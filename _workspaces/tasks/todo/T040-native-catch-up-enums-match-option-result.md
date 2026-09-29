@@ -1,0 +1,32 @@
+---
+id: T040
+title: Native catch-up: enums, match, Option/Result
+phase: P5-language
+owner: axiom-backend
+reviewer: axiom-qa
+depends: [T039, T037]
+priority: 60
+status: todo
+attempts: 0
+paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum]
+spec: [0268, 0183]
+---
+# T040 — Native catch-up: enums, match, Option/Result
+
+## Goal
+Enum/match programs pass natively.
+
+## Scope
+- Switch lowering (compare chains; jump tables optional), tag/payload access, enum ABI.
+
+## Acceptance
+- [ ] Differential green.
+- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Report `_workspaces/reports/T040-report.md` with exact `## Files changed`.
+
+## Out of scope
+- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+
+## Notes
+- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

@@ -1,0 +1,32 @@
+---
+id: T023
+title: LIR + naive MIR→LIR lowering
+phase: P4-native
+owner: axiom-backend
+reviewer: axiom-qa
+depends: [T021]
+priority: 40
+status: todo
+attempts: 0
+paths: [bootstrap/axiom0/src/lir, tests/lir]
+spec: [0162, 0179, 0215, 0232, 0049]
+---
+# T023 — LIR + naive MIR→LIR lowering
+
+## Goal
+Machine-independent low-level IR: explicit memory, stack slots, calls; MIR ownership erased.
+
+## Scope
+- LIR data model + printer (`--emit=lir`); naive lowering: every MIR local → stack slot; operations → LIR ops; calls with abstract ABI placeholders.
+
+## Acceptance
+- [ ] Golden LIR tests for the subset programs.
+- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Report `_workspaces/reports/T023-report.md` with exact `## Files changed`.
+
+## Out of scope
+- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+
+## Notes
+- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
