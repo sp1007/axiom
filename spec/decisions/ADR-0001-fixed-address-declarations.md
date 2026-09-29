@@ -92,10 +92,52 @@ read/write to a volatile access of exactly that width; plain fields are ordinary
 - Oracle (MIR interpreter): simulated address space; overlays map to simulated memory or to
   test-harness device models, so programs using `@at` stay testable without hardware.
 
+### 5. Addendum — load-time resolved, module-relative overlays (REQ-OWNER-005)
+
+With ASLR, code and data of a loaded image live at `module base + offset`, known only at load time.
+Overlays (never placements) may therefore use a module-relative address in the **hosted** profile:
+
+```axiom
+// Inside a DLL (or EXE) running in the same process as "game.exe":
+@at(image("game.exe") + 0x1A_2B30)
+unsafe extern "C" fn game_add_item(player: *mut Player, item_id: u32, count: i32) -> bool
+
+@at(image("game.exe") + 0x3F_0010)
+unsafe static GAME_STATE: GameState            // @repr(C) layout reconstructed by the programmer
+
+@at(image_self() + 0x2000)                     // relative to the module being built
+unsafe static TABLE: [256]u8
+
+fn give_potions() {
+    if GAME_STATE.player_count > 0 {
+        game_add_item(GAME_STATE.players[0], 42, 10)   // ordinary call through the declared ABI
+    }
+}
+```
+
+- `image("name")` resolves once, at module initialisation (Windows: module lookup by name in the
+  current process; Linux: `dl_iterate_phdr`/`dlopen` equivalent), before any user code in the module
+  runs; `image_self()` is the module's own base. Failure (module not loaded) → the module
+  initialiser reports a defined error (DLL: `DllMain` returns FALSE; EXE: startup panic) — never a
+  call through an unresolved address.
+- Representation: each such binding is a load-time resolved slot (like an import table entry)
+  filled by generated init code; calls are indirect through the slot, field accesses go through the
+  resolved base. Alignment/layout checks as in §3; no overlap checks across foreign modules.
+- Only overlays: code/data is never *placed* into another module.
+- Calling conventions: whatever the target supports (`extern "C"`/`"system"` on x64 Windows). Many
+  older games are 32-bit; calling them needs an i686-windows target with `thiscall`/`stdcall`/
+  `fastcall` — tracked as an optional epic candidate, not scheduled.
+
+### 6. PE DLL output
+
+`axiom build --kind dll` produces a PE32+ DLL: exports table from `@export` items, optional
+`@entry` `DllMain`-style initialiser generated around the module initialisers of §5, base
+relocations (DLLs are relocatable). Linux counterpart (`.so`) is E16.2.
+
 ## Consequences
 
-- New roadmap epic **E13.6 Fixed-address declarations** (P13), implemented in axiomc after
-  self-hosting (ROADMAP R7).
+- New roadmap epics **E13.6 Fixed-address declarations** and **E13.7 Module-relative bindings +
+  PE DLL output** (P13), implemented in axiomc after self-hosting (ROADMAP R7).
 - Core extension points must exist from day one (T003a / SPEC-04): placement on items, `fixed`
   provenance, absolute symbols, pinned sections, volatile MIR ops. axiom0 parses `@at` and reports
   `AX_ADDR_UNSUPPORTED_STAGE0`, never crashes.

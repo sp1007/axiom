@@ -120,6 +120,9 @@ unsafe extern "C" fn rom_crc32(data: *const u8, len: usize) -> u32   // routine 
 UART0.ctrl = UartCtrl.ENABLE           // ordinary field access; Mmio<T> fields are volatile
 ```
 
+Module-relative overlays for ASLR'd images (hosted profile, resolved at load time, ADR-0001 §5):
+`@at(image("game.exe") + 0x1A_2B30) unsafe extern "C" fn f(x: i32) -> i32`, `@at(image_self() + 0x2000)`.
+
 No initializer / `extern fn` = overlay; initializer or body = placement. The address is a
 compile-time constant; the type needs a defined layout (`@repr(C)`/primitive). Freestanding/system
 profiles only. Semantics land in epic E13.6; Stage-0 parses `@at` and reports

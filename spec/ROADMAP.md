@@ -138,6 +138,11 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
   address space. Src ADR-0001, 0071 §31-32, 0044, 0097, tasks/0328.
   Exit: a freestanding test image with an `@at` vector table and UART register block runs under the
   oracle with a device model, and native images place every `@at` object at its address.
+- **E13.7 Module-relative bindings & PE DLL output** — owner requirement REQ-OWNER-005,
+  ADR-0001 §5-6: `@at(image("mod") + off)` / `image_self()` overlays resolved at module init in the
+  hosted profile; PE32+ DLL output with exports, `DllMain` initialiser, base relocations.
+  Src ADR-0001, 0187, 0104, tasks/0336. Exit: a test DLL loaded into a test host EXE calls host
+  functions and reads host data through module-relative bindings; missing module → DllMain FALSE.
 - **E13.5 Panic & unwinding strategy** — panic=abort vs unwind decision per profile, cleanup
   guarantees across unwinding. Src 0229 tasks/0351 tasks/0700.
 Exit: freestanding program boots without std; UB/safety conformance suite.
@@ -277,5 +282,6 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-29 | New epic E13.7 module-relative bindings + PE DLL output (REQ-OWNER-005) | ADR-0001 §5-6 |
 | 2026-09-29 | New epic E13.6 fixed-address declarations (owner requirement REQ-OWNER-003) | ADR-0001 |
 | 2026-09-29 | R7 minimal C: T058→E14.4, T061 trimmed to const items (rest E14.1), T063→E15.8, T064→E15.4, T066→E16.9, T067→E18.6, T068→E17.3; P15 opens right after P10; new T003a core extensibility contract + exact self-host subset | owner decision |
