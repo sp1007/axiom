@@ -20,7 +20,7 @@ UTF-8 text model per spec.
 - Str/String/Bytes APIs, UTF-8 validation, int/float to string, concatenation, comparison, simple `format`/print helpers per spec.
 
 ## Acceptance
-- [ ] Text tests round-trip `Xin chào thế giới`: byte length 23, 17 Unicode scalar values, validation, slicing on char boundaries, invalid UTF-8 rejected.
+- [ ] Text tests round-trip `Xin chào thế giới`: byte length 22, 17 Unicode scalar values, validation, slicing on char boundaries, invalid UTF-8 rejected.
 - [ ] run tests incl. multi-byte text.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T071-report.md` with exact `## Files changed`.

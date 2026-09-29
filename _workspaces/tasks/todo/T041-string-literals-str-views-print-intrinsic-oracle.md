@@ -20,7 +20,7 @@ Static string data and output, first stdout-observable programs.
 - String literals → static read-only data, `Str` as (ptr,len) view type, byte strings, `print(s)`/`print_int(n)` as declared intrinsics (library-level later), interp writes to stdout.
 
 ## Acceptance
-- [ ] Interp run test prints `Xin chào thế giới` (stdout compared as exact UTF-8 bytes); `Str` length of the literal is its byte length (23) per the text spec, character iteration deferred to std.
+- [ ] Interp run test prints `Xin chào thế giới` (stdout compared as exact UTF-8 bytes); `Str` length of the literal is its byte length (22) per the text spec, character iteration deferred to std.
 - [ ] run tests with `// stdout:` directives in interp mode.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T041-report.md` with exact `## Files changed`.
