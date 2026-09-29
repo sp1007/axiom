@@ -3,7 +3,7 @@ id: T086
 title: Stage-1: axiom0 builds axiomc; axiomc passes the full suite
 phase: P10-selfhost
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T085]
 priority: 120
 status: todo

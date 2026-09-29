@@ -3,7 +3,7 @@ id: T052
 title: P6 gate: adversarial semantic suite
 phase: P6-ownership
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T051]
 priority: 72
 status: todo

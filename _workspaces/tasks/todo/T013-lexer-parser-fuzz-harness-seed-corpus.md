@@ -3,7 +3,7 @@ id: T013
 title: Lexer/parser fuzz harness + seed corpus
 phase: P2-frontend
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T012, T005]
 priority: 23
 status: todo

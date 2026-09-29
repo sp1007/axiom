@@ -30,8 +30,8 @@ The corpus is too large to read. Read **only** what the task needs, in this prio
 
 The corpus grew chronologically through many design passes. Later documents usually supersede
 earlier ones, several topics were re-frozen 3–5 times, and some directions were reversed (e.g.
-early docs say "bootstrap via LLVM", later ones forbid LLVM; early docs target Linux ELF first,
-0181 re-targets Windows PE64 first because development happens on Windows). Reading an early doc
+early docs say "bootstrap via LLVM", later ones forbid LLVM; early docs targeted Linux ELF,
+0181 re-targets Windows PE64 as the first platform because development happens on Windows). Reading an early doc
 alone produces confident but wrong implementations.
 
 ## Project-level decisions already fixed (do not relitigate)

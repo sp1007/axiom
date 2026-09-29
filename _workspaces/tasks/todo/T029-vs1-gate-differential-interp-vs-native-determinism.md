@@ -3,7 +3,7 @@ id: T029
 title: VS1 gate: differential interp vs native, determinism
 phase: P4-native
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T028, T022]
 priority: 46
 status: todo

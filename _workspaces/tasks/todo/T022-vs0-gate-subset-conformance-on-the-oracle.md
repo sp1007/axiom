@@ -3,7 +3,7 @@ id: T022
 title: VS0 gate: subset conformance on the oracle
 phase: P3-semantic-core
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T021, T016]
 priority: 35
 status: todo

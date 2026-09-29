@@ -3,7 +3,7 @@ id: T075
 title: Library conformance + real-program suite
 phase: P9-stdlib
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T074, T073]
 priority: 106
 status: todo

@@ -28,6 +28,7 @@ python .claude/skills/axiom-tasks/scripts/taskctl.py block T010 --reason "needs 
 python .claude/skills/axiom-tasks/scripts/taskctl.py requeue T010 --reason "stale after restart"
 python .claude/skills/axiom-tasks/scripts/taskctl.py commit T010
 python .claude/skills/axiom-tasks/scripts/taskctl.py validate
+python .claude/skills/axiom-tasks/scripts/harness_check.py   # harness consistency (run after board/skill edits)
 ```
 
 `next` only returns tasks whose dependencies are all done, that are not blocked, and whose `paths`

@@ -3,7 +3,7 @@ id: T006
 title: Architecture layer checker tools/archcheck.py
 phase: P0-foundation
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T004]
 priority: 12
 status: todo

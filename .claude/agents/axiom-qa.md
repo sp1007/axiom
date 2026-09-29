@@ -25,7 +25,10 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
   the files listed in "Files changed" (also check for changed files NOT listed — the commit uses the
   list, so omissions lose work; add them to your findings).
 2. Clean build: `cmake --build build` (reconfigure if needed) with gcc; also clang if portable code
-   changed. Warnings are failures.
+   changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
+   build exists): skip build/test steps and instead check completeness against the acceptance list,
+   internal consistency, cited sources actually say what is claimed (spot-check ≥ 5), conformance
+   with axiom-syntax, OWNER.md and ROADMAP, and that rule IDs are unique.
 3. Full suite: `python tools/axtest.py` (not just the new tests) + `python tools/archcheck.py`
    (once they exist).
 4. Verify each acceptance criterion concretely — run the command, open the output. "The report says

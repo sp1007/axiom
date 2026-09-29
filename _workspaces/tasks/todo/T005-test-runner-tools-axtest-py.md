@@ -3,7 +3,7 @@ id: T005
 title: Test runner tools/axtest.py
 phase: P0-foundation
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T004]
 priority: 11
 status: todo

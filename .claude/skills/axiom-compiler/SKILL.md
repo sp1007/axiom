@@ -68,8 +68,10 @@ runtime rejects that type (agent files added mid-session are not yet registered)
    - `BLOCKED` → `taskctl.py block <ID> --reason "<reason>"`; queue an architect unblock (below).
    - `COMPLETE` but no report → send it back once (SendMessage to `<ID>-impl`: "write the report");
      still missing → requeue.
-4. **QA gate**: spawn `name: "<ID>-qa"`, `subagent_type: axiom-qa`, `model: "opus"`, background,
-   prompt: `Gate task <ID>. Task file: … Report: _workspaces/reports/<ID>-report.md. Follow your
+4. **QA gate**: the gate agent is the task's `reviewer` (axiom-qa for most tasks; axiom-architect
+   for tasks owned by axiom-qa, so nobody grades their own work — its prompt adds "follow the Gate
+   protocol in .claude/agents/axiom-qa.md"). Spawn `name: "<ID>-qa"`, `subagent_type: <reviewer>`,
+   `model: "opus"`, background, prompt: `Gate task <ID>. Task file: … Report: _workspaces/reports/<ID>-report.md. Follow your
    Gate protocol and write _workspaces/reports/<ID>-qa.md ending with VERDICT: PASS|FAIL.`
 5. On QA result (read the last `VERDICT:` line of `<ID>-qa.md`, not the chat summary):
    - **PASS** → `taskctl.py finish <ID>` → `taskctl.py commit <ID>` (auto-commit, local, never
@@ -89,8 +91,10 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 Spawn `name: "unblock-<ID>"`, `subagent_type: axiom-architect`, `model: "opus"`, background:
 `Task <ID> is blocked. Task file: …; report/QA files: …; blocker: <reason>. Follow your Unblocking
 protocol (ADR / split / prerequisite / rescope), run taskctl validate, report what changed.`
-Architect changes to `spec/` and the board are committed afterwards with
-`git add spec _workspaces/tasks && git commit -m "arch: unblock <ID> — <summary>"` (+ trailer).
+The architect writes `_workspaces/reports/unblock-<ID>.md` with an exact `## Files changed` list.
+Commit only those files plus the board: `git add -- <listed files> _workspaces/tasks` then
+`git commit -m "arch: unblock <ID> — <summary>"` (+ trailer). Never `git add spec` wholesale — other
+architect tasks may have half-written files there.
 Unblocking never waits for the human.
 
 ## Parallelism rules
@@ -126,7 +130,7 @@ the roadmap: if work appears that no epic covers, hand it to the architect for a
 When the last task of a phase lands (see `phase:` in task files), spawn axiom-architect for a
 short phase review (`_workspaces/reports/phase-<P>-review.md`, starting with a Vietnamese
 `## Tóm tắt` for the owner): spec drift, shortcuts to retire,
-requirement coverage of the phase (`reqcov.py --phase <P>` — every mapped requirement implemented
+`harness_check.py` clean, requirement coverage of the phase (`reqcov.py --phase <P>` — every mapped requirement implemented
 or explicitly re-mapped), backlog adjustments for the next phase. Commit its board/spec changes.
 
 ## Test scenarios

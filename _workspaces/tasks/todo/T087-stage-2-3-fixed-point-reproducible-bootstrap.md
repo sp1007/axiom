@@ -3,7 +3,7 @@ id: T087
 title: Stage-2/3 fixed point + reproducible bootstrap
 phase: P10-selfhost
 owner: axiom-qa
-reviewer: axiom-qa
+reviewer: axiom-architect
 depends: [T086]
 priority: 121
 status: todo
