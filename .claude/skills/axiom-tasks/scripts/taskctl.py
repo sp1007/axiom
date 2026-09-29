@@ -107,7 +107,7 @@ def load_all():
 
 
 def save(t):
-    with open(t["path"], "w", encoding="utf-8") as fh:
+    with open(t["path"], "w", encoding="utf-8", newline="\n") as fh:
         fh.write(dump(t["meta"], t["body"]))
 
 

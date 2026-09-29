@@ -20,6 +20,7 @@ Enough OS access to write a compiler in Axiom.
 - stdout/stderr writers, read/write whole files, command-line args, environment, exit, errors as Result types.
 
 ## Acceptance
+- [ ] std.io print/println of `Xin chào thế giới` correct on console, pipe and file; file written and read back byte-identical.
 - [ ] run tests using temp files.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T074-report.md` with exact `## Files changed`.

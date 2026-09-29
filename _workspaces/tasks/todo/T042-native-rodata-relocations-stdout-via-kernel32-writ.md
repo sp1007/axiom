@@ -1,6 +1,6 @@
 ---
 id: T042
-title: Native: rodata, relocations, stdout via kernel32 WriteFile
+title: Native: rodata, relocations, stdout via kernel32 (UTF-8 greeting)
 phase: P5-language
 owner: axiom-backend
 reviewer: axiom-qa
@@ -14,13 +14,14 @@ spec: [0186, 0187, 0185]
 # T042 — Native: rodata, relocations, stdout via kernel32 WriteFile
 
 ## Goal
-hello.exe: string output natively.
+hello.exe prints `Xin chào thế giới` natively (UTF-8 end to end).
 
 ## Scope
 - .rdata section, RIP-relative addressing, import GetStdHandle/WriteFile, runtime print helpers generated as machine code or Axiom-level intrinsic stubs.
 
 ## Acceptance
-- [ ] All stdout run tests pass natively; hello world exe.
+- [ ] hello.exe prints `Xin chào thế giới\n`: exact UTF-8 bytes when stdout is a pipe/file (runner), and correct glyphs when stdout is a real Windows console (runtime uses WriteConsoleW with UTF-8→UTF-16 conversion, or sets CP_UTF8 at startup — decide and document); no mojibake.
+- [ ] All stdout run tests pass natively.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T042-report.md` with exact `## Files changed`.
 

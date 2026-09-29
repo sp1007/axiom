@@ -31,7 +31,7 @@ exist.
 ```axiom
 // test: run                 # run | ui | golden | diff
 // exit: 42                  # expected exit code (run/diff)
-// stdout: hello\n           # optional exact stdout (escape sequences allowed)
+// stdout: Xin chào thế giới\n   # optional exact stdout, compared as UTF-8 bytes
 // modes: interp native      # default for run: both; restrict only with a reason comment
 // target: x86_64-windows    # optional; default host target
 // flags: -O1                # extra compiler flags
@@ -71,6 +71,16 @@ It must print a final line
 `TOTAL n PASS p FAIL f SKIP s` and exit non-zero on any failure.
 
 ## Writing good compiler tests
+
+- **Canonical greeting is `Xin chào thế giới`, never "hello world"** (owner decision): every
+  hello-style sample, smoke test, doc example and fixture prints it, so UTF-8 (2- and 3-byte
+  sequences, combining-free precomposed Vietnamese) is exercised by default. stdout is compared as
+  raw UTF-8 bytes (`Xin ch\xc3\xa0o th\xe1\xba\xbf gi\xe1\xbb\x9bi`).
+
+- Files are LF-only (`.gitattributes`); when generating tests or golden files from Python on Windows
+  use `open(path, "w", encoding="utf-8", newline="
+")` — the default writes CRLF and breaks
+  byte-exact comparisons.
 
 - One behaviour per test, named after it (`move_then_use.ax`, `shadow_space_5_args.ax`).
 - Always pair a positive with a negative test for each rule (accepts valid, rejects invalid with the
