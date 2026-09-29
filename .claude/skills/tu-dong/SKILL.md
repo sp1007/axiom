@@ -1,6 +1,6 @@
 ---
 name: tu-dong
-description: Lệnh "tự động" — bật chế độ autopilot cho dự án compiler Axiom. Tạo monitor chạy mỗi 5 phút; nếu không có task nào đang thực hiện (_workspaces/tasks/doing trống) thì tự xác định task tiếp theo và chạy ngay bằng nhiều subagent song song, tự QA, tự commit sau mỗi task, không hỏi người dùng, không ngủ đông. Dùng khi người dùng gõ /tu-dong, "tự động", "chạy tự động", "autopilot", "cứ chạy tiếp đi", "bật tự động"; cũng dùng cho "tự động dừng"/"dừng tự động" (tắt) và "tự động trạng thái"/"tiến độ" (xem trạng thái).
+description: Lệnh "tự động" — bật chế độ autopilot cho dự án compiler Axiom. Tạo monitor chạy mỗi 5 phút; luôn giữ tối đa 3 task chạy song song — hễ có chỗ trống (task xong hoặc bị chặn) là tự xác định task tiếp theo không đụng thư mục đang làm và chạy ngay bằng subagent, tự QA, tự commit sau mỗi task, không hỏi người dùng, không ngủ đông. Dùng khi người dùng gõ /tu-dong, "tự động", "chạy tự động", "autopilot", "cứ chạy tiếp đi", "bật tự động"; cũng dùng cho "tự động dừng"/"dừng tự động" (tắt) và "tự động trạng thái"/"tiến độ" (xem trạng thái).
 ---
 
 # /tu-dong — Axiom autopilot
@@ -41,10 +41,10 @@ the board is finished or the user says stop.
 
 ## Behaviour contract ("không ngủ đông")
 
-- Idle is never a stopping point: when a task finishes and `doing/` is empty, start the next batch
-  right away (the orchestrator does this); the 5-minute tick is the safety net that catches
+- Idle is never a stopping point: whenever a task finishes or blocks, refill its slot right away
+  (the orchestrator does this; owner decision 2026-09-29 replaced "only when doing/ is empty"); the 5-minute tick is the safety net that catches
   anything missed (stale tasks, crashed agents, blocked tasks awaiting the architect).
 - Never end a turn by asking the user what to do next while autopilot is enabled. Summarise in one
-  or two lines and continue.
+  or two lines **in Vietnamese** and continue.
 - If the whole board is done: run the final phase review (architect), commit, `CronDelete`, set
   `enabled: false`, and report completion.

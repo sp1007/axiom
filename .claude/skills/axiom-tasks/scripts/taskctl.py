@@ -22,7 +22,8 @@ Commands:
     status                     board summary (add --json for machine output)
     list [todo|doing|done|blocked|deferred]
     next [--max N]             ready tasks: deps done, not blocked, paths disjoint from doing
-                               and from each other (safe to run in parallel)
+                               and from each other (safe to run in parallel); nothing while a
+                               critical (priority < 10) task runs. Use N = free slots to refill.
     show ID                    print the task file
     start ID [--agent NAME]    todo -> doing
     finish ID                  doing -> done
@@ -126,10 +127,10 @@ def log(t, text):
 
 
 def get(tasks, tid):
-    tid = tid.upper()
-    if tid not in tasks:
-        raise SystemExit(f"unknown task {tid}")
-    return tasks[tid]
+    for key in tasks:
+        if key.lower() == tid.lower():
+            return tasks[key]
+    raise SystemExit(f"unknown task {tid}")
 
 
 # ---------------------------------------------------------------- logic
@@ -150,6 +151,8 @@ def ready(tasks, maxn):
         if t["dir"] == "doing":
             any_doing = True
             busy_paths += t["meta"].get("paths", [])
+            if int(t["meta"].get("priority", 100)) < 10:
+                return []  # a critical task is running alone
     cands = []
     for i, t in tasks.items():
         m = t["meta"]

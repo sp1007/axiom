@@ -13,6 +13,8 @@ namespace/thư viện chỉ dùng `.` (không có `::`). Chi tiết: skill `axio
 `axiomc`, bằng đội agent (architect, frontend, semantics, backend, stdlib, qa) với QA gate và auto-commit
 sau mỗi task.
 
+**Ngôn ngữ:** spec/code/test/báo cáo giữa agent bằng tiếng Anh; mỗi spec chuẩn, ADR, bản rà soát phase có `## Tóm tắt` tiếng Việt; autopilot báo cáo bằng tiếng Việt.
+
 **Trigger:** Mọi yêu cầu xây/tiếp tục/sửa/kiểm thử compiler Axiom → dùng skill `axiom-compiler`.
 Chạy tự động liên tục → `/tu-dong` (dừng: `/tu-dong dừng`, trạng thái: `/tu-dong trạng thái`); nhịp
 giám sát 5 phút → `/axiom-tick`. Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
@@ -30,3 +32,4 @@ Câu hỏi đơn giản có thể trả lời trực tiếp.
 | 2026-09-29 | Bổ sung xuất file đa nền tảng/đa chip và thư viện: E16.10 (ma trận exe/lib tĩnh/lib động), E16.11 universal binary, E16.12 Windows ARM64, E12.5 multiversioning CPU, E20.7 plugin/hot-reload/ABI Axiom | spec/ROADMAP.md | Specs có (0453, 0563, 0584…) nhưng roadmap chưa gom đủ |
 | 2026-09-29 | Windows x64 xuất/dùng đủ artifact: .obj/.exe ở core; .lib, .dll + import lib ngay sau self-host (E18.7: T750, T751); T003a chừa sẵn loại artifact; REQ-OWNER-006; E13.7 chỉ còn binding theo module | board, spec | Yêu cầu chủ dự án |
 | 2026-09-29 | Rà soát harness: sửa thứ tự tầng (objmodel là tầng thấp), commit kèm test do QA thêm, T024/T026 phụ thuộc T003a, .gitattributes (LF, binary), đánh số ADR tiếp theo | axiom-c-stage0, taskctl.py, board, architect | Lỗi phát hiện khi rà soát |
+| 2026-09-29 | Autopilot lấp chỗ trống ngay khi một task xong (tối đa 3 song song, không chồng thư mục; task critical chạy một mình); tóm tắt tiếng Việt cho spec/ADR/rà soát phase | axiom-tick, axiom-compiler, tu-dong, taskctl.py, architect | Quyết định của chủ dự án |

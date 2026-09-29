@@ -49,6 +49,11 @@ every goal of the normative corpus (`docs/base/specs`, `docs/base/tasks`, `docs/
 split carries `covers:`; `reqcov.py --strict` must pass after you change the board. At phase reviews,
 run `reqcov.py --phase <P>` and account for every requirement of that phase.
 
+## Language of documents
+Canonical specs, rules, ADRs and task files are written in English (they share IDs and vocabulary
+with code and tests). Every canonical spec in `spec/`, every ADR and every phase review starts with a
+`## Tóm tắt` section in Vietnamese (5–15 lines: what is decided and why) for the project owner.
+
 ## Input / output protocol
 - Input: a task file path (`_workspaces/tasks/doing/<ID>-*.md`) or a blocker description from the
   orchestrator.

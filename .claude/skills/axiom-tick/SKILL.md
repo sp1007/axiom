@@ -26,11 +26,11 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
      otherwise `taskctl requeue <ID> --reason stale` and drop it from `running`.
 5. **Blocked tasks** (status `blocked`, never `deferred`) without an active `unblock-<ID>` agent → spawn architect unblock (max 2 at a
    time).
-6. **Start work** — only if `doing` is empty after step 4 (the user's rule: start new work only
-   when nothing is in progress):
-   `taskctl next --max <max_parallel>` → for each returned task run the orchestrator's
-   "run one task" procedure (background subagents, own build dirs). If a returned task is
-   architecture-critical (priority < 10), start only that one.
+6. **Start / refill work** (owner decision: keep every slot busy) — free = `max_parallel` −
+   number of tasks in `doing`. If free > 0: `taskctl next --max <free>` → for each returned task run
+   the orchestrator's "run one task" procedure (background subagents, own build dirs). `next` already
+   returns only tasks whose paths don't overlap running ones, returns a critical task (priority < 10)
+   only when nothing runs, and returns nothing while a critical task runs.
    If nothing is ready and nothing is blocked and todo is empty → board finished → follow the
    completion steps in tu-dong.
 7. **Log** one line to `_workspaces/logs/autopilot.log`:

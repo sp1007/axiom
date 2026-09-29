@@ -42,7 +42,7 @@ runtime rejects that type (agent files added mid-session are not yet registered)
      with a note only if the user asked to redo it; otherwise run a follow-up task).
    - user gives feedback on a finished task ("parser recovery is weak") → architect creates a
      follow-up task (or re-opens scope) → run it.
-   - otherwise → **batch run**: `taskctl.py next --max 3` and run those.
+   - otherwise → **batch run**: `taskctl.py next --max <3 − tasks in doing>` and run those.
 3. Stale work: a task in `doing/` with no live agent (check `ListAgents` / autopilot.json) →
    if `<ID>-report.md` says COMPLETE and no PASS QA yet → go to step "QA gate"; else
    `taskctl.py requeue <ID> --reason stale` and treat as ready.
@@ -81,8 +81,8 @@ runtime rejects that type (agent files added mid-session are not yet registered)
      resumed, spawn a fresh owner agent with the same prompt plus the QA file. Then QA again.
    - **FAIL**, round == 2 → `taskctl.py block <ID> --reason "QA failed 3 times: <top findings>"` →
      architect unblock.
-6. After any task leaves `doing/`: if `doing/` is now empty, immediately start the next batch
-   (do not wait for the 5-minute tick).
+6. After any task leaves `doing/` (done or blocked): immediately refill the free slots with
+   `taskctl next --max <free slots>` (do not wait for the 5-minute tick).
 
 ## Procedure: architect unblock
 
@@ -124,7 +124,8 @@ the roadmap: if work appears that no epic covers, hand it to the architect for a
 ## Phase gates (milestones)
 
 When the last task of a phase lands (see `phase:` in task files), spawn axiom-architect for a
-short phase review (`_workspaces/reports/phase-<P>-review.md`): spec drift, shortcuts to retire,
+short phase review (`_workspaces/reports/phase-<P>-review.md`, starting with a Vietnamese
+`## Tóm tắt` for the owner): spec drift, shortcuts to retire,
 requirement coverage of the phase (`reqcov.py --phase <P>` — every mapped requirement implemented
 or explicitly re-mapped), backlog adjustments for the next phase. Commit its board/spec changes.
 
