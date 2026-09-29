@@ -4,12 +4,12 @@ title: COFF object writer
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T024]
+depends: [T024, T003a]
 priority: 43
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/obj/coff, tests/obj]
-spec: [0185, .claude/skills/axiom-x64-backend/references/pe-coff.md]
+spec: [0185, .claude/skills/axiom-x64-backend/references/pe-coff.md, spec/SPEC-04-core-extensibility.md]
 ---
 # T026 — COFF object writer
 

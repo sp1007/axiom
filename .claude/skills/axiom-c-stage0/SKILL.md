@@ -58,10 +58,13 @@ A module may include headers only from its own layer or **lower** layers:
 
 ```
 kernel < source < diag < lex < syntax < resolve < hir < types < traits < own < mir < verify
-       < interp, opt < lir < abi < target/x64 < objmodel < obj < link < driver
+       < interp, opt < lir < abi < target/x64 < obj < link < driver
+
+objmodel: low layer (depends on kernel only), usable by target/x64, obj and link
 ```
 
-Exceptions: `objmodel` depends only on `kernel`; `obj`/`link` depend on `objmodel`+`kernel`+`diag`
+Exceptions: `objmodel` depends only on `kernel` (the encoder in `target/x64` emits into it);
+`obj`/`link` depend on `objmodel`+`kernel`+`diag`
 (never on MIR/HIR — "linker → parser" is an architecture violation, doc 0263 §46). `interp` must not
 depend on `target`, `opt` must not depend on `syntax`. Why: this is what lets the backend, the
 oracle and the frontend evolve and be ported independently.

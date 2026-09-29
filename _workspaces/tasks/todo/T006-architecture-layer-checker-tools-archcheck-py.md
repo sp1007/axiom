@@ -17,7 +17,7 @@ spec: [0263, 0152]
 Enforce the layer rules of axiom-c-stage0 automatically.
 
 ## Scope
-- Parse #include "..." in bootstrap/axiom0/src/**; map files to layers; rules file with the ordered layers and explicit exceptions (objmodel, obj, link, interp, opt).
+- Parse #include "..." in bootstrap/axiom0/src/**; map files to layers; rules file with the ordered layers and explicit exceptions (objmodel is a low layer usable by target/x64, obj, link; obj/link never include MIR/HIR; interp never includes target; opt never includes syntax).
 - Report violations as `file:line: layer X must not include Y`; exit non-zero.
 - Also flag: mutable globals outside driver (heuristic: non-const file-scope variables), `printf`/`exit(` outside driver/diag render.
 

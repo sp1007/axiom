@@ -4,12 +4,12 @@ title: Object model + x86-64 encoder core (validated vs GNU as)
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T007, T005]
+depends: [T007, T005, T003a]
 priority: 41
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/objmodel, bootstrap/axiom0/src/target/x64/encode, tests/encode, tools/gen_encode_tests.py]
-spec: [0184, 0180, 0233, 0254, .claude/skills/axiom-x64-backend]
+spec: [0184, 0180, 0233, 0254, .claude/skills/axiom-x64-backend, spec/SPEC-04-core-extensibility.md]
 ---
 # T024 — Object model + x86-64 encoder core (validated vs GNU as)
 

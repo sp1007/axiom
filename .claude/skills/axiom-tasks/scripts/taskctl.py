@@ -225,10 +225,7 @@ def cmd_validate(tasks):
     return ok
 
 
-def report_files(tid):
-    path = os.path.join(REPORTS, f"{tid}-report.md")
-    if not os.path.exists(path):
-        return None
+def _files_section(path):
     files, on = [], False
     with open(path, encoding="utf-8") as fh:
         for line in fh:
@@ -239,7 +236,19 @@ def report_files(tid):
                 m = re.match(r"^\s*[-*]\s+`?([^`\s]+)`?", line)
                 if m:
                     files.append(m.group(1))
-    return files + [os.path.relpath(path, ROOT)]
+    return files
+
+
+def report_files(tid):
+    """Files of the engineer report plus the QA report (QA-added tests are committed too)."""
+    path = os.path.join(REPORTS, f"{tid}-report.md")
+    if not os.path.exists(path):
+        return None
+    files = _files_section(path) + [os.path.relpath(path, ROOT)]
+    qa = os.path.join(REPORTS, f"{tid}-qa.md")
+    if os.path.exists(qa):
+        files += _files_section(qa) + [os.path.relpath(qa, ROOT)]
+    return sorted(set(files))
 
 
 def git(*args, check=True):

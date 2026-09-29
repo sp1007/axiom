@@ -36,6 +36,9 @@ alone produces confident but wrong implementations.
 
 ## Project-level decisions already fixed (do not relitigate)
 
+- Owner requirements `spec/requirements/OWNER.md` (REQ-OWNER-*) and the binding roadmap
+  `spec/ROADMAP.md` (phases, epics, R1–R7: minimal C core, axiom0 frozen after self-hosting T087).
+
 - Stage-0 compiler `axiom0` is written in **C11** (`bootstrap/axiom0/`), no LLVM, no external
   assembler or linker in the production path (docs 0263, 0172, 0181). Using clang/llvm-objdump **as
   test oracles** (to validate our bytes/objects) is fine.

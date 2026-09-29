@@ -74,9 +74,8 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 5. On QA result (read the last `VERDICT:` line of `<ID>-qa.md`, not the chat summary):
    - **PASS** → `taskctl.py finish <ID>` → `taskctl.py commit <ID>` (auto-commit, local, never
      push) → log → remove from `running`.
-     `taskctl commit` stages the report's "Files changed" list; QA's added tests are listed in the
-     QA file — append them to the engineer report's list before committing (or `git add` them
-     explicitly).
+     `taskctl commit` stages the "Files changed" lists of both `<ID>-report.md` and `<ID>-qa.md`
+     (so QA-added tests are committed) plus both report files.
    - **FAIL**, round < 2 → round += 1; `SendMessage` to `<ID>-impl` with the path of the QA file and
      "fix every finding, add regression tests, update the report (Round N)". If the agent cannot be
      resumed, spawn a fresh owner agent with the same prompt plus the QA file. Then QA again.

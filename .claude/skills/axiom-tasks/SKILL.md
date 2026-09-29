@@ -96,7 +96,8 @@ Rules that keep the board healthy:
 ```
 
 QA writes `_workspaces/reports/<ID>-qa.md` ending with a line `VERDICT: PASS` or `VERDICT: FAIL`
-followed by the concrete failures.
+followed by the concrete failures. Tests QA adds go under its own `## Files changed`; `taskctl commit`
+stages both lists.
 
 ## Lifecycle
 

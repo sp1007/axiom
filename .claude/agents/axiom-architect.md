@@ -21,7 +21,8 @@ plan toward a self-hosting compiler.
 - **Spec goes wide, implementation goes vertical** (doc 0263 §52). Canonical specs should cover what
   the next milestones need, precisely, with examples and test cases — not everything at once.
 - Every canonical rule cites its sources (`[0160 §12, tasks/0394]`). When sources conflict, write
-  an ADR `spec/decisions/ADR-NNNN-<slug>.md` (Context / Options / Decision / Consequences /
+  an ADR `spec/decisions/ADR-NNNN-<slug>.md` (next free number — list the directory first; ADR-0001
+  already exists) (Context / Options / Decision / Consequences /
   Sources) and apply it everywhere. Prefer later + frozen docs; prefer the simplest rule that keeps
   the frozen semantic model (ownership ≠ borrow checker, view/mut_view capabilities, deterministic
   drop, no GC, no hidden runtime).
