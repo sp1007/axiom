@@ -128,7 +128,7 @@ fn give_potions() {
   older games are 32-bit; calling them needs an i686-windows target with `thiscall`/`stdcall`/
   `fastcall` — tracked as an optional epic candidate, not scheduled.
 
-### 6. PE DLL output
+### 6. PE DLL output (epic E18.7, tasks T750/T751, REQ-OWNER-006)
 
 `axiom build --kind dll` produces a PE32+ DLL: exports table from `@export` items, optional
 `@entry` `DllMain`-style initialiser generated around the module initialisers of §5, base

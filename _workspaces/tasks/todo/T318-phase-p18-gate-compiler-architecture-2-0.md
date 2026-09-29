@@ -4,7 +4,7 @@ title: Phase P18 gate — Compiler architecture 2.0
 phase: P18-compiler-architecture-2-0
 owner: axiom-qa
 reviewer: axiom-architect
-depends: [T218, T067]
+depends: [T218, T067, T750, T751]
 priority: 318
 status: todo
 attempts: 0

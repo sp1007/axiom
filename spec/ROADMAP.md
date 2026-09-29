@@ -79,7 +79,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068 | T217 | T317 | P16 |
-| P18 compiler architecture 2.0 | T067 | T218 | T318 | P10 |
+| P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750, T751 | T218 | T318 | P10 |
 | P19 developer tooling | — | T219 | T319 | P18 |
 | P20 build & packages | — | T220 | T320 | P16, P18 |
 | P21 std completion | — | T221 | T321 | P11, P13 |
@@ -141,9 +141,9 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
   address space. Src ADR-0001, 0071 §31-32, 0044, 0097, tasks/0328.
   Exit: a freestanding test image with an `@at` vector table and UART register block runs under the
   oracle with a device model, and native images place every `@at` object at its address.
-- **E13.7 Module-relative bindings & PE DLL output** — owner requirement REQ-OWNER-005,
+- **E13.7 Module-relative bindings** — owner requirement REQ-OWNER-005,
   ADR-0001 §5-6: `@at(image("mod") + off)` / `image_self()` overlays resolved at module init in the
-  hosted profile; PE32+ DLL output with exports, `DllMain` initialiser, base relocations.
+  hosted profile, hooked into the DLL/EXE initialisers of E18.7 (PE DLL output).
   Src ADR-0001, 0187, 0104, tasks/0336. Exit: a test DLL loaded into a test host EXE calls host
   functions and reads host data through module-relative bindings; missing module → DllMain FALSE.
 - **E13.5 Panic & unwinding strategy** — panic=abort vs unwind decision per profile, cleanup
@@ -191,7 +191,7 @@ Exit: differential green at -O2; benchmark targets met and tracked in CI.
   libraries** (produce Axiom `.lib`/`.a`; consume C/system archives), **dynamic libraries** (produce
   PE DLL + import `.lib` / ELF `.so` / Mach-O `.dylib`; consume system and third-party dynamic libs,
   lazy/eager binding, versioned symbols where the format supports them), import-library generation
-  from `.def`-like declarations. Generalises E13.7 (PE DLL) and E16.2 (ELF dynamic). Src 0563 0197
+  from `.def`-like declarations. Generalises E18.7 (Windows libraries) and E16.2 (ELF dynamic). Src 0563 0197
   0164 0217 tasks/0369 tasks/0453.
 - **E16.11 Universal / multi-architecture artifacts** — explicit multi-target artifact composition
   (Mach-O universal x64+arm64 first; bundle formats elsewhere), never implicit. Src tasks/0453 §194.29.
@@ -204,7 +204,7 @@ Artifact matrix (E16.10–E16.12; ✔ = must be produced *and* consumed with tes
 
 | Target | executable | static lib | dynamic lib | notes |
 |---|---|---|---|---|
-| x86_64-windows | PE32+ `.exe` (P4) | `.lib` (COFF archive) | `.dll` + import `.lib` (E13.7) | first target |
+| x86_64-windows | `.obj` (T026), `.exe` (T028) — core | `.lib` (E18.7) | `.dll` + import `.lib` (E18.7) | first target |
 | aarch64-windows | PE32+ ARM64 | `.lib` | `.dll` | E16.12 |
 | x86_64-linux | ELF (E16.9) | `.a` | `.so` (E16.2) | static first |
 | aarch64-linux | ELF | `.a` | `.so` | E16.3 |
@@ -232,6 +232,11 @@ Exit: step-through debugging in a standard debugger on Windows and Linux; saniti
 - **E18.4 Artifact format & module interface files** — Axiom object/LTO/semantic package sections.
   Src tasks/0787 tasks/0739.
 - **E18.5 Pass contracts & proof-carrying transformations** — Src tasks/0578 tasks/0545.
+- **E18.7 Windows x64 artifact kinds: static `.lib`, `.dll` + import `.lib`** — owner requirement
+  REQ-OWNER-006; first P18 tasks (P18 opens right after P10). COFF archive writer/reader, `--kind
+  exe|obj|lib|dll`, PE DLL with exports/DllMain initialiser/.reloc, import-library generation;
+  consume third-party .lib/.dll. The C core emits only .obj/.exe but reserves these kinds (SPEC-04).
+  Src 0164 0217 0563 0186 0187 tasks/0369. *(T750, T751)*
 - **E18.6 Separate compilation, multiple objects, archives, section GC** — Src 0164 0217 0099
   tasks/0369. *(T067)*
 Exit: no-op rebuild < 100 ms on the compiler itself; edit-one-private-fn rebuild re-typechecks only
@@ -313,6 +318,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-29 | E18.7 Windows x64 .lib/.dll + import lib right after self-hosting (T750, T751); E13.7 reduced to module-relative bindings; C core emits .obj/.exe only | REQ-OWNER-006 |
 | 2026-09-29 | Output/library coverage: E16.10 artifact kinds & library matrix, E16.11 universal binaries, E16.12 Windows ARM64, E12.5 CPU multiversioning, E20.7 Axiom dynamic components; artifact matrix table | owner review of specs |
 | 2026-09-29 | New epic E13.7 module-relative bindings + PE DLL output (REQ-OWNER-005) | ADR-0001 §5-6 |
 | 2026-09-29 | New epic E13.6 fixed-address declarations (owner requirement REQ-OWNER-003) | ADR-0001 |

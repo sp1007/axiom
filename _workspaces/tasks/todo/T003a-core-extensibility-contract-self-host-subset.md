@@ -32,6 +32,7 @@ redesign — "implement later ≠ design later" (0263 §42).
 - SPEC-00-bootstrap.md: add the **exact self-host subset** — the features axiom0 must support to
   compile axiomc — with the rule that anything outside it belongs to post-T087 epics. Justify each
   inclusion by the compiler's needs (tasks/0260 §3-4).
+- Artifact kinds as data: object model/driver/linker represent output kind (obj, exe, static lib, dynamic lib + import lib) and object/archive/image format independently; the core emits only obj/exe, E18.7 and E16.10 add writers without redesign (REQ-OWNER-006).
 - C-scope budget: rough size target per axiom0 module and the list of forbidden-in-C features.
 
 ## Acceptance
