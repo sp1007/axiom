@@ -117,6 +117,9 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
   parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331.
 - **E12.3 SIMD & vector types** — portable vector types, masks, lane ops, target feature detection.
   Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347.
+- **E12.5 CPU feature detection & function multiversioning** — explicit `@target_feature` /
+  multiversioned functions with a generated dispatcher; features never change language semantics.
+  Src tasks/0453 §194.14-15, 0095 §8, tasks/0341 (ASIMD-14).
 - **E12.4 SIMD backend** — SSE2/AVX2 (and NEON in P16) instruction selection/encoding for vector ops.
   Src tasks/0403 tasks/0407.
 Exit (phase): numeric conformance + differential interp/native for float and vector programs.
@@ -182,9 +185,33 @@ Exit: differential green at -O2; benchmark targets met and tracked in CI.
 - **E16.5 Android AArch64 (+JNI layer)** — Src 0198 0200.
 - **E16.6 WASM32** — Src tasks/0784.
 - **E16.7 RISC-V64** — Src 0152 §59 tasks/0784.
-- **E16.8 Cross-compilation & target matrix, OS platform layer** — Src tasks/0587 0220 tasks/0336.
-Exit: full run suite on each tier-1 target (Windows x64, Linux x64, Linux AArch64, macOS AArch64);
-WASM/RISC-V tier-2.
+- **E16.8 Cross-compilation & target matrix, OS platform layer** — any host builds for any target
+  from one frontend; target SDK/sysroot selection. Src tasks/0453 tasks/0587 0220 tasks/0336.
+- **E16.10 Artifact kinds & library matrix** — for every tier-1 target: executables, **static
+  libraries** (produce Axiom `.lib`/`.a`; consume C/system archives), **dynamic libraries** (produce
+  PE DLL + import `.lib` / ELF `.so` / Mach-O `.dylib`; consume system and third-party dynamic libs,
+  lazy/eager binding, versioned symbols where the format supports them), import-library generation
+  from `.def`-like declarations. Generalises E13.7 (PE DLL) and E16.2 (ELF dynamic). Src 0563 0197
+  0164 0217 tasks/0369 tasks/0453.
+- **E16.11 Universal / multi-architecture artifacts** — explicit multi-target artifact composition
+  (Mach-O universal x64+arm64 first; bundle formats elsewhere), never implicit. Src tasks/0453 §194.29.
+- **E16.12 Windows on ARM64** — PE/COFF ARM64, Windows ARM64 ABI, reuse of the AArch64 backend.
+  Src 0181 0193 tasks/0453.
+Exit: full run suite on each tier-1 target (Windows x64, Windows ARM64, Linux x64, Linux AArch64,
+macOS AArch64); WASM/RISC-V tier-2; the artifact matrix below is green.
+
+Artifact matrix (E16.10–E16.12; ✔ = must be produced *and* consumed with tests):
+
+| Target | executable | static lib | dynamic lib | notes |
+|---|---|---|---|---|
+| x86_64-windows | PE32+ `.exe` (P4) | `.lib` (COFF archive) | `.dll` + import `.lib` (E13.7) | first target |
+| aarch64-windows | PE32+ ARM64 | `.lib` | `.dll` | E16.12 |
+| x86_64-linux | ELF (E16.9) | `.a` | `.so` (E16.2) | static first |
+| aarch64-linux | ELF | `.a` | `.so` | E16.3 |
+| aarch64-macos | Mach-O | `.a` | `.dylib` | E16.4; universal with x86_64 (E16.11) |
+| aarch64-android | ELF PIE | `.a` | `.so` (JNI) | E16.5 |
+| wasm32 | `.wasm` module | object archive | — (component model later) | E16.6, tier-2 |
+| riscv64-linux | ELF | `.a` | `.so` | E16.7, tier-2 |
 
 ### P17 — Debugging & runtime introspection
 - **E17.1 Debug IR + CodeView/PDB (Windows)** — Src 0190 0191.
@@ -225,6 +252,10 @@ Exit: VS Code extension using the LSP; formatter idempotence over the whole corp
 - **E20.3 Registry & distribution** — Src tasks/0665.
 - **E20.4 Hermetic/reproducible builds & supply-chain trust** — Src tasks/0590 tasks/0449 tasks/0772.
 - **E20.5 ABI stability, versioning, binary compatibility** — Src 0104 tasks/0452.
+- **E20.7 Axiom dynamic components: plugins, hot-reload, versioned Axiom ABI** — Axiom-to-Axiom
+  dynamic libraries with a stable, versioned interface (not just C ABI), component discovery/loading,
+  hot-reload with state hand-off, ownership/capability rules preserved across the boundary.
+  Src tasks/0584 tasks/0583 0104 tasks/0739 tasks/0856.
 - **E20.6 SDK / sysroot / toolchain distribution** — Src tasks/0605 tasks/1034.
 Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 
@@ -282,6 +313,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-29 | Output/library coverage: E16.10 artifact kinds & library matrix, E16.11 universal binaries, E16.12 Windows ARM64, E12.5 CPU multiversioning, E20.7 Axiom dynamic components; artifact matrix table | owner review of specs |
 | 2026-09-29 | New epic E13.7 module-relative bindings + PE DLL output (REQ-OWNER-005) | ADR-0001 §5-6 |
 | 2026-09-29 | New epic E13.6 fixed-address declarations (owner requirement REQ-OWNER-003) | ADR-0001 |
 | 2026-09-29 | R7 minimal C: T058→E14.4, T061 trimmed to const items (rest E14.1), T063→E15.8, T064→E15.4, T066→E16.9, T067→E18.6, T068→E17.3; P15 opens right after P10; new T003a core extensibility contract + exact self-host subset | owner decision |
