@@ -20,7 +20,8 @@ resolve conflicts via ADRs, and publish the coverage matrix of corpus goals vs t
 ## Scope
 - Phase B of `.claude/skills/axiom-spec-index/references/requirements-extraction.md`.
 - `spec/requirements/CATALOG.md` in the exact format read by `reqcov.py`; `spec/COVERAGE.md` summary (area × tier counts, GAP list, DEFERRED list with reasons, conflict → ADR list).
-- ADRs for every cross-chunk conflict.
+- Copy every row of `spec/requirements/OWNER.md` into the catalogue unchanged (owner requirements override the corpus; conflicting corpus rows become DUPLICATE/REJECTED referencing them).
+- ADRs for every cross-chunk conflict (next free ADR number; ADR-0001 is taken).
 
 ## Acceptance
 - [ ] `python .claude/skills/axiom-tasks/scripts/reqcov.py` parses the catalogue with zero format problems (GAPs are allowed at this stage).

@@ -19,6 +19,7 @@ Implement the full lexical spec: tokens with spans, newline tokens where signifi
 ## Scope
 - Token kinds per SPEC-01; literal decoding (value + suffix) with overflow diagnostics; string escapes; nested comments; newline significance flag.
 - Targeted diagnostics + fix-its: AX_LEX_COLON_COLON, AX_LEX_COLON_EQ, unterminated string/comment, invalid escape, invalid digit for base, invalid UTF-8.
+- `@at` is an ordinary attribute token sequence for the lexer (no special casing).
 - Driver: `axiom0 inspect --emit=tokens file.ax` (stable text format documented in tests/lex/README.md).
 
 ## Acceptance

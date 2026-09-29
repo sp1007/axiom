@@ -12,6 +12,9 @@ consciously deferred (post-v1) or rejected by an ADR — nothing silently droppe
 | `docs/base/discussions/` | **Non-normative**: brainstorming only. Never extract requirements from it; read only as background when a normative text is unclear. |
 | Owner decisions (CLAUDE.md, axiom-syntax) | Override everything. |
 
+Owner requirements live in `spec/requirements/OWNER.md` (REQ-OWNER-*): they are copied into the
+catalogue unchanged and override conflicting corpus rows.
+
 ## Phase A — per-chunk extraction (one task per chunk, `spec/requirements/chunks/Cnn.txt`)
 
 Chunks are ~2 MB: far too much to read line by line. For each file:

@@ -24,7 +24,9 @@ redesign — "implement later ≠ design later" (0263 §42).
   variants and fields reserved for later epics (async state machines E11.4, atomics & orderings
   E11.2, SIMD/vector types E12.3, raw pointers/volatile/address spaces E13.x, generators E14.3,
   dyn/vtables E14.4, GPU execution domains/device memory E22.x, other targets E16.x, debug info
-  E17.x, query engine E18.1). Say how each is represented (reserved enum values, extension tables,
+  E17.x, query engine E18.1, **fixed-address declarations E13.6 / ADR-0001**: item placement
+  attribute (overlay | place, const address), `fixed` provenance on places, `Volatile`/`Mmio` volatile
+  MIR ops, absolute symbols and address-pinned sections in the object model). Say how each is represented (reserved enum values, extension tables,
   target hooks) and what axiom0 does on encountering it (clear "not supported in Stage-0" diagnostic,
   never a crash).
 - SPEC-00-bootstrap.md: add the **exact self-host subset** — the features axiom0 must support to

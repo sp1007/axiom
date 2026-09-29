@@ -103,6 +103,28 @@ backtracks and parses a comparison. Examples: `Vec<i32>.new()`, `size_of<T>()`,
 - Strings `"…"` (UTF-8, escapes `\n \t \\ \" \u{…}`), byte strings `b"…"`, chars `'a'` if enabled by
   the lexical spec.
 
+## Rule 4 — Fixed-address declarations (owner requirement, ADR-0001)
+
+Low-level code may bind statics and functions to absolute addresses and then use them normally:
+
+```axiom
+@at(0x4000_1000)
+unsafe static UART0: UartRegs          // overlay: object already exists there (no initializer)
+
+@at(0x0000_0000)
+unsafe static VECTORS: [48]fn() = [reset, nmi, hard_fault]   // placement: we emit it there
+
+@at(0xFFFF_0400)
+unsafe extern "C" fn rom_crc32(data: *const u8, len: usize) -> u32   // routine already in ROM
+
+UART0.ctrl = UartCtrl.ENABLE           // ordinary field access; Mmio<T> fields are volatile
+```
+
+No initializer / `extern fn` = overlay; initializer or body = placement. The address is a
+compile-time constant; the type needs a defined layout (`@repr(C)`/primitive). Freestanding/system
+profiles only. Semantics land in epic E13.6; Stage-0 parses `@at` and reports
+`AX_ADDR_UNSUPPORTED_STAGE0`.
+
 ## Canonical example
 
 ```axiom

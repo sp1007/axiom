@@ -20,6 +20,7 @@ Produce the canonical, implementable lexical specification and complete EBNF gra
 - SPEC-01-lexical.md: source encoding, whitespace/newline significance, comments (nested /* */, ///), identifiers (Unicode rules or ASCII-first decision), keywords (reserved vs contextual), literals (int bases, suffixes, underscores, floats, strings, escapes, byte strings, chars), operators/punctuation with maximal munch, `..`/`..=` vs float, `p.0.1` tuple index lexing, diagnostics for `::`, `:=`, `var`, `import` with fix-its. Each rule gets an ID AXS-LEX-NNN.
 - SPEC-02-grammar.md: complete ISO-EBNF (no `:=`/`::=` notation) for items, statements, expressions (precedence/associativity table; comparisons non-associative), types (`[N]T`, `view<T>`, `mut_view<T>`, `*const T`, fn types, tuples), patterns, generics + where, traits/impls, attributes `@x(...)`, closures, visibility, modules/use with groups and aliases. Newline statement-termination rules precisely (continuation tokens). Generic-argument commit rule in expressions. DottedChain: parser builds it, resolver disambiguates. Rule IDs AXS-GRM-NNN.
 - ADRs in spec/decisions/ for every contradiction resolved (at least: `::`→`.`, `:=`→`=`, `var`→`let mut`, `import`→`use`, array type `[N]T`, semicolons optional).
+- Grammar admits `@at(<const expr>)` on `static`, `static mut`, `fn` and `extern fn` items (ADR-0001, owner requirement REQ-OWNER-003); semantics are E13.6.
 - Example corpus: 20+ small canonical programs inside the spec exercising every construct (they become parser tests).
 
 ## Acceptance
