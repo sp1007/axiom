@@ -67,6 +67,11 @@ and every task lists the requirements it implements in `covers:`. Check with
 `python .claude/skills/axiom-tasks/scripts/reqcov.py` (`--gaps`, `--phase P6-ownership`, `--strict`).
 When you create or split a task, move the relevant `covers:` entries and update the catalog status.
 
+Roadmap frame: `spec/ROADMAP.md` fixes phases P0–P24, their epics and dependencies. Phases P11+ are
+expanded by their planning task T2NN (standard in ROADMAP §4) and closed by gate T3NN. Status
+`deferred` (T224, post-v1 ecosystem) is skipped by `next` and must not be unblocked by the autopilot —
+only on the owner's explicit request.
+
 Rules that keep the board healthy:
 - A task must be finishable by one agent in one sitting (roughly ≤ 1–2k lines of change). If an
   engineer finds it larger, they finish a coherent slice, and the architect splits the rest into new

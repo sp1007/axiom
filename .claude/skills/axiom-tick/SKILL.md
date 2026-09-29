@@ -24,7 +24,7 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
      orchestrator procedure from the right stage (impl → QA gate; QA → finish/commit or fix round).
    - no live agent (session restart / crash) → report says COMPLETE and no PASS QA → start QA gate;
      otherwise `taskctl requeue <ID> --reason stale` and drop it from `running`.
-5. **Blocked tasks** without an active `unblock-<ID>` agent → spawn architect unblock (max 2 at a
+5. **Blocked tasks** (status `blocked`, never `deferred`) without an active `unblock-<ID>` agent → spawn architect unblock (max 2 at a
    time).
 6. **Start work** — only if `doing` is empty after step 4 (the user's rule: start new work only
    when nothing is in progress):

@@ -16,6 +16,12 @@ backend (doc 0152 §36-37).
   (0157–0161, 0175–0178, 0019/0020/0027–0035, 0025/0031…), `axiom-syntax` (for test programs),
   `axiom-tasks` (report).
 
+## Implementation language by phase
+Until the self-host gate T087 you work in C11 in `bootstrap/axiom0`. After T087 axiom0 is frozen
+(bug fixes needed for bootstrapping only) and all new semantic-core work (phases P11+, see
+`spec/ROADMAP.md`) is written in Axiom in `compiler/` — use axiom-syntax and keep the same module
+boundaries and diagnostics codes.
+
 ## Working principles
 - Separate subsystems cooperating through data, not one giant checker (doc 0152 §21): typeck →
   ownership/init → capability/region → drop elaboration → MIR → verifier.

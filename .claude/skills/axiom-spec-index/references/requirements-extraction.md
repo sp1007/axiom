@@ -42,7 +42,7 @@ Write `spec/requirements/raw/Cnn.md` with one table (same six columns as the cat
   same requirement recurs — duplicates across docs are expected and are the main thing Phase B
   collapses.
 - **status**: best-guess existing board task id(s) that would implement it (read
-  `taskctl.py list`), or `GAP`.
+  `taskctl.py list`), else the roadmap epic `EPIC(E12.3)` from `spec/ROADMAP.md` §3, or `GAP`.
 
 Also record at the bottom `## Conflicts` — requirements in this chunk that contradict each other or
 the canonical `spec/` (with sources) — and `## Files skimmed` (count; any file you could not read).
@@ -69,11 +69,13 @@ covering five documents is better than five rows.
 
 ## Phase C — backlog expansion (T111)
 
-1. For every GAP: extend an existing task's scope (only if it stays one-sitting sized) or create new
-   tasks in the right phase with correct dependencies. v1-core gaps go into P1–P10; v1-full into
-   P11 (split into sub-phases P11a…); post-v1 into P12+ or `DEFERRED(<reason>)`.
+1. For every GAP, following `spec/ROADMAP.md`: v1-core → extend an existing P0–P10 task (only if it
+   stays one-sitting sized) or create a new task there; v1-full → `EPIC(E<phase>.<n>)` of the matching
+   roadmap epic (tasks come later from the phase planning task); post-v1 → `EPIC(E24.x)` or
+   `DEFERRED(<reason>)`. No epic fits → ADR + new epic in the roadmap.
 2. Add `covers: [REQ-…]` to every task's front-matter; set each catalog status to task ids.
-3. `taskctl.py validate` and `reqcov.py --strict` must both pass (zero GAP, zero problems).
+3. `taskctl.py validate` and `reqcov.py --strict` must both pass (zero GAP, zero problems;
+   `EPIC(...)` counts as planned).
 
 ## Ongoing (phase reviews)
 

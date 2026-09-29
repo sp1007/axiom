@@ -20,14 +20,14 @@ Each task is one markdown file `<ID>-<slug>.md` with a simple front-matter block
 
 Commands:
     status                     board summary (add --json for machine output)
-    list [todo|doing|done|blocked]
+    list [todo|doing|done|blocked|deferred]
     next [--max N]             ready tasks: deps done, not blocked, paths disjoint from doing
                                and from each other (safe to run in parallel)
     show ID                    print the task file
     start ID [--agent NAME]    todo -> doing
     finish ID                  doing -> done
     block ID --reason TEXT     doing|todo -> todo with status blocked
-    unblock ID                 blocked -> todo
+    unblock ID                 blocked|deferred -> todo (deferred only on the owner's request)
     requeue ID --reason TEXT   doing -> todo (e.g. stale after session restart), keeps attempts
     note ID TEXT               append a line to the task's "## Log" section
     validate                   check ids unique, deps exist, no cycles
@@ -153,7 +153,7 @@ def ready(tasks, maxn):
     cands = []
     for i, t in tasks.items():
         m = t["meta"]
-        if t["dir"] != "todo" or m.get("status") == "blocked":
+        if t["dir"] != "todo" or m.get("status") in ("blocked", "deferred"):
             continue
         if all(d in done for d in m.get("depends", [])):
             cands.append(t)
@@ -177,9 +177,10 @@ def ready(tasks, maxn):
 
 
 def cmd_status(tasks, as_json):
-    groups = {"todo": [], "blocked": [], "doing": [], "done": []}
+    groups = {"todo": [], "blocked": [], "deferred": [], "doing": [], "done": []}
     for i, t in sorted(tasks.items()):
-        key = "blocked" if t["meta"].get("status") == "blocked" else t["dir"]
+        st = t["meta"].get("status")
+        key = st if st in ("blocked", "deferred") and t["dir"] == "todo" else t["dir"]
         groups[key].append(i)
     nxt = [t["meta"]["id"] for t in ready(tasks, 4)]
     if as_json:
@@ -187,7 +188,7 @@ def cmd_status(tasks, as_json):
         return
     total = len(tasks)
     print(f"total {total} | done {len(groups['done'])} | doing {len(groups['doing'])} | "
-          f"todo {len(groups['todo'])} | blocked {len(groups['blocked'])}")
+          f"todo {len(groups['todo'])} | blocked {len(groups['blocked'])} | deferred {len(groups['deferred'])}")
     for k in ("doing", "blocked"):
         for i in groups[k]:
             m = tasks[i]["meta"]
@@ -298,7 +299,8 @@ def main(argv):
     elif cmd == "list":
         which = rest[0] if rest else None
         for i, t in sorted(tasks.items()):
-            key = "blocked" if t["meta"].get("status") == "blocked" else t["dir"]
+            st = t["meta"].get("status")
+            key = st if st in ("blocked", "deferred") and t["dir"] == "todo" else t["dir"]
             if which in (None, key):
                 m = t["meta"]
                 print(f"{i:6} {key:8} {m.get('owner', ''):18} {m.get('title', '')}  deps={','.join(m.get('depends', []))}")
@@ -312,7 +314,7 @@ def main(argv):
     elif cmd == "start":
         t = get(tasks, rest[0])
         agent = opt("--agent", "")
-        if t["dir"] != "todo" or t["meta"].get("status") == "blocked":
+        if t["dir"] != "todo" or t["meta"].get("status") in ("blocked", "deferred"):
             raise SystemExit(f"{t['meta']['id']} is not a startable todo task")
         t["meta"]["status"] = "doing"
         t["meta"]["attempts"] = str(int(t["meta"].get("attempts", 0)) + 1)

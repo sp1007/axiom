@@ -8,8 +8,8 @@ depends: [T110]
 priority: 9
 status: todo
 attempts: 0
-paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md]
-spec: [spec/requirements/CATALOG.md, spec/COVERAGE.md]
+paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md, spec/ROADMAP.md]
+spec: [spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/ROADMAP.md]
 ---
 # T111 — Backlog expansion
 
@@ -19,9 +19,10 @@ by a task, merged, deferred (post-v1 only) or rejected by ADR; every task declar
 
 ## Scope
 - Phase C of the extraction procedure.
-- New tasks for gaps in the right phases (v1-core → P1–P10, v1-full → P11a…P11n sub-phases, post-v1 → P12+ or DEFERRED), one-sitting sized, correct dependencies and owners, acceptance as tests.
+- Follow `spec/ROADMAP.md` (binding frame). v1-core gaps → new/extended tasks in P0–P10 (one-sitting sized, correct deps/owners, acceptance as tests). Requirements belonging to P11–P23 → status `EPIC(E<phase>.<n>)` of the matching roadmap epic (the phase planning task T2NN turns them into tasks later). post-v1 ecosystem → `EPIC(E24.x)` or `DEFERRED(<reason>)`.
+- A requirement that fits no existing epic → ADR + new epic in ROADMAP §3 (with change-log entry); never an ad-hoc task.
 - Extend scope of existing todo tasks only where they stay one-sitting sized; never rewrite tasks already in doing/ or done/ — add follow-up tasks instead.
-- Update SPEC-00 milestone ladder if phases change.
+- Update SPEC-00 milestone ladder if P0–P10 phases change.
 
 ## Acceptance
 - [ ] `taskctl.py validate` OK.

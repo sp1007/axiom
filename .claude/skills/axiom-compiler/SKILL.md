@@ -115,6 +115,13 @@ Unblocking never waits for the human.
 | Git commit fails (hook, conflict) | do not bypass hooks; log, fix the cause, retry; never `--no-verify` |
 | All remaining tasks blocked | run architect unblock for each; if architect cannot unblock, log and keep ticking |
 
+## Roadmap frame
+
+`spec/ROADMAP.md` is binding. Planning tasks (T2NN, owner architect, priority 6 → run alone) expand a
+phase's roadmap epics into tasks; gate tasks (T3NN, owner qa) close phases. Never create tasks outside
+the roadmap: if work appears that no epic covers, hand it to the architect for an ADR + new epic.
+`deferred` tasks are ignored until the owner schedules them.
+
 ## Phase gates (milestones)
 
 When the last task of a phase lands (see `phase:` in task files), spawn axiom-architect for a

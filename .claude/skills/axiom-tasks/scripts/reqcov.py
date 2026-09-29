@@ -7,6 +7,8 @@ Sources of truth
       columns: id | area | tier | statement | sources | status
       tier   : v1-core (needed for self-hosting) | v1-full (needed for Axiom v1.0) | post-v1
       status : one or more task ids "T046, T051"   → planned/implemented by those tasks
+               EPIC(E15.3)                          → planned in a roadmap epic (spec/ROADMAP.md),
+                                                      converted to task ids by the phase planning task
                DEFERRED(<reason>)                   → consciously postponed (post-v1 only)
                REJECTED(ADR-NNNN)                   → dropped by an architecture decision
                DUPLICATE(REQ-...)                   → merged into another requirement
@@ -86,6 +88,13 @@ def main(argv):
         if st == "GAP" or not st:
             kind = "gap"
             gaps.append(rid)
+        elif st.startswith("EPIC("):
+            kind = "epic"
+            ep = re.search(r"E\d+\.\d+", st)
+            rm_path = os.path.join(ROOT, "spec", "ROADMAP.md")
+            roadmap = open(rm_path, encoding="utf-8").read() if os.path.exists(rm_path) else ""
+            if not ep or f"**{ep.group(0)} " not in roadmap:
+                problems.append(f"{rid}: EPIC status names an epic not in spec/ROADMAP.md")
         elif st.startswith("DEFERRED"):
             kind = "deferred"
             if r["tier"] != "post-v1":
@@ -98,7 +107,7 @@ def main(argv):
             if not target or target.group(0) not in reqs:
                 problems.append(f"{rid}: DUPLICATE of unknown requirement")
         else:
-            ids = re.findall(r"T\d{3}[a-z]?", st)
+            ids = re.findall(r"T\d{3,4}[a-z]?", st)
             if not ids:
                 problems.append(f"{rid}: unparseable status '{st}'")
             for tid in ids:
@@ -114,7 +123,7 @@ def main(argv):
     if "--phase" in argv:
         ph = argv[argv.index("--phase") + 1]
         for rid, r in sorted(reqs.items()):
-            ids = re.findall(r"T\d{3}[a-z]?", r.get("status", ""))
+            ids = re.findall(r"T\d{3,4}[a-z]?", r.get("status", ""))
             hit = [i for i in ids if i in tasks and tasks[i]["meta"].get("phase") == ph]
             if hit:
                 state = ",".join(f"{i}:{tasks[i]['dir']}" for i in ids if i in tasks)

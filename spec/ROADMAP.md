@@ -1,0 +1,254 @@
+# Axiom implementation roadmap (P0 → v1.0 → ecosystem)
+
+Status: **baseline, binding**. Owner: axiom-architect. Changing a phase, an epic's scope or the phase
+dependency graph requires an ADR (`spec/decisions/`) and an entry in the change log at the bottom.
+Task-level detail lives on the board (`_workspaces/tasks/`); this file fixes the *shape* of the whole
+project so tasks created at different times stay consistent.
+
+Normative sources: `docs/base/specs`, `docs/base/tasks`, `docs/base/others` (concluded, lightly
+reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs/base file numbers.
+
+## 1. Roadmap decisions
+
+- **R1 — Spec goes wide, implementation goes vertical** (0263 §52, 0152 §81). Every feature crosses
+  the whole pipeline with tests before the next starts.
+- **R2 — Core first, then self-host, then breadth.** P0–P10 build the Stage-0 compiler `axiom0` (C11)
+  far enough to compile its own Axiom rewrite `axiomc`, reaching a fixed point (T087). This follows
+  the later ladder (0263 §51, tasks/0260, tasks/0262) rather than the earlier order in 0152 §80, which
+  put async/concurrency/GPU before self-hosting: doing that would implement every such feature twice
+  (in C, then again in Axiom).
+- **R3 — axiom0 freezes at the self-host gate.** After T087, `bootstrap/axiom0` receives only bug
+  fixes needed to rebuild `axiomc` from scratch (bootstrap trust chain). All phases P11+ are
+  implemented in `compiler/` (Axiom source) and `std/`, built by `axiomc`. Engineers keep their
+  areas (frontend/semantics/backend/stdlib); only the implementation language changes.
+- **R4 — Rolling-wave planning with a fixed frame.** Phases P0–P10 are fully tasked now. Each phase
+  P11+ has a fixed **planning task** (T2NN) and **gate task** (T3NN) already on the board. The planning
+  task expands only the epics listed here into tasks, following §4. New scope discovered later becomes a
+  new epic through an ADR — never ad-hoc tasks.
+- **R5 — Every requirement is traced.** `spec/requirements/CATALOG.md` maps each requirement to a task
+  or to an epic here (`EPIC(E15.3)`); the phase planning task converts its epics' requirements to task
+  ids. `reqcov.py --strict` must pass at every gate.
+- **R6 — Targets:** Windows x64 PE first, Linux x64 ELF second (0181); other targets in P16 through the
+  shared target-independent LIR / target description (0152 §68, 0163).
+
+## 2. Phase map
+
+```
+P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (oracle)
+  → P4 first native exe → P5 language core → P6 ownership/capability/drop
+  → P7 abstraction (methods, generics, traits, closures, dyn, modules, comptime)
+  → P8 backend maturity (regalloc, opt ladder 2, FFI, Linux ELF, linker v2, unwind)
+  → P9 core+std libraries → P10 self-hosting fixed point (axiom0 frozen)
+        ├─ P11 concurrency & async ───────────────┐
+        ├─ P12 numeric, float, SIMD ── P15 optimizer 2.0
+        ├─ P13 low-level, unsafe, freestanding, security ── P16 targets ── P17 debugging
+        ├─ P14 comptime 2.0, reflection, generators
+        └─ P18 compiler architecture 2.0 ── P19 developer tooling
+                                           └─ P20 build & packages (also needs P16)
+  P21 std completion (needs P11, P13)   P22 GPU & heterogeneous (needs P11, P12, P16)
+  P23 v1.0 conformance, freeze, release (needs P11–P22)
+  P24 ecosystem runtimes (post-v1, deferred until the owner decides)
+```
+
+| Phase | Tasks now | Planning task | Gate task | Depends on gates |
+|---|---|---|---|---|
+| P0 foundation / traceability | T001–T006, T092–T111 | — | T111 | — |
+| P1 kernel | T007–T009 | — | (T022) | P0 |
+| P2 frontend | T010–T016 | — | (T022) | P1 |
+| P3 semantic core | T017–T022 | — | T022 | P2 |
+| P4 native | T023–T029 | — | T029 | P3 |
+| P5 language core | T030–T044 | — | T044 | P4 |
+| P6 ownership | T045–T052 | — | T052 | P5 |
+| P7 abstraction | T053–T062 | — | T062 | P6 |
+| P8 backend maturity | T063–T068 | — | (T075) | P7 |
+| P9 libraries | T069–T075 | — | T075 | P7, P8 |
+| P10 self-hosting | T076–T087 | — | T087 | P9 |
+| P11 concurrency & async | T088–T090 | T211 | T311 | P10 |
+| P12 numeric & SIMD | — | T212 | T312 | P10 |
+| P13 low-level & security | — | T213 | T313 | P10 |
+| P14 comptime 2.0 & generators | — | T214 | T314 | P10 |
+| P15 optimizer 2.0 | — | T215 | T315 | P12 |
+| P16 targets & platforms | — | T216 | T316 | P13 |
+| P17 debugging & introspection | — | T217 | T317 | P16 |
+| P18 compiler architecture 2.0 | — | T218 | T318 | P10 |
+| P19 developer tooling | — | T219 | T319 | P18 |
+| P20 build & packages | — | T220 | T320 | P16, P18 |
+| P21 std completion | — | T221 | T321 | P11, P13 |
+| P22 GPU & heterogeneous | — | T222 | T322 | P11, P12, P16 |
+| P23 v1.0 release | T091 | T223 | T323 | P11–P22 |
+| P24 ecosystem (post-v1) | — | T224 (deferred) | — | P23 + owner decision |
+
+## 3. Epics per phase (P11+)
+
+Each epic: scope, key sources, exit criterion. Sources are starting points — the planning task also
+pulls every catalogue requirement marked `EPIC(<id>)`.
+
+### P11 — Concurrency & async (compiler/ + std/)
+- **E11.1 Concurrency semantics** — Send/Share auto-traits, spawn capture rules, data-race = compile
+  error, memory model. Src 0079 0091 0105 0033 0040 tasks/0298 tasks/0488 tasks/0685. Exit: race
+  conformance suite green. *(T089)*
+- **E11.2 Atomics & memory ordering** — Atomic<T>, orderings, fences, lowering to x64/other targets,
+  oracle scheduler exploration. Src 0092 0208 tasks/0328 tasks/0515. Exit: litmus tests pass under
+  oracle and native stress.
+- **E11.3 Threads & synchronisation library** — thread spawn/join, Mutex, RwLock, Condvar, Once,
+  channels, thread-local storage. Src 0203 0206 0207 0209 tasks/0329 tasks/0623. Exit: native stress
+  suite. *(T090)*
+- **E11.4 Async/await** — Future lang item, state-machine lowering, cancellation & drop, Waker.
+  Src 0093 0201 0202 0248 tasks/0275 tasks/0297. Exit: async conformance. *(T088)*
+- **E11.5 Executors, fibers & structured concurrency** — single/multi-thread executor, task groups,
+  fiber/stackful model, scheduler. Src 0204 0205 tasks/0277 tasks/0278 tasks/0620. Exit: executor
+  benchmarks + structured-cancellation tests.
+- **E11.6 Async IO integration** — IOCP (Windows), epoll/io_uring (Linux) reactor, unified IO model.
+  Src 0221 tasks/0335. Exit: async file/socket tests.
+
+### P12 — Numeric, floating point & SIMD
+- **E12.1 Integer model completion** — all widths incl. i128/u128 if specified, wrapping/checked/
+  saturating families, bit ops, conversions. Src tasks/0327 tasks/0334 tasks/0431.
+- **E12.2 Floating-point semantics** — IEEE-754 rules, NaN/signed zero, rounding, float formatting/
+  parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331.
+- **E12.3 SIMD & vector types** — portable vector types, masks, lane ops, target feature detection.
+  Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347.
+- **E12.4 SIMD backend** — SSE2/AVX2 (and NEON in P16) instruction selection/encoding for vector ops.
+  Src tasks/0403 tasks/0407.
+Exit (phase): numeric conformance + differential interp/native for float and vector programs.
+
+### P13 — Low-level systems, unsafe, freestanding, security
+- **E13.1 Unsafe & UB model** — unsafe blocks/fns, raw pointer rules, provenance, trusted-unsafe
+  boundaries. Src 0071 0044 tasks/0339 tasks/0282.
+- **E13.2 Raw memory, volatile, MMIO, layout control** — volatile, packed/aligned repr, unions (0072),
+  address spaces. Src tasks/0328 tasks/0515 0067 0072.
+- **E13.3 Runtime composition & freestanding profile** — hosted vs freestanding, `@entry`, optional
+  runtime, startup/static init/global state, runtime capability graph. Src 0143 0097 tasks/0358
+  tasks/0359 tasks/0370 tasks/0455.
+- **E13.4 Safety profiles & capability security** — profiles, sandboxing hooks, secure memory,
+  constant-time annotations. Src tasks/0342 tasks/0449 tasks/0467 tasks/0703.
+- **E13.5 Panic & unwinding strategy** — panic=abort vs unwind decision per profile, cleanup
+  guarantees across unwinding. Src 0229 tasks/0351 tasks/0700.
+Exit: freestanding program boots without std; UB/safety conformance suite.
+
+### P14 — Comptime 2.0, reflection, metaprogramming, generators
+- **E14.1 Comptime completion** — full comptime execution model, partial evaluation, specialization.
+  Src 0102 0140 tasks/0340 tasks/0346 tasks/0509.
+- **E14.2 Reflection & derive** — compile-time reflection API, derive framework, code generation
+  boundary (no textual macros unless specified). Src tasks/0343 tasks/0296 tasks/0433.
+- **E14.3 Generators & `yield`** — iterator state machines, lazy control flow. Src tasks/0512.
+Exit: derive(Debug/Eq/Hash/Serialize-style) implemented via reflection in std; generator tests.
+
+### P15 — Optimizer 2.0
+- **E15.1 OptIR: SSA / MemorySSA** — Src tasks/0398 0315 tasks/0366.
+- **E15.2 Alias & escape analysis, allocation promotion** — Src tasks/0395 tasks/0397.
+- **E15.3 Loops & bounds-check elimination** — SCEV, LICM, unrolling, BCE. Src tasks/0402.
+- **E15.4 Inlining, specialization, devirtualization** — Src tasks/0401 tasks/0551.
+- **E15.5 Auto-vectorization** — Src tasks/0403 tasks/0407 0095.
+- **E15.6 LTO / whole-program / section GC / PGO** — Src tasks/0355 tasks/0408 tasks/0409 tasks/0410.
+- **E15.7 Performance contract** — benchmark suite, code-size & compile-time budgets, regression CI.
+  Src tasks/0706 0074.
+Exit: differential green at -O2; benchmark targets met and tracked in CI.
+
+### P16 — Targets & platforms
+- **E16.1 Target description as data** — TargetDesc/ISA tables, backend conformance. Src 0163
+  tasks/0524 tasks/0784.
+- **E16.2 Linux ELF dynamic** — PIE, GOT/PLT, shared objects, libc interop. Src 0197.
+- **E16.3 AArch64 Linux** — Src 0193 tasks/0521.
+- **E16.4 macOS AArch64 + Mach-O** — Src 0196.
+- **E16.5 Android AArch64 (+JNI layer)** — Src 0198 0200.
+- **E16.6 WASM32** — Src tasks/0784.
+- **E16.7 RISC-V64** — Src 0152 §59 tasks/0784.
+- **E16.8 Cross-compilation & target matrix, OS platform layer** — Src tasks/0587 0220 tasks/0336.
+Exit: full run suite on each tier-1 target (Windows x64, Linux x64, Linux AArch64, macOS AArch64);
+WASM/RISC-V tier-2.
+
+### P17 — Debugging & runtime introspection
+- **E17.1 Debug IR + CodeView/PDB (Windows)** — Src 0190 0191.
+- **E17.2 DWARF (ELF/Mach-O)** — Src tasks/0596.
+- **E17.3 Unwinding & backtraces on all targets** — Src 0188 tasks/0700.
+- **E17.4 Debugger contract & symbolication** — Src 0100 0147 tasks/0811.
+- **E17.5 Profiler & performance introspection** — Src tasks/0572 tasks/0730.
+- **E17.6 Sanitizers & runtime verification** — Src tasks/0599 tasks/0733.
+- **E17.7 Trace & replay** — Src tasks/1058 (AXREPLAY) 0147.
+Exit: step-through debugging in a standard debugger on Windows and Linux; sanitizer suite.
+
+### P18 — Compiler architecture 2.0
+- **E18.1 Query engine / semantic database** — demand-driven queries, cycle handling, invalidation.
+  Src tasks/0530 tasks/0533 tasks/0781 tasks/0384.
+- **E18.2 Incremental compilation** — API/semantic/codegen fingerprints (0152 §78). Src 0142
+  tasks/0778.
+- **E18.3 Parallel compilation** — Src tasks/0530 tasks/0790.
+- **E18.4 Artifact format & module interface files** — Axiom object/LTO/semantic package sections.
+  Src tasks/0787 tasks/0739.
+- **E18.5 Pass contracts & proof-carrying transformations** — Src tasks/0578 tasks/0545.
+Exit: no-op rebuild < 100 ms on the compiler itself; edit-one-private-fn rebuild re-typechecks only
+that module.
+
+### P19 — Developer tooling
+- **E19.1 LSP server** — diagnostics, go-to-definition, hover, completion, rename. Src 0101 tasks/0374.
+- **E19.2 Formatter (canonical form)** — Src tasks/0476 (canonical language form).
+- **E19.3 Refactoring engine** — Src 0101.
+- **E19.4 Diagnostics UX 2.0 & AI-agent interface** — machine-readable fixes, explain codes. Src 0146
+  tasks/0360 tasks/0421.
+- **E19.5 Documentation generator & test framework UX** — Src tasks/0418 tasks/0361.
+Exit: VS Code extension using the LSP; formatter idempotence over the whole corpus.
+
+### P20 — Build system & package ecosystem
+- **E20.1 Build graph & driver** — Src 0168 tasks/0356 tasks/0372 tasks/0411.
+- **E20.2 Package manager, resolution, lockfiles** — Src 0098 tasks/0412 tasks/0446.
+- **E20.3 Registry & distribution** — Src tasks/0665.
+- **E20.4 Hermetic/reproducible builds & supply-chain trust** — Src tasks/0590 tasks/0449 tasks/0772.
+- **E20.5 ABI stability, versioning, binary compatibility** — Src 0104 tasks/0452.
+- **E20.6 SDK / sysroot / toolchain distribution** — Src tasks/0605 tasks/1034.
+Exit: multi-package workspace builds reproducibly from lockfile on two machines.
+
+### P21 — Standard library completion
+- **E21.1 Collections breadth & data-oriented storage** — deque, B-tree map, SoA helpers, handles/
+  generational storage. Src 0210 tasks/0348 tasks/0349 tasks/0608.
+- **E21.2 Text & Unicode complete** — normalization, segmentation, case mapping. Src tasks/0332 0089.
+- **E21.3 OS: fs, process, env, signals, IPC** — Src tasks/0335 tasks/0443.
+- **E21.4 Networking** — sockets, DNS, async integration. Src tasks/0461 tasks/0335.
+- **E21.5 Time & clocks** — Src tasks/0440 tasks/0464.
+- **E21.6 Virtual memory & memory mapping** — Src tasks/0437.
+- **E21.7 Serialization & binary data model** — Src tasks/0650 tasks/0742 tasks/0841.
+- **E21.8 Crypto primitives & secure memory** — hashes, RNG, constant-time utilities. Src tasks/0467.
+- **E21.9 Allocators: arena, pool, custom allocators** — Src 0106 0036 tasks/0280.
+Exit: std API reference complete; std conformance suite on all tier-1 targets.
+
+### P22 — GPU & heterogeneous computing
+- **E22.1 Execution domains & kernel model** — Src 0096 0139 0120 tasks/0299.
+- **E22.2 Device memory & ownership across devices** — Src 0120 tasks/0626.
+- **E22.3 GPU codegen backend (SPIR-V first unless ADR decides otherwise)** — Src tasks/0626.
+- **E22.4 Host runtime (Vulkan/D3D12 compute)** — Src tasks/0626.
+Exit: kernel conformance examples run on a GPU with oracle-checked results.
+
+### P23 — v1.0 conformance, freeze, release
+- **E23.1 Full conformance suite & compiler qualification** — Src 0017 0145 0150 tasks/0602.
+- **E23.2 Global contradiction audit & spec freeze** — Src 0151 0121. *(T091)*
+- **E23.3 Release engineering** — binaries, installer, docs site, versioning policy.
+Exit: Axiom v1.0 tagged; `reqcov.py --strict` shows every v1-core and v1-full requirement implemented.
+
+### P24 — Ecosystem runtimes (post-v1, deferred)
+Application-domain libraries from the corpus (AI serving/agents, GUI/windowing, audio/media,
+graphics, scientific/ML, databases/storage engines, distributed systems, finance/transport/… domain
+runtimes). Catalogued as `post-v1` requirements; planning task T224 is created **deferred** and only
+starts when the project owner explicitly schedules it.
+
+## 4. How a planning task expands a phase (standard, so all phases look alike)
+
+1. Read this file's section for the phase, the catalogue rows with `EPIC(E<phase>.*)`, the phase's
+   sources, and the gate reports of the phases it depends on.
+2. For each epic create **3–10 tasks**, each finishable by one agent in one sitting (≤ ~1–2k changed
+   lines), owner = area owner (frontend/semantics/backend/stdlib/qa/architect), `paths` narrow,
+   `spec:` refs, `covers:` requirement ids, acceptance expressed as tests (positive + negative), plus
+   the standard DoD lines. Start each epic with a spec task (architect) when the canonical `spec/`
+   lacks that area — never implement from raw docs alone.
+3. IDs: next free numbers from `T400` upward in phase blocks of 50 (`T400–T449` P11, `T450–T499`
+   P12, … `T1050–T1099` P24). Titles: `<Epic id> <short title>` (e.g. `E11.2 Atomic<T> lowering x64`).
+4. Make the phase gate task T3NN depend on every task of the phase; add a QA conformance task per
+   epic that has an exit criterion.
+5. Update catalogue statuses `EPIC(...)` → task ids; run `taskctl.py validate` and
+   `reqcov.py --strict`; record the expansion in the change log below.
+6. Scope not covered by any epic → ADR proposing a new epic (added here), not a stray task.
+
+## 5. Change log
+
+| Date | Change | ADR |
+|---|---|---|
+| 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |

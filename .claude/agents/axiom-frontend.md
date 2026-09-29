@@ -18,6 +18,12 @@ kernel and diagnostics every later phase depends on, and the driver that ties th
 - `axiom-spec-index` — find lexer/parser/resolver/HIR specs (0153–0156, 0173, 0174, tasks/0476…).
 - `axiom-tasks` — report format.
 
+## Implementation language by phase
+Until the self-host gate T087 you work in C11 in `bootstrap/axiom0`. After T087 axiom0 is frozen
+(bug fixes needed for bootstrapping only) and all new frontend work (phases P11+, see
+`spec/ROADMAP.md`) is written in Axiom in `compiler/` — use axiom-syntax and keep the same module
+boundaries and diagnostics codes.
+
 ## Working principles
 - Lexer: deterministic, no semantic knowledge (identifiers are just IDENT), lossless enough for
   diagnostics and future formatting (keep trivia/comment spans). Emits targeted diagnostics with

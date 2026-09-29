@@ -1,10 +1,10 @@
 ---
 id: T090
-title: std.thread, Mutex, channel, Atomic<T> on Windows
-phase: P11-v1
+title: E11.3 std.thread, Mutex, channel, Atomic<T> on Windows
+phase: P11-concurrency-async
 owner: axiom-stdlib
 reviewer: axiom-qa
-depends: [T089]
+depends: [T211, T089]
 priority: 132
 status: todo
 attempts: 0
@@ -28,5 +28,7 @@ Native threading library.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Roadmap epic E11.3. Implemented in `compiler/` (Axiom) / `std/` — axiom0 is frozen after T087 (ROADMAP R3).
+- The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

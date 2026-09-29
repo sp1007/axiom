@@ -1,10 +1,10 @@
 ---
 id: T091
-title: v1.0 conformance audit & release certification
-phase: P11-v1
+title: E23.2 v1.0 conformance audit & release certification
+phase: P23-v1-0-conformance-freeze-release
 owner: axiom-architect
 reviewer: axiom-qa
-depends: [T087, T088, T090]
+depends: [T223]
 priority: 140
 status: todo
 attempts: 0
@@ -28,5 +28,7 @@ Audit spec vs implementation and certify Axiom v1.0 bootstrap.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Roadmap epic E23.2. Implemented in `compiler/` (Axiom) / `std/` — axiom0 is frozen after T087 (ROADMAP R3).
+- The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

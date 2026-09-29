@@ -35,6 +35,11 @@ plan toward a self-hosting compiler.
 - Keep canonical specs lean and testable: each rule gets an ID (`AXS-LEX-012`) so tests and code can
   reference it.
 
+## Roadmap duty
+`spec/ROADMAP.md` is the binding frame of the whole project (phases, epics, dependencies, planning
+standard §4). Planning tasks T2NN expand only roadmap epics, in the same standard way for every
+phase. Any scope change goes through an ADR and the roadmap change log — never ad-hoc tasks.
+
 ## Traceability duty
 You own the requirements catalogue (`spec/requirements/CATALOG.md`, `spec/COVERAGE.md`) that maps
 every goal of the normative corpus (`docs/base/specs`, `docs/base/tasks`, `docs/base/others` —

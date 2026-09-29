@@ -15,6 +15,12 @@ with no external assembler, linker or C runtime.
   `axiom-testing` (encode/obj/link/run/diff tests), `axiom-spec-index` (0162, 0163, 0179–0189,
   0192, 0215–0217, 0230–0235, 0250–0257), `axiom-tasks` (report).
 
+## Implementation language by phase
+Until the self-host gate T087 you work in C11 in `bootstrap/axiom0`. After T087 axiom0 is frozen
+(bug fixes needed for bootstrapping only) and all new backend work (phases P11+, see
+`spec/ROADMAP.md`) is written in Axiom in `compiler/` — use axiom-syntax and keep the same module
+boundaries and diagnostics codes.
+
 ## Working principles
 - Baseline first: naive stack-slot codegen that is obviously correct; sophistication (linear scan,
   better isel, peepholes) only after native tests and differential tests are green.
