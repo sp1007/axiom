@@ -1,14 +1,14 @@
 ---
 id: T068
-title: Windows unwind info (.pdata/.xdata) and panic backtrace basics
-phase: P8-backend
+title: E17.3 Windows unwind info (.pdata/.xdata) and panic backtrace basics
+phase: P17-debugging-runtime-introspecti
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T063]
+depends: [T217]
 priority: 95
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/target/x64/unwind, bootstrap/axiom0/src/link/pe, tests/run/unwind]
+paths: [compiler/target/x64/unwind, compiler/link/pe, tests/run/unwind]
 spec: [0188, 0190]
 ---
 # T068 — Windows unwind info (.pdata/.xdata) and panic backtrace basics
@@ -28,5 +28,7 @@ Make generated code debugger/unwinder friendly on Windows.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Roadmap epic E17.3 (moved out of the C core by ROADMAP R7: not needed for self-hosting). Implemented in `compiler/` (Axiom) after T087; the phase planning task may split it, keeping this id for the first slice.
+- 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

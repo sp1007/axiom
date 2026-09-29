@@ -1,14 +1,14 @@
 ---
 id: T066
-title: Linux x86-64: SysV ABI, ELF64 writer, static ELF linker
-phase: P8-backend
+title: E16.9 Linux x86-64: SysV ABI, ELF64 writer, static ELF linker
+phase: P16-targets-platforms
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T063]
+depends: [T216]
 priority: 93
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/abi/sysv, bootstrap/axiom0/src/obj/elf, bootstrap/axiom0/src/link/elf, tests/run/linux]
+paths: [compiler/abi/sysv, compiler/obj/elf, compiler/link/elf, tests/run/linux]
 spec: [0192, 0053, 0255, 0256]
 ---
 # T066 — Linux x86-64: SysV ABI, ELF64 writer, static ELF linker
@@ -28,5 +28,7 @@ Second target: static Linux executables testable through WSL.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Roadmap epic E16.9 (moved out of the C core by ROADMAP R7: not needed for self-hosting). Implemented in `compiler/` (Axiom) after T087; the phase planning task may split it, keeping this id for the first slice.
+- 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

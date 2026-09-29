@@ -4,12 +4,12 @@ title: LIR + naive MIR→LIR lowering
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T021]
+depends: [T021, T003a]
 priority: 40
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, tests/lir]
-spec: [0162, 0179, 0215, 0232, 0049]
+spec: [0162, 0179, 0215, 0232, 0049, spec/SPEC-04-core-extensibility.md]
 ---
 # T023 — LIR + naive MIR→LIR lowering
 

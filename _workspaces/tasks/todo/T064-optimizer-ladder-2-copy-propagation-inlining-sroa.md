@@ -1,14 +1,14 @@
 ---
 id: T064
-title: Optimizer ladder 2: copy propagation, inlining, SROA
-phase: P8-backend
+title: E15.4 Optimizer ladder 2: copy propagation, inlining, SROA
+phase: P15-optimizer-2-0
 owner: axiom-semantics
 reviewer: axiom-qa
-depends: [T062]
+depends: [T215]
 priority: 91
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/opt, tests/opt2]
+paths: [compiler/opt, tests/opt2]
 spec: [0165, 0226, tasks/0401, tasks/0399]
 ---
 # T064 — Optimizer ladder 2: copy propagation, inlining, SROA
@@ -28,5 +28,7 @@ Meaningful MIR optimizations with legality from ownership facts.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Roadmap epic E15.4 (moved out of the C core by ROADMAP R7: not needed for self-hosting). Implemented in `compiler/` (Axiom) after T087; the phase planning task may split it, keeping this id for the first slice.
+- 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

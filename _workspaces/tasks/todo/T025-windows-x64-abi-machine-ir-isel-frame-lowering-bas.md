@@ -4,12 +4,12 @@ title: Windows x64 ABI + machine IR + isel + frame lowering (baseline)
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
-depends: [T023, T024]
+depends: [T023, T024, T003a]
 priority: 42
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/abi, bootstrap/axiom0/src/target/x64/mir, bootstrap/axiom0/src/target/x64/isel, bootstrap/axiom0/src/target/x64/frame, tests/mc]
-spec: [0181, 0189, 0180, 0183, 0251, 0253, 0230, 0231]
+spec: [0181, 0189, 0180, 0183, 0251, 0253, 0230, 0231, spec/SPEC-04-core-extensibility.md]
 ---
 # T025 — Windows x64 ABI + machine IR + isel + frame lowering (baseline)
 

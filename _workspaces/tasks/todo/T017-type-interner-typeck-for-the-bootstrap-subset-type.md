@@ -4,12 +4,12 @@ title: Type interner + typeck for the bootstrap subset (typed HIR)
 phase: P3-semantic-core
 owner: axiom-semantics
 reviewer: axiom-qa
-depends: [T015, T003]
+depends: [T015, T003, T003a]
 priority: 30
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck]
-spec: [0157, 0175, 0245, tasks/0388, tasks/0482, spec/SPEC-03-core-semantics.md]
+spec: [0157, 0175, 0245, tasks/0388, tasks/0482, spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md]
 ---
 # T017 — Type interner + typeck for the bootstrap subset (typed HIR)
 

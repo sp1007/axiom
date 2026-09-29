@@ -1,6 +1,6 @@
 ---
 id: T061
-title: Comptime: const items, const fn via the MIR interpreter
+title: Const items and constant expressions (via the MIR interpreter)
 phase: P7-abstraction
 owner: axiom-semantics
 reviewer: axiom-qa
@@ -11,13 +11,13 @@ attempts: 0
 paths: [bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/const, tests/run/comptime, tests/ui/comptime]
 spec: [0102, 0140, 0274, tasks/0509, tasks/0346]
 ---
-# T061 — Comptime: const items, const fn via the MIR interpreter
+# T061 — Const items and constant expressions
 
 ## Goal
 Compile-time evaluation reusing the oracle (no separate mini-language).
 
 ## Scope
-- const items, `comptime fn`, `comptime {}` blocks, const generics for array sizes if in spec, evaluation limits and diagnostics.
+- `const` items and constant expressions (array sizes, tables) evaluated by the MIR interpreter, evaluation limits and diagnostics. `comptime fn`, `comptime {}` blocks, const generics and reflection are E14.1/E14.2 (after self-hosting, ROADMAP R7) — but keep the evaluator reusable so they plug in without redesign.
 
 ## Acceptance
 - [ ] run + ui tests.

@@ -14,7 +14,7 @@ spec: [0017, 0026, 0114]
 # T062 — P7 gate: abstraction conformance + generated-program fuzzing
 
 ## Goal
-Validate generics/traits/closures/dyn/modules together.
+Validate generics/traits/closures/modules together (dyn is E14.4).
 
 ## Scope
 - Conformance cases; typed-program generator that produces valid programs and checks interp==native at -O0/-O1.

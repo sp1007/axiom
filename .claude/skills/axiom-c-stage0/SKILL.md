@@ -10,6 +10,15 @@ later ported module-by-module to Axiom (self-hosting). Anything that would be aw
 hidden globals, pointer-identity semantics, host-library behaviour leaking into Axiom semantics —
 is a defect even if tests pass. (docs 0152 §5, 0172, tasks/0260 ABOOT-41..57)
 
+## Minimal C scope (ROADMAP R7 — owner decision)
+
+axiom0 exists only to reach self-hosting quickly. Implement exactly the self-host subset in
+`spec/SPEC-00-bootstrap.md`; everything else is a post-T087 epic written in Axiom. Keep the C simple
+and fast to compile; don't polish what will be rewritten. But design data models per
+`spec/SPEC-04-core-extensibility.md` so later features plug in — out-of-subset constructs get a clear
+`AX_*_UNSUPPORTED_STAGE0` diagnostic, never a crash or a silent miscompile. Implementing an
+out-of-subset feature in C is a QA FAIL even if it works.
+
 ## Repository layout
 
 ```

@@ -4,7 +4,7 @@ title: Phase P16 gate — Targets & platforms
 phase: P16-targets-platforms
 owner: axiom-qa
 reviewer: axiom-architect
-depends: [T216]
+depends: [T216, T066]
 priority: 316
 status: todo
 attempts: 0

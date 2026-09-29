@@ -4,12 +4,12 @@ title: MIR data model, printer and text parser
 phase: P3-semantic-core
 owner: axiom-semantics
 reviewer: axiom-qa
-depends: [T017]
+depends: [T017, T003a]
 priority: 31
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/mir, tests/mir]
-spec: [0161, 0227, 0228, 0247, 0024, tasks/0393, 0054, 0056]
+spec: [0161, 0227, 0228, 0247, 0024, tasks/0393, 0054, 0056, spec/SPEC-04-core-extensibility.md]
 ---
 # T018 — MIR data model, printer and text parser
 

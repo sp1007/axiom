@@ -4,7 +4,7 @@ title: Phase P17 gate — Debugging & runtime introspection
 phase: P17-debugging-runtime-introspectio
 owner: axiom-qa
 reviewer: axiom-architect
-depends: [T217]
+depends: [T217, T068]
 priority: 317
 status: todo
 attempts: 0

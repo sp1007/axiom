@@ -28,6 +28,14 @@ reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs
 - **R5 — Every requirement is traced.** `spec/requirements/CATALOG.md` maps each requirement to a task
   or to an epic here (`EPIC(E15.3)`); the phase planning task converts its epics' requirements to task
   ids. `reqcov.py --strict` must pass at every gate.
+- **R7 — Minimal C, general core.** The C core exists only to reach self-hosting fast; C code that
+  will be rewritten anyway is waste. axiom0 implements exactly the self-host subset defined in
+  `spec/SPEC-00-bootstrap.md` (T003a) — nothing more — while its data models (types, HIR, MIR, LIR,
+  target description, object model) reserve extension points for every later epic
+  (`spec/SPEC-04-core-extensibility.md`), so P11+ features plug in without redesign. Features not
+  needed to compile axiomc (dyn/vtables, comptime fn, linear-scan regalloc, optimizer ladder 2,
+  Linux ELF, separate compilation, unwind info…) are post-T087 epics. QA fails any axiom0 change
+  that implements out-of-subset features.
 - **R6 — Targets:** Windows x64 PE first, Linux x64 ELF second (0181); other targets in P16 through the
   shared target-independent LIR / target description (0152 §68, 0163).
 
@@ -36,11 +44,12 @@ reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs
 ```
 P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (oracle)
   → P4 first native exe → P5 language core → P6 ownership/capability/drop
-  → P7 abstraction (methods, generics, traits, closures, dyn, modules, comptime)
-  → P8 backend maturity (regalloc, opt ladder 2, FFI, Linux ELF, linker v2, unwind)
+  → P7 abstraction (methods, generics, traits, closures, modules, const items)
+  → P8 FFI (the rest of backend maturity moved after self-hosting by R7)
   → P9 core+std libraries → P10 self-hosting fixed point (axiom0 frozen)
         ├─ P11 concurrency & async ───────────────┐
-        ├─ P12 numeric, float, SIMD ── P15 optimizer 2.0
+        ├─ P15 optimizer 2.0 + regalloc (opens at once; vectorization waits for P12)
+        ├─ P12 numeric, float, SIMD
         ├─ P13 low-level, unsafe, freestanding, security ── P16 targets ── P17 debugging
         ├─ P14 comptime 2.0, reflection, generators
         └─ P18 compiler architecture 2.0 ── P19 developer tooling
@@ -59,18 +68,18 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P4 native | T023–T029 | — | T029 | P3 |
 | P5 language core | T030–T044 | — | T044 | P4 |
 | P6 ownership | T045–T052 | — | T052 | P5 |
-| P7 abstraction | T053–T062 | — | T062 | P6 |
-| P8 backend maturity | T063–T068 | — | (T075) | P7 |
+| P7 abstraction | T053–T057, T059–T062 | — | T062 | P6 |
+| P8 FFI (backend maturity trimmed by R7) | T065 | — | (T075) | P7 |
 | P9 libraries | T069–T075 | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090 | T211 | T311 | P10 |
 | P12 numeric & SIMD | — | T212 | T312 | P10 |
 | P13 low-level & security | — | T213 | T313 | P10 |
-| P14 comptime 2.0 & generators | — | T214 | T314 | P10 |
-| P15 optimizer 2.0 | — | T215 | T315 | P12 |
-| P16 targets & platforms | — | T216 | T316 | P13 |
-| P17 debugging & introspection | — | T217 | T317 | P16 |
-| P18 compiler architecture 2.0 | — | T218 | T318 | P10 |
+| P14 language completion: comptime 2.0, reflection, generators, dyn | T058 | T214 | T314 | P10 |
+| P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
+| P16 targets & platforms | T066 | T216 | T316 | P13 |
+| P17 debugging & introspection | T068 | T217 | T317 | P16 |
+| P18 compiler architecture 2.0 | T067 | T218 | T318 | P10 |
 | P19 developer tooling | — | T219 | T319 | P18 |
 | P20 build & packages | — | T220 | T320 | P16, P18 |
 | P21 std completion | — | T221 | T321 | P11, P13 |
@@ -126,26 +135,33 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
   guarantees across unwinding. Src 0229 tasks/0351 tasks/0700.
 Exit: freestanding program boots without std; UB/safety conformance suite.
 
-### P14 — Comptime 2.0, reflection, metaprogramming, generators
+### P14 — Language completion: comptime 2.0, reflection, generators, dyn
 - **E14.1 Comptime completion** — full comptime execution model, partial evaluation, specialization.
   Src 0102 0140 tasks/0340 tasks/0346 tasks/0509.
 - **E14.2 Reflection & derive** — compile-time reflection API, derive framework, code generation
   boundary (no textual macros unless specified). Src tasks/0343 tasks/0296 tasks/0433.
 - **E14.3 Generators & `yield`** — iterator state machines, lazy control flow. Src tasks/0512.
+- **E14.4 dyn Trait & vtables** — dyn compatibility, coercion, vtable layout, native emission.
+  Src tasks/0476 217.49-50, 0212. *(T058)*
 Exit: derive(Debug/Eq/Hash/Serialize-style) implemented via reflection in std; generator tests.
 
 ### P15 — Optimizer 2.0
 - **E15.1 OptIR: SSA / MemorySSA** — Src tasks/0398 0315 tasks/0366.
 - **E15.2 Alias & escape analysis, allocation promotion** — Src tasks/0395 tasks/0397.
 - **E15.3 Loops & bounds-check elimination** — SCEV, LICM, unrolling, BCE. Src tasks/0402.
-- **E15.4 Inlining, specialization, devirtualization** — Src tasks/0401 tasks/0551.
+- **E15.4 Inlining, specialization, devirtualization** (+ copy propagation, SROA) — Src tasks/0401
+  tasks/0551. *(T064)*
 - **E15.5 Auto-vectorization** — Src tasks/0403 tasks/0407 0095.
 - **E15.6 LTO / whole-program / section GC / PGO** — Src tasks/0355 tasks/0408 tasks/0409 tasks/0410.
+- **E15.8 Register allocation (linear scan) & better instruction selection** — first P15 task so
+  axiomc itself becomes fast. Src 0182 0235 0252 tasks/0557. *(T063)*
 - **E15.7 Performance contract** — benchmark suite, code-size & compile-time budgets, regression CI.
   Src tasks/0706 0074.
 Exit: differential green at -O2; benchmark targets met and tracked in CI.
 
 ### P16 — Targets & platforms
+- **E16.9 Linux x86-64 static** — SysV ABI, ELF64 writer, static linker, WSL test runs. Src 0192
+  0053. *(T066; first P16 task)*
 - **E16.1 Target description as data** — TargetDesc/ISA tables, backend conformance. Src 0163
   tasks/0524 tasks/0784.
 - **E16.2 Linux ELF dynamic** — PIE, GOT/PLT, shared objects, libc interop. Src 0197.
@@ -161,7 +177,7 @@ WASM/RISC-V tier-2.
 ### P17 — Debugging & runtime introspection
 - **E17.1 Debug IR + CodeView/PDB (Windows)** — Src 0190 0191.
 - **E17.2 DWARF (ELF/Mach-O)** — Src tasks/0596.
-- **E17.3 Unwinding & backtraces on all targets** — Src 0188 tasks/0700.
+- **E17.3 Unwinding & backtraces on all targets** — Src 0188 tasks/0700. *(T068 = Windows slice)*
 - **E17.4 Debugger contract & symbolication** — Src 0100 0147 tasks/0811.
 - **E17.5 Profiler & performance introspection** — Src tasks/0572 tasks/0730.
 - **E17.6 Sanitizers & runtime verification** — Src tasks/0599 tasks/0733.
@@ -177,6 +193,8 @@ Exit: step-through debugging in a standard debugger on Windows and Linux; saniti
 - **E18.4 Artifact format & module interface files** — Axiom object/LTO/semantic package sections.
   Src tasks/0787 tasks/0739.
 - **E18.5 Pass contracts & proof-carrying transformations** — Src tasks/0578 tasks/0545.
+- **E18.6 Separate compilation, multiple objects, archives, section GC** — Src 0164 0217 0099
+  tasks/0369. *(T067)*
 Exit: no-op rebuild < 100 ms on the compiler itself; edit-one-private-fn rebuild re-typechecks only
 that module.
 
@@ -252,3 +270,4 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-29 | R7 minimal C: T058→E14.4, T061 trimmed to const items (rest E14.1), T063→E15.8, T064→E15.4, T066→E16.9, T067→E18.6, T068→E17.3; P15 opens right after P10; new T003a core extensibility contract + exact self-host subset | owner decision |

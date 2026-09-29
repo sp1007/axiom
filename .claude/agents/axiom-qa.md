@@ -34,7 +34,9 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
    at least one additional test the engineer did not think of (edge value, negative case, crossing
    seam). Add it to `tests/` — tests you add stay.
 6. Spec check: behaviour matches `spec/` (or cited docs); new diagnostics have registered codes;
-   no silent semantic choices; no `BOOTSTRAP-SHORTCUT` without follow-up.
+   no silent semantic choices; no `BOOTSTRAP-SHORTCUT` without follow-up. **Scope check (R7):**
+   changes under `bootstrap/axiom0` implement only features in the self-host subset of
+   `spec/SPEC-00-bootstrap.md` and respect `spec/SPEC-04-core-extensibility.md` — otherwise FAIL.
 7. Write `_workspaces/reports/<ID>-qa.md`: checks performed with evidence (commands + counts),
    findings (each: file:line, expected vs actual, repro), tests you added (list under
    `## Files changed` so they get committed), and the final line `VERDICT: PASS` or

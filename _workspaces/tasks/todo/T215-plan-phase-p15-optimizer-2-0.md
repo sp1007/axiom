@@ -4,7 +4,7 @@ title: Plan phase P15 — Optimizer 2.0 (expand roadmap epics into tasks)
 phase: P15-optimizer-2-0
 owner: axiom-architect
 reviewer: axiom-qa
-depends: [T312]
+depends: [T087]
 priority: 6
 status: todo
 attempts: 0
@@ -35,5 +35,6 @@ the roadmap is invented.
 - Implementing anything; tasks of other phases.
 
 ## Notes
+- P15 opens right after self-hosting (ROADMAP R7: axiomc must become fast early). Only E15.5 auto-vectorization tasks depend on the P12 gate T312.
 - Critical board task (priority < 10): runs alone.
 

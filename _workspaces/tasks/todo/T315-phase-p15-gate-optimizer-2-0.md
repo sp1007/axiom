@@ -4,7 +4,7 @@ title: Phase P15 gate — Optimizer 2.0
 phase: P15-optimizer-2-0
 owner: axiom-qa
 reviewer: axiom-architect
-depends: [T215]
+depends: [T215, T063, T064]
 priority: 315
 status: todo
 attempts: 0
