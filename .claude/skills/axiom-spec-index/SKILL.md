@@ -5,6 +5,16 @@ description: Find the normative Axiom design text for any compiler topic inside 
 
 # Axiom spec lookup
 
+**Normative vs non-normative.** `docs/base/specs/`, `docs/base/tasks/`, `docs/base/others/` hold
+conclusions that were already debated and lightly critiqued — they are normative.
+`docs/base/discussions/` is brainstorming only: never treat it as a requirement or decision; use it
+at most as background when a normative text is unclear.
+
+Requirements catalogue and traceability (which board task implements which goal of the corpus):
+`spec/requirements/CATALOG.md`, `spec/COVERAGE.md`, checked by
+`python .claude/skills/axiom-tasks/scripts/reqcov.py`. The extraction procedure is in
+`references/requirements-extraction.md` — read it when working on T092–T111 or a phase review.
+
 The corpus is too large to read. Read **only** what the task needs, in this priority order:
 
 1. `spec/` — canonical, consolidated specs written by the axiom-architect agent (authoritative once
@@ -68,9 +78,9 @@ alone produces confident but wrong implementations.
 | Bootstrap / self-hosting | 0167, 0150, tasks/0259–0262, tasks/0371 |
 | Contradiction audits | 0151, 0110, 0121, 0016 |
 
-Out of scope for the compiler (ignore unless a task says otherwise): the application-domain
-BOOTSTRAP-4xx…7xx documents (AI serving, finance, GUI, audio, GPU apps…). They are listed under
-"XX" in `references/index.md`.
+Application-domain documents (AI serving, finance, GUI, audio…) are not compiler work; they are
+listed under "XX" in `references/index.md` and triaged once as `post-v1` requirements (chunk C18).
+Note that GPU, other targets, async, threads, LSP etc. ARE part of the v1 specs (tier `v1-full`).
 
 ## When documents conflict
 

@@ -41,6 +41,12 @@ import re
 import subprocess
 import sys
 
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
+
 ROOT = os.getcwd()
 BOARD = os.path.join(ROOT, "_workspaces", "tasks")
 STATES = ["todo", "doing", "done"]

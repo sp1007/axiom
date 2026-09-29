@@ -64,12 +64,12 @@ TOPICS = [
 
 # Application-domain documents: not needed to build the compiler.
 OUT_OF_SCOPE = re.compile(
-    r"\bAI\b|AGENT|MODEL SERVING|INFERENCE|GUI|Windowing|WINDOW|Rendering|RENDER|AUDIO|Audio|MEDIA|"
-    r"FINANCE|TRANSPORT|CORRECTIONS|RETAIL|CONSTRUCTION|GEOSPATIAL|ENVIRONMENT|Clipboard|CLIPBOARD|"
-    r"Game Engine|Machine Learning|Neural|Probabilistic|Signal Processing|Scientific|Linear Algebra|"
-    r"Distributed|DISTRIBUTED|Cluster|Networking|DATABASE|Document Model|Scripting|Input, Keyboard|"
-    r"WIDGETS|COMPOSITOR|APPLICATION|IPC|Crash|LOGGING|REGISTRY|Cryptography|INCIDENT|Graphics|GPU|"
-    r"Heterogeneous|Android|ANDROID|JNI|MACHO|Mach-O"
+    r"\bAI (MODEL|AGENT|WORKFLOW|SYSTEM|DATA|OBSERVABILITY|DATASET|SECURITY)|MODEL SERVING|"
+    r"INFERENCE SERVER|\bGUI\b|Windowing|\bWINDOW|Rendering|\bAUDIO\b|\bAudio\b|\bMEDIA\b|"
+    r"AXFINANCE|AXTRANSPORT|AXCORRECTIONS|AXRETAIL|AXCONSTRUCTION|AXGEOSPATIAL|AXENVIRONMENT|"
+    r"AXMEDIA|AXAUDIO|AXWINDOW|AXCOMPOSITOR|AXAPPLICATION|AXGUI|AXWIDGETS|Clipboard|CLIPBOARD|"
+    r"Game Engine|Machine Learning|Neural|Probabilistic|Signal Processing|Linear Algebra|"
+    r"Document Model|Input, Keyboard|APPLICATION LIFECYCLE|\bGraphics\b"
 )
 
 

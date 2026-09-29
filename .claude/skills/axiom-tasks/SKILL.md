@@ -52,6 +52,7 @@ status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/layout, tests/run/struct]   # dirs/files this task may modify
 spec: [0267, 0059, 0081, tasks/0281]                     # docs/base numbers to read
+covers: [REQ-LAY-003, REQ-TYP-017]                        # requirement ids (spec/requirements/CATALOG.md)
 ---
 ## Goal            one paragraph: the observable capability added
 ## Scope           bullet list of what to build
@@ -60,6 +61,11 @@ spec: [0267, 0059, 0081, tasks/0281]                     # docs/base numbers to 
 ## Notes           hints, pitfalls, links
 ## Log             appended by taskctl
 ```
+
+Traceability: every requirement in `spec/requirements/CATALOG.md` is mapped to tasks (status column)
+and every task lists the requirements it implements in `covers:`. Check with
+`python .claude/skills/axiom-tasks/scripts/reqcov.py` (`--gaps`, `--phase P6-ownership`, `--strict`).
+When you create or split a task, move the relevant `covers:` entries and update the catalog status.
 
 Rules that keep the board healthy:
 - A task must be finishable by one agent in one sitting (roughly ≤ 1–2k lines of change). If an

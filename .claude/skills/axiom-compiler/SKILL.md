@@ -119,7 +119,8 @@ Unblocking never waits for the human.
 
 When the last task of a phase lands (see `phase:` in task files), spawn axiom-architect for a
 short phase review (`_workspaces/reports/phase-<P>-review.md`): spec drift, shortcuts to retire,
-backlog adjustments for the next phase. Commit its board/spec changes.
+requirement coverage of the phase (`reqcov.py --phase <P>` — every mapped requirement implemented
+or explicitly re-mapped), backlog adjustments for the next phase. Commit its board/spec changes.
 
 ## Test scenarios
 

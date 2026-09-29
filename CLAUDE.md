@@ -1,7 +1,8 @@
 # Axiom — ngôn ngữ và compiler mới
 
 Tài liệu thiết kế gốc: `docs/base/specs`, `docs/base/tasks` (rất lớn, có mâu thuẫn — tra cứu qua skill
-`axiom-spec-index`). Spec chuẩn hoá do agent kiến trúc sư viết nằm ở `spec/` và được ưu tiên hơn `docs/base`.
+`axiom-spec-index`). `specs/`, `tasks/`, `others/` là kết luận đã phản biện (có giá trị quy chuẩn);
+`discussions/` chỉ là bàn bạc, không lấy làm yêu cầu. Spec chuẩn hoá do agent kiến trúc sư viết nằm ở `spec/` và được ưu tiên hơn `docs/base`.
 
 **Quy ước cú pháp bắt buộc:** gán/khai báo chỉ dùng `=` (không có `:=`, không có `var`); phân giải
 namespace/thư viện chỉ dùng `.` (không có `::`). Chi tiết: skill `axiom-syntax`.
@@ -21,3 +22,4 @@ Câu hỏi đơn giản có thể trả lời trực tiếp.
 | Ngày | Thay đổi | Đối tượng | Lý do |
 |------|----------|-----------|-------|
 | 2026-09-29 | Khởi tạo harness: 6 agent, 9 skill, 91 task (P0–P11) | toàn bộ | Yêu cầu dựng đội agent xây compiler |
+| 2026-09-29 | Thêm truy vết yêu cầu: T092–T109 rút yêu cầu theo 18 khối, T110 catalog, T111 mở rộng backlog; `reqcov.py`; thu hẹp bộ lọc ngoài phạm vi | skills/axiom-spec-index, axiom-tasks, agents/axiom-architect, board | Board chưa phủ hết mục tiêu trong specs và tasks |

@@ -35,6 +35,14 @@ plan toward a self-hosting compiler.
 - Keep canonical specs lean and testable: each rule gets an ID (`AXS-LEX-012`) so tests and code can
   reference it.
 
+## Traceability duty
+You own the requirements catalogue (`spec/requirements/CATALOG.md`, `spec/COVERAGE.md`) that maps
+every goal of the normative corpus (`docs/base/specs`, `docs/base/tasks`, `docs/base/others` —
+**not** `docs/base/discussions`, which is brainstorming only) to board tasks. Follow
+`.claude/skills/axiom-spec-index/references/requirements-extraction.md`. Every task you create or
+split carries `covers:`; `reqcov.py --strict` must pass after you change the board. At phase reviews,
+run `reqcov.py --phase <P>` and account for every requirement of that phase.
+
 ## Input / output protocol
 - Input: a task file path (`_workspaces/tasks/doing/<ID>-*.md`) or a blocker description from the
   orchestrator.
