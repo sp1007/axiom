@@ -17,7 +17,7 @@ sau mỗi task.
 
 **Trigger:** Mọi yêu cầu xây/tiếp tục/sửa/kiểm thử compiler Axiom → dùng skill `axiom-compiler`.
 Chạy tự động liên tục → `/tu-dong` (dừng: `/tu-dong dừng`, trạng thái: `/tu-dong trạng thái`); nhịp
-giám sát 5 phút → `/axiom-tick`. Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
+giám sát 5 phút → `/axiom-tick`. Thẩm định lại tài liệu/board trước khi chạy → `/tham-dinh` (4 agent axiom-auditor). Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
 Câu hỏi đơn giản có thể trả lời trực tiếp.
 
 **Lịch sử thay đổi:**
@@ -44,3 +44,4 @@ Câu hỏi đơn giản có thể trả lời trực tiếp.
 | 2026-09-30 | Giữ PE writer tối giản trước self-host (T027); thêm phép đối chứng: .obj của axiom0 được gcc/ld link và phải chạy giống PE tự ghi (T026 fixture, T028 mọi chương trình run/basic); chỉ là test, không dùng trong đường sản xuất | T026, T028, axiom-testing | Tách lỗi COFF writer khỏi lỗi linker; chứng minh .obj dùng được với toolchain khác |
 | 2026-09-30 | Kiểu cơ bản và chuỗi trước self-host: thêm `char` (T010, T034, T071, T073), escape `\u{...}` có kiểm tra, chuyển UTF-8 ↔ UTF-16 và chỉ dùng API W của Windows cho đường dẫn/tham số/biến môi trường tiếng Việt (T071, T074); số thực không làm trong axiom0 mà viết một lần bằng Axiom ở P12 (E12.2), bỏ định dạng float khỏi T071 | board, ROADMAP | Đề xuất được chủ dự án duyệt |
 | 2026-09-30 | Bổ sung cấu trúc cơ bản trước self-host: T061a con trỏ thô tối giản + `unsafe` + intrinsic bộ nhớ (Box/Vec/FFI cần; E13.1 mở rộng sau), slice (view độ dài động) ở T048/T051, `if let`/`while let`/destructuring ở T038 | board, ROADMAP | Phát hiện khi rà soát cấu trúc ngôn ngữ |
+| 2026-09-30 | Thêm agent `axiom-auditor` (chỉ đọc) và lệnh `/tham-dinh`: 4 góc thẩm định song song (self-host, ladder 0263, tính khả thi task, nhất quán quy trình), gộp kết quả, sửa lỗi rõ ràng, trình điểm cần quyết định | agents/axiom-auditor, skills/tham-dinh | Chủ dự án thấy nhiều lỗi cơ bản; tác giả task khó tự thấy điểm mù |
