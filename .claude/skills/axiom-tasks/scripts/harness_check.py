@@ -63,7 +63,12 @@ for tid, t in tasks.items():
         p(f"{tid}: title epic {mm.group(1)} not in ROADMAP")
 
 # --- skills / agents ---------------------------------------------------------
-skills = set(os.listdir(os.path.join(ROOT, ".claude", "skills")))
+skills_dir = os.path.join(ROOT, ".claude", "skills")
+skills = {s for s in os.listdir(skills_dir) if os.path.isdir(os.path.join(skills_dir, s))}
+for s in sorted(skills):
+    if not os.path.exists(os.path.join(skills_dir, s, "SKILL.md")):
+        p(f".claude/skills/{s}: no SKILL.md")
+skills = {s for s in skills if os.path.exists(os.path.join(skills_dir, s, "SKILL.md"))}
 agents = {f[:-3] for f in os.listdir(os.path.join(ROOT, ".claude", "agents")) if f.endswith(".md")}
 docs = [os.path.join(ROOT, ".claude", "skills", s, "SKILL.md") for s in skills] + \
        [os.path.join(ROOT, ".claude", "agents", a + ".md") for a in agents]
@@ -83,8 +88,12 @@ for base in (".claude", "spec", "_workspaces/tasks", "CLAUDE.md", ".gitattribute
     files = [path] if os.path.isfile(path) else [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs]
     for f in files:
         if f.endswith((".md", ".py", ".txt")) or os.path.basename(f).startswith("."):
-            if b"\r\n" in open(f, "rb").read():
-                p(f"CRLF line endings: {os.path.relpath(f, ROOT)}")
+            data = open(f, "rb").read()
+            if b"\r" in data:
+                p(f"CR characters (CRLF or stray \\r): {os.path.relpath(f, ROOT)}")
+            # an escaped \n that a shell turned into a real line break: `<LF>`
+            if f.endswith(".md") and re.search(rb"[^`]`\n`[^`]", data):
+                p(f"broken inline-code escape (`<newline>`): {os.path.relpath(f, ROOT)}")
 
 # --- owner files never staged ------------------------------------------------------
 staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=ROOT,
@@ -100,6 +109,10 @@ for base in (".claude", "spec", "_workspaces/tasks", "CLAUDE.md"):
     path = os.path.join(ROOT, base)
     files = [path] if os.path.isfile(path) else [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs]
     for f in files:
+        # a real line break right after newline=" (shell-escaping accident) breaks the LF advice
+        if f.endswith((".md", ".py")) and "harness_check" not in f and \
+                re.search(r'newline="\n', open(f, encoding="utf-8").read()):
+            p(f"broken newline literal in {os.path.relpath(f, ROOT)}")
         if not f.endswith(".md") or "harness_check" in f:
             continue
         for n, line in enumerate(open(f, encoding="utf-8"), 1):

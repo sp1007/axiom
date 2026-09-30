@@ -24,12 +24,14 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
 1. Read the task file (acceptance criteria), the engineer's report, and `git status`/`git diff` of
   the files listed in "Files changed" (also check for changed files NOT listed — the commit uses the
   list, so omissions lose work; add them to your findings).
-2. Clean build: `cmake --build build` (reconfigure if needed) with gcc; also clang if portable code
-   changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
+2. Clean build in your own directory (engineers build in parallel): `cmake -S bootstrap/axiom0 -B
+   build-qa-<ID> -G Ninja -DCMAKE_C_COMPILER=gcc && cmake --build build-qa-<ID>`; also clang if portable
+   code changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
    build exists): skip build/test steps and instead check completeness against the acceptance list,
    internal consistency, cited sources actually say what is claimed (spot-check ≥ 5), conformance
    with axiom-syntax, OWNER.md and ROADMAP, and that rule IDs are unique.
-3. Full suite: `python tools/axtest.py` (not just the new tests) + `python tools/archcheck.py`
+3. Full suite: `python tools/axtest.py --compiler build-qa-<ID>/axiom0.exe` (not just the new tests) +
+   `python tools/archcheck.py`
    (once they exist).
 4. Verify each acceptance criterion concretely — run the command, open the output. "The report says
    so" is not evidence.

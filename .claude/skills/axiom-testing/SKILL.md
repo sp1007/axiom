@@ -65,8 +65,10 @@ python tools/axtest.py --json > _workspaces/artifacts/test-results.json   # for 
 python tools/axtest.py --bless parse/
 ```
 
-The runner builds nothing: build first (`cmake --build build`). Parallel agents use their own
+The runner builds nothing: build first (`cmake --build build-<ID>`). Parallel agents use their own
 build dirs, so the runner takes `--compiler <path>` (default `build/axiom0.exe`, env `AXIOM0`).
+It runs the compiler and test programs as binary subprocesses and compares stdout/stderr as raw
+bytes — never through text-mode decoding, which would hide CRLF/UTF-8 bugs.
 It must print a final line
 `TOTAL n PASS p FAIL f SKIP s` and exit non-zero on any failure.
 
@@ -78,9 +80,12 @@ It must print a final line
   raw UTF-8 bytes (`Xin ch\xc3\xa0o th\xe1\xba\xbf gi\xe1\xbb\x9bi`).
 
 - Files are LF-only (`.gitattributes`); when generating tests or golden files from Python on Windows
-  use `open(path, "w", encoding="utf-8", newline="
-")` — the default writes CRLF and breaks
+  use `open(path, "w", encoding="utf-8", newline="\n")` — the default writes CRLF and breaks
   byte-exact comparisons.
+
+- Write test and golden files with the Write/Edit tools, never shell heredocs/`printf`/`echo -e`:
+  the Windows shells here rewrite `\n`/`\r` escapes and backticks, producing tests that check the
+  wrong bytes.
 
 - One behaviour per test, named after it (`move_then_use.ax`, `shadow_space_5_args.ax`).
 - Always pair a positive with a negative test for each rule (accepts valid, rejects invalid with the

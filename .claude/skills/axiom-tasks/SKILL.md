@@ -119,4 +119,4 @@ stages both lists.
    the new agent reads the old report/QA files and continues rather than restarting from scratch.
 
 Commit message format (produced by `taskctl commit`): `T034: Struct + layout engine` + body +
-`Co-Authored-By` trailer. The user's own files under `docs/base/` are never staged by the fallback.
+`Co-Authored-By` trailer. The owner's files under `docs/` and git-ignored paths are never staged.

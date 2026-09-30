@@ -22,18 +22,21 @@ Commands:
     status                     board summary (add --json for machine output)
     list [todo|doing|done|blocked|deferred]
     next [--max N]             ready tasks: deps done, not blocked, paths disjoint from doing
-                               and from each other (safe to run in parallel); nothing while a
-                               critical (priority < 10) task runs. Use N = free slots to refill.
+                               and from each other (safe to run in parallel). A ready critical
+                               (priority < 10) task is returned alone once doing/ is empty; until
+                               then nothing new starts (drain). Use N = free slots to refill.
     show ID                    print the task file
-    start ID [--agent NAME]    todo -> doing
+    start ID [--agent NAME] [--force]  todo -> doing (refuses unfinished deps without --force)
     finish ID                  doing -> done
     block ID --reason TEXT     doing|todo -> todo with status blocked
-    unblock ID                 blocked|deferred -> todo (deferred only on the owner's request)
-    requeue ID --reason TEXT   doing -> todo (e.g. stale after session restart), keeps attempts
+    unblock ID                 blocked|deferred -> todo, attempts reset (deferred: owner only)
+    requeue ID --reason TEXT   doing -> todo (e.g. stale after restart); after 3 attempts it
+                               blocks instead, so the architect looks at it
     note ID TEXT               append a line to the task's "## Log" section
     validate                   check ids unique, deps exist, no cycles
-    commit ID                  git-commit the task: files listed in the report's
-                               "## Files changed" section + the task files
+    commit ID                  git-commit the task: files listed in the report's and QA's
+                               "## Files changed" sections + the board; never docs/, never
+                               git-ignored paths
 """
 import datetime as _dt
 import json
@@ -53,6 +56,8 @@ BOARD = os.path.join(ROOT, "_workspaces", "tasks")
 STATES = ["todo", "doing", "done"]
 REPORTS = os.path.join(ROOT, "_workspaces", "reports")
 TRAILER = "Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+MAX_ATTEMPTS = 3
+OWNER_DIRS = ("docs/",)  # the owner's documents: never staged by the harness
 
 
 def now():
@@ -161,14 +166,12 @@ def ready(tasks, maxn):
         if all(d in done for d in m.get("depends", [])):
             cands.append(t)
     cands.sort(key=lambda t: (int(t["meta"].get("priority", 100)), t["meta"]["id"]))
+    if cands and int(cands[0]["meta"].get("priority", 100)) < 10:
+        # Architecture-critical tasks run alone. While one is ready, start nothing new so the
+        # running tasks drain; otherwise refilling would starve it forever.
+        return [] if any_doing else [cands[0]]
     picked, used = [], list(busy_paths)
     for t in cands:
-        critical = int(t["meta"].get("priority", 100)) < 10
-        if critical:
-            # Architecture-critical tasks run alone: only when nothing else runs or is picked.
-            if not picked and not any_doing:
-                return [t]
-            continue
         p = t["meta"].get("paths", [])
         if p and overlaps(p, used):
             continue
@@ -238,8 +241,25 @@ def _files_section(path):
             if on:
                 m = re.match(r"^\s*[-*]\s+`?([^`\s]+)`?", line)
                 if m:
-                    files.append(m.group(1))
+                    f = m.group(1).replace("\\", "/").rstrip(":,;")
+                    while f.startswith("./"):
+                        f = f[2:]
+                    files.append(f)
     return files
+
+
+def stageable(files):
+    """Drop owner files, paths outside the repo and git-ignored paths (git add fails on those)."""
+    keep = []
+    for f in files:
+        if f.startswith(OWNER_DIRS) or f.startswith("/") or ".." in f.split("/") or re.match(r"^[A-Za-z]:", f):
+            print(f"skip (not stageable): {f}")
+            continue
+        if git("check-ignore", "-q", "--", f, check=False).returncode == 0:
+            print(f"skip (git-ignored): {f}")
+            continue
+        keep.append(f)
+    return keep
 
 
 def report_files(tid):
@@ -265,6 +285,7 @@ def cmd_commit(tasks, tid):
     board = os.path.relpath(os.path.join(ROOT, "_workspaces", "tasks"), ROOT)
     others_doing = [i for i, x in tasks.items() if x["dir"] == "doing" and i != m["id"]]
     if files:
+        files = stageable(files)
         existing = [f for f in files if os.path.exists(os.path.join(ROOT, f))]
         deleted = [f for f in files if not os.path.exists(os.path.join(ROOT, f))]
         if existing:
@@ -273,7 +294,7 @@ def cmd_commit(tasks, tid):
             git("rm", "--cached", "--quiet", "--ignore-unmatch", "--", f, check=False)
     elif not others_doing:
         # No parallel work in flight: everything outside the user's docs belongs to this task.
-        git("add", "-A", "--", ".", ":(exclude)docs/base")
+        git("add", "-A", "--", ".", ":(exclude)docs")
     else:
         raise SystemExit(f"{m['id']}: no '## Files changed' in report and other tasks are in "
                          f"progress ({', '.join(others_doing)}); refusing to guess which files to commit")
@@ -328,6 +349,10 @@ def main(argv):
         agent = opt("--agent", "")
         if t["dir"] != "todo" or t["meta"].get("status") in ("blocked", "deferred"):
             raise SystemExit(f"{t['meta']['id']} is not a startable todo task")
+        pending = [d for d in t["meta"].get("depends", []) if tasks[d]["dir"] != "done"]
+        if pending and "--force" not in rest:
+            raise SystemExit(f"{t['meta']['id']} depends on unfinished {', '.join(pending)} "
+                             f"(run those first, or --force with an architect note)")
         t["meta"]["status"] = "doing"
         t["meta"]["attempts"] = str(int(t["meta"].get("attempts", 0)) + 1)
         t["meta"]["started"] = now()
@@ -349,6 +374,10 @@ def main(argv):
     elif cmd in ("block", "requeue"):
         t = get(tasks, rest[0])
         reason = opt("--reason", "") or " ".join(rest[1:])
+        if cmd == "requeue" and int(t["meta"].get("attempts", 0)) >= MAX_ATTEMPTS:
+            # A task that keeps dying (crash, stale, no report) goes to the architect instead of
+            # looping forever.
+            cmd, reason = "block", f"{reason}; {MAX_ATTEMPTS} attempts without acceptance"
         t["meta"]["status"] = "blocked" if cmd == "block" else "todo"
         t["meta"].pop("agent", None)
         log(t, f"{cmd}: {reason}")
@@ -357,6 +386,7 @@ def main(argv):
     elif cmd == "unblock":
         t = get(tasks, rest[0])
         t["meta"]["status"] = "todo"
+        t["meta"]["attempts"] = "0"  # fresh budget after the architect changed something
         log(t, "unblocked " + " ".join(rest[1:]))
         save(t)
         print("unblocked", t["meta"]["id"])

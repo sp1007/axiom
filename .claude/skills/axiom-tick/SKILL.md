@@ -10,6 +10,9 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
 
 ## Steps
 
+0. If `ListAgents`, `SendMessage` or `CronCreate` are not callable yet in this session, load them
+   with `ToolSearch` (`select:CronCreate,CronList,CronDelete,SendMessage,ListAgents`).
+
 1. **Enabled?** Read `_workspaces/autopilot.json`. If missing or `enabled: false` → do nothing,
    reply "autopilot off" in one line. (Manual `/axiom-tick` with autopilot off still performs steps
    2–6 once.)
@@ -23,14 +26,16 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
    - completion already arrived but not processed (e.g. arrived mid-turn) → continue the
      orchestrator procedure from the right stage (impl → QA gate; QA → finish/commit or fix round).
    - no live agent (session restart / crash) → report says COMPLETE and no PASS QA → start QA gate;
-     otherwise `taskctl requeue <ID> --reason stale` and drop it from `running`.
+     otherwise `taskctl requeue <ID> --reason stale` and drop it from `running` (after 3 attempts
+     requeue blocks it; step 5 then sends it to the architect).
 5. **Blocked tasks** (status `blocked`, never `deferred`) without an active `unblock-<ID>` agent → spawn architect unblock (max 2 at a
    time).
 6. **Start / refill work** (owner decision: keep every slot busy) — free = `max_parallel` −
    number of tasks in `doing`. If free > 0: `taskctl next --max <free>` → for each returned task run
    the orchestrator's "run one task" procedure (background subagents, own build dirs). `next` already
    returns only tasks whose paths don't overlap running ones, returns a critical task (priority < 10)
-   only when nothing runs, and returns nothing while a critical task runs.
+   alone once nothing runs, and returns nothing while a critical task runs or waits to run (drain)
+   — idle slots then are expected, not a stall.
    If nothing is ready and nothing is blocked and todo is empty → board finished → follow the
    completion steps in tu-dong.
 7. **Log** one line to `_workspaces/logs/autopilot.log`:

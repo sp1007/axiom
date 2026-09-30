@@ -21,7 +21,9 @@ the board is finished or the user says stop.
 
 ## Start procedure
 
-0. The main session only coordinates; recommend `/model sonnet` to the user if the session runs on
+0. Load the deferred tools first: `ToolSearch` with query
+   `select:CronCreate,CronList,CronDelete,SendMessage,ListAgents` (they cannot be called before
+   their schemas are loaded). The main session only coordinates; recommend `/model sonnet` to the user if the session runs on
    Opus (subagent models come from the task files, see axiom-compiler model policy).
 
 1. Ensure the repo is a git repo on a working branch (`git rev-parse --abbrev-ref HEAD`); if on

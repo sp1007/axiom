@@ -35,7 +35,7 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 - Final ids, cross-chunk dedup, creating tasks (T110/T111 do that). Do not edit the board.
 
 ## Notes
-- Procedure: `.claude/skills/axiom-spec-index/references/requirements-extraction.md` (Phase A).
+- Procedure: `.claude/skills/axiom-spec-index/references/requirements-extraction.md` (Phase A). Write the raw file incrementally (resume from it on restart).
 - Normative sources only: specs/, tasks/, others/, init prompt. `docs/base/discussions/` is brainstorming — do not extract from it.
 - Map to existing tasks with `python .claude/skills/axiom-tasks/scripts/taskctl.py list`.
 - All code in statements uses canonical syntax (`=`, `.`).

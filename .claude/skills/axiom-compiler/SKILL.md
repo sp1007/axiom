@@ -47,6 +47,8 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 
 ## Phase 0 — context check (every invocation)
 
+0. `SendMessage` and `ListAgents` are deferred tools: load them once per session with `ToolSearch`
+   (`select:SendMessage,ListAgents`) before the first fix round or stale check.
 1. `taskctl.py status` and read `_workspaces/autopilot.json` if present.
 2. Decide the mode:
    - user names a task (`T010`) → **single task run** (or re-run: if it is in `done/`, move it back
@@ -118,7 +120,11 @@ Unblocking never waits for the human.
   the same time share `build/`; tell each implementation agent to use its own build dir
   `build-<ID>` and QA to use `build-qa-<ID>` so parallel builds don't clobber each other
   (add that to the prompts).
-- Architecture-critical tasks (priority < 10) run alone.
+- Architecture-critical tasks (priority < 10) run alone. When one becomes ready while others run,
+  `next` returns nothing (drain): let the running tasks finish, then the critical task starts alone.
+  Idle slots during a drain are intended — do not start other tasks by hand.
+- `requeue` blocks a task instead after 3 attempts (crash loops go to the architect); `unblock`
+  resets the attempt budget. `start` refuses a task whose dependencies are not done.
 
 ## Error handling summary
 

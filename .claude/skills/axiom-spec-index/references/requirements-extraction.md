@@ -25,6 +25,12 @@ Chunks are ~2 MB: far too much to read line by line. For each file:
 3. Skip pure explanation, repeated background and speculative "có thể/sau này" material, unless it
    is phrased as a commitment.
 
+**Work incrementally.** A chunk is ~100 files; your context may be compacted or the task restarted
+part-way. Create `raw/Cnn.md` at the start, append rows and add the file to `## Files skimmed`
+after every few files, so the file on disk is always the complete state. On (re)start read the
+existing `raw/Cnn.md` and continue with the files not yet listed; dedup within the chunk at the
+end.
+
 Write `spec/requirements/raw/Cnn.md` with one table (same six columns as the catalog):
 
 ```

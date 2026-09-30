@@ -93,6 +93,13 @@ oracle and the frontend evolve and be ported independently.
 - **Determinism**: output (diagnostic order, symbol order, object bytes) must not depend on hash
   iteration order, pointer values, time, or environment. Sort where order is observable. Two runs
   on the same input produce byte-identical artifacts (needed for reproducible bootstrap).
+- **Byte-exact I/O**: open every file with `"rb"`/`"wb"`, and the driver switches stdout/stderr
+  to binary mode on Windows (`_setmode(_fileno(stdout), _O_BINARY)`, same for stderr) at startup.
+  The UCRT text mode turns `\n` into `\r\n`, which makes dumps, diagnostics and golden tests
+  differ from the files in git and between hosts. Output always uses `\n`.
+- **Create and edit files with the Write/Edit tools**, not shell heredocs, `printf` or `sed`
+  one-liners: on this Windows host the shell layers rewrite escapes (`\n` became a real line break,
+  `\r` a CR byte) and silently corrupt C string literals, tests and golden files.
 - **Semantic independence from C**: Axiom integer overflow, division by zero, shifts, float
   behaviour are implemented explicitly per spec (use unsigned arithmetic / checked helpers), never
   by inheriting C UB. Axiom `Vec`/ownership semantics come from the spec, not from what C does.
@@ -106,6 +113,7 @@ oracle and the frontend evolve and be ported independently.
 ## Build & run
 
 ```bash
+# single-agent example; parallel tasks use build-<ID> (below)
 cmake -S bootstrap/axiom0 -B build -G Ninja -DCMAKE_C_COMPILER=gcc -DCMAKE_BUILD_TYPE=Debug
 cmake --build build                         # → build/axiom0.exe
 python tools/axtest.py                      # all tests; --filter lex, --json for machine output
