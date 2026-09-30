@@ -1,6 +1,7 @@
 ---
 name: axiom-compiler
 description: Orchestrator for building the Axiom compiler with the agent team (architect, frontend, semantics, backend, stdlib, qa). Runs board tasks end-to-end — start → implementation subagent → QA gate → fix rounds → done → auto-commit — in parallel batches, unblocks blocked tasks via the architect, and handles follow-ups. Use for ANY request to build/continue/implement/fix/test the Axiom compiler or run a specific task ("làm task T010", "tiếp tục compiler", "chạy lại task", "sửa lỗi QA", "làm lại phần lexer", "cập nhật kết quả", "run next task", "implement the parser"). For unattended continuous running use the tu-dong skill; this skill is the procedure it calls.
+model: sonnet
 ---
 
 # Axiom compiler orchestrator
@@ -30,8 +31,10 @@ that tests can verify.** Every spawn passes an explicit `model`:
 - architect unblock and phase reviews → `opus`;
 - **escalation:** the second QA fix round always runs on a fresh owner agent with `model: "opus"`
   (and its re-gate on `opus`), because a Sonnet agent that failed twice rarely fixes it a third time.
-The main session (orchestrator, `/tu-dong`, ticks) only coordinates — run it on Sonnet
-(`/model sonnet`).
+The main session (orchestrator, `/tu-dong`, ticks, `/tham-dinh`) only coordinates: these skills carry
+`model: sonnet` in their front-matter, so the session switches to Sonnet automatically while they
+run — the owner never picks models by hand. Design discussions outside these skills keep the
+session's own model.
 
 Spawn with `subagent_type: "<agent-name>"`; if the
 runtime rejects that type (agent files added mid-session are not yet registered), use

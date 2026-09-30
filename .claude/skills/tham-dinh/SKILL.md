@@ -1,6 +1,7 @@
 ---
 name: tham-dinh
 description: Lệnh "thẩm định" — chạy đội 4 agent axiom-auditor song song để thẩm định lại tài liệu, roadmap, board task và harness của dự án compiler Axiom (self-host có khả thi không, bám ladder 0263 chưa, task có thực thi được không, quy trình có nhất quán không), rồi gộp kết quả, sửa lỗi rõ ràng và trình các điểm cần chủ dự án quyết định. Dùng khi người dùng gõ /tham-dinh, "thẩm định", "audit kế hoạch", "rà soát lại task/tài liệu", "kiểm tra lại toàn bộ", hoặc trước khi chạy /tu-dong lần đầu.
+model: sonnet
 ---
 
 # /tham-dinh — independent plan audit

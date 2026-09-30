@@ -1,6 +1,7 @@
 ---
 name: tu-dong
 description: Lệnh "tự động" — bật chế độ autopilot cho dự án compiler Axiom. Tạo monitor chạy mỗi 5 phút; luôn giữ tối đa 3 task chạy song song — hễ có chỗ trống (task xong hoặc bị chặn) là tự xác định task tiếp theo không đụng thư mục đang làm và chạy ngay bằng subagent, tự QA, tự commit sau mỗi task, không hỏi người dùng, không ngủ đông. Dùng khi người dùng gõ /tu-dong, "tự động", "chạy tự động", "autopilot", "cứ chạy tiếp đi", "bật tự động"; cũng dùng cho "tự động dừng"/"dừng tự động" (tắt) và "tự động trạng thái"/"tiến độ" (xem trạng thái).
+model: sonnet
 ---
 
 # /tu-dong — Axiom autopilot
@@ -23,8 +24,8 @@ the board is finished or the user says stop.
 
 0. Load the deferred tools first: `ToolSearch` with query
    `select:CronCreate,CronList,CronDelete,SendMessage,ListAgents` (they cannot be called before
-   their schemas are loaded). The main session only coordinates; recommend `/model sonnet` to the user if the session runs on
-   Opus (subagent models come from the task files, see axiom-compiler model policy).
+   their schemas are loaded). Models are automatic: this skill runs on Sonnet (front-matter), every subagent
+   gets its model from the task file (axiom-compiler model policy). Never ask the user to switch.
 
 1. Ensure the repo is a git repo on a working branch (`git rev-parse --abbrev-ref HEAD`); if on
    `main`/`master`, that is acceptable for this local, single-user project — the user asked for

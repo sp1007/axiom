@@ -20,6 +20,8 @@ Chạy tự động liên tục → `/tu-dong` (dừng: `/tu-dong dừng`, trạ
 giám sát 5 phút → `/axiom-tick`. Thẩm định lại tài liệu/board trước khi chạy → `/tham-dinh` (4 agent axiom-auditor). Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
 Câu hỏi đơn giản có thể trả lời trực tiếp.
 
+**Chọn model tự động:** chủ dự án không phải gõ `/model`. Các skill điều phối (`axiom-compiler`, `/tu-dong`, `/axiom-tick`, `/tham-dinh`) tự chạy trên Sonnet; mỗi subagent nhận model từ task (`model`/`gate_model`: Opus cho thiết kế, Sonnet cho việc kiểm chứng được bằng test); vòng sửa QA thứ 2 tự nâng lên Opus.
+
 **Lịch sử thay đổi:**
 | Ngày | Thay đổi | Đối tượng | Lý do |
 |------|----------|-----------|-------|
@@ -45,3 +47,4 @@ Câu hỏi đơn giản có thể trả lời trực tiếp.
 | 2026-09-30 | Kiểu cơ bản và chuỗi trước self-host: thêm `char` (T010, T034, T071, T073), escape `\u{...}` có kiểm tra, chuyển UTF-8 ↔ UTF-16 và chỉ dùng API W của Windows cho đường dẫn/tham số/biến môi trường tiếng Việt (T071, T074); số thực không làm trong axiom0 mà viết một lần bằng Axiom ở P12 (E12.2), bỏ định dạng float khỏi T071 | board, ROADMAP | Đề xuất được chủ dự án duyệt |
 | 2026-09-30 | Bổ sung cấu trúc cơ bản trước self-host: T061a con trỏ thô tối giản + `unsafe` + intrinsic bộ nhớ (Box/Vec/FFI cần; E13.1 mở rộng sau), slice (view độ dài động) ở T048/T051, `if let`/`while let`/destructuring ở T038 | board, ROADMAP | Phát hiện khi rà soát cấu trúc ngôn ngữ |
 | 2026-09-30 | Thêm agent `axiom-auditor` (chỉ đọc) và lệnh `/tham-dinh`: 4 góc thẩm định song song (self-host, ladder 0263, tính khả thi task, nhất quán quy trình), gộp kết quả, sửa lỗi rõ ràng, trình điểm cần quyết định | agents/axiom-auditor, skills/tham-dinh | Chủ dự án thấy nhiều lỗi cơ bản; tác giả task khó tự thấy điểm mù |
+| 2026-09-30 | Chọn model tự động: `model: sonnet` trong front-matter của các skill điều phối, bỏ bước `/model sonnet` thủ công; harness_check kiểm tra giá trị model của skill | skills axiom-compiler, tu-dong, axiom-tick, tham-dinh; CLAUDE.md | Chủ dự án không muốn chọn model bằng tay |

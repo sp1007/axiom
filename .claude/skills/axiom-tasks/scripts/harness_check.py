@@ -81,6 +81,10 @@ docs = [os.path.join(ROOT, ".claude", "skills", s, "SKILL.md") for s in skills] 
        [os.path.join(ROOT, ".claude", "agents", a + ".md") for a in agents]
 for f in docs:
     text = open(f, encoding="utf-8").read()
+    fm = text.split("---")[1] if text.startswith("---\n") else ""
+    mm = re.search(r"\nmodel:\s*(\S+)", fm)
+    if mm and mm.group(1) not in ("opus", "sonnet", "haiku", "inherit"):
+        p(f"{os.path.relpath(f, ROOT)}: invalid model '{mm.group(1)}'")
     if not text.startswith("---\n") or "\nname:" not in text.split("---")[1] or "\ndescription:" not in text.split("---")[1]:
         p(f"{os.path.relpath(f, ROOT)}: bad front-matter")
     for ref in set(re.findall(r"`((?:axiom-[a-z0-9-]+)|tu-dong)`", text)):

@@ -1,6 +1,7 @@
 ---
 name: axiom-tick
 description: One scheduling tick of the Axiom autopilot (fired every 5 minutes by the /tu-dong cron job, or run manually with /axiom-tick). Checks running agents and the task board, resumes stale tasks, advances finished work through QA/commit, unblocks blocked tasks via the architect, and — if no task is in progress — picks the next parallel-safe batch and starts it. Use when the prompt is "/axiom-tick", "tick", "kiểm tra tiến độ và chạy tiếp".
+model: sonnet
 ---
 
 # axiom-tick — one autopilot step
