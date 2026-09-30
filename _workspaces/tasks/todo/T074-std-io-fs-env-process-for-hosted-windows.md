@@ -20,8 +20,10 @@ Enough OS access to write a compiler in Axiom.
 
 ## Scope
 - stdout/stderr writers, read/write whole files, command-line args, environment, exit, errors as Result types.
+- Binary file read/write (whole file and streaming writer), `std.path` (join, parent, file name, extension, normalisation, Windows separators), directory listing (sorted), create directory, remove file, file-exists/metadata, monotonic clock `Instant` for `--time-passes`. Needed by the self-hosted compiler (self-host std subset, SPEC-00 / T003a).
 
 ## Acceptance
+- [ ] A test program writes a small binary file with ByteBuf and reads it back byte-identical; directory listing is sorted and deterministic.
 - [ ] std.io print/println of `Xin chào thế giới` correct on console, pipe and file; file written and read back byte-identical.
 - [ ] run tests using temp files.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).

@@ -70,7 +70,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P6 ownership | T045–T052 | — | T052 | P5 |
 | P7 abstraction | T053–T057, T059–T062 | — | T062 | P6 |
 | P8 FFI (backend maturity trimmed by R7) | T065 | — | (T075) | P7 |
-| P9 libraries | T069–T075 | — | T075 | P7, P8 |
+| P9 libraries (self-host std subset) | T069–T075, T073a | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090 | T211 | T311 | P10 |
 | P12 numeric & SIMD | — | T212 | T312 | P10 |
@@ -274,7 +274,8 @@ Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 - **E21.6 Virtual memory & memory mapping** — Src tasks/0437.
 - **E21.7 Serialization & binary data model** — Src tasks/0650 tasks/0742 tasks/0841.
 - **E21.8 Crypto primitives & secure memory** — hashes, RNG, constant-time utilities. Src tasks/0467.
-- **E21.9 Allocators: arena, pool, custom allocators** — Src 0106 0036 tasks/0280.
+- **E21.9 Allocators: pool, custom and concurrent allocators** (basic arenas + typed ID tables are
+  core, T073a) — Src 0106 0036 tasks/0280.
 Exit: std API reference complete; std conformance suite on all tier-1 targets.
 
 ### P22 — GPU & heterogeneous computing
@@ -318,6 +319,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-30 | Self-host std subset completed: T073a arenas + typed ID tables (from E21.9), sort (T070), StringBuilder/format/parse/ByteBuf (T071), binary files/path/dir listing/clock (T074); subset defined early in T003a | self-host needs |
 | 2026-09-29 | E18.7 Windows x64 .lib/.dll + import lib right after self-hosting (T750, T751); E13.7 reduced to module-relative bindings; C core emits .obj/.exe only | REQ-OWNER-006 |
 | 2026-09-29 | Output/library coverage: E16.10 artifact kinds & library matrix, E16.11 universal binaries, E16.12 Windows ARM64, E12.5 CPU multiversioning, E20.7 Axiom dynamic components; artifact matrix table | owner review of specs |
 | 2026-09-29 | New epic E13.7 module-relative bindings + PE DLL output (REQ-OWNER-005) | ADR-0001 §5-6 |

@@ -30,6 +30,7 @@ Plan the port of axiom0 to Axiom (axiomc).
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Verify the self-host std subset defined in SPEC-00 (T003a) is fully implemented before porting starts; file gap tasks in P9 if not.
 - ROADMAP R3: after T087 axiom0 is frozen (bug fixes for bootstrapping only); all P11+ work happens in compiler/ + std/. Design compiler/ so every later epic has a natural home.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

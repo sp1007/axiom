@@ -20,8 +20,10 @@ UTF-8 text model per spec.
 
 ## Scope
 - Str/String/Bytes APIs, UTF-8 validation, int/float to string, concatenation, comparison, simple `format`/print helpers per spec.
+- `StringBuilder`-style growth, integer formatting in decimal/hex/binary with width and zero-padding, integer parsing with overflow errors, `ByteBuf` (growable bytes) with little-endian `put_u8/u16/u32/u64/i32/i64`, `patch_u32_at` (for relocations/headers), and byte-slice views. Needed by the self-hosted compiler (self-host std subset, SPEC-00 / T003a).
 
 ## Acceptance
+- [ ] ByteBuf LE writers produce exact bytes (golden tests); formatting/parsing round-trips at MIN/MAX of every width.
 - [ ] Text tests round-trip `Xin chào thế giới`: byte length 22, 17 Unicode scalar values, validation, slicing on char boundaries, invalid UTF-8 rejected.
 - [ ] run tests incl. multi-byte text.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).

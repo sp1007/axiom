@@ -20,8 +20,10 @@ Heap memory with explicit ownership.
 
 ## Scope
 - Allocator trait + Windows heap backend via FFI, Box<T>, Vec<T> (push/pop/get/index/views/iteration later, drops elements), allocation-failure policy per spec.
+- Stable `sort` / `sort_by` / `sort_by_key` on Vec and mut views; `binary_search`; `dedup`. Needed by the self-hosted compiler (self-host std subset, SPEC-00 / T003a).
 
 ## Acceptance
+- [ ] Sort is stable and deterministic; tests with duplicate keys and 100k elements.
 - [ ] run tests incl. drop counts and growth; leak check via allocator counters.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T070-report.md` with exact `## Files changed`.
