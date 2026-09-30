@@ -20,8 +20,10 @@ Capability semantics that make views safe without a borrow checker clone.
 
 ## Scope
 - view<T>/mut_view<T> types, ephemeral views at call sites, explicit `view(x)`/`mut_view(x)`, region relation computation (DISJOINT/SAME/CONTAINS/OVERLAPS/UNKNOWN), conflict detection (mutation while viewed, overlapping mut_views), view escape via return/store, method receivers.
+- Dynamic-length views (slices) in the spec's form (e.g. `view<[T]>` / `mut_view<[T]>`): array → slice coercion, `len`, bounds-checked indexing, sub-range views `s[a..b]` with checked bounds, disjoint split of a mut_view (`split_at_mut`-style) accepted by the region analysis.
 
 ## Acceptance
+- [ ] Slice tests: sum over `view<[i32]>` of an array, sub-range views, out-of-range sub-view panics, two overlapping mut sub-views rejected, disjoint split accepted.
 - [ ] Test matrix rows for capability pass (0263 §39 first capability test).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T048-report.md` with exact `## Files changed`.

@@ -36,6 +36,7 @@ redesign — "implement later ≠ design later" (0263 §42).
   inclusion by the compiler's needs (tasks/0260 §3-4).
 - Artifact kinds as data: object model/driver/linker represent output kind (obj, exe, static lib, dynamic lib + import lib) and object/archive/image format independently; the core emits only obj/exe, E18.7 and E16.10 add writers without redesign (REQ-OWNER-006).
 - **Self-host std subset**: the exact library surface axiomc needs (core, alloc/Box/Vec + sort, text/StringBuilder/formatting/parsing, ByteBuf LE writers, HashMap/HashSet, iterators, arenas + typed ID tables + interner, io/fs/path/dir listing/binary files/args/env/exit/monotonic clock) mapped to P9 tasks T069–T074, T073a; anything a P9 task lacks becomes a scope change filed now, not discovered at T076.
+- Minimal raw pointers + `unsafe` blocks + memory intrinsics are in the self-host subset (T061a; std needs them); the full unsafe/UB model, volatile and MMIO stay in E13.1/E13.2. Slices (dynamic views) and `if let`/destructuring patterns are in the subset too (T048, T038).
 - Scalars in the self-host subset: all integer widths, bool, unit, never, `char`; **no floating point** in axiom0 (f32/f64 → P12 E12.2, written in Axiom; axiom0 reports AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP). The compiler itself needs no floats.
 - C-scope budget: rough size target per axiom0 module and the list of forbidden-in-C features.
 

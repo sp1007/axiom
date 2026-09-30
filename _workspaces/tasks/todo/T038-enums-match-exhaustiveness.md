@@ -20,8 +20,10 @@ Algebraic data types and pattern matching.
 
 ## Scope
 - Enum decl (unit/tuple/struct variants), variant construction via dotted paths, layout (tag + payload), match with all pattern kinds, guards if in spec, exhaustiveness + unreachable-arm analysis (AX_MATCH_NONEXHAUSTIVE with missing patterns listed).
+- Refutable pattern forms the spec defines (`if let`, `while let`, `let … else` or their canonical equivalents) desugared to match; destructuring `let` for tuples/structs with an irrefutability check (AX_PATTERN_REFUTABLE).
 
 ## Acceptance
+- [ ] Pattern tests: `if let`/`while let` (or spec equivalents) over Option, destructuring `let (a, b) = pair` and struct patterns, refutable pattern in plain `let` rejected.
 - [ ] run + ui tests incl. nested patterns and exhaustiveness counter-examples.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T038-report.md` with exact `## Files changed`.

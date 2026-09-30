@@ -131,7 +131,8 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
 Exit (phase): numeric conformance + differential interp/native for float and vector programs.
 
 ### P13 — Low-level systems, unsafe, freestanding, security
-- **E13.1 Unsafe & UB model** — unsafe blocks/fns, raw pointer rules, provenance, trusted-unsafe
+- **E13.1 Unsafe & UB model** — builds on the minimal core version (T061a: raw pointers, unsafe blocks,
+  memory intrinsics); here: full unsafe blocks/fns rules, raw pointer rules, provenance, trusted-unsafe
   boundaries. Src 0071 0044 tasks/0339 tasks/0282.
 - **E13.2 Raw memory, volatile, MMIO, layout control** — volatile, packed/aligned repr, unions (0072),
   address spaces. Src tasks/0328 tasks/0515 0067 0072.
@@ -325,6 +326,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-30 | Core constructs completed: T061a minimal raw pointers/unsafe/intrinsics (needed by Box/Vec/FFI; E13.1 extends it), slices in T048/T051, if-let/while-let/destructuring in T038 | self-host needs |
 | 2026-09-30 | Text & scalars before self-host: `char` in T034/T010, char + UTF-16 primitives in T071, chars() in T073, W APIs only in T074; floats entirely in E12.2 (not in axiom0), float formatting removed from T071 | owner decision |
 | 2026-09-30 | R8 std in Axiom as early as possible: T065 → T051+T060, T069 → T056+T060, T073 +T059, T075 +T062 | owner remark |
 | 2026-09-30 | Self-host std subset completed: T073a arenas + typed ID tables (from E21.9), sort (T070), StringBuilder/format/parse/ByteBuf (T071), binary files/path/dir listing/clock (T074); subset defined early in T003a | self-host needs |

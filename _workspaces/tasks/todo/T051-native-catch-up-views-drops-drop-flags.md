@@ -19,7 +19,7 @@ spec: [0152, 0162]
 Ownership programs run natively with correct drop behaviour.
 
 ## Scope
-- Views lowered to pointers / (ptr,len); drop calls; drop flag storage; ownership erasure after verification.
+- Views lowered to pointers / (ptr,len) — slices included (fat pointer passed by the Windows x64 ABI rules for 16-byte aggregates); drop calls; drop flag storage; ownership erasure after verification.
 
 ## Acceptance
 - [ ] Differential green for all P6 run tests.
