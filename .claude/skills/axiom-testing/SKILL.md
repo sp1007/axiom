@@ -110,6 +110,11 @@ store them as `tests/encode/*.txt` expectations so the test suite does not need 
 `objdump -x -d out.exe` must parse every object/image we write; check section flags, entry point,
 import table, relocations.
 
+**Cross-link oracle** (T026, T028): our `.obj` files are also linked by the system toolchain
+(`gcc`/`ld`, MSYS2 ucrt64) and must behave exactly like our own PE output. This isolates COFF-writer
+bugs from PE-linker bugs. It is a test oracle only; the production path never calls an external
+linker. Tests SKIP when gcc is not on PATH.
+
 ## Differential testing
 
 `tests/diff/` programs are compiled at every optimisation level and run under the interpreter;

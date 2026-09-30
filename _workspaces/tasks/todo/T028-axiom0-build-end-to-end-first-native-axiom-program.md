@@ -24,6 +24,7 @@ spec: [0152, 0263, 0186]
 ## Acceptance
 - [ ] All tests/run/basic pass in native mode as well as interp.
 - [ ] Exit-42 test is green both ways.
+- [ ] Cross-link oracle (T026): for every tests/run/basic program, `--emit=obj` linked by `gcc` gives the same exit code and stdout as our own PE output (SKIP when gcc is absent); a mismatch pinpoints our linker vs our object file.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T028-report.md` with exact `## Files changed`.
 
