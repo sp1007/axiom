@@ -4,6 +4,8 @@ title: Phase P21 gate — Standard library completion
 phase: P21-standard-library-completion
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T221]
 priority: 321
 status: todo

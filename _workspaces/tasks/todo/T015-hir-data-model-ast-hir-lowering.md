@@ -4,6 +4,8 @@ title: HIR data model + AST→HIR lowering
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T014]
 priority: 25
 status: todo

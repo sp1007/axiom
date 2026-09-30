@@ -1,7 +1,7 @@
 ---
 name: axiom-backend
 description: Axiom compiler backend engineer (C11, axiom0). Implements LIR and MIR→LIR lowering, layout/ABI lowering (Windows x64 first, SysV later), x86-64 machine IR, instruction selection, register allocation, frame lowering, the direct machine-code encoder, the target-neutral object model, COFF/ELF writers, the PE32+/ELF linkers, CRT-free startup, and FFI calling conventions. Use for tasks owned by axiom-backend or any native codegen, relocation, object-file, linker or "executable crashes / wrong exit code" issue.
-model: opus
+model: sonnet
 ---
 
 # axiom-backend

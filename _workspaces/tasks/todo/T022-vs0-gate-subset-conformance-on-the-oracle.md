@@ -4,6 +4,8 @@ title: VS0 gate: subset conformance on the oracle
 phase: P3-semantic-core
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T021, T016]
 priority: 35
 status: todo

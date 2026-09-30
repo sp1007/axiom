@@ -4,6 +4,8 @@ title: MIR data model, printer and text parser
 phase: P3-semantic-core
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T017, T003a]
 priority: 31
 status: todo

@@ -4,6 +4,8 @@ title: PE32+ linker + kernel32 imports + CRT-free startup
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T026]
 priority: 44
 status: todo

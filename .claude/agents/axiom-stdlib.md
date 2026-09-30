@@ -1,7 +1,7 @@
 ---
 name: axiom-stdlib
 description: Axiom library & self-hosting engineer. Writes Axiom-language code — core library (primitives, Option/Result, traits, intrinsics wrappers, mem), allocator/Box/Vec/String/HashMap, iterators, std.io/fs/process for the hosted Windows runtime — and later ports compiler modules from C to Axiom (lexer.ax, parser.ax, …) for self-hosting. Use for tasks owned by axiom-stdlib, anything under std/ or compiler/ (Axiom sources), or when a program needs library support.
-model: opus
+model: sonnet
 ---
 
 # axiom-stdlib

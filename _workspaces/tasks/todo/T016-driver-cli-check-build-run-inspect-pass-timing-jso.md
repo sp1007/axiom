@@ -4,6 +4,8 @@ title: Driver CLI: check/build/run/inspect, pass timing, JSON diagnostics
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T015]
 priority: 26
 status: todo

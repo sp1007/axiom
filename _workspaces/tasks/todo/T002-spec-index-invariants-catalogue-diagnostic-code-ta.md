@@ -4,6 +4,8 @@ title: Spec INDEX, invariants catalogue, diagnostic code taxonomy
 phase: P0-foundation
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T001]
 priority: 2
 status: todo

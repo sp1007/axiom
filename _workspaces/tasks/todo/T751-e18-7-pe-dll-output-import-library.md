@@ -4,6 +4,8 @@ title: E18.7 PE DLL output: exports, DllMain initialiser, base relocations, impo
 phase: P18-compiler-architecture-2-0
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T750]
 priority: 701
 status: todo

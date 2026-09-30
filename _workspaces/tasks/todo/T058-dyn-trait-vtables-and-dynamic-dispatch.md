@@ -4,6 +4,8 @@ title: E14.4 dyn Trait: vtables and dynamic dispatch
 phase: P14-comptime-2-0-reflection-gener
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T214]
 priority: 78
 status: todo

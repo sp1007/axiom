@@ -4,6 +4,8 @@ title: Numeric types, casts, checked arithmetic, panic=abort
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T033]
 priority: 54
 status: todo

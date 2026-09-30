@@ -4,6 +4,8 @@ title: Port typeck + trait solver to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T080]
 priority: 115
 status: todo

@@ -4,6 +4,8 @@ title: Plan phase P15 — Optimizer 2.0 (expand roadmap epics into tasks)
 phase: P15-optimizer-2-0
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

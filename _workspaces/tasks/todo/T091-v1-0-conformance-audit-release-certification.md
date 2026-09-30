@@ -4,6 +4,8 @@ title: E23.2 v1.0 conformance audit & release certification
 phase: P23-v1-0-conformance-freeze-release
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T223]
 priority: 140
 status: todo

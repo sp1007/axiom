@@ -4,6 +4,8 @@ title: Option/Result lang items + `?` operator
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T038]
 priority: 59
 status: todo

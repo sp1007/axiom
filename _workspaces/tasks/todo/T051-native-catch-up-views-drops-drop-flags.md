@@ -4,6 +4,8 @@ title: Native catch-up: views, drops, drop flags
 phase: P6-ownership
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T050]
 priority: 71
 status: todo

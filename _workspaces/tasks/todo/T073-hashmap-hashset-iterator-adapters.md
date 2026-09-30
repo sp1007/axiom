@@ -4,6 +4,8 @@ title: HashMap/HashSet + iterator adapters
 phase: P9-stdlib
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T071, T072]
 priority: 104
 status: todo

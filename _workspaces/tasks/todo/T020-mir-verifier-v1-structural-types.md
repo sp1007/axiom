@@ -4,6 +4,8 @@ title: MIR verifier v1 (structural + types)
 phase: P3-semantic-core
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T019]
 priority: 33
 status: todo

@@ -4,6 +4,8 @@ title: Port parser + AST to Axiom (differential AST)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T078]
 priority: 113
 status: todo

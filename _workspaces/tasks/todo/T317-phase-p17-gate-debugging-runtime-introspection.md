@@ -4,6 +4,8 @@ title: Phase P17 gate — Debugging & runtime introspection
 phase: P17-debugging-runtime-introspectio
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T217, T068]
 priority: 317
 status: todo

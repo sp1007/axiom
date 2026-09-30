@@ -4,6 +4,8 @@ title: Phase P13 gate — Low-level systems, unsafe, freestanding, security
 phase: P13-low-level-systems-unsafe-frees
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T213]
 priority: 313
 status: todo

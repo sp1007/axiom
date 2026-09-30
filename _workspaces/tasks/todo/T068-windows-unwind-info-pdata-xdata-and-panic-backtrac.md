@@ -4,6 +4,8 @@ title: E17.3 Windows unwind info (.pdata/.xdata) and panic backtrace basics
 phase: P17-debugging-runtime-introspecti
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T217]
 priority: 95
 status: todo

@@ -4,6 +4,8 @@ title: Port kernel, source DB, diagnostics to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T076]
 priority: 111
 status: todo

@@ -4,6 +4,8 @@ title: Iterator protocol, for-loop desugaring, ranges
 phase: P9-stdlib
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T069]
 priority: 103
 status: todo

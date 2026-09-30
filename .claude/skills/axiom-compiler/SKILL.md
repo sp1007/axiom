@@ -22,7 +22,18 @@ tools (TeamCreate) are not assumed; if they are available, the same roles and fi
 | axiom-stdlib | `std/` (Axiom code), self-hosting ports in `compiler/` |
 | axiom-qa | tools/, test suites, fuzzing, **gate for every task** |
 
-Always pass `model: "opus"` when spawning. Spawn with `subagent_type: "<agent-name>"`; if the
+**Model policy (owner decision 2026-09-30): Opus for design judgement, Sonnet for spec-driven work
+that tests can verify.** Every spawn passes an explicit `model`:
+- implementation agent → the task's `model:` field (defaults per agent: architect/semantics `opus`,
+  frontend/backend/stdlib/qa `sonnet`; requirement extraction `sonnet`; phase gates `opus`);
+- gate agent → the task's `gate_model:` (`sonnet`, `opus` for the critical spec tasks);
+- architect unblock and phase reviews → `opus`;
+- **escalation:** the second QA fix round always runs on a fresh owner agent with `model: "opus"`
+  (and its re-gate on `opus`), because a Sonnet agent that failed twice rarely fixes it a third time.
+The main session (orchestrator, `/tu-dong`, ticks) only coordinates — run it on Sonnet
+(`/model sonnet`).
+
+Spawn with `subagent_type: "<agent-name>"`; if the
 runtime rejects that type (agent files added mid-session are not yet registered), use
 `subagent_type: "general-purpose"` and start the prompt with
 `You are <agent-name>. First read .claude/agents/<agent-name>.md and follow it exactly.`
@@ -51,7 +62,7 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 
 1. `taskctl.py start <ID> --agent <ID>-impl`
 2. Spawn implementation agent (background):
-   - `name: "<ID>-impl"`, `subagent_type: <owner>`, `model: "opus"`, `run_in_background: true`
+   - `name: "<ID>-impl"`, `subagent_type: <owner>`, `model: <task model>`, `run_in_background: true`
    - prompt (fill in):
      ```
      Task <ID>: <title>. Task file: _workspaces/tasks/doing/<file>.
@@ -71,16 +82,18 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 4. **QA gate**: the gate agent is the task's `reviewer` (axiom-qa for most tasks; axiom-architect
    for tasks owned by axiom-qa, so nobody grades their own work — its prompt adds "follow the Gate
    protocol in .claude/agents/axiom-qa.md"). Spawn `name: "<ID>-qa"`, `subagent_type: <reviewer>`,
-   `model: "opus"`, background, prompt: `Gate task <ID>. Task file: … Report: _workspaces/reports/<ID>-report.md. Follow your
+   `model: <task gate_model>` (`opus` after escalation), background, prompt: `Gate task <ID>. Task file: … Report: _workspaces/reports/<ID>-report.md. Follow your
    Gate protocol and write _workspaces/reports/<ID>-qa.md ending with VERDICT: PASS|FAIL.`
 5. On QA result (read the last `VERDICT:` line of `<ID>-qa.md`, not the chat summary):
    - **PASS** → `taskctl.py finish <ID>` → `taskctl.py commit <ID>` (auto-commit, local, never
      push) → log → remove from `running`.
      `taskctl commit` stages the "Files changed" lists of both `<ID>-report.md` and `<ID>-qa.md`
      (so QA-added tests are committed) plus both report files.
-   - **FAIL**, round < 2 → round += 1; `SendMessage` to `<ID>-impl` with the path of the QA file and
-     "fix every finding, add regression tests, update the report (Round N)". If the agent cannot be
-     resumed, spawn a fresh owner agent with the same prompt plus the QA file. Then QA again.
+   - **FAIL**, round 0 → round = 1; `SendMessage` to `<ID>-impl` with the path of the QA file and
+     "fix every finding, add regression tests, update the report (Round 1)". If the agent cannot be
+     resumed, spawn a fresh owner agent (task model) with the same prompt plus the QA file. QA again.
+   - **FAIL**, round 1 → round = 2; **escalate**: spawn a fresh owner agent `name: "<ID>-fix2"`,
+     `model: "opus"`, prompt = implementation prompt + both QA files; re-gate with `model: "opus"`.
    - **FAIL**, round == 2 → `taskctl.py block <ID> --reason "QA failed 3 times: <top findings>"` →
      architect unblock.
 6. After any task leaves `doing/` (done or blocked): immediately refill the free slots with
@@ -88,7 +101,7 @@ runtime rejects that type (agent files added mid-session are not yet registered)
 
 ## Procedure: architect unblock
 
-Spawn `name: "unblock-<ID>"`, `subagent_type: axiom-architect`, `model: "opus"`, background:
+Spawn `name: "unblock-<ID>"`, `subagent_type: axiom-architect`, `model: "opus"` (always), background:
 `Task <ID> is blocked. Task file: …; report/QA files: …; blocker: <reason>. Follow your Unblocking
 protocol (ADR / split / prerequisite / rescope), run taskctl validate, report what changed.`
 The architect writes `_workspaces/reports/unblock-<ID>.md` with an exact `## Files changed` list.

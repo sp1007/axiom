@@ -4,6 +4,8 @@ title: Port resolver + HIR to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T079]
 priority: 114
 status: todo

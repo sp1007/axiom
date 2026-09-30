@@ -4,6 +4,8 @@ title: Plan phase P23 — v1.0 conformance, freeze & release (expand roadmap epi
 phase: P23-v1-0-conformance-freeze-releas
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T311, T312, T313, T314, T315, T316, T317, T318, T319, T320, T321, T322]
 priority: 6
 status: todo

@@ -4,6 +4,8 @@ title: Canonical ownership / capability / drop specification
 phase: P6-ownership
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T003]
 priority: 65
 status: todo

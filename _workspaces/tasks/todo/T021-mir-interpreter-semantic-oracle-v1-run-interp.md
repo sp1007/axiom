@@ -4,6 +4,8 @@ title: MIR interpreter (semantic oracle) v1 + `run --interp`
 phase: P3-semantic-core
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T020]
 priority: 34
 status: todo

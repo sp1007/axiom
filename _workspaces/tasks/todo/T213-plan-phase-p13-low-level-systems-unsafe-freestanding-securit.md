@@ -4,6 +4,8 @@ title: Plan phase P13 — Low-level systems, unsafe, freestanding, security (exp
 phase: P13-low-level-systems-unsafe-frees
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

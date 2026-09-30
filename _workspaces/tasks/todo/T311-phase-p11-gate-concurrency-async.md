@@ -4,6 +4,8 @@ title: Phase P11 gate — Concurrency & async
 phase: P11-concurrency-async
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T211, T088, T089, T090]
 priority: 311
 status: todo

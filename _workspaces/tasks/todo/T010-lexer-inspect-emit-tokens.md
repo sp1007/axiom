@@ -4,6 +4,8 @@ title: Lexer + `inspect --emit=tokens`
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T001, T009]
 priority: 20
 status: todo

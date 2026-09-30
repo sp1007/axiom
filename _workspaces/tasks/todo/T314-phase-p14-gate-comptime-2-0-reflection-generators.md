@@ -4,6 +4,8 @@ title: Phase P14 gate — Comptime 2.0, reflection, generators
 phase: P14-comptime-2-0-reflection-genera
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T214, T058]
 priority: 314
 status: todo

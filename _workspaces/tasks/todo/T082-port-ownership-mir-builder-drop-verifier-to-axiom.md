@@ -4,6 +4,8 @@ title: Port ownership, MIR builder, drop, verifier to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T081]
 priority: 116
 status: todo

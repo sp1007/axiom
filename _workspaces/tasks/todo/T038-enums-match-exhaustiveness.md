@@ -4,6 +4,8 @@ title: Enums + match + exhaustiveness
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T036]
 priority: 58
 status: todo

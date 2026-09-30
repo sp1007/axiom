@@ -4,6 +4,8 @@ title: Plan phase P22 — GPU & heterogeneous computing (expand roadmap epics in
 phase: P22-gpu-heterogeneous-computing
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T311, T312, T316]
 priority: 6
 status: todo

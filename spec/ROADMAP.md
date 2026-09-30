@@ -303,7 +303,7 @@ starts when the project owner explicitly schedules it.
 2. For each epic create **3–10 tasks**, each finishable by one agent in one sitting (≤ ~1–2k changed
    lines), owner = area owner (frontend/semantics/backend/stdlib/qa/architect), `paths` narrow,
    `spec:` refs, `covers:` requirement ids, acceptance expressed as tests (positive + negative), plus
-   the standard DoD lines. Start each epic with a spec task (architect) when the canonical `spec/`
+   the standard DoD lines, and `model:`/`gate_model:` by the axiom-tasks model rule. Start each epic with a spec task (architect) when the canonical `spec/`
    lacks that area — never implement from raw docs alone.
 3. IDs: next free numbers from `T400` upward in phase blocks of 50 (`T400–T449` P11, `T450–T499`
    P12, … `T1050–T1099` P24). Titles: `<Epic id> <short title>` (e.g. `E11.2 Atomic<T> lowering x64`).

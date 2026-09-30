@@ -4,6 +4,8 @@ title: Requirement extraction C16 (core)
 phase: P0-traceability
 owner: axiom-architect
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T003]
 priority: 31
 status: todo

@@ -4,6 +4,8 @@ title: Modules & packages: multi-file, visibility, use, re-exports, prelude modu
 phase: P7-abstraction
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T052]
 priority: 80
 status: todo

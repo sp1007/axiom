@@ -4,6 +4,8 @@ title: E16.9 Linux x86-64: SysV ABI, ELF64 writer, static ELF linker
 phase: P16-targets-platforms
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T216]
 priority: 93
 status: todo

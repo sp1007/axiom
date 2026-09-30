@@ -4,6 +4,8 @@ title: Port LIR + x64 backend + encoder to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T083]
 priority: 118
 status: todo

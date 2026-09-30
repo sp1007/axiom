@@ -4,6 +4,8 @@ title: Plan phase P21 — Standard library completion (expand roadmap epics into
 phase: P21-standard-library-completion
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T311, T313]
 priority: 6
 status: todo

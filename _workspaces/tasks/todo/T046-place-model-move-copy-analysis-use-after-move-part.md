@@ -4,6 +4,8 @@ title: Place model + move/copy analysis (use-after-move, partial moves)
 phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T044, T045]
 priority: 66
 status: todo

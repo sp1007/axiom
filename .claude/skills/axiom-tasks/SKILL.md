@@ -47,6 +47,8 @@ title: Struct + layout engine
 phase: P5-language
 owner: axiom-semantics            # agent that implements
 reviewer: axiom-qa
+model: opus                       # implementation model: opus | sonnet (see axiom-compiler)
+gate_model: sonnet                # QA gate model
 depends: [T031, T032]
 priority: 34                      # lower runs first among ready tasks
 status: todo
@@ -72,6 +74,10 @@ Roadmap frame: `spec/ROADMAP.md` fixes phases P0–P24, their epics and dependen
 expanded by their planning task T2NN (standard in ROADMAP §4) and closed by gate T3NN. Status
 `deferred` (T224, post-v1 ecosystem) is skipped by `next` and must not be unblocked by the autopilot —
 only on the owner's explicit request.
+
+Model choice when creating tasks: `opus` for design judgement (specs, ADRs, planning, type system,
+ownership/capability, verifier, phase gates); `sonnet` for spec-driven work verifiable by tests
+(lexer/parser, backend with reference tools, libraries, ports, extraction, routine gates).
 
 Rules that keep the board healthy:
 - A task must be finishable by one agent in one sitting (roughly ≤ 1–2k lines of change). If an

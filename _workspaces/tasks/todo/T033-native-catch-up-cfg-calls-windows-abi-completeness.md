@@ -4,6 +4,8 @@ title: Native catch-up: CFG, calls, Windows ABI completeness
 phase: P5-language
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T032]
 priority: 53
 status: todo

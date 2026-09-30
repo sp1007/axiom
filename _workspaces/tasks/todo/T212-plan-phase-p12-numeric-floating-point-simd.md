@@ -4,6 +4,8 @@ title: Plan phase P12 — Numeric, floating point & SIMD (expand roadmap epics i
 phase: P12-numeric-floating-point-simd
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

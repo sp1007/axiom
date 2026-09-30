@@ -4,6 +4,8 @@ title: Views & capabilities: view/mut_view, regions, conflicts, escapes
 phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T047]
 priority: 68
 status: todo

@@ -49,6 +49,9 @@ for tid, t in tasks.items():
     owner = m.get("owner", "")
     if owner and not os.path.exists(os.path.join(ROOT, ".claude", "agents", owner + ".md")):
         p(f"{tid}: owner '{owner}' has no agent file")
+    for key in ("model", "gate_model"):
+        if m.get(key) not in ("opus", "sonnet"):
+            p(f"{tid}: {key} must be opus or sonnet (got {m.get(key)!r})")
     if "## Acceptance" not in t["body"]:
         p(f"{tid}: no Acceptance section")
 

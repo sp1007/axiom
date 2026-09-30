@@ -4,6 +4,8 @@ title: `axiom0 build` end to end: first native Axiom program
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T025, T027, T016]
 priority: 45
 status: todo

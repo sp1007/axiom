@@ -4,6 +4,8 @@ title: Phase P12 gate — Numeric, floating point & SIMD
 phase: P12-numeric-floating-point-simd
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T212]
 priority: 312
 status: todo

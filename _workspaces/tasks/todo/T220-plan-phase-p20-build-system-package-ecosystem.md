@@ -4,6 +4,8 @@ title: Plan phase P20 — Build system & package ecosystem (expand roadmap epics
 phase: P20-build-system-package-ecosystem
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T316, T318]
 priority: 6
 status: todo

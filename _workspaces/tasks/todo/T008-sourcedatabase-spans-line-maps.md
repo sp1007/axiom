@@ -4,6 +4,8 @@ title: SourceDatabase, spans, line maps
 phase: P1-kernel
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T007]
 priority: 14
 status: todo

@@ -4,6 +4,8 @@ title: AST + parser core (items, statements, expressions, recovery)
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T010]
 priority: 21
 status: todo

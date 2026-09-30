@@ -4,6 +4,8 @@ title: Core extensibility contract + exact self-host subset (minimal C scope)
 phase: P0-foundation
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T003]
 priority: 4
 status: todo

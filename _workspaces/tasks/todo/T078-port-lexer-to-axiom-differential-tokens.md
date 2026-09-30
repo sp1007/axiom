@@ -4,6 +4,8 @@ title: Port lexer to Axiom (differential tokens)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T077]
 priority: 112
 status: todo

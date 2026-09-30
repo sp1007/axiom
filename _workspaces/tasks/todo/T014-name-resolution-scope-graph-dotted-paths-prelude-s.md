@@ -4,6 +4,8 @@ title: Name resolution: scope graph, dotted paths, prelude stub
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T012]
 priority: 24
 status: todo

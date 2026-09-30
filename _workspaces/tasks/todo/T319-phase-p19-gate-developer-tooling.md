@@ -4,6 +4,8 @@ title: Phase P19 gate — Developer tooling
 phase: P19-developer-tooling
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T219]
 priority: 319
 status: todo

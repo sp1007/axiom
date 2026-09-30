@@ -4,6 +4,8 @@ title: Plan phase P18 — Compiler architecture 2.0 (expand roadmap epics into t
 phase: P18-compiler-architecture-2-0
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

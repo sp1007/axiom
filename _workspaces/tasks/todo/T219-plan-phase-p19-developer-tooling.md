@@ -4,6 +4,8 @@ title: Plan phase P19 — Developer tooling (expand roadmap epics into tasks)
 phase: P19-developer-tooling
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T318]
 priority: 6
 status: todo

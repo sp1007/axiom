@@ -4,6 +4,8 @@ title: Closures, capture inference, function values
 phase: P7-abstraction
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T056]
 priority: 77
 status: todo

@@ -4,6 +4,8 @@ title: E18.6 Linker v2: separate compilation, multiple objects, archives
 phase: P18-compiler-architecture-2-0
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T218]
 priority: 94
 status: todo

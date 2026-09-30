@@ -4,6 +4,8 @@ title: VS2 gate: P5 conformance + differential -O0/-O1 + compiler perf baseline
 phase: P5-language
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T042, T043]
 priority: 64
 status: todo

@@ -4,6 +4,8 @@ title: Verifier v2: ownership/capability/drop re-verification
 phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T049]
 priority: 70
 status: todo

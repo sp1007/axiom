@@ -4,6 +4,8 @@ title: E11.3 std.thread, Mutex, channel, Atomic<T> on Windows
 phase: P11-concurrency-async
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T211, T089]
 priority: 132
 status: todo

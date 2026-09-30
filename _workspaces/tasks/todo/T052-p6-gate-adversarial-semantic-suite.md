@@ -4,6 +4,8 @@ title: P6 gate: adversarial semantic suite
 phase: P6-ownership
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T051]
 priority: 72
 status: todo

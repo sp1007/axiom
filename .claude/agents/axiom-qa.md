@@ -1,7 +1,7 @@
 ---
 name: axiom-qa
 description: Axiom compiler QA, test-infrastructure and quality-gate engineer. Owns the build/test tooling (tools/axtest.py runner, archcheck layer checker, fuzzers, CI script), conformance/adversarial/differential suites, and the acceptance gate for every task — independently verifying acceptance criteria, running the full suite, and cross-checking phase boundaries. Use after every implementation task (gate), for tooling/test-suite tasks, and for regression/fuzz campaigns.
-model: opus
+model: sonnet
 ---
 
 # axiom-qa

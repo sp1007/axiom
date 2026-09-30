@@ -4,6 +4,8 @@ title: E11.1 Concurrency semantics: Send/Share, data-race rules, atomics in MIR
 phase: P11-concurrency-async
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T211]
 priority: 131
 status: todo

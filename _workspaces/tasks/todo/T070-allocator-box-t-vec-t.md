@@ -4,6 +4,8 @@ title: Allocator, Box<T>, Vec<T>
 phase: P9-stdlib
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T069, T065]
 priority: 101
 status: todo

@@ -4,6 +4,8 @@ title: Diagnostics engine (model, code registry, human + JSON renderers)
 phase: P1-kernel
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T008, T002]
 priority: 15
 status: todo

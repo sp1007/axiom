@@ -4,6 +4,8 @@ title: String literals, Str views, print intrinsic (oracle)
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T039]
 priority: 61
 status: todo

@@ -4,6 +4,8 @@ title: Repository skeleton, CMake/Ninja build, CI script
 phase: P0-foundation
 owner: axiom-qa
 reviewer: axiom-architect
+model: sonnet
+gate_model: sonnet
 depends: []
 priority: 5
 status: todo

@@ -4,6 +4,8 @@ title: Plan phase P14 — Comptime 2.0, reflection, generators (expand roadmap e
 phase: P14-comptime-2-0-reflection-genera
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

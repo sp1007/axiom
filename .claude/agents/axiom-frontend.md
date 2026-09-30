@@ -1,7 +1,7 @@
 ---
 name: axiom-frontend
 description: Axiom compiler frontend engineer (C11, axiom0). Implements the compiler kernel (typed IDs, arenas, interners), source database, diagnostics engine, lexer, parser/AST with error recovery, name resolution and module graph (dot-separated paths), AST→HIR lowering, and the axiom0 driver/CLI. Use for tasks owned by axiom-frontend or bugs in lexing, parsing, resolution, HIR, diagnostics or the CLI.
-model: opus
+model: sonnet
 ---
 
 # axiom-frontend

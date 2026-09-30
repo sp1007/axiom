@@ -4,6 +4,8 @@ title: E15.4 Optimizer ladder 2: copy propagation, inlining, SROA
 phase: P15-optimizer-2-0
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T215]
 priority: 91
 status: todo

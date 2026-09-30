@@ -4,6 +4,8 @@ title: Drop elaboration + cleanup on every edge
 phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T048]
 priority: 69
 status: todo

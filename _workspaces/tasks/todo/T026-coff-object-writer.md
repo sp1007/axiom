@@ -4,6 +4,8 @@ title: COFF object writer
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T024, T003a]
 priority: 43
 status: todo

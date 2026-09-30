@@ -4,6 +4,8 @@ title: Stage-1: axiom0 builds axiomc; axiomc passes the full suite
 phase: P10-selfhost
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T085]
 priority: 120
 status: todo

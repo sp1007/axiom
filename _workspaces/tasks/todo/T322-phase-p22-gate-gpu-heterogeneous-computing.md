@@ -4,6 +4,8 @@ title: Phase P22 gate — GPU & heterogeneous computing
 phase: P22-gpu-heterogeneous-computing
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T222]
 priority: 322
 status: todo

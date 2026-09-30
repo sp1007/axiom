@@ -4,6 +4,8 @@ title: Port interpreter + optimizer to Axiom
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T082]
 priority: 117
 status: todo

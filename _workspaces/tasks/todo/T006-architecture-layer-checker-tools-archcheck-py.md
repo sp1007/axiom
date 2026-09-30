@@ -4,6 +4,8 @@ title: Architecture layer checker tools/archcheck.py
 phase: P0-foundation
 owner: axiom-qa
 reviewer: axiom-architect
+model: sonnet
+gate_model: sonnet
 depends: [T004]
 priority: 12
 status: todo

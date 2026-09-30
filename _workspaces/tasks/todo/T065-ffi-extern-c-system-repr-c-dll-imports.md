@@ -4,6 +4,8 @@ title: FFI: extern "C"/"system", @repr(C), DLL imports
 phase: P8-backend
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T062]
 priority: 92
 status: todo

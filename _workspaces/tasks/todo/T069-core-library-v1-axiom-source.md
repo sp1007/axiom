@@ -4,6 +4,8 @@ title: core library v1 (Axiom source)
 phase: P9-stdlib
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T062]
 priority: 100
 status: todo

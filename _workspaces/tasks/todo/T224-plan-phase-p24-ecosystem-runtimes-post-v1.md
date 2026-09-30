@@ -4,6 +4,8 @@ title: Plan phase P24 — Ecosystem runtimes (post-v1) (expand roadmap epics int
 phase: P24-ecosystem-runtimes-post-v1
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T323]
 priority: 6
 status: deferred

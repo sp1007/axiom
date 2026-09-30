@@ -4,6 +4,8 @@ title: Self-hosting plan: feature audit, compiler/ layout, differential strategy
 phase: P10-selfhost
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T075]
 priority: 110
 status: todo

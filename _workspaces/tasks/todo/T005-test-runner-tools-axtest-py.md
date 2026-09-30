@@ -4,6 +4,8 @@ title: Test runner tools/axtest.py
 phase: P0-foundation
 owner: axiom-qa
 reviewer: axiom-architect
+model: sonnet
+gate_model: sonnet
 depends: [T004]
 priority: 11
 status: todo

@@ -4,6 +4,8 @@ title: Windows x64 ABI + machine IR + isel + frame lowering (baseline)
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T023, T024, T003a]
 priority: 42
 status: todo

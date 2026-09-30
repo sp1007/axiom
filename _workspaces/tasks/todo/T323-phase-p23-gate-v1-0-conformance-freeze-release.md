@@ -4,6 +4,8 @@ title: Phase P23 gate — v1.0 conformance, freeze & release
 phase: P23-v1-0-conformance-freeze-releas
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T223, T091]
 priority: 323
 status: todo

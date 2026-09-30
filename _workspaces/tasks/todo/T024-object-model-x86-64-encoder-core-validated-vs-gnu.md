@@ -4,6 +4,8 @@ title: Object model + x86-64 encoder core (validated vs GNU as)
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T007, T005, T003a]
 priority: 41
 status: todo

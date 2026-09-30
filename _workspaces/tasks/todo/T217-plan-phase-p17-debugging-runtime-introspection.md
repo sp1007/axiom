@@ -4,6 +4,8 @@ title: Plan phase P17 — Debugging & runtime introspection (expand roadmap epic
 phase: P17-debugging-runtime-introspectio
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T316]
 priority: 6
 status: todo

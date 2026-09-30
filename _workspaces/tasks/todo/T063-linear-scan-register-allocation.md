@@ -4,6 +4,8 @@ title: E15.8 Linear-scan register allocation
 phase: P15-optimizer-2-0
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T215]
 priority: 90
 status: todo

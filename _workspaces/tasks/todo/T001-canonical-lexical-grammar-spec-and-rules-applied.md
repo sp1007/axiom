@@ -4,6 +4,8 @@ title: Canonical lexical + grammar spec (= and . rules applied)
 phase: P0-foundation
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: []
 priority: 1
 status: todo

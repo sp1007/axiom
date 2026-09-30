@@ -4,6 +4,8 @@ title: Text: Str, String, formatting minimal, Bytes
 phase: P9-stdlib
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T070]
 priority: 102
 status: todo

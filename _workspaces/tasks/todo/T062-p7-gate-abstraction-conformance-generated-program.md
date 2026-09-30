@@ -4,6 +4,8 @@ title: P7 gate: abstraction conformance + generated-program fuzzing
 phase: P7-abstraction
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T061, T060]
 priority: 82
 status: todo

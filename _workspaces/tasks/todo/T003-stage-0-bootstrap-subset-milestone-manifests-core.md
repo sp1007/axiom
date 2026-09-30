@@ -4,6 +4,8 @@ title: Stage-0 bootstrap subset, milestone manifests, core execution semantics
 phase: P0-foundation
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T001]
 priority: 3
 status: todo

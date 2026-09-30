@@ -4,6 +4,8 @@ title: Port COFF writer, PE linker, driver → axiomc
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T084]
 priority: 119
 status: todo

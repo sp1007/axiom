@@ -4,6 +4,8 @@ title: Kernel: typed IDs, arena, vec, hashmap, strings, interner, hashing
 phase: P1-kernel
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T004, T005]
 priority: 13
 status: todo

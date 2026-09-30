@@ -4,6 +4,8 @@ title: Phase P16 gate — Targets & platforms
 phase: P16-targets-platforms
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T216, T066]
 priority: 316
 status: todo

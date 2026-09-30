@@ -4,6 +4,8 @@ title: Native catch-up: generics, closures, fn pointers
 phase: P7-abstraction
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T057]
 priority: 79
 status: todo

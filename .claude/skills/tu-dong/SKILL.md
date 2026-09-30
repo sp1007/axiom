@@ -21,6 +21,9 @@ the board is finished or the user says stop.
 
 ## Start procedure
 
+0. The main session only coordinates; recommend `/model sonnet` to the user if the session runs on
+   Opus (subagent models come from the task files, see axiom-compiler model policy).
+
 1. Ensure the repo is a git repo on a working branch (`git rev-parse --abbrev-ref HEAD`); if on
    `main`/`master`, that is acceptable for this local, single-user project — the user asked for
    automatic commits here. Never force-push, never rewrite history.

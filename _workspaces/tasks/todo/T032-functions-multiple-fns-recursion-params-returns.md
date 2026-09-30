@@ -4,6 +4,8 @@ title: Functions: multiple fns, recursion, params, returns
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T031]
 priority: 52
 status: todo

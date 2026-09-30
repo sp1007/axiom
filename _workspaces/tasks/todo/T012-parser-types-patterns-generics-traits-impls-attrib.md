@@ -4,6 +4,8 @@ title: Parser: types, patterns, generics, traits/impls, attributes, closures
 phase: P2-frontend
 owner: axiom-frontend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T011]
 priority: 22
 status: todo

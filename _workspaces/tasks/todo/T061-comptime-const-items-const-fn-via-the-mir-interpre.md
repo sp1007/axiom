@@ -4,6 +4,8 @@ title: Const items and constant expressions (via the MIR interpreter)
 phase: P7-abstraction
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T059]
 priority: 81
 status: todo

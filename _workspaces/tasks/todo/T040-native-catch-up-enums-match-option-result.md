@@ -4,6 +4,8 @@ title: Native catch-up: enums, match, Option/Result
 phase: P5-language
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T039, T037]
 priority: 60
 status: todo

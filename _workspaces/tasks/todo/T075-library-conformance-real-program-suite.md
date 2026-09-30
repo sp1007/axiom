@@ -4,6 +4,8 @@ title: Library conformance + real-program suite
 phase: P9-stdlib
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T074, T073]
 priority: 106
 status: todo

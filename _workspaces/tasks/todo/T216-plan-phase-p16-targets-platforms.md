@@ -4,6 +4,8 @@ title: Plan phase P16 — Targets & platforms (expand roadmap epics into tasks)
 phase: P16-targets-platforms
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T313]
 priority: 6
 status: todo

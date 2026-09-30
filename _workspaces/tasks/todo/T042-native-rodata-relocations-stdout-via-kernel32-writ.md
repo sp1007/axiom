@@ -4,6 +4,8 @@ title: Native: rodata, relocations, stdout via kernel32 (UTF-8 greeting)
 phase: P5-language
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T041, T040]
 priority: 62
 status: todo

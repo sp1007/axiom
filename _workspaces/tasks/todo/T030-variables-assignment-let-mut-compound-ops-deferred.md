@@ -4,6 +4,8 @@ title: Variables & assignment: let mut, compound ops, deferred init
 phase: P5-language
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T029]
 priority: 50
 status: todo

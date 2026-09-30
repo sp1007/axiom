@@ -4,6 +4,8 @@ title: LIR + naive MIR→LIR lowering
 phase: P4-native
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T021, T003a]
 priority: 40
 status: todo

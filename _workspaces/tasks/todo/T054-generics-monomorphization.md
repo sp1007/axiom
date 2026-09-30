@@ -4,6 +4,8 @@ title: Generics + monomorphization
 phase: P7-abstraction
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T053]
 priority: 74
 status: todo

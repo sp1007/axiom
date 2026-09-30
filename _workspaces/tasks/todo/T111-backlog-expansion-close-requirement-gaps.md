@@ -4,6 +4,8 @@ title: Backlog expansion — close every requirement gap, add covers to all task
 phase: P0-traceability
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T110]
 priority: 9
 status: todo

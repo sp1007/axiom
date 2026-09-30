@@ -4,6 +4,8 @@ title: Phase P20 gate — Build system & package ecosystem
 phase: P20-build-system-package-ecosystem
 owner: axiom-qa
 reviewer: axiom-architect
+model: opus
+gate_model: sonnet
 depends: [T220]
 priority: 320
 status: todo

@@ -4,6 +4,8 @@ title: Requirements catalogue + coverage matrix (consolidation)
 phase: P0-traceability
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: opus
 depends: [T092, T093, T094, T095, T096, T097, T098, T099, T100, T101, T102, T103, T104, T105, T106, T107, T108, T109]
 priority: 8
 status: todo

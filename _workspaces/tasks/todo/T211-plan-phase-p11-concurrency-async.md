@@ -4,6 +4,8 @@ title: Plan phase P11 — Concurrency & async (expand roadmap epics into tasks)
 phase: P11-concurrency-async
 owner: axiom-architect
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T087]
 priority: 6
 status: todo

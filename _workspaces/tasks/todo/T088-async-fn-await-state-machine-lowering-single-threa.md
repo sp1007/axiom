@@ -4,6 +4,8 @@ title: E11.4 async fn / await: state-machine lowering + single-thread executor
 phase: P11-concurrency-async
 owner: axiom-semantics
 reviewer: axiom-qa
+model: opus
+gate_model: sonnet
 depends: [T211]
 priority: 130
 status: todo

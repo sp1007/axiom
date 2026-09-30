@@ -4,6 +4,8 @@ title: Native catch-up: numerics, aggregates, arrays, struct ABI
 phase: P5-language
 owner: axiom-backend
 reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
 depends: [T036]
 priority: 57
 status: todo
