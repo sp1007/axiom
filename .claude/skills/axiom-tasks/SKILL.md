@@ -29,6 +29,7 @@ python .claude/skills/axiom-tasks/scripts/taskctl.py requeue T010 --reason "stal
 python .claude/skills/axiom-tasks/scripts/taskctl.py commit T010
 python .claude/skills/axiom-tasks/scripts/taskctl.py validate
 python .claude/skills/axiom-tasks/scripts/harness_check.py   # harness consistency (run after board/skill edits)
+python .claude/skills/axiom-tasks/scripts/overdue.py         # autopilot agents running past their time limit (hung)
 ```
 
 `next` only returns tasks whose dependencies are all done, that are not blocked, and whose `paths`

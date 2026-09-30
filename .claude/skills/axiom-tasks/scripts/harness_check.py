@@ -115,7 +115,8 @@ for f in staged:
 
 # --- stale phrases from superseded decisions -----------------------------------------
 STALE = [r"doing/ is (now )?empty", r"only when doing", r"T092-T108", r"\bP11a\b", r"Linux ELF first",
-         r"x86_64-linux first", r"\bT065a\b", r"\bT065b\b"]
+         r"x86_64-linux first", r"\bT065a\b", r"\bT065b\b", r"\*/5 \* \* \* \*", r"5-minute",
+         r"every 5 minutes", r"mỗi 5 phút"]
 for base in (".claude", "spec", "_workspaces/tasks", "CLAUDE.md"):
     path = os.path.join(ROOT, base)
     files = [path] if os.path.isfile(path) else [os.path.join(d, f) for d, _, fs in os.walk(path) for f in fs]

@@ -16,8 +16,8 @@ sau mỗi task.
 **Ngôn ngữ:** spec/code/test/báo cáo giữa agent bằng tiếng Anh; mỗi spec chuẩn, ADR, bản rà soát phase có `## Tóm tắt` tiếng Việt; autopilot báo cáo bằng tiếng Việt.
 
 **Trigger:** Mọi yêu cầu xây/tiếp tục/sửa/kiểm thử compiler Axiom → dùng skill `axiom-compiler`.
-Chạy tự động liên tục → `/tu-dong` (dừng: `/tu-dong dừng`, trạng thái: `/tu-dong trạng thái`); nhịp
-giám sát 5 phút → `/axiom-tick`. Thẩm định lại tài liệu/board trước khi chạy → `/tham-dinh` (4 agent axiom-auditor). Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
+Chạy tự động liên tục → `/tu-dong` (dừng: `/tu-dong dừng`, trạng thái: `/tu-dong trạng thái`); tiến độ chạy theo sự kiện, nhịp
+giám sát dự phòng 30 phút → `/axiom-tick` (kèm phát hiện agent treo). Thẩm định lại tài liệu/board trước khi chạy → `/tham-dinh` (4 agent axiom-auditor). Quản lý task → `axiom-tasks` (board ở `_workspaces/tasks/{todo,doing,done}`).
 Câu hỏi đơn giản có thể trả lời trực tiếp.
 
 **Chọn model tự động:** chủ dự án không phải gõ `/model`. Các skill điều phối (`axiom-compiler`, `/tu-dong`, `/axiom-tick`, `/tham-dinh`) tự chạy trên Sonnet; mỗi subagent nhận model từ task (`model`/`gate_model`: Opus cho thiết kế, Sonnet cho việc kiểm chứng được bằng test); vòng sửa QA thứ 2 tự nâng lên Opus.
@@ -48,3 +48,4 @@ Câu hỏi đơn giản có thể trả lời trực tiếp.
 | 2026-09-30 | Bổ sung cấu trúc cơ bản trước self-host: T061a con trỏ thô tối giản + `unsafe` + intrinsic bộ nhớ (Box/Vec/FFI cần; E13.1 mở rộng sau), slice (view độ dài động) ở T048/T051, `if let`/`while let`/destructuring ở T038 | board, ROADMAP | Phát hiện khi rà soát cấu trúc ngôn ngữ |
 | 2026-09-30 | Thêm agent `axiom-auditor` (chỉ đọc) và lệnh `/tham-dinh`: 4 góc thẩm định song song (self-host, ladder 0263, tính khả thi task, nhất quán quy trình), gộp kết quả, sửa lỗi rõ ràng, trình điểm cần quyết định | agents/axiom-auditor, skills/tham-dinh | Chủ dự án thấy nhiều lỗi cơ bản; tác giả task khó tự thấy điểm mù |
 | 2026-09-30 | Chọn model tự động: `model: sonnet` trong front-matter của các skill điều phối, bỏ bước `/model sonnet` thủ công; harness_check kiểm tra giá trị model của skill | skills axiom-compiler, tu-dong, axiom-tick, tham-dinh; CLAUDE.md | Chủ dự án không muốn chọn model bằng tay |
+| 2026-09-30 | Tick giảm từ 5 xuống 30 phút (tiến độ chính chạy theo thông báo hoàn thành của subagent); thêm phát hiện agent treo (`overdue.py`, mốc `since` trong autopilot.json, giới hạn impl/fix 180 phút, QA/unblock 60 phút) | tu-dong, axiom-tick, axiom-compiler, axiom-tasks/scripts | Tick 5 phút tốn quota và làm dài ngữ cảnh; agent treo không bị phát hiện |

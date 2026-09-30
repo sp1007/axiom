@@ -79,7 +79,10 @@ runtime rejects that type (agent files added mid-session are not yet registered)
      --compiler build-<ID>/axiom0.exe to tools/axtest.py.
      Finish with "<ID> COMPLETE" or "<ID> BLOCKED: <reason>".
      ```
-   - record in autopilot.json `running[<ID>] = {agent: "<ID>-impl", stage: "impl", round: 0}`.
+   - record in autopilot.json `running[<ID>] = {agent: "<ID>-impl", stage: "impl", round: 0, since: "<YYYY-MM-DD HH:MM>"}`.
+     On every stage change (QA gate → `stage: "qa"`, fix round → `stage: "fix"`, architect unblock →
+     `stage: "unblock"`) update `agent`, `stage` and `since` — the tick's hang check
+     (`overdue.py`) measures time from `since`.
 3. When the agent finishes (task notification):
    - `BLOCKED` → `taskctl.py block <ID> --reason "<reason>"`; queue an architect unblock (below).
    - `COMPLETE` but no report → send it back once (SendMessage to `<ID>-impl`: "write the report");
@@ -102,7 +105,7 @@ runtime rejects that type (agent files added mid-session are not yet registered)
    - **FAIL**, round == 2 → `taskctl.py block <ID> --reason "QA failed 3 times: <top findings>"` →
      architect unblock.
 6. After any task leaves `doing/` (done or blocked): immediately refill the free slots with
-   `taskctl next --max <free slots>` (do not wait for the 5-minute tick).
+   `taskctl next --max <free slots>` (do not wait for the 30-minute safety tick).
 
 ## Procedure: architect unblock
 

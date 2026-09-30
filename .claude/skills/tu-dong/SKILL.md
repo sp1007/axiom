@@ -1,6 +1,6 @@
 ---
 name: tu-dong
-description: Lệnh "tự động" — bật chế độ autopilot cho dự án compiler Axiom. Tạo monitor chạy mỗi 5 phút; luôn giữ tối đa 3 task chạy song song — hễ có chỗ trống (task xong hoặc bị chặn) là tự xác định task tiếp theo không đụng thư mục đang làm và chạy ngay bằng subagent, tự QA, tự commit sau mỗi task, không hỏi người dùng, không ngủ đông. Dùng khi người dùng gõ /tu-dong, "tự động", "chạy tự động", "autopilot", "cứ chạy tiếp đi", "bật tự động"; cũng dùng cho "tự động dừng"/"dừng tự động" (tắt) và "tự động trạng thái"/"tiến độ" (xem trạng thái).
+description: Lệnh "tự động" — bật chế độ autopilot cho dự án compiler Axiom. Tạo nhịp giám sát dự phòng mỗi 30 phút (tiến độ chính chạy theo sự kiện khi subagent xong); luôn giữ tối đa 3 task chạy song song — hễ có chỗ trống (task xong hoặc bị chặn) là tự xác định task tiếp theo không đụng thư mục đang làm và chạy ngay bằng subagent, tự QA, tự commit sau mỗi task, không hỏi người dùng, không ngủ đông. Dùng khi người dùng gõ /tu-dong, "tự động", "chạy tự động", "autopilot", "cứ chạy tiếp đi", "bật tự động"; cũng dùng cho "tự động dừng"/"dừng tự động" (tắt) và "tự động trạng thái"/"tiến độ" (xem trạng thái).
 model: sonnet
 ---
 
@@ -33,13 +33,15 @@ the board is finished or the user says stop.
 2. `python .claude/skills/axiom-tasks/scripts/taskctl.py validate` — fix board errors first
    (architect) if invalid.
 3. `CronList`; if an autopilot job already exists, reuse it. Otherwise `CronCreate` with
-   `cron: "*/5 * * * *"`, `recurring: true`, `prompt: "/axiom-tick"`.
+   `cron: "7,37 * * * *"` (every 30 minutes, off the :00/:30 marks), `recurring: true`,
+   `prompt: "/axiom-tick"`.
 4. Write `_workspaces/autopilot.json`:
    ```json
    {"enabled": true, "cron_id": "<id>", "cron_created": "YYYY-MM-DD HH:MM",
-    "max_parallel": 3, "running": {}}
+    "max_parallel": 3, "running": {},
+    "timeouts": {"impl": 180, "fix": 180, "qa": 60, "unblock": 60}}
    ```
-5. Run one tick **immediately** (follow the axiom-tick skill) — don't wait 5 minutes for the first.
+5. Run one tick **immediately** (follow the axiom-tick skill) — don't wait for the first cron firing.
 6. Tell the user (Vietnamese, ≤ 6 lines): autopilot on, cron id, which tasks started, how to stop
    (`/tu-dong dừng`), and that session cron jobs expire after 7 days and live only while this
    Claude session is open (the tick renews the job automatically before expiry; if the session is
@@ -48,7 +50,8 @@ the board is finished or the user says stop.
 ## Behaviour contract ("không ngủ đông")
 
 - Idle is never a stopping point: whenever a task finishes or blocks, refill its slot right away
-  (the orchestrator does this; owner decision 2026-09-29 replaced "only when doing/ is empty"); the 5-minute tick is the safety net that catches
+  (the orchestrator does this; owner decision 2026-09-29 replaced "only when doing/ is empty"); progress is event-driven (every subagent completion re-invokes the session, which
+  advances the task and refills slots at once); the 30-minute tick is the safety net that catches
   anything missed (stale tasks, crashed agents, blocked tasks awaiting the architect).
 - Never end a turn by asking the user what to do next while autopilot is enabled. Summarise in one
   or two lines **in Vietnamese** and continue.

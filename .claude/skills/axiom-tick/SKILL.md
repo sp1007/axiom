@@ -1,6 +1,6 @@
 ---
 name: axiom-tick
-description: One scheduling tick of the Axiom autopilot (fired every 5 minutes by the /tu-dong cron job, or run manually with /axiom-tick). Checks running agents and the task board, resumes stale tasks, advances finished work through QA/commit, unblocks blocked tasks via the architect, and — if no task is in progress — picks the next parallel-safe batch and starts it. Use when the prompt is "/axiom-tick", "tick", "kiểm tra tiến độ và chạy tiếp".
+description: One scheduling tick of the Axiom autopilot (fired every 30 minutes by the /tu-dong cron job as a safety net, or run manually with /axiom-tick). Checks running agents and the task board, resumes stale tasks, advances finished work through QA/commit, unblocks blocked tasks via the architect, and — if no task is in progress — picks the next parallel-safe batch and starts it. Use when the prompt is "/axiom-tick", "tick", "kiểm tra tiến độ và chạy tiếp".
 model: sonnet
 ---
 
@@ -17,7 +17,7 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
 1. **Enabled?** Read `_workspaces/autopilot.json`. If missing or `enabled: false` → do nothing,
    reply "autopilot off" in one line. (Manual `/axiom-tick` with autopilot off still performs steps
    2–6 once.)
-2. **Renew cron** if `cron_created` is older than 6 days: `CronCreate` a new `*/5 * * * *` job with
+2. **Renew cron** if `cron_created` is older than 6 days: `CronCreate` a new `7,37 * * * *` job with
    prompt `/axiom-tick`, `CronDelete` the old id, update the file. (Session cron jobs expire after
    7 days — renewing keeps the loop alive.)
 3. **Board**: `python .claude/skills/axiom-tasks/scripts/taskctl.py status --json`.
@@ -29,6 +29,12 @@ ask the user anything. All actions follow the axiom-compiler orchestrator proced
    - no live agent (session restart / crash) → report says COMPLETE and no PASS QA → start QA gate;
      otherwise `taskctl requeue <ID> --reason stale` and drop it from `running` (after 3 attempts
      requeue blocks it; step 5 then sends it to the architect).
+4b. **Hung agents** — `python .claude/skills/axiom-tasks/scripts/overdue.py`. For each overdue entry
+   (a hung agent still looks alive, so only elapsed time reveals it): `TaskStop` the agent, log it,
+   then by stage — `impl`/`fix` → `taskctl requeue <ID> --reason "hung: <n> min in <stage>"` (requeue
+   blocks after 3 attempts) and drop it from `running`; `qa` → spawn a fresh gate once, a second
+   overdue gate → `taskctl block`; `unblock` → spawn the architect unblock once more, then leave the
+   task blocked and log. An entry without `since` gets `since` = now (legacy state).
 5. **Blocked tasks** (status `blocked`, never `deferred`) without an active `unblock-<ID>` agent → spawn architect unblock (max 2 at a
    time).
 6. **Start / refill work** (owner decision: keep every slot busy) — free = `max_parallel` −
