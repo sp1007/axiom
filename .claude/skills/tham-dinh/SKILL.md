@@ -33,8 +33,9 @@ holds it — it does not ask whether it arrives *in time*. Four independent lens
    `subagent_type: "axiom-auditor"` (if rejected: `general-purpose` and start the prompt with
    `You are axiom-auditor. First read .claude/agents/axiom-auditor.md and follow it exactly.`).
    Tell the user in Vietnamese (≤ 3 lines) that the audit runs and roughly takes 20–40 minutes.
-3. When all four have finished (task notifications; if one crashes, rerun it once), consolidate
-   yourself — or, if the findings are long, spawn `axiom-architect` (opus) with the four files:
+3. When all four have finished (task notifications; if one crashes, rerun it once), spawn
+   `axiom-architect` with `model: "opus"` to consolidate — judging which findings are real, mechanical
+   or owner decisions needs design judgement, and this session runs on Sonnet. Give it the four files:
    - dedupe across lenses; keep the highest severity; drop findings disproven by reading the cited
      file (note them under "Rejected" with the reason);
    - write `_workspaces/audit/<date>/SUMMARY.md`: Vietnamese `## Tóm tắt` first, then a table
