@@ -27,6 +27,7 @@ Implement the full lexical spec: tokens with spans, newline tokens where signifi
 ## Acceptance
 - [ ] Golden test: string literal `"Xin chào thế giới"` lexes with correct byte span and decoded value (UTF-8 preserved; char count vs byte count checked).
 - [ ] Golden tests covering every token kind and literal form from 0152 §12 (1, 1u32, 1.0, 1e10, 0xff, 0b101, "a", b"..."), `1..2`, `p.0.1`, all operators by maximal munch.
+- [ ] Char literals `'a'`, `'ế'`, `'\u{1EBF}'` decode to their Unicode scalar value; string `"\u{1EBF}"` decodes to the UTF-8 bytes of `ế` (E1 BA BF); `\u{D800}` (surrogate), `\u{110000}`, `''` and `'ab'` are rejected with dedicated codes (e.g. AX_LEX_INVALID_UNICODE_ESCAPE, AX_LEX_BAD_CHAR_LITERAL).
 - [ ] ui tests for each lexer diagnostic.
 - [ ] Lexer never crashes on arbitrary bytes (quick random test in report).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).

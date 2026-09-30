@@ -118,7 +118,8 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
 ### P12 — Numeric, floating point & SIMD
 - **E12.1 Integer model completion** — all widths incl. i128/u128 if specified, wrapping/checked/
   saturating families, bit ops, conversions. Src tasks/0327 tasks/0334 tasks/0431.
-- **E12.2 Floating-point semantics** — IEEE-754 rules, NaN/signed zero, rounding, float formatting/
+- **E12.2 Floating-point semantics** — f32/f64 types enter the language here (axiom0 has none; T034),
+  SSE2 scalar codegen and XMM argument passing in the Windows x64 ABI, IEEE-754 rules, NaN/signed zero, rounding, float formatting/
   parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331.
 - **E12.3 SIMD & vector types** — portable vector types, masks, lane ops, target feature detection.
   Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347.
@@ -324,6 +325,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-30 | Text & scalars before self-host: `char` in T034/T010, char + UTF-16 primitives in T071, chars() in T073, W APIs only in T074; floats entirely in E12.2 (not in axiom0), float formatting removed from T071 | owner decision |
 | 2026-09-30 | R8 std in Axiom as early as possible: T065 → T051+T060, T069 → T056+T060, T073 +T059, T075 +T062 | owner remark |
 | 2026-09-30 | Self-host std subset completed: T073a arenas + typed ID tables (from E21.9), sort (T070), StringBuilder/format/parse/ByteBuf (T071), binary files/path/dir listing/clock (T074); subset defined early in T003a | self-host needs |
 | 2026-09-29 | E18.7 Windows x64 .lib/.dll + import lib right after self-hosting (T750, T751); E13.7 reduced to module-relative bindings; C core emits .obj/.exe only | REQ-OWNER-006 |
