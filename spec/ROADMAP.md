@@ -36,6 +36,11 @@ reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs
   needed to compile axiomc (dyn/vtables, comptime fn, linear-scan regalloc, optimizer ladder 2,
   Linux ELF, separate compilation, unwind info…) are post-T087 epics. QA fails any axiom0 change
   that implements out-of-subset features.
+- **R8 — Std in Axiom as soon as possible.** The standard library (including the self-host std subset)
+  is written in Axiom from the start and compiled by axiom0 — never implemented in C; C provides only
+  compiler intrinsics and FFI to the OS. Each std task depends only on the language features it uses,
+  so library work (and dogfooding of the compiler) starts as early as possible. std is not ported at
+  self-hosting: axiomc compiles the same sources.
 - **R6 — Targets:** Windows x64 PE first, Linux x64 ELF second (0181); other targets in P16 through the
   shared target-independent LIR / target description (0152 §68, 0163).
 
@@ -319,6 +324,7 @@ starts when the project owner explicitly schedules it.
 | Date | Change | ADR |
 |---|---|---|
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
+| 2026-09-30 | R8 std in Axiom as early as possible: T065 → T051+T060, T069 → T056+T060, T073 +T059, T075 +T062 | owner remark |
 | 2026-09-30 | Self-host std subset completed: T073a arenas + typed ID tables (from E21.9), sort (T070), StringBuilder/format/parse/ByteBuf (T071), binary files/path/dir listing/clock (T074); subset defined early in T003a | self-host needs |
 | 2026-09-29 | E18.7 Windows x64 .lib/.dll + import lib right after self-hosting (T750, T751); E13.7 reduced to module-relative bindings; C core emits .obj/.exe only | REQ-OWNER-006 |
 | 2026-09-29 | Output/library coverage: E16.10 artifact kinds & library matrix, E16.11 universal binaries, E16.12 Windows ARM64, E12.5 CPU multiversioning, E20.7 Axiom dynamic components; artifact matrix table | owner review of specs |

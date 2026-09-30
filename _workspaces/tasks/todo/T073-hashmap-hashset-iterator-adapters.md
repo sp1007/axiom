@@ -6,7 +6,7 @@ owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T071, T072]
+depends: [T071, T072, T059]
 priority: 104
 status: todo
 attempts: 0

@@ -6,7 +6,7 @@ owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T062]
+depends: [T056, T060]
 priority: 100
 status: todo
 attempts: 0
@@ -30,5 +30,6 @@ The OS-independent core every Axiom program can use.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Starts as soon as the language features it needs exist (ROADMAP R8), not after the whole P7 gate.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

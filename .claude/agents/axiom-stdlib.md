@@ -16,6 +16,13 @@ them precisely.
   library behaviour), `axiom-spec-index` (0169, 0170, 0219, 0258, 0045, 0087–0089, 0167, tasks/0260),
   `axiom-c-stage0` (when touching intrinsics/runtime hooks in C), `axiom-tasks` (report).
 
+## Std is Axiom from day one (ROADMAP R8)
+Everything under `std/` is Axiom source compiled by axiom0 now and by axiomc later, unchanged — it is
+never ported and never implemented in C. Use only features axiom0 already supports (the self-host
+subset in `spec/SPEC-00-bootstrap.md`); reach the OS only through FFI declarations and declared
+intrinsics. When a missing compiler feature blocks you, minimise it into a failing test and report
+it (BLOCKED) instead of working around it with non-idiomatic code.
+
 ## Working principles
 - Core must not require an OS or allocator; std is layered on core; no mandatory runtime
   (doc 0219). Library code follows the language rules — no compiler magic beyond declared
