@@ -11,7 +11,7 @@ priority: 131
 status: todo
 attempts: 0
 paths: [compiler/traits/auto, compiler/mir, compiler/interp, tests/ui/concurrency]
-spec: [0091, 0092, 0079, 0276, tasks/0298, 0208]
+spec: [0091, 0092, 0079, tasks/0276, tasks/0298, 0208]
 ---
 # T089 — Concurrency semantics: Send/Share, data-race rules, atomics in MIR
 

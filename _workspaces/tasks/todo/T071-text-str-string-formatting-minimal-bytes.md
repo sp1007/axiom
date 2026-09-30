@@ -11,7 +11,7 @@ priority: 102
 status: todo
 attempts: 0
 paths: [std/text, tests/std/text]
-spec: [0089, tasks/0332, 0045, 0304]
+spec: [0089, tasks/0332, 0045, tasks/0304]
 ---
 # T071 — Text: Str, String, formatting minimal, Bytes
 

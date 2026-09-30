@@ -31,6 +31,8 @@ def phase_num(t):
 # --- board -------------------------------------------------------------------
 tasks = taskctl.load_all()
 ids = set(tasks)
+corpus = {d: os.listdir(os.path.join(ROOT, "docs", "base", d))
+          for d in ("specs", "tasks", "others") if os.path.isdir(os.path.join(ROOT, "docs", "base", d))}
 for tid, t in tasks.items():
     m = t["meta"]
     for key in ("id", "title", "phase", "owner", "priority", "status", "paths"):
@@ -54,6 +56,11 @@ for tid, t in tasks.items():
             p(f"{tid}: {key} must be opus or sonnet (got {m.get(key)!r})")
     if "## Acceptance" not in t["body"]:
         p(f"{tid}: no Acceptance section")
+    # spec refs: plain NNNN = docs/base/specs, tasks/NNNN = docs/base/tasks, others/NNNN = docs/base/others
+    for s in m.get("spec", []):
+        mm = re.fullmatch(r"(?:(tasks|others)/)?(\d{4})", s)
+        if mm and not any(f.startswith(mm.group(2)) for f in corpus.get(mm.group(1) or "specs", [])):
+            p(f"{tid}: spec ref {s} not found in docs/base/{mm.group(1) or 'specs'}")
 
 # roadmap epics referenced by task titles exist
 roadmap = open(os.path.join(ROOT, "spec", "ROADMAP.md"), encoding="utf-8").read()

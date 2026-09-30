@@ -11,7 +11,7 @@ priority: 76
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/traits, bootstrap/axiom0/src/types, tests/run/trait2, tests/ui/trait2]
-spec: [0066, 0305, tasks/0476]
+spec: [0066, tasks/0305, tasks/0476]
 ---
 # T056 — Associated items, default methods, supertraits, operator traits, derive
 

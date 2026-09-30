@@ -11,7 +11,7 @@ priority: 701
 status: todo
 attempts: 0
 paths: [compiler/link/pe_dll, compiler/link/implib, tests/link/dll]
-spec: [0186, 0187, 0563, 0104, spec/decisions/ADR-0001-fixed-address-declarations.md]
+spec: [0186, 0187, tasks/0563, 0104, spec/decisions/ADR-0001-fixed-address-declarations.md]
 ---
 # T751 — E18.7 PE DLL output: exports, DllMain initialiser, base relocations, import library
 

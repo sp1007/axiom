@@ -11,7 +11,7 @@ priority: 52
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/fn, tests/ui/fn]
-spec: [0069, 0266, tasks/0284]
+spec: [0069, tasks/0266, tasks/0284]
 ---
 # T032 — Functions: multiple fns, recursion, params, returns
 

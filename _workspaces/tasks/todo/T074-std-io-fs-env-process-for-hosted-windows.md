@@ -11,7 +11,7 @@ priority: 105
 status: todo
 attempts: 0
 paths: [std/io, std/fs, std/env, std/process, tests/std/io]
-spec: [0330, tasks/0335, 0220, 0221]
+spec: [tasks/0330, tasks/0335, 0220, 0221]
 ---
 # T074 — std.io / fs / env / process for hosted Windows
 

@@ -11,7 +11,7 @@ priority: 100
 status: todo
 attempts: 0
 paths: [std/core, tests/std/core]
-spec: [0169, 0170, 0219, 0303, 0305, tasks/0353]
+spec: [0169, 0170, 0219, tasks/0303, tasks/0305, tasks/0353]
 ---
 # T069 — core library v1 (Axiom source)
 

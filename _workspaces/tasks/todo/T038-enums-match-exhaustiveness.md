@@ -11,7 +11,7 @@ priority: 58
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/match, tests/run/enum, tests/ui/enum]
-spec: [0065, 0268, tasks/0392, tasks/0504]
+spec: [0065, tasks/0268, tasks/0392, tasks/0504]
 ---
 # T038 — Enums + match + exhaustiveness
 

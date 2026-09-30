@@ -11,7 +11,7 @@ priority: 75
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/traits, bootstrap/axiom0/src/types, tests/run/trait, tests/ui/trait]
-spec: [0158, 0212, 0046, 0272, tasks/0389, tasks/0611]
+spec: [0158, 0212, 0046, tasks/0272, tasks/0389, tasks/0611]
 ---
 # T055 — Traits + trait solver + static dispatch
 

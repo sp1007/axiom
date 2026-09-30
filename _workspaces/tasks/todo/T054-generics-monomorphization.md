@@ -11,7 +11,7 @@ priority: 74
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/traits/mono, bootstrap/axiom0/src/mir, tests/run/generic, tests/ui/generic]
-spec: [0083, 0271, tasks/0506, tasks/0354, 0042]
+spec: [0083, tasks/0271, tasks/0506, tasks/0354, 0042]
 ---
 # T054 — Generics + monomorphization
 

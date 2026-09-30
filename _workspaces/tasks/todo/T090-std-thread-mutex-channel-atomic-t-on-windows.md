@@ -11,7 +11,7 @@ priority: 132
 status: todo
 attempts: 0
 paths: [std/thread, std/sync, tests/std/thread]
-spec: [0203, 0206, 0207, 0208, 0329]
+spec: [0203, 0206, 0207, 0208, tasks/0329]
 ---
 # T090 — std.thread, Mutex, channel, Atomic<T> on Windows
 

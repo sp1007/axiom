@@ -11,7 +11,7 @@ priority: 60
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum]
-spec: [0268, 0183]
+spec: [tasks/0268, 0183]
 ---
 # T040 — Native catch-up: enums, match, Option/Result
 

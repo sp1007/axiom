@@ -11,7 +11,7 @@ priority: 59
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, std/core/prelude, tests/run/result, tests/ui/result]
-spec: [0269, 0111, 0107, 0222, tasks/0288]
+spec: [tasks/0269, 0111, 0107, 0222, tasks/0288]
 ---
 # T039 — Option/Result lang items + `?` operator
 

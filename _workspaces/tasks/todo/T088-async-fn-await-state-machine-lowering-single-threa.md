@@ -11,7 +11,7 @@ priority: 130
 status: todo
 attempts: 0
 paths: [compiler/mir/async, compiler/types, std/async, tests/run/async]
-spec: [0093, 0275, tasks/0297, 0202, 0248]
+spec: [0093, tasks/0275, tasks/0297, 0202, 0248]
 ---
 # T088 — async fn / await: state-machine lowering + single-thread executor
 

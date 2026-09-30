@@ -11,7 +11,7 @@ priority: 55
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types/layout, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/struct, tests/ui/struct]
-spec: [0059, 0081, 0043, 0267, tasks/0281, 0009]
+spec: [0059, 0081, 0043, tasks/0267, tasks/0281, 0009]
 ---
 # T035 — Structs, tuples, layout engine
 

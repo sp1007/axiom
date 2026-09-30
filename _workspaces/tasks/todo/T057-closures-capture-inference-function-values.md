@@ -11,7 +11,7 @@ priority: 77
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/own, bootstrap/axiom0/src/mir, tests/run/closure, tests/ui/closure]
-spec: [0060, 0069, 0273, tasks/0290, tasks/0671]
+spec: [0060, 0069, tasks/0273, tasks/0290, tasks/0671]
 ---
 # T057 — Closures, capture inference, function values
 

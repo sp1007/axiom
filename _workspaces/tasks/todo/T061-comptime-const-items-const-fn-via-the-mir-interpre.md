@@ -11,7 +11,7 @@ priority: 81
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/const, tests/run/comptime, tests/ui/comptime]
-spec: [0102, 0140, 0274, tasks/0509, tasks/0346]
+spec: [0102, 0140, tasks/0274, tasks/0509, tasks/0346]
 ---
 # T061 — Const items and constant expressions
 
