@@ -1,5 +1,16 @@
 # Axiom implementation roadmap (P0 → v1.0 → ecosystem)
 
+## Tóm tắt
+Lộ trình ràng buộc của toàn dự án. P0–P10: viết compiler `axiom0` bằng C11 chỉ đủ để biên dịch
+được bản viết lại bằng Axiom (`axiomc`) và đạt điểm cố định (T087); sau đó axiom0 đóng băng, mọi
+tính năng P11–P23 viết một lần bằng Axiom; P24 (hệ sinh thái) hoãn tới khi chủ dự án quyết định.
+Chín nguyên tắc R1–R9: spec rộng – cài đặt theo lát cắt dọc; lõi trước, tự biên dịch, rồi mới mở
+rộng; lập kế hoạch cuốn chiếu trong khung cố định (task lập kế hoạch T2NN, gate T3NN); mọi yêu cầu
+đều được truy vết; Windows x64 trước; C tối thiểu; thư viện chuẩn viết bằng Axiom ngay từ đầu; gate
+chỉ có ĐẠT hoặc BỊ CHẶN. Đợt thẩm định 2026-09-30 đã chỉnh: test viết trước bản native mang dấu
+`native-after`; oracle chạy được heap/hệ điều hành qua intrinsic "host"; tách các task quá lớn;
+file dùng chung tách theo vùng. Thay đổi phạm vi phải có ADR và một dòng trong nhật ký cuối file.
+
 Status: **baseline, binding**. Owner: axiom-architect. Changing a phase, an epic's scope or the phase
 dependency graph requires an ADR (`spec/decisions/`) and an entry in the change log at the bottom.
 Task-level detail lives on the board (`_workspaces/tasks/`); this file fixes the *shape* of the whole
@@ -28,6 +39,9 @@ reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs
 - **R5 — Every requirement is traced.** `spec/requirements/CATALOG.md` maps each requirement to a task
   or to an epic here (`EPIC(E15.3)`); the phase planning task converts its epics' requirements to task
   ids. `reqcov.py --strict` must pass at every gate.
+- **R6 — Targets:** Windows x64 PE first, Linux x64 ELF second (0181) — Linux arrives after
+  self-hosting (E16.9, by R7); other targets in P16 through the shared target-independent LIR /
+  target description (0152 §68, 0163).
 - **R7 — Minimal C, general core.** The C core exists only to reach self-hosting fast; C code that
   will be rewritten anyway is waste. axiom0 implements exactly the self-host subset defined in
   `spec/SPEC-00-bootstrap.md` (T003a) — nothing more — while its data models (types, HIR, MIR, LIR,
@@ -36,20 +50,28 @@ reviewed). `docs/base/discussions` is brainstorming only. Numbers below are docs
   needed to compile axiomc (dyn/vtables, comptime fn, linear-scan regalloc, optimizer ladder 2,
   Linux ELF, separate compilation, unwind info…) are post-T087 epics. QA fails any axiom0 change
   that implements out-of-subset features.
+  *Conditional exception (ADR-0005 §7):* if the stage-1 gate T086 measures a self-compile outside the
+  SPEC-20 budget, the architect pulls a minimal linear-scan slice of E15.8 into axiom0 as a new P10
+  task before T087. Nothing else may be pulled forward without an ADR.
 - **R8 — Std in Axiom as soon as possible.** The standard library (including the self-host std subset)
   is written in Axiom from the start and compiled by axiom0 — never implemented in C; C provides only
-  compiler intrinsics and FFI to the OS. Each std task depends only on the language features it uses,
-  so library work (and dogfooding of the compiler) starts as early as possible. std is not ported at
+  compiler intrinsics (including the host-interface intrinsics of ADR-0002, which the oracle implements
+  so std also runs under the MIR interpreter) and FFI to the OS. Each std task depends on exactly the
+  language features it uses — in the oracle **and** natively — so library work (and dogfooding of the
+  compiler) starts as early as possible but never before a feature it needs. std is not ported at
   self-hosting: axiomc compiles the same sources.
-- **R6 — Targets:** Windows x64 PE first, Linux x64 ELF second (0181); other targets in P16 through the
-  shared target-independent LIR / target description (0152 §68, 0163).
+- **R9 — Gates are PASS or BLOCKED** (0264 §20, ADR-0005 §3). A gate never closes with a known
+  implementation bug; the only tolerated non-passing tests are `xfail` entries for a spec gap that has
+  an ADR and a task. Tests written before their native support carry `native-after: <task>`, removed
+  by that native catch-up task (ADR-0005 §1).
 
 ## 2. Phase map
 
 ```
 P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (oracle)
   → P4 first native exe → P5 language core → P6 ownership/capability/drop
-  → P7 abstraction (methods, generics, traits, closures, modules, const items)
+  → P7 abstraction (methods, generics, traits, closures, const items, raw pointers, host interface;
+       modules T060 open right after the P5 gate, in parallel with P6)
   → P8 FFI (the rest of backend maturity moved after self-hosting by R7)
   → P9 core+std libraries → P10 self-hosting fixed point (axiom0 frozen)
         ├─ P11 concurrency & async ───────────────┐
@@ -66,16 +88,16 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 
 | Phase | Tasks now | Planning task | Gate task | Depends on gates |
 |---|---|---|---|---|
-| P0 foundation / traceability | T001–T006, T092–T111 | — | T111 | — |
-| P1 kernel | T007–T009 | — | (T022) | P0 |
-| P2 frontend | T010–T016 | — | (T022) | P1 |
-| P3 semantic core | T017–T022 | — | T022 | P2 |
-| P4 native | T023–T029 | — | T029 | P3 |
-| P5 language core | T030–T044 | — | T044 | P4 |
-| P6 ownership | T045–T052 | — | T052 | P5 |
-| P7 abstraction | T053–T057, T059–T062 | — | T062 | P6 |
-| P8 FFI (backend maturity trimmed by R7) | T065 | — | (T075) | P7 |
-| P9 libraries (self-host std subset) | T069–T075, T073a | — | T075 | P7, P8 |
+| P0 foundation / traceability | T001–T006, T003a, T092–T111 | — | T111 | — |
+| P1 kernel | T007–T009 | — | (T022) | P0 foundation tasks they name (run alongside traceability) |
+| P2 frontend | T010–T016, T015b | — | (T022) | P1 |
+| P3 semantic core | T017–T022 | — | T022 | P2, P0 gate T111, ownership spec T045 (for T018) |
+| P4 native | T023–T029, T025b | — | T029 | P3 |
+| P5 language core | T030–T044, T038b | — | T044 | P4 |
+| P6 ownership | T045–T052, T048b (spec T045 runs early) | — | T052 | P5 |
+| P7 abstraction | T053–T057, T054b, T059–T062, T061a–T061d (T060 opens after the P5 gate) | — | T062 | P6 |
+| P8 FFI (backend maturity trimmed by R7) | T065 | — | (T075) | T060, T061b |
+| P9 libraries (self-host std subset) | T069–T075, T071b, T071c, T073a, T074b | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090 | T211 | T311 | P10 |
 | P12 numeric & SIMD | — | T212 | T312 | P10 |
@@ -90,7 +112,12 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P21 std completion | — | T221 | T321 | P11, P13 |
 | P22 GPU & heterogeneous | — | T222 | T322 | P11, P12, P16 |
 | P23 v1.0 release | T091 | T223 | T323 | P11–P22 |
-| P24 ecosystem (post-v1) | — | T224 (deferred) | — | P23 + owner decision |
+| P24 ecosystem (post-v1) | — | T224 (deferred) | T324 (deferred) | P23 + owner decision |
+
+Core vertical-slice names (ADR-0005; SPEC-00 holds the full BOOT-00..38 map): VS0 = T022 (oracle),
+VS1 = T029 (first native, 0263 §51 VS#1), P5 gate = T044, VS2 = T086–T087 (self-hosting, 0263 §51
+VS#2). Only board-editing tasks (T110, T111, T2NN) are "critical, run alone"; the P0 spec tasks and
+the repository skeleton run in parallel (ADR-0005 §11).
 
 ## 3. Epics per phase (P11+)
 
@@ -299,10 +326,18 @@ Exit: kernel conformance examples run on a GPU with oracle-checked results.
 Exit: Axiom v1.0 tagged; `reqcov.py --strict` shows every v1-core and v1-full requirement implemented.
 
 ### P24 — Ecosystem runtimes (post-v1, deferred)
-Application-domain libraries from the corpus (AI serving/agents, GUI/windowing, audio/media,
-graphics, scientific/ML, databases/storage engines, distributed systems, finance/transport/… domain
-runtimes). Catalogued as `post-v1` requirements; planning task T224 is created **deferred** and only
-starts when the project owner explicitly schedules it.
+Application-domain libraries from the corpus, catalogued as `post-v1` requirements (chunk C18 of the
+extraction; `EPIC(E24.n)` in the catalogue). Planning task T224 and gate T324 are created
+**deferred** and only start when the project owner explicitly schedules them.
+- **E24.1 AI serving & agents** — model serving runtimes, agent frameworks.
+- **E24.2 GUI & windowing** — windowing, widgets, input, text rendering.
+- **E24.3 Audio & media** — audio graphs, codecs, media pipelines.
+- **E24.4 Graphics** — rendering engines and scene runtimes on top of P22.
+- **E24.5 Scientific computing & ML** — tensors, linear algebra, training runtimes.
+- **E24.6 Databases & storage engines** — embedded stores, query engines.
+- **E24.7 Distributed systems** — RPC, consensus, cluster runtimes.
+- **E24.8 Domain runtimes** — finance, transport and the other application domains of the corpus.
+Exit (phase): defined by T224 per epic when the owner schedules P24.
 
 ## 4. How a planning task expands a phase (standard, so all phases look alike)
 
@@ -312,19 +347,33 @@ starts when the project owner explicitly schedules it.
    lines), owner = area owner (frontend/semantics/backend/stdlib/qa/architect), `paths` narrow,
    `spec:` refs, `covers:` requirement ids, acceptance expressed as tests (positive + negative), plus
    the standard DoD lines, and `model:`/`gate_model:` by the axiom-tasks model rule. Start each epic with a spec task (architect) when the canonical `spec/`
-   lacks that area — never implement from raw docs alone.
+   lacks that area — never implement from raw docs alone. **Cross-phase prerequisites:** when this
+   file says an epic needs another phase (E15.5 needs P12; P16 needs P13; P20 needs P16 and P18; …),
+   every task of that epic gets `depends` on that phase's gate task (E15.5 tasks → T312). Shared
+   files go in `locks:`, single-owner files in `paths:` (ADR-0005 §14).
 3. IDs: next free numbers from `T400` upward in phase blocks of 50 (`T400–T449` P11, `T450–T499`
-   P12, … `T1050–T1099` P24). Titles: `<Epic id> <short title>` (e.g. `E11.2 Atomic<T> lowering x64`).
+   P12, … `T1050–T1099` P24), taken with `taskctl.py new-id --phase <P>`. Titles: `<Epic id> <short
+   title>` (e.g. `E11.2 Atomic<T> lowering x64`).
 4. Make the phase gate task T3NN depend on every task of the phase; add a QA conformance task per
-   epic that has an exit criterion.
-5. Update catalogue statuses `EPIC(...)` → task ids; run `taskctl.py validate` and
-   `reqcov.py --strict`; record the expansion in the change log below.
+   epic that has an exit criterion. Phase gates use `gate_model: opus` and the gate rule R9.
+5. Update catalogue statuses `EPIC(...)` → task ids; run `taskctl.py validate`,
+   `reqcov.py --strict` and `harness_check.py`; record the expansion in the change log below.
 6. Scope not covered by any epic → ADR proposing a new epic (added here), not a stray task.
+7. **Follow-up tasks outside a planning task** (unblock splits, gap tasks found by T076 or a gate,
+   fix tasks): a letter suffix of the task they derive from (`T048c`), or the next free id of the
+   phase from `taskctl.py new-id --phase <P>` — `T112–T199` for P0–P10, the phase block for P11+
+   (ADR-0005 §9). Never an id from the `T2NN`/`T3NN` ranges, never a retired id. A task replaced by
+   a split is closed with `taskctl.py supersede`.
 
 ## 5. Change log
 
 | Date | Change | ADR |
 |---|---|---|
+| 2026-10-01 | Audit 2026-09-30 (4 lenses) applied. Oracle host interface: T061c; std runs under the interpreter (R8 wording) | ADR-0002 |
+| 2026-10-01 | Backend robustness: ABI lowering as a LIR pass, machine-IR verifier, stack probes, `--stack-reserve` (T025 narrowed, new T025b; T027, T028, T037, T086) | ADR-0003 |
+| 2026-10-01 | Self-host subset additions: wrapping/bit intrinsics (T034/T037), constant tables in `.rdata` (T061, new T061d), stored views (T045/T048), HashMap insertion order + shared hash (T007/T069/T073), generic drop glue (new T054b), derive Hash/Ord (T056), control/pattern forms (T031, T038, new T038b) | ADR-0004 |
+| 2026-10-01 | Plan structure: `native-after` tests and VS1 reduced to 0263 VS#1 (T021, T028, T029, T033…); shared files split per area/command with `locks:`; gates PASS-or-BLOCKED with XFAIL (new R9); vertical frontend slice (T014 → T011, new T015b); T018 waits for T045; T017 waits for T111; T060 opens after the P5 gate; T034 ∥ T033 and T043 ∥ T042; only board-editing tasks are critical; self-compile budget with a conditional R7 exception; splits T025b, T038b, T048b, T054b, T061b, T061c, T061d, T071b, T071c, T074b; T076 must split the port tasks; follow-up id rule (§4.7); P24 epics E24.1–E24.8 and deferred gate T324; phase gates on Opus; R6 listed before R7 | ADR-0005 |
+| 2026-10-01 | Bootstrap forms (Drop, `char` cast, `len`, derive(Copy), Option/Result, sub-range views), manifest `axiom.toml`, std root discovery, console output | ADR-0006 |
 | 2026-09-29 | Baseline roadmap P0–P24, epics E11–E24, rolling-wave frame (T2NN plan / T3NN gate) | — |
 | 2026-09-30 | Core constructs completed: T061a minimal raw pointers/unsafe/intrinsics (needed by Box/Vec/FFI; E13.1 extends it), slices in T048/T051, if-let/while-let/destructuring in T038 | self-host needs |
 | 2026-09-30 | Text & scalars before self-host: `char` in T034/T010, char + UTF-16 primitives in T071, chars() in T073, W APIs only in T074; floats entirely in E12.2 (not in axiom0), float formatting removed from T071 | owner decision |

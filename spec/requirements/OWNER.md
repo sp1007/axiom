@@ -12,3 +12,9 @@ New owner requirements are appended here with the next id.
 | REQ-OWNER-006 | linker | v1-full | On x86_64-windows Axiom emits and consumes every artifact kind: .obj and .exe (core), static .lib archives and .dll with import libraries (right after self-hosting, in axiomc); the core's data models reserve these kinds from day one | owner 2026-09-29 | T026, T028, T750, T751 |
 
 Note: rows referencing tasks will be completed with `covers:` entries by T111.
+
+Status note 2026-10-01 (audit 2026-09-30, ADR-0002..0006): no owner requirement was dropped,
+re-tiered or re-sequenced. The task ids in the rows above are unchanged; T003a additionally produces
+`spec/selfhost-subset.tsv` for REQ-OWNER-004. The owner's rule that samples print
+`Xin chào thế giới` (UTF-8, correct on pipe, file and console) is kept, and its console part is now
+checked by a script instead of by eye (T042, T074; ADR-0005 §16, ADR-0006 §9).

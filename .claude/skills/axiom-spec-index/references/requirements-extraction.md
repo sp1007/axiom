@@ -31,7 +31,8 @@ after every few files, so the file on disk is always the complete state. On (re)
 existing `raw/Cnn.md` and continue with the files not yet listed; dedup within the chunk at the
 end.
 
-Write `spec/requirements/raw/Cnn.md` with one table (same six columns as the catalog):
+Write `spec/requirements/raw/Cnn.md` with one table of six columns (the catalogue later adds a
+`needs` column before `status`):
 
 ```
 | RQ-Cnn-001 | ownership | v1-core | Partial move of a field leaves the parent PARTIAL; using the parent afterwards is an error unless the field is re-initialised | 0160 §12; tasks/0394 §7 | T046 |
@@ -52,6 +53,15 @@ Write `spec/requirements/raw/Cnn.md` with one table (same six columns as the cat
   collapses.
 - **status**: best-guess existing board task id(s) that would implement it (read
   `taskctl.py list`), else the roadmap epic `EPIC(E12.3)` from `spec/ROADMAP.md` §3, or `GAP`.
+- **needs** (inside the statement cell): when the text says a requirement is built on, uses or
+  requires another one ("Vec<T> is built on raw pointers"), end the statement with
+  `[needs RQ-Cnn-NNN, …]` (or a short description if the other requirement is in another chunk).
+  T110 turns these into the catalogue's `needs` column. This is what lets `reqcov.py` detect
+  "planned, but too late" — a feature scheduled after the task that needs it.
+- **Tier discipline**: mark `v1-core` only what the self-hosting compiler or the self-host std
+  subset really needs (check `spec/SPEC-00-bootstrap.md` and `spec/selfhost-subset.tsv` when they
+  exist). A `v1-core` row may only be mapped to P0–P10 tasks: mapping it to `EPIC(E11+)` is an error
+  that reqcov reports — either the tier or the plan is wrong, say which in `## Conflicts`.
 
 Also record at the bottom `## Conflicts` — requirements in this chunk that contradict each other or
 the canonical `spec/` (with sources) — and `## Files skimmed` (count; any file you could not read).
@@ -73,8 +83,12 @@ covering five documents is better than five rows.
    TOOL, DBG, TST, CNF, BOOT, SEC, ECO).
 2. Resolve conflicts by the spec-index priority rules → ADRs.
 3. Write `spec/requirements/CATALOG.md` (the table reqcov.py reads) and `spec/COVERAGE.md`
-   (human summary: counts per area × tier, list of GAPs, list of DEFERRED with reasons).
+   (human summary: counts per area × tier, list of GAPs, list of DEFERRED with reasons). The
+   catalogue has seven columns — `id | area | tier | statement | sources | needs | status` — where
+   `needs` lists the requirement ids this one is built on (`-` when none), taken from the
+   `[needs …]` notes of Phase A.
 4. Keep `raw/` files as the audit trail (never delete).
+5. ADR numbers come from `taskctl.py adr-next <slug>`, never from listing the directory.
 
 ## Phase C — backlog expansion (T111)
 
@@ -82,9 +96,14 @@ covering five documents is better than five rows.
    stays one-sitting sized) or create a new task there; v1-full → `EPIC(E<phase>.<n>)` of the matching
    roadmap epic (tasks come later from the phase planning task); post-v1 → `EPIC(E24.x)` or
    `DEFERRED(<reason>)`. No epic fits → ADR + new epic in the roadmap.
-2. Add `covers: [REQ-…]` to every task's front-matter; set each catalog status to task ids.
-3. `taskctl.py validate` and `reqcov.py --strict` must both pass (zero GAP, zero problems;
-   `EPIC(...)` counts as planned).
+2. Add `covers: [REQ-…]` to every task's front-matter; set each catalog status to task ids. A task
+   that is already running or done is not rewritten: its `covers:` is extended with
+   `taskctl.py covers <ID> <REQ-…>` (metadata only), and missing scope becomes a follow-up task
+   (id from `taskctl.py new-id --phase <P>`, i.e. T112–T199 for P0–P10).
+3. `taskctl.py validate`, `reqcov.py --strict` and `harness_check.py` must all pass (zero GAP, zero
+   problems; `EPIC(...)` counts as planned, except on a `v1-core` row of a post-self-host epic).
+4. T017 (first task of the semantic core) depends on T111: the backlog is complete before P3 starts
+   (ADR-0005 §6).
 
 ## Ongoing (phase reviews)
 

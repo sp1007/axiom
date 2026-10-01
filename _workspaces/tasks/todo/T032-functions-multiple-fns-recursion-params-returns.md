@@ -11,6 +11,7 @@ priority: 52
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/fn, tests/ui/fn]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0069, tasks/0266, tasks/0284]
 ---
 # T032 — Functions: multiple fns, recursion, params, returns
@@ -22,7 +23,8 @@ Full function semantics in the oracle.
 - Order-independent item use, recursion/mutual recursion, many params, unit fns, early return, argument evaluation order.
 
 ## Acceptance
-- [ ] run + ui tests in interp mode.
+- [ ] run + ui tests in interp mode; run tests carry `// native-after: T033` (removed by T033).
+- [ ] At least one positive run test and one negative ui test per Scope bullet; the report maps each bullet to its test files (QA checks the map).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T032-report.md` with exact `## Files changed`.
 
@@ -30,5 +32,6 @@ Full function semantics in the oracle.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Direct calls and simple recursion already work since T019/T021; this task adds what Scope lists and re-tests the rest, it does not re-implement it.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

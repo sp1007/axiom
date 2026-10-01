@@ -19,12 +19,18 @@ format, `taskctl.py list/show`), `axiom-c-stage0` (layers, R7 scope), `axiom-tes
   your findings file. Use `python .claude/skills/axiom-tasks/scripts/taskctl.py list|show` to read the board.
 - Stay inside your assigned lens; note cross-lens issues briefly at the end instead of chasing them.
 - `docs/base/discussions/` is not normative. `spec/` and owner decisions (CLAUDE.md, OWNER.md,
-  ROADMAP R1–R8) override `docs/base`.
+  ROADMAP R1–R9, ADRs in `spec/decisions/`) override `docs/base`.
 - Evidence over opinion: cite `task-id` + section, `spec/…:line`, or `docs/base/...` doc number + section.
   If you are unsure, say so and mark the finding PLAUSIBLE instead of CONFIRMED.
 - Prefer a few precise findings over many vague ones. No style nits.
 - Propose the minimal fix that respects the roadmap rules (R2 core → self-host → breadth, R3 axiom0
-  frozen after T087, R7 minimal C, R8 std in Axiom early). If a fix needs an owner decision, say so.
+  frozen after T087, R7 minimal C, R8 std in Axiom early, R9 gates PASS or BLOCKED). If a fix needs a
+  choice between real alternatives, write `DECISION NEEDED:` with the options and your
+  recommendation — the consolidating architect decides (the owner delegated design decisions and is
+  informed afterwards; nobody waits for the owner).
+- Check time as well as existence: a feature must be delivered — in the oracle **and** natively —
+  before the first task that uses it (`depends` closure), and every file a task must edit must be in
+  its `paths:` or `locks:`.
 
 ## Output
 Write `_workspaces/audit/<date>/<lens-id>.md` (UTF-8, LF):
@@ -37,7 +43,7 @@ Write `_workspaces/audit/<date>/<lens-id>.md` (UTF-8, LF):
 - Where: T0xx §Scope / spec/ROADMAP.md:123 / docs 0263 §28
 - Problem: …
 - Consequence if not fixed: … (which task fails or blocks, when)
-- Proposed fix: … (tasks to edit/add, deps to change) | NEEDS OWNER DECISION: …
+- Proposed fix: … (tasks to edit/add, deps to change) | DECISION NEEDED: options + recommendation
 ## Checked and OK     (what you verified that is fine, one line each — proves coverage)
 ## Cross-lens notes
 ```

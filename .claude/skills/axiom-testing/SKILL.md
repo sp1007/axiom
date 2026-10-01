@@ -20,11 +20,22 @@ exist.
 | `tests/ui/` | compile-fail | expected diagnostic codes at expected lines, nothing else |
 | `tests/run/` | run | exit code / stdout, **both** interpreter and native unless restricted |
 | `tests/diff/` | differential | interp vs native -O0 vs native -O1 must agree |
-| `tests/encode/` | encoder | our instruction bytes == GNU `as` bytes for the same instruction |
-| `tests/obj/`, `tests/link/` | object/linker | `objdump -x/-d` accepts our COFF/PE/ELF; layout/relocs correct |
+| `tests/encode/` | exec + C driver | our instruction bytes == GNU `as` bytes for the same instruction |
+| `tests/obj/`, `tests/link/` | exec + C driver | `objdump -x/-d` accepts our COFF/PE/ELF; layout/relocs correct |
+| `tests/mc/` | golden + C driver | machine IR (`.mi`), encoded listing (`.mc`), frame/probe checks |
+| `tests/modules/` | project | a directory with `axiom.toml` is one multi-file test |
+| `tests/std/`, `tests/programs/` | run | library and real-program tests, both modes |
+| `tests/perf/` | data | benchmark sources and committed baselines (`*.csv`) |
 | `tests/conformance/` | spec suites | cases ported from 0017, 0022, 0026, 0114 (one dir per spec area) |
 | `tests/fuzz/` | corpus | seeds for tools/fuzz.py; any crash/ICE/hang is a failure |
-| `tests/unit/` | C unit tests | kernel data structures etc. (compiled into `axiom0-unit`) |
+| `tests/unit/` | C unit tests | kernel data structures etc. (compiled into `axiom0-unit`, run by an `exec` manifest) |
+
+Adding tests never requires editing shared files (ADR-0005 §2): the runner discovers `tests/**`, a
+golden kind is derived from the sibling file extension (`x.tokens`, `x.ast`, `x.resolved`, `x.hir`,
+`x.thir`, `x.mir`, `x.lir`, `x.mi`, `x.mc` ↔ `inspect --emit=<ext>`), C unit tests are globbed from
+`tests/unit/**/*.c`, and C test drivers from `tests/**/cdriver_*.c` (run through `*.test` manifests of
+kind `exec`). Only T005 edits `tools/axtest.py`; only T004 edits CMakeLists.txt. Binary fixtures live
+under `tests/**/fixtures/` (everything else binary is git-ignored).
 
 ## Directives (first comment lines of an `.ax` file)
 
@@ -39,6 +50,31 @@ fn main() -> i32 {
     return 42
 }
 ```
+
+More directives (all implemented by T005): `args: xin chào` (program arguments), `env: NAME=value`,
+`stdin: text`, `stderr: text`, `timeout: 30` (seconds; default 10), `skip-unless: tool gcc`,
+`requires: axiom0-internal` (test of the C implementation, excluded when the compiler under test is
+axiomc), and the two below.
+
+**`// native-after: T033`** — the test was written before the native backend supports its feature:
+its native mode is SKIP until the named catch-up task removes the directive (ADR-0005 §1). Use it
+for every run test added by an oracle-first task (the task text says which catch-up task to name);
+the catch-up task must leave `grep -rn "native-after: <its id>" tests` empty. Never use
+`modes: interp` for this purpose.
+
+**`// xfail: T123 <reason>`** — an expected failure for a **spec gap that has an ADR** and an open
+task (never for an implementation bug). It is reported XFAIL; if it passes it is XPASS, which counts
+as a failure until the directive is removed.
+
+**Native-only tests.** The MIR interpreter runs heap and OS code through the host intrinsics
+(ADR-0002), so std and compiler-port tests run in both modes. The only accepted reasons for
+`// modes: native` are "direct FFI is native-only (ADR-0002)" and a heavy test (≥ 100k elements) that
+has a small interp twin. The only accepted reason for `// modes: interp` is "oracle-only check"
+(out-of-bounds, dangling or misaligned raw-pointer access that only the oracle detects). QA fails
+any other restriction.
+
+Result states: PASS, FAIL, SKIP (always with a reason), XFAIL, XPASS, CRASH (compiler exit code 3 or
+an unexpected access violation), TIMEOUT. XPASS, CRASH and TIMEOUT count as FAIL.
 
 Compile-fail tests annotate the offending line inline:
 
@@ -65,12 +101,25 @@ python tools/axtest.py --json > _workspaces/artifacts/test-results.json   # for 
 python tools/axtest.py --bless parse/
 ```
 
-The runner builds nothing: build first (`cmake --build build-<ID>`). Parallel agents use their own
-build dirs, so the runner takes `--compiler <path>` (default `build/axiom0.exe`, env `AXIOM0`).
+The runner builds nothing: build first. The build that counts for a task is the one in its snapshot
+(`taskctl.py snapshot <ID>` → `build-snap-<ID>/`, build directory `build-snap-<ID>/build`), so the
+runner takes `--compiler <path>` (default `build/axiom0.exe`, env `AXIOM0`) and is run from inside
+the snapshot for a verdict.
 It runs the compiler and test programs as binary subprocesses and compares stdout/stderr as raw
 bytes — never through text-mode decoding, which would hide CRLF/UTF-8 bugs.
 It must print a final line
-`TOTAL n PASS p FAIL f SKIP s` and exit non-zero on any failure.
+`TOTAL n PASS p FAIL f SKIP s XFAIL x` and exit non-zero on any failure. `--std-root std` is passed
+to the compiler (ADR-0006 §8); `--exclude-requires axiom0-internal` is used once axiomc is the
+compiler under test (T086 onwards).
+
+## Gates (ADR-0005 §3, ROADMAP R9)
+
+A gate task is PASS or BLOCKED, never "passes except for …". All tests pass; the only tolerated
+non-passing tests are `xfail` entries for spec gaps with an ADR and a task. An implementation bug
+found by a gate blocks it until the fix task (filed by the architect) is done. Every core gate also
+runs `python tools/gatecheck.py` (from T022), `reqcov.py --strict` and `harness_check.py`. Fuzz
+campaigns are defined by `--seed` and `--iterations`, never by wall time. Performance baselines are
+committed under `tests/perf/*.csv` (`_workspaces/artifacts` is git-ignored).
 
 ## Writing good compiler tests
 
@@ -127,6 +176,8 @@ never "fix" it by changing the expectation without finding which one is wrong.
 `tools/fuzz.py` mutates `tests/fuzz/` seeds (byte flips, token splices, grammar-aware generation)
 and runs `axiom0 check`; failure = crash, ICE, timeout (>5 s), or non-deterministic diagnostics
 across two runs. Minimise and add any finding to `tests/ui/` or `tests/parse/` as a regression.
+A campaign is a command with a fixed seed and iteration count (for example
+`python tools/fuzz.py --seed 1 --iterations 200000`) that must end with 0 findings.
 
 ## QA boundary cross-checks (what QA looks for beyond "tests pass")
 
@@ -137,7 +188,10 @@ Most compiler bugs live at the seams between phases, where each side is "correct
 - MIR ↔ interpreter ↔ LIR lowering (same semantics for overflow, division, shifts, casts)
 - ABI lowering ↔ isel ↔ frame lowering (shadow space, alignment, callee-saved actually saved)
 - encoder relocations ↔ object writer ↔ linker (offsets, addends, REL32 relative to next instr)
-- diagnostics codes in code ↔ `diag/codes.def` ↔ tests referencing them
+- diagnostics codes in code ↔ `diag/codes/<AREA>.def` ↔ tests referencing them
+- oracle host intrinsics ↔ native `__ax_host_*` functions in `std/sys/windows` (same results in both
+  modes for heap, files, args, env)
+- std `HashMap` order and hash ↔ axiom0 `kernel/` (the port must produce byte-identical dumps)
 
 QA reads both sides of a seam and writes a test that crosses it. Grep for `switch` over enum kinds
 and check the default branches: an `AX_ICE` default hides unhandled kinds until a user hits them.

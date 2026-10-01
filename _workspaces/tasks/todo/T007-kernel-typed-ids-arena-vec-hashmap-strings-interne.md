@@ -20,11 +20,13 @@ Provide the deterministic, allocation-disciplined data structures all compiler p
 
 ## Scope
 - Typed ID macro pattern + IdTable; Arena (aligned bump, chunks, reset/destroy); Vec (type-safe macro wrapper); HashMap (open addressing, deterministic iteration = insertion order); StrView/StrBuf; StringInterner → StrId; stable 64-bit hash (documented algorithm, independent of platform); UTF-8 decode/validate helpers; AX_ICE and AX_ASSERT.
-- Unit test binary axiom0-unit (CMake target) run by the test runner (or ctest) — add a `unit` kind if needed.
+- Unit tests are C files under `tests/unit/kernel/`, compiled into `axiom0-unit` by the T004 glob and run through an `exec` manifest of the runner (T005); neither CMakeLists.txt nor tools/axtest.py is edited.
+- The hash algorithm and the HashMap iteration contract (insertion order, also after deletions) are written down in `bootstrap/axiom0/src/kernel/README.md`: std `HashMap` (T073) and `std/core/hash.ax` (T069) must reproduce both bit for bit (ADR-0004 §4). The hash uses only wrapping 64-bit multiply/add/xor/rotate. Reference vectors (key bytes → hash) are written to `tests/unit/kernel/hash_vectors.txt`.
 
 ## Acceptance
 - [ ] Unit tests for each structure incl. growth, collisions, deletion, iteration order determinism, interner identity.
 - [ ] No mutable globals; builds warning-free with gcc and clang.
+- [ ] `tests/unit/kernel/hash_vectors.txt` (≥ 32 keys incl. empty, 1 byte, `Xin chào thế giới`, 1 KB) is checked by a unit test; iteration order after delete + reinsert is tested and documented.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T007-report.md` with exact `## Files changed`.
 

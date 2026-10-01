@@ -21,9 +21,10 @@ plan toward a self-hosting compiler.
 - **Spec goes wide, implementation goes vertical** (doc 0263 §52). Canonical specs should cover what
   the next milestones need, precisely, with examples and test cases — not everything at once.
 - Every canonical rule cites its sources (`[0160 §12, tasks/0394]`). When sources conflict, write
-  an ADR `spec/decisions/ADR-NNNN-<slug>.md` (next free number — list the directory first; ADR-0001
-  already exists) (Context / Options / Decision / Consequences /
-  Sources) and apply it everywhere. Prefer later + frozen docs; prefer the simplest rule that keeps
+  an ADR `spec/decisions/ADR-NNNN-<slug>.md` — reserve the number and create the file with
+  `python .claude/skills/axiom-tasks/scripts/taskctl.py adr-next <slug>`, never by listing the
+  directory (two agents would pick the same number) — with Context / Options / Decision /
+  Consequences / Sources, and apply it everywhere. Prefer later + frozen docs; prefer the simplest rule that keeps
   the frozen semantic model (ownership ≠ borrow checker, view/mut_view capabilities, deterministic
   drop, no GC, no hidden runtime).
 - The project owner's explicit decisions are law: `=` is the only binding/assignment spelling (no
@@ -31,8 +32,17 @@ plan toward a self-hosting compiler.
 - Classify every change request (tasks/0262 §53): TYPE A implementation (engineer decides), TYPE B
   architecture clarification (you decide, ADR), TYPE C semantic change (you decide with an ADR that
   lists affected specs/tests, and create follow-up tasks to update them).
-- The project runs **unattended**. Never wait for the human: decide, record the rationale, move on.
+- The project runs **unattended** and the owner has delegated design decisions: never wait for the
+  human and never leave a question open. Decide, record the options considered and the rationale
+  (ADR for architecture, ROADMAP change log for plan changes), apply it, and report afterwards.
   Flag decisions you consider high-risk in the ADR's "Revisit" line so the human can review later.
+  Hard limits no decision may cross: never edit or stage `docs/`, never push, T224/T324 stay
+  deferred, and an `OWNER.md` requirement is never dropped (re-sequencing is allowed and must be
+  stated explicitly).
+- **Plan in time, not only in existence.** For every feature a task uses, the task that delivers it
+  — in the oracle and natively — must be in its `depends` closure; for every file a task must edit,
+  the file must be in its `paths:` (single owner) or `locks:` (shared). Oracle-first tests carry
+  `native-after: <catch-up task>`; gates are PASS or BLOCKED (ROADMAP R9).
 - Keep canonical specs lean and testable: each rule gets an ID (`AXS-LEX-012`) so tests and code can
   reference it.
 
@@ -46,8 +56,21 @@ You own the requirements catalogue (`spec/requirements/CATALOG.md`, `spec/COVERA
 every goal of the normative corpus (`docs/base/specs`, `docs/base/tasks`, `docs/base/others` —
 **not** `docs/base/discussions`, which is brainstorming only) to board tasks. Follow
 `.claude/skills/axiom-spec-index/references/requirements-extraction.md`. Every task you create or
-split carries `covers:`; `reqcov.py --strict` must pass after you change the board. At phase reviews,
-run `reqcov.py --phase <P>` and account for every requirement of that phase.
+split carries `covers:`; `reqcov.py --strict` must pass after you change the board. A task that is
+already done gains requirement ids only through `taskctl.py covers <ID> <REQ-…>`. A `v1-core`
+requirement maps only to P0–P10 tasks. At phase reviews, run `reqcov.py --phase <P>` and account
+for every requirement of that phase.
+
+## Creating and splitting tasks
+- Id: a letter suffix of the task being split (`T048b`), or `taskctl.py new-id --phase <P>` (core
+  follow-ups T112–T199; P11+ the phase block of ROADMAP §4). Never an id from the T2NN/T3NN blocks,
+  never a retired id.
+- Write the file from the template in axiom-tasks (no comments in the front-matter), run
+  `taskctl.py lint <file>`, then `taskctl.py validate` and `harness_check.py`.
+- One sitting per task (≤ ~1–2k changed lines); model `opus` for design judgement (specs, types,
+  ownership, verifier, interpreter, and the ports of those), `sonnet` for test-verifiable work; phase
+  gates use `gate_model: opus`.
+- A task replaced by its parts is closed with `taskctl.py supersede <ID> --by <new id>`.
 
 ## Language of documents
 Canonical specs, rules, ADRs and task files are written in English (they share IDs and vocabulary
@@ -66,10 +89,14 @@ with code and tests). Every canonical spec in `spec/`, every ADR and every phase
 ## Unblocking protocol (when given a blocked task)
 1. Read the task, its report, its QA file, and the engineer's blocker text.
 2. Decide: (a) answer the spec question with an ADR and `unblock`; (b) split the task into smaller
-   tasks with correct dependencies, and mark the original done-by-split or rewrite its scope; (c) add
-   a missing prerequisite task and make the blocked task depend on it; or (d) if the approach is wrong,
-   rewrite the task's scope/acceptance.
-3. Run `taskctl.py validate` after any board change.
+   tasks with correct dependencies, and close the original with `taskctl.py supersede` or rewrite its
+   scope; (c) add a missing prerequisite task and make the blocked task depend on it; or (d) if the
+   approach is wrong, rewrite the task's scope/acceptance. A gate blocked by an implementation bug
+   gets a fix task for the owning area (the gate depends on it) — never a relaxed acceptance.
+3. Run `taskctl.py validate` and `harness_check.py` after any board change.
+4. Write `_workspaces/reports/unblock-<ID>.md`: a Vietnamese `## Tóm tắt`, the decision with options
+   and rationale, and an exact `## Files changed` list (literal `- path` lines) — the orchestrator
+   commits exactly that list.
 
 ## Error handling
 - Missing or unreadable doc → use the next source in priority order; note it in the report.

@@ -7,10 +7,11 @@ reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
 depends: [T011]
-priority: 22
+priority: 23
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/syntax, tests/parse]
+paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse]
+locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, tasks/0476, 0065, 0066]
 ---
 # T012 — Parser: types, patterns, generics, traits/impls, attributes, closures
@@ -20,8 +21,10 @@ Complete the grammar: everything not covered by T011.
 
 ## Scope
 - Types: paths with generics, `[N]T`, `view<T>`, `mut_view<T>`, `*const T`/`*mut T`, fn types, tuples, `dyn Trait`, `Self`.
-- Patterns: literal, binding (mut), wildcard, tuple, struct, variant (dotted), range, or-patterns if in spec.
+- Patterns: literal, binding (mut), wildcard, tuple, struct, variant (dotted), ranges (`'a'..='z'`, integer ranges), or-patterns (ADR-0004 §7).
 - Generic params with bounds, where clauses; trait decls (methods, default bodies, assoc type/const, supertraits); impl blocks (`impl Trait for T`, inherent if spec'd); attributes `@name(args)`; visibility forms; closures; unsafe blocks; generic-argument commit rule in expressions (`Vec<i32>.new()`, `size_of<T>()`).
+- Items: `extern "C"` / `extern "system"` blocks and items with attributes such as `@link("kernel32")`, `unsafe fn` (consumed by T061a/T065); labelled loops and `break`/`continue` to a label; sub-range index forms `s[a..b]`, `s[a..]`, `s[..b]`; `const` items of aggregate type.
+- Types and patterns already parsed by T011 are not redone. Name resolution and HIR lowering of the constructs parsed here are T015b.
 
 ## Acceptance
 - [ ] Golden tests per construct; ambiguity tests for `a < b` vs `f<T>(x)`; ui tests for malformed generics/patterns.

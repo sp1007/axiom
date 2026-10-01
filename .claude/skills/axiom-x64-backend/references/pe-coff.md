@@ -77,6 +77,11 @@ Sections
 
 Checksum may be 0 for user executables. TimeDateStamp 0 for reproducibility.
 
+SizeOfStackReserve is set by the linker option `--stack-reserve <bytes>` (default 0x100000; ADR-0003).
+SizeOfStackCommit stays 0x1000, so the stack grows page by page through the guard page: any function
+whose frame exceeds 4096 bytes must probe each page in order before moving RSP (inline loop emitted
+by frame lowering; no CRT `__chkstk`). `tools/bootstrap.py` links axiomc with 64 MB (67108864).
+
 ## 4. Import directory recipe (kernel32!ExitProcess)
 
 In an `.idata` (or `.rdata`) section:

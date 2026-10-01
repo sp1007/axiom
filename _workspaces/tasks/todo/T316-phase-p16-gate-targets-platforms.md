@@ -5,7 +5,7 @@ phase: P16-targets-platforms
 owner: axiom-qa
 reviewer: axiom-architect
 model: opus
-gate_model: sonnet
+gate_model: opus
 depends: [T216, T066]
 priority: 316
 status: todo
@@ -27,7 +27,7 @@ requirements mapped to the phase are implemented.
 
 ## Acceptance
 - [ ] Every epic exit criterion demonstrated with commands and results in the QA report.
-- [ ] Full suite green; `reqcov.py --strict` exits 0.
+- [ ] Full suite green (gate rule: PASS or BLOCKED; only `xfail` entries for spec gaps with an ADR may remain); `reqcov.py --strict` and `harness_check.py` exit 0.
 - [ ] Report `_workspaces/reports/T316-report.md` with exact `## Files changed`.
 
 ## Out of scope

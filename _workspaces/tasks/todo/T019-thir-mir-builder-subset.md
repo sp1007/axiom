@@ -11,6 +11,7 @@ priority: 32
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
+locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0161, tasks/0364, tasks/0539, 0041]
 ---
 # T019 — THIR → MIR builder (subset)

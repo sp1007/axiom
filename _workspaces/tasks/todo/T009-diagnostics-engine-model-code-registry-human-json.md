@@ -20,12 +20,13 @@ Diagnostics as data, rendered by the driver in human or JSON form.
 
 ## Scope
 - Diagnostic{code, severity, primary span, labels[], notes[], helps[], fixits[]}; DiagSink collecting in memory; deterministic ordering (file, offset, code).
-- diag/codes.def X-macro registry seeded from spec/diagnostics.md.
+- Code registry split by area (ADR-0005 §2): `diag/codes/<AREA>.def` X-macro files, one per area of spec/diagnostics.md, all created here (seeded; an area with no code yet gets an empty file) and included by `diag/codes.def`. Later tasks add codes only to their area file (their `locks:` entry) and never edit `codes.def`.
 - Human renderer: `error[AX_TYPE_MISMATCH]: msg` + `--> file:line:col` + source line + caret/underline, labels, notes; JSON renderer (schema from spec/diagnostics.md).
 
 ## Acceptance
 - [ ] Unit/golden tests of both renderers incl. multi-line spans, tabs, CRLF, unicode.
 - [ ] Unknown code use is a compile-time error in C (X-macro enum).
+- [ ] Every area of spec/diagnostics.md has its file; adding a code to one area file needs no other edit to be usable (shown by a unit test).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T009-report.md` with exact `## Files changed`.
 

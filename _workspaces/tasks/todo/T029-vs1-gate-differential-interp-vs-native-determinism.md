@@ -5,7 +5,7 @@ phase: P4-native
 owner: axiom-qa
 reviewer: axiom-architect
 model: opus
-gate_model: sonnet
+gate_model: opus
 depends: [T028, T022]
 priority: 46
 status: todo
@@ -19,10 +19,12 @@ spec: [0263, 0152, 0145]
 Establish the three-level oracle (MIR interp / native / agreement) as a permanent CI guard.
 
 ## Scope
-- Differential suite: every run test executed in both modes and compared; determinism check (build twice, compare bytes) in CI; first ABI test (add(20,22)).
+- Differential suite: every run test whose native mode is enabled (no `native-after`) is executed in both modes and compared; determinism check (build twice, compare bytes) in CI. The first ABI test `add(20, 22)` belongs to T033 (0263 §51: calls come after VS#1).
 
 ## Acceptance
 - [ ] CI runs differential + determinism; QA report documents seams MIR↔LIR↔MC↔COFF↔PE reviewed.
+- [ ] Gate rule (ADR-0005 §3): PASS or BLOCKED. Every non-passing test is an `xfail: <task-id>` for a spec gap that has an ADR; implementation bugs are fixed (their fix task done) before the gate closes; XPASS counts as a failure.
+- [ ] `python tools/gatecheck.py`, `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T029-report.md` with exact `## Files changed`.
 

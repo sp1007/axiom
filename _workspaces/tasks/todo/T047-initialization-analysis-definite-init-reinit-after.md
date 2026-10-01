@@ -11,6 +11,7 @@ priority: 67
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/own/init, tests/ui/init, tests/run/init]
+locks: [bootstrap/axiom0/src/diag/codes/INIT.def]
 spec: [spec/SPEC-10-ownership.md, tasks/0394]
 ---
 # T047 — Initialization analysis (definite init, reinit after move)
@@ -22,7 +23,7 @@ Definite initialization across CFG including loops and conditional moves.
 - Uninit use errors, conditional init, reinitialisation of moved places, struct field init.
 
 ## Acceptance
-- [ ] Test matrix rows for init pass.
+- [ ] Every test-matrix row tagged T047 passes. Run tests carry `// native-after: T051`.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T047-report.md` with exact `## Files changed`.
 

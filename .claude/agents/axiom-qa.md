@@ -21,44 +21,70 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
   Axiom code), `axiom-tasks` (QA file format).
 
 ## Gate protocol (for task `<ID>`)
-1. Read the task file (acceptance criteria), the engineer's report, and `git status`/`git diff` of
-  the files listed in "Files changed" (also check for changed files NOT listed — the commit uses the
-  list, so omissions lose work; add them to your findings).
-2. Clean build in your own directory (engineers build in parallel): `cmake -S bootstrap/axiom0 -B
-   build-qa-<ID> -G Ninja -DCMAKE_C_COMPILER=gcc && cmake --build build-qa-<ID>`; also clang if portable
-   code changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
+1. Read the task file (acceptance criteria) and the engineer's report (its last line must be
+   `STATUS: COMPLETE round=<n>`). Run `python .claude/skills/axiom-tasks/scripts/taskctl.py changes <ID>`:
+   it prints what the acceptance commit would contain; a `REFUSED` line (changed file under the
+   task's paths not listed, entry inside another task's paths, edit outside `paths:`/`locks:`) is a
+   FAIL finding.
+2. Build and test **only inside the task snapshot** `build-snap-<ID>/` (the orchestrator creates it;
+   refresh with `taskctl.py snapshot <ID>`), never in the main working tree where other tasks are
+   mid-edit: `cmake -S build-snap-<ID>/bootstrap/axiom0 -B build-snap-<ID>/build -G Ninja
+   -DCMAKE_C_COMPILER=gcc && cmake --build build-snap-<ID>/build`; also clang if portable code
+   changed. Warnings are failures. **Spec/doc-only tasks** (architect tasks, or anything before the
    build exists): skip build/test steps and instead check completeness against the acceptance list,
    internal consistency, cited sources actually say what is claimed (spot-check ≥ 5), conformance
    with axiom-syntax, OWNER.md and ROADMAP, and that rule IDs are unique.
-3. Full suite: `python tools/axtest.py --compiler build-qa-<ID>/axiom0.exe` (not just the new tests) +
-   `python tools/archcheck.py`
-   (once they exist).
+3. Full suite, run from inside the snapshot: `python tools/axtest.py --compiler build/axiom0.exe`
+   (not just the new tests) + `python tools/archcheck.py` (once they exist). After the fixed point
+   T087 the compiler under test is the stage-2 axiomc built in the snapshot (`tools/build_axiomc.py`),
+   and the gate also runs `harness_check.py` (axiom0 freeze: a change under `bootstrap/axiom0`
+   outside an `AX0-FIX-<nn>` task is a FAIL).
 4. Verify each acceptance criterion concretely — run the command, open the output. "The report says
    so" is not evidence.
 5. Boundary cross-check (axiom-testing §QA): read both sides of every seam the task touched; write
    at least one additional test the engineer did not think of (edge value, negative case, crossing
-   seam). Add it to `tests/` — tests you add stay.
-6. Spec check: behaviour matches `spec/` (or cited docs); new diagnostics have registered codes;
-   no silent semantic choices; no `BOOTSTRAP-SHORTCUT` without follow-up. **Scope check (R7):**
-   changes under `bootstrap/axiom0` implement only features in the self-host subset of
-   `spec/SPEC-00-bootstrap.md` and respect `spec/SPEC-04-core-extensibility.md` — otherwise FAIL.
-7. Write `_workspaces/reports/<ID>-qa.md`: checks performed with evidence (commands + counts),
-   findings (each: file:line, expected vs actual, repro), tests you added (list under
-   `## Files changed` so they get committed), and the final line `VERDICT: PASS` or
-   `VERDICT: FAIL`.
+   seam). Write it in the main tree under the task's test directories, list it under
+   `## Files changed` of your QA file, then refresh the snapshot — tests you add stay.
+6. Spec check: behaviour matches `spec/` (or cited docs); new diagnostics are registered in the
+   right area file (`diag/codes/<AREA>.def`); no silent semantic choices; no `BOOTSTRAP-SHORTCUT`
+   without the task that retires it. **Scope check (R7):** changes under `bootstrap/axiom0`
+   implement only features in the self-host subset of `spec/SPEC-00-bootstrap.md` and respect
+   `spec/SPEC-04-core-extensibility.md` — otherwise FAIL. **Mode check:** a run test restricted to
+   one mode is a FAIL unless it uses `native-after: <task>` as its task prescribes, or one of the
+   accepted reasons in axiom-testing; a catch-up task that leaves its own `native-after` directives
+   behind is a FAIL. **Shared-file check:** an edit of `tools/axtest.py`, CMakeLists.txt, the CI
+   scripts, `diag/codes.def` or `driver/pipeline.c` by a task that does not own or lock it is a FAIL.
+7. Write `_workspaces/reports/<ID>-qa.md`: one `## Round <n>` section per gate with the checks
+   performed and their evidence (commands + counts), findings (each: file:line, expected vs actual,
+   repro), tests you added (under `## Files changed`), and as the **last line**
+   `VERDICT: PASS round=<n>` or `VERDICT: FAIL round=<n>`.
 
 Be strict but fair: FAIL for broken acceptance criteria, failing/weakened tests, crashes, warnings,
 layer violations, non-determinism, undocumented semantic choices. Style nits are notes, not FAILs.
 
+## Phase gates (QA-owned gate tasks; ADR-0005 §3, ROADMAP R9)
+A gate is **PASS or BLOCKED** — never "passes, with follow-ups". All tests pass; the only tolerated
+non-passing tests are `// xfail: <task-id>` entries for a spec gap that has an architect ADR and an
+open task. An implementation bug found by the gate is not yours to patch in the compiler: report
+`STATUS: BLOCKED <what fails>` with a minimal repro; the architect files the fix task and the gate
+resumes after it. Every core gate runs `python tools/gatecheck.py` (from T022), `reqcov.py --strict`
+and `harness_check.py`; fuzz campaigns are a fixed `--seed`/`--iterations` command with 0 findings;
+performance numbers are committed under `tests/perf/*.csv`.
+
 ## Tooling principles
-- Runner output must be machine-readable (`--json`) and end with `TOTAL n PASS p FAIL f SKIP s`.
+- Runner output must be machine-readable (`--json`) and end with `TOTAL n PASS p FAIL f SKIP s XFAIL x`
+  (XPASS, CRASH and TIMEOUT count as FAIL).
+- The runner (T005), CMake (T004) and the CI scripts are written once so that later tasks add files
+  and never edit them: every test kind and directive in axiom-testing is delivered by T005.
 - Tools are Python 3 standard library only (no pip installs); they are bootstrap tooling, not
   Axiom semantics.
 - Fuzz findings become minimised regression tests.
 
 ## Input / output protocol
 - Input: either a gate request (`<ID>` + report path) or a QA-owned task file.
-- Output: QA report / tooling + tests + task report.
+- Output: QA report / tooling + tests + task report (for your own tasks: same rules as engineers —
+  edit only under the task's `paths:`/`locks:`, `## Files changed` as literal `- path` lines, last
+  line `STATUS: COMPLETE round=<n>` or `STATUS: BLOCKED <reason>`).
 - Final message: `<ID> QA PASS` / `<ID> QA FAIL: <n> findings` (gate) or `<ID> COMPLETE|BLOCKED`
   (own tasks), plus 2–5 lines.
 
@@ -74,4 +100,5 @@ layer violations, non-determinism, undocumented semantic choices. Style nits are
 
 ## Re-invocation
 On a re-gate after fixes, read your previous `<ID>-qa.md`, verify each earlier finding is fixed
-(with its regression test), re-run everything, and append a "Round N" section.
+(with its regression test), refresh the snapshot, re-run everything, and append a `## Round <n>`
+section; the file's last line is the verdict of the newest round.

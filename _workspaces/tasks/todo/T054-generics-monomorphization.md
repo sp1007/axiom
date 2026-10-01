@@ -1,6 +1,6 @@
 ---
 id: T054
-title: Generics + monomorphization
+title: Generics: type checking and inference
 phase: P7-abstraction
 owner: axiom-semantics
 reviewer: axiom-qa
@@ -10,19 +10,21 @@ depends: [T053]
 priority: 74
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/traits/mono, bootstrap/axiom0/src/mir, tests/run/generic, tests/ui/generic]
+paths: [bootstrap/axiom0/src/types, tests/typeck/generic, tests/ui/generic]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0083, tasks/0271, tasks/0506, tasks/0354, 0042]
 ---
-# T054 — Generics + monomorphization
+# T054 — Generics: type checking and inference
 
 ## Goal
-Generic functions/types with static dispatch via monomorphization.
+Generic functions and types in the type checker. Monomorphization, mangling and generic drop glue are T054b (split, ADR-0005 §8).
 
 ## Scope
-- Generic params, inference of type args, generic structs/enums, instance collection, MIR instantiation, symbol mangling scheme (spec'd), Option<T>/Result<T,E> made truly generic (retire T039 shortcut).
+- Generic parameters on fns, structs, enums and impls; explicit type arguments (`f<T>(x)`, `Vec<i32>.new()`); inference of type arguments; generic struct/enum construction and field/variant typing; bounds are parsed and stored (checked by T055).
+- Typed HIR carries the substitution of every generic use (input of T054b).
 
 ## Acceptance
-- [ ] run + ui tests; instance dedup test; mangling deterministic.
+- [ ] ui tests (wrong number of type arguments, cannot infer, mismatched instantiation) and THIR golden tests showing the substitutions.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T054-report.md` with exact `## Files changed`.
 

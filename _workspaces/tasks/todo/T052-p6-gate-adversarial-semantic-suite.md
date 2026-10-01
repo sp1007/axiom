@@ -5,7 +5,7 @@ phase: P6-ownership
 owner: axiom-qa
 reviewer: axiom-architect
 model: opus
-gate_model: sonnet
+gate_model: opus
 depends: [T051]
 priority: 72
 status: todo
@@ -22,7 +22,9 @@ Attack the ownership/capability implementation with the adversarial cases from t
 - Port 0026 adversarial tests + relevant 0022 stress tests into canonical syntax; report every divergence as finding or spec gap.
 
 ## Acceptance
-- [ ] Suite passes or every failure has a filed follow-up task.
+- [ ] The whole suite passes. A divergence that is a spec gap gets an architect ADR and an `xfail: <task-id>` entry; an implementation bug blocks the gate until its fix task is done (0264 §20: PASS or BLOCKED, never "almost done").
+- [ ] Gate rule (ADR-0005 §3): PASS or BLOCKED. Every non-passing test is an `xfail: <task-id>` for a spec gap that has an ADR; implementation bugs are fixed (their fix task done) before the gate closes; XPASS counts as a failure.
+- [ ] `python tools/gatecheck.py`, `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T052-report.md` with exact `## Files changed`.
 

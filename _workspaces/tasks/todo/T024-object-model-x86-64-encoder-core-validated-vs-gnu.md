@@ -22,6 +22,7 @@ Encode x86-64 instructions directly to bytes with target-neutral relocations.
 - objmodel: Section{name,kind,flags,align,bytes,relocs}, Symbol, Relocation{offset,kind,symbol,addend}.
 - Encoder for: mov (r/r, r/imm, r/m, m/r, imm64), movzx/movsx, lea, add/sub/and/or/xor/cmp/test, imul, cqo/cdq, idiv/div, neg/not, shl/shr/sar (cl & imm), setcc, jcc/jmp rel8/rel32, call rel32, call [rip+disp32], ret, push/pop, int3; all GPRs incl. r8–r15 and byte regs; ModRM/SIB/disp8/disp32/RIP-relative edge cases.
 - tools/gen_encode_tests.py generates expectation tables using GNU as + objdump (checked into tests/encode).
+- Tests are a C driver `tests/encode/cdriver_encode.c` (T004 glob) plus `exec` manifests (T005); no CMake or runner edit.
 
 ## Acceptance
 - [ ] Encoding tables pass for every form × register class × addressing edge case (RSP/R12 SIB, RBP/R13 disp).

@@ -11,6 +11,7 @@ priority: 33
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/verify, tests/verify]
+locks: [bootstrap/axiom0/src/diag/codes/VERIFY.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0027, 0029, 0034, 0035, tasks/0365]
 ---
 # T020 — MIR verifier v1 (structural + types)

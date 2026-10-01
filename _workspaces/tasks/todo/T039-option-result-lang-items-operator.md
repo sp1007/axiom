@@ -6,11 +6,12 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T038]
+depends: [T038b]
 priority: 59
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, std/core/prelude, tests/run/result, tests/ui/result]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/result, tests/ui/result]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0269, 0111, 0107, 0222, tasks/0288]
 ---
 # T039 — Option/Result lang items + `?` operator
@@ -19,10 +20,12 @@ spec: [tasks/0269, 0111, 0107, 0222, tasks/0288]
 Error handling core: Option/Result in the prelude and `?` lowering.
 
 ## Scope
-- Prelude source (Axiom) or built-in lang items for Option/Result (non-generic special-casing allowed until generics land — mark BOOTSTRAP-SHORTCUT and file follow-up for T054), `?` on Option/Result with return-type compatibility checks.
+- Built-in, non-generic lang items for Option/Result (ADR-0006 §4; mark `BOOTSTRAP-SHORTCUT` — T054b replaces them by generic enums in std, loaded through the prelude mechanism of T060), `?` on Option/Result with return-type compatibility checks.
 
 ## Acceptance
 - [ ] run tests for propagation paths; ui tests for `?` in non-Result fn.
+- [ ] `if let` / `while let` over Option (moved here from T038).
+- [ ] Run tests carry `// native-after: T040` (removed by T040).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T039-report.md` with exact `## Files changed`.
 

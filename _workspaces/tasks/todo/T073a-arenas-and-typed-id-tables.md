@@ -6,8 +6,8 @@ owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T070]
-priority: 104
+depends: [T070, T073]
+priority: 105
 status: todo
 attempts: 0
 paths: [std/core/arena, std/collections/idtable, tests/std/arena]
@@ -29,7 +29,7 @@ AKERNEL-24).
 - Documentation of how compiler phases use them (mirrors axiom0 kernel/).
 
 ## Acceptance
-- [ ] Tests: 1M allocations in an arena, reset reuses memory, drop of arena frees everything (allocator counters back to zero).
+- [ ] Tests: 1M allocations in an arena natively and a 10k interp twin, reset reuses memory, drop of arena frees everything (allocator counters back to zero).
 - [ ] IdTable/Interner tests: identity, insertion-order iteration, determinism across runs.
 - [ ] A mini "AST in an arena" example built and traversed in interp and native mode.
 - [ ] Full test suite passes; report `_workspaces/reports/T073a-report.md` with exact `## Files changed`.
@@ -38,5 +38,6 @@ AKERNEL-24).
 - Pool / general custom allocators, concurrent arenas (E21.9).
 
 ## Notes
+- Arena-escape rule: SPEC-11 stored-view rule (T045). Interner hashing comes from T073/T069, so this task depends on T073 (audit A1-03, A3-10).
 - Moved from E21.9 into the core because the Axiom compiler cannot be ported without it.
 - All Axiom code uses canonical syntax (axiom-syntax).

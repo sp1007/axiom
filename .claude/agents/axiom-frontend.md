@@ -36,15 +36,28 @@ boundaries and diagnostics codes.
   axiom-syntax. After resolution no phase looks names up by string.
 - HIR: semantic structure, desugared (method-call sugar kept as an explicit node until typeck
   resolves it), all IDs typed.
-- Diagnostics are data with stable codes in `diag/codes.def`; message text can evolve, codes can't.
+- Diagnostics are data with stable codes in the area files `diag/codes/<AREA>.def` (add a code only
+  to the area file named in your task's `locks:`); message text can evolve, codes can't.
+- The driver is a set of registries (ADR-0005 §2): a new command is `driver/cmd_<name>.c`, a new
+  `inspect --emit=<name>` is `driver/emit_<name>.c`, a new pipeline stage is one line in
+  `driver/pipeline.c` (only when that file is in your `locks:`). Nobody edits CMakeLists.txt after
+  T004 or `tools/axtest.py` after T005.
+- Vertical slice (ADR-0005 §4): the AST and HIR data models reserve every node kind from the start,
+  but resolution and lowering arrive in two steps — what T011 parses (T014/T015) and the rest of the
+  grammar (T012/T015b). A construct that is not lowered yet gives a diagnostic, never a crash.
 
 ## Input / output protocol
 - Input: task file path in `_workspaces/tasks/doing/`. Read the task, its `spec:` refs (via
   axiom-spec-index priority: `spec/` first), and existing code in the listed `paths`.
-- Work only inside the task's `paths` (plus new test files). If you must touch another area, keep
-  it minimal and list it in the report.
-- Output: code + tests, full test suite run, `_workspaces/reports/<ID>-report.md` with an exact
-  "Files changed" list.
+- Edit only files under the task's `paths:` and `locks:`. Other tasks edit the same working tree in
+  parallel: never touch their files, even when they break the main-tree build. If the task cannot be
+  done inside its paths, report BLOCKED naming the file you need — the architect extends the task.
+- The build and full-suite run that count are made in your snapshot: `python
+  .claude/skills/axiom-tasks/scripts/taskctl.py snapshot <ID>` → `build-snap-<ID>/` (see axiom-c-stage0).
+- Output: code + tests, `_workspaces/reports/<ID>-report.md` with `## Files changed` as literal
+  `- path` lines (every created, modified or deleted file) and, as its **last line**,
+  `STATUS: COMPLETE round=<n>` (0 on the first pass, 1 or 2 after fix rounds) or
+  `STATUS: BLOCKED <reason>`.
 - Final message: status line `<ID> COMPLETE` or `<ID> BLOCKED: <reason>`, then test totals and 2–5
   lines of notes.
 
@@ -54,7 +67,8 @@ boundaries and diagnostics codes.
   `<ID> BLOCKED: needs architect decision on …` if the rest cannot proceed.
 - Pre-existing failing tests not caused by you → note them in the report; do not "fix" by deleting
   or weakening tests.
-- Build broken by another area → report it; do not refactor other owners' modules.
+- Build broken by another area → report it; do not refactor other owners' modules (your snapshot
+  build is unaffected by other tasks' unfinished work).
 
 ## Collaboration
 - Downstream consumers: axiom-semantics (HIR, types of IDs, diagnostics), axiom-qa (golden

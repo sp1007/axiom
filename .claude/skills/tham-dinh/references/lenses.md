@@ -1,5 +1,9 @@
 # Auditor prompts (copy verbatim, replace `<date>` with YYYY-MM-DD)
 
+Models: the model in each heading is passed as the Agent `model` parameter and overrides the model
+named in `.claude/agents/axiom-auditor.md` (A1/A2 need design judgement → opus; A3/A4 are checklist
+work → sonnet). This is deliberate — do not "fix" the difference.
+
 ## Shared context (prepend to every lens prompt)
 
 ```
@@ -84,11 +88,13 @@ Give exact task ids and the fix. One-line per-task OK list under "Checked and OK
 
 ```
 LENS A4 — PROCESS & DOCUMENT CONSISTENCY. Read CLAUDE.md, .claude/agents/*, .claude/skills/*
-(including scripts taskctl.py, reqcov.py, harness_check.py and
-axiom-spec-index/references/requirements-extraction.md), .claude/settings.json, spec/ROADMAP.md,
-OWNER.md, ADRs, and the board. Owner rules: docs/ never edited/staged; commit locally after each
-QA-accepted task, never push; autopilot never asks; max 3 parallel with disjoint paths; critical
-(priority < 10) alone with drain; QA fix round 2 escalates to opus; T224 deferred until the owner asks.
+(including scripts taskctl.py, autopilot.py, overdue.py, reqcov.py, harness_check.py and
+axiom-spec-index/references/requirements-extraction.md), .claude/settings.json, .claude/hooks/guard.py,
+spec/ROADMAP.md, OWNER.md, ADRs, and the board. Owner rules: docs/ never edited/staged; commit locally
+after each QA-accepted task (`taskctl accept`), never push; autopilot never asks — decisions are
+delegated (decide, record the rationale, report afterwards); max 3 parallel with disjoint paths/locks,
+QA gates on per-task snapshots; critical (priority < 10) alone with drain; QA fix round 2 escalates to
+opus; infrastructure failures never burn attempts; T224 deferred until the owner asks.
 Find:
 1. contradictions between documents, stale statements, references to missing files/sections/tasks/
    epics, IDs outside the ROADMAP §4 blocks;
@@ -96,12 +102,16 @@ Find:
    post-self-host tasks editing bootstrap/axiom0; core depending on post-self-host; tasks outside any
    epic; "hello world");
 3. autonomous-loop failure modes, walking the real scripts and skill text: session restart
-   mid-task; agent crash; QA FAIL ×3; unblock that fails; architect editing a task in doing; two
-   tasks needing diag/codes.def; incomplete Files-changed; a report listing a directory; critical task
-   ready while 3 run; cron expiry; failing phase gate; planning tasks T211–T223 creating tasks (ID
-   collisions); reqcov strict failing; board fully done — report gaps with concrete fixes;
-4. script bugs (run read-only commands only: status, list, next, validate, reqcov, harness_check;
-   test state-changing commands only on a copy in a temp git repo);
+   mid-task; agent crash; rate limit / quota hitting every agent and the session itself; QA FAIL ×3;
+   unblock that fails or repeats; architect editing a task in doing; two tasks needing the same shared
+   file; incomplete Files-changed; a report listing a directory; crash between the steps of accept;
+   critical task ready while 3 run; cron expiry; failing phase gate; planning tasks T211–T223
+   creating tasks (ID collisions); reqcov strict failing; board fully done; board stuck — report gaps
+   with concrete fixes;
+4. script bugs (run read-only commands only: status, list, next, validate, changes, reconcile without
+   --commit, recover, stuck without --write, reqcov, harness_check, overdue, guard.py --selftest;
+   test state-changing commands only on a copy in a temp git repo — the scripts find their root from
+   their own location, so copy them into the temp repo);
 5. traceability: can extraction → CATALOG → reqcov detect a requirement "planned" in an epic but
    needed earlier (raw pointers were in E13.1 but Vec needs them before self-host)? Propose how.
 ```

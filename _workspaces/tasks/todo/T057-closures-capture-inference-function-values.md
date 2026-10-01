@@ -11,6 +11,7 @@ priority: 77
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/own, bootstrap/axiom0/src/mir, tests/run/closure, tests/ui/closure]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/MOVE.def, bootstrap/axiom0/src/diag/codes/CAP.def]
 spec: [0060, 0069, tasks/0273, tasks/0290, tasks/0671]
 ---
 # T057 — Closures, capture inference, function values
@@ -22,7 +23,8 @@ Closures without runtime objects by default.
 - Closure syntax → HIR, capture inference (copy / view / mut_view / move by usage), closure types, Fn-like traits per spec, fn pointers, passing closures to generic fns.
 
 ## Acceptance
-- [ ] run + ui tests incl. capture conflicts.
+- [ ] run + ui tests incl. capture conflicts; run tests carry `// native-after: T059`.
+- [ ] At least one positive run test and one negative ui test per Scope bullet; the report maps each bullet to its test files (QA checks the map).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T057-report.md` with exact `## Files changed`.
 

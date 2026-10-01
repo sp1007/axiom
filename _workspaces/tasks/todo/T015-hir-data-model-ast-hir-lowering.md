@@ -10,7 +10,8 @@ depends: [T014]
 priority: 25
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/hir, tests/hir]
+paths: [bootstrap/axiom0/src/hir, tests/hir, bootstrap/axiom0/src/driver/emit_hir.c]
+locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, 0023, tasks/0378, 0159]
 ---
 # T015 — HIR data model + AST→HIR lowering
@@ -19,11 +20,11 @@ spec: [0156, 0023, tasks/0378, 0159]
 Produce the semantic HIR consumed by typeck: resolved IDs, desugared syntax, spans preserved.
 
 ## Scope
-- HIR nodes for all items/exprs/stmts/patterns/types; desugar compound assignment, else-if chains, `for` placeholders (full desugar in T072), method-call node kept explicit.
+- HIR data model with node kinds for the whole grammar (reserved up front, 0263 §42); lowering implemented for everything T011 parses. Constructs parsed only by T012 are lowered by T015b — until then they produce a "not supported yet" diagnostic, never a crash. Desugar compound assignment, else-if chains, `for` placeholders (full desugar in T072), method-call node kept explicit.
 - `inspect --emit=hir` stable dump.
 
 ## Acceptance
-- [ ] Golden tests covering every AST node kind (QA will cross-check exhaustiveness).
+- [ ] Golden tests covering every AST node kind T011 produces; `tests/hir/COVERAGE.md` maps AST kind → test file (QA cross-checks it against the AST enum).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T015-report.md` with exact `## Files changed`.
 

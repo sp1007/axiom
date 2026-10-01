@@ -11,6 +11,7 @@ priority: 70
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/verify, tests/verify/own]
+locks: [bootstrap/axiom0/src/diag/codes/VERIFY.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0027, 0029, 0034, 0035, 0019, 0020]
 ---
 # T050 — Verifier v2: ownership/capability/drop re-verification

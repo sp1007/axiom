@@ -11,6 +11,7 @@ priority: 56
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/array, tests/ui/array]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, tasks/0326, 0087]
 ---
 # T036 — Fixed arrays, indexing, bounds checks
@@ -19,10 +20,10 @@ spec: [tasks/0476, tasks/0326, 0087]
 `[N]T` arrays with safe indexing.
 
 ## Scope
-- Array literals, repeat literals if spec'd, indexing read/write, bounds checks → panic, arrays of structs, arrays in structs, `len`.
+- Array literals, repeat literals if spec'd, indexing read/write, bounds checks → panic, arrays of structs, arrays in structs, built-in `len(a)` (ADR-0006 §3).
 
 ## Acceptance
-- [ ] run tests incl. out-of-bounds abort exit code; ui tests.
+- [ ] run tests incl. out-of-bounds abort exit code; ui tests. Run tests carry `// native-after: T037` (removed by T037).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T036-report.md` with exact `## Files changed`.
 

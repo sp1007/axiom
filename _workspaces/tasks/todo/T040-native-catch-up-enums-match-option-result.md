@@ -10,7 +10,7 @@ depends: [T039, T037]
 priority: 60
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum]
+paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum, tests/run/enum, tests/run/pattern, tests/run/result]
 spec: [tasks/0268, 0183]
 ---
 # T040 — Native catch-up: enums, match, Option/Result
@@ -20,9 +20,12 @@ Enum/match programs pass natively.
 
 ## Scope
 - Switch lowering (compare chains; jump tables optional), tag/payload access, enum ABI.
+- Remove every `// native-after: T040` directive from tests/run/{enum,pattern,result} (ADR-0005 §1) and make those tests pass natively. New instruction forms go into the encoder only with GNU-as validation tables (T024 method).
+- Decision trees for literal, range and or-patterns; `enum as uN`.
 
 ## Acceptance
-- [ ] Differential green.
+- [ ] Differential green, incl. the lexer-style char-range `match` of T038b natively.
+- [ ] `grep -rn "native-after: T040" tests` prints nothing; every run test that depended on this task passes in both modes.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T040-report.md` with exact `## Files changed`.
 

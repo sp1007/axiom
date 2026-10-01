@@ -7,10 +7,11 @@ reviewer: axiom-qa
 model: opus
 gate_model: opus
 depends: [T003]
-priority: 4
+priority: 12
 status: todo
 attempts: 0
-paths: [spec/SPEC-04-core-extensibility.md, spec/SPEC-00-bootstrap.md]
+paths: [spec/SPEC-04-core-extensibility.md, spec/SPEC-00-bootstrap.md, spec/selfhost-subset.tsv]
+timeout_min: 300
 spec: [0263, tasks/0260, tasks/0494, 0152, 0056, 0054, 0161, 0162, 0163, spec/ROADMAP.md]
 ---
 # T003a — Core extensibility contract + exact self-host subset
@@ -39,14 +40,21 @@ redesign — "implement later ≠ design later" (0263 §42).
 - Minimal raw pointers + `unsafe` blocks + memory intrinsics are in the self-host subset (T061a; std needs them); the full unsafe/UB model, volatile and MMIO stay in E13.1/E13.2. Slices (dynamic views) and `if let`/destructuring patterns are in the subset too (T048, T038).
 - Scalars in the self-host subset: all integer widths, bool, unit, never, `char`; **no floating point** in axiom0 (f32/f64 → P12 E12.2, written in Axiom; axiom0 reports AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP). The compiler itself needs no floats.
 - C-scope budget: rough size target per axiom0 module and the list of forbidden-in-C features.
+- Subset items fixed by ADR-0002, ADR-0004 and ADR-0006 are listed explicitly: the host-interface intrinsic set with final names and signatures (SPEC-04); wrapping/bit intrinsics; `const` aggregate tables placed once in `.rdata` (no `static` items in axiom0); stored views; labelled `break`/`continue`; literal / char-range / or-patterns; `enum as uN`; `@derive(Copy, Clone, Eq, PartialEq, Ord, Hash)` and tuple `Eq`/`Ord`/`Hash`; generic drop glue with `drop_in_place`/`needs_drop`; `extern` items and `unsafe fn`; the `HashMap` insertion-order + hash contract; the const-evaluator interface (`types` never includes `interp`); the MIR text parser as C-only test infrastructure that is not ported.
+- Every item of tasks/0260 §3 is marked in or out with a reason (`var` is excluded by the syntax rule; "comptime (limited)" = const items).
+- `spec/selfhost-subset.tsv`: one row per subset feature — feature id, delivering task (oracle), native task, first consumer task. `tools/gatecheck.py` (T022) checks that each delivering task is an ancestor of its first consumer; T076 re-audits it.
+- SPEC-04 also records the registry contracts of ADR-0005 §2: per-area diagnostic code files, command/emitter registration in the driver, option tables owned by commands/stages.
 
 ## Acceptance
 - [ ] Every roadmap epic of P11–P22 that touches a core data model has an explicit extension point.
 - [ ] Self-host subset list is concrete (feature-by-feature) and every P0–P10 task is consistent with it (list any task scope that should shrink; architect files the change).
 - [ ] Report `_workspaces/reports/T003a-report.md` with exact `## Files changed`.
+- [ ] `spec/selfhost-subset.tsv` exists; every row names existing board tasks and its delivering task is an ancestor of the consumer (checked by a few lines of Python in the report until gatecheck exists).
+- [ ] tasks/0260 §3 in/out table present in SPEC-00.
 
 ## Out of scope
 - Implementing anything.
 
 ## Notes
-- Critical (priority < 10): runs alone, before the repository skeleton.
+- Not a "critical, runs alone" task any more (ADR-0005 §11): ordered by `depends`; T010, T017, T023–T026 and T045 depend on it.
+- ADRs: reserve the number with `python .claude/skills/axiom-tasks/scripts/taskctl.py adr-next <slug>` (never pick one by listing the directory) and list the ADR file in the report.

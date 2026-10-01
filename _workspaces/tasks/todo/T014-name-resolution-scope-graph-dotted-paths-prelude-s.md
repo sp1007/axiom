@@ -6,11 +6,12 @@ owner: axiom-frontend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T012]
-priority: 24
+depends: [T011]
+priority: 22
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/resolve, tests/resolve, tests/ui/resolve]
+paths: [bootstrap/axiom0/src/resolve, tests/resolve, tests/ui/resolve, bootstrap/axiom0/src/driver/emit_resolved.c]
+locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, tasks/0387, tasks/0357, tasks/0497, 0103, .claude/skills/axiom-syntax]
 ---
 # T014 — Name resolution: scope graph, dotted paths, prelude stub
@@ -23,6 +24,7 @@ Resolve every identifier and DottedChain to SymbolIds within a single module (mu
 - DottedChain disambiguation (value vs module vs type vs enum variant) per axiom-syntax; AX_NAME_SHADOW_MODULE warning.
 - Built-in prelude stub (primitive types, Option/Result names reserved until P5).
 - `inspect --emit=resolved` (AST annotated with symbol ids).
+- Covers the constructs T011 parses (ADR-0005 §4). Generic parameters, impl/trait items, closures, labels and the remaining pattern forms are resolved by T015b.
 
 ## Acceptance
 - [ ] ui tests: unknown name, duplicate item, use before let, shadowing allowed, variant paths, field access on locals vs module paths.

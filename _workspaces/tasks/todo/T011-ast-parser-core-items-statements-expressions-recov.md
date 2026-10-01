@@ -10,7 +10,8 @@ depends: [T010]
 priority: 21
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/syntax, tests/parse]
+paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, bootstrap/axiom0/src/driver/emit_ast.c]
+locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, 0155, 0174, tasks/0386, tasks/0476]
 ---
 # T011 — AST + parser core (items, statements, expressions, recovery)
@@ -24,10 +25,12 @@ Parse the core grammar into an arena AST with spans and robust error recovery.
 - Newline termination + continuation rules; optional `;`.
 - Recovery: sync at newline/`}`/`)`/`]`/EOF; error nodes; no cascades of more than 1 diagnostic per construct.
 - `inspect --emit=ast` stable S-expression-like dump.
+- Parsed here because the first vertical slice needs them (ADR-0005 §4): simple types — named paths without generic arguments, unit, tuple types, `[N]T`; basic patterns — binding, `mut` binding, wildcard, literal, tuple. Everything else in types and patterns is T012.
+- The AST dump is the emitter file `src/driver/emit_ast.c` (T004 table).
 
 ## Acceptance
 - [ ] Golden tests: every construct + all example programs of SPEC-02.
-- [ ] ui tests: missing `)`, missing expression, `var x = 1` (AX_PARSE_VAR fix-it), `import a` fix-it, stray tokens; parser never crashes on the fuzz-lite loop in the report.
+- [ ] ui tests (under tests/ui/parse): missing `)`, missing expression, `var x = 1` (AX_PARSE_VAR fix-it), `import a` fix-it, stray tokens; parser never crashes on the fuzz-lite loop in the report.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T011-report.md` with exact `## Files changed`.
 

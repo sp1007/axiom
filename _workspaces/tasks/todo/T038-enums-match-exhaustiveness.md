@@ -11,6 +11,7 @@ priority: 58
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/match, tests/run/enum, tests/ui/enum]
+locks: [bootstrap/axiom0/src/diag/codes/PAT.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0065, tasks/0268, tasks/0392, tasks/0504]
 ---
 # T038 — Enums + match + exhaustiveness
@@ -19,12 +20,14 @@ spec: [0065, tasks/0268, tasks/0392, tasks/0504]
 Algebraic data types and pattern matching.
 
 ## Scope
-- Enum decl (unit/tuple/struct variants), variant construction via dotted paths, layout (tag + payload), match with all pattern kinds, guards if in spec, exhaustiveness + unreachable-arm analysis (AX_MATCH_NONEXHAUSTIVE with missing patterns listed).
-- Refutable pattern forms the spec defines (`if let`, `while let`, `let … else` or their canonical equivalents) desugared to match; destructuring `let` for tuples/structs with an irrefutability check (AX_PATTERN_REFUTABLE).
+- Enum declarations (unit/tuple/struct variants), variant construction via dotted paths, layout (tag + payload), `enum as uN` for fieldless enums (ADR-0004 §7).
+- `match` with variant, binding, wildcard, tuple, struct and nested patterns; exhaustiveness + unreachable-arm analysis over these forms (AX_PAT_NONEXHAUSTIVE with the missing patterns listed, AX_PAT_UNREACHABLE).
+- Literal / range / or-patterns, guards, `if let` / `while let` / `let … else` and destructuring `let` are T038b.
 
 ## Acceptance
-- [ ] Pattern tests: `if let`/`while let` (or spec equivalents) over Option, destructuring `let (a, b) = pair` and struct patterns, refutable pattern in plain `let` rejected.
-- [ ] run + ui tests incl. nested patterns and exhaustiveness counter-examples.
+- [ ] run + ui tests incl. nested patterns and exhaustiveness counter-examples, written with user-defined enums only (for example `enum Maybe { Some(i32), None }`) — Option arrives in T039.
+- [ ] `enum as u8` test for a fieldless enum; a cast of an enum with payload is rejected.
+- [ ] Run tests carry `// native-after: T040` (removed by T040).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T038-report.md` with exact `## Files changed`.
 

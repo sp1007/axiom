@@ -10,7 +10,7 @@ depends: [T057]
 priority: 79
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/native_p7]
+paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/native_p7, tests/run/method, tests/run/generic, tests/run/mono, tests/run/trait, tests/run/trait2, tests/run/closure]
 spec: [0183, 0162]
 ---
 # T059 — Native catch-up: generics, closures, fn pointers
@@ -20,9 +20,11 @@ All P7 programs run natively.
 
 ## Scope
 - Mono instance codegen and symbol emission, closure environments, indirect calls (dyn/vtables moved to E14.4).
+- Remove every `// native-after: T059` directive from tests/run/{method,generic,mono,trait,trait2,closure} (ADR-0005 §1) and make those tests pass natively. New instruction forms go into the encoder only with GNU-as validation tables (T024 method).
 
 ## Acceptance
 - [ ] Differential green.
+- [ ] `grep -rn "native-after: T059" tests` prints nothing; every run test that depended on this task passes in both modes.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T059-report.md` with exact `## Files changed`.
 

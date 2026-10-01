@@ -5,17 +5,36 @@ description: Backend knowledge for the Axiom compiler — LIR→x86-64 machine I
 
 # x86-64 backend (Windows first, Linux second)
 
-Pipeline (docs 0152, 0162, 0180, 0181): **Verified MIR → LIR → x64 Machine IR (virtual regs) →
-ABI lowering → regalloc → frame lowering → encoder (bytes + relocations) → objmodel → COFF/ELF
-writer → PE/ELF linker**. One x86 backend; only ABI + object format + linker + startup differ per OS.
+Pipeline (docs 0152, 0162, 0180, 0181; ADR-0003): **Verified MIR → LIR → ABI lowering (a LIR→LIR
+pass in `abi`) → x64 machine IR (instruction selection, fixed registers) → frame lowering (+ stack
+probes) → machine-IR verifier → encoder (bytes + relocations) → objmodel → COFF writer → PE
+linker**. One x86 backend; only ABI + object format + linker + startup differ per OS (the Linux/ELF
+side is written after self-hosting, in Axiom — E16.9).
 Never emit assembly text; never call an external assembler/linker in the production path (tools are
 test oracles only).
 
 ## Baseline first (doc 0152 §70-71)
 
 Start dumb-but-correct: every MIR local gets a stack slot; each operation loads operands into fixed
-scratch registers, computes, stores back. Mark it `BOOTSTRAP-SHORTCUT`. Linear-scan regalloc (T053)
-comes only after native execution is green and differential tests exist to catch regressions.
+scratch registers, computes, stores back. Mark it `BOOTSTRAP-SHORTCUT`. Linear-scan regalloc is
+E15.8 (T063), written in Axiom after the self-host gate T087 (ROADMAP R7) — it is not part of
+axiom0 unless the T086 budget check triggers the documented exception (ADR-0005 §7).
+
+Robustness rules that the baseline must still meet (ADR-0003):
+- **Stack probes.** Every local lives in a stack slot, so frames get large. Windows commits stack
+  pages one at a time through a guard page: a frame larger than 4096 bytes must touch each page in
+  order before `sub rsp` (inline loop, no CRT `__chkstk`; doc 0188 §12). Skipping this gives
+  0xC0000005 in big functions.
+- **Stack reserve.** The linker option `--stack-reserve <bytes>` sets SizeOfStackReserve (default
+  1 MB); `tools/bootstrap.py` builds axiomc with 64 MB because the compiler recurses deeply.
+- **Machine-IR verifier.** Before encoding, check operand forms against the encoder tables, register
+  classes, 16-byte alignment at call sites, shadow space and frame-size consistency; a violation is
+  an ICE at the right seam, not a crashing executable (doc 0181 §31).
+- **Host calls.** A host intrinsic (`host.heap_alloc`, `host.write`, …; ADR-0002) is lowered to an
+  ordinary call of the Axiom function `__ax_host_<name>` from `std/sys/windows`; no runtime helper is
+  written in C or as hand-made machine code.
+- **Catch-up tasks** remove the `// native-after: <task>` directive from the tests they make pass
+  and add new instruction forms to the encoder only together with GNU-as validation tables.
 
 ## Windows x64 ABI (doc 0181, 0189)
 

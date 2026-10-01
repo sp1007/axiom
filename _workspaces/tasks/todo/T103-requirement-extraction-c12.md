@@ -24,6 +24,7 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 - Skim each listed file (headings, conclusions, invariants, MUST/phải statements, rule IDs); read decision passages in full.
 - Write `spec/requirements/raw/C12.md`: six-column table (id RQ-C12-NNN | area | tier | statement | sources | status), then `## Conflicts` and `## Files skimmed`.
 - Tier every row v1-core / v1-full / post-v1 as defined in the procedure.
+- When a statement says it is built on / uses / requires another requirement, end the statement with `[needs RQ-Cnn-NNN, …]` (T110 turns this into the catalogue `needs` column).
 
 ## Acceptance
 - [ ] Every file in the chunk manifest is accounted for in `## Files skimmed` (skimmed / unreadable).

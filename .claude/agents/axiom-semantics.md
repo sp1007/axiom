@@ -36,14 +36,31 @@ boundaries and diagnostics codes.
   from day one even if early milestones only use a few (doc 0263 §42 "implement later ≠ design later").
 - The interpreter implements Axiom semantics exactly (overflow, division, shifts, drop order) —
   it is the reference the native backend is compared against. Never copy C behaviour by accident.
-- Optimizations run only on verified MIR, must re-verify, and must pass differential tests.
+- Optimizations run only on verified MIR, must re-verify (after every pass in test builds), and must
+  pass differential tests.
+- **Oracle first, native by directive** (ADR-0005 §1): a run test you write before the backend
+  supports the feature carries `// native-after: <catch-up task>` (the task text names it). Never use
+  `// modes: interp` for that; the catch-up task removes the directive.
+- **The oracle runs heap and OS code** through the host intrinsics (ADR-0002); direct `extern` calls
+  are native-only. Constant evaluation reaches the interpreter only through the const-evaluator
+  interface declared in `types` (ADR-0004 §8) — `types` never includes `interp`.
+- **Bootstrap forms** (ADR-0006): use the final surface syntax and recognise one fixed shape until the
+  general mechanism exists (`impl Drop for S`, built-in Option/Result, built-in `len`, checked
+  `u32 as char`); mark each with `BOOTSTRAP-SHORTCUT` naming the task that retires it.
+- New diagnostic codes go into the area file `diag/codes/<AREA>.def` named in your task's `locks:`.
 
 ## Input / output protocol
 - Input: task file path in `_workspaces/tasks/doing/`. Read the task, spec refs (`spec/` first),
   and the HIR/MIR contracts already in the code.
-- Stay within the task's `paths`; list any extra file touched.
+- Edit only files under the task's `paths:` and `locks:`. Other tasks edit the same working tree in
+  parallel: never touch their files, even when they break the main-tree build. If the task cannot be
+  done inside its paths, report BLOCKED naming the file you need.
+- The build and full-suite run that count are made in your snapshot: `python
+  .claude/skills/axiom-tasks/scripts/taskctl.py snapshot <ID>` → `build-snap-<ID>/` (see axiom-c-stage0).
 - Output: code + positive/negative tests (each rule: accepted case + rejected case with the exact
-  `AX_*` code), full suite run, `_workspaces/reports/<ID>-report.md`.
+  `AX_*` code), `_workspaces/reports/<ID>-report.md` with `## Files changed` as literal `- path` lines
+  (every created, modified or deleted file) and, as its **last line**, `STATUS: COMPLETE round=<n>`
+  (0 on the first pass, 1 or 2 after fix rounds) or `STATUS: BLOCKED <reason>`.
 - Final message: `<ID> COMPLETE` or `<ID> BLOCKED: <reason>`, test totals, short notes.
 
 ## Error handling

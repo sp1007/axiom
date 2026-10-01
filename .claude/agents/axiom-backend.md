@@ -31,13 +31,29 @@ boundaries and diagnostics codes.
   must be accepted by `objdump -x -d`.
 - Determinism: byte-identical outputs across runs (no timestamps, stable symbol order).
 - Native results must equal the MIR interpreter's for every run test (differential).
+- **Catch-up tasks** (ADR-0005 §1): tests written oracle-first carry `// native-after: <your task>`.
+  Your task makes them pass natively and removes the directive from the test directories listed in
+  its `paths:`; `grep -rn "native-after: <ID>" tests` must print nothing when you finish. Do not
+  implement native support for features of a later catch-up task.
+- **Pipeline and robustness** (ADR-0003): ABI lowering is a LIR→LIR pass before instruction
+  selection; frames above 4096 bytes get an inline stack probe; the machine-IR verifier runs before
+  the encoder; `--stack-reserve` sets the PE stack reserve. Host intrinsics (ADR-0002) lower to calls
+  of `__ax_host_<name>` Axiom functions — never to hand-written machine-code helpers.
+- Constant tables live in `.rdata` and are indexed in place (ADR-0004 §2); linear-scan register
+  allocation is post-T087 work (ROADMAP R7).
 
 ## Input / output protocol
 - Input: task file path in `_workspaces/tasks/doing/`; read spec refs and the current MIR/LIR dumps
   of the relevant tests.
-- Stay within the task's `paths`; list anything else touched.
-- Output: code + tests (encode tables, obj/link checks, run tests), full suite run,
-  `_workspaces/reports/<ID>-report.md`.
+- Edit only files under the task's `paths:` and `locks:`. Other tasks edit the same working tree in
+  parallel: never touch their files, even when they break the main-tree build. If the task cannot be
+  done inside its paths, report BLOCKED naming the file you need.
+- The build and full-suite run that count are made in your snapshot: `python
+  .claude/skills/axiom-tasks/scripts/taskctl.py snapshot <ID>` → `build-snap-<ID>/` (see axiom-c-stage0).
+- Output: code + tests (encode tables, obj/link checks through C drivers and `exec` manifests, run
+  tests), `_workspaces/reports/<ID>-report.md` with `## Files changed` as literal `- path` lines
+  (every created, modified or deleted file) and, as its **last line**, `STATUS: COMPLETE round=<n>`
+  (0 on the first pass, 1 or 2 after fix rounds) or `STATUS: BLOCKED <reason>`.
 - Final message: `<ID> COMPLETE` or `<ID> BLOCKED: <reason>`, test totals, notes.
 
 ## Error handling

@@ -23,11 +23,15 @@ out-of-subset feature in C is a QA FAIL even if it works.
 
 ```
 bootstrap/axiom0/
-  CMakeLists.txt          globs src/**/*.c → build/axiom0(.exe); never list files by hand
+  CMakeLists.txt          globs src/**/*.c → build/axiom0(.exe), tests/unit/**/*.c → axiom0-unit,
+                          tests/**/cdriver_*.c → one test exe each; never list files by hand,
+                          never edit it after T004
   src/
     kernel/    typed ids, arena, vec, hashmap, str/strview, interner, hash, utf8
     source/    SourceDatabase, FileId, Span, LineMap
-    diag/      Diagnostic model, code registry (codes.def), human/json renderers
+    diag/      Diagnostic model, human/json renderers, code registry: one X-macro file per area
+               codes/<AREA>.def (LEX, PARSE, NAME, TYPE, TRAIT, PAT, MOVE, INIT, CAP, DROP, UNSAFE,
+               CONST, VERIFY, FFI, LINK, IO, DRIVER, ICE), included by codes.def
     lex/       tokens, lexer
     syntax/    AST, parser, AST dumper
     resolve/   scope graph, name resolution, module graph
@@ -45,8 +49,10 @@ bootstrap/axiom0/
     objmodel/  target-neutral sections/symbols/relocations
     obj/       COFF writer, ELF writer (+ readers for the linker)
     link/      PE32+ linker, ELF linker, startup stubs
-    driver/    CLI (`axiom0 check|build|run|test|inspect`), pipeline orchestration
-tests/        lex/ parse/ ui/ run/ mir/ interp/ diff/ encode/ obj/ link/ fuzz/ conformance/
+    driver/    CLI (`axiom0 check|build|run|test|inspect`): one file per command (cmd_<name>.c)
+               and per inspect emitter (emit_<name>.c), registered by a CMake-generated table;
+               pipeline.c = the ordered stage list
+tests/        lex/ parse/ ui/ run/ mir/ interp/ diff/ encode/ obj/ link/ mc/ unit/ fuzz/ conformance/
 tools/        axtest.py (test runner), archcheck.py (layer checker), helpers
 std/          Axiom-source libraries: core/, std/ (written in Axiom)
 spec/         canonical specs + decisions/ (architect)
@@ -69,6 +75,25 @@ Exceptions: `objmodel` depends only on `kernel` (the encoder in `target/x64` emi
 depend on `target`, `opt` must not depend on `syntax`. Why: this is what lets the backend, the
 oracle and the frontend evolve and be ported independently.
 
+Two clarifications (ADRs): constant evaluation during type checking goes through a const-evaluator
+interface that `types` declares and the driver wires to the interpreter — `types` never includes
+`interp` (ADR-0004 §8). ABI lowering is a LIR→LIR pass in `abi`, run before x64 instruction
+selection (ADR-0003); the ABI never leaks into MIR.
+
+## Shared files (ADR-0005 §2, §14)
+
+No task edits a file another running task may edit:
+- A new diagnostic code goes into the area file `diag/codes/<AREA>.def` named in your task's
+  `locks:`; never into `codes.def`, never into another area's file.
+- A new command or `inspect --emit=<name>` is a new file `driver/cmd_<name>.c` /
+  `driver/emit_<name>.c` (in your task's `paths:`); a new pipeline stage is one registration line in
+  `driver/pipeline.c`, which you may edit only if it is in your task's `locks:`. Options are declared
+  next to the command or stage that owns them.
+- Tests: add files under your task's test directories; never edit `tools/axtest.py`, CMakeLists.txt
+  or the CI scripts (C tests are picked up by the globs above; other checks are `*.test` manifests).
+- If you need a shared file that is not in your `paths:`/`locks:`, stop and report BLOCKED — the
+  architect adds the lock; do not edit it anyway.
+
 ## Coding rules
 
 - **C11**, compiled warning-clean with `-std=c11 -Wall -Wextra -Wpedantic -Werror` under both gcc
@@ -84,7 +109,7 @@ oracle and the frontend evolve and be ported independently.
   `StrId` is not a `SymbolId`.
 - **Spans** are `FileId + byte start/end`. Line/column only in renderers.
 - **Diagnostics are data**: every user-facing error has a stable code registered once in
-  `diag/codes.def` (`AX_LEX_*`, `AX_PARSE_*`, `AX_NAME_*`, `AX_TYPE_*`, `AX_MOVE_*`, `AX_CAP_*`,
+  its area file `diag/codes/<AREA>.def` (`AX_LEX_*`, `AX_PARSE_*`, `AX_NAME_*`, `AX_TYPE_*`, `AX_MOVE_*`, `AX_CAP_*`,
   `AX_DROP_*`, `AX_VERIFY_*`, `AX_LINK_*`…), a primary span, optional labels/notes/fix-its. Library
   code never prints or calls `exit()`; only the driver renders (human / `--json`).
 - **Never crash on user input.** Malformed source must yield diagnostics (fuzzed). Internal
@@ -118,13 +143,18 @@ cmake -S bootstrap/axiom0 -B build -G Ninja -DCMAKE_C_COMPILER=gcc -DCMAKE_BUILD
 cmake --build build                         # → build/axiom0.exe
 python tools/axtest.py                      # all tests; --filter lex, --json for machine output
 python tools/archcheck.py                   # layer rules
-build/axiom0.exe inspect --emit=tokens|ast|hir|thir|mir|lir|mc file.ax
+build/axiom0.exe inspect --emit=tokens|ast|resolved|hir|thir|mir|lir|mi|mc file.ax
 build/axiom0.exe run --interp file.ax       # oracle
 build/axiom0.exe build file.ax -o out.exe   # native
 ```
 
-When the orchestrator runs tasks in parallel, use a private build dir (`-B build-<TASKID>`) and
-pass `--compiler build-<TASKID>/axiom0.exe` to the runner; `build*/` is git-ignored.
+When the orchestrator runs tasks in parallel, several agents edit the same working tree, so the
+build that counts is made in your task's snapshot: `python .claude/skills/axiom-tasks/scripts/taskctl.py
+snapshot <TASKID>` creates or refreshes `build-snap-<TASKID>/` (the last commit plus exactly your
+task's changes); configure with `-S build-snap-<TASKID>/bootstrap/axiom0 -B build-snap-<TASKID>/build`
+and pass `--compiler build-snap-<TASKID>/build/axiom0.exe` to the runner. For quick iteration a
+private build dir of the main tree (`-B build-<TASKID>`) is fine, but another task's half-written file
+may break it — that is not your bug and not yours to fix. `build*/` is git-ignored.
 Also build with `-DCMAKE_C_COMPILER=clang` before declaring done when you touched portable code;
 enable `-fsanitize=address,undefined` builds via clang in WSL for fuzz/QA runs when available.
 
@@ -135,4 +165,7 @@ enable `-fsanitize=address,undefined` builds via clang in WSL for fuzz/QA runs w
    just the new tests.
 3. archcheck passes; no new `BOOTSTRAP-SHORTCUT` without a follow-up task.
 4. Any semantic choice not dictated by `spec/` is an ADR (via axiom-architect), not a silent pick.
-5. Report written to `_workspaces/reports/<ID>-report.md` (format in axiom-tasks).
+5. Only files under the task's `paths:`/`locks:` were edited, and every created, modified or deleted
+   file is listed as a literal `- path` line under `## Files changed`.
+6. Report written to `_workspaces/reports/<ID>-report.md` (format in axiom-tasks), last line
+   `STATUS: COMPLETE round=<n>` or `STATUS: BLOCKED <reason>`.

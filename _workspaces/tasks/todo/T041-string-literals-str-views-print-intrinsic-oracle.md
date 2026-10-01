@@ -11,6 +11,7 @@ priority: 61
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/str]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0089, tasks/0332, 0045, 0152]
 ---
 # T041 — String literals, Str views, print intrinsic (oracle)
@@ -19,11 +20,11 @@ spec: [0089, tasks/0332, 0045, 0152]
 Static string data and output, first stdout-observable programs.
 
 ## Scope
-- String literals → static read-only data, `Str` as (ptr,len) view type, byte strings, `print(s)`/`print_int(n)` as declared intrinsics (library-level later), interp writes to stdout.
+- String literals → static read-only data, `Str` as a built-in read-only (ptr,len) value for literals (T048b folds it into the view/slice rules, 0263 §39), built-in `len(s)` (ADR-0006 §3), byte strings, `print(s)`/`print_int(n)` as declared intrinsics (library-level later), interp writes to stdout.
 
 ## Acceptance
 - [ ] Interp run test prints `Xin chào thế giới` (stdout compared as exact UTF-8 bytes); `Str` length of the literal is its byte length (22) per the text spec, character iteration deferred to std.
-- [ ] run tests with `// stdout:` directives in interp mode.
+- [ ] run tests with `// stdout:` directives in interp mode; they carry `// native-after: T042` (removed by T042).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T041-report.md` with exact `## Files changed`.
 

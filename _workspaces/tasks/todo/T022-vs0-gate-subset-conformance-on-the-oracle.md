@@ -5,12 +5,12 @@ phase: P3-semantic-core
 owner: axiom-qa
 reviewer: axiom-architect
 model: opus
-gate_model: sonnet
-depends: [T021, T016]
+gate_model: opus
+depends: [T021, T016, T006, T013, T015b]
 priority: 35
 status: todo
 attempts: 0
-paths: [tests/conformance/vs0, tools/ci.sh]
+paths: [tests/conformance/vs0, tools/ci.sh, tools/gatecheck.py, tools/tests/gatecheck]
 spec: [0263, 0114, 0017]
 ---
 # T022 — VS0 gate: subset conformance on the oracle
@@ -21,9 +21,12 @@ Prove the whole front half works end-to-end before any native code exists.
 ## Scope
 - Port the 0263 first-test set and applicable 0114 E2E cases into tests/conformance/vs0 (canonical syntax).
 - Seam review: parser↔HIR↔THIR↔MIR exhaustiveness (every node kind lowered or diagnosed).
+- `tools/gatecheck.py` (Python standard library; ADR-0005 §3, 0264 §19-24): (a) every invariant in spec/invariants.md names an existing test directory or tool in its `verify:` field; (b) every milestone block of SPEC-00 up to the current gate lists existing tests and they pass; (c) every `xfail:` / `native-after:` directive names a board task that exists and is not done; (d) in `spec/selfhost-subset.tsv` each delivering task is an ancestor of its first consumer. Self-tests under tools/tests/gatecheck.
 
 ## Acceptance
-- [ ] All VS0 tests pass in interp mode; seam review written in the QA report with any gaps filed as follow-ups.
+- [ ] All VS0 tests pass in interp mode; seam review written in the QA report; every gap is fixed, or is an XFAIL with an ADR and a task.
+- [ ] Gate rule (ADR-0005 §3): PASS or BLOCKED. Every non-passing test is an `xfail: <task-id>` for a spec gap that has an ADR; implementation bugs are fixed (their fix task done) before the gate closes; XPASS counts as a failure.
+- [ ] `python tools/gatecheck.py`, `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
 - [ ] Report `_workspaces/reports/T022-report.md` with exact `## Files changed`.
 
@@ -31,5 +34,6 @@ Prove the whole front half works end-to-end before any native code exists.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Waits for T006 (archcheck), T013 (fuzz) and T015b (rest of the grammar in HIR), so the P2 work is closed by this gate.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.

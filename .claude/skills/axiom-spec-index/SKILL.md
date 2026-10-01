@@ -37,13 +37,22 @@ alone produces confident but wrong implementations.
 ## Project-level decisions already fixed (do not relitigate)
 
 - Owner requirements `spec/requirements/OWNER.md` (REQ-OWNER-*) and the binding roadmap
-  `spec/ROADMAP.md` (phases, epics, R1–R7: minimal C core, axiom0 frozen after self-hosting T087).
+  `spec/ROADMAP.md` (phases, epics, R1–R9: minimal C core, std written in Axiom from the start,
+  gates are PASS or BLOCKED, axiom0 frozen after self-hosting T087).
+- Architecture decisions already taken (read the ADR before touching the area):
+  ADR-0001 fixed-address declarations `@at`; ADR-0002 oracle host interface (how the interpreter
+  runs heap/OS code); ADR-0003 backend pipeline (ABI lowering on LIR, machine-IR verifier, stack
+  probes); ADR-0004 self-host subset additions (wrapping intrinsics, constant tables, stored views,
+  HashMap order, generic drop glue); ADR-0005 plan structure (`native-after` tests, shared-file
+  locks, gate rule, task splits); ADR-0006 bootstrap forms (`impl Drop`, `u32 as char`, `len`),
+  manifest `axiom.toml`, std root discovery.
 
 - Stage-0 compiler `axiom0` is written in **C11** (`bootstrap/axiom0/`), no LLVM, no external
   assembler or linker in the production path (docs 0263, 0172, 0181). Using clang/llvm-objdump **as
   test oracles** (to validate our bytes/objects) is fine.
 - First target **x86_64-windows (MS x64 ABI, COFF → PE32+)**, second **x86_64-linux (SysV, ELF64)**
-  testable through WSL (doc 0181).
+  testable through WSL (doc 0181) — but the Linux target is written after self-hosting, in Axiom
+  (epic E16.9, ROADMAP R6/R7): never build ELF or SysV support into axiom0.
 - Pipeline: Source → Lexer → Parser → AST → Resolver → HIR → Typeck → Typed HIR → Ownership/
   Capability → MIR (+Drop elaboration) → Verifier → Verified MIR → {Oracle interpreter | Optimizer →
   LIR → Machine IR → Encoder → Object → Linker → Executable} (doc 0152).

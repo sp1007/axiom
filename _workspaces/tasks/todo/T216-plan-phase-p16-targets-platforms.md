@@ -26,9 +26,10 @@ the roadmap is invented.
 - Implementation happens in `compiler/` (Axiom) and `std/` — axiom0 is frozen (ROADMAP R3).
 - Make gate task T316 depend on every new task; convert catalogue `EPIC(E16.*)` statuses to task ids.
 - Scope not covered by an epic → ADR + new epic in ROADMAP (and change-log entry), never a stray task.
+- Add `depends` on the gate task of every phase ROADMAP lists as a prerequisite of an epic (for example E15.5 tasks depend on T312); take ids with `taskctl.py new-id --phase <P>`.
 
 ## Acceptance
-- [ ] `taskctl.py validate` OK and `reqcov.py --strict` exits 0.
+- [ ] Every new task file passes `taskctl.py lint`; `taskctl.py validate` OK, `reqcov.py --strict` exits 0 and `harness_check.py` exits 0.
 - [ ] Every P16 epic has tasks; gate T316 depends on all of them.
 - [ ] ROADMAP change log records the expansion (task count per epic).
 - [ ] Report `_workspaces/reports/T216-report.md` listing new tasks under `## Files changed`.

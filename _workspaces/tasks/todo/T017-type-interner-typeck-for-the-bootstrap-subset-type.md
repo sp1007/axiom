@@ -6,11 +6,13 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T015, T003, T003a]
+depends: [T015, T016, T003, T003a, T111]
 priority: 30
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck]
+paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck, bootstrap/axiom0/src/driver/emit_thir.c]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
+timeout_min: 300
 spec: [0157, 0175, 0245, tasks/0388, tasks/0482, spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md]
 ---
 # T017 — Type interner + typeck for the bootstrap subset (typed HIR)
@@ -34,5 +36,7 @@ Type the subset: integers (all widths), bool, unit, never, functions, let (annot
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
+- Depends on T111 (ADR-0005 §6): the requirement backlog is complete before the semantic core starts. Depends on T016 for `check` (ui tests) and the pipeline.
+- Scope boundary with T030–T032: this task types immutable `let`, literals, operators, `if`/`while`/`loop` as statements, direct calls and `return`. Mutation, value-producing control flow and the remaining function forms are T030–T032.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
