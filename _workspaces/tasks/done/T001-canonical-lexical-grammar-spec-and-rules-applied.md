@@ -8,11 +8,13 @@ model: opus
 gate_model: opus
 depends: []
 priority: 10
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-01-lexical.md, spec/SPEC-02-grammar.md, spec/decisions, .claude/skills/axiom-syntax/SKILL.md]
 timeout_min: 300
 spec: [0154, 0173, tasks/0324, tasks/0476, tasks/0323, 0243, 0084, 0109, 0151]
+started: 2026-10-01 08:37:43
+finished: 2026-10-01 12:10:00
 ---
 # T001 — Canonical lexical + grammar spec (= and . rules applied)
 
@@ -43,3 +45,7 @@ Produce the canonical, implementable lexical specification and complete EBNF gra
 - Not a "critical, runs alone" task any more (ADR-0005 §11): it runs in parallel with T004.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-01 08:37:43 started (attempt 1) T001-impl
+- 2026-10-01 12:10:00 accepted by QA -> done
