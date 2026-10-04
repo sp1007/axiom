@@ -8,12 +8,12 @@ model: opus
 gate_model: opus
 depends: [T001]
 priority: 11
-status: doing
+status: done
 attempts: 1
 paths: [spec/INDEX.md, spec/invariants.md, spec/diagnostics.md]
 spec: [0151, 0153, 0171, 0172, tasks/0260, tasks/0262, 0146, tasks/0360]
 started: 2026-10-04 07:44:10
-agent: T002-impl
+finished: 2026-10-04 08:07:13
 ---
 # T002 — Spec INDEX, invariants catalogue, diagnostic code taxonomy
 
@@ -43,3 +43,4 @@ Give every agent a map of the canonical spec set and a single registry of invari
 
 ## Log
 - 2026-10-04 07:44:10 started (attempt 1) T002-impl
+- 2026-10-04 08:07:13 accepted by QA -> done

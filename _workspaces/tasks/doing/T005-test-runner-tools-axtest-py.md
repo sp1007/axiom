@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004]
 priority: 11
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tools/axtest.py, tools/tests/axtest, tests/README.md]
 spec: [0166, 0145, 0017]
+started: 2026-10-04 07:58:18
+agent: T005-impl
 ---
 # T005 — Test runner tools/axtest.py
 
@@ -44,3 +46,6 @@ Implement the test runner specified in the axiom-testing skill so every later ta
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-04 07:58:18 started (attempt 1) T005-impl
