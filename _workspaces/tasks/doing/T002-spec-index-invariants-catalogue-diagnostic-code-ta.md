@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T001]
 priority: 11
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/INDEX.md, spec/invariants.md, spec/diagnostics.md]
 spec: [0151, 0153, 0171, 0172, tasks/0260, tasks/0262, 0146, tasks/0360]
+started: 2026-10-04 07:44:10
+agent: T002-impl
 ---
 # T002 — Spec INDEX, invariants catalogue, diagnostic code taxonomy
 
@@ -38,3 +40,6 @@ Give every agent a map of the canonical spec set and a single registry of invari
 - ADRs: reserve the number with `python .claude/skills/axiom-tasks/scripts/taskctl.py adr-next <slug>` (never pick one by listing the directory) and list the ADR file in the report.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-04 07:44:10 started (attempt 1) T002-impl

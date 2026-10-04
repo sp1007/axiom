@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 10
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0, tests/unit/unit.h, .gitignore, README.md, tools/ci.sh, tools/ci.ps1]
 spec: [0152, 0263, 0172]
+started: 2026-10-04 07:44:10
+finished: 2026-10-04 07:57:50
 ---
 # T004 — Repository skeleton, CMake/Ninja build, CI script
 
@@ -45,3 +47,7 @@ Create the repository layout from axiom-c-stage0 and a build that produces `axio
 - Not a "critical" task any more (ADR-0005 §11): runs in parallel with T001. It needs only the axiom-c-stage0 conventions, not SPEC-00/SPEC-04.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-04 07:44:10 started (attempt 1) T004-impl
+- 2026-10-04 07:57:50 accepted by QA -> done
