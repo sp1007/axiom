@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T010]
 priority: 21
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, bootstrap/axiom0/src/driver/emit_ast.c]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, 0155, 0174, tasks/0386, tasks/0476]
+started: 2026-10-05 16:36:55
+agent: T011-impl
 ---
 # T011 — AST + parser core (items, statements, expressions, recovery)
 
@@ -40,3 +42,6 @@ Parse the core grammar into an arena AST with spans and robust error recovery.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 16:36:55 started (attempt 1) T011-impl
