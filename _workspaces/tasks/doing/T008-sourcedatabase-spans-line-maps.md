@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T007]
 priority: 14
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/source, tests/unit/source]
 spec: [0153, 0172, 0171]
+started: 2026-10-05 15:22:36
+agent: T008-impl
 ---
 # T008 — SourceDatabase, spans, line maps
 
@@ -33,3 +35,6 @@ Load source files (and virtual files for tests) with FileId, byte spans and line
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 15:22:36 started (attempt 1) T008-impl
