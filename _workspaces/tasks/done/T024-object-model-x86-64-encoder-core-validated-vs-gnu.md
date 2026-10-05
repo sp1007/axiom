@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T007, T005, T003a]
 priority: 41
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/objmodel, bootstrap/axiom0/src/target/x64/encode, tests/encode, tools/gen_encode_tests.py]
 spec: [0184, 0180, 0233, 0254, .claude/skills/axiom-x64-backend, spec/SPEC-04-core-extensibility.md]
 started: 2026-10-05 19:58:39
-agent: T024-impl
+finished: 2026-10-05 20:19:23
 ---
 # T024 — Object model + x86-64 encoder core (validated vs GNU as)
 
@@ -40,3 +40,4 @@ Encode x86-64 instructions directly to bytes with target-neutral relocations.
 
 ## Log
 - 2026-10-05 19:58:39 started (attempt 1) T024-impl
+- 2026-10-05 20:19:23 accepted by QA -> done

@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+import subprocess
+import tempfile
+import os
+import sys
+
+def get_bytes(asm_code):
+    with tempfile.TemporaryDirectory() as td:
+        s_file = os.path.join(td, "test.s")
+        o_file = os.path.join(td, "test.o")
+        with open(s_file, "w") as f:
+            f.write(".text\n")
+            f.write(asm_code + "\n")
+        
+        res = subprocess.run(["as", "-o", o_file, s_file], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"as failed for {asm_code}:\n{res.stderr}", file=sys.stderr)
+            sys.exit(1)
+        
+        res = subprocess.run(["objdump", "-d", o_file], capture_output=True, text=True)
+        if res.returncode != 0:
+            print(f"objdump failed:\n{res.stderr}", file=sys.stderr)
+            sys.exit(1)
+            
+        bytes_hex = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if ":" in line and not line.endswith(":"):
+                parts = line.split(":\t")
+                if len(parts) >= 2:
+                    # Ignore padding nop
+                    if "nop" in parts[1] and "nop" not in asm_code:
+                        continue
+                    
+                    b = parts[1].split("\t")[0].strip()
+                    for h in b.split():
+                        bytes_hex.append(f"0x{h}")
+        return bytes_hex
+
+REGS = ["RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI", "R8", "R9", "R10", "R11", "R12", "R13", "R14", "R15"]
+REG_NAMES = {
+    8: ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"],
+    4: ["eax", "ecx", "edx", "ebx", "esp", "ebp", "esi", "edi", "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d"],
+    2: ["ax", "cx", "dx", "bx", "sp", "bp", "si", "di", "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w"],
+    1: ["al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil", "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b"]
+}
+
+def r(sz, idx): return f"%{REG_NAMES[sz][idx]}"
+
+def c_reg(idx): return f"AX_REG_{REGS[idx]}"
+
+def generate_tests():
+    tests = []
+    
+    # We will pick a few representative combinations for R/R to not make it huge.
+    # We must cover at least: standard regs, high regs, SPL/BPL/SIL/DIL.
+    # Let's test cross product of 4 selected regs: rax (0), rsp (4), rbp (5), r12 (12)
+    sel = [0, 4, 5, 12]
+    
+    for sz in [1, 4, 8]:
+        for d in sel:
+            for s in sel:
+                asm = f"mov {r(sz, s)}, {r(sz, d)}"
+                code = f"ax_x64_mov_rr(&sec, {sz}, {c_reg(d)}, {c_reg(s)});"
+                tests.append((asm, code))
+                
+                asm = f"add {r(sz, s)}, {r(sz, d)}"
+                code = f"ax_x64_add_rr(&sec, {sz}, {c_reg(d)}, {c_reg(s)});"
+                tests.append((asm, code))
+                
+                # and so on for others...
+
+    # For memory, we MUST test edge cases: RSP/R12 (SIB needed), RBP/R13 (disp needed).
+    # Base only
+    for base in [0, 4, 5, 12, 13]:
+        asm = f"mov ({r(8, base)}), %rax"
+        code = f"ax_x64_mov_rm(&sec, 8, AX_REG_RAX, ax_x64_mem_base({c_reg(base)}));"
+        tests.append((asm, code))
+
+    # Base + Disp8
+    for base in [0, 4, 5, 12, 13]:
+        asm = f"mov 8({r(8, base)}), %rax"
+        code = f"ax_x64_mov_rm(&sec, 8, AX_REG_RAX, ax_x64_mem_base_disp({c_reg(base)}, 8));"
+        tests.append((asm, code))
+        
+    # Base + Disp32
+    for base in [0, 4, 5, 12, 13]:
+        asm = f"mov 1000({r(8, base)}), %rax"
+        code = f"ax_x64_mov_rm(&sec, 8, AX_REG_RAX, ax_x64_mem_base_disp({c_reg(base)}, 1000));"
+        tests.append((asm, code))
+
+    # SIB
+    for base in [0, 4, 12]:
+        for index in [1, 5, 13]: # index cannot be RSP(4)
+            for scale in [1, 4]:
+                asm = f"mov ({r(8, base)},{r(8, index)},{scale}), %rax"
+                code = f"ax_x64_mov_rm(&sec, 8, AX_REG_RAX, ax_x64_mem_index({c_reg(base)}, {c_reg(index)}, {scale}));"
+                tests.append((asm, code))
+                
+    # RIP
+    tests.append(("mov 10(%rip), %rax", "ax_x64_mov_rm(&sec, 8, AX_REG_RAX, ax_x64_mem_rip(10));"))
+
+    # cqo, cdq, ret, int3
+    tests.append(("cqo", "ax_x64_cqo(&sec);"))
+    tests.append(("cdq", "ax_x64_cdq(&sec);"))
+    tests.append(("ret", "ax_x64_ret(&sec);"))
+    tests.append(("int3", "ax_x64_int3(&sec);"))
+
+    # Jumps & Calls. For relative branches, 'as' will encode 0 as branch to next instruction if we use . + offset ?
+    # Let's not use AS for them or carefully. 'jmp .+0x10' ?
+    # Actually, jmp .+0x10 works.
+    tests.append(("jmp .+0x12", "ax_x64_jmp8(&sec, 0x10);")) # wait, jmp .+0x12 means rel is 0x10 since instruction is 2 bytes!
+    # Let's skip Jcc/Jmp/Call in python AS test, do them manually.
+
+    return tests
+
+def main():
+    tests = generate_tests()
+    out = []
+    out.append("/* GENERATED BY gen_encode_tests.py */")
+    out.append("static void run_encode_tests(void) {")
+    out.append("    ax_section_t sec = {0};")
+    
+    for i, (asm, code) in enumerate(tests):
+        bytes_hex = get_bytes(asm)
+        b_str = ", ".join(bytes_hex)
+        out.append(f"    // {asm}")
+        out.append(f"    sec.bytes_len = 0;")
+        out.append(f"    {code}")
+        out.append(f"    uint8_t expected_{i}[] = {{ {b_str} }};")
+        out.append(f"    assert_bytes_eq(expected_{i}, sizeof(expected_{i}), sec.bytes, sec.bytes_len, \"{asm}\");")
+    
+    out.append("}")
+    
+    with open("tests/encode/encode_tests.inc", "w") as f:
+        f.write("\n".join(out) + "\n")
+        
+if __name__ == "__main__":
+    main()
