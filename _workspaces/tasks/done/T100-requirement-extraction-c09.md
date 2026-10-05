@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T003]
 priority: 24
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/requirements/raw/C09.md]
 spec: [spec/requirements/chunks/C09.txt]
+started: 2026-10-05 16:40:27
+finished: 2026-10-05 16:48:07
 ---
 # T100 — Requirement extraction C09 (core)
 
@@ -40,3 +42,7 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 - Normative sources only: specs/, tasks/, others/, init prompt. `docs/base/discussions/` is brainstorming — do not extract from it.
 - Map to existing tasks with `python .claude/skills/axiom-tasks/scripts/taskctl.py list`.
 - All code in statements uses canonical syntax (`=`, `.`).
+
+## Log
+- 2026-10-05 16:40:27 started (attempt 1) T100-impl
+- 2026-10-05 16:48:07 accepted by QA -> done
