@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T008, T002]
 priority: 15
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/diag, tests/unit/diag]
 spec: [0146, tasks/0360, tasks/0421, 0153]
+started: 2026-10-05 15:31:19
+agent: T009-impl
 ---
 # T009 — Diagnostics engine (model, code registry, human + JSON renderers)
 
@@ -36,3 +38,6 @@ Diagnostics as data, rendered by the driver in human or JSON form.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 15:31:19 started (attempt 1) T009-impl
