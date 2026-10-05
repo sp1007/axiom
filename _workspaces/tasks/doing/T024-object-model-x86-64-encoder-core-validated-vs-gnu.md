@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T007, T005, T003a]
 priority: 41
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/objmodel, bootstrap/axiom0/src/target/x64/encode, tests/encode, tools/gen_encode_tests.py]
 spec: [0184, 0180, 0233, 0254, .claude/skills/axiom-x64-backend, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-05 19:58:39
+agent: T024-impl
 ---
 # T024 — Object model + x86-64 encoder core (validated vs GNU as)
 
@@ -35,3 +37,6 @@ Encode x86-64 instructions directly to bytes with target-neutral relocations.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 19:58:39 started (attempt 1) T024-impl
