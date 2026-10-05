@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004]
 priority: 11
-status: doing
+status: done
 attempts: 1
 paths: [tools/axtest.py, tools/tests/axtest, tests/README.md]
 spec: [0166, 0145, 0017]
 started: 2026-10-04 07:58:18
-agent: T005-impl
+finished: 2026-10-05 11:55:43
 ---
 # T005 — Test runner tools/axtest.py
 
@@ -49,3 +49,4 @@ Implement the test runner specified in the axiom-testing skill so every later ta
 
 ## Log
 - 2026-10-04 07:58:18 started (attempt 1) T005-impl
+- 2026-10-05 11:55:43 accepted by QA -> done

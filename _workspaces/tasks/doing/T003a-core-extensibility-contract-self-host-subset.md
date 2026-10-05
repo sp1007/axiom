@@ -8,11 +8,13 @@ model: opus
 gate_model: opus
 depends: [T003]
 priority: 12
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-04-core-extensibility.md, spec/SPEC-00-bootstrap.md, spec/selfhost-subset.tsv]
 timeout_min: 300
 spec: [0263, tasks/0260, tasks/0494, 0152, 0056, 0054, 0161, 0162, 0163, spec/ROADMAP.md]
+started: 2026-10-05 11:52:51
+agent: T003a-impl
 ---
 # T003a — Core extensibility contract + exact self-host subset
 
@@ -58,3 +60,6 @@ redesign — "implement later ≠ design later" (0263 §42).
 ## Notes
 - Not a "critical, runs alone" task any more (ADR-0005 §11): ordered by `depends`; T010, T017, T023–T026 and T045 depend on it.
 - ADRs: reserve the number with `python .claude/skills/axiom-tasks/scripts/taskctl.py adr-next <slug>` (never pick one by listing the directory) and list the ADR file in the report.
+
+## Log
+- 2026-10-05 11:52:51 started (attempt 1) T003a-impl
