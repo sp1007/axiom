@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T007]
 priority: 14
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/source, tests/unit/source]
 spec: [0153, 0172, 0171]
 started: 2026-10-05 15:22:36
-agent: T008-impl
+finished: 2026-10-05 15:31:11
 ---
 # T008 — SourceDatabase, spans, line maps
 
@@ -38,3 +38,4 @@ Load source files (and virtual files for tests) with FileId, byte spans and line
 
 ## Log
 - 2026-10-05 15:22:36 started (attempt 1) T008-impl
+- 2026-10-05 15:31:11 accepted by QA -> done
