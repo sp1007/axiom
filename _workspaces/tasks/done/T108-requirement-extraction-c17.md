@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T003]
 priority: 32
-status: doing
+status: done
 attempts: 1
 paths: [spec/requirements/raw/C17.md]
 spec: [spec/requirements/chunks/C17.txt]
 started: 2026-10-05 19:39:19
-agent: T108-impl
+finished: 2026-10-05 19:58:30
 ---
 # T108 — Requirement extraction C17 (core)
 
@@ -45,3 +45,4 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 
 ## Log
 - 2026-10-05 19:39:19 started (attempt 1) T108-impl
+- 2026-10-05 19:58:30 accepted by QA -> done
