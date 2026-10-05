@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T001, T009, T003a]
 priority: 20
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/lex, tests/lex, tests/ui/lex, bootstrap/axiom0/src/driver/emit_tokens.c]
 locks: [bootstrap/axiom0/src/diag/codes/LEX.def]
 spec: [spec/SPEC-01-lexical.md, 0154, 0173, tasks/0385]
 started: 2026-10-05 16:02:36
-agent: T010-impl
+finished: 2026-10-05 16:29:29
 ---
 # T010 — Lexer + `inspect --emit=tokens`
 
@@ -45,3 +45,4 @@ Implement the full lexical spec: tokens with spans, newline tokens where signifi
 
 ## Log
 - 2026-10-05 16:02:36 started (attempt 1) T010-impl
+- 2026-10-05 16:29:29 accepted by QA -> done

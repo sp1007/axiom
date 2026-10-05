@@ -1,0 +1,90 @@
+# T010 Report
+
+## Summary
+- Implemented full lexical specification in lex.c and lex.h.
+- Created emit_tokens.c which runs x_lex and outputs the token stream.
+- Added 14 golden tests for valid token cases, passing and generating .tokens files.
+- Added 23 UI tests for lexer diagnostics. Since xiom0 check does not exist yet (scheduled for pipeline T016) and cmd_check.c cannot be added under the current task paths, the UI tests are written as .test manifests (exec tests) paired with .ax helper files. The exec tests use stderr-contains: to verify the expected diagnostic emission exactly.
+- Verified lexer doesn't crash on random bytes via a custom fuzzer script (100 iterations of up to 1000 random bytes without crash).
+
+## Files changed
+- bootstrap/axiom0/src/driver/emit_tokens.c
+- bootstrap/axiom0/src/lex/lex.c
+- bootstrap/axiom0/src/lex/lex.h
+- tests/lex/L01_range.ax
+- tests/lex/L01_range.tokens
+- tests/lex/L02_tuple_index.ax
+- tests/lex/L02_tuple_index.tokens
+- tests/lex/L03_float.ax
+- tests/lex/L03_float.tokens
+- tests/lex/L04_shl.ax
+- tests/lex/L04_shl.tokens
+- tests/lex/L05_generics.ax
+- tests/lex/L05_generics.tokens
+- tests/lex/L06_char_range.ax
+- tests/lex/L06_char_range.tokens
+- tests/lex/L07_label.ax
+- tests/lex/L07_label.tokens
+- tests/lex/L08_byte_literal.ax
+- tests/lex/L08_byte_literal.tokens
+- tests/lex/L09_newlines.ax
+- tests/lex/L09_newlines.tokens
+- tests/lex/L10_attr.ax
+- tests/lex/L10_attr.tokens
+- tests/lex/L11_comments.ax
+- tests/lex/L11_comments.tokens
+- tests/lex/L12_string.ax
+- tests/lex/L12_string.tokens
+- tests/lex/L13_underscore.ax
+- tests/lex/L13_underscore.tokens
+- tests/lex/L14_self.ax
+- tests/lex/L14_self.tokens
+- tests/lex/README.md
+- tests/ui/lex/E01_colon_colon.ax
+- tests/ui/lex/E01_colon_colon.test
+- tests/ui/lex/E02_colon_eq.ax
+- tests/ui/lex/E02_colon_eq.test
+- tests/ui/lex/E03_missing_digits.ax
+- tests/ui/lex/E03_missing_digits.test
+- tests/ui/lex/E04_bad_sep.ax
+- tests/ui/lex/E04_bad_sep.test
+- tests/ui/lex/E05_invalid_suffix.ax
+- tests/ui/lex/E05_invalid_suffix.test
+- tests/ui/lex/E06_bad_char.ax
+- tests/ui/lex/E06_bad_char.test
+- tests/ui/lex/E07_empty_char.ax
+- tests/ui/lex/E07_empty_char.test
+- tests/ui/lex/E08_surrogate.ax
+- tests/ui/lex/E08_surrogate.test
+- tests/ui/lex/E09_out_of_range_unicode.ax
+- tests/ui/lex/E09_out_of_range_unicode.test
+- tests/ui/lex/E10_unterminated_str.ax
+- tests/ui/lex/E10_unterminated_str.test
+- tests/ui/lex/E11_unterminated_comment.ax
+- tests/ui/lex/E11_unterminated_comment.test
+- tests/ui/lex/E12_invalid_char.ax
+- tests/ui/lex/E12_invalid_char.test
+- tests/ui/lex/E13_invalid_operator.ax
+- tests/ui/lex/E13_invalid_operator.test
+- tests/ui/lex/E14_non_ascii_ident.ax
+- tests/ui/lex/E14_non_ascii_ident.test
+- tests/ui/lex/E15_invalid_digit.ax
+- tests/ui/lex/E15_invalid_digit.test
+- tests/ui/lex/E16_overflow.ax
+- tests/ui/lex/E16_overflow.test
+- tests/ui/lex/E17_missing_digits_sep.ax
+- tests/ui/lex/E17_missing_digits_sep.test
+- tests/ui/lex/E18_bad_sep_hex.ax
+- tests/ui/lex/E18_bad_sep_hex.test
+- tests/ui/lex/E19_invalid_digit_sep.ax
+- tests/ui/lex/E19_invalid_digit_sep.test
+- tests/ui/lex/E20_first_run_only.ax
+- tests/ui/lex/E20_first_run_only.test
+- tests/ui/lex/E21_backslash_eol.ax
+- tests/ui/lex/E21_backslash_eol.test
+- tests/ui/lex/E22_invalid_escape.ax
+- tests/ui/lex/E22_invalid_escape.test
+- tests/ui/lex/E23_unterminated_char.ax
+- tests/ui/lex/E23_unterminated_char.test
+
+STATUS: COMPLETE round=0
