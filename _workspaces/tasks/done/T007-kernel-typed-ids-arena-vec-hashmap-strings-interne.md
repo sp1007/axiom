@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004, T005]
 priority: 13
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/kernel, tests/unit/kernel]
 spec: [0153, 0171, 0172, tasks/0533, 0263]
 started: 2026-10-05 15:07:14
-agent: T007-impl
+finished: 2026-10-05 15:22:27
 ---
 # T007 — Kernel: typed IDs, arena, vec, hashmap, strings, interner, hashing
 
@@ -43,3 +43,4 @@ Provide the deterministic, allocation-disciplined data structures all compiler p
 - 2026-10-05 11:55:58 started (attempt 1) T007-impl
 - 2026-10-05 14:19:43 requeue: quota (infrastructure failure: attempt refunded)
 - 2026-10-05 15:07:14 started (attempt 1) T007-impl
+- 2026-10-05 15:22:27 accepted by QA -> done
