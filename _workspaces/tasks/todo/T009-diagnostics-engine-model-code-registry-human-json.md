@@ -6,14 +6,14 @@ owner: axiom-frontend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T008, T002]
+depends: [T008, T002, T112]
 priority: 15
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 paths: [bootstrap/axiom0/src/diag, tests/unit/diag]
 spec: [0146, tasks/0360, tasks/0421, 0153]
 started: 2026-10-05 15:31:19
-agent: T009-impl
+unblocks: 1
 ---
 # T009 — Diagnostics engine (model, code registry, human + JSON renderers)
 
@@ -41,3 +41,5 @@ Diagnostics as data, rendered by the driver in human or JSON form.
 
 ## Log
 - 2026-10-05 15:31:19 started (attempt 1) T009-impl
+- 2026-10-05 15:49:29 block: needs bootstrap/axiom0/src/kernel/base.c in paths to fix archcheck failure
+- 2026-10-05 15:51:17 unblocked (cycle 1) 
