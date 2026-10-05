@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T014]
 priority: 25
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/hir, tests/hir, bootstrap/axiom0/src/driver/emit_hir.c]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, 0023, tasks/0378, 0159]
 started: 2026-10-05 22:05:27
-agent: T015-impl
+finished: 2026-10-05 22:27:20
 ---
 # T015 — HIR data model + AST→HIR lowering
 
@@ -39,3 +39,4 @@ Produce the semantic HIR consumed by typeck: resolved IDs, desugared syntax, spa
 
 ## Log
 - 2026-10-05 22:05:27 started (attempt 1) T015-impl
+- 2026-10-05 22:27:20 accepted by QA -> done
