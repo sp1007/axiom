@@ -8,12 +8,13 @@ model: opus
 gate_model: opus
 depends: [T110]
 priority: 9
-status: todo
-attempts: 0
-paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md, spec/ROADMAP.md, _workspaces/tasks/done/]
+status: done
+attempts: 1
+paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md, spec/ROADMAP.md, _workspaces/tasks/done/, spec/requirements/raw/C03.md, _workspaces/tasks/doing/]
 spec: [spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/ROADMAP.md]
-started: 2026-10-06 02:16:10
+started: 2026-10-06 02:49:28
 unblocks: 1
+finished: 2026-10-06 03:26:02
 ---
 # T111 — Backlog expansion
 
@@ -49,3 +50,5 @@ by a task, merged, deferred (post-v1 only) or rejected by ADR; every task declar
 - 2026-10-06 02:16:10 started (attempt 1) T111-impl
 - 2026-10-06 02:48:12 block: needs _workspaces/tasks/done/ in paths to add covers to old tasks
 - 2026-10-06 02:48:47 unblocked (cycle 1) 
+- 2026-10-06 02:49:28 started (attempt 1) T111-impl
+- 2026-10-06 03:26:02 accepted by QA -> done

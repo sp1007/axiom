@@ -337,6 +337,8 @@ extraction; `EPIC(E24.n)` in the catalogue). Planning task T224 and gate T324 ar
 - **E24.6 Databases & storage engines** — embedded stores, query engines.
 - **E24.7 Distributed systems** — RPC, consensus, cluster runtimes.
 - **E24.8 Domain runtimes** — finance, transport and the other application domains of the corpus.
+- **E24.0 General post-v1 backlog** — deferred features not part of any specific epic.
+- **E24.9 Ecosystem (post-v1)** — unspecified ecosystem projects. — finance, transport and the other application domains of the corpus.
 Exit (phase): defined by T224 per epic when the owner schedules P24.
 
 ## 4. How a planning task expands a phase (standard, so all phases look alike)
