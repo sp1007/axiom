@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T026]
 priority: 44
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/link/pe, bootstrap/axiom0/src/link/startup, tests/link]
 locks: [bootstrap/axiom0/src/diag/codes/LINK.def]
 spec: [0186, 0187, 0164, 0217, .claude/skills/axiom-x64-backend/references/pe-coff.md]
+started: 2026-10-05 21:54:07
+agent: T027-impl
 ---
 # T027 — PE32+ linker + kernel32 imports + CRT-free startup
 
@@ -38,3 +40,6 @@ Link our COFF objects into a runnable PE32+ console executable without any exter
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 21:54:07 started (attempt 1) T027-impl

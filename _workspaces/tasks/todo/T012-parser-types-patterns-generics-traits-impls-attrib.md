@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T011]
 priority: 23
-status: todo
-attempts: 0
+status: blocked
+attempts: 1
 paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, tasks/0476, 0065, 0066]
+started: 2026-10-05 20:38:52
 ---
 # T012 — Parser: types, patterns, generics, traits/impls, attributes, closures
 
@@ -37,3 +38,7 @@ Complete the grammar: everything not covered by T011.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 20:38:52 started (attempt 1) T012-impl
+- 2026-10-05 21:53:56 block: need tests/resolve added to paths to update resolve tests (currently locked by T014)

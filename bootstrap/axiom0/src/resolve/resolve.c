@@ -19,10 +19,8 @@ typedef struct Env {
     size_t symbol_nodes_cap;
 } Env;
 
-typedef struct Symbol {
-    AxSymbolId id;
-    const void *node;
-} Symbol;
+typedef enum SymbolKind { SYM_ITEM, SYM_MODULE, SYM_LOCAL } SymbolKind;
+typedef struct Symbol { AxSymbolId id; const void *node; SymbolKind kind; } Symbol;
 
 AX_DEFINE_HASHMAP(SymEnv, uint32_t, Symbol, ax_key_hash_u32, ax_key_eq_u32);
 
@@ -35,6 +33,7 @@ typedef struct Scope {
 static Scope *push_scope(Env *env, Scope *parent) {
     Scope *s = ax_arena_alloc(env->arena, sizeof(Scope), 8);
     s->parent = parent;
+    s->is_module_scope = false;
     SymEnv_init(&s->bindings);
     return s;
 }
@@ -67,23 +66,25 @@ static void emit_diag(Env *env, AxDiagCode code, Span span) {
     ax_diag_sink_report(env->sink, &d);
 }
 
-static Symbol *declare_name(Env *env, Scope *scope, StrId name, const void *node) {
+static Symbol *declare_name(Env *env, Scope *scope, StrId name, const void *node, Span span, SymbolKind kind) {
     AxSymbolId sym = new_symbol(env, node);
     if (name.v != 0) {
-        if (SymEnv_contains(&scope->bindings, name.v)) {
-            emit_diag(env, AX_NAME_DUPLICATE, node ? ((const AxAstExpr*)node)->span : (Span){0});
+        if (scope->is_module_scope && SymEnv_contains(&scope->bindings, name.v)) {
+            emit_diag(env, AX_NAME_DUPLICATE, span);
         } else {
             if (!scope->is_module_scope) {
                 Scope *s = scope->parent;
                 while (s) {
-                    if (s->is_module_scope && SymEnv_contains(&s->bindings, name.v)) {
-                        emit_diag(env, AX_NAME_SHADOW_MODULE, node ? ((const AxAstExpr*)node)->span : (Span){0});
-                        break;
+                    if (s->is_module_scope) {
+                        if (SymEnv_contains(&s->bindings, name.v)) {
+                            emit_diag(env, AX_NAME_SHADOW_MODULE, span);
+                            break;
+                        }
                     }
                     s = s->parent;
                 }
             }
-            Symbol s = { sym, node };
+            Symbol s = { sym, node, kind };
             SymEnv_insert(&scope->bindings, name.v, s);
         }
     }
@@ -120,7 +121,7 @@ static void resolve_path_seg(Env *env, Scope *scope, const AxAstTypePathSegment 
     seg = seg->next;
     
     while (seg) {
-        if (head_node && ((const AxAstItem*)head_node)->kind == AX_ITEM_ENUM) {
+        if (sym->kind == SYM_ITEM && head_node && ((const AxAstItem*)head_node)->kind == AX_ITEM_ENUM) {
             const AxAstItem *en = (const AxAstItem*)head_node;
             bool found = false;
             for(AxAstVariantDecl *v = en->enum_decl.variants; v; v = v->next) {
@@ -182,7 +183,7 @@ static void resolve_pat(Env *env, Scope *scope, const AxAstPat *p, bool is_decl)
         switch (p->kind) {
             case AX_PAT_BINDING:
                 if (is_decl) {
-                    declare_name(env, scope, p->binding.name, p);
+                    declare_name(env, scope, p->binding.name, p, p->span, SYM_LOCAL);
                 } else {
                     Symbol *sym = lookup_name(scope, p->binding.name);
                     if (sym) bind_node(env, p, sym->id);
@@ -197,7 +198,7 @@ static void resolve_pat(Env *env, Scope *scope, const AxAstPat *p, bool is_decl)
                 } else {
                     for (AxAstPatField *f = p->struct_pat.fields; f; f = f->next) {
                         if (f->pat) resolve_pat(env, scope, f->pat, is_decl);
-                        else if (is_decl) declare_name(env, scope, f->name, f);
+                        else if (is_decl) declare_name(env, scope, f->name, f, f->span, SYM_LOCAL);
                     }
                 }
                 break;
@@ -295,7 +296,7 @@ static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
             case AX_EXPR_CLOSURE: {
                 Scope *c_scope = push_scope(env, scope);
                 for(AxAstParam *p = e->closure.params; p; p = p->next) {
-                    declare_name(env, c_scope, p->name, p);
+                    declare_name(env, c_scope, p->name, p, p->span, SYM_LOCAL);
                     resolve_type(env, scope, p->type);
                 }
                 resolve_type(env, scope, e->closure.ret_type);
@@ -330,7 +331,12 @@ static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
                 
                 for (AxAstPostfixSeg *s = e->postfix.segments; s; s = s->next) {
                     if (s->kind == AX_POSTFIX_FIELD && head_node) {
-                        if (((const AxAstItem*)head_node)->kind == AX_ITEM_ENUM) {
+                        SymbolKind hkind = SYM_LOCAL;
+                        if (e->postfix.head->kind == AX_EXPR_PATH && e->postfix.head->path.segments) {
+                            Symbol *hsym = lookup_name(scope, e->postfix.head->path.segments->name);
+                            if (hsym) hkind = hsym->kind;
+                        }
+                        if (hkind == SYM_ITEM && ((const AxAstItem*)head_node)->kind == AX_ITEM_ENUM) {
                             const AxAstItem *en = (const AxAstItem*)head_node;
                             bool found = false;
                             for(AxAstVariantDecl *v = en->enum_decl.variants; v; v = v->next) {
@@ -346,6 +352,9 @@ static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
                                 emit_diag(env, AX_NAME_UNRESOLVED, e->span); // AX_NAME_UNRESOLVED
                                 head_node = NULL;
                             }
+                        } else if (hkind == SYM_MODULE) {
+                            emit_diag(env, AX_NAME_UNRESOLVED, e->span);
+                            head_node = NULL;
                         } else {
                             head_node = NULL;
                         }
@@ -400,7 +409,7 @@ static void resolve_item_bodies(Env *env, Scope *scope, const AxAstItem *n) {
             case AX_ITEM_FN: {
                 Scope *fn_scope = push_scope(env, scope);
                 for(AxAstParam *p = n->fn.params; p; p = p->next) {
-                    declare_name(env, fn_scope, p->name, p);
+                    declare_name(env, fn_scope, p->name, p, p->span, SYM_LOCAL);
                     resolve_type(env, scope, p->type);
                 }
                 resolve_type(env, scope, n->fn.ret_type);
@@ -453,6 +462,74 @@ static void resolve_item_bodies(Env *env, Scope *scope, const AxAstItem *n) {
     }
 }
 
+static void resolve_use_tree(Env *env, Scope *scope, const AxAstUseTree *tree, const AxAstItem *item) {
+    while (tree) {
+        const AxAstDottedName *path = &tree->path;
+        if (path->count > 0) {
+            Symbol *sym = lookup_name(scope, path->segments[0]);
+            if (!sym) {
+                emit_diag(env, AX_NAME_UNRESOLVED, path->span);
+                tree = tree->next;
+                continue;
+            }
+            
+            const void *head_node = sym->node;
+            AxSymbolId final_sym = sym->id;
+            
+            bool error = false;
+            for (size_t i = 1; i < path->count; i++) {
+                if (sym->kind == SYM_ITEM && head_node && ((const AxAstItem*)head_node)->kind == AX_ITEM_ENUM) {
+                    const AxAstItem *en = (const AxAstItem*)head_node;
+                    bool found = false;
+                    for(AxAstVariantDecl *v = en->enum_decl.variants; v; v = v->next) {
+                        if (v->name.v == path->segments[i].v) {
+                            AxSymbolId *v_id = AxNodeMap_get(&env->rmap->node_map, v);
+                            if (v_id && v_id->v != 0) {
+                                final_sym = *v_id;
+                            }
+                            head_node = v;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        emit_diag(env, AX_NAME_UNRESOLVED, path->span);
+                        error = true;
+                        break;
+                    }
+                } else {
+                    emit_diag(env, AX_NAME_UNRESOLVED, path->span);
+                    error = true;
+                    break;
+                }
+            }
+            
+            if (!error) {
+                bind_node(env, tree, final_sym);
+                bind_node(env, path, final_sym);
+                if (item) bind_node(env, item, final_sym);
+                
+                StrId alias = tree->alias;
+                if (alias.v == 0) {
+                    alias = path->segments[path->count - 1];
+                }
+                
+                if (SymEnv_contains(&scope->bindings, alias.v)) {
+                    emit_diag(env, AX_NAME_DUPLICATE, tree->span);
+                } else {
+                    Symbol s = { final_sym, head_node, sym->kind };
+                    SymEnv_insert(&scope->bindings, alias.v, s);
+                }
+            }
+        }
+        
+        if (tree->subtrees) {
+            resolve_use_tree(env, scope, tree->subtrees, NULL);
+        }
+        tree = tree->next;
+    }
+}
+
 AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterner *interner) {
     AxResolveMap map;
     ax_resolve_map_init(&map);
@@ -469,7 +546,7 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     };
     for(size_t i=0; i<sizeof(prelude_types)/sizeof(prelude_types[0]); i++) {
         StrId id = ax_intern_cstr(interner, prelude_types[i]);
-        declare_name(&env, prelude, id, NULL);
+        declare_name(&env, prelude, id, NULL, (Span){0}, SYM_ITEM);
     }
 
     Scope *mod_scope = push_scope(&env, prelude);
@@ -479,20 +556,34 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     const AxAstItem *it = ast->items;
     while (it) {
         switch (it->kind) {
-            case AX_ITEM_FN: declare_name(&env, mod_scope, it->fn.name, it); break;
-            case AX_ITEM_STRUCT: declare_name(&env, mod_scope, it->struct_decl.name, it); break;
+            case AX_ITEM_FN: declare_name(&env, mod_scope, it->fn.name, it, it->span, SYM_ITEM); break;
+            case AX_ITEM_MODULE:
+                if (it->module.path.count > 0) {
+                    declare_name(&env, mod_scope, it->module.path.segments[0], it, it->span, SYM_MODULE);
+                }
+                break;
+            case AX_ITEM_STRUCT: declare_name(&env, mod_scope, it->struct_decl.name, it, it->span, SYM_ITEM); break;
             case AX_ITEM_ENUM: 
-                declare_name(&env, mod_scope, it->enum_decl.name, it);
+                declare_name(&env, mod_scope, it->enum_decl.name, it, it->span, SYM_ITEM);
                 for(AxAstVariantDecl *v = it->enum_decl.variants; v; v = v->next) {
                     AxSymbolId sym = new_symbol(&env, v);
                     bind_node(&env, v, sym);
                 }
                 break;
-            case AX_ITEM_TRAIT: declare_name(&env, mod_scope, it->trait.name, it); break;
-            case AX_ITEM_TYPE_ALIAS: declare_name(&env, mod_scope, it->type_alias.name, it); break;
-            case AX_ITEM_CONST: declare_name(&env, mod_scope, it->const_decl.name, it); break;
-            case AX_ITEM_STATIC: declare_name(&env, mod_scope, it->static_decl.name, it); break;
+            case AX_ITEM_TRAIT: declare_name(&env, mod_scope, it->trait.name, it, it->span, SYM_ITEM); break;
+            case AX_ITEM_TYPE_ALIAS: declare_name(&env, mod_scope, it->type_alias.name, it, it->span, SYM_ITEM); break;
+            case AX_ITEM_CONST: declare_name(&env, mod_scope, it->const_decl.name, it, it->span, SYM_ITEM); break;
+            case AX_ITEM_STATIC: declare_name(&env, mod_scope, it->static_decl.name, it, it->span, SYM_ITEM); break;
             default: break;
+        }
+        it = it->next;
+    }
+
+    // Phase A.5: Resolve imports
+    it = ast->items;
+    while (it) {
+        if (it->kind == AX_ITEM_USE) {
+            resolve_use_tree(&env, mod_scope, it->use.tree, it);
         }
         it = it->next;
     }

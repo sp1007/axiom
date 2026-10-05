@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T011]
 priority: 22
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/resolve, tests/resolve, tests/ui/resolve, bootstrap/axiom0/src/driver/emit_resolved.c]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, tasks/0387, tasks/0357, tasks/0497, 0103, .claude/skills/axiom-syntax]
 started: 2026-10-05 20:23:51
-agent: T014-impl
+finished: 2026-10-05 22:05:16
 ---
 # T014 — Name resolution: scope graph, dotted paths, prelude stub
 
@@ -43,3 +43,4 @@ Resolve every identifier and DottedChain to SymbolIds within a single module (mu
 
 ## Log
 - 2026-10-05 20:23:51 started (attempt 1) T014-impl
+- 2026-10-05 22:05:16 accepted by QA -> done

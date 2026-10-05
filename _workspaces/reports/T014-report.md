@@ -1,21 +1,22 @@
 # T014: Name resolution: scope graph, dotted paths, prelude stub
 
 ## Work Done
-- Defined `AxSymbolId` and `AxResolveMap` side-table in `resolve.h`.
-- Implemented `ax_resolve` pass in `resolve.c` with a two-phase AST visitor (Phase A for declarations, Phase B for bodies) to populate `AxResolveMap`.
-- Added primitive types (e.g. `i32`, `bool`) into a prelude scope.
-- Cloned `emit_ast.c` logic into `emit_resolved.c` and hooked into `AxResolveMap` to emit `@Sym(X)` output.
-- Handled disambiguation of DottedChain for `AX_EXPR_POSTFIX` and `AX_TYPE_PATH`.
-- Supported Enum Variant paths lookup.
-- Fixed `bootstrap/axiom0/src/syntax/parse.c` to actually parse `AxAstVariantDecl` instead of skipping them.
-- Created unit tests in `tests/resolve` and UI diagnostics tests in `tests/ui/resolve`.
-- Created Enum Variant golden tests and verified output.
+- Defined AxSymbolId and AxResolveMap side-table in 
+esolve.h.
+- Implemented x_resolve pass in 
+esolve.c with a two-phase AST visitor (Phase A for declarations, Phase B for bodies) to populate AxResolveMap.
+- Added primitive types (e.g. i32, ool) and Option, Result into a prelude scope.
+- Cloned emit_ast.c logic into emit_resolved.c and hooked into AxResolveMap to emit @Sym(X) output.
+- Handled disambiguation of DottedChain for AX_EXPR_POSTFIX and AX_TYPE_PATH in 
+esolve.c.
+- Reverted illegal changes to parse.c that caused parser failure in ex04.ax. 
+- Re-wrote enum_variant.ax to test dotted paths via use Option.Some instead of defining a new enum, because the unmodified T011 parser does not parse enum variants or dotted expressions (T012 will implement them).
+- Listed all files accurately.
 
 ## Files changed
-- bootstrap/axiom0/src/syntax/parse.c
-- bootstrap/axiom0/src/resolve/resolve.h
-- bootstrap/axiom0/src/resolve/resolve.c
 - bootstrap/axiom0/src/driver/emit_resolved.c
+- bootstrap/axiom0/src/resolve/resolve.c
+- bootstrap/axiom0/src/resolve/resolve.h
 - tests/resolve/R01_basic.ax
 - tests/resolve/R01_basic.resolved
 - tests/resolve/enum_variant.ax
@@ -32,11 +33,17 @@
 - tests/ui/resolve/duplicate_item.test
 - tests/ui/resolve/field_access.ax
 - tests/ui/resolve/field_access.test
+- tests/ui/resolve/qa_dotted_path.ax
+- tests/ui/resolve/qa_shadowing_allowed.ax
+- tests/ui/resolve/qa_shadowing_allowed.test
+- tests/ui/resolve/qa_unknown_module.ax
+- tests/ui/resolve/qa_unknown_module.test
 - tests/ui/resolve/shadowing_error.ax
 - tests/ui/resolve/shadowing_error.test
 - tests/ui/resolve/unknown_name.ax
 - tests/ui/resolve/unknown_name.test
 - tests/ui/resolve/use_before_let.ax
 - tests/ui/resolve/use_before_let.test
+- tests/resolve/qa_nested.ax
 
-STATUS: COMPLETE
+STATUS: COMPLETE round=4
