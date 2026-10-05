@@ -8,13 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T010]
 priority: 21
-status: doing
+status: blocked
 attempts: 1
 paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, bootstrap/axiom0/src/driver/emit_ast.c]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, 0155, 0174, tasks/0386, tasks/0476]
 started: 2026-10-05 16:36:55
-agent: T011-impl
 ---
 # T011 — AST + parser core (items, statements, expressions, recovery)
 
@@ -45,3 +44,4 @@ Parse the core grammar into an arena AST with spans and robust error recovery.
 
 ## Log
 - 2026-10-05 16:36:55 started (attempt 1) T011-impl
+- 2026-10-05 19:37:38 block: Lexer offset regression from T010 requires fixing tests/lex which is outside T011 paths
