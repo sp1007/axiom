@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T001, T009, T003a]
 priority: 20
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/lex, tests/lex, tests/ui/lex, bootstrap/axiom0/src/driver/emit_tokens.c]
 locks: [bootstrap/axiom0/src/diag/codes/LEX.def]
 spec: [spec/SPEC-01-lexical.md, 0154, 0173, tasks/0385]
+started: 2026-10-05 16:02:36
+agent: T010-impl
 ---
 # T010 — Lexer + `inspect --emit=tokens`
 
@@ -40,3 +42,6 @@ Implement the full lexical spec: tokens with spans, newline tokens where signifi
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 16:02:36 started (attempt 1) T010-impl
