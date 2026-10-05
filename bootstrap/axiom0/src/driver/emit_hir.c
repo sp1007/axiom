@@ -312,62 +312,32 @@ static void d_item(DumpState *st, const AxHirItem *n) {
 }
 
 static int run_emit_hir(const AxIo *io, int argc, char **argv) {
-    if (argc != 2) {
-        fputs("axiom0: usage: axiom0 inspect --emit=hir <file>\n", io->err);
+    char **pos_argv = NULL;
+    int pos_argc = 0;
+    if (ax_options_parse(io, argc, argv, ax_all_options, &pos_argc, &pos_argv, NULL) != AX_EXIT_OK) {
         return AX_EXIT_USAGE;
     }
 
-    const char *path = argv[1];
-    SourceDatabase db;
-    ax_source_db_init(&db);
-
-    FileId file = ax_source_db_load(&db, ax_sv_cstr(path));
-    if (file.v == 0) {
-        fprintf(io->err, "axiom0: failed to open file '%s'\n", path);
-        ax_source_db_free(&db);
-        return AX_EXIT_DIAG;
+    if (pos_argc != 2) {
+        fputs("axiom0: usage: axiom0 inspect --emit=hir <file>\n", io->err);
+        free(pos_argv);
+        return AX_EXIT_USAGE;
     }
 
-    StrView text = ax_source_db_text(&db, file);
+    const char *path = pos_argv[1];
+    
+    AxDriverState st;
+    ax_pipeline_init(&st, io);
+    st.main_file = path;
+    
+    int rc = ax_pipeline_run(&st, AX_STAGE_HIR);
 
-    AxDiagSink sink;
-    ax_diag_sink_init(&sink);
-    StrInterner interner;
-    ax_interner_init(&interner);
-    AxArena arena;
-    ax_arena_init(&arena, 0);
+    DumpState dst = { io->out, &st.interner, 0 };
+    d_item(&dst, st.hir.items);
+    fputs("\n", dst.out);
 
-    AxLexResult res = ax_lex(file, text, &sink, &interner);
-    AxParseResult parse_res = ax_parse(&arena, res.tokens, res.token_count, &sink, &interner);
-
-    AxArena res_arena;
-    ax_arena_init(&res_arena, 0);
-    AxResolveMap map = ax_resolve(&parse_res.ast, &res_arena, &sink, &interner);
-
-    AxArena hir_arena;
-    ax_arena_init(&hir_arena, 0);
-    AxHir hir = ax_lower_ast(&hir_arena, &parse_res.ast, &map, &sink);
-
-    DumpState st = { io->out, &interner, 0 };
-    d_item(&st, hir.items);
-    fputs("\n", st.out);
-
-    ax_resolve_map_free(&map);
-    ax_arena_destroy(&hir_arena);
-    ax_arena_destroy(&res_arena);
-
-    int rc = AX_EXIT_OK;
-    if (sink.errors > 0 || sink.warnings > 0) {
-        ax_diag_render_human(&sink, &db, io->err);
-        rc = sink.errors > 0 ? AX_EXIT_DIAG : AX_EXIT_OK;
-    }
-
-    ax_arena_destroy(&arena);
-    ax_lex_result_free(&res);
-    ax_interner_free(&interner);
-    ax_diag_sink_free(&sink);
-    ax_source_db_free(&db);
-
+    ax_pipeline_free(&st);
+    free(pos_argv);
     return rc;
 }
 

@@ -9,6 +9,12 @@ static int run_features(const AxIo *io, int argc, char **argv) {
         fprintf(io->err, "axiom0: '--features' takes no arguments (got '%s')\n", argv[1]);
         return AX_EXIT_USAGE;
     }
+    
+    for (int i = 0; ax_pipeline_stages[i].name != NULL; ++i) {
+        if (ax_pipeline_stages[i].feature_name != NULL) {
+            fprintf(io->out, "%s\n", ax_pipeline_stages[i].feature_name);
+        }
+    }
     return AX_EXIT_OK;
 }
 

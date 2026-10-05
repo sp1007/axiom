@@ -6,8 +6,6 @@
 /* `axiom0 inspect --emit=<name> [arguments]`: dispatches to the emitter registered by
  * src/driver/emit_<name>.c. The emitter receives argv = {"inspect", <all other arguments>}. */
 
-#define EMIT_PREFIX "--emit="
-
 static void list_emitters(FILE *to) {
     if (ax_emitters[0] == NULL) {
         fputs("axiom0: no emitters are available in this build\n", to);
@@ -29,8 +27,8 @@ static int run_inspect(const AxIo *io, int argc, char **argv) {
     int n = 0;
     rest[n++] = argv[0];
     for (int i = 1; i < argc; ++i) {
-        if (strncmp(argv[i], EMIT_PREFIX, sizeof EMIT_PREFIX - 1) == 0) {
-            emit = argv[i] + sizeof EMIT_PREFIX - 1;
+        if (strncmp(argv[i], "--emit=", 7) == 0) {
+            emit = argv[i] + 7;
         } else {
             rest[n++] = argv[i];
         }

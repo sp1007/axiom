@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T015]
 priority: 26
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/driver, tests/driver]
 locks: [bootstrap/axiom0/src/diag/codes/DRIVER.def, bootstrap/axiom0/src/diag/codes/IO.def]
 spec: [0257, tasks/0411, 0146]
+started: 2026-10-06 03:31:40
+finished: 2026-10-06 03:55:34
 ---
 # T016 — Driver CLI: check/build/run/inspect, pass timing, JSON diagnostics
 
@@ -39,3 +41,7 @@ Stable CLI contract for humans, tests and AI agents.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 03:31:40 started (attempt 1) T016-impl
+- 2026-10-06 03:55:34 accepted by QA -> done
