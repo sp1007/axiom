@@ -8,12 +8,12 @@ model: opus
 gate_model: opus
 depends: [T001]
 priority: 11
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-00-bootstrap.md, spec/SPEC-03-core-semantics.md]
 spec: [0263, tasks/0262, tasks/0494, tasks/0260, 0152, 0032, 0041, 0068, tasks/0327, 0010]
 started: 2026-10-04 07:44:10
-agent: T003-impl
+finished: 2026-10-05 11:52:37
 ---
 # T003 — Stage-0 bootstrap subset, milestone manifests, core execution semantics
 
@@ -45,3 +45,4 @@ Define exactly which language subset each milestone supports and freeze the core
 
 ## Log
 - 2026-10-04 07:44:10 started (attempt 1) T003-impl
+- 2026-10-05 11:52:37 accepted by QA -> done

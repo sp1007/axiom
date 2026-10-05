@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004]
 priority: 12
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tools/archcheck.py, tools/archcheck_rules.txt, tools/tests/archcheck]
 spec: [0263, 0152]
+started: 2026-10-05 11:50:04
+agent: T006-impl
 ---
 # T006 — Architecture layer checker tools/archcheck.py
 
@@ -36,3 +38,8 @@ Enforce the layer rules of axiom-c-stage0 automatically.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-04 08:07:33 started (attempt 1) T006-impl
+- 2026-10-05 11:49:47 requeue: restart (not charged: attempt refunded)
+- 2026-10-05 11:50:04 started (attempt 1) T006-impl
