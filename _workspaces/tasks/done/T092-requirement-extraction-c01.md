@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T003]
 priority: 16
-status: doing
+status: done
 attempts: 1
 paths: [spec/requirements/raw/C01.md]
 spec: [spec/requirements/chunks/C01.txt]
 started: 2026-10-05 15:07:15
-agent: T092-impl
+finished: 2026-10-05 15:20:53
 ---
 # T092 — Requirement extraction C01 (core)
 
@@ -47,3 +47,4 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 - 2026-10-05 12:00:23 started (attempt 1) T092-impl
 - 2026-10-05 14:19:43 requeue: quota (infrastructure failure: attempt refunded)
 - 2026-10-05 15:07:15 started (attempt 1) T092-impl
+- 2026-10-05 15:20:53 accepted by QA -> done

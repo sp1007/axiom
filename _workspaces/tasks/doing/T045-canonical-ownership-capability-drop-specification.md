@@ -8,11 +8,13 @@ model: opus
 gate_model: opus
 depends: [T003, T003a]
 priority: 10
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-10-ownership.md, spec/SPEC-11-capability.md, spec/SPEC-12-drop.md]
 timeout_min: 300
 spec: [0004, 0005, 0160, 0176, 0177, 0178, 0019, 0020, 0021, 0028, 0030, 0086, 0118, tasks/0394, tasks/0395, tasks/0674, tasks/0541, tasks/0270, 0263]
+started: 2026-10-05 15:20:15
+agent: T045-impl
 ---
 # T045 — Canonical ownership / capability / drop specification
 
@@ -40,3 +42,6 @@ One precise, testable statement of Axiom's ownership model (ownership ≠ borrow
 - ADRs: reserve the number with `python .claude/skills/axiom-tasks/scripts/taskctl.py adr-next <slug>` and list the ADR file in the report.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 15:20:15 started (attempt 1) T045-impl
