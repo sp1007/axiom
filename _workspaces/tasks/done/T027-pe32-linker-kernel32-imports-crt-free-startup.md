@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T026]
 priority: 44
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/link/pe, bootstrap/axiom0/src/link/startup, tests/link]
 locks: [bootstrap/axiom0/src/diag/codes/LINK.def]
 spec: [0186, 0187, 0164, 0217, .claude/skills/axiom-x64-backend/references/pe-coff.md]
 started: 2026-10-05 21:54:07
-agent: T027-impl
+finished: 2026-10-06 01:56:14
 ---
 # T027 — PE32+ linker + kernel32 imports + CRT-free startup
 
@@ -43,3 +43,4 @@ Link our COFF objects into a runnable PE32+ console executable without any exter
 
 ## Log
 - 2026-10-05 21:54:07 started (attempt 1) T027-impl
+- 2026-10-06 01:56:14 accepted by QA -> done
