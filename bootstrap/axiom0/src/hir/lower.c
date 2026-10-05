@@ -310,6 +310,22 @@ static AxHirExpr *lower_postfix(LowerCtx *ctx, const AxAstExpr *e) {
     return head;
 }
 
+static AxHirMatchArm *lower_match_arms(LowerCtx *ctx, const AxAstMatchArm *a) {
+    AxHirMatchArm *head = NULL;
+    AxHirMatchArm **tail = &head;
+    for (; a; a = a->next) {
+        AxHirMatchArm *ha = ax_arena_alloc(ctx->arena, sizeof(AxHirMatchArm), 8);
+        ha->span = a->span;
+        ha->pat = lower_pat(ctx, a->pat);
+        ha->guard = lower_expr(ctx, a->guard);
+        ha->body = lower_expr(ctx, a->body);
+        *tail = ha;
+        tail = &ha->next;
+    }
+    *tail = NULL;
+    return head;
+}
+
 static AxHirExpr *lower_expr(LowerCtx *ctx, const AxAstExpr *e) {
     AxHirExpr *head = NULL;
     AxHirExpr **tail = &head;
@@ -393,9 +409,9 @@ static AxHirExpr *lower_expr(LowerCtx *ctx, const AxAstExpr *e) {
                 }
                 break;
             case AX_EXPR_MATCH:
-                // T012 construct, so emit not supported
-                emit_not_supported(ctx, e->span);
-                he->kind = AX_HIR_EXPR_ERROR;
+                he->kind = AX_HIR_EXPR_MATCH;
+                he->match.expr = lower_expr(ctx, e->match.expr);
+                he->match.arms = lower_match_arms(ctx, e->match.arms);
                 break;
             case AX_EXPR_LOOP:
                 he->kind = AX_HIR_EXPR_LOOP;
@@ -436,8 +452,20 @@ static AxHirExpr *lower_expr(LowerCtx *ctx, const AxAstExpr *e) {
                 he->jump.expr = lower_expr(ctx, e->jump.expr);
                 break;
             case AX_EXPR_CLOSURE:
-                emit_not_supported(ctx, e->span);
-                he->kind = AX_HIR_EXPR_ERROR;
+                he->kind = AX_HIR_EXPR_CLOSURE;
+                AxHirParam **ctail = &he->closure.params;
+                for (AxAstParam *p = e->closure.params; p; p = p->next) {
+                    AxHirParam *hp = ax_arena_alloc(ctx->arena, sizeof(AxHirParam), 8);
+                    hp->span = p->span;
+                    hp->is_mut = p->is_mut;
+                    hp->symbol = get_symbol(ctx, p);
+                    hp->type = lower_type(ctx, p->type);
+                    *ctail = hp;
+                    ctail = &hp->next;
+                }
+                *ctail = NULL;
+                he->closure.ret_type = lower_type(ctx, e->closure.ret_type);
+                he->closure.body = lower_expr(ctx, e->closure.body);
                 break;
             case AX_EXPR_RANGE:
                 he->kind = AX_HIR_EXPR_RANGE;
@@ -551,6 +579,22 @@ static AxHirBlock lower_block(LowerCtx *ctx, const AxAstBlock *b) {
     return hb;
 }
 
+static AxHirUseTree *lower_use_tree(LowerCtx *ctx, const AxAstUseTree *tree) {
+    AxHirUseTree *head = NULL;
+    AxHirUseTree **tail = &head;
+    for (; tree; tree = tree->next) {
+        AxHirUseTree *ht = ax_arena_alloc(ctx->arena, sizeof(AxHirUseTree), 8);
+        ht->span = tree->span;
+        ht->path = tree->path;
+        ht->alias = tree->alias;
+        ht->subtrees = lower_use_tree(ctx, tree->subtrees);
+        *tail = ht;
+        tail = &ht->next;
+    }
+    *tail = NULL;
+    return head;
+}
+
 static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
     AxHirItem *head = NULL;
     AxHirItem **tail = &head;
@@ -562,12 +606,12 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
         switch (n->kind) {
             case AX_ITEM_ERROR: hi->kind = AX_HIR_ITEM_ERROR; break;
             case AX_ITEM_MODULE:
-                emit_not_supported(ctx, n->span);
-                hi->kind = AX_HIR_ITEM_ERROR;
+                hi->kind = AX_HIR_ITEM_MODULE;
+                hi->module.path = n->module.path;
                 break;
             case AX_ITEM_USE:
-                emit_not_supported(ctx, n->span);
-                hi->kind = AX_HIR_ITEM_ERROR;
+                hi->kind = AX_HIR_ITEM_USE;
+                hi->use.tree = lower_use_tree(ctx, n->use.tree);
                 break;
             case AX_ITEM_FN:
                 hi->kind = AX_HIR_ITEM_FN;
@@ -622,14 +666,78 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                 }
                 break;
             case AX_ITEM_ENUM:
+                hi->kind = AX_HIR_ITEM_ENUM;
+                hi->enum_decl.name = n->enum_decl.name;
+                hi->enum_decl.generic_params = lower_generic_params(ctx, n->enum_decl.generic_params);
+                hi->enum_decl.where_clause = lower_where_clause(ctx, n->enum_decl.where_clause);
+                AxHirVariantDecl **vtail = &hi->enum_decl.variants;
+                for (AxAstVariantDecl *v = n->enum_decl.variants; v; v = v->next) {
+                    AxHirVariantDecl *hv = ax_arena_alloc(ctx->arena, sizeof(AxHirVariantDecl), 8);
+                    hv->attrs = lower_attrs(ctx, v->attrs);
+                    hv->span = v->span;
+                    hv->name = v->name;
+                    hv->is_struct = v->is_struct;
+                    if (v->is_struct) {
+                        AxHirFieldDecl **ftail = &hv->struct_fields;
+                        for (AxAstFieldDecl *f = v->struct_fields; f; f = f->next) {
+                            AxHirFieldDecl *hf = ax_arena_alloc(ctx->arena, sizeof(AxHirFieldDecl), 8);
+                            hf->attrs = lower_attrs(ctx, f->attrs);
+                            hf->vis = lower_vis(ctx, &f->vis);
+                            hf->span = f->span;
+                            hf->name = f->name;
+                            hf->type = lower_type(ctx, f->type);
+                            *ftail = hf;
+                            ftail = &hf->next;
+                        }
+                        *ftail = NULL;
+                    } else {
+                        hv->tuple_types = lower_type(ctx, v->tuple_types);
+                    }
+                    *vtail = hv;
+                    vtail = &hv->next;
+                }
+                *vtail = NULL;
+                break;
             case AX_ITEM_TRAIT:
+                hi->kind = AX_HIR_ITEM_TRAIT;
+                hi->trait.name = n->trait.name;
+                hi->trait.generic_params = lower_generic_params(ctx, n->trait.generic_params);
+                hi->trait.supertraits = lower_type(ctx, n->trait.supertraits);
+                hi->trait.where_clause = lower_where_clause(ctx, n->trait.where_clause);
+                hi->trait.members = lower_item(ctx, n->trait.members);
+                break;
             case AX_ITEM_IMPL:
+                hi->kind = AX_HIR_ITEM_IMPL;
+                hi->impl.generic_params = lower_generic_params(ctx, n->impl.generic_params);
+                hi->impl.trait_path = lower_type(ctx, n->impl.trait_path);
+                hi->impl.self_type = lower_type(ctx, n->impl.self_type);
+                hi->impl.where_clause = lower_where_clause(ctx, n->impl.where_clause);
+                hi->impl.members = lower_item(ctx, n->impl.members);
+                break;
             case AX_ITEM_TYPE_ALIAS:
+                hi->kind = AX_HIR_ITEM_TYPE_ALIAS;
+                hi->type_alias.name = n->type_alias.name;
+                hi->type_alias.generic_params = lower_generic_params(ctx, n->type_alias.generic_params);
+                hi->type_alias.type = lower_type(ctx, n->type_alias.type);
+                break;
             case AX_ITEM_CONST:
+                hi->kind = AX_HIR_ITEM_CONST;
+                hi->const_decl.name = n->const_decl.name;
+                hi->const_decl.type = lower_type(ctx, n->const_decl.type);
+                hi->const_decl.expr = lower_expr(ctx, n->const_decl.expr);
+                break;
             case AX_ITEM_STATIC:
+                hi->kind = AX_HIR_ITEM_STATIC;
+                hi->static_decl.is_unsafe = n->static_decl.is_unsafe;
+                hi->static_decl.is_mut = n->static_decl.is_mut;
+                hi->static_decl.name = n->static_decl.name;
+                hi->static_decl.type = lower_type(ctx, n->static_decl.type);
+                hi->static_decl.expr = lower_expr(ctx, n->static_decl.expr);
+                break;
             case AX_ITEM_EXTERN_BLOCK:
-                emit_not_supported(ctx, n->span);
-                hi->kind = AX_HIR_ITEM_ERROR;
+                hi->kind = AX_HIR_ITEM_EXTERN_BLOCK;
+                hi->extern_block.abi = n->extern_block.abi;
+                hi->extern_block.members = lower_item(ctx, n->extern_block.members);
                 break;
         }
         *tail = hi;

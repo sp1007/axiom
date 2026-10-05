@@ -178,12 +178,20 @@ static void resolve_type(Env *env, Scope *scope, const AxAstType *t) {
     }
 }
 
-static void resolve_pat(Env *env, Scope *scope, const AxAstPat *p, bool is_decl) {
+static void resolve_pat_inner(Env *env, Scope *scope, SymEnv *pat_env, const AxAstPat *p, bool is_decl) {
     while (p) {
         switch (p->kind) {
             case AX_PAT_BINDING:
                 if (is_decl) {
-                    declare_name(env, scope, p->binding.name, p, p->span, SYM_LOCAL);
+                    if (SymEnv_contains(pat_env, p->binding.name.v)) {
+                        emit_diag(env, AX_NAME_DUPLICATE_BINDING, p->span);
+                    } else {
+                        Symbol *s = declare_name(env, scope, p->binding.name, p, p->span, SYM_LOCAL);
+                        if (s) {
+                            Symbol copied = *s;
+                            SymEnv_insert(pat_env, p->binding.name.v, copied);
+                        }
+                    }
                 } else {
                     Symbol *sym = lookup_name(scope, p->binding.name);
                     if (sym) bind_node(env, p, sym->id);
@@ -194,28 +202,72 @@ static void resolve_pat(Env *env, Scope *scope, const AxAstPat *p, bool is_decl)
             case AX_PAT_STRUCT:
                 resolve_path_seg(env, scope, p->path.segments); // Struct has same offset
                 if (p->kind == AX_PAT_PATH) {
-                    resolve_pat(env, scope, p->path.payload, is_decl);
+                    resolve_pat_inner(env, scope, pat_env, p->path.payload, is_decl);
                 } else {
                     for (AxAstPatField *f = p->struct_pat.fields; f; f = f->next) {
-                        if (f->pat) resolve_pat(env, scope, f->pat, is_decl);
-                        else if (is_decl) declare_name(env, scope, f->name, f, f->span, SYM_LOCAL);
+                        if (f->pat) resolve_pat_inner(env, scope, pat_env, f->pat, is_decl);
+                        else if (is_decl) {
+                            if (SymEnv_contains(pat_env, f->name.v)) {
+                                emit_diag(env, AX_NAME_DUPLICATE_BINDING, f->span);
+                            } else {
+                                Symbol *s = declare_name(env, scope, f->name, f, f->span, SYM_LOCAL);
+                                if (s) {
+                                    Symbol copied = *s;
+                                    SymEnv_insert(pat_env, f->name.v, copied);
+                                }
+                            }
+                        }
                     }
                 }
                 break;
             case AX_PAT_TUPLE:
-                resolve_pat(env, scope, p->tuple.elems, is_decl);
+                resolve_pat_inner(env, scope, pat_env, p->tuple.elems, is_decl);
                 break;
-            case AX_PAT_OR:
-                resolve_pat(env, scope, p->or_pat.pats, is_decl);
+            case AX_PAT_OR: {
+                SymEnv base_env; SymEnv_init(&base_env);
+                resolve_pat_inner(env, scope, &base_env, p->or_pat.pats, is_decl);
+                for (AxAstPat *alt = p->or_pat.pats->next; alt; alt = alt->next) {
+                    SymEnv alt_env; SymEnv_init(&alt_env);
+                    resolve_pat_inner(env, scope, &alt_env, alt, is_decl);
+                    uint32_t cur = 0; void *raw_e;
+                    while (ax_rawmap_next(&base_env.raw, &cur, &raw_e)) {
+                        SymEnvEntry *e = (SymEnvEntry*)raw_e;
+                        if (!SymEnv_contains(&alt_env, e->key)) {
+                            emit_diag(env, AX_NAME_OR_PATTERN_MISMATCH, alt->span);
+                        }
+                    }
+                    cur = 0;
+                    while (ax_rawmap_next(&alt_env.raw, &cur, &raw_e)) {
+                        SymEnvEntry *e = (SymEnvEntry*)raw_e;
+                        if (!SymEnv_contains(&base_env, e->key)) {
+                            emit_diag(env, AX_NAME_OR_PATTERN_MISMATCH, alt->span);
+                        }
+                    }
+                }
+                uint32_t cur = 0; void *raw_e;
+                while (ax_rawmap_next(&base_env.raw, &cur, &raw_e)) {
+                    SymEnvEntry *e = (SymEnvEntry*)raw_e;
+                    if (SymEnv_contains(pat_env, e->key)) {
+                        emit_diag(env, AX_NAME_DUPLICATE_BINDING, p->span);
+                    } else {
+                        SymEnv_insert(pat_env, e->key, e->value);
+                    }
+                }
                 break;
+            }
             case AX_PAT_RANGE:
-                resolve_pat(env, scope, p->range.start, is_decl);
-                resolve_pat(env, scope, p->range.end, is_decl);
+                resolve_pat_inner(env, scope, pat_env, p->range.start, is_decl);
+                resolve_pat_inner(env, scope, pat_env, p->range.end, is_decl);
                 break;
             default: break;
         }
         p = p->next;
     }
+}
+
+static void resolve_pat(Env *env, Scope *scope, const AxAstPat *p, bool is_decl) {
+    SymEnv pat_env; SymEnv_init(&pat_env);
+    resolve_pat_inner(env, scope, &pat_env, p, is_decl);
 }
 
 static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
@@ -244,9 +296,10 @@ static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
                 }
                 break;
             case AX_EXPR_BLOCK:
-            case AX_EXPR_UNSAFE:
-            case AX_EXPR_COMPTIME:
                 resolve_block(env, scope, &e->block.block);
+                break;
+            case AX_EXPR_UNSAFE:
+                resolve_block(env, scope, &e->unsafe_block.block);
                 break;
             case AX_EXPR_IF:
                 if (e->if_expr.let_pat) {
@@ -269,29 +322,48 @@ static void resolve_expr(Env *env, Scope *scope, const AxAstExpr *e) {
                     resolve_expr(env, arm_scope, a->body);
                 }
                 break;
-            case AX_EXPR_LOOP:
-                resolve_block(env, scope, &e->loop.block);
+            case AX_EXPR_LOOP: {
+                Scope *l_scope = push_scope(env, scope);
+                if (e->loop.label.v != 0) declare_name(env, l_scope, e->loop.label, e, e->span, SYM_LOCAL);
+                resolve_block(env, l_scope, &e->loop.block);
                 break;
-            case AX_EXPR_WHILE:
+            }
+            case AX_EXPR_WHILE: {
+                Scope *l_scope = push_scope(env, scope);
+                if (e->while_expr.label.v != 0) declare_name(env, l_scope, e->while_expr.label, e, e->span, SYM_LOCAL);
                 if (e->while_expr.let_pat) {
-                    Scope *w_scope = push_scope(env, scope);
+                    Scope *w_scope = push_scope(env, l_scope);
                     resolve_pat(env, w_scope, e->while_expr.let_pat, true);
-                    resolve_expr(env, scope, e->while_expr.cond);
+                    resolve_expr(env, l_scope, e->while_expr.cond);
                     resolve_block(env, w_scope, &e->while_expr.block);
                 } else {
-                    resolve_expr(env, scope, e->while_expr.cond);
-                    resolve_block(env, scope, &e->while_expr.block);
+                    resolve_expr(env, l_scope, e->while_expr.cond);
+                    resolve_block(env, l_scope, &e->while_expr.block);
                 }
                 break;
+            }
             case AX_EXPR_FOR: {
-                Scope *f_scope = push_scope(env, scope);
+                Scope *l_scope = push_scope(env, scope);
+                if (e->for_expr.label.v != 0) declare_name(env, l_scope, e->for_expr.label, e, e->span, SYM_LOCAL);
+                Scope *f_scope = push_scope(env, l_scope);
                 resolve_pat(env, f_scope, e->for_expr.pat, true);
-                resolve_expr(env, scope, e->for_expr.iter);
+                resolve_expr(env, l_scope, e->for_expr.iter);
                 resolve_block(env, f_scope, &e->for_expr.block);
                 break;
             }
             case AX_EXPR_VIEW:
                 resolve_expr(env, scope, e->view.expr);
+                break;
+            case AX_EXPR_COMPTIME:
+                resolve_block(env, scope, &e->comptime.block);
+                break;
+            case AX_EXPR_JUMP:
+                if (e->jump.label.v != 0) {
+                    Symbol *sym = lookup_name(scope, e->jump.label);
+                    if (sym) bind_node(env, e, sym->id);
+                    else emit_diag(env, AX_NAME_UNRESOLVED, e->span);
+                }
+                if (e->jump.expr) resolve_expr(env, scope, e->jump.expr);
                 break;
             case AX_EXPR_CLOSURE: {
                 Scope *c_scope = push_scope(env, scope);
@@ -403,51 +475,92 @@ static void resolve_block(Env *env, Scope *parent, const AxAstBlock *b) {
     resolve_stmt(env, scope, b->stmts);
 }
 
+static void resolve_generic_params(Env *env, Scope *scope, const AxAstGenericParams *gps) {
+    if (!gps) return;
+    for (AxAstGenericParam *gp = gps->params; gp; gp = gp->next) {
+        declare_name(env, scope, gp->name, gp, gp->span, SYM_LOCAL);
+    }
+    for (AxAstGenericParam *gp = gps->params; gp; gp = gp->next) {
+        resolve_type(env, scope, gp->bounds);
+    }
+}
+
+static void resolve_where_clause(Env *env, Scope *scope, const AxAstWhereClause *w) {
+    if (!w) return;
+    for (AxAstWherePred *p = w->preds; p; p = p->next) {
+        resolve_type(env, scope, p->type);
+        resolve_type(env, scope, p->bounds);
+    }
+}
+
 static void resolve_item_bodies(Env *env, Scope *scope, const AxAstItem *n) {
     while (n) {
         switch (n->kind) {
             case AX_ITEM_FN: {
                 Scope *fn_scope = push_scope(env, scope);
+                resolve_generic_params(env, fn_scope, n->fn.generic_params);
+                resolve_where_clause(env, fn_scope, n->fn.where_clause);
                 for(AxAstParam *p = n->fn.params; p; p = p->next) {
                     declare_name(env, fn_scope, p->name, p, p->span, SYM_LOCAL);
-                    resolve_type(env, scope, p->type);
+                    resolve_type(env, fn_scope, p->type);
                 }
-                resolve_type(env, scope, n->fn.ret_type);
+                resolve_type(env, fn_scope, n->fn.ret_type);
                 if (n->fn.body) resolve_block(env, fn_scope, n->fn.body);
                 break;
             }
-            case AX_ITEM_STRUCT:
+            case AX_ITEM_STRUCT: {
+                Scope *s_scope = push_scope(env, scope);
+                resolve_generic_params(env, s_scope, n->struct_decl.generic_params);
+                resolve_where_clause(env, s_scope, n->struct_decl.where_clause);
                 if (n->struct_decl.is_tuple) {
-                    resolve_type(env, scope, n->struct_decl.tuple_types);
+                    resolve_type(env, s_scope, n->struct_decl.tuple_types);
                 } else {
                     for(AxAstFieldDecl *f = n->struct_decl.struct_fields; f; f = f->next) {
-                        resolve_type(env, scope, f->type);
+                        resolve_type(env, s_scope, f->type);
                     }
                 }
                 break;
-            case AX_ITEM_ENUM:
+            }
+            case AX_ITEM_ENUM: {
+                Scope *e_scope = push_scope(env, scope);
+                resolve_generic_params(env, e_scope, n->enum_decl.generic_params);
+                resolve_where_clause(env, e_scope, n->enum_decl.where_clause);
                 for(AxAstVariantDecl *v = n->enum_decl.variants; v; v = v->next) {
                     if (v->is_struct) {
                         for(AxAstFieldDecl *f = v->struct_fields; f; f = f->next) {
-                            resolve_type(env, scope, f->type);
+                            resolve_type(env, e_scope, f->type);
                         }
                     } else {
-                        resolve_type(env, scope, v->tuple_types);
+                        resolve_type(env, e_scope, v->tuple_types);
                     }
                 }
                 break;
-            case AX_ITEM_TRAIT:
-                resolve_type(env, scope, n->trait.supertraits);
-                resolve_item_bodies(env, push_scope(env, scope), n->trait.members); // Assuming members have their own scope
+            }
+            case AX_ITEM_TRAIT: {
+                Scope *t_scope = push_scope(env, scope);
+                declare_name(env, t_scope, ax_intern_cstr(env->interner, "Self"), n, n->span, SYM_LOCAL);
+                resolve_generic_params(env, t_scope, n->trait.generic_params);
+                resolve_type(env, t_scope, n->trait.supertraits);
+                resolve_where_clause(env, t_scope, n->trait.where_clause);
+                resolve_item_bodies(env, t_scope, n->trait.members);
                 break;
-            case AX_ITEM_IMPL:
-                resolve_type(env, scope, n->impl.trait_path);
-                resolve_type(env, scope, n->impl.self_type);
-                resolve_item_bodies(env, push_scope(env, scope), n->impl.members);
+            }
+            case AX_ITEM_IMPL: {
+                Scope *i_scope = push_scope(env, scope);
+                declare_name(env, i_scope, ax_intern_cstr(env->interner, "Self"), n, n->span, SYM_LOCAL);
+                resolve_generic_params(env, i_scope, n->impl.generic_params);
+                resolve_type(env, i_scope, n->impl.trait_path);
+                resolve_type(env, i_scope, n->impl.self_type);
+                resolve_where_clause(env, i_scope, n->impl.where_clause);
+                resolve_item_bodies(env, i_scope, n->impl.members);
                 break;
-            case AX_ITEM_TYPE_ALIAS:
-                resolve_type(env, scope, n->type_alias.type);
+            }
+            case AX_ITEM_TYPE_ALIAS: {
+                Scope *a_scope = push_scope(env, scope);
+                resolve_generic_params(env, a_scope, n->type_alias.generic_params);
+                resolve_type(env, a_scope, n->type_alias.type);
                 break;
+            }
             case AX_ITEM_CONST:
                 resolve_type(env, scope, n->const_decl.type);
                 if (n->const_decl.expr) resolve_expr(env, scope, n->const_decl.expr);
@@ -455,6 +568,9 @@ static void resolve_item_bodies(Env *env, Scope *scope, const AxAstItem *n) {
             case AX_ITEM_STATIC:
                 resolve_type(env, scope, n->static_decl.type);
                 if (n->static_decl.expr) resolve_expr(env, scope, n->static_decl.expr);
+                break;
+            case AX_ITEM_EXTERN_BLOCK:
+                resolve_item_bodies(env, scope, n->extern_block.members);
                 break;
             default: break;
         }

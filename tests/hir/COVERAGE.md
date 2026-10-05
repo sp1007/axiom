@@ -45,3 +45,14 @@
 | AX_STMT_EXPR | `tests/hir/basic.ax` |
 | AX_ITEM_FN | `tests/hir/basic.ax` |
 | AX_ITEM_STRUCT | `tests/hir/types.ax` |
+| AX_EXPR_MATCH | 	ests/hir/more.ax |
+| AX_EXPR_CLOSURE | 	ests/hir/more.ax |
+| AX_ITEM_ENUM | 	ests/hir/more.ax |
+| AX_ITEM_TRAIT | 	ests/hir/more.ax |
+| AX_ITEM_IMPL | 	ests/hir/more.ax |
+| AX_ITEM_TYPE_ALIAS | 	ests/hir/more.ax |
+| AX_ITEM_CONST | 	ests/hir/more.ax |
+| AX_ITEM_STATIC | 	ests/hir/more.ax |
+| AX_ITEM_MODULE | 	ests/hir/more.ax |
+| AX_ITEM_USE | 	ests/hir/more.ax |
+| AX_ITEM_EXTERN_BLOCK | 	ests/hir/more.ax |

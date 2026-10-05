@@ -863,6 +863,7 @@ AxLexResult ax_lex(FileId file, StrView text, AxDiagSink *sink, StrInterner *int
         uint32_t start = l.pos;
         AxToken tok;
         memset(&tok, 0, sizeof(tok));
+        tok.span.file = l.file;
         tok.span.start = start;
         
         unsigned char c = l.src[l.pos];

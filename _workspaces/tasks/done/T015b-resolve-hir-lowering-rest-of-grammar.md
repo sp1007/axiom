@@ -8,14 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T012, T015]
 priority: 27
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/hir, tests/resolve, tests/hir, tests/ui/resolve, bootstrap/axiom0/src/driver/emit_resolved.c, bootstrap/axiom0/src/driver/emit_hir.c, bootstrap/axiom0/src/lex/lex.c]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, 0023, tasks/0378, tasks/0387, 0159, spec/SPEC-02-grammar.md]
 covers: []
-started: 2026-10-06 03:55:48
+started: 2026-10-06 04:31:23
 unblocks: 1
+finished: 2026-10-06 04:36:14
 ---
 # T015b — Name resolution + HIR lowering for the rest of the grammar
 
@@ -46,3 +47,5 @@ Finish the frontend for everything T012 parses, off the critical path of the fir
 - 2026-10-06 03:55:48 started (attempt 1) T015b-impl
 - 2026-10-06 04:30:32 block: needs bootstrap/axiom0/src/lex/lex.c added to paths
 - 2026-10-06 04:31:07 unblocked (cycle 1) 
+- 2026-10-06 04:31:23 started (attempt 1) T015b-impl
+- 2026-10-06 04:36:14 accepted by QA -> done
