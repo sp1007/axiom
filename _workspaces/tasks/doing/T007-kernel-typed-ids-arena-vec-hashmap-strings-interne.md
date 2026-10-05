@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004, T005]
 priority: 13
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/kernel, tests/unit/kernel]
 spec: [0153, 0171, 0172, tasks/0533, 0263]
+started: 2026-10-05 11:55:58
+agent: T007-impl
 ---
 # T007 — Kernel: typed IDs, arena, vec, hashmap, strings, interner, hashing
 
@@ -36,3 +38,6 @@ Provide the deterministic, allocation-disciplined data structures all compiler p
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 11:55:58 started (attempt 1) T007-impl

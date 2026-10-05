@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T004]
 priority: 12
-status: doing
+status: done
 attempts: 1
 paths: [tools/archcheck.py, tools/archcheck_rules.txt, tools/tests/archcheck]
 spec: [0263, 0152]
 started: 2026-10-05 11:50:04
-agent: T006-impl
+finished: 2026-10-05 12:00:11
 ---
 # T006 — Architecture layer checker tools/archcheck.py
 
@@ -43,3 +43,4 @@ Enforce the layer rules of axiom-c-stage0 automatically.
 - 2026-10-04 08:07:33 started (attempt 1) T006-impl
 - 2026-10-05 11:49:47 requeue: restart (not charged: attempt refunded)
 - 2026-10-05 11:50:04 started (attempt 1) T006-impl
+- 2026-10-05 12:00:11 accepted by QA -> done
