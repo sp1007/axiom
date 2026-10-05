@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T024, T003a]
 priority: 43
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/obj/coff, tests/obj]
 spec: [0185, .claude/skills/axiom-x64-backend/references/pe-coff.md, spec/SPEC-04-core-extensibility.md]
 started: 2026-10-05 20:19:37
-agent: T026-impl
+finished: 2026-10-05 20:38:42
 ---
 # T026 — COFF object writer
 
@@ -47,3 +47,4 @@ Write deterministic COFF (.obj) files from the object model.
 
 ## Log
 - 2026-10-05 20:19:37 started (attempt 1) T026-impl
+- 2026-10-05 20:38:42 accepted by QA -> done

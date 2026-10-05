@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T011]
 priority: 22
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/resolve, tests/resolve, tests/ui/resolve, bootstrap/axiom0/src/driver/emit_resolved.c]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, tasks/0387, tasks/0357, tasks/0497, 0103, .claude/skills/axiom-syntax]
+started: 2026-10-05 20:23:51
+agent: T014-impl
 ---
 # T014 — Name resolution: scope graph, dotted paths, prelude stub
 
@@ -38,3 +40,6 @@ Resolve every identifier and DottedChain to SymbolIds within a single module (mu
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 20:23:51 started (attempt 1) T014-impl
