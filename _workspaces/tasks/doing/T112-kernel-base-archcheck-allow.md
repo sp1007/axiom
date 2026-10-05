@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T008]
 priority: 14
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/kernel/base.c]
 spec: []
+started: 2026-10-05 15:52:18
+agent: T112-impl
 ---
 # T112 — Fix archcheck violations in kernel base.c
 
@@ -30,3 +32,6 @@ Add `archcheck:allow` pragmas to `kernel/base.c` to fix architecture violations 
 
 ## Notes
 - `base.c` is the foundational file and contains the ICE fail implementation which must print to stderr and abort. It legitimately violates INV-LAYER-006.
+
+## Log
+- 2026-10-05 15:52:18 started (attempt 1) T112-impl
