@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T092, T093, T094, T095, T096, T097, T098, T099, T100, T101, T102, T103, T104, T105, T106, T107, T108, T109]
 priority: 8
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/decisions]
 spec: [spec/requirements/raw]
+started: 2026-10-06 01:56:24
+finished: 2026-10-06 02:15:56
 ---
 # T110 — Requirements catalogue + coverage matrix
 
@@ -37,3 +39,7 @@ resolve conflicts via ADRs, and publish the coverage matrix of corpus goals vs t
 ## Notes
 - Critical board-level task (priority < 10): runs alone.
 - Keep `spec/requirements/raw/` untouched as audit trail.
+
+## Log
+- 2026-10-06 01:56:24 started (attempt 1) T110-impl
+- 2026-10-06 02:15:56 accepted by QA -> done
