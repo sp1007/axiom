@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T014]
 priority: 25
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/hir, tests/hir, bootstrap/axiom0/src/driver/emit_hir.c]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, 0023, tasks/0378, 0159]
+started: 2026-10-05 22:05:27
+agent: T015-impl
 ---
 # T015 — HIR data model + AST→HIR lowering
 
@@ -34,3 +36,6 @@ Produce the semantic HIR consumed by typeck: resolved IDs, desugared syntax, spa
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 22:05:27 started (attempt 1) T015-impl
