@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T008, T002, T112]
 priority: 15
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/diag, tests/unit/diag]
 spec: [0146, tasks/0360, tasks/0421, 0153]
-started: 2026-10-05 15:31:19
+started: 2026-10-05 15:56:48
 unblocks: 1
+finished: 2026-10-05 16:02:28
 ---
 # T009 — Diagnostics engine (model, code registry, human + JSON renderers)
 
@@ -43,3 +44,5 @@ Diagnostics as data, rendered by the driver in human or JSON form.
 - 2026-10-05 15:31:19 started (attempt 1) T009-impl
 - 2026-10-05 15:49:29 block: needs bootstrap/axiom0/src/kernel/base.c in paths to fix archcheck failure
 - 2026-10-05 15:51:17 unblocked (cycle 1) 
+- 2026-10-05 15:56:48 started (attempt 1) T009-impl
+- 2026-10-05 16:02:28 accepted by QA -> done
