@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T024, T003a]
 priority: 43
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/obj/coff, tests/obj]
 spec: [0185, .claude/skills/axiom-x64-backend/references/pe-coff.md, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-05 20:19:37
+agent: T026-impl
 ---
 # T026 — COFF object writer
 
@@ -42,3 +44,6 @@ Write deterministic COFF (.obj) files from the object model.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-05 20:19:37 started (attempt 1) T026-impl
