@@ -8,13 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T011]
 priority: 23
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, tests/resolve/]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, tasks/0476, 0065, 0066]
-started: 2026-10-05 20:38:52
+started: 2026-10-05 22:08:36
 unblocks: 1
+agent: T012-impl
 ---
 # T012 — Parser: types, patterns, generics, traits/impls, attributes, closures
 
@@ -44,3 +45,4 @@ Complete the grammar: everything not covered by T011.
 - 2026-10-05 20:38:52 started (attempt 1) T012-impl
 - 2026-10-05 21:53:56 block: need tests/resolve added to paths to update resolve tests (currently locked by T014)
 - 2026-10-05 22:08:11 unblocked (cycle 1) 
+- 2026-10-05 22:08:36 started (attempt 1) T012-impl
