@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T003]
 priority: 16
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/requirements/raw/C01.md]
 spec: [spec/requirements/chunks/C01.txt]
+started: 2026-10-05 15:07:15
+agent: T092-impl
 ---
 # T092 — Requirement extraction C01 (core)
 
@@ -40,3 +42,8 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 - Normative sources only: specs/, tasks/, others/, init prompt. `docs/base/discussions/` is brainstorming — do not extract from it.
 - Map to existing tasks with `python .claude/skills/axiom-tasks/scripts/taskctl.py list`.
 - All code in statements uses canonical syntax (`=`, `.`).
+
+## Log
+- 2026-10-05 12:00:23 started (attempt 1) T092-impl
+- 2026-10-05 14:19:43 requeue: quota (infrastructure failure: attempt refunded)
+- 2026-10-05 15:07:15 started (attempt 1) T092-impl

@@ -16,12 +16,18 @@ không làm vượt mốc và QA có tiêu chí máy kiểm được:
   capability) và mẫu "Xin chào thế giới", mỗi cái gắn với task và thư mục test.
 - **Bảng BOOT-00..38 → task**, hoặc "hoãn tới epic … theo R6/R7" (comptime, regalloc, linker đầy
   đủ, AArch64; Linux-first của 0263 §4 bị đảo thành Windows-first).
-Tập con self-host chính xác (tính năng nào axiom0 phải có để biên dịch axiomc) do T003a bổ sung vào
-§9 của tài liệu này. Quyết định: ADR-0012.
+Tập con self-host chính xác (§9, T003a, ADR-0013): danh sách từng tính năng axiom0 phải có để
+biên dịch axiomc, mỗi tính năng kèm lý do compiler cần; bảng vào/ra cho từng mục của tasks/0260 §3
+(`var` bị loại theo quy tắc cú pháp, "comptime (limited)" = hằng `const`); danh sách cấm (float,
+`static`, `@at`, `dyn`, async, …) kèm mã chẩn đoán và epic; bề mặt std mà axiomc cần ánh xạ tới các
+task P9; ngân sách kích thước mã C theo module; và các thay đổi board phải áp dụng (BC-01..BC-12).
+Bản máy đọc được là `spec/selfhost-subset.tsv` (task oracle, task native, task dùng đầu tiên).
+Quyết định: ADR-0012 (§1–§8), ADR-0013 (§9).
 
-Status: canonical (T003, 2026-10-04); §9 is completed by T003a. Rule ids `AXS-BOOT-NNN` are stable.
+Status: canonical (T003, 2026-10-04; §9 by T003a, 2026-10-05). Rule ids `AXS-BOOT-NNN` are stable.
 Decisions: ADR-0005 (native-after, gates, vertical slices), ADR-0012 (manifest format, ladder
-choices). Semantics referenced here: `spec/SPEC-03-core-semantics.md`. Plan frame:
+choices), ADR-0013 (exact self-host subset, §9). Semantics referenced here: `spec/SPEC-03-core-semantics.md`.
+Extension points and intrinsic sets: `spec/SPEC-04-core-extensibility.md`. Plan frame:
 `spec/ROADMAP.md`. Consumers: every P2–P10 task ("Out of scope: features scheduled for later
 tasks"), axiom-qa (scope check), T022 (`tools/gatecheck.py`), T003a, T076.
 
@@ -690,9 +696,76 @@ Native support of each rule follows the feature's native task in §4.
 
 ## 9. Exact self-host subset
 
-Reserved for T003a (ROADMAP R7): the feature-by-feature list of what axiom0 must support to compile
-axiomc, the tasks/0260 §3 in/out table, the self-host std subset, and `spec/selfhost-subset.tsv`.
-Until T003a lands, §4 is the list of core features and anything not in it is outside axiom0.
+The exact self-host subset is the minimal set of features that `axiom0` must support to compile `axiomc`. Anything outside this subset belongs to post-T087 epics.
+
+### 9.1 Core Language Features (tasks/0260 §3 in/out)
+
+Every item from the tasks/0260 §3 list is mapped as follows:
+- **primitive types**: IN (bool, unit, never, char, all integer widths). No floating point (f32/f64 go to P12 E12.2). The compiler itself needs no floats.
+- **struct**, **enum**, **tuple**, **array**: IN (needed for AST/HIR/MIR nodes, symbol tables, basic data structures).
+- **function**, **module**, **impl**, **generic**, **trait**: IN (required for project structure, polymorphism in collections, traits for hashing/equality).
+- **match**, **if**, **loop**, **while**, **for**, **let**: IN (core control flow).
+- **var**: OUT (excluded by the global syntax rule that `=` is the only binding/assignment spelling).
+- **closure**: IN (needed for iterator adapters, Option/Result combinators, sorting callbacks).
+- **Result**, **Option**: IN (error handling and absent values).
+- **ownership**, **view**, **mut_view**: IN (core memory safety and zero-copy references; memory is managed via arenas/Vecs instead of GC).
+- **comptime (limited)**: IN as `const` items (no `comptime fn` or advanced reflection).
+
+Additional items in the self-host subset explicitly added by ADRs (ADR-0002, ADR-0004, ADR-0006):
+- **Minimal raw pointers + `unsafe` blocks + memory intrinsics**: IN (T061a, required by std for `Box`, `Vec`, FFI). Full unsafe/UB model, volatile, and MMIO stay in E13.1/E13.2.
+- **Slices (dynamic views) and `if let`/destructuring patterns**: IN (T048, T038).
+- **Wrapping/bit intrinsics**: IN.
+- **Constant aggregate tables**: IN (placed once in `.rdata`). Note: `static` items are OUT.
+- **Stored views**: IN.
+- **Labelled `break`/`continue`**: IN.
+- **Literal / char-range / or-patterns**: IN.
+- **`enum as uN`**: IN.
+- **`@derive(Copy, Clone, Eq, PartialEq, Ord, Hash)` and tuple `Eq`/`Ord`/`Hash`**: IN.
+- **Generic drop glue (`drop_in_place`/`needs_drop`)**: IN.
+- **`extern` items and `unsafe fn`**: IN.
+- **HashMap insertion-order + hash contract**: IN.
+- **Const-evaluator interface**: IN (but `types` module never includes `interp`).
+- **MIR text parser**: IN (as C-only test infrastructure that is not ported to axiomc).
+- **Host-interface intrinsics**: IN (set with final names/signatures fixed in SPEC-04).
+
+### 9.2 Self-host Standard Library Subset
+
+The exact library surface `axiomc` needs is mapped to P9 tasks:
+- **Core (T069)**: Primitives, `Option`/`Result`, basic traits (`Eq`, `Ord`, `Hash`), memory intrinsics.
+- **Alloc (T070)**: `Box`, `Vec`, and stable `sort` (needed for deterministic output order).
+- **Text (T071, T071b, T071c)**: `String`, `StringBuilder`, UTF-8/UTF-16 processing, formatting/parsing, `ByteBuf` LE writers.
+- **Collections (T073)**: `HashMap`, `HashSet` (insertion-order preserving).
+- **Iterators (T072)**: Ranges, `for` loops, basic iterator adapters.
+- **Arenas (T073a)**: Arenas, typed ID tables, `Interner`.
+- **OS/IO (T074, T074b)**: io, fs (path, dir listing, metadata, binary files), args, env, exit, monotonic clock.
+
+Any required std feature missing from these P9 tasks becomes a scope change to be filed immediately, not discovered at T076.
+
+### 9.3 Out of Scope for Self-Hosting (tasks/0260 §4)
+
+The following are forbidden in `axiom0` (post-T087 epics):
+- `async`, GPU, `dyn Trait`, runtime reflection, advanced comptime, network, GUI, HTTP, database, filesystem watcher.
+- Floating-point types (`f32`/`f64`).
+- `static` and `@at` items.
+
+### 9.4 C-Scope Budget
+
+The C core (`axiom0`) is strictly budgeted to keep it small and fast. Rough size target per module:
+- `lexer` / `parser` / `ast`: ~4k LOC.
+- `resolver` / `hir` / `module`: ~4k LOC.
+- `typeck` / `traits`: ~6k LOC.
+- `mir` / `ownership` / `verifier`: ~9k LOC.
+- `interpreter`: ~3k LOC.
+- `lir` / `backend` / `encoder`: ~12k LOC.
+- `driver` / `object_writer` / `linker`: ~4k LOC.
+- Total budget limit: ~45k LOC.
+
+**Forbidden-in-C features**:
+- Anything outside the exact self-host subset defined above.
+- Floating-point emulation.
+- Linear-scan register allocation (unless strictly required by the SPEC-20 budget for T086, per ADR-0005 §7).
+- Advanced debug info (DWARF/PDB) emission.
+- Standard library implementation in C (only host intrinsics are in C).
 
 ## Sources
 0263 §4-12, §20-45, §49-51; 0264 §18-20; tasks/0262 §1, §13-19, §50, §55; tasks/0260 §3-4, §41,
