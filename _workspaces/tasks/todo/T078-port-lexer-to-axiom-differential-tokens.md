@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/lexer, tests/selfhost/lexer]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-LEX-114]
 ---
 # T078 — Port lexer to Axiom (differential tokens)
 
@@ -35,3 +36,6 @@ Port lexer to Axiom (differential tokens), keeping behaviour identical to the C 
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:21 covers += REQ-LEX-114 (metadata only)

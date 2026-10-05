@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [std/core/alloc, std/alloc, std/sys/windows/heap.ax, tests/std/alloc, tests/run/host/heap]
 spec: [0087, 0106, 0210, tasks/0280, 0045]
+covers: [REQ-RT-183]
 ---
 # T070 — Allocator, Box<T>, Vec<T>
 
@@ -37,3 +38,6 @@ Heap memory with explicit ownership.
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:31:20 covers += REQ-RT-183 (metadata only)

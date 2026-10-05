@@ -15,6 +15,7 @@ locks: [bootstrap/axiom0/src/diag/codes/NAME.def]
 spec: [0156, tasks/0387, tasks/0357, tasks/0497, 0103, .claude/skills/axiom-syntax]
 started: 2026-10-05 20:23:51
 finished: 2026-10-05 22:05:16
+covers: [REQ-OWNER-002]
 ---
 # T014 — Name resolution: scope graph, dotted paths, prelude stub
 
@@ -44,3 +45,4 @@ Resolve every identifier and DottedChain to SymbolIds within a single module (mu
 ## Log
 - 2026-10-05 20:23:51 started (attempt 1) T014-impl
 - 2026-10-05 22:05:16 accepted by QA -> done
+- 2026-10-06 02:24:24 covers += REQ-OWNER-002 (metadata only)

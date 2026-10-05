@@ -14,6 +14,7 @@ paths: [tools/archcheck.py, tools/archcheck_rules.txt, tools/tests/archcheck]
 spec: [0263, 0152]
 started: 2026-10-05 11:50:04
 finished: 2026-10-05 12:00:11
+covers: [REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006]
 ---
 # T006 — Architecture layer checker tools/archcheck.py
 
@@ -44,3 +45,4 @@ Enforce the layer rules of axiom-c-stage0 automatically.
 - 2026-10-05 11:49:47 requeue: restart (not charged: attempt refunded)
 - 2026-10-05 11:50:04 started (attempt 1) T006-impl
 - 2026-10-05 12:00:11 accepted by QA -> done
+- 2026-10-06 02:31:23 covers += REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006 (metadata only)

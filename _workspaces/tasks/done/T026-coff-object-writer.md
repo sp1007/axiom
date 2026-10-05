@@ -14,6 +14,7 @@ paths: [bootstrap/axiom0/src/obj/coff, tests/obj]
 spec: [0185, .claude/skills/axiom-x64-backend/references/pe-coff.md, spec/SPEC-04-core-extensibility.md]
 started: 2026-10-05 20:19:37
 finished: 2026-10-05 20:38:42
+covers: [REQ-OWNER-006, REQ-TOOL-001]
 ---
 # T026 — COFF object writer
 
@@ -48,3 +49,5 @@ Write deterministic COFF (.obj) files from the object model.
 ## Log
 - 2026-10-05 20:19:37 started (attempt 1) T026-impl
 - 2026-10-05 20:38:42 accepted by QA -> done
+- 2026-10-06 02:24:25 covers += REQ-OWNER-006 (metadata only)
+- 2026-10-06 02:31:22 covers += REQ-TOOL-001 (metadata only)

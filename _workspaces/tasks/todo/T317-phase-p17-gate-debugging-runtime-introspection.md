@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p17, _workspaces/reports/phase-P17-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-DBG-116, REQ-DBG-117]
 ---
 # T317 — Phase P17 gate: Debugging & runtime introspection
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T217, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:56 covers += REQ-DBG-116, REQ-DBG-117 (metadata only)

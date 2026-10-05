@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/backend, tests/selfhost/backend]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-ABI-106, REQ-ABI-107, REQ-ABI-108, REQ-LAY-298, REQ-LIR-030, REQ-TGT-327, REQ-X64-001]
 ---
 # T084 — Port LIR + x64 backend + encoder to Axiom
 
@@ -35,3 +36,8 @@ Port LIR + x64 backend + encoder to Axiom, keeping behaviour identical to the C 
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:53 covers += REQ-ABI-106, REQ-ABI-107, REQ-ABI-108 (metadata only)
+- 2026-10-06 02:24:21 covers += REQ-LAY-298, REQ-LIR-030 (metadata only)
+- 2026-10-06 02:31:21 covers += REQ-TGT-327, REQ-X64-001 (metadata only)

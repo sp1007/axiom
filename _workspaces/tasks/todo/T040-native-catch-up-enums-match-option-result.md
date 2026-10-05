@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum, tests/run/enum, tests/run/pattern, tests/run/result]
 spec: [tasks/0268, 0183]
+covers: [REQ-ASY-001, REQ-ASY-002]
 ---
 # T040 — Native catch-up: enums, match, Option/Result
 
@@ -35,3 +36,6 @@ Enum/match programs pass natively.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:54 covers += REQ-ASY-001, REQ-ASY-002 (metadata only)

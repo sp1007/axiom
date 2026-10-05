@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/traits/auto, compiler/mir, compiler/interp, tests/ui/concurrency]
 spec: [0091, 0092, 0079, tasks/0276, tasks/0298, 0208]
+covers: [REQ-CONC-218, REQ-CONC-219]
 ---
 # T089 — Concurrency semantics: Send/Share, data-race rules, atomics in MIR
 
@@ -34,3 +35,6 @@ Compile-time data-race freedom.
 - The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:55 covers += REQ-CONC-218, REQ-CONC-219 (metadata only)

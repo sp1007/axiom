@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/kernel_source_diag, tests/selfhost/kernel_source_diag]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-DRV-020, REQ-DRV-021]
 ---
 # T077 — Port kernel, source DB, diagnostics to Axiom
 
@@ -35,3 +36,6 @@ Port kernel, source DB, diagnostics to Axiom, keeping behaviour identical to the
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:57 covers += REQ-DRV-020, REQ-DRV-021 (metadata only)

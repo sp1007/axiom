@@ -15,6 +15,7 @@ timeout_min: 300
 spec: [0263, tasks/0260, tasks/0494, 0152, 0056, 0054, 0161, 0162, 0163, spec/ROADMAP.md]
 started: 2026-10-05 15:07:14
 finished: 2026-10-05 15:20:07
+covers: [REQ-OWNER-004]
 ---
 # T003a — Core extensibility contract + exact self-host subset
 
@@ -66,3 +67,4 @@ redesign — "implement later ≠ design later" (0263 §42).
 - 2026-10-05 14:19:43 requeue: quota (infrastructure failure: attempt refunded)
 - 2026-10-05 15:07:14 started (attempt 1) T003a-impl
 - 2026-10-05 15:20:07 accepted by QA -> done
+- 2026-10-06 02:24:24 covers += REQ-OWNER-004 (metadata only)

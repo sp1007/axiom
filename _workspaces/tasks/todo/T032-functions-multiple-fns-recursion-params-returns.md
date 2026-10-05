@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/fn, tests/ui/fn]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0069, tasks/0266, tasks/0284]
+covers: [REQ-CONC-001, REQ-CONC-002]
 ---
 # T032 — Functions: multiple fns, recursion, params, returns
 
@@ -35,3 +36,6 @@ Full function semantics in the oracle.
 - Direct calls and simple recursion already work since T019/T021; this task adds what Scope lists and re-tests the rest, it does not re-implement it.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:55 covers += REQ-CONC-001, REQ-CONC-002 (metadata only)

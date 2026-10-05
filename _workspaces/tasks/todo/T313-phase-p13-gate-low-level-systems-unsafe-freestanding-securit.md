@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p13, _workspaces/reports/phase-P13-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-SEC-123]
 ---
 # T313 — Phase P13 gate: Low-level systems, unsafe, freestanding, security
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T213, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:31:20 covers += REQ-SEC-123 (metadata only)

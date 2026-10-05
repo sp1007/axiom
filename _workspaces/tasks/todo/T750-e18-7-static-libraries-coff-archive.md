@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/obj/archive, compiler/link/archive, compiler/driver/kind, tests/link/lib]
 spec: [0164, 0217, 0099, tasks/0369, 0185]
+covers: [REQ-OWNER-006]
 ---
 # T750 — E18.7 Static libraries: COFF archive (.lib) writer and reader, --kind
 
@@ -39,3 +40,6 @@ spec: [0164, 0217, 0099, tasks/0369, 0185]
 - Owner requirement REQ-OWNER-006, roadmap epic E18.7: implemented in axiomc (Axiom, `compiler/`) right after self-hosting (P18 opens after P10). The C core emits only .obj/.exe but its data models reserve these artifact kinds (SPEC-04, T003a).
 - The P18 planning task T218 may split this task; keep this id for the first slice.
 - All Axiom code uses canonical syntax (axiom-syntax).
+
+## Log
+- 2026-10-06 02:24:25 covers += REQ-OWNER-006 (metadata only)

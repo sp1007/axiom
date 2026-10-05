@@ -14,6 +14,7 @@ paths: [spec/requirements/raw/C12.md]
 spec: [spec/requirements/chunks/C12.txt]
 started: 2026-10-05 17:01:21
 finished: 2026-10-05 17:20:01
+covers: [REQ-MOD-001, REQ-MOD-002]
 ---
 # T103 — Requirement extraction C12 (core)
 
@@ -46,3 +47,4 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 ## Log
 - 2026-10-05 17:01:21 started (attempt 1) T103-impl
 - 2026-10-05 17:20:01 accepted by QA -> done
+- 2026-10-06 02:24:22 covers += REQ-MOD-001, REQ-MOD-002 (metadata only)

@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p19, _workspaces/reports/phase-P19-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-TOOL-297, REQ-TOOL-298, REQ-TST-112]
 ---
 # T319 — Phase P19 gate: Developer tooling
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T219, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:31:22 covers += REQ-TOOL-297, REQ-TOOL-298, REQ-TST-112 (metadata only)

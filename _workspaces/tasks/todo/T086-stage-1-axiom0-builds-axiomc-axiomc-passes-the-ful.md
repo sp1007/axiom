@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tools/bootstrap.py, tests/selfhost/stage1, tests/perf]
 spec: [0167, 0150, tasks/0371]
+covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
 ---
 # T086 — Stage-1: axiom0 builds axiomc; axiomc passes the full suite
 
@@ -38,3 +39,6 @@ The Axiom compiler, written in Axiom, works.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:24 covers += REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006 (metadata only)

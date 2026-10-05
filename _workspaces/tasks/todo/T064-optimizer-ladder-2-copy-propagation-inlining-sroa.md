@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/opt, tests/opt2]
 spec: [0165, 0226, tasks/0401, tasks/0399]
+covers: [REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006]
 ---
 # T064 — Optimizer ladder 2: copy propagation, inlining, SROA
 
@@ -35,3 +36,6 @@ Meaningful MIR optimizations with legality from ownership facts.
 - 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:31:24 covers += REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006 (metadata only)

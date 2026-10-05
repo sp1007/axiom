@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p22, _workspaces/reports/phase-P22-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-GPU-064, REQ-GPU-065]
 ---
 # T322 — Phase P22 gate: GPU & heterogeneous computing
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T222, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:59 covers += REQ-GPU-064, REQ-GPU-065 (metadata only)

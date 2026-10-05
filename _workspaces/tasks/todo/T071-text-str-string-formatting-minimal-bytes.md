@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [std/text, tests/std/text]
 spec: [0089, tasks/0332, 0045, tasks/0304]
+covers: [REQ-STD-176]
 ---
 # T071 — Text core: Str, String, UTF-8, char primitives
 
@@ -36,3 +37,6 @@ UTF-8 text model per spec.
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:31:21 covers += REQ-STD-176 (metadata only)

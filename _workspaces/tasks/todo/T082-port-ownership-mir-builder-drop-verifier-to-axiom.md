@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/own_mir_verify, tests/selfhost/own_mir_verify]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-DRP-183, REQ-ERR-087, REQ-MIR-338, REQ-MIR-339, REQ-MIR-340, REQ-OWN-338]
 ---
 # T082 — Port ownership, MIR builder, drop, verifier to Axiom
 
@@ -36,3 +37,7 @@ Port ownership, MIR builder, drop, verifier to Axiom, keeping behaviour identica
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:57 covers += REQ-DRP-183, REQ-ERR-087 (metadata only)
+- 2026-10-06 02:24:22 covers += REQ-MIR-338, REQ-MIR-339, REQ-MIR-340, REQ-OWN-338 (metadata only)

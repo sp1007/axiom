@@ -13,6 +13,7 @@ attempts: 0
 paths: [spec/SPEC-20-selfhost.md, _workspaces/tasks/todo]
 timeout_min: 300
 spec: [0167, 0150, tasks/0260, tasks/0261, tasks/0371, tasks/0473]
+covers: [REQ-DRV-022]
 ---
 # T076 — Self-hosting plan: feature audit, compiler/ layout, differential strategy
 
@@ -39,3 +40,6 @@ Plan the port of axiom0 to Axiom (axiomc).
 - ROADMAP R3: after T087 axiom0 is frozen (bug fixes for bootstrapping only); all P11+ work happens in compiler/ + std/. Design compiler/ so every later epic has a natural home.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:58 covers += REQ-DRV-022 (metadata only)

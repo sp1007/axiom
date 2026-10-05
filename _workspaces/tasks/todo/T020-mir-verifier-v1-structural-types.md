@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/verify, tests/verify]
 locks: [bootstrap/axiom0/src/diag/codes/VERIFY.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0027, 0029, 0034, 0035, tasks/0365]
+covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
 ---
 # T020 — MIR verifier v1 (structural + types)
 
@@ -34,3 +35,6 @@ Guard the verified-MIR boundary: nothing malformed reaches the interpreter or ba
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:24 covers += REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006 (metadata only)

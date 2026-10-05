@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tools/fuzz.py, tests/fuzz]
 spec: [0263, tasks/0381]
+covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
 ---
 # T013 — Lexer/parser fuzz harness + seed corpus
 
@@ -35,3 +36,6 @@ Catch crashes, ICEs, hangs and non-determinism in the frontend early.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:23 covers += REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006 (metadata only)

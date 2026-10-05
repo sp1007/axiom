@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p21, _workspaces/reports/phase-P21-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-STD-171, REQ-STD-172, REQ-STD-173, REQ-STD-174, REQ-STD-175, REQ-STD-177]
 ---
 # T321 — Phase P21 gate: Standard library completion
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T221, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:31:20 covers += REQ-STD-171, REQ-STD-172, REQ-STD-173, REQ-STD-174, REQ-STD-175, REQ-STD-177 (metadata only)

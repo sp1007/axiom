@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/mir/async, compiler/types, std/async, tests/run/async]
 spec: [0093, tasks/0275, tasks/0297, 0202, 0248]
+covers: [REQ-ASY-167, REQ-ASY-168]
 ---
 # T088 — async fn / await: state-machine lowering + single-thread executor
 
@@ -34,3 +35,6 @@ Async per spec without mandatory runtime.
 - The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:54 covers += REQ-ASY-167, REQ-ASY-168 (metadata only)

@@ -12,7 +12,7 @@ status: todo
 attempts: 0
 paths: [std/fs, std/path, std/time, std/sys/windows/fs.ax, std/sys/windows/time.ax, tests/std/fs, tests/run/host/fs]
 spec: [tasks/0330, tasks/0335, 0220, 0221]
-covers: []
+covers: [REQ-STD-173, REQ-STD-174]
 ---
 # T074b — std.fs / path / directories / monotonic clock for hosted Windows
 
@@ -39,3 +39,6 @@ The rest of the OS surface the compiler driver needs (split from T074): file sys
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:31:21 covers += REQ-STD-173, REQ-STD-174 (metadata only)

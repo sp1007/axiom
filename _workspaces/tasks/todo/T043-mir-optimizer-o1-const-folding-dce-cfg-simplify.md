@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/opt, tests/opt, tests/diff/opt]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0165, 0226, 0074, 0263]
+covers: [REQ-ABI-001, REQ-ABI-002, REQ-ABI-003, REQ-ABI-004]
 ---
 # T043 — MIR optimizer -O1: const folding, DCE, CFG simplify
 
@@ -34,3 +35,6 @@ First optimization ladder rung, guarded by re-verification and differential test
 - Depends on T041 (string-constant operands exist in MIR) and T040; runs in parallel with T042 — string tests keep `native-after: T042` until T042 removes it, and the P5 gate T044 checks the combination.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:53 covers += REQ-ABI-001, REQ-ABI-002, REQ-ABI-003, REQ-ABI-004 (metadata only)

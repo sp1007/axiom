@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/target/x64/unwind, compiler/link/pe, tests/run/unwind]
 spec: [0188, 0190]
+covers: [REQ-ERR-001, REQ-ERR-002, REQ-ERR-003]
 ---
 # T068 — Windows unwind info (.pdata/.xdata) and panic backtrace basics
 
@@ -35,3 +36,6 @@ Make generated code debugger/unwinder friendly on Windows.
 - 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:59 covers += REQ-ERR-001, REQ-ERR-002, REQ-ERR-003 (metadata only)

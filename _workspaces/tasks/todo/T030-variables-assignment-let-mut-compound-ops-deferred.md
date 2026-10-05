@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/vars, tests/ui/vars]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, 0263, spec/SPEC-03-core-semantics.md]
+covers: [REQ-DRP-001, REQ-DRP-002, REQ-DRP-003]
 ---
 # T030 — Variables & assignment: let mut, compound ops, deferred init
 
@@ -34,3 +35,6 @@ Mutable bindings and assignment through the full pipeline (oracle).
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:57 covers += REQ-DRP-001, REQ-DRP-002, REQ-DRP-003 (metadata only)

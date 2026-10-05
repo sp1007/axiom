@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/resolve_hir, tests/selfhost/resolve_hir]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-MOD-142, REQ-PKG-023, REQ-RES-243]
 ---
 # T080 — Port resolver + HIR to Axiom
 
@@ -35,3 +36,7 @@ Port resolver + HIR to Axiom, keeping behaviour identical to the C implementatio
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:23 covers += REQ-MOD-142, REQ-PKG-023 (metadata only)
+- 2026-10-06 02:31:19 covers += REQ-RES-243 (metadata only)

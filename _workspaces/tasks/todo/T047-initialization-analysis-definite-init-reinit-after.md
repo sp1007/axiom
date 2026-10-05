@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/own/init, tests/ui/init, tests/run/init]
 locks: [bootstrap/axiom0/src/diag/codes/INIT.def]
 spec: [spec/SPEC-10-ownership.md, tasks/0394]
+covers: [REQ-MOD-001, REQ-MOD-002]
 ---
 # T047 — Initialization analysis (definite init, reinit after move)
 
@@ -33,3 +34,6 @@ Definite initialization across CFG including loops and conditional moves.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:22 covers += REQ-MOD-001, REQ-MOD-002 (metadata only)

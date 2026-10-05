@@ -16,6 +16,7 @@ spec: [spec/SPEC-02-grammar.md, 0155, 0174, tasks/0386, tasks/0476]
 started: 2026-10-05 20:14:22
 unblocks: 1
 finished: 2026-10-05 20:23:37
+covers: [REQ-GRM-001, REQ-GRM-002, REQ-OWNER-001]
 ---
 # T011 — AST + parser core (items, statements, expressions, recovery)
 
@@ -50,3 +51,4 @@ Parse the core grammar into an arena AST with spans and robust error recovery.
 - 2026-10-05 20:13:26 unblocked (cycle 1) 
 - 2026-10-05 20:14:22 started (attempt 1) T011-impl
 - 2026-10-05 20:23:37 accepted by QA -> done
+- 2026-10-06 02:24:20 covers += REQ-GRM-001, REQ-GRM-002, REQ-OWNER-001 (metadata only)

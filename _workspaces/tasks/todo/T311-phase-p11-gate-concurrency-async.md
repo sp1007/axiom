@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p11, _workspaces/reports/phase-P11-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-ASY-167, REQ-ASY-168]
 ---
 # T311 — Phase P11 gate: Concurrency & async
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T211, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:54 covers += REQ-ASY-167, REQ-ASY-168 (metadata only)

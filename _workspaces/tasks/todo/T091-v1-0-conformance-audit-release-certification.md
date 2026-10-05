@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [spec/RELEASE-v1.md, spec/decisions]
 spec: [0150, 0151, tasks/0602, 0121]
+covers: [REQ-CNF-001]
 ---
 # T091 — v1.0 conformance audit & release certification
 
@@ -34,3 +35,6 @@ Audit spec vs implementation and certify Axiom v1.0 bootstrap.
 - The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:55 covers += REQ-CNF-001 (metadata only)

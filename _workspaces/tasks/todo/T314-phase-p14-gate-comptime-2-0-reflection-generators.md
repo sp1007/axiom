@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p14, _workspaces/reports/phase-P14-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-CTM-048, REQ-CTM-049]
 ---
 # T314 — Phase P14 gate: Comptime 2.0, reflection, generators
 
@@ -35,3 +36,6 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T214, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:56 covers += REQ-CTM-048, REQ-CTM-049 (metadata only)

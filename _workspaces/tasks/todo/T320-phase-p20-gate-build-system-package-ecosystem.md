@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [tests/conformance/p20, _workspaces/reports/phase-P20-review.md]
 spec: [spec/ROADMAP.md]
+covers: [REQ-ECO-8734, REQ-ECO-8736, REQ-PKG-022]
 ---
 # T320 — Phase P20 gate: Build system & package ecosystem
 
@@ -35,3 +36,7 @@ requirements mapped to the phase are implemented.
 
 ## Notes
 - Depends on the planning task T220, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:58 covers += REQ-ECO-8734, REQ-ECO-8736 (metadata only)
+- 2026-10-06 02:24:26 covers += REQ-PKG-022 (metadata only)

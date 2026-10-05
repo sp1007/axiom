@@ -12,7 +12,7 @@ status: deferred
 attempts: 0
 paths: [tests/conformance/p24, _workspaces/reports/phase-P24-review.md]
 spec: [spec/ROADMAP.md]
-covers: []
+covers: [REQ-ECO-8733, REQ-ECO-8735, REQ-ECO-8737, REQ-ECO-8738, REQ-ECO-8739, REQ-ECO-8740, REQ-ECO-8741, REQ-ECO-8742, REQ-ECO-8743, REQ-ECO-8744, REQ-ECO-8745, REQ-ECO-8746, REQ-ECO-8747, REQ-ECO-8748, REQ-ECO-8749]
 ---
 # T324 — Phase P24 gate: Ecosystem runtimes (post-v1)
 
@@ -35,3 +35,6 @@ Certify that phase P24 meets the exit criteria of every epic E24.1–E24.8 in `s
 ## Notes
 - DEFERRED together with T224: post-v1 ecosystem. It becomes active only when the project owner schedules P24; the autopilot must not unblock it.
 - Depends on the planning task T224, which adds every phase task as a dependency of this gate.
+
+## Log
+- 2026-10-06 02:23:58 covers += REQ-ECO-8733, REQ-ECO-8735, REQ-ECO-8737, REQ-ECO-8738, REQ-ECO-8739, REQ-ECO-8740, REQ-ECO-8741, REQ-ECO-8742, REQ-ECO-8743, REQ-ECO-8744, REQ-ECO-8745, REQ-ECO-8746, REQ-ECO-8747, REQ-ECO-8748, REQ-ECO-8749 (metadata only)

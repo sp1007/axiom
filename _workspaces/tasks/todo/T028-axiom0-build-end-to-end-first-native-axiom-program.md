@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/driver/build_native, tests/run/native, bootstrap/axiom0/src/driver/emit_obj.c]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0152, 0263, 0186]
+covers: [REQ-OWNER-006]
 ---
 # T028 — `axiom0 build` end to end: first native Axiom program
 
@@ -37,3 +38,6 @@ spec: [0152, 0263, 0186]
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:25 covers += REQ-OWNER-006 (metadata only)

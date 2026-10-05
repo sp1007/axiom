@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [std/core, tests/std/core]
 spec: [0169, 0170, 0219, tasks/0303, tasks/0305, tasks/0353]
+covers: [REQ-STD-170]
 ---
 # T069 — core library v1 (Axiom source)
 
@@ -37,3 +38,6 @@ The OS-independent core every Axiom program can use.
 - Starts as soon as the language features it needs exist (ROADMAP R8), not after the whole P7 gate.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:31:20 covers += REQ-STD-170 (metadata only)

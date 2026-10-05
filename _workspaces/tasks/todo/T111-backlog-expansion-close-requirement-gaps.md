@@ -10,8 +10,10 @@ depends: [T110]
 priority: 9
 status: todo
 attempts: 0
-paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md, spec/ROADMAP.md]
+paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/SPEC-00-bootstrap.md, spec/ROADMAP.md, _workspaces/tasks/done/]
 spec: [spec/requirements/CATALOG.md, spec/COVERAGE.md, spec/ROADMAP.md]
+started: 2026-10-06 02:16:10
+unblocks: 1
 ---
 # T111 — Backlog expansion
 
@@ -42,3 +44,8 @@ by a task, merged, deferred (post-v1 only) or rejected by ADR; every task declar
 - Gate of P0 traceability: T017 (first semantic task) depends on this task; P1/P2 run in parallel with extraction (ADR-0005 §6).
 - Critical board-level task (priority < 10): runs alone, so no agent moves task files while you edit.
 - Only discussions/ is non-normative; everything else in docs/base counts.
+
+## Log
+- 2026-10-06 02:16:10 started (attempt 1) T111-impl
+- 2026-10-06 02:48:12 block: needs _workspaces/tasks/done/ in paths to add covers to old tasks
+- 2026-10-06 02:48:47 unblocked (cycle 1) 

@@ -15,6 +15,7 @@ locks: [bootstrap/axiom0/src/diag/codes/LEX.def]
 spec: [spec/SPEC-01-lexical.md, 0154, 0173, tasks/0385]
 started: 2026-10-05 16:02:36
 finished: 2026-10-05 16:29:29
+covers: [REQ-GRM-001, REQ-GRM-002, REQ-OWNER-001, REQ-OWNER-002]
 ---
 # T010 — Lexer + `inspect --emit=tokens`
 
@@ -46,3 +47,5 @@ Implement the full lexical spec: tokens with spans, newline tokens where signifi
 ## Log
 - 2026-10-05 16:02:36 started (attempt 1) T010-impl
 - 2026-10-05 16:29:29 accepted by QA -> done
+- 2026-10-06 02:24:00 covers += REQ-GRM-001 (metadata only)
+- 2026-10-06 02:24:21 covers += REQ-GRM-002, REQ-OWNER-001, REQ-OWNER-002 (metadata only)

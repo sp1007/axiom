@@ -14,6 +14,7 @@ paths: [spec/requirements/raw/C03.md]
 spec: [spec/requirements/chunks/C03.txt]
 started: 2026-10-05 15:27:18
 finished: 2026-10-05 15:38:14
+covers: [REQ-FFI-001, REQ-FFI-002, REQ-FFI-003]
 ---
 # T094 — Requirement extraction C03 (core)
 
@@ -46,3 +47,4 @@ existing board tasks or marked GAP, so that nothing the corpus concluded is sile
 ## Log
 - 2026-10-05 15:27:18 started (attempt 1) T094-impl
 - 2026-10-05 15:38:14 accepted by QA -> done
+- 2026-10-06 02:23:59 covers += REQ-FFI-001, REQ-FFI-002, REQ-FFI-003 (metadata only)

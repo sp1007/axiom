@@ -2,7 +2,7 @@
 id: T112
 title: Fix archcheck violations in kernel base.c
 phase: P1-kernel
-owner: axiom-kernel
+owner: axiom-architect
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet

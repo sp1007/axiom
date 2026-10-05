@@ -13,6 +13,7 @@ attempts: 0
 paths: [bootstrap/axiom0/src/mir/drop, bootstrap/axiom0/src/interp, tests/run/drop, tests/ui/drop]
 locks: [bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [spec/SPEC-12-drop.md, 0178, 0030, 0118, tasks/0674]
+covers: [REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006]
 ---
 # T049 — Drop elaboration + cleanup on every edge
 
@@ -33,3 +34,6 @@ Deterministic destruction made explicit in MIR.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:24:22 covers += REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006 (metadata only)

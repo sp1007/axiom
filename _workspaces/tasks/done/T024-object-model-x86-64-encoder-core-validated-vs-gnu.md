@@ -14,6 +14,7 @@ paths: [bootstrap/axiom0/src/objmodel, bootstrap/axiom0/src/target/x64/encode, t
 spec: [0184, 0180, 0233, 0254, .claude/skills/axiom-x64-backend, spec/SPEC-04-core-extensibility.md]
 started: 2026-10-05 19:58:39
 finished: 2026-10-05 20:19:23
+covers: [REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006, REQ-TOOL-001]
 ---
 # T024 — Object model + x86-64 encoder core (validated vs GNU as)
 
@@ -41,3 +42,5 @@ Encode x86-64 instructions directly to bytes with target-neutral relocations.
 ## Log
 - 2026-10-05 19:58:39 started (attempt 1) T024-impl
 - 2026-10-05 20:19:23 accepted by QA -> done
+- 2026-10-06 02:24:21 covers += REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006 (metadata only)
+- 2026-10-06 02:31:22 covers += REQ-TOOL-001 (metadata only)

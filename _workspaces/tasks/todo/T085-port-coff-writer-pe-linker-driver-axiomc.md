@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/obj_link_driver, tests/selfhost/obj_link_driver]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-CORE-3181]
 ---
 # T085 — Port COFF writer, PE linker, driver → axiomc
 
@@ -35,3 +36,6 @@ Port COFF writer, PE linker, driver → axiomc, keeping behaviour identical to t
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:56 covers += REQ-CORE-3181 (metadata only)

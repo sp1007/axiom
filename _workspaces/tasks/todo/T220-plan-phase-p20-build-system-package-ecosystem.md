@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+covers: [REQ-PKG-024, REQ-PKG-025]
 ---
 # T220 — Plan phase P20: Build system & package ecosystem
 
@@ -40,3 +41,5 @@ the roadmap is invented.
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-10-06 02:24:26 covers += REQ-PKG-024, REQ-PKG-025 (metadata only)

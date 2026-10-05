@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [std/thread, std/sync, tests/std/thread]
 spec: [0203, 0206, 0207, 0208, tasks/0329]
+covers: [REQ-CONC-219]
 ---
 # T090 — std.thread, Mutex, channel, Atomic<T> on Windows
 
@@ -34,3 +35,6 @@ Native threading library.
 - The P11/P23 planning task may split this task further; keep its id for the first slice.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:55 covers += REQ-CONC-219 (metadata only)

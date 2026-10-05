@@ -12,6 +12,7 @@ status: todo
 attempts: 0
 paths: [compiler/typeck_traits, tests/selfhost/typeck_traits]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-GEN-100, REQ-TRT-139, REQ-TYP-354, REQ-TYP-355]
 ---
 # T081 — Port typeck + trait solver to Axiom
 
@@ -36,3 +37,7 @@ Port typeck + trait solver to Axiom, keeping behaviour identical to the C implem
 - Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 02:23:59 covers += REQ-GEN-100 (metadata only)
+- 2026-10-06 02:31:23 covers += REQ-TRT-139, REQ-TYP-354, REQ-TYP-355 (metadata only)

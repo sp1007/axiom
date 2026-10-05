@@ -15,6 +15,7 @@ timeout_min: 300
 spec: [0154, 0173, tasks/0324, tasks/0476, tasks/0323, 0243, 0084, 0109, 0151]
 started: 2026-10-01 08:37:43
 finished: 2026-10-01 12:10:00
+covers: [REQ-GRM-001, REQ-GRM-002, REQ-OWNER-001, REQ-OWNER-002]
 ---
 # T001 — Canonical lexical + grammar spec (= and . rules applied)
 
@@ -49,3 +50,5 @@ Produce the canonical, implementable lexical specification and complete EBNF gra
 ## Log
 - 2026-10-01 08:37:43 started (attempt 1) T001-impl
 - 2026-10-01 12:10:00 accepted by QA -> done
+- 2026-10-06 02:24:00 covers += REQ-GRM-001 (metadata only)
+- 2026-10-06 02:24:20 covers += REQ-GRM-002, REQ-OWNER-001, REQ-OWNER-002 (metadata only)
