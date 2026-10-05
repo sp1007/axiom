@@ -1,8 +1,6 @@
 ## Tóm tắt
-Đã giải quyết xung đột đường dẫn cho T012. T014 đã hoàn thành nên thư mục `tests/resolve/` hiện đã có sẵn. Đã thêm thư mục này vào danh sách `paths` của T012 để cho phép cập nhật các bài test resolve.
 
-## Khác (Other/Details)
-The conflict is gone because T014 has completed. The `tests/resolve/` directory has been appended to the `paths` array in the T012 task file.
+Task T012 QA gate blocked because `hir/control.ax`, `hir/exprs.ax`, and `hir/pats.ax` are successfully parsing, causing an expected parser error (`exit: 1`) to fail. Added `tests/hir/` to the `paths` array of T012 so the tests can be updated.
 
 ## Files changed
 - _workspaces/tasks/todo/T012-parser-types-patterns-generics-traits-impls-attrib.md
