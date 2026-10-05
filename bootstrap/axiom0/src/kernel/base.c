@@ -6,11 +6,11 @@
 
 _Noreturn void ax_ice_failv(const char *file, int line, const char *fmt, va_list ap) {
     /* One banner line (runner pattern ICE_BANNER_RE), then the location on its own line. */
-    fputs("error: internal compiler error: ", stderr);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\nnote: at %s:%d\n", file, line);
-    fflush(stderr);
-    abort();
+    fputs("error: internal compiler error: ", stderr); /* archcheck:allow(INV-LAYER-006): ICE reporter terminates process */
+    vfprintf(stderr, fmt, ap); /* archcheck:allow(INV-LAYER-006): ICE reporter terminates process */
+    fprintf(stderr, "\nnote: at %s:%d\n", file, line); /* archcheck:allow(INV-LAYER-006): ICE reporter terminates process */
+    fflush(stderr); /* archcheck:allow(INV-LAYER-006): ICE reporter terminates process */
+    abort(); /* archcheck:allow(INV-LAYER-006): ICE reporter terminates process */
 }
 
 _Noreturn void ax_ice_fail(const char *file, int line, const char *fmt, ...) {

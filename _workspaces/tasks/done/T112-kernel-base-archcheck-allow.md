@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T008]
 priority: 14
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/kernel/base.c]
 spec: []
 started: 2026-10-05 15:52:18
-agent: T112-impl
+finished: 2026-10-05 15:56:40
 ---
 # T112 — Fix archcheck violations in kernel base.c
 
@@ -35,3 +35,4 @@ Add `archcheck:allow` pragmas to `kernel/base.c` to fix architecture violations 
 
 ## Log
 - 2026-10-05 15:52:18 started (attempt 1) T112-impl
+- 2026-10-05 15:56:40 accepted by QA -> done
