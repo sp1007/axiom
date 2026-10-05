@@ -223,8 +223,30 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             }
         }
 
-        advance(p); // Consume operator
+        if (tok->kind == AX_TOK_DOT) {
+            advance(p);
+            if (check(p, AX_TOK_IDENT)) {
+                AxAstExpr *postfix = NEW_NODE(p, AxAstExpr);
+                postfix->span = left->span;
+                postfix->kind = AX_EXPR_POSTFIX;
+                postfix->postfix.head = left;
+                AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
+                seg->kind = AX_POSTFIX_FIELD;
+                seg->field.name = peek(p)->val.ident_val;
+                seg->field.generic_args = NULL;
+                seg->next = NULL;
+                postfix->postfix.segments = seg;
+                left = postfix;
+                advance(p);
+                continue;
+            } else {
+                report(p, peek(p)->span, AX_PARSE_EXPECTED_TOKEN, "Expected field or method name");
+                break;
+            }
+        }
+
         if (tok->kind == AX_TOK_KW_AS) {
+            advance(p);
             AxAstExpr *cast = NEW_NODE(p, AxAstExpr);
             cast->span = left->span;
             cast->kind = AX_EXPR_CAST;
@@ -233,6 +255,8 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             left = cast;
             continue;
         }
+
+        advance(p); // Consume operator
 
         AxAstExpr *bin = NEW_NODE(p, AxAstExpr);
         bin->span = left->span;
@@ -261,11 +285,23 @@ static AxAstType *parse_type(Parser *p) {
     type->span = peek(p)->span;
     type->next = NULL;
 
-    if (consume(p, AX_TOK_IDENT)) {
+    if (check(p, AX_TOK_IDENT)) {
         type->kind = AX_TYPE_PATH;
-        type->path.segments = NEW_NODE(p, AxAstTypePathSegment);
-        type->path.segments->name = peek_nth(p, -1)->val.ident_val;
-        type->path.segments->next = NULL;
+        AxAstTypePathSegment *head = NULL, *tail = NULL;
+        while (check(p, AX_TOK_IDENT)) {
+            AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
+            seg->span = peek(p)->span;
+            seg->name = peek(p)->val.ident_val;
+            seg->generic_args = NULL;
+            seg->next = NULL;
+            if (tail) tail->next = seg;
+            else head = seg;
+            tail = seg;
+            advance(p);
+            if (consume(p, AX_TOK_DOT)) continue;
+            break;
+        }
+        type->path.segments = head;
     } else {
         report(p, type->span, AX_PARSE_EXPECTED_TYPE, "Expected type");
         type->kind = AX_TYPE_ERROR;
@@ -488,6 +524,17 @@ static AxAstItem *parse_item(Parser *p) {
         expect(p, AX_TOK_IDENT, AX_PARSE_EXPECTED_TOKEN, "Expected enum name");
         if (check(p, AX_TOK_LBRACE)) {
             advance(p);
+            AxAstVariantDecl **v_ptr = &item->enum_decl.variants;
+            while (!check(p, AX_TOK_EOF) && !check(p, AX_TOK_RBRACE)) {
+                AxAstVariantDecl *v = NEW_NODE(p, AxAstVariantDecl);
+                memset(v, 0, sizeof(*v));
+                v->span = peek(p)->span;
+                v->name = peek(p)->val.ident_val;
+                expect(p, AX_TOK_IDENT, AX_PARSE_EXPECTED_TOKEN, "Expected variant name");
+                *v_ptr = v;
+                v_ptr = &v->next;
+                if (!consume(p, AX_TOK_COMMA)) break;
+            }
             expect(p, AX_TOK_RBRACE, AX_PARSE_EXPECTED_TOKEN, "Expected '}'");
         } else {
             sync_to_term(p);
