@@ -371,6 +371,7 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 
 | Date | Change | ADR |
 |---|---|---|
+| 2026-10-06 | T022 (VS0 gate) unblock: fix tasks T114 parser, T115 typeck/driver, T116 MIR builder, T117 interpreter (after T116); T022 depends on all four and owns `tools/ci.ps1`; T069 depends on T061 (selfhost-subset rule d) | ADR-0016 |
 | 2026-10-01 | Audit 2026-09-30 (4 lenses) applied. Oracle host interface: T061c; std runs under the interpreter (R8 wording) | ADR-0002 |
 | 2026-10-01 | Backend robustness: ABI lowering as a LIR pass, machine-IR verifier, stack probes, `--stack-reserve` (T025 narrowed, new T025b; T027, T028, T037, T086) | ADR-0003 |
 | 2026-10-01 | Self-host subset additions: wrapping/bit intrinsics (T034/T037), constant tables in `.rdata` (T061, new T061d), stored views (T045/T048), HashMap insertion order + shared hash (T007/T069/T073), generic drop glue (new T054b), derive Hash/Ord (T056), control/pattern forms (T031, T038, new T038b) | ADR-0004 |
