@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T017, T003a, T045]
 priority: 31
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir, tests/mir, bootstrap/axiom0/src/driver/emit_mir.c]
 spec: [0161, 0227, 0228, 0247, 0024, tasks/0393, 0054, 0056, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-06 09:26:39
+finished: 2026-10-06 10:05:25
 ---
 # T018 — MIR data model, printer and text parser
 
@@ -36,3 +38,7 @@ Define the full MIR (designed for ownership from day one) with a round-trippable
 - Depends on T045 (ADR-0005 §5): the ownership/capability/drop rules exist before the MIR that must express them.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 09:26:39 started (attempt 1) T018-impl
+- 2026-10-06 10:05:25 accepted by QA -> done
