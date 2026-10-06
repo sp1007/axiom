@@ -252,10 +252,10 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                         TypeId lhs_ty = get_operand_type(body, &stmt->assign.rvalue.binary_op.lhs);
                         TypeId rhs_ty = get_operand_type(body, &stmt->assign.rvalue.binary_op.rhs);
                         bool is_cmp = (stmt->assign.rvalue.binary_op.op >= AX_MIR_BINOP_EQ && stmt->assign.rvalue.binary_op.op <= AX_MIR_BINOP_GT);
-                        if (lhs_ty.v != 0 && rhs_ty.v != 0 && lhs_ty.v == rhs_ty.v) {
+                        if (lhs_ty.v != 0 && rhs_ty.v != 0 && types_compatible(thir, lhs_ty, rhs_ty)) {
                             if (is_cmp && thir) src_ty = thir->interner.t_bool;
                             else src_ty = lhs_ty;
-                        } else if (lhs_ty.v != 0 && rhs_ty.v != 0 && lhs_ty.v != rhs_ty.v) {
+                        } else if (lhs_ty.v != 0 && rhs_ty.v != 0 && !types_compatible(thir, lhs_ty, rhs_ty)) {
                             report_verify_error(sink, func, AX_VERIFY_TYPE_MISMATCH);
                             if (is_cmp && thir) src_ty = thir->interner.t_bool;
                             else src_ty = lhs_ty;
@@ -273,7 +273,7 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                         break;
                 }
                 
-                if (dest_ty.v != 0 && src_ty.v != 0 && dest_ty.v != src_ty.v) {
+                if (dest_ty.v != 0 && src_ty.v != 0 && !types_compatible(thir, dest_ty, src_ty)) {
                     report_verify_error(sink, func, AX_VERIFY_TYPE_MISMATCH);
                 }
                 

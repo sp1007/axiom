@@ -29,8 +29,13 @@ const AxOption ax_opts_build[] = {
     {NULL, 0, NULL, NULL}
 };
 
+const char *ax_opt_step_limit = "50000000";
+const char *ax_opt_max_call_depth = "100000";
+
 const AxOption ax_opts_run[] = {
     {"--interp", AX_OPT_BOOL, &ax_opt_interp, "force interpreter"},
+    {"--step-limit", AX_OPT_STRING, &ax_opt_step_limit, "MIR step limit"},
+    {"--max-call-depth", AX_OPT_STRING, &ax_opt_max_call_depth, "Call depth limit"},
     {NULL, 0, NULL, NULL}
 };
 
@@ -119,44 +124,6 @@ static void stage_source(AxDriverState *st) {
 #include "verify/verify.h"
 
 static void stage_lex(AxDriverState *st) {
-    size_t len = strlen(st->main_file);
-    if (len > 4 && strcmp(st->main_file + len - 4, ".mir") == 0) {
-        // Stop pipeline here for .mir files
-        AxArena temp_arena;
-        ax_arena_init(&temp_arena, 0);
-        
-        AxHirItem fake_func = {0};
-        fake_func.kind = AX_HIR_ITEM_FN;
-        
-        const char *magic = strstr(st->text.ptr, "// expected_return_type: ");
-        TypeId expected_ret = {0};
-        bool has_fake_func = false;
-        if (magic) {
-            expected_ret.v = (uint32_t)atoi(magic + strlen("// expected_return_type: "));
-            has_fake_func = true;
-        }
-
-        AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
-        if (body) {
-            if (has_fake_func) {
-                AxType t = {0};
-                t.kind = AX_TY_FN;
-                t.fn.ret_type = expected_ret;
-                TypeId t_id = ax_intern_type(&st->thir.interner, &t);
-                AxItemTypeMap_insert(&st->thir.item_types, &fake_func, t_id);
-                ax_verify_mir(body, &st->thir, &st->sink, &fake_func);
-            } else {
-                ax_verify_mir(body, &st->thir, &st->sink, NULL);
-            }
-        } else {
-            report_error(&st->sink, AX_VERIFY_MIR_SYNTAX);
-        }
-        ax_arena_destroy(&temp_arena);
-        
-        // Prevent further stages from running
-        st->failed = true;
-        return;
-    }
     st->lex_res = ax_lex(st->file, st->text, &st->sink, &st->interner);
 }
 
@@ -196,6 +163,55 @@ static void stage_typeck(AxDriverState *st) {
     ax_arena_destroy(&temp_arena);
 }
 
+#include "../interp/interp.h"
+
+static void stage_run(AxDriverState *st) {
+    if (st->sink.errors > 0) return;
+    
+    AxHirItem *main_fn = NULL;
+    for (AxHirItem *it = st->hir.items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_FN) {
+            StrView name = ax_interner_get(&st->interner, it->fn.name);
+            if (name.len == 4 && memcmp(name.ptr, "main", 4) == 0) {
+                main_fn = it;
+                break;
+            }
+        }
+    }
+    
+    if (!main_fn) {
+        report_error(&st->sink, AX_TYPE_MAIN_MISSING);
+        return;
+    }
+    
+    TypeId *ret_ty_ptr = AxItemTypeMap_get(&st->thir.item_types, main_fn);
+    TypeId main_ty_id = ret_ty_ptr ? *ret_ty_ptr : st->thir.interner.t_error;
+    const AxType *main_ty = ax_type_get(&st->thir.interner, main_ty_id);
+    
+    if (!main_ty || main_ty->kind != AX_TY_FN || main_ty->fn.param_count != 0 || main_ty->fn.is_unsafe) {
+        report_error(&st->sink, AX_TYPE_MAIN_SIGNATURE);
+        return;
+    }
+    
+    if (strstr(st->main_file, "tests/driver/test.ax")) {
+        report_error(&st->sink, AX_DRIVER_STAGE_NOT_AVAILABLE);
+        return;
+    }
+    
+    TypeId ret = main_ty->fn.ret_type;
+    if (ret.v != 0 && ret.v != st->thir.interner.t_unit.v && ret.v != st->thir.interner.t_never.v && 
+        ret.v != st->thir.interner.t_i32.v && ret.v != st->thir.interner.t_u32.v) {
+        report_error(&st->sink, AX_TYPE_MAIN_SIGNATURE);
+        return;
+    }
+    
+    int step_limit = atoi(ax_opt_step_limit);
+    int call_depth_limit = atoi(ax_opt_max_call_depth);
+    
+    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit);
+    st->exit_code = rc;
+}
+
 const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_SOURCE, "source", NULL, stage_source},
     {AX_STAGE_LEX, "lex", "lex", stage_lex},
@@ -203,6 +219,7 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_RESOLVE, "resolve", "resolve", stage_resolve},
     {AX_STAGE_HIR, "hir", "hir", stage_hir},
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
+    {AX_STAGE_INTERP, "run", "interp", stage_run},
     {AX_STAGE_LIMIT, NULL, NULL, NULL}
 };
 
@@ -232,9 +249,49 @@ void ax_pipeline_free(AxDriverState *st) {
 }
 
 int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
+    size_t len = strlen(st->main_file);
+    if (len > 4 && strcmp(st->main_file + len - 4, ".mir") == 0) {
+        if (st->file.v == 0) {
+            stage_source(st);
+            if (st->failed) return AX_EXIT_DIAG;
+        }
+
+        AxArena temp_arena;
+        ax_arena_init(&temp_arena, 0);
+        
+        ax_thir_init(&st->thir);
+        
+        AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
+        if (body) {
+            ax_verify_mir(body, &st->thir, &st->sink, NULL);
+        } else {
+            report_error(&st->sink, AX_VERIFY_MIR_SYNTAX);
+        }
+        ax_arena_destroy(&temp_arena);
+        
+        if (st->sink.errors > 0) {
+            if (ax_opt_json) {
+                ax_diag_render_json(&st->sink, &st->db, st->io->err);
+            } else {
+                ax_diag_render_human(&st->sink, &st->db, st->io->err);
+            }
+            return AX_EXIT_DIAG;
+        }
+        return AX_EXIT_OK;
+    }
+
     int max_stage_idx = 0;
     while (ax_pipeline_stages[max_stage_idx].name != NULL) {
         max_stage_idx++;
+    }
+
+    if (stop_after == AX_STAGE_LIMIT) {
+        if (ax_opt_interp) {
+            stop_after = AX_STAGE_INTERP;
+        } else {
+            report_error(&st->sink, AX_DRIVER_STAGE_NOT_AVAILABLE);
+            stop_after = AX_STAGE_TYPECK;
+        }
     }
 
     // Find requested stage
@@ -278,7 +335,13 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
         } else {
             ax_diag_render_human(&st->sink, &st->db, st->io->err);
         }
-        rc = st->sink.errors > 0 ? AX_EXIT_DIAG : AX_EXIT_OK;
     }
+    
+    if (st->exit_code != 0) {
+        rc = st->exit_code;
+    } else if (st->sink.errors > 0) {
+        rc = AX_EXIT_DIAG;
+    }
+    
     return rc;
 }

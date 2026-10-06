@@ -110,6 +110,7 @@ typedef enum AxStageId {
     AX_STAGE_RESOLVE,
     AX_STAGE_HIR,
     AX_STAGE_TYPECK,
+    AX_STAGE_INTERP,
     AX_STAGE_LIMIT
 } AxStageId;
 
@@ -117,6 +118,7 @@ typedef struct AxDriverState {
     const AxIo *io;
     const char *main_file;
     bool failed;
+    int exit_code;
     
     SourceDatabase db;
     AxDiagSink sink;
