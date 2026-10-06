@@ -1,5 +1,6 @@
 #include "driver/driver.h"
 #include "mir/mir.h"
+#include "mir/build/build.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,11 +49,30 @@ static int emit_mir_run(const AxIo *io, int argc, char **argv) {
         return AX_EXIT_OK;
     }
 
-    // For .ax files, we would typecheck and lower, but that is T019
-    // For now, we will just return OK or error since we don't have lowering.
-    fputs("axiom0: MIR lowering from .ax is not implemented yet\n", io->err);
+    // For .ax files, we run the pipeline up to TYPECK, then build MIR for each function
+    AxDriverState st;
+    ax_pipeline_init(&st, io);
+    st.main_file = path;
+    
+    ax_pipeline_run(&st, AX_STAGE_TYPECK);
+    if (st.failed) {
+        ax_pipeline_free(&st);
+        free(pos_argv);
+        return AX_EXIT_DIAG;
+    }
+    
+    for (const AxHirItem *item = st.hir.items; item != NULL; item = item->next) {
+        if (item->kind == AX_HIR_ITEM_FN) {
+            AxMirBody *body = ax_mir_build(item, &st.thir, &st.hir_arena);
+            if (body) {
+                ax_mir_print(io->out, body);
+            }
+        }
+    }
+    
+    ax_pipeline_free(&st);
     free(pos_argv);
-    return AX_EXIT_ICE;
+    return AX_EXIT_OK;
 }
 
 const AxEmitter axemit_mir = {

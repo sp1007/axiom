@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T018]
 priority: 32
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build, bootstrap/axiom0/src/driver/emit_mir.c]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0161, tasks/0364, tasks/0539, 0041]
-started: 2026-10-06 10:05:37
+started: 2026-10-06 10:10:50
 unblocks: 1
+finished: 2026-10-06 10:28:57
 ---
 # T019 — THIR → MIR builder (subset)
 
@@ -40,3 +41,6 @@ Lower typed HIR of the subset into MIR CFGs.
 - 2026-10-06 10:05:37 started (attempt 1) T019-impl
 - 2026-10-06 10:10:01 block: bootstrap/axiom0/src/driver/emit_mir.c is missing from locks
 - 2026-10-06 10:10:33 unblocked (cycle 1) 
+- 2026-10-06 10:10:50 started (attempt 1) T019-impl
+- 2026-10-06 10:27:37 accepted by QA -> done
+- 2026-10-06 10:28:57 accepted by QA -> done
