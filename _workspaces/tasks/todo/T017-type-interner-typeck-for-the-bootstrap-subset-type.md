@@ -10,10 +10,12 @@ depends: [T015, T016, T003, T003a, T111]
 priority: 30
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck, bootstrap/axiom0/src/driver/emit_thir.c]
+paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck, bootstrap/axiom0/src/driver/emit_thir.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/driver/cmd_check.c]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 timeout_min: 300
 spec: [0157, 0175, 0245, tasks/0388, tasks/0482, spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-06 07:08:03
+unblocks: 1
 ---
 # T017 — Type interner + typeck for the bootstrap subset (typed HIR)
 
@@ -40,3 +42,8 @@ Type the subset: integers (all widths), bool, unit, never, functions, let (annot
 - Scope boundary with T030–T032: this task types immutable `let`, literals, operators, `if`/`while`/`loop` as statements, direct calls and `return`. Mutation, value-producing control flow and the remaining function forms are T030–T032.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 07:08:03 started (attempt 1) T017-impl
+- 2026-10-06 09:14:18 block: needs bootstrap/axiom0/src/driver/driver.h and cmd_check.c added to paths
+- 2026-10-06 09:14:57 unblocked (cycle 1) 
