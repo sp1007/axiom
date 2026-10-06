@@ -10,11 +10,11 @@ depends: [T020]
 priority: 34
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/diag/codes/DRIVER.def]
+paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/diag/codes/DRIVER.def, bootstrap/axiom0/src/verify/verify.c, bootstrap/axiom0/src/driver/cmd_run.c, tests/verify/return_type.test, tests/perf/]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0025, 0031, 0145, spec/SPEC-03-core-semantics.md]
-started: 2026-10-06 12:58:26
-unblocks: 1
+started: 2026-10-06 13:30:14
+unblocks: 2
 ---
 # T021 — MIR interpreter (semantic oracle) v1 + `run --interp`
 
@@ -43,3 +43,6 @@ Execute verified MIR with exact Axiom semantics; exit code = main's result.
 - 2026-10-06 12:58:26 started (attempt 1) T021-impl
 - 2026-10-06 13:29:15 block: needs typeck.c, driver.h, and DRIVER.def to fix inference and architecture layers
 - 2026-10-06 13:29:55 unblocked (cycle 1) 
+- 2026-10-06 13:30:14 started (attempt 1) T021-impl
+- 2026-10-06 14:57:35 block: needs verify.c, cmd_run.c, return_type.test, tests/perf/ added to paths
+- 2026-10-06 14:58:16 unblocked (cycle 2) 
