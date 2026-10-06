@@ -131,12 +131,18 @@ static void stage_hir(AxDriverState *st) {
     st->hir = ax_lower_ast(&st->hir_arena, &st->parse_res.ast, &st->resolve_map, &st->sink);
 }
 
+static void stage_typeck(AxDriverState *st) {
+    if (st->sink.errors > 0) return;
+    st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
+}
+
 const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_SOURCE, "source", NULL, stage_source},
     {AX_STAGE_LEX, "lex", "lex", stage_lex},
     {AX_STAGE_PARSE, "parse", "parse", stage_parse},
     {AX_STAGE_RESOLVE, "resolve", "resolve", stage_resolve},
     {AX_STAGE_HIR, "hir", "hir", stage_hir},
+    {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
     {AX_STAGE_LIMIT, NULL, NULL, NULL}
 };
 
@@ -150,9 +156,11 @@ void ax_pipeline_init(AxDriverState *st, const AxIo *io) {
     ax_arena_init(&st->resolve_arena, 0);
     ax_arena_init(&st->hir_arena, 0);
     ax_resolve_map_init(&st->resolve_map);
+    ax_thir_init(&st->thir);
 }
 
 void ax_pipeline_free(AxDriverState *st) {
+    ax_thir_free(&st->thir);
     ax_arena_destroy(&st->hir_arena);
     ax_resolve_map_free(&st->resolve_map);
     ax_arena_destroy(&st->resolve_arena);

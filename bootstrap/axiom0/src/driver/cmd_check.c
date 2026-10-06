@@ -18,7 +18,7 @@ static int run_check(const AxIo *io, int argc, char **argv) {
     ax_pipeline_init(&st, io);
     st.main_file = pos_argv[1];
     
-    int rc = ax_pipeline_run(&st, AX_STAGE_HIR);
+    int rc = ax_pipeline_run(&st, AX_STAGE_TYPECK);
     
     ax_pipeline_free(&st);
     free(pos_argv);

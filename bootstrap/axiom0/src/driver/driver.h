@@ -25,6 +25,7 @@
 #include "kernel/arena.h"
 #include "kernel/str.h"
 #include "kernel/interner.h"
+#include "types/types.h"
 
 /* Process exit codes of `axiom0` (axiom-testing: exit code 3 is a CRASH for the runner). */
 enum {
@@ -108,6 +109,7 @@ typedef enum AxStageId {
     AX_STAGE_PARSE,
     AX_STAGE_RESOLVE,
     AX_STAGE_HIR,
+    AX_STAGE_TYPECK,
     AX_STAGE_LIMIT
 } AxStageId;
 
@@ -129,6 +131,7 @@ typedef struct AxDriverState {
     AxParseResult parse_res;
     AxResolveMap resolve_map;
     AxHir hir;
+    AxThir thir;
 } AxDriverState;
 
 typedef void (*AxStageRunFn)(AxDriverState *st);
