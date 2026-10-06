@@ -10,9 +10,11 @@ depends: [T020]
 priority: 34
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/interp, tests/run/basic]
+paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/diag/codes/DRIVER.def]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0025, 0031, 0145, spec/SPEC-03-core-semantics.md]
+started: 2026-10-06 12:58:26
+unblocks: 1
 ---
 # T021 — MIR interpreter (semantic oracle) v1 + `run --interp`
 
@@ -36,3 +38,8 @@ Execute verified MIR with exact Axiom semantics; exit code = main's result.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 12:58:26 started (attempt 1) T021-impl
+- 2026-10-06 13:29:15 block: needs typeck.c, driver.h, and DRIVER.def to fix inference and architecture layers
+- 2026-10-06 13:29:55 unblocked (cycle 1) 
