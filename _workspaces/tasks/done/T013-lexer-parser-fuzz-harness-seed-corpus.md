@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T012, T005, T016]
 priority: 28
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tools/fuzz.py, tests/fuzz]
 spec: [0263, tasks/0381]
 covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
+started: 2026-10-06 04:36:27
+finished: 2026-10-06 07:07:53
 ---
 # T013 — Lexer/parser fuzz harness + seed corpus
 
@@ -39,3 +41,5 @@ Catch crashes, ICEs, hangs and non-determinism in the frontend early.
 
 ## Log
 - 2026-10-06 02:24:23 covers += REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006 (metadata only)
+- 2026-10-06 04:36:27 started (attempt 1) T013-impl
+- 2026-10-06 07:07:53 accepted by QA -> done
