@@ -10,9 +10,11 @@ depends: [T018]
 priority: 32
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
+paths: [bootstrap/axiom0/src/mir/build, tests/mir/build, bootstrap/axiom0/src/driver/emit_mir.c]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0161, tasks/0364, tasks/0539, 0041]
+started: 2026-10-06 10:05:37
+unblocks: 1
 ---
 # T019 — THIR → MIR builder (subset)
 
@@ -33,3 +35,8 @@ Lower typed HIR of the subset into MIR CFGs.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-06 10:05:37 started (attempt 1) T019-impl
+- 2026-10-06 10:10:01 block: bootstrap/axiom0/src/driver/emit_mir.c is missing from locks
+- 2026-10-06 10:10:33 unblocked (cycle 1) 
