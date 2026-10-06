@@ -10,25 +10,34 @@ typedef struct {
     size_t len;
     AxArena *arena;
     TypeInterner *interner;
+    TypeId type_map[1024];
 } MirParser;
 
 static void skip_ws(MirParser *p) {
-    while (p->pos < p->len && isspace((unsigned char)p->text[p->pos])) {
-        p->pos++;
+    
+    while (p->pos < p->len) {
+        unsigned char c = (unsigned char)p->text[p->pos];
+        if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\v' || c == '\f') {
+            p->pos++;
+        } else {
+            break;
+        }
     }
 }
 
 static bool match_str(MirParser *p, const char *s) {
     skip_ws(p);
     size_t slen = strlen(s);
-    if (p->pos + slen <= p->len && strncmp(p->text + p->pos, s, slen) == 0) {
+    bool match = (p->pos + slen <= p->len && strncmp(p->text + p->pos, s, slen) == 0);
+    if (match) {
         p->pos += slen;
         return true;
     }
     return false;
 }
 
-static void expect_str(MirParser *p, const char *s) {
+#define expect_str(p, s) expect_str_impl(p, s)
+static void expect_str_impl(MirParser *p, const char *s) {
     if (!match_str(p, s)) {
         AX_ICE("MIR parse error: expected '%s'", s);
     }
@@ -79,6 +88,9 @@ static AxMirBbId parse_bb(MirParser *p) {
 static TypeId parse_type(MirParser *p) {
     expect_str(p, "type#");
     uint32_t v = (uint32_t)parse_int(p);
+    if (v < 1024 && p->type_map[v].v != 0) {
+        return p->type_map[v];
+    }
     return (TypeId){v};
 }
 
@@ -369,11 +381,40 @@ static AxMirTerminator parse_terminator(MirParser *p, AxMirPlace *call_dest) {
 
 AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena) {
     MirParser p = { .text = text, .pos = 0, .len = strlen(text), .arena = arena, .interner = interner };
+    memset(p.type_map, 0, sizeof(p.type_map));
     AxMirBody *body = AX_ARENA_NEW(arena, AxMirBody);
     
     expect_str(&p, "mir_body");
     expect_str(&p, "{");
     
+    while (match_ident(&p, "type")) {
+        uint32_t id = (uint32_t)parse_int(&p);
+        expect_str(&p, "=");
+        expect_str(&p, "fn(");
+        TypeId params[16];
+        size_t param_count = 0;
+        while (!match_str(&p, ")")) {
+            if (param_count > 0) expect_str(&p, ",");
+            params[param_count++] = parse_type(&p);
+        }
+        expect_str(&p, "->");
+        TypeId ret_ty = parse_type(&p);
+        expect_str(&p, ";");
+        
+        AxType t = {0};
+        t.kind = AX_TY_FN;
+        t.fn.param_count = param_count;
+        if (param_count > 0) {
+            t.fn.param_types = AX_ARENA_NEW_ARRAY(arena, TypeId, param_count);
+            memcpy(t.fn.param_types, params, sizeof(TypeId) * param_count);
+        }
+        t.fn.ret_type = ret_ty;
+        
+        if (id < 1024) {
+            p.type_map[id] = ax_intern_type(interner, &t);
+        }
+    }
+
     AxMirLocalDecl locals[256];
     size_t local_count = 0;
     while (match_ident(&p, "let")) {
@@ -399,10 +440,17 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
         expect_str(&p, ":");
         expect_str(&p, "{");
         
+        bbs[bb_count].terminator.kind = 255;
         AxMirStmt stmts[128];
         size_t stmt_count = 0;
         
-        while (!match_str(&p, "}") && p.pos < p.len) {
+        while (p.pos < p.len) {
+            size_t saved_check = p.pos;
+            if (match_str(&p, "}")) {
+                p.pos = saved_check;
+                break;
+            }
+            
             size_t saved = p.pos;
             bool is_term = match_ident(&p, "goto") || match_ident(&p, "return") || 
                            match_ident(&p, "unreachable") || match_ident(&p, "drop") || 
@@ -418,7 +466,7 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
                 // Statement looks like: `_1 = ...;` or `StorageLive(_1);`
                 if (match_ident(&p, "StorageLive(") || match_ident(&p, "StorageDead(")) {
                     p.pos = saved;
-                    stmts[stmt_count++] = parse_stmt(&p);
+                    AxMirStmt tmp = parse_stmt(&p); stmts[stmt_count++] = tmp;
                 } else {
                     AxMirPlace place = parse_place(&p);
                     expect_str(&p, "=");
@@ -431,18 +479,19 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
                     AxMirOperand func = parse_operand(&p);
                     (void)func;
                     if (match_str(&p, "(")) {
-                        // It's a call!
-                        p.pos = op_saved; // Reset to parse the function operand again inside parse_terminator
+                        p.pos = op_saved;
                         bbs[bb_count].terminator = parse_terminator(&p, &place);
                         break;
                     } else {
-                        // It's an assignment statement
-                        p.pos = saved; // Reset everything and parse as statement
-                        stmts[stmt_count++] = parse_stmt(&p);
+                        p.pos = saved;
+                        
+                        AxMirStmt tmp = parse_stmt(&p); stmts[stmt_count++] = tmp;
+                        
                     }
                 }
             }
         }
+        
         
         expect_str(&p, "}");
         bbs[bb_count].stmt_count = stmt_count;

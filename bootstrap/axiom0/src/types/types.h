@@ -109,10 +109,14 @@ bool ax_type_is_unsigned(TypeId id, const TypeInterner *in);
 #define ax_key_hash_ptr(k) ax_hash_u64((uint64_t)(uintptr_t)*(k))
 #define ax_key_eq_ptr(a, b) (*(a) == *(b))
 
-AX_DEFINE_HASHMAP(AxExprTypeMap, const AxHirExpr *, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
-AX_DEFINE_HASHMAP(AxPatTypeMap, const AxHirPat *, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
-AX_DEFINE_HASHMAP(AxItemTypeMap, const AxHirItem *, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
-AX_DEFINE_HASHMAP(AxParamTypeMap, const AxHirParam *, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
+typedef struct AxHirExpr AxHirExpr; typedef const AxHirExpr *AxHirExprPtr;
+AX_DEFINE_HASHMAP(AxExprTypeMap, AxHirExprPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
+typedef struct AxHirPat AxHirPat; typedef const AxHirPat *AxHirPatPtr;
+AX_DEFINE_HASHMAP(AxPatTypeMap, AxHirPatPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
+typedef struct AxHirItem AxHirItem; typedef const AxHirItem *AxHirItemPtr;
+AX_DEFINE_HASHMAP(AxItemTypeMap, AxHirItemPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
+typedef struct AxHirParam AxHirParam; typedef const AxHirParam *AxHirParamPtr;
+AX_DEFINE_HASHMAP(AxParamTypeMap, AxHirParamPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
 static inline uint64_t ax_key_hash_symbol(const AxSymbolId *k) { return ax_key_hash_u32(&k->v); }
 static inline bool ax_key_eq_symbol(const AxSymbolId *a, const AxSymbolId *b) { return a->v == b->v; }
 AX_DEFINE_HASHMAP(AxSymbolTypeMap, AxSymbolId, TypeId, ax_key_hash_symbol, ax_key_eq_symbol);

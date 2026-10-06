@@ -8,14 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T019]
 priority: 33
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/verify, tests/verify, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/resolve/resolve.h, bootstrap/axiom0/src/types/types.h]
 locks: [bootstrap/axiom0/src/diag/codes/VERIFY.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0027, 0029, 0034, 0035, tasks/0365]
 covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
-started: 2026-10-06 10:29:27
+started: 2026-10-06 11:22:09
 unblocks: 1
+finished: 2026-10-06 12:57:49
 ---
 # T020 — MIR verifier v1 (structural + types)
 
@@ -43,3 +44,5 @@ Guard the verified-MIR boundary: nothing malformed reaches the interpreter or ba
 - 2026-10-06 10:29:27 started (attempt 1) T020-impl
 - 2026-10-06 11:21:14 block: needs parse.c, resolve.h, types.h added to paths
 - 2026-10-06 11:21:48 unblocked (cycle 1) 
+- 2026-10-06 11:22:09 started (attempt 1) T020-impl
+- 2026-10-06 12:57:49 accepted by QA -> done

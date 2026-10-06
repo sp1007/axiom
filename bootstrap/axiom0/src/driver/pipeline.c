@@ -115,7 +115,48 @@ static void stage_source(AxDriverState *st) {
     st->text = ax_source_db_text(&st->db, st->file);
 }
 
+#include "mir/mir.h"
+#include "verify/verify.h"
+
 static void stage_lex(AxDriverState *st) {
+    size_t len = strlen(st->main_file);
+    if (len > 4 && strcmp(st->main_file + len - 4, ".mir") == 0) {
+        // Stop pipeline here for .mir files
+        AxArena temp_arena;
+        ax_arena_init(&temp_arena, 0);
+        
+        AxHirItem fake_func = {0};
+        fake_func.kind = AX_HIR_ITEM_FN;
+        
+        const char *magic = strstr(st->text.ptr, "// expected_return_type: ");
+        TypeId expected_ret = {0};
+        bool has_fake_func = false;
+        if (magic) {
+            expected_ret.v = (uint32_t)atoi(magic + strlen("// expected_return_type: "));
+            has_fake_func = true;
+        }
+
+        AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
+        if (body) {
+            if (has_fake_func) {
+                AxType t = {0};
+                t.kind = AX_TY_FN;
+                t.fn.ret_type = expected_ret;
+                TypeId t_id = ax_intern_type(&st->thir.interner, &t);
+                AxItemTypeMap_insert(&st->thir.item_types, &fake_func, t_id);
+                ax_verify_mir(body, &st->thir, &st->sink, &fake_func);
+            } else {
+                ax_verify_mir(body, &st->thir, &st->sink, NULL);
+            }
+        } else {
+            report_error(&st->sink, AX_VERIFY_MIR_SYNTAX);
+        }
+        ax_arena_destroy(&temp_arena);
+        
+        // Prevent further stages from running
+        st->failed = true;
+        return;
+    }
     st->lex_res = ax_lex(st->file, st->text, &st->sink, &st->interner);
 }
 
@@ -131,9 +172,28 @@ static void stage_hir(AxDriverState *st) {
     st->hir = ax_lower_ast(&st->hir_arena, &st->parse_res.ast, &st->resolve_map, &st->sink);
 }
 
+#include "mir/build/build.h"
+#include "verify/verify.h"
+
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
+    if (st->sink.errors > 0) return;
+    
+    // Build and verify MIR
+    AxArena temp_arena;
+    ax_arena_init(&temp_arena, 0);
+    
+    for (AxHirItem *it = st->hir.items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_FN) {
+            AxMirBody *body = ax_mir_build(it, &st->thir, &temp_arena);
+            if (body) {
+                ax_verify_mir(body, &st->thir, &st->sink, it);
+            }
+        }
+    }
+    
+    ax_arena_destroy(&temp_arena);
 }
 
 const AxStage ax_pipeline_stages[] = {

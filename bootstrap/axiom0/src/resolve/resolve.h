@@ -9,14 +9,11 @@
 
 AX_DEFINE_ID(AxSymbolId);
 
-static inline uint64_t ax_key_hash_ptr(const void *const *k) {
-    return ax_hash_u64((uint64_t)(uintptr_t)*k);
-}
-static inline bool ax_key_eq_ptr(const void *const *a, const void *const *b) {
-    return *a == *b;
-}
+#define ax_resolve_hash_ptr(k) ax_hash_u64((uint64_t)(uintptr_t)*(k))
+#define ax_resolve_eq_ptr(a, b) (*(a) == *(b))
 
-AX_DEFINE_HASHMAP(AxNodeMap, const void *, AxSymbolId, ax_key_hash_ptr, ax_key_eq_ptr);
+typedef const void * AxNodePtr;
+AX_DEFINE_HASHMAP(AxNodeMap, AxNodePtr, AxSymbolId, ax_resolve_hash_ptr, ax_resolve_eq_ptr);
 
 typedef struct AxResolveMap {
     AxNodeMap node_map;
