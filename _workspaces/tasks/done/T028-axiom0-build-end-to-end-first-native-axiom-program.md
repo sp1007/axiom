@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T025b, T027, T016]
 priority: 45
-status: doing
+status: done
 attempts: 1
 paths: [tests/driver, tests/mc, tests/mir, bootstrap/axiom0/src/driver/build_native, tests/run/native, bootstrap/axiom0/src/driver/emit_obj.c, tests/run/basic, tests/conformance/vs0]
 locks: [bootstrap/axiom0/src/target/x64/mir/mi.c, bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/target/x64/frame/frame.c, bootstrap/axiom0/src/target/x64/isel/isel.c, bootstrap/axiom0/src/types/typeck.c]
@@ -16,7 +16,7 @@ spec: [0152, 0263, 0186]
 covers: [REQ-OWNER-006]
 started: 2026-10-08 05:58:22
 unblocks: 1
-agent: T028-impl
+finished: 2026-10-08 06:37:46
 ---
 # T028 â€” `axiom0 build` end to end: first native Axiom program
 
@@ -57,3 +57,4 @@ agent: T028-impl
 - 2026-10-08 05:56:10 block: need paths: [tests/run/basic, tests/conformance/vs0] to remove native-after: T028
 - 2026-10-08 05:56:44 unblocked (cycle 1) 
 - 2026-10-08 05:58:22 started (attempt 1) T028-impl
+- 2026-10-08 06:37:46 accepted by QA -> done
