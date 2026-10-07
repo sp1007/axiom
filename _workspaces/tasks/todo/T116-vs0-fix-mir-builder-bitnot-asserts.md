@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T021]
 priority: 11
-status: blocked
+status: todo
 attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
 locks: [bootstrap/axiom0/src/interp/interp.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/verify/verify.c]
@@ -17,23 +17,23 @@ covers: [REQ-EXP-021]
 started: 2026-10-07 10:01:32
 unblocks: 1
 ---
-# T116 — VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
+# T116 â€” VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
 
 ## Goal
-The THIR→MIR builder emits the MIR SPEC-03 / FP-03 prescribes — correct operators and explicit
-`Assert` terminators for every trapping operation — so the oracle and later the native backend
+The THIRâ†’MIR builder emits the MIR SPEC-03 / FP-03 prescribes â€” correct operators and explicit
+`Assert` terminators for every trapping operation â€” so the oracle and later the native backend
 (T023, AXS-BOOT-007) see the checks in MIR. Fix task created by the T022 unblock (ADR-0016); bugs
-M1–M3 of `_workspaces/reports/T022-report.md`.
+M1â€“M3 of `_workspaces/reports/T022-report.md`.
 
 ## Scope
 - M1 `builder.c` ~238: unary `~` lowers to bitwise NOT, not NEG.
 - M2: Rename `AX_MIR_RVALUE_CHECKED_BINARY_OP` in `mir.h` to `AX_MIR_RVALUE_OVERFLOWS_BINARY_OP` (returning bool, ADR-0017). Checked operations (`+ - *`, `/`, `%`, shifts, unary `-`) lower to computing the overflow bool (via explicit comparisons or `OverflowsBinaryOp`), an `AX_MIR_TERM_ASSERT` asserting it is false, and then the standard `BinaryOp`.
   Update the printer, text parser, verifier and interpreter to support `OverflowsBinaryOp` and the `Assert` terminator.
-- M3: `build_expr_into` gets an exhaustive final branch — an unhandled HIR/THIR kind is an ICE
+- M3: `build_expr_into` gets an exhaustive final branch â€” an unhandled HIR/THIR kind is an ICE
   (internal-error diagnostic), never silently dropped.
 - Minimal interpreter support (lock on `interp/interp.c`): execute `AX_MIR_TERM_ASSERT`
   (continue on success, take the existing panic path on failure) so the full suite stays green.
-  Nothing else in the interpreter — width/bitwise/panic-format work is T117.
+  Nothing else in the interpreter â€” width/bitwise/panic-format work is T117.
 - Regenerate `tests/mir/build/first_mir.mir` (FP-03 with the checked Add + assert edge) and add
   MIR goldens for `~`, division and shift asserts; the verifier accepts every new golden.
 

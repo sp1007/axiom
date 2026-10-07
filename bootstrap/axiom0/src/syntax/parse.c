@@ -14,6 +14,14 @@ typedef struct Parser {
     AxDiagSink *sink;
     StrInterner *interner;
     bool mode_on;
+    bool no_struct;
+    bool type_tentative;
+    bool allow_bodiless_fn;
+    int tentative;
+    bool tentative_failed;
+    size_t split_len;
+    size_t split_idx[64];
+    AxToken split_tok[64];
 } Parser;
 
 static inline const AxToken *peek(Parser *p) {
@@ -44,6 +52,10 @@ static inline bool consume(Parser *p, AxTokenKind kind) {
 }
 
 static void report(Parser *p, Span span, AxDiagCode code, const char *msg) {
+    if (p->tentative > 0) {
+        p->tentative_failed = true;
+        return;
+    }
     AxDiagnostic diag = {0};
     diag.code = code;
     diag.severity = AX_DIAG_ERROR;
@@ -70,6 +82,7 @@ static void *alloc_node(Parser *p, size_t size) {
 // Forward decls
 static AxAstExpr *parse_expr(Parser *p);
 static AxAstExpr *parse_expr_prec(Parser *p, int min_prec);
+static AxAstExpr *parse_header_expr(Parser *p);
 static AxAstType *parse_type(Parser *p);
 static AxAstPat *parse_pattern(Parser *p);
 static AxAstPat *parse_pat_no_or(Parser *p);
@@ -182,6 +195,30 @@ static AxAstBinOp token_to_binop(AxTokenKind k) {
     }
 }
 
+static void split_gt(Parser *p, AxTokenKind rest) {
+    if (p->tentative > 0) {
+        if (p->split_len >= sizeof(p->split_idx) / sizeof(p->split_idx[0])) {
+            p->tentative_failed = true;
+            return;
+        }
+        p->split_idx[p->split_len] = p->pos;
+        p->split_tok[p->split_len] = *peek(p);
+        p->split_len++;
+    }
+    AxToken *mut_tok = (AxToken *)peek(p);
+    mut_tok->kind = rest;
+    mut_tok->span.start += 1;
+    mut_tok->flags &= ~AX_TOK_FLAG_NL_BEFORE;
+}
+
+static void split_rollback(Parser *p, size_t mark) {
+    while (p->split_len > mark) {
+        p->split_len--;
+        AxToken *mut_tok = (AxToken *)&p->tokens[p->split_idx[p->split_len]];
+        *mut_tok = p->split_tok[p->split_len];
+    }
+}
+
 static AxAstGenericArgs *parse_generic_args(Parser *p) {
     if (!check(p, AX_TOK_LT)) return NULL;
     AxAstGenericArgs *args = NEW_NODE(p, AxAstGenericArgs);
@@ -207,22 +244,65 @@ static AxAstGenericArgs *parse_generic_args(Parser *p) {
     }
     
     if (check(p, AX_TOK_SHR)) {
-        AxToken *mut_tok = (AxToken *)peek(p);
-        mut_tok->kind = AX_TOK_GT;
-        mut_tok->span.start += 1;
+        split_gt(p, AX_TOK_GT);
     } else if (check(p, AX_TOK_GT_EQ)) {
-        AxToken *mut_tok = (AxToken *)peek(p);
-        mut_tok->kind = AX_TOK_EQ;
-        mut_tok->span.start += 1;
+        split_gt(p, AX_TOK_EQ);
     } else if (check(p, AX_TOK_SHR_EQ)) {
-        AxToken *mut_tok = (AxToken *)peek(p);
-        mut_tok->kind = AX_TOK_GT_EQ;
-        mut_tok->span.start += 1;
+        split_gt(p, AX_TOK_GT_EQ);
     } else if (check(p, AX_TOK_GT)) {
         advance(p);
+    } else {
+        report(p, peek(p)->span, AX_PARSE_EXPECTED_TOKEN, "Expected '>'");
     }
     
     p->mode_on = old;
+    return args;
+}
+
+typedef enum {
+    GA_FOLLOW_NONE,        /* cast type (AXS-GRM-054): no follower condition */
+    GA_FOLLOW_CALL_DOT,    /* `(` or `.` */
+    GA_FOLLOW_CALL_DOT_BRACE /* `(`, `.` or `{` (struct literals allowed, AXS-GRM-059) */
+} GenericFollow;
+
+/* AXS-GRM-056: tentative parse of GenericArgs. Commits (returns the args) iff the parse succeeds
+   without any diagnostic and the follower rule holds; otherwise restores the position and the
+   token stream and returns NULL. Reports no diagnostics. */
+static AxAstGenericArgs *try_generic_args(Parser *p, GenericFollow follow) {
+    if (!check(p, AX_TOK_LT)) return NULL;
+    if (p->mode_on && (peek(p)->flags & AX_TOK_FLAG_NL_BEFORE)) return NULL;
+    size_t pos = p->pos;
+    size_t split_mark = p->split_len;
+    bool outer_failed = p->tentative_failed;
+    p->tentative++;
+    p->tentative_failed = false;
+    
+    /* temporarily disable no_struct & type_tentative so parse_generic_args behaves deterministically */
+    bool old_no_struct = p->no_struct;
+    bool old_type_tentative = p->type_tentative;
+    p->no_struct = false;
+    p->type_tentative = false;
+    
+    AxAstGenericArgs *args = parse_generic_args(p);
+    
+    p->no_struct = old_no_struct;
+    p->type_tentative = old_type_tentative;
+    
+    bool ok = !p->tentative_failed;
+    p->tentative--;
+    p->tentative_failed = outer_failed;
+    if (ok && follow != GA_FOLLOW_NONE) {
+        const AxToken *t = peek(p);
+        bool nl = p->mode_on && (t->flags & AX_TOK_FLAG_NL_BEFORE) != 0;
+        ok = (t->kind == AX_TOK_LPAREN && !nl) || t->kind == AX_TOK_DOT ||
+             (follow == GA_FOLLOW_CALL_DOT_BRACE && t->kind == AX_TOK_LBRACE && !nl);
+    }
+    if (!ok) {
+        split_rollback(p, split_mark);
+        p->pos = pos;
+        return NULL;
+    }
+    if (p->tentative == 0) p->split_len = 0; /* committed outside any tentative parse */
     return args;
 }
 
@@ -251,7 +331,8 @@ static AxAstType *parse_type(Parser *p) {
             advance(p);
             
             if (check(p, AX_TOK_LT)) {
-                seg->generic_args = parse_generic_args(p);
+                seg->generic_args = p->type_tentative ? try_generic_args(p, GA_FOLLOW_NONE)
+                                                      : parse_generic_args(p);
             }
             
             if (tail) tail->next = seg;
@@ -524,7 +605,7 @@ static AxAstExpr *parse_primary(Parser *p) {
         expr->kind = AX_EXPR_UNARY;
         expr->unary.op = (tok->kind == AX_TOK_MINUS) ? AX_UNOP_NEG : (tok->kind == AX_TOK_BANG ? AX_UNOP_NOT : (tok->kind == AX_TOK_TILDE ? AX_UNOP_BITNOT : AX_UNOP_DEREF));
         advance(p);
-        expr->unary.expr = parse_expr_prec(p, 13);
+        expr->unary.expr = parse_expr_prec(p, 2);
         return expr;
     } else if (tok->kind == AX_TOK_INT || tok->kind == AX_TOK_FLOAT || tok->kind == AX_TOK_STR ||
         tok->kind == AX_TOK_BYTE_STR || tok->kind == AX_TOK_CHAR || tok->kind == AX_TOK_KW_TRUE ||
@@ -548,33 +629,40 @@ static AxAstExpr *parse_primary(Parser *p) {
     } else if (tok->kind == AX_TOK_IDENT || tok->kind == AX_TOK_KW_SELF_TYPE) {
         // PathExpr or StructLit
         size_t initial_pos = p->pos;
-        AxAstTypePathSegment *head = NULL, *tail = NULL;
-        while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
-            AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
-            seg->span = peek(p)->span;
-            seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
-            advance(p);
-            
-            // tentative generic args
-            if (check(p, AX_TOK_LT)) {
-                size_t old_pos = p->pos;
-                AxAstGenericArgs *args = parse_generic_args(p);
-                // check commit rule
-                if (check(p, AX_TOK_LPAREN) || (check(p, AX_TOK_DOT) && !(peek(p)->flags & AX_TOK_FLAG_NL_BEFORE)) || (check(p, AX_TOK_LBRACE) && !(peek(p)->flags & AX_TOK_FLAG_NL_BEFORE))) {
-                    seg->generic_args = args;
-                } else {
-                    p->pos = old_pos; // backtrack
-                    seg->generic_args = NULL;
-                }
+        bool is_struct = false;
+        if (!p->no_struct) {
+            /* AXS-GRM-058 lookahead: a chain of names (with optional generic args) followed by
+               `{`. Done as a silent tentative scan; position and tokens are restored after. */
+            size_t split_mark = p->split_len;
+            bool outer_failed = p->tentative_failed;
+            p->tentative++;
+            while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+                advance(p);
+                try_generic_args(p, GA_FOLLOW_CALL_DOT_BRACE);
+                if (consume(p, AX_TOK_DOT)) continue;
+                break;
             }
-            if (tail) tail->next = seg;
-            else head = seg;
-            tail = seg;
-            if (consume(p, AX_TOK_DOT)) continue;
-            break;
+            is_struct = check(p, AX_TOK_LBRACE) && !(p->mode_on && (peek(p)->flags & AX_TOK_FLAG_NL_BEFORE));
+            p->tentative--;
+            p->tentative_failed = outer_failed;
+            split_rollback(p, split_mark);
+            p->pos = initial_pos;
         }
-        
-        if (check(p, AX_TOK_LBRACE) && !(peek(p)->flags & AX_TOK_FLAG_NL_BEFORE)) {
+
+        if (is_struct) {
+            AxAstTypePathSegment *head = NULL, *tail = NULL;
+            while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+                AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
+                seg->span = peek(p)->span;
+                seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
+                advance(p);
+                seg->generic_args = try_generic_args(p, GA_FOLLOW_CALL_DOT_BRACE);
+                if (tail) tail->next = seg;
+                else head = seg;
+                tail = seg;
+                if (consume(p, AX_TOK_DOT)) continue;
+                break;
+            }
             expr->kind = AX_EXPR_STRUCT;
             expr->struct_lit.segments = head;
             advance(p); // {
@@ -596,25 +684,15 @@ static AxAstExpr *parse_primary(Parser *p) {
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
             return expr;
         } else {
-            // Not a struct lit! Backtrack and only parse ONE segment, so that
-            // dotted chains like a.b.c are parsed by parse_expr_prec as ExprPostfix!
-            p->pos = initial_pos;
-            
+            // Not a struct lit: parse only ONE segment, so that dotted chains like a.b.c are
+            // parsed by parse_expr_prec as ExprPostfix.
             AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
             seg->span = peek(p)->span;
             seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
             advance(p);
-            
-            if (check(p, AX_TOK_LT)) {
-                size_t old_pos = p->pos;
-                AxAstGenericArgs *args = parse_generic_args(p);
-                if (check(p, AX_TOK_LPAREN) || (check(p, AX_TOK_DOT) && !(peek(p)->flags & AX_TOK_FLAG_NL_BEFORE)) || (check(p, AX_TOK_LBRACE) && !(peek(p)->flags & AX_TOK_FLAG_NL_BEFORE))) {
-                    seg->generic_args = args;
-                } else {
-                    p->pos = old_pos; // backtrack
-                    seg->generic_args = NULL;
-                }
-            }
+            /* `{` cannot follow here: with struct literals allowed it was taken above, and in a
+               header it is not a follower (AXS-GRM-059). */
+            seg->generic_args = try_generic_args(p, GA_FOLLOW_CALL_DOT);
             seg->next = NULL;
             expr->kind = AX_EXPR_PATH;
             expr->path.segments = seg;
@@ -622,7 +700,9 @@ static AxAstExpr *parse_primary(Parser *p) {
         }
     } else if (consume(p, AX_TOK_LPAREN)) {
         bool old = p->mode_on;
+        bool old_no_struct = p->no_struct;
         p->mode_on = false;
+        p->no_struct = false;
         if (consume(p, AX_TOK_RPAREN)) {
             expr->kind = AX_EXPR_PAREN; // we use paren with empty for unit? actually AST doesn't have tuple expr. 
             // Wait, ast.h says ParenExpr has paren.expr. How to represent ()?
@@ -644,10 +724,13 @@ static AxAstExpr *parse_primary(Parser *p) {
             expect(p, AX_TOK_RPAREN, AX_PARSE_UNCLOSED_DELIMITER, "Expected ')'");
         }
         p->mode_on = old;
+        p->no_struct = old_no_struct;
         return expr;
     } else if (consume(p, AX_TOK_LBRACKET)) {
         bool old = p->mode_on;
+        bool old_no_struct = p->no_struct;
         p->mode_on = false;
+        p->no_struct = false;
         expr->kind = AX_EXPR_ARRAY;
         if (consume(p, AX_TOK_RBRACKET)) {
             expr->array.elems = NULL;
@@ -672,6 +755,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             expect(p, AX_TOK_RBRACKET, AX_PARSE_UNCLOSED_DELIMITER, "Expected ']'");
         }
         p->mode_on = old;
+        p->no_struct = old_no_struct;
         return expr;
     } else if (check(p, AX_TOK_LBRACE)) {
         expr->kind = AX_EXPR_BLOCK;
@@ -683,7 +767,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             expr->if_expr.let_pat = parse_pattern(p);
             expect(p, AX_TOK_EQ, AX_PARSE_EXPECTED_TOKEN, "Expected '='");
         }
-        expr->if_expr.cond = parse_expr_prec(p, 0); // parse cond
+        expr->if_expr.cond = parse_header_expr(p); // parse cond
         expr->if_expr.block = *parse_block(p);
         if (consume(p, AX_TOK_KW_ELSE)) {
             if (check(p, AX_TOK_KW_IF)) {
@@ -699,7 +783,7 @@ static AxAstExpr *parse_primary(Parser *p) {
         return expr;
     } else if (consume(p, AX_TOK_KW_MATCH)) {
         expr->kind = AX_EXPR_MATCH;
-        expr->match.expr = parse_expr_prec(p, 0);
+        expr->match.expr = parse_header_expr(p);
         expect(p, AX_TOK_LBRACE, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
         AxAstMatchArm **curr = &expr->match.arms;
         while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
@@ -739,7 +823,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             expr->while_expr.let_pat = parse_pattern(p);
             expect(p, AX_TOK_EQ, AX_PARSE_EXPECTED_TOKEN, "Expected '='");
         }
-        expr->while_expr.cond = parse_expr_prec(p, 0);
+        expr->while_expr.cond = parse_header_expr(p);
         expr->while_expr.block = *parse_block(p);
         return expr;
     } else if (check(p, AX_TOK_KW_FOR) || (check(p, AX_TOK_LABEL) && peek_nth(p, 1)->kind == AX_TOK_COLON && peek_nth(p, 2)->kind == AX_TOK_KW_FOR)) {
@@ -752,7 +836,7 @@ static AxAstExpr *parse_primary(Parser *p) {
         advance(p); // for
         expr->for_expr.pat = parse_pattern(p);
         expect(p, AX_TOK_KW_IN, AX_PARSE_EXPECTED_TOKEN, "Expected 'in'");
-        expr->for_expr.iter = parse_expr_prec(p, 0);
+        expr->for_expr.iter = parse_header_expr(p);
         expr->for_expr.block = *parse_block(p);
         return expr;
     } else if (consume(p, AX_TOK_KW_UNSAFE)) {
@@ -841,11 +925,14 @@ static AxAstExpr *parse_primary(Parser *p) {
 
 static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
     AxAstExpr *left = parse_primary(p);
+    bool left_is_cmp = false; /* `left` is a level-10 comparison built by this loop */
 
     while (true) {
         const AxToken *tok = peek(p);
         int prec = get_infix_prec(tok->kind);
         if (prec == 0 || prec > min_prec) break;
+        bool was_cmp = left_is_cmp;
+        left_is_cmp = false;
 
         if (p->mode_on && (tok->flags & AX_TOK_FLAG_NL_BEFORE)) {
             if (tok->kind != AX_TOK_DOT) {
@@ -982,7 +1069,12 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             cast->span = left->span;
             cast->kind = AX_EXPR_CAST;
             cast->cast.expr = left;
+            
+            bool old_tt = p->type_tentative;
+            p->type_tentative = true;
             cast->cast.type = parse_type(p);
+            p->type_tentative = old_tt;
+            
             left = cast;
             continue;
         }
@@ -1006,13 +1098,21 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             bin->kind = AX_EXPR_BINARY;
             bin->binary.left = left;
             bin->binary.op = token_to_binop(tok->kind);
-            int next_prec = prec;
-            if (prec == 10 || prec == 13) {
-                next_prec = prec - 1; // non-associative fallback
+            if (prec == 10) {
+                /* AXS-GRM-051: comparisons are non-associative. `left` is already a comparison
+                   only when it was built by this loop at level 10 (a parenthesised comparison
+                   is an ExprParen). Recover by parsing on, left-associatively. */
+                if (was_cmp) {
+                    report(p, tok->span, AX_PARSE_CHAINED_COMPARISON,
+                           "comparison operators cannot be chained; use parentheses or `&&`");
+                }
             }
-            bin->binary.right = parse_expr_prec(p, next_prec);
+            /* AXS-GRM-050: every binary level is left-associative (or non-associative): the
+               right operand only takes operators that bind strictly tighter. */
+            bin->binary.right = parse_expr_prec(p, prec - 1);
         }
         
+        left_is_cmp = (bin->kind == AX_EXPR_BINARY && prec == 10);
         left = bin;
     }
 
@@ -1021,6 +1121,16 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
 
 static AxAstExpr *parse_expr(Parser *p) {
     return parse_expr_prec(p, 14);
+}
+
+/* Cond of if/while, scrutinee of match, iterable of for: a full expression in which a `{` after
+   a path starts the construct's block (AXS-GRM-059). */
+static AxAstExpr *parse_header_expr(Parser *p) {
+    bool old_no_struct = p->no_struct;
+    p->no_struct = true;
+    AxAstExpr *e = parse_expr(p);
+    p->no_struct = old_no_struct;
+    return e;
 }
 
 static AxAstBlock *parse_block(Parser *p) {
@@ -1383,6 +1493,9 @@ static AxAstItem *parse_item(Parser *p) {
             item->fn.body = block;
         } else {
             item->fn.body = NULL;
+            if (!p->allow_bodiless_fn) {
+                report(p, peek(p)->span, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
+            }
             sync_to_term(p);
         }
     } else if (consume(p, AX_TOK_KW_STRUCT)) {
@@ -1490,11 +1603,14 @@ static AxAstItem *parse_item(Parser *p) {
         }
         item->trait.where_clause = parse_where_clause(p);
         if (consume(p, AX_TOK_LBRACE)) {
+            bool old_bodiless = p->allow_bodiless_fn;
+            p->allow_bodiless_fn = true;
             AxAstItem **curr = &item->trait.members;
             while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
                 *curr = parse_item(p); // recursive call! It works since traits have fns and types inside
                 curr = &(*curr)->next;
             }
+            p->allow_bodiless_fn = old_bodiless;
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
         } else {
             sync_to_term(p);
@@ -1552,11 +1668,14 @@ static AxAstItem *parse_item(Parser *p) {
         expect(p, AX_TOK_STR, AX_PARSE_EXPECTED_TOKEN, "Expected string literal for ABI");
         expect(p, AX_TOK_LBRACE, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
         
+        bool old_bodiless = p->allow_bodiless_fn;
+        p->allow_bodiless_fn = true;
         AxAstItem **curr = &item->extern_block.members;
         while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
             *curr = parse_item(p);
             curr = &(*curr)->next;
         }
+        p->allow_bodiless_fn = old_bodiless;
         expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
     } else {
         report(p, item->span, AX_PARSE_EXPECTED_ITEM, "Expected item");
@@ -1568,7 +1687,14 @@ static AxAstItem *parse_item(Parser *p) {
 }
 
 AxParseResult ax_parse(AxArena *arena, const AxToken *tokens, size_t token_count, AxDiagSink *sink, StrInterner *interner) {
-    Parser p = {arena, tokens, token_count, 0, sink, interner, true};
+    Parser p = {0};
+    p.arena = arena;
+    p.tokens = tokens;
+    p.count = token_count;
+    p.pos = 0;
+    p.sink = sink;
+    p.interner = interner;
+    p.mode_on = true;
     AxParseResult res = {0};
     
     AxAstItem **curr_item = &res.ast.items;

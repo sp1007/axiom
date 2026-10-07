@@ -8,14 +8,15 @@ model: sonnet
 gate_model: sonnet
 depends: [T013, T015b]
 priority: 11
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/syntax/parse.c, tests/parse, tests/hir/control.ax, tests/hir/control.hir, tests/mir/build/control_flow.ax]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md]
 covers: [REQ-GRM-001]
 unblocks: 2
-started: 2026-10-07 10:01:33
+started: 2026-10-07 10:30:22
+finished: 2026-10-07 10:56:26
 ---
 # T118 — Fix parser crash on missing function body
 
@@ -39,3 +40,5 @@ Fix a parser bug where a missing function body sets `item->fn.body = NULL` witho
 - 2026-10-07 10:01:33 started (attempt 1) T118-impl
 - 2026-10-07 10:28:38 block: Catch-22: must xfail tests to pass suite, but tests are outside paths
 - 2026-10-07 10:29:23 unblocked (cycle 2) 
+- 2026-10-07 10:30:22 started (attempt 1) T118-impl
+- 2026-10-07 10:56:26 accepted by QA -> done
