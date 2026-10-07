@@ -10,10 +10,12 @@ depends: [T116]
 priority: 12
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/driver/cmd_run.c]
+paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/driver/cmd_run.c, tests/conformance/vs0]
 locks: [bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/diag/codes/DRIVER.def]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-EXP-021]
+started: 2026-10-07 20:54:37
+unblocks: 1
 ---
 # T117 — VS0 fix: interpreter width-exact arithmetic, bitwise/shift/unary, panic stderr, verified MIR
 
@@ -48,7 +50,7 @@ bugs I1–I5 of `_workspaces/reports/T022-report.md`.
 - [ ] Report `_workspaces/reports/T117-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- MIR builder (T116), parser (T114), typeck (T115). Do not edit `tests/conformance/vs0`.
+- MIR builder (T116), parser (T114), typeck (T115).
 - Casts/intrinsics (MS-P5), floats.
 
 ## Notes
@@ -56,3 +58,6 @@ bugs I1–I5 of `_workspaces/reports/T022-report.md`.
   checks agree with the MIR asserts (the oracle double-checks, it must not disagree).
 
 ## Log
+- 2026-10-07 20:54:37 started (attempt 1) T117-impl
+- 2026-10-07 21:10:45 block: XPASS on tests/conformance/vs0 but not in paths to remove xfail
+- 2026-10-07 21:11:20 unblocked (cycle 1) 
