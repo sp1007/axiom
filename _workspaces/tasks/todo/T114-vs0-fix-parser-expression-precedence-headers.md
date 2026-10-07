@@ -6,7 +6,7 @@ owner: axiom-frontend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T013, T015b]
+depends: [T013, T015b, T118]
 priority: 11
 status: todo
 attempts: 0
@@ -14,8 +14,8 @@ paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, tests/hir, tes
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, spec/decisions/ADR-0010-grammar-forms-v0-1.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-GRM-001, REQ-GRM-002]
-started: 2026-10-07 08:37:12
-unblocks: 1
+started: 2026-10-07 09:26:49
+unblocks: 2
 ---
 # T114 — VS0 fix: parser expression precedence, associativity and control-flow headers
 
@@ -64,3 +64,6 @@ the parser. Fix task created by the T022 unblock (ADR-0016); bugs P1–P5 of
 - 2026-10-07 08:37:12 started (attempt 1) T114-impl
 - 2026-10-07 09:18:51 block: needs tests/mir in paths to fix tests/mir/build/control_flow.mir regression
 - 2026-10-07 09:19:46 unblocked (cycle 1) 
+- 2026-10-07 09:26:49 started (attempt 1) T114-impl
+- 2026-10-07 09:59:21 block: QA failed 3 times: fuzz smoke timeout on fn n()
+- 2026-10-07 10:00:35 unblocked (cycle 2) 
