@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T021]
 priority: 11
-status: todo
-attempts: 0
+status: blocked
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
 locks: [bootstrap/axiom0/src/interp/interp.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/verify/verify.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md, spec/decisions/ADR-0017-checked-arithmetic-mir.md]
 covers: [REQ-EXP-021]
-started: 2026-10-07 08:37:13
+started: 2026-10-07 10:01:32
 unblocks: 1
 ---
 # T116 — VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
@@ -58,3 +58,5 @@ M1–M3 of `_workspaces/reports/T022-report.md`.
 - 2026-10-07 08:37:13 started (attempt 1) T116-impl
 - 2026-10-07 09:22:27 block: Missing CheckedBinaryOp in MIR, and no clear way to represent checked arithmetic without tuple support in the interpreter.
 - 2026-10-07 09:25:56 unblocked (cycle 1) 
+- 2026-10-07 10:01:32 started (attempt 1) T116-impl
+- 2026-10-07 10:19:20 block: Interferes with T118
