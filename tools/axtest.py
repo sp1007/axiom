@@ -897,7 +897,7 @@ class Runner:
         for afile, sev, code, line in actual:
             found = None
             for i, (efile, esev, ecode, eline) in enumerate(unmatched_expected):
-                if esev == sev and ecode == code and eline == line and \
+                if esev == sev and ecode == code and (eline is None or eline == line) and \
                         (efile is None or (afile and (afile.replace("\\", "/") == efile
                                                       or afile.replace("\\", "/").endswith("/" + efile)))):
                     found = i

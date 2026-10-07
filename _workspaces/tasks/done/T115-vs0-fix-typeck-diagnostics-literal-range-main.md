@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T021]
 priority: 11
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/types, tests/typeck, tests/ui/typeck, bootstrap/axiom0/src/driver/cmd_check.c, tests/driver]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-TYP-124]
+started: 2026-10-07 08:37:12
+finished: 2026-10-07 09:04:06
 ---
 # T115 — VS0 fix: typeck diagnostics, literal range, float rejection, main signature in check
 
@@ -57,3 +59,7 @@ each, so the VS0 gate (T022) no longer fails in typeck/driver. Fix task created 
   reopen. `pipeline.c` is shared: hold it only through `locks:`.
 
 ## Log
+- 2026-10-06 23:44:39 started (attempt 1) T115-impl
+- 2026-10-07 07:50:23 requeue: quota 429 (infrastructure failure: attempt refunded)
+- 2026-10-07 08:37:12 started (attempt 1) T115-impl
+- 2026-10-07 09:04:06 accepted by QA -> done

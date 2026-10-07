@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T021]
 priority: 11
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
 locks: [bootstrap/axiom0/src/interp/interp.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-EXP-021]
+started: 2026-10-07 08:37:13
+agent: T116-impl
 ---
 # T116 — VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
 
@@ -53,3 +55,6 @@ M1–M3 of `_workspaces/reports/T022-report.md`.
   covers the terminator dispatch.
 
 ## Log
+- 2026-10-06 23:44:40 started (attempt 1) T116-impl
+- 2026-10-07 07:50:23 requeue: quota 429 (infrastructure failure: attempt refunded)
+- 2026-10-07 08:37:13 started (attempt 1) T116-impl

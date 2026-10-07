@@ -188,21 +188,10 @@ static void stage_run(AxDriverState *st) {
     TypeId main_ty_id = ret_ty_ptr ? *ret_ty_ptr : st->thir.interner.t_error;
     const AxType *main_ty = ax_type_get(&st->thir.interner, main_ty_id);
     
-    if (!main_ty || main_ty->kind != AX_TY_FN || main_ty->fn.param_count != 0 || main_ty->fn.is_unsafe) {
-        report_error(&st->sink, AX_TYPE_MAIN_SIGNATURE);
-        return;
-    }
-    
-    if (strstr(st->main_file, "tests/driver/test.ax")) {
-        report_error(&st->sink, AX_DRIVER_STAGE_NOT_AVAILABLE);
-        return;
-    }
-    
-    TypeId ret = main_ty->fn.ret_type;
-    if (ret.v != 0 && ret.v != st->thir.interner.t_unit.v && ret.v != st->thir.interner.t_never.v && 
-        ret.v != st->thir.interner.t_i32.v && ret.v != st->thir.interner.t_u32.v) {
-        report_error(&st->sink, AX_TYPE_MAIN_SIGNATURE);
-        return;
+    /* AXS-SEM-080: the signature is a type rule checked by typeck (reported by `check` as well);
+     * reaching here with a non-fn type would be an internal error. */
+    if (!main_ty || main_ty->kind != AX_TY_FN) {
+        AX_ICE("driver: main has no fn type after a successful typeck");
     }
     
     int step_limit = atoi(ax_opt_step_limit);
