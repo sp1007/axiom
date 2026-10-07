@@ -39,7 +39,7 @@ static bool match_str(MirParser *p, const char *s) {
 #define expect_str(p, s) expect_str_impl(p, s)
 static void expect_str_impl(MirParser *p, const char *s) {
     if (!match_str(p, s)) {
-        AX_ICE("MIR parse error: expected '%s'", s);
+        AX_ICE("MIR parse error: expected '%s' at '%s'", s, p->text + p->pos);
     }
 }
 
@@ -182,10 +182,10 @@ static AxMirBinOp parse_binop_symbol(MirParser *p) {
     if (match_str(p, "!=")) return AX_MIR_BINOP_NE;
     if (match_str(p, "<=")) return AX_MIR_BINOP_LE;
     if (match_str(p, ">=")) return AX_MIR_BINOP_GE;
-    if (match_str(p, "<")) return AX_MIR_BINOP_LT;
-    if (match_str(p, ">")) return AX_MIR_BINOP_GT;
     if (match_str(p, "<<")) return AX_MIR_BINOP_SHL;
     if (match_str(p, ">>")) return AX_MIR_BINOP_SHR;
+    if (match_str(p, "<")) return AX_MIR_BINOP_LT;
+    if (match_str(p, ">")) return AX_MIR_BINOP_GT;
     if (match_str(p, "^")) return AX_MIR_BINOP_BIT_XOR;
     if (match_str(p, "&")) return AX_MIR_BINOP_BIT_AND;
     if (match_str(p, "|")) return AX_MIR_BINOP_BIT_OR;
@@ -509,17 +509,20 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
                     // `print_place(io, &term->call.destination); fprintf(io->out, " = "); print_operand(io, &term->call.func); fprintf(io->out, "(");`
                     // Wait! Since operand parsing might consume `(` ? No, operand doesn't consume `(`.
                     size_t op_saved = p.pos;
-                    AxMirOperand func = parse_operand(&p);
-                    (void)func;
-                    if (match_str(&p, "(")) {
+                    bool is_call = false;
+                    for (size_t i = p.pos; i < p.len && p.text[i] != ';' && p.text[i] != '}'; i++) {
+                        if (p.text[i] == '-' && i + 1 < p.len && p.text[i+1] == '>') {
+                            is_call = true;
+                            break;
+                        }
+                    }
+                    if (is_call) {
                         p.pos = op_saved;
                         bbs[bb_count].terminator = parse_terminator(&p, &place);
                         break;
                     } else {
                         p.pos = saved;
-                        
                         AxMirStmt tmp = parse_stmt(&p); stmts[stmt_count++] = tmp;
-                        
                     }
                 }
             }
