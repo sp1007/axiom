@@ -24,8 +24,13 @@ const AxOption ax_opts_pipeline[] = {
     {NULL, 0, NULL, NULL}
 };
 
+const char *ax_opt_emit = NULL;
+const char *ax_opt_stack_reserve = "1048576";
+
 const AxOption ax_opts_build[] = {
     {"-o", AX_OPT_STRING, &ax_opt_build_o, "output file"},
+    {"--emit", AX_OPT_STRING, &ax_opt_emit, "emit type (obj)"},
+    {"--stack-reserve", AX_OPT_STRING, &ax_opt_stack_reserve, "stack reserve size"},
     {NULL, 0, NULL, NULL}
 };
 
@@ -62,19 +67,32 @@ int ax_options_parse(const AxIo *io, int argc, char **argv, const AxOption *cons
         }
         if (!dash_dash && argv[i][0] == '-') {
             bool found = false;
+            const char *arg = argv[i];
+            const char *eq = strchr(arg, '=');
+            size_t name_len = eq ? (size_t)(eq - arg) : strlen(arg);
+
             for (const AxOption *const *t = tables; *t != NULL; ++t) {
                 for (const AxOption *o = *t; o->name != NULL; ++o) {
-                    if (strcmp(argv[i], o->name) == 0) {
+                    if (strncmp(arg, o->name, name_len) == 0 && strlen(o->name) == name_len) {
                         found = true;
                         if (o->type == AX_OPT_BOOL) {
-                            *(bool *)o->dest = true;
-                        } else if (o->type == AX_OPT_STRING) {
-                            if (i + 1 >= argc) {
-                                fprintf(io->err, "axiom0: option '%s' requires an argument\n", o->name);
+                            if (eq) {
+                                fprintf(io->err, "axiom0: option '%s' does not take an argument\n", o->name);
                                 free(pos);
                                 return AX_EXIT_USAGE;
                             }
-                            *(const char **)o->dest = argv[++i];
+                            *(bool *)o->dest = true;
+                        } else if (o->type == AX_OPT_STRING) {
+                            if (eq) {
+                                *(const char **)o->dest = eq + 1;
+                            } else {
+                                if (i + 1 >= argc) {
+                                    fprintf(io->err, "axiom0: option '%s' requires an argument\n", o->name);
+                                    free(pos);
+                                    return AX_EXIT_USAGE;
+                                }
+                                *(const char **)o->dest = argv[++i];
+                            }
                         }
                         break;
                     }
@@ -196,6 +214,11 @@ static void stage_run(AxDriverState *st) {
     
     TypeId *ret_ty_ptr = AxItemTypeMap_get(&st->thir.item_types, main_fn);
     TypeId main_ty_id = ret_ty_ptr ? *ret_ty_ptr : st->thir.interner.t_error;
+    
+    if (main_ty_id.v == 0) {
+        AX_ICE("driver: main has unresolved type (0) after typeck");
+    }
+    
     const AxType *main_ty = ax_type_get(&st->thir.interner, main_ty_id);
     
     /* AXS-SEM-080: the signature is a type rule checked by typeck (reported by `check` as well);
@@ -212,6 +235,8 @@ static void stage_run(AxDriverState *st) {
     st->exit_code = rc;
 }
 
+extern void ax_stage_build_native(AxDriverState *st);
+
 const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_SOURCE, "source", NULL, stage_source},
     {AX_STAGE_LEX, "lex", "lex", stage_lex},
@@ -220,7 +245,8 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_HIR, "hir", "hir", stage_hir},
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
     {AX_STAGE_INTERP, "run", "interp", stage_run},
-    {AX_STAGE_LIMIT, NULL, NULL, NULL}
+    {AX_STAGE_LIMIT, "build", "native", ax_stage_build_native},
+    {AX_STAGE_LIMIT + 1, NULL, NULL, NULL}
 };
 
 void ax_pipeline_init(AxDriverState *st, const AxIo *io) {
@@ -293,9 +319,6 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
     if (stop_after == AX_STAGE_LIMIT) {
         if (ax_opt_interp) {
             stop_after = AX_STAGE_INTERP;
-        } else {
-            report_error(&st->sink, AX_DRIVER_STAGE_NOT_AVAILABLE);
-            stop_after = AX_STAGE_TYPECK;
         }
     }
 
@@ -317,6 +340,10 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
     for (int i = 0; i <= target_idx; ++i) {
         if (st->failed) break;
         
+        if (ax_pipeline_stages[i].id == AX_STAGE_INTERP && stop_after != AX_STAGE_INTERP) {
+            continue;
+        }
+
         clock_t start = 0;
         if (ax_opt_time_passes) start = clock();
         

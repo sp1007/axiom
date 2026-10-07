@@ -63,18 +63,47 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0));
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                     break;
+                case AX_LIR_INST_DIV:
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(0 /*RAX*/));
+                    emit(mi, mbb, AX_X64_MI_SAR, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(63));
+                    emit(mi, mbb, AX_X64_MI_IDIV, ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0), (AxX64Op){0});
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    break;
+                case AX_LIR_INST_REM:
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(0 /*RAX*/));
+                    emit(mi, mbb, AX_X64_MI_SAR, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(63));
+                    emit(mi, mbb, AX_X64_MI_IDIV, ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0), (AxX64Op){0});
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(2 /*RDX*/));
+                    break;
+                case AX_LIR_INST_NEG:
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->unary.operand.v, 0));
+                    // we can't use AX_X64_MI_NEG yet because it's not in mi.h, wait!
+                    // I will just use SUB from 0:
+                    // mov rax, 0; sub rax, [operand]
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1), ax_x64_op_imm(0));
+                    emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(1), ax_x64_op_reg(0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1));
+                    break;
+                case AX_LIR_INST_BITNOT:
+                    // NOT x == -1 - x, so we use SUB which is fully supported
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1), ax_x64_op_imm(-1));
+                    emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(1), ax_x64_op_frame(slot_offset + inst->unary.operand.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1));
+                    break;
                 case AX_LIR_INST_ABI_ARG:
                     if (inst->abi_arg.loc_kind == 0) { // REG
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(inst->abi_arg.loc_reg_or_offset));
                     } else if (inst->abi_arg.loc_kind == 1) { // STACK
-                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 5 /*RBP*/, .index = 0, .scale = 0, .disp = inst->abi_arg.loc_reg_or_offset } };
+                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 5 /*RBP*/, .index = AX_REG_NONE, .scale = 1, .disp = inst->abi_arg.loc_reg_or_offset, .is_rip = false } };
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), mem);
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                     }
                     break;
                 case AX_LIR_INST_ABI_RESULT:
                     if (inst->abi_result.loc_kind == 0) { // REG
-                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(inst->abi_result.loc_reg_or_offset), ax_x64_op_frame(slot_offset + inst->abi_result.index, 0));
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(inst->abi_result.loc_reg_or_offset));
                     }
                     break;
                 case AX_LIR_INST_STACK_ADDR:
@@ -84,7 +113,7 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                 case AX_LIR_INST_LOAD:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->load.ptr.v, 0));
                     {
-                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = 0, .scale = 0, .disp = 0 } };
+                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = 0, .is_rip = false } };
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), mem);
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1));
                     }
@@ -93,7 +122,7 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->store.ptr.v, 0));
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->store.val.v, 0));
                     {
-                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = 0, .scale = 0, .disp = 0 } };
+                        AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = 0, .is_rip = false } };
                         emit(mi, mbb, AX_X64_MI_MOV, mem, ax_x64_op_reg(1));
                     }
                     break;
@@ -103,9 +132,16 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
         }
         
         switch (lbb->terminator.kind) {
-            case AX_LIR_TERM_RETURN:
+            case AX_LIR_TERM_RETURN: {
+                const AxType *ret_ty = ax_type_get(interner, lir->slots[0].ty);
+                if (ret_ty && ret_ty->kind == AX_TY_UNIT) {
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(0));
+                } else {
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(0, 0));
+                }
                 emit(mi, mbb, AX_X64_MI_RET, (AxX64Op){0}, (AxX64Op){0});
                 break;
+            }
             default:
                 break;
         }

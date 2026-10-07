@@ -372,6 +372,9 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     for (const AxHirItem *it = hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_FN) {
             TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
+            if (TypeId_is_none(ret_ty)) {
+                ret_ty = thir.interner.t_unit;
+            }
 
             AxType ft;
             memset(&ft, 0, sizeof(ft));

@@ -32,14 +32,26 @@ static void print_op(FILE *out, const AxX64Op *op) {
             fprintf(out, "%lld", (long long)op->imm);
             break;
         case AX_X64_OP_MEM:
-            // Assuming simple [base + offset] for now
-            fprintf(out, "[%s", reg_names[op->mem.base]);
-            if (op->mem.index != 0) { // Assume 0 means no index? wait, 4 is RSP which is usually no index in SIB
-                fprintf(out, " + %s*%d", reg_names[op->mem.index], 1 << op->mem.scale);
+            if (op->mem.is_rip) {
+                fprintf(out, "[rip");
+            } else if (op->mem.base != AX_REG_NONE) {
+                fprintf(out, "[%s", reg_names[op->mem.base]);
+            } else {
+                fprintf(out, "[");
             }
-            if (op->mem.disp != 0) {
-                if (op->mem.disp > 0) fprintf(out, " + %d", op->mem.disp);
-                else fprintf(out, " - %d", -op->mem.disp);
+            
+            if (op->mem.index != AX_REG_NONE) {
+                if (op->mem.base != AX_REG_NONE || op->mem.is_rip) fprintf(out, " + ");
+                fprintf(out, "%s*%d", reg_names[op->mem.index], 1 << op->mem.scale);
+            }
+            if (op->mem.disp != 0 || (op->mem.base == AX_REG_NONE && op->mem.index == AX_REG_NONE && !op->mem.is_rip)) {
+                if (op->mem.disp > 0 && (op->mem.base != AX_REG_NONE || op->mem.index != AX_REG_NONE || op->mem.is_rip)) {
+                    fprintf(out, " + %d", op->mem.disp);
+                } else if (op->mem.disp < 0 && (op->mem.base != AX_REG_NONE || op->mem.index != AX_REG_NONE || op->mem.is_rip)) {
+                    fprintf(out, " - %d", -op->mem.disp);
+                } else {
+                    fprintf(out, "%d", op->mem.disp);
+                }
             }
             fprintf(out, "]");
             break;

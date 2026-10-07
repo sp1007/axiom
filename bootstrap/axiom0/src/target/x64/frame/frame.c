@@ -14,18 +14,18 @@ AxX64FrameLayout ax_x64_frame_lower(AxX64MIBody *body, const AxLirBody *lir, Typ
     for (size_t i = 0; i < lir->slot_count; i++) {
         uint32_t size = ax_type_size(lir->slots[i].ty, interner);
         uint32_t align = ax_type_align(lir->slots[i].ty, interner);
-        if (align == 0) align = 1;
-        current_offset = (current_offset + align - 1) & ~(align - 1);
-        current_offset += size;
+        if (size < 8) size = 8;
+        if (align < 8) align = 8;
+        current_offset = (current_offset + size + align - 1) & ~(align - 1);
         layout.slot_offsets[i] = -current_offset;
     }
     
     for (size_t i = 0; i < lir->vreg_count; i++) {
         uint32_t size = ax_type_size(lir->vregs[i].ty, interner);
         uint32_t align = ax_type_align(lir->vregs[i].ty, interner);
-        if (align == 0) align = 1;
-        current_offset = (current_offset + align - 1) & ~(align - 1);
-        current_offset += size;
+        if (size < 8) size = 8;
+        if (align < 8) align = 8;
+        current_offset = (current_offset + size + align - 1) & ~(align - 1);
         layout.slot_offsets[lir->slot_count + i] = -current_offset;
     }
     
