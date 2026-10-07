@@ -95,8 +95,12 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
     if (expr->kind == AX_HIR_EXPR_LITERAL) {
         op.kind = AX_MIR_OP_CONST;
         op.constant.ty = get_expr_type(b, expr);
-        if (expr->literal.kind == AX_TOK_INT || expr->literal.kind == AX_TOK_CHAR || expr->literal.kind == AX_TOK_KW_TRUE || expr->literal.kind == AX_TOK_KW_FALSE) {
+        if (expr->literal.kind == AX_TOK_INT || expr->literal.kind == AX_TOK_CHAR) {
             op.constant.val = expr->literal.val.int_val.value;
+        } else if (expr->literal.kind == AX_TOK_KW_TRUE) {
+            op.constant.val = 1;
+        } else if (expr->literal.kind == AX_TOK_KW_FALSE) {
+            op.constant.val = 0;
         } else {
             op.constant.val = 0;
         }

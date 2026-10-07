@@ -157,7 +157,13 @@ static AxMirOperand parse_operand(MirParser *p) {
         op.place = parse_place(p);
     } else if (match_ident(p, "const")) {
         op.kind = AX_MIR_OP_CONST;
-        op.constant.val = parse_int(p);
+        if (match_ident(p, "true")) {
+            op.constant.val = 1;
+        } else if (match_ident(p, "false")) {
+            op.constant.val = 0;
+        } else {
+            op.constant.val = parse_int(p);
+        }
         op.constant.ty.v = 0;
     } else {
         op.kind = AX_MIR_OP_COPY;

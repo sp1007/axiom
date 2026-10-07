@@ -141,6 +141,14 @@ static void stage_hir(AxDriverState *st) {
 
 #include "mir/build/build.h"
 #include "verify/verify.h"
+#include "kernel/hashmap.h"
+
+typedef AxMirBody *AxMirBodyPtr;
+AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
+
+static AxArena g_mir_arena;
+static AxMirMap g_mir_map;
+static bool g_mir_initialized = false;
 
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
@@ -148,19 +156,21 @@ static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     
     // Build and verify MIR
-    AxArena temp_arena;
-    ax_arena_init(&temp_arena, 0);
+    if (!g_mir_initialized) {
+        ax_arena_init(&g_mir_arena, 0);
+        AxMirMap_init(&g_mir_map);
+        g_mir_initialized = true;
+    }
     
     for (AxHirItem *it = st->hir.items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_FN) {
-            AxMirBody *body = ax_mir_build(it, &st->thir, &temp_arena);
+            AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
             if (body) {
                 ax_verify_mir(body, &st->thir, &st->sink, it);
+                AxMirMap_insert(&g_mir_map, it, body);
             }
         }
     }
-    
-    ax_arena_destroy(&temp_arena);
 }
 
 #include "../interp/interp.h"
@@ -197,7 +207,8 @@ static void stage_run(AxDriverState *st) {
     int step_limit = atoi(ax_opt_step_limit);
     int call_depth_limit = atoi(ax_opt_max_call_depth);
     
-    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit);
+    extern const char *ax_run_panic_msg;
+    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit, g_mir_initialized ? &g_mir_map : NULL, &ax_run_panic_msg);
     st->exit_code = rc;
 }
 
@@ -226,6 +237,11 @@ void ax_pipeline_init(AxDriverState *st, const AxIo *io) {
 }
 
 void ax_pipeline_free(AxDriverState *st) {
+    if (g_mir_initialized) {
+        AxMirMap_free(&g_mir_map);
+        ax_arena_destroy(&g_mir_arena);
+        g_mir_initialized = false;
+    }
     ax_thir_free(&st->thir);
     ax_arena_destroy(&st->hir_arena);
     ax_resolve_map_free(&st->resolve_map);

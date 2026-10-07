@@ -2,6 +2,11 @@
 #include "mir/build/build.h"
 #include <stdlib.h>
 #include <string.h>
+#include "kernel/hashmap.h"
+#include "kernel/base.h"
+
+typedef AxMirBody *AxMirBodyPtr;
+AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
 
 // Interpreter state
 typedef struct {
@@ -14,6 +19,7 @@ typedef struct {
     AxDiagSink *sink;
     int step_limit;
     int call_depth_limit;
+    void *mir_map;
     
     int steps;
     int call_depth;
@@ -21,6 +27,7 @@ typedef struct {
     AxArena arena;
     bool failed;
     int exit_code;
+    const char **out_panic_msg;
 } InterpCtx;
 
 typedef struct {
@@ -60,6 +67,9 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
 
 static uint64_t eval_operand(CallFrame *frame, const AxMirOperand *op) {
     if (op->kind == AX_MIR_OP_CONST) {
+        if (op->constant.ty.v != 0 && frame->body) {
+            // How do we know it's bool? We don't easily have interner here, but we can print all constants!
+        }
         return op->constant.val;
     } else {
         AxMirLocalId loc = op->place.local;
@@ -73,11 +83,9 @@ static void write_place(CallFrame *frame, const AxMirPlace *place, uint64_t val)
 }
 
 static void panic_interp(InterpCtx *ctx, const char *msg) {
-    AxDiagnostic d = {0};
-    d.code = AX_DRIVER_INTERP_PANIC;
-    d.severity = AX_DIAG_ERROR;
-    d.message = msg;
-    ax_diag_sink_report(ctx->sink, &d);
+    if (ctx->out_panic_msg) {
+        *ctx->out_panic_msg = msg;
+    }
     ctx->failed = true;
     ctx->exit_code = 101;
 }
@@ -108,17 +116,11 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
         return;
     }
     
-    AxArena local_arena;
-    ax_arena_init(&local_arena, 0);
-    AxMirBody *body = ax_mir_build(func, ctx->thir, &local_arena);
-    
-    if (!body) {
-        ax_arena_destroy(&local_arena);
-        ctx->failed = true;
-        ctx->exit_code = 1;
-        ctx->call_depth--;
-        return;
+    AxMirBodyPtr *cached_body_ptr = AxMirMap_get((AxMirMap*)ctx->mir_map, func);
+    if (!cached_body_ptr) {
+        AX_ICE("interpreter: function has no verified MIR body");
     }
+    AxMirBody *body = *cached_body_ptr;
     
     CallFrame frame;
     frame.body = body;
@@ -196,6 +198,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                                 case AX_TY_U32: is_signed = false; bits = 32; break;
                                 case AX_TY_U64: is_signed = false; bits = 64; break;
                                 case AX_TY_USIZE: is_signed = false; bits = 64; break;
+                                case AX_TY_BOOL: is_signed = false; bits = 1; break;
                                 default: break;
                             }
                         }
@@ -205,10 +208,24 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                         if (is_signed) {
                             int64_t a = 0;
                             int64_t b = 0;
-                            if (bits == 8) { a = (int8_t)lhs; b = (int8_t)rhs; }
-                            else if (bits == 16) { a = (int16_t)lhs; b = (int16_t)rhs; }
-                            else if (bits == 32) { a = (int32_t)lhs; b = (int32_t)rhs; }
-                            else { a = (int64_t)lhs; b = (int64_t)rhs; }
+                            
+                            if (stmt->assign.rvalue.binary_op.lhs.kind == AX_MIR_OP_CONST) {
+                                a = (int64_t)stmt->assign.rvalue.binary_op.lhs.constant.val;
+                            } else {
+                                if (bits == 8) a = (int8_t)lhs;
+                                else if (bits == 16) a = (int16_t)lhs;
+                                else if (bits == 32) a = (int32_t)lhs;
+                                else a = (int64_t)lhs;
+                            }
+                            
+                            if (stmt->assign.rvalue.binary_op.rhs.kind == AX_MIR_OP_CONST) {
+                                b = (int64_t)stmt->assign.rvalue.binary_op.rhs.constant.val;
+                            } else {
+                                if (bits == 8) b = (int8_t)rhs;
+                                else if (bits == 16) b = (int16_t)rhs;
+                                else if (bits == 32) b = (int32_t)rhs;
+                                else b = (int64_t)rhs;
+                            }
                     
                             int64_t r = 0;
                             switch (op) {
@@ -219,13 +236,23 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                                     if (b == 0) { panic_interp(ctx, "division by zero"); }
                                     else if (b == -1 && bits == 64 && a == (-9223372036854775807LL - 1)) { overflow = true; r = a; }
                                     else if (b == -1 && bits < 64 && a == -((int64_t)1 << (bits - 1))) { overflow = true; r = a; }
-                                    else { r = a / b; }
+                                    else {
+                                        uint64_t ua = a < 0 ? (uint64_t)(-(a + 1)) + 1 : (uint64_t)a;
+                                        uint64_t ub = b < 0 ? (uint64_t)(-(b + 1)) + 1 : (uint64_t)b;
+                                        r = (int64_t)(ua / ub);
+                                        if ((a < 0) != (b < 0) && r != 0) r = -r;
+                                    }
                                     break;
                                 case AX_MIR_BINOP_REM:
                                     if (b == 0) { panic_interp(ctx, "division by zero"); }
                                     else if (b == -1 && bits == 64 && a == (-9223372036854775807LL - 1)) { overflow = true; r = 0; }
                                     else if (b == -1 && bits < 64 && a == -((int64_t)1 << (bits - 1))) { overflow = true; r = 0; }
-                                    else { r = a % b; }
+                                    else {
+                                        uint64_t ua = a < 0 ? (uint64_t)(-(a + 1)) + 1 : (uint64_t)a;
+                                        uint64_t ub = b < 0 ? (uint64_t)(-(b + 1)) + 1 : (uint64_t)b;
+                                        r = (int64_t)(ua % ub);
+                                        if (a < 0 && r != 0) r = -r;
+                                    }
                                     break;
                                 case AX_MIR_BINOP_EQ: r = (a == b); break;
                                 case AX_MIR_BINOP_NE: r = (a != b); break;
@@ -234,17 +261,24 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                                 case AX_MIR_BINOP_GT: r = (a > b); break;
                                 case AX_MIR_BINOP_GE: r = (a >= b); break;
                                 case AX_MIR_BINOP_SHL:
-                                    if (b < 0 || b >= bits) overflow = true;
-                                    r = (int64_t)((uint64_t)a << (b & 63));
+                                    if (b < 0 || b >= bits) { overflow = true; break; }
+                                    r = (int64_t)((uint64_t)a << b);
                                     break;
                                 case AX_MIR_BINOP_SHR:
-                                    if (b < 0 || b >= bits) overflow = true;
-                                    r = a >> (b & 63);
+                                    if (b < 0 || b >= bits) { overflow = true; break; }
+                                    if (a < 0) {
+                                        uint64_t ua = (uint64_t)a;
+                                        ua >>= b;
+                                        uint64_t sign_ext = ~(((uint64_t)1 << (64 - b)) - 1);
+                                        r = (int64_t)(ua | sign_ext);
+                                    } else {
+                                        r = a >> b;
+                                    }
                                     break;
                                 case AX_MIR_BINOP_BIT_AND: r = a & b; break;
                                 case AX_MIR_BINOP_BIT_OR: r = a | b; break;
                                 case AX_MIR_BINOP_BIT_XOR: r = a ^ b; break;
-                                default: break;
+                                default: AX_ICE("interpreter: unknown binary operator"); break;
                             }
                     
                             if (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL) {
@@ -289,17 +323,17 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                                 case AX_MIR_BINOP_GT: r = (a > b); break;
                                 case AX_MIR_BINOP_GE: r = (a >= b); break;
                                 case AX_MIR_BINOP_SHL:
-                                    if (b >= (uint64_t)bits) overflow = true;
-                                    r = a << (b & 63);
+                                    if (b >= (uint64_t)bits) { overflow = true; break; }
+                                    r = a << b;
                                     break;
                                 case AX_MIR_BINOP_SHR:
-                                    if (b >= (uint64_t)bits) overflow = true;
-                                    r = a >> (b & 63);
+                                    if (b >= (uint64_t)bits) { overflow = true; break; }
+                                    r = a >> b;
                                     break;
                                 case AX_MIR_BINOP_BIT_AND: r = a & b; break;
                                 case AX_MIR_BINOP_BIT_OR: r = a | b; break;
                                 case AX_MIR_BINOP_BIT_XOR: r = a ^ b; break;
-                                default: break;
+                                default: AX_ICE("interpreter: unknown binary operator"); break;
                             }
                     
                             if (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL) {
@@ -320,8 +354,12 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                         if (ctx->failed) break;
 
                         if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_BINARY_OP) {
-                            if (overflow && (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL || op == AX_MIR_BINOP_DIV || op == AX_MIR_BINOP_REM || op == AX_MIR_BINOP_SHL || op == AX_MIR_BINOP_SHR)) {
-                                panic_interp(ctx, "arithmetic overflow");
+                            if (overflow) {
+                                if (op == AX_MIR_BINOP_SHL || op == AX_MIR_BINOP_SHR) {
+                                    panic_interp(ctx, "shift amount out of range");
+                                } else if (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL || op == AX_MIR_BINOP_DIV || op == AX_MIR_BINOP_REM) {
+                                    panic_interp(ctx, "arithmetic overflow");
+                                }
                             }
                             val = res;
                         } else {
@@ -331,9 +369,73 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                     }
                     case AX_MIR_RVALUE_UNARY_OP: {
                         uint64_t op_val = eval_operand(&frame, &stmt->assign.rvalue.unary_op.operand);
-                        if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NOT) val = (op_val == 0);
-                        else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_BITNOT) val = ~op_val;
-                        else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NEG) val = (uint64_t)(-(int64_t)op_val);
+                        
+                        TypeId ty = {0};
+                        if (stmt->assign.rvalue.unary_op.operand.kind == AX_MIR_OP_CONST) {
+                            ty = stmt->assign.rvalue.unary_op.operand.constant.ty;
+                        } else {
+                            AxMirLocalId loc = stmt->assign.rvalue.unary_op.operand.place.local;
+                            ty = frame.body->locals[loc.v].ty;
+                        }
+                        const AxType *t = NULL;
+                        if (ty.v != 0) {
+                            t = ax_type_get(&ctx->thir->interner, ty);
+                        }
+                        bool is_signed = true;
+                        int bits = 32;
+                        if (t) {
+                            switch (t->kind) {
+                                case AX_TY_I8: is_signed = true; bits = 8; break;
+                                case AX_TY_I16: is_signed = true; bits = 16; break;
+                                case AX_TY_I32: is_signed = true; bits = 32; break;
+                                case AX_TY_I64: is_signed = true; bits = 64; break;
+                                case AX_TY_ISIZE: is_signed = true; bits = 64; break;
+                                case AX_TY_U8: is_signed = false; bits = 8; break;
+                                case AX_TY_U16: is_signed = false; bits = 16; break;
+                                case AX_TY_U32: is_signed = false; bits = 32; break;
+                                case AX_TY_U64: is_signed = false; bits = 64; break;
+                                case AX_TY_USIZE: is_signed = false; bits = 64; break;
+                                case AX_TY_BOOL: is_signed = false; bits = 1; break;
+                                default: break;
+                            }
+                        }
+                        
+                        if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NOT) {
+                            val = (op_val == 0);
+                        } else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_BITNOT) {
+                            val = ~op_val;
+                            if (bits < 64) val &= ((uint64_t)1 << bits) - 1;
+                        } else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NEG) {
+                            if (is_signed) {
+                                int64_t s_val = 0;
+                                if (stmt->assign.rvalue.unary_op.operand.kind == AX_MIR_OP_CONST) {
+                                    s_val = (int64_t)op_val;
+                                } else {
+                                    if (bits == 8) s_val = (int8_t)op_val;
+                                    else if (bits == 16) s_val = (int16_t)op_val;
+                                    else if (bits == 32) s_val = (int32_t)op_val;
+                                    else s_val = (int64_t)op_val;
+                                }
+                                
+                                int64_t min_val = bits == 64 ? (-9223372036854775807LL - 1) : -((int64_t)1 << (bits - 1));
+                                if (s_val == min_val) {
+                                    panic_interp(ctx, "arithmetic overflow");
+                                } else {
+                                    int64_t r = -s_val;
+                                    val = (uint64_t)r;
+                                    if (bits < 64) val &= ((uint64_t)1 << bits) - 1;
+                                }
+                            } else {
+                                uint64_t mask = bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+                                if ((op_val & mask) != 0) {
+                                    panic_interp(ctx, "arithmetic overflow");
+                                } else {
+                                    val = 0;
+                                }
+                            }
+                        } else {
+                            AX_ICE("interpreter: unknown unary operator");
+                        }
                         break;
                     }
                     default:
@@ -403,11 +505,10 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
     
     *out_ret = frame.locals[0].v;
     free(frame.locals);
-    ax_arena_destroy(&local_arena);
     ctx->call_depth--;
 }
 
-int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit) {
+int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg) {
     InterpCtx ctx = {0};
     ctx.main_fn = main_fn;
     ctx.thir = thir;
@@ -418,6 +519,8 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.sink = sink;
     ctx.step_limit = step_limit;
     ctx.call_depth_limit = call_depth_limit;
+    ctx.mir_map = mir_map;
+    ctx.out_panic_msg = out_panic_msg;
     ax_arena_init(&ctx.arena, 0);
     
     uint64_t ret = 0;

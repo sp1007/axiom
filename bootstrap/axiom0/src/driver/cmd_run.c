@@ -1,6 +1,7 @@
 #include "driver/driver.h"
 #include <stdlib.h>
 
+const char *ax_run_panic_msg = NULL;
 static int run_run(const AxIo *io, int argc, char **argv) {
     char **pos_argv = NULL;
     int pos_argc = 0;
@@ -20,8 +21,19 @@ static int run_run(const AxIo *io, int argc, char **argv) {
     ax_pipeline_init(&st, io);
     st.main_file = pos_argv[1];
     
+    extern const char *ax_run_panic_msg;
+    ax_run_panic_msg = NULL;
+    
     // We don't have execution yet, so this will fail with AX_DRIVER_STAGE_NOT_AVAILABLE
     int rc = ax_pipeline_run(&st, AX_STAGE_LIMIT /* dummy for run/interp */);
+    
+    if (rc == 101 && ax_run_panic_msg) {
+        fprintf(io->err, "panic: %s\n", ax_run_panic_msg);
+        fflush(io->err);
+        ax_pipeline_free(&st);
+        free(pos_argv);
+        exit(101);
+    }
     
     ax_pipeline_free(&st);
     free(pos_argv);
