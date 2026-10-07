@@ -14,8 +14,9 @@ paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
 locks: [bootstrap/axiom0/src/interp/interp.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/verify/verify.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md, spec/decisions/ADR-0017-checked-arithmetic-mir.md]
 covers: [REQ-EXP-021]
-started: 2026-10-07 10:01:32
-unblocks: 2
+started: 2026-10-07 18:30:34
+unblocks: 1
+unblock_failures: 0
 ---
 # T116 â€” VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
 
@@ -30,10 +31,10 @@ M1â€“M3 of `_workspaces/reports/T022-report.md`.
 - M2: Rename `AX_MIR_RVALUE_CHECKED_BINARY_OP` in `mir.h` to `AX_MIR_RVALUE_OVERFLOWS_BINARY_OP` (returning bool, ADR-0017). Checked operations (`+ - *`, `/`, `%`, shifts, unary `-`) lower to computing the overflow bool (via explicit comparisons or `OverflowsBinaryOp`), an `AX_MIR_TERM_ASSERT` asserting it is false, and then the standard `BinaryOp`.
   Update the printer, text parser, verifier and interpreter to support `OverflowsBinaryOp` and the `Assert` terminator.
 - M3: `build_expr_into` gets an exhaustive final branch â€” an unhandled HIR/THIR kind is an ICE
-  (internal-error diagnostic), never silently dropped.
+  (internal-error diagnostic), never silently dropped. Use `AX_ICE(...)` (from `kernel/base.h`) to report it; never use `fprintf` or `exit` directly (archcheck violation `INV-LAYER-006`).
 - Minimal interpreter support (lock on `interp/interp.c`): execute `AX_MIR_TERM_ASSERT`
   (continue on success, take the existing panic path on failure) so the full suite stays green.
-  Nothing else in the interpreter â€” width/bitwise/panic-format work is T117.
+  Implement `OverflowsBinaryOp` correctly in `interp.c` using the same `__builtin_*_overflow` checks used for `BinaryOp` â€” do not just return 0. Do NOT edit `base.c` as it is out of locks. For printing panics in `interp.c`, do NOT use `fprintf` (violates `INV-LAYER-006`); instead, just set `ctx->failed = true` and `ctx->exit_code = 101` or use `ax_diag_sink_report` if available.
 - Regenerate `tests/mir/build/first_mir.mir` (FP-03 with the checked Add + assert edge) and add
   MIR goldens for `~`, division and shift asserts; the verifier accepts every new golden.
 
@@ -62,3 +63,10 @@ M1â€“M3 of `_workspaces/reports/T022-report.md`.
 - 2026-10-07 10:19:20 block: Interferes with T118
 - 2026-10-07 11:05:06 block: QA failed 3 times: path conflict on control_flow files with T114
 - 2026-10-07 11:05:43 unblocked (cycle 2) 
+- 2026-10-07 11:21:07 started (attempt 1) T116-impl
+- 2026-10-07 18:29:40 block: QA failed 3 times: archcheck violation, dummy OverflowsBinaryOp, base.c path violation
+- 2026-10-07 18:29:40 parked: unblock cap reached (unblocks=2, failed unblock agents=0); needs the owner
+- 2026-10-07 18:30:34 unblocked (owner-approved cycle 0) 
+- 2026-10-07 18:30:34 started (attempt 1) 
+- 2026-10-07 18:30:52 block: QA failed 3 times: archcheck violation, dummy OverflowsBinaryOp, base.c path violation
+- 2026-10-07 18:31:51 unblocked (cycle 1) 
