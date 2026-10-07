@@ -11,11 +11,11 @@ priority: 12
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/interp, tests/run/basic, bootstrap/axiom0/src/driver/cmd_run.c, tests/conformance/vs0]
-locks: [bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/diag/codes/DRIVER.def]
+locks: [bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/diag/codes/DRIVER.def, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/build/builder.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-EXP-021]
-started: 2026-10-07 20:54:37
-unblocks: 1
+started: 2026-10-07 21:12:10
+unblocks: 2
 ---
 # T117 — VS0 fix: interpreter width-exact arithmetic, bitwise/shift/unary, panic stderr, verified MIR
 
@@ -61,3 +61,6 @@ bugs I1–I5 of `_workspaces/reports/T022-report.md`.
 - 2026-10-07 20:54:37 started (attempt 1) T117-impl
 - 2026-10-07 21:10:45 block: XPASS on tests/conformance/vs0 but not in paths to remove xfail
 - 2026-10-07 21:11:20 unblocked (cycle 1) 
+- 2026-10-07 21:12:10 started (attempt 1) T117-impl
+- 2026-10-07 21:39:49 block: boolean literal bug in builder/parse; need path locks for builder.c/parse.c to fix it
+- 2026-10-07 21:41:19 unblocked (cycle 2) 
