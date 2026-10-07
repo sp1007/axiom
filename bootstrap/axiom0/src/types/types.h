@@ -24,8 +24,12 @@ typedef enum AxTypeKind {
     AX_TY_U64,
     AX_TY_USIZE,
     AX_TY_FN,
-    AX_TY_INT_VAR,
+    AX_TY_INT_VAR
 } AxTypeKind;
+
+#define AX_TY_PTR (AX_TY_INT_VAR + 1)
+#define AX_TY_ARRAY (AX_TY_INT_VAR + 2)
+#define AX_TY_TUPLE (AX_TY_INT_VAR + 3)
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -40,6 +44,18 @@ typedef struct AxType {
         struct {
             uint32_t var_id;
         } int_var;
+        struct {
+            TypeId pointee;
+            bool is_mut;
+        } ptr;
+        struct {
+            TypeId elem;
+            uint64_t len;
+        } array;
+        struct {
+            TypeId *fields;
+            size_t field_count;
+        } tuple;
     };
 } AxType;
 
@@ -57,6 +73,17 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         }
     } else if (k->kind == AX_TY_INT_VAR) {
         h = ax_hash_combine(h, ax_hash_u32(k->int_var.var_id));
+    } else if (k->kind == AX_TY_PTR) {
+        h = ax_hash_combine(h, ax_hash_u32(k->ptr.pointee.v));
+        h = ax_hash_combine(h, ax_hash_u32(k->ptr.is_mut));
+    } else if (k->kind == AX_TY_ARRAY) {
+        h = ax_hash_combine(h, ax_hash_u32(k->array.elem.v));
+        h = ax_hash_combine(h, ax_hash_u64(k->array.len));
+    } else if (k->kind == AX_TY_TUPLE) {
+        h = ax_hash_combine(h, ax_hash_u64((uint64_t)k->tuple.field_count));
+        for (size_t i = 0; i < k->tuple.field_count; i++) {
+            h = ax_hash_combine(h, ax_hash_u32(k->tuple.fields[i].v));
+        }
     }
     return h;
 }
@@ -74,6 +101,16 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
         return true;
     } else if (a->kind == AX_TY_INT_VAR) {
         return a->int_var.var_id == b->int_var.var_id;
+    } else if (a->kind == AX_TY_PTR) {
+        return a->ptr.pointee.v == b->ptr.pointee.v && a->ptr.is_mut == b->ptr.is_mut;
+    } else if (a->kind == AX_TY_ARRAY) {
+        return a->array.elem.v == b->array.elem.v && a->array.len == b->array.len;
+    } else if (a->kind == AX_TY_TUPLE) {
+        if (a->tuple.field_count != b->tuple.field_count) return false;
+        for (size_t i = 0; i < a->tuple.field_count; i++) {
+            if (a->tuple.fields[i].v != b->tuple.fields[i].v) return false;
+        }
+        return true;
     }
     return true;
 }
@@ -104,6 +141,64 @@ const AxType *ax_type_get(const TypeInterner *in, TypeId id);
 bool ax_type_is_int(TypeId id, const TypeInterner *in);
 bool ax_type_is_signed(TypeId id, const TypeInterner *in);
 bool ax_type_is_unsigned(TypeId id, const TypeInterner *in);
+
+static inline uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
+    if (id.v == in->t_unit.v || id.v == in->t_never.v) return 1;
+    if (id.v == in->t_bool.v || id.v == in->t_i8.v || id.v == in->t_u8.v) return 1;
+    if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;
+    if (id.v == in->t_i32.v || id.v == in->t_u32.v || id.v == in->t_char.v) return 4;
+    if (id.v == in->t_i64.v || id.v == in->t_u64.v || id.v == in->t_isize.v || id.v == in->t_usize.v) return 8;
+
+    const AxType *ty = ax_type_get(in, id);
+    if (!ty) return 1;
+    switch ((int)ty->kind) {
+        case AX_TY_PTR:
+        case AX_TY_FN:
+            return 8;
+        case AX_TY_ARRAY:
+            return ax_type_align(ty->array.elem, in);
+        case AX_TY_TUPLE: {
+            uint32_t align = 1;
+            for (size_t i = 0; i < ty->tuple.field_count; i++) {
+                uint32_t fa = ax_type_align(ty->tuple.fields[i], in);
+                if (fa > align) align = fa;
+            }
+            return align;
+        }
+        default: return 1;
+    }
+}
+
+static inline uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
+    if (id.v == in->t_unit.v || id.v == in->t_never.v) return 0;
+    if (id.v == in->t_bool.v || id.v == in->t_i8.v || id.v == in->t_u8.v) return 1;
+    if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;
+    if (id.v == in->t_i32.v || id.v == in->t_u32.v || id.v == in->t_char.v) return 4;
+    if (id.v == in->t_i64.v || id.v == in->t_u64.v || id.v == in->t_isize.v || id.v == in->t_usize.v) return 8;
+
+    const AxType *ty = ax_type_get(in, id);
+    if (!ty) return 0;
+    switch ((int)ty->kind) {
+        case AX_TY_PTR:
+        case AX_TY_FN:
+            return 8;
+        case AX_TY_ARRAY:
+            return ax_type_size(ty->array.elem, in) * ty->array.len;
+        case AX_TY_TUPLE: {
+            uint32_t offset = 0;
+            uint32_t max_align = 1;
+            for (size_t i = 0; i < ty->tuple.field_count; i++) {
+                uint32_t fa = ax_type_align(ty->tuple.fields[i], in);
+                uint32_t fs = ax_type_size(ty->tuple.fields[i], in);
+                if (fa > max_align) max_align = fa;
+                offset = (offset + fa - 1) & ~(fa - 1);
+                offset += fs;
+            }
+            return (offset + max_align - 1) & ~(max_align - 1);
+        }
+        default: return 0;
+    }
+}
 
 // THIR mappings
 #define ax_key_hash_ptr(k) ax_hash_u64((uint64_t)(uintptr_t)*(k))

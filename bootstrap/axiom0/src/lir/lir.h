@@ -66,9 +66,13 @@ typedef struct AxLirInst {
         struct {
             uint32_t index;
             AxLirVRegId val;
+            uint32_t loc_kind;
+            uint32_t loc_reg_or_offset;
         } abi_arg;
         struct {
             uint32_t index;
+            uint32_t loc_kind;
+            uint32_t loc_reg_or_offset;
         } abi_result;
     };
 } AxLirInst;
@@ -118,6 +122,11 @@ typedef struct AxLirVReg {
     TypeId ty;
 } AxLirVReg;
 
+typedef struct AxLirFrameReq {
+    uint32_t max_outgoing_args_bytes;
+    bool requires_16_byte_alignment;
+} AxLirFrameReq;
+
 typedef struct AxLirBody {
     AxArena arena;
     AxLirStackSlot *slots;
@@ -126,6 +135,7 @@ typedef struct AxLirBody {
     size_t vreg_count;
     AxLirBb *bbs;
     size_t bb_count;
+    AxLirFrameReq frame_req;
 } AxLirBody;
 
 AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner);
