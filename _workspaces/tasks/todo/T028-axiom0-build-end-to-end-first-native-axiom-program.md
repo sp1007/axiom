@@ -11,9 +11,11 @@ priority: 45
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/driver/build_native, tests/run/native, bootstrap/axiom0/src/driver/emit_obj.c]
-locks: [bootstrap/axiom0/src/driver/pipeline.c]
+locks: [bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/target/x64/mir/frame.c, bootstrap/axiom0/src/target/x64/isel/isel.c]
 spec: [0152, 0263, 0186]
 covers: [REQ-OWNER-006]
+started: 2026-10-08 00:36:42
+unblocks: 1
 ---
 # T028 — `axiom0 build` end to end: first native Axiom program
 
@@ -41,3 +43,6 @@ covers: [REQ-OWNER-006]
 
 ## Log
 - 2026-10-06 02:24:25 covers += REQ-OWNER-006 (metadata only)
+- 2026-10-08 00:36:42 started (attempt 1) T028-impl
+- 2026-10-08 01:32:10 block: buggy frame.c and isel.c cause memory corruption and SIB pointer bugs; need locks for bootstrap/axiom0/src/target/x64/mir/frame.c and bootstrap/axiom0/src/target/x64/isel/isel.c to fix them properly
+- 2026-10-08 01:32:40 unblocked (cycle 1) 
