@@ -192,6 +192,15 @@ static AxMirRvalue parse_rvalue(MirParser *p) {
         rv.kind = AX_MIR_RVALUE_LEN;
         rv.len = parse_place(p);
         expect_str(p, ")");
+    } else if (match_ident(p, "overflows(")) {
+        rv.kind = AX_MIR_RVALUE_OVERFLOWS_BINARY_OP;
+        AxMirOperand lhs = parse_operand(p);
+        AxMirBinOp op = parse_binop_symbol(p);
+        AxMirOperand rhs = parse_operand(p);
+        expect_str(p, ")");
+        rv.binary_op.op = op;
+        rv.binary_op.lhs = lhs;
+        rv.binary_op.rhs = rhs;
     } else if (match_str(p, "&mut ")) {
         rv.kind = AX_MIR_RVALUE_REF;
         rv.ref.bk = AX_MIR_BORROW_MUT;
@@ -225,6 +234,10 @@ static AxMirRvalue parse_rvalue(MirParser *p) {
     } else if (match_str(p, "!")) {
         rv.kind = AX_MIR_RVALUE_UNARY_OP;
         rv.unary_op.op = AX_MIR_UNOP_NOT;
+        rv.unary_op.operand = parse_operand(p);
+    } else if (match_str(p, "~")) {
+        rv.kind = AX_MIR_RVALUE_UNARY_OP;
+        rv.unary_op.op = AX_MIR_UNOP_BITNOT;
         rv.unary_op.operand = parse_operand(p);
     } else if (match_str(p, "-")) {
         rv.kind = AX_MIR_RVALUE_UNARY_OP;
@@ -337,6 +350,20 @@ static AxMirTerminator parse_terminator(MirParser *p, AxMirPlace *call_dest) {
             term.assert.expected = false;
         } else {
             AX_ICE("Expected true or false in assert");
+        }
+        if (match_str(p, ",")) {
+            skip_ws(p);
+            expect_str(p, "\"");
+            size_t start = p->pos;
+            while (p->pos < p->len && p->text[p->pos] != '"') p->pos++;
+            size_t len = p->pos - start;
+            char *msg = AX_ARENA_NEW_ARRAY(p->arena, char, len + 1);
+            memcpy(msg, p->text + start, len);
+            msg[len] = '\0';
+            term.assert.msg = msg;
+            expect_str(p, "\"");
+        } else {
+            term.assert.msg = NULL;
         }
         expect_str(p, ")");
         expect_str(p, "->");

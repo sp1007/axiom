@@ -156,47 +156,177 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                     case AX_MIR_RVALUE_USE:
                         val = eval_operand(&frame, &stmt->assign.rvalue.use);
                         break;
-                    case AX_MIR_RVALUE_BINARY_OP: {
+                    case AX_MIR_RVALUE_BINARY_OP:
+                    case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
                         uint64_t lhs = eval_operand(&frame, &stmt->assign.rvalue.binary_op.lhs);
                         uint64_t rhs = eval_operand(&frame, &stmt->assign.rvalue.binary_op.rhs);
                         AxMirBinOp op = stmt->assign.rvalue.binary_op.op;
                         
-                        int32_t a = (int32_t)lhs;
-                        int32_t b = (int32_t)rhs;
-                        int32_t res = 0;
-                        switch (op) {
-                            case AX_MIR_BINOP_ADD:
-                                if (__builtin_add_overflow(a, b, &res)) { panic_interp(ctx, "arithmetic overflow"); }
-                                break;
-                            case AX_MIR_BINOP_SUB:
-                                if (__builtin_sub_overflow(a, b, &res)) { panic_interp(ctx, "arithmetic overflow"); }
-                                break;
-                            case AX_MIR_BINOP_MUL:
-                                if (__builtin_mul_overflow(a, b, &res)) { panic_interp(ctx, "arithmetic overflow"); }
-                                break;
-                            case AX_MIR_BINOP_DIV: 
-                                if (b == 0) { panic_interp(ctx, "division by zero"); }
-                                else if (a == (int32_t)0x80000000 && b == -1) { panic_interp(ctx, "arithmetic overflow"); }
-                                else { res = a / b; }
-                                break;
-                            case AX_MIR_BINOP_REM:
-                                if (b == 0) { panic_interp(ctx, "division by zero"); }
-                                else if (a == (int32_t)0x80000000 && b == -1) { panic_interp(ctx, "arithmetic overflow"); }
-                                else { res = a % b; }
-                                break;
-                            case AX_MIR_BINOP_EQ: res = (a == b); break;
-                            case AX_MIR_BINOP_NE: res = (a != b); break;
-                            case AX_MIR_BINOP_LT: res = (a < b); break;
-                            case AX_MIR_BINOP_LE: res = (a <= b); break;
-                            case AX_MIR_BINOP_GT: res = (a > b); break;
-                            case AX_MIR_BINOP_GE: res = (a >= b); break;
-                            default: break;
+                        TypeId ty = {0};
+                        if (stmt->assign.rvalue.binary_op.lhs.kind == AX_MIR_OP_CONST) {
+                            ty = stmt->assign.rvalue.binary_op.lhs.constant.ty;
+                        } else {
+                            AxMirLocalId loc = stmt->assign.rvalue.binary_op.lhs.place.local;
+                            ty = frame.body->locals[loc.v].ty;
                         }
-                        val = (uint64_t)res;
-                        break;
-                    }
-                    case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
-                        val = 0;
+                        if (ty.v == 0) {
+                            if (stmt->assign.rvalue.binary_op.rhs.kind == AX_MIR_OP_CONST) {
+                                ty = stmt->assign.rvalue.binary_op.rhs.constant.ty;
+                            } else {
+                                AxMirLocalId loc = stmt->assign.rvalue.binary_op.rhs.place.local;
+                                ty = frame.body->locals[loc.v].ty;
+                            }
+                        }
+                        const AxType *t = NULL;
+                        if (ty.v != 0) {
+                            t = ax_type_get(&ctx->thir->interner, ty);
+                        }
+                        
+                        bool is_signed = true;
+                        int bits = 32;
+                        if (t) {
+                            switch (t->kind) {
+                                case AX_TY_I8: is_signed = true; bits = 8; break;
+                                case AX_TY_I16: is_signed = true; bits = 16; break;
+                                case AX_TY_I32: is_signed = true; bits = 32; break;
+                                case AX_TY_I64: is_signed = true; bits = 64; break;
+                                case AX_TY_ISIZE: is_signed = true; bits = 64; break;
+                                case AX_TY_U8: is_signed = false; bits = 8; break;
+                                case AX_TY_U16: is_signed = false; bits = 16; break;
+                                case AX_TY_U32: is_signed = false; bits = 32; break;
+                                case AX_TY_U64: is_signed = false; bits = 64; break;
+                                case AX_TY_USIZE: is_signed = false; bits = 64; break;
+                                default: break;
+                            }
+                        }
+                        
+                        uint64_t res = 0;
+                        bool overflow = false;
+                        if (is_signed) {
+                            int64_t a = 0;
+                            int64_t b = 0;
+                            if (bits == 8) { a = (int8_t)lhs; b = (int8_t)rhs; }
+                            else if (bits == 16) { a = (int16_t)lhs; b = (int16_t)rhs; }
+                            else if (bits == 32) { a = (int32_t)lhs; b = (int32_t)rhs; }
+                            else { a = (int64_t)lhs; b = (int64_t)rhs; }
+                    
+                            int64_t r = 0;
+                            switch (op) {
+                                case AX_MIR_BINOP_ADD: overflow = __builtin_add_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_SUB: overflow = __builtin_sub_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_MUL: overflow = __builtin_mul_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_DIV:
+                                    if (b == 0) { panic_interp(ctx, "division by zero"); }
+                                    else if (b == -1 && bits == 64 && a == (-9223372036854775807LL - 1)) { overflow = true; r = a; }
+                                    else if (b == -1 && bits < 64 && a == -((int64_t)1 << (bits - 1))) { overflow = true; r = a; }
+                                    else { r = a / b; }
+                                    break;
+                                case AX_MIR_BINOP_REM:
+                                    if (b == 0) { panic_interp(ctx, "division by zero"); }
+                                    else if (b == -1 && bits == 64 && a == (-9223372036854775807LL - 1)) { overflow = true; r = 0; }
+                                    else if (b == -1 && bits < 64 && a == -((int64_t)1 << (bits - 1))) { overflow = true; r = 0; }
+                                    else { r = a % b; }
+                                    break;
+                                case AX_MIR_BINOP_EQ: r = (a == b); break;
+                                case AX_MIR_BINOP_NE: r = (a != b); break;
+                                case AX_MIR_BINOP_LT: r = (a < b); break;
+                                case AX_MIR_BINOP_LE: r = (a <= b); break;
+                                case AX_MIR_BINOP_GT: r = (a > b); break;
+                                case AX_MIR_BINOP_GE: r = (a >= b); break;
+                                case AX_MIR_BINOP_SHL:
+                                    if (b < 0 || b >= bits) overflow = true;
+                                    r = (int64_t)((uint64_t)a << (b & 63));
+                                    break;
+                                case AX_MIR_BINOP_SHR:
+                                    if (b < 0 || b >= bits) overflow = true;
+                                    r = a >> (b & 63);
+                                    break;
+                                case AX_MIR_BINOP_BIT_AND: r = a & b; break;
+                                case AX_MIR_BINOP_BIT_OR: r = a | b; break;
+                                case AX_MIR_BINOP_BIT_XOR: r = a ^ b; break;
+                                default: break;
+                            }
+                    
+                            if (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL) {
+                                if (bits < 64) {
+                                    int64_t min_val = -((int64_t)1 << (bits - 1));
+                                    int64_t max_val = ((int64_t)1 << (bits - 1)) - 1;
+                                    if (r < min_val || r > max_val) overflow = true;
+                                }
+                            }
+                            
+                            if (bits < 64) {
+                                uint64_t mask = ((uint64_t)1 << bits) - 1;
+                                res = (uint64_t)r & mask;
+                            } else {
+                                res = (uint64_t)r;
+                            }
+                        } else {
+                            uint64_t a = 0;
+                            uint64_t b = 0;
+                            if (bits == 8) { a = (uint8_t)lhs; b = (uint8_t)rhs; }
+                            else if (bits == 16) { a = (uint16_t)lhs; b = (uint16_t)rhs; }
+                            else if (bits == 32) { a = (uint32_t)lhs; b = (uint32_t)rhs; }
+                            else { a = (uint64_t)lhs; b = (uint64_t)rhs; }
+                    
+                            uint64_t r = 0;
+                            switch (op) {
+                                case AX_MIR_BINOP_ADD: overflow = __builtin_add_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_SUB: overflow = __builtin_sub_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_MUL: overflow = __builtin_mul_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_DIV:
+                                    if (b == 0) { panic_interp(ctx, "division by zero"); }
+                                    else { r = a / b; }
+                                    break;
+                                case AX_MIR_BINOP_REM:
+                                    if (b == 0) { panic_interp(ctx, "division by zero"); }
+                                    else { r = a % b; }
+                                    break;
+                                case AX_MIR_BINOP_EQ: r = (a == b); break;
+                                case AX_MIR_BINOP_NE: r = (a != b); break;
+                                case AX_MIR_BINOP_LT: r = (a < b); break;
+                                case AX_MIR_BINOP_LE: r = (a <= b); break;
+                                case AX_MIR_BINOP_GT: r = (a > b); break;
+                                case AX_MIR_BINOP_GE: r = (a >= b); break;
+                                case AX_MIR_BINOP_SHL:
+                                    if (b >= (uint64_t)bits) overflow = true;
+                                    r = a << (b & 63);
+                                    break;
+                                case AX_MIR_BINOP_SHR:
+                                    if (b >= (uint64_t)bits) overflow = true;
+                                    r = a >> (b & 63);
+                                    break;
+                                case AX_MIR_BINOP_BIT_AND: r = a & b; break;
+                                case AX_MIR_BINOP_BIT_OR: r = a | b; break;
+                                case AX_MIR_BINOP_BIT_XOR: r = a ^ b; break;
+                                default: break;
+                            }
+                    
+                            if (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL) {
+                                if (bits < 64) {
+                                    uint64_t max_val = ((uint64_t)1 << bits) - 1;
+                                    if (r > max_val) overflow = true;
+                                }
+                            }
+                            
+                            if (bits < 64) {
+                                uint64_t mask = ((uint64_t)1 << bits) - 1;
+                                res = r & mask;
+                            } else {
+                                res = r;
+                            }
+                        }
+                        
+                        if (ctx->failed) break;
+
+                        if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_BINARY_OP) {
+                            if (overflow && (op == AX_MIR_BINOP_ADD || op == AX_MIR_BINOP_SUB || op == AX_MIR_BINOP_MUL || op == AX_MIR_BINOP_DIV || op == AX_MIR_BINOP_REM || op == AX_MIR_BINOP_SHL || op == AX_MIR_BINOP_SHR)) {
+                                panic_interp(ctx, "arithmetic overflow");
+                            }
+                            val = res;
+                        } else {
+                            val = overflow ? 1 : 0;
+                        }
                         break;
                     }
                     case AX_MIR_RVALUE_UNARY_OP: {
@@ -224,8 +354,11 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
             uint64_t cond = eval_operand(&frame, &term->assert.cond);
             bool expected = term->assert.expected;
             if ((cond != 0) != expected) {
-                ctx->failed = true;
-                ctx->exit_code = 101;
+                if (term->assert.msg) {
+                    panic_interp(ctx, term->assert.msg);
+                } else {
+                    panic_interp(ctx, "assertion failed");
+                }
                 break;
             }
             current_bb = term->assert.target;
