@@ -8,12 +8,13 @@ model: opus
 gate_model: opus
 depends: [T021, T016, T006, T013, T015b, T114, T115, T116, T117]
 priority: 35
-status: todo
-attempts: 0
-paths: [tests/conformance/vs0, tools/ci.sh, tools/ci.ps1, tools/gatecheck.py, tools/tests/gatecheck]
+status: done
+attempts: 1
+paths: [tests/conformance/vs0, tools/ci.sh, tools/ci.ps1, tools/gatecheck.py, tools/tests/gatecheck, tests/hir]
 spec: [0263, 0114, 0017]
-started: 2026-10-06 23:18:07
+started: 2026-10-07 22:00:32
 unblocks: 1
+finished: 2026-10-07 22:11:51
 ---
 # T022 — VS0 gate: subset conformance on the oracle
 
@@ -48,3 +49,5 @@ Prove the whole front half works end-to-end before any native code exists.
 - 2026-10-06 23:18:07 started (attempt 1) T022-impl
 - 2026-10-06 23:39:49 block: VS0 gate: impl bugs outside T022 paths (parser precedence/headers, typeck/driver, MIR builder ~/asserts, interp int32/bitwise/panic) + selfhost-subset.tsv rule (d): T061 not ancestor of T069
 - 2026-10-06 23:43:46 unblocked (cycle 1) 
+- 2026-10-07 22:00:32 started (attempt 1) T022-impl
+- 2026-10-07 22:11:51 accepted by QA -> done

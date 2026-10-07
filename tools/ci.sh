@@ -79,7 +79,8 @@ for cc in $COMPILERS; do
 
     run_checker axtest.py --compiler "$EXE"
     run_checker archcheck.py
-    run_checker gatecheck.py
+    run_checker gatecheck.py --compiler "$EXE"
+    run_checker tests/gatecheck/run_selftests.py
     run_checker fuzz.py --smoke
 done
 

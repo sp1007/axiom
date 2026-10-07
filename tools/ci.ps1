@@ -82,7 +82,8 @@ foreach ($cc in $Compilers) {
 
     Invoke-Checker 'axtest.py' @('--compiler', $Exe)
     Invoke-Checker 'archcheck.py' @()
-    Invoke-Checker 'gatecheck.py' @()
+    Invoke-Checker 'gatecheck.py' @('--compiler', $Exe)
+    Invoke-Checker 'tests/gatecheck/run_selftests.py' @()
     Invoke-Checker 'fuzz.py' @('--smoke')
 }
 
