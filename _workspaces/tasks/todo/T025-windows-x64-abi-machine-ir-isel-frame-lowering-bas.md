@@ -11,7 +11,10 @@ priority: 42
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/abi, bootstrap/axiom0/src/target/x64/mir, bootstrap/axiom0/src/target/x64/isel, tests/mc/isel, bootstrap/axiom0/src/driver/emit_mi.c]
+locks: [bootstrap/axiom0/src/types/types.h, bootstrap/axiom0/src/lir/lir.h]
 spec: [0181, 0189, 0180, 0183, 0251, 0253, 0230, 0231, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-07 23:09:14
+unblocks: 1
 ---
 # T025 — Windows x64 ABI lowering + machine IR + baseline isel
 
@@ -36,3 +39,8 @@ Lower LIR to x86-64 machine IR following the MS x64 ABI with a simple stack-slot
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-07 23:09:14 started (attempt 1) T025-impl
+- 2026-10-07 23:22:56 block: missing aggregate types and layout queries in types.h and missing frame fields in lir.h; need locks
+- 2026-10-07 23:23:47 unblocked (cycle 1) 
