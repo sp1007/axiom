@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T021]
 priority: 11
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
-locks: [bootstrap/axiom0/src/interp/interp.c]
-spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
+locks: [bootstrap/axiom0/src/interp/interp.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/verify/verify.c]
+spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md, spec/decisions/ADR-0017-checked-arithmetic-mir.md]
 covers: [REQ-EXP-021]
 started: 2026-10-07 08:37:13
-agent: T116-impl
+unblocks: 1
 ---
 # T116 — VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
 
@@ -27,10 +27,8 @@ M1–M3 of `_workspaces/reports/T022-report.md`.
 
 ## Scope
 - M1 `builder.c` ~238: unary `~` lowers to bitwise NOT, not NEG.
-- M2: checked `+ - *`, unary `-`, `/` and `%` (zero divisor, MIN / -1) and shifts (amount out of
-  range) lower to a checked operation plus `AX_MIR_TERM_ASSERT` with an edge to the panic path,
-  using the SPEC-03 panic messages (AXS-SEM-071). The data model, printer, text parser and verifier
-  already support the terminator.
+- M2: Rename `AX_MIR_RVALUE_CHECKED_BINARY_OP` in `mir.h` to `AX_MIR_RVALUE_OVERFLOWS_BINARY_OP` (returning bool, ADR-0017). Checked operations (`+ - *`, `/`, `%`, shifts, unary `-`) lower to computing the overflow bool (via explicit comparisons or `OverflowsBinaryOp`), an `AX_MIR_TERM_ASSERT` asserting it is false, and then the standard `BinaryOp`.
+  Update the printer, text parser, verifier and interpreter to support `OverflowsBinaryOp` and the `Assert` terminator.
 - M3: `build_expr_into` gets an exhaustive final branch — an unhandled HIR/THIR kind is an ICE
   (internal-error diagnostic), never silently dropped.
 - Minimal interpreter support (lock on `interp/interp.c`): execute `AX_MIR_TERM_ASSERT`
@@ -58,3 +56,5 @@ M1–M3 of `_workspaces/reports/T022-report.md`.
 - 2026-10-06 23:44:40 started (attempt 1) T116-impl
 - 2026-10-07 07:50:23 requeue: quota 429 (infrastructure failure: attempt refunded)
 - 2026-10-07 08:37:13 started (attempt 1) T116-impl
+- 2026-10-07 09:22:27 block: Missing CheckedBinaryOp in MIR, and no clear way to represent checked arithmetic without tuple support in the interpreter.
+- 2026-10-07 09:25:56 unblocked (cycle 1) 
