@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T013, T015b]
 priority: 11
-status: doing
-attempts: 1
-paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, tests/hir, tests/resolve]
+status: todo
+attempts: 0
+paths: [bootstrap/axiom0/src/syntax, tests/parse, tests/ui/parse, tests/hir, tests/resolve, tests/mir/build/control_flow.ax, tests/mir/build/control_flow.mir]
 locks: [bootstrap/axiom0/src/diag/codes/PARSE.def]
 spec: [spec/SPEC-02-grammar.md, spec/decisions/ADR-0010-grammar-forms-v0-1.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md]
 covers: [REQ-GRM-001, REQ-GRM-002]
 started: 2026-10-07 08:37:12
-agent: T114-impl
+unblocks: 1
 ---
 # T114 — VS0 fix: parser expression precedence, associativity and control-flow headers
 
@@ -37,6 +37,7 @@ the parser. Fix task created by the T022 unblock (ADR-0016); bugs P1–P5 of
   restriction in headers, SPEC-02 / ADR-0010); parenthesised struct literals stay allowed.
 - Update AST/HIR golden files whose tree changes because of the fix (each change explained in the
   report); add one parse golden per bug under `tests/parse/` pinning the corrected tree.
+- Delete `tests/mir/build/control_flow.ax` and `tests/mir/build/control_flow.mir` as they are being deleted by parallel task T116 anyway (avoids needing a golden update).
 
 ## Acceptance
 - [ ] New parse goldens for P1–P5 pass; changed goldens listed and justified in the report.
@@ -61,3 +62,5 @@ the parser. Fix task created by the T022 unblock (ADR-0016); bugs P1–P5 of
 - 2026-10-06 23:44:39 started (attempt 1) T114-impl
 - 2026-10-07 07:50:22 requeue: quota 429 (infrastructure failure: attempt refunded)
 - 2026-10-07 08:37:12 started (attempt 1) T114-impl
+- 2026-10-07 09:18:51 block: needs tests/mir in paths to fix tests/mir/build/control_flow.mir regression
+- 2026-10-07 09:19:46 unblocked (cycle 1) 
