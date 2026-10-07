@@ -73,7 +73,8 @@ typedef enum AxMirBinOp {
 
 typedef enum AxMirUnOp {
     AX_MIR_UNOP_NOT,
-    AX_MIR_UNOP_NEG
+    AX_MIR_UNOP_NEG,
+    AX_MIR_UNOP_BITNOT
 } AxMirUnOp;
 
 typedef enum AxMirOperandKind {
@@ -111,6 +112,7 @@ typedef enum AxMirRvalueKind {
     AX_MIR_RVALUE_REF,        
     AX_MIR_RVALUE_LEN,
     AX_MIR_RVALUE_CAST,
+    AX_MIR_RVALUE_OVERFLOWS_BINARY_OP,
     AX_MIR_RVALUE_BINARY_OP,
     AX_MIR_RVALUE_UNARY_OP,
     AX_MIR_RVALUE_DISCRIMINANT,
@@ -224,6 +226,7 @@ typedef struct AxMirTerminator {
         struct {
             AxMirOperand cond;
             bool expected;
+            const char *msg;
             AxMirBbId target;
             AxMirBbId unwind;
         } assert;

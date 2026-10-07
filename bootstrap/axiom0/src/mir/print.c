@@ -78,6 +78,7 @@ static void print_rvalue(FILE *out, const AxMirRvalue *rv) {
             print_operand(out, &rv->cast.op);
             fprintf(out, " as type#%u", rv->cast.ty.v);
             break;
+        case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP:
         case AX_MIR_RVALUE_BINARY_OP: {
             const char *op_str = "?";
             switch (rv->binary_op.op) {
@@ -106,14 +107,17 @@ static void print_rvalue(FILE *out, const AxMirRvalue *rv) {
                 print_operand(out, &rv->binary_op.rhs);
                 fprintf(out, ")");
             } else {
+                if (rv->kind == AX_MIR_RVALUE_OVERFLOWS_BINARY_OP) fprintf(out, "overflows(");
                 print_operand(out, &rv->binary_op.lhs);
                 fprintf(out, " %s ", op_str);
                 print_operand(out, &rv->binary_op.rhs);
+                if (rv->kind == AX_MIR_RVALUE_OVERFLOWS_BINARY_OP) fprintf(out, ")");
             }
             break;
         }
         case AX_MIR_RVALUE_UNARY_OP:
             if (rv->unary_op.op == AX_MIR_UNOP_NOT) fprintf(out, "!");
+            else if (rv->unary_op.op == AX_MIR_UNOP_BITNOT) fprintf(out, "~");
             else fprintf(out, "-");
             print_operand(out, &rv->unary_op.operand);
             break;
@@ -190,7 +194,11 @@ static void print_terminator(FILE *out, const AxMirTerminator *term, int level) 
         case AX_MIR_TERM_ASSERT:
             fprintf(out, "assert(");
             print_operand(out, &term->assert.cond);
-            fprintf(out, " == %s) -> [return: ", term->assert.expected ? "true" : "false");
+            if (term->assert.msg) {
+                fprintf(out, " == %s, \"%s\") -> [return: ", term->assert.expected ? "true" : "false", term->assert.msg);
+            } else {
+                fprintf(out, " == %s) -> [return: ", term->assert.expected ? "true" : "false");
+            }
             print_bb(out, term->assert.target);
             fprintf(out, ", unwind: ");
             print_bb(out, term->assert.unwind);

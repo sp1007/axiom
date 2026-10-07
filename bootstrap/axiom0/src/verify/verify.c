@@ -229,6 +229,7 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                         CHECK_OP(stmt->assign.rvalue.use);
                         break;
                     case AX_MIR_RVALUE_BINARY_OP:
+                    case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP:
                         CHECK_OP(stmt->assign.rvalue.binary_op.lhs);
                         CHECK_OP(stmt->assign.rvalue.binary_op.rhs);
                         break;
@@ -252,7 +253,8 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                         TypeId lhs_ty = get_operand_type(body, &stmt->assign.rvalue.binary_op.lhs);
                         TypeId rhs_ty = get_operand_type(body, &stmt->assign.rvalue.binary_op.rhs);
                         bool is_cmp = (stmt->assign.rvalue.binary_op.op >= AX_MIR_BINOP_EQ && stmt->assign.rvalue.binary_op.op <= AX_MIR_BINOP_GT);
-                        if (lhs_ty.v != 0 && rhs_ty.v != 0 && types_compatible(thir, lhs_ty, rhs_ty)) {
+                        bool is_shift = (stmt->assign.rvalue.binary_op.op == AX_MIR_BINOP_SHL || stmt->assign.rvalue.binary_op.op == AX_MIR_BINOP_SHR);
+                        if (lhs_ty.v != 0 && rhs_ty.v != 0 && (is_shift || types_compatible(thir, lhs_ty, rhs_ty))) {
                             if (is_cmp && thir) src_ty = thir->interner.t_bool;
                             else src_ty = lhs_ty;
                         } else if (lhs_ty.v != 0 && rhs_ty.v != 0 && !types_compatible(thir, lhs_ty, rhs_ty)) {
@@ -262,6 +264,9 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                         }
                         break;
                     }
+                    case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP:
+                        src_ty = thir ? thir->interner.t_bool : (TypeId){0};
+                        break;
                     case AX_MIR_RVALUE_UNARY_OP:
                         src_ty = get_operand_type(body, &stmt->assign.rvalue.unary_op.operand);
                         break;

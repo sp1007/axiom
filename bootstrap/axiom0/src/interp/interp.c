@@ -195,6 +195,17 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                         val = (uint64_t)res;
                         break;
                     }
+                    case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
+                        val = 0;
+                        break;
+                    }
+                    case AX_MIR_RVALUE_UNARY_OP: {
+                        uint64_t op_val = eval_operand(&frame, &stmt->assign.rvalue.unary_op.operand);
+                        if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NOT) val = (op_val == 0);
+                        else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_BITNOT) val = ~op_val;
+                        else if (stmt->assign.rvalue.unary_op.op == AX_MIR_UNOP_NEG) val = (uint64_t)(-(int64_t)op_val);
+                        break;
+                    }
                     default:
                         val = 0;
                         break;
@@ -209,6 +220,15 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
         AxMirTerminator *term = &bb->terminator;
         if (term->kind == AX_MIR_TERM_GOTO) {
             current_bb = term->goto_target;
+        } else if (term->kind == AX_MIR_TERM_ASSERT) {
+            uint64_t cond = eval_operand(&frame, &term->assert.cond);
+            bool expected = term->assert.expected;
+            if ((cond != 0) != expected) {
+                ctx->failed = true;
+                ctx->exit_code = 101;
+                break;
+            }
+            current_bb = term->assert.target;
         } else if (term->kind == AX_MIR_TERM_RETURN) {
             break;
         } else if (term->kind == AX_MIR_TERM_SWITCH_INT) {

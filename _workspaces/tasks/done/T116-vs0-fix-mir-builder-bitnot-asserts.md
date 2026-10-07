@@ -8,15 +8,16 @@ model: opus
 gate_model: sonnet
 depends: [T021, T114]
 priority: 11
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, tests/mir/build]
 locks: [bootstrap/axiom0/src/interp/interp.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/verify/verify.c]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-00-bootstrap.md, spec/decisions/ADR-0012-core-execution-semantics-and-milestones.md, spec/decisions/ADR-0016-vs0-gate-fix-tasks.md, spec/decisions/ADR-0017-checked-arithmetic-mir.md]
 covers: [REQ-EXP-021]
-started: 2026-10-07 18:33:13
+started: 2026-10-07 19:57:51
 unblocks: 2
 unblock_failures: 0
+finished: 2026-10-07 20:18:03
 ---
 # T116 — VS0 fix: MIR builder bit-not, checked-arithmetic asserts, exhaustive lowering
 
@@ -66,3 +67,5 @@ The THIR->MIR builder emits the MIR SPEC-03 / FP-03 prescribes — correct opera
 - 2026-10-07 18:33:13 started (attempt 1) T116-impl
 - 2026-10-07 19:53:32 block: QA failed 3 times: false panics for large u32 addition, parse.c lacks ~, parse.c lacks overflows
 - 2026-10-07 19:57:21 unblocked (cycle 2) 
+- 2026-10-07 19:57:51 started (attempt 1) T116-impl
+- 2026-10-07 20:18:03 accepted by QA -> done
