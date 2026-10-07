@@ -10,8 +10,11 @@ depends: [T021, T003a, T022]
 priority: 40
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/lir, tests/lir, bootstrap/axiom0/src/driver/emit_lir.c]
+paths: [bootstrap/axiom0/src/lir, tests/lir, bootstrap/axiom0/src/driver/emit_lir.c, tests/run/basic]
+locks: [bootstrap/axiom0/src/mir/parse.c]
 spec: [0162, 0179, 0215, 0232, 0049, spec/SPEC-04-core-extensibility.md]
+started: 2026-10-07 22:12:00
+unblocks: 1
 ---
 # T023 — LIR + naive MIR→LIR lowering
 
@@ -33,3 +36,8 @@ Machine-independent low-level IR: explicit memory, stack slots, calls; MIR owner
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-07 22:12:00 started (attempt 1) T023-impl
+- 2026-10-07 22:52:40 block: buggy parse.c prevents MIR to LIR lowering tests from passing; need locks for bootstrap/axiom0/src/mir/parse.c and tests/run/basic
+- 2026-10-07 22:53:19 unblocked (cycle 1) 
