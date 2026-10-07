@@ -1,11 +1,9 @@
 ## Tóm tắt
-Tác vụ T028 bị block do `typeck.c` gặp lỗi crash (lỗi `TypeInterner: invalid id 0`) khi hàm `main` trong `build_ok.test` không có kiểu trả về. Agent cần quyền lock file này để sửa lỗi. Tôi đã thêm `bootstrap/axiom0/src/typeck/typeck.c` vào danh sách `locks` của T028 và unblock tác vụ. Đây là cách giải quyết đơn giản nhất để agent có thể tiếp tục thực hiện và sửa lỗi type checking fallback.
+Đã thêm `tests/run/basic` và `tests/conformance/vs0` vào mảng `paths` của task T028 để cho phép xoá các chỉ thị `native-after: T028` trong các test này, qua đó tháo gỡ khó khăn cho quá trình build native end-to-end. Đã chạy `taskctl.py unblock T028` thành công.
 
-## Options and Rationale
-- **Option A:** Add `bootstrap/axiom0/src/typeck/typeck.c` to T028's `locks` array. This is the simplest and most direct way to unblock the agent, allowing it to quickly fix the missing return type fallback in `typeck.c` for `build_ok.test`.
-- **Option B:** Split the task to fix the type checking bug separately. This adds unnecessary overhead for a minor fallback bug that blocks the current progress.
-
-Decision: Option A. The lock was added to T028 and the task was unblocked via `taskctl.py unblock T028`.
+## Quyết định và Căn cứ
+- **Lựa chọn:** Bổ sung trực tiếp thư mục `tests/run/basic` và `tests/conformance/vs0` vào cấu hình `paths` của T028 thay vì tạo task mới hay ghi đè toàn bộ cấu trúc.
+- **Căn cứ:** Theo báo cáo từ agent, sự cố block xảy ra do T028 cần truy cập vào hai đường dẫn này để gỡ bỏ cờ `native-after: T028` khi backend native đã hoàn thiện. Đây là một sửa đổi phạm vi nhỏ phù hợp nhất với việc chỉnh sửa thuộc tính `paths` của file cấu hình task T028.
 
 ## Files changed
 - _workspaces/tasks/todo/T028-axiom0-build-end-to-end-first-native-axiom-program.md
