@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T025]
 priority: 43
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/target/x64/frame, bootstrap/axiom0/src/target/x64/verify, tests/mc/frame, bootstrap/axiom0/src/driver/emit_mc.c]
 spec: [0181, 0188, 0189, 0183, 0251, 0253, spec/decisions/ADR-0003-backend-pipeline-robustness.md]
 covers: []
+started: 2026-10-08 00:07:58
+finished: 2026-10-08 00:35:55
 ---
 # T025b — Frame lowering, stack probes, machine-IR verifier, `--emit=mc`
 
@@ -40,3 +42,7 @@ Turn the machine IR of T025 into encoded functions that are safe on Windows: cor
 - New instruction forms are added to the encoder only with GNU-as validation tables (T024 method).
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-08 00:07:58 started (attempt 1) T025b-impl
+- 2026-10-08 00:35:55 accepted by QA -> done
