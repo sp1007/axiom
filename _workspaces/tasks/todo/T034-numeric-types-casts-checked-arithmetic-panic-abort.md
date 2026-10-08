@@ -10,9 +10,11 @@ depends: [T032]
 priority: 54
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/numeric, tests/ui/numeric]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/numeric, tests/ui/numeric, tests/typeck, tests/mir]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0327, tasks/0334, spec/SPEC-03-core-semantics.md, 0068]
+started: 2026-10-08 14:38:02
+unblocks: 1
 ---
 # T034 — Numeric types, casts, checked arithmetic, panic=abort
 
@@ -40,3 +42,8 @@ All integer widths, bool ops, `char`, `as` casts, overflow/div-zero/shift semant
 - Runs in parallel with the native catch-up T033 (different directories; its run tests carry `native-after: T037`). T037 depends on T033.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-08 14:38:02 started (attempt 1) T034-impl
+- 2026-10-08 15:21:35 block: need paths for tests/typeck and tests/mir to update golden files shifted by MIR variable numbering
+- 2026-10-08 15:22:20 unblocked (cycle 1) 
