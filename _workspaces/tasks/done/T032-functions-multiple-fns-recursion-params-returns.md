@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T031]
 priority: 52
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/fn, tests/ui/fn]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0069, tasks/0266, tasks/0284]
 covers: [REQ-CONC-001, REQ-CONC-002]
+started: 2026-10-08 10:51:13
+finished: 2026-10-08 11:25:47
 ---
 # T032 — Functions: multiple fns, recursion, params, returns
 
@@ -39,3 +41,5 @@ Full function semantics in the oracle.
 
 ## Log
 - 2026-10-06 02:23:55 covers += REQ-CONC-001, REQ-CONC-002 (metadata only)
+- 2026-10-08 10:51:13 started (attempt 1) T032-impl
+- 2026-10-08 11:25:47 accepted by QA -> done
