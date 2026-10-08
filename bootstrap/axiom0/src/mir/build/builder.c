@@ -606,6 +606,99 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         
         set_terminator(b, b->current_bb, term);
         b->current_bb = next_bb;
+    } else if (expr->kind == AX_HIR_EXPR_CAST) {
+        AxMirOperand op = build_expr_as_operand(b, expr->cast.expr);
+        TypeId dest_ty = get_expr_type(b, expr);
+        TypeId src_ty = get_expr_type(b, expr->cast.expr);
+
+        if (TypeId_eq(dest_ty, b->thir->interner.t_char) && TypeId_eq(src_ty, b->thir->interner.t_u32)) {
+            // Check if op <= 0x10FFFF && !(0xD800 <= op && op <= 0xDFFF)
+            
+            // 1. op <= 0x10FFFF
+            AxMirLocalId is_le_max = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace le_max_place = { is_le_max, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt le_max_stmt = {0};
+            le_max_stmt.kind = AX_MIR_STMT_ASSIGN;
+            le_max_stmt.assign.place = le_max_place;
+            le_max_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            le_max_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LE;
+            le_max_stmt.assign.rvalue.binary_op.lhs = op;
+            AxMirOperand max_char = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0x10FFFF } } };
+            le_max_stmt.assign.rvalue.binary_op.rhs = max_char;
+            push_stmt(b, b->current_bb, le_max_stmt);
+
+            AxMirTerminator assert_max = {0};
+            assert_max.kind = AX_MIR_TERM_ASSERT;
+            assert_max.assert.cond.kind = AX_MIR_OP_COPY;
+            assert_max.assert.cond.place = le_max_place;
+            assert_max.assert.expected = true;
+            assert_max.assert.msg = "invalid char value";
+            assert_max.assert.target = add_bb(b);
+            assert_max.assert.unwind = add_bb(b);
+            set_terminator(b, b->current_bb, assert_max);
+            b->current_bb = assert_max.assert.target;
+
+            // 2. !(0xD800 <= op && op <= 0xDFFF) -> !(op >= 0xD800 && op <= 0xDFFF)
+            // Or simpler: assert(op < 0xD800 || op > 0xDFFF)
+            // Let's do op < 0xD800
+            AxMirLocalId is_lt_d800 = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace lt_d800_place = { is_lt_d800, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt lt_d800_stmt = {0};
+            lt_d800_stmt.kind = AX_MIR_STMT_ASSIGN;
+            lt_d800_stmt.assign.place = lt_d800_place;
+            lt_d800_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            lt_d800_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LT;
+            lt_d800_stmt.assign.rvalue.binary_op.lhs = op;
+            AxMirOperand c_d800 = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0xD800 } } };
+            lt_d800_stmt.assign.rvalue.binary_op.rhs = c_d800;
+            push_stmt(b, b->current_bb, lt_d800_stmt);
+
+            // op > 0xDFFF
+            AxMirLocalId is_gt_dfff = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace gt_dfff_place = { is_gt_dfff, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt gt_dfff_stmt = {0};
+            gt_dfff_stmt.kind = AX_MIR_STMT_ASSIGN;
+            gt_dfff_stmt.assign.place = gt_dfff_place;
+            gt_dfff_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            gt_dfff_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_GT;
+            gt_dfff_stmt.assign.rvalue.binary_op.lhs = op;
+            AxMirOperand c_dfff = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0xDFFF } } };
+            gt_dfff_stmt.assign.rvalue.binary_op.rhs = c_dfff;
+            push_stmt(b, b->current_bb, gt_dfff_stmt);
+
+            // lt || gt
+            AxMirLocalId is_valid = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace valid_place = { is_valid, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt valid_stmt = {0};
+            valid_stmt.kind = AX_MIR_STMT_ASSIGN;
+            valid_stmt.assign.place = valid_place;
+            valid_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            valid_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_BIT_OR;
+            valid_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ AX_MIR_OP_COPY, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .place = lt_d800_place } };
+            valid_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ AX_MIR_OP_COPY, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .place = gt_dfff_place } };
+            push_stmt(b, b->current_bb, valid_stmt);
+
+            AxMirTerminator assert_valid = {0};
+            assert_valid.kind = AX_MIR_TERM_ASSERT;
+            assert_valid.assert.cond.kind = AX_MIR_OP_COPY;
+            assert_valid.assert.cond.place = valid_place;
+            assert_valid.assert.expected = true;
+            assert_valid.assert.msg = "invalid char value";
+            assert_valid.assert.target = add_bb(b);
+            assert_valid.assert.unwind = add_bb(b);
+            set_terminator(b, b->current_bb, assert_valid);
+            b->current_bb = assert_valid.assert.target;
+        }
+
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+        stmt.assign.rvalue.cast.kind = AX_MIR_CAST_INT_TO_INT;
+        stmt.assign.rvalue.cast.op = op;
+        stmt.assign.rvalue.cast.ty = dest_ty;
+        push_stmt(b, b->current_bb, stmt);
+
     } else if (expr->kind == AX_HIR_EXPR_JUMP) {
         if (expr->jump.jump_kind == AX_JUMP_RETURN) {
             if (expr->jump.expr) {

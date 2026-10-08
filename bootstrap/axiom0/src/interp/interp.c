@@ -116,6 +116,119 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
         return;
     }
     
+    bool is_intrinsic = false;
+    for (AxHirAttr *attr = func->attrs; attr; attr = attr->next) {
+        StrView an = ax_interner_get(ctx->interner, attr->name);
+        if (ax_sv_eq_cstr(an, "intrinsic")) {
+            is_intrinsic = true;
+            break;
+        }
+    }
+
+    if (is_intrinsic) {
+        StrView name = ax_interner_get(ctx->interner, func->fn.name);
+        if (ax_sv_eq_cstr(name, "assert")) {
+            if (arg_count > 0 && args[0] == 0) {
+                panic_interp(ctx, "assertion failed");
+            }
+            if (out_ret) *out_ret = 0;
+            return;
+        } else if (ax_sv_eq_cstr(name, "unreachable")) {
+            panic_interp(ctx, "entered unreachable code");
+            return;
+        } else if (ax_sv_eq_cstr(name, "panic")) {
+            panic_interp(ctx, "panic");
+            return;
+        } else {
+            TypeId *fn_ty_ptr = AxItemTypeMap_get(&ctx->thir->item_types, func);
+            int bits = 64;
+            if (fn_ty_ptr) {
+                const AxType *fn_ty = ax_type_get(&ctx->thir->interner, *fn_ty_ptr);
+                if (fn_ty->kind == AX_TY_FN && fn_ty->fn.ret_type.v != 0) {
+                    // For intrinsics that return `u32` (like leading_zeros), the operand width is the parameter type.
+                    const AxType *op_ty = ax_type_get(&ctx->thir->interner, fn_ty->fn.param_types[0]);
+                    switch(op_ty->kind) {
+                        case AX_TY_I8: case AX_TY_U8: bits = 8; break;
+                        case AX_TY_I16: case AX_TY_U16: bits = 16; break;
+                        case AX_TY_I32: case AX_TY_U32: bits = 32; break;
+                        default: bits = 64; break;
+                    }
+                }
+            }
+            uint64_t mask = bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
+            
+            #define IS_OP(name, op) (name.len >= strlen(op) && memcmp(name.ptr, op, strlen(op)) == 0 && (name.len == strlen(op) || name.ptr[strlen(op)] == '_'))
+
+            if (IS_OP(name, "wrapping_add")) {
+                if (out_ret && arg_count == 2) {
+                    *out_ret = (args[0] + args[1]) & mask;
+                    // printf("wrapping_add %llu + %llu = %llu\n", args[0], args[1], *out_ret);
+                }
+                return;
+            } else if (IS_OP(name, "wrapping_sub")) {
+                if (out_ret && arg_count == 2) *out_ret = (args[0] - args[1]) & mask;
+                return;
+            } else if (IS_OP(name, "wrapping_mul")) {
+                if (out_ret && arg_count == 2) *out_ret = (args[0] * args[1]) & mask;
+                return;
+            } else if (IS_OP(name, "wrapping_neg")) {
+                if (out_ret && arg_count == 1) *out_ret = (0 - args[0]) & mask;
+                return;
+            } else if (IS_OP(name, "rotate_left")) {
+                if (out_ret && arg_count == 2) {
+                    uint32_t n = (uint32_t)args[1] % bits;
+                    *out_ret = ((args[0] << n) | (args[0] >> ((bits - n) % bits))) & mask;
+                }
+                return;
+            } else if (IS_OP(name, "rotate_right")) {
+                if (out_ret && arg_count == 2) {
+                    uint32_t n = (uint32_t)args[1] % bits;
+                    *out_ret = ((args[0] >> n) | (args[0] << ((bits - n) % bits))) & mask;
+                }
+                return;
+            } else if (IS_OP(name, "leading_zeros")) {
+                if (out_ret && arg_count == 1) {
+                    uint64_t val = args[0] & mask;
+                    if (val == 0) *out_ret = bits;
+                    else {
+                        uint32_t lz = 0;
+                        for (int i = bits - 1; i >= 0; i--) {
+                            if ((val >> i) & 1) break;
+                            lz++;
+                        }
+                        *out_ret = lz;
+                    }
+                }
+                return;
+            } else if (IS_OP(name, "trailing_zeros")) {
+                if (out_ret && arg_count == 1) {
+                    uint64_t val = args[0] & mask;
+                    if (val == 0) *out_ret = bits;
+                    else {
+                        uint32_t tz = 0;
+                        for (int i = 0; i < bits; i++) {
+                            if ((val >> i) & 1) break;
+                            tz++;
+                        }
+                        *out_ret = tz;
+                    }
+                }
+                return;
+            } else if (IS_OP(name, "count_ones")) {
+                if (out_ret && arg_count == 1) {
+                    uint64_t val = args[0] & mask;
+                    uint32_t ones = 0;
+                    for (int i = 0; i < bits; i++) {
+                        if ((val >> i) & 1) ones++;
+                    }
+                    *out_ret = ones;
+                }
+                return;
+            }
+            #undef IS_OP
+        }
+    }
+
     AxMirBodyPtr *cached_body_ptr = AxMirMap_get((AxMirMap*)ctx->mir_map, func);
     if (!cached_body_ptr) {
         AX_ICE("interpreter: function has no verified MIR body");
@@ -436,6 +549,67 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                         } else {
                             AX_ICE("interpreter: unknown unary operator");
                         }
+                        break;
+                    }
+                    case AX_MIR_RVALUE_CAST: {
+                        uint64_t op_val = eval_operand(&frame, &stmt->assign.rvalue.cast.op);
+                        
+                        TypeId src_ty = {0};
+                        if (stmt->assign.rvalue.cast.op.kind == AX_MIR_OP_CONST) {
+                            src_ty = stmt->assign.rvalue.cast.op.constant.ty;
+                        } else {
+                            AxMirLocalId loc = stmt->assign.rvalue.cast.op.place.local;
+                            src_ty = frame.body->locals[loc.v].ty;
+                        }
+                        TypeId dest_ty = stmt->assign.rvalue.cast.ty;
+                        
+                        const AxType *s_t = NULL;
+                        if (src_ty.v != 0) s_t = ax_type_get(&ctx->thir->interner, src_ty);
+                        const AxType *d_t = NULL;
+                        if (dest_ty.v != 0) d_t = ax_type_get(&ctx->thir->interner, dest_ty);
+                        
+                        bool src_signed = false;
+                        int src_bits = 64;
+                        if (s_t) {
+                            switch (s_t->kind) {
+                                case AX_TY_I8: src_signed = true; src_bits = 8; break;
+                                case AX_TY_I16: src_signed = true; src_bits = 16; break;
+                                case AX_TY_I32: src_signed = true; src_bits = 32; break;
+                                case AX_TY_I64: case AX_TY_ISIZE: src_signed = true; src_bits = 64; break;
+                                case AX_TY_U8: src_signed = false; src_bits = 8; break;
+                                case AX_TY_U16: src_signed = false; src_bits = 16; break;
+                                case AX_TY_U32: case AX_TY_CHAR: src_signed = false; src_bits = 32; break;
+                                case AX_TY_U64: case AX_TY_USIZE: src_signed = false; src_bits = 64; break;
+                                case AX_TY_BOOL: src_signed = false; src_bits = 1; break;
+                                default: break;
+                            }
+                        }
+                        
+                        int dest_bits = 64;
+                        if (d_t) {
+                            switch (d_t->kind) {
+                                case AX_TY_I8: case AX_TY_U8: dest_bits = 8; break;
+                                case AX_TY_I16: case AX_TY_U16: dest_bits = 16; break;
+                                case AX_TY_I32: case AX_TY_U32: case AX_TY_CHAR: dest_bits = 32; break;
+                                default: dest_bits = 64; break;
+                            }
+                        }
+                        
+                        uint64_t res = op_val;
+                        // 1. Sign extend if needed
+                        if (src_signed && src_bits < 64) {
+                            uint64_t sign_bit = (uint64_t)1 << (src_bits - 1);
+                            if (res & sign_bit) {
+                                uint64_t mask = ~(((uint64_t)1 << src_bits) - 1);
+                                res |= mask;
+                            }
+                        }
+                        
+                        // 2. Truncate to dest
+                        if (dest_bits < 64) {
+                            res &= (((uint64_t)1 << dest_bits) - 1);
+                        }
+                        val = res;
                         break;
                     }
                     default:

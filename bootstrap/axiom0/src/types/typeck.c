@@ -817,15 +817,34 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         case AX_HIR_EXPR_UNARY:
             return check_unary(cx, expr);
         case AX_HIR_EXPR_CAST: {
-            // Casts are MS-P5; the minimal v1 rule is kept as delivered by T017.
             TypeId src_ty = resolve_ty(cx, check_expr(cx, expr->cast.expr, TypeId_none()));
             TypeId dest_ty = resolve_ty(cx, hir_type_to_typeid(cx, expr->cast.type));
             if (TypeId_is_none(dest_ty) || is_error(cx, src_ty) || is_error(cx, dest_ty)) return in->t_error;
             if (TypeId_eq(src_ty, dest_ty)) return dest_ty;
-            bool src_ok = is_intlike(cx, src_ty) || TypeId_eq(src_ty, in->t_bool) || TypeId_eq(src_ty, in->t_char);
-            if (src_ok && ax_type_is_int(dest_ty, in)) return dest_ty;
-            return type_error(cx, expr->span, AX_TYPE_MISMATCH); // AX_TYPE_INVALID_CAST: MS-P5
+
+            bool is_valid = false;
+            if (is_intlike(cx, src_ty) && ax_type_is_int(dest_ty, in)) {
+                is_valid = true;
+            } else if (TypeId_eq(src_ty, in->t_bool) && ax_type_is_int(dest_ty, in)) {
+                is_valid = true;
+            } else if (TypeId_eq(src_ty, in->t_u8) && TypeId_eq(dest_ty, in->t_char)) {
+                is_valid = true;
+            } else if (TypeId_eq(src_ty, in->t_u32) && TypeId_eq(dest_ty, in->t_char)) {
+                is_valid = true;
+            } else if (TypeId_eq(src_ty, in->t_char) && ax_type_is_int(dest_ty, in)) {
+                AxTypeKind k = kind_of(cx, dest_ty);
+                if (k == AX_TY_U32 || k == AX_TY_I32 || k == AX_TY_U64 || k == AX_TY_I64 || k == AX_TY_USIZE || k == AX_TY_ISIZE) {
+                    is_valid = true;
+                }
+            } else if (is_never(cx, src_ty)) {
+                is_valid = true;
+            }
+            // Enums and pointers are for later tasks.
+
+            if (is_valid) return dest_ty;
+            return type_error(cx, expr->span, AX_TYPE_INVALID_CAST);
         }
+
 
         // Valid Axiom outside the axiom0 subset (AXD-013): a diagnostic, never a silent type.
         case AX_HIR_EXPR_ARRAY:

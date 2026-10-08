@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T032]
 priority: 54
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/numeric, tests/ui/numeric, tests/typeck, tests/mir, tests/mc, tests/lir, tests/run/fn]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/numeric, tests/ui/numeric, tests/typeck, tests/mir, tests/mc, tests/lir, tests/run/fn, tests/hir, tests/resolve]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0327, tasks/0334, spec/SPEC-03-core-semantics.md, 0068]
-started: 2026-10-08 15:23:13
+started: 2026-10-08 16:32:16
 unblocks: 2
+finished: 2026-10-08 16:50:25
 ---
 # T034 — Numeric types, casts, checked arithmetic, panic=abort
 
@@ -50,3 +51,5 @@ All integer widths, bool ops, `char`, `as` casts, overflow/div-zero/shift semant
 - 2026-10-08 15:23:13 started (attempt 1) T034-impl
 - 2026-10-08 16:30:26 block: need paths for bootstrap/axiom0/src/resolve/resolve.c to add isize to prelude_types
 - 2026-10-08 16:31:10 unblocked (cycle 2) 
+- 2026-10-08 16:32:16 started (attempt 1) T034-impl
+- 2026-10-08 16:50:25 accepted by QA -> done
