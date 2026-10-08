@@ -70,8 +70,8 @@ CHECK_COMMANDS = {
     "reqcov": [".claude/skills/axiom-tasks/scripts/reqcov.py", "--strict"],
     "harness_check": [".claude/skills/axiom-tasks/scripts/harness_check.py"],
     "gatecheck": None,
-    "differential": None,
-    "determinism": None,
+    "differential": ["python", "tools/axtest.py", "diff"],
+    "determinism": ["bash", "tools/ci.sh"],
 }
 INTERNAL_CHECKS = ("gatecheck",)
 
@@ -598,10 +598,24 @@ def run_check(ctx, name, verbose):
     cmd = CHECK_COMMANDS.get(name)
     if cmd is None:
         return "check %s has no command yet (AXS-BOOT-050)" % name
-    script = os.path.join(ctx.root, *cmd[0].split("/"))
+        
+    if cmd[0] in ("python", "bash"):
+        prog = cmd[0]
+        script_idx = 1
+    else:
+        prog = None
+        script_idx = 0
+        
+    script = os.path.join(ctx.root, *cmd[script_idx].split("/"))
     if not os.path.isfile(script):
-        return "check %s: %s not present" % (name, cmd[0])
-    full = [sys.executable, script] + cmd[1:]
+        return "check %s: %s not present" % (name, cmd[script_idx])
+        
+    if prog == "python":
+        full = [sys.executable, script] + cmd[script_idx+1:]
+    elif prog == "bash":
+        full = ["bash", cmd[script_idx]] + cmd[script_idx+1:]
+    else:
+        full = [sys.executable, script] + cmd[script_idx+1:]
     if verbose:
         print("gatecheck: running check %s: %s" % (name, " ".join(full)), file=sys.stderr)
     try:

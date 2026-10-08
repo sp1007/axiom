@@ -23,9 +23,13 @@ BUILD_ROOT="${AX_CI_BUILD_ROOT:-$ROOT/build-ci}"
 
 # MSYS2 ucrt64 toolchain may not be on PATH in a plain Git Bash.
 if ! command -v cmake >/dev/null 2>&1; then
-    for d in /ucrt64/bin /c/msys64/ucrt64/bin; do
+    for d in /ucrt64/bin /c/msys64/ucrt64/bin /mnt/c/msys64/ucrt64/bin; do
         if [ -x "$d/cmake" ] || [ -x "$d/cmake.exe" ]; then
             PATH="$d:$PATH"
+            if ! command -v cmake >/dev/null 2>&1 && command -v cmake.exe >/dev/null 2>&1; then
+                cmake() { cmake.exe "$@"; }
+                ninja() { ninja.exe "$@"; }
+            fi
             break
         fi
     done
@@ -42,7 +46,7 @@ done
 step() { printf '\n== %s\n' "$*"; }
 
 for tool in cmake ninja; do
-    command -v "$tool" >/dev/null 2>&1 || { echo "ci: missing tool: $tool" >&2; exit 127; }
+    command -v "$tool" >/dev/null 2>&1 || command -v "$tool.exe" >/dev/null 2>&1 || { echo "ci: missing tool: $tool" >&2; exit 127; }
 done
 
 run_checker() { # <script> [args...]: run tools/<script> only when the file exists
@@ -72,6 +76,17 @@ for cc in $COMPILERS; do
     [ -f "$EXE.exe" ] && EXE="$EXE.exe"
     step "smoke: $EXE version"
     "$EXE" version
+
+    step "determinism ($cc)"
+    echo "fn main() -> i32 { return 0; }" > "$BUILD/det.ax"
+    "$EXE" build -o "$BUILD/det.exe" "$BUILD/det.ax"
+    cp "$BUILD/det.exe" "$BUILD/det.exe.1"
+    "$EXE" build -o "$BUILD/det.exe" "$BUILD/det.ax"
+    if ! cmp -s "$BUILD/det.exe" "$BUILD/det.exe.1"; then
+        echo "ci: determinism failure: build output differs" >&2
+        exit 1
+    fi
+    rm -f "$BUILD/det.exe" "$BUILD/det.exe.1" "$BUILD/det.ax"
 
     step "ctest ($cc)"
     # `ctest` fails when no tests are defined only with --no-tests=error, which we do not pass.

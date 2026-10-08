@@ -105,8 +105,8 @@ int main(void) {
     }
 
     test_relocs_obj();
-    // The test driver runs in build/, so we use ../tests/obj/fixtures/c_helper.c
-    if (system("gcc relocs.obj ../tests/obj/fixtures/c_helper.c -o relocs.exe") != 0) {
+    // The test driver runs in build/tests/, so we use ../../tests/obj/fixtures/c_helper.c
+    if (system("gcc relocs.obj ../../tests/obj/fixtures/c_helper.c -o relocs.exe") != 0) {
         printf("FAIL: gcc failed to link relocs.obj\n");
         return 1;
     }

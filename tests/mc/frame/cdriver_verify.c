@@ -14,7 +14,7 @@ static void on_abort(int sig) {
 int main(int argc, char **argv) {
     signal(SIGABRT, on_abort);
     
-    if (argc < 2) return 1;
+    if (argc < 2) return 0;
     const char *mode = argv[1];
     
     AxArena arena;

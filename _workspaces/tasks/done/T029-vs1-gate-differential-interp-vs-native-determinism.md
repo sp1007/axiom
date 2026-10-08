@@ -8,13 +8,14 @@ model: opus
 gate_model: opus
 depends: [T028, T022]
 priority: 46
-status: todo
-attempts: 0
-paths: [tests/diff, tests/conformance/vs1, tools/ci.sh, tests/mc/frame, tests/mir/build]
+status: done
+attempts: 2
+paths: [tests/diff, tests/conformance/vs1, tools/ci.sh, tests/mc/frame, tests/mir/build, tests/obj]
 locks: [bootstrap/axiom0/src/driver/emit_obj.c, tools/gatecheck.py]
 spec: [0263, 0152, 0145]
-started: 2026-10-08 07:11:59
-unblocks: 2
+started: 2026-10-08 07:44:26
+unblocks: 0
+finished: 2026-10-08 08:01:42
 ---
 # T029 — VS1 gate: differential interp vs native, determinism
 
@@ -45,3 +46,8 @@ Establish the three-level oracle (MIR interp / native / agreement) as a permanen
 - 2026-10-08 07:11:59 started (attempt 1) T029-impl
 - 2026-10-08 07:28:15 block: need locks for tools/gatecheck.py to fix MS-P4 gatecheck differential check error
 - 2026-10-08 07:28:46 unblocked (cycle 2) 
+- 2026-10-08 07:29:26 started (attempt 1) T029-impl
+- 2026-10-08 07:43:56 block: need paths for tests/obj to fix ct_obj_cdriver_coff ctest failure and gatecheck
+- 2026-10-08 07:43:57 parked: unblock cap reached (unblocks=2, failed unblock agents=0); needs the owner
+- 2026-10-08 07:44:26 started (attempt 2) T029-impl
+- 2026-10-08 08:01:42 accepted by QA -> done
