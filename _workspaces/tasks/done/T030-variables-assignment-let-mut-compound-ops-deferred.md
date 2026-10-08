@@ -8,14 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T029, T015b]
 priority: 50
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/vars, tests/ui/vars]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, 0263, spec/SPEC-03-core-semantics.md]
 covers: [REQ-DRP-001, REQ-DRP-002, REQ-DRP-003]
-started: 2026-10-08 08:02:04
+started: 2026-10-08 08:04:42
 unblocks: 1
+finished: 2026-10-08 08:19:49
 ---
 # T030 — Variables & assignment: let mut, compound ops, deferred init
 
@@ -44,3 +45,5 @@ Mutable bindings and assignment through the full pipeline (oracle).
 - 2026-10-08 08:02:04 started (attempt 1) T030-impl
 - 2026-10-08 08:02:54 block: need more information on how the types module expects bindings to be represented
 - 2026-10-08 08:03:47 unblocked (cycle 1) 
+- 2026-10-08 08:04:42 started (attempt 1) T030-impl
+- 2026-10-08 08:19:49 accepted by QA -> done

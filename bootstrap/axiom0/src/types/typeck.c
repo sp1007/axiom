@@ -32,6 +32,12 @@ typedef struct NegCheck {
     TypeId ty;
 } NegCheck;
 
+typedef struct VarState {
+    AxSymbolId sym;
+    bool is_mut;
+    bool is_init;
+} VarState;
+
 typedef struct TypeckCtx {
     const AxHir *hir;
     AxThir *thir;
@@ -53,6 +59,10 @@ typedef struct TypeckCtx {
     NegCheck *negs;
     size_t negs_len;
     size_t negs_cap;
+    
+    VarState *vars;
+    size_t vars_len;
+    size_t vars_cap;
 
     TypeId return_type;
     bool in_loop;
@@ -435,16 +445,24 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     ax_xfree(cx.int_vars);
     ax_xfree(cx.lits);
     ax_xfree(cx.negs);
+    ax_xfree(cx.vars);
     return thir;
 }
 
-static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected) {
+static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, bool is_init) {
     if (!pat) return cx->thir->interner.t_unit;
     TypeId ty = expected;
     switch (pat->kind) {
         case AX_HIR_PAT_BINDING:
             if (pat->binding.symbol.v != 0) {
                 AxSymbolTypeMap_insert(&cx->thir->symbol_types, pat->binding.symbol, ty);
+                if (cx->vars_len == cx->vars_cap) {
+                    cx->vars = ax_grow_array(cx->vars, &cx->vars_cap, sizeof(VarState), cx->vars_len + 1);
+                }
+                cx->vars[cx->vars_len].sym = pat->binding.symbol;
+                cx->vars[cx->vars_len].is_mut = pat->binding.is_mut;
+                cx->vars[cx->vars_len].is_init = is_init;
+                cx->vars_len++;
             }
             break;
         case AX_HIR_PAT_LITERAL: {
@@ -655,7 +673,7 @@ static TypeId check_if(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected) {
     const TypeInterner *in = &cx->thir->interner;
     if (expr->if_expr.let_pat) {
         TypeId cond_ty = check_expr(cx, expr->if_expr.cond, TypeId_none());
-        check_pat(cx, expr->if_expr.let_pat, cond_ty);
+        check_pat(cx, expr->if_expr.let_pat, cond_ty, true);
     } else {
         check_expr(cx, expr->if_expr.cond, in->t_bool); // AXS-SEM-012: the condition is bool
     }
@@ -680,8 +698,20 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             return in->t_error;
         case AX_HIR_EXPR_LITERAL:
             return check_literal(cx, expr);
-        case AX_HIR_EXPR_PATH:
-            return lookup_path_type(cx, &expr->path.path);
+        case AX_HIR_EXPR_PATH: {
+            TypeId t = lookup_path_type(cx, &expr->path.path);
+            if (expr->path.path.symbol.v != 0) {
+                for (size_t i = 0; i < cx->vars_len; i++) {
+                    if (cx->vars[i].sym.v == expr->path.path.symbol.v) {
+                        if (!cx->vars[i].is_init) {
+                            type_error(cx, expr->span, AX_TYPE_UNINIT_USE);
+                        }
+                        break;
+                    }
+                }
+            }
+            return t;
+        }
         case AX_HIR_EXPR_BLOCK:
             return check_block(cx, &expr->block.block, expected);
         case AX_HIR_EXPR_IF:
@@ -698,7 +728,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             cx->in_loop = true;
             if (expr->while_expr.let_pat) {
                 TypeId cond_ty = check_expr(cx, expr->while_expr.cond, TypeId_none());
-                check_pat(cx, expr->while_expr.let_pat, cond_ty);
+                check_pat(cx, expr->while_expr.let_pat, cond_ty, true);
             } else {
                 check_expr(cx, expr->while_expr.cond, in->t_bool);
             }
@@ -775,20 +805,49 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
         tail = NULL;
         if (s->kind == AX_HIR_STMT_LET) {
             TypeId declared = hir_type_to_typeid(cx, s->let.type);
+            bool is_init = false;
             if (s->let.expr) {
                 // The initializer is the coercion site for the annotation.
                 TypeId init = check_expr(cx, s->let.expr, declared);
                 if (is_never(cx, init)) diverges = true;
                 if (TypeId_is_none(declared)) declared = init;
+                is_init = true;
             } else if (TypeId_is_none(declared)) {
                 type_error(cx, s->let.pat->span, AX_TYPE_UNKNOWN);
                 declared = in->t_error;
             }
-            check_pat(cx, s->let.pat, declared);
+            check_pat(cx, s->let.pat, declared, is_init);
             ty = in->t_unit;
         } else if (s->kind == AX_HIR_STMT_ASSIGN) {
-            TypeId left = check_expr(cx, s->assign.left, TypeId_none());
-            TypeId right = check_expr(cx, s->assign.right, left);
+            // Note: right hand side is evaluated first in assignment
+            TypeId right = check_expr(cx, s->assign.right, TypeId_none());
+            
+            // To avoid UNINIT_USE when re-assigning, we check if it's a path and update it first
+            // Wait, actually `check_expr` on left will trigger UNINIT_USE if we just call it normally!
+            // But an assignment to a variable is NOT a use of its previous value.
+            // So we shouldn't do a full `check_expr(left)` which evaluates it as an r-value, 
+            // unless we handle `AX_HIR_EXPR_PATH` specially here.
+            TypeId left = TypeId_none();
+            if (s->assign.left->kind == AX_HIR_EXPR_PATH) {
+                left = lookup_path_type(cx, &s->assign.left->path.path);
+                AxExprTypeMap_insert(&cx->thir->expr_types, s->assign.left, left);
+                if (s->assign.left->path.path.symbol.v != 0) {
+                    AxSymbolId sym = s->assign.left->path.path.symbol;
+                    for (size_t i = 0; i < cx->vars_len; i++) {
+                        if (cx->vars[i].sym.v == sym.v) {
+                            if (cx->vars[i].is_init && !cx->vars[i].is_mut) {
+                                type_error(cx, s->assign.left->span, AX_TYPE_ASSIGN_IMMUTABLE);
+                            }
+                            cx->vars[i].is_init = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                left = check_expr(cx, s->assign.left, TypeId_none());
+            }
+            
+            coerce(cx, right, left, s->assign.right->span);
             if (is_never(cx, right)) diverges = true;
             ty = in->t_unit;
         } else if (s->kind == AX_HIR_STMT_EXPR) {

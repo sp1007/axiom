@@ -650,6 +650,20 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
             b->var_map[b->var_count].sym = stmt->let.pat->binding.symbol;
             b->var_map[b->var_count].loc = loc;
             b->var_count++;
+        } else if (stmt->kind == AX_HIR_STMT_ASSIGN) {
+            AxMirPlace dest = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            if (stmt->assign.left->kind == AX_HIR_EXPR_PATH) {
+                AxSymbolId sym = stmt->assign.left->path.path.symbol;
+                for (size_t i = 0; i < b->var_count; i++) {
+                    if (b->var_map[i].sym.v == sym.v) {
+                        dest.local = b->var_map[i].loc;
+                        break;
+                    }
+                }
+            } else {
+                AX_ICE("builder: unhandled assignment left hand side kind");
+            }
+            build_expr_into(b, stmt->assign.right, dest);
         }
     }
 }
