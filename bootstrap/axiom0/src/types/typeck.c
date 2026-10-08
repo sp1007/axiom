@@ -103,6 +103,7 @@ static TypeId new_int_var(TypeckCtx *cx) {
     return ax_intern_type(&cx->thir->interner, &t);
 }
 
+static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path);
 static TypeId resolve_ty(TypeckCtx *cx, TypeId id) {
     if (TypeId_is_none(id)) return id;
     const AxType *t = ax_type_get(&cx->thir->interner, id);
@@ -163,10 +164,18 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
         return false;
     }
 
+    if (ta->kind == AX_TY_TUPLE && tb->kind == AX_TY_TUPLE) {
+        if (ta->tuple.field_count != tb->tuple.field_count) return false;
+        bool ok = true;
+        for (size_t i = 0; i < ta->tuple.field_count; i++) {
+            if (!unify_ty(cx, ta->tuple.fields[i], tb->tuple.fields[i])) ok = false;
+        }
+        return ok;
+    }
+
     return false;
 }
 
-/* The coercion seam: report a mismatch once and poison the result. */
 static TypeId coerce(TypeckCtx *cx, TypeId ty, TypeId expected, Span span) {
     if (TypeId_is_none(expected)) return ty;
     if (!unify_ty(cx, ty, expected)) {
@@ -202,8 +211,10 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         if (ax_sv_eq_cstr(name, "bool")) return cx->thir->interner.t_bool;
         if (ax_sv_eq_cstr(name, "char")) return cx->thir->interner.t_char;
         if (ax_sv_eq_cstr(name, "never")) return cx->thir->interner.t_never;
-        // AXS-SEM-010: f32/f64 (and everything else) are outside the axiom0 subset.
-        return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+        if (ax_sv_eq_cstr(name, "f32") || ax_sv_eq_cstr(name, "f64")) return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+
+        TypeId t = lookup_path_type(cx, &ht->path.path);
+        return t;
     }
     if (ht->kind == AX_HIR_TYPE_FN) {
         AxType t;
@@ -225,6 +236,17 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         } else {
             t.fn.param_types = NULL;
         }
+        return ax_intern_type(&cx->thir->interner, &t);
+    }
+    if (ht->kind == AX_HIR_TYPE_TUPLE) {
+        size_t count = 0;
+        for (const AxHirType *e = ht->tuple.elem_types; e; e = e->next) count++;
+        TypeId *fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
+        size_t i = 0;
+        for (const AxHirType *e = ht->tuple.elem_types; e; e = e->next) {
+            fields[i++] = hir_type_to_typeid(cx, e);
+        }
+        AxType t = { .kind = AX_TY_TUPLE, .tuple = { .field_count = count, .fields = fields } };
         return ax_intern_type(&cx->thir->interner, &t);
     }
     return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
@@ -494,6 +516,24 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
         }
         case AX_HIR_PAT_WILDCARD:
             break;
+
+        case AX_HIR_PAT_STRUCT: {
+            TypeId path_ty = lookup_path_type(cx, &pat->struct_pat.path);
+            if (!is_error(cx, path_ty)) {
+                const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
+                if (t->kind != AX_TY_STRUCT && t->kind != AX_TY_ERROR) {
+                    return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                } else {
+                    return path_ty;
+                }
+            } else {
+                return cx->thir->interner.t_error;
+            }
+        }
+        case AX_HIR_PAT_TUPLE: {
+            return cx->thir->interner.t_error; // Stub for tuple patterns
+        }
+
         default:
             return type_error(cx, pat->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
     }
@@ -508,8 +548,44 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_STRUCT) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_STRUCT;
+            st.strct.def = it;
+            
+            size_t count = 0;
+            for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) count++;
+            st.strct.field_count = count;
+            
+            if (count > 0) {
+                st.strct.fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
+                size_t i = 0;
+                for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) {
+                    st.strct.fields[i++] = hir_type_to_typeid(cx, f->type);
+                }
+            } else {
+                st.strct.fields = NULL;
+            }
+            
+            for (const AxHirAttr *a = it->attrs; a; a = a->next) {
+                StrView aname = ax_interner_get(cx->str_in, a->name);
+                if (ax_sv_eq_cstr(aname, "repr")) {
+                    st.strct.is_repr_c = true;
+                }
+            }
+            
+            TypeId st_ty = ax_intern_type(&cx->thir->interner, &st);
+            AxItemTypeMap_insert(&cx->thir->item_types, it, st_ty);
+        }
         if (it->kind == AX_HIR_ITEM_FN) {
             StrView it_name = ax_interner_get(cx->str_in, it->fn.name);
+            if (ax_sv_eq(it_name, name)) {
+                TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
+                if (t) return *t;
+            }
+        } else if (it->kind == AX_HIR_ITEM_STRUCT) {
+            StrView it_name = ax_interner_get(cx->str_in, it->struct_decl.name);
             if (ax_sv_eq(it_name, name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (t) return *t;
@@ -709,6 +785,126 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             return in->t_error;
         case AX_HIR_EXPR_LITERAL:
             return check_literal(cx, expr);
+        case AX_HIR_EXPR_TUPLE: {
+            size_t count = 0;
+            for (AxHirExpr *e = expr->tuple.elems; e; e = e->next) count++;
+            TypeId *fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
+            size_t i = 0;
+            
+            const AxType *exp_t = NULL;
+            if (TypeId_is_some(expected)) {
+                exp_t = ax_type_get(&cx->thir->interner, resolve_ty(cx, expected));
+                if (exp_t->kind != AX_TY_TUPLE || exp_t->tuple.field_count != count) {
+                    exp_t = NULL;
+                }
+            }
+
+            for (AxHirExpr *e = expr->tuple.elems; e; e = e->next) {
+                TypeId exp_elem = exp_t ? exp_t->tuple.fields[i] : TypeId_none();
+                fields[i++] = check_expr(cx, e, exp_elem);
+            }
+            AxType t = { .kind = AX_TY_TUPLE, .tuple = { .field_count = count, .fields = fields } };
+            return ax_intern_type(&cx->thir->interner, &t);
+        }
+
+        case AX_HIR_EXPR_STRUCT: {
+            TypeId path_ty = lookup_path_type(cx, &expr->struct_lit.path);
+            if (!is_error(cx, path_ty)) {
+                const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
+                if (t->kind != AX_TY_STRUCT) {
+                    return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                }
+                
+                // check duplicate fields
+                for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                    StrView iname = ax_interner_get(cx->str_in, init->name);
+                    for (const AxHirFieldInit *other = init->next; other; other = other->next) {
+                        StrView oname = ax_interner_get(cx->str_in, other->name);
+                        if (ax_sv_eq(iname, oname)) {
+                            type_error(cx, other->span, AX_TYPE_DUPLICATE_FIELD);
+                        }
+                    }
+                }
+
+                // check fields
+                for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                    StrView iname = ax_interner_get(cx->str_in, init->name);
+                    bool found = false;
+                    size_t idx = 0;
+                    for (const AxHirFieldDecl *f = t->strct.def->struct_decl.struct_fields; f; f = f->next) {
+                        StrView fname = ax_interner_get(cx->str_in, f->name);
+                        if (ax_sv_eq(fname, iname)) {
+                            found = true;
+                            check_expr(cx, init->expr, t->strct.fields[idx]);
+                            break;
+                        }
+                        idx++;
+                    }
+                    if (!found) {
+                        type_error(cx, init->span, AX_TYPE_UNKNOWN_FIELD);
+                    }
+                }
+                // check missing
+                for (const AxHirFieldDecl *f = t->strct.def->struct_decl.struct_fields; f; f = f->next) {
+                    StrView fname = ax_interner_get(cx->str_in, f->name);
+                    bool found = false;
+                    for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                        StrView iname = ax_interner_get(cx->str_in, init->name);
+                        if (ax_sv_eq(fname, iname)) found = true;
+                    }
+                    if (!found) {
+                        type_error(cx, expr->span, AX_TYPE_MISSING_FIELD);
+                    }
+                }
+            }
+            return path_ty;
+        }
+        case AX_HIR_EXPR_FIELD: {
+            TypeId obj_ty = check_expr(cx, expr->field.base, TypeId_none());
+            if (!is_error(cx, obj_ty)) {
+                const AxType *t = ax_type_get(&cx->thir->interner, obj_ty);
+                if (t->kind == AX_TY_STRUCT) {
+                    bool found = false;
+                    size_t idx = 0;
+                    for (const AxHirFieldDecl *f = t->strct.def->struct_decl.struct_fields; f; f = f->next) {
+                        StrView fname = ax_interner_get(cx->str_in, f->name);
+                        StrView search = ax_interner_get(cx->str_in, expr->field.name);
+                        if (ax_sv_eq(fname, search)) {
+                            found = true;
+                            return t->strct.fields[idx];
+                        }
+                        idx++;
+                    }
+                    if (!found) {
+                        return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                    }
+                } else {
+                    return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                }
+            }
+            return cx->thir->interner.t_error;
+        }
+        case AX_HIR_EXPR_TUPLE_INDEX: {
+            TypeId obj_ty = check_expr(cx, expr->tuple_index.base, TypeId_none());
+            if (!is_error(cx, obj_ty)) {
+                const AxType *t = ax_type_get(&cx->thir->interner, obj_ty);
+                if (t->kind == AX_TY_STRUCT && t->strct.def->struct_decl.is_tuple) {
+                    if (expr->tuple_index.tuple_index < t->strct.field_count) {
+                        return t->strct.fields[expr->tuple_index.tuple_index];
+                    }
+                    return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                } else if (t->kind == AX_TY_TUPLE) {
+                    if (expr->tuple_index.tuple_index < t->tuple.field_count) {
+                        return t->tuple.fields[expr->tuple_index.tuple_index];
+                    }
+                    return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                } else {
+                    return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                }
+            }
+            return cx->thir->interner.t_error;
+        }
+
         case AX_HIR_EXPR_PATH: {
             TypeId t = lookup_path_type(cx, &expr->path.path);
             if (expr->path.path.symbol.v != 0) {
@@ -848,7 +1044,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
 
         // Valid Axiom outside the axiom0 subset (AXD-013): a diagnostic, never a silent type.
         case AX_HIR_EXPR_ARRAY:
-        case AX_HIR_EXPR_STRUCT:
+        /* case AX_HIR_EXPR_STRUCT: */
         case AX_HIR_EXPR_MATCH:
         case AX_HIR_EXPR_FOR:
         case AX_HIR_EXPR_UNSAFE:
@@ -856,8 +1052,8 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         case AX_HIR_EXPR_COMPTIME:
         case AX_HIR_EXPR_CLOSURE:
         case AX_HIR_EXPR_RANGE:
-        case AX_HIR_EXPR_FIELD:
-        case AX_HIR_EXPR_TUPLE_INDEX:
+        /* case AX_HIR_EXPR_FIELD: */
+        /* case AX_HIR_EXPR_TUPLE_INDEX: */
         case AX_HIR_EXPR_METHOD_CALL:
         case AX_HIR_EXPR_INDEX:
         case AX_HIR_EXPR_TRY:
@@ -936,6 +1132,27 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
                 }
             } else {
                 left = check_expr(cx, s->assign.left, TypeId_none());
+                const AxHirExpr* base = s->assign.left;
+                while (base->kind == AX_HIR_EXPR_FIELD || base->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+                    if (base->kind == AX_HIR_EXPR_FIELD) {
+                        base = base->field.base;
+                    } else {
+                        base = base->tuple_index.base;
+                    }
+                }
+                if (base->kind == AX_HIR_EXPR_PATH) {
+                    if (base->path.path.symbol.v != 0) {
+                        AxSymbolId sym = base->path.path.symbol;
+                        for (size_t i = 0; i < cx->vars_len; i++) {
+                            if (cx->vars[i].sym.v == sym.v) {
+                                if (cx->vars[i].is_init && !cx->vars[i].is_mut) {
+                                    type_error(cx, s->assign.left->span, AX_TYPE_ASSIGN_IMMUTABLE);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
             
             coerce(cx, right, left, s->assign.right->span);

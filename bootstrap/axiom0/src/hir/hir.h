@@ -181,6 +181,7 @@ typedef enum AxHirExprKind {
     AX_HIR_EXPR_ERROR,
     AX_HIR_EXPR_LITERAL,
     AX_HIR_EXPR_PATH,
+    AX_HIR_EXPR_TUPLE,
     AX_HIR_EXPR_ARRAY,
     AX_HIR_EXPR_STRUCT,
     AX_HIR_EXPR_BLOCK,
@@ -238,6 +239,9 @@ struct AxHirExpr {
         struct {
             AxHirPath path;
         } path;
+        struct {
+            AxHirExpr *elems;
+        } tuple;
         struct {
             AxHirExpr *elems;
             AxHirExpr *count;

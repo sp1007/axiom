@@ -4,6 +4,7 @@
 typedef struct LirBuilder {
     AxArena *arena;
     TypeInterner *interner;
+    const AxMirBody *mir;
     
     AxLirStackSlot *slots;
     size_t slot_count;
@@ -68,50 +69,80 @@ static void emit_store(LirBuilder *b, AxLirVRegId ptr, AxLirVRegId val) {
 
 static AxLirVRegId emit_offset(LirBuilder *b, AxLirVRegId ptr, AxLirVRegId off) {
     AxLirVRegId dest = make_vreg(b, b->interner->t_usize);
-    AxLirInst inst = { .kind = AX_LIR_INST_OFFSET, .dest = dest, .binary = { .lhs = ptr, .rhs = off } };
+    AxLirInst inst = { .kind = AX_LIR_INST_ADD, .dest = dest, .binary = { .lhs = ptr, .rhs = off } };
     emit_inst(b, inst);
     return dest;
 }
 
-static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place) {
+static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, TypeId *out_ty) {
     AxLirStackSlotId slot = { place->local.v };
     AxLirVRegId addr = emit_stack_addr(b, slot);
+    TypeId ty = b->mir->locals[place->local.v].ty;
     
     // Projections
     for (size_t i = 0; i < place->proj_count; i++) {
         switch (place->projs[i].kind) {
             case AX_MIR_PROJ_DEREF: {
-                // If it's a pointer, dereferencing means reading the pointer value as the new address
-                // Assuming pointers are usize
                 addr = emit_load(b, addr, b->interner->t_usize);
+                const AxType *t = ax_type_get(b->interner, ty);
+                if (t && t->kind == AX_TY_PTR) ty = t->ptr.pointee;
                 break;
             }
             case AX_MIR_PROJ_FIELD: {
-                // To do: get field offset from layout.
-                // For naive lowering, we can't fully lower fields without layout. 
-                // We'll just emit an offset of 0 or dummy for now until we have layout.
-                AxLirVRegId dummy_off = emit_const(b, 0, b->interner->t_usize);
+                const AxType *t = ax_type_get(b->interner, ty);
+                uint32_t idx = place->projs[i].field_idx;
+                uint32_t offset = 0;
+                uint32_t max_align = 1;
+                TypeId next_ty = {0};
+                size_t f_count = 0;
+                TypeId *fields = NULL;
+                if (t && t->kind == AX_TY_STRUCT) {
+                    f_count = t->strct.field_count;
+                    fields = t->strct.fields;
+                } else if (t && t->kind == AX_TY_TUPLE) {
+                    f_count = t->tuple.field_count;
+                    fields = t->tuple.fields;
+                }
+                
+                for (size_t k = 0; k <= idx && k < f_count; k++) {
+                    TypeId field_ty = fields[k];
+                    uint32_t fa = ax_type_align(field_ty, b->interner);
+                    uint32_t fs = ax_type_size(field_ty, b->interner);
+                    if (fa > max_align) max_align = fa;
+                    offset = (offset + fa - 1) & ~(fa - 1);
+                    if (k == idx) {
+                        next_ty = field_ty;
+                        break;
+                    }
+                    offset += fs;
+                }
+                ty = next_ty;
+                AxLirVRegId dummy_off = emit_const(b, offset, b->interner->t_usize);
                 addr = emit_offset(b, addr, dummy_off);
                 break;
             }
             case AX_MIR_PROJ_INDEX: {
-                // Naive: index value * size
+                const AxType *t = ax_type_get(b->interner, ty);
+                TypeId elem_ty = {0};
+                if (t && t->kind == AX_TY_ARRAY) elem_ty = t->array.elem;
                 AxLirStackSlotId idx_slot = { place->projs[i].index_local.v };
                 AxLirVRegId idx_addr = emit_stack_addr(b, idx_slot);
                 AxLirVRegId idx_val = emit_load(b, idx_addr, b->interner->t_usize);
-                AxLirVRegId dummy_size = emit_const(b, 1, b->interner->t_usize); // dummy size
+                uint32_t fs = ax_type_size(elem_ty, b->interner);
+                AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
                 AxLirVRegId off = make_vreg(b, b->interner->t_usize);
                 emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = off, .binary = { .lhs = idx_val, .rhs = dummy_size } });
                 addr = emit_offset(b, addr, off);
+                ty = elem_ty;
                 break;
             }
             case AX_MIR_PROJ_DOWNCAST: {
-                // No address change for downcast in many ABIs, just reinterpret.
                 break;
             }
         }
     }
     
+    if (out_ty) *out_ty = ty;
     return addr;
 }
 
@@ -119,11 +150,9 @@ static AxLirVRegId lower_operand(LirBuilder *b, const AxMirOperand *op) {
     switch (op->kind) {
         case AX_MIR_OP_COPY:
         case AX_MIR_OP_MOVE: {
-            AxLirVRegId addr = lower_place_addr(b, &op->place);
-            // We need to know the type, but we don't have place type easily accessible without MIR typeck here.
-            // But we can approximate or use a dummy type. Let's use the local's type as an approximation for naive lowering.
-            // Wait, we can get type from locals array? We don't have it explicitly passed unless we track it.
-            return emit_load(b, addr, b->interner->t_isize);
+            TypeId place_ty;
+            AxLirVRegId addr = lower_place_addr(b, &op->place, &place_ty);
+            return emit_load(b, addr, place_ty);
         }
         case AX_MIR_OP_CONST:
             return emit_const(b, op->constant.val, op->constant.ty);
@@ -149,7 +178,7 @@ static AxLirInstKind lower_binop(AxMirBinOp op, bool is_signed) {
         case AX_MIR_BINOP_LE: return is_signed ? AX_LIR_INST_ICMP_SLE : AX_LIR_INST_ICMP_ULE;
         case AX_MIR_BINOP_GT: return is_signed ? AX_LIR_INST_ICMP_SGT : AX_LIR_INST_ICMP_UGT;
         case AX_MIR_BINOP_GE: return is_signed ? AX_LIR_INST_ICMP_SGE : AX_LIR_INST_ICMP_UGE;
-        case AX_MIR_BINOP_OFFSET: return AX_LIR_INST_OFFSET;
+        case AX_MIR_BINOP_OFFSET: return AX_LIR_INST_ADD;
     }
     return AX_LIR_INST_ADD;
 }
@@ -159,11 +188,10 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
         case AX_MIR_RVALUE_USE:
             return lower_operand(b, &rv->use);
         case AX_MIR_RVALUE_REF:
-            return lower_place_addr(b, &rv->ref.place);
+            return lower_place_addr(b, &rv->ref.place, NULL);
         case AX_MIR_RVALUE_BINARY_OP: {
             AxLirVRegId lhs = lower_operand(b, &rv->binary_op.lhs);
             AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
-            // Assuming signed for now or fetching from type
             const AxType *t = ax_type_get(b->interner, dest_ty);
               bool is_signed = true;
               if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
@@ -183,7 +211,8 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .unary = { .operand = op } });
             return dest;
         }
-        // Simplified mapping for other RValues
+        case AX_MIR_RVALUE_AGGREGATE:
+            return emit_const(b, 0, dest_ty); // Not used directly, handled in assign
         default:
             return emit_const(b, 0, b->interner->t_isize);
     }
@@ -191,13 +220,13 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
 
 #include "kernel/interner.h"
 #include "kernel/str.h"
-#include "hir/hir.h"
+
 AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInterner *interner, struct StrInterner *str_in, const AxType *fn_ty) {
     
     AxLirBody *lir = malloc(sizeof(AxLirBody));
     ax_arena_init(&lir->arena, 4096);
     
-    LirBuilder b = { .arena = &lir->arena, .interner = interner };
+    LirBuilder b = { .arena = &lir->arena, .interner = interner, .mir = mir };
     
     // Create stack slots
     b.slot_count = mir->local_count;
@@ -227,8 +256,34 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
             const AxMirStmt *stmt = &mbb->stmts[j];
             if (stmt->kind == AX_MIR_STMT_ASSIGN) {
                 TypeId dest_ty = mir->locals[stmt->assign.place.local.v].ty;
+                if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
+                    AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
+                    uint32_t offset = 0;
+                    uint32_t max_align = 1;
+                    const AxType *ty = ax_type_get(b.interner, dest_ty);
+                    for (size_t k = 0; k < stmt->assign.rvalue.aggregate.operand_count; k++) {
+                        TypeId field_ty = {0};
+                        if (ty->kind == AX_TY_STRUCT) field_ty = ty->strct.fields[k];
+                        else if (ty->kind == AX_TY_TUPLE) field_ty = ty->tuple.fields[k];
+                        
+                        uint32_t fa = ax_type_align(field_ty, b.interner);
+                        uint32_t fs = ax_type_size(field_ty, b.interner);
+                        if (fa > max_align) max_align = fa;
+                        offset = (offset + fa - 1) & ~(fa - 1);
+                        
+                        AxLirVRegId off_reg = emit_const(&b, offset, b.interner->t_usize);
+                        AxLirVRegId field_addr = emit_offset(&b, addr, off_reg);
+                        
+                        AxLirVRegId field_val = lower_operand(&b, &stmt->assign.rvalue.aggregate.operands[k]);
+                        emit_store(&b, field_addr, field_val);
+                        
+                        offset += fs;
+                    }
+                    continue;
+                }
+                
                 AxLirVRegId val = lower_rvalue(&b, &stmt->assign.rvalue, dest_ty);
-                AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place);
+                AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
                 emit_store(&b, addr, val);
             }
         }
@@ -288,7 +343,7 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
 
                 emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_RESULT, .dest = res, .abi_result = { .index = 0 } });
                 
-                AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination);
+                AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
                 emit_store(&b, dst_addr, res);
                 
                 term.kind = AX_LIR_TERM_JMP;

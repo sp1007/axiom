@@ -31,7 +31,7 @@ typedef struct {
 } InterpCtx;
 
 typedef struct {
-    uint64_t v; // Simple representation for integer/bool
+    uint64_t vals[8];
 } AxInterpValue;
 
 typedef struct {
@@ -65,22 +65,27 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
     return NULL;
 }
 
+
+static uint64_t* get_place_ptr(CallFrame *frame, const AxMirPlace *place) {
+    AxMirLocalId loc = place->local;
+    uint64_t *ptr = frame->locals[loc.v].vals;
+    for (size_t i = 0; i < place->proj_count; i++) {
+        AxMirProjection *proj = &place->projs[i];
+        if (proj->kind == AX_MIR_PROJ_FIELD) {
+            ptr += proj->field_idx;
+        }
+    }
+    return ptr;
+}
 static uint64_t eval_operand(CallFrame *frame, const AxMirOperand *op) {
     if (op->kind == AX_MIR_OP_CONST) {
-        if (op->constant.ty.v != 0 && frame->body) {
-            // How do we know it's bool? We don't easily have interner here, but we can print all constants!
-        }
         return op->constant.val;
     } else {
-        AxMirLocalId loc = op->place.local;
-        return frame->locals[loc.v].v;
+        return *get_place_ptr(frame, &op->place);
     }
 }
 
-static void write_place(CallFrame *frame, const AxMirPlace *place, uint64_t val) {
-    AxMirLocalId loc = place->local;
-    frame->locals[loc.v].v = val;
-}
+
 
 static void panic_interp(InterpCtx *ctx, const char *msg) {
     if (ctx->out_panic_msg) {
@@ -102,7 +107,7 @@ static void check_step_limit(InterpCtx *ctx) {
     }
 }
 
-static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t arg_count, uint64_t *out_ret) {
+static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret) {
     ctx->call_depth++;
     if (ctx->call_depth_limit > 0 && ctx->call_depth > ctx->call_depth_limit) {
         AxDiagnostic d = {0};
@@ -117,6 +122,10 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
     }
     
     bool is_intrinsic = false;
+    uint64_t args[16] = {0};
+    for (size_t i = 0; i < arg_count && i < 16; i++) {
+        if (args_raw) args[i] = args_raw[i].vals[0];
+    }
     for (AxHirAttr *attr = func->attrs; attr; attr = attr->next) {
         StrView an = ax_interner_get(ctx->interner, attr->name);
         if (ax_sv_eq_cstr(an, "intrinsic")) {
@@ -131,7 +140,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
             if (arg_count > 0 && args[0] == 0) {
                 panic_interp(ctx, "assertion failed");
             }
-            if (out_ret) *out_ret = 0;
+            if (out_ret) out_ret->vals[0] = 0;
             return;
         } else if (ax_sv_eq_cstr(name, "unreachable")) {
             panic_interp(ctx, "entered unreachable code");
@@ -161,56 +170,56 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
 
             if (IS_OP(name, "wrapping_add")) {
                 if (out_ret && arg_count == 2) {
-                    *out_ret = (args[0] + args[1]) & mask;
+                    out_ret->vals[0] = (args[0] + args[1]) & mask;
                     // printf("wrapping_add %llu + %llu = %llu\n", args[0], args[1], *out_ret);
                 }
                 return;
             } else if (IS_OP(name, "wrapping_sub")) {
-                if (out_ret && arg_count == 2) *out_ret = (args[0] - args[1]) & mask;
+                if (out_ret && arg_count == 2) out_ret->vals[0] = (args[0] - args[1]) & mask;
                 return;
             } else if (IS_OP(name, "wrapping_mul")) {
-                if (out_ret && arg_count == 2) *out_ret = (args[0] * args[1]) & mask;
+                if (out_ret && arg_count == 2) out_ret->vals[0] = (args[0] * args[1]) & mask;
                 return;
             } else if (IS_OP(name, "wrapping_neg")) {
-                if (out_ret && arg_count == 1) *out_ret = (0 - args[0]) & mask;
+                if (out_ret && arg_count == 1) out_ret->vals[0] = (0 - args[0]) & mask;
                 return;
             } else if (IS_OP(name, "rotate_left")) {
                 if (out_ret && arg_count == 2) {
                     uint32_t n = (uint32_t)args[1] % bits;
-                    *out_ret = ((args[0] << n) | (args[0] >> ((bits - n) % bits))) & mask;
+                    out_ret->vals[0] = ((args[0] << n) | (args[0] >> ((bits - n) % bits))) & mask;
                 }
                 return;
             } else if (IS_OP(name, "rotate_right")) {
                 if (out_ret && arg_count == 2) {
                     uint32_t n = (uint32_t)args[1] % bits;
-                    *out_ret = ((args[0] >> n) | (args[0] << ((bits - n) % bits))) & mask;
+                    out_ret->vals[0] = ((args[0] >> n) | (args[0] << ((bits - n) % bits))) & mask;
                 }
                 return;
             } else if (IS_OP(name, "leading_zeros")) {
                 if (out_ret && arg_count == 1) {
                     uint64_t val = args[0] & mask;
-                    if (val == 0) *out_ret = bits;
+                    if (val == 0) out_ret->vals[0] = bits;
                     else {
                         uint32_t lz = 0;
                         for (int i = bits - 1; i >= 0; i--) {
                             if ((val >> i) & 1) break;
                             lz++;
                         }
-                        *out_ret = lz;
+                        out_ret->vals[0] = lz;
                     }
                 }
                 return;
             } else if (IS_OP(name, "trailing_zeros")) {
                 if (out_ret && arg_count == 1) {
                     uint64_t val = args[0] & mask;
-                    if (val == 0) *out_ret = bits;
+                    if (val == 0) out_ret->vals[0] = bits;
                     else {
                         uint32_t tz = 0;
                         for (int i = 0; i < bits; i++) {
                             if ((val >> i) & 1) break;
                             tz++;
                         }
-                        *out_ret = tz;
+                        out_ret->vals[0] = tz;
                     }
                 }
                 return;
@@ -221,7 +230,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                     for (int i = 0; i < bits; i++) {
                         if ((val >> i) & 1) ones++;
                     }
-                    *out_ret = ones;
+                    out_ret->vals[0] = ones;
                 }
                 return;
             }
@@ -242,7 +251,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
     // args start at local 1
     for (size_t i = 0; i < arg_count; i++) {
         if (i + 1 < body->local_count) {
-            frame.locals[i + 1].v = args[i];
+            frame.locals[i + 1] = args_raw[i];
         }
     }
     
@@ -268,9 +277,22 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
             if (stmt->kind == AX_MIR_STMT_ASSIGN) {
                 uint64_t val = 0;
                 switch (stmt->assign.rvalue.kind) {
-                    case AX_MIR_RVALUE_USE:
-                        val = eval_operand(&frame, &stmt->assign.rvalue.use);
-                        break;
+                    case AX_MIR_RVALUE_USE: {
+                        uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place);
+                        if (stmt->assign.rvalue.use.kind == AX_MIR_OP_CONST) {
+                            dest[0] = stmt->assign.rvalue.use.constant.val;
+                        } else {
+                            memcpy(dest, get_place_ptr(&frame, &stmt->assign.rvalue.use.place), sizeof(AxInterpValue));
+                        }
+                        goto skip_write;
+                    }
+                    case AX_MIR_RVALUE_AGGREGATE: {
+                        uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place);
+                        for (size_t i = 0; i < stmt->assign.rvalue.aggregate.operand_count; i++) {
+                            dest[i] = eval_operand(&frame, &stmt->assign.rvalue.aggregate.operands[i]);
+                        }
+                        goto skip_write;
+                    }
                     case AX_MIR_RVALUE_BINARY_OP:
                     case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
                         uint64_t lhs = eval_operand(&frame, &stmt->assign.rvalue.binary_op.lhs);
@@ -617,7 +639,8 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                         break;
                 }
                 if (ctx->failed) break;
-                write_place(&frame, &stmt->assign.place, val);
+                uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place); dest[0] = val;
+skip_write:;
             }
         }
         
@@ -658,18 +681,18 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
                 break;
             }
             
-            uint64_t *call_args = calloc(term->call.arg_count, sizeof(uint64_t));
+            AxInterpValue *call_args = calloc(term->call.arg_count, sizeof(AxInterpValue));
             for (size_t i = 0; i < term->call.arg_count; i++) {
-                call_args[i] = eval_operand(&frame, &term->call.args[i]);
+                if (term->call.args[i].kind == AX_MIR_OP_CONST) { call_args[i].vals[0] = term->call.args[i].constant.val; } else { memcpy(&call_args[i], get_place_ptr(&frame, &term->call.args[i].place), sizeof(AxInterpValue)); }
             }
             
-            uint64_t ret_val = 0;
+            AxInterpValue ret_val = {0};
             eval_call(ctx, callee, call_args, term->call.arg_count, &ret_val);
             free(call_args);
             
             if (ctx->failed) break;
             
-            write_place(&frame, &term->call.destination, ret_val);
+            memcpy(get_place_ptr(&frame, &term->call.destination), &ret_val, sizeof(AxInterpValue));
             current_bb = term->call.target;
         } else {
             panic_interp(ctx, "unsupported terminator");
@@ -677,7 +700,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, uint64_t *args, size_t ar
         }
     }
     
-    *out_ret = frame.locals[0].v;
+    if (out_ret) *out_ret = frame.locals[0];
     free(frame.locals);
     ctx->call_depth--;
 }
@@ -697,7 +720,7 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.out_panic_msg = out_panic_msg;
     ax_arena_init(&ctx.arena, 0);
     
-    uint64_t ret = 0;
+    AxInterpValue ret = {0};
     eval_call(&ctx, main_fn, NULL, 0, &ret);
     
     ax_arena_destroy(&ctx.arena);
@@ -705,5 +728,5 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     if (ctx.failed) {
         return ctx.exit_code;
     }
-    return (int)ret;
+    return (int)ret.vals[0];
 }

@@ -249,6 +249,7 @@ static void d_expr(DumpState *st, const AxHirExpr *n) {
             case AX_HIR_EXPR_LITERAL: d_list_begin(st, "ExprLiteral"); { TypeId *ty = (TypeId*)AxExprTypeMap_get(&st->thir->expr_types, (const AxHirExpr*)n); if (ty) d_typeid(st, *ty); } break;
             case AX_HIR_EXPR_PATH: d_list_begin(st, "ExprPath"); { TypeId *ty = (TypeId*)AxExprTypeMap_get(&st->thir->expr_types, (const AxHirExpr*)n); if (ty) d_typeid(st, *ty); } d_path(st, &n->path.path); break;
             case AX_HIR_EXPR_ARRAY: d_list_begin(st, "ExprArray"); { TypeId *ty = (TypeId*)AxExprTypeMap_get(&st->thir->expr_types, (const AxHirExpr*)n); if (ty) d_typeid(st, *ty); } d_expr(st, n->array.elems); d_expr(st, n->array.count); break;
+            case AX_HIR_EXPR_TUPLE: d_list_begin(st, "ExprTuple"); { TypeId *ty = (TypeId*)AxExprTypeMap_get(&st->thir->expr_types, (const AxHirExpr*)n); if (ty) d_typeid(st, *ty); } d_expr(st, n->tuple.elems); break;
             case AX_HIR_EXPR_STRUCT: d_list_begin(st, "ExprStruct"); { TypeId *ty = (TypeId*)AxExprTypeMap_get(&st->thir->expr_types, (const AxHirExpr*)n); if (ty) d_typeid(st, *ty); } d_path(st, &n->struct_lit.path); 
                 for(AxHirFieldInit *f = n->struct_lit.fields; f; f = f->next) {
                     d_nl(st); d_list_begin(st, "FieldInit"); d_strid(st, f->name); d_expr(st, f->expr); d_list_end(st);

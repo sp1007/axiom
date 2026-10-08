@@ -184,6 +184,7 @@ typedef enum AxAstExprKind {
     AX_EXPR_ERROR,
     AX_EXPR_LITERAL,
     AX_EXPR_PATH,
+    AX_EXPR_TUPLE,
     AX_EXPR_PAREN,
     AX_EXPR_ARRAY,
     AX_EXPR_STRUCT,
@@ -285,6 +286,9 @@ struct AxAstExpr {
         struct {
             AxAstExpr *expr;
         } paren;
+        struct {
+            AxAstExpr *elems;
+        } tuple;
         struct {
             AxAstExpr *elems;
             AxAstExpr *count; /* if repeat [v; n] */

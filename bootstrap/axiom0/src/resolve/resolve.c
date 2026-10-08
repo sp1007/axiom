@@ -515,7 +515,14 @@ static void resolve_item_bodies(Env *env, Scope *scope, const AxAstItem *n) {
                 if (n->struct_decl.is_tuple) {
                     resolve_type(env, s_scope, n->struct_decl.tuple_types);
                 } else {
+                    SymEnv field_names; SymEnv_init(&field_names);
                     for(AxAstFieldDecl *f = n->struct_decl.struct_fields; f; f = f->next) {
+                        if (SymEnv_contains(&field_names, f->name.v)) {
+                            emit_diag(env, AX_NAME_DUPLICATE, f->span);
+                        } else {
+                            Symbol s = {0};
+                            SymEnv_insert(&field_names, f->name.v, s);
+                        }
                         resolve_type(env, s_scope, f->type);
                     }
                 }

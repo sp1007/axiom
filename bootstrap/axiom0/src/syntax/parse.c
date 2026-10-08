@@ -704,23 +704,23 @@ static AxAstExpr *parse_primary(Parser *p) {
         p->mode_on = false;
         p->no_struct = false;
         if (consume(p, AX_TOK_RPAREN)) {
-            expr->kind = AX_EXPR_PAREN; // we use paren with empty for unit? actually AST doesn't have tuple expr. 
-            // Wait, ast.h says ParenExpr has paren.expr. How to represent ()?
-            // Actually, unit is an empty tuple, but ast.h has no AX_EXPR_TUPLE! 
-            // Let's just create an empty array or something? Or maybe it's missing in ast.h? 
-            // ast.h: AX_EXPR_PAREN with NULL expr?
-            expr->paren.expr = NULL;
+            expr->kind = AX_EXPR_TUPLE;
+            expr->tuple.elems = NULL;
         } else {
             AxAstExpr *inner = parse_expr(p);
             if (consume(p, AX_TOK_COMMA)) {
-                // tuple
-                // Wait! AST doesn't have AX_EXPR_TUPLE in ast.h!
-                // Let's just create it as Paren... wait, I'll just use AX_EXPR_PAREN and chain `next`?
-                // `expr->next` is used for lists. So `inner->next` can be the next elements.
-                inner->next = parse_expr(p); // this is hacky, but what else?
+                expr->kind = AX_EXPR_TUPLE;
+                AxAstExpr **curr = &inner->next;
+                while (!check(p, AX_TOK_RPAREN) && !check(p, AX_TOK_EOF)) {
+                    *curr = parse_expr(p);
+                    curr = &(*curr)->next;
+                    if (!consume(p, AX_TOK_COMMA)) break;
+                }
+                expr->tuple.elems = inner;
+            } else {
+                expr->kind = AX_EXPR_PAREN;
+                expr->paren.expr = inner;
             }
-            expr->kind = AX_EXPR_PAREN;
-            expr->paren.expr = inner;
             expect(p, AX_TOK_RPAREN, AX_PARSE_UNCLOSED_DELIMITER, "Expected ')'");
         }
         p->mode_on = old;
@@ -947,9 +947,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
                 postfix->span = left->span;
                 postfix->kind = AX_EXPR_POSTFIX;
                 postfix->postfix.head = left;
-                AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-                
-                if (ax_sv_eq(ax_interner_get(p->interner, peek(p)->val.ident_val), ax_sv_cstr("await"))) {
+                AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; if (ax_sv_eq(ax_interner_get(p->interner, peek(p)->val.ident_val), ax_sv_cstr("await"))) {
                     seg->kind = AX_POSTFIX_AWAIT;
                     advance(p);
                 } else {
@@ -975,8 +973,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
                 postfix->span = left->span;
                 postfix->kind = AX_EXPR_POSTFIX;
                 postfix->postfix.head = left;
-                AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-                seg->kind = AX_POSTFIX_TUPLE_INDEX;
+                AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; seg->kind = AX_POSTFIX_TUPLE_INDEX;
                 // Parse int value... Wait, val is union.
                 seg->tuple_index = (uint32_t)peek(p)->val.int_val.value; // assuming int_val exists
                 advance(p);
@@ -995,8 +992,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             postfix->span = left->span;
             postfix->kind = AX_EXPR_POSTFIX;
             postfix->postfix.head = left;
-            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-            seg->kind = AX_POSTFIX_CALL;
+            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; seg->kind = AX_POSTFIX_CALL;
             
             bool old = p->mode_on;
             p->mode_on = false;
@@ -1020,8 +1016,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             postfix->span = left->span;
             postfix->kind = AX_EXPR_POSTFIX;
             postfix->postfix.head = left;
-            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-            seg->kind = AX_POSTFIX_INDEX;
+            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; seg->kind = AX_POSTFIX_INDEX;
             
             bool old = p->mode_on;
             p->mode_on = false;
@@ -1041,8 +1036,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             postfix->span = left->span;
             postfix->kind = AX_EXPR_POSTFIX;
             postfix->postfix.head = left;
-            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-            seg->kind = AX_POSTFIX_TRY;
+            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; seg->kind = AX_POSTFIX_TRY;
             postfix->postfix.segments = seg;
             left = postfix;
             continue;
@@ -1054,8 +1048,7 @@ static AxAstExpr *parse_expr_prec(Parser *p, int min_prec) {
             postfix->span = left->span;
             postfix->kind = AX_EXPR_POSTFIX;
             postfix->postfix.head = left;
-            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg);
-            seg->kind = AX_POSTFIX_ARROW;
+            AxAstPostfixSeg *seg = NEW_NODE(p, AxAstPostfixSeg); seg->span = postfix->span; seg->kind = AX_POSTFIX_ARROW;
             seg->arrow_name = peek(p)->val.ident_val;
             expect(p, AX_TOK_IDENT, AX_PARSE_EXPECTED_TOKEN, "Expected identifier after ->");
             postfix->postfix.segments = seg;

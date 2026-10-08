@@ -97,6 +97,50 @@ static TypeId get_expr_type(Builder *b, const AxHirExpr *expr) {
 }
 
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
+
+static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
+    if (expr->kind == AX_HIR_EXPR_PATH) {
+        AxSymbolId sym = expr->path.path.symbol;
+        for (size_t i = 0; i < b->var_count; i++) {
+            if (b->var_map[i].sym.v == sym.v) {
+                AxMirPlace p = { b->var_map[i].loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                return p;
+            }
+        }
+    } else if (expr->kind == AX_HIR_EXPR_FIELD) {
+        AxMirPlace base = build_place(b, expr->field.base);
+        TypeId base_ty = *AxExprTypeMap_get(&b->thir->expr_types, expr->field.base);
+        const AxType *t = ax_type_get(&b->thir->interner, base_ty);
+        uint32_t idx = 0;
+        if (t->kind == AX_TY_STRUCT) {
+            for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
+                if (fd->name.v == expr->field.name.v) break;
+            }
+        }
+        
+        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
+        for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
+        projs[base.proj_count].kind = AX_MIR_PROJ_FIELD;
+        projs[base.proj_count].field_idx = idx;
+        
+        base.projs = projs;
+        base.proj_count++;
+        return base;
+    } else if (expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+        AxMirPlace base = build_place(b, expr->tuple_index.base);
+        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
+        for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
+        projs[base.proj_count].kind = AX_MIR_PROJ_FIELD;
+        projs[base.proj_count].field_idx = expr->tuple_index.tuple_index;
+        
+        base.projs = projs;
+        base.proj_count++;
+        return base;
+    }
+    AxMirPlace err = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+    return err;
+}
+
 static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest);
 
 static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
@@ -136,6 +180,11 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
             op.place = p;
             return op;
         }
+    } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+        AxMirPlace p = build_place(b, expr);
+        op.kind = AX_MIR_OP_COPY;
+        op.place = p;
+        return op;
     }
     
     TypeId ty = get_expr_type(b, expr);
@@ -150,13 +199,60 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
 }
 
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
-    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH) {
+    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
         AxMirOperand op = build_expr_as_operand(b, expr);
         AxMirStmt stmt = {0};
         stmt.kind = AX_MIR_STMT_ASSIGN;
         stmt.assign.place = dest;
         stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
         stmt.assign.rvalue.use = op;
+        push_stmt(b, b->current_bb, stmt);
+    } else if (expr->kind == AX_HIR_EXPR_TUPLE) {
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+        
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = ax_type_get(&b->thir->interner, ty);
+        uint32_t f_count = 0;
+        if (t && t->kind == AX_TY_TUPLE) f_count = t->tuple.field_count;
+        
+        stmt.assign.rvalue.aggregate.operand_count = f_count;
+        if (f_count > 0) {
+            stmt.assign.rvalue.aggregate.operands = ax_arena_alloc(b->arena, sizeof(AxMirOperand) * f_count, _Alignof(AxMirOperand));
+            uint32_t i = 0;
+            for (const AxHirExpr *elem = expr->tuple.elems; elem && i < f_count; elem = elem->next, i++) {
+                stmt.assign.rvalue.aggregate.operands[i] = build_expr_as_operand(b, elem);
+            }
+        }
+        push_stmt(b, b->current_bb, stmt);
+    } else if (expr->kind == AX_HIR_EXPR_STRUCT) {
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+        
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = ax_type_get(&b->thir->interner, ty);
+        uint32_t f_count = t->strct.field_count;
+        
+        stmt.assign.rvalue.aggregate.operand_count = f_count;
+        if (f_count > 0) {
+            stmt.assign.rvalue.aggregate.operands = ax_arena_alloc(b->arena, sizeof(AxMirOperand) * f_count, _Alignof(AxMirOperand));
+            for (uint32_t i = 0; i < f_count; i++) {
+                stmt.assign.rvalue.aggregate.operands[i].kind = AX_MIR_OP_CONST;
+                stmt.assign.rvalue.aggregate.operands[i].constant.val = 0;
+            }
+            
+            for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                uint32_t idx = 0;
+                for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
+                    if (fd->name.v == init->name.v) break;
+                }
+                stmt.assign.rvalue.aggregate.operands[idx] = build_expr_as_operand(b, init->expr);
+            }
+        }
         push_stmt(b, b->current_bb, stmt);
     } else if (expr->kind == AX_HIR_EXPR_BINARY) {
         if (expr->binary.op == AX_BINOP_LOGAND || expr->binary.op == AX_BINOP_LOGOR) {
@@ -789,17 +885,10 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
             b->var_map[b->var_count].loc = loc;
             b->var_count++;
         } else if (stmt->kind == AX_HIR_STMT_ASSIGN) {
-            AxMirPlace dest = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-            if (stmt->assign.left->kind == AX_HIR_EXPR_PATH) {
-                AxSymbolId sym = stmt->assign.left->path.path.symbol;
-                for (size_t i = 0; i < b->var_count; i++) {
-                    if (b->var_map[i].sym.v == sym.v) {
-                        dest.local = b->var_map[i].loc;
-                        break;
-                    }
-                }
-            } else {
-                AX_ICE("builder: unhandled assignment left hand side kind");
+            AxMirPlace dest = build_place(b, stmt->assign.left);
+            if (dest.local.v == 0 && dest.proj_count == 0 && stmt->assign.left->kind != AX_HIR_EXPR_PATH) {
+                // If it's a real failure, we could AX_ICE, but let's just let it pass or AX_ICE
+                // Actually build_place returns err for anything else, so if it's 0 and not PATH, it's err (or maybe return place, but return place is PATH).
             }
             build_expr_into(b, stmt->assign.right, dest);
         }

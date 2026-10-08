@@ -50,6 +50,14 @@ TypeId ax_intern_type(TypeInterner *in, const AxType *type) {
             new_type->fn.param_types[i] = type->fn.param_types[i];
         }
     }
+    if (type->kind == AX_TY_TUPLE && type->tuple.field_count > 0) {
+        new_type->tuple.fields = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->tuple.field_count, _Alignof(TypeId));
+        for (size_t i = 0; i < type->tuple.field_count; i++) new_type->tuple.fields[i] = type->tuple.fields[i];
+    }
+    if (type->kind == AX_TY_STRUCT && type->strct.field_count > 0) {
+        new_type->strct.fields = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->strct.field_count, _Alignof(TypeId));
+        for (size_t i = 0; i < type->strct.field_count; i++) new_type->strct.fields[i] = type->strct.fields[i];
+    }
     
     if (in->len == in->cap) {
         in->types = (AxType **)ax_grow_array(in->types, &in->cap, sizeof(AxType *), in->len + 1);

@@ -30,6 +30,7 @@ typedef enum AxTypeKind {
 #define AX_TY_PTR (AX_TY_INT_VAR + 1)
 #define AX_TY_ARRAY (AX_TY_INT_VAR + 2)
 #define AX_TY_TUPLE (AX_TY_INT_VAR + 3)
+#define AX_TY_STRUCT (AX_TY_INT_VAR + 4)
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -56,6 +57,12 @@ typedef struct AxType {
             TypeId *fields;
             size_t field_count;
         } tuple;
+        struct {
+            const struct AxHirItem *def;
+            TypeId *fields;
+            size_t field_count;
+            bool is_repr_c;
+        } strct;
     };
 } AxType;
 
@@ -84,6 +91,8 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         for (size_t i = 0; i < k->tuple.field_count; i++) {
             h = ax_hash_combine(h, ax_hash_u32(k->tuple.fields[i].v));
         }
+    } else if (k->kind == AX_TY_STRUCT) {
+        h = ax_hash_combine(h, ax_hash_u64((uint64_t)(uintptr_t)k->strct.def));
     }
     return h;
 }
@@ -111,6 +120,8 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
             if (a->tuple.fields[i].v != b->tuple.fields[i].v) return false;
         }
         return true;
+    } else if (a->kind == AX_TY_STRUCT) {
+        return a->strct.def == b->strct.def;
     }
     return true;
 }
@@ -166,6 +177,14 @@ static inline uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
             }
             return align;
         }
+        case AX_TY_STRUCT: {
+            uint32_t align = 1;
+            for (size_t i = 0; i < ty->strct.field_count; i++) {
+                uint32_t fa = ax_type_align(ty->strct.fields[i], in);
+                if (fa > align) align = fa;
+            }
+            return align;
+        }
         default: return 1;
     }
 }
@@ -192,6 +211,18 @@ static inline uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
             for (size_t i = 0; i < ty->tuple.field_count; i++) {
                 uint32_t fa = ax_type_align(ty->tuple.fields[i], in);
                 uint32_t fs = ax_type_size(ty->tuple.fields[i], in);
+                if (fa > max_align) max_align = fa;
+                offset = (offset + fa - 1) & ~(fa - 1);
+                offset += fs;
+            }
+            return (offset + max_align - 1) & ~(max_align - 1);
+        }
+        case AX_TY_STRUCT: {
+            uint32_t offset = 0;
+            uint32_t max_align = 1;
+            for (size_t i = 0; i < ty->strct.field_count; i++) {
+                uint32_t fa = ax_type_align(ty->strct.fields[i], in);
+                uint32_t fs = ax_type_size(ty->strct.fields[i], in);
                 if (fa > max_align) max_align = fa;
                 offset = (offset + fa - 1) & ~(fa - 1);
                 offset += fs;

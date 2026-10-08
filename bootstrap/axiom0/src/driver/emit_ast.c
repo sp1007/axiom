@@ -205,6 +205,7 @@ static void d_expr(DumpState *st, const AxAstExpr *n) {
             case AX_EXPR_PATH: d_list_begin(st, "ExprPath"); d_path_seg(st, n->path.segments); break;
             case AX_EXPR_PAREN: d_list_begin(st, "ExprParen"); d_expr(st, n->paren.expr); break;
             case AX_EXPR_ARRAY: d_list_begin(st, "ExprArray"); d_expr(st, n->array.elems); d_expr(st, n->array.count); break;
+            case AX_EXPR_TUPLE: d_list_begin(st, "ExprTuple"); d_expr(st, n->tuple.elems); break;
             case AX_EXPR_STRUCT: d_list_begin(st, "ExprStruct"); d_path_seg(st, n->struct_lit.segments); 
                 for(AxAstFieldInit *f = n->struct_lit.fields; f; f = f->next) {
                     d_nl(st); d_list_begin(st, "FieldInit"); d_strid(st, f->name); d_expr(st, f->expr); d_list_end(st);

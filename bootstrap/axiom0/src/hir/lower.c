@@ -343,6 +343,10 @@ static AxHirExpr *lower_expr(LowerCtx *ctx, const AxAstExpr *e) {
                 while (last && last->next) last = last->next;
                 if (last) he->path.path.generic_args = lower_generic_args(ctx, last->generic_args);
                 break;
+            case AX_EXPR_TUPLE:
+                he->kind = AX_HIR_EXPR_TUPLE;
+                he->tuple.elems = lower_expr(ctx, e->tuple.elems);
+                break;
             case AX_EXPR_PAREN:
                 // Drop paren, just lower inner expr, but keep the paren's span maybe?
                 // Actually it's cleaner to just return the inner lowered expr directly.
