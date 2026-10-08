@@ -14,6 +14,8 @@ paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/ax
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, 0263, spec/SPEC-03-core-semantics.md]
 covers: [REQ-DRP-001, REQ-DRP-002, REQ-DRP-003]
+started: 2026-10-08 08:02:04
+unblocks: 1
 ---
 # T030 — Variables & assignment: let mut, compound ops, deferred init
 
@@ -35,6 +37,10 @@ Mutable bindings and assignment through the full pipeline (oracle).
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+- The types module expects bindings to be represented by mapping `AxSymbolId` to `TypeId` via the `symbol_types` map in `AxThir`.
 
 ## Log
 - 2026-10-06 02:23:57 covers += REQ-DRP-001, REQ-DRP-002, REQ-DRP-003 (metadata only)
+- 2026-10-08 08:02:04 started (attempt 1) T030-impl
+- 2026-10-08 08:02:54 block: need more information on how the types module expects bindings to be represented
+- 2026-10-08 08:03:47 unblocked (cycle 1) 
