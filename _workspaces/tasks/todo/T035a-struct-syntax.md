@@ -11,10 +11,10 @@ priority: 55
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/syntax, bootstrap/axiom0/src/hir, bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/types, tests/ui/struct]
-locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
+locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/emit_ast.c, bootstrap/axiom0/src/driver/emit_hir.c]
 spec: [0059, 0081, 0043, tasks/0267, tasks/0281, 0009]
-started: 2026-10-08 19:20:05
-unblocks: 1
+started: 2026-10-08 19:35:30
+unblocks: 2
 ---
 # T035a — Structs syntax, lowering, resolution and typechecking
 
@@ -36,3 +36,6 @@ Implement parser, HIR lowering, name resolution, and typechecking for structs an
 - 2026-10-08 19:20:05 started (attempt 1) T035a-impl
 - 2026-10-08 19:33:00 block: needs typeck.c, ast.h, hir.h, lower.c to properly implement and lower tuple expressions and pass type-checking ui tests for structs
 - 2026-10-08 19:34:30 unblocked (cycle 1) 
+- 2026-10-08 19:35:30 started (attempt 1) T035a-impl
+- 2026-10-08 19:40:21 block: needs driver/emit_ast.c and emit_hir.c etc to handle new AX_EXPR_TUPLE variants due to Werror=switch
+- 2026-10-08 19:41:04 unblocked (cycle 2) 

@@ -1,12 +1,14 @@
 ## Tóm tắt
-Nhiệm vụ T035a bị chặn do thiếu quyền truy cập vào các tệp type-checking và lowering. Tuy nhiên, việc phân giải tên (name resolution) cho struct field đòi hỏi type-checking phải hoạt động. Do đó, phạm vi của T035a đã được mở rộng để bao gồm cả type-checking và HIR lowering thay vì chia nhỏ nhiệm vụ. Các đường dẫn `bootstrap/axiom0/src/hir` và `bootstrap/axiom0/src/types` đã được thêm vào `paths` của nhiệm vụ T035a.
+Kỹ sư báo cáo task T035a bị block do không thể chỉnh sửa `emit_ast.c` và `emit_hir.c` để xử lý các variant enum mới (`AX_EXPR_TUPLE`, v.v.) vì các file này không nằm trong `locks` hay `paths`. Việc cập nhật các hàm in AST/HIR này gắn liền với việc thêm các node AST/HIR mới để tránh lỗi `-Werror=switch`. Do đó, tôi đã quyết định thêm các file này vào danh sách `locks:` của T035a để kỹ sư có thể hoàn thành task. T035a đã được unblock lần 2.
 
-## Decision
-- **Option A**: Add missing paths (`hir` and `types`) to T035a so it can implement type-checking and lowering.
-- **Option B**: Split T035a further to separate syntax from type-checking.
+## Quyết định và Lý do (Decision & Rationale)
+**Options considered:**
+1. Split the AST/HIR emit changes into a separate prerequisite task.
+2. Add `emit_ast.c` and `emit_hir.c` to `locks:` of T035a so the current task can handle it.
 
-**Rationale**: Name resolution for struct field accesses (`x.y`) inherently depends on type-checking the base expression (`x`). Thus, separating syntax and name resolution from type-checking is impractical, especially since the UI tests require type-checking to pass. Expanding T035a's scope to include lowering and type-checking is the correct architectural decision. 
-The task's scope description and `paths` have been updated accordingly, and the task has been unblocked.
+**Decision:** Option 2.
+
+**Rationale:** Modifying AST and HIR nodes inherently breaks `-Werror=switch` in the emit functions. Handling this in a separate task would either require intermediate broken builds or complex coordination. Allowing T035a to lock and edit the driver's emit functions is standard practice and keeps the AST addition atomically tied to its stringification. T035a's scope was extended to include these locks.
 
 ## Files changed
 - _workspaces/tasks/todo/T035a-struct-syntax.md
