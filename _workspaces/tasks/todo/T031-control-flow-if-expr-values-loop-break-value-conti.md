@@ -10,9 +10,11 @@ depends: [T030]
 priority: 51
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/cfg, tests/ui/cfg]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/cfg, tests/ui/cfg, tests/typeck]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0063, 0041, 0113, tasks/0391, tasks/0617]
+started: 2026-10-08 08:20:10
+unblocks: 1
 ---
 # T031 — Control flow: if-expr values, loop/break value, continue, blocks, never
 
@@ -34,3 +36,8 @@ Expression-oriented control flow with correct typing.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-08 08:20:10 started (attempt 1) T031-impl
+- 2026-10-08 08:48:34 block: need paths for tests/typeck to bless basic.thir
+- 2026-10-08 08:49:04 unblocked (cycle 1) 
