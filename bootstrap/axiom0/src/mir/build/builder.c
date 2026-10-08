@@ -11,6 +11,14 @@ typedef struct BbData {
     bool is_terminated;
 } BbData;
 
+
+typedef struct LoopContext {
+    AxMirBbId break_bb;
+    AxMirBbId continue_bb;
+    AxMirPlace dest;
+    StrId label;
+} LoopContext;
+
 typedef struct Builder {
     AxArena *arena;
     const AxThir *thir;
@@ -25,8 +33,9 @@ typedef struct Builder {
     
     AxMirBbId current_bb;
     
-    AxMirBbId loop_break_bb;
-    AxMirBbId loop_continue_bb;
+    LoopContext *loops;
+    size_t loop_count;
+    size_t loop_cap;
     
     struct {
         AxSymbolId sym;
@@ -516,13 +525,18 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         
         b->current_bb = body_bb;
         
-        AxMirBbId old_break = b->loop_break_bb;
-        AxMirBbId old_cont = b->loop_continue_bb;
-        b->loop_break_bb = exit_bb;
-        b->loop_continue_bb = loop_bb;
+        if (b->loop_count >= b->loop_cap) {
+            b->loop_cap = b->loop_cap ? b->loop_cap * 2 : 16;
+            b->loops = realloc(b->loops, b->loop_cap * sizeof(LoopContext));
+        }
+        AxMirPlace void_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        b->loops[b->loop_count].break_bb = exit_bb;
+        b->loops[b->loop_count].continue_bb = loop_bb;
+        b->loops[b->loop_count].dest = void_place;
+        b->loops[b->loop_count].label = expr->while_expr.label;
+        b->loop_count++;
         
-        AxMirPlace ignore_dest = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-        build_block_into(b, &expr->while_expr.block, ignore_dest);
+        build_block_into(b, &expr->while_expr.block, void_place);
         
         if (!b->bbs[b->current_bb.v].is_terminated) {
             AxMirTerminator term = {0};
@@ -532,8 +546,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         }
         
         b->current_bb = exit_bb;
-        b->loop_break_bb = old_break;
-        b->loop_continue_bb = old_cont;
+        b->loop_count--;
     } else if (expr->kind == AX_HIR_EXPR_LOOP) {
         AxMirBbId loop_bb = add_bb(b);
         AxMirBbId exit_bb = add_bb(b);
@@ -545,13 +558,17 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         
         b->current_bb = loop_bb;
         
-        AxMirBbId old_break = b->loop_break_bb;
-        AxMirBbId old_cont = b->loop_continue_bb;
-        b->loop_break_bb = exit_bb;
-        b->loop_continue_bb = loop_bb;
+        if (b->loop_count >= b->loop_cap) {
+            b->loop_cap = b->loop_cap ? b->loop_cap * 2 : 16;
+            b->loops = realloc(b->loops, b->loop_cap * sizeof(LoopContext));
+        }
+        b->loops[b->loop_count].break_bb = exit_bb;
+        b->loops[b->loop_count].continue_bb = loop_bb;
+        b->loops[b->loop_count].dest = dest;
+        b->loops[b->loop_count].label = expr->loop.label;
+        b->loop_count++;
         
-        AxMirPlace ignore_dest = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-        build_block_into(b, &expr->loop.block, ignore_dest);
+        build_block_into(b, &expr->loop.block, dest);
         
         if (!b->bbs[b->current_bb.v].is_terminated) {
             AxMirTerminator term = {0};
@@ -561,8 +578,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         }
         
         b->current_bb = exit_bb;
-        b->loop_break_bb = old_break;
-        b->loop_continue_bb = old_cont;
+        b->loop_count--;
     } else if (expr->kind == AX_HIR_EXPR_CALL) {
         AxMirOperand callee = build_expr_as_operand(b, expr->call.callee);
         
@@ -600,15 +616,44 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             term.kind = AX_MIR_TERM_RETURN;
             set_terminator(b, b->current_bb, term);
         } else if (expr->jump.jump_kind == AX_JUMP_BREAK) {
-            AxMirTerminator term = {0};
-            term.kind = AX_MIR_TERM_GOTO;
-            term.goto_target = b->loop_break_bb;
-            set_terminator(b, b->current_bb, term);
+            LoopContext *target = NULL;
+            if (expr->jump.label.v != 0) {
+                for (size_t i = b->loop_count; i > 0; i--) {
+                    if (b->loops[i-1].label.v == expr->jump.label.v) {
+                        target = &b->loops[i-1];
+                        break;
+                    }
+                }
+            } else if (b->loop_count > 0) {
+                target = &b->loops[b->loop_count - 1];
+            }
+            if (target) {
+                if (expr->jump.expr) {
+                    build_expr_into(b, expr->jump.expr, target->dest);
+                }
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_GOTO;
+                term.goto_target = target->break_bb;
+                set_terminator(b, b->current_bb, term);
+            }
         } else if (expr->jump.jump_kind == AX_JUMP_CONTINUE) {
-            AxMirTerminator term = {0};
-            term.kind = AX_MIR_TERM_GOTO;
-            term.goto_target = b->loop_continue_bb;
-            set_terminator(b, b->current_bb, term);
+            LoopContext *target = NULL;
+            if (expr->jump.label.v != 0) {
+                for (size_t i = b->loop_count; i > 0; i--) {
+                    if (b->loops[i-1].label.v == expr->jump.label.v) {
+                        target = &b->loops[i-1];
+                        break;
+                    }
+                }
+            } else if (b->loop_count > 0) {
+                target = &b->loops[b->loop_count - 1];
+            }
+            if (target) {
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_GOTO;
+                term.goto_target = target->continue_bb;
+                set_terminator(b, b->current_bb, term);
+            }
         } else {
             AX_ICE("Unhandled jump kind in MIR builder");
         }
@@ -737,6 +782,7 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
     free(b.locals);
     free(b.bbs);
     free(b.var_map);
+    free(b.loops);
     
     return body;
 }

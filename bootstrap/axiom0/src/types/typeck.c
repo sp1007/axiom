@@ -32,6 +32,12 @@ typedef struct NegCheck {
     TypeId ty;
 } NegCheck;
 
+
+typedef struct LoopEnv {
+    StrId label;
+    TypeId break_ty;
+    bool has_break;
+} LoopEnv;
 typedef struct VarState {
     AxSymbolId sym;
     bool is_mut;
@@ -66,6 +72,10 @@ typedef struct TypeckCtx {
 
     TypeId return_type;
     bool in_loop;
+
+    LoopEnv *loops;
+    size_t loops_len;
+    size_t loops_cap;
 } TypeckCtx;
 
 static TypeId type_error(TypeckCtx *cx, Span span, AxDiagCode code) {
@@ -446,6 +456,7 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     ax_xfree(cx.lits);
     ax_xfree(cx.negs);
     ax_xfree(cx.vars);
+    ax_xfree(cx.loops);
     return thir;
 }
 
@@ -716,16 +727,38 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             return check_block(cx, &expr->block.block, expected);
         case AX_HIR_EXPR_IF:
             return check_if(cx, expr, expected);
-        case AX_HIR_EXPR_LOOP: {
+                case AX_HIR_EXPR_LOOP: {
             bool old_loop = cx->in_loop;
             cx->in_loop = true;
+            if (cx->loops_len == cx->loops_cap) {
+                cx->loops = ax_grow_array(cx->loops, &cx->loops_cap, sizeof(LoopEnv), cx->loops_len + 1);
+            }
+            cx->loops[cx->loops_len].label = expr->loop.label;
+            cx->loops[cx->loops_len].break_ty = TypeId_none();
+            cx->loops[cx->loops_len].has_break = false;
+            cx->loops_len++;
+            
             check_block(cx, &expr->loop.block, in->t_unit);
+            
+            cx->loops_len--;
             cx->in_loop = old_loop;
+            
+            if (cx->loops[cx->loops_len].has_break) {
+                return cx->loops[cx->loops_len].break_ty;
+            }
             return in->t_never;
         }
-        case AX_HIR_EXPR_WHILE: {
+                case AX_HIR_EXPR_WHILE: {
             bool old_loop = cx->in_loop;
             cx->in_loop = true;
+            if (cx->loops_len == cx->loops_cap) {
+                cx->loops = ax_grow_array(cx->loops, &cx->loops_cap, sizeof(LoopEnv), cx->loops_len + 1);
+            }
+            cx->loops[cx->loops_len].label = expr->while_expr.label;
+            cx->loops[cx->loops_len].break_ty = in->t_unit; // Cannot break with value from while
+            cx->loops[cx->loops_len].has_break = false;
+            cx->loops_len++;
+            
             if (expr->while_expr.let_pat) {
                 TypeId cond_ty = check_expr(cx, expr->while_expr.cond, TypeId_none());
                 check_pat(cx, expr->while_expr.let_pat, cond_ty, true);
@@ -733,10 +766,12 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                 check_expr(cx, expr->while_expr.cond, in->t_bool);
             }
             check_block(cx, &expr->while_expr.block, in->t_unit);
+            
+            cx->loops_len--;
             cx->in_loop = old_loop;
             return in->t_unit;
         }
-        case AX_HIR_EXPR_JUMP:
+                case AX_HIR_EXPR_JUMP:
             if (expr->jump.jump_kind == AX_JUMP_RETURN) {
                 TypeId ret = TypeId_is_none(cx->return_type) ? in->t_unit : cx->return_type;
                 if (expr->jump.expr) {
@@ -744,8 +779,35 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                 } else if (!unify_ty(cx, in->t_unit, ret)) {
                     type_error(cx, expr->span, AX_TYPE_MISMATCH);
                 }
-            } else if (expr->jump.expr) {
-                check_expr(cx, expr->jump.expr, TypeId_none());
+            } else if (expr->jump.jump_kind == AX_JUMP_BREAK) {
+                LoopEnv *target = NULL;
+                if (expr->jump.label.v != 0) {
+                    for (size_t i = cx->loops_len; i > 0; i--) {
+                        if (cx->loops[i-1].label.v == expr->jump.label.v) {
+                            target = &cx->loops[i-1];
+                            break;
+                        }
+                    }
+                } else if (cx->loops_len > 0) {
+                    target = &cx->loops[cx->loops_len - 1];
+                }
+                
+                if (target) {
+                    TypeId val_ty = in->t_unit;
+                    if (expr->jump.expr) {
+                        val_ty = check_expr(cx, expr->jump.expr, target->break_ty);
+                    }
+                    if (!target->has_break) {
+                        target->break_ty = val_ty;
+                        target->has_break = true;
+                    } else if (!is_error(cx, target->break_ty) && !is_error(cx, val_ty)) {
+                        target->break_ty = coerce(cx, val_ty, target->break_ty, expr->jump.expr ? expr->jump.expr->span : expr->span);
+                    }
+                } else {
+                    if (expr->jump.expr) check_expr(cx, expr->jump.expr, TypeId_none());
+                }
+            } else if (expr->jump.jump_kind == AX_JUMP_CONTINUE) {
+                // Continue can't have value, no need to track types
             }
             return in->t_never;
         case AX_HIR_EXPR_CALL:
@@ -801,7 +863,17 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
     TypeId ty = in->t_unit;
     const AxHirExpr *tail = NULL;
     bool diverges = false;
+    bool reported_unreachable = false;
     for (const AxHirStmt *s = block->stmts; s; s = s->next) {
+        if (diverges && !reported_unreachable) {
+            AxDiagnostic d = {0};
+            d.code = AX_TYPE_UNREACHABLE;
+            d.severity = AX_DIAG_WARNING;
+            d.message = "unreachable statement";
+            d.primary = s->span;
+            ax_diag_sink_report(cx->sink, &d);
+            reported_unreachable = true;
+        }
         tail = NULL;
         if (s->kind == AX_HIR_STMT_LET) {
             TypeId declared = hir_type_to_typeid(cx, s->let.type);
