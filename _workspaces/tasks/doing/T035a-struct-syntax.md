@@ -10,7 +10,7 @@ depends: [T034]
 priority: 55
 status: doing
 attempts: 2
-paths: [bootstrap/axiom0/src/syntax, bootstrap/axiom0/src/hir, bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/types, tests/ui/struct, bootstrap/axiom0/src/lir]
+paths: [bootstrap/axiom0/src/syntax, bootstrap/axiom0/src/hir, bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/types, tests/ui/struct, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/mir]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/emit_ast.c, bootstrap/axiom0/src/driver/emit_hir.c, bootstrap/axiom0/src/driver/emit_thir.c, bootstrap/axiom0/src/driver/emit_resolved.c]
 spec: [0059, 0081, 0043, tasks/0267, tasks/0281, 0009]
 started: 2026-10-08 19:45:12
@@ -44,4 +44,5 @@ Implement parser, HIR lowering, name resolution, and typechecking for structs an
 - 2026-10-08 19:44:38 block: needs driver/emit_thir.c and emit_resolved.c in locks to handle exhaustive switch for new tuple variants
 - 2026-10-08 19:44:39 parked: unblock cap reached (unblocks=2, failed unblock agents=0); needs the owner
 - 2026-10-08 19:45:12 started (attempt 2) T035a-impl
+
 
