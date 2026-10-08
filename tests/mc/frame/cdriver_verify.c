@@ -36,7 +36,8 @@ int main(int argc, char **argv) {
         mi.bbs[0].last_inst = inst;
     } else if (strcmp(mode, "align") == 0) {
         mi.shadow_space = 32;
-        layout.frame_size = 8; // misaligned!
+        layout.frame_size = 40; // misaligned! (40+56 = 96? wait 96%16 == 0. Let's use 48. 48+56 = 104 % 16 != 0)
+        layout.frame_size = 48;
     } else if (strcmp(mode, "shadow") == 0) {
         mi.shadow_space = 16; // < 32
     } else if (strcmp(mode, "regclass") == 0) {
@@ -47,7 +48,7 @@ int main(int argc, char **argv) {
         mi.bbs[0].last_inst = inst;
     } else if (strcmp(mode, "framesize") == 0) {
         mi.shadow_space = 32;
-        layout.frame_size = 16;
+        layout.frame_size = 8; // aligned (8+56=64), but < 32
     }
     
     ax_x64_verify(&mi, &layout); // Should ICE!

@@ -143,6 +143,7 @@ bool ax_type_is_signed(TypeId id, const TypeInterner *in);
 bool ax_type_is_unsigned(TypeId id, const TypeInterner *in);
 
 static inline uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
+    if (id.v == 0) return 1;
     if (id.v == in->t_unit.v || id.v == in->t_never.v) return 1;
     if (id.v == in->t_bool.v || id.v == in->t_i8.v || id.v == in->t_u8.v) return 1;
     if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;
@@ -170,6 +171,7 @@ static inline uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
 }
 
 static inline uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
+    if (id.v == 0) return 0;
     if (id.v == in->t_unit.v || id.v == in->t_never.v) return 0;
     if (id.v == in->t_bool.v || id.v == in->t_i8.v || id.v == in->t_u8.v) return 1;
     if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;

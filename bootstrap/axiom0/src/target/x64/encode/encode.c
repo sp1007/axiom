@@ -150,6 +150,14 @@ void ax_x64_lea(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_mem_t sr
     emit_op_mem(sec, sz, 0x8D, 0x8D, dst, src);
 }
 
+void ax_x64_lea_sym(ax_section_t *sec, ax_x64_reg_t dst, ax_symbol_id_t sym) {
+    emit_rex_rr(sec, 8, AX_REG_NONE, dst);
+    emit8(sec, 0x8D);
+    emit8(sec, 0x05 | ((dst & 7) << 3)); // RIP-relative
+    ax_section_add_reloc(sec, sec->bytes_len, AX_RELOC_X86_64_PC32, sym, -4);
+    emit32(sec, 0);
+}
+
 #define DEF_ALU(name, op_rm, op_mr, op_imm, ext) \
 void ax_x64_##name##_rr(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_reg_t src) { \
     emit_op_rm(sec, sz, (op_mr), (op_mr)+1, src, dst); \

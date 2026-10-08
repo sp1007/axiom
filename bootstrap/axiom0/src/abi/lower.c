@@ -17,14 +17,25 @@ void ax_lir_lower_abi(AxLirBody *body, TypeInterner *interner, const AxAbi *abi,
             AxLirInst *inst = &bb->insts[i];
             if (inst->kind == AX_LIR_INST_ABI_ARG) {
                 uint32_t idx = inst->abi_arg.index;
-                if (idx < sig.arg_count) {
-                    inst->abi_arg.loc_kind = sig.args[idx].loc.kind;
-                    if (sig.args[idx].loc.kind == AX_ABI_LOC_STACK) {
-                        inst->abi_arg.loc_reg_or_offset = sig.args[idx].loc.offset;
-                    } else {
-                        inst->abi_arg.loc_reg_or_offset = sig.args[idx].loc.reg;
+                if (inst->dest.v != 0xFFFFFFFF) { 
+                    if (idx < sig.arg_count) {
+                        inst->abi_arg.loc_kind = sig.args[idx].loc.kind;
+                        if (sig.args[idx].loc.kind == AX_ABI_LOC_STACK) {
+                            inst->abi_arg.loc_reg_or_offset = sig.args[idx].loc.offset;
+                        } else {
+                            inst->abi_arg.loc_reg_or_offset = sig.args[idx].loc.reg;
+                        }
                     }
-                }
+                } else { 
+                    const uint32_t ARG_REGS[] = { 1, 2, 8, 9 }; 
+                    if (idx < 4) { 
+                        inst->abi_arg.loc_kind = 0; 
+                        inst->abi_arg.loc_reg_or_offset = ARG_REGS[idx]; 
+                    } else { 
+                        inst->abi_arg.loc_kind = 1; 
+                        inst->abi_arg.loc_reg_or_offset = 32 + (idx - 4) * 8; 
+                    } 
+                } 
             } else if (inst->kind == AX_LIR_INST_ABI_RESULT) {
                 inst->abi_result.loc_kind = sig.ret.loc.kind;
                 if (sig.ret.loc.kind == AX_ABI_LOC_STACK) {

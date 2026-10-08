@@ -44,7 +44,7 @@ static int run_emit_mi(const AxIo *io, int argc, char **argv) {
         
         AxMirBody *mir_body = ax_mir_parse(text, &st.thir.interner, &st.hir_arena);
         if (mir_body) {
-            AxLirBody *lir_body = ax_lir_lower(mir_body, &st.thir.interner);
+            AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, NULL);
             AxType fn_ty = { .kind = AX_TY_FN };
             fn_ty.fn.param_count = 0; // assumption for mir tests
             fn_ty.fn.ret_type = mir_body->locals[0].ty;
@@ -76,10 +76,10 @@ static int run_emit_mi(const AxIo *io, int argc, char **argv) {
         if (item->kind == AX_HIR_ITEM_FN) {
             AxMirBody *mir_body = ax_mir_build(item, &st.thir, &st.hir_arena);
             if (mir_body) {
-                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.thir.interner);
+                const TypeId *pty = AxItemTypeMap_get(&st.thir.item_types, item);
+                const AxType *fn_ty = ax_type_get(&st.thir.interner, *pty);
+                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, fn_ty);
                 if (lir_body) {
-                    const TypeId *pty = AxItemTypeMap_get(&st.thir.item_types, item);
-                    const AxType *fn_ty = ax_type_get(&st.thir.interner, *pty);
                     ax_lir_lower_abi(lir_body, &st.thir.interner, &ax_abi_win64, fn_ty);
                     AxX64MIBody *mi_body = ax_x64_isel(lir_body, &st.thir.interner);
                     ax_x64_mi_print(io->out, mi_body);
@@ -98,3 +98,5 @@ const AxEmitter axemit_mi = {
     "dump the x64 machine IR",
     run_emit_mi
 };
+
+

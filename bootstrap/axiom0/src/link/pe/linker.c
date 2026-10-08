@@ -231,7 +231,8 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
                 if (sym.StorageClass == IMAGE_SYM_CLASS_EXTERNAL) {
                     GlobalSymbol *g = add_global(&ctx, name);
                     if (g->defined) {
-                        if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_DUPLICATE_SYMBOL, .severity=AX_DIAG_ERROR, .message="duplicate symbol"});
+                        char msg[256]; snprintf(msg, sizeof(msg), "duplicate symbol: %s", name);
+                        if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_DUPLICATE_SYMBOL, .severity=AX_DIAG_ERROR, .message=ax_xstrdup(msg)});
                         
                         ax_xfree(name);
                         for (uint32_t clean_s = 0; clean_s < s; clean_s++) {
@@ -309,6 +310,24 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     append_section_data(text_sec, start_code, sizeof(start_code), 16, &axiom_start_offset);
     add_reloc(&ctx, text_sec, axiom_start_offset + 5, IMAGE_REL_AMD64_REL32, "main", -4);
     
+    uint8_t panic_code[] = {
+        0x56, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x89, 0xCB, 0xB9, 0xF4, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xD6,
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,
+        0x4C, 0x8D, 0x4C, 0x24, 0x38, 0x49, 0x89, 0xF0, 0x48, 0x89, 0xDA, 0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC1,
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,
+        0xB9, 0x65, 0x00, 0x00, 0x00,
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,
+        0xCC
+    };
+    uint32_t panic_offset;
+    append_section_data(text_sec, panic_code, sizeof(panic_code), 16, &panic_offset);
+    add_reloc(&ctx, text_sec, panic_offset + 19, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", -4);
+    add_reloc(&ctx, text_sec, panic_offset + 48, IMAGE_REL_AMD64_REL32, "__IAT_WriteFile", -4);
+    add_reloc(&ctx, text_sec, panic_offset + 59, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", -4);
+    
+    GlobalSymbol *panic_sym = add_global(&ctx, "axiom_panic");
+    panic_sym->defined = true; panic_sym->sec = text_sec; panic_sym->offset = panic_offset;
+    
     // Build Import Directory
     MergedSection *idata_sec = get_or_create_section(&ctx, ".idata", IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
     uint32_t idata_base = 0;
@@ -322,14 +341,20 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     memset(idata_buf + i_off, 0, 20); i_off += 20;     // desc null
     
     uint32_t ilt_offset = i_off;
-    i_off += 16; // ILT (2x qword)
+    i_off += 32; // ILT (4x qword)
     uint32_t iat_offset = i_off;
-    i_off += 16; // IAT (2x qword)
-    
-    uint32_t hint_offset = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0; // hint
-    strcpy((char*)idata_buf + i_off, "ExitProcess"); i_off += 12; // "ExitProcess\0"
-    
+    i_off += 32; // IAT (4x qword)
+
+    uint32_t hint_exit = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "ExitProcess"); i_off += 12;
+    uint32_t hint_getstd = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "GetStdHandle"); i_off += 13;
+    uint32_t hint_write = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "WriteFile"); i_off += 10;
+
     uint32_t dll_name_offset = i_off;
     strcpy((char*)idata_buf + i_off, "KERNEL32.dll"); i_off += 13;
     i_off = ALIGN_UP(i_off, 8);
@@ -359,18 +384,31 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     pdesc->Name = idata_rva + dll_name_offset;
     pdesc->FirstThunk = idata_rva + iat_offset;
     
-    uint64_t hint_rva = idata_rva + hint_offset;
-    memcpy(idata_sec->data + idata_base + ilt_offset, &hint_rva, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset, &hint_rva, 8);
+    uint64_t rva_exit = idata_rva + hint_exit;
+    uint64_t rva_getstd = idata_rva + hint_getstd;
+    uint64_t rva_write = idata_rva + hint_write;
+
+    memcpy(idata_sec->data + idata_base + ilt_offset, &rva_exit, 8);
+    memcpy(idata_sec->data + idata_base + ilt_offset + 8, &rva_getstd, 8);
+    memcpy(idata_sec->data + idata_base + ilt_offset + 16, &rva_write, 8);
+
+    memcpy(idata_sec->data + idata_base + iat_offset, &rva_exit, 8);
+    memcpy(idata_sec->data + idata_base + iat_offset + 8, &rva_getstd, 8);
+    memcpy(idata_sec->data + idata_base + iat_offset + 16, &rva_write, 8);
     
     // Reloc for call [rip + IAT_ExitProcess]
     uint32_t call_exit_offset = axiom_start_offset + 13;
     add_reloc(&ctx, text_sec, call_exit_offset, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", -4);
     
-    GlobalSymbol *iat_sym = add_global(&ctx, "__IAT_ExitProcess");
-    iat_sym->defined = true;
-    iat_sym->sec = idata_sec;
-    iat_sym->offset = idata_base + iat_offset;
+    GlobalSymbol *iat_exit = add_global(&ctx, "__IAT_ExitProcess");
+    iat_exit->defined = true; iat_exit->sec = idata_sec; iat_exit->offset = idata_base + iat_offset;
+    
+    GlobalSymbol *iat_getstd = add_global(&ctx, "__IAT_GetStdHandle");
+    iat_getstd->defined = true; iat_getstd->sec = idata_sec; iat_getstd->offset = idata_base + iat_offset + 8;
+
+    GlobalSymbol *iat_write = add_global(&ctx, "__IAT_WriteFile");
+    iat_write->defined = true; iat_write->sec = idata_sec; iat_write->offset = idata_base + iat_offset + 16;
+
     
     // Apply relocations
     for (size_t i = 0; i < ctx.num_relocs; i++) {
@@ -452,7 +490,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     dirs[1].VirtualAddress = idata_sec->rva + idata_base + desc_offset;
     dirs[1].Size = 40; // 2 descriptors
     dirs[12].VirtualAddress = idata_sec->rva + idata_base + iat_offset;
-    dirs[12].Size = 16; // 1 import + null
+    dirs[12].Size = 32; // 3 imports + null
     fwrite(dirs, sizeof(IMAGE_DATA_DIRECTORY), 16, out);
     
     // Write Section Headers

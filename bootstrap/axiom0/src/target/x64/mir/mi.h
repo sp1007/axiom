@@ -14,6 +14,7 @@ typedef enum AxX64OpKind {
     AX_X64_OP_IMM,
     AX_X64_OP_MEM,      // Explicit memory (base + index + disp)
     AX_X64_OP_FRAME,    // Stack slot based on RBP (or RSP after frame lowering)
+    AX_X64_OP_SYM,      // Symbol ID
 } AxX64OpKind;
 
 typedef struct AxX64Op {
@@ -26,6 +27,7 @@ typedef struct AxX64Op {
             uint32_t slot_id;
             int32_t offset;
         } frame;
+        uint32_t sym;
     };
 } AxX64Op;
 
@@ -43,6 +45,14 @@ typedef enum AxX64MIOpcode {
     AX_X64_MI_SAR,
     AX_X64_MI_SHR,
     AX_X64_MI_LEA,
+    AX_X64_MI_CMP,
+    AX_X64_MI_JMP,
+    AX_X64_MI_JCC,
+    AX_X64_MI_CALL,
+    AX_X64_MI_ASSERT,
+    AX_X64_MI_PUSH,
+    AX_X64_MI_POP,
+    AX_X64_MI_SETCC,
     AX_X64_MI_RET,
 } AxX64MIOpcode;
 
@@ -52,6 +62,7 @@ typedef struct AxX64MI {
     AxX64Op ops[3];
     uint8_t op_count;
     struct AxX64MI *next;
+    const char *msg;
 } AxX64MI;
 
 typedef struct AxX64MIBb {
@@ -83,6 +94,11 @@ static inline AxX64Op ax_x64_op_imm(int64_t imm) {
 
 static inline AxX64Op ax_x64_op_frame(uint32_t slot, int32_t offset) {
     AxX64Op op = { .kind = AX_X64_OP_FRAME, .frame = { .slot_id = slot, .offset = offset } };
+    return op;
+}
+
+static inline AxX64Op ax_x64_op_sym(uint32_t sym) {
+    AxX64Op op = { .kind = AX_X64_OP_SYM, .sym = sym };
     return op;
 }
 

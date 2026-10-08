@@ -620,6 +620,7 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                 hi->fn.is_unsafe = n->fn.is_unsafe;
                 hi->fn.abi = n->fn.abi;
                 hi->fn.name = n->fn.name;
+                hi->fn.symbol = get_symbol(ctx, n);
                 hi->fn.generic_params = lower_generic_params(ctx, n->fn.generic_params);
                 
                 AxHirParam **ptail = &hi->fn.params;

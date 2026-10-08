@@ -486,6 +486,7 @@ struct AxHirItem {
             bool is_unsafe;
             StrId abi;
             StrId name;
+            AxSymbolId symbol;
             AxHirGenericParams *generic_params;
             AxHirParam *params;
             AxHirType *ret_type;

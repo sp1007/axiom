@@ -142,7 +142,7 @@ static AxLirInstKind lower_binop(AxMirBinOp op, bool is_signed) {
         case AX_MIR_BINOP_BIT_AND: return AX_LIR_INST_BIT_AND;
         case AX_MIR_BINOP_BIT_OR: return AX_LIR_INST_BIT_OR;
         case AX_MIR_BINOP_SHL: return AX_LIR_INST_SHL;
-        case AX_MIR_BINOP_SHR: return AX_LIR_INST_SHR;
+        case AX_MIR_BINOP_SHR: return is_signed ? AX_LIR_INST_SAR : AX_LIR_INST_SHR;
         case AX_MIR_BINOP_EQ: return AX_LIR_INST_ICMP_EQ;
         case AX_MIR_BINOP_NE: return AX_LIR_INST_ICMP_NE;
         case AX_MIR_BINOP_LT: return is_signed ? AX_LIR_INST_ICMP_SLT : AX_LIR_INST_ICMP_ULT;
@@ -154,7 +154,7 @@ static AxLirInstKind lower_binop(AxMirBinOp op, bool is_signed) {
     return AX_LIR_INST_ADD;
 }
 
-static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv) {
+static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId dest_ty) {
     switch (rv->kind) {
         case AX_MIR_RVALUE_USE:
             return lower_operand(b, &rv->use);
@@ -164,9 +164,13 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv) {
             AxLirVRegId lhs = lower_operand(b, &rv->binary_op.lhs);
             AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
             // Assuming signed for now or fetching from type
-            bool is_signed = true;
-            AxLirInstKind kind = lower_binop(rv->binary_op.op, is_signed);
-            AxLirVRegId dest = make_vreg(b, b->interner->t_isize);
+            const AxType *t = ax_type_get(b->interner, dest_ty);
+              bool is_signed = true;
+              if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
+                  is_signed = false;
+              }
+              AxLirInstKind kind = lower_binop(rv->binary_op.op, is_signed);
+            AxLirVRegId dest = make_vreg(b, dest_ty);
             emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .binary = { .lhs = lhs, .rhs = rhs } });
             return dest;
         }
@@ -175,7 +179,7 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv) {
             AxLirInstKind kind = AX_LIR_INST_NEG;
             if (rv->unary_op.op == AX_MIR_UNOP_NOT) kind = AX_LIR_INST_NOT;
             else if (rv->unary_op.op == AX_MIR_UNOP_BITNOT) kind = AX_LIR_INST_BITNOT;
-            AxLirVRegId dest = make_vreg(b, b->interner->t_isize);
+            AxLirVRegId dest = make_vreg(b, dest_ty);
             emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .unary = { .operand = op } });
             return dest;
         }
@@ -185,7 +189,11 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv) {
     }
 }
 
-AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner) {
+#include "kernel/interner.h"
+#include "kernel/str.h"
+#include "hir/hir.h"
+AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInterner *interner, struct StrInterner *str_in, const AxType *fn_ty) {
+    
     AxLirBody *lir = malloc(sizeof(AxLirBody));
     ax_arena_init(&lir->arena, 4096);
     
@@ -198,6 +206,7 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner) {
         b.slots[i].ty = mir->locals[i].ty;
     }
     
+    b.interner = interner;
     b.bb_count = mir->bb_count;
     b.bbs = ax_arena_alloc(&lir->arena, b.bb_count * sizeof(AxLirBb), _Alignof(AxLirBb));
     
@@ -205,10 +214,20 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner) {
         const AxMirBb *mbb = &mir->bbs[i];
         b.cur_inst_count = 0;
         
+        if (i == 0 && fn_ty && fn_ty->kind == AX_TY_FN) {
+            for (size_t p = 0; p < fn_ty->fn.param_count; p++) {
+                AxLirVRegId dest = make_vreg(&b, fn_ty->fn.param_types[p]);
+                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_ARG, .dest = dest, .abi_arg = { .index = (uint32_t)p } });
+                AxLirVRegId addr = emit_stack_addr(&b, (AxLirStackSlotId){ (uint32_t)(p + 1) });
+                emit_store(&b, addr, dest);
+            }
+        }
+        
         for (size_t j = 0; j < mbb->stmt_count; j++) {
             const AxMirStmt *stmt = &mbb->stmts[j];
             if (stmt->kind == AX_MIR_STMT_ASSIGN) {
-                AxLirVRegId val = lower_rvalue(&b, &stmt->assign.rvalue);
+                TypeId dest_ty = mir->locals[stmt->assign.place.local.v].ty;
+                AxLirVRegId val = lower_rvalue(&b, &stmt->assign.rvalue, dest_ty);
                 AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place);
                 emit_store(&b, addr, val);
             }
@@ -239,14 +258,34 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner) {
                 term.kind = AX_LIR_TERM_RETURN;
                 break;
             case AX_MIR_TERM_CALL: {
+                AxLirVRegId *args = ax_arena_alloc(b.arena, mbb->terminator.call.arg_count * sizeof(AxLirVRegId), _Alignof(AxLirVRegId));
                 for (size_t k = 0; k < mbb->terminator.call.arg_count; k++) {
-                    AxLirVRegId arg = lower_operand(&b, &mbb->terminator.call.args[k]);
-                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_ARG, .dest = {0}, .abi_arg = { .index = (uint32_t)k, .val = arg } });
+                    args[k] = lower_operand(&b, &mbb->terminator.call.args[k]);
                 }
-                AxLirVRegId func = lower_operand(&b, &mbb->terminator.call.func);
-                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .callee = func } });
+                for (size_t k = 0; k < mbb->terminator.call.arg_count; k++) {
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_ARG, .dest = { 0xFFFFFFFF }, .abi_arg = { .index = (uint32_t)k, .val = args[k] } });
+                }
                 
-                AxLirVRegId res = make_vreg(&b, b.interner->t_isize);
+                const char *sym_name = NULL;
+                if (mbb->terminator.call.func.kind == AX_MIR_OP_CONST) {
+                    uint32_t sym_v = (uint32_t)mbb->terminator.call.func.constant.val;
+                    if (sym_v != 0 && hir && str_in) {
+                        for (const struct AxHirItem *it = hir->items; it; it = it->next) {
+                            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == sym_v) {
+                                StrView sv = ax_interner_get(str_in, it->fn.name);
+                                char *name = malloc(sv.len + 1);
+                                memcpy(name, sv.ptr, sv.len);
+                                name[sv.len] = '\0';
+                                sym_name = name;
+                                break;
+                            }
+                        }
+                    }
+                }
+                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name } });
+                
+                AxLirVRegId res = make_vreg(&b, interner->t_isize);
+
                 emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_RESULT, .dest = res, .abi_result = { .index = 0 } });
                 
                 AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination);

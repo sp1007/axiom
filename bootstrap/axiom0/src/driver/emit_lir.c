@@ -40,7 +40,7 @@ static int emit_lir_run(const AxIo *io, int argc, char **argv) {
         
         AxMirBody *mir_body = ax_mir_parse(text, &st.thir.interner, &st.hir_arena);
         if (mir_body) {
-            AxLirBody *lir_body = ax_lir_lower(mir_body, &st.thir.interner);
+            AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, NULL);
             ax_lir_print(io->out, lir_body);
         }
         
@@ -65,7 +65,7 @@ static int emit_lir_run(const AxIo *io, int argc, char **argv) {
         if (item->kind == AX_HIR_ITEM_FN) {
             AxMirBody *mir_body = ax_mir_build(item, &st.thir, &st.hir_arena);
             if (mir_body) {
-                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.thir.interner);
+                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, NULL);
                 if (lir_body) {
                     ax_lir_print(io->out, lir_body);
                 }
@@ -83,3 +83,5 @@ const AxEmitter axemit_lir = {
     "Emit LIR (parse from .mir or lower from .ax)",
     emit_lir_run
 };
+
+

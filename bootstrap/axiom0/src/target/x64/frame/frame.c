@@ -9,7 +9,10 @@ AxX64FrameLayout ax_x64_frame_lower(AxX64MIBody *body, const AxLirBody *lir, Typ
         layout.slot_offsets = AX_ARENA_NEW_ARRAY(arena, int32_t, layout.slot_count);
     }
     
-    int32_t current_offset = 0;
+    int32_t current_offset = 56; // 7 callee-saved registers * 8 bytes
+    if (body->shadow_space < 32) {
+        body->shadow_space = 32;
+    }
     
     for (size_t i = 0; i < lir->slot_count; i++) {
         uint32_t size = ax_type_size(lir->slots[i].ty, interner);
@@ -35,7 +38,7 @@ AxX64FrameLayout ax_x64_frame_lower(AxX64MIBody *body, const AxLirBody *lir, Typ
         current_offset = (current_offset + 15) & ~15;
     }
     
-    layout.frame_size = current_offset;
+    layout.frame_size = current_offset - 56;
     
     for (size_t b = 0; b < body->bb_count; b++) {
         AxX64MIBb *mbb = &body->bbs[b];
@@ -63,6 +66,13 @@ AxX64FrameLayout ax_x64_frame_lower(AxX64MIBody *body, const AxLirBody *lir, Typ
 void ax_x64_frame_emit_prologue(ax_section_t *sec, const AxX64FrameLayout *layout) {
     ax_x64_push_r(sec, AX_REG_RBP);
     ax_x64_mov_rr(sec, 8, AX_REG_RBP, AX_REG_RSP);
+    ax_x64_push_r(sec, 3); // RBX
+    ax_x64_push_r(sec, 6); // RSI
+    ax_x64_push_r(sec, 7); // RDI
+    ax_x64_push_r(sec, 12); // R12
+    ax_x64_push_r(sec, 13); // R13
+    ax_x64_push_r(sec, 14); // R14
+    ax_x64_push_r(sec, 15); // R15
     
     if (layout->frame_size > 0) {
         if (layout->frame_size > 4096) {
@@ -85,7 +95,16 @@ void ax_x64_frame_emit_prologue(ax_section_t *sec, const AxX64FrameLayout *layou
 
 void ax_x64_frame_emit_epilogue(ax_section_t *sec, const AxX64FrameLayout *layout) {
     if (layout->frame_size > 0) {
-        ax_x64_mov_rr(sec, 8, AX_REG_RSP, AX_REG_RBP);
+        // RSP is currently at RBP - 56 - frame_size
+        // We need to restore it to RBP - 56
+        ax_x64_add_ri(sec, 8, AX_REG_RSP, layout->frame_size);
     }
+    ax_x64_pop_r(sec, 15);
+    ax_x64_pop_r(sec, 14);
+    ax_x64_pop_r(sec, 13);
+    ax_x64_pop_r(sec, 12);
+    ax_x64_pop_r(sec, 7);
+    ax_x64_pop_r(sec, 6);
+    ax_x64_pop_r(sec, 3);
     ax_x64_pop_r(sec, AX_REG_RBP);
 }

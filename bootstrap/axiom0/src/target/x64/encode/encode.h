@@ -67,6 +67,7 @@ void ax_x64_movsx_rr(ax_section_t *sec, uint8_t sz, uint8_t src_sz, ax_x64_reg_t
 void ax_x64_movsx_rm(ax_section_t *sec, uint8_t sz, uint8_t src_sz, ax_x64_reg_t dst, ax_x64_mem_t src);
 
 void ax_x64_lea(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_mem_t src);
+void ax_x64_lea_sym(ax_section_t *sec, ax_x64_reg_t dst, ax_symbol_id_t sym);
 
 void ax_x64_add_rr(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_reg_t src);
 void ax_x64_add_rm(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_mem_t src);

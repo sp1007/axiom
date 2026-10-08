@@ -15,7 +15,7 @@
 #include <string.h>
 
 // duplicate the encoder logic here to emit the object model
-static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64FrameLayout *layout) {
+static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64FrameLayout *layout, ax_objmodel_t *obj) {
     switch (inst->opcode) {
         case AX_X64_MI_MOV:
             if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
@@ -28,6 +28,59 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
                 ax_x64_mov_ri(sec, 8, inst->ops[0].reg, inst->ops[1].imm);
             } else if (inst->ops[0].kind == AX_X64_OP_MEM && inst->ops[1].kind == AX_X64_OP_IMM) {
                 ax_x64_mov_mi(sec, 8, inst->ops[0].mem, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        
+        case AX_X64_MI_CMP:
+            if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
+                ax_x64_cmp_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_MEM) {
+                ax_x64_cmp_rm(sec, 8, inst->ops[0].reg, inst->ops[1].mem);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_cmp_ri(sec, 8, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        case AX_X64_MI_JMP:
+            if (inst->ops[0].kind == AX_X64_OP_IMM) {
+                ax_x64_jmp(sec, (int32_t)inst->ops[0].imm);
+            }
+            break;
+        case AX_X64_MI_JCC:
+            if (inst->ops[0].kind == AX_X64_OP_IMM && inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_jcc(sec, (uint8_t)inst->ops[0].imm, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        case AX_X64_MI_SETCC:
+            if (inst->ops[0].kind == AX_X64_OP_IMM && inst->ops[1].kind == AX_X64_OP_REG) {
+                ax_x64_setcc_r(sec, (uint8_t)inst->ops[0].imm, inst->ops[1].reg);
+            }
+            break;
+        case AX_X64_MI_AND:
+            if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
+                ax_x64_and_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_and_ri(sec, 8, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        case AX_X64_MI_OR:
+            if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
+                ax_x64_or_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_or_ri(sec, 8, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        case AX_X64_MI_XOR:
+            if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
+                ax_x64_xor_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_xor_ri(sec, 8, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
+            }
+            break;
+        case AX_X64_MI_SHL:
+            if (inst->ops[1].kind == AX_X64_OP_IMM) {
+                ax_x64_shl_ri(sec, 8, inst->ops[0].reg, (int8_t)inst->ops[1].imm);
+            } else if (inst->ops[1].kind == AX_X64_OP_REG && inst->ops[1].reg == AX_REG_RCX) {
+                ax_x64_shl_rcl(sec, 8, inst->ops[0].reg);
             }
             break;
         case AX_X64_MI_ADD:
@@ -84,6 +137,13 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
             break;
         default:
             break;
+
+        case AX_X64_MI_CALL:
+            if (inst->msg) {
+                ax_section_add_bytes(sec, (const uint8_t[]){0xE8, 0, 0, 0, 0}, 5);
+                ax_section_add_reloc(sec, sec->bytes_len - 4, AX_RELOC_X86_64_PC32, ax_objmodel_add_symbol(obj, inst->msg, (ax_section_id_t){0}, 0, 0, AX_SYM_EXTERNAL), -4);
+            }
+            break;
     }
 }
 
@@ -122,7 +182,7 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
         if (item->kind == AX_HIR_ITEM_FN) {
             AxMirBody *mir_body = ax_mir_build(item, &st.thir, &st.hir_arena);
             if (mir_body) {
-                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.thir.interner);
+                AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, NULL);
                 if (lir_body) {
                     const TypeId *pty = AxItemTypeMap_get(&st.thir.item_types, item);
                     const AxType *fn_ty = ax_type_get(&st.thir.interner, *pty);
@@ -147,12 +207,12 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
                     for (size_t b = 0; b < mi_body->bb_count; b++) {
                         AxX64MIBb *mbb = &mi_body->bbs[b];
                         for (AxX64MI *inst = mbb->first_inst; inst != NULL; inst = inst->next) {
-                            encode_mi_to_sec(text_sec, inst, &layout);
+                            encode_mi_to_sec(text_sec, inst, &layout, &obj);
                         }
                     }
                     
                     uint64_t func_size = text_sec->bytes_len - func_start;
-                    ax_objmodel_add_symbol(&obj, name_buf, text_sec_id, func_start, func_size, AX_SYM_GLOBAL);
+                    ax_objmodel_add_symbol(&obj, strdup(name_buf), text_sec_id, func_start, func_size, AX_SYM_GLOBAL);
                 }
             }
         }
@@ -185,3 +245,5 @@ const AxEmitter axemit_obj = {
     "Emit COFF object file",
     run_emit_obj
 };
+
+

@@ -13,6 +13,13 @@ static const char *const opc_names[] = {
     [AX_X64_MI_SAR] = "sar",
     [AX_X64_MI_SHR] = "shr",
     [AX_X64_MI_LEA] = "lea",
+    [AX_X64_MI_CMP] = "cmp",
+    [AX_X64_MI_JMP] = "jmp",
+    [AX_X64_MI_JCC] = "jcc",
+    [AX_X64_MI_CALL] = "call",
+    [AX_X64_MI_PUSH] = "push",
+    [AX_X64_MI_POP] = "pop",
+    [AX_X64_MI_SETCC] = "setcc",
     [AX_X64_MI_RET] = "ret",
 };
 
@@ -61,6 +68,9 @@ static void print_op(FILE *out, const AxX64Op *op) {
             } else {
                 fprintf(out, "[frame#%u - %d]", op->frame.slot_id, -op->frame.offset);
             }
+            break;
+        case AX_X64_OP_SYM:
+            fprintf(out, "sym#%u", op->sym);
             break;
         case AX_X64_OP_NONE:
             break;

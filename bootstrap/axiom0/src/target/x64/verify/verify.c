@@ -6,7 +6,7 @@ void ax_x64_verify(const AxX64MIBody *body, const AxX64FrameLayout *layout) {
         if (body->shadow_space < 32) {
             AX_ICE("Machine IR verifier: shadow space is present but < 32 bytes");
         }
-        if (layout->frame_size % 16 != 0) {
+        if ((layout->frame_size + 56) % 16 != 0) {
             AX_ICE("Machine IR verifier: 16-byte alignment violated at call site");
         }
     }
@@ -45,7 +45,7 @@ void ax_x64_verify(const AxX64MIBody *body, const AxX64FrameLayout *layout) {
                 }
                 
                 if (inst->opcode == AX_X64_MI_LEA) {
-                    if (k0 == AX_X64_OP_REG && k1 == AX_X64_OP_MEM) continue;
+                    if (k0 == AX_X64_OP_REG && (k1 == AX_X64_OP_MEM || k1 == AX_X64_OP_SYM)) continue;
                     
                     AX_ICE("Machine IR verifier: illegal operand form for lea");
                 }
@@ -68,7 +68,7 @@ void ax_x64_verify(const AxX64MIBody *body, const AxX64FrameLayout *layout) {
                     AX_ICE("Machine IR verifier: illegal operand form for shift");
                 }
             } else if (inst->op_count == 1) {
-                if (inst->ops[0].kind == AX_X64_OP_IMM) {
+                if (inst->opcode == AX_X64_MI_IDIV && inst->ops[0].kind == AX_X64_OP_IMM) {
                     AX_ICE("Machine IR verifier: illegal operand form for idiv");
                 }
             }

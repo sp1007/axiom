@@ -16,6 +16,7 @@ typedef enum AxLirInstKind {
     AX_LIR_INST_ADD, AX_LIR_INST_SUB, AX_LIR_INST_MUL, AX_LIR_INST_DIV, AX_LIR_INST_REM,
     AX_LIR_INST_BIT_XOR, AX_LIR_INST_BIT_AND, AX_LIR_INST_BIT_OR,
     AX_LIR_INST_SHL, AX_LIR_INST_SHR,
+    AX_LIR_INST_SAR,
     AX_LIR_INST_NEG, AX_LIR_INST_NOT, AX_LIR_INST_BITNOT,
     // Compare
     AX_LIR_INST_ICMP_EQ, AX_LIR_INST_ICMP_NE, 
@@ -61,7 +62,7 @@ typedef struct AxLirInst {
             TypeId ty;
         } constant;
         struct {
-            AxLirVRegId callee; // wait, naive call might take symbol or func address
+            const char *sym_name;
         } call;
         struct {
             uint32_t index;
@@ -83,6 +84,7 @@ typedef enum AxLirTerminatorKind {
     AX_LIR_TERM_SWITCH,
     AX_LIR_TERM_RETURN,
     AX_LIR_TERM_UNREACHABLE,
+    AX_LIR_TERM_ASSERT,
 } AxLirTerminatorKind;
 
 typedef struct AxLirSwitchTarget {
@@ -99,6 +101,11 @@ typedef struct AxLirTerminator {
             AxLirBbId then_target;
             AxLirBbId else_target;
         } jcc;
+    struct {
+        AxLirVRegId cond;
+        AxLirBbId target;
+        const char *msg;
+    } assert_term;
         struct {
             AxLirVRegId cond;
             AxLirSwitchTarget *targets;
@@ -138,7 +145,7 @@ typedef struct AxLirBody {
     AxLirFrameReq frame_req;
 } AxLirBody;
 
-AxLirBody *ax_lir_lower(const AxMirBody *mir, TypeInterner *interner);
+AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInterner *interner, struct StrInterner *str_in, const AxType *fn_ty);
 void ax_lir_print(FILE *out, const AxLirBody *body);
 
 #endif
