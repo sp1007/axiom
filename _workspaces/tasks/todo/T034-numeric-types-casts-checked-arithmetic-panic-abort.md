@@ -10,11 +10,11 @@ depends: [T032]
 priority: 54
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/numeric, tests/ui/numeric, tests/typeck, tests/mir]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/numeric, tests/ui/numeric, tests/typeck, tests/mir, tests/mc, tests/lir, tests/run/fn]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0327, tasks/0334, spec/SPEC-03-core-semantics.md, 0068]
-started: 2026-10-08 14:38:02
-unblocks: 1
+started: 2026-10-08 15:23:13
+unblocks: 2
 ---
 # T034 — Numeric types, casts, checked arithmetic, panic=abort
 
@@ -47,3 +47,6 @@ All integer widths, bool ops, `char`, `as` casts, overflow/div-zero/shift semant
 - 2026-10-08 14:38:02 started (attempt 1) T034-impl
 - 2026-10-08 15:21:35 block: need paths for tests/typeck and tests/mir to update golden files shifted by MIR variable numbering
 - 2026-10-08 15:22:20 unblocked (cycle 1) 
+- 2026-10-08 15:23:13 started (attempt 1) T034-impl
+- 2026-10-08 16:30:26 block: need paths for bootstrap/axiom0/src/resolve/resolve.c to add isize to prelude_types
+- 2026-10-08 16:31:10 unblocked (cycle 2) 
