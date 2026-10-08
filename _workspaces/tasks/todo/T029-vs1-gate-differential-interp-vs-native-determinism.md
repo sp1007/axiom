@@ -11,10 +11,10 @@ priority: 46
 status: todo
 attempts: 0
 paths: [tests/diff, tests/conformance/vs1, tools/ci.sh, tests/mc/frame, tests/mir/build]
-locks: [bootstrap/axiom0/src/driver/emit_obj.c]
+locks: [bootstrap/axiom0/src/driver/emit_obj.c, tools/gatecheck.py]
 spec: [0263, 0152, 0145]
-started: 2026-10-08 06:58:59
-unblocks: 1
+started: 2026-10-08 07:11:59
+unblocks: 2
 ---
 # T029 — VS1 gate: differential interp vs native, determinism
 
@@ -42,3 +42,6 @@ Establish the three-level oracle (MIR interp / native / agreement) as a permanen
 - 2026-10-08 06:58:59 started (attempt 1) T029-impl
 - 2026-10-08 07:10:59 block: need locks for bootstrap/axiom0/src/driver/emit_obj.c and paths for tests/mc/frame, tests/mir/build to fix PE determinism timestamp and failing C tests
 - 2026-10-08 07:11:23 unblocked (cycle 1) 
+- 2026-10-08 07:11:59 started (attempt 1) T029-impl
+- 2026-10-08 07:28:15 block: need locks for tools/gatecheck.py to fix MS-P4 gatecheck differential check error
+- 2026-10-08 07:28:46 unblocked (cycle 2) 

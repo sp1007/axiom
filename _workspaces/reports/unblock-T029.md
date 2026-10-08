@@ -1,9 +1,9 @@
 ## Tóm tắt
-Thêm đường dẫn `tests/mc/frame`, `tests/mir/build` vào `paths:` và file `bootstrap/axiom0/src/driver/emit_obj.c` vào `locks:` của T029 để cấp quyền sửa lỗi determinism của file PE (zero out timestamp) và cập nhật các test C bị hỏng, giúp tiếp tục thực thi T029.
+Đã thêm `tools/gatecheck.py` vào danh sách `locks:` trong file task T029 để cấp quyền chỉnh sửa file này, giúp tác vụ có thể sửa lỗi MS-P4 gatecheck differential check. Đã chạy kiểm tra hợp lệ (taskctl validate và harness_check) thành công và bỏ chặn (unblock) tác vụ.
 
-## Quyết định và lý do
-- Cập nhật phạm vi file (paths và locks) của T029 để bao gồm các file bị thiếu thay vì tạo một task nhỏ hoặc sửa lại task. Điều này là đơn giản nhất và giữ cho PR gọn gàng khi mục tiêu của T029 cần các thay đổi đó để sửa test C và determinism file PE.
-- T029 được mở block (unblocked).
+## Rationale & Options considered
+- **Option 1 (Chosen)**: Add `tools/gatecheck.py` to `locks:` array of T029. This is the simplest and most direct way to resolve the block and allow the agent to hook up differential and determinism checks to the gatecheck harness.
+- **Option 2**: Create a separate sub-task for updating `tools/gatecheck.py`. Rejected because the change is integral to the acceptance criteria of T029 itself and a split is unnecessary for a single script modification.
 
 ## Files changed
 - _workspaces/tasks/todo/T029-vs1-gate-differential-interp-vs-native-determinism.md
