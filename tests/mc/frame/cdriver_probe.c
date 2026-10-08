@@ -4,7 +4,7 @@
 #include "target/x64/frame/frame.h"
 #include "target/x64/encode/encode.h"
 
-int main() {
+int main(void) {
     AxArena arena;
     ax_arena_init(&arena, 0);
     TypeInterner interner;

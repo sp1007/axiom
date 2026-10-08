@@ -2,7 +2,7 @@
 #include <assert.h>
 #include "abi/abi.h"
 
-int main() {
+int main(void) {
     TypeInterner interner;
     ax_type_interner_init(&interner);
     AxArena arena;
