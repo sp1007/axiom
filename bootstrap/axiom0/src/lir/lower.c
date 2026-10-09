@@ -1,5 +1,6 @@
 #include "lir/lir.h"
 #include <stdlib.h>
+#include "types/layout/layout.h"
 
 typedef struct LirBuilder {
     AxArena *arena;
@@ -92,30 +93,13 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 const AxType *t = ax_type_get(b->interner, ty);
                 uint32_t idx = place->projs[i].field_idx;
                 uint32_t offset = 0;
-                uint32_t max_align = 1;
                 TypeId next_ty = {0};
-                size_t f_count = 0;
-                TypeId *fields = NULL;
-                if (t && t->kind == AX_TY_STRUCT) {
-                    f_count = t->strct.field_count;
-                    fields = t->strct.fields;
-                } else if (t && t->kind == AX_TY_TUPLE) {
-                    f_count = t->tuple.field_count;
-                    fields = t->tuple.fields;
+                if (t && (t->kind == AX_TY_STRUCT || t->kind == AX_TY_TUPLE)) {
+                    offset = ax_type_field_offset(ty, idx, b->interner);
+                    if (t->kind == AX_TY_STRUCT && idx < t->strct.field_count) next_ty = t->strct.fields[idx];
+                    else if (t->kind == AX_TY_TUPLE && idx < t->tuple.field_count) next_ty = t->tuple.fields[idx];
                 }
                 
-                for (size_t k = 0; k <= idx && k < f_count; k++) {
-                    TypeId field_ty = fields[k];
-                    uint32_t fa = ax_type_align(field_ty, b->interner);
-                    uint32_t fs = ax_type_size(field_ty, b->interner);
-                    if (fa > max_align) max_align = fa;
-                    offset = (offset + fa - 1) & ~(fa - 1);
-                    if (k == idx) {
-                        next_ty = field_ty;
-                        break;
-                    }
-                    offset += fs;
-                }
                 ty = next_ty;
                 AxLirVRegId dummy_off = emit_const(b, offset, b->interner->t_usize);
                 addr = emit_offset(b, addr, dummy_off);
@@ -189,15 +173,43 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             return lower_operand(b, &rv->use);
         case AX_MIR_RVALUE_REF:
             return lower_place_addr(b, &rv->ref.place, NULL);
+        case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
+            AxLirVRegId lhs = lower_operand(b, &rv->binary_op.lhs);
+            AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
+            AxLirInstKind kind = 0;
+            TypeId op_ty = b->interner->t_i32; // fallback
+            if (rv->binary_op.lhs.kind == AX_MIR_OP_COPY || rv->binary_op.lhs.kind == AX_MIR_OP_MOVE) {
+                op_ty = b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
+            } else if (rv->binary_op.lhs.kind == AX_MIR_OP_CONST) {
+                op_ty = rv->binary_op.lhs.constant.ty;
+            }
+            const AxType *t = ax_type_get(b->interner, op_ty);
+            bool is_signed = true;
+            if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
+                is_signed = false;
+            }
+            switch (rv->binary_op.op) {
+                case AX_MIR_BINOP_ADD: kind = is_signed ? AX_LIR_INST_SADD_OVERFLOW : AX_LIR_INST_UADD_OVERFLOW; break;
+                case AX_MIR_BINOP_SUB: kind = is_signed ? AX_LIR_INST_SSUB_OVERFLOW : AX_LIR_INST_USUB_OVERFLOW; break;
+                case AX_MIR_BINOP_MUL: kind = is_signed ? AX_LIR_INST_SMUL_OVERFLOW : AX_LIR_INST_UMUL_OVERFLOW; break;
+                case AX_MIR_BINOP_DIV: kind = is_signed ? AX_LIR_INST_SDIV_OVERFLOW : AX_LIR_INST_UDIV_OVERFLOW; break;
+                case AX_MIR_BINOP_REM: kind = is_signed ? AX_LIR_INST_SREM_OVERFLOW : AX_LIR_INST_UREM_OVERFLOW; break;
+                default: kind = AX_LIR_INST_SADD_OVERFLOW; break; // fallback
+            }
+            AxLirVRegId dest = make_vreg(b, dest_ty);
+            uint32_t bit_width = ax_type_size(op_ty, b->interner) * 8;
+            emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .overflow_op = { .lhs = lhs, .rhs = rhs, .bit_width = bit_width } });
+            return dest;
+        }
         case AX_MIR_RVALUE_BINARY_OP: {
             AxLirVRegId lhs = lower_operand(b, &rv->binary_op.lhs);
             AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
             const AxType *t = ax_type_get(b->interner, dest_ty);
-              bool is_signed = true;
-              if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
-                  is_signed = false;
-              }
-              AxLirInstKind kind = lower_binop(rv->binary_op.op, is_signed);
+            bool is_signed = true;
+            if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
+                is_signed = false;
+            }
+            AxLirInstKind kind = lower_binop(rv->binary_op.op, is_signed);
             AxLirVRegId dest = make_vreg(b, dest_ty);
             emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .binary = { .lhs = lhs, .rhs = rhs } });
             return dest;
@@ -210,6 +222,22 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             AxLirVRegId dest = make_vreg(b, dest_ty);
             emit_inst(b, (AxLirInst){ .kind = kind, .dest = dest, .unary = { .operand = op } });
             return dest;
+        }
+        case AX_MIR_RVALUE_CAST:
+            return lower_operand(b, &rv->cast.op);
+        case AX_MIR_RVALUE_LEN: {
+            TypeId place_ty = b->mir->locals[rv->len.local.v].ty;
+            for (size_t i = 0; i < rv->len.proj_count; i++) {
+                const AxType *t = ax_type_get(b->interner, place_ty);
+                if (t->kind == AX_TY_ARRAY) place_ty = t->array.elem;
+                else if (t->kind == AX_TY_TUPLE) place_ty = t->tuple.fields[rv->len.projs[i].field_idx];
+                else if (t->kind == AX_TY_STRUCT) place_ty = t->strct.fields[rv->len.projs[i].field_idx];
+                else if (t->kind == AX_TY_PTR) place_ty = t->ptr.pointee;
+            }
+            const AxType *t = ax_type_get(b->interner, place_ty);
+            uint64_t len = 0;
+            if (t && t->kind == AX_TY_ARRAY) len = t->array.len;
+            return emit_const(b, len, b->interner->t_usize);
         }
         case AX_MIR_RVALUE_AGGREGATE:
             return emit_const(b, 0, dest_ty); // Not used directly, handled in assign
@@ -258,30 +286,47 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 TypeId dest_ty = mir->locals[stmt->assign.place.local.v].ty;
                 if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
                     AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
-                    uint32_t offset = 0;
-                    uint32_t max_align = 1;
                     const AxType *ty = ax_type_get(b.interner, dest_ty);
                     for (size_t k = 0; k < stmt->assign.rvalue.aggregate.operand_count; k++) {
-                        TypeId field_ty = {0};
-                        if (ty->kind == AX_TY_STRUCT) field_ty = ty->strct.fields[k];
-                        else if (ty->kind == AX_TY_TUPLE) field_ty = ty->tuple.fields[k];
-                        
-                        uint32_t fa = ax_type_align(field_ty, b.interner);
-                        uint32_t fs = ax_type_size(field_ty, b.interner);
-                        if (fa > max_align) max_align = fa;
-                        offset = (offset + fa - 1) & ~(fa - 1);
-                        
+                        uint32_t offset = 0;
+                        if (ty && (ty->kind == AX_TY_STRUCT || ty->kind == AX_TY_TUPLE)) {
+                            offset = ax_type_field_offset(dest_ty, k, b.interner);
+                        } else if (ty && ty->kind == AX_TY_ARRAY) {
+                            TypeId elem_ty = ty->array.elem;
+                            uint32_t fa = ax_type_align(elem_ty, b.interner);
+                            uint32_t fs = ax_type_size(elem_ty, b.interner);
+                            uint32_t stride = (fs + fa - 1) & ~(fa - 1);
+                            offset = (uint32_t)(k * stride);
+                        }
                         AxLirVRegId off_reg = emit_const(&b, offset, b.interner->t_usize);
                         AxLirVRegId field_addr = emit_offset(&b, addr, off_reg);
                         
                         AxLirVRegId field_val = lower_operand(&b, &stmt->assign.rvalue.aggregate.operands[k]);
                         emit_store(&b, field_addr, field_val);
+                    }
+                    continue;
+                } else if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_REPEAT) {
+                    AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
+                    const AxType *ty = ax_type_get(b.interner, dest_ty);
+                    if (ty && ty->kind == AX_TY_ARRAY) {
+                        TypeId elem_ty = ty->array.elem;
+                        uint32_t fa = ax_type_align(elem_ty, b.interner);
+                        uint32_t fs = ax_type_size(elem_ty, b.interner);
+                        uint32_t stride = (fs + fa - 1) & ~(fa - 1);
                         
-                        offset += fs;
+                        uint64_t count = ty->array.len;
+                        
+                        AxLirVRegId elem_val = lower_operand(&b, &stmt->assign.rvalue.repeat.op);
+                        
+                        for (uint64_t k = 0; k < count; k++) {
+                            uint32_t offset = (uint32_t)(k * stride);
+                            AxLirVRegId off_reg = emit_const(&b, offset, b.interner->t_usize);
+                            AxLirVRegId elem_addr = emit_offset(&b, addr, off_reg);
+                            emit_store(&b, elem_addr, elem_val);
+                        }
                     }
                     continue;
                 }
-                
                 AxLirVRegId val = lower_rvalue(&b, &stmt->assign.rvalue, dest_ty);
                 AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
                 emit_store(&b, addr, val);
@@ -344,13 +389,11 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                     AxMirLocalId loc = mbb->terminator.call.func.place.local;
                     callee_ty = mir->locals[loc.v].ty;
                 }
-                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name, .callee_ty = callee_ty } });
-                
-                AxLirVRegId res = make_vreg(&b, interner->t_isize);
-
-                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_RESULT, .dest = res, .abi_result = { .index = 0 } });
-                
                 AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name, .callee_ty = callee_ty, .dst_addr = dst_addr } });
+                
+                AxLirVRegId res = make_vreg(&b, mir->locals[mbb->terminator.call.destination.local.v].ty);
+                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_RESULT, .dest = res, .abi_result = { .index = 0 } });
                 emit_store(&b, dst_addr, res);
                 
                 term.kind = AX_LIR_TERM_JMP;
@@ -358,8 +401,17 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 break;
             }
             case AX_MIR_TERM_ASSERT: {
-                term.kind = AX_LIR_TERM_JMP;
-                term.jmp_target = (AxLirBbId){ mbb->terminator.assert.target.v };
+                AxLirVRegId cond_vreg = lower_operand(&b, &mbb->terminator.assert.cond);
+                if (!mbb->terminator.assert.expected) {
+                    AxLirVRegId one = emit_const(&b, 1, b.interner->t_bool);
+                    AxLirVRegId xor_res = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_BIT_XOR, .dest = xor_res, .binary = { .lhs = cond_vreg, .rhs = one } });
+                    cond_vreg = xor_res;
+                }
+                term.kind = AX_LIR_TERM_ASSERT;
+                term.assert_term.cond = cond_vreg;
+                term.assert_term.target = (AxLirBbId){ mbb->terminator.assert.target.v };
+                term.assert_term.msg = mbb->terminator.assert.msg;
                 break;
             }
             default:

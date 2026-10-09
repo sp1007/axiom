@@ -308,7 +308,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
         0xCC                          // int3
     };
     append_section_data(text_sec, start_code, sizeof(start_code), 16, &axiom_start_offset);
-    add_reloc(&ctx, text_sec, axiom_start_offset + 5, IMAGE_REL_AMD64_REL32, "main", -4);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 5, IMAGE_REL_AMD64_REL32, "main", 0);
     
     uint8_t panic_code[] = {
         0x56, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x89, 0xCB, 0xB9, 0xF4, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xD6,
@@ -321,9 +321,9 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     };
     uint32_t panic_offset;
     append_section_data(text_sec, panic_code, sizeof(panic_code), 16, &panic_offset);
-    add_reloc(&ctx, text_sec, panic_offset + 19, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", -4);
-    add_reloc(&ctx, text_sec, panic_offset + 48, IMAGE_REL_AMD64_REL32, "__IAT_WriteFile", -4);
-    add_reloc(&ctx, text_sec, panic_offset + 59, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", -4);
+    add_reloc(&ctx, text_sec, panic_offset + 19, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", 0);
+    add_reloc(&ctx, text_sec, panic_offset + 48, IMAGE_REL_AMD64_REL32, "__IAT_WriteFile", 0);
+    add_reloc(&ctx, text_sec, panic_offset + 59, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", 0);
     
     GlobalSymbol *panic_sym = add_global(&ctx, "axiom_panic");
     panic_sym->defined = true; panic_sym->sec = text_sec; panic_sym->offset = panic_offset;
@@ -398,7 +398,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     
     // Reloc for call [rip + IAT_ExitProcess]
     uint32_t call_exit_offset = axiom_start_offset + 13;
-    add_reloc(&ctx, text_sec, call_exit_offset, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", -4);
+    add_reloc(&ctx, text_sec, call_exit_offset, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", 0);
     
     GlobalSymbol *iat_exit = add_global(&ctx, "__IAT_ExitProcess");
     iat_exit->defined = true; iat_exit->sec = idata_sec; iat_exit->offset = idata_base + iat_offset;
@@ -415,7 +415,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
         Reloc *r = &ctx.relocs[i];
         GlobalSymbol *sym = add_global(&ctx, r->sym_name);
         if (!sym->defined) {
-            if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_UNDEFINED_SYMBOL, .severity=AX_DIAG_ERROR, .message="undefined symbol"});
+            if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_UNDEFINED_SYMBOL, .severity=AX_DIAG_ERROR, .message=r->sym_name});
             { free_linker_context(&ctx); return false; }
         }
         
@@ -423,7 +423,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
         uint32_t reloc_rva = r->sec->rva + r->offset;
         
         if (r->type == IMAGE_REL_AMD64_REL32 || (r->type >= IMAGE_REL_AMD64_REL32_1 && r->type <= IMAGE_REL_AMD64_REL32_5)) {
-            int64_t val = (int64_t)sym_rva - (int64_t)reloc_rva + r->addend;
+            int64_t val = (int64_t)sym_rva - (int64_t)reloc_rva - 4 + r->addend;
             int32_t val32 = (int32_t)val;
             memcpy(r->sec->data + r->offset, &val32, 4);
         } else if (r->type == IMAGE_REL_AMD64_ADDR64) {

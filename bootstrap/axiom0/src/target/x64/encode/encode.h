@@ -105,6 +105,8 @@ void ax_x64_test_ri(ax_section_t *sec, uint8_t sz, ax_x64_reg_t left, int32_t im
 
 void ax_x64_imul_rr(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_reg_t src);
 void ax_x64_imul_rm(ax_section_t *sec, uint8_t sz, ax_x64_reg_t dst, ax_x64_mem_t src);
+void ax_x64_mul_r(ax_section_t *sec, uint8_t sz, ax_x64_reg_t src);
+void ax_x64_mul_m(ax_section_t *sec, uint8_t sz, ax_x64_mem_t src);
 
 void ax_x64_cqo(ax_section_t *sec);
 void ax_x64_cdq(ax_section_t *sec);

@@ -37,6 +37,7 @@ typedef enum AxX64MIOpcode {
     AX_X64_MI_ADD,
     AX_X64_MI_SUB,
     AX_X64_MI_IMUL,
+    AX_X64_MI_MUL,
     AX_X64_MI_IDIV, // implicit uses/defs
     AX_X64_MI_AND,
     AX_X64_MI_OR,
@@ -46,6 +47,7 @@ typedef enum AxX64MIOpcode {
     AX_X64_MI_SHR,
     AX_X64_MI_LEA,
     AX_X64_MI_CMP,
+    AX_X64_MI_TEST,
     AX_X64_MI_JMP,
     AX_X64_MI_JCC,
     AX_X64_MI_CALL,
@@ -61,6 +63,7 @@ typedef struct AxX64MI {
     AxX64MIOpcode opcode;
     AxX64Op ops[3];
     uint8_t op_count;
+    uint8_t sz; // size of the operation in bytes
     struct AxX64MI *next;
     const char *msg;
 } AxX64MI;

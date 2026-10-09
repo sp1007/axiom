@@ -29,6 +29,16 @@ typedef enum AxLirInstKind {
     AX_LIR_INST_OFFSET,
     // Constants
     AX_LIR_INST_CONST,
+    AX_LIR_INST_SADD_OVERFLOW,
+    AX_LIR_INST_UADD_OVERFLOW,
+    AX_LIR_INST_SSUB_OVERFLOW,
+    AX_LIR_INST_USUB_OVERFLOW,
+    AX_LIR_INST_SMUL_OVERFLOW,
+    AX_LIR_INST_UMUL_OVERFLOW,
+    AX_LIR_INST_SDIV_OVERFLOW,
+    AX_LIR_INST_UDIV_OVERFLOW,
+    AX_LIR_INST_SREM_OVERFLOW,
+    AX_LIR_INST_UREM_OVERFLOW,
     // Call
     AX_LIR_INST_CALL,
     AX_LIR_INST_ABI_ARG,
@@ -55,6 +65,11 @@ typedef struct AxLirInst {
             AxLirVRegId val;
         } store;
         struct {
+            AxLirVRegId lhs;
+            AxLirVRegId rhs;
+            uint32_t bit_width;
+        } overflow_op;
+        struct {
             AxLirStackSlotId slot;
         } stack_addr;
         struct {
@@ -64,6 +79,7 @@ typedef struct AxLirInst {
         struct {
             const char *sym_name;
             TypeId callee_ty;
+            AxLirVRegId dst_addr;
         } call;
         struct {
             uint32_t index;

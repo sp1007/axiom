@@ -1,9 +1,11 @@
 #include "types/layout/layout.h"
 #include "isel.h"
+#include "kernel/base.h"
 #include <stdlib.h>
 
-static void emit(AxX64MIBody *mi, AxX64MIBb *mbb, AxX64MIOpcode opc, AxX64Op op1, AxX64Op op2) {
+static void emit_sz(AxX64MIBody *mi, AxX64MIBb *mbb, AxX64MIOpcode opc, uint8_t sz, AxX64Op op1, AxX64Op op2) {
     AxX64MI *inst = ax_x64_mi_new(&mi->arena, opc);
+    inst->sz = sz;
     if (op1.kind != AX_X64_OP_NONE) ax_x64_mi_add_op(inst, op1);
     if (op2.kind != AX_X64_OP_NONE) ax_x64_mi_add_op(inst, op2);
     if (mbb->last_inst) {
@@ -12,6 +14,10 @@ static void emit(AxX64MIBody *mi, AxX64MIBb *mbb, AxX64MIOpcode opc, AxX64Op op1
     } else {
         mbb->first_inst = mbb->last_inst = inst;
     }
+}
+
+static void emit(AxX64MIBody *mi, AxX64MIBb *mbb, AxX64MIOpcode opc, AxX64Op op1, AxX64Op op2) {
+    emit_sz(mi, mbb, opc, 8, op1, op2);
 }
 
 
@@ -68,12 +74,22 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
     // Simple vreg mapping to stack slots (naive ISEL)
     uint32_t slot_offset = lir->slot_count; 
     
+    bool callee_ret_in_mem = false;
+    if (lir->slot_count > 0) {
+        uint32_t ret_size = ax_type_size(lir->slots[0].ty, interner);
+        callee_ret_in_mem = (ret_size > 8 || (ret_size != 1 && ret_size != 2 && ret_size != 4 && ret_size != 8 && ret_size != 0));
+    }
+    
     for (size_t b = 0; b < lir->bb_count; b++) {
         const AxLirBb *lbb = &lir->bbs[b];
         AxX64MIBb *mbb = &mi->bbs[b];
         mbb->id = b; // assume bb index is ID
         mbb->first_inst = NULL;
         mbb->last_inst = NULL;
+        
+        if (b == 0 && callee_ret_in_mem) {
+            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(0, 0), ax_x64_op_reg(1 /*RCX*/));
+        }
         
         for (size_t i = 0; i < lbb->inst_count; i++) {
             const AxLirInst *inst = &lbb->insts[i];
@@ -161,6 +177,134 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                       emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                       break;
                   }
+                  case AX_LIR_INST_UADD_OVERFLOW:
+                case AX_LIR_INST_USUB_OVERFLOW:
+                case AX_LIR_INST_UMUL_OVERFLOW: {
+                    int is_64 = (inst->overflow_op.bit_width == 64);
+                    
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->overflow_op.lhs.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RCX*/), ax_x64_op_frame(slot_offset + inst->overflow_op.rhs.v, 0));
+                    
+                    if (!is_64) {
+                        uint64_t mask = 0;
+                        uint64_t uint_max = 0;
+                        if (inst->overflow_op.bit_width == 8) { mask = 0xFF; uint_max = 0xFF; }
+                        else if (inst->overflow_op.bit_width == 16) { mask = 0xFFFF; uint_max = 0xFFFF; }
+                        else if (inst->overflow_op.bit_width == 32) { mask = 0xFFFFFFFF; uint_max = 0xFFFFFFFF; }
+                        
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(3 /*RDX*/), ax_x64_op_imm(mask));
+                        emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0), ax_x64_op_reg(3));
+                        emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(2), ax_x64_op_reg(3));
+                        
+                        if (inst->kind == AX_LIR_INST_UADD_OVERFLOW) {
+                            emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0), ax_x64_op_reg(2));
+                        } else if (inst->kind == AX_LIR_INST_USUB_OVERFLOW) {
+                            emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(0), ax_x64_op_reg(2));
+                        } else {
+                            emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(0), ax_x64_op_reg(2));
+                        }
+                        
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(3 /*RDX*/), ax_x64_op_imm(uint_max));
+                        
+                        if (inst->kind == AX_LIR_INST_USUB_OVERFLOW) {
+                            // Underflow for unsigned sub: result is > uint_max? No, result of 64-bit sub of two positive small numbers might be negative (represented as large 64-bit value).
+                            // So if A < B, A - B is negative, which means > uint_max.
+                            emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0), ax_x64_op_reg(3));
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x7 /*A*/), ax_x64_op_reg(0));
+                        } else {
+                            emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0), ax_x64_op_reg(3));
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x7 /*A*/), ax_x64_op_reg(0));
+                        }
+                    } else {
+                        if (inst->kind == AX_LIR_INST_UADD_OVERFLOW) {
+                            emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0), ax_x64_op_reg(2));
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x2 /*B*/), ax_x64_op_reg(0));
+                        } else if (inst->kind == AX_LIR_INST_USUB_OVERFLOW) {
+                            emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(0), ax_x64_op_reg(2));
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x2 /*B*/), ax_x64_op_reg(0));
+                        } else {
+                            emit(mi, mbb, AX_X64_MI_MUL, ax_x64_op_reg(2), (AxX64Op){0});
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x2 /*B*/), ax_x64_op_reg(0)); // wait, MUL sets CF and OF. B is carry flag! So SETC works!
+                        }
+                    }
+                    emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    break;
+                }
+                case AX_LIR_INST_SADD_OVERFLOW:
+                  case AX_LIR_INST_SSUB_OVERFLOW:
+                  case AX_LIR_INST_SMUL_OVERFLOW: {
+                      int is_64 = (inst->overflow_op.bit_width == 64);
+                      
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->overflow_op.lhs.v, 0));
+                      if (inst->kind == AX_LIR_INST_SADD_OVERFLOW) {
+                          emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->overflow_op.rhs.v, 0));
+                      } else if (inst->kind == AX_LIR_INST_SSUB_OVERFLOW) {
+                          emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->overflow_op.rhs.v, 0));
+                      } else {
+                          emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->overflow_op.rhs.v, 0));
+                      }
+                      
+                      if (is_64) {
+                          emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x0 /*O*/), ax_x64_op_reg(0 /*RAX*/));
+                          emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(1));
+                      } else {
+                          int64_t int_min, int_max;
+                          if (inst->overflow_op.bit_width == 8) { int_min = -128LL; int_max = 127LL; }
+                          else if (inst->overflow_op.bit_width == 16) { int_min = -32768LL; int_max = 32767LL; }
+                          else { int_min = -2147483648LL; int_max = 2147483647LL; }
+                          
+                          emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(int_min));
+                          emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(2 /*RDX*/));
+                          emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0xC /*L*/), ax_x64_op_reg(1 /*RCX*/));
+                          emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(1));
+                          
+                          emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(int_max));
+                          emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(2 /*RDX*/));
+                          emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0xF /*G*/), ax_x64_op_reg(0 /*RAX*/));
+                          emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(1));
+                          
+                          emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(1 /*RCX*/));
+                      }
+                      
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0 /*RAX*/));
+                      break;
+                  }
+
+                  case AX_LIR_INST_UDIV_OVERFLOW:
+                  case AX_LIR_INST_UREM_OVERFLOW: {
+                      // Unsigned division never overflows! (Except div by zero, which is checked separately)
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(0));
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0 /*RAX*/));
+                      break;
+                  }
+                  
+                  case AX_LIR_INST_SDIV_OVERFLOW:
+                  case AX_LIR_INST_SREM_OVERFLOW: {
+                      int64_t int_min;
+                      if (inst->overflow_op.bit_width == 8) int_min = -128LL;
+                      else if (inst->overflow_op.bit_width == 16) int_min = -32768LL;
+                      else if (inst->overflow_op.bit_width == 32) int_min = -2147483648LL;
+                      else int_min = 0x8000000000000000ULL;
+                      
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->overflow_op.lhs.v, 0));
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_frame(slot_offset + inst->overflow_op.rhs.v, 0));
+                      
+                      emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(-1));
+                      emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x4 /*E*/), ax_x64_op_reg(1 /*RCX*/));
+                      emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(1));
+                      
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(int_min));
+                      
+                      emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(2 /*RDX*/));
+                      emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x4 /*E*/), ax_x64_op_reg(0 /*RAX*/));
+                      emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(1));
+                      
+                      emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(1 /*RCX*/));
+                      
+                      emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0 /*RAX*/));
+                      break;
+                  }
                   case AX_LIR_INST_DIV:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(0 /*RAX*/));
@@ -183,6 +327,11 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1), ax_x64_op_imm(0));
                     emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(1), ax_x64_op_reg(0));
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1));
+                    break;
+                case AX_LIR_INST_NOT:
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->unary.operand.v, 0));
+                    emit(mi, mbb, AX_X64_MI_XOR, ax_x64_op_reg(0), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                     break;
                 case AX_LIR_INST_BITNOT:
                     // NOT x == -1 - x, so we use SUB which is fully supported
@@ -236,31 +385,92 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                           }
                       }
                       break;
-                                  case AX_LIR_INST_CALL:
+                                  case AX_LIR_INST_CALL: {
+                      const AxType *callee_ty = ax_type_get(interner, inst->call.callee_ty);
+                      if (callee_ty) {
+                          uint32_t ret_size = ax_type_size(callee_ty->fn.ret_type, interner);
+                          bool ret_in_mem = (ret_size > 8 || (ret_size != 1 && ret_size != 2 && ret_size != 4 && ret_size != 8 && ret_size != 0));
+                          if (ret_in_mem) {
+                              emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->call.dst_addr.v, 0));
+                          }
+                      }
                       emit(mi, mbb, AX_X64_MI_CALL, (AxX64Op){0}, (AxX64Op){0});
                       mbb->last_inst->msg = inst->call.sym_name;
                       break;
+                  }
                                     case AX_LIR_INST_ABI_RESULT:
                     if (inst->abi_result.loc_kind == 0) { // REG
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(inst->abi_result.loc_reg_or_offset));
                     } else if (inst->abi_result.loc_kind == 2) { // INDIRECT
-                        // Result was returned in the memory pointer we passed!
-                        // But wait! We passed the pointer as the FIRST hidden argument (RCX).
-                        // Isel naive approach: if it's indirect, we just leave it?
-                        // Wait, if it's indirect, the caller allocated the space, and the call already wrote to it.
-                        // So we don't need to do anything here because the struct is already in the allocated space!
+                        uint32_t load_sz = ax_type_size(lir->vregs[inst->dest.v].ty, interner);
+                        if (load_sz <= 8) {
+                            if (load_sz != 1 && load_sz != 2 && load_sz != 4 && load_sz != 8) load_sz = 8;
+                            AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = 0, .is_rip = false } };
+                            emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_reg(1 /*RCX*/), mem);
+                            emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1 /*RCX*/));
+                        } else {
+                            for (uint32_t i = 0; i < load_sz; i += 8) {
+                                uint32_t chunk = load_sz - i >= 8 ? 8 : (load_sz - i >= 4 ? 4 : (load_sz - i >= 2 ? 2 : 1));
+                                AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = i, .is_rip = false } };
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), mem);
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                            }
+                        }
                     }
                     break;
-                case AX_LIR_INST_STACK_ADDR:
-                    emit(mi, mbb, AX_X64_MI_LEA, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(inst->stack_addr.slot.v, 0));
-                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                case AX_LIR_INST_STACK_ADDR: {
+                    bool ret_in_mem = false;
+                    if (inst->stack_addr.slot.v == 0 && lir->slot_count > 0) {
+                        uint32_t ret_size = ax_type_size(lir->slots[0].ty, interner);
+                        ret_in_mem = (ret_size > 8 || (ret_size != 1 && ret_size != 2 && ret_size != 4 && ret_size != 8 && ret_size != 0));
+                    }
+                    if (ret_in_mem) {
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(0, 0));
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    } else {
+                        emit(mi, mbb, AX_X64_MI_LEA, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(inst->stack_addr.slot.v, 0));
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    }
                     break;
+                }
                 case AX_LIR_INST_LOAD:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_frame(slot_offset + inst->load.ptr.v, 0));
                     {
                         AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = 0, .is_rip = false } };
-                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), mem);
+                        uint32_t load_sz = ax_type_size(inst->load.ty, interner);
+                        if (load_sz <= 8) {
+                            if (load_sz != 1 && load_sz != 2 && load_sz != 4 && load_sz != 8) load_sz = 8;
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(0));
+                            emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_reg(1 /*RCX*/), mem);
+                        } else {
+                            for (uint32_t i = 0; i < load_sz; i += 8) {
+                                uint32_t chunk = load_sz - i >= 8 ? 8 : (load_sz - i >= 4 ? 4 : (load_sz - i >= 2 ? 2 : 1));
+                                mem.mem.disp = i;
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), mem);
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                            }
+                            goto load_skip_mov; // Skip the single 8-byte move at the end
+                        }
+                        
+                        uint32_t size = ax_type_size(inst->load.ty, interner);
+                        bool is_signed = false;
+                        const AxType *t = ax_type_get(interner, inst->load.ty);
+                        if (t && (t->kind == AX_TY_I8 || t->kind == AX_TY_I16 || t->kind == AX_TY_I32 || t->kind == AX_TY_I64 || t->kind == AX_TY_ISIZE)) {
+                            is_signed = true;
+                        }
+                        if (size == 1) {
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(1), ax_x64_op_imm(56));
+                            emit(mi, mbb, is_signed ? AX_X64_MI_SAR : AX_X64_MI_SHR, ax_x64_op_reg(1), ax_x64_op_imm(56));
+                        } else if (size == 2) {
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(1), ax_x64_op_imm(48));
+                            emit(mi, mbb, is_signed ? AX_X64_MI_SAR : AX_X64_MI_SHR, ax_x64_op_reg(1), ax_x64_op_imm(48));
+                        } else if (size == 4) {
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(1), ax_x64_op_imm(32));
+                            emit(mi, mbb, is_signed ? AX_X64_MI_SAR : AX_X64_MI_SHR, ax_x64_op_reg(1), ax_x64_op_imm(32));
+                        }
+                        
                         emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1));
+                    load_skip_mov:;
                     }
                     break;
                 case AX_LIR_INST_STORE:
@@ -268,7 +478,19 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->store.val.v, 0));
                     {
                         AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = 0, .is_rip = false } };
-                        emit(mi, mbb, AX_X64_MI_MOV, mem, ax_x64_op_reg(1));
+                        if (inst->store.val.v >= lir->vreg_count) { AX_ICE("VReg out of bounds"); }
+                        uint32_t size = ax_type_size(lir->vregs[inst->store.val.v].ty, interner);
+                        if (size <= 8) {
+                            if (size != 1 && size != 2 && size != 4 && size != 8) size = 8;
+                            emit_sz(mi, mbb, AX_X64_MI_MOV, size, mem, ax_x64_op_reg(1));
+                        } else {
+                            for (uint32_t i = 0; i < size; i += 8) {
+                                uint32_t chunk = size - i >= 8 ? 8 : (size - i >= 4 ? 4 : (size - i >= 2 ? 2 : 1));
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->store.val.v, i));
+                                mem.mem.disp = i;
+                                emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, mem, ax_x64_op_reg(1 /*RCX*/));
+                            }
+                        }
                     }
                     break;
                 default:

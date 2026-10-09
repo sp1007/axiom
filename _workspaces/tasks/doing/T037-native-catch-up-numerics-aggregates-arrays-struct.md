@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T036, T033]
 priority: 57
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/abi, bootstrap/axiom0/src/target/x64, tests/run/native_aggr, tests/run/numeric, tests/run/struct, tests/run/array]
+status: doing
+attempts: 1
+paths: [bootstrap/axiom0/src/driver, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target, bootstrap/axiom0/src/mir, tests/run, bootstrap/axiom0/src/link/pe, bootstrap/axiom0/src/obj/coff, tests/mc]
 spec: [0189, 0230, 0250, 0181]
+started: 2026-10-09 15:01:01
+agent: T037-impl
 ---
 # T037 — Native catch-up: numerics, aggregates, arrays, struct ABI
 
@@ -36,3 +38,6 @@ All numeric/struct/array tests pass natively.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-09 15:01:01 started (attempt 1) T037-impl

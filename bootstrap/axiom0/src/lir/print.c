@@ -49,6 +49,16 @@ void ax_lir_print(FILE *out, const AxLirBody *body) {
                 case AX_LIR_INST_STACK_ADDR: fprintf(out, "stack_addr slot%u;\n", inst->stack_addr.slot.v); break;
                 case AX_LIR_INST_OFFSET: fprintf(out, "offset v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_CONST: fprintf(out, "const %llu;\n", (unsigned long long)inst->constant.val); break;
+                case AX_LIR_INST_SADD_OVERFLOW: fprintf(out, "sadd_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_UADD_OVERFLOW: fprintf(out, "uadd_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_SSUB_OVERFLOW: fprintf(out, "ssub_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_USUB_OVERFLOW: fprintf(out, "usub_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_SMUL_OVERFLOW: fprintf(out, "smul_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_UMUL_OVERFLOW: fprintf(out, "umul_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_SDIV_OVERFLOW: fprintf(out, "sdiv_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_UDIV_OVERFLOW: fprintf(out, "udiv_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_SREM_OVERFLOW: fprintf(out, "srem_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
+                case AX_LIR_INST_UREM_OVERFLOW: fprintf(out, "urem_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
                 case AX_LIR_INST_CALL: fprintf(out, "call %s;\n", inst->call.sym_name); break;
                 case AX_LIR_INST_ABI_ARG: fprintf(out, "abi_arg %u, v%u;\n", inst->abi_arg.index, inst->abi_arg.val.v); break;
                 case AX_LIR_INST_ABI_RESULT: fprintf(out, "abi_result %u;\n", inst->abi_result.index); break;

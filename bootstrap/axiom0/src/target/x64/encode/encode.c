@@ -232,6 +232,19 @@ void ax_x64_idiv_r(ax_section_t *sec, uint8_t sz, ax_x64_reg_t src) {
     emit8(sec, sz == 1 ? 0xF6 : 0xF7);
     emit8(sec, 0xF8 | (src & 7)); // 11 111 (7) rm
 }
+void ax_x64_mul_r(ax_section_t *sec, uint8_t sz, ax_x64_reg_t src) {
+    emit_sz(sec, sz);
+    emit_rex_rr(sec, sz, AX_REG_NONE, src);
+    emit8(sec, sz == 1 ? 0xF6 : 0xF7);
+    emit8(sec, 0xE0 | (src & 7));
+}
+void ax_x64_mul_m(ax_section_t *sec, uint8_t sz, ax_x64_mem_t src) {
+    emit_sz(sec, sz);
+    emit_rex_rm(sec, sz, AX_REG_NONE, src);
+    emit8(sec, sz == 1 ? 0xF6 : 0xF7);
+    emit_modrm_sib_disp(sec, 4, src);
+}
+
 void ax_x64_idiv_m(ax_section_t *sec, uint8_t sz, ax_x64_mem_t src) {
     emit_sz(sec, sz);
     emit_rex_rm(sec, sz, AX_REG_NONE, src);

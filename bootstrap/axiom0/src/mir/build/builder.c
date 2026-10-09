@@ -96,6 +96,13 @@ static TypeId get_expr_type(Builder *b, const AxHirExpr *expr) {
     return ty;
 }
 
+static TypeId get_pat_type(Builder *b, const struct AxHirPat *pat) {
+    TypeId ty = {0};
+    const TypeId *res = AxPatTypeMap_get(&b->thir->pat_types, pat);
+    if (res) return *res;
+    return ty;
+}
+
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
 
 static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr);
@@ -155,6 +162,44 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
             stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
             stmt.assign.rvalue.use = idx_op;
             push_stmt(b, b->current_bb, stmt);
+        }
+        
+        TypeId base_ty = get_expr_type(b, expr->index.base);
+        const AxType *t = ax_type_get(&b->thir->interner, base_ty);
+        if (t && t->kind == AX_TY_ARRAY) {
+            uint64_t len = t->array.len;
+            
+            AxMirLocalId cond_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace cond_place = { cond_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt cmp_stmt = {0};
+            cmp_stmt.kind = AX_MIR_STMT_ASSIGN;
+            cmp_stmt.assign.place = cond_place;
+            cmp_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            cmp_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LT;
+            
+            AxMirLocalId u_idx = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+            AxMirPlace u_idx_place = { u_idx, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt cast_stmt = {0};
+            cast_stmt.kind = AX_MIR_STMT_ASSIGN;
+            cast_stmt.assign.place = u_idx_place;
+            cast_stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+            cast_stmt.assign.rvalue.cast.op = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = { idx_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 } };
+            cast_stmt.assign.rvalue.cast.ty = b->thir->interner.t_usize;
+            push_stmt(b, b->current_bb, cast_stmt);
+            
+            cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_idx_place };
+            cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .val = len, .ty = b->thir->interner.t_usize } };
+            push_stmt(b, b->current_bb, cmp_stmt);
+            
+            AxMirTerminator assert_term = {0};
+            assert_term.kind = AX_MIR_TERM_ASSERT;
+            assert_term.assert.cond = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = cond_place };
+            assert_term.assert.expected = true;
+            assert_term.assert.msg = "index out of bounds";
+            assert_term.assert.target = add_bb(b);
+            assert_term.assert.unwind = add_bb(b);
+            set_terminator(b, b->current_bb, assert_term);
+            b->current_bb = assert_term.assert.target;
         }
         
         AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
@@ -957,8 +1002,8 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
                 }
             }
         } else if (stmt->kind == AX_HIR_STMT_LET) {
-            TypeId ty = {0}; // Should compute from let... we'll use expr type
-            if (stmt->let.expr) ty = get_expr_type(b, stmt->let.expr);
+            TypeId ty = get_pat_type(b, stmt->let.pat);
+            if (ty.v == 0 && stmt->let.expr) ty = get_expr_type(b, stmt->let.expr);
             
             AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_USER, ty, stmt->let.pat->binding.is_mut);
             if (stmt->let.expr) {

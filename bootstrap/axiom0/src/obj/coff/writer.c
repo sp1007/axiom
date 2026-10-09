@@ -200,7 +200,7 @@ bool ax_coff_write(ax_objmodel_t *obj, const char *path) {
             for (size_t r = 0; r < sec->relocs_len; r++) {
                 ax_reloc_t *rel = &sec->relocs[r];
                 if (rel->kind == AX_RELOC_X86_64_PC32 || rel->kind == AX_RELOC_X86_64_PLT32) {
-                    int32_t addend32 = (int32_t)rel->addend;
+                    int32_t addend32 = (int32_t)rel->addend + 4;
                     memcpy(patched_bytes + rel->offset, &addend32, 4);
                 } else if (rel->kind == AX_RELOC_X86_64_32 || rel->kind == AX_RELOC_X86_64_GOT32) {
                     int32_t addend32 = (int32_t)rel->addend;

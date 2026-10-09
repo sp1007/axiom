@@ -222,6 +222,36 @@ void ax_stage_build_native(AxDriverState *st) {
                                 fixups[num_fixups].target = inst->ops[1].imm;
                                 num_fixups++;
                                 ax_x64_jcc(text_sec, (uint8_t)inst->ops[0].imm, 0);
+                            } else if (inst->opcode == AX_X64_MI_ASSERT) {
+                                fixups[num_fixups].fixup = text_sec->bytes_len + 2;
+                                fixups[num_fixups].target = inst->ops[0].imm;
+                                num_fixups++;
+                                ax_x64_jcc(text_sec, 0x4, 0); // JE over panic block
+                                
+                                ax_section_id_t rdata_sec_id = ax_objmodel_add_section(&obj, ".rdata", AX_SEC_RODATA, AX_SEC_FLAG_READ, 8);
+                                text_sec = ax_objmodel_get_section(&obj, text_sec_id); // Refresh text_sec pointer
+                                ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, rdata_sec_id);
+                                uint32_t str_offset = rdata_sec->bytes_len;
+                                const char *msg = inst->msg ? inst->msg : "assertion failed";
+                                char formatted_msg[256];
+                                snprintf(formatted_msg, sizeof(formatted_msg), "panic: %s\n", msg);
+                                uint32_t len = strlen(formatted_msg);
+                                ax_section_add_bytes(rdata_sec, (const uint8_t*)formatted_msg, len);
+                                ax_section_add_byte(rdata_sec, 0);
+                                
+                                static int panic_id = 0;
+                                char panic_sym_name[64];
+                                snprintf(panic_sym_name, sizeof(panic_sym_name), ".Lpanic_%d", panic_id++);
+                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(panic_sym_name), rdata_sec_id, str_offset, len + 1, AX_SYM_GLOBAL);
+                                
+                                ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x83); ax_section_add_byte(text_sec, 0xEC); ax_section_add_byte(text_sec, 0x20); // sub rsp, 32
+                                ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x8D); ax_section_add_byte(text_sec, 0x0D);
+                                ax_section_add_reloc(text_sec, text_sec->bytes_len, AX_RELOC_X86_64_PC32, str_sym, -4);
+                                ax_section_add_bytes(text_sec, (const uint8_t[]){0, 0, 0, 0}, 4);
+                                ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0xC7); ax_section_add_byte(text_sec, 0xC2);
+                                ax_section_add_bytes(text_sec, (const uint8_t[]){len & 0xFF, (len >> 8) & 0xFF, (len >> 16) & 0xFF, (len >> 24) & 0xFF}, 4);
+                                ax_section_add_bytes(text_sec, (const uint8_t[]){0xE8, 0, 0, 0, 0}, 5);
+                                ax_section_add_reloc(text_sec, text_sec->bytes_len - 4, AX_RELOC_X86_64_PC32, ax_objmodel_add_symbol(&obj, "axiom_panic", ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL), -4);
                             } else {
                                 encode_mi_to_sec(text_sec, inst, &layout, &obj);
                             }
