@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T035a]
 priority: 55
-status: todo
+status: done
 attempts: 0
-paths: [bootstrap/axiom0/src/types/layout, bootstrap/axiom0/src/types, tests/unit/types]
+paths: [bootstrap/axiom0/src/types/layout, bootstrap/axiom0/src/types, tests/unit/types, tests/hir, tests/mir, tests/resolve, tests/typeck]
 spec: [0059, 0081, 0043, tasks/0267, tasks/0281, 0009]
+finished: 2026-10-09 13:04:42
 ---
-# T035d — Struct layout engine
+# T035d Ã¢â‚¬â€ Struct layout engine
 
 ## Goal
 Implement layout engine for structs (size, align, field offsets).
@@ -24,3 +25,6 @@ Implement layout engine for structs (size, align, field offsets).
 ## Acceptance
 - [ ] Layout unit tests pass.
 - [ ] Report `_workspaces/reports/T035d-report.md`.
+
+## Log
+- 2026-10-09 13:04:42 accepted by QA -> done
