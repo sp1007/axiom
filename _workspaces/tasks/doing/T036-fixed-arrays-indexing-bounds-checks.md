@@ -10,7 +10,7 @@ depends: [T035]
 priority: 56
 status: doing
 attempts: 1
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/array, tests/ui/array]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/array, tests/ui/array]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, tasks/0326, 0087]
 started: 2026-10-09 13:37:33
@@ -22,7 +22,7 @@ agent: T036-impl
 `[N]T` arrays with safe indexing.
 
 ## Scope
-- Array literals, repeat literals if spec'd, indexing read/write, bounds checks → panic, arrays of structs, arrays in structs, built-in `len(a)` (ADR-0006 §3).
+- Array literals, repeat literals if spec'd, indexing read/write, bounds checks → panic, arrays of structs, arrays in structs, built-in `len(a)` (ADR-0006 §3). `len` must be declared in `resolve.c` as a built-in so it passes resolution without `AX_NAME_UNRESOLVED`, instead of bypassing resolution in typeck.
 
 ## Acceptance
 - [ ] run tests incl. out-of-bounds abort exit code; ui tests. Run tests carry `// native-after: T037` (removed by T037).
