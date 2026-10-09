@@ -665,7 +665,7 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     const char *prelude_types[] = {
         "bool", "i32", "u32", "usize", "isize", "Option", "Result", 
         "Copy", "Drop", "Send", "Share", "f32", "f64", "char", "str",
-        "u8", "i8", "u16", "i16", "u64", "i64"
+        "u8", "i8", "u16", "i16", "u64", "i64", "len"
     };
     for(size_t i=0; i<sizeof(prelude_types)/sizeof(prelude_types[0]); i++) {
         StrId id = ax_intern_cstr(interner, prelude_types[i]);

@@ -31,6 +31,7 @@ typedef enum AxTypeKind {
 #define AX_TY_ARRAY (AX_TY_INT_VAR + 2)
 #define AX_TY_TUPLE (AX_TY_INT_VAR + 3)
 #define AX_TY_STRUCT (AX_TY_INT_VAR + 4)
+#define AX_TY_BUILTIN_LEN (AX_TY_INT_VAR + 5)
 
 typedef struct AxType {
     AxTypeKind kind;

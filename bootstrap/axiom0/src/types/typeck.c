@@ -238,6 +238,22 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         }
         return ax_intern_type(&cx->thir->interner, &t);
     }
+    if (ht->kind == AX_HIR_TYPE_ARRAY) {
+        TypeId elem = hir_type_to_typeid(cx, ht->array.elem);
+        uint64_t len = 0;
+        if (ht->array.count->kind == AX_HIR_EXPR_LITERAL && ht->array.count->literal.kind == AX_TOK_INT) {
+            len = ht->array.count->literal.val.int_val.value;
+        } else {
+            type_error(cx, ht->array.count->span, AX_TYPE_ARRAY_SIZE);
+            return cx->thir->interner.t_error;
+        }
+        AxType t;
+        memset(&t, 0, sizeof(t));
+        t.kind = AX_TY_ARRAY;
+        t.array.elem = elem;
+        t.array.len = len;
+        return ax_intern_type(&cx->thir->interner, &t);
+    }
     if (ht->kind == AX_HIR_TYPE_TUPLE) {
         size_t count = 0;
         for (const AxHirType *e = ht->tuple.elem_types; e; e = e->next) count++;
@@ -464,6 +480,7 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
                 if (p->symbol.v != 0) {
                     AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, fn_ty->fn.param_types[i]);
                 }
+                AxParamTypeMap_insert(&thir.param_types, p, fn_ty->fn.param_types[i]);
             }
 
             check_block(&cx, it->fn.body, cx.return_type);
@@ -545,6 +562,14 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
     if (path->symbol.v != 0) {
         TypeId *t = AxSymbolTypeMap_get(&cx->thir->symbol_types, path->symbol);
         if (t) return *t;
+        
+        StrView name = ax_source_db_span_text(cx->db, path->span);
+        if (ax_sv_eq_cstr(name, "len")) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_BUILTIN_LEN;
+            return ax_intern_type(&cx->thir->interner, &st);
+        }
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
@@ -734,7 +759,27 @@ static TypeId check_unary(TypeckCtx *cx, const AxHirExpr *expr) {
 
 static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
     TypeId callee_ty = resolve_ty(cx, check_expr(cx, expr->call.callee, TypeId_none()));
+
     const AxType *ct = ax_type_get(&cx->thir->interner, callee_ty);
+    
+    if (ct->kind == AX_TY_BUILTIN_LEN) {
+        // BOOTSTRAP-SHORTCUT T036 built-in len(a)
+        size_t argc = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+        if (argc != 1) {
+            return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
+        }
+        TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
+        if (!is_error(cx, arg_ty)) {
+            const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
+            if (t->kind != AX_TY_ARRAY) {
+                type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH); // Or maybe custom error
+                return cx->thir->interner.t_error;
+            }
+        }
+        return cx->thir->interner.t_usize;
+    }
+    
     if (ct->kind != AX_TY_FN) {
         for (const AxHirExpr *a = expr->call.args; a; a = a->next) check_expr(cx, a, TypeId_none());
         if (ct->kind == AX_TY_ERROR) return cx->thir->interner.t_error;
@@ -1043,7 +1088,74 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
 
 
         // Valid Axiom outside the axiom0 subset (AXD-013): a diagnostic, never a silent type.
-        case AX_HIR_EXPR_ARRAY:
+        case AX_HIR_EXPR_ARRAY: {
+            if (expr->array.count) {
+                // Repeat array [expr; count]
+                uint64_t len = 0;
+                if (expr->array.count->kind == AX_HIR_EXPR_LITERAL && expr->array.count->literal.kind == AX_TOK_INT) {
+                    len = expr->array.count->literal.val.int_val.value;
+                } else {
+                    type_error(cx, expr->array.count->span, AX_TYPE_ARRAY_SIZE);
+                    return in->t_error;
+                }
+                
+                TypeId expected_elem = TypeId_none();
+                if (TypeId_is_some(expected) && kind_of(cx, expected) == AX_TY_ARRAY) {
+                    expected_elem = ax_type_get(in, resolve_ty(cx, expected))->array.elem;
+                }
+                
+                TypeId elem_ty = check_expr(cx, expr->array.elems, expected_elem);
+                if (is_error(cx, elem_ty)) return in->t_error;
+                
+                AxType t;
+                memset(&t, 0, sizeof(t));
+                t.kind = AX_TY_ARRAY;
+                t.array.elem = elem_ty;
+                t.array.len = len;
+                return ax_intern_type(&cx->thir->interner, &t);
+            } else {
+                // List array [e1, e2, ...]
+                TypeId expected_elem = TypeId_none();
+                if (TypeId_is_some(expected) && kind_of(cx, expected) == AX_TY_ARRAY) {
+                    expected_elem = ax_type_get(in, resolve_ty(cx, expected))->array.elem;
+                }
+                
+                uint64_t count = 0;
+                TypeId elem_ty = expected_elem;
+                
+                for (const AxHirExpr *e = expr->array.elems; e; e = e->next) {
+                    count++;
+                    TypeId t = check_expr(cx, e, elem_ty);
+                    if (TypeId_is_none(elem_ty)) {
+                        elem_ty = t;
+                    }
+                }
+                
+                if (TypeId_is_none(elem_ty)) {
+                    elem_ty = in->t_never; // empty array with no expected type
+                }
+                
+                if (is_error(cx, elem_ty)) return in->t_error;
+                
+                AxType t;
+                memset(&t, 0, sizeof(t));
+                t.kind = AX_TY_ARRAY;
+                t.array.elem = elem_ty;
+                t.array.len = count;
+                return ax_intern_type(&cx->thir->interner, &t);
+            }
+        }
+        case AX_HIR_EXPR_INDEX: {
+            TypeId base_ty = resolve_ty(cx, check_expr(cx, expr->index.base, TypeId_none()));
+            TypeId idx_ty = check_expr(cx, expr->index.arg, in->t_usize);
+            if (is_error(cx, base_ty) || is_error(cx, idx_ty)) return in->t_error;
+            
+            const AxType *t = ax_type_get(in, base_ty);
+            if (t->kind == AX_TY_ARRAY) {
+                return t->array.elem;
+            }
+            return type_error(cx, expr->index.base->span, AX_TYPE_CANNOT_INDEX);
+        }
         /* case AX_HIR_EXPR_STRUCT: */
         case AX_HIR_EXPR_MATCH:
         case AX_HIR_EXPR_FOR:
@@ -1055,7 +1167,6 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         /* case AX_HIR_EXPR_FIELD: */
         /* case AX_HIR_EXPR_TUPLE_INDEX: */
         case AX_HIR_EXPR_METHOD_CALL:
-        case AX_HIR_EXPR_INDEX:
         case AX_HIR_EXPR_TRY:
         case AX_HIR_EXPR_AWAIT:
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);

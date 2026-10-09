@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T035]
 priority: 56
-status: doing
+status: done
 attempts: 1
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/array, tests/ui/array]
+paths: [tests/hir, tests/resolve, tests/typeck, tests/mir, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/resolve, tests/run/array, tests/ui/array]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, tasks/0326, 0087]
-started: 2026-10-09 13:37:33
-agent: T036-impl
+started: 2026-10-09 14:32:55
+finished: 2026-10-09 15:00:17
 ---
 # T036 — Fixed arrays, indexing, bounds checks
 
@@ -38,3 +38,6 @@ agent: T036-impl
 
 ## Log
 - 2026-10-09 13:37:33 started (attempt 1) T036-impl
+- 2026-10-09 14:32:32 requeue: unblocked scope change (not charged: attempt refunded)
+- 2026-10-09 14:32:55 started (attempt 1) T036-impl
+- 2026-10-09 15:00:17 accepted by QA -> done

@@ -98,6 +98,8 @@ static TypeId get_expr_type(Builder *b, const AxHirExpr *expr) {
 
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
 
+static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr);
+static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr);
 static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
     if (expr->kind == AX_HIR_EXPR_PATH) {
         AxSymbolId sym = expr->path.path.symbol;
@@ -126,12 +128,39 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         base.projs = projs;
         base.proj_count++;
         return base;
-    } else if (expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+        } else if (expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
         AxMirPlace base = build_place(b, expr->tuple_index.base);
         AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
         for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
         projs[base.proj_count].kind = AX_MIR_PROJ_FIELD;
         projs[base.proj_count].field_idx = expr->tuple_index.tuple_index;
+        
+        base.projs = projs;
+        base.proj_count++;
+        return base;
+    } else if (expr->kind == AX_HIR_EXPR_INDEX) {
+        AxMirPlace base = build_place(b, expr->index.base);
+        AxMirOperand idx_op = build_expr_as_operand(b, expr->index.arg);
+        
+        AxMirLocalId idx_local;
+        if ((idx_op.kind == AX_MIR_OP_COPY || idx_op.kind == AX_MIR_OP_MOVE) && idx_op.place.proj_count == 0) {
+            idx_local = idx_op.place.local;
+        } else {
+            TypeId idx_ty = get_expr_type(b, expr->index.arg);
+            idx_local = add_local(b, AX_MIR_LOCAL_TEMP, idx_ty, false);
+            AxMirPlace temp_place = { idx_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place = temp_place;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+            stmt.assign.rvalue.use = idx_op;
+            push_stmt(b, b->current_bb, stmt);
+        }
+        
+        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
+        for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
+        projs[base.proj_count].kind = AX_MIR_PROJ_INDEX;
+        projs[base.proj_count].index_local = idx_local;
         
         base.projs = projs;
         base.proj_count++;
@@ -180,7 +209,7 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
             op.place = p;
             return op;
         }
-    } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+    } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
         AxMirPlace p = build_place(b, expr);
         op.kind = AX_MIR_OP_COPY;
         op.place = p;
@@ -199,7 +228,7 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
 }
 
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
-    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
+    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
         AxMirOperand op = build_expr_as_operand(b, expr);
         AxMirStmt stmt = {0};
         stmt.kind = AX_MIR_STMT_ASSIGN;
@@ -207,6 +236,40 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
         stmt.assign.rvalue.use = op;
         push_stmt(b, b->current_bb, stmt);
+    } else if (expr->kind == AX_HIR_EXPR_ARRAY) {
+        if (expr->array.count) {
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place = dest;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_REPEAT;
+            stmt.assign.rvalue.repeat.op = build_expr_as_operand(b, expr->array.elems);
+            stmt.assign.rvalue.repeat.count = build_expr_as_operand(b, expr->array.count);
+            push_stmt(b, b->current_bb, stmt);
+        } else {
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place = dest;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+            
+            TypeId ty = get_expr_type(b, expr);
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            uint32_t len = 0;
+            if (t && t->kind == AX_TY_ARRAY) len = t->array.len;
+            
+            stmt.assign.rvalue.aggregate.operand_count = len;
+            stmt.assign.rvalue.aggregate.variant_idx = 0;
+            
+            if (len > 0) {
+                stmt.assign.rvalue.aggregate.operands = ax_arena_alloc_array(b->arena, len, sizeof(AxMirOperand), _Alignof(AxMirOperand));
+                size_t i = 0;
+                for (const AxHirExpr *e = expr->array.elems; e; e = e->next) {
+                    stmt.assign.rvalue.aggregate.operands[i++] = build_expr_as_operand(b, e);
+                }
+            } else {
+                stmt.assign.rvalue.aggregate.operands = NULL;
+            }
+            push_stmt(b, b->current_bb, stmt);
+        }
     } else if (expr->kind == AX_HIR_EXPR_TUPLE) {
         AxMirStmt stmt = {0};
         stmt.kind = AX_MIR_STMT_ASSIGN;
@@ -676,6 +739,32 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         b->current_bb = exit_bb;
         b->loop_count--;
     } else if (expr->kind == AX_HIR_EXPR_CALL) {
+        if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
+            TypeId callee_ty = get_expr_type(b, expr->call.callee);
+            if (!TypeId_is_none(callee_ty) && ax_type_get(&b->thir->interner, callee_ty)->kind == AX_TY_BUILTIN_LEN) {
+                AxMirOperand arg = build_expr_as_operand(b, expr->call.args);
+                AxMirPlace arg_place;
+                if (arg.kind == AX_MIR_OP_COPY || arg.kind == AX_MIR_OP_MOVE) {
+                    arg_place = arg.place;
+                } else {
+                    AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, get_expr_type(b, expr->call.args), false);
+                    arg_place = (AxMirPlace){ temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt s = {0};
+                    s.kind = AX_MIR_STMT_ASSIGN;
+                    s.assign.place = arg_place;
+                    s.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    s.assign.rvalue.use = arg;
+                    push_stmt(b, b->current_bb, s);
+                }
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_LEN;
+                stmt.assign.rvalue.len = arg_place;
+                push_stmt(b, b->current_bb, stmt);
+                return;
+            }
+        }
         AxMirOperand callee = build_expr_as_operand(b, expr->call.callee);
         
         size_t arg_count = 0;
