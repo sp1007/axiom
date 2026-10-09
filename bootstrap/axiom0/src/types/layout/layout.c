@@ -30,6 +30,23 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
     const AxType *ty = ax_type_get(in, id);
     if (!ty) return 1;
     switch ((int)ty->kind) {
+        case AX_TY_BOOL:
+        case AX_TY_I8:
+        case AX_TY_U8:
+            return 1;
+        case AX_TY_I16:
+        case AX_TY_U16:
+            return 2;
+        case AX_TY_I32:
+        case AX_TY_U32:
+        case AX_TY_CHAR:
+        case AX_TY_INT_VAR:
+            return 4;
+        case AX_TY_I64:
+        case AX_TY_U64:
+        case AX_TY_ISIZE:
+        case AX_TY_USIZE:
+            return 8;
         case AX_TY_PTR:
         case AX_TY_FN:
             return 8;
@@ -66,6 +83,23 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
     const AxType *ty = ax_type_get(in, id);
     if (!ty) return 0;
     switch ((int)ty->kind) {
+        case AX_TY_BOOL:
+        case AX_TY_I8:
+        case AX_TY_U8:
+            return 1;
+        case AX_TY_I16:
+        case AX_TY_U16:
+            return 2;
+        case AX_TY_I32:
+        case AX_TY_U32:
+        case AX_TY_CHAR:
+        case AX_TY_INT_VAR:
+            return 4;
+        case AX_TY_I64:
+        case AX_TY_U64:
+        case AX_TY_ISIZE:
+        case AX_TY_USIZE:
+            return 8;
         case AX_TY_PTR:
         case AX_TY_FN:
             return 8;

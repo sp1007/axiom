@@ -1,5 +1,6 @@
 #include "interp/interp.h"
 #include "mir/build/build.h"
+#include "types/layout/layout.h"
 #include <stdlib.h>
 #include <string.h>
 #include "kernel/hashmap.h"
@@ -66,22 +67,48 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
 }
 
 
-static uint64_t* get_place_ptr(CallFrame *frame, const AxMirPlace *place) {
-    AxMirLocalId loc = place->local;
-    uint64_t *ptr = frame->locals[loc.v].vals;
+static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace *place, TypeId *out_ty) {
+    if (place->local.v >= frame->body->local_count) {
+        return NULL; // should ICE
+    }
+    
+    uint8_t *ptr = (uint8_t*)&frame->locals[place->local.v];
+    *out_ty = frame->body->locals[place->local.v].ty;
+    TypeId current_ty = *out_ty;
     for (size_t i = 0; i < place->proj_count; i++) {
-        AxMirProjection *proj = &place->projs[i];
-        if (proj->kind == AX_MIR_PROJ_FIELD) {
-            ptr += proj->field_idx;
+        const AxMirProjection *proj = &place->projs[i];
+        if (proj->kind == AX_MIR_PROJ_DEREF) {
+            ptr = (uint8_t*)(*(uintptr_t*)ptr);
+            const AxType *ty = ax_type_get(&ctx->thir->interner, current_ty);
+            current_ty = ty->ptr.pointee;
+        } else if (proj->kind == AX_MIR_PROJ_FIELD) {
+            uint32_t offset = ax_type_field_offset(current_ty, proj->field_idx, &ctx->thir->interner);
+            ptr += offset;
+            const AxType *ty = ax_type_get(&ctx->thir->interner, current_ty);
+            if (ty->kind == AX_TY_STRUCT) {
+                current_ty = ty->strct.fields[proj->field_idx];
+            } else if (ty->kind == AX_TY_TUPLE) {
+                current_ty = ty->tuple.fields[proj->field_idx];
+            }
         }
     }
+    *out_ty = current_ty;
     return ptr;
 }
-static uint64_t eval_operand(CallFrame *frame, const AxMirOperand *op) {
+
+static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperand *op) {
     if (op->kind == AX_MIR_OP_CONST) {
         return op->constant.val;
     } else {
-        return *get_place_ptr(frame, &op->place);
+        TypeId ty;
+        uint8_t *ptr = get_place_ptr(ctx, frame, &op->place, &ty);
+        uint32_t size = ax_type_size(ty, &ctx->thir->interner);
+        uint64_t val = 0;
+        if (size == 1) val = *(uint8_t*)ptr;
+        else if (size == 2) val = *(uint16_t*)ptr;
+        else if (size == 4) val = *(uint32_t*)ptr;
+        else if (size == 8) val = *(uint64_t*)ptr;
+        return val;
     }
 }
 
@@ -278,25 +305,51 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                 uint64_t val = 0;
                 switch (stmt->assign.rvalue.kind) {
                     case AX_MIR_RVALUE_USE: {
-                        uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place);
+                        TypeId dest_ty;
+                        uint8_t *dest = get_place_ptr(ctx, &frame, &stmt->assign.place, &dest_ty);
                         if (stmt->assign.rvalue.use.kind == AX_MIR_OP_CONST) {
-                            dest[0] = stmt->assign.rvalue.use.constant.val;
+                            uint32_t size = ax_type_size(dest_ty, &ctx->thir->interner);
+                            uint64_t val = stmt->assign.rvalue.use.constant.val;
+                            if (size == 1) *(uint8_t*)dest = (uint8_t)val;
+                            else if (size == 2) *(uint16_t*)dest = (uint16_t)val;
+                            else if (size == 4) *(uint32_t*)dest = (uint32_t)val;
+                            else if (size == 8) *(uint64_t*)dest = val;
                         } else {
-                            memcpy(dest, get_place_ptr(&frame, &stmt->assign.rvalue.use.place), sizeof(AxInterpValue));
+                            TypeId src_ty;
+                            uint8_t *src = get_place_ptr(ctx, &frame, &stmt->assign.rvalue.use.place, &src_ty);
+                            uint32_t size = ax_type_size(dest_ty, &ctx->thir->interner);
+                            memcpy(dest, src, size);
                         }
                         goto skip_write;
                     }
                     case AX_MIR_RVALUE_AGGREGATE: {
-                        uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place);
+                        TypeId dest_ty;
+                        uint8_t *dest = get_place_ptr(ctx, &frame, &stmt->assign.place, &dest_ty);
+                        const AxType *ty = ax_type_get(&ctx->thir->interner, dest_ty);
                         for (size_t i = 0; i < stmt->assign.rvalue.aggregate.operand_count; i++) {
-                            dest[i] = eval_operand(&frame, &stmt->assign.rvalue.aggregate.operands[i]);
+                            uint32_t offset = ax_type_field_offset(dest_ty, i, &ctx->thir->interner);
+                            TypeId field_ty = (ty->kind == AX_TY_STRUCT) ? ty->strct.fields[i] : ty->tuple.fields[i];
+                            uint32_t f_size = ax_type_size(field_ty, &ctx->thir->interner);
+                            
+                            AxMirOperand *f_op = &stmt->assign.rvalue.aggregate.operands[i];
+                            if (f_op->kind == AX_MIR_OP_CONST) {
+                                uint64_t val = f_op->constant.val;
+                                if (f_size == 1) *(uint8_t*)(dest + offset) = (uint8_t)val;
+                                else if (f_size == 2) *(uint16_t*)(dest + offset) = (uint16_t)val;
+                                else if (f_size == 4) *(uint32_t*)(dest + offset) = (uint32_t)val;
+                                else if (f_size == 8) *(uint64_t*)(dest + offset) = val;
+                            } else {
+                                TypeId src_ty;
+                                uint8_t *src = get_place_ptr(ctx, &frame, &f_op->place, &src_ty);
+                                memcpy(dest + offset, src, f_size);
+                            }
                         }
                         goto skip_write;
                     }
                     case AX_MIR_RVALUE_BINARY_OP:
                     case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
-                        uint64_t lhs = eval_operand(&frame, &stmt->assign.rvalue.binary_op.lhs);
-                        uint64_t rhs = eval_operand(&frame, &stmt->assign.rvalue.binary_op.rhs);
+                        uint64_t lhs = eval_operand(ctx, &frame, &stmt->assign.rvalue.binary_op.lhs);
+                        uint64_t rhs = eval_operand(ctx, &frame, &stmt->assign.rvalue.binary_op.rhs);
                         AxMirBinOp op = stmt->assign.rvalue.binary_op.op;
                         
                         TypeId ty = {0};
@@ -503,7 +556,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         break;
                     }
                     case AX_MIR_RVALUE_UNARY_OP: {
-                        uint64_t op_val = eval_operand(&frame, &stmt->assign.rvalue.unary_op.operand);
+                        uint64_t op_val = eval_operand(ctx, &frame, &stmt->assign.rvalue.unary_op.operand);
                         
                         TypeId ty = {0};
                         if (stmt->assign.rvalue.unary_op.operand.kind == AX_MIR_OP_CONST) {
@@ -574,7 +627,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         break;
                     }
                     case AX_MIR_RVALUE_CAST: {
-                        uint64_t op_val = eval_operand(&frame, &stmt->assign.rvalue.cast.op);
+                        uint64_t op_val = eval_operand(ctx, &frame, &stmt->assign.rvalue.cast.op);
                         
                         TypeId src_ty = {0};
                         if (stmt->assign.rvalue.cast.op.kind == AX_MIR_OP_CONST) {
@@ -639,7 +692,13 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         break;
                 }
                 if (ctx->failed) break;
-                uint64_t *dest = get_place_ptr(&frame, &stmt->assign.place); dest[0] = val;
+                TypeId dest_ty;
+                uint8_t *dest = get_place_ptr(ctx, &frame, &stmt->assign.place, &dest_ty);
+                uint32_t dest_size = ax_type_size(dest_ty, &ctx->thir->interner);
+                if (dest_size == 1) *(uint8_t*)dest = (uint8_t)val;
+                else if (dest_size == 2) *(uint16_t*)dest = (uint16_t)val;
+                else if (dest_size == 4) *(uint32_t*)dest = (uint32_t)val;
+                else if (dest_size == 8) *(uint64_t*)dest = val;
 skip_write:;
             }
         }
@@ -650,7 +709,7 @@ skip_write:;
         if (term->kind == AX_MIR_TERM_GOTO) {
             current_bb = term->goto_target;
         } else if (term->kind == AX_MIR_TERM_ASSERT) {
-            uint64_t cond = eval_operand(&frame, &term->assert.cond);
+            uint64_t cond = eval_operand(ctx, &frame, &term->assert.cond);
             bool expected = term->assert.expected;
             if ((cond != 0) != expected) {
                 if (term->assert.msg) {
@@ -664,7 +723,7 @@ skip_write:;
         } else if (term->kind == AX_MIR_TERM_RETURN) {
             break;
         } else if (term->kind == AX_MIR_TERM_SWITCH_INT) {
-            uint64_t discr = eval_operand(&frame, &term->switch_int.discr);
+            uint64_t discr = eval_operand(ctx, &frame, &term->switch_int.discr);
             AxMirBbId next = term->switch_int.targets.otherwise;
             for (size_t i = 0; i < term->switch_int.targets.count; i++) {
                 if (discr == term->switch_int.targets.values[i].value) {
@@ -674,7 +733,7 @@ skip_write:;
             }
             current_bb = next;
         } else if (term->kind == AX_MIR_TERM_CALL) {
-            uint64_t func_val = eval_operand(&frame, &term->call.func);
+            uint64_t func_val = eval_operand(ctx, &frame, &term->call.func);
             AxHirItem *callee = find_func_by_symbol(ctx, func_val);
             if (!callee) {
                 panic_interp(ctx, "unresolved function call");
@@ -683,7 +742,7 @@ skip_write:;
             
             AxInterpValue *call_args = calloc(term->call.arg_count, sizeof(AxInterpValue));
             for (size_t i = 0; i < term->call.arg_count; i++) {
-                if (term->call.args[i].kind == AX_MIR_OP_CONST) { call_args[i].vals[0] = term->call.args[i].constant.val; } else { memcpy(&call_args[i], get_place_ptr(&frame, &term->call.args[i].place), sizeof(AxInterpValue)); }
+                if (term->call.args[i].kind == AX_MIR_OP_CONST) { call_args[i].vals[0] = term->call.args[i].constant.val; } else { TypeId src_ty; uint8_t* src = get_place_ptr(ctx, &frame, &term->call.args[i].place, &src_ty); memcpy(&call_args[i], src, ax_type_size(src_ty, &ctx->thir->interner)); }
             }
             
             AxInterpValue ret_val = {0};
@@ -692,7 +751,7 @@ skip_write:;
             
             if (ctx->failed) break;
             
-            memcpy(get_place_ptr(&frame, &term->call.destination), &ret_val, sizeof(AxInterpValue));
+            TypeId dest_ty; uint8_t* dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty); memcpy(dest, &ret_val, ax_type_size(dest_ty, &ctx->thir->interner));
             current_bb = term->call.target;
         } else {
             panic_interp(ctx, "unsupported terminator");
