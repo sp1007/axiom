@@ -6,11 +6,9 @@ void ax_lir_lower_abi(AxLirBody *body, TypeInterner *interner, const AxAbi *abi,
     
     AxAbiSig sig = abi->classify(fn_ty, interner, &arena);
     
-    // Set frame requirements
-    body->frame_req.max_outgoing_args_bytes = sig.shadow_space; // for now, assuming calls take this
+    body->frame_req.max_outgoing_args_bytes = sig.shadow_space; 
     body->frame_req.requires_16_byte_alignment = true;
     
-    // Update instructions
     for (size_t b = 0; b < body->bb_count; b++) {
         AxLirBb *bb = &body->bbs[b];
         for (size_t i = 0; i < bb->inst_count; i++) {
@@ -27,21 +25,55 @@ void ax_lir_lower_abi(AxLirBody *body, TypeInterner *interner, const AxAbi *abi,
                         }
                     }
                 } else { 
-                    const uint32_t ARG_REGS[] = { 1, 2, 8, 9 }; 
-                    if (idx < 4) { 
-                        inst->abi_arg.loc_kind = 0; 
-                        inst->abi_arg.loc_reg_or_offset = ARG_REGS[idx]; 
-                    } else { 
-                        inst->abi_arg.loc_kind = 1; 
-                        inst->abi_arg.loc_reg_or_offset = 32 + (idx - 4) * 8; 
-                    } 
+                    AxLirInst *call_inst = NULL;
+                    for (size_t j = i + 1; j < bb->inst_count; j++) {
+                        if (bb->insts[j].kind == AX_LIR_INST_CALL) { call_inst = &bb->insts[j]; break; }
+                    }
+                    if (call_inst) {
+                        AxArena temp_arena; ax_arena_init(&temp_arena, 0);
+                        const AxType *callee = ax_type_get(interner, call_inst->call.callee_ty);
+                        if (callee) {
+                            AxAbiSig call_sig = abi->classify(callee, interner, &temp_arena);
+                            if (idx < call_sig.arg_count) {
+                                inst->abi_arg.loc_kind = call_sig.args[idx].loc.kind;
+                                if (call_sig.args[idx].loc.kind == AX_ABI_LOC_STACK) {
+                                    inst->abi_arg.loc_reg_or_offset = call_sig.args[idx].loc.offset;
+                                } else {
+                                    inst->abi_arg.loc_reg_or_offset = call_sig.args[idx].loc.reg;
+                                }
+                            }
+                            if (call_sig.shadow_space > body->frame_req.max_outgoing_args_bytes) {
+                                body->frame_req.max_outgoing_args_bytes = call_sig.shadow_space;
+                            }
+                        }
+                        ax_arena_destroy(&temp_arena);
+                    }
                 } 
             } else if (inst->kind == AX_LIR_INST_ABI_RESULT) {
-                inst->abi_result.loc_kind = sig.ret.loc.kind;
-                if (sig.ret.loc.kind == AX_ABI_LOC_STACK) {
-                    inst->abi_result.loc_reg_or_offset = sig.ret.loc.offset;
+                AxLirInst *call_inst = NULL;
+                for (size_t j = i; j > 0; j--) {
+                    if (bb->insts[j - 1].kind == AX_LIR_INST_CALL) { call_inst = &bb->insts[j - 1]; break; }
+                }
+                if (call_inst) {
+                    AxArena temp_arena; ax_arena_init(&temp_arena, 0);
+                    const AxType *callee = ax_type_get(interner, call_inst->call.callee_ty);
+                    if (callee) {
+                        AxAbiSig call_sig = abi->classify(callee, interner, &temp_arena);
+                        inst->abi_result.loc_kind = call_sig.ret.loc.kind;
+                        if (call_sig.ret.loc.kind == AX_ABI_LOC_STACK) {
+                            inst->abi_result.loc_reg_or_offset = call_sig.ret.loc.offset;
+                        } else {
+                            inst->abi_result.loc_reg_or_offset = call_sig.ret.loc.reg;
+                        }
+                    }
+                    ax_arena_destroy(&temp_arena);
                 } else {
-                    inst->abi_result.loc_reg_or_offset = sig.ret.loc.reg;
+                    inst->abi_result.loc_kind = sig.ret.loc.kind;
+                    if (sig.ret.loc.kind == AX_ABI_LOC_STACK) {
+                        inst->abi_result.loc_reg_or_offset = sig.ret.loc.offset;
+                    } else {
+                        inst->abi_result.loc_reg_or_offset = sig.ret.loc.reg;
+                    }
                 }
             }
         }

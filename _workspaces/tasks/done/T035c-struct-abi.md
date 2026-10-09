@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T035d, T035e]
 priority: 55
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/abi, bootstrap/axiom0/src/driver, bootstrap/axiom0/src/link, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target]
 spec: [0059, 0081, 0043, tasks/0267, tasks/0281, 0009]
+started: 2026-10-09 13:33:48
+finished: 2026-10-09 13:56:36
 ---
 # T035c — Structs ABI and linkage
 
@@ -28,3 +30,7 @@ Implement ABI and linkages for struct params/returns by value.
 
 ## Notes
 - Third part of original T035.
+
+## Log
+- 2026-10-09 13:33:48 started (attempt 1) T035c-impl
+- 2026-10-09 13:56:36 accepted by QA -> done

@@ -63,6 +63,7 @@ typedef struct AxLirInst {
         } constant;
         struct {
             const char *sym_name;
+            TypeId callee_ty;
         } call;
         struct {
             uint32_t index;

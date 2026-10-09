@@ -337,7 +337,14 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                         }
                     }
                 }
-                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name } });
+                TypeId callee_ty = {0};
+                if (mbb->terminator.call.func.kind == AX_MIR_OP_CONST) {
+                    callee_ty = mbb->terminator.call.func.constant.ty;
+                } else {
+                    AxMirLocalId loc = mbb->terminator.call.func.place.local;
+                    callee_ty = mir->locals[loc.v].ty;
+                }
+                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name, .callee_ty = callee_ty } });
                 
                 AxLirVRegId res = make_vreg(&b, interner->t_isize);
 

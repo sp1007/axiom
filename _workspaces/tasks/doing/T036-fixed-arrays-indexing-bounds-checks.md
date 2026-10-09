@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T035]
 priority: 56
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/array, tests/ui/array]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0476, tasks/0326, 0087]
+started: 2026-10-09 13:37:33
+agent: T036-impl
 ---
 # T036 — Fixed arrays, indexing, bounds checks
 
@@ -33,3 +35,6 @@ spec: [tasks/0476, tasks/0326, 0087]
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-09 13:37:33 started (attempt 1) T036-impl
