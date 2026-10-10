@@ -77,6 +77,7 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
     
     uint8_t *ptr = (uint8_t*)&frame->locals[place->local.v];
     *out_ty = frame->body->locals[place->local.v].ty;
+    uint32_t current_variant = (uint32_t)-1;
     TypeId current_ty = *out_ty;
     for (size_t i = 0; i < place->proj_count; i++) {
         const AxMirProjection *proj = &place->projs[i];
@@ -84,15 +85,24 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
             ptr = (uint8_t*)(*(uintptr_t*)ptr);
             const AxType *ty = ax_type_get(&ctx->thir->interner, current_ty);
             current_ty = ty->ptr.pointee;
-                } else if (proj->kind == AX_MIR_PROJ_FIELD) {
-            uint32_t offset = ax_type_field_offset(current_ty, proj->field_idx, &ctx->thir->interner);
-            ptr += offset;
+        } else if (proj->kind == AX_MIR_PROJ_DOWNCAST) {
+            current_variant = proj->variant_idx;
+        } else if (proj->kind == AX_MIR_PROJ_FIELD) {
+            uint32_t offset;
             const AxType *ty = ax_type_get(&ctx->thir->interner, current_ty);
-            if (ty->kind == AX_TY_STRUCT) {
-                current_ty = ty->strct.fields[proj->field_idx];
-            } else if (ty->kind == AX_TY_TUPLE) {
-                current_ty = ty->tuple.fields[proj->field_idx];
+            if (ty->kind == AX_TY_ENUM && current_variant != (uint32_t)-1) {
+                offset = ax_type_enum_field_offset(current_ty, current_variant, proj->field_idx, &ctx->thir->interner);
+                current_ty = ty->enm.variant_fields[current_variant][proj->field_idx];
+                current_variant = (uint32_t)-1;
+            } else {
+                offset = ax_type_field_offset(current_ty, proj->field_idx, &ctx->thir->interner);
+                if (ty->kind == AX_TY_STRUCT) {
+                    current_ty = ty->strct.fields[proj->field_idx];
+                } else if (ty->kind == AX_TY_TUPLE) {
+                    current_ty = ty->tuple.fields[proj->field_idx];
+                }
             }
+            ptr += offset;
         } else if (proj->kind == AX_MIR_PROJ_INDEX) {
             const AxType *ty = ax_type_get(&ctx->thir->interner, current_ty);
             if (ty->kind == AX_TY_ARRAY) {

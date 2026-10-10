@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T038]
 priority: 58
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/types/match, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/pattern, tests/ui/pattern]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/types/match, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/hir, tests/run/pattern, tests/ui/pattern, tests/mir, tests/mc]
 locks: [bootstrap/axiom0/src/diag/codes/PAT.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0065, tasks/0268, tasks/0392, tasks/0504]
 covers: []
+started: 2026-10-10 07:57:55
+finished: 2026-10-10 09:12:21
 ---
 # T038b — Pattern forms: literal/range/or-patterns, guards, if-let, while-let, destructuring
 
@@ -39,3 +41,7 @@ Complete pattern matching for the self-host subset (split from T038, ADR-0005 §
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 07:57:55 started (attempt 1) 
+- 2026-10-10 09:12:21 accepted by QA -> done

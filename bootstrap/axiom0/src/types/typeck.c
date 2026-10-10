@@ -410,7 +410,118 @@ static void finalize_types(TypeckCtx *cx) {
 }
 
 static TypeId check_expr(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
+
+static void desugar_let_else(TypeckCtx *cx, AxHirStmt *stmt) {
+    if (!stmt->let.else_block) return;
+    
+    AxHirMatchArm *arm_else = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_else->span = stmt->span;
+    AxHirPat *wild = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    wild->kind = AX_HIR_PAT_WILDCARD;
+    wild->span = stmt->span;
+    wild->next = NULL;
+    arm_else->pat = wild;
+    
+    AxHirExpr *else_blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    else_blk->kind = AX_HIR_EXPR_BLOCK;
+    else_blk->span = stmt->let.else_block->span;
+    else_blk->next = NULL;
+    else_blk->block.block = *stmt->let.else_block;
+    arm_else->body = else_blk;
+    arm_else->guard = NULL;
+    arm_else->next = NULL;
+    
+    AxHirMatchArm *arm_then = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_then->span = stmt->span;
+    arm_then->pat = stmt->let.pat;
+    AxHirExpr *then_blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    then_blk->kind = AX_HIR_EXPR_BLOCK;
+    then_blk->span = stmt->span;
+    then_blk->next = NULL;
+    then_blk->block.block.span = stmt->span;
+    then_blk->block.block.stmts = NULL; // unit block
+    arm_then->body = then_blk;
+    arm_then->guard = NULL;
+    arm_then->next = arm_else;
+    
+    AxHirExpr *match_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    match_expr->kind = AX_HIR_EXPR_MATCH;
+    match_expr->span = stmt->span;
+    match_expr->next = NULL;
+    match_expr->match.expr = stmt->let.expr;
+    match_expr->match.arms = arm_then;
+    
+    stmt->kind = AX_HIR_STMT_EXPR;
+    stmt->expr_stmt.expr = match_expr;
+    stmt->expr_stmt.has_semi = true;
+}
+
+
+static bool is_pat_irrefutable(TypeckCtx *cx, const AxHirPat *pat, TypeId ty) {
+    if (!pat) return true;
+    switch (pat->kind) {
+        case AX_HIR_PAT_WILDCARD:
+        case AX_HIR_PAT_BINDING:
+            return true;
+        case AX_HIR_PAT_TUPLE:
+            if (pat->tuple.elems) {
+                const AxType *t = TypeId_is_none(ty) ? NULL : ax_type_get(&cx->thir->interner, ty);
+                size_t i = 0;
+                for (const AxHirPat *p = pat->tuple.elems; p; p = p->next) {
+                    TypeId inner_ty = (t && t->kind == AX_TY_TUPLE && i < t->tuple.field_count) ? t->tuple.fields[i] : TypeId_none();
+                    if (!is_pat_irrefutable(cx, p, inner_ty)) return false;
+                    i++;
+                }
+            }
+            return true;
+        case AX_HIR_PAT_STRUCT:
+        case AX_HIR_PAT_PATH: {
+            if (TypeId_is_none(ty)) return true; // prevent crash if type is unknown
+            const AxType *t = ax_type_get(&cx->thir->interner, ty);
+            if (t->kind == AX_TY_STRUCT) {
+                if (pat->kind == AX_HIR_PAT_STRUCT) {
+                    for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                        // find field index
+                        size_t idx = 0;
+                        for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
+                            if (fd->name.v == pf->name.v) break;
+                        }
+                        if (idx < t->strct.field_count) {
+                            if (!is_pat_irrefutable(cx, pf->pat, t->strct.fields[idx])) return false;
+                        }
+                    }
+                }
+                return true;
+            } else if (t->kind == AX_TY_ENUM && t->enm.variant_count == 1) {
+                // Single variant enums are irrefutable!
+                if (pat->kind == AX_HIR_PAT_STRUCT) {
+                    for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                        size_t idx = 0;
+                        const AxHirVariantDecl *vd = t->enm.def->enum_decl.variants;
+                        if (vd) {
+                            for (const AxHirFieldDecl *fd = vd->struct_fields; fd; fd = fd->next, idx++) {
+                                if (fd->name.v == pf->name.v) break;
+                            }
+                            if (idx < t->enm.variant_field_counts[0]) {
+                                if (!is_pat_irrefutable(cx, pf->pat, t->enm.variant_fields[0][idx])) return false;
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+        case AX_HIR_PAT_LITERAL:
+        case AX_HIR_PAT_RANGE:
+        case AX_HIR_PAT_OR:
+        default:
+            return false; // Actually OR pattern is irrefutable if one of its branches is irrefutable? No, `A | B` is refutable unless they together cover everything, but `let` requires structurally irrefutable.
+    }
+}
+
 static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expected);
+static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
 
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db) {
     AxThir thir;
@@ -666,11 +777,42 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
                         vidx++;
                     }
                     if (!found_variant) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
-                    return path_ty;
-                } else if (t->kind != AX_TY_STRUCT && t->kind != AX_TY_ERROR) {
+                    ty = path_ty;
+                    break;
+                } else if (t->kind == AX_TY_STRUCT) {
+                    for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                        StrView iname = ax_interner_get(cx->str_in, pf->name);
+                        bool found = false;
+                        size_t idx = 0;
+                        for (const AxHirFieldDecl *f = t->strct.def->struct_decl.struct_fields; f; f = f->next) {
+                            StrView fname = ax_interner_get(cx->str_in, f->name);
+                            if (ax_sv_eq(fname, iname)) {
+                                found = true;
+                                check_pat(cx, pf->pat, t->strct.fields[idx], is_init);
+                                break;
+                            }
+                            idx++;
+                        }
+                        if (!found) type_error(cx, pf->span, AX_TYPE_UNKNOWN_FIELD);
+                    }
+                    if (!pat->struct_pat.has_rest) {
+                        for (const AxHirFieldDecl *f = t->strct.def->struct_decl.struct_fields; f; f = f->next) {
+                            StrView fname = ax_interner_get(cx->str_in, f->name);
+                            bool found = false;
+                            for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                                StrView iname = ax_interner_get(cx->str_in, pf->name);
+                                if (ax_sv_eq(fname, iname)) { found = true; break; }
+                            }
+                            if (!found) type_error(cx, pat->span, AX_TYPE_MISSING_FIELD);
+                        }
+                    }
+                    ty = path_ty;
+                    break;
+                } else if (t->kind != AX_TY_ERROR) {
                     return type_error(cx, pat->span, AX_TYPE_MISMATCH);
                 } else {
-                    return path_ty;
+                    ty = path_ty;
+                    break;
                 }
             } else {
                 return cx->thir->interner.t_error;
@@ -731,7 +873,38 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             break;
         }
         case AX_HIR_PAT_TUPLE: {
-            return cx->thir->interner.t_error; // Stub for tuple patterns
+            if (is_error(cx, ty)) return cx->thir->interner.t_error;
+            if (TypeId_is_none(ty)) return type_error(cx, pat->span, AX_TYPE_UNKNOWN);
+            const AxType *t = ax_type_get(&cx->thir->interner, ty);
+            if (!t || t->kind != AX_TY_TUPLE) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            size_t count = 0;
+            for (const AxHirPat *p = pat->tuple.elems; p; p = p->next) count++;
+            if (count != t->tuple.field_count) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            size_t i = 0;
+            for (const AxHirPat *p = pat->tuple.elems; p; p = p->next) {
+                check_pat(cx, p, t->tuple.fields[i++], is_init);
+            }
+            break;
+        }
+        case AX_HIR_PAT_RANGE: {
+            if (is_error(cx, ty)) return cx->thir->interner.t_error;
+            if (TypeId_is_none(ty)) return type_error(cx, pat->span, AX_TYPE_UNKNOWN);
+            const AxType *t = ax_type_get(&cx->thir->interner, ty);
+            if (!t || (t->kind != AX_TY_I8 && t->kind != AX_TY_I16 && t->kind != AX_TY_I32 && t->kind != AX_TY_I64 &&
+                       t->kind != AX_TY_U8 && t->kind != AX_TY_U16 && t->kind != AX_TY_U32 && t->kind != AX_TY_U64 &&
+                       t->kind != AX_TY_CHAR && t->kind != AX_TY_INT_VAR)) {
+                return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            }
+            check_pat(cx, pat->range.start, ty, is_init);
+            check_pat(cx, pat->range.end, ty, is_init);
+            break;
+        }
+        case AX_HIR_PAT_OR: {
+            if (is_error(cx, ty)) return cx->thir->interner.t_error;
+            for (const AxHirPat *p = pat->or_pat.pats; p; p = p->next) {
+                check_pat(cx, p, ty, is_init);
+            }
+            break;
         }
 
         default:
@@ -972,7 +1145,111 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
     return TypeId_is_none(ret) ? cx->thir->interner.t_unit : ret;
 }
 
+
+static void desugar_if_let(TypeckCtx *cx, AxHirExpr *expr) {
+    if (!expr->if_expr.let_pat) return;
+    
+    AxHirMatchArm *arm_else = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_else->span = expr->span;
+    AxHirPat *wild = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    wild->kind = AX_HIR_PAT_WILDCARD;
+    wild->span = expr->span;
+    wild->next = NULL;
+    arm_else->pat = wild;
+    
+    AxHirExpr *else_blk;
+    if (expr->if_expr.else_branch) {
+        else_blk = expr->if_expr.else_branch;
+    } else {
+        else_blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+        else_blk->kind = AX_HIR_EXPR_BLOCK;
+        else_blk->span = expr->span;
+        else_blk->next = NULL;
+        else_blk->block.block.span = expr->span;
+        else_blk->block.block.stmts = NULL;
+    }
+    arm_else->body = else_blk;
+    arm_else->guard = NULL;
+    arm_else->next = NULL;
+    
+    AxHirMatchArm *arm_then = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_then->span = expr->if_expr.block.span;
+    arm_then->pat = expr->if_expr.let_pat;
+    AxHirExpr *then_blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    then_blk->kind = AX_HIR_EXPR_BLOCK;
+    then_blk->span = expr->if_expr.block.span;
+    then_blk->next = NULL;
+    then_blk->block.block = expr->if_expr.block;
+    arm_then->body = then_blk;
+    arm_then->guard = NULL;
+    arm_then->next = arm_else;
+    
+    AxHirExpr *cond = expr->if_expr.cond;
+    expr->kind = AX_HIR_EXPR_MATCH;
+    expr->match.expr = cond;
+    expr->match.arms = arm_then;
+}
+
+static void desugar_while_let(TypeckCtx *cx, AxHirExpr *expr) {
+    if (!expr->while_expr.let_pat) return;
+    
+    AxHirExpr *brk_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    brk_expr->kind = AX_HIR_EXPR_JUMP;
+    brk_expr->span = expr->span;
+    brk_expr->next = NULL;
+    brk_expr->jump.jump_kind = AX_JUMP_BREAK;
+    brk_expr->jump.label = (StrId){0}; 
+    brk_expr->jump.expr = NULL;
+
+    AxHirMatchArm *arm_else = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_else->span = expr->span;
+    AxHirPat *wild = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    wild->kind = AX_HIR_PAT_WILDCARD;
+    wild->span = expr->span;
+    wild->next = NULL;
+    arm_else->pat = wild;
+    arm_else->body = brk_expr;
+    arm_else->guard = NULL;
+    arm_else->next = NULL;
+    
+    AxHirMatchArm *arm_then = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirMatchArm), _Alignof(AxHirMatchArm));
+    arm_then->span = expr->while_expr.block.span;
+    arm_then->pat = expr->while_expr.let_pat;
+    AxHirExpr *then_blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    then_blk->kind = AX_HIR_EXPR_BLOCK;
+    then_blk->span = expr->while_expr.block.span;
+    then_blk->next = NULL;
+    then_blk->block.block = expr->while_expr.block;
+    arm_then->body = then_blk;
+    arm_then->guard = NULL;
+    arm_then->next = arm_else;
+    
+    AxHirExpr *match_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    match_expr->kind = AX_HIR_EXPR_MATCH;
+    match_expr->span = expr->span;
+    match_expr->next = NULL;
+    match_expr->match.expr = expr->while_expr.cond;
+    match_expr->match.arms = arm_then;
+    
+    AxHirStmt *match_stmt = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+    match_stmt->kind = AX_HIR_STMT_EXPR;
+    match_stmt->span = expr->span;
+    match_stmt->next = NULL;
+    match_stmt->expr_stmt.expr = match_expr;
+    match_stmt->expr_stmt.has_semi = false;
+    
+    StrId lbl = expr->while_expr.label;
+    expr->kind = AX_HIR_EXPR_LOOP;
+    expr->loop.label = lbl;
+    expr->loop.block.span = expr->span;
+    expr->loop.block.stmts = match_stmt;
+}
+
 static TypeId check_if(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected) {
+    if (expr->if_expr.let_pat) {
+        desugar_if_let(cx, (AxHirExpr*)expr);
+        return check_expr_kind(cx, expr, expected);
+    }
     const TypeInterner *in = &cx->thir->interner;
     if (expr->if_expr.let_pat) {
         TypeId cond_ty = check_expr(cx, expr->if_expr.cond, TypeId_none());
@@ -1254,13 +1531,15 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             cx->loops[cx->loops_len].break_ty = in->t_unit; // Cannot break with value from while
             cx->loops[cx->loops_len].has_break = false;
             cx->loops_len++;
-            
             if (expr->while_expr.let_pat) {
-                TypeId cond_ty = check_expr(cx, expr->while_expr.cond, TypeId_none());
-                check_pat(cx, expr->while_expr.let_pat, cond_ty, true);
+                desugar_while_let(cx, (AxHirExpr*)expr);
+                cx->loops_len--;
+                cx->in_loop = old_loop;
+                return check_expr_kind(cx, expr, expected);
             } else {
                 check_expr(cx, expr->while_expr.cond, in->t_bool);
             }
+
             check_block(cx, &expr->while_expr.block, in->t_unit);
             
             cx->loops_len--;
@@ -1428,8 +1707,10 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
 
             TypeId match_ty = expected;
             bool first = true;
+            bool has_error = false;
             for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
-                check_pat(cx, arm->pat, val_ty, true);
+                TypeId p_ty = check_pat(cx, arm->pat, val_ty, true);
+                if (is_error(cx, p_ty)) has_error = true;
                 if (arm->guard) {
                     check_expr(cx, arm->guard, in->t_bool);
                 }
@@ -1444,8 +1725,10 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                 match_ty = expr->match.arms ? in->t_error : in->t_never;
             }
             
-            extern void ax_match_check_exhaustiveness(AxThir *thir, StrInterner *str_in, const SourceDatabase *db, AxDiagSink *sink, const AxHirExpr *expr, TypeId val_ty);
-            ax_match_check_exhaustiveness(cx->thir, cx->str_in, cx->db, cx->sink, expr, val_ty);
+            if (!has_error && !is_error(cx, val_ty)) {
+                extern void ax_match_check_exhaustiveness(AxThir *thir, StrInterner *str_in, const SourceDatabase *db, AxDiagSink *sink, const AxHirExpr *expr, TypeId val_ty);
+                ax_match_check_exhaustiveness(cx->thir, cx->str_in, cx->db, cx->sink, expr, val_ty);
+            }
             
             return match_ty;
         }
@@ -1525,7 +1808,23 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
         }
         tail = NULL;
         if (s->kind == AX_HIR_STMT_LET) {
+            if (s->let.else_block) {
+                desugar_let_else(cx, (AxHirStmt*)s);
+                // Fall through to AX_HIR_STMT_EXPR! Wait, I can't fall through directly without goto.
+                // Let's just process it as EXPR right away:
+                TypeId ety = check_expr(cx, s->expr_stmt.expr, TypeId_none());
+                if (is_never(cx, ety)) diverges = true;
+                if (s->expr_stmt.has_semi) {
+                    ty = in->t_unit;
+                } else {
+                    ty = ety;
+                    tail = s->expr_stmt.expr;
+                }
+                continue;
+            }
+            // Irrefutability check for normal let
             TypeId declared = hir_type_to_typeid(cx, s->let.type);
+
             bool is_init = false;
             if (s->let.expr) {
                 // The initializer is the coercion site for the annotation.
@@ -1537,6 +1836,17 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
                 type_error(cx, s->let.pat->span, AX_TYPE_UNKNOWN);
                 declared = in->t_error;
             }
+            
+            // Do irrefutability check:
+            if (!is_pat_irrefutable(cx, s->let.pat, declared)) {
+                AxDiagnostic d = {0};
+                d.code = AX_PAT_REFUTABLE;
+                d.severity = AX_DIAG_ERROR;
+                d.message = ax_diag_code_default_message(AX_PAT_REFUTABLE);
+                d.primary = s->let.pat->span;
+                ax_diag_sink_report(cx->sink, &d);
+            }
+
             check_pat(cx, s->let.pat, declared, is_init);
             ty = in->t_unit;
         } else if (s->kind == AX_HIR_STMT_ASSIGN) {

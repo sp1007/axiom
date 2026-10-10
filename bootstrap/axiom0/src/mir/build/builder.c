@@ -103,6 +103,367 @@ static TypeId get_pat_type(Builder *b, const struct AxHirPat *pat) {
     return ty;
 }
 
+
+static void declare_pat_locals(Builder *b, const AxHirPat *pat, TypeId ty) {
+    if (!pat) return;
+    switch (pat->kind) {
+        case AX_HIR_PAT_BINDING: {
+            AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_USER, ty, pat->binding.is_mut);
+            if (b->var_count >= b->var_cap) {
+                b->var_cap = b->var_cap ? b->var_cap * 2 : 16;
+                b->var_map = realloc(b->var_map, b->var_cap * sizeof(*b->var_map));
+            }
+            b->var_map[b->var_count].sym = pat->binding.symbol;
+            b->var_map[b->var_count].loc = loc;
+            b->var_count++;
+            break;
+        }
+        case AX_HIR_PAT_TUPLE: {
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            if (t->kind != AX_TY_TUPLE) break;
+            size_t i = 0;
+            for (const AxHirPat *p = pat->tuple.elems; p; p = p->next, i++) {
+                if (i < t->tuple.field_count) {
+                    declare_pat_locals(b, p, t->tuple.fields[i]);
+                }
+            }
+            break;
+        }
+        case AX_HIR_PAT_STRUCT: {
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            if (t->kind == AX_TY_STRUCT) {
+                for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                    size_t idx = 0;
+                    for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
+                        if (fd->name.v == pf->name.v) break;
+                    }
+                    if (idx < t->strct.field_count) {
+                        declare_pat_locals(b, pf->pat, t->strct.fields[idx]);
+                    }
+                }
+            } else if (t->kind == AX_TY_ENUM && t->enm.variant_count == 1) {
+                for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                    size_t idx = 0;
+                    const AxHirVariantDecl *vd = t->enm.def->enum_decl.variants;
+                    for (const AxHirFieldDecl *fd = vd->struct_fields; fd; fd = fd->next, idx++) {
+                        if (fd->name.v == pf->name.v) break;
+                    }
+                    if (idx < t->enm.variant_field_counts[0]) {
+                        declare_pat_locals(b, pf->pat, t->enm.variant_fields[0][idx]);
+                    }
+                }
+            }
+            break;
+        }
+        case AX_HIR_PAT_PATH: {
+            if (pat->path.payload) {
+                const AxType *t = ax_type_get(&b->thir->interner, ty);
+                if (t->kind == AX_TY_ENUM && t->enm.variant_count == 1) {
+                    if (pat->path.payload->kind == AX_HIR_PAT_TUPLE) {
+                        size_t idx = 0;
+                        for (const AxHirPat *p = pat->path.payload->tuple.elems; p; p = p->next, idx++) {
+                            if (idx < t->enm.variant_field_counts[0]) {
+                                declare_pat_locals(b, p, t->enm.variant_fields[0][idx]);
+                            }
+                        }
+                    }
+                }
+            }
+            break;
+        }
+        case AX_HIR_PAT_WILDCARD:
+        default:
+            break;
+    }
+}
+
+static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail) {
+    if (!pat) return current_bb;
+    
+    switch (pat->kind) {
+        case AX_HIR_PAT_WILDCARD:
+            return current_bb;
+            
+        case AX_HIR_PAT_BINDING: {
+            TypeId ty = get_pat_type(b, pat);
+            AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_USER, ty, pat->binding.is_mut);
+            if (b->var_count >= b->var_cap) {
+                b->var_cap = b->var_cap ? b->var_cap * 2 : 16;
+                b->var_map = realloc(b->var_map, b->var_cap * sizeof(*b->var_map));
+            }
+            b->var_map[b->var_count].sym = pat->binding.symbol;
+            b->var_map[b->var_count].loc = loc;
+            b->var_count++;
+            
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place.local = loc;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+            stmt.assign.rvalue.use.kind = AX_MIR_OP_COPY;
+            stmt.assign.rvalue.use.place = place;
+            push_stmt(b, current_bb, stmt);
+            return current_bb;
+        }
+        
+        case AX_HIR_PAT_LITERAL: {
+            AxMirOperand const_op = {0};
+            const_op.kind = AX_MIR_OP_CONST;
+            const_op.constant.ty = get_pat_type(b, pat);
+            if (pat->literal.tok.kind == AX_TOK_KW_TRUE) const_op.constant.val = 1;
+            else if (pat->literal.tok.kind == AX_TOK_KW_FALSE) const_op.constant.val = 0;
+            else if (pat->literal.tok.kind == AX_TOK_INT || pat->literal.tok.kind == AX_TOK_CHAR) {
+                const_op.constant.val = pat->literal.tok.val.int_val.value;
+            }
+            if (pat->literal.is_negated) const_op.constant.val = -(int64_t)const_op.constant.val;
+            
+            AxMirLocalId cmp_loc = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace cmp_place = { cmp_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place = cmp_place;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_EQ;
+            stmt.assign.rvalue.binary_op.lhs.kind = AX_MIR_OP_COPY;
+            stmt.assign.rvalue.binary_op.lhs.place = place;
+            stmt.assign.rvalue.binary_op.rhs = const_op;
+            push_stmt(b, current_bb, stmt);
+            
+            AxMirBbId bb_succ = add_bb(b);
+            AxMirTerminator switch_term = {0};
+            switch_term.kind = AX_MIR_TERM_SWITCH_INT;
+            switch_term.switch_int.discr.kind = AX_MIR_OP_COPY;
+            switch_term.switch_int.discr.place = cmp_place;
+            AxMirSwitchTarget *targets = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+            targets[0].value = 0;
+            targets[0].target = bb_fail;
+            switch_term.switch_int.targets.values = targets;
+            switch_term.switch_int.targets.count = 1;
+            switch_term.switch_int.targets.otherwise = bb_succ;
+            set_terminator(b, current_bb, switch_term);
+            
+            return bb_succ;
+        }
+        
+        case AX_HIR_PAT_RANGE: {
+            AxMirConst start_c = {0}, end_c = {0};
+            start_c.ty = get_pat_type(b, pat->range.start);
+            end_c.ty = get_pat_type(b, pat->range.end);
+            
+            if (pat->range.start->kind == AX_HIR_PAT_LITERAL) {
+                if (pat->range.start->literal.tok.kind == AX_TOK_INT || pat->range.start->literal.tok.kind == AX_TOK_CHAR) {
+                    start_c.val = pat->range.start->literal.tok.val.int_val.value;
+                }
+                if (pat->range.start->literal.is_negated) start_c.val = -(int64_t)start_c.val;
+            }
+            if (pat->range.end->kind == AX_HIR_PAT_LITERAL) {
+                if (pat->range.end->literal.tok.kind == AX_TOK_INT || pat->range.end->literal.tok.kind == AX_TOK_CHAR) {
+                    end_c.val = pat->range.end->literal.tok.val.int_val.value;
+                }
+                if (pat->range.end->literal.is_negated) end_c.val = -(int64_t)end_c.val;
+            }
+            
+            AxMirLocalId cmp1_loc = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace cmp1_place = { cmp1_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt stmt1 = {0};
+            stmt1.kind = AX_MIR_STMT_ASSIGN;
+            stmt1.assign.place = cmp1_place;
+            stmt1.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            stmt1.assign.rvalue.binary_op.op = AX_MIR_BINOP_GE;
+            stmt1.assign.rvalue.binary_op.lhs.kind = AX_MIR_OP_COPY;
+            stmt1.assign.rvalue.binary_op.lhs.place = place;
+            stmt1.assign.rvalue.binary_op.rhs.kind = AX_MIR_OP_CONST;
+            stmt1.assign.rvalue.binary_op.rhs.constant = start_c;
+            push_stmt(b, current_bb, stmt1);
+            
+            AxMirBbId bb_check_end = add_bb(b);
+            AxMirTerminator switch1 = {0};
+            switch1.kind = AX_MIR_TERM_SWITCH_INT;
+            switch1.switch_int.discr.kind = AX_MIR_OP_COPY;
+            switch1.switch_int.discr.place = cmp1_place;
+            AxMirSwitchTarget *targets1 = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+            targets1[0].value = 0;
+            targets1[0].target = bb_fail;
+            switch1.switch_int.targets.values = targets1;
+            switch1.switch_int.targets.count = 1;
+            switch1.switch_int.targets.otherwise = bb_check_end;
+            set_terminator(b, current_bb, switch1);
+            
+            current_bb = bb_check_end;
+            AxMirLocalId cmp2_loc = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+            AxMirPlace cmp2_place = { cmp2_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt stmt2 = {0};
+            stmt2.kind = AX_MIR_STMT_ASSIGN;
+            stmt2.assign.place = cmp2_place;
+            stmt2.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+            stmt2.assign.rvalue.binary_op.op = pat->range.is_inclusive ? AX_MIR_BINOP_LE : AX_MIR_BINOP_LT;
+            stmt2.assign.rvalue.binary_op.lhs.kind = AX_MIR_OP_COPY;
+            stmt2.assign.rvalue.binary_op.lhs.place = place;
+            stmt2.assign.rvalue.binary_op.rhs.kind = AX_MIR_OP_CONST;
+            stmt2.assign.rvalue.binary_op.rhs.constant = end_c;
+            push_stmt(b, current_bb, stmt2);
+            
+            AxMirBbId bb_succ = add_bb(b);
+            AxMirTerminator switch2 = {0};
+            switch2.kind = AX_MIR_TERM_SWITCH_INT;
+            switch2.switch_int.discr.kind = AX_MIR_OP_COPY;
+            switch2.switch_int.discr.place = cmp2_place;
+            AxMirSwitchTarget *targets2 = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+            targets2[0].value = 0;
+            targets2[0].target = bb_fail;
+            switch2.switch_int.targets.values = targets2;
+            switch2.switch_int.targets.count = 1;
+            switch2.switch_int.targets.otherwise = bb_succ;
+            set_terminator(b, current_bb, switch2);
+            
+            return bb_succ;
+        }
+        
+        case AX_HIR_PAT_OR: {
+            AxMirBbId bb_succ = add_bb(b);
+            const AxHirPat *p = pat->or_pat.pats;
+            while (p) {
+                AxMirBbId next_or = p->next ? add_bb(b) : bb_fail;
+                AxMirBbId succ = build_pat_match(b, current_bb, place, p, next_or);
+                
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_GOTO;
+                term.goto_target = bb_succ;
+                set_terminator(b, succ, term);
+                
+                current_bb = next_or;
+                p = p->next;
+            }
+            return bb_succ;
+        }
+        
+        case AX_HIR_PAT_PATH:
+        case AX_HIR_PAT_STRUCT:
+        case AX_HIR_PAT_TUPLE: {
+            TypeId ty = get_pat_type(b, pat);
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            
+            if (t->kind == AX_TY_ENUM) {
+                uint32_t *vidx = AxPatVariantMap_get(&b->thir->pat_variants, pat);
+                if (!vidx) return bb_fail;
+                
+                AxMirLocalId discr_loc = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_u32, false);
+                AxMirPlace discr_place = { discr_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = discr_place;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_DISCRIMINANT;
+                stmt.assign.rvalue.discriminant = place;
+                push_stmt(b, current_bb, stmt);
+                
+                AxMirBbId bb_succ = add_bb(b);
+                AxMirTerminator switch_term = {0};
+                switch_term.kind = AX_MIR_TERM_SWITCH_INT;
+                switch_term.switch_int.discr.kind = AX_MIR_OP_COPY;
+                switch_term.switch_int.discr.place = discr_place;
+                AxMirSwitchTarget *targets = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+                targets[0].value = *vidx;
+                targets[0].target = bb_succ;
+                switch_term.switch_int.targets.values = targets;
+                switch_term.switch_int.targets.count = 1;
+                switch_term.switch_int.targets.otherwise = bb_fail;
+                set_terminator(b, current_bb, switch_term);
+                
+                current_bb = bb_succ;
+                
+                if (pat->kind == AX_HIR_PAT_STRUCT) {
+                    const AxHirVariantDecl *vd = t->enm.def->enum_decl.variants;
+                    for (uint32_t i = 0; i < *vidx && vd; i++) vd = vd->next;
+                    
+                    for (const AxHirPatField *f = pat->struct_pat.fields; f; f = f->next) {
+                        size_t idx = 0;
+                        for (const AxHirFieldDecl *fd = vd->struct_fields; fd; fd = fd->next, idx++) {
+                            if (fd->name.v == f->name.v) break;
+                        }
+                        AxMirPlace field_place = place;
+                        AxMirProjection *projs = ax_arena_alloc_array(b->arena, field_place.proj_count + 2, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                        for (size_t i = 0; i < field_place.proj_count; i++) projs[i] = field_place.projs[i];
+                        projs[field_place.proj_count].kind = AX_MIR_PROJ_DOWNCAST;
+                        projs[field_place.proj_count].variant_idx = *vidx;
+                        projs[field_place.proj_count + 1].kind = AX_MIR_PROJ_FIELD;
+                        projs[field_place.proj_count + 1].field_idx = idx;
+                        field_place.projs = projs;
+                        field_place.proj_count += 2;
+                        
+                        current_bb = build_pat_match(b, current_bb, field_place, f->pat, bb_fail);
+                    }
+                } else if (pat->kind == AX_HIR_PAT_PATH && pat->path.payload) {
+                    if (pat->path.payload->kind == AX_HIR_PAT_TUPLE) {
+                        size_t idx = 0;
+                        for (const AxHirPat *p = pat->path.payload->tuple.elems; p; p = p->next, idx++) {
+                            AxMirPlace field_place = place;
+                            AxMirProjection *projs = ax_arena_alloc_array(b->arena, field_place.proj_count + 2, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                            for (size_t i = 0; i < field_place.proj_count; i++) projs[i] = field_place.projs[i];
+                            projs[field_place.proj_count].kind = AX_MIR_PROJ_DOWNCAST;
+                            projs[field_place.proj_count].variant_idx = *vidx;
+                            projs[field_place.proj_count + 1].kind = AX_MIR_PROJ_FIELD;
+                            projs[field_place.proj_count + 1].field_idx = idx;
+                            field_place.projs = projs;
+                            field_place.proj_count += 2;
+                            
+                            current_bb = build_pat_match(b, current_bb, field_place, p, bb_fail);
+                        }
+                    }
+                }
+            } else if (t->kind == AX_TY_STRUCT) {
+                if (pat->kind == AX_HIR_PAT_STRUCT) {
+                    for (const AxHirPatField *f = pat->struct_pat.fields; f; f = f->next) {
+                        size_t idx = 0;
+                        for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
+                            if (fd->name.v == f->name.v) break;
+                        }
+                        AxMirPlace field_place = place;
+                        AxMirProjection *projs = ax_arena_alloc_array(b->arena, field_place.proj_count + 1, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                        for (size_t i = 0; i < field_place.proj_count; i++) projs[i] = field_place.projs[i];
+                        projs[field_place.proj_count].kind = AX_MIR_PROJ_FIELD;
+                        projs[field_place.proj_count].field_idx = idx;
+                        field_place.projs = projs;
+                        field_place.proj_count += 1;
+                        
+                        current_bb = build_pat_match(b, current_bb, field_place, f->pat, bb_fail);
+                    }
+                } else if (pat->kind == AX_HIR_PAT_TUPLE) { // Tuple struct
+                    size_t idx = 0;
+                    for (const AxHirPat *p = pat->tuple.elems; p; p = p->next, idx++) {
+                        AxMirPlace field_place = place;
+                        AxMirProjection *projs = ax_arena_alloc_array(b->arena, field_place.proj_count + 1, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                        for (size_t i = 0; i < field_place.proj_count; i++) projs[i] = field_place.projs[i];
+                        projs[field_place.proj_count].kind = AX_MIR_PROJ_FIELD;
+                        projs[field_place.proj_count].field_idx = idx;
+                        field_place.projs = projs;
+                        field_place.proj_count += 1;
+                        
+                        current_bb = build_pat_match(b, current_bb, field_place, p, bb_fail);
+                    }
+                }
+            } else if (t->kind == AX_TY_TUPLE) {
+                size_t idx = 0;
+                for (const AxHirPat *p = pat->tuple.elems; p; p = p->next, idx++) {
+                    AxMirPlace field_place = place;
+                    AxMirProjection *projs = ax_arena_alloc_array(b->arena, field_place.proj_count + 1, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                    for (size_t i = 0; i < field_place.proj_count; i++) projs[i] = field_place.projs[i];
+                    projs[field_place.proj_count].kind = AX_MIR_PROJ_FIELD;
+                    projs[field_place.proj_count].field_idx = idx;
+                    field_place.projs = projs;
+                    field_place.proj_count += 1;
+                    
+                    current_bb = build_pat_match(b, current_bb, field_place, p, bb_fail);
+                }
+            }
+            return current_bb;
+        }
+        
+        default:
+            return current_bb;
+    }
+}
+
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
 
 static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr);
@@ -736,89 +1097,43 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             set_terminator(b, b->current_bb, term);
         }
         
-        b->current_bb = bb_end;
-    } else if (expr->kind == AX_HIR_EXPR_MATCH) {
+        b->current_bb = bb_end;    } else if (expr->kind == AX_HIR_EXPR_MATCH) {
         TypeId match_val_ty = get_expr_type(b, expr->match.expr);
-        const AxType *t = ax_type_get(&b->thir->interner, match_val_ty);
-        
         AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, match_val_ty, false);
         AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
         build_expr_into(b, expr->match.expr, temp_place);
         
-        AxMirOperand discr_op;
-        if (t->kind == AX_TY_ENUM) {
-            AxMirLocalId discr_temp = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_u32, false);
-            AxMirPlace discr_temp_place = { discr_temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-            
-            AxMirStmt stmt = {0};
-            stmt.kind = AX_MIR_STMT_ASSIGN;
-            stmt.assign.place = discr_temp_place;
-            stmt.assign.rvalue.kind = AX_MIR_RVALUE_DISCRIMINANT;
-            stmt.assign.rvalue.discriminant = temp_place;
-            push_stmt(b, b->current_bb, stmt);
-            
-            discr_op.kind = AX_MIR_OP_COPY;
-            discr_op.place = discr_temp_place;
-        } else {
-            discr_op.kind = AX_MIR_OP_COPY;
-            discr_op.place = temp_place;
-        }
-        
-        size_t arm_count = 0;
-        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) arm_count++;
-        
         AxMirBbId bb_end = add_bb(b);
-        AxMirBbId *arm_bbs = ax_arena_alloc(b->arena, sizeof(AxMirBbId) * arm_count, _Alignof(AxMirBbId));
+        AxMirBbId bb_current = b->current_bb;
         
-        size_t i = 0;
         for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
-            arm_bbs[i++] = add_bb(b);
-        }
-        
-        AxMirSwitchTarget *targets = ax_arena_alloc(b->arena, sizeof(AxMirSwitchTarget) * arm_count, _Alignof(AxMirSwitchTarget));
-        size_t target_count = 0;
-        
-        AxMirBbId otherwise = {0}; // 0 is invalid or we can create one
-        bool has_otherwise = false;
-        
-        i = 0;
-        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
-            if (arm->pat->kind == AX_HIR_PAT_LITERAL) {
-                targets[target_count].value = (arm->pat->literal.tok.kind == AX_TOK_KW_TRUE) ? 1 : 0;
-                targets[target_count].target = arm_bbs[i];
-                target_count++;
-            } else if (arm->pat->kind == AX_HIR_PAT_WILDCARD || arm->pat->kind == AX_HIR_PAT_BINDING) {
-                otherwise = arm_bbs[i];
-                has_otherwise = true;
-            } else {
-                uint32_t *vidx = AxPatVariantMap_get(&b->thir->pat_variants, arm->pat);
-                if (vidx) {
-                    targets[target_count].value = *vidx;
-                    targets[target_count].target = arm_bbs[i];
-                    target_count++;
-                }
+            AxMirBbId bb_next_arm = arm->next ? add_bb(b) : (AxMirBbId){0};
+            if (bb_next_arm.v == 0) {
+                bb_next_arm = add_bb(b);
+                AxMirTerminator unreach = {0};
+                unreach.kind = AX_MIR_TERM_UNREACHABLE;
+                set_terminator(b, bb_next_arm, unreach);
             }
-            i++;
-        }
-        
-        if (!has_otherwise) {
-            otherwise = add_bb(b);
-            AxMirTerminator unreach = {0};
-            unreach.kind = AX_MIR_TERM_UNREACHABLE;
-            set_terminator(b, otherwise, unreach);
-        }
-        
-        AxMirTerminator switch_term = {0};
-        switch_term.kind = AX_MIR_TERM_SWITCH_INT;
-        switch_term.switch_int.discr = discr_op;
-        switch_term.switch_int.targets.values = targets;
-        switch_term.switch_int.targets.count = target_count;
-        switch_term.switch_int.targets.otherwise = otherwise;
-        set_terminator(b, b->current_bb, switch_term);
-        
-        i = 0;
-        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
-            b->current_bb = arm_bbs[i++];
+            
+            AxMirBbId bb_body = build_pat_match(b, bb_current, temp_place, arm->pat, bb_next_arm);
+            if (arm->guard) {
+                b->current_bb = bb_body;
+                AxMirOperand guard_op = build_expr_as_operand(b, arm->guard);
+                AxMirBbId bb_guard_pass = add_bb(b);
+                AxMirTerminator switch_term = {0};
+                switch_term.kind = AX_MIR_TERM_SWITCH_INT;
+                switch_term.switch_int.discr = guard_op;
+                AxMirSwitchTarget *targets = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+                targets[0].value = 0;
+                targets[0].target = bb_next_arm;
+                switch_term.switch_int.targets.values = targets;
+                switch_term.switch_int.targets.count = 1;
+                switch_term.switch_int.targets.otherwise = bb_guard_pass;
+                set_terminator(b, b->current_bb, switch_term);
+                bb_body = bb_guard_pass;
+            }
+            
+            b->current_bb = bb_body;
             build_expr_into(b, arm->body, dest);
             if (!b->bbs[b->current_bb.v].is_terminated) {
                 AxMirTerminator term = {0};
@@ -826,58 +1141,11 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
                 term.goto_target = bb_end;
                 set_terminator(b, b->current_bb, term);
             }
+            
+            bb_current = bb_next_arm;
         }
-        
         b->current_bb = bb_end;
-    } else if (expr->kind == AX_HIR_EXPR_WHILE) {
-        AxMirBbId loop_bb = add_bb(b);
-        AxMirBbId exit_bb = add_bb(b);
-        
-        AxMirTerminator goto_loop = {0};
-        goto_loop.kind = AX_MIR_TERM_GOTO;
-        goto_loop.goto_target = loop_bb;
-        set_terminator(b, b->current_bb, goto_loop);
-        
-        b->current_bb = loop_bb;
-        AxMirOperand cond = build_expr_as_operand(b, expr->while_expr.cond);
-        
-        AxMirBbId body_bb = add_bb(b);
-        
-        AxMirTerminator switch_term = {0};
-        switch_term.kind = AX_MIR_TERM_SWITCH_INT;
-        switch_term.switch_int.discr = cond;
-        AxMirSwitchTarget *targets = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
-        targets[0].value = 0;
-        targets[0].target = exit_bb;
-        switch_term.switch_int.targets.values = targets;
-        switch_term.switch_int.targets.count = 1;
-        switch_term.switch_int.targets.otherwise = body_bb;
-        set_terminator(b, b->current_bb, switch_term);
-        
-        b->current_bb = body_bb;
-        
-        if (b->loop_count >= b->loop_cap) {
-            b->loop_cap = b->loop_cap ? b->loop_cap * 2 : 16;
-            b->loops = realloc(b->loops, b->loop_cap * sizeof(LoopContext));
-        }
-        AxMirPlace void_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-        b->loops[b->loop_count].break_bb = exit_bb;
-        b->loops[b->loop_count].continue_bb = loop_bb;
-        b->loops[b->loop_count].dest = void_place;
-        b->loops[b->loop_count].label = expr->while_expr.label;
-        b->loop_count++;
-        
-        build_block_into(b, &expr->while_expr.block, void_place);
-        
-        if (!b->bbs[b->current_bb.v].is_terminated) {
-            AxMirTerminator term = {0};
-            term.kind = AX_MIR_TERM_GOTO;
-            term.goto_target = loop_bb;
-            set_terminator(b, b->current_bb, term);
-        }
-        
-        b->current_bb = exit_bb;
-        b->loop_count--;
+
     } else if (expr->kind == AX_HIR_EXPR_LOOP) {
         AxMirBbId loop_bb = add_bb(b);
         AxMirBbId exit_bb = add_bb(b);
@@ -905,6 +1173,52 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             AxMirTerminator term = {0};
             term.kind = AX_MIR_TERM_GOTO;
             term.goto_target = loop_bb;
+            set_terminator(b, b->current_bb, term);
+        }
+        
+        b->current_bb = exit_bb;
+        b->loop_count--;
+    } else if (expr->kind == AX_HIR_EXPR_WHILE) {
+        AxMirBbId cond_bb = add_bb(b);
+        AxMirBbId body_bb = add_bb(b);
+        AxMirBbId exit_bb = add_bb(b);
+        
+        AxMirTerminator goto_cond = {0};
+        goto_cond.kind = AX_MIR_TERM_GOTO;
+        goto_cond.goto_target = cond_bb;
+        set_terminator(b, b->current_bb, goto_cond);
+        
+        b->current_bb = cond_bb;
+        AxMirOperand cond_op = build_expr_as_operand(b, expr->while_expr.cond);
+        
+        AxMirTerminator switch_int = {0};
+        switch_int.kind = AX_MIR_TERM_SWITCH_INT;
+        switch_int.switch_int.discr = cond_op;
+        switch_int.switch_int.targets.count = 1;
+        switch_int.switch_int.targets.values = ax_arena_alloc((AxArena*)&b->thir->interner.arena, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+        switch_int.switch_int.targets.values[0].value = 1;
+        switch_int.switch_int.targets.values[0].target = body_bb;
+        switch_int.switch_int.targets.otherwise = exit_bb;
+        set_terminator(b, b->current_bb, switch_int);
+        
+        b->current_bb = body_bb;
+        
+        if (b->loop_count >= b->loop_cap) {
+            b->loop_cap = b->loop_cap ? b->loop_cap * 2 : 16;
+            b->loops = realloc(b->loops, b->loop_cap * sizeof(LoopContext));
+        }
+        b->loops[b->loop_count].break_bb = exit_bb;
+        b->loops[b->loop_count].continue_bb = cond_bb;
+        b->loops[b->loop_count].dest = dest;
+        b->loops[b->loop_count].label = expr->while_expr.label;
+        b->loop_count++;
+        
+        build_block_into(b, &expr->while_expr.block, dest);
+        
+        if (!b->bbs[b->current_bb.v].is_terminated) {
+            AxMirTerminator term = {0};
+            term.kind = AX_MIR_TERM_GOTO;
+            term.goto_target = cond_bb;
             set_terminator(b, b->current_bb, term);
         }
         
@@ -1127,24 +1441,20 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
                     AxMirPlace void_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                     build_expr_into(b, stmt->expr_stmt.expr, void_place);
                 }
-            }
-        } else if (stmt->kind == AX_HIR_STMT_LET) {
+            }        } else if (stmt->kind == AX_HIR_STMT_LET) {
             TypeId ty = get_pat_type(b, stmt->let.pat);
             if (ty.v == 0 && stmt->let.expr) ty = get_expr_type(b, stmt->let.expr);
             
-            AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_USER, ty, stmt->let.pat->binding.is_mut);
             if (stmt->let.expr) {
+                AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_TEMP, ty, false);
                 AxMirPlace p = { loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                 build_expr_into(b, stmt->let.expr, p);
+                
+                b->current_bb = build_pat_match(b, b->current_bb, p, stmt->let.pat, (AxMirBbId){0});
+            } else {
+                declare_pat_locals(b, stmt->let.pat, ty);
             }
-            
-            if (b->var_count >= b->var_cap) {
-                b->var_cap = b->var_cap ? b->var_cap * 2 : 16;
-                b->var_map = realloc(b->var_map, b->var_cap * sizeof(*b->var_map));
-            }
-            b->var_map[b->var_count].sym = stmt->let.pat->binding.symbol;
-            b->var_map[b->var_count].loc = loc;
-            b->var_count++;
+
         } else if (stmt->kind == AX_HIR_STMT_ASSIGN) {
             AxMirPlace dest = build_place(b, stmt->assign.left);
             if (dest.local.v == 0 && dest.proj_count == 0 && stmt->assign.left->kind != AX_HIR_EXPR_PATH) {

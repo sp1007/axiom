@@ -241,7 +241,14 @@ static AxHirPat *lower_pat(LowerCtx *ctx, const AxAstPat *p) {
                     AxHirPatField *hf = ax_arena_alloc(ctx->arena, sizeof(AxHirPatField), 8);
                     hf->span = f->span;
                     hf->name = f->name;
-                    hf->pat = lower_pat(ctx, f->pat); // could be NULL
+                    hf->pat = lower_pat(ctx, f->pat);
+                    if (!hf->pat) {
+                        hf->pat = ax_arena_alloc(ctx->arena, sizeof(AxHirPat), 8);
+                        hf->pat->kind = AX_HIR_PAT_BINDING;
+                        hf->pat->span = f->span;
+                        hf->pat->binding.is_mut = false;
+                        hf->pat->binding.symbol = get_symbol(ctx, f);
+                    }
                     *ftail = hf;
                     ftail = &hf->next;
                 }
