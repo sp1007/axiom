@@ -371,6 +371,8 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 
 | Date | Change | ADR |
 |---|---|---|
+| 2026-10-10 | T121 rescoped to include bootstrap/axiom0/src/driver/pipeline.c in paths to allow pipeline integration | ADR-0020 |
+| 2026-10-10 | T046 split into T120 (place model, copy classification, pipeline registration) and T121 (move dataflow analysis, use-after-move/partial-move diagnostics) due to complexity of dataflow logic | ADR-0019 |
 | 2026-10-06 | T022 (VS0 gate) unblock: fix tasks T114 parser, T115 typeck/driver, T116 MIR builder, T117 interpreter (after T116); T022 depends on all four and owns `tools/ci.ps1`; T069 depends on T061 (selfhost-subset rule d) | ADR-0016 |
 | 2026-10-01 | Audit 2026-09-30 (4 lenses) applied. Oracle host interface: T061c; std runs under the interpreter (R8 wording) | ADR-0002 |
 | 2026-10-01 | Backend robustness: ABI lowering as a LIR pass, machine-IR verifier, stack probes, `--stack-reserve` (T025 narrowed, new T025b; T027, T028, T037, T086) | ADR-0003 |

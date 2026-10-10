@@ -10,9 +10,11 @@ depends: [T120]
 priority: 66
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/own, tests/ui/own, tests/run/own]
+paths: [bootstrap/axiom0/src/own, tests/ui/own, tests/run/own, bootstrap/axiom0/src/driver/pipeline.c]
 locks: []
-spec: [spec/SPEC-10-ownership.md, spec/decisions/ADR-0019-split-t046-move-analysis.md]
+spec: [spec/SPEC-10-ownership.md, spec/decisions/ADR-0019-split-t046-move-analysis.md, spec/decisions/ADR-0020-rescope-t121-paths.md]
+started: 2026-10-10 16:04:12
+unblocks: 1
 ---
 # T121 — Move dataflow analysis (use-after-move, partial moves) (T046 split)
 
@@ -26,3 +28,8 @@ Ownership dataflow over MIR places.
 ## Acceptance
 - [ ] Every SPEC-10 test-matrix row tagged T121 has passing positive + negative tests. Run tests carry `// native-after: T051` (removed by T051).
 - [ ] Full test suite passes; build warning-free; archcheck clean.
+
+## Log
+- 2026-10-10 16:04:12 started (attempt 1) T121-impl
+- 2026-10-10 16:08:02 block: Needs to modify bootstrap/axiom0/src/driver/pipeline.c but it is not in paths
+- 2026-10-10 16:10:03 unblocked (cycle 1) 
