@@ -8,11 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T044, T045]
 priority: 66
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/own, tests/ui/own, tests/run/own]
 locks: [bootstrap/axiom0/src/diag/codes/MOVE.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [spec/SPEC-10-ownership.md, 0160, 0176, tasks/0394, tasks/0503]
+started: 2026-10-10 13:47:45
+superseded_by: T120
+finished: 2026-10-10 13:55:08
 ---
 # T046 — Place model + move/copy analysis (use-after-move, partial moves)
 
@@ -34,3 +37,8 @@ Ownership dataflow over MIR places.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 13:47:45 started (attempt 1) T046-impl
+- 2026-10-10 13:53:48 block: Data flow logic and tests are yet to be implemented.
+- 2026-10-10 13:55:08 superseded by T120 -> done (no code of its own)
