@@ -37,6 +37,8 @@ typedef struct Builder {
     size_t loop_count;
     size_t loop_cap;
     
+    AxLocation current_span;
+    
     struct {
         AxSymbolId sym;
         AxMirLocalId loc;
@@ -44,6 +46,15 @@ typedef struct Builder {
     size_t var_count;
     size_t var_cap;
 } Builder;
+
+static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
+static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
+static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
+static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
+static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *expr);
+static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr);
+static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPlace dest);
+static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest);
 
 static AxMirLocalId add_local(Builder *b, AxMirLocalKind kind, TypeId ty, bool mut) {
     if (b->local_count >= b->local_cap) {
@@ -54,6 +65,7 @@ static AxMirLocalId add_local(Builder *b, AxMirLocalKind kind, TypeId ty, bool m
     b->locals[id.v].kind = kind;
     b->locals[id.v].ty = ty;
     b->locals[id.v].mut = mut;
+    b->locals[id.v].location = b->current_span;
     return id;
 }
 
@@ -74,6 +86,7 @@ static AxMirBbId add_bb(Builder *b) {
 
 static void push_stmt(Builder *b, AxMirBbId bb, AxMirStmt stmt) {
     BbData *d = &b->bbs[bb.v];
+    stmt.location = b->current_span;
     if (d->stmt_count >= d->stmt_cap) {
         d->stmt_cap = d->stmt_cap ? d->stmt_cap * 2 : 8;
         d->stmts = realloc(d->stmts, d->stmt_cap * sizeof(AxMirStmt));
@@ -83,6 +96,7 @@ static void push_stmt(Builder *b, AxMirBbId bb, AxMirStmt stmt) {
 
 static void set_terminator(Builder *b, AxMirBbId bb, AxMirTerminator term) {
     BbData *d = &b->bbs[bb.v];
+    term.location = b->current_span;
     if (!d->is_terminated) {
         d->terminator = term;
         d->is_terminated = true;
@@ -177,7 +191,7 @@ static void declare_pat_locals(Builder *b, const AxHirPat *pat, TypeId ty) {
     }
 }
 
-static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail) {
+static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail) {
     if (!pat) return current_bb;
     
     switch (pat->kind) {
@@ -579,7 +593,7 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
 
 static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest);
 
-static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
+static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *expr) {
     AxMirOperand op = {0};
     if (expr->kind == AX_HIR_EXPR_LITERAL) {
         op.kind = AX_MIR_OP_CONST;
@@ -644,7 +658,7 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
     return op;
 }
 
-static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
+static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
     uint32_t *vidx_ptr = AxExprVariantMap_get(&b->thir->expr_variants, expr);
     if (vidx_ptr) {
         AxMirStmt stmt = {0};
@@ -1452,8 +1466,8 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             valid_stmt.assign.place = valid_place;
             valid_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
             valid_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_BIT_OR;
-            valid_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ AX_MIR_OP_COPY, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .place = lt_d800_place } };
-            valid_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ AX_MIR_OP_COPY, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .place = gt_dfff_place } };
+            valid_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = lt_d800_place  };
+            valid_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = gt_dfff_place  };
             push_stmt(b, b->current_bb, valid_stmt);
 
             AxMirTerminator assert_valid = {0};
@@ -1533,7 +1547,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
     }
 }
 
-static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest) {
+static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPlace dest) {
     for (const AxHirStmt *stmt = block->stmts; stmt != NULL; stmt = stmt->next) {
         if (stmt->kind == AX_HIR_STMT_EXPR) {
             if (!stmt->expr_stmt.has_semi && stmt->next == NULL) {
@@ -1571,6 +1585,45 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
             build_expr_into(b, stmt->assign.right, dest);
         }
     }
+}
+
+
+static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail) {
+    AxLocation old_span = b->current_span;
+    if (pat) b->current_span = pat->span;
+
+    AxMirBbId res = build_pat_match_inner(b, current_bb, place, pat, bb_fail);
+    b->current_span = old_span;
+    return res;
+}
+
+
+static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
+    AxLocation old_span = b->current_span;
+    if (expr) b->current_span = expr->span;
+
+    build_expr_into_inner(b, expr, dest);
+    b->current_span = old_span;
+}
+
+
+static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
+    AxLocation old_span = b->current_span;
+    if (expr) b->current_span = expr->span;
+
+    AxMirOperand res = build_expr_as_operand_inner(b, expr);
+    if (expr) res.location = expr->span;
+    b->current_span = old_span;
+    return res;
+}
+
+
+static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest) {
+    AxLocation old_span = b->current_span;
+    if (block) b->current_span = block->span;
+
+    build_block_into_inner(b, block, dest);
+    b->current_span = old_span;
 }
 
 AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *arena) {

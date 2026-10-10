@@ -11,6 +11,8 @@
 AX_DEFINE_ID(AxMirLocalId);
 AX_DEFINE_ID(AxMirBbId);
 
+typedef Span AxLocation;
+
 typedef enum AxMirRegion {
     AX_MIR_REGION_UNKNOWN,
     AX_MIR_REGION_SAME,
@@ -35,6 +37,7 @@ typedef struct AxMirLocalDecl {
     AxMirLocalKind kind;
     TypeId ty;
     bool mut;
+    AxLocation location;
 } AxMirLocalDecl;
 
 typedef enum AxMirProjKind {
@@ -105,6 +108,7 @@ typedef struct AxMirOperand {
     AxMirRegion region;
     AxMirView view;
     uint32_t drop_flag;
+    AxLocation location;
     union {
         AxMirPlace place;
         AxMirConst constant;
@@ -180,6 +184,7 @@ typedef enum AxMirStmtKind {
 
 typedef struct AxMirStmt {
     AxMirStmtKind kind;
+    AxLocation location;
     union {
         struct {
             AxMirPlace place;
@@ -216,6 +221,7 @@ typedef struct AxMirTerminator {
     AxMirRegion region;
     AxMirView view;
     uint32_t drop_flag;
+    AxLocation location;
     union {
         AxMirBbId goto_target;
         struct {
