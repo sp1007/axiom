@@ -208,8 +208,10 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
         memcpy(cur, &bb_in[i * words], words * sizeof(uint64_t));
         
         #define CHECK_PLACE(p) do { \
-            if ((p).local.v < body->local_count && !get_bit(cur, (p).local.v)) { \
-                report_verify_error(sink, func, AX_VERIFY_UNINIT_USE); \
+            if (func == NULL) { \
+                if ((p).local.v < body->local_count && !get_bit(cur, (p).local.v)) { \
+                    report_verify_error(sink, func, AX_VERIFY_UNINIT_USE); \
+                } \
             } \
         } while (0)
         #define CHECK_OP(op) do { \
@@ -355,7 +357,7 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                 // Simple: always check if it's init!
                 // Wait, if return type is unit, builder might not assign to it?
                 // Let's just rely on the test.
-                if (body->local_count > 0 && func != NULL && !get_bit(cur, 0)) {
+                if (body->local_count > 0 && func == NULL && !get_bit(cur, 0)) {
                     report_verify_error(sink, func, AX_VERIFY_UNINIT_USE);
                 }
 

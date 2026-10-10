@@ -1588,9 +1588,6 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             if (expr->path.path.symbol.v != 0) {
                 for (size_t i = 0; i < cx->vars_len; i++) {
                     if (cx->vars[i].sym.v == expr->path.path.symbol.v) {
-                        if (!cx->vars[i].is_init) {
-                            type_error(cx, expr->span, AX_TYPE_UNINIT_USE);
-                        }
                         break;
                     }
                 }

@@ -179,10 +179,14 @@ static bool merge_states(AxOwnStateInfo *dest, const AxOwnStateInfo *src, size_t
     bool changed = false;
     for (size_t i = 0; i < count; i++) {
         AxOwnState m = merge_state_val(dest[i].state, src[i].state);
-        if (m != dest[i].state) {
+        AxLocation new_loc = dest[i].move_loc;
+        if (new_loc.file.v == 0) new_loc = src[i].move_loc;
+
+        if (m != dest[i].state || 
+            ((m == AX_OWN_MOVED || m == AX_OWN_PARTIAL) && dest[i].move_loc.file.v == 0 && new_loc.file.v != 0)) {
             dest[i].state = m;
             if (m == AX_OWN_MOVED || m == AX_OWN_PARTIAL) {
-                if (src[i].state == m) dest[i].move_loc = src[i].move_loc;
+                dest[i].move_loc = new_loc;
             }
             changed = true;
         }
@@ -195,19 +199,24 @@ typedef struct {
     const PathCtx *ctx;
     AxDiagSink *sink;
     bool report;
+    const AxMirBody *body;
+    const AxThir *thir;
 } Visitor;
 
 static void check_use(Visitor *v, const AxMirPlace *place, AxLocation loc) {
     uint32_t node = resolve_place(v->ctx, place);
-    if ((v->state[node].state == AX_OWN_MOVED || v->state[node].state == AX_OWN_PARTIAL) && v->report) {
+    AxOwnState st = v->state[node].state;
+    if (st != AX_OWN_OWNED && v->report) {
         AxDiagnostic *d = ax_arena_alloc(&v->sink->arena, sizeof(AxDiagnostic), _Alignof(AxDiagnostic));
         memset(d, 0, sizeof(*d));
-        d->code = AX_MOVE_USE_AFTER_MOVE;
+        
+        bool is_uninit = (st == AX_OWN_UNINIT) || (st == AX_OWN_PARTIAL && v->state[node].move_loc.file.v == 0);
+        d->code = is_uninit ? AX_INIT_USE_UNINIT : AX_MOVE_USE_AFTER_MOVE;
         d->severity = AX_DIAG_ERROR;
-        d->message = ax_diag_code_default_message(AX_MOVE_USE_AFTER_MOVE);
+        d->message = ax_diag_code_default_message(d->code);
         d->primary = loc;
         
-        if (v->state[node].state == AX_OWN_MOVED || v->state[node].state == AX_OWN_PARTIAL) {
+        if (st == AX_OWN_MOVED || (st == AX_OWN_PARTIAL && v->state[node].move_loc.file.v != 0)) {
             AxDiagLabel *l = ax_arena_alloc(&v->sink->arena, sizeof(AxDiagLabel), _Alignof(AxDiagLabel));
             l->span = v->state[node].move_loc;
             l->message = "moved here";
@@ -318,7 +327,16 @@ static void visit_bb(Visitor *v, const AxMirBb *bb) {
             {
                 AxMirPlace ret_place = {0};
                 ret_place.local.v = 0;
-                check_use(v, &ret_place, loc);
+                bool needs_check = true;
+                if (v->body->local_count > 0 && v->thir) {
+                    const AxType *ty = ax_type_get(&v->thir->interner, v->body->locals[0].ty);
+                    if (ty && (ty->kind == AX_TY_UNIT || ty->kind == AX_TY_NEVER)) {
+                        needs_check = false;
+                    }
+                }
+                if (needs_check) {
+                    check_use(v, &ret_place, loc);
+                }
             }
             break;
         default:
@@ -377,7 +395,7 @@ void ax_own_check(const AxHirItem *it, AxMirBody *body, const AxThir *thir, AxDi
 
     bool changed = true;
     AxOwnStateInfo *temp = malloc(ctx.count * sizeof(AxOwnStateInfo));
-    Visitor v = { .state = temp, .ctx = &ctx, .sink = sink, .report = false };
+    Visitor v = { .state = temp, .ctx = &ctx, .sink = sink, .report = false, .body = body, .thir = thir };
 
     while (changed) {
         changed = false;
