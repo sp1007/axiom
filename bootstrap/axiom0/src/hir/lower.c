@@ -300,8 +300,8 @@ static AxHirExpr *lower_postfix(LowerCtx *ctx, const AxAstExpr *e) {
                 next->index.arg = lower_expr(ctx, seg->index.arg);
                 break;
             case AX_POSTFIX_TRY:
-                emit_not_supported(ctx, seg->span);
-                next->kind = AX_HIR_EXPR_ERROR;
+                next->kind = AX_HIR_EXPR_TRY;
+                next->try_expr.expr = head;
                 break;
             case AX_POSTFIX_AWAIT:
                 emit_not_supported(ctx, seg->span);

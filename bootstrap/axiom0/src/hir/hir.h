@@ -343,6 +343,9 @@ struct AxHirExpr {
         } index;
         struct {
             AxHirExpr *expr;
+            bool is_opt;
+            uint32_t payload_idx;
+            uint32_t err_idx;
         } try_expr;
         struct {
             AxHirExpr *expr;

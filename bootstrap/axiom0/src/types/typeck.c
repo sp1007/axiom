@@ -1773,7 +1773,54 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             }
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
         }
-        case AX_HIR_EXPR_TRY:
+                case AX_HIR_EXPR_TRY: {
+            TypeId expr_ty = check_expr(cx, expr->try_expr.expr, TypeId_none());
+            if (is_error(cx, expr_ty)) return in->t_error;
+            const AxType *t = ax_type_get(in, expr_ty);
+            if (t->kind != AX_TY_ENUM) {
+                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            }
+            StrView enum_name = ax_interner_get(cx->str_in, t->enm.def->enum_decl.name);
+            bool is_opt = ax_sv_eq_cstr(enum_name, "Option");
+            bool is_res = ax_sv_eq_cstr(enum_name, "Result");
+            if (!is_opt && !is_res) {
+                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            }
+            
+            if (is_error(cx, cx->return_type)) return in->t_error;
+            const AxType *ret_t = ax_type_get(in, cx->return_type);
+            if (ret_t->kind != AX_TY_ENUM) return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            StrView ret_enum_name = ax_interner_get(cx->str_in, ret_t->enm.def->enum_decl.name);
+            if (is_opt && !ax_sv_eq_cstr(ret_enum_name, "Option")) {
+                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            }
+            if (is_res && !ax_sv_eq_cstr(ret_enum_name, "Result")) {
+                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            }
+            
+            const char *payload_var_name = is_opt ? "Some" : "Ok";
+            const AxHirVariantDecl *payload_var = NULL;
+            uint32_t payload_idx = 0;
+            uint32_t err_idx = 0;
+            uint32_t curr_idx = 0;
+            for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next, curr_idx++) {
+                if (ax_sv_eq_cstr(ax_interner_get(cx->str_in, v->name), payload_var_name)) {
+                    payload_var = v;
+                    payload_idx = curr_idx;
+                } else {
+                    err_idx = curr_idx;
+                }
+            }
+            if (!payload_var || payload_var->is_struct || !payload_var->tuple_types) return in->t_error;
+            
+            // NOTE: cast away const to mutate the HIR
+            AxHirExpr *mut_expr = (AxHirExpr *)expr;
+            mut_expr->try_expr.is_opt = is_opt;
+            mut_expr->try_expr.payload_idx = payload_idx;
+            mut_expr->try_expr.err_idx = err_idx;
+            
+            return hir_type_to_typeid(cx, payload_var->tuple_types);
+        }
         case AX_HIR_EXPR_AWAIT:
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
 

@@ -1058,6 +1058,105 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
         stmt.assign.rvalue.unary_op.op = expr->unary.op == AX_UNOP_NOT ? AX_MIR_UNOP_NOT : (expr->unary.op == AX_UNOP_BITNOT ? AX_MIR_UNOP_BITNOT : AX_MIR_UNOP_NEG);
         stmt.assign.rvalue.unary_op.operand = op;
         push_stmt(b, b->current_bb, stmt);
+        } else if (expr->kind == AX_HIR_EXPR_TRY) {
+        TypeId expr_ty = get_expr_type(b, expr->try_expr.expr);
+        bool is_opt = expr->try_expr.is_opt;
+        uint32_t payload_idx = expr->try_expr.payload_idx;
+        uint32_t err_idx = expr->try_expr.err_idx;
+        
+        AxMirLocalId expr_loc = add_local(b, AX_MIR_LOCAL_TEMP, expr_ty, false);
+        AxMirPlace expr_place = { expr_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        build_expr_into(b, expr->try_expr.expr, expr_place);
+        
+        AxMirLocalId discr_loc = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_u32, false);
+        AxMirPlace discr_place = { discr_loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.assign.place = discr_place;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_DISCRIMINANT;
+        stmt.assign.rvalue.discriminant = expr_place;
+        push_stmt(b, b->current_bb, stmt);
+        
+        AxMirBbId bb_then = add_bb(b);
+        AxMirBbId bb_else = add_bb(b);
+        
+        AxMirTerminator term = {0};
+        term.kind = AX_MIR_TERM_SWITCH_INT;
+        term.region = AX_MIR_REGION_UNKNOWN;
+        term.view = AX_MIR_VIEW_UNKNOWN;
+        term.drop_flag = 0;
+        term.switch_int.discr.kind = AX_MIR_OP_COPY;
+        term.switch_int.discr.place = discr_place;
+        
+        term.switch_int.targets.count = 1;
+        term.switch_int.targets.values = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+        term.switch_int.targets.values[0].value = payload_idx;
+        term.switch_int.targets.values[0].target = bb_then;
+        term.switch_int.targets.otherwise = bb_else;
+        set_terminator(b, b->current_bb, term);
+        
+        b->current_bb = bb_then;
+        AxMirProjection proj = { .kind = AX_MIR_PROJ_DOWNCAST, .variant_idx = payload_idx };
+        AxMirProjection *projs = ax_arena_alloc_array(b->arena, 2, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+        projs[0] = proj;
+        projs[1].kind = AX_MIR_PROJ_FIELD;
+        projs[1].field_idx = 0;
+        AxMirPlace field_place = expr_place;
+        field_place.proj_count = 2;
+        field_place.projs = projs;
+        
+        AxMirStmt assign_dest = {0};
+        assign_dest.kind = AX_MIR_STMT_ASSIGN;
+        assign_dest.assign.place = dest;
+        assign_dest.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+        assign_dest.assign.rvalue.use.kind = AX_MIR_OP_MOVE;
+        assign_dest.assign.rvalue.use.place = field_place;
+        push_stmt(b, b->current_bb, assign_dest);
+        
+        b->current_bb = bb_else;
+        AxMirPlace ret_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        
+        if (is_opt) {
+            AxMirStmt ret_assign = {0};
+            ret_assign.kind = AX_MIR_STMT_ASSIGN;
+            ret_assign.assign.place = ret_place;
+            ret_assign.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+            ret_assign.assign.rvalue.aggregate.variant_idx = err_idx;
+            ret_assign.assign.rvalue.aggregate.operands = NULL;
+            ret_assign.assign.rvalue.aggregate.operand_count = 0;
+            push_stmt(b, b->current_bb, ret_assign);
+        } else {
+            AxMirProjection *err_projs = ax_arena_alloc_array(b->arena, 2, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+            err_projs[0].kind = AX_MIR_PROJ_DOWNCAST;
+            err_projs[0].variant_idx = err_idx;
+            err_projs[1].kind = AX_MIR_PROJ_FIELD;
+            err_projs[1].field_idx = 0;
+            AxMirPlace err_field_place = expr_place;
+            err_field_place.proj_count = 2;
+            err_field_place.projs = err_projs;
+            
+            AxMirOperand *err_op = ax_arena_alloc_array(b->arena, 1, sizeof(AxMirOperand), _Alignof(AxMirOperand));
+            err_op[0].kind = AX_MIR_OP_MOVE;
+            err_op[0].place = err_field_place;
+            
+            AxMirStmt ret_assign = {0};
+            ret_assign.kind = AX_MIR_STMT_ASSIGN;
+            ret_assign.assign.place = ret_place;
+            ret_assign.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+            ret_assign.assign.rvalue.aggregate.variant_idx = err_idx;
+            ret_assign.assign.rvalue.aggregate.operands = err_op;
+            ret_assign.assign.rvalue.aggregate.operand_count = 1;
+            push_stmt(b, b->current_bb, ret_assign);
+        }
+        
+        AxMirTerminator ret_term = {0};
+        ret_term.kind = AX_MIR_TERM_RETURN;
+        ret_term.region = AX_MIR_REGION_UNKNOWN;
+        ret_term.view = AX_MIR_VIEW_UNKNOWN;
+        ret_term.drop_flag = 0;
+        set_terminator(b, b->current_bb, ret_term);
+        
+        b->current_bb = bb_then;
     } else if (expr->kind == AX_HIR_EXPR_BLOCK) {
         build_block_into(b, &expr->block.block, dest);
     } else if (expr->kind == AX_HIR_EXPR_IF) {
