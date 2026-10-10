@@ -330,11 +330,13 @@ static void stage_own(AxDriverState *st) {
     uint32_t cur = 0;
     AxMirMapEntry *e;
     while (AxMirMap_next(&g_mir_map, &cur, &e)) {
+        const AxHirItem *it = e->key;
         AxMirBody *body = e->value;
         for (uint32_t i = 0; i < body->local_count; i++) {
             // Exercise the copy classification for coverage
             ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
         }
+        ax_own_check(it, body, &st->thir, &st->sink, &st->interner);
     }
 }
 
@@ -475,6 +477,9 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
 
     // Find requested stage
     int target_idx = -1;
+    if (stop_after == AX_STAGE_TYPECK) {
+        stop_after = AX_STAGE_OWN;
+    }
     for (int i = 0; i < max_stage_idx; ++i) {
         if (ax_pipeline_stages[i].id == stop_after) {
             target_idx = i;

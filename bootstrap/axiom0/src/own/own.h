@@ -2,6 +2,8 @@
 #define AX_OWN_OWN_H
 
 #include "types/types.h"
+#include "mir/mir.h"
+#include "diag/diag.h"
 
 typedef enum AxOwnState {
     AX_OWN_UNINIT,
@@ -11,5 +13,6 @@ typedef enum AxOwnState {
 } AxOwnState;
 
 bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in);
+void ax_own_check(const AxHirItem *it, AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const StrInterner *str_in);
 
 #endif // AX_OWN_OWN_H
