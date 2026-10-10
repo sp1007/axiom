@@ -220,7 +220,13 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
         case AX_MIR_RVALUE_BINARY_OP: {
             AxLirVRegId lhs = lower_operand(b, &rv->binary_op.lhs);
             AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
-            const AxType *t = ax_type_get(b->interner, dest_ty);
+            TypeId op_ty = b->interner->t_i32;
+            if (rv->binary_op.lhs.kind == AX_MIR_OP_COPY || rv->binary_op.lhs.kind == AX_MIR_OP_MOVE) {
+                op_ty = b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
+            } else if (rv->binary_op.lhs.kind == AX_MIR_OP_CONST) {
+                op_ty = rv->binary_op.lhs.constant.ty;
+            }
+            const AxType *t = ax_type_get(b->interner, op_ty);
             bool is_signed = true;
             if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
                 is_signed = false;
