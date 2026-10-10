@@ -277,6 +277,13 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         AxType t = { .kind = AX_TY_TUPLE, .tuple = { .field_count = count, .fields = fields } };
         return ax_intern_type(&cx->thir->interner, &t);
     }
+    if (ht->kind == AX_HIR_TYPE_VIEW) {
+        AxType t;
+        memset(&t, 0, sizeof(t));
+        t.kind = ht->view.is_mut ? AX_TY_MUT_VIEW : AX_TY_VIEW;
+        t.view.pointee = hir_type_to_typeid(cx, ht->view.elem);
+        return ax_intern_type(&cx->thir->interner, &t);
+    }
     return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
 }
 
@@ -1830,9 +1837,24 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             
             return match_ty;
         }
+        case AX_HIR_EXPR_VIEW: {
+            TypeId expected_inner = TypeId_none();
+            if (expected.v && !is_error(cx, expected)) {
+                const AxType *exp_t = ax_type_get(in, expected);
+                if (exp_t->kind == (expr->view.is_mut ? AX_TY_MUT_VIEW : AX_TY_VIEW)) {
+                    expected_inner = exp_t->view.pointee;
+                }
+            }
+            TypeId inner_ty = check_expr(cx, expr->view.expr, expected_inner);
+            if (is_error(cx, inner_ty)) return in->t_error;
+            AxType t;
+            memset(&t, 0, sizeof(t));
+            t.kind = expr->view.is_mut ? AX_TY_MUT_VIEW : AX_TY_VIEW;
+            t.view.pointee = inner_ty;
+            return ax_intern_type(&cx->thir->interner, &t);
+        }
         case AX_HIR_EXPR_FOR:
         case AX_HIR_EXPR_UNSAFE:
-        case AX_HIR_EXPR_VIEW:
         case AX_HIR_EXPR_COMPTIME:
         case AX_HIR_EXPR_CLOSURE:
         case AX_HIR_EXPR_RANGE:

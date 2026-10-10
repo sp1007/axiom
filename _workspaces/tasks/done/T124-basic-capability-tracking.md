@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T047, T123]
 priority: 67
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, bootstrap/axiom0/src/own, bootstrap/axiom0/src/syntax]
 locks: [bootstrap/axiom0/src/diag/codes/CAP.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/SPEC-11-capability.md, 0177, 0021, 0028, tasks/0395]
+started: 2026-10-10 19:35:24
+finished: 2026-10-10 19:52:38
 ---
 # T124 — Basic capability tracking & syntax for views
 
@@ -28,3 +30,7 @@ Implement foundational view tracking in own.c and syntax/typeck.
 - [ ] View capability structures are present and build warning-free.
 - [ ] Stubs for conflict detection to be fleshed out in T125.
 - [ ] Report `_workspaces/reports/T124-report.md` with exact `## Files changed`.
+
+## Log
+- 2026-10-10 19:35:24 started (attempt 1) T124-impl
+- 2026-10-10 19:52:38 accepted by QA -> done

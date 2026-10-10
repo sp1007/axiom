@@ -4,6 +4,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include "mir/cap/cap.h"
 
 typedef struct {
     AxOwnState state;
@@ -26,6 +27,7 @@ bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in) {
         case AX_TY_PTR:
         case AX_TY_FN:
         case AX_TY_INT_VAR:
+        case AX_TY_VIEW:
             return true;
         case AX_TY_STR:
             return false;
@@ -201,6 +203,7 @@ typedef struct {
     bool report;
     const AxMirBody *body;
     const AxThir *thir;
+    AxMirCapTracker *cap_tracker;
 } Visitor;
 
 static void check_use(Visitor *v, const AxMirPlace *place, AxLocation loc) {
@@ -261,6 +264,7 @@ static void visit_rvalue(Visitor *v, const AxMirRvalue *rv, AxLocation loc) {
             break;
         case AX_MIR_RVALUE_REF:
             check_use(v, &rv->ref.place, loc);
+            ax_mir_cap_tracker_add(v->cap_tracker, &rv->ref.place, rv->ref.bk == AX_MIR_BORROW_MUT ? AX_MIR_VIEW_MUT : AX_MIR_VIEW_READ);
             break;
         case AX_MIR_RVALUE_LEN:
             check_use(v, &rv->len, loc);
@@ -394,8 +398,11 @@ void ax_own_check(const AxHirItem *it, AxMirBody *body, const AxThir *thir, AxDi
     if (body->bb_count > 0) visited[0] = true;
 
     bool changed = true;
+    AxArena cap_arena;
+    ax_arena_init(&cap_arena, 0);
+    AxMirCapTracker *cap_tracker = ax_mir_cap_tracker_new(&cap_arena);
     AxOwnStateInfo *temp = malloc(ctx.count * sizeof(AxOwnStateInfo));
-    Visitor v = { .state = temp, .ctx = &ctx, .sink = sink, .report = false, .body = body, .thir = thir };
+    Visitor v = { .state = temp, .ctx = &ctx, .sink = sink, .report = false, .body = body, .thir = thir, .cap_tracker = cap_tracker };
 
     while (changed) {
         changed = false;
@@ -458,4 +465,5 @@ void ax_own_check(const AxHirItem *it, AxMirBody *body, const AxThir *thir, AxDi
     free(bb_in);
     free(ctx.nodes);
     free(ctx.local_roots);
+    ax_arena_destroy(&cap_arena);
 }
