@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T047]
 priority: 67
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/regions, bootstrap/axiom0/src/mir/cap, tests/ui/mir]
 locks: [bootstrap/axiom0/src/diag/codes/MIR.def]
 spec: [spec/SPEC-11-capability.md, spec/decisions/ADR-0024-capability-tracker.md]
+started: 2026-10-10 19:00:32
+finished: 2026-10-10 19:28:57
 ---
 # T123 — MIR region representation and capability tracker
 
@@ -34,3 +36,7 @@ Implement the foundational data structures and dataflow analyses in MIR for regi
 
 ## Notes
 - Created as a prerequisite for T048 per ADR-0024.
+
+## Log
+- 2026-10-10 19:00:32 started (attempt 1) T123-impl
+- 2026-10-10 19:28:57 accepted by QA -> done
