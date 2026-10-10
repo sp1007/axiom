@@ -6,13 +6,15 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T047]
+depends: [T047, T123]
 priority: 68
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, tests/ui/cap, tests/run/cap]
 locks: [bootstrap/axiom0/src/diag/codes/CAP.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/SPEC-11-capability.md, 0177, 0021, 0028, tasks/0395]
+started: 2026-10-10 18:49:15
+unblocks: 1
 ---
 # T048 — Views & capabilities: view/mut_view, regions, conflicts, escapes
 
@@ -37,3 +39,8 @@ Capability semantics that make views safe without a borrow checker clone.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 18:49:15 started (attempt 1) T048-impl
+- 2026-10-10 18:58:27 block: missing MIR region representation and capability tracker structures
+- 2026-10-10 18:59:24 unblocked (cycle 1) 
