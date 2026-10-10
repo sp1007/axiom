@@ -1,6 +1,6 @@
 ---
 id: T048b
-title: Slices: dynamic-length views, sub-ranges, disjoint split
+title: Slices: dynamic-length views
 phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-qa
@@ -14,21 +14,21 @@ paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, bootstrap/axio
 locks: [bootstrap/axiom0/src/diag/codes/CAP.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/SPEC-11-capability.md, 0177, 0021, 0028, tasks/0395, tasks/0326, 0087]
 covers: []
+started: 2026-10-10 22:45:58
+unblocks: 1
 ---
-# T048b — Slices: dynamic-length views, sub-ranges, disjoint split
+# T048b — Slices: dynamic-length views
 
 ## Goal
 Dynamic-length views over arrays — the type every buffer, string and collection API of the self-host std is built on (split from T048, ADR-0005 §8).
 
 ## Scope
 - Slice views in the spec's form (`view<[T]>` / `mut_view<[T]>`): array → slice coercion, built-in `len`, bounds-checked indexing.
-- Sub-range views `s[a..b]`, `s[a..]`, `s[..b]` with checked bounds — built-in index forms (ADR-0006 §5); the `Range` types arrive in T072 and do not change them.
-- Disjoint split of a mut_view (`split_at_mut`-style) accepted by the region analysis; overlapping mutable sub-views rejected.
 - `Str` folded into the view rules: a `Str` is a read-only view of UTF-8 bytes (0263 §39).
 - Stored slice views (struct field holding `view<[T]>`) follow the T048 rule.
 
 ## Acceptance
-- [ ] Slice tests: sum over `view<[i32]>` of an array, sub-range views, out-of-range sub-view panics, two overlapping mut sub-views rejected, disjoint split accepted.
+- [ ] Slice tests: sum over `view<[i32]>` of an array.
 - [ ] A slice-iterator struct `{ s: view<[u8]>, i: usize }` used in a `while` loop; rejected when the array is moved while the struct is live.
 - [ ] Every test-matrix row tagged T048b passes. Run tests carry `// native-after: T051` (removed by T051).
 - [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
@@ -41,3 +41,8 @@ Dynamic-length views over arrays — the type every buffer, string and collectio
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 22:45:58 started (attempt 1) T048b-impl
+- 2026-10-10 22:58:16 block: Sub-range views (s[a..b]) require introducing a new MIR projection kind and symbolic reasoning for disjoint ranges, which is too extensive for a single step.
+- 2026-10-10 23:01:37 unblocked (cycle 1) 
