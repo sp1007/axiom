@@ -1,9 +1,13 @@
-# T048 Unblock Report
+# Unblock T048 Report
 
 ## Tóm tắt
-Task T048 đã bị kẹt do thiếu cấu trúc dữ liệu theo dõi capability và phân tích vùng (region) trong MIR. Để giải quyết, chúng tôi quyết định tách phần MIR ra thành một task điều kiện tiên quyết (prerequisite task) mới là T123. T048 bây giờ sẽ phụ thuộc vào T123 để phần backend hoàn tất trước, giúp T048 tập trung vào ngữ nghĩa capability ở frontend. Quyết định này được ghi chép trong ADR-0024.
+Nhiệm vụ T048 bị chặn vì thiếu cơ sở hạ tầng theo dõi capability cơ bản trong `ax_mir_cap_tracker`, `own.c`, và `syntax/typeck`. Để giải quyết, tôi đã áp dụng quyết định kiến trúc ADR-0025, tách T048 thành hai nhiệm vụ nhỏ hơn:
+- T124: Cơ sở hạ tầng capability tracking và syntax cho views.
+- T125: Phần còn lại của T048 (view/mut_view, regions, conflicts, escapes) phụ thuộc vào T124.
+Nhiệm vụ T048 cũ đã bị thay thế (supersede) bởi T124.
 
 ## Files changed
-- spec/decisions/ADR-0024-capability-tracker.md
-- _workspaces/tasks/todo/T123-mir-region-and-capability-tracker.md
-- _workspaces/tasks/todo/T048-views-capabilities-view-mut-view-regions-conflicts.md
+- spec/decisions/ADR-0025-split-t048-view-tracking.md
+- _workspaces/tasks/todo/T124-basic-capability-tracking.md
+- _workspaces/tasks/todo/T125-views-capabilities-view-mut-view-regions-conflicts.md
+- _workspaces/tasks/done/T048-views-capabilities-view-mut-view-regions-conflicts.md
