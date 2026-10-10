@@ -11,9 +11,11 @@ priority: 67
 status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/own/init, tests/ui/init, tests/run/init]
-locks: [bootstrap/axiom0/src/diag/codes/INIT.def]
+locks: [bootstrap/axiom0/src/diag/codes/INIT.def, bootstrap/axiom0/src/own/own.c, bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/verify/verify.c, bootstrap/axiom0/src/target/x64/verify/verify.c]
 spec: [spec/SPEC-10-ownership.md, tasks/0394]
 covers: [REQ-MOD-001, REQ-MOD-002]
+started: 2026-10-10 18:08:43
+unblocks: 1
 ---
 # T047 — Initialization analysis (definite init, reinit after move)
 
@@ -37,3 +39,6 @@ Definite initialization across CFG including loops and conditional moves.
 
 ## Log
 - 2026-10-06 02:24:22 covers += REQ-MOD-001, REQ-MOD-002 (metadata only)
+- 2026-10-10 18:08:43 started (attempt 1) T047-impl
+- 2026-10-10 18:16:02 block: T047 lacks required paths to own.c, typeck.c, and verify.c to integrate the analysis and remove legacy checks
+- 2026-10-10 18:17:42 unblocked (cycle 1) 
