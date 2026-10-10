@@ -33,6 +33,8 @@ AxMirRegion ax_mir_region_relate(const AxMirPlace *a, const AxMirPlace *b) {
     
     if (a->proj_count == b->proj_count) {
         return AX_MIR_REGION_SAME;
+    } else if (a->proj_count < b->proj_count) {
+        return AX_MIR_REGION_CONTAINS; 
     } else {
         return AX_MIR_REGION_OVERLAPS; 
     }

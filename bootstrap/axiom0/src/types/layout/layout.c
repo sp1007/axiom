@@ -49,7 +49,11 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
             return 8;
         case AX_TY_PTR:
         case AX_TY_FN:
+        case AX_TY_VIEW:
+        case AX_TY_MUT_VIEW:
             return 8;
+        case AX_TY_SLICE:
+            return ax_type_align(ty->slice.elem, in);
         case AX_TY_ARRAY:
             return ax_type_align(ty->array.elem, in);
         case AX_TY_ENUM: {
@@ -115,6 +119,12 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
         case AX_TY_PTR:
         case AX_TY_FN:
             return 8;
+        case AX_TY_VIEW:
+        case AX_TY_MUT_VIEW:
+            if (ax_type_get(in, ty->view.pointee)->kind == AX_TY_SLICE) return 16;
+            return 8;
+        case AX_TY_SLICE:
+            return 0;
         case AX_TY_ARRAY:
             return ax_type_size(ty->array.elem, in) * ty->array.len;
         case AX_TY_ENUM: {

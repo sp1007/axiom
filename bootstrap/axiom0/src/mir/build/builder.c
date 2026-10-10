@@ -578,13 +578,23 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
             b->current_bb = assert_term.assert.target;
         }
         
-        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
+        bool is_slice_view = (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&b->thir->interner, t->view.pointee)->kind == AX_TY_SLICE);
+        
+        size_t new_proj_count = base.proj_count + 1;
+        if (is_slice_view) new_proj_count++;
+        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * new_proj_count, _Alignof(AxMirProjection));
         for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
-        projs[base.proj_count].kind = AX_MIR_PROJ_INDEX;
-        projs[base.proj_count].index_local = idx_local;
+        
+        size_t pi = base.proj_count;
+        if (is_slice_view) {
+            projs[pi].kind = AX_MIR_PROJ_DEREF;
+            pi++;
+        }
+        projs[pi].kind = AX_MIR_PROJ_INDEX;
+        projs[pi].index_local = idx_local;
         
         base.projs = projs;
-        base.proj_count++;
+        base.proj_count = new_proj_count;
         return base;
     }
     AxMirPlace err = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
@@ -631,8 +641,14 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             op.constant.val = sym.v;
             return op;
         } else {
-            op.kind = AX_MIR_OP_COPY;
             AxMirPlace p = { loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            TypeId ty = get_expr_type(b, expr);
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            bool is_copy = true;
+            if (t && (t->kind == AX_TY_STR || t->kind == AX_TY_ARRAY)) {
+                is_copy = false;
+            }
+            op.kind = is_copy ? AX_MIR_OP_COPY : AX_MIR_OP_MOVE;
             op.place = p;
             return op;
         }
@@ -641,7 +657,13 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             // It's a variant, let the default path build it into a temp
         } else {
             AxMirPlace p = build_place(b, expr);
-            op.kind = AX_MIR_OP_COPY;
+            TypeId ty = get_expr_type(b, expr);
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            bool is_copy = true;
+            if (t && (t->kind == AX_TY_STR || t->kind == AX_TY_ARRAY)) {
+                is_copy = false;
+            }
+            op.kind = is_copy ? AX_MIR_OP_COPY : AX_MIR_OP_MOVE;
             op.place = p;
             return op;
         }

@@ -194,12 +194,36 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
     if (ta->kind == AX_TY_MUT_VIEW && tb->kind == AX_TY_MUT_VIEW) {
         return unify_ty(cx, ta->view.pointee, tb->view.pointee);
     }
+    if (ta->kind == AX_TY_STR && tb->kind == AX_TY_VIEW) {
+        const AxType *p_tb = ax_type_get(&cx->thir->interner, tb->view.pointee);
+        return p_tb->kind == AX_TY_SLICE && unify_ty(cx, cx->thir->interner.t_u8, p_tb->slice.elem);
+    }
+    if (tb->kind == AX_TY_STR && ta->kind == AX_TY_VIEW) {
+        const AxType *p_ta = ax_type_get(&cx->thir->interner, ta->view.pointee);
+        return p_ta->kind == AX_TY_SLICE && unify_ty(cx, cx->thir->interner.t_u8, p_ta->slice.elem);
+    }
 
     return false;
 }
 
 static TypeId coerce(TypeckCtx *cx, TypeId ty, TypeId expected, Span span) {
     if (TypeId_is_none(expected)) return ty;
+    
+    if (ty.v && expected.v && !is_error(cx, ty) && !is_error(cx, expected)) {
+        const AxType *t_ty = ax_type_get(&cx->thir->interner, resolve_ty(cx, ty));
+        const AxType *t_exp = ax_type_get(&cx->thir->interner, resolve_ty(cx, expected));
+        if ((t_ty->kind == AX_TY_VIEW && t_exp->kind == AX_TY_VIEW) || 
+            (t_ty->kind == AX_TY_MUT_VIEW && t_exp->kind == AX_TY_MUT_VIEW)) {
+            const AxType *p_ty = ax_type_get(&cx->thir->interner, t_ty->view.pointee);
+            const AxType *p_exp = ax_type_get(&cx->thir->interner, t_exp->view.pointee);
+            if (p_ty->kind == AX_TY_ARRAY && p_exp->kind == AX_TY_SLICE) {
+                if (unify_ty(cx, p_ty->array.elem, p_exp->slice.elem)) {
+                    return expected;
+                }
+            }
+        }
+    }
+    
     if (!unify_ty(cx, ty, expected)) {
         return type_error(cx, span, AX_TYPE_MISMATCH);
     }
@@ -286,6 +310,14 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
             fields[i++] = hir_type_to_typeid(cx, e);
         }
         AxType t = { .kind = AX_TY_TUPLE, .tuple = { .field_count = count, .fields = fields } };
+        return ax_intern_type(&cx->thir->interner, &t);
+    }
+    if (ht->kind == AX_HIR_TYPE_SLICE) {
+        TypeId elem = hir_type_to_typeid(cx, ht->slice.elem);
+        AxType t;
+        memset(&t, 0, sizeof(t));
+        t.kind = AX_TY_SLICE;
+        t.slice.elem = elem;
         return ax_intern_type(&cx->thir->interner, &t);
     }
     if (ht->kind == AX_HIR_TYPE_VIEW) {
@@ -1220,7 +1252,8 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
         TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
         if (!is_error(cx, arg_ty)) {
             const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
-            if (t->kind != AX_TY_ARRAY && t->kind != AX_TY_STR) {
+            bool is_slice_view = (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&cx->thir->interner, t->view.pointee)->kind == AX_TY_SLICE;
+            if (t->kind != AX_TY_ARRAY && t->kind != AX_TY_STR && !is_slice_view) {
                 type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH); // Or maybe custom error
                 return cx->thir->interner.t_error;
             }
@@ -1233,8 +1266,7 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
         if (argc != 1) return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
         TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
         if (!is_error(cx, arg_ty)) {
-            const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
-            if (t->kind != AX_TY_STR) {
+            if (!TypeId_eq(arg_ty, cx->thir->interner.t_str)) {
                 type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH);
                 return cx->thir->interner.t_error;
             }
@@ -1857,13 +1889,41 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         }
         case AX_HIR_EXPR_INDEX: {
             TypeId base_ty = resolve_ty(cx, check_expr(cx, expr->index.base, TypeId_none()));
-            TypeId idx_ty = check_expr(cx, expr->index.arg, in->t_usize);
-            if (is_error(cx, base_ty) || is_error(cx, idx_ty)) return in->t_error;
+            if (is_error(cx, base_ty)) return in->t_error;
             
             const AxType *t = ax_type_get(in, base_ty);
-            if (t->kind == AX_TY_ARRAY) {
-                return t->array.elem;
+            bool is_slice = (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(in, t->view.pointee)->kind == AX_TY_SLICE;
+            bool is_array = t->kind == AX_TY_ARRAY;
+            bool is_str = t->kind == AX_TY_STR;
+            
+            if (expr->index.arg->kind == AX_HIR_EXPR_RANGE) {
+                if (!is_slice && !is_array && !is_str) return type_error(cx, expr->index.base->span, AX_TYPE_CANNOT_INDEX);
+                const AxHirExpr *start = expr->index.arg->range.start;
+                const AxHirExpr *end = expr->index.arg->range.end;
+                if (start) check_expr(cx, start, in->t_usize);
+                if (end) check_expr(cx, end, in->t_usize);
+                
+                AxType v; memset(&v, 0, sizeof(v));
+                if (is_slice || is_str) {
+                    v.kind = t->kind;
+                    v.view.pointee = t->view.pointee; // For STR it doesn't matter, we can return STR
+                    if (is_str) return in->t_str;
+                } else {
+                    v.kind = AX_TY_VIEW;
+                    AxType sl; memset(&sl, 0, sizeof(sl));
+                    sl.kind = AX_TY_SLICE;
+                    sl.slice.elem = t->array.elem;
+                    v.view.pointee = ax_intern_type(&cx->thir->interner, &sl);
+                }
+                return ax_intern_type(&cx->thir->interner, &v);
             }
+            
+            TypeId idx_ty = check_expr(cx, expr->index.arg, in->t_usize);
+            if (is_error(cx, idx_ty)) return in->t_error;
+            
+            if (is_array) return t->array.elem;
+            if (is_slice) return ax_type_get(in, t->view.pointee)->slice.elem;
+            if (is_str) return in->t_u8;
             return type_error(cx, expr->index.base->span, AX_TYPE_CANNOT_INDEX);
         }
         /* case AX_HIR_EXPR_STRUCT: */
@@ -1906,19 +1966,35 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                     expected_inner = exp_t->view.pointee;
                 }
             }
-            TypeId inner_ty = check_expr(cx, expr->view.expr, expected_inner);
+            TypeId inner_ty_expected = expected_inner;
+            if (expected_inner.v && !is_error(cx, expected_inner) && ax_type_get(in, expected_inner)->kind == AX_TY_SLICE) {
+                inner_ty_expected = TypeId_none();
+            }
+            TypeId inner_ty = check_expr(cx, expr->view.expr, inner_ty_expected);
             if (is_error(cx, inner_ty)) return in->t_error;
+            
+            if (expected_inner.v && !is_error(cx, expected_inner)) {
+                const AxType *it = ax_type_get(in, inner_ty);
+                if (it->kind == AX_TY_ARRAY && ax_type_get(in, expected_inner)->kind == AX_TY_SLICE) {
+                    AxType slice; memset(&slice, 0, sizeof(slice));
+                    slice.kind = AX_TY_SLICE;
+                    slice.slice.elem = it->array.elem;
+                    inner_ty = ax_intern_type(&cx->thir->interner, &slice);
+                }
+            }
+            
             AxType t;
             memset(&t, 0, sizeof(t));
             t.kind = expr->view.is_mut ? AX_TY_MUT_VIEW : AX_TY_VIEW;
             t.view.pointee = inner_ty;
             return ax_intern_type(&cx->thir->interner, &t);
         }
+        case AX_HIR_EXPR_RANGE:
+            return type_error(cx, expr->span, AX_TYPE_MISMATCH); // Or AX_TYPE_UNSUPPORTED
         case AX_HIR_EXPR_FOR:
         case AX_HIR_EXPR_UNSAFE:
         case AX_HIR_EXPR_COMPTIME:
         case AX_HIR_EXPR_CLOSURE:
-        case AX_HIR_EXPR_RANGE:
         /* case AX_HIR_EXPR_FIELD: */
         /* case AX_HIR_EXPR_TUPLE_INDEX: */
         case AX_HIR_EXPR_METHOD_CALL: {

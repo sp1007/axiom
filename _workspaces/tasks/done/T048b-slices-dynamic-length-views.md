@@ -8,14 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T125]
 priority: 68
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/slice, tests/ui/slice]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/lir, tests/run/slice, tests/ui/slice]
 locks: [bootstrap/axiom0/src/diag/codes/CAP.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/SPEC-11-capability.md, 0177, 0021, 0028, tasks/0395, tasks/0326, 0087]
 covers: []
-started: 2026-10-10 22:45:58
+started: 2026-10-10 23:09:54
 unblocks: 1
+finished: 2026-10-11 00:20:51
 ---
 # T048b — Slices: dynamic-length views
 
@@ -46,3 +47,5 @@ Dynamic-length views over arrays — the type every buffer, string and collectio
 - 2026-10-10 22:45:58 started (attempt 1) T048b-impl
 - 2026-10-10 22:58:16 block: Sub-range views (s[a..b]) require introducing a new MIR projection kind and symbolic reasoning for disjoint ranges, which is too extensive for a single step.
 - 2026-10-10 23:01:37 unblocked (cycle 1) 
+- 2026-10-10 23:09:54 started (attempt 1) T048b-impl
+- 2026-10-11 00:20:51 accepted by QA -> done

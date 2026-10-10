@@ -87,7 +87,13 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
             case AX_MIR_PROJ_DEREF: {
                 addr = emit_load(b, addr, b->interner->t_usize);
                 const AxType *t = ax_type_get(b->interner, ty);
-                if (t && t->kind == AX_TY_PTR) ty = t->ptr.pointee;
+                if (t && t->kind == AX_TY_PTR) {
+                    ty = t->ptr.pointee;
+                } else if (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW)) {
+                    ty = t->view.pointee;
+                } else if (t && t->kind == AX_TY_STR) {
+                    ty = b->interner->t_u8;
+                }
                 break;
             }
             case AX_MIR_PROJ_FIELD: {
@@ -114,6 +120,8 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 const AxType *t = ax_type_get(b->interner, ty);
                 TypeId elem_ty = {0};
                 if (t && t->kind == AX_TY_ARRAY) elem_ty = t->array.elem;
+                else if (t && t->kind == AX_TY_SLICE) elem_ty = t->slice.elem;
+                else if (t && t->kind == AX_TY_STR) elem_ty = b->interner->t_u8;
                 AxLirStackSlotId idx_slot = { place->projs[i].index_local.v };
                 AxLirVRegId idx_addr = emit_stack_addr(b, idx_slot);
                 AxLirVRegId idx_val = emit_load(b, idx_addr, b->interner->t_usize);

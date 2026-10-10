@@ -170,6 +170,10 @@ static void visit_bb(CapState *state, size_t local_count, const AxMirBb *bb, AxD
     AxLocation loc = term->location;
     if (term->kind == AX_MIR_TERM_DROP) {
         check_invalidate(state, local_count, &term->drop.place, loc, sink, report);
+    } else if (term->kind == AX_MIR_TERM_CALL) {
+        for (size_t i = 0; i < term->call.arg_count; i++) {
+            visit_operand(state, local_count, &term->call.args[i], loc, sink, report);
+        }
     }
 }
 

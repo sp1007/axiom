@@ -25,6 +25,7 @@ typedef enum AxTypeKind {
     AX_TY_USIZE,
     AX_TY_FN,
     AX_TY_STR,
+    AX_TY_SLICE,
     AX_TY_INT_VAR
 } AxTypeKind;
 
@@ -59,6 +60,9 @@ typedef struct AxType {
         struct {
             TypeId pointee;
         } view;
+        struct {
+            TypeId elem;
+        } slice;
         struct {
             TypeId elem;
             uint64_t len;
@@ -102,6 +106,8 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         h = ax_hash_combine(h, ax_hash_u32(k->ptr.is_mut));
     } else if (k->kind == AX_TY_VIEW || k->kind == AX_TY_MUT_VIEW) {
         h = ax_hash_combine(h, ax_hash_u32(k->view.pointee.v));
+    } else if (k->kind == AX_TY_SLICE) {
+        h = ax_hash_combine(h, ax_hash_u32(k->slice.elem.v));
     } else if (k->kind == AX_TY_ARRAY) {
         h = ax_hash_combine(h, ax_hash_u32(k->array.elem.v));
         h = ax_hash_combine(h, ax_hash_u64(k->array.len));
@@ -135,6 +141,8 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
         return a->ptr.pointee.v == b->ptr.pointee.v && a->ptr.is_mut == b->ptr.is_mut;
     } else if (a->kind == AX_TY_VIEW || a->kind == AX_TY_MUT_VIEW) {
         return a->view.pointee.v == b->view.pointee.v;
+    } else if (a->kind == AX_TY_SLICE) {
+        return a->slice.elem.v == b->slice.elem.v;
     } else if (a->kind == AX_TY_ARRAY) {
         return a->array.elem.v == b->array.elem.v && a->array.len == b->array.len;
     } else if (a->kind == AX_TY_TUPLE) {
