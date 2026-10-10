@@ -90,8 +90,8 @@ static SourceFile *create_file(SourceDatabase *db, StrView canonical_path, StrVi
     return psf;
 }
 
-FileId ax_source_db_load(SourceDatabase *db, StrView canonical_path) {
-    FileId *existing = AxPathMap_get(&db->path_map, canonical_path);
+FileId ax_source_db_load_as(SourceDatabase *db, StrView disk_path, StrView display_path) {
+    FileId *existing = AxPathMap_get(&db->path_map, display_path);
     if (existing) {
         return *existing;
     }
@@ -99,7 +99,7 @@ FileId ax_source_db_load(SourceDatabase *db, StrView canonical_path) {
     /* Need to NUL-terminate path for fopen */
     StrBuf path_buf;
     ax_sb_init(&path_buf);
-    ax_sb_push(&path_buf, canonical_path);
+    ax_sb_push(&path_buf, disk_path);
     
     FILE *f = fopen(path_buf.ptr, "rb");
     ax_sb_free(&path_buf);
@@ -125,9 +125,13 @@ FileId ax_source_db_load(SourceDatabase *db, StrView canonical_path) {
     }
     buf[size] = '\0';
     
-    StrView interned_path = ax_sv_dup(&db->arena, canonical_path);
+    StrView interned_path = ax_sv_dup(&db->arena, display_path);
     SourceFile *sf = create_file(db, interned_path, ax_sv(buf, (size_t)size), buf);
     return sf->id;
+}
+
+FileId ax_source_db_load(SourceDatabase *db, StrView canonical_path) {
+    return ax_source_db_load_as(db, canonical_path, canonical_path);
 }
 
 FileId ax_source_db_add_virtual(SourceDatabase *db, StrView identity, StrView text) {

@@ -18,6 +18,7 @@ typedef struct DumpState {
     StrInterner *interner;
     const AxResolveMap *map;
     int indent;
+    FileId filter_file;
 } DumpState;
 
 
@@ -300,6 +301,10 @@ static void d_stmt(DumpState *st, const AxAstStmt *n) {
 
 static void d_item(DumpState *st, const AxAstItem *n) {
     while (n) {
+        if (st->filter_file.v != 0 && n->span.file.v != 0 && n->span.file.v != st->filter_file.v) {
+            n = n->next;
+            continue;
+        }
         d_nl(st);
         switch (n->kind) {
             case AX_ITEM_ERROR: d_list_begin(st, "ItemError"); d_resolved(st, n); break;
@@ -350,7 +355,7 @@ static int run_emit_resolved(const AxIo *io, int argc, char **argv) {
     
     int rc = ax_pipeline_run(&st, AX_STAGE_RESOLVE);
 
-    DumpState dst = { io->out, &st.interner, &st.resolve_map, 0 };
+    DumpState dst = { io->out, &st.interner, &st.resolve_map, 0, st.file };
     d_item(&dst, st.parse_res.ast.items);
     fputs("\n", dst.out);
 

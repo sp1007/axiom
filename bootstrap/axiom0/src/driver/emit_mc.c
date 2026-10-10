@@ -163,6 +163,9 @@ static int run_emit_mc(const AxIo *io, int argc, char **argv) {
     }
     
     for (const AxHirItem *item = st.hir.items; item != NULL; item = item->next) {
+        if (st.file.v != 0 && item->span.file.v != 0 && item->span.file.v != st.file.v) {
+            continue;
+        }
         if (item->kind == AX_HIR_ITEM_FN) {
             AxMirBody *mir_body = ax_mir_build(item, &st.thir, &st.hir_arena);
             if (mir_body) {

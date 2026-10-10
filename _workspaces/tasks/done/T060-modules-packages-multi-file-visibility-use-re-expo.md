@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T044]
 priority: 66
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/source, bootstrap/axiom0/src/driver, bootstrap/axiom0/src/hir, bootstrap/axiom0/src/types, tests/modules, tests/ui/modules, std/core/prelude.ax, std/README.md]
 locks: [bootstrap/axiom0/src/diag/codes/NAME.def, bootstrap/axiom0/src/diag/codes/DRIVER.def]
 spec: [0103, 0108, tasks/0357, tasks/0306, 0141, 0168, 0047]
 started: 2026-10-10 13:54:31
-agent: T060-impl
+finished: 2026-10-10 15:36:35
 ---
 # T060 — Modules & packages: multi-file, visibility, use, re-exports, prelude module
 
@@ -46,3 +46,4 @@ Real module system with dotted paths.
 
 ## Log
 - 2026-10-10 13:54:31 started (attempt 1) T060-impl
+- 2026-10-10 15:36:35 accepted by QA -> done

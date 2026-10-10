@@ -21,6 +21,7 @@ typedef struct DumpState {
     StrInterner *interner;
     int indent;
     const AxThir *thir;
+    FileId filter_file;
 } DumpState;
 
 
@@ -329,6 +330,10 @@ static void d_stmt(DumpState *st, const AxHirStmt *n) {
 
 static void d_item(DumpState *st, const AxHirItem *n) {
     while (n) {
+        if (st->filter_file.v != 0 && n->span.file.v != 0 && n->span.file.v != st->filter_file.v) {
+            n = n->next;
+            continue;
+        }
         d_nl(st);
         switch (n->kind) {
             case AX_HIR_ITEM_ERROR: d_list_begin(st, "ItemError"); break;
@@ -380,7 +385,7 @@ static int run_emit_thir(const AxIo *io, int argc, char **argv) {
     int rc = ax_pipeline_run(&st, AX_STAGE_TYPECK);
     if (rc != 0) { ax_pipeline_free(&st); free(pos_argv); return rc; }
 
-    DumpState dst = { io->out, &st.interner, 0, &st.thir };
+    DumpState dst = { io->out, &st.interner, 0, &st.thir, st.file };
     d_item(&dst, st.hir.items);
     fputs("\n", dst.out);
 

@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T046]
+depends: [T121]
 priority: 67
 status: todo
 attempts: 0

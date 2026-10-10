@@ -76,7 +76,18 @@ typedef struct TypeckCtx {
     LoopEnv *loops;
     size_t loops_len;
     size_t loops_cap;
+
+    const AxHirItem *current_fn;
 } TypeckCtx;
+
+static bool dotted_name_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
+    if (!a || !b) return true;
+    if (a->count != b->count) return false;
+    for (size_t i = 0; i < a->count; i++) {
+        if (a->segments[i].v != b->segments[i].v) return false;
+    }
+    return true;
+}
 
 static TypeId type_error(TypeckCtx *cx, Span span, AxDiagCode code) {
     AxDiagnostic d = {0};
@@ -538,38 +549,9 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     cx.return_type = thir.interner.t_unit;
     cx.in_loop = false;
 
-    // Pass 1: Global types (each signature type is converted, and so diagnosed, once)
+    // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_FN) {
-            TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
-            if (TypeId_is_none(ret_ty)) {
-                ret_ty = thir.interner.t_unit;
-            }
-
-            AxType ft;
-            memset(&ft, 0, sizeof(ft));
-            ft.kind = AX_TY_FN;
-            ft.fn.is_unsafe = it->fn.is_unsafe;
-            ft.fn.abi = it->fn.abi;
-            ft.fn.ret_type = ret_ty;
-
-            size_t count = 0;
-            for (const AxHirParam *p = it->fn.params; p; p = p->next) count++;
-            ft.fn.param_count = count;
-            if (count > 0) {
-                ft.fn.param_types = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
-                size_t i = 0;
-                for (const AxHirParam *p = it->fn.params; p; p = p->next) {
-                    TypeId pty = hir_type_to_typeid(&cx, p->type);
-                    ft.fn.param_types[i++] = pty;
-                }
-            } else {
-                ft.fn.param_types = NULL;
-            }
-
-            TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
-            AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
-        } else if (it->kind == AX_HIR_ITEM_STRUCT) {
+        if (it->kind == AX_HIR_ITEM_STRUCT) {
             AxType st;
             memset(&st, 0, sizeof(st));
             st.kind = AX_TY_STRUCT;
@@ -650,12 +632,47 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
         }
     }
 
+    // Pass 1b: Function signatures
+    for (const AxHirItem *it = hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_FN) {
+            TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
+            if (TypeId_is_none(ret_ty)) {
+                ret_ty = thir.interner.t_unit;
+            }
+
+            AxType ft;
+            memset(&ft, 0, sizeof(ft));
+            ft.kind = AX_TY_FN;
+            ft.fn.is_unsafe = it->fn.is_unsafe;
+            ft.fn.abi = it->fn.abi;
+            ft.fn.ret_type = ret_ty;
+
+            size_t count = 0;
+            for (const AxHirParam *p = it->fn.params; p; p = p->next) count++;
+            ft.fn.param_count = count;
+            if (count > 0) {
+                ft.fn.param_types = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
+                size_t i = 0;
+                for (const AxHirParam *p = it->fn.params; p; p = p->next) {
+                    TypeId pty = hir_type_to_typeid(&cx, p->type);
+                    ft.fn.param_types[i++] = pty;
+                }
+            } else {
+                ft.fn.param_types = NULL;
+            }
+
+            TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
+            AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
+        }
+    }
+
     // AXS-SEM-080 is a type rule: `check` reports it (only MAIN_MISSING is build/run-only).
     check_main_signature(&cx);
 
     // Pass 2: Typecheck bodies
     for (const AxHirItem *it = hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
+            cx.current_fn = it;
             TypeId *fn_ty_ptr = AxItemTypeMap_get(&thir.item_types, it);
             if (!fn_ty_ptr) AX_ICE("typeck: fn item without a signature type");
             const AxType *fn_ty = ax_type_get(&thir.interner, *fn_ty_ptr);
@@ -919,6 +936,13 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
     if (path->symbol.v != 0) {
         TypeId *t = AxSymbolTypeMap_get(&cx->thir->symbol_types, path->symbol);
         if (t) return *t;
+
+        for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == path->symbol.v) {
+                TypeId *it_t = AxItemTypeMap_get(&cx->thir->item_types, it);
+                if (it_t) return *it_t;
+            }
+        }
         
         StrView name = ax_source_db_span_text(cx->db, path->span);
         if (ax_sv_eq_cstr(name, "len")) {
@@ -1430,6 +1454,25 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         StrView fname = ax_interner_get(cx->str_in, f->name);
                         if (ax_sv_eq(fname, iname)) {
                             found = true;
+                            if (f->vis.kind == AX_HIR_VIS_PRIVATE || f->vis.kind == AX_HIR_VIS_PUB_MODULE) {
+                                if (cx->current_fn && t->strct.def) {
+                                    if (!dotted_name_eq(&cx->current_fn->module_path, &t->strct.def->module_path)) {
+                                        type_error(cx, init->span, AX_NAME_PRIVATE);
+                                    }
+                                }
+                            } else if (f->vis.kind == AX_HIR_VIS_PUB_PACKAGE) {
+                                if (cx->current_fn && t->strct.def) {
+                                    bool diff = false;
+                                    if (cx->current_fn->module_path.count == 0 || t->strct.def->module_path.count == 0) {
+                                        diff = (cx->current_fn->module_path.count != t->strct.def->module_path.count);
+                                    } else if (cx->current_fn->module_path.segments[0].v != t->strct.def->module_path.segments[0].v) {
+                                        diff = true;
+                                    }
+                                    if (diff) {
+                                        type_error(cx, init->span, AX_NAME_PRIVATE);
+                                    }
+                                }
+                            }
                             check_expr(cx, init->expr, t->strct.fields[idx]);
                             break;
                         }
@@ -1467,6 +1510,25 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         StrView search = ax_interner_get(cx->str_in, expr->field.name);
                         if (ax_sv_eq(fname, search)) {
                             found = true;
+                            if (f->vis.kind == AX_HIR_VIS_PRIVATE || f->vis.kind == AX_HIR_VIS_PUB_MODULE) {
+                                if (cx->current_fn && t->strct.def) {
+                                    if (!dotted_name_eq(&cx->current_fn->module_path, &t->strct.def->module_path)) {
+                                        return type_error(cx, expr->span, AX_NAME_PRIVATE);
+                                    }
+                                }
+                            } else if (f->vis.kind == AX_HIR_VIS_PUB_PACKAGE) {
+                                if (cx->current_fn && t->strct.def) {
+                                    bool diff = false;
+                                    if (cx->current_fn->module_path.count == 0 || t->strct.def->module_path.count == 0) {
+                                        diff = (cx->current_fn->module_path.count != t->strct.def->module_path.count);
+                                    } else if (cx->current_fn->module_path.segments[0].v != t->strct.def->module_path.segments[0].v) {
+                                        diff = true;
+                                    }
+                                    if (diff) {
+                                        return type_error(cx, expr->span, AX_NAME_PRIVATE);
+                                    }
+                                }
+                            }
                             return t->strct.fields[idx];
                         }
                         idx++;

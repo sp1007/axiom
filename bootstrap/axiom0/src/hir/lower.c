@@ -270,12 +270,22 @@ static AxHirExpr *lower_postfix(LowerCtx *ctx, const AxAstExpr *e) {
         next->span = seg->span;
         
         switch (seg->kind) {
-            case AX_POSTFIX_FIELD:
+            case AX_POSTFIX_FIELD: {
+                if (AxNodeMap_contains(&ctx->rmap->module_access_nodes, seg)) {
+                    AxSymbolId *sym = AxNodeMap_get(&ctx->rmap->module_access_nodes, seg);
+                    next->kind = AX_HIR_EXPR_PATH;
+                    next->path.path.span = seg->span;
+                    next->path.path.symbol = *sym;
+                    next->path.path.generic_args = lower_generic_args(ctx, seg->field.generic_args);
+                    head = next;
+                    continue;
+                }
                 next->kind = AX_HIR_EXPR_FIELD;
                 next->field.base = head;
                 next->field.name = seg->field.name;
                 next->field.generic_args = lower_generic_args(ctx, seg->field.generic_args);
                 break;
+            }
             case AX_POSTFIX_TUPLE_INDEX:
                 next->kind = AX_HIR_EXPR_TUPLE_INDEX;
                 next->tuple_index.base = head;
@@ -609,11 +619,16 @@ static AxHirUseTree *lower_use_tree(LowerCtx *ctx, const AxAstUseTree *tree) {
 static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
     AxHirItem *head = NULL;
     AxHirItem **tail = &head;
+    AxAstDottedName current_mod = {0};
     for (; n; n = n->next) {
+        if (n->kind == AX_ITEM_MODULE) {
+            current_mod = n->module.path;
+        }
         AxHirItem *hi = ax_arena_alloc(ctx->arena, sizeof(AxHirItem), 8);
         hi->span = n->span;
         hi->attrs = lower_attrs(ctx, n->attrs);
         hi->vis = lower_vis(ctx, &n->vis);
+        hi->module_path = current_mod;
         switch (n->kind) {
             case AX_ITEM_ERROR: hi->kind = AX_HIR_ITEM_ERROR; break;
             case AX_ITEM_MODULE:

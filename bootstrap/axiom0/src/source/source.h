@@ -68,6 +68,7 @@ void ax_source_db_free(SourceDatabase *db);
 /* path should be canonical. If already loaded, returns existing FileId.
  * On I/O error, returns FileId_none(). */
 FileId ax_source_db_load(SourceDatabase *db, StrView canonical_path);
+FileId ax_source_db_load_as(SourceDatabase *db, StrView disk_path, StrView display_path);
 
 /* Identity is used as the path. */
 FileId ax_source_db_add_virtual(SourceDatabase *db, StrView identity, StrView text);

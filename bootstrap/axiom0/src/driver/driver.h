@@ -26,6 +26,9 @@
 #include "kernel/str.h"
 #include "kernel/interner.h"
 #include "types/types.h"
+#include "driver/manifest.h"
+#include "driver/std_root.h"
+#include "driver/project.h"
 
 /* Process exit codes of `axiom0` (axiom-testing: exit code 3 is a CRASH for the runner). */
 enum {
@@ -97,6 +100,7 @@ extern bool ax_opt_O1;
 extern const char *ax_opt_target;
 extern const char *ax_opt_build_o;
 extern bool ax_opt_interp;
+extern const char *ax_opt_std_root;
 
 extern const AxOption ax_opts_pipeline[];
 extern const AxOption ax_opts_build[];
@@ -127,6 +131,7 @@ typedef struct AxDriverState {
     AxArena resolve_arena;
     AxArena hir_arena;
     
+    AxProject project;
     FileId file;
     StrView text;
     AxLexResult lex_res;

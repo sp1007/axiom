@@ -480,6 +480,7 @@ struct AxHirItem {
     AxHirAttr *attrs;
     AxHirVis vis;
     AxHirItem *next;
+    AxAstDottedName module_path;
     union {
         struct {
             AxAstDottedName path;

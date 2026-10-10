@@ -14,6 +14,7 @@ bool ax_opt_verify_each = false;
 const char *ax_opt_target = NULL;
 const char *ax_opt_build_o = NULL;
 bool ax_opt_interp = false;
+const char *ax_opt_std_root = NULL;
 
 const AxOption ax_opts_pipeline[] = {
     {"--color=never", AX_OPT_BOOL, &ax_opt_color_never, "disable colored diagnostics"},
@@ -23,6 +24,7 @@ const AxOption ax_opts_pipeline[] = {
     {"-O1", AX_OPT_BOOL, &ax_opt_O1, "enable optimizations"},
     {"--verify-each", AX_OPT_BOOL, &ax_opt_verify_each, "verify MIR after each pass"},
     {"--target", AX_OPT_STRING, &ax_opt_target, "target triple"},
+    {"--std-root", AX_OPT_STRING, &ax_opt_std_root, "path to std library root"},
     {NULL, 0, NULL, NULL}
 };
 
@@ -131,24 +133,144 @@ static void report_error(AxDiagSink *sink, AxDiagCode code) {
 }
 
 static void stage_source(AxDriverState *st) {
-    st->file = ax_source_db_load(&st->db, ax_sv_cstr(st->main_file));
-    if (st->file.v == 0) {
+    size_t len = strlen(st->main_file);
+    if (len > 4 && strcmp(st->main_file + len - 4, ".mir") == 0) {
+        st->file = ax_source_db_load(&st->db, ax_sv_cstr(st->main_file));
+        if (st->file.v == 0) {
+            report_error(&st->sink, AX_IO_FILE_NOT_FOUND);
+            st->failed = true;
+            return;
+        }
+        st->text = ax_source_db_text(&st->db, st->file);
+        return;
+    }
+
+    if (!ax_project_discover(st->main_file, ax_opt_std_root, &st->project, &st->sink)) {
+        st->failed = true;
+        return;
+    }
+
+    if (st->project.file_count == 0) {
         report_error(&st->sink, AX_IO_FILE_NOT_FOUND);
         st->failed = true;
         return;
     }
-    st->text = ax_source_db_text(&st->db, st->file);
+
+    for (size_t i = 0; i < st->project.file_count; i++) {
+        AxProjectFile *f = &st->project.files[i];
+        f->fid = ax_source_db_load_as(&st->db, ax_sv_cstr(f->disk_path), ax_sv_cstr(f->display_path));
+        if (f->fid.v == 0) {
+            report_error(&st->sink, AX_IO_FILE_NOT_FOUND);
+            st->failed = true;
+            return;
+        }
+        if (f->is_main) {
+            st->file = f->fid;
+            st->text = ax_source_db_text(&st->db, f->fid);
+        }
+    }
+
+    if (st->file.v == 0) {
+        for (size_t i = 0; i < st->project.file_count; i++) {
+            if (!st->project.files[i].is_std) {
+                st->file = st->project.files[i].fid;
+                st->text = ax_source_db_text(&st->db, st->file);
+                break;
+            }
+        }
+        if (st->file.v == 0 && st->project.file_count > 0) {
+            st->file = st->project.files[0].fid;
+            st->text = ax_source_db_text(&st->db, st->file);
+        }
+    }
 }
 
 #include "mir/mir.h"
 #include "verify/verify.h"
 
 static void stage_lex(AxDriverState *st) {
-    st->lex_res = ax_lex(st->file, st->text, &st->sink, &st->interner);
+    if (st->file.v != 0) {
+        st->lex_res = ax_lex(st->file, st->text, &st->sink, &st->interner);
+    }
 }
 
 static void stage_parse(AxDriverState *st) {
-    st->parse_res = ax_parse(&st->parse_arena, st->lex_res.tokens, st->lex_res.token_count, &st->sink, &st->interner);
+    if (st->project.file_count == 0) {
+        st->parse_res = ax_parse(&st->parse_arena, st->lex_res.tokens, st->lex_res.token_count, &st->sink, &st->interner);
+        return;
+    }
+
+    AxAstItem *first_item = NULL;
+    AxAstItem *last_item = NULL;
+
+    for (size_t i = 0; i < st->project.file_count; i++) {
+        AxProjectFile *f = &st->project.files[i];
+        FileId fid = f->fid;
+        StrView txt = ax_source_db_text(&st->db, fid);
+        if (txt.ptr == NULL) continue;
+
+        AxLexResult l;
+        bool need_free_lex = false;
+        if (fid.v == st->file.v && st->lex_res.tokens != NULL) {
+            l = st->lex_res;
+        } else {
+            l = ax_lex(fid, txt, &st->sink, &st->interner);
+            need_free_lex = true;
+        }
+
+        AxParseResult p = ax_parse(&st->parse_arena, l.tokens, l.token_count, &st->sink, &st->interner);
+        if (need_free_lex) {
+            ax_lex_result_free(&l);
+        }
+
+        /* If this is a package file without an explicit leading module declaration,
+         * synthesize an AX_ITEM_MODULE node. */
+        if (st->project.is_package && f->module_path[0] != '\0') {
+            if (p.ast.items == NULL || p.ast.items->kind != AX_ITEM_MODULE) {
+                size_t seg_count = 1;
+                for (const char *c = f->module_path; *c; c++) {
+                    if (*c == '.') seg_count++;
+                }
+
+                StrId *segs = ax_arena_alloc(&st->parse_arena, seg_count * sizeof(StrId), _Alignof(StrId));
+                char seg_buf[256];
+                const char *cur = f->module_path;
+                for (size_t s = 0; s < seg_count; s++) {
+                    const char *dot = strchr(cur, '.');
+                    size_t slen = dot ? (size_t)(dot - cur) : strlen(cur);
+                    if (slen >= sizeof(seg_buf)) slen = sizeof(seg_buf) - 1;
+                    memcpy(seg_buf, cur, slen);
+                    seg_buf[slen] = '\0';
+                    segs[s] = ax_intern_cstr(&st->interner, seg_buf);
+                    cur = dot ? dot + 1 : "";
+                }
+
+                AxAstItem *synth_mod = ax_arena_alloc(&st->parse_arena, sizeof(AxAstItem), _Alignof(AxAstItem));
+                memset(synth_mod, 0, sizeof(AxAstItem));
+                synth_mod->kind = AX_ITEM_MODULE;
+                synth_mod->vis.kind = AX_VIS_PUB;
+                synth_mod->module.path.segments = segs;
+                synth_mod->module.path.count = seg_count;
+                synth_mod->next = p.ast.items;
+                p.ast.items = synth_mod;
+            }
+        }
+
+        /* Append p.ast.items to overall item chain */
+        if (p.ast.items != NULL) {
+            if (!first_item) {
+                first_item = p.ast.items;
+                last_item = p.ast.items;
+            } else {
+                last_item->next = p.ast.items;
+            }
+            while (last_item && last_item->next) {
+                last_item = last_item->next;
+            }
+        }
+    }
+
+    st->parse_res.ast.items = first_item;
 }
 
 static void stage_resolve(AxDriverState *st) {
@@ -285,6 +407,7 @@ void ax_pipeline_free(AxDriverState *st) {
     ax_interner_free(&st->interner);
     ax_diag_sink_free(&st->sink);
     ax_source_db_free(&st->db);
+    ax_project_free(&st->project);
 }
 
 int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
