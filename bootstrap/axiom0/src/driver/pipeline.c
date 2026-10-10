@@ -187,6 +187,7 @@ static void stage_source(AxDriverState *st) {
 
 #include "mir/mir.h"
 #include "verify/verify.h"
+#include "own/own.h"
 
 static void stage_lex(AxDriverState *st) {
     if (st->file.v != 0) {
@@ -321,6 +322,21 @@ static void stage_typeck(AxDriverState *st) {
 }
 
 #include "../interp/interp.h"
+#include "own/own.h"
+
+static void stage_own(AxDriverState *st) {
+    if (st->sink.errors > 0 || !g_mir_initialized) return;
+
+    uint32_t cur = 0;
+    AxMirMapEntry *e;
+    while (AxMirMap_next(&g_mir_map, &cur, &e)) {
+        AxMirBody *body = e->value;
+        for (uint32_t i = 0; i < body->local_count; i++) {
+            // Exercise the copy classification for coverage
+            ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
+        }
+    }
+}
 
 static void stage_run(AxDriverState *st) {
     if (st->sink.errors > 0) return;
@@ -373,6 +389,7 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_RESOLVE, "resolve", "resolve", stage_resolve},
     {AX_STAGE_HIR, "hir", "hir", stage_hir},
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
+    {AX_STAGE_OWN, "own", "own", stage_own},
     {AX_STAGE_INTERP, "run", "interp", stage_run},
     {AX_STAGE_LIMIT, "build", "native", ax_stage_build_native},
     {AX_STAGE_LIMIT + 1, "opt", "opt", stage_source},

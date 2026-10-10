@@ -114,6 +114,7 @@ typedef enum AxStageId {
     AX_STAGE_RESOLVE,
     AX_STAGE_HIR,
     AX_STAGE_TYPECK,
+    AX_STAGE_OWN,
     AX_STAGE_INTERP,
     AX_STAGE_LIMIT
 } AxStageId;
