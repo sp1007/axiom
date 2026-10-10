@@ -10,6 +10,7 @@ bool ax_opt_time_passes = false;
 bool ax_opt_json = false;
 bool ax_opt_O0 = false;
 bool ax_opt_O1 = false;
+bool ax_opt_verify_each = false;
 const char *ax_opt_target = NULL;
 const char *ax_opt_build_o = NULL;
 bool ax_opt_interp = false;
@@ -20,6 +21,7 @@ const AxOption ax_opts_pipeline[] = {
     {"--json", AX_OPT_BOOL, &ax_opt_json, "emit diagnostics in JSON format"},
     {"-O0", AX_OPT_BOOL, &ax_opt_O0, "disable optimizations"},
     {"-O1", AX_OPT_BOOL, &ax_opt_O1, "enable optimizations"},
+    {"--verify-each", AX_OPT_BOOL, &ax_opt_verify_each, "verify MIR after each pass"},
     {"--target", AX_OPT_STRING, &ax_opt_target, "target triple"},
     {NULL, 0, NULL, NULL}
 };
@@ -168,6 +170,8 @@ static AxArena g_mir_arena;
 static AxMirMap g_mir_map;
 static bool g_mir_initialized = false;
 
+#include "opt/opt.h"
+
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
@@ -185,6 +189,9 @@ static void stage_typeck(AxDriverState *st) {
             AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
             if (body) {
                 ax_verify_mir(body, &st->thir, &st->sink, it);
+                if (st->sink.errors == 0 && ax_opt_O1) {
+                    ax_opt_run(body, &st->thir, &st->sink, it, ax_opt_verify_each);
+                }
                 AxMirMap_insert(&g_mir_map, it, body);
             }
         }
@@ -246,7 +253,8 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
     {AX_STAGE_INTERP, "run", "interp", stage_run},
     {AX_STAGE_LIMIT, "build", "native", ax_stage_build_native},
-    {AX_STAGE_LIMIT + 1, NULL, NULL, NULL}
+    {AX_STAGE_LIMIT + 1, "opt", "opt", stage_source},
+    {AX_STAGE_LIMIT + 2, NULL, NULL, NULL}
 };
 
 void ax_pipeline_init(AxDriverState *st, const AxIo *io) {
@@ -295,6 +303,9 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
         AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, NULL);
+            if (st->sink.errors == 0 && ax_opt_O1) {
+                ax_opt_run(body, &st->thir, &st->sink, NULL, ax_opt_verify_each);
+            }
         } else {
             report_error(&st->sink, AX_VERIFY_MIR_SYNTAX);
         }

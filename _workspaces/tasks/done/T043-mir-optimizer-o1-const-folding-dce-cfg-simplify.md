@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T041, T040]
 priority: 63
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/opt, tests/opt, tests/diff/opt]
 locks: [bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0165, 0226, 0074, 0263]
 covers: [REQ-ABI-001, REQ-ABI-002, REQ-ABI-003, REQ-ABI-004]
+started: 2026-10-10 10:56:06
+finished: 2026-10-10 11:34:26
 ---
 # T043 — MIR optimizer -O1: const folding, DCE, CFG simplify
 
@@ -38,3 +40,5 @@ First optimization ladder rung, guarded by re-verification and differential test
 
 ## Log
 - 2026-10-06 02:23:53 covers += REQ-ABI-001, REQ-ABI-002, REQ-ABI-003, REQ-ABI-004 (metadata only)
+- 2026-10-10 10:56:06 started (attempt 1) 
+- 2026-10-10 11:34:26 accepted by QA -> done

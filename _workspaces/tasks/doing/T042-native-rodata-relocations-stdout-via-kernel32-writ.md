@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T041, T040]
 priority: 62
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/link, bootstrap/axiom0/src/obj, tests/run/native_str, tests/run/str, tools/tests/console_check.py]
 spec: [0186, 0187, 0185]
 covers: [REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006]
+started: 2026-10-10 10:56:01
 ---
 # T042 — Native: rodata, relocations, stdout via kernel32 WriteFile
 
@@ -42,3 +43,4 @@ hello.exe prints `Xin chào thế giới` natively (UTF-8 end to end).
 
 ## Log
 - 2026-10-06 02:31:23 covers += REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006 (metadata only)
+- 2026-10-10 10:56:01 started (attempt 1) 
