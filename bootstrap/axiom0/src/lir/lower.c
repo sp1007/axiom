@@ -79,6 +79,7 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
     AxLirStackSlotId slot = { place->local.v };
     AxLirVRegId addr = emit_stack_addr(b, slot);
     TypeId ty = b->mir->locals[place->local.v].ty;
+    uint32_t current_variant = (uint32_t)-1;
     
     // Projections
     for (size_t i = 0; i < place->proj_count; i++) {
@@ -94,7 +95,11 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 uint32_t idx = place->projs[i].field_idx;
                 uint32_t offset = 0;
                 TypeId next_ty = {0};
-                if (t && (t->kind == AX_TY_STRUCT || t->kind == AX_TY_TUPLE)) {
+                if (t && t->kind == AX_TY_ENUM && current_variant != (uint32_t)-1) {
+                    offset = ax_type_enum_field_offset(ty, current_variant, idx, b->interner);
+                    if (idx < t->enm.variant_field_counts[current_variant]) next_ty = t->enm.variant_fields[current_variant][idx];
+                    current_variant = (uint32_t)-1;
+                } else if (t && (t->kind == AX_TY_STRUCT || t->kind == AX_TY_TUPLE)) {
                     offset = ax_type_field_offset(ty, idx, b->interner);
                     if (t->kind == AX_TY_STRUCT && idx < t->strct.field_count) next_ty = t->strct.fields[idx];
                     else if (t->kind == AX_TY_TUPLE && idx < t->tuple.field_count) next_ty = t->tuple.fields[idx];
@@ -121,6 +126,7 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 break;
             }
             case AX_MIR_PROJ_DOWNCAST: {
+                current_variant = place->projs[i].variant_idx;
                 break;
             }
         }
@@ -225,6 +231,11 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
         }
         case AX_MIR_RVALUE_CAST:
             return lower_operand(b, &rv->cast.op);
+        case AX_MIR_RVALUE_DISCRIMINANT: {
+            TypeId src_ty = {0};
+            AxLirVRegId addr = lower_place_addr(b, &rv->discriminant, &src_ty);
+            return emit_load(b, addr, b->interner->t_u32);
+        }
         case AX_MIR_RVALUE_LEN: {
             TypeId place_ty = b->mir->locals[rv->len.local.v].ty;
             for (size_t i = 0; i < rv->len.proj_count; i++) {
@@ -287,9 +298,15 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
                     AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
                     const AxType *ty = ax_type_get(b.interner, dest_ty);
+                    if (ty && ty->kind == AX_TY_ENUM) {
+                        AxLirVRegId discr_val = emit_const(&b, stmt->assign.rvalue.aggregate.variant_idx, b.interner->t_u32);
+                        emit_store(&b, addr, discr_val);
+                    }
                     for (size_t k = 0; k < stmt->assign.rvalue.aggregate.operand_count; k++) {
                         uint32_t offset = 0;
-                        if (ty && (ty->kind == AX_TY_STRUCT || ty->kind == AX_TY_TUPLE)) {
+                        if (ty && ty->kind == AX_TY_ENUM) {
+                            offset = ax_type_enum_field_offset(dest_ty, stmt->assign.rvalue.aggregate.variant_idx, k, b.interner);
+                        } else if (ty && (ty->kind == AX_TY_STRUCT || ty->kind == AX_TY_TUPLE)) {
                             offset = ax_type_field_offset(dest_ty, k, b.interner);
                         } else if (ty && ty->kind == AX_TY_ARRAY) {
                             TypeId elem_ty = ty->array.elem;

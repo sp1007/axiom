@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T039]
 priority: 61
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/str]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0089, tasks/0332, 0045, 0152]
+started: 2026-10-10 10:19:34
 ---
 # T041 — String literals, Str views, print intrinsic (oracle)
 
@@ -34,3 +35,6 @@ Static string data and output, first stdout-observable programs.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 10:19:34 started (attempt 1) 

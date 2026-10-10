@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T039, T037]
 priority: 60
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_enum, tests/run/enum, tests/run/pattern, tests/run/result]
 spec: [tasks/0268, 0183]
 covers: [REQ-ASY-001, REQ-ASY-002]
+started: 2026-10-10 10:19:29
+finished: 2026-10-10 10:27:37
 ---
 # T040 — Native catch-up: enums, match, Option/Result
 
@@ -39,3 +41,5 @@ Enum/match programs pass natively.
 
 ## Log
 - 2026-10-06 02:23:54 covers += REQ-ASY-001, REQ-ASY-002 (metadata only)
+- 2026-10-10 10:19:29 started (attempt 1) 
+- 2026-10-10 10:27:37 accepted by QA -> done
