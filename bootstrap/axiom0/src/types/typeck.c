@@ -184,6 +184,17 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
         return ok;
     }
 
+    if (ta->kind == AX_TY_ARRAY && tb->kind == AX_TY_ARRAY) {
+        return ta->array.len == tb->array.len && unify_ty(cx, ta->array.elem, tb->array.elem);
+    }
+
+    if (ta->kind == AX_TY_VIEW && tb->kind == AX_TY_VIEW) {
+        return unify_ty(cx, ta->view.pointee, tb->view.pointee);
+    }
+    if (ta->kind == AX_TY_MUT_VIEW && tb->kind == AX_TY_MUT_VIEW) {
+        return unify_ty(cx, ta->view.pointee, tb->view.pointee);
+    }
+
     return false;
 }
 
@@ -542,6 +553,41 @@ static bool is_pat_irrefutable(TypeckCtx *cx, const AxHirPat *pat, TypeId ty) {
 static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expected);
 static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
 
+
+static bool type_contains_view(const TypeckCtx *cx, TypeId id, TypeId target) {
+    if (id.v == 0) return false;
+    const AxType *ty = ax_type_get(&cx->thir->interner, id);
+    if (!ty) return false;
+    
+    if (ty->kind == AX_TY_VIEW || ty->kind == AX_TY_MUT_VIEW) {
+        if (target.v == 0) return true;
+        if (ty->view.pointee.v == target.v) return true;
+        return type_contains_view(cx, ty->view.pointee, target);
+    }
+    
+    if (ty->kind == AX_TY_ARRAY) return type_contains_view(cx, ty->array.elem, target);
+    if (ty->kind == AX_TY_TUPLE) {
+        for (size_t i = 0; i < ty->tuple.field_count; i++) {
+            if (type_contains_view(cx, ty->tuple.fields[i], target)) return true;
+        }
+    }
+    if (ty->kind == AX_TY_STRUCT) {
+        if (target.v != 0 && id.v == target.v) return false; // avoid infinite recursion on the target struct itself
+        for (size_t i = 0; i < ty->strct.field_count; i++) {
+            if (type_contains_view(cx, ty->strct.fields[i], target)) return true;
+        }
+    }
+    if (ty->kind == AX_TY_ENUM) {
+        if (target.v != 0 && id.v == target.v) return false;
+        for (size_t i = 0; i < ty->enm.variant_count; i++) {
+            for (size_t j = 0; j < ty->enm.variant_field_counts[i]; j++) {
+                if (type_contains_view(cx, ty->enm.variant_fields[i][j], target)) return true;
+            }
+        }
+    }
+    return false;
+}
+
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db) {
     AxThir thir;
     ax_thir_init(&thir);
@@ -587,6 +633,23 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             
             TypeId st_ty = ax_intern_type(&thir.interner, &st);
             AxItemTypeMap_insert(&thir.item_types, it, st_ty);
+            for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) {
+                if (f->type->kind == AX_HIR_TYPE_VIEW) {
+                    if (f->type->view.elem->kind == AX_HIR_TYPE_PATH) {
+                        StrView name = ax_source_db_span_text(cx.db, f->type->view.elem->path.path.span);
+                        StrView it_name = ax_interner_get(cx.str_in, it->struct_decl.name);
+                        if (ax_sv_eq(name, it_name)) {
+                            AxDiagnostic d = {0};
+                            d.code = AX_TYPE_STORED_VIEW_SELF_REF;
+                            d.severity = AX_DIAG_ERROR;
+                            d.message = "self-referencing stored views within the same struct are forbidden";
+                            d.primary = f->span;
+                            ax_diag_sink_report(sink, &d);
+                            break;
+                        }
+                    }
+                }
+            }
         } else if (it->kind == AX_HIR_ITEM_ENUM) {
             AxType en;
             memset(&en, 0, sizeof(en));
@@ -643,6 +706,9 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     for (const AxHirItem *it = hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_FN) {
             TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
+            if (type_contains_view(&cx, ret_ty, (TypeId){0})) {
+                AxDiagnostic d2 = {0}; d2.code = AX_TYPE_STORED_VIEW_ESCAPE; d2.severity = AX_DIAG_ERROR; d2.message = "stored view might outlive the owner of the referenced data"; d2.primary = it->fn.ret_type ? it->fn.ret_type->span : it->span; ax_diag_sink_report(sink, &d2);
+            }
             if (TypeId_is_none(ret_ty)) {
                 ret_ty = thir.interner.t_unit;
             }
@@ -985,6 +1051,7 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             if (ax_sv_eq(it_name, name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (t) return *t;
+                return cx->thir->interner.t_error; // Being computed
             }
         } else if (it->kind == AX_HIR_ITEM_ENUM) {
             StrView enum_name = name;
@@ -994,12 +1061,6 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             }
             StrView it_name = ax_interner_get(cx->str_in, it->enum_decl.name);
             if (ax_sv_eq(it_name, enum_name)) {
-                TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
-                if (t) return *t;
-            }
-        } else if (it->kind == AX_HIR_ITEM_STRUCT) {
-            StrView it_name = ax_interner_get(cx->str_in, it->struct_decl.name);
-            if (ax_sv_eq(it_name, name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (t) return *t;
             }

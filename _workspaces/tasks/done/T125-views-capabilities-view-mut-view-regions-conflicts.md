@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T124]
 priority: 68
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, tests/ui/cap, tests/run/cap]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/own/cap, bootstrap/axiom0/src/types, bootstrap/axiom0/src/own/own.c, bootstrap/axiom0/src/mir/build/builder.c, bootstrap/axiom0/src/resolve/resolve.c, tests/ui/cap, tests/run/cap]
 locks: [bootstrap/axiom0/src/diag/codes/CAP.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/SPEC-11-capability.md, 0177, 0021, 0028, tasks/0395]
+started: 2026-10-10 19:53:01
+finished: 2026-10-10 22:45:17
 ---
 # T125 — Views & capabilities: view/mut_view, regions, conflicts, escapes
 
@@ -34,3 +36,7 @@ Capability semantics that make views safe without a borrow checker clone.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 19:53:01 started (attempt 1) T125-impl
+- 2026-10-10 22:45:17 accepted by QA -> done

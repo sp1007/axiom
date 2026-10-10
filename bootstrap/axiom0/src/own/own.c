@@ -212,8 +212,8 @@ static void check_use(Visitor *v, const AxMirPlace *place, AxLocation loc) {
     if (st != AX_OWN_OWNED && v->report) {
         AxDiagnostic *d = ax_arena_alloc(&v->sink->arena, sizeof(AxDiagnostic), _Alignof(AxDiagnostic));
         memset(d, 0, sizeof(*d));
-        
         bool is_uninit = (st == AX_OWN_UNINIT) || (st == AX_OWN_PARTIAL && v->state[node].move_loc.file.v == 0);
+        if (v->sink->errors > 0) return;
         d->code = is_uninit ? AX_INIT_USE_UNINIT : AX_MOVE_USE_AFTER_MOVE;
         d->severity = AX_DIAG_ERROR;
         d->message = ax_diag_code_default_message(d->code);
@@ -348,7 +348,10 @@ static void visit_bb(Visitor *v, const AxMirBb *bb) {
     }
 }
 
+#include "own/cap/cap.h"
+
 void ax_own_check(const AxHirItem *it, AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const StrInterner *str_in) {
+    ax_own_cap_check(body, sink);
     PathCtx ctx = {0};
     ctx.cap = body->local_count * 2;
     ctx.nodes = malloc(ctx.cap * sizeof(PathNode));

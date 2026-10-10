@@ -1542,6 +1542,16 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         } else {
             AX_ICE("Unhandled jump kind in MIR builder");
         }
+    } else if (expr->kind == AX_HIR_EXPR_VIEW) {
+        AxMirPlace p = build_place(b, expr->view.expr);
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.location = expr->span;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_REF;
+        stmt.assign.rvalue.ref.bk = expr->view.is_mut ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
+        stmt.assign.rvalue.ref.place = p;
+        push_stmt(b, b->current_bb, stmt);
     } else {
         AX_ICE("Unhandled HIR expr kind in MIR builder: %d", expr->kind);
     }
