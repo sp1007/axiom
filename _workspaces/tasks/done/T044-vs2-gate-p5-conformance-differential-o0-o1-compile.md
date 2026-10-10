@@ -8,10 +8,13 @@ model: opus
 gate_model: opus
 depends: [T042, T043]
 priority: 64
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p5, tools/ci.sh, tools/perf.py, tests/perf]
 spec: [0114, 0022, 0263, 0152]
+started: 2026-10-10 13:24:23
+unblocks: 1
+finished: 2026-10-10 13:47:22
 ---
 # T044 — P5 gate: language core conformance + differential -O0/-O1 + compiler perf baseline
 
@@ -36,3 +39,12 @@ Lock in the language-core milestone.
 - Named "P5 gate" (not VS2): in the ladder 0263 §51, VERTICAL SLICE #2 is self-hosting (T087). Name map in SPEC-00 (T003).
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 12:54:13 started (attempt 1) 
+- 2026-10-10 13:03:30 block: Native stdout empty, signed comp fail
+- 2026-10-10 13:20:49 unblocked (cycle 1) 
+- 2026-10-10 13:23:03 started (attempt 1) 
+- 2026-10-10 13:23:50 requeue:  (not charged: attempt refunded)
+- 2026-10-10 13:24:23 started (attempt 1) T044-impl
+- 2026-10-10 13:47:22 accepted by QA -> done

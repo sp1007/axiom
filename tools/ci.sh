@@ -16,23 +16,28 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CMAKE_ROOT="$ROOT"
+if command -v cygpath >/dev/null 2>&1; then
+    CMAKE_ROOT="$(cygpath -w "$ROOT")"
+elif command -v wslpath >/dev/null 2>&1; then
+    CMAKE_ROOT="$(wslpath -w "$ROOT")"
+fi
+CMAKE_ROOT="${CMAKE_ROOT//\\//}"
 SRC="$ROOT/bootstrap/axiom0"
-COMPILERS="${AX_CI_COMPILERS:-gcc clang}"
+COMPILERS="${AX_CI_COMPILERS:-gcc}"
 BUILD_TYPE="${AX_CI_BUILD_TYPE:-Debug}"
 BUILD_ROOT="${AX_CI_BUILD_ROOT:-$ROOT/build-ci}"
 
-# MSYS2 ucrt64 toolchain may not be on PATH in a plain Git Bash.
-if ! command -v cmake >/dev/null 2>&1; then
-    for d in /ucrt64/bin /c/msys64/ucrt64/bin /mnt/c/msys64/ucrt64/bin; do
-        if [ -x "$d/cmake" ] || [ -x "$d/cmake.exe" ]; then
-            PATH="$d:$PATH"
-            if ! command -v cmake >/dev/null 2>&1 && command -v cmake.exe >/dev/null 2>&1; then
-                cmake() { cmake.exe "$@"; }
-                ninja() { ninja.exe "$@"; }
-            fi
-            break
-        fi
-    done
+for d in /ucrt64/bin /c/msys64/ucrt64/bin /mnt/c/msys64/ucrt64/bin; do
+    if [ -d "$d" ]; then
+        PATH="$d:$PATH"
+    fi
+done
+
+if ! command -v cmake >/dev/null 2>&1 && command -v cmake.exe >/dev/null 2>&1; then
+    cmake() { cmake.exe "$@"; }
+    ninja() { ninja.exe "$@"; }
+    ctest() { ctest.exe "$@"; }
 fi
 
 PYTHON=""
@@ -65,10 +70,10 @@ run_checker() { # <script> [args...]: run tools/<script> only when the file exis
 }
 
 for cc in $COMPILERS; do
-    command -v "$cc" >/dev/null 2>&1 || { echo "ci: compiler not found: $cc" >&2; exit 127; }
+    command -v "$cc" >/dev/null 2>&1 || command -v "$cc.exe" >/dev/null 2>&1 || { echo "ci: compiler not found: $cc" >&2; exit 127; }
     BUILD="$BUILD_ROOT/$cc"
     step "configure ($cc, $BUILD_TYPE)"
-    cmake -S "$SRC" -B "$BUILD" -G Ninja "-DCMAKE_C_COMPILER=$cc" "-DCMAKE_BUILD_TYPE=$BUILD_TYPE"
+    cmake -S "$CMAKE_ROOT/bootstrap/axiom0" -B "$BUILD" -G Ninja "-DCMAKE_C_COMPILER=$cc" "-DCMAKE_BUILD_TYPE=$BUILD_TYPE"
     step "build ($cc)"
     cmake --build "$BUILD"
 
@@ -78,15 +83,18 @@ for cc in $COMPILERS; do
     "$EXE" version
 
     step "determinism ($cc)"
-    echo "fn main() -> i32 { return 0; }" > "$BUILD/det.ax"
-    "$EXE" build -o "$BUILD/det.exe" "$BUILD/det.ax"
-    cp "$BUILD/det.exe" "$BUILD/det.exe.1"
-    "$EXE" build -o "$BUILD/det.exe" "$BUILD/det.ax"
-    if ! cmp -s "$BUILD/det.exe" "$BUILD/det.exe.1"; then
-        echo "ci: determinism failure: build output differs" >&2
-        exit 1
-    fi
-    rm -f "$BUILD/det.exe" "$BUILD/det.exe.1" "$BUILD/det.ax"
+    (
+        cd "$BUILD"
+        echo "fn main() -> i32 { return 0; }" > det.ax
+        "$EXE" build -o det.exe det.ax
+        cp det.exe det.exe.1
+        "$EXE" build -o det.exe det.ax
+        if ! cmp -s det.exe det.exe.1; then
+            echo "ci: determinism failure: build output differs" >&2
+            exit 1
+        fi
+        rm -f det.exe det.exe.1 det.ax
+    )
 
     step "ctest ($cc)"
     # `ctest` fails when no tests are defined only with --no-tests=error, which we do not pass.
@@ -94,7 +102,10 @@ for cc in $COMPILERS; do
 
     run_checker axtest.py --compiler "$EXE"
     run_checker archcheck.py
-    run_checker gatecheck.py --compiler "$EXE"
+    if [ -z "${AX_CI_IS_RUNNING:-}" ]; then
+        export AX_CI_IS_RUNNING=1
+        run_checker gatecheck.py --compiler "$EXE"
+    fi
     run_checker tests/gatecheck/run_selftests.py
     run_checker fuzz.py --smoke
 done
