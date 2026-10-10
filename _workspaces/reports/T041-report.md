@@ -1,0 +1,31 @@
+## Files changed
+- _workspaces/tasks/doing/T041-string-literals-str-views-print-intrinsic-oracle.md
+- _workspaces/reports/T041-report.md
+- _workspaces/reports/T041-qa.md
+- bootstrap/axiom0/src/driver/emit_thir.c
+- bootstrap/axiom0/src/driver/pipeline.c
+- bootstrap/axiom0/src/interp/interp.c
+- bootstrap/axiom0/src/interp/interp.h
+- bootstrap/axiom0/src/mir/build/builder.c
+- bootstrap/axiom0/src/mir/mir.h
+- bootstrap/axiom0/src/mir/print.c
+- bootstrap/axiom0/src/resolve/resolve.c
+- bootstrap/axiom0/src/types/interner.c
+- bootstrap/axiom0/src/types/layout/layout.c
+- bootstrap/axiom0/src/types/typeck.c
+- bootstrap/axiom0/src/types/types.h
+- tests/hir/basic.hir
+- tests/hir/control.hir
+- tests/hir/exprs.hir
+- tests/mir/build/calls.mir
+- tests/mir/build/qa_eval_order.mir
+- tests/resolve/R01_basic.resolved
+- tests/resolve/enum_variant.resolved
+- tests/resolve/more.resolved
+- tests/resolve/qa_patterns.resolved
+- tests/resolve/simple.resolved
+- tests/run/str/hello.ax
+- tests/run/str/qa_hello_empty.ax
+- tests/typeck/basic.thir
+- tests/ui/typeck/qa_expr_unsupported.ax
+STATUS: COMPLETE round=1

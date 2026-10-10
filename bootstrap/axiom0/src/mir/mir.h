@@ -83,9 +83,21 @@ typedef enum AxMirOperandKind {
     AX_MIR_OP_CONST,
 } AxMirOperandKind;
 
+typedef enum AxMirConstKind {
+    AX_MIR_CONST_INT,
+    AX_MIR_CONST_STR,
+} AxMirConstKind;
+
 typedef struct AxMirConst {
     TypeId ty;
-    uint64_t val; 
+    AxMirConstKind kind;
+    union {
+        uint64_t val; 
+        struct {
+            const uint8_t *bytes;
+            size_t len;
+        } str;
+    };
 } AxMirConst;
 
 typedef struct AxMirOperand {

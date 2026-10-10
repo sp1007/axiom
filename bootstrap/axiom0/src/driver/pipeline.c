@@ -231,7 +231,7 @@ static void stage_run(AxDriverState *st) {
     int call_depth_limit = atoi(ax_opt_max_call_depth);
     
     extern const char *ax_run_panic_msg;
-    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit, g_mir_initialized ? &g_mir_map : NULL, &ax_run_panic_msg);
+    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit, g_mir_initialized ? &g_mir_map : NULL, &ax_run_panic_msg, st->io->out);
     st->exit_code = rc;
 }
 

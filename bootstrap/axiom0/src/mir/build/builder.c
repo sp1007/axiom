@@ -209,6 +209,7 @@ static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace pl
             AxMirOperand const_op = {0};
             const_op.kind = AX_MIR_OP_CONST;
             const_op.constant.ty = get_pat_type(b, pat);
+            const_op.constant.kind = AX_MIR_CONST_INT;
             if (pat->literal.tok.kind == AX_TOK_KW_TRUE) const_op.constant.val = 1;
             else if (pat->literal.tok.kind == AX_TOK_KW_FALSE) const_op.constant.val = 0;
             else if (pat->literal.tok.kind == AX_TOK_INT || pat->literal.tok.kind == AX_TOK_CHAR) {
@@ -549,7 +550,7 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
             push_stmt(b, b->current_bb, cast_stmt);
             
             cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_idx_place };
-            cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .val = len, .ty = b->thir->interner.t_usize } };
+            cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .ty = b->thir->interner.t_usize, .kind = AX_MIR_CONST_INT, .val = len } };
             push_stmt(b, b->current_bb, cmp_stmt);
             
             AxMirTerminator assert_term = {0};
@@ -583,8 +584,13 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
     if (expr->kind == AX_HIR_EXPR_LITERAL) {
         op.kind = AX_MIR_OP_CONST;
         op.constant.ty = get_expr_type(b, expr);
+        op.constant.kind = AX_MIR_CONST_INT;
         if (expr->literal.kind == AX_TOK_INT || expr->literal.kind == AX_TOK_CHAR) {
             op.constant.val = expr->literal.val.int_val.value;
+        } else if (expr->literal.kind == AX_TOK_STR || expr->literal.kind == AX_TOK_BYTE_STR) {
+            op.constant.kind = AX_MIR_CONST_STR;
+            op.constant.str.bytes = expr->literal.val.str_val.bytes;
+            op.constant.str.len = expr->literal.val.str_val.len;
         } else if (expr->literal.kind == AX_TOK_KW_TRUE) {
             op.constant.val = 1;
         } else if (expr->literal.kind == AX_TOK_KW_FALSE) {
@@ -607,6 +613,7 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
         if (!found) {
             op.kind = AX_MIR_OP_CONST;
             op.constant.ty = get_expr_type(b, expr);
+            op.constant.kind = AX_MIR_CONST_INT;
             op.constant.val = sym.v;
             return op;
         } else {
@@ -1011,6 +1018,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             AxMirOperand zero_op = {0};
             zero_op.kind = AX_MIR_OP_CONST;
             zero_op.constant.ty = get_expr_type(b, expr->unary.expr);
+            zero_op.constant.kind = AX_MIR_CONST_INT;
             zero_op.constant.val = 0;
             
             AxMirLocalId overflow_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
@@ -1393,7 +1401,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             le_max_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
             le_max_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LE;
             le_max_stmt.assign.rvalue.binary_op.lhs = op;
-            AxMirOperand max_char = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0x10FFFF } } };
+            AxMirOperand max_char = { .kind = AX_MIR_OP_CONST, .region = AX_MIR_REGION_UNKNOWN, .view = AX_MIR_VIEW_UNKNOWN, .constant = { .ty = b->thir->interner.t_u32, .kind = AX_MIR_CONST_INT, .val = 0x10FFFF } };
             le_max_stmt.assign.rvalue.binary_op.rhs = max_char;
             push_stmt(b, b->current_bb, le_max_stmt);
 
@@ -1419,7 +1427,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             lt_d800_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
             lt_d800_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LT;
             lt_d800_stmt.assign.rvalue.binary_op.lhs = op;
-            AxMirOperand c_d800 = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0xD800 } } };
+            AxMirOperand c_d800 = { .kind = AX_MIR_OP_CONST, .region = AX_MIR_REGION_UNKNOWN, .view = AX_MIR_VIEW_UNKNOWN, .constant = { .ty = b->thir->interner.t_u32, .kind = AX_MIR_CONST_INT, .val = 0xD800 } };
             lt_d800_stmt.assign.rvalue.binary_op.rhs = c_d800;
             push_stmt(b, b->current_bb, lt_d800_stmt);
 
@@ -1432,7 +1440,7 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             gt_dfff_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
             gt_dfff_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_GT;
             gt_dfff_stmt.assign.rvalue.binary_op.lhs = op;
-            AxMirOperand c_dfff = { AX_MIR_OP_CONST, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0, { .constant = { b->thir->interner.t_u32, 0xDFFF } } };
+            AxMirOperand c_dfff = { .kind = AX_MIR_OP_CONST, .region = AX_MIR_REGION_UNKNOWN, .view = AX_MIR_VIEW_UNKNOWN, .constant = { .ty = b->thir->interner.t_u32, .kind = AX_MIR_CONST_INT, .val = 0xDFFF } };
             gt_dfff_stmt.assign.rvalue.binary_op.rhs = c_dfff;
             push_stmt(b, b->current_bb, gt_dfff_stmt);
 

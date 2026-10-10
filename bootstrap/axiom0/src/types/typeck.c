@@ -210,6 +210,7 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         if (ax_sv_eq_cstr(name, "usize")) return cx->thir->interner.t_usize;
         if (ax_sv_eq_cstr(name, "bool")) return cx->thir->interner.t_bool;
         if (ax_sv_eq_cstr(name, "char")) return cx->thir->interner.t_char;
+        if (ax_sv_eq_cstr(name, "Str")) return cx->thir->interner.t_str;
         if (ax_sv_eq_cstr(name, "never")) return cx->thir->interner.t_never;
         if (ax_sv_eq_cstr(name, "f32") || ax_sv_eq_cstr(name, "f64")) return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
 
@@ -926,6 +927,18 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             st.kind = AX_TY_BUILTIN_LEN;
             return ax_intern_type(&cx->thir->interner, &st);
         }
+        if (ax_sv_eq_cstr(name, "print")) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_BUILTIN_PRINT;
+            return ax_intern_type(&cx->thir->interner, &st);
+        }
+        if (ax_sv_eq_cstr(name, "print_int")) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_BUILTIN_PRINT_INT;
+            return ax_intern_type(&cx->thir->interner, &st);
+        }
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
@@ -984,8 +997,7 @@ static TypeId check_literal(TypeckCtx *cx, const AxHirExpr *expr) {
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
         case AX_TOK_STR:
         case AX_TOK_BYTE_STR:
-            // Str arrives with T041; until then a string literal is outside the subset.
-            return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+            return cx->thir->interner.t_str;
         default:
             AX_ICE("typeck: literal with token kind %d", (int)expr->literal.kind);
     }
@@ -1116,12 +1128,39 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
         TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
         if (!is_error(cx, arg_ty)) {
             const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
-            if (t->kind != AX_TY_ARRAY) {
+            if (t->kind != AX_TY_ARRAY && t->kind != AX_TY_STR) {
                 type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH); // Or maybe custom error
                 return cx->thir->interner.t_error;
             }
         }
         return cx->thir->interner.t_usize;
+    }
+    if (ct->kind == AX_TY_BUILTIN_PRINT) {
+        size_t argc = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+        if (argc != 1) return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
+        TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
+        if (!is_error(cx, arg_ty)) {
+            const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
+            if (t->kind != AX_TY_STR) {
+                type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH);
+                return cx->thir->interner.t_error;
+            }
+        }
+        return cx->thir->interner.t_unit;
+    }
+    if (ct->kind == AX_TY_BUILTIN_PRINT_INT) {
+        size_t argc = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+        if (argc != 1) return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
+        TypeId arg_ty = resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
+        if (!is_error(cx, arg_ty)) {
+            if (!ax_type_is_int(arg_ty, &cx->thir->interner)) {
+                type_error(cx, expr->call.args->span, AX_TYPE_MISMATCH);
+                return cx->thir->interner.t_error;
+            }
+        }
+        return cx->thir->interner.t_unit;
     }
     
     if (ct->kind != AX_TY_FN) {

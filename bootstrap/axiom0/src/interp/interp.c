@@ -29,6 +29,7 @@ typedef struct {
     bool failed;
     int exit_code;
     const char **out_panic_msg;
+    FILE *out;
     uint64_t dummy_buf;
 } InterpCtx;
 
@@ -341,11 +342,16 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         uint8_t *dest = get_place_ptr(ctx, &frame, &stmt->assign.place, &dest_ty);
                         if (stmt->assign.rvalue.use.kind == AX_MIR_OP_CONST) {
                             uint32_t size = ax_type_size(dest_ty, &ctx->thir->interner);
-                            uint64_t val = stmt->assign.rvalue.use.constant.val;
-                            if (size == 1) *(uint8_t*)dest = (uint8_t)val;
-                            else if (size == 2) *(uint16_t*)dest = (uint16_t)val;
-                            else if (size == 4) *(uint32_t*)dest = (uint32_t)val;
-                            else if (size == 8) *(uint64_t*)dest = val;
+                            if (stmt->assign.rvalue.use.constant.ty.v != 0 && ax_type_get(&ctx->thir->interner, stmt->assign.rvalue.use.constant.ty)->kind == AX_TY_STR) {
+                                *(const uint8_t**)dest = stmt->assign.rvalue.use.constant.str.bytes;
+                                *(uint64_t*)(dest + 8) = stmt->assign.rvalue.use.constant.str.len;
+                            } else {
+                                uint64_t val = stmt->assign.rvalue.use.constant.val;
+                                if (size == 1) *(uint8_t*)dest = (uint8_t)val;
+                                else if (size == 2) *(uint16_t*)dest = (uint16_t)val;
+                                else if (size == 4) *(uint32_t*)dest = (uint32_t)val;
+                                else if (size == 8) *(uint64_t*)dest = val;
+                            }
                         } else {
                             TypeId src_ty;
                             uint8_t *src = get_place_ptr(ctx, &frame, &stmt->assign.rvalue.use.place, &src_ty);
@@ -449,6 +455,9 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         uint64_t len = 0;
                         if (t->kind == AX_TY_ARRAY) {
                             len = t->array.len;
+                        } else if (t->kind == AX_TY_STR) {
+                            uint8_t *ptr = get_place_ptr(ctx, &frame, &stmt->assign.rvalue.len, &arg_ty);
+                            len = *(uint64_t*)(ptr + 8);
                         } else {
                             len = 0; // ICE
                         }
@@ -845,6 +854,46 @@ skip_write:;
             }
             current_bb = next;
         } else if (term->kind == AX_MIR_TERM_CALL) {
+            if (term->call.func.kind == AX_MIR_OP_CONST) {
+                const AxType *ft = ax_type_get(&ctx->thir->interner, term->call.func.constant.ty);
+                if (ft->kind == AX_TY_BUILTIN_PRINT) {
+                    const uint8_t *bytes = NULL;
+                    size_t len = 0;
+                    if (term->call.args[0].kind == AX_MIR_OP_CONST) {
+                        bytes = term->call.args[0].constant.str.bytes;
+                        len = term->call.args[0].constant.str.len;
+                    } else {
+                        TypeId ty;
+                        uint8_t *ptr = get_place_ptr(ctx, &frame, &term->call.args[0].place, &ty);
+                        bytes = *(const uint8_t**)ptr;
+                        len = *(uint64_t*)(ptr + 8);
+                    }
+                    fwrite(bytes, 1, len, ctx->out);
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_PRINT_INT) {
+                    uint64_t val = eval_operand(ctx, &frame, &term->call.args[0]);
+                    TypeId arg_ty_id;
+                    if (term->call.args[0].kind == AX_MIR_OP_CONST) {
+                        arg_ty_id = term->call.args[0].constant.ty;
+                    } else {
+                        get_place_ptr(ctx, &frame, &term->call.args[0].place, &arg_ty_id);
+                    }
+                    if (ax_type_is_signed(arg_ty_id, &ctx->thir->interner)) {
+                        uint32_t size = ax_type_size(arg_ty_id, &ctx->thir->interner);
+                        int64_t sval = val;
+                        if (size == 1) sval = (int8_t)val;
+                        else if (size == 2) sval = (int16_t)val;
+                        else if (size == 4) sval = (int32_t)val;
+                        fprintf(ctx->out, "%lld", (long long)sval);
+                    } else {
+                        fprintf(ctx->out, "%llu", (unsigned long long)val);
+                    }
+                    current_bb = term->call.target;
+                    continue;
+                }
+            }
             uint64_t func_val = eval_operand(ctx, &frame, &term->call.func);
             AxHirItem *callee = find_func_by_symbol(ctx, func_val);
             if (!callee) {
@@ -876,7 +925,7 @@ skip_write:;
     ctx->call_depth--;
 }
 
-int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg) {
+int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg, FILE *out) {
     InterpCtx ctx = {0};
     ctx.main_fn = main_fn;
     ctx.thir = thir;
@@ -889,6 +938,7 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.call_depth_limit = call_depth_limit;
     ctx.mir_map = mir_map;
     ctx.out_panic_msg = out_panic_msg;
+    ctx.out = out;
     ax_arena_init(&ctx.arena, 0);
     
     AxInterpValue ret = {0};

@@ -25,7 +25,7 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
     if (id.v == in->t_bool.v || id.v == in->t_i8.v || id.v == in->t_u8.v) return 1;
     if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;
     if (id.v == in->t_i32.v || id.v == in->t_u32.v || id.v == in->t_char.v) return 4;
-    if (id.v == in->t_i64.v || id.v == in->t_u64.v || id.v == in->t_isize.v || id.v == in->t_usize.v) return 8;
+    if (id.v == in->t_i64.v || id.v == in->t_u64.v || id.v == in->t_isize.v || id.v == in->t_usize.v || id.v == in->t_str.v) return 8;
 
     const AxType *ty = ax_type_get(in, id);
     if (!ty) return 1;
@@ -90,6 +90,7 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
     if (id.v == in->t_i16.v || id.v == in->t_u16.v) return 2;
     if (id.v == in->t_i32.v || id.v == in->t_u32.v || id.v == in->t_char.v) return 4;
     if (id.v == in->t_i64.v || id.v == in->t_u64.v || id.v == in->t_isize.v || id.v == in->t_usize.v) return 8;
+    if (id.v == in->t_str.v) return 16;
 
     const AxType *ty = ax_type_get(in, id);
     if (!ty) return 0;

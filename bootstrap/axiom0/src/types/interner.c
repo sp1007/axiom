@@ -26,6 +26,7 @@ void ax_type_interner_init(TypeInterner *in) {
     t.kind = AX_TY_U32; in->t_u32 = ax_intern_type(in, &t);
     t.kind = AX_TY_U64; in->t_u64 = ax_intern_type(in, &t);
     t.kind = AX_TY_USIZE; in->t_usize = ax_intern_type(in, &t);
+    t.kind = AX_TY_STR; in->t_str = ax_intern_type(in, &t);
 }
 
 void ax_type_interner_free(TypeInterner *in) {

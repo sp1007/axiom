@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T039]
 priority: 61
-status: doing
+status: done
 attempts: 1
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/str]
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/driver, bootstrap/axiom0/src/resolve, tests/]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0089, tasks/0332, 0045, 0152]
 started: 2026-10-10 10:19:34
+finished: 2026-10-10 10:55:38
 ---
 # T041 — String literals, Str views, print intrinsic (oracle)
 
@@ -38,3 +39,4 @@ Static string data and output, first stdout-observable programs.
 
 ## Log
 - 2026-10-10 10:19:34 started (attempt 1) 
+- 2026-10-10 10:55:38 accepted by QA -> done

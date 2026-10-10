@@ -31,7 +31,7 @@ static void d_typeid(DumpState *st, TypeId id) {
     }
     const AxType *t = ax_type_get(&st->thir->interner, id);
     fputs(" <Type ", st->out);
-    switch (t->kind) {
+    switch ((int)t->kind) {
         case AX_TY_ERROR: fputs("error", st->out); break;
         case AX_TY_UNIT: fputs("()", st->out); break;
         case AX_TY_NEVER: fputs("never", st->out); break;
@@ -47,6 +47,10 @@ static void d_typeid(DumpState *st, TypeId id) {
         case AX_TY_U32: fputs("u32", st->out); break;
         case AX_TY_U64: fputs("u64", st->out); break;
         case AX_TY_USIZE: fputs("usize", st->out); break;
+        case AX_TY_STR: fputs("Str", st->out); break;
+        case AX_TY_BUILTIN_LEN: fputs("<builtin:len>", st->out); break;
+        case AX_TY_BUILTIN_PRINT: fputs("<builtin:print>", st->out); break;
+        case AX_TY_BUILTIN_PRINT_INT: fputs("<builtin:print_int>", st->out); break;
         case AX_TY_FN: 
             fputs("fn(", st->out);
             for(size_t i=0; i<t->fn.param_count; i++) {

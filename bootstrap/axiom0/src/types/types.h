@@ -24,6 +24,7 @@ typedef enum AxTypeKind {
     AX_TY_U64,
     AX_TY_USIZE,
     AX_TY_FN,
+    AX_TY_STR,
     AX_TY_INT_VAR
 } AxTypeKind;
 
@@ -33,6 +34,8 @@ typedef enum AxTypeKind {
 #define AX_TY_STRUCT (AX_TY_INT_VAR + 4)
 #define AX_TY_BUILTIN_LEN (AX_TY_INT_VAR + 5)
 #define AX_TY_ENUM (AX_TY_INT_VAR + 6)
+#define AX_TY_BUILTIN_PRINT (AX_TY_INT_VAR + 7)
+#define AX_TY_BUILTIN_PRINT_INT (AX_TY_INT_VAR + 8)
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -154,6 +157,7 @@ struct TypeInterner {
     TypeId t_never;
     TypeId t_bool;
     TypeId t_char;
+    TypeId t_str;
     TypeId t_i8, t_i16, t_i32, t_i64, t_isize;
     TypeId t_u8, t_u16, t_u32, t_u64, t_usize;
 };

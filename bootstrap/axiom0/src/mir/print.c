@@ -48,7 +48,22 @@ static void print_operand(FILE *out, const AxMirOperand *op) {
             print_place(out, &op->place);
             break;
         case AX_MIR_OP_CONST:
-            fprintf(out, "const %llu", (unsigned long long)op->constant.val);
+            if (op->constant.kind == AX_MIR_CONST_STR) {
+                fprintf(out, "const \"");
+                for (size_t i = 0; i < op->constant.str.len; i++) {
+                    uint8_t c = op->constant.str.bytes[i];
+                    if (c == '\n') fprintf(out, "\\n");
+                    else if (c == '\r') fprintf(out, "\\r");
+                    else if (c == '\t') fprintf(out, "\\t");
+                    else if (c == '\"') fprintf(out, "\\\"");
+                    else if (c == '\\') fprintf(out, "\\\\");
+                    else if (c >= 32 && c <= 126) fputc(c, out);
+                    else fprintf(out, "\\x%02x", c);
+                }
+                fprintf(out, "\"");
+            } else {
+                fprintf(out, "const %llu", (unsigned long long)op->constant.val);
+            }
             break;
     }
 }
