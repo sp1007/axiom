@@ -457,6 +457,84 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
 
             TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
             AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
+        } else if (it->kind == AX_HIR_ITEM_STRUCT) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_STRUCT;
+            st.strct.def = it;
+            
+            size_t count = 0;
+            for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) count++;
+            st.strct.field_count = count;
+            
+            if (count > 0) {
+                st.strct.fields = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
+                size_t i = 0;
+                for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) {
+                    st.strct.fields[i++] = hir_type_to_typeid(&cx, f->type);
+                }
+            } else {
+                st.strct.fields = NULL;
+            }
+            
+            for (const AxHirAttr *a = it->attrs; a; a = a->next) {
+                StrView aname = ax_interner_get(str_in, a->name);
+                if (ax_sv_eq_cstr(aname, "repr")) {
+                    st.strct.is_repr_c = true;
+                }
+            }
+            
+            TypeId st_ty = ax_intern_type(&thir.interner, &st);
+            AxItemTypeMap_insert(&thir.item_types, it, st_ty);
+        } else if (it->kind == AX_HIR_ITEM_ENUM) {
+            AxType en;
+            memset(&en, 0, sizeof(en));
+            en.kind = AX_TY_ENUM;
+            en.enm.def = it;
+            
+            size_t vcount = 0;
+            for (const AxHirVariantDecl *v = it->enum_decl.variants; v; v = v->next) vcount++;
+            en.enm.variant_count = vcount;
+            
+            if (vcount > 0) {
+                en.enm.variant_fields = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId*) * vcount, _Alignof(TypeId*));
+                en.enm.variant_field_counts = ax_arena_alloc(&thir.interner.arena, sizeof(size_t) * vcount, _Alignof(size_t));
+                size_t i = 0;
+                for (const AxHirVariantDecl *v = it->enum_decl.variants; v; v = v->next) {
+                    size_t fcount = 0;
+                    if (v->is_struct) {
+                        for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) fcount++;
+                        en.enm.variant_field_counts[i] = fcount;
+                        if (fcount > 0) {
+                            en.enm.variant_fields[i] = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * fcount, _Alignof(TypeId));
+                            size_t j = 0;
+                            for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) {
+                                en.enm.variant_fields[i][j++] = hir_type_to_typeid(&cx, f->type);
+                            }
+                        } else {
+                            en.enm.variant_fields[i] = NULL;
+                        }
+                    } else {
+                        for (const AxHirType *t = v->tuple_types; t; t = t->next) fcount++;
+                        en.enm.variant_field_counts[i] = fcount;
+                        if (fcount > 0) {
+                            en.enm.variant_fields[i] = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * fcount, _Alignof(TypeId));
+                            size_t j = 0;
+                            for (const AxHirType *t = v->tuple_types; t; t = t->next) {
+                                en.enm.variant_fields[i][j++] = hir_type_to_typeid(&cx, t);
+                            }
+                        } else {
+                            en.enm.variant_fields[i] = NULL;
+                        }
+                    }
+                    i++;
+                }
+            } else {
+                en.enm.variant_fields = NULL;
+                en.enm.variant_field_counts = NULL;
+            }
+            TypeId en_ty = ax_intern_type(&thir.interner, &en);
+            AxItemTypeMap_insert(&thir.item_types, it, en_ty);
         }
     }
 
@@ -536,9 +614,60 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
 
         case AX_HIR_PAT_STRUCT: {
             TypeId path_ty = lookup_path_type(cx, &pat->struct_pat.path);
+            if (!unify_ty(cx, ty, path_ty)) {
+                return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            }
             if (!is_error(cx, path_ty)) {
                 const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
-                if (t->kind != AX_TY_STRUCT && t->kind != AX_TY_ERROR) {
+                if (t->kind == AX_TY_ENUM) {
+                    StrView name = ax_source_db_span_text(cx->db, pat->struct_pat.path.span);
+                    StrView vname = name;
+                    const char *dot = memchr(name.ptr, '.', name.len);
+                    if (dot) {
+                        vname.ptr = dot + 1;
+                        vname.len = name.len - (dot - name.ptr) - 1;
+                    }
+                    bool found_variant = false;
+                    size_t vidx = 0;
+                    for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                        StrView var_name = ax_interner_get(cx->str_in, v->name);
+                        if (ax_sv_eq(var_name, vname)) {
+                            found_variant = true;
+                    AxPatVariantMap_insert(&cx->thir->pat_variants, pat, vidx);
+                            if (!v->is_struct) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                            for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                                StrView iname = ax_interner_get(cx->str_in, pf->name);
+                                bool found = false;
+                                size_t idx = 0;
+                                for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) {
+                                    StrView fname = ax_interner_get(cx->str_in, f->name);
+                                    if (ax_sv_eq(fname, iname)) {
+                                        found = true;
+                                        check_pat(cx, pf->pat, t->enm.variant_fields[vidx][idx], is_init);
+                                        break;
+                                    }
+                                    idx++;
+                                }
+                                if (!found) type_error(cx, pf->span, AX_TYPE_UNKNOWN_FIELD);
+                            }
+                            if (!pat->struct_pat.has_rest) {
+                                for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) {
+                                    StrView fname = ax_interner_get(cx->str_in, f->name);
+                                    bool found = false;
+                                    for (const AxHirPatField *pf = pat->struct_pat.fields; pf; pf = pf->next) {
+                                        StrView iname = ax_interner_get(cx->str_in, pf->name);
+                                        if (ax_sv_eq(fname, iname)) { found = true; break; }
+                                    }
+                                    if (!found) type_error(cx, pat->span, AX_TYPE_MISSING_FIELD);
+                                }
+                            }
+                            break;
+                        }
+                        vidx++;
+                    }
+                    if (!found_variant) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                    return path_ty;
+                } else if (t->kind != AX_TY_STRUCT && t->kind != AX_TY_ERROR) {
                     return type_error(cx, pat->span, AX_TYPE_MISMATCH);
                 } else {
                     return path_ty;
@@ -546,6 +675,60 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             } else {
                 return cx->thir->interner.t_error;
             }
+        }
+        case AX_HIR_PAT_PATH: {
+            TypeId path_ty = lookup_path_type(cx, &pat->path.path);
+            if (is_error(cx, path_ty)) return cx->thir->interner.t_error;
+            if (!unify_ty(cx, ty, path_ty)) {
+                return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            }
+            const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
+            if (t->kind != AX_TY_ENUM) {
+                return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            }
+            StrView name = ax_source_db_span_text(cx->db, pat->path.path.span);
+            StrView vname = name;
+            const char *dot = memchr(name.ptr, '.', name.len);
+            if (dot) {
+                vname.ptr = dot + 1;
+                vname.len = name.len - (dot - name.ptr) - 1;
+            }
+            bool found_variant = false;
+            size_t vidx = 0;
+            for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                StrView var_name = ax_interner_get(cx->str_in, v->name);
+                if (ax_sv_eq(var_name, vname)) {
+                    found_variant = true;
+                    AxPatVariantMap_insert(&cx->thir->pat_variants, pat, vidx);
+                    if (v->is_struct) {
+                        return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                    }
+                    if (pat->path.payload) {
+                        if (pat->path.payload->kind != AX_HIR_PAT_TUPLE) {
+                            return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                        }
+                        size_t count = 0;
+                        for (const AxHirPat *p = pat->path.payload->tuple.elems; p; p = p->next) count++;
+                        if (count != t->enm.variant_field_counts[vidx]) {
+                            return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                        }
+                        size_t i = 0;
+                        for (const AxHirPat *p = pat->path.payload->tuple.elems; p; p = p->next) {
+                            check_pat(cx, p, t->enm.variant_fields[vidx][i++], is_init);
+                        }
+                    } else {
+                        if (t->enm.variant_field_counts[vidx] > 0) {
+                            return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+                        }
+                    }
+                    break;
+                }
+                vidx++;
+            }
+            if (!found_variant) return type_error(cx, pat->span, AX_TYPE_MISMATCH);
+            
+            ty = path_ty;
+            break;
         }
         case AX_HIR_PAT_TUPLE: {
             return cx->thir->interner.t_error; // Stub for tuple patterns
@@ -573,39 +756,27 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_STRUCT) {
-            AxType st;
-            memset(&st, 0, sizeof(st));
-            st.kind = AX_TY_STRUCT;
-            st.strct.def = it;
-            
-            size_t count = 0;
-            for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) count++;
-            st.strct.field_count = count;
-            
-            if (count > 0) {
-                st.strct.fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * count, _Alignof(TypeId));
-                size_t i = 0;
-                for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) {
-                    st.strct.fields[i++] = hir_type_to_typeid(cx, f->type);
-                }
-            } else {
-                st.strct.fields = NULL;
-            }
-            
-            for (const AxHirAttr *a = it->attrs; a; a = a->next) {
-                StrView aname = ax_interner_get(cx->str_in, a->name);
-                if (ax_sv_eq_cstr(aname, "repr")) {
-                    st.strct.is_repr_c = true;
-                }
-            }
-            
-            TypeId st_ty = ax_intern_type(&cx->thir->interner, &st);
-            AxItemTypeMap_insert(&cx->thir->item_types, it, st_ty);
-        }
+
         if (it->kind == AX_HIR_ITEM_FN) {
             StrView it_name = ax_interner_get(cx->str_in, it->fn.name);
             if (ax_sv_eq(it_name, name)) {
+                TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
+                if (t) return *t;
+            }
+        } else if (it->kind == AX_HIR_ITEM_STRUCT) {
+            StrView it_name = ax_interner_get(cx->str_in, it->struct_decl.name);
+            if (ax_sv_eq(it_name, name)) {
+                TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
+                if (t) return *t;
+            }
+        } else if (it->kind == AX_HIR_ITEM_ENUM) {
+            StrView enum_name = name;
+            const char *dot = memchr(name.ptr, '.', name.len);
+            if (dot) {
+                enum_name.len = dot - name.ptr;
+            }
+            StrView it_name = ax_interner_get(cx->str_in, it->enum_decl.name);
+            if (ax_sv_eq(it_name, enum_name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (t) return *t;
             }
@@ -856,9 +1027,72 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             TypeId path_ty = lookup_path_type(cx, &expr->struct_lit.path);
             if (!is_error(cx, path_ty)) {
                 const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
-                if (t->kind != AX_TY_STRUCT) {
+                if (t->kind == AX_TY_ENUM) {
+                    StrView name = ax_source_db_span_text(cx->db, expr->struct_lit.path.span);
+                    StrView vname = name;
+                    const char *dot = memchr(name.ptr, '.', name.len);
+                    if (dot) {
+                        vname.ptr = dot + 1;
+                        vname.len = name.len - (dot - name.ptr) - 1;
+                    }
+                    bool found_variant = false;
+                    size_t vidx = 0;
+                    for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                        StrView var_name = ax_interner_get(cx->str_in, v->name);
+                        if (ax_sv_eq(var_name, vname)) {
+                            found_variant = true;
+                            AxExprVariantMap_insert(&cx->thir->expr_variants, expr, vidx);
+                            if (!v->is_struct) return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                            
+                            // check duplicate fields
+                            for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                                StrView iname = ax_interner_get(cx->str_in, init->name);
+                                for (const AxHirFieldInit *other = init->next; other; other = other->next) {
+                                    StrView oname = ax_interner_get(cx->str_in, other->name);
+                                    if (ax_sv_eq(iname, oname)) {
+                                        type_error(cx, other->span, AX_TYPE_DUPLICATE_FIELD);
+                                    }
+                                }
+                            }
+
+                            // check fields
+                            for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                                StrView iname = ax_interner_get(cx->str_in, init->name);
+                                bool found = false;
+                                size_t idx = 0;
+                                for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) {
+                                    StrView fname = ax_interner_get(cx->str_in, f->name);
+                                    if (ax_sv_eq(fname, iname)) {
+                                        found = true;
+                                        check_expr(cx, init->expr, t->enm.variant_fields[vidx][idx]);
+                                        break;
+                                    }
+                                    idx++;
+                                }
+                                if (!found) {
+                                    type_error(cx, init->span, AX_TYPE_UNKNOWN_FIELD);
+                                }
+                            }
+                            // check missing
+                            for (const AxHirFieldDecl *f = v->struct_fields; f; f = f->next) {
+                                StrView fname = ax_interner_get(cx->str_in, f->name);
+                                bool found = false;
+                                for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
+                                    StrView iname = ax_interner_get(cx->str_in, init->name);
+                                    if (ax_sv_eq(fname, iname)) found = true;
+                                }
+                                if (!found) {
+                                    type_error(cx, expr->span, AX_TYPE_MISSING_FIELD);
+                                }
+                            }
+                            break;
+                        }
+                        vidx++;
+                    }
+                    if (!found_variant) return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                } else if (t->kind != AX_TY_STRUCT) {
                     return type_error(cx, expr->span, AX_TYPE_MISMATCH);
-                }
+                } else {
                 
                 // check duplicate fields
                 for (const AxHirFieldInit *init = expr->struct_lit.fields; init; init = init->next) {
@@ -901,6 +1135,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         type_error(cx, expr->span, AX_TYPE_MISSING_FIELD);
                     }
                 }
+                } // close else { t->kind == AX_TY_STRUCT }
             }
             return path_ty;
         }
@@ -923,6 +1158,26 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                     if (!found) {
                         return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
                     }
+                                } else if (t->kind == AX_TY_ENUM) {
+                    bool found = false;
+                    size_t vidx = 0;
+                    for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                        StrView vname = ax_interner_get(cx->str_in, v->name); 
+                        StrView search = ax_interner_get(cx->str_in, expr->field.name); 
+                        if (ax_sv_eq(vname, search)) {
+                            AxExprVariantMap_insert(&cx->thir->expr_variants, expr, vidx);
+                            found = true;
+                            if (v->is_struct || t->enm.variant_field_counts[vidx] > 0) {
+                                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                            }
+                            return obj_ty;
+                        }
+                        vidx++;
+                    }
+                    if (!found) {
+                        return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                    }
+                    return obj_ty;
                 } else {
                     return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
                 }
@@ -1066,6 +1321,16 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             bool is_valid = false;
             if (is_intlike(cx, src_ty) && ax_type_is_int(dest_ty, in)) {
                 is_valid = true;
+                        } else if (ax_type_get(in, src_ty)->kind == AX_TY_ENUM && ax_type_is_int(dest_ty, in)) {
+                const AxType *t = ax_type_get(in, src_ty);
+                bool has_payload = false;
+                for (size_t i = 0; i < t->enm.variant_count; i++) {
+                    if (t->enm.variant_field_counts[i] > 0) {
+                        has_payload = true;
+                        break;
+                    }
+                }
+                if (!has_payload) is_valid = true;
             } else if (TypeId_eq(src_ty, in->t_bool) && ax_type_is_int(dest_ty, in)) {
                 is_valid = true;
             } else if (TypeId_eq(src_ty, in->t_u8) && TypeId_eq(dest_ty, in->t_char)) {
@@ -1157,7 +1422,33 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             return type_error(cx, expr->index.base->span, AX_TYPE_CANNOT_INDEX);
         }
         /* case AX_HIR_EXPR_STRUCT: */
-        case AX_HIR_EXPR_MATCH:
+        case AX_HIR_EXPR_MATCH: {
+            TypeId val_ty = resolve_ty(cx, check_expr(cx, expr->match.expr, TypeId_none()));
+            if (is_error(cx, val_ty)) return in->t_error;
+
+            TypeId match_ty = expected;
+            bool first = true;
+            for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
+                check_pat(cx, arm->pat, val_ty, true);
+                if (arm->guard) {
+                    check_expr(cx, arm->guard, in->t_bool);
+                }
+                TypeId arm_ty = check_expr(cx, arm->body, match_ty);
+                if (first && !is_error(cx, arm_ty)) {
+                    match_ty = arm_ty;
+                    first = false;
+                }
+            }
+            
+            if (TypeId_is_none(match_ty)) {
+                match_ty = expr->match.arms ? in->t_error : in->t_never;
+            }
+            
+            extern void ax_match_check_exhaustiveness(AxThir *thir, StrInterner *str_in, const SourceDatabase *db, AxDiagSink *sink, const AxHirExpr *expr, TypeId val_ty);
+            ax_match_check_exhaustiveness(cx->thir, cx->str_in, cx->db, cx->sink, expr, val_ty);
+            
+            return match_ty;
+        }
         case AX_HIR_EXPR_FOR:
         case AX_HIR_EXPR_UNSAFE:
         case AX_HIR_EXPR_VIEW:
@@ -1166,7 +1457,39 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         case AX_HIR_EXPR_RANGE:
         /* case AX_HIR_EXPR_FIELD: */
         /* case AX_HIR_EXPR_TUPLE_INDEX: */
-        case AX_HIR_EXPR_METHOD_CALL:
+        case AX_HIR_EXPR_METHOD_CALL: {
+            TypeId receiver_ty = check_expr(cx, expr->method_call.receiver, TypeId_none());
+            if (is_error(cx, receiver_ty)) return in->t_error;
+            const AxType *t = ax_type_get(in, receiver_ty);
+            if (t->kind == AX_TY_ENUM) {
+                size_t vidx = 0;
+                for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                    StrView vname = ax_interner_get(cx->str_in, v->name);
+                    StrView search = ax_interner_get(cx->str_in, expr->method_call.method_name);
+                    if (ax_sv_eq(vname, search)) {
+                        AxExprVariantMap_insert(&cx->thir->expr_variants, expr, vidx);
+                        if (v->is_struct) {
+                            return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                        }
+                        size_t expected_args = t->enm.variant_field_counts[vidx];
+                        size_t argc = 0;
+                        for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) argc++;
+                        if (argc != expected_args) {
+                            return type_error(cx, expr->span, AX_TYPE_ARG_COUNT);
+                        }
+                        const TypeId *payloads = t->enm.variant_fields[vidx];
+                        size_t i = 0;
+                        for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
+                            check_expr(cx, a, payloads[i++]);
+                        }
+                        return receiver_ty;
+                    }
+                    vidx++;
+                }
+                return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+            }
+            return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+        }
         case AX_HIR_EXPR_TRY:
         case AX_HIR_EXPR_AWAIT:
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);

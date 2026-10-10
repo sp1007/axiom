@@ -8,12 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T036, T033]
 priority: 57
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/driver, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target, bootstrap/axiom0/src/mir, tests/run, bootstrap/axiom0/src/link/pe, bootstrap/axiom0/src/obj/coff, tests/mc]
 spec: [0189, 0230, 0250, 0181]
 started: 2026-10-09 15:01:01
-agent: T037-impl
+finished: 2026-10-10 00:05:15
 ---
 # T037 — Native catch-up: numerics, aggregates, arrays, struct ABI
 
@@ -41,3 +41,4 @@ All numeric/struct/array tests pass natively.
 
 ## Log
 - 2026-10-09 15:01:01 started (attempt 1) T037-impl
+- 2026-10-10 00:05:15 finished without commit (manual) -> done; run `taskctl commit` next

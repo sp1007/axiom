@@ -32,6 +32,7 @@ typedef enum AxTypeKind {
 #define AX_TY_TUPLE (AX_TY_INT_VAR + 3)
 #define AX_TY_STRUCT (AX_TY_INT_VAR + 4)
 #define AX_TY_BUILTIN_LEN (AX_TY_INT_VAR + 5)
+#define AX_TY_ENUM (AX_TY_INT_VAR + 6)
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -64,6 +65,13 @@ typedef struct AxType {
             size_t field_count;
             bool is_repr_c;
         } strct;
+        struct {
+            const struct AxHirItem *def;
+            TypeId **variant_fields;
+            size_t *variant_field_counts;
+            size_t variant_count;
+            bool is_repr_c;
+        } enm;
     };
 } AxType;
 
@@ -94,6 +102,8 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         }
     } else if (k->kind == AX_TY_STRUCT) {
         h = ax_hash_combine(h, ax_hash_u64((uint64_t)(uintptr_t)k->strct.def));
+    } else if (k->kind == AX_TY_ENUM) {
+        h = ax_hash_combine(h, ax_hash_u64((uint64_t)(uintptr_t)k->enm.def));
     }
     return h;
 }
@@ -123,6 +133,8 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
         return true;
     } else if (a->kind == AX_TY_STRUCT) {
         return a->strct.def == b->strct.def;
+    } else if (a->kind == AX_TY_ENUM) {
+        return a->enm.def == b->enm.def;
     }
     return true;
 }
@@ -164,6 +176,8 @@ typedef struct AxHirExpr AxHirExpr; typedef const AxHirExpr *AxHirExprPtr;
 AX_DEFINE_HASHMAP(AxExprTypeMap, AxHirExprPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
 typedef struct AxHirPat AxHirPat; typedef const AxHirPat *AxHirPatPtr;
 AX_DEFINE_HASHMAP(AxPatTypeMap, AxHirPatPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
+AX_DEFINE_HASHMAP(AxExprVariantMap, AxHirExprPtr, uint32_t, ax_key_hash_ptr, ax_key_eq_ptr);
+AX_DEFINE_HASHMAP(AxPatVariantMap, AxHirPatPtr, uint32_t, ax_key_hash_ptr, ax_key_eq_ptr);
 typedef struct AxHirItem AxHirItem; typedef const AxHirItem *AxHirItemPtr;
 AX_DEFINE_HASHMAP(AxItemTypeMap, AxHirItemPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
 typedef struct AxHirParam AxHirParam; typedef const AxHirParam *AxHirParamPtr;
@@ -176,6 +190,8 @@ typedef struct AxThir {
     TypeInterner interner;
     AxExprTypeMap expr_types;
     AxPatTypeMap pat_types;
+    AxExprVariantMap expr_variants;
+    AxPatVariantMap pat_variants;
     AxItemTypeMap item_types;
     AxParamTypeMap param_types;
     AxSymbolTypeMap symbol_types;

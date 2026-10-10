@@ -344,16 +344,35 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         }
                         goto skip_write;
                     }
+                    case AX_MIR_RVALUE_DISCRIMINANT: {
+                        TypeId src_ty;
+                        uint8_t *src = get_place_ptr(ctx, &frame, &stmt->assign.rvalue.discriminant, &src_ty);
+                        const AxType *ty = ax_type_get(&ctx->thir->interner, src_ty);
+                        if (ty->kind == AX_TY_ENUM) {
+                            val = *(uint32_t*)src;
+                        } else {
+                            AX_ICE("interpreter: discriminant on non-enum");
+                        }
+                        break;
+                    }
                                         case AX_MIR_RVALUE_AGGREGATE: {
                         TypeId dest_ty;
                         uint8_t *dest = get_place_ptr(ctx, &frame, &stmt->assign.place, &dest_ty);
                         const AxType *ty = ax_type_get(&ctx->thir->interner, dest_ty);
+                        
+                        if (ty->kind == AX_TY_ENUM) {
+                            *(uint32_t*)dest = stmt->assign.rvalue.aggregate.variant_idx;
+                        }
+                        
                         for (size_t i = 0; i < stmt->assign.rvalue.aggregate.operand_count; i++) {
                             uint32_t offset = 0;
                             TypeId field_ty;
                             if (ty->kind == AX_TY_ARRAY) {
                                 field_ty = ty->array.elem;
                                 offset = i * ax_type_size(field_ty, &ctx->thir->interner);
+                            } else if (ty->kind == AX_TY_ENUM) {
+                                offset = ax_type_enum_field_offset(dest_ty, stmt->assign.rvalue.aggregate.variant_idx, i, &ctx->thir->interner);
+                                field_ty = ty->enm.variant_fields[stmt->assign.rvalue.aggregate.variant_idx][i];
                             } else {
                                 offset = ax_type_field_offset(dest_ty, i, &ctx->thir->interner);
                                 field_ty = (ty->kind == AX_TY_STRUCT) ? ty->strct.fields[i] : ty->tuple.fields[i];

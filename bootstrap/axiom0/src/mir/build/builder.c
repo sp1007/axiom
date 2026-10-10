@@ -255,10 +255,14 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
             return op;
         }
     } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
-        AxMirPlace p = build_place(b, expr);
-        op.kind = AX_MIR_OP_COPY;
-        op.place = p;
-        return op;
+        if (AxExprVariantMap_get(&b->thir->expr_variants, expr)) {
+            // It's a variant, let the default path build it into a temp
+        } else {
+            AxMirPlace p = build_place(b, expr);
+            op.kind = AX_MIR_OP_COPY;
+            op.place = p;
+            return op;
+        }
     }
     
     TypeId ty = get_expr_type(b, expr);
@@ -273,6 +277,37 @@ static AxMirOperand build_expr_as_operand(Builder *b, const AxHirExpr *expr) {
 }
 
 static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
+    uint32_t *vidx_ptr = AxExprVariantMap_get(&b->thir->expr_variants, expr);
+    if (vidx_ptr) {
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+        stmt.assign.rvalue.aggregate.variant_idx = *vidx_ptr;
+        
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = ax_type_get(&b->thir->interner, ty);
+        uint32_t f_count = t->enm.variant_field_counts[*vidx_ptr];
+        stmt.assign.rvalue.aggregate.operand_count = f_count;
+        
+        if (f_count > 0) {
+            stmt.assign.rvalue.aggregate.operands = ax_arena_alloc(b->arena, sizeof(AxMirOperand) * f_count, _Alignof(AxMirOperand));
+            if (expr->kind == AX_HIR_EXPR_METHOD_CALL) {
+                uint32_t i = 0;
+                for (const AxHirExpr *arg = expr->method_call.args; arg; arg = arg->next) {
+                    stmt.assign.rvalue.aggregate.operands[i++] = build_expr_as_operand(b, arg);
+                }
+            } else if (expr->kind == AX_HIR_EXPR_CALL) {
+                uint32_t i = 0;
+                for (const AxHirExpr *arg = expr->call.args; arg; arg = arg->next) {
+                    stmt.assign.rvalue.aggregate.operands[i++] = build_expr_as_operand(b, arg);
+                }
+            }
+        }
+        push_stmt(b, b->current_bb, stmt);
+        return;
+    }
+
     if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
         AxMirOperand op = build_expr_as_operand(b, expr);
         AxMirStmt stmt = {0};
@@ -699,6 +734,98 @@ static void build_expr_into(Builder *b, const AxHirExpr *expr, AxMirPlace dest) 
             term.kind = AX_MIR_TERM_GOTO;
             term.goto_target = bb_end;
             set_terminator(b, b->current_bb, term);
+        }
+        
+        b->current_bb = bb_end;
+    } else if (expr->kind == AX_HIR_EXPR_MATCH) {
+        TypeId match_val_ty = get_expr_type(b, expr->match.expr);
+        const AxType *t = ax_type_get(&b->thir->interner, match_val_ty);
+        
+        AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, match_val_ty, false);
+        AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        build_expr_into(b, expr->match.expr, temp_place);
+        
+        AxMirOperand discr_op;
+        if (t->kind == AX_TY_ENUM) {
+            AxMirLocalId discr_temp = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_u32, false);
+            AxMirPlace discr_temp_place = { discr_temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            
+            AxMirStmt stmt = {0};
+            stmt.kind = AX_MIR_STMT_ASSIGN;
+            stmt.assign.place = discr_temp_place;
+            stmt.assign.rvalue.kind = AX_MIR_RVALUE_DISCRIMINANT;
+            stmt.assign.rvalue.discriminant = temp_place;
+            push_stmt(b, b->current_bb, stmt);
+            
+            discr_op.kind = AX_MIR_OP_COPY;
+            discr_op.place = discr_temp_place;
+        } else {
+            discr_op.kind = AX_MIR_OP_COPY;
+            discr_op.place = temp_place;
+        }
+        
+        size_t arm_count = 0;
+        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) arm_count++;
+        
+        AxMirBbId bb_end = add_bb(b);
+        AxMirBbId *arm_bbs = ax_arena_alloc(b->arena, sizeof(AxMirBbId) * arm_count, _Alignof(AxMirBbId));
+        
+        size_t i = 0;
+        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
+            arm_bbs[i++] = add_bb(b);
+        }
+        
+        AxMirSwitchTarget *targets = ax_arena_alloc(b->arena, sizeof(AxMirSwitchTarget) * arm_count, _Alignof(AxMirSwitchTarget));
+        size_t target_count = 0;
+        
+        AxMirBbId otherwise = {0}; // 0 is invalid or we can create one
+        bool has_otherwise = false;
+        
+        i = 0;
+        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
+            if (arm->pat->kind == AX_HIR_PAT_LITERAL) {
+                targets[target_count].value = (arm->pat->literal.tok.kind == AX_TOK_KW_TRUE) ? 1 : 0;
+                targets[target_count].target = arm_bbs[i];
+                target_count++;
+            } else if (arm->pat->kind == AX_HIR_PAT_WILDCARD || arm->pat->kind == AX_HIR_PAT_BINDING) {
+                otherwise = arm_bbs[i];
+                has_otherwise = true;
+            } else {
+                uint32_t *vidx = AxPatVariantMap_get(&b->thir->pat_variants, arm->pat);
+                if (vidx) {
+                    targets[target_count].value = *vidx;
+                    targets[target_count].target = arm_bbs[i];
+                    target_count++;
+                }
+            }
+            i++;
+        }
+        
+        if (!has_otherwise) {
+            otherwise = add_bb(b);
+            AxMirTerminator unreach = {0};
+            unreach.kind = AX_MIR_TERM_UNREACHABLE;
+            set_terminator(b, otherwise, unreach);
+        }
+        
+        AxMirTerminator switch_term = {0};
+        switch_term.kind = AX_MIR_TERM_SWITCH_INT;
+        switch_term.switch_int.discr = discr_op;
+        switch_term.switch_int.targets.values = targets;
+        switch_term.switch_int.targets.count = target_count;
+        switch_term.switch_int.targets.otherwise = otherwise;
+        set_terminator(b, b->current_bb, switch_term);
+        
+        i = 0;
+        for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
+            b->current_bb = arm_bbs[i++];
+            build_expr_into(b, arm->body, dest);
+            if (!b->bbs[b->current_bb.v].is_terminated) {
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_GOTO;
+                term.goto_target = bb_end;
+                set_terminator(b, b->current_bb, term);
+            }
         }
         
         b->current_bb = bb_end;

@@ -52,6 +52,17 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
             return 8;
         case AX_TY_ARRAY:
             return ax_type_align(ty->array.elem, in);
+        case AX_TY_ENUM: {
+            uint32_t max_align = 4;
+            for (size_t i = 0; i < ty->enm.variant_count; i++) {
+                size_t count = ty->enm.variant_field_counts[i];
+                for (size_t j = 0; j < count; j++) {
+                    uint32_t a = ax_type_align(ty->enm.variant_fields[i][j], in);
+                    if (a > max_align) max_align = a;
+                }
+            }
+            return max_align;
+        }
         case AX_TY_TUPLE: {
             uint32_t align = 1;
             for (size_t i = 0; i < ty->tuple.field_count; i++) {
@@ -105,6 +116,35 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
             return 8;
         case AX_TY_ARRAY:
             return ax_type_size(ty->array.elem, in) * ty->array.len;
+        case AX_TY_ENUM: {
+            uint32_t max_align = 4;
+            uint32_t max_payload_size = 0;
+            for (size_t i = 0; i < ty->enm.variant_count; i++) {
+                size_t count = ty->enm.variant_field_counts[i];
+                if (count == 0) continue;
+                
+                FieldLayout fl_stack[128];
+                FieldLayout *fl = count <= 128 ? fl_stack : malloc(count * sizeof(FieldLayout));
+                for (size_t j = 0; j < count; j++) {
+                    fl[j].index = (uint32_t)j;
+                    fl[j].align = ax_type_align(ty->enm.variant_fields[i][j], in);
+                    fl[j].size = ax_type_size(ty->enm.variant_fields[i][j], in);
+                    if (fl[j].align > max_align) max_align = fl[j].align;
+                }
+                qsort(fl, count, sizeof(FieldLayout), compare_fields);
+                
+                uint32_t offset = 0;
+                for (size_t j = 0; j < count; j++) {
+                    offset = (offset + fl[j].align - 1) & ~(fl[j].align - 1);
+                    offset += fl[j].size;
+                }
+                if (count > 128) free(fl);
+                
+                if (offset > max_payload_size) max_payload_size = offset;
+            }
+            uint32_t total_size = 4 + max_payload_size;
+            return (total_size + max_align - 1) & ~(max_align - 1);
+        }
         case AX_TY_TUPLE: {
             size_t count = ty->tuple.field_count;
             if (count == 0) return 0;
@@ -218,4 +258,30 @@ uint32_t ax_type_field_offset(TypeId id, size_t field_idx, const TypeInterner *i
         return target_offset;
     }
     return 0;
+}
+uint32_t ax_type_enum_field_offset(TypeId id, uint32_t variant_idx, size_t field_idx, const TypeInterner *in) {
+    const AxType *ty = ax_type_get(in, id);
+    if (!ty || ty->kind != AX_TY_ENUM) return 0;
+    size_t count = ty->enm.variant_field_counts[variant_idx];
+    if (field_idx >= count) return 0;
+    FieldLayout fl_stack[128];
+    FieldLayout *fl = count <= 128 ? fl_stack : malloc(count * sizeof(FieldLayout));
+    for (size_t i = 0; i < count; i++) {
+        fl[i].index = (uint32_t)i;
+        fl[i].align = ax_type_align(ty->enm.variant_fields[variant_idx][i], in);
+        fl[i].size = ax_type_size(ty->enm.variant_fields[variant_idx][i], in);
+    }
+    qsort(fl, count, sizeof(FieldLayout), compare_fields);
+    uint32_t offset = 4;
+    uint32_t target_offset = 0;
+    for (size_t i = 0; i < count; i++) {
+        offset = (offset + fl[i].align - 1) & ~(fl[i].align - 1);
+        if (fl[i].index == field_idx) {
+            target_offset = offset;
+            break;
+        }
+        offset += fl[i].size;
+    }
+    if (count > 128) free(fl);
+    return target_offset;
 }
