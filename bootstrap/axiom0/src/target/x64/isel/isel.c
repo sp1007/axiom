@@ -101,6 +101,28 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(inst->constant.val));
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                     break;
+                case AX_LIR_INST_CONST_STR: {
+                    uint32_t sym_id = (uint32_t)(100000 + mi->string_count);
+                    if (mi->string_count >= mi->string_cap) {
+                        mi->string_cap = mi->string_cap == 0 ? 16 : mi->string_cap * 2;
+                        AxX64MIStr *new_strings = malloc(mi->string_cap * sizeof(AxX64MIStr));
+                        if (mi->strings) {
+                            memcpy(new_strings, mi->strings, mi->string_count * sizeof(AxX64MIStr));
+                            free(mi->strings);
+                        }
+                        mi->strings = new_strings;
+                    }
+                    mi->strings[mi->string_count].bytes = inst->const_str.bytes;
+                    mi->strings[mi->string_count].len = inst->const_str.len;
+                    mi->strings[mi->string_count].sym_id = sym_id;
+                    mi->string_count++;
+
+                    emit(mi, mbb, AX_X64_MI_LEA, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_sym(sym_id));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(inst->const_str.len));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 8), ax_x64_op_reg(0));
+                    break;
+                }
                 case AX_LIR_INST_ADD:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
                     emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0));
@@ -366,6 +388,7 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                               // Or maybe the tests don't even run this code yet because they are C tests.
                               // In C driver tests `cdriver_abi.c`, it just checks the ABI classification!
                           }
+
                       } else {
                           if (inst->abi_arg.loc_kind == 0) { // REG
                               emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(inst->abi_arg.loc_reg_or_offset), ax_x64_op_frame(slot_offset + inst->abi_arg.val.v, 0));

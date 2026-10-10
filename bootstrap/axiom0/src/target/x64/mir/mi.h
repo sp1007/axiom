@@ -74,7 +74,12 @@ typedef struct AxX64MIBb {
     AxX64MI *last_inst;
 } AxX64MIBb;
 
-// The MI function body
+typedef struct AxX64MIStr {
+    const uint8_t *bytes;
+    size_t len;
+    uint32_t sym_id;
+} AxX64MIStr;
+
 typedef struct AxX64MIBody {
     AxArena arena;
     AxX64MIBb *bbs;
@@ -82,6 +87,9 @@ typedef struct AxX64MIBody {
     // Frame requirements passed down from LIR
     uint32_t shadow_space;
     uint32_t stack_args_size;
+    AxX64MIStr *strings;
+    size_t string_count;
+    size_t string_cap;
 } AxX64MIBody;
 
 // Helpers to create operands

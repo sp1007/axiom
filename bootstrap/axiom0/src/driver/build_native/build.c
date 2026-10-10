@@ -172,6 +172,7 @@ void ax_stage_build_native(AxDriverState *st) {
 
     ax_objmodel_t obj;
     ax_objmodel_init(&obj);
+    ax_section_id_t my_rdata_sec_id = ax_objmodel_add_section(&obj, ".rdata", AX_SEC_RODATA, AX_SEC_FLAG_READ, 16);
     ax_section_id_t text_sec_id = ax_objmodel_add_section(&obj, ".text", AX_SEC_CODE, AX_SEC_FLAG_EXEC | AX_SEC_FLAG_READ, 16);
     ax_section_t *text_sec = ax_objmodel_get_section(&obj, text_sec_id);
 
@@ -188,6 +189,18 @@ void ax_stage_build_native(AxDriverState *st) {
 
                     AxX64MIBody *mi_body = ax_x64_isel(lir_body, &st->thir.interner);
                     AxX64FrameLayout layout = ax_x64_frame_lower(mi_body, lir_body, &st->thir.interner, &st->hir_arena);
+
+    ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, my_rdata_sec_id);
+    for (size_t i = 0; i < mi_body->string_count; i++) {
+        AxX64MIStr *str = &mi_body->strings[i];
+        uint32_t offset = rdata_sec->bytes_len;
+        ax_section_add_bytes(rdata_sec, str->bytes, str->len);
+        ax_section_add_byte(rdata_sec, 0); // null terminator for good measure
+        
+        char sym_name[64];
+        snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, str->sym_id);
+        ax_objmodel_add_symbol(&obj, strdup(sym_name), my_rdata_sec_id, offset, str->len, AX_SYM_GLOBAL);
+    }
                     ax_x64_verify(mi_body, &layout);
 
                     uint64_t func_start = text_sec->bytes_len;
@@ -222,15 +235,21 @@ void ax_stage_build_native(AxDriverState *st) {
                                 fixups[num_fixups].target = inst->ops[1].imm;
                                 num_fixups++;
                                 ax_x64_jcc(text_sec, (uint8_t)inst->ops[0].imm, 0);
+
+                            } else if (inst->opcode == AX_X64_MI_LEA && inst->ops[1].kind == AX_X64_OP_SYM) {
+                                char sym_name[64];
+                                snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, inst->ops[1].sym);
+                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(sym_name), ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL);
+                                ax_section_add_bytes(text_sec, (const uint8_t[]){0x48, 0x8D, 0x05}, 3);
+                                ax_section_add_reloc(text_sec, text_sec->bytes_len, AX_RELOC_X86_64_PC32, str_sym, -4);
+                                ax_section_add_bytes(text_sec, (const uint8_t[]){0, 0, 0, 0}, 4);
                             } else if (inst->opcode == AX_X64_MI_ASSERT) {
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 2;
                                 fixups[num_fixups].target = inst->ops[0].imm;
                                 num_fixups++;
                                 ax_x64_jcc(text_sec, 0x4, 0); // JE over panic block
-                                
-                                ax_section_id_t rdata_sec_id = ax_objmodel_add_section(&obj, ".rdata", AX_SEC_RODATA, AX_SEC_FLAG_READ, 8);
                                 text_sec = ax_objmodel_get_section(&obj, text_sec_id); // Refresh text_sec pointer
-                                ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, rdata_sec_id);
+                                ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, my_rdata_sec_id);
                                 uint32_t str_offset = rdata_sec->bytes_len;
                                 const char *msg = inst->msg ? inst->msg : "assertion failed";
                                 char formatted_msg[256];
@@ -242,7 +261,7 @@ void ax_stage_build_native(AxDriverState *st) {
                                 static int panic_id = 0;
                                 char panic_sym_name[64];
                                 snprintf(panic_sym_name, sizeof(panic_sym_name), ".Lpanic_%d", panic_id++);
-                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(panic_sym_name), rdata_sec_id, str_offset, len + 1, AX_SYM_GLOBAL);
+                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(panic_sym_name), my_rdata_sec_id, str_offset, len + 1, AX_SYM_GLOBAL);
                                 
                                 ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x83); ax_section_add_byte(text_sec, 0xEC); ax_section_add_byte(text_sec, 0x20); // sub rsp, 32
                                 ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x8D); ax_section_add_byte(text_sec, 0x0D);
@@ -276,6 +295,12 @@ void ax_stage_build_native(AxDriverState *st) {
         st->failed = true;
         ax_objmodel_free(&obj);
         return;
+    }
+
+
+    ax_section_t *rdata_sec2 = ax_objmodel_get_section(&obj, my_rdata_sec_id);
+    if (rdata_sec2->bytes_len == 0) {
+        ax_section_add_byte(rdata_sec2, 0);
     }
 
     if (ax_opt_emit != NULL && strcmp(ax_opt_emit, "obj") == 0) {

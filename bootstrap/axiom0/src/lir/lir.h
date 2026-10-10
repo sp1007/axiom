@@ -29,6 +29,7 @@ typedef enum AxLirInstKind {
     AX_LIR_INST_OFFSET,
     // Constants
     AX_LIR_INST_CONST,
+    AX_LIR_INST_CONST_STR,
     AX_LIR_INST_SADD_OVERFLOW,
     AX_LIR_INST_UADD_OVERFLOW,
     AX_LIR_INST_SSUB_OVERFLOW,
@@ -76,6 +77,10 @@ typedef struct AxLirInst {
             uint64_t val;
             TypeId ty;
         } constant;
+        struct {
+            const uint8_t *bytes;
+            size_t len;
+        } const_str;
         struct {
             const char *sym_name;
             TypeId callee_ty;

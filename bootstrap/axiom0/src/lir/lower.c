@@ -136,6 +136,13 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
     return addr;
 }
 
+static AxLirVRegId emit_const_str(LirBuilder *b, const uint8_t *bytes, size_t len, TypeId ty) {
+    AxLirVRegId dest = make_vreg(b, ty);
+    AxLirInst inst = { .kind = AX_LIR_INST_CONST_STR, .dest = dest, .const_str = { .bytes = bytes, .len = len } };
+    emit_inst(b, inst);
+    return dest;
+}
+
 static AxLirVRegId lower_operand(LirBuilder *b, const AxMirOperand *op) {
     switch (op->kind) {
         case AX_MIR_OP_COPY:
@@ -145,6 +152,9 @@ static AxLirVRegId lower_operand(LirBuilder *b, const AxMirOperand *op) {
             return emit_load(b, addr, place_ty);
         }
         case AX_MIR_OP_CONST:
+            if (op->constant.kind == AX_MIR_CONST_STR) {
+                return emit_const_str(b, op->constant.str.bytes, op->constant.str.len, op->constant.ty);
+            }
             return emit_const(b, op->constant.val, op->constant.ty);
     }
     return (AxLirVRegId){0};
@@ -406,6 +416,13 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                     AxMirLocalId loc = mbb->terminator.call.func.place.local;
                     callee_ty = mir->locals[loc.v].ty;
                 }
+                const AxType *cty = callee_ty.v ? ax_type_get(b.interner, callee_ty) : NULL;
+                if (cty && cty->kind == AX_TY_BUILTIN_PRINT) {
+                    sym_name = "__ax_host_print";
+                } else if (cty && cty->kind == AX_TY_BUILTIN_PRINT_INT) {
+                    sym_name = "__ax_host_print_int";
+                }
+                
                 AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
                 emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name, .callee_ty = callee_ty, .dst_addr = dst_addr } });
                 

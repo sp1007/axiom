@@ -129,6 +129,8 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
         case AX_X64_MI_LEA:
             if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_MEM) {
                 ax_x64_lea(sec, 8, inst->ops[0].reg, inst->ops[1].mem);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_SYM) {
+                ax_x64_lea_sym(sec, inst->ops[0].reg, (ax_symbol_id_t){ inst->ops[1].sym });
             }
             break;
         case AX_X64_MI_RET:
@@ -177,6 +179,8 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
     ax_objmodel_init(&obj);
     ax_section_id_t text_sec_id = ax_objmodel_add_section(&obj, ".text", AX_SEC_CODE, AX_SEC_FLAG_EXEC | AX_SEC_FLAG_READ, 16);
     ax_section_t *text_sec = ax_objmodel_get_section(&obj, text_sec_id);
+    ax_section_id_t rdata_sec_id = ax_objmodel_add_section(&obj, ".rdata", AX_SEC_RODATA, AX_SEC_FLAG_READ, 16);
+    ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, rdata_sec_id);
     
     for (const AxHirItem *item = st.hir.items; item != NULL; item = item->next) {
         if (item->kind == AX_HIR_ITEM_FN) {
@@ -192,6 +196,39 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
                     AxX64FrameLayout layout = ax_x64_frame_lower(mi_body, lir_body, &st.thir.interner, &st.hir_arena);
                     ax_x64_verify(mi_body, &layout);
                     
+                    uint32_t *sym_map = NULL;
+                    if (mi_body->string_count > 0) {
+                        sym_map = malloc(mi_body->string_count * sizeof(uint32_t));
+                        for (size_t s = 0; s < mi_body->string_count; s++) {
+                            AxX64MIStr *str = &mi_body->strings[s];
+                            uint64_t offset = rdata_sec->bytes_len;
+                            ax_section_add_bytes(rdata_sec, str->bytes, str->len);
+                            ax_section_add_byte(rdata_sec, 0); // null term
+                            while (rdata_sec->bytes_len % 8 != 0) {
+                                ax_section_add_byte(rdata_sec, 0);
+                            }
+                            char sym_name[64];
+                            snprintf(sym_name, sizeof(sym_name), ".Lstr.%u", str->sym_id);
+                            ax_symbol_id_t sym = ax_objmodel_add_symbol(&obj, sym_name, rdata_sec_id, offset, str->len, AX_SYM_LOCAL);
+                            sym_map[s] = sym.v;
+                        }
+                    }
+
+                    for (size_t b = 0; b < mi_body->bb_count; b++) {
+                        AxX64MIBb *mbb = &mi_body->bbs[b];
+                        for (AxX64MI *inst = mbb->first_inst; inst != NULL; inst = inst->next) {
+                            if (inst->opcode == AX_X64_MI_LEA && inst->ops[1].kind == AX_X64_OP_SYM) {
+                                for (size_t s = 0; s < mi_body->string_count; s++) {
+                                    if (inst->ops[1].sym == mi_body->strings[s].sym_id) {
+                                        inst->ops[1].sym = sym_map[s];
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (sym_map) free(sym_map);
+
                     uint64_t func_start = text_sec->bytes_len;
                     while (text_sec->bytes_len % 16 != 0) {
                         ax_section_add_byte(text_sec, 0x90);

@@ -297,18 +297,20 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
         fclose(f);
     }
     
+
     // Add axiom_start
     MergedSection *text_sec = get_or_create_section(&ctx, ".text", IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ);
     uint32_t axiom_start_offset = 0;
-    uint8_t start_code[] = {
-        0x48, 0x83, 0xEC, 0x28,       // sub rsp, 40
-        0xE8, 0x00, 0x00, 0x00, 0x00, // call main
-        0x8B, 0xC8,                   // mov ecx, eax
-        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, // call [rip + IAT_ExitProcess]
-        0xCC                          // int3
-    };
+    uint8_t start_code[] = { 0x53, 0x55, 0x48, 0x83, 0xEC, 0x38, 0x31, 0xED, 0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC1, 0x48, 0x8D, 0x54, 0x24, 0x30, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0x0D, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x89, 0xC5, 0xB9, 0xE9, 0xFD, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x89, 0xC3, 0x85, 0xED, 0x74, 0x08, 0x89, 0xE9, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x89, 0xD9, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0xCC };
     append_section_data(text_sec, start_code, sizeof(start_code), 16, &axiom_start_offset);
-    add_reloc(&ctx, text_sec, axiom_start_offset + 5, IMAGE_REL_AMD64_REL32, "main", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 17, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 31, IMAGE_REL_AMD64_REL32, "__IAT_GetConsoleMode", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 41, IMAGE_REL_AMD64_REL32, "__IAT_GetConsoleOutputCP", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 54, IMAGE_REL_AMD64_REL32, "__IAT_SetConsoleOutputCP", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 59, IMAGE_REL_AMD64_REL32, "main", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 73, IMAGE_REL_AMD64_REL32, "__IAT_SetConsoleOutputCP", 0);
+    add_reloc(&ctx, text_sec, axiom_start_offset + 81, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", 0);
+
     
     uint8_t panic_code[] = {
         0x56, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x89, 0xCB, 0xB9, 0xF4, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xD6,
@@ -328,11 +330,42 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     GlobalSymbol *panic_sym = add_global(&ctx, "axiom_panic");
     panic_sym->defined = true; panic_sym->sec = text_sec; panic_sym->offset = panic_offset;
     
+
+    uint8_t print_code[] = {
+        0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x89, 0xCB, 0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF,
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x89, 0xC1, 0x48, 0x8B, 0x13, 
+        0x4C, 0x8B, 0x43, 0x08, 0x90, 0x90, 
+        0x4C, 0x8D, 0x4C, 0x24, 0x28,
+        0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00,
+        0xFF, 0x15, 0x00, 0x00, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x30, 0x5B, 0xC3
+    };
+    uint32_t print_offset;
+    append_section_data(text_sec, print_code, sizeof(print_code), 16, &print_offset);
+    add_reloc(&ctx, text_sec, print_offset + 17, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", 0);
+    add_reloc(&ctx, text_sec, print_offset + 49, IMAGE_REL_AMD64_REL32, "__IAT_WriteFile", 0);
+    
+    GlobalSymbol *print_sym = add_global(&ctx, "__ax_host_print");
+    print_sym->defined = true; print_sym->sec = text_sec; print_sym->offset = print_offset;
+
+
+    uint8_t print_int_code[] = {
+        0x53, 0x56, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x89, 0xC8, 0x48, 0x8D, 0x7C, 0x24, 0x20, 0xC6, 0x07, 0x00, 0x48, 0xC7, 0xC3, 0x0A, 0x00, 0x00, 0x00, 0x48, 0x89, 0xFE, 0x48, 0x85, 0xC0, 0x79, 0x03, 0x48, 0xF7, 0xD8, 0x48, 0x31, 0xD2, 0x48, 0xF7, 0xF3, 0x80, 0xC2, 0x30, 0x48, 0xFF, 0xCE, 0x88, 0x16, 0x48, 0x85, 0xC0, 0x75, 0xED, 0x48, 0x85, 0xC9, 0x79, 0x06, 0x48, 0xFF, 0xCE, 0xC6, 0x06, 0x2D, 0x48, 0xC7, 0xC1, 0xF5, 0xFF, 0xFF, 0xFF, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC1, 0x48, 0x89, 0xF2, 0x49, 0x89, 0xF8, 0x49, 0x29, 0xF0, 0x4C, 0x8D, 0x4C, 0x24, 0x28, 0x48, 0xC7, 0x44, 0x24, 0x20, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x30, 0x5F, 0x5E, 0x5B, 0xC3
+    };
+    uint32_t print_int_offset;
+    append_section_data(text_sec, print_int_code, sizeof(print_int_code), 16, &print_int_offset);
+    add_reloc(&ctx, text_sec, print_int_offset + 75, IMAGE_REL_AMD64_REL32, "__IAT_GetStdHandle", 0);
+    add_reloc(&ctx, text_sec, print_int_offset + 107, IMAGE_REL_AMD64_REL32, "__IAT_WriteFile", 0);
+    
+    GlobalSymbol *print_int_sym = add_global(&ctx, "__ax_host_print_int");
+    print_int_sym->defined = true; print_int_sym->sec = text_sec; print_int_sym->offset = print_int_offset;
+
     // Build Import Directory
     MergedSection *idata_sec = get_or_create_section(&ctx, ".idata", IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
     uint32_t idata_base = 0;
     
-    uint8_t idata_buf[256] = {0};
+    uint8_t idata_buf[1024] = {0};
     uint32_t i_off = 0;
     
     IMAGE_IMPORT_DESCRIPTOR desc = {0};
@@ -340,10 +373,11 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     memcpy(idata_buf + i_off, &desc, 20); i_off += 20; // desc kernel32
     memset(idata_buf + i_off, 0, 20); i_off += 20;     // desc null
     
+
     uint32_t ilt_offset = i_off;
-    i_off += 32; // ILT (4x qword)
+    i_off += 56; // ILT (7x qword)
     uint32_t iat_offset = i_off;
-    i_off += 32; // IAT (4x qword)
+    i_off += 56; // IAT (7x qword)
 
     uint32_t hint_exit = i_off;
     idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
@@ -354,6 +388,16 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     uint32_t hint_write = i_off;
     idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
     strcpy((char*)idata_buf + i_off, "WriteFile"); i_off += 10;
+    uint32_t hint_setcp = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "SetConsoleOutputCP"); i_off += 19;
+    uint32_t hint_getcm = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "GetConsoleMode"); i_off += 15;
+    uint32_t hint_getcp = i_off;
+    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
+    strcpy((char*)idata_buf + i_off, "GetConsoleOutputCP"); i_off += 19;
+
 
     uint32_t dll_name_offset = i_off;
     strcpy((char*)idata_buf + i_off, "KERNEL32.dll"); i_off += 13;
@@ -384,21 +428,32 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     pdesc->Name = idata_rva + dll_name_offset;
     pdesc->FirstThunk = idata_rva + iat_offset;
     
+
     uint64_t rva_exit = idata_rva + hint_exit;
     uint64_t rva_getstd = idata_rva + hint_getstd;
     uint64_t rva_write = idata_rva + hint_write;
-
+    uint64_t rva_setcp = idata_rva + hint_setcp;
+    uint64_t rva_getcm = idata_rva + hint_getcm;
+    uint64_t rva_getcp = idata_rva + hint_getcp;
+    
     memcpy(idata_sec->data + idata_base + ilt_offset, &rva_exit, 8);
     memcpy(idata_sec->data + idata_base + ilt_offset + 8, &rva_getstd, 8);
     memcpy(idata_sec->data + idata_base + ilt_offset + 16, &rva_write, 8);
+    memcpy(idata_sec->data + idata_base + ilt_offset + 24, &rva_setcp, 8);
+    memcpy(idata_sec->data + idata_base + ilt_offset + 32, &rva_getcm, 8);
+    memcpy(idata_sec->data + idata_base + ilt_offset + 40, &rva_getcp, 8);
 
     memcpy(idata_sec->data + idata_base + iat_offset, &rva_exit, 8);
     memcpy(idata_sec->data + idata_base + iat_offset + 8, &rva_getstd, 8);
     memcpy(idata_sec->data + idata_base + iat_offset + 16, &rva_write, 8);
+    memcpy(idata_sec->data + idata_base + iat_offset + 24, &rva_setcp, 8);
+    memcpy(idata_sec->data + idata_base + iat_offset + 32, &rva_getcm, 8);
+    memcpy(idata_sec->data + idata_base + iat_offset + 40, &rva_getcp, 8);
+
     
+
     // Reloc for call [rip + IAT_ExitProcess]
-    uint32_t call_exit_offset = axiom_start_offset + 13;
-    add_reloc(&ctx, text_sec, call_exit_offset, IMAGE_REL_AMD64_REL32, "__IAT_ExitProcess", 0);
+    // Removed call_exit_offset logic because it was added in start_code relocations!
     
     GlobalSymbol *iat_exit = add_global(&ctx, "__IAT_ExitProcess");
     iat_exit->defined = true; iat_exit->sec = idata_sec; iat_exit->offset = idata_base + iat_offset;
@@ -408,6 +463,16 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
 
     GlobalSymbol *iat_write = add_global(&ctx, "__IAT_WriteFile");
     iat_write->defined = true; iat_write->sec = idata_sec; iat_write->offset = idata_base + iat_offset + 16;
+
+    GlobalSymbol *iat_setcp = add_global(&ctx, "__IAT_SetConsoleOutputCP");
+    iat_setcp->defined = true; iat_setcp->sec = idata_sec; iat_setcp->offset = idata_base + iat_offset + 24;
+
+    GlobalSymbol *iat_getcm = add_global(&ctx, "__IAT_GetConsoleMode");
+    iat_getcm->defined = true; iat_getcm->sec = idata_sec; iat_getcm->offset = idata_base + iat_offset + 32;
+
+    GlobalSymbol *iat_getcp = add_global(&ctx, "__IAT_GetConsoleOutputCP");
+    iat_getcp->defined = true; iat_getcp->sec = idata_sec; iat_getcp->offset = idata_base + iat_offset + 40;
+
 
     
     // Apply relocations
@@ -490,7 +555,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     dirs[1].VirtualAddress = idata_sec->rva + idata_base + desc_offset;
     dirs[1].Size = 40; // 2 descriptors
     dirs[12].VirtualAddress = idata_sec->rva + idata_base + iat_offset;
-    dirs[12].Size = 32; // 3 imports + null
+    dirs[12].Size = 40; // 3 imports + null
     fwrite(dirs, sizeof(IMAGE_DATA_DIRECTORY), 16, out);
     
     // Write Section Headers

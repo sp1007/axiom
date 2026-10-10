@@ -49,6 +49,7 @@ void ax_lir_print(FILE *out, const AxLirBody *body) {
                 case AX_LIR_INST_STACK_ADDR: fprintf(out, "stack_addr slot%u;\n", inst->stack_addr.slot.v); break;
                 case AX_LIR_INST_OFFSET: fprintf(out, "offset v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_CONST: fprintf(out, "const %llu;\n", (unsigned long long)inst->constant.val); break;
+                case AX_LIR_INST_CONST_STR: fprintf(out, "const_str \"...\" (len %zu);\n", inst->const_str.len); break;
                 case AX_LIR_INST_SADD_OVERFLOW: fprintf(out, "sadd_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
                 case AX_LIR_INST_UADD_OVERFLOW: fprintf(out, "uadd_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
                 case AX_LIR_INST_SSUB_OVERFLOW: fprintf(out, "ssub_overflow v%u, v%u;\n", inst->overflow_op.lhs.v, inst->overflow_op.rhs.v); break;
