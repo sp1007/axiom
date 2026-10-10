@@ -1,13 +1,10 @@
-# Unblock T121
+# Unblock T121: Move dataflow analysis
 
 ## Tóm tắt
-Thêm `bootstrap/axiom0/src/driver/pipeline.c` vào danh sách `paths` của task T121 và tạo ADR-0020 để ghi nhận quyết định này. Đã unblock T121 và cập nhật ROADMAP.md.
-
-## Quyết định
-- **Vấn đề**: T121 cần sửa đổi `bootstrap/axiom0/src/driver/pipeline.c` nhưng file này không nằm trong `paths`.
-- **Giải pháp**: Cập nhật trực tiếp `paths` của T121 thay vì chia nhỏ (split) task, vì việc đăng ký pipeline chỉ là một thay đổi nhỏ đi kèm với dataflow analysis.
+Task T121 gặp vấn đề không thể thêm chẩn đoán (diagnostics) với vị trí và nhãn (location & labels) do MIR hiện tại không theo dõi vị trí cho statements/operands. Để giải quyết, tôi đã tạo mới task T122 nhằm thêm tính năng theo dõi vị trí vào MIR (AxLocation) như một prerequisite cho T121. T121 đã được unblock (về trạng thái chờ T122 hoàn thành) và tài liệu cũng được cập nhật tương ứng.
 
 ## Files changed
-- spec/decisions/ADR-0020-rescope-t121-paths.md
-- spec/ROADMAP.md
-- _workspaces/tasks/todo/T121-move-dataflow-analysis.md
+* _workspaces/tasks/todo/T121-move-dataflow-analysis.md
+* _workspaces/tasks/todo/T122-mir-location-tracking.md
+* spec/decisions/ADR-0021-mir-location-tracking.md
+* spec/ROADMAP.md
