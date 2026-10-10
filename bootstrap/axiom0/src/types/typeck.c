@@ -1778,24 +1778,24 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             if (is_error(cx, expr_ty)) return in->t_error;
             const AxType *t = ax_type_get(in, expr_ty);
             if (t->kind != AX_TY_ENUM) {
-                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                return type_error(cx, expr->span, AX_TYPE_TRY_OPERAND);
             }
             StrView enum_name = ax_interner_get(cx->str_in, t->enm.def->enum_decl.name);
             bool is_opt = ax_sv_eq_cstr(enum_name, "Option");
             bool is_res = ax_sv_eq_cstr(enum_name, "Result");
             if (!is_opt && !is_res) {
-                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                return type_error(cx, expr->span, AX_TYPE_TRY_OPERAND);
             }
             
             if (is_error(cx, cx->return_type)) return in->t_error;
             const AxType *ret_t = ax_type_get(in, cx->return_type);
-            if (ret_t->kind != AX_TY_ENUM) return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            if (ret_t->kind != AX_TY_ENUM) return type_error(cx, expr->span, AX_TYPE_TRY_RETURN_MISMATCH);
             StrView ret_enum_name = ax_interner_get(cx->str_in, ret_t->enm.def->enum_decl.name);
             if (is_opt && !ax_sv_eq_cstr(ret_enum_name, "Option")) {
-                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                return type_error(cx, expr->span, AX_TYPE_TRY_RETURN_MISMATCH);
             }
             if (is_res && !ax_sv_eq_cstr(ret_enum_name, "Result")) {
-                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                return type_error(cx, expr->span, AX_TYPE_TRY_RETURN_MISMATCH);
             }
             
             const char *payload_var_name = is_opt ? "Some" : "Ok";

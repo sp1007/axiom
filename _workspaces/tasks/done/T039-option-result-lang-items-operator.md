@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T038b]
 priority: 59
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/result, tests/ui/result]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/result, tests/ui/result, bootstrap/axiom0/src/hir]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [tasks/0269, 0111, 0107, 0222, tasks/0288]
+started: 2026-10-10 09:12:39
+finished: 2026-10-10 10:19:14
 ---
 # T039 — Option/Result lang items + `?` operator
 
@@ -35,3 +37,7 @@ Error handling core: Option/Result in the prelude and `?` lowering.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-10 09:12:39 started (attempt 1) 
+- 2026-10-10 10:19:14 accepted by QA -> done
