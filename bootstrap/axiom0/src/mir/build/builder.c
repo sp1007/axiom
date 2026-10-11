@@ -1763,6 +1763,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
 }
 
 static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPlace dest) {
+    DropNode *old_drops = b->current_drops;
     for (const AxHirStmt *stmt = block->stmts; stmt != NULL; stmt = stmt->next) {
         if (stmt->kind == AX_HIR_STMT_EXPR) {
             if (!stmt->expr_stmt.has_semi && stmt->next == NULL) {
@@ -1794,12 +1795,15 @@ static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPla
         } else if (stmt->kind == AX_HIR_STMT_ASSIGN) {
             AxMirPlace dest = build_place(b, stmt->assign.left);
             if (dest.local.v == 0 && dest.proj_count == 0 && stmt->assign.left->kind != AX_HIR_EXPR_PATH) {
-                // If it's a real failure, we could AX_ICE, but let's just let it pass or AX_ICE
-                // Actually build_place returns err for anything else, so if it's 0 and not PATH, it's err (or maybe return place, but return place is PATH).
             }
             build_expr_into(b, stmt->assign.right, dest);
         }
     }
+    
+    if (!b->bbs[b->current_bb.v].is_terminated) {
+        b->current_bb = build_drop_chain(b, b->current_bb, b->current_drops, old_drops, (AxMirBbId){0}, b->current_span);
+    }
+    b->current_drops = old_drops;
 }
 
 
