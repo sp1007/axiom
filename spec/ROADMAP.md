@@ -392,3 +392,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-09-29 | R7 minimal C: T058→E14.4, T061 trimmed to const items (rest E14.1), T063→E15.8, T064→E15.4, T066→E16.9, T067→E18.6, T068→E17.3; P15 opens right after P10; new T003a core extensibility contract + exact self-host subset | owner decision |
 | 2026-10-10 | T047 rescoped to add locks for own.c, typeck.c, verify.c, and target verify.c so it can integrate analysis | ADR-0023 |
 | 2026-10-10 | T048b rescoped to remove sub-ranges and disjoint splits into new task T126 to manage size. | ADR-0026 |
+| 2026-10-11 | T128 rescoped to only handle explicit drop(x) builtin. Implicit block cleanup and destructors split into new task T131. | ADR-0029 |
