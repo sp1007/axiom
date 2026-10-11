@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T048b]
 priority: 69
-status: todo
+status: done
 paths: [bootstrap/axiom0/src/mir/drop, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/drop, tests/ui/drop, bootstrap/axiom0/src/driver, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/own/own.c, bootstrap/axiom0/src/own/cap/cap.c]
-locks: [bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/driver/pipeline.c]
-attempts: 0
-started: 2026-10-11 08:28:18
+locks: [tests/ui/mir/cdriver_mir_cap.c, tests/ui/mir/cdriver_mir_cap_qa.c, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/driver/pipeline.c]
+attempts: 1
+started: 2026-10-11 09:15:38
 unblocks: 1
+finished: 2026-10-11 09:31:17
 ---
 # T127 — MIR Infrastructure for Drop
 
@@ -36,3 +37,5 @@ Extend MIR data structures to support drop statements, drop flags, and drop term
 - 2026-10-11 08:28:18 started (attempt 1) T127-impl
 - 2026-10-11 09:11:06 block: QA failed 3 times: C-driver MIR parse test string uses wrong syntax (fn main instead of mir_body), causing ICE.
 - 2026-10-11 09:14:22 unblocked (cycle 1) 
+- 2026-10-11 09:15:38 started (attempt 1) T127-impl
+- 2026-10-11 09:31:17 accepted by QA -> done

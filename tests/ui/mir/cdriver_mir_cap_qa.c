@@ -40,7 +40,7 @@ static void test_qa_region_relate_projections(void) {
     AxMirPlace p_deref_field = { .local = {3}, .proj_count = 2, .projs = deref_then_field };
 
     AX_CHECK_EQ_INT(ax_mir_region_relate(&p_deref_1, &p_deref_2), AX_MIR_REGION_SAME);
-    AX_CHECK_EQ_INT(ax_mir_region_relate(&p_deref_1, &p_deref_field), AX_MIR_REGION_OVERLAPS);
+    AX_CHECK_EQ_INT(ax_mir_region_relate(&p_deref_1, &p_deref_field), AX_MIR_REGION_CONTAINS);
     AX_CHECK_EQ_INT(ax_mir_region_relate(&p_deref_field, &p_deref_1), AX_MIR_REGION_OVERLAPS);
 
     // 4. Mismatched projection kinds

@@ -1,5 +1,6 @@
 #include "driver/driver.h"
 #include "hir/lower.h"
+#include "mir/drop/drop.h"
 #include <string.h>
 #include <stdlib.h>
 #include <time.h>
@@ -295,6 +296,18 @@ static bool g_mir_initialized = false;
 
 #include "opt/opt.h"
 
+static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
+    if (it->kind == AX_HIR_ITEM_FN) {
+        AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
+        if (body) {
+            ax_verify_mir(body, &st->thir, &st->sink, it);
+            if (st->sink.errors == 0 && ax_opt_O1) {
+                ax_opt_run(body, &st->thir, &st->sink, it, ax_opt_verify_each);
+            }
+            AxMirMap_insert(&g_mir_map, it, body);
+        }
+    }
+}
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
@@ -308,16 +321,7 @@ static void stage_typeck(AxDriverState *st) {
     }
     
     for (AxHirItem *it = st->hir.items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_FN) {
-            AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
-            if (body) {
-                ax_verify_mir(body, &st->thir, &st->sink, it);
-                if (st->sink.errors == 0 && ax_opt_O1) {
-                    ax_opt_run(body, &st->thir, &st->sink, it, ax_opt_verify_each);
-                }
-                AxMirMap_insert(&g_mir_map, it, body);
-            }
-        }
+        build_mir_for_item(st, it);
     }
 }
 
@@ -337,6 +341,7 @@ static void stage_own(AxDriverState *st) {
             ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
         }
         ax_own_check(it, body, &st->thir, &st->sink, &st->interner);
+        ax_mir_drop_elaborate(body, &st->thir, &st->sink, &st->interner);
     }
 }
 

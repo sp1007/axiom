@@ -188,6 +188,7 @@ typedef enum AxMirStmtKind {
     AX_MIR_STMT_ASSIGN,
     AX_MIR_STMT_STORAGE_LIVE,
     AX_MIR_STMT_STORAGE_DEAD,
+    AX_MIR_STMT_DROP,
 } AxMirStmtKind;
 
 typedef struct AxMirStmt {
@@ -200,6 +201,7 @@ typedef struct AxMirStmt {
         } assign;
         AxMirLocalId storage_live;
         AxMirLocalId storage_dead;
+        AxMirPlace drop;
     };
 } AxMirStmt;
 

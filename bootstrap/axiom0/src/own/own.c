@@ -300,6 +300,10 @@ static void visit_stmt(Visitor *v, const AxMirStmt *stmt) {
         case AX_MIR_STMT_STORAGE_LIVE:
         case AX_MIR_STMT_STORAGE_DEAD:
             break;
+        case AX_MIR_STMT_DROP:
+            check_use(v, &stmt->drop, stmt->location);
+            do_move(v, &stmt->drop, stmt->location);
+            break;
     }
 }
 

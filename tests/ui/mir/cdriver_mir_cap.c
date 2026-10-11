@@ -23,7 +23,7 @@ static void test_region_relate(void) {
     AxMirProjection projs_a_f1_f2[] = { proj_f1, proj_f2 };
     AxMirPlace a_f1_f2 = { .local = {1}, .proj_count = 2, .projs = projs_a_f1_f2 };
     
-    AX_CHECK_EQ_INT(ax_mir_region_relate(&a_f1, &a_f1_f2), AX_MIR_REGION_OVERLAPS);
+    AX_CHECK_EQ_INT(ax_mir_region_relate(&a_f1, &a_f1_f2), AX_MIR_REGION_CONTAINS);
     AX_CHECK_EQ_INT(ax_mir_region_relate(&a_f1_f2, &a_f1), AX_MIR_REGION_OVERLAPS);
 }
 

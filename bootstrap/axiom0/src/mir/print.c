@@ -262,6 +262,11 @@ void ax_mir_print(FILE *out, const AxMirBody *body) {
                     print_local(out, stmt->storage_dead);
                     fprintf(out, ");\n");
                     break;
+                case AX_MIR_STMT_DROP:
+                    fprintf(out, "Drop(");
+                    print_place(out, &stmt->drop);
+                    fprintf(out, ");\n");
+                    break;
             }
         }
         print_terminator(out, &bb->terminator, 2);

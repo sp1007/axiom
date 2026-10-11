@@ -292,6 +292,10 @@ static AxMirStmt parse_stmt(MirParser *p) {
         stmt.kind = AX_MIR_STMT_STORAGE_DEAD;
         stmt.storage_dead = parse_local(p);
         expect_str(p, ")");
+    } else if (match_ident(p, "Drop(")) {
+        stmt.kind = AX_MIR_STMT_DROP;
+        stmt.drop = parse_place(p);
+        expect_str(p, ")");
     } else {
         stmt.kind = AX_MIR_STMT_ASSIGN;
         stmt.assign.place = parse_place(p);
@@ -497,7 +501,7 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
                 // Not a standalone terminator. Could be a statement OR a call terminator.
                 // Call terminator looks like: `_1 = ... (...) -> [return: bb1, unwind: bb2];`
                 // Statement looks like: `_1 = ...;` or `StorageLive(_1);`
-                if (match_ident(&p, "StorageLive(") || match_ident(&p, "StorageDead(")) {
+                if (match_ident(&p, "StorageLive(") || match_ident(&p, "StorageDead(") || match_ident(&p, "Drop(")) {
                     p.pos = saved;
                     AxMirStmt tmp = parse_stmt(&p); stmts[stmt_count++] = tmp;
                 } else {

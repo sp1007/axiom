@@ -159,6 +159,9 @@ static void visit_stmt(CapState *state, size_t local_count, const AxMirStmt *stm
         case AX_MIR_STMT_STORAGE_DEAD:
             state->caps[stmt->storage_dead.v].view = AX_MIR_VIEW_UNKNOWN;
             break;
+        case AX_MIR_STMT_DROP:
+            check_invalidate(state, local_count, &stmt->drop, stmt->location, sink, report);
+            break;
     }
 }
 
