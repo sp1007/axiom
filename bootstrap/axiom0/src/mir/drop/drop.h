@@ -5,6 +5,6 @@
 #include "hir/hir.h"
 #include "diag/diag.h"
 
-void ax_mir_drop_elaborate(AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const StrInterner *interner);
+void ax_mir_drop_elaborate(AxMirBody *body, const AxThir *thir, const AxHir *hir, const struct SourceDatabase *db, AxDiagSink *sink, const StrInterner *interner);
 
 #endif // AX_MIR_DROP_H

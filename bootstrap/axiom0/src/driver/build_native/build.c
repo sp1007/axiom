@@ -178,11 +178,17 @@ void ax_stage_build_native(AxDriverState *st) {
 
     for (const AxHirItem *item = st->hir.items; item != NULL; item = item->next) {
         if (item->kind == AX_HIR_ITEM_FN) {
-            AxMirBody *mir_body = ax_mir_build(item, &st->thir, &st->hir_arena);
+            AxMirBody *mir_body = ax_pipeline_get_mir(item);
             if (mir_body) {
                 const TypeId *pty = AxItemTypeMap_get(&st->thir.item_types, item);
-                if (!pty || pty->v == 0) continue;
-                const AxType *fn_ty = ax_type_get(&st->thir.interner, *pty);
+                TypeId ty_id = pty ? *pty : (TypeId){0};
+                if (ty_id.v == 0) {
+                    AxType dummy;
+                    memset(&dummy, 0, sizeof(dummy));
+                    dummy.kind = AX_TY_FN;
+                    ty_id = ax_intern_type(&st->thir.interner, &dummy);
+                }
+                const AxType *fn_ty = ax_type_get(&st->thir.interner, ty_id);
                 AxLirBody *lir_body = ax_lir_lower(mir_body, &st->hir, &st->thir.interner, &st->interner, fn_ty);
                 if (lir_body) {
                     ax_lir_lower_abi(lir_body, &st->thir.interner, &ax_abi_win64, fn_ty);

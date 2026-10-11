@@ -49,7 +49,7 @@ static void test_mir_drop_terminator_and_flag(void) {
 static void test_mir_drop_elaborate_stub(void) {
     AxMirBody body;
     memset(&body, 0, sizeof(body));
-    ax_mir_drop_elaborate(&body, NULL, NULL, NULL);
+    ax_mir_drop_elaborate(&body, NULL, NULL, NULL, NULL, NULL);
     // Verified that stub does not crash or dereference NULL prematurely
     AX_CHECK(true);
 }

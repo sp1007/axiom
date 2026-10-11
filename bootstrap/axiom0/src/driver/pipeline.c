@@ -281,6 +281,41 @@ static void stage_resolve(AxDriverState *st) {
 
 static void stage_hir(AxDriverState *st) {
     st->hir = ax_lower_ast(&st->hir_arena, &st->parse_res.ast, &st->resolve_map, &st->sink);
+
+    // BOOTSTRAP-SHORTCUT T087: Link impl members to the main AST item list to ensure they are typechecked.
+    // This avoids memory leaks and bypasses the need for complex module resolution of methods for now.
+    AxHirItem *tail = st->hir.items;
+    if (tail) {
+        while (tail->next) tail = tail->next;
+        for (AxHirItem *it = st->hir.items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_IMPL && it->impl.members) {
+                // BOOTSTRAP-SHORTCUT T131: Mangle destructor names
+                if (it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+                    StrView trait_name = ax_source_db_span_text(&st->db, it->impl.trait_path->span);
+                    if (trait_name.len == 4 && memcmp(trait_name.ptr, "Drop", 4) == 0) {
+                        StrView self_name = ax_source_db_span_text(&st->db, it->impl.self_type->path.path.span);
+                        char mangled[256];
+                        snprintf(mangled, sizeof(mangled), "%.*s_drop", (int)self_name.len, self_name.ptr);
+                        StrId mangled_id = ax_intern_cstr(&st->interner, mangled);
+                        AxSymbolId mangled_sym = { mangled_id.v };
+                        
+                        for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                            if (m->kind == AX_HIR_ITEM_FN) {
+                                StrView fname = ax_interner_get(&st->interner, m->fn.name);
+                                if (fname.len == 4 && memcmp(fname.ptr, "drop", 4) == 0) {
+                                    m->fn.name = mangled_id;
+                                    m->fn.symbol = mangled_sym;
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                tail->next = it->impl.members;
+                while (tail->next) tail = tail->next;
+            }
+        }
+    }
 }
 
 #include "mir/build/build.h"
@@ -290,9 +325,15 @@ static void stage_hir(AxDriverState *st) {
 typedef AxMirBody *AxMirBodyPtr;
 AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
 
-static AxArena g_mir_arena;
-static AxMirMap g_mir_map;
+static AxMirMap g_mir_map = {0};
+static AxArena g_mir_arena = {0};
 static bool g_mir_initialized = false;
+
+struct AxMirBody *ax_pipeline_get_mir(const struct AxHirItem *it) {
+    AxMirBody **ptr = AxMirMap_get(&g_mir_map, (AxHirItemPtr)it);
+    if (ptr) return *ptr;
+    return NULL;
+}
 
 #include "opt/opt.h"
 
@@ -341,7 +382,7 @@ static void stage_own(AxDriverState *st) {
             ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
         }
         ax_own_check(it, body, &st->thir, &st->sink, &st->interner);
-        ax_mir_drop_elaborate(body, &st->thir, &st->sink, &st->interner);
+        ax_mir_drop_elaborate(body, &st->thir, &st->hir, &st->db, &st->sink, &st->interner);
     }
 }
 

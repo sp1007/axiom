@@ -165,4 +165,6 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after);
 // Free pipeline context
 void ax_pipeline_free(AxDriverState *st);
 
+struct AxMirBody *ax_pipeline_get_mir(const struct AxHirItem *it);
+
 #endif /* AX_DRIVER_DRIVER_H */

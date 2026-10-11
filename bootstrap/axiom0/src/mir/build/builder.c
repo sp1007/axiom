@@ -145,6 +145,7 @@ static bool type_needs_drop(Builder *b, TypeId ty) {
         }
         return false;
     }
+
     return false;
 }
 
@@ -1792,6 +1793,16 @@ static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPla
                     AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, ty, false);
                     AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                     build_expr_into(b, stmt->expr_stmt.expr, temp_place);
+                    
+                    if (type_needs_drop(b, ty)) {
+                        AxMirBbId next_bb = add_bb(b);
+                        AxMirTerminator term = {0};
+                        term.kind = AX_MIR_TERM_DROP;
+                        term.drop.place = temp_place;
+                        term.drop.target = next_bb;
+                        set_terminator(b, b->current_bb, term);
+                        b->current_bb = next_bb;
+                    }
                 } else {
                     AxMirPlace void_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                     build_expr_into(b, stmt->expr_stmt.expr, void_place);
