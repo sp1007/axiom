@@ -941,6 +941,9 @@ skip_write:;
             current_bb = term->assert.target;
         } else if (term->kind == AX_MIR_TERM_RETURN) {
             break;
+        } else if (term->kind == AX_MIR_TERM_DROP) {
+            fprintf(ctx->out, "[interp] drop _%zu\n", (size_t)term->drop.place.local.v);
+            current_bb = term->drop.target;
         } else if (term->kind == AX_MIR_TERM_SWITCH_INT) {
             uint64_t discr = eval_operand(ctx, &frame, &term->switch_int.discr);
             AxMirBbId next = term->switch_int.targets.otherwise;

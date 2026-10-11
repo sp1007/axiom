@@ -1453,6 +1453,41 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
     } else if (expr->kind == AX_HIR_EXPR_CALL) {
         if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
             TypeId callee_ty = get_expr_type(b, expr->call.callee);
+            if (!TypeId_is_none(callee_ty) && ax_type_get(&b->thir->interner, callee_ty)->kind == AX_TY_BUILTIN_DROP) {
+                AxMirOperand arg = build_expr_as_operand(b, expr->call.args);
+                AxMirPlace arg_place;
+                if (arg.kind == AX_MIR_OP_COPY || arg.kind == AX_MIR_OP_MOVE) {
+                    arg_place = arg.place;
+                } else {
+                    AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, get_expr_type(b, expr->call.args), false);
+                    arg_place = (AxMirPlace){ temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt s = {0};
+                    s.kind = AX_MIR_STMT_ASSIGN;
+                    s.assign.place = arg_place;
+                    s.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    s.assign.rvalue.use = arg;
+                    push_stmt(b, b->current_bb, s);
+                }
+                AxMirBbId next_bb = add_bb(b);
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_DROP;
+                term.location = expr->span;
+                term.drop.place = arg_place;
+                term.drop.target = next_bb;
+                term.drop.unwind = (AxMirBbId){0};
+                set_terminator(b, b->current_bb, term);
+                b->current_bb = next_bb;
+
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+                stmt.assign.rvalue.aggregate.operands = NULL;
+                stmt.assign.rvalue.aggregate.operand_count = 0;
+                stmt.assign.rvalue.aggregate.variant_idx = 0;
+                push_stmt(b, b->current_bb, stmt);
+                return;
+            }
             if (!TypeId_is_none(callee_ty) && ax_type_get(&b->thir->interner, callee_ty)->kind == AX_TY_BUILTIN_LEN) {
                 AxMirOperand arg = build_expr_as_operand(b, expr->call.args);
                 AxMirPlace arg_place;
