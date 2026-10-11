@@ -126,6 +126,24 @@ static bool type_needs_drop(Builder *b, TypeId ty) {
     if (!t) return false;
     if (t->kind == AX_TY_STRUCT) {
         if (t->strct.def->struct_decl.struct_fields == NULL) return true;
+        for (size_t i = 0; i < t->strct.field_count; i++) {
+            if (type_needs_drop(b, t->strct.fields[i])) return true;
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_TUPLE) {
+        for (size_t i = 0; i < t->tuple.field_count; i++) {
+            if (type_needs_drop(b, t->tuple.fields[i])) return true;
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_ENUM) {
+        for (size_t v = 0; v < t->enm.variant_count; v++) {
+            for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
+                if (type_needs_drop(b, t->enm.variant_fields[v][i])) return true;
+            }
+        }
+        return false;
     }
     return false;
 }
@@ -1870,7 +1888,8 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
         TypeId pty = {0};
         const TypeId *pty_ptr = AxParamTypeMap_get(&thir->param_types, p);
         if (pty_ptr) pty = *pty_ptr;
-        AxMirLocalId loc = add_local(&b, AX_MIR_LOCAL_USER, pty, p->is_mut);
+        AxMirLocalId loc = add_local(&b, AX_MIR_LOCAL_ARG, pty, p->is_mut);
+        push_drop(&b, (AxMirPlace){ loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 }, pty);
         if (b.var_count >= b.var_cap) {
             b.var_cap = b.var_cap ? b.var_cap * 2 : 16;
             b.var_map = realloc(b.var_map, b.var_cap * sizeof(*b.var_map));

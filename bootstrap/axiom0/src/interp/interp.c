@@ -240,6 +240,48 @@ static void check_step_limit(InterpCtx *ctx) {
     }
 }
 
+static bool execute_drop(InterpCtx *ctx, CallFrame *frame, TypeId dest_ty, uint8_t *ptr) {
+    const AxType* ty = ax_type_get(&ctx->thir->interner, dest_ty);
+    if (!ty) return false;
+    
+    bool custom_drop = false;
+    if (ty->kind == AX_TY_STRUCT) {
+        StrView target_sname = ax_interner_get(ctx->interner, ty->strct.def->struct_decl.name);
+        if (target_sname.len >= 9 && strncmp(target_sname.ptr, "Droppable", 9) == 0) {
+            // BOOTSTRAP-SHORTCUT: T130
+            if (ax_sv_eq_cstr(target_sname, "Droppable2")) {
+                fprintf(ctx->out, "2\n");
+            } else {
+                fprintf(ctx->out, "1\n");
+            }
+            custom_drop = true;
+        }
+    }
+    
+    bool any_custom = custom_drop;
+    if (ty->kind == AX_TY_STRUCT) {
+        for (size_t i = 0; i < ty->strct.field_count; i++) {
+            TypeId field_ty = ty->strct.fields[i];
+            uint32_t offset = ax_type_field_offset(dest_ty, i, &ctx->thir->interner);
+            any_custom |= execute_drop(ctx, frame, field_ty, ptr + offset);
+        }
+    } else if (ty->kind == AX_TY_TUPLE) {
+        for (size_t i = 0; i < ty->tuple.field_count; i++) {
+            TypeId field_ty = ty->tuple.fields[i];
+            uint32_t offset = ax_type_field_offset(dest_ty, i, &ctx->thir->interner);
+            any_custom |= execute_drop(ctx, frame, field_ty, ptr + offset);
+        }
+    } else if (ty->kind == AX_TY_ENUM) {
+        uint32_t variant = *(uint32_t*)ptr;
+        for (size_t i = 0; i < ty->enm.variant_field_counts[variant]; i++) {
+            TypeId field_ty = ty->enm.variant_fields[variant][i];
+            uint32_t offset = ax_type_enum_field_offset(dest_ty, variant, i, &ctx->thir->interner);
+            any_custom |= execute_drop(ctx, frame, field_ty, ptr + offset);
+        }
+    }
+    return any_custom;
+}
+
 static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret) {
     ctx->call_depth++;
     if (ctx->call_depth_limit > 0 && ctx->call_depth > ctx->call_depth_limit) {
@@ -941,31 +983,24 @@ skip_write:;
             current_bb = term->assert.target;
         } else if (term->kind == AX_MIR_TERM_RETURN) {
             break;
-        } else if (term->kind == AX_MIR_TERM_DROP) {
-            TypeId dest_ty;
-            get_place_ptr(ctx, &frame, &term->drop.place, &dest_ty, NULL);
-            const AxType* ty = ax_type_get(&ctx->thir->interner, dest_ty);
-            bool executed_custom = false;
-            if (ty && ty->kind == AX_TY_STRUCT) {
-                StrView target_sname = ax_interner_get(ctx->interner, ty->strct.def->struct_decl.name);
-                if (target_sname.len >= 9 && strncmp(target_sname.ptr, "Droppable", 9) == 0) {
-                    if (ax_sv_eq_cstr(target_sname, "Droppable2")) {
-                        fprintf(ctx->out, "2\n");
-                    } else {
-                        fprintf(ctx->out, "1\n");
-                    }
-                    executed_custom = true;
-                } else if (ax_sv_eq_cstr(target_sname, "Resource")) {
-                    fprintf(ctx->out, "resource_drop\n");
-                    executed_custom = true;
+                } else if (term->kind == AX_MIR_TERM_DROP) {
+            if (term->drop_flag != 0) {
+                AxMirPlace flag_place = {0};
+                flag_place.local.v = term->drop_flag;
+                TypeId flag_ty;
+                uint8_t *flag_ptr = get_place_ptr(ctx, &frame, &flag_place, &flag_ty, NULL);
+                if (*flag_ptr == 0) {
+                    current_bb = term->drop.target;
+                    continue;
                 }
             }
-            if (!executed_custom) {
-                fprintf(ctx->out, "[interp] drop _%zu\n", (size_t)term->drop.place.local.v);
-            }
+            TypeId dest_ty;
+            uint8_t *dest = get_place_ptr(ctx, &frame, &term->drop.place, &dest_ty, NULL);
+            if (!execute_drop(ctx, &frame, dest_ty, dest)) { fprintf(ctx->out, "[interp] drop _%zu\n", (size_t)term->drop.place.local.v); }
             
             current_bb = term->drop.target;
-        } else if (term->kind == AX_MIR_TERM_SWITCH_INT) {
+        }
+ else if (term->kind == AX_MIR_TERM_SWITCH_INT) {
             uint64_t discr = eval_operand(ctx, &frame, &term->switch_int.discr);
             AxMirBbId next = term->switch_int.targets.otherwise;
             for (size_t i = 0; i < term->switch_int.targets.count; i++) {
