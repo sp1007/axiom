@@ -8,12 +8,15 @@ model: opus
 gate_model: sonnet
 depends: [T048b]
 priority: 69
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/mir/drop, bootstrap/axiom0/src/interp, tests/run/drop, tests/ui/drop]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/mir/drop, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/interp, tests/run/drop, tests/ui/drop, bootstrap/axiom0/src/driver, bootstrap/axiom0/src/lir]
 locks: [bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [spec/SPEC-12-drop.md, 0178, 0030, 0118, tasks/0674]
 covers: [REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006]
+started: 2026-10-11 00:21:15
+superseded_by: T127
+finished: 2026-10-11 07:37:50
 ---
 # T049 — Drop elaboration + cleanup on every edge
 
@@ -37,3 +40,6 @@ Deterministic destruction made explicit in MIR.
 
 ## Log
 - 2026-10-06 02:24:22 covers += REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006 (metadata only)
+- 2026-10-11 00:21:15 started (attempt 1) T049-impl
+- 2026-10-11 07:36:15 block: QA failed 3 times: builder.c/interp.c logic hallucinated, GCC compilation errors (AxMirBb missing stmt_cap), layer violations.
+- 2026-10-11 07:37:50 superseded by T127 -> done (no code of its own)
