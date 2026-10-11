@@ -31,6 +31,7 @@ typedef enum AxMirLocalKind {
     AX_MIR_LOCAL_RETURN,
     AX_MIR_LOCAL_USER,
     AX_MIR_LOCAL_TEMP,
+    AX_MIR_LOCAL_ARG,
 } AxMirLocalKind;
 
 typedef struct AxMirLocalDecl {
@@ -45,6 +46,7 @@ typedef enum AxMirProjKind {
     AX_MIR_PROJ_FIELD,
     AX_MIR_PROJ_INDEX,
     AX_MIR_PROJ_DOWNCAST,
+    AX_MIR_PROJ_SUB_SLICE,
 } AxMirProjKind;
 
 typedef struct AxMirProjection {
@@ -53,6 +55,12 @@ typedef struct AxMirProjection {
         uint32_t field_idx;
         AxMirLocalId index_local;
         uint32_t variant_idx;
+        struct {
+            AxMirLocalId from_local;
+            AxMirLocalId to_local;
+            bool has_from;
+            bool has_to;
+        } sub_slice;
     };
 } AxMirProjection;
 
@@ -254,6 +262,7 @@ typedef struct AxMirTerminator {
 typedef struct AxMirBb {
     AxMirStmt *stmts;
     size_t stmt_count;
+    size_t stmt_cap;
     AxMirTerminator terminator;
 } AxMirBb;
 

@@ -116,6 +116,30 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 addr = emit_offset(b, addr, dummy_off);
                 break;
             }
+            case AX_MIR_PROJ_SUB_SLICE: {
+                const AxType *t = ax_type_get(b->interner, ty);
+                TypeId elem_ty = {0};
+                if (t && t->kind == AX_TY_ARRAY) elem_ty = t->array.elem;
+                else if (t && t->kind == AX_TY_SLICE) elem_ty = t->slice.elem;
+                else if (t && t->kind == AX_TY_STR) elem_ty = b->interner->t_u8;
+                if (place->projs[i].sub_slice.has_from) {
+                    AxLirStackSlotId idx_slot = { place->projs[i].sub_slice.from_local.v };
+                    AxLirVRegId idx_addr = emit_stack_addr(b, idx_slot);
+                    AxLirVRegId idx_val = emit_load(b, idx_addr, b->interner->t_usize);
+                    uint32_t fs = ax_type_size(elem_ty, b->interner);
+                    AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
+                    AxLirVRegId offset = make_vreg(b, b->interner->t_usize);
+                    emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = offset, .binary = { .lhs = idx_val, .rhs = dummy_size } });
+                    addr = emit_offset(b, addr, offset);
+                }
+                if (t && t->kind == AX_TY_ARRAY) {
+                    AxType sl; memset(&sl, 0, sizeof(sl));
+                    sl.kind = AX_TY_SLICE;
+                    sl.slice.elem = elem_ty;
+                    ty = ax_intern_type(b->interner, &sl);
+                }
+                break;
+            }
             case AX_MIR_PROJ_INDEX: {
                 const AxType *t = ax_type_get(b->interner, ty);
                 TypeId elem_ty = {0};

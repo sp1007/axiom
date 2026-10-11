@@ -24,6 +24,19 @@ AxMirRegion ax_mir_region_relate(const AxMirPlace *a, const AxMirPlace *b) {
              if (pa.variant_idx != pb.variant_idx) {
                  return AX_MIR_REGION_DISJOINT;
              }
+        } else if (pa.kind == AX_MIR_PROJ_SUB_SLICE) {
+            if (pa.sub_slice.has_from && pb.sub_slice.has_to && pa.sub_slice.from_local.v == pb.sub_slice.to_local.v) {
+                return AX_MIR_REGION_DISJOINT;
+            }
+            if (pa.sub_slice.has_to && pb.sub_slice.has_from && pa.sub_slice.to_local.v == pb.sub_slice.from_local.v) {
+                return AX_MIR_REGION_DISJOINT;
+            }
+            if (pa.sub_slice.has_from && pb.sub_slice.has_from && pa.sub_slice.from_local.v == pb.sub_slice.from_local.v && 
+                pa.sub_slice.has_to && pb.sub_slice.has_to && pa.sub_slice.to_local.v == pb.sub_slice.to_local.v) {
+                // same slice
+            } else {
+                return AX_MIR_REGION_UNKNOWN;
+            }
         } else if (pa.kind == AX_MIR_PROJ_DEREF) {
              // same deref
         } else {

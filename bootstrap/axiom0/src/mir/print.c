@@ -21,6 +21,7 @@ static void print_place(FILE *out, const AxMirPlace *place) {
             case AX_MIR_PROJ_DEREF: fprintf(out, "(*"); break;
             case AX_MIR_PROJ_FIELD: fprintf(out, "("); break;
             case AX_MIR_PROJ_INDEX: fprintf(out, "("); break;
+            case AX_MIR_PROJ_SUB_SLICE: fprintf(out, "("); break;
             case AX_MIR_PROJ_DOWNCAST: fprintf(out, "("); break;
         }
     }
@@ -32,6 +33,13 @@ static void print_place(FILE *out, const AxMirPlace *place) {
             case AX_MIR_PROJ_DEREF: fprintf(out, ")"); break;
             case AX_MIR_PROJ_FIELD: fprintf(out, ").%u", place->projs[i].field_idx); break;
             case AX_MIR_PROJ_INDEX: fprintf(out, ")["); print_local(out, place->projs[i].index_local); fprintf(out, "]"); break;
+            case AX_MIR_PROJ_SUB_SLICE:
+                fprintf(out, ")[");
+                if (place->projs[i].sub_slice.has_from) print_local(out, place->projs[i].sub_slice.from_local);
+                fprintf(out, "..");
+                if (place->projs[i].sub_slice.has_to) print_local(out, place->projs[i].sub_slice.to_local);
+                fprintf(out, "]");
+                break;
             case AX_MIR_PROJ_DOWNCAST: fprintf(out, " as variant#%u)", place->projs[i].variant_idx); break;
         }
     }

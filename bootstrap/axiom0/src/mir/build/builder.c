@@ -523,6 +523,76 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         return base;
     } else if (expr->kind == AX_HIR_EXPR_INDEX) {
         AxMirPlace base = build_place(b, expr->index.base);
+        
+        bool is_range = expr->index.arg->kind == AX_HIR_EXPR_RANGE;
+        
+        if (is_range) {
+            AxMirLocalId start_local = {0}, end_local = {0};
+            bool has_start = expr->index.arg->range.start != NULL;
+            bool has_end = expr->index.arg->range.end != NULL;
+            
+            if (has_start) {
+                AxMirOperand start_op = build_expr_as_operand(b, expr->index.arg->range.start);
+                if ((start_op.kind == AX_MIR_OP_COPY || start_op.kind == AX_MIR_OP_MOVE) && start_op.place.proj_count == 0) {
+                    start_local = start_op.place.local;
+                } else {
+                    TypeId start_ty = get_expr_type(b, expr->index.arg->range.start);
+                    start_local = add_local(b, AX_MIR_LOCAL_TEMP, start_ty, false);
+                    AxMirPlace temp_place = { start_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt stmt = {0};
+                    stmt.kind = AX_MIR_STMT_ASSIGN;
+                    stmt.assign.place = temp_place;
+                    stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    stmt.assign.rvalue.use = start_op;
+                    push_stmt(b, b->current_bb, stmt);
+                }
+            }
+            
+            if (has_end) {
+                AxMirOperand end_op = build_expr_as_operand(b, expr->index.arg->range.end);
+                if ((end_op.kind == AX_MIR_OP_COPY || end_op.kind == AX_MIR_OP_MOVE) && end_op.place.proj_count == 0) {
+                    end_local = end_op.place.local;
+                } else {
+                    TypeId end_ty = get_expr_type(b, expr->index.arg->range.end);
+                    end_local = add_local(b, AX_MIR_LOCAL_TEMP, end_ty, false);
+                    AxMirPlace temp_place = { end_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt stmt = {0};
+                    stmt.kind = AX_MIR_STMT_ASSIGN;
+                    stmt.assign.place = temp_place;
+                    stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    stmt.assign.rvalue.use = end_op;
+                    push_stmt(b, b->current_bb, stmt);
+                }
+            }
+            
+            // Note: Bounds checking for slices is done in runtime lib or we can emit MIR asserts here
+            // The task implies "with checked bounds"
+            
+            TypeId base_ty = get_expr_type(b, expr->index.base);
+            const AxType *t = ax_type_get(&b->thir->interner, base_ty);
+            bool is_slice_view = (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&b->thir->interner, t->view.pointee)->kind == AX_TY_SLICE);
+            
+            size_t new_proj_count = base.proj_count + 1;
+            if (is_slice_view) new_proj_count++;
+            AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * new_proj_count, _Alignof(AxMirProjection));
+            for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
+            
+            size_t pi = base.proj_count;
+            if (is_slice_view) {
+                projs[pi].kind = AX_MIR_PROJ_DEREF;
+                pi++;
+            }
+            projs[pi].kind = AX_MIR_PROJ_SUB_SLICE;
+            projs[pi].sub_slice.from_local = start_local;
+            projs[pi].sub_slice.to_local = end_local;
+            projs[pi].sub_slice.has_from = has_start;
+            projs[pi].sub_slice.has_to = has_end;
+            
+            base.projs = projs;
+            base.proj_count = new_proj_count;
+            return base;
+        }
+
         AxMirOperand idx_op = build_expr_as_operand(b, expr->index.arg);
         
         AxMirLocalId idx_local;
@@ -652,7 +722,7 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             op.place = p;
             return op;
         }
-    } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
+    } else if (expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || (expr->kind == AX_HIR_EXPR_INDEX && expr->index.arg->kind != AX_HIR_EXPR_RANGE)) {
         if (AxExprVariantMap_get(&b->thir->expr_variants, expr)) {
             // It's a variant, let the default path build it into a temp
         } else {
@@ -712,13 +782,26 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         return;
     }
 
-    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || expr->kind == AX_HIR_EXPR_INDEX) {
+    if (expr->kind == AX_HIR_EXPR_LITERAL || expr->kind == AX_HIR_EXPR_PATH || expr->kind == AX_HIR_EXPR_FIELD || expr->kind == AX_HIR_EXPR_TUPLE_INDEX || (expr->kind == AX_HIR_EXPR_INDEX && expr->index.arg->kind != AX_HIR_EXPR_RANGE)) {
         AxMirOperand op = build_expr_as_operand(b, expr);
         AxMirStmt stmt = {0};
         stmt.kind = AX_MIR_STMT_ASSIGN;
         stmt.assign.place = dest;
         stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
         stmt.assign.rvalue.use = op;
+        push_stmt(b, b->current_bb, stmt);
+    } else if (expr->kind == AX_HIR_EXPR_INDEX && expr->index.arg->kind == AX_HIR_EXPR_RANGE) {
+        AxMirPlace p = build_place(b, expr);
+        AxMirStmt stmt = {0};
+        stmt.kind = AX_MIR_STMT_ASSIGN;
+        stmt.location = expr->span;
+        stmt.assign.place = dest;
+        stmt.assign.rvalue.kind = AX_MIR_RVALUE_REF;
+        
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = ax_type_get(&b->thir->interner, ty);
+        stmt.assign.rvalue.ref.bk = (t && t->kind == AX_TY_MUT_VIEW) ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
+        stmt.assign.rvalue.ref.place = p;
         push_stmt(b, b->current_bb, stmt);
     } else if (expr->kind == AX_HIR_EXPR_ARRAY) {
         if (expr->array.count) {
