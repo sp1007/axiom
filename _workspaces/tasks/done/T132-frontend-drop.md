@@ -8,9 +8,11 @@ model: opus
 gate_model: sonnet
 depends: [T127]
 priority: 68
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/types, tests/ui, tests/run/drop]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/types, tests/ui, tests/run/drop, tests/hir, tests/mir, tests/resolve, tests/typeck]
+started: 2026-10-11 19:00:19
+finished: 2026-10-11 19:30:05
 ---
 ## Goal
 Add the explicit `drop` builtin to the frontend (name resolution, type checking) and update all affected golden tests.
@@ -31,3 +33,5 @@ Add the explicit `drop` builtin to the frontend (name resolution, type checking)
 ## Notes
 - Extracted from T128 to fix scope violations and test regressions (ADR-0030).
 ## Log
+- 2026-10-11 19:00:19 started (attempt 1) T132-impl
+- 2026-10-11 19:30:05 accepted by QA -> done

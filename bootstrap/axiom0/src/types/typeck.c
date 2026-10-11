@@ -1068,6 +1068,12 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             st.kind = AX_TY_BUILTIN_PRINT_INT;
             return ax_intern_type(&cx->thir->interner, &st);
         }
+        if (ax_sv_eq_cstr(name, "drop")) {
+            AxType st;
+            memset(&st, 0, sizeof(st));
+            st.kind = AX_TY_BUILTIN_DROP;
+            return ax_intern_type(&cx->thir->interner, &st);
+        }
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
@@ -1238,7 +1244,20 @@ static TypeId check_unary(TypeckCtx *cx, const AxHirExpr *expr) {
 }
 
 static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
-    TypeId callee_ty = resolve_ty(cx, check_expr(cx, expr->call.callee, TypeId_none()));
+    TypeId callee_ty;
+    if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
+        callee_ty = resolve_ty(cx, lookup_path_type(cx, &expr->call.callee->path.path));
+        AxExprTypeMap_insert(&cx->thir->expr_types, expr->call.callee, callee_ty);
+        if (expr->call.callee->path.path.symbol.v != 0) {
+            for (size_t i = 0; i < cx->vars_len; i++) {
+                if (cx->vars[i].sym.v == expr->call.callee->path.path.symbol.v) {
+                    break;
+                }
+            }
+        }
+    } else {
+        callee_ty = resolve_ty(cx, check_expr(cx, expr->call.callee, TypeId_none()));
+    }
 
     const AxType *ct = ax_type_get(&cx->thir->interner, callee_ty);
     
@@ -1284,6 +1303,13 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
                 return cx->thir->interner.t_error;
             }
         }
+        return cx->thir->interner.t_unit;
+    }
+    if (ct->kind == AX_TY_BUILTIN_DROP) {
+        size_t argc = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+        if (argc != 1) return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
+        resolve_ty(cx, check_expr(cx, expr->call.args, TypeId_none()));
         return cx->thir->interner.t_unit;
     }
     
@@ -1690,6 +1716,12 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                     if (cx->vars[i].sym.v == expr->path.path.symbol.v) {
                         break;
                     }
+                }
+            }
+            if (!is_error(cx, t)) {
+                AxTypeKind k = ax_type_get(&cx->thir->interner, resolve_ty(cx, t))->kind;
+                if (k == AX_TY_BUILTIN_DROP || k == AX_TY_BUILTIN_LEN || k == AX_TY_BUILTIN_PRINT || k == AX_TY_BUILTIN_PRINT_INT) {
+                    return type_error(cx, expr->span, AX_TYPE_MISMATCH);
                 }
             }
             return t;
