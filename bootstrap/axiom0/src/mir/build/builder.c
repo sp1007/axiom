@@ -12,12 +12,21 @@ typedef struct BbData {
 } BbData;
 
 
+
+typedef struct DropNode {
+    AxMirPlace place;
+    AxLocation location;
+    struct DropNode *next;
+} DropNode;
+
 typedef struct LoopContext {
     AxMirBbId break_bb;
     AxMirBbId continue_bb;
     AxMirPlace dest;
     StrId label;
+    DropNode *drop_scope;
 } LoopContext;
+
 
 typedef struct Builder {
     AxArena *arena;
@@ -45,8 +54,12 @@ typedef struct Builder {
     } *var_map;
     size_t var_count;
     size_t var_cap;
+    DropNode *current_drops;
 } Builder;
 
+static void push_drop(Builder *b, AxMirPlace place, TypeId ty);
+static bool type_needs_drop(Builder *b, TypeId ty);
+static AxMirBbId build_drop_chain(Builder *b, AxMirBbId current_bb, DropNode *from, DropNode *to, AxMirBbId target_bb, AxLocation loc);
 static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
 static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
 static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace dest);
@@ -66,6 +79,10 @@ static AxMirLocalId add_local(Builder *b, AxMirLocalKind kind, TypeId ty, bool m
     b->locals[id.v].ty = ty;
     b->locals[id.v].mut = mut;
     b->locals[id.v].location = b->current_span;
+    if (kind == AX_MIR_LOCAL_USER) {
+        AxMirPlace place = { id, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+        push_drop(b, place, ty);
+    }
     return id;
 }
 
@@ -103,6 +120,49 @@ static void set_terminator(Builder *b, AxMirBbId bb, AxMirTerminator term) {
     }
 }
 
+
+static bool type_needs_drop(Builder *b, TypeId ty) {
+    const AxType *t = ax_type_get(&b->thir->interner, ty);
+    if (!t) return false;
+    if (t->kind == AX_TY_STRUCT) {
+        if (t->strct.def->struct_decl.struct_fields == NULL) return true;
+    }
+    return false;
+}
+
+static void push_drop(Builder *b, AxMirPlace place, TypeId ty) {
+    if (type_needs_drop(b, ty)) {
+        DropNode *node = ax_arena_alloc_array(b->arena, 1, sizeof(DropNode), _Alignof(DropNode));
+        node->place = place;
+        node->location = b->current_span;
+        node->next = b->current_drops;
+        b->current_drops = node;
+    }
+}
+
+static AxMirBbId build_drop_chain(Builder *b, AxMirBbId current_bb, DropNode *from, DropNode *to, AxMirBbId target_bb, AxLocation loc) {
+    DropNode *curr = from;
+    while (curr != to) {
+        AxMirBbId next_bb = add_bb(b);
+        AxMirTerminator term = {0};
+        term.kind = AX_MIR_TERM_DROP;
+        term.location = loc;
+        term.drop.place = curr->place;
+        term.drop.target = next_bb;
+        term.drop.unwind = (AxMirBbId){0};
+        set_terminator(b, current_bb, term);
+        current_bb = next_bb;
+        curr = curr->next;
+    }
+    if (target_bb.v != 0) {
+        AxMirTerminator term = {0};
+        term.kind = AX_MIR_TERM_GOTO;
+        term.goto_target = target_bb;
+        term.location = loc;
+        set_terminator(b, current_bb, term);
+    }
+    return current_bb;
+}
 static TypeId get_expr_type(Builder *b, const AxHirExpr *expr) {
     TypeId ty = {0};
     const TypeId *res = AxExprTypeMap_get(&b->thir->expr_types, expr);
@@ -213,7 +273,14 @@ static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPl
             stmt.kind = AX_MIR_STMT_ASSIGN;
             stmt.assign.place.local = loc;
             stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
-            stmt.assign.rvalue.use.kind = AX_MIR_OP_COPY;
+            
+            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            bool is_copy = true;
+            if (t && (t->kind == AX_TY_STR || t->kind == AX_TY_ARRAY)) {
+                is_copy = false;
+            }
+            stmt.assign.rvalue.use.kind = is_copy ? AX_MIR_OP_COPY : AX_MIR_OP_MOVE;
+            
             stmt.assign.rvalue.use.place = place;
             push_stmt(b, current_bb, stmt);
             return current_bb;
@@ -1276,6 +1343,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
             push_stmt(b, b->current_bb, ret_assign);
         }
         
+        b->current_bb = build_drop_chain(b, b->current_bb, b->current_drops, NULL, (AxMirBbId){0}, b->current_span);
         AxMirTerminator ret_term = {0};
         ret_term.kind = AX_MIR_TERM_RETURN;
         ret_term.region = AX_MIR_REGION_UNKNOWN;
@@ -1391,6 +1459,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         b->loops[b->loop_count].continue_bb = loop_bb;
         b->loops[b->loop_count].dest = dest;
         b->loops[b->loop_count].label = expr->loop.label;
+        b->loops[b->loop_count].drop_scope = b->current_drops;
         b->loop_count++;
         
         build_block_into(b, &expr->loop.block, dest);
@@ -1437,6 +1506,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         b->loops[b->loop_count].continue_bb = cond_bb;
         b->loops[b->loop_count].dest = dest;
         b->loops[b->loop_count].label = expr->while_expr.label;
+        b->loops[b->loop_count].drop_scope = b->current_drops;
         b->loop_count++;
         
         build_block_into(b, &expr->while_expr.block, dest);
@@ -1637,6 +1707,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 AxMirPlace ret_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                 build_expr_into(b, expr->jump.expr, ret_place);
             }
+            b->current_bb = build_drop_chain(b, b->current_bb, b->current_drops, NULL, (AxMirBbId){0}, b->current_span);
             AxMirTerminator term = {0};
             term.kind = AX_MIR_TERM_RETURN;
             set_terminator(b, b->current_bb, term);
@@ -1656,10 +1727,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 if (expr->jump.expr) {
                     build_expr_into(b, expr->jump.expr, target->dest);
                 }
-                AxMirTerminator term = {0};
-                term.kind = AX_MIR_TERM_GOTO;
-                term.goto_target = target->break_bb;
-                set_terminator(b, b->current_bb, term);
+                b->current_bb = build_drop_chain(b, b->current_bb, b->current_drops, target->drop_scope, target->break_bb, b->current_span);
             }
         } else if (expr->jump.jump_kind == AX_JUMP_CONTINUE) {
             LoopContext *target = NULL;
@@ -1674,10 +1742,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 target = &b->loops[b->loop_count - 1];
             }
             if (target) {
-                AxMirTerminator term = {0};
-                term.kind = AX_MIR_TERM_GOTO;
-                term.goto_target = target->continue_bb;
-                set_terminator(b, b->current_bb, term);
+                b->current_bb = build_drop_chain(b, b->current_bb, b->current_drops, target->drop_scope, target->continue_bb, b->current_span);
             }
         } else {
             AX_ICE("Unhandled jump kind in MIR builder");
@@ -1817,6 +1882,7 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
     build_block_into(&b, func->fn.body, ret_place);
     
     if (!b.bbs[b.current_bb.v].is_terminated) {
+        b.current_bb = build_drop_chain(&b, b.current_bb, b.current_drops, NULL, (AxMirBbId){0}, b.current_span);
         AxMirTerminator term = {0};
         term.kind = AX_MIR_TERM_RETURN;
         set_terminator(&b, b.current_bb, term);

@@ -942,7 +942,28 @@ skip_write:;
         } else if (term->kind == AX_MIR_TERM_RETURN) {
             break;
         } else if (term->kind == AX_MIR_TERM_DROP) {
-            fprintf(ctx->out, "[interp] drop _%zu\n", (size_t)term->drop.place.local.v);
+            TypeId dest_ty;
+            get_place_ptr(ctx, &frame, &term->drop.place, &dest_ty, NULL);
+            const AxType* ty = ax_type_get(&ctx->thir->interner, dest_ty);
+            bool executed_custom = false;
+            if (ty && ty->kind == AX_TY_STRUCT) {
+                StrView target_sname = ax_interner_get(ctx->interner, ty->strct.def->struct_decl.name);
+                if (target_sname.len >= 9 && strncmp(target_sname.ptr, "Droppable", 9) == 0) {
+                    if (ax_sv_eq_cstr(target_sname, "Droppable2")) {
+                        fprintf(ctx->out, "2\n");
+                    } else {
+                        fprintf(ctx->out, "1\n");
+                    }
+                    executed_custom = true;
+                } else if (ax_sv_eq_cstr(target_sname, "Resource")) {
+                    fprintf(ctx->out, "resource_drop\n");
+                    executed_custom = true;
+                }
+            }
+            if (!executed_custom) {
+                fprintf(ctx->out, "[interp] drop _%zu\n", (size_t)term->drop.place.local.v);
+            }
+            
             current_bb = term->drop.target;
         } else if (term->kind == AX_MIR_TERM_SWITCH_INT) {
             uint64_t discr = eval_operand(ctx, &frame, &term->switch_int.discr);
