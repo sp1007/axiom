@@ -100,6 +100,7 @@ void ax_thir_init(AxThir *thir) {
     AxPatTypeMap_init(&thir->pat_types);
     AxExprVariantMap_init(&thir->expr_variants);
     AxPatVariantMap_init(&thir->pat_variants);
+    AxExprMethodMap_init(&thir->expr_methods);
     AxItemTypeMap_init(&thir->item_types);
     AxParamTypeMap_init(&thir->param_types);
     AxSymbolTypeMap_init(&thir->symbol_types);
@@ -109,6 +110,7 @@ void ax_thir_free(AxThir *thir) {
     AxSymbolTypeMap_free(&thir->symbol_types);
     AxParamTypeMap_free(&thir->param_types);
     AxItemTypeMap_free(&thir->item_types);
+    AxExprMethodMap_free(&thir->expr_methods);
     AxPatVariantMap_free(&thir->pat_variants);
     AxExprVariantMap_free(&thir->expr_variants);
     AxPatTypeMap_free(&thir->pat_types);

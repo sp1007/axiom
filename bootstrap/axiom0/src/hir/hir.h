@@ -440,6 +440,7 @@ struct AxHirWhereClause {
 struct AxHirParam {
     Span span;
     bool is_mut;
+    StrId name;
     AxSymbolId symbol;
     AxHirType *type;
     AxHirParam *next;

@@ -479,6 +479,7 @@ static AxHirExpr *lower_expr(LowerCtx *ctx, const AxAstExpr *e) {
                     AxHirParam *hp = ax_arena_alloc(ctx->arena, sizeof(AxHirParam), 8);
                     hp->span = p->span;
                     hp->is_mut = p->is_mut;
+                    hp->name = p->name;
                     hp->symbol = get_symbol(ctx, p);
                     hp->type = lower_type(ctx, p->type);
                     *ctail = hp;
@@ -654,6 +655,7 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                     AxHirParam *hp = ax_arena_alloc(ctx->arena, sizeof(AxHirParam), 8);
                     hp->span = p->span;
                     hp->is_mut = p->is_mut;
+                    hp->name = p->name;
                     hp->symbol = get_symbol(ctx, p); // parameter node gets symbol
                     hp->type = lower_type(ctx, p->type);
                     *ptail = hp;

@@ -321,13 +321,13 @@ static AxAstType *parse_type(Parser *p) {
     type->span = peek(p)->span;
     type->next = NULL;
 
-    if (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+    if (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE))) {
         type->kind = AX_TYPE_PATH;
         AxAstTypePathSegment *head = NULL, *tail = NULL;
-        while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+        while (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE))) {
             AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
             seg->span = peek(p)->span;
-            seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
+            seg->name = (check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : (check(p, AX_TOK_KW_SELF_VALUE) ? ax_intern_cstr(p->interner, "self") : peek(p)->val.ident_val));
             advance(p);
             
             if (check(p, AX_TOK_LT)) {
@@ -366,7 +366,7 @@ static AxAstType *parse_type(Parser *p) {
         
         bool next_is_type = check(p, AX_TOK_IDENT) || check(p, AX_TOK_LPAREN) || check(p, AX_TOK_LBRACKET) || 
                             check(p, AX_TOK_STAR) || check(p, AX_TOK_KW_FN) || check(p, AX_TOK_KW_UNSAFE) || 
-                            check(p, AX_TOK_KW_EXTERN) || check(p, AX_TOK_KW_VIEW) || check(p, AX_TOK_KW_MUT_VIEW) || check(p, AX_TOK_KW_DYN) || check(p, AX_TOK_KW_SELF_TYPE);
+                            check(p, AX_TOK_KW_EXTERN) || check(p, AX_TOK_KW_VIEW) || check(p, AX_TOK_KW_MUT_VIEW) || check(p, AX_TOK_KW_DYN) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE));
                             
         if (next_is_type) {
             type->kind = AX_TYPE_ARRAY;
@@ -468,8 +468,8 @@ static AxAstPat *parse_pat_no_or(Parser *p) {
             pat->literal.tok = tok;
             pat->literal.is_negated = neg;
         }
-    } else if (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_MUT)) {
-        if (check(p, AX_TOK_IDENT) && !check(p, AX_TOK_KW_SELF_TYPE) && peek_nth(p, 1)->kind != AX_TOK_DOT && peek_nth(p, 1)->kind != AX_TOK_LPAREN && peek_nth(p, 1)->kind != AX_TOK_LBRACE && !check(p, AX_TOK_KW_MUT)) {
+    } else if (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE)) || check(p, AX_TOK_KW_MUT)) {
+        if (check(p, AX_TOK_IDENT) && !(check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE)) && peek_nth(p, 1)->kind != AX_TOK_DOT && peek_nth(p, 1)->kind != AX_TOK_LPAREN && peek_nth(p, 1)->kind != AX_TOK_LBRACE && !check(p, AX_TOK_KW_MUT)) {
             // Identifier pattern
             pat->kind = AX_PAT_BINDING;
             pat->binding.is_mut = false;
@@ -483,10 +483,10 @@ static AxAstPat *parse_pat_no_or(Parser *p) {
         } else {
             // PathPat
             AxAstTypePathSegment *head = NULL, *tail = NULL;
-            while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+            while (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE))) {
                 AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
                 seg->span = peek(p)->span;
-                seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
+                seg->name = (check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : (check(p, AX_TOK_KW_SELF_VALUE) ? ax_intern_cstr(p->interner, "self") : peek(p)->val.ident_val));
                 advance(p);
                 if (tail) tail->next = seg;
                 else head = seg;
@@ -626,7 +626,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             expr->range.end = parse_expr_prec(p, 12);
         }
         return expr;
-    } else if (tok->kind == AX_TOK_IDENT || tok->kind == AX_TOK_KW_SELF_TYPE) {
+    } else if (tok->kind == AX_TOK_IDENT || (tok->kind == AX_TOK_KW_SELF_TYPE || tok->kind == AX_TOK_KW_SELF_VALUE)) {
         // PathExpr or StructLit
         size_t initial_pos = p->pos;
         bool is_struct = false;
@@ -636,7 +636,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             size_t split_mark = p->split_len;
             bool outer_failed = p->tentative_failed;
             p->tentative++;
-            while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+            while (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE))) {
                 advance(p);
                 try_generic_args(p, GA_FOLLOW_CALL_DOT_BRACE);
                 if (consume(p, AX_TOK_DOT)) continue;
@@ -651,10 +651,10 @@ static AxAstExpr *parse_primary(Parser *p) {
 
         if (is_struct) {
             AxAstTypePathSegment *head = NULL, *tail = NULL;
-            while (check(p, AX_TOK_IDENT) || check(p, AX_TOK_KW_SELF_TYPE)) {
+            while (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE))) {
                 AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
                 seg->span = peek(p)->span;
-                seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
+                seg->name = (check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : (check(p, AX_TOK_KW_SELF_VALUE) ? ax_intern_cstr(p->interner, "self") : peek(p)->val.ident_val));
                 advance(p);
                 seg->generic_args = try_generic_args(p, GA_FOLLOW_CALL_DOT_BRACE);
                 if (tail) tail->next = seg;
@@ -688,7 +688,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             // parsed by parse_expr_prec as ExprPostfix.
             AxAstTypePathSegment *seg = NEW_NODE(p, AxAstTypePathSegment);
             seg->span = peek(p)->span;
-            seg->name = check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : peek(p)->val.ident_val;
+            seg->name = (check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : (check(p, AX_TOK_KW_SELF_VALUE) ? ax_intern_cstr(p->interner, "self") : peek(p)->val.ident_val));
             advance(p);
             /* `{` cannot follow here: with struct literals allowed it was taken above, and in a
                header it is not a follower (AXS-GRM-059). */

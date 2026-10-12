@@ -631,20 +631,33 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         AxMirPlace base = build_place(b, expr->field.base);
         TypeId base_ty = *AxExprTypeMap_get(&b->thir->expr_types, expr->field.base);
         const AxType *t = ax_type_get(&b->thir->interner, base_ty);
+        
+        size_t deref_count = 0;
+        while (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_PTR)) {
+            deref_count++;
+            base_ty = (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee;
+            t = ax_type_get(&b->thir->interner, base_ty);
+        }
+        
         uint32_t idx = 0;
-        if (t->kind == AX_TY_STRUCT) {
+        if (t && t->kind == AX_TY_STRUCT) {
             for (const AxHirFieldDecl *fd = t->strct.def->struct_decl.struct_fields; fd; fd = fd->next, idx++) {
                 if (fd->name.v == expr->field.name.v) break;
             }
         }
         
-        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + 1), _Alignof(AxMirProjection));
+        AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * (base.proj_count + deref_count + 1), _Alignof(AxMirProjection));
         for (size_t i = 0; i < base.proj_count; i++) projs[i] = base.projs[i];
-        projs[base.proj_count].kind = AX_MIR_PROJ_FIELD;
-        projs[base.proj_count].field_idx = idx;
+        
+        for (size_t i = 0; i < deref_count; i++) {
+            projs[base.proj_count + i].kind = AX_MIR_PROJ_DEREF;
+        }
+        
+        projs[base.proj_count + deref_count].kind = AX_MIR_PROJ_FIELD;
+        projs[base.proj_count + deref_count].field_idx = idx;
         
         base.projs = projs;
-        base.proj_count++;
+        base.proj_count += (deref_count + 1);
         return base;
         } else if (expr->kind == AX_HIR_EXPR_TUPLE_INDEX) {
         AxMirPlace base = build_place(b, expr->tuple_index.base);
@@ -1820,6 +1833,75 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         
         AxMirTerminator term = {0};
         term.kind = AX_MIR_TERM_CALL;
+        term.call.func = callee;
+        term.call.args = args;
+        term.call.arg_count = arg_count;
+        term.call.destination = dest;
+        
+        AxMirBbId next_bb = add_bb(b);
+        term.call.target = next_bb;
+        
+        set_terminator(b, b->current_bb, term);
+        b->current_bb = next_bb;
+    } else if (expr->kind == AX_HIR_EXPR_METHOD_CALL) {
+        const AxHirItem **method_item_ptr = AxExprMethodMap_get(&b->thir->expr_methods, expr);
+        const AxHirItem *method_item = method_item_ptr ? *method_item_ptr : NULL;
+        
+        AxMirOperand callee = {0};
+        callee.kind = AX_MIR_OP_CONST;
+        callee.constant.kind = AX_MIR_CONST_INT;
+        callee.constant.val = method_item->fn.symbol.v;
+        callee.constant.ty = *AxItemTypeMap_get(&b->thir->item_types, method_item);
+        
+        size_t explicit_args = 0;
+        for (const AxHirExpr *arg = expr->method_call.args; arg; arg = arg->next) explicit_args++;
+        
+        const AxType *fn_ty = ax_type_get(&b->thir->interner, callee.constant.ty);
+        bool has_self = (explicit_args + 1 == fn_ty->fn.param_count);
+        
+        size_t arg_count = explicit_args + (has_self ? 1 : 0);
+        AxMirOperand *args = NULL;
+        if (arg_count > 0) {
+            args = ax_arena_alloc(b->arena, sizeof(AxMirOperand) * arg_count, _Alignof(AxMirOperand));
+            size_t i = 0;
+            if (has_self) {
+                TypeId self_ty = fn_ty->fn.param_types[0];
+                const AxType *self_t = ax_type_get(&b->thir->interner, self_ty);
+                TypeId actual_self_ty = get_expr_type(b, expr->method_call.receiver);
+                const AxType *actual_self_t = ax_type_get(&b->thir->interner, actual_self_ty);
+                
+                if (self_t && (self_t->kind == AX_TY_VIEW || self_t->kind == AX_TY_MUT_VIEW) && 
+                    actual_self_t && actual_self_t->kind != AX_TY_VIEW && actual_self_t->kind != AX_TY_MUT_VIEW) {
+                    
+                    AxMirPlace receiver_place = build_place(b, expr->method_call.receiver);
+                    AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, self_ty, false);
+                    AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    
+                    AxMirStmt ref_stmt = {0};
+                    ref_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    ref_stmt.location = expr->span;
+                    ref_stmt.assign.place = temp_place;
+                    ref_stmt.assign.rvalue.kind = AX_MIR_RVALUE_REF;
+                    ref_stmt.assign.rvalue.ref.bk = (self_t->kind == AX_TY_MUT_VIEW) ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
+                    ref_stmt.assign.rvalue.ref.place = receiver_place;
+                    push_stmt(b, b->current_bb, ref_stmt);
+                    
+                    AxMirOperand ref_op = {0};
+                    ref_op.kind = AX_MIR_OP_MOVE;
+                    ref_op.place = temp_place;
+                    args[i++] = ref_op;
+                } else {
+                    args[i++] = build_expr_as_operand(b, expr->method_call.receiver);
+                }
+            }
+            for (const AxHirExpr *arg = expr->method_call.args; arg; arg = arg->next) {
+                args[i++] = build_expr_as_operand(b, arg);
+            }
+        }
+        
+        AxMirTerminator term = {0};
+        term.kind = AX_MIR_TERM_CALL;
+        term.location = expr->span;
         term.call.func = callee;
         term.call.args = args;
         term.call.arg_count = arg_count;

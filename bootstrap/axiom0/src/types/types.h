@@ -201,6 +201,7 @@ AX_DEFINE_HASHMAP(AxPatTypeMap, AxHirPatPtr, TypeId, ax_key_hash_ptr, ax_key_eq_
 AX_DEFINE_HASHMAP(AxExprVariantMap, AxHirExprPtr, uint32_t, ax_key_hash_ptr, ax_key_eq_ptr);
 AX_DEFINE_HASHMAP(AxPatVariantMap, AxHirPatPtr, uint32_t, ax_key_hash_ptr, ax_key_eq_ptr);
 typedef struct AxHirItem AxHirItem; typedef const AxHirItem *AxHirItemPtr;
+AX_DEFINE_HASHMAP(AxExprMethodMap, AxHirExprPtr, AxHirItemPtr, ax_key_hash_ptr, ax_key_eq_ptr);
 AX_DEFINE_HASHMAP(AxItemTypeMap, AxHirItemPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
 typedef struct AxHirParam AxHirParam; typedef const AxHirParam *AxHirParamPtr;
 AX_DEFINE_HASHMAP(AxParamTypeMap, AxHirParamPtr, TypeId, ax_key_hash_ptr, ax_key_eq_ptr);
@@ -214,6 +215,7 @@ typedef struct AxThir {
     AxPatTypeMap pat_types;
     AxExprVariantMap expr_variants;
     AxPatVariantMap pat_variants;
+    AxExprMethodMap expr_methods;
     AxItemTypeMap item_types;
     AxParamTypeMap param_types;
     AxSymbolTypeMap symbol_types;

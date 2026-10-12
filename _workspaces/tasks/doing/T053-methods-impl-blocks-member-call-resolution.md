@@ -10,7 +10,7 @@ depends: [T052]
 priority: 73
 status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/traits, tests/run/method, tests/ui/method]
+paths: [bootstrap/axiom0/src, tests/run/method, tests/ui/method]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/TRAIT.def]
 spec: [0112, tasks/0476, tasks/0614]
 ---

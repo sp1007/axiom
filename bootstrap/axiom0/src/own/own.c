@@ -207,6 +207,13 @@ typedef struct {
 } Visitor;
 
 static void check_use(Visitor *v, const AxMirPlace *place, AxLocation loc) {
+    AxMirPlace base = *place;
+    for (size_t i = 0; i < place->proj_count; i++) {
+        if (place->projs[i].kind == AX_MIR_PROJ_DEREF) {
+            base.proj_count = i;
+            place = &base; break;
+        }
+    }
     uint32_t node = resolve_place(v->ctx, place);
     AxOwnState st = v->state[node].state;
     if (st != AX_OWN_OWNED && v->report) {
@@ -232,6 +239,13 @@ static void check_use(Visitor *v, const AxMirPlace *place, AxLocation loc) {
 }
 
 static void do_move(Visitor *v, const AxMirPlace *place, AxLocation loc) {
+    AxMirPlace base = *place;
+    for (size_t i = 0; i < place->proj_count; i++) {
+        if (place->projs[i].kind == AX_MIR_PROJ_DEREF) {
+            base.proj_count = i;
+            check_use(v, &base, loc); return;
+        }
+    }
     uint32_t node = resolve_place(v->ctx, place);
     if (!v->ctx->nodes[node].is_copy) {
         mark_state(v->state, v->ctx, node, AX_OWN_MOVED, loc);
@@ -240,6 +254,13 @@ static void do_move(Visitor *v, const AxMirPlace *place, AxLocation loc) {
 }
 
 static void do_assign(Visitor *v, const AxMirPlace *place, AxLocation loc) {
+    AxMirPlace base = *place;
+    for (size_t i = 0; i < place->proj_count; i++) {
+        if (place->projs[i].kind == AX_MIR_PROJ_DEREF) {
+            base.proj_count = i;
+            check_use(v, &base, loc); return;
+        }
+    }
     uint32_t node = resolve_place(v->ctx, place);
     mark_state(v->state, v->ctx, node, AX_OWN_OWNED, loc);
     update_parent(v->state, v->ctx, node);

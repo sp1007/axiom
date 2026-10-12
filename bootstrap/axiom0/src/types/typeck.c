@@ -471,6 +471,28 @@ static void finalize_types(TypeckCtx *cx) {
     while (AxSymbolTypeMap_next(&cx->thir->symbol_types, &cur, &se)) se->value = resolve_ty(cx, se->value);
 }
 
+
+static const AxHirItem *find_inherent_method(TypeckCtx *cx, TypeId base_ty, StrView method_name) {
+    if (is_error(cx, base_ty)) return NULL;
+    for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path == NULL) {
+            TypeId self_ty = hir_type_to_typeid(cx, it->impl.self_type);
+            if (is_error(cx, self_ty)) continue;
+            if (self_ty.v == base_ty.v) {
+                for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_FN) {
+                        StrView mname = ax_interner_get(cx->str_in, m->fn.name);
+                        if (ax_sv_eq(mname, method_name)) {
+                            return m;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static TypeId check_expr(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
 
 static void desugar_let_else(TypeckCtx *cx, AxHirStmt *stmt) {
@@ -735,9 +757,12 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     }
 
     // Pass 1b: Function signatures
-    for (const AxHirItem *it = hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_FN) {
-            TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
+    for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
+        for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
+            const AxHirItem *it = (impl_pass == 0) ? top_it : (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : NULL);
+            for (; it; it = (impl_pass == 0) ? NULL : it->next) {
+                if (it->kind == AX_HIR_ITEM_FN) {
+                    TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
             if (type_contains_view(&cx, ret_ty, (TypeId){0})) {
                 AxDiagnostic d2 = {0}; d2.code = AX_TYPE_STORED_VIEW_ESCAPE; d2.severity = AX_DIAG_ERROR; d2.message = "stored view might outlive the owner of the referenced data"; d2.primary = it->fn.ret_type ? it->fn.ret_type->span : it->span; ax_diag_sink_report(sink, &d2);
             }
@@ -768,6 +793,8 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
 
             TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
             AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
+                }
+            }
         }
     }
 
@@ -775,9 +802,12 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     check_main_signature(&cx);
 
     // Pass 2: Typecheck bodies
-    for (const AxHirItem *it = hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
-            cx.current_fn = it;
+    for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
+        for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
+            const AxHirItem *it = (impl_pass == 0) ? top_it : (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : NULL);
+            for (; it; it = (impl_pass == 0) ? NULL : it->next) {
+                if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
+                    cx.current_fn = it;
             TypeId *fn_ty_ptr = AxItemTypeMap_get(&thir.item_types, it);
             if (!fn_ty_ptr) AX_ICE("typeck: fn item without a signature type");
             const AxType *fn_ty = ax_type_get(&thir.interner, *fn_ty_ptr);
@@ -798,6 +828,8 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             check_block(&cx, it->fn.body, cx.return_type);
             default_int_vars(&cx);
             check_literal_ranges(&cx);
+                }
+            }
         }
     }
 
@@ -1076,6 +1108,22 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
         }
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
+    
+    // Check built-in types for UFCS
+    if (ax_sv_eq_cstr(name, "bool")) return cx->thir->interner.t_bool;
+    if (ax_sv_eq_cstr(name, "char")) return cx->thir->interner.t_char;
+    if (ax_sv_eq_cstr(name, "i8")) return cx->thir->interner.t_i8;
+    if (ax_sv_eq_cstr(name, "i16")) return cx->thir->interner.t_i16;
+    if (ax_sv_eq_cstr(name, "i32")) return cx->thir->interner.t_i32;
+    if (ax_sv_eq_cstr(name, "i64")) return cx->thir->interner.t_i64;
+    if (ax_sv_eq_cstr(name, "isize")) return cx->thir->interner.t_isize;
+    if (ax_sv_eq_cstr(name, "u8")) return cx->thir->interner.t_u8;
+    if (ax_sv_eq_cstr(name, "u16")) return cx->thir->interner.t_u16;
+    if (ax_sv_eq_cstr(name, "u32")) return cx->thir->interner.t_u32;
+    if (ax_sv_eq_cstr(name, "u64")) return cx->thir->interner.t_u64;
+    if (ax_sv_eq_cstr(name, "usize")) return cx->thir->interner.t_usize;
+    if (ax_sv_eq_cstr(name, "str")) return cx->thir->interner.t_str;
+
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
 
         if (it->kind == AX_HIR_ITEM_FN) {
@@ -1627,7 +1675,12 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         case AX_HIR_EXPR_FIELD: {
             TypeId obj_ty = check_expr(cx, expr->field.base, TypeId_none());
             if (!is_error(cx, obj_ty)) {
-                const AxType *t = ax_type_get(&cx->thir->interner, obj_ty);
+                TypeId base_ty = obj_ty;
+                const AxType *t = ax_type_get(&cx->thir->interner, base_ty);
+                while (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_PTR) {
+                    base_ty = (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee;
+                    t = ax_type_get(&cx->thir->interner, base_ty);
+                }
                 if (t->kind == AX_TY_STRUCT) {
                     bool found = false;
                     size_t idx = 0;
@@ -2030,37 +2083,92 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         /* case AX_HIR_EXPR_FIELD: */
         /* case AX_HIR_EXPR_TUPLE_INDEX: */
         case AX_HIR_EXPR_METHOD_CALL: {
-            TypeId receiver_ty = check_expr(cx, expr->method_call.receiver, TypeId_none());
-            if (is_error(cx, receiver_ty)) return in->t_error;
-            const AxType *t = ax_type_get(in, receiver_ty);
-            if (t->kind == AX_TY_ENUM) {
-                size_t vidx = 0;
-                for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
-                    StrView vname = ax_interner_get(cx->str_in, v->name);
-                    StrView search = ax_interner_get(cx->str_in, expr->method_call.method_name);
-                    if (ax_sv_eq(vname, search)) {
-                        AxExprVariantMap_insert(&cx->thir->expr_variants, expr, vidx);
-                        if (v->is_struct) {
-                            return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+            bool is_type_name = false;
+            if (expr->method_call.receiver->kind == AX_HIR_EXPR_PATH) {
+                is_type_name = true;
+                if (expr->method_call.receiver->path.path.symbol.v != 0) {
+                    for (size_t k = 0; k < cx->vars_len; k++) {
+                        if (cx->vars[k].sym.v == expr->method_call.receiver->path.path.symbol.v) {
+                            is_type_name = false;
+                            break;
                         }
-                        size_t expected_args = t->enm.variant_field_counts[vidx];
-                        size_t argc = 0;
-                        for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) argc++;
-                        if (argc != expected_args) {
-                            return type_error(cx, expr->span, AX_TYPE_ARG_COUNT);
-                        }
-                        const TypeId *payloads = t->enm.variant_fields[vidx];
-                        size_t i = 0;
-                        for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
-                            check_expr(cx, a, payloads[i++]);
-                        }
-                        return receiver_ty;
                     }
-                    vidx++;
+                }
+            }
+            TypeId receiver_ty = check_expr(cx, expr->method_call.receiver, TypeId_none());
+            if (is_error(cx, receiver_ty)) return cx->thir->interner.t_error;
+            
+            // Strip view/mut_view to find the base type for method lookup
+            TypeId base_ty = receiver_ty;
+            const AxType *t = ax_type_get(&cx->thir->interner, base_ty);
+            while (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_PTR) {
+                base_ty = (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee;
+                t = ax_type_get(&cx->thir->interner, base_ty);
+            }
+            
+            StrView mname = ax_interner_get(cx->str_in, expr->method_call.method_name);
+            const AxHirItem *method_item = find_inherent_method(cx, base_ty, mname);
+            
+            if (!method_item) {
+                if (t->kind == AX_TY_ENUM) {
+                    size_t vidx = 0;
+                    for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
+                        StrView vname = ax_interner_get(cx->str_in, v->name);
+                        if (ax_sv_eq(vname, mname)) {
+                            AxExprVariantMap_insert(&cx->thir->expr_variants, expr, vidx);
+                            if (v->is_struct) {
+                                return type_error(cx, expr->span, AX_TYPE_MISMATCH);
+                            }
+                            size_t expected_args = t->enm.variant_field_counts[vidx];
+                            size_t argc = 0;
+                            for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) argc++;
+                            if (argc != expected_args) {
+                                return type_error(cx, expr->span, AX_TYPE_ARG_COUNT);
+                            }
+                            const TypeId *payloads = t->enm.variant_fields[vidx];
+                            size_t arg_idx = 0;
+                            for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
+                                check_expr(cx, a, payloads[arg_idx++]);
+                            }
+                            return receiver_ty;
+                        }
+                        vidx++;
+                    }
                 }
                 return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
             }
-            return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+            
+            AxExprMethodMap_insert(&cx->thir->expr_methods, expr, method_item);
+            
+            TypeId *fn_ty_ptr = AxItemTypeMap_get(&cx->thir->item_types, method_item);
+            if (!fn_ty_ptr) AX_ICE("Method missing fn type");
+            const AxType *fn_ty = ax_type_get(&cx->thir->interner, *fn_ty_ptr);
+            
+            size_t expected_args = fn_ty->fn.param_count;
+            bool has_self = (method_item->fn.params && ax_sv_eq_cstr(ax_interner_get(cx->str_in, method_item->fn.params->name), "self"));
+            
+            bool pass_receiver = has_self && !is_type_name;
+            size_t argc = pass_receiver ? 1 : 0;
+            for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) argc++;
+            
+            if (argc != expected_args) {
+                for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
+                    check_expr(cx, a, TypeId_none());
+                }
+                return type_error(cx, expr->span, AX_TYPE_ARG_COUNT);
+            }
+            
+            size_t i = pass_receiver ? 1 : 0;
+            for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
+                TypeId arg_expected = fn_ty->fn.param_types[i];
+                TypeId arg_ty = check_expr(cx, a, arg_expected);
+                if (!is_error(cx, arg_ty) && !unify_ty(cx, arg_ty, arg_expected)) {
+                    type_error(cx, a->span, AX_TYPE_MISMATCH);
+                }
+                i++;
+            }
+            
+            return fn_ty->fn.ret_type;
         }
                 case AX_HIR_EXPR_TRY: {
             TypeId expr_ty = check_expr(cx, expr->try_expr.expr, TypeId_none());

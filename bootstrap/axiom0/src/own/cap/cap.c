@@ -65,6 +65,9 @@ static void check_invalidate(const CapState *state, size_t local_count, const Ax
 static void visit_operand(CapState *state, size_t local_count, const AxMirOperand *op, AxLocation loc, AxDiagSink *sink, bool report) {
     if (op->kind == AX_MIR_OP_MOVE) {
         check_invalidate(state, local_count, &op->place, loc, sink, report);
+        if (op->place.proj_count == 0 && op->place.local.v < local_count) {
+            state->caps[op->place.local.v].view = AX_MIR_VIEW_UNKNOWN;
+        }
     }
 }
 
