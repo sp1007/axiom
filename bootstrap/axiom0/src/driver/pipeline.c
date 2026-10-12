@@ -17,6 +17,8 @@ const char *ax_opt_build_o = NULL;
 bool ax_opt_interp = false;
 const char *ax_opt_std_root = NULL;
 
+void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const AxHirItem *func);
+
 const AxOption ax_opts_pipeline[] = {
     {"--color=never", AX_OPT_BOOL, &ax_opt_color_never, "disable colored diagnostics"},
     {"--time-passes", AX_OPT_BOOL, &ax_opt_time_passes, "print pass timing"},
@@ -382,6 +384,9 @@ static void stage_own(AxDriverState *st) {
             ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
         }
         ax_own_check(it, body, &st->thir, &st->sink, &st->interner);
+        if (st->sink.errors == 0) {
+            ax_verify_mir_own(body, &st->thir, &st->sink, it);
+        }
         ax_mir_drop_elaborate(body, &st->thir, &st->hir, &st->db, &st->sink, &st->interner);
     }
 }
@@ -491,6 +496,9 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
         AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, NULL);
+            if (st->sink.errors == 0) {
+                ax_verify_mir_own(body, &st->thir, &st->sink, NULL);
+            }
             if (st->sink.errors == 0 && ax_opt_O1) {
                 ax_opt_run(body, &st->thir, &st->sink, NULL, ax_opt_verify_each);
             }

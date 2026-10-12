@@ -7,3 +7,4 @@
 void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const AxHirItem *func);
 
 #endif // AX_VERIFY_VERIFY_H
+void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const AxHirItem *func);

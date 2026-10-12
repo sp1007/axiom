@@ -408,7 +408,6 @@ static bool ax_type_needs_drop(const AxThir *thir, TypeId ty, const AxHirItem *f
     if (!t) return false;
     if (t->kind == AX_TY_BUILTIN_DROP) return true;
     if (t->kind == AX_TY_STRUCT) {
-        if (t->strct.def && t->strct.def->struct_decl.struct_fields == NULL) return true;
         for (size_t i = 0; i < t->strct.field_count; i++) {
             if (ax_type_needs_drop(thir, t->strct.fields[i], func)) return true;
         }
@@ -570,8 +569,12 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                         }
                     }
                 }
-                if (stmt->assign.place.local.v < lc) {
-                    cur[stmt->assign.place.local.v] = ST_OWNED;
+                uint32_t dst_loc = stmt->assign.place.local.v;
+                if (dst_loc < lc) {
+                    if (ax_type_needs_drop(thir, body->locals[dst_loc].ty, func) && (cur[dst_loc] & ST_OWNED)) {
+                        report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
+                    }
+                    cur[dst_loc] = ST_OWNED;
                 }
             } else if (stmt->kind == AX_MIR_STMT_DROP) {
                 uint32_t loc = stmt->drop.local.v;
@@ -621,7 +624,11 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                     }
                 }
                 if (term->call.destination.local.v < lc) {
-                    cur[term->call.destination.local.v] = ST_OWNED;
+                    uint32_t dst_loc = term->call.destination.local.v;
+                    if (ax_type_needs_drop(thir, body->locals[dst_loc].ty, func) && (cur[dst_loc] & ST_OWNED)) {
+                        report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
+                    }
+                    cur[dst_loc] = ST_OWNED;
                 }
                 break;
             case AX_MIR_TERM_ASSERT:
@@ -634,12 +641,12 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                 }
                 break;
             case AX_MIR_TERM_RETURN:
-                if (lc > 0 && func == NULL && (cur[0] & ST_UNINIT)) {
-                    report_verify_error(sink, func, AX_VERIFY_UNINIT_USE);
+                if (lc > 0) {
+                    if (cur[0] & ST_UNINIT) report_verify_error(sink, func, AX_VERIFY_UNINIT_USE);
+                    if (cur[0] & ST_MOVED) report_verify_error(sink, func, AX_VERIFY_USE_AFTER_MOVE);
                 }
                 for (size_t l = 1; l < lc; l++) {
                     if (ax_type_needs_drop(thir, body->locals[l].ty, func) && 
-                        (body->locals[l].kind == AX_MIR_LOCAL_USER || body->locals[l].kind == AX_MIR_LOCAL_ARG) && 
                         (cur[l] & ST_OWNED)) {
                         report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
                     }
