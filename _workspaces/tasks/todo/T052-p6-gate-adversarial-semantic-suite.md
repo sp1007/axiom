@@ -8,7 +8,7 @@ model: opus
 gate_model: opus
 depends: [T051, T052a, T052b, T126a]
 priority: 72
-status: doing
+status: blocked
 attempts: 1
 paths: [tests, spec, _workspaces/tasks/done]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
@@ -51,3 +51,4 @@ Attack the ownership/capability implementation with the adversarial cases from t
 - 2026-10-12 08:56:03 block: partial move and last-use bugs
 - 2026-10-12 09:20:31 unblocked (cycle 1) 
 - 2026-10-12 09:20:39 started (attempt 1) 
+- 2026-10-12 09:45:03 block: archcheck selftest fails; T126 slice bugs

@@ -7,9 +7,11 @@ reviewer: axiom-architect
 model: sonnet
 depends: [T126]
 priority: 70
-status: todo
+status: doing
 paths: [src, tests]
 spec: []
+attempts: 1
+started: 2026-10-12 09:45:13
 ---
 # T126a — Fix incomplete slice features
 
@@ -23,3 +25,6 @@ Fix slice implementation bugs that were left incomplete by T126.
 
 ## Acceptance
 - The tests pass without xfail.
+
+## Log
+- 2026-10-12 09:45:13 started (attempt 1) 
