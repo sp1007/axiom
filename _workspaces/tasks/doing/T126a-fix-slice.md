@@ -5,6 +5,7 @@ phase: P6-ownership
 owner: axiom-backend
 reviewer: axiom-architect
 model: sonnet
+gate_model: sonnet
 depends: [T126]
 priority: 70
 status: doing

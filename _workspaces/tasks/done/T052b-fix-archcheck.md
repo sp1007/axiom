@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 70
-status: doing
+status: done
 paths: [tools/tests/archcheck/test_archcheck.py, tools/archcheck_rules.txt]
 spec: []
 attempts: 1
 started: 2026-10-12 09:45:12
+finished: 2026-10-12 10:24:51
 ---
 # T052b — Fix test_archcheck.py layer order
 
@@ -27,3 +28,4 @@ Fix `archcheck_selftest` failing due to layer order mismatch.
 
 ## Log
 - 2026-10-12 09:45:12 started (attempt 1) 
+- 2026-10-12 10:24:51 accepted by QA -> done

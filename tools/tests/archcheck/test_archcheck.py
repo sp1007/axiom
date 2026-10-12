@@ -22,7 +22,7 @@ FIXTURES = HERE / "fixtures"
 
 # The spec chain of INV-LAYER-001, written out independently of the rules file.
 CHAIN = [["kernel"], ["source"], ["diag"], ["lex"], ["syntax"], ["resolve"], ["hir"], ["types"], ["traits"],
-         ["own"], ["mir"], ["verify"], ["interp", "opt"], ["lir"], ["abi"], ["target/x64"], ["obj"], ["link"],
+         ["mir"], ["own"], ["verify"], ["interp", "opt"], ["lir"], ["abi"], ["target/x64"], ["obj"], ["link"],
          ["driver"]]
 RANK = {m: i for i, grp in enumerate(CHAIN) for m in grp}
 
@@ -162,6 +162,17 @@ class LayerMatrixTests(unittest.TestCase):
         got = sorted((p, l, inv) for p, l, inv, _m in run_tree(files))
         self.assertEqual(got, [(src("lex/a.c"), 1, "INV-LAYER-001"), (src("lex/e.c"), 1, "INV-LAYER-001"),
                                (src("lex/f.c"), 1, "INV-LAYER-001")])
+
+    def test_mir_and_own_layer_order(self):
+        files = {
+            src("mir/a.c"): '#include "own/own.h"\n',
+            src("own/b.c"): '#include "mir/mir.h"\n',
+            src("own/own.h"): '/* */\n',
+            src("mir/mir.h"): '/* */\n',
+        }
+        got = sorted((p, l, inv) for p, l, inv, _m in run_tree(files))
+        # mir cannot include own (mir < own), but own can include mir
+        self.assertEqual(got, [(src("mir/a.c"), 1, "INV-LAYER-001")])
 
     def test_crlf_sources(self):
         files = {src("lex/a.c"): '#include "kernel/k.h"\r\n#include "syntax/ast.h"\r\n',
