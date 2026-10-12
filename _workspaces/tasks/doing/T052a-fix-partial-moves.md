@@ -7,8 +7,10 @@ reviewer: axiom-architect
 model: opus
 depends: []
 priority: 72
-status: todo
-paths: [src/compiler/semantics]
+status: doing
+paths: [src/compiler/semantics, tests/conformance/adversarial]
+attempts: 1
+started: 2026-10-12 08:56:17
 ---
 # T052a — Compiler fix: Partial moves invalidate whole struct
 
@@ -20,3 +22,6 @@ Fix the compiler so that a partial move out of a struct invalidates the entire s
 
 ## Acceptance
 - `tests/conformance/adversarial/partial_002.ax` correctly fails with `AX_MOVE_USE_AFTER_MOVE`.
+
+## Log
+- 2026-10-12 08:56:17 started (attempt 1) 

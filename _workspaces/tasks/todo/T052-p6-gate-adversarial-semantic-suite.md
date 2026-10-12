@@ -8,7 +8,7 @@ model: opus
 gate_model: opus
 depends: [T051, T052a]
 priority: 72
-status: doing
+status: blocked
 attempts: 1
 paths: [tests/conformance/adversarial, tests/conformance/stress]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
@@ -43,3 +43,4 @@ Attack the ownership/capability implementation with the adversarial cases from t
 
 ## Log
 - 2026-10-12 08:49:03 started (attempt 1) 
+- 2026-10-12 08:56:03 block: partial move and last-use bugs
