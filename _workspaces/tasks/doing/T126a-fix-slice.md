@@ -9,7 +9,7 @@ gate_model: sonnet
 depends: [T126]
 priority: 70
 status: doing
-paths: [src, tests]
+paths: [bootstrap/axiom0/src, tests]
 spec: []
 attempts: 1
 started: 2026-10-12 09:45:13
