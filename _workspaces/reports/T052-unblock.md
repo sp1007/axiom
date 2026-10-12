@@ -1,23 +1,27 @@
+# T052 Unblock Report
+
 ## Tóm tắt
-Cổng P6 (T052) bị block vì hai lỗi implementation: `archcheck_selftest` bị sai thứ tự layer (own < mir thay vì mir < own), và tính năng slice của T126 chưa hoàn thiện khiến các test bị lỗi khi gỡ bỏ `xfail: T126`. Quyết định: tạo task T052b để sửa archcheck và T126a để sửa slice, đồng thời thêm chúng vào dependency của T052 để các lỗi này được giải quyết trước khi đóng cổng.
+Đã giải quyết các blocker cho cổng P6 (T052) bằng cách chia nhỏ các lỗi thành các task mới để sửa chữa triệt để thay vì hạ thấp tiêu chuẩn:
+- Tạo T126b để sửa lỗi implement của slice (crashes và open ranges).
+- Tạo T052c để sửa lỗi compiler với `drop()` (use-after-move không bị phát hiện).
+- Tạo T052d để khắc phục lỗi thiếu thư mục `tests/run/native_abi` trong `gatecheck.py`.
+- Tạo T052e để sửa kịch bản kiểm tra `test_archcheck.py`.
+- Viết ADR-0007 để thống nhất và khẳng định thứ tự tầng kiến trúc chuẩn xác là `mir < own`.
 
 ## Analysis
-The T052 QA report (Round 3) shows two issues blocking the gate:
-1. `archcheck_selftest` fails because `test_archcheck.py` expects the layer order `own < mir`, which contradicts the actual C code and `tools/archcheck_rules.txt` (`mir < own`).
-2. Slice features introduced in T126 are incomplete. The instruction to remove `xfail: T126` exposed bugs in `qa_slice_bounds_panic.ax`, `qa_slice_inverted_panic.ax`, `qa_slice_open_ranges.ax`, and `sub_range.ax`. 
+T052 is a gate task and must not have relaxed acceptance criteria. Therefore, implementation bugs found during the gate execution must be fixed in appropriate fix tasks before the gate can pass.
 
-According to the architect rules (0264 §20), a gate blocked by implementation bugs gets fix tasks for the owning areas, on which the gate then depends.
-
-## Actions Taken
-- Created `_workspaces/tasks/todo/T052b-fix-archcheck.md` to fix the `test_archcheck.py` layer order.
-- Created `_workspaces/tasks/todo/T126a-fix-slice.md` to fix the incomplete slice implementations.
-- Updated `_workspaces/tasks/doing/T052-p6-gate-adversarial-semantic-suite.md`:
-  - Added `T052b` and `T126a` to the `depends` list.
-  - Removed the flawed instruction to remove `xfail: T126` from slice tests in this task (T126a will handle it).
+- **Slice Bugs**: T126 slice implementation was incomplete. Split to `T126b`.
+- **Drop Bug**: Explicit `drop(b)` allows use-after-move without triggering `AX_MOVE_USE_AFTER_MOVE`. Split to `T052c`.
+- **Native ABI Directory**: The `gatecheck.py` script fails on missing `tests/run/native_abi`. Split to `T052d`.
+- **Archcheck Layer Order**: QA observed that `test_archcheck.py` incorrectly hardcodes `own < mir` while the codebase legitimately uses `mir < own`. Codified this architectural decision in `docs/adr/ADR-0007-layer-order.md` and created `T052e` to fix the test script.
 
 ## Files changed
-- _workspaces/tasks/todo/T052b-fix-archcheck.md
-- _workspaces/tasks/todo/T126a-fix-slice.md
-- _workspaces/tasks/doing/T052-p6-gate-adversarial-semantic-suite.md
+- docs/adr/ADR-0007-layer-order.md
+- _workspaces/tasks/todo/T052-p6-gate-adversarial-semantic-suite.md
+- _workspaces/tasks/todo/T126b-fix-slice-crashes.md
+- _workspaces/tasks/todo/T052c-fix-drop-uam.md
+- _workspaces/tasks/todo/T052d-fix-native-abi-missing.md
+- _workspaces/tasks/todo/T052e-fix-archcheck-test.md
 
 STATUS: UNBLOCKED

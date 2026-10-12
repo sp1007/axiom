@@ -6,9 +6,9 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T051, T052a, T052b, T126a]
+depends: [T051, T052a, T052b, T126a, T052c, T052d]
 priority: 72
-status: doing
+status: blocked
 attempts: 1
 paths: [tests, spec, _workspaces/tasks/done]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
@@ -54,3 +54,4 @@ Attack the ownership/capability implementation with the adversarial cases from t
 - 2026-10-12 09:45:03 block: archcheck selftest fails; T126 slice bugs
 - 2026-10-12 11:06:44 unblocked (cycle 2) 
 - 2026-10-12 11:06:58 started (attempt 1) 
+- 2026-10-12 11:17:20 block: T126 slice features are incomplete (slice tests crash/fail); own_branch_003.ax compiler bug (drop() does not trigger AX_MOVE_USE_AFTER_MOVE); gatecheck fails on missing tests/run/native_abi
