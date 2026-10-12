@@ -288,15 +288,33 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             TypeId place_ty = b->mir->locals[rv->len.local.v].ty;
             for (size_t i = 0; i < rv->len.proj_count; i++) {
                 const AxType *t = ax_type_get(b->interner, place_ty);
-                if (t->kind == AX_TY_ARRAY) place_ty = t->array.elem;
-                else if (t->kind == AX_TY_TUPLE) place_ty = t->tuple.fields[rv->len.projs[i].field_idx];
-                else if (t->kind == AX_TY_STRUCT) place_ty = t->strct.fields[rv->len.projs[i].field_idx];
-                else if (t->kind == AX_TY_PTR) place_ty = t->ptr.pointee;
+                if (rv->len.projs[i].kind == AX_MIR_PROJ_DEREF) {
+                    if (t->kind == AX_TY_PTR) place_ty = t->ptr.pointee;
+                    else if (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) place_ty = t->view.pointee;
+                    else if (t->kind == AX_TY_STR) place_ty = b->interner->t_u8;
+                } else if (rv->len.projs[i].kind == AX_MIR_PROJ_FIELD) {
+                    if (t->kind == AX_TY_TUPLE) place_ty = t->tuple.fields[rv->len.projs[i].field_idx];
+                    else if (t->kind == AX_TY_STRUCT) place_ty = t->strct.fields[rv->len.projs[i].field_idx];
+                } else if (rv->len.projs[i].kind == AX_MIR_PROJ_INDEX) {
+                    if (t->kind == AX_TY_ARRAY) place_ty = t->array.elem;
+                    else if (t->kind == AX_TY_SLICE) place_ty = t->slice.elem;
+                    else if (t->kind == AX_TY_STR) place_ty = b->interner->t_u8;
+                }
             }
             const AxType *t = ax_type_get(b->interner, place_ty);
-            uint64_t len = 0;
-            if (t && t->kind == AX_TY_ARRAY) len = t->array.len;
-            return emit_const(b, len, b->interner->t_usize);
+            if (t && t->kind == AX_TY_ARRAY) {
+                return emit_const(b, t->array.len, b->interner->t_usize);
+            } else if (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_STR)) {
+                TypeId src_ty = {0};
+                AxLirVRegId addr = lower_place_addr(b, &rv->len, &src_ty);
+                AxLirVRegId offset = emit_const(b, 8, b->interner->t_usize);
+                AxLirVRegId len_addr = emit_offset(b, addr, offset);
+                return emit_load(b, len_addr, b->interner->t_usize);
+            } else if (t && t->kind == AX_TY_SLICE) {
+                // Should not happen, len() takes view/array directly.
+                return emit_const(b, 0, b->interner->t_usize);
+            }
+            return emit_const(b, 0, b->interner->t_usize);
         }
         case AX_MIR_RVALUE_AGGREGATE:
             return emit_const(b, 0, dest_ty); // Not used directly, handled in assign
@@ -391,7 +409,37 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                         }
                     }
                     continue;
+                } else if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_REF) {
+                    const AxType *ty = ax_type_get(b.interner, dest_ty);
+                    if (ty && (ty->kind == AX_TY_VIEW || ty->kind == AX_TY_MUT_VIEW)) {
+                        const AxType *pointee = ax_type_get(b.interner, ty->view.pointee);
+                        if (pointee && (pointee->kind == AX_TY_SLICE || pointee->kind == AX_TY_STR)) {
+                            AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
+                            TypeId src_ty = {0};
+                            AxLirVRegId ptr_val = lower_place_addr(&b, &stmt->assign.rvalue.ref.place, &src_ty);
+                            emit_store(&b, addr, ptr_val);
+                            
+                            AxLirVRegId len_reg = {0};
+                            const AxType *src_t = ax_type_get(b.interner, src_ty);
+                            if (src_t && src_t->kind == AX_TY_ARRAY) {
+                                len_reg = emit_const(&b, src_t->array.len, b.interner->t_usize);
+                            } else if (src_t && (src_t->kind == AX_TY_VIEW || src_t->kind == AX_TY_MUT_VIEW || src_t->kind == AX_TY_STR || src_t->kind == AX_TY_SLICE)) {
+                                AxLirVRegId src_addr = lower_place_addr(&b, &stmt->assign.rvalue.ref.place, NULL);
+                                AxLirVRegId off8 = emit_const(&b, 8, b.interner->t_usize);
+                                AxLirVRegId len_addr = emit_offset(&b, src_addr, off8);
+                                len_reg = emit_load(&b, len_addr, b.interner->t_usize);
+                            } else {
+                                len_reg = emit_const(&b, 0, b.interner->t_usize);
+                            }
+                            
+                            AxLirVRegId off8 = emit_const(&b, 8, b.interner->t_usize);
+                            AxLirVRegId len_dest = emit_offset(&b, addr, off8);
+                            emit_store(&b, len_dest, len_reg);
+                            continue;
+                        }
+                    }
                 }
+                
                 AxLirVRegId val = lower_rvalue(&b, &stmt->assign.rvalue, dest_ty);
                 AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, NULL);
                 emit_store(&b, addr, val);

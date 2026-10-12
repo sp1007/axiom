@@ -8,10 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T050]
 priority: 71
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_own, tests/run/own, tests/run/init, tests/run/cap, tests/run/slice, tests/run/drop]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/native_own, tests/run/own, tests/run/init, tests/run/cap, tests/run/slice, tests/run/drop, tests/ui/own, tests/ui/slice]
 spec: [0152, 0162]
+started: 2026-10-12 07:58:00
+finished: 2026-10-12 08:48:48
 ---
 # T051 — Native catch-up: views, drops, drop flags
 
@@ -34,3 +36,7 @@ Ownership programs run natively with correct drop behaviour.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-12 07:58:00 started (attempt 1) 
+- 2026-10-12 08:48:48 accepted by QA -> done

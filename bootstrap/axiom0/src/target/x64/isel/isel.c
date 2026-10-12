@@ -371,22 +371,19 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                               emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), mem);
                               emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
                           } else if (inst->abi_arg.loc_kind == 2) { // INDIRECT
-                              // Passed by reference. The pointer is in a register or on the stack.
-                              // We need to read the pointer, and copy the struct into our local stack frame?
-                              // Actually, the ABI says the caller allocated it, so we can just use the pointer directly?
-                              // No, in Axiom, the parameter is a local variable. So we should copy it to our frame, OR the LIR already allocated a slot for the struct and we copy it.
-                              // The naive ISEL just copies it. Since it's naive, let's just copy 8 bytes or something?
-                              // Wait! The struct could be any size. For now, we can just copy 8 bytes, or maybe not copy at all?
-                              // If we don't copy, we have to remember it's a pointer. But naive isel assumes everything is in a stack slot!
-                              // So we must copy the struct into `slot_offset + inst->dest.v`.
-                              // We need the size to do a memcpy. But isel.c doesn't know the size easily without looking it up.
-                              // Wait, we can just load the pointer into the slot?
-                              // If we load the pointer into the slot, then every access to it in MIR will think it's a pointer, but MIR thinks it's by-value!
-                              // Wait! Does LIR add a load? No, MIR thinks it's a local struct.
-                              // This is getting complicated. What if we just do a loop to copy?
-                              // Let's just do a simple 8-byte copy for now since this is naive isel and the test structs are small?
-                              // Or maybe the tests don't even run this code yet because they are C tests.
-                              // In C driver tests `cdriver_abi.c`, it just checks the ABI classification!
+                              uint32_t size = ax_type_size(lir->vregs[inst->dest.v].ty, interner);
+                              if (inst->abi_arg.loc_reg_or_offset < 16) {
+                                  emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_reg(inst->abi_arg.loc_reg_or_offset));
+                              } else {
+                                  AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 5 /*RBP*/, .index = AX_REG_NONE, .scale = 1, .disp = 16 + inst->abi_arg.loc_reg_or_offset, .is_rip = false } };
+                                  emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), mem);
+                              }
+                              for (uint32_t i = 0; i < size; i += 8) {
+                                  uint32_t chunk = size - i >= 8 ? 8 : (size - i >= 4 ? 4 : (size - i >= 2 ? 2 : 1));
+                                  AxX64Op src_mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = i, .is_rip = false } };
+                                  emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), src_mem);
+                                  emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                              }
                           }
 
                       } else {
