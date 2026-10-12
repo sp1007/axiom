@@ -1,5 +1,5 @@
 ---
-gate_model: none
+gate_model: sonnet
 id: T052d
 title: Fix missing tests/run/native_abi for gatecheck
 phase: P6-ownership
@@ -13,7 +13,7 @@ paths: [tests/run/native_abi, tools/gatecheck.py]
 attempts: 1
 started: 2026-10-12 11:37:28
 ---
-gate_model: none
+gate_model: sonnet
 # T052d — Fix missing tests/run/native_abi for gatecheck
 
 ## Goal

@@ -1,5 +1,5 @@
 ---
-gate_model: none
+gate_model: sonnet
 id: T052c
 title: Fix drop() use-after-move bug
 phase: P6-ownership
@@ -14,7 +14,7 @@ attempts: 1
 started: 2026-10-12 11:37:28
 finished: 2026-10-12 12:22:25
 ---
-gate_model: none
+gate_model: sonnet
 # T052c — Fix drop() use-after-move bug
 
 ## Goal
