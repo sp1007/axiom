@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T126]
 priority: 70
-status: doing
+status: done
 paths: [bootstrap/axiom0/src, tests]
 spec: []
 attempts: 1
 started: 2026-10-12 09:45:13
+finished: 2026-10-12 11:06:42
 ---
 # T126a — Fix incomplete slice features
 
@@ -29,3 +30,4 @@ Fix slice implementation bugs that were left incomplete by T126.
 
 ## Log
 - 2026-10-12 09:45:13 started (attempt 1) 
+- 2026-10-12 11:06:42 accepted by QA -> done
