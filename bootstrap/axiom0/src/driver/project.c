@@ -258,21 +258,29 @@ bool ax_project_discover(const char *input_path, const char *explicit_std_root, 
         add_project_file(proj, norm_input, norm_input, mod_path, true, false);
     }
 
-    /* Add <std_root>/core/prelude.ax after user files if it exists */
+    /* Add core std files after user files if they exist */
     if (proj->std_root) {
-        char prelude_disk[2048];
-        snprintf(prelude_disk, sizeof(prelude_disk), "%s/core/prelude.ax", proj->std_root);
-        normalize_slashes(prelude_disk);
-        if (file_exists(prelude_disk)) {
-            bool already = false;
-            for (size_t i = 0; i < proj->file_count; i++) {
-                if (strcmp(proj->files[i].disk_path, prelude_disk) == 0) {
-                    already = true;
-                    break;
+        struct StdFile { const char *path; const char *vpath; const char *mod; };
+        struct StdFile std_files[] = {
+            {"core/option.ax", "<std>/core/option.ax", "std.core.option"},
+            {"core/result.ax", "<std>/core/result.ax", "std.core.result"},
+            {"core/prelude.ax", "<std>/core/prelude.ax", "std.core.prelude"}
+        };
+        for (size_t f = 0; f < 3; f++) {
+            char disk[2048];
+            snprintf(disk, sizeof(disk), "%s/%s", proj->std_root, std_files[f].path);
+            normalize_slashes(disk);
+            if (file_exists(disk)) {
+                bool already = false;
+                for (size_t i = 0; i < proj->file_count; i++) {
+                    if (strcmp(proj->files[i].disk_path, disk) == 0) {
+                        already = true;
+                        break;
+                    }
                 }
-            }
-            if (!already) {
-                add_project_file(proj, prelude_disk, "<std>/core/prelude.ax", "std.core.prelude", false, true);
+                if (!already) {
+                    add_project_file(proj, disk, std_files[f].vpath, std_files[f].mod, false, true);
+                }
             }
         }
     }

@@ -1079,7 +1079,7 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     env.prelude_scope = prelude;
 
     const char *prelude_types[] = {
-        "bool", "i32", "u32", "usize", "isize", "Option", "Result", 
+        "bool", "i32", "u32", "usize", "isize", 
         "Copy", "Drop", "Send", "Share", "f32", "f64", "char", "str",
         "u8", "i8", "u16", "i16", "u64", "i64", "len", "Str", "print", "print_int", "drop"
     };

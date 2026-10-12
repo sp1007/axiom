@@ -532,7 +532,7 @@ static const AxHirItem *find_inherent_method(TypeckCtx *cx, TypeId base_ty, StrV
 }
 
 
-static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
+TypeId ax_subst_ty(TypeckCtx *cx, TypeId ty, const AxGenericArgs *args) {
     if (TypeId_is_none(ty)) return ty;
     if (args == NULL || args->count == 0) return ty;
     ty = resolve_ty(cx, ty);
@@ -544,28 +544,28 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
         return ty;
     }
     if (t->kind == AX_TY_ARRAY) {
-        TypeId elem = subst_ty(cx, t->array.elem, args);
+        TypeId elem = ax_subst_ty(cx, t->array.elem, args);
         if (elem.v == t->array.elem.v) return ty;
         AxType new_t = *t;
         new_t.array.elem = elem;
         return ax_intern_type(&cx->thir->interner, &new_t);
     }
     if (t->kind == AX_TY_SLICE) {
-        TypeId elem = subst_ty(cx, t->slice.elem, args);
+        TypeId elem = ax_subst_ty(cx, t->slice.elem, args);
         if (elem.v == t->slice.elem.v) return ty;
         AxType new_t = *t;
         new_t.slice.elem = elem;
         return ax_intern_type(&cx->thir->interner, &new_t);
     }
     if (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) {
-        TypeId pointee = subst_ty(cx, t->view.pointee, args);
+        TypeId pointee = ax_subst_ty(cx, t->view.pointee, args);
         if (pointee.v == t->view.pointee.v) return ty;
         AxType new_t = *t;
         new_t.view.pointee = pointee;
         return ax_intern_type(&cx->thir->interner, &new_t);
     }
     if (t->kind == AX_TY_PTR) {
-        TypeId pointee = subst_ty(cx, t->ptr.pointee, args);
+        TypeId pointee = ax_subst_ty(cx, t->ptr.pointee, args);
         if (pointee.v == t->ptr.pointee.v) return ty;
         AxType new_t = *t;
         new_t.ptr.pointee = pointee;
@@ -575,7 +575,7 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
         bool changed = false;
         TypeId *fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->tuple.field_count, _Alignof(TypeId));
         for (size_t i = 0; i < t->tuple.field_count; i++) {
-            fields[i] = subst_ty(cx, t->tuple.fields[i], args);
+            fields[i] = ax_subst_ty(cx, t->tuple.fields[i], args);
             if (fields[i].v != t->tuple.fields[i].v) changed = true;
         }
         if (!changed) return ty;
@@ -585,13 +585,13 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
     }
     if (t->kind == AX_TY_FN) {
         bool changed = false;
-        TypeId ret = subst_ty(cx, t->fn.ret_type, args);
+        TypeId ret = ax_subst_ty(cx, t->fn.ret_type, args);
         if (ret.v != t->fn.ret_type.v) changed = true;
         TypeId *param_types = NULL;
         if (t->fn.param_count > 0) {
             param_types = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->fn.param_count, _Alignof(TypeId));
             for (size_t i = 0; i < t->fn.param_count; i++) {
-                param_types[i] = subst_ty(cx, t->fn.param_types[i], args);
+                param_types[i] = ax_subst_ty(cx, t->fn.param_types[i], args);
                 if (param_types[i].v != t->fn.param_types[i].v) changed = true;
             }
         }
@@ -608,14 +608,14 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
         if (t->strct.arg_count > 0) {
             sargs = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->strct.arg_count, _Alignof(TypeId));
             for (size_t i = 0; i < t->strct.arg_count; i++) {
-                sargs[i] = subst_ty(cx, t->strct.args[i], args);
+                sargs[i] = ax_subst_ty(cx, t->strct.args[i], args);
                 if (sargs[i].v != t->strct.args[i].v) changed = true;
             }
         }
         if (t->strct.field_count > 0) {
             fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->strct.field_count, _Alignof(TypeId));
             for (size_t i = 0; i < t->strct.field_count; i++) {
-                fields[i] = subst_ty(cx, t->strct.fields[i], args);
+                fields[i] = ax_subst_ty(cx, t->strct.fields[i], args);
                 if (fields[i].v != t->strct.fields[i].v) changed = true;
             }
         }
@@ -632,7 +632,7 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
         if (t->enm.arg_count > 0) {
             eargs = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->enm.arg_count, _Alignof(TypeId));
             for (size_t i = 0; i < t->enm.arg_count; i++) {
-                eargs[i] = subst_ty(cx, t->enm.args[i], args);
+                eargs[i] = ax_subst_ty(cx, t->enm.args[i], args);
                 if (eargs[i].v != t->enm.args[i].v) changed = true;
             }
         }
@@ -642,7 +642,7 @@ static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
                 if (t->enm.variant_field_counts[v] > 0) {
                     vfields[v] = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->enm.variant_field_counts[v], _Alignof(TypeId));
                     for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
-                        vfields[v][i] = subst_ty(cx, t->enm.variant_fields[v][i], args);
+                        vfields[v][i] = ax_subst_ty(cx, t->enm.variant_fields[v][i], args);
                         if (vfields[v][i].v != t->enm.variant_fields[v][i].v) changed = true;
                     }
                 } else {
@@ -1350,7 +1350,7 @@ static TypeId instantiate_path(TypeckCtx *cx, TypeId ty, const AxHirItem *it, co
     }
     
     if (out_args) *out_args = gargs;
-    return subst_ty(cx, ty, &gargs);
+    return ax_subst_ty(cx, ty, &gargs);
 }
 
 static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericArgs *out_args) {

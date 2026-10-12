@@ -264,6 +264,10 @@ typedef struct AxThir {
 void ax_thir_init(AxThir *thir);
 void ax_thir_free(AxThir *thir);
 
+// Exposed for monomorphization
+struct TypeckCtx;
+TypeId ax_subst_ty(struct TypeckCtx *cx, TypeId ty, const AxGenericArgs *args);
+
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db);
 
 #endif

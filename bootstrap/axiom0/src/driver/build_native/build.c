@@ -11,6 +11,7 @@
 #include "objmodel/objmodel.h"
 #include "obj/coff/writer.h"
 #include "link/pe/linker.h"
+#include "traits/mono/mono.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -176,9 +177,9 @@ void ax_stage_build_native(AxDriverState *st) {
     ax_section_id_t text_sec_id = ax_objmodel_add_section(&obj, ".text", AX_SEC_CODE, AX_SEC_FLAG_EXEC | AX_SEC_FLAG_READ, 16);
     ax_section_t *text_sec = ax_objmodel_get_section(&obj, text_sec_id);
 
-    for (const AxHirItem *item = st->hir.items; item != NULL; item = item->next) {
+    for (const AxMonoInstance *inst = st->mono_instances; inst != NULL; inst = inst->next) { const AxHirItem *item = inst->item;
         if (item->kind == AX_HIR_ITEM_FN) {
-            AxMirBody *mir_body = ax_pipeline_get_mir(item);
+            AxMirBody *mir_body = inst->body;
             if (mir_body) {
                 const TypeId *pty = AxItemTypeMap_get(&st->thir.item_types, item);
                 TypeId ty_id = pty ? *pty : (TypeId){0};
@@ -217,9 +218,10 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
                     func_start = text_sec->bytes_len;
 
-                    StrView name = ax_interner_get(&st->interner, item->fn.name);
+                    StrView name = ax_interner_get(&st->interner, inst->mangled_name);
                     char name_buf[256];
                     snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+
 
                     ax_x64_frame_emit_prologue(text_sec, &layout);
 
@@ -291,7 +293,9 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
 
                     uint64_t func_size = text_sec->bytes_len - func_start;
+                    printf("EXPORTING: %s\n", name_buf);
                     ax_objmodel_add_symbol(&obj, strdup(name_buf), text_sec_id, func_start, func_size, AX_SYM_GLOBAL);
+                    if (strcmp(name_buf, "main") == 0) { ax_objmodel_add_symbol(&obj, strdup("ax_main"), text_sec_id, func_start, func_size, AX_SYM_GLOBAL); }
                 }
             }
         }

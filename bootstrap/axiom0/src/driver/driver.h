@@ -115,9 +115,12 @@ typedef enum AxStageId {
     AX_STAGE_HIR,
     AX_STAGE_TYPECK,
     AX_STAGE_OWN,
+    AX_STAGE_MONO,
     AX_STAGE_INTERP,
     AX_STAGE_LIMIT
 } AxStageId;
+
+struct AxMonoInstance;
 
 typedef struct AxDriverState {
     const AxIo *io;
@@ -140,6 +143,7 @@ typedef struct AxDriverState {
     AxResolveMap resolve_map;
     AxHir hir;
     AxThir thir;
+    struct AxMonoInstance *mono_instances;
 } AxDriverState;
 
 typedef void (*AxStageRunFn)(AxDriverState *st);

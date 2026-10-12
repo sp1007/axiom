@@ -434,6 +434,7 @@ static void stage_run(AxDriverState *st) {
 }
 
 extern void ax_stage_build_native(AxDriverState *st);
+extern void ax_stage_mono(AxDriverState *st);
 
 const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_SOURCE, "source", NULL, stage_source},
@@ -444,6 +445,7 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
     {AX_STAGE_OWN, "own", "own", stage_own},
     {AX_STAGE_INTERP, "run", "interp", stage_run},
+    {AX_STAGE_MONO, "mono", "mono", ax_stage_mono},
     {AX_STAGE_LIMIT, "build", "native", ax_stage_build_native},
     {AX_STAGE_LIMIT + 1, "opt", "opt", stage_source},
     {AX_STAGE_LIMIT + 2, NULL, NULL, NULL}

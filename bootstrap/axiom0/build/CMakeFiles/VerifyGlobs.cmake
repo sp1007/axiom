@@ -132,6 +132,7 @@ set(OLD_GLOB
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/target/x64/isel/isel.c"
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/target/x64/mir/mi.c"
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/target/x64/verify/verify.c"
+  "D:/projects/compiler/new lang/bootstrap/axiom0/src/traits/mono/mono.c"
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/types/interner.c"
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/types/layout/layout.c"
   "D:/projects/compiler/new lang/bootstrap/axiom0/src/types/match/exhaust.c"

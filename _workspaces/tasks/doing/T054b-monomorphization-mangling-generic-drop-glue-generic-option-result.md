@@ -10,8 +10,8 @@ depends: [T054, T060]
 priority: 74
 status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src/traits/mono, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, std/core/option.ax, std/core/result.ax, std/core/prelude.ax, tests/run/generic, tests/run/mono, tests/ui/mono]
-locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c]
+paths: [bootstrap/axiom0/src/traits/mono, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, std/core, tests/run, tests/ui/mono]
+locks: [bootstrap/axiom0/src/driver/project.c, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/driver/build_native/build.c, bootstrap/axiom0/src/resolve/resolve.c]
 spec: [0083, tasks/0271, tasks/0506, tasks/0354, 0042, 0178]
 covers: []
 ---
