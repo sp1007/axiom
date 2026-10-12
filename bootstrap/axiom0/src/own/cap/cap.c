@@ -65,9 +65,6 @@ static void check_invalidate(const CapState *state, size_t local_count, const Ax
 static void visit_operand(CapState *state, size_t local_count, const AxMirOperand *op, AxLocation loc, AxDiagSink *sink, bool report) {
     if (op->kind == AX_MIR_OP_MOVE) {
         check_invalidate(state, local_count, &op->place, loc, sink, report);
-        if (op->place.proj_count == 0 && op->place.local.v < local_count) {
-            state->caps[op->place.local.v].view = AX_MIR_VIEW_UNKNOWN;
-        }
     }
 }
 
@@ -125,7 +122,7 @@ static void visit_stmt(CapState *state, size_t local_count, const AxMirStmt *stm
                         }
                     }
                 }
-            } else if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_USE && stmt->assign.rvalue.use.kind == AX_MIR_OP_COPY) {
+            } else if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_USE && (stmt->assign.rvalue.use.kind == AX_MIR_OP_COPY || stmt->assign.rvalue.use.kind == AX_MIR_OP_MOVE)) {
                 if (stmt->assign.place.proj_count == 0 && stmt->assign.rvalue.use.place.proj_count == 0) {
                     state->caps[stmt->assign.place.local.v] = state->caps[stmt->assign.rvalue.use.place.local.v];
                     if (report && state->caps[stmt->assign.place.local.v].view != AX_MIR_VIEW_UNKNOWN) {
@@ -155,6 +152,19 @@ static void visit_stmt(CapState *state, size_t local_count, const AxMirStmt *stm
                     }
                 }
             }
+            
+            if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_USE && stmt->assign.rvalue.use.kind == AX_MIR_OP_MOVE) {
+                if (stmt->assign.rvalue.use.place.proj_count == 0 && stmt->assign.rvalue.use.place.local.v < local_count) {
+                    state->caps[stmt->assign.rvalue.use.place.local.v].view = AX_MIR_VIEW_UNKNOWN;
+                }
+            } else if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
+                for (size_t i = 0; i < stmt->assign.rvalue.aggregate.operand_count; i++) {
+                    const AxMirOperand *op = &stmt->assign.rvalue.aggregate.operands[i];
+                    if (op->kind == AX_MIR_OP_MOVE && op->place.proj_count == 0 && op->place.local.v < local_count) {
+                        state->caps[op->place.local.v].view = AX_MIR_VIEW_UNKNOWN;
+                    }
+                }
+            }
             break;
         case AX_MIR_STMT_STORAGE_LIVE:
             state->caps[stmt->storage_live.v].view = AX_MIR_VIEW_UNKNOWN;
@@ -179,6 +189,10 @@ static void visit_bb(CapState *state, size_t local_count, const AxMirBb *bb, AxD
     } else if (term->kind == AX_MIR_TERM_CALL) {
         for (size_t i = 0; i < term->call.arg_count; i++) {
             visit_operand(state, local_count, &term->call.args[i], loc, sink, report);
+            const AxMirOperand *op = &term->call.args[i];
+            if (op->kind == AX_MIR_OP_MOVE && op->place.proj_count == 0 && op->place.local.v < local_count) {
+                state->caps[op->place.local.v].view = AX_MIR_VIEW_UNKNOWN;
+            }
         }
     }
 }

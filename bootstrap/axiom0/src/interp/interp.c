@@ -50,6 +50,13 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
         if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == (uint32_t)sym_v) {
             return (AxHirItem*)it;
         }
+        if (it->kind == AX_HIR_ITEM_IMPL) {
+            for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == (uint32_t)sym_v) {
+                    return (AxHirItem*)m;
+                }
+            }
+        }
     }
 
     StrId target_name = {0};
@@ -61,6 +68,18 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
             }
             break;
         }
+        if (it->kind == AX_ITEM_IMPL) {
+            for (const AxAstItem *m = it->impl.members; m; m = m->next) {
+                AxSymbolId *m_sym = AxNodeMap_get(&ctx->rmap->node_map, m);
+                if (m_sym && m_sym->v == (uint32_t)sym_v) {
+                    if (m->kind == AX_ITEM_FN) {
+                        target_name = m->fn.name;
+                    }
+                    break;
+                }
+            }
+            if (target_name.v != 0) break;
+        }
     }
     
     if (target_name.v == 0) {
@@ -70,6 +89,13 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
     for (const AxHirItem *it = ctx->hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_FN && it->fn.name.v == target_name.v) {
             return (AxHirItem*)it;
+        }
+        if (it->kind == AX_HIR_ITEM_IMPL) {
+            for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == target_name.v) {
+                    return (AxHirItem*)m;
+                }
+            }
         }
     }
     return NULL;

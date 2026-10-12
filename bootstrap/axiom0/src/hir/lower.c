@@ -5,6 +5,7 @@ typedef struct LowerCtx {
     AxArena *arena;
     const AxResolveMap *rmap;
     AxDiagSink *sink;
+    uint32_t fake_sym_counter;
 } LowerCtx;
 
 static void emit_not_supported(LowerCtx *ctx, Span span) {
@@ -640,7 +641,7 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                 hi->kind = AX_HIR_ITEM_USE;
                 hi->use.tree = lower_use_tree(ctx, n->use.tree);
                 break;
-            case AX_ITEM_FN:
+            case AX_ITEM_FN: {
                 hi->kind = AX_HIR_ITEM_FN;
                 hi->fn.is_async = n->fn.is_async;
                 hi->fn.is_comptime = n->fn.is_comptime;
@@ -648,6 +649,9 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                 hi->fn.abi = n->fn.abi;
                 hi->fn.name = n->fn.name;
                 hi->fn.symbol = get_symbol(ctx, n);
+                if (hi->fn.symbol.v == 0) {
+                    hi->fn.symbol.v = ctx->fake_sym_counter++;
+                }
                 hi->fn.generic_params = lower_generic_params(ctx, n->fn.generic_params);
                 
                 AxHirParam **ptail = &hi->fn.params;
@@ -671,6 +675,7 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                     hi->fn.body = b;
                 }
                 break;
+            }
             case AX_ITEM_STRUCT:
                 hi->kind = AX_HIR_ITEM_STRUCT;
                 hi->struct_decl.name = n->struct_decl.name;
@@ -777,7 +782,7 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
 }
 
 AxHir ax_lower_ast(AxArena *arena, const AxAst *ast, const AxResolveMap *rmap, AxDiagSink *sink) {
-    LowerCtx ctx = { arena, rmap, sink };
+    LowerCtx ctx = { arena, rmap, sink, 0x80000000 };
     AxHir hir = {0};
     hir.items = lower_item(&ctx, ast->items);
     return hir;
