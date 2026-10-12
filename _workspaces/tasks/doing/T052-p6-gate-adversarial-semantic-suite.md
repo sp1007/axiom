@@ -8,11 +8,12 @@ model: opus
 gate_model: opus
 depends: [T051, T052a]
 priority: 72
-status: blocked
+status: doing
 attempts: 1
-paths: [tests/conformance/adversarial, tests/conformance/stress]
+paths: [tests, spec, _workspaces/tasks/done]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
-started: 2026-10-12 08:49:03
+started: 2026-10-12 09:20:39
+unblocks: 1
 ---
 # T052 — P6 gate: adversarial semantic suite
 
@@ -23,9 +24,14 @@ Attack the ownership/capability implementation with the adversarial cases from t
 - Port 0026 adversarial tests + relevant 0022 stress tests into canonical syntax; report every divergence as finding or spec gap.
 
 ## Implementation Plan
-1. Update `tests/conformance/stress/e003.ax` to either expect `AX_CAP_CONFLICT_MUT` or use explicit block scoping for the view, as per ADR-0006 (no last-use analysis in Axiom).
-2. Wait for `T052a` to be completed to fix the compiler for `partial_002.ax` (partial moves invalidate the whole struct).
-3. Re-run the test suite to verify everything passes.
+1. Update `tests/conformance/stress/e003.ax` to either expect `AX_CAP_CONFLICT_MUT` or use explicit block scoping for the view, as per ADR-0006.
+2. Fix board hygiene issues preventing `gatecheck.py`, `reqcov.py` and `harness_check.py` from passing:
+   - Update `spec/invariants.md` to change `since: T046` to `since: T121` (T046 was superseded).
+   - Update `spec/requirements/CATALOG.md` (or `COVERAGE.md`) to change `T049` to `T127` in `REQ-MIR-001`.
+   - Update `_workspaces/tasks/done/T052a-fix-partial-moves.md` to add `gate_model: opus`.
+   - Remove `// xfail: T130` from `tests/run/drop/qa_array_drop.ax`.
+   - Remove `// xfail: T126` from `tests/run/slice/disjoint_split.ax`.
+3. Re-run the test suite and gate scripts to verify everything passes.
 
 ## Acceptance
 - [ ] The whole suite passes. A divergence that is a spec gap gets an architect ADR and an `xfail: <task-id>` entry; an implementation bug blocks the gate until its fix task is done (0264 §20: PASS or BLOCKED, never "almost done").
@@ -44,3 +50,5 @@ Attack the ownership/capability implementation with the adversarial cases from t
 ## Log
 - 2026-10-12 08:49:03 started (attempt 1) 
 - 2026-10-12 08:56:03 block: partial move and last-use bugs
+- 2026-10-12 09:20:31 unblocked (cycle 1) 
+- 2026-10-12 09:20:39 started (attempt 1) 

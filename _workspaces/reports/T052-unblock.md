@@ -1,24 +1,15 @@
-# T052 Unblock
+# T052 Unblock Analysis
 
 ## Tóm tắt
-QA phát hiện hai vấn đề trong quá trình port test: (1) compiler cho phép dùng biến sau khi đã move một phần (partial move), (2) test e003 mong muốn NLL (last-use analysis) cho view.
-Giải pháp: Tuân thủ mô hình semantic đơn giản (không borrow checker).
-- Viết ADR 0006: Khẳng định view chỉ có lexical scope (không có NLL) và partial move làm mất giá trị (invalidate) cả struct.
-- Tạo task `T052a` để sửa compiler về vấn đề partial move.
-- Thêm `T052a` vào dependency của T052 và cập nhật Implementation Plan cho test e003.
+T052 (P6 gate) bị chặn do các script kiểm tra (`gatecheck.py`, `reqcov.py`, `harness_check.py`) báo lỗi ở những file nằm ngoài phạm vi `paths` ban đầu của task. Lỗi chủ yếu do metadata bị cũ: các task T046, T049 đã được thay thế (superseded) nhưng vẫn còn tham chiếu trong `spec/invariants.md` và `spec/requirements/CATALOG.md`; các tag `xfail` của T130 và T126 vẫn còn trong test dù task đã xong; và T052a thiếu trường `gate_model`.
+Thay vì tạo một task mới, phạm vi `paths` của T052 đã được mở rộng để có thể tự dọn dẹp các metadata này, vì một gate task cần có khả năng dọn dẹp board hygiene để hoàn thành các script kiểm tra. Kế hoạch triển khai của T052 cũng đã được cập nhật chi tiết các bước sửa lỗi metadata.
 
-## Decision and Rationale
-The failing tests revealed confusion around Axiom's semantic model. A strict, simple capability model ("ownership ≠ borrow checker") dictates:
-1. No Non-Lexical Lifetimes (NLL): The `e003.ax` test erroneously assumes last-use analysis. Views are strictly bound to their lexical scope, so the test should either explicitly scope the view or expect `AX_CAP_CONFLICT_MUT`.
-2. Partial move invalidation: The compiler's acceptance of `partial_002.ax` is an implementation bug. A partial move out of an aggregate invalidates the entire aggregate for by-value use.
-
-I have created `docs/adr/0006-ownership-semantics.md` to codify this architecture decision.
-I split out the compiler fix into `_workspaces/tasks/todo/T052a-fix-partial-moves.md` and made T052 depend on it. T052's implementation plan was also updated to address the `e003.ax` test.
+## Decision
+- **Option 1**: Create a prerequisite board hygiene task (`T134`) and have T052 depend on it.
+- **Option 2**: Expand T052's `paths` to include `tests`, `spec`, and `_workspaces/tasks/done` so it can fix the metadata itself, as a gate task is expected to ensure system-wide cleanliness.
+- **Decision**: Option 2. T052 is a gate task and its acceptance criteria explicitly require `gatecheck.py`, `reqcov.py`, and `harness_check.py` to pass. Restricting its paths to only the new adversarial tests prevented it from achieving its acceptance criteria. We have expanded its `paths` and updated its `Implementation Plan` with the exact metadata updates needed.
 
 ## Files changed
-- docs/adr/0006-ownership-semantics.md
-- _workspaces/tasks/todo/T052a-fix-partial-moves.md
 - _workspaces/tasks/doing/T052-p6-gate-adversarial-semantic-suite.md
-- _workspaces/reports/T052-unblock.md
 
 STATUS: UNBLOCKED
