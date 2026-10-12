@@ -1,13 +1,14 @@
 ---
 id: T137
 title: Write missing tests for native_str
-status: doing
+status: done
 owner: axiom-backend
 reviewer: axiom-qa
 model: pro
 gate_model: pro
 dependencies: [T130]
 paths: [tests/run/native_str/]
+finished: 2026-10-12 13:35:43
 ---
 
 ## Objective
@@ -17,3 +18,6 @@ We need to write proper end-to-end tests for native_str to ensure quality.
 ## Implementation Plan
 1. Write exhaustive tests for str in 	ests/run/native_str/.
 2. Remove the qa_dummy.ax placeholder.
+
+## Log
+- 2026-10-12 13:35:43 accepted by QA -> done
