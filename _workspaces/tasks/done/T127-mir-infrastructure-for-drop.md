@@ -15,6 +15,7 @@ attempts: 1
 started: 2026-10-11 09:15:38
 unblocks: 1
 finished: 2026-10-11 09:31:17
+covers: [REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006]
 ---
 # T127 — MIR Infrastructure for Drop
 
@@ -39,3 +40,4 @@ Extend MIR data structures to support drop statements, drop flags, and drop term
 - 2026-10-11 09:14:22 unblocked (cycle 1) 
 - 2026-10-11 09:15:38 started (attempt 1) T127-impl
 - 2026-10-11 09:31:17 accepted by QA -> done
+- 2026-10-12 09:38:18 covers += REQ-MIR-001, REQ-MIR-002, REQ-MIR-003, REQ-MIR-004, REQ-MIR-005, REQ-MIR-006 (metadata only)

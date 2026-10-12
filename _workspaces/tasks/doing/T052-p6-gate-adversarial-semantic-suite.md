@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T051, T052a]
+depends: [T051, T052a, T052b, T126a]
 priority: 72
 status: doing
 attempts: 1
@@ -30,7 +30,6 @@ Attack the ownership/capability implementation with the adversarial cases from t
    - Update `spec/requirements/CATALOG.md` (or `COVERAGE.md`) to change `T049` to `T127` in `REQ-MIR-001`.
    - Update `_workspaces/tasks/done/T052a-fix-partial-moves.md` to add `gate_model: opus`.
    - Remove `// xfail: T130` from `tests/run/drop/qa_array_drop.ax`.
-   - Remove `// xfail: T126` from `tests/run/slice/disjoint_split.ax`.
 3. Re-run the test suite and gate scripts to verify everything passes.
 
 ## Acceptance

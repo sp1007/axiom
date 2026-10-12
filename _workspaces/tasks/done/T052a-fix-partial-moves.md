@@ -5,6 +5,7 @@ phase: P6-ownership
 owner: axiom-semantics
 reviewer: axiom-architect
 model: opus
+gate_model: opus
 depends: []
 priority: 72
 status: done
