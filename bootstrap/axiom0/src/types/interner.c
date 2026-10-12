@@ -70,6 +70,20 @@ TypeId ax_intern_type(TypeInterner *in, const AxType *type) {
             new_type->enm.args = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->enm.arg_count, _Alignof(TypeId));
             for (size_t i = 0; i < type->enm.arg_count; i++) new_type->enm.args[i] = type->enm.args[i];
         }
+        if (type->enm.variant_fields) {
+            TypeId **new_vfields = ax_arena_alloc(&in->arena, type->enm.variant_count * sizeof(TypeId *), _Alignof(TypeId *));
+            for (size_t v = 0; v < type->enm.variant_count; v++) {
+                if (type->enm.variant_field_counts[v] > 0) {
+                    new_vfields[v] = ax_arena_alloc(&in->arena, type->enm.variant_field_counts[v] * sizeof(TypeId), _Alignof(TypeId));
+                    for (size_t i = 0; i < type->enm.variant_field_counts[v]; i++) {
+                        new_vfields[v][i] = type->enm.variant_fields[v][i];
+                    }
+                } else {
+                    new_vfields[v] = NULL;
+                }
+            }
+            new_type->enm.variant_fields = (TypeId **)new_vfields;
+        }
     }
     
     if (in->len == in->cap) {

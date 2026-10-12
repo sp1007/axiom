@@ -469,7 +469,7 @@ static AxAstPat *parse_pat_no_or(Parser *p) {
             pat->literal.is_negated = neg;
         }
     } else if (check(p, AX_TOK_IDENT) || (check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE)) || check(p, AX_TOK_KW_MUT)) {
-        if (check(p, AX_TOK_IDENT) && !(check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE)) && peek_nth(p, 1)->kind != AX_TOK_DOT && peek_nth(p, 1)->kind != AX_TOK_LPAREN && peek_nth(p, 1)->kind != AX_TOK_LBRACE && !check(p, AX_TOK_KW_MUT)) {
+        if (check(p, AX_TOK_IDENT) && !(check(p, AX_TOK_KW_SELF_TYPE) || check(p, AX_TOK_KW_SELF_VALUE)) && peek_nth(p, 1)->kind != AX_TOK_DOT && peek_nth(p, 1)->kind != AX_TOK_LPAREN && peek_nth(p, 1)->kind != AX_TOK_LBRACE && peek_nth(p, 1)->kind != AX_TOK_LT && !check(p, AX_TOK_KW_MUT)) {
             // Identifier pattern
             pat->kind = AX_PAT_BINDING;
             pat->binding.is_mut = false;
@@ -488,6 +488,9 @@ static AxAstPat *parse_pat_no_or(Parser *p) {
                 seg->span = peek(p)->span;
                 seg->name = (check(p, AX_TOK_KW_SELF_TYPE) ? ax_intern_cstr(p->interner, "Self") : (check(p, AX_TOK_KW_SELF_VALUE) ? ax_intern_cstr(p->interner, "self") : peek(p)->val.ident_val));
                 advance(p);
+                if (check(p, AX_TOK_LT)) {
+                    seg->generic_args = parse_generic_args(p);
+                }
                 if (tail) tail->next = seg;
                 else head = seg;
                 tail = seg;

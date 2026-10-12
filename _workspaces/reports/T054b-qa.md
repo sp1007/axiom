@@ -44,3 +44,25 @@
 - tests/run/mono/qa_generic_enum_drop.ax
 
 VERDICT: FAIL round=3
+
+## Round 4
+
+### Checks Performed
+1. **Changes check**: Ran `taskctl.py changes T054b`. Raised `WARN` regarding `tests/ui/resolve/test_span.ax` being outside the task's `paths:` array.
+2. **Build**: Built snapshot `build-snap-T054b`. Passed with 0 warnings.
+3. **Test Suite**: Ran `python tools/axtest.py --compiler build/axiom0.exe`. Passed (TOTAL 1147 PASS 1139 FAIL 0 SKIP 8 XFAIL 0).
+4. **Acceptance Criteria Verification**:
+   - `run + ui tests; instance dedup test; mangling deterministic`: Deterministic mangling verified manually using `diff` on two subsequent `build/axiom0.exe inspect --emit=mir tests/run/mono/qa_dedup_mangling.ax` outputs.
+   - `Drop-count test: a generic container struct holding values with destructors drops each exactly once`: Verified `qa_drop_count_generic.ax` tests order correctly. Also created `tests/run/mono/qa_test_result_drop.ax` to cross-check enum drops.
+   - `New generic run tests of this task carry // native-after: T059 only where they need backend work`: **FAILED**.
+
+### Findings
+1. `tests/run/mono/qa_test_basic.ax` carries an unnecessary `// native-after: T059` directive. The task's acceptance criteria state that plain generic functions and types should run natively here. I confirmed that the test builds and runs perfectly in native mode. (Violation of Mode Check / Acceptance Criteria).
+2. `tests/ui/resolve/test_span.ax` was edited but lies outside the task's allowed `paths:` (`tests/ui/mono/`). This is an edit outside `paths:`/`locks:` which constitutes a REFUSED / FAIL finding.
+
+## Files changed
+- tests/run/mono/qa_test_basic.ax
+- tests/run/mono/qa_generic_enum_drop.ax
+- tests/run/mono/qa_test_result_drop.ax
+
+VERDICT: FAIL round=4

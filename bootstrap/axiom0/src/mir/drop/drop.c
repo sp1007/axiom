@@ -131,6 +131,15 @@ static TypeId place_type(AxMirPlace p, AxMirBody *body, const AxThir *thir) {
         } else if (proj->kind == AX_MIR_PROJ_FIELD) {
             if (ty->kind == AX_TY_STRUCT) current_ty = ty->strct.fields[proj->field_idx];
             else if (ty->kind == AX_TY_TUPLE) current_ty = ty->tuple.fields[proj->field_idx];
+        } else if (proj->kind == AX_MIR_PROJ_DOWNCAST) {
+            // Downcast doesn't change the logical type (still the enum), but the next field projection will use the variant's fields
+            // We need a way to track the active variant, or we can just peek ahead!
+            if (ty->kind == AX_TY_ENUM) {
+                if (i + 1 < p.proj_count && p.projs[i+1].kind == AX_MIR_PROJ_FIELD) {
+                    current_ty = ty->enm.variant_fields[proj->variant_idx][p.projs[i+1].field_idx];
+                    i++; // skip the field projection
+                }
+            }
         } else if (proj->kind == AX_MIR_PROJ_INDEX) {
             if (ty->kind == AX_TY_ARRAY) current_ty = ty->array.elem;
             else if (ty->kind == AX_TY_SLICE) current_ty = ty->slice.elem;
@@ -205,6 +214,89 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
                 inner_target = field_bb;
             }
         }
+    } else if (ty && ty->kind == AX_TY_ENUM) {
+        AxMirLocalDecl *decl = ax_arena_alloc(&body->arena, (body->local_count + 1) * sizeof(AxMirLocalDecl), _Alignof(AxMirLocalDecl));
+        memcpy(decl, body->locals, body->local_count * sizeof(AxMirLocalDecl));
+        body->locals = decl;
+        AxMirLocalId discr_local = { (uint32_t)body->local_count++ };
+        body->locals[discr_local.v].ty = thir->interner.t_isize;
+        body->locals[discr_local.v].kind = AX_MIR_LOCAL_TEMP;
+
+        AxMirBb *bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
+        memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
+        body->bbs = bbs;
+        AxMirBbId switch_bb = { (uint32_t)body->bb_count++ };
+
+        AxMirStmt *discr_stmt = ax_arena_alloc(&body->arena, sizeof(AxMirStmt), _Alignof(AxMirStmt));
+        discr_stmt->kind = AX_MIR_STMT_ASSIGN;
+        discr_stmt->assign.place = (AxMirPlace){.local = discr_local};
+        discr_stmt->assign.rvalue.kind = AX_MIR_RVALUE_DISCRIMINANT;
+        discr_stmt->assign.rvalue.discriminant = place;
+
+        body->bbs[switch_bb.v].stmts = discr_stmt;
+        body->bbs[switch_bb.v].stmt_count = 1;
+        body->bbs[switch_bb.v].stmt_cap = 1;
+
+        AxMirSwitchTargets targets;
+        targets.values = ax_arena_alloc(&body->arena, ty->enm.variant_count * sizeof(AxMirSwitchTarget), _Alignof(AxMirSwitchTarget));
+        targets.count = 0;
+        targets.otherwise = inner_target;
+
+        for (size_t v = 0; v < ty->enm.variant_count; v++) {
+            bool variant_needs_drop = false;
+            for (size_t i = 0; i < ty->enm.variant_field_counts[v]; i++) {
+                if (needs_drop(ty->enm.variant_fields[v][i], thir, interner, hir, db)) {
+                    variant_needs_drop = true;
+                    break;
+                }
+            }
+
+            if (variant_needs_drop) {
+                AxMirBbId variant_target = inner_target;
+
+                for (size_t i = ty->enm.variant_field_counts[v]; i > 0; i--) {
+                    size_t idx = i - 1;
+                    TypeId field_ty = ty->enm.variant_fields[v][idx];
+                    if (needs_drop(field_ty, thir, interner, hir, db)) {
+                        bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
+                        memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
+                        body->bbs = bbs;
+                        AxMirBbId field_bb = { (uint32_t)body->bb_count++ };
+
+                        AxMirProjection *projs = ax_arena_alloc(&body->arena, (place.proj_count + 2) * sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                        if (place.proj_count > 0) memcpy(projs, place.projs, place.proj_count * sizeof(AxMirProjection));
+                        projs[place.proj_count].kind = AX_MIR_PROJ_DOWNCAST;
+                        projs[place.proj_count].variant_idx = (uint32_t)v;
+                        projs[place.proj_count + 1].kind = AX_MIR_PROJ_FIELD;
+                        projs[place.proj_count + 1].field_idx = (uint32_t)idx;
+
+                        AxMirPlace field_place = place;
+                        field_place.projs = projs;
+                        field_place.proj_count += 2;
+
+                        body->bbs[field_bb.v].stmts = NULL;
+                        body->bbs[field_bb.v].stmt_count = 0;
+                        body->bbs[field_bb.v].terminator.kind = AX_MIR_TERM_DROP;
+                        body->bbs[field_bb.v].terminator.drop.place = field_place;
+                        body->bbs[field_bb.v].terminator.drop.target = variant_target;
+                        body->bbs[field_bb.v].terminator.drop_flag = 0;
+
+                        variant_target = field_bb;
+                    }
+                }
+
+                targets.values[targets.count].value = v;
+                targets.values[targets.count].target = variant_target;
+                targets.count++;
+            }
+        }
+
+        body->bbs[switch_bb.v].terminator.kind = AX_MIR_TERM_SWITCH_INT;
+        body->bbs[switch_bb.v].terminator.switch_int.discr.kind = AX_MIR_OP_MOVE;
+        body->bbs[switch_bb.v].terminator.switch_int.discr.place = (AxMirPlace){.local = discr_local};
+        body->bbs[switch_bb.v].terminator.switch_int.targets = targets;
+
+        inner_target = switch_bb;
     }
     
 

@@ -120,6 +120,21 @@ static TypeId subst_ty_local(TypeId ty, const AxGenericArgs *args, TypeInterner 
                 if (e_args[i].v != t->enm.args[i].v) changed = true;
             }
             new_t.enm.args = e_args;
+            if (t->enm.variant_fields) {
+                TypeId **new_vfields = malloc(t->enm.variant_count * sizeof(TypeId *));
+                for (size_t v = 0; v < t->enm.variant_count; v++) {
+                    if (t->enm.variant_field_counts[v] > 0) {
+                        new_vfields[v] = malloc(t->enm.variant_field_counts[v] * sizeof(TypeId));
+                        for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
+                            new_vfields[v][i] = subst_ty_local(t->enm.variant_fields[v][i], args, in);
+                            if (new_vfields[v][i].v != t->enm.variant_fields[v][i].v) changed = true;
+                        }
+                    } else {
+                        new_vfields[v] = NULL;
+                    }
+                }
+                new_t.enm.variant_fields = (TypeId **)new_vfields;
+            }
             break;
         }
         default: break;

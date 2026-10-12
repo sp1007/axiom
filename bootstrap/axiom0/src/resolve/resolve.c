@@ -1154,20 +1154,6 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
         it = it->next;
     }
 
-    /* 4. Prelude module implicit export: if std.core.prelude exists, export its pub items to prelude scope */
-    for (Module *m = env.modules_list; m; m = m->next) {
-        if (strcmp(m->full_path, "std.core.prelude") == 0) {
-            uint32_t cur = 0; void *raw_e;
-            while (ax_rawmap_next(&m->exports.raw, &cur, &raw_e)) {
-                SymEnvEntry *e = (SymEnvEntry*)raw_e;
-                if (e->value.vis == AX_VIS_PUB) {
-                    SymEnv_insert(&prelude->bindings, e->key, e->value);
-                }
-            }
-            break;
-        }
-    }
-
     /* 5. Pass 2: Resolve imports */
     env.current_module = env.root_module;
     it = ast->items;
@@ -1183,6 +1169,20 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
             }
         }
         it = it->next;
+    }
+
+    /* 4. Prelude module implicit export: if std.core.prelude exists, export its pub items to prelude scope */
+    for (Module *m = env.modules_list; m; m = m->next) {
+        if (strcmp(m->full_path, "std.core.prelude") == 0) {
+            uint32_t cur = 0; void *raw_e;
+            while (ax_rawmap_next(&m->exports.raw, &cur, &raw_e)) {
+                SymEnvEntry *e = (SymEnvEntry*)raw_e;
+                if (e->value.vis == AX_VIS_PUB) {
+                    SymEnv_insert(&prelude->bindings, e->key, e->value);
+                }
+            }
+            break;
+        }
     }
 
     /* 6. Pass 3: Resolve bodies */

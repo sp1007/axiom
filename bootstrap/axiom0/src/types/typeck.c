@@ -236,6 +236,26 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
         return p_ta->kind == AX_TY_SLICE && unify_ty(cx, cx->thir->interner.t_u8, p_ta->slice.elem);
     }
 
+    if (ta->kind == AX_TY_ENUM && tb->kind == AX_TY_ENUM) {
+        if (ta->enm.def != tb->enm.def) return false;
+        if (ta->enm.arg_count != tb->enm.arg_count) return false;
+        bool ok = true;
+        for (size_t i = 0; i < ta->enm.arg_count; i++) {
+            if (!unify_ty(cx, ta->enm.args[i], tb->enm.args[i])) ok = false;
+        }
+        return ok;
+    }
+
+    if (ta->kind == AX_TY_STRUCT && tb->kind == AX_TY_STRUCT) {
+        if (ta->strct.def != tb->strct.def) return false;
+        if (ta->strct.arg_count != tb->strct.arg_count) return false;
+        bool ok = true;
+        for (size_t i = 0; i < ta->strct.arg_count; i++) {
+            if (!unify_ty(cx, ta->strct.args[i], tb->strct.args[i])) ok = false;
+        }
+        return ok;
+    }
+
     return false;
 }
 
@@ -1227,11 +1247,15 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             }
             StrView name = ax_source_db_span_text(cx->db, pat->path.path.span);
             StrView vname = name;
-            const char *dot = memchr(name.ptr, '.', name.len);
+            const char *dot = NULL;
+            for (size_t i = 0; i < name.len; i++) {
+                if (name.ptr[i] == '.') dot = name.ptr + i;
+            }
             if (dot) {
                 vname.ptr = dot + 1;
                 vname.len = name.len - (dot - name.ptr) - 1;
             }
+
             bool found_variant = false;
             size_t vidx = 0;
             for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
@@ -1423,7 +1447,10 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
             }
         } else if (it->kind == AX_HIR_ITEM_STRUCT) {
             StrView it_name = ax_interner_get(cx->str_in, it->struct_decl.name);
-            if (ax_sv_eq(it_name, name)) {
+            StrView struct_name = name;
+            const char *lt = memchr(name.ptr, '<', name.len);
+            if (lt) struct_name.len = lt - name.ptr;
+            if (ax_sv_eq(it_name, struct_name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (t) return instantiate_path(cx, *t, it, path, out_args);
                 return cx->thir->interner.t_error; // Being computed
@@ -1431,9 +1458,11 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         } else if (it->kind == AX_HIR_ITEM_ENUM) {
             StrView enum_name = name;
             const char *dot = memchr(name.ptr, '.', name.len);
-            if (dot) {
-                enum_name.len = dot - name.ptr;
-            }
+            const char *lt = memchr(name.ptr, '<', name.len);
+            const char *end = name.ptr + name.len;
+            if (dot && dot < end) end = dot;
+            if (lt && lt < end) end = lt;
+            enum_name.len = end - name.ptr;
             StrView it_name = ax_interner_get(cx->str_in, it->enum_decl.name);
             if (ax_sv_eq(it_name, enum_name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
@@ -1441,6 +1470,7 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
             }
         }
     }
+    
     AxDiagnostic d = {0};
     d.code = AX_NAME_UNRESOLVED;
     d.severity = AX_DIAG_ERROR;
@@ -2519,7 +2549,11 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             mut_expr->try_expr.payload_idx = payload_idx;
             mut_expr->try_expr.err_idx = err_idx;
             
-            return hir_type_to_typeid(cx, payload_var->tuple_types);
+            if (t->enm.variant_field_counts[payload_idx] > 0) {
+                return t->enm.variant_fields[payload_idx][0];
+            } else {
+                return hir_type_to_typeid(cx, payload_var->tuple_types);
+            }
         }
         case AX_HIR_EXPR_AWAIT:
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
