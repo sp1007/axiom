@@ -9,7 +9,7 @@ model: opus
 depends: []
 priority: 71
 status: doing
-paths: [src/semantics]
+paths: [bootstrap/axiom0/src, tests]
 attempts: 1
 started: 2026-10-12 11:37:28
 ---
