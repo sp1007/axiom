@@ -1,7 +1,11 @@
 ---
 id: T137
 title: Write missing tests for native_str
-status: todo
+status: doing
+owner: axiom-backend
+reviewer: axiom-qa
+model: pro
+gate_model: pro
 dependencies: [T130]
 paths: [tests/run/native_str/]
 ---

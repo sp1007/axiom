@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T052]
 priority: 73
-status: todo
+status: doing
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/traits, tests/run/method, tests/ui/method]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/TRAIT.def]
@@ -20,7 +20,7 @@ spec: [0112, tasks/0476, tasks/0614]
 Method call syntax and resolution order.
 
 ## Scope
-- `fn f(self: view<T>)` methods, receivers by value/view/mut_view with automatic ephemeral capability, member call resolution order (inherent → trait → imported extension → generic extension), UFCS `T.f(x)`.
+- `fn f(self: view<T>)` methods, receivers by value/view/mut_view with automatic ephemeral capability, inherent member call resolution, UFCS `T.f(x)` for inherent methods (trait and extension methods deferred to T055).
 - View receivers (moved from T048, ADR-0006 §6): `self: view<T>` / `mut_view<T>` with the automatic ephemeral capability at the call, checked by the T048 analysis.
 - Inherent impls on built-in types when declared in std (needed by T069: `u32.min`, `char.len_utf8`, …) per the spec's rule for who may add them.
 

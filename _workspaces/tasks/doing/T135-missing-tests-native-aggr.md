@@ -1,7 +1,11 @@
 ---
 id: T135
 title: Write missing tests for native_aggr
-status: todo
+status: doing
+owner: axiom-backend
+reviewer: axiom-qa
+model: pro
+gate_model: pro
 dependencies: [T130]
 paths: [tests/run/native_aggr/]
 ---
