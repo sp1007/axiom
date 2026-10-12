@@ -8,7 +8,7 @@ reviewer: axiom-architect
 model: sonnet
 depends: []
 priority: 71
-status: doing
+status: done
 paths: [tests/run/native_abi, tools/gatecheck.py]
 attempts: 1
 started: 2026-10-12 11:37:28

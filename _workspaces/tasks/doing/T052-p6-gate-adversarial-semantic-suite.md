@@ -8,7 +8,7 @@ model: opus
 gate_model: opus
 depends: [T051, T052a, T052b, T126a, T052c, T052d]
 priority: 72
-status: blocked
+status: doing
 attempts: 1
 paths: [tests, spec, _workspaces/tasks/done]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
