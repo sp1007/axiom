@@ -316,8 +316,13 @@ static AxMirTerminator parse_terminator(MirParser *p, AxMirPlace *call_dest) {
         term.kind = AX_MIR_TERM_RETURN;
     } else if (match_ident(p, "unreachable")) {
         term.kind = AX_MIR_TERM_UNREACHABLE;
+    } else if (match_ident(p, "explicit") && match_ident(p, "drop(")) {
+        term.kind = AX_MIR_TERM_DROP;
+        term.drop.is_explicit = true;
+        term.drop.place = parse_place(p);
     } else if (match_ident(p, "drop(")) {
         term.kind = AX_MIR_TERM_DROP;
+        term.drop.is_explicit = false;
         term.drop.place = parse_place(p);
         expect_str(p, ")");
         expect_str(p, "->");
@@ -491,6 +496,7 @@ AxMirBody *ax_mir_parse(const char *text, TypeInterner *interner, AxArena *arena
             size_t saved = p.pos;
             bool is_term = match_ident(&p, "goto") || match_ident(&p, "return") || 
                            match_ident(&p, "unreachable") || match_ident(&p, "drop") || 
+                           match_ident(&p, "explicit") ||
                            match_ident(&p, "switchInt") || match_ident(&p, "assert");
             p.pos = saved;
             

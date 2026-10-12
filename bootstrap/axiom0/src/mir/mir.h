@@ -242,6 +242,7 @@ typedef struct AxMirTerminator {
             AxMirPlace place;
             AxMirBbId target;
             AxMirBbId unwind;
+            bool is_explicit;
         } drop;
         struct {
             AxMirOperand func;

@@ -318,8 +318,9 @@ static void visit_bb(Visitor *v, const AxMirBb *bb) {
             visit_operand(v, &term->switch_int.discr, loc);
             break;
         case AX_MIR_TERM_DROP:
-            // Implicit drops should not cause 'use of moved value' errors
-            // check_use(v, &term->drop.place, loc);
+            if (term->drop.is_explicit) {
+                check_use(v, &term->drop.place, loc);
+            }
             do_move(v, &term->drop.place, loc);
             break;
         case AX_MIR_TERM_CALL:

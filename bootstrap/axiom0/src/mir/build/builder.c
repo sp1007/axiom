@@ -1616,6 +1616,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 term.drop.place = arg_place;
                 term.drop.target = next_bb;
                 term.drop.unwind = (AxMirBbId){0};
+                term.drop.is_explicit = true;
                 set_terminator(b, b->current_bb, term);
                 b->current_bb = next_bb;
 

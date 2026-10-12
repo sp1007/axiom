@@ -191,6 +191,9 @@ static void print_terminator(FILE *out, const AxMirTerminator *term, int level) 
             fprintf(out, "unreachable;\n");
             break;
         case AX_MIR_TERM_DROP:
+            if (term->drop.is_explicit) {
+                fprintf(out, "explicit ");
+            }
             fprintf(out, "drop(");
             print_place(out, &term->drop.place);
             fprintf(out, ") -> [return: ");

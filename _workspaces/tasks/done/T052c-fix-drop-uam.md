@@ -1,4 +1,5 @@
 ---
+gate_model: none
 id: T052c
 title: Fix drop() use-after-move bug
 phase: P6-ownership
@@ -7,9 +8,13 @@ reviewer: axiom-architect
 model: opus
 depends: []
 priority: 71
-status: todo
-paths: [src/semantics]
+status: done
+paths: [bootstrap/axiom0/src, tests]
+attempts: 1
+started: 2026-10-12 11:37:28
+finished: 2026-10-12 12:22:25
 ---
+gate_model: none
 # T052c — Fix drop() use-after-move bug
 
 ## Goal
@@ -17,3 +22,10 @@ Fix compiler bug where explicit `drop()` fails to trigger `AX_MOVE_USE_AFTER_MOV
 
 ## Scope
 - Ensure that `drop(b)` correctly moves `b` and any subsequent uses trigger the correct move error, as found in `own_branch_003.ax`.
+
+## Log
+- 2026-10-12 11:37:28 started (attempt 1) 
+
+## Acceptance
+All tests pass.
+- 2026-10-12 12:22:25 accepted by QA -> done
