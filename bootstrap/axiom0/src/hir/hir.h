@@ -404,6 +404,7 @@ typedef enum AxHirItemKind {
 struct AxHirGenericParam {
     Span span;
     StrId name;
+    AxSymbolId symbol;
     AxHirType *bounds;
     AxHirGenericParam *next;
 };
@@ -504,6 +505,7 @@ struct AxHirItem {
         } fn;
         struct {
             StrId name;
+            AxSymbolId symbol;
             AxHirGenericParams *generic_params;
             AxHirWhereClause *where_clause;
             bool is_tuple;
@@ -514,12 +516,14 @@ struct AxHirItem {
         } struct_decl;
         struct {
             StrId name;
+            AxSymbolId symbol;
             AxHirGenericParams *generic_params;
             AxHirWhereClause *where_clause;
             AxHirVariantDecl *variants;
         } enum_decl;
         struct {
             StrId name;
+            AxSymbolId symbol;
             AxHirGenericParams *generic_params;
             AxHirType *supertraits;
             AxHirWhereClause *where_clause;

@@ -40,6 +40,8 @@ typedef enum AxTypeKind {
 #define AX_TY_BUILTIN_DROP (AX_TY_INT_VAR + 9)
 #define AX_TY_VIEW (AX_TY_INT_VAR + 10)
 #define AX_TY_MUT_VIEW (AX_TY_INT_VAR + 11)
+#define AX_TY_PARAM (AX_TY_INT_VAR + 12)
+#define AX_TY_VAR (AX_TY_INT_VAR + 13)
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -51,6 +53,10 @@ typedef struct AxType {
             size_t param_count;
             TypeId ret_type;
         } fn;
+        struct {
+            StrId name;
+            uint32_t index;
+        } param;
         struct {
             uint32_t var_id;
         } int_var;
@@ -74,12 +80,16 @@ typedef struct AxType {
         } tuple;
         struct {
             const struct AxHirItem *def;
+            TypeId *args;
+            size_t arg_count;
             TypeId *fields;
             size_t field_count;
             bool is_repr_c;
         } strct;
         struct {
             const struct AxHirItem *def;
+            TypeId *args;
+            size_t arg_count;
             TypeId **variant_fields;
             size_t *variant_field_counts;
             size_t variant_count;
@@ -100,8 +110,10 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         for (size_t i = 0; i < k->fn.param_count; i++) {
             h = ax_hash_combine(h, ax_hash_u32(k->fn.param_types[i].v));
         }
-    } else if (k->kind == AX_TY_INT_VAR) {
+    } else if (k->kind == AX_TY_INT_VAR || k->kind == AX_TY_VAR) {
         h = ax_hash_combine(h, ax_hash_u32(k->int_var.var_id));
+    } else if (k->kind == AX_TY_PARAM) {
+        h = ax_hash_combine(h, ax_hash_u32(k->param.index));
     } else if (k->kind == AX_TY_PTR) {
         h = ax_hash_combine(h, ax_hash_u32(k->ptr.pointee.v));
         h = ax_hash_combine(h, ax_hash_u32(k->ptr.is_mut));
@@ -119,8 +131,14 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         }
     } else if (k->kind == AX_TY_STRUCT) {
         h = ax_hash_combine(h, ax_hash_u64((uint64_t)(uintptr_t)k->strct.def));
+        for (size_t i = 0; i < k->strct.arg_count; i++) {
+            h = ax_hash_combine(h, ax_hash_u32(k->strct.args[i].v));
+        }
     } else if (k->kind == AX_TY_ENUM) {
         h = ax_hash_combine(h, ax_hash_u64((uint64_t)(uintptr_t)k->enm.def));
+        for (size_t i = 0; i < k->enm.arg_count; i++) {
+            h = ax_hash_combine(h, ax_hash_u32(k->enm.args[i].v));
+        }
     }
     return h;
 }
@@ -136,8 +154,10 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
             if (a->fn.param_types[i].v != b->fn.param_types[i].v) return false;
         }
         return true;
-    } else if (a->kind == AX_TY_INT_VAR) {
+    } else if (a->kind == AX_TY_INT_VAR || a->kind == AX_TY_VAR) {
         return a->int_var.var_id == b->int_var.var_id;
+    } else if (a->kind == AX_TY_PARAM) {
+        return a->param.index == b->param.index;
     } else if (a->kind == AX_TY_PTR) {
         return a->ptr.pointee.v == b->ptr.pointee.v && a->ptr.is_mut == b->ptr.is_mut;
     } else if (a->kind == AX_TY_VIEW || a->kind == AX_TY_MUT_VIEW) {
@@ -153,9 +173,19 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
         }
         return true;
     } else if (a->kind == AX_TY_STRUCT) {
-        return a->strct.def == b->strct.def;
+        if (a->strct.def != b->strct.def) return false;
+        if (a->strct.arg_count != b->strct.arg_count) return false;
+        for (size_t i = 0; i < a->strct.arg_count; i++) {
+            if (a->strct.args[i].v != b->strct.args[i].v) return false;
+        }
+        return true;
     } else if (a->kind == AX_TY_ENUM) {
-        return a->enm.def == b->enm.def;
+        if (a->enm.def != b->enm.def) return false;
+        if (a->enm.arg_count != b->enm.arg_count) return false;
+        for (size_t i = 0; i < a->enm.arg_count; i++) {
+            if (a->enm.args[i].v != b->enm.args[i].v) return false;
+        }
+        return true;
     }
     return true;
 }
@@ -209,6 +239,14 @@ static inline uint64_t ax_key_hash_symbol(const AxSymbolId *k) { return ax_key_h
 static inline bool ax_key_eq_symbol(const AxSymbolId *a, const AxSymbolId *b) { return a->v == b->v; }
 AX_DEFINE_HASHMAP(AxSymbolTypeMap, AxSymbolId, TypeId, ax_key_hash_symbol, ax_key_eq_symbol);
 
+typedef struct AxGenericArgs {
+    TypeId *args;
+    size_t count;
+} AxGenericArgs;
+
+AX_DEFINE_HASHMAP(AxExprSubstMap, AxHirExprPtr, AxGenericArgs, ax_key_hash_ptr, ax_key_eq_ptr);
+AX_DEFINE_HASHMAP(AxPatSubstMap, AxHirPatPtr, AxGenericArgs, ax_key_hash_ptr, ax_key_eq_ptr);
+
 typedef struct AxThir {
     TypeInterner interner;
     AxExprTypeMap expr_types;
@@ -219,6 +257,8 @@ typedef struct AxThir {
     AxItemTypeMap item_types;
     AxParamTypeMap param_types;
     AxSymbolTypeMap symbol_types;
+    AxExprSubstMap expr_substs;
+    AxPatSubstMap pat_substs;
 } AxThir;
 
 void ax_thir_init(AxThir *thir);

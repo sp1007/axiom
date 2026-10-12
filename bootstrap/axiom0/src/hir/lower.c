@@ -77,6 +77,7 @@ static AxHirGenericParams *lower_generic_params(LowerCtx *ctx, const AxAstGeneri
         AxHirGenericParam *ha = ax_arena_alloc(ctx->arena, sizeof(AxHirGenericParam), 8);
         ha->span = a->span;
         ha->name = a->name;
+        ha->symbol = get_symbol(ctx, a);
         ha->bounds = lower_type(ctx, a->bounds);
         *tail = ha;
         tail = &ha->next;
@@ -679,6 +680,8 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
             case AX_ITEM_STRUCT:
                 hi->kind = AX_HIR_ITEM_STRUCT;
                 hi->struct_decl.name = n->struct_decl.name;
+                hi->struct_decl.symbol = get_symbol(ctx, n);
+                if (hi->struct_decl.symbol.v == 0) hi->struct_decl.symbol.v = ctx->fake_sym_counter++;
                 hi->struct_decl.generic_params = lower_generic_params(ctx, n->struct_decl.generic_params);
                 hi->struct_decl.where_clause = lower_where_clause(ctx, n->struct_decl.where_clause);
                 hi->struct_decl.is_tuple = n->struct_decl.is_tuple;
@@ -702,6 +705,8 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
             case AX_ITEM_ENUM:
                 hi->kind = AX_HIR_ITEM_ENUM;
                 hi->enum_decl.name = n->enum_decl.name;
+                hi->enum_decl.symbol = get_symbol(ctx, n);
+                if (hi->enum_decl.symbol.v == 0) hi->enum_decl.symbol.v = ctx->fake_sym_counter++;
                 hi->enum_decl.generic_params = lower_generic_params(ctx, n->enum_decl.generic_params);
                 hi->enum_decl.where_clause = lower_where_clause(ctx, n->enum_decl.where_clause);
                 AxHirVariantDecl **vtail = &hi->enum_decl.variants;

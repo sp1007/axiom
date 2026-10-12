@@ -114,11 +114,27 @@ static TypeId new_int_var(TypeckCtx *cx) {
     return ax_intern_type(&cx->thir->interner, &t);
 }
 
-static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path);
+
+static TypeId new_ty_var(TypeckCtx *cx) {
+    if (cx->int_vars_len == cx->int_vars_cap) {
+        cx->int_vars = ax_grow_array(cx->int_vars, &cx->int_vars_cap, sizeof(IntTypeVar), cx->int_vars_len + 1);
+    }
+    uint32_t var_id = (uint32_t)cx->int_vars_len;
+    cx->int_vars[cx->int_vars_len].resolved_to = TypeId_none();
+    cx->int_vars_len++;
+
+    AxType t;
+    memset(&t, 0, sizeof(t));
+    t.kind = AX_TY_VAR;
+    t.int_var.var_id = var_id;
+    return ax_intern_type(&cx->thir->interner, &t);
+}
+
+static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericArgs *out_args);
 static TypeId resolve_ty(TypeckCtx *cx, TypeId id) {
     if (TypeId_is_none(id)) return id;
     const AxType *t = ax_type_get(&cx->thir->interner, id);
-    if (t->kind == AX_TY_INT_VAR) {
+    if (t->kind == AX_TY_INT_VAR || t->kind == AX_TY_VAR) {
         TypeId resolved = cx->int_vars[t->int_var.var_id].resolved_to;
         if (TypeId_is_some(resolved)) {
             // Path compression
@@ -159,7 +175,18 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
     if (ta->kind == AX_TY_ERROR || tb->kind == AX_TY_ERROR) return true;
     if (ta->kind == AX_TY_NEVER || tb->kind == AX_TY_NEVER) return true; // never coerces
 
+
     // AXS-SEM-020: an integer type variable can only become an integer type.
+    if (ta->kind == AX_TY_VAR) {
+        if (tb->kind != AX_TY_VAR || ta->int_var.var_id != tb->int_var.var_id)
+            cx->int_vars[ta->int_var.var_id].resolved_to = b;
+        return true;
+    }
+    if (tb->kind == AX_TY_VAR) {
+        cx->int_vars[tb->int_var.var_id].resolved_to = a;
+        return true;
+    }
+
     if (ta->kind == AX_TY_INT_VAR) {
         if (tb->kind == AX_TY_INT_VAR || ax_type_is_int(b, &cx->thir->interner)) {
             cx->int_vars[ta->int_var.var_id].resolved_to = b;
@@ -260,7 +287,7 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
         if (ax_sv_eq_cstr(name, "never")) return cx->thir->interner.t_never;
         if (ax_sv_eq_cstr(name, "f32") || ax_sv_eq_cstr(name, "f64")) return type_error(cx, ht->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
 
-        TypeId t = lookup_path_type(cx, &ht->path.path);
+        TypeId t = lookup_path_type(cx, &ht->path.path, NULL);
         return t;
     }
     if (ht->kind == AX_HIR_TYPE_FN) {
@@ -493,6 +520,134 @@ static const AxHirItem *find_inherent_method(TypeckCtx *cx, TypeId base_ty, StrV
     return NULL;
 }
 
+
+static TypeId subst_ty(TypeckCtx *cx, TypeId ty, AxGenericArgs *args) {
+    if (TypeId_is_none(ty)) return ty;
+    if (args == NULL || args->count == 0) return ty;
+    ty = resolve_ty(cx, ty);
+    const AxType *t = ax_type_get(&cx->thir->interner, ty);
+    if (t->kind == AX_TY_PARAM) {
+        if (t->param.index < args->count) {
+            return args->args[t->param.index];
+        }
+        return ty;
+    }
+    if (t->kind == AX_TY_ARRAY) {
+        TypeId elem = subst_ty(cx, t->array.elem, args);
+        if (elem.v == t->array.elem.v) return ty;
+        AxType new_t = *t;
+        new_t.array.elem = elem;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_SLICE) {
+        TypeId elem = subst_ty(cx, t->slice.elem, args);
+        if (elem.v == t->slice.elem.v) return ty;
+        AxType new_t = *t;
+        new_t.slice.elem = elem;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) {
+        TypeId pointee = subst_ty(cx, t->view.pointee, args);
+        if (pointee.v == t->view.pointee.v) return ty;
+        AxType new_t = *t;
+        new_t.view.pointee = pointee;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_PTR) {
+        TypeId pointee = subst_ty(cx, t->ptr.pointee, args);
+        if (pointee.v == t->ptr.pointee.v) return ty;
+        AxType new_t = *t;
+        new_t.ptr.pointee = pointee;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_TUPLE) {
+        bool changed = false;
+        TypeId *fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->tuple.field_count, _Alignof(TypeId));
+        for (size_t i = 0; i < t->tuple.field_count; i++) {
+            fields[i] = subst_ty(cx, t->tuple.fields[i], args);
+            if (fields[i].v != t->tuple.fields[i].v) changed = true;
+        }
+        if (!changed) return ty;
+        AxType new_t = *t;
+        new_t.tuple.fields = fields;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_FN) {
+        bool changed = false;
+        TypeId ret = subst_ty(cx, t->fn.ret_type, args);
+        if (ret.v != t->fn.ret_type.v) changed = true;
+        TypeId *param_types = NULL;
+        if (t->fn.param_count > 0) {
+            param_types = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->fn.param_count, _Alignof(TypeId));
+            for (size_t i = 0; i < t->fn.param_count; i++) {
+                param_types[i] = subst_ty(cx, t->fn.param_types[i], args);
+                if (param_types[i].v != t->fn.param_types[i].v) changed = true;
+            }
+        }
+        if (!changed) return ty;
+        AxType new_t = *t;
+        new_t.fn.ret_type = ret;
+        new_t.fn.param_types = param_types;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_STRUCT) {
+        bool changed = false;
+        TypeId *sargs = NULL;
+        TypeId *fields = NULL;
+        if (t->strct.arg_count > 0) {
+            sargs = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->strct.arg_count, _Alignof(TypeId));
+            for (size_t i = 0; i < t->strct.arg_count; i++) {
+                sargs[i] = subst_ty(cx, t->strct.args[i], args);
+                if (sargs[i].v != t->strct.args[i].v) changed = true;
+            }
+        }
+        if (t->strct.field_count > 0) {
+            fields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->strct.field_count, _Alignof(TypeId));
+            for (size_t i = 0; i < t->strct.field_count; i++) {
+                fields[i] = subst_ty(cx, t->strct.fields[i], args);
+                if (fields[i].v != t->strct.fields[i].v) changed = true;
+            }
+        }
+        if (!changed) return ty;
+        AxType new_t = *t;
+        if (sargs) new_t.strct.args = sargs;
+        if (fields) new_t.strct.fields = fields;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    if (t->kind == AX_TY_ENUM) {
+        bool changed = false;
+        TypeId *eargs = NULL;
+        TypeId **vfields = NULL;
+        if (t->enm.arg_count > 0) {
+            eargs = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->enm.arg_count, _Alignof(TypeId));
+            for (size_t i = 0; i < t->enm.arg_count; i++) {
+                eargs[i] = subst_ty(cx, t->enm.args[i], args);
+                if (eargs[i].v != t->enm.args[i].v) changed = true;
+            }
+        }
+        if (t->enm.variant_count > 0) {
+            vfields = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId*) * t->enm.variant_count, _Alignof(TypeId*));
+            for (size_t v = 0; v < t->enm.variant_count; v++) {
+                if (t->enm.variant_field_counts[v] > 0) {
+                    vfields[v] = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * t->enm.variant_field_counts[v], _Alignof(TypeId));
+                    for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
+                        vfields[v][i] = subst_ty(cx, t->enm.variant_fields[v][i], args);
+                        if (vfields[v][i].v != t->enm.variant_fields[v][i].v) changed = true;
+                    }
+                } else {
+                    vfields[v] = NULL;
+                }
+            }
+        }
+        if (!changed) return ty;
+        AxType new_t = *t;
+        if (eargs) new_t.enm.args = eargs;
+        if (vfields) new_t.enm.variant_fields = vfields;
+        return ax_intern_type(&cx->thir->interner, &new_t);
+    }
+    return ty;
+}
+
 static TypeId check_expr(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
 
 static void desugar_let_else(TypeckCtx *cx, AxHirStmt *stmt) {
@@ -664,6 +819,32 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             st.kind = AX_TY_STRUCT;
             st.strct.def = it;
             
+
+            size_t param_count = 0;
+            AxHirGenericParam *gp = it->struct_decl.generic_params ? it->struct_decl.generic_params->params : NULL;
+            for (AxHirGenericParam *p = gp; p; p = p->next) param_count++;
+            
+            st.strct.arg_count = param_count;
+            if (param_count > 0) {
+                st.strct.args = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * param_count, _Alignof(TypeId));
+                size_t i = 0;
+                for (AxHirGenericParam *p = gp; p; p = p->next) {
+                    AxType pt;
+                    memset(&pt, 0, sizeof(pt));
+                    pt.kind = AX_TY_PARAM;
+                    pt.param.name = p->name;
+                    pt.param.index = i;
+                    TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                    st.strct.args[i] = pt_id;
+                    if (p->symbol.v != 0) {
+                        AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                    }
+                    i++;
+                }
+            } else {
+                st.strct.args = NULL;
+            }
+
             size_t count = 0;
             for (const AxHirFieldDecl *f = it->struct_decl.struct_fields; f; f = f->next) count++;
             st.strct.field_count = count;
@@ -710,6 +891,32 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             en.kind = AX_TY_ENUM;
             en.enm.def = it;
             
+
+            size_t param_count = 0;
+            AxHirGenericParam *gp = it->enum_decl.generic_params ? it->enum_decl.generic_params->params : NULL;
+            for (AxHirGenericParam *p = gp; p; p = p->next) param_count++;
+            
+            en.enm.arg_count = param_count;
+            if (param_count > 0) {
+                en.enm.args = ax_arena_alloc(&thir.interner.arena, sizeof(TypeId) * param_count, _Alignof(TypeId));
+                size_t i = 0;
+                for (AxHirGenericParam *p = gp; p; p = p->next) {
+                    AxType pt;
+                    memset(&pt, 0, sizeof(pt));
+                    pt.kind = AX_TY_PARAM;
+                    pt.param.name = p->name;
+                    pt.param.index = i;
+                    TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                    en.enm.args[i] = pt_id;
+                    if (p->symbol.v != 0) {
+                        AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                    }
+                    i++;
+                }
+            } else {
+                en.enm.args = NULL;
+            }
+
             size_t vcount = 0;
             for (const AxHirVariantDecl *v = it->enum_decl.variants; v; v = v->next) vcount++;
             en.enm.variant_count = vcount;
@@ -761,9 +968,25 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
         for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
             const AxHirItem *it = (impl_pass == 0) ? top_it : (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : NULL);
             for (; it; it = (impl_pass == 0) ? NULL : it->next) {
-                if (it->kind == AX_HIR_ITEM_FN) {
-                    TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
-            if (type_contains_view(&cx, ret_ty, (TypeId){0})) {
+            if (it->kind == AX_HIR_ITEM_FN) {
+                AxHirGenericParam *gp = it->fn.generic_params ? it->fn.generic_params->params : NULL;
+                size_t i = 0;
+                for (AxHirGenericParam *p = gp; p; p = p->next) {
+                    AxType pt;
+                    memset(&pt, 0, sizeof(pt));
+                    pt.kind = AX_TY_PARAM;
+                    pt.param.name = p->name;
+                    pt.param.index = i;
+                    TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                    if (p->symbol.v != 0) {
+                        AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                    }
+                    i++;
+                }
+                
+                TypeId ret_ty = hir_type_to_typeid(&cx, it->fn.ret_type);
+                if (type_contains_view(&cx, ret_ty, (TypeId){0})) {
+
                 AxDiagnostic d2 = {0}; d2.code = AX_TYPE_STORED_VIEW_ESCAPE; d2.severity = AX_DIAG_ERROR; d2.message = "stored view might outlive the owner of the referenced data"; d2.primary = it->fn.ret_type ? it->fn.ret_type->span : it->span; ax_diag_sink_report(sink, &d2);
             }
             if (TypeId_is_none(ret_ty)) {
@@ -879,7 +1102,11 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             break;
 
         case AX_HIR_PAT_STRUCT: {
-            TypeId path_ty = lookup_path_type(cx, &pat->struct_pat.path);
+            AxGenericArgs gargs = {0};
+            TypeId path_ty = lookup_path_type(cx, &pat->struct_pat.path, &gargs);
+            if (gargs.count > 0) {
+                AxPatSubstMap_insert(&cx->thir->pat_substs, pat, gargs);
+            }
             if (!unify_ty(cx, ty, path_ty)) {
                 return type_error(cx, pat->span, AX_TYPE_MISMATCH);
             }
@@ -974,7 +1201,11 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             }
         }
         case AX_HIR_PAT_PATH: {
-            TypeId path_ty = lookup_path_type(cx, &pat->path.path);
+            AxGenericArgs gargs = {0};
+            TypeId path_ty = lookup_path_type(cx, &pat->path.path, &gargs);
+            if (gargs.count > 0) {
+                AxPatSubstMap_insert(&cx->thir->pat_substs, pat, gargs);
+            }
             if (is_error(cx, path_ty)) return cx->thir->interner.t_error;
             if (!unify_ty(cx, ty, path_ty)) {
                 return type_error(cx, pat->span, AX_TYPE_MISMATCH);
@@ -1069,15 +1300,62 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
     return ty;
 }
 
-static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
+
+
+static TypeId instantiate_path(TypeckCtx *cx, TypeId ty, const AxHirItem *it, const AxHirPath *path, AxGenericArgs *out_args) {
+    if (TypeId_is_none(ty)) return ty;
+    
+    AxHirGenericParams *gps = NULL;
+    if (it->kind == AX_HIR_ITEM_FN) gps = it->fn.generic_params;
+    else if (it->kind == AX_HIR_ITEM_STRUCT) gps = it->struct_decl.generic_params;
+    else if (it->kind == AX_HIR_ITEM_ENUM) gps = it->enum_decl.generic_params;
+    
+    size_t param_count = 0;
+    if (gps) {
+        for (AxHirGenericParam *p = gps->params; p; p = p->next) param_count++;
+    }
+    
+    if (param_count == 0) return ty;
+    
+    AxGenericArgs gargs;
+    gargs.count = param_count;
+    gargs.args = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * param_count, _Alignof(TypeId));
+    
+    if (path->generic_args) {
+        size_t arg_count = 0;
+        for (AxHirGenericArg *a = path->generic_args->args; a; a = a->next) arg_count++;
+        if (arg_count != param_count) {
+            type_error(cx, path->span, AX_TYPE_MISMATCH);
+            return cx->thir->interner.t_error;
+        }
+        size_t i = 0;
+        for (AxHirGenericArg *a = path->generic_args->args; a; a = a->next) {
+            gargs.args[i++] = hir_type_to_typeid(cx, a->type);
+        }
+    } else {
+        for (size_t i = 0; i < param_count; i++) {
+            gargs.args[i] = new_ty_var(cx);
+        }
+    }
+    
+    if (out_args) *out_args = gargs;
+    return subst_ty(cx, ty, &gargs);
+}
+
+static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericArgs *out_args) {
     if (path->symbol.v != 0) {
         TypeId *t = AxSymbolTypeMap_get(&cx->thir->symbol_types, path->symbol);
         if (t) return *t;
 
         for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
-            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == path->symbol.v) {
+            bool match = false;
+            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == path->symbol.v) match = true;
+            else if (it->kind == AX_HIR_ITEM_STRUCT && it->struct_decl.symbol.v == path->symbol.v) match = true;
+            else if (it->kind == AX_HIR_ITEM_ENUM && it->enum_decl.symbol.v == path->symbol.v) match = true;
+
+            if (match) {
                 TypeId *it_t = AxItemTypeMap_get(&cx->thir->item_types, it);
-                if (it_t) return *it_t;
+                if (it_t) return instantiate_path(cx, *it_t, it, path, out_args);
             }
         }
         
@@ -1130,13 +1408,13 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             StrView it_name = ax_interner_get(cx->str_in, it->fn.name);
             if (ax_sv_eq(it_name, name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
-                if (t) return *t;
+                if (t) return instantiate_path(cx, *t, it, path, out_args);
             }
         } else if (it->kind == AX_HIR_ITEM_STRUCT) {
             StrView it_name = ax_interner_get(cx->str_in, it->struct_decl.name);
             if (ax_sv_eq(it_name, name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
-                if (t) return *t;
+                if (t) return instantiate_path(cx, *t, it, path, out_args);
                 return cx->thir->interner.t_error; // Being computed
             }
         } else if (it->kind == AX_HIR_ITEM_ENUM) {
@@ -1148,7 +1426,7 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path) {
             StrView it_name = ax_interner_get(cx->str_in, it->enum_decl.name);
             if (ax_sv_eq(it_name, enum_name)) {
                 TypeId *t = AxItemTypeMap_get(&cx->thir->item_types, it);
-                if (t) return *t;
+                if (t) return instantiate_path(cx, *t, it, path, out_args);
             }
         }
     }
@@ -1294,8 +1572,12 @@ static TypeId check_unary(TypeckCtx *cx, const AxHirExpr *expr) {
 static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
     TypeId callee_ty;
     if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
-        callee_ty = resolve_ty(cx, lookup_path_type(cx, &expr->call.callee->path.path));
+        AxGenericArgs gargs = {0};
+        callee_ty = resolve_ty(cx, lookup_path_type(cx, &expr->call.callee->path.path, &gargs));
         AxExprTypeMap_insert(&cx->thir->expr_types, expr->call.callee, callee_ty);
+        if (gargs.count > 0) {
+            AxExprSubstMap_insert(&cx->thir->expr_substs, expr->call.callee, gargs);
+        }
         if (expr->call.callee->path.path.symbol.v != 0) {
             for (size_t i = 0; i < cx->vars_len; i++) {
                 if (cx->vars[i].sym.v == expr->call.callee->path.path.symbol.v) {
@@ -1538,7 +1820,11 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         }
 
         case AX_HIR_EXPR_STRUCT: {
-            TypeId path_ty = lookup_path_type(cx, &expr->struct_lit.path);
+            AxGenericArgs gargs = {0};
+            TypeId path_ty = lookup_path_type(cx, &expr->struct_lit.path, &gargs);
+            if (gargs.count > 0) {
+                AxExprSubstMap_insert(&cx->thir->expr_substs, expr, gargs);
+            }
             if (!is_error(cx, path_ty)) {
                 const AxType *t = ax_type_get(&cx->thir->interner, path_ty);
                 if (t->kind == AX_TY_ENUM) {
@@ -1763,7 +2049,13 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
         }
 
         case AX_HIR_EXPR_PATH: {
-            TypeId t = lookup_path_type(cx, &expr->path.path);
+            
+            AxGenericArgs gargs = {0};
+            TypeId t = lookup_path_type(cx, &expr->path.path, &gargs);
+            if (gargs.count > 0) {
+                AxExprSubstMap_insert(&cx->thir->expr_substs, expr, gargs);
+            }
+
             if (expr->path.path.symbol.v != 0) {
                 for (size_t i = 0; i < cx->vars_len; i++) {
                     if (cx->vars[i].sym.v == expr->path.path.symbol.v) {
@@ -2304,7 +2596,7 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
             // unless we handle `AX_HIR_EXPR_PATH` specially here.
             TypeId left = TypeId_none();
             if (s->assign.left->kind == AX_HIR_EXPR_PATH) {
-                left = lookup_path_type(cx, &s->assign.left->path.path);
+                left = lookup_path_type(cx, &s->assign.left->path.path, NULL);
                 AxExprTypeMap_insert(&cx->thir->expr_types, s->assign.left, left);
                 if (s->assign.left->path.path.symbol.v != 0) {
                     AxSymbolId sym = s->assign.left->path.path.symbol;

@@ -55,9 +55,21 @@ TypeId ax_intern_type(TypeInterner *in, const AxType *type) {
         new_type->tuple.fields = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->tuple.field_count, _Alignof(TypeId));
         for (size_t i = 0; i < type->tuple.field_count; i++) new_type->tuple.fields[i] = type->tuple.fields[i];
     }
-    if (type->kind == AX_TY_STRUCT && type->strct.field_count > 0) {
-        new_type->strct.fields = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->strct.field_count, _Alignof(TypeId));
-        for (size_t i = 0; i < type->strct.field_count; i++) new_type->strct.fields[i] = type->strct.fields[i];
+    if (type->kind == AX_TY_STRUCT) {
+        if (type->strct.field_count > 0) {
+            new_type->strct.fields = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->strct.field_count, _Alignof(TypeId));
+            for (size_t i = 0; i < type->strct.field_count; i++) new_type->strct.fields[i] = type->strct.fields[i];
+        }
+        if (type->strct.arg_count > 0) {
+            new_type->strct.args = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->strct.arg_count, _Alignof(TypeId));
+            for (size_t i = 0; i < type->strct.arg_count; i++) new_type->strct.args[i] = type->strct.args[i];
+        }
+    }
+    if (type->kind == AX_TY_ENUM) {
+        if (type->enm.arg_count > 0) {
+            new_type->enm.args = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->enm.arg_count, _Alignof(TypeId));
+            for (size_t i = 0; i < type->enm.arg_count; i++) new_type->enm.args[i] = type->enm.args[i];
+        }
     }
     
     if (in->len == in->cap) {
@@ -104,9 +116,13 @@ void ax_thir_init(AxThir *thir) {
     AxItemTypeMap_init(&thir->item_types);
     AxParamTypeMap_init(&thir->param_types);
     AxSymbolTypeMap_init(&thir->symbol_types);
+    AxExprSubstMap_init(&thir->expr_substs);
+    AxPatSubstMap_init(&thir->pat_substs);
 }
 
 void ax_thir_free(AxThir *thir) {
+    AxPatSubstMap_free(&thir->pat_substs);
+    AxExprSubstMap_free(&thir->expr_substs);
     AxSymbolTypeMap_free(&thir->symbol_types);
     AxParamTypeMap_free(&thir->param_types);
     AxItemTypeMap_free(&thir->item_types);
