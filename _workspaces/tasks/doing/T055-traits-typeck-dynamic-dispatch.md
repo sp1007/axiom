@@ -8,9 +8,9 @@ model: opus
 gate_model: sonnet
 depends: [T054b]
 priority: 75
-status: todo
+status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src/traits, bootstrap/axiom0/src/types, tests/run/trait, tests/ui/trait]
+paths: [bootstrap/axiom0/src, tests/run/trait, tests/ui/trait]
 locks: [bootstrap/axiom0/src/diag/codes/TRAIT.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 timeout_min: 300
 spec: [0158, 0212, 0046, tasks/0272, tasks/0389, tasks/0611]
