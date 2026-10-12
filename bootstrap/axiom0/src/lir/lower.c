@@ -421,7 +421,39 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                             
                             AxLirVRegId len_reg = {0};
                             const AxType *src_t = ax_type_get(b.interner, src_ty);
-                            if (src_t && src_t->kind == AX_TY_ARRAY) {
+                            if (stmt->assign.rvalue.ref.place.proj_count > 0 && stmt->assign.rvalue.ref.place.projs[stmt->assign.rvalue.ref.place.proj_count - 1].kind == AX_MIR_PROJ_SUB_SLICE) {
+                                AxMirProjection *sub_slice = &stmt->assign.rvalue.ref.place.projs[stmt->assign.rvalue.ref.place.proj_count - 1];
+                                AxLirVRegId from_val = emit_const(&b, 0, b.interner->t_usize);
+                                if (sub_slice->sub_slice.has_from) {
+                                    AxLirStackSlotId idx_slot = { sub_slice->sub_slice.from_local.v };
+                                    AxLirVRegId idx_addr = emit_stack_addr(&b, idx_slot);
+                                    from_val = emit_load(&b, idx_addr, b.interner->t_usize);
+                                }
+                                AxLirVRegId to_val = emit_const(&b, 0, b.interner->t_usize);
+                                if (sub_slice->sub_slice.has_to) {
+                                    AxLirStackSlotId idx_slot = { sub_slice->sub_slice.to_local.v };
+                                    AxLirVRegId idx_addr = emit_stack_addr(&b, idx_slot);
+                                    to_val = emit_load(&b, idx_addr, b.interner->t_usize);
+                                } else {
+                                    AxMirPlace base_place = stmt->assign.rvalue.ref.place;
+                                    base_place.proj_count--;
+                                    if (base_place.proj_count > 0 && base_place.projs[base_place.proj_count - 1].kind == AX_MIR_PROJ_DEREF) {
+                                        base_place.proj_count--;
+                                    }
+                                    TypeId base_ty = {0};
+                                    AxLirVRegId base_addr = lower_place_addr(&b, &base_place, &base_ty);
+                                    const AxType *base_t = ax_type_get(b.interner, base_ty);
+                                    if (base_t && base_t->kind == AX_TY_ARRAY) {
+                                        to_val = emit_const(&b, (uint64_t)base_t->array.len, b.interner->t_usize);
+                                    } else {
+                                        AxLirVRegId off8 = emit_const(&b, 8, b.interner->t_usize);
+                                        AxLirVRegId len_addr = emit_offset(&b, base_addr, off8);
+                                        to_val = emit_load(&b, len_addr, b.interner->t_usize);
+                                    }
+                                }
+                                len_reg = make_vreg(&b, b.interner->t_usize);
+                                emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_SUB, .dest = len_reg, .binary = { .lhs = to_val, .rhs = from_val } });
+                            } else if (src_t && src_t->kind == AX_TY_ARRAY) {
                                 len_reg = emit_const(&b, src_t->array.len, b.interner->t_usize);
                             } else if (src_t && (src_t->kind == AX_TY_VIEW || src_t->kind == AX_TY_MUT_VIEW || src_t->kind == AX_TY_STR || src_t->kind == AX_TY_SLICE)) {
                                 AxLirVRegId src_addr = lower_place_addr(&b, &stmt->assign.rvalue.ref.place, NULL);

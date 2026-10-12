@@ -707,6 +707,139 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
             const AxType *t = ax_type_get(&b->thir->interner, base_ty);
             bool is_slice_view = (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&b->thir->interner, t->view.pointee)->kind == AX_TY_SLICE);
             
+            if (t && (t->kind == AX_TY_ARRAY || t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_SLICE || t->kind == AX_TY_STR)) {
+                AxMirLocalId len_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+                AxMirPlace len_place = { len_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                
+                if (t->kind == AX_TY_ARRAY) {
+                    AxMirStmt len_stmt = {0};
+                    len_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    len_stmt.assign.place = len_place;
+                    len_stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    len_stmt.assign.rvalue.use = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .ty = b->thir->interner.t_usize, .kind = AX_MIR_CONST_INT, .val = t->array.len } };
+                    push_stmt(b, b->current_bb, len_stmt);
+                } else {
+                    AxMirStmt len_stmt = {0};
+                    len_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    len_stmt.assign.place = len_place;
+                    len_stmt.assign.rvalue.kind = AX_MIR_RVALUE_LEN;
+                    len_stmt.assign.rvalue.len = base;
+                    push_stmt(b, b->current_bb, len_stmt);
+                }
+                
+                if (has_start) {
+                    AxMirLocalId cond_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+                    AxMirPlace cond_place = { cond_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cmp_stmt = {0};
+                    cmp_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    cmp_stmt.assign.place = cond_place;
+                    cmp_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+                    cmp_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LE;
+                    
+                    AxMirLocalId u_start = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+                    AxMirPlace u_start_place = { u_start, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cast_stmt = {0};
+                    cast_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    cast_stmt.assign.place = u_start_place;
+                    cast_stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+                    cast_stmt.assign.rvalue.cast.op = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = { start_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 } };
+                    cast_stmt.assign.rvalue.cast.ty = b->thir->interner.t_usize;
+                    push_stmt(b, b->current_bb, cast_stmt);
+                    
+                    cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_start_place };
+                    cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = len_place };
+                    push_stmt(b, b->current_bb, cmp_stmt);
+                    
+                    AxMirTerminator assert_term = {0};
+                    assert_term.kind = AX_MIR_TERM_ASSERT;
+                    assert_term.assert.cond = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = cond_place };
+                    assert_term.assert.expected = true;
+                    assert_term.assert.msg = "index out of bounds";
+                    assert_term.assert.target = add_bb(b);
+                    assert_term.assert.unwind = add_bb(b);
+                    set_terminator(b, b->current_bb, assert_term);
+                    b->current_bb = assert_term.assert.target;
+                }
+                
+                if (has_end) {
+                    AxMirLocalId cond_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+                    AxMirPlace cond_place = { cond_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cmp_stmt = {0};
+                    cmp_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    cmp_stmt.assign.place = cond_place;
+                    cmp_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+                    cmp_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LE;
+                    
+                    AxMirLocalId u_end = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+                    AxMirPlace u_end_place = { u_end, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cast_stmt = {0};
+                    cast_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    cast_stmt.assign.place = u_end_place;
+                    cast_stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+                    cast_stmt.assign.rvalue.cast.op = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = { end_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 } };
+                    cast_stmt.assign.rvalue.cast.ty = b->thir->interner.t_usize;
+                    push_stmt(b, b->current_bb, cast_stmt);
+                    
+                    cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_end_place };
+                    cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = len_place };
+                    push_stmt(b, b->current_bb, cmp_stmt);
+                    
+                    AxMirTerminator assert_term = {0};
+                    assert_term.kind = AX_MIR_TERM_ASSERT;
+                    assert_term.assert.cond = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = cond_place };
+                    assert_term.assert.expected = true;
+                    assert_term.assert.msg = "index out of bounds";
+                    assert_term.assert.target = add_bb(b);
+                    assert_term.assert.unwind = add_bb(b);
+                    set_terminator(b, b->current_bb, assert_term);
+                    b->current_bb = assert_term.assert.target;
+                }
+                
+                if (has_start && has_end) {
+                    AxMirLocalId cond_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
+                    AxMirPlace cond_place = { cond_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cmp_stmt = {0};
+                    cmp_stmt.kind = AX_MIR_STMT_ASSIGN;
+                    cmp_stmt.assign.place = cond_place;
+                    cmp_stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+                    cmp_stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_LE;
+                    
+                    AxMirLocalId u_start = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+                    AxMirPlace u_start_place = { u_start, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cast_start = {0};
+                    cast_start.kind = AX_MIR_STMT_ASSIGN;
+                    cast_start.assign.place = u_start_place;
+                    cast_start.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+                    cast_start.assign.rvalue.cast.op = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = { start_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 } };
+                    cast_start.assign.rvalue.cast.ty = b->thir->interner.t_usize;
+                    push_stmt(b, b->current_bb, cast_start);
+                    
+                    AxMirLocalId u_end = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+                    AxMirPlace u_end_place = { u_end, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                    AxMirStmt cast_end = {0};
+                    cast_end.kind = AX_MIR_STMT_ASSIGN;
+                    cast_end.assign.place = u_end_place;
+                    cast_end.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+                    cast_end.assign.rvalue.cast.op = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = { end_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 } };
+                    cast_end.assign.rvalue.cast.ty = b->thir->interner.t_usize;
+                    push_stmt(b, b->current_bb, cast_end);
+                    
+                    cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_start_place };
+                    cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_end_place };
+                    push_stmt(b, b->current_bb, cmp_stmt);
+                    
+                    AxMirTerminator assert_term = {0};
+                    assert_term.kind = AX_MIR_TERM_ASSERT;
+                    assert_term.assert.cond = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = cond_place };
+                    assert_term.assert.expected = true;
+                    assert_term.assert.msg = "index out of bounds";
+                    assert_term.assert.target = add_bb(b);
+                    assert_term.assert.unwind = add_bb(b);
+                    set_terminator(b, b->current_bb, assert_term);
+                    b->current_bb = assert_term.assert.target;
+                }
+            }
+            
             size_t new_proj_count = base.proj_count + 1;
             if (is_slice_view) new_proj_count++;
             AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection) * new_proj_count, _Alignof(AxMirProjection));
@@ -747,8 +880,25 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         
         TypeId base_ty = get_expr_type(b, expr->index.base);
         const AxType *t = ax_type_get(&b->thir->interner, base_ty);
-        if (t && t->kind == AX_TY_ARRAY) {
-            uint64_t len = t->array.len;
+        if (t && (t->kind == AX_TY_ARRAY || t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_SLICE || t->kind == AX_TY_STR)) {
+            AxMirLocalId len_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_usize, false);
+            AxMirPlace len_place = { len_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            
+            if (t->kind == AX_TY_ARRAY) {
+                AxMirStmt len_stmt = {0};
+                len_stmt.kind = AX_MIR_STMT_ASSIGN;
+                len_stmt.assign.place = len_place;
+                len_stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                len_stmt.assign.rvalue.use = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .ty = b->thir->interner.t_usize, .kind = AX_MIR_CONST_INT, .val = t->array.len } };
+                push_stmt(b, b->current_bb, len_stmt);
+            } else {
+                AxMirStmt len_stmt = {0};
+                len_stmt.kind = AX_MIR_STMT_ASSIGN;
+                len_stmt.assign.place = len_place;
+                len_stmt.assign.rvalue.kind = AX_MIR_RVALUE_LEN;
+                len_stmt.assign.rvalue.len = base;
+                push_stmt(b, b->current_bb, len_stmt);
+            }
             
             AxMirLocalId cond_local = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
             AxMirPlace cond_place = { cond_local, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
@@ -769,7 +919,7 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
             push_stmt(b, b->current_bb, cast_stmt);
             
             cmp_stmt.assign.rvalue.binary_op.lhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = u_idx_place };
-            cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_CONST, .constant = { .ty = b->thir->interner.t_usize, .kind = AX_MIR_CONST_INT, .val = len } };
+            cmp_stmt.assign.rvalue.binary_op.rhs = (AxMirOperand){ .kind = AX_MIR_OP_COPY, .place = len_place };
             push_stmt(b, b->current_bb, cmp_stmt);
             
             AxMirTerminator assert_term = {0};

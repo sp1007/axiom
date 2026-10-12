@@ -319,6 +319,9 @@ static void count_place_uses(AxMirPlace *p, size_t *use_counts) {
     for (size_t i = 0; i < p->proj_count; i++) {
         if (p->projs[i].kind == AX_MIR_PROJ_INDEX) {
             use_counts[p->projs[i].index_local.v]++;
+        } else if (p->projs[i].kind == AX_MIR_PROJ_SUB_SLICE) {
+            if (p->projs[i].sub_slice.has_from) use_counts[p->projs[i].sub_slice.from_local.v]++;
+            if (p->projs[i].sub_slice.has_to) use_counts[p->projs[i].sub_slice.to_local.v]++;
         }
     }
 }
@@ -460,3 +463,4 @@ void ax_opt_run(AxMirBody *body, AxThir *thir, AxDiagSink *sink, const AxHirItem
     ax_opt_cfg_simplify(body);
     if (verify_each) ax_verify_mir(body, thir, sink, item);
 }
+
