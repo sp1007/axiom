@@ -8,9 +8,9 @@ model: opus
 gate_model: sonnet
 depends: [T055]
 priority: 76
-status: todo
+status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src/traits, bootstrap/axiom0/src/types, tests/run/trait2, tests/ui/trait2]
+paths: [bootstrap/axiom0/src, tests/run/trait2, tests/ui/trait2]
 locks: [bootstrap/axiom0/src/diag/codes/TRAIT.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0066, tasks/0305, tasks/0476]
 ---
@@ -29,6 +29,7 @@ Complete the trait feature set used by the standard library.
 - [ ] Report `_workspaces/reports/T056-report.md` with exact `## Files changed`.
 
 ## Out of scope
+- Dynamic dispatch (trait objects, vtables, `dyn Trait`) are explicitly OUT OF SCOPE for this task. The filename `T056-traits-dynamic-dispatch-vtables.md` is a legacy name and does not reflect the current scope.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
