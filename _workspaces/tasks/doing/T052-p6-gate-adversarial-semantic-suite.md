@@ -6,12 +6,13 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T051]
+depends: [T051, T052a]
 priority: 72
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/adversarial, tests/conformance/stress]
 spec: [0026, 0022, 0019, 0020, 0028, 0017]
+started: 2026-10-12 08:49:03
 ---
 # T052 — P6 gate: adversarial semantic suite
 
@@ -20,6 +21,11 @@ Attack the ownership/capability implementation with the adversarial cases from t
 
 ## Scope
 - Port 0026 adversarial tests + relevant 0022 stress tests into canonical syntax; report every divergence as finding or spec gap.
+
+## Implementation Plan
+1. Update `tests/conformance/stress/e003.ax` to either expect `AX_CAP_CONFLICT_MUT` or use explicit block scoping for the view, as per ADR-0006 (no last-use analysis in Axiom).
+2. Wait for `T052a` to be completed to fix the compiler for `partial_002.ax` (partial moves invalidate the whole struct).
+3. Re-run the test suite to verify everything passes.
 
 ## Acceptance
 - [ ] The whole suite passes. A divergence that is a spec gap gets an architect ADR and an `xfail: <task-id>` entry; an implementation bug blocks the gate until its fix task is done (0264 §20: PASS or BLOCKED, never "almost done").
@@ -34,3 +40,6 @@ Attack the ownership/capability implementation with the adversarial cases from t
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-12 08:49:03 started (attempt 1) 
