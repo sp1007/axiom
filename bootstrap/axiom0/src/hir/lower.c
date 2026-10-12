@@ -24,6 +24,8 @@ static AxSymbolId get_symbol(LowerCtx *ctx, const void *node) {
     return zero;
 }
 
+static AxHirGenericArgs *lower_generic_args(LowerCtx *ctx, const AxAstGenericArgs *g);
+
 static AxHirPath lower_path(LowerCtx *ctx, const AxAstTypePathSegment *seg) {
     AxHirPath p = {0};
     if (!seg) return p;
@@ -35,8 +37,7 @@ static AxHirPath lower_path(LowerCtx *ctx, const AxAstTypePathSegment *seg) {
         p.span.end = last->span.end;
     }
     p.symbol = get_symbol(ctx, last);
-    // TODO: generic args on path. We just take them from the last segment for now.
-    // p.generic_args = lower_generic_args(ctx, last->generic_args);
+    p.generic_args = lower_generic_args(ctx, last->generic_args);
     return p;
 }
 

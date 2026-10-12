@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T053]
 priority: 74
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src, tests/typeck/generic, tests/ui/generic]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [0083, tasks/0271, tasks/0506, tasks/0354, 0042]
+finished: 2026-10-12 17:41:37
 ---
 # T054 — Generics: type checking and inference
 
@@ -34,3 +35,6 @@ Generic functions and types in the type checker. Monomorphization, mangling and 
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-12 17:41:37 accepted by QA -> done

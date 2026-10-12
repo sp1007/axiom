@@ -13,6 +13,8 @@
 
 typedef struct IntTypeVar {
     TypeId resolved_to; // none if unresolved
+    bool is_generic;
+    Span span;
 } IntTypeVar;
 
 /* AXS-SEM-021: integer literals are range-checked after typing (the final type is known only
@@ -105,6 +107,8 @@ static TypeId new_int_var(TypeckCtx *cx) {
     }
     uint32_t var_id = (uint32_t)cx->int_vars_len;
     cx->int_vars[cx->int_vars_len].resolved_to = TypeId_none();
+    cx->int_vars[cx->int_vars_len].is_generic = false;
+    cx->int_vars[cx->int_vars_len].span = (Span){0};
     cx->int_vars_len++;
 
     AxType t;
@@ -115,12 +119,14 @@ static TypeId new_int_var(TypeckCtx *cx) {
 }
 
 
-static TypeId new_ty_var(TypeckCtx *cx) {
+static TypeId new_ty_var(TypeckCtx *cx, Span span) {
     if (cx->int_vars_len == cx->int_vars_cap) {
         cx->int_vars = ax_grow_array(cx->int_vars, &cx->int_vars_cap, sizeof(IntTypeVar), cx->int_vars_len + 1);
     }
     uint32_t var_id = (uint32_t)cx->int_vars_len;
     cx->int_vars[cx->int_vars_len].resolved_to = TypeId_none();
+    cx->int_vars[cx->int_vars_len].is_generic = true;
+    cx->int_vars[cx->int_vars_len].span = span;
     cx->int_vars_len++;
 
     AxType t;
@@ -261,7 +267,12 @@ static void default_int_vars(TypeckCtx *cx) {
     // AXS-SEM-020: still unconstrained at the end of the function body -> i32.
     for (size_t i = cx->fn_var_start; i < cx->int_vars_len; i++) {
         if (TypeId_is_none(cx->int_vars[i].resolved_to)) {
-            cx->int_vars[i].resolved_to = cx->thir->interner.t_i32;
+            if (cx->int_vars[i].is_generic) {
+                type_error(cx, cx->int_vars[i].span, AX_TYPE_UNKNOWN);
+                cx->int_vars[i].resolved_to = cx->thir->interner.t_error;
+            } else {
+                cx->int_vars[i].resolved_to = cx->thir->interner.t_i32;
+            }
         }
     }
 }
@@ -1325,7 +1336,7 @@ static TypeId instantiate_path(TypeckCtx *cx, TypeId ty, const AxHirItem *it, co
         size_t arg_count = 0;
         for (AxHirGenericArg *a = path->generic_args->args; a; a = a->next) arg_count++;
         if (arg_count != param_count) {
-            type_error(cx, path->span, AX_TYPE_MISMATCH);
+            type_error(cx, path->span, AX_TYPE_ARG_COUNT);
             return cx->thir->interner.t_error;
         }
         size_t i = 0;
@@ -1334,7 +1345,7 @@ static TypeId instantiate_path(TypeckCtx *cx, TypeId ty, const AxHirItem *it, co
         }
     } else {
         for (size_t i = 0; i < param_count; i++) {
-            gargs.args[i] = new_ty_var(cx);
+            gargs.args[i] = new_ty_var(cx, path->span);
         }
     }
     
