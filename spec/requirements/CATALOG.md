@@ -27,12 +27,12 @@
 | REQ-FFI-001 | ffi | v1-core | External storage used via FFI requires explicit provenance contracts. | 0036 §ASM-10 — External Memory | - | T094 |
 | REQ-FFI-002 | ffi | v1-core | Pointers must carry internal provenance and address-space metadata. | 0096 §32. Pointer trong GPU | - | T094 |
 | REQ-FFI-003 | ffi | v1-core | Raw pointers are restricted to unsafe and system-level contexts. | 0012 §31. `volatile` | - | T094 |
-| REQ-MIR-001 | mir | v1-core | The compiler tracks capability dependencies rather than literal pointer arithmetic. | 0011 §2 | - | T024, T049 |
-| REQ-MIR-002 | mir | v1-core | Semantic mechanisms without observable runtime effects must be erased before machine code generation. | 0083 §AGEN-01 — Generic Erasure | - | T024, T049 |
-| REQ-MIR-003 | mir | v1-core | LIR is a target-neutral representation produced after semantic verification. | 0030 §38. Caller-allocated return | - | T024, T049 |
-| REQ-MIR-004 | mir | v1-core | Verified MIR must not contain error nodes. | 0015 §9. Sau Formal Test Suite, tôi | - | T024, T049 |
-| REQ-MIR-005 | mir | v1-core | Safe MIR LOAD operations must have valid initialization and READ proofs. | 0029 §AOV-19 | - | T024, T049 |
-| REQ-MIR-006 | mir | v1-core | Expression operands are evaluated in strict left-to-right order. | 0002 §33. Evaluation Order | - | T024, T049 |
+| REQ-MIR-001 | mir | v1-core | The compiler tracks capability dependencies rather than literal pointer arithmetic. | 0011 §2 | - | T024, T127 |
+| REQ-MIR-002 | mir | v1-core | Semantic mechanisms without observable runtime effects must be erased before machine code generation. | 0083 §AGEN-01 — Generic Erasure | - | T024, T127 |
+| REQ-MIR-003 | mir | v1-core | LIR is a target-neutral representation produced after semantic verification. | 0030 §38. Caller-allocated return | - | T024, T127 |
+| REQ-MIR-004 | mir | v1-core | Verified MIR must not contain error nodes. | 0015 §9. Sau Formal Test Suite, tôi | - | T024, T127 |
+| REQ-MIR-005 | mir | v1-core | Safe MIR LOAD operations must have valid initialization and READ proofs. | 0029 §AOV-19 | - | T024, T127 |
+| REQ-MIR-006 | mir | v1-core | Expression operands are evaluated in strict left-to-right order. | 0002 §33. Evaluation Order | - | T024, T127 |
 | REQ-MOD-001 | module | v1-core | Importing a module does not implicitly execute its code. | 0011 §2 | - | T047, T103 |
 | REQ-MOD-002 | module | v1-core | Modules define semantic boundaries, while packages define distribution boundaries. | 0046 §Bước tiếp theo | - | T047, T103 |
 | REQ-OWN-001 | ownership | v1-core | Moving a value transfers ownership semantics but may not require physical memory copying. | 0004 §21. Tôi nghĩ đây mới là "linh | - | T013, T020, T086 |

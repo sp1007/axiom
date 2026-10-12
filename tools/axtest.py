@@ -684,11 +684,14 @@ class Runner:
         return flags
 
     def program_env(self, test):
-        if not test.env:
-            return None
         env = dict(os.environ)
+        if 'AXIOM_STD' not in env and os.path.isdir('std'):
+            env['AXIOM_STD'] = 'std'
+        if not test.env:
+            return env
         env.update(test.env)
         return env
+
 
     # -- skip logic common to all kinds -----------------------------------------------------
 

@@ -312,21 +312,21 @@ added by editing this list.
 - statement: Values are moved or copied by their type's Copy classification. A use after move is a compile error. Surface code has no lifetimes and no references (`&`): access to a value without owning it goes through the `view` / `mut_view` capabilities.
 - source: 0151 §1-3, §57; 0160; tasks/0360 §13; SPEC-02 AXS-GRM-053
 - verify: tests/ui/own
-- since: T046
+- since: T121
 - check: ui tests for use after move, partial move and Copy types
 
 ### INV-SEM-002 — Capability conflicts are compile errors
 - statement: A `mut_view` that overlaps any other live view of the same region is rejected, and so is an overlap the compiler cannot prove absent. Validity of capabilities does not depend on the optimization level.
 - source: 0151 §5-6 (ACAP-31); tasks/0360 §14-15; 0177
 - verify: tests/ui/cap
-- since: T048
+- since: T125
 - check: ui tests WRITE+WRITE, WRITE+READ and unknown overlap; run tests stay identical at -O0/-O1
 
 ### INV-SEM-003 — Deterministic drop
 - statement: Owned values are dropped exactly once, at the end of their scope in reverse declaration order, never after being moved out. Conditional moves use drop flags. Drop never depends on a garbage collector or on reference counting.
 - source: 0151 §1, §8; 0178; tasks/0262 §26-27; tasks/0260 ABOOT-50/51
 - verify: tests/run/drop
-- since: T049
+- since: T127
 - check: run tests observe drop order through output in both modes
 
 ### INV-SEM-004 — Definite initialisation
