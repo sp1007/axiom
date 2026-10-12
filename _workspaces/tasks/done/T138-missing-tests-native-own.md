@@ -1,9 +1,10 @@
 ---
 id: T138
 title: Write missing tests for native_own
-status: doing
+status: done
 dependencies: [T129]
 paths: [tests/run/native_own/]
+finished: 2026-10-12 13:34:56
 ---
 
 ## Objective
@@ -14,3 +15,6 @@ ative_own to ensure quality.
 ## Implementation Plan
 1. Write exhaustive tests for own types in 	ests/run/native_own/.
 2. Remove the qa_dummy.ax placeholder.
+
+## Log
+- 2026-10-12 13:34:56 accepted by QA -> done
