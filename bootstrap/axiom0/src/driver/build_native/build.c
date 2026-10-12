@@ -11,7 +11,7 @@
 #include "objmodel/objmodel.h"
 #include "obj/coff/writer.h"
 #include "link/pe/linker.h"
-#include "traits/mono/mono.h"
+#include "driver/mono.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

@@ -335,18 +335,15 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                     if (t && t->kind == AX_TY_FN) {
                         TypeId dest_ty = get_place_type(body, bb->terminator.call.destination);
                         if (dest_ty.v != 0 && t->fn.ret_type.v != 0 && !types_compatible(thir, dest_ty, t->fn.ret_type)) {
-                            printf("DEBUG: dest_ty vs ret_ty\n");
                             report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                         }
                         
                         if (bb->terminator.call.arg_count != t->fn.param_count) {
-                            printf("DEBUG: arg_count %zu != param_count %zu\n", bb->terminator.call.arg_count, t->fn.param_count);
                             report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                         } else {
                             for (size_t a = 0; a < t->fn.param_count; ++a) {
                                 TypeId arg_ty = get_operand_type(body, &bb->terminator.call.args[a]);
                                 if (arg_ty.v != 0 && t->fn.param_types[a].v != 0 && !types_compatible(thir, arg_ty, t->fn.param_types[a])) {
-                                    printf("DEBUG: arg %zu mismatch! arg_ty=%u, param_ty=%u\n", a, arg_ty.v, t->fn.param_types[a].v);
                                     report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                                 }
                             }

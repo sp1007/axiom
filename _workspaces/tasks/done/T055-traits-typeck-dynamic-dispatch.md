@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T054b]
 priority: 75
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src, tests/run/trait, tests/ui/trait, tests/run/drop, tests/ui/drop, tests/ui/method]
 locks: [bootstrap/axiom0/src/diag/codes/TRAIT.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 timeout_min: 300
 spec: [0158, 0212, 0046, tasks/0272, tasks/0389, tasks/0611]
+finished: 2026-10-12 23:32:51
 ---
 # T055 — Traits + trait solver + static dispatch
 
@@ -36,3 +37,6 @@ Trait system with a solver that never guesses.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-12 23:32:51 accepted by QA -> done

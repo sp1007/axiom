@@ -1,4 +1,4 @@
-#include "traits/mono/mono.h"
+#include "driver/mono.h"
 #include "driver/driver.h"
 #include "resolve/resolve.h"
 #include <stdio.h>

@@ -529,8 +529,12 @@ static void finalize_types(TypeckCtx *cx) {
     while (AxSymbolTypeMap_next(&cx->thir->symbol_types, &cur, &se)) se->value = resolve_ty(cx, se->value);
 }
 
-
-#include "traits/solver.h"
+typedef enum AxTraitResult {
+    AX_TRAIT_PROVEN,
+    AX_TRAIT_DISPROVEN,
+    AX_TRAIT_AMBIGUOUS,
+    AX_TRAIT_OVERFLOW
+} AxTraitResult;
 
 static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView method_name, AxTraitResult *out_res) {
     if (is_error(cx, base_ty)) return NULL;
@@ -879,6 +883,90 @@ static bool type_contains_view(const TypeckCtx *cx, TypeId id, TypeId target) {
     return false;
 }
 
+static bool satisfies_bound(TypeckCtx *cx, TypeId arg_ty, AxHirType *bound) {
+    if (bound->kind != AX_HIR_TYPE_PATH) return true;
+    AxSymbolId trait_sym = bound->path.path.symbol;
+
+    const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
+    if (t->kind == AX_TY_PARAM || t->kind == AX_TY_VAR || t->kind == AX_TY_INT_VAR) return true;
+
+    for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.trait_path->kind == AX_HIR_TYPE_PATH && it->impl.trait_path->path.path.symbol.v == trait_sym.v) {
+            if (it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+                AxSymbolId impl_sym = it->impl.self_type->path.path.symbol;
+                if (t->kind == AX_TY_STRUCT && t->strct.def->struct_decl.symbol.v == impl_sym.v) return true;
+                if (t->kind == AX_TY_ENUM && t->enm.def->enum_decl.symbol.v == impl_sym.v) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static void check_all_bounds(TypeckCtx *cx) {
+    uint32_t cur = 0;
+    AxExprSubstMapEntry *e;
+    while (AxExprSubstMap_next(&cx->thir->expr_substs, &cur, &e)) {
+        const AxHirExpr *expr = e->key;
+        AxGenericArgs *gargs = &e->value;
+        const AxHirPath *path = NULL;
+        if (expr->kind == AX_HIR_EXPR_PATH) {
+            path = &expr->path.path;
+        } else if (expr->kind == AX_HIR_EXPR_STRUCT) {
+            path = &expr->struct_lit.path;
+        }
+        if (!path || path->symbol.v == 0) continue;
+
+        const AxHirItem *target = NULL;
+        for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == path->symbol.v) target = it;
+            else if (it->kind == AX_HIR_ITEM_STRUCT && it->struct_decl.symbol.v == path->symbol.v) target = it;
+            else if (it->kind == AX_HIR_ITEM_ENUM && it->enum_decl.symbol.v == path->symbol.v) target = it;
+            if (target) break;
+        }
+        if (!target) continue;
+
+        AxHirGenericParams *gps = NULL;
+        AxHirWhereClause *wc = NULL;
+        if (target->kind == AX_HIR_ITEM_FN) { gps = target->fn.generic_params; wc = target->fn.where_clause; }
+        else if (target->kind == AX_HIR_ITEM_STRUCT) { gps = target->struct_decl.generic_params; wc = target->struct_decl.where_clause; }
+        else if (target->kind == AX_HIR_ITEM_ENUM) { gps = target->enum_decl.generic_params; wc = target->enum_decl.where_clause; }
+
+        if (gps) {
+            size_t param_idx = 0;
+            for (AxHirGenericParam *p = gps->params; p && param_idx < gargs->count; p = p->next, param_idx++) {
+                TypeId arg_ty = resolve_ty(cx, gargs->args[param_idx]);
+                for (AxHirType *b = p->bounds; b; b = b->next) {
+                    if (!satisfies_bound(cx, arg_ty, b)) {
+                        AxDiagnostic d = {0};
+                        d.code = AX_TRAIT_UNSATISFIED_BOUND;
+                        d.severity = AX_DIAG_ERROR;
+                        d.message = "the trait bound is not satisfied";
+                        d.primary = path->generic_args ? path->generic_args->span : expr->span;
+                        ax_diag_sink_report(cx->sink, &d);
+                    }
+                }
+            }
+        }
+        if (wc) {
+            for (AxHirWherePred *pred = wc->preds; pred; pred = pred->next) {
+                TypeId pred_ty_id = hir_type_to_typeid(cx, pred->type);
+                pred_ty_id = ax_subst_ty(cx, pred_ty_id, gargs);
+                pred_ty_id = resolve_ty(cx, pred_ty_id);
+                for (AxHirType *b = pred->bounds; b; b = b->next) {
+                    if (!satisfies_bound(cx, pred_ty_id, b)) {
+                        AxDiagnostic d = {0};
+                        d.code = AX_TRAIT_UNSATISFIED_BOUND;
+                        d.severity = AX_DIAG_ERROR;
+                        d.message = "the trait bound is not satisfied";
+                        d.primary = path->generic_args ? path->generic_args->span : expr->span;
+                        ax_diag_sink_report(cx->sink, &d);
+                    }
+                }
+            }
+        }
+    }
+}
+
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db) {
     AxThir thir;
     ax_thir_init(&thir);
@@ -1143,6 +1231,7 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     }
 
     finalize_types(&cx);
+    check_all_bounds(&cx);
 
     ax_xfree(cx.int_vars);
     ax_xfree(cx.lits);
@@ -2169,7 +2258,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             }
             if (!is_error(cx, t)) {
                 AxTypeKind k = ax_type_get(&cx->thir->interner, resolve_ty(cx, t))->kind;
-                if (k == AX_TY_BUILTIN_LEN || k == AX_TY_BUILTIN_PRINT || k == AX_TY_BUILTIN_PRINT_INT) {
+                if (k == AX_TY_BUILTIN_DROP || k == AX_TY_BUILTIN_LEN || k == AX_TY_BUILTIN_PRINT || k == AX_TY_BUILTIN_PRINT_INT) {
                     return type_error(cx, expr->span, AX_TYPE_MISMATCH);
                 }
             }
@@ -2543,7 +2632,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         vidx++;
                     }
                 }
-                return type_error(cx, expr->span, AX_TRAIT_MISSING_METHOD);
+                return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
             }
             
             AxExprMethodMap_insert(&cx->thir->expr_methods, expr, method_item);
@@ -2786,3 +2875,4 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
 
     return ty;
 }
+
