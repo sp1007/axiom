@@ -10,8 +10,8 @@ depends: [T054b]
 priority: 75
 status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src, tests/run/trait, tests/ui/trait]
-locks: [bootstrap/axiom0/src/diag/codes/TRAIT.def, bootstrap/axiom0/src/diag/codes/TYPE.def]
+paths: [bootstrap/axiom0/src, tests/run/trait, tests/ui/trait, tests/run/drop, tests/ui/drop, tests/ui/method]
+locks: [bootstrap/axiom0/src/diag/codes/TRAIT.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 timeout_min: 300
 spec: [0158, 0212, 0046, tasks/0272, tasks/0389, tasks/0611]
 ---

@@ -40,6 +40,11 @@ static bool types_compatible(const AxThir *thir, TypeId a, TypeId b) {
     if (ta && tb) {
         if (ta->kind == AX_TY_INT_VAR || tb->kind == AX_TY_INT_VAR) return true;
         if (ta->kind == AX_TY_ERROR || tb->kind == AX_TY_ERROR) return true;
+        if (ta->kind == AX_TY_PARAM || tb->kind == AX_TY_PARAM) return true;
+        if (ta->kind == AX_TY_VAR || tb->kind == AX_TY_VAR) return true;
+        if (ta->kind == AX_TY_VIEW && tb->kind == AX_TY_VIEW) return types_compatible(thir, ta->view.pointee, tb->view.pointee);
+        if (ta->kind == AX_TY_MUT_VIEW && tb->kind == AX_TY_MUT_VIEW) return types_compatible(thir, ta->view.pointee, tb->view.pointee);
+        if (ta->kind == AX_TY_PTR && tb->kind == AX_TY_PTR) return types_compatible(thir, ta->ptr.pointee, tb->ptr.pointee);
     }
     return false;
 }
@@ -330,15 +335,18 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                     if (t && t->kind == AX_TY_FN) {
                         TypeId dest_ty = get_place_type(body, bb->terminator.call.destination);
                         if (dest_ty.v != 0 && t->fn.ret_type.v != 0 && !types_compatible(thir, dest_ty, t->fn.ret_type)) {
+                            printf("DEBUG: dest_ty vs ret_ty\n");
                             report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                         }
                         
                         if (bb->terminator.call.arg_count != t->fn.param_count) {
+                            printf("DEBUG: arg_count %zu != param_count %zu\n", bb->terminator.call.arg_count, t->fn.param_count);
                             report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                         } else {
                             for (size_t a = 0; a < t->fn.param_count; ++a) {
                                 TypeId arg_ty = get_operand_type(body, &bb->terminator.call.args[a]);
                                 if (arg_ty.v != 0 && t->fn.param_types[a].v != 0 && !types_compatible(thir, arg_ty, t->fn.param_types[a])) {
+                                    printf("DEBUG: arg %zu mismatch! arg_ty=%u, param_ty=%u\n", a, arg_ty.v, t->fn.param_types[a].v);
                                     report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
                                 }
                             }
@@ -406,7 +414,7 @@ static bool ax_type_needs_drop(const AxThir *thir, TypeId ty, const AxHirItem *f
 
     const AxType *t = ax_type_get(&thir->interner, ty);
     if (!t) return false;
-    if (t->kind == AX_TY_BUILTIN_DROP) return true;
+    // if (t->kind == AX_TY_BUILTIN_DROP) return true;
     if (t->kind == AX_TY_STRUCT) {
         for (size_t i = 0; i < t->strct.field_count; i++) {
             if (ax_type_needs_drop(thir, t->strct.fields[i], func)) return true;

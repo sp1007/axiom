@@ -530,25 +530,76 @@ static void finalize_types(TypeckCtx *cx) {
 }
 
 
-static const AxHirItem *find_inherent_method(TypeckCtx *cx, TypeId base_ty, StrView method_name) {
+#include "traits/solver.h"
+
+static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView method_name, AxTraitResult *out_res) {
     if (is_error(cx, base_ty)) return NULL;
+    const AxHirItem *found = NULL;
+    int matches = 0;
+    *out_res = AX_TRAIT_DISPROVEN;
+    
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path == NULL) {
+        if (it->kind == AX_HIR_ITEM_IMPL) {
             TypeId self_ty = hir_type_to_typeid(cx, it->impl.self_type);
             if (is_error(cx, self_ty)) continue;
+            
+            bool match = false;
             if (self_ty.v == base_ty.v) {
+                match = true;
+            } else {
+                const AxType *b = ax_type_get(&cx->thir->interner, base_ty);
+                const AxType *s = ax_type_get(&cx->thir->interner, self_ty);
+                if (b->kind == AX_TY_VIEW && s->kind == AX_TY_VIEW) {
+                     match = (b->view.pointee.v == s->view.pointee.v);
+                } else if (b->kind == AX_TY_VIEW) {
+                     if (b->view.pointee.v == self_ty.v) match = true;
+                }
+            }
+
+            if (match) {
                 for (const AxHirItem *m = it->impl.members; m; m = m->next) {
                     if (m->kind == AX_HIR_ITEM_FN) {
                         StrView mname = ax_interner_get(cx->str_in, m->fn.name);
                         if (ax_sv_eq(mname, method_name)) {
-                            return m;
+                            found = m;
+                            matches++;
+                        }
+                    }
+                }
+            }
+        } else if (it->kind == AX_HIR_ITEM_TRAIT) {
+            // Also check trait methods if we are calling on a generic parameter
+            const AxType *b = ax_type_get(&cx->thir->interner, base_ty);
+            bool is_param = false;
+            if (b->kind == AX_TY_PARAM) is_param = true;
+            if (b->kind == AX_TY_VIEW) {
+                const AxType *pb = ax_type_get(&cx->thir->interner, b->view.pointee);
+                if (pb->kind == AX_TY_PARAM) is_param = true;
+            }
+            if (is_param) {
+                for (const AxHirItem *m = it->trait.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_FN) {
+                        StrView mname = ax_interner_get(cx->str_in, m->fn.name);
+                        if (ax_sv_eq(mname, method_name)) {
+                            found = m;
+                            matches++;
                         }
                     }
                 }
             }
         }
     }
-    return NULL;
+    
+    if (matches > 1) {
+        *out_res = AX_TRAIT_AMBIGUOUS;
+        return NULL;
+    } else if (matches == 1) {
+        *out_res = AX_TRAIT_PROVEN;
+        return found;
+    } else {
+        *out_res = AX_TRAIT_DISPROVEN;
+        return NULL;
+    }
 }
 
 
@@ -997,7 +1048,9 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     // Pass 1b: Function signatures
     for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
         for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
-            const AxHirItem *it = (impl_pass == 0) ? top_it : (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : NULL);
+            const AxHirItem *it = (impl_pass == 0) ? top_it : 
+                                  (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
+                                  (top_it->kind == AX_HIR_ITEM_TRAIT ? top_it->trait.members : NULL));
             for (; it; it = (impl_pass == 0) ? NULL : it->next) {
             if (it->kind == AX_HIR_ITEM_FN) {
                 AxHirGenericParam *gp = it->fn.generic_params ? it->fn.generic_params->params : NULL;
@@ -1058,7 +1111,9 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     // Pass 2: Typecheck bodies
     for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
         for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
-            const AxHirItem *it = (impl_pass == 0) ? top_it : (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : NULL);
+            const AxHirItem *it = (impl_pass == 0) ? top_it : 
+                                  (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
+                                  (top_it->kind == AX_HIR_ITEM_TRAIT ? top_it->trait.members : NULL));
             for (; it; it = (impl_pass == 0) ? NULL : it->next) {
                 if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
                     cx.current_fn = it;
@@ -1395,6 +1450,14 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         }
         
         StrView name = ax_source_db_span_text(cx->db, path->span);
+        if (ax_sv_eq_cstr(name, "Self")) {
+            AxType pt;
+            memset(&pt, 0, sizeof(pt));
+            pt.kind = AX_TY_PARAM;
+            pt.param.name = ax_intern_cstr(cx->str_in, "Self");
+            pt.param.index = 0;
+            return ax_intern_type(&cx->thir->interner, &pt);
+        }
         if (ax_sv_eq_cstr(name, "len")) {
             AxType st;
             memset(&st, 0, sizeof(st));
@@ -2106,7 +2169,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             }
             if (!is_error(cx, t)) {
                 AxTypeKind k = ax_type_get(&cx->thir->interner, resolve_ty(cx, t))->kind;
-                if (k == AX_TY_BUILTIN_DROP || k == AX_TY_BUILTIN_LEN || k == AX_TY_BUILTIN_PRINT || k == AX_TY_BUILTIN_PRINT_INT) {
+                if (k == AX_TY_BUILTIN_LEN || k == AX_TY_BUILTIN_PRINT || k == AX_TY_BUILTIN_PRINT_INT) {
                     return type_error(cx, expr->span, AX_TYPE_MISMATCH);
                 }
             }
@@ -2426,6 +2489,14 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                             break;
                         }
                     }
+                    if (is_type_name && cx->current_fn) {
+                        for (const AxHirParam *p = cx->current_fn->fn.params; p; p = p->next) {
+                            if (p->symbol.v == expr->method_call.receiver->path.path.symbol.v) {
+                                is_type_name = false;
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             TypeId receiver_ty = check_expr(cx, expr->method_call.receiver, TypeId_none());
@@ -2440,8 +2511,12 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             }
             
             StrView mname = ax_interner_get(cx->str_in, expr->method_call.method_name);
-            const AxHirItem *method_item = find_inherent_method(cx, base_ty, mname);
+            AxTraitResult trait_res = AX_TRAIT_DISPROVEN;
+            const AxHirItem *method_item = find_method(cx, base_ty, mname, &trait_res);
             
+            if (trait_res == AX_TRAIT_AMBIGUOUS) {
+                return type_error(cx, expr->span, AX_TRAIT_AMBIGUOUS_METHOD);
+            }
             if (!method_item) {
                 if (t->kind == AX_TY_ENUM) {
                     size_t vidx = 0;
@@ -2468,7 +2543,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         vidx++;
                     }
                 }
-                return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                return type_error(cx, expr->span, AX_TRAIT_MISSING_METHOD);
             }
             
             AxExprMethodMap_insert(&cx->thir->expr_methods, expr, method_item);

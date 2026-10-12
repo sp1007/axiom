@@ -286,6 +286,33 @@ void ax_stage_mono(struct AxDriverState *st) {
                             break;
                         }
                     }
+                    if (!callee) {
+                        AxHirItem *trait_method = NULL;
+                        for (AxHirItem *it = st->hir.items; it; it = it->next) {
+                            if (it->kind == AX_HIR_ITEM_TRAIT) {
+                                for (AxHirItem *m = it->trait.members; m; m = m->next) {
+                                    if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == sym_v.v) {
+                                        trait_method = m;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (trait_method) {
+                            // Find the impl for S
+                            for (AxHirItem *it = st->hir.items; it; it = it->next) {
+                                if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path) {
+                                    for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                                        if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == trait_method->fn.name.v) {
+                                            callee = m;
+                                            term->call.func.constant.val = m->fn.symbol.v;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     size_t count = 0;
                     if (callee && callee->fn.generic_params) {
                         for (AxHirGenericParam *p = callee->fn.generic_params->params; p; p = p->next) count++;

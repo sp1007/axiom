@@ -353,6 +353,8 @@ static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
 }
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
+    extern void ax_traits_check_overlap(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in);
+    ax_traits_check_overlap(&st->hir, &st->sink, &st->interner);
     st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
     if (st->sink.errors > 0) return;
     
