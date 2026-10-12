@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T130, T131]
 priority: 70
-status: doing
+status: done
 paths: [bootstrap/axiom0/src/mir/build, tests/run/drop]
-locks: []
+locks: [bootstrap/axiom0/src/diag/codes/VERIFY.def]
 attempts: 1
 started: 2026-10-12 07:07:16
+finished: 2026-10-12 07:57:51
 ---
 # T133 — Drop Elaboration for Temporaries
 
@@ -32,3 +33,4 @@ Ensure `builder.c` correctly emits drops for temporary variables (`AX_MIR_LOCAL_
 
 ## Log
 - 2026-10-12 07:07:16 started (attempt 1) 
+- 2026-10-12 07:57:51 accepted by QA -> done

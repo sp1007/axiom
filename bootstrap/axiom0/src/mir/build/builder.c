@@ -16,6 +16,7 @@ typedef struct BbData {
 typedef struct DropNode {
     AxMirPlace place;
     AxLocation location;
+    bool is_temp;
     struct DropNode *next;
 } DropNode;
 
@@ -57,7 +58,7 @@ typedef struct Builder {
     DropNode *current_drops;
 } Builder;
 
-static void push_drop(Builder *b, AxMirPlace place, TypeId ty);
+static void push_drop(Builder *b, AxMirPlace place, TypeId ty, bool is_temp);
 static bool type_needs_drop(Builder *b, TypeId ty);
 static AxMirBbId build_drop_chain(Builder *b, AxMirBbId current_bb, DropNode *from, DropNode *to, AxMirBbId target_bb, AxLocation loc);
 static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
@@ -79,9 +80,9 @@ static AxMirLocalId add_local(Builder *b, AxMirLocalKind kind, TypeId ty, bool m
     b->locals[id.v].ty = ty;
     b->locals[id.v].mut = mut;
     b->locals[id.v].location = b->current_span;
-    if (kind == AX_MIR_LOCAL_USER) {
+    if (kind == AX_MIR_LOCAL_USER || kind == AX_MIR_LOCAL_TEMP) {
         AxMirPlace place = { id, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-        push_drop(b, place, ty);
+        push_drop(b, place, ty, kind == AX_MIR_LOCAL_TEMP);
     }
     return id;
 }
@@ -101,7 +102,43 @@ static AxMirBbId add_bb(Builder *b) {
     return id;
 }
 
+
+static void consume_local(Builder *b, AxMirPlace place) {
+    if (place.proj_count > 0) return;
+    DropNode **curr = &b->current_drops;
+    while (*curr) {
+        if ((*curr)->place.local.v == place.local.v && (*curr)->is_temp) {
+            *curr = (*curr)->next;
+            break;
+        }
+        curr = &(*curr)->next;
+    }
+}
+
+static void consume_op(Builder *b, const AxMirOperand *op) {
+    if (op->kind == AX_MIR_OP_MOVE) {
+        consume_local(b, op->place);
+    }
+}
+
 static void push_stmt(Builder *b, AxMirBbId bb, AxMirStmt stmt) {
+    if (stmt.kind == AX_MIR_STMT_ASSIGN) {
+        if (stmt.assign.rvalue.kind == AX_MIR_RVALUE_USE) {
+            consume_op(b, &stmt.assign.rvalue.use);
+        } else if (stmt.assign.rvalue.kind == AX_MIR_RVALUE_CAST) {
+            consume_op(b, &stmt.assign.rvalue.cast.op);
+        } else if (stmt.assign.rvalue.kind == AX_MIR_RVALUE_UNARY_OP) {
+            consume_op(b, &stmt.assign.rvalue.unary_op.operand);
+        } else if (stmt.assign.rvalue.kind == AX_MIR_RVALUE_BINARY_OP) {
+            consume_op(b, &stmt.assign.rvalue.binary_op.lhs);
+            consume_op(b, &stmt.assign.rvalue.binary_op.rhs);
+        } else if (stmt.assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
+            for (size_t i = 0; i < stmt.assign.rvalue.aggregate.operand_count; i++) {
+                consume_op(b, &stmt.assign.rvalue.aggregate.operands[i]);
+            }
+        }
+    }
+
     BbData *d = &b->bbs[bb.v];
     stmt.location = b->current_span;
     if (d->stmt_count >= d->stmt_cap) {
@@ -112,6 +149,17 @@ static void push_stmt(Builder *b, AxMirBbId bb, AxMirStmt stmt) {
 }
 
 static void set_terminator(Builder *b, AxMirBbId bb, AxMirTerminator term) {
+    if (term.kind == AX_MIR_TERM_CALL) {
+        consume_op(b, &term.call.func);
+        for (size_t i = 0; i < term.call.arg_count; i++) {
+            consume_op(b, &term.call.args[i]);
+        }
+    } else if (term.kind == AX_MIR_TERM_ASSERT) {
+        consume_op(b, &term.assert.cond);
+    } else if (term.kind == AX_MIR_TERM_SWITCH_INT) {
+        consume_op(b, &term.switch_int.discr);
+    }
+
     BbData *d = &b->bbs[bb.v];
     term.location = b->current_span;
     if (!d->is_terminated) {
@@ -149,11 +197,12 @@ static bool type_needs_drop(Builder *b, TypeId ty) {
     return false;
 }
 
-static void push_drop(Builder *b, AxMirPlace place, TypeId ty) {
+static void push_drop(Builder *b, AxMirPlace place, TypeId ty, bool is_temp) {
     if (type_needs_drop(b, ty)) {
         DropNode *node = ax_arena_alloc_array(b->arena, 1, sizeof(DropNode), _Alignof(DropNode));
         node->place = place;
         node->location = b->current_span;
+        node->is_temp = is_temp;
         node->next = b->current_drops;
         b->current_drops = node;
     }
@@ -753,8 +802,11 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         base.proj_count = new_proj_count;
         return base;
     }
-    AxMirPlace err = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
-    return err;
+    TypeId ty = get_expr_type(b, expr);
+    AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, ty, false);
+    AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+    build_expr_into(b, expr, temp_place);
+    return temp_place;
 }
 
 static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace dest);
@@ -1794,15 +1846,7 @@ static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPla
                     AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                     build_expr_into(b, stmt->expr_stmt.expr, temp_place);
                     
-                    if (type_needs_drop(b, ty)) {
-                        AxMirBbId next_bb = add_bb(b);
-                        AxMirTerminator term = {0};
-                        term.kind = AX_MIR_TERM_DROP;
-                        term.drop.place = temp_place;
-                        term.drop.target = next_bb;
-                        set_terminator(b, b->current_bb, term);
-                        b->current_bb = next_bb;
-                    }
+                    
                 } else {
                     AxMirPlace void_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
                     build_expr_into(b, stmt->expr_stmt.expr, void_place);
@@ -1826,6 +1870,34 @@ static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPla
             if (dest.local.v == 0 && dest.proj_count == 0 && stmt->assign.left->kind != AX_HIR_EXPR_PATH) {
             }
             build_expr_into(b, stmt->assign.right, dest);
+        }
+
+        // Cleanup temporaries
+        DropNode *curr = b->current_drops;
+        DropNode *prev = NULL;
+        while (curr != old_drops) {
+            if (curr->is_temp) {
+                AxMirBbId next_bb = add_bb(b);
+                AxMirTerminator term = {0};
+                term.kind = AX_MIR_TERM_DROP;
+                term.location = stmt->span;
+                term.drop.place = curr->place;
+                term.drop.target = next_bb;
+                term.drop.unwind = (AxMirBbId){0};
+                set_terminator(b, b->current_bb, term);
+                b->current_bb = next_bb;
+                
+                if (prev) {
+                    prev->next = curr->next;
+                    curr = curr->next;
+                } else {
+                    b->current_drops = curr->next;
+                    curr = b->current_drops;
+                }
+            } else {
+                prev = curr;
+                curr = curr->next;
+            }
         }
     }
     
@@ -1900,7 +1972,7 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
         const TypeId *pty_ptr = AxParamTypeMap_get(&thir->param_types, p);
         if (pty_ptr) pty = *pty_ptr;
         AxMirLocalId loc = add_local(&b, AX_MIR_LOCAL_ARG, pty, p->is_mut);
-        push_drop(&b, (AxMirPlace){ loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 }, pty);
+        push_drop(&b, (AxMirPlace){ loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 }, pty, false);
         if (b.var_count >= b.var_cap) {
             b.var_cap = b.var_cap ? b.var_cap * 2 : 16;
             b.var_map = realloc(b.var_map, b.var_cap * sizeof(*b.var_map));
