@@ -8,7 +8,7 @@ model: opus
 gate_model: sonnet
 depends: [T054, T060]
 priority: 74
-status: doing
+status: todo
 attempts: 0
 paths: [bootstrap/axiom0/src/traits/mono, bootstrap/axiom0/src/types, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, std/core/option.ax, std/core/result.ax, std/core/prelude.ax, tests/run/generic, tests/run/mono, tests/ui/mono]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c]
