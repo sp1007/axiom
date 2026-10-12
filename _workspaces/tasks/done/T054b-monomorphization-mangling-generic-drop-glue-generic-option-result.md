@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T054, T060]
 priority: 74
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src, std/core, tests/run, tests/ui/mono, tests/ui/resolve]
 locks: [bootstrap/axiom0/src/driver/project.c, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/DROP.def, bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/driver/driver.h, bootstrap/axiom0/src/driver/build_native/build.c, bootstrap/axiom0/src/resolve/resolve.c]
 spec: [0083, tasks/0271, tasks/0506, tasks/0354, 0042, 0178]
 covers: []
+finished: 2026-10-12 21:34:31
 ---
 # T054b — Monomorphization, mangling, generic drop glue, generic Option/Result
 
@@ -42,3 +43,6 @@ Static dispatch for generics: one MIR body per instance, deterministic symbols, 
 - Depends on T060 for the std root and the prelude module.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-12 21:34:31 accepted by QA -> done

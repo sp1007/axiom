@@ -64,4 +64,8 @@
   - Converted `test_span.ax` to a proper `ui` test to verify the type-check/resolution span.
 - Refreshed task snapshot.
 
-STATUS: COMPLETE round=4
+## Round 5
+- Removed `// native-after: T059` directive from `tests/run/mono/qa_test_basic.ax`.
+- Ran tests successfully in native mode.
+
+STATUS: COMPLETE round=5
