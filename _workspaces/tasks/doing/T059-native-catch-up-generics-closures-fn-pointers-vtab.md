@@ -8,7 +8,7 @@ model: sonnet
 gate_model: sonnet
 depends: [T057]
 priority: 79
-status: todo
+status: doing
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/native_p7, tests/run/method, tests/run/generic, tests/run/mono, tests/run/trait, tests/run/trait2, tests/run/closure]
 spec: [0183, 0162]
