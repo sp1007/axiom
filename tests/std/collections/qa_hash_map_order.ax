@@ -1,0 +1,739 @@
+// test: run
+// stdout: OK HashMapOrder\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(a: u64, b: u32) -> u64 { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic pub unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+const AXH_K1: u64 = 0x9E3779B97F4A7C15;
+const AXH_K2: u64 = 0xC2B2AE3D27D4EB4F;
+const AXH_K3: u64 = 0x165667B19E3779F9;
+const AXH_SEED: u64 = 0x27D4EB2F165667C5;
+const AXH_M: u64 = 0x9FB21C651E98DF25;
+
+fn axh_round(h: u64, w: u64) -> u64 {
+    let m = wrapping_mul_u64(rotate_left_u64(wrapping_mul_u64(w, AXH_K2), 31), AXH_K1);
+    wrapping_add_u64(wrapping_mul_u64(rotate_left_u64(h ^ m, 27), AXH_K1), AXH_K3)
+}
+
+fn axh_fold(h: u64) -> u64 {
+    h ^ rotate_left_u64(h, 15) ^ rotate_left_u64(h, 40)
+}
+
+fn axh_avalanche(mut h: u64) -> u64 {
+    h = wrapping_mul_u64(axh_fold(h), AXH_M);
+    h = wrapping_mul_u64(axh_fold(h), AXH_K2);
+    axh_fold(h)
+}
+
+pub fn ax_hash_u32(v: u32) -> u64 {
+    let mut h = AXH_SEED;
+    let w = v as u64;
+    h = axh_round(h, w);
+    h = h ^ (wrapping_mul_u64(4, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub fn ax_hash_u64(v: u64) -> u64 {
+    let mut h = AXH_SEED;
+    h = axh_round(h, v);
+    h = h ^ (wrapping_mul_u64(8, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub fn ax_hash_bytes(bytes: *const u8, byte_len: usize) -> u64 {
+    let mut h = AXH_SEED;
+    let mut offset: usize = 0;
+    let mut rem = byte_len;
+    while rem >= 8 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < 8 {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+        offset = offset + 8;
+        rem = rem - 8;
+    }
+    if rem > 0 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < rem {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+    }
+    h = h ^ (wrapping_mul_u64(byte_len as u64, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub const AX_MAP_TOMBSTONE: u32 = 0xFFFFFFFF;
+
+pub struct AxRawMap {
+    pub entries: *mut u8,
+    pub hashes: *mut u64,
+    pub alive: *mut u8,
+    pub entry_size: usize,
+    pub len: usize,
+    pub live: usize,
+    pub cap: usize,
+    pub index: *mut u32,
+    pub index_cap: usize,
+    pub index_used: usize,
+}
+
+pub fn rawmap_init(m: mut_view<AxRawMap>, entry_size: usize) {
+    m.entries = 0 as *mut u8;
+    m.hashes = 0 as *mut u64;
+    m.alive = 0 as *mut u8;
+    m.entry_size = entry_size;
+    m.len = 0;
+    m.live = 0;
+    m.cap = 0;
+    m.index = 0 as *mut u32;
+    m.index_cap = 0;
+    m.index_used = 0;
+}
+
+pub fn rawmap_free(m: mut_view<AxRawMap>) {
+    let esz = m.entry_size;
+    if m.cap > 0 {
+        if m.entries as usize != 0 {
+            unsafe { heap_free(m.entries, m.cap * esz, 8); }
+        }
+        if m.hashes as usize != 0 {
+            unsafe { heap_free(m.hashes as *mut u8, m.cap * 8, 8); }
+        }
+        if m.alive as usize != 0 {
+            unsafe { heap_free(m.alive, m.cap, 1); }
+        }
+    }
+    if m.index_cap > 0 && m.index as usize != 0 {
+        unsafe { heap_free(m.index as *mut u8, m.index_cap * 4, 4); }
+    }
+    rawmap_init(m, esz);
+}
+
+pub fn rawmap_clear(m: mut_view<AxRawMap>) {
+    m.len = 0;
+    m.live = 0;
+    m.index_used = 0;
+    if m.index as usize != 0 {
+        let mut i: usize = 0;
+        while i < m.index_cap {
+            unsafe { *(m.index + i) = 0u32; }
+            i = i + 1;
+        }
+    }
+}
+
+fn index_put(index: *mut u32, cap: usize, hash: u64, entry: usize) {
+    let mask = cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while unsafe { *(index + slot) } != 0 && unsafe { *(index + slot) } != AX_MAP_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    unsafe { *(index + slot) = (entry + 1) as u32; }
+}
+
+fn index_rebuild(m: mut_view<AxRawMap>) {
+    let mut cap: usize = 8;
+    while (m.live + 1) * 2 > cap {
+        cap = cap * 2;
+    }
+    if m.index as usize != 0 {
+        unsafe { heap_free(m.index as *mut u8, m.index_cap * 4, 4); }
+    }
+    let raw = unsafe { heap_alloc(cap * 4, 4) };
+    let new_idx = raw as *mut u32;
+    let mut j: usize = 0;
+    while j < cap {
+        unsafe { *(new_idx + j) = 0u32; }
+        j = j + 1;
+    }
+    m.index = new_idx;
+    m.index_cap = cap;
+    m.index_used = 0;
+    let mut i: usize = 0;
+    while i < m.len {
+        if unsafe { *(m.alive + i) } != 0 {
+            let h = unsafe { *(m.hashes + i) };
+            index_put(m.index, cap, h, i);
+            m.index_used = m.index_used + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn rawmap_compact(m: mut_view<AxRawMap>) {
+    let mut w: usize = 0;
+    let mut r: usize = 0;
+    let esz = m.entry_size;
+    while r < m.len {
+        if unsafe { *(m.alive + r) } != 0 {
+            if w != r {
+                unsafe {
+                    ptr_copy_nonoverlapping<u8>((m.entries + r * esz) as *const u8, m.entries + w * esz, esz);
+                    *(m.hashes + w) = *(m.hashes + r);
+                    *(m.alive + w) = 1u8;
+                }
+            }
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    m.len = w;
+    index_rebuild(m);
+}
+
+// U32 HashMap
+pub struct U32Entry {
+    pub key: u32,
+    pub val: u32,
+}
+
+pub struct U32Map {
+    pub raw: AxRawMap,
+}
+
+pub fn u32map_new() -> U32Map {
+    let mut m = U32Map {
+        raw: AxRawMap {
+            entries: 0 as *mut u8,
+            hashes: 0 as *mut u64,
+            alive: 0 as *mut u8,
+            entry_size: 8,
+            len: 0,
+            live: 0,
+            cap: 0,
+            index: 0 as *mut u32,
+            index_cap: 0,
+            index_used: 0,
+        }
+    };
+    rawmap_init(mut_view(m.raw), 8);
+    m
+}
+
+pub fn u32map_with_capacity(capacity: usize) -> U32Map {
+    let mut m = u32map_new();
+    if capacity > 0 {
+        let esz = 8;
+        m.raw.entries = unsafe { heap_alloc(capacity * esz, 8) };
+        m.raw.hashes = unsafe { heap_alloc(capacity * 8, 8) } as *mut u64;
+        m.raw.alive = unsafe { heap_alloc(capacity, 1) };
+        m.raw.cap = capacity;
+    }
+    m
+}
+
+pub fn u32map_find(m: view<U32Map>, hash: u64, key: u32) -> usize {
+    if m.raw.index_cap == 0 || m.raw.live == 0 {
+        return 0xFFFFFFFF;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while true {
+        let s = unsafe { *(m.raw.index + slot) };
+        if s == 0 {
+            return 0xFFFFFFFF;
+        }
+        if s != AX_MAP_TOMBSTONE {
+            let i = (s - 1) as usize;
+            if unsafe { *(m.raw.hashes + i) } == hash {
+                let entry = unsafe { (m.raw.entries as *const U32Entry) + i };
+                if unsafe { (*entry).key } == key {
+                    return i;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    0xFFFFFFFF
+}
+
+pub fn u32map_insert(m: mut_view<U32Map>, key: u32, val: u32) -> bool {
+    let h = ax_hash_u32(key);
+    let found = u32map_find(view(*m), h, key);
+    if found != 0xFFFFFFFF {
+        let entry = unsafe { (m.raw.entries as *mut U32Entry) + found };
+        unsafe { (*entry).val = val; }
+        return false;
+    }
+    let dead = m.raw.len - m.raw.live;
+    if dead >= 8 && dead * 2 >= m.raw.len {
+        rawmap_compact(mut_view(m.raw));
+    }
+    if m.raw.len == m.raw.cap {
+        let mut new_cap = if m.raw.cap == 0 { 8 } else { m.raw.cap * 2 };
+        let new_entries = unsafe { heap_alloc(new_cap * 8, 8) };
+        let new_hashes = unsafe { heap_alloc(new_cap * 8, 8) } as *mut u64;
+        let new_alive = unsafe { heap_alloc(new_cap, 1) };
+        if m.raw.len > 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(m.raw.entries as *const u8, new_entries, m.raw.len * 8);
+                ptr_copy_nonoverlapping<u8>(m.raw.hashes as *const u8, new_hashes as *mut u8, m.raw.len * 8);
+                ptr_copy_nonoverlapping<u8>(m.raw.alive as *const u8, new_alive, m.raw.len);
+                heap_free(m.raw.entries, m.raw.cap * 8, 8);
+                heap_free(m.raw.hashes as *mut u8, m.raw.cap * 8, 8);
+                heap_free(m.raw.alive, m.raw.cap, 1);
+            }
+        }
+        m.raw.entries = new_entries;
+        m.raw.hashes = new_hashes;
+        m.raw.alive = new_alive;
+        m.raw.cap = new_cap;
+    }
+    if m.raw.index_cap == 0 || (m.raw.index_used + 1) * 4 > m.raw.index_cap * 3 {
+        index_rebuild(mut_view(m.raw));
+    }
+    let i = m.raw.len;
+    m.raw.len = m.raw.len + 1;
+    m.raw.live = m.raw.live + 1;
+    let entry = unsafe { (m.raw.entries as *mut U32Entry) + i };
+    unsafe {
+        (*entry).key = key;
+        (*entry).val = val;
+        *(m.raw.hashes + i) = h;
+        *(m.raw.alive + i) = 1u8;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while unsafe { *(m.raw.index + slot) } != 0 && unsafe { *(m.raw.index + slot) } != AX_MAP_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    if unsafe { *(m.raw.index + slot) } == 0 {
+        m.raw.index_used = m.raw.index_used + 1;
+    }
+    unsafe { *(m.raw.index + slot) = (i + 1) as u32; }
+    true
+}
+
+pub fn u32map_get(m: view<U32Map>, key: u32) -> Option<u32> {
+    let h = ax_hash_u32(key);
+    let idx = u32map_find(m, h, key);
+    if idx == 0xFFFFFFFF {
+        return Option.None;
+    }
+    let entry = unsafe { (m.raw.entries as *const U32Entry) + idx };
+    Option.Some(unsafe { (*entry).val })
+}
+
+pub fn u32map_contains(m: view<U32Map>, key: u32) -> bool {
+    let h = ax_hash_u32(key);
+    u32map_find(m, h, key) != 0xFFFFFFFF
+}
+
+pub fn u32map_remove(m: mut_view<U32Map>, key: u32, out_val: mut_view<u32>) -> bool {
+    let h = ax_hash_u32(key);
+    if m.raw.index_cap == 0 || m.raw.live == 0 {
+        return false;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let s = unsafe { *(m.raw.index + slot) };
+        if s == 0 {
+            return false;
+        }
+        if s != AX_MAP_TOMBSTONE {
+            let i = (s - 1) as usize;
+            if unsafe { *(m.raw.hashes + i) } == h {
+                let entry = unsafe { (m.raw.entries as *const U32Entry) + i };
+                if unsafe { (*entry).key } == key {
+                    *out_val = unsafe { (*entry).val };
+                    unsafe {
+                        *(m.raw.index + slot) = AX_MAP_TOMBSTONE;
+                        *(m.raw.alive + i) = 0u8;
+                    }
+                    m.raw.live = m.raw.live - 1;
+                    return true;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
+pub fn u32map_len(m: view<U32Map>) -> usize {
+    m.raw.live
+}
+
+pub fn u32map_is_empty(m: view<U32Map>) -> bool {
+    m.raw.live == 0
+}
+
+pub fn u32map_clear(m: mut_view<U32Map>) {
+    rawmap_clear(mut_view(m.raw));
+}
+
+pub fn u32map_free(m: mut_view<U32Map>) {
+    rawmap_free(mut_view(m.raw));
+}
+
+// Str -> U32 Map
+pub struct StrU32Entry {
+    pub key: Str,
+    pub val: u32,
+}
+
+pub struct StrU32Map {
+    pub raw: AxRawMap,
+}
+
+fn str_eq(a: view<Str>, b: view<Str>) -> bool {
+    let n = len(*a);
+    if n != len(*b) {
+        return false;
+    }
+    let pa = unsafe { *(address_of(*a) as *const *const u8) };
+    let pb = unsafe { *(address_of(*b) as *const *const u8) };
+    let mut i: usize = 0;
+    while i < n {
+        if unsafe { *(pa + i) } != unsafe { *(pb + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn strmap_new() -> StrU32Map {
+    let mut m = StrU32Map {
+        raw: AxRawMap {
+            entries: 0 as *mut u8,
+            hashes: 0 as *mut u64,
+            alive: 0 as *mut u8,
+            entry_size: 24,
+            len: 0,
+            live: 0,
+            cap: 0,
+            index: 0 as *mut u32,
+            index_cap: 0,
+            index_used: 0,
+        }
+    };
+    rawmap_init(mut_view(m.raw), 24);
+    m
+}
+
+pub fn strmap_find(m: view<StrU32Map>, hash: u64, key: view<Str>) -> usize {
+    if m.raw.index_cap == 0 || m.raw.live == 0 {
+        return 0xFFFFFFFF;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while true {
+        let s = unsafe { *(m.raw.index + slot) };
+        if s == 0 {
+            return 0xFFFFFFFF;
+        }
+        if s != AX_MAP_TOMBSTONE {
+            let i = (s - 1) as usize;
+            if unsafe { *(m.raw.hashes + i) } == hash {
+                let entry = unsafe { (m.raw.entries as *const StrU32Entry) + i };
+                let eq = unsafe { str_eq(view((*entry).key), key) };
+                if eq {
+                    return i;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    0xFFFFFFFF
+}
+
+pub fn strmap_insert(m: mut_view<StrU32Map>, key: Str, val: u32) -> bool {
+    let p_k = unsafe { *(address_of(key) as *const *const u8) };
+    let n_k = len(key);
+    let h = ax_hash_bytes(p_k, n_k);
+    let found = {
+        let v_key = view(key);
+        strmap_find(view(*m), h, v_key)
+    };
+    if found != 0xFFFFFFFF {
+        let entry = unsafe { (m.raw.entries as *mut StrU32Entry) + found };
+        unsafe { (*entry).val = val; }
+        return false;
+    }
+    let dead = m.raw.len - m.raw.live;
+    if dead >= 8 && dead * 2 >= m.raw.len {
+        rawmap_compact(mut_view(m.raw));
+    }
+    let esz = 24;
+    if m.raw.len == m.raw.cap {
+        let mut new_cap = if m.raw.cap == 0 { 8 } else { m.raw.cap * 2 };
+        let new_entries = unsafe { heap_alloc(new_cap * esz, 8) };
+        let new_hashes = unsafe { heap_alloc(new_cap * 8, 8) } as *mut u64;
+        let new_alive = unsafe { heap_alloc(new_cap, 1) };
+        if m.raw.len > 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(m.raw.entries as *const u8, new_entries, m.raw.len * esz);
+                ptr_copy_nonoverlapping<u8>(m.raw.hashes as *const u8, new_hashes as *mut u8, m.raw.len * 8);
+                ptr_copy_nonoverlapping<u8>(m.raw.alive as *const u8, new_alive, m.raw.len);
+                heap_free(m.raw.entries, m.raw.cap * esz, 8);
+                heap_free(m.raw.hashes as *mut u8, m.raw.cap * 8, 8);
+                heap_free(m.raw.alive, m.raw.cap, 1);
+            }
+        }
+        m.raw.entries = new_entries;
+        m.raw.hashes = new_hashes;
+        m.raw.alive = new_alive;
+        m.raw.cap = new_cap;
+    }
+    if m.raw.index_cap == 0 || (m.raw.index_used + 1) * 4 > m.raw.index_cap * 3 {
+        index_rebuild(mut_view(m.raw));
+    }
+    let i = m.raw.len;
+    m.raw.len = m.raw.len + 1;
+    m.raw.live = m.raw.live + 1;
+    let entry = unsafe { (m.raw.entries as *mut StrU32Entry) + i };
+    unsafe {
+        ptr_copy_nonoverlapping<Str>(address_of(key), (entry as *mut Str), 1);
+        (*entry).val = val;
+        *(m.raw.hashes + i) = h;
+        *(m.raw.alive + i) = 1u8;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while unsafe { *(m.raw.index + slot) } != 0 && unsafe { *(m.raw.index + slot) } != AX_MAP_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    if unsafe { *(m.raw.index + slot) } == 0 {
+        m.raw.index_used = m.raw.index_used + 1;
+    }
+    unsafe { *(m.raw.index + slot) = (i + 1) as u32; }
+    true
+}
+
+pub fn strmap_get(m: view<StrU32Map>, key: view<Str>) -> Option<u32> {
+    let p_k = unsafe { *(address_of(*key) as *const *const u8) };
+    let n_k = len(*key);
+    let h = ax_hash_bytes(p_k, n_k);
+    let idx = strmap_find(m, h, key);
+    if idx == 0xFFFFFFFF {
+        return Option.None;
+    }
+    let entry = unsafe { (m.raw.entries as *const StrU32Entry) + idx };
+    Option.Some(unsafe { (*entry).val })
+}
+
+pub fn strmap_contains(m: view<StrU32Map>, key: view<Str>) -> bool {
+    let p_k = unsafe { *(address_of(*key) as *const *const u8) };
+    let n_k = len(*key);
+    let h = ax_hash_bytes(p_k, n_k);
+    strmap_find(m, h, key) != 0xFFFFFFFF
+}
+
+pub fn strmap_remove(m: mut_view<StrU32Map>, key: view<Str>, out_val: mut_view<u32>) -> bool {
+    let p_k = unsafe { *(address_of(*key) as *const *const u8) };
+    let n_k = len(*key);
+    let h = ax_hash_bytes(p_k, n_k);
+    if m.raw.index_cap == 0 || m.raw.live == 0 {
+        return false;
+    }
+    let mask = m.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let s = unsafe { *(m.raw.index + slot) };
+        if s == 0 {
+            return false;
+        }
+        if s != AX_MAP_TOMBSTONE {
+            let i = (s - 1) as usize;
+            if unsafe { *(m.raw.hashes + i) } == h {
+                let entry = unsafe { (m.raw.entries as *const StrU32Entry) + i };
+                let eq = unsafe { str_eq(view((*entry).key), key) };
+                if eq {
+                    *out_val = unsafe { (*entry).val };
+                    unsafe {
+                        *(m.raw.index + slot) = AX_MAP_TOMBSTONE;
+                        *(m.raw.alive + i) = 0u8;
+                    }
+                    m.raw.live = m.raw.live - 1;
+                    return true;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
+pub fn strmap_len(m: view<StrU32Map>) -> usize {
+    m.raw.live
+}
+
+pub fn strmap_is_empty(m: view<StrU32Map>) -> bool {
+    m.raw.live == 0
+}
+
+pub fn strmap_clear(m: mut_view<StrU32Map>) {
+    rawmap_clear(mut_view(m.raw));
+}
+
+pub fn strmap_free(m: mut_view<StrU32Map>) {
+    rawmap_free(mut_view(m.raw));
+}
+fn check_order(m: view<U32Map>, expected: *const u32, expected_len: usize) -> bool {
+    let mut count = 0;
+    let mut i = 0;
+    while i < m.raw.len {
+        let is_alive = unsafe { *(m.raw.alive + i) };
+        if is_alive != 0 {
+            if count >= expected_len {
+                return false;
+            }
+            let entry = unsafe { (m.raw.entries as *const U32Entry) + i };
+            let k = unsafe { (*entry).key };
+            let exp_k = unsafe { *(expected + count) };
+            if k != exp_k {
+                return false;
+            }
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count == expected_len
+}
+
+fn test_kernel_order_delete_reinsert() -> i32 {
+    let mut m = u32map_new();
+
+    // 1. Insert [50->1, 10->2, 40->3, 20->4, 30->5]
+    u32map_insert(mut_view(m), 50, 1);
+    u32map_insert(mut_view(m), 10, 2);
+    u32map_insert(mut_view(m), 40, 3);
+    u32map_insert(mut_view(m), 20, 4);
+    u32map_insert(mut_view(m), 30, 5);
+
+    if u32map_len(view(m)) != 5 { return 1; }
+
+    let exp1: [5]u32 = [50, 10, 40, 20, 30];
+    if !check_order(view(m), unsafe { address_of(exp1[0]) }, 5) { return 2; }
+
+    // 2. Update 40 -> 99: position must remain unchanged!
+    let inserted_new = u32map_insert(mut_view(m), 40, 99);
+    if inserted_new { return 3; }
+    if !check_order(view(m), unsafe { address_of(exp1[0]) }, 5) { return 4; }
+
+    // 3. Delete 10 -> order becomes [50, 40, 20, 30]
+    let mut out_v: u32 = 0;
+    if !u32map_remove(mut_view(m), 10, mut_view(out_v)) { return 5; }
+    if out_v != 2 { return 6; }
+    let exp2: [4]u32 = [50, 40, 20, 30];
+    if !check_order(view(m), unsafe { address_of(exp2[0]) }, 4) { return 7; }
+
+    // 4. Re-insert 10 -> 7: 10 must be appended at the end!
+    u32map_insert(mut_view(m), 10, 7);
+    let exp3: [5]u32 = [50, 40, 20, 30, 10];
+    if !check_order(view(m), unsafe { address_of(exp3[0]) }, 5) { return 8; }
+
+    // 5. Delete 50 & 10 -> order becomes [40, 20, 30]
+    if !u32map_remove(mut_view(m), 50, mut_view(out_v)) { return 9; }
+    if !u32map_remove(mut_view(m), 10, mut_view(out_v)) { return 10; }
+    let exp4: [3]u32 = [40, 20, 30];
+    if !check_order(view(m), unsafe { address_of(exp4[0]) }, 3) { return 11; }
+
+    // 6. Insert 60 -> 6: order becomes [40, 20, 30, 60]
+    u32map_insert(mut_view(m), 60, 6);
+    let exp5: [4]u32 = [40, 20, 30, 60];
+    if !check_order(view(m), unsafe { address_of(exp5[0]) }, 4) { return 12; }
+
+    // Verify all lookups
+    match u32map_get(view(m), 40) {
+        Option.Some(v) => { if v != 99 { return 13; } },
+        Option.None => { return 14; },
+    }
+    match u32map_get(view(m), 20) {
+        Option.Some(v) => { if v != 4 { return 15; } },
+        Option.None => { return 16; },
+    }
+    match u32map_get(view(m), 30) {
+        Option.Some(v) => { if v != 5 { return 17; } },
+        Option.None => { return 18; },
+    }
+    match u32map_get(view(m), 60) {
+        Option.Some(v) => { if v != 6 { return 19; } },
+        Option.None => { return 20; },
+    }
+    if u32map_contains(view(m), 10) { return 21; }
+    if u32map_contains(view(m), 50) { return 22; }
+
+    u32map_free(mut_view(m));
+    0
+}
+
+fn test_compaction_order() -> i32 {
+    let mut m = u32map_new();
+    // Insert 16 items: 100 to 115
+    let mut i: u32 = 0;
+    while i < 16 {
+        u32map_insert(mut_view(m), 100 + i, i);
+        i = i + 1;
+    }
+    // Delete first 8 items: 100..107
+    let mut out_v: u32 = 0;
+    i = 0;
+    while i < 8 {
+        u32map_remove(mut_view(m), 100 + i, mut_view(out_v));
+        i = i + 1;
+    }
+    // Now dead == 8 and dead*2 >= len(16).
+    // Next insert should trigger compaction!
+    u32map_insert(mut_view(m), 200, 200);
+
+    // Remaining order must be [108, 109, 110, 111, 112, 113, 114, 115, 200]
+    let exp: [9]u32 = [108, 109, 110, 111, 112, 113, 114, 115, 200];
+    if !check_order(view(m), unsafe { address_of(exp[0]) }, 9) {
+        return 30;
+    }
+
+    u32map_free(mut_view(m));
+    0
+}
+
+fn main() -> i32 {
+    let rc1 = test_kernel_order_delete_reinsert();
+    if rc1 != 0 { return rc1; }
+
+    let rc2 = test_compaction_order();
+    if rc2 != 0 { return rc2; }
+
+    print("OK HashMapOrder\n");
+    0
+}

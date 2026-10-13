@@ -1,0 +1,649 @@
+// test: run
+// stdout: OK HashSet\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.option.Option
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(a: u64, b: u32) -> u64 { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic pub unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+const AXH_K1: u64 = 0x9E3779B97F4A7C15;
+const AXH_K2: u64 = 0xC2B2AE3D27D4EB4F;
+const AXH_K3: u64 = 0x165667B19E3779F9;
+const AXH_SEED: u64 = 0x27D4EB2F165667C5;
+const AXH_M: u64 = 0x9FB21C651E98DF25;
+
+fn axh_round(h: u64, w: u64) -> u64 {
+    let m = wrapping_mul_u64(rotate_left_u64(wrapping_mul_u64(w, AXH_K2), 31), AXH_K1);
+    wrapping_add_u64(wrapping_mul_u64(rotate_left_u64(h ^ m, 27), AXH_K1), AXH_K3)
+}
+
+fn axh_fold(h: u64) -> u64 {
+    h ^ rotate_left_u64(h, 15) ^ rotate_left_u64(h, 40)
+}
+
+fn axh_avalanche(mut h: u64) -> u64 {
+    h = wrapping_mul_u64(axh_fold(h), AXH_M);
+    h = wrapping_mul_u64(axh_fold(h), AXH_K2);
+    axh_fold(h)
+}
+
+pub fn ax_hash_u32(v: u32) -> u64 {
+    let mut h = AXH_SEED;
+    let w = v as u64;
+    h = axh_round(h, w);
+    h = h ^ (wrapping_mul_u64(4, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub fn ax_hash_bytes(bytes: *const u8, byte_len: usize) -> u64 {
+    let mut h = AXH_SEED;
+    let mut offset: usize = 0;
+    let mut rem = byte_len;
+    while rem >= 8 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < 8 {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+        offset = offset + 8;
+        rem = rem - 8;
+    }
+    if rem > 0 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < rem {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+    }
+    h = h ^ (wrapping_mul_u64(byte_len as u64, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub const AX_SET_TOMBSTONE: u32 = 0xFFFFFFFF;
+
+pub struct AxRawSet {
+    pub entries: *mut u8,
+    pub hashes: *mut u64,
+    pub alive: *mut u8,
+    pub entry_size: usize,
+    pub len: usize,
+    pub live: usize,
+    pub cap: usize,
+    pub index: *mut u32,
+    pub index_cap: usize,
+    pub index_used: usize,
+}
+
+pub fn rawset_init(s: mut_view<AxRawSet>, entry_size: usize) {
+    s.entries = 0 as *mut u8;
+    s.hashes = 0 as *mut u64;
+    s.alive = 0 as *mut u8;
+    s.entry_size = entry_size;
+    s.len = 0;
+    s.live = 0;
+    s.cap = 0;
+    s.index = 0 as *mut u32;
+    s.index_cap = 0;
+    s.index_used = 0;
+}
+
+pub fn rawset_free(s: mut_view<AxRawSet>) {
+    let esz = s.entry_size;
+    if s.cap > 0 {
+        if s.entries as usize != 0 {
+            unsafe { heap_free(s.entries, s.cap * esz, 8); }
+        }
+        if s.hashes as usize != 0 {
+            unsafe { heap_free(s.hashes as *mut u8, s.cap * 8, 8); }
+        }
+        if s.alive as usize != 0 {
+            unsafe { heap_free(s.alive, s.cap, 1); }
+        }
+    }
+    if s.index_cap > 0 && s.index as usize != 0 {
+        unsafe { heap_free(s.index as *mut u8, s.index_cap * 4, 4); }
+    }
+    rawset_init(s, esz);
+}
+
+pub fn rawset_clear(s: mut_view<AxRawSet>) {
+    s.len = 0;
+    s.live = 0;
+    s.index_used = 0;
+    if s.index as usize != 0 {
+        let mut i: usize = 0;
+        while i < s.index_cap {
+            unsafe { *(s.index + i) = 0u32; }
+            i = i + 1;
+        }
+    }
+}
+
+fn index_put(index: *mut u32, cap: usize, hash: u64, entry: usize) {
+    let mask = cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while unsafe { *(index + slot) } != 0 && unsafe { *(index + slot) } != AX_SET_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    unsafe { *(index + slot) = (entry + 1) as u32; }
+}
+
+fn index_rebuild(s: mut_view<AxRawSet>) {
+    let mut cap: usize = 8;
+    while (s.live + 1) * 2 > cap {
+        cap = cap * 2;
+    }
+    if s.index as usize != 0 {
+        unsafe { heap_free(s.index as *mut u8, s.index_cap * 4, 4); }
+    }
+    let raw = unsafe { heap_alloc(cap * 4, 4) };
+    let new_idx = raw as *mut u32;
+    let mut j: usize = 0;
+    while j < cap {
+        unsafe { *(new_idx + j) = 0u32; }
+        j = j + 1;
+    }
+    s.index = new_idx;
+    s.index_cap = cap;
+    s.index_used = 0;
+    let mut i: usize = 0;
+    while i < s.len {
+        if unsafe { *(s.alive + i) } != 0 {
+            let h = unsafe { *(s.hashes + i) };
+            index_put(s.index, cap, h, i);
+            s.index_used = s.index_used + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn rawset_compact(s: mut_view<AxRawSet>) {
+    let mut w: usize = 0;
+    let mut r: usize = 0;
+    let esz = s.entry_size;
+    while r < s.len {
+        if unsafe { *(s.alive + r) } != 0 {
+            if w != r {
+                unsafe {
+                    ptr_copy_nonoverlapping<u8>((s.entries + r * esz) as *const u8, s.entries + w * esz, esz);
+                    *(s.hashes + w) = *(s.hashes + r);
+                    *(s.alive + w) = 1u8;
+                }
+            }
+            w = w + 1;
+        }
+        r = r + 1;
+    }
+    s.len = w;
+    index_rebuild(s);
+}
+
+// U32 HashSet
+pub struct U32Set {
+    pub raw: AxRawSet,
+}
+
+pub fn u32set_new() -> U32Set {
+    let mut s = U32Set {
+        raw: AxRawSet {
+            entries: 0 as *mut u8,
+            hashes: 0 as *mut u64,
+            alive: 0 as *mut u8,
+            entry_size: 4,
+            len: 0,
+            live: 0,
+            cap: 0,
+            index: 0 as *mut u32,
+            index_cap: 0,
+            index_used: 0,
+        }
+    };
+    rawset_init(mut_view(s.raw), 4);
+    s
+}
+
+pub fn u32set_with_capacity(capacity: usize) -> U32Set {
+    let mut s = u32set_new();
+    if capacity > 0 {
+        let esz = 4;
+        s.raw.entries = unsafe { heap_alloc(capacity * esz, 4) };
+        s.raw.hashes = unsafe { heap_alloc(capacity * 8, 8) } as *mut u64;
+        s.raw.alive = unsafe { heap_alloc(capacity, 1) };
+        s.raw.cap = capacity;
+    }
+    s
+}
+
+pub fn u32set_find(s: view<U32Set>, hash: u64, val: u32) -> usize {
+    let _ = s.raw.len;
+    if s.raw.index_cap == 0 || s.raw.live == 0 {
+        return 0xFFFFFFFF;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while true {
+        let entry_idx_plus_1 = unsafe { *(s.raw.index + slot) };
+        if entry_idx_plus_1 == 0 {
+            return 0xFFFFFFFF;
+        }
+        if entry_idx_plus_1 != AX_SET_TOMBSTONE {
+            let i = (entry_idx_plus_1 - 1) as usize;
+            if unsafe { *(s.raw.hashes + i) } == hash {
+                let entry_val = unsafe { *((s.raw.entries as *const u32) + i) };
+                if entry_val == val {
+                    return i;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    0xFFFFFFFF
+}
+
+pub fn u32set_contains(s: view<U32Set>, val: u32) -> bool {
+    let h = ax_hash_u32(val);
+    u32set_find(s, h, val) != 0xFFFFFFFF
+}
+
+pub fn u32set_insert(s: mut_view<U32Set>, val: u32) -> bool {
+    let h = ax_hash_u32(val);
+    let found = u32set_find(view(*s), h, val);
+    if found != 0xFFFFFFFF {
+        return false;
+    }
+    let dead = s.raw.len - s.raw.live;
+    if dead >= 8 && dead * 2 >= s.raw.len {
+        rawset_compact(mut_view(s.raw));
+    }
+    if s.raw.len == s.raw.cap {
+        let mut new_cap = if s.raw.cap == 0 { 8 } else { s.raw.cap * 2 };
+        let new_entries = unsafe { heap_alloc(new_cap * 4, 4) };
+        let new_hashes = unsafe { heap_alloc(new_cap * 8, 8) } as *mut u64;
+        let new_alive = unsafe { heap_alloc(new_cap, 1) };
+        if s.raw.len > 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(s.raw.entries as *const u8, new_entries, s.raw.len * 4);
+                ptr_copy_nonoverlapping<u8>(s.raw.hashes as *const u8, new_hashes as *mut u8, s.raw.len * 8);
+                ptr_copy_nonoverlapping<u8>(s.raw.alive as *const u8, new_alive, s.raw.len);
+                heap_free(s.raw.entries, s.raw.cap * 4, 4);
+                heap_free(s.raw.hashes as *mut u8, s.raw.cap * 8, 8);
+                heap_free(s.raw.alive, s.raw.cap, 1);
+            }
+        }
+        s.raw.entries = new_entries;
+        s.raw.hashes = new_hashes;
+        s.raw.alive = new_alive;
+        s.raw.cap = new_cap;
+    }
+    if s.raw.index_cap == 0 || (s.raw.index_used + 1) * 4 > s.raw.index_cap * 3 {
+        index_rebuild(mut_view(s.raw));
+    }
+    let i = s.raw.len;
+    s.raw.len = s.raw.len + 1;
+    s.raw.live = s.raw.live + 1;
+    unsafe {
+        *((s.raw.entries as *mut u32) + i) = val;
+        *(s.raw.hashes + i) = h;
+        *(s.raw.alive + i) = 1u8;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while unsafe { *(s.raw.index + slot) } != 0 && unsafe { *(s.raw.index + slot) } != AX_SET_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    if unsafe { *(s.raw.index + slot) } == 0 {
+        s.raw.index_used = s.raw.index_used + 1;
+    }
+    unsafe { *(s.raw.index + slot) = (i + 1) as u32; }
+    true
+}
+
+pub fn u32set_remove(s: mut_view<U32Set>, val: u32) -> bool {
+    let h = ax_hash_u32(val);
+    if s.raw.index_cap == 0 || s.raw.live == 0 {
+        return false;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let entry_idx_plus_1 = unsafe { *(s.raw.index + slot) };
+        if entry_idx_plus_1 == 0 {
+            return false;
+        }
+        if entry_idx_plus_1 != AX_SET_TOMBSTONE {
+            let i = (entry_idx_plus_1 - 1) as usize;
+            if unsafe { *(s.raw.hashes + i) } == h {
+                let entry_val = unsafe { *((s.raw.entries as *const u32) + i) };
+                if entry_val == val {
+                    unsafe {
+                        *(s.raw.index + slot) = AX_SET_TOMBSTONE;
+                        *(s.raw.alive + i) = 0u8;
+                    }
+                    s.raw.live = s.raw.live - 1;
+                    return true;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
+pub fn u32set_len(s: view<U32Set>) -> usize {
+    s.raw.live
+}
+
+pub fn u32set_is_empty(s: view<U32Set>) -> bool {
+    s.raw.live == 0
+}
+
+pub fn u32set_clear(s: mut_view<U32Set>) {
+    rawset_clear(mut_view(s.raw));
+}
+
+pub fn u32set_free(s: mut_view<U32Set>) {
+    rawset_free(mut_view(s.raw));
+}
+
+// Str Set
+pub struct StrSet {
+    pub raw: AxRawSet,
+}
+
+fn str_eq(a: view<Str>, b: view<Str>) -> bool {
+    let n = len(*a);
+    if n != len(*b) {
+        return false;
+    }
+    let pa = unsafe { *(address_of(*a) as *const *const u8) };
+    let pb = unsafe { *(address_of(*b) as *const *const u8) };
+    let mut i: usize = 0;
+    while i < n {
+        if unsafe { *(pa + i) } != unsafe { *(pb + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn strset_new() -> StrSet {
+    let mut s = StrSet {
+        raw: AxRawSet {
+            entries: 0 as *mut u8,
+            hashes: 0 as *mut u64,
+            alive: 0 as *mut u8,
+            entry_size: 16,
+            len: 0,
+            live: 0,
+            cap: 0,
+            index: 0 as *mut u32,
+            index_cap: 0,
+            index_used: 0,
+        }
+    };
+    rawset_init(mut_view(s.raw), 16);
+    s
+}
+
+pub fn strset_find(s: view<StrSet>, hash: u64, val: view<Str>) -> usize {
+    if s.raw.index_cap == 0 || s.raw.live == 0 {
+        return 0xFFFFFFFF;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (hash as usize) & mask;
+    while true {
+        let entry_idx_plus_1 = unsafe { *(s.raw.index + slot) };
+        if entry_idx_plus_1 == 0 {
+            return 0xFFFFFFFF;
+        }
+        if entry_idx_plus_1 != AX_SET_TOMBSTONE {
+            let i = (entry_idx_plus_1 - 1) as usize;
+            if unsafe { *(s.raw.hashes + i) } == hash {
+                let entry_val = unsafe { *((s.raw.entries as *const Str) + i) };
+                let eq = unsafe { str_eq(view(entry_val), val) };
+                if eq {
+                    return i;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    0xFFFFFFFF
+}
+
+pub fn strset_contains(s: view<StrSet>, val: view<Str>) -> bool {
+    let p_k = unsafe { *(address_of(*val) as *const *const u8) };
+    let n_k = len(*val);
+    let h = ax_hash_bytes(p_k, n_k);
+    strset_find(s, h, val) != 0xFFFFFFFF
+}
+
+pub fn strset_insert(s: mut_view<StrSet>, val: Str) -> bool {
+    let p_k = unsafe { *(address_of(val) as *const *const u8) };
+    let n_k = len(val);
+    let h = ax_hash_bytes(p_k, n_k);
+    let found = {
+        let v_val = view(val);
+        strset_find(view(*s), h, v_val)
+    };
+    if found != 0xFFFFFFFF {
+        return false;
+    }
+    let dead = s.raw.len - s.raw.live;
+    if dead >= 8 && dead * 2 >= s.raw.len {
+        rawset_compact(mut_view(s.raw));
+    }
+    let esz = 16;
+    if s.raw.len == s.raw.cap {
+        let mut new_cap = if s.raw.cap == 0 { 8 } else { s.raw.cap * 2 };
+        let new_entries = unsafe { heap_alloc(new_cap * esz, 8) };
+        let new_hashes = unsafe { heap_alloc(new_cap * 8, 8) } as *mut u64;
+        let new_alive = unsafe { heap_alloc(new_cap, 1) };
+        if s.raw.len > 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(s.raw.entries as *const u8, new_entries, s.raw.len * esz);
+                ptr_copy_nonoverlapping<u8>(s.raw.hashes as *const u8, new_hashes as *mut u8, s.raw.len * 8);
+                ptr_copy_nonoverlapping<u8>(s.raw.alive as *const u8, new_alive, s.raw.len);
+                heap_free(s.raw.entries, s.raw.cap * esz, 8);
+                heap_free(s.raw.hashes as *mut u8, s.raw.cap * 8, 8);
+                heap_free(s.raw.alive, s.raw.cap, 1);
+            }
+        }
+        s.raw.entries = new_entries;
+        s.raw.hashes = new_hashes;
+        s.raw.alive = new_alive;
+        s.raw.cap = new_cap;
+    }
+    if s.raw.index_cap == 0 || (s.raw.index_used + 1) * 4 > s.raw.index_cap * 3 {
+        index_rebuild(mut_view(s.raw));
+    }
+    let i = s.raw.len;
+    s.raw.len = s.raw.len + 1;
+    s.raw.live = s.raw.live + 1;
+    let entry = unsafe { (s.raw.entries as *mut Str) + i };
+    unsafe {
+        ptr_copy_nonoverlapping<Str>(address_of(val), entry, 1);
+        *(s.raw.hashes + i) = h;
+        *(s.raw.alive + i) = 1u8;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while unsafe { *(s.raw.index + slot) } != 0 && unsafe { *(s.raw.index + slot) } != AX_SET_TOMBSTONE {
+        slot = (slot + 1) & mask;
+    }
+    if unsafe { *(s.raw.index + slot) } == 0 {
+        s.raw.index_used = s.raw.index_used + 1;
+    }
+    unsafe { *(s.raw.index + slot) = (i + 1) as u32; }
+    true
+}
+
+pub fn strset_remove(s: mut_view<StrSet>, val: view<Str>) -> bool {
+    let p_k = unsafe { *(address_of(*val) as *const *const u8) };
+    let n_k = len(*val);
+    let h = ax_hash_bytes(p_k, n_k);
+    if s.raw.index_cap == 0 || s.raw.live == 0 {
+        return false;
+    }
+    let mask = s.raw.index_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let entry_idx_plus_1 = unsafe { *(s.raw.index + slot) };
+        if entry_idx_plus_1 == 0 {
+            return false;
+        }
+        if entry_idx_plus_1 != AX_SET_TOMBSTONE {
+            let i = (entry_idx_plus_1 - 1) as usize;
+            if unsafe { *(s.raw.hashes + i) } == h {
+                let entry_val = unsafe { *((s.raw.entries as *const Str) + i) };
+                let eq = unsafe { str_eq(view(entry_val), val) };
+                if eq {
+                    unsafe {
+                        *(s.raw.index + slot) = AX_SET_TOMBSTONE;
+                        *(s.raw.alive + i) = 0u8;
+                    }
+                    s.raw.live = s.raw.live - 1;
+                    return true;
+                }
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    false
+}
+
+pub fn strset_len(s: view<StrSet>) -> usize {
+    s.raw.live
+}
+
+pub fn strset_is_empty(s: view<StrSet>) -> bool {
+    s.raw.live == 0
+}
+
+pub fn strset_clear(s: mut_view<StrSet>) {
+    rawset_clear(mut_view(s.raw));
+}
+
+pub fn strset_free(s: mut_view<StrSet>) {
+    rawset_free(mut_view(s.raw));
+}
+fn check_set_order(s: view<U32Set>, expected: *const u32, expected_len: usize) -> bool {
+    let mut count = 0;
+    let mut i = 0;
+    while i < s.raw.len {
+        let is_alive = unsafe { *(s.raw.alive + i) };
+        if is_alive != 0 {
+            if count >= expected_len {
+                return false;
+            }
+            let val = unsafe { *((s.raw.entries as *const u32) + i) };
+            let exp_val = unsafe { *(expected + count) };
+            if val != exp_val {
+                return false;
+            }
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count == expected_len
+}
+
+fn test_hash_set() -> i32 {
+    let mut s = u32set_new();
+
+    // 1. Insert elements
+    u32set_insert(mut_view(s), 10);
+    u32set_insert(mut_view(s), 20);
+    u32set_insert(mut_view(s), 30);
+    u32set_insert(mut_view(s), 40);
+
+    if u32set_len(view(s)) != 4 { return 5; }
+
+    // Deduplication: duplicate insert must return false and keep len
+    if u32set_insert(mut_view(s), 20) { return 6; }
+    if u32set_len(view(s)) != 4 { return 7; }
+
+    // Check order: [10, 20, 30, 40]
+    let exp1: [4]u32 = [10, 20, 30, 40];
+    if !check_set_order(view(s), unsafe { address_of(exp1[0]) }, 4) { return 8; }
+
+    // Contains
+    if !u32set_contains(view(s), 10) { return 9; }
+    if !u32set_contains(view(s), 20) { return 10; }
+    if !u32set_contains(view(s), 30) { return 11; }
+    if !u32set_contains(view(s), 40) { return 12; }
+    if u32set_contains(view(s), 50) { return 13; }
+
+    // Remove 20
+    if !u32set_remove(mut_view(s), 20) { return 14; }
+    if u32set_contains(view(s), 20) { return 15; }
+    if u32set_len(view(s)) != 3 { return 16; }
+
+    // Order after remove: [10, 30, 40]
+    let exp2: [3]u32 = [10, 30, 40];
+    if !check_set_order(view(s), unsafe { address_of(exp2[0]) }, 3) { return 17; }
+
+    // Re-insert 20: goes to the end -> [10, 30, 40, 20]
+    if !u32set_insert(mut_view(s), 20) { return 18; }
+    let exp3: [4]u32 = [10, 30, 40, 20];
+    if !check_set_order(view(s), unsafe { address_of(exp3[0]) }, 4) { return 19; }
+
+    // Clear and reuse
+    u32set_clear(mut_view(s));
+    if u32set_len(view(s)) != 0 { return 20; }
+    if u32set_contains(view(s), 10) { return 21; }
+
+    // Re-insert into cleared set
+    u32set_insert(mut_view(s), 100);
+    u32set_insert(mut_view(s), 200);
+    if u32set_len(view(s)) != 2 { return 22; }
+    if !u32set_contains(view(s), 100) { return 23; }
+    if !u32set_contains(view(s), 200) { return 24; }
+
+    u32set_free(mut_view(s));
+    0
+}
+
+fn main() -> i32 {
+    let rc = test_hash_set();
+    if rc != 0 {
+        return rc;
+    }
+    print("OK HashSet\n");
+    0
+}
