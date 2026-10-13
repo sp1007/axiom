@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T061, T060, T061a, T061b, T061c, T061d]
 priority: 84
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p7, tools/progfuzz.py]
 spec: [0017, 0026, 0114]
+started: 2026-10-13 18:22:03
+finished: 2026-10-13 18:59:17
 ---
 # T062 — P7 gate: abstraction conformance + generated-program fuzzing
 
@@ -34,3 +36,7 @@ Validate generics/traits/closures/modules together (dyn is E14.4).
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 18:22:03 started (attempt 1) 
+- 2026-10-13 18:59:17 accepted by QA -> done
