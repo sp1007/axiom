@@ -11,7 +11,7 @@ priority: 81
 status: doing
 attempts: 1
 paths: [bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/const, bootstrap/axiom0/src/mir, tests/run/comptime, tests/ui/comptime]
-locks: [bootstrap/axiom0/src/diag/codes/CONST.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
+locks: [bootstrap/axiom0/src/diag/codes/CONST.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/types/types.h]
 spec: [0102, 0140, tasks/0274, tasks/0509, tasks/0346]
 started: 2026-10-13 13:26:45
 ---
