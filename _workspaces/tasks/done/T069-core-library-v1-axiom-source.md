@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T056, T060, T059, T061, T061b]
 priority: 100
-status: doing
+status: done
 attempts: 1
 paths: [std/core, tests/std/core]
 spec: [0169, 0170, 0219, tasks/0303, tasks/0305, tasks/0353]
 covers: [REQ-STD-170]
 started: 2026-10-13 16:33:04
+finished: 2026-10-13 19:01:25
 ---
 # T069 — core library v1 (Axiom source)
 
@@ -43,3 +44,4 @@ The OS-independent core every Axiom program can use.
 ## Log
 - 2026-10-06 02:31:20 covers += REQ-STD-170 (metadata only)
 - 2026-10-13 16:33:04 started (attempt 1) 
+- 2026-10-13 19:01:25 accepted by QA -> done
