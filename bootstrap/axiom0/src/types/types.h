@@ -238,6 +238,7 @@ AX_DEFINE_HASHMAP(AxParamTypeMap, AxHirParamPtr, TypeId, ax_key_hash_ptr, ax_key
 static inline uint64_t ax_key_hash_symbol(const AxSymbolId *k) { return ax_key_hash_u32(&k->v); }
 static inline bool ax_key_eq_symbol(const AxSymbolId *a, const AxSymbolId *b) { return a->v == b->v; }
 AX_DEFINE_HASHMAP(AxSymbolTypeMap, AxSymbolId, TypeId, ax_key_hash_symbol, ax_key_eq_symbol);
+AX_DEFINE_HASHMAP(AxSymbolConstMap, AxSymbolId, uint64_t, ax_key_hash_symbol, ax_key_eq_symbol);
 
 typedef struct AxGenericArgs {
     TypeId *args;
@@ -257,6 +258,7 @@ typedef struct AxThir {
     AxItemTypeMap item_types;
     AxParamTypeMap param_types;
     AxSymbolTypeMap symbol_types;
+    AxSymbolConstMap symbol_consts;
     AxExprSubstMap expr_substs;
     AxPatSubstMap pat_substs;
 } AxThir;

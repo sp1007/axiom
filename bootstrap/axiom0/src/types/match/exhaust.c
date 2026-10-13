@@ -175,37 +175,46 @@ void ax_match_check_exhaustiveness(AxThir *thir, StrInterner *str_in, const Sour
         for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
             StrView vname = {0};
             if (arm->pat->kind == AX_HIR_PAT_PATH) {
-                StrView name = ax_source_db_span_text(db, arm->pat->path.path.span);
+                StrView name = (arm->pat->path.path.span.file.v != 0) ? ax_source_db_span_text(db, arm->pat->path.path.span) : (StrView){0};
                 vname = name;
-                const char *dot = memchr(name.ptr, '.', name.len);
-                if (dot) {
-                    vname.ptr = dot + 1;
-                    vname.len = name.len - (dot - name.ptr) - 1;
+                if (name.len > 0) {
+                    const char *dot = memchr(name.ptr, '.', name.len);
+                    if (dot) {
+                        vname.ptr = dot + 1;
+                        vname.len = name.len - (dot - name.ptr) - 1;
+                    }
+                }
+                if (vname.len == 0 && arm->pat->path.path.name.v != 0) {
+                    vname = ax_interner_get(str_in, arm->pat->path.path.name);
                 }
             } else if (arm->pat->kind == AX_HIR_PAT_STRUCT) {
-                StrView name = ax_source_db_span_text(db, arm->pat->struct_pat.path.span);
+                StrView name = (arm->pat->struct_pat.path.span.file.v != 0) ? ax_source_db_span_text(db, arm->pat->struct_pat.path.span) : (StrView){0};
                 vname = name;
-                const char *dot = memchr(name.ptr, '.', name.len);
-                if (dot) {
-                    vname.ptr = dot + 1;
-                    vname.len = name.len - (dot - name.ptr) - 1;
+                if (name.len > 0) {
+                    const char *dot = memchr(name.ptr, '.', name.len);
+                    if (dot) {
+                        vname.ptr = dot + 1;
+                        vname.len = name.len - (dot - name.ptr) - 1;
+                    }
+                }
+                if (vname.len == 0 && arm->pat->struct_pat.path.name.v != 0) {
+                    vname = ax_interner_get(str_in, arm->pat->struct_pat.path.name);
                 }
             }
 
             if (vname.ptr) {
                 size_t vidx = 0;
-                StrView name = (arm->pat->kind == AX_HIR_PAT_PATH) ? ax_source_db_span_text(db, arm->pat->path.path.span) : ax_source_db_span_text(db, arm->pat->struct_pat.path.span);
+                StrView name = (arm->pat->kind == AX_HIR_PAT_PATH) ?
+                    ((arm->pat->path.path.span.file.v != 0) ? ax_source_db_span_text(db, arm->pat->path.path.span) : (StrView){0}) :
+                    ((arm->pat->struct_pat.path.span.file.v != 0) ? ax_source_db_span_text(db, arm->pat->struct_pat.path.span) : (StrView){0});
                 bool enum_matches = true;
-                const char *dot = memchr(name.ptr, '.', name.len);
-                if (dot) {
-                    StrView ename;
-                    ename.ptr = name.ptr;
-                    ename.len = dot - name.ptr;
-                    StrView expected_ename = ax_interner_get(str_in, t->enm.def->enum_decl.name);
-                    // Just a basic check: if it has a dot, the part before the last dot should end with expected_ename.
-                    // For axiom0, it's just EnumName.VariantName.
-                    if (ename.len < expected_ename.len || !ax_sv_eq_cstr((StrView){ename.ptr + ename.len - expected_ename.len, expected_ename.len}, expected_ename.ptr)) { // rough check
-                        // better to just use sv_eq
+                if (name.len > 0) {
+                    const char *dot = memchr(name.ptr, '.', name.len);
+                    if (dot) {
+                        StrView ename;
+                        ename.ptr = name.ptr;
+                        ename.len = dot - name.ptr;
+                        StrView expected_ename = ax_interner_get(str_in, t->enm.def->enum_decl.name);
                         if (!ax_sv_eq(ename, expected_ename)) {
                             enum_matches = false;
                         }

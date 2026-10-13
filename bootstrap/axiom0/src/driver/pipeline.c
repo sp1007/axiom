@@ -289,13 +289,19 @@ static void stage_hir(AxDriverState *st) {
     AxHirItem *tail = st->hir.items;
     if (tail) {
         while (tail->next) tail = tail->next;
-        for (AxHirItem *it = st->hir.items; it; it = it->next) {
+        AxHirItem *orig_tail = tail;
+        for (AxHirItem *it = st->hir.items; it && it != orig_tail->next; it = it->next) {
             if (it->kind == AX_HIR_ITEM_IMPL && it->impl.members) {
                 // BOOTSTRAP-SHORTCUT T131: Mangle destructor names
                 if (it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
                     StrView trait_name = ax_source_db_span_text(&st->db, it->impl.trait_path->span);
                     if (trait_name.len == 4 && memcmp(trait_name.ptr, "Drop", 4) == 0) {
                         StrView self_name = ax_source_db_span_text(&st->db, it->impl.self_type->path.path.span);
+                        size_t less_idx = 0;
+                        while (less_idx < self_name.len && self_name.ptr[less_idx] != '<') {
+                            less_idx++;
+                        }
+                        self_name.len = less_idx;
                         char mangled[256];
                         snprintf(mangled, sizeof(mangled), "%.*s_drop", (int)self_name.len, self_name.ptr);
                         StrId mangled_id = ax_intern_cstr(&st->interner, mangled);
@@ -313,8 +319,13 @@ static void stage_hir(AxDriverState *st) {
                     }
                 }
                 
-                tail->next = it->impl.members;
-                while (tail->next) tail = tail->next;
+                for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                    AxHirItem *copy = ax_arena_alloc(&st->hir_arena, sizeof(AxHirItem), _Alignof(AxHirItem));
+                    *copy = *m;
+                    copy->next = NULL;
+                    tail->next = copy;
+                    tail = copy;
+                }
             }
         }
     }
@@ -340,7 +351,7 @@ struct AxMirBody *ax_pipeline_get_mir(const struct AxHirItem *it) {
 #include "opt/opt.h"
 
 static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
-    if (it->kind == AX_HIR_ITEM_FN) {
+    if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
         AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, it);
@@ -367,6 +378,15 @@ static void stage_typeck(AxDriverState *st) {
     
     for (AxHirItem *it = st->hir.items; it; it = it->next) {
         build_mir_for_item(st, it);
+        if (it->kind == AX_HIR_ITEM_IMPL) {
+            for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                build_mir_for_item(st, m);
+            }
+        } else if (it->kind == AX_HIR_ITEM_TRAIT) {
+            for (AxHirItem *m = it->trait.members; m; m = m->next) {
+                build_mir_for_item(st, m);
+            }
+        }
     }
 }
 

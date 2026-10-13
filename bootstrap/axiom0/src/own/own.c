@@ -46,7 +46,11 @@ bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in) {
                 StrView attr_name = ax_interner_get(str_in, attr->name);
                 if (attr_name.len == 6 && memcmp(attr_name.ptr, "derive", 6) == 0) {
                     for (const AxHirAttrArg *arg = attr->args; arg; arg = arg->next) {
-                        StrView arg_name = ax_interner_get(str_in, arg->name);
+                        StrView arg_name = {0};
+                        if (arg->name.v != 0) arg_name = ax_interner_get(str_in, arg->name);
+                        else if (arg->expr && arg->expr->kind == AX_HIR_EXPR_PATH) {
+                            if (arg->expr->path.path.name.v != 0) arg_name = ax_interner_get(str_in, arg->expr->path.path.name);
+                        }
                         if (arg_name.len == 4 && memcmp(arg_name.ptr, "Copy", 4) == 0) {
                             return true;
                         }

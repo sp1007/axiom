@@ -37,6 +37,7 @@ static AxHirPath lower_path(LowerCtx *ctx, const AxAstTypePathSegment *seg) {
         p.span.end = last->span.end;
     }
     p.symbol = get_symbol(ctx, last);
+    p.name = last->name;
     p.generic_args = lower_generic_args(ctx, last->generic_args);
     return p;
 }
@@ -717,6 +718,11 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                     hv->span = v->span;
                     hv->name = v->name;
                     hv->is_struct = v->is_struct;
+                    if (AxNodeMap_contains(&ctx->rmap->node_map, v)) {
+                        hv->symbol = *AxNodeMap_get(&ctx->rmap->node_map, v);
+                    } else {
+                        hv->symbol = (AxSymbolId){0};
+                    }
                     if (v->is_struct) {
                         AxHirFieldDecl **ftail = &hv->struct_fields;
                         for (AxAstFieldDecl *f = v->struct_fields; f; f = f->next) {
@@ -741,6 +747,8 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
             case AX_ITEM_TRAIT:
                 hi->kind = AX_HIR_ITEM_TRAIT;
                 hi->trait.name = n->trait.name;
+                hi->trait.symbol = get_symbol(ctx, n);
+                if (hi->trait.symbol.v == 0) hi->trait.symbol.v = ctx->fake_sym_counter++;
                 hi->trait.generic_params = lower_generic_params(ctx, n->trait.generic_params);
                 hi->trait.supertraits = lower_type(ctx, n->trait.supertraits);
                 hi->trait.where_clause = lower_where_clause(ctx, n->trait.where_clause);
@@ -757,12 +765,16 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
             case AX_ITEM_TYPE_ALIAS:
                 hi->kind = AX_HIR_ITEM_TYPE_ALIAS;
                 hi->type_alias.name = n->type_alias.name;
+                hi->type_alias.symbol = get_symbol(ctx, n);
+                if (hi->type_alias.symbol.v == 0) hi->type_alias.symbol.v = ctx->fake_sym_counter++;
                 hi->type_alias.generic_params = lower_generic_params(ctx, n->type_alias.generic_params);
                 hi->type_alias.type = lower_type(ctx, n->type_alias.type);
                 break;
             case AX_ITEM_CONST:
                 hi->kind = AX_HIR_ITEM_CONST;
                 hi->const_decl.name = n->const_decl.name;
+                hi->const_decl.symbol = get_symbol(ctx, n);
+                if (hi->const_decl.symbol.v == 0) hi->const_decl.symbol.v = ctx->fake_sym_counter++;
                 hi->const_decl.type = lower_type(ctx, n->const_decl.type);
                 hi->const_decl.expr = lower_expr(ctx, n->const_decl.expr);
                 break;

@@ -37,6 +37,7 @@ typedef struct AxHirUseTree AxHirUseTree;
 typedef struct AxHirPath {
     Span span;
     AxSymbolId symbol;
+    StrId name;
     AxHirGenericArgs *generic_args;
 } AxHirPath;
 
@@ -460,6 +461,7 @@ struct AxHirVariantDecl {
     AxHirAttr *attrs;
     Span span;
     StrId name;
+    AxSymbolId symbol;
     bool is_struct;
     union {
         AxHirType *tuple_types;
@@ -538,11 +540,13 @@ struct AxHirItem {
         } impl;
         struct {
             StrId name;
+            AxSymbolId symbol;
             AxHirGenericParams *generic_params;
             AxHirType *type;
         } type_alias;
         struct {
             StrId name;
+            AxSymbolId symbol;
             AxHirType *type;
             AxHirExpr *expr;
         } const_decl;

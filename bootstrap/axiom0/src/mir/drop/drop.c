@@ -167,6 +167,11 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
                 StrView trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
                 if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
                     StrView impl_sname = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
+                    size_t less_idx = 0;
+                    while (less_idx < impl_sname.len && impl_sname.ptr[less_idx] != '<') {
+                        less_idx++;
+                    }
+                    impl_sname.len = less_idx;
                     if (ax_sv_eq(target_sname, impl_sname)) {
                         for (AxHirItem *m = it->impl.members; m; m = m->next) {
                             if (m->kind == AX_HIR_ITEM_FN) {

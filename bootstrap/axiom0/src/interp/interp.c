@@ -57,6 +57,13 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
                 }
             }
         }
+        if (it->kind == AX_HIR_ITEM_TRAIT) {
+            for (const AxHirItem *m = it->trait.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == (uint32_t)sym_v) {
+                    return (AxHirItem*)m;
+                }
+            }
+        }
     }
 
     StrId target_name = {0};
@@ -80,6 +87,18 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
             }
             if (target_name.v != 0) break;
         }
+        if (it->kind == AX_ITEM_TRAIT) {
+            for (const AxAstItem *m = it->trait.members; m; m = m->next) {
+                AxSymbolId *m_sym = AxNodeMap_get(&ctx->rmap->node_map, m);
+                if (m_sym && m_sym->v == (uint32_t)sym_v) {
+                    if (m->kind == AX_ITEM_FN) {
+                        target_name = m->fn.name;
+                    }
+                    break;
+                }
+            }
+            if (target_name.v != 0) break;
+        }
     }
     
     if (target_name.v == 0) {
@@ -92,6 +111,13 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
         }
         if (it->kind == AX_HIR_ITEM_IMPL) {
             for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == target_name.v) {
+                    return (AxHirItem*)m;
+                }
+            }
+        }
+        if (it->kind == AX_HIR_ITEM_TRAIT) {
+            for (const AxHirItem *m = it->trait.members; m; m = m->next) {
                 if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == target_name.v) {
                     return (AxHirItem*)m;
                 }
@@ -401,6 +427,24 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                 return;
             }
             #undef IS_OP
+        }
+    }
+
+    if (func->kind == AX_HIR_ITEM_FN && !func->fn.body && ctx->interner) {
+        StrView fname = ax_interner_get(ctx->interner, func->fn.name);
+        for (const AxHirItem *it = ctx->hir->items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_IMPL) {
+                for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_FN && m->fn.body) {
+                        StrView mname = ax_interner_get(ctx->interner, m->fn.name);
+                        if (ax_sv_eq(fname, mname)) {
+                            func = (AxHirItem*)m;
+                            break;
+                        }
+                    }
+                }
+                if (func->fn.body) break;
+            }
         }
     }
 

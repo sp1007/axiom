@@ -101,6 +101,7 @@ typedef struct Env {
     Scope *prelude_scope;
     NamingCtx *naming;
     AxNodeMap resolved_use_trees;
+    const AxAst *ast;
 } Env;
 
 static Scope *push_scope(Env *env, Scope *parent) {
@@ -384,6 +385,107 @@ static void resolve_path_seg(Env *env, Scope *scope, const AxAstTypePathSegment 
                 }
             }
             if (!found) {
+                emit_diag(env, AX_NAME_UNRESOLVED, seg->span);
+                break;
+            }
+        } else if (head_node) {
+            const AxAstItem *target_item = (const AxAstItem*)head_node;
+            const AxAstItem *found_member = NULL;
+            if (target_item->kind == AX_ITEM_IMPL) {
+                for (const AxAstItem *m = target_item->impl.members; m; m = m->next) {
+                    StrId mname = {0};
+                    if (m->kind == AX_ITEM_FN) mname = m->fn.name;
+                    else if (m->kind == AX_ITEM_TYPE_ALIAS) mname = m->type_alias.name;
+                    else if (m->kind == AX_ITEM_CONST) mname = m->const_decl.name;
+                    if (mname.v == seg->name.v) {
+                        found_member = m;
+                        break;
+                    }
+                }
+                if (!found_member && target_item->impl.trait_path && target_item->impl.trait_path->kind == AX_TYPE_PATH) {
+                    StrId tr_name = target_item->impl.trait_path->path.segments->name;
+                    Symbol *tr_sym = lookup_name(env, scope, tr_name);
+                    if (tr_sym && tr_sym->node) {
+                        const AxAstItem *tr = (const AxAstItem*)tr_sym->node;
+                        if (tr->kind == AX_ITEM_TRAIT) {
+                            for (const AxAstItem *m = tr->trait.members; m; m = m->next) {
+                                StrId mname = {0};
+                                if (m->kind == AX_ITEM_FN) mname = m->fn.name;
+                                else if (m->kind == AX_ITEM_TYPE_ALIAS) mname = m->type_alias.name;
+                                else if (m->kind == AX_ITEM_CONST) mname = m->const_decl.name;
+                                if (mname.v == seg->name.v) {
+                                    found_member = m;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if (target_item->kind == AX_ITEM_TRAIT) {
+                for (const AxAstItem *m = target_item->trait.members; m; m = m->next) {
+                    StrId mname = {0};
+                    if (m->kind == AX_ITEM_FN) mname = m->fn.name;
+                    else if (m->kind == AX_ITEM_TYPE_ALIAS) mname = m->type_alias.name;
+                    else if (m->kind == AX_ITEM_CONST) mname = m->const_decl.name;
+                    if (mname.v == seg->name.v) {
+                        found_member = m;
+                        break;
+                    }
+                }
+            } else if (target_item->kind == AX_ITEM_STRUCT) {
+                StrId sname = target_item->struct_decl.name;
+                for (const AxAstItem *it = env->ast ? env->ast->items : NULL; it; it = it->next) {
+                    if (it->kind == AX_ITEM_IMPL && it->impl.self_type && it->impl.self_type->kind == AX_TYPE_PATH) {
+                        if (it->impl.self_type->path.segments->name.v == sname.v) {
+                            for (const AxAstItem *m = it->impl.members; m; m = m->next) {
+                                StrId mname = {0};
+                                if (m->kind == AX_ITEM_FN) mname = m->fn.name;
+                                else if (m->kind == AX_ITEM_TYPE_ALIAS) mname = m->type_alias.name;
+                                else if (m->kind == AX_ITEM_CONST) mname = m->const_decl.name;
+                                if (mname.v == seg->name.v) {
+                                    found_member = m;
+                                    break;
+                                }
+                            }
+                            if (found_member) break;
+                            if (it->impl.trait_path && it->impl.trait_path->kind == AX_TYPE_PATH) {
+                                StrId tr_name = it->impl.trait_path->path.segments->name;
+                                Symbol *tr_sym = lookup_name(env, scope, tr_name);
+                                if (tr_sym && tr_sym->node) {
+                                    const AxAstItem *tr = (const AxAstItem*)tr_sym->node;
+                                    if (tr->kind == AX_ITEM_TRAIT) {
+                                        for (const AxAstItem *m = tr->trait.members; m; m = m->next) {
+                                            StrId mname = {0};
+                                            if (m->kind == AX_ITEM_FN) mname = m->fn.name;
+                                            else if (m->kind == AX_ITEM_TYPE_ALIAS) mname = m->type_alias.name;
+                                            else if (m->kind == AX_ITEM_CONST) mname = m->const_decl.name;
+                                            if (mname.v == seg->name.v) {
+                                                found_member = m;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                if (found_member) break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (found_member) {
+                AxSymbolId *mid = AxNodeMap_get(&env->rmap->node_map, found_member);
+                AxSymbolId sym_id;
+                if (mid && mid->v != 0) {
+                    sym_id = *mid;
+                } else {
+                    sym_id = new_symbol(env, found_member);
+                    bind_node(env, found_member, sym_id);
+                }
+                bind_node(env, seg, sym_id);
+                head_node = found_member;
+                hkind = SYM_ITEM;
+            } else {
                 emit_diag(env, AX_NAME_UNRESOLVED, seg->span);
                 break;
             }
@@ -1071,6 +1173,7 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
     env.sink = sink;
     env.interner = interner;
     env.naming = naming;
+    env.ast = ast;
     AxNodeMap_init(&env.resolved_use_trees);
 
     /* 1. Setup prelude scope */

@@ -130,6 +130,7 @@ void ax_thir_init(AxThir *thir) {
     AxItemTypeMap_init(&thir->item_types);
     AxParamTypeMap_init(&thir->param_types);
     AxSymbolTypeMap_init(&thir->symbol_types);
+    AxSymbolConstMap_init(&thir->symbol_consts);
     AxExprSubstMap_init(&thir->expr_substs);
     AxPatSubstMap_init(&thir->pat_substs);
 }
@@ -137,6 +138,7 @@ void ax_thir_init(AxThir *thir) {
 void ax_thir_free(AxThir *thir) {
     AxPatSubstMap_free(&thir->pat_substs);
     AxExprSubstMap_free(&thir->expr_substs);
+    AxSymbolConstMap_free(&thir->symbol_consts);
     AxSymbolTypeMap_free(&thir->symbol_types);
     AxParamTypeMap_free(&thir->param_types);
     AxItemTypeMap_free(&thir->item_types);

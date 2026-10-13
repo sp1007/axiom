@@ -1389,6 +1389,115 @@ static AxAstVis parse_visibility(Parser *p) {
     return vis;
 }
 
+
+#include "source/source.h"
+
+static AxAstItem *parse_synthetic_item(Parser *p, const char *text) {
+    AxLexResult lex_res = ax_lex((FileId){0}, ax_sv_cstr(text), p->sink, p->interner);
+    Parser sub_p = *p;
+    sub_p.tokens = lex_res.tokens;
+    sub_p.count = lex_res.token_count;
+    sub_p.pos = 0;
+    AxAstItem *item = parse_item(&sub_p);
+    ax_lex_result_free(&lex_res);
+    return item;
+}
+
+static void expand_derives(Parser *p, AxAstItem *item) {
+    if (item->kind != AX_ITEM_STRUCT && item->kind != AX_ITEM_ENUM) return;
+    
+    const char *struct_name = ax_interner_get(p->interner, item->kind == AX_ITEM_STRUCT ? item->struct_decl.name : item->enum_decl.name).ptr;
+    
+    AxAstItem **tail = &item->next;
+    while (*tail) tail = &(*tail)->next;
+    
+    for (AxAstAttr *attr = item->attrs; attr; attr = attr->next) {
+        if (ax_sv_eq(ax_interner_get(p->interner, attr->name), ax_sv_cstr("derive"))) {
+            for (AxAstAttrArg *arg = attr->args; arg; arg = arg->next) {
+                if (arg->expr && arg->expr->kind == AX_EXPR_PATH) {
+                    const char *trait_name = ax_interner_get(p->interner, arg->expr->path.segments->name).ptr;
+                    char buf[4096];
+                    buf[0] = 0;
+                    
+                    if (strcmp(trait_name, "Copy") == 0) {
+                        snprintf(buf, sizeof(buf), "impl Copy for %s {}", struct_name);
+                    } else if (strcmp(trait_name, "Clone") == 0) {
+                        char body[2048] = {0};
+                        if (item->struct_decl.is_tuple) {
+                        } else {
+                            strcat(body, struct_name);
+                            strcat(body, " { ");
+                            for (AxAstFieldDecl *f = item->struct_decl.struct_fields; f; f = f->next) {
+                                const char *fname = ax_interner_get(p->interner, f->name).ptr;
+                                char fbuf[128];
+                                snprintf(fbuf, sizeof(fbuf), "%s: self.%s.clone(), ", fname, fname);
+                                strcat(body, fbuf);
+                            }
+                            strcat(body, "}");
+                        }
+                        snprintf(buf, sizeof(buf), "impl Clone for %s { fn clone(self: view<%s>) -> %s { %s } }", struct_name, struct_name, struct_name, body);
+                    } else if (strcmp(trait_name, "Eq") == 0) {
+                        snprintf(buf, sizeof(buf), "impl Eq for %s {}", struct_name);
+                    } else if (strcmp(trait_name, "PartialEq") == 0) {
+                        char body[2048] = {0};
+                        if (item->struct_decl.struct_fields == NULL) {
+                            strcpy(body, "true");
+                        } else {
+                            for (AxAstFieldDecl *f = item->struct_decl.struct_fields; f; f = f->next) {
+                                const char *fname = ax_interner_get(p->interner, f->name).ptr;
+                                char fbuf[128];
+                                snprintf(fbuf, sizeof(fbuf), "self.%s == other.%s", fname, fname);
+                                strcat(body, fbuf);
+                                if (f->next) strcat(body, " && ");
+                            }
+                        }
+                        snprintf(buf, sizeof(buf), "impl PartialEq for %s { fn eq(self: view<%s>, other: view<%s>) -> bool { %s } }", struct_name, struct_name, struct_name, body);
+                    } else if (strcmp(trait_name, "Hash") == 0) {
+                        char body[2048] = {0};
+                        for (AxAstFieldDecl *f = item->struct_decl.struct_fields; f; f = f->next) {
+                            const char *fname = ax_interner_get(p->interner, f->name).ptr;
+                            char fbuf[128];
+                            snprintf(fbuf, sizeof(fbuf), "self.%s.hash(state); ", fname);
+                            strcat(body, fbuf);
+                        }
+                        snprintf(buf, sizeof(buf), "impl Hash for %s { fn hash<H: Hasher>(self: view<%s>, state: mut_view<H>) { %s } }", struct_name, struct_name, body);
+                    } else if (strcmp(trait_name, "Ord") == 0) {
+                        char body[2048] = {0};
+                        if (item->struct_decl.struct_fields == NULL) {
+                            strcpy(body, "return Ordering.Equal;\n");
+                        } else {
+                            for (AxAstFieldDecl *f = item->struct_decl.struct_fields; f; f = f->next) {
+                                const char *fname = ax_interner_get(p->interner, f->name).ptr;
+                                char fbuf[256];
+                                snprintf(fbuf, sizeof(fbuf), "let c = self.%s.cmp(view(other.%s));\nmatch c { Ordering.Equal => {}, _ => return c, };\n", fname, fname);
+                                strcat(body, fbuf);
+                            }
+                            strcat(body, "return Ordering.Equal;\n");
+                        }
+                        snprintf(buf, sizeof(buf), "impl Ord for %s {\nfn cmp(self: view<%s>, other: view<%s>) -> Ordering {\n%s\n}\n}\n", struct_name, struct_name, struct_name, body);
+                          
+                    } else {
+                        AxDiagnostic d = {0};
+                        d.code = AX_TRAIT_UNKNOWN_DERIVE;
+                        d.severity = AX_DIAG_ERROR;
+                        d.message = "cannot derive unknown trait";
+                        d.primary = arg->expr->span;
+                        ax_diag_sink_report(p->sink, &d);
+                    }
+                    
+                    if (buf[0]) {
+                        AxAstItem *syn = parse_synthetic_item(p, buf);
+                        if (syn && syn->kind != AX_ITEM_ERROR) {
+                            *tail = syn;
+                            while (*tail) tail = &(*tail)->next;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 static AxAstItem *parse_item(Parser *p) {
     if (consume(p, AX_TOK_SEMI)) {
         AxAstItem *empty = NEW_NODE(p, AxAstItem);
@@ -1430,8 +1539,9 @@ static AxAstItem *parse_item(Parser *p) {
         expect(p, AX_TOK_IDENT, AX_PARSE_EXPECTED_TOKEN, "Expected const name");
         expect(p, AX_TOK_COLON, AX_PARSE_EXPECTED_TOKEN, "Expected ':'");
         item->const_decl.type = parse_type(p);
-        expect(p, AX_TOK_EQ, AX_PARSE_EXPECTED_TOKEN, "Expected '='");
-        item->const_decl.expr = parse_expr(p);
+        if (consume(p, AX_TOK_EQ)) {
+            item->const_decl.expr = parse_expr(p);
+        }
         sync_to_term(p);
     } else if (check(p, AX_TOK_KW_STATIC) || (check(p, AX_TOK_KW_UNSAFE) && peek_nth(p, 1)->kind == AX_TOK_KW_STATIC)) {
         bool is_unsafe = consume(p, AX_TOK_KW_UNSAFE);
@@ -1604,7 +1714,7 @@ static AxAstItem *parse_item(Parser *p) {
             AxAstItem **curr = &item->trait.members;
             while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
                 *curr = parse_item(p); // recursive call! It works since traits have fns and types inside
-                curr = &(*curr)->next;
+                while (*curr) curr = &(*curr)->next;
             }
             p->allow_bodiless_fn = old_bodiless;
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
@@ -1631,7 +1741,7 @@ static AxAstItem *parse_item(Parser *p) {
             AxAstItem **curr = &item->impl.members;
             while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
                 *curr = parse_item(p);
-                curr = &(*curr)->next;
+                while (*curr) curr = &(*curr)->next;
             }
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
         } else {
@@ -1669,7 +1779,7 @@ static AxAstItem *parse_item(Parser *p) {
         AxAstItem **curr = &item->extern_block.members;
         while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
             *curr = parse_item(p);
-            curr = &(*curr)->next;
+            while (*curr) curr = &(*curr)->next;
         }
         p->allow_bodiless_fn = old_bodiless;
         expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
@@ -1679,7 +1789,11 @@ static AxAstItem *parse_item(Parser *p) {
         advance(p);
         sync_to_term(p);
     }
-    return item;
+    
+    if (item->kind == AX_ITEM_STRUCT || item->kind == AX_ITEM_ENUM) {
+        expand_derives(p, item);
+    }
+return item;
 }
 
 AxParseResult ax_parse(AxArena *arena, const AxToken *tokens, size_t token_count, AxDiagSink *sink, StrInterner *interner) {
@@ -1698,7 +1812,7 @@ AxParseResult ax_parse(AxArena *arena, const AxToken *tokens, size_t token_count
         AxAstItem *item = parse_item(&p);
         if (item->kind != AX_ITEM_ERROR) {
             *curr_item = item;
-            curr_item = &(*curr_item)->next;
+            while (*curr_item) curr_item = &(*curr_item)->next;
         }
     }
     

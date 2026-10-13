@@ -80,6 +80,8 @@ typedef struct TypeckCtx {
     size_t loops_cap;
 
     const AxHirItem *current_fn;
+    const AxHirItem *current_impl;
+    TypeId self_ty;
 } TypeckCtx;
 
 static bool dotted_name_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
@@ -536,6 +538,30 @@ typedef enum AxTraitResult {
     AX_TRAIT_OVERFLOW
 } AxTraitResult;
 
+static const AxHirItem *find_trait_default_method(TypeckCtx *cx, const AxHirItem *tr, StrView method_name) {
+    if (!tr || tr->kind != AX_HIR_ITEM_TRAIT) return NULL;
+    for (const AxHirItem *m = tr->trait.members; m; m = m->next) {
+        if (m->kind == AX_HIR_ITEM_FN && m->fn.body != NULL) {
+            StrView mname = ax_interner_get(cx->str_in, m->fn.name);
+            if (ax_sv_eq(mname, method_name)) return m;
+        }
+    }
+    for (const AxHirType *st = tr->trait.supertraits; st; st = st->next) {
+        StrView st_name = (st->span.file.v != 0) ? ax_source_db_span_text(cx->db, st->span) : (StrView){0};
+        if (st_name.len == 0 && st->path.path.name.v != 0) st_name = ax_interner_get(cx->str_in, st->path.path.name);
+        for (const AxHirItem *item = cx->hir->items; item; item = item->next) {
+            if (item->kind == AX_HIR_ITEM_TRAIT) {
+                StrView tname = ax_interner_get(cx->str_in, item->trait.name);
+                if (ax_sv_eq(tname, st_name)) {
+                    const AxHirItem *dm = find_trait_default_method(cx, item, method_name);
+                    if (dm) return dm;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView method_name, AxTraitResult *out_res) {
     if (is_error(cx, base_ty)) return NULL;
     const AxHirItem *found = NULL;
@@ -544,7 +570,10 @@ static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView metho
     
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_IMPL) {
+            const AxHirItem *old_impl = cx->current_impl;
+            cx->current_impl = it;
             TypeId self_ty = hir_type_to_typeid(cx, it->impl.self_type);
+            cx->current_impl = old_impl;
             if (is_error(cx, self_ty)) continue;
             
             bool match = false;
@@ -561,12 +590,37 @@ static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView metho
             }
 
             if (match) {
+                bool found_in_impl = false;
                 for (const AxHirItem *m = it->impl.members; m; m = m->next) {
                     if (m->kind == AX_HIR_ITEM_FN) {
                         StrView mname = ax_interner_get(cx->str_in, m->fn.name);
                         if (ax_sv_eq(mname, method_name)) {
                             found = m;
                             matches++;
+                            found_in_impl = true;
+                        }
+                    }
+                }
+                if (!found_in_impl && it->impl.trait_path) {
+                    StrView tr_name = (it->impl.trait_path->span.file.v != 0) ? ax_source_db_span_text(cx->db, it->impl.trait_path->span) : (StrView){0};
+                    if (tr_name.len == 0 && it->impl.trait_path->path.path.name.v != 0) {
+                        tr_name = ax_interner_get(cx->str_in, it->impl.trait_path->path.path.name);
+                    }
+                    for (const AxHirItem *item = cx->hir->items; item; item = item->next) {
+                        if (item->kind == AX_HIR_ITEM_TRAIT) {
+                            bool tr_match = (it->impl.trait_path->path.path.symbol.v != 0 && item->trait.symbol.v == it->impl.trait_path->path.path.symbol.v);
+                            if (!tr_match && tr_name.len > 0) {
+                                StrView tname = ax_interner_get(cx->str_in, item->trait.name);
+                                if (ax_sv_eq(tname, tr_name)) tr_match = true;
+                            }
+                            if (tr_match) {
+                                const AxHirItem *dm = find_trait_default_method(cx, item, method_name);
+                                if (dm) {
+                                    found = dm;
+                                    matches++;
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -886,16 +940,26 @@ static bool type_contains_view(const TypeckCtx *cx, TypeId id, TypeId target) {
 static bool satisfies_bound(TypeckCtx *cx, TypeId arg_ty, AxHirType *bound) {
     if (bound->kind != AX_HIR_TYPE_PATH) return true;
     AxSymbolId trait_sym = bound->path.path.symbol;
+    StrView bound_name = (bound->span.file.v != 0) ? ax_source_db_span_text(cx->db, bound->span) : (StrView){0};
+    if (bound_name.len == 0 && bound->path.path.name.v != 0) bound_name = ax_interner_get(cx->str_in, bound->path.path.name);
 
     const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
     if (t->kind == AX_TY_PARAM || t->kind == AX_TY_VAR || t->kind == AX_TY_INT_VAR) return true;
 
     for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.trait_path->kind == AX_HIR_TYPE_PATH && it->impl.trait_path->path.path.symbol.v == trait_sym.v) {
-            if (it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                AxSymbolId impl_sym = it->impl.self_type->path.path.symbol;
-                if (t->kind == AX_TY_STRUCT && t->strct.def->struct_decl.symbol.v == impl_sym.v) return true;
-                if (t->kind == AX_TY_ENUM && t->enm.def->enum_decl.symbol.v == impl_sym.v) return true;
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.trait_path->kind == AX_HIR_TYPE_PATH) {
+            bool trait_match = (trait_sym.v != 0 && it->impl.trait_path->path.path.symbol.v == trait_sym.v);
+            if (!trait_match && bound_name.len > 0) {
+                StrView it_tr_name = (it->impl.trait_path->span.file.v != 0) ? ax_source_db_span_text(cx->db, it->impl.trait_path->span) : (StrView){0};
+                if (it_tr_name.len == 0 && it->impl.trait_path->path.path.name.v != 0) it_tr_name = ax_interner_get(cx->str_in, it->impl.trait_path->path.path.name);
+                if (ax_sv_eq(bound_name, it_tr_name)) trait_match = true;
+            }
+            if (trait_match && it->impl.self_type) {
+                const AxHirItem *old_impl = cx->current_impl;
+                cx->current_impl = it;
+                TypeId impl_self_ty = hir_type_to_typeid(cx, it->impl.self_type);
+                cx->current_impl = old_impl;
+                if (unify_ty(cx, impl_self_ty, arg_ty)) return true;
             }
         }
     }
@@ -959,6 +1023,40 @@ static void check_all_bounds(TypeckCtx *cx) {
                         d.severity = AX_DIAG_ERROR;
                         d.message = "the trait bound is not satisfied";
                         d.primary = path->generic_args ? path->generic_args->span : expr->span;
+                        ax_diag_sink_report(cx->sink, &d);
+                    }
+                }
+            }
+        }
+    }
+
+    for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path) {
+            StrView tr_name = (it->impl.trait_path->span.file.v != 0) ? ax_source_db_span_text(cx->db, it->impl.trait_path->span) : (StrView){0};
+            if (tr_name.len == 0 && it->impl.trait_path->path.path.name.v != 0) tr_name = ax_interner_get(cx->str_in, it->impl.trait_path->path.path.name);
+            const AxHirItem *tr = NULL;
+            for (const AxHirItem *item = cx->hir->items; item; item = item->next) {
+                if (item->kind == AX_HIR_ITEM_TRAIT) {
+                    bool tr_match = (it->impl.trait_path->path.path.symbol.v != 0 && item->trait.symbol.v == it->impl.trait_path->path.path.symbol.v);
+                    if (!tr_match && tr_name.len > 0) {
+                        StrView tname = ax_interner_get(cx->str_in, item->trait.name);
+                        if (ax_sv_eq(tname, tr_name)) tr_match = true;
+                    }
+                    if (tr_match) { tr = item; break; }
+                }
+            }
+            if (tr) {
+                const AxHirItem *old_impl = cx->current_impl;
+                cx->current_impl = it;
+                TypeId self_ty = hir_type_to_typeid(cx, it->impl.self_type);
+                cx->current_impl = old_impl;
+                for (AxHirType *st = tr->trait.supertraits; st; st = st->next) {
+                    if (!satisfies_bound(cx, self_ty, st)) {
+                        AxDiagnostic d = {0};
+                        d.code = AX_TRAIT_UNSATISFIED_BOUND;
+                        d.severity = AX_DIAG_ERROR;
+                        d.message = "the trait bound is not satisfied";
+                        d.primary = it->span;
                         ax_diag_sink_report(cx->sink, &d);
                     }
                 }
@@ -1130,11 +1228,84 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             }
             TypeId en_ty = ax_intern_type(&thir.interner, &en);
             AxItemTypeMap_insert(&thir.item_types, it, en_ty);
+        } else if (it->kind == AX_HIR_ITEM_IMPL && it->impl.generic_params) {
+            size_t i = 0;
+            for (AxHirGenericParam *p = it->impl.generic_params->params; p; p = p->next) {
+                AxType pt;
+                memset(&pt, 0, sizeof(pt));
+                pt.kind = AX_TY_PARAM;
+                pt.param.name = p->name;
+                pt.param.index = i;
+                TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                if (p->symbol.v != 0) {
+                    AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                }
+                i++;
+            }
+        } else if (it->kind == AX_HIR_ITEM_TRAIT && it->trait.generic_params) {
+            size_t i = 0;
+            for (AxHirGenericParam *p = it->trait.generic_params->params; p; p = p->next) {
+                AxType pt;
+                memset(&pt, 0, sizeof(pt));
+                pt.kind = AX_TY_PARAM;
+                pt.param.name = p->name;
+                pt.param.index = i;
+                TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                if (p->symbol.v != 0) {
+                    AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                }
+                i++;
+            }
+        } else if (it->kind == AX_HIR_ITEM_TYPE_ALIAS && it->type_alias.generic_params) {
+            size_t i = 0;
+            for (AxHirGenericParam *p = it->type_alias.generic_params->params; p; p = p->next) {
+                AxType pt;
+                memset(&pt, 0, sizeof(pt));
+                pt.kind = AX_TY_PARAM;
+                pt.param.name = p->name;
+                pt.param.index = i;
+                TypeId pt_id = ax_intern_type(&thir.interner, &pt);
+                if (p->symbol.v != 0) {
+                    AxSymbolTypeMap_insert(&thir.symbol_types, p->symbol, pt_id);
+                }
+                i++;
+            }
         }
     }
 
     // Pass 1b: Function signatures
     for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
+        if (top_it->kind == AX_HIR_ITEM_IMPL) {
+            cx.current_impl = top_it;
+            if (top_it->impl.self_type) {
+                cx.self_ty = hir_type_to_typeid(&cx, top_it->impl.self_type);
+            } else {
+                cx.self_ty = TypeId_none();
+            }
+        } else if (top_it->kind == AX_HIR_ITEM_FN && top_it->fn.symbol.v != 0) {
+            cx.current_impl = NULL;
+            const AxHirItem *orig_m = NULL;
+            for (const AxHirItem *impl_it = hir->items; impl_it; impl_it = impl_it->next) {
+                if (impl_it->kind == AX_HIR_ITEM_IMPL) {
+                    for (const AxHirItem *m = impl_it->impl.members; m; m = m->next) {
+                        if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == top_it->fn.symbol.v && m != top_it) {
+                            orig_m = m;
+                            break;
+                        }
+                    }
+                    if (orig_m) break;
+                }
+            }
+            if (orig_m) {
+                TypeId *m_ty = AxItemTypeMap_get(&thir.item_types, orig_m);
+                if (m_ty) AxItemTypeMap_insert(&thir.item_types, top_it, *m_ty);
+                continue;
+            }
+            cx.self_ty = TypeId_none();
+        } else {
+            cx.current_impl = NULL;
+            cx.self_ty = TypeId_none();
+        }
         for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
             const AxHirItem *it = (impl_pass == 0) ? top_it : 
                                   (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
@@ -1188,6 +1359,28 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
 
             TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
             AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
+                } else if (it->kind == AX_HIR_ITEM_TYPE_ALIAS) {
+                    TypeId ty = TypeId_none();
+                    if (it->type_alias.type) {
+                        ty = hir_type_to_typeid(&cx, it->type_alias.type);
+                    } else {
+                        AxType pt;
+                        memset(&pt, 0, sizeof(pt));
+                        pt.kind = AX_TY_PARAM;
+                        pt.param.name = it->type_alias.name;
+                        pt.param.index = 0;
+                        ty = ax_intern_type(&thir.interner, &pt);
+                    }
+                    AxItemTypeMap_insert(&thir.item_types, it, ty);
+                    if (it->type_alias.symbol.v != 0) {
+                        AxSymbolTypeMap_insert(&thir.symbol_types, it->type_alias.symbol, ty);
+                    }
+                } else if (it->kind == AX_HIR_ITEM_CONST) {
+                    TypeId ty = hir_type_to_typeid(&cx, it->const_decl.type);
+                    AxItemTypeMap_insert(&thir.item_types, it, ty);
+                    if (it->const_decl.symbol.v != 0) {
+                        AxSymbolTypeMap_insert(&thir.symbol_types, it->const_decl.symbol, ty);
+                    }
                 }
             }
         }
@@ -1198,6 +1391,33 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
 
     // Pass 2: Typecheck bodies
     for (const AxHirItem *top_it = hir->items; top_it; top_it = top_it->next) {
+        if (top_it->kind == AX_HIR_ITEM_IMPL) {
+            cx.current_impl = top_it;
+            if (top_it->impl.self_type) {
+                cx.self_ty = hir_type_to_typeid(&cx, top_it->impl.self_type);
+            } else {
+                cx.self_ty = TypeId_none();
+            }
+        } else if (top_it->kind == AX_HIR_ITEM_FN && top_it->fn.symbol.v != 0) {
+            cx.current_impl = NULL;
+            bool is_copied = false;
+            for (const AxHirItem *impl_it = hir->items; impl_it; impl_it = impl_it->next) {
+                if (impl_it->kind == AX_HIR_ITEM_IMPL) {
+                    for (const AxHirItem *m = impl_it->impl.members; m; m = m->next) {
+                        if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == top_it->fn.symbol.v && m != top_it) {
+                            is_copied = true;
+                            break;
+                        }
+                    }
+                    if (is_copied) break;
+                }
+            }
+            if (is_copied) continue;
+            cx.self_ty = TypeId_none();
+        } else {
+            cx.current_impl = NULL;
+            cx.self_ty = TypeId_none();
+        }
         for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
             const AxHirItem *it = (impl_pass == 0) ? top_it : 
                                   (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
@@ -1225,6 +1445,18 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             check_block(&cx, it->fn.body, cx.return_type);
             default_int_vars(&cx);
             check_literal_ranges(&cx);
+                } else if (it->kind == AX_HIR_ITEM_CONST && it->const_decl.expr) {
+                    TypeId *cty = AxItemTypeMap_get(&thir.item_types, it);
+                    TypeId expected = cty ? *cty : TypeId_none();
+                    check_expr(&cx, it->const_decl.expr, expected);
+                    if (it->const_decl.expr->kind == AX_HIR_EXPR_LITERAL) {
+                        if (it->const_decl.expr->literal.kind == AX_TOK_INT || it->const_decl.expr->literal.kind == AX_TOK_CHAR) {
+                            uint64_t val = it->const_decl.expr->literal.val.int_val.value;
+                            if (it->const_decl.symbol.v != 0) {
+                                AxSymbolConstMap_insert(&thir.symbol_consts, it->const_decl.symbol, val);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1389,7 +1621,7 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             if (t->kind != AX_TY_ENUM) {
                 return type_error(cx, pat->span, AX_TYPE_MISMATCH);
             }
-            StrView name = ax_source_db_span_text(cx->db, pat->path.path.span);
+            StrView name = (pat->path.path.span.file.v != 0) ? ax_source_db_span_text(cx->db, pat->path.path.span) : (StrView){0};
             StrView vname = name;
             const char *dot = NULL;
             for (size_t i = 0; i < name.len; i++) {
@@ -1398,6 +1630,9 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             if (dot) {
                 vname.ptr = dot + 1;
                 vname.len = name.len - (dot - name.ptr) - 1;
+            }
+            if (vname.len == 0 && pat->path.path.name.v != 0) {
+                vname = ax_interner_get(cx->str_in, pat->path.path.name);
             }
 
             bool found_variant = false;
@@ -1530,7 +1765,19 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
             bool match = false;
             if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == path->symbol.v) match = true;
             else if (it->kind == AX_HIR_ITEM_STRUCT && it->struct_decl.symbol.v == path->symbol.v) match = true;
-            else if (it->kind == AX_HIR_ITEM_ENUM && it->enum_decl.symbol.v == path->symbol.v) match = true;
+            else if (it->kind == AX_HIR_ITEM_ENUM) {
+                if (it->enum_decl.symbol.v == path->symbol.v) match = true;
+                else {
+                    for (const AxHirVariantDecl *v = it->enum_decl.variants; v; v = v->next) {
+                        if (v->symbol.v == path->symbol.v) {
+                            match = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            else if (it->kind == AX_HIR_ITEM_TYPE_ALIAS && it->type_alias.symbol.v == path->symbol.v) match = true;
+            else if (it->kind == AX_HIR_ITEM_CONST && it->const_decl.symbol.v == path->symbol.v) match = true;
 
             if (match) {
                 TypeId *it_t = AxItemTypeMap_get(&cx->thir->item_types, it);
@@ -1539,7 +1786,11 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         }
         
         StrView name = ax_source_db_span_text(cx->db, path->span);
+    if (name.len == 0 && path->name.v != 0) {
+        name = ax_interner_get(cx->str_in, path->name);
+    }
         if (ax_sv_eq_cstr(name, "Self")) {
+            if (TypeId_is_some(cx->self_ty)) return cx->self_ty;
             AxType pt;
             memset(&pt, 0, sizeof(pt));
             pt.kind = AX_TY_PARAM;
@@ -1573,6 +1824,9 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         }
     }
     StrView name = ax_source_db_span_text(cx->db, path->span);
+    if (name.len == 0 && path->name.v != 0) {
+        name = ax_interner_get(cx->str_in, path->name);
+    }
     
     // Check built-in types for UFCS
     if (ax_sv_eq_cstr(name, "bool")) return cx->thir->interner.t_bool;
@@ -1623,6 +1877,35 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         }
     }
     
+    if (cx->current_impl && cx->current_impl->kind == AX_HIR_ITEM_IMPL && cx->current_impl->impl.generic_params) {
+        size_t idx = 0;
+        for (AxHirGenericParam *gp = cx->current_impl->impl.generic_params->params; gp; gp = gp->next, idx++) {
+            StrView gp_name = ax_interner_get(cx->str_in, gp->name);
+            if (ax_sv_eq(gp_name, name)) {
+                AxType pt;
+                memset(&pt, 0, sizeof(pt));
+                pt.kind = AX_TY_PARAM;
+                pt.param.name = gp->name;
+                pt.param.index = idx;
+                return ax_intern_type(&cx->thir->interner, &pt);
+            }
+        }
+    }
+    if (cx->current_fn && cx->current_fn->kind == AX_HIR_ITEM_FN && cx->current_fn->fn.generic_params) {
+        size_t idx = 0;
+        for (AxHirGenericParam *gp = cx->current_fn->fn.generic_params->params; gp; gp = gp->next, idx++) {
+            StrView gp_name = ax_interner_get(cx->str_in, gp->name);
+            if (ax_sv_eq(gp_name, name)) {
+                AxType pt;
+                memset(&pt, 0, sizeof(pt));
+                pt.kind = AX_TY_PARAM;
+                pt.param.name = gp->name;
+                pt.param.index = idx;
+                return ax_intern_type(&cx->thir->interner, &pt);
+            }
+        }
+    }
+
     AxDiagnostic d = {0};
     d.code = AX_NAME_UNRESOLVED;
     d.severity = AX_DIAG_ERROR;
@@ -1702,7 +1985,44 @@ static TypeId check_binary(TypeckCtx *cx, const AxHirExpr *expr) {
             } else {
                 ok = is_intlike(cx, opnd);
             }
-            if (!ok) return type_error(cx, expr->span, AX_TYPE_OPERATOR);
+            
+              if (!ok) {
+                  const char *method_name = NULL;
+                  bool is_cmp = false;
+                  switch (op) {
+                      case AX_BINOP_ADD: method_name = "add"; break;
+                      case AX_BINOP_SUB: method_name = "sub"; break;
+                      case AX_BINOP_MUL: method_name = "mul"; break;
+                      case AX_BINOP_DIV: method_name = "div"; break;
+                      case AX_BINOP_REM: method_name = "rem"; break;
+                      case AX_BINOP_BITAND: method_name = "bitand"; break;
+                      case AX_BINOP_BITOR: method_name = "bitor"; break;
+                      case AX_BINOP_BITXOR: method_name = "bitxor"; break;
+                      case AX_BINOP_SHL: method_name = "shl"; break;
+                      case AX_BINOP_SHR: method_name = "shr"; break;
+                      case AX_BINOP_EQ: method_name = "eq"; is_cmp = true; break;
+                      case AX_BINOP_NE: method_name = "eq"; is_cmp = true; break;
+                      case AX_BINOP_LT: method_name = "cmp"; is_cmp = true; break;
+                      case AX_BINOP_LE: method_name = "cmp"; is_cmp = true; break;
+                      case AX_BINOP_GT: method_name = "cmp"; is_cmp = true; break;
+                      case AX_BINOP_GE: method_name = "cmp"; is_cmp = true; break;
+                      default: break;
+                  }
+                  if (method_name) {
+                      AxTraitResult trait_res = AX_TRAIT_DISPROVEN;
+                      const AxHirItem *method_item = find_method(cx, left_ty, ax_sv_cstr(method_name), &trait_res);
+                      if (method_item) {
+                          AxExprMethodMap_insert(&cx->thir->expr_methods, expr, method_item);
+                          TypeId *fn_ty_ptr = AxItemTypeMap_get(&cx->thir->item_types, method_item);
+                          if (fn_ty_ptr) {
+                              const AxType *fn_ty = ax_type_get(&cx->thir->interner, *fn_ty_ptr);
+                              return is_cmp ? in->t_bool : fn_ty->fn.ret_type;
+                          }
+                      }
+                  }
+                  return type_error(cx, expr->span, AX_TYPE_OPERATOR);
+              }
+
             if (op >= AX_BINOP_EQ && op <= AX_BINOP_GE) return in->t_bool;
             return opnd;
         }
@@ -1752,9 +2072,15 @@ static TypeId check_unary(TypeckCtx *cx, const AxHirExpr *expr) {
             return type_error(cx, expr->span, AX_TYPE_OPERATOR);
         }
 
-        case AX_UNOP_DEREF:
-            check_expr(cx, operand, TypeId_none());
+        case AX_UNOP_DEREF: {
+            TypeId op = check_expr(cx, operand, TypeId_none());
+            if (!is_error(cx, op)) {
+                const AxType *t = ax_type_get(&cx->thir->interner, op);
+                if (t->kind == AX_TY_PTR) return t->ptr.pointee;
+                if (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) return t->view.pointee;
+            }
             return type_error(cx, expr->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+        }
 
         default:
             AX_ICE("typeck: unknown unary operator %d", (int)expr->unary.op);
@@ -2192,9 +2518,47 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                         idx++;
                     }
                     if (!found) {
+                        StrView search = ax_interner_get(cx->str_in, expr->field.name);
+                        for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+                            if (it->kind == AX_HIR_ITEM_IMPL && it->impl.self_type) {
+                                const AxHirItem *old_impl = cx->current_impl;
+                                cx->current_impl = it;
+                                TypeId impl_self_ty = hir_type_to_typeid(cx, it->impl.self_type);
+                                cx->current_impl = old_impl;
+                                if (unify_ty(cx, impl_self_ty, base_ty)) {
+                                    for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                                        if (m->kind == AX_HIR_ITEM_CONST) {
+                                            StrView cname = ax_interner_get(cx->str_in, m->const_decl.name);
+                                            if (ax_sv_eq(cname, search)) {
+                                                AxExprMethodMap_insert(&cx->thir->expr_methods, expr, m);
+                                                TypeId *cty = AxItemTypeMap_get(&cx->thir->item_types, m);
+                                                return cty ? *cty : in->t_i32;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
                     }
-                                } else if (t->kind == AX_TY_ENUM) {
+                } else if (t->kind == AX_TY_PARAM) {
+                    StrView search = ax_interner_get(cx->str_in, expr->field.name);
+                    for (const AxHirItem *it = cx->hir->items; it; it = it->next) {
+                        if (it->kind == AX_HIR_ITEM_TRAIT) {
+                            for (const AxHirItem *m = it->trait.members; m; m = m->next) {
+                                if (m->kind == AX_HIR_ITEM_CONST) {
+                                    StrView cname = ax_interner_get(cx->str_in, m->const_decl.name);
+                                    if (ax_sv_eq(cname, search)) {
+                                        AxExprMethodMap_insert(&cx->thir->expr_methods, expr, m);
+                                        TypeId *cty = AxItemTypeMap_get(&cx->thir->item_types, m);
+                                        return cty ? *cty : in->t_i32;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return type_error(cx, expr->span, AX_TYPE_UNKNOWN_FIELD);
+                } else if (t->kind == AX_TY_ENUM) {
                     bool found = false;
                     size_t vidx = 0;
                     for (const AxHirVariantDecl *v = t->enm.def->enum_decl.variants; v; v = v->next) {
@@ -2488,12 +2852,26 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                 return ax_intern_type(&cx->thir->interner, &v);
             }
             
-            TypeId idx_ty = check_expr(cx, expr->index.arg, in->t_usize);
-            if (is_error(cx, idx_ty)) return in->t_error;
+            if (is_array || is_slice || is_str) {
+                TypeId idx_ty = check_expr(cx, expr->index.arg, in->t_usize);
+                if (is_error(cx, idx_ty)) return in->t_error;
+                if (is_array) return t->array.elem;
+                if (is_slice) return ax_type_get(in, t->view.pointee)->slice.elem;
+                if (is_str) return in->t_u8;
+            }
             
-            if (is_array) return t->array.elem;
-            if (is_slice) return ax_type_get(in, t->view.pointee)->slice.elem;
-            if (is_str) return in->t_u8;
+            AxTraitResult trait_res = AX_TRAIT_DISPROVEN;
+            const AxHirItem *method_item = find_method(cx, base_ty, ax_sv_cstr("index"), &trait_res);
+            if (method_item) {
+                AxExprMethodMap_insert(&cx->thir->expr_methods, expr, method_item);
+                TypeId *fn_ty_ptr = AxItemTypeMap_get(&cx->thir->item_types, method_item);
+                if (fn_ty_ptr) {
+                    const AxType *fn_ty = ax_type_get(&cx->thir->interner, *fn_ty_ptr);
+                    TypeId expected_idx_ty = (fn_ty->fn.param_count >= 2) ? fn_ty->fn.param_types[1] : in->t_usize;
+                    check_expr(cx, expr->index.arg, expected_idx_ty);
+                    return fn_ty->fn.ret_type;
+                }
+            }
             return type_error(cx, expr->index.base->span, AX_TYPE_CANNOT_INDEX);
         }
         /* case AX_HIR_EXPR_STRUCT: */
@@ -2639,7 +3017,29 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             
             TypeId *fn_ty_ptr = AxItemTypeMap_get(&cx->thir->item_types, method_item);
             if (!fn_ty_ptr) AX_ICE("Method missing fn type");
-            const AxType *fn_ty = ax_type_get(&cx->thir->interner, *fn_ty_ptr);
+            TypeId fn_ty_id = *fn_ty_ptr;
+            if (method_item->kind == AX_HIR_ITEM_FN && method_item->fn.generic_params) {
+                size_t param_count = 0;
+                for (AxHirGenericParam *p = method_item->fn.generic_params->params; p; p = p->next) param_count++;
+                if (param_count > 0) {
+                    AxGenericArgs gargs;
+                    gargs.count = param_count;
+                    gargs.args = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * param_count, _Alignof(TypeId));
+                    if (expr->method_call.generic_args) {
+                        AxHirGenericArg *ga = expr->method_call.generic_args->args;
+                        for (size_t k = 0; k < param_count; k++) {
+                            gargs.args[k] = ga ? hir_type_to_typeid(cx, ga->type) : new_ty_var(cx, expr->span);
+                            if (ga) ga = ga->next;
+                        }
+                    } else {
+                        for (size_t k = 0; k < param_count; k++) {
+                            gargs.args[k] = new_ty_var(cx, expr->span);
+                        }
+                    }
+                    fn_ty_id = ax_subst_ty(cx, fn_ty_id, &gargs);
+                }
+            }
+            const AxType *fn_ty = ax_type_get(&cx->thir->interner, fn_ty_id);
             
             size_t expected_args = fn_ty->fn.param_count;
             bool has_self = (method_item->fn.params && ax_sv_eq_cstr(ax_interner_get(cx->str_in, method_item->fn.params->name), "self"));
