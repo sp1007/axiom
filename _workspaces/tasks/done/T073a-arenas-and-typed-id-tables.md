@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T070, T073]
 priority: 105
-status: doing
+status: done
 attempts: 1
 paths: [std/core/arena, std/collections/idtable, tests/std/arena]
 spec: [tasks/0260, 0263, 0172, 0106, 0036, spec/SPEC-00-bootstrap.md]
 started: 2026-10-13 22:38:26
+finished: 2026-10-14 00:08:40
 ---
 # T073a — Arenas and typed ID tables
 
@@ -45,3 +46,4 @@ AKERNEL-24).
 
 ## Log
 - 2026-10-13 22:38:26 started (attempt 1) 
+- 2026-10-14 00:08:40 accepted by QA -> done

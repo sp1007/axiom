@@ -8,10 +8,11 @@ model: sonnet
 gate_model: sonnet
 depends: [T071b, T071c, T065, T061c]
 priority: 105
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/io, std/env, std/process, std/sys/windows/io.ax, std/sys/windows/process.ax, tests/std/io, tests/run/host/io]
 spec: [tasks/0330, tasks/0335, 0220, 0221]
+started: 2026-10-13 23:33:16
 ---
 # T074 — std.io / env / process for hosted Windows
 
@@ -40,3 +41,6 @@ Enough OS access to write a compiler in Axiom.
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 23:33:16 started (attempt 1) 
