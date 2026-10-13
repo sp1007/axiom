@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T074b, T073, T073a, T062, T071b]
 priority: 107
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/programs, tests/conformance/std, tools/gen_large.py, tests/perf]
 spec: [0114, 0169]
+started: 2026-10-14 02:15:25
+finished: 2026-10-14 03:27:43
 ---
 # T075 — Library conformance + real-program suite
 
@@ -36,3 +38,7 @@ Prove the language + library can build real software.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 02:15:25 started (attempt 1) 
+- 2026-10-14 03:27:43 accepted by QA -> done
