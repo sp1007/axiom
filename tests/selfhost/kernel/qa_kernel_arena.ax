@@ -1,0 +1,241 @@
+// test: run
+// stdout: OK Kernel Arena\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn null_mut<T>() -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+const AX_ARENA_DEFAULT_CHUNK: usize = 65536;
+const AX_ARENA_MAX_ALIGN: usize = 4096;
+
+struct ArenaChunk {
+    next: *mut ArenaChunk,
+    cap: usize,
+    used: usize,
+    data: *mut u8,
+}
+
+struct Arena {
+    head: *mut ArenaChunk,
+    current: *mut ArenaChunk,
+    chunk_size: usize,
+    bytes_requested: usize,
+    chunk_count: usize,
+    chunks_allocated: usize,
+    chunks_freed: usize,
+}
+
+fn arena_new() -> Arena {
+    arena_with_chunk_size(AX_ARENA_DEFAULT_CHUNK)
+}
+
+fn arena_with_chunk_size(chunk_size: usize) -> Arena {
+    let sz = if chunk_size == 0 { AX_ARENA_DEFAULT_CHUNK } else { chunk_size };
+    Arena {
+        head: null_mut<ArenaChunk>(),
+        current: null_mut<ArenaChunk>(),
+        chunk_size: sz,
+        bytes_requested: 0,
+        chunk_count: 0,
+        chunks_allocated: 0,
+        chunks_freed: 0,
+    }
+}
+
+fn arena_alloc_raw(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
+    let mut al = align;
+    if al == 0 { al = 1; }
+    if al > AX_ARENA_MAX_ALIGN { al = AX_ARENA_MAX_ALIGN; }
+    let mask: usize = al - 1;
+    a.bytes_requested = a.bytes_requested + size;
+
+    if a.current as usize != 0 {
+        let cur: *mut ArenaChunk = a.current;
+        let c_addr: usize = unsafe { (*cur).data as usize };
+        let u: usize = unsafe { (*cur).used };
+        let cur_addr: usize = c_addr + u;
+        let al_addr: usize = (cur_addr + mask) & ~mask;
+        let off: usize = al_addr - c_addr;
+        let cap: usize = unsafe { (*cur).cap };
+        if cap >= off {
+            let rem_cap: usize = cap - off;
+            if rem_cap >= size {
+                unsafe {
+                    (*cur).used = off + size;
+                }
+                let ptr: *mut u8 = unsafe { (*cur).data + off };
+                return ptr;
+            }
+        }
+    }
+
+    let need: usize = size + (al - 1);
+    let payload: usize = if need > a.chunk_size { need } else { a.chunk_size };
+    let raw: *mut u8 = unsafe { heap_alloc(payload, 16) };
+    let hdr: *mut ArenaChunk = unsafe { heap_alloc(size_of<ArenaChunk>(), align_of<ArenaChunk>()) as *mut ArenaChunk };
+    unsafe {
+        (*hdr).next = null_mut<ArenaChunk>();
+        (*hdr).cap = payload;
+        (*hdr).used = 0;
+        (*hdr).data = raw;
+    }
+
+    if a.head as usize == 0 {
+        a.head = hdr;
+    } else {
+        unsafe {
+            (*a.current).next = hdr;
+        }
+    }
+    a.current = hdr;
+    a.chunk_count = a.chunk_count + 1;
+    a.chunks_allocated = a.chunks_allocated + 1;
+
+    let c_addr: usize = raw as usize;
+    let al_addr: usize = (c_addr + mask) & ~mask;
+    let off: usize = al_addr - c_addr;
+    unsafe {
+        (*hdr).used = off + size;
+    }
+    let ptr: *mut u8 = unsafe { raw + off };
+    ptr
+}
+
+fn arena_dup(a: mut_view<Arena>, src: *const u8, size: usize) -> *mut u8 {
+    let ptr = arena_alloc_raw(a, size, 1);
+    if size > 0 && src as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(src, ptr, size);
+        }
+    }
+    ptr
+}
+
+fn arena_reset(a: mut_view<Arena>) {
+    if a.head as usize == 0 {
+        a.bytes_requested = 0;
+        return;
+    }
+    let mut c: *mut ArenaChunk = unsafe { (*a.head).next };
+    while c as usize != 0 {
+        let next: *mut ArenaChunk = unsafe { (*c).next };
+        unsafe {
+            heap_free((*c).data, (*c).cap, 16);
+            heap_free(c as *mut u8, size_of<ArenaChunk>(), align_of<ArenaChunk>());
+        }
+        a.chunks_freed = a.chunks_freed + 1;
+        c = next;
+    }
+    unsafe {
+        (*a.head).next = null_mut<ArenaChunk>();
+        (*a.head).used = 0;
+    }
+    a.current = a.head;
+    a.chunk_count = 1;
+    a.bytes_requested = 0;
+}
+
+fn arena_destroy(a: mut_view<Arena>) {
+    let mut c: *mut ArenaChunk = a.head;
+    while c as usize != 0 {
+        let next: *mut ArenaChunk = unsafe { (*c).next };
+        unsafe {
+            heap_free((*c).data, (*c).cap, 16);
+            heap_free(c as *mut u8, size_of<ArenaChunk>(), align_of<ArenaChunk>());
+        }
+        a.chunks_freed = a.chunks_freed + 1;
+        c = next;
+    }
+    a.head = null_mut<ArenaChunk>();
+    a.current = null_mut<ArenaChunk>();
+    a.chunk_count = 0;
+    a.bytes_requested = 0;
+}
+
+fn main() -> i32 {
+    let mut a = arena_with_chunk_size(1024);
+
+    // Initial state
+    if a.chunk_count != 0 { return 1; }
+    if a.bytes_requested != 0 { return 2; }
+
+    // Alloc 64 bytes with align 8
+    let p1 = arena_alloc_raw(mut_view(a), 64, 8);
+    if p1 as usize == 0 { return 3; }
+    if (p1 as usize) & 7 != 0 { return 4; }
+    if a.chunk_count != 1 { return 5; }
+    if a.bytes_requested != 64 { return 6; }
+
+    // Alloc 128 bytes with align 16
+    let p2 = arena_alloc_raw(mut_view(a), 128, 16);
+    if p2 as usize == 0 { return 7; }
+    if (p2 as usize) & 15 != 0 { return 8; }
+    if a.chunk_count != 1 { return 9; }
+    if a.bytes_requested != 192 { return 10; }
+
+    // Write patterns to p1 and p2
+    unsafe {
+        *p1 = 0xAAu8;
+        *(p1 + 63) = 0xBBu8;
+        *p2 = 0xCCu8;
+        *(p2 + 127) = 0xDDu8;
+    }
+    if unsafe { *p1 != 0xAAu8 || *(p1 + 63) != 0xBBu8 } { return 11; }
+    if unsafe { *p2 != 0xCCu8 || *(p2 + 127) != 0xDDu8 } { return 12; }
+
+    // Large allocation forcing a dedicated chunk (> chunk_size 1024)
+    let p3 = arena_alloc_raw(mut_view(a), 2048, 64);
+    if p3 as usize == 0 { return 13; }
+    if (p3 as usize) & 63 != 0 { return 14; }
+    if a.chunk_count <= 1 { return 15; }
+
+    // Dup bytes
+    let p_dup = arena_dup(mut_view(a), p1 as *const u8, 64);
+    if p_dup as usize == 0 { return 16; }
+    if unsafe { *p_dup != 0xAAu8 || *(p_dup + 63) != 0xBBu8 } { return 17; }
+
+    // Test arena_reset: retains head chunk, drops others
+    arena_reset(mut_view(a));
+    if a.chunk_count != 1 { return 18; }
+    if a.bytes_requested != 0 { return 19; }
+
+    // Re-alloc after reset into retained chunk
+    let p_after_reset = arena_alloc_raw(mut_view(a), 32, 8);
+    if p_after_reset as usize == 0 { return 20; }
+    if a.bytes_requested != 32 { return 21; }
+
+    // Destroy
+    arena_destroy(mut_view(a));
+    if a.chunk_count != 0 { return 22; }
+    if a.head as usize != 0 { return 23; }
+
+    print("OK Kernel Arena\n");
+    0
+}

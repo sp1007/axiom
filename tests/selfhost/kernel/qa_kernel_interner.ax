@@ -1,0 +1,651 @@
+// test: run
+// stdout: OK Kernel Interner\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn null_mut<T>() -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(a: u64, b: u32) -> u64 { 0 }
+
+// AXH64 Hashing
+const AXH_K1: u64 = 0x9E3779B97F4A7C15;
+const AXH_K2: u64 = 0xC2B2AE3D27D4EB4F;
+const AXH_K3: u64 = 0x165667B19E3779F9;
+const AXH_SEED: u64 = 0x27D4EB2F165667C5;
+const AXH_M: u64 = 0x9FB21C651E98DF25;
+
+fn axh_round(h: u64, w: u64) -> u64 {
+    let m = wrapping_mul_u64(rotate_left_u64(wrapping_mul_u64(w, AXH_K2), 31), AXH_K1);
+    wrapping_add_u64(wrapping_mul_u64(rotate_left_u64(h ^ m, 27), AXH_K1), AXH_K3)
+}
+
+fn axh_fold(h: u64) -> u64 {
+    h ^ rotate_left_u64(h, 15) ^ rotate_left_u64(h, 40)
+}
+
+fn axh_avalanche(mut h: u64) -> u64 {
+    h = wrapping_mul_u64(axh_fold(h), AXH_M);
+    h = wrapping_mul_u64(axh_fold(h), AXH_K2);
+    axh_fold(h)
+}
+
+pub fn ax_hash_u32(v: u32) -> u64 {
+    let mut h = AXH_SEED;
+    let w = v as u64;
+    h = axh_round(h, w);
+    h = h ^ (wrapping_mul_u64(4, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub fn ax_hash_bytes(bytes: *const u8, byte_len: usize) -> u64 {
+    let mut h = AXH_SEED;
+    let mut offset: usize = 0;
+    let mut rem = byte_len;
+    while rem >= 8 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < 8 {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+        offset = offset + 8;
+        rem = rem - 8;
+    }
+    if rem > 0 {
+        let mut w: u64 = 0;
+        let mut i: usize = 0;
+        while i < rem {
+            let b = unsafe { *(bytes + offset + i) } as u64;
+            w = w | (b << (8 * i as u32));
+            i = i + 1;
+        }
+        h = axh_round(h, w);
+    }
+    h = h ^ (wrapping_mul_u64(byte_len as u64, AXH_K3));
+    axh_avalanche(h)
+}
+
+pub struct ArenaChunk {
+    pub next: *mut ArenaChunk,
+    pub cap: usize,
+    pub used: usize,
+    pub data: *mut u8,
+}
+
+pub struct Arena {
+    pub head: *mut ArenaChunk,
+    pub current: *mut ArenaChunk,
+    pub chunk_size: usize,
+    pub bytes_requested: usize,
+    pub chunk_count: usize,
+    pub chunks_allocated: usize,
+    pub chunks_freed: usize,
+}
+
+pub fn arena_new() -> Arena {
+    Arena {
+        head: null_mut<ArenaChunk>(),
+        current: null_mut<ArenaChunk>(),
+        chunk_size: 4096,
+        bytes_requested: 0,
+        chunk_count: 0,
+        chunks_allocated: 0,
+        chunks_freed: 0,
+    }
+}
+
+pub fn arena_alloc_raw(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
+    let mut al = align;
+    if al == 0 { al = 1; }
+    let mask: usize = al - 1;
+    a.bytes_requested = a.bytes_requested + size;
+
+    if a.current as usize != 0 {
+        let cur: *mut ArenaChunk = a.current;
+        let c_addr: usize = unsafe { (*cur).data as usize };
+        let u: usize = unsafe { (*cur).used };
+        let cur_addr: usize = c_addr + u;
+        let al_addr: usize = (cur_addr + mask) & ~mask;
+        let off: usize = al_addr - c_addr;
+        let cap: usize = unsafe { (*cur).cap };
+        if cap >= off {
+            let rem_cap: usize = cap - off;
+            if rem_cap >= size {
+                unsafe {
+                    (*cur).used = off + size;
+                }
+                let ptr: *mut u8 = (c_addr + off) as *mut u8;
+                return ptr;
+            }
+        }
+    }
+
+    let need: usize = size + (al - 1);
+    let payload: usize = if need > a.chunk_size { need } else { a.chunk_size };
+    let raw: *mut u8 = unsafe { heap_alloc(payload, 16) };
+    let hdr: *mut ArenaChunk = unsafe { heap_alloc(size_of<ArenaChunk>(), align_of<ArenaChunk>()) as *mut ArenaChunk };
+    unsafe {
+        (*hdr).next = null_mut<ArenaChunk>();
+        (*hdr).cap = payload;
+        (*hdr).used = 0;
+        (*hdr).data = raw;
+    }
+
+    if a.head as usize == 0 {
+        a.head = hdr;
+    } else {
+        unsafe {
+            (*a.current).next = hdr;
+        }
+    }
+    a.current = hdr;
+    a.chunk_count = a.chunk_count + 1;
+    a.chunks_allocated = a.chunks_allocated + 1;
+
+    let c_addr: usize = raw as usize;
+    let al_addr: usize = (c_addr + mask) & ~mask;
+    let off: usize = al_addr - c_addr;
+    unsafe {
+        (*hdr).used = off + size;
+    }
+    let ptr: *mut u8 = (c_addr + off) as *mut u8;
+    ptr
+}
+
+pub fn arena_destroy(a: mut_view<Arena>) {
+    let mut c: *mut ArenaChunk = a.head;
+    while c as usize != 0 {
+        let next: *mut ArenaChunk = unsafe { (*c).next };
+        unsafe {
+            heap_free((*c).data, (*c).cap, 16);
+            heap_free(c as *mut u8, size_of<ArenaChunk>(), align_of<ArenaChunk>());
+        }
+        a.chunks_freed = a.chunks_freed + 1;
+        c = next;
+    }
+    a.head = null_mut<ArenaChunk>();
+    a.current = null_mut<ArenaChunk>();
+    a.chunk_count = 0;
+    a.bytes_requested = 0;
+}
+
+pub struct StrId {
+    pub v: u32,
+}
+
+impl StrId {
+    pub fn none() -> StrId { StrId { v: 0 } }
+    pub fn is_none(self: view<StrId>) -> bool { self.v == 0 }
+    pub fn is_some(self: view<StrId>) -> bool { self.v != 0 }
+    pub fn eq(self: view<StrId>, other: view<StrId>) -> bool { self.v == other.v }
+}
+
+pub struct StrView {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+pub struct StrInterner {
+    pub bytes: Arena,
+    pub strings: *mut StrView,
+    pub len: usize,
+    pub cap: usize,
+    pub map_hashes: *mut u64,
+    pub map_ids: *mut u32,
+    pub map_cap: usize,
+}
+
+fn bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
+    let mut i: usize = 0;
+    while i < n {
+        if unsafe { *(a + i) } != unsafe { *(b + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn interner_init(in_: mut_view<StrInterner>) {
+    in_.bytes = arena_new();
+    in_.strings = 0 as *mut StrView;
+    in_.len = 0;
+    in_.cap = 0;
+    in_.map_hashes = 0 as *mut u64;
+    in_.map_ids = 0 as *mut u32;
+    in_.map_cap = 0;
+}
+
+pub fn interner_free(in_: mut_view<StrInterner>) {
+    arena_destroy(mut_view(in_.bytes));
+    if in_.cap > 0 && in_.strings as usize != 0 {
+        unsafe {
+            heap_free(in_.strings as *mut u8, in_.cap * size_of<StrView>(), align_of<StrView>());
+        }
+    }
+    if in_.map_cap > 0 && in_.map_hashes as usize != 0 {
+        unsafe {
+            heap_free(in_.map_hashes as *mut u8, in_.map_cap * 8, 8);
+            heap_free(in_.map_ids as *mut u8, in_.map_cap * 4, 4);
+        }
+    }
+    in_.strings = 0 as *mut StrView;
+    in_.len = 0;
+    in_.cap = 0;
+    in_.map_hashes = 0 as *mut u64;
+    in_.map_ids = 0 as *mut u32;
+    in_.map_cap = 0;
+}
+
+fn interner_grow_map(in_: mut_view<StrInterner>) {
+    let new_cap: usize = if in_.map_cap == 0 { 16 } else { in_.map_cap + in_.map_cap };
+    let new_hashes: *mut u64 = unsafe { heap_alloc(new_cap * 8, 8) as *mut u64 };
+    let new_ids: *mut u32 = unsafe { heap_alloc(new_cap * 4, 4) as *mut u32 };
+    let mut j: usize = 0;
+    while j < new_cap {
+        unsafe {
+            *(new_ids + j) = 0u32;
+        }
+        j = j + 1;
+    }
+
+    let mask = new_cap - 1;
+    let mut i: usize = 0;
+    while i < in_.len {
+        let sv = unsafe { *(in_.strings + i) };
+        let h = ax_hash_bytes(sv.ptr, sv.len);
+        let mut slot = (h as usize) & mask;
+        while unsafe { *(new_ids + slot) } != 0u32 {
+            slot = (slot + 1) & mask;
+        }
+        unsafe {
+            *(new_hashes + slot) = h;
+            *(new_ids + slot) = (i + 1) as u32;
+        }
+        i = i + 1;
+    }
+
+    if in_.map_cap > 0 && in_.map_hashes as usize != 0 {
+        unsafe {
+            heap_free(in_.map_hashes as *mut u8, in_.map_cap * 8, 8);
+            heap_free(in_.map_ids as *mut u8, in_.map_cap * 4, 4);
+        }
+    }
+    in_.map_hashes = new_hashes;
+    in_.map_ids = new_ids;
+    in_.map_cap = new_cap;
+}
+
+pub fn interner_intern_bytes(in_: mut_view<StrInterner>, p_s: *const u8, n: usize) -> StrId {
+    let h = ax_hash_bytes(p_s, n);
+
+    if in_.map_cap > 0 {
+        let mask = in_.map_cap - 1;
+        let mut slot = (h as usize) & mask;
+        while true {
+            let id_v = unsafe { *(in_.map_ids + slot) };
+            if id_v == 0u32 {
+                break;
+            }
+            if unsafe { *(in_.map_hashes + slot) } == h {
+                let sv = unsafe { *(in_.strings + ((id_v - 1) as usize)) };
+                if sv.len == n && bytes_eq(sv.ptr, p_s, n) {
+                    return StrId { v: id_v };
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    let copy = arena_alloc_raw(mut_view(in_.bytes), n + 1, 1);
+    if n > 0 && p_s as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(p_s, copy, n);
+            *(copy + n) = 0u8;
+        }
+    }
+
+    if in_.len == in_.cap {
+        let new_cap: usize = if in_.cap == 0 { 8 } else { in_.cap + in_.cap };
+        let new_strings: *mut StrView = unsafe { heap_alloc(new_cap * size_of<StrView>(), align_of<StrView>()) as *mut StrView };
+        if in_.len > 0 && in_.strings as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<StrView>(in_.strings as *const StrView, new_strings, in_.len);
+                heap_free(in_.strings as *mut u8, in_.cap * size_of<StrView>(), align_of<StrView>());
+            }
+        }
+        in_.strings = new_strings;
+        in_.cap = new_cap;
+    }
+
+    let sv = StrView { ptr: copy as *const u8, len: n };
+    unsafe {
+        *(in_.strings + in_.len) = sv;
+    }
+    let new_id = StrId { v: (in_.len + 1) as u32 };
+    in_.len = in_.len + 1;
+
+    if in_.map_cap == 0 || in_.len * 4 > in_.map_cap * 3 {
+        interner_grow_map(in_);
+    } else {
+        let mask = in_.map_cap - 1;
+        let mut slot = (h as usize) & mask;
+        while unsafe { *(in_.map_ids + slot) } != 0u32 {
+            slot = (slot + 1) & mask;
+        }
+        unsafe {
+            *(in_.map_hashes + slot) = h;
+            *(in_.map_ids + slot) = new_id.v;
+        }
+    }
+
+    new_id
+}
+
+pub fn interner_lookup_bytes(in_: view<StrInterner>, p_s: *const u8, n: usize) -> StrId {
+    if in_.map_cap == 0 || in_.len == 0 {
+        return StrId.none();
+    }
+    let h = ax_hash_bytes(p_s, n);
+    let mask = in_.map_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let id_v = unsafe { *(in_.map_ids + slot) };
+        if id_v == 0u32 {
+            return StrId.none();
+        }
+        if unsafe { *(in_.map_hashes + slot) } == h {
+            let sv = unsafe { *(in_.strings + ((id_v - 1) as usize)) };
+            if sv.len == n && bytes_eq(sv.ptr, p_s, n) {
+                return StrId { v: id_v };
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    StrId.none()
+}
+
+pub fn interner_get(in_: view<StrInterner>, id: StrId) -> StrView {
+    if id.v == 0 || (id.v as usize) > in_.len {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    unsafe {
+        *(in_.strings + ((id.v - 1) as usize))
+    }
+}
+
+pub fn interner_len(in_: view<StrInterner>) -> usize {
+    in_.len
+}
+
+pub fn interner_is_empty(in_: view<StrInterner>) -> bool {
+    in_.len == 0
+}
+
+pub struct U32Interner {
+    pub items: *mut u32,
+    pub len: usize,
+    pub cap: usize,
+    pub map_hashes: *mut u64,
+    pub map_ids: *mut u32,
+    pub map_cap: usize,
+}
+
+pub fn u32_interner_new() -> U32Interner {
+    U32Interner {
+        items: 0 as *mut u32,
+        len: 0,
+        cap: 0,
+        map_hashes: 0 as *mut u64,
+        map_ids: 0 as *mut u32,
+        map_cap: 0,
+    }
+}
+
+pub fn u32_interner_free(in_: mut_view<U32Interner>) {
+    if in_.cap > 0 && in_.items as usize != 0 {
+        unsafe {
+            heap_free(in_.items as *mut u8, in_.cap * 4, 4);
+        }
+    }
+    if in_.map_cap > 0 && in_.map_hashes as usize != 0 {
+        unsafe {
+            heap_free(in_.map_hashes as *mut u8, in_.map_cap * 8, 8);
+            heap_free(in_.map_ids as *mut u8, in_.map_cap * 4, 4);
+        }
+    }
+    in_.items = 0 as *mut u32;
+    in_.len = 0;
+    in_.cap = 0;
+    in_.map_hashes = 0 as *mut u64;
+    in_.map_ids = 0 as *mut u32;
+    in_.map_cap = 0;
+}
+
+fn u32_interner_grow_map(in_: mut_view<U32Interner>) {
+    let new_cap: usize = if in_.map_cap == 0 { 16 } else { in_.map_cap + in_.map_cap };
+    let new_hashes: *mut u64 = unsafe { heap_alloc(new_cap * 8, 8) as *mut u64 };
+    let new_ids: *mut u32 = unsafe { heap_alloc(new_cap * 4, 4) as *mut u32 };
+    let mut j: usize = 0;
+    while j < new_cap {
+        unsafe {
+            *(new_ids + j) = 0u32;
+        }
+        j = j + 1;
+    }
+
+    let mask = new_cap - 1;
+    let mut i: usize = 0;
+    while i < in_.len {
+        let val = unsafe { *(in_.items + i) };
+        let h = ax_hash_u32(val);
+        let mut slot = (h as usize) & mask;
+        while unsafe { *(new_ids + slot) } != 0u32 {
+            slot = (slot + 1) & mask;
+        }
+        unsafe {
+            *(new_hashes + slot) = h;
+            *(new_ids + slot) = (i + 1) as u32;
+        }
+        i = i + 1;
+    }
+
+    if in_.map_cap > 0 && in_.map_hashes as usize != 0 {
+        unsafe {
+            heap_free(in_.map_hashes as *mut u8, in_.map_cap * 8, 8);
+            heap_free(in_.map_ids as *mut u8, in_.map_cap * 4, 4);
+        }
+    }
+    in_.map_hashes = new_hashes;
+    in_.map_ids = new_ids;
+    in_.map_cap = new_cap;
+}
+
+pub fn u32_intern(in_: mut_view<U32Interner>, val: u32) -> u32 {
+    let h = ax_hash_u32(val);
+    if in_.map_cap > 0 {
+        let mask = in_.map_cap - 1;
+        let mut slot = (h as usize) & mask;
+        while true {
+            let id_v = unsafe { *(in_.map_ids + slot) };
+            if id_v == 0u32 {
+                break;
+            }
+            if unsafe { *(in_.map_hashes + slot) } == h {
+                let existing = unsafe { *(in_.items + ((id_v - 1) as usize)) };
+                if existing == val {
+                    return id_v;
+                }
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    if in_.len == in_.cap {
+        let new_cap: usize = if in_.cap == 0 { 8 } else { in_.cap + in_.cap };
+        let new_items: *mut u32 = unsafe { heap_alloc(new_cap * 4, 4) as *mut u32 };
+        if in_.len > 0 && in_.items as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u32>(in_.items as *const u32, new_items, in_.len);
+                heap_free(in_.items as *mut u8, in_.cap * 4, 4);
+            }
+        }
+        in_.items = new_items;
+        in_.cap = new_cap;
+    }
+
+    unsafe {
+        *(in_.items + in_.len) = val;
+    }
+    let new_id = (in_.len + 1) as u32;
+    in_.len = in_.len + 1;
+
+    if in_.map_cap == 0 || in_.len * 4 > in_.map_cap * 3 {
+        u32_interner_grow_map(in_);
+    } else {
+        let mask = in_.map_cap - 1;
+        let mut slot = (h as usize) & mask;
+        while unsafe { *(in_.map_ids + slot) } != 0u32 {
+            slot = (slot + 1) & mask;
+        }
+        unsafe {
+            *(in_.map_hashes + slot) = h;
+            *(in_.map_ids + slot) = new_id;
+        }
+    }
+
+    new_id
+}
+
+pub fn u32_interner_lookup(in_: view<U32Interner>, val: u32) -> u32 {
+    if in_.map_cap == 0 || in_.len == 0 {
+        return 0u32;
+    }
+    let h = ax_hash_u32(val);
+    let mask = in_.map_cap - 1;
+    let mut slot = (h as usize) & mask;
+    while true {
+        let id_v = unsafe { *(in_.map_ids + slot) };
+        if id_v == 0u32 {
+            return 0u32;
+        }
+        if unsafe { *(in_.map_hashes + slot) } == h {
+            let existing = unsafe { *(in_.items + ((id_v - 1) as usize)) };
+            if existing == val {
+                return id_v;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    0u32
+}
+
+pub fn u32_interner_get(in_: view<U32Interner>, id: u32) -> u32 {
+    if id == 0 || (id as usize) > in_.len {
+        return 0u32;
+    }
+    unsafe {
+        *(in_.items + ((id - 1) as usize))
+    }
+}
+
+fn main() -> i32 {
+    let mut in_ = StrInterner {
+        bytes: arena_new(),
+        strings: 0 as *mut StrView,
+        len: 0,
+        cap: 0,
+        map_hashes: 0 as *mut u64,
+        map_ids: 0 as *mut u32,
+        map_cap: 0,
+    };
+    interner_init(mut_view(in_));
+    if !interner_is_empty(view(in_)) { return 1; }
+    if interner_len(view(in_)) != 0 { return 2; }
+
+    let mut scratch = arena_new();
+    let p_foo = arena_alloc_raw(mut_view(scratch), 8, 1);
+    let p_bar = arena_alloc_raw(mut_view(scratch), 8, 1);
+    let p_baz = arena_alloc_raw(mut_view(scratch), 8, 1);
+    unsafe {
+        *p_foo = 102u8; *(p_foo + 1) = 111u8; *(p_foo + 2) = 111u8; // "foo"
+        *p_bar = 98u8;  *(p_bar + 1) = 97u8;  *(p_bar + 2) = 114u8; // "bar"
+        *p_baz = 98u8;  *(p_baz + 1) = 97u8;  *(p_baz + 2) = 122u8; // "baz"
+    }
+
+    let id_foo = interner_intern_bytes(mut_view(in_), p_foo as *const u8, 3);
+    let id_bar = interner_intern_bytes(mut_view(in_), p_bar as *const u8, 3);
+
+    if id_foo.v != 1 { return 3; }
+    if id_bar.v != 2 { return 4; }
+    if interner_len(view(in_)) != 2 { return 5; }
+
+    // Deduplication check
+    let id_foo2 = interner_intern_bytes(mut_view(in_), p_foo as *const u8, 3);
+    if !id_foo2.eq(view(id_foo)) { return 6; }
+    if interner_len(view(in_)) != 2 { return 7; }
+
+    // Lookup
+    let l_foo = interner_lookup_bytes(view(in_), p_foo as *const u8, 3);
+    if !l_foo.eq(view(id_foo)) { return 8; }
+
+    let l_baz = interner_lookup_bytes(view(in_), p_baz as *const u8, 3);
+    if !l_baz.is_none() { return 9; }
+
+    // Get
+    let sv_foo = interner_get(view(in_), id_foo);
+    if sv_foo.len != 3 { return 10; }
+    if !bytes_eq(sv_foo.ptr, p_foo as *const u8, 3) { return 11; }
+
+    // Test U32Interner
+    let mut u32_in = u32_interner_new();
+    let u_id1 = u32_intern(mut_view(u32_in), 12345u32);
+    let u_id2 = u32_intern(mut_view(u32_in), 67890u32);
+    let u_id1_dup = u32_intern(mut_view(u32_in), 12345u32);
+
+    if u_id1 != 1 { return 12; }
+    if u_id2 != 2 { return 13; }
+    if u_id1_dup != u_id1 { return 14; }
+    if u32_interner_lookup(view(u32_in), 12345u32) != 1 { return 15; }
+    if u32_interner_lookup(view(u32_in), 99999u32) != 0 { return 16; }
+    if u32_interner_get(view(u32_in), u_id1) != 12345u32 { return 17; }
+    if u32_interner_get(view(u32_in), u_id2) != 67890u32 { return 18; }
+
+    u32_interner_free(mut_view(u32_in));
+    interner_free(mut_view(in_));
+    arena_destroy(mut_view(scratch));
+
+    print("OK Kernel Interner\n");
+    0
+}

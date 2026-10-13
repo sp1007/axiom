@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T076]
 priority: 111
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/kernel, tests/selfhost/kernel]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-020]
+started: 2026-10-14 03:45:04
+finished: 2026-10-14 04:14:45
 ---
 # T077a — Port kernel to Axiom (arena, interner, hashtable, dynarray, idtable)
 
@@ -37,3 +39,7 @@ Port the core kernel utilities and data structures (`compiler/kernel/`) from C t
 ## Notes
 - Sub-task of T077 split per ADR-0005 §8 and SPEC-20 §4.1.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 03:45:04 started (attempt 1) 
+- 2026-10-14 04:14:45 accepted by QA -> done
