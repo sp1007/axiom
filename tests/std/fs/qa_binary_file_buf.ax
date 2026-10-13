@@ -1,0 +1,925 @@
+// test: run
+// timeout: 30
+
+use std.core.host.open;
+use std.core.host.read;
+use std.core.host.write;
+use std.core.host.close;
+use std.core.host.file_size;
+use std.core.host.remove;
+use std.core.host.mkdir;
+use std.core.host.dir_open;
+use std.core.host.dir_next;
+use std.core.host.dir_close;
+use std.core.host.heap_alloc;
+use std.core.host.heap_free;
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+    fn CreateFileW(lpFileName: *const u16, dwDesiredAccess: u32, dwShareMode: u32, lpSecurityAttributes: *mut u8, dwCreationDisposition: u32, dwFlagsAndAttributes: u32, hTemplateFile: *mut u8) -> *mut u8;
+    fn CloseHandle(hObject: *mut u8) -> i32;
+    fn CreateDirectoryW(lpPathName: *const u16, lpSecurityAttributes: *mut u8) -> i32;
+    fn DeleteFileW(lpFileName: *const u16) -> i32;
+    fn RemoveDirectoryW(lpPathName: *const u16) -> i32;
+    fn FindFirstFileW(lpFileName: *const u16, lpFindFileData: *mut u8) -> *mut u8;
+    fn FindNextFileW(hFindFile: *mut u8, lpFindFileData: *mut u8) -> i32;
+    fn FindClose(hFindFile: *mut u8) -> i32;
+    fn GetEnvironmentVariableW(lpName: *const u16, lpBuffer: *mut u16, nSize: u32) -> u32;
+    fn SetEnvironmentVariableW(lpName: *const u16, lpValue: *const u16) -> i32;
+    fn GetLastError() -> u32;
+    fn WriteFile(hFile: *mut u8, lpBuffer: *const u8, nNumberOfBytesToWrite: u32, lpNumberOfBytesWritten: *mut u32, lpOverlapped: *mut u8) -> i32;
+    fn ReadFile(hFile: *mut u8, lpBuffer: *mut u8, nNumberOfBytesToRead: u32, lpNumberOfBytesRead: *mut u32, lpOverlapped: *mut u8) -> i32;
+    fn GetFileSizeEx(hFile: *mut u8, lpFileSize: *mut i64) -> i32;
+}
+
+@intrinsic pub unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+unsafe fn utf8_to_wpath(path: *const u8, path_len: usize, wpath: *mut u16, cap: usize) -> usize {
+    let mut in_pos: usize = 0;
+    let mut out_pos: usize = 0;
+    while in_pos < path_len && out_pos + 2 < cap {
+        let b0 = *(path + in_pos) as u32;
+        let mut cp: u32 = 0;
+        let mut step: usize = 1;
+        if b0 < 0x80 {
+            cp = b0;
+            step = 1;
+        } else if (b0 & 0xE0) == 0xC0 && in_pos + 1 < path_len {
+            let b1 = *(path + in_pos + 1) as u32;
+            cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+            step = 2;
+        } else if (b0 & 0xF0) == 0xE0 && in_pos + 2 < path_len {
+            let b1 = *(path + in_pos + 1) as u32;
+            let b2 = *(path + in_pos + 2) as u32;
+            cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+            step = 3;
+        } else if (b0 & 0xF8) == 0xF0 && in_pos + 3 < path_len {
+            let b1 = *(path + in_pos + 1) as u32;
+            let b2 = *(path + in_pos + 2) as u32;
+            let b3 = *(path + in_pos + 3) as u32;
+            cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+            step = 4;
+        } else {
+            cp = 0xFFFD;
+            step = 1;
+        }
+        in_pos = in_pos + step;
+
+        if cp <= 0xFFFF {
+            *(wpath + out_pos) = cp as u16;
+            out_pos = out_pos + 1;
+        } else {
+            *(wpath + out_pos) = (0xD800 + ((cp - 0x10000) >> 10)) as u16;
+            *(wpath + out_pos + 1) = (0xDC00 + ((cp - 0x10000) & 0x3FF)) as u16;
+            out_pos = out_pos + 2;
+        }
+    }
+    *(wpath + out_pos) = 0u16;
+    out_pos
+}
+
+unsafe fn utf16_null_len(ptr: *const u16) -> usize {
+    let mut count: usize = 0;
+    while *(ptr + count) != 0u16 {
+        count = count + 1;
+    }
+    count
+}
+
+unsafe fn wchars_to_utf8(wchars: *const u16, wlen: usize, buf: *mut u8, cap: usize) -> usize {
+    let mut u8_len: usize = 0;
+    let mut w_idx: usize = 0;
+    while w_idx < wlen {
+        let u0 = *(wchars + w_idx) as u32;
+        let mut cp: u32 = 0;
+        if u0 >= 0xD800 && u0 <= 0xDBFF && w_idx + 1 < wlen {
+            let u1 = *(wchars + w_idx + 1) as u32;
+            if u1 >= 0xDC00 && u1 <= 0xDFFF {
+                cp = 0x10000 + (((u0 - 0xD800) << 10) | (u1 - 0xDC00));
+                w_idx = w_idx + 2;
+            } else {
+                cp = 0xFFFD;
+                w_idx = w_idx + 1;
+            }
+        } else if u0 >= 0xD800 && u0 <= 0xDFFF {
+            cp = 0xFFFD;
+            w_idx = w_idx + 1;
+        } else {
+            cp = u0;
+            w_idx = w_idx + 1;
+        }
+
+        if cp <= 0x7F {
+            if u8_len < cap { *(buf + u8_len) = cp as u8; }
+            u8_len = u8_len + 1;
+        } else if cp <= 0x7FF {
+            if u8_len < cap { *(buf + u8_len) = (0xC0 | (cp >> 6)) as u8; }
+            if u8_len + 1 < cap { *(buf + u8_len + 1) = (0x80 | (cp & 0x3F)) as u8; }
+            u8_len = u8_len + 2;
+        } else if cp <= 0xFFFF {
+            if u8_len < cap { *(buf + u8_len) = (0xE0 | (cp >> 12)) as u8; }
+            if u8_len + 1 < cap { *(buf + u8_len + 1) = (0x80 | ((cp >> 6) & 0x3F)) as u8; }
+            if u8_len + 2 < cap { *(buf + u8_len + 2) = (0x80 | (cp & 0x3F)) as u8; }
+            u8_len = u8_len + 3;
+        } else {
+            if u8_len < cap { *(buf + u8_len) = (0xF0 | (cp >> 18)) as u8; }
+            if u8_len + 1 < cap { *(buf + u8_len + 1) = (0x80 | ((cp >> 12) & 0x3F)) as u8; }
+            if u8_len + 2 < cap { *(buf + u8_len + 2) = (0x80 | ((cp >> 6) & 0x3F)) as u8; }
+            if u8_len + 3 < cap { *(buf + u8_len + 3) = (0x80 | (cp & 0x3F)) as u8; }
+            u8_len = u8_len + 4;
+        }
+    }
+    u8_len
+}
+
+unsafe fn get_file_table() -> *mut u8 {
+    let mut vname: [6]u16 = [65u16, 88u16, 95u16, 70u16, 84u16, 0u16];
+    let pvname = address_of_mut(vname[0]);
+    let mut val: [32]u16 = [0u16; 32];
+    let pval = address_of_mut(val[0]);
+    let vlen = GetEnvironmentVariableW(pvname, pval, 32);
+    if vlen > 0 {
+        let mut ptr_val: usize = 0;
+        let mut idx: usize = 0;
+        while idx < vlen as usize {
+            let ch = val[idx];
+            let mut digit: usize = 0;
+            if ch >= 48u16 && ch <= 57u16 { digit = (ch - 48u16) as usize; }
+            else if ch >= 97u16 && ch <= 102u16 { digit = (ch - 97u16 + 10u16) as usize; }
+            else if ch >= 65u16 && ch <= 70u16 { digit = (ch - 65u16 + 10u16) as usize; }
+            ptr_val = (ptr_val << 4) | digit;
+            idx = idx + 1;
+        }
+        return ptr_val as *mut u8;
+    }
+    let tbl = HeapAlloc(GetProcessHeap(), 8u32, 4096);
+    if tbl as usize == 0 { return 0 as *mut u8; }
+    let mut sval: [17]u16 = [0u16; 17];
+    let mut cur: usize = tbl as usize;
+    let mut pos: usize = 16;
+    sval[pos] = 0u16;
+    while pos > 0 {
+        pos = pos - 1;
+        let nibble = (cur & 0x0F) as u16;
+        if nibble < 10u16 { sval[pos] = 48u16 + nibble; }
+        else { sval[pos] = 97u16 + (nibble - 10u16); }
+        cur = cur >> 4;
+    }
+    SetEnvironmentVariableW(pvname, address_of_mut(sval[0]));
+    tbl
+}
+
+unsafe fn get_dir_table() -> *mut u8 {
+    let mut vname: [6]u16 = [65u16, 88u16, 95u16, 68u16, 84u16, 0u16];
+    let pvname = address_of_mut(vname[0]);
+    let mut val: [32]u16 = [0u16; 32];
+    let pval = address_of_mut(val[0]);
+    let vlen = GetEnvironmentVariableW(pvname, pval, 32);
+    if vlen > 0 {
+        let mut ptr_val: usize = 0;
+        let mut idx: usize = 0;
+        while idx < vlen as usize {
+            let ch = val[idx];
+            let mut digit: usize = 0;
+            if ch >= 48u16 && ch <= 57u16 { digit = (ch - 48u16) as usize; }
+            else if ch >= 97u16 && ch <= 102u16 { digit = (ch - 97u16 + 10u16) as usize; }
+            else if ch >= 65u16 && ch <= 70u16 { digit = (ch - 65u16 + 10u16) as usize; }
+            ptr_val = (ptr_val << 4) | digit;
+            idx = idx + 1;
+        }
+        return ptr_val as *mut u8;
+    }
+    let tbl = HeapAlloc(GetProcessHeap(), 8u32, 40000);
+    if tbl as usize == 0 { return 0 as *mut u8; }
+    let mut sval: [17]u16 = [0u16; 17];
+    let mut cur: usize = tbl as usize;
+    let mut pos: usize = 16;
+    sval[pos] = 0u16;
+    while pos > 0 {
+        pos = pos - 1;
+        let nibble = (cur & 0x0F) as u16;
+        if nibble < 10u16 { sval[pos] = 48u16 + nibble; }
+        else { sval[pos] = 97u16 + (nibble - 10u16); }
+        cur = cur >> 4;
+    }
+    SetEnvironmentVariableW(pvname, address_of_mut(sval[0]));
+    tbl
+}
+
+pub unsafe fn __ax_host_open(path: *const u8, path_len: usize, mode: u32) -> i64 {
+    let mut wpath_buf: [1024]u16 = [0u16; 1024];
+    let pwpath = address_of_mut(wpath_buf[0]);
+    utf8_to_wpath(path, path_len, pwpath, 1024);
+    let mut access: u32 = 0;
+    let mut disp: u32 = 0;
+    if mode == 0u32 {
+        access = 0x80000000u32;
+        disp = 3u32;
+    } else if mode == 1u32 {
+        access = 0x40000000u32 | 0x80000000u32;
+        disp = 2u32;
+    } else if mode == 2u32 {
+        access = 4u32 | 0x80000000u32;
+        disp = 4u32;
+    } else {
+        return -4;
+    }
+    let h = CreateFileW(pwpath, access, 7u32, 0 as *mut u8, disp, 0x80u32, 0 as *mut u8);
+    if h as usize == 0xFFFFFFFFFFFFFFFF || h as usize == 0 {
+        let err = GetLastError();
+        if err == 2u32 || err == 3u32 { return -1; }
+        if err == 5u32 { return -2; }
+        return -9;
+    }
+    let tbl = get_file_table();
+    if tbl as usize == 0 { CloseHandle(h); return -9; }
+    let mut slot: usize = 3;
+    let mut found_slot: usize = 0;
+    while slot < 256 {
+        let is_open_ptr = (tbl as usize + slot * 16 + 8) as *mut u32;
+        if *is_open_ptr == 0u32 {
+            found_slot = slot;
+            break;
+        }
+        slot = slot + 1;
+    }
+    if found_slot == 0 { CloseHandle(h); return -9; }
+    let h_ptr = (tbl as usize + found_slot * 16) as *mut *mut u8;
+    let is_open_ptr = (tbl as usize + found_slot * 16 + 8) as *mut u32;
+    *h_ptr = h;
+    *is_open_ptr = 1u32;
+    found_slot as i64
+}
+
+pub unsafe fn __ax_host_close(h: i64) -> i64 {
+    if h >= 3 && h < 256 {
+        let tbl = get_file_table();
+        if tbl as usize == 0 { return -4; }
+        let is_open_ptr = (tbl as usize + (h as usize) * 16 + 8) as *mut u32;
+        if *is_open_ptr == 0u32 { return -4; }
+        let h_ptr = (tbl as usize + (h as usize) * 16) as *mut *mut u8;
+        let win_h = *h_ptr;
+        CloseHandle(win_h);
+        *is_open_ptr = 0u32;
+        *h_ptr = 0 as *mut u8;
+        return 0;
+    }
+    -4
+}
+
+pub unsafe fn __ax_host_read(h: i64, buf: *mut u8, cap: usize) -> i64 {
+    if cap == 0 { return 0; }
+    if h < 3 || h >= 256 { return -4; }
+    let tbl = get_file_table();
+    if tbl as usize == 0 { return -4; }
+    let is_open = *((tbl as usize + (h as usize) * 16 + 8) as *mut u32);
+    if is_open == 0u32 { return -4; }
+    let win_h = *((tbl as usize + (h as usize) * 16) as *mut *mut u8);
+    let mut read_bytes: [1]u32 = [0u32];
+    let ok = ReadFile(win_h, buf, cap as u32, address_of_mut(read_bytes[0]), 0 as *mut u8);
+    if ok == 0 {
+        let err = GetLastError();
+        if err == 38u32 || err == 109u32 { return 0; }
+        return -9;
+    }
+    read_bytes[0] as i64
+}
+
+pub unsafe fn __ax_host_write(h: i64, p: *const u8, count: usize) -> i64 {
+    if count == 0 { return 0; }
+    if h < 3 || h >= 256 { return -4; }
+    let tbl = get_file_table();
+    if tbl as usize == 0 { return -4; }
+    let is_open = *((tbl as usize + (h as usize) * 16 + 8) as *mut u32);
+    if is_open == 0u32 { return -4; }
+    let win_h = *((tbl as usize + (h as usize) * 16) as *mut *mut u8);
+    let mut written: [1]u32 = [0u32];
+    let ok = WriteFile(win_h, p, count as u32, address_of_mut(written[0]), 0 as *mut u8);
+    if ok == 0 { return -9; }
+    written[0] as i64
+}
+
+pub unsafe fn __ax_host_file_size(h: i64) -> i64 {
+    if h < 3 || h >= 256 { return -4; }
+    let tbl = get_file_table();
+    if tbl as usize == 0 { return -4; }
+    let is_open = *((tbl as usize + (h as usize) * 16 + 8) as *mut u32);
+    if is_open == 0u32 { return -4; }
+    let win_h = *((tbl as usize + (h as usize) * 16) as *mut *mut u8);
+    let mut sz: [1]i64 = [0i64];
+    let ok = GetFileSizeEx(win_h, address_of_mut(sz[0]));
+    if ok == 0 { return -9; }
+    sz[0]
+}
+
+pub unsafe fn __ax_host_remove(path: *const u8, path_len: usize) -> i64 {
+    let mut wpath_buf: [1024]u16 = [0u16; 1024];
+    let pwpath = address_of_mut(wpath_buf[0]);
+    utf8_to_wpath(path, path_len, pwpath, 1024);
+    if DeleteFileW(pwpath) != 0 { return 0; }
+    let mut err = GetLastError();
+    if err == 5u32 {
+        if RemoveDirectoryW(pwpath) != 0 { return 0; }
+        err = GetLastError();
+    }
+    if err == 2u32 || err == 3u32 { return -1; }
+    if err == 5u32 { return -2; }
+    -9
+}
+
+pub unsafe fn __ax_host_mkdir(path: *const u8, path_len: usize) -> i64 {
+    let mut wpath_buf: [1024]u16 = [0u16; 1024];
+    let pwpath = address_of_mut(wpath_buf[0]);
+    utf8_to_wpath(path, path_len, pwpath, 1024);
+    if CreateDirectoryW(pwpath, 0 as *mut u8) != 0 { return 0; }
+    let err = GetLastError();
+    if err == 183u32 { return -3; }
+    if err == 3u32 { return -1; }
+    if err == 5u32 { return -2; }
+    -9
+}
+
+pub unsafe fn __ax_host_dir_open(path: *const u8, path_len: usize) -> i64 {
+    let mut wpath_buf: [1024]u16 = [0u16; 1024];
+    let pwpath = address_of_mut(wpath_buf[0]);
+    let wlen = utf8_to_wpath(path, path_len, pwpath, 1020);
+    if wlen == 0 { return -4; }
+    if *(pwpath + (wlen - 1)) == 47u16 || *(pwpath + (wlen - 1)) == 92u16 {
+        *(pwpath + wlen) = 42u16;
+        *(pwpath + wlen + 1) = 0u16;
+    } else {
+        *(pwpath + wlen) = 92u16;
+        *(pwpath + wlen + 1) = 42u16;
+        *(pwpath + wlen + 2) = 0u16;
+    }
+    let tbl = get_dir_table();
+    if tbl as usize == 0 { return -9; }
+    let mut slot_idx: usize = 0;
+    let mut i: usize = 1;
+    while i <= 64 {
+        let is_open_ptr = (tbl as usize + (i - 1) * 608 + 12) as *mut u32;
+        if *is_open_ptr == 0u32 {
+            slot_idx = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if slot_idx == 0 { return -9; }
+    let slot_addr = tbl as usize + (slot_idx - 1) * 608;
+    let pffd = (slot_addr + 16) as *mut u8;
+    let hFind = FindFirstFileW(pwpath, pffd);
+    if hFind as usize == 0xFFFFFFFFFFFFFFFF {
+        let err = GetLastError();
+        if err == 2u32 || err == 3u32 { return -1; }
+        if err == 5u32 { return -2; }
+        return -9;
+    }
+    let phFind = slot_addr as *mut *mut u8;
+    let phas_entry = (slot_addr + 8) as *mut u32;
+    let pis_open = (slot_addr + 12) as *mut u32;
+    *phFind = hFind;
+    *phas_entry = 1u32;
+    *pis_open = 1u32;
+    (1000 + slot_idx) as i64
+}
+
+pub unsafe fn __ax_host_dir_next(h: i64, buf: *mut u8, cap: usize) -> i64 {
+    if h < 1001 || h > 1064 { return -4; }
+    let tbl = get_dir_table();
+    if tbl as usize == 0 { return -4; }
+    let slot_idx = (h - 1000) as usize;
+    let slot_addr = tbl as usize + (slot_idx - 1) * 608;
+    let pis_open = (slot_addr + 12) as *mut u32;
+    if *pis_open == 0u32 { return -4; }
+    let phFind = slot_addr as *mut *mut u8;
+    let phas_entry = (slot_addr + 8) as *mut u32;
+    let pffd = (slot_addr + 16) as *mut u8;
+    let hFind = *phFind;
+
+    while *phas_entry != 0u32 {
+        let pwname = (slot_addr + 16 + 44) as *const u16;
+        let ch0 = *pwname;
+        let ch1 = *(pwname + 1);
+        let is_dot = (ch0 == 46u16 && ch1 == 0u16);
+        let is_dotdot = (ch0 == 46u16 && ch1 == 46u16 && *(pwname + 2) == 0u16);
+        if !is_dot && !is_dotdot { break; }
+        let ok = FindNextFileW(hFind, pffd);
+        if ok == 0 {
+            *phas_entry = 0u32;
+            break;
+        }
+    }
+    if *phas_entry == 0u32 { return 0; }
+
+    let pwname = (slot_addr + 16 + 44) as *const u16;
+    let wlen = utf16_null_len(pwname);
+    let u8_len = wchars_to_utf8(pwname, wlen, buf, cap);
+
+    let ok = FindNextFileW(hFind, pffd);
+    if ok == 0 {
+        *phas_entry = 0u32;
+    }
+    u8_len as i64
+}
+
+pub unsafe fn __ax_host_dir_close(h: i64) -> i64 {
+    if h < 1001 || h > 1064 { return -4; }
+    let tbl = get_dir_table();
+    if tbl as usize == 0 { return -4; }
+    let slot_idx = (h - 1000) as usize;
+    let slot_addr = tbl as usize + (slot_idx - 1) * 608;
+    let pis_open = (slot_addr + 12) as *mut u32;
+    if *pis_open == 0u32 { return -4; }
+    let phFind = slot_addr as *mut *mut u8;
+    let phas_entry = (slot_addr + 8) as *mut u32;
+    let hFind = *phFind;
+    FindClose(hFind);
+    *pis_open = 0u32;
+    *phas_entry = 0u32;
+    *phFind = 0 as *mut u8;
+    0
+}
+
+fn open_path(path_bytes: view<[u8]>, mode: u32) -> i64 {
+    let n = len(path_bytes);
+    let p = unsafe { heap_alloc(n + 1, 1) };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(p + i) = path_bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(p + n) = 0u8; }
+    let first_byte = unsafe { *p as i64 };
+    unsafe { heap_free(p, n + 1, 1); }
+    return 0 - first_byte;
+}
+
+fn remove_path(path_bytes: view<[u8]>) -> i64 {
+    let n = len(path_bytes);
+    let p = unsafe { heap_alloc(n + 1, 1) };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(p + i) = path_bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(p + n) = 0u8; }
+    let res = unsafe { remove(p as *const u8, n) };
+    unsafe { heap_free(p, n + 1, 1); }
+    res
+}
+
+fn mkdir_path(path_bytes: view<[u8]>) -> i64 {
+    let n = len(path_bytes);
+    let p = unsafe { heap_alloc(n + 1, 1) };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(p + i) = path_bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(p + n) = 0u8; }
+    let res = unsafe { mkdir(p as *const u8, n) };
+    unsafe { heap_free(p, n + 1, 1); }
+    res
+}
+
+fn dir_open_path(path_bytes: view<[u8]>) -> i64 {
+    let n = len(path_bytes);
+    let p = unsafe { heap_alloc(n + 1, 1) };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(p + i) = path_bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(p + n) = 0u8; }
+    let res = unsafe { dir_open(p as *const u8, n) };
+    unsafe { heap_free(p, n + 1, 1); }
+    res
+}
+
+struct DropGlue {}
+
+pub struct ByteBuf {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+    _glue: DropGlue,
+}
+
+impl Drop for ByteBuf {
+    fn drop(self: mut_view<ByteBuf>) {
+        if self.ptr as usize != 0 {
+            unsafe { heap_free(self.ptr, self.cap, 8); }
+            self.ptr = 0 as *mut u8;
+            self.len = 0;
+            self.cap = 0;
+        }
+    }
+}
+
+pub fn byte_buf_with_capacity(capacity: usize) -> ByteBuf {
+    let raw = unsafe { heap_alloc(capacity, 8) };
+    ByteBuf {
+        ptr: raw as *mut u8,
+        len: 0,
+        cap: capacity,
+        _glue: DropGlue {},
+    }
+}
+
+pub fn byte_buf_put_u8(b: mut_view<ByteBuf>, val: u8) {
+    if b.cap > b.len {
+        unsafe { *(b.ptr + b.len) = val; }
+        b.len = b.len + 1;
+    }
+}
+
+pub fn byte_buf_put_u32(b: mut_view<ByteBuf>, val: u32) {
+    if b.cap >= b.len + 4 {
+        unsafe {
+            let p = b.ptr + b.len;
+            *p = (val & 0xFFu32) as u8;
+            *(p + 1) = ((val >> 8) & 0xFFu32) as u8;
+            *(p + 2) = ((val >> 16) & 0xFFu32) as u8;
+            *(p + 3) = ((val >> 24) & 0xFFu32) as u8;
+        }
+        b.len = b.len + 4;
+    }
+}
+
+fn str_cmp_bytes(a: *const u8, alen: usize, b: *const u8, blen: usize) -> i32 {
+    let min_len = if blen > alen { alen } else { blen };
+    let mut i: usize = 0;
+    while min_len > i {
+        let ba = unsafe { *(a + i) };
+        let bb = unsafe { *(b + i) };
+        if bb > ba { return -1; }
+        else if ba > bb { return 1; }
+        i = i + 1;
+    }
+    if blen > alen { -1 }
+    else if alen > blen { 1 }
+    else { 0 }
+}
+
+unsafe fn make_dir_path(p: *mut u8) {
+    // "_qa_sort_dir_1" (14 chars)
+    *p = 95u8; *(p + 1) = 113u8; *(p + 2) = 97u8; *(p + 3) = 95u8;
+    *(p + 4) = 115u8; *(p + 5) = 111u8; *(p + 6) = 114u8; *(p + 7) = 116u8;
+    *(p + 8) = 95u8; *(p + 9) = 100u8; *(p + 10) = 105u8; *(p + 11) = 114u8;
+    *(p + 12) = 95u8; *(p + 13) = 49u8; *(p + 14) = 0u8;
+}
+
+unsafe fn make_file_path(p: *mut u8, letter: u8, digit: u8) {
+    make_dir_path(p);
+    *(p + 14) = 92u8; // '\'
+    *(p + 15) = letter;
+    *(p + 16) = 95u8; // '_'
+    *(p + 17) = digit;
+    *(p + 18) = 46u8; // '.'
+    *(p + 19) = 116u8; // 't'
+    *(p + 20) = 120u8; // 'x'
+    *(p + 21) = 116u8; // 't'
+    *(p + 22) = 0u8;
+}
+
+fn test_binary_roundtrip() -> i32 {
+    let file_path = unsafe { heap_alloc(32, 1) };
+    unsafe {
+        *file_path = 95u8; *(file_path + 1) = 113u8; *(file_path + 2) = 97u8; *(file_path + 3) = 95u8;
+        *(file_path + 4) = 98u8; *(file_path + 5) = 105u8; *(file_path + 6) = 110u8; *(file_path + 7) = 95u8;
+        *(file_path + 8) = 98u8; *(file_path + 9) = 117u8; *(file_path + 10) = 102u8; *(file_path + 11) = 95u8;
+        *(file_path + 12) = 116u8; *(file_path + 13) = 109u8; *(file_path + 14) = 112u8; *(file_path + 15) = 46u8;
+        *(file_path + 16) = 98u8; *(file_path + 17) = 105u8; *(file_path + 18) = 110u8; *(file_path + 19) = 0u8;
+    }
+    // Delete any previous leftover
+    unsafe { remove(file_path as *const u8, 19); }
+
+    let mut buf = byte_buf_with_capacity(32);
+    byte_buf_put_u8(mut_view(buf), 0x00u8);
+    byte_buf_put_u8(mut_view(buf), 0xFFu8);
+    byte_buf_put_u8(mut_view(buf), 0x55u8);
+    byte_buf_put_u8(mut_view(buf), 0xAAu8);
+    byte_buf_put_u8(mut_view(buf), 0x7Fu8);
+    byte_buf_put_u8(mut_view(buf), 0x80u8);
+    byte_buf_put_u32(mut_view(buf), 0xDEADBEEFu32);
+    byte_buf_put_u32(mut_view(buf), 0x12345678u32);
+    byte_buf_put_u32(mut_view(buf), 0xCAFEBABEu32);
+
+    let test_len: usize = buf.len;
+    if test_len != 18 {
+        unsafe { heap_free(file_path, 32, 1); }
+        return 1;
+    }
+
+    // Write binary file (mode 1 = write create)
+    let hw = unsafe { open(file_path as *const u8, 19, 1u32) };
+    if hw < 0 {
+        unsafe { heap_free(file_path, 32, 1); }
+        return 2;
+    }
+    let wr = unsafe { write(hw, buf.ptr as *const u8, test_len) };
+    close(hw);
+    if wr != test_len as i64 {
+        unsafe {
+            remove(file_path as *const u8, 19);
+            heap_free(file_path, 32, 1);
+        }
+        return 3;
+    }
+
+    // Read back binary file (mode 0 = read)
+    let hr = unsafe { open(file_path as *const u8, 19, 0u32) };
+    if hr < 0 {
+        unsafe {
+            remove(file_path as *const u8, 19);
+            heap_free(file_path, 32, 1);
+        }
+        return 4;
+    }
+    let sz = unsafe { file_size(hr) };
+    if sz != test_len as i64 {
+        close(hr);
+        unsafe {
+            remove(file_path as *const u8, 19);
+            heap_free(file_path, 32, 1);
+        }
+        return 5;
+    }
+
+    let rd_buf = unsafe { heap_alloc(test_len, 1) };
+    let rd = unsafe { read(hr, rd_buf, test_len) };
+    close(hr);
+    if rd != test_len as i64 {
+        unsafe {
+            heap_free(rd_buf, test_len, 1);
+            remove(file_path as *const u8, 19);
+            heap_free(file_path, 32, 1);
+        }
+        return 6;
+    }
+
+    // Verify exact byte-identical roundtrip
+    let mut idx: usize = 0;
+    while idx < test_len {
+        let orig = unsafe { *(buf.ptr + idx) };
+        let read_byte = unsafe { *(rd_buf + idx) };
+        if orig != read_byte {
+            unsafe {
+                heap_free(rd_buf, test_len, 1);
+                remove(file_path as *const u8, 19);
+                heap_free(file_path, 32, 1);
+            }
+            return 7;
+        }
+        idx = idx + 1;
+    }
+    unsafe {
+        heap_free(rd_buf, test_len, 1);
+        remove(file_path as *const u8, 19);
+        heap_free(file_path, 32, 1);
+    }
+
+    0
+}
+
+fn test_dir_sort() -> i32 {
+    let dir_path: *mut u8 = unsafe { heap_alloc(32, 1) };
+    // "test_sort_dir" (13 chars)
+    unsafe {
+        *dir_path = 0x74;
+        *(dir_path + 1) = 0x65;
+        *(dir_path + 2) = 0x73;
+        *(dir_path + 3) = 0x74;
+        *(dir_path + 4) = 0x5f;
+        *(dir_path + 5) = 0x73;
+        *(dir_path + 6) = 0x6f;
+        *(dir_path + 7) = 0x72;
+        *(dir_path + 8) = 0x74;
+        *(dir_path + 9) = 0x5f;
+        *(dir_path + 10) = 0x64;
+        *(dir_path + 11) = 0x69;
+        *(dir_path + 12) = 0x72;
+    }
+
+    let mk: i64 = unsafe { mkdir(dir_path as *const u8, 13) };
+    if mk < 0 {
+        unsafe { heap_free(dir_path, 32, 1); }
+        return 8;
+    }
+
+    // Create file c: "test_sort_dir/c.txt" (19 chars)
+    let fc_path: *mut u8 = unsafe { heap_alloc(32, 1) };
+    unsafe {
+        let mut i: usize = 0;
+        while i < 13 {
+            *(fc_path + i) = *(dir_path + i);
+            i = i + 1;
+        }
+        *(fc_path + 13) = 0x2f; // '/'
+        *(fc_path + 14) = 0x63; // 'c'
+        *(fc_path + 15) = 0x2e; // '.'
+        *(fc_path + 16) = 0x74; // 't'
+        *(fc_path + 17) = 0x78; // 'x'
+        *(fc_path + 18) = 0x74; // 't'
+    }
+    let hc: i64 = unsafe { open(fc_path as *const u8, 19, 1) };
+    if hc < 0 {
+        unsafe {
+            remove(dir_path as *const u8, 13);
+            heap_free(fc_path, 32, 1);
+            heap_free(dir_path, 32, 1);
+        }
+        return 9;
+    }
+    close(hc);
+
+    // Create file a: "test_sort_dir/a.txt" (19 chars)
+    let fa_path: *mut u8 = unsafe { heap_alloc(32, 1) };
+    unsafe {
+        let mut i: usize = 0;
+        while i < 19 {
+            *(fa_path + i) = *(fc_path + i);
+            i = i + 1;
+        }
+        *(fa_path + 14) = 0x61; // 'a'
+    }
+    let ha: i64 = unsafe { open(fa_path as *const u8, 19, 1) };
+    if ha < 0 {
+        unsafe {
+            remove(fc_path as *const u8, 19);
+            remove(dir_path as *const u8, 13);
+            heap_free(fa_path, 32, 1);
+            heap_free(fc_path, 32, 1);
+            heap_free(dir_path, 32, 1);
+        }
+        return 10;
+    }
+    close(ha);
+
+    // Create file b: "test_sort_dir/b.txt" (19 chars)
+    let fb_path: *mut u8 = unsafe { heap_alloc(32, 1) };
+    unsafe {
+        let mut i: usize = 0;
+        while i < 19 {
+            *(fb_path + i) = *(fc_path + i);
+            i = i + 1;
+        }
+        *(fb_path + 14) = 0x62; // 'b'
+    }
+    let hb: i64 = unsafe { open(fb_path as *const u8, 19, 1) };
+    if hb < 0 {
+        unsafe {
+            remove(fa_path as *const u8, 19);
+            remove(fc_path as *const u8, 19);
+            remove(dir_path as *const u8, 13);
+            heap_free(fa_path, 32, 1);
+            heap_free(fb_path, 32, 1);
+            heap_free(fc_path, 32, 1);
+            heap_free(dir_path, 32, 1);
+        }
+        return 11;
+    }
+    close(hb);
+
+    // Open directory and collect entries
+    let dh: i64 = unsafe { dir_open(dir_path as *const u8, 13) };
+    if dh < 0 {
+        unsafe {
+            remove(fa_path as *const u8, 19);
+            remove(fb_path as *const u8, 19);
+            remove(fc_path as *const u8, 19);
+            remove(dir_path as *const u8, 13);
+            heap_free(fa_path, 32, 1);
+            heap_free(fb_path, 32, 1);
+            heap_free(fc_path, 32, 1);
+            heap_free(dir_path, 32, 1);
+        }
+        return 12;
+    }
+
+    let entry_storage = unsafe { heap_alloc(3 * 64, 1) };
+    let mut entry_lens: [3]usize = [0usize; 3];
+    let mut entry_count: usize = 0;
+    let temp_name = unsafe { heap_alloc(64, 1) };
+
+    let mut loop_count: usize = 0;
+    while loop_count < 10 {
+        let n = unsafe { dir_next(dh, temp_name, 64) };
+        if n == 0 { break; }
+        if n > 0 && entry_count < 3 {
+            let un = n as usize;
+            let dst = unsafe { entry_storage + entry_count * 64 };
+            unsafe { ptr_copy_nonoverlapping<u8>(temp_name as *const u8, dst, un); }
+            entry_lens[entry_count] = un;
+            entry_count = entry_count + 1;
+        }
+        loop_count = loop_count + 1;
+    }
+    dir_close(dh);
+    unsafe { heap_free(temp_name, 64, 1); }
+
+    if entry_count != 3 {
+        unsafe {
+            remove(fa_path as *const u8, 19);
+            remove(fb_path as *const u8, 19);
+            remove(fc_path as *const u8, 19);
+            remove(dir_path as *const u8, 13);
+            heap_free(fa_path, 32, 1);
+            heap_free(fb_path, 32, 1);
+            heap_free(fc_path, 32, 1);
+            heap_free(dir_path, 32, 1);
+            heap_free(entry_storage, 3 * 64, 1);
+        }
+        return 13;
+    }
+
+    // Deterministic in-place sort of the 3 directory entries
+    let tmp_slot = unsafe { heap_alloc(64, 1) };
+    let mut i: usize = 0;
+    while i < entry_count - 1 {
+        let mut min_idx = i;
+        let mut j = i + 1;
+        while j < entry_count {
+            let pj = unsafe { entry_storage + j * 64 };
+            let pmin = unsafe { entry_storage + min_idx * 64 };
+            let cmp = str_cmp_bytes(pj as *const u8, entry_lens[j], pmin as *const u8, entry_lens[min_idx]);
+            if 0 > cmp {
+                min_idx = j;
+            }
+            j = j + 1;
+        }
+        if min_idx != i {
+            unsafe {
+                let pi = entry_storage + i * 64;
+                let pmin = entry_storage + min_idx * 64;
+                ptr_copy_nonoverlapping<u8>(pi as *const u8, tmp_slot, 64);
+                ptr_copy_nonoverlapping<u8>(pmin as *const u8, pi, 64);
+                ptr_copy_nonoverlapping<u8>(tmp_slot as *const u8, pmin, 64);
+            }
+            let tlen = entry_lens[i];
+            entry_lens[i] = entry_lens[min_idx];
+            entry_lens[min_idx] = tlen;
+        }
+        i = i + 1;
+    }
+    unsafe { heap_free(tmp_slot, 64, 1); }
+
+    // Verify sorted order:
+    // Entry 0 must be "a.txt" (first byte 'a' = 0x61)
+    // Entry 1 must be "b.txt" (first byte 'b' = 0x62)
+    // Entry 2 must be "c.txt" (first byte 'c' = 0x63)
+    let e0 = unsafe { *(entry_storage + 0 * 64) };
+    let e1 = unsafe { *(entry_storage + 1 * 64) };
+    let e2 = unsafe { *(entry_storage + 2 * 64) };
+
+    let mut sort_ok = true;
+    if e0 != 0x61u8 || e1 != 0x62u8 || e2 != 0x63u8 {
+        sort_ok = false;
+    }
+
+    // Clean up temporary files and directory
+    unsafe {
+        remove(fa_path as *const u8, 19);
+        remove(fb_path as *const u8, 19);
+        remove(fc_path as *const u8, 19);
+        remove(dir_path as *const u8, 13);
+        heap_free(fa_path, 32, 1);
+        heap_free(fb_path, 32, 1);
+        heap_free(fc_path, 32, 1);
+        heap_free(dir_path, 32, 1);
+        heap_free(entry_storage, 3 * 64, 1);
+    }
+
+    if !sort_ok { return 14; }
+    0
+}
+
+fn main() -> i32 {
+    let r1 = test_binary_roundtrip();
+    if r1 != 0 { return r1; }
+
+    let r2 = test_dir_sort();
+    if r2 != 0 { return r2 + 20; }
+
+    0
+}
