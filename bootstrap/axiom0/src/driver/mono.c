@@ -61,7 +61,7 @@ static TypeId subst_ty_local(TypeId ty, const AxGenericArgs *args, TypeInterner 
     const AxType *t = ax_type_get(in, ty);
     if (!t) return ty;
     if (t->kind == AX_TY_PARAM) {
-        if (t->param.index < args->count) return args->args[t->param.index];
+        if (t->param.index < args->count && args->args[t->param.index].v != 0) return args->args[t->param.index];
         return ty;
     }
     AxType new_t = *t;
@@ -111,6 +111,14 @@ static TypeId subst_ty_local(TypeId ty, const AxGenericArgs *args, TypeInterner 
                 if (s_args[i].v != t->strct.args[i].v) changed = true;
             }
             new_t.strct.args = s_args;
+            if (t->strct.field_count > 0 && t->strct.fields) {
+                TypeId *s_fields = malloc(t->strct.field_count * sizeof(TypeId));
+                for (size_t i = 0; i < t->strct.field_count; i++) {
+                    s_fields[i] = subst_ty_local(t->strct.fields[i], args, in);
+                    if (s_fields[i].v != t->strct.fields[i].v) changed = true;
+                }
+                new_t.strct.fields = s_fields;
+            }
             break;
         }
         case AX_TY_ENUM: {
@@ -188,14 +196,20 @@ static bool args_eq(const AxGenericArgs *a, const AxGenericArgs *b) {
 
 static WorkItem *find_or_create_inst(AxDriverState *st, AxHirItem *orig_item, AxGenericArgs args) {
     for (WorkItem *w = g_instances; w; w = w->next) {
-        if (w->orig_item == orig_item && args_eq(&w->args, &args)) return w;
+        if ((w->orig_item == orig_item || (orig_item->fn.symbol.v != 0 && w->orig_item->fn.symbol.v == orig_item->fn.symbol.v)) && args_eq(&w->args, &args)) return w;
     }
     WorkItem *w = malloc(sizeof(WorkItem));
     w->orig_item = orig_item;
     w->args = args;
     w->body = NULL;
     
-    if (args.count == 0) {
+    if (orig_item->fn.name.v == 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "__ax_fn_%u", orig_item->fn.symbol.v);
+        w->mangled_name = ax_intern_cstr(&st->interner, buf);
+        w->mangled_sym = orig_item->fn.symbol;
+        w->new_item = orig_item;
+    } else if (args.count == 0) {
         w->mangled_sym = orig_item->fn.symbol;
         w->mangled_name = orig_item->fn.name;
         w->new_item = orig_item;
@@ -213,6 +227,12 @@ static WorkItem *find_or_create_inst(AxDriverState *st, AxHirItem *orig_item, Ax
         w->new_item->fn.symbol = w->mangled_sym;
         w->new_item->next = st->hir.items;
         st->hir.items = w->new_item;
+
+        const TypeId *orig_pty = AxItemTypeMap_get(&st->thir.item_types, orig_item);
+        if (orig_pty) {
+            TypeId new_ty = subst_ty_local(*orig_pty, &args, &st->thir.interner);
+            AxItemTypeMap_insert(&st->thir.item_types, w->new_item, new_ty);
+        }
     }
     
     w->next = g_instances;
@@ -223,6 +243,12 @@ static WorkItem *find_or_create_inst(AxDriverState *st, AxHirItem *orig_item, Ax
     todo->next = g_worklist;
     g_worklist = todo;
     return w;
+}
+
+static void subst_operand(AxMirOperand *op, const AxGenericArgs *args, TypeInterner *in) {
+    if (op->kind == AX_MIR_OP_CONST) {
+        op->constant.ty = subst_ty_local(op->constant.ty, args, in);
+    }
 }
 
 static AxMirBody *subst_mir_body(AxDriverState *st, AxMirBody *orig, const AxGenericArgs *args) {
@@ -244,33 +270,99 @@ static AxMirBody *subst_mir_body(AxDriverState *st, AxMirBody *orig, const AxGen
             for (size_t j = 0; j < b->bbs[i].stmt_count; j++) {
                 AxMirStmt *stmt = &b->bbs[i].stmts[j];
                 if (stmt->kind == AX_MIR_STMT_ASSIGN) {
-                    if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_CAST) {
-                        stmt->assign.rvalue.cast.ty = subst_ty_local(stmt->assign.rvalue.cast.ty, args, &st->thir.interner);
-                    }
-                    if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_USE && stmt->assign.rvalue.use.kind == AX_MIR_OP_CONST) {
-                        stmt->assign.rvalue.use.constant.ty = subst_ty_local(stmt->assign.rvalue.use.constant.ty, args, &st->thir.interner);
+                    switch (stmt->assign.rvalue.kind) {
+                        case AX_MIR_RVALUE_USE:
+                            subst_operand(&stmt->assign.rvalue.use, args, &st->thir.interner);
+                            break;
+                        case AX_MIR_RVALUE_REPEAT:
+                            subst_operand(&stmt->assign.rvalue.repeat.op, args, &st->thir.interner);
+                            subst_operand(&stmt->assign.rvalue.repeat.count, args, &st->thir.interner);
+                            break;
+                        case AX_MIR_RVALUE_CAST:
+                            stmt->assign.rvalue.cast.ty = subst_ty_local(stmt->assign.rvalue.cast.ty, args, &st->thir.interner);
+                            subst_operand(&stmt->assign.rvalue.cast.op, args, &st->thir.interner);
+                            break;
+                        case AX_MIR_RVALUE_BINARY_OP:
+                            subst_operand(&stmt->assign.rvalue.binary_op.lhs, args, &st->thir.interner);
+                            subst_operand(&stmt->assign.rvalue.binary_op.rhs, args, &st->thir.interner);
+                            break;
+                        case AX_MIR_RVALUE_UNARY_OP:
+                            subst_operand(&stmt->assign.rvalue.unary_op.operand, args, &st->thir.interner);
+                            break;
+                        case AX_MIR_RVALUE_AGGREGATE:
+                            if (stmt->assign.rvalue.aggregate.operand_count > 0) {
+                                size_t op_cnt = stmt->assign.rvalue.aggregate.operand_count;
+                                AxMirOperand *ops = ax_arena_alloc(&st->hir_arena, op_cnt * sizeof(AxMirOperand), _Alignof(AxMirOperand));
+                                memcpy(ops, stmt->assign.rvalue.aggregate.operands, op_cnt * sizeof(AxMirOperand));
+                                for (size_t k = 0; k < op_cnt; k++) {
+                                    subst_operand(&ops[k], args, &st->thir.interner);
+                                }
+                                stmt->assign.rvalue.aggregate.operands = ops;
+                            }
+                            break;
+                        default: break;
                     }
                 }
             }
         }
         
         AxMirTerminator *term = &b->bbs[i].terminator;
-        if (term->kind == AX_MIR_TERM_CALL) {
-            if (term->call.func.kind == AX_MIR_OP_CONST) {
-                term->call.func.constant.ty = subst_ty_local(term->call.func.constant.ty, args, &st->thir.interner);
-            }
-            if (term->call.arg_count > 0) {
-                term->call.args = ax_arena_alloc(&st->hir_arena, orig->bbs[i].terminator.call.arg_count * sizeof(AxMirOperand), _Alignof(AxMirOperand));
-                memcpy(term->call.args, orig->bbs[i].terminator.call.args, term->call.arg_count * sizeof(AxMirOperand));
-                for (size_t j = 0; j < term->call.arg_count; j++) {
-                    if (term->call.args[j].kind == AX_MIR_OP_CONST) {
-                        term->call.args[j].constant.ty = subst_ty_local(term->call.args[j].constant.ty, args, &st->thir.interner);
+        switch (term->kind) {
+            case AX_MIR_TERM_CALL:
+                subst_operand(&term->call.func, args, &st->thir.interner);
+                if (term->call.arg_count > 0) {
+                    term->call.args = ax_arena_alloc(&st->hir_arena, orig->bbs[i].terminator.call.arg_count * sizeof(AxMirOperand), _Alignof(AxMirOperand));
+                    memcpy(term->call.args, orig->bbs[i].terminator.call.args, term->call.arg_count * sizeof(AxMirOperand));
+                    for (size_t j = 0; j < term->call.arg_count; j++) {
+                        subst_operand(&term->call.args[j], args, &st->thir.interner);
                     }
                 }
-            }
+                break;
+            case AX_MIR_TERM_SWITCH_INT:
+                subst_operand(&term->switch_int.discr, args, &st->thir.interner);
+                break;
+            case AX_MIR_TERM_ASSERT:
+                subst_operand(&term->assert.cond, args, &st->thir.interner);
+                break;
+            default: break;
         }
     }
     return b;
+}
+
+static bool impl_matches_receiver(AxDriverState *st, const AxHirItem *impl_it, TypeId receiver_ty) {
+    if (receiver_ty.v == 0 || !impl_it->impl.self_type) return false;
+    const AxType *rt = ax_type_get(&st->thir.interner, receiver_ty);
+    while (rt && (rt->kind == AX_TY_VIEW || rt->kind == AX_TY_MUT_VIEW || rt->kind == AX_TY_PTR)) {
+        receiver_ty = (rt->kind == AX_TY_PTR) ? rt->ptr.pointee : rt->view.pointee;
+        if (receiver_ty.v == 0) return false;
+        rt = ax_type_get(&st->thir.interner, receiver_ty);
+    }
+    if (!rt) return false;
+
+    const AxHirType *st_hir = impl_it->impl.self_type;
+    if (st_hir->kind == AX_HIR_TYPE_PATH) {
+        if (st_hir->path.path.symbol.v != 0) {
+            if (rt->kind == AX_TY_STRUCT && rt->strct.def && rt->strct.def->struct_decl.symbol.v == st_hir->path.path.symbol.v) return true;
+            if (rt->kind == AX_TY_ENUM && rt->enm.def && rt->enm.def->enum_decl.symbol.v == st_hir->path.path.symbol.v) return true;
+        }
+        StrId s_name = st_hir->path.path.name;
+        if (s_name.v != 0) {
+            if (rt->kind == AX_TY_STRUCT && rt->strct.def && rt->strct.def->struct_decl.name.v == s_name.v) return true;
+            if (rt->kind == AX_TY_ENUM && rt->enm.def && rt->enm.def->enum_decl.name.v == s_name.v) return true;
+            StrView sv = ax_interner_get(&st->interner, s_name);
+            if (rt->kind == AX_TY_I32 && ax_sv_eq(sv, ax_sv_cstr("i32"))) return true;
+            if (rt->kind == AX_TY_U32 && ax_sv_eq(sv, ax_sv_cstr("u32"))) return true;
+            if (rt->kind == AX_TY_I64 && ax_sv_eq(sv, ax_sv_cstr("i64"))) return true;
+            if (rt->kind == AX_TY_U64 && ax_sv_eq(sv, ax_sv_cstr("u64"))) return true;
+            if (rt->kind == AX_TY_ISIZE && ax_sv_eq(sv, ax_sv_cstr("isize"))) return true;
+            if (rt->kind == AX_TY_USIZE && ax_sv_eq(sv, ax_sv_cstr("usize"))) return true;
+            if (rt->kind == AX_TY_BOOL && ax_sv_eq(sv, ax_sv_cstr("bool"))) return true;
+            if (rt->kind == AX_TY_CHAR && ax_sv_eq(sv, ax_sv_cstr("char"))) return true;
+            if (rt->kind == AX_TY_STR && ax_sv_eq(sv, ax_sv_cstr("str"))) return true;
+        }
+    }
+    return false;
 }
 
 void ax_stage_mono(struct AxDriverState *st) {
@@ -307,6 +399,15 @@ void ax_stage_mono(struct AxDriverState *st) {
                             callee = it;
                             break;
                         }
+                        if (it->kind == AX_HIR_ITEM_IMPL) {
+                            for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                                if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == sym_v.v) {
+                                    callee = m;
+                                    break;
+                                }
+                            }
+                            if (callee) break;
+                        }
                     }
                     if (!callee) {
                         AxHirItem *trait_method = NULL;
@@ -318,20 +419,36 @@ void ax_stage_mono(struct AxDriverState *st) {
                                         break;
                                     }
                                 }
+                                if (trait_method) break;
                             }
                         }
                         if (trait_method) {
-                            // Find the impl for S
+                            TypeId receiver_ty = (TypeId){0};
+                            if (term->call.arg_count > 0) {
+                                if (term->call.args[0].kind == AX_MIR_OP_CONST) {
+                                    receiver_ty = term->call.args[0].constant.ty;
+                                } else {
+                                    receiver_ty = w->body->locals[term->call.args[0].place.local.v].ty;
+                                }
+                            }
+                            // Find the matching impl for receiver_ty
                             for (AxHirItem *it = st->hir.items; it; it = it->next) {
                                 if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path) {
-                                    for (AxHirItem *m = it->impl.members; m; m = m->next) {
-                                        if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == trait_method->fn.name.v) {
-                                            callee = m;
-                                            term->call.func.constant.val = m->fn.symbol.v;
-                                            break;
+                                    if (receiver_ty.v == 0 || impl_matches_receiver(st, it, receiver_ty)) {
+                                        for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                                            if (m->kind == AX_HIR_ITEM_FN && m->fn.name.v == trait_method->fn.name.v) {
+                                                callee = m;
+                                                term->call.func.constant.val = m->fn.symbol.v;
+                                                break;
+                                            }
                                         }
+                                        if (callee) break;
                                     }
                                 }
+                            }
+                            if (!callee) {
+                                callee = trait_method;
+                                term->call.func.constant.val = trait_method->fn.symbol.v;
                             }
                         }
                     }
@@ -346,9 +463,42 @@ void ax_stage_mono(struct AxDriverState *st) {
                             TypeId spec_ty = term->call.func.constant.ty;
                             TypeId *args = calloc(count, sizeof(TypeId));
                             deduce_args(gen_ty, spec_ty, &st->thir.interner, args);
+
+                            const AxType *gt = ax_type_get(&st->thir.interner, gen_ty);
+                            if (gt && gt->kind == AX_TY_FN) {
+                                for (size_t a = 0; a < term->call.arg_count && a < gt->fn.param_count; a++) {
+                                    TypeId arg_ty = (TypeId){0};
+                                    if (term->call.args[a].kind == AX_MIR_OP_CONST) {
+                                        arg_ty = term->call.args[a].constant.ty;
+                                    } else if (term->call.args[a].place.local.v < w->body->local_count) {
+                                        arg_ty = w->body->locals[term->call.args[a].place.local.v].ty;
+                                    }
+                                    if (arg_ty.v != 0) {
+                                        deduce_args(gt->fn.param_types[a], arg_ty, &st->thir.interner, args);
+                                    }
+                                }
+                                if (term->call.destination.local.v < w->body->local_count) {
+                                    TypeId ret_ty = w->body->locals[term->call.destination.local.v].ty;
+                                    if (ret_ty.v != 0) {
+                                        deduce_args(gt->fn.ret_type, ret_ty, &st->thir.interner, args);
+                                    }
+                                }
+                            }
+
                             AxGenericArgs gargs = { args, count };
                             WorkItem *callee_inst = find_or_create_inst(st, callee, gargs);
                             term->call.func.constant.val = callee_inst->mangled_sym.v;
+                            const TypeId *inst_ty = AxItemTypeMap_get(&st->thir.item_types, callee_inst->new_item);
+                            if (inst_ty && inst_ty->v != 0) {
+                                term->call.func.constant.ty = *inst_ty;
+                            }
+                        }
+                    } else if (callee) {
+                        WorkItem *callee_inst = find_or_create_inst(st, callee, (AxGenericArgs){NULL, 0});
+                        term->call.func.constant.val = callee_inst->mangled_sym.v;
+                        const TypeId *inst_ty = AxItemTypeMap_get(&st->thir.item_types, callee_inst->new_item);
+                        if (inst_ty && inst_ty->v != 0) {
+                            term->call.func.constant.ty = *inst_ty;
                         }
                     }
                 }
@@ -364,6 +514,43 @@ void ax_stage_mono(struct AxDriverState *st) {
             saved = saved->next;
         }
         free(w);
+    }
+
+    // Deduplicate any colliding symbol names in g_instances
+    for (WorkItem *w = g_instances; w; w = w->next) {
+        if (!w->body || !w->orig_item || w->orig_item->fn.name.v == 0) continue;
+        StrView w_name = ax_interner_get(&st->interner, w->orig_item->fn.name);
+        if (ax_sv_eq(w_name, ax_sv_cstr("main"))) continue;
+
+        bool has_duplicate = false;
+        for (WorkItem *other = g_instances; other; other = other->next) {
+            if (other != w && other->body && other->orig_item && other->orig_item->fn.name.v != 0 &&
+                other->orig_item->fn.name.v == w->orig_item->fn.name.v) {
+                has_duplicate = true;
+                break;
+            }
+        }
+
+        if (has_duplicate) {
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%.*s_%u", (int)w_name.len, w_name.ptr, w->mangled_sym.v);
+            StrId new_name = ax_intern_cstr(&st->interner, buf);
+            w->mangled_name = new_name;
+            if (w->new_item) w->new_item->fn.name = new_name;
+            if (w->orig_item) w->orig_item->fn.name = new_name;
+            for (AxHirItem *it = st->hir.items; it; it = it->next) {
+                if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == w->mangled_sym.v) {
+                    it->fn.name = new_name;
+                }
+                if (it->kind == AX_HIR_ITEM_IMPL) {
+                    for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                        if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == w->mangled_sym.v) {
+                            m->fn.name = new_name;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     AxMonoInstance **tail = &st->mono_instances;

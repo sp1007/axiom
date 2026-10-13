@@ -22,29 +22,33 @@ extern const char *ax_opt_stack_reserve;
 
 static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64FrameLayout *layout, ax_objmodel_t *obj) {
     switch (inst->opcode) {
-        case AX_X64_MI_MOV:
+        case AX_X64_MI_MOV: {
+            uint8_t sz = inst->sz ? inst->sz : 8;
             if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
-                ax_x64_mov_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+                ax_x64_mov_rr(sec, sz, inst->ops[0].reg, inst->ops[1].reg);
             } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_MEM) {
-                ax_x64_mov_rm(sec, 8, inst->ops[0].reg, inst->ops[1].mem);
+                ax_x64_mov_rm(sec, sz, inst->ops[0].reg, inst->ops[1].mem);
             } else if (inst->ops[0].kind == AX_X64_OP_MEM && inst->ops[1].kind == AX_X64_OP_REG) {
-                ax_x64_mov_mr(sec, 8, inst->ops[0].mem, inst->ops[1].reg);
+                ax_x64_mov_mr(sec, sz, inst->ops[0].mem, inst->ops[1].reg);
             } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
-                ax_x64_mov_ri(sec, 8, inst->ops[0].reg, inst->ops[1].imm);
+                ax_x64_mov_ri(sec, sz, inst->ops[0].reg, inst->ops[1].imm);
             } else if (inst->ops[0].kind == AX_X64_OP_MEM && inst->ops[1].kind == AX_X64_OP_IMM) {
-                ax_x64_mov_mi(sec, 8, inst->ops[0].mem, (int32_t)inst->ops[1].imm);
+                ax_x64_mov_mi(sec, sz, inst->ops[0].mem, (int32_t)inst->ops[1].imm);
             }
             break;
+        }
         
-        case AX_X64_MI_CMP:
+        case AX_X64_MI_CMP: {
+            uint8_t sz = inst->sz ? inst->sz : 8;
             if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_REG) {
-                ax_x64_cmp_rr(sec, 8, inst->ops[0].reg, inst->ops[1].reg);
+                ax_x64_cmp_rr(sec, sz, inst->ops[0].reg, inst->ops[1].reg);
             } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_MEM) {
-                ax_x64_cmp_rm(sec, 8, inst->ops[0].reg, inst->ops[1].mem);
+                ax_x64_cmp_rm(sec, sz, inst->ops[0].reg, inst->ops[1].mem);
             } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_IMM) {
-                ax_x64_cmp_ri(sec, 8, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
+                ax_x64_cmp_ri(sec, sz, inst->ops[0].reg, (int32_t)inst->ops[1].imm);
             }
             break;
+        }
         case AX_X64_MI_JMP:
             if (inst->ops[0].kind == AX_X64_OP_IMM) {
                 ax_x64_jmp(sec, (int32_t)inst->ops[0].imm);
@@ -160,6 +164,8 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
             if (inst->msg) {
                 ax_section_add_bytes(sec, (const uint8_t[]){0xE8, 0, 0, 0, 0}, 5);
                 ax_section_add_reloc(sec, sec->bytes_len - 4, AX_RELOC_X86_64_PC32, ax_objmodel_add_symbol(obj, inst->msg, (ax_section_id_t){0}, 0, 0, AX_SYM_EXTERNAL), -4);
+            } else if (inst->op_count > 0 && inst->ops[0].kind == AX_X64_OP_REG) {
+                ax_x64_call_r(sec, inst->ops[0].reg);
             }
             break;
     }
@@ -183,10 +189,28 @@ void ax_stage_build_native(AxDriverState *st) {
             if (mir_body) {
                 const TypeId *pty = AxItemTypeMap_get(&st->thir.item_types, item);
                 TypeId ty_id = pty ? *pty : (TypeId){0};
+                if (ty_id.v != 0) {
+                    const AxType *item_ty = ax_type_get(&st->thir.interner, ty_id);
+                    if (item_ty && item_ty->kind == AX_TY_CLOSURE && item_ty->closure.fn_type.v != 0) {
+                        ty_id = item_ty->closure.fn_type;
+                    }
+                }
                 if (ty_id.v == 0) {
+                    size_t arg_count = 0;
+                    for (size_t i = 1; i < mir_body->local_count; i++) {
+                        if (mir_body->locals[i].kind == AX_MIR_LOCAL_ARG) arg_count++;
+                        else break;
+                    }
+                    TypeId *param_types = malloc((arg_count ? arg_count : 1) * sizeof(TypeId));
+                    for (size_t i = 0; i < arg_count; i++) {
+                        param_types[i] = mir_body->locals[i + 1].ty;
+                    }
                     AxType dummy;
                     memset(&dummy, 0, sizeof(dummy));
                     dummy.kind = AX_TY_FN;
+                    dummy.fn.ret_type = mir_body->locals[0].ty;
+                    dummy.fn.param_count = arg_count;
+                    dummy.fn.param_types = param_types;
                     ty_id = ax_intern_type(&st->thir.interner, &dummy);
                 }
                 const AxType *fn_ty = ax_type_get(&st->thir.interner, ty_id);
@@ -218,9 +242,13 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
                     func_start = text_sec->bytes_len;
 
-                    StrView name = ax_interner_get(&st->interner, inst->mangled_name);
                     char name_buf[256];
-                    snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+                    if (inst->mangled_name.v != 0) {
+                        StrView name = ax_interner_get(&st->interner, inst->mangled_name);
+                        snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+                    } else {
+                        snprintf(name_buf, 256, "__ax_fn_%u", (uint32_t)item->fn.symbol.v);
+                    }
 
 
                     ax_x64_frame_emit_prologue(text_sec, &layout);
@@ -245,12 +273,15 @@ void ax_stage_build_native(AxDriverState *st) {
                                 ax_x64_jcc(text_sec, (uint8_t)inst->ops[0].imm, 0);
 
                             } else if (inst->opcode == AX_X64_MI_LEA && inst->ops[1].kind == AX_X64_OP_SYM) {
-                                char sym_name[64];
-                                snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, inst->ops[1].sym);
-                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(sym_name), ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL);
-                                ax_section_add_bytes(text_sec, (const uint8_t[]){0x48, 0x8D, 0x05}, 3);
-                                ax_section_add_reloc(text_sec, text_sec->bytes_len, AX_RELOC_X86_64_PC32, str_sym, -4);
-                                ax_section_add_bytes(text_sec, (const uint8_t[]){0, 0, 0, 0}, 4);
+                                if (inst->msg) {
+                                    ax_symbol_id_t fn_sym = ax_objmodel_add_symbol(&obj, inst->msg, ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL);
+                                    ax_x64_lea_sym(text_sec, inst->ops[0].reg, fn_sym);
+                                } else {
+                                    char sym_name[64];
+                                    snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, inst->ops[1].sym);
+                                    ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(sym_name), ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL);
+                                    ax_x64_lea_sym(text_sec, inst->ops[0].reg, str_sym);
+                                }
                             } else if (inst->opcode == AX_X64_MI_ASSERT) {
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 2;
                                 fixups[num_fixups].target = inst->ops[0].imm;
@@ -293,7 +324,6 @@ void ax_stage_build_native(AxDriverState *st) {
                     }
 
                     uint64_t func_size = text_sec->bytes_len - func_start;
-                    printf("EXPORTING: %s\n", name_buf);
                     ax_objmodel_add_symbol(&obj, strdup(name_buf), text_sec_id, func_start, func_size, AX_SYM_GLOBAL);
                     if (strcmp(name_buf, "main") == 0) { ax_objmodel_add_symbol(&obj, strdup("ax_main"), text_sec_id, func_start, func_size, AX_SYM_GLOBAL); }
                 }

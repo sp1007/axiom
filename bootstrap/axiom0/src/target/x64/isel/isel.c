@@ -123,6 +123,12 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 8), ax_x64_op_reg(0));
                     break;
                 }
+                case AX_LIR_INST_FN_ADDR: {
+                    emit(mi, mbb, AX_X64_MI_LEA, ax_x64_op_reg(0 /*RAX*/), (AxX64Op){ .kind = AX_X64_OP_SYM, .sym = 0 });
+                    mbb->last_inst->msg = inst->fn_addr.sym_name;
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0));
+                    break;
+                }
                 case AX_LIR_INST_ADD:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
                     emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0));
@@ -407,15 +413,29 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                       break;
                                   case AX_LIR_INST_CALL: {
                       const AxType *callee_ty = ax_type_get(interner, inst->call.callee_ty);
+                      TypeId ret_ty = {0};
                       if (callee_ty) {
-                          uint32_t ret_size = ax_type_size(callee_ty->fn.ret_type, interner);
+                          if (callee_ty->kind == AX_TY_FN) {
+                              ret_ty = callee_ty->fn.ret_type;
+                          } else if (callee_ty->kind == AX_TY_CLOSURE) {
+                              ret_ty = callee_ty->closure.ret_type;
+                          }
+                      }
+                      if (ret_ty.v != 0) {
+                          uint32_t ret_size = ax_type_size(ret_ty, interner);
                           bool ret_in_mem = (ret_size > 8 || (ret_size != 1 && ret_size != 2 && ret_size != 4 && ret_size != 8 && ret_size != 0));
                           if (ret_in_mem) {
                               emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->call.dst_addr.v, 0));
                           }
                       }
-                      emit(mi, mbb, AX_X64_MI_CALL, (AxX64Op){0}, (AxX64Op){0});
-                      mbb->last_inst->msg = inst->call.sym_name;
+                      if (inst->call.sym_name) {
+                          emit(mi, mbb, AX_X64_MI_CALL, (AxX64Op){0}, (AxX64Op){0});
+                          mbb->last_inst->msg = inst->call.sym_name;
+                      } else {
+                          emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(10 /*R10*/), ax_x64_op_frame(slot_offset + inst->call.callee_vreg.v, 0));
+                          emit(mi, mbb, AX_X64_MI_CALL, ax_x64_op_reg(10 /*R10*/), (AxX64Op){0});
+                          mbb->last_inst->op_count = 1;
+                      }
                       break;
                   }
                                     case AX_LIR_INST_ABI_RESULT:

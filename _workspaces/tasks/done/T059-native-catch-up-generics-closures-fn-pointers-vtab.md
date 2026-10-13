@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T057]
 priority: 79
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/native_p7, tests/run/method, tests/run/generic, tests/run/mono, tests/run/trait, tests/run/trait2, tests/run/closure]
 locks: [bootstrap/axiom0/src/driver/build_native/build.c, bootstrap/axiom0/src/driver/mono.c, tests/ui/trait/qa_round4_bounds.ax, tests/ui/trait2/test_no_derive.ax]
 spec: [0183, 0162]
+finished: 2026-10-13 13:26:31
 ---
 # T059 — Native catch-up: generics, closures, fn pointers
 
@@ -35,3 +36,6 @@ All P7 programs run natively.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 13:26:31 accepted by QA -> done
