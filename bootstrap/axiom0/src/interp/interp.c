@@ -47,6 +47,10 @@ typedef struct {
     size_t alloc_count;
     size_t alloc_cap;
     uint64_t next_synth_addr;
+
+    bool is_comptime;
+    AxConstEvalResult comptime_result;
+    Span current_span;
 } InterpCtx;
 
 typedef struct {
@@ -55,10 +59,13 @@ typedef struct {
 
 typedef struct {
     AxMirBody *body;
-    AxInterpValue *locals;
+    uint8_t **local_ptrs;
+    uint8_t *storage;
 } CallFrame;
 
 static void panic_interp(InterpCtx *ctx, const char *msg);
+static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret);
+static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size);
 
 static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
     if (sym_v == 0) return NULL;
@@ -279,12 +286,24 @@ static uint64_t find_synth_addr(InterpCtx *ctx, uint8_t *host_ptr) {
     return 0;
 }
 
+static inline uint8_t *get_local_ptr(InterpCtx *ctx, CallFrame *frame, AxMirLocalId loc) {
+    if (loc.v >= frame->body->local_count) return (uint8_t*)&ctx->dummy_buf;
+    AxMirLocalDecl *decl = &frame->body->locals[loc.v];
+    if (decl->kind == AX_MIR_LOCAL_CONST) {
+        AxConstValue *cval = AxSymbolConstMap_get(&ctx->thir->symbol_consts, decl->const_sym);
+        if (cval && cval->kind == AX_CONST_AGGREGATE) {
+            return cval->aggregate.data;
+        }
+    }
+    return frame->local_ptrs[loc.v];
+}
+
 static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace *place, TypeId *out_ty, uint64_t *out_fat_len) {
     if (place->local.v >= frame->body->local_count) {
         return NULL; // should ICE
     }
     
-    uint8_t *ptr = (uint8_t*)&frame->locals[place->local.v];
+    uint8_t *ptr = get_local_ptr(ctx, frame, place->local);
     *out_ty = frame->body->locals[place->local.v].ty;
     uint32_t current_variant = (uint32_t)-1;
     uint64_t fat_len = 0;
@@ -355,7 +374,7 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
             
             uint64_t start_idx = 0;
             if (proj->sub_slice.has_from) {
-                uint8_t *idx_ptr = (uint8_t*)&frame->locals[proj->sub_slice.from_local.v];
+                uint8_t *idx_ptr = get_local_ptr(ctx, frame, proj->sub_slice.from_local);
                 TypeId idx_ty = frame->body->locals[proj->sub_slice.from_local.v].ty;
                 uint32_t idx_size = ax_type_size(idx_ty, &ctx->thir->interner);
                 if (idx_size == 4) start_idx = *(uint32_t*)idx_ptr;
@@ -363,7 +382,7 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
             }
             uint64_t end_idx = len;
             if (proj->sub_slice.has_to) {
-                uint8_t *idx_ptr = (uint8_t*)&frame->locals[proj->sub_slice.to_local.v];
+                uint8_t *idx_ptr = get_local_ptr(ctx, frame, proj->sub_slice.to_local);
                 TypeId idx_ty = frame->body->locals[proj->sub_slice.to_local.v].ty;
                 uint32_t idx_size = ax_type_size(idx_ty, &ctx->thir->interner);
                 if (idx_size == 4) end_idx = *(uint32_t*)idx_ptr;
@@ -399,7 +418,7 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
                 return (uint8_t*)&ctx->dummy_buf;
             }
             
-            uint8_t *idx_ptr = (uint8_t*)&frame->locals[proj->index_local.v];
+            uint8_t *idx_ptr = get_local_ptr(ctx, frame, proj->index_local);
             TypeId idx_ty = frame->body->locals[proj->index_local.v].ty;
             uint32_t idx_size = ax_type_size(idx_ty, &ctx->thir->interner);
             uint64_t index = 0;
@@ -444,19 +463,47 @@ static void panic_interp(InterpCtx *ctx, const char *msg) {
     if (ctx->out_panic_msg) {
         *ctx->out_panic_msg = msg;
     }
+    if (ctx->is_comptime) {
+        if (msg && strstr(msg, "division by zero")) {
+            ctx->comptime_result.err_code = AX_CONST_DIV_ZERO;
+        } else if (msg && (strstr(msg, "overflow") || strstr(msg, "shift amount"))) {
+            ctx->comptime_result.err_code = AX_CONST_OVERFLOW;
+        } else {
+            ctx->comptime_result.err_code = AX_CONST_OVERFLOW;
+        }
+        ctx->comptime_result.err_msg = msg;
+        ctx->comptime_result.err_span = ctx->current_span;
+    }
     ctx->failed = true;
     ctx->exit_code = 101;
 }
 
 static void check_step_limit(InterpCtx *ctx) {
     if (ctx->step_limit > 0 && ctx->steps >= ctx->step_limit) {
-        AxDiagnostic d = {0};
-        d.code = AX_DRIVER_INTERP_STEP_LIMIT;
-        d.severity = AX_DIAG_ERROR;
-        d.message = "step limit exceeded";
-        ax_diag_sink_report(ctx->sink, &d);
+        if (ctx->is_comptime) {
+            ctx->comptime_result.err_code = AX_CONST_EVAL_LIMIT;
+            ctx->comptime_result.err_msg = "evaluation limit exceeded during constant evaluation";
+            ctx->comptime_result.err_span = ctx->current_span;
+        } else {
+            AxDiagnostic d = {0};
+            d.code = AX_DRIVER_INTERP_STEP_LIMIT;
+            d.severity = AX_DIAG_ERROR;
+            d.message = "step limit exceeded";
+            ax_diag_sink_report(ctx->sink, &d);
+        }
         ctx->failed = true;
         ctx->exit_code = 124;
+    }
+}
+
+static void register_const_allocs(InterpCtx *ctx) {
+    if (!ctx->thir) return;
+    uint32_t cur = 0;
+    AxSymbolConstMapEntry *entry;
+    while (AxSymbolConstMap_next(&ctx->thir->symbol_consts, &cur, &entry)) {
+        if (entry->value.kind == AX_CONST_AGGREGATE && entry->value.aggregate.data) {
+            register_alloc(ctx, entry->value.aggregate.data, entry->value.aggregate.size, entry->value.aggregate.align, 0);
+        }
     }
 }
 
@@ -611,29 +658,59 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
         }
     }
 
-    AxMirBodyPtr *cached_body_ptr = AxMirMap_get((AxMirMap*)ctx->mir_map, func);
+    AxMirBodyPtr *cached_body_ptr = ctx->mir_map ? AxMirMap_get((AxMirMap*)ctx->mir_map, func) : NULL;
     if (!cached_body_ptr) {
+        if (ctx->is_comptime) {
+            panic_interp(ctx, "function calls not supported in constant expressions");
+            ctx->call_depth--;
+            return;
+        }
         AX_ICE("interpreter: function has no verified MIR body");
     }
     AxMirBody *body = *cached_body_ptr;
     
-    CallFrame frame;
+    exec_mir_body(ctx, body, args_raw, arg_count, (uint8_t*)out_ret, sizeof(AxInterpValue));
+    ctx->call_depth--;
+}
+
+static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size) {
+    CallFrame frame = {0};
     frame.body = body;
-    frame.locals = calloc(body->local_count, sizeof(AxInterpValue));
+    frame.local_ptrs = calloc(body->local_count ? body->local_count : 1, sizeof(uint8_t*));
+    
+    size_t total_storage = 0;
+    for (size_t i = 0; i < body->local_count; i++) {
+        uint32_t sz = ax_type_size(body->locals[i].ty, &ctx->thir->interner);
+        if (sz < sizeof(AxInterpValue)) sz = sizeof(AxInterpValue);
+        sz = (sz + 15) & ~15ULL;
+        total_storage += sz;
+    }
+    if (total_storage == 0) total_storage = 64;
+    frame.storage = calloc(1, total_storage);
+    
+    size_t cur_offset = 0;
+    for (size_t i = 0; i < body->local_count; i++) {
+        uint32_t sz = ax_type_size(body->locals[i].ty, &ctx->thir->interner);
+        if (sz < sizeof(AxInterpValue)) sz = sizeof(AxInterpValue);
+        sz = (sz + 15) & ~15ULL;
+        frame.local_ptrs[i] = frame.storage + cur_offset;
+        cur_offset += sz;
+    }
     
     // args start at local 1
     for (size_t i = 0; i < arg_count; i++) {
-        if (i + 1 < body->local_count) {
-            frame.locals[i + 1] = args_raw[i];
+        if (i + 1 < body->local_count && args_raw) {
+            memcpy(frame.local_ptrs[i + 1], &args_raw[i], sizeof(AxInterpValue));
         }
     }
     
     size_t alloc_start = ctx->alloc_count;
     for (size_t i = 0; i < body->local_count; i++) {
+        if (body->locals[i].kind == AX_MIR_LOCAL_CONST) continue;
         uint32_t sz = ax_type_size(body->locals[i].ty, &ctx->thir->interner);
         uint32_t al = ax_type_align(body->locals[i].ty, &ctx->thir->interner);
         if (sz == 0) sz = sizeof(AxInterpValue);
-        register_alloc(ctx, (uint8_t*)&frame.locals[i], sz, al, ctx->call_depth);
+        register_alloc(ctx, frame.local_ptrs[i], sz, al, ctx->call_depth);
     }
     
     AxMirBbId current_bb = {0};
@@ -654,8 +731,13 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
             check_step_limit(ctx);
             if (ctx->failed) break;
             AxMirStmt *stmt = &bb->stmts[i];
+            ctx->current_span = stmt->location;
             
             if (stmt->kind == AX_MIR_STMT_ASSIGN) {
+                if (stmt->assign.place.local.v < frame.body->local_count &&
+                    frame.body->locals[stmt->assign.place.local.v].kind == AX_MIR_LOCAL_CONST) {
+                    continue;
+                }
                 uint64_t val = 0;
                 switch (stmt->assign.rvalue.kind) {
                     case AX_MIR_RVALUE_USE: {
@@ -1234,6 +1316,7 @@ skip_write:;
         if (ctx->failed) break;
         
         AxMirTerminator *term = &bb->terminator;
+        ctx->current_span = term->location;
         if (term->kind == AX_MIR_TERM_GOTO) {
             current_bb = term->goto_target;
         } else if (term->kind == AX_MIR_TERM_ASSERT) {
@@ -1480,9 +1563,11 @@ skip_write:;
             ctx->allocs[a].host_ptr = NULL;
         }
     }
-    if (out_ret) *out_ret = frame.locals[0];
-    free(frame.locals);
-    ctx->call_depth--;
+    if (out_ret && out_ret_size > 0 && body->local_count > 0) {
+        memcpy(out_ret, frame.local_ptrs[0], out_ret_size);
+    }
+    free(frame.local_ptrs);
+    free(frame.storage);
 }
 
 int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg, FILE *out) {
@@ -1502,6 +1587,8 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.next_synth_addr = 0x10000000;
     ax_arena_init(&ctx.arena, 0);
     
+    register_const_allocs(&ctx);
+    
     AxInterpValue ret = {0};
     eval_call(&ctx, main_fn, NULL, 0, &ret);
     
@@ -1512,4 +1599,123 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
         return ctx.exit_code;
     }
     return (int)ret.vals[0];
+}
+
+typedef struct {
+    const AxHir *hir;
+    StrInterner *interner;
+    const AxResolveMap *rmap;
+    const AxAst *ast;
+    AxDiagSink *sink;
+} InterpConstEvalCtx;
+
+static AxConstEvalResult ax_interp_eval_const_expr(void *ctx_void, AxThir *thir, const AxHirExpr *expr, TypeId expected_ty, AxConstLimits limits) {
+    InterpConstEvalCtx *cctx = (InterpConstEvalCtx*)ctx_void;
+    AxConstEvalResult res = {0};
+    res.val.ty = expected_ty;
+    
+    if (!expr) {
+        res.ok = false;
+        res.err_code = AX_CONST_OVERFLOW;
+        return res;
+    }
+    
+    AxArena mir_arena;
+    ax_arena_init(&mir_arena, 0);
+    AxMirBody *body = ax_mir_build_expr(expr, expected_ty, thir, &mir_arena);
+    if (!body) {
+        res.ok = false;
+        res.err_code = AX_CONST_OVERFLOW;
+        ax_arena_destroy(&mir_arena);
+        return res;
+    }
+    
+    InterpCtx ictx = {0};
+    ictx.thir = thir;
+    ictx.hir = cctx->hir;
+    ictx.interner = cctx->interner;
+    ictx.rmap = cctx->rmap;
+    ictx.ast = cctx->ast;
+    ictx.sink = cctx->sink;
+    ictx.step_limit = (limits.max_steps > 0) ? limits.max_steps : 100000;
+    ictx.call_depth_limit = (limits.max_call_depth > 0) ? limits.max_call_depth : 100;
+    ictx.is_comptime = true;
+    ictx.next_synth_addr = 0x20000000;
+    ictx.current_span = expr->span;
+    ax_arena_init(&ictx.arena, 0);
+    
+    register_const_allocs(&ictx);
+    
+    uint32_t ret_size = ax_type_size(expected_ty, &thir->interner);
+    uint32_t ret_align = ax_type_align(expected_ty, &thir->interner);
+    if (ret_size == 0) ret_size = 8;
+    if (ret_align == 0) ret_align = 8;
+    
+    const AxType *exp_t = ax_type_get(&thir->interner, expected_ty);
+    uint8_t *ret_buf = NULL;
+    bool is_aggregate = (exp_t && (exp_t->kind == AX_TY_STRUCT || exp_t->kind == AX_TY_ARRAY || exp_t->kind == AX_TY_TUPLE));
+    if (is_aggregate) {
+        ret_buf = ax_arena_alloc(&thir->interner.arena, ret_size, ret_align);
+    } else {
+        ret_buf = calloc(1, ret_size < 16 ? 16 : ret_size);
+    }
+    
+    exec_mir_body(&ictx, body, NULL, 0, ret_buf, ret_size);
+    
+    if (ictx.failed) {
+        res.ok = false;
+        res.err_code = ictx.comptime_result.err_code;
+        res.err_span = ictx.comptime_result.err_span.file.v ? ictx.comptime_result.err_span : expr->span;
+        res.err_msg = ictx.comptime_result.err_msg;
+        if (res.err_code == 0) res.err_code = AX_CONST_OVERFLOW;
+        if (!is_aggregate) free(ret_buf);
+    } else {
+        res.ok = true;
+        if (is_aggregate) {
+            res.val.kind = AX_CONST_AGGREGATE;
+            res.val.aggregate.data = ret_buf;
+            res.val.aggregate.size = ret_size;
+            res.val.aggregate.align = ret_align;
+        } else if (exp_t && exp_t->kind == AX_TY_STR) {
+            res.val.kind = AX_CONST_STR;
+            res.val.str_val.bytes = *(const uint8_t**)ret_buf;
+            res.val.str_val.len = *(uint64_t*)(ret_buf + 8);
+            free(ret_buf);
+        } else if (exp_t && exp_t->kind == AX_TY_UNIT) {
+            res.val.kind = AX_CONST_UNIT;
+            free(ret_buf);
+        } else {
+            res.val.kind = AX_CONST_INT;
+            if (ret_size == 1) res.val.int_val = *(uint8_t*)ret_buf;
+            else if (ret_size == 2) res.val.int_val = *(uint16_t*)ret_buf;
+            else if (ret_size == 4) res.val.int_val = *(uint32_t*)ret_buf;
+            else res.val.int_val = *(uint64_t*)ret_buf;
+            free(ret_buf);
+        }
+    }
+    
+    if (ictx.allocs) free(ictx.allocs);
+    ax_arena_destroy(&ictx.arena);
+    ax_arena_destroy(&mir_arena);
+    return res;
+}
+
+AxConstEvaluator ax_interp_create_const_evaluator(
+    const AxHir *hir,
+    StrInterner *interner,
+    const AxResolveMap *rmap,
+    const AxAst *ast,
+    AxDiagSink *sink
+) {
+    InterpConstEvalCtx *cctx = calloc(1, sizeof(InterpConstEvalCtx));
+    cctx->hir = hir;
+    cctx->interner = interner;
+    cctx->rmap = rmap;
+    cctx->ast = ast;
+    cctx->sink = sink;
+    
+    AxConstEvaluator eval = {0};
+    eval.ctx = cctx;
+    eval.eval_expr = ax_interp_eval_const_expr;
+    return eval;
 }

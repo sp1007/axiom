@@ -6,6 +6,7 @@
 #include "types/types.h"
 
 AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *arena);
+AxMirBody *ax_mir_build_expr(const AxHirExpr *expr, TypeId ty, const AxThir *thir, AxArena *arena);
 
 #endif
 

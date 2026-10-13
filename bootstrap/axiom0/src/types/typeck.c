@@ -83,6 +83,11 @@ typedef struct TypeckCtx {
     const AxHirItem *current_impl;
     TypeId self_ty;
     uint32_t next_closure_id;
+
+    const AxConstEvaluator *evaluator;
+    AxSymbolId *const_eval_stack;
+    size_t const_eval_stack_len;
+    size_t const_eval_stack_cap;
 } TypeckCtx;
 
 static bool dotted_name_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
@@ -138,6 +143,14 @@ static TypeId new_ty_var(TypeckCtx *cx, Span span) {
     t.int_var.var_id = var_id;
     return ax_intern_type(&cx->thir->interner, &t);
 }
+
+static TypeId check_expr(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected);
+static void default_int_vars(TypeckCtx *cx);
+static void check_literal_ranges(TypeckCtx *cx);
+static bool is_valid_const_type(TypeckCtx *cx, TypeId ty);
+static const AxHirItem *find_const_item_by_symbol(TypeckCtx *cx, AxSymbolId sym);
+static AxConstValue evaluate_const_item(TypeckCtx *cx, const AxHirItem *it);
+static bool eval_array_len_expr(TypeckCtx *cx, const AxHirExpr *count_expr, uint64_t *out_len);
 
 static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericArgs *out_args);
 static TypeId resolve_ty(TypeckCtx *cx, TypeId id) {
@@ -340,6 +353,254 @@ static void default_int_vars(TypeckCtx *cx) {
     }
 }
 
+static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht);
+
+static bool is_valid_const_type(TypeckCtx *cx, TypeId ty) {
+    ty = resolve_ty(cx, ty);
+    const AxType *t = ax_type_get(&cx->thir->interner, ty);
+    if (!t) return false;
+    switch ((int)t->kind) {
+        case AX_TY_BOOL:
+        case AX_TY_CHAR:
+        case AX_TY_I8:
+        case AX_TY_U8:
+        case AX_TY_I16:
+        case AX_TY_U16:
+        case AX_TY_I32:
+        case AX_TY_U32:
+        case AX_TY_I64:
+        case AX_TY_U64:
+        case AX_TY_ISIZE:
+        case AX_TY_USIZE:
+        case AX_TY_STR:
+        case AX_TY_UNIT:
+        case AX_TY_INT_VAR:
+            return true;
+        case AX_TY_ENUM: {
+            for (size_t i = 0; i < t->enm.variant_count; i++) {
+                if (t->enm.variant_field_counts && t->enm.variant_field_counts[i] > 0) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        case AX_TY_ARRAY:
+            return is_valid_const_type(cx, t->array.elem);
+        case AX_TY_TUPLE: {
+            for (size_t i = 0; i < t->tuple.field_count; i++) {
+                if (!is_valid_const_type(cx, t->tuple.fields[i])) return false;
+            }
+            return true;
+        }
+        case AX_TY_STRUCT: {
+            for (size_t i = 0; i < t->strct.field_count; i++) {
+                if (!is_valid_const_type(cx, t->strct.fields[i])) return false;
+            }
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+static const AxHirItem *find_const_item_by_symbol(TypeckCtx *cx, AxSymbolId sym) {
+    if (sym.v == 0) return NULL;
+    for (const AxHirItem *top_it = cx->hir->items; top_it; top_it = top_it->next) {
+        for (int impl_pass = 0; impl_pass < 2; impl_pass++) {
+            const AxHirItem *it = (impl_pass == 0) ? top_it : 
+                                  (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
+                                  (top_it->kind == AX_HIR_ITEM_TRAIT ? top_it->trait.members : NULL));
+            for (; it; it = (impl_pass == 0) ? NULL : it->next) {
+                if (it->kind == AX_HIR_ITEM_CONST && it->const_decl.symbol.v == sym.v) {
+                    return it;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static AxConstValue evaluate_const_item(TypeckCtx *cx, const AxHirItem *it) {
+    if (!it || it->kind != AX_HIR_ITEM_CONST) {
+        AxConstValue zero = {0};
+        return zero;
+    }
+    
+    // Check if already evaluated
+    AxConstValue *existing = AxSymbolConstMap_get(&cx->thir->symbol_consts, it->const_decl.symbol);
+    if (existing) {
+        return *existing;
+    }
+    
+    // Check cycle
+    for (size_t i = 0; i < cx->const_eval_stack_len; i++) {
+        if (cx->const_eval_stack[i].v == it->const_decl.symbol.v) {
+            type_error(cx, it->span, AX_CONST_CYCLE);
+            AxConstValue zero = {0};
+            return zero;
+        }
+    }
+    
+    // Push stack
+    if (cx->const_eval_stack_len == cx->const_eval_stack_cap) {
+        cx->const_eval_stack = ax_grow_array(cx->const_eval_stack, &cx->const_eval_stack_cap, sizeof(AxSymbolId), cx->const_eval_stack_len + 1);
+    }
+    cx->const_eval_stack[cx->const_eval_stack_len++] = it->const_decl.symbol;
+    
+    // Save context state
+    const AxHirItem *save_fn = cx->current_fn;
+    const AxHirItem *save_impl = cx->current_impl;
+    TypeId save_ret = cx->return_type;
+    bool save_in_loop = cx->in_loop;
+    size_t save_fn_var_start = cx->fn_var_start;
+    
+    LitCheck *saved_lits = cx->lits;
+    size_t saved_lits_len = cx->lits_len;
+    size_t saved_lits_cap = cx->lits_cap;
+    NegCheck *saved_negs = cx->negs;
+    size_t saved_negs_len = cx->negs_len;
+    size_t saved_negs_cap = cx->negs_cap;
+    
+    cx->lits = NULL;
+    cx->lits_len = 0;
+    cx->lits_cap = 0;
+    cx->negs = NULL;
+    cx->negs_len = 0;
+    cx->negs_cap = 0;
+    
+    cx->current_fn = NULL;
+    cx->current_impl = NULL;
+    cx->return_type = TypeId_none();
+    cx->in_loop = false;
+    cx->fn_var_start = cx->int_vars_len;
+    
+    TypeId expected = hir_type_to_typeid(cx, it->const_decl.type);
+    
+    if (!is_valid_const_type(cx, expected)) {
+        type_error(cx, it->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
+    }
+    
+    if (it->const_decl.expr) {
+        check_expr(cx, it->const_decl.expr, expected);
+        default_int_vars(cx);
+        check_literal_ranges(cx);
+    }
+    
+    AxConstValue val = {0};
+    val.ty = expected;
+    if (cx->evaluator && cx->evaluator->eval_expr && it->const_decl.expr) {
+        AxConstLimits limits = { .max_steps = 100000, .max_call_depth = 100 };
+        AxConstEvalResult res = cx->evaluator->eval_expr(cx->evaluator->ctx, cx->thir, it->const_decl.expr, expected, limits);
+        if (!res.ok) {
+            type_error(cx, res.err_span.file.v ? res.err_span : it->const_decl.expr->span, res.err_code);
+        } else {
+            val = res.val;
+        }
+    } else if (it->const_decl.expr && it->const_decl.expr->kind == AX_HIR_EXPR_LITERAL) {
+        if (it->const_decl.expr->literal.kind == AX_TOK_INT || it->const_decl.expr->literal.kind == AX_TOK_CHAR) {
+            val.kind = AX_CONST_INT;
+            val.int_val = it->const_decl.expr->literal.val.int_val.value;
+        }
+    }
+    
+    // Restore context state
+    ax_xfree(cx->lits);
+    ax_xfree(cx->negs);
+    cx->lits = saved_lits;
+    cx->lits_len = saved_lits_len;
+    cx->lits_cap = saved_lits_cap;
+    cx->negs = saved_negs;
+    cx->negs_len = saved_negs_len;
+    cx->negs_cap = saved_negs_cap;
+    
+    cx->current_fn = save_fn;
+    cx->current_impl = save_impl;
+    cx->return_type = save_ret;
+    cx->in_loop = save_in_loop;
+    cx->fn_var_start = save_fn_var_start;
+    
+    // Pop stack
+    cx->const_eval_stack_len--;
+    
+    // Insert into symbol_consts
+    if (it->const_decl.symbol.v != 0) {
+        AxSymbolConstMap_insert(&cx->thir->symbol_consts, it->const_decl.symbol, val);
+    }
+    
+    return val;
+}
+
+static bool eval_array_len_expr(TypeckCtx *cx, const AxHirExpr *count_expr, uint64_t *out_len) {
+    if (!count_expr) return false;
+    
+    if (count_expr->kind == AX_HIR_EXPR_LITERAL && count_expr->literal.kind == AX_TOK_INT) {
+        *out_len = count_expr->literal.val.int_val.value;
+        return true;
+    }
+    
+    if (count_expr->kind == AX_HIR_EXPR_UNARY && count_expr->unary.op == AX_UNOP_NEG) {
+        type_error(cx, count_expr->span, AX_TYPE_ARRAY_SIZE);
+        return false;
+    }
+    
+    if (cx->evaluator && cx->evaluator->eval_expr) {
+        LitCheck *saved_lits = cx->lits;
+        size_t saved_lits_len = cx->lits_len;
+        size_t saved_lits_cap = cx->lits_cap;
+        NegCheck *saved_negs = cx->negs;
+        size_t saved_negs_len = cx->negs_len;
+        size_t saved_negs_cap = cx->negs_cap;
+        size_t save_fn_var_start = cx->fn_var_start;
+        
+        cx->lits = NULL;
+        cx->lits_len = 0;
+        cx->lits_cap = 0;
+        cx->negs = NULL;
+        cx->negs_len = 0;
+        cx->negs_cap = 0;
+        cx->fn_var_start = cx->int_vars_len;
+        
+        TypeId count_ty = check_expr(cx, count_expr, TypeId_none());
+        default_int_vars(cx);
+        check_literal_ranges(cx);
+        
+        ax_xfree(cx->lits);
+        ax_xfree(cx->negs);
+        cx->lits = saved_lits;
+        cx->lits_len = saved_lits_len;
+        cx->lits_cap = saved_lits_cap;
+        cx->negs = saved_negs;
+        cx->negs_len = saved_negs_len;
+        cx->negs_cap = saved_negs_cap;
+        cx->fn_var_start = save_fn_var_start;
+        
+        if (is_error(cx, count_ty)) return false;
+        TypeId resolved = resolve_ty(cx, count_ty);
+        if (!ax_type_is_int(resolved, &cx->thir->interner)) {
+            type_error(cx, count_expr->span, AX_TYPE_ARRAY_SIZE);
+            return false;
+        }
+        
+        AxConstLimits limits = { .max_steps = 100000, .max_call_depth = 100 };
+        AxConstEvalResult res = cx->evaluator->eval_expr(cx->evaluator->ctx, cx->thir, count_expr, resolved, limits);
+        if (res.ok && res.val.kind == AX_CONST_INT) {
+            bool is_signed = ax_type_is_signed(resolved, &cx->thir->interner);
+            if (is_signed && (int64_t)res.val.int_val < 0) {
+                type_error(cx, count_expr->span, AX_TYPE_ARRAY_SIZE);
+                return false;
+            }
+            *out_len = res.val.int_val;
+            return true;
+        } else if (!res.ok) {
+            type_error(cx, res.err_span.file.v ? res.err_span : count_expr->span, res.err_code);
+            return false;
+        }
+    }
+    
+    type_error(cx, count_expr->span, AX_TYPE_ARRAY_SIZE);
+    return false;
+}
+
 static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
     if (!ht) return (TypeId){0};
     if (ht->kind == AX_HIR_TYPE_ERROR) return cx->thir->interner.t_error;
@@ -389,10 +650,7 @@ static TypeId hir_type_to_typeid(TypeckCtx *cx, const AxHirType *ht) {
     if (ht->kind == AX_HIR_TYPE_ARRAY) {
         TypeId elem = hir_type_to_typeid(cx, ht->array.elem);
         uint64_t len = 0;
-        if (ht->array.count->kind == AX_HIR_EXPR_LITERAL && ht->array.count->literal.kind == AX_TOK_INT) {
-            len = ht->array.count->literal.val.int_val.value;
-        } else {
-            type_error(cx, ht->array.count->span, AX_TYPE_ARRAY_SIZE);
+        if (!eval_array_len_expr(cx, ht->array.count, &len)) {
             return cx->thir->interner.t_error;
         }
         AxType t;
@@ -1169,7 +1427,7 @@ static void check_all_bounds(TypeckCtx *cx) {
     }
 }
 
-AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db) {
+AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db, const AxConstEvaluator *evaluator) {
     AxThir thir;
     ax_thir_init(&thir);
 
@@ -1183,6 +1441,7 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     cx.return_type = thir.interner.t_unit;
     cx.in_loop = false;
     cx.next_closure_id = 1;
+    cx.evaluator = evaluator;
 
     // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
@@ -1480,6 +1739,8 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
                     if (it->type_alias.symbol.v != 0) {
                         AxSymbolTypeMap_insert(&thir.symbol_types, it->type_alias.symbol, ty);
                     }
+                } else if (it->kind == AX_HIR_ITEM_STATIC) {
+                    type_error(&cx, it->span, AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP);
                 } else if (it->kind == AX_HIR_ITEM_CONST) {
                     TypeId ty = hir_type_to_typeid(&cx, it->const_decl.type);
                     AxItemTypeMap_insert(&thir.item_types, it, ty);
@@ -1551,18 +1812,8 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
             check_block(&cx, it->fn.body, cx.return_type);
             default_int_vars(&cx);
             check_literal_ranges(&cx);
-                } else if (it->kind == AX_HIR_ITEM_CONST && it->const_decl.expr) {
-                    TypeId *cty = AxItemTypeMap_get(&thir.item_types, it);
-                    TypeId expected = cty ? *cty : TypeId_none();
-                    check_expr(&cx, it->const_decl.expr, expected);
-                    if (it->const_decl.expr->kind == AX_HIR_EXPR_LITERAL) {
-                        if (it->const_decl.expr->literal.kind == AX_TOK_INT || it->const_decl.expr->literal.kind == AX_TOK_CHAR) {
-                            uint64_t val = it->const_decl.expr->literal.val.int_val.value;
-                            if (it->const_decl.symbol.v != 0) {
-                                AxSymbolConstMap_insert(&thir.symbol_consts, it->const_decl.symbol, val);
-                            }
-                        }
-                    }
+                } else if (it->kind == AX_HIR_ITEM_CONST) {
+                    evaluate_const_item(&cx, it);
                 }
             }
         }
@@ -1576,7 +1827,12 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     ax_xfree(cx.negs);
     ax_xfree(cx.vars);
     ax_xfree(cx.loops);
+    ax_xfree(cx.const_eval_stack);
     return thir;
+}
+
+AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db) {
+    return ax_typeck_with_evaluator(hir, sink, str_in, db, NULL);
 }
 
 static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, bool is_init) {
@@ -3186,6 +3442,10 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             }
 
             if (expr->path.path.symbol.v != 0) {
+                const AxHirItem *citem = find_const_item_by_symbol(cx, expr->path.path.symbol);
+                if (citem) {
+                    evaluate_const_item(cx, citem);
+                }
                 for (size_t i = 0; i < cx->vars_len; i++) {
                     if (cx->vars[i].sym.v == expr->path.path.symbol.v) {
                         break;
@@ -3345,10 +3605,7 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             if (expr->array.count) {
                 // Repeat array [expr; count]
                 uint64_t len = 0;
-                if (expr->array.count->kind == AX_HIR_EXPR_LITERAL && expr->array.count->literal.kind == AX_TOK_INT) {
-                    len = expr->array.count->literal.val.int_val.value;
-                } else {
-                    type_error(cx, expr->array.count->span, AX_TYPE_ARRAY_SIZE);
+                if (!eval_array_len_expr(cx, expr->array.count, &len)) {
                     return in->t_error;
                 }
                 

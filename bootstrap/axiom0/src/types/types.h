@@ -7,6 +7,8 @@
 
 AX_DEFINE_ID(TypeId);
 
+#include "types/const/eval.h"
+
 typedef enum AxTypeKind {
     AX_TY_ERROR,
     AX_TY_UNIT,
@@ -281,7 +283,7 @@ AX_DEFINE_HASHMAP(AxParamTypeMap, AxHirParamPtr, TypeId, ax_key_hash_ptr, ax_key
 static inline uint64_t ax_key_hash_symbol(const AxSymbolId *k) { return ax_key_hash_u32(&k->v); }
 static inline bool ax_key_eq_symbol(const AxSymbolId *a, const AxSymbolId *b) { return a->v == b->v; }
 AX_DEFINE_HASHMAP(AxSymbolTypeMap, AxSymbolId, TypeId, ax_key_hash_symbol, ax_key_eq_symbol);
-AX_DEFINE_HASHMAP(AxSymbolConstMap, AxSymbolId, uint64_t, ax_key_hash_symbol, ax_key_eq_symbol);
+AX_DEFINE_HASHMAP(AxSymbolConstMap, AxSymbolId, AxConstValue, ax_key_hash_symbol, ax_key_eq_symbol);
 
 typedef struct AxGenericArgs {
     TypeId *args;
@@ -314,6 +316,7 @@ struct TypeckCtx;
 TypeId ax_subst_ty(struct TypeckCtx *cx, TypeId ty, const AxGenericArgs *args);
 
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db);
+AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db, const AxConstEvaluator *evaluator);
 bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in);
 
 #endif

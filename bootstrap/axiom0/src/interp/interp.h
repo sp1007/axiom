@@ -8,4 +8,13 @@
 
 int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg, FILE *out);
 
+AxConstEvaluator ax_interp_create_const_evaluator(
+    const AxHir *hir,
+    StrInterner *interner,
+    const AxResolveMap *rmap,
+    const AxAst *ast,
+    AxDiagSink *sink
+);
+
 #endif
+

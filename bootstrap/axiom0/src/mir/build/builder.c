@@ -649,6 +649,30 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
                 return p;
             }
         }
+        AxConstValue *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, sym);
+        if (cval && cval->kind == AX_CONST_AGGREGATE) {
+            AxMirLocalId loc = add_local(b, AX_MIR_LOCAL_CONST, cval->ty, false);
+            b->locals[loc.v].const_sym = sym;
+            if (b->var_count >= b->var_cap) {
+                b->var_cap = b->var_cap ? b->var_cap * 2 : 16;
+                b->var_map = realloc(b->var_map, b->var_cap * sizeof(*b->var_map));
+            }
+            b->var_map[b->var_count].sym = sym;
+            b->var_map[b->var_count].loc = loc;
+            b->var_count++;
+            AxMirPlace p = { loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirStmt init_stmt = {0};
+            init_stmt.kind = AX_MIR_STMT_ASSIGN;
+            init_stmt.location = b->current_span;
+            init_stmt.assign.place = p;
+            init_stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+            init_stmt.assign.rvalue.use.kind = AX_MIR_OP_CONST;
+            init_stmt.assign.rvalue.use.constant.ty = cval->ty;
+            init_stmt.assign.rvalue.use.constant.kind = AX_MIR_CONST_INT;
+            init_stmt.assign.rvalue.use.constant.val = 0;
+            push_stmt(b, (AxMirBbId){0}, init_stmt);
+            return p;
+        }
     } else if (expr->kind == AX_HIR_EXPR_FIELD) {
         AxMirPlace base = build_place(b, expr->field.base);
         TypeId *base_ty_ptr = AxExprTypeMap_get(&b->thir->expr_types, expr->field.base);
@@ -1035,12 +1059,26 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             }
         }
         if (!found) {
-            uint64_t *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, sym);
-            op.kind = AX_MIR_OP_CONST;
-            op.constant.ty = get_expr_type(b, expr);
-            op.constant.kind = AX_MIR_CONST_INT;
-            op.constant.val = cval ? *cval : sym.v;
-            return op;
+            AxConstValue *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, sym);
+            if (cval && cval->kind == AX_CONST_AGGREGATE) {
+                AxMirPlace p = build_place(b, expr);
+                op.kind = AX_MIR_OP_COPY;
+                op.place = p;
+                return op;
+            } else if (cval && cval->kind == AX_CONST_STR) {
+                op.kind = AX_MIR_OP_CONST;
+                op.constant.ty = get_expr_type(b, expr);
+                op.constant.kind = AX_MIR_CONST_STR;
+                op.constant.str.bytes = cval->str_val.bytes;
+                op.constant.str.len = cval->str_val.len;
+                return op;
+            } else {
+                op.kind = AX_MIR_OP_CONST;
+                op.constant.ty = get_expr_type(b, expr);
+                op.constant.kind = AX_MIR_CONST_INT;
+                op.constant.val = cval ? cval->int_val : sym.v;
+                return op;
+            }
         } else {
             AxMirPlace p = build_place(b, expr);
             TypeId ty = get_expr_type(b, expr);
@@ -1058,12 +1096,26 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             const AxHirItem **m_ptr = AxExprMethodMap_get(&b->thir->expr_methods, expr);
             if (m_ptr && (*m_ptr)->kind == AX_HIR_ITEM_CONST) {
                 const AxHirItem *m = *m_ptr;
-                uint64_t *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, m->const_decl.symbol);
-                op.kind = AX_MIR_OP_CONST;
-                op.constant.ty = get_expr_type(b, expr);
-                op.constant.kind = AX_MIR_CONST_INT;
-                op.constant.val = cval ? *cval : 0;
-                return op;
+                AxConstValue *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, m->const_decl.symbol);
+                if (cval && cval->kind == AX_CONST_AGGREGATE) {
+                    AxMirPlace p = build_place(b, expr);
+                    op.kind = AX_MIR_OP_COPY;
+                    op.place = p;
+                    return op;
+                } else if (cval && cval->kind == AX_CONST_STR) {
+                    op.kind = AX_MIR_OP_CONST;
+                    op.constant.ty = get_expr_type(b, expr);
+                    op.constant.kind = AX_MIR_CONST_STR;
+                    op.constant.str.bytes = cval->str_val.bytes;
+                    op.constant.str.len = cval->str_val.len;
+                    return op;
+                } else {
+                    op.kind = AX_MIR_OP_CONST;
+                    op.constant.ty = get_expr_type(b, expr);
+                    op.constant.kind = AX_MIR_CONST_INT;
+                    op.constant.val = cval ? cval->int_val : 0;
+                    return op;
+                }
             }
         }
         if (AxExprVariantMap_get(&b->thir->expr_variants, expr) || AxExprMethodMap_get(&b->thir->expr_methods, expr)) {
@@ -2653,6 +2705,55 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
     
     AxMirPlace ret_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
     build_block_into(&b, func->fn.body, ret_place);
+    
+    if (!b.bbs[b.current_bb.v].is_terminated) {
+        b.current_bb = build_drop_chain(&b, b.current_bb, b.current_drops, NULL, (AxMirBbId){0}, b.current_span);
+        AxMirTerminator term = {0};
+        term.kind = AX_MIR_TERM_RETURN;
+        set_terminator(&b, b.current_bb, term);
+    }
+    
+    AxMirBody *body = AX_ARENA_NEW(arena, AxMirBody);
+    body->arena = *arena;
+    body->local_count = b.local_count;
+    body->locals = AX_ARENA_NEW_ARRAY(arena, AxMirLocalDecl, b.local_count);
+    memcpy(body->locals, b.locals, b.local_count * sizeof(AxMirLocalDecl));
+    
+    body->bb_count = b.bb_count;
+    body->bbs = AX_ARENA_NEW_ARRAY(arena, AxMirBb, b.bb_count);
+    for (size_t i = 0; i < b.bb_count; i++) {
+        body->bbs[i].stmt_count = b.bbs[i].stmt_count;
+        if (b.bbs[i].stmt_count > 0) {
+            body->bbs[i].stmts = AX_ARENA_NEW_ARRAY(arena, AxMirStmt, b.bbs[i].stmt_count);
+            memcpy(body->bbs[i].stmts, b.bbs[i].stmts, b.bbs[i].stmt_count * sizeof(AxMirStmt));
+        } else {
+            body->bbs[i].stmts = NULL;
+        }
+        body->bbs[i].terminator = b.bbs[i].terminator;
+        free(b.bbs[i].stmts);
+    }
+    
+    free(b.locals);
+    free(b.bbs);
+    free(b.var_map);
+    free(b.loops);
+    
+    return body;
+}
+
+AxMirBody *ax_mir_build_expr(const AxHirExpr *expr, TypeId ty, const AxThir *thir, AxArena *arena) {
+    if (!expr) return NULL;
+    
+    Builder b = {0};
+    b.arena = arena;
+    b.thir = thir;
+    
+    add_local(&b, AX_MIR_LOCAL_RETURN, ty, true);
+    
+    b.current_bb = add_bb(&b);
+    
+    AxMirPlace ret_place = { {0}, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+    build_expr_into(&b, expr, ret_place);
     
     if (!b.bbs[b.current_bb.v].is_terminated) {
         b.current_bb = build_drop_chain(&b, b.current_bb, b.current_drops, NULL, (AxMirBbId){0}, b.current_span);

@@ -32,6 +32,7 @@ typedef enum AxMirLocalKind {
     AX_MIR_LOCAL_USER,
     AX_MIR_LOCAL_TEMP,
     AX_MIR_LOCAL_ARG,
+    AX_MIR_LOCAL_CONST,
 } AxMirLocalKind;
 
 typedef struct AxMirLocalDecl {
@@ -39,6 +40,7 @@ typedef struct AxMirLocalDecl {
     TypeId ty;
     bool mut;
     AxLocation location;
+    AxSymbolId const_sym;
 } AxMirLocalDecl;
 
 typedef enum AxMirProjKind {

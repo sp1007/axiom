@@ -335,6 +335,7 @@ static void stage_hir(AxDriverState *st) {
 #include "verify/verify.h"
 #include "own/unsafe/unsafe.h"
 #include "kernel/hashmap.h"
+#include "../interp/interp.h"
 
 typedef AxMirBody *AxMirBodyPtr;
 AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
@@ -367,7 +368,9 @@ static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     extern void ax_traits_check_overlap(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in);
     ax_traits_check_overlap(&st->hir, &st->sink, &st->interner);
-    st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
+    AxConstEvaluator evaluator = ax_interp_create_const_evaluator(&st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink);
+    st->thir = ax_typeck_with_evaluator(&st->hir, &st->sink, &st->interner, &st->db, &evaluator);
+    free(evaluator.ctx);
     if (st->sink.errors > 0) return;
 
     ax_unsafe_check(&st->hir, &st->thir, &st->sink, &st->interner);
@@ -394,7 +397,6 @@ static void stage_typeck(AxDriverState *st) {
     }
 }
 
-#include "../interp/interp.h"
 #include "own/own.h"
 
 static void stage_own(AxDriverState *st) {
