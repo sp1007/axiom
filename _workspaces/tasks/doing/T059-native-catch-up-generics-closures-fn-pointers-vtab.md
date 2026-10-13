@@ -11,6 +11,7 @@ priority: 79
 status: doing
 attempts: 0
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/native_p7, tests/run/method, tests/run/generic, tests/run/mono, tests/run/trait, tests/run/trait2, tests/run/closure]
+locks: [bootstrap/axiom0/src/driver/build_native/build.c, bootstrap/axiom0/src/driver/mono.c, tests/ui/trait/qa_round4_bounds.ax, tests/ui/trait2/test_no_derive.ax]
 spec: [0183, 0162]
 ---
 # T059 — Native catch-up: generics, closures, fn pointers
