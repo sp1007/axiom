@@ -1,0 +1,803 @@
+// test: run
+// stdout: OK Diag Emitter\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// Arena Chunk & Arena
+struct ArenaChunk {
+    next: *mut ArenaChunk,
+    cap: usize,
+    used: usize,
+}
+
+pub struct Arena {
+    head: *mut ArenaChunk,
+}
+
+pub fn arena_new() -> Arena {
+    Arena { head: 0 as *mut ArenaChunk }
+}
+
+pub fn arena_alloc_raw(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
+    if size == 0 { return 0 as *mut u8; }
+    let effective_align = if align < 8 { 8 } else { align };
+    let mut cur = a.head;
+
+    if cur as usize != 0 {
+        let raw = unsafe { (*cur).used };
+        let mask = effective_align - 1;
+        let offset = (raw + mask) & ~mask;
+        if offset + size <= unsafe { (*cur).cap } {
+            unsafe { (*cur).used = offset + size; }
+            let data_ptr = ((cur as usize) + 32) as *mut u8;
+            return ((data_ptr as usize) + offset) as *mut u8;
+        }
+    }
+
+    let default_chunk: usize = 4096;
+    let header_size: usize = 32;
+    let chunk_cap = if size > default_chunk { size + effective_align } else { default_chunk };
+    let total_alloc = header_size + chunk_cap;
+
+    let p = unsafe { heap_alloc(total_alloc, 16) as *mut ArenaChunk };
+    if p as usize == 0 { return 0 as *mut u8; }
+
+    unsafe {
+        (*p).next = a.head;
+        (*p).cap = chunk_cap;
+        (*p).used = 0;
+    }
+    a.head = p;
+
+    let raw = 0;
+    let mask = effective_align - 1;
+    let offset = (raw + mask) & ~mask;
+    unsafe { (*p).used = offset + size; }
+    let data_ptr = ((p as usize) + header_size) as *mut u8;
+    ((data_ptr as usize) + offset) as *mut u8
+}
+
+pub fn arena_destroy(a: mut_view<Arena>) {
+    let mut cur = a.head;
+    while cur as usize != 0 {
+        let next = unsafe { (*cur).next };
+        let total_alloc = 32 + unsafe { (*cur).cap };
+        unsafe {
+            heap_free(cur as *mut u8, total_alloc, 16);
+        }
+        cur = next;
+    }
+    a.head = 0 as *mut ArenaChunk;
+}
+
+// StrView
+pub struct StrView {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+fn copy_sv(sv: view<StrView>) -> StrView {
+    StrView { ptr: sv.ptr, len: sv.len }
+}
+
+fn sv_eq(a: StrView, b: StrView) -> bool {
+    if a.len != b.len { return false; }
+    let mut i: usize = 0;
+    while i < a.len {
+        if unsafe { *(a.ptr + i) != *(b.ptr + i) } { return false; }
+        i = i + 1;
+    }
+    true
+}
+
+// Spans
+@derive(Copy)
+pub struct FileId {
+    pub v: u32,
+}
+
+@derive(Copy)
+pub struct Span {
+    pub file: FileId,
+    pub start: u32,
+    pub end: u32,
+}
+
+pub fn span_new(file: FileId, start: u32, end: u32) -> Span {
+    Span { file: file, start: start, end: end }
+}
+
+pub fn span_none() -> Span {
+    Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+}
+
+pub fn span_is_none(s: view<Span>) -> bool {
+    s.file.v == 0u32
+}
+
+// Diag Codes & Severities
+@derive(Copy)
+pub enum DiagSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+@derive(Copy)
+pub enum FixApplicability {
+    MachineApplicable,
+    MaybeApplicable,
+    ManualReview,
+}
+
+@derive(Copy)
+pub enum DiagDataKind {
+    String,
+    Integer,
+    Boolean,
+    StringList,
+}
+
+@derive(Copy)
+pub struct DiagCode {
+    pub v: u32,
+}
+
+pub fn diag_code(v: u32) -> DiagCode {
+    DiagCode { v: v }
+}
+
+// Diagnostic Models
+pub struct DiagLabel {
+    pub span: Span,
+    pub message: StrView,
+}
+
+pub struct DiagEdit {
+    pub span: Span,
+    pub replacement: StrView,
+}
+
+pub struct DiagFix {
+    pub message: StrView,
+    pub applicability: FixApplicability,
+    pub edits: *mut DiagEdit,
+    pub edit_count: usize,
+}
+
+pub struct DiagDataValue {
+    pub kind: DiagDataKind,
+    pub str_val: StrView,
+    pub int_val: i64,
+    pub bool_val: bool,
+    pub list_items: *mut StrView,
+    pub list_count: usize,
+}
+
+pub struct DiagDataEntry {
+    pub key: StrView,
+    pub value: DiagDataValue,
+}
+
+pub struct Diagnostic {
+    pub code: DiagCode,
+    pub severity: DiagSeverity,
+    pub message: StrView,
+    pub primary: Span,
+
+    pub labels: *mut DiagLabel,
+    pub label_count: usize,
+
+    pub notes: *mut StrView,
+    pub note_count: usize,
+
+    pub helps: *mut StrView,
+    pub help_count: usize,
+
+    pub fixes: *mut DiagFix,
+    pub fix_count: usize,
+
+    pub data: *mut DiagDataEntry,
+    pub data_count: usize,
+}
+
+pub struct DiagSink {
+    pub arena: Arena,
+    pub diags: *mut Diagnostic,
+    pub len: usize,
+    pub cap: usize,
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+pub fn diag_new(c: DiagCode, sev: DiagSeverity, primary: Span, msg: StrView) -> Diagnostic {
+    Diagnostic {
+        code: c,
+        severity: sev,
+        message: msg,
+        primary: primary,
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    }
+}
+
+pub fn diag_sink_new() -> DiagSink {
+    DiagSink {
+        arena: arena_new(),
+        diags: 0 as *mut Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+}
+
+pub fn diag_sink_free(sink: mut_view<DiagSink>) {
+    if sink.cap > 0 && sink.diags as usize != 0 {
+        unsafe {
+            heap_free(sink.diags as *mut u8, (((sink.cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>());
+        }
+    }
+    sink.diags = 0 as *mut Diagnostic;
+    sink.len = 0;
+    sink.cap = 0;
+    sink.errors = 0;
+    sink.warnings = 0;
+    arena_destroy(mut_view(sink.arena));
+}
+
+fn copy_str_view(arena: mut_view<Arena>, sv: StrView) -> StrView {
+    if sv.len == 0 || sv.ptr as usize == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let dst = arena_alloc_raw(arena, sv.len + 1, 1);
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(sv.ptr, dst, sv.len);
+        *(dst + sv.len) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: sv.len }
+}
+
+unsafe fn diag_ptr(diags: *mut Diagnostic, idx: usize) -> *mut Diagnostic {
+    ((diags as usize) + (((idx as isize) * (size_of<Diagnostic>() as isize)) as usize)) as *mut Diagnostic
+}
+
+pub fn diag_sink_report(sink: mut_view<DiagSink>, diag: view<Diagnostic>) {
+    if sink.len == sink.cap {
+        let new_cap = if sink.cap == 0 { 8 } else { sink.cap + sink.cap };
+        let new_diags = unsafe { heap_alloc((((new_cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>()) as *mut Diagnostic };
+        if sink.len > 0 && sink.diags as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(sink.diags as *const u8, new_diags as *mut u8, (((sink.len as isize) * (size_of<Diagnostic>() as isize)) as usize));
+                heap_free(sink.diags as *mut u8, (((sink.cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>());
+            }
+        }
+        sink.diags = new_diags;
+        sink.cap = new_cap;
+    }
+
+    let mut d = Diagnostic {
+        code: diag.code,
+        severity: diag.severity,
+        message: copy_str_view(mut_view(sink.arena), copy_sv(view(diag.message))),
+        primary: diag.primary,
+        labels: 0 as *mut DiagLabel,
+        label_count: diag.label_count,
+        notes: 0 as *mut StrView,
+        note_count: diag.note_count,
+        helps: 0 as *mut StrView,
+        help_count: diag.help_count,
+        fixes: 0 as *mut DiagFix,
+        fix_count: diag.fix_count,
+        data: 0 as *mut DiagDataEntry,
+        data_count: diag.data_count,
+    };
+
+    if diag.label_count > 0 && diag.labels as usize != 0 {
+        let labels_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.label_count as isize) * (size_of<DiagLabel>() as isize)) as usize), align_of<DiagLabel>()) as *mut DiagLabel;
+        let mut i: usize = 0;
+        while i < diag.label_count {
+            let src_l = unsafe { *((diag.labels as usize + (((i as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+            let dst_l_ptr = ((labels_mem as usize) + (((i as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *mut DiagLabel;
+            unsafe {
+                *dst_l_ptr = DiagLabel {
+                    span: src_l.span,
+                    message: copy_str_view(mut_view(sink.arena), copy_sv(view(src_l.message))),
+                };
+            }
+            i = i + 1;
+        }
+        d.labels = labels_mem;
+    }
+
+    if diag.note_count > 0 && diag.notes as usize != 0 {
+        let notes_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.note_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+        let mut i: usize = 0;
+        while i < diag.note_count {
+            let src_n = unsafe { *((diag.notes as usize + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            let dst_n_ptr = ((notes_mem as usize) + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+            unsafe {
+                *dst_n_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(src_n)));
+            }
+            i = i + 1;
+        }
+        d.notes = notes_mem;
+    }
+
+    if diag.help_count > 0 && diag.helps as usize != 0 {
+        let helps_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.help_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+        let mut i: usize = 0;
+        while i < diag.help_count {
+            let src_h = unsafe { *((diag.helps as usize + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            let dst_h_ptr = ((helps_mem as usize) + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+            unsafe {
+                *dst_h_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(src_h)));
+            }
+            i = i + 1;
+        }
+        d.helps = helps_mem;
+    }
+
+    if diag.fix_count > 0 && diag.fixes as usize != 0 {
+        let fixes_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.fix_count as isize) * (size_of<DiagFix>() as isize)) as usize), align_of<DiagFix>()) as *mut DiagFix;
+        let mut i: usize = 0;
+        while i < diag.fix_count {
+            let src_f = unsafe { *((diag.fixes as usize + (((i as isize) * (size_of<DiagFix>() as isize)) as usize)) as *const DiagFix) };
+            let dst_f_ptr = ((fixes_mem as usize) + (((i as isize) * (size_of<DiagFix>() as isize)) as usize)) as *mut DiagFix;
+            let mut edits_mem = 0 as *mut DiagEdit;
+            if src_f.edit_count > 0 && src_f.edits as usize != 0 {
+                edits_mem = arena_alloc_raw(mut_view(sink.arena), (((src_f.edit_count as isize) * (size_of<DiagEdit>() as isize)) as usize), align_of<DiagEdit>()) as *mut DiagEdit;
+                let mut j: usize = 0;
+                while j < src_f.edit_count {
+                    let src_e = unsafe { *((src_f.edits as usize + (((j as isize) * (size_of<DiagEdit>() as isize)) as usize)) as *const DiagEdit) };
+                    let dst_e_ptr = ((edits_mem as usize) + (((j as isize) * (size_of<DiagEdit>() as isize)) as usize)) as *mut DiagEdit;
+                    unsafe {
+                        *dst_e_ptr = DiagEdit {
+                            span: src_e.span,
+                            replacement: copy_str_view(mut_view(sink.arena), copy_sv(view(src_e.replacement))),
+                        };
+                    }
+                    j = j + 1;
+                }
+            }
+            unsafe {
+                *dst_f_ptr = DiagFix {
+                    message: copy_str_view(mut_view(sink.arena), copy_sv(view(src_f.message))),
+                    applicability: src_f.applicability,
+                    edits: edits_mem,
+                    edit_count: src_f.edit_count,
+                };
+            }
+            i = i + 1;
+        }
+        d.fixes = fixes_mem;
+    }
+
+    if diag.data_count > 0 && diag.data as usize != 0 {
+        let data_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.data_count as isize) * (size_of<DiagDataEntry>() as isize)) as usize), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+        let mut i: usize = 0;
+        while i < diag.data_count {
+            let src_entry = unsafe { *((diag.data as usize + (((i as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *const DiagDataEntry) };
+            let dst_entry_ptr = ((data_mem as usize) + (((i as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *mut DiagDataEntry;
+            let mut val = DiagDataValue {
+                kind: src_entry.value.kind,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: src_entry.value.int_val,
+                bool_val: src_entry.value.bool_val,
+                list_items: 0 as *mut StrView,
+                list_count: src_entry.value.list_count,
+            };
+            match src_entry.value.kind {
+                DiagDataKind.String => {
+                    val.str_val = copy_str_view(mut_view(sink.arena), copy_sv(view(src_entry.value.str_val)));
+                },
+                DiagDataKind.StringList => {
+                    if src_entry.value.list_count > 0 && src_entry.value.list_items as usize != 0 {
+                        let items_mem = arena_alloc_raw(mut_view(sink.arena), (((src_entry.value.list_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+                        let mut k: usize = 0;
+                        while k < src_entry.value.list_count {
+                            let item = unsafe { *((src_entry.value.list_items as usize + (((k as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+                            let dst_item_ptr = ((items_mem as usize) + (((k as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+                            unsafe {
+                                *dst_item_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(item)));
+                            }
+                            k = k + 1;
+                        }
+                        val.list_items = items_mem;
+                    }
+                },
+                _ => {},
+            }
+            unsafe {
+                *dst_entry_ptr = DiagDataEntry {
+                    key: copy_str_view(mut_view(sink.arena), copy_sv(view(src_entry.key))),
+                    value: val,
+                };
+            }
+            i = i + 1;
+        }
+        d.data = data_mem;
+    }
+
+    let sev = diag.severity;
+    unsafe {
+        *(diag_ptr(sink.diags, sink.len)) = d;
+    }
+    sink.len = sink.len + 1;
+
+    match sev {
+        DiagSeverity.Error => {
+            sink.errors = sink.errors + 1;
+        },
+        DiagSeverity.Warning => {
+            sink.warnings = sink.warnings + 1;
+        },
+        _ => {},
+    }
+}
+
+fn diag_less(da: view<Diagnostic>, db: view<Diagnostic>) -> bool {
+    let da_none = da.primary.file.v == 0u32;
+    let db_none = db.primary.file.v == 0u32;
+    if da_none != db_none {
+        return da_none;
+    }
+    if !da_none {
+        let fa: u32 = da.primary.file.v;
+        let fb: u32 = db.primary.file.v;
+        if fa < fb { return true; }
+        if fa > fb { return false; }
+
+        let sa: u32 = da.primary.start;
+        let sb: u32 = db.primary.start;
+        if sa < sb { return true; }
+        if sa > sb { return false; }
+    }
+    let ca = da.code.v;
+    let cb = db.code.v;
+    if ca < cb { return true; }
+    false
+}
+
+pub fn diag_sink_sort(sink: mut_view<DiagSink>) {
+    if sink.len <= 1 { return; }
+    let mut i: usize = 1;
+    while i < sink.len {
+        let current = unsafe { *(diag_ptr(sink.diags, i)) };
+        let mut j: usize = i;
+        while j > 0 {
+            let prev = unsafe { *(diag_ptr(sink.diags, j - 1)) };
+            if diag_less(view(current), view(prev)) {
+                unsafe {
+                    *(diag_ptr(sink.diags, j)) = prev;
+                }
+                j = j - 1;
+            } else {
+                break;
+            }
+        }
+        unsafe {
+            *(diag_ptr(sink.diags, j)) = current;
+        }
+        i = i + 1;
+    }
+}
+
+// Helpers for test strings
+fn alloc_sv_msg(a: mut_view<Arena>, id: u32) -> StrView {
+    let p = arena_alloc_raw(a, 4, 1);
+    unsafe {
+        *p = 109u8; // 'm'
+        *(p + 1) = 115u8; // 's'
+        *(p + 2) = 103u8; // 'g'
+        *(p + 3) = (id as u8) + 48u8;
+    }
+    StrView { ptr: p as *const u8, len: 4 }
+}
+
+fn alloc_sv_label(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 5, 1);
+    unsafe { *p = 108u8; *(p+1) = 97u8; *(p+2) = 98u8; *(p+3) = 101u8; *(p+4) = 108u8; }
+    StrView { ptr: p as *const u8, len: 5 }
+}
+
+fn alloc_sv_note(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 4, 1);
+    unsafe { *p = 110u8; *(p+1) = 111u8; *(p+2) = 116u8; *(p+3) = 101u8; }
+    StrView { ptr: p as *const u8, len: 4 }
+}
+
+fn alloc_sv_help(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 4, 1);
+    unsafe { *p = 104u8; *(p+1) = 101u8; *(p+2) = 108u8; *(p+3) = 112u8; }
+    StrView { ptr: p as *const u8, len: 4 }
+}
+
+fn alloc_sv_fix(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 3, 1);
+    unsafe { *p = 102u8; *(p+1) = 105u8; *(p+2) = 120u8; }
+    StrView { ptr: p as *const u8, len: 3 }
+}
+
+fn alloc_sv_repl(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 4, 1);
+    unsafe { *p = 114u8; *(p+1) = 101u8; *(p+2) = 112u8; *(p+3) = 108u8; }
+    StrView { ptr: p as *const u8, len: 4 }
+}
+
+fn alloc_sv_key(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 3, 1);
+    unsafe { *p = 107u8; *(p+1) = 101u8; *(p+2) = 121u8; }
+    StrView { ptr: p as *const u8, len: 3 }
+}
+
+fn alloc_sv_val(a: mut_view<Arena>) -> StrView {
+    let p = arena_alloc_raw(a, 3, 1);
+    unsafe { *p = 118u8; *(p+1) = 97u8; *(p+2) = 108u8; }
+    StrView { ptr: p as *const u8, len: 3 }
+}
+
+fn main() -> i32 {
+    let mut scratch = arena_new();
+    let mut sink = diag_sink_new();
+    if sink.len != 0 { return 1; }
+    if sink.errors != 0 { return 2; }
+    if sink.warnings != 0 { return 3; }
+
+    let msg1 = alloc_sv_msg(mut_view(scratch), 1u32);
+    let d1 = Diagnostic {
+        code: diag_code(20u32),
+        severity: DiagSeverity.Error,
+        message: msg1,
+        primary: span_new(FileId { v: 2u32 }, 50u32, 60u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(d1));
+
+    if sink.len != 1 { return 4; }
+    if sink.errors != 1 { return 5; }
+    if sink.warnings != 0 { return 6; }
+
+    // Diag 2 with labels, notes, helps, fixes, data
+    let msg2 = alloc_sv_msg(mut_view(scratch), 2u32);
+    let mut d2 = Diagnostic {
+        code: diag_code(49u32),
+        severity: DiagSeverity.Warning,
+        message: msg2,
+        primary: span_new(FileId { v: 1u32 }, 100u32, 105u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+
+    let l_msg = alloc_sv_label(mut_view(scratch));
+    let label_mem = arena_alloc_raw(mut_view(scratch), size_of<DiagLabel>(), align_of<DiagLabel>()) as *mut DiagLabel;
+    unsafe {
+        *label_mem = DiagLabel { span: span_new(FileId { v: 1u32 }, 80u32, 85u32), message: l_msg };
+    }
+    d2.labels = label_mem;
+    d2.label_count = 1;
+
+    let note_sv = alloc_sv_note(mut_view(scratch));
+    let note_mem = arena_alloc_raw(mut_view(scratch), size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    unsafe {
+        *note_mem = note_sv;
+    }
+    d2.notes = note_mem;
+    d2.note_count = 1;
+
+    let help_sv = alloc_sv_help(mut_view(scratch));
+    let help_mem = arena_alloc_raw(mut_view(scratch), size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    unsafe {
+        *help_mem = help_sv;
+    }
+    d2.helps = help_mem;
+    d2.help_count = 1;
+
+    let fix_msg = alloc_sv_fix(mut_view(scratch));
+    let repl_sv = alloc_sv_repl(mut_view(scratch));
+    let edit_mem = arena_alloc_raw(mut_view(scratch), size_of<DiagEdit>(), align_of<DiagEdit>()) as *mut DiagEdit;
+    unsafe {
+        *edit_mem = DiagEdit { span: span_new(FileId { v: 1u32 }, 100u32, 101u32), replacement: repl_sv };
+    }
+    let fix_mem = arena_alloc_raw(mut_view(scratch), size_of<DiagFix>(), align_of<DiagFix>()) as *mut DiagFix;
+    unsafe {
+        *fix_mem = DiagFix { message: fix_msg, applicability: FixApplicability.MachineApplicable, edits: edit_mem, edit_count: 1 };
+    }
+    d2.fixes = fix_mem;
+    d2.fix_count = 1;
+
+    let key_sv = alloc_sv_key(mut_view(scratch));
+    let val_sv = alloc_sv_val(mut_view(scratch));
+    let data_mem = arena_alloc_raw(mut_view(scratch), size_of<DiagDataEntry>(), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    unsafe {
+        *data_mem = DiagDataEntry {
+            key: key_sv,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: val_sv,
+                int_val: 42,
+                bool_val: true,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+    }
+    d2.data = data_mem;
+    d2.data_count = 1;
+
+    diag_sink_report(mut_view(sink), view(d2));
+
+    if sink.len != 2 { return 7; }
+    if sink.errors != 1 { return 8; }
+    if sink.warnings != 1 { return 9; }
+
+    // Diag 3: file 1, start 10
+    let msg3 = alloc_sv_msg(mut_view(scratch), 3u32);
+    let d3 = Diagnostic {
+        code: diag_code(57u32),
+        severity: DiagSeverity.Error,
+        message: msg3,
+        primary: span_new(FileId { v: 1u32 }, 10u32, 20u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(d3));
+
+    // Diag 4: span_none
+    let msg4 = alloc_sv_msg(mut_view(scratch), 4u32);
+    let d4 = Diagnostic {
+        code: diag_code(130u32),
+        severity: DiagSeverity.Error,
+        message: msg4,
+        primary: span_none(),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(d4));
+
+    // Diag 5: file 1, start 10 (same span, different code 58)
+    let msg5 = alloc_sv_msg(mut_view(scratch), 5u32);
+    let d5 = Diagnostic {
+        code: diag_code(58u32),
+        severity: DiagSeverity.Error,
+        message: msg5,
+        primary: span_new(FileId { v: 1u32 }, 10u32, 20u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(d5));
+
+    if sink.len != 5 { return 10; }
+    if sink.errors != 4 { return 11; }
+    if sink.warnings != 1 { return 12; }
+
+    // Sort sink
+    diag_sink_sort(mut_view(sink));
+
+    // Expected order matching sink.c:
+    // 0: span none, code 130 (da_none comes first)
+    // 1: file 1, start 10, code 57
+    // 2: file 1, start 10, code 58
+    // 3: file 1, start 100, code 49
+    // 4: file 2, start 50, code 20
+    let r0 = unsafe { *(diag_ptr(sink.diags, 0)) };
+    let r1 = unsafe { *(diag_ptr(sink.diags, 1)) };
+    let r2 = unsafe { *(diag_ptr(sink.diags, 2)) };
+    let r3 = unsafe { *(diag_ptr(sink.diags, 3)) };
+    let r4 = unsafe { *(diag_ptr(sink.diags, 4)) };
+
+    if r0.primary.file.v != 0u32 || r0.code.v != 130u32 { return 13; }
+    if r1.primary.file.v != 1u32 || r1.primary.start != 10u32 || r1.code.v != 57u32 { return 14; }
+    if r2.primary.file.v != 1u32 || r2.primary.start != 10u32 || r2.code.v != 58u32 { return 15; }
+    if r3.primary.file.v != 1u32 || r3.primary.start != 100u32 || r3.code.v != 49u32 { return 16; }
+    if r4.primary.file.v != 2u32 || r4.primary.start != 50u32 || r4.code.v != 20u32 { return 17; }
+
+    // Verify deep copy of labels, notes, fixes, data on r3 (was d2)
+    if r3.label_count != 1 { return 18; }
+    let r3_lbl = unsafe { *(r3.labels) };
+    if r3_lbl.span.file.v != 1u32 || r3_lbl.span.start != 80u32 { return 19; }
+    if !sv_eq(r3_lbl.message, alloc_sv_label(mut_view(scratch))) { return 20; }
+
+    if r3.note_count != 1 { return 21; }
+    let r3_note = unsafe { *(r3.notes) };
+    if !sv_eq(r3_note, alloc_sv_note(mut_view(scratch))) { return 22; }
+
+    if r3.help_count != 1 { return 23; }
+    let r3_help = unsafe { *(r3.helps) };
+    if !sv_eq(r3_help, alloc_sv_help(mut_view(scratch))) { return 24; }
+
+    if r3.fix_count != 1 { return 25; }
+    let r3_fix = unsafe { *(r3.fixes) };
+    if !sv_eq(r3_fix.message, alloc_sv_fix(mut_view(scratch))) || r3_fix.edit_count != 1 { return 26; }
+    let r3_edit = unsafe { *(r3_fix.edits) };
+    if r3_edit.span.start != 100u32 || !sv_eq(r3_edit.replacement, alloc_sv_repl(mut_view(scratch))) { return 27; }
+
+    if r3.data_count != 1 { return 28; }
+    let r3_data = unsafe { *(r3.data) };
+    if !sv_eq(r3_data.key, alloc_sv_key(mut_view(scratch))) || r3_data.value.int_val != 42 || !r3_data.value.bool_val { return 29; }
+    if !sv_eq(r3_data.value.str_val, alloc_sv_val(mut_view(scratch))) { return 30; }
+
+    diag_sink_free(mut_view(sink));
+    arena_destroy(mut_view(scratch));
+
+    print("OK Diag Emitter\n");
+    0
+}

@@ -1,0 +1,2257 @@
+// test: run
+// stdout: OK Diag Format JSON\n
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// Arena Chunk & Arena
+struct ArenaChunk {
+    next: *mut ArenaChunk,
+    cap: usize,
+    used: usize,
+}
+
+pub struct Arena {
+    head: *mut ArenaChunk,
+}
+
+pub fn arena_new() -> Arena {
+    Arena { head: 0 as *mut ArenaChunk }
+}
+
+pub fn arena_alloc_raw(a: mut_view<Arena>, size: usize, align: usize) -> *mut u8 {
+    if size == 0 { return 0 as *mut u8; }
+    let effective_align = if align < 8 { 8 } else { align };
+    let mut cur = a.head;
+
+    if cur as usize != 0 {
+        let raw = unsafe { (*cur).used };
+        let mask = effective_align - 1;
+        let offset = (raw + mask) & ~mask;
+        if offset + size <= unsafe { (*cur).cap } {
+            unsafe { (*cur).used = offset + size; }
+            let data_ptr = ((cur as usize) + 32) as *mut u8;
+            return ((data_ptr as usize) + offset) as *mut u8;
+        }
+    }
+
+    let default_chunk: usize = 4096;
+    let header_size: usize = 32;
+    let chunk_cap = if size > default_chunk { size + effective_align } else { default_chunk };
+    let total_alloc = header_size + chunk_cap;
+
+    let p = unsafe { heap_alloc(total_alloc, 16) as *mut ArenaChunk };
+    if p as usize == 0 { return 0 as *mut u8; }
+
+    unsafe {
+        (*p).next = a.head;
+        (*p).cap = chunk_cap;
+        (*p).used = 0;
+    }
+    a.head = p;
+
+    let raw = 0;
+    let mask = effective_align - 1;
+    let offset = (raw + mask) & ~mask;
+    unsafe { (*p).used = offset + size; }
+    let data_ptr = ((p as usize) + header_size) as *mut u8;
+    ((data_ptr as usize) + offset) as *mut u8
+}
+
+pub fn arena_destroy(a: mut_view<Arena>) {
+    let mut cur = a.head;
+    while cur as usize != 0 {
+        let next = unsafe { (*cur).next };
+        let total_alloc = 32 + unsafe { (*cur).cap };
+        unsafe {
+            heap_free(cur as *mut u8, total_alloc, 16);
+        }
+        cur = next;
+    }
+    a.head = 0 as *mut ArenaChunk;
+}
+
+// StrView
+@derive(Copy)
+pub struct StrView {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+fn copy_sv(sv: view<StrView>) -> StrView {
+    StrView { ptr: sv.ptr, len: sv.len }
+}
+
+fn sv_eq(a: StrView, b: StrView) -> bool {
+    if a.len != b.len { return false; }
+    let mut i: usize = 0;
+    while i < a.len {
+        if unsafe { *(a.ptr + i) != *(b.ptr + i) } { return false; }
+        i = i + 1;
+    }
+    true
+}
+
+fn sv_contains(haystack: StrView, needle: StrView) -> bool {
+    let n_len: usize = needle.len;
+    if n_len == 0 { return true; }
+    let h_len: usize = haystack.len;
+    if h_len < n_len { return false; }
+    let mut i: usize = 0;
+    let limit = h_len - n_len;
+    while i <= limit {
+        let mut match_ok = true;
+        let mut j: usize = 0;
+        while j < n_len {
+            if unsafe { *(haystack.ptr + i + j) != *(needle.ptr + j) } {
+                match_ok = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if match_ok { return true; }
+        i = i + 1;
+    }
+    false
+}
+
+// Spans
+@derive(Copy)
+pub struct FileId {
+    pub v: u32,
+}
+
+@derive(Copy)
+pub struct Span {
+    pub file: FileId,
+    pub start: u32,
+    pub end: u32,
+}
+
+pub fn span_new(file: FileId, start: u32, end: u32) -> Span {
+    Span { file: file, start: start, end: end }
+}
+
+pub fn span_none() -> Span {
+    Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+}
+
+pub fn span_is_none(s: view<Span>) -> bool {
+    s.file.v == 0u32
+}
+
+@derive(Copy)
+pub struct LineCol {
+    pub line: u32,
+    pub col_bytes: u32,
+    pub col_chars: u32,
+}
+
+impl LineCol {
+    pub fn zero() -> LineCol {
+        LineCol { line: 0u32, col_bytes: 0u32, col_chars: 0u32 }
+    }
+}
+
+fn copy_fid(fid: view<FileId>) -> FileId { FileId { v: fid.v } }
+fn copy_span(s: view<Span>) -> Span { Span { file: copy_fid(view(s.file)), start: s.start, end: s.end } }
+
+// Minimal SourceDatabase for formatting tests
+struct SourceFile {
+    id: FileId,
+    canonical_path: StrView,
+    text: StrView,
+    line_offsets: *mut u32,
+    line_count: usize,
+}
+
+pub struct SourceDatabase {
+    arena: Arena,
+    files: *mut SourceFile,
+    file_count: usize,
+    file_cap: usize,
+}
+
+pub fn source_db_init(db: mut_view<SourceDatabase>) {
+    db.arena = arena_new();
+    db.files = 0 as *mut SourceFile;
+    db.file_count = 0;
+    db.file_cap = 0;
+}
+
+pub fn source_db_free(db: mut_view<SourceDatabase>) {
+    let mut i: usize = 0;
+    while i < db.file_count {
+        let sf = unsafe { *(file_ptr(db.files, i)) };
+        if sf.line_count > 0 && sf.line_offsets as usize != 0 {
+            unsafe { heap_free(sf.line_offsets as *mut u8, (((sf.line_count as isize) * 4isize) as usize), 4); }
+        }
+        i = i + 1;
+    }
+    if db.file_cap > 0 && db.files as usize != 0 {
+        unsafe { heap_free(db.files as *mut u8, (((db.file_cap as isize) * (size_of<SourceFile>() as isize)) as usize), align_of<SourceFile>()); }
+    }
+    db.files = 0 as *mut SourceFile;
+    db.file_count = 0;
+    db.file_cap = 0;
+    arena_destroy(mut_view(db.arena));
+}
+
+fn file_ptr(p: *mut SourceFile, i: usize) -> *mut SourceFile {
+    ((p as usize) + (((i as isize) * (size_of<SourceFile>() as isize)) as usize)) as *mut SourceFile
+}
+
+fn offset_ptr(p: *mut u32, i: usize) -> *mut u32 {
+    ((p as usize) + (((i as isize) * 4isize) as usize)) as *mut u32
+}
+
+fn utf8_count_scalars(ptr: *const u8, byte_count: usize) -> usize {
+    let mut count: usize = 0;
+    let mut i: usize = 0;
+    while i < byte_count {
+        let b = unsafe { *(ptr + i) };
+        if (b & 0xC0u8) != 0x80u8 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+pub fn source_db_add_virtual(db: mut_view<SourceDatabase>, path_ptr: *const u8, path_len: usize, text_ptr: *const u8, text_len: usize) -> FileId {
+    let path_copy = arena_alloc_raw(mut_view(db.arena), path_len + 1, 1);
+    if path_len > 0 && path_ptr as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(path_ptr, path_copy, path_len);
+            *(path_copy + path_len) = 0u8;
+        }
+    }
+
+    let text_copy = arena_alloc_raw(mut_view(db.arena), text_len + 1, 1);
+    if text_len > 0 && text_ptr as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(text_ptr, text_copy, text_len);
+            *(text_copy + text_len) = 0u8;
+        }
+    }
+
+    let mut count: usize = 1;
+    let mut i: usize = 0;
+    while i < text_len {
+        let b = unsafe { *(text_copy + i) };
+        if b == 13u8 && i + 1 < text_len && unsafe { *(text_copy + i + 1) } == 10u8 {
+            count = count + 1;
+            i = i + 2;
+        } else if b == 10u8 {
+            count = count + 1;
+            i = i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    let offsets = unsafe { heap_alloc((((count as isize) * 4isize) as usize), 4) as *mut u32 };
+    unsafe { *(offset_ptr(offsets, 0)) = 0u32; }
+    let mut line_idx: usize = 1;
+    i = 0;
+    while i < text_len {
+        let b = unsafe { *(text_copy + i) };
+        if b == 13u8 && i + 1 < text_len && unsafe { *(text_copy + i + 1) } == 10u8 {
+            unsafe { *(offset_ptr(offsets, line_idx)) = (i + 2) as u32; }
+            line_idx = line_idx + 1;
+            i = i + 2;
+        } else if b == 10u8 {
+            unsafe { *(offset_ptr(offsets, line_idx)) = (i + 1) as u32; }
+            line_idx = line_idx + 1;
+            i = i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    let new_id = FileId { v: (db.file_count + 1) as u32 };
+    if db.file_count == db.file_cap {
+        let new_cap = if db.file_cap == 0 { 4 } else { db.file_cap + db.file_cap };
+        let new_files = unsafe { heap_alloc((((new_cap as isize) * (size_of<SourceFile>() as isize)) as usize), align_of<SourceFile>()) as *mut SourceFile };
+        if db.file_count > 0 && db.files as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(db.files as *const u8, new_files as *mut u8, (((db.file_count as isize) * (size_of<SourceFile>() as isize)) as usize));
+                heap_free(db.files as *mut u8, (((db.file_cap as isize) * (size_of<SourceFile>() as isize)) as usize), align_of<SourceFile>());
+            }
+        }
+        db.files = new_files;
+        db.file_cap = new_cap;
+    }
+
+    let sf = SourceFile {
+        id: new_id,
+        canonical_path: StrView { ptr: path_copy as *const u8, len: path_len },
+        text: StrView { ptr: text_copy as *const u8, len: text_len },
+        line_offsets: offsets,
+        line_count: count,
+    };
+    unsafe { *(file_ptr(db.files, db.file_count)) = sf; }
+    db.file_count = db.file_count + 1;
+    new_id
+}
+
+pub fn source_db_path(db: view<SourceDatabase>, file: FileId) -> StrView {
+    if file.v == 0 || (file.v as usize) > db.file_count {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    sf.canonical_path
+}
+
+pub fn source_db_span_text(db: view<SourceDatabase>, span: Span) -> StrView {
+    if span.file.v == 0 || (span.file.v as usize) > db.file_count {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let sf = unsafe { *(file_ptr(db.files, (span.file.v - 1) as usize)) };
+    if span.start > span.end || (span.end as usize) > sf.text.len {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    StrView {
+        ptr: ((sf.text.ptr as usize) + (span.start as usize)) as *const u8,
+        len: (span.end - span.start) as usize,
+    }
+}
+
+pub fn source_db_line_col(db: view<SourceDatabase>, span: Span) -> LineCol {
+    if span.file.v == 0 || (span.file.v as usize) > db.file_count {
+        return LineCol.zero();
+    }
+    let sf = unsafe { *(file_ptr(db.files, (span.file.v - 1) as usize)) };
+
+    let mut offset = span.start;
+    if (offset as usize) > sf.text.len {
+        offset = sf.text.len as u32;
+    }
+
+    let mut line_idx: usize = 0;
+    let mut i: usize = 0;
+    while i < sf.line_count {
+        let off = unsafe { *(offset_ptr(sf.line_offsets, i)) };
+        if off <= offset {
+            line_idx = i;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+
+    let line_start = unsafe { *(offset_ptr(sf.line_offsets, line_idx)) };
+    let col_bytes = offset - line_start + 1u32;
+    let byte_diff = (offset - line_start) as usize;
+    let p = ((sf.text.ptr as usize) + line_start as usize) as *const u8;
+    let col_chars = (utf8_count_scalars(p, byte_diff) + 1) as u32;
+
+    LineCol {
+        line: (line_idx + 1) as u32,
+        col_bytes: col_bytes,
+        col_chars: col_chars,
+    }
+}
+
+pub fn source_db_line_range(db: view<SourceDatabase>, file: FileId, line: u32) -> Span {
+    if file.v == 0 || (file.v as usize) > db.file_count {
+        return span_none();
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    if line == 0u32 || (line as usize) > sf.line_count {
+        return span_none();
+    }
+
+    let start = unsafe { *(offset_ptr(sf.line_offsets, (line - 1u32) as usize)) };
+    let mut end: u32 = 0u32;
+    if (line as usize) < sf.line_count {
+        end = unsafe { *(offset_ptr(sf.line_offsets, line as usize)) };
+        if end > start && unsafe { *(sf.text.ptr + (end - 1u32) as usize) } == 10u8 {
+            end = end - 1u32;
+            if end > start && unsafe { *(sf.text.ptr + (end - 1u32) as usize) } == 13u8 {
+                end = end - 1u32;
+            }
+        }
+    } else {
+        end = sf.text.len as u32;
+    }
+    span_new(file, start, end)
+}
+
+// Diag Codes & Severities
+@derive(Copy)
+pub enum DiagSeverity {
+    Error,
+    Warning,
+    Info,
+    Hint,
+}
+
+@derive(Copy)
+pub enum FixApplicability {
+    MachineApplicable,
+    MaybeApplicable,
+    ManualReview,
+}
+
+@derive(Copy)
+pub enum DiagDataKind {
+    String,
+    Integer,
+    Boolean,
+    StringList,
+}
+
+@derive(Copy)
+pub struct DiagCode {
+    pub v: u32,
+}
+
+pub fn diag_code(v: u32) -> DiagCode {
+    DiagCode { v: v }
+}
+
+// Diag Models
+pub struct DiagLabel {
+    pub span: Span,
+    pub message: StrView,
+}
+
+pub struct DiagEdit {
+    pub span: Span,
+    pub replacement: StrView,
+}
+
+pub struct DiagFix {
+    pub message: StrView,
+    pub applicability: FixApplicability,
+    pub edits: *mut DiagEdit,
+    pub edit_count: usize,
+}
+
+pub struct DiagDataValue {
+    pub kind: DiagDataKind,
+    pub str_val: StrView,
+    pub int_val: i64,
+    pub bool_val: bool,
+    pub list_items: *mut StrView,
+    pub list_count: usize,
+}
+
+pub struct DiagDataEntry {
+    pub key: StrView,
+    pub value: DiagDataValue,
+}
+
+pub struct Diagnostic {
+    pub code: DiagCode,
+    pub severity: DiagSeverity,
+    pub message: StrView,
+    pub primary: Span,
+    pub labels: *mut DiagLabel,
+    pub label_count: usize,
+    pub notes: *mut StrView,
+    pub note_count: usize,
+    pub helps: *mut StrView,
+    pub help_count: usize,
+    pub fixes: *mut DiagFix,
+    pub fix_count: usize,
+    pub data: *mut DiagDataEntry,
+    pub data_count: usize,
+}
+
+pub struct DiagSink {
+    pub arena: Arena,
+    pub diags: *mut Diagnostic,
+    pub len: usize,
+    pub cap: usize,
+    pub errors: usize,
+    pub warnings: usize,
+}
+
+pub fn diag_sink_new() -> DiagSink {
+    DiagSink {
+        arena: arena_new(),
+        diags: 0 as *mut Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+}
+
+pub fn diag_sink_free(sink: mut_view<DiagSink>) {
+    if sink.cap > 0 && sink.diags as usize != 0 {
+        unsafe {
+            heap_free(sink.diags as *mut u8, (((sink.cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>());
+        }
+    }
+    sink.diags = 0 as *mut Diagnostic;
+    sink.len = 0;
+    sink.cap = 0;
+    sink.errors = 0;
+    sink.warnings = 0;
+    arena_destroy(mut_view(sink.arena));
+}
+
+fn copy_str_view(arena: mut_view<Arena>, sv: StrView) -> StrView {
+    if sv.len == 0 || sv.ptr as usize == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let dst = arena_alloc_raw(arena, sv.len + 1, 1);
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(sv.ptr, dst, sv.len);
+        *(dst + sv.len) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: sv.len }
+}
+
+fn diag_ptr(p: *mut Diagnostic, i: usize) -> *mut Diagnostic {
+    ((p as usize) + (((i as isize) * (size_of<Diagnostic>() as isize)) as usize)) as *mut Diagnostic
+}
+
+pub fn diag_sink_report(sink: mut_view<DiagSink>, diag: view<Diagnostic>) {
+    if sink.len == sink.cap {
+        let new_cap = if sink.cap == 0 { 8 } else { sink.cap + sink.cap };
+        let new_diags = unsafe { heap_alloc((((new_cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>()) as *mut Diagnostic };
+        if sink.len > 0 && sink.diags as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(sink.diags as *const u8, new_diags as *mut u8, (((sink.len as isize) * (size_of<Diagnostic>() as isize)) as usize));
+                heap_free(sink.diags as *mut u8, (((sink.cap as isize) * (size_of<Diagnostic>() as isize)) as usize), align_of<Diagnostic>());
+            }
+        }
+        sink.diags = new_diags;
+        sink.cap = new_cap;
+    }
+
+    let mut d = Diagnostic {
+        code: diag.code,
+        severity: diag.severity,
+        message: copy_str_view(mut_view(sink.arena), copy_sv(view(diag.message))),
+        primary: diag.primary,
+        labels: 0 as *mut DiagLabel,
+        label_count: diag.label_count,
+        notes: 0 as *mut StrView,
+        note_count: diag.note_count,
+        helps: 0 as *mut StrView,
+        help_count: diag.help_count,
+        fixes: 0 as *mut DiagFix,
+        fix_count: diag.fix_count,
+        data: 0 as *mut DiagDataEntry,
+        data_count: diag.data_count,
+    };
+
+    if diag.label_count > 0 && diag.labels as usize != 0 {
+        let labels_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.label_count as isize) * (size_of<DiagLabel>() as isize)) as usize), align_of<DiagLabel>()) as *mut DiagLabel;
+        let mut i: usize = 0;
+        while i < diag.label_count {
+            let src_l = unsafe { *((diag.labels as usize + (((i as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+            let dst_l_ptr = ((labels_mem as usize) + (((i as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *mut DiagLabel;
+            unsafe {
+                *dst_l_ptr = DiagLabel {
+                    span: src_l.span,
+                    message: copy_str_view(mut_view(sink.arena), copy_sv(view(src_l.message))),
+                };
+            }
+            i = i + 1;
+        }
+        d.labels = labels_mem;
+    }
+
+    if diag.note_count > 0 && diag.notes as usize != 0 {
+        let notes_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.note_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+        let mut i: usize = 0;
+        while i < diag.note_count {
+            let src_n = unsafe { *((diag.notes as usize + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            let dst_n_ptr = ((notes_mem as usize) + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+            unsafe {
+                *dst_n_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(src_n)));
+            }
+            i = i + 1;
+        }
+        d.notes = notes_mem;
+    }
+
+    if diag.help_count > 0 && diag.helps as usize != 0 {
+        let helps_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.help_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+        let mut i: usize = 0;
+        while i < diag.help_count {
+            let src_h = unsafe { *((diag.helps as usize + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            let dst_h_ptr = ((helps_mem as usize) + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+            unsafe {
+                *dst_h_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(src_h)));
+            }
+            i = i + 1;
+        }
+        d.helps = helps_mem;
+    }
+
+    if diag.fix_count > 0 && diag.fixes as usize != 0 {
+        let fixes_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.fix_count as isize) * (size_of<DiagFix>() as isize)) as usize), align_of<DiagFix>()) as *mut DiagFix;
+        let mut i: usize = 0;
+        while i < diag.fix_count {
+            let src_f = unsafe { *((diag.fixes as usize + (((i as isize) * (size_of<DiagFix>() as isize)) as usize)) as *const DiagFix) };
+            let dst_f_ptr = ((fixes_mem as usize) + (((i as isize) * (size_of<DiagFix>() as isize)) as usize)) as *mut DiagFix;
+            let mut edits_mem = 0 as *mut DiagEdit;
+            if src_f.edit_count > 0 && src_f.edits as usize != 0 {
+                edits_mem = arena_alloc_raw(mut_view(sink.arena), (((src_f.edit_count as isize) * (size_of<DiagEdit>() as isize)) as usize), align_of<DiagEdit>()) as *mut DiagEdit;
+                let mut j: usize = 0;
+                while j < src_f.edit_count {
+                    let src_e = unsafe { *((src_f.edits as usize + (((j as isize) * (size_of<DiagEdit>() as isize)) as usize)) as *const DiagEdit) };
+                    let dst_e_ptr = ((edits_mem as usize) + (((j as isize) * (size_of<DiagEdit>() as isize)) as usize)) as *mut DiagEdit;
+                    unsafe {
+                        *dst_e_ptr = DiagEdit {
+                            span: src_e.span,
+                            replacement: copy_str_view(mut_view(sink.arena), copy_sv(view(src_e.replacement))),
+                        };
+                    }
+                    j = j + 1;
+                }
+            }
+            unsafe {
+                *dst_f_ptr = DiagFix {
+                    message: copy_str_view(mut_view(sink.arena), copy_sv(view(src_f.message))),
+                    applicability: src_f.applicability,
+                    edits: edits_mem,
+                    edit_count: src_f.edit_count,
+                };
+            }
+            i = i + 1;
+        }
+        d.fixes = fixes_mem;
+    }
+
+    if diag.data_count > 0 && diag.data as usize != 0 {
+        let data_mem = arena_alloc_raw(mut_view(sink.arena), (((diag.data_count as isize) * (size_of<DiagDataEntry>() as isize)) as usize), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+        let mut i: usize = 0;
+        while i < diag.data_count {
+            let src_entry = unsafe { *((diag.data as usize + (((i as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *const DiagDataEntry) };
+            let dst_entry_ptr = ((data_mem as usize) + (((i as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *mut DiagDataEntry;
+            let mut val = DiagDataValue {
+                kind: src_entry.value.kind,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: src_entry.value.int_val,
+                bool_val: src_entry.value.bool_val,
+                list_items: 0 as *mut StrView,
+                list_count: src_entry.value.list_count,
+            };
+            match src_entry.value.kind {
+                DiagDataKind.String => {
+                    val.str_val = copy_str_view(mut_view(sink.arena), copy_sv(view(src_entry.value.str_val)));
+                },
+                DiagDataKind.StringList => {
+                    if src_entry.value.list_count > 0 && src_entry.value.list_items as usize != 0 {
+                        let items_mem = arena_alloc_raw(mut_view(sink.arena), (((src_entry.value.list_count as isize) * (size_of<StrView>() as isize)) as usize), align_of<StrView>()) as *mut StrView;
+                        let mut k: usize = 0;
+                        while k < src_entry.value.list_count {
+                            let item = unsafe { *((src_entry.value.list_items as usize + (((k as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+                            let dst_item_ptr = ((items_mem as usize) + (((k as isize) * (size_of<StrView>() as isize)) as usize)) as *mut StrView;
+                            unsafe {
+                                *dst_item_ptr = copy_str_view(mut_view(sink.arena), copy_sv(view(item)));
+                            }
+                            k = k + 1;
+                        }
+                        val.list_items = items_mem;
+                    }
+                },
+                _ => {},
+            }
+            unsafe {
+                *dst_entry_ptr = DiagDataEntry {
+                    key: copy_str_view(mut_view(sink.arena), copy_sv(view(src_entry.key))),
+                    value: val,
+                };
+            }
+            i = i + 1;
+        }
+        d.data = data_mem;
+    }
+
+    let sev = diag.severity;
+    unsafe {
+        *(diag_ptr(sink.diags, sink.len)) = d;
+    }
+    sink.len = sink.len + 1;
+
+    match sev {
+        DiagSeverity.Error => {
+            sink.errors = sink.errors + 1;
+        },
+        DiagSeverity.Warning => {
+            sink.warnings = sink.warnings + 1;
+        },
+        _ => {},
+    }
+}
+
+// DiagBuffer & formatters
+pub struct DiagBuffer {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+pub fn diag_buf_new() -> DiagBuffer {
+    DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+pub fn diag_buf_init(b: mut_view<DiagBuffer>) {
+    b.ptr = 0 as *mut u8;
+    b.len = 0;
+    b.cap = 0;
+}
+
+pub fn diag_buf_free(b: mut_view<DiagBuffer>) {
+    if b.cap > 0 && b.ptr as usize != 0 {
+        unsafe {
+            heap_free(b.ptr, b.cap, 1);
+        }
+    }
+    b.ptr = 0 as *mut u8;
+    b.len = 0;
+    b.cap = 0;
+}
+
+pub fn diag_buf_push_byte(b: mut_view<DiagBuffer>, byte: u8) {
+    if b.len == b.cap {
+        let new_cap = if b.cap == 0 { 128 } else { b.cap + b.cap };
+        let new_ptr = unsafe { heap_alloc(new_cap, 1) };
+        if b.len > 0 && b.ptr as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(b.ptr as *const u8, new_ptr, b.len);
+                heap_free(b.ptr, b.cap, 1);
+            }
+        }
+        b.ptr = new_ptr;
+        b.cap = new_cap;
+    }
+    unsafe {
+        *(b.ptr + b.len) = byte;
+    }
+    b.len = b.len + 1;
+}
+
+pub fn diag_buf_push_bytes(b: mut_view<DiagBuffer>, p: *const u8, count: usize) {
+    if count == 0 || p as usize == 0 {
+        return;
+    }
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*b), unsafe { *(p + i) });
+        i = i + 1;
+    }
+}
+
+pub fn diag_buf_push_sv(b: mut_view<DiagBuffer>, sv: StrView) {
+    diag_buf_push_bytes(b, sv.ptr, sv.len);
+}
+
+pub fn diag_buf_push_u32(b: mut_view<DiagBuffer>, mut n: u32) {
+    if n == 0u32 {
+        diag_buf_push_byte(b, 48u8);
+        return;
+    }
+    let mut digits: [10]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut count: usize = 0;
+    while n > 0u32 {
+        digits[count] = ((n % 10u32) as u8) + 48u8;
+        n = n / 10u32;
+        count = count + 1;
+    }
+    while count > 0 {
+        count = count - 1;
+        diag_buf_push_byte(mut_view(*b), digits[count]);
+    }
+}
+
+pub fn diag_buf_as_str_view(b: view<DiagBuffer>) -> StrView {
+    StrView { ptr: b.ptr as *const u8, len: b.len }
+}
+
+const FMT_STRS: [97]u8 = [
+    60u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 62u8, 32u8, 124u8, 32u8, 101u8, 114u8, 114u8, 111u8,
+    114u8, 91u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8, 91u8, 105u8, 110u8, 102u8, 111u8, 91u8, 104u8,
+    105u8, 110u8, 116u8, 91u8, 93u8, 58u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 45u8, 45u8, 62u8, 32u8,
+    46u8, 46u8, 46u8, 10u8, 32u8, 32u8, 61u8, 32u8, 110u8, 111u8, 116u8, 101u8, 58u8, 32u8, 32u8, 32u8,
+    61u8, 32u8, 104u8, 101u8, 108u8, 112u8, 58u8, 32u8, 32u8, 32u8, 61u8, 32u8, 102u8, 105u8, 120u8, 58u8,
+    32u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8, 44u8, 32u8, 32u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8,
+    103u8,
+];
+
+pub fn diag_buf_push_fmt_str(b: mut_view<DiagBuffer>, start: usize, byte_count: usize) {
+    let mut i: usize = 0;
+    while i < byte_count {
+        diag_buf_push_byte(mut_view(*b), FMT_STRS[start + i]);
+        i = i + 1;
+    }
+}
+
+const CODE_NAMES_DATA: [2885]u8 = [
+    65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 85u8, 84u8, 70u8, 56u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 78u8, 79u8, 78u8, 95u8, 65u8, 83u8, 67u8, 73u8, 73u8, 95u8, 73u8, 68u8, 69u8, 78u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8,
+    67u8, 79u8, 77u8, 77u8, 69u8, 78u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8, 83u8, 84u8, 82u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8, 65u8, 76u8,
+    65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 85u8, 78u8, 73u8, 67u8, 79u8, 68u8, 69u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 78u8, 79u8, 78u8, 95u8, 65u8, 83u8, 67u8, 73u8, 73u8, 95u8, 73u8, 78u8, 95u8, 66u8, 89u8, 84u8, 69u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8,
+    65u8, 76u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 68u8, 73u8, 71u8, 73u8, 84u8, 83u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 66u8, 65u8, 83u8, 69u8, 95u8, 80u8, 82u8, 69u8, 70u8, 73u8, 88u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 68u8, 73u8, 71u8, 73u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 68u8, 73u8, 71u8, 73u8,
+    84u8, 95u8, 83u8, 69u8, 80u8, 65u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 83u8, 85u8, 70u8, 70u8, 73u8, 88u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 70u8, 76u8, 79u8, 87u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8,
+    95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 95u8, 69u8, 81u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8, 79u8, 75u8, 69u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 69u8, 88u8, 80u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8,
+    95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 80u8, 65u8, 84u8, 84u8, 69u8, 82u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 73u8, 84u8, 69u8, 77u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8,
+    69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 76u8, 79u8, 79u8, 80u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 85u8, 78u8, 67u8, 76u8, 79u8, 83u8, 69u8, 68u8, 95u8, 68u8, 69u8, 76u8, 73u8, 77u8, 73u8, 84u8, 69u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 76u8, 69u8, 65u8, 68u8, 73u8, 78u8, 71u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8,
+    84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 67u8, 72u8, 65u8, 73u8, 78u8, 69u8, 68u8, 95u8, 67u8, 79u8, 77u8, 80u8, 65u8, 82u8, 73u8, 83u8, 79u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 65u8, 83u8, 83u8, 73u8, 71u8, 78u8, 95u8, 73u8, 78u8, 95u8, 69u8, 88u8, 80u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 82u8, 69u8, 70u8, 69u8, 82u8, 69u8, 78u8, 67u8, 69u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8,
+    65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 86u8, 65u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 77u8, 79u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 77u8, 79u8, 68u8, 85u8, 76u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 70u8, 73u8, 82u8, 83u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 73u8, 84u8, 69u8, 77u8, 95u8, 73u8, 78u8,
+    95u8, 66u8, 76u8, 79u8, 67u8, 75u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 76u8, 69u8, 84u8, 95u8, 78u8, 69u8, 69u8, 68u8, 83u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 82u8, 95u8, 73u8, 78u8, 73u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 83u8, 69u8, 76u8, 70u8, 95u8, 78u8, 69u8, 69u8, 68u8, 83u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 70u8, 78u8, 95u8, 66u8, 79u8, 68u8, 89u8, 95u8, 82u8, 69u8,
+    81u8, 85u8, 73u8, 82u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 70u8, 78u8, 95u8, 66u8, 79u8, 68u8, 89u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 76u8, 76u8, 79u8, 87u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 86u8, 73u8, 83u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 76u8, 76u8, 79u8, 87u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 65u8, 82u8, 82u8, 65u8, 89u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 82u8,
+    68u8, 69u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 82u8, 69u8, 83u8, 69u8, 82u8, 86u8, 69u8, 68u8, 95u8, 75u8, 69u8, 89u8, 87u8, 79u8, 82u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 85u8, 78u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 95u8, 73u8, 78u8, 95u8, 66u8, 79u8, 79u8, 84u8, 83u8, 84u8, 82u8, 65u8, 80u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 83u8, 79u8, 76u8, 86u8, 69u8, 68u8, 65u8,
+    88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 95u8, 86u8, 65u8, 76u8, 85u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 83u8, 79u8, 76u8, 86u8, 69u8, 68u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 65u8, 88u8,
+    95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 83u8, 72u8, 65u8, 68u8, 79u8, 87u8, 95u8, 77u8, 79u8, 68u8, 85u8, 76u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 68u8, 69u8, 70u8, 73u8, 78u8, 69u8, 68u8, 95u8, 76u8, 65u8, 66u8, 69u8, 76u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 66u8, 82u8, 69u8, 65u8, 75u8, 95u8, 79u8, 85u8, 84u8, 83u8, 73u8, 68u8, 69u8, 95u8, 76u8, 79u8, 79u8, 80u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8,
+    89u8, 69u8, 84u8, 95u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8, 69u8, 95u8, 66u8, 73u8, 78u8, 68u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 79u8, 82u8, 95u8, 80u8, 65u8, 84u8, 84u8, 69u8, 82u8, 78u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 80u8, 82u8, 73u8, 86u8, 65u8, 84u8, 69u8,
+    65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 95u8, 67u8, 89u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 67u8, 65u8, 76u8, 76u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8,
+    82u8, 71u8, 95u8, 67u8, 79u8, 85u8, 78u8, 84u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8, 65u8, 76u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 82u8, 65u8, 78u8, 71u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 69u8, 71u8, 95u8, 85u8, 78u8,
+    83u8, 73u8, 71u8, 78u8, 69u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 67u8, 65u8, 83u8, 84u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 69u8, 86u8, 69u8, 82u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 83u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 65u8, 73u8, 78u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 65u8, 73u8, 78u8, 95u8,
+    83u8, 73u8, 71u8, 78u8, 65u8, 84u8, 85u8, 82u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 95u8, 73u8, 78u8, 95u8, 66u8, 79u8, 79u8, 84u8, 83u8, 84u8, 82u8, 65u8, 80u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8, 83u8, 83u8, 73u8, 71u8, 78u8, 95u8, 73u8, 77u8, 77u8, 85u8, 84u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 95u8,
+    85u8, 83u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 65u8, 67u8, 72u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8,
+    69u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8, 82u8, 82u8, 65u8, 89u8, 95u8, 83u8, 73u8, 90u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 67u8, 65u8, 78u8, 78u8, 79u8, 84u8, 95u8, 73u8, 78u8, 68u8, 69u8, 88u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 84u8, 82u8, 89u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 78u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 84u8, 82u8, 89u8, 95u8, 82u8, 69u8, 84u8, 85u8,
+    82u8, 78u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 83u8, 84u8, 79u8, 82u8, 69u8, 68u8, 95u8, 86u8, 73u8, 69u8, 87u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 83u8, 84u8, 79u8, 82u8, 69u8, 68u8, 95u8, 86u8, 73u8, 69u8, 87u8, 95u8, 83u8, 69u8, 76u8, 70u8, 95u8, 82u8, 69u8, 70u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 76u8, 65u8,
+    80u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 65u8, 77u8, 66u8, 73u8, 71u8, 85u8, 79u8, 85u8, 83u8, 95u8, 77u8, 69u8, 84u8, 72u8, 79u8, 68u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 85u8, 78u8, 83u8, 65u8, 84u8, 73u8, 83u8, 70u8, 73u8, 69u8, 68u8, 95u8, 66u8, 79u8, 85u8, 78u8, 68u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 68u8, 69u8, 82u8, 73u8, 86u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8,
+    84u8, 95u8, 78u8, 79u8, 78u8, 95u8, 69u8, 88u8, 72u8, 65u8, 85u8, 83u8, 84u8, 73u8, 86u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 84u8, 95u8, 82u8, 69u8, 70u8, 85u8, 84u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 84u8, 95u8, 85u8, 78u8, 82u8, 69u8, 65u8, 67u8, 72u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 77u8, 79u8, 86u8, 69u8, 95u8, 85u8, 83u8, 69u8, 95u8, 65u8, 70u8, 84u8, 69u8, 82u8, 95u8, 77u8, 79u8, 86u8, 69u8, 65u8, 88u8, 95u8, 73u8, 78u8, 73u8, 84u8, 95u8,
+    85u8, 83u8, 69u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 67u8, 79u8, 78u8, 70u8, 76u8, 73u8, 67u8, 84u8, 95u8, 77u8, 85u8, 84u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 67u8, 79u8, 78u8, 70u8, 76u8, 73u8, 67u8, 84u8, 95u8, 82u8, 69u8, 65u8, 68u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 79u8, 85u8, 84u8, 76u8, 73u8, 86u8, 69u8, 83u8, 95u8, 79u8, 87u8, 78u8, 69u8, 82u8, 65u8, 88u8, 95u8, 85u8, 78u8, 83u8, 65u8, 70u8, 69u8, 95u8,
+    82u8, 69u8, 81u8, 85u8, 73u8, 82u8, 69u8, 68u8, 65u8, 88u8, 95u8, 85u8, 78u8, 83u8, 65u8, 70u8, 69u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 85u8, 66u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 70u8, 76u8, 79u8, 87u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 68u8, 73u8, 86u8, 95u8, 90u8, 69u8, 82u8, 79u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 67u8, 89u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 67u8, 79u8,
+    78u8, 83u8, 84u8, 95u8, 69u8, 86u8, 65u8, 76u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 77u8, 73u8, 82u8, 95u8, 83u8, 89u8, 78u8, 84u8, 65u8, 88u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 76u8, 79u8, 67u8, 65u8, 76u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8,
+    66u8, 76u8, 79u8, 67u8, 75u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 66u8, 65u8, 68u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 95u8, 85u8, 83u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 67u8, 65u8,
+    76u8, 76u8, 95u8, 83u8, 73u8, 71u8, 78u8, 65u8, 84u8, 85u8, 82u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 83u8, 69u8, 95u8, 65u8, 70u8, 84u8, 69u8, 82u8, 95u8, 77u8, 79u8, 86u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 68u8, 82u8, 79u8, 80u8, 65u8,
+    88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 68u8, 79u8, 85u8, 66u8, 76u8, 69u8, 95u8, 68u8, 82u8, 79u8, 80u8, 65u8, 88u8, 95u8, 70u8, 70u8, 73u8, 95u8, 78u8, 79u8, 84u8, 95u8, 73u8, 78u8, 95u8, 79u8, 82u8, 65u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 85u8, 78u8, 68u8, 69u8, 70u8, 73u8, 78u8, 69u8, 68u8, 95u8, 83u8, 89u8, 77u8, 66u8, 79u8, 76u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8,
+    69u8, 95u8, 83u8, 89u8, 77u8, 66u8, 79u8, 76u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 82u8, 69u8, 76u8, 79u8, 67u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 82u8, 65u8, 78u8, 71u8, 69u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 66u8, 65u8, 68u8, 95u8, 79u8, 66u8, 74u8, 69u8, 67u8, 84u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 73u8, 77u8, 65u8, 71u8, 69u8, 95u8, 84u8, 79u8, 79u8, 95u8, 76u8, 65u8, 82u8, 71u8, 69u8, 65u8, 88u8, 95u8, 73u8, 79u8,
+    95u8, 70u8, 73u8, 76u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 70u8, 79u8, 85u8, 78u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 82u8, 69u8, 65u8, 68u8, 95u8, 70u8, 65u8, 73u8, 76u8, 69u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 87u8, 82u8, 73u8, 84u8, 69u8, 95u8, 70u8, 65u8, 73u8, 76u8, 69u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 70u8, 73u8, 76u8, 69u8, 95u8, 84u8, 79u8, 79u8, 95u8, 76u8, 65u8, 82u8, 71u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8,
+    85u8, 83u8, 65u8, 71u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 79u8, 80u8, 84u8, 73u8, 79u8, 78u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 78u8, 79u8, 95u8, 73u8, 78u8, 80u8, 85u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8,
+    95u8, 83u8, 84u8, 65u8, 71u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 86u8, 65u8, 73u8, 76u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 83u8, 84u8, 69u8, 80u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 83u8, 84u8, 65u8, 67u8, 75u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8,
+    73u8, 86u8, 69u8, 82u8, 95u8, 78u8, 79u8, 95u8, 83u8, 84u8, 68u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 66u8, 65u8, 68u8, 95u8, 77u8, 65u8, 78u8, 73u8, 70u8, 69u8, 83u8, 84u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 78u8, 65u8, 76u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 77u8, 73u8, 82u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 77u8,
+    69u8, 77u8, 79u8, 82u8, 89u8,
+];
+
+const CODE_NAMES_OFF: [134]u16 = [
+    0u16, 19u16, 38u16, 60u16, 87u16, 113u16, 137u16, 160u16, 181u16, 210u16, 242u16, 263u16, 285u16, 305u16, 331u16, 352u16, 371u16, 394u16, 412u16, 427u16, 450u16, 472u16, 494u16, 519u16, 541u16, 569u16, 591u16, 618u16, 643u16, 670u16, 693u16, 720u16,
+    732u16, 747u16, 759u16, 784u16, 806u16, 837u16, 861u16, 886u16, 914u16, 938u16, 963u16, 988u16, 1021u16, 1039u16, 1056u16, 1075u16, 1093u16, 1118u16, 1139u16, 1162u16, 1188u16, 1213u16, 1238u16, 1265u16, 1280u16, 1300u16, 1316u16, 1331u16, 1351u16, 1368u16, 1382u16, 1398u16,
+    1426u16, 1446u16, 1466u16, 1487u16, 1507u16, 1529u16, 1561u16, 1585u16, 1603u16, 1622u16, 1643u16, 1664u16, 1687u16, 1705u16, 1725u16, 1744u16, 1771u16, 1797u16, 1825u16, 1841u16, 1866u16, 1892u16, 1915u16, 1936u16, 1952u16, 1970u16, 1992u16, 2010u16, 2029u16, 2049u16, 2070u16, 2088u16,
+    2107u16, 2124u16, 2141u16, 2155u16, 2174u16, 2194u16, 2217u16, 2245u16, 2265u16, 2288u16, 2308u16, 2332u16, 2353u16, 2377u16, 2399u16, 2420u16, 2440u16, 2464u16, 2488u16, 2514u16, 2532u16, 2555u16, 2575u16, 2592u16, 2610u16, 2630u16, 2645u16, 2669u16, 2687u16, 2711u16, 2740u16, 2767u16,
+    2795u16, 2811u16, 2833u16, 2848u16, 2865u16, 2885u16,
+];
+
+pub fn diag_buf_push_code_name(b: mut_view<DiagBuffer>, c: DiagCode) {
+    if c.v >= 133u32 {
+        diag_buf_push_fmt_str(b, 0, 9);
+        return;
+    }
+    let start = CODE_NAMES_OFF[c.v as usize] as usize;
+    let end = CODE_NAMES_OFF[(c.v + 1u32) as usize] as usize;
+    let mut i = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*b), CODE_NAMES_DATA[i]);
+        i = i + 1;
+    }
+}
+
+fn get_gutter_width(mut line: u32) -> u32 {
+    if line == 0u32 {
+        return 1u32;
+    }
+    let mut w: u32 = 0u32;
+    while line > 0u32 {
+        w = w + 1u32;
+        line = line / 10u32;
+    }
+    w
+}
+
+fn print_gutter_space(b: mut_view<DiagBuffer>, width: u32) {
+    let mut i: u32 = 0u32;
+    while i < width {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        i = i + 1u32;
+    }
+    diag_buf_push_fmt_str(b, 9, 3);
+}
+
+fn print_severity_prefix(b: mut_view<DiagBuffer>, sev: DiagSeverity, c: DiagCode) {
+    match sev {
+        DiagSeverity.Error => {
+            diag_buf_push_fmt_str(mut_view(*b), 12, 6);
+        },
+        DiagSeverity.Warning => {
+            diag_buf_push_fmt_str(mut_view(*b), 18, 8);
+        },
+        DiagSeverity.Info => {
+            diag_buf_push_fmt_str(mut_view(*b), 26, 5);
+        },
+        DiagSeverity.Hint => {
+            diag_buf_push_fmt_str(mut_view(*b), 31, 5);
+        },
+    }
+    diag_buf_push_code_name(mut_view(*b), c);
+    diag_buf_push_fmt_str(b, 36, 3);
+}
+
+fn render_line(b: mut_view<DiagBuffer>, line_text: StrView) {
+    let mut i: usize = 0;
+    while i < line_text.len {
+        let c = unsafe { *(line_text.ptr + i) };
+        if c == 9u8 {
+            diag_buf_push_fmt_str(mut_view(*b), 39, 4);
+        } else if c != 13u8 && c != 10u8 {
+            diag_buf_push_byte(mut_view(*b), c);
+        }
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 10u8);
+}
+
+fn render_carets(b: mut_view<DiagBuffer>, line_text: StrView, start_col: u32, end_col: u32, caret_byte: u8, msg: StrView) {
+    let mut display_start: usize = 0;
+    let mut char_idx: usize = 1;
+    let mut i: usize = 0;
+
+    while i < line_text.len && char_idx < (start_col as usize) {
+        let c = unsafe { *(line_text.ptr + i) };
+        let mut w: usize = 1;
+        let mut bytes: usize = 1;
+        if c == 9u8 {
+            w = 4;
+        } else if (c & 0xE0u8) == 0xC0u8 {
+            bytes = 2;
+        } else if (c & 0xF0u8) == 0xE0u8 {
+            bytes = 3;
+        } else if (c & 0xF8u8) == 0xF0u8 {
+            bytes = 4;
+        }
+        display_start = display_start + w;
+        char_idx = char_idx + 1;
+        i = i + bytes;
+    }
+
+    let mut display_end: usize = display_start;
+    if start_col == end_col {
+        display_end = display_end + 1;
+    } else {
+        while i < line_text.len && char_idx < (end_col as usize) {
+            let c = unsafe { *(line_text.ptr + i) };
+            let mut w: usize = 1;
+            let mut bytes: usize = 1;
+            if c == 9u8 {
+                w = 4;
+            } else if (c & 0xE0u8) == 0xC0u8 {
+                bytes = 2;
+            } else if (c & 0xF0u8) == 0xE0u8 {
+                bytes = 3;
+            } else if (c & 0xF8u8) == 0xF0u8 {
+                bytes = 4;
+            }
+            display_end = display_end + w;
+            char_idx = char_idx + 1;
+            i = i + bytes;
+        }
+    }
+
+    let mut j: usize = 0;
+    while j < display_start {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        j = j + 1;
+    }
+    while j < display_end {
+        diag_buf_push_byte(mut_view(*b), caret_byte);
+        j = j + 1;
+    }
+    if msg.len > 0 {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        diag_buf_push_sv(mut_view(*b), msg);
+    }
+    diag_buf_push_byte(b, 10u8);
+}
+
+fn print_gutter_line_num(b: mut_view<DiagBuffer>, line: u32, width: u32) {
+    let lw = get_gutter_width(line);
+    let mut pad = width - lw;
+    while pad > 0u32 {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        pad = pad - 1u32;
+    }
+    diag_buf_push_u32(mut_view(*b), line);
+    diag_buf_push_fmt_str(b, 9, 3);
+}
+
+fn print_span_snippet(b: mut_view<DiagBuffer>, db: view<SourceDatabase>, span: Span, caret_byte: u8, msg: StrView, gutter_width: u32) {
+    let s_start: u32 = span.start;
+    let s_end: u32 = span.end;
+    let lc_start = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_start, s_start));
+    let lc_end = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_end, s_end));
+
+    if lc_start.line == lc_end.line {
+        let line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_start.line);
+        let line_text = source_db_span_text(db, line_span);
+        print_gutter_line_num(mut_view(*b), lc_start.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(line_text)));
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(line_text)), lc_start.col_chars, lc_end.col_chars, caret_byte, copy_sv(view(msg)));
+    } else {
+        let start_line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_start.line);
+        let start_line_text = source_db_span_text(db, start_line_span);
+        print_gutter_line_num(mut_view(*b), lc_start.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(start_line_text)));
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(start_line_text)), lc_start.col_chars, 999999u32, caret_byte, StrView { ptr: 0 as *const u8, len: 0 });
+
+        if lc_end.line > lc_start.line + 1u32 {
+            let mut sp = gutter_width + 2u32;
+            while sp > 0u32 {
+                diag_buf_push_byte(mut_view(*b), 32u8);
+                sp = sp - 1u32;
+            }
+            diag_buf_push_fmt_str(mut_view(*b), 48, 4);
+        }
+
+        let end_line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_end.line);
+        let end_line_text = source_db_span_text(db, end_line_span);
+        print_gutter_line_num(mut_view(*b), lc_end.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(end_line_text)));
+
+        let mut first_non_blank: u32 = 1u32;
+        let mut k: usize = 0;
+        while k < end_line_text.len {
+            let eb = unsafe { *(end_line_text.ptr + k) };
+            if eb != 32u8 && eb != 9u8 && eb != 13u8 {
+                break;
+            }
+            first_non_blank = first_non_blank + 1u32;
+            k = k + 1;
+        }
+
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(end_line_text)), first_non_blank, lc_end.col_chars, caret_byte, copy_sv(view(msg)));
+    }
+}
+
+pub fn ax_diag_render_human(sink: view<DiagSink>, db: view<SourceDatabase>, out: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < sink.len {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+        let d = unsafe { *((sink.diags as usize + (((i as isize) * (size_of<Diagnostic>() as isize)) as usize)) as *const Diagnostic) };
+
+        let d_prim = copy_span(view(d.primary));
+        let d_msg = copy_sv(view(d.message));
+
+        print_severity_prefix(mut_view(*out), d.severity, d.code);
+        diag_buf_push_sv(mut_view(*out), d_msg);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+
+        if !span_is_none(view(d_prim)) {
+            let p_start: u32 = d_prim.start;
+            let lc = source_db_line_col(db, span_new(copy_fid(view(d_prim.file)), p_start, p_start));
+            let path = source_db_path(db, copy_fid(view(d_prim.file)));
+
+            diag_buf_push_fmt_str(mut_view(*out), 43, 5);
+
+            let mut pi: usize = 0;
+            while pi < path.len {
+                let pb = unsafe { *(path.ptr + pi) };
+                if pb == 92u8 {
+                    diag_buf_push_byte(mut_view(*out), 47u8);
+                } else {
+                    diag_buf_push_byte(mut_view(*out), pb);
+                }
+                pi = pi + 1;
+            }
+
+            diag_buf_push_byte(mut_view(*out), 58u8);
+            diag_buf_push_u32(mut_view(*out), lc.line);
+            diag_buf_push_byte(mut_view(*out), 58u8);
+            diag_buf_push_u32(mut_view(*out), lc.col_chars);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+
+            let mut gutter_width = get_gutter_width(lc.line);
+            let mut l: usize = 0;
+            while l < d.label_count {
+                let lbl = unsafe { *((d.labels as usize + (((l as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+                let l_span = copy_span(view(lbl.span));
+                if !span_is_none(view(l_span)) && l_span.file.v == d_prim.file.v {
+                    let l_start: u32 = l_span.start;
+                    let llc = source_db_line_col(db, span_new(copy_fid(view(l_span.file)), l_start, l_start));
+                    let lw = get_gutter_width(llc.line);
+                    if lw > gutter_width {
+                        gutter_width = lw;
+                    }
+                }
+                l = l + 1;
+            }
+
+            print_gutter_space(mut_view(*out), gutter_width);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+
+            print_span_snippet(mut_view(*out), db, copy_span(view(d_prim)), 94u8, StrView { ptr: 0 as *const u8, len: 0 }, gutter_width);
+
+            let mut l2: usize = 0;
+            while l2 < d.label_count {
+                let lbl = unsafe { *((d.labels as usize + (((l2 as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+                let l_span = copy_span(view(lbl.span));
+                let l_msg = copy_sv(view(lbl.message));
+                if !span_is_none(view(l_span)) && l_span.file.v == d_prim.file.v {
+                    print_span_snippet(mut_view(*out), db, copy_span(view(l_span)), 45u8, l_msg, gutter_width);
+                }
+                l2 = l2 + 1;
+            }
+
+            print_gutter_space(mut_view(*out), gutter_width);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+
+        // Notes
+        let mut ni: usize = 0;
+        while ni < d.note_count {
+            let note = unsafe { *((d.notes as usize + (((ni as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            diag_buf_push_fmt_str(mut_view(*out), 52, 10);
+            diag_buf_push_sv(mut_view(*out), note);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            ni = ni + 1;
+        }
+
+        // Helps
+        let mut hi: usize = 0;
+        while hi < d.help_count {
+            let help = unsafe { *((d.helps as usize + (((hi as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            diag_buf_push_fmt_str(mut_view(*out), 62, 10);
+            diag_buf_push_sv(mut_view(*out), help);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            hi = hi + 1;
+        }
+
+        // Fixes
+        let mut fi: usize = 0;
+        while fi < d.fix_count {
+            let fix = unsafe { *((d.fixes as usize + (((fi as isize) * (size_of<DiagFix>() as isize)) as usize)) as *const DiagFix) };
+            diag_buf_push_fmt_str(mut_view(*out), 72, 9);
+            diag_buf_push_sv(mut_view(*out), fix.message);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            fi = fi + 1;
+        }
+
+        i = i + 1;
+    }
+
+    if sink.len > 0 {
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        diag_buf_push_u32(mut_view(*out), sink.errors as u32);
+        diag_buf_push_fmt_str(mut_view(*out), 81, 6);
+        if sink.errors != 1 {
+            diag_buf_push_byte(mut_view(*out), 115u8);
+        }
+        diag_buf_push_fmt_str(mut_view(*out), 87, 2);
+        diag_buf_push_u32(mut_view(*out), sink.warnings as u32);
+        diag_buf_push_fmt_str(mut_view(*out), 89, 8);
+        if sink.warnings != 1 {
+            diag_buf_push_byte(mut_view(*out), 115u8);
+        }
+        diag_buf_push_byte(out, 10u8);
+    }
+}
+fn hex_digit(v: u8) -> u8 {
+    if v < 10u8 {
+        v + 48u8
+    } else {
+        v - 10u8 + 97u8
+    }
+}
+
+const JSON_STRS: [389]u8 = [
+    92u8, 34u8, 92u8, 92u8, 92u8, 98u8, 92u8, 102u8, 92u8, 110u8, 92u8, 114u8, 92u8, 116u8, 34u8, 101u8, 114u8, 114u8, 111u8, 114u8, 34u8, 34u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8, 34u8, 34u8, 105u8,
+    110u8, 102u8, 111u8, 34u8, 34u8, 104u8, 105u8, 110u8, 116u8, 34u8, 110u8, 117u8, 108u8, 108u8, 123u8, 34u8, 102u8, 105u8, 108u8, 101u8, 34u8, 58u8, 44u8, 34u8, 115u8, 116u8, 97u8, 114u8, 116u8, 34u8, 58u8, 44u8,
+    34u8, 101u8, 110u8, 100u8, 34u8, 58u8, 44u8, 34u8, 108u8, 105u8, 110u8, 101u8, 34u8, 58u8, 44u8, 34u8, 99u8, 111u8, 108u8, 34u8, 58u8, 44u8, 34u8, 101u8, 110u8, 100u8, 95u8, 108u8, 105u8, 110u8, 101u8, 34u8,
+    58u8, 44u8, 34u8, 101u8, 110u8, 100u8, 95u8, 99u8, 111u8, 108u8, 34u8, 58u8, 123u8, 34u8, 115u8, 112u8, 97u8, 110u8, 34u8, 58u8, 44u8, 34u8, 109u8, 101u8, 115u8, 115u8, 97u8, 103u8, 101u8, 34u8, 58u8, 44u8,
+    34u8, 97u8, 112u8, 112u8, 108u8, 105u8, 99u8, 97u8, 98u8, 105u8, 108u8, 105u8, 116u8, 121u8, 34u8, 58u8, 34u8, 109u8, 97u8, 99u8, 104u8, 105u8, 110u8, 101u8, 45u8, 97u8, 112u8, 112u8, 108u8, 105u8, 99u8, 97u8,
+    98u8, 108u8, 101u8, 34u8, 34u8, 109u8, 97u8, 121u8, 98u8, 101u8, 45u8, 97u8, 112u8, 112u8, 108u8, 105u8, 99u8, 97u8, 98u8, 108u8, 101u8, 34u8, 34u8, 109u8, 97u8, 110u8, 117u8, 97u8, 108u8, 45u8, 114u8, 101u8,
+    118u8, 105u8, 101u8, 119u8, 34u8, 44u8, 34u8, 101u8, 100u8, 105u8, 116u8, 115u8, 34u8, 58u8, 91u8, 44u8, 34u8, 114u8, 101u8, 112u8, 108u8, 97u8, 99u8, 101u8, 109u8, 101u8, 110u8, 116u8, 34u8, 58u8, 116u8, 114u8,
+    117u8, 101u8, 102u8, 97u8, 108u8, 115u8, 101u8, 123u8, 34u8, 115u8, 99u8, 104u8, 101u8, 109u8, 97u8, 34u8, 58u8, 49u8, 44u8, 34u8, 116u8, 111u8, 111u8, 108u8, 34u8, 58u8, 34u8, 97u8, 120u8, 105u8, 111u8, 109u8,
+    48u8, 34u8, 44u8, 34u8, 100u8, 105u8, 97u8, 103u8, 110u8, 111u8, 115u8, 116u8, 105u8, 99u8, 115u8, 34u8, 58u8, 91u8, 123u8, 34u8, 105u8, 100u8, 34u8, 58u8, 44u8, 34u8, 99u8, 111u8, 100u8, 101u8, 34u8, 58u8,
+    44u8, 34u8, 115u8, 101u8, 118u8, 101u8, 114u8, 105u8, 116u8, 121u8, 34u8, 58u8, 44u8, 34u8, 112u8, 114u8, 105u8, 109u8, 97u8, 114u8, 121u8, 34u8, 58u8, 44u8, 34u8, 108u8, 97u8, 98u8, 101u8, 108u8, 115u8, 34u8,
+    58u8, 44u8, 34u8, 110u8, 111u8, 116u8, 101u8, 115u8, 34u8, 58u8, 44u8, 34u8, 104u8, 101u8, 108u8, 112u8, 115u8, 34u8, 58u8, 44u8, 34u8, 102u8, 105u8, 120u8, 101u8, 115u8, 34u8, 58u8, 44u8, 34u8, 100u8, 97u8,
+    116u8, 97u8, 34u8, 58u8, 44u8, 34u8, 101u8, 114u8, 114u8, 111u8, 114u8, 115u8, 34u8, 58u8, 44u8, 34u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8, 115u8, 34u8, 58u8, 123u8, 34u8, 109u8, 101u8, 115u8, 115u8,
+    97u8, 103u8, 101u8, 34u8, 58u8,
+];
+
+fn diag_buf_push_json_str(b: mut_view<DiagBuffer>, start: usize, byte_count: usize) {
+    let mut i: usize = 0;
+    while i < byte_count {
+        diag_buf_push_byte(mut_view(*b), JSON_STRS[start + i]);
+        i = i + 1;
+    }
+}
+
+pub fn write_json_string(b: mut_view<DiagBuffer>, sv: StrView) {
+    diag_buf_push_byte(mut_view(*b), 34u8);
+    let mut i: usize = 0;
+    while i < sv.len {
+        let c = unsafe { *(sv.ptr + i) };
+        if c == 34u8 {
+            diag_buf_push_json_str(mut_view(*b), 0, 2);
+        } else if c == 92u8 {
+            diag_buf_push_json_str(mut_view(*b), 2, 2);
+        } else if c == 8u8 {
+            diag_buf_push_json_str(mut_view(*b), 4, 2);
+        } else if c == 12u8 {
+            diag_buf_push_json_str(mut_view(*b), 6, 2);
+        } else if c == 10u8 {
+            diag_buf_push_json_str(mut_view(*b), 8, 2);
+        } else if c == 13u8 {
+            diag_buf_push_json_str(mut_view(*b), 10, 2);
+        } else if c == 9u8 {
+            diag_buf_push_json_str(mut_view(*b), 12, 2);
+        } else if c < 32u8 {
+            diag_buf_push_byte(mut_view(*b), 92u8);
+            diag_buf_push_byte(mut_view(*b), 117u8);
+            diag_buf_push_byte(mut_view(*b), 48u8);
+            diag_buf_push_byte(mut_view(*b), 48u8);
+            diag_buf_push_byte(mut_view(*b), hex_digit(c / 16u8));
+            diag_buf_push_byte(mut_view(*b), hex_digit(c % 16u8));
+        } else {
+            diag_buf_push_byte(mut_view(*b), c);
+        }
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 34u8);
+}
+
+fn write_severity(b: mut_view<DiagBuffer>, sev: DiagSeverity) {
+    match sev {
+        DiagSeverity.Error => {
+            diag_buf_push_json_str(b, 14, 7);
+        },
+        DiagSeverity.Warning => {
+            diag_buf_push_json_str(b, 21, 9);
+        },
+        DiagSeverity.Info => {
+            diag_buf_push_json_str(b, 30, 6);
+        },
+        DiagSeverity.Hint => {
+            diag_buf_push_json_str(b, 36, 6);
+        },
+    }
+}
+
+fn write_span(b: mut_view<DiagBuffer>, db: view<SourceDatabase>, span: Span) {
+    if span_is_none(view(span)) {
+        diag_buf_push_json_str(b, 42, 4);
+        return;
+    }
+
+    let s_start: u32 = span.start;
+    let s_end: u32 = span.end;
+    let path = source_db_path(db, copy_fid(view(span.file)));
+    let lc_start = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_start, s_start));
+    let lc_end = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_end, s_end));
+
+    diag_buf_push_json_str(mut_view(*b), 46, 8);
+
+    diag_buf_push_byte(mut_view(*b), 34u8);
+    let mut i: usize = 0;
+    while i < path.len {
+        let c = unsafe { *(path.ptr + i) };
+        if c == 92u8 {
+            diag_buf_push_byte(mut_view(*b), 47u8);
+        } else if c == 34u8 {
+            diag_buf_push_byte(mut_view(*b), 92u8);
+            diag_buf_push_byte(mut_view(*b), 34u8);
+        } else {
+            diag_buf_push_byte(mut_view(*b), c);
+        }
+        i = i + 1;
+    }
+    diag_buf_push_byte(mut_view(*b), 34u8);
+
+    diag_buf_push_json_str(mut_view(*b), 54, 9);
+    diag_buf_push_u32(mut_view(*b), span.start);
+
+    diag_buf_push_json_str(mut_view(*b), 63, 7);
+    diag_buf_push_u32(mut_view(*b), span.end);
+
+    diag_buf_push_json_str(mut_view(*b), 70, 8);
+    diag_buf_push_u32(mut_view(*b), lc_start.line);
+
+    diag_buf_push_json_str(mut_view(*b), 78, 7);
+    diag_buf_push_u32(mut_view(*b), lc_start.col_chars);
+
+    diag_buf_push_json_str(mut_view(*b), 85, 12);
+    diag_buf_push_u32(mut_view(*b), lc_end.line);
+
+    diag_buf_push_json_str(mut_view(*b), 97, 11);
+    diag_buf_push_u32(mut_view(*b), lc_end.col_chars);
+
+    diag_buf_push_byte(b, 125u8);
+}
+
+fn write_labels(b: mut_view<DiagBuffer>, db: view<SourceDatabase>, d: view<Diagnostic>) {
+    diag_buf_push_byte(mut_view(*b), 91u8);
+    let mut i: usize = 0;
+    while i < d.label_count {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*b), 44u8);
+        }
+        let lbl = unsafe { *((d.labels as usize + (((i as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+        diag_buf_push_json_str(mut_view(*b), 108, 8);
+        write_span(mut_view(*b), db, lbl.span);
+
+        diag_buf_push_json_str(mut_view(*b), 116, 11);
+        write_json_string(mut_view(*b), lbl.message);
+
+        diag_buf_push_byte(mut_view(*b), 125u8);
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 93u8);
+}
+
+fn write_string_array(b: mut_view<DiagBuffer>, arr: *mut StrView, count: usize) {
+    diag_buf_push_byte(mut_view(*b), 91u8);
+    let mut i: usize = 0;
+    while i < count {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*b), 44u8);
+        }
+        let sv = unsafe { *((arr as usize + (((i as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+        write_json_string(mut_view(*b), sv);
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 93u8);
+}
+
+fn write_fixes(b: mut_view<DiagBuffer>, db: view<SourceDatabase>, d: view<Diagnostic>) {
+    diag_buf_push_byte(mut_view(*b), 91u8);
+    let mut i: usize = 0;
+    while i < d.fix_count {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*b), 44u8);
+        }
+        let fix = unsafe { *((d.fixes as usize + (((i as isize) * (size_of<DiagFix>() as isize)) as usize)) as *const DiagFix) };
+
+        diag_buf_push_json_str(mut_view(*b), 378, 11);
+        write_json_string(mut_view(*b), fix.message);
+
+        diag_buf_push_json_str(mut_view(*b), 127, 17);
+        match fix.applicability {
+            FixApplicability.MachineApplicable => {
+                diag_buf_push_json_str(mut_view(*b), 144, 20);
+            },
+            FixApplicability.MaybeApplicable => {
+                diag_buf_push_json_str(mut_view(*b), 164, 18);
+            },
+            FixApplicability.ManualReview => {
+                diag_buf_push_json_str(mut_view(*b), 182, 15);
+            },
+        }
+
+        diag_buf_push_json_str(mut_view(*b), 197, 10);
+        let mut j: usize = 0;
+        while j < fix.edit_count {
+            if j > 0 {
+                diag_buf_push_byte(mut_view(*b), 44u8);
+            }
+            let edit = unsafe { *((fix.edits as usize + (((j as isize) * (size_of<DiagEdit>() as isize)) as usize)) as *const DiagEdit) };
+            diag_buf_push_json_str(mut_view(*b), 108, 8);
+            write_span(mut_view(*b), db, edit.span);
+
+            diag_buf_push_json_str(mut_view(*b), 207, 15);
+            write_json_string(mut_view(*b), edit.replacement);
+
+            diag_buf_push_byte(mut_view(*b), 125u8);
+            j = j + 1;
+        }
+        diag_buf_push_byte(mut_view(*b), 93u8);
+        diag_buf_push_byte(mut_view(*b), 125u8);
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 93u8);
+}
+
+fn write_data(b: mut_view<DiagBuffer>, d: view<Diagnostic>) {
+    diag_buf_push_byte(mut_view(*b), 123u8);
+    let mut i: usize = 0;
+    while i < d.data_count {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*b), 44u8);
+        }
+        let entry = unsafe { *((d.data as usize + (((i as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *const DiagDataEntry) };
+        write_json_string(mut_view(*b), entry.key);
+        diag_buf_push_byte(mut_view(*b), 58u8);
+
+        match entry.value.kind {
+            DiagDataKind.String => {
+                write_json_string(mut_view(*b), entry.value.str_val);
+            },
+            DiagDataKind.Integer => {
+                let mut val = entry.value.int_val;
+                if val < 0 {
+                    diag_buf_push_byte(mut_view(*b), 45u8);
+                    val = 0 - val;
+                }
+                diag_buf_push_u32(mut_view(*b), val as u32);
+            },
+            DiagDataKind.Boolean => {
+                if entry.value.bool_val {
+                    diag_buf_push_json_str(mut_view(*b), 222, 4);
+                } else {
+                    diag_buf_push_json_str(mut_view(*b), 226, 5);
+                }
+            },
+            DiagDataKind.StringList => {
+                write_string_array(mut_view(*b), entry.value.list_items, entry.value.list_count);
+            },
+        }
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 125u8);
+}
+
+pub fn ax_diag_render_json(sink: view<DiagSink>, db: view<SourceDatabase>, out: mut_view<DiagBuffer>) {
+    diag_buf_push_json_str(mut_view(*out), 231, 43);
+
+    let mut i: usize = 0;
+    while i < sink.len {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*out), 44u8);
+        }
+        let d = unsafe { *((sink.diags as usize + (((i as isize) * (size_of<Diagnostic>() as isize)) as usize)) as *const Diagnostic) };
+
+        diag_buf_push_json_str(mut_view(*out), 274, 6);
+        diag_buf_push_u32(mut_view(*out), i as u32);
+
+        diag_buf_push_json_str(mut_view(*out), 280, 8);
+        diag_buf_push_byte(mut_view(*out), 34u8);
+        diag_buf_push_code_name(mut_view(*out), d.code);
+        diag_buf_push_byte(mut_view(*out), 34u8);
+
+        diag_buf_push_json_str(mut_view(*out), 288, 12);
+        write_severity(mut_view(*out), d.severity);
+
+        diag_buf_push_json_str(mut_view(*out), 116, 11);
+        write_json_string(mut_view(*out), copy_sv(view(d.message)));
+
+        diag_buf_push_json_str(mut_view(*out), 300, 11);
+        write_span(mut_view(*out), db, copy_span(view(d.primary)));
+
+        diag_buf_push_json_str(mut_view(*out), 311, 10);
+        write_labels(mut_view(*out), db, view(d));
+
+        diag_buf_push_json_str(mut_view(*out), 321, 9);
+        write_string_array(mut_view(*out), d.notes, d.note_count);
+
+        diag_buf_push_json_str(mut_view(*out), 330, 9);
+        write_string_array(mut_view(*out), d.helps, d.help_count);
+
+        diag_buf_push_json_str(mut_view(*out), 339, 9);
+        write_fixes(mut_view(*out), db, view(d));
+
+        diag_buf_push_json_str(mut_view(*out), 348, 8);
+        write_data(mut_view(*out), view(d));
+
+        diag_buf_push_byte(mut_view(*out), 125u8);
+        i = i + 1;
+    }
+    diag_buf_push_byte(mut_view(*out), 93u8);
+
+    diag_buf_push_json_str(mut_view(*out), 356, 10);
+    diag_buf_push_u32(mut_view(*out), sink.errors as u32);
+
+    diag_buf_push_json_str(mut_view(*out), 366, 12);
+    diag_buf_push_u32(mut_view(*out), sink.warnings as u32);
+
+    diag_buf_push_byte(mut_view(*out), 125u8);
+    diag_buf_push_byte(out, 10u8);
+}
+
+fn alloc_mem(scratch: mut_view<Arena>, byte_count: usize) -> *mut u8 {
+    arena_alloc_raw(scratch, byte_count, 1)
+}
+
+fn make_sv(ptr: *const u8, byte_count: usize) -> StrView {
+    StrView { ptr: ptr, len: byte_count }
+}
+
+// TEST 1: Buffer Operations
+fn test_buffer_operations() -> i32 {
+    let mut scratch = arena_new();
+    let mut b = diag_buf_new();
+    if b.len != 0 || b.cap != 0 { return 101; }
+
+    diag_buf_push_byte(mut_view(b), 65u8);
+    diag_buf_push_byte(mut_view(b), 66u8);
+    if b.len != 2 { return 102; }
+
+    diag_buf_push_byte(mut_view(b), 32u8);
+    diag_buf_push_u32(mut_view(b), 0u32);
+    diag_buf_push_byte(mut_view(b), 32u8);
+    diag_buf_push_u32(mut_view(b), 42u32);
+    diag_buf_push_byte(mut_view(b), 32u8);
+    diag_buf_push_u32(mut_view(b), 987654u32);
+
+    let sv = diag_buf_as_str_view(view(b));
+    let p_needle = alloc_mem(mut_view(scratch), 14);
+    unsafe {
+        *p_needle = 65u8;
+        *(p_needle + 1) = 66u8;
+        *(p_needle + 2) = 32u8;
+        *(p_needle + 3) = 48u8;
+        *(p_needle + 4) = 32u8;
+        *(p_needle + 5) = 52u8;
+        *(p_needle + 6) = 50u8;
+        *(p_needle + 7) = 32u8;
+        *(p_needle + 8) = 57u8;
+        *(p_needle + 9) = 56u8;
+        *(p_needle + 10) = 55u8;
+        *(p_needle + 11) = 54u8;
+        *(p_needle + 12) = 53u8;
+        *(p_needle + 13) = 52u8;
+    }
+    let needle = make_sv(p_needle, 14);
+    let eq = sv_eq(sv, needle);
+    if !eq { return 103; }
+
+    let mut b2 = diag_buf_new();
+    diag_buf_push_code_name(mut_view(b2), diag_code(0u32));
+    let sv2 = diag_buf_as_str_view(view(b2));
+    if sv2.len != 19 { return 104; }
+
+    let mut b3 = diag_buf_new();
+    diag_buf_push_code_name(mut_view(b3), diag_code(200u32));
+    let sv3 = diag_buf_as_str_view(view(b3));
+    if sv3.len != 9 { return (1000 + sv3.len) as i32; }
+
+    diag_buf_free(mut_view(b));
+    diag_buf_free(mut_view(b2));
+    diag_buf_free(mut_view(b3));
+    arena_destroy(mut_view(scratch));
+    0
+}
+
+// TEST 2: JSON String Escaping
+fn test_json_escaping() -> i32 {
+    let mut scratch = arena_new();
+    let mut b = diag_buf_new();
+    let p_raw = alloc_mem(mut_view(scratch), 6);
+    unsafe {
+        *p_raw = 34u8;
+        *(p_raw + 1) = 92u8;
+        *(p_raw + 2) = 9u8;
+        *(p_raw + 3) = 10u8;
+        *(p_raw + 4) = 13u8;
+        *(p_raw + 5) = 1u8;
+    }
+    let sv = make_sv(p_raw, 6);
+    write_json_string(mut_view(b), sv);
+
+    let res = diag_buf_as_str_view(view(b));
+    if res.len != 18 { return 201; }
+    if unsafe { *(res.ptr) } != 34u8 { return 202; }
+    if unsafe { *(res.ptr + 17) } != 34u8 { return 203; }
+
+    diag_buf_free(mut_view(b));
+    arena_destroy(mut_view(scratch));
+    0
+}
+
+// TEST 3: Human renderer
+fn test_human_rendering() -> i32 {
+    let mut scratch = arena_new();
+    let mut db: SourceDatabase = SourceDatabase {
+        arena: arena_new(),
+        files: 0 as *mut SourceFile,
+        file_count: 0,
+        file_cap: 0,
+    };
+    source_db_init(mut_view(db));
+
+    let p_path = alloc_mem(mut_view(scratch), 11);
+    unsafe {
+        *p_path = 115u8;
+        *(p_path + 1) = 114u8;
+        *(p_path + 2) = 99u8;
+        *(p_path + 3) = 47u8;
+        *(p_path + 4) = 109u8;
+        *(p_path + 5) = 97u8;
+        *(p_path + 6) = 105u8;
+        *(p_path + 7) = 110u8;
+        *(p_path + 8) = 46u8;
+        *(p_path + 9) = 97u8;
+        *(p_path + 10) = 120u8;
+    }
+    let sv_path = make_sv(p_path, 11);
+    let p_text = alloc_mem(mut_view(scratch), 28);
+    unsafe {
+        *p_text = 102u8;
+        *(p_text + 1) = 110u8;
+        *(p_text + 2) = 32u8;
+        *(p_text + 3) = 109u8;
+        *(p_text + 4) = 97u8;
+        *(p_text + 5) = 105u8;
+        *(p_text + 6) = 110u8;
+        *(p_text + 7) = 40u8;
+        *(p_text + 8) = 41u8;
+        *(p_text + 9) = 32u8;
+        *(p_text + 10) = 123u8;
+        *(p_text + 11) = 10u8;
+        *(p_text + 12) = 9u8;
+        *(p_text + 13) = 114u8;
+        *(p_text + 14) = 101u8;
+        *(p_text + 15) = 116u8;
+        *(p_text + 16) = 117u8;
+        *(p_text + 17) = 114u8;
+        *(p_text + 18) = 110u8;
+        *(p_text + 19) = 32u8;
+        *(p_text + 20) = 116u8;
+        *(p_text + 21) = 114u8;
+        *(p_text + 22) = 117u8;
+        *(p_text + 23) = 101u8;
+        *(p_text + 24) = 59u8;
+        *(p_text + 25) = 10u8;
+        *(p_text + 26) = 125u8;
+        *(p_text + 27) = 10u8;
+    }
+    let sv_text = make_sv(p_text, 28);
+
+    let fid = source_db_add_virtual(mut_view(db), p_path as *const u8, 11, p_text as *const u8, 27);
+    if fid.v != 1u32 { return 301; }
+
+    let mut sink = diag_sink_new();
+
+    let p_msg = alloc_mem(mut_view(scratch), 16);
+    unsafe {
+        *p_msg = 109u8;
+        *(p_msg + 1) = 105u8;
+        *(p_msg + 2) = 115u8;
+        *(p_msg + 3) = 109u8;
+        *(p_msg + 4) = 97u8;
+        *(p_msg + 5) = 116u8;
+        *(p_msg + 6) = 99u8;
+        *(p_msg + 7) = 104u8;
+        *(p_msg + 8) = 101u8;
+        *(p_msg + 9) = 100u8;
+        *(p_msg + 10) = 32u8;
+        *(p_msg + 11) = 116u8;
+        *(p_msg + 12) = 121u8;
+        *(p_msg + 13) = 112u8;
+        *(p_msg + 14) = 101u8;
+        *(p_msg + 15) = 115u8;
+    }
+    let sv_msg = make_sv(p_msg, 16);
+    let p_note = alloc_mem(mut_view(scratch), 11);
+    unsafe {
+        *p_note = 114u8;
+        *(p_note + 1) = 101u8;
+        *(p_note + 2) = 116u8;
+        *(p_note + 3) = 117u8;
+        *(p_note + 4) = 114u8;
+        *(p_note + 5) = 110u8;
+        *(p_note + 6) = 115u8;
+        *(p_note + 7) = 32u8;
+        *(p_note + 8) = 105u8;
+        *(p_note + 9) = 51u8;
+        *(p_note + 10) = 50u8;
+    }
+    let sv_note = make_sv(p_note, 11);
+    let p_help = alloc_mem(mut_view(scratch), 11);
+    unsafe {
+        *p_help = 99u8;
+        *(p_help + 1) = 104u8;
+        *(p_help + 2) = 97u8;
+        *(p_help + 3) = 110u8;
+        *(p_help + 4) = 103u8;
+        *(p_help + 5) = 101u8;
+        *(p_help + 6) = 32u8;
+        *(p_help + 7) = 116u8;
+        *(p_help + 8) = 121u8;
+        *(p_help + 9) = 112u8;
+        *(p_help + 10) = 101u8;
+    }
+    let sv_help = make_sv(p_help, 11);
+
+    let notes_arr = arena_alloc_raw(mut_view(scratch), size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    unsafe {
+        *notes_arr = sv_note;
+    }
+
+    let helps_arr = arena_alloc_raw(mut_view(scratch), size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    unsafe {
+        *helps_arr = sv_help;
+    }
+
+    let diag = Diagnostic {
+        code: diag_code(57u32),
+        severity: DiagSeverity.Error,
+        message: sv_msg,
+        primary: span_new(fid, 20u32, 24u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: notes_arr,
+        note_count: 1,
+        helps: helps_arr,
+        help_count: 1,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(diag));
+
+    let mut out = diag_buf_new();
+    ax_diag_render_human(view(sink), view(db), mut_view(out));
+
+    let rendered = diag_buf_as_str_view(view(out));
+
+    let p_n1 = alloc_mem(mut_view(scratch), 13);
+    unsafe {
+        *p_n1 = 101u8;
+        *(p_n1 + 1) = 114u8;
+        *(p_n1 + 2) = 114u8;
+        *(p_n1 + 3) = 111u8;
+        *(p_n1 + 4) = 114u8;
+        *(p_n1 + 5) = 91u8;
+        *(p_n1 + 6) = 65u8;
+        *(p_n1 + 7) = 88u8;
+        *(p_n1 + 8) = 95u8;
+        *(p_n1 + 9) = 84u8;
+        *(p_n1 + 10) = 89u8;
+        *(p_n1 + 11) = 80u8;
+        *(p_n1 + 12) = 69u8;
+    }
+    let n1 = make_sv(p_n1, 13);
+    let has1 = sv_contains(rendered, n1);
+    if !has1 { return 302; }
+
+    let p_n2 = alloc_mem(mut_view(scratch), 7);
+    unsafe {
+        *p_n2 = 45u8;
+        *(p_n2 + 1) = 45u8;
+        *(p_n2 + 2) = 62u8;
+        *(p_n2 + 3) = 32u8;
+        *(p_n2 + 4) = 115u8;
+        *(p_n2 + 5) = 114u8;
+        *(p_n2 + 6) = 99u8;
+    }
+    let n2 = make_sv(p_n2, 7);
+    let has2 = sv_contains(rendered, n2);
+    if !has2 { return 303; }
+
+    let p_n3 = alloc_mem(mut_view(scratch), 11);
+    unsafe {
+        *p_n3 = 50u8;
+        *(p_n3 + 1) = 32u8;
+        *(p_n3 + 2) = 124u8;
+        *(p_n3 + 3) = 32u8;
+        *(p_n3 + 4) = 32u8;
+        *(p_n3 + 5) = 32u8;
+        *(p_n3 + 6) = 32u8;
+        *(p_n3 + 7) = 32u8;
+        *(p_n3 + 8) = 114u8;
+        *(p_n3 + 9) = 101u8;
+        *(p_n3 + 10) = 116u8;
+    }
+    let n3 = make_sv(p_n3, 11);
+    let has3 = sv_contains(rendered, n3);
+    if !has3 { return 304; }
+
+    let p_n4 = alloc_mem(mut_view(scratch), 4);
+    unsafe {
+        *p_n4 = 94u8;
+        *(p_n4 + 1) = 94u8;
+        *(p_n4 + 2) = 94u8;
+        *(p_n4 + 3) = 94u8;
+    }
+    let n4 = make_sv(p_n4, 4);
+    let has4 = sv_contains(rendered, n4);
+    if !has4 { return 305; }
+
+    let p_n5 = alloc_mem(mut_view(scratch), 5);
+    unsafe {
+        *p_n5 = 110u8;
+        *(p_n5 + 1) = 111u8;
+        *(p_n5 + 2) = 116u8;
+        *(p_n5 + 3) = 101u8;
+        *(p_n5 + 4) = 58u8;
+    }
+    let n5 = make_sv(p_n5, 5);
+    let has5 = sv_contains(rendered, n5);
+    if !has5 { return 306; }
+
+    let p_n6 = alloc_mem(mut_view(scratch), 5);
+    unsafe {
+        *p_n6 = 104u8;
+        *(p_n6 + 1) = 101u8;
+        *(p_n6 + 2) = 108u8;
+        *(p_n6 + 3) = 112u8;
+        *(p_n6 + 4) = 58u8;
+    }
+    let n6 = make_sv(p_n6, 5);
+    let has6 = sv_contains(rendered, n6);
+    if !has6 { return 307; }
+
+    let p_n7 = alloc_mem(mut_view(scratch), 7);
+    unsafe {
+        *p_n7 = 49u8;
+        *(p_n7 + 1) = 32u8;
+        *(p_n7 + 2) = 101u8;
+        *(p_n7 + 3) = 114u8;
+        *(p_n7 + 4) = 114u8;
+        *(p_n7 + 5) = 111u8;
+        *(p_n7 + 6) = 114u8;
+    }
+    let n7 = make_sv(p_n7, 7);
+    let has7 = sv_contains(rendered, n7);
+    if !has7 { return 308; }
+
+    diag_buf_free(mut_view(out));
+    diag_sink_free(mut_view(sink));
+    source_db_free(mut_view(db));
+    arena_destroy(mut_view(scratch));
+    0
+}
+
+// TEST 4: JSON Renderer
+fn test_json_rendering() -> i32 {
+    let mut scratch = arena_new();
+    let mut db: SourceDatabase = SourceDatabase {
+        arena: arena_new(),
+        files: 0 as *mut SourceFile,
+        file_count: 0,
+        file_cap: 0,
+    };
+    source_db_init(mut_view(db));
+
+    let p_path = alloc_mem(mut_view(scratch), 14);
+    unsafe {
+        *p_path = 67u8;
+        *(p_path + 1) = 58u8;
+        *(p_path + 2) = 92u8;
+        *(p_path + 3) = 112u8;
+        *(p_path + 4) = 97u8;
+        *(p_path + 5) = 116u8;
+        *(p_path + 6) = 104u8;
+        *(p_path + 7) = 92u8;
+        *(p_path + 8) = 115u8;
+        *(p_path + 9) = 114u8;
+        *(p_path + 10) = 99u8;
+        *(p_path + 11) = 46u8;
+        *(p_path + 12) = 97u8;
+        *(p_path + 13) = 120u8;
+    }
+    let sv_path = make_sv(p_path, 14);
+    let p_text = alloc_mem(mut_view(scratch), 5);
+    unsafe {
+        *p_text = 97u8;
+        *(p_text + 1) = 58u8;
+        *(p_text + 2) = 58u8;
+        *(p_text + 3) = 98u8;
+        *(p_text + 4) = 10u8;
+    }
+    let sv_text = make_sv(p_text, 5);
+
+    let fid = source_db_add_virtual(mut_view(db), p_path as *const u8, 14, p_text as *const u8, 5);
+
+    let mut sink = diag_sink_new();
+
+    let p_fix = alloc_mem(mut_view(scratch), 7);
+    unsafe {
+        *p_fix = 114u8;
+        *(p_fix + 1) = 101u8;
+        *(p_fix + 2) = 112u8;
+        *(p_fix + 3) = 108u8;
+        *(p_fix + 4) = 97u8;
+        *(p_fix + 5) = 99u8;
+        *(p_fix + 6) = 101u8;
+    }
+    let sv_fix = make_sv(p_fix, 7);
+    let p_dot = alloc_mem(mut_view(scratch), 1);
+    unsafe {
+        *p_dot = 46u8;
+    }
+    let sv_dot = make_sv(p_dot, 1);
+
+    let edits_arr = arena_alloc_raw(mut_view(scratch), size_of<DiagEdit>(), align_of<DiagEdit>()) as *mut DiagEdit;
+    unsafe {
+        *edits_arr = DiagEdit {
+            span: span_new(fid, 1u32, 3u32),
+            replacement: sv_dot,
+        };
+    }
+
+    let fixes_arr = arena_alloc_raw(mut_view(scratch), size_of<DiagFix>(), align_of<DiagFix>()) as *mut DiagFix;
+    unsafe {
+        *fixes_arr = DiagFix {
+            message: sv_fix,
+            applicability: FixApplicability.MachineApplicable,
+            edits: edits_arr,
+            edit_count: 1,
+        };
+    }
+
+    let p_k1 = alloc_mem(mut_view(scratch), 2);
+    unsafe {
+        *p_k1 = 107u8;
+        *(p_k1 + 1) = 49u8;
+    }
+    let sv_k1 = make_sv(p_k1, 2);
+    let p_v1 = alloc_mem(mut_view(scratch), 2);
+    unsafe {
+        *p_v1 = 118u8;
+        *(p_v1 + 1) = 49u8;
+    }
+    let sv_v1 = make_sv(p_v1, 2);
+    let p_k2 = alloc_mem(mut_view(scratch), 2);
+    unsafe {
+        *p_k2 = 107u8;
+        *(p_k2 + 1) = 50u8;
+    }
+    let sv_k2 = make_sv(p_k2, 2);
+    let p_k3 = alloc_mem(mut_view(scratch), 2);
+    unsafe {
+        *p_k3 = 107u8;
+        *(p_k3 + 1) = 51u8;
+    }
+    let sv_k3 = make_sv(p_k3, 2);
+
+    let data_arr = arena_alloc_raw(mut_view(scratch), (((3 as isize) * (size_of<DiagDataEntry>() as isize)) as usize), align_of<DiagDataEntry>()) as *mut DiagDataEntry;
+    unsafe {
+        *(data_arr) = DiagDataEntry {
+            key: sv_k1,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: sv_v1,
+                int_val: 0,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *(((data_arr as usize) + size_of<DiagDataEntry>()) as *mut DiagDataEntry) = DiagDataEntry {
+            key: sv_k2,
+            value: DiagDataValue {
+                kind: DiagDataKind.Integer,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: 42,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *(((data_arr as usize) + (((2 as isize) * (size_of<DiagDataEntry>() as isize)) as usize)) as *mut DiagDataEntry) = DiagDataEntry {
+            key: sv_k3,
+            value: DiagDataValue {
+                kind: DiagDataKind.Boolean,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: 0,
+                bool_val: true,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+    }
+
+    let p_msg = alloc_mem(mut_view(scratch), 3);
+    unsafe {
+        *p_msg = 98u8;
+        *(p_msg + 1) = 97u8;
+        *(p_msg + 2) = 100u8;
+    }
+    let sv_msg = make_sv(p_msg, 3);
+
+    let diag = Diagnostic {
+        code: diag_code(17u32),
+        severity: DiagSeverity.Error,
+        message: sv_msg,
+        primary: span_new(fid, 1u32, 3u32),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: fixes_arr,
+        fix_count: 1,
+        data: data_arr,
+        data_count: 3,
+    };
+    diag_sink_report(mut_view(sink), view(diag));
+
+    let mut out = diag_buf_new();
+    ax_diag_render_json(view(sink), view(db), mut_view(out));
+
+    let rendered = diag_buf_as_str_view(view(out));
+
+    let p_n1 = alloc_mem(mut_view(scratch), 10);
+    unsafe {
+        *p_n1 = 34u8;
+        *(p_n1 + 1) = 115u8;
+        *(p_n1 + 2) = 99u8;
+        *(p_n1 + 3) = 104u8;
+        *(p_n1 + 4) = 101u8;
+        *(p_n1 + 5) = 109u8;
+        *(p_n1 + 6) = 97u8;
+        *(p_n1 + 7) = 34u8;
+        *(p_n1 + 8) = 58u8;
+        *(p_n1 + 9) = 49u8;
+    }
+    let n1 = make_sv(p_n1, 10);
+    let has1 = sv_contains(rendered, n1);
+    if !has1 { return 401; }
+
+    let p_n2 = alloc_mem(mut_view(scratch), 8);
+    unsafe {
+        *p_n2 = 65u8;
+        *(p_n2 + 1) = 88u8;
+        *(p_n2 + 2) = 95u8;
+        *(p_n2 + 3) = 76u8;
+        *(p_n2 + 4) = 69u8;
+        *(p_n2 + 5) = 88u8;
+        *(p_n2 + 6) = 95u8;
+        *(p_n2 + 7) = 67u8;
+    }
+    let n2 = make_sv(p_n2, 8);
+    let has2 = sv_contains(rendered, n2);
+    if !has2 { return 402; }
+
+    let p_n3 = alloc_mem(mut_view(scratch), 8);
+    unsafe {
+        *p_n3 = 67u8;
+        *(p_n3 + 1) = 58u8;
+        *(p_n3 + 2) = 47u8;
+        *(p_n3 + 3) = 112u8;
+        *(p_n3 + 4) = 97u8;
+        *(p_n3 + 5) = 116u8;
+        *(p_n3 + 6) = 104u8;
+        *(p_n3 + 7) = 47u8;
+    }
+    let n3 = make_sv(p_n3, 8);
+    let has3 = sv_contains(rendered, n3);
+    if !has3 { return 403; }
+
+    let p_n4 = alloc_mem(mut_view(scratch), 8);
+    unsafe {
+        *p_n4 = 109u8;
+        *(p_n4 + 1) = 97u8;
+        *(p_n4 + 2) = 99u8;
+        *(p_n4 + 3) = 104u8;
+        *(p_n4 + 4) = 105u8;
+        *(p_n4 + 5) = 110u8;
+        *(p_n4 + 6) = 101u8;
+        *(p_n4 + 7) = 45u8;
+    }
+    let n4 = make_sv(p_n4, 8);
+    let has4 = sv_contains(rendered, n4);
+    if !has4 { return 404; }
+
+    let p_n5 = alloc_mem(mut_view(scratch), 9);
+    unsafe {
+        *p_n5 = 34u8;
+        *(p_n5 + 1) = 114u8;
+        *(p_n5 + 2) = 101u8;
+        *(p_n5 + 3) = 112u8;
+        *(p_n5 + 4) = 108u8;
+        *(p_n5 + 5) = 97u8;
+        *(p_n5 + 6) = 99u8;
+        *(p_n5 + 7) = 101u8;
+        *(p_n5 + 8) = 109u8;
+    }
+    let n5 = make_sv(p_n5, 9);
+    let has5 = sv_contains(rendered, n5);
+    if !has5 { return 405; }
+
+    let p_n6 = alloc_mem(mut_view(scratch), 2);
+    unsafe {
+        *p_n6 = 52u8;
+        *(p_n6 + 1) = 50u8;
+    }
+    let n6 = make_sv(p_n6, 2);
+    let has6 = sv_contains(rendered, n6);
+    if !has6 { return 406; }
+
+    let p_n7 = alloc_mem(mut_view(scratch), 4);
+    unsafe {
+        *p_n7 = 116u8;
+        *(p_n7 + 1) = 114u8;
+        *(p_n7 + 2) = 117u8;
+        *(p_n7 + 3) = 101u8;
+    }
+    let n7 = make_sv(p_n7, 4);
+    let has7 = sv_contains(rendered, n7);
+    if !has7 { return 407; }
+
+    let p_n8 = alloc_mem(mut_view(scratch), 10);
+    unsafe {
+        *p_n8 = 34u8;
+        *(p_n8 + 1) = 101u8;
+        *(p_n8 + 2) = 114u8;
+        *(p_n8 + 3) = 114u8;
+        *(p_n8 + 4) = 111u8;
+        *(p_n8 + 5) = 114u8;
+        *(p_n8 + 6) = 115u8;
+        *(p_n8 + 7) = 34u8;
+        *(p_n8 + 8) = 58u8;
+        *(p_n8 + 9) = 49u8;
+    }
+    let n8 = make_sv(p_n8, 10);
+    let has8 = sv_contains(rendered, n8);
+    if !has8 { return 408; }
+
+    diag_buf_free(mut_view(out));
+    diag_sink_free(mut_view(sink));
+    source_db_free(mut_view(db));
+    arena_destroy(mut_view(scratch));
+    0
+}
+
+// TEST 5: Differential verification against byte-exact fixture from C axiom0
+const EXPECTED_JSON_FIXTURE: [238]u8 = [
+    123u8, 34u8, 115u8, 99u8, 104u8, 101u8, 109u8, 97u8, 34u8, 58u8, 49u8, 44u8, 34u8, 116u8, 111u8, 111u8, 108u8, 34u8, 58u8, 34u8,
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 34u8, 44u8, 34u8, 100u8, 105u8, 97u8, 103u8, 110u8, 111u8, 115u8, 116u8, 105u8, 99u8, 115u8,
+    34u8, 58u8, 91u8, 123u8, 34u8, 105u8, 100u8, 34u8, 58u8, 48u8, 44u8, 34u8, 99u8, 111u8, 100u8, 101u8, 34u8, 58u8, 34u8, 65u8,
+    88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 78u8, 79u8, 95u8, 83u8, 84u8, 68u8, 34u8, 44u8, 34u8, 115u8, 101u8,
+    118u8, 101u8, 114u8, 105u8, 116u8, 121u8, 34u8, 58u8, 34u8, 101u8, 114u8, 114u8, 111u8, 114u8, 34u8, 44u8, 34u8, 109u8, 101u8,
+    115u8, 115u8, 97u8, 103u8, 101u8, 34u8, 58u8, 34u8, 110u8, 111u8, 32u8, 115u8, 116u8, 100u8, 32u8, 114u8, 111u8, 111u8, 116u8,
+    32u8, 102u8, 111u8, 117u8, 110u8, 100u8, 32u8, 40u8, 65u8, 68u8, 82u8, 45u8, 48u8, 48u8, 48u8, 54u8, 32u8, 194u8, 167u8, 56u8,
+    41u8, 34u8, 44u8, 34u8, 112u8, 114u8, 105u8, 109u8, 97u8, 114u8, 121u8, 34u8, 58u8, 110u8, 117u8, 108u8, 108u8, 44u8, 34u8,
+    108u8, 97u8, 98u8, 101u8, 108u8, 115u8, 34u8, 58u8, 91u8, 93u8, 44u8, 34u8, 110u8, 111u8, 116u8, 101u8, 115u8, 34u8, 58u8,
+    91u8, 93u8, 44u8, 34u8, 104u8, 101u8, 108u8, 112u8, 115u8, 34u8, 58u8, 91u8, 93u8, 44u8, 34u8, 102u8, 105u8, 120u8, 101u8,
+    115u8, 34u8, 58u8, 91u8, 93u8, 44u8, 34u8, 100u8, 97u8, 116u8, 97u8, 34u8, 58u8, 123u8, 125u8, 125u8, 93u8, 44u8, 34u8,
+    101u8, 114u8, 114u8, 111u8, 114u8, 115u8, 34u8, 58u8, 49u8, 44u8, 34u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8,
+    115u8, 34u8, 58u8, 48u8, 125u8, 10u8
+];
+
+fn test_differential_fixture() -> i32 {
+    let mut scratch = arena_new();
+    let mut db: SourceDatabase = SourceDatabase {
+        arena: arena_new(),
+        files: 0 as *mut SourceFile,
+        file_count: 0,
+        file_cap: 0,
+    };
+    source_db_init(mut_view(db));
+
+    let mut sink = diag_sink_new();
+
+    let p_msg = alloc_mem(mut_view(scratch), 32);
+    unsafe {
+        *p_msg = 110u8;
+        *(p_msg + 1) = 111u8;
+        *(p_msg + 2) = 32u8;
+        *(p_msg + 3) = 115u8;
+        *(p_msg + 4) = 116u8;
+        *(p_msg + 5) = 100u8;
+        *(p_msg + 6) = 32u8;
+        *(p_msg + 7) = 114u8;
+        *(p_msg + 8) = 111u8;
+        *(p_msg + 9) = 111u8;
+        *(p_msg + 10) = 116u8;
+        *(p_msg + 11) = 32u8;
+        *(p_msg + 12) = 102u8;
+        *(p_msg + 13) = 111u8;
+        *(p_msg + 14) = 117u8;
+        *(p_msg + 15) = 110u8;
+        *(p_msg + 16) = 100u8;
+        *(p_msg + 17) = 32u8;
+        *(p_msg + 18) = 40u8;
+        *(p_msg + 19) = 65u8;
+        *(p_msg + 20) = 68u8;
+        *(p_msg + 21) = 82u8;
+        *(p_msg + 22) = 45u8;
+        *(p_msg + 23) = 48u8;
+        *(p_msg + 24) = 48u8;
+        *(p_msg + 25) = 48u8;
+        *(p_msg + 26) = 54u8;
+        *(p_msg + 27) = 32u8;
+        *(p_msg + 28) = 194u8;
+        *(p_msg + 29) = 167u8;
+        *(p_msg + 30) = 56u8;
+        *(p_msg + 31) = 41u8;
+    }
+    let sv_msg = make_sv(p_msg, 32);
+
+    let diag = Diagnostic {
+        code: diag_code(128u32),
+        severity: DiagSeverity.Error,
+        message: sv_msg,
+        primary: span_none(),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(sink), view(diag));
+
+    let mut out = diag_buf_new();
+    ax_diag_render_json(view(sink), view(db), mut_view(out));
+
+    if out.len != 238 {
+        return 501;
+    }
+
+    let mut i: usize = 0;
+    while i < 238 {
+        let b_out = unsafe { *(out.ptr + i) };
+        let b_exp = EXPECTED_JSON_FIXTURE[i];
+        if b_out != b_exp {
+            return (1000 + i) as i32;
+        }
+        i = i + 1;
+    }
+
+    diag_buf_free(mut_view(out));
+    diag_sink_free(mut_view(sink));
+    source_db_free(mut_view(db));
+    arena_destroy(mut_view(scratch));
+    0
+}
+
+fn main() -> i32 {
+    let r1 = test_buffer_operations();
+    if r1 != 0 { return r1; }
+
+    let r2 = test_json_escaping();
+    if r2 != 0 { return r2; }
+
+    let r3 = test_human_rendering();
+    if r3 != 0 { return r3; }
+
+    let r4 = test_json_rendering();
+    if r4 != 0 { return r4; }
+
+    let r5 = test_differential_fixture();
+    if r5 != 0 { return r5; }
+
+    print("OK Diag Format JSON\n");
+    0
+}

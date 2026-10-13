@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T076]
 priority: 111
-status: doing
+status: done
 attempts: 1
 paths: [compiler/diag, tests/selfhost/diag]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-020]
 started: 2026-10-14 03:45:15
+finished: 2026-10-14 06:54:02
 ---
 # T077c — Port diagnostics emitter to Axiom (codes, formatters, json)
 
@@ -41,3 +42,4 @@ Port compiler diagnostic reporting and error emission (`compiler/diag/`) from C 
 
 ## Log
 - 2026-10-14 03:45:15 started (attempt 1) 
+- 2026-10-14 06:54:02 accepted by QA -> done

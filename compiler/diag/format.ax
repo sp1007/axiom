@@ -1,0 +1,496 @@
+module compiler.diag.format
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.LineCol
+use compiler.source.span.span_new
+use compiler.source.span.span_is_none
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_path
+use compiler.source.manager.source_db_line_col
+use compiler.source.manager.source_db_line_range
+use compiler.source.manager.source_db_span_text
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.DiagCode
+use compiler.diag.code.diag_code_name
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagSink
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+fn copy_fid(fid: view<FileId>) -> FileId { FileId { v: fid.v } }
+fn copy_span(s: view<Span>) -> Span { Span { file: copy_fid(view(s.file)), start: s.start, end: s.end } }
+fn copy_sv(sv: view<StrView>) -> StrView { StrView { ptr: sv.ptr, len: sv.len } }
+
+pub struct DiagBuffer {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+pub fn diag_buf_new() -> DiagBuffer {
+    DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+pub fn diag_buf_init(b: mut_view<DiagBuffer>) {
+    b.ptr = 0 as *mut u8;
+    b.len = 0;
+    b.cap = 0;
+}
+
+pub fn diag_buf_free(b: mut_view<DiagBuffer>) {
+    if b.cap > 0 && b.ptr as usize != 0 {
+        unsafe {
+            heap_free(b.ptr, b.cap, 1);
+        }
+    }
+    b.ptr = 0 as *mut u8;
+    b.len = 0;
+    b.cap = 0;
+}
+
+pub fn diag_buf_push_byte(b: mut_view<DiagBuffer>, byte: u8) {
+    if b.len == b.cap {
+        let new_cap = if b.cap == 0 { 128 } else { b.cap + b.cap };
+        let new_ptr = unsafe { heap_alloc(new_cap, 1) };
+        if b.len > 0 && b.ptr as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(b.ptr as *const u8, new_ptr, b.len);
+                heap_free(b.ptr, b.cap, 1);
+            }
+        }
+        b.ptr = new_ptr;
+        b.cap = new_cap;
+    }
+    unsafe {
+        *(b.ptr + b.len) = byte;
+    }
+    b.len = b.len + 1;
+}
+
+pub fn diag_buf_push_bytes(b: mut_view<DiagBuffer>, p: *const u8, count: usize) {
+    if count == 0 || p as usize == 0 {
+        return;
+    }
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*b), unsafe { *(p + i) });
+        i = i + 1;
+    }
+}
+
+pub fn diag_buf_push_sv(b: mut_view<DiagBuffer>, sv: StrView) {
+    diag_buf_push_bytes(b, sv.ptr, sv.len);
+}
+
+pub fn diag_buf_push_u32(b: mut_view<DiagBuffer>, mut n: u32) {
+    if n == 0u32 {
+        diag_buf_push_byte(b, 48u8);
+        return;
+    }
+    let mut digits: [10]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut count: usize = 0;
+    while n > 0u32 {
+        digits[count] = ((n % 10u32) as u8) + 48u8;
+        n = n / 10u32;
+        count = count + 1;
+    }
+    while count > 0 {
+        count = count - 1;
+        diag_buf_push_byte(mut_view(*b), digits[count]);
+    }
+}
+
+pub fn diag_buf_as_str_view(b: view<DiagBuffer>) -> StrView {
+    StrView { ptr: b.ptr as *const u8, len: b.len }
+}
+
+const FMT_STRS: [97]u8 = [
+    60u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 62u8, 32u8, 124u8, 32u8, 101u8, 114u8, 114u8, 111u8,
+    114u8, 91u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8, 103u8, 91u8, 105u8, 110u8, 102u8, 111u8, 91u8, 104u8,
+    105u8, 110u8, 116u8, 91u8, 93u8, 58u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 45u8, 45u8, 62u8, 32u8,
+    46u8, 46u8, 46u8, 10u8, 32u8, 32u8, 61u8, 32u8, 110u8, 111u8, 116u8, 101u8, 58u8, 32u8, 32u8, 32u8,
+    61u8, 32u8, 104u8, 101u8, 108u8, 112u8, 58u8, 32u8, 32u8, 32u8, 61u8, 32u8, 102u8, 105u8, 120u8, 58u8,
+    32u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8, 44u8, 32u8, 32u8, 119u8, 97u8, 114u8, 110u8, 105u8, 110u8,
+    103u8,
+];
+
+pub fn diag_buf_push_fmt_str(b: mut_view<DiagBuffer>, start: usize, byte_count: usize) {
+    let mut i: usize = 0;
+    while i < byte_count {
+        diag_buf_push_byte(mut_view(*b), FMT_STRS[start + i]);
+        i = i + 1;
+    }
+}
+
+const CODE_NAMES_DATA: [2885]u8 = [
+    65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 85u8, 84u8, 70u8, 56u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 78u8, 79u8, 78u8, 95u8, 65u8, 83u8, 67u8, 73u8, 73u8, 95u8, 73u8, 68u8, 69u8, 78u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8,
+    67u8, 79u8, 77u8, 77u8, 69u8, 78u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8, 83u8, 84u8, 82u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 67u8, 72u8, 65u8, 82u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8, 65u8, 76u8,
+    65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 85u8, 78u8, 73u8, 67u8, 79u8, 68u8, 69u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 78u8, 79u8, 78u8, 95u8, 65u8, 83u8, 67u8, 73u8, 73u8, 95u8, 73u8, 78u8, 95u8, 66u8, 89u8, 84u8, 69u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8,
+    65u8, 76u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 68u8, 73u8, 71u8, 73u8, 84u8, 83u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 66u8, 65u8, 83u8, 69u8, 95u8, 80u8, 82u8, 69u8, 70u8, 73u8, 88u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 68u8, 73u8, 71u8, 73u8, 84u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 66u8, 65u8, 68u8, 95u8, 68u8, 73u8, 71u8, 73u8,
+    84u8, 95u8, 83u8, 69u8, 80u8, 65u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 83u8, 85u8, 70u8, 70u8, 73u8, 88u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 70u8, 76u8, 79u8, 87u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8,
+    95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 65u8, 88u8, 95u8, 76u8, 69u8, 88u8, 95u8, 67u8, 79u8, 76u8, 79u8, 78u8, 95u8, 69u8, 81u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8, 79u8, 75u8, 69u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 69u8, 88u8, 80u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8,
+    95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 80u8, 65u8, 84u8, 84u8, 69u8, 82u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 73u8, 84u8, 69u8, 77u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 84u8,
+    69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 69u8, 88u8, 80u8, 69u8, 67u8, 84u8, 69u8, 68u8, 95u8, 76u8, 79u8, 79u8, 80u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 85u8, 78u8, 67u8, 76u8, 79u8, 83u8, 69u8, 68u8, 95u8, 68u8, 69u8, 76u8, 73u8, 77u8, 73u8, 84u8, 69u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 76u8, 69u8, 65u8, 68u8, 73u8, 78u8, 71u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8,
+    84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 67u8, 72u8, 65u8, 73u8, 78u8, 69u8, 68u8, 95u8, 67u8, 79u8, 77u8, 80u8, 65u8, 82u8, 73u8, 83u8, 79u8, 78u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 65u8, 83u8, 83u8, 73u8, 71u8, 78u8, 95u8, 73u8, 78u8, 95u8, 69u8, 88u8, 80u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 82u8, 69u8, 70u8, 69u8, 82u8, 69u8, 78u8, 67u8, 69u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8,
+    65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 86u8, 65u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 77u8, 79u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 77u8, 79u8, 68u8, 85u8, 76u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 70u8, 73u8, 82u8, 83u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 73u8, 84u8, 69u8, 77u8, 95u8, 73u8, 78u8,
+    95u8, 66u8, 76u8, 79u8, 67u8, 75u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 76u8, 69u8, 84u8, 95u8, 78u8, 69u8, 69u8, 68u8, 83u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 82u8, 95u8, 73u8, 78u8, 73u8, 84u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 83u8, 69u8, 76u8, 70u8, 95u8, 78u8, 69u8, 69u8, 68u8, 83u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 70u8, 78u8, 95u8, 66u8, 79u8, 68u8, 89u8, 95u8, 82u8, 69u8,
+    81u8, 85u8, 73u8, 82u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 70u8, 78u8, 95u8, 66u8, 79u8, 68u8, 89u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 76u8, 76u8, 79u8, 87u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 86u8, 73u8, 83u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 76u8, 76u8, 79u8, 87u8, 69u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 65u8, 82u8, 82u8, 65u8, 89u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 82u8,
+    68u8, 69u8, 82u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 82u8, 69u8, 83u8, 69u8, 82u8, 86u8, 69u8, 68u8, 95u8, 75u8, 69u8, 89u8, 87u8, 79u8, 82u8, 68u8, 65u8, 88u8, 95u8, 80u8, 65u8, 82u8, 83u8, 69u8, 95u8, 85u8, 78u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 95u8, 73u8, 78u8, 95u8, 66u8, 79u8, 79u8, 84u8, 83u8, 84u8, 82u8, 65u8, 80u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 83u8, 79u8, 76u8, 86u8, 69u8, 68u8, 65u8,
+    88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 95u8, 86u8, 65u8, 76u8, 85u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 83u8, 79u8, 76u8, 86u8, 69u8, 68u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 65u8, 88u8,
+    95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 83u8, 72u8, 65u8, 68u8, 79u8, 87u8, 95u8, 77u8, 79u8, 68u8, 85u8, 76u8, 69u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 85u8, 78u8, 68u8, 69u8, 70u8, 73u8, 78u8, 69u8, 68u8, 95u8, 76u8, 65u8, 66u8, 69u8, 76u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 66u8, 82u8, 69u8, 65u8, 75u8, 95u8, 79u8, 85u8, 84u8, 83u8, 73u8, 68u8, 69u8, 95u8, 76u8, 79u8, 79u8, 80u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8,
+    89u8, 69u8, 84u8, 95u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8, 69u8, 95u8, 66u8, 73u8, 78u8, 68u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 79u8, 82u8, 95u8, 80u8, 65u8, 84u8, 84u8, 69u8, 82u8, 78u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 80u8, 82u8, 73u8, 86u8, 65u8, 84u8, 69u8,
+    65u8, 88u8, 95u8, 78u8, 65u8, 77u8, 69u8, 95u8, 73u8, 77u8, 80u8, 79u8, 82u8, 84u8, 95u8, 67u8, 89u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 67u8, 65u8, 76u8, 76u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8,
+    82u8, 71u8, 95u8, 67u8, 79u8, 85u8, 78u8, 84u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 84u8, 79u8, 82u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 76u8, 73u8, 84u8, 69u8, 82u8, 65u8, 76u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 82u8, 65u8, 78u8, 71u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 69u8, 71u8, 95u8, 85u8, 78u8,
+    83u8, 73u8, 71u8, 78u8, 69u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 73u8, 78u8, 86u8, 65u8, 76u8, 73u8, 68u8, 95u8, 67u8, 65u8, 83u8, 84u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 78u8, 69u8, 86u8, 69u8, 82u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 83u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 65u8, 73u8, 78u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 65u8, 73u8, 78u8, 95u8,
+    83u8, 73u8, 71u8, 78u8, 65u8, 84u8, 85u8, 82u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 83u8, 85u8, 80u8, 80u8, 79u8, 82u8, 84u8, 69u8, 68u8, 95u8, 73u8, 78u8, 95u8, 66u8, 79u8, 79u8, 84u8, 83u8, 84u8, 82u8, 65u8, 80u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8, 83u8, 83u8, 73u8, 71u8, 78u8, 95u8, 73u8, 77u8, 77u8, 85u8, 84u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 95u8,
+    85u8, 83u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 82u8, 69u8, 65u8, 67u8, 72u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8,
+    69u8, 95u8, 70u8, 73u8, 69u8, 76u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 65u8, 82u8, 82u8, 65u8, 89u8, 95u8, 83u8, 73u8, 90u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 67u8, 65u8, 78u8, 78u8, 79u8, 84u8, 95u8, 73u8, 78u8, 68u8, 69u8, 88u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 84u8, 82u8, 89u8, 95u8, 79u8, 80u8, 69u8, 82u8, 65u8, 78u8, 68u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 84u8, 82u8, 89u8, 95u8, 82u8, 69u8, 84u8, 85u8,
+    82u8, 78u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 83u8, 84u8, 79u8, 82u8, 69u8, 68u8, 95u8, 86u8, 73u8, 69u8, 87u8, 95u8, 69u8, 83u8, 67u8, 65u8, 80u8, 69u8, 65u8, 88u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 83u8, 84u8, 79u8, 82u8, 69u8, 68u8, 95u8, 86u8, 73u8, 69u8, 87u8, 95u8, 83u8, 69u8, 76u8, 70u8, 95u8, 82u8, 69u8, 70u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 76u8, 65u8,
+    80u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 65u8, 77u8, 66u8, 73u8, 71u8, 85u8, 79u8, 85u8, 83u8, 95u8, 77u8, 69u8, 84u8, 72u8, 79u8, 68u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 85u8, 78u8, 83u8, 65u8, 84u8, 73u8, 83u8, 70u8, 73u8, 69u8, 68u8, 95u8, 66u8, 79u8, 85u8, 78u8, 68u8, 65u8, 88u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 68u8, 69u8, 82u8, 73u8, 86u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8,
+    84u8, 95u8, 78u8, 79u8, 78u8, 95u8, 69u8, 88u8, 72u8, 65u8, 85u8, 83u8, 84u8, 73u8, 86u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 84u8, 95u8, 82u8, 69u8, 70u8, 85u8, 84u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 80u8, 65u8, 84u8, 95u8, 85u8, 78u8, 82u8, 69u8, 65u8, 67u8, 72u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 77u8, 79u8, 86u8, 69u8, 95u8, 85u8, 83u8, 69u8, 95u8, 65u8, 70u8, 84u8, 69u8, 82u8, 95u8, 77u8, 79u8, 86u8, 69u8, 65u8, 88u8, 95u8, 73u8, 78u8, 73u8, 84u8, 95u8,
+    85u8, 83u8, 69u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 67u8, 79u8, 78u8, 70u8, 76u8, 73u8, 67u8, 84u8, 95u8, 77u8, 85u8, 84u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 67u8, 79u8, 78u8, 70u8, 76u8, 73u8, 67u8, 84u8, 95u8, 82u8, 69u8, 65u8, 68u8, 65u8, 88u8, 95u8, 67u8, 65u8, 80u8, 95u8, 79u8, 85u8, 84u8, 76u8, 73u8, 86u8, 69u8, 83u8, 95u8, 79u8, 87u8, 78u8, 69u8, 82u8, 65u8, 88u8, 95u8, 85u8, 78u8, 83u8, 65u8, 70u8, 69u8, 95u8,
+    82u8, 69u8, 81u8, 85u8, 73u8, 82u8, 69u8, 68u8, 65u8, 88u8, 95u8, 85u8, 78u8, 83u8, 65u8, 70u8, 69u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 85u8, 66u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 79u8, 86u8, 69u8, 82u8, 70u8, 76u8, 79u8, 87u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 68u8, 73u8, 86u8, 95u8, 90u8, 69u8, 82u8, 79u8, 65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 83u8, 84u8, 95u8, 67u8, 89u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 67u8, 79u8,
+    78u8, 83u8, 84u8, 95u8, 69u8, 86u8, 65u8, 76u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 77u8, 73u8, 82u8, 95u8, 83u8, 89u8, 78u8, 84u8, 65u8, 88u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 76u8, 79u8, 67u8, 65u8, 76u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 84u8, 69u8, 82u8, 77u8, 73u8, 78u8, 65u8, 84u8, 69u8, 68u8, 95u8,
+    66u8, 76u8, 79u8, 67u8, 75u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 66u8, 65u8, 68u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 84u8, 89u8, 80u8, 69u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 78u8, 73u8, 78u8, 73u8, 84u8, 95u8, 85u8, 83u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 67u8, 65u8,
+    76u8, 76u8, 95u8, 83u8, 73u8, 71u8, 78u8, 65u8, 84u8, 85u8, 82u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 82u8, 69u8, 84u8, 85u8, 82u8, 78u8, 95u8, 84u8, 89u8, 80u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 85u8, 83u8, 69u8, 95u8, 65u8, 70u8, 84u8, 69u8, 82u8, 95u8, 77u8, 79u8, 86u8, 69u8, 65u8, 88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 68u8, 82u8, 79u8, 80u8, 65u8,
+    88u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 95u8, 68u8, 79u8, 85u8, 66u8, 76u8, 69u8, 95u8, 68u8, 82u8, 79u8, 80u8, 65u8, 88u8, 95u8, 70u8, 70u8, 73u8, 95u8, 78u8, 79u8, 84u8, 95u8, 73u8, 78u8, 95u8, 79u8, 82u8, 65u8, 67u8, 76u8, 69u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 85u8, 78u8, 68u8, 69u8, 70u8, 73u8, 78u8, 69u8, 68u8, 95u8, 83u8, 89u8, 77u8, 66u8, 79u8, 76u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8,
+    69u8, 95u8, 83u8, 89u8, 77u8, 66u8, 79u8, 76u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 82u8, 69u8, 76u8, 79u8, 67u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 82u8, 65u8, 78u8, 71u8, 69u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 66u8, 65u8, 68u8, 95u8, 79u8, 66u8, 74u8, 69u8, 67u8, 84u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 73u8, 77u8, 65u8, 71u8, 69u8, 95u8, 84u8, 79u8, 79u8, 95u8, 76u8, 65u8, 82u8, 71u8, 69u8, 65u8, 88u8, 95u8, 73u8, 79u8,
+    95u8, 70u8, 73u8, 76u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 70u8, 79u8, 85u8, 78u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 82u8, 69u8, 65u8, 68u8, 95u8, 70u8, 65u8, 73u8, 76u8, 69u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 87u8, 82u8, 73u8, 84u8, 69u8, 95u8, 70u8, 65u8, 73u8, 76u8, 69u8, 68u8, 65u8, 88u8, 95u8, 73u8, 79u8, 95u8, 70u8, 73u8, 76u8, 69u8, 95u8, 84u8, 79u8, 79u8, 95u8, 76u8, 65u8, 82u8, 71u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8,
+    85u8, 83u8, 65u8, 71u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 79u8, 80u8, 84u8, 73u8, 79u8, 78u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 78u8, 79u8, 95u8, 73u8, 78u8, 80u8, 85u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 85u8, 78u8, 75u8, 78u8, 79u8, 87u8, 78u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8,
+    95u8, 83u8, 84u8, 65u8, 71u8, 69u8, 95u8, 78u8, 79u8, 84u8, 95u8, 65u8, 86u8, 65u8, 73u8, 76u8, 65u8, 66u8, 76u8, 69u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 83u8, 84u8, 69u8, 80u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 80u8, 95u8, 83u8, 84u8, 65u8, 67u8, 75u8, 95u8, 76u8, 73u8, 77u8, 73u8, 84u8, 65u8, 88u8, 95u8, 68u8, 82u8,
+    73u8, 86u8, 69u8, 82u8, 95u8, 78u8, 79u8, 95u8, 83u8, 84u8, 68u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 66u8, 65u8, 68u8, 95u8, 77u8, 65u8, 78u8, 73u8, 70u8, 69u8, 83u8, 84u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 73u8, 78u8, 84u8, 69u8, 82u8, 78u8, 65u8, 76u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 77u8, 73u8, 82u8, 95u8, 86u8, 69u8, 82u8, 73u8, 70u8, 89u8, 65u8, 88u8, 95u8, 73u8, 67u8, 69u8, 95u8, 79u8, 85u8, 84u8, 95u8, 79u8, 70u8, 95u8, 77u8,
+    69u8, 77u8, 79u8, 82u8, 89u8,
+];
+
+const CODE_NAMES_OFF: [134]u16 = [
+    0u16, 19u16, 38u16, 60u16, 87u16, 113u16, 137u16, 160u16, 181u16, 210u16, 242u16, 263u16, 285u16, 305u16, 331u16, 352u16, 371u16, 394u16, 412u16, 427u16, 450u16, 472u16, 494u16, 519u16, 541u16, 569u16, 591u16, 618u16, 643u16, 670u16, 693u16, 720u16,
+    732u16, 747u16, 759u16, 784u16, 806u16, 837u16, 861u16, 886u16, 914u16, 938u16, 963u16, 988u16, 1021u16, 1039u16, 1056u16, 1075u16, 1093u16, 1118u16, 1139u16, 1162u16, 1188u16, 1213u16, 1238u16, 1265u16, 1280u16, 1300u16, 1316u16, 1331u16, 1351u16, 1368u16, 1382u16, 1398u16,
+    1426u16, 1446u16, 1466u16, 1487u16, 1507u16, 1529u16, 1561u16, 1585u16, 1603u16, 1622u16, 1643u16, 1664u16, 1687u16, 1705u16, 1725u16, 1744u16, 1771u16, 1797u16, 1825u16, 1841u16, 1866u16, 1892u16, 1915u16, 1936u16, 1952u16, 1970u16, 1992u16, 2010u16, 2029u16, 2049u16, 2070u16, 2088u16,
+    2107u16, 2124u16, 2141u16, 2155u16, 2174u16, 2194u16, 2217u16, 2245u16, 2265u16, 2288u16, 2308u16, 2332u16, 2353u16, 2377u16, 2399u16, 2420u16, 2440u16, 2464u16, 2488u16, 2514u16, 2532u16, 2555u16, 2575u16, 2592u16, 2610u16, 2630u16, 2645u16, 2669u16, 2687u16, 2711u16, 2740u16, 2767u16,
+    2795u16, 2811u16, 2833u16, 2848u16, 2865u16, 2885u16,
+];
+
+pub fn diag_buf_push_code_name(b: mut_view<DiagBuffer>, c: DiagCode) {
+    if c.v >= 133u32 {
+        diag_buf_push_fmt_str(b, 0, 9);
+        return;
+    }
+    let start = CODE_NAMES_OFF[c.v as usize] as usize;
+    let end = CODE_NAMES_OFF[(c.v + 1u32) as usize] as usize;
+    let mut i = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*b), CODE_NAMES_DATA[i]);
+        i = i + 1;
+    }
+}
+
+fn get_gutter_width(mut line: u32) -> u32 {
+    if line == 0u32 {
+        return 1u32;
+    }
+    let mut w: u32 = 0u32;
+    while line > 0u32 {
+        w = w + 1u32;
+        line = line / 10u32;
+    }
+    w
+}
+
+fn print_gutter_space(b: mut_view<DiagBuffer>, width: u32) {
+    let mut i: u32 = 0u32;
+    while i < width {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        i = i + 1u32;
+    }
+    diag_buf_push_fmt_str(b, 9, 3);
+}
+
+fn print_severity_prefix(b: mut_view<DiagBuffer>, sev: DiagSeverity, c: DiagCode) {
+    match sev {
+        DiagSeverity.Error => {
+            diag_buf_push_fmt_str(mut_view(*b), 12, 6);
+        },
+        DiagSeverity.Warning => {
+            diag_buf_push_fmt_str(mut_view(*b), 18, 8);
+        },
+        DiagSeverity.Info => {
+            diag_buf_push_fmt_str(mut_view(*b), 26, 5);
+        },
+        DiagSeverity.Hint => {
+            diag_buf_push_fmt_str(mut_view(*b), 31, 5);
+        },
+    }
+    diag_buf_push_code_name(mut_view(*b), c);
+    diag_buf_push_fmt_str(b, 36, 3);
+}
+
+fn render_line(b: mut_view<DiagBuffer>, line_text: StrView) {
+    let mut i: usize = 0;
+    while i < line_text.len {
+        let c = unsafe { *(line_text.ptr + i) };
+        if c == 9u8 {
+            diag_buf_push_fmt_str(mut_view(*b), 39, 4);
+        } else if c != 13u8 && c != 10u8 {
+            diag_buf_push_byte(mut_view(*b), c);
+        }
+        i = i + 1;
+    }
+    diag_buf_push_byte(b, 10u8);
+}
+
+fn render_carets(b: mut_view<DiagBuffer>, line_text: StrView, start_col: u32, end_col: u32, caret_byte: u8, msg: StrView) {
+    let mut display_start: usize = 0;
+    let mut char_idx: usize = 1;
+    let mut i: usize = 0;
+
+    while i < line_text.len && char_idx < (start_col as usize) {
+        let c = unsafe { *(line_text.ptr + i) };
+        let mut w: usize = 1;
+        let mut bytes: usize = 1;
+        if c == 9u8 {
+            w = 4;
+        } else if (c & 0xE0u8) == 0xC0u8 {
+            bytes = 2;
+        } else if (c & 0xF0u8) == 0xE0u8 {
+            bytes = 3;
+        } else if (c & 0xF8u8) == 0xF0u8 {
+            bytes = 4;
+        }
+        display_start = display_start + w;
+        char_idx = char_idx + 1;
+        i = i + bytes;
+    }
+
+    let mut display_end: usize = display_start;
+    if start_col == end_col {
+        display_end = display_end + 1;
+    } else {
+        while i < line_text.len && char_idx < (end_col as usize) {
+            let c = unsafe { *(line_text.ptr + i) };
+            let mut w: usize = 1;
+            let mut bytes: usize = 1;
+            if c == 9u8 {
+                w = 4;
+            } else if (c & 0xE0u8) == 0xC0u8 {
+                bytes = 2;
+            } else if (c & 0xF0u8) == 0xE0u8 {
+                bytes = 3;
+            } else if (c & 0xF8u8) == 0xF0u8 {
+                bytes = 4;
+            }
+            display_end = display_end + w;
+            char_idx = char_idx + 1;
+            i = i + bytes;
+        }
+    }
+
+    let mut j: usize = 0;
+    while j < display_start {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        j = j + 1;
+    }
+    while j < display_end {
+        diag_buf_push_byte(mut_view(*b), caret_byte);
+        j = j + 1;
+    }
+    if msg.len > 0 {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        diag_buf_push_sv(mut_view(*b), msg);
+    }
+    diag_buf_push_byte(b, 10u8);
+}
+
+fn print_gutter_line_num(b: mut_view<DiagBuffer>, line: u32, width: u32) {
+    let lw = get_gutter_width(line);
+    let mut pad = width - lw;
+    while pad > 0u32 {
+        diag_buf_push_byte(mut_view(*b), 32u8);
+        pad = pad - 1u32;
+    }
+    diag_buf_push_u32(mut_view(*b), line);
+    diag_buf_push_fmt_str(b, 9, 3);
+}
+
+fn print_span_snippet(b: mut_view<DiagBuffer>, db: view<SourceDatabase>, span: Span, caret_byte: u8, msg: StrView, gutter_width: u32) {
+    let s_start: u32 = span.start;
+    let s_end: u32 = span.end;
+    let lc_start = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_start, s_start));
+    let lc_end = source_db_line_col(db, span_new(copy_fid(view(span.file)), s_end, s_end));
+
+    if lc_start.line == lc_end.line {
+        let line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_start.line);
+        let line_text = source_db_span_text(db, line_span);
+        print_gutter_line_num(mut_view(*b), lc_start.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(line_text)));
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(line_text)), lc_start.col_chars, lc_end.col_chars, caret_byte, copy_sv(view(msg)));
+    } else {
+        let start_line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_start.line);
+        let start_line_text = source_db_span_text(db, start_line_span);
+        print_gutter_line_num(mut_view(*b), lc_start.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(start_line_text)));
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(start_line_text)), lc_start.col_chars, 999999u32, caret_byte, StrView { ptr: 0 as *const u8, len: 0 });
+
+        if lc_end.line > lc_start.line + 1u32 {
+            let mut sp = gutter_width + 2u32;
+            while sp > 0u32 {
+                diag_buf_push_byte(mut_view(*b), 32u8);
+                sp = sp - 1u32;
+            }
+            diag_buf_push_fmt_str(mut_view(*b), 48, 4);
+        }
+
+        let end_line_span = source_db_line_range(db, copy_fid(view(span.file)), lc_end.line);
+        let end_line_text = source_db_span_text(db, end_line_span);
+        print_gutter_line_num(mut_view(*b), lc_end.line, gutter_width);
+        render_line(mut_view(*b), copy_sv(view(end_line_text)));
+
+        let mut first_non_blank: u32 = 1u32;
+        let mut k: usize = 0;
+        while k < end_line_text.len {
+            let eb = unsafe { *(end_line_text.ptr + k) };
+            if eb != 32u8 && eb != 9u8 && eb != 13u8 {
+                break;
+            }
+            first_non_blank = first_non_blank + 1u32;
+            k = k + 1;
+        }
+
+        print_gutter_space(mut_view(*b), gutter_width);
+        render_carets(mut_view(*b), copy_sv(view(end_line_text)), first_non_blank, lc_end.col_chars, caret_byte, copy_sv(view(msg)));
+    }
+}
+
+pub fn ax_diag_render_human(sink: view<DiagSink>, db: view<SourceDatabase>, out: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < sink.len {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+        let d = unsafe { *((sink.diags as usize + (((i as isize) * (size_of<Diagnostic>() as isize)) as usize)) as *const Diagnostic) };
+
+        let d_prim = copy_span(view(d.primary));
+        let d_msg = copy_sv(view(d.message));
+
+        print_severity_prefix(mut_view(*out), d.severity, d.code);
+        diag_buf_push_sv(mut_view(*out), d_msg);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+
+        if !span_is_none(view(d_prim)) {
+            let p_start: u32 = d_prim.start;
+            let lc = source_db_line_col(db, span_new(copy_fid(view(d_prim.file)), p_start, p_start));
+            let path = source_db_path(db, copy_fid(view(d_prim.file)));
+
+            diag_buf_push_fmt_str(mut_view(*out), 43, 5);
+
+            let mut pi: usize = 0;
+            while pi < path.len {
+                let pb = unsafe { *(path.ptr + pi) };
+                if pb == 92u8 {
+                    diag_buf_push_byte(mut_view(*out), 47u8);
+                } else {
+                    diag_buf_push_byte(mut_view(*out), pb);
+                }
+                pi = pi + 1;
+            }
+
+            diag_buf_push_byte(mut_view(*out), 58u8);
+            diag_buf_push_u32(mut_view(*out), lc.line);
+            diag_buf_push_byte(mut_view(*out), 58u8);
+            diag_buf_push_u32(mut_view(*out), lc.col_chars);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+
+            let mut gutter_width = get_gutter_width(lc.line);
+            let mut l: usize = 0;
+            while l < d.label_count {
+                let lbl = unsafe { *((d.labels as usize + (((l as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+                let l_span = copy_span(view(lbl.span));
+                if !span_is_none(view(l_span)) && l_span.file.v == d_prim.file.v {
+                    let l_start: u32 = l_span.start;
+                    let llc = source_db_line_col(db, span_new(copy_fid(view(l_span.file)), l_start, l_start));
+                    let lw = get_gutter_width(llc.line);
+                    if lw > gutter_width {
+                        gutter_width = lw;
+                    }
+                }
+                l = l + 1;
+            }
+
+            print_gutter_space(mut_view(*out), gutter_width);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+
+            print_span_snippet(mut_view(*out), db, copy_span(view(d_prim)), 94u8, StrView { ptr: 0 as *const u8, len: 0 }, gutter_width);
+
+            let mut l2: usize = 0;
+            while l2 < d.label_count {
+                let lbl = unsafe { *((d.labels as usize + (((l2 as isize) * (size_of<DiagLabel>() as isize)) as usize)) as *const DiagLabel) };
+                let l_span = copy_span(view(lbl.span));
+                let l_msg = copy_sv(view(lbl.message));
+                if !span_is_none(view(l_span)) && l_span.file.v == d_prim.file.v {
+                    print_span_snippet(mut_view(*out), db, copy_span(view(l_span)), 45u8, l_msg, gutter_width);
+                }
+                l2 = l2 + 1;
+            }
+
+            print_gutter_space(mut_view(*out), gutter_width);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+
+        // Notes
+        let mut ni: usize = 0;
+        while ni < d.note_count {
+            let note = unsafe { *((d.notes as usize + (((ni as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            diag_buf_push_fmt_str(mut_view(*out), 52, 10);
+            diag_buf_push_sv(mut_view(*out), note);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            ni = ni + 1;
+        }
+
+        // Helps
+        let mut hi: usize = 0;
+        while hi < d.help_count {
+            let help = unsafe { *((d.helps as usize + (((hi as isize) * (size_of<StrView>() as isize)) as usize)) as *const StrView) };
+            diag_buf_push_fmt_str(mut_view(*out), 62, 10);
+            diag_buf_push_sv(mut_view(*out), help);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            hi = hi + 1;
+        }
+
+        // Fixes
+        let mut fi: usize = 0;
+        while fi < d.fix_count {
+            let fix = unsafe { *((d.fixes as usize + (((fi as isize) * (size_of<DiagFix>() as isize)) as usize)) as *const DiagFix) };
+            diag_buf_push_fmt_str(mut_view(*out), 72, 9);
+            diag_buf_push_sv(mut_view(*out), fix.message);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            fi = fi + 1;
+        }
+
+        i = i + 1;
+    }
+
+    if sink.len > 0 {
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        diag_buf_push_u32(mut_view(*out), sink.errors as u32);
+        diag_buf_push_fmt_str(mut_view(*out), 81, 6);
+        if sink.errors != 1 {
+            diag_buf_push_byte(mut_view(*out), 115u8);
+        }
+        diag_buf_push_fmt_str(mut_view(*out), 87, 2);
+        diag_buf_push_u32(mut_view(*out), sink.warnings as u32);
+        diag_buf_push_fmt_str(mut_view(*out), 89, 8);
+        if sink.warnings != 1 {
+            diag_buf_push_byte(mut_view(*out), 115u8);
+        }
+        diag_buf_push_byte(out, 10u8);
+    }
+}
