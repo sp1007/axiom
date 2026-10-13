@@ -58,6 +58,9 @@ const AxOption *const ax_all_options[] = {
     NULL
 };
 
+static int s_run_argc = 0;
+static const char *s_run_argv[256];
+
 int ax_options_parse(const AxIo *io, int argc, char **argv, const AxOption *const *tables, int *out_argc, char ***out_argv, bool *out_dash_dash) {
     char **pos = malloc(((size_t)argc + 1) * sizeof(char *));
     if (!pos) {
@@ -66,10 +69,15 @@ int ax_options_parse(const AxIo *io, int argc, char **argv, const AxOption *cons
     }
     int pos_c = 0;
     bool dash_dash = false;
+    s_run_argc = 0;
     
     for (int i = 0; i < argc; ++i) {
         if (!dash_dash && strcmp(argv[i], "--") == 0) {
             dash_dash = true;
+            s_run_argc = 0;
+            for (int j = i + 1; j < argc && s_run_argc < 256; j++) {
+                s_run_argv[s_run_argc++] = argv[j];
+            }
             continue;
         }
         if (!dash_dash && argv[i][0] == '-') {
@@ -151,6 +159,64 @@ static void stage_source(AxDriverState *st) {
     if (!ax_project_discover(st->main_file, ax_opt_std_root, &st->project, &st->sink)) {
         st->failed = true;
         return;
+    }
+
+    if (st->project.std_root) {
+        bool uses_host = false;
+        for (size_t i = 0; i < st->project.file_count; i++) {
+            if (!st->project.files[i].is_std) {
+                FILE *f = fopen(st->project.files[i].disk_path, "rb");
+                if (f) {
+                    fseek(f, 0, SEEK_END);
+                    long sz = ftell(f);
+                    fseek(f, 0, SEEK_SET);
+                    if (sz > 0) {
+                        char *buf = malloc(sz + 1);
+                        if (buf) {
+                            size_t rd = fread(buf, 1, sz, f);
+                            buf[rd] = '\0';
+                            if (strstr(buf, "host")) {
+                                uses_host = true;
+                            }
+                            free(buf);
+                        }
+                    }
+                    fclose(f);
+                }
+            }
+            if (uses_host) break;
+        }
+
+        if (uses_host) {
+            char disk[sizeof(((AxProjectFile*)0)->disk_path)];
+            snprintf(disk, sizeof(disk), "%s/core/host.ax", st->project.std_root);
+            for (char *p = disk; *p; p++) {
+                if (*p == '\\') *p = '/';
+            }
+            FILE *hf = fopen(disk, "rb");
+            if (hf) {
+                fclose(hf);
+                bool already = false;
+                for (size_t i = 0; i < st->project.file_count; i++) {
+                    if (strcmp(st->project.files[i].disk_path, disk) == 0) {
+                        already = true;
+                        break;
+                    }
+                }
+                if (!already) {
+                    if (st->project.file_count >= st->project.file_cap) {
+                        st->project.file_cap = st->project.file_cap == 0 ? 8 : st->project.file_cap * 2;
+                        st->project.files = realloc(st->project.files, st->project.file_cap * sizeof(AxProjectFile));
+                    }
+                    AxProjectFile *pf = &st->project.files[st->project.file_count++];
+                    memcpy(pf->disk_path, disk, sizeof(pf->disk_path));
+                    snprintf(pf->display_path, sizeof(pf->display_path), "<std>/core/host.ax");
+                    snprintf(pf->module_path, sizeof(pf->module_path), "std.core.host");
+                    pf->is_main = false;
+                    pf->is_std = true;
+                }
+            }
+        }
     }
 
     if (st->project.file_count == 0) {
@@ -354,6 +420,21 @@ struct AxMirBody *ax_pipeline_get_mir(const struct AxHirItem *it) {
 
 static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
     if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
+        for (AxHirAttr *attr = it->attrs; attr; attr = attr->next) {
+            StrView an = ax_interner_get(&st->interner, attr->name);
+            if (ax_sv_eq_cstr(an, "intrinsic")) {
+                StrView fn_name = ax_interner_get(&st->interner, it->fn.name);
+                static const char *const host_names[] = {
+                    "heap_alloc", "heap_realloc", "heap_free", "stdio", "open", "read",
+                    "write", "close", "file_size", "args_count", "arg", "env_get",
+                    "exe_path", "exit", "remove", "mkdir", "metadata", "dir_open",
+                    "dir_next", "dir_close", "monotonic_ns", NULL
+                };
+                for (int i = 0; host_names[i]; i++) {
+                    if (ax_sv_eq_cstr(fn_name, host_names[i])) return;
+                }
+            }
+        }
         AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, it);
@@ -456,8 +537,15 @@ static void stage_run(AxDriverState *st) {
     int step_limit = atoi(ax_opt_step_limit);
     int call_depth_limit = atoi(ax_opt_max_call_depth);
     
+    const char *full_argv[257];
+    int full_argc = 0;
+    full_argv[full_argc++] = st->main_file ? st->main_file : "axiom0";
+    for (int i = 0; i < s_run_argc && full_argc < 256; i++) {
+        full_argv[full_argc++] = s_run_argv[i];
+    }
+
     extern const char *ax_run_panic_msg;
-    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit, g_mir_initialized ? &g_mir_map : NULL, &ax_run_panic_msg, st->io->out);
+    int rc = ax_interp_run(main_fn, &st->thir, &st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink, step_limit, call_depth_limit, g_mir_initialized ? &g_mir_map : NULL, &ax_run_panic_msg, st->io->out, full_argc, full_argv);
     st->exit_code = rc;
 }
 

@@ -30,12 +30,33 @@ typedef struct LirBuilder {
     size_t cur_inst_cap;
 } LirBuilder;
 
+static bool is_host_intrinsic_name(StrView name) {
+    static const char *const host_names[] = {
+        "heap_alloc", "heap_realloc", "heap_free", "stdio", "open", "read",
+        "write", "close", "file_size", "args_count", "arg", "env_get",
+        "exe_path", "exit", "remove", "mkdir", "metadata", "dir_open",
+        "dir_next", "dir_close", "monotonic_ns", NULL
+    };
+    for (int i = 0; host_names[i]; i++) {
+        if (ax_sv_eq_cstr(name, host_names[i])) return true;
+    }
+    return false;
+}
+
 static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *str_in, uint32_t sym_v) {
     if (sym_v != 0 && hir && str_in) {
         for (const struct AxHirItem *it = hir->items; it; it = it->next) {
             if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == sym_v) {
                 if (it->fn.name.v != 0) {
                     StrView sv = ax_interner_get(str_in, it->fn.name);
+                    for (const struct AxHirAttr *attr = it->attrs; attr; attr = attr->next) {
+                        StrView an = ax_interner_get(str_in, attr->name);
+                        if (ax_sv_eq_cstr(an, "intrinsic") && is_host_intrinsic_name(sv)) {
+                            char *iname = malloc(sv.len + 16);
+                            snprintf(iname, sv.len + 16, "__ax_host_%.*s", (int)sv.len, sv.ptr);
+                            return iname;
+                        }
+                    }
                     char *name = malloc(sv.len + 1);
                     memcpy(name, sv.ptr, sv.len);
                     name[sv.len] = '\0';
@@ -48,6 +69,14 @@ static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *
                     if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == sym_v) {
                         if (m->fn.name.v != 0) {
                             StrView sv = ax_interner_get(str_in, m->fn.name);
+                            for (const struct AxHirAttr *attr = m->attrs; attr; attr = attr->next) {
+                                StrView an = ax_interner_get(str_in, attr->name);
+                                if (ax_sv_eq_cstr(an, "intrinsic") && is_host_intrinsic_name(sv)) {
+                                    char *iname = malloc(sv.len + 16);
+                                    snprintf(iname, sv.len + 16, "__ax_host_%.*s", (int)sv.len, sv.ptr);
+                                    return iname;
+                                }
+                            }
                             char *name = malloc(sv.len + 1);
                             memcpy(name, sv.ptr, sv.len);
                             name[sv.len] = '\0';
@@ -62,6 +91,14 @@ static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *
                     if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == sym_v) {
                         if (m->fn.name.v != 0) {
                             StrView sv = ax_interner_get(str_in, m->fn.name);
+                            for (const struct AxHirAttr *attr = m->attrs; attr; attr = attr->next) {
+                                StrView an = ax_interner_get(str_in, attr->name);
+                                if (ax_sv_eq_cstr(an, "intrinsic") && is_host_intrinsic_name(sv)) {
+                                    char *iname = malloc(sv.len + 16);
+                                    snprintf(iname, sv.len + 16, "__ax_host_%.*s", (int)sv.len, sv.ptr);
+                                    return iname;
+                                }
+                            }
                             char *name = malloc(sv.len + 1);
                             memcpy(name, sv.ptr, sv.len);
                             name[sv.len] = '\0';

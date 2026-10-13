@@ -1,4 +1,5 @@
 #include "interp/interp.h"
+#include "interp/host.h"
 #include "mir/build/build.h"
 #include "mir/drop/drop.h"
 #include "types/layout/layout.h"
@@ -11,59 +12,12 @@ typedef AxMirBody *AxMirBodyPtr;
 AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
 
 typedef struct {
-    uint32_t alloc_id;
-    uint64_t base_addr;
-    uint64_t size;
-    uint32_t align;
-    uint8_t *host_ptr;
-    bool is_live;
-    int call_depth;
-} InterpAlloc;
-
-// Interpreter state
-typedef struct {
-    AxHirItem *main_fn;
-    AxThir *thir;
-    const AxHir *hir;
-    StrInterner *interner;
-    const AxResolveMap *rmap;
-    const AxAst *ast;
-    AxDiagSink *sink;
-    int step_limit;
-    int call_depth_limit;
-    void *mir_map;
-    
-    int steps;
-    int call_depth;
-    
-    AxArena arena;
-    bool failed;
-    int exit_code;
-    const char **out_panic_msg;
-    FILE *out;
-    uint64_t dummy_buf;
-
-    InterpAlloc *allocs;
-    size_t alloc_count;
-    size_t alloc_cap;
-    uint64_t next_synth_addr;
-
-    bool is_comptime;
-    AxConstEvalResult comptime_result;
-    Span current_span;
-} InterpCtx;
-
-typedef struct {
-    uint64_t vals[8];
-} AxInterpValue;
-
-typedef struct {
     AxMirBody *body;
     uint8_t **local_ptrs;
     uint8_t *storage;
 } CallFrame;
 
-static void panic_interp(InterpCtx *ctx, const char *msg);
+#define panic_interp ax_interp_panic
 static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret);
 static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size);
 
@@ -179,7 +133,7 @@ static AxHirItem *find_drop_fn_for_type(InterpCtx *ctx, TypeId ty_id) {
     return NULL;
 }
 
-static void report_ub(InterpCtx *ctx, const char *msg) {
+void ax_interp_report_ub(InterpCtx *ctx, const char *msg) {
     AxDiagnostic d = {0};
     d.code = AX_UNSAFE_INTERP_UB;
     d.severity = AX_DIAG_ERROR;
@@ -188,8 +142,9 @@ static void report_ub(InterpCtx *ctx, const char *msg) {
     ctx->failed = true;
     ctx->exit_code = 125;
 }
+#define report_ub ax_interp_report_ub
 
-static InterpAlloc *register_alloc(InterpCtx *ctx, uint8_t *host_ptr, uint64_t size, uint32_t align, int call_depth) {
+InterpAlloc *ax_interp_register_alloc(InterpCtx *ctx, uint8_t *host_ptr, uint64_t size, uint32_t align, int call_depth) {
     if (ctx->alloc_count >= ctx->alloc_cap) {
         ctx->alloc_cap = ctx->alloc_cap ? ctx->alloc_cap * 2 : 64;
         ctx->allocs = realloc(ctx->allocs, ctx->alloc_cap * sizeof(InterpAlloc));
@@ -206,8 +161,9 @@ static InterpAlloc *register_alloc(InterpCtx *ctx, uint8_t *host_ptr, uint64_t s
     ctx->next_synth_addr = base + ((size + 15) & ~15ULL) + 16;
     return a;
 }
+#define register_alloc ax_interp_register_alloc
 
-static uint8_t *validate_raw_ptr(InterpCtx *ctx, uint64_t addr, uint64_t size, uint32_t align) {
+uint8_t *ax_interp_validate_raw_ptr(InterpCtx *ctx, uint64_t addr, uint64_t size, uint32_t align) {
     if (addr == 0) {
         report_ub(ctx, "null pointer dereference");
         return (uint8_t*)&ctx->dummy_buf;
@@ -245,6 +201,7 @@ static uint8_t *validate_raw_ptr(InterpCtx *ctx, uint64_t addr, uint64_t size, u
     }
     return found->host_ptr + (addr - found->base_addr);
 }
+#define validate_raw_ptr ax_interp_validate_raw_ptr
 
 static void validate_ptr_arith(InterpCtx *ctx, uint64_t orig_addr, uint64_t new_addr) {
     if (orig_addr == 0 && new_addr == 0) return;
@@ -459,7 +416,7 @@ static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperan
 
 
 
-static void panic_interp(InterpCtx *ctx, const char *msg) {
+void ax_interp_panic(InterpCtx *ctx, const char *msg) {
     if (ctx->out_panic_msg) {
         *ctx->out_panic_msg = msg;
     }
@@ -477,6 +434,7 @@ static void panic_interp(InterpCtx *ctx, const char *msg) {
     ctx->failed = true;
     ctx->exit_code = 101;
 }
+#define panic_interp ax_interp_panic
 
 static void check_step_limit(InterpCtx *ctx) {
     if (ctx->step_limit > 0 && ctx->steps >= ctx->step_limit) {
@@ -538,6 +496,10 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
 
     if (is_intrinsic) {
         StrView name = ax_interner_get(ctx->interner, func->fn.name);
+        if (ax_interp_eval_host_intrinsic(ctx, name, args, arg_count, out_ret)) {
+            ctx->call_depth--;
+            return;
+        }
         if (ax_sv_eq_cstr(name, "assert")) {
             if (arg_count > 0 && args[0] == 0) {
                 panic_interp(ctx, "assertion failed");
@@ -1570,7 +1532,7 @@ skip_write:;
     free(frame.storage);
 }
 
-int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg, FILE *out) {
+int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterner *interner, const AxResolveMap *rmap, const AxAst *ast, AxDiagSink *sink, int step_limit, int call_depth_limit, void *mir_map, const char **out_panic_msg, FILE *out, int argc, const char **argv) {
     InterpCtx ctx = {0};
     ctx.main_fn = main_fn;
     ctx.thir = thir;
@@ -1586,14 +1548,25 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.out = out;
     ctx.next_synth_addr = 0x10000000;
     ax_arena_init(&ctx.arena, 0);
+    ax_interp_host_init(&ctx, argc, argv);
     
     register_const_allocs(&ctx);
     
     AxInterpValue ret = {0};
     eval_call(&ctx, main_fn, NULL, 0, &ret);
     
-    if (ctx.allocs) free(ctx.allocs);
+    if (ctx.allocs) {
+        for (size_t i = 0; i < ctx.alloc_count; i++) {
+            if (ctx.allocs[i].call_depth == -1 && ctx.allocs[i].host_ptr) {
+                free(ctx.allocs[i].host_ptr);
+                ctx.allocs[i].host_ptr = NULL;
+                ctx.allocs[i].is_live = false;
+            }
+        }
+        free(ctx.allocs);
+    }
     ax_arena_destroy(&ctx.arena);
+    ax_interp_host_cleanup(&ctx);
     
     if (ctx.failed) {
         return ctx.exit_code;
@@ -1643,6 +1616,7 @@ static AxConstEvalResult ax_interp_eval_const_expr(void *ctx_void, AxThir *thir,
     ictx.next_synth_addr = 0x20000000;
     ictx.current_span = expr->span;
     ax_arena_init(&ictx.arena, 0);
+    ax_interp_host_init(&ictx, 0, NULL);
     
     register_const_allocs(&ictx);
     
@@ -1694,9 +1668,19 @@ static AxConstEvalResult ax_interp_eval_const_expr(void *ctx_void, AxThir *thir,
         }
     }
     
-    if (ictx.allocs) free(ictx.allocs);
+    if (ictx.allocs) {
+        for (size_t i = 0; i < ictx.alloc_count; i++) {
+            if (ictx.allocs[i].call_depth == -1 && ictx.allocs[i].host_ptr) {
+                free(ictx.allocs[i].host_ptr);
+                ictx.allocs[i].host_ptr = NULL;
+                ictx.allocs[i].is_live = false;
+            }
+        }
+        free(ictx.allocs);
+    }
     ax_arena_destroy(&ictx.arena);
     ax_arena_destroy(&mir_arena);
+    ax_interp_host_cleanup(&ictx);
     return res;
 }
 
