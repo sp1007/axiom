@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T071]
 priority: 102
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/text/fmt, std/bytes, tests/std/fmt, tests/std/bytes]
 spec: [0089, tasks/0332, 0045, tasks/0304]
 covers: []
+started: 2026-10-13 21:10:34
 ---
 # T071b — ByteBuf, integer formatting and parsing, format helpers
 
@@ -38,3 +39,6 @@ The byte-level and number-formatting half of the self-host std subset (split fro
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 21:10:34 started (attempt 1) 

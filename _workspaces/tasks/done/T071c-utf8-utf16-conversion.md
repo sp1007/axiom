@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T071]
 priority: 102
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [std/text/utf16, tests/std/utf16]
 spec: [0089, tasks/0332]
 covers: []
+started: 2026-10-13 21:10:39
+finished: 2026-10-13 22:21:01
 ---
 # T071c — UTF-8 ↔ UTF-16 conversion (for Windows W APIs)
 
@@ -35,3 +37,7 @@ Text conversion at the OS boundary: Axiom strings are UTF-8, Windows W APIs take
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 21:10:39 started (attempt 1) 
+- 2026-10-13 22:21:01 accepted by QA -> done

@@ -8,10 +8,11 @@ model: sonnet
 gate_model: sonnet
 depends: [T071, T072, T059]
 priority: 104
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/collections, std/core/iter/adapters, tests/std/collections, std/text/chars]
 spec: [0045, 0210, tasks/0333]
+started: 2026-10-13 21:10:45
 ---
 # T073 — HashMap/HashSet + iterator adapters
 
@@ -39,3 +40,6 @@ Collections the compiler rewrite will need.
 - Both modes are mandatory. The only accepted reason for a `// modes: native` test is "direct FFI is native-only (ADR-0002)"; heavy tests (≥ 100k elements) may be native-only if a small interp twin of the same test exists.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 21:10:45 started (attempt 1) 
