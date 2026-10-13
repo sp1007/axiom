@@ -8,9 +8,9 @@ model: opus
 gate_model: sonnet
 depends: [T056]
 priority: 77
-status: todo
+status: doing
 attempts: 0
-paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/own, bootstrap/axiom0/src/mir, tests/run/closure, tests/ui/closure]
+paths: [bootstrap/axiom0/src, tests/run/closure, tests/ui/closure]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/MOVE.def, bootstrap/axiom0/src/diag/codes/CAP.def]
 spec: [0060, 0069, tasks/0273, tasks/0290, tasks/0671]
 ---
