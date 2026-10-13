@@ -1,0 +1,403 @@
+module compiler.source.manager
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.LineCol
+use compiler.source.span.span_new
+use compiler.source.span.span_none
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+fn bytes_eq(a: *const u8, b: *const u8, n: usize) -> bool {
+    let mut i: usize = 0;
+    while i < n {
+        if unsafe { *(a + i) } != unsafe { *(b + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn utf8_count_scalars(bytes: *const u8, byte_len: usize) -> usize {
+    let mut count: usize = 0;
+    let mut i: usize = 0;
+    while i < byte_len {
+        let b = unsafe { *(bytes + i) };
+        if (b & 0xC0u8) != 0x80u8 {
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    count
+}
+
+fn utf8_validate(bytes: *const u8, byte_len: usize) -> bool {
+    let mut i: usize = 0;
+    while i < byte_len {
+        let b0 = unsafe { *(bytes + i) };
+        if b0 < 0x80u8 {
+            i = i + 1;
+        } else if (b0 & 0xE0u8) == 0xC0u8 {
+            if i + 1 >= byte_len { return false; }
+            let b1 = unsafe { *(bytes + i + 1) };
+            if (b1 & 0xC0u8) != 0x80u8 { return false; }
+            if b0 < 0xC2u8 { return false; }
+            i = i + 2;
+        } else if (b0 & 0xF0u8) == 0xE0u8 {
+            if i + 2 >= byte_len { return false; }
+            let b1 = unsafe { *(bytes + i + 1) };
+            let b2 = unsafe { *(bytes + i + 2) };
+            if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 { return false; }
+            if b0 == 0xE0u8 && b1 < 0xA0u8 { return false; }
+            if b0 == 0xEDu8 && b1 >= 0xA0u8 { return false; }
+            i = i + 3;
+        } else if (b0 & 0xF8u8) == 0xF0u8 {
+            if i + 3 >= byte_len { return false; }
+            let b1 = unsafe { *(bytes + i + 1) };
+            let b2 = unsafe { *(bytes + i + 2) };
+            let b3 = unsafe { *(bytes + i + 3) };
+            if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 || (b3 & 0xC0u8) != 0x80u8 { return false; }
+            if b0 == 0xF0u8 && b1 < 0x90u8 { return false; }
+            if b0 == 0xF4u8 && b1 > 0x8Fu8 { return false; }
+            if b0 > 0xF4u8 { return false; }
+            i = i + 4;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+pub struct SourceFile {
+    pub id: FileId,
+    pub canonical_path: StrView,
+    pub text: StrView,
+    pub content_hash: u64,
+    pub line_offsets: *mut u32,
+    pub line_count: usize,
+    pub line_cap: usize,
+    pub alloc_ptr: *mut u8,
+    pub alloc_size: usize,
+    pub has_invalid_utf8: bool,
+}
+
+unsafe fn file_ptr(files: *mut SourceFile, idx: usize) -> *mut SourceFile {
+    ((files as usize) + idx * size_of<SourceFile>()) as *mut SourceFile
+}
+
+unsafe fn offset_ptr(offsets: *mut u32, idx: usize) -> *mut u32 {
+    ((offsets as usize) + idx * 4) as *mut u32
+}
+
+pub struct SourceDatabase {
+    pub arena: Arena,
+    pub files: *mut SourceFile,
+    pub files_count: usize,
+    pub files_cap: usize,
+}
+
+pub fn source_db_init(db: mut_view<SourceDatabase>) {
+    db.arena = arena_new();
+    db.files = 0 as *mut SourceFile;
+    db.files_count = 0;
+    db.files_cap = 0;
+}
+
+pub fn source_db_free(db: mut_view<SourceDatabase>) {
+    let mut i: usize = 0;
+    while i < db.files_count {
+        let sf = unsafe { *(file_ptr(db.files, i)) };
+        if sf.line_cap > 0 && sf.line_offsets as usize != 0 {
+            unsafe {
+                heap_free(sf.line_offsets as *mut u8, sf.line_cap * 4, 4);
+            }
+        }
+        if sf.alloc_ptr as usize != 0 && sf.alloc_size > 0 {
+            unsafe {
+                heap_free(sf.alloc_ptr, sf.alloc_size, 1);
+            }
+        }
+        i = i + 1;
+    }
+    if db.files_cap > 0 && db.files as usize != 0 {
+        unsafe {
+            heap_free(db.files as *mut u8, db.files_cap * size_of<SourceFile>(), align_of<SourceFile>());
+        }
+    }
+    db.files = 0 as *mut SourceFile;
+    db.files_count = 0;
+    db.files_cap = 0;
+    arena_destroy(mut_view(db.arena));
+}
+
+pub struct LineMapResult {
+    pub offsets: *mut u32,
+    pub count: usize,
+    pub cap: usize,
+}
+
+fn build_line_map(text_ptr: *const u8, text_len: usize) -> LineMapResult {
+    let mut cap: usize = 16;
+    let mut count: usize = 0;
+    let mut offsets = unsafe { heap_alloc(cap * 4, 4) as *mut u32 };
+
+    // Line 1 starts at byte offset 0
+    unsafe {
+        *(offset_ptr(offsets, 0)) = 0u32;
+    }
+    count = 1;
+
+    let mut i: usize = 0;
+    while i < text_len {
+        let b = unsafe { *(text_ptr + i) };
+        if b == 13u8 && i + 1 < text_len && unsafe { *(text_ptr + i + 1) } == 10u8 { // \r\n
+            if count == cap {
+                let new_cap = cap + cap;
+                let new_offsets = unsafe { heap_alloc(new_cap * 4, 4) as *mut u32 };
+                if count > 0 && offsets as usize != 0 {
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(offsets as *const u8, new_offsets as *mut u8, count * 4);
+                        heap_free(offsets as *mut u8, cap * 4, 4);
+                    }
+                }
+                offsets = new_offsets;
+                cap = new_cap;
+            }
+            unsafe {
+                *(offset_ptr(offsets, count)) = (i + 2) as u32;
+            }
+            count = count + 1;
+            i = i + 2;
+        } else if b == 10u8 { // \n
+            if count == cap {
+                let new_cap = cap + cap;
+                let new_offsets = unsafe { heap_alloc(new_cap * 4, 4) as *mut u32 };
+                if count > 0 && offsets as usize != 0 {
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(offsets as *const u8, new_offsets as *mut u8, count * 4);
+                        heap_free(offsets as *mut u8, cap * 4, 4);
+                    }
+                }
+                offsets = new_offsets;
+                cap = new_cap;
+            }
+            unsafe {
+                *(offset_ptr(offsets, count)) = (i + 1) as u32;
+            }
+            count = count + 1;
+            i = i + 1;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    LineMapResult {
+        offsets: offsets,
+        count: count,
+        cap: cap,
+    }
+}
+
+pub fn source_db_add_virtual(db: mut_view<SourceDatabase>, identity_ptr: *const u8, identity_len: usize, text_ptr: *const u8, text_len: usize) -> FileId {
+    // Check if file with same identity is already loaded
+    let mut i: usize = 0;
+    while i < db.files_count {
+        let existing = unsafe { *(file_ptr(db.files, i)) };
+        if existing.canonical_path.len == identity_len && bytes_eq(existing.canonical_path.ptr, identity_ptr, identity_len) {
+            return FileId { v: existing.id.v };
+        }
+        i = i + 1;
+    }
+
+    // Allocate copy of path in db.arena
+    let path_copy = arena_alloc_raw(mut_view(db.arena), identity_len + 1, 1);
+    if identity_len > 0 && identity_ptr as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(identity_ptr, path_copy, identity_len);
+            *(path_copy + identity_len) = 0u8;
+        }
+    }
+
+    // Handle UTF-8 BOM in text
+    let mut p_text = text_ptr;
+    let mut actual_len = text_len;
+    if actual_len >= 3 && unsafe { *p_text } == 0xEFu8 && unsafe { *(p_text + 1) } == 0xBBu8 && unsafe { *(p_text + 2) } == 0xBFu8 {
+        p_text = unsafe { p_text + 3 };
+        actual_len = actual_len - 3;
+    }
+
+    // Allocate copy of text in db.arena
+    let text_copy = arena_alloc_raw(mut_view(db.arena), actual_len + 1, 1);
+    if actual_len > 0 && p_text as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(p_text, text_copy, actual_len);
+            *(text_copy + actual_len) = 0u8;
+        }
+    }
+
+    let hash = ax_hash_bytes(text_copy as *const u8, actual_len);
+    let is_valid = utf8_validate(text_copy as *const u8, actual_len);
+
+    let lm = build_line_map(text_copy as *const u8, actual_len);
+
+    let new_id = FileId { v: (db.files_count + 1) as u32 };
+
+    if db.files_count == db.files_cap {
+        let new_cap = if db.files_cap == 0 { 8 } else { db.files_cap + db.files_cap };
+        let new_files = unsafe { heap_alloc(new_cap * size_of<SourceFile>(), align_of<SourceFile>()) as *mut SourceFile };
+        if db.files_count > 0 && db.files as usize != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(db.files as *const u8, new_files as *mut u8, db.files_count * size_of<SourceFile>());
+                heap_free(db.files as *mut u8, db.files_cap * size_of<SourceFile>(), align_of<SourceFile>());
+            }
+        }
+        db.files = new_files;
+        db.files_cap = new_cap;
+    }
+
+    let sf = SourceFile {
+        id: FileId { v: new_id.v },
+        canonical_path: StrView { ptr: path_copy as *const u8, len: identity_len },
+        text: StrView { ptr: text_copy as *const u8, len: actual_len },
+        content_hash: hash,
+        line_offsets: lm.offsets,
+        line_count: lm.count,
+        line_cap: lm.cap,
+        alloc_ptr: 0 as *mut u8,
+        alloc_size: 0,
+        has_invalid_utf8: !is_valid,
+    };
+
+    unsafe {
+        *(file_ptr(db.files, db.files_count)) = sf;
+    }
+    db.files_count = db.files_count + 1;
+
+    new_id
+}
+
+pub fn source_db_file_count(db: view<SourceDatabase>) -> usize {
+    db.files_count
+}
+
+pub fn source_db_text(db: view<SourceDatabase>, file: FileId) -> StrView {
+    if file.v == 0 || (file.v as usize) > db.files_count {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    sf.text
+}
+
+pub fn source_db_path(db: view<SourceDatabase>, file: FileId) -> StrView {
+    if file.v == 0 || (file.v as usize) > db.files_count {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    sf.canonical_path
+}
+
+pub fn source_db_hash(db: view<SourceDatabase>, file: FileId) -> u64 {
+    if file.v == 0 || (file.v as usize) > db.files_count {
+        return 0u64;
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    sf.content_hash
+}
+
+pub fn source_db_has_invalid_utf8(db: view<SourceDatabase>, file: FileId) -> bool {
+    if file.v == 0 || (file.v as usize) > db.files_count {
+        return false;
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    sf.has_invalid_utf8
+}
+
+pub fn source_db_span_text(db: view<SourceDatabase>, span: Span) -> StrView {
+    if span.file.v == 0 || (span.file.v as usize) > db.files_count {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let sf = unsafe { *(file_ptr(db.files, (span.file.v - 1) as usize)) };
+    if span.start > span.end || (span.end as usize) > sf.text.len {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    StrView {
+        ptr: (sf.text.ptr as usize + (span.start as usize)) as *const u8,
+        len: (span.end - span.start) as usize,
+    }
+}
+
+pub fn source_db_line_col(db: view<SourceDatabase>, span: Span) -> LineCol {
+    if span.file.v == 0 || (span.file.v as usize) > db.files_count {
+        return LineCol.zero();
+    }
+    let sf = unsafe { *(file_ptr(db.files, (span.file.v - 1) as usize)) };
+
+    let mut offset = span.start;
+    if (offset as usize) > sf.text.len {
+        offset = sf.text.len as u32;
+    }
+
+    let mut low: usize = 0;
+    let mut high: usize = sf.line_count;
+    let mut line_idx: usize = 0;
+    while low < high {
+        let mid = low + (high - low) / 2;
+        let line_off = unsafe { *(offset_ptr(sf.line_offsets, mid)) };
+        if line_off <= offset {
+            line_idx = mid;
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+
+    let line_start = unsafe { *(offset_ptr(sf.line_offsets, line_idx)) };
+    let col_bytes = offset - line_start + 1u32;
+    let byte_diff = (offset - line_start) as usize;
+    let p = (sf.text.ptr as usize + line_start as usize) as *const u8;
+    let col_chars = (utf8_count_scalars(p, byte_diff) + 1) as u32;
+
+    LineCol {
+        line: (line_idx + 1) as u32,
+        col_bytes: col_bytes,
+        col_chars: col_chars,
+    }
+}
+
+pub fn source_db_line_range(db: view<SourceDatabase>, file: FileId, line: u32) -> Span {
+    if file.v == 0 || (file.v as usize) > db.files_count {
+        return span_none();
+    }
+    let sf = unsafe { *(file_ptr(db.files, (file.v - 1) as usize)) };
+    if line == 0u32 || (line as usize) > sf.line_count {
+        return span_none();
+    }
+
+    let start = unsafe { *(offset_ptr(sf.line_offsets, (line - 1u32) as usize)) };
+    let mut end: u32 = 0u32;
+    if (line as usize) < sf.line_count {
+        end = unsafe { *(offset_ptr(sf.line_offsets, line as usize)) };
+        // Exclude trailing \n or \r\n
+        if end > start && unsafe { *(sf.text.ptr + (end - 1u32) as usize) } == 10u8 { // \n
+            end = end - 1u32;
+            if end > start && unsafe { *(sf.text.ptr + (end - 1u32) as usize) } == 13u8 { // \r
+                end = end - 1u32;
+            }
+        }
+    } else {
+        end = sf.text.len as u32;
+    }
+    span_new(file, start, end)
+}

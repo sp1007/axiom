@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T076]
 priority: 111
-status: doing
+status: done
 attempts: 1
 paths: [compiler/source, tests/selfhost/source]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-021]
 started: 2026-10-14 03:45:14
+finished: 2026-10-14 04:53:13
 ---
 # T077b — Port source DB to Axiom (source manager, span decoding, line/col lookup)
 
@@ -41,3 +42,4 @@ Port source text management and span tracking (`compiler/source/`) from C to Axi
 
 ## Log
 - 2026-10-14 03:45:14 started (attempt 1) 
+- 2026-10-14 04:53:13 accepted by QA -> done
