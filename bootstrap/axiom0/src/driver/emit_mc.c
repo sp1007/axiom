@@ -60,6 +60,8 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
         case AX_X64_MI_LEA:
             if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_MEM) {
                 ax_x64_lea(sec, 8, inst->ops[0].reg, inst->ops[1].mem);
+            } else if (inst->ops[0].kind == AX_X64_OP_REG && inst->ops[1].kind == AX_X64_OP_SYM) {
+                ax_x64_lea_sym(sec, inst->ops[0].reg, (ax_symbol_id_t){0});
             }
             break;
         case AX_X64_MI_RET:

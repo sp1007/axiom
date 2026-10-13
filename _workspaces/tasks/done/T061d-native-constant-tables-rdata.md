@@ -8,11 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T061, T061b]
 priority: 83
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/obj, tests/run/comptime, tests/run/native_const]
+locks: [bootstrap/axiom0/src/driver/build_native/build.c, bootstrap/axiom0/src/driver/emit_obj.c, bootstrap/axiom0/src/driver/emit_mc.c]
 spec: [0162, 0185, 0186, spec/decisions/ADR-0004-self-host-subset-additions.md]
 covers: []
+started: 2026-10-13 17:37:40
+finished: 2026-10-13 18:21:40
 ---
 # T061d — Native catch-up: constant tables in .rdata
 
@@ -38,3 +41,7 @@ Constant aggregate tables (opcode tables, keyword tables, diagnostic metadata) a
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 17:37:40 started (attempt 1) 
+- 2026-10-13 18:21:40 accepted by QA -> done

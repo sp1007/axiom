@@ -16,6 +16,10 @@ AxX64FrameLayout ax_x64_frame_lower(AxX64MIBody *body, const AxLirBody *lir, Typ
     }
     
     for (size_t i = 0; i < lir->slot_count; i++) {
+        if (lir->slots[i].is_const) {
+            layout.slot_offsets[i] = 0;
+            continue;
+        }
         uint32_t size = ax_type_size(lir->slots[i].ty, interner);
         uint32_t align = ax_type_align(lir->slots[i].ty, interner);
         if (size < 8) size = 8;

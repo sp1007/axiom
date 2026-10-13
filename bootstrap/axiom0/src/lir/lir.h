@@ -150,6 +150,7 @@ typedef struct AxLirBb {
 
 typedef struct AxLirStackSlot {
     TypeId ty; // naive lowering just uses MIR local type
+    bool is_const;
 } AxLirStackSlot;
 
 typedef struct AxLirVReg {

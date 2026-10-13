@@ -134,6 +134,51 @@ static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *
     return name;
 }
 
+static const char *get_const_table_sym_name(const struct AxHir *hir, struct StrInterner *str_in, uint32_t sym_v) {
+    if (sym_v != 0 && hir && str_in) {
+        for (const struct AxHirItem *it = hir->items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_CONST && it->const_decl.symbol.v == sym_v) {
+                if (it->const_decl.name.v != 0) {
+                    StrView sv = ax_interner_get(str_in, it->const_decl.name);
+                    char *name = malloc(sv.len + 32);
+                    snprintf(name, sv.len + 32, ".Lconst_%u_%.*s", sym_v, (int)sv.len, sv.ptr);
+                    return name;
+                }
+                break;
+            }
+            if (it->kind == AX_HIR_ITEM_IMPL) {
+                for (const struct AxHirItem *m = it->impl.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_CONST && m->const_decl.symbol.v == sym_v) {
+                        if (m->const_decl.name.v != 0) {
+                            StrView sv = ax_interner_get(str_in, m->const_decl.name);
+                            char *name = malloc(sv.len + 32);
+                            snprintf(name, sv.len + 32, ".Lconst_%u_%.*s", sym_v, (int)sv.len, sv.ptr);
+                            return name;
+                        }
+                        break;
+                    }
+                }
+            }
+            if (it->kind == AX_HIR_ITEM_TRAIT) {
+                for (const struct AxHirItem *m = it->trait.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_CONST && m->const_decl.symbol.v == sym_v) {
+                        if (m->const_decl.name.v != 0) {
+                            StrView sv = ax_interner_get(str_in, m->const_decl.name);
+                            char *name = malloc(sv.len + 32);
+                            snprintf(name, sv.len + 32, ".Lconst_%u_%.*s", sym_v, (int)sv.len, sv.ptr);
+                            return name;
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    char *name = malloc(32);
+    snprintf(name, 32, ".Lconst_%u", sym_v);
+    return name;
+}
+
 static size_t add_lir_bb(LirBuilder *b) {
     if (b->bb_count == b->bb_cap) {
         b->bb_cap = b->bb_cap == 0 ? 16 : b->bb_cap * 2;
@@ -346,8 +391,16 @@ static TypeId get_place_type(const LirBuilder *b, const AxMirPlace *place) {
 }
 
 static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, TypeId *out_ty) {
-    AxLirStackSlotId slot = { place->local.v };
-    AxLirVRegId addr = emit_stack_addr(b, slot);
+    AxLirVRegId addr;
+    if (b->mir->locals[place->local.v].kind == AX_MIR_LOCAL_CONST) {
+        uint32_t sym_v = b->mir->locals[place->local.v].const_sym.v;
+        const char *sym_name = get_const_table_sym_name(b->hir, b->str_in, sym_v);
+        addr = make_vreg(b, b->interner->t_usize);
+        emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_FN_ADDR, .dest = addr, .fn_addr = { .sym_name = sym_name } });
+    } else {
+        AxLirStackSlotId slot = { place->local.v };
+        addr = emit_stack_addr(b, slot);
+    }
     TypeId ty = b->mir->locals[place->local.v].ty;
     uint32_t current_variant = (uint32_t)-1;
     
@@ -382,8 +435,10 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 }
                 
                 ty = next_ty;
-                AxLirVRegId dummy_off = emit_const(b, offset, b->interner->t_usize);
-                addr = emit_offset(b, addr, dummy_off);
+                if (offset != 0) {
+                    AxLirVRegId dummy_off = emit_const(b, offset, b->interner->t_usize);
+                    addr = emit_offset(b, addr, dummy_off);
+                }
                 break;
             }
             case AX_MIR_PROJ_SUB_SLICE: {
@@ -397,10 +452,14 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                     AxLirVRegId idx_addr = emit_stack_addr(b, idx_slot);
                     AxLirVRegId idx_val = emit_load(b, idx_addr, b->interner->t_usize);
                     uint32_t fs = ax_type_size(elem_ty, b->interner);
-                    AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
-                    AxLirVRegId offset = make_vreg(b, b->interner->t_usize);
-                    emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = offset, .binary = { .lhs = idx_val, .rhs = dummy_size } });
-                    addr = emit_offset(b, addr, offset);
+                    if (fs == 1) {
+                        addr = emit_offset(b, addr, idx_val);
+                    } else {
+                        AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
+                        AxLirVRegId offset = make_vreg(b, b->interner->t_usize);
+                        emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = offset, .binary = { .lhs = idx_val, .rhs = dummy_size } });
+                        addr = emit_offset(b, addr, offset);
+                    }
                 }
                 if (t && t->kind == AX_TY_ARRAY) {
                     AxType sl; memset(&sl, 0, sizeof(sl));
@@ -420,10 +479,14 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                 AxLirVRegId idx_addr = emit_stack_addr(b, idx_slot);
                 AxLirVRegId idx_val = emit_load(b, idx_addr, b->interner->t_usize);
                 uint32_t fs = ax_type_size(elem_ty, b->interner);
-                AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
-                AxLirVRegId off = make_vreg(b, b->interner->t_usize);
-                emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = off, .binary = { .lhs = idx_val, .rhs = dummy_size } });
-                addr = emit_offset(b, addr, off);
+                if (fs == 1) {
+                    addr = emit_offset(b, addr, idx_val);
+                } else {
+                    AxLirVRegId dummy_size = emit_const(b, fs, b->interner->t_usize);
+                    AxLirVRegId off = make_vreg(b, b->interner->t_usize);
+                    emit_inst(b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = off, .binary = { .lhs = idx_val, .rhs = dummy_size } });
+                    addr = emit_offset(b, addr, off);
+                }
                 ty = elem_ty;
                 break;
             }
@@ -615,6 +678,7 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
     b.slots = ax_arena_alloc(&lir->arena, b.slot_count * sizeof(AxLirStackSlot), _Alignof(AxLirStackSlot));
     for (size_t i = 0; i < mir->local_count; i++) {
         b.slots[i].ty = mir->locals[i].ty;
+        b.slots[i].is_const = (mir->locals[i].kind == AX_MIR_LOCAL_CONST);
     }
     
     b.interner = interner;
@@ -645,6 +709,9 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
         for (size_t j = 0; j < mbb->stmt_count; j++) {
             const AxMirStmt *stmt = &mbb->stmts[j];
             if (stmt->kind == AX_MIR_STMT_ASSIGN) {
+                if (mir->locals[stmt->assign.place.local.v].kind == AX_MIR_LOCAL_CONST) {
+                    continue;
+                }
                 TypeId dest_ty = mir->locals[stmt->assign.place.local.v].ty;
                 if (stmt->assign.rvalue.kind == AX_MIR_RVALUE_AGGREGATE) {
                     AxLirVRegId addr = lower_place_addr(&b, &stmt->assign.place, &dest_ty);
