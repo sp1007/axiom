@@ -1,5 +1,6 @@
 #include "interp/interp.h"
 #include "mir/build/build.h"
+#include "mir/drop/drop.h"
 #include "types/layout/layout.h"
 #include <stdlib.h>
 #include <string.h>
@@ -8,6 +9,16 @@
 
 typedef AxMirBody *AxMirBodyPtr;
 AX_DEFINE_HASHMAP(AxMirMap, AxHirItemPtr, AxMirBodyPtr, ax_key_hash_ptr, ax_key_eq_ptr);
+
+typedef struct {
+    uint32_t alloc_id;
+    uint64_t base_addr;
+    uint64_t size;
+    uint32_t align;
+    uint8_t *host_ptr;
+    bool is_live;
+    int call_depth;
+} InterpAlloc;
 
 // Interpreter state
 typedef struct {
@@ -31,6 +42,11 @@ typedef struct {
     const char **out_panic_msg;
     FILE *out;
     uint64_t dummy_buf;
+
+    InterpAlloc *allocs;
+    size_t alloc_count;
+    size_t alloc_cap;
+    uint64_t next_synth_addr;
 } InterpCtx;
 
 typedef struct {
@@ -127,6 +143,141 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
     return NULL;
 }
 
+static AxHirItem *find_drop_fn_for_type(InterpCtx *ctx, TypeId ty_id) {
+    if (TypeId_is_none(ty_id) || ty_id.v == 0) return NULL;
+    const AxType *ty = ax_type_get(&ctx->thir->interner, ty_id);
+    if (!ty || ty->kind != AX_TY_STRUCT) return NULL;
+    StrView target_sname = ax_interner_get(ctx->interner, ty->strct.def->struct_decl.name);
+    for (const AxHirItem *it = ctx->hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+            StrView trait_sname = {0};
+            if (it->impl.trait_path->path.path.name.v != 0) {
+                trait_sname = ax_interner_get(ctx->interner, it->impl.trait_path->path.path.name);
+            }
+            if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
+                StrView impl_sname = {0};
+                if (it->impl.self_type->path.path.name.v != 0) {
+                    impl_sname = ax_interner_get(ctx->interner, it->impl.self_type->path.path.name);
+                }
+                if (ax_sv_eq(target_sname, impl_sname)) {
+                    for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                        if (m->kind == AX_HIR_ITEM_FN) {
+                            return (AxHirItem*)m;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+static void report_ub(InterpCtx *ctx, const char *msg) {
+    AxDiagnostic d = {0};
+    d.code = AX_UNSAFE_INTERP_UB;
+    d.severity = AX_DIAG_ERROR;
+    d.message = msg ? msg : ax_diag_code_default_message(AX_UNSAFE_INTERP_UB);
+    ax_diag_sink_report(ctx->sink, &d);
+    ctx->failed = true;
+    ctx->exit_code = 125;
+}
+
+static InterpAlloc *register_alloc(InterpCtx *ctx, uint8_t *host_ptr, uint64_t size, uint32_t align, int call_depth) {
+    if (ctx->alloc_count >= ctx->alloc_cap) {
+        ctx->alloc_cap = ctx->alloc_cap ? ctx->alloc_cap * 2 : 64;
+        ctx->allocs = realloc(ctx->allocs, ctx->alloc_cap * sizeof(InterpAlloc));
+    }
+    InterpAlloc *a = &ctx->allocs[ctx->alloc_count++];
+    a->alloc_id = (uint32_t)ctx->alloc_count;
+    uint64_t base = (ctx->next_synth_addr + 15) & ~15ULL;
+    a->base_addr = base;
+    a->size = size;
+    a->align = align ? align : 1;
+    a->host_ptr = host_ptr;
+    a->is_live = true;
+    a->call_depth = call_depth;
+    ctx->next_synth_addr = base + ((size + 15) & ~15ULL) + 16;
+    return a;
+}
+
+static uint8_t *validate_raw_ptr(InterpCtx *ctx, uint64_t addr, uint64_t size, uint32_t align) {
+    if (addr == 0) {
+        report_ub(ctx, "null pointer dereference");
+        return (uint8_t*)&ctx->dummy_buf;
+    }
+    if (align > 1 && (addr % align) != 0) {
+        report_ub(ctx, "misaligned pointer access");
+        return (uint8_t*)&ctx->dummy_buf;
+    }
+    InterpAlloc *found = NULL;
+    for (size_t i = 0; i < ctx->alloc_count; i++) {
+        if (addr >= ctx->allocs[i].base_addr && addr < ctx->allocs[i].base_addr + ctx->allocs[i].size + 16) {
+            found = &ctx->allocs[i];
+            break;
+        }
+    }
+    if (!found) {
+        for (size_t i = 0; i < ctx->alloc_count; i++) {
+            if (addr >= ctx->allocs[i].base_addr && addr <= ctx->allocs[i].base_addr + ctx->allocs[i].size) {
+                found = &ctx->allocs[i];
+                break;
+            }
+        }
+    }
+    if (!found) {
+        report_ub(ctx, "pointer access to unmapped memory");
+        return (uint8_t*)&ctx->dummy_buf;
+    }
+    if (!found->is_live) {
+        report_ub(ctx, "use of dangling pointer (use-after-free)");
+        return (uint8_t*)&ctx->dummy_buf;
+    }
+    if (addr + size > found->base_addr + found->size) {
+        report_ub(ctx, "out-of-bounds pointer access");
+        return (uint8_t*)&ctx->dummy_buf;
+    }
+    return found->host_ptr + (addr - found->base_addr);
+}
+
+static void validate_ptr_arith(InterpCtx *ctx, uint64_t orig_addr, uint64_t new_addr) {
+    if (orig_addr == 0 && new_addr == 0) return;
+    InterpAlloc *found = NULL;
+    for (size_t i = 0; i < ctx->alloc_count; i++) {
+        if (ctx->allocs[i].is_live &&
+            orig_addr >= ctx->allocs[i].base_addr &&
+            orig_addr <= ctx->allocs[i].base_addr + ctx->allocs[i].size) {
+            found = &ctx->allocs[i];
+            break;
+        }
+    }
+    if (!found) {
+        report_ub(ctx, "pointer arithmetic on pointer outside live allocation");
+        return;
+    }
+    if (new_addr < found->base_addr || new_addr > found->base_addr + found->size) {
+        report_ub(ctx, "pointer arithmetic out of allocation bounds");
+        return;
+    }
+}
+
+static uint64_t find_synth_addr(InterpCtx *ctx, uint8_t *host_ptr) {
+    if (!host_ptr) return 0;
+    for (size_t i = 0; i < ctx->alloc_count; i++) {
+        if (ctx->allocs[i].is_live &&
+            host_ptr >= ctx->allocs[i].host_ptr &&
+            host_ptr < ctx->allocs[i].host_ptr + ctx->allocs[i].size) {
+            uint64_t off = (uint64_t)(host_ptr - ctx->allocs[i].host_ptr);
+            return ctx->allocs[i].base_addr + off;
+        }
+    }
+    for (size_t i = 0; i < ctx->alloc_count; i++) {
+        if (ctx->allocs[i].is_live &&
+            host_ptr == ctx->allocs[i].host_ptr + ctx->allocs[i].size) {
+            return ctx->allocs[i].base_addr + ctx->allocs[i].size;
+        }
+    }
+    return 0;
+}
 
 static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace *place, TypeId *out_ty, uint64_t *out_fat_len) {
     if (place->local.v >= frame->body->local_count) {
@@ -148,13 +299,22 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
                     fat_len = *(uint64_t*)(ptr + 8);
                 }
                 current_ty = ty->view.pointee;
+                ptr = (uint8_t*)(*(uintptr_t*)ptr);
             } else if (ty->kind == AX_TY_STR) {
                 fat_len = *(uint64_t*)(ptr + 8);
                 current_ty = ctx->thir->interner.t_u8;
+                ptr = (uint8_t*)(*(uintptr_t*)ptr);
+            } else if (ty->kind == AX_TY_PTR) {
+                uint64_t addr = *(uint64_t*)ptr;
+                TypeId pointee_ty = ty->ptr.pointee;
+                uint32_t align = ax_type_align(pointee_ty, &ctx->thir->interner);
+                uint32_t size = ax_type_size(pointee_ty, &ctx->thir->interner);
+                ptr = validate_raw_ptr(ctx, addr, size, align);
+                current_ty = pointee_ty;
             } else {
                 current_ty = ty->ptr.pointee;
+                ptr = (uint8_t*)(*(uintptr_t*)ptr);
             }
-            ptr = (uint8_t*)(*(uintptr_t*)ptr);
         } else if (proj->kind == AX_MIR_PROJ_DOWNCAST) {
             current_variant = proj->variant_idx;
         } else if (proj->kind == AX_MIR_PROJ_FIELD) {
@@ -468,6 +628,14 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
         }
     }
     
+    size_t alloc_start = ctx->alloc_count;
+    for (size_t i = 0; i < body->local_count; i++) {
+        uint32_t sz = ax_type_size(body->locals[i].ty, &ctx->thir->interner);
+        uint32_t al = ax_type_align(body->locals[i].ty, &ctx->thir->interner);
+        if (sz == 0) sz = sizeof(AxInterpValue);
+        register_alloc(ctx, (uint8_t*)&frame.locals[i], sz, al, ctx->call_depth);
+    }
+    
     AxMirBbId current_bb = {0};
     
     while (!ctx->failed) {
@@ -610,7 +778,13 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         uint64_t src_fat_len = 0;
                         uint8_t *src = get_place_ptr(ctx, &frame, &stmt->assign.rvalue.ref.place, &src_ty, &src_fat_len);
                         const AxType *t = ax_type_get(&ctx->thir->interner, dest_ty);
-                        if ((t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&ctx->thir->interner, t->view.pointee)->kind == AX_TY_SLICE) {
+                        if (t && t->kind == AX_TY_PTR) {
+                            uint64_t synth = find_synth_addr(ctx, src);
+                            if (synth == 0 && src != NULL) {
+                                synth = (uint64_t)(uintptr_t)src;
+                            }
+                            *(uint64_t*)dest = synth;
+                        } else if ((t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) && ax_type_get(&ctx->thir->interner, t->view.pointee)->kind == AX_TY_SLICE) {
                             *(uint8_t**)dest = src;
                             const AxType *s_t = ax_type_get(&ctx->thir->interner, src_ty);
                             uint64_t len = 0;
@@ -680,7 +854,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         bool is_signed = true;
                         int bits = 32;
                         if (t) {
-                            switch (t->kind) {
+                            switch ((int)t->kind) {
                                 case AX_TY_I8: is_signed = true; bits = 8; break;
                                 case AX_TY_I16: is_signed = true; bits = 16; break;
                                 case AX_TY_I32: is_signed = true; bits = 32; break;
@@ -692,6 +866,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                                 case AX_TY_U64: is_signed = false; bits = 64; break;
                                 case AX_TY_USIZE: is_signed = false; bits = 64; break;
                                 case AX_TY_BOOL: is_signed = false; bits = 1; break;
+                                case AX_TY_PTR: is_signed = false; bits = 64; break;
                                 default: break;
                             }
                         }
@@ -798,8 +973,40 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                     
                             uint64_t r = 0;
                             switch (op) {
-                                case AX_MIR_BINOP_ADD: overflow = __builtin_add_overflow(a, b, &r); break;
-                                case AX_MIR_BINOP_SUB: overflow = __builtin_sub_overflow(a, b, &r); break;
+                                case AX_MIR_BINOP_ADD:
+                                    if (t && t->kind == AX_TY_PTR) {
+                                        uint32_t elem_sz = ax_type_size(t->ptr.pointee, &ctx->thir->interner);
+                                        if (elem_sz == 0) elem_sz = 1;
+                                        r = a + b * elem_sz;
+                                        validate_ptr_arith(ctx, a, r);
+                                        overflow = false;
+                                    } else {
+                                        overflow = __builtin_add_overflow(a, b, &r);
+                                    }
+                                    break;
+                                case AX_MIR_BINOP_SUB:
+                                    if (t && t->kind == AX_TY_PTR) {
+                                        uint32_t elem_sz = ax_type_size(t->ptr.pointee, &ctx->thir->interner);
+                                        if (elem_sz == 0) elem_sz = 1;
+                                        TypeId r_ty = {0};
+                                        if (stmt->assign.rvalue.binary_op.rhs.kind == AX_MIR_OP_CONST) {
+                                            r_ty = stmt->assign.rvalue.binary_op.rhs.constant.ty;
+                                        } else {
+                                            r_ty = frame.body->locals[stmt->assign.rvalue.binary_op.rhs.place.local.v].ty;
+                                        }
+                                        const AxType *rt = r_ty.v ? ax_type_get(&ctx->thir->interner, r_ty) : NULL;
+                                        if (rt && rt->kind == AX_TY_PTR) {
+                                            r = (uint64_t)((int64_t)(a - b) / (int64_t)elem_sz);
+                                            overflow = false;
+                                        } else {
+                                            r = a - b * elem_sz;
+                                            validate_ptr_arith(ctx, a, r);
+                                            overflow = false;
+                                        }
+                                    } else {
+                                        overflow = __builtin_sub_overflow(a, b, &r);
+                                    }
+                                    break;
                                 case AX_MIR_BINOP_MUL: overflow = __builtin_mul_overflow(a, b, &r); break;
                                 case AX_MIR_BINOP_DIV:
                                     if (b == 0) { panic_interp(ctx, "division by zero"); }
@@ -989,6 +1196,22 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         if (dest_bits < 64) {
                             res &= (((uint64_t)1 << dest_bits) - 1);
                         }
+                        if (d_t && d_t->kind == AX_TY_PTR) {
+                            if (res != 0) {
+                                bool found_live = false;
+                                for (size_t i = 0; i < ctx->alloc_count; i++) {
+                                    if (ctx->allocs[i].is_live &&
+                                        res >= ctx->allocs[i].base_addr &&
+                                        res <= ctx->allocs[i].base_addr + ctx->allocs[i].size) {
+                                        found_live = true;
+                                        break;
+                                    }
+                                }
+                                if (!found_live) {
+                                    report_ub(ctx, "usize as ptr: address not in a live allocation");
+                                }
+                            }
+                        }
                         val = res;
                         break;
                     }
@@ -1078,6 +1301,123 @@ skip_write:;
                     current_bb = term->call.target;
                     continue;
                 }
+                if (ft->kind == AX_TY_BUILTIN_NEEDS_DROP) {
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    bool nd = ax_type_needs_drop(elem_ty, ctx->thir, ctx->interner, ctx->hir, NULL);
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *dest = nd ? 1 : 0;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_DROP_IN_PLACE) {
+                    uint64_t addr = eval_operand(ctx, &frame, &term->call.args[0]);
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint32_t sz = ax_type_size(elem_ty, &ctx->thir->interner);
+                    uint32_t al = ax_type_align(elem_ty, &ctx->thir->interner);
+                    uint8_t *host_ptr = validate_raw_ptr(ctx, addr, sz, al);
+                    if (!ctx->failed) {
+                        AxHirItem *drop_fn = find_drop_fn_for_type(ctx, elem_ty);
+                        if (drop_fn) {
+                            AxInterpValue drop_arg = {0};
+                            *(uint8_t**)&drop_arg = host_ptr;
+                            AxInterpValue ret = {0};
+                            eval_call(ctx, drop_fn, &drop_arg, 1, &ret);
+                        }
+                    }
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_PTR_COPY || ft->kind == AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING) {
+                    uint64_t src_addr = eval_operand(ctx, &frame, &term->call.args[0]);
+                    uint64_t dst_addr = eval_operand(ctx, &frame, &term->call.args[1]);
+                    uint64_t count = eval_operand(ctx, &frame, &term->call.args[2]);
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, &ctx->thir->interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    uint64_t bytes = count * elem_sz;
+                    uint8_t *src_host = validate_raw_ptr(ctx, src_addr, bytes, 1);
+                    uint8_t *dst_host = validate_raw_ptr(ctx, dst_addr, bytes, 1);
+                    if (!ctx->failed && bytes > 0) {
+                        if (ft->kind == AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING) {
+                            if (src_addr < dst_addr + bytes && dst_addr < src_addr + bytes) {
+                                report_ub(ctx, "ptr_copy_nonoverlapping with overlapping ranges");
+                            } else {
+                                memcpy(dst_host, src_host, bytes);
+                            }
+                        } else {
+                            memmove(dst_host, src_host, bytes);
+                        }
+                    }
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_PTR_WRITE_BYTES) {
+                    uint64_t dst_addr = eval_operand(ctx, &frame, &term->call.args[0]);
+                    uint8_t byte_val = (uint8_t)eval_operand(ctx, &frame, &term->call.args[1]);
+                    uint64_t count = eval_operand(ctx, &frame, &term->call.args[2]);
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, &ctx->thir->interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    uint64_t bytes = count * elem_sz;
+                    uint8_t *dst_host = validate_raw_ptr(ctx, dst_addr, bytes, 1);
+                    if (!ctx->failed && bytes > 0) {
+                        memset(dst_host, byte_val, bytes);
+                    }
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_PTR_ADD || ft->kind == AX_TY_BUILTIN_PTR_SUB) {
+                    uint64_t p_addr = eval_operand(ctx, &frame, &term->call.args[0]);
+                    uint64_t count = eval_operand(ctx, &frame, &term->call.args[1]);
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, &ctx->thir->interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    uint64_t new_addr = (ft->kind == AX_TY_BUILTIN_PTR_ADD) ? (p_addr + count * elem_sz) : (p_addr - count * elem_sz);
+                    validate_ptr_arith(ctx, p_addr, new_addr);
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *(uint64_t*)dest = new_addr;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_SIZE_OF) {
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint64_t sz = ax_type_size(elem_ty, &ctx->thir->interner);
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *(uint64_t*)dest = sz;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_ALIGN_OF) {
+                    TypeId elem_ty = { (uint32_t)term->call.func.constant.val };
+                    uint64_t al = ax_type_align(elem_ty, &ctx->thir->interner);
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *(uint64_t*)dest = al;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_NULL || ft->kind == AX_TY_BUILTIN_NULL_MUT) {
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *(uint64_t*)dest = 0;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_IS_NULL) {
+                    uint64_t p_addr = eval_operand(ctx, &frame, &term->call.args[0]);
+                    TypeId dest_ty;
+                    uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+                    if (dest) *dest = (p_addr == 0) ? 1 : 0;
+                    current_bb = term->call.target;
+                    continue;
+                }
+                if (ft->kind == AX_TY_BUILTIN_FORGET) {
+                    current_bb = term->call.target;
+                    continue;
+                }
             }
             uint64_t func_val = eval_operand(ctx, &frame, &term->call.func);
             AxHirItem *callee = find_func_by_symbol(ctx, func_val);
@@ -1134,6 +1474,12 @@ skip_write:;
         }
     }
     
+    for (size_t a = alloc_start; a < ctx->alloc_count; a++) {
+        if (ctx->allocs[a].call_depth == ctx->call_depth) {
+            ctx->allocs[a].is_live = false;
+            ctx->allocs[a].host_ptr = NULL;
+        }
+    }
     if (out_ret) *out_ret = frame.locals[0];
     free(frame.locals);
     ctx->call_depth--;
@@ -1153,11 +1499,13 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     ctx.mir_map = mir_map;
     ctx.out_panic_msg = out_panic_msg;
     ctx.out = out;
+    ctx.next_synth_addr = 0x10000000;
     ax_arena_init(&ctx.arena, 0);
     
     AxInterpValue ret = {0};
     eval_call(&ctx, main_fn, NULL, 0, &ret);
     
+    if (ctx.allocs) free(ctx.allocs);
     ax_arena_destroy(&ctx.arena);
     
     if (ctx.failed) {

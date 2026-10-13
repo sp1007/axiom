@@ -333,6 +333,7 @@ static void stage_hir(AxDriverState *st) {
 
 #include "mir/build/build.h"
 #include "verify/verify.h"
+#include "own/unsafe/unsafe.h"
 #include "kernel/hashmap.h"
 
 typedef AxMirBody *AxMirBodyPtr;
@@ -367,6 +368,9 @@ static void stage_typeck(AxDriverState *st) {
     extern void ax_traits_check_overlap(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in);
     ax_traits_check_overlap(&st->hir, &st->sink, &st->interner);
     st->thir = ax_typeck(&st->hir, &st->sink, &st->interner, &st->db);
+    if (st->sink.errors > 0) return;
+
+    ax_unsafe_check(&st->hir, &st->thir, &st->sink, &st->interner);
     if (st->sink.errors > 0) return;
     
     // Build and verify MIR

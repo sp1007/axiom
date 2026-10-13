@@ -4,7 +4,12 @@
 #include <string.h>
 #include <stdlib.h>
 
+bool ax_type_needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db);
 static bool needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
+    return ax_type_needs_drop(ty, thir, interner, hir, db);
+}
+
+bool ax_type_needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
     if (TypeId_is_none(ty) || ty.v == 0) return false;
     const AxType *t = ax_type_get(&thir->interner, ty);
     if (!t) return false;
@@ -21,18 +26,28 @@ static bool needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interne
     if (t->kind == AX_TY_STRUCT) {
         if (t->strct.def->struct_decl.struct_fields == NULL) return true;
         
-        if (hir && db) {
+        if (hir) {
             StrView target_sname = ax_interner_get((StrInterner*)interner, t->strct.def->struct_decl.name);
             for (AxHirItem *it = (AxHirItem*)hir->items; it; it = it->next) {
                 if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                    StrView trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
+                    StrView trait_sname = {0};
+                    if (db) {
+                        trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
+                    } else if (it->impl.trait_path->path.path.name.v != 0) {
+                        trait_sname = ax_interner_get((StrInterner*)interner, it->impl.trait_path->path.path.name);
+                    }
                     if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
-                        StrView impl_sname = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
-                        size_t less_idx = 0;
-                        while (less_idx < impl_sname.len && impl_sname.ptr[less_idx] != '<') {
-                            less_idx++;
+                        StrView impl_sname = {0};
+                        if (db) {
+                            impl_sname = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
+                            size_t less_idx = 0;
+                            while (less_idx < impl_sname.len && impl_sname.ptr[less_idx] != '<') {
+                                less_idx++;
+                            }
+                            impl_sname.len = less_idx;
+                        } else if (it->impl.self_type->path.path.name.v != 0) {
+                            impl_sname = ax_interner_get((StrInterner*)interner, it->impl.self_type->path.path.name);
                         }
-                        impl_sname.len = less_idx;
                         if (ax_sv_eq(target_sname, impl_sname)) {
                             for (AxHirItem *m = it->impl.members; m; m = m->next) {
                                 if (m->kind == AX_HIR_ITEM_FN) {

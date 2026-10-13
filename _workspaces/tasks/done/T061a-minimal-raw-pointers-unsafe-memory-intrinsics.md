@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T051, T054b]
 priority: 80
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src/types, bootstrap/axiom0/src/own/unsafe, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/interp, tests/run/ptr, tests/ui/ptr]
 locks: [bootstrap/axiom0/src/diag/codes/UNSAFE.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0003, 0009, tasks/0260, 0263, spec/SPEC-04-core-extensibility.md, spec/SPEC-00-bootstrap.md]
+finished: 2026-10-13 12:52:05
 ---
 # T061a — Minimal raw pointers, unsafe blocks and memory intrinsics
 
@@ -60,3 +61,6 @@ E13.1 and volatile/MMIO/packed layout in E13.2 (after self-hosting, ROADMAP R7).
 - Critical for T065/T070: std blocks without it. Keep the checker simple and precise.
 - Split (ADR-0005 §8): this task is the type/checker/oracle half; T061b is the native half; T061c the host interface (ADR-0002); T061d native constant tables.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 12:52:05 accepted by QA -> done

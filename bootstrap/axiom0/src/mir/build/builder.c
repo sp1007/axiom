@@ -1461,6 +1461,39 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
             default: break;
         }
 
+        TypeId lty = get_expr_type(b, expr->binary.left);
+        TypeId rty = get_expr_type(b, expr->binary.right);
+        const AxType *lt = (lty.v != 0) ? ax_type_get(&b->thir->interner, lty) : NULL;
+        const AxType *rt = (rty.v != 0) ? ax_type_get(&b->thir->interner, rty) : NULL;
+        if (lt && lt->kind == AX_TY_PTR && (expr->binary.op == AX_BINOP_ADD || expr->binary.op == AX_BINOP_SUB) && (!rt || rt->kind != AX_TY_PTR)) {
+            AxMirOperand callee = {0};
+            callee.kind = AX_MIR_OP_CONST;
+            callee.constant.kind = AX_MIR_CONST_INT;
+            callee.constant.val = lt->ptr.pointee.v;
+            AxType ct = {0};
+            ct.kind = (expr->binary.op == AX_BINOP_ADD) ? AX_TY_BUILTIN_PTR_ADD : AX_TY_BUILTIN_PTR_SUB;
+            callee.constant.ty = ax_intern_type((TypeInterner*)&b->thir->interner, &ct);
+
+            AxMirOperand *args = ax_arena_alloc(b->arena, sizeof(AxMirOperand) * 2, _Alignof(AxMirOperand));
+            args[0] = lhs;
+            args[1] = rhs;
+
+            AxMirTerminator term = {0};
+            term.kind = AX_MIR_TERM_CALL;
+            term.call.func = callee;
+            term.call.args = args;
+            term.call.arg_count = 2;
+            term.call.destination = dest;
+            AxMirBbId next_bb = add_bb(b);
+            term.call.target = next_bb;
+            set_terminator(b, b->current_bb, term);
+            b->current_bb = next_bb;
+            return;
+        }
+        if ((lt && lt->kind == AX_TY_PTR) || (rt && rt->kind == AX_TY_PTR)) {
+            is_checked = false;
+        }
+
         if (is_checked) {
             if (binop == AX_MIR_BINOP_DIV || binop == AX_MIR_BINOP_REM) {
                 AxMirLocalId cond_not_zero = add_local(b, AX_MIR_LOCAL_TEMP, b->thir->interner.t_bool, false);
@@ -1793,6 +1826,8 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         b->current_bb = bb_then;
     } else if (expr->kind == AX_HIR_EXPR_BLOCK) {
         build_block_into(b, &expr->block.block, dest);
+    } else if (expr->kind == AX_HIR_EXPR_UNSAFE) {
+        build_block_into(b, &expr->unsafe_block.block, dest);
     } else if (expr->kind == AX_HIR_EXPR_IF) {
         AxMirOperand cond = build_expr_as_operand(b, expr->if_expr.cond);
         AxMirBbId bb_then = add_bb(b);
@@ -2021,8 +2056,113 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 push_stmt(b, b->current_bb, stmt);
                 return;
             }
+            const AxType *callee_t = !TypeId_is_none(callee_ty) ? ax_type_get(&b->thir->interner, callee_ty) : NULL;
+            if (callee_t && (callee_t->kind == AX_TY_BUILTIN_ADDRESS_OF || callee_t->kind == AX_TY_BUILTIN_ADDRESS_OF_MUT)) {
+                AxMirPlace p = build_place(b, expr->call.args);
+                TypeId ptr_ty = get_expr_type(b, expr);
+                AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, ptr_ty, false);
+                AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+
+                AxMirStmt ref_stmt = {0};
+                ref_stmt.kind = AX_MIR_STMT_ASSIGN;
+                ref_stmt.location = expr->span;
+                ref_stmt.assign.place = temp_place;
+                ref_stmt.assign.rvalue.kind = AX_MIR_RVALUE_REF;
+                ref_stmt.assign.rvalue.ref.bk = (callee_t->kind == AX_TY_BUILTIN_ADDRESS_OF_MUT) ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
+                ref_stmt.assign.rvalue.ref.place = p;
+                push_stmt(b, b->current_bb, ref_stmt);
+
+                AxMirStmt cast_stmt = {0};
+                cast_stmt.kind = AX_MIR_STMT_ASSIGN;
+                cast_stmt.location = expr->span;
+                cast_stmt.assign.place = dest;
+                cast_stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
+                cast_stmt.assign.rvalue.cast.kind = AX_MIR_CAST_PTR_TO_PTR;
+                cast_stmt.assign.rvalue.cast.ty = ptr_ty;
+                cast_stmt.assign.rvalue.cast.op.kind = AX_MIR_OP_COPY;
+                cast_stmt.assign.rvalue.cast.op.place = temp_place;
+                push_stmt(b, b->current_bb, cast_stmt);
+                return;
+            }
+            if (callee_t && (callee_t->kind == AX_TY_BUILTIN_SIZE_OF ||
+                             callee_t->kind == AX_TY_BUILTIN_ALIGN_OF ||
+                             callee_t->kind == AX_TY_BUILTIN_NULL ||
+                             callee_t->kind == AX_TY_BUILTIN_NULL_MUT)) {
+                AxGenericArgs *substs = AxExprSubstMap_get(&b->thir->expr_substs, expr->call.callee);
+                TypeId T = (substs && substs->count > 0) ? substs->args[0] : (TypeId){0};
+                uint64_t val = 0;
+                TypeId res_ty = b->thir->interner.t_usize;
+                if (callee_t->kind == AX_TY_BUILTIN_SIZE_OF) {
+                    val = ax_type_size(T, &b->thir->interner);
+                } else if (callee_t->kind == AX_TY_BUILTIN_ALIGN_OF) {
+                    val = ax_type_align(T, &b->thir->interner);
+                } else {
+                    res_ty = get_expr_type(b, expr);
+                    val = 0;
+                }
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.location = expr->span;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                stmt.assign.rvalue.use.kind = AX_MIR_OP_CONST;
+                stmt.assign.rvalue.use.constant.kind = AX_MIR_CONST_INT;
+                stmt.assign.rvalue.use.constant.ty = res_ty;
+                stmt.assign.rvalue.use.constant.val = val;
+                push_stmt(b, b->current_bb, stmt);
+                return;
+            }
+            if (callee_t && callee_t->kind == AX_TY_BUILTIN_IS_NULL) {
+                AxMirOperand arg = build_expr_as_operand(b, expr->call.args);
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.location = expr->span;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_BINARY_OP;
+                stmt.assign.rvalue.binary_op.op = AX_MIR_BINOP_EQ;
+                stmt.assign.rvalue.binary_op.lhs = arg;
+                stmt.assign.rvalue.binary_op.rhs.kind = AX_MIR_OP_CONST;
+                stmt.assign.rvalue.binary_op.rhs.constant.kind = AX_MIR_CONST_INT;
+                stmt.assign.rvalue.binary_op.rhs.constant.ty = get_expr_type(b, expr->call.args);
+                stmt.assign.rvalue.binary_op.rhs.constant.val = 0;
+                push_stmt(b, b->current_bb, stmt);
+                return;
+            }
+            if (callee_t && callee_t->kind == AX_TY_BUILTIN_FORGET) {
+                build_expr_as_operand(b, expr->call.args);
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+                stmt.assign.rvalue.aggregate.operands = NULL;
+                stmt.assign.rvalue.aggregate.operand_count = 0;
+                push_stmt(b, b->current_bb, stmt);
+                return;
+            }
         }
         AxMirOperand callee = build_expr_as_operand(b, expr->call.callee);
+        if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
+            TypeId cty = get_expr_type(b, expr->call.callee);
+            const AxType *c_t = !TypeId_is_none(cty) ? ax_type_get(&b->thir->interner, cty) : NULL;
+            if (c_t && (c_t->kind == AX_TY_BUILTIN_NEEDS_DROP ||
+                        c_t->kind == AX_TY_BUILTIN_DROP_IN_PLACE ||
+                        c_t->kind == AX_TY_BUILTIN_PTR_COPY ||
+                        c_t->kind == AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING ||
+                        c_t->kind == AX_TY_BUILTIN_PTR_WRITE_BYTES ||
+                        c_t->kind == AX_TY_BUILTIN_PTR_ADD ||
+                        c_t->kind == AX_TY_BUILTIN_PTR_SUB)) {
+                AxGenericArgs *substs = AxExprSubstMap_get(&b->thir->expr_substs, expr->call.callee);
+                TypeId T = (substs && substs->count > 0) ? substs->args[0] : (TypeId){0};
+                if (T.v == 0 && expr->call.args) {
+                    TypeId a0_ty = get_expr_type(b, expr->call.args);
+                    const AxType *at0 = ax_type_get(&b->thir->interner, a0_ty);
+                    if (at0 && at0->kind == AX_TY_PTR) {
+                        T = at0->ptr.pointee;
+                    }
+                }
+                callee.constant.val = T.v;
+            }
+        }
         
         size_t arg_count = 0;
         for (const AxHirExpr *arg = expr->call.args; arg; arg = arg->next) arg_count++;
@@ -2201,11 +2341,24 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
             b->current_bb = assert_valid.assert.target;
         }
 
+        AxMirCastKind ckind = AX_MIR_CAST_INT_TO_INT;
+        const AxType *st = (src_ty.v != 0) ? ax_type_get(&b->thir->interner, src_ty) : NULL;
+        const AxType *dt = (dest_ty.v != 0) ? ax_type_get(&b->thir->interner, dest_ty) : NULL;
+        if (st && dt) {
+            if (st->kind == AX_TY_PTR && dt->kind == AX_TY_PTR) {
+                ckind = AX_MIR_CAST_PTR_TO_PTR;
+            } else if (st->kind == AX_TY_PTR && dt->kind != AX_TY_PTR) {
+                ckind = AX_MIR_CAST_PTR_TO_INT;
+            } else if (st->kind != AX_TY_PTR && dt->kind == AX_TY_PTR) {
+                ckind = AX_MIR_CAST_INT_TO_PTR;
+            }
+        }
+
         AxMirStmt stmt = {0};
         stmt.kind = AX_MIR_STMT_ASSIGN;
         stmt.assign.place = dest;
         stmt.assign.rvalue.kind = AX_MIR_RVALUE_CAST;
-        stmt.assign.rvalue.cast.kind = AX_MIR_CAST_INT_TO_INT;
+        stmt.assign.rvalue.cast.kind = ckind;
         stmt.assign.rvalue.cast.op = op;
         stmt.assign.rvalue.cast.ty = dest_ty;
         push_stmt(b, b->current_bb, stmt);
