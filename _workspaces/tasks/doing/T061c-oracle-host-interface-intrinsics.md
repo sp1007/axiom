@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T061b, T060]
 priority: 82
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types, bootstrap/axiom0/src/lir, std/core/host.ax, tests/run/host]
 locks: [bootstrap/axiom0/src/diag/codes/IO.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0025, 0031, 0169, 0170, 0219, spec/decisions/ADR-0002-oracle-host-interface.md, spec/SPEC-04-core-extensibility.md]
 covers: []
+started: 2026-10-13 15:04:32
 ---
 # T061c — Host-interface intrinsics: oracle implementation + native call lowering
 
@@ -42,3 +43,6 @@ Let the MIR interpreter run programs that use the heap and the OS, so std (P9) a
 - axiomc's interpreter port implements the same intrinsics by calling std directly (ADR-0002 §6).
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 15:04:32 started (attempt 1) 
