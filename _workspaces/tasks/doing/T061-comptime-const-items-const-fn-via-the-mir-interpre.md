@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T059]
 priority: 81
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [bootstrap/axiom0/src/interp, bootstrap/axiom0/src/types/const, bootstrap/axiom0/src/mir, tests/run/comptime, tests/ui/comptime]
 locks: [bootstrap/axiom0/src/diag/codes/CONST.def, bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0102, 0140, tasks/0274, tasks/0509, tasks/0346]
+started: 2026-10-13 13:26:45
 ---
 # T061 — Const items and constant expressions
 
@@ -37,3 +38,6 @@ Compile-time evaluation reusing the oracle (no separate mini-language).
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 13:26:45 started (attempt 1) 
