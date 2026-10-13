@@ -8,10 +8,11 @@ model: sonnet
 gate_model: sonnet
 depends: [T070, T073]
 priority: 105
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/core/arena, std/collections/idtable, tests/std/arena]
 spec: [tasks/0260, 0263, 0172, 0106, 0036, spec/SPEC-00-bootstrap.md]
+started: 2026-10-13 22:38:26
 ---
 # T073a — Arenas and typed ID tables
 
@@ -41,3 +42,6 @@ AKERNEL-24).
 - Arena-escape rule: SPEC-11 stored-view rule (T045). Interner hashing comes from T073/T069, so this task depends on T073 (audit A1-03, A3-10).
 - Moved from E21.9 into the core because the Axiom compiler cannot be ported without it.
 - All Axiom code uses canonical syntax (axiom-syntax).
+
+## Log
+- 2026-10-13 22:38:26 started (attempt 1) 

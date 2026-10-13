@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T071]
 priority: 102
-status: doing
+status: done
 attempts: 1
 paths: [std/text/fmt, std/bytes, tests/std/fmt, tests/std/bytes]
 spec: [0089, tasks/0332, 0045, tasks/0304]
 covers: []
 started: 2026-10-13 21:10:34
+finished: 2026-10-13 23:32:42
 ---
 # T071b — ByteBuf, integer formatting and parsing, format helpers
 
@@ -42,3 +43,4 @@ The byte-level and number-formatting half of the self-host std subset (split fro
 
 ## Log
 - 2026-10-13 21:10:34 started (attempt 1) 
+- 2026-10-13 23:32:42 accepted by QA -> done
