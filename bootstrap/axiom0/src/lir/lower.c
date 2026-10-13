@@ -23,6 +23,7 @@ typedef struct LirBuilder {
     
     AxLirBb *bbs;
     size_t bb_count;
+    size_t bb_cap;
     
     AxLirInst *cur_insts;
     size_t cur_inst_count;
@@ -75,6 +76,112 @@ static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *
     char *name = malloc(64);
     snprintf(name, 64, "__ax_fn_%u", sym_v);
     return name;
+}
+
+static size_t add_lir_bb(LirBuilder *b) {
+    if (b->bb_count == b->bb_cap) {
+        b->bb_cap = b->bb_cap == 0 ? 16 : b->bb_cap * 2;
+        b->bbs = realloc(b->bbs, b->bb_cap * sizeof(AxLirBb));
+    }
+    size_t new_idx = b->bb_count++;
+    memset(&b->bbs[new_idx], 0, sizeof(AxLirBb));
+    return new_idx;
+}
+
+static void finish_bb(LirBuilder *b, size_t bb_idx, AxLirTerminator term) {
+    b->bbs[bb_idx].inst_count = b->cur_inst_count;
+    if (b->cur_inst_count > 0) {
+        b->bbs[bb_idx].insts = ax_arena_alloc(b->arena, b->cur_inst_count * sizeof(AxLirInst), _Alignof(AxLirInst));
+        memcpy(b->bbs[bb_idx].insts, b->cur_insts, b->cur_inst_count * sizeof(AxLirInst));
+    } else {
+        b->bbs[bb_idx].insts = NULL;
+    }
+    b->bbs[bb_idx].terminator = term;
+    b->cur_inst_count = 0;
+}
+
+static bool lir_type_needs_drop(const LirBuilder *b, TypeId ty_id) {
+    if (TypeId_is_none(ty_id) || ty_id.v == 0) return false;
+    const AxType *t = ax_type_get(b->interner, ty_id);
+    if (!t) return false;
+
+    if (t->kind == AX_TY_STRUCT) {
+        if (t->strct.def && t->strct.def->struct_decl.struct_fields == NULL) return true;
+        if (b->hir && t->strct.def && t->strct.def->struct_decl.name.v != 0 && b->str_in) {
+            StrView target_sname = ax_interner_get(b->str_in, t->strct.def->struct_decl.name);
+            for (const struct AxHirItem *it = b->hir->items; it; it = it->next) {
+                if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+                    StrView trait_sname = {0};
+                    if (it->impl.trait_path->path.path.name.v != 0) {
+                        trait_sname = ax_interner_get(b->str_in, it->impl.trait_path->path.path.name);
+                    }
+                    if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
+                        StrView impl_sname = {0};
+                        if (it->impl.self_type->path.path.name.v != 0) {
+                            impl_sname = ax_interner_get(b->str_in, it->impl.self_type->path.path.name);
+                        }
+                        if (ax_sv_eq(target_sname, impl_sname)) {
+                            for (const struct AxHirItem *m = it->impl.members; m; m = m->next) {
+                                if (m->kind == AX_HIR_ITEM_FN) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for (size_t i = 0; i < t->strct.field_count; i++) {
+            if (lir_type_needs_drop(b, t->strct.fields[i])) return true;
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_TUPLE) {
+        for (size_t i = 0; i < t->tuple.field_count; i++) {
+            if (lir_type_needs_drop(b, t->tuple.fields[i])) return true;
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_ARRAY) {
+        return lir_type_needs_drop(b, t->array.elem);
+    }
+    return false;
+}
+
+static const char *find_drop_fn_sym_name(const struct AxHir *hir, struct StrInterner *str_in, TypeId ty_id, const TypeInterner *interner) {
+    if (TypeId_is_none(ty_id) || ty_id.v == 0) return NULL;
+    const AxType *ty = ax_type_get(interner, ty_id);
+    if (!ty || ty->kind != AX_TY_STRUCT) return NULL;
+    StrView target_sname = ax_interner_get(str_in, ty->strct.def->struct_decl.name);
+    for (const struct AxHirItem *it = hir ? hir->items : NULL; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+            StrView trait_sname = {0};
+            if (it->impl.trait_path->path.path.name.v != 0) {
+                trait_sname = ax_interner_get(str_in, it->impl.trait_path->path.path.name);
+            }
+            if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
+                StrView impl_sname = {0};
+                if (it->impl.self_type->path.path.name.v != 0) {
+                    impl_sname = ax_interner_get(str_in, it->impl.self_type->path.path.name);
+                }
+                if (ax_sv_eq(target_sname, impl_sname)) {
+                    for (const struct AxHirItem *m = it->impl.members; m; m = m->next) {
+                        if (m->kind == AX_HIR_ITEM_FN) {
+                            if (m->fn.name.v != 0) {
+                                StrView sv = ax_interner_get(str_in, m->fn.name);
+                                char *name = malloc(sv.len + 1);
+                                memcpy(name, sv.ptr, sv.len);
+                                name[sv.len] = '\0';
+                                return name;
+                            }
+                            return get_fn_sym_name(hir, str_in, m->fn.symbol.v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
 }
 
 
@@ -344,13 +451,13 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             AxLirInstKind kind = 0;
             TypeId op_ty = b->interner->t_i32; // fallback
             if (rv->binary_op.lhs.kind == AX_MIR_OP_COPY || rv->binary_op.lhs.kind == AX_MIR_OP_MOVE) {
-                op_ty = b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
+                op_ty = (rv->binary_op.lhs.place.proj_count > 0) ? get_place_type(b, &rv->binary_op.lhs.place) : b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
             } else if (rv->binary_op.lhs.kind == AX_MIR_OP_CONST) {
                 op_ty = rv->binary_op.lhs.constant.ty;
             }
             const AxType *t = ax_type_get(b->interner, op_ty);
             bool is_signed = true;
-            if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
+            if (t && ((t->kind >= AX_TY_U8 && t->kind <= AX_TY_USIZE) || t->kind == AX_TY_BOOL || t->kind == AX_TY_PTR || t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW)) {
                 is_signed = false;
             }
             switch (rv->binary_op.op) {
@@ -371,13 +478,13 @@ static AxLirVRegId lower_rvalue(LirBuilder *b, const AxMirRvalue *rv, TypeId des
             AxLirVRegId rhs = lower_operand(b, &rv->binary_op.rhs);
             TypeId op_ty = b->interner->t_i32;
             if (rv->binary_op.lhs.kind == AX_MIR_OP_COPY || rv->binary_op.lhs.kind == AX_MIR_OP_MOVE) {
-                op_ty = b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
+                op_ty = (rv->binary_op.lhs.place.proj_count > 0) ? get_place_type(b, &rv->binary_op.lhs.place) : b->mir->locals[rv->binary_op.lhs.place.local.v].ty;
             } else if (rv->binary_op.lhs.kind == AX_MIR_OP_CONST) {
                 op_ty = rv->binary_op.lhs.constant.ty;
             }
             const AxType *t = ax_type_get(b->interner, op_ty);
             bool is_signed = true;
-            if (t && (t->kind == 10 || t->kind == 11 || t->kind == 12 || t->kind == 13 || t->kind == 14 || t->kind == 3)) {
+            if (t && ((t->kind >= AX_TY_U8 && t->kind <= AX_TY_USIZE) || t->kind == AX_TY_BOOL || t->kind == AX_TY_PTR || t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW)) {
                 is_signed = false;
             }
             AxLirInstKind kind = lower_binop(rv->binary_op.op, is_signed);
@@ -455,8 +562,9 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
     }
     
     b.interner = interner;
+    b.bb_cap = mir->bb_count + 64;
+    b.bbs = calloc(b.bb_cap, sizeof(AxLirBb));
     b.bb_count = mir->bb_count;
-    b.bbs = ax_arena_alloc(&lir->arena, b.bb_count * sizeof(AxLirBb), _Alignof(AxLirBb));
     
     for (size_t i = 0; i < mir->bb_count; i++) {
         const AxMirBb *mbb = &mir->bbs[i];
@@ -547,10 +655,12 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                             b.vregs[elem_val.v].ty = elem_ty;
                         }
                         
+                        AxLirVRegId off_reg = make_vreg(&b, b.interner->t_usize);
+                        AxLirVRegId elem_addr = make_vreg(&b, b.interner->t_usize);
                         for (uint64_t k = 0; k < count; k++) {
                             uint32_t offset = (uint32_t)(k * stride);
-                            AxLirVRegId off_reg = emit_const(&b, offset, b.interner->t_usize);
-                            AxLirVRegId elem_addr = emit_offset(&b, addr, off_reg);
+                            emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CONST, .dest = off_reg, .constant = { .val = offset, .ty = b.interner->t_usize } });
+                            emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = elem_addr, .binary = { .lhs = addr, .rhs = off_reg } });
                             emit_store(&b, elem_addr, elem_val);
                         }
                     }
@@ -661,6 +771,321 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                     callee_ty = mir->locals[loc.v].ty;
                 }
                 const AxType *cty = callee_ty.v ? ax_type_get(b.interner, callee_ty) : NULL;
+
+                if (cty && (cty->kind == AX_TY_BUILTIN_PTR_ADD || cty->kind == AX_TY_BUILTIN_PTR_SUB)) {
+                    AxLirVRegId p = lower_operand(&b, &mbb->terminator.call.args[0]);
+                    AxLirVRegId count = lower_operand(&b, &mbb->terminator.call.args[1]);
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, b.interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    AxLirVRegId offset;
+                    if (elem_sz == 1) {
+                        offset = count;
+                    } else {
+                        AxLirVRegId sz_reg = emit_const(&b, elem_sz, b.interner->t_usize);
+                        offset = make_vreg(&b, b.interner->t_usize);
+                        emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = offset, .binary = { .lhs = count, .rhs = sz_reg } });
+                    }
+                    AxLirVRegId res = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){
+                        .kind = (cty->kind == AX_TY_BUILTIN_PTR_ADD) ? AX_LIR_INST_ADD : AX_LIR_INST_SUB,
+                        .dest = res,
+                        .binary = { .lhs = p, .rhs = offset }
+                    });
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, res);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_NEEDS_DROP) {
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    bool nd = lir_type_needs_drop(&b, elem_ty);
+                    AxLirVRegId val = emit_const(&b, nd ? 1 : 0, b.interner->t_bool);
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, val);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_DROP_IN_PLACE) {
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    const char *drop_sym = find_drop_fn_sym_name(b.hir, b.str_in, elem_ty, b.interner);
+                    if (drop_sym) {
+                        AxLirVRegId p = lower_operand(&b, &mbb->terminator.call.args[0]);
+                        emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_ARG, .dest = { 0xFFFFFFFF }, .abi_arg = { .index = 0, .val = p } });
+                        TypeId param_ty = b.interner->t_usize;
+                        AxType fn_type = {
+                            .kind = AX_TY_FN,
+                            .fn = {
+                                .param_types = &param_ty,
+                                .param_count = 1,
+                                .ret_type = b.interner->t_unit
+                            }
+                        };
+                        TypeId callee_drop_ty = ax_intern_type(b.interner, &fn_type);
+                        emit_inst(&b, (AxLirInst){
+                            .kind = AX_LIR_INST_CALL,
+                            .dest = {0},
+                            .call = {
+                                .sym_name = drop_sym,
+                                .callee_ty = callee_drop_ty,
+                                .dst_addr = (AxLirVRegId){ 0xFFFFFFFF },
+                                .callee_vreg = (AxLirVRegId){ 0xFFFFFFFF }
+                            }
+                        });
+                    }
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_PTR_WRITE_BYTES) {
+                    AxLirVRegId dst = lower_operand(&b, &mbb->terminator.call.args[0]);
+                    AxLirVRegId val = lower_operand(&b, &mbb->terminator.call.args[1]);
+                    b.vregs[val.v].ty = b.interner->t_u8;
+                    AxLirVRegId count = lower_operand(&b, &mbb->terminator.call.args[2]);
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, b.interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    AxLirVRegId total_bytes;
+                    if (elem_sz == 1) {
+                        total_bytes = count;
+                    } else {
+                        AxLirVRegId sz_reg = emit_const(&b, elem_sz, b.interner->t_usize);
+                        total_bytes = make_vreg(&b, b.interner->t_usize);
+                        emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = total_bytes, .binary = { .lhs = count, .rhs = sz_reg } });
+                    }
+                    AxLirVRegId idx = make_vreg(&b, b.interner->t_usize);
+                    AxLirVRegId zero = emit_const(&b, 0, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = idx, .binary = { .lhs = zero, .rhs = zero } });
+
+                    size_t head_bb = add_lir_bb(&b);
+                    size_t body_bb = add_lir_bb(&b);
+                    size_t target_bb = mbb->terminator.call.target.v;
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)head_bb } });
+
+                    // head_bb
+                    AxLirVRegId cmp = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_ULT, .dest = cmp, .binary = { .lhs = idx, .rhs = total_bytes } });
+                    AxLirSwitchTarget *sw = ax_arena_alloc(b.arena, sizeof(AxLirSwitchTarget), _Alignof(AxLirSwitchTarget));
+                    sw[0].value = 1;
+                    sw[0].target = (AxLirBbId){ (uint32_t)body_bb };
+                    AxLirTerminator head_term = {
+                        .kind = AX_LIR_TERM_SWITCH,
+                        .switch_int = {
+                            .cond = cmp,
+                            .targets = sw,
+                            .count = 1,
+                            .otherwise = (AxLirBbId){ (uint32_t)target_bb }
+                        }
+                    };
+                    finish_bb(&b, head_bb, head_term);
+
+                    // body_bb
+                    AxLirVRegId curr_addr = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = curr_addr, .binary = { .lhs = dst, .rhs = idx } });
+                    emit_store(&b, curr_addr, val);
+                    AxLirVRegId one = emit_const(&b, 1, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = idx, .binary = { .lhs = idx, .rhs = one } });
+                    finish_bb(&b, body_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)head_bb } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING) {
+                    AxLirVRegId src = lower_operand(&b, &mbb->terminator.call.args[0]);
+                    AxLirVRegId dst = lower_operand(&b, &mbb->terminator.call.args[1]);
+                    AxLirVRegId count = lower_operand(&b, &mbb->terminator.call.args[2]);
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, b.interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    AxLirVRegId total_bytes;
+                    if (elem_sz == 1) {
+                        total_bytes = count;
+                    } else {
+                        AxLirVRegId sz_reg = emit_const(&b, elem_sz, b.interner->t_usize);
+                        total_bytes = make_vreg(&b, b.interner->t_usize);
+                        emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = total_bytes, .binary = { .lhs = count, .rhs = sz_reg } });
+                    }
+                    AxLirVRegId idx = make_vreg(&b, b.interner->t_usize);
+                    AxLirVRegId zero = emit_const(&b, 0, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = idx, .binary = { .lhs = zero, .rhs = zero } });
+
+                    size_t head_bb = add_lir_bb(&b);
+                    size_t body_bb = add_lir_bb(&b);
+                    size_t target_bb = mbb->terminator.call.target.v;
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)head_bb } });
+
+                    // head_bb
+                    AxLirVRegId cmp = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_ULT, .dest = cmp, .binary = { .lhs = idx, .rhs = total_bytes } });
+                    AxLirSwitchTarget *sw = ax_arena_alloc(b.arena, sizeof(AxLirSwitchTarget), _Alignof(AxLirSwitchTarget));
+                    sw[0].value = 1;
+                    sw[0].target = (AxLirBbId){ (uint32_t)body_bb };
+                    AxLirTerminator head_term = {
+                        .kind = AX_LIR_TERM_SWITCH,
+                        .switch_int = {
+                            .cond = cmp,
+                            .targets = sw,
+                            .count = 1,
+                            .otherwise = (AxLirBbId){ (uint32_t)target_bb }
+                        }
+                    };
+                    finish_bb(&b, head_bb, head_term);
+
+                    // body_bb
+                    AxLirVRegId src_curr = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = src_curr, .binary = { .lhs = src, .rhs = idx } });
+                    AxLirVRegId byte_val = emit_load(&b, src_curr, b.interner->t_u8);
+                    AxLirVRegId dst_curr = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = dst_curr, .binary = { .lhs = dst, .rhs = idx } });
+                    emit_store(&b, dst_curr, byte_val);
+                    AxLirVRegId one = emit_const(&b, 1, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = idx, .binary = { .lhs = idx, .rhs = one } });
+                    finish_bb(&b, body_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)head_bb } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_PTR_COPY) {
+                    AxLirVRegId src = lower_operand(&b, &mbb->terminator.call.args[0]);
+                    AxLirVRegId dst = lower_operand(&b, &mbb->terminator.call.args[1]);
+                    AxLirVRegId count = lower_operand(&b, &mbb->terminator.call.args[2]);
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t elem_sz = ax_type_size(elem_ty, b.interner);
+                    if (elem_sz == 0) elem_sz = 1;
+                    AxLirVRegId total_bytes;
+                    if (elem_sz == 1) {
+                        total_bytes = count;
+                    } else {
+                        AxLirVRegId sz_reg = emit_const(&b, elem_sz, b.interner->t_usize);
+                        total_bytes = make_vreg(&b, b.interner->t_usize);
+                        emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_MUL, .dest = total_bytes, .binary = { .lhs = count, .rhs = sz_reg } });
+                    }
+                    AxLirVRegId is_bwd = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_ULT, .dest = is_bwd, .binary = { .lhs = src, .rhs = dst } });
+
+                    size_t bwd_setup_bb = add_lir_bb(&b);
+                    size_t bwd_head_bb = add_lir_bb(&b);
+                    size_t bwd_body_bb = add_lir_bb(&b);
+                    size_t fwd_setup_bb = add_lir_bb(&b);
+                    size_t fwd_head_bb = add_lir_bb(&b);
+                    size_t fwd_body_bb = add_lir_bb(&b);
+                    size_t target_bb = mbb->terminator.call.target.v;
+
+                    AxLirSwitchTarget *sw_dir = ax_arena_alloc(b.arena, sizeof(AxLirSwitchTarget), _Alignof(AxLirSwitchTarget));
+                    sw_dir[0].value = 1;
+                    sw_dir[0].target = (AxLirBbId){ (uint32_t)bwd_setup_bb };
+                    finish_bb(&b, i, (AxLirTerminator){
+                        .kind = AX_LIR_TERM_SWITCH,
+                        .switch_int = {
+                            .cond = is_bwd,
+                            .targets = sw_dir,
+                            .count = 1,
+                            .otherwise = (AxLirBbId){ (uint32_t)fwd_setup_bb }
+                        }
+                    });
+
+                    // bwd_setup_bb: bwd_idx = total_bytes
+                    AxLirVRegId bwd_idx = make_vreg(&b, b.interner->t_usize);
+                    AxLirVRegId zero_b = emit_const(&b, 0, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = bwd_idx, .binary = { .lhs = total_bytes, .rhs = zero_b } });
+                    finish_bb(&b, bwd_setup_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)bwd_head_bb } });
+
+                    // bwd_head_bb: bwd_idx > 0
+                    AxLirVRegId cmp_zero = emit_const(&b, 0, b.interner->t_usize);
+                    AxLirVRegId bwd_cmp = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_UGT, .dest = bwd_cmp, .binary = { .lhs = bwd_idx, .rhs = cmp_zero } });
+                    AxLirSwitchTarget *sw_bwd = ax_arena_alloc(b.arena, sizeof(AxLirSwitchTarget), _Alignof(AxLirSwitchTarget));
+                    sw_bwd[0].value = 1;
+                    sw_bwd[0].target = (AxLirBbId){ (uint32_t)bwd_body_bb };
+                    finish_bb(&b, bwd_head_bb, (AxLirTerminator){
+                        .kind = AX_LIR_TERM_SWITCH,
+                        .switch_int = {
+                            .cond = bwd_cmp,
+                            .targets = sw_bwd,
+                            .count = 1,
+                            .otherwise = (AxLirBbId){ (uint32_t)target_bb }
+                        }
+                    });
+
+                    // bwd_body_bb: bwd_idx = bwd_idx - 1; copy at bwd_idx
+                    AxLirVRegId one_b = emit_const(&b, 1, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_SUB, .dest = bwd_idx, .binary = { .lhs = bwd_idx, .rhs = one_b } });
+                    AxLirVRegId s_addr_b = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = s_addr_b, .binary = { .lhs = src, .rhs = bwd_idx } });
+                    AxLirVRegId b_val_b = emit_load(&b, s_addr_b, b.interner->t_u8);
+                    AxLirVRegId d_addr_b = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = d_addr_b, .binary = { .lhs = dst, .rhs = bwd_idx } });
+                    emit_store(&b, d_addr_b, b_val_b);
+                    finish_bb(&b, bwd_body_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)bwd_head_bb } });
+
+                    // fwd_setup_bb: fwd_idx = 0
+                    AxLirVRegId fwd_idx = make_vreg(&b, b.interner->t_usize);
+                    AxLirVRegId zero_f = emit_const(&b, 0, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = fwd_idx, .binary = { .lhs = zero_f, .rhs = zero_f } });
+                    finish_bb(&b, fwd_setup_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)fwd_head_bb } });
+
+                    // fwd_head_bb: fwd_idx < total_bytes
+                    AxLirVRegId fwd_cmp = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_ULT, .dest = fwd_cmp, .binary = { .lhs = fwd_idx, .rhs = total_bytes } });
+                    AxLirSwitchTarget *sw_fwd = ax_arena_alloc(b.arena, sizeof(AxLirSwitchTarget), _Alignof(AxLirSwitchTarget));
+                    sw_fwd[0].value = 1;
+                    sw_fwd[0].target = (AxLirBbId){ (uint32_t)fwd_body_bb };
+                    finish_bb(&b, fwd_head_bb, (AxLirTerminator){
+                        .kind = AX_LIR_TERM_SWITCH,
+                        .switch_int = {
+                            .cond = fwd_cmp,
+                            .targets = sw_fwd,
+                            .count = 1,
+                            .otherwise = (AxLirBbId){ (uint32_t)target_bb }
+                        }
+                    });
+
+                    // fwd_body_bb: copy at fwd_idx; fwd_idx = fwd_idx + 1
+                    AxLirVRegId s_addr_f = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = s_addr_f, .binary = { .lhs = src, .rhs = fwd_idx } });
+                    AxLirVRegId b_val_f = emit_load(&b, s_addr_f, b.interner->t_u8);
+                    AxLirVRegId d_addr_f = make_vreg(&b, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = d_addr_f, .binary = { .lhs = dst, .rhs = fwd_idx } });
+                    emit_store(&b, d_addr_f, b_val_f);
+                    AxLirVRegId one_f = emit_const(&b, 1, b.interner->t_usize);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ADD, .dest = fwd_idx, .binary = { .lhs = fwd_idx, .rhs = one_f } });
+                    finish_bb(&b, fwd_body_bb, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ (uint32_t)fwd_head_bb } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_SIZE_OF) {
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t sz = ax_type_size(elem_ty, b.interner);
+                    AxLirVRegId val = emit_const(&b, sz, b.interner->t_usize);
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, val);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_ALIGN_OF) {
+                    TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
+                    uint32_t al = ax_type_align(elem_ty, b.interner);
+                    AxLirVRegId val = emit_const(&b, al, b.interner->t_usize);
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, val);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && (cty->kind == AX_TY_BUILTIN_NULL || cty->kind == AX_TY_BUILTIN_NULL_MUT)) {
+                    AxLirVRegId val = emit_const(&b, 0, b.interner->t_usize);
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, val);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_IS_NULL) {
+                    AxLirVRegId p = lower_operand(&b, &mbb->terminator.call.args[0]);
+                    AxLirVRegId zero = emit_const(&b, 0, b.interner->t_usize);
+                    AxLirVRegId cmp = make_vreg(&b, b.interner->t_bool);
+                    emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ICMP_EQ, .dest = cmp, .binary = { .lhs = p, .rhs = zero } });
+                    AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                    emit_store(&b, dst_addr, cmp);
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
+                if (cty && cty->kind == AX_TY_BUILTIN_FORGET) {
+                    finish_bb(&b, i, (AxLirTerminator){ .kind = AX_LIR_TERM_JMP, .jmp_target = (AxLirBbId){ mbb->terminator.call.target.v } });
+                    continue;
+                }
                 
                 size_t cap_count = 0;
                 if (cty && cty->kind == AX_TY_CLOSURE) {
@@ -745,14 +1170,7 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 break;
         }
         
-        b.bbs[i].inst_count = b.cur_inst_count;
-        if (b.cur_inst_count > 0) {
-            b.bbs[i].insts = ax_arena_alloc(&lir->arena, b.cur_inst_count * sizeof(AxLirInst), _Alignof(AxLirInst));
-            for (size_t j = 0; j < b.cur_inst_count; j++) b.bbs[i].insts[j] = b.cur_insts[j];
-        } else {
-            b.bbs[i].insts = NULL;
-        }
-        b.bbs[i].terminator = term;
+        finish_bb(&b, i, term);
     }
     
     lir->slots = b.slots;
@@ -766,9 +1184,15 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
     }
     lir->vreg_count = b.vreg_count;
     
-    lir->bbs = b.bbs;
+    if (b.bb_count > 0) {
+        lir->bbs = ax_arena_alloc(&lir->arena, b.bb_count * sizeof(AxLirBb), _Alignof(AxLirBb));
+        memcpy(lir->bbs, b.bbs, b.bb_count * sizeof(AxLirBb));
+    } else {
+        lir->bbs = NULL;
+    }
     lir->bb_count = b.bb_count;
     
+    free(b.bbs);
     free(b.vregs);
     free(b.cur_insts);
     

@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T061a, T059]
 priority: 81
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, tests/run/ptr, tests/run/native_ptr]
 spec: [0162, 0183, 0003, 0009]
 covers: []
 started: 2026-10-13 13:26:45
+finished: 2026-10-13 14:19:56
 ---
 # T061b — Native catch-up: raw pointers and memory intrinsics
 
@@ -41,3 +42,4 @@ Raw-pointer programs and the memory intrinsics of T061a run natively with the sa
 
 ## Log
 - 2026-10-13 13:26:45 started (attempt 1) 
+- 2026-10-13 14:19:56 accepted by QA -> done
