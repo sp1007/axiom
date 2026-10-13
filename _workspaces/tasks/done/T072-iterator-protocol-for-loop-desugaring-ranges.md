@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T069]
 priority: 103
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/hir, bootstrap/axiom0/src/types, std/core/iter, tests/run/for]
 spec: [tasks/0333, tasks/0476, 0045]
+started: 2026-10-13 19:03:55
+finished: 2026-10-13 20:11:23
 ---
 # T072 — Iterator protocol, for-loop desugaring, ranges
 
@@ -32,3 +34,7 @@ spec: [tasks/0333, tasks/0476, 0045]
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 19:03:55 started (attempt 1) 
+- 2026-10-13 20:11:23 accepted by QA -> done

@@ -891,6 +891,7 @@ static const AxHirItem *find_trait_default_method(TypeckCtx *cx, const AxHirItem
 
 static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView method_name, AxTraitResult *out_res) {
     if (is_error(cx, base_ty)) return NULL;
+    size_t saved_vars_len = cx->int_vars_len;
     const AxHirItem *found = NULL;
     int matches = 0;
     *out_res = AX_TRAIT_DISPROVEN;
@@ -975,6 +976,7 @@ static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView metho
         }
     }
     
+    cx->int_vars_len = saved_vars_len;
     if (matches > 1) {
         *out_res = AX_TRAIT_AMBIGUOUS;
         return NULL;
@@ -1442,6 +1444,8 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
     cx.in_loop = false;
     cx.next_closure_id = 1;
     cx.evaluator = evaluator;
+
+
 
     // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
@@ -1984,6 +1988,9 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
                 return type_error(cx, pat->span, AX_TYPE_MISMATCH);
             }
             StrView name = (pat->path.path.span.file.v != 0) ? ax_source_db_span_text(cx->db, pat->path.path.span) : (StrView){0};
+            if (name.len == 0 && pat->path.path.name.v != 0) {
+                name = ax_interner_get(cx->str_in, pat->path.path.name);
+            }
             StrView vname = name;
             const char *dot = NULL;
             for (size_t i = 0; i < name.len; i++) {
@@ -1992,9 +1999,6 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
             if (dot) {
                 vname.ptr = dot + 1;
                 vname.len = name.len - (dot - name.ptr) - 1;
-            }
-            if (vname.len == 0 && pat->path.path.name.v != 0) {
-                vname = ax_interner_get(cx->str_in, pat->path.path.name);
             }
 
             bool found_variant = false;
@@ -2018,7 +2022,7 @@ static TypeId check_pat(TypeckCtx *cx, const AxHirPat *pat, TypeId expected, boo
                         }
                         size_t i = 0;
                         for (const AxHirPat *p = pat->path.payload->tuple.elems; p; p = p->next) {
-                            check_pat(cx, p, t->enm.variant_fields[vidx][i++], is_init);
+                            check_pat(cx, p, resolve_ty(cx, t->enm.variant_fields[vidx][i++]), is_init);
                         }
                     } else {
                         if (t->enm.variant_field_counts[vidx] > 0) {
@@ -2280,6 +2284,54 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         name = ax_interner_get(cx->str_in, path->name);
     }
     
+    if (ax_sv_eq_cstr(name, "len")) {
+        AxType st = {0}; st.kind = AX_TY_BUILTIN_LEN;
+        return ax_intern_type(&cx->thir->interner, &st);
+    }
+    if (ax_sv_eq_cstr(name, "print")) {
+        AxType st = {0}; st.kind = AX_TY_BUILTIN_PRINT;
+        return ax_intern_type(&cx->thir->interner, &st);
+    }
+    if (ax_sv_eq_cstr(name, "print_int")) {
+        AxType st = {0}; st.kind = AX_TY_BUILTIN_PRINT_INT;
+        return ax_intern_type(&cx->thir->interner, &st);
+    }
+    if (ax_sv_eq_cstr(name, "drop")) {
+        AxType st = {0}; st.kind = AX_TY_BUILTIN_DROP;
+        return ax_intern_type(&cx->thir->interner, &st);
+    }
+    
+    if (name.len > 5 && memcmp(name.ptr, "Self.", 5) == 0) {
+        StrView assoc_name;
+        assoc_name.ptr = name.ptr + 5;
+        assoc_name.len = name.len - 5;
+        if (cx->current_impl && cx->current_impl->kind == AX_HIR_ITEM_IMPL) {
+            for (const AxHirItem *m = cx->current_impl->impl.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_TYPE_ALIAS) {
+                    StrView mname = ax_interner_get(cx->str_in, m->type_alias.name);
+                    if (ax_sv_eq(mname, assoc_name)) {
+                        return hir_type_to_typeid(cx, m->type_alias.type);
+                    }
+                }
+            }
+        }
+        AxType pt;
+        memset(&pt, 0, sizeof(pt));
+        pt.kind = AX_TY_PARAM;
+        pt.param.name = ax_intern(cx->str_in, assoc_name);
+        pt.param.index = 0;
+        return ax_intern_type(&cx->thir->interner, &pt);
+    }
+    if (ax_sv_eq_cstr(name, "Self")) {
+        if (TypeId_is_some(cx->self_ty)) return cx->self_ty;
+        AxType pt;
+        memset(&pt, 0, sizeof(pt));
+        pt.kind = AX_TY_PARAM;
+        pt.param.name = ax_intern_cstr(cx->str_in, "Self");
+        pt.param.index = 0;
+        return ax_intern_type(&cx->thir->interner, &pt);
+    }
+
     // Check built-in types for UFCS
     if (ax_sv_eq_cstr(name, "bool")) return cx->thir->interner.t_bool;
     if (ax_sv_eq_cstr(name, "char")) return cx->thir->interner.t_char;
@@ -2927,6 +2979,585 @@ static void desugar_while_let(TypeckCtx *cx, AxHirExpr *expr) {
     expr->loop.block.stmts = match_stmt;
 }
 
+static AxHirExpr *make_var_expr(TypeckCtx *cx, Span span, AxSymbolId sym, const char *name_str) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_PATH;
+    e->span = span;
+    e->path.path.span = (Span){0};
+    e->path.path.symbol = sym;
+    e->path.path.name = ax_intern_cstr(cx->str_in, name_str);
+    return e;
+}
+
+static AxHirStmt *make_let_stmt(TypeckCtx *cx, Span span, AxSymbolId sym, const char *name_str, bool is_mut, AxHirExpr *init_expr) {
+    (void)name_str;
+    AxHirStmt *s = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+    memset(s, 0, sizeof(AxHirStmt));
+    s->kind = AX_HIR_STMT_LET;
+    s->span = span;
+    
+    AxHirPat *p = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    memset(p, 0, sizeof(AxHirPat));
+    p->kind = AX_HIR_PAT_BINDING;
+    p->span = span;
+    p->binding.is_mut = is_mut;
+    p->binding.symbol = sym;
+    
+    s->let.pat = p;
+    s->let.expr = init_expr;
+    return s;
+}
+
+static AxHirStmt *make_assign_stmt(TypeckCtx *cx, Span span, AxHirExpr *left, AxHirExpr *right) {
+    AxHirStmt *s = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+    memset(s, 0, sizeof(AxHirStmt));
+    s->kind = AX_HIR_STMT_ASSIGN;
+    s->span = span;
+    s->assign.left = left;
+    s->assign.right = right;
+    return s;
+}
+
+static AxHirExpr *make_binop_expr(TypeckCtx *cx, Span span, AxAstBinOp op, AxHirExpr *left, AxHirExpr *right) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_BINARY;
+    e->span = span;
+    e->binary.op = op;
+    e->binary.left = left;
+    e->binary.right = right;
+    return e;
+}
+
+static AxHirExpr *make_unary_expr(TypeckCtx *cx, Span span, AxAstUnOp op, AxHirExpr *inner) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_UNARY;
+    e->span = span;
+    e->unary.op = op;
+    e->unary.expr = inner;
+    return e;
+}
+
+static AxHirExpr *make_int_literal(TypeckCtx *cx, Span span, uint64_t val, AxSuffix suffix) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_LITERAL;
+    e->span = span;
+    e->literal.kind = AX_TOK_INT;
+    e->literal.span = span;
+    e->literal.val.int_val.value = val;
+    e->literal.val.int_val.suffix = suffix;
+    return e;
+}
+
+static AxHirExpr *make_bool_literal(TypeckCtx *cx, Span span, bool val) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_LITERAL;
+    e->span = span;
+    e->literal.kind = val ? AX_TOK_KW_TRUE : AX_TOK_KW_FALSE;
+    e->literal.span = span;
+    return e;
+}
+
+static AxHirExpr *make_call_expr(TypeckCtx *cx, Span span, const char *callee_name, AxHirExpr *args) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_CALL;
+    e->span = span;
+    AxHirExpr *callee = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(callee, 0, sizeof(AxHirExpr));
+    callee->kind = AX_HIR_EXPR_PATH;
+    callee->span = (Span){0};
+    callee->path.path.span = (Span){0};
+    callee->path.path.symbol = (AxSymbolId){ 0x50000001 };
+    callee->path.path.name = ax_intern_cstr(cx->str_in, callee_name);
+    e->call.callee = callee;
+    e->call.args = args;
+    return e;
+}
+
+static AxHirExpr *make_index_expr(TypeckCtx *cx, Span span, AxHirExpr *base, AxHirExpr *arg) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_INDEX;
+    e->span = span;
+    e->index.base = base;
+    e->index.arg = arg;
+    return e;
+}
+
+static AxHirExpr *make_method_call_expr(TypeckCtx *cx, Span span, AxHirExpr *receiver, const char *method_name, AxHirExpr *args) {
+    AxHirExpr *e = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(e, 0, sizeof(AxHirExpr));
+    e->kind = AX_HIR_EXPR_METHOD_CALL;
+    e->span = span;
+    e->method_call.receiver = receiver;
+    e->method_call.method_name = ax_intern_cstr(cx->str_in, method_name);
+    e->method_call.args = args;
+    return e;
+}
+
+static AxHirPat *make_option_some_pat(TypeckCtx *cx, Span span, AxHirPat *inner_pat) {
+    AxHirPat *p = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    memset(p, 0, sizeof(AxHirPat));
+    p->kind = AX_HIR_PAT_PATH;
+    p->span = span;
+    p->path.path.span = (Span){0};
+    p->path.path.name = ax_intern_cstr(cx->str_in, "Option.Some");
+    
+    AxHirPat *tup = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirPat), _Alignof(AxHirPat));
+    memset(tup, 0, sizeof(AxHirPat));
+    tup->kind = AX_HIR_PAT_TUPLE;
+    tup->span = span;
+    tup->tuple.elems = inner_pat;
+    if (inner_pat) inner_pat->next = NULL;
+    
+    p->path.payload = tup;
+    return p;
+}
+
+static void desugar_range(TypeckCtx *cx, AxHirExpr *expr) {
+    if (expr->kind != AX_HIR_EXPR_RANGE) return;
+    bool is_inc = expr->range.is_inclusive;
+    AxHirExpr *start = expr->range.start;
+    AxHirExpr *end = expr->range.end;
+
+    AxHirFieldInit *f_start = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirFieldInit), _Alignof(AxHirFieldInit));
+    memset(f_start, 0, sizeof(AxHirFieldInit));
+    f_start->span = start ? start->span : expr->span;
+    f_start->name = ax_intern_cstr(cx->str_in, "start");
+    f_start->expr = start;
+
+    AxHirFieldInit *f_end = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirFieldInit), _Alignof(AxHirFieldInit));
+    memset(f_end, 0, sizeof(AxHirFieldInit));
+    f_end->span = end ? end->span : expr->span;
+    f_end->name = ax_intern_cstr(cx->str_in, "end");
+    f_end->expr = end;
+    f_start->next = f_end;
+
+    if (is_inc) {
+        AxHirFieldInit *f_done = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirFieldInit), _Alignof(AxHirFieldInit));
+        memset(f_done, 0, sizeof(AxHirFieldInit));
+        f_done->span = expr->span;
+        f_done->name = ax_intern_cstr(cx->str_in, "done");
+        f_done->expr = make_bool_literal(cx, expr->span, false);
+        f_end->next = f_done;
+    }
+
+    expr->kind = AX_HIR_EXPR_STRUCT;
+    expr->struct_lit.path.span = (Span){0};
+    expr->struct_lit.path.symbol = (AxSymbolId){0};
+    expr->struct_lit.path.name = ax_intern_cstr(cx->str_in, is_inc ? "RangeInclusive" : "Range");
+    expr->struct_lit.path.generic_args = NULL;
+    expr->struct_lit.fields = f_start;
+}
+
+static void desugar_for(TypeckCtx *cx, AxHirExpr *expr) {
+    if (expr->kind != AX_HIR_EXPR_FOR) return;
+    
+    StrId label = expr->for_expr.label;
+    AxHirPat *pat = expr->for_expr.pat;
+    AxHirExpr *iter = expr->for_expr.iter;
+    AxHirBlock body = expr->for_expr.block;
+    Span span = expr->span;
+    
+    if (iter && iter->kind == AX_HIR_EXPR_RANGE) {
+        bool is_inc = iter->range.is_inclusive;
+        AxHirExpr *start = iter->range.start;
+        AxHirExpr *end = iter->range.end;
+        
+        AxSymbolId cur_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+        AxSymbolId end_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+        
+        AxHirStmt *s1 = make_let_stmt(cx, start ? start->span : span, cur_sym, "$cur", true, start);
+        AxHirStmt *s2 = make_let_stmt(cx, end ? end->span : span, end_sym, "$end", false, end);
+        s1->next = s2;
+        
+        if (!is_inc) {
+            AxHirExpr *cond = make_binop_expr(cx, span, AX_BINOP_LT,
+                                              make_var_expr(cx, span, cur_sym, "$cur"),
+                                              make_var_expr(cx, span, end_sym, "$end"));
+            
+            AxHirStmt *sa = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sa, 0, sizeof(AxHirStmt));
+            sa->kind = AX_HIR_STMT_LET;
+            sa->span = pat ? pat->span : span;
+            sa->let.pat = pat;
+            sa->let.expr = make_var_expr(cx, span, cur_sym, "$cur");
+            
+            AxHirExpr *one_lit = make_int_literal(cx, span, 1, AX_SUFFIX_NONE);
+            AxHirExpr *add_expr = make_binop_expr(cx, span, AX_BINOP_ADD,
+                                                  make_var_expr(cx, span, cur_sym, "$cur"),
+                                                  one_lit);
+            AxHirStmt *sb = make_assign_stmt(cx, span, make_var_expr(cx, span, cur_sym, "$cur"), add_expr);
+            sa->next = sb;
+            sb->next = body.stmts;
+            
+            AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(w_expr, 0, sizeof(AxHirExpr));
+            w_expr->kind = AX_HIR_EXPR_WHILE;
+            w_expr->span = span;
+            w_expr->while_expr.label = label;
+            w_expr->while_expr.cond = cond;
+            w_expr->while_expr.block.span = body.span;
+            w_expr->while_expr.block.stmts = sa;
+            
+            AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sw, 0, sizeof(AxHirStmt));
+            sw->kind = AX_HIR_STMT_EXPR;
+            sw->span = span;
+            sw->expr_stmt.expr = w_expr;
+            sw->expr_stmt.has_semi = false;
+            
+            s2->next = sw;
+            
+            expr->kind = AX_HIR_EXPR_BLOCK;
+            expr->block.block.span = span;
+            expr->block.block.stmts = s1;
+            return;
+        } else {
+            AxSymbolId done_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            AxHirStmt *s3 = make_let_stmt(cx, span, done_sym, "$done", true, make_bool_literal(cx, span, false));
+            s2->next = s3;
+            
+            AxHirExpr *not_done = make_unary_expr(cx, span, AX_UNOP_NOT, make_var_expr(cx, span, done_sym, "$done"));
+            AxHirExpr *cur_le = make_binop_expr(cx, span, AX_BINOP_LE,
+                                                make_var_expr(cx, span, cur_sym, "$cur"),
+                                                make_var_expr(cx, span, end_sym, "$end"));
+            AxHirExpr *cond = make_binop_expr(cx, span, AX_BINOP_LOGAND, not_done, cur_le);
+            
+            AxHirStmt *sa = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sa, 0, sizeof(AxHirStmt));
+            sa->kind = AX_HIR_STMT_LET;
+            sa->span = pat ? pat->span : span;
+            sa->let.pat = pat;
+            sa->let.expr = make_var_expr(cx, span, cur_sym, "$cur");
+            
+            AxHirExpr *if_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(if_expr, 0, sizeof(AxHirExpr));
+            if_expr->kind = AX_HIR_EXPR_IF;
+            if_expr->span = span;
+            if_expr->if_expr.cond = make_binop_expr(cx, span, AX_BINOP_GE,
+                                                    make_var_expr(cx, span, cur_sym, "$cur"),
+                                                    make_var_expr(cx, span, end_sym, "$end"));
+            
+            AxHirStmt *set_done = make_assign_stmt(cx, span, make_var_expr(cx, span, done_sym, "$done"), make_bool_literal(cx, span, true));
+            if_expr->if_expr.block.span = span;
+            if_expr->if_expr.block.stmts = set_done;
+            
+            AxHirExpr *one_lit = make_int_literal(cx, span, 1, AX_SUFFIX_NONE);
+            AxHirExpr *add_expr = make_binop_expr(cx, span, AX_BINOP_ADD,
+                                                  make_var_expr(cx, span, cur_sym, "$cur"),
+                                                  one_lit);
+            AxHirStmt *inc_cur = make_assign_stmt(cx, span, make_var_expr(cx, span, cur_sym, "$cur"), add_expr);
+            AxHirExpr *else_blk_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(else_blk_expr, 0, sizeof(AxHirExpr));
+            else_blk_expr->kind = AX_HIR_EXPR_BLOCK;
+            else_blk_expr->span = span;
+            else_blk_expr->block.block.span = span;
+            else_blk_expr->block.block.stmts = inc_cur;
+            if_expr->if_expr.else_branch = else_blk_expr;
+            
+            AxHirStmt *sb = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sb, 0, sizeof(AxHirStmt));
+            sb->kind = AX_HIR_STMT_EXPR;
+            sb->span = span;
+            sb->expr_stmt.expr = if_expr;
+            sb->expr_stmt.has_semi = false;
+            
+            sa->next = sb;
+            sb->next = body.stmts;
+            
+            AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(w_expr, 0, sizeof(AxHirExpr));
+            w_expr->kind = AX_HIR_EXPR_WHILE;
+            w_expr->span = span;
+            w_expr->while_expr.label = label;
+            w_expr->while_expr.cond = cond;
+            w_expr->while_expr.block.span = body.span;
+            w_expr->while_expr.block.stmts = sa;
+            
+            AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sw, 0, sizeof(AxHirStmt));
+            sw->kind = AX_HIR_STMT_EXPR;
+            sw->span = span;
+            sw->expr_stmt.expr = w_expr;
+            sw->expr_stmt.has_semi = false;
+            
+            s3->next = sw;
+            
+            expr->kind = AX_HIR_EXPR_BLOCK;
+            expr->block.block.span = span;
+            expr->block.block.stmts = s1;
+            return;
+        }
+    }
+    
+    // Check type of iter to determine if array, view, or iterator
+    TypeId iter_ty = resolve_ty(cx, check_expr(cx, iter, TypeId_none()));
+    if (is_error(cx, iter_ty)) return;
+    
+    const AxType *t = ax_type_get(&cx->thir->interner, iter_ty);
+    bool is_array = (t->kind == AX_TY_ARRAY);
+    bool is_slice = (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) &&
+                    (ax_type_get(&cx->thir->interner, t->view.pointee)->kind == AX_TY_SLICE ||
+                     ax_type_get(&cx->thir->interner, t->view.pointee)->kind == AX_TY_ARRAY);
+    
+    if (is_array || is_slice) {
+        AxSymbolId arr_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+        AxSymbolId idx_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+        AxSymbolId len_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+        
+        AxHirStmt *s1 = make_let_stmt(cx, iter->span, arr_sym, "$arr", false, iter);
+        AxHirStmt *s2 = make_let_stmt(cx, span, idx_sym, "$idx", true,
+                                      make_int_literal(cx, span, 0, AX_SUFFIX_USIZE));
+        AxHirStmt *s3 = make_let_stmt(cx, span, len_sym, "$len", false,
+                                      make_call_expr(cx, span, "len", make_var_expr(cx, span, arr_sym, "$arr")));
+        s1->next = s2;
+        s2->next = s3;
+        
+        AxHirExpr *cond = make_binop_expr(cx, span, AX_BINOP_LT,
+                                          make_var_expr(cx, span, idx_sym, "$idx"),
+                                          make_var_expr(cx, span, len_sym, "$len"));
+        
+        AxHirExpr *idx_expr = make_index_expr(cx, span,
+                                              make_var_expr(cx, span, arr_sym, "$arr"),
+                                              make_var_expr(cx, span, idx_sym, "$idx"));
+        AxHirStmt *sa = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+        memset(sa, 0, sizeof(AxHirStmt));
+        sa->kind = AX_HIR_STMT_LET;
+        sa->span = pat ? pat->span : span;
+        sa->let.pat = pat;
+        sa->let.expr = idx_expr;
+        
+        AxHirExpr *one_usize = make_int_literal(cx, span, 1, AX_SUFFIX_USIZE);
+        AxHirExpr *add_idx = make_binop_expr(cx, span, AX_BINOP_ADD,
+                                             make_var_expr(cx, span, idx_sym, "$idx"),
+                                             one_usize);
+        AxHirStmt *sb = make_assign_stmt(cx, span, make_var_expr(cx, span, idx_sym, "$idx"), add_idx);
+        sa->next = sb;
+        sb->next = body.stmts;
+        
+        AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+        memset(w_expr, 0, sizeof(AxHirExpr));
+        w_expr->kind = AX_HIR_EXPR_WHILE;
+        w_expr->span = span;
+        w_expr->while_expr.label = label;
+        w_expr->while_expr.cond = cond;
+        w_expr->while_expr.block.span = body.span;
+        w_expr->while_expr.block.stmts = sa;
+        
+        AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+        memset(sw, 0, sizeof(AxHirStmt));
+        sw->kind = AX_HIR_STMT_EXPR;
+        sw->span = span;
+        sw->expr_stmt.expr = w_expr;
+        sw->expr_stmt.has_semi = false;
+        
+        s3->next = sw;
+        
+        expr->kind = AX_HIR_EXPR_BLOCK;
+        expr->block.block.span = span;
+        expr->block.block.stmts = s1;
+        return;
+    }
+    
+    // Check if iter has method `next`
+    AxTraitResult trait_res = AX_TRAIT_DISPROVEN;
+    const AxHirItem *method_item = find_method(cx, iter_ty, ax_sv_cstr("next"), &trait_res);
+    if (!method_item && (t->kind == AX_TY_STRUCT)) {
+        StrView sname = ax_interner_get(cx->str_in, t->strct.def->struct_decl.name);
+        if (ax_sv_eq_cstr(sname, "Range")) {
+            AxSymbolId cur_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            AxSymbolId end_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            
+            AxHirExpr *r_start = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(r_start, 0, sizeof(AxHirExpr));
+            r_start->kind = AX_HIR_EXPR_FIELD;
+            r_start->span = span;
+            r_start->field.base = iter;
+            r_start->field.name = ax_intern_cstr(cx->str_in, "start");
+            
+            AxHirExpr *r_end = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(r_end, 0, sizeof(AxHirExpr));
+            r_end->kind = AX_HIR_EXPR_FIELD;
+            r_end->span = span;
+            r_end->field.base = iter;
+            r_end->field.name = ax_intern_cstr(cx->str_in, "end");
+            
+            AxHirStmt *s1 = make_let_stmt(cx, span, cur_sym, "$cur", true, r_start);
+            AxHirStmt *s2 = make_let_stmt(cx, span, end_sym, "$end", false, r_end);
+            s1->next = s2;
+            
+            AxHirExpr *cond = make_binop_expr(cx, span, AX_BINOP_LT,
+                                              make_var_expr(cx, span, cur_sym, "$cur"),
+                                              make_var_expr(cx, span, end_sym, "$end"));
+            
+            AxHirStmt *sa = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sa, 0, sizeof(AxHirStmt));
+            sa->kind = AX_HIR_STMT_LET;
+            sa->span = pat ? pat->span : span;
+            sa->let.pat = pat;
+            sa->let.expr = make_var_expr(cx, span, cur_sym, "$cur");
+            
+            AxHirExpr *one_lit = make_int_literal(cx, span, 1, AX_SUFFIX_NONE);
+            AxHirExpr *add_expr = make_binop_expr(cx, span, AX_BINOP_ADD,
+                                                  make_var_expr(cx, span, cur_sym, "$cur"),
+                                                  one_lit);
+            AxHirStmt *sb = make_assign_stmt(cx, span, make_var_expr(cx, span, cur_sym, "$cur"), add_expr);
+            sa->next = sb;
+            sb->next = body.stmts;
+            
+            AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(w_expr, 0, sizeof(AxHirExpr));
+            w_expr->kind = AX_HIR_EXPR_WHILE;
+            w_expr->span = span;
+            w_expr->while_expr.label = label;
+            w_expr->while_expr.cond = cond;
+            w_expr->while_expr.block.span = body.span;
+            w_expr->while_expr.block.stmts = sa;
+            
+            AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sw, 0, sizeof(AxHirStmt));
+            sw->kind = AX_HIR_STMT_EXPR;
+            sw->span = span;
+            sw->expr_stmt.expr = w_expr;
+            sw->expr_stmt.has_semi = false;
+            
+            s2->next = sw;
+            
+            expr->kind = AX_HIR_EXPR_BLOCK;
+            expr->block.block.span = span;
+            expr->block.block.stmts = s1;
+            return;
+        } else if (ax_sv_eq_cstr(sname, "RangeInclusive")) {
+            AxSymbolId cur_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            AxSymbolId end_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            AxSymbolId done_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+            
+            AxHirExpr *r_start = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(r_start, 0, sizeof(AxHirExpr));
+            r_start->kind = AX_HIR_EXPR_FIELD;
+            r_start->span = span;
+            r_start->field.base = iter;
+            r_start->field.name = ax_intern_cstr(cx->str_in, "start");
+            
+            AxHirExpr *r_end = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(r_end, 0, sizeof(AxHirExpr));
+            r_end->kind = AX_HIR_EXPR_FIELD;
+            r_end->span = span;
+            r_end->field.base = iter;
+            r_end->field.name = ax_intern_cstr(cx->str_in, "end");
+            
+            AxHirStmt *s1 = make_let_stmt(cx, span, cur_sym, "$cur", true, r_start);
+            AxHirStmt *s2 = make_let_stmt(cx, span, end_sym, "$end", false, r_end);
+            AxHirStmt *s3 = make_let_stmt(cx, span, done_sym, "$done", true, make_bool_literal(cx, span, false));
+            s1->next = s2;
+            s2->next = s3;
+            
+            AxHirExpr *not_done = make_unary_expr(cx, span, AX_UNOP_NOT, make_var_expr(cx, span, done_sym, "$done"));
+            AxHirExpr *cur_le = make_binop_expr(cx, span, AX_BINOP_LE,
+                                                make_var_expr(cx, span, cur_sym, "$cur"),
+                                                make_var_expr(cx, span, end_sym, "$end"));
+            AxHirExpr *cond = make_binop_expr(cx, span, AX_BINOP_LOGAND, not_done, cur_le);
+            
+            AxHirStmt *sa = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sa, 0, sizeof(AxHirStmt));
+            sa->kind = AX_HIR_STMT_LET;
+            sa->span = pat ? pat->span : span;
+            sa->let.pat = pat;
+            sa->let.expr = make_var_expr(cx, span, cur_sym, "$cur");
+            
+            AxHirExpr *if_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(if_expr, 0, sizeof(AxHirExpr));
+            if_expr->kind = AX_HIR_EXPR_IF;
+            if_expr->span = span;
+            if_expr->if_expr.cond = make_binop_expr(cx, span, AX_BINOP_GE,
+                                                    make_var_expr(cx, span, cur_sym, "$cur"),
+                                                    make_var_expr(cx, span, end_sym, "$end"));
+            
+            AxHirStmt *set_done = make_assign_stmt(cx, span, make_var_expr(cx, span, done_sym, "$done"), make_bool_literal(cx, span, true));
+            if_expr->if_expr.block.span = span;
+            if_expr->if_expr.block.stmts = set_done;
+            
+            AxHirExpr *one_lit = make_int_literal(cx, span, 1, AX_SUFFIX_NONE);
+            AxHirExpr *add_expr = make_binop_expr(cx, span, AX_BINOP_ADD,
+                                                  make_var_expr(cx, span, cur_sym, "$cur"),
+                                                  one_lit);
+            AxHirStmt *inc_cur = make_assign_stmt(cx, span, make_var_expr(cx, span, cur_sym, "$cur"), add_expr);
+            AxHirExpr *else_blk_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(else_blk_expr, 0, sizeof(AxHirExpr));
+            else_blk_expr->kind = AX_HIR_EXPR_BLOCK;
+            else_blk_expr->span = span;
+            else_blk_expr->block.block.span = span;
+            else_blk_expr->block.block.stmts = inc_cur;
+            if_expr->if_expr.else_branch = else_blk_expr;
+            
+            AxHirStmt *sb = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sb, 0, sizeof(AxHirStmt));
+            sb->kind = AX_HIR_STMT_EXPR;
+            sb->span = span;
+            sb->expr_stmt.expr = if_expr;
+            sb->expr_stmt.has_semi = false;
+            
+            sa->next = sb;
+            sb->next = body.stmts;
+            
+            AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+            memset(w_expr, 0, sizeof(AxHirExpr));
+            w_expr->kind = AX_HIR_EXPR_WHILE;
+            w_expr->span = span;
+            w_expr->while_expr.label = label;
+            w_expr->while_expr.cond = cond;
+            w_expr->while_expr.block.span = body.span;
+            w_expr->while_expr.block.stmts = sa;
+            
+            AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+            memset(sw, 0, sizeof(AxHirStmt));
+            sw->kind = AX_HIR_STMT_EXPR;
+            sw->span = span;
+            sw->expr_stmt.expr = w_expr;
+            sw->expr_stmt.has_semi = false;
+            
+            s3->next = sw;
+            
+            expr->kind = AX_HIR_EXPR_BLOCK;
+            expr->block.block.span = span;
+            expr->block.block.stmts = s1;
+            return;
+        }
+    }
+    
+    // Default: Iterator protocol `while let Option.Some(pat) = __iter.next()`
+    AxSymbolId iter_sym = (AxSymbolId){ 0x60000000 + (cx->next_closure_id++) };
+    AxHirStmt *s1 = make_let_stmt(cx, iter->span, iter_sym, "$iter", true, iter);
+    
+    AxHirExpr *w_expr = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(w_expr, 0, sizeof(AxHirExpr));
+    w_expr->kind = AX_HIR_EXPR_WHILE;
+    w_expr->span = span;
+    w_expr->while_expr.label = label;
+    w_expr->while_expr.let_pat = make_option_some_pat(cx, span, pat);
+    w_expr->while_expr.cond = make_method_call_expr(cx, span, make_var_expr(cx, span, iter_sym, "$iter"), "next", NULL);
+    w_expr->while_expr.block = body;
+    
+    AxHirStmt *sw = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+    memset(sw, 0, sizeof(AxHirStmt));
+    sw->kind = AX_HIR_STMT_EXPR;
+    sw->span = span;
+    sw->expr_stmt.expr = w_expr;
+    sw->expr_stmt.has_semi = false;
+    
+    s1->next = sw;
+    
+    expr->kind = AX_HIR_EXPR_BLOCK;
+    expr->block.block.span = span;
+    expr->block.block.stmts = s1;
+}
+
 static TypeId check_if(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected) {
     if (expr->if_expr.let_pat) {
         desugar_if_let(cx, (AxHirExpr*)expr);
@@ -3062,6 +3693,19 @@ static void scan_expr_captures(TypeckCtx *cx, const AxHirExpr *expr, AxSymbolId 
         case AX_HIR_EXPR_WHILE:
             scan_expr_captures(cx, expr->while_expr.cond, inner, inner_count, caps, cap_count, false, false);
             scan_block_captures(cx, &expr->while_expr.block, inner, inner_count, caps, cap_count);
+            break;
+        case AX_HIR_EXPR_FOR:
+            scan_expr_captures(cx, expr->for_expr.iter, inner, inner_count, caps, cap_count, false, false);
+            {
+                size_t save = *inner_count;
+                add_pat_syms(expr->for_expr.pat, inner, inner_count);
+                scan_block_captures(cx, &expr->for_expr.block, inner, inner_count, caps, cap_count);
+                *inner_count = save;
+            }
+            break;
+        case AX_HIR_EXPR_RANGE:
+            if (expr->range.start) scan_expr_captures(cx, expr->range.start, inner, inner_count, caps, cap_count, false, false);
+            if (expr->range.end) scan_expr_captures(cx, expr->range.end, inner, inner_count, caps, cap_count, false, false);
             break;
         case AX_HIR_EXPR_MATCH: {
             scan_expr_captures(cx, expr->match.expr, inner, inner_count, caps, cap_count, false, false);
@@ -3302,16 +3946,29 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                     }
                 }
                 } // close else { t->kind == AX_TY_STRUCT }
+                if (gargs.count > 0 && t->kind == AX_TY_STRUCT) {
+                    AxGenericArgs resolved_args;
+                    resolved_args.count = gargs.count;
+                    resolved_args.args = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * gargs.count, _Alignof(TypeId));
+                    for (size_t i = 0; i < gargs.count; i++) {
+                        resolved_args.args[i] = resolve_ty(cx, gargs.args[i]);
+                    }
+                    const AxHirItem *sdef = t->strct.def;
+                    TypeId *orig_st_ty = AxItemTypeMap_get(&cx->thir->item_types, sdef);
+                    if (orig_st_ty) {
+                        path_ty = ax_subst_ty(cx, *orig_st_ty, &resolved_args);
+                    }
+                }
             }
             return path_ty;
         }
         case AX_HIR_EXPR_FIELD: {
             TypeId obj_ty = check_expr(cx, expr->field.base, TypeId_none());
             if (!is_error(cx, obj_ty)) {
-                TypeId base_ty = obj_ty;
+                TypeId base_ty = resolve_ty(cx, obj_ty);
                 const AxType *t = ax_type_get(&cx->thir->interner, base_ty);
                 while (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_PTR) {
-                    base_ty = (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee;
+                    base_ty = resolve_ty(cx, (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee);
                     t = ax_type_get(&cx->thir->interner, base_ty);
                 }
                 if (t->kind == AX_TY_STRUCT) {
@@ -3771,7 +4428,14 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             t.view.pointee = inner_ty;
             return ax_intern_type(&cx->thir->interner, &t);
         }
-        case AX_HIR_EXPR_FOR:
+        case AX_HIR_EXPR_FOR: {
+            desugar_for(cx, (AxHirExpr*)expr);
+            return check_expr_kind(cx, expr, expected);
+        }
+        case AX_HIR_EXPR_RANGE: {
+            desugar_range(cx, (AxHirExpr*)expr);
+            return check_expr_kind(cx, expr, expected);
+        }
         case AX_HIR_EXPR_COMPTIME:
             return in->t_error;
         case AX_HIR_EXPR_UNSAFE:

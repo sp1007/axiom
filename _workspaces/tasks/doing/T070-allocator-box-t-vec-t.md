@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T069, T065, T061c]
 priority: 101
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/core/alloc, std/alloc, std/sys/windows/heap.ax, tests/std/alloc, tests/run/host/heap]
 spec: [0087, 0106, 0210, tasks/0280, 0045]
 covers: [REQ-RT-183]
+started: 2026-10-13 19:03:50
 ---
 # T070 — Allocator, Box<T>, Vec<T>
 
@@ -41,3 +42,4 @@ Heap memory with explicit ownership.
 
 ## Log
 - 2026-10-06 02:31:20 covers += REQ-RT-183 (metadata only)
+- 2026-10-13 19:03:50 started (attempt 1) 
