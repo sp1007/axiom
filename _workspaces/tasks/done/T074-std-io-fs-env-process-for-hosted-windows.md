@@ -8,11 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T071b, T071c, T065, T061c]
 priority: 105
-status: doing
+status: done
 attempts: 1
 paths: [std/io, std/env, std/process, std/sys/windows/io.ax, std/sys/windows/process.ax, tests/std/io, tests/run/host/io]
 spec: [tasks/0330, tasks/0335, 0220, 0221]
 started: 2026-10-13 23:33:16
+finished: 2026-10-14 00:21:09
 ---
 # T074 — std.io / env / process for hosted Windows
 
@@ -44,3 +45,4 @@ Enough OS access to write a compiler in Axiom.
 
 ## Log
 - 2026-10-13 23:33:16 started (attempt 1) 
+- 2026-10-14 00:21:09 accepted by QA -> done
