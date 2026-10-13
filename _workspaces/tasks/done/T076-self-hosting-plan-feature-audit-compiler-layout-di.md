@@ -8,12 +8,14 @@ model: opus
 gate_model: opus
 depends: [T075]
 priority: 110
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-20-selfhost.md, _workspaces/tasks/todo]
 timeout_min: 300
 spec: [0167, 0150, tasks/0260, tasks/0261, tasks/0371, tasks/0473]
 covers: [REQ-DRV-022]
+started: 2026-10-14 03:28:36
+finished: 2026-10-14 03:44:34
 ---
 # T076 — Self-hosting plan: feature audit, compiler/ layout, differential strategy
 
@@ -43,3 +45,5 @@ Plan the port of axiom0 to Axiom (axiomc).
 
 ## Log
 - 2026-10-06 02:23:58 covers += REQ-DRV-022 (metadata only)
+- 2026-10-14 03:28:36 started (attempt 1) 
+- 2026-10-14 03:44:34 accepted by QA -> done

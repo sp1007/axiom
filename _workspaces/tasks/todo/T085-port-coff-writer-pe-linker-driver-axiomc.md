@@ -1,12 +1,12 @@
 ---
 id: T085
-title: Port COFF writer, PE linker, driver → axiomc
+title: Port COFF writer, PE linker, driver → axiomc (integration + differential)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T084]
+depends: [T085a, T085b, T085c]
 priority: 119
 status: todo
 attempts: 0
@@ -14,28 +14,27 @@ paths: [compiler/obj_link_driver, tests/selfhost/obj_link_driver]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
 ---
-# T085 — Port COFF writer, PE linker, driver → axiomc
+# T085 — Port COFF writer, PE linker, driver → axiomc (integration + differential)
 
 ## Goal
-Port COFF writer, PE linker, driver → axiomc, keeping behaviour identical to the C implementation.
+Integrate COFF object writer, PE linker, and driver in Axiom to produce a fully functional `axiomc` binary.
 
 ## Scope
-- Idiomatic canonical Axiom port of the corresponding axiom0 modules; same data model and diagnostics codes.
-- Differential test harness comparing outputs with axiom0 over the whole tests/ corpus.
+- Integrate `compiler/obj`, `compiler/link`, and `compiler/driver`.
+- Differential test harness comparing emitted COFF objects and linked executables with `axiom0`.
+- Verify `axiomc` can compile programs from source to runnable PE32+ executables.
 
 ## Acceptance
 - [ ] Differential equality over the corpus (documented counts); module tests pass in interp and native.
-- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Sub-tasks T085a, T085b, T085c integrated into a runnable `axiomc` compiler binary.
+- [ ] Full test suite passes; build warning-free; archcheck clean.
 - [ ] Report `_workspaces/reports/T085-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+- Full self-hosting bootstrap pipeline (handled in T086 and T087).
 
 ## Notes
-- Template task: T076 splits it per C module (≤ ~1.5k lines of Axiom per task), names the exact differential artefact and harness entry, and may change these `paths` (ADR-0005 §8). This id stays as the group's integration + differential task.
-- Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
-- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- Group integration task for T085a, T085b, T085c per ADR-0005 §8 and SPEC-20 §4.9.
+- Exact differential artefact: `--emit=obj` object bytes and PE executable image bytes.
+- Harness entry: `tests/selfhost/obj_link_driver`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
-
-## Log
-- 2026-10-06 02:23:56 covers += REQ-CORE-3181 (metadata only)

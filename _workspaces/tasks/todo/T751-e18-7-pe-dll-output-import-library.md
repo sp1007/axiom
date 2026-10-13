@@ -10,7 +10,7 @@ depends: [T750]
 priority: 701
 status: todo
 attempts: 0
-paths: [compiler/link/pe_dll, compiler/link/implib, tests/link/dll]
+paths: [compiler/link, tests/link/dll]
 spec: [0186, 0187, tasks/0563, 0104, spec/decisions/ADR-0001-fixed-address-declarations.md]
 covers: [REQ-OWNER-006]
 ---
@@ -36,7 +36,7 @@ covers: [REQ-OWNER-006]
 - Other targets/formats (ELF/Mach-O libraries are E16.10); Axiom-ABI dynamic components (E20.7).
 
 ## Notes
-- `paths` are provisional: T076 fixes the `compiler/<module>` layout and re-paths this task (ADR-0005 §8).
+- Paths re-pathed to canonical `compiler/<module>` layout by T076 (ADR-0005 §8, SPEC-20 §8).
 - Owner requirement REQ-OWNER-006, roadmap epic E18.7: implemented in axiomc (Axiom, `compiler/`) right after self-hosting (P18 opens after P10). The C core emits only .obj/.exe but its data models reserve these artifact kinds (SPEC-04, T003a).
 - The P18 planning task T218 may split this task; keep this id for the first slice.
 - All Axiom code uses canonical syntax (axiom-syntax).

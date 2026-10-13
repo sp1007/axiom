@@ -1,12 +1,12 @@
 ---
 id: T081
-title: Port typeck + trait solver to Axiom
+title: Port typeck + trait solver to Axiom (integration + differential typeck)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T080]
+depends: [T081a, T081b, T081c]
 priority: 115
 status: todo
 attempts: 0
@@ -14,30 +14,28 @@ paths: [compiler/typeck_traits, tests/selfhost/typeck_traits]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-GEN-100, REQ-TRT-139, REQ-TYP-354, REQ-TYP-355]
 ---
-# T081 — Port typeck + trait solver to Axiom
+# T081 — Port typeck + trait solver to Axiom (integration + differential typeck)
 
 ## Goal
-Port typeck + trait solver to Axiom, keeping behaviour identical to the C implementation.
+Integrate typeck and trait solver in Axiom and run differential type checking against `axiom0`.
 
 ## Scope
-- Idiomatic canonical Axiom port of the corresponding axiom0 modules; same data model and diagnostics codes.
-- Differential test harness comparing outputs with axiom0 over the whole tests/ corpus.
+- Integrate `compiler/types` and `compiler/traits`.
+- Differential test harness comparing typed AST/HIR dumps and typeck diagnostics against `axiom0` across the entire tests corpus.
+- Verification of generic monomorphization, trait bounds, and exhaustiveness analysis.
 
 ## Acceptance
 - [ ] Differential equality over the corpus (documented counts); module tests pass in interp and native.
-- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Sub-tasks T081a, T081b, T081c integrated and passing differential checks.
+- [ ] Full test suite passes; build warning-free; archcheck clean.
 - [ ] Report `_workspaces/reports/T081-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+- MIR building (handled in T082).
 
 ## Notes
-- `model: opus`: ports of the type checker, trait solver, ownership analyses, verifier, interpreter and optimizer need the same judgement as the C originals (model policy).
-- Template task: T076 splits it per C module (≤ ~1.5k lines of Axiom per task), names the exact differential artefact and harness entry, and may change these `paths` (ADR-0005 §8). This id stays as the group's integration + differential task.
-- Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
-- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- `model: opus`: Porting the type checker and trait solver requires semantic precision (model policy).
+- Group integration task for T081a, T081b, T081c per ADR-0005 §8 and SPEC-20 §4.5.
+- Exact differential artefact: `inspect --emit=thir` and type error diagnostics.
+- Harness entry: `tests/selfhost/typeck_traits`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
-
-## Log
-- 2026-10-06 02:23:59 covers += REQ-GEN-100 (metadata only)
-- 2026-10-06 02:31:23 covers += REQ-TRT-139, REQ-TYP-354, REQ-TYP-355 (metadata only)

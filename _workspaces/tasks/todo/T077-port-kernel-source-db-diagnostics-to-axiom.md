@@ -1,12 +1,12 @@
 ---
 id: T077
-title: Port kernel, source DB, diagnostics to Axiom
+title: Port kernel, source DB, diagnostics to Axiom (integration + differential)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T076]
+depends: [T077a, T077b, T077c]
 priority: 111
 status: todo
 attempts: 0
@@ -14,28 +14,27 @@ paths: [compiler/kernel_source_diag, tests/selfhost/kernel_source_diag]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-020, REQ-DRV-021]
 ---
-# T077 — Port kernel, source DB, diagnostics to Axiom
+# T077 — Port kernel, source DB, diagnostics to Axiom (integration + differential)
 
 ## Goal
-Port kernel, source DB, diagnostics to Axiom, keeping behaviour identical to the C implementation.
+Integrate kernel, source DB, and diagnostics in Axiom and run differential testing against `axiom0`.
 
 ## Scope
-- Idiomatic canonical Axiom port of the corresponding axiom0 modules; same data model and diagnostics codes.
-- Differential test harness comparing outputs with axiom0 over the whole tests/ corpus.
+- Integrate `compiler/kernel`, `compiler/source`, and `compiler/diag`.
+- Differential test harness comparing outputs with `axiom0` across the entire tests corpus.
+- Verification of `--json` error emission and source span rendering.
 
 ## Acceptance
-- [ ] Differential equality over the corpus (documented counts); module tests pass in interp and native.
-- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Differential equality over the corpus (documented counts); integration tests pass in interp and native.
+- [ ] Sub-tasks T077a, T077b, T077c integrated into a cohesive subsystem.
+- [ ] Full test suite passes; build warning-free; archcheck clean.
 - [ ] Report `_workspaces/reports/T077-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+- Lexer and parser (handled in T078 and T079).
 
 ## Notes
-- Template task: T076 splits it per C module (≤ ~1.5k lines of Axiom per task), names the exact differential artefact and harness entry, and may change these `paths` (ADR-0005 §8). This id stays as the group's integration + differential task.
-- Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
-- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- Group integration task for T077a, T077b, T077c per ADR-0005 §8 and SPEC-20 §4.1.
+- Exact differential artefact: `--json` error diagnostics and data structure dumps.
+- Harness entry: `tests/selfhost/kernel_source_diag`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
-
-## Log
-- 2026-10-06 02:23:57 covers += REQ-DRV-020, REQ-DRV-021 (metadata only)

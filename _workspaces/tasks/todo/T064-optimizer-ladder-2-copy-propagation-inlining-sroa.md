@@ -31,9 +31,8 @@ Meaningful MIR optimizations with legality from ownership facts.
 - Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
 
 ## Notes
-- `paths` are provisional: T076 fixes the `compiler/<module>` layout and re-paths this task (ADR-0005 §8).
+- Paths re-pathed to canonical `compiler/<module>` layout by T076 (ADR-0005 §8, SPEC-20 §8).
 - Roadmap epic E15.4 (moved out of the C core by ROADMAP R7: not needed for self-hosting). Implemented in `compiler/` (Axiom) after T087; the phase planning task may split it, keeping this id for the first slice.
-- 
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 

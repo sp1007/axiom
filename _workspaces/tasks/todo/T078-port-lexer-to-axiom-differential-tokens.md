@@ -1,12 +1,12 @@
 ---
 id: T078
-title: Port lexer to Axiom (differential tokens)
+title: Port lexer to Axiom (integration + differential tokens)
 phase: P10-selfhost
 owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T077]
+depends: [T078a]
 priority: 112
 status: todo
 attempts: 0
@@ -14,28 +14,27 @@ paths: [compiler/lexer, tests/selfhost/lexer]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-LEX-114]
 ---
-# T078 — Port lexer to Axiom (differential tokens)
+# T078 — Port lexer to Axiom (integration + differential tokens)
 
 ## Goal
-Port lexer to Axiom (differential tokens), keeping behaviour identical to the C implementation.
+Integrate lexer in Axiom and run differential token testing against `axiom0`.
 
 ## Scope
-- Idiomatic canonical Axiom port of the corresponding axiom0 modules; same data model and diagnostics codes.
-- Differential test harness comparing outputs with axiom0 over the whole tests/ corpus.
+- Integrate `compiler/lex` and execute tokenization over the full test corpus.
+- Differential test harness comparing token streams with `axiom0 inspect --emit=tokens`.
+- Validation of span tracking, escape sequences, and comment handling.
 
 ## Acceptance
 - [ ] Differential equality over the corpus (documented counts); module tests pass in interp and native.
-- [ ] Full test suite passes (not only new tests); build warning-free; archcheck clean (once available).
+- [ ] Sub-task T078a integrated and verified across all tests.
+- [ ] Full test suite passes; build warning-free; archcheck clean.
 - [ ] Report `_workspaces/reports/T078-report.md` with exact `## Files changed`.
 
 ## Out of scope
-- Features scheduled for later tasks (see spec/SPEC-00-bootstrap.md milestone ladder); do not jump ahead.
+- Parsing (handled in T079).
 
 ## Notes
-- Template task: T076 splits it per C module (≤ ~1.5k lines of Axiom per task), names the exact differential artefact and harness entry, and may change these `paths` (ADR-0005 §8). This id stays as the group's integration + differential task.
-- Module tests run in both modes: OS and heap access go through std (host intrinsics, ADR-0002); maps iterate in insertion order and hash like axiom0 (ADR-0004 §4), so dumps are byte-identical.
-- Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
+- Group integration task for T078a per ADR-0005 §8 and SPEC-20 §4.2.
+- Exact differential artefact: `inspect --emit=tokens`.
+- Harness entry: `tests/selfhost/lexer`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
-
-## Log
-- 2026-10-06 02:24:21 covers += REQ-LEX-114 (metadata only)

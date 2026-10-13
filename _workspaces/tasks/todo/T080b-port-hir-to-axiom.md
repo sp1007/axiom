@@ -1,0 +1,39 @@
+---
+id: T080b
+title: Port HIR data model and lowering to Axiom
+phase: P10-selfhost
+owner: axiom-stdlib
+reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
+depends: [T080a]
+priority: 114
+status: todo
+attempts: 0
+paths: [compiler/hir, tests/selfhost/hir]
+spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
+covers: [REQ-MOD-142, REQ-RES-243]
+---
+# T080b — Port HIR data model and lowering to Axiom
+
+## Goal
+Port High-level Intermediate Representation (HIR) and AST->HIR lowering (`compiler/hir/`) from C to Axiom.
+
+## Scope
+- Port HIR node structures, definition IDs, and lowering from AST to HIR.
+- Port pattern desugaring, `for`-loop desugaring, and path resolution lowering.
+- Unit tests under `tests/selfhost/hir/`.
+
+## Acceptance
+- [ ] HIR lowering implemented in `compiler/hir/` with ≤ 1,500 lines of Axiom.
+- [ ] Unit tests pass in both interpreter and native modes.
+- [ ] Emitted HIR matches `axiom0 inspect --emit=hir` on representative test programs.
+- [ ] Full test suite passes; build warning-free; archcheck clean.
+- [ ] Report `_workspaces/reports/T080b-report.md` with exact `## Files changed`.
+
+## Out of scope
+- Full corpus differential validation (handled in integration task T080).
+
+## Notes
+- Sub-task of T080 split per ADR-0005 §8 and SPEC-20 §4.4.
+- All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
