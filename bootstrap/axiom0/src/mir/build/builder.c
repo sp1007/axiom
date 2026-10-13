@@ -170,6 +170,7 @@ static void set_terminator(Builder *b, AxMirBbId bb, AxMirTerminator term) {
 
 
 static bool type_needs_drop(Builder *b, TypeId ty) {
+    if (TypeId_is_none(ty) || ty.v == 0) return false;
     const AxType *t = ax_type_get(&b->thir->interner, ty);
     if (!t) return false;
     if (t->kind == AX_TY_STRUCT) {
@@ -189,6 +190,14 @@ static bool type_needs_drop(Builder *b, TypeId ty) {
         for (size_t v = 0; v < t->enm.variant_count; v++) {
             for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
                 if (type_needs_drop(b, t->enm.variant_fields[v][i])) return true;
+            }
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_CLOSURE) {
+        for (size_t i = 0; i < t->closure.capture_count; i++) {
+            if (t->closure.captures[i].mode == AX_CAP_MOVE) {
+                if (type_needs_drop(b, t->closure.captures[i].type)) return true;
             }
         }
         return false;
@@ -624,19 +633,33 @@ static AxMirPlace build_place(Builder *b, const AxHirExpr *expr) {
         for (size_t i = 0; i < b->var_count; i++) {
             if (b->var_map[i].sym.v == sym.v) {
                 AxMirPlace p = { b->var_map[i].loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                TypeId loc_ty = b->locals[p.local.v].ty;
+                if (!TypeId_is_none(loc_ty) && loc_ty.v != 0) {
+                    const AxType *lt = ax_type_get(&b->thir->interner, loc_ty);
+                    if (lt && (lt->kind == AX_TY_VIEW || lt->kind == AX_TY_MUT_VIEW)) {
+                        TypeId expr_ty = get_expr_type(b, expr);
+                        if (expr_ty.v != 0 && expr_ty.v != loc_ty.v) {
+                            AxMirProjection *projs = ax_arena_alloc(b->arena, sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                            projs[0].kind = AX_MIR_PROJ_DEREF;
+                            p.projs = projs;
+                            p.proj_count = 1;
+                        }
+                    }
+                }
                 return p;
             }
         }
     } else if (expr->kind == AX_HIR_EXPR_FIELD) {
         AxMirPlace base = build_place(b, expr->field.base);
-        TypeId base_ty = *AxExprTypeMap_get(&b->thir->expr_types, expr->field.base);
-        const AxType *t = ax_type_get(&b->thir->interner, base_ty);
+        TypeId *base_ty_ptr = AxExprTypeMap_get(&b->thir->expr_types, expr->field.base);
+        TypeId base_ty = base_ty_ptr ? *base_ty_ptr : (TypeId){0};
+        const AxType *t = (TypeId_is_none(base_ty) || base_ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, base_ty);
         
         size_t deref_count = 0;
         while (t && (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW || t->kind == AX_TY_PTR)) {
             deref_count++;
             base_ty = (t->kind == AX_TY_PTR) ? t->ptr.pointee : t->view.pointee;
-            t = ax_type_get(&b->thir->interner, base_ty);
+            t = (TypeId_is_none(base_ty) || base_ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, base_ty);
         }
         
         uint32_t idx = 0;
@@ -1004,11 +1027,9 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
         return op;
     } else if (expr->kind == AX_HIR_EXPR_PATH) {
         AxSymbolId sym = expr->path.path.symbol;
-        AxMirLocalId loc = {0};
         bool found = false;
         for (size_t i = 0; i < b->var_count; i++) {
             if (b->var_map[i].sym.v == sym.v) {
-                loc = b->var_map[i].loc;
                 found = true;
                 break;
             }
@@ -1021,9 +1042,9 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
             op.constant.val = cval ? *cval : sym.v;
             return op;
         } else {
-            AxMirPlace p = { loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+            AxMirPlace p = build_place(b, expr);
             TypeId ty = get_expr_type(b, expr);
-            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            const AxType *t = (TypeId_is_none(ty) || ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, ty);
             bool is_copy = true;
             if (t && (t->kind == AX_TY_STR || t->kind == AX_TY_ARRAY)) {
                 is_copy = false;
@@ -1050,13 +1071,23 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
         } else {
             AxMirPlace p = build_place(b, expr);
             TypeId ty = get_expr_type(b, expr);
-            const AxType *t = ax_type_get(&b->thir->interner, ty);
+            const AxType *t = (TypeId_is_none(ty) || ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, ty);
             bool is_copy = true;
             if (t && (t->kind == AX_TY_STR || t->kind == AX_TY_ARRAY)) {
                 is_copy = false;
             }
             op.kind = is_copy ? AX_MIR_OP_COPY : AX_MIR_OP_MOVE;
             op.place = p;
+            return op;
+        }
+    } else if (expr->kind == AX_HIR_EXPR_CLOSURE) {
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = (TypeId_is_none(ty) || ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, ty);
+        if (t && t->kind == AX_TY_CLOSURE && t->closure.capture_count == 0) {
+            op.kind = AX_MIR_OP_CONST;
+            op.constant.ty = ty;
+            op.constant.kind = AX_MIR_CONST_INT;
+            op.constant.val = t->closure.fn_sym;
             return op;
         }
     }
@@ -2235,6 +2266,77 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         stmt.assign.rvalue.ref.bk = expr->view.is_mut ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
         stmt.assign.rvalue.ref.place = p;
         push_stmt(b, b->current_bb, stmt);
+    } else if (expr->kind == AX_HIR_EXPR_CLOSURE) {
+        TypeId ty = get_expr_type(b, expr);
+        const AxType *t = (TypeId_is_none(ty) || ty.v == 0) ? NULL : ax_type_get(&b->thir->interner, ty);
+        if (t && t->kind == AX_TY_CLOSURE) {
+            if (t->closure.capture_count == 0) {
+                AxMirOperand op = {0};
+                op.kind = AX_MIR_OP_CONST;
+                op.constant.ty = ty;
+                op.constant.kind = AX_MIR_CONST_INT;
+                op.constant.val = t->closure.fn_sym;
+
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                stmt.assign.rvalue.use = op;
+                push_stmt(b, b->current_bb, stmt);
+            } else {
+                size_t num_ops = 1 + t->closure.capture_count;
+                AxMirOperand *ops = ax_arena_alloc_array(b->arena, num_ops, sizeof(AxMirOperand), _Alignof(AxMirOperand));
+                
+                ops[0].kind = AX_MIR_OP_CONST;
+                ops[0].constant.ty = b->thir->interner.t_u64;
+                ops[0].constant.kind = AX_MIR_CONST_INT;
+                ops[0].constant.val = t->closure.fn_sym;
+                
+                for (size_t i = 0; i < t->closure.capture_count; i++) {
+                    AxSymbolId sym = t->closure.captures[i].sym;
+                    AxCaptureMode mode = t->closure.captures[i].mode;
+                    TypeId cap_field_ty = t->closure.captures[i].type;
+                    
+                    AxMirPlace cap_place = {0};
+                    for (size_t v = 0; v < b->var_count; v++) {
+                        if (b->var_map[v].sym.v == sym.v) {
+                            cap_place = (AxMirPlace){ b->var_map[v].loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                            break;
+                        }
+                    }
+                    if (mode == AX_CAP_VIEW || mode == AX_CAP_MUT_VIEW) {
+                        AxMirLocalId temp = add_local(b, AX_MIR_LOCAL_TEMP, cap_field_ty, false);
+                        AxMirPlace temp_place = { temp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                        AxMirStmt ref_stmt = {0};
+                        ref_stmt.kind = AX_MIR_STMT_ASSIGN;
+                        ref_stmt.location = expr->span;
+                        ref_stmt.assign.place = temp_place;
+                        ref_stmt.assign.rvalue.kind = AX_MIR_RVALUE_REF;
+                        ref_stmt.assign.rvalue.ref.bk = (mode == AX_CAP_MUT_VIEW) ? AX_MIR_BORROW_MUT : AX_MIR_BORROW_SHARED;
+                        ref_stmt.assign.rvalue.ref.place = cap_place;
+                        push_stmt(b, b->current_bb, ref_stmt);
+                        
+                        ops[1 + i].kind = AX_MIR_OP_MOVE;
+                        ops[1 + i].place = temp_place;
+                    } else if (mode == AX_CAP_COPY) {
+                        ops[1 + i].kind = AX_MIR_OP_COPY;
+                        ops[1 + i].place = cap_place;
+                    } else { // AX_CAP_MOVE
+                        ops[1 + i].kind = AX_MIR_OP_MOVE;
+                        ops[1 + i].place = cap_place;
+                    }
+                }
+                
+                AxMirStmt stmt = {0};
+                stmt.kind = AX_MIR_STMT_ASSIGN;
+                stmt.assign.place = dest;
+                stmt.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+                stmt.assign.rvalue.aggregate.variant_idx = 0;
+                stmt.assign.rvalue.aggregate.operand_count = num_ops;
+                stmt.assign.rvalue.aggregate.operands = ops;
+                push_stmt(b, b->current_bb, stmt);
+            }
+        }
     } else {
         AX_ICE("Unhandled HIR expr kind in MIR builder: %d", expr->kind);
     }
@@ -2374,10 +2476,15 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
     
     add_local(&b, AX_MIR_LOCAL_RETURN, ret_ty, true);
     
-    for (const AxHirParam *p = func->fn.params; p != NULL; p = p->next) {
+    const AxType *fn_type_info = (func_ty.v != 0) ? ax_type_get(&thir->interner, func_ty) : NULL;
+    size_t param_idx = 0;
+    for (const AxHirParam *p = func->fn.params; p != NULL; p = p->next, param_idx++) {
         TypeId pty = {0};
         const TypeId *pty_ptr = AxParamTypeMap_get(&thir->param_types, p);
         if (pty_ptr) pty = *pty_ptr;
+        else if (fn_type_info && fn_type_info->kind == AX_TY_FN && param_idx < fn_type_info->fn.param_count) {
+            pty = fn_type_info->fn.param_types[param_idx];
+        }
         AxMirLocalId loc = add_local(&b, AX_MIR_LOCAL_ARG, pty, p->is_mut);
         push_drop(&b, (AxMirPlace){ loc, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 }, pty, false);
         if (b.var_count >= b.var_cap) {

@@ -11,58 +11,6 @@ typedef struct {
     AxLocation move_loc;
 } AxOwnStateInfo;
 
-bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in) {
-    if (id.v == 0) return false;
-    const AxType *ty = ax_type_get(&thir->interner, id);
-    if (!ty) return false;
-    
-    switch ((int)ty->kind) {
-        case AX_TY_ERROR: return false;
-        case AX_TY_UNIT:
-        case AX_TY_NEVER:
-        case AX_TY_BOOL:
-        case AX_TY_CHAR:
-        case AX_TY_I8: case AX_TY_I16: case AX_TY_I32: case AX_TY_I64: case AX_TY_ISIZE:
-        case AX_TY_U8: case AX_TY_U16: case AX_TY_U32: case AX_TY_U64: case AX_TY_USIZE:
-        case AX_TY_PTR:
-        case AX_TY_FN:
-        case AX_TY_INT_VAR:
-        case AX_TY_VIEW:
-            return true;
-        case AX_TY_STR:
-            return false;
-        case AX_TY_ARRAY:
-            return ax_type_is_copy(ty->array.elem, thir, str_in);
-        case AX_TY_TUPLE:
-            for (size_t i = 0; i < ty->tuple.field_count; i++) {
-                if (!ax_type_is_copy(ty->tuple.fields[i], thir, str_in)) return false;
-            }
-            return true;
-        case AX_TY_STRUCT:
-        case AX_TY_ENUM: {
-            const AxHirItem *def = (ty->kind == AX_TY_STRUCT) ? ty->strct.def : ty->enm.def;
-            if (!def) return false;
-            for (const AxHirAttr *attr = def->attrs; attr; attr = attr->next) {
-                StrView attr_name = ax_interner_get(str_in, attr->name);
-                if (attr_name.len == 6 && memcmp(attr_name.ptr, "derive", 6) == 0) {
-                    for (const AxHirAttrArg *arg = attr->args; arg; arg = arg->next) {
-                        StrView arg_name = {0};
-                        if (arg->name.v != 0) arg_name = ax_interner_get(str_in, arg->name);
-                        else if (arg->expr && arg->expr->kind == AX_HIR_EXPR_PATH) {
-                            if (arg->expr->path.path.name.v != 0) arg_name = ax_interner_get(str_in, arg->expr->path.path.name);
-                        }
-                        if (arg_name.len == 4 && memcmp(arg_name.ptr, "Copy", 4) == 0) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            return false;
-        }
-        default: return false;
-    }
-}
-
 typedef struct PathNode {
     uint32_t parent;
     uint32_t first_child;
@@ -79,6 +27,7 @@ typedef struct {
 } PathCtx;
 
 static void populate_path_tree(PathCtx *ctx, uint32_t node_idx, TypeId ty_id, const AxThir *thir, const StrInterner *str_in) {
+    if (TypeId_is_none(ty_id) || ty_id.v == 0) return;
     const AxType *ty = ax_type_get(&thir->interner, ty_id);
     if (!ty) return;
 
@@ -348,13 +297,39 @@ static void visit_bb(Visitor *v, const AxMirBb *bb) {
             }
             do_move(v, &term->drop.place, loc);
             break;
-        case AX_MIR_TERM_CALL:
-            visit_operand(v, &term->call.func, loc);
+        case AX_MIR_TERM_CALL: {
+            bool moves_callee = true;
+            if (term->call.func.kind == AX_MIR_OP_COPY || term->call.func.kind == AX_MIR_OP_MOVE) {
+                if (term->call.func.place.local.v < v->body->local_count) {
+                    TypeId callee_ty = v->body->locals[term->call.func.place.local.v].ty;
+                    const AxType *t = ax_type_get(&v->thir->interner, callee_ty);
+                    if (t && t->kind == AX_TY_CLOSURE) {
+                        bool has_move = false;
+                        for (size_t i = 0; i < t->closure.capture_count; i++) {
+                            if (t->closure.captures[i].mode == AX_CAP_MOVE) {
+                                has_move = true;
+                                break;
+                            }
+                        }
+                        if (!has_move) {
+                            moves_callee = false;
+                        }
+                    } else if (t && t->kind == AX_TY_PARAM) {
+                        moves_callee = false;
+                    }
+                }
+            }
+            if (moves_callee) {
+                visit_operand(v, &term->call.func, loc);
+            } else {
+                check_use(v, &term->call.func.place, loc);
+            }
             for (size_t i = 0; i < term->call.arg_count; i++) {
                 visit_operand(v, &term->call.args[i], loc);
             }
             do_assign(v, &term->call.destination, loc);
             break;
+        }
         case AX_MIR_TERM_ASSERT:
             visit_operand(v, &term->assert.cond, loc);
             break;

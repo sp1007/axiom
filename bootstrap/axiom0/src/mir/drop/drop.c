@@ -5,8 +5,18 @@
 #include <stdlib.h>
 
 static bool needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
+    if (TypeId_is_none(ty) || ty.v == 0) return false;
     const AxType *t = ax_type_get(&thir->interner, ty);
     if (!t) return false;
+
+    if (t->kind == AX_TY_CLOSURE) {
+        for (size_t i = 0; i < t->closure.capture_count; i++) {
+            if (t->closure.captures[i].mode == AX_CAP_MOVE && needs_drop(t->closure.captures[i].type, thir, interner, hir, db)) {
+                return true;
+            }
+        }
+        return false;
+    }
     
     if (t->kind == AX_TY_STRUCT) {
         if (t->strct.def->struct_decl.struct_fields == NULL) return true;
@@ -123,14 +133,20 @@ static void visit_rvalue(const AxMirRvalue *rv, uint32_t *local_flags, size_t or
 static TypeId place_type(AxMirPlace p, AxMirBody *body, const AxThir *thir) {
     TypeId current_ty = body->locals[p.local.v].ty;
     for (size_t i = 0; i < p.proj_count; i++) {
+        if (TypeId_is_none(current_ty) || current_ty.v == 0) break;
         const AxMirProjection *proj = &p.projs[i];
         const AxType *ty = ax_type_get(&thir->interner, current_ty);
+        if (!ty) break;
         if (proj->kind == AX_MIR_PROJ_DEREF) {
             if (ty->kind == AX_TY_VIEW || ty->kind == AX_TY_MUT_VIEW) current_ty = ty->view.pointee;
             else current_ty = ty->ptr.pointee;
         } else if (proj->kind == AX_MIR_PROJ_FIELD) {
             if (ty->kind == AX_TY_STRUCT) current_ty = ty->strct.fields[proj->field_idx];
             else if (ty->kind == AX_TY_TUPLE) current_ty = ty->tuple.fields[proj->field_idx];
+            else if (ty->kind == AX_TY_CLOSURE) {
+                if (proj->field_idx == 0) current_ty = thir->interner.t_usize;
+                else if (proj->field_idx - 1 < ty->closure.capture_count) current_ty = ty->closure.captures[proj->field_idx - 1].type;
+            }
         } else if (proj->kind == AX_MIR_PROJ_DOWNCAST) {
             // Downcast doesn't change the logical type (still the enum), but the next field projection will use the variant's fields
             // We need a way to track the active variant, or we can just peek ahead!
@@ -157,7 +173,9 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
     uint32_t flag = bb->terminator.drop_flag;
     
     TypeId ty_id = place_type(place, body, thir);
+    if (TypeId_is_none(ty_id) || ty_id.v == 0) return false;
     const AxType *ty = ax_type_get(&thir->interner, ty_id);
+    if (!ty) return false;
     
     AxHirItem *drop_fn = NULL;
     if (ty && ty->kind == AX_TY_STRUCT) {
@@ -217,6 +235,37 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
                 body->bbs[field_bb.v].terminator.drop_flag = 0; // fields inherit the check from the outer struct for now
                 
                 inner_target = field_bb;
+            }
+        }
+    } else if (ty && ty->kind == AX_TY_CLOSURE) {
+        for (size_t i = ty->closure.capture_count; i > 0; i--) {
+            size_t idx = i - 1;
+            if (ty->closure.captures[idx].mode == AX_CAP_MOVE) {
+                TypeId field_ty = ty->closure.captures[idx].type;
+                if (needs_drop(field_ty, thir, interner, hir, db)) {
+                    AxMirBb *bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
+                    memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
+                    body->bbs = bbs;
+                    AxMirBbId field_bb = { (uint32_t)body->bb_count++ };
+                    
+                    AxMirProjection *projs = ax_arena_alloc(&body->arena, (place.proj_count + 1) * sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                    if (place.proj_count > 0) memcpy(projs, place.projs, place.proj_count * sizeof(AxMirProjection));
+                    projs[place.proj_count].kind = AX_MIR_PROJ_FIELD;
+                    projs[place.proj_count].field_idx = (uint32_t)(idx + 1);
+                    
+                    AxMirPlace field_place = place;
+                    field_place.projs = projs;
+                    field_place.proj_count++;
+                    
+                    body->bbs[field_bb.v].stmts = NULL;
+                    body->bbs[field_bb.v].stmt_count = 0;
+                    body->bbs[field_bb.v].terminator.kind = AX_MIR_TERM_DROP;
+                    body->bbs[field_bb.v].terminator.drop.place = field_place;
+                    body->bbs[field_bb.v].terminator.drop.target = inner_target;
+                    body->bbs[field_bb.v].terminator.drop_flag = 0;
+                    
+                    inner_target = field_bb;
+                }
             }
         }
     } else if (ty && ty->kind == AX_TY_ENUM) {

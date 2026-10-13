@@ -881,6 +881,20 @@ static AxAstExpr *parse_primary(Parser *p) {
             }
         }
         return expr;
+    } else if (check(p, AX_TOK_KW_MOVE)) {
+        Span sp = advance(p)->span;
+        report(p, sp, AX_PARSE_RESERVED_KEYWORD, "The 'move' keyword is reserved in v0.1; omit it for closures");
+        if (check(p, AX_TOK_PIPE_PIPE) || check(p, AX_TOK_PIPE)) {
+            AxAstExpr *cl = parse_primary(p);
+            (void)cl;
+        }
+        expr->kind = AX_EXPR_ERROR;
+        return expr;
+    } else if (check(p, AX_TOK_KW_YIELD)) {
+        Span sp = advance(p)->span;
+        report(p, sp, AX_PARSE_RESERVED_KEYWORD, "The 'yield' keyword is reserved in v0.1");
+        expr->kind = AX_EXPR_ERROR;
+        return expr;
     } else if (consume(p, AX_TOK_PIPE_PIPE) || consume(p, AX_TOK_PIPE)) {
         expr->kind = AX_EXPR_CLOSURE;
         AxTokenKind k = peek_nth(p, -1)->kind;
@@ -1783,6 +1797,11 @@ static AxAstItem *parse_item(Parser *p) {
         }
         p->allow_bodiless_fn = old_bodiless;
         expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
+    } else if (check(p, AX_TOK_KW_UNION)) {
+        report(p, peek(p)->span, AX_PARSE_RESERVED_KEYWORD, "The 'union' keyword is reserved in v0.1");
+        advance(p);
+        item->kind = AX_ITEM_ERROR;
+        sync_to_term(p);
     } else {
         report(p, item->span, AX_PARSE_EXPECTED_ITEM, "Expected item");
         item->kind = AX_ITEM_ERROR;

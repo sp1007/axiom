@@ -170,6 +170,8 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
                     current_ty = ty->strct.fields[proj->field_idx];
                 } else if (ty->kind == AX_TY_TUPLE) {
                     current_ty = ty->tuple.fields[proj->field_idx];
+                } else if (ty->kind == AX_TY_CLOSURE) {
+                    current_ty = (proj->field_idx == 0) ? ctx->thir->interner.t_u64 : ty->closure.captures[proj->field_idx - 1].type;
                 }
             }
             ptr += offset;
@@ -270,7 +272,8 @@ static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperan
         if (size == 1) val = *(uint8_t*)ptr;
         else if (size == 2) val = *(uint16_t*)ptr;
         else if (size == 4) val = *(uint32_t*)ptr;
-        else if (size == 8) val = *(uint64_t*)ptr;
+        else if (size >= 8) val = *(uint64_t*)ptr;
+        else val = *(uint64_t*)ptr;
         return val;
     }
 }
@@ -532,7 +535,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                         
                         for (size_t i = 0; i < stmt->assign.rvalue.aggregate.operand_count; i++) {
                             uint32_t offset = 0;
-                            TypeId field_ty;
+                            TypeId field_ty = TypeId_none();
                             if (ty->kind == AX_TY_ARRAY) {
                                 field_ty = ty->array.elem;
                                 offset = i * ax_type_size(field_ty, &ctx->thir->interner);
@@ -541,7 +544,13 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
                                 field_ty = ty->enm.variant_fields[stmt->assign.rvalue.aggregate.variant_idx][i];
                             } else {
                                 offset = ax_type_field_offset(dest_ty, i, &ctx->thir->interner);
-                                field_ty = (ty->kind == AX_TY_STRUCT) ? ty->strct.fields[i] : ty->tuple.fields[i];
+                                if (ty->kind == AX_TY_STRUCT) {
+                                    field_ty = ty->strct.fields[i];
+                                } else if (ty->kind == AX_TY_TUPLE) {
+                                    field_ty = ty->tuple.fields[i];
+                                } else if (ty->kind == AX_TY_CLOSURE) {
+                                    field_ty = (i == 0) ? ctx->thir->interner.t_u64 : ty->closure.captures[i - 1].type;
+                                }
                             }
                             uint32_t f_size = ax_type_size(field_ty, &ctx->thir->interner);
                             
@@ -1077,13 +1086,42 @@ skip_write:;
                 break;
             }
             
-            AxInterpValue *call_args = calloc(term->call.arg_count, sizeof(AxInterpValue));
+            size_t callee_param_count = 0;
+            for (const AxHirParam *p = callee->fn.params; p; p = p->next) callee_param_count++;
+            
+            size_t total_args = callee_param_count > term->call.arg_count ? callee_param_count : term->call.arg_count;
+            size_t cap_count = callee_param_count > term->call.arg_count ? (callee_param_count - term->call.arg_count) : 0;
+            
+            AxInterpValue *call_args = calloc(total_args ? total_args : 1, sizeof(AxInterpValue));
+            
+            if (cap_count > 0 && term->call.func.kind != AX_MIR_OP_CONST) {
+                TypeId func_ty;
+                uint8_t *closure_ptr = get_place_ptr(ctx, &frame, &term->call.func.place, &func_ty, NULL);
+                uint32_t offset = 8;
+                const AxHirParam *cp = callee->fn.params;
+                for (size_t c = 0; c < cap_count && cp; c++, cp = cp->next) {
+                    const TypeId *pty = AxParamTypeMap_get(&ctx->thir->param_types, cp);
+                    TypeId cap_field_ty = pty ? *pty : ctx->thir->interner.t_u64;
+                    uint32_t a = ax_type_align(cap_field_ty, &ctx->thir->interner);
+                    uint32_t s = ax_type_size(cap_field_ty, &ctx->thir->interner);
+                    if (a > 0) offset = (offset + a - 1) & ~(a - 1);
+                    memcpy(&call_args[c], closure_ptr + offset, s ? s : 8);
+                    offset += (s ? s : 8);
+                }
+            }
+            
             for (size_t i = 0; i < term->call.arg_count; i++) {
-                if (term->call.args[i].kind == AX_MIR_OP_CONST) { call_args[i].vals[0] = term->call.args[i].constant.val; } else { TypeId src_ty; uint8_t* src = get_place_ptr(ctx, &frame, &term->call.args[i].place, &src_ty, NULL); memcpy(&call_args[i], src, ax_type_size(src_ty, &ctx->thir->interner)); }
+                if (term->call.args[i].kind == AX_MIR_OP_CONST) {
+                    call_args[cap_count + i].vals[0] = term->call.args[i].constant.val;
+                } else {
+                    TypeId src_ty;
+                    uint8_t* src = get_place_ptr(ctx, &frame, &term->call.args[i].place, &src_ty, NULL);
+                    memcpy(&call_args[cap_count + i], src, ax_type_size(src_ty, &ctx->thir->interner));
+                }
             }
             
             AxInterpValue ret_val = {0};
-            eval_call(ctx, callee, call_args, term->call.arg_count, &ret_val);
+            eval_call(ctx, callee, call_args, total_args, &ret_val);
             free(call_args);
             
             if (ctx->failed) break;

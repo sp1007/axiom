@@ -45,6 +45,9 @@ static bool types_compatible(const AxThir *thir, TypeId a, TypeId b) {
         if (ta->kind == AX_TY_VIEW && tb->kind == AX_TY_VIEW) return types_compatible(thir, ta->view.pointee, tb->view.pointee);
         if (ta->kind == AX_TY_MUT_VIEW && tb->kind == AX_TY_MUT_VIEW) return types_compatible(thir, ta->view.pointee, tb->view.pointee);
         if (ta->kind == AX_TY_PTR && tb->kind == AX_TY_PTR) return types_compatible(thir, ta->ptr.pointee, tb->ptr.pointee);
+        if (ta->kind == AX_TY_CLOSURE && tb->kind == AX_TY_CLOSURE) return ta->closure.closure_id == tb->closure.closure_id;
+        if (ta->kind == AX_TY_FN && tb->kind == AX_TY_CLOSURE && tb->closure.capture_count == 0) return true;
+        if (tb->kind == AX_TY_FN && ta->kind == AX_TY_CLOSURE && ta->closure.capture_count == 0) return true;
     }
     return false;
 }
@@ -348,6 +351,21 @@ void ax_verify_mir(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, 
                                 }
                             }
                         }
+                    } else if (t && t->kind == AX_TY_CLOSURE) {
+                        TypeId dest_ty = get_place_type(body, bb->terminator.call.destination);
+                        if (dest_ty.v != 0 && t->closure.ret_type.v != 0 && !types_compatible(thir, dest_ty, t->closure.ret_type)) {
+                            report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
+                        }
+                        if (bb->terminator.call.arg_count != t->closure.param_count) {
+                            report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
+                        } else {
+                            for (size_t a = 0; a < t->closure.param_count; ++a) {
+                                TypeId arg_ty = get_operand_type(body, &bb->terminator.call.args[a]);
+                                if (arg_ty.v != 0 && t->closure.params[a].v != 0 && !types_compatible(thir, arg_ty, t->closure.params[a])) {
+                                    report_verify_error(sink, func, AX_VERIFY_CALL_SIGNATURE);
+                                }
+                            }
+                        }
                     }
                 }
                 set_bit(cur, bb->terminator.call.destination.local.v);
@@ -428,6 +446,14 @@ static bool ax_type_needs_drop(const AxThir *thir, TypeId ty, const AxHirItem *f
         for (size_t v = 0; v < t->enm.variant_count; v++) {
             for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
                 if (ax_type_needs_drop(thir, t->enm.variant_fields[v][i], func)) return true;
+            }
+        }
+        return false;
+    }
+    if (t->kind == AX_TY_CLOSURE) {
+        for (size_t i = 0; i < t->closure.capture_count; i++) {
+            if (t->closure.captures[i].mode == AX_CAP_MOVE) {
+                if (ax_type_needs_drop(thir, t->closure.captures[i].type, func)) return true;
             }
         }
         return false;

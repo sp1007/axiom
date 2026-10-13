@@ -8,11 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T056]
 priority: 77
-status: doing
+status: done
 attempts: 0
 paths: [bootstrap/axiom0/src, tests/run/closure, tests/ui/closure]
 locks: [bootstrap/axiom0/src/diag/codes/TYPE.def, bootstrap/axiom0/src/diag/codes/MOVE.def, bootstrap/axiom0/src/diag/codes/CAP.def]
 spec: [0060, 0069, tasks/0273, tasks/0290, tasks/0671]
+finished: 2026-10-13 11:35:24
 ---
 # T057 — Closures, capture inference, function values
 
@@ -34,3 +35,6 @@ Closures without runtime objects by default.
 ## Notes
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 11:35:24 accepted by QA -> done

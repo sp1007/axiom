@@ -42,6 +42,20 @@ typedef enum AxTypeKind {
 #define AX_TY_MUT_VIEW (AX_TY_INT_VAR + 11)
 #define AX_TY_PARAM (AX_TY_INT_VAR + 12)
 #define AX_TY_VAR (AX_TY_INT_VAR + 13)
+#define AX_TY_CLOSURE (AX_TY_INT_VAR + 14)
+
+typedef enum AxCaptureMode {
+    AX_CAP_COPY,
+    AX_CAP_VIEW,
+    AX_CAP_MUT_VIEW,
+    AX_CAP_MOVE
+} AxCaptureMode;
+
+typedef struct AxClosureCapture {
+    AxSymbolId sym;
+    AxCaptureMode mode;
+    TypeId type;
+} AxClosureCapture;
 
 typedef struct AxType {
     AxTypeKind kind;
@@ -95,6 +109,16 @@ typedef struct AxType {
             size_t variant_count;
             bool is_repr_c;
         } enm;
+        struct {
+            uint32_t closure_id;
+            uint32_t fn_sym;
+            TypeId fn_type;
+            TypeId ret_type;
+            size_t param_count;
+            TypeId *params;
+            size_t capture_count;
+            AxClosureCapture *captures;
+        } closure;
     };
 } AxType;
 
@@ -139,6 +163,8 @@ AX_MAYBE_UNUSED static inline uint64_t ax_key_hash_type(const AxType *k) {
         for (size_t i = 0; i < k->enm.arg_count; i++) {
             h = ax_hash_combine(h, ax_hash_u32(k->enm.args[i].v));
         }
+    } else if (k->kind == AX_TY_CLOSURE) {
+        h = ax_hash_combine(h, ax_hash_u32(k->closure.closure_id));
     }
     return h;
 }
@@ -186,6 +212,8 @@ AX_MAYBE_UNUSED static inline bool ax_key_eq_type(const AxType *a, const AxType 
             if (a->enm.args[i].v != b->enm.args[i].v) return false;
         }
         return true;
+    } else if (a->kind == AX_TY_CLOSURE) {
+        return a->closure.closure_id == b->closure.closure_id;
     }
     return true;
 }
@@ -271,5 +299,6 @@ struct TypeckCtx;
 TypeId ax_subst_ty(struct TypeckCtx *cx, TypeId ty, const AxGenericArgs *args);
 
 AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db);
+bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in);
 
 #endif

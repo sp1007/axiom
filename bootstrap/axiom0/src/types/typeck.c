@@ -82,6 +82,7 @@ typedef struct TypeckCtx {
     const AxHirItem *current_fn;
     const AxHirItem *current_impl;
     TypeId self_ty;
+    uint32_t next_closure_id;
 } TypeckCtx;
 
 static bool dotted_name_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
@@ -140,11 +141,12 @@ static TypeId new_ty_var(TypeckCtx *cx, Span span) {
 
 static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericArgs *out_args);
 static TypeId resolve_ty(TypeckCtx *cx, TypeId id) {
-    if (TypeId_is_none(id)) return id;
+    if (TypeId_is_none(id) || id.v == 0) return id;
     const AxType *t = ax_type_get(&cx->thir->interner, id);
+    if (!t) return id;
     if (t->kind == AX_TY_INT_VAR || t->kind == AX_TY_VAR) {
         TypeId resolved = cx->int_vars[t->int_var.var_id].resolved_to;
-        if (TypeId_is_some(resolved)) {
+        if (TypeId_is_some(resolved) && resolved.v != 0) {
             // Path compression
             TypeId fully_resolved = resolve_ty(cx, resolved);
             cx->int_vars[t->int_var.var_id].resolved_to = fully_resolved;
@@ -155,7 +157,11 @@ static TypeId resolve_ty(TypeckCtx *cx, TypeId id) {
 }
 
 static AxTypeKind kind_of(TypeckCtx *cx, TypeId id) {
-    return ax_type_get(&cx->thir->interner, resolve_ty(cx, id))->kind;
+    if (TypeId_is_none(id) || id.v == 0) return AX_TY_ERROR;
+    TypeId r = resolve_ty(cx, id);
+    if (TypeId_is_none(r) || r.v == 0) return AX_TY_ERROR;
+    const AxType *t = ax_type_get(&cx->thir->interner, r);
+    return t ? t->kind : AX_TY_ERROR;
 }
 
 static bool is_error(TypeckCtx *cx, TypeId id) {
@@ -258,6 +264,19 @@ static bool unify_ty(TypeckCtx *cx, TypeId a, TypeId b) {
         return ok;
     }
 
+    if (ta->kind == AX_TY_FN && tb->kind == AX_TY_FN) {
+        if (ta->fn.param_count != tb->fn.param_count) return false;
+        if (!unify_ty(cx, ta->fn.ret_type, tb->fn.ret_type)) return false;
+        for (size_t i = 0; i < ta->fn.param_count; i++) {
+            if (!unify_ty(cx, ta->fn.param_types[i], tb->fn.param_types[i])) return false;
+        }
+        return true;
+    }
+
+    if (ta->kind == AX_TY_CLOSURE && tb->kind == AX_TY_CLOSURE) {
+        return ta->closure.closure_id == tb->closure.closure_id;
+    }
+
     return false;
 }
 
@@ -276,6 +295,19 @@ static TypeId coerce(TypeckCtx *cx, TypeId ty, TypeId expected, Span span) {
                     return expected;
                 }
             }
+        }
+        if (t_ty->kind == AX_TY_CLOSURE && t_exp->kind == AX_TY_FN) {
+            if (t_ty->closure.capture_count == 0 && t_ty->closure.param_count == t_exp->fn.param_count) {
+                bool ok = unify_ty(cx, t_ty->closure.ret_type, t_exp->fn.ret_type);
+                for (size_t i = 0; i < t_ty->closure.param_count && ok; i++) {
+                    ok = unify_ty(cx, t_ty->closure.params[i], t_exp->fn.param_types[i]);
+                }
+                if (ok) return expected;
+            }
+            return type_error(cx, span, AX_TYPE_MISMATCH);
+        }
+        if (t_ty->kind == AX_TY_FN && t_exp->kind == AX_TY_CLOSURE) {
+            return type_error(cx, span, AX_TYPE_MISMATCH);
         }
     }
     
@@ -517,18 +549,38 @@ static void check_main_signature(TypeckCtx *cx) {
 
 /* ---- THIR finalisation ------------------------------------------------------------------- */
 
+static TypeId resolve_deep_ty(TypeckCtx *cx, TypeId id) {
+    if (TypeId_is_none(id) || id.v == 0) return id;
+    id = resolve_ty(cx, id);
+    if (TypeId_is_none(id) || id.v == 0) return id;
+    const AxType *t = ax_type_get(&cx->thir->interner, id);
+    if (!t) return id;
+    if (t->kind == AX_TY_VIEW || t->kind == AX_TY_MUT_VIEW) {
+        TypeId p = resolve_deep_ty(cx, t->view.pointee);
+        if (!TypeId_eq(p, t->view.pointee)) {
+            AxType nt = *t;
+            nt.view.pointee = p;
+            return ax_intern_type(&cx->thir->interner, &nt);
+        }
+    }
+    return id;
+}
+
 /* Replace every integer type variable in the THIR by its final type, so later phases (MIR
  * builder, verifier, interpreter, dumps) only see concrete types. */
 static void finalize_types(TypeckCtx *cx) {
     uint32_t cur = 0;
     AxExprTypeMapEntry *ee;
-    while (AxExprTypeMap_next(&cx->thir->expr_types, &cur, &ee)) ee->value = resolve_ty(cx, ee->value);
+    while (AxExprTypeMap_next(&cx->thir->expr_types, &cur, &ee)) ee->value = resolve_deep_ty(cx, ee->value);
     cur = 0;
     AxPatTypeMapEntry *pe;
-    while (AxPatTypeMap_next(&cx->thir->pat_types, &cur, &pe)) pe->value = resolve_ty(cx, pe->value);
+    while (AxPatTypeMap_next(&cx->thir->pat_types, &cur, &pe)) pe->value = resolve_deep_ty(cx, pe->value);
     cur = 0;
     AxSymbolTypeMapEntry *se;
-    while (AxSymbolTypeMap_next(&cx->thir->symbol_types, &cur, &se)) se->value = resolve_ty(cx, se->value);
+    while (AxSymbolTypeMap_next(&cx->thir->symbol_types, &cur, &se)) se->value = resolve_deep_ty(cx, se->value);
+    cur = 0;
+    AxParamTypeMapEntry *pme;
+    while (AxParamTypeMap_next(&cx->thir->param_types, &cur, &pme)) pme->value = resolve_deep_ty(cx, pme->value);
 }
 
 typedef enum AxTraitResult {
@@ -943,6 +995,41 @@ static bool satisfies_bound(TypeckCtx *cx, TypeId arg_ty, AxHirType *bound) {
     StrView bound_name = (bound->span.file.v != 0) ? ax_source_db_span_text(cx->db, bound->span) : (StrView){0};
     if (bound_name.len == 0 && bound->path.path.name.v != 0) bound_name = ax_interner_get(cx->str_in, bound->path.path.name);
 
+    StrView tr_name = (bound->path.path.name.v != 0) ? ax_interner_get(cx->str_in, bound->path.path.name) : bound_name;
+    bool is_fn = ax_sv_eq_cstr(tr_name, "Fn");
+    bool is_fn_mut = ax_sv_eq_cstr(tr_name, "FnMut");
+    bool is_fn_once = ax_sv_eq_cstr(tr_name, "FnOnce");
+    bool is_callable = ax_sv_eq_cstr(tr_name, "Callable");
+
+    if (is_fn || is_fn_mut || is_fn_once || is_callable) {
+        const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
+        if (t->kind == AX_TY_PARAM || t->kind == AX_TY_VAR || t->kind == AX_TY_INT_VAR) return true;
+        if (t->kind == AX_TY_FN) return true;
+        if (t->kind == AX_TY_CLOSURE) {
+            if (is_fn) {
+                for (size_t i = 0; i < t->closure.capture_count; i++) {
+                    if (t->closure.captures[i].mode == AX_CAP_MUT_VIEW ||
+                        t->closure.captures[i].mode == AX_CAP_MOVE) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (is_fn_mut) {
+                for (size_t i = 0; i < t->closure.capture_count; i++) {
+                    if (t->closure.captures[i].mode == AX_CAP_MOVE) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            if (is_fn_once || is_callable) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     const AxType *t = ax_type_get(&cx->thir->interner, arg_ty);
     if (t->kind == AX_TY_PARAM || t->kind == AX_TY_VAR || t->kind == AX_TY_INT_VAR) return true;
 
@@ -1078,6 +1165,7 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
     cx.db = db;
     cx.return_type = thir.interner.t_unit;
     cx.in_loop = false;
+    cx.next_closure_id = 1;
 
     // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
@@ -1423,7 +1511,8 @@ AxThir ax_typeck(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const 
                                   (top_it->kind == AX_HIR_ITEM_IMPL ? top_it->impl.members : 
                                   (top_it->kind == AX_HIR_ITEM_TRAIT ? top_it->trait.members : NULL));
             for (; it; it = (impl_pass == 0) ? NULL : it->next) {
-                if (it->kind == AX_HIR_ITEM_FN && it->fn.body) {
+                bool is_closure = (it->fn.symbol.v >= 0x40000000 && it->fn.symbol.v < 0x50000000);
+                if (it->kind == AX_HIR_ITEM_FN && it->fn.body && !is_closure) {
                     cx.current_fn = it;
             TypeId *fn_ty_ptr = AxItemTypeMap_get(&thir.item_types, it);
             if (!fn_ty_ptr) AX_ICE("typeck: fn item without a signature type");
@@ -2162,6 +2251,48 @@ static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
         return cx->thir->interner.t_unit;
     }
     
+    if (ct->kind == AX_TY_CLOSURE) {
+        size_t argc = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+        if (argc != ct->closure.param_count) {
+            for (const AxHirExpr *a = expr->call.args; a; a = a->next) check_expr(cx, a, TypeId_none());
+            return type_error(cx, expr->call.callee->span, AX_TYPE_ARG_COUNT);
+        }
+        TypeId ret = ct->closure.ret_type;
+        const TypeId *params = ct->closure.params;
+        size_t i = 0;
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) {
+            check_expr(cx, a, params[i++]);
+        }
+        return TypeId_is_none(ret) ? cx->thir->interner.t_unit : ret;
+    }
+    
+    if (ct->kind == AX_TY_PARAM) {
+        bool is_callable_param = false;
+        if (cx->current_fn && cx->current_fn->fn.generic_params) {
+            size_t idx = 0;
+            for (AxHirGenericParam *gp = cx->current_fn->fn.generic_params->params; gp; gp = gp->next, idx++) {
+                if (idx == ct->param.index || (gp->name.v != 0 && gp->name.v == ct->param.name.v)) {
+                    for (AxHirType *b = gp->bounds; b; b = b->next) {
+                        StrView bname = (b->path.path.name.v != 0) ? ax_interner_get(cx->str_in, b->path.path.name) : (StrView){0};
+                        if (ax_sv_eq_cstr(bname, "Fn") || ax_sv_eq_cstr(bname, "FnMut") ||
+                            ax_sv_eq_cstr(bname, "FnOnce") || ax_sv_eq_cstr(bname, "Callable")) {
+                            is_callable_param = true;
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        if (is_callable_param) {
+            for (const AxHirExpr *a = expr->call.args; a; a = a->next) check_expr(cx, a, TypeId_none());
+            return cx->return_type.v != 0 ? cx->return_type : cx->thir->interner.t_i32;
+        }
+        for (const AxHirExpr *a = expr->call.args; a; a = a->next) check_expr(cx, a, TypeId_none());
+        return type_error(cx, expr->call.callee->span, AX_TYPE_NOT_CALLABLE);
+    }
+
     if (ct->kind != AX_TY_FN) {
         for (const AxHirExpr *a = expr->call.args; a; a = a->next) check_expr(cx, a, TypeId_none());
         if (ct->kind == AX_TY_ERROR) return cx->thir->interner.t_error;
@@ -2305,6 +2436,187 @@ static TypeId check_if(TypeckCtx *cx, const AxHirExpr *expr, TypeId expected) {
     if (is_never(cx, then_ty)) return else_ty;
     if (is_error(cx, else_ty)) return else_ty;
     return resolve_ty(cx, then_ty);
+}
+
+typedef struct {
+    AxSymbolId sym;
+    bool is_mutated;
+    bool is_moved;
+    bool is_read;
+} RawCapture;
+
+static void record_cap(RawCapture *caps, size_t *cap_count, AxSymbolId sym, bool is_mut, bool is_move) {
+    for (size_t i = 0; i < *cap_count; i++) {
+        if (caps[i].sym.v == sym.v) {
+            if (is_move) caps[i].is_moved = true;
+            else if (is_mut) caps[i].is_mutated = true;
+            else caps[i].is_read = true;
+            return;
+        }
+    }
+    if (*cap_count < 64) {
+        caps[*cap_count].sym = sym;
+        caps[*cap_count].is_mutated = is_mut;
+        caps[*cap_count].is_moved = is_move;
+        caps[*cap_count].is_read = !is_mut && !is_move;
+        (*cap_count)++;
+    }
+}
+
+static bool is_inner_sym(AxSymbolId sym, const AxSymbolId *inner, size_t inner_count) {
+    for (size_t i = 0; i < inner_count; i++) {
+        if (inner[i].v == sym.v) return true;
+    }
+    return false;
+}
+
+static bool is_outer_var(TypeckCtx *cx, AxSymbolId sym) {
+    for (size_t i = 0; i < cx->vars_len; i++) {
+        if (cx->vars[i].sym.v == sym.v) return true;
+    }
+    return false;
+}
+
+static void add_pat_syms(const AxHirPat *pat, AxSymbolId *inner, size_t *inner_count) {
+    if (!pat) return;
+    if (pat->kind == AX_HIR_PAT_BINDING) {
+        if (*inner_count < 128) inner[(*inner_count)++] = pat->binding.symbol;
+    } else if (pat->kind == AX_HIR_PAT_TUPLE) {
+        for (const AxHirPat *p = pat->tuple.elems; p; p = p->next) add_pat_syms(p, inner, inner_count);
+    } else if (pat->kind == AX_HIR_PAT_STRUCT) {
+        for (const AxHirPatField *f = pat->struct_pat.fields; f; f = f->next) add_pat_syms(f->pat, inner, inner_count);
+    }
+}
+
+static void scan_expr_captures(TypeckCtx *cx, const AxHirExpr *expr, AxSymbolId *inner, size_t *inner_count,
+                               RawCapture *caps, size_t *cap_count, bool in_mut, bool in_move);
+
+static void scan_block_captures(TypeckCtx *cx, const AxHirBlock *block, AxSymbolId *inner, size_t *inner_count,
+                                RawCapture *caps, size_t *cap_count) {
+    if (!block) return;
+    size_t save_inner = *inner_count;
+    for (const AxHirStmt *s = block->stmts; s; s = s->next) {
+        if (s->kind == AX_HIR_STMT_LET) {
+            if (s->let.expr) scan_expr_captures(cx, s->let.expr, inner, inner_count, caps, cap_count, false, false);
+            if (s->let.else_block) scan_block_captures(cx, s->let.else_block, inner, inner_count, caps, cap_count);
+            add_pat_syms(s->let.pat, inner, inner_count);
+        } else if (s->kind == AX_HIR_STMT_ASSIGN) {
+            scan_expr_captures(cx, s->assign.left, inner, inner_count, caps, cap_count, true, false);
+            scan_expr_captures(cx, s->assign.right, inner, inner_count, caps, cap_count, false, false);
+        } else if (s->kind == AX_HIR_STMT_EXPR) {
+            scan_expr_captures(cx, s->expr_stmt.expr, inner, inner_count, caps, cap_count, false, false);
+        }
+    }
+    *inner_count = save_inner;
+}
+
+static void scan_expr_captures(TypeckCtx *cx, const AxHirExpr *expr, AxSymbolId *inner, size_t *inner_count,
+                               RawCapture *caps, size_t *cap_count, bool in_mut, bool in_move) {
+    if (!expr) return;
+    switch (expr->kind) {
+        case AX_HIR_EXPR_PATH:
+            if (expr->path.path.symbol.v != 0) {
+                AxSymbolId sym = expr->path.path.symbol;
+                if (!is_inner_sym(sym, inner, *inner_count) && is_outer_var(cx, sym)) {
+                    record_cap(caps, cap_count, sym, in_mut, in_move);
+                }
+            }
+            break;
+        case AX_HIR_EXPR_BINARY:
+            scan_expr_captures(cx, expr->binary.left, inner, inner_count, caps, cap_count, false, false);
+            scan_expr_captures(cx, expr->binary.right, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_UNARY:
+            scan_expr_captures(cx, expr->unary.expr, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_CAST:
+            scan_expr_captures(cx, expr->cast.expr, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_VIEW:
+            scan_expr_captures(cx, expr->view.expr, inner, inner_count, caps, cap_count, expr->view.is_mut, false);
+            break;
+        case AX_HIR_EXPR_BLOCK:
+            scan_block_captures(cx, &expr->block.block, inner, inner_count, caps, cap_count);
+            break;
+        case AX_HIR_EXPR_IF:
+            scan_expr_captures(cx, expr->if_expr.cond, inner, inner_count, caps, cap_count, false, false);
+            scan_block_captures(cx, &expr->if_expr.block, inner, inner_count, caps, cap_count);
+            if (expr->if_expr.else_branch) scan_expr_captures(cx, expr->if_expr.else_branch, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_WHILE:
+            scan_expr_captures(cx, expr->while_expr.cond, inner, inner_count, caps, cap_count, false, false);
+            scan_block_captures(cx, &expr->while_expr.block, inner, inner_count, caps, cap_count);
+            break;
+        case AX_HIR_EXPR_MATCH: {
+            scan_expr_captures(cx, expr->match.expr, inner, inner_count, caps, cap_count, false, false);
+            for (const AxHirMatchArm *arm = expr->match.arms; arm; arm = arm->next) {
+                size_t save = *inner_count;
+                add_pat_syms(arm->pat, inner, inner_count);
+                if (arm->guard) scan_expr_captures(cx, arm->guard, inner, inner_count, caps, cap_count, false, false);
+                scan_expr_captures(cx, arm->body, inner, inner_count, caps, cap_count, false, false);
+                *inner_count = save;
+            }
+            break;
+        }
+        case AX_HIR_EXPR_CALL: {
+            bool is_drop = false;
+            if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
+                TypeId cty = lookup_path_type(cx, &expr->call.callee->path.path, NULL);
+                if (!TypeId_is_none(cty)) {
+                    const AxType *ct = ax_type_get(&cx->thir->interner, cty);
+                    if (ct && ct->kind == AX_TY_BUILTIN_DROP) is_drop = true;
+                }
+            }
+            scan_expr_captures(cx, expr->call.callee, inner, inner_count, caps, cap_count, false, false);
+            for (const AxHirExpr *a = expr->call.args; a; a = a->next) {
+                bool arg_move = is_drop;
+                if (!arg_move && a->kind == AX_HIR_EXPR_PATH && a->path.path.symbol.v != 0) {
+                    const TypeId *vty = AxSymbolTypeMap_get(&cx->thir->symbol_types, a->path.path.symbol);
+                    if (vty && !ax_type_is_copy(*vty, cx->thir, cx->str_in)) {
+                        arg_move = true;
+                    }
+                }
+                scan_expr_captures(cx, a, inner, inner_count, caps, cap_count, false, arg_move);
+            }
+            break;
+        }
+        case AX_HIR_EXPR_METHOD_CALL:
+            scan_expr_captures(cx, expr->method_call.receiver, inner, inner_count, caps, cap_count, false, false);
+            for (const AxHirExpr *a = expr->method_call.args; a; a = a->next) {
+                scan_expr_captures(cx, a, inner, inner_count, caps, cap_count, false, false);
+            }
+            break;
+        case AX_HIR_EXPR_FIELD:
+            scan_expr_captures(cx, expr->field.base, inner, inner_count, caps, cap_count, in_mut, in_move);
+            break;
+        case AX_HIR_EXPR_TUPLE_INDEX:
+            scan_expr_captures(cx, expr->tuple_index.base, inner, inner_count, caps, cap_count, in_mut, in_move);
+            break;
+        case AX_HIR_EXPR_INDEX:
+            scan_expr_captures(cx, expr->index.base, inner, inner_count, caps, cap_count, in_mut, false);
+            scan_expr_captures(cx, expr->index.arg, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_TUPLE:
+            for (const AxHirExpr *e = expr->tuple.elems; e; e = e->next) {
+                scan_expr_captures(cx, e, inner, inner_count, caps, cap_count, false, false);
+            }
+            break;
+        case AX_HIR_EXPR_ARRAY:
+            for (const AxHirExpr *e = expr->array.elems; e; e = e->next) {
+                scan_expr_captures(cx, e, inner, inner_count, caps, cap_count, false, false);
+            }
+            if (expr->array.count) scan_expr_captures(cx, expr->array.count, inner, inner_count, caps, cap_count, false, false);
+            break;
+        case AX_HIR_EXPR_STRUCT:
+            for (const AxHirFieldInit *f = expr->struct_lit.fields; f; f = f->next) {
+                scan_expr_captures(cx, f->expr, inner, inner_count, caps, cap_count, false, false);
+            }
+            break;
+        case AX_HIR_EXPR_JUMP:
+            if (expr->jump.expr) scan_expr_captures(cx, expr->jump.expr, inner, inner_count, caps, cap_count, false, false);
+            break;
+        default: break;
+    }
 }
 
 /* Computes the type of `expr`; `expected` is only a hint for sub-expressions that carry it on
@@ -2937,12 +3249,190 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
             t.view.pointee = inner_ty;
             return ax_intern_type(&cx->thir->interner, &t);
         }
-        case AX_HIR_EXPR_RANGE:
-            return type_error(cx, expr->span, AX_TYPE_MISMATCH); // Or AX_TYPE_UNSUPPORTED
         case AX_HIR_EXPR_FOR:
         case AX_HIR_EXPR_UNSAFE:
         case AX_HIR_EXPR_COMPTIME:
-        case AX_HIR_EXPR_CLOSURE:
+            return in->t_error;
+        case AX_HIR_EXPR_CLOSURE: {
+            AxSymbolId inner_syms[128];
+            size_t inner_count = 0;
+            for (const AxHirParam *p = expr->closure.params; p; p = p->next) {
+                if (inner_count < 128) inner_syms[inner_count++] = p->symbol;
+            }
+            
+            RawCapture raw_caps[64];
+            size_t raw_cap_count = 0;
+            scan_expr_captures(cx, expr->closure.body, inner_syms, &inner_count, raw_caps, &raw_cap_count, false, false);
+            
+            AxClosureCapture *caps = NULL;
+            if (raw_cap_count > 0) {
+                caps = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxClosureCapture) * raw_cap_count, _Alignof(AxClosureCapture));
+                for (size_t i = 0; i < raw_cap_count; i++) {
+                    caps[i].sym = raw_caps[i].sym;
+                    const TypeId *vty_ptr = AxSymbolTypeMap_get(&cx->thir->symbol_types, raw_caps[i].sym);
+                    TypeId base_ty = vty_ptr ? *vty_ptr : cx->thir->interner.t_i32;
+                    
+                    if (raw_caps[i].is_moved) {
+                        caps[i].mode = AX_CAP_MOVE;
+                        caps[i].type = base_ty;
+                    } else if (raw_caps[i].is_mutated) {
+                        caps[i].mode = AX_CAP_MUT_VIEW;
+                        AxType vt; memset(&vt, 0, sizeof(vt));
+                        vt.kind = AX_TY_MUT_VIEW;
+                        vt.view.pointee = base_ty;
+                        caps[i].type = ax_intern_type(&cx->thir->interner, &vt);
+                    } else {
+                        if (ax_type_is_copy(base_ty, cx->thir, cx->str_in)) {
+                            caps[i].mode = AX_CAP_COPY;
+                            caps[i].type = base_ty;
+                        } else {
+                            caps[i].mode = AX_CAP_VIEW;
+                            AxType vt; memset(&vt, 0, sizeof(vt));
+                            vt.kind = AX_TY_VIEW;
+                            vt.view.pointee = base_ty;
+                            caps[i].type = ax_intern_type(&cx->thir->interner, &vt);
+                        }
+                    }
+                }
+            }
+            
+            size_t param_count = 0;
+            for (const AxHirParam *p = expr->closure.params; p; p = p->next) param_count++;
+            
+            const AxType *exp_t = (!TypeId_is_none(expected) && !is_error(cx, expected)) ? ax_type_get(in, resolve_ty(cx, expected)) : NULL;
+            TypeId *closure_param_types = NULL;
+            if (param_count > 0) {
+                closure_param_types = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * param_count, _Alignof(TypeId));
+                size_t idx = 0;
+                for (const AxHirParam *p = expr->closure.params; p; p = p->next, idx++) {
+                    TypeId pty;
+                    if (p->type) {
+                        pty = resolve_ty(cx, hir_type_to_typeid(cx, p->type));
+                    } else if (exp_t && exp_t->kind == AX_TY_FN && idx < exp_t->fn.param_count) {
+                        pty = exp_t->fn.param_types[idx];
+                    } else if (exp_t && exp_t->kind == AX_TY_CLOSURE && idx < exp_t->closure.param_count) {
+                        pty = exp_t->closure.params[idx];
+                    } else {
+                        pty = new_int_var(cx);
+                    }
+                    closure_param_types[idx] = pty;
+                    AxParamTypeMap_insert(&cx->thir->param_types, p, pty);
+                    AxSymbolTypeMap_insert(&cx->thir->symbol_types, p->symbol, pty);
+                }
+            }
+            
+            TypeId exp_ret = TypeId_none();
+            if (expr->closure.ret_type) {
+                exp_ret = resolve_ty(cx, hir_type_to_typeid(cx, expr->closure.ret_type));
+            } else if (exp_t && exp_t->kind == AX_TY_FN) {
+                exp_ret = exp_t->fn.ret_type;
+            } else if (exp_t && exp_t->kind == AX_TY_CLOSURE) {
+                exp_ret = exp_t->closure.ret_type;
+            }
+            
+            TypeId old_ret = cx->return_type;
+            size_t old_vars_len = cx->vars_len;
+            cx->return_type = exp_ret;
+            
+            for (const AxHirParam *p = expr->closure.params; p; p = p->next) {
+                if (cx->vars_len == cx->vars_cap) {
+                    cx->vars = ax_grow_array(cx->vars, &cx->vars_cap, sizeof(VarState), cx->vars_len + 1);
+                }
+                cx->vars[cx->vars_len].sym = p->symbol;
+                cx->vars[cx->vars_len].is_mut = p->is_mut;
+                cx->vars[cx->vars_len].is_init = true;
+                cx->vars_len++;
+            }
+            
+            TypeId body_ty = check_expr(cx, expr->closure.body, exp_ret);
+            if (TypeId_is_none(body_ty) || body_ty.v == 0) body_ty = in->t_unit;
+            
+            cx->return_type = old_ret;
+            cx->vars_len = old_vars_len;
+            
+            uint32_t closure_id = cx->next_closure_id++;
+            uint32_t closure_sym = 0x40000000 + closure_id;
+            
+            AxHirItem *fn_item = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirItem), _Alignof(AxHirItem));
+            memset(fn_item, 0, sizeof(AxHirItem));
+            fn_item->kind = AX_HIR_ITEM_FN;
+            fn_item->span = expr->span;
+            fn_item->fn.symbol = (AxSymbolId){ closure_sym };
+            
+            AxHirParam *first_p = NULL;
+            AxHirParam **curr_p = &first_p;
+            for (size_t i = 0; i < raw_cap_count; i++) {
+                AxHirParam *hp = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirParam), _Alignof(AxHirParam));
+                memset(hp, 0, sizeof(AxHirParam));
+                hp->span = expr->span;
+                hp->is_mut = (caps[i].mode == AX_CAP_MUT_VIEW);
+                hp->symbol = caps[i].sym;
+                *curr_p = hp;
+                curr_p = &hp->next;
+                AxParamTypeMap_insert(&cx->thir->param_types, hp, caps[i].type);
+            }
+            for (const AxHirParam *p = expr->closure.params; p; p = p->next) {
+                AxHirParam *hp = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirParam), _Alignof(AxHirParam));
+                memset(hp, 0, sizeof(AxHirParam));
+                hp->span = p->span;
+                hp->name = p->name;
+                hp->symbol = p->symbol;
+                hp->is_mut = p->is_mut;
+                *curr_p = hp;
+                curr_p = &hp->next;
+                TypeId pty = *AxParamTypeMap_get(&cx->thir->param_types, p);
+                AxParamTypeMap_insert(&cx->thir->param_types, hp, pty);
+            }
+            *curr_p = NULL;
+            fn_item->fn.params = first_p;
+            
+            if (expr->closure.body->kind == AX_HIR_EXPR_BLOCK) {
+                fn_item->fn.body = &expr->closure.body->block.block;
+            } else {
+                AxHirBlock *blk = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirBlock), _Alignof(AxHirBlock));
+                memset(blk, 0, sizeof(AxHirBlock));
+                blk->span = expr->closure.body->span;
+                AxHirStmt *st = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirStmt), _Alignof(AxHirStmt));
+                memset(st, 0, sizeof(AxHirStmt));
+                st->kind = AX_HIR_STMT_EXPR;
+                st->span = expr->closure.body->span;
+                st->expr_stmt.expr = expr->closure.body;
+                st->expr_stmt.has_semi = false;
+                blk->stmts = st;
+                fn_item->fn.body = blk;
+            }
+            
+            size_t total_fn_params = raw_cap_count + param_count;
+            TypeId *fn_param_types = ax_arena_alloc(&cx->thir->interner.arena, sizeof(TypeId) * (total_fn_params ? total_fn_params : 1), _Alignof(TypeId));
+            for (size_t i = 0; i < raw_cap_count; i++) fn_param_types[i] = caps[i].type;
+            for (size_t i = 0; i < param_count; i++) fn_param_types[raw_cap_count + i] = closure_param_types[i];
+            
+            AxType fnt; memset(&fnt, 0, sizeof(fnt));
+            fnt.kind = AX_TY_FN;
+            fnt.fn.param_count = total_fn_params;
+            fnt.fn.param_types = fn_param_types;
+            fnt.fn.ret_type = body_ty;
+            TypeId fn_type_id = ax_intern_type(&cx->thir->interner, &fnt);
+            
+            AxItemTypeMap_insert(&cx->thir->item_types, fn_item, fn_type_id);
+            
+            AxHirItem **tail = &((AxHir*)cx->hir)->items;
+            while (*tail) tail = &(*tail)->next;
+            *tail = fn_item;
+            
+            AxType cty; memset(&cty, 0, sizeof(cty));
+            cty.kind = AX_TY_CLOSURE;
+            cty.closure.closure_id = closure_id;
+            cty.closure.fn_sym = closure_sym;
+            cty.closure.fn_type = fn_type_id;
+            cty.closure.ret_type = body_ty;
+            cty.closure.param_count = param_count;
+            cty.closure.params = closure_param_types;
+            cty.closure.capture_count = raw_cap_count;
+            cty.closure.captures = caps;
+            
+            return ax_intern_type(&cx->thir->interner, &cty);
+        }
         /* case AX_HIR_EXPR_FIELD: */
         /* case AX_HIR_EXPR_TUPLE_INDEX: */
         case AX_HIR_EXPR_METHOD_CALL: {
@@ -3243,7 +3733,6 @@ static TypeId check_block(TypeckCtx *cx, const AxHirBlock *block, TypeId expecte
                     }
                 }
             }
-            
             coerce(cx, right, left, s->assign.right->span);
             if (is_never(cx, right)) diverges = true;
             ty = in->t_unit;

@@ -51,6 +51,7 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
         case AX_TY_FN:
         case AX_TY_VIEW:
         case AX_TY_MUT_VIEW:
+        case AX_TY_PARAM:
             return 8;
         case AX_TY_SLICE:
             return ax_type_align(ty->slice.elem, in);
@@ -79,6 +80,14 @@ uint32_t ax_type_align(TypeId id, const TypeInterner *in) {
             uint32_t align = 1;
             for (size_t i = 0; i < ty->strct.field_count; i++) {
                 uint32_t fa = ax_type_align(ty->strct.fields[i], in);
+                if (fa > align) align = fa;
+            }
+            return align;
+        }
+        case AX_TY_CLOSURE: {
+            uint32_t align = 8;
+            for (size_t i = 0; i < ty->closure.capture_count; i++) {
+                uint32_t fa = ax_type_align(ty->closure.captures[i].type, in);
                 if (fa > align) align = fa;
             }
             return align;
@@ -118,6 +127,7 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
             return 8;
         case AX_TY_PTR:
         case AX_TY_FN:
+        case AX_TY_PARAM:
             return 8;
         case AX_TY_VIEW:
         case AX_TY_MUT_VIEW:
@@ -202,6 +212,18 @@ uint32_t ax_type_size(TypeId id, const TypeInterner *in) {
             if (count > 128) free(fl);
             return (offset + max_align - 1) & ~(max_align - 1);
         }
+        case AX_TY_CLOSURE: {
+            uint32_t offset = 8;
+            uint32_t max_align = 8;
+            for (size_t i = 0; i < ty->closure.capture_count; i++) {
+                uint32_t a = ax_type_align(ty->closure.captures[i].type, in);
+                uint32_t s = ax_type_size(ty->closure.captures[i].type, in);
+                if (a > max_align) max_align = a;
+                offset = (offset + a - 1) & ~(a - 1);
+                offset += s;
+            }
+            return (offset + max_align - 1) & ~(max_align - 1);
+        }
         default: return 0;
     }
 }
@@ -267,6 +289,18 @@ uint32_t ax_type_field_offset(TypeId id, size_t field_idx, const TypeInterner *i
         }
         if (count > 128) free(fl);
         return target_offset;
+    } else if (ty->kind == AX_TY_CLOSURE) {
+        if (field_idx == 0) return 0;
+        if (field_idx > ty->closure.capture_count) return 0;
+        uint32_t offset = 8;
+        for (size_t i = 0; i < ty->closure.capture_count; i++) {
+            uint32_t a = ax_type_align(ty->closure.captures[i].type, in);
+            uint32_t s = ax_type_size(ty->closure.captures[i].type, in);
+            offset = (offset + a - 1) & ~(a - 1);
+            if (field_idx == i + 1) return offset;
+            offset += s;
+        }
+        return offset;
     }
     return 0;
 }

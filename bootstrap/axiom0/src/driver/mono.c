@@ -137,6 +137,28 @@ static TypeId subst_ty_local(TypeId ty, const AxGenericArgs *args, TypeInterner 
             }
             break;
         }
+        case AX_TY_CLOSURE: {
+            new_t.closure.ret_type = subst_ty_local(t->closure.ret_type, args, in);
+            if (new_t.closure.ret_type.v != t->closure.ret_type.v) changed = true;
+            if (t->closure.param_count > 0) {
+                TypeId *params = malloc(t->closure.param_count * sizeof(TypeId));
+                for (size_t i = 0; i < t->closure.param_count; i++) {
+                    params[i] = subst_ty_local(t->closure.params[i], args, in);
+                    if (params[i].v != t->closure.params[i].v) changed = true;
+                }
+                new_t.closure.params = params;
+            }
+            if (t->closure.capture_count > 0) {
+                AxClosureCapture *caps = malloc(t->closure.capture_count * sizeof(AxClosureCapture));
+                for (size_t i = 0; i < t->closure.capture_count; i++) {
+                    caps[i] = t->closure.captures[i];
+                    caps[i].type = subst_ty_local(t->closure.captures[i].type, args, in);
+                    if (caps[i].type.v != t->closure.captures[i].type.v) changed = true;
+                }
+                new_t.closure.captures = caps;
+            }
+            break;
+        }
         default: break;
     }
     if (changed) return ax_intern_type(in, &new_t);

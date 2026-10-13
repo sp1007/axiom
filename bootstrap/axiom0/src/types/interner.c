@@ -1,5 +1,6 @@
 #include "types/types.h"
 #include <stdlib.h>
+#include <string.h>
 
 void ax_type_interner_init(TypeInterner *in) {
     ax_arena_init(&in->arena, 0);
@@ -85,6 +86,16 @@ TypeId ax_intern_type(TypeInterner *in, const AxType *type) {
             new_type->enm.variant_fields = (TypeId **)new_vfields;
         }
     }
+    if (type->kind == AX_TY_CLOSURE) {
+        if (type->closure.param_count > 0) {
+            new_type->closure.params = ax_arena_alloc(&in->arena, sizeof(TypeId) * type->closure.param_count, _Alignof(TypeId));
+            for (size_t i = 0; i < type->closure.param_count; i++) new_type->closure.params[i] = type->closure.params[i];
+        }
+        if (type->closure.capture_count > 0) {
+            new_type->closure.captures = ax_arena_alloc(&in->arena, sizeof(AxClosureCapture) * type->closure.capture_count, _Alignof(AxClosureCapture));
+            for (size_t i = 0; i < type->closure.capture_count; i++) new_type->closure.captures[i] = type->closure.captures[i];
+        }
+    }
     
     if (in->len == in->cap) {
         in->types = (AxType **)ax_grow_array(in->types, &in->cap, sizeof(AxType *), in->len + 1);
@@ -148,4 +159,65 @@ void ax_thir_free(AxThir *thir) {
     AxPatTypeMap_free(&thir->pat_types);
     AxExprTypeMap_free(&thir->expr_types);
     ax_type_interner_free(&thir->interner);
+}
+
+bool ax_type_is_copy(TypeId id, const AxThir *thir, const StrInterner *str_in) {
+    if (id.v == 0) return false;
+    const AxType *ty = ax_type_get(&thir->interner, id);
+    if (!ty) return false;
+    
+    switch ((int)ty->kind) {
+        case AX_TY_ERROR: return false;
+        case AX_TY_UNIT:
+        case AX_TY_NEVER:
+        case AX_TY_BOOL:
+        case AX_TY_CHAR:
+        case AX_TY_I8: case AX_TY_I16: case AX_TY_I32: case AX_TY_I64: case AX_TY_ISIZE:
+        case AX_TY_U8: case AX_TY_U16: case AX_TY_U32: case AX_TY_U64: case AX_TY_USIZE:
+        case AX_TY_PTR:
+        case AX_TY_FN:
+        case AX_TY_INT_VAR:
+        case AX_TY_VIEW:
+            return true;
+        case AX_TY_STR:
+            return false;
+        case AX_TY_ARRAY:
+            return ax_type_is_copy(ty->array.elem, thir, str_in);
+        case AX_TY_TUPLE:
+            for (size_t i = 0; i < ty->tuple.field_count; i++) {
+                if (!ax_type_is_copy(ty->tuple.fields[i], thir, str_in)) return false;
+            }
+            return true;
+        case AX_TY_CLOSURE:
+            for (size_t i = 0; i < ty->closure.capture_count; i++) {
+                if (ty->closure.captures[i].mode == AX_CAP_MUT_VIEW ||
+                    ty->closure.captures[i].mode == AX_CAP_MOVE) {
+                    return false;
+                }
+                if (!ax_type_is_copy(ty->closure.captures[i].type, thir, str_in)) return false;
+            }
+            return true;
+        case AX_TY_STRUCT:
+        case AX_TY_ENUM: {
+            const AxHirItem *def = (ty->kind == AX_TY_STRUCT) ? ty->strct.def : ty->enm.def;
+            if (!def) return false;
+            for (const AxHirAttr *attr = def->attrs; attr; attr = attr->next) {
+                StrView attr_name = ax_interner_get(str_in, attr->name);
+                if (attr_name.len == 6 && memcmp(attr_name.ptr, "derive", 6) == 0) {
+                    for (const AxHirAttrArg *arg = attr->args; arg; arg = arg->next) {
+                        StrView arg_name = {0};
+                        if (arg->name.v != 0) arg_name = ax_interner_get(str_in, arg->name);
+                        else if (arg->expr && arg->expr->kind == AX_HIR_EXPR_PATH) {
+                            if (arg->expr->path.path.name.v != 0) arg_name = ax_interner_get(str_in, arg->expr->path.path.name);
+                        }
+                        if (arg_name.len == 4 && memcmp(arg_name.ptr, "Copy", 4) == 0) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            return false;
+        }
+        default: return false;
+    }
 }

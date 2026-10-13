@@ -1190,6 +1190,12 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
         StrId id = ax_intern_cstr(interner, prelude_types[i]);
         declare_name(&env, prelude, id, NULL, (Span){0}, SYM_ITEM);
     }
+    const char *fn_traits[] = { "Fn", "FnMut", "FnOnce", "Callable" };
+    for (size_t i = 0; i < sizeof(fn_traits)/sizeof(fn_traits[0]); i++) {
+        StrId id = ax_intern_cstr(interner, fn_traits[i]);
+        Symbol s = { (AxSymbolId){ 10100 + (uint32_t)i }, NULL, SYM_ITEM, AX_VIS_PUB, NULL };
+        SymEnv_insert(&prelude->bindings, id.v, s);
+    }
 
     /* 2. Setup root module */
     env.root_module = create_module(&env, "", (StrId){0}, NULL);
