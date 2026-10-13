@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T070]
 priority: 102
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [std/text, tests/std/text]
 spec: [0089, tasks/0332, 0045, tasks/0304]
 covers: [REQ-STD-176]
+started: 2026-10-13 20:23:49
+finished: 2026-10-13 21:10:05
 ---
 # T071 — Text core: Str, String, UTF-8, char primitives
 
@@ -40,3 +42,5 @@ UTF-8 text model per spec.
 
 ## Log
 - 2026-10-06 02:31:21 covers += REQ-STD-176 (metadata only)
+- 2026-10-13 20:23:49 started (attempt 1) 
+- 2026-10-13 21:10:05 accepted by QA -> done
