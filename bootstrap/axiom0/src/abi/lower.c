@@ -42,8 +42,9 @@ void ax_lir_lower_abi(AxLirBody *body, TypeInterner *interner, const AxAbi *abi,
                                     inst->abi_arg.loc_reg_or_offset = call_sig.args[idx].loc.reg;
                                 }
                             }
-                            if (call_sig.shadow_space > body->frame_req.max_outgoing_args_bytes) {
-                                body->frame_req.max_outgoing_args_bytes = call_sig.shadow_space;
+                            uint32_t outgoing = call_sig.shadow_space + call_sig.stack_args_size;
+                            if (outgoing > body->frame_req.max_outgoing_args_bytes) {
+                                body->frame_req.max_outgoing_args_bytes = outgoing;
                             }
                         }
                         ax_arena_destroy(&temp_arena);

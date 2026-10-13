@@ -44,11 +44,98 @@ typedef struct {
     size_t cap_relocs;
 } LinkerContext;
 
+#ifdef _WIN32
+#define ax_stricmp _stricmp
+#else
+#include <strings.h>
+#define ax_stricmp strcasecmp
+#endif
+
+typedef struct ImportFunc {
+    char *name;
+    char *full_sym;
+    uint32_t hint_offset;
+    uint32_t iat_offset;
+    uint32_t thunk_offset;
+} ImportFunc;
+
+typedef struct ImportDll {
+    char *dll_name;
+    ImportFunc *funcs;
+    size_t num_funcs;
+    size_t cap_funcs;
+    uint32_t desc_offset;
+    uint32_t ilt_offset;
+    uint32_t iat_offset;
+    uint32_t dll_name_offset;
+} ImportDll;
+
 static char *ax_xstrdup(const char *s) {
     size_t l = strlen(s);
     char *r = ax_xmalloc(l + 1);
     memcpy(r, s, l + 1);
     return r;
+}
+
+static void free_import_dlls(ImportDll *dlls, size_t num_dlls) {
+    if (!dlls) return;
+    for (size_t d = 0; d < num_dlls; d++) {
+        for (size_t f = 0; f < dlls[d].num_funcs; f++) {
+            if (dlls[d].funcs[f].name) ax_xfree(dlls[d].funcs[f].name);
+            if (dlls[d].funcs[f].full_sym) ax_xfree(dlls[d].funcs[f].full_sym);
+        }
+        if (dlls[d].funcs) ax_xfree(dlls[d].funcs);
+        if (dlls[d].dll_name) ax_xfree(dlls[d].dll_name);
+    }
+    ax_xfree(dlls);
+}
+
+static ImportDll *find_or_add_dll(ImportDll **dlls, size_t *num_dlls, size_t *cap_dlls, const char *name) {
+    char norm[256];
+    size_t len = strlen(name);
+    if (len >= 4 && (ax_stricmp(name + len - 4, ".dll") == 0)) {
+        snprintf(norm, sizeof(norm), "%s", name);
+    } else {
+        snprintf(norm, sizeof(norm), "%s.dll", name);
+    }
+    if (ax_stricmp(norm, "kernel32.dll") == 0) {
+        strcpy(norm, "KERNEL32.dll");
+    }
+
+    for (size_t i = 0; i < *num_dlls; i++) {
+        if (ax_stricmp((*dlls)[i].dll_name, norm) == 0) {
+            return &(*dlls)[i];
+        }
+    }
+
+    if (*num_dlls == *cap_dlls) {
+        *cap_dlls = *cap_dlls == 0 ? 8 : (*cap_dlls * 2);
+        *dlls = ax_xrealloc(*dlls, *cap_dlls * sizeof(ImportDll));
+    }
+    ImportDll *d = &(*dlls)[(*num_dlls)++];
+    memset(d, 0, sizeof(*d));
+    d->dll_name = ax_xstrdup(norm);
+    return d;
+}
+
+static ImportFunc *add_import_func(ImportDll *dll, const char *func_name, const char *full_sym) {
+    for (size_t i = 0; i < dll->num_funcs; i++) {
+        if (strcmp(dll->funcs[i].name, func_name) == 0) {
+            if (!dll->funcs[i].full_sym && full_sym) {
+                dll->funcs[i].full_sym = ax_xstrdup(full_sym);
+            }
+            return &dll->funcs[i];
+        }
+    }
+    if (dll->num_funcs == dll->cap_funcs) {
+        dll->cap_funcs = dll->cap_funcs == 0 ? 16 : (dll->cap_funcs * 2);
+        dll->funcs = ax_xrealloc(dll->funcs, dll->cap_funcs * sizeof(ImportFunc));
+    }
+    ImportFunc *f = &dll->funcs[dll->num_funcs++];
+    memset(f, 0, sizeof(*f));
+    f->name = ax_xstrdup(func_name);
+    f->full_sym = full_sym ? ax_xstrdup(full_sym) : NULL;
+    return f;
 }
 
 static void free_linker_context(LinkerContext *ctx) {
@@ -361,117 +448,201 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     GlobalSymbol *print_int_sym = add_global(&ctx, "__ax_host_print_int");
     print_int_sym->defined = true; print_int_sym->sec = text_sec; print_int_sym->offset = print_int_offset;
 
-    // Build Import Directory
+    // Build Import Directory dynamically
+    ImportDll *import_dlls = NULL;
+    size_t num_import_dlls = 0;
+    size_t cap_import_dlls = 0;
+
+    // 1. Base KERNEL32 imports
+    ImportDll *k32 = find_or_add_dll(&import_dlls, &num_import_dlls, &cap_import_dlls, "KERNEL32.dll");
+    add_import_func(k32, "ExitProcess", NULL);
+    add_import_func(k32, "GetStdHandle", NULL);
+    add_import_func(k32, "WriteFile", NULL);
+    add_import_func(k32, "SetConsoleOutputCP", NULL);
+    add_import_func(k32, "GetConsoleMode", NULL);
+    add_import_func(k32, "GetConsoleOutputCP", NULL);
+
+    // 2. Discover DLL imports from relocations
+    for (size_t i = 0; i < ctx.num_relocs; i++) {
+        const char *sname = ctx.relocs[i].sym_name;
+        if (!sname || !sname[0]) continue;
+
+        bool is_defined = false;
+        for (size_t g = 0; g < ctx.num_globals; g++) {
+            if (ctx.globals[g].defined && strcmp(ctx.globals[g].name, sname) == 0) {
+                is_defined = true;
+                break;
+            }
+        }
+        if (is_defined) continue;
+
+        // Undefined symbol: check if DLL$func or __IAT_
+        const char *target = sname;
+        if (strncmp(target, "__IAT_", 6) == 0) {
+            target += 6;
+        }
+
+        const char *dollar = strchr(target, '$');
+        if (dollar) {
+            size_t dlen = (size_t)(dollar - target);
+            char dll_buf[128];
+            if (dlen >= sizeof(dll_buf)) dlen = sizeof(dll_buf) - 1;
+            memcpy(dll_buf, target, dlen);
+            dll_buf[dlen] = '\0';
+            const char *fname = dollar + 1;
+            ImportDll *dll = find_or_add_dll(&import_dlls, &num_import_dlls, &cap_import_dlls, dll_buf);
+            add_import_func(dll, fname, target);
+        } else if (strncmp(sname, "__IAT_", 6) == 0) {
+            ImportDll *dll = find_or_add_dll(&import_dlls, &num_import_dlls, &cap_import_dlls, "KERNEL32.dll");
+            add_import_func(dll, target, NULL);
+        }
+    }
+
+    // 3. Emit thunks for each imported function into text_sec
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        ImportDll *dll = &import_dlls[d];
+        for (size_t f = 0; f < dll->num_funcs; f++) {
+            ImportFunc *fn = &dll->funcs[f];
+            
+            char iat_sym_name[256];
+            snprintf(iat_sym_name, sizeof(iat_sym_name), "__IAT_%s", fn->name);
+
+            uint8_t thunk[] = { 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 }; // jmp [rip + disp32]
+            uint32_t thunk_off = 0;
+            append_section_data(text_sec, thunk, sizeof(thunk), 8, &thunk_off);
+            fn->thunk_offset = thunk_off;
+
+            add_reloc(&ctx, text_sec, thunk_off + 2, IMAGE_REL_AMD64_REL32, iat_sym_name, 0);
+
+            GlobalSymbol *g_fn = add_global(&ctx, fn->name);
+            if (!g_fn->defined) {
+                g_fn->defined = true;
+                g_fn->sec = text_sec;
+                g_fn->offset = thunk_off;
+            }
+            if (fn->full_sym) {
+                GlobalSymbol *g_full = add_global(&ctx, fn->full_sym);
+                if (!g_full->defined) {
+                    g_full->defined = true;
+                    g_full->sec = text_sec;
+                    g_full->offset = thunk_off;
+                }
+            }
+        }
+    }
+
+    // 4. Construct .idata buffer
     MergedSection *idata_sec = get_or_create_section(&ctx, ".idata", IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE);
     uint32_t idata_base = 0;
-    
-    uint8_t idata_buf[1024] = {0};
+
+    uint32_t idata_cap = 65536;
+    uint8_t *idata_buf = ax_xcalloc(1, idata_cap);
     uint32_t i_off = 0;
-    
-    IMAGE_IMPORT_DESCRIPTOR desc = {0};
+
+    // 4a. Descriptors
     uint32_t desc_offset = i_off;
-    memcpy(idata_buf + i_off, &desc, 20); i_off += 20; // desc kernel32
-    memset(idata_buf + i_off, 0, 20); i_off += 20;     // desc null
-    
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        import_dlls[d].desc_offset = i_off;
+        i_off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    }
+    // Null terminating descriptor
+    i_off += sizeof(IMAGE_IMPORT_DESCRIPTOR);
 
-    uint32_t ilt_offset = i_off;
-    i_off += 56; // ILT (7x qword)
-    uint32_t iat_offset = i_off;
-    i_off += 56; // IAT (7x qword)
+    // 4b. ILTs
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        import_dlls[d].ilt_offset = i_off;
+        i_off += (uint32_t)((import_dlls[d].num_funcs + 1) * 8);
+    }
 
-    uint32_t hint_exit = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "ExitProcess"); i_off += 12;
-    uint32_t hint_getstd = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "GetStdHandle"); i_off += 13;
-    uint32_t hint_write = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "WriteFile"); i_off += 10;
-    uint32_t hint_setcp = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "SetConsoleOutputCP"); i_off += 19;
-    uint32_t hint_getcm = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "GetConsoleMode"); i_off += 15;
-    uint32_t hint_getcp = i_off;
-    idata_buf[i_off++] = 0; idata_buf[i_off++] = 0;
-    strcpy((char*)idata_buf + i_off, "GetConsoleOutputCP"); i_off += 19;
+    // 4c. IATs (all contiguous)
+    uint32_t all_iats_start = i_off;
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        import_dlls[d].iat_offset = i_off;
+        for (size_t f = 0; f < import_dlls[d].num_funcs; f++) {
+            import_dlls[d].funcs[f].iat_offset = i_off + (uint32_t)(f * 8);
+        }
+        i_off += (uint32_t)((import_dlls[d].num_funcs + 1) * 8);
+    }
+    uint32_t all_iats_size = i_off - all_iats_start;
 
+    // 4d. Hint/Names
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        for (size_t f = 0; f < import_dlls[d].num_funcs; f++) {
+            import_dlls[d].funcs[f].hint_offset = i_off;
+            idata_buf[i_off++] = 0;
+            idata_buf[i_off++] = 0;
+            size_t nlen = strlen(import_dlls[d].funcs[f].name);
+            memcpy(idata_buf + i_off, import_dlls[d].funcs[f].name, nlen + 1);
+            i_off += (uint32_t)(nlen + 1);
+            if (i_off & 1) i_off++;
+        }
+    }
 
-    uint32_t dll_name_offset = i_off;
-    strcpy((char*)idata_buf + i_off, "KERNEL32.dll"); i_off += 13;
+    // 4e. DLL Names
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        import_dlls[d].dll_name_offset = i_off;
+        size_t nlen = strlen(import_dlls[d].dll_name);
+        memcpy(idata_buf + i_off, import_dlls[d].dll_name, nlen + 1);
+        i_off += (uint32_t)(nlen + 1);
+        if (i_off & 1) i_off++;
+    }
+
     i_off = ALIGN_UP(i_off, 8);
-    
     append_section_data(idata_sec, idata_buf, i_off, 8, &idata_base);
-    
-    // RVA assignment (Layout)
+    ax_xfree(idata_buf);
+
+    // 5. Define __IAT_* global symbols
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        for (size_t f = 0; f < import_dlls[d].num_funcs; f++) {
+            ImportFunc *fn = &import_dlls[d].funcs[f];
+            char iat_sym[256];
+            snprintf(iat_sym, sizeof(iat_sym), "__IAT_%s", fn->name);
+            GlobalSymbol *g = add_global(&ctx, iat_sym);
+            g->defined = true;
+            g->sec = idata_sec;
+            g->offset = idata_base + fn->iat_offset;
+
+            if (fn->full_sym) {
+                snprintf(iat_sym, sizeof(iat_sym), "__IAT_%s", fn->full_sym);
+                GlobalSymbol *g2 = add_global(&ctx, iat_sym);
+                g2->defined = true;
+                g2->sec = idata_sec;
+                g2->offset = idata_base + fn->iat_offset;
+            }
+        }
+    }
+
+    // 6. RVA assignment (Layout)
     uint32_t file_align = 0x200;
     uint32_t sec_align = 0x1000;
     uint32_t current_rva = sec_align;
     uint32_t current_raw = ALIGN_UP(64 + 4 + 20 + 240 + ctx.num_sections * 40, file_align);
-    
+
     for (size_t i = 0; i < ctx.num_sections; i++) {
         ctx.sections[i]->rva = current_rva;
         ctx.sections[i]->raw_ptr = current_raw;
         current_rva = ALIGN_UP(current_rva + ctx.sections[i]->size, sec_align);
         current_raw = ALIGN_UP(current_raw + ctx.sections[i]->size, file_align);
     }
-    
+
     text_sec = get_or_create_section(&ctx, ".text", 0);
     idata_sec = get_or_create_section(&ctx, ".idata", 0);
 
-    // Now we know RVAs, patch idata
+    // 7. Patch .idata with computed RVAs
     uint32_t idata_rva = idata_sec->rva + idata_base;
-    IMAGE_IMPORT_DESCRIPTOR *pdesc = (IMAGE_IMPORT_DESCRIPTOR*)(idata_sec->data + idata_base + desc_offset);
-    pdesc->OriginalFirstThunk = idata_rva + ilt_offset;
-    pdesc->Name = idata_rva + dll_name_offset;
-    pdesc->FirstThunk = idata_rva + iat_offset;
-    
+    for (size_t d = 0; d < num_import_dlls; d++) {
+        ImportDll *dll = &import_dlls[d];
+        IMAGE_IMPORT_DESCRIPTOR *pdesc = (IMAGE_IMPORT_DESCRIPTOR*)(idata_sec->data + idata_base + dll->desc_offset);
+        pdesc->OriginalFirstThunk = idata_rva + dll->ilt_offset;
+        pdesc->Name = idata_rva + dll->dll_name_offset;
+        pdesc->FirstThunk = idata_rva + dll->iat_offset;
 
-    uint64_t rva_exit = idata_rva + hint_exit;
-    uint64_t rva_getstd = idata_rva + hint_getstd;
-    uint64_t rva_write = idata_rva + hint_write;
-    uint64_t rva_setcp = idata_rva + hint_setcp;
-    uint64_t rva_getcm = idata_rva + hint_getcm;
-    uint64_t rva_getcp = idata_rva + hint_getcp;
-    
-    memcpy(idata_sec->data + idata_base + ilt_offset, &rva_exit, 8);
-    memcpy(idata_sec->data + idata_base + ilt_offset + 8, &rva_getstd, 8);
-    memcpy(idata_sec->data + idata_base + ilt_offset + 16, &rva_write, 8);
-    memcpy(idata_sec->data + idata_base + ilt_offset + 24, &rva_setcp, 8);
-    memcpy(idata_sec->data + idata_base + ilt_offset + 32, &rva_getcm, 8);
-    memcpy(idata_sec->data + idata_base + ilt_offset + 40, &rva_getcp, 8);
-
-    memcpy(idata_sec->data + idata_base + iat_offset, &rva_exit, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset + 8, &rva_getstd, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset + 16, &rva_write, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset + 24, &rva_setcp, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset + 32, &rva_getcm, 8);
-    memcpy(idata_sec->data + idata_base + iat_offset + 40, &rva_getcp, 8);
-
-    
-
-    // Reloc for call [rip + IAT_ExitProcess]
-    // Removed call_exit_offset logic because it was added in start_code relocations!
-    
-    GlobalSymbol *iat_exit = add_global(&ctx, "__IAT_ExitProcess");
-    iat_exit->defined = true; iat_exit->sec = idata_sec; iat_exit->offset = idata_base + iat_offset;
-    
-    GlobalSymbol *iat_getstd = add_global(&ctx, "__IAT_GetStdHandle");
-    iat_getstd->defined = true; iat_getstd->sec = idata_sec; iat_getstd->offset = idata_base + iat_offset + 8;
-
-    GlobalSymbol *iat_write = add_global(&ctx, "__IAT_WriteFile");
-    iat_write->defined = true; iat_write->sec = idata_sec; iat_write->offset = idata_base + iat_offset + 16;
-
-    GlobalSymbol *iat_setcp = add_global(&ctx, "__IAT_SetConsoleOutputCP");
-    iat_setcp->defined = true; iat_setcp->sec = idata_sec; iat_setcp->offset = idata_base + iat_offset + 24;
-
-    GlobalSymbol *iat_getcm = add_global(&ctx, "__IAT_GetConsoleMode");
-    iat_getcm->defined = true; iat_getcm->sec = idata_sec; iat_getcm->offset = idata_base + iat_offset + 32;
-
-    GlobalSymbol *iat_getcp = add_global(&ctx, "__IAT_GetConsoleOutputCP");
-    iat_getcp->defined = true; iat_getcp->sec = idata_sec; iat_getcp->offset = idata_base + iat_offset + 40;
+        for (size_t f = 0; f < dll->num_funcs; f++) {
+            uint64_t hint_rva = (uint64_t)(idata_rva + dll->funcs[f].hint_offset);
+            memcpy(idata_sec->data + idata_base + dll->ilt_offset + f * 8, &hint_rva, 8);
+            memcpy(idata_sec->data + idata_base + dll->iat_offset + f * 8, &hint_rva, 8);
+        }
+    }
 
 
     
@@ -481,7 +652,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
         GlobalSymbol *sym = add_global(&ctx, r->sym_name);
         if (!sym->defined) {
             if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_UNDEFINED_SYMBOL, .severity=AX_DIAG_ERROR, .message=r->sym_name});
-            { free_linker_context(&ctx); return false; }
+            { free_import_dlls(import_dlls, num_import_dlls); free_linker_context(&ctx); return false; }
         }
         
         uint32_t sym_rva = sym->sec->rva + sym->offset;
@@ -502,7 +673,7 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     
     // Write PE file
     FILE *out = fopen(output_path, "wb");
-    if (!out) { free_linker_context(&ctx); return false; }
+    if (!out) { free_import_dlls(import_dlls, num_import_dlls); free_linker_context(&ctx); return false; }
     
     // DOS Header
     uint8_t dos[64] = {0};
@@ -553,9 +724,9 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     // Write Data Directories (16)
     IMAGE_DATA_DIRECTORY dirs[16] = {0};
     dirs[1].VirtualAddress = idata_sec->rva + idata_base + desc_offset;
-    dirs[1].Size = 40; // 2 descriptors
-    dirs[12].VirtualAddress = idata_sec->rva + idata_base + iat_offset;
-    dirs[12].Size = 40; // 3 imports + null
+    dirs[1].Size = (uint32_t)((num_import_dlls + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR));
+    dirs[12].VirtualAddress = idata_sec->rva + idata_base + all_iats_start;
+    dirs[12].Size = all_iats_size;
     fwrite(dirs, sizeof(IMAGE_DATA_DIRECTORY), 16, out);
     
     // Write Section Headers
@@ -585,5 +756,6 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     }
     
     fclose(out);
+    free_import_dlls(import_dlls, num_import_dlls);
     { free_linker_context(&ctx); return true; }
 }

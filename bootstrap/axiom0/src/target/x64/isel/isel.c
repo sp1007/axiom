@@ -384,11 +384,12 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                                   AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 5 /*RBP*/, .index = AX_REG_NONE, .scale = 1, .disp = 16 + inst->abi_arg.loc_reg_or_offset, .is_rip = false } };
                                   emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), mem);
                               }
-                              for (uint32_t i = 0; i < size; i += 8) {
+                              for (uint32_t i = 0; i < size;) {
                                   uint32_t chunk = size - i >= 8 ? 8 : (size - i >= 4 ? 4 : (size - i >= 2 ? 2 : 1));
                                   AxX64Op src_mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = i, .is_rip = false } };
                                   emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), src_mem);
                                   emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                                  i += chunk;
                               }
                           }
 
@@ -449,11 +450,12 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                             emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_reg(1 /*RCX*/), mem);
                             emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(1 /*RCX*/));
                         } else {
-                            for (uint32_t i = 0; i < load_sz; i += 8) {
+                            for (uint32_t i = 0; i < load_sz;) {
                                 uint32_t chunk = load_sz - i >= 8 ? 8 : (load_sz - i >= 4 ? 4 : (load_sz - i >= 2 ? 2 : 1));
                                 AxX64Op mem = { .kind = AX_X64_OP_MEM, .mem = { .base = 0 /*RAX*/, .index = AX_REG_NONE, .scale = 1, .disp = i, .is_rip = false } };
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), mem);
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                                i += chunk;
                             }
                         }
                     }
@@ -483,11 +485,12 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                             emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(0));
                             emit_sz(mi, mbb, AX_X64_MI_MOV, load_sz, ax_x64_op_reg(1 /*RCX*/), mem);
                         } else {
-                            for (uint32_t i = 0; i < load_sz; i += 8) {
+                            for (uint32_t i = 0; i < load_sz;) {
                                 uint32_t chunk = load_sz - i >= 8 ? 8 : (load_sz - i >= 4 ? 4 : (load_sz - i >= 2 ? 2 : 1));
                                 mem.mem.disp = i;
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), mem);
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_frame(slot_offset + inst->dest.v, i), ax_x64_op_reg(1 /*RCX*/));
+                                i += chunk;
                             }
                             goto load_skip_mov; // Skip the single 8-byte move at the end
                         }
@@ -524,11 +527,12 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                             if (size != 1 && size != 2 && size != 4 && size != 8) size = 8;
                             emit_sz(mi, mbb, AX_X64_MI_MOV, size, mem, ax_x64_op_reg(1));
                         } else {
-                            for (uint32_t i = 0; i < size; i += 8) {
+                            for (uint32_t i = 0; i < size;) {
                                 uint32_t chunk = size - i >= 8 ? 8 : (size - i >= 4 ? 4 : (size - i >= 2 ? 2 : 1));
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_frame(slot_offset + inst->store.val.v, i));
                                 mem.mem.disp = i;
                                 emit_sz(mi, mbb, AX_X64_MI_MOV, chunk, mem, ax_x64_op_reg(1 /*RCX*/));
+                                i += chunk;
                             }
                         }
                     }

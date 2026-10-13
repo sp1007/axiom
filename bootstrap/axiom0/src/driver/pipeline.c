@@ -392,6 +392,14 @@ static void stage_hir(AxDriverState *st) {
                     tail->next = copy;
                     tail = copy;
                 }
+            } else if (it->kind == AX_HIR_ITEM_EXTERN_BLOCK && it->extern_block.members) {
+                for (AxHirItem *m = it->extern_block.members; m; m = m->next) {
+                    AxHirItem *copy = ax_arena_alloc(&st->hir_arena, sizeof(AxHirItem), _Alignof(AxHirItem));
+                    *copy = *m;
+                    copy->next = NULL;
+                    tail->next = copy;
+                    tail = copy;
+                }
             }
         }
     }

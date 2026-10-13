@@ -18,6 +18,7 @@ AX_DEFINE_HASHMAP(AxNodeMap, AxNodePtr, AxSymbolId, ax_resolve_hash_ptr, ax_reso
 typedef struct AxResolveMap {
     AxNodeMap node_map;
     AxNodeMap module_access_nodes;
+    AxNodeMap extern_nodes;
     uint32_t next_symbol_v;
     uint32_t next_std_symbol_v;
     void *module_naming_ctx;

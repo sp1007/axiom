@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T060, T061b]
 priority: 82
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/abi, bootstrap/axiom0/src/link, bootstrap/axiom0/src/types/ffi, bootstrap/axiom0/src/resolve, bootstrap/axiom0/src/hir, bootstrap/axiom0/src/mir, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/interp, tests/run/ffi, tests/ui/ffi]
 locks: [bootstrap/axiom0/src/diag/codes/FFI.def, bootstrap/axiom0/src/diag/codes/LINK.def, bootstrap/axiom0/src/driver/pipeline.c]
 spec: [0094, 0195, tasks/0292, tasks/0336, 0104]
+started: 2026-10-13 16:33:00
+finished: 2026-10-13 17:37:25
 ---
 # T065 — FFI: extern "C"/"system", @repr(C), DLL imports
 
@@ -36,3 +38,7 @@ Call Windows APIs and C functions from native code.
 - Starts as soon as the language features it needs exist (ROADMAP R8), not after the whole P7 gate.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-13 16:33:00 started (attempt 1) 
+- 2026-10-13 17:37:25 accepted by QA -> done

@@ -57,6 +57,25 @@ static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *
                             return iname;
                         }
                     }
+                    if (it->fn.abi.v != 0) {
+                        for (const struct AxHirAttr *attr = it->attrs; attr; attr = attr->next) {
+                            StrView an = ax_interner_get(str_in, attr->name);
+                            if (ax_sv_eq_cstr(an, "link") && attr->args && attr->args->expr && attr->args->expr->kind == AX_HIR_EXPR_LITERAL) {
+                                StrView link_val = {
+                                    .ptr = (const char*)attr->args->expr->literal.val.str_val.bytes,
+                                    .len = attr->args->expr->literal.val.str_val.len
+                                };
+                                if (link_val.len > 0) {
+                                    char *ename = malloc(link_val.len + 1 + sv.len + 1);
+                                    snprintf(ename, link_val.len + 1 + sv.len + 1, "%.*s$%.*s", (int)link_val.len, link_val.ptr, (int)sv.len, sv.ptr);
+                                    return ename;
+                                }
+                            }
+                        }
+                        char *ename = malloc(13 + sv.len + 1);
+                        snprintf(ename, 13 + sv.len + 1, "KERNEL32.dll$%.*s", (int)sv.len, sv.ptr);
+                        return ename;
+                    }
                     char *name = malloc(sv.len + 1);
                     memcpy(name, sv.ptr, sv.len);
                     name[sv.len] = '\0';

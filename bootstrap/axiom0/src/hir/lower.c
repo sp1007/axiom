@@ -20,6 +20,8 @@ static void emit_not_supported(LowerCtx *ctx, Span span) {
 static AxSymbolId get_symbol(LowerCtx *ctx, const void *node) {
     AxSymbolId *sym = AxNodeMap_get(&ctx->rmap->node_map, node);
     if (sym) return *sym;
+    sym = AxNodeMap_get(&ctx->rmap->extern_nodes, node);
+    if (sym) return *sym;
     AxSymbolId zero = {0};
     return zero;
 }
@@ -790,6 +792,22 @@ static AxHirItem *lower_item(LowerCtx *ctx, const AxAstItem *n) {
                 hi->kind = AX_HIR_ITEM_EXTERN_BLOCK;
                 hi->extern_block.abi = n->extern_block.abi;
                 hi->extern_block.members = lower_item(ctx, n->extern_block.members);
+                for (AxHirItem *m = hi->extern_block.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_FN) {
+                        if (m->fn.abi.v == 0) {
+                            m->fn.abi = n->extern_block.abi;
+                        }
+                        if (hi->attrs) {
+                            if (!m->attrs) {
+                                m->attrs = hi->attrs;
+                            } else {
+                                AxHirAttr *at = m->attrs;
+                                while (at->next) at = at->next;
+                                at->next = hi->attrs;
+                            }
+                        }
+                    }
+                }
                 break;
         }
         *tail = hi;

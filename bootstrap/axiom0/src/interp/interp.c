@@ -41,6 +41,13 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
                 }
             }
         }
+        if (it->kind == AX_HIR_ITEM_EXTERN_BLOCK) {
+            for (const AxHirItem *m = it->extern_block.members; m; m = m->next) {
+                if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == (uint32_t)sym_v) {
+                    return (AxHirItem*)m;
+                }
+            }
+        }
     }
 
     StrId target_name = {0};
@@ -481,6 +488,19 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
         return;
     }
     
+    if (func->fn.abi.v != 0) {
+        AxDiagnostic d = {0};
+        d.code = AX_FFI_NOT_IN_ORACLE;
+        d.severity = AX_DIAG_ERROR;
+        d.message = ax_diag_code_default_message(AX_FFI_NOT_IN_ORACLE);
+        d.primary = func->span;
+        ax_diag_sink_report(ctx->sink, &d);
+        ctx->failed = true;
+        ctx->exit_code = 1;
+        ctx->call_depth--;
+        return;
+    }
+
     bool is_intrinsic = false;
     uint64_t args[16] = {0};
     for (size_t i = 0; i < arg_count && i < 16; i++) {

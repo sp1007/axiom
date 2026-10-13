@@ -12,12 +12,14 @@ typedef struct NamingCtx {
 void ax_resolve_map_init(AxResolveMap *map) {
     AxNodeMap_init(&map->node_map);
     AxNodeMap_init(&map->module_access_nodes);
+    AxNodeMap_init(&map->extern_nodes);
     map->next_symbol_v = 1;
     map->next_std_symbol_v = 10000;
     map->module_naming_ctx = NULL;
 }
 
 void ax_resolve_map_free(AxResolveMap *map) {
+    AxNodeMap_free(&map->extern_nodes);
     AxNodeMap_free(&map->module_access_nodes);
     AxNodeMap_free(&map->node_map);
     if (map->module_naming_ctx) {
@@ -102,6 +104,7 @@ typedef struct Env {
     NamingCtx *naming;
     AxNodeMap resolved_use_trees;
     const AxAst *ast;
+    uint32_t next_extern_symbol_v;
 } Env;
 
 static Scope *push_scope(Env *env, Scope *parent) {
@@ -118,6 +121,42 @@ static AxSymbolId new_symbol(Env *env, const void *node) {
         env->rmap->next_std_symbol_v = 10000;
     }
     uint32_t val = is_std ? env->rmap->next_std_symbol_v++ : env->rmap->next_symbol_v++;
+    AxSymbolId id = { val };
+    if (id.v >= env->symbol_nodes_cap) {
+        size_t new_cap = env->symbol_nodes_cap == 0 ? 64 : env->symbol_nodes_cap * 2;
+        while (new_cap <= id.v) new_cap *= 2;
+        const void **new_nodes = ax_arena_alloc(env->arena, sizeof(void*) * new_cap, 8);
+        if (env->symbol_nodes) {
+            memcpy(new_nodes, env->symbol_nodes, sizeof(void*) * env->symbol_nodes_cap);
+        }
+        env->symbol_nodes = new_nodes;
+        env->symbol_nodes_cap = new_cap;
+    }
+    env->symbol_nodes[id.v] = node;
+
+    /* Expand naming metadata table */
+    if (env->naming) {
+        if (id.v >= env->naming->cap) {
+            size_t new_cap = env->naming->cap == 0 ? 64 : env->naming->cap * 2;
+            while (new_cap <= id.v) new_cap *= 2;
+            env->naming->module_paths = realloc(env->naming->module_paths, new_cap * sizeof(char *));
+            env->naming->canonical_names = realloc(env->naming->canonical_names, new_cap * sizeof(char *));
+            for (size_t i = env->naming->cap; i < new_cap; i++) {
+                env->naming->module_paths[i] = NULL;
+                env->naming->canonical_names[i] = NULL;
+            }
+            env->naming->cap = new_cap;
+        }
+    }
+
+    return id;
+}
+
+static AxSymbolId new_symbol_extern(Env *env, const void *node) {
+    if (!env->next_extern_symbol_v) {
+        env->next_extern_symbol_v = 30000;
+    }
+    uint32_t val = env->next_extern_symbol_v++;
     AxSymbolId id = { val };
     if (id.v >= env->symbol_nodes_cap) {
         size_t new_cap = env->symbol_nodes_cap == 0 ? 64 : env->symbol_nodes_cap * 2;
@@ -1213,6 +1252,27 @@ AxResolveMap ax_resolve(AxAst *ast, AxArena *arena, AxDiagSink *sink, StrInterne
             mui->item = it;
             mui->next = env.current_module->use_items;
             env.current_module->use_items = mui;
+        } else if (it->kind == AX_ITEM_EXTERN_BLOCK) {
+            for (const AxAstItem *m = it->extern_block.members; m; m = m->next) {
+                StrId name = {0};
+                if (m->kind == AX_ITEM_FN) name = m->fn.name;
+                else if (m->kind == AX_ITEM_STATIC) name = m->static_decl.name;
+                if (name.v != 0) {
+                    AxSymbolId sym = new_symbol_extern(&env, m);
+                    AxNodeMap_insert(&env.rmap->extern_nodes, m, sym);
+                    Symbol s = { sym, m, SYM_ITEM, m->vis.kind, env.current_module };
+                    SymEnv_insert(&env.current_module->scope->bindings, name.v, s);
+                    SymEnv_insert(&env.current_module->exports, name.v, s);
+                    StrView n_sv = ax_interner_get(interner, name);
+                    char canon[512];
+                    if (env.current_module->full_path[0]) {
+                        snprintf(canon, sizeof(canon), "%s.%.*s", env.current_module->full_path, (int)n_sv.len, n_sv.ptr);
+                    } else {
+                        snprintf(canon, sizeof(canon), "%.*s", (int)n_sv.len, n_sv.ptr);
+                    }
+                    record_symbol_naming(&env, s.id, env.current_module->full_path, canon);
+                }
+            }
         } else {
             StrId name = {0};
             SymbolKind kind = SYM_ITEM;
