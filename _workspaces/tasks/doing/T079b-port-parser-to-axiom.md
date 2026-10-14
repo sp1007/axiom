@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T079a]
 priority: 113
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/syntax/parse.ax, tests/selfhost/parse]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
+started: 2026-10-14 12:45:40
+agent: axiom-frontend
 ---
 # T079b — Port recursive-descent parser to Axiom
 
@@ -37,3 +39,6 @@ Port the recursive-descent parser and Pratt expression parser (`compiler/syntax/
 ## Notes
 - Sub-task of T079 split per ADR-0005 §8 and SPEC-20 §4.3.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 12:45:40 started (attempt 1) axiom-frontend
