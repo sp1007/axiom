@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T078]
 priority: 113
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/syntax/ast.ax, tests/selfhost/ast]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
+started: 2026-10-14 10:33:38
+finished: 2026-10-14 12:45:29
 ---
 # T079a — Port AST data structures & visitor to Axiom
 
@@ -37,3 +39,7 @@ Port Abstract Syntax Tree (AST) node definitions and AST visitor traits (`compil
 ## Notes
 - Sub-task of T079 split per ADR-0005 §8 and SPEC-20 §4.3.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 10:33:38 started (attempt 1) axiom-frontend
+- 2026-10-14 12:45:29 accepted by QA -> done
