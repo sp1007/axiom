@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T078a]
 priority: 112
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/lexer, tests/selfhost/lexer]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-LEX-114]
+started: 2026-10-14 10:05:15
+finished: 2026-10-14 10:33:21
 ---
 # T078 — Port lexer to Axiom (integration + differential tokens)
 
@@ -38,3 +40,7 @@ Integrate lexer in Axiom and run differential token testing against `axiom0`.
 - Exact differential artefact: `inspect --emit=tokens`.
 - Harness entry: `tests/selfhost/lexer`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 10:05:15 started (attempt 1) axiom-frontend
+- 2026-10-14 10:33:21 accepted by QA -> done
