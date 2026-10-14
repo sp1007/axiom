@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T079a, T079b]
 priority: 113
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/parser, tests/selfhost/parser]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
+started: 2026-10-14 20:25:11
+finished: 2026-10-14 20:38:32
 ---
 # T079 — Port parser + AST to Axiom (integration + differential AST)
 
@@ -38,3 +40,7 @@ Integrate parser and AST in Axiom and run differential AST testing against `axio
 - Exact differential artefact: `inspect --emit=ast`.
 - Harness entry: `tests/selfhost/parser`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 20:25:11 started (attempt 1) axiom-frontend
+- 2026-10-14 20:38:32 accepted by QA -> done
