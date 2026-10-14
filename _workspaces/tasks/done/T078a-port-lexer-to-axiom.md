@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T077]
 priority: 112
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/lex, tests/selfhost/lex]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-LEX-114]
+started: 2026-10-14 07:23:13
+finished: 2026-10-14 10:05:00
 ---
 # T078a — Port lexer scanner to Axiom (UTF-8, tokens, literals)
 
@@ -37,3 +39,7 @@ Port lexical scanner (`compiler/lex/`) from C to Axiom.
 ## Notes
 - Sub-task of T078 split per ADR-0005 §8 and SPEC-20 §4.2.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 07:23:13 started (attempt 1) 
+- 2026-10-14 10:05:00 accepted by QA -> done
