@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T077a, T077b, T077c]
 priority: 111
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/kernel_source_diag, tests/selfhost/kernel_source_diag]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-020, REQ-DRV-021]
+started: 2026-10-14 06:54:10
+finished: 2026-10-14 07:22:46
 ---
 # T077 — Port kernel, source DB, diagnostics to Axiom (integration + differential)
 
@@ -38,3 +40,7 @@ Integrate kernel, source DB, and diagnostics in Axiom and run differential testi
 - Exact differential artefact: `--json` error diagnostics and data structure dumps.
 - Harness entry: `tests/selfhost/kernel_source_diag`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 06:54:10 started (attempt 1) 
+- 2026-10-14 07:22:46 accepted by QA -> done
