@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T079a]
 priority: 113
-status: doing
+status: done
 attempts: 1
 paths: [compiler/syntax/parse.ax, compiler/syntax/parse, tests/selfhost/parse]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
 started: 2026-10-14 15:12:56
-agent: T079b-impl
+finished: 2026-10-14 20:24:23
 ---
 # T079b — Port recursive-descent parser to Axiom
 
@@ -44,3 +44,4 @@ Port the recursive-descent parser and Pratt expression parser (`compiler/syntax/
 - 2026-10-14 12:45:40 started (attempt 1) axiom-frontend
 - 2026-10-14 15:12:45 requeue: session restart; continue from files (not charged: attempt refunded)
 - 2026-10-14 15:12:56 started (attempt 1) T079b-impl
+- 2026-10-14 20:24:23 accepted by QA -> done
