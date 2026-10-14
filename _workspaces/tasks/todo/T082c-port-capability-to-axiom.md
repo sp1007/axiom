@@ -25,7 +25,7 @@ Port capability analysis for immutable `view` and mutable `mut_view` (`compiler/
 - Unit tests under `tests/selfhost/cap/`.
 
 ## Acceptance
-- [ ] Capability analysis implemented in `compiler/own/cap.ax` with ≤ 1,500 lines of Axiom.
+- [ ] Capability analysis implemented in `compiler/own/cap.ax` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Capability conflict diagnostics match `axiom0` on error fixtures.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

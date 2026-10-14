@@ -25,7 +25,7 @@ Port Mid-level Intermediate Representation (MIR) data structures and HIR->MIR lo
 - Unit tests under `tests/selfhost/mir/`.
 
 ## Acceptance
-- [ ] MIR builder implemented in `compiler/mir/` with ≤ 1,500 lines of Axiom.
+- [ ] MIR builder implemented in `compiler/mir/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Unoptimized MIR CFG matches `axiom0 inspect --emit=mir-raw` on representative test programs.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

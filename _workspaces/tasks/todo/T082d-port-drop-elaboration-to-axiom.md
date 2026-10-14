@@ -26,7 +26,7 @@ Port drop elaboration, drop flag tracking, and cleanup blocks (`compiler/mir/dro
 - Unit tests under `tests/selfhost/drop/`.
 
 ## Acceptance
-- [ ] Drop elaboration implemented in `compiler/mir/drop.ax` with ≤ 1,500 lines of Axiom.
+- [ ] Drop elaboration implemented in `compiler/mir/drop.ax` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Elaborated drop calls and cleanup CFG blocks match `axiom0 inspect --emit=mir`.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

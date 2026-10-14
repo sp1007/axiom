@@ -25,7 +25,7 @@ Port Low-level Intermediate Representation (LIR) data structures and lowering fr
 - Unit tests under `tests/selfhost/lir/`.
 
 ## Acceptance
-- [ ] LIR builder implemented in `compiler/lir/` with ≤ 1,500 lines of Axiom.
+- [ ] LIR builder implemented in `compiler/lir/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] LIR instruction stream matches `axiom0 inspect --emit=lir` on representative test programs.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

@@ -25,7 +25,7 @@ Port ownership move/copy analysis and definite initialization analysis (`compile
 - Unit tests under `tests/selfhost/own/`.
 
 ## Acceptance
-- [ ] Move and initialization analyses implemented in `compiler/own/` with ≤ 1,500 lines of Axiom.
+- [ ] Move and initialization analyses implemented in `compiler/own/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Move and initialization diagnostics match `axiom0` on error test fixtures.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

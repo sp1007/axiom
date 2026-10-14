@@ -393,3 +393,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-10-10 | T047 rescoped to add locks for own.c, typeck.c, verify.c, and target verify.c so it can integrate analysis | ADR-0023 |
 | 2026-10-10 | T048b rescoped to remove sub-ranges and disjoint splits into new task T126 to manage size. | ADR-0026 |
 | 2026-10-11 | T128 rescoped to only handle explicit drop(x) builtin. Implicit block cleanup and destructors split into new task T131. | ADR-0029 |
+| 2026-10-14 | Port sub-tasks T077–T085: "≤ 1,500 lines of Axiom" removed as an acceptance criterion; ~1.5k is a split guide only (AXS-SELF-004). Ports already sat at 1,498–1,499 lines with packed lines | owner review |

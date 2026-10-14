@@ -26,7 +26,7 @@ Port the MIR -O1 baseline optimizer (`compiler/opt/`) from C to Axiom.
 - Unit tests under `tests/selfhost/opt/`.
 
 ## Acceptance
-- [ ] Optimizer implemented in `compiler/opt/` with ≤ 1,500 lines of Axiom.
+- [ ] Optimizer implemented in `compiler/opt/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Optimized MIR matches `axiom0 inspect --emit=mir-opt` on optimization test fixtures.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

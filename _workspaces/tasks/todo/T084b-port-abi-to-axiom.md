@@ -25,7 +25,7 @@ Port Windows x64 calling conventions and ABI register allocation rules (`compile
 - Unit tests under `tests/selfhost/abi/`.
 
 ## Acceptance
-- [ ] Windows x64 ABI lowering implemented in `compiler/abi/` with ≤ 1,500 lines of Axiom.
+- [ ] Windows x64 ABI lowering implemented in `compiler/abi/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] ABI register assignment and call argument passing match `axiom0`.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

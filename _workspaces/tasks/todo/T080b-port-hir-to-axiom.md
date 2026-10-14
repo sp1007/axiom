@@ -25,7 +25,7 @@ Port High-level Intermediate Representation (HIR) and AST->HIR lowering (`compil
 - Unit tests under `tests/selfhost/hir/`.
 
 ## Acceptance
-- [ ] HIR lowering implemented in `compiler/hir/` with ≤ 1,500 lines of Axiom.
+- [ ] HIR lowering implemented in `compiler/hir/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Emitted HIR matches `axiom0 inspect --emit=hir` on representative test programs.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

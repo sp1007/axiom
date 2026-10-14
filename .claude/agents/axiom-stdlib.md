@@ -47,8 +47,10 @@ compiler. Constant tables are `const` aggregates (placed in `.rdata`), not `stat
   the report for the architect.
 - Self-hosting ports: port module-by-module with differential tests against the C implementation
   (same tokens / same AST dump / same MIR / same bytes) before switching over. Each port task names
-  its differential artefact and harness entry (set by T076); if a module turns out larger than one
-  sitting (~1.5k lines of Axiom), finish a coherent slice and report the rest for a split.
+  its differential artefact and harness entry (set by T076). ~1.5k lines of Axiom per file is a
+  split guide, never a limit to squeeze under: write complete, readable code (one statement per
+  line, full names, all features and error recovery); split a larger module into several files
+  under the task's paths, or finish a coherent slice and report the rest for a split.
 - After the fixed point T087, `bootstrap/axiom0` is frozen: all work is in `compiler/` and `std/`,
   built with the stage-2 axiomc (`tools/build_axiomc.py`); a bug that must be fixed in the C compiler
   is a separate `AX0-FIX-<nn>` task filed by the architect.

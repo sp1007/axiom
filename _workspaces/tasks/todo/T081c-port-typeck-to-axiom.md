@@ -26,7 +26,7 @@ Port the bidirectional type checker, type inference engine, and pattern exhausti
 - Unit tests under `tests/selfhost/typeck/`.
 
 ## Acceptance
-- [ ] Type checker implemented in `compiler/types/typeck.ax` with ≤ 1,500 lines of Axiom.
+- [ ] Type checker implemented in `compiler/types/typeck.ax` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Type inference and diagnostic error codes match `axiom0` on typeck error fixtures.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

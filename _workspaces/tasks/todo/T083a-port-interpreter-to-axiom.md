@@ -25,7 +25,7 @@ Port the MIR step execution interpreter and host interface oracle (`compiler/int
 - Unit tests under `tests/selfhost/interp/`.
 
 ## Acceptance
-- [ ] MIR interpreter implemented in `compiler/interp/` with ≤ 1,500 lines of Axiom.
+- [ ] MIR interpreter implemented in `compiler/interp/` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Program execution exit codes and standard output match `axiom0` in interp mode.
 - [ ] Full test suite passes; build warning-free; archcheck clean.

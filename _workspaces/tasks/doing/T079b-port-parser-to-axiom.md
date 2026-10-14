@@ -10,11 +10,11 @@ depends: [T079a]
 priority: 113
 status: doing
 attempts: 1
-paths: [compiler/syntax/parse.ax, tests/selfhost/parse]
+paths: [compiler/syntax/parse.ax, compiler/syntax/parse, tests/selfhost/parse]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
-started: 2026-10-14 12:45:40
-agent: axiom-frontend
+started: 2026-10-14 15:12:56
+agent: T079b-impl
 ---
 # T079b — Port recursive-descent parser to Axiom
 
@@ -27,7 +27,7 @@ Port the recursive-descent parser and Pratt expression parser (`compiler/syntax/
 - Unit tests under `tests/selfhost/parse/`.
 
 ## Acceptance
-- [ ] Parser implemented in `compiler/syntax/parse.ax` with ≤ 1,500 lines of Axiom.
+- [ ] Parser implemented in `compiler/syntax/parse.ax` — complete and readable: no line-packing or dropped features to meet a size target; ~1.5k lines per file is a split guide, not a limit (a larger module is split into several files under the task's paths, AXS-SELF-004).
 - [ ] Unit tests pass in both interpreter and native modes.
 - [ ] Parsed AST matches `axiom0 inspect --emit=ast` on representative syntax tests.
 - [ ] Full test suite passes; build warning-free; archcheck clean.
@@ -42,3 +42,5 @@ Port the recursive-descent parser and Pratt expression parser (`compiler/syntax/
 
 ## Log
 - 2026-10-14 12:45:40 started (attempt 1) axiom-frontend
+- 2026-10-14 15:12:45 requeue: session restart; continue from files (not charged: attempt refunded)
+- 2026-10-14 15:12:56 started (attempt 1) T079b-impl
