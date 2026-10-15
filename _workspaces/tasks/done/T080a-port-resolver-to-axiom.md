@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T079]
 priority: 114
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/resolve, tests/selfhost/resolve]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-MOD-142, REQ-PKG-023, REQ-RES-243]
+started: 2026-10-14 20:40:20
+finished: 2026-10-15 10:23:03
 ---
 # T080a — Port resolver and module graph to Axiom
 
@@ -37,3 +39,7 @@ Port name resolver, scoping ribs, and module graph (`compiler/resolve/`) from C 
 ## Notes
 - Sub-task of T080 split per ADR-0005 §8 and SPEC-20 §4.4.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-14 20:40:20 started (attempt 1) axiom-frontend
+- 2026-10-15 10:23:03 finished without commit (manual) -> done; run `taskctl commit` next

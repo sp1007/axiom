@@ -1,0 +1,578 @@
+// Symbol table, pointer-keyed NodeMap, u32-keyed SymEnv, and module-naming table.
+// Port of data structures in bootstrap/axiom0/src/resolve/resolve.h and resolve.c.
+module compiler.resolve.symtab
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+pub const SYM_VAR: u8 = 0u8;
+pub const SYM_FN: u8 = 1u8;
+pub const SYM_STRUCT: u8 = 2u8;
+pub const SYM_ENUM: u8 = 3u8;
+pub const SYM_VARIANT: u8 = 4u8;
+pub const SYM_TRAIT: u8 = 5u8;
+pub const SYM_TYPE_ALIAS: u8 = 6u8;
+pub const SYM_GENERIC_PARAM: u8 = 7u8;
+pub const SYM_CONST: u8 = 8u8;
+pub const SYM_STATIC: u8 = 9u8;
+pub const SYM_MODULE: u8 = 10u8;
+pub const SYM_PRIMITIVE: u8 = 11u8;
+pub const SYM_LOCAL: u8 = 12u8;
+
+pub struct Symbol {
+    pub id: SymbolId,
+    pub name: StrId,
+    pub kind: u8,
+    pub vis: u8,
+    pub is_mut: bool,
+    pub def_span: Span,
+    pub node: usize,
+    pub def_module: usize,
+}
+
+pub fn copy_symbol_into(dst: mut_view<Symbol>, src: view<Symbol>) {
+    dst.id.v = src.id.v;
+    dst.name.v = src.name.v;
+    dst.kind = src.kind;
+    dst.vis = src.vis;
+    dst.is_mut = src.is_mut;
+    dst.def_span.file.v = src.def_span.file.v;
+    dst.def_span.start = src.def_span.start;
+    dst.def_span.end = src.def_span.end;
+    dst.node = src.node;
+    dst.def_module = src.def_module;
+}
+
+pub struct NodeMap {
+    pub keys: *mut usize,
+    pub vals: *mut SymbolId,
+    pub states: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+pub struct SymEnv {
+    pub keys: *mut u32,
+    pub vals: *mut Symbol,
+    pub states: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+// SymbolId.v -> (module path, canonical name). Symbol ids are sparse (user ids from 1, std ids from 10000,
+// extern ids from 30000), so `index` maps an id to `slot + 1` in the append-only `module_paths` /
+// `canonical_names` arrays instead of indexing a dense table by id.
+pub struct NamingCtx {
+    pub index: NodeMap,
+    pub module_paths: *mut StrView,
+    pub canonical_names: *mut StrView,
+    pub count: usize,
+    pub cap: usize,
+}
+
+const NAMING_INITIAL_CAP: usize = 64;
+
+pub struct ResolveMap {
+    pub node_map: NodeMap,
+    pub module_access_nodes: NodeMap,
+    pub extern_nodes: NodeMap,
+    pub next_symbol_v: u32,
+    pub next_std_symbol_v: u32,
+    pub naming_ctx: *mut NamingCtx,
+}
+
+fn mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+fn symtab_zero_bytes(ptr: *mut u8, n: usize) {
+    let word_count = n >> 3;
+    let mut w: usize = 0;
+    while w < word_count {
+        let off = w << 3;
+        unsafe { *(((ptr as usize) + off) as *mut u64) = 0u64; }
+        w = w + 1;
+    }
+    let mut i: usize = word_count << 3;
+    while i < n {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+unsafe fn usize_at(base: *mut usize, idx: usize) -> *mut usize {
+    let off = ((idx as isize) * (size_of<usize>() as isize)) as usize;
+    ((base as usize) + off) as *mut usize
+}
+
+unsafe fn u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = ((idx as isize) * (size_of<u32>() as isize)) as usize;
+    ((base as usize) + off) as *mut u32
+}
+
+unsafe fn symid_at(base: *mut SymbolId, idx: usize) -> *mut SymbolId {
+    let off = ((idx as isize) * (size_of<SymbolId>() as isize)) as usize;
+    ((base as usize) + off) as *mut SymbolId
+}
+
+unsafe fn symbol_at(base: *mut Symbol, idx: usize) -> *mut Symbol {
+    let off = ((idx as isize) * (size_of<Symbol>() as isize)) as usize;
+    ((base as usize) + off) as *mut Symbol
+}
+
+unsafe fn strview_at(base: *mut StrView, idx: usize) -> *mut StrView {
+    let off = ((idx as isize) * (size_of<StrView>() as isize)) as usize;
+    ((base as usize) + off) as *mut StrView
+}
+
+// Keeps the bits that survive a left shift by `HASH_MIX_SHIFT`, so the shift never overflows (native builds
+// trap on overflowing shifts; the dropped high bits would be discarded anyway).
+const HASH_MIX_SHIFT: usize = 7;
+const HASH_MIX_MASK: usize = 0x01FFFFFFFFFFFFFF;
+
+fn map_hash_key(key: usize) -> usize {
+    let mut h = key ^ (key >> 16);
+    h = h ^ ((h & HASH_MIX_MASK) << HASH_MIX_SHIFT);
+    h ^ (h >> 11)
+}
+
+pub fn nodemap_init(m: mut_view<NodeMap>) {
+    m.keys = 0 as *mut usize;
+    m.vals = 0 as *mut SymbolId;
+    m.states = 0 as *mut u8;
+    m.len = 0;
+    m.cap = 0;
+}
+
+pub fn nodemap_free(m: mut_view<NodeMap>) {
+    if m.cap > 0 {
+        unsafe {
+            heap_free(m.keys as *mut u8, mul_usize(m.cap, size_of<usize>()), align_of<usize>());
+            heap_free(m.vals as *mut u8, mul_usize(m.cap, size_of<SymbolId>()), align_of<SymbolId>());
+            heap_free(m.states, m.cap, 1);
+        }
+    }
+    nodemap_init(m);
+}
+
+fn nodemap_grow(m: mut_view<NodeMap>) {
+    let new_cap: usize = if m.cap == 0 { 16 } else { m.cap + m.cap };
+    let new_keys = unsafe { heap_alloc(mul_usize(new_cap, size_of<usize>()), align_of<usize>()) as *mut usize };
+    let new_vals = unsafe {
+        heap_alloc(mul_usize(new_cap, size_of<SymbolId>()), align_of<SymbolId>()) as *mut SymbolId
+    };
+    let new_states = unsafe { heap_alloc(new_cap, 1) };
+    symtab_zero_bytes(new_states, new_cap);
+
+    let old_keys = m.keys;
+    let old_vals = m.vals;
+    let old_states = m.states;
+    let old_cap = m.cap;
+
+    m.keys = new_keys;
+    m.vals = new_vals;
+    m.states = new_states;
+    m.len = 0;
+    m.cap = new_cap;
+
+    let mut i: usize = 0;
+    while i < old_cap {
+        let st = unsafe { *(old_states + i) };
+        if st == 1u8 {
+            let k = unsafe { *usize_at(old_keys, i) };
+            let v = unsafe { (*symid_at(old_vals, i)).v };
+            nodemap_insert(mut_view(*m), k, SymbolId { v: v });
+        }
+        i = i + 1;
+    }
+
+    if old_cap > 0 {
+        unsafe {
+            heap_free(old_keys as *mut u8, mul_usize(old_cap, size_of<usize>()), align_of<usize>());
+            heap_free(old_vals as *mut u8, mul_usize(old_cap, size_of<SymbolId>()), align_of<SymbolId>());
+            heap_free(old_states, old_cap, 1);
+        }
+    }
+}
+
+pub fn nodemap_insert(m: mut_view<NodeMap>, key: usize, val: SymbolId) {
+    if m.cap == 0 || mul_usize(m.len + 1, 10) >= mul_usize(m.cap, 7) {
+        nodemap_grow(mut_view(*m));
+    }
+    let mask = m.cap - 1;
+    let mut idx = map_hash_key(key as usize) & mask;
+    loop {
+        let st = unsafe { *(m.states + idx) };
+        if st == 0u8 {
+            unsafe {
+                *usize_at(m.keys, idx) = key;
+                (*symid_at(m.vals, idx)).v = val.v;
+                *(m.states + idx) = 1u8;
+            }
+            m.len = m.len + 1;
+            return;
+        }
+        let k = unsafe { *usize_at(m.keys, idx) };
+        if k == key {
+            unsafe { (*symid_at(m.vals, idx)).v = val.v; }
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+pub fn nodemap_get(m: view<NodeMap>, key: usize) -> *mut SymbolId {
+    if m.cap == 0 {
+        return 0 as *mut SymbolId;
+    }
+    let mask = m.cap - 1;
+    let mut idx = map_hash_key(key as usize) & mask;
+    let mut probes: usize = 0;
+    while probes < m.cap {
+        let st = unsafe { *(m.states + idx) };
+        if st == 0u8 {
+            return 0 as *mut SymbolId;
+        }
+        if st == 1u8 {
+            let k = unsafe { *usize_at(m.keys, idx) };
+            if k == key {
+                return unsafe { symid_at(m.vals, idx) };
+            }
+        }
+        idx = (idx + 1) & mask;
+        probes = probes + 1;
+    }
+    0 as *mut SymbolId
+}
+
+pub fn nodemap_contains(m: view<NodeMap>, key: usize) -> bool {
+    (nodemap_get(m, key) as usize) != 0
+}
+
+pub fn symenv_init(m: mut_view<SymEnv>) {
+    m.keys = 0 as *mut u32;
+    m.vals = 0 as *mut Symbol;
+    m.states = 0 as *mut u8;
+    m.len = 0;
+    m.cap = 0;
+}
+
+pub fn symenv_free(m: mut_view<SymEnv>) {
+    if m.cap > 0 {
+        unsafe {
+            heap_free(m.keys as *mut u8, mul_usize(m.cap, size_of<u32>()), align_of<u32>());
+            heap_free(m.vals as *mut u8, mul_usize(m.cap, size_of<Symbol>()), align_of<Symbol>());
+            heap_free(m.states, m.cap, 1);
+        }
+    }
+    symenv_init(m);
+}
+
+fn symenv_grow(m: mut_view<SymEnv>) {
+    let new_cap: usize = if m.cap == 0 { 16 } else { m.cap + m.cap };
+    let new_keys = unsafe { heap_alloc(mul_usize(new_cap, size_of<u32>()), align_of<u32>()) as *mut u32 };
+    let new_vals = unsafe { heap_alloc(mul_usize(new_cap, size_of<Symbol>()), align_of<Symbol>()) as *mut Symbol };
+    let new_states = unsafe { heap_alloc(new_cap, 1) };
+    symtab_zero_bytes(new_states, new_cap);
+
+    let old_keys = m.keys;
+    let old_vals = m.vals;
+    let old_states = m.states;
+    let old_cap = m.cap;
+
+    m.keys = new_keys;
+    m.vals = new_vals;
+    m.states = new_states;
+    m.len = 0;
+    m.cap = new_cap;
+
+    let mut i: usize = 0;
+    while i < old_cap {
+        let st = unsafe { *(old_states + i) };
+        if st == 1u8 {
+            let k = unsafe { *u32_at(old_keys, i) };
+            let v_ptr = unsafe { symbol_at(old_vals, i) };
+            symenv_insert(mut_view(*m), k, unsafe { view(*v_ptr) });
+        }
+        i = i + 1;
+    }
+
+    if old_cap > 0 {
+        unsafe {
+            heap_free(old_keys as *mut u8, mul_usize(old_cap, size_of<u32>()), align_of<u32>());
+            heap_free(old_vals as *mut u8, mul_usize(old_cap, size_of<Symbol>()), align_of<Symbol>());
+            heap_free(old_states, old_cap, 1);
+        }
+    }
+}
+
+pub fn symenv_insert(m: mut_view<SymEnv>, key: u32, val: view<Symbol>) {
+    if m.cap == 0 || mul_usize(m.len + 1, 10) >= mul_usize(m.cap, 7) {
+        symenv_grow(mut_view(*m));
+    }
+    let mask = m.cap - 1;
+    let mut idx = map_hash_key(key as usize) & mask;
+    loop {
+        let st = unsafe { *(m.states + idx) };
+        if st == 0u8 {
+            unsafe {
+                *u32_at(m.keys, idx) = key;
+                let dst = symbol_at(m.vals, idx);
+                copy_symbol_into(mut_view(*dst), val);
+                *(m.states + idx) = 1u8;
+            }
+            m.len = m.len + 1;
+            return;
+        }
+        let k = unsafe { *u32_at(m.keys, idx) };
+        if k == key {
+            unsafe { let dst = symbol_at(m.vals, idx);
+                copy_symbol_into(mut_view(*dst), val); }
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+pub fn symenv_get(m: view<SymEnv>, key: u32) -> *mut Symbol {
+    if m.cap == 0 {
+        return 0 as *mut Symbol;
+    }
+    let mask = m.cap - 1;
+    let mut idx = map_hash_key(key as usize) & mask;
+    let mut probes: usize = 0;
+    while probes < m.cap {
+        let st = unsafe { *(m.states + idx) };
+        if st == 0u8 {
+            return 0 as *mut Symbol;
+        }
+        if st == 1u8 {
+            let k = unsafe { *u32_at(m.keys, idx) };
+            if k == key {
+                return unsafe { symbol_at(m.vals, idx) };
+            }
+        }
+        idx = (idx + 1) & mask;
+        probes = probes + 1;
+    }
+    0 as *mut Symbol
+}
+
+pub fn symenv_contains(m: view<SymEnv>, key: u32) -> bool {
+    (symenv_get(m, key) as usize) != 0
+}
+
+pub fn symenv_at_slot(m: view<SymEnv>, slot: usize) -> *mut Symbol {
+    if slot >= m.cap {
+        return 0 as *mut Symbol;
+    }
+    let st = unsafe { *(m.states + slot) };
+    if st != 1u8 {
+        return 0 as *mut Symbol;
+    }
+    unsafe { symbol_at(m.vals, slot) }
+}
+
+pub fn symenv_key_at_slot(m: view<SymEnv>, slot: usize) -> u32 {
+    unsafe { *u32_at(m.keys, slot) }
+}
+
+pub fn resolve_map_init(rmap: mut_view<ResolveMap>) {
+    nodemap_init(mut_view(rmap.node_map));
+    nodemap_init(mut_view(rmap.module_access_nodes));
+    nodemap_init(mut_view(rmap.extern_nodes));
+    rmap.next_symbol_v = 1u32;
+    rmap.next_std_symbol_v = 10000u32;
+    rmap.naming_ctx = 0 as *mut NamingCtx;
+}
+
+pub fn resolve_map_free(rmap: mut_view<ResolveMap>) {
+    nodemap_free(mut_view(rmap.extern_nodes));
+    nodemap_free(mut_view(rmap.module_access_nodes));
+    nodemap_free(mut_view(rmap.node_map));
+    if (rmap.naming_ctx as usize) == 0 {
+        return;
+    }
+    let ctx = rmap.naming_ctx;
+    let count = unsafe { (*ctx).count };
+    let cap = unsafe { (*ctx).cap };
+    let mut i: usize = 0;
+    while i < count {
+        free_heap_sv(unsafe { strview_at((*ctx).module_paths, i) });
+        free_heap_sv(unsafe { strview_at((*ctx).canonical_names, i) });
+        i = i + 1;
+    }
+    if cap > 0 {
+        unsafe {
+            heap_free((*ctx).module_paths as *mut u8, mul_usize(cap, size_of<StrView>()), align_of<StrView>());
+            heap_free((*ctx).canonical_names as *mut u8, mul_usize(cap, size_of<StrView>()), align_of<StrView>());
+        }
+    }
+    unsafe { nodemap_free(mut_view((*ctx).index)); }
+    unsafe { heap_free(ctx as *mut u8, size_of<NamingCtx>(), align_of<NamingCtx>()); }
+    rmap.naming_ctx = 0 as *mut NamingCtx;
+}
+
+fn free_heap_sv(slot: *mut StrView) {
+    let p = unsafe { (*slot).ptr };
+    if (p as usize) != 0 {
+        let n = unsafe { (*slot).len };
+        unsafe { heap_free(p as *mut u8, n + 1, 1); }
+    }
+    unsafe {
+        (*slot).ptr = 0 as *const u8;
+        (*slot).len = 0;
+    }
+}
+
+fn dup_heap_sv(sv: view<StrView>) -> StrView {
+    if (sv.ptr as usize) == 0 || sv.len == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = unsafe { heap_alloc(sv.len + 1, 1) };
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe { *(buf + i) = *(sv.ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(buf + sv.len) = 0u8; }
+    StrView { ptr: buf as *const u8, len: sv.len }
+}
+
+fn build_canonical(mod_path: view<StrView>, item_name: view<StrView>) -> StrView {
+    if item_name.len == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    if mod_path.len == 0 {
+        return dup_heap_sv(item_name);
+    }
+    let total = mod_path.len + 1 + item_name.len;
+    let buf = unsafe { heap_alloc(total + 1, 1) };
+    let mut j: usize = 0;
+    while j < mod_path.len {
+        unsafe { *(buf + j) = *(mod_path.ptr + j); }
+        j = j + 1;
+    }
+    unsafe { *(buf + mod_path.len) = 46u8; }
+    let mut k: usize = 0;
+    while k < item_name.len {
+        unsafe { *(buf + mod_path.len + 1 + k) = *(item_name.ptr + k); }
+        k = k + 1;
+    }
+    unsafe { *(buf + total) = 0u8; }
+    StrView { ptr: buf as *const u8, len: total }
+}
+
+fn naming_ensure_capacity(ctx: *mut NamingCtx) {
+    let count = unsafe { (*ctx).count };
+    let old_cap = unsafe { (*ctx).cap };
+    if count < old_cap {
+        return;
+    }
+    let new_cap: usize = if old_cap == 0 { NAMING_INITIAL_CAP } else { old_cap + old_cap };
+    let mp_bytes = mul_usize(new_cap, size_of<StrView>());
+    let new_mp = unsafe { heap_alloc(mp_bytes, align_of<StrView>()) as *mut StrView };
+    let new_cn = unsafe { heap_alloc(mp_bytes, align_of<StrView>()) as *mut StrView };
+    symtab_zero_bytes(new_mp as *mut u8, mp_bytes);
+    symtab_zero_bytes(new_cn as *mut u8, mp_bytes);
+    let old_mp = unsafe { (*ctx).module_paths };
+    let old_cn = unsafe { (*ctx).canonical_names };
+    let mut i: usize = 0;
+    while i < count {
+        unsafe {
+            let s_mp = strview_at(old_mp, i);
+            let d_mp = strview_at(new_mp, i);
+            (*d_mp).ptr = (*s_mp).ptr;
+            (*d_mp).len = (*s_mp).len;
+            let s_cn = strview_at(old_cn, i);
+            let d_cn = strview_at(new_cn, i);
+            (*d_cn).ptr = (*s_cn).ptr;
+            (*d_cn).len = (*s_cn).len;
+        }
+        i = i + 1;
+    }
+    if old_cap > 0 {
+        let old_bytes = mul_usize(old_cap, size_of<StrView>());
+        unsafe {
+            heap_free(old_mp as *mut u8, old_bytes, align_of<StrView>());
+            heap_free(old_cn as *mut u8, old_bytes, align_of<StrView>());
+        }
+    }
+    unsafe {
+        (*ctx).module_paths = new_mp;
+        (*ctx).canonical_names = new_cn;
+        (*ctx).cap = new_cap;
+    }
+}
+
+pub fn record_symbol_naming(rmap: mut_view<ResolveMap>, id: SymbolId, mod_path: StrView, item_name: StrView) {
+    if id.v == 0u32 {
+        return;
+    }
+    if (rmap.naming_ctx as usize) == 0 {
+        let raw = unsafe { heap_alloc(size_of<NamingCtx>(), align_of<NamingCtx>()) };
+        symtab_zero_bytes(raw, size_of<NamingCtx>());
+        rmap.naming_ctx = raw as *mut NamingCtx;
+        unsafe { nodemap_init(mut_view((*rmap.naming_ctx).index)); }
+    }
+    let ctx = rmap.naming_ctx;
+    let mut slot: usize = 0;
+    let found = unsafe { nodemap_get(view((*ctx).index), id.v as usize) };
+    if (found as usize) != 0 {
+        slot = (unsafe { (*found).v } as usize) - 1;
+    } else {
+        naming_ensure_capacity(ctx);
+        slot = unsafe { (*ctx).count };
+        unsafe {
+            (*ctx).count = slot + 1;
+            nodemap_insert(mut_view((*ctx).index), id.v as usize, SymbolId { v: (slot as u32) + 1u32 });
+        }
+    }
+    let mp_slot = unsafe { strview_at((*ctx).module_paths, slot) };
+    free_heap_sv(mp_slot);
+    let mp_dup = dup_heap_sv(view(mod_path));
+    unsafe {
+        (*mp_slot).ptr = mp_dup.ptr;
+        (*mp_slot).len = mp_dup.len;
+    }
+    let cn_slot = unsafe { strview_at((*ctx).canonical_names, slot) };
+    free_heap_sv(cn_slot);
+    let cn = build_canonical(view(mod_path), view(item_name));
+    unsafe {
+        (*cn_slot).ptr = cn.ptr;
+        (*cn_slot).len = cn.len;
+    }
+}
+
+fn naming_lookup(rmap: view<ResolveMap>, sym: SymbolId, want_canonical: bool) -> StrView {
+    if sym.v == 0u32 || (rmap.naming_ctx as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let ctx = rmap.naming_ctx;
+    let found = unsafe { nodemap_get(view((*ctx).index), sym.v as usize) };
+    if (found as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let slot = (unsafe { (*found).v } as usize) - 1;
+    let sv = if want_canonical {
+        unsafe { strview_at((*ctx).canonical_names, slot) }
+    } else {
+        unsafe { strview_at((*ctx).module_paths, slot) }
+    };
+    StrView { ptr: unsafe { (*sv).ptr }, len: unsafe { (*sv).len } }
+}
+
+pub fn resolve_symbol_module_path(rmap: view<ResolveMap>, sym: SymbolId) -> StrView {
+    naming_lookup(rmap, (SymbolId { v: sym.v }), false)
+}
+
+pub fn resolve_symbol_canonical_name(rmap: view<ResolveMap>, sym: SymbolId) -> StrView {
+    naming_lookup(rmap, (SymbolId { v: sym.v }), true)
+}
