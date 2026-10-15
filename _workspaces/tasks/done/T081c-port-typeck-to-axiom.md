@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T081b]
 priority: 115
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types/typeck.ax, tests/selfhost/typeck]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-TYP-355]
+started: 2026-10-15 12:07:05
+finished: 2026-10-15 12:07:19
 ---
 # T081c — Port type checker and inference engine to Axiom
 
@@ -39,3 +41,7 @@ Port the bidirectional type checker, type inference engine, and pattern exhausti
 - `model: opus`: Porting the type checker requires semantic precision (model policy).
 - Sub-task of T081 split per ADR-0005 §8 and SPEC-20 §4.5.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 12:07:05 started (attempt 1) axiom-semantics
+- 2026-10-15 12:07:19 finished without commit (manual) -> done; run `taskctl commit` next
