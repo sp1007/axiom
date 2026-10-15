@@ -1,0 +1,487 @@
+// Session-level Resolver + HIR integration (T080): wires `compiler.parser.session`, `compiler.resolve`,
+// and `compiler.hir` over `CompilerSession` so virtual or on-disk files can be parsed (with optional
+// std.core.{option,result,prelude,host} prelude injection matching `axiom0`), resolved, lowered to HIR,
+// and rendered in canonical `inspect --emit=resolved` and `inspect --emit=hir` S-expression formats.
+module compiler.resolve_hir.session
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.source.span.Span
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.ax_diag_render_human
+use compiler.diag.json.ax_diag_render_json
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.parser.session.session_parse_virtual_file
+use compiler.syntax.ast.Ast
+use compiler.syntax.ast.AstItem
+use compiler.syntax.ast.ITEM_MODULE
+use compiler.syntax.ast.VIS_PUB
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.resolve.resolver.resolve_file_into
+use compiler.resolve.resolver.emit_resolved
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.emit_hir
+use compiler.hir.lower.lower_file
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+const STD_CORE_DATA: [2021]u8 = [
+    60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 111u8, 112u8, 116u8, 105u8, 111u8,
+    110u8, 46u8, 97u8, 120u8, 109u8, 111u8, 100u8, 117u8, 108u8, 101u8, 32u8, 115u8, 116u8, 100u8, 46u8, 99u8,
+    111u8, 114u8, 101u8, 46u8, 111u8, 112u8, 116u8, 105u8, 111u8, 110u8, 10u8, 10u8, 112u8, 117u8, 98u8, 32u8,
+    101u8, 110u8, 117u8, 109u8, 32u8, 79u8, 112u8, 116u8, 105u8, 111u8, 110u8, 60u8, 84u8, 62u8, 32u8, 123u8,
+    10u8, 32u8, 32u8, 32u8, 32u8, 78u8, 111u8, 110u8, 101u8, 44u8, 10u8, 32u8, 32u8, 32u8, 32u8, 83u8,
+    111u8, 109u8, 101u8, 40u8, 84u8, 41u8, 44u8, 10u8, 125u8, 10u8, 60u8, 115u8, 116u8, 100u8, 62u8, 47u8,
+    99u8, 111u8, 114u8, 101u8, 47u8, 114u8, 101u8, 115u8, 117u8, 108u8, 116u8, 46u8, 97u8, 120u8, 109u8, 111u8,
+    100u8, 117u8, 108u8, 101u8, 32u8, 115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 114u8, 101u8,
+    115u8, 117u8, 108u8, 116u8, 10u8, 10u8, 112u8, 117u8, 98u8, 32u8, 101u8, 110u8, 117u8, 109u8, 32u8, 82u8,
+    101u8, 115u8, 117u8, 108u8, 116u8, 60u8, 84u8, 44u8, 32u8, 69u8, 62u8, 32u8, 123u8, 10u8, 32u8, 32u8,
+    32u8, 32u8, 79u8, 107u8, 40u8, 84u8, 41u8, 44u8, 10u8, 32u8, 32u8, 32u8, 32u8, 69u8, 114u8, 114u8,
+    40u8, 69u8, 41u8, 44u8, 10u8, 125u8, 10u8, 60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8,
+    101u8, 47u8, 112u8, 114u8, 101u8, 108u8, 117u8, 100u8, 101u8, 46u8, 97u8, 120u8, 109u8, 111u8, 100u8, 117u8,
+    108u8, 101u8, 32u8, 115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 112u8, 114u8, 101u8, 108u8,
+    117u8, 100u8, 101u8, 10u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 115u8, 101u8, 32u8, 115u8, 116u8, 100u8,
+    46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 111u8, 112u8, 116u8, 105u8, 111u8, 110u8, 46u8, 79u8, 112u8, 116u8,
+    105u8, 111u8, 110u8, 59u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 115u8, 101u8, 32u8, 115u8, 116u8, 100u8,
+    46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 114u8, 101u8, 115u8, 117u8, 108u8, 116u8, 46u8, 82u8, 101u8, 115u8,
+    117u8, 108u8, 116u8, 59u8, 10u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8, 32u8, 112u8, 114u8, 101u8,
+    108u8, 117u8, 100u8, 101u8, 95u8, 108u8, 111u8, 97u8, 100u8, 101u8, 100u8, 40u8, 41u8, 32u8, 45u8, 62u8,
+    32u8, 98u8, 111u8, 111u8, 108u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 116u8, 114u8, 117u8, 101u8,
+    10u8, 125u8, 10u8, 60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 104u8, 111u8,
+    115u8, 116u8, 46u8, 97u8, 120u8, 109u8, 111u8, 100u8, 117u8, 108u8, 101u8, 32u8, 115u8, 116u8, 100u8, 46u8,
+    99u8, 111u8, 114u8, 101u8, 46u8, 104u8, 111u8, 115u8, 116u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8,
+    105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8,
+    32u8, 102u8, 110u8, 32u8, 104u8, 101u8, 97u8, 112u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8, 40u8, 115u8,
+    105u8, 122u8, 101u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 97u8, 108u8, 105u8, 103u8,
+    110u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 42u8, 109u8, 117u8,
+    116u8, 32u8, 117u8, 56u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 32u8, 97u8, 115u8, 32u8,
+    42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8,
+    105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8,
+    32u8, 102u8, 110u8, 32u8, 104u8, 101u8, 97u8, 112u8, 95u8, 114u8, 101u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    40u8, 112u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 111u8, 108u8, 100u8,
+    95u8, 115u8, 105u8, 122u8, 101u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 110u8, 101u8,
+    119u8, 95u8, 115u8, 105u8, 122u8, 101u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 97u8,
+    108u8, 105u8, 103u8, 110u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8,
+    42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 32u8,
+    97u8, 115u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8,
+    110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8,
+    97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 104u8, 101u8, 97u8, 112u8, 95u8, 102u8, 114u8, 101u8, 101u8,
+    40u8, 112u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 115u8, 105u8, 122u8,
+    101u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 97u8, 108u8, 105u8, 103u8, 110u8, 58u8,
+    32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 123u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8,
+    116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8, 32u8, 115u8,
+    116u8, 100u8, 105u8, 111u8, 40u8, 119u8, 104u8, 105u8, 99u8, 104u8, 58u8, 32u8, 117u8, 51u8, 50u8, 41u8,
+    32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8,
+    125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8,
+    98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 111u8, 112u8, 101u8, 110u8,
+    40u8, 112u8, 97u8, 116u8, 104u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8, 115u8, 116u8, 32u8, 117u8, 56u8,
+    44u8, 32u8, 112u8, 97u8, 116u8, 104u8, 95u8, 108u8, 101u8, 110u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8,
+    101u8, 44u8, 32u8, 109u8, 111u8, 100u8, 101u8, 58u8, 32u8, 117u8, 51u8, 50u8, 41u8, 32u8, 45u8, 62u8,
+    32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8,
+    64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8,
+    110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 114u8, 101u8, 97u8, 100u8, 40u8, 104u8, 58u8,
+    32u8, 105u8, 54u8, 52u8, 44u8, 32u8, 98u8, 117u8, 102u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8,
+    117u8, 56u8, 44u8, 32u8, 99u8, 97u8, 112u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8,
+    45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8,
+    10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8,
+    32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 119u8, 114u8, 105u8, 116u8, 101u8,
+    40u8, 104u8, 58u8, 32u8, 105u8, 54u8, 52u8, 44u8, 32u8, 112u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8,
+    115u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 99u8, 111u8, 117u8, 110u8, 116u8, 58u8, 32u8, 117u8, 115u8,
+    105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8,
+    32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8,
+    99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8, 32u8, 99u8, 108u8, 111u8, 115u8, 101u8, 40u8, 104u8,
+    58u8, 32u8, 105u8, 54u8, 52u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8,
+    115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8, 32u8, 102u8, 105u8, 108u8, 101u8, 95u8,
+    115u8, 105u8, 122u8, 101u8, 40u8, 104u8, 58u8, 32u8, 105u8, 54u8, 52u8, 41u8, 32u8, 45u8, 62u8, 32u8,
+    105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8,
+    105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8,
+    32u8, 97u8, 114u8, 103u8, 115u8, 95u8, 99u8, 111u8, 117u8, 110u8, 116u8, 40u8, 41u8, 32u8, 45u8, 62u8,
+    32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8,
+    10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8,
+    32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 97u8, 114u8, 103u8, 40u8, 105u8,
+    58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 98u8, 117u8, 102u8, 58u8, 32u8, 42u8, 109u8,
+    117u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 99u8, 97u8, 112u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8,
+    101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8,
+    48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8,
+    112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 101u8, 110u8,
+    118u8, 95u8, 103u8, 101u8, 116u8, 40u8, 110u8, 97u8, 109u8, 101u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8,
+    115u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 110u8, 97u8, 109u8, 101u8, 95u8, 108u8, 101u8, 110u8, 58u8,
+    32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8, 98u8, 117u8, 102u8, 58u8, 32u8, 42u8, 109u8, 117u8,
+    116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 99u8, 97u8, 112u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8,
+    41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8,
+    10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8,
+    117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 101u8, 120u8, 101u8,
+    95u8, 112u8, 97u8, 116u8, 104u8, 40u8, 98u8, 117u8, 102u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8,
+    117u8, 56u8, 44u8, 32u8, 99u8, 97u8, 112u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8,
+    45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8,
+    10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8,
+    32u8, 102u8, 110u8, 32u8, 101u8, 120u8, 105u8, 116u8, 40u8, 99u8, 111u8, 100u8, 101u8, 58u8, 32u8, 105u8,
+    51u8, 50u8, 41u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 108u8, 111u8, 111u8, 112u8, 32u8, 123u8,
+    125u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8,
+    112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 114u8, 101u8,
+    109u8, 111u8, 118u8, 101u8, 40u8, 112u8, 97u8, 116u8, 104u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8, 115u8,
+    116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 112u8, 97u8, 116u8, 104u8, 95u8, 108u8, 101u8, 110u8, 58u8, 32u8,
+    117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8,
+    115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8,
+    110u8, 32u8, 109u8, 107u8, 100u8, 105u8, 114u8, 40u8, 112u8, 97u8, 116u8, 104u8, 58u8, 32u8, 42u8, 99u8,
+    111u8, 110u8, 115u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 112u8, 97u8, 116u8, 104u8, 95u8, 108u8, 101u8,
+    110u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8,
+    32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8,
+    114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8,
+    101u8, 32u8, 102u8, 110u8, 32u8, 109u8, 101u8, 116u8, 97u8, 100u8, 97u8, 116u8, 97u8, 40u8, 112u8, 97u8,
+    116u8, 104u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8, 115u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 112u8,
+    97u8, 116u8, 104u8, 95u8, 108u8, 101u8, 110u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 44u8, 32u8,
+    111u8, 117u8, 116u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 54u8, 52u8, 41u8, 32u8, 45u8,
+    62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8,
+    10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8,
+    117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8, 100u8, 105u8, 114u8, 95u8, 111u8, 112u8,
+    101u8, 110u8, 40u8, 112u8, 97u8, 116u8, 104u8, 58u8, 32u8, 42u8, 99u8, 111u8, 110u8, 115u8, 116u8, 32u8,
+    117u8, 56u8, 44u8, 32u8, 112u8, 97u8, 116u8, 104u8, 95u8, 108u8, 101u8, 110u8, 58u8, 32u8, 117u8, 115u8,
+    105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8,
+    32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8,
+    99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 102u8, 110u8, 32u8,
+    100u8, 105u8, 114u8, 95u8, 110u8, 101u8, 120u8, 116u8, 40u8, 104u8, 58u8, 32u8, 105u8, 54u8, 52u8, 44u8,
+    32u8, 98u8, 117u8, 102u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 44u8, 32u8, 99u8,
+    97u8, 112u8, 58u8, 32u8, 117u8, 115u8, 105u8, 122u8, 101u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 54u8,
+    52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8, 125u8, 10u8, 10u8, 64u8, 105u8, 110u8,
+    116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8, 98u8, 32u8, 102u8, 110u8, 32u8, 100u8,
+    105u8, 114u8, 95u8, 99u8, 108u8, 111u8, 115u8, 101u8, 40u8, 104u8, 58u8, 32u8, 105u8, 54u8, 52u8, 41u8,
+    32u8, 45u8, 62u8, 32u8, 105u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8, 32u8, 48u8, 10u8,
+    125u8, 10u8, 10u8, 64u8, 105u8, 110u8, 116u8, 114u8, 105u8, 110u8, 115u8, 105u8, 99u8, 10u8, 112u8, 117u8,
+    98u8, 32u8, 102u8, 110u8, 32u8, 109u8, 111u8, 110u8, 111u8, 116u8, 111u8, 110u8, 105u8, 99u8, 95u8, 110u8,
+    115u8, 40u8, 41u8, 32u8, 45u8, 62u8, 32u8, 117u8, 54u8, 52u8, 32u8, 123u8, 10u8, 32u8, 32u8, 32u8,
+    32u8, 48u8, 10u8, 125u8, 10u8,
+];
+const STD_CORE_OFF: [9]u32 = [
+    0u32, 20u32, 90u32, 110u32, 183u32, 204u32, 339u32, 357u32, 2021u32,
+];
+
+fn std_core_str_in_arena(arena: mut_view<Arena>, idx: usize) -> StrView {
+    let start = STD_CORE_OFF[idx] as usize;
+    let end = STD_CORE_OFF[idx + 1] as usize;
+    let slen = end - start;
+    let buf = arena_alloc_raw(arena, slen + 1, 1);
+    let mut i: usize = 0;
+    while (i < slen) {
+        unsafe { *(buf + i) = STD_CORE_DATA[start + i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + slen) = 0u8; }
+    StrView { ptr: buf as *const u8, len: slen }
+}
+
+fn sv_contains_host(text: StrView) -> bool {
+    if (text.len) < 4 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i + 4 <= text.len {
+        let b0 = unsafe { *(text.ptr + i) };
+        let b1 = unsafe { *(text.ptr + i + 1) };
+        let b2 = unsafe { *(text.ptr + i + 2) };
+        let b3 = unsafe { *(text.ptr + i + 3) };
+        if b0 == 104u8 && b1 == 111u8 && b2 == 115u8 && b3 == 116u8 {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn session_ensure_module_header(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    ast: mut_view<Ast>,
+    module_path: StrView
+) {
+    if module_path.len == 0 {
+        return;
+    }
+    if (ast.items as usize) != 0 && (unsafe { (*ast.items).kind }) == ITEM_MODULE {
+        return;
+    }
+    let mut seg_count: usize = 1;
+    let mut i: usize = 0;
+    while i < module_path.len {
+        if (unsafe { *(module_path.ptr + i) }) == 46u8 {
+            seg_count = seg_count + 1;
+        }
+        i = i + 1;
+    }
+    let seg_bytes = ((seg_count as isize) * 4isize) as usize;
+    let segs = arena_alloc_raw(mut_view(*parse_arena), seg_bytes, 4) as *mut StrId;
+    let mut s_idx: usize = 0;
+    let mut start: usize = 0;
+    let mut pos: usize = 0;
+    while pos <= module_path.len {
+        let is_end = pos == module_path.len;
+        let is_dot = if is_end { false } else { (unsafe { *(module_path.ptr + pos) }) == 46u8 };
+        if is_end || is_dot {
+            let slen = pos - start;
+            let sid = interner_intern_bytes(mut_view(sess.interner), unsafe { module_path.ptr + start }, slen);
+            let slot_off = ((s_idx as isize) * 4isize) as usize;
+            let slot = ((segs as usize) + slot_off) as *mut StrId;
+            unsafe { (*slot).v = sid.v; }
+            s_idx = s_idx + 1;
+            start = pos + 1;
+        }
+        pos = pos + 1;
+    }
+    let item_sz = size_of<AstItem>();
+    let raw_mod = arena_alloc_raw(mut_view(*parse_arena), item_sz, align_of<AstItem>());
+    let mut zi: usize = 0;
+    while zi < item_sz {
+        unsafe { *(raw_mod + zi) = 0u8; }
+        zi = zi + 1;
+    }
+    let synth_mod = raw_mod as *mut AstItem;
+    unsafe {
+        (*synth_mod).kind = ITEM_MODULE;
+        (*synth_mod).vis.kind = VIS_PUB;
+        (*synth_mod).mod_path.segments = segs;
+        (*synth_mod).mod_path.count = seg_count;
+        (*synth_mod).next = ast.items;
+    }
+    ast.items = synth_mod;
+}
+
+pub fn append_ast_items(head: *mut AstItem, more: *mut AstItem) -> *mut AstItem {
+    if (more as usize) == 0 {
+        return head;
+    }
+    if (head as usize) == 0 {
+        return more;
+    }
+    let mut cur: *mut AstItem = head;
+    while (unsafe { (*cur).next as usize }) != 0 {
+        cur = unsafe { (*cur).next };
+    }
+    unsafe { (*cur).next = more; }
+    head
+}
+
+pub fn session_append_std_prelude(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    ast: mut_view<Ast>,
+    main_text: StrView
+) {
+    let mut dummy_fid = FileId { v: 0u32 };
+    let mut i: usize = 0;
+    let count: usize = if sv_contains_host(main_text) { 4 } else { 3 };
+    while (i < count) {
+        let vpath = std_core_str_in_arena(mut_view(*parse_arena), i + i);
+        let src = std_core_str_in_arena(mut_view(*parse_arena), i + i + 1);
+        let pres = session_parse_virtual_file(
+            mut_view(*sess),
+            mut_view(*parse_arena),
+            vpath,
+            src,
+            mut_view(dummy_fid)
+        );
+        let _t1 = append_ast_items(ast.items, pres.ast.items);
+        ast.items = _t1;
+        i = i + 1;
+    }
+}
+
+pub fn session_resolve_ast_into(
+    sess: mut_view<CompilerSession>,
+    resolve_arena: mut_view<Arena>,
+    ast: view<Ast>,
+    out_rmap: mut_view<ResolveMap>
+) {
+    resolve_file_into(
+        ast,
+        resolve_arena,
+        mut_view(sess.diag_sink),
+        mut_view(sess.interner),
+        out_rmap
+    );
+}
+
+pub fn session_lower_hir(
+    sess: mut_view<CompilerSession>,
+    hir_arena: mut_view<Arena>,
+    ast: view<Ast>,
+    rmap: view<ResolveMap>
+) -> HirFile {
+    let hf = lower_file(
+        hir_arena,
+        ast,
+        rmap,
+        mut_view(sess.diag_sink),
+        mut_view(sess.interner)
+    );
+    HirFile { items: hf.items }
+}
+
+pub fn session_render_resolved(
+    sess: view<CompilerSession>,
+    ast: view<Ast>,
+    rmap: view<ResolveMap>,
+    filter_file: FileId
+) -> DiagBuffer {
+    let mut buf = diag_buf_new();
+    emit_resolved(mut_view(buf), ast, rmap, view(sess.interner), FileId { v: filter_file.v });
+    DiagBuffer { ptr: buf.ptr, len: buf.len, cap: buf.cap }
+}
+
+pub fn session_render_resolved_into(
+    sess: view<CompilerSession>,
+    ast: view<Ast>,
+    rmap: view<ResolveMap>,
+    filter_file: FileId,
+    out: mut_view<DiagBuffer>
+) {
+    emit_resolved(out, ast, rmap, view(sess.interner), FileId { v: filter_file.v });
+}
+
+pub fn session_render_hir(
+    sess: view<CompilerSession>,
+    hf: view<HirFile>,
+    filter_file: FileId
+) -> DiagBuffer {
+    let mut buf = diag_buf_new();
+    emit_hir(mut_view(buf), hf, view(sess.interner), FileId { v: filter_file.v });
+    DiagBuffer { ptr: buf.ptr, len: buf.len, cap: buf.cap }
+}
+
+pub fn session_render_hir_into(
+    sess: view<CompilerSession>,
+    hf: view<HirFile>,
+    filter_file: FileId,
+    out: mut_view<DiagBuffer>
+) {
+    emit_hir(out, hf, view(sess.interner), FileId { v: filter_file.v });
+}
+
+pub fn session_resolve_and_render_human(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_resolved: mut_view<DiagBuffer>,
+    out_diags: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        StrView { ptr: text.ptr, len: text.len },
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    emit_resolved(out_resolved, view(parse_res.ast), view(*rmap), view(sess.interner), FileId { v: fid.v });
+    ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), out_diags);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}
+
+pub fn session_resolve_and_render_json(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_resolved: mut_view<DiagBuffer>,
+    out_json: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        StrView { ptr: text.ptr, len: text.len },
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    emit_resolved(out_resolved, view(parse_res.ast), view(*rmap), view(sess.interner), FileId { v: fid.v });
+    ax_diag_render_json(view(sess.diag_sink), view(sess.source_db), out_json);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}
+
+pub fn session_hir_and_render_human(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_hir: mut_view<DiagBuffer>,
+    out_diags: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        StrView { ptr: text.ptr, len: text.len },
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    let hf = session_lower_hir(mut_view(*sess), hir_arena, view(parse_res.ast), view(*rmap));
+    emit_hir(out_hir, view(hf), view(sess.interner), FileId { v: fid.v });
+    ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), out_diags);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}
+
+pub fn session_hir_and_render_json(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_hir: mut_view<DiagBuffer>,
+    out_json: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        StrView { ptr: text.ptr, len: text.len },
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    let hf = session_lower_hir(mut_view(*sess), hir_arena, view(parse_res.ast), view(*rmap));
+    emit_hir(out_hir, view(hf), view(sess.interner), FileId { v: fid.v });
+    ax_diag_render_json(view(sess.diag_sink), view(sess.source_db), out_json);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}

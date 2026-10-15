@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T080a, T080b]
 priority: 114
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/resolve_hir, tests/selfhost/resolve_hir]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-MOD-142, REQ-PKG-023, REQ-RES-243]
+started: 2026-10-15 11:34:22
+finished: 2026-10-15 12:00:17
 ---
 # T080 — Port resolver + HIR to Axiom (integration + differential HIR)
 
@@ -38,3 +40,7 @@ Integrate resolver and HIR in Axiom and run differential HIR testing against `ax
 - Exact differential artefact: `inspect --emit=hir`.
 - Harness entry: `tests/selfhost/resolve_hir`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 11:34:22 started (attempt 1) axiom-frontend
+- 2026-10-15 12:00:17 finished without commit (manual) -> done; run `taskctl commit` next
