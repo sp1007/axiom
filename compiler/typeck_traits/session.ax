@@ -1,0 +1,257 @@
+// End-to-end Typeck + Trait Solver + Monomorphization session integration (T081):
+// wires `compiler.typeck.session`, `compiler.traits.solver`, and `compiler.traits.mono`
+// over `CompilerSession` so programs can be parsed, resolved, lowered to HIR, typechecked
+// into THIR, and seeded/instantiated in `MonoEngine`.
+module compiler.typeck_traits.session
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.ax_diag_render_human
+use compiler.diag.json.ax_diag_render_json
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_TRAIT
+use compiler.hir.hir.HIR_EXPR_CALL
+use compiler.hir.hir.HIR_EXPR_METHOD_CALL
+use compiler.hir.hir.HIR_EXPR_PATH
+use compiler.hir.hir.HirExpr
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirFile
+use compiler.resolve_hir.session.session_append_std_prelude
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.GenericArgsSlice
+use compiler.types.types.Thir
+use compiler.types.types.mul_usize
+use compiler.types.types.thir_get_expr_method
+use compiler.types.typeck.emit_thir
+use compiler.typeck.session.session_typeck_into
+use compiler.traits.mono.MonoEngine
+use compiler.traits.mono.mono_engine_init
+use compiler.traits.mono.mono_has_concrete_args
+use compiler.traits.mono.mono_find_or_create_inst
+use compiler.traits.mono.mono_seed_hir_items
+use compiler.traits.mono.mono_dedup_instance_names
+
+@intrinsic
+fn size_of<T>() -> usize {
+    0
+}
+
+@intrinsic
+unsafe fn address_of_mut<T>(val: mut_view<T>) -> *mut T {
+    0 as *mut T
+}
+
+const SLOT_OCCUPIED: u8 = 1u8;
+
+unsafe fn usize_at(base: *mut usize, idx: usize) -> *mut usize {
+    let off = mul_usize(idx, size_of<usize>());
+    ((base as usize) + off) as *mut usize
+}
+
+unsafe fn subst_at(base: *mut GenericArgsSlice, idx: usize) -> *mut GenericArgsSlice {
+    let off = mul_usize(idx, size_of<GenericArgsSlice>());
+    ((base as usize) + off) as *mut GenericArgsSlice
+}
+
+fn find_fn_item_by_sym(hir: view<HirFile>, sym: SymbolId) -> *mut HirItem {
+    if sym.v == 0u32 {
+        return 0 as *mut HirItem;
+    }
+    let mut it: *mut HirItem = hir.items;
+    while ((it as usize) != 0) {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN && (unsafe { (*it).symbol.v }) == sym.v {
+            return it;
+        }
+        if ik == HIR_ITEM_IMPL || ik == HIR_ITEM_TRAIT {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while ((m as usize) != 0) {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym.v {
+                    return m;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *mut HirItem
+}
+
+pub fn mono_collect_thir_substs(
+    eng: mut_view<MonoEngine>,
+    hir: view<HirFile>,
+    thir: view<Thir>,
+    str_in: mut_view<StrInterner>
+) {
+    let cap = thir.expr_substs.cap;
+    let states = thir.expr_substs.states;
+    let keys = thir.expr_substs.keys;
+    let vals = thir.expr_substs.vals;
+    let mut i: usize = 0;
+    while (i < cap) {
+        if (unsafe { *(states + i) }) == SLOT_OCCUPIED {
+            let ex_addr = unsafe { *usize_at(keys, i) };
+            let ex = ex_addr as *const HirExpr;
+            let sp = unsafe { subst_at(vals, i) };
+            let acnt = unsafe { (*sp).count };
+            if (ex as usize) != 0 && acnt > 0 {
+                if unsafe { mono_has_concrete_args(view(*sp), view(thir.interner)) } {
+                    let mut target: *mut HirItem = 0 as *mut HirItem;
+                    let ek = unsafe { (*ex).kind };
+                    if ek == HIR_EXPR_METHOD_CALL {
+                        let mp = thir_get_expr_method(thir, ex);
+                        if (mp as usize) != 0 {
+                            target = unsafe { (*mp) as *mut HirItem };
+                        }
+                    } else if ek == HIR_EXPR_CALL {
+                        let callee: *mut HirExpr = unsafe { (*ex).callee };
+                        if (callee as usize) != 0 && (unsafe { (*callee).kind }) == HIR_EXPR_PATH {
+                            let csym_v = unsafe { (*callee).path.symbol.v };
+                            target = find_fn_item_by_sym(hir, (SymbolId { v: csym_v }));
+                        }
+                    } else if ek == HIR_EXPR_PATH {
+                        let esym_v = unsafe { (*ex).path.symbol.v };
+                        target = find_fn_item_by_sym(hir, (SymbolId { v: esym_v }));
+                    }
+                    if (target as usize) != 0 && (unsafe { (*target).kind }) == HIR_ITEM_FN && (unsafe { (*target).body as usize }) != 0 {
+                        unsafe {
+                            mono_find_or_create_inst(mut_view(*eng), mut_view(*str_in), target, view(*sp));
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fn session_typeck_and_seed_mono(
+    sess: mut_view<CompilerSession>,
+    hir: view<HirFile>,
+    out_thir: mut_view<Thir>,
+    mono_arena: mut_view<Arena>,
+    out_mono: mut_view<MonoEngine>
+) -> usize {
+    let arena_ptr = unsafe { address_of_mut(mono_arena.head) as *mut Arena };
+    mono_engine_init(mut_view(*out_mono), arena_ptr);
+    session_typeck_into(mut_view(*sess), hir, mut_view(*out_thir));
+    if session_error_count(view(*sess)) == 0 {
+        mono_seed_hir_items(
+            mut_view(*out_mono),
+            hir,
+            mut_view(sess.interner),
+            view(sess.source_db)
+        );
+        mono_collect_thir_substs(
+            mut_view(*out_mono),
+            hir,
+            view(*out_thir),
+            mut_view(sess.interner)
+        );
+        mono_dedup_instance_names(mut_view(*out_mono), mut_view(sess.interner));
+    }
+    session_error_count(view(*sess))
+}
+
+pub fn session_typeck_traits_and_render_human(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mono_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir: mut_view<Thir>,
+    mono: mut_view<MonoEngine>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_thir_buf: mut_view<DiagBuffer>,
+    out_diags: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = (FileId { v: 0u32 });
+    let text_copy = (StrView { ptr: text.ptr, len: text.len });
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        text,
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text_copy);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    let hir = session_lower_hir(mut_view(*sess), hir_arena, view(parse_res.ast), view(*rmap));
+    if session_error_count(view(*sess)) == 0 {
+        let _ = session_typeck_and_seed_mono(
+            mut_view(*sess),
+            view(hir),
+            mut_view(*thir),
+            mono_arena,
+            mut_view(*mono)
+        );
+        if session_error_count(view(*sess)) == 0 {
+            emit_thir(out_thir_buf, view(hir), view(*thir), view(sess.interner), (FileId { v: fid.v }));
+        }
+    }
+    ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), out_diags);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}
+
+pub fn session_typeck_traits_and_render_json(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mono_arena: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir: mut_view<Thir>,
+    mono: mut_view<MonoEngine>,
+    path: StrView,
+    text: StrView,
+    load_prelude: bool,
+    out_thir_buf: mut_view<DiagBuffer>,
+    out_json: mut_view<DiagBuffer>
+) -> usize {
+    let mut fid = (FileId { v: 0u32 });
+    let text_copy = (StrView { ptr: text.ptr, len: text.len });
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        path,
+        text,
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(mut_view(*sess), mut_view(*parse_arena), mut_view(parse_res.ast), text_copy);
+    }
+    session_resolve_ast_into(mut_view(*sess), resolve_arena, view(parse_res.ast), mut_view(*rmap));
+    let hir = session_lower_hir(mut_view(*sess), hir_arena, view(parse_res.ast), view(*rmap));
+    if session_error_count(view(*sess)) == 0 {
+        let _ = session_typeck_and_seed_mono(
+            mut_view(*sess),
+            view(hir),
+            mut_view(*thir),
+            mono_arena,
+            mut_view(*mono)
+        );
+        if session_error_count(view(*sess)) == 0 {
+            emit_thir(out_thir_buf, view(hir), view(*thir), view(sess.interner), (FileId { v: fid.v }));
+        }
+    }
+    ax_diag_render_json(view(sess.diag_sink), view(sess.source_db), out_json);
+    resolve_map_free(mut_view(*rmap));
+    session_error_count(view(*sess))
+}

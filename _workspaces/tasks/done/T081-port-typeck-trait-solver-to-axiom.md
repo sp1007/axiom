@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T081a, T081b, T081c]
 priority: 115
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/typeck_traits, tests/selfhost/typeck_traits]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-GEN-100, REQ-TRT-139, REQ-TYP-354, REQ-TYP-355]
+started: 2026-10-15 20:02:36
+finished: 2026-10-15 20:02:37
 ---
 # T081 — Port typeck + trait solver to Axiom (integration + differential typeck)
 
@@ -39,3 +41,7 @@ Integrate typeck and trait solver in Axiom and run differential type checking ag
 - Exact differential artefact: `inspect --emit=thir` and type error diagnostics.
 - Harness entry: `tests/selfhost/typeck_traits`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 20:02:36 started (attempt 1) axiom-stdlib
+- 2026-10-15 20:02:37 accepted by QA -> done
