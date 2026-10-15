@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T080a]
 priority: 114
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/hir, tests/selfhost/hir]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-MOD-142, REQ-RES-243]
+started: 2026-10-15 10:23:09
+finished: 2026-10-15 11:31:49
 ---
 # T080b — Port HIR data model and lowering to Axiom
 
@@ -37,3 +39,7 @@ Port High-level Intermediate Representation (HIR) and AST->HIR lowering (`compil
 ## Notes
 - Sub-task of T080 split per ADR-0005 §8 and SPEC-20 §4.4.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 10:23:09 started (attempt 1) axiom-frontend
+- 2026-10-15 11:31:49 finished without commit (manual) -> done; run `taskctl commit` next
