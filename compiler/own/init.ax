@@ -1,0 +1,678 @@
+// Definite initialization analysis and use-after-move checker across MIR CFG.
+// Port of bootstrap/axiom0/src/own/own.c.
+module compiler.own.init
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.ArenaChunk
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.id.FileId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.code.AX_INIT_USE_UNINIT
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.diag_sink_report
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirParam
+use compiler.types.types.CAP_MOVE
+use compiler.types.types.ClosureCapture
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_NEVER
+use compiler.types.types.TY_PARAM
+use compiler.types.types.TY_UNIT
+use compiler.types.types.Thir
+use compiler.types.types.mul_usize
+use compiler.types.types.type_get
+use compiler.mir.mir.MIR_BORROW_MUT
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_VIEW_MUT
+use compiler.mir.mir.MIR_VIEW_READ
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_place_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.own.cap.MirCapTracker
+use compiler.own.cap.mir_cap_tracker_add
+use compiler.own.cap.mir_cap_tracker_new
+use compiler.own.cap.own_cap_check
+use compiler.own.move.OWN_MOVED
+use compiler.own.move.OWN_OWNED
+use compiler.own.move.OWN_PARTIAL
+use compiler.own.move.OWN_UNINIT
+use compiler.own.move.OwnStateInfo
+use compiler.own.move.PathCtx
+use compiler.own.move.PathNode
+use compiler.own.move.mark_state
+use compiler.own.move.merge_states
+use compiler.own.move.own_state_at
+use compiler.own.move.own_state_at_mut
+use compiler.own.move.own_u32_at
+use compiler.own.move.path_ctx_free
+use compiler.own.move.path_ctx_init
+use compiler.own.move.path_node_at
+use compiler.own.move.resolve_place
+use compiler.own.move.update_parent
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// "use of moved value" (18 bytes)
+const OWN_MSG_MOVED: [18]u8 = [
+    117u8, 115u8, 101u8, 32u8, 111u8, 102u8, 32u8, 109u8, 111u8, 118u8, 101u8, 100u8, 32u8, 118u8, 97u8, 108u8,
+    117u8, 101u8
+];
+
+// "use of possibly uninitialized value" (35 bytes)
+const OWN_MSG_UNINIT: [35]u8 = [
+    117u8, 115u8, 101u8, 32u8, 111u8, 102u8, 32u8, 112u8, 111u8, 115u8, 115u8, 105u8, 98u8, 108u8, 121u8, 32u8,
+    117u8, 110u8, 105u8, 110u8, 105u8, 116u8, 105u8, 97u8, 108u8, 105u8, 122u8, 101u8, 100u8, 32u8, 118u8, 97u8,
+    108u8, 117u8, 101u8
+];
+
+// "moved here" (10 bytes)
+const OWN_LBL_MOVED_HERE: [10]u8 = [
+    109u8, 111u8, 118u8, 101u8, 100u8, 32u8, 104u8, 101u8, 114u8, 101u8
+];
+
+pub struct OwnVisitor {
+    pub state: *mut OwnStateInfo,
+    pub ctx: *const PathCtx,
+    pub sink: *mut DiagSink,
+    pub report: bool,
+    pub body: *const MirBody,
+    pub thir: *const Thir,
+    pub cap_tracker: *mut MirCapTracker,
+    pub cap_arena: *mut Arena,
+}
+
+unsafe fn own_state_ptr_at_mut(base: *mut *mut OwnStateInfo, idx: usize) -> *mut *mut OwnStateInfo {
+    ((base as usize) + mul_usize(idx, size_of<*mut OwnStateInfo>())) as *mut *mut OwnStateInfo
+}
+
+unsafe fn closure_cap_at(base: *const ClosureCapture, idx: usize) -> *const ClosureCapture {
+    ((base as usize) + mul_usize(idx, size_of<ClosureCapture>())) as *const ClosureCapture
+}
+
+fn truncate_at_deref(place: view<MirPlace>, out: mut_view<MirPlace>) -> bool {
+    mir_copy_place(mut_view(*out), place);
+    let mut i: usize = 0;
+    while (i < place.proj_count) {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            out.proj_count = i;
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn emit_own_diag(sink: mut_view<DiagSink>, is_uninit: bool, loc: Span, has_move_lbl: bool, move_loc: Span) {
+    if sink.errors > 0 {
+        return;
+    }
+    let code_v = if is_uninit { AX_INIT_USE_UNINIT } else { AX_MOVE_USE_AFTER_MOVE };
+    let msg_len: usize = if is_uninit { 35 } else { 18 };
+    let buf = arena_alloc_raw(mut_view(sink.arena), msg_len + 1, 1);
+    let mut i: usize = 0;
+    if is_uninit {
+        while (i < 35) {
+            unsafe { *(buf + i) = OWN_MSG_UNINIT[i]; }
+            i = i + 1;
+        }
+    } else {
+        while (i < 18) {
+            unsafe { *(buf + i) = OWN_MSG_MOVED[i]; }
+            i = i + 1;
+        }
+    }
+    unsafe { *(buf + msg_len) = 0u8; }
+
+    let mut labels_ptr: *mut DiagLabel = 0 as *mut DiagLabel;
+    let mut label_cnt: usize = 0;
+    if has_move_lbl {
+        let lbuf = arena_alloc_raw(mut_view(sink.arena), 11, 1);
+        let mut li: usize = 0;
+        while (li < 10) {
+            unsafe { *(lbuf + li) = OWN_LBL_MOVED_HERE[li]; }
+            li = li + 1;
+        }
+        unsafe { *(lbuf + 10) = 0u8; }
+        let lraw = arena_alloc_raw(mut_view(sink.arena), size_of<DiagLabel>(), align_of<DiagLabel>());
+        labels_ptr = lraw as *mut DiagLabel;
+        unsafe {
+            (*labels_ptr).span.file.v = move_loc.file.v;
+            (*labels_ptr).span.start = move_loc.start;
+            (*labels_ptr).span.end = move_loc.end;
+            (*labels_ptr).message.ptr = lbuf as *const u8;
+            (*labels_ptr).message.len = 10;
+        }
+        label_cnt = 1;
+    }
+
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf as *const u8, len: msg_len },
+        primary: Span { file: FileId { v: loc.file.v }, start: loc.start, end: loc.end },
+        labels: labels_ptr,
+        label_count: label_cnt,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(sink, view(d));
+}
+
+pub fn own_check_use(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
+    let mut base = mir_place_local(MirLocalId { v: 0u32 });
+    truncate_at_deref(place, mut_view(base));
+    let node = unsafe { resolve_place(view(*v.ctx), view(base)) };
+    let st_p = unsafe { own_state_at(v.state as *const OwnStateInfo, node as usize) };
+    let st = unsafe { (*st_p).state };
+    if st != OWN_OWNED && v.report {
+        let m_fv = unsafe { (*st_p).move_loc.file.v };
+        let m_st = unsafe { (*st_p).move_loc.start };
+        let m_en = unsafe { (*st_p).move_loc.end };
+        let is_uninit = (st == OWN_UNINIT) || (st == OWN_PARTIAL && m_fv == 0u32);
+        let has_lbl = (st == OWN_MOVED || (st == OWN_PARTIAL && m_fv != 0u32)) && !is_uninit;
+        let mloc = Span { file: FileId { v: m_fv }, start: m_st, end: m_en };
+        unsafe {
+            emit_own_diag(mut_view(*v.sink), is_uninit, loc, has_lbl, mloc);
+        }
+    }
+}
+
+pub fn own_do_move(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
+    let mut base = mir_place_local(MirLocalId { v: 0u32 });
+    let had_deref = truncate_at_deref(place, mut_view(base));
+    if had_deref {
+        own_check_use(v, view(base), loc);
+        return;
+    }
+    let node = unsafe { resolve_place(view(*v.ctx), place) };
+    let np = unsafe { path_node_at((*v.ctx).nodes as *const PathNode, node as usize) };
+    let is_cp = unsafe { (*np).is_copy };
+    if !is_cp {
+        unsafe {
+            mark_state(v.state, view(*v.ctx), node, OWN_MOVED, loc);
+            update_parent(v.state, view(*v.ctx), node);
+        }
+    }
+}
+
+pub fn own_do_assign(v: mut_view<OwnVisitor>, place: view<MirPlace>, loc: Span) {
+    let mut base = mir_place_local(MirLocalId { v: 0u32 });
+    let had_deref = truncate_at_deref(place, mut_view(base));
+    if had_deref {
+        own_check_use(v, view(base), loc);
+        return;
+    }
+    let node = unsafe { resolve_place(view(*v.ctx), place) };
+    unsafe {
+        mark_state(v.state, view(*v.ctx), node, OWN_OWNED, loc);
+        update_parent(v.state, view(*v.ctx), node);
+    }
+}
+
+fn own_span_copy(s: view<Span>) -> Span {
+    Span { file: FileId { v: s.file.v }, start: s.start, end: s.end }
+}
+
+pub fn own_visit_operand(v: mut_view<OwnVisitor>, op: view<MirOperand>, loc: Span) {
+    let op_loc = if op.location.file.v != 0u32 {
+        Span { file: FileId { v: op.location.file.v }, start: op.location.start, end: op.location.end }
+    } else {
+        loc
+    };
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        own_check_use(mut_view(*v), view(op.place), own_span_copy(view(op_loc)));
+        own_do_move(v, view(op.place), op_loc);
+    }
+}
+
+pub fn own_visit_rvalue(v: mut_view<OwnVisitor>, rv: view<MirRvalue>, loc: Span) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE {
+        own_visit_operand(v, view(rv.use_op), loc);
+    } else if k == MIR_RVALUE_REPEAT {
+        own_visit_operand(v, view(rv.use_op), loc);
+    } else if k == MIR_RVALUE_REF {
+        own_check_use(mut_view(*v), view(rv.place), loc);
+        if (v.cap_tracker as usize) != 0 && (v.cap_arena as usize) != 0 {
+            let vk = if rv.borrow_kind == MIR_BORROW_MUT { MIR_VIEW_MUT } else { MIR_VIEW_READ };
+            unsafe {
+                mir_cap_tracker_add(mut_view(*v.cap_tracker), mut_view(*v.cap_arena), view(rv.place), vk);
+            }
+        }
+    } else if k == MIR_RVALUE_LEN {
+        own_check_use(v, view(rv.place), loc);
+    } else if k == MIR_RVALUE_CAST {
+        own_visit_operand(v, view(rv.use_op), loc);
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        own_visit_operand(mut_view(*v), view(rv.lhs), own_span_copy(view(loc)));
+        own_visit_operand(v, view(rv.rhs), loc);
+    } else if k == MIR_RVALUE_UNARY_OP {
+        own_visit_operand(v, view(rv.use_op), loc);
+    } else if k == MIR_RVALUE_DISCRIMINANT {
+        own_check_use(v, view(rv.place), loc);
+    } else if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while (i < rv.operand_count) {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            unsafe {
+                own_visit_operand(mut_view(*v), view(*op), own_span_copy(view(loc)));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+pub fn own_visit_stmt(v: mut_view<OwnVisitor>, stmt: view<MirStmt>) {
+    let sk = stmt.kind;
+    let loc = Span { file: FileId { v: stmt.location.file.v }, start: stmt.location.start, end: stmt.location.end };
+    if sk == MIR_STMT_ASSIGN {
+        own_visit_rvalue(mut_view(*v), view(stmt.rvalue), own_span_copy(view(loc)));
+        own_do_assign(v, view(stmt.place), loc);
+    } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+        // handled by assignment/drop
+    } else if sk == MIR_STMT_DROP {
+        own_check_use(mut_view(*v), view(stmt.place), own_span_copy(view(loc)));
+        own_do_move(v, view(stmt.place), loc);
+    }
+}
+
+pub fn own_visit_bb(v: mut_view<OwnVisitor>, bb: view<MirBb>) {
+    let mut i: usize = 0;
+    while (i < bb.stmt_count) {
+        let st = unsafe { mir_stmt_at(bb.stmts, i) };
+        unsafe {
+            own_visit_stmt(mut_view(*v), view(*st));
+        }
+        i = i + 1;
+    }
+    if !bb.has_terminator {
+        return;
+    }
+    let tk = bb.terminator.kind;
+    let loc = Span {
+        file: FileId { v: bb.terminator.location.file.v },
+        start: bb.terminator.location.start,
+        end: bb.terminator.location.end,
+    };
+    if tk == MIR_TERM_SWITCH_INT {
+        own_visit_operand(v, view(bb.terminator.discr), loc);
+    } else if tk == MIR_TERM_DROP {
+        if bb.terminator.expected {
+            own_check_use(mut_view(*v), view(bb.terminator.drop_place), own_span_copy(view(loc)));
+        }
+        own_do_move(v, view(bb.terminator.drop_place), loc);
+    } else if tk == MIR_TERM_CALL {
+        let mut moves_callee = true;
+        let fk = bb.terminator.func.kind;
+        if fk == MIR_OP_COPY || fk == MIR_OP_MOVE {
+            let flocal = bb.terminator.func.place.local.v as usize;
+            let body_lcount = unsafe { (*v.body).local_count };
+            if flocal < body_lcount && (v.thir as usize) != 0 {
+                let ldecl = unsafe { mir_local_at((*v.body).locals, flocal) };
+                let cty_v = unsafe { (*ldecl).ty.v };
+                let t = unsafe { type_get(view((*v.thir).interner), TypeId { v: cty_v }) };
+                if (t as usize) != 0 {
+                    let t_kind = unsafe { (*t).kind };
+                    if t_kind == TY_CLOSURE {
+                        let mut has_move = false;
+                        let cap_cnt = unsafe { (*t).capture_count };
+                        let caps = unsafe { (*t).captures };
+                        let mut ci: usize = 0;
+                        while (ci < cap_cnt) {
+                            let cp = unsafe { closure_cap_at(caps as *const ClosureCapture, ci) };
+                            if (unsafe { (*cp).mode }) == CAP_MOVE {
+                                has_move = true;
+                                break;
+                            }
+                            ci = ci + 1;
+                        }
+                        if !has_move {
+                            moves_callee = false;
+                        }
+                    } else if t_kind == TY_PARAM {
+                        moves_callee = false;
+                    }
+                }
+            }
+        }
+        if moves_callee {
+            own_visit_operand(mut_view(*v), view(bb.terminator.func), own_span_copy(view(loc)));
+        } else {
+            own_check_use(mut_view(*v), view(bb.terminator.func.place), own_span_copy(view(loc)));
+        }
+        let mut a: usize = 0;
+        while (a < bb.terminator.arg_count) {
+            let arg_op = unsafe { mir_op_at(bb.terminator.args, a) };
+            unsafe {
+                own_visit_operand(mut_view(*v), view(*arg_op), own_span_copy(view(loc)));
+            }
+            a = a + 1;
+        }
+        own_do_assign(v, view(bb.terminator.destination), loc);
+    } else if tk == MIR_TERM_ASSERT {
+        own_visit_operand(v, view(bb.terminator.cond), loc);
+    } else if tk == MIR_TERM_RETURN {
+        let mut needs_check = true;
+        let body_lcount = unsafe { (*v.body).local_count };
+        if body_lcount > 0 && (v.thir as usize) != 0 {
+            let ldecl0 = unsafe { mir_local_at((*v.body).locals, 0) };
+            let rty_v = unsafe { (*ldecl0).ty.v };
+            let rty = unsafe { type_get(view((*v.thir).interner), TypeId { v: rty_v }) };
+            if (rty as usize) != 0 {
+                let rtk = unsafe { (*rty).kind };
+                if rtk == TY_UNIT || rtk == TY_NEVER {
+                    needs_check = false;
+                }
+            }
+        }
+        if needs_check {
+            let ret_place = mir_place_local(MirLocalId { v: 0u32 });
+            own_check_use(v, view(ret_place), loc);
+        }
+    }
+}
+
+fn copy_own_states(dst: *mut OwnStateInfo, src: *const OwnStateInfo, count: usize) {
+    let mut i: usize = 0;
+    while (i < count) {
+        let dp = unsafe { own_state_at_mut(dst, i) };
+        let sp = unsafe { own_state_at(src, i) };
+        unsafe {
+            (*dp).state = (*sp).state;
+            (*dp).move_loc.file.v = (*sp).move_loc.file.v;
+            (*dp).move_loc.start = (*sp).move_loc.start;
+            (*dp).move_loc.end = (*sp).move_loc.end;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn own_check(
+    it: *const HirItem,
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    sink: mut_view<DiagSink>,
+    str_in: view<StrInterner>
+) {
+    own_cap_check(view(*body), mut_view(*sink));
+    if body.bb_count == 0 {
+        return;
+    }
+
+    let ctx_raw = unsafe { heap_alloc(size_of<PathCtx>(), align_of<PathCtx>()) };
+    let ctx = ctx_raw as *mut PathCtx;
+    let ctx_init_p = ctx;
+    unsafe {
+        (*ctx_init_p).nodes = 0 as *mut PathNode;
+        (*ctx_init_p).count = 0;
+        (*ctx_init_p).cap = 0;
+        (*ctx_init_p).local_roots = 0 as *mut u32;
+        (*ctx_init_p).local_count = 0;
+        path_ctx_init(mut_view(*ctx_init_p), view(*body), thir, str_in);
+    }
+
+    let bb_count = body.bb_count;
+    let ctx_cnt = unsafe { (*ctx).count };
+    let node_count = if ctx_cnt > 0 { ctx_cnt } else { 1 };
+    let state_arr_bytes = mul_usize(node_count, size_of<OwnStateInfo>());
+    let bb_in_bytes = mul_usize(bb_count, size_of<*mut OwnStateInfo>());
+    let bb_in_raw = unsafe { heap_alloc(bb_in_bytes, align_of<*mut OwnStateInfo>()) };
+    let bb_in = bb_in_raw as *mut *mut OwnStateInfo;
+
+    let mut i: usize = 0;
+    while (i < bb_count) {
+        let row_raw = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) };
+        let row = row_raw as *mut OwnStateInfo;
+        let mut j: usize = 0;
+        while (j < ctx_cnt) {
+            let cell = unsafe { own_state_at_mut(row, j) };
+            unsafe {
+                (*cell).state = OWN_UNINIT;
+                (*cell).move_loc.file.v = 0u32;
+                (*cell).move_loc.start = 0u32;
+                (*cell).move_loc.end = 0u32;
+            }
+            j = j + 1;
+        }
+        let slot = unsafe { own_state_ptr_at_mut(bb_in, i) };
+        unsafe { *slot = row; }
+        i = i + 1;
+    }
+
+    let mut arg_count: usize = body.arg_count;
+    if (it as usize) != 0 && (unsafe { (*it).kind }) == HIR_ITEM_FN {
+        let mut p_cnt: usize = 0;
+        let mut p = unsafe { (*it).params as *const HirParam };
+        while ((p as usize) != 0) {
+            p_cnt = p_cnt + 1;
+            p = unsafe { (*p).next as *const HirParam };
+        }
+        if p_cnt > arg_count {
+            arg_count = p_cnt;
+        }
+    }
+
+    let zero_loc = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    let bb0_row = unsafe { *own_state_ptr_at_mut(bb_in, 0) };
+    let lroots = unsafe { (*ctx).local_roots as *const u32 };
+    i = 0;
+    while (i < arg_count) {
+        if i + 1 < body.local_count {
+            let root_p = unsafe { own_u32_at(lroots, i + 1) };
+            let root_idx = unsafe { *root_p };
+            unsafe {
+                mark_state(bb0_row, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc)));
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while (i < body.local_count) {
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lk = unsafe { (*ldecl).kind };
+        if lk == MIR_LOCAL_ARG || lk == MIR_LOCAL_CONST {
+            let root_p = unsafe { own_u32_at(lroots, i) };
+            let root_idx = unsafe { *root_p };
+            unsafe {
+                mark_state(bb0_row, view(*ctx), root_idx, OWN_OWNED, own_span_copy(view(zero_loc)));
+            }
+        }
+        i = i + 1;
+    }
+
+    let vis_raw = unsafe { heap_alloc(bb_count, 1) };
+    let visited = vis_raw;
+    i = 0;
+    while (i < bb_count) {
+        unsafe { *(visited + i) = 0u8; }
+        i = i + 1;
+    }
+    unsafe { *visited = 1u8; }
+
+    let cap_arena_raw = unsafe { heap_alloc(size_of<Arena>(), align_of<Arena>()) };
+    let cap_arena = cap_arena_raw as *mut Arena;
+    let cap_init_p = cap_arena;
+    unsafe {
+        (*cap_init_p).head = 0 as *mut ArenaChunk;
+    }
+    let cap_tracker = unsafe { mir_cap_tracker_new(mut_view(*cap_init_p)) };
+    let temp_raw = unsafe { heap_alloc(state_arr_bytes, align_of<OwnStateInfo>()) };
+    let temp = temp_raw as *mut OwnStateInfo;
+
+    let mut v = OwnVisitor {
+        state: temp,
+        ctx: ctx as *const PathCtx,
+        sink: unsafe { address_of_mut(*sink) },
+        report: false,
+        body: unsafe { address_of(*body) },
+        thir: unsafe { address_of(*thir) },
+        cap_tracker: cap_tracker,
+        cap_arena: cap_arena,
+    };
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        i = 0;
+        while (i < bb_count) {
+            if (unsafe { *(visited + i) }) != 0u8 {
+                let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
+                copy_own_states(temp, row_i as *const OwnStateInfo, ctx_cnt);
+                let bb_p = unsafe { mir_bb_at(body.bbs, i) };
+                unsafe {
+                    own_visit_bb(mut_view(v), view(*bb_p));
+                }
+
+                let has_term = unsafe { (*bb_p).has_terminator };
+                if has_term {
+                    let tk = unsafe { (*bb_p).terminator.kind };
+                    let mut targets: [16]u32 = [0u32; 16];
+                    let mut target_count: usize = 0;
+
+                    if tk == MIR_TERM_GOTO {
+                        targets[target_count] = unsafe { (*bb_p).terminator.goto_target.v };
+                        target_count = target_count + 1;
+                    } else if tk == MIR_TERM_SWITCH_INT {
+                        let sc = unsafe { (*bb_p).terminator.switch_count };
+                        let tgts = unsafe { (*bb_p).terminator.targets };
+                        let mut sj: usize = 0;
+                        while (sj < sc && target_count < 15) {
+                            let tid = unsafe { (*mir_bb_id_at(tgts, sj)).v };
+                            targets[target_count] = tid;
+                            target_count = target_count + 1;
+                            sj = sj + 1;
+                        }
+                        if target_count < 16 {
+                            targets[target_count] = unsafe { (*bb_p).terminator.otherwise.v };
+                            target_count = target_count + 1;
+                        }
+                    } else if tk == MIR_TERM_DROP {
+                        targets[target_count] = unsafe { (*bb_p).terminator.drop_target.v };
+                        target_count = target_count + 1;
+                    } else if tk == MIR_TERM_CALL {
+                        targets[target_count] = unsafe { (*bb_p).terminator.call_target.v };
+                        target_count = target_count + 1;
+                    } else if tk == MIR_TERM_ASSERT {
+                        targets[target_count] = unsafe { (*bb_p).terminator.assert_target.v };
+                        target_count = target_count + 1;
+                    }
+
+                    let mut tj: usize = 0;
+                    while (tj < target_count) {
+                        let tgt_v = targets[tj] as usize;
+                        if tgt_v < bb_count {
+                            let tgt_row = unsafe { *own_state_ptr_at_mut(bb_in, tgt_v) };
+                            if (unsafe { *(visited + tgt_v) }) == 0u8 {
+                                copy_own_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                unsafe { *(visited + tgt_v) = 1u8; }
+                                changed = true;
+                            } else {
+                                let merged = merge_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                if merged {
+                                    changed = true;
+                                }
+                            }
+                        }
+                        tj = tj + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    v.report = true;
+    i = 0;
+    while (i < bb_count) {
+        if (unsafe { *(visited + i) }) != 0u8 {
+            let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
+            copy_own_states(temp, row_i as *const OwnStateInfo, ctx_cnt);
+            let bb_p = unsafe { mir_bb_at(body.bbs, i) };
+            unsafe {
+                own_visit_bb(mut_view(v), view(*bb_p));
+            }
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < bb_count) {
+        let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };
+        unsafe {
+            heap_free(row_i as *mut u8, state_arr_bytes, align_of<OwnStateInfo>());
+        }
+        i = i + 1;
+    }
+    let ctx_free_p = ctx;
+    let cap_free_p = cap_arena;
+    unsafe {
+        heap_free(bb_in as *mut u8, bb_in_bytes, align_of<*mut OwnStateInfo>());
+        heap_free(temp as *mut u8, state_arr_bytes, align_of<OwnStateInfo>());
+        heap_free(visited, bb_count, 1);
+        path_ctx_free(mut_view(*ctx_free_p));
+        heap_free(ctx as *mut u8, size_of<PathCtx>(), align_of<PathCtx>());
+        arena_destroy(mut_view(*cap_free_p));
+        heap_free(cap_arena as *mut u8, size_of<Arena>(), align_of<Arena>());
+    }
+}

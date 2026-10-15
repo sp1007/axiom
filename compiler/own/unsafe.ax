@@ -1,0 +1,494 @@
+// Unsafe operation checker (raw pointer dereference, pointer field/arithmetic, unsafe calls).
+// Port of bootstrap/axiom0/src/own/unsafe/unsafe.h and unsafe.c.
+module compiler.own.unsafe
+
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.code.AX_UNSAFE_REQUIRED
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.diag_sink_report
+use compiler.syntax.ast.BINOP_ADD
+use compiler.syntax.ast.BINOP_SUB
+use compiler.syntax.ast.UNOP_DEREF
+use compiler.hir.hir.HIR_EXPR_ARRAY
+use compiler.hir.hir.HIR_EXPR_AWAIT
+use compiler.hir.hir.HIR_EXPR_BINARY
+use compiler.hir.hir.HIR_EXPR_BLOCK
+use compiler.hir.hir.HIR_EXPR_CALL
+use compiler.hir.hir.HIR_EXPR_CAST
+use compiler.hir.hir.HIR_EXPR_CLOSURE
+use compiler.hir.hir.HIR_EXPR_COMPTIME
+use compiler.hir.hir.HIR_EXPR_FIELD
+use compiler.hir.hir.HIR_EXPR_FOR
+use compiler.hir.hir.HIR_EXPR_IF
+use compiler.hir.hir.HIR_EXPR_INDEX
+use compiler.hir.hir.HIR_EXPR_JUMP
+use compiler.hir.hir.HIR_EXPR_LOOP
+use compiler.hir.hir.HIR_EXPR_MATCH
+use compiler.hir.hir.HIR_EXPR_METHOD_CALL
+use compiler.hir.hir.HIR_EXPR_PATH
+use compiler.hir.hir.HIR_EXPR_RANGE
+use compiler.hir.hir.HIR_EXPR_STRUCT
+use compiler.hir.hir.HIR_EXPR_TRY
+use compiler.hir.hir.HIR_EXPR_TUPLE
+use compiler.hir.hir.HIR_EXPR_TUPLE_INDEX
+use compiler.hir.hir.HIR_EXPR_UNARY
+use compiler.hir.hir.HIR_EXPR_UNSAFE
+use compiler.hir.hir.HIR_EXPR_VIEW
+use compiler.hir.hir.HIR_EXPR_WHILE
+use compiler.hir.hir.HIR_ITEM_CONST
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_STATIC
+use compiler.hir.hir.HIR_STMT_ASSIGN
+use compiler.hir.hir.HIR_STMT_EXPR
+use compiler.hir.hir.HIR_STMT_LET
+use compiler.hir.hir.HirBlock
+use compiler.hir.hir.HirExpr
+use compiler.hir.hir.HirFieldInit
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirMatchArm
+use compiler.hir.hir.HirStmt
+use compiler.types.types.TY_BUILTIN_ADDRESS_OF
+use compiler.types.types.TY_BUILTIN_ADDRESS_OF_MUT
+use compiler.types.types.TY_BUILTIN_DROP_IN_PLACE
+use compiler.types.types.TY_BUILTIN_PTR_ADD
+use compiler.types.types.TY_BUILTIN_PTR_COPY
+use compiler.types.types.TY_BUILTIN_PTR_COPY_NONOVERLAPPING
+use compiler.types.types.TY_BUILTIN_PTR_SUB
+use compiler.types.types.TY_BUILTIN_PTR_WRITE_BYTES
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_PTR
+use compiler.types.types.Thir
+use compiler.types.types.thir_get_expr_method
+use compiler.types.types.thir_get_expr_type
+use compiler.types.types.type_get
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// "operation requires an unsafe block or function" (46 bytes)
+const UNSAFE_REQ_MSG: [46]u8 = [
+    111u8, 112u8, 101u8, 114u8, 97u8, 116u8, 105u8, 111u8, 110u8, 32u8, 114u8, 101u8, 113u8, 117u8, 105u8, 114u8,
+    101u8, 115u8, 32u8, 97u8, 110u8, 32u8, 117u8, 110u8, 115u8, 97u8, 102u8, 101u8, 32u8, 98u8, 108u8, 111u8,
+    99u8, 107u8, 32u8, 111u8, 114u8, 32u8, 102u8, 117u8, 110u8, 99u8, 116u8, 105u8, 111u8, 110u8
+];
+
+pub struct UnsafeChecker {
+    pub hir: *const HirFile,
+    pub thir: *const Thir,
+    pub sink: *mut DiagSink,
+    pub interner: *const StrInterner,
+    pub unsafe_depth: i32,
+}
+
+fn report_unsafe_required(c: mut_view<UnsafeChecker>, span: Span) {
+    if (c.sink as usize) == 0 {
+        return;
+    }
+    let buf = unsafe { arena_alloc_raw(mut_view((*c.sink).arena), 47, 1) };
+    let mut i: usize = 0;
+    while (i < 46) {
+        unsafe { *(buf + i) = UNSAFE_REQ_MSG[i]; }
+        i = i + 1;
+    }
+    unsafe { *(buf + 46) = 0u8; }
+
+    let d = Diagnostic {
+        code: DiagCode { v: AX_UNSAFE_REQUIRED },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf as *const u8, len: 46 },
+        primary: Span { file: FileId { v: span.file.v }, start: span.start, end: span.end },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    unsafe {
+        diag_sink_report(mut_view(*c.sink), view(d));
+    }
+}
+
+fn unsafe_get_expr_ty(c: view<UnsafeChecker>, expr: *const HirExpr) -> TypeId {
+    if (expr as usize) == 0 || (c.thir as usize) == 0 {
+        return TypeId { v: 0u32 };
+    }
+    let tp = unsafe { thir_get_expr_type(view(*c.thir), expr) };
+    if (tp as usize) == 0 {
+        return TypeId { v: 0u32 };
+    }
+    let tv = unsafe { (*tp).v };
+    TypeId { v: tv }
+}
+
+fn is_callee_unsafe(c: view<UnsafeChecker>, callee: *const HirExpr) -> bool {
+    if (callee as usize) == 0 {
+        return false;
+    }
+    let cty = unsafe_get_expr_ty(c, callee);
+    if cty.v != 0u32 && (c.thir as usize) != 0 {
+        let ft = unsafe { type_get(view((*c.thir).interner), cty) };
+        if (ft as usize) != 0 {
+            let ftk = unsafe { (*ft).kind };
+            if ftk == TY_BUILTIN_ADDRESS_OF ||
+                ftk == TY_BUILTIN_ADDRESS_OF_MUT ||
+                ftk == TY_BUILTIN_PTR_ADD ||
+                ftk == TY_BUILTIN_PTR_SUB ||
+                ftk == TY_BUILTIN_DROP_IN_PLACE ||
+                ftk == TY_BUILTIN_PTR_COPY ||
+                ftk == TY_BUILTIN_PTR_COPY_NONOVERLAPPING ||
+                ftk == TY_BUILTIN_PTR_WRITE_BYTES {
+                return true;
+            }
+            if ftk == TY_FN && (unsafe { (*ft).is_unsafe }) {
+                return true;
+            }
+        }
+    }
+
+    let ck = unsafe { (*callee).kind };
+    if ck == HIR_EXPR_PATH && (c.hir as usize) != 0 {
+        let name_v = unsafe { (*callee).path.name.v };
+        let sym_v = unsafe { (*callee).path.symbol.v };
+        if name_v != 0u32 || sym_v != 0u32 {
+            let mut it = unsafe { (*c.hir).items as *const HirItem };
+            while ((it as usize) != 0) {
+                let ik = unsafe { (*it).kind };
+                if ik == HIR_ITEM_FN {
+                    let it_name = unsafe { (*it).name.v };
+                    let it_sym = unsafe { (*it).symbol.v };
+                    if (sym_v != 0u32 && it_sym == sym_v) || (name_v != 0u32 && it_name == name_v) {
+                        if unsafe { (*it).is_unsafe } {
+                            return true;
+                        }
+                    }
+                } else if ik == HIR_ITEM_IMPL {
+                    let mut m = unsafe { (*it).members as *const HirItem };
+                    while ((m as usize) != 0) {
+                        let mk = unsafe { (*m).kind };
+                        if mk == HIR_ITEM_FN {
+                            let m_name = unsafe { (*m).name.v };
+                            let m_sym = unsafe { (*m).symbol.v };
+                            if (sym_v != 0u32 && m_sym == sym_v) || (name_v != 0u32 && m_name == name_v) {
+                                if unsafe { (*m).is_unsafe } {
+                                    return true;
+                                }
+                            }
+                        }
+                        m = unsafe { (*m).next as *const HirItem };
+                    }
+                }
+                it = unsafe { (*it).next as *const HirItem };
+            }
+        }
+    }
+    false
+}
+
+pub fn unsafe_check_stmt(c: mut_view<UnsafeChecker>, stmt: *const HirStmt) {
+    if (stmt as usize) == 0 {
+        return;
+    }
+    let sk = unsafe { (*stmt).kind };
+    if sk == HIR_STMT_LET {
+        let ex = unsafe { (*stmt).expr as *const HirExpr };
+        if (ex as usize) != 0 {
+            unsafe_check_expr(mut_view(*c), ex);
+        }
+        let eb = unsafe { (*stmt).else_block as *const HirBlock };
+        if (eb as usize) != 0 {
+            unsafe_check_block(c, eb);
+        }
+    } else if sk == HIR_STMT_ASSIGN {
+        let rex = unsafe { (*stmt).right as *const HirExpr };
+        let lex = unsafe { (*stmt).left as *const HirExpr };
+        unsafe_check_expr(mut_view(*c), rex);
+        unsafe_check_expr(c, lex);
+    } else if sk == HIR_STMT_EXPR {
+        let ex = unsafe { (*stmt).expr as *const HirExpr };
+        unsafe_check_expr(c, ex);
+    }
+}
+
+pub fn unsafe_check_block(c: mut_view<UnsafeChecker>, block: *const HirBlock) {
+    if (block as usize) == 0 {
+        return;
+    }
+    let mut s = unsafe { (*block).stmts as *const HirStmt };
+    while ((s as usize) != 0) {
+        unsafe_check_stmt(mut_view(*c), s);
+        s = unsafe { (*s).next as *const HirStmt };
+    }
+}
+
+pub fn unsafe_check_expr(c: mut_view<UnsafeChecker>, expr: *const HirExpr) {
+    if (expr as usize) == 0 {
+        return;
+    }
+    let ek = unsafe { (*expr).kind };
+    let sp = Span {
+        file: FileId { v: unsafe { (*expr).span.file.v } },
+        start: unsafe { (*expr).span.start },
+        end: unsafe { (*expr).span.end },
+    };
+
+    if ek == HIR_EXPR_UNSAFE {
+        c.unsafe_depth = c.unsafe_depth + 1;
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        unsafe_check_block(mut_view(*c), blk);
+        c.unsafe_depth = c.unsafe_depth - 1;
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_COMPTIME {
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        unsafe_check_block(c, blk);
+    } else if ek == HIR_EXPR_CLOSURE {
+        let saved = c.unsafe_depth;
+        c.unsafe_depth = 0;
+        let bdy = unsafe { (*expr).body as *const HirExpr };
+        unsafe_check_expr(mut_view(*c), bdy);
+        c.unsafe_depth = saved;
+    } else if ek == HIR_EXPR_UNARY {
+        let op = unsafe { (*expr).op };
+        let inner = unsafe { (*expr).inner as *const HirExpr };
+        if op == UNOP_DEREF {
+            let op_ty = unsafe_get_expr_ty(view(*c), inner);
+            if op_ty.v != 0u32 && (c.thir as usize) != 0 {
+                let t = unsafe { type_get(view((*c.thir).interner), op_ty) };
+                if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_PTR {
+                    if c.unsafe_depth == 0 {
+                        report_unsafe_required(mut_view(*c), sp);
+                    }
+                }
+            }
+        }
+        unsafe_check_expr(c, inner);
+    } else if ek == HIR_EXPR_FIELD {
+        let base = unsafe { (*expr).base as *const HirExpr };
+        let base_ty = unsafe_get_expr_ty(view(*c), base);
+        if base_ty.v != 0u32 && (c.thir as usize) != 0 {
+            let t = unsafe { type_get(view((*c.thir).interner), base_ty) };
+            if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_PTR {
+                if c.unsafe_depth == 0 {
+                    report_unsafe_required(mut_view(*c), sp);
+                }
+            }
+        }
+        unsafe_check_expr(c, base);
+    } else if ek == HIR_EXPR_BINARY {
+        let op = unsafe { (*expr).op };
+        let left = unsafe { (*expr).left as *const HirExpr };
+        let right = unsafe { (*expr).right as *const HirExpr };
+        if op == BINOP_ADD || op == BINOP_SUB {
+            let lty = unsafe_get_expr_ty(view(*c), left);
+            let rty = unsafe_get_expr_ty(view(*c), right);
+            let mut is_ptr_arith = false;
+            if lty.v != 0u32 && (c.thir as usize) != 0 {
+                let lt = unsafe { type_get(view((*c.thir).interner), lty) };
+                if (lt as usize) != 0 && (unsafe { (*lt).kind }) == TY_PTR {
+                    is_ptr_arith = true;
+                }
+            }
+            if rty.v != 0u32 && (c.thir as usize) != 0 {
+                let rt = unsafe { type_get(view((*c.thir).interner), rty) };
+                if (rt as usize) != 0 && (unsafe { (*rt).kind }) == TY_PTR {
+                    is_ptr_arith = true;
+                }
+            }
+            if is_ptr_arith && c.unsafe_depth == 0 {
+                report_unsafe_required(mut_view(*c), sp);
+            }
+        }
+        unsafe_check_expr(mut_view(*c), left);
+        unsafe_check_expr(c, right);
+    } else if ek == HIR_EXPR_CALL {
+        let callee = unsafe { (*expr).callee as *const HirExpr };
+        if is_callee_unsafe(view(*c), callee) {
+            if c.unsafe_depth == 0 {
+                report_unsafe_required(mut_view(*c), sp);
+            }
+        }
+        unsafe_check_expr(mut_view(*c), callee);
+        let mut arg = unsafe { (*expr).args as *const HirExpr };
+        while ((arg as usize) != 0) {
+            unsafe_check_expr(mut_view(*c), arg);
+            arg = unsafe { (*arg).next as *const HirExpr };
+        }
+    } else if ek == HIR_EXPR_METHOD_CALL {
+        if (c.thir as usize) != 0 {
+            let mp = unsafe { thir_get_expr_method(view(*c.thir), expr) };
+            if (mp as usize) != 0 {
+                let m_item = unsafe { *mp };
+                if (m_item as usize) != 0 && (unsafe { (*m_item).is_unsafe }) {
+                    if c.unsafe_depth == 0 {
+                        report_unsafe_required(mut_view(*c), sp);
+                    }
+                }
+            }
+        }
+        let recv = unsafe { (*expr).receiver as *const HirExpr };
+        unsafe_check_expr(mut_view(*c), recv);
+        let mut arg = unsafe { (*expr).args as *const HirExpr };
+        while ((arg as usize) != 0) {
+            unsafe_check_expr(mut_view(*c), arg);
+            arg = unsafe { (*arg).next as *const HirExpr };
+        }
+    } else if ek == HIR_EXPR_IF {
+        let cond = unsafe { (*expr).cond as *const HirExpr };
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        let else_br = unsafe { (*expr).else_branch as *const HirExpr };
+        unsafe_check_expr(mut_view(*c), cond);
+        unsafe_check_block(mut_view(*c), blk);
+        if (else_br as usize) != 0 {
+            unsafe_check_expr(c, else_br);
+        }
+    } else if ek == HIR_EXPR_MATCH {
+        let cond = unsafe { (*expr).cond as *const HirExpr };
+        let inner = unsafe { (*expr).inner as *const HirExpr };
+        if (cond as usize) != 0 {
+            unsafe_check_expr(mut_view(*c), cond);
+        } else if (inner as usize) != 0 {
+            unsafe_check_expr(mut_view(*c), inner);
+        }
+        let mut arm = unsafe { (*expr).arms as *const HirMatchArm };
+        while ((arm as usize) != 0) {
+            let grd = unsafe { (*arm).guard as *const HirExpr };
+            let bdy = unsafe { (*arm).body as *const HirExpr };
+            if (grd as usize) != 0 {
+                unsafe_check_expr(mut_view(*c), grd);
+            }
+            unsafe_check_expr(mut_view(*c), bdy);
+            arm = unsafe { (*arm).next as *const HirMatchArm };
+        }
+    } else if ek == HIR_EXPR_LOOP {
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        unsafe_check_block(c, blk);
+    } else if ek == HIR_EXPR_WHILE {
+        let cond = unsafe { (*expr).cond as *const HirExpr };
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        unsafe_check_expr(mut_view(*c), cond);
+        unsafe_check_block(c, blk);
+    } else if ek == HIR_EXPR_FOR {
+        let iter = unsafe { (*expr).iter as *const HirExpr };
+        let blk = unsafe { (*expr).block as *const HirBlock };
+        unsafe_check_expr(mut_view(*c), iter);
+        unsafe_check_block(c, blk);
+    } else if ek == HIR_EXPR_TUPLE || ek == HIR_EXPR_ARRAY {
+        let mut e = unsafe { (*expr).elems as *const HirExpr };
+        while ((e as usize) != 0) {
+            unsafe_check_expr(mut_view(*c), e);
+            e = unsafe { (*e).next as *const HirExpr };
+        }
+        let ce = unsafe { (*expr).count_expr as *const HirExpr };
+        if (ce as usize) != 0 {
+            unsafe_check_expr(c, ce);
+        }
+    } else if ek == HIR_EXPR_STRUCT {
+        let mut f = unsafe { (*expr).fields as *const HirFieldInit };
+        while ((f as usize) != 0) {
+            let fe = unsafe { (*f).expr as *const HirExpr };
+            unsafe_check_expr(mut_view(*c), fe);
+            f = unsafe { (*f).next as *const HirFieldInit };
+        }
+    } else if ek == HIR_EXPR_VIEW || ek == HIR_EXPR_CAST || ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT {
+        let inner = unsafe { (*expr).inner as *const HirExpr };
+        unsafe_check_expr(c, inner);
+    } else if ek == HIR_EXPR_INDEX {
+        let base = unsafe { (*expr).base as *const HirExpr };
+        let idx = unsafe { (*expr).index_arg as *const HirExpr };
+        unsafe_check_expr(mut_view(*c), base);
+        unsafe_check_expr(c, idx);
+    } else if ek == HIR_EXPR_TUPLE_INDEX {
+        let base = unsafe { (*expr).base as *const HirExpr };
+        unsafe_check_expr(c, base);
+    } else if ek == HIR_EXPR_JUMP {
+        let inner = unsafe { (*expr).inner as *const HirExpr };
+        if (inner as usize) != 0 {
+            unsafe_check_expr(c, inner);
+        }
+    } else if ek == HIR_EXPR_RANGE {
+        let s = unsafe { (*expr).start_expr as *const HirExpr };
+        let e = unsafe { (*expr).end_expr as *const HirExpr };
+        if (s as usize) != 0 {
+            unsafe_check_expr(mut_view(*c), s);
+        }
+        if (e as usize) != 0 {
+            unsafe_check_expr(c, e);
+        }
+    }
+}
+
+pub fn unsafe_check_item(c: mut_view<UnsafeChecker>, it: *const HirItem) {
+    if (it as usize) == 0 {
+        return;
+    }
+    let ik = unsafe { (*it).kind };
+    if ik == HIR_ITEM_FN {
+        let bdy = unsafe { (*it).body as *const HirBlock };
+        if (bdy as usize) != 0 {
+            c.unsafe_depth = if unsafe { (*it).is_unsafe } { 1 } else { 0 };
+            unsafe_check_block(c, bdy);
+        }
+    } else if ik == HIR_ITEM_IMPL {
+        let mut m = unsafe { (*it).members as *const HirItem };
+        while ((m as usize) != 0) {
+            let mk = unsafe { (*m).kind };
+            if mk == HIR_ITEM_FN {
+                let mbdy = unsafe { (*m).body as *const HirBlock };
+                if (mbdy as usize) != 0 {
+                    c.unsafe_depth = if unsafe { (*m).is_unsafe } { 1 } else { 0 };
+                    unsafe_check_block(mut_view(*c), mbdy);
+                }
+            }
+            m = unsafe { (*m).next as *const HirItem };
+        }
+    } else if ik == HIR_ITEM_STATIC {
+        let ex = unsafe { (*it).expr as *const HirExpr };
+        if (ex as usize) != 0 {
+            c.unsafe_depth = if unsafe { (*it).is_unsafe } { 1 } else { 0 };
+            unsafe_check_expr(c, ex);
+        }
+    } else if ik == HIR_ITEM_CONST {
+        let ex = unsafe { (*it).expr as *const HirExpr };
+        if (ex as usize) != 0 {
+            c.unsafe_depth = 0;
+            unsafe_check_expr(c, ex);
+        }
+    }
+}
+
+pub fn unsafe_check(
+    hir: view<HirFile>,
+    thir: view<Thir>,
+    sink: mut_view<DiagSink>,
+    interner: view<StrInterner>
+) {
+    let mut c = UnsafeChecker {
+        hir: unsafe { address_of(*hir) },
+        thir: unsafe { address_of(*thir) },
+        sink: unsafe { address_of_mut(*sink) },
+        interner: unsafe { address_of(*interner) },
+        unsafe_depth: 0,
+    };
+
+    let mut it = hir.items as *const HirItem;
+    while ((it as usize) != 0) {
+        unsafe_check_item(mut_view(c), it);
+        it = unsafe { (*it).next as *const HirItem };
+    }
+}

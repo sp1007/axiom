@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082a]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/own/move.ax, compiler/own/init.ax, tests/selfhost/own]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OWN-338]
+started: 2026-10-15 20:06:21
+finished: 2026-10-15 20:06:21
 ---
 # T082b — Port ownership move analysis and definite initialization to Axiom
 
@@ -38,3 +40,7 @@ Port ownership move/copy analysis and definite initialization analysis (`compile
 - `model: opus`: Ownership and initialization analyses require semantic precision (model policy).
 - Sub-task of T082 split per ADR-0005 §8 and SPEC-20 §4.6.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 20:06:21 started (attempt 1) axiom-stdlib
+- 2026-10-15 20:06:21 accepted by QA -> done

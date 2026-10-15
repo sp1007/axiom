@@ -1,0 +1,410 @@
+// Place move paths, ownership state lattice, and copy/move classification.
+// Port of bootstrap/axiom0/src/own/own.h and path/state helpers from own/own.c.
+module compiler.own.move
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use compiler.kernel.id.FileId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.source.span.Span
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.Thir
+use compiler.types.types.mul_usize
+use compiler.types.types.type_get
+use compiler.types.types.type_is_copy
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_proj_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+pub const OWN_UNINIT: u8 = 0u8;
+pub const OWN_OWNED: u8 = 1u8;
+pub const OWN_MOVED: u8 = 2u8;
+pub const OWN_PARTIAL: u8 = 3u8;
+
+pub const OWN_NODE_NONE: u32 = 0xFFFFFFFFu32;
+
+pub struct OwnStateInfo {
+    pub state: u8,
+    pub move_loc: Span,
+}
+
+pub struct PathNode {
+    pub parent: u32,
+    pub first_child: u32,
+    pub num_children: u32,
+    pub is_copy: bool,
+}
+
+pub struct PathCtx {
+    pub nodes: *mut PathNode,
+    pub count: usize,
+    pub cap: usize,
+    pub local_roots: *mut u32,
+    pub local_count: usize,
+}
+
+pub unsafe fn own_state_at(base: *const OwnStateInfo, idx: usize) -> *const OwnStateInfo {
+    ((base as usize) + mul_usize(idx, size_of<OwnStateInfo>())) as *const OwnStateInfo
+}
+
+pub unsafe fn own_state_at_mut(base: *mut OwnStateInfo, idx: usize) -> *mut OwnStateInfo {
+    ((base as usize) + mul_usize(idx, size_of<OwnStateInfo>())) as *mut OwnStateInfo
+}
+
+pub unsafe fn path_node_at(base: *const PathNode, idx: usize) -> *const PathNode {
+    ((base as usize) + mul_usize(idx, size_of<PathNode>())) as *const PathNode
+}
+
+pub unsafe fn path_node_at_mut(base: *mut PathNode, idx: usize) -> *mut PathNode {
+    ((base as usize) + mul_usize(idx, size_of<PathNode>())) as *mut PathNode
+}
+
+pub unsafe fn own_u32_at(base: *const u32, idx: usize) -> *const u32 {
+    ((base as usize) + (idx << 2usize)) as *const u32
+}
+
+pub unsafe fn own_u32_at_mut(base: *mut u32, idx: usize) -> *mut u32 {
+    ((base as usize) + (idx << 2usize)) as *mut u32
+}
+
+unsafe fn own_type_id_at(base: *const TypeId, idx: usize) -> *const TypeId {
+    ((base as usize) + mul_usize(idx, size_of<TypeId>())) as *const TypeId
+}
+
+pub fn own_type_is_copy(id: TypeId, thir: view<Thir>, str_in: view<StrInterner>) -> bool {
+    type_is_copy(id, thir, str_in)
+}
+
+fn path_ctx_ensure_cap(ctx: mut_view<PathCtx>, needed: usize) {
+    if needed <= ctx.cap {
+        return;
+    }
+    let mut new_cap = if ctx.cap == 0 { 64 } else { ctx.cap };
+    while new_cap < needed {
+        new_cap = mul_usize(new_cap, 2);
+    }
+    let new_bytes = mul_usize(new_cap, size_of<PathNode>());
+    let new_raw = unsafe { heap_alloc(new_bytes, align_of<PathNode>()) };
+    let new_nodes = new_raw as *mut PathNode;
+    if ctx.count > 0 && (ctx.nodes as usize) != 0 {
+        let old_bytes = mul_usize(ctx.count, size_of<PathNode>());
+        let cap_bytes = mul_usize(ctx.cap, size_of<PathNode>());
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(ctx.nodes as *const u8, new_nodes as *mut u8, old_bytes);
+            heap_free(ctx.nodes as *mut u8, cap_bytes, align_of<PathNode>());
+        }
+    }
+    ctx.nodes = new_nodes;
+    ctx.cap = new_cap;
+}
+
+pub fn populate_path_tree(
+    ctx: mut_view<PathCtx>,
+    node_idx: u32,
+    ty_id: TypeId,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    if ty_id.v == 0u32 || ty_id.v == 0xFFFFFFFFu32 {
+        return;
+    }
+    let ty = type_get(view(thir.interner), ty_id);
+    if (ty as usize) == 0 {
+        return;
+    }
+    let tk = unsafe { (*ty).kind };
+    let mut field_count: usize = 0;
+    let mut fields: *mut TypeId = 0 as *mut TypeId;
+
+    if tk == TY_TUPLE || tk == TY_STRUCT {
+        field_count = unsafe { (*ty).field_count };
+        fields = unsafe { (*ty).fields };
+    }
+
+    if field_count > 0 && (fields as usize) != 0 {
+        let first_child = ctx.count as u32;
+        let new_count = ctx.count + field_count;
+        path_ctx_ensure_cap(mut_view(*ctx), new_count);
+        ctx.count = new_count;
+
+        let parent_np = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*parent_np).first_child = first_child;
+            (*parent_np).num_children = field_count as u32;
+        }
+
+        let mut i: usize = 0;
+        while (i < field_count) {
+            let fty_p = unsafe { own_type_id_at(fields as *const TypeId, i) };
+            let fty_v = unsafe { (*fty_p).v };
+            let is_cp = type_is_copy(TypeId { v: fty_v }, thir, str_in);
+            let child_np = unsafe { path_node_at_mut(ctx.nodes, (first_child as usize) + i) };
+            unsafe {
+                (*child_np).parent = node_idx;
+                (*child_np).first_child = 0u32;
+                (*child_np).num_children = 0u32;
+                (*child_np).is_copy = is_cp;
+            }
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < field_count) {
+            let fty_p = unsafe { own_type_id_at(fields as *const TypeId, i) };
+            let fty_v = unsafe { (*fty_p).v };
+            populate_path_tree(mut_view(*ctx), first_child + (i as u32), TypeId { v: fty_v }, thir, str_in);
+            i = i + 1;
+        }
+    }
+}
+
+pub fn path_ctx_init(
+    ctx: mut_view<PathCtx>,
+    body: view<MirBody>,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    let init_cap: usize = if body.local_count > 0 { mul_usize(body.local_count, 2) } else { 8 };
+    let nodes_bytes = mul_usize(init_cap, size_of<PathNode>());
+    let nodes_raw = unsafe { heap_alloc(nodes_bytes, align_of<PathNode>()) };
+    ctx.nodes = nodes_raw as *mut PathNode;
+    ctx.count = 0;
+    ctx.cap = init_cap;
+
+    let roots_count = if body.local_count > 0 { body.local_count } else { 1 };
+    let roots_bytes = roots_count << 2usize;
+    let roots_raw = unsafe { heap_alloc(roots_bytes, 4) };
+    ctx.local_roots = roots_raw as *mut u32;
+    ctx.local_count = body.local_count;
+
+    let mut i: usize = 0;
+    while (i < body.local_count) {
+        let node_idx = ctx.count as u32;
+        path_ctx_ensure_cap(mut_view(*ctx), ctx.count + 1);
+        ctx.count = ctx.count + 1;
+
+        let root_p = unsafe { own_u32_at_mut(ctx.local_roots, i) };
+        unsafe { *root_p = node_idx; }
+
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lty_v = unsafe { (*ldecl).ty.v };
+        let is_cp = type_is_copy(TypeId { v: lty_v }, thir, str_in);
+
+        let np = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*np).parent = OWN_NODE_NONE;
+            (*np).first_child = 0u32;
+            (*np).num_children = 0u32;
+            (*np).is_copy = is_cp;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < body.local_count) {
+        let root_p = unsafe { own_u32_at(ctx.local_roots as *const u32, i) };
+        let root_idx = unsafe { *root_p };
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lty_v = unsafe { (*ldecl).ty.v };
+        populate_path_tree(mut_view(*ctx), root_idx, TypeId { v: lty_v }, thir, str_in);
+        i = i + 1;
+    }
+}
+
+pub fn path_ctx_free(ctx: mut_view<PathCtx>) {
+    if ctx.cap > 0 && (ctx.nodes as usize) != 0 {
+        let cap_bytes = mul_usize(ctx.cap, size_of<PathNode>());
+        unsafe {
+            heap_free(ctx.nodes as *mut u8, cap_bytes, align_of<PathNode>());
+        }
+    }
+    if (ctx.local_roots as usize) != 0 {
+        let roots_count = if ctx.local_count > 0 { ctx.local_count } else { 1 };
+        unsafe {
+            heap_free(ctx.local_roots as *mut u8, roots_count << 2usize, 4);
+        }
+    }
+    ctx.nodes = 0 as *mut PathNode;
+    ctx.count = 0;
+    ctx.cap = 0;
+    ctx.local_roots = 0 as *mut u32;
+    ctx.local_count = 0;
+}
+
+pub fn resolve_place(ctx: view<PathCtx>, place: view<MirPlace>) -> u32 {
+    if (place.local.v as usize) >= ctx.local_count {
+        return 0u32;
+    }
+    let root_p = unsafe { own_u32_at(ctx.local_roots as *const u32, place.local.v as usize) };
+    let mut node = unsafe { *root_p };
+    let mut i: usize = 0;
+    while (i < place.proj_count) {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_FIELD {
+            let f = unsafe { (*pr).field_idx };
+            let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+            let nchild = unsafe { (*np).num_children };
+            let fchild = unsafe { (*np).first_child };
+            if f < nchild {
+                node = fchild + f;
+            }
+        }
+        i = i + 1;
+    }
+    node
+}
+
+pub fn update_parent(state: *mut OwnStateInfo, ctx: view<PathCtx>, node: u32) {
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    let p = unsafe { (*np).parent };
+    if p == OWN_NODE_NONE {
+        return;
+    }
+
+    let pnp = unsafe { path_node_at(ctx.nodes as *const PathNode, p as usize) };
+    let nchild = unsafe { (*pnp).num_children };
+    let fchild = unsafe { (*pnp).first_child };
+
+    let mut all_init = true;
+    let mut all_moved = true;
+    let mut any_moved = false;
+    let mut any_init = false;
+    let mut move_file_v: u32 = 0u32;
+    let mut move_start: u32 = 0u32;
+    let mut move_end: u32 = 0u32;
+
+    let mut i: u32 = 0u32;
+    while (i < nchild) {
+        let cst_p = unsafe { own_state_at(state as *const OwnStateInfo, (fchild + i) as usize) };
+        let cst = unsafe { (*cst_p).state };
+        if cst != OWN_OWNED {
+            all_init = false;
+        }
+        if cst == OWN_OWNED {
+            any_init = true;
+        }
+        if cst != OWN_MOVED && cst != OWN_UNINIT {
+            all_moved = false;
+        }
+        if cst == OWN_MOVED || cst == OWN_PARTIAL {
+            any_moved = true;
+            if move_file_v == 0u32 {
+                move_file_v = unsafe { (*cst_p).move_loc.file.v };
+                move_start = unsafe { (*cst_p).move_loc.start };
+                move_end = unsafe { (*cst_p).move_loc.end };
+            }
+        }
+        i = i + 1u32;
+    }
+
+    let mut new_p = OWN_UNINIT;
+    if all_init {
+        new_p = OWN_OWNED;
+    } else if all_moved {
+        new_p = OWN_MOVED;
+    } else if any_moved {
+        new_p = OWN_PARTIAL;
+    } else if any_init {
+        new_p = OWN_PARTIAL;
+    }
+
+    let pst = unsafe { own_state_at_mut(state, p as usize) };
+    unsafe {
+        (*pst).state = new_p;
+        if new_p == OWN_MOVED || new_p == OWN_PARTIAL {
+            (*pst).move_loc.file.v = move_file_v;
+            (*pst).move_loc.start = move_start;
+            (*pst).move_loc.end = move_end;
+        }
+    }
+    update_parent(state, ctx, p);
+}
+
+pub fn mark_state(state: *mut OwnStateInfo, ctx: view<PathCtx>, node: u32, new_state: u8, move_loc: Span) {
+    let st_p = unsafe { own_state_at_mut(state, node as usize) };
+    unsafe {
+        (*st_p).state = new_state;
+        if new_state == OWN_MOVED || new_state == OWN_PARTIAL {
+            (*st_p).move_loc.file.v = move_loc.file.v;
+            (*st_p).move_loc.start = move_loc.start;
+            (*st_p).move_loc.end = move_loc.end;
+        }
+    }
+    let np = unsafe { path_node_at(ctx.nodes as *const PathNode, node as usize) };
+    let nchild = unsafe { (*np).num_children };
+    let fchild = unsafe { (*np).first_child };
+    let mut i: u32 = 0u32;
+    while (i < nchild) {
+        let mloc = Span { file: FileId { v: move_loc.file.v }, start: move_loc.start, end: move_loc.end };
+        mark_state(state, ctx, fchild + i, new_state, mloc);
+        i = i + 1u32;
+    }
+}
+
+pub fn merge_state_val(a: u8, b: u8) -> u8 {
+    if a == b {
+        return a;
+    }
+    if a == OWN_PARTIAL || b == OWN_PARTIAL {
+        return OWN_PARTIAL;
+    }
+    if a == OWN_OWNED || b == OWN_OWNED {
+        return OWN_PARTIAL;
+    }
+    if a == OWN_MOVED {
+        OWN_MOVED
+    } else {
+        b
+    }
+}
+
+pub fn merge_states(dest: *mut OwnStateInfo, src: *const OwnStateInfo, count: usize) -> bool {
+    let mut changed = false;
+    let mut i: usize = 0;
+    while (i < count) {
+        let dp = unsafe { own_state_at_mut(dest, i) };
+        let sp = unsafe { own_state_at(src, i) };
+        let ds = unsafe { (*dp).state };
+        let ss = unsafe { (*sp).state };
+        let m = merge_state_val(ds, ss);
+
+        let d_fv = unsafe { (*dp).move_loc.file.v };
+        let d_st = unsafe { (*dp).move_loc.start };
+        let d_en = unsafe { (*dp).move_loc.end };
+        let s_fv = unsafe { (*sp).move_loc.file.v };
+        let s_st = unsafe { (*sp).move_loc.start };
+        let s_en = unsafe { (*sp).move_loc.end };
+
+        let mut new_fv = d_fv;
+        let mut new_st = d_st;
+        let mut new_en = d_en;
+        if new_fv == 0u32 {
+            new_fv = s_fv;
+            new_st = s_st;
+            new_en = s_en;
+        }
+
+        if m != ds || ((m == OWN_MOVED || m == OWN_PARTIAL) && d_fv == 0u32 && new_fv != 0u32) {
+            unsafe {
+                (*dp).state = m;
+                if m == OWN_MOVED || m == OWN_PARTIAL {
+                    (*dp).move_loc.file.v = new_fv;
+                    (*dp).move_loc.start = new_st;
+                    (*dp).move_loc.end = new_en;
+                }
+            }
+            changed = true;
+        }
+        i = i + 1;
+    }
+    changed
+}
