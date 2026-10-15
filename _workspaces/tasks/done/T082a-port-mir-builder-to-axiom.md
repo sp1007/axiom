@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T081]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/mir/mir.ax, compiler/mir/builder.ax, tests/selfhost/mir]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-MIR-338, REQ-MIR-339, REQ-MIR-340]
+started: 2026-10-15 20:06:14
+finished: 2026-10-15 20:06:15
 ---
 # T082a — Port MIR data model and MIR builder to Axiom
 
@@ -38,3 +40,7 @@ Port Mid-level Intermediate Representation (MIR) data structures and HIR->MIR lo
 - `model: opus`: MIR construction requires semantic precision (model policy).
 - Sub-task of T082 split per ADR-0005 §8 and SPEC-20 §4.6.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 20:06:14 started (attempt 1) axiom-stdlib
+- 2026-10-15 20:06:15 accepted by QA -> done
