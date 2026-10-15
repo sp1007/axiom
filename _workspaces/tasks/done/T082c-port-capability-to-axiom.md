@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082b]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/own/cap.ax, tests/selfhost/cap]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OWN-338]
+started: 2026-10-15 20:06:26
+finished: 2026-10-15 20:06:27
 ---
 # T082c — Port capability analysis (views & mut_views) to Axiom
 
@@ -38,3 +40,7 @@ Port capability analysis for immutable `view` and mutable `mut_view` (`compiler/
 - `model: opus`: Capability tracking requires semantic precision (model policy).
 - Sub-task of T082 split per ADR-0005 §8 and SPEC-20 §4.6.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 20:06:26 started (attempt 1) axiom-stdlib
+- 2026-10-15 20:06:27 accepted by QA -> done
