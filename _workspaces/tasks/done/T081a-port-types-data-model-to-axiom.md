@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T080]
 priority: 115
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types/types.ax, compiler/types/layout.ax, tests/selfhost/types]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-TYP-354]
+started: 2026-10-15 12:01:29
+finished: 2026-10-15 12:04:18
 ---
 # T081a — Port types data model, interner & layout to Axiom
 
@@ -39,3 +41,7 @@ Port TypeKind definitions, type interner, and target memory layout calculation (
 - `model: opus`: Porting the type system requires semantic precision (model policy).
 - Sub-task of T081 split per ADR-0005 §8 and SPEC-20 §4.5.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 12:01:29 started (attempt 1) axiom-semantics
+- 2026-10-15 12:04:18 finished without commit (manual) -> done; run `taskctl commit` next
