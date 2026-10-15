@@ -1,0 +1,1205 @@
+// Generic type substitution, type argument deduction, symbol name mangling,
+// and monomorphization worklist/instance cache engine.
+// Port of bootstrap/axiom0/src/driver/mono.{h,c} and ax_subst_ty in typeck.c.
+module compiler.traits.mono
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.interner_get
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.source.manager.SourceDatabase
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_TRAIT
+use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirGenericParams
+use compiler.hir.hir.HirItem
+use compiler.types.types.AxType
+use compiler.types.types.ClosureCapture
+use compiler.types.types.GenericArgsSlice
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_ERROR
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_INT_VAR
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PARAM
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_VAR
+use compiler.types.types.TY_VIEW
+use compiler.types.types.TypeInterner
+use compiler.types.types.capture_at
+use compiler.types.types.copy_ax_type_into
+use compiler.types.types.intern_array_ty
+use compiler.types.types.intern_fn_ty
+use compiler.types.types.intern_ptr_ty
+use compiler.types.types.intern_slice_ty
+use compiler.types.types.intern_tuple_ty
+use compiler.types.types.intern_type
+use compiler.types.types.intern_view_ty
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.types.usize_at
+use compiler.traits.solver.find_trait_by_type_path
+use compiler.traits.solver.find_trait_default_method
+use compiler.traits.solver.hir_item_name_sv
+use compiler.traits.solver.impl_matches_receiver
+use compiler.traits.solver.sv_eq
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+pub const MONO_FIRST_SYM_ID: u32 = 0x08000000u32;
+
+pub struct MonoInstance {
+    pub orig_item: *mut HirItem,
+    pub new_item: *mut HirItem,
+    pub args: GenericArgsSlice,
+    pub mangled_sym: SymbolId,
+    pub mangled_name: StrId,
+    pub mir_body: usize,
+    pub next: *mut MonoInstance,
+    pub work_next: *mut MonoInstance,
+    pub in_worklist: bool,
+}
+
+pub struct MonoEngine {
+    pub arena: *mut Arena,
+    pub instances_head: *mut MonoInstance,
+    pub instances_tail: *mut MonoInstance,
+    pub instance_count: usize,
+    pub work_head: *mut MonoInstance,
+    pub work_tail: *mut MonoInstance,
+    pub next_counter: u32,
+    pub next_sym_id: u32,
+}
+
+pub fn generic_args_eq(a: view<GenericArgsSlice>, b: view<GenericArgsSlice>) -> bool {
+    let a_cnt: usize = a.count;
+    let b_cnt: usize = b.count;
+    if a_cnt != b_cnt {
+        return false;
+    }
+    if a_cnt == 0 {
+        return true;
+    }
+    let a_ptr: *mut TypeId = a.args;
+    let b_ptr: *mut TypeId = b.args;
+    if (a_ptr as usize) == 0 || (b_ptr as usize) == 0 {
+        return (a_ptr as usize) == (b_ptr as usize);
+    }
+    let mut i: usize = 0;
+    while (i < a_cnt) {
+        let av = unsafe { (*typeid_at(a_ptr, i)).v };
+        let bv = unsafe { (*typeid_at(b_ptr, i)).v };
+        if av != bv {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn type_contains_param(ti: view<TypeInterner>, ty: TypeId) -> bool {
+    if ty.v == 0u32 {
+        return true;
+    }
+    let t = type_get(ti, ty);
+    if (t as usize) == 0 {
+        return true;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk == TY_PARAM || tk == TY_VAR || tk == TY_INT_VAR || tk == TY_ERROR {
+        return true;
+    }
+    if tk == TY_VIEW || tk == TY_MUT_VIEW || tk == TY_PTR {
+        let pt_v = unsafe { (*t).pointee.v };
+        return type_contains_param(ti, TypeId { v: pt_v });
+    }
+    if tk == TY_ARRAY || tk == TY_SLICE {
+        let el_v = unsafe { (*t).elem.v };
+        return type_contains_param(ti, TypeId { v: el_v });
+    }
+    if tk == TY_TUPLE {
+        let fcount = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut i: usize = 0;
+        while (i < fcount) {
+            let fv = unsafe { (*typeid_at(fields, i)).v };
+            if type_contains_param(ti, (TypeId { v: fv })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    if tk == TY_FN {
+        let pcount = unsafe { (*t).param_count };
+        let params = unsafe { (*t).param_types };
+        let mut i: usize = 0;
+        while (i < pcount) {
+            let pv = unsafe { (*typeid_at(params, i)).v };
+            if type_contains_param(ti, (TypeId { v: pv })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        let rv = unsafe { (*t).ret_type.v };
+        return type_contains_param(ti, (TypeId { v: rv }));
+    }
+    if tk == TY_STRUCT || tk == TY_ENUM {
+        let acount = unsafe { (*t).arg_count };
+        let args = unsafe { (*t).args };
+        let mut i: usize = 0;
+        while (i < acount) {
+            let av = unsafe { (*typeid_at(args, i)).v };
+            if type_contains_param(ti, (TypeId { v: av })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+    false
+}
+
+pub fn mono_has_concrete_args(args: view<GenericArgsSlice>, ti: view<TypeInterner>) -> bool {
+    let a_cnt: usize = args.count;
+    let a_ptr: *mut TypeId = args.args;
+    if a_cnt == 0 || (a_ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while (i < a_cnt) {
+        let av = unsafe { (*typeid_at(a_ptr, i)).v };
+        if av == 0u32 || type_contains_param(ti, (TypeId { v: av })) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn subst_ty(
+    ti: mut_view<TypeInterner>,
+    ty: TypeId,
+    args: view<GenericArgsSlice>
+) -> TypeId {
+    let ty_v = ty.v;
+    let a_cnt: usize = args.count;
+    let a_ptr: *mut TypeId = args.args;
+    if ty_v == 0u32 || a_cnt == 0 || (a_ptr as usize) == 0 {
+        return TypeId { v: ty_v };
+    }
+    let t = type_get(view(*ti), TypeId { v: ty_v });
+    if (t as usize) == 0 {
+        return TypeId { v: ty_v };
+    }
+    let tk = unsafe { (*t).kind };
+
+    if tk == TY_PARAM {
+        let idx = unsafe { (*t).param_index as usize };
+        if idx < a_cnt {
+            let rep_v = unsafe { (*typeid_at(a_ptr, idx)).v };
+            if rep_v != 0u32 {
+                return TypeId { v: rep_v };
+            }
+        }
+        return TypeId { v: ty_v };
+    }
+
+    if tk == TY_ARRAY {
+        let elem_v = unsafe { (*t).elem.v };
+        let arr_len = unsafe { (*t).array_len };
+        let new_elem = subst_ty(mut_view(*ti), TypeId { v: elem_v }, args);
+        if new_elem.v == elem_v {
+            return TypeId { v: ty_v };
+        }
+        return intern_array_ty(mut_view(*ti), new_elem, arr_len);
+    }
+
+    if tk == TY_SLICE {
+        let elem_v = unsafe { (*t).elem.v };
+        let new_elem = subst_ty(mut_view(*ti), TypeId { v: elem_v }, args);
+        if new_elem.v == elem_v {
+            return TypeId { v: ty_v };
+        }
+        return intern_slice_ty(mut_view(*ti), new_elem);
+    }
+
+    if tk == TY_VIEW {
+        let pt_v = unsafe { (*t).pointee.v };
+        let new_pt = subst_ty(mut_view(*ti), TypeId { v: pt_v }, args);
+        if new_pt.v == pt_v {
+            return TypeId { v: ty_v };
+        }
+        return intern_view_ty(mut_view(*ti), new_pt, false);
+    }
+
+    if tk == TY_MUT_VIEW {
+        let pt_v = unsafe { (*t).pointee.v };
+        let new_pt = subst_ty(mut_view(*ti), TypeId { v: pt_v }, args);
+        if new_pt.v == pt_v {
+            return TypeId { v: ty_v };
+        }
+        return intern_view_ty(mut_view(*ti), new_pt, true);
+    }
+
+    if tk == TY_PTR {
+        let pt_v = unsafe { (*t).pointee.v };
+        let is_mut = unsafe { (*t).is_mut };
+        let new_pt = subst_ty(mut_view(*ti), TypeId { v: pt_v }, args);
+        if new_pt.v == pt_v {
+            return TypeId { v: ty_v };
+        }
+        return intern_ptr_ty(mut_view(*ti), new_pt, is_mut);
+    }
+
+    if tk == TY_TUPLE {
+        let fcount = unsafe { (*t).field_count };
+        if fcount == 0 {
+            return TypeId { v: ty_v };
+        }
+        let orig_fields = unsafe { (*t).fields };
+        let new_fields = arena_alloc_raw(
+            mut_view(ti.arena),
+            (((fcount as isize) * (size_of<TypeId>() as isize)) as usize),
+            align_of<TypeId>()
+        ) as *mut TypeId;
+        let mut changed: bool = false;
+        let mut i: usize = 0;
+        while (i < fcount) {
+            let orig_fv = unsafe { (*typeid_at(orig_fields, i)).v };
+            let sub_f = subst_ty(mut_view(*ti), TypeId { v: orig_fv }, args);
+            if sub_f.v != orig_fv {
+                changed = true;
+            }
+            unsafe {
+                (*typeid_at(new_fields, i)).v = sub_f.v;
+            }
+            i = i + 1;
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        return intern_tuple_ty(mut_view(*ti), new_fields, fcount);
+    }
+
+    if tk == TY_FN {
+        let pcount = unsafe { (*t).param_count };
+        let orig_params = unsafe { (*t).param_types };
+        let orig_ret_v = unsafe { (*t).ret_type.v };
+        let is_unsafe = unsafe { (*t).is_unsafe };
+        let abi_v = unsafe { (*t).abi.v };
+        let mut new_params: *mut TypeId = 0 as *mut TypeId;
+        let mut changed: bool = false;
+        if pcount > 0 {
+            new_params = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((pcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut i: usize = 0;
+            while (i < pcount) {
+                let orig_pv = unsafe { (*typeid_at(orig_params, i)).v };
+                let sub_p = subst_ty(mut_view(*ti), TypeId { v: orig_pv }, args);
+                if sub_p.v != orig_pv {
+                    changed = true;
+                }
+                unsafe {
+                    (*typeid_at(new_params, i)).v = sub_p.v;
+                }
+                i = i + 1;
+            }
+        }
+        let new_ret = subst_ty(mut_view(*ti), TypeId { v: orig_ret_v }, args);
+        if new_ret.v != orig_ret_v {
+            changed = true;
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        return intern_fn_ty(
+            mut_view(*ti),
+            is_unsafe,
+            StrId { v: abi_v },
+            new_params,
+            pcount,
+            new_ret
+        );
+    }
+
+    if tk == TY_STRUCT {
+        let gcount = unsafe { (*t).arg_count };
+        let orig_gargs = unsafe { (*t).args };
+        let fcount = unsafe { (*t).field_count };
+        let orig_fields = unsafe { (*t).fields };
+        let mut changed: bool = false;
+        let mut new_gargs: *mut TypeId = orig_gargs;
+        if gcount > 0 && (orig_gargs as usize) != 0 {
+            new_gargs = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut i: usize = 0;
+            while (i < gcount) {
+                let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
+                let sub_g = subst_ty(mut_view(*ti), TypeId { v: orig_gv }, args);
+                if sub_g.v != orig_gv {
+                    changed = true;
+                }
+                unsafe {
+                    (*typeid_at(new_gargs, i)).v = sub_g.v;
+                }
+                i = i + 1;
+            }
+        }
+        let mut new_fields: *mut TypeId = orig_fields;
+        if fcount > 0 && (orig_fields as usize) != 0 {
+            new_fields = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((fcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut i: usize = 0;
+            while (i < fcount) {
+                let orig_fv = unsafe { (*typeid_at(orig_fields, i)).v };
+                let sub_f = subst_ty(mut_view(*ti), TypeId { v: orig_fv }, args);
+                if sub_f.v != orig_fv {
+                    changed = true;
+                }
+                unsafe {
+                    (*typeid_at(new_fields, i)).v = sub_f.v;
+                }
+                i = i + 1;
+            }
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        let t_latest = type_get(view(*ti), TypeId { v: ty_v });
+        let sp = ti.scratch;
+        unsafe {
+            copy_ax_type_into(mut_view(*sp), view(*t_latest));
+            (*sp).args = new_gargs;
+            (*sp).arg_count = gcount;
+            (*sp).fields = new_fields;
+            (*sp).field_count = fcount;
+        }
+        return intern_type(mut_view(*ti), unsafe { view(*sp) });
+    }
+
+    if tk == TY_ENUM {
+        let gcount = unsafe { (*t).arg_count };
+        let orig_gargs = unsafe { (*t).args };
+        let vcount = unsafe { (*t).variant_count };
+        let orig_vfields = unsafe { (*t).variant_fields };
+        let orig_vcounts = unsafe { (*t).variant_field_counts };
+        let mut changed: bool = false;
+        let mut new_gargs: *mut TypeId = orig_gargs;
+        if gcount > 0 && (orig_gargs as usize) != 0 {
+            new_gargs = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((gcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut i: usize = 0;
+            while (i < gcount) {
+                let orig_gv = unsafe { (*typeid_at(orig_gargs, i)).v };
+                let sub_g = subst_ty(mut_view(*ti), TypeId { v: orig_gv }, args);
+                if sub_g.v != orig_gv {
+                    changed = true;
+                }
+                unsafe {
+                    (*typeid_at(new_gargs, i)).v = sub_g.v;
+                }
+                i = i + 1;
+            }
+        }
+        let mut new_vfields: *mut *mut TypeId = orig_vfields;
+        if vcount > 0 && (orig_vfields as usize) != 0 && (orig_vcounts as usize) != 0 {
+            new_vfields = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((vcount as isize) * (size_of<*mut TypeId>() as isize)) as usize),
+                align_of<*mut TypeId>()
+            ) as *mut *mut TypeId;
+            let mut v: usize = 0;
+            while (v < vcount) {
+                let fcount = unsafe { *usize_at(orig_vcounts, v) };
+                let src_vf = unsafe { *typeid_ptr_at(orig_vfields, v) };
+                if fcount > 0 && (src_vf as usize) != 0 {
+                    let dst_vf = arena_alloc_raw(
+                        mut_view(ti.arena),
+                        (((fcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                        align_of<TypeId>()
+                    ) as *mut TypeId;
+                    let mut f: usize = 0;
+                    while (f < fcount) {
+                        let orig_fv = unsafe { (*typeid_at(src_vf, f)).v };
+                        let sub_f = subst_ty(mut_view(*ti), TypeId { v: orig_fv }, args);
+                        if sub_f.v != orig_fv {
+                            changed = true;
+                        }
+                        unsafe {
+                            (*typeid_at(dst_vf, f)).v = sub_f.v;
+                        }
+                        f = f + 1;
+                    }
+                    unsafe {
+                        *typeid_ptr_at(new_vfields, v) = dst_vf;
+                    }
+                } else {
+                    unsafe {
+                        *typeid_ptr_at(new_vfields, v) = 0 as *mut TypeId;
+                    }
+                }
+                v = v + 1;
+            }
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        let t_latest = type_get(view(*ti), TypeId { v: ty_v });
+        let sp = ti.scratch;
+        unsafe {
+            copy_ax_type_into(mut_view(*sp), view(*t_latest));
+            (*sp).args = new_gargs;
+            (*sp).arg_count = gcount;
+            (*sp).variant_fields = new_vfields;
+        }
+        return intern_type(mut_view(*ti), unsafe { view(*sp) });
+    }
+
+    if tk == TY_CLOSURE {
+        let ccount = unsafe { (*t).capture_count };
+        let orig_caps = unsafe { (*t).captures };
+        let pcount = unsafe { (*t).param_count };
+        let orig_params = unsafe { (*t).param_types };
+        let orig_ret_v = unsafe { (*t).ret_type.v };
+        let orig_fn_v = unsafe { (*t).fn_type.v };
+        let orig_cid = unsafe { (*t).closure_id };
+        let mut changed: bool = false;
+        let mut cid_mix: u32 = orig_cid;
+
+        let mut new_caps: *mut ClosureCapture = orig_caps;
+        if ccount > 0 && (orig_caps as usize) != 0 {
+            new_caps = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((ccount as isize) * (size_of<ClosureCapture>() as isize)) as usize),
+                align_of<ClosureCapture>()
+            ) as *mut ClosureCapture;
+            let mut c: usize = 0;
+            while (c < ccount) {
+                let src_cap = unsafe { capture_at(orig_caps, c) };
+                let dst_cap = unsafe { capture_at(new_caps, c) };
+                let orig_cty_v = unsafe { (*src_cap).ty.v };
+                let sub_cty = subst_ty(mut_view(*ti), TypeId { v: orig_cty_v }, args);
+                if sub_cty.v != orig_cty_v {
+                    changed = true;
+                }
+                cid_mix = (cid_mix * 31u32) ^ sub_cty.v;
+                unsafe {
+                    (*dst_cap).sym.v = (*src_cap).sym.v;
+                    (*dst_cap).mode = (*src_cap).mode;
+                    (*dst_cap).ty.v = sub_cty.v;
+                }
+                c = c + 1;
+            }
+        }
+        let mut new_params: *mut TypeId = orig_params;
+        if pcount > 0 && (orig_params as usize) != 0 {
+            new_params = arena_alloc_raw(
+                mut_view(ti.arena),
+                (((pcount as isize) * (size_of<TypeId>() as isize)) as usize),
+                align_of<TypeId>()
+            ) as *mut TypeId;
+            let mut i: usize = 0;
+            while (i < pcount) {
+                let orig_pv = unsafe { (*typeid_at(orig_params, i)).v };
+                let sub_p = subst_ty(mut_view(*ti), TypeId { v: orig_pv }, args);
+                if sub_p.v != orig_pv {
+                    changed = true;
+                }
+                cid_mix = (cid_mix * 31u32) ^ sub_p.v;
+                unsafe {
+                    (*typeid_at(new_params, i)).v = sub_p.v;
+                }
+                i = i + 1;
+            }
+        }
+        let new_ret = subst_ty(mut_view(*ti), TypeId { v: orig_ret_v }, args);
+        if new_ret.v != orig_ret_v {
+            changed = true;
+            cid_mix = (cid_mix * 31u32) ^ new_ret.v;
+        }
+        let new_fn = subst_ty(mut_view(*ti), TypeId { v: orig_fn_v }, args);
+        if new_fn.v != orig_fn_v {
+            changed = true;
+        }
+        if !changed {
+            return TypeId { v: ty_v };
+        }
+        let new_cid: u32 = if cid_mix == orig_cid { orig_cid ^ 0x40000000u32 } else { cid_mix | 0x40000000u32 };
+        let t_latest = type_get(view(*ti), TypeId { v: ty_v });
+        let sp = ti.scratch;
+        unsafe {
+            copy_ax_type_into(mut_view(*sp), view(*t_latest));
+            (*sp).closure_id = new_cid;
+            (*sp).captures = new_caps;
+            (*sp).param_types = new_params;
+            (*sp).ret_type.v = new_ret.v;
+            (*sp).fn_type.v = new_fn.v;
+        }
+        return intern_type(mut_view(*ti), unsafe { view(*sp) });
+    }
+
+    TypeId { v: ty_v }
+}
+
+pub fn deduce_args(
+    gen_ty: TypeId,
+    spec_ty: TypeId,
+    ti: view<TypeInterner>,
+    out_args: *mut TypeId,
+    arg_count: usize
+) {
+    let gen_v = gen_ty.v;
+    let spec_v = spec_ty.v;
+    if gen_v == 0u32 || spec_v == 0u32 || gen_v == spec_v || (out_args as usize) == 0 {
+        return;
+    }
+    let gt = type_get(ti, TypeId { v: gen_v });
+    let st = type_get(ti, TypeId { v: spec_v });
+    if (gt as usize) == 0 || (st as usize) == 0 {
+        return;
+    }
+    let gk = unsafe { (*gt).kind };
+    let sk = unsafe { (*st).kind };
+
+    if gk == TY_PARAM {
+        let idx = unsafe { (*gt).param_index as usize };
+        if idx < arg_count && sk != TY_PARAM && sk != TY_VAR && sk != TY_INT_VAR && sk != TY_ERROR {
+            unsafe {
+                (*typeid_at(out_args, idx)).v = spec_v;
+            }
+        }
+        return;
+    }
+
+    // Method receiver auto-view: gen_ty is view<T> or mut_view<T>, spec_ty is T
+    if (gk == TY_VIEW || gk == TY_MUT_VIEW) && (sk != TY_VIEW && sk != TY_MUT_VIEW) {
+        let g_pt = unsafe { (*gt).pointee.v };
+        deduce_args(TypeId { v: g_pt }, TypeId { v: spec_v }, ti, out_args, arg_count);
+        return;
+    }
+
+    if gk != sk {
+        if (gk == TY_VIEW && sk == TY_MUT_VIEW) || (gk == TY_MUT_VIEW && sk == TY_VIEW) {
+            let g_pt = unsafe { (*gt).pointee.v };
+            let s_pt = unsafe { (*st).pointee.v };
+            deduce_args(TypeId { v: g_pt }, TypeId { v: s_pt }, ti, out_args, arg_count);
+        }
+        return;
+    }
+
+    if gk == TY_VIEW || gk == TY_MUT_VIEW || gk == TY_PTR {
+        let g_pt = unsafe { (*gt).pointee.v };
+        let s_pt = unsafe { (*st).pointee.v };
+        deduce_args(TypeId { v: g_pt }, TypeId { v: s_pt }, ti, out_args, arg_count);
+        return;
+    }
+
+    if gk == TY_ARRAY || gk == TY_SLICE {
+        let g_el = unsafe { (*gt).elem.v };
+        let s_el = unsafe { (*st).elem.v };
+        deduce_args(TypeId { v: g_el }, TypeId { v: s_el }, ti, out_args, arg_count);
+        return;
+    }
+
+    if gk == TY_TUPLE {
+        let g_fc = unsafe { (*gt).field_count };
+        let s_fc = unsafe { (*st).field_count };
+        if g_fc == s_fc {
+            let g_fields = unsafe { (*gt).fields };
+            let s_fields = unsafe { (*st).fields };
+            let mut i: usize = 0;
+            while (i < g_fc) {
+                let gf = unsafe { (*typeid_at(g_fields, i)).v };
+                let sf = unsafe { (*typeid_at(s_fields, i)).v };
+                deduce_args(TypeId { v: gf }, TypeId { v: sf }, ti, out_args, arg_count);
+                i = i + 1;
+            }
+        }
+        return;
+    }
+
+    if gk == TY_FN {
+        let g_pc = unsafe { (*gt).param_count };
+        let s_pc = unsafe { (*st).param_count };
+        if g_pc == s_pc {
+            let g_params = unsafe { (*gt).param_types };
+            let s_params = unsafe { (*st).param_types };
+            let mut i: usize = 0;
+            while (i < g_pc) {
+                let gp = unsafe { (*typeid_at(g_params, i)).v };
+                let sp = unsafe { (*typeid_at(s_params, i)).v };
+                deduce_args(TypeId { v: gp }, TypeId { v: sp }, ti, out_args, arg_count);
+                i = i + 1;
+            }
+            let g_ret = unsafe { (*gt).ret_type.v };
+            let s_ret = unsafe { (*st).ret_type.v };
+            deduce_args(TypeId { v: g_ret }, TypeId { v: s_ret }, ti, out_args, arg_count);
+        }
+        return;
+    }
+
+    if gk == TY_STRUCT || gk == TY_ENUM {
+        let g_def = unsafe { (*gt).def as usize };
+        let s_def = unsafe { (*st).def as usize };
+        if g_def == s_def {
+            let g_ac = unsafe { (*gt).arg_count };
+            let s_ac = unsafe { (*st).arg_count };
+            if g_ac > 0 && g_ac == s_ac {
+                let g_args = unsafe { (*gt).args };
+                let s_args = unsafe { (*st).args };
+                let mut i: usize = 0;
+                while (i < g_ac) {
+                    let ga = unsafe { (*typeid_at(g_args, i)).v };
+                    let sa = unsafe { (*typeid_at(s_args, i)).v };
+                    deduce_args(TypeId { v: ga }, TypeId { v: sa }, ti, out_args, arg_count);
+                    i = i + 1;
+                }
+            } else if gk == TY_STRUCT {
+                let g_fc = unsafe { (*gt).field_count };
+                let s_fc = unsafe { (*st).field_count };
+                if g_fc == s_fc {
+                    let g_fields = unsafe { (*gt).fields };
+                    let s_fields = unsafe { (*st).fields };
+                    let mut i: usize = 0;
+                    while (i < g_fc) {
+                        let gf = unsafe { (*typeid_at(g_fields, i)).v };
+                        let sf = unsafe { (*typeid_at(s_fields, i)).v };
+                        deduce_args(TypeId { v: gf }, TypeId { v: sf }, ti, out_args, arg_count);
+                        i = i + 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn write_u32_decimal(buf: *mut u8, offset: usize, val: u32) -> usize {
+    if val == 0u32 {
+        unsafe {
+            *(buf + offset) = 48u8;
+        }
+        return offset + 1;
+    }
+    let mut tmp: [12]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut dlen: usize = 0;
+    let mut cur: u32 = val;
+    while (cur > 0u32) {
+        let digit = (cur % 10u32) as u8;
+        tmp[dlen] = 48u8 + digit;
+        dlen = dlen + 1;
+        cur = cur / 10u32;
+    }
+    let mut i: usize = 0;
+    while (i < dlen) {
+        let rev_idx = dlen - 1 - i;
+        unsafe {
+            *(buf + offset + i) = tmp[rev_idx];
+        }
+        i = i + 1;
+    }
+    offset + dlen
+}
+
+pub fn mangle_anon_fn_name(str_in: mut_view<StrInterner>, sym: SymbolId) -> StrId {
+    let buf = arena_alloc_raw(mut_view(str_in.bytes), 32, 1);
+    unsafe {
+        *(buf + 0) = 95u8;
+        *(buf + 1) = 95u8;
+        *(buf + 2) = 97u8;
+        *(buf + 3) = 120u8;
+        *(buf + 4) = 95u8;
+        *(buf + 5) = 102u8;
+        *(buf + 6) = 110u8;
+        *(buf + 7) = 95u8;
+    }
+    let end_off = write_u32_decimal(buf, 8, sym.v);
+    interner_intern_bytes(mut_view(*str_in), buf as *const u8, end_off)
+}
+
+pub fn mangle_instance_name(
+    str_in: mut_view<StrInterner>,
+    orig_name: StrId,
+    orig_sym: SymbolId,
+    arg_count: usize,
+    counter: u32
+) -> StrId {
+    let mut base_id = StrId { v: orig_name.v };
+    if base_id.v == 0u32 {
+        base_id = mangle_anon_fn_name(mut_view(*str_in), orig_sym);
+    }
+    if arg_count == 0 {
+        return base_id;
+    }
+    let base_sv = interner_get(view(*str_in), base_id);
+    let base_len: usize = base_sv.len;
+    let base_ptr: *const u8 = base_sv.ptr;
+    let buf = arena_alloc_raw(mut_view(str_in.bytes), base_len + 24, 1);
+    if base_len > 0 && (base_ptr as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(base_ptr, buf, base_len);
+        }
+    }
+    let mut off = base_len;
+    unsafe {
+        *(buf + off) = 95u8;
+        *(buf + off + 1) = 73u8;
+    }
+    off = write_u32_decimal(buf, off + 2, counter);
+    unsafe {
+        *(buf + off) = 69u8;
+    }
+    off = off + 1;
+    interner_intern_bytes(mut_view(*str_in), buf as *const u8, off)
+}
+
+pub fn mangle_collision_name(
+    str_in: mut_view<StrInterner>,
+    base_name: StrId,
+    sym: SymbolId
+) -> StrId {
+    let base_sv = interner_get(view(*str_in), base_name);
+    let base_len: usize = base_sv.len;
+    let base_ptr: *const u8 = base_sv.ptr;
+    let buf = arena_alloc_raw(mut_view(str_in.bytes), base_len + 20, 1);
+    if base_len > 0 && (base_ptr as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(base_ptr, buf, base_len);
+        }
+    }
+    let mut off = base_len;
+    unsafe {
+        *(buf + off) = 95u8;
+    }
+    off = write_u32_decimal(buf, off + 1, sym.v);
+    interner_intern_bytes(mut_view(*str_in), buf as *const u8, off)
+}
+
+pub fn mangle_drop_name(
+    str_in: mut_view<StrInterner>,
+    self_type_name: view<StrView>
+) -> StrId {
+    let s_len: usize = self_type_name.len;
+    let s_ptr: *const u8 = self_type_name.ptr;
+    let mut clean_len: usize = 0;
+    while (clean_len < s_len) {
+        let ch = unsafe { *(s_ptr + clean_len) };
+        if ch == 60u8 || ch == 32u8 {
+            break;
+        }
+        clean_len = clean_len + 1;
+    }
+    let buf = arena_alloc_raw(mut_view(str_in.bytes), clean_len + 6, 1);
+    if clean_len > 0 && (s_ptr as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(s_ptr, buf, clean_len);
+        }
+    }
+    unsafe {
+        *(buf + clean_len + 0) = 95u8;
+        *(buf + clean_len + 1) = 100u8;
+        *(buf + clean_len + 2) = 114u8;
+        *(buf + clean_len + 3) = 111u8;
+        *(buf + clean_len + 4) = 112u8;
+    }
+    interner_intern_bytes(mut_view(*str_in), buf as *const u8, clean_len + 5)
+}
+
+pub fn mangle_structural_args(
+    str_in: mut_view<StrInterner>,
+    base_name: StrId,
+    args: view<GenericArgsSlice>
+) -> StrId {
+    let a_cnt: usize = args.count;
+    let a_ptr: *mut TypeId = args.args;
+    if a_cnt == 0 || (a_ptr as usize) == 0 {
+        return base_name;
+    }
+    let base_sv = interner_get(view(*str_in), base_name);
+    let base_len: usize = base_sv.len;
+    let base_ptr: *const u8 = base_sv.ptr;
+    let cap = base_len + 8 + (((a_cnt as isize) * 14isize) as usize);
+    let buf = arena_alloc_raw(mut_view(str_in.bytes), cap, 1);
+    if base_len > 0 && (base_ptr as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(base_ptr, buf, base_len);
+        }
+    }
+    let mut off = base_len;
+    unsafe {
+        *(buf + off) = 95u8;
+        *(buf + off + 1) = 73u8;
+    }
+    off = off + 2;
+    let mut i: usize = 0;
+    while (i < a_cnt) {
+        let av = unsafe { (*typeid_at(a_ptr, i)).v };
+        unsafe {
+            *(buf + off) = 95u8;
+        }
+        off = write_u32_decimal(buf, off + 1, av);
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + off) = 95u8;
+        *(buf + off + 1) = 69u8;
+    }
+    off = off + 2;
+    interner_intern_bytes(mut_view(*str_in), buf as *const u8, off)
+}
+
+pub fn mono_engine_init(eng: mut_view<MonoEngine>, arena: *mut Arena) {
+    eng.arena = arena;
+    eng.instances_head = 0 as *mut MonoInstance;
+    eng.instances_tail = 0 as *mut MonoInstance;
+    eng.instance_count = 0;
+    eng.work_head = 0 as *mut MonoInstance;
+    eng.work_tail = 0 as *mut MonoInstance;
+    eng.next_counter = 1u32;
+    eng.next_sym_id = MONO_FIRST_SYM_ID;
+}
+
+pub fn mono_find_instance(
+    eng: view<MonoEngine>,
+    orig: *const HirItem,
+    args: view<GenericArgsSlice>
+) -> *mut MonoInstance {
+    let mut cur: *mut MonoInstance = eng.instances_head;
+    while ((cur as usize) != 0) {
+        let cur_orig = unsafe { (*cur).orig_item as usize };
+        if cur_orig == (orig as usize) {
+            let eq = unsafe { generic_args_eq(view((*cur).args), args) };
+            if eq {
+                return cur;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    0 as *mut MonoInstance
+}
+
+fn clone_hir_item_for_mono(
+    arena: mut_view<Arena>,
+    orig: *const HirItem,
+    new_sym: SymbolId,
+    new_name: StrId
+) -> *mut HirItem {
+    let bytes = size_of<HirItem>();
+    let copy = arena_alloc_raw(mut_view(*arena), bytes, align_of<HirItem>()) as *mut HirItem;
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(orig as *const u8, copy as *mut u8, bytes);
+        (*copy).symbol.v = new_sym.v;
+        (*copy).name.v = new_name.v;
+        (*copy).generic_params = 0 as *mut HirGenericParams;
+        (*copy).next = 0 as *mut HirItem;
+    }
+    copy
+}
+
+pub fn mono_find_or_create_inst(
+    eng: mut_view<MonoEngine>,
+    str_in: mut_view<StrInterner>,
+    orig: *mut HirItem,
+    args: view<GenericArgsSlice>
+) -> *mut MonoInstance {
+    if (orig as usize) == 0 {
+        return 0 as *mut MonoInstance;
+    }
+    let existing = mono_find_instance(view(*eng), orig, args);
+    if (existing as usize) != 0 {
+        return existing;
+    }
+
+    let inst = unsafe {
+        arena_alloc_raw(
+            mut_view(*eng.arena),
+            size_of<MonoInstance>(),
+            align_of<MonoInstance>()
+        ) as *mut MonoInstance
+    };
+
+    let ac: usize = args.count;
+    let a_ptr: *mut TypeId = args.args;
+    let mut copied_args: *mut TypeId = 0 as *mut TypeId;
+    if ac > 0 && (a_ptr as usize) != 0 {
+        let abytes = (((ac as isize) * (size_of<TypeId>() as isize)) as usize);
+        copied_args = unsafe {
+            arena_alloc_raw(mut_view(*eng.arena), abytes, align_of<TypeId>()) as *mut TypeId
+        };
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(a_ptr as *const u8, copied_args as *mut u8, abytes);
+        }
+    }
+
+    let orig_name_v = unsafe { (*orig).name.v };
+    let orig_sym_v = unsafe { (*orig).symbol.v };
+    let mut m_sym_v: u32 = orig_sym_v;
+    let mut m_name_v: u32 = orig_name_v;
+    let mut new_it: *mut HirItem = orig;
+
+    if ac == 0 {
+        let m_id = mangle_instance_name(
+            mut_view(*str_in),
+            StrId { v: orig_name_v },
+            SymbolId { v: orig_sym_v },
+            0,
+            0u32
+        );
+        m_name_v = m_id.v;
+    } else {
+        m_sym_v = eng.next_sym_id;
+        eng.next_sym_id = m_sym_v + 1u32;
+        let cnt = eng.next_counter;
+        eng.next_counter = cnt + 1u32;
+        let m_id = mangle_instance_name(
+            mut_view(*str_in),
+            StrId { v: orig_name_v },
+            SymbolId { v: orig_sym_v },
+            ac,
+            cnt
+        );
+        m_name_v = m_id.v;
+        new_it = unsafe {
+            clone_hir_item_for_mono(
+                mut_view(*eng.arena),
+                orig,
+                SymbolId { v: m_sym_v },
+                StrId { v: m_name_v }
+            )
+        };
+    }
+
+    unsafe {
+        (*inst).orig_item = orig;
+        (*inst).new_item = new_it;
+        (*inst).args.args = copied_args;
+        (*inst).args.count = ac;
+        (*inst).mangled_sym.v = m_sym_v;
+        (*inst).mangled_name.v = m_name_v;
+        (*inst).mir_body = 0;
+        (*inst).next = 0 as *mut MonoInstance;
+        (*inst).work_next = 0 as *mut MonoInstance;
+        (*inst).in_worklist = true;
+    }
+
+    if (eng.instances_tail as usize) != 0 {
+        unsafe {
+            (*eng.instances_tail).next = inst;
+        }
+    } else {
+        eng.instances_head = inst;
+    }
+    eng.instances_tail = inst;
+    let prev_count: usize = eng.instance_count;
+    eng.instance_count = prev_count + 1;
+
+    if (eng.work_tail as usize) != 0 {
+        unsafe {
+            (*eng.work_tail).work_next = inst;
+        }
+    } else {
+        eng.work_head = inst;
+    }
+    eng.work_tail = inst;
+
+    inst
+}
+
+pub fn mono_worklist_is_empty(eng: view<MonoEngine>) -> bool {
+    (eng.work_head as usize) == 0
+}
+
+pub fn mono_pop_worklist(eng: mut_view<MonoEngine>) -> *mut MonoInstance {
+    let head = eng.work_head;
+    if (head as usize) == 0 {
+        return 0 as *mut MonoInstance;
+    }
+    let next_w = unsafe { (*head).work_next };
+    eng.work_head = next_w;
+    if (next_w as usize) == 0 {
+        eng.work_tail = 0 as *mut MonoInstance;
+    }
+    unsafe {
+        (*head).work_next = 0 as *mut MonoInstance;
+        (*head).in_worklist = false;
+    }
+    head
+}
+
+pub fn mono_resolve_trait_or_impl_method(
+    hir: view<HirFile>,
+    ti: view<TypeInterner>,
+    str_in: view<StrInterner>,
+    db: view<SourceDatabase>,
+    receiver_ty: TypeId,
+    method_name: view<StrView>
+) -> *mut HirItem {
+    let rec_v = receiver_ty.v;
+    let m_len: usize = method_name.len;
+    if rec_v == 0u32 || m_len == 0 {
+        return 0 as *mut HirItem;
+    }
+    let mut it: *mut HirItem = hir.items;
+    while ((it as usize) != 0) {
+        if unsafe { (*it).kind } == HIR_ITEM_IMPL {
+            if impl_matches_receiver(ti, str_in, it, (TypeId { v: rec_v })) {
+                let mut m: *mut HirItem = unsafe { (*it).members };
+                while ((m as usize) != 0) {
+                    if unsafe { (*m).kind } == HIR_ITEM_FN {
+                        let m_name = hir_item_name_sv(m, str_in, db);
+                        if sv_eq(view(m_name), method_name) {
+                            return m;
+                        }
+                    }
+                    m = unsafe { (*m).next };
+                }
+                let tp = unsafe { (*it).trait_path };
+                if (tp as usize) != 0 && unsafe { (*tp).kind } == HIR_TYPE_PATH {
+                    let tr_it = find_trait_by_type_path(hir, tp, str_in, db);
+                    if (tr_it as usize) != 0 {
+                        let def_m = find_trait_default_method(hir, tr_it, method_name, str_in, db);
+                        if (def_m as usize) != 0 {
+                            return def_m;
+                        }
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *mut HirItem
+}
+
+fn item_is_non_generic_fn(it: *const HirItem) -> bool {
+    if (it as usize) == 0 {
+        return false;
+    }
+    if unsafe { (*it).kind } != HIR_ITEM_FN {
+        return false;
+    }
+    if (unsafe { (*it).body as usize }) == 0 {
+        return false;
+    }
+    let gps = unsafe { (*it).generic_params };
+    if (gps as usize) == 0 {
+        return true;
+    }
+    (unsafe { (*gps).params as usize }) == 0
+}
+
+pub fn mono_seed_hir_items(
+    eng: mut_view<MonoEngine>,
+    hir: view<HirFile>,
+    str_in: mut_view<StrInterner>,
+    db: view<SourceDatabase>
+) {
+    let empty = GenericArgsSlice { args: 0 as *mut TypeId, count: 0 };
+    let mut it: *mut HirItem = hir.items;
+    while ((it as usize) != 0) {
+        let ik = unsafe { (*it).kind };
+        if item_is_non_generic_fn(it) {
+            mono_find_or_create_inst(mut_view(*eng), mut_view(*str_in), it, view(empty));
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while ((m as usize) != 0) {
+                if item_is_non_generic_fn(m) {
+                    mono_find_or_create_inst(mut_view(*eng), mut_view(*str_in), m, view(empty));
+                }
+                m = unsafe { (*m).next };
+            }
+            let tp = unsafe { (*it).trait_path };
+            if (tp as usize) != 0 && unsafe { (*tp).kind } == HIR_TYPE_PATH {
+                let tr_it = find_trait_by_type_path(hir, tp, view(*str_in), db);
+                if (tr_it as usize) != 0 {
+                    let mut tm: *mut HirItem = unsafe { (*tr_it).members };
+                    while ((tm as usize) != 0) {
+                        if item_is_non_generic_fn(tm) {
+                            let tm_name = hir_item_name_sv(tm, view(*str_in), db);
+                            let mut overridden: bool = false;
+                            let mut im: *mut HirItem = unsafe { (*it).members };
+                            while ((im as usize) != 0) {
+                                if unsafe { (*im).kind } == HIR_ITEM_FN {
+                                    let im_name = hir_item_name_sv(im, view(*str_in), db);
+                                    if sv_eq(view(tm_name), view(im_name)) {
+                                        overridden = true;
+                                        break;
+                                    }
+                                }
+                                im = unsafe { (*im).next };
+                            }
+                            if !overridden {
+                                mono_find_or_create_inst(
+                                    mut_view(*eng),
+                                    mut_view(*str_in),
+                                    tm,
+                                    view(empty)
+                                );
+                            }
+                        }
+                        tm = unsafe { (*tm).next };
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
+pub fn mono_dedup_instance_names(
+    eng: mut_view<MonoEngine>,
+    str_in: mut_view<StrInterner>
+) {
+    let mut i1: *mut MonoInstance = eng.instances_head;
+    while ((i1 as usize) != 0) {
+        let mut i2: *mut MonoInstance = unsafe { (*i1).next };
+        while ((i2 as usize) != 0) {
+            let n1 = unsafe { (*i1).mangled_name.v };
+            let n2 = unsafe { (*i2).mangled_name.v };
+            if n1 != 0u32 && n1 == n2 {
+                let sym2_v = unsafe { (*i2).mangled_sym.v };
+                let dedup = mangle_collision_name(
+                    mut_view(*str_in),
+                    StrId { v: n2 },
+                    SymbolId { v: sym2_v }
+                );
+                unsafe {
+                    (*i2).mangled_name.v = dedup.v;
+                    let new_it2 = (*i2).new_item;
+                    let orig_it2 = (*i2).orig_item;
+                    if (new_it2 as usize) != 0 && (new_it2 as usize) != (orig_it2 as usize) {
+                        (*new_it2).name.v = dedup.v;
+                    }
+                }
+            }
+            i2 = unsafe { (*i2).next };
+        }
+        i1 = unsafe { (*i1).next };
+    }
+}

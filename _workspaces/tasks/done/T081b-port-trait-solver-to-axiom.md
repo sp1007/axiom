@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T081a]
 priority: 115
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/traits, tests/selfhost/traits]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-GEN-100, REQ-TRT-139]
+started: 2026-10-15 12:06:35
+finished: 2026-10-15 12:06:55
 ---
 # T081b — Port trait solver & monomorphization engine to Axiom
 
@@ -38,3 +40,7 @@ Port trait solver, static dispatch resolution, and generic monomorphization (`co
 - `model: opus`: Porting trait solver requires semantic precision (model policy).
 - Sub-task of T081 split per ADR-0005 §8 and SPEC-20 §4.5.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-15 12:06:35 started (attempt 1) axiom-semantics
+- 2026-10-15 12:06:55 finished without commit (manual) -> done; run `taskctl commit` next
