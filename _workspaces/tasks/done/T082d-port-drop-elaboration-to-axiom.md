@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082c]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/mir/drop.ax, tests/selfhost/drop]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRP-183]
+started: 2026-10-16 23:51:50
+finished: 2026-10-17 02:30:22
 ---
 # T082d — Port drop elaboration and cleanup edges to Axiom
 
@@ -39,3 +41,9 @@ Port drop elaboration, drop flag tracking, and cleanup blocks (`compiler/mir/dro
 - `model: opus`: Drop elaboration requires semantic precision (model policy).
 - Sub-task of T082 split per ADR-0005 §8 and SPEC-20 §4.6.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-16 22:22:23 started (attempt 1) T082d-impl
+- 2026-10-16 23:51:04 requeue: session limit 429, resets 23:50; work kept in files (infrastructure failure: attempt refunded)
+- 2026-10-16 23:51:50 started (attempt 1) T082d-impl
+- 2026-10-17 02:30:22 accepted by QA -> done

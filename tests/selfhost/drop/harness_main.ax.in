@@ -1,0 +1,367 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.source.span.Span
+use compiler.source.manager.SourceDatabase
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.ax_diag_render_human
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_new
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirType
+use compiler.hir.hir.hir_alloc_item
+use compiler.hir.hir.hir_alloc_type
+use compiler.resolve_hir.session.session_append_std_prelude
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.Thir
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.typeck.session.session_typeck_into
+use compiler.traits.mono.MonoEngine
+use compiler.mir.mir.mir_print
+use compiler.mir.builder.mir_build_fn
+use compiler.mir.drop.mir_drop_elaborate
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// Per case five blobs: fixture path, fixture source, expected MIR before drop elaboration
+// (`axiom0 inspect --emit=mir`), expected MIR after it (C `ax_mir_drop_elaborate`), and the
+// expected MIR of the synthetic-destructor pass (empty when the case has none).
+@DATA_TABLE@
+@OFFSET_TABLE@
+// 1 when the case also runs the synthetic-destructor pass.
+@SYNTH_TABLE@
+
+const CASE_COUNT: usize = @CASE_COUNT@;
+const BLOBS_PER_CASE: usize = 5;
+
+// Passes over one fixture.
+const PASS_BUILD: u8 = 0u8;
+const PASS_DROP: u8 = 1u8;
+const PASS_SYNTH: u8 = 2u8;
+
+// Symbol of the synthesized `Guard.drop` (no real item has it: fixtures stay far below).
+const SYNTH_DROP_SYMBOL: u32 = 7001u32;
+
+// Arenas, session state and the output buffer shared by every case.
+struct DropHarness {
+    sess: CompilerSession,
+    parse_arena: Arena,
+    resolve_arena: Arena,
+    hir_arena: Arena,
+    mir_arena: Arena,
+    scratch: Arena,
+    rmap: ResolveMap,
+    thir_ptr: *mut Thir,
+    out: DiagBuffer,
+}
+
+fn blob(a: mut_view<Arena>, blob_idx: usize) -> StrView {
+    let start = DROP_OFF[blob_idx] as usize;
+    let end = DROP_OFF[blob_idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(a, n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = DROP_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn dump_sv(sv: StrView) {
+    let s: str = unsafe { *(address_of(sv) as *const str) };
+    print(s);
+}
+
+fn bytes_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if (unsafe { *(a + i) }) != (unsafe { *(b + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn empty_node_map() -> NodeMap {
+    NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+fn zero_span() -> Span {
+    Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+}
+
+// "Drop", "Guard", "drop": the names of the synthesized impl, as bytes at SYNTH_NAMES[start..start + len].
+const SYNTH_NAMES: [13]u8 = [68u8, 114u8, 111u8, 112u8, 71u8, 117u8, 97u8, 114u8, 100u8, 100u8, 114u8, 111u8, 112u8];
+
+fn intern_name(arena: mut_view<Arena>, str_in: *mut StrInterner, start: usize, len: usize) -> StrId {
+    let bytes = arena_alloc_raw(mut_view(*arena), len, 1);
+    let mut i: usize = 0;
+    while i < len {
+        unsafe {
+            *(bytes + i) = SYNTH_NAMES[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe { interner_intern_bytes(mut_view(*str_in), bytes as *const u8, len) }
+}
+
+// Prepends `impl Drop for Guard { fn drop(..); }` to the HIR item list. Only names are filled in,
+// so drop elaboration matches the impl without a source database.
+fn synthesize_guard_drop_impl(arena: mut_view<Arena>, str_in: *mut StrInterner, hir: mut_view<HirFile>) {
+    let trait_path: *mut HirType = hir_alloc_type(mut_view(*arena), HIR_TYPE_PATH, zero_span());
+    let self_type: *mut HirType = hir_alloc_type(mut_view(*arena), HIR_TYPE_PATH, zero_span());
+    let method: *mut HirItem = hir_alloc_item(mut_view(*arena), HIR_ITEM_FN, zero_span());
+    let imp: *mut HirItem = hir_alloc_item(mut_view(*arena), HIR_ITEM_IMPL, zero_span());
+    let drop_trait_name = intern_name(mut_view(*arena), str_in, 0, 4);
+    let guard_name = intern_name(mut_view(*arena), str_in, 4, 5);
+    let drop_fn_name = intern_name(mut_view(*arena), str_in, 9, 4);
+    unsafe {
+        (*trait_path).path.name.v = drop_trait_name.v;
+        (*self_type).path.name.v = guard_name.v;
+        (*method).name.v = drop_fn_name.v;
+        (*method).symbol.v = SYNTH_DROP_SYMBOL;
+        (*imp).trait_path = trait_path;
+        (*imp).self_type = self_type;
+        (*imp).members = method;
+        (*imp).next = hir.items;
+    }
+    hir.items = imp;
+}
+
+// Lowers one fixture to MIR (every top-level fn of the fixture file, in item order, like
+// `axiom0 inspect --emit=mir`) and prints it into h.out. PASS_DROP runs mir_drop_elaborate on each
+// body right after it is built (like the C oracle); PASS_SYNTH first adds the synthetic destructor
+// impl and elaborates without a source database. Returns 0 or an error code.
+fn emit_mir(
+    h: mut_view<DropHarness>,
+    path_sv: StrView,
+    src_sv: StrView,
+    pass: u8
+) -> i32 {
+    let mut fid = FileId { v: 0u32 };
+    let src_for_prelude = StrView { ptr: src_sv.ptr, len: src_sv.len };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(h.sess),
+        mut_view(h.parse_arena),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        src_sv,
+        mut_view(fid)
+    );
+    // The std prelude (core types, Drop, ...) is part of every axiom0 compilation.
+    session_append_std_prelude(
+        mut_view(h.sess),
+        mut_view(h.parse_arena),
+        mut_view(parse_res.ast),
+        src_for_prelude
+    );
+    session_resolve_ast_into(mut_view(h.sess), mut_view(h.resolve_arena), view(parse_res.ast), mut_view(h.rmap));
+    let mut hir = session_lower_hir(mut_view(h.sess), mut_view(h.hir_arena), view(parse_res.ast), view(h.rmap));
+    if session_error_count(view(h.sess)) != 0 {
+        resolve_map_free(mut_view(h.rmap));
+        return 100;
+    }
+    unsafe {
+        session_typeck_into(mut_view(h.sess), view(hir), mut_view(*h.thir_ptr));
+    }
+    if session_error_count(view(h.sess)) != 0 {
+        ax_diag_render_human(view(h.sess.diag_sink), view(h.sess.source_db), mut_view(h.out));
+        dump_sv(path_sv);
+        print("\n--- TYPECK DIAG ---\n");
+        dump_sv(StrView { ptr: h.out.ptr as *const u8, len: h.out.len });
+        resolve_map_free(mut_view(h.rmap));
+        return 200;
+    }
+
+    let thir_ptr = h.thir_ptr;
+    let str_in_ptr = unsafe { address_of_mut(h.sess.interner) as *mut StrInterner };
+    let mut db_ptr = unsafe { address_of(h.sess.source_db) as *const SourceDatabase };
+    if pass == PASS_SYNTH {
+        synthesize_guard_drop_impl(mut_view(h.hir_arena), str_in_ptr, mut_view(hir));
+        db_ptr = 0 as *const SourceDatabase;
+    }
+    let hir_ptr = unsafe { address_of(hir.items) as *const HirFile };
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let it_file = unsafe { (*it).span.file.v };
+        let is_fn = (unsafe { (*it).kind }) == HIR_ITEM_FN;
+        if is_fn && (fid.v == 0u32 || it_file == 0u32 || it_file == fid.v) {
+            let body = mir_build_fn(
+                mut_view(h.mir_arena),
+                it,
+                thir_ptr,
+                hir_ptr,
+                str_in_ptr,
+                db_ptr,
+                0 as *mut MonoEngine
+            );
+            if (body as usize) != 0 {
+                if pass != PASS_BUILD {
+                    unsafe {
+                        mir_drop_elaborate(
+                            mut_view(*body),
+                            mut_view(*thir_ptr),
+                            view(hir),
+                            db_ptr,
+                            view(*str_in_ptr),
+                            mut_view(h.mir_arena)
+                        );
+                    }
+                }
+                mir_print(mut_view(h.out), unsafe { view(*body) });
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    resolve_map_free(mut_view(h.rmap));
+    0
+}
+
+// One fresh compilation of fixture `case_idx`, compared with the golden of `pass`.
+fn run_pass(h: mut_view<DropHarness>, case_idx: usize, pass: u8) -> i32 {
+    session_init(mut_view(h.sess));
+    unsafe {
+        thir_init(mut_view(*h.thir_ptr));
+    }
+    h.out.len = 0;
+
+    let base = case_idx * BLOBS_PER_CASE;
+    let path_sv = blob(mut_view(h.scratch), base);
+    let src_sv = blob(mut_view(h.scratch), base + 1);
+    let expected = blob(mut_view(h.scratch), base + 2 + (pass as usize));
+
+    let step_rc = emit_mir(
+        mut_view(*h),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len },
+        pass
+    );
+
+    let mut rc: i32 = 0;
+    if step_rc != 0 {
+        rc = step_rc + (case_idx as i32);
+    } else if !bytes_equal(h.out.ptr as *const u8, h.out.len, expected.ptr, expected.len) {
+        dump_sv(path_sv);
+        if pass == PASS_BUILD {
+            print("\n--- ACTUAL (before drop elaboration) ---\n");
+        } else if pass == PASS_DROP {
+            print("\n--- ACTUAL (after drop elaboration) ---\n");
+        } else {
+            print("\n--- ACTUAL (synthetic destructor) ---\n");
+        }
+        dump_sv(StrView { ptr: h.out.ptr as *const u8, len: h.out.len });
+        print("--- EXPECTED ---\n");
+        dump_sv(expected);
+        rc = 300 + 100 * (pass as i32) + (case_idx as i32);
+    }
+
+    unsafe {
+        thir_free(mut_view(*h.thir_ptr));
+    }
+    arena_reset(mut_view(h.mir_arena));
+    arena_reset(mut_view(h.hir_arena));
+    arena_reset(mut_view(h.resolve_arena));
+    arena_reset(mut_view(h.parse_arena));
+    arena_reset(mut_view(h.scratch));
+    session_free(mut_view(h.sess));
+    rc
+}
+
+fn new_arena(chunk: usize) -> Arena {
+    let mut a = arena_with_chunk_size(chunk);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+    a
+}
+
+pub fn main() -> i32 {
+    let mut perm_arena = new_arena(262144);
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    let mut out = diag_buf_new();
+    out.ptr = arena_alloc_raw(mut_view(perm_arena), 262144, 1);
+    out.cap = 262144;
+    let mut h = DropHarness {
+        sess: session_new(),
+        parse_arena: new_arena(262144),
+        resolve_arena: new_arena(262144),
+        hir_arena: new_arena(262144),
+        mir_arena: new_arena(262144),
+        scratch: new_arena(65536),
+        rmap: ResolveMap {
+            node_map: empty_node_map(),
+            module_access_nodes: empty_node_map(),
+            extern_nodes: empty_node_map(),
+            next_symbol_v: 1u32,
+            next_std_symbol_v: 10000u32,
+            naming_ctx: 0 as *mut NamingCtx,
+        },
+        thir_ptr: thir_ptr,
+        out: out,
+    };
+
+    // Every case runs even after a failure, so one run shows all mismatches. The exit code is the
+    // first failure's: 300 + case (builder differs from the C builder), 400 + case (drop
+    // elaboration differs from the C elaboration), 500 + case (synthetic destructor golden).
+    let mut first_rc: i32 = 0;
+    let mut idx: usize = 0;
+    while idx < CASE_COUNT {
+        let mut pass: u8 = PASS_BUILD;
+        let last_pass: u8 = if DROP_SYNTH[idx] != 0u32 { PASS_SYNTH } else { PASS_DROP };
+        while pass <= last_pass {
+            let rc = run_pass(mut_view(h), idx, pass);
+            if rc != 0 && first_rc == 0 {
+                first_rc = rc;
+            }
+            pass = pass + 1u8;
+        }
+        idx = idx + 1;
+    }
+    if first_rc != 0 {
+        return first_rc;
+    }
+
+    arena_destroy(mut_view(h.scratch));
+    arena_destroy(mut_view(h.mir_arena));
+    arena_destroy(mut_view(h.hir_arena));
+    arena_destroy(mut_view(h.resolve_arena));
+    arena_destroy(mut_view(h.parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK drop elaboration @GROUP@ (@CASE_COUNT@ cases)\n");
+    0
+}
