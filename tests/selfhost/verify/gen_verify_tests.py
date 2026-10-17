@@ -1,0 +1,407 @@
+#!/usr/bin/env python3
+"""Generator for the selfhost MIR verifier tests (T082e).
+
+    python tests/selfhost/verify/gen_verify_tests.py
+        Generates:
+          - tests/selfhost/verify/qa_verify_mir.ax:
+            Differential test over all 21 `.mir` fixtures in `tests/verify/` and `tests/verify/own/`
+            plus valid `.mir` goldens and unit tests for CFG, projections, aggregates, casts,
+            call signatures, return types, ownership dataflow, capabilities, and drop flags.
+          - tests/selfhost/verify/qa_verify_pipeline.ax:
+            End-to-end selfhost pipeline test lowering `.ax` programs through `mir_build_fn` and
+            `mir_drop_elaborate` and verifying all resulting MIR bodies with `verify_mir`,
+            `verify_mir_own`, `verify_mir_cap`, and `verify_mir_drop_flags`.
+
+Run from the repository root. Files are written with LF line endings.
+"""
+import os
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
+REFERENCE_BUNDLE = "tests/selfhost/mir/qa_mir_builder_and_drop_a.ax"
+
+CORE_MODULES = [
+    ("compiler.kernel.id", "reference"),
+    ("compiler.kernel.hash", "reference"),
+    ("compiler.kernel.arena", "reference"),
+    ("compiler.kernel.interner", "reference"),
+    ("compiler.source.span", "reference"),
+    ("compiler.source.manager", "reference"),
+    ("compiler.diag.code", "reference"),
+    ("compiler.diag.emitter", "reference"),
+    ("compiler.diag.format", "reference"),
+    ("compiler.lex.token", "reference"),
+    ("compiler.syntax.ast", "reference"),
+    ("compiler.hir.hir", "reference"),
+    ("compiler.types.types", "reference"),
+    ("compiler.mir.mir", "compiler"),
+    ("compiler.verify.verifier", "compiler"),
+    ("compiler.verify", "compiler"),
+]
+
+PIPELINE_MODULES = [
+    ("compiler.kernel.id", "reference"),
+    ("compiler.kernel.hash", "reference"),
+    ("compiler.kernel.arena", "reference"),
+    ("compiler.kernel.interner", "reference"),
+    ("compiler.source.span", "reference"),
+    ("compiler.source.manager", "reference"),
+    ("compiler.diag.code", "reference"),
+    ("compiler.diag.emitter", "reference"),
+    ("compiler.diag.format", "reference"),
+    ("compiler.diag.json", "reference"),
+    ("compiler.kernel_source_diag.session", "reference"),
+    ("compiler.lex.token", "reference"),
+    ("compiler.lex.scanner", "reference"),
+    ("compiler.lexer.session", "reference"),
+    ("compiler.syntax.ast", "reference"),
+    ("compiler.syntax.parse", "reference"),
+    ("compiler.parser.session", "reference"),
+    ("compiler.resolve.symtab", "reference"),
+    ("compiler.resolve.rib", "reference"),
+    ("compiler.resolve.resolver", "reference"),
+    ("compiler.hir.hir", "reference"),
+    ("compiler.hir.lower", "reference"),
+    ("compiler.resolve_hir.session", "reference"),
+    ("compiler.types.types", "reference"),
+    ("compiler.types.layout", "reference"),
+    ("compiler.types.exhaust", "reference"),
+    ("compiler.traits.solver", "reference"),
+    ("compiler.traits.mono", "reference"),
+    ("compiler.types.typeck", "reference"),
+    ("compiler.types", "reference"),
+    ("compiler.traits", "reference"),
+    ("compiler.typeck.session", "reference"),
+    ("compiler.typeck", "reference"),
+    ("compiler.typeck_traits.session", "reference"),
+    ("compiler.typeck_traits", "reference"),
+    ("compiler.mir.mir", "compiler"),
+    ("compiler.mir.drop", "compiler"),
+    ("compiler.mir.builder", "compiler"),
+    ("compiler.mir", "compiler"),
+    ("compiler.verify.verifier", "compiler"),
+    ("compiler.verify", "compiler"),
+]
+
+PRELUDE = """\
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+const HEAP_ZERO_MEMORY: u32 = 8u32;
+const MIN_HEAP_ALLOC: usize = 16;
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if (h as usize) == 0 {
+        return 0 as *mut u8;
+    }
+    let alloc_bytes: usize = if size < MIN_HEAP_ALLOC { MIN_HEAP_ALLOC } else { size };
+    HeapAlloc(h, HEAP_ZERO_MEMORY, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if (p as usize) != 0 {
+        let h = GetProcessHeap();
+        if (h as usize) != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+"""
+
+# All 21 `.mir` fixtures under `tests/verify/` and `tests/verify/own/`, with their expected
+# diagnostic codes from `axiom0 check`.
+MIR_FIXTURES = [
+    ("tests/verify/bad_target.mir", ["AX_VERIFY_BAD_TARGET"]),
+    ("tests/verify/call_signature.mir", ["AX_VERIFY_CALL_SIGNATURE"]),
+    ("tests/verify/return_type.mir", []),
+    ("tests/verify/type_mismatch.mir", ["AX_VERIFY_TYPE_MISMATCH"]),
+    ("tests/verify/type_mismatch_binop.mir", ["AX_VERIFY_TYPE_MISMATCH"]),
+    ("tests/verify/type_mismatch_cast.mir", ["AX_VERIFY_TYPE_MISMATCH"]),
+    ("tests/verify/uninit_cond.mir", ["AX_VERIFY_UNINIT_USE"]),
+    ("tests/verify/uninit_use.mir", ["AX_VERIFY_UNINIT_USE"]),
+    ("tests/verify/unknown_local.mir", ["AX_VERIFY_UNKNOWN_LOCAL"]),
+    ("tests/verify/unknown_local_storage.mir", ["AX_VERIFY_UNKNOWN_LOCAL"]),
+    ("tests/verify/unterminated_block.mir", ["AX_VERIFY_UNTERMINATED_BLOCK"]),
+    ("tests/verify/own/call_unwind_owned.mir", ["AX_VERIFY_MISSING_DROP", "AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/conditional_move.mir", ["AX_VERIFY_USE_AFTER_MOVE", "AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/double_drop.mir", ["AX_VERIFY_DOUBLE_DROP"]),
+    ("tests/verify/own/missing_drop.mir", ["AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/missing_drop_no_unreachable.mir", ["AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/overwrite_owned.mir", ["AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/qa_conditional_double_drop.mir", ["AX_VERIFY_DOUBLE_DROP"]),
+    ("tests/verify/own/qa_loop_move.mir", ["AX_VERIFY_USE_AFTER_MOVE", "AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/own/return_moved.mir", ["AX_VERIFY_USE_AFTER_MOVE"]),
+    ("tests/verify/own/use_after_move.mir", [
+        "AX_VERIFY_USE_AFTER_MOVE",
+        "AX_VERIFY_MISSING_DROP",
+        "AX_VERIFY_MISSING_DROP",
+    ]),
+]
+
+
+def read_bytes(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def write_bytes(path, data):
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def compiler_module_files():
+    found = {}
+    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
+        for fn in files:
+            if not fn.endswith(".ax"):
+                continue
+            path = os.path.join(dirpath, fn)
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("module "):
+                        found[line.split()[1]] = path
+                        break
+    return found
+
+
+def reference_sections():
+    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
+    sections = {}
+    current = None
+    buf = []
+    for line in text.split("\n"):
+        if line.startswith("module "):
+            if current:
+                sections[current] = "\n".join(buf)
+            current = line.split()[1]
+            buf = [line]
+        elif current:
+            buf.append(line)
+    if current:
+        sections[current] = "\n".join(buf)
+    return sections
+
+
+def assemble_modules(mod_list):
+    files = compiler_module_files()
+    ref = reference_sections()
+    parts = []
+    for name, origin in mod_list:
+        src = read_bytes(files[name]).decode("utf-8") if origin == "compiler" else ref[name]
+        parts.append(src.rstrip("\n") + "\n")
+    return "\n".join(parts)
+
+
+def byte_table(name, data):
+    lines = ["const %s: [%d]u8 = [" % (name, len(data))]
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        lines.append("    " + ", ".join("%du8" % b for b in chunk) + ",")
+    lines.append("];")
+    return "\n".join(lines)
+
+
+def u32_table(name, values):
+    lines = ["const %s: [%d]u32 = [" % (name, max(1, len(values)))]
+    if not values:
+        lines.append("    0u32,")
+    else:
+        for i in range(0, len(values), 10):
+            chunk = values[i:i + 10]
+            lines.append("    " + ", ".join("%du32" % v for v in chunk) + ",")
+    lines.append("];")
+    return "\n".join(lines)
+
+
+UNIT_MIR_SNIPPETS = [
+    b"mir_body { bad_syntax }",
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#2;\n"
+        b"    let _1: type#8;\n"
+        b"    let _2: type#8;\n"
+        b"    let _3: type#4;\n"
+        b"    let _4: type#12;\n"
+        b"    let _5: type#8;\n"
+        b"    let _6: type#4;\n"
+        b"    let _7: type#10;\n"
+        b"    bb0: {\n"
+        b"        StorageLive(_7);\n"
+        b"        _1 = const 10: type#8;\n"
+        b"        _2 = const 20: type#8;\n"
+        b"        _3 = copy _1 < copy _2;\n"
+        b"        _4 = const 2: type#12;\n"
+        b"        _5 = copy _1 << copy _4;\n"
+        b"        _6 = overflows(copy _1 + copy _2);\n"
+        b"        _7 = const 0;\n"
+        b"        StorageDead(_7);\n"
+        b"        assert(copy _3 == true, \"cmp ok\") -> [return: bb1, unwind: bb0];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        switchInt(copy _5) -> [40: bb2, otherwise: bb2];\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#2;\n"
+        b"    let _1: type#8;\n"
+        b"    let _2: type#8;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 1: type#8;\n"
+        b"        _2 = copy _1 == copy _1;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#2;\n"
+        b"    let _1: type#8;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 0;\n"
+        b"        switchInt(copy _1) -> [0: bb5, otherwise: bb0];\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#2;\n"
+        b"    let _1: type#4;\n"
+        b"    bb0: {\n"
+        b"        _1 = const true;\n"
+        b"        assert(copy _1 == true, \"chk\") -> [return: bb0, unwind: bb9];\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    (
+        b"mir_body {\n"
+        b"    type 20 = fn(type#8) -> type#2;\n"
+        b"    let mut _0: type#2;\n"
+        b"    let _1: type#20;\n"
+        b"    let _2: type#4;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 0;\n"
+        b"        _2 = const true: type#4;\n"
+        b"        _0 = copy _1(copy _2) -> [return: bb1, unwind: bb0];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    bb0: {\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+]
+
+PIPE_BLOBS = [
+    b"tests/selfhost/verify/pipeline_input.ax",
+    (
+        b"struct Res {}\n"
+        b"fn helper(x: i32, flag: bool) -> i32 {\n"
+        b"    let r = Res {};\n"
+        b"    if flag { return x; }\n"
+        b"    0\n"
+        b"}\n"
+    ),
+]
+
+
+def pack_blobs(blobs):
+    offsets = [0]
+    for b in blobs:
+        offsets.append(offsets[-1] + len(b))
+    return b"".join(blobs), offsets
+
+
+def build_qa_verify_mir():
+    blobs = []
+    offsets = [0]
+    exp_counts = []
+    exp_code_offs = [0]
+    exp_codes = []
+
+    for rel_path, codes in MIR_FIXTURES:
+        raw = read_bytes(os.path.join(ROOT, *rel_path.split("/"))).replace(b"\r\n", b"\n")
+        blobs.append(raw)
+        offsets.append(offsets[-1] + len(raw))
+        exp_counts.append(len(codes))
+        exp_codes.extend(codes)
+        exp_code_offs.append(len(exp_codes))
+
+    data = b"".join(blobs)
+    code_lines = ["const FIXTURE_EXP_CODES: [%d]u32 = [" % len(exp_codes)]
+    for c in exp_codes:
+        code_lines.append("    %s," % c)
+    code_lines.append("];")
+
+    unit_data, unit_offs = pack_blobs(UNIT_MIR_SNIPPETS)
+
+    template = read_bytes(os.path.join(HERE, "harness_verify_mir.ax.in")).decode("utf-8")
+    main_src = (
+        template
+        .replace("@FIXTURE_COUNT@", str(len(MIR_FIXTURES)))
+        .replace("@FIXTURE_DATA@", byte_table("FIXTURE_DATA", data))
+        .replace("@FIXTURE_OFF@", u32_table("FIXTURE_OFF", offsets))
+        .replace("@FIXTURE_EXP_COUNTS@", u32_table("FIXTURE_EXP_COUNTS", exp_counts))
+        .replace("@FIXTURE_EXP_OFF@", u32_table("FIXTURE_EXP_OFF", exp_code_offs))
+        .replace("@FIXTURE_EXP_CODES@", "\n".join(code_lines))
+        .replace("@UNIT_MIR_DATA@", byte_table("UNIT_MIR_DATA", unit_data))
+        .replace("@UNIT_MIR_OFF@", u32_table("UNIT_MIR_OFF", unit_offs))
+    )
+
+    header = (
+        "// test: run\n"
+        "// timeout: 600\n"
+        "// stdout: OK verify mir (21 fixtures + unit checks)\\n\n"
+        "// Generated by tests/selfhost/verify/gen_verify_tests.py; do not edit.\n\n"
+    )
+    full_text = header + PRELUDE + "\n" + assemble_modules(CORE_MODULES) + "\n" + main_src
+    out_path = os.path.join(HERE, "qa_verify_mir.ax")
+    write_bytes(out_path, full_text.encode("utf-8"))
+    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+
+
+def build_qa_verify_pipeline():
+    pipe_data, pipe_offs = pack_blobs(PIPE_BLOBS)
+    template = read_bytes(os.path.join(HERE, "harness_verify_pipeline.ax.in")).decode("utf-8")
+    main_src = (
+        template
+        .replace("@PIPE_DATA@", byte_table("PIPE_DATA", pipe_data))
+        .replace("@PIPE_OFF@", u32_table("PIPE_OFF", pipe_offs))
+    )
+    header = (
+        "// test: run\n"
+        "// timeout: 1200\n"
+        "// stdout: OK verify pipeline\\n\n"
+        "// Generated by tests/selfhost/verify/gen_verify_tests.py; do not edit.\n\n"
+    )
+    full_text = header + PRELUDE + "\n" + assemble_modules(PIPELINE_MODULES) + "\n" + main_src
+    out_path = os.path.join(HERE, "qa_verify_pipeline.ax")
+    write_bytes(out_path, full_text.encode("utf-8"))
+    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+
+
+def main():
+    build_qa_verify_mir()
+    build_qa_verify_pipeline()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

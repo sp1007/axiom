@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082d]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/verify, tests/selfhost/verify]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-ERR-087]
+started: 2026-10-17 23:03:18
+finished: 2026-10-18 04:36:02
 ---
 # T082e — Port MIR verifier to Axiom
 
@@ -38,3 +40,9 @@ Port the MIR invariant verifier (`compiler/verify/`) from C to Axiom.
 - `model: opus`: MIR verification requires semantic precision (model policy).
 - Sub-task of T082 split per ADR-0005 §8 and SPEC-20 §4.6.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-17 21:39:33 started (attempt 1) T082e-impl
+- 2026-10-17 23:03:16 requeue: restart (not charged: attempt refunded)
+- 2026-10-17 23:03:18 started (attempt 1) T082e-impl
+- 2026-10-18 04:36:02 accepted by QA -> done

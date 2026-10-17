@@ -1,0 +1,332 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.source.manager.SourceDatabase
+use compiler.diag.code.AX_VERIFY_BAD_TARGET
+use compiler.diag.code.AX_VERIFY_RETURN_TYPE
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirFile
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.Thir
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.typeck.session.session_typeck_into
+use compiler.traits.mono.MonoEngine
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_term_zero
+use compiler.mir.builder.mir_build_fn
+use compiler.mir.drop.mir_drop_elaborate
+use compiler.verify.verify_mir
+use compiler.verify.verify_mir_own
+use compiler.verify.verify_mir_cap
+use compiler.verify.verify_mir_drop_flags
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+@PIPE_DATA@
+@PIPE_OFF@
+
+fn empty_node_map() -> NodeMap {
+    NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+fn pipe_blob(arena: mut_view<Arena>, idx: usize) -> StrView {
+    let start = PIPE_OFF[idx] as usize;
+    let end = PIPE_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = PIPE_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+unsafe fn diag_at(base: *mut Diagnostic, idx: usize) -> *mut Diagnostic {
+    let off = ((idx as isize) * (size_of<Diagnostic>() as isize)) as usize;
+    ((base as usize) + off) as *mut Diagnostic
+}
+
+fn new_arena(chunk: usize) -> Arena {
+    let mut a = arena_with_chunk_size(chunk);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+    a
+}
+
+fn run_verify_pipeline(
+    sess_ptr: *mut CompilerSession,
+    thir_ptr: *mut Thir,
+    perm_arena: mut_view<Arena>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>
+) -> i32 {
+    let mut rmap = ResolveMap {
+        node_map: empty_node_map(),
+        module_access_nodes: empty_node_map(),
+        extern_nodes: empty_node_map(),
+        next_symbol_v: 1u32,
+        next_std_symbol_v: 10000u32,
+        naming_ctx: 0 as *mut NamingCtx,
+    };
+
+    let path_sv = pipe_blob(mut_view(*perm_arena), 0);
+    let src_sv = pipe_blob(mut_view(*perm_arena), 1);
+
+    let mut fid = FileId { v: 0u32 };
+    let parse_res = session_parse_virtual_file(
+        unsafe { mut_view(*sess_ptr) },
+        mut_view(*parse_arena),
+        path_sv,
+        src_sv,
+        mut_view(fid)
+    );
+    session_resolve_ast_into(unsafe { mut_view(*sess_ptr) }, mut_view(*resolve_arena), view(parse_res.ast), mut_view(rmap));
+    let hir = session_lower_hir(unsafe { mut_view(*sess_ptr) }, mut_view(*hir_arena), view(parse_res.ast), view(rmap));
+
+    if (unsafe { (*sess_ptr).diag_sink.errors }) != 0 {
+        resolve_map_free(mut_view(rmap));
+        return 100;
+    }
+    unsafe {
+        session_typeck_into(mut_view(*sess_ptr), view(hir), mut_view(*thir_ptr));
+    }
+    if (unsafe { (*sess_ptr).diag_sink.errors }) != 0 {
+        resolve_map_free(mut_view(rmap));
+        return 200;
+    }
+
+    let str_in_ptr = unsafe { address_of_mut((*sess_ptr).interner) as *mut StrInterner };
+    let db_ptr = unsafe { address_of((*sess_ptr).source_db) as *const SourceDatabase };
+    let sink_ptr = unsafe { address_of_mut((*sess_ptr).diag_sink) as *mut DiagSink };
+    let hir_ptr = unsafe { address_of(hir.items) as *const HirFile };
+
+    let mut verified_fns: usize = 0;
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let it_file = unsafe { (*it).span.file.v };
+        let is_fn = (unsafe { (*it).kind }) == HIR_ITEM_FN;
+        if is_fn && (fid.v == 0u32 || it_file == 0u32 || it_file == fid.v) {
+            let body = mir_build_fn(
+                mut_view(*mir_arena),
+                it,
+                thir_ptr,
+                hir_ptr,
+                str_in_ptr,
+                db_ptr,
+                0 as *mut MonoEngine
+            );
+            if (body as usize) != 0 {
+                verified_fns = verified_fns + 1;
+
+                // 1. Verify pre-drop-elaboration MIR.
+                verify_mir(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) != 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 301;
+                }
+
+                // 2. Run drop elaboration and verify post-drop-elaboration MIR across all verifiers.
+                unsafe {
+                    mir_drop_elaborate(
+                        mut_view(*body),
+                        mut_view(*thir_ptr),
+                        view(hir),
+                        db_ptr,
+                        view(*str_in_ptr),
+                        mut_view(*mir_arena)
+                    );
+                }
+                verify_mir(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) != 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 302;
+                }
+                verify_mir_own(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) != 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 303;
+                }
+                verify_mir_cap(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) }
+                );
+                if (unsafe { (*sink_ptr).errors }) != 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 304;
+                }
+                verify_mir_drop_flags(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) != 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 305;
+                }
+
+                // 3. Corrupt `_0`'s type on the lowered function body and verify that `verify_mir`
+                // catches `AX_VERIFY_RETURN_TYPE`.
+                let loc0 = unsafe { mir_local_at((*body).locals, 0) };
+                let saved_ty_v = unsafe { (*loc0).ty.v };
+                unsafe {
+                    (*loc0).ty = TypeId { v: (*thir_ptr).interner.t_bool.v };
+                }
+                verify_mir(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) == 0 {
+                    resolve_map_free(mut_view(rmap));
+                    return 306;
+                }
+                let mut saw_ret_err = false;
+                let mut di: usize = 0;
+                let dlen = unsafe { (*sink_ptr).len };
+                while di < dlen {
+                    let d_ret = unsafe { diag_at((*sink_ptr).diags, di) };
+                    if (unsafe { (*d_ret).code.v }) == AX_VERIFY_RETURN_TYPE {
+                        saw_ret_err = true;
+                    }
+                    di = di + 1;
+                }
+                if !saw_ret_err {
+                    resolve_map_free(mut_view(rmap));
+                    return 307;
+                }
+                unsafe {
+                    (*loc0).ty = TypeId { v: saved_ty_v };
+                    (*sink_ptr).errors = 0;
+                    (*sink_ptr).len = 0;
+                }
+
+                // 4. Corrupt `bb0` terminator to `goto -> bb999` and verify `AX_VERIFY_BAD_TARGET`.
+                let bb0 = unsafe { mir_bb_at((*body).bbs, 0) };
+                unsafe {
+                    mir_term_zero(mut_view((*bb0).terminator), MIR_TERM_GOTO);
+                    (*bb0).terminator.goto_target.v = 999u32;
+                    (*bb0).has_terminator = true;
+                }
+                verify_mir(
+                    unsafe { view(*body) },
+                    thir_ptr as *const Thir,
+                    unsafe { mut_view(*sink_ptr) },
+                    it as *const HirItem
+                );
+                if (unsafe { (*sink_ptr).errors }) != 1 {
+                    resolve_map_free(mut_view(rmap));
+                    return 308;
+                }
+                let d_tgt = unsafe { diag_at((*sink_ptr).diags, 0) };
+                if (unsafe { (*d_tgt).code.v }) != AX_VERIFY_BAD_TARGET {
+                    resolve_map_free(mut_view(rmap));
+                    return 309;
+                }
+                unsafe {
+                    (*sink_ptr).errors = 0;
+                    (*sink_ptr).len = 0;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+
+    resolve_map_free(mut_view(rmap));
+    if verified_fns == 0 {
+        return 310;
+    }
+    0
+}
+
+pub fn main() -> i32 {
+    let mut perm_arena = new_arena(262144);
+    let mut parse_arena = new_arena(262144);
+    let mut resolve_arena = new_arena(262144);
+    let mut hir_arena = new_arena(262144);
+    let mut mir_arena = new_arena(262144);
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    let sess_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<CompilerSession>(), align_of<CompilerSession>()) as *mut CompilerSession;
+
+    let int_arena = new_arena(65536);
+    unsafe {
+        session_init(mut_view(*sess_ptr));
+        (*thir_ptr).interner.arena = int_arena;
+        thir_init(mut_view(*thir_ptr));
+    }
+
+    let rc = run_verify_pipeline(
+        sess_ptr,
+        thir_ptr,
+        mut_view(perm_arena),
+        mut_view(parse_arena),
+        mut_view(resolve_arena),
+        mut_view(hir_arena),
+        mut_view(mir_arena)
+    );
+    if rc != 0 {
+        return rc;
+    }
+
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+        session_free(mut_view(*sess_ptr));
+    }
+    arena_destroy(mut_view(mir_arena));
+    arena_destroy(mut_view(hir_arena));
+    arena_destroy(mut_view(resolve_arena));
+    arena_destroy(mut_view(parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK verify pipeline\n");
+    0
+}

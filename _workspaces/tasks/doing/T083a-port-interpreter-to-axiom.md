@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082d]
 priority: 117
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/interp, tests/selfhost/interp]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OPT-387]
+started: 2026-10-17 23:03:19
+agent: T083a-impl
 ---
 # T083a — Port MIR interpreter and host oracle to Axiom
 
@@ -38,3 +40,8 @@ Port the MIR step execution interpreter and host interface oracle (`compiler/int
 - `model: opus`: Porting the interpreter and comptime oracle requires semantic precision (model policy).
 - Sub-task of T083 split per ADR-0005 §8 and SPEC-20 §4.7.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-17 21:48:21 started (attempt 1) T083a-impl
+- 2026-10-17 23:03:17 requeue: restart (not charged: attempt refunded)
+- 2026-10-17 23:03:19 started (attempt 1) T083a-impl
