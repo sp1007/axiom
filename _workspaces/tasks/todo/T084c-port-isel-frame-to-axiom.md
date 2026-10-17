@@ -6,11 +6,11 @@ owner: axiom-stdlib
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T084b]
+depends: [T084b, T084d]
 priority: 118
 status: todo
 attempts: 0
-paths: [compiler/target/x64/isel.ax, compiler/target/x64/frame.ax, tests/selfhost/isel]
+paths: [compiler/target/x64, tests/selfhost/isel]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-TGT-327, REQ-X64-001]
 ---
