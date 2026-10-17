@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T082d]
 priority: 118
-status: doing
+status: done
 attempts: 1
 paths: [compiler/lir, tests/selfhost/lir]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-LIR-030, REQ-LAY-298]
 started: 2026-10-17 23:03:19
-agent: T084a-impl
+finished: 2026-10-18 04:48:04
 ---
 # T084a — Port LIR data model and builder to Axiom
 
@@ -44,3 +44,4 @@ Port Low-level Intermediate Representation (LIR) data structures and lowering fr
 - 2026-10-17 21:48:21 started (attempt 1) T084a-impl
 - 2026-10-17 23:03:18 requeue: restart (not charged: attempt refunded)
 - 2026-10-17 23:03:19 started (attempt 1) T084a-impl
+- 2026-10-18 04:48:04 accepted by QA -> done

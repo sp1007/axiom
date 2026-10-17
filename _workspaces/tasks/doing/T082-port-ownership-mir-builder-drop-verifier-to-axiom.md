@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082a, T082b, T082c, T082d, T082e]
 priority: 116
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/own_mir_verify, tests/selfhost/own_mir_verify]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRP-183, REQ-ERR-087, REQ-MIR-338, REQ-MIR-339, REQ-MIR-340, REQ-OWN-338]
+started: 2026-10-18 04:36:29
+agent: T082-impl
 ---
 # T082 — Port ownership, MIR builder, drop, verifier to Axiom (integration + differential MIR)
 
@@ -39,3 +41,6 @@ Integrate ownership, MIR builder, drop elaboration, and verifier in Axiom and ru
 - Exact differential artefact: `inspect --emit=mir`.
 - Harness entry: `tests/selfhost/own_mir_verify`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 04:36:29 started (attempt 1) T082-impl
