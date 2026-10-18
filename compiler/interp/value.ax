@@ -1,0 +1,1066 @@
+// Axiom Compiler — MIR Interpreter Values, Allocations & Context (compiler/interp/value.ax)
+// Port of value, allocation, pointer validation, and error/limit reporting from
+// bootstrap/axiom0/src/interp/host.h and bootstrap/axiom0/src/interp/interp.c.
+module compiler.interp.value
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.manager.SourceDatabase
+use compiler.diag.code.AX_CONST_DIV_ZERO
+use compiler.diag.code.AX_CONST_EVAL_LIMIT
+use compiler.diag.code.AX_CONST_OVERFLOW
+use compiler.diag.code.AX_DRIVER_INTERP_STACK_LIMIT
+use compiler.diag.code.AX_DRIVER_INTERP_STEP_LIMIT
+use compiler.diag.code.AX_FFI_NOT_IN_ORACLE
+use compiler.diag.code.AX_UNSAFE_INTERP_UB
+use compiler.diag.code.diag_code
+use compiler.diag.code.diag_code_severity
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.syntax.ast.Ast
+use compiler.resolve.symtab.ResolveMap
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirItem
+use compiler.types.types.CONST_AGGREGATE
+use compiler.types.types.CONST_ERROR
+use compiler.types.types.ConstEvalResult
+use compiler.types.types.ConstValue
+use compiler.types.types.Thir
+use compiler.traits.mono.MonoEngine
+use compiler.mir.mir.MirBody
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn ptr_write_bytes<T>(dst: *mut T, val: u8, count: usize) {}
+
+pub const INTERP_SYNTH_BASE_RUNTIME: u64 = 0x10000000u64;
+pub const INTERP_SYNTH_BASE_COMPTIME: u64 = 0x20000000u64;
+
+pub const INTERP_MSG_UB_NULL_DEREF: u8 = 1u8;
+pub const INTERP_MSG_UB_MISALIGNED: u8 = 2u8;
+pub const INTERP_MSG_UB_UNMAPPED: u8 = 3u8;
+pub const INTERP_MSG_UB_DANGLING: u8 = 4u8;
+pub const INTERP_MSG_UB_USE_AFTER_FREE: u8 = 4u8;
+pub const INTERP_MSG_UB_OOB: u8 = 5u8;
+pub const INTERP_MSG_UB_OUT_OF_BOUNDS: u8 = 5u8;
+pub const INTERP_MSG_UB_PTR_ARITH_UNMAPPED: u8 = 6u8;
+pub const INTERP_MSG_UB_PTR_ARITH_OUTSIDE: u8 = 6u8;
+pub const INTERP_MSG_UB_PTR_ARITH_OOB: u8 = 7u8;
+pub const INTERP_MSG_UB_FREE_NON_HEAP: u8 = 8u8;
+pub const INTERP_MSG_UB_USIZE_AS_PTR: u8 = 9u8;
+pub const INTERP_MSG_UB_OVERLAPPING_COPY: u8 = 10u8;
+pub const INTERP_MSG_UB_OVERLAP: u8 = 10u8;
+
+pub const INTERP_MSG_PANIC_SUBSLICE_NON_ARR: u8 = 20u8;
+pub const INTERP_MSG_PANIC_SUBSLICE_OOB: u8 = 21u8;
+pub const INTERP_MSG_PANIC_INDEX_NON_ARR: u8 = 22u8;
+pub const INTERP_MSG_PANIC_INDEX_OOB: u8 = 23u8;
+pub const INTERP_MSG_PANIC_ASSERT_FAILED: u8 = 24u8;
+pub const INTERP_MSG_PANIC_ASSERT: u8 = 24u8;
+pub const INTERP_MSG_PANIC_UNREACHABLE: u8 = 25u8;
+pub const INTERP_MSG_PANIC_PANIC: u8 = 26u8;
+pub const INTERP_MSG_PANIC_COMPTIME_CALL: u8 = 27u8;
+pub const INTERP_MSG_PANIC_DIV_ZERO: u8 = 28u8;
+pub const INTERP_MSG_PANIC_SHIFT_RANGE: u8 = 29u8;
+pub const INTERP_MSG_PANIC_ARITH_OV: u8 = 30u8;
+pub const INTERP_MSG_PANIC_UNRESOLVED_CALL: u8 = 31u8;
+pub const INTERP_MSG_PANIC_UNSUPPORTED_TERM: u8 = 32u8;
+
+pub const INTERP_MSG_LIMIT_COMPTIME_STEP: u8 = 40u8;
+pub const INTERP_MSG_LIMIT_STEP: u8 = 41u8;
+pub const INTERP_MSG_LIMIT_STACK: u8 = 42u8;
+pub const INTERP_MSG_FFI_NOT_IN_ORACLE: u8 = 43u8;
+
+// Concatenated message bytes indexed by offset/length table below.
+const INTERP_MSG_BYTES: [769]u8 = [
+    // 0..24: "null pointer dereference"
+    110u8, 117u8, 108u8, 108u8, 32u8, 112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8,
+    32u8, 100u8, 101u8, 114u8, 101u8, 102u8, 101u8, 114u8, 101u8, 110u8, 99u8, 101u8,
+    // 24..49: "misaligned pointer access"
+    109u8, 105u8, 115u8, 97u8, 108u8, 105u8, 103u8, 110u8, 101u8, 100u8, 32u8, 112u8,
+    111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 97u8, 99u8, 99u8, 101u8, 115u8, 115u8,
+    // 49..82: "pointer access to unmapped memory"
+    112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 97u8, 99u8, 99u8, 101u8,
+    115u8, 115u8, 32u8, 116u8, 111u8, 32u8, 117u8, 110u8, 109u8, 97u8, 112u8, 112u8,
+    101u8, 100u8, 32u8, 109u8, 101u8, 109u8, 111u8, 114u8, 121u8,
+    // 82..122: "use of dangling pointer (use-after-free)"
+    117u8, 115u8, 101u8, 32u8, 111u8, 102u8, 32u8, 100u8, 97u8, 110u8, 103u8, 108u8,
+    105u8, 110u8, 103u8, 32u8, 112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8,
+    40u8, 117u8, 115u8, 101u8, 45u8, 97u8, 102u8, 116u8, 101u8, 114u8, 45u8, 102u8,
+    114u8, 101u8, 101u8, 41u8,
+    // 122..150: "out-of-bounds pointer access"
+    111u8, 117u8, 116u8, 45u8, 111u8, 102u8, 45u8, 98u8, 111u8, 117u8, 110u8, 100u8,
+    115u8, 32u8, 112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 97u8, 99u8,
+    99u8, 101u8, 115u8, 115u8,
+    // 150..203: "pointer arithmetic on pointer outside live allocation"
+    112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 97u8, 114u8, 105u8, 116u8,
+    104u8, 109u8, 101u8, 116u8, 105u8, 99u8, 32u8, 111u8, 110u8, 32u8, 112u8, 111u8,
+    105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 111u8, 117u8, 116u8, 115u8, 105u8, 100u8,
+    101u8, 32u8, 108u8, 105u8, 118u8, 101u8, 32u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    97u8, 116u8, 105u8, 111u8, 110u8,
+    // 203..246: "pointer arithmetic out of allocation bounds"
+    112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 32u8, 97u8, 114u8, 105u8, 116u8,
+    104u8, 109u8, 101u8, 116u8, 105u8, 99u8, 32u8, 111u8, 117u8, 116u8, 32u8, 111u8,
+    102u8, 32u8, 97u8, 108u8, 108u8, 111u8, 99u8, 97u8, 116u8, 105u8, 111u8, 110u8,
+    32u8, 98u8, 111u8, 117u8, 110u8, 100u8, 115u8,
+    // 246..285: "heap_free called on non-heap allocation"
+    104u8, 101u8, 97u8, 112u8, 95u8, 102u8, 114u8, 101u8, 101u8, 32u8, 99u8, 97u8,
+    108u8, 108u8, 101u8, 100u8, 32u8, 111u8, 110u8, 32u8, 110u8, 111u8, 110u8, 45u8,
+    104u8, 101u8, 97u8, 112u8, 32u8, 97u8, 108u8, 108u8, 111u8, 99u8, 97u8, 116u8,
+    105u8, 111u8, 110u8,
+    // 285..331: "usize as ptr: address not in a live allocation"
+    117u8, 115u8, 105u8, 122u8, 101u8, 32u8, 97u8, 115u8, 32u8, 112u8, 116u8, 114u8,
+    58u8, 32u8, 97u8, 100u8, 100u8, 114u8, 101u8, 115u8, 115u8, 32u8, 110u8, 111u8,
+    116u8, 32u8, 105u8, 110u8, 32u8, 97u8, 32u8, 108u8, 105u8, 118u8, 101u8, 32u8,
+    97u8, 108u8, 108u8, 111u8, 99u8, 97u8, 116u8, 105u8, 111u8, 110u8,
+    // 331..378: "ptr_copy_nonoverlapping with overlapping ranges"
+    112u8, 116u8, 114u8, 95u8, 99u8, 111u8, 112u8, 121u8, 95u8, 110u8, 111u8, 110u8,
+    111u8, 118u8, 101u8, 114u8, 108u8, 97u8, 112u8, 112u8, 105u8, 110u8, 103u8, 32u8,
+    119u8, 105u8, 116u8, 104u8, 32u8, 111u8, 118u8, 101u8, 114u8, 108u8, 97u8, 112u8,
+    112u8, 105u8, 110u8, 103u8, 32u8, 114u8, 97u8, 110u8, 103u8, 101u8, 115u8,
+    // 378..410: "sub-slicing into non-array/slice"
+    115u8, 117u8, 98u8, 45u8, 115u8, 108u8, 105u8, 99u8, 105u8, 110u8, 103u8, 32u8,
+    105u8, 110u8, 116u8, 111u8, 32u8, 110u8, 111u8, 110u8, 45u8, 97u8, 114u8, 114u8,
+    97u8, 121u8, 47u8, 115u8, 108u8, 105u8, 99u8, 101u8,
+    // 410..433: "sub-slice out of bounds"
+    115u8, 117u8, 98u8, 45u8, 115u8, 108u8, 105u8, 99u8, 101u8, 32u8, 111u8, 117u8,
+    116u8, 32u8, 111u8, 102u8, 32u8, 98u8, 111u8, 117u8, 110u8, 100u8, 115u8,
+    // 433..462: "indexing into non-array/slice"
+    105u8, 110u8, 100u8, 101u8, 120u8, 105u8, 110u8, 103u8, 32u8, 105u8, 110u8, 116u8,
+    111u8, 32u8, 110u8, 111u8, 110u8, 45u8, 97u8, 114u8, 114u8, 97u8, 121u8, 47u8,
+    115u8, 108u8, 105u8, 99u8, 101u8,
+    // 462..481: "index out of bounds"
+    105u8, 110u8, 100u8, 101u8, 120u8, 32u8, 111u8, 117u8, 116u8, 32u8, 111u8, 102u8,
+    32u8, 98u8, 111u8, 117u8, 110u8, 100u8, 115u8,
+    // 481..497: "assertion failed"
+    97u8, 115u8, 115u8, 101u8, 114u8, 116u8, 105u8, 111u8, 110u8, 32u8, 102u8, 97u8,
+    105u8, 108u8, 101u8, 100u8,
+    // 497..521: "entered unreachable code"
+    101u8, 110u8, 116u8, 101u8, 114u8, 101u8, 100u8, 32u8, 117u8, 110u8, 114u8, 101u8,
+    97u8, 99u8, 104u8, 97u8, 98u8, 108u8, 101u8, 32u8, 99u8, 111u8, 100u8, 101u8,
+    // 521..526: "panic"
+    112u8, 97u8, 110u8, 105u8, 99u8,
+    // 526..578: "function calls not supported in constant expressions"
+    102u8, 117u8, 110u8, 99u8, 116u8, 105u8, 111u8, 110u8, 32u8, 99u8, 97u8, 108u8,
+    108u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 115u8, 117u8, 112u8, 112u8, 111u8,
+    114u8, 116u8, 101u8, 100u8, 32u8, 105u8, 110u8, 32u8, 99u8, 111u8, 110u8, 115u8,
+    116u8, 97u8, 110u8, 116u8, 32u8, 101u8, 120u8, 112u8, 114u8, 101u8, 115u8, 115u8,
+    105u8, 111u8, 110u8, 115u8,
+    // 578..594: "division by zero"
+    100u8, 105u8, 118u8, 105u8, 115u8, 105u8, 111u8, 110u8, 32u8, 98u8, 121u8, 32u8,
+    122u8, 101u8, 114u8, 111u8,
+    // 594..619: "shift amount out of range"
+    115u8, 104u8, 105u8, 102u8, 116u8, 32u8, 97u8, 109u8, 111u8, 117u8, 110u8, 116u8,
+    32u8, 111u8, 117u8, 116u8, 32u8, 111u8, 102u8, 32u8, 114u8, 97u8, 110u8, 103u8, 101u8,
+    // 619..638: "arithmetic overflow"
+    97u8, 114u8, 105u8, 116u8, 104u8, 109u8, 101u8, 116u8, 105u8, 99u8, 32u8, 111u8,
+    118u8, 101u8, 114u8, 102u8, 108u8, 111u8, 119u8,
+    // 638..662: "unresolved function call"
+    117u8, 110u8, 114u8, 101u8, 115u8, 111u8, 108u8, 118u8, 101u8, 100u8, 32u8, 102u8,
+    117u8, 110u8, 99u8, 116u8, 105u8, 111u8, 110u8, 32u8, 99u8, 97u8, 108u8, 108u8,
+    // 662..684: "unsupported terminator"
+    117u8, 110u8, 115u8, 117u8, 112u8, 112u8, 111u8, 114u8, 116u8, 101u8, 100u8, 32u8,
+    116u8, 101u8, 114u8, 109u8, 105u8, 110u8, 97u8, 116u8, 111u8, 114u8,
+    // 684..736: "evaluation limit exceeded during constant evaluation"
+    101u8, 118u8, 97u8, 108u8, 117u8, 97u8, 116u8, 105u8, 111u8, 110u8, 32u8, 108u8,
+    105u8, 109u8, 105u8, 116u8, 32u8, 101u8, 120u8, 99u8, 101u8, 101u8, 100u8, 101u8,
+    100u8, 32u8, 100u8, 117u8, 114u8, 105u8, 110u8, 103u8, 32u8, 99u8, 111u8, 110u8,
+    115u8, 116u8, 97u8, 110u8, 116u8, 32u8, 101u8, 118u8, 97u8, 108u8, 117u8, 97u8,
+    116u8, 105u8, 111u8, 110u8,
+    // 736..755: "step limit exceeded"
+    115u8, 116u8, 101u8, 112u8, 32u8, 108u8, 105u8, 109u8, 105u8, 116u8, 32u8, 101u8,
+    120u8, 99u8, 101u8, 101u8, 100u8, 101u8, 100u8,
+    // 755..769: unused tail; see INTERP_MSG_STACK_BYTES below
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+const INTERP_MSG_STACK_BYTES: [25]u8 = [
+    99u8, 97u8, 108u8, 108u8, 32u8, 100u8, 101u8, 112u8, 116u8, 104u8, 32u8, 108u8,
+    105u8, 109u8, 105u8, 116u8, 32u8, 101u8, 120u8, 99u8, 101u8, 101u8, 100u8, 101u8, 100u8,
+];
+
+const INTERP_MSG_FFI_BYTES: [51]u8 = [
+    100u8, 105u8, 114u8, 101u8, 99u8, 116u8, 32u8, 101u8, 120u8, 116u8, 101u8, 114u8,
+    110u8, 32u8, 99u8, 97u8, 108u8, 108u8, 32u8, 99u8, 97u8, 110u8, 110u8, 111u8,
+    116u8, 32u8, 114u8, 117u8, 110u8, 32u8, 105u8, 110u8, 32u8, 105u8, 110u8, 116u8,
+    101u8, 114u8, 112u8, 114u8, 101u8, 116u8, 101u8, 114u8, 32u8, 111u8, 114u8, 97u8,
+    99u8, 108u8, 101u8,
+];
+
+const INTERP_WORD_DIV_ZERO: [16]u8 = [
+    100u8, 105u8, 118u8, 105u8, 115u8, 105u8, 111u8, 110u8, 32u8, 98u8, 121u8, 32u8,
+    122u8, 101u8, 114u8, 111u8,
+];
+
+pub struct InterpValue {
+    pub vals: [8]u64,
+}
+
+pub struct InterpAlloc {
+    pub alloc_id: u32,
+    pub base_addr: u64,
+    pub size: u64,
+    pub align: u32,
+    pub host_ptr: *mut u8,
+    pub is_live: bool,
+    pub call_depth: i32,
+}
+
+pub struct InterpHostArg {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+pub struct InterpHostState {
+    pub args: *mut InterpHostArg,
+    pub argc: usize,
+    pub args_cap: usize,
+    pub use_custom_args: bool,
+    pub open_fds: *mut i64,
+    pub open_fds_len: usize,
+    pub open_fds_cap: usize,
+    pub open_dirs: *mut i64,
+    pub open_dirs_len: usize,
+    pub open_dirs_cap: usize,
+    pub last_monotonic_ns: u64,
+}
+
+pub struct MirBodyEntry {
+    pub item_ptr: usize,
+    pub sym_v: u32,
+    pub body: *mut MirBody,
+}
+
+pub struct MirBodyMap {
+    pub entries: *mut MirBodyEntry,
+    pub len: usize,
+    pub cap: usize,
+}
+
+pub struct InterpCtx {
+    pub main_fn: *mut HirItem,
+    pub thir: *mut Thir,
+    pub hir: *const HirFile,
+    pub interner: *mut StrInterner,
+    pub rmap: *const ResolveMap,
+    pub ast: *const Ast,
+    pub db: *const SourceDatabase,
+    pub sink: *mut DiagSink,
+    pub mono_engine: *mut MonoEngine,
+    pub step_limit: i32,
+    pub call_depth_limit: i32,
+    pub mir_map: *mut MirBodyMap,
+    pub build_on_demand: bool,
+    pub steps: i32,
+    pub call_depth: i32,
+    pub arena: Arena,
+    pub failed: bool,
+    pub has_panicked: bool,
+    pub has_exited: bool,
+    pub exit_code: i32,
+    pub panic_msg_ptr: *const u8,
+    pub panic_msg_len: usize,
+    pub out_buf: *mut DiagBuffer,
+    pub capture_stdout: bool,
+    pub dummy_ptr: *mut u8,
+    pub allocs: *mut InterpAlloc,
+    pub alloc_count: usize,
+    pub alloc_cap: usize,
+    pub next_synth_addr: u64,
+    pub is_comptime: bool,
+    pub comptime_err_code: u16,
+    pub comptime_err_span: Span,
+    pub comptime_err_msg: StrView,
+    pub current_span: Span,
+    pub host: InterpHostState,
+}
+
+// =================================================================================================
+// Pointer & Memory Helpers
+// =================================================================================================
+
+pub fn interp_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn interp_alloc_at(base: *mut InterpAlloc, idx: usize) -> *mut InterpAlloc {
+    let off = interp_mul_usize(idx, size_of<InterpAlloc>());
+    ((base as usize) + off) as *mut InterpAlloc
+}
+
+pub unsafe fn interp_val_at(base: *mut InterpValue, idx: usize) -> *mut InterpValue {
+    let off = interp_mul_usize(idx, size_of<InterpValue>());
+    ((base as usize) + off) as *mut InterpValue
+}
+
+pub unsafe fn interp_host_arg_at(base: *mut InterpHostArg, idx: usize) -> *mut InterpHostArg {
+    let off = interp_mul_usize(idx, size_of<InterpHostArg>());
+    ((base as usize) + off) as *mut InterpHostArg
+}
+
+pub unsafe fn interp_i64_at(base: *mut i64, idx: usize) -> *mut i64 {
+    let off = interp_mul_usize(idx, size_of<i64>());
+    ((base as usize) + off) as *mut i64
+}
+
+pub unsafe fn interp_u8_ptr_at(base: *mut *mut u8, idx: usize) -> *mut *mut u8 {
+    let off = interp_mul_usize(idx, size_of<*mut u8>());
+    ((base as usize) + off) as *mut *mut u8
+}
+
+pub unsafe fn mir_body_entry_at(base: *mut MirBodyEntry, idx: usize) -> *mut MirBodyEntry {
+    let off = interp_mul_usize(idx, size_of<MirBodyEntry>());
+    ((base as usize) + off) as *mut MirBodyEntry
+}
+
+pub fn interp_val_zero() -> InterpValue {
+    InterpValue {
+        vals: [0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64],
+    }
+}
+
+pub fn interp_val_u64(v: u64) -> InterpValue {
+    InterpValue {
+        vals: [v, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64],
+    }
+}
+
+pub fn interp_zero_val(dst: mut_view<InterpValue>) {
+    let mut i: usize = 0;
+    while i < 8 {
+        dst.vals[i] = 0u64;
+        i = i + 1;
+    }
+}
+
+pub fn interp_copy_val(dst: mut_view<InterpValue>, src: view<InterpValue>) {
+    let mut i: usize = 0;
+    while i < 8 {
+        dst.vals[i] = src.vals[i];
+        i = i + 1;
+    }
+}
+
+pub unsafe fn interp_zero_bytes(dst: *mut u8, count: usize) {
+    if (dst as usize) == 0 || count == 0 {
+        return;
+    }
+    ptr_write_bytes<u8>(dst, 0u8, count);
+}
+
+pub unsafe fn interp_fill_bytes(dst: *mut u8, byte_val: u8, count: usize) {
+    if (dst as usize) == 0 || count == 0 {
+        return;
+    }
+    ptr_write_bytes<u8>(dst, byte_val, count);
+}
+
+pub unsafe fn interp_copy_bytes(dst: *mut u8, src: *const u8, count: usize) {
+    if count == 0 || (dst as usize) == 0 || (src as usize) == 0 {
+        return;
+    }
+    let dst_addr = dst as usize;
+    let src_addr = src as usize;
+    if dst_addr == src_addr {
+        return;
+    }
+    if dst_addr + count <= src_addr || src_addr + count <= dst_addr {
+        ptr_copy_nonoverlapping<u8>(src, dst, count);
+    } else if dst_addr > src_addr && dst_addr < src_addr + count {
+        let mut i: usize = count;
+        while i > 0 {
+            i = i - 1;
+            *(dst + i) = *(src + i);
+        }
+    } else {
+        let mut i: usize = 0;
+        while i < count {
+            *(dst + i) = *(src + i);
+            i = i + 1;
+        }
+    }
+}
+
+pub unsafe fn interp_move_bytes(dst: *mut u8, src: *const u8, count: usize) {
+    interp_copy_bytes(dst, src, count);
+}
+
+pub unsafe fn interp_cstr_len(s: *const u8) -> usize {
+    if (s as usize) == 0 {
+        return 0;
+    }
+    let mut n: usize = 0;
+    while *(s + n) != 0u8 {
+        n = n + 1;
+    }
+    n
+}
+
+pub unsafe fn interp_bytes_eq(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if *(a + i) != *(b + i) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn interp_sv_eq(a: view<StrView>, b: view<StrView>) -> bool {
+    unsafe { interp_bytes_eq(a.ptr, a.len, b.ptr, b.len) }
+}
+
+pub fn interp_sv_contains(hay: view<StrView>, needle: view<StrView>) -> bool {
+    if needle.len == 0 {
+        return true;
+    }
+    if (hay.ptr as usize) == 0 || (needle.ptr as usize) == 0 || (hay.len) < (needle.len) {
+        return false;
+    }
+    let mut start: usize = 0;
+    while start + needle.len <= hay.len {
+        let ok = unsafe { interp_bytes_eq(hay.ptr + start, needle.len, needle.ptr, needle.len) };
+        if ok {
+            return true;
+        }
+        start = start + 1;
+    }
+    false
+}
+
+// =================================================================================================
+// Message Lookup & Formatting
+// =================================================================================================
+
+fn interp_msg_range(msg_kind: u8, out_off: mut_view<usize>, out_len: mut_view<usize>) {
+    *out_off = 0;
+    *out_len = 0;
+    if msg_kind == INTERP_MSG_UB_NULL_DEREF {
+        *out_off = 0;
+        *out_len = 24;
+    } else if msg_kind == INTERP_MSG_UB_MISALIGNED {
+        *out_off = 24;
+        *out_len = 25;
+    } else if msg_kind == INTERP_MSG_UB_UNMAPPED {
+        *out_off = 49;
+        *out_len = 33;
+    } else if msg_kind == INTERP_MSG_UB_DANGLING {
+        *out_off = 82;
+        *out_len = 40;
+    } else if msg_kind == INTERP_MSG_UB_OOB {
+        *out_off = 122;
+        *out_len = 28;
+    } else if msg_kind == INTERP_MSG_UB_PTR_ARITH_UNMAPPED {
+        *out_off = 150;
+        *out_len = 53;
+    } else if msg_kind == INTERP_MSG_UB_PTR_ARITH_OOB {
+        *out_off = 203;
+        *out_len = 43;
+    } else if msg_kind == INTERP_MSG_UB_FREE_NON_HEAP {
+        *out_off = 246;
+        *out_len = 39;
+    } else if msg_kind == INTERP_MSG_UB_USIZE_AS_PTR {
+        *out_off = 285;
+        *out_len = 46;
+    } else if msg_kind == INTERP_MSG_UB_OVERLAPPING_COPY {
+        *out_off = 331;
+        *out_len = 47;
+    } else if msg_kind == INTERP_MSG_PANIC_SUBSLICE_NON_ARR {
+        *out_off = 378;
+        *out_len = 32;
+    } else if msg_kind == INTERP_MSG_PANIC_SUBSLICE_OOB {
+        *out_off = 410;
+        *out_len = 23;
+    } else if msg_kind == INTERP_MSG_PANIC_INDEX_NON_ARR {
+        *out_off = 433;
+        *out_len = 29;
+    } else if msg_kind == INTERP_MSG_PANIC_INDEX_OOB {
+        *out_off = 462;
+        *out_len = 19;
+    } else if msg_kind == INTERP_MSG_PANIC_ASSERT_FAILED {
+        *out_off = 481;
+        *out_len = 16;
+    } else if msg_kind == INTERP_MSG_PANIC_UNREACHABLE {
+        *out_off = 497;
+        *out_len = 24;
+    } else if msg_kind == INTERP_MSG_PANIC_PANIC {
+        *out_off = 521;
+        *out_len = 5;
+    } else if msg_kind == INTERP_MSG_PANIC_COMPTIME_CALL {
+        *out_off = 526;
+        *out_len = 52;
+    } else if msg_kind == INTERP_MSG_PANIC_DIV_ZERO {
+        *out_off = 578;
+        *out_len = 16;
+    } else if msg_kind == INTERP_MSG_PANIC_SHIFT_RANGE {
+        *out_off = 594;
+        *out_len = 25;
+    } else if msg_kind == INTERP_MSG_PANIC_ARITH_OV {
+        *out_off = 619;
+        *out_len = 19;
+    } else if msg_kind == INTERP_MSG_PANIC_UNRESOLVED_CALL {
+        *out_off = 638;
+        *out_len = 24;
+    } else if msg_kind == INTERP_MSG_PANIC_UNSUPPORTED_TERM {
+        *out_off = 662;
+        *out_len = 22;
+    } else if msg_kind == INTERP_MSG_LIMIT_COMPTIME_STEP {
+        *out_off = 684;
+        *out_len = 52;
+    } else if msg_kind == INTERP_MSG_LIMIT_STEP {
+        *out_off = 736;
+        *out_len = 19;
+    }
+}
+
+pub fn interp_alloc_msg(arena: mut_view<Arena>, msg_kind: u8) -> StrView {
+    if msg_kind == INTERP_MSG_LIMIT_STACK {
+        let n: usize = 25;
+        let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+        let mut i: usize = 0;
+        while i < n {
+            unsafe {
+                *(dst + i) = INTERP_MSG_STACK_BYTES[i];
+            }
+            i = i + 1;
+        }
+        unsafe {
+            *(dst + n) = 0u8;
+        }
+        return StrView { ptr: dst as *const u8, len: n };
+    }
+    if msg_kind == INTERP_MSG_FFI_NOT_IN_ORACLE {
+        let n: usize = 51;
+        let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+        let mut i: usize = 0;
+        while i < n {
+            unsafe {
+                *(dst + i) = INTERP_MSG_FFI_BYTES[i];
+            }
+            i = i + 1;
+        }
+        unsafe {
+            *(dst + n) = 0u8;
+        }
+        return StrView { ptr: dst as *const u8, len: n };
+    }
+    let mut off: usize = 0;
+    let mut msg_len: usize = 0;
+    interp_msg_range(msg_kind, mut_view(off), mut_view(msg_len));
+    let dst = arena_alloc_raw(mut_view(*arena), msg_len + 1, 1);
+    let mut i: usize = 0;
+    while i < msg_len {
+        unsafe {
+            *(dst + i) = INTERP_MSG_BYTES[off + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + msg_len) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: msg_len }
+}
+
+pub fn interp_msg_sv(arena: mut_view<Arena>, msg_kind: u8) -> StrView {
+    interp_alloc_msg(mut_view(*arena), msg_kind)
+}
+
+fn interp_msg_has_div_zero(msg_ptr: *const u8, msg_len: usize) -> bool {
+    if (msg_ptr as usize) == 0 || msg_len < 16 {
+        return false;
+    }
+    let mut start: usize = 0;
+    while start + 16 <= msg_len {
+        let mut matched = true;
+        let mut j: usize = 0;
+        while j < 16 {
+            let b = unsafe { *(msg_ptr + start + j) };
+            if b != INTERP_WORD_DIV_ZERO[j] {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched {
+            return true;
+        }
+        start = start + 1;
+    }
+    false
+}
+
+// =================================================================================================
+// UB, Panic & Limit Reporting
+// =================================================================================================
+
+pub fn interp_push_diag(ctx: mut_view<InterpCtx>, code_v: u32, span: Span, msg: StrView) {
+    if (ctx.sink as usize) != 0 {
+        let d_ptr = arena_alloc_raw(mut_view(ctx.arena), size_of<Diagnostic>(), align_of<Diagnostic>()) as *mut Diagnostic;
+        unsafe {
+            interp_zero_bytes(d_ptr as *mut u8, size_of<Diagnostic>());
+            let c = diag_code(code_v);
+            let sev = diag_code_severity(c);
+            (*d_ptr).code = c;
+            (*d_ptr).severity = sev;
+            (*d_ptr).message = msg;
+            (*d_ptr).primary = span;
+            diag_sink_report(mut_view(*ctx.sink), view(*d_ptr));
+        }
+    }
+}
+
+pub fn interp_report_ub_sv(ctx: mut_view<InterpCtx>, msg: StrView) {
+    interp_push_diag(mut_view(*ctx), AX_UNSAFE_INTERP_UB, ctx.current_span, msg);
+    ctx.failed = true;
+    ctx.exit_code = 125;
+}
+
+pub fn interp_report_ub(ctx: mut_view<InterpCtx>, msg_kind: u8) {
+    let msg = interp_alloc_msg(mut_view(ctx.arena), msg_kind);
+    interp_report_ub_sv(mut_view(*ctx), msg);
+}
+
+pub fn interp_panic_sv(ctx: mut_view<InterpCtx>, msg: StrView) {
+    let dup = arena_alloc_raw(mut_view(ctx.arena), msg.len + 1, 1);
+    if msg.len > 0 && (msg.ptr as usize) != 0 {
+        unsafe {
+            interp_copy_bytes(dup, msg.ptr, msg.len);
+        }
+    }
+    unsafe {
+        *(dup + msg.len) = 0u8;
+    }
+    ctx.panic_msg_ptr = dup as *const u8;
+    ctx.panic_msg_len = msg.len;
+    ctx.has_panicked = true;
+    if ctx.is_comptime {
+        if interp_msg_has_div_zero(ctx.panic_msg_ptr, ctx.panic_msg_len) {
+            ctx.comptime_err_code = AX_CONST_DIV_ZERO as u16;
+        } else {
+            ctx.comptime_err_code = AX_CONST_OVERFLOW as u16;
+        }
+        ctx.comptime_err_msg.ptr = ctx.panic_msg_ptr;
+        ctx.comptime_err_msg.len = ctx.panic_msg_len;
+        ctx.comptime_err_span = ctx.current_span;
+    }
+    ctx.failed = true;
+    ctx.exit_code = 101;
+}
+
+pub fn interp_panic(ctx: mut_view<InterpCtx>, msg_kind: u8) {
+    let msg = interp_alloc_msg(mut_view(ctx.arena), msg_kind);
+    interp_panic_sv(mut_view(*ctx), msg);
+}
+
+pub fn interp_check_step_limit(ctx: mut_view<InterpCtx>) {
+    if ctx.step_limit > 0 && ctx.steps >= ctx.step_limit {
+        if ctx.is_comptime {
+            let msg = interp_alloc_msg(mut_view(ctx.arena), INTERP_MSG_LIMIT_COMPTIME_STEP);
+            ctx.comptime_err_code = AX_CONST_EVAL_LIMIT as u16;
+            ctx.comptime_err_msg = msg;
+            ctx.comptime_err_span = ctx.current_span;
+        } else {
+            let msg = interp_alloc_msg(mut_view(ctx.arena), INTERP_MSG_LIMIT_STEP);
+            interp_push_diag(mut_view(*ctx), AX_DRIVER_INTERP_STEP_LIMIT, ctx.current_span, msg);
+        }
+        ctx.failed = true;
+        ctx.exit_code = 124;
+    }
+}
+
+pub fn interp_report_stack_limit(ctx: mut_view<InterpCtx>) {
+    let msg = interp_alloc_msg(mut_view(ctx.arena), INTERP_MSG_LIMIT_STACK);
+    interp_push_diag(mut_view(*ctx), AX_DRIVER_INTERP_STACK_LIMIT, ctx.current_span, msg);
+    ctx.failed = true;
+    ctx.exit_code = 124;
+}
+
+pub fn interp_report_ffi_not_in_oracle(ctx: mut_view<InterpCtx>, span: Span) {
+    let msg = interp_alloc_msg(mut_view(ctx.arena), INTERP_MSG_FFI_NOT_IN_ORACLE);
+    interp_push_diag(mut_view(*ctx), AX_FFI_NOT_IN_ORACLE, span, msg);
+    ctx.failed = true;
+    ctx.exit_code = 1;
+}
+
+// =================================================================================================
+// Allocation Table & Pointer Validation
+// =================================================================================================
+
+pub fn interp_register_alloc(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u64,
+    align: u32,
+    call_depth: i32
+) -> *mut InterpAlloc {
+    if ctx.alloc_count >= ctx.alloc_cap {
+        let new_cap: usize = if ctx.alloc_cap == 0 { 64 } else { interp_mul_usize(ctx.alloc_cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<InterpAlloc>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<InterpAlloc>()) as *mut InterpAlloc };
+        unsafe {
+            interp_zero_bytes(new_arr as *mut u8, new_bytes);
+        }
+        if ctx.alloc_count > 0 && (ctx.allocs as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.alloc_count, size_of<InterpAlloc>());
+            let old_cap_bytes = interp_mul_usize(ctx.alloc_cap, size_of<InterpAlloc>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(ctx.allocs as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(ctx.allocs as *mut u8, old_cap_bytes, align_of<InterpAlloc>());
+            }
+        }
+        ctx.allocs = new_arr;
+        ctx.alloc_cap = new_cap;
+    }
+
+    let idx = ctx.alloc_count;
+    ctx.alloc_count = idx + 1;
+    let a = unsafe { interp_alloc_at(ctx.allocs, idx) };
+    let eff_align: u64 = if align > 16u32 { align as u64 } else { 16u64 };
+    let mask: u64 = eff_align - 1u64;
+    let base: u64 = (ctx.next_synth_addr + mask) & (0xFFFFFFFFFFFFFFFFu64 ^ mask);
+    let padded_size: u64 = (size + 15u64) & (0xFFFFFFFFFFFFFFFFu64 ^ 15u64);
+
+    unsafe {
+        (*a).alloc_id = (idx + 1) as u32;
+        (*a).base_addr = base;
+        (*a).size = size;
+        (*a).align = if align != 0u32 { align } else { 1u32 };
+        (*a).host_ptr = host_ptr;
+        (*a).is_live = true;
+        (*a).call_depth = call_depth;
+    }
+    ctx.next_synth_addr = base + padded_size + 16u64;
+    a
+}
+
+pub fn interp_validate_raw_ptr(
+    ctx: mut_view<InterpCtx>,
+    addr: u64,
+    size: u64,
+    align: u32
+) -> *mut u8 {
+    if addr == 0u64 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_NULL_DEREF);
+        return ctx.dummy_ptr;
+    }
+    if align > 1u32 && (addr % (align as u64)) != 0u64 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MISALIGNED);
+        return ctx.dummy_ptr;
+    }
+
+    let mut found: *mut InterpAlloc = 0 as *mut InterpAlloc;
+    let mut i: usize = ctx.alloc_count;
+    while i > 0 {
+        i = i - 1;
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let base = unsafe { (*a).base_addr };
+        let asz = unsafe { (*a).size };
+        if addr >= base && addr < base + asz + 16u64 {
+            found = a;
+            break;
+        }
+    }
+    if (found as usize) == 0 {
+        i = ctx.alloc_count;
+        while i > 0 {
+            i = i - 1;
+            let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+            let base = unsafe { (*a).base_addr };
+            let asz = unsafe { (*a).size };
+            if addr >= base && addr <= base + asz {
+                found = a;
+                break;
+            }
+        }
+    }
+    if (found as usize) == 0 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_UNMAPPED);
+        return ctx.dummy_ptr;
+    }
+    let is_live = unsafe { (*found).is_live };
+    if !is_live {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DANGLING);
+        return ctx.dummy_ptr;
+    }
+    let base = unsafe { (*found).base_addr };
+    let asz = unsafe { (*found).size };
+    if addr + size > base + asz {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_OOB);
+        return ctx.dummy_ptr;
+    }
+    let off = (addr - base) as usize;
+    unsafe { (*found).host_ptr + off }
+}
+
+pub fn interp_resolve_synth_ptr(ctx: mut_view<InterpCtx>, addr: u64) -> *mut u8 {
+    if addr == 0u64 {
+        return ctx.dummy_ptr;
+    }
+    let mut i: usize = ctx.alloc_count;
+    while i > 0 {
+        i = i - 1;
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let is_live = unsafe { (*a).is_live };
+        let base = unsafe { (*a).base_addr };
+        let asz = unsafe { (*a).size };
+        if is_live && addr >= base && addr <= base + asz {
+            let off = (addr - base) as usize;
+            return unsafe { (*a).host_ptr + off };
+        }
+    }
+    (addr as usize) as *mut u8
+}
+
+pub fn interp_validate_ptr_arith(ctx: mut_view<InterpCtx>, orig_addr: u64, new_addr: u64) {
+    if orig_addr == 0u64 && new_addr == 0u64 {
+        return;
+    }
+    let mut found: *mut InterpAlloc = 0 as *mut InterpAlloc;
+    let mut i: usize = ctx.alloc_count;
+    while i > 0 {
+        i = i - 1;
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let is_live = unsafe { (*a).is_live };
+        let base = unsafe { (*a).base_addr };
+        let asz = unsafe { (*a).size };
+        if is_live && orig_addr >= base && orig_addr <= base + asz {
+            found = a;
+            break;
+        }
+    }
+    if (found as usize) == 0 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_PTR_ARITH_UNMAPPED);
+        return;
+    }
+    let base = unsafe { (*found).base_addr };
+    let asz = unsafe { (*found).size };
+    if new_addr < base || new_addr > base + asz {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_PTR_ARITH_OOB);
+    }
+}
+
+pub fn interp_find_synth_addr(ctx: view<InterpCtx>, host_ptr: *const u8) -> u64 {
+    let h_addr = host_ptr as usize;
+    if h_addr == 0 {
+        return 0u64;
+    }
+    let mut i: usize = ctx.alloc_count;
+    while i > 0 {
+        i = i - 1;
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let is_live = unsafe { (*a).is_live };
+        let a_host = unsafe { (*a).host_ptr as usize };
+        let a_size = unsafe { (*a).size as usize };
+        if is_live && a_host != 0 && h_addr >= a_host && h_addr < a_host + a_size {
+            let off = (h_addr - a_host) as u64;
+            let base = unsafe { (*a).base_addr };
+            return base + off;
+        }
+    }
+    i = ctx.alloc_count;
+    while i > 0 {
+        i = i - 1;
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let is_live = unsafe { (*a).is_live };
+        let a_host = unsafe { (*a).host_ptr as usize };
+        let a_size = unsafe { (*a).size as usize };
+        if is_live && a_host != 0 && h_addr == a_host + a_size {
+            let base = unsafe { (*a).base_addr };
+            let asz = unsafe { (*a).size };
+            return base + asz;
+        }
+    }
+    0u64
+}
+
+pub fn interp_ensure_const_str_alloc(
+    ctx: mut_view<InterpCtx>,
+    str_bytes: *const u8,
+    str_len: usize
+) -> u64 {
+    let mut ptr: *mut u8 = str_bytes as *mut u8;
+    if (ptr as usize) == 0 {
+        ptr = arena_alloc_raw(mut_view(ctx.arena), 1, 1);
+        unsafe {
+            *ptr = 0u8;
+        }
+    }
+    let target_host = ptr as usize;
+    let min_sz: u64 = if str_len > 0 { str_len as u64 } else { 1u64 };
+    let mut i: usize = 0;
+    while i < ctx.alloc_count {
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        let is_live = unsafe { (*a).is_live };
+        let a_host = unsafe { (*a).host_ptr as usize };
+        let a_sz = unsafe { (*a).size };
+        if is_live && a_host == target_host && a_sz >= min_sz {
+            return unsafe { (*a).base_addr };
+        }
+        i = i + 1;
+    }
+    let alloc_sz: u64 = (str_len + 1) as u64;
+    let na = interp_register_alloc(mut_view(*ctx), ptr, alloc_sz, 1u32, 0);
+    unsafe { (*na).base_addr }
+}
+
+pub fn interp_register_const_allocs(ctx: mut_view<InterpCtx>) {
+    if (ctx.thir as usize) == 0 {
+        return;
+    }
+    let cap = unsafe { (*ctx.thir).symbol_consts.cap };
+    let states = unsafe { (*ctx.thir).symbol_consts.states };
+    let vals = unsafe { (*ctx.thir).symbol_consts.vals };
+    let mut i: usize = 0;
+    while i < cap {
+        let st = unsafe { *(states + i) };
+        if st == 1u8 {
+            let off = interp_mul_usize(i, size_of<ConstValue>());
+            let cv = ((vals as usize) + off) as *mut ConstValue;
+            let kind = unsafe { (*cv).kind };
+            let agg_data = unsafe { (*cv).agg_data };
+            if kind == CONST_AGGREGATE && (agg_data as usize) != 0 {
+                let agg_sz = unsafe { (*cv).agg_size as u64 };
+                let agg_al = unsafe { (*cv).agg_align as u32 };
+                let _ = interp_register_alloc(mut_view(*ctx), agg_data, agg_sz, agg_al, 0);
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// =================================================================================================
+// Context Initialization & Teardown
+// =================================================================================================
+
+pub fn interp_ctx_init(
+    ctx: mut_view<InterpCtx>,
+    main_fn: *mut HirItem,
+    thir: *mut Thir,
+    hir: *const HirFile,
+    interner: *mut StrInterner,
+    rmap: *const ResolveMap,
+    ast: *const Ast,
+    db: *const SourceDatabase,
+    sink: *mut DiagSink,
+    mono_engine: *mut MonoEngine,
+    step_limit: i32,
+    call_depth_limit: i32,
+    mir_map: *mut MirBodyMap,
+    out_buf: *mut DiagBuffer,
+    capture_stdout: bool
+) {
+    ctx.main_fn = main_fn;
+    ctx.thir = thir;
+    ctx.hir = hir;
+    ctx.interner = interner;
+    ctx.rmap = rmap;
+    ctx.ast = ast;
+    ctx.db = db;
+    ctx.sink = sink;
+    ctx.mono_engine = mono_engine;
+    ctx.step_limit = step_limit;
+    ctx.call_depth_limit = call_depth_limit;
+    ctx.mir_map = mir_map;
+    ctx.build_on_demand = true;
+    ctx.steps = 0;
+    ctx.call_depth = 0;
+    let a = arena_with_chunk_size(65536);
+    ctx.arena = a;
+    ctx.failed = false;
+    ctx.has_panicked = false;
+    ctx.has_exited = false;
+    ctx.exit_code = 0;
+    ctx.panic_msg_ptr = 0 as *const u8;
+    ctx.panic_msg_len = 0;
+    ctx.out_buf = out_buf;
+    ctx.capture_stdout = capture_stdout;
+    let dummy = arena_alloc_raw(mut_view(ctx.arena), 64, 16);
+    unsafe {
+        interp_zero_bytes(dummy, 64);
+    }
+    ctx.dummy_ptr = dummy;
+    ctx.allocs = 0 as *mut InterpAlloc;
+    ctx.alloc_count = 0;
+    ctx.alloc_cap = 0;
+    ctx.next_synth_addr = INTERP_SYNTH_BASE_RUNTIME;
+    ctx.is_comptime = false;
+    ctx.comptime_err_code = 0u16;
+    ctx.comptime_err_span = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    ctx.comptime_err_msg = StrView { ptr: 0 as *const u8, len: 0 };
+    ctx.current_span = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    ctx.host.args = 0 as *mut InterpHostArg;
+    ctx.host.argc = 0;
+    ctx.host.args_cap = 0;
+    ctx.host.use_custom_args = false;
+    ctx.host.open_fds = 0 as *mut i64;
+    ctx.host.open_fds_len = 0;
+    ctx.host.open_fds_cap = 0;
+    ctx.host.open_dirs = 0 as *mut i64;
+    ctx.host.open_dirs_len = 0;
+    ctx.host.open_dirs_cap = 0;
+    ctx.host.last_monotonic_ns = 0u64;
+}
+
+pub fn interp_ctx_alloc_zeroed() -> *mut InterpCtx {
+    let sz = size_of<InterpCtx>();
+    let al = align_of<InterpCtx>();
+    let p = unsafe { heap_alloc(sz, al) as *mut InterpCtx };
+    unsafe {
+        interp_zero_bytes(p as *mut u8, sz);
+    }
+    p
+}
+
+pub fn interp_ctx_dealloc(ctx_ptr: *mut InterpCtx) {
+    if (ctx_ptr as usize) != 0 {
+        unsafe {
+            heap_free(ctx_ptr as *mut u8, size_of<InterpCtx>(), align_of<InterpCtx>());
+        }
+    }
+}
+
+pub fn interp_ctx_free_allocs(ctx: mut_view<InterpCtx>) {
+    if (ctx.allocs as usize) != 0 {
+        let mut i: usize = 0;
+        while i < ctx.alloc_count {
+            let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+            let depth = unsafe { (*a).call_depth };
+            let hptr = unsafe { (*a).host_ptr };
+            let sz = unsafe { (*a).size as usize };
+            if depth == -1 && (hptr as usize) != 0 {
+                let alloc_bytes = if sz < 16 { 16 } else { sz };
+                unsafe {
+                    heap_free(hptr, alloc_bytes, 16);
+                    (*a).host_ptr = 0 as *mut u8;
+                    (*a).is_live = false;
+                }
+            }
+            i = i + 1;
+        }
+        let cap_bytes = interp_mul_usize(ctx.alloc_cap, size_of<InterpAlloc>());
+        unsafe {
+            heap_free(ctx.allocs as *mut u8, cap_bytes, align_of<InterpAlloc>());
+        }
+        ctx.allocs = 0 as *mut InterpAlloc;
+        ctx.alloc_count = 0;
+        ctx.alloc_cap = 0;
+    }
+}

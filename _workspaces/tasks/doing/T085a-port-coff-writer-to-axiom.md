@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T077]
 priority: 119
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/obj, tests/selfhost/obj]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
+started: 2026-10-18 12:55:19
+agent: T085a-impl
 ---
 # T085a — Port COFF object writer & object model to Axiom
 
@@ -37,3 +39,6 @@ Port COFF object file model and binary writer (`compiler/obj/`) from C to Axiom.
 ## Notes
 - Sub-task of T085 split per ADR-0005 §8 and SPEC-20 §4.9.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 12:55:19 started (attempt 1) T085a-impl

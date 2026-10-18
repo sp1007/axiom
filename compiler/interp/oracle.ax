@@ -1,0 +1,881 @@
+// Axiom Compiler — MIR Interpreter Host Oracle (compiler/interp/oracle.ax)
+// Port of bootstrap/axiom0/src/interp/host.c.
+// Implements the 18-function std.core.host capability table (ADR-0002) by validating all
+// interpreted pointers against the interpreter allocation table and delegating host operations
+// to std.core.host intrinsics (never raw extern "system" FFI, per ADR-0002 §6).
+module compiler.interp.oracle
+
+use std.core.host.arg
+use std.core.host.args_count
+use std.core.host.close
+use std.core.host.dir_close
+use std.core.host.dir_next
+use std.core.host.dir_open
+use std.core.host.env_get
+use std.core.host.exe_path
+use std.core.host.file_size
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.metadata
+use std.core.host.mkdir
+use std.core.host.monotonic_ns
+use std.core.host.open
+use std.core.host.read
+use std.core.host.remove
+use std.core.host.stdio
+use std.core.host.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.interp.value.INTERP_MSG_UB_DANGLING
+use compiler.interp.value.INTERP_MSG_UB_FREE_NON_HEAP
+use compiler.interp.value.INTERP_MSG_UB_UNMAPPED
+use compiler.interp.value.InterpAlloc
+use compiler.interp.value.InterpCtx
+use compiler.interp.value.InterpHostArg
+use compiler.interp.value.InterpValue
+use compiler.interp.value.interp_alloc_at
+use compiler.interp.value.interp_copy_bytes
+use compiler.interp.value.interp_host_arg_at
+use compiler.interp.value.interp_i64_at
+use compiler.interp.value.interp_mul_usize
+use compiler.interp.value.interp_register_alloc
+use compiler.interp.value.interp_report_ub
+use compiler.interp.value.interp_validate_raw_ptr
+use compiler.interp.value.interp_zero_bytes
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// Concatenated host intrinsic names:
+//   0..10:   "heap_alloc"
+//   10..22:  "heap_realloc"
+//   22..31:  "heap_free"
+//   31..36:  "stdio"
+//   36..40:  "open"
+//   40..44:  "read"
+//   44..49:  "write"
+//   49..54:  "close"
+//   54..63:  "file_size"
+//   63..73:  "args_count"
+//   73..76:  "arg"
+//   76..83:  "env_get"
+//   83..91:  "exe_path"
+//   91..95:  "exit"
+//   95..101: "remove"
+//   101..106:"mkdir"
+//   106..114:"metadata"
+//   114..122:"dir_open"
+//   122..130:"dir_next"
+//   130..139:"dir_close"
+//   139..151:"monotonic_ns"
+const HOST_NAMES_BYTES: [151]u8 = [
+    // "heap_alloc" (0, 10)
+    104u8, 101u8, 97u8, 112u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    // "heap_realloc" (10, 12)
+    104u8, 101u8, 97u8, 112u8, 95u8, 114u8, 101u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    // "heap_free" (22, 9)
+    104u8, 101u8, 97u8, 112u8, 95u8, 102u8, 114u8, 101u8, 101u8,
+    // "stdio" (31, 5)
+    115u8, 116u8, 100u8, 105u8, 111u8,
+    // "open" (36, 4)
+    111u8, 112u8, 101u8, 110u8,
+    // "read" (40, 4)
+    114u8, 101u8, 97u8, 100u8,
+    // "write" (44, 5)
+    119u8, 114u8, 105u8, 116u8, 101u8,
+    // "close" (49, 5)
+    99u8, 108u8, 111u8, 115u8, 101u8,
+    // "file_size" (54, 9)
+    102u8, 105u8, 108u8, 101u8, 95u8, 115u8, 105u8, 122u8, 101u8,
+    // "args_count" (63, 10)
+    97u8, 114u8, 103u8, 115u8, 95u8, 99u8, 111u8, 117u8, 110u8, 116u8,
+    // "arg" (73, 3)
+    97u8, 114u8, 103u8,
+    // "env_get" (76, 7)
+    101u8, 110u8, 118u8, 95u8, 103u8, 101u8, 116u8,
+    // "exe_path" (83, 8)
+    101u8, 120u8, 101u8, 95u8, 112u8, 97u8, 116u8, 104u8,
+    // "exit" (91, 4)
+    101u8, 120u8, 105u8, 116u8,
+    // "remove" (95, 6)
+    114u8, 101u8, 109u8, 111u8, 118u8, 101u8,
+    // "mkdir" (101, 5)
+    109u8, 107u8, 100u8, 105u8, 114u8,
+    // "metadata" (106, 8)
+    109u8, 101u8, 116u8, 97u8, 100u8, 97u8, 116u8, 97u8,
+    // "dir_open" (114, 8)
+    100u8, 105u8, 114u8, 95u8, 111u8, 112u8, 101u8, 110u8,
+    // "dir_next" (122, 8)
+    100u8, 105u8, 114u8, 95u8, 110u8, 101u8, 120u8, 116u8,
+    // "dir_close" (130, 9)
+    100u8, 105u8, 114u8, 95u8, 99u8, 108u8, 111u8, 115u8, 101u8,
+    // "monotonic_ns" (139, 12)
+    109u8, 111u8, 110u8, 111u8, 116u8, 111u8, 110u8, 105u8, 99u8, 95u8, 110u8, 115u8,
+];
+
+fn host_name_eq(name: view<StrView>, off: usize, n: usize) -> bool {
+    if name.len != n || (name.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n {
+        let ch = unsafe { *(name.ptr + i) };
+        if ch != HOST_NAMES_BYTES[off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn interp_is_host_intrinsic_name(name: view<StrView>) -> bool {
+    if host_name_eq(name, 0, 10) { return true; }
+    if host_name_eq(name, 10, 12) { return true; }
+    if host_name_eq(name, 22, 9) { return true; }
+    if host_name_eq(name, 31, 5) { return true; }
+    if host_name_eq(name, 36, 4) { return true; }
+    if host_name_eq(name, 40, 4) { return true; }
+    if host_name_eq(name, 44, 5) { return true; }
+    if host_name_eq(name, 49, 5) { return true; }
+    if host_name_eq(name, 54, 9) { return true; }
+    if host_name_eq(name, 63, 10) { return true; }
+    if host_name_eq(name, 73, 3) { return true; }
+    if host_name_eq(name, 76, 7) { return true; }
+    if host_name_eq(name, 83, 8) { return true; }
+    if host_name_eq(name, 91, 4) { return true; }
+    if host_name_eq(name, 95, 6) { return true; }
+    if host_name_eq(name, 101, 5) { return true; }
+    if host_name_eq(name, 106, 8) { return true; }
+    if host_name_eq(name, 114, 8) { return true; }
+    if host_name_eq(name, 122, 8) { return true; }
+    if host_name_eq(name, 130, 9) { return true; }
+    if host_name_eq(name, 139, 12) { return true; }
+    false
+}
+
+// =================================================================================================
+// Host State Lifecycle & Handle Tracking
+// =================================================================================================
+
+pub fn interp_host_init(ctx: mut_view<InterpCtx>) {
+    ctx.host.args = 0 as *mut InterpHostArg;
+    ctx.host.argc = 0;
+    ctx.host.args_cap = 0;
+    ctx.host.use_custom_args = false;
+    ctx.host.open_fds = 0 as *mut i64;
+    ctx.host.open_fds_len = 0;
+    ctx.host.open_fds_cap = 0;
+    ctx.host.open_dirs = 0 as *mut i64;
+    ctx.host.open_dirs_len = 0;
+    ctx.host.open_dirs_cap = 0;
+    ctx.host.last_monotonic_ns = 0u64;
+}
+
+pub fn interp_host_set_custom_args(ctx: mut_view<InterpCtx>, enable: bool) {
+    ctx.host.use_custom_args = enable;
+}
+
+pub fn interp_host_push_arg(ctx: mut_view<InterpCtx>, arg_sv: StrView) {
+    ctx.host.use_custom_args = true;
+    if ctx.host.argc >= ctx.host.args_cap {
+        let new_cap: usize = if ctx.host.args_cap == 0 { 16 } else { interp_mul_usize(ctx.host.args_cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<InterpHostArg>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<InterpHostArg>()) as *mut InterpHostArg };
+        unsafe {
+            interp_zero_bytes(new_arr as *mut u8, new_bytes);
+        }
+        if ctx.host.argc > 0 && (ctx.host.args as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.host.argc, size_of<InterpHostArg>());
+            let old_cap_bytes = interp_mul_usize(ctx.host.args_cap, size_of<InterpHostArg>());
+            unsafe {
+                interp_copy_bytes(new_arr as *mut u8, ctx.host.args as *const u8, old_bytes);
+                heap_free(ctx.host.args as *mut u8, old_cap_bytes, align_of<InterpHostArg>());
+            }
+        }
+        ctx.host.args = new_arr;
+        ctx.host.args_cap = new_cap;
+    }
+
+    let arg_len = arg_sv.len;
+    let alloc_len: usize = if arg_len < 16 { 16 } else { arg_len + 1 };
+    let copy_buf = unsafe { heap_alloc(alloc_len, 1) };
+    unsafe {
+        interp_zero_bytes(copy_buf, alloc_len);
+    }
+    if arg_len > 0 && (arg_sv.ptr as usize) != 0 {
+        unsafe {
+            interp_copy_bytes(copy_buf, arg_sv.ptr, arg_len);
+        }
+    }
+    let slot = unsafe { interp_host_arg_at(ctx.host.args, ctx.host.argc) };
+    unsafe {
+        (*slot).ptr = copy_buf;
+        (*slot).len = arg_len;
+    }
+    ctx.host.argc = ctx.host.argc + 1;
+}
+
+fn host_record_open_fd(ctx: mut_view<InterpCtx>, fd: i64) {
+    if ctx.host.open_fds_len >= ctx.host.open_fds_cap {
+        let new_cap: usize = if ctx.host.open_fds_cap == 0 { 16 } else { interp_mul_usize(ctx.host.open_fds_cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<i64>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<i64>()) as *mut i64 };
+        if ctx.host.open_fds_len > 0 && (ctx.host.open_fds as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.host.open_fds_len, size_of<i64>());
+            let old_cap_bytes = interp_mul_usize(ctx.host.open_fds_cap, size_of<i64>());
+            unsafe {
+                interp_copy_bytes(new_arr as *mut u8, ctx.host.open_fds as *const u8, old_bytes);
+                heap_free(ctx.host.open_fds as *mut u8, old_cap_bytes, align_of<i64>());
+            }
+        }
+        ctx.host.open_fds = new_arr;
+        ctx.host.open_fds_cap = new_cap;
+    }
+    unsafe {
+        *interp_i64_at(ctx.host.open_fds, ctx.host.open_fds_len) = fd;
+    }
+    ctx.host.open_fds_len = ctx.host.open_fds_len + 1;
+}
+
+fn host_has_open_fd(ctx: view<InterpCtx>, fd: i64) -> bool {
+    let mut i: usize = 0;
+    while i < ctx.host.open_fds_len {
+        let cur = unsafe { *interp_i64_at(ctx.host.open_fds, i) };
+        if cur == fd {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn host_remove_open_fd(ctx: mut_view<InterpCtx>, fd: i64) -> bool {
+    let mut i: usize = 0;
+    while i < ctx.host.open_fds_len {
+        let cur = unsafe { *interp_i64_at(ctx.host.open_fds, i) };
+        if cur == fd {
+            let last_idx = ctx.host.open_fds_len - 1;
+            if i != last_idx {
+                let last_val = unsafe { *interp_i64_at(ctx.host.open_fds, last_idx) };
+                unsafe {
+                    *interp_i64_at(ctx.host.open_fds, i) = last_val;
+                }
+            }
+            ctx.host.open_fds_len = last_idx;
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn host_record_open_dir(ctx: mut_view<InterpCtx>, dhid: i64) {
+    if ctx.host.open_dirs_len >= ctx.host.open_dirs_cap {
+        let new_cap: usize = if ctx.host.open_dirs_cap == 0 { 16 } else { interp_mul_usize(ctx.host.open_dirs_cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<i64>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<i64>()) as *mut i64 };
+        if ctx.host.open_dirs_len > 0 && (ctx.host.open_dirs as usize) != 0 {
+            let old_bytes = interp_mul_usize(ctx.host.open_dirs_len, size_of<i64>());
+            let old_cap_bytes = interp_mul_usize(ctx.host.open_dirs_cap, size_of<i64>());
+            unsafe {
+                interp_copy_bytes(new_arr as *mut u8, ctx.host.open_dirs as *const u8, old_bytes);
+                heap_free(ctx.host.open_dirs as *mut u8, old_cap_bytes, align_of<i64>());
+            }
+        }
+        ctx.host.open_dirs = new_arr;
+        ctx.host.open_dirs_cap = new_cap;
+    }
+    unsafe {
+        *interp_i64_at(ctx.host.open_dirs, ctx.host.open_dirs_len) = dhid;
+    }
+    ctx.host.open_dirs_len = ctx.host.open_dirs_len + 1;
+}
+
+fn host_has_open_dir(ctx: view<InterpCtx>, dhid: i64) -> bool {
+    let mut i: usize = 0;
+    while i < ctx.host.open_dirs_len {
+        let cur = unsafe { *interp_i64_at(ctx.host.open_dirs, i) };
+        if cur == dhid {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn host_remove_open_dir(ctx: mut_view<InterpCtx>, dhid: i64) -> bool {
+    let mut i: usize = 0;
+    while i < ctx.host.open_dirs_len {
+        let cur = unsafe { *interp_i64_at(ctx.host.open_dirs, i) };
+        if cur == dhid {
+            let last_idx = ctx.host.open_dirs_len - 1;
+            if i != last_idx {
+                let last_val = unsafe { *interp_i64_at(ctx.host.open_dirs, last_idx) };
+                unsafe {
+                    *interp_i64_at(ctx.host.open_dirs, i) = last_val;
+                }
+            }
+            ctx.host.open_dirs_len = last_idx;
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn interp_host_cleanup(ctx: mut_view<InterpCtx>) {
+    let mut i: usize = 0;
+    while i < ctx.host.open_fds_len {
+        let fd = unsafe { *interp_i64_at(ctx.host.open_fds, i) };
+        let _ = close(fd);
+        i = i + 1;
+    }
+    if ctx.host.open_fds_cap > 0 && (ctx.host.open_fds as usize) != 0 {
+        let cap_bytes = interp_mul_usize(ctx.host.open_fds_cap, size_of<i64>());
+        unsafe {
+            heap_free(ctx.host.open_fds as *mut u8, cap_bytes, align_of<i64>());
+        }
+    }
+    ctx.host.open_fds = 0 as *mut i64;
+    ctx.host.open_fds_len = 0;
+    ctx.host.open_fds_cap = 0;
+
+    i = 0;
+    while i < ctx.host.open_dirs_len {
+        let dhid = unsafe { *interp_i64_at(ctx.host.open_dirs, i) };
+        let _ = dir_close(dhid);
+        i = i + 1;
+    }
+    if ctx.host.open_dirs_cap > 0 && (ctx.host.open_dirs as usize) != 0 {
+        let cap_bytes = interp_mul_usize(ctx.host.open_dirs_cap, size_of<i64>());
+        unsafe {
+            heap_free(ctx.host.open_dirs as *mut u8, cap_bytes, align_of<i64>());
+        }
+    }
+    ctx.host.open_dirs = 0 as *mut i64;
+    ctx.host.open_dirs_len = 0;
+    ctx.host.open_dirs_cap = 0;
+
+    i = 0;
+    while i < ctx.host.argc {
+        let slot = unsafe { interp_host_arg_at(ctx.host.args, i) };
+        let p = unsafe { (*slot).ptr };
+        let l = unsafe { (*slot).len };
+        if (p as usize) != 0 {
+            let alloc_len: usize = if l < 16 { 16 } else { l + 1 };
+            unsafe {
+                heap_free(p, alloc_len, 1);
+                (*slot).ptr = 0 as *mut u8;
+            }
+        }
+        i = i + 1;
+    }
+    if ctx.host.args_cap > 0 && (ctx.host.args as usize) != 0 {
+        let cap_bytes = interp_mul_usize(ctx.host.args_cap, size_of<InterpHostArg>());
+        unsafe {
+            heap_free(ctx.host.args as *mut u8, cap_bytes, align_of<InterpHostArg>());
+        }
+    }
+    ctx.host.args = 0 as *mut InterpHostArg;
+    ctx.host.argc = 0;
+    ctx.host.args_cap = 0;
+    ctx.host.use_custom_args = false;
+}
+
+// =================================================================================================
+// Host Intrinsic Dispatch
+// =================================================================================================
+
+fn eval_host_heap_alloc(ctx: mut_view<InterpCtx>, size: u64, align: u64, out_ret: mut_view<InterpValue>) {
+    if size == 0u64 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    if align == 0u64 || (align & (align - 1u64)) != 0u64 || align > 4096u64 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    let alloc_bytes: usize = if size < 16u64 { 16 } else { size as usize };
+    let mem = unsafe { heap_alloc(alloc_bytes, 16) };
+    if (mem as usize) == 0 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    unsafe {
+        interp_zero_bytes(mem, alloc_bytes);
+    }
+    let a = interp_register_alloc(mut_view(*ctx), mem, size, align as u32, -1);
+    out_ret.vals[0] = unsafe { (*a).base_addr };
+}
+
+fn eval_host_heap_realloc(
+    ctx: mut_view<InterpCtx>,
+    p: u64,
+    old_size: u64,
+    new_size: u64,
+    align: u64,
+    out_ret: mut_view<InterpValue>
+) {
+    if p == 0u64 {
+        eval_host_heap_alloc(mut_view(*ctx), new_size, align, mut_view(*out_ret));
+        return;
+    }
+    if new_size == 0u64 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    if align == 0u64 || (align & (align - 1u64)) != 0u64 || align > 4096u64 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+
+    let mut found: *mut InterpAlloc = 0 as *mut InterpAlloc;
+    let mut i: usize = 0;
+    while i < ctx.alloc_count {
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        if (unsafe { (*a).base_addr }) == p {
+            found = a;
+            break;
+        }
+        i = i + 1;
+    }
+    if (found as usize) == 0 || !(unsafe { (*found).is_live }) || (unsafe { (*found).call_depth }) != -1 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DANGLING);
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+
+    let alloc_bytes: usize = if new_size < 16u64 { 16 } else { new_size as usize };
+    let new_mem = unsafe { heap_alloc(alloc_bytes, 16) };
+    if (new_mem as usize) == 0 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    unsafe {
+        interp_zero_bytes(new_mem, alloc_bytes);
+    }
+
+    let mut copy_sz: u64 = if old_size < new_size { old_size } else { new_size };
+    let found_sz = unsafe { (*found).size };
+    if found_sz < copy_sz {
+        copy_sz = found_sz;
+    }
+    let found_ptr = unsafe { (*found).host_ptr };
+    if copy_sz > 0u64 && (found_ptr as usize) != 0 {
+        unsafe {
+            interp_copy_bytes(new_mem, found_ptr as *const u8, copy_sz as usize);
+        }
+    }
+    if (found_ptr as usize) != 0 {
+        let old_alloc_bytes: usize = if found_sz < 16u64 { 16 } else { found_sz as usize };
+        unsafe {
+            heap_free(found_ptr, old_alloc_bytes, 16);
+        }
+    }
+    unsafe {
+        (*found).is_live = false;
+        (*found).host_ptr = 0 as *mut u8;
+    }
+
+    let na = interp_register_alloc(mut_view(*ctx), new_mem, new_size, align as u32, -1);
+    out_ret.vals[0] = unsafe { (*na).base_addr };
+}
+
+fn eval_host_heap_free(ctx: mut_view<InterpCtx>, p: u64, out_ret: mut_view<InterpValue>) {
+    if p == 0u64 {
+        out_ret.vals[0] = 0u64;
+        return;
+    }
+    let mut found: *mut InterpAlloc = 0 as *mut InterpAlloc;
+    let mut i: usize = 0;
+    while i < ctx.alloc_count {
+        let a = unsafe { interp_alloc_at(ctx.allocs, i) };
+        if (unsafe { (*a).base_addr }) == p {
+            found = a;
+            break;
+        }
+        i = i + 1;
+    }
+    if (found as usize) == 0 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_UNMAPPED);
+        return;
+    }
+    if !(unsafe { (*found).is_live }) {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DANGLING);
+        return;
+    }
+    if (unsafe { (*found).call_depth }) != -1 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_FREE_NON_HEAP);
+        return;
+    }
+    let found_ptr = unsafe { (*found).host_ptr };
+    let found_sz = unsafe { (*found).size };
+    if (found_ptr as usize) != 0 {
+        let old_alloc_bytes: usize = if found_sz < 16u64 { 16 } else { found_sz as usize };
+        unsafe {
+            heap_free(found_ptr, old_alloc_bytes, 16);
+        }
+    }
+    unsafe {
+        (*found).is_live = false;
+        (*found).host_ptr = 0 as *mut u8;
+    }
+    out_ret.vals[0] = 0u64;
+}
+
+pub fn interp_eval_host_intrinsic(
+    ctx: mut_view<InterpCtx>,
+    name: StrView,
+    args: *const u64,
+    arg_count: usize,
+    out_ret: mut_view<InterpValue>
+) -> bool {
+    let a0: u64 = if arg_count > 0 && (args as usize) != 0 { unsafe { *(args + 0) } } else { 0u64 };
+    let a1: u64 = if arg_count > 1 && (args as usize) != 0 { unsafe { *(args + 1) } } else { 0u64 };
+    let a2: u64 = if arg_count > 2 && (args as usize) != 0 { unsafe { *(args + 2) } } else { 0u64 };
+    let a3: u64 = if arg_count > 3 && (args as usize) != 0 { unsafe { *(args + 3) } } else { 0u64 };
+
+    // 1. heap_alloc
+    if host_name_eq(view(name), 0, 10) {
+        eval_host_heap_alloc(mut_view(*ctx), a0, a1, mut_view(*out_ret));
+        return true;
+    }
+
+    // 2. heap_realloc
+    if host_name_eq(view(name), 10, 12) {
+        eval_host_heap_realloc(mut_view(*ctx), a0, a1, a2, a3, mut_view(*out_ret));
+        return true;
+    }
+
+    // 3. heap_free
+    if host_name_eq(view(name), 22, 9) {
+        eval_host_heap_free(mut_view(*ctx), a0, mut_view(*out_ret));
+        return true;
+    }
+
+    // 4. stdio
+    if host_name_eq(view(name), 31, 5) {
+        if a0 <= 2u64 {
+            out_ret.vals[0] = a0;
+        } else {
+            out_ret.vals[0] = (-4i64) as u64;
+        }
+        return true;
+    }
+
+    // 5. open
+    if host_name_eq(view(name), 36, 4) {
+        let path_host = interp_validate_raw_ptr(mut_view(*ctx), a0, a1, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let mode = a2 as u32;
+        if mode > 2u32 {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { open(path_host as *const u8, a1 as usize, mode) };
+        if res >= 3i64 {
+            host_record_open_fd(mut_view(*ctx), res);
+        }
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 6. read
+    if host_name_eq(view(name), 40, 4) {
+        let h = a0 as i64;
+        let buf_addr = a1;
+        let cap = a2;
+        if cap == 0u64 {
+            out_ret.vals[0] = 0u64;
+            return true;
+        }
+        let buf_host = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, cap, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        if h != 0i64 && !(h >= 3i64 && host_has_open_fd(view(*ctx), h)) {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { read(h, buf_host, cap as usize) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 7. write
+    if host_name_eq(view(name), 44, 5) {
+        let h = a0 as i64;
+        let p_addr = a1;
+        let byte_len = a2;
+        if byte_len == 0u64 {
+            out_ret.vals[0] = 0u64;
+            return true;
+        }
+        let p_host = interp_validate_raw_ptr(mut_view(*ctx), p_addr, byte_len, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        if h == 1i64 && (ctx.out_buf as usize) != 0 && ctx.capture_stdout {
+            unsafe {
+                diag_buf_push_bytes(mut_view(*ctx.out_buf), p_host as *const u8, byte_len as usize);
+            }
+            out_ret.vals[0] = byte_len;
+            return true;
+        }
+        if h != 1i64 && h != 2i64 && !(h >= 3i64 && host_has_open_fd(view(*ctx), h)) {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { write(h, p_host as *const u8, byte_len as usize) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 8. close
+    if host_name_eq(view(name), 49, 5) {
+        let h = a0 as i64;
+        if h >= 0i64 && h <= 2i64 {
+            out_ret.vals[0] = 0u64;
+            return true;
+        }
+        if h >= 3i64 && host_remove_open_fd(mut_view(*ctx), h) {
+            let res = close(h);
+            out_ret.vals[0] = res as u64;
+            return true;
+        }
+        out_ret.vals[0] = (-4i64) as u64;
+        return true;
+    }
+
+    // 9. file_size
+    if host_name_eq(view(name), 54, 9) {
+        let h = a0 as i64;
+        if h < 3i64 || !host_has_open_fd(view(*ctx), h) {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = file_size(h);
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 10. args_count
+    if host_name_eq(view(name), 63, 10) {
+        if ctx.host.use_custom_args {
+            out_ret.vals[0] = ctx.host.argc as u64;
+        } else {
+            let ac = args_count();
+            out_ret.vals[0] = ac as u64;
+        }
+        return true;
+    }
+
+    // 11. arg
+    if host_name_eq(view(name), 73, 3) {
+        let idx = a0 as usize;
+        let buf_addr = a1;
+        let cap = a2 as usize;
+        if ctx.host.use_custom_args {
+            if idx >= ctx.host.argc {
+                out_ret.vals[0] = (-4i64) as u64;
+                return true;
+            }
+            let slot = unsafe { interp_host_arg_at(ctx.host.args, idx) };
+            let ptr = unsafe { (*slot).ptr };
+            let arg_len = unsafe { (*slot).len };
+            if cap > 0 && arg_len > 0 {
+                let to_write: usize = if arg_len < cap { arg_len } else { cap };
+                let host_buf = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, to_write as u64, 1u32);
+                if !ctx.failed {
+                    unsafe {
+                        interp_copy_bytes(host_buf, ptr as *const u8, to_write);
+                    }
+                }
+            }
+            out_ret.vals[0] = (arg_len as i64) as u64;
+            return true;
+        }
+        let total_len = unsafe { arg(idx, 0 as *mut u8, 0) };
+        if total_len < 0i64 {
+            out_ret.vals[0] = total_len as u64;
+            return true;
+        }
+        if cap > 0 && total_len > 0i64 {
+            let ulen = total_len as usize;
+            let to_write: usize = if ulen < cap { ulen } else { cap };
+            let host_buf = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, to_write as u64, 1u32);
+            if !ctx.failed {
+                let _ = unsafe { arg(idx, host_buf, to_write) };
+            }
+        }
+        out_ret.vals[0] = total_len as u64;
+        return true;
+    }
+
+    // 12. env_get
+    if host_name_eq(view(name), 76, 7) {
+        let name_addr = a0;
+        let name_len = a1;
+        let buf_addr = a2;
+        let cap = a3 as usize;
+        let name_host = interp_validate_raw_ptr(mut_view(*ctx), name_addr, name_len, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let total_len = unsafe { env_get(name_host as *const u8, name_len as usize, 0 as *mut u8, 0) };
+        if total_len < 0i64 {
+            out_ret.vals[0] = total_len as u64;
+            return true;
+        }
+        if cap > 0 && total_len > 0i64 {
+            let ulen = total_len as usize;
+            let to_write: usize = if ulen < cap { ulen } else { cap };
+            let host_buf = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, to_write as u64, 1u32);
+            if !ctx.failed {
+                let _ = unsafe { env_get(name_host as *const u8, name_len as usize, host_buf, to_write) };
+            }
+        }
+        out_ret.vals[0] = total_len as u64;
+        return true;
+    }
+
+    // 13. exe_path
+    if host_name_eq(view(name), 83, 8) {
+        let buf_addr = a0;
+        let cap = a1 as usize;
+        let total_len = unsafe { exe_path(0 as *mut u8, 0) };
+        if total_len < 0i64 {
+            out_ret.vals[0] = total_len as u64;
+            return true;
+        }
+        if cap > 0 && total_len > 0i64 {
+            let ulen = total_len as usize;
+            let to_write: usize = if ulen < cap { ulen } else { cap };
+            let host_buf = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, to_write as u64, 1u32);
+            if !ctx.failed {
+                let _ = unsafe { exe_path(host_buf, to_write) };
+            }
+        }
+        out_ret.vals[0] = total_len as u64;
+        return true;
+    }
+
+    // 14. exit
+    if host_name_eq(view(name), 91, 4) {
+        let code = (a0 as u32) as i32;
+        ctx.failed = true;
+        ctx.has_exited = true;
+        ctx.exit_code = code;
+        out_ret.vals[0] = (code as i64) as u64;
+        return true;
+    }
+
+    // 15. remove
+    if host_name_eq(view(name), 95, 6) {
+        let path_host = interp_validate_raw_ptr(mut_view(*ctx), a0, a1, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { remove(path_host as *const u8, a1 as usize) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 16. mkdir
+    if host_name_eq(view(name), 101, 5) {
+        let path_host = interp_validate_raw_ptr(mut_view(*ctx), a0, a1, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { mkdir(path_host as *const u8, a1 as usize) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 17. metadata
+    if host_name_eq(view(name), 106, 8) {
+        let path_host = interp_validate_raw_ptr(mut_view(*ctx), a0, a1, 1u32);
+        let out_host = interp_validate_raw_ptr(mut_view(*ctx), a2, 16u64, 8u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { metadata(path_host as *const u8, a1 as usize, out_host as *mut u64) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 18. dir_open
+    if host_name_eq(view(name), 114, 8) {
+        let path_host = interp_validate_raw_ptr(mut_view(*ctx), a0, a1, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { dir_open(path_host as *const u8, a1 as usize) };
+        if res > 0i64 {
+            host_record_open_dir(mut_view(*ctx), res);
+        }
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 19. dir_next
+    if host_name_eq(view(name), 122, 8) {
+        let dhid = a0 as i64;
+        let buf_addr = a1;
+        let cap = a2 as usize;
+        if !host_has_open_dir(view(*ctx), dhid) {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let n = unsafe { dir_next(dhid, 0 as *mut u8, 0) };
+        if n <= 0i64 || (n as usize) > cap {
+            out_ret.vals[0] = n as u64;
+            return true;
+        }
+        let host_buf = interp_validate_raw_ptr(mut_view(*ctx), buf_addr, n as u64, 1u32);
+        if ctx.failed {
+            out_ret.vals[0] = (-4i64) as u64;
+            return true;
+        }
+        let res = unsafe { dir_next(dhid, host_buf, cap) };
+        out_ret.vals[0] = res as u64;
+        return true;
+    }
+
+    // 20. dir_close
+    if host_name_eq(view(name), 130, 9) {
+        let dhid = a0 as i64;
+        if host_remove_open_dir(mut_view(*ctx), dhid) {
+            let res = dir_close(dhid);
+            out_ret.vals[0] = res as u64;
+            return true;
+        }
+        out_ret.vals[0] = (-4i64) as u64;
+        return true;
+    }
+
+    // 21. monotonic_ns
+    if host_name_eq(view(name), 139, 12) {
+        let mut ns = monotonic_ns();
+        if ns < ctx.host.last_monotonic_ns {
+            ns = ctx.host.last_monotonic_ns;
+        } else {
+            ctx.host.last_monotonic_ns = ns;
+        }
+        out_ret.vals[0] = ns;
+        return true;
+    }
+
+    false
+}

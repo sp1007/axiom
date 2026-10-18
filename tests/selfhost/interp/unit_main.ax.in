@@ -1,0 +1,521 @@
+module main
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.id.FileId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.manager.SourceDatabase
+use compiler.diag.code.AX_UNSAFE_INTERP_UB
+use compiler.diag.code.AX_DRIVER_INTERP_STEP_LIMIT
+use compiler.diag.code.AX_DRIVER_INTERP_STACK_LIMIT
+use compiler.diag.code.AX_FFI_NOT_IN_ORACLE
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_free
+use compiler.syntax.ast.Ast
+use compiler.resolve.symtab.ResolveMap
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.traits.mono.MonoEngine
+use compiler.mir.mir.MirBody
+use compiler.interp.InterpAlloc
+use compiler.interp.InterpCtx
+use compiler.interp.InterpHostArg
+use compiler.interp.InterpHostState
+use compiler.interp.InterpValue
+use compiler.interp.MirBodyEntry
+use compiler.interp.MirBodyMap
+use compiler.interp.bit_mask_u64
+use compiler.interp.interp_check_step_limit
+use compiler.interp.interp_ctx_alloc_zeroed
+use compiler.interp.interp_ctx_dealloc
+use compiler.interp.interp_ctx_free_allocs
+use compiler.interp.interp_ctx_init
+use compiler.interp.interp_eval_host_intrinsic
+use compiler.interp.interp_find_synth_addr
+use compiler.interp.interp_host_cleanup
+use compiler.interp.interp_host_init
+use compiler.interp.interp_host_push_arg
+use compiler.interp.interp_host_set_custom_args
+use compiler.interp.interp_is_host_intrinsic_name
+use compiler.interp.interp_register_alloc
+use compiler.interp.interp_report_ffi_not_in_oracle
+use compiler.interp.interp_report_stack_limit
+use compiler.interp.interp_validate_ptr_arith
+use compiler.interp.interp_validate_raw_ptr
+use compiler.interp.mir_body_map_free
+use compiler.interp.mir_body_map_get_by_item
+use compiler.interp.mir_body_map_get_by_sym
+use compiler.interp.mir_body_map_init
+use compiler.interp.mir_body_map_insert
+use compiler.interp.sign_extend_u64
+use compiler.interp.signed_ge_u64
+use compiler.interp.signed_gt_u64
+use compiler.interp.signed_le_u64
+use compiler.interp.signed_lt_u64
+use compiler.interp.w_add_u64
+use compiler.interp.w_add_u64_ovf
+use compiler.interp.w_mul_u64
+use compiler.interp.w_mul_u64_ovf
+use compiler.interp.w_neg_u64
+use compiler.interp.w_sub_u64
+use compiler.interp.w_sub_u64_ovf
+
+@intrinsic fn assert(cond: bool) {}
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn check(cond: bool) {
+    if !cond {
+        assert(false);
+    }
+}
+
+fn alloc_init_sink() -> *mut DiagSink {
+    let p = unsafe { heap_alloc(size_of<DiagSink>(), align_of<DiagSink>()) as *mut DiagSink };
+    unsafe {
+        diag_sink_init(mut_view(*p));
+    }
+    p
+}
+
+fn free_dealloc_sink(p: *mut DiagSink) {
+    if (p as usize) != 0 {
+        unsafe {
+            diag_sink_free(mut_view(*p));
+            heap_free(p as *mut u8, size_of<DiagSink>(), align_of<DiagSink>());
+        }
+    }
+}
+
+fn make_empty_ctx(sink_ptr: *mut DiagSink, out_ptr: *mut DiagBuffer) -> *mut InterpCtx {
+    let ctx_ptr = interp_ctx_alloc_zeroed();
+    interp_ctx_init(
+        unsafe { mut_view(*ctx_ptr) },
+        0 as *mut HirItem,
+        0 as *mut Thir,
+        0 as *const HirFile,
+        0 as *mut StrInterner,
+        0 as *const ResolveMap,
+        0 as *const Ast,
+        0 as *const SourceDatabase,
+        sink_ptr,
+        0 as *mut MonoEngine,
+        1000,
+        64,
+        0 as *mut MirBodyMap,
+        out_ptr,
+        true
+    );
+    interp_host_init(unsafe { mut_view(*ctx_ptr) });
+    ctx_ptr
+}
+
+fn cleanup_empty_ctx(ctx_ptr: *mut InterpCtx) {
+    interp_ctx_free_allocs(unsafe { mut_view(*ctx_ptr) });
+    unsafe {
+        arena_destroy(mut_view((*ctx_ptr).arena));
+    }
+    interp_host_cleanup(unsafe { mut_view(*ctx_ptr) });
+    interp_ctx_dealloc(ctx_ptr);
+}
+
+fn test_wrapping_arith() {
+    let mut ovf = false;
+    let s1 = w_add_u64_ovf(10u64, 20u64, mut_view(ovf));
+    check(s1 == 30u64);
+    check(!ovf);
+
+    let s2 = w_add_u64_ovf(0xFFFFFFFFFFFFFFFFu64, 1u64, mut_view(ovf));
+    check(s2 == 0u64);
+    check(ovf);
+
+    let s3 = w_add_u64_ovf(0xFFFFFFFFFFFFFFFFu64, 2u64, mut_view(ovf));
+    check(s3 == 1u64);
+    check(ovf);
+
+    let d1 = w_sub_u64_ovf(50u64, 18u64, mut_view(ovf));
+    check(d1 == 32u64);
+    check(!ovf);
+
+    let d2 = w_sub_u64_ovf(0u64, 1u64, mut_view(ovf));
+    check(d2 == 0xFFFFFFFFFFFFFFFFu64);
+    check(ovf);
+
+    let m1 = w_mul_u64_ovf(123456789u64, 987654321u64, mut_view(ovf));
+    check(m1 == 121932631112635269u64);
+    check(!ovf);
+
+    let m2 = w_mul_u64_ovf(0x8000000000000000u64, 2u64, mut_view(ovf));
+    check(m2 == 0u64);
+    check(ovf);
+
+    check(w_neg_u64(0u64) == 0u64);
+    check(w_neg_u64(1u64) == 0xFFFFFFFFFFFFFFFFu64);
+    check(w_neg_u64(0x8000000000000000u64) == 0x8000000000000000u64);
+
+    check(bit_mask_u64(8) == 0xFFu64);
+    check(bit_mask_u64(16) == 0xFFFFu64);
+    check(bit_mask_u64(32) == 0xFFFFFFFFu64);
+    check(bit_mask_u64(64) == 0xFFFFFFFFFFFFFFFFu64);
+
+    check(sign_extend_u64(0x7Fu64, 8) == 0x7Fu64);
+    check(sign_extend_u64(0x80u64, 8) == 0xFFFFFFFFFFFFFF80u64);
+    check(sign_extend_u64(0xFFu64, 8) == 0xFFFFFFFFFFFFFFFFu64);
+    check(sign_extend_u64(0x8000u64, 16) == 0xFFFFFFFFFFFF8000u64);
+    check(sign_extend_u64(0x80000000u64, 32) == 0xFFFFFFFF80000000u64);
+
+    let neg5 = w_neg_u64(5u64);
+    let neg2 = w_neg_u64(2u64);
+    check(signed_lt_u64(neg5, neg2));
+    check(signed_lt_u64(neg2, 0u64));
+    check(signed_lt_u64(0u64, 3u64));
+    check(signed_le_u64(neg5, neg5));
+    check(signed_gt_u64(3u64, neg5));
+    check(signed_ge_u64(neg2, neg5));
+}
+
+fn buf_mut_ptr(b: mut_view<DiagBuffer>) -> *mut DiagBuffer {
+    unsafe { address_of_mut(*b) }
+}
+
+fn test_alloc_and_ptr_validation() {
+    let sink_ptr = alloc_init_sink();
+    let mut out = diag_buf_new();
+    let out_ptr = buf_mut_ptr(mut_view(out));
+    let ctx_ptr = make_empty_ctx(sink_ptr, out_ptr);
+
+    let mut host_buf: [32]u8 = [0u8; 32];
+    let host_ptr = unsafe { address_of_mut(host_buf[0]) };
+    let alloc = interp_register_alloc(unsafe { mut_view(*ctx_ptr) }, host_ptr, 32u64, 8u32, 1);
+    let base_addr = unsafe { (*alloc).base_addr };
+    check(base_addr >= 0x10000000u64);
+    check((base_addr & 15u64) == 0u64);
+
+    let found_synth = interp_find_synth_addr(unsafe { view(*ctx_ptr) }, unsafe { (host_ptr + 8) as *const u8 });
+    check(found_synth == base_addr + 8u64);
+
+    // Exact one-past-the-end pointer resolves to base_addr + size
+    let end_synth = interp_find_synth_addr(unsafe { view(*ctx_ptr) }, unsafe { (host_ptr + 32) as *const u8 });
+    check(end_synth == base_addr + 32u64);
+
+    let p0 = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, base_addr, 8u64, 8u32);
+    check(unsafe { !(*ctx_ptr).failed });
+    check((p0 as usize) == (host_ptr as usize));
+
+    interp_validate_ptr_arith(unsafe { mut_view(*ctx_ptr) }, base_addr, base_addr + 32u64);
+    check(unsafe { !(*ctx_ptr).failed });
+
+    // Pointer arithmetic out-of-bounds (one past base + size + 1) -> UB
+    interp_validate_ptr_arith(unsafe { mut_view(*ctx_ptr) }, base_addr, base_addr + 33u64);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 1 });
+
+    // Pointer arithmetic on unmapped pointer -> UB
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    interp_validate_ptr_arith(unsafe { mut_view(*ctx_ptr) }, 0x77770000u64, 0x77770004u64);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 2 });
+
+    // Misaligned access -> UB
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    let _ = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, base_addr + 2u64, 4u64, 4u32);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 3 });
+
+    // Reset failure state and test out-of-bounds
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    let _ = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, base_addr + 28u64, 8u64, 4u32);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 4 });
+
+    // Null pointer deref -> UB
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    let _ = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, 0u64, 1u64, 1u32);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 5 });
+
+    // Dangling pointer (use-after-free) -> UB
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+        (*alloc).is_live = false;
+    }
+    let _ = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, base_addr, 4u64, 4u32);
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+    check(unsafe { (*sink_ptr).errors == 6 });
+
+    cleanup_empty_ctx(ctx_ptr);
+    diag_buf_free(mut_view(out));
+    free_dealloc_sink(sink_ptr);
+}
+
+// "heap_alloc" (0..10), "heap_realloc" (10..22), "heap_free" (22..31), "stdio" (31..36),
+// "write" (36..41), "args_count" (41..51), "arg" (51..54), "monotonic_ns" (54..66), "exit" (66..70),
+// "close" (70..75)
+const UNIT_HOST_NAMES: [75]u8 = [
+    104u8, 101u8, 97u8, 112u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    104u8, 101u8, 97u8, 112u8, 95u8, 114u8, 101u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    104u8, 101u8, 97u8, 112u8, 95u8, 102u8, 114u8, 101u8, 101u8,
+    115u8, 116u8, 100u8, 105u8, 111u8,
+    119u8, 114u8, 105u8, 116u8, 101u8,
+    97u8, 114u8, 103u8, 115u8, 95u8, 99u8, 111u8, 117u8, 110u8, 116u8,
+    97u8, 114u8, 103u8,
+    109u8, 111u8, 110u8, 111u8, 116u8, 111u8, 110u8, 105u8, 99u8, 95u8, 110u8, 115u8,
+    101u8, 120u8, 105u8, 116u8,
+    99u8, 108u8, 111u8, 115u8, 101u8,
+];
+
+fn unit_host_sv(off: usize, n: usize) -> StrView {
+    let p = unsafe { address_of(UNIT_HOST_NAMES[off]) };
+    StrView { ptr: p, len: n }
+}
+
+fn test_host_oracle() {
+    let sink_ptr = alloc_init_sink();
+    let mut out = diag_buf_new();
+    let out_ptr = buf_mut_ptr(mut_view(out));
+    let ctx_ptr = make_empty_ctx(sink_ptr, out_ptr);
+
+    let sv_alloc = unit_host_sv(0, 10);
+    let sv_realloc = unit_host_sv(10, 12);
+    let sv_free = unit_host_sv(22, 9);
+    let sv_stdio = unit_host_sv(31, 5);
+    let sv_write = unit_host_sv(36, 5);
+    let sv_argc = unit_host_sv(41, 10);
+    let sv_arg = unit_host_sv(51, 3);
+    let sv_mono = unit_host_sv(54, 12);
+    let sv_exit = unit_host_sv(66, 4);
+    let sv_close = unit_host_sv(70, 5);
+
+    check(interp_is_host_intrinsic_name(view(sv_alloc)));
+    check(interp_is_host_intrinsic_name(view(sv_realloc)));
+    check(interp_is_host_intrinsic_name(view(sv_free)));
+    check(interp_is_host_intrinsic_name(view(sv_stdio)));
+    check(interp_is_host_intrinsic_name(view(sv_write)));
+    check(interp_is_host_intrinsic_name(view(sv_argc)));
+    check(interp_is_host_intrinsic_name(view(sv_arg)));
+    check(interp_is_host_intrinsic_name(view(sv_mono)));
+    check(interp_is_host_intrinsic_name(view(sv_exit)));
+    check(interp_is_host_intrinsic_name(view(sv_close)));
+
+    let mut args: [4]u64 = [32u64, 8u64, 0u64, 0u64];
+    let args_ptr = unsafe { address_of(args[0]) };
+    let mut ret = InterpValue { vals: [0u64; 8] };
+
+    // 1. heap_alloc(32, 8)
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_alloc, args_ptr, 2, mut_view(ret)));
+    let p1 = ret.vals[0];
+    check(p1 != 0u64);
+    let h1 = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, p1, 32u64, 8u32);
+    check(unsafe { !(*ctx_ptr).failed });
+    unsafe {
+        *h1 = 65u8;
+        let h1_1: *mut u8 = h1 + 1;
+        *h1_1 = 66u8;
+        let h1_2: *mut u8 = h1 + 2;
+        *h1_2 = 67u8;
+    }
+
+    // 2. write(1, p1, 3) -> captured into out_buf
+    args[0] = 1u64;
+    args[1] = p1;
+    args[2] = 3u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_write, args_ptr, 3, mut_view(ret)));
+    check(ret.vals[0] == 3u64);
+    check(out.len == 3);
+    check((unsafe { *out.ptr }) == 65u8);
+    check((unsafe { *(out.ptr + 1) }) == 66u8);
+    check((unsafe { *(out.ptr + 2) }) == 67u8);
+
+    // 3. heap_realloc(p1, 32, 64, 8)
+    args[0] = p1;
+    args[1] = 32u64;
+    args[2] = 64u64;
+    args[3] = 8u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_realloc, args_ptr, 4, mut_view(ret)));
+    let p2 = ret.vals[0];
+    check(p2 != 0u64);
+    let h2 = interp_validate_raw_ptr(unsafe { mut_view(*ctx_ptr) }, p2, 64u64, 8u32);
+    check(unsafe { !(*ctx_ptr).failed });
+    check((unsafe { *h2 }) == 65u8);
+    check((unsafe { *(h2 + 1) }) == 66u8);
+    check((unsafe { *(h2 + 2) }) == 67u8);
+
+    // 4. custom args_count and arg
+    interp_host_set_custom_args(unsafe { mut_view(*ctx_ptr) }, true);
+    interp_host_push_arg(unsafe { mut_view(*ctx_ptr) }, sv_stdio);
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_argc, args_ptr, 0, mut_view(ret)));
+    check(ret.vals[0] == 1u64);
+
+    args[0] = 0u64;
+    args[1] = p2;
+    args[2] = 64u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_arg, args_ptr, 3, mut_view(ret)));
+    check(ret.vals[0] == 5u64);
+    check((unsafe { *h2 }) == 115u8);
+
+    // 5. monotonic_ns monotonicity
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_mono, args_ptr, 0, mut_view(ret)));
+    let t1 = ret.vals[0];
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(54, 12), args_ptr, 0, mut_view(ret)));
+    let t2 = ret.vals[0];
+    check(t2 >= t1);
+
+    // 6. stdio(0..3) and close(1 vs untracked 99)
+    args[0] = 2u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(31, 5), args_ptr, 1, mut_view(ret)));
+    check(ret.vals[0] == 2u64);
+    args[0] = 3u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(31, 5), args_ptr, 1, mut_view(ret)));
+    check(ret.vals[0] == ((-4i64) as u64));
+
+    args[0] = 1u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_close, args_ptr, 1, mut_view(ret)));
+    check(ret.vals[0] == 0u64);
+    args[0] = 99u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(70, 5), args_ptr, 1, mut_view(ret)));
+    check(ret.vals[0] == ((-4i64) as u64));
+
+    // 7. heap_free(p2, 64, 8)
+    args[0] = p2;
+    args[1] = 64u64;
+    args[2] = 8u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_free, args_ptr, 3, mut_view(ret)));
+    check(unsafe { !(*ctx_ptr).failed });
+
+    // Double free -> UB
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(22, 9), args_ptr, 3, mut_view(ret)));
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+
+    // heap_free on non-heap (stack call_depth >= 0) allocation -> UB
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    let mut stack_buf: [16]u8 = [0u8; 16];
+    let stack_ptr = unsafe { address_of_mut(stack_buf[0]) };
+    let stack_alloc = interp_register_alloc(unsafe { mut_view(*ctx_ptr) }, stack_ptr, 16u64, 8u32, 1);
+    args[0] = unsafe { (*stack_alloc).base_addr };
+    args[1] = 16u64;
+    args[2] = 8u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, unit_host_sv(22, 9), args_ptr, 3, mut_view(ret)));
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 125 });
+
+    // 8. exit(42)
+    unsafe {
+        (*ctx_ptr).failed = false;
+        (*ctx_ptr).exit_code = 0;
+    }
+    args[0] = 42u64;
+    check(interp_eval_host_intrinsic(unsafe { mut_view(*ctx_ptr) }, sv_exit, args_ptr, 1, mut_view(ret)));
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).has_exited });
+    check(unsafe { (*ctx_ptr).exit_code == 42 });
+
+    cleanup_empty_ctx(ctx_ptr);
+    diag_buf_free(mut_view(out));
+    free_dealloc_sink(sink_ptr);
+}
+
+fn test_mir_body_map_and_limits() {
+    let mut map = MirBodyMap {
+        entries: 0 as *mut MirBodyEntry,
+        len: 0,
+        cap: 0,
+    };
+    mir_body_map_init(mut_view(map));
+    let d1: u64 = 1u64;
+    let d2: u64 = 2u64;
+    let mut b1: u64 = 3u64;
+    let mut b2: u64 = 4u64;
+    let fake_item1 = unsafe { address_of(d1) as *const HirItem };
+    let fake_item2 = unsafe { address_of(d2) as *const HirItem };
+    let fake_body1 = unsafe { address_of_mut(b1) as *mut MirBody };
+    let fake_body2 = unsafe { address_of_mut(b2) as *mut MirBody };
+
+    mir_body_map_insert(mut_view(map), fake_item1, 10u32, fake_body1);
+    mir_body_map_insert(mut_view(map), fake_item2, 20u32, fake_body2);
+    check((mir_body_map_get_by_item(view(map), fake_item1) as usize) == (fake_body1 as usize));
+    check((mir_body_map_get_by_item(view(map), fake_item2) as usize) == (fake_body2 as usize));
+    check((mir_body_map_get_by_sym(view(map), 10u32) as usize) == (fake_body1 as usize));
+    check((mir_body_map_get_by_sym(view(map), 20u32) as usize) == (fake_body2 as usize));
+    check((mir_body_map_get_by_sym(view(map), 99u32) as usize) == 0usize);
+    mir_body_map_free(mut_view(map));
+
+    let sink_ptr = alloc_init_sink();
+    let mut out = diag_buf_new();
+    let out_ptr = buf_mut_ptr(mut_view(out));
+    let ctx_ptr = make_empty_ctx(sink_ptr, out_ptr);
+
+    unsafe {
+        (*ctx_ptr).step_limit = 5;
+        (*ctx_ptr).steps = 5;
+    }
+    interp_check_step_limit(unsafe { mut_view(*ctx_ptr) });
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 124 });
+    check(unsafe { (*sink_ptr).errors == 1 });
+
+    unsafe {
+        (*ctx_ptr).failed = false;
+    }
+    interp_report_stack_limit(unsafe { mut_view(*ctx_ptr) });
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 124 });
+    check(unsafe { (*sink_ptr).errors == 2 });
+
+    unsafe {
+        (*ctx_ptr).failed = false;
+    }
+    interp_report_ffi_not_in_oracle(unsafe { mut_view(*ctx_ptr) }, Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 });
+    check(unsafe { (*ctx_ptr).failed });
+    check(unsafe { (*ctx_ptr).exit_code == 1 });
+    check(unsafe { (*sink_ptr).errors == 3 });
+
+    cleanup_empty_ctx(ctx_ptr);
+    diag_buf_free(mut_view(out));
+    free_dealloc_sink(sink_ptr);
+}
+
+pub fn main() -> i32 {
+    test_wrapping_arith();
+    test_alloc_and_ptr_validation();
+    test_host_oracle();
+    test_mir_body_map_and_limits();
+    print("ALL INTERP UNIT TESTS PASSED\n");
+    0
+}

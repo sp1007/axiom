@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082d]
 priority: 117
-status: doing
+status: done
 attempts: 1
 paths: [compiler/interp, tests/selfhost/interp]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OPT-387]
 started: 2026-10-17 23:03:19
-agent: T083a-impl
+finished: 2026-10-18 14:52:29
 ---
 # T083a — Port MIR interpreter and host oracle to Axiom
 
@@ -45,3 +45,4 @@ Port the MIR step execution interpreter and host interface oracle (`compiler/int
 - 2026-10-17 21:48:21 started (attempt 1) T083a-impl
 - 2026-10-17 23:03:17 requeue: restart (not charged: attempt refunded)
 - 2026-10-17 23:03:19 started (attempt 1) T083a-impl
+- 2026-10-18 14:52:29 accepted by QA -> done

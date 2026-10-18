@@ -1,0 +1,638 @@
+// Axiom Compiler — MIR Interpreter Call Frames, Places & Body Map (compiler/interp/frame.ax)
+// Port of CallFrame, get_local_ptr, get_place_ptr, eval_operand, and AxMirMap from
+// bootstrap/axiom0/src/interp/interp.c.
+module compiler.interp.frame
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.hir.hir.HirItem
+use compiler.types.types.AxType
+use compiler.types.types.CONST_AGGREGATE
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STR
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.capture_at
+use compiler.types.types.intern_slice_ty
+use compiler.types.types.sym_constmap_get
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.layout.type_align
+use compiler.types.layout.type_enum_field_offset
+use compiler.types.layout.type_field_offset
+use compiler.types.layout.type_size
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_DOWNCAST
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_proj_at
+use compiler.interp.value.INTERP_MSG_PANIC_INDEX_NON_ARR
+use compiler.interp.value.INTERP_MSG_PANIC_INDEX_OOB
+use compiler.interp.value.INTERP_MSG_PANIC_SUBSLICE_NON_ARR
+use compiler.interp.value.INTERP_MSG_PANIC_SUBSLICE_OOB
+use compiler.interp.value.InterpCtx
+use compiler.interp.value.InterpValue
+use compiler.interp.value.MirBodyEntry
+use compiler.interp.value.MirBodyMap
+use compiler.interp.value.interp_alloc_at
+use compiler.interp.value.interp_copy_bytes
+use compiler.interp.value.interp_ensure_const_str_alloc
+use compiler.interp.value.interp_mul_usize
+use compiler.interp.value.interp_panic
+use compiler.interp.value.interp_register_alloc
+use compiler.interp.value.interp_resolve_synth_ptr
+use compiler.interp.value.interp_u8_ptr_at
+use compiler.interp.value.interp_val_at
+use compiler.interp.value.interp_validate_raw_ptr
+use compiler.interp.value.interp_zero_bytes
+use compiler.interp.value.interp_zero_val
+use compiler.interp.value.mir_body_entry_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+pub struct CallFrame {
+    pub body: *mut MirBody,
+    pub local_ptrs: *mut *mut u8,
+    pub storage: *mut u8,
+    pub storage_size: usize,
+    pub local_cap: usize,
+}
+
+// =================================================================================================
+// MirBodyMap (Function Item / SymbolId -> MirBody Cache)
+// =================================================================================================
+
+pub fn mir_body_map_init(m: mut_view<MirBodyMap>) {
+    m.entries = 0 as *mut MirBodyEntry;
+    m.len = 0;
+    m.cap = 0;
+}
+
+pub fn mir_body_map_free(m: mut_view<MirBodyMap>) {
+    if m.cap > 0 && (m.entries as usize) != 0 {
+        let cap_bytes = interp_mul_usize(m.cap, size_of<MirBodyEntry>());
+        unsafe {
+            heap_free(m.entries as *mut u8, cap_bytes, align_of<MirBodyEntry>());
+        }
+    }
+    m.entries = 0 as *mut MirBodyEntry;
+    m.len = 0;
+    m.cap = 0;
+}
+
+pub fn mir_body_map_insert(
+    m: mut_view<MirBodyMap>,
+    item: *const HirItem,
+    sym_v: u32,
+    body: *mut MirBody
+) {
+    let item_addr = item as usize;
+    let mut i: usize = 0;
+    while i < m.len {
+        let ent = unsafe { mir_body_entry_at(m.entries, i) };
+        let e_item = unsafe { (*ent).item_ptr };
+        let e_sym = unsafe { (*ent).sym_v };
+        if (item_addr != 0 && e_item == item_addr) || (sym_v != 0u32 && e_sym == sym_v) {
+            unsafe {
+                if item_addr != 0 {
+                    (*ent).item_ptr = item_addr;
+                }
+                if sym_v != 0u32 {
+                    (*ent).sym_v = sym_v;
+                }
+                (*ent).body = body;
+            }
+            return;
+        }
+        i = i + 1;
+    }
+
+    if m.len >= m.cap {
+        let new_cap: usize = if m.cap == 0 { 32 } else { interp_mul_usize(m.cap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<MirBodyEntry>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<MirBodyEntry>()) as *mut MirBodyEntry };
+        unsafe {
+            interp_zero_bytes(new_arr as *mut u8, new_bytes);
+        }
+        if m.len > 0 && (m.entries as usize) != 0 {
+            let old_bytes = interp_mul_usize(m.len, size_of<MirBodyEntry>());
+            let old_cap_bytes = interp_mul_usize(m.cap, size_of<MirBodyEntry>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(m.entries as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(m.entries as *mut u8, old_cap_bytes, align_of<MirBodyEntry>());
+            }
+        }
+        m.entries = new_arr;
+        m.cap = new_cap;
+    }
+
+    let dst = unsafe { mir_body_entry_at(m.entries, m.len) };
+    unsafe {
+        (*dst).item_ptr = item_addr;
+        (*dst).sym_v = sym_v;
+        (*dst).body = body;
+    }
+    m.len = m.len + 1;
+}
+
+pub fn mir_body_map_get_by_item(m: view<MirBodyMap>, item: *const HirItem) -> *mut MirBody {
+    let item_addr = item as usize;
+    if item_addr == 0 {
+        return 0 as *mut MirBody;
+    }
+    let mut i: usize = 0;
+    while i < m.len {
+        let ent = unsafe { mir_body_entry_at(m.entries, i) };
+        if (unsafe { (*ent).item_ptr }) == item_addr {
+            return unsafe { (*ent).body };
+        }
+        i = i + 1;
+    }
+    0 as *mut MirBody
+}
+
+pub fn mir_body_map_get_by_sym(m: view<MirBodyMap>, sym_v: u32) -> *mut MirBody {
+    if sym_v == 0u32 {
+        return 0 as *mut MirBody;
+    }
+    let mut i: usize = 0;
+    while i < m.len {
+        let ent = unsafe { mir_body_entry_at(m.entries, i) };
+        if (unsafe { (*ent).sym_v }) == sym_v {
+            return unsafe { (*ent).body };
+        }
+        i = i + 1;
+    }
+    0 as *mut MirBody
+}
+
+// =================================================================================================
+// CallFrame Allocation & Cleanup
+// =================================================================================================
+
+pub fn frame_init(
+    ctx: mut_view<InterpCtx>,
+    frm: mut_view<CallFrame>,
+    body: *mut MirBody,
+    args_raw: *const InterpValue,
+    arg_count: usize
+) -> usize {
+    frm.body = body;
+    let local_count = unsafe { (*body).local_count };
+    let lcap: usize = if local_count > 0 { local_count } else { 1 };
+    let ptrs_bytes = interp_mul_usize(lcap, size_of<*mut u8>());
+    let local_ptrs = unsafe { heap_alloc(ptrs_bytes, align_of<*mut u8>()) as *mut *mut u8 };
+    unsafe {
+        interp_zero_bytes(local_ptrs as *mut u8, ptrs_bytes);
+    }
+    frm.local_ptrs = local_ptrs;
+    frm.local_cap = lcap;
+
+    let val_sz = size_of<InterpValue>();
+    let mut total_storage: usize = 0;
+    let mut i: usize = 0;
+    while i < local_count {
+        let decl = unsafe { mir_local_at((*body).locals, i) };
+        let lty = TypeId { v: unsafe { (*decl).ty.v } };
+        let mut sz: usize = if (ctx.thir as usize) != 0 {
+            unsafe { type_size(lty, view((*ctx.thir).interner)) as usize }
+        } else {
+            val_sz
+        };
+        if sz < val_sz {
+            sz = val_sz;
+        }
+        sz = (sz + 15) & (0xFFFFFFFFFFFFFFFFusize ^ 15usize);
+        total_storage = total_storage + sz;
+        i = i + 1;
+    }
+    if total_storage == 0 {
+        total_storage = 64;
+    }
+
+    let storage = unsafe { heap_alloc(total_storage, 16) };
+    unsafe {
+        interp_zero_bytes(storage, total_storage);
+    }
+    frm.storage = storage;
+    frm.storage_size = total_storage;
+
+    let mut cur_offset: usize = 0;
+    i = 0;
+    while i < local_count {
+        let decl = unsafe { mir_local_at((*body).locals, i) };
+        let lty = TypeId { v: unsafe { (*decl).ty.v } };
+        let mut sz: usize = if (ctx.thir as usize) != 0 {
+            unsafe { type_size(lty, view((*ctx.thir).interner)) as usize }
+        } else {
+            val_sz
+        };
+        if sz < val_sz {
+            sz = val_sz;
+        }
+        sz = (sz + 15) & (0xFFFFFFFFFFFFFFFFusize ^ 15usize);
+        unsafe {
+            *interp_u8_ptr_at(frm.local_ptrs, i) = storage + cur_offset;
+        }
+        cur_offset = cur_offset + sz;
+        i = i + 1;
+    }
+
+    if (args_raw as usize) != 0 {
+        i = 0;
+        while i < arg_count {
+            if i + 1 < local_count {
+                let dst = unsafe { *interp_u8_ptr_at(frm.local_ptrs, i + 1) };
+                let src = unsafe { interp_val_at(args_raw as *mut InterpValue, i) as *const u8 };
+                unsafe {
+                    interp_copy_bytes(dst, src, val_sz);
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    let alloc_start = ctx.alloc_count;
+    i = 0;
+    while i < local_count {
+        let decl = unsafe { mir_local_at((*body).locals, i) };
+        let lkind = unsafe { (*decl).kind };
+        if lkind != MIR_LOCAL_CONST {
+            let lty_v = unsafe { (*decl).ty.v };
+            let mut sz: u32 = if (ctx.thir as usize) != 0 {
+                unsafe { type_size(TypeId { v: lty_v }, view((*ctx.thir).interner)) }
+            } else {
+                val_sz as u32
+            };
+            let al: u32 = if (ctx.thir as usize) != 0 {
+                unsafe { type_align(TypeId { v: lty_v }, view((*ctx.thir).interner)) }
+            } else {
+                8u32
+            };
+            if sz == 0u32 {
+                sz = val_sz as u32;
+            }
+            let lptr = unsafe { *interp_u8_ptr_at(frm.local_ptrs, i) };
+            let _ = interp_register_alloc(mut_view(*ctx), lptr, sz as u64, al, ctx.call_depth);
+        }
+        i = i + 1;
+    }
+
+    alloc_start
+}
+
+pub fn frame_cleanup(
+    ctx: mut_view<InterpCtx>,
+    frm: mut_view<CallFrame>,
+    alloc_start: usize,
+    out_ret: *mut u8,
+    out_ret_size: usize
+) {
+    if !ctx.failed && (out_ret as usize) != 0 && out_ret_size > 0 && (frm.body as usize) != 0 {
+        let lcount = unsafe { (*frm.body).local_count };
+        if lcount > 0 {
+            let decl0 = unsafe { mir_local_at((*frm.body).locals, 0) };
+            let ty0 = TypeId { v: unsafe { (*decl0).ty.v } };
+            let mut ret_sz: usize = if (ctx.thir as usize) != 0 {
+                unsafe { type_size(ty0, view((*ctx.thir).interner)) as usize }
+            } else {
+                size_of<InterpValue>()
+            };
+            if ret_sz == 0 {
+                ret_sz = out_ret_size;
+            }
+            let copy_sz = if ret_sz < out_ret_size { ret_sz } else { out_ret_size };
+            let loc0_ptr = unsafe { *interp_u8_ptr_at(frm.local_ptrs, 0) };
+            unsafe {
+                interp_copy_bytes(out_ret, loc0_ptr as *const u8, copy_sz);
+            }
+        }
+    }
+
+    let mut a_idx: usize = alloc_start;
+    while a_idx < ctx.alloc_count {
+        let a = unsafe { interp_alloc_at(ctx.allocs, a_idx) };
+        if (unsafe { (*a).call_depth }) == ctx.call_depth {
+            unsafe {
+                (*a).is_live = false;
+                (*a).host_ptr = 0 as *mut u8;
+            }
+        }
+        a_idx = a_idx + 1;
+    }
+
+    if (frm.local_ptrs as usize) != 0 && frm.local_cap > 0 {
+        let ptrs_bytes = interp_mul_usize(frm.local_cap, size_of<*mut u8>());
+        unsafe {
+            heap_free(frm.local_ptrs as *mut u8, ptrs_bytes, align_of<*mut u8>());
+        }
+        frm.local_ptrs = 0 as *mut *mut u8;
+    }
+    if (frm.storage as usize) != 0 && frm.storage_size > 0 {
+        unsafe {
+            heap_free(frm.storage, frm.storage_size, 16);
+        }
+        frm.storage = 0 as *mut u8;
+    }
+}
+
+// =================================================================================================
+// Local, Place & Operand Evaluation
+// =================================================================================================
+
+pub fn interp_view_pointee_ty(ty: *mut AxType) -> TypeId {
+    if (ty as usize) == 0 {
+        return TypeId { v: 0u32 };
+    }
+    let pv = unsafe { (*ty).pointee.v };
+    if pv != 0u32 {
+        return TypeId { v: pv };
+    }
+    TypeId { v: unsafe { (*ty).elem.v } }
+}
+
+pub fn get_local_ptr(ctx: mut_view<InterpCtx>, frm: view<CallFrame>, loc: MirLocalId) -> *mut u8 {
+    if (frm.body as usize) == 0 {
+        return ctx.dummy_ptr;
+    }
+    let lcount = unsafe { (*frm.body).local_count };
+    if (loc.v as usize) >= lcount {
+        return ctx.dummy_ptr;
+    }
+    let decl = unsafe { mir_local_at((*frm.body).locals, loc.v as usize) };
+    let lkind = unsafe { (*decl).kind };
+    if lkind == MIR_LOCAL_CONST && (ctx.thir as usize) != 0 {
+        let csym_v = unsafe { (*decl).const_sym.v };
+        let cval = unsafe { sym_constmap_get(view((*ctx.thir).symbol_consts), SymbolId { v: csym_v }) };
+        if (cval as usize) != 0 {
+            let ckind = unsafe { (*cval).kind };
+            let agg_data = unsafe { (*cval).agg_data };
+            if ckind == CONST_AGGREGATE && (agg_data as usize) != 0 {
+                return agg_data;
+            }
+        }
+    }
+    unsafe { *interp_u8_ptr_at(frm.local_ptrs, loc.v as usize) }
+}
+
+fn read_index_local_u64(ctx: mut_view<InterpCtx>, frm: view<CallFrame>, loc: MirLocalId) -> u64 {
+    let loc_v = loc.v as usize;
+    let idx_ptr = get_local_ptr(mut_view(*ctx), frm, loc);
+    let decl = unsafe { mir_local_at((*frm.body).locals, loc_v) };
+    let idx_ty = TypeId { v: unsafe { (*decl).ty.v } };
+    let idx_sz = unsafe { type_size(idx_ty, view((*ctx.thir).interner)) };
+    if idx_sz == 1u32 {
+        return unsafe { *idx_ptr as u64 };
+    }
+    if idx_sz == 2u32 {
+        return unsafe { *(idx_ptr as *const u16) as u64 };
+    }
+    if idx_sz == 4u32 {
+        return unsafe { *(idx_ptr as *const u32) as u64 };
+    }
+    unsafe { *(idx_ptr as *const u64) }
+}
+
+pub fn get_place_ptr(
+    ctx: mut_view<InterpCtx>,
+    frm: view<CallFrame>,
+    place: view<MirPlace>,
+    out_ty: mut_view<TypeId>,
+    out_fat_len: mut_view<u64>
+) -> *mut u8 {
+    if (frm.body as usize) == 0 {
+        *out_ty = TypeId { v: 0u32 };
+        *out_fat_len = 0u64;
+        return ctx.dummy_ptr;
+    }
+    let lcount = unsafe { (*frm.body).local_count };
+    if (place.local.v as usize) >= lcount {
+        *out_ty = TypeId { v: 0u32 };
+        *out_fat_len = 0u64;
+        return ctx.dummy_ptr;
+    }
+
+    let mut ptr = get_local_ptr(mut_view(*ctx), frm, MirLocalId { v: place.local.v });
+    let decl = unsafe { mir_local_at((*frm.body).locals, place.local.v as usize) };
+    let mut current_ty_v: u32 = unsafe { (*decl).ty.v };
+    let mut current_variant: u32 = 0xFFFFFFFFu32;
+    let mut fat_len: u64 = 0u64;
+    *out_ty = TypeId { v: current_ty_v };
+    *out_fat_len = 0u64;
+
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let pkind = unsafe { (*proj).kind };
+
+        if pkind == MIR_PROJ_DEREF {
+            let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: current_ty_v }) };
+            let tk = unsafe { (*ty).kind };
+            if tk == TY_VIEW || tk == TY_MUT_VIEW {
+                let pt_ty = interp_view_pointee_ty(ty);
+                let pt_ty_v = pt_ty.v;
+                let pt_ax = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: pt_ty_v }) };
+                if (pt_ax as usize) != 0 && (unsafe { (*pt_ax).kind }) == TY_SLICE {
+                    fat_len = unsafe { *((ptr as *const u64) + 1) };
+                }
+                current_ty_v = pt_ty_v;
+                let addr = unsafe { *(ptr as *const u64) };
+                ptr = interp_resolve_synth_ptr(mut_view(*ctx), addr);
+            } else if tk == TY_STR {
+                fat_len = unsafe { *((ptr as *const u64) + 1) };
+                current_ty_v = unsafe { (*ctx.thir).interner.t_u8.v };
+                let addr = unsafe { *(ptr as *const u64) };
+                ptr = interp_resolve_synth_ptr(mut_view(*ctx), addr);
+            } else if tk == TY_PTR {
+                let addr = unsafe { *(ptr as *const u64) };
+                let pt_ty = interp_view_pointee_ty(ty);
+                let pt_ty_v = pt_ty.v;
+                let al = unsafe { type_align(TypeId { v: pt_ty_v }, view((*ctx.thir).interner)) };
+                let sz = unsafe { type_size(TypeId { v: pt_ty_v }, view((*ctx.thir).interner)) };
+                ptr = interp_validate_raw_ptr(mut_view(*ctx), addr, sz as u64, al);
+                current_ty_v = pt_ty_v;
+            } else {
+                let pt_ty = interp_view_pointee_ty(ty);
+                current_ty_v = pt_ty.v;
+                let addr = unsafe { *(ptr as *const u64) };
+                ptr = interp_resolve_synth_ptr(mut_view(*ctx), addr);
+            }
+        } else if pkind == MIR_PROJ_DOWNCAST {
+            current_variant = unsafe { (*proj).variant_idx };
+        } else if pkind == MIR_PROJ_FIELD {
+            let f_idx = unsafe { (*proj).field_idx as usize };
+            let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: current_ty_v }) };
+            let tk = unsafe { (*ty).kind };
+            let mut offset: u32 = 0u32;
+            if tk == TY_ENUM && current_variant != 0xFFFFFFFFu32 {
+                offset = unsafe {
+                    type_enum_field_offset(TypeId { v: current_ty_v }, current_variant, f_idx, view((*ctx.thir).interner))
+                };
+                let vf = unsafe { *typeid_ptr_at((*ty).variant_fields, current_variant as usize) };
+                let fty_v = unsafe { (*typeid_at(vf, f_idx)).v };
+                current_ty_v = fty_v;
+                current_variant = 0xFFFFFFFFu32;
+            } else {
+                offset = unsafe {
+                    type_field_offset(TypeId { v: current_ty_v }, f_idx, view((*ctx.thir).interner))
+                };
+                if tk == TY_STRUCT || tk == TY_TUPLE {
+                    let fty_v = unsafe { (*typeid_at((*ty).fields, f_idx)).v };
+                    current_ty_v = fty_v;
+                } else if tk == TY_CLOSURE {
+                    if f_idx == 0 {
+                        current_ty_v = unsafe { (*ctx.thir).interner.t_u64.v };
+                    } else {
+                        let cap = unsafe { capture_at((*ty).captures, f_idx - 1) };
+                        current_ty_v = unsafe { (*cap).ty.v };
+                    }
+                }
+            }
+            ptr = unsafe { ptr + (offset as usize) };
+        } else if pkind == MIR_PROJ_SUB_SLICE {
+            let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: current_ty_v }) };
+            let tk = unsafe { (*ty).kind };
+            let mut arr_len: u64 = 0u64;
+            let mut elem_ty_v: u32 = 0u32;
+            if tk == TY_ARRAY {
+                arr_len = unsafe { (*ty).array_len };
+                elem_ty_v = unsafe { (*ty).elem.v };
+            } else if tk == TY_SLICE {
+                arr_len = fat_len;
+                elem_ty_v = unsafe { (*ty).elem.v };
+            } else if tk == TY_STR {
+                arr_len = fat_len;
+                elem_ty_v = unsafe { (*ctx.thir).interner.t_u8.v };
+            } else {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_SUBSLICE_NON_ARR);
+                return ctx.dummy_ptr;
+            }
+
+            let mut start_idx: u64 = 0u64;
+            if unsafe { (*proj).has_from } {
+                let from_loc = MirLocalId { v: unsafe { (*proj).from_local.v } };
+                start_idx = read_index_local_u64(mut_view(*ctx), frm, from_loc);
+            }
+            let mut end_idx: u64 = arr_len;
+            if unsafe { (*proj).has_to } {
+                let to_loc = MirLocalId { v: unsafe { (*proj).to_local.v } };
+                end_idx = read_index_local_u64(mut_view(*ctx), frm, to_loc);
+            }
+            if start_idx > end_idx || end_idx > arr_len {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_SUBSLICE_OOB);
+                return ctx.dummy_ptr;
+            }
+            fat_len = end_idx - start_idx;
+            let elem_sz = unsafe { type_size(TypeId { v: elem_ty_v }, view((*ctx.thir).interner)) as usize };
+            ptr = unsafe { ptr + interp_mul_usize(start_idx as usize, elem_sz) };
+            let slice_ty = unsafe { intern_slice_ty(mut_view((*ctx.thir).interner), TypeId { v: elem_ty_v }) };
+            current_ty_v = slice_ty.v;
+        } else if pkind == MIR_PROJ_INDEX {
+            let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: current_ty_v }) };
+            let tk = unsafe { (*ty).kind };
+            let mut arr_len: u64 = 0u64;
+            let mut elem_ty_v: u32 = 0u32;
+            if tk == TY_ARRAY {
+                arr_len = unsafe { (*ty).array_len };
+                elem_ty_v = unsafe { (*ty).elem.v };
+            } else if tk == TY_SLICE {
+                arr_len = fat_len;
+                elem_ty_v = unsafe { (*ty).elem.v };
+            } else if tk == TY_STR {
+                arr_len = fat_len;
+                elem_ty_v = unsafe { (*ctx.thir).interner.t_u8.v };
+            } else {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_INDEX_NON_ARR);
+                return ctx.dummy_ptr;
+            }
+
+            let idx_loc = MirLocalId { v: unsafe { (*proj).index_local.v } };
+            let index = read_index_local_u64(mut_view(*ctx), frm, idx_loc);
+            if index >= arr_len {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_INDEX_OOB);
+                return ctx.dummy_ptr;
+            }
+            let elem_sz = unsafe { type_size(TypeId { v: elem_ty_v }, view((*ctx.thir).interner)) as usize };
+            ptr = unsafe { ptr + interp_mul_usize(index as usize, elem_sz) };
+            current_ty_v = elem_ty_v;
+        }
+
+        i = i + 1;
+    }
+
+    *out_ty = TypeId { v: current_ty_v };
+    *out_fat_len = fat_len;
+    ptr
+}
+
+pub fn eval_operand(
+    ctx: mut_view<InterpCtx>,
+    frm: view<CallFrame>,
+    op: view<MirOperand>,
+    out_val: mut_view<InterpValue>
+) {
+    interp_zero_val(mut_view(*out_val));
+    if op.kind == MIR_OP_CONST {
+        if (ctx.thir as usize) != 0 && op.constant.ty.v != 0u32 {
+            let ty = unsafe { type_get(view((*ctx.thir).interner), op.constant.ty) };
+            if (ty as usize) != 0 && (unsafe { (*ty).kind }) == TY_STR {
+                let _ = interp_ensure_const_str_alloc(
+                    mut_view(*ctx),
+                    op.constant.str_bytes,
+                    op.constant.str_len
+                );
+                out_val.vals[0] = (op.constant.str_bytes as usize) as u64;
+                out_val.vals[1] = op.constant.str_len as u64;
+                return;
+            }
+        }
+        out_val.vals[0] = op.constant.val;
+        return;
+    }
+    let mut ty = TypeId { v: 0u32 };
+    let mut fat_len: u64 = 0u64;
+    let ptr = get_place_ptr(mut_view(*ctx), frm, view(op.place), mut_view(ty), mut_view(fat_len));
+    let mut sz: usize = 8;
+    if (ctx.thir as usize) != 0 && ty.v != 0u32 {
+        sz = unsafe { type_size(ty, view((*ctx.thir).interner)) as usize };
+    }
+    let max_sz = size_of<InterpValue>();
+    if sz > max_sz {
+        sz = max_sz;
+    }
+    if sz > 0 {
+        let dst_bytes = unsafe { address_of_mut(out_val.vals[0]) as *mut u8 };
+        unsafe {
+            interp_copy_bytes(dst_bytes, ptr as *const u8, sz);
+        }
+    }
+    if sz == 1 {
+        out_val.vals[0] = unsafe { *ptr as u64 };
+    } else if sz == 2 {
+        out_val.vals[0] = unsafe { *(ptr as *const u16) as u64 };
+    } else if sz == 4 {
+        out_val.vals[0] = unsafe { *(ptr as *const u32) as u64 };
+    }
+}
+
