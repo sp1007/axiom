@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T077]
 priority: 119
-status: doing
+status: done
 attempts: 1
 paths: [compiler/obj, tests/selfhost/obj]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
 started: 2026-10-18 12:55:19
-agent: T085a-impl
+finished: 2026-10-18 14:52:55
 ---
 # T085a — Port COFF object writer & object model to Axiom
 
@@ -42,3 +42,4 @@ Port COFF object file model and binary writer (`compiler/obj/`) from C to Axiom.
 
 ## Log
 - 2026-10-18 12:55:19 started (attempt 1) T085a-impl
+- 2026-10-18 14:52:55 accepted by QA -> done
