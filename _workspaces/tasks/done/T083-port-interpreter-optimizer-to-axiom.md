@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082, T083a, T083b]
 priority: 117
-status: doing
+status: done
 attempts: 1
 paths: [compiler/interp_opt, tests/selfhost/interp_opt]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OPT-387, REQ-OPT-388, REQ-OPT-389]
 started: 2026-10-18 15:12:25
-agent: T083-impl
+finished: 2026-10-19 03:16:37
 ---
 # T083 — Port interpreter + optimizer to Axiom (integration + differential)
 
@@ -44,3 +44,4 @@ Integrate interpreter and optimizer in Axiom and run differential execution and 
 
 ## Log
 - 2026-10-18 15:12:25 started (attempt 1) T083-impl
+- 2026-10-19 03:16:37 accepted by QA -> done

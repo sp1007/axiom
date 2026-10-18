@@ -1,0 +1,383 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.code.AX_VERIFY_MIR_SYNTAX
+use compiler.diag.code.AX_VERIFY_UNINIT_USE
+use compiler.diag.code.AX_DRIVER_INTERP_STEP_LIMIT
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_new
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.interp_opt.session_opt_mir_text
+use compiler.interp_opt.session_interp_mir_text
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+@UNIT_DATA_TABLE@
+@UNIT_OFFSET_TABLE@
+
+fn unit_blob_sv(a: mut_view<Arena>, idx: usize) -> StrView {
+    let start = UNIT_OFF[idx] as usize;
+    let end = UNIT_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = UNIT_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn bytes_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if (unsafe { *(a + i) }) != (unsafe { *(b + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn dump_sv(sv: StrView) {
+    if sv.len > 0 && (sv.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), sv.ptr, sv.len);
+        }
+    }
+}
+
+fn first_diag_code(sess: view<CompilerSession>) -> u32 {
+    if sess.diag_sink.len == 0 || (sess.diag_sink.diags as usize) == 0 {
+        return 0u32;
+    }
+    unsafe { (*sess.diag_sink.diags).code.v }
+}
+
+fn test_opt_and_interp_equiv(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    out_buf: mut_view<DiagBuffer>
+) -> i32 {
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    out_buf.len = 0;
+
+    let mir_in = unit_blob_sv(mut_view(*arena), 0);
+    let mir_exp = unit_blob_sv(mut_view(*arena), 1);
+
+    let ok = session_opt_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        mir_in,
+        true,
+        mut_view(*out_buf)
+    );
+    if !ok || session_error_count(view(*sess)) != 0 {
+        session_free(mut_view(*sess));
+        return 10;
+    }
+    if !bytes_equal(out_buf.ptr as *const u8, out_buf.len, mir_exp.ptr, mir_exp.len) {
+        print("--- ACTUAL OPT MIR ---\n");
+        dump_sv(StrView { ptr: out_buf.ptr as *const u8, len: out_buf.len });
+        print("--- EXPECTED OPT MIR ---\n");
+        dump_sv(mir_exp);
+        session_free(mut_view(*sess));
+        return 11;
+    }
+    session_free(mut_view(*sess));
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let mir_in_o0 = unit_blob_sv(mut_view(*arena), 0);
+    let rc_o0 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        mir_in_o0,
+        false,
+        true,
+        10000,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    session_free(mut_view(*sess));
+    if rc_o0 != 42 {
+        return 12;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let mir_in_o1 = unit_blob_sv(mut_view(*arena), 0);
+    let rc_o1 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        mir_in_o1,
+        true,
+        true,
+        10000,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    session_free(mut_view(*sess));
+    if rc_o1 != 42 {
+        return 13;
+    }
+
+    0
+}
+
+fn test_panic_preserved(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    mir_idx: usize,
+    msg_idx: usize,
+    base_err: i32
+) -> i32 {
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let mir_o0 = unit_blob_sv(mut_view(*arena), mir_idx);
+    let exp_msg = unit_blob_sv(mut_view(*arena), msg_idx);
+    let mut panic_o0 = StrView { ptr: 0 as *const u8, len: 0 };
+    let panic_o0_ptr = unsafe { address_of_mut(panic_o0) };
+    let rc_o0 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        mir_o0,
+        false,
+        true,
+        10000,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        panic_o0_ptr
+    );
+    if rc_o0 != 101 || !bytes_equal(panic_o0.ptr, panic_o0.len, exp_msg.ptr, exp_msg.len) {
+        session_free(mut_view(*sess));
+        return base_err;
+    }
+    session_free(mut_view(*sess));
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let mir_o1 = unit_blob_sv(mut_view(*arena), mir_idx);
+    let exp_msg_o1 = unit_blob_sv(mut_view(*arena), msg_idx);
+    let mut panic_o1 = StrView { ptr: 0 as *const u8, len: 0 };
+    let panic_o1_ptr = unsafe { address_of_mut(panic_o1) };
+    let rc_o1 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        mir_o1,
+        true,
+        true,
+        10000,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        panic_o1_ptr
+    );
+    if rc_o1 != 101 || !bytes_equal(panic_o1.ptr, panic_o1.len, exp_msg_o1.ptr, exp_msg_o1.len) {
+        session_free(mut_view(*sess));
+        return base_err + 1;
+    }
+    session_free(mut_view(*sess));
+    0
+}
+
+fn test_step_limit_and_syntax(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    out_buf: mut_view<DiagBuffer>
+) -> i32 {
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let loop_mir = unit_blob_sv(mut_view(*arena), 8);
+    let rc_o0 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        loop_mir,
+        false,
+        true,
+        40,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    let code_o0 = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if rc_o0 != 124 || code_o0 != AX_DRIVER_INTERP_STEP_LIMIT {
+        return 50;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let loop_mir_o1 = unit_blob_sv(mut_view(*arena), 8);
+    let rc_o1 = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        loop_mir_o1,
+        true,
+        true,
+        40,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    let code_o1 = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if rc_o1 != 124 || code_o1 != AX_DRIVER_INTERP_STEP_LIMIT {
+        return 51;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    out_buf.len = 0;
+    let bad_mir = unit_blob_sv(mut_view(*arena), 9);
+    let ok_opt = session_opt_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        bad_mir,
+        true,
+        mut_view(*out_buf)
+    );
+    let bad_code = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if ok_opt || bad_code != AX_VERIFY_MIR_SYNTAX {
+        return 52;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let bad_mir2 = unit_blob_sv(mut_view(*arena), 9);
+    let rc_bad = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        bad_mir2,
+        true,
+        true,
+        100,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    let bad_code2 = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if rc_bad != 1 || bad_code2 != AX_VERIFY_MIR_SYNTAX {
+        return 53;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    out_buf.len = 0;
+    let uninit_mir = unit_blob_sv(mut_view(*arena), 11);
+    let ok_uninit = session_opt_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        uninit_mir,
+        true,
+        mut_view(*out_buf)
+    );
+    let uninit_code = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if ok_uninit || uninit_code != AX_VERIFY_UNINIT_USE {
+        return 54;
+    }
+
+    session_init(mut_view(*sess));
+    arena_reset(mut_view(*arena));
+    let uninit_mir2 = unit_blob_sv(mut_view(*arena), 11);
+    let rc_uninit = session_interp_mir_text(
+        mut_view(*sess),
+        mut_view(*arena),
+        uninit_mir2,
+        true,
+        true,
+        100,
+        64,
+        0 as *mut DiagBuffer,
+        false,
+        0 as *mut StrView
+    );
+    let uninit_code2 = first_diag_code(view(*sess));
+    session_free(mut_view(*sess));
+    if rc_uninit != 1 || uninit_code2 != AX_VERIFY_UNINIT_USE {
+        return 55;
+    }
+
+    0
+}
+
+pub fn main() -> i32 {
+    let mut sess = session_new();
+    let mut perm_arena = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(perm_arena), 16, 8);
+    let mut work_arena = arena_with_chunk_size(131072);
+    let _ = arena_alloc_raw(mut_view(work_arena), 16, 8);
+    let mut out_buf = diag_buf_new();
+    out_buf.ptr = arena_alloc_raw(mut_view(perm_arena), 16384, 1);
+    out_buf.cap = 16384;
+
+    let rc1 = test_opt_and_interp_equiv(mut_view(sess), mut_view(work_arena), mut_view(out_buf));
+    if rc1 != 0 {
+        return rc1;
+    }
+
+    let rc2 = test_panic_preserved(mut_view(sess), mut_view(work_arena), 2, 3, 20);
+    if rc2 != 0 {
+        return rc2;
+    }
+
+    let rc3 = test_panic_preserved(mut_view(sess), mut_view(work_arena), 4, 5, 30);
+    if rc3 != 0 {
+        return rc3;
+    }
+
+    let rc4 = test_panic_preserved(mut_view(sess), mut_view(work_arena), 6, 7, 40);
+    if rc4 != 0 {
+        return rc4;
+    }
+
+    let rc4b = test_panic_preserved(mut_view(sess), mut_view(work_arena), 10, 5, 45);
+    if rc4b != 0 {
+        return rc4b;
+    }
+
+    let rc5 = test_step_limit_and_syntax(mut_view(sess), mut_view(work_arena), mut_view(out_buf));
+    if rc5 != 0 {
+        return rc5;
+    }
+
+    arena_destroy(mut_view(work_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK interp_opt UNIT\n");
+    0
+}
