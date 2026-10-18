@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T085a]
 priority: 119
-status: doing
+status: done
 attempts: 1
 paths: [compiler/link, tests/selfhost/link]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
 started: 2026-10-18 14:53:19
-agent: T085b-impl
+finished: 2026-10-18 18:16:37
 ---
 # T085b — Port PE32+ linker to Axiom
 
@@ -43,3 +43,4 @@ Port in-memory PE32+ linker and executable builder (`compiler/link/`) from C to 
 
 ## Log
 - 2026-10-18 14:53:19 started (attempt 1) T085b-impl
+- 2026-10-18 18:16:37 accepted by QA -> done

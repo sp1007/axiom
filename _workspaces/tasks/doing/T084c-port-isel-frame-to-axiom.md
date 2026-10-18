@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T084b, T084d]
 priority: 118
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/target/x64, tests/selfhost/isel]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-TGT-327, REQ-X64-001]
+started: 2026-10-18 15:53:32
+agent: T084c-impl
 ---
 # T084c — Port x64 instruction selection and frame lowering to Axiom
 
@@ -37,3 +39,6 @@ Port x86-64 instruction selection and stack frame layout (`compiler/target/x64/i
 ## Notes
 - Sub-task of T084 split per ADR-0005 §8 and SPEC-20 §4.8.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 15:53:32 started (attempt 1) T084c-impl

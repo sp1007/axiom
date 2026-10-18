@@ -1,0 +1,775 @@
+// Axiom Compiler — PE32+ Import Table Synthesis & Runtime Stubs (compiler/link/import.ax)
+// Port of IAT/ILT synthesis, DLL import discovery, jump thunks, and startup/runtime
+// stubs (axiom_start, axiom_panic, __ax_host_print, __ax_host_print_int) from
+// bootstrap/axiom0/src/link/pe/linker.c.
+module compiler.link.import
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.obj.coff.CoffBuf
+use compiler.obj.coff.coff_buf_with_capacity
+use compiler.obj.coff.coff_buf_free
+use compiler.obj.coff.coff_buf_put_u8
+use compiler.obj.coff.coff_buf_put_bytes
+use compiler.obj.coff.IMAGE_SCN_CNT_CODE
+use compiler.obj.coff.IMAGE_SCN_CNT_INITIALIZED_DATA
+use compiler.obj.coff.IMAGE_SCN_MEM_EXECUTE
+use compiler.obj.coff.IMAGE_SCN_MEM_READ
+use compiler.obj.coff.IMAGE_SCN_MEM_WRITE
+use compiler.obj.coff.IMAGE_REL_AMD64_REL32
+use compiler.obj.coff.coff_write_u32_le
+use compiler.obj.coff.coff_write_u64_le
+use compiler.obj.coff.cstr_len
+use compiler.obj.coff.bytes_eq
+use compiler.obj.coff.cstr_eq
+use compiler.obj.coff.coff_mul_usize
+use compiler.obj.coff.coff_mul_u32
+
+use compiler.link.pe.PE_IMPORT_DESCRIPTOR_SIZE
+use compiler.link.pe.pe_align_up_u32
+use compiler.link.pe.pe_bytes_ieq
+use compiler.link.pe.pe_cstr_ieq
+use compiler.link.pe.pe_cstr_find_char
+use compiler.link.pe.pe_buf_put_zeroes
+use compiler.link.pe.pe_str_to_cstr_buf
+use compiler.link.pe.MergedSection
+use compiler.link.pe.GlobalSymbol
+use compiler.link.pe.PeReloc
+use compiler.link.pe.LinkerContext
+use compiler.link.pe.linker_dup_bytes
+use compiler.link.pe.linker_dup_cstr
+use compiler.link.pe.linker_get_or_create_section_str
+use compiler.link.pe.linker_append_section_data
+use compiler.link.pe.linker_append_section_slice
+use compiler.link.pe.linker_add_global
+use compiler.link.pe.linker_add_global_str
+use compiler.link.pe.linker_find_global
+use compiler.link.pe.linker_add_reloc
+use compiler.link.pe.linker_add_reloc_str
+use compiler.link.pe.linker_reloc_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Runtime Startup & Host Stub Machine Code Tables (.rdata consts) ---
+
+// 86-byte entry point stub (`axiom_start`): configures console UTF-8 codepage if stdout is a console,
+// invokes `main`, restores console codepage, and calls `ExitProcess(exit_code)`.
+pub const AXIOM_START_CODE: [86]u8 = [
+    0x53u8, 0x55u8, 0x48u8, 0x83u8, 0xECu8, 0x38u8, 0x31u8, 0xEDu8,
+    0x48u8, 0xC7u8, 0xC1u8, 0xF5u8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x48u8, 0x89u8, 0xC1u8,
+    0x48u8, 0x8Du8, 0x54u8, 0x24u8, 0x30u8, 0xFFu8, 0x15u8, 0x00u8,
+    0x00u8, 0x00u8, 0x00u8, 0x85u8, 0xC0u8, 0x74u8, 0x0Du8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x89u8, 0xC5u8, 0xB9u8,
+    0xE9u8, 0xFDu8, 0x00u8, 0x00u8, 0xFFu8, 0x15u8, 0x00u8, 0x00u8,
+    0x00u8, 0x00u8, 0xE8u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x89u8,
+    0xC3u8, 0x85u8, 0xEDu8, 0x74u8, 0x08u8, 0x89u8, 0xE9u8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x89u8, 0xD9u8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0xCCu8,
+];
+
+// 64-byte panic handler stub (`axiom_panic`): writes panic message to STD_ERROR_HANDLE (-12)
+// and terminates with exit code 101 (0x65).
+pub const AXIOM_PANIC_CODE: [64]u8 = [
+    0x56u8, 0x53u8, 0x48u8, 0x83u8, 0xECu8, 0x48u8, 0x48u8, 0x89u8,
+    0xCBu8, 0xB9u8, 0xF4u8, 0xFFu8, 0xFFu8, 0xFFu8, 0x48u8, 0x89u8,
+    0xD6u8, 0xFFu8, 0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x4Cu8,
+    0x8Du8, 0x4Cu8, 0x24u8, 0x38u8, 0x49u8, 0x89u8, 0xF0u8, 0x48u8,
+    0x89u8, 0xDAu8, 0x48u8, 0xC7u8, 0x44u8, 0x24u8, 0x20u8, 0x00u8,
+    0x00u8, 0x00u8, 0x00u8, 0x48u8, 0x89u8, 0xC1u8, 0xFFu8, 0x15u8,
+    0x00u8, 0x00u8, 0x00u8, 0x00u8, 0xB9u8, 0x65u8, 0x00u8, 0x00u8,
+    0x00u8, 0xFFu8, 0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0xCCu8,
+];
+
+// 59-byte string print stub (`__ax_host_print`): writes a `Str` slice (ptr, len) to STD_OUTPUT_HANDLE (-11).
+pub const AXIOM_PRINT_CODE: [59]u8 = [
+    0x53u8, 0x48u8, 0x83u8, 0xECu8, 0x30u8, 0x48u8, 0x89u8, 0xCBu8,
+    0x48u8, 0xC7u8, 0xC1u8, 0xF5u8, 0xFFu8, 0xFFu8, 0xFFu8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x48u8, 0x89u8, 0xC1u8,
+    0x48u8, 0x8Bu8, 0x13u8, 0x4Cu8, 0x8Bu8, 0x43u8, 0x08u8, 0x90u8,
+    0x90u8, 0x4Cu8, 0x8Du8, 0x4Cu8, 0x24u8, 0x28u8, 0x48u8, 0xC7u8,
+    0x44u8, 0x24u8, 0x20u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0xFFu8,
+    0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x48u8, 0x83u8, 0xC4u8,
+    0x30u8, 0x5Bu8, 0xC3u8,
+];
+
+// 119-byte integer print stub (`__ax_host_print_int`): formats a signed 64-bit integer and writes to STD_OUTPUT_HANDLE (-11).
+pub const AXIOM_PRINT_INT_CODE: [119]u8 = [
+    0x53u8, 0x56u8, 0x57u8, 0x48u8, 0x83u8, 0xECu8, 0x30u8, 0x48u8,
+    0x89u8, 0xC8u8, 0x48u8, 0x8Du8, 0x7Cu8, 0x24u8, 0x20u8, 0xC6u8,
+    0x07u8, 0x00u8, 0x48u8, 0xC7u8, 0xC3u8, 0x0Au8, 0x00u8, 0x00u8,
+    0x00u8, 0x48u8, 0x89u8, 0xFEu8, 0x48u8, 0x85u8, 0xC0u8, 0x79u8,
+    0x03u8, 0x48u8, 0xF7u8, 0xD8u8, 0x48u8, 0x31u8, 0xD2u8, 0x48u8,
+    0xF7u8, 0xF3u8, 0x80u8, 0xC2u8, 0x30u8, 0x48u8, 0xFFu8, 0xCEu8,
+    0x88u8, 0x16u8, 0x48u8, 0x85u8, 0xC0u8, 0x75u8, 0xEDu8, 0x48u8,
+    0x85u8, 0xC9u8, 0x79u8, 0x06u8, 0x48u8, 0xFFu8, 0xCEu8, 0xC6u8,
+    0x06u8, 0x2Du8, 0x48u8, 0xC7u8, 0xC1u8, 0xF5u8, 0xFFu8, 0xFFu8,
+    0xFFu8, 0xFFu8, 0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x48u8,
+    0x89u8, 0xC1u8, 0x48u8, 0x89u8, 0xF2u8, 0x49u8, 0x89u8, 0xF8u8,
+    0x49u8, 0x29u8, 0xF0u8, 0x4Cu8, 0x8Du8, 0x4Cu8, 0x24u8, 0x28u8,
+    0x48u8, 0xC7u8, 0x44u8, 0x24u8, 0x20u8, 0x00u8, 0x00u8, 0x00u8,
+    0x00u8, 0xFFu8, 0x15u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8, 0x48u8,
+    0x83u8, 0xC4u8, 0x30u8, 0x5Fu8, 0x5Eu8, 0x5Bu8, 0xC3u8,
+];
+
+// Emits `axiom_start`, `axiom_panic`, `__ax_host_print`, and `__ax_host_print_int` into `.text`
+// and registers their relocations and global symbols. Returns `axiom_start_offset`.
+pub fn linker_emit_runtime_stubs(ctx: mut_view<LinkerContext>) -> u32 {
+    let text_chars = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    let text_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".text" }, text_chars);
+
+    // 1. axiom_start (86 bytes, align 16)
+    let start_code = AXIOM_START_CODE;
+    let axiom_start_offset = linker_append_section_slice(text_sec, view(start_code), 16u32);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 17u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 31u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetConsoleMode" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 41u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetConsoleOutputCP" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 54u32, IMAGE_REL_AMD64_REL32, { "__IAT_SetConsoleOutputCP" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 59u32, IMAGE_REL_AMD64_REL32, { "main" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 73u32, IMAGE_REL_AMD64_REL32, { "__IAT_SetConsoleOutputCP" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, axiom_start_offset + 81u32, IMAGE_REL_AMD64_REL32, { "__IAT_ExitProcess" }, 0i64);
+
+    // 2. axiom_panic (64 bytes, align 16)
+    let panic_code = AXIOM_PANIC_CODE;
+    let panic_offset = linker_append_section_slice(text_sec, view(panic_code), 16u32);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 19u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 48u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 59u32, IMAGE_REL_AMD64_REL32, { "__IAT_ExitProcess" }, 0i64);
+
+    let panic_sym = linker_add_global_str(mut_view(*ctx), { "axiom_panic" });
+    unsafe {
+        (*panic_sym).defined = true;
+        (*panic_sym).sec = text_sec;
+        (*panic_sym).offset = panic_offset;
+    }
+
+    // 3. __ax_host_print (59 bytes, align 16)
+    let print_code = AXIOM_PRINT_CODE;
+    let print_offset = linker_append_section_slice(text_sec, view(print_code), 16u32);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, print_offset + 17u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, print_offset + 49u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+
+    let print_sym = linker_add_global_str(mut_view(*ctx), { "__ax_host_print" });
+    unsafe {
+        (*print_sym).defined = true;
+        (*print_sym).sec = text_sec;
+        (*print_sym).offset = print_offset;
+    }
+
+    // 4. __ax_host_print_int (119 bytes, align 16)
+    let print_int_code = AXIOM_PRINT_INT_CODE;
+    let print_int_offset = linker_append_section_slice(text_sec, view(print_int_code), 16u32);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, print_int_offset + 75u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+    linker_add_reloc_str(mut_view(*ctx), text_sec, print_int_offset + 107u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+
+    let print_int_sym = linker_add_global_str(mut_view(*ctx), { "__ax_host_print_int" });
+    unsafe {
+        (*print_int_sym).defined = true;
+        (*print_int_sym).sec = text_sec;
+        (*print_int_sym).offset = print_int_offset;
+    }
+
+    axiom_start_offset
+}
+
+// --- Import Table Data Structures (ImportFunc, ImportDll, ImportTable) ---
+
+pub struct ImportFunc {
+    pub name: *const u8,
+    pub full_sym: *const u8,
+    pub hint_offset: u32,
+    pub iat_offset: u32,
+    pub thunk_offset: u32,
+}
+
+pub struct ImportDll {
+    pub dll_name: *const u8,
+    pub funcs: *mut ImportFunc,
+    pub num_funcs: usize,
+    pub cap_funcs: usize,
+    pub desc_offset: u32,
+    pub ilt_offset: u32,
+    pub iat_offset: u32,
+    pub dll_name_offset: u32,
+}
+
+pub struct ImportTable {
+    pub dlls: *mut ImportDll,
+    pub num_dlls: usize,
+    pub cap_dlls: usize,
+    pub desc_offset: u32,
+    pub all_iats_start: u32,
+    pub all_iats_size: u32,
+    pub idata_base: u32,
+}
+
+pub fn import_table_new() -> ImportTable {
+    ImportTable {
+        dlls: 0 as *mut ImportDll,
+        num_dlls: 0,
+        cap_dlls: 0,
+        desc_offset: 0u32,
+        all_iats_start: 0u32,
+        all_iats_size: 0u32,
+        idata_base: 0u32,
+    }
+}
+
+pub fn import_table_init(tbl: mut_view<ImportTable>) {
+    tbl.dlls = 0 as *mut ImportDll;
+    tbl.num_dlls = 0;
+    tbl.cap_dlls = 0;
+    tbl.desc_offset = 0u32;
+    tbl.all_iats_start = 0u32;
+    tbl.all_iats_size = 0u32;
+    tbl.idata_base = 0u32;
+}
+
+pub unsafe fn import_dll_slot_ptr(base: *mut ImportDll, idx: usize) -> *mut ImportDll {
+    ((base as usize) + coff_mul_usize(idx, size_of<ImportDll>())) as *mut ImportDll
+}
+
+pub unsafe fn import_func_slot_ptr(base: *mut ImportFunc, idx: usize) -> *mut ImportFunc {
+    ((base as usize) + coff_mul_usize(idx, size_of<ImportFunc>())) as *mut ImportFunc
+}
+
+pub fn import_dll_at(tbl: view<ImportTable>, idx: usize) -> *mut ImportDll {
+    if idx >= tbl.num_dlls || (tbl.dlls as usize) == 0 {
+        return 0 as *mut ImportDll;
+    }
+    unsafe { import_dll_slot_ptr(tbl.dlls, idx) }
+}
+
+pub fn import_func_at(dll: *const ImportDll, idx: usize) -> *mut ImportFunc {
+    if (dll as usize) == 0 {
+        return 0 as *mut ImportFunc;
+    }
+    let n = unsafe { (*dll).num_funcs };
+    let funcs = unsafe { (*dll).funcs };
+    if idx >= n || (funcs as usize) == 0 {
+        return 0 as *mut ImportFunc;
+    }
+    unsafe { import_func_slot_ptr(funcs, idx) }
+}
+
+pub fn import_table_free(tbl: mut_view<ImportTable>) {
+    let mut d: usize = 0;
+    while d < tbl.num_dlls {
+        let dll = unsafe { import_dll_slot_ptr(tbl.dlls, d) };
+        unsafe {
+            if (*dll).cap_funcs > 0 && ((*dll).funcs as usize) != 0 {
+                heap_free(
+                    (*dll).funcs as *mut u8,
+                    coff_mul_usize((*dll).cap_funcs, size_of<ImportFunc>()),
+                    align_of<ImportFunc>()
+                );
+            }
+            (*dll).funcs = 0 as *mut ImportFunc;
+            (*dll).num_funcs = 0;
+            (*dll).cap_funcs = 0;
+        }
+        d = d + 1;
+    }
+    if tbl.cap_dlls > 0 && (tbl.dlls as usize) != 0 {
+        unsafe {
+            heap_free(
+                tbl.dlls as *mut u8,
+                coff_mul_usize(tbl.cap_dlls, size_of<ImportDll>()),
+                align_of<ImportDll>()
+            );
+        }
+    }
+    tbl.dlls = 0 as *mut ImportDll;
+    tbl.num_dlls = 0;
+    tbl.cap_dlls = 0;
+}
+
+// Normalizes a DLL name (appends `.dll` if missing, canonicalizes `kernel32.dll` -> `KERNEL32.dll`).
+pub fn import_normalize_dll_name(ctx: mut_view<LinkerContext>, raw_name: *const u8, raw_len: usize) -> *const u8 {
+    let dll_ext: [4]u8 = [46u8, 100u8, 108u8, 108u8]; // ".dll"
+    let pdll_ext = unsafe { address_of(dll_ext[0]) };
+
+    let has_ext = if raw_len >= 4 {
+        pe_bytes_ieq(unsafe { raw_name + (raw_len - 4) }, 4, pdll_ext, 4)
+    } else {
+        false
+    };
+
+    let norm_len = if has_ext { raw_len } else { raw_len + 4 };
+    let mut tmp = coff_buf_with_capacity(norm_len + 1);
+    coff_buf_put_bytes(mut_view(tmp), raw_name, raw_len);
+    if !has_ext {
+        coff_buf_put_bytes(mut_view(tmp), pdll_ext, 4);
+    }
+    coff_buf_put_u8(mut_view(tmp), 0u8);
+
+    // Check if it matches "kernel32.dll" case-insensitively -> "KERNEL32.dll"
+    let k32_canon: [13]u8 = [
+        75u8, 69u8, 82u8, 78u8, 69u8, 76u8, 51u8, 50u8,
+        46u8, 100u8, 108u8, 108u8, 0u8,
+    ];
+    let pk32 = unsafe { address_of(k32_canon[0]) };
+    let res = if pe_bytes_ieq(tmp.ptr as *const u8, norm_len, pk32, 12) {
+        linker_dup_bytes(ctx, pk32, 12)
+    } else {
+        linker_dup_bytes(ctx, tmp.ptr as *const u8, norm_len)
+    };
+    coff_buf_free(mut_view(tmp));
+    res
+}
+
+pub fn import_find_or_add_dll_bytes(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>, name: *const u8, name_len: usize) -> *mut ImportDll {
+    let norm = import_normalize_dll_name(mut_view(*ctx), name, name_len);
+
+    let mut i: usize = 0;
+    while i < tbl.num_dlls {
+        let existing = import_dll_at(view(*tbl), i);
+        let edll = unsafe { (*existing).dll_name };
+        if pe_cstr_ieq(edll, norm) {
+            return existing;
+        }
+        i = i + 1;
+    }
+
+    if tbl.num_dlls == tbl.cap_dlls {
+        let new_cap = if tbl.cap_dlls == 0 { 8 } else { tbl.cap_dlls + tbl.cap_dlls };
+        let new_bytes = coff_mul_usize(new_cap, size_of<ImportDll>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<ImportDll>()) as *mut ImportDll };
+        if tbl.num_dlls > 0 && (tbl.dlls as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    tbl.dlls as *const u8,
+                    new_arr as *mut u8,
+                    coff_mul_usize(tbl.num_dlls, size_of<ImportDll>())
+                );
+                heap_free(
+                    tbl.dlls as *mut u8,
+                    coff_mul_usize(tbl.cap_dlls, size_of<ImportDll>()),
+                    align_of<ImportDll>()
+                );
+            }
+        }
+        tbl.dlls = new_arr;
+        tbl.cap_dlls = new_cap;
+    }
+
+    let slot = unsafe { import_dll_slot_ptr(tbl.dlls, tbl.num_dlls) };
+    unsafe {
+        *slot = ImportDll {
+            dll_name: norm,
+            funcs: 0 as *mut ImportFunc,
+            num_funcs: 0,
+            cap_funcs: 0,
+            desc_offset: 0u32,
+            ilt_offset: 0u32,
+            iat_offset: 0u32,
+            dll_name_offset: 0u32,
+        };
+    }
+    tbl.num_dlls = tbl.num_dlls + 1;
+    slot
+}
+
+pub fn import_find_or_add_dll(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>, name: *const u8) -> *mut ImportDll {
+    import_find_or_add_dll_bytes(tbl, ctx, name, cstr_len(name))
+}
+
+pub fn import_find_or_add_dll_str(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>, name: Str) -> *mut ImportDll {
+    let mut tmp = pe_str_to_cstr_buf(name);
+    let n = tmp.len - 1;
+    let res = import_find_or_add_dll_bytes(tbl, ctx, tmp.ptr as *const u8, n);
+    coff_buf_free(mut_view(tmp));
+    res
+}
+
+pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_name: *const u8, full_sym: *const u8) -> *mut ImportFunc {
+    if (dll as usize) == 0 {
+        return 0 as *mut ImportFunc;
+    }
+    let num_funcs = unsafe { (*dll).num_funcs };
+    let f0 = unsafe { *func_name };
+    let mut i: usize = 0;
+    while i < num_funcs {
+        let fn_ptr = import_func_at(dll as *const ImportDll, i);
+        let existing_name = unsafe { (*fn_ptr).name };
+        if (unsafe { *existing_name }) == f0 && cstr_eq(existing_name, func_name) {
+            let existing_full = unsafe { (*fn_ptr).full_sym };
+            if (existing_full as usize) == 0 && (full_sym as usize) != 0 {
+                let dup_full = linker_dup_cstr(mut_view(*ctx), full_sym);
+                unsafe {
+                    (*fn_ptr).full_sym = dup_full;
+                }
+            }
+            return fn_ptr;
+        }
+        i = i + 1;
+    }
+
+    let cap_funcs = unsafe { (*dll).cap_funcs };
+    if num_funcs == cap_funcs {
+        let new_cap = if cap_funcs == 0 { 16 } else { cap_funcs + cap_funcs };
+        let new_bytes = coff_mul_usize(new_cap, size_of<ImportFunc>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<ImportFunc>()) as *mut ImportFunc };
+        let old_funcs = unsafe { (*dll).funcs };
+        if num_funcs > 0 && (old_funcs as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    old_funcs as *const u8,
+                    new_arr as *mut u8,
+                    coff_mul_usize(num_funcs, size_of<ImportFunc>())
+                );
+                heap_free(
+                    old_funcs as *mut u8,
+                    coff_mul_usize(cap_funcs, size_of<ImportFunc>()),
+                    align_of<ImportFunc>()
+                );
+            }
+        }
+        unsafe {
+            (*dll).funcs = new_arr;
+            (*dll).cap_funcs = new_cap;
+        }
+    }
+
+    let dup_name = linker_dup_cstr(mut_view(*ctx), func_name);
+    let dup_full = if (full_sym as usize) != 0 {
+        linker_dup_cstr(mut_view(*ctx), full_sym)
+    } else {
+        0 as *const u8
+    };
+
+    let slot = unsafe { import_func_slot_ptr((*dll).funcs, num_funcs) };
+    unsafe {
+        *slot = ImportFunc {
+            name: dup_name,
+            full_sym: dup_full,
+            hint_offset: 0u32,
+            iat_offset: 0u32,
+            thunk_offset: 0u32,
+        };
+        (*dll).num_funcs = num_funcs + 1;
+    }
+    slot
+}
+
+pub fn import_add_func_str(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_name: Str) -> *mut ImportFunc {
+    let mut tmp = pe_str_to_cstr_buf(func_name);
+    let res = import_add_func(ctx, dll, tmp.ptr as *const u8, 0 as *const u8);
+    coff_buf_free(mut_view(tmp));
+    res
+}
+
+// 1. Adds the 6 base KERNEL32.dll imports required by the runtime startup/print/panic stubs.
+pub fn import_add_base_kernel32(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>) {
+    let k32 = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "ExitProcess" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "GetStdHandle" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "WriteFile" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "SetConsoleOutputCP" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "GetConsoleMode" });
+    let _ = import_add_func_str(mut_view(*ctx), k32, { "GetConsoleOutputCP" });
+}
+
+fn has_iat_prefix_cstr(s: *const u8) -> bool {
+    let slen = cstr_len(s);
+    if slen < 6 {
+        return false;
+    }
+    let b0 = unsafe { *s };
+    let b1 = unsafe { *(s + 1) };
+    let b2 = unsafe { *(s + 2) };
+    let b3 = unsafe { *(s + 3) };
+    let b4 = unsafe { *(s + 4) };
+    let b5 = unsafe { *(s + 5) };
+    b0 == 95u8 && b1 == 95u8 && b2 == 73u8 && b3 == 65u8 && b4 == 84u8 && b5 == 95u8
+}
+
+// 2. Discovers DLL imports (`DLL$func` or `__IAT_func`) from unresolved relocations.
+pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>) {
+    let num_relocs = ctx.num_relocs;
+    let mut i: usize = 0;
+    while i < num_relocs {
+        let rel = linker_reloc_at(view(*ctx), i);
+        let sname = unsafe { (*rel).sym_name };
+        if (sname as usize) != 0 && (unsafe { *sname }) != 0u8 {
+            let existing = linker_find_global(view(*ctx), sname);
+            let is_defined = if (existing as usize) != 0 {
+                unsafe { (*existing).defined }
+            } else {
+                false
+            };
+
+            if !is_defined {
+                let starts_iat = has_iat_prefix_cstr(sname);
+                let target = if starts_iat {
+                    unsafe { sname + 6 }
+                } else {
+                    sname
+                };
+
+                let dollar_idx = pe_cstr_find_char(target, 36u8); // '$'
+                if dollar_idx >= 0 {
+                    let dlen = dollar_idx as usize;
+                    let fname = unsafe { target + dlen + 1 };
+                    let dll = import_find_or_add_dll_bytes(mut_view(*tbl), mut_view(*ctx), target, dlen);
+                    let _ = import_add_func(mut_view(*ctx), dll, fname, target);
+                } else if starts_iat {
+                    let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
+                    let _ = import_add_func(mut_view(*ctx), dll, target, 0 as *const u8);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fn make_iat_sym_cstr(ctx: mut_view<LinkerContext>, suffix: *const u8) -> *const u8 {
+    let slen = cstr_len(suffix);
+    let prefix: [6]u8 = [95u8, 95u8, 73u8, 65u8, 84u8, 95u8]; // "__IAT_"
+    let p_prefix = unsafe { address_of(prefix[0]) };
+    let mut tmp = coff_buf_with_capacity(6 + slen + 1);
+    coff_buf_put_bytes(mut_view(tmp), p_prefix, 6);
+    coff_buf_put_bytes(mut_view(tmp), suffix, slen);
+    coff_buf_put_u8(mut_view(tmp), 0u8);
+    let res = linker_dup_bytes(ctx, tmp.ptr as *const u8, 6 + slen);
+    coff_buf_free(mut_view(tmp));
+    res
+}
+
+// 3. Emits 6-byte `jmp [rip + disp32]` thunks (`FF 25 00 00 00 00`) into `.text` for each imported function.
+pub fn import_emit_thunks(tbl: view<ImportTable>, ctx: mut_view<LinkerContext>, text_sec: *mut MergedSection) {
+    let thunk_bytes: [6]u8 = [0xFFu8, 0x25u8, 0x00u8, 0x00u8, 0x00u8, 0x00u8];
+    let mut d: usize = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(tbl, d);
+        let num_funcs = unsafe { (*dll).num_funcs };
+        let mut f: usize = 0;
+        while f < num_funcs {
+            let fn_ptr = import_func_at(dll as *const ImportDll, f);
+            let fn_name = unsafe { (*fn_ptr).name };
+            let fn_full = unsafe { (*fn_ptr).full_sym };
+
+            let iat_sym_name = make_iat_sym_cstr(mut_view(*ctx), fn_name);
+            let thunk_off = linker_append_section_slice(text_sec, view(thunk_bytes), 8u32);
+            unsafe {
+                (*fn_ptr).thunk_offset = thunk_off;
+            }
+
+            linker_add_reloc(mut_view(*ctx), text_sec, thunk_off + 2u32, IMAGE_REL_AMD64_REL32, iat_sym_name, 0i64);
+
+            let g_fn = linker_add_global(mut_view(*ctx), fn_name);
+            if !(unsafe { (*g_fn).defined }) {
+                unsafe {
+                    (*g_fn).defined = true;
+                    (*g_fn).sec = text_sec;
+                    (*g_fn).offset = thunk_off;
+                }
+            }
+
+            if (fn_full as usize) != 0 {
+                let g_full = linker_add_global(mut_view(*ctx), fn_full);
+                if !(unsafe { (*g_full).defined }) {
+                    unsafe {
+                        (*g_full).defined = true;
+                        (*g_full).sec = text_sec;
+                        (*g_full).offset = thunk_off;
+                    }
+                }
+            }
+            f = f + 1;
+        }
+        d = d + 1;
+    }
+}
+
+// 4 & 5. Builds the `.idata` section buffer (Descriptors, ILTs, IATs, Hint/Names, DLL Names)
+// and defines `__IAT_*` global symbols. Returns `idata_sec`.
+pub fn import_build_idata_section(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>) -> *mut MergedSection {
+    let idata_chars = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE;
+    let idata_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".idata" }, idata_chars);
+
+    let mut i_off: u32 = 0u32;
+
+    // 4a. Descriptors
+    tbl.desc_offset = i_off;
+    let mut d: usize = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        unsafe {
+            (*dll).desc_offset = i_off;
+        }
+        i_off = i_off + (PE_IMPORT_DESCRIPTOR_SIZE as u32);
+        d = d + 1;
+    }
+    // Null-terminating descriptor
+    i_off = i_off + (PE_IMPORT_DESCRIPTOR_SIZE as u32);
+
+    // 4b. ILTs (Import Lookup Tables)
+    d = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        let num_funcs = unsafe { (*dll).num_funcs };
+        unsafe {
+            (*dll).ilt_offset = i_off;
+        }
+        i_off = i_off + coff_mul_u32((num_funcs + 1) as u32, 8u32);
+        d = d + 1;
+    }
+
+    // 4c. IATs (Import Address Tables, contiguous)
+    tbl.all_iats_start = i_off;
+    d = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        let num_funcs = unsafe { (*dll).num_funcs };
+        unsafe {
+            (*dll).iat_offset = i_off;
+        }
+        let mut f: usize = 0;
+        while f < num_funcs {
+            let fn_ptr = import_func_at(dll as *const ImportDll, f);
+            unsafe {
+                (*fn_ptr).iat_offset = i_off + coff_mul_u32(f as u32, 8u32);
+            }
+            f = f + 1;
+        }
+        i_off = i_off + coff_mul_u32((num_funcs + 1) as u32, 8u32);
+        d = d + 1;
+    }
+    tbl.all_iats_size = i_off - tbl.all_iats_start;
+
+    // Allocate a growable buffer initialized with zeroes up to `i_off`
+    let mut idata_buf = coff_buf_with_capacity((i_off as usize) + 512);
+    pe_buf_put_zeroes(mut_view(idata_buf), i_off as usize);
+
+    // 4d. Hint/Names (2-byte Hint = 0 + NUL-terminated ASCII function name + even-byte pad)
+    d = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        let num_funcs = unsafe { (*dll).num_funcs };
+        let mut f: usize = 0;
+        while f < num_funcs {
+            let fn_ptr = import_func_at(dll as *const ImportDll, f);
+            unsafe {
+                (*fn_ptr).hint_offset = idata_buf.len as u32;
+            }
+            coff_buf_put_u8(mut_view(idata_buf), 0u8);
+            coff_buf_put_u8(mut_view(idata_buf), 0u8);
+            let fn_name = unsafe { (*fn_ptr).name };
+            let nlen = cstr_len(fn_name);
+            coff_buf_put_bytes(mut_view(idata_buf), fn_name, nlen);
+            coff_buf_put_u8(mut_view(idata_buf), 0u8);
+            if (idata_buf.len & 1) != 0 {
+                coff_buf_put_u8(mut_view(idata_buf), 0u8);
+            }
+            f = f + 1;
+        }
+        d = d + 1;
+    }
+
+    // 4e. DLL Names (NUL-terminated ASCII DLL name + even-byte pad)
+    d = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        unsafe {
+            (*dll).dll_name_offset = idata_buf.len as u32;
+        }
+        let dname = unsafe { (*dll).dll_name };
+        let nlen = cstr_len(dname);
+        coff_buf_put_bytes(mut_view(idata_buf), dname, nlen);
+        coff_buf_put_u8(mut_view(idata_buf), 0u8);
+        if (idata_buf.len & 1) != 0 {
+            coff_buf_put_u8(mut_view(idata_buf), 0u8);
+        }
+        d = d + 1;
+    }
+
+    let aligned_len = pe_align_up_u32(idata_buf.len as u32, 8u32);
+    if (idata_buf.len as u32) < aligned_len {
+        pe_buf_put_zeroes(mut_view(idata_buf), (aligned_len - (idata_buf.len as u32)) as usize);
+    }
+
+    let mut idata_base_out: [1]u32 = [0u32];
+    let pidata_base = unsafe { address_of(idata_base_out[0]) as *mut u32 };
+    linker_append_section_data(idata_sec, idata_buf.ptr as *const u8, aligned_len, 8u32, pidata_base);
+    tbl.idata_base = idata_base_out[0];
+    coff_buf_free(mut_view(idata_buf));
+
+    // 5. Define `__IAT_*` global symbols
+    d = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(view(*tbl), d);
+        let num_funcs = unsafe { (*dll).num_funcs };
+        let mut f: usize = 0;
+        while f < num_funcs {
+            let fn_ptr = import_func_at(dll as *const ImportDll, f);
+            let fn_name = unsafe { (*fn_ptr).name };
+            let fn_full = unsafe { (*fn_ptr).full_sym };
+            let fn_iat_off = unsafe { (*fn_ptr).iat_offset };
+
+            let iat_sym = make_iat_sym_cstr(mut_view(*ctx), fn_name);
+            let g = linker_add_global(mut_view(*ctx), iat_sym);
+            unsafe {
+                (*g).defined = true;
+                (*g).sec = idata_sec;
+                (*g).offset = tbl.idata_base + fn_iat_off;
+            }
+
+            if (fn_full as usize) != 0 {
+                let iat_full = make_iat_sym_cstr(mut_view(*ctx), fn_full);
+                let g2 = linker_add_global(mut_view(*ctx), iat_full);
+                unsafe {
+                    (*g2).defined = true;
+                    (*g2).sec = idata_sec;
+                    (*g2).offset = tbl.idata_base + fn_iat_off;
+                }
+            }
+            f = f + 1;
+        }
+        d = d + 1;
+    }
+
+    idata_sec
+}
+
+// 7. Patches `.idata` descriptors, ILTs, and IATs with computed section RVAs.
+pub fn import_patch_idata_rvas(tbl: view<ImportTable>, idata_sec: *mut MergedSection) {
+    if (idata_sec as usize) == 0 {
+        return;
+    }
+    let sec_rva = unsafe { (*idata_sec).rva };
+    let sec_data = unsafe { (*idata_sec).data };
+    let idata_rva: u32 = sec_rva + tbl.idata_base;
+    let base_off: usize = tbl.idata_base as usize;
+
+    let mut d: usize = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(tbl, d);
+        let desc_off = (unsafe { (*dll).desc_offset }) as usize;
+        let ilt_off = unsafe { (*dll).ilt_offset };
+        let iat_off = unsafe { (*dll).iat_offset };
+        let dll_name_off = unsafe { (*dll).dll_name_offset };
+        let num_funcs = unsafe { (*dll).num_funcs };
+
+        // Patch IMAGE_IMPORT_DESCRIPTOR (OriginalFirstThunk at +0, Name at +12, FirstThunk at +16)
+        coff_write_u32_le(sec_data, base_off + desc_off + 0, idata_rva + ilt_off);
+        coff_write_u32_le(sec_data, base_off + desc_off + 12, idata_rva + dll_name_off);
+        coff_write_u32_le(sec_data, base_off + desc_off + 16, idata_rva + iat_off);
+
+        let mut f: usize = 0;
+        while f < num_funcs {
+            let fn_ptr = import_func_at(dll as *const ImportDll, f);
+            let hint_off = unsafe { (*fn_ptr).hint_offset };
+            let hint_rva: u64 = (idata_rva + hint_off) as u64;
+            let entry_disp: usize = coff_mul_usize(f, 8);
+            coff_write_u64_le(sec_data, base_off + (ilt_off as usize) + entry_disp, hint_rva);
+            coff_write_u64_le(sec_data, base_off + (iat_off as usize) + entry_disp, hint_rva);
+            f = f + 1;
+        }
+        d = d + 1;
+    }
+}

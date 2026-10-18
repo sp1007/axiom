@@ -1,0 +1,1005 @@
+// Axiom Compiler — In-Memory PE32+ Linker & Executable Image Builder (compiler/link/linker.ax)
+// Port of bootstrap/axiom0/src/link/pe/linker.h and bootstrap/axiom0/src/link/pe/linker.c.
+module compiler.link.linker
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.open
+use std.core.host.read
+use std.core.host.write
+use std.core.host.close
+use std.core.host.file_size
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_LINK_UNDEFINED_SYMBOL
+use compiler.diag.code.AX_LINK_DUPLICATE_SYMBOL
+use compiler.diag.code.AX_LINK_BAD_OBJECT
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
+
+use compiler.obj.coff.CoffBuf
+use compiler.obj.coff.coff_buf_with_capacity
+use compiler.obj.coff.coff_buf_free
+use compiler.obj.coff.coff_buf_clear
+use compiler.obj.coff.coff_buf_reserve
+use compiler.obj.coff.coff_buf_put_u8
+use compiler.obj.coff.coff_buf_put_bytes
+use compiler.obj.coff.ObjModel
+use compiler.obj.coff.CoffFileHeader
+use compiler.obj.coff.CoffSectionHeader
+use compiler.obj.coff.COFF_FILE_HEADER_SIZE
+use compiler.obj.coff.COFF_SECTION_HEADER_SIZE
+use compiler.obj.coff.COFF_RELOC_SIZE
+use compiler.obj.coff.COFF_SYMBOL_SIZE
+use compiler.obj.coff.IMAGE_FILE_MACHINE_AMD64
+use compiler.obj.coff.IMAGE_SCN_CNT_INITIALIZED_DATA
+use compiler.obj.coff.IMAGE_SYM_CLASS_EXTERNAL
+use compiler.obj.coff.IMAGE_SYM_CLASS_STATIC
+use compiler.obj.coff.IMAGE_REL_AMD64_ADDR64
+use compiler.obj.coff.IMAGE_REL_AMD64_ADDR32
+use compiler.obj.coff.IMAGE_REL_AMD64_ADDR32NB
+use compiler.obj.coff.IMAGE_REL_AMD64_REL32
+use compiler.obj.coff.coff_read_i32_le
+use compiler.obj.coff.coff_write_u64_le
+use compiler.obj.coff.coff_decode_file_header
+use compiler.obj.coff.coff_decode_section_header
+use compiler.obj.coff.coff_decode_relocation
+use compiler.obj.coff.coff_decode_symbol_record
+use compiler.obj.coff.cstr_len
+use compiler.obj.coff.coff_mul_usize
+use compiler.obj.coff.coff_mul_u32
+use compiler.obj.writer.coff_encode_bytes
+
+use compiler.link.pe.PE_OPTIONAL_HEADER64_TOTAL_SIZE
+use compiler.link.pe.PE_IMPORT_DESCRIPTOR_SIZE
+use compiler.link.pe.PE_DATA_DIRECTORY_COUNT
+use compiler.link.pe.pe_default_image_base
+use compiler.link.pe.PE_DEFAULT_SECTION_ALIGN
+use compiler.link.pe.PE_DEFAULT_FILE_ALIGN
+use compiler.link.pe.PE_DEFAULT_STACK_RESERVE
+use compiler.link.pe.IMAGE_FILE_EXECUTABLE_IMAGE
+use compiler.link.pe.IMAGE_FILE_LARGE_ADDRESS_AWARE
+use compiler.link.pe.IMAGE_FILE_DEBUG_STRIPPED
+use compiler.link.pe.IMAGE_REL_AMD64_REL32_1
+use compiler.link.pe.IMAGE_REL_AMD64_REL32_5
+use compiler.link.pe.PE_DIR_IMPORT
+use compiler.link.pe.PE_DIR_IAT
+use compiler.link.pe.pe_align_up_u32
+use compiler.link.pe.pe_compute_headers_size
+use compiler.link.pe.pe_section_align_from_chars
+use compiler.link.pe.pe_parse_u32_decimal
+use compiler.link.pe.pe_read_i64_le
+use compiler.link.pe.pe_write_i32_le
+use compiler.link.pe.PeDataDirectory
+use compiler.link.pe.PeOptionalHeader64
+use compiler.link.pe.pe_optional_header64_init
+use compiler.link.pe.pe_buf_put_zeroes
+use compiler.link.pe.pe_str_to_cstr_buf
+use compiler.link.pe.pe_emit_dos_header
+use compiler.link.pe.pe_emit_pe_signature
+use compiler.link.pe.pe_emit_file_header
+use compiler.link.pe.pe_emit_optional_header64
+use compiler.link.pe.pe_emit_data_directory
+use compiler.link.pe.pe_emit_section_header
+use compiler.link.pe.MergedSection
+use compiler.link.pe.LinkerContext
+use compiler.link.pe.merged_sec_slot_ptr
+use compiler.link.pe.linker_context_init
+use compiler.link.pe.linker_context_free
+use compiler.link.pe.linker_dup_bytes
+use compiler.link.pe.linker_section_at
+use compiler.link.pe.linker_find_section_str
+use compiler.link.pe.linker_get_or_create_section
+use compiler.link.pe.linker_get_or_create_section_str
+use compiler.link.pe.linker_append_section_data
+use compiler.link.pe.linker_add_global
+use compiler.link.pe.linker_add_reloc
+use compiler.link.pe.linker_reloc_at
+
+use compiler.link.import.ImportTable
+use compiler.link.import.import_table_new
+use compiler.link.import.import_table_free
+use compiler.link.import.linker_emit_runtime_stubs
+use compiler.link.import.import_add_base_kernel32
+use compiler.link.import.import_discover_from_relocs
+use compiler.link.import.import_emit_thunks
+use compiler.link.import.import_build_idata_section
+use compiler.link.import.import_patch_idata_rvas
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+// --- Linker Diagnostic Reporting Helpers ---
+
+pub fn linker_report_diag(diag: *mut DiagSink, code_v: u32, msg_ptr: *const u8, msg_len: usize) {
+    if (diag as usize) == 0 {
+        return;
+    }
+    let d = Diagnostic {
+        code: diag_code(code_v),
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: msg_ptr, len: msg_len },
+        primary: span_none(),
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(unsafe { mut_view(*diag) }, view(d));
+}
+
+pub fn linker_report_bad_object(diag: *mut DiagSink) {
+    let msg: [11]u8 = [98u8, 97u8, 100u8, 32u8, 111u8, 98u8, 106u8, 101u8, 99u8, 116u8, 0u8]; // "bad object"
+    let pmsg = unsafe { address_of(msg[0]) };
+    linker_report_diag(diag, AX_LINK_BAD_OBJECT, pmsg, 10);
+}
+
+pub fn linker_report_duplicate_symbol(diag: *mut DiagSink, sym_name: *const u8) {
+    if (diag as usize) == 0 {
+        return;
+    }
+    let prefix: [18]u8 = [
+        100u8, 117u8, 112u8, 108u8, 105u8, 99u8, 97u8, 116u8, 101u8, 32u8,
+        115u8, 121u8, 109u8, 98u8, 111u8, 108u8, 58u8, 32u8,
+    ]; // "duplicate symbol: "
+    let p_prefix = unsafe { address_of(prefix[0]) };
+    let slen = cstr_len(sym_name);
+    let mut buf = coff_buf_with_capacity(18 + slen + 1);
+    coff_buf_put_bytes(mut_view(buf), p_prefix, 18);
+    coff_buf_put_bytes(mut_view(buf), sym_name, slen);
+    let msg_len = buf.len;
+    coff_buf_put_u8(mut_view(buf), 0u8);
+    linker_report_diag(diag, AX_LINK_DUPLICATE_SYMBOL, buf.ptr as *const u8, msg_len);
+    coff_buf_free(mut_view(buf));
+}
+
+pub fn linker_report_undefined_symbol(diag: *mut DiagSink, sym_name: *const u8) {
+    linker_report_diag(diag, AX_LINK_UNDEFINED_SYMBOL, sym_name, cstr_len(sym_name));
+}
+
+pub fn linker_diag_code_at(sink: view<DiagSink>, idx: usize) -> u32 {
+    if idx >= sink.len || (sink.diags as usize) == 0 {
+        return 0u32;
+    }
+    let d_ptr = ((sink.diags as usize) + coff_mul_usize(idx, size_of<Diagnostic>())) as *const Diagnostic;
+    unsafe { (*d_ptr).code.v }
+}
+
+pub fn linker_diag_message_at(sink: view<DiagSink>, idx: usize) -> StrView {
+    if idx >= sink.len || (sink.diags as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let d_ptr = ((sink.diags as usize) + coff_mul_usize(idx, size_of<Diagnostic>())) as *const Diagnostic;
+    unsafe { (*d_ptr).message }
+}
+
+// --- COFF Object File Loader & Section/Symbol/Relocation Merger ---
+
+unsafe fn u32_slot_ptr(base: *mut u32, idx: usize) -> *mut u32 {
+    ((base as usize) + coff_mul_usize(idx, size_of<u32>())) as *mut u32
+}
+
+unsafe fn cstr_slot_ptr(base: *mut *const u8, idx: usize) -> *mut *const u8 {
+    ((base as usize) + coff_mul_usize(idx, size_of<*const u8>())) as *mut *const u8
+}
+
+fn read_cstr_at_offset(buf: *const u8, buf_len: usize, off: usize, out_len: mut_view<usize>) -> *const u8 {
+    if off >= buf_len {
+        *out_len = 0;
+        return 0 as *const u8;
+    }
+    let mut n: usize = 0;
+    while off + n < buf_len {
+        if (unsafe { *(buf + off + n) }) == 0u8 {
+            break;
+        }
+        n = n + 1;
+    }
+    *out_len = n;
+    unsafe { buf + off }
+}
+
+// Parses a single COFF `.obj` image in memory (`obj_ptr`, `obj_len`) and merges its sections,
+// symbols, and relocations into `ctx`.
+pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8, obj_len: usize, diag: *mut DiagSink) -> bool {
+    if (obj_ptr as usize) == 0 || obj_len < COFF_FILE_HEADER_SIZE {
+        linker_report_bad_object(diag);
+        return false;
+    }
+
+    let hdr = coff_decode_file_header(obj_ptr, 0);
+    if hdr.machine != IMAGE_FILE_MACHINE_AMD64 {
+        linker_report_bad_object(diag);
+        return false;
+    }
+
+    let num_secs: usize = hdr.number_of_sections as usize;
+    let shdr_table_end: usize = COFF_FILE_HEADER_SIZE + coff_mul_usize(num_secs, COFF_SECTION_HEADER_SIZE);
+    if shdr_table_end > obj_len {
+        linker_report_bad_object(diag);
+        return false;
+    }
+
+    let num_syms: usize = hdr.number_of_symbols as usize;
+    let sym_table_off: usize = hdr.pointer_to_symbol_table as usize;
+    let str_table_offset: usize = sym_table_off + coff_mul_usize(num_syms, COFF_SYMBOL_SIZE);
+    if num_syms > 0 && str_table_offset > obj_len {
+        linker_report_bad_object(diag);
+        return false;
+    }
+
+    let sec_slots_count: usize = num_secs + 1;
+    let obj_merged_secs = unsafe {
+        heap_alloc(coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>()) as *mut *mut MergedSection
+    };
+    let obj_sec_offsets = unsafe {
+        heap_alloc(coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>()) as *mut u32
+    };
+    unsafe {
+        *(merged_sec_slot_ptr(obj_merged_secs, 0)) = 0 as *mut MergedSection;
+        *(u32_slot_ptr(obj_sec_offsets, 0)) = 0u32;
+    }
+
+    // 1. Merge Sections
+    let mut s: usize = 0;
+    while s < num_secs {
+        let shdr = coff_decode_section_header(obj_ptr, COFF_FILE_HEADER_SIZE + coff_mul_usize(s, COFF_SECTION_HEADER_SIZE));
+        let mut sec_name: [9]u8 = [0u8; 9];
+
+        if shdr.name[0] == 47u8 { // '/'
+            let p_digits = unsafe { address_of(shdr.name[1]) };
+            let str_off = pe_parse_u32_decimal(p_digits, 7) as usize;
+            let mut slen: usize = 0;
+            let sptr = read_cstr_at_offset(obj_ptr, obj_len, str_table_offset + str_off, mut_view(slen));
+            let copy_len = if slen > 8 { 8 } else { slen };
+            let mut k: usize = 0;
+            while k < copy_len {
+                sec_name[k] = unsafe { *(sptr + k) };
+                k = k + 1;
+            }
+        } else {
+            let mut k: usize = 0;
+            while k < 8 {
+                let ch = shdr.name[k];
+                if ch == 0u8 {
+                    break;
+                }
+                sec_name[k] = ch;
+                k = k + 1;
+            }
+        }
+
+        let p_sec_name = unsafe { address_of(sec_name[0]) };
+        let msec = linker_get_or_create_section(mut_view(*ctx), p_sec_name, shdr.characteristics);
+        unsafe {
+            *(merged_sec_slot_ptr(obj_merged_secs, s + 1)) = msec;
+        }
+
+        let raw_size: u32 = shdr.size_of_raw_data;
+        let raw_ptr_off: u32 = shdr.pointer_to_raw_data;
+        let mut data_ptr: *const u8 = 0 as *const u8;
+        if raw_size > 0u32 && raw_ptr_off > 0u32 {
+            let end_off: usize = (raw_ptr_off as usize) + (raw_size as usize);
+            if end_off > obj_len {
+                unsafe {
+                    heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
+                    heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
+                }
+                linker_report_bad_object(diag);
+                return false;
+            }
+            data_ptr = unsafe { obj_ptr + (raw_ptr_off as usize) };
+        }
+
+        let align: u32 = pe_section_align_from_chars(shdr.characteristics);
+        let mut out_off: [1]u32 = [0u32];
+        let p_out_off = unsafe { address_of(out_off[0]) as *mut u32 };
+        linker_append_section_data(msec, data_ptr, raw_size, align, p_out_off);
+        unsafe {
+            *(u32_slot_ptr(obj_sec_offsets, s + 1)) = out_off[0];
+        }
+
+        s = s + 1;
+    }
+
+    // 2. Parse Symbol Table
+    let sym_names_cap: usize = if num_syms == 0 { 1 } else { num_syms };
+    let sym_names = unsafe {
+        heap_alloc(coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>()) as *mut *const u8
+    };
+    let mut sym_idx: usize = 0;
+    while sym_idx < sym_names_cap {
+        unsafe {
+            *(cstr_slot_ptr(sym_names, sym_idx)) = 0 as *const u8;
+        }
+        sym_idx = sym_idx + 1;
+    }
+
+    sym_idx = 0;
+    while sym_idx < num_syms {
+        let sym_off: usize = sym_table_off + coff_mul_usize(sym_idx, COFF_SYMBOL_SIZE);
+        let sym = coff_decode_symbol_record(obj_ptr, sym_off);
+
+        let name_ptr: *const u8 = if sym.zeroes == 0u32 {
+            let mut slen: usize = 0;
+            let raw_s = read_cstr_at_offset(obj_ptr, obj_len, str_table_offset + (sym.offset as usize), mut_view(slen));
+            linker_dup_bytes(mut_view(*ctx), raw_s, slen)
+        } else {
+            let mut short_len: usize = 0;
+            while short_len < 8 {
+                if sym.name_bytes[short_len] == 0u8 {
+                    break;
+                }
+                short_len = short_len + 1;
+            }
+            let p_short = unsafe { address_of(sym.name_bytes[0]) };
+            linker_dup_bytes(mut_view(*ctx), p_short, short_len)
+        };
+
+        unsafe {
+            *(cstr_slot_ptr(sym_names, sym_idx)) = name_ptr;
+        }
+
+        if sym.section_number > 0i16 {
+            let sec_num: usize = sym.section_number as usize;
+            if sec_num <= num_secs {
+                let s_msec = unsafe { *(merged_sec_slot_ptr(obj_merged_secs, sec_num)) };
+                let s_base = unsafe { *(u32_slot_ptr(obj_sec_offsets, sec_num)) };
+                let s_offset: u32 = s_base + sym.value;
+
+                if sym.storage_class == IMAGE_SYM_CLASS_EXTERNAL {
+                    let g = linker_add_global(mut_view(*ctx), name_ptr);
+                    if unsafe { (*g).defined } {
+                        linker_report_duplicate_symbol(diag, name_ptr);
+                        unsafe {
+                            heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
+                            heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
+                            heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
+                        }
+                        return false;
+                    }
+                    unsafe {
+                        (*g).defined = true;
+                        (*g).sec = s_msec;
+                        (*g).offset = s_offset;
+                    }
+                } else if sym.storage_class == IMAGE_SYM_CLASS_STATIC {
+                    let g_static = linker_add_global(mut_view(*ctx), name_ptr);
+                    if !(unsafe { (*g_static).defined }) {
+                        unsafe {
+                            (*g_static).defined = true;
+                            (*g_static).sec = s_msec;
+                            (*g_static).offset = s_offset;
+                        }
+                    }
+                }
+            }
+        }
+
+        let aux_count: usize = sym.number_of_aux_symbols as usize;
+        sym_idx = sym_idx + 1 + aux_count;
+    }
+
+    // 3. Parse Relocations
+    s = 0;
+    while s < num_secs {
+        let shdr = coff_decode_section_header(obj_ptr, COFF_FILE_HEADER_SIZE + coff_mul_usize(s, COFF_SECTION_HEADER_SIZE));
+        let num_rels: usize = shdr.number_of_relocations as usize;
+        if num_rels > 0 {
+            let rel_table_off: usize = shdr.pointer_to_relocations as usize;
+            let rel_table_end: usize = rel_table_off + coff_mul_usize(num_rels, COFF_RELOC_SIZE);
+            if rel_table_end > obj_len {
+                unsafe {
+                    heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
+                    heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
+                    heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
+                }
+                linker_report_bad_object(diag);
+                return false;
+            }
+
+            let msec = unsafe { *(merged_sec_slot_ptr(obj_merged_secs, s + 1)) };
+            let msec_base = unsafe { *(u32_slot_ptr(obj_sec_offsets, s + 1)) };
+            let msec_data = unsafe { (*msec).data as *const u8 };
+            let msec_size = unsafe { (*msec).size };
+
+            let mut r: usize = 0;
+            while r < num_rels {
+                let rel = coff_decode_relocation(obj_ptr, rel_table_off + coff_mul_usize(r, COFF_RELOC_SIZE));
+                let off: u32 = msec_base + rel.virtual_address;
+                let mut addend: i64 = 0i64;
+                if rel.reloc_type == IMAGE_REL_AMD64_ADDR64 {
+                    if off + 8u32 <= msec_size {
+                        addend = pe_read_i64_le(msec_data, off as usize);
+                    }
+                } else {
+                    if off + 4u32 <= msec_size {
+                        addend = (coff_read_i32_le(msec_data, off as usize)) as i64;
+                    }
+                }
+
+                let sym_tab_idx: usize = rel.symbol_table_index as usize;
+                let target_sym_name: *const u8 = if sym_tab_idx < num_syms {
+                    unsafe { *(cstr_slot_ptr(sym_names, sym_tab_idx)) }
+                } else {
+                    0 as *const u8
+                };
+
+                linker_add_reloc(mut_view(*ctx), msec, off, rel.reloc_type, target_sym_name, addend);
+                r = r + 1;
+            }
+        }
+        s = s + 1;
+    }
+
+    unsafe {
+        heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
+        heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
+        heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
+    }
+    true
+}
+
+pub fn linker_read_file_bytes(path_ptr: *const u8, path_len: usize, out_buf: mut_view<CoffBuf>) -> bool {
+    coff_buf_clear(mut_view(*out_buf));
+    if (path_ptr as usize) == 0 || path_len == 0 {
+        return false;
+    }
+    let h = unsafe { open(path_ptr, path_len, 0u32) };
+    if h < 0 {
+        return false;
+    }
+    let sz = file_size(h);
+    if sz <= 0 {
+        let _ = close(h);
+        return false;
+    }
+    let usize_sz = sz as usize;
+    coff_buf_reserve(mut_view(*out_buf), usize_sz);
+    let mut total_read: usize = 0;
+    while total_read < usize_sz {
+        let dst = unsafe { out_buf.ptr + total_read };
+        let rem = usize_sz - total_read;
+        let rd = unsafe { read(h, dst, rem) };
+        if rd <= 0 {
+            let _ = close(h);
+            return false;
+        }
+        total_read = total_read + (rd as usize);
+    }
+    out_buf.len = total_read;
+    let _ = close(h);
+    true
+}
+
+pub fn linker_load_coff_file(ctx: mut_view<LinkerContext>, path_ptr: *const u8, path_len: usize, diag: *mut DiagSink) -> bool {
+    let mut file_buf = coff_buf_with_capacity(256);
+    if !linker_read_file_bytes(path_ptr, path_len, mut_view(file_buf)) {
+        coff_buf_free(mut_view(file_buf));
+        linker_report_bad_object(diag);
+        return false;
+    }
+    let ok = linker_load_coff_object(ctx, file_buf.ptr as *const u8, file_buf.len, diag);
+    coff_buf_free(mut_view(file_buf));
+    ok
+}
+
+// --- RVA Assignment, Relocation Application & PE32+ Image Emission ---
+
+// 6. Assigns RVAs (`SectionAlignment = 0x1000`) and raw file offsets (`FileAlignment = 0x200`)
+// to all merged sections in `ctx`. Returns `SizeOfImage` (final `current_rva`).
+pub fn linker_assign_rvas(ctx: mut_view<LinkerContext>, file_align: u32, sec_align: u32) -> u32 {
+    let mut current_rva: u32 = sec_align;
+    let mut current_raw: u32 = pe_compute_headers_size(ctx.num_sections, file_align);
+
+    let mut i: usize = 0;
+    while i < ctx.num_sections {
+        let sec = linker_section_at(view(*ctx), i);
+        let sec_size = unsafe { (*sec).size };
+        unsafe {
+            (*sec).rva = current_rva;
+            (*sec).raw_ptr = current_raw;
+        }
+        current_rva = pe_align_up_u32(current_rva + sec_size, sec_align);
+        current_raw = pe_align_up_u32(current_raw + sec_size, file_align);
+        i = i + 1;
+    }
+    current_rva
+}
+
+// 8. Resolves and patches all relocations in `ctx`. Reports `AX_LINK_UNDEFINED_SYMBOL` on failure.
+pub fn linker_apply_relocations(ctx: mut_view<LinkerContext>, image_base: u64, diag: *mut DiagSink) -> bool {
+    let mut i: usize = 0;
+    while i < ctx.num_relocs {
+        let r = linker_reloc_at(view(*ctx), i);
+        let sym_name = unsafe { (*r).sym_name };
+        let sym = linker_add_global(mut_view(*ctx), sym_name);
+        if !(unsafe { (*sym).defined }) {
+            linker_report_undefined_symbol(diag, sym_name);
+            return false;
+        }
+
+        let sym_sec = unsafe { (*sym).sec };
+        let sym_off = unsafe { (*sym).offset };
+        let sym_rva: u32 = (unsafe { (*sym_sec).rva }) + sym_off;
+
+        let r_sec = unsafe { (*r).sec };
+        let r_off = unsafe { (*r).offset };
+        let reloc_rva: u32 = (unsafe { (*r_sec).rva }) + r_off;
+        let r_data = unsafe { (*r_sec).data };
+        let r_type = unsafe { (*r).reloc_type };
+        let r_addend = unsafe { (*r).addend };
+
+        if r_type == IMAGE_REL_AMD64_REL32 || (r_type >= IMAGE_REL_AMD64_REL32_1 && r_type <= IMAGE_REL_AMD64_REL32_5) {
+            let val: i64 = (sym_rva as i64) - (reloc_rva as i64) - 4i64 + r_addend;
+            pe_write_i32_le(r_data, r_off as usize, val as i32);
+        } else if r_type == IMAGE_REL_AMD64_ADDR64 {
+            let val: u64 = image_base + (sym_rva as u64) + (r_addend as u64);
+            coff_write_u64_le(r_data, r_off as usize, val);
+        } else if r_type == IMAGE_REL_AMD64_ADDR32NB {
+            let val32: i32 = ((sym_rva as i64) + r_addend) as i32;
+            pe_write_i32_le(r_data, r_off as usize, val32);
+        } else if r_type == IMAGE_REL_AMD64_ADDR32 {
+            let val32: i32 = ((image_base as i64) + (sym_rva as i64) + r_addend) as i32;
+            pe_write_i32_le(r_data, r_off as usize, val32);
+        }
+
+        i = i + 1;
+    }
+    true
+}
+
+// 9. Serializes the complete PE32+ executable image into `out`.
+pub fn linker_emit_pe_image(
+    ctx: view<LinkerContext>,
+    imports: view<ImportTable>,
+    axiom_start_offset: u32,
+    size_of_image: u32,
+    stack_reserve: u32,
+    out: mut_view<CoffBuf>
+) -> bool {
+    let file_align: u32 = PE_DEFAULT_FILE_ALIGN;
+    let sec_align: u32 = PE_DEFAULT_SECTION_ALIGN;
+    let eff_stack_reserve: u32 = if stack_reserve == 0u32 { PE_DEFAULT_STACK_RESERVE } else { stack_reserve };
+
+    let text_sec = linker_find_section_str(ctx, { ".text" });
+    let idata_sec = linker_find_section_str(ctx, { ".idata" });
+    if (text_sec as usize) == 0 || (idata_sec as usize) == 0 {
+        return false;
+    }
+
+    let size_of_headers: u32 = pe_compute_headers_size(ctx.num_sections, file_align);
+
+    // 1. DOS Header (64 bytes)
+    pe_emit_dos_header(mut_view(*out));
+
+    // 2. PE Signature ("PE\0\0", 4 bytes)
+    pe_emit_pe_signature(mut_view(*out));
+
+    // 3. COFF File Header (20 bytes)
+    let fhdr = CoffFileHeader {
+        machine: IMAGE_FILE_MACHINE_AMD64,
+        number_of_sections: ctx.num_sections as u16,
+        time_date_stamp: 0u32,
+        pointer_to_symbol_table: 0u32,
+        number_of_symbols: 0u32,
+        size_of_optional_header: PE_OPTIONAL_HEADER64_TOTAL_SIZE as u16,
+        characteristics: IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DEBUG_STRIPPED,
+    };
+    pe_emit_file_header(mut_view(*out), view(fhdr));
+
+    // 4. Optional Header (112 bytes)
+    let mut size_of_init_data: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < ctx.num_sections {
+        let sec = linker_section_at(ctx, i);
+        let chars = unsafe { (*sec).characteristics };
+        let sz = unsafe { (*sec).size };
+        if (chars & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0u32 {
+            size_of_init_data = size_of_init_data + sz;
+        }
+        i = i + 1;
+    }
+
+    let text_rva = unsafe { (*text_sec).rva };
+    let text_size = unsafe { (*text_sec).size };
+    let mut ohdr = PeOptionalHeader64 {
+        magic: 0u16,
+        major_linker_version: 0u8,
+        minor_linker_version: 0u8,
+        size_of_code: 0u32,
+        size_of_initialized_data: 0u32,
+        size_of_uninitialized_data: 0u32,
+        address_of_entry_point: 0u32,
+        base_of_code: 0u32,
+        image_base: 0u64,
+        section_alignment: 0u32,
+        file_alignment: 0u32,
+        major_operating_system_version: 0u16,
+        minor_operating_system_version: 0u16,
+        major_image_version: 0u16,
+        minor_image_version: 0u16,
+        major_subsystem_version: 0u16,
+        minor_subsystem_version: 0u16,
+        win32_version_value: 0u32,
+        size_of_image: 0u32,
+        size_of_headers: 0u32,
+        check_sum: 0u32,
+        subsystem: 0u16,
+        dll_characteristics: 0u16,
+        size_of_stack_reserve: 0u64,
+        size_of_stack_commit: 0u64,
+        size_of_heap_reserve: 0u64,
+        size_of_heap_commit: 0u64,
+        loader_flags: 0u32,
+        number_of_rva_and_sizes: 0u32,
+    };
+    pe_optional_header64_init(mut_view(ohdr));
+    ohdr.size_of_code = text_size;
+    ohdr.size_of_initialized_data = size_of_init_data;
+    ohdr.address_of_entry_point = text_rva + axiom_start_offset;
+    ohdr.base_of_code = text_rva;
+    ohdr.section_alignment = sec_align;
+    ohdr.file_alignment = file_align;
+    ohdr.size_of_image = size_of_image;
+    ohdr.size_of_headers = size_of_headers;
+    ohdr.size_of_stack_reserve = eff_stack_reserve as u64;
+    pe_emit_optional_header64(mut_view(*out), view(ohdr));
+
+    // 5. Data Directories (16 * 8 = 128 bytes)
+    let idata_rva = unsafe { (*idata_sec).rva };
+    let import_dir_rva: u32 = idata_rva + imports.idata_base + imports.desc_offset;
+    let import_dir_size: u32 = coff_mul_u32((imports.num_dlls + 1) as u32, PE_IMPORT_DESCRIPTOR_SIZE as u32);
+    let iat_dir_rva: u32 = idata_rva + imports.idata_base + imports.all_iats_start;
+    let iat_dir_size: u32 = imports.all_iats_size;
+
+    let mut d_idx: usize = 0;
+    while d_idx < PE_DATA_DIRECTORY_COUNT {
+        let dir = if d_idx == PE_DIR_IMPORT {
+            PeDataDirectory { virtual_address: import_dir_rva, size: import_dir_size }
+        } else if d_idx == PE_DIR_IAT {
+            PeDataDirectory { virtual_address: iat_dir_rva, size: iat_dir_size }
+        } else {
+            PeDataDirectory { virtual_address: 0u32, size: 0u32 }
+        };
+        pe_emit_data_directory(mut_view(*out), view(dir));
+        d_idx = d_idx + 1;
+    }
+
+    // 6. Section Headers (40 bytes each)
+    i = 0;
+    while i < ctx.num_sections {
+        let sec = linker_section_at(ctx, i);
+        let mut sname: [8]u8 = [0u8; 8];
+        let mut k: usize = 0;
+        while k < 8 {
+            let ch = unsafe { (*sec).name[k] };
+            if ch == 0u8 {
+                break;
+            }
+            sname[k] = ch;
+            k = k + 1;
+        }
+        let sec_size = unsafe { (*sec).size };
+        let sec_rva = unsafe { (*sec).rva };
+        let sec_raw_ptr = unsafe { (*sec).raw_ptr };
+        let sec_chars = unsafe { (*sec).characteristics };
+        let raw_data_sz = pe_align_up_u32(sec_size, file_align);
+        let ptr_to_raw = if raw_data_sz > 0u32 { sec_raw_ptr } else { 0u32 };
+
+        let shdr = CoffSectionHeader {
+            name: sname,
+            virtual_size: sec_size,
+            virtual_address: sec_rva,
+            size_of_raw_data: raw_data_sz,
+            pointer_to_raw_data: ptr_to_raw,
+            pointer_to_relocations: 0u32,
+            pointer_to_linenumbers: 0u32,
+            number_of_relocations: 0u16,
+            number_of_linenumbers: 0u16,
+            characteristics: sec_chars,
+        };
+        pe_emit_section_header(mut_view(*out), view(shdr));
+        i = i + 1;
+    }
+
+    // 7. Section Raw Data (padded to raw_ptr and FileAlignment)
+    i = 0;
+    while i < ctx.num_sections {
+        let sec = linker_section_at(ctx, i);
+        let sec_size = unsafe { (*sec).size };
+        if sec_size > 0u32 {
+            let sec_raw_ptr = (unsafe { (*sec).raw_ptr }) as usize;
+            if (out.len) < sec_raw_ptr {
+                pe_buf_put_zeroes(mut_view(*out), sec_raw_ptr - out.len);
+            }
+            let sec_data = unsafe { (*sec).data as *const u8 };
+            coff_buf_put_bytes(mut_view(*out), sec_data, sec_size as usize);
+
+            let aligned_sz = pe_align_up_u32(sec_size, file_align);
+            let padding: u32 = aligned_sz - sec_size;
+            if padding > 0u32 {
+                pe_buf_put_zeroes(mut_view(*out), padding as usize);
+            }
+        }
+        i = i + 1;
+    }
+
+    true
+}
+
+// Complete pipeline on an already-loaded `LinkerContext`: emits runtime stubs, synthesizes imports
+// and `.idata`, computes RVAs, patches `.idata` and relocations, and emits the PE32+ executable into `out`.
+pub fn linker_finalize_to_buf(ctx: mut_view<LinkerContext>, stack_reserve: u32, out: mut_view<CoffBuf>, diag: *mut DiagSink) -> bool {
+    coff_buf_clear(mut_view(*out));
+
+    let axiom_start_offset = linker_emit_runtime_stubs(mut_view(*ctx));
+    let mut imports = import_table_new();
+    import_add_base_kernel32(mut_view(imports), mut_view(*ctx));
+    import_discover_from_relocs(mut_view(imports), mut_view(*ctx));
+
+    let text_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".text" }, 0u32);
+    import_emit_thunks(view(imports), mut_view(*ctx), text_sec);
+
+    let idata_sec = import_build_idata_section(mut_view(imports), mut_view(*ctx));
+    let size_of_image = linker_assign_rvas(mut_view(*ctx), PE_DEFAULT_FILE_ALIGN, PE_DEFAULT_SECTION_ALIGN);
+    import_patch_idata_rvas(view(imports), idata_sec);
+
+    if !linker_apply_relocations(mut_view(*ctx), pe_default_image_base(), diag) {
+        import_table_free(mut_view(imports));
+        return false;
+    }
+
+    let ok = linker_emit_pe_image(view(*ctx), view(imports), axiom_start_offset, size_of_image, stack_reserve, out);
+    import_table_free(mut_view(imports));
+    ok
+}
+
+// --- High-Level In-Memory & File-Based PE32+ Linker Entry Points ---
+
+unsafe fn const_ptr_slot(base: *const *const u8, idx: usize) -> *const u8 {
+    let slot = ((base as usize) + coff_mul_usize(idx, size_of<*const u8>())) as *const *const u8;
+    *slot
+}
+
+unsafe fn usize_slot(base: *const usize, idx: usize) -> usize {
+    let slot = ((base as usize) + coff_mul_usize(idx, size_of<usize>())) as *const usize;
+    *slot
+}
+
+pub fn pe_link_coff_buffers_to_buf(
+    obj_ptrs: *const *const u8,
+    obj_lens: *const usize,
+    input_count: usize,
+    stack_reserve: u32,
+    out: mut_view<CoffBuf>,
+    diag: *mut DiagSink
+) -> bool {
+    let mut ctx = LinkerContext {
+        sections: 0 as *mut *mut MergedSection,
+        num_sections: 0,
+        cap_sections: 0,
+        globals: 0 as *mut compiler.link.pe.GlobalSymbol,
+        num_globals: 0,
+        cap_globals: 0,
+        relocs: 0 as *mut compiler.link.pe.PeReloc,
+        num_relocs: 0,
+        cap_relocs: 0,
+        str_arena: 0 as *mut compiler.kernel.arena.Arena,
+    };
+    linker_context_init(mut_view(ctx));
+
+    let mut i: usize = 0;
+    while i < input_count {
+        let p = unsafe { const_ptr_slot(obj_ptrs, i) };
+        let l = unsafe { usize_slot(obj_lens, i) };
+        if !linker_load_coff_object(mut_view(ctx), p, l, diag) {
+            linker_context_free(mut_view(ctx));
+            return false;
+        }
+        i = i + 1;
+    }
+
+    let ok = linker_finalize_to_buf(mut_view(ctx), stack_reserve, out, diag);
+    linker_context_free(mut_view(ctx));
+    ok
+}
+
+pub fn pe_link_single_coff_to_buf(
+    obj_ptr: *const u8,
+    obj_len: usize,
+    stack_reserve: u32,
+    out: mut_view<CoffBuf>,
+    diag: *mut DiagSink
+) -> bool {
+    let mut ptrs: [1]*const u8 = [obj_ptr];
+    let mut lens: [1]usize = [obj_len];
+    let pptrs = unsafe { address_of(ptrs[0]) };
+    let plens = unsafe { address_of(lens[0]) };
+    pe_link_coff_buffers_to_buf(pptrs, plens, 1, stack_reserve, out, diag)
+}
+
+pub fn pe_link_objmodel_to_buf(
+    model: view<ObjModel>,
+    stack_reserve: u32,
+    out: mut_view<CoffBuf>,
+    diag: *mut DiagSink
+) -> bool {
+    let mut obj_buf = coff_encode_bytes(model);
+    let ok = pe_link_single_coff_to_buf(obj_buf.ptr as *const u8, obj_buf.len, stack_reserve, out, diag);
+    coff_buf_free(mut_view(obj_buf));
+    ok
+}
+
+pub fn pe_write_buf_to_path_bytes(buf: view<CoffBuf>, path_ptr: *const u8, path_len: usize) -> bool {
+    if (path_ptr as usize) == 0 || path_len == 0 {
+        return false;
+    }
+    let h = unsafe { open(path_ptr, path_len, 1u32) };
+    if h < 0 {
+        return false;
+    }
+    let n = buf.len;
+    if n > 0 && (buf.ptr as usize) != 0 {
+        let mut total_written: usize = 0;
+        while total_written < n {
+            let src = unsafe { (buf.ptr as *const u8) + total_written };
+            let rem = n - total_written;
+            let wr = unsafe { write(h, src, rem) };
+            if wr <= 0 {
+                let _ = close(h);
+                return false;
+            }
+            total_written = total_written + (wr as usize);
+        }
+    }
+    let cl = close(h);
+    cl >= 0
+}
+
+pub fn pe_write_buf_to_file(buf: view<CoffBuf>, output_path: *const u8) -> bool {
+    if (output_path as usize) == 0 {
+        return false;
+    }
+    pe_write_buf_to_path_bytes(buf, output_path, cstr_len(output_path))
+}
+
+pub fn pe_write_buf_to_file_str(buf: view<CoffBuf>, output_path: Str) -> bool {
+    let mut path_buf = pe_str_to_cstr_buf(output_path);
+    let plen = path_buf.len - 1;
+    if plen == 0 {
+        coff_buf_free(mut_view(path_buf));
+        return false;
+    }
+    let ok = pe_write_buf_to_path_bytes(buf, path_buf.ptr as *const u8, plen);
+    coff_buf_free(mut_view(path_buf));
+    ok
+}
+
+pub fn pe_link_files_to_buf(
+    input_paths: *const *const u8,
+    input_count: usize,
+    stack_reserve: u32,
+    out: mut_view<CoffBuf>,
+    diag: *mut DiagSink
+) -> bool {
+    let mut ctx = LinkerContext {
+        sections: 0 as *mut *mut MergedSection,
+        num_sections: 0,
+        cap_sections: 0,
+        globals: 0 as *mut compiler.link.pe.GlobalSymbol,
+        num_globals: 0,
+        cap_globals: 0,
+        relocs: 0 as *mut compiler.link.pe.PeReloc,
+        num_relocs: 0,
+        cap_relocs: 0,
+        str_arena: 0 as *mut compiler.kernel.arena.Arena,
+    };
+    linker_context_init(mut_view(ctx));
+
+    let mut i: usize = 0;
+    while i < input_count {
+        let p = unsafe { const_ptr_slot(input_paths, i) };
+        let plen = cstr_len(p);
+        if !linker_load_coff_file(mut_view(ctx), p, plen, diag) {
+            linker_context_free(mut_view(ctx));
+            return false;
+        }
+        i = i + 1;
+    }
+
+    let ok = linker_finalize_to_buf(mut_view(ctx), stack_reserve, out, diag);
+    linker_context_free(mut_view(ctx));
+    ok
+}
+
+pub fn pe_link(
+    input_paths: *const *const u8,
+    input_count: usize,
+    output_path: *const u8,
+    stack_reserve: u32,
+    diag: *mut DiagSink
+) -> bool {
+    if (output_path as usize) == 0 || cstr_len(output_path) == 0 {
+        return false;
+    }
+    let mut pe_buf = coff_buf_with_capacity(4096);
+    if !pe_link_files_to_buf(input_paths, input_count, stack_reserve, mut_view(pe_buf), diag) {
+        coff_buf_free(mut_view(pe_buf));
+        return false;
+    }
+    let ok = pe_write_buf_to_file(view(pe_buf), output_path);
+    coff_buf_free(mut_view(pe_buf));
+    ok
+}
+
+pub fn ax_pe_link(
+    input_paths: *const *const u8,
+    input_count: usize,
+    output_path: *const u8,
+    stack_reserve: u32,
+    diag: *mut DiagSink
+) -> bool {
+    pe_link(input_paths, input_count, output_path, stack_reserve, diag)
+}
+
+pub fn pe_link_one_file(
+    input_path: *const u8,
+    output_path: *const u8,
+    stack_reserve: u32,
+    diag: *mut DiagSink
+) -> bool {
+    let mut inputs: [1]*const u8 = [input_path];
+    let p_inputs = unsafe { address_of(inputs[0]) };
+    pe_link(p_inputs, 1, output_path, stack_reserve, diag)
+}
+
+pub fn pe_link_one_file_str(
+    input_path: Str,
+    output_path: Str,
+    stack_reserve: u32,
+    diag: *mut DiagSink
+) -> bool {
+    let mut in_buf = pe_str_to_cstr_buf(input_path);
+    let mut out_buf = pe_str_to_cstr_buf(output_path);
+    if in_buf.len <= 1 || out_buf.len <= 1 {
+        coff_buf_free(mut_view(in_buf));
+        coff_buf_free(mut_view(out_buf));
+        return false;
+    }
+
+    let ok = pe_link_one_file(in_buf.ptr as *const u8, out_buf.ptr as *const u8, stack_reserve, diag);
+    coff_buf_free(mut_view(in_buf));
+    coff_buf_free(mut_view(out_buf));
+    ok
+}
+
+pub fn pe_link_objmodel_to_file_str(
+    model: view<ObjModel>,
+    output_path: Str,
+    stack_reserve: u32,
+    diag: *mut DiagSink
+) -> bool {
+    let mut pe_buf = coff_buf_with_capacity(4096);
+    if !pe_link_objmodel_to_buf(model, stack_reserve, mut_view(pe_buf), diag) {
+        coff_buf_free(mut_view(pe_buf));
+        return false;
+    }
+    let ok = pe_write_buf_to_file_str(view(pe_buf), output_path);
+    coff_buf_free(mut_view(pe_buf));
+    ok
+}
