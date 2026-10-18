@@ -1,0 +1,294 @@
+// Axiom Compiler — MIR Optimization Pipeline (`compiler.opt`)
+// Port of bootstrap/axiom0/src/opt/opt.h and bootstrap/axiom0/src/opt/opt.c.
+//
+// Coordinates the `-O1` MIR optimization passes:
+//   1. `opt_const_fold`: constant folding for binary, overflow-check, and unary rvalues
+//   2. `opt_dce`: iterative dead code elimination for unused locals and storage markers
+//   3. `opt_cfg_simplify`: constant switch folding and unreachable basic block cleanup
+//      (plus `opt_cfg_eliminate_redundant_switches` and `opt_cfg_merge_linear_blocks`)
+// Optionally invokes `verify_mir` after each pass when `verify_each` is enabled (`--verify-mir`).
+module compiler.opt
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.hir.hir.HirItem
+use compiler.types.types.AxType
+use compiler.types.types.Thir
+use compiler.types.types.ax_type_reset
+use compiler.types.types.typemap_free
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_mul_usize
+use compiler.mir.mir.mir_print_ext
+use compiler.verify.verifier.verify_mir
+use compiler.verify.verifier.verify_parse_mir
+
+pub use compiler.opt.const_fold.opt_type_bits
+pub use compiler.opt.const_fold.opt_type_is_signed
+pub use compiler.opt.const_fold.opt_type_is_bool
+pub use compiler.opt.const_fold.opt_bool_type_id
+pub use compiler.opt.const_fold.opt_bit_mask
+pub use compiler.opt.const_fold.opt_sign_bit_mask
+pub use compiler.opt.const_fold.opt_wrapping_add_u64
+pub use compiler.opt.const_fold.opt_twos_complement_u64
+pub use compiler.opt.const_fold.opt_sign_extend_u64
+pub use compiler.opt.const_fold.opt_fits_signed_bits
+pub use compiler.opt.const_fold.opt_checked_add_u64
+pub use compiler.opt.const_fold.opt_checked_sub_u64
+pub use compiler.opt.const_fold.opt_checked_mul_u64_raw
+pub use compiler.opt.const_fold.opt_checked_mul_u64
+pub use compiler.opt.const_fold.opt_checked_add_signed
+pub use compiler.opt.const_fold.opt_checked_sub_signed
+pub use compiler.opt.const_fold.opt_checked_mul_signed
+pub use compiler.opt.const_fold.opt_signed_lt
+pub use compiler.opt.const_fold.opt_signed_le
+pub use compiler.opt.const_fold.opt_is_scalar_const_op
+pub use compiler.opt.const_fold.do_const_fold_binop
+pub use compiler.opt.const_fold.do_const_fold_unop
+pub use compiler.opt.const_fold.opt_const_fold
+pub use compiler.opt.const_fold.ax_opt_const_fold
+
+pub use compiler.opt.dce.opt_count_place_uses
+pub use compiler.opt.dce.opt_count_place_full_use
+pub use compiler.opt.dce.opt_count_operand_uses
+pub use compiler.opt.dce.opt_count_rvalue_uses
+pub use compiler.opt.dce.opt_rvalue_is_pure
+pub use compiler.opt.dce.opt_dce_in_arena
+pub use compiler.opt.dce.opt_dce
+pub use compiler.opt.dce.ax_opt_dce
+
+pub use compiler.opt.cfg_simp.opt_cfg_compute_reachable
+pub use compiler.opt.cfg_simp.opt_cfg_fold_const_switches
+pub use compiler.opt.cfg_simp.opt_cfg_eliminate_redundant_switches
+pub use compiler.opt.cfg_simp.opt_cfg_mark_unreachable_in_arena
+pub use compiler.opt.cfg_simp.opt_cfg_mark_unreachable
+pub use compiler.opt.cfg_simp.opt_cfg_merge_linear_blocks
+pub use compiler.opt.cfg_simp.opt_cfg_simplify_in_arena
+pub use compiler.opt.cfg_simp.opt_cfg_simplify
+pub use compiler.opt.cfg_simp.ax_opt_cfg_simplify
+pub use compiler.opt.cfg_simp.opt_cfg_simplify_with_merge
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+// Runs the `-O1` MIR optimization pipeline using a caller-supplied scratch `arena`.
+pub fn opt_run_in_arena(
+    body: mut_view<MirBody>,
+    thir: *const Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    verify_each: bool,
+    fn_item: *const HirItem
+) {
+    let _ = opt_const_fold(mut_view(*body), thir);
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_dce_in_arena(mut_view(*body), mut_view(*arena));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_cfg_simplify_in_arena(mut_view(*body), mut_view(*arena));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+}
+
+// Runs the `-O1` MIR optimization pipeline matching `bootstrap/axiom0/src/opt/opt.c`:
+//   1. `opt_const_fold`
+//   2. `opt_dce`
+//   3. `opt_cfg_simplify`
+// When `verify_each` is true, runs `verify_mir` after every pass.
+pub fn opt_run(
+    body: mut_view<MirBody>,
+    thir: *const Thir,
+    sink: mut_view<DiagSink>,
+    verify_each: bool,
+    fn_item: *const HirItem
+) {
+    let _ = opt_const_fold(mut_view(*body), thir);
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_dce(mut_view(*body));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_cfg_simplify(mut_view(*body));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+}
+
+pub fn ax_opt_run(
+    body: mut_view<MirBody>,
+    thir: *const Thir,
+    sink: mut_view<DiagSink>,
+    verify_each: bool,
+    fn_item: *const HirItem
+) {
+    opt_run(body, thir, sink, verify_each, fn_item);
+}
+
+// Runs the optimization pipeline with extended CFG simplification (redundant conditional jump
+// elimination and single-predecessor linear block merging) followed by a final DCE pass.
+pub fn opt_run_with_merge(
+    body: mut_view<MirBody>,
+    thir: *const Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    verify_each: bool,
+    fn_item: *const HirItem
+) {
+    let _ = opt_const_fold(mut_view(*body), thir);
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_dce_in_arena(mut_view(*body), mut_view(*arena));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_cfg_simplify_with_merge(mut_view(*body), mut_view(*arena));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+
+    let _ = opt_dce_in_arena(mut_view(*body), mut_view(*arena));
+    if verify_each {
+        verify_mir(view(*body), thir, mut_view(*sink), fn_item);
+    }
+}
+
+// Initializes a standalone `Thir` with all 16 built-in primitive types populated (`TypeId 1..16`).
+pub fn opt_init_minimal_thir(thir_ptr: *mut Thir, arena: mut_view<Arena>) {
+    let types_arr = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(32, size_of<*mut AxType>()),
+        align_of<*mut AxType>()
+    ) as *mut *mut AxType;
+    let builtins = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(16, size_of<AxType>()),
+        align_of<AxType>()
+    );
+    let scratch_ty = arena_alloc_raw(mut_view(*arena), size_of<AxType>(), align_of<AxType>()) as *mut AxType;
+    let ty_sz = size_of<AxType>();
+    let ptr_sz = size_of<*mut AxType>();
+    let mut k: usize = 0;
+    while k < 16 {
+        let t_ptr = ((builtins as usize) + mir_mul_usize(k, ty_sz)) as *mut AxType;
+        let slot = ((types_arr as usize) + mir_mul_usize(k, ptr_sz)) as *mut *mut AxType;
+        unsafe {
+            ax_type_reset(mut_view(*t_ptr), k as u8);
+            *slot = t_ptr;
+        }
+        k = k + 1;
+    }
+    unsafe {
+        (*thir_ptr).interner.arena = arena_new();
+        (*thir_ptr).interner.map.keys = 0 as *mut *mut AxType;
+        (*thir_ptr).interner.map.vals = 0 as *mut TypeId;
+        (*thir_ptr).interner.map.states = 0 as *mut u8;
+        (*thir_ptr).interner.map.len = 0;
+        (*thir_ptr).interner.map.cap = 0;
+        (*thir_ptr).interner.types = types_arr;
+        (*thir_ptr).interner.len = 16;
+        (*thir_ptr).interner.cap = 32;
+        (*thir_ptr).interner.next_int_var = 1u32;
+        (*thir_ptr).interner.scratch = scratch_ty;
+        (*thir_ptr).interner.t_error.v = 1u32;
+        (*thir_ptr).interner.t_unit.v = 2u32;
+        (*thir_ptr).interner.t_never.v = 3u32;
+        (*thir_ptr).interner.t_bool.v = 4u32;
+        (*thir_ptr).interner.t_char.v = 5u32;
+        (*thir_ptr).interner.t_i8.v = 6u32;
+        (*thir_ptr).interner.t_i16.v = 7u32;
+        (*thir_ptr).interner.t_i32.v = 8u32;
+        (*thir_ptr).interner.t_i64.v = 9u32;
+        (*thir_ptr).interner.t_isize.v = 10u32;
+        (*thir_ptr).interner.t_u8.v = 11u32;
+        (*thir_ptr).interner.t_u16.v = 12u32;
+        (*thir_ptr).interner.t_u32.v = 13u32;
+        (*thir_ptr).interner.t_u64.v = 14u32;
+        (*thir_ptr).interner.t_usize.v = 15u32;
+        (*thir_ptr).interner.t_str.v = 16u32;
+        (*thir_ptr).item_types.keys = 0 as *mut usize;
+        (*thir_ptr).item_types.vals = 0 as *mut TypeId;
+        (*thir_ptr).item_types.states = 0 as *mut u8;
+        (*thir_ptr).item_types.len = 0;
+        (*thir_ptr).item_types.cap = 0;
+    }
+}
+
+pub fn opt_free_minimal_thir(thir_ptr: *mut Thir) {
+    unsafe {
+        typemap_free(mut_view((*thir_ptr).interner.map));
+        arena_destroy(mut_view((*thir_ptr).interner.arena));
+    }
+}
+
+// Parses standalone `.mir` text using the caller-provided `arena`, runs `opt_run_in_arena` (with
+// optional `verify_each`), and formats the resulting optimized MIR text into `out`.
+pub fn opt_mir_text_in_arena(
+    text: StrView,
+    out: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>,
+    verify_each: bool,
+    arena: mut_view<Arena>
+) -> bool {
+    let thir_ptr = arena_alloc_raw(mut_view(*arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    opt_init_minimal_thir(thir_ptr, mut_view(*arena));
+    let body = verify_parse_mir(
+        text,
+        unsafe { mut_view((*thir_ptr).interner) },
+        mut_view(*arena)
+    );
+    let mut ok: bool = false;
+    if (body as usize) != 0 {
+        if verify_each {
+            verify_mir(unsafe { view(*body) }, thir_ptr as *const Thir, mut_view(*sink), 0 as *const HirItem);
+        }
+        if sink.errors == 0 {
+            opt_run_in_arena(
+                unsafe { mut_view(*body) },
+                thir_ptr as *const Thir,
+                mut_view(*arena),
+                mut_view(*sink),
+                verify_each,
+                0 as *const HirItem
+            );
+            let interner_ptr = thir_ptr as *const compiler.types.types.TypeInterner;
+            mir_print_ext(mut_view(*out), unsafe { view(*body) }, interner_ptr);
+            ok = sink.errors == 0;
+        }
+    }
+    opt_free_minimal_thir(thir_ptr);
+    ok
+}
+
+// Parses standalone `.mir` text, runs `opt_run` (with optional `verify_each`), and formats the
+// resulting optimized MIR text into `out`. Returns `true` when parsing and verification succeeded.
+pub fn opt_mir_text(
+    text: StrView,
+    out: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>,
+    verify_each: bool
+) -> bool {
+    let mut arena = arena_new();
+    let ok = opt_mir_text_in_arena(text, out, sink, verify_each, mut_view(arena));
+    arena_destroy(mut_view(arena));
+    ok
+}
+

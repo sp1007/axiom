@@ -1,0 +1,296 @@
+// Axiom Compiler — MIR Dead Code Elimination Pass (compiler/opt/dce.ax)
+// Port of iterative dead code elimination from bootstrap/axiom0/src/opt/opt.c (`-O1` pass 2).
+//
+// Iteratively counts local variable uses across all basic blocks (statements, projections,
+// operands, and terminators) and removes:
+//   - pure assignments (`MIR_STMT_ASSIGN`) to unprojected locals with 0 uses (excluding `_0`)
+//   - `StorageLive` / `StorageDead` statements for locals with 0 uses
+// Repeats until a fixed point is reached so transitive chains of dead temporaries are eliminated.
+module compiler.opt.dce
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_UNREACHABLE
+use compiler.mir.mir.mir_mul_usize
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_copy_stmt
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+
+unsafe fn opt_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = mir_mul_usize(idx, size_of<u32>());
+    ((base as usize) + off) as *mut u32
+}
+
+unsafe fn opt_inc_use(uses: *mut u32, local_v: u32, max_locals: usize) {
+    let idx = local_v as usize;
+    if idx < max_locals {
+        let slot = opt_u32_at(uses, idx);
+        let cur = *slot;
+        *slot = cur + 1u32;
+    }
+}
+
+pub fn opt_count_place_uses(p: view<MirPlace>, uses: *mut u32, max_locals: usize) {
+    if p.proj_count == 0 || (p.projs as usize) == 0 {
+        return;
+    }
+    let mut i: usize = 0;
+    while i < p.proj_count {
+        let proj = unsafe { mir_proj_at(p.projs, i) };
+        let pk = unsafe { (*proj).kind };
+        if pk == MIR_PROJ_INDEX {
+            let idx_v = unsafe { (*proj).index_local.v };
+            unsafe { opt_inc_use(uses, idx_v, max_locals) };
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            let has_from = unsafe { (*proj).has_from };
+            if has_from {
+                let fl = unsafe { (*proj).from_local.v };
+                unsafe { opt_inc_use(uses, fl, max_locals) };
+            }
+            let has_to = unsafe { (*proj).has_to };
+            if has_to {
+                let tl = unsafe { (*proj).to_local.v };
+                unsafe { opt_inc_use(uses, tl, max_locals) };
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fn opt_count_place_full_use(p: view<MirPlace>, uses: *mut u32, max_locals: usize) {
+    unsafe { opt_inc_use(uses, p.local.v, max_locals) };
+    opt_count_place_uses(p, uses, max_locals);
+}
+
+pub fn opt_count_operand_uses(op: view<MirOperand>, uses: *mut u32, max_locals: usize) {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        opt_count_place_full_use(view(op.place), uses, max_locals);
+    }
+}
+
+pub fn opt_count_rvalue_uses(rv: view<MirRvalue>, uses: *mut u32, max_locals: usize) {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_UNARY_OP || k == MIR_RVALUE_CAST {
+        opt_count_operand_uses(view(rv.use_op), uses, max_locals);
+    } else if k == MIR_RVALUE_REPEAT {
+        opt_count_operand_uses(view(rv.use_op), uses, max_locals);
+        if (rv.repeat_count_op as usize) != 0 {
+            unsafe { opt_count_operand_uses(view(*rv.repeat_count_op), uses, max_locals) };
+        }
+    } else if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        opt_count_place_full_use(view(rv.place), uses, max_locals);
+    } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        opt_count_operand_uses(view(rv.lhs), uses, max_locals);
+        opt_count_operand_uses(view(rv.rhs), uses, max_locals);
+    } else if k == MIR_RVALUE_AGGREGATE {
+        if rv.operand_count > 0 && (rv.operands as usize) != 0 {
+            let mut i: usize = 0;
+            while i < rv.operand_count {
+                let op_ptr = unsafe { mir_op_at(rv.operands, i) };
+                unsafe { opt_count_operand_uses(view(*op_ptr), uses, max_locals) };
+                i = i + 1;
+            }
+        }
+    }
+}
+
+pub fn opt_rvalue_is_pure(rv: view<MirRvalue>) -> bool {
+    let k = rv.kind;
+    k == MIR_RVALUE_USE ||
+    k == MIR_RVALUE_REF ||
+    k == MIR_RVALUE_LEN ||
+    k == MIR_RVALUE_CAST ||
+    k == MIR_RVALUE_DISCRIMINANT ||
+    k == MIR_RVALUE_AGGREGATE
+}
+
+pub fn opt_dce_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bool {
+    let max_locals = body.local_count;
+    if max_locals == 0 || body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+
+    let uses_bytes = mir_mul_usize(max_locals, size_of<u32>());
+    let uses = arena_alloc_raw(mut_view(*scratch), uses_bytes, 4) as *mut u32;
+    let mut total_changed: bool = false;
+    let mut pass_changed: bool = true;
+
+    while pass_changed {
+        pass_changed = false;
+
+        let mut u_idx: usize = 0;
+        while u_idx < max_locals {
+            let slot = unsafe { opt_u32_at(uses, u_idx) };
+            unsafe { *slot = 0u32 };
+            u_idx = u_idx + 1;
+        }
+        // Return place `_0` is always live
+        unsafe { *opt_u32_at(uses, 0) = 1u32 };
+
+        let mut i: usize = 0;
+        while i < body.bb_count {
+            let bb = unsafe { mir_bb_at(body.bbs, i) };
+            let is_unreach = unsafe { (*bb).has_terminator && (*bb).terminator.kind == MIR_TERM_UNREACHABLE };
+            if !is_unreach {
+                let stmt_count = unsafe { (*bb).stmt_count };
+                let stmts = unsafe { (*bb).stmts };
+                let mut j: usize = 0;
+                while j < stmt_count {
+                    let stmt = unsafe { mir_stmt_at(stmts, j) };
+                    let sk = unsafe { (*stmt).kind };
+                    if sk == MIR_STMT_ASSIGN {
+                        let p_cnt = unsafe { (*stmt).place.proj_count };
+                        if p_cnt > 0 {
+                            unsafe { opt_count_place_full_use(view((*stmt).place), uses, max_locals) };
+                        } else {
+                            unsafe { opt_count_place_uses(view((*stmt).place), uses, max_locals) };
+                        }
+                        unsafe { opt_count_rvalue_uses(view((*stmt).rvalue), uses, max_locals) };
+                    } else if sk == MIR_STMT_DROP {
+                        unsafe { opt_count_place_full_use(view((*stmt).place), uses, max_locals) };
+                    }
+                    j = j + 1;
+                }
+
+                let has_term = unsafe { (*bb).has_terminator };
+                if has_term {
+                    let tk = unsafe { (*bb).terminator.kind };
+                    if tk == MIR_TERM_SWITCH_INT {
+                        unsafe { opt_count_operand_uses(view((*bb).terminator.discr), uses, max_locals) };
+                    } else if tk == MIR_TERM_DROP {
+                        unsafe { opt_count_place_full_use(view((*bb).terminator.drop_place), uses, max_locals) };
+                    } else if tk == MIR_TERM_CALL {
+                        unsafe { opt_count_operand_uses(view((*bb).terminator.func), uses, max_locals) };
+                        let argc = unsafe { (*bb).terminator.arg_count };
+                        let args = unsafe { (*bb).terminator.args };
+                        if argc > 0 && (args as usize) != 0 {
+                            let mut k: usize = 0;
+                            while k < argc {
+                                let arg_ptr = unsafe { mir_op_at(args, k) };
+                                unsafe { opt_count_operand_uses(view(*arg_ptr), uses, max_locals) };
+                                k = k + 1;
+                            }
+                        }
+                        let has_dest = unsafe { (*bb).terminator.has_destination };
+                        if has_dest {
+                            let d_projs = unsafe { (*bb).terminator.destination.proj_count };
+                            if d_projs > 0 {
+                                unsafe { opt_count_place_full_use(view((*bb).terminator.destination), uses, max_locals) };
+                            } else {
+                                unsafe { opt_count_place_uses(view((*bb).terminator.destination), uses, max_locals) };
+                            }
+                        }
+                    } else if tk == MIR_TERM_ASSERT {
+                        unsafe { opt_count_operand_uses(view((*bb).terminator.cond), uses, max_locals) };
+                    }
+                }
+            }
+            i = i + 1;
+        }
+
+        // Remove dead statements in each reachable basic block
+        i = 0;
+        while i < body.bb_count {
+            let bb = unsafe { mir_bb_at(body.bbs, i) };
+            let is_unreach = unsafe { (*bb).has_terminator && (*bb).terminator.kind == MIR_TERM_UNREACHABLE };
+            if !is_unreach {
+                let stmt_count = unsafe { (*bb).stmt_count };
+                let stmts = unsafe { (*bb).stmts };
+                let mut write_idx: usize = 0;
+                let mut j: usize = 0;
+                while j < stmt_count {
+                    let stmt = unsafe { mir_stmt_at(stmts, j) };
+                    let sk = unsafe { (*stmt).kind };
+                    let mut remove: bool = false;
+                    if sk == MIR_STMT_ASSIGN {
+                        let p_cnt = unsafe { (*stmt).place.proj_count };
+                        if p_cnt == 0 {
+                            let lv = unsafe { (*stmt).place.local.v as usize };
+                            if lv < max_locals {
+                                let u_cnt = unsafe { *opt_u32_at(uses, lv) };
+                                if u_cnt == 0u32 {
+                                    let is_pure = unsafe { opt_rvalue_is_pure(view((*stmt).rvalue)) };
+                                    if is_pure {
+                                        remove = true;
+                                    }
+                                }
+                            }
+                        }
+                    } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+                        let lv = unsafe { (*stmt).storage_local.v as usize };
+                        if lv < max_locals {
+                            let u_cnt = unsafe { *opt_u32_at(uses, lv) };
+                            if u_cnt == 0u32 {
+                                remove = true;
+                            }
+                        }
+                    }
+
+                    if !remove {
+                        if write_idx != j {
+                            let dst_stmt = unsafe { mir_stmt_at(stmts, write_idx) };
+                            unsafe { mir_copy_stmt(mut_view(*dst_stmt), view(*stmt)) };
+                        }
+                        write_idx = write_idx + 1;
+                    } else {
+                        pass_changed = true;
+                        total_changed = true;
+                    }
+                    j = j + 1;
+                }
+                unsafe { (*bb).stmt_count = write_idx };
+            }
+            i = i + 1;
+        }
+    }
+
+    total_changed
+}
+
+pub fn opt_dce(body: mut_view<MirBody>) -> bool {
+    let max_locals = body.local_count;
+    if max_locals == 0 || body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut scratch = arena_new();
+    let total_changed = opt_dce_in_arena(body, mut_view(scratch));
+    arena_destroy(mut_view(scratch));
+    total_changed
+}
+
+pub fn ax_opt_dce(body: mut_view<MirBody>) -> bool {
+    opt_dce(body)
+}

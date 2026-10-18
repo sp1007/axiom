@@ -1,0 +1,479 @@
+// Axiom Compiler — MIR Control-Flow Graph Simplification Pass (compiler/opt/cfg_simp.ax)
+// Port of CFG simplification from bootstrap/axiom0/src/opt/opt.c (`-O1` pass 3), plus
+// redundant conditional jump elimination and single-predecessor linear block merging.
+//
+// Provides:
+//   - `opt_cfg_fold_const_switches`: folds `SwitchInt` with a constant discriminant into `Goto`
+//   - `opt_cfg_eliminate_redundant_switches`: folds constant `SwitchInt` and `SwitchInt` whose
+//     arm targets all equal `otherwise` into `Goto`
+//   - `opt_cfg_mark_unreachable`: computes forward reachability from `bb0` and replaces
+//     unreachable blocks with empty `unreachable` blocks
+//   - `opt_cfg_merge_linear_blocks`: merges `bbA -> goto bbB` chains when `bbB` (`!= bb0`) has
+//     `bbA` as its sole predecessor and matching cleanup status
+//   - `opt_cfg_simplify` / `ax_opt_cfg_simplify`: standard `-O1` CFG pass matching `axiom0`
+//   - `opt_cfg_simplify_with_merge`: full fixed-point CFG simplification including block merging
+module compiler.opt.cfg_simp
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.source.span.Span
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MIR_BB_NONE
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_TERM_UNREACHABLE
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.mir_mul_usize
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_u64_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_span_copy
+use compiler.mir.mir.mir_term_reset
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_bb_push_stmt
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+
+unsafe fn opt_u8_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+unsafe fn opt_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = mir_mul_usize(idx, size_of<u32>());
+    ((base as usize) + off) as *mut u32
+}
+
+fn opt_zero_span() -> Span {
+    Span {
+        file: compiler.kernel.id.FileId { v: 0u32 },
+        start: 0u32,
+        end: 0u32,
+    }
+}
+
+fn opt_is_valid_unwind(unwind_v: u32, bb_count: usize) -> bool {
+    unwind_v != 0u32 && unwind_v != MIR_BB_NONE && (unwind_v as usize) < bb_count
+}
+
+unsafe fn opt_mark_bb_reachable(reachable: *mut u8, target_v: u32, bb_count: usize) -> bool {
+    let idx = target_v as usize;
+    if idx < bb_count {
+        let slot = opt_u8_at(reachable, idx);
+        if *slot == 0u8 {
+            *slot = 1u8;
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn opt_inc_pred(preds: *mut u32, target_v: u32, bb_count: usize) {
+    let idx = target_v as usize;
+    if idx < bb_count {
+        let slot = opt_u32_at(preds, idx);
+        let cur = *slot;
+        *slot = cur + 1u32;
+    }
+}
+
+// Computes basic block reachability from `bb0` into `reachable[0..bb_count]`.
+pub fn opt_cfg_compute_reachable(body: view<MirBody>, reachable: *mut u8) {
+    let bb_count = body.bb_count;
+    if bb_count == 0 || (body.bbs as usize) == 0 {
+        return;
+    }
+
+    let mut i: usize = 0;
+    while i < bb_count {
+        let slot = unsafe { opt_u8_at(reachable, i) };
+        unsafe { *slot = 0u8 };
+        i = i + 1;
+    }
+    unsafe { *opt_u8_at(reachable, 0) = 1u8 };
+
+    let mut r_changed: bool = true;
+    while r_changed {
+        r_changed = false;
+        i = 0;
+        while i < bb_count {
+            let is_reach = unsafe { *opt_u8_at(reachable, i) != 0u8 };
+            if is_reach {
+                let bb = unsafe { mir_bb_at(body.bbs, i) };
+                let has_term = unsafe { (*bb).has_terminator };
+                if has_term {
+                    let tk = unsafe { (*bb).terminator.kind };
+                    if tk == MIR_TERM_GOTO {
+                        let gt_v = unsafe { (*bb).terminator.goto_target.v };
+                        if unsafe { opt_mark_bb_reachable(reachable, gt_v, bb_count) } {
+                            r_changed = true;
+                        }
+                    } else if tk == MIR_TERM_SWITCH_INT {
+                        let sc = unsafe { (*bb).terminator.switch_count };
+                        let targets = unsafe { (*bb).terminator.targets };
+                        if sc > 0 && (targets as usize) != 0 {
+                            let mut j: usize = 0;
+                            while j < sc {
+                                let tgt_v = unsafe { (*mir_bb_id_at(targets, j)).v };
+                                if unsafe { opt_mark_bb_reachable(reachable, tgt_v, bb_count) } {
+                                    r_changed = true;
+                                }
+                                j = j + 1;
+                            }
+                        }
+                        let ow_v = unsafe { (*bb).terminator.otherwise.v };
+                        if unsafe { opt_mark_bb_reachable(reachable, ow_v, bb_count) } {
+                            r_changed = true;
+                        }
+                    } else if tk == MIR_TERM_DROP {
+                        let dt_v = unsafe { (*bb).terminator.drop_target.v };
+                        if unsafe { opt_mark_bb_reachable(reachable, dt_v, bb_count) } {
+                            r_changed = true;
+                        }
+                        let du_v = unsafe { (*bb).terminator.drop_unwind.v };
+                        if opt_is_valid_unwind(du_v, bb_count) {
+                            if unsafe { opt_mark_bb_reachable(reachable, du_v, bb_count) } {
+                                r_changed = true;
+                            }
+                        }
+                    } else if tk == MIR_TERM_CALL {
+                        let ct_v = unsafe { (*bb).terminator.call_target.v };
+                        if unsafe { opt_mark_bb_reachable(reachable, ct_v, bb_count) } {
+                            r_changed = true;
+                        }
+                        let cu_v = unsafe { (*bb).terminator.call_unwind.v };
+                        if opt_is_valid_unwind(cu_v, bb_count) {
+                            if unsafe { opt_mark_bb_reachable(reachable, cu_v, bb_count) } {
+                                r_changed = true;
+                            }
+                        }
+                    } else if tk == MIR_TERM_ASSERT {
+                        let at_v = unsafe { (*bb).terminator.assert_target.v };
+                        if unsafe { opt_mark_bb_reachable(reachable, at_v, bb_count) } {
+                            r_changed = true;
+                        }
+                        let au_v = unsafe { (*bb).terminator.assert_unwind.v };
+                        if opt_is_valid_unwind(au_v, bb_count) {
+                            if unsafe { opt_mark_bb_reachable(reachable, au_v, bb_count) } {
+                                r_changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Folds `SwitchInt` terminators with constant integer/bool discriminants into `Goto`.
+pub fn opt_cfg_fold_const_switches(body: mut_view<MirBody>) -> bool {
+    if body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut changed: bool = false;
+    let mut i: usize = 0;
+    while i < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, i) };
+        let has_term = unsafe { (*bb).has_terminator };
+        if has_term {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                let dk = unsafe { (*bb).terminator.discr.kind };
+                let ck = unsafe { (*bb).terminator.discr.constant.kind };
+                if dk == MIR_OP_CONST && (ck == MIR_CONST_INT || ck == MIR_CONST_BOOL) {
+                    let val = unsafe { (*bb).terminator.discr.constant.val };
+                    let mut target_v = unsafe { (*bb).terminator.otherwise.v };
+                    let sc = unsafe { (*bb).terminator.switch_count };
+                    let values = unsafe { (*bb).terminator.values };
+                    let targets = unsafe { (*bb).terminator.targets };
+                    if sc > 0 && (values as usize) != 0 && (targets as usize) != 0 {
+                        let mut j: usize = 0;
+                        while j < sc {
+                            let arm_val = unsafe { *mir_u64_at(values, j) };
+                            if arm_val == val {
+                                target_v = unsafe { (*mir_bb_id_at(targets, j)).v };
+                                break;
+                            }
+                            j = j + 1;
+                        }
+                    }
+                    let mut loc = opt_zero_span();
+                    unsafe {
+                        mir_span_copy(mut_view(loc), view((*bb).terminator.location));
+                        mir_term_reset(mut_view((*bb).terminator), MIR_TERM_GOTO, view(loc));
+                        (*bb).terminator.goto_target.v = target_v;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    changed
+}
+
+// Eliminates both constant-discriminant `SwitchInt` and redundant `SwitchInt` where all arm
+// targets equal `otherwise`.
+pub fn opt_cfg_eliminate_redundant_switches(body: mut_view<MirBody>) -> bool {
+    if body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut changed = opt_cfg_fold_const_switches(mut_view(*body));
+    let mut i: usize = 0;
+    while i < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, i) };
+        let has_term = unsafe { (*bb).has_terminator };
+        if has_term {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                let ow_v = unsafe { (*bb).terminator.otherwise.v };
+                let sc = unsafe { (*bb).terminator.switch_count };
+                let targets = unsafe { (*bb).terminator.targets };
+                let mut all_same: bool = true;
+                if sc > 0 && (targets as usize) != 0 {
+                    let mut j: usize = 0;
+                    while j < sc {
+                        let tgt_v = unsafe { (*mir_bb_id_at(targets, j)).v };
+                        if tgt_v != ow_v {
+                            all_same = false;
+                            break;
+                        }
+                        j = j + 1;
+                    }
+                }
+                if all_same {
+                    let mut loc = opt_zero_span();
+                    unsafe {
+                        mir_span_copy(mut_view(loc), view((*bb).terminator.location));
+                        mir_term_reset(mut_view((*bb).terminator), MIR_TERM_GOTO, view(loc));
+                        (*bb).terminator.goto_target.v = ow_v;
+                    }
+                    changed = true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    changed
+}
+
+// Clears statements in unreachable blocks and sets their terminator to `MIR_TERM_UNREACHABLE`.
+pub fn opt_cfg_mark_unreachable_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bool {
+    let bb_count = body.bb_count;
+    if bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+
+    let reachable = arena_alloc_raw(mut_view(*scratch), bb_count, 1);
+    opt_cfg_compute_reachable(view(*body), reachable);
+
+    let mut changed: bool = false;
+    let mut i: usize = 0;
+    while i < bb_count {
+        let is_reach = unsafe { *opt_u8_at(reachable, i) != 0u8 };
+        if !is_reach {
+            let bb = unsafe { mir_bb_at(body.bbs, i) };
+            let stmt_cnt = unsafe { (*bb).stmt_count };
+            let has_term = unsafe { (*bb).has_terminator };
+            let term_kind = unsafe { (*bb).terminator.kind };
+            if stmt_cnt > 0 || (has_term && term_kind != MIR_TERM_UNREACHABLE) {
+                let mut loc = opt_zero_span();
+                unsafe {
+                    mir_span_copy(mut_view(loc), view((*bb).terminator.location));
+                    (*bb).stmt_count = 0;
+                    (*bb).has_terminator = true;
+                    mir_term_reset(mut_view((*bb).terminator), MIR_TERM_UNREACHABLE, view(loc));
+                }
+                changed = true;
+            }
+        }
+        i = i + 1;
+    }
+
+    changed
+}
+
+pub fn opt_cfg_mark_unreachable(body: mut_view<MirBody>) -> bool {
+    let bb_count = body.bb_count;
+    if bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut scratch = arena_new();
+    let changed = opt_cfg_mark_unreachable_in_arena(body, mut_view(scratch));
+    arena_destroy(mut_view(scratch));
+    changed
+}
+
+// Merges linear `bbA -> goto bbB` chains when `bbB` (`!= bb0`) has `bbA` as its sole
+// predecessor among reachable blocks and identical `is_cleanup` flag.
+pub fn opt_cfg_merge_linear_blocks(body: mut_view<MirBody>, arena: mut_view<Arena>) -> bool {
+    let bb_count = body.bb_count;
+    if bb_count <= 1 || (body.bbs as usize) == 0 {
+        return false;
+    }
+
+    let reachable = arena_alloc_raw(mut_view(*arena), bb_count, 1);
+    let preds_bytes = mir_mul_usize(bb_count, size_of<u32>());
+    let preds = arena_alloc_raw(mut_view(*arena), preds_bytes, 4) as *mut u32;
+    let mut total_changed: bool = false;
+    let mut pass_changed: bool = true;
+
+    while pass_changed {
+        pass_changed = false;
+        opt_cfg_compute_reachable(view(*body), reachable);
+
+        let mut i: usize = 0;
+        while i < bb_count {
+            let slot = unsafe { opt_u32_at(preds, i) };
+            unsafe { *slot = 0u32 };
+            i = i + 1;
+        }
+
+        i = 0;
+        while i < bb_count {
+            let is_reach = unsafe { *opt_u8_at(reachable, i) != 0u8 };
+            if is_reach {
+                let bb = unsafe { mir_bb_at(body.bbs, i) };
+                let has_term = unsafe { (*bb).has_terminator };
+                if has_term {
+                    let tk = unsafe { (*bb).terminator.kind };
+                    if tk == MIR_TERM_GOTO {
+                        let gt_v = unsafe { (*bb).terminator.goto_target.v };
+                        unsafe { opt_inc_pred(preds, gt_v, bb_count) };
+                    } else if tk == MIR_TERM_SWITCH_INT {
+                        let sc = unsafe { (*bb).terminator.switch_count };
+                        let targets = unsafe { (*bb).terminator.targets };
+                        if sc > 0 && (targets as usize) != 0 {
+                            let mut j: usize = 0;
+                            while j < sc {
+                                let tgt_v = unsafe { (*mir_bb_id_at(targets, j)).v };
+                                unsafe { opt_inc_pred(preds, tgt_v, bb_count) };
+                                j = j + 1;
+                            }
+                        }
+                        let ow_v = unsafe { (*bb).terminator.otherwise.v };
+                        unsafe { opt_inc_pred(preds, ow_v, bb_count) };
+                    } else if tk == MIR_TERM_DROP {
+                        let dt_v = unsafe { (*bb).terminator.drop_target.v };
+                        unsafe { opt_inc_pred(preds, dt_v, bb_count) };
+                        let du_v = unsafe { (*bb).terminator.drop_unwind.v };
+                        if opt_is_valid_unwind(du_v, bb_count) {
+                            unsafe { opt_inc_pred(preds, du_v, bb_count) };
+                        }
+                    } else if tk == MIR_TERM_CALL {
+                        let ct_v = unsafe { (*bb).terminator.call_target.v };
+                        unsafe { opt_inc_pred(preds, ct_v, bb_count) };
+                        let cu_v = unsafe { (*bb).terminator.call_unwind.v };
+                        if opt_is_valid_unwind(cu_v, bb_count) {
+                            unsafe { opt_inc_pred(preds, cu_v, bb_count) };
+                        }
+                    } else if tk == MIR_TERM_ASSERT {
+                        let at_v = unsafe { (*bb).terminator.assert_target.v };
+                        unsafe { opt_inc_pred(preds, at_v, bb_count) };
+                        let au_v = unsafe { (*bb).terminator.assert_unwind.v };
+                        if opt_is_valid_unwind(au_v, bb_count) {
+                            unsafe { opt_inc_pred(preds, au_v, bb_count) };
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+
+        i = 0;
+        while i < bb_count {
+            let is_reach = unsafe { *opt_u8_at(reachable, i) != 0u8 };
+            if is_reach {
+                let bb_a = unsafe { mir_bb_at(body.bbs, i) };
+                let a_has_term = unsafe { (*bb_a).has_terminator };
+                let a_tk = unsafe { (*bb_a).terminator.kind };
+                if a_has_term && a_tk == MIR_TERM_GOTO {
+                    let target_idx = unsafe { (*bb_a).terminator.goto_target.v as usize };
+                    if target_idx > 0 && target_idx < bb_count && target_idx != i {
+                        let pred_cnt = unsafe { *opt_u32_at(preds, target_idx) };
+                        let bb_b = unsafe { mir_bb_at(body.bbs, target_idx) };
+                        let a_cleanup = unsafe { (*bb_a).is_cleanup };
+                        let b_cleanup = unsafe { (*bb_b).is_cleanup };
+                        if pred_cnt == 1u32 && a_cleanup == b_cleanup {
+                            let b_stmt_cnt = unsafe { (*bb_b).stmt_count };
+                            let b_stmts = unsafe { (*bb_b).stmts };
+                            let mut s: usize = 0;
+                            while s < b_stmt_cnt {
+                                let st = unsafe { mir_stmt_at(b_stmts, s) };
+                                unsafe { mir_bb_push_stmt(mut_view(*bb_a), mut_view(*arena), view(*st)) };
+                                s = s + 1;
+                            }
+                            let mut loc = opt_zero_span();
+                            unsafe {
+                                mir_span_copy(mut_view(loc), view((*bb_b).terminator.location));
+                                mir_copy_terminator(mut_view((*bb_a).terminator), view((*bb_b).terminator));
+                                (*bb_a).has_terminator = (*bb_b).has_terminator;
+                                (*bb_b).stmt_count = 0;
+                                (*bb_b).has_terminator = true;
+                                mir_term_reset(mut_view((*bb_b).terminator), MIR_TERM_UNREACHABLE, view(loc));
+                            }
+                            pass_changed = true;
+                            total_changed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    total_changed
+}
+
+pub fn opt_cfg_simplify_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bool {
+    let mut total_changed: bool = false;
+    let mut pass_changed: bool = true;
+    while pass_changed {
+        let c1 = opt_cfg_fold_const_switches(mut_view(*body));
+        let c2 = opt_cfg_mark_unreachable_in_arena(mut_view(*body), mut_view(*scratch));
+        pass_changed = c1 || c2;
+        if pass_changed {
+            total_changed = true;
+        }
+    }
+    total_changed
+}
+
+// Standard `-O1` CFG simplification pass matching `bootstrap/axiom0/src/opt/opt.c`.
+pub fn opt_cfg_simplify(body: mut_view<MirBody>) -> bool {
+    let mut scratch = arena_new();
+    let total_changed = opt_cfg_simplify_in_arena(body, mut_view(scratch));
+    arena_destroy(mut_view(scratch));
+    total_changed
+}
+
+pub fn ax_opt_cfg_simplify(body: mut_view<MirBody>) -> bool {
+    opt_cfg_simplify(body)
+}
+
+// Extended CFG simplification pass combining redundant switch elimination, unreachable block
+// cleanup, and single-predecessor linear block merging to a fixed point.
+pub fn opt_cfg_simplify_with_merge(body: mut_view<MirBody>, arena: mut_view<Arena>) -> bool {
+    let mut total_changed: bool = false;
+    let mut pass_changed: bool = true;
+    while pass_changed {
+        let c1 = opt_cfg_eliminate_redundant_switches(mut_view(*body));
+        let c2 = opt_cfg_mark_unreachable_in_arena(mut_view(*body), mut_view(*arena));
+        let c3 = opt_cfg_merge_linear_blocks(mut_view(*body), mut_view(*arena));
+        pass_changed = c1 || c2 || c3;
+        if pass_changed {
+            total_changed = true;
+        }
+    }
+    total_changed
+}

@@ -1,0 +1,775 @@
+// Axiom Compiler — MIR Constant Folding Pass (compiler/opt/const_fold.ax)
+// Port of constant folding from bootstrap/axiom0/src/opt/opt.c (`-O1` pass 1).
+//
+// Folds constant binary (`MIR_RVALUE_BINARY_OP`), overflow-check (`MIR_RVALUE_OVERFLOWS_BINARY_OP`),
+// and unary (`MIR_RVALUE_UNARY_OP`) rvalues across all scalar integer (`i8..i64`, `isize`,
+// `u8..u64`, `usize`, `char`) and `bool` types.
+// Checked arithmetic operations that would overflow or divide by zero are intentionally left
+// unfolded so runtime trap semantics (`assert(!overflows(...))`) are preserved.
+module compiler.opt.const_fold
+
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.types.types.Thir
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_CHAR
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_USIZE
+use compiler.types.types.type_get
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirConst
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_BIT_XOR
+use compiler.mir.mir.MIR_BINOP_BIT_AND
+use compiler.mir.mir.MIR_BINOP_BIT_OR
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_BINOP_EQ
+use compiler.mir.mir.MIR_BINOP_LT
+use compiler.mir.mir.MIR_BINOP_LE
+use compiler.mir.mir.MIR_BINOP_NE
+use compiler.mir.mir.MIR_BINOP_GE
+use compiler.mir.mir.MIR_BINOP_GT
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_UNOP_NOT
+use compiler.mir.mir.MIR_UNOP_NEG
+use compiler.mir.mir.MIR_UNOP_BITNOT
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_span_copy
+use compiler.mir.mir.mir_const_reset_vals
+use compiler.mir.mir.mir_copy_const
+use compiler.mir.mir.mir_rvalue_reset
+
+const OPT_ALL_ONES_U64: u64 = 0xFFFFFFFFFFFFFFFFu64;
+const OPT_SIGN64_U64: u64 = 0x8000000000000000u64;
+const OPT_LOW32_U64: u64 = 0xFFFFFFFFu64;
+
+// --- Type Metadata Helpers ---
+
+pub fn opt_type_bits(thir: *const Thir, ty: TypeId) -> u32 {
+    let ty_v = ty.v;
+    if (thir as usize) != 0 {
+        let types_ptr = unsafe { (*thir).interner.types };
+        if (types_ptr as usize) != 0 {
+            let t = unsafe { type_get(view((*thir).interner), TypeId { v: ty_v }) };
+            if (t as usize) != 0 {
+                let k = unsafe { (*t).kind };
+                if k == TY_I8 || k == TY_U8 || k == TY_BOOL {
+                    return 8u32;
+                }
+                if k == TY_I16 || k == TY_U16 {
+                    return 16u32;
+                }
+                if k == TY_I32 || k == TY_U32 || k == TY_CHAR {
+                    return 32u32;
+                }
+                if k == TY_I64 || k == TY_U64 || k == TY_ISIZE || k == TY_USIZE {
+                    return 64u32;
+                }
+                return 0u32;
+            }
+        }
+    }
+    // Canonical builtin TypeId fallback when Thir is null or unpopulated:
+    // 4=bool, 5=char, 6=i8, 7=i16, 8=i32, 9=i64, 10=isize, 11=u8, 12=u16, 13=u32, 14=u64, 15=usize
+    if ty_v == 4u32 || ty_v == 6u32 || ty_v == 11u32 {
+        return 8u32;
+    }
+    if ty_v == 7u32 || ty_v == 12u32 {
+        return 16u32;
+    }
+    if ty_v == 5u32 || ty_v == 8u32 || ty_v == 13u32 {
+        return 32u32;
+    }
+    if ty_v == 9u32 || ty_v == 10u32 || ty_v == 14u32 || ty_v == 15u32 {
+        return 64u32;
+    }
+    0u32
+}
+
+pub fn opt_type_is_signed(thir: *const Thir, ty: TypeId) -> bool {
+    let ty_v = ty.v;
+    if (thir as usize) != 0 {
+        let types_ptr = unsafe { (*thir).interner.types };
+        if (types_ptr as usize) != 0 {
+            let t = unsafe { type_get(view((*thir).interner), TypeId { v: ty_v }) };
+            if (t as usize) != 0 {
+                let k = unsafe { (*t).kind };
+                return k == TY_I8 || k == TY_I16 || k == TY_I32 || k == TY_I64 || k == TY_ISIZE;
+            }
+        }
+    }
+    ty_v >= 6u32 && ty_v <= 10u32
+}
+
+pub fn opt_type_is_bool(thir: *const Thir, ty: TypeId) -> bool {
+    let ty_v = ty.v;
+    if (thir as usize) != 0 {
+        let types_ptr = unsafe { (*thir).interner.types };
+        if (types_ptr as usize) != 0 {
+            let t = unsafe { type_get(view((*thir).interner), TypeId { v: ty_v }) };
+            if (t as usize) != 0 {
+                let k = unsafe { (*t).kind };
+                return k == TY_BOOL;
+            }
+        }
+    }
+    ty_v == 4u32
+}
+
+pub fn opt_bool_type_id(thir: *const Thir) -> TypeId {
+    if (thir as usize) != 0 {
+        let bv = unsafe { (*thir).interner.t_bool.v };
+        if bv != 0u32 {
+            return TypeId { v: bv };
+        }
+    }
+    TypeId { v: 4u32 }
+}
+
+// --- Trap-Free 64-Bit Two's-Complement Arithmetic Helpers ---
+
+pub fn opt_bit_mask(bits: u32) -> u64 {
+    if bits == 8u32 {
+        0xFFu64
+    } else if bits == 16u32 {
+        0xFFFFu64
+    } else if bits == 32u32 {
+        0xFFFFFFFFu64
+    } else {
+        OPT_ALL_ONES_U64
+    }
+}
+
+pub fn opt_sign_bit_mask(bits: u32) -> u64 {
+    if bits == 8u32 {
+        0x80u64
+    } else if bits == 16u32 {
+        0x8000u64
+    } else if bits == 32u32 {
+        0x80000000u64
+    } else {
+        OPT_SIGN64_U64
+    }
+}
+
+pub fn opt_wrapping_add_u64(a: u64, b: u64) -> u64 {
+    let a_lo = a & OPT_LOW32_U64;
+    let a_hi = (a >> 32u64) & OPT_LOW32_U64;
+    let b_lo = b & OPT_LOW32_U64;
+    let b_hi = (b >> 32u64) & OPT_LOW32_U64;
+    let sum_lo = a_lo + b_lo;
+    let carry = (sum_lo >> 32u64) & 1u64;
+    let sum_hi = (a_hi + b_hi + carry) & OPT_LOW32_U64;
+    (sum_lo & OPT_LOW32_U64) | (sum_hi << 32u64)
+}
+
+pub fn opt_twos_complement_u64(x: u64) -> u64 {
+    opt_wrapping_add_u64(x ^ OPT_ALL_ONES_U64, 1u64)
+}
+
+pub fn opt_sign_extend_u64(val: u64, bits: u32) -> u64 {
+    let m = opt_bit_mask(bits);
+    let v = val & m;
+    if bits >= 64u32 {
+        return v;
+    }
+    let sign_bit = opt_sign_bit_mask(bits);
+    if (v & sign_bit) != 0u64 {
+        v | (m ^ OPT_ALL_ONES_U64)
+    } else {
+        v
+    }
+}
+
+pub fn opt_fits_signed_bits(val_tc: u64, bits: u32) -> bool {
+    if bits >= 64u32 {
+        return true;
+    }
+    opt_sign_extend_u64(val_tc, bits) == val_tc
+}
+
+pub fn opt_checked_add_u64(a: u64, b: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let a_u = a & m;
+    let b_u = b & m;
+    let a_lo = a_u & OPT_LOW32_U64;
+    let a_hi = (a_u >> 32u64) & OPT_LOW32_U64;
+    let b_lo = b_u & OPT_LOW32_U64;
+    let b_hi = (b_u >> 32u64) & OPT_LOW32_U64;
+    let sum_lo = a_lo + b_lo;
+    let carry = (sum_lo >> 32u64) & 1u64;
+    let sum_hi_full = a_hi + b_hi + carry;
+    let res = (sum_lo & OPT_LOW32_U64) | ((sum_hi_full & OPT_LOW32_U64) << 32u64);
+    *out = res & m;
+    if bits >= 64u32 {
+        (sum_hi_full >> 32u64) != 0u64
+    } else {
+        (res & (m ^ OPT_ALL_ONES_U64)) != 0u64
+    }
+}
+
+pub fn opt_checked_sub_u64(a: u64, b: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let a_u = a & m;
+    let b_u = b & m;
+    if a_u < b_u {
+        *out = 0u64;
+        return true;
+    }
+    *out = (a_u - b_u) & m;
+    false
+}
+
+pub fn opt_mul_u32_to_u64(x: u64, y: u64) -> u64 {
+    let x32 = x & OPT_LOW32_U64;
+    let y_lo = y & 0xFFFFu64;
+    let y_hi = (y >> 16u64) & 0xFFFFu64;
+    let lo_prod = ((x32 as i64) * (y_lo as i64)) as u64;
+    let hi_prod = ((x32 as i64) * (y_hi as i64)) as u64;
+    lo_prod + (hi_prod << 16u64)
+}
+
+pub fn opt_div_rem_u64(n: u64, d: u64, rem_out: mut_view<u64>) -> u64 {
+    if d == 0u64 {
+        *rem_out = 0u64;
+        return 0u64;
+    }
+    if (d & OPT_SIGN64_U64) != 0u64 {
+        if n >= d {
+            *rem_out = n - d;
+            return 1u64;
+        } else {
+            *rem_out = n;
+            return 0u64;
+        }
+    }
+    let mut q: u64 = 0u64;
+    let mut r: u64 = 0u64;
+    let mut i: u32 = 64u32;
+    while i > 0u32 {
+        i = i - 1u32;
+        let bit = (n >> (i as u64)) & 1u64;
+        r = (r << 1u64) | bit;
+        if r >= d {
+            r = r - d;
+            q = q | (1u64 << (i as u64));
+        }
+    }
+    *rem_out = r;
+    q
+}
+
+pub fn opt_checked_mul_u64_raw(a: u64, b: u64, out: mut_view<u64>) -> bool {
+    let a_lo = a & OPT_LOW32_U64;
+    let a_hi = (a >> 32u64) & OPT_LOW32_U64;
+    let b_lo = b & OPT_LOW32_U64;
+    let b_hi = (b >> 32u64) & OPT_LOW32_U64;
+    let p0 = opt_mul_u32_to_u64(a_lo, b_lo);
+    let p1 = opt_mul_u32_to_u64(a_lo, b_hi);
+    let p2 = opt_mul_u32_to_u64(a_hi, b_lo);
+    let mid = (p0 >> 32u64) + (p1 & OPT_LOW32_U64) + (p2 & OPT_LOW32_U64);
+    *out = (p0 & OPT_LOW32_U64) | ((mid & OPT_LOW32_U64) << 32u64);
+    if a_hi != 0u64 && b_hi != 0u64 {
+        return true;
+    }
+    if (p1 >> 32u64) != 0u64 || (p2 >> 32u64) != 0u64 {
+        return true;
+    }
+    (mid >> 32u64) != 0u64
+}
+
+pub fn opt_checked_mul_u64(a: u64, b: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let a_u = a & m;
+    let b_u = b & m;
+    let mut raw: u64 = 0u64;
+    let ovf64 = opt_checked_mul_u64_raw(a_u, b_u, mut_view(raw));
+    *out = raw & m;
+    if bits >= 64u32 {
+        ovf64
+    } else {
+        ovf64 || ((raw & (m ^ OPT_ALL_ONES_U64)) != 0u64)
+    }
+}
+
+pub fn opt_checked_add_signed(a_tc: u64, b_tc: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let res_tc = opt_wrapping_add_u64(a_tc, b_tc);
+    let same_sign = ((a_tc ^ b_tc) & OPT_SIGN64_U64) == 0u64;
+    let flipped_sign = ((a_tc ^ res_tc) & OPT_SIGN64_U64) != 0u64;
+    let ovf64 = same_sign && flipped_sign;
+    let ovf = ovf64 || !opt_fits_signed_bits(res_tc, bits);
+    *out = res_tc & m;
+    ovf
+}
+
+pub fn opt_checked_sub_signed(a_tc: u64, b_tc: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let neg_b = opt_twos_complement_u64(b_tc);
+    let res_tc = opt_wrapping_add_u64(a_tc, neg_b);
+    let diff_sign = ((a_tc ^ b_tc) & OPT_SIGN64_U64) != 0u64;
+    let flipped_sign = ((a_tc ^ res_tc) & OPT_SIGN64_U64) != 0u64;
+    let ovf64 = diff_sign && flipped_sign;
+    let ovf = ovf64 || !opt_fits_signed_bits(res_tc, bits);
+    *out = res_tc & m;
+    ovf
+}
+
+pub fn opt_checked_mul_signed(a_tc: u64, b_tc: u64, bits: u32, out: mut_view<u64>) -> bool {
+    let m = opt_bit_mask(bits);
+    let a_neg = (a_tc & OPT_SIGN64_U64) != 0u64;
+    let b_neg = (b_tc & OPT_SIGN64_U64) != 0u64;
+    let a_mag: u64 = if a_neg {
+        opt_twos_complement_u64(a_tc)
+    } else {
+        a_tc
+    };
+    let b_mag: u64 = if b_neg {
+        opt_twos_complement_u64(b_tc)
+    } else {
+        b_tc
+    };
+    if a_mag == 0u64 || b_mag == 0u64 {
+        *out = 0u64;
+        return false;
+    }
+    let mut mag_prod: u64 = 0u64;
+    let mag_ovf = opt_checked_mul_u64_raw(a_mag, b_mag, mut_view(mag_prod));
+    if mag_ovf {
+        *out = 0u64;
+        return true;
+    }
+    let res_neg = a_neg != b_neg;
+    let mut res_tc: u64 = 0u64;
+    if res_neg {
+        if mag_prod > OPT_SIGN64_U64 {
+            *out = 0u64;
+            return true;
+        }
+        res_tc = opt_twos_complement_u64(mag_prod);
+    } else {
+        if mag_prod >= OPT_SIGN64_U64 {
+            *out = 0u64;
+            return true;
+        }
+        res_tc = mag_prod;
+    }
+    if !opt_fits_signed_bits(res_tc, bits) {
+        *out = 0u64;
+        return true;
+    }
+    *out = res_tc & m;
+    false
+}
+
+pub fn opt_signed_lt(a_tc: u64, b_tc: u64) -> bool {
+    (a_tc ^ OPT_SIGN64_U64) < (b_tc ^ OPT_SIGN64_U64)
+}
+
+pub fn opt_signed_le(a_tc: u64, b_tc: u64) -> bool {
+    (a_tc ^ OPT_SIGN64_U64) <= (b_tc ^ OPT_SIGN64_U64)
+}
+
+pub fn opt_is_scalar_const_op(op: view<MirOperand>) -> bool {
+    if op.kind != MIR_OP_CONST {
+        return false;
+    }
+    op.constant.kind == MIR_CONST_INT || op.constant.kind == MIR_CONST_BOOL
+}
+
+// --- Binary & Unary Constant Folding ---
+
+pub fn do_const_fold_binop(
+    thir: *const Thir,
+    op: u8,
+    lhs: view<MirOperand>,
+    rhs: view<MirOperand>,
+    out_const: mut_view<MirConst>
+) -> bool {
+    if !opt_is_scalar_const_op(lhs) || !opt_is_scalar_const_op(rhs) {
+        return false;
+    }
+    if lhs.constant.ty.v != rhs.constant.ty.v {
+        return false;
+    }
+
+    let ty_v = lhs.constant.ty.v;
+    let bits = opt_type_bits(thir, TypeId { v: ty_v });
+    if bits == 0u32 || bits > 64u32 {
+        return false;
+    }
+    let is_signed = opt_type_is_signed(thir, TypeId { v: ty_v });
+    let mask = opt_bit_mask(bits);
+
+    let a_val = lhs.constant.val;
+    let b_val = rhs.constant.val;
+    let a_tc = opt_sign_extend_u64(a_val, bits);
+    let b_tc = opt_sign_extend_u64(b_val, bits);
+
+    let mut res: u64 = 0u64;
+    let mut overflow: bool = false;
+    let mut res_ty_v: u32 = ty_v;
+
+    if op == MIR_BINOP_ADD {
+        if is_signed {
+            overflow = opt_checked_add_signed(a_tc, b_tc, bits, mut_view(res));
+        } else {
+            overflow = opt_checked_add_u64(a_val, b_val, bits, mut_view(res));
+        }
+    } else if op == MIR_BINOP_SUB {
+        if is_signed {
+            overflow = opt_checked_sub_signed(a_tc, b_tc, bits, mut_view(res));
+        } else {
+            overflow = opt_checked_sub_u64(a_val, b_val, bits, mut_view(res));
+        }
+    } else if op == MIR_BINOP_MUL {
+        if is_signed {
+            overflow = opt_checked_mul_signed(a_tc, b_tc, bits, mut_view(res));
+        } else {
+            overflow = opt_checked_mul_u64(a_val, b_val, bits, mut_view(res));
+        }
+    } else if op == MIR_BINOP_DIV {
+        if is_signed {
+            let min_tc = opt_sign_extend_u64(opt_sign_bit_mask(bits), bits);
+            if b_tc == 0u64 || (a_tc == min_tc && b_tc == OPT_ALL_ONES_U64) {
+                overflow = true;
+            } else {
+                let a_neg = (a_tc & OPT_SIGN64_U64) != 0u64;
+                let b_neg = (b_tc & OPT_SIGN64_U64) != 0u64;
+                let a_mag: u64 = if a_neg { opt_twos_complement_u64(a_tc) } else { a_tc };
+                let b_mag: u64 = if b_neg { opt_twos_complement_u64(b_tc) } else { b_tc };
+                let mut rem_unused: u64 = 0u64;
+                let q_mag = opt_div_rem_u64(a_mag, b_mag, mut_view(rem_unused));
+                let q_tc: u64 = if (a_neg != b_neg) && q_mag != 0u64 {
+                    opt_twos_complement_u64(q_mag)
+                } else {
+                    q_mag
+                };
+                res = q_tc & mask;
+            }
+        } else {
+            let b_u = b_val & mask;
+            if b_u == 0u64 {
+                overflow = true;
+            } else {
+                let mut rem_unused: u64 = 0u64;
+                let q_u = opt_div_rem_u64(a_val & mask, b_u, mut_view(rem_unused));
+                res = q_u & mask;
+            }
+        }
+    } else if op == MIR_BINOP_REM {
+        if is_signed {
+            let min_tc = opt_sign_extend_u64(opt_sign_bit_mask(bits), bits);
+            if b_tc == 0u64 || (a_tc == min_tc && b_tc == OPT_ALL_ONES_U64) {
+                overflow = true;
+            } else {
+                let a_neg = (a_tc & OPT_SIGN64_U64) != 0u64;
+                let b_neg = (b_tc & OPT_SIGN64_U64) != 0u64;
+                let a_mag: u64 = if a_neg { opt_twos_complement_u64(a_tc) } else { a_tc };
+                let b_mag: u64 = if b_neg { opt_twos_complement_u64(b_tc) } else { b_tc };
+                let mut r_mag: u64 = 0u64;
+                let _q_unused = opt_div_rem_u64(a_mag, b_mag, mut_view(r_mag));
+                let r_tc: u64 = if a_neg && r_mag != 0u64 {
+                    opt_twos_complement_u64(r_mag)
+                } else {
+                    r_mag
+                };
+                res = r_tc & mask;
+            }
+        } else {
+            let b_u = b_val & mask;
+            if b_u == 0u64 {
+                overflow = true;
+            } else {
+                let mut r_u: u64 = 0u64;
+                let _q_unused = opt_div_rem_u64(a_val & mask, b_u, mut_view(r_u));
+                res = r_u & mask;
+            }
+        }
+    } else if op == MIR_BINOP_SHL {
+        if b_val >= (bits as u64) {
+            overflow = true;
+        } else {
+            res = ((a_val & mask) << b_val) & mask;
+        }
+    } else if op == MIR_BINOP_SHR {
+        if b_val >= (bits as u64) {
+            overflow = true;
+        } else if is_signed {
+            if b_val == 0u64 {
+                res = a_tc & mask;
+            } else {
+                let shifted = a_tc >> b_val;
+                if (a_tc & OPT_SIGN64_U64) != 0u64 {
+                    let fill = OPT_ALL_ONES_U64 << (64u64 - b_val);
+                    res = (shifted | fill) & mask;
+                } else {
+                    res = shifted & mask;
+                }
+            }
+        } else {
+            res = ((a_val & mask) >> b_val) & mask;
+        }
+    } else if op == MIR_BINOP_BIT_AND {
+        res = (a_val & b_val) & mask;
+    } else if op == MIR_BINOP_BIT_OR {
+        res = (a_val | b_val) & mask;
+    } else if op == MIR_BINOP_BIT_XOR {
+        res = (a_val ^ b_val) & mask;
+    } else if op == MIR_BINOP_EQ {
+        res = if (a_val & mask) == (b_val & mask) { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else if op == MIR_BINOP_NE {
+        res = if (a_val & mask) != (b_val & mask) { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else if op == MIR_BINOP_LT {
+        let cmp: bool = if is_signed {
+            opt_signed_lt(a_tc, b_tc)
+        } else {
+            (a_val & mask) < (b_val & mask)
+        };
+        res = if cmp { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else if op == MIR_BINOP_LE {
+        let cmp: bool = if is_signed {
+            opt_signed_le(a_tc, b_tc)
+        } else {
+            (a_val & mask) <= (b_val & mask)
+        };
+        res = if cmp { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else if op == MIR_BINOP_GT {
+        let cmp: bool = if is_signed {
+            opt_signed_lt(b_tc, a_tc)
+        } else {
+            (a_val & mask) > (b_val & mask)
+        };
+        res = if cmp { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else if op == MIR_BINOP_GE {
+        let cmp: bool = if is_signed {
+            opt_signed_le(b_tc, a_tc)
+        } else {
+            (a_val & mask) >= (b_val & mask)
+        };
+        res = if cmp { 1u64 } else { 0u64 };
+        let bty = opt_bool_type_id(thir);
+        res_ty_v = bty.v;
+    } else {
+        return false;
+    }
+
+    if overflow {
+        return false;
+    }
+
+    mir_const_reset_vals(mut_view(*out_const), MIR_CONST_INT, res_ty_v, res);
+    true
+}
+
+pub fn do_const_fold_unop(
+    thir: *const Thir,
+    op: u8,
+    operand: view<MirOperand>,
+    out_const: mut_view<MirConst>
+) -> bool {
+    if !opt_is_scalar_const_op(operand) {
+        return false;
+    }
+
+    let ty_v = operand.constant.ty.v;
+    let bits = opt_type_bits(thir, TypeId { v: ty_v });
+    if bits == 0u32 || bits > 64u32 {
+        return false;
+    }
+    let is_signed = opt_type_is_signed(thir, TypeId { v: ty_v });
+    let mask = opt_bit_mask(bits);
+    let val = operand.constant.val;
+
+    let mut res: u64 = 0u64;
+    if op == MIR_UNOP_NOT {
+        let is_b = opt_type_is_bool(thir, TypeId { v: ty_v });
+        if !is_b {
+            return false;
+        }
+        res = if val == 0u64 { 1u64 } else { 0u64 };
+    } else if op == MIR_UNOP_BITNOT {
+        res = (val ^ OPT_ALL_ONES_U64) & mask;
+    } else if op == MIR_UNOP_NEG {
+        if !is_signed {
+            return false;
+        }
+        let s_tc = opt_sign_extend_u64(val, bits);
+        let min_tc = opt_sign_extend_u64(opt_sign_bit_mask(bits), bits);
+        if s_tc == min_tc {
+            return false;
+        }
+        res = opt_twos_complement_u64(s_tc) & mask;
+    } else {
+        return false;
+    }
+
+    mir_const_reset_vals(mut_view(*out_const), MIR_CONST_INT, ty_v, res);
+    true
+}
+
+pub fn opt_const_fold(body: mut_view<MirBody>, thir: *const Thir) -> bool {
+    if body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let bool_ty = opt_bool_type_id(thir);
+    let mut total_changed: bool = false;
+    let mut pass_changed: bool = true;
+    let mut folded = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: compiler.kernel.id.SymbolId { v: 0u32 },
+    };
+    let mut loc = Span {
+        file: compiler.kernel.id.FileId { v: 0u32 },
+        start: 0u32,
+        end: 0u32,
+    };
+
+    while pass_changed {
+        pass_changed = false;
+        let mut i: usize = 0;
+        while i < body.bb_count {
+            let bb = unsafe { mir_bb_at(body.bbs, i) };
+            let stmt_count = unsafe { (*bb).stmt_count };
+            let stmts = unsafe { (*bb).stmts };
+            let mut j: usize = 0;
+            while j < stmt_count {
+                let stmt = unsafe { mir_stmt_at(stmts, j) };
+                let sk = unsafe { (*stmt).kind };
+                if sk == MIR_STMT_ASSIGN {
+                    let rv_kind = unsafe { (*stmt).rvalue.kind };
+                    if rv_kind == MIR_RVALUE_BINARY_OP {
+                        let orig_op = unsafe { (*stmt).rvalue.bin_op };
+                        mir_const_reset_vals(mut_view(folded), MIR_CONST_INT, 0u32, 0u64);
+                        let ok = unsafe {
+                            do_const_fold_binop(
+                                thir,
+                                orig_op,
+                                view((*stmt).rvalue.lhs),
+                                view((*stmt).rvalue.rhs),
+                                mut_view(folded)
+                            )
+                        };
+                        if ok {
+                            unsafe {
+                                mir_span_copy(mut_view(loc), view((*stmt).rvalue.lhs.location));
+                                mir_rvalue_reset(mut_view((*stmt).rvalue), MIR_RVALUE_USE);
+                                (*stmt).rvalue.use_op.kind = MIR_OP_CONST;
+                                mir_span_copy(mut_view((*stmt).rvalue.use_op.location), view(loc));
+                                mir_copy_const(mut_view((*stmt).rvalue.use_op.constant), view(folded));
+                            }
+                            pass_changed = true;
+                            total_changed = true;
+                        }
+                    } else if rv_kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                        let orig_op = unsafe { (*stmt).rvalue.bin_op };
+                        mir_const_reset_vals(mut_view(folded), MIR_CONST_INT, 0u32, 0u64);
+                        let ok = unsafe {
+                            do_const_fold_binop(
+                                thir,
+                                orig_op,
+                                view((*stmt).rvalue.lhs),
+                                view((*stmt).rvalue.rhs),
+                                mut_view(folded)
+                            )
+                        };
+                        if ok {
+                            let mut dst_ty_v = bool_ty.v;
+                            let dst_loc = unsafe { (*stmt).place.local.v as usize };
+                            if (body.locals as usize) != 0 && dst_loc < body.local_count {
+                                let l_ty = unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v };
+                                if l_ty != 0u32 {
+                                    dst_ty_v = l_ty;
+                                }
+                            }
+                            unsafe {
+                                mir_span_copy(mut_view(loc), view((*stmt).rvalue.lhs.location));
+                                mir_rvalue_reset(mut_view((*stmt).rvalue), MIR_RVALUE_USE);
+                                (*stmt).rvalue.use_op.kind = MIR_OP_CONST;
+                                mir_span_copy(mut_view((*stmt).rvalue.use_op.location), view(loc));
+                                mir_const_reset_vals(
+                                    mut_view((*stmt).rvalue.use_op.constant),
+                                    MIR_CONST_INT,
+                                    dst_ty_v,
+                                    0u64
+                                );
+                            }
+                            pass_changed = true;
+                            total_changed = true;
+                        }
+                    } else if rv_kind == MIR_RVALUE_UNARY_OP {
+                        let orig_unop = unsafe { (*stmt).rvalue.un_op };
+                        mir_const_reset_vals(mut_view(folded), MIR_CONST_INT, 0u32, 0u64);
+                        let ok = unsafe {
+                            do_const_fold_unop(
+                                thir,
+                                orig_unop,
+                                view((*stmt).rvalue.use_op),
+                                mut_view(folded)
+                            )
+                        };
+                        if ok {
+                            unsafe {
+                                mir_span_copy(mut_view(loc), view((*stmt).rvalue.use_op.location));
+                                mir_rvalue_reset(mut_view((*stmt).rvalue), MIR_RVALUE_USE);
+                                (*stmt).rvalue.use_op.kind = MIR_OP_CONST;
+                                mir_span_copy(mut_view((*stmt).rvalue.use_op.location), view(loc));
+                                mir_copy_const(mut_view((*stmt).rvalue.use_op.constant), view(folded));
+                            }
+                            pass_changed = true;
+                            total_changed = true;
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    total_changed
+}
+
+pub fn ax_opt_const_fold(body: mut_view<MirBody>, thir: *const Thir) -> bool {
+    if (thir as usize) == 0 {
+        return false;
+    }
+    opt_const_fold(body, thir)
+}

@@ -1,0 +1,541 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.types.types.typemap_free
+use compiler.mir.mir.MirConst
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_BIT_XOR
+use compiler.mir.mir.MIR_BINOP_BIT_AND
+use compiler.mir.mir.MIR_BINOP_BIT_OR
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_BINOP_EQ
+use compiler.mir.mir.MIR_BINOP_LT
+use compiler.mir.mir.MIR_BINOP_LE
+use compiler.mir.mir.MIR_BINOP_NE
+use compiler.mir.mir.MIR_BINOP_GE
+use compiler.mir.mir.MIR_BINOP_GT
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_UNREACHABLE
+use compiler.mir.mir.MIR_UNOP_NOT
+use compiler.mir.mir.MIR_UNOP_NEG
+use compiler.mir.mir.MIR_UNOP_BITNOT
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_const_reset_vals
+use compiler.mir.mir.mir_operand_zero
+use compiler.verify.verify_mir
+use compiler.verify.verify_parse_mir
+use compiler.opt.do_const_fold_binop
+use compiler.opt.do_const_fold_unop
+use compiler.opt.opt_const_fold
+use compiler.opt.opt_dce
+use compiler.opt.opt_cfg_simplify
+use compiler.opt.opt_cfg_eliminate_redundant_switches
+use compiler.opt.opt_cfg_merge_linear_blocks
+use compiler.opt.opt_run
+use compiler.opt.opt_run_with_merge
+use compiler.opt.opt_init_minimal_thir
+use compiler.opt.opt_free_minimal_thir
+use compiler.opt.opt_mir_text
+use compiler.opt.opt_mir_text_in_arena
+
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+@UNIT_MIR_FN@
+
+fn unit_mir_blob(arena: mut_view<Arena>, idx: usize) -> StrView {
+    let s: str = unit_mir_raw(idx);
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = bytes[i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn str_eq_buf(buf: view<DiagBuffer>, exp: view<StrView>) -> bool {
+    if buf.len != exp.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < exp.len {
+        let a = unsafe { *(buf.ptr + i) };
+        let b = unsafe { *(exp.ptr + i) };
+        if a != b {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn init_const_op(op: mut_view<MirOperand>, ty_v: u32, val: u64) {
+    mir_operand_zero(mut_view(*op), MIR_OP_CONST);
+    mir_const_reset_vals(mut_view(op.constant), MIR_CONST_INT, ty_v, val);
+}
+
+fn check_binop_ok(
+    thir: *const Thir,
+    op: u8,
+    ty_v: u32,
+    lhs_v: u64,
+    rhs_v: u64,
+    exp_val: u64,
+    exp_ty_v: u32
+) -> bool {
+    let mut lhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut rhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut out = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: SymbolId { v: 0u32 },
+    };
+    init_const_op(mut_view(lhs), ty_v, lhs_v);
+    init_const_op(mut_view(rhs), ty_v, rhs_v);
+    mir_const_reset_vals(mut_view(out), MIR_CONST_INT, 0u32, 0u64);
+    let ok = do_const_fold_binop(thir, op, view(lhs), view(rhs), mut_view(out));
+    if !ok {
+        return false;
+    }
+    out.kind == MIR_CONST_INT && out.val == exp_val && out.ty.v == exp_ty_v
+}
+
+fn check_binop_ovf(thir: *const Thir, op: u8, ty_v: u32, lhs_v: u64, rhs_v: u64) -> bool {
+    let mut lhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut rhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut out = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: SymbolId { v: 0u32 },
+    };
+    init_const_op(mut_view(lhs), ty_v, lhs_v);
+    init_const_op(mut_view(rhs), ty_v, rhs_v);
+    mir_const_reset_vals(mut_view(out), MIR_CONST_INT, 0u32, 0u64);
+    !do_const_fold_binop(thir, op, view(lhs), view(rhs), mut_view(out))
+}
+
+fn check_unop_ok(
+    thir: *const Thir,
+    op: u8,
+    ty_v: u32,
+    val: u64,
+    exp_val: u64
+) -> bool {
+    let mut operand = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut out = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: SymbolId { v: 0u32 },
+    };
+    init_const_op(mut_view(operand), ty_v, val);
+    mir_const_reset_vals(mut_view(out), MIR_CONST_INT, 0u32, 0u64);
+    let ok = do_const_fold_unop(thir, op, view(operand), mut_view(out));
+    if !ok {
+        return false;
+    }
+    out.kind == MIR_CONST_INT && out.val == exp_val && out.ty.v == ty_v
+}
+
+fn check_unop_ovf(thir: *const Thir, op: u8, ty_v: u32, val: u64) -> bool {
+    let mut operand = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut out = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: SymbolId { v: 0u32 },
+    };
+    init_const_op(mut_view(operand), ty_v, val);
+    mir_const_reset_vals(mut_view(out), MIR_CONST_INT, 0u32, 0u64);
+    !do_const_fold_unop(thir, op, view(operand), mut_view(out))
+}
+
+fn check_binop_mismatch(thir: *const Thir, op: u8, lhs_ty_v: u32, rhs_ty_v: u32, lhs_v: u64, rhs_v: u64) -> bool {
+    let mut lhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut rhs = MirOperand {
+        kind: MIR_OP_CONST,
+        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        place: mir_local_place(0u32),
+        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },
+    };
+    let mut out = MirConst {
+        ty: TypeId { v: 0u32 },
+        kind: MIR_CONST_INT,
+        val: 0u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        sym: SymbolId { v: 0u32 },
+    };
+    init_const_op(mut_view(lhs), lhs_ty_v, lhs_v);
+    init_const_op(mut_view(rhs), rhs_ty_v, rhs_v);
+    mir_const_reset_vals(mut_view(out), MIR_CONST_INT, 0u32, 0u64);
+    !do_const_fold_binop(thir, op, view(lhs), view(rhs), mut_view(out))
+}
+
+// 1. Exhaustive constant folding unit tests across all scalar types (`i8..i64`, `isize`, `u8..u64`, `usize`, `char`, `bool`).
+fn test_const_fold_scalars(arena: mut_view<Arena>) -> i32 {
+    let thir_ptr = arena_alloc_raw(mut_view(*arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    opt_init_minimal_thir(thir_ptr, mut_view(*arena));
+    let t_ptr = thir_ptr as *const Thir;
+
+    // --- i8 (type#6) ---
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 6u32, 100u64, 27u64, 127u64, 6u32) { return 101; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 6u32, 100u64, 28u64) { return 102; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SUB, 6u32, 0x9Cu64, 28u64, 0x80u64, 6u32) { return 103; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 6u32, 0x9Cu64, 29u64) { return 104; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 6u32, 16u64, 7u64, 112u64, 6u32) { return 105; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 6u32, 16u64, 8u64) { return 106; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 6u32, 0xF0u64, 8u64, 0x80u64, 6u32) { return 107; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 6u32, 0x80u64, 0xFFu64) { return 108; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_DIV, 6u32, 0x9Cu64, 3u64, 0xDFu64, 6u32) { return 109; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 6u32, 0x80u64, 0xFFu64) { return 110; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 6u32, 10u64, 0u64) { return 111; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_REM, 6u32, 0x9Cu64, 3u64, 0xFFu64, 6u32) { return 112; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_REM, 6u32, 0x80u64, 0xFFu64) { return 113; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHL, 6u32, 1u64, 7u64, 0x80u64, 6u32) { return 114; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHL, 6u32, 1u64, 8u64) { return 115; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHR, 6u32, 0xF0u64, 2u64, 0xFCu64, 6u32) { return 116; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHR, 6u32, 1u64, 8u64) { return 117; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_LT, 6u32, 0xFBu64, 2u64, 1u64, 4u32) { return 118; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_GT, 6u32, 0xFBu64, 2u64, 0u64, 4u32) { return 119; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_NEG, 6u32, 42u64, 0xD6u64) { return 120; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 6u32, 0x80u64) { return 121; }
+    // `MIR_UNOP_NOT` only folds `bool` (`type#4`); `MIR_UNOP_BITNOT` folds integer bitwise NOT.
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NOT, 6u32, 0x0Fu64) { return 122; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_BITNOT, 6u32, 0x0Fu64, 0xF0u64) { return 123; }
+    // Mismatched operand types must be rejected (`lhs.constant.ty.v != rhs.constant.ty.v`).
+    if !check_binop_mismatch(t_ptr, MIR_BINOP_ADD, 8u32, 13u32, 1u64, 1u64) { return 124; }
+    if !check_binop_mismatch(t_ptr, MIR_BINOP_LT, 6u32, 8u32, 1u64, 2u64) { return 125; }
+
+    // --- i16 (type#7) ---
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 7u32, 32766u64, 1u64, 32767u64, 7u32) { return 130; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 7u32, 32767u64, 1u64) { return 131; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 7u32, 0x8000u64, 1u64) { return 132; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 7u32, 0x8000u64, 0xFFFFu64) { return 133; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 7u32, 0x8000u64) { return 134; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_NEG, 7u32, 1u64, 0xFFFFu64) { return 135; }
+
+    // --- i32 (type#8) ---
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 8u32, 0x7FFFFFFEu64, 1u64, 0x7FFFFFFFu64, 8u32) { return 140; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 8u32, 0x7FFFFFFFu64, 1u64) { return 141; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 8u32, 0x80000000u64, 1u64) { return 142; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 8u32, 0x80000000u64, 0xFFFFFFFFu64) { return 143; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHL, 8u32, 1u64, 31u64, 0x80000000u64, 8u32) { return 144; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHL, 8u32, 1u64, 32u64) { return 145; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHR, 8u32, 0x80000000u64, 31u64, 0xFFFFFFFFu64, 8u32) { return 146; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 8u32, 0x80000000u64) { return 147; }
+
+    // --- i64 (type#9) & isize (type#10) ---
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 9u32, 0x7FFFFFFFFFFFFFFEu64, 1u64, 0x7FFFFFFFFFFFFFFFu64, 9u32) { return 150; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 9u32, 0x7FFFFFFFFFFFFFFFu64, 1u64) { return 151; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 9u32, 0x8000000000000000u64, 1u64) { return 152; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 9u32, 0u64, 0x8000000000000000u64) { return 153; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 9u32, 0x8000000000000000u64, 0xFFFFFFFFFFFFFFFFu64) { return 154; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 9u32, 0x4000000000000000u64, 2u64) { return 155; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 9u32, 0x4000000000000000u64, 0xFFFFFFFFFFFFFFFEu64, 0x8000000000000000u64, 9u32) { return 156; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 9u32, 0x8000000000000000u64, 0xFFFFFFFFFFFFFFFFu64) { return 157; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_REM, 9u32, 0x8000000000000000u64, 0xFFFFFFFFFFFFFFFFu64) { return 158; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_DIV, 10u32, 100u64, 0u64) { return 159; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_REM, 10u32, 100u64, 0u64) { return 160; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 9u32, 0x8000000000000000u64) { return 161; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_NEG, 10u32, 1u64, 0xFFFFFFFFFFFFFFFFu64) { return 162; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHL, 9u32, 1u64, 63u64, 0x8000000000000000u64, 9u32) { return 163; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHL, 9u32, 1u64, 64u64) { return 164; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHR, 9u32, 0x8000000000000000u64, 63u64, 0xFFFFFFFFFFFFFFFFu64, 9u32) { return 165; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHR, 9u32, 1u64, 64u64) { return 166; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_LT, 9u32, 0x8000000000000000u64, 0x7FFFFFFFFFFFFFFFu64, 1u64, 4u32) { return 167; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_LE, 9u32, 0x8000000000000000u64, 0x8000000000000000u64, 1u64, 4u32) { return 168; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_GE, 9u32, 0x7FFFFFFFFFFFFFFFu64, 0x8000000000000000u64, 1u64, 4u32) { return 169; }
+
+    // --- u8 (type#11), u16 (type#12), u32 (type#13), u64 (type#14), usize (type#15), char (type#5), bool (type#4) ---
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 11u32, 200u64, 55u64, 255u64, 11u32) { return 170; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 11u32, 200u64, 56u64) { return 171; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 11u32, 0u64, 1u64) { return 172; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 11u32, 16u64, 15u64, 240u64, 11u32) { return 173; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 11u32, 16u64, 16u64) { return 174; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_LT, 11u32, 250u64, 10u64, 0u64, 4u32) { return 175; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 11u32, 1u64) { return 176; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 12u32, 65535u64, 1u64) { return 177; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 12u32, 0u64, 1u64) { return 178; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 13u32, 0xFFFFFFFFu64, 1u64) { return 179; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 13u32, 0x10000u64, 0x10000u64) { return 180; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 13u32, 0xFFFFu64, 0xFFFFu64, 0xFFFE0001u64, 13u32) { return 181; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 5u32, 65u64, 1u64, 66u64, 5u32) { return 182; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 14u32, 0xFFFFFFFFFFFFFFFFu64, 1u64) { return 183; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_ADD, 14u32, 0xFFFFFFFFFFFFFFFEu64, 1u64, 0xFFFFFFFFFFFFFFFFu64, 14u32) { return 184; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SUB, 14u32, 0u64, 1u64) { return 185; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 14u32, 0xFFFFFFFFFFFFFFFFu64, 2u64) { return 186; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_MUL, 14u32, 0x100000000u64, 0x100000000u64) { return 187; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_MUL, 15u32, 0xFFFFFFFFu64, 0xFFFFFFFFu64, 0xFFFFFFFE00000001u64, 15u32) { return 188; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_SHR, 14u32, 0xFFFFFFFF00000000u64, 32u64, 0xFFFFFFFFu64, 14u32) { return 189; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_GT, 14u32, 0xFFFFFFFFFFFFFFFFu64, 0u64, 1u64, 4u32) { return 190; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_BIT_AND, 14u32, 0xF0F0u64, 0x0FF0u64, 0x00F0u64, 14u32) { return 191; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_BIT_OR, 14u32, 0xF000u64, 0x00F0u64, 0xF0F0u64, 14u32) { return 192; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_BIT_XOR, 14u32, 0xFF00u64, 0x0FF0u64, 0xF0F0u64, 14u32) { return 193; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_NOT, 4u32, 0u64, 1u64) { return 194; }
+    if !check_unop_ok(t_ptr, MIR_UNOP_NOT, 4u32, 1u64, 0u64) { return 195; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_EQ, 4u32, 1u64, 1u64, 1u64, 4u32) { return 196; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_NE, 4u32, 1u64, 0u64, 1u64, 4u32) { return 197; }
+
+    // Also test null Thir fallback (`0 as *const Thir`)
+    if !check_binop_ok(0 as *const Thir, MIR_BINOP_ADD, 8u32, 40u64, 2u64, 42u64, 8u32) { return 198; }
+    if !check_unop_ok(0 as *const Thir, MIR_UNOP_NOT, 4u32, 0u64, 1u64) { return 199; }
+
+    // QA Round 1 boundary cases:
+    // - `MIR_UNOP_NEG` on `bool` (`type#4`) and `char` (`type#5`) must be rejected; `MIR_UNOP_NOT` on `u32`/`char` must be rejected
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 4u32, 1u64) { return 250; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NEG, 5u32, 1u64) { return 250; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NOT, 13u32, 0u64) { return 251; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_NOT, 5u32, 0u64) { return 252; }
+    // - `INT8_MIN / 1` and `INT8_MIN % 1` succeed (`0x80` and `0`), while `INT16_MIN % -1` (`0x8000 % 0xFFFF`) overflows
+    if !check_binop_ok(t_ptr, MIR_BINOP_DIV, 6u32, 0x80u64, 1u64, 0x80u64, 6u32) { return 253; }
+    if !check_binop_ok(t_ptr, MIR_BINOP_REM, 6u32, 0x80u64, 1u64, 0u64, 6u32) { return 254; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_REM, 7u32, 0x8000u64, 0xFFFFu64) { return 255; }
+    // - Negative shift counts (two's complement `-1` = `0xFFFFFFFFFFFFFFFF`) on signed types must be rejected
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHL, 8u32, 1u64, 0xFFFFFFFFFFFFFFFFu64) { return 256; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_SHR, 9u32, 1u64, 0xFFFFFFFFFFFFFFFFu64) { return 257; }
+    // - Non-integer types (`unit` = `type#2`, `str` = `type#16`, unknown `type#99`) must be rejected
+    if !check_binop_ovf(t_ptr, MIR_BINOP_ADD, 2u32, 0u64, 0u64) { return 258; }
+    if !check_binop_ovf(t_ptr, MIR_BINOP_EQ, 16u32, 0u64, 0u64) { return 259; }
+    if !check_unop_ovf(t_ptr, MIR_UNOP_BITNOT, 99u32, 0u64) { return 260; }
+
+    opt_free_minimal_thir(thir_ptr);
+    arena_reset(mut_view(*arena));
+    0
+}
+
+fn check_mir_blob_pair(
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    out: mut_view<DiagBuffer>,
+    in_idx: usize,
+    exp_idx: usize,
+    err_base: i32
+) -> i32 {
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    out.len = 0;
+    let in_sv = unit_mir_blob(mut_view(*arena), in_idx);
+    let exp_sv = unit_mir_blob(mut_view(*arena), exp_idx);
+    let ok = if in_idx == 0 {
+        opt_mir_text(in_sv, mut_view(*out), mut_view(*sink), true)
+    } else {
+        opt_mir_text_in_arena(in_sv, mut_view(*out), mut_view(*sink), false, mut_view(*arena))
+    };
+    if !ok || sink.errors != 0 {
+        return err_base;
+    }
+    if !str_eq_buf(view(*out), view(exp_sv)) {
+        return err_base + 1;
+    }
+    arena_reset(mut_view(*arena));
+    0
+}
+
+// 2. MIR optimization pass & differential MIR text tests.
+fn test_mir_passes(arena: mut_view<Arena>, sink: mut_view<DiagSink>, out_ptr: *mut u8) -> i32 {
+    let mut out = DiagBuffer { ptr: out_ptr, len: 0, cap: 32768 };
+
+    // Case 0 (blobs 0 -> 1): Full `-O1` pipeline (const_fold + dce + cfg_simplify) with `verify_each = true`.
+    let rc0 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 0, 1, 201);
+    if rc0 != 0 { return rc0; }
+
+    // Case 1 (blobs 2 -> 3): Overflowing constant ops & div-by-zero are NOT folded and NOT DCE'd.
+    let rc1 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 2, 3, 203);
+    if rc1 != 0 { return rc1; }
+
+    // Case 2 (blobs 4 -> 5): Multi-iteration transitive DCE of unused pure chains and StorageLive/StorageDead.
+    let rc2 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 4, 5, 205);
+    if rc2 != 0 { return rc2; }
+
+    // Case 3 (blob 6): Extended CFG simplification (`opt_cfg_eliminate_redundant_switches`,
+    // `opt_cfg_merge_linear_blocks`, and `opt_run_with_merge`).
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let thir_ptr = arena_alloc_raw(mut_view(*arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    opt_init_minimal_thir(thir_ptr, mut_view(*arena));
+    let in3 = unit_mir_blob(mut_view(*arena), 6);
+    let body3 = verify_parse_mir(
+        in3,
+        unsafe { mut_view((*thir_ptr).interner) },
+        mut_view(*arena)
+    );
+    if (body3 as usize) == 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 207;
+    }
+    opt_run_with_merge(
+        unsafe { mut_view(*body3) },
+        thir_ptr as *const Thir,
+        mut_view(*arena),
+        mut_view(*sink),
+        true,
+        0 as *const HirItem
+    );
+    if sink.errors != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 208;
+    }
+    // After `opt_run_with_merge`, `bb0` should have merged `bb2` and `bb3` and terminate with `return`,
+    // while `bb1`, `bb2`, and `bb3` should be `unreachable` with 0 statements.
+    let bb0 = unsafe { mir_bb_at((*body3).bbs, 0) };
+    let bb1 = unsafe { mir_bb_at((*body3).bbs, 1) };
+    let bb2 = unsafe { mir_bb_at((*body3).bbs, 2) };
+    let bb3 = unsafe { mir_bb_at((*body3).bbs, 3) };
+    let bb0_tk = unsafe { (*bb0).terminator.kind };
+    let bb1_tk = unsafe { (*bb1).terminator.kind };
+    let bb2_tk = unsafe { (*bb2).terminator.kind };
+    let bb3_tk = unsafe { (*bb3).terminator.kind };
+    let bb1_sc = unsafe { (*bb1).stmt_count };
+    let bb2_sc = unsafe { (*bb2).stmt_count };
+    let bb3_sc = unsafe { (*bb3).stmt_count };
+    opt_free_minimal_thir(thir_ptr);
+    if bb0_tk != MIR_TERM_RETURN ||
+       bb1_tk != MIR_TERM_UNREACHABLE || bb1_sc != 0 ||
+       bb2_tk != MIR_TERM_UNREACHABLE || bb2_sc != 0 ||
+       bb3_tk != MIR_TERM_UNREACHABLE || bb3_sc != 0 {
+        return 209;
+    }
+    arena_reset(mut_view(*arena));
+
+    // Case 4 (blobs 7 -> 8): Differential test on `tests/opt/qa_dce_run.ax` lowered MIR vs `axiom0 -O1`.
+    let rc4 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 7, 8, 210);
+    if rc4 != 0 { return rc4; }
+
+    // Case 5 (blobs 9 -> 10): Regression test for Finding 2 — foldable `MIR_RVALUE_BINARY_OP`
+    // followed immediately by overflowing or runtime `MIR_RVALUE_OVERFLOWS_BINARY_OP` must NOT
+    // rewrite the subsequent overflow check to `const 0`.
+    let rc5 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 9, 10, 212);
+    if rc5 != 0 { return rc5; }
+
+    // Case 6 (blobs 11 -> 12): Regression test for Finding 3 — (a) `MIR_RVALUE_UNARY_OP` is not
+    // considered pure in `opt_rvalue_is_pure`, so unused `_1 = -const 128: type#6;` is preserved;
+    // (b) `opt_dce` skips `MIR_TERM_UNREACHABLE` blocks during use counting, so a use in an
+    // already-unreachable block does not keep dead `_2 = const 99: type#8;` in `bb0` alive.
+    let rc6 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 11, 12, 214);
+    if rc6 != 0 { return rc6; }
+
+    // Case 7 (blobs 13 -> 14): Differential test on `tests/opt/const_fold_run.ax` lowered MIR vs `axiom0 -O1`.
+    let rc7 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 13, 14, 216);
+    if rc7 != 0 { return rc7; }
+
+    // Case 8 (blobs 15 -> 16): Differential test on `tests/opt/qa_edge_cases_run.ax` lowered MIR vs `axiom0 -O1`.
+    let rc8 = check_mir_blob_pair(mut_view(*arena), mut_view(*sink), mut_view(out), 15, 16, 218);
+    if rc8 != 0 { return rc8; }
+
+    0
+}
+
+pub fn main() -> i32 {
+    let mut perm_arena = arena_new();
+    let out_ptr = arena_alloc_raw(mut_view(perm_arena), 32768, 1);
+    let mut arena = arena_new();
+    let _ = arena_alloc_raw(mut_view(arena), 16, 8);
+    let sink_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<DiagSink>(), align_of<DiagSink>()) as *mut DiagSink;
+    unsafe { diag_sink_init(mut_view(*sink_ptr)); }
+
+    let rc1 = test_const_fold_scalars(mut_view(arena));
+    if rc1 != 0 {
+        unsafe { diag_sink_free(mut_view(*sink_ptr)); }
+        arena_destroy(mut_view(arena));
+        arena_destroy(mut_view(perm_arena));
+        return rc1;
+    }
+
+    let rc2 = test_mir_passes(mut_view(arena), unsafe { mut_view(*sink_ptr) }, out_ptr);
+    if rc2 != 0 {
+        unsafe { diag_sink_free(mut_view(*sink_ptr)); }
+        arena_destroy(mut_view(arena));
+        arena_destroy(mut_view(perm_arena));
+        return rc2;
+    }
+
+    unsafe { diag_sink_free(mut_view(*sink_ptr)); }
+    arena_destroy(mut_view(arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK opt unit (const_fold + dce + cfg_simp + mir diff)\n");
+    0
+}
+

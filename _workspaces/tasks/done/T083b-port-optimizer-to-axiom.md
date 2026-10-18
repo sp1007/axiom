@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T082e]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/opt, tests/selfhost/opt]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-OPT-388, REQ-OPT-389]
+started: 2026-10-18 04:48:31
+finished: 2026-10-18 10:52:47
 ---
 # T083b — Port MIR optimizer (-O1 const folding, DCE, CFG simplify) to Axiom
 
@@ -39,3 +41,7 @@ Port the MIR -O1 baseline optimizer (`compiler/opt/`) from C to Axiom.
 - `model: opus`: Optimization passes require careful correctness and transformation legality (model policy).
 - Sub-task of T083 split per ADR-0005 §8 and SPEC-20 §4.7.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 04:48:31 started (attempt 1) T083b-impl
+- 2026-10-18 10:52:47 accepted by QA -> done
