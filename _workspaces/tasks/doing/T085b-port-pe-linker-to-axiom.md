@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T085a]
 priority: 119
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/link, tests/selfhost/link]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
+started: 2026-10-18 14:53:19
+agent: T085b-impl
 ---
 # T085b — Port PE32+ linker to Axiom
 
@@ -38,3 +40,6 @@ Port in-memory PE32+ linker and executable builder (`compiler/link/`) from C to 
 ## Notes
 - Sub-task of T085 split per ADR-0005 §8 and SPEC-20 §4.9.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 14:53:19 started (attempt 1) T085b-impl

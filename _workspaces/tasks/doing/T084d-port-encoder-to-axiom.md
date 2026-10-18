@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T085a]
 priority: 118
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/target/x64/encode.ax, tests/selfhost/encode]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-X64-001]
+started: 2026-10-18 14:53:18
+agent: T084d-impl
 ---
 # T084d — Port x64 machine code encoder to Axiom
 
@@ -37,3 +39,6 @@ Port x86-64 machine code binary encoder (`compiler/target/x64/encode.ax`) from C
 ## Notes
 - Sub-task of T084 split per ADR-0005 §8 and SPEC-20 §4.8.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 14:53:18 started (attempt 1) T084d-impl

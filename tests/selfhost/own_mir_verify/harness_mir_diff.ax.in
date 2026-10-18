@@ -1,0 +1,293 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.ax_diag_render_human
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_new
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.resolve_hir.session.session_append_std_prelude
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.Thir
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.typeck.session.session_typeck_into
+use compiler.traits.mono.MonoEngine
+use compiler.own_mir_verify.session_own_mir_verify_file_with_synth
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+const CASE_COUNT: usize = @CASE_COUNT@;
+
+@DATA_TABLE@
+@OFFSET_TABLE@
+@SYNTH_TABLE@
+@PRELUDE_TABLE@
+
+fn blob_sv(a: mut_view<Arena>, idx: usize) -> StrView {
+    let start = CASE_OFF[idx] as usize;
+    let end = CASE_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = CASE_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn dump_sv(sv: StrView) {
+    let s: str = unsafe { *(address_of(sv) as *const str) };
+    print(s);
+}
+
+fn bytes_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if (unsafe { *(a + i) }) != (unsafe { *(b + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn empty_node_map() -> NodeMap {
+    NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+fn run_case(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    pre_out: mut_view<DiagBuffer>,
+    drop_out: mut_view<DiagBuffer>,
+    synth_out: mut_view<DiagBuffer>,
+    case_idx: usize
+) -> i32 {
+    session_init(mut_view(*sess));
+    let int_arena = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena;
+        thir_init(mut_view(*thir_ptr));
+    }
+    pre_out.len = 0;
+    drop_out.len = 0;
+    synth_out.len = 0;
+
+    let base = case_idx * 5;
+    let path_sv = blob_sv(mut_view(*scratch), base);
+    let src_sv = blob_sv(mut_view(*scratch), base + 1);
+    let exp_pre = blob_sv(mut_view(*scratch), base + 2);
+    let exp_drop = blob_sv(mut_view(*scratch), base + 3);
+    let exp_synth = blob_sv(mut_view(*scratch), base + 4);
+    let check_synth = CASE_SYNTH[case_idx] != 0u32;
+
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len },
+        mut_view(fid)
+    );
+    if CASE_PRELUDE[case_idx] != 0u32 {
+        session_append_std_prelude(
+            mut_view(*sess),
+            mut_view(*parse_arena),
+            mut_view(parse_res.ast),
+            StrView { ptr: src_sv.ptr, len: src_sv.len }
+        );
+    }
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(parse_res.ast), mut_view(*rmap));
+    let hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(parse_res.ast), view(*rmap));
+
+    let mut rc: i32 = 0;
+    if session_error_count(view(*sess)) != 0 {
+        ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), mut_view(*drop_out));
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- RESOLVE/HIR DIAG ---\n");
+        dump_sv(StrView { ptr: drop_out.ptr as *const u8, len: drop_out.len });
+        rc = 100 + (case_idx as i32);
+    } else {
+        unsafe {
+            session_typeck_into(mut_view(*sess), view(hir), mut_view(*thir_ptr));
+        }
+        if session_error_count(view(*sess)) != 0 {
+            ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), mut_view(*drop_out));
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- TYPECK DIAG ---\n");
+            dump_sv(StrView { ptr: drop_out.ptr as *const u8, len: drop_out.len });
+            rc = 200 + (case_idx as i32);
+        }
+    }
+
+    if rc == 0 {
+        let pre_ptr = unsafe { address_of_mut(pre_out.ptr) as *mut DiagBuffer };
+        let drop_ptr = unsafe { address_of_mut(drop_out.ptr) as *mut DiagBuffer };
+        let synth_ptr = if check_synth {
+            unsafe { address_of_mut(synth_out.ptr) as *mut DiagBuffer }
+        } else {
+            0 as *mut DiagBuffer
+        };
+        let fn_cnt = session_own_mir_verify_file_with_synth(
+            mut_view(*sess),
+            mut_view(*mir_arena),
+            view(hir),
+            unsafe { mut_view(*thir_ptr) },
+            fid,
+            0 as *mut MonoEngine,
+            true,
+            pre_ptr,
+            drop_ptr,
+            synth_ptr
+        );
+        if fn_cnt == 0 {
+            rc = 250 + (case_idx as i32);
+        } else if session_error_count(view(*sess)) != 0 {
+            unsafe {
+                (*drop_ptr).len = 0;
+                ax_diag_render_human(view(sess.diag_sink), view(sess.source_db), mut_view(*drop_ptr));
+            }
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- UNEXPECTED OWN/VERIFY DIAG ---\n");
+            unsafe {
+                dump_sv(StrView { ptr: (*drop_ptr).ptr as *const u8, len: (*drop_ptr).len });
+            }
+            rc = 260 + (case_idx as i32);
+        } else if !bytes_equal(pre_out.ptr as *const u8, pre_out.len, exp_pre.ptr, exp_pre.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- PRE-DROP MIR ACTUAL ---\n");
+            dump_sv(StrView { ptr: pre_out.ptr as *const u8, len: pre_out.len });
+            print("--- EXPECTED ---\n");
+            dump_sv(exp_pre);
+            rc = 300 + (case_idx as i32);
+        } else if !bytes_equal(drop_out.ptr as *const u8, drop_out.len, exp_drop.ptr, exp_drop.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- POST-DROP MIR ACTUAL ---\n");
+            dump_sv(StrView { ptr: drop_out.ptr as *const u8, len: drop_out.len });
+            print("--- EXPECTED ---\n");
+            dump_sv(exp_drop);
+            rc = 400 + (case_idx as i32);
+        } else if check_synth && !bytes_equal(synth_out.ptr as *const u8, synth_out.len, exp_synth.ptr, exp_synth.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- SYNTH DESTRUCTOR MIR ACTUAL ---\n");
+            dump_sv(StrView { ptr: synth_out.ptr as *const u8, len: synth_out.len });
+            print("--- EXPECTED ---\n");
+            dump_sv(exp_synth);
+            rc = 500 + (case_idx as i32);
+        }
+    }
+
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+    rc
+}
+
+fn new_arena(chunk: usize) -> Arena {
+    let mut a = arena_with_chunk_size(chunk);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+    a
+}
+
+fn new_buf(perm: mut_view<Arena>) -> DiagBuffer {
+    let mut b = diag_buf_new();
+    let p = arena_alloc_raw(perm, 65536, 1);
+    b.ptr = p;
+    b.cap = 65536;
+    b
+}
+
+pub fn main() -> i32 {
+    let mut sess = session_new();
+    let mut perm_arena = new_arena(262144);
+    let mut parse_arena = new_arena(262144);
+    let mut resolve_arena = new_arena(262144);
+    let mut hir_arena = new_arena(262144);
+    let mut mir_arena = new_arena(262144);
+    let mut scratch = new_arena(65536);
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    let mut pre_out = new_buf(mut_view(perm_arena));
+    let mut drop_out = new_buf(mut_view(perm_arena));
+    let mut synth_out = new_buf(mut_view(perm_arena));
+    let mut rmap = ResolveMap {
+        node_map: empty_node_map(),
+        module_access_nodes: empty_node_map(),
+        extern_nodes: empty_node_map(),
+        next_symbol_v: 1u32,
+        next_std_symbol_v: 10000u32,
+        naming_ctx: 0 as *mut NamingCtx,
+    };
+
+    let mut idx: usize = 0;
+    while idx < CASE_COUNT {
+        let rc = run_case(
+            mut_view(sess),
+            mut_view(parse_arena),
+            mut_view(resolve_arena),
+            mut_view(hir_arena),
+            mut_view(mir_arena),
+            mut_view(scratch),
+            mut_view(rmap),
+            thir_ptr,
+            mut_view(pre_out),
+            mut_view(drop_out),
+            mut_view(synth_out),
+            idx
+        );
+        if rc != 0 {
+            return rc;
+        }
+        idx = idx + 1;
+    }
+
+    arena_destroy(mut_view(scratch));
+    arena_destroy(mut_view(mir_arena));
+    arena_destroy(mut_view(hir_arena));
+    arena_destroy(mut_view(resolve_arena));
+    arena_destroy(mut_view(parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK own_mir_verify @GROUP@ (@CASE_COUNT@ cases)\n");
+    0
+}

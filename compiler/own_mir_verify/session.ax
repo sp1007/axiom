@@ -1,0 +1,739 @@
+// Session-level integration for ownership, capability, unsafe checking, MIR lowering,
+// drop elaboration, and MIR verification (T082).
+// Wires compiler.own, compiler.mir, and compiler.verify into CompilerSession.
+module compiler.own_mir_verify.session
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.interner_get
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.source.span.Span
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_span_text
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.AX_TYPE_STORED_VIEW_ESCAPE
+use compiler.diag.code.AX_TYPE_STORED_VIEW_SELF_REF
+use compiler.diag.format.DiagBuffer
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_has_errors
+use compiler.kernel_source_diag.session.session_render_human
+use compiler.kernel_source_diag.session.session_render_json
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_STRUCT
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_TRAIT
+use compiler.hir.hir.HIR_TYPE_VIEW
+use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.hir.hir.HirFieldDecl
+use compiler.hir.hir.HirType
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.hir_alloc_item
+use compiler.hir.hir.hir_alloc_type
+use compiler.types.types.TY_VIEW
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_ENUM
+use compiler.types.types.Thir
+use compiler.types.types.type_get
+use compiler.types.types.thir_get_item_type
+use compiler.traits.mono.MonoEngine
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_print
+use compiler.mir.builder.mir_build_fn
+use compiler.mir.drop.mir_drop_elaborate
+use compiler.own.move.own_type_is_copy
+use compiler.own.cap.own_cap_check
+use compiler.own.init.own_check
+use compiler.own.unsafe.unsafe_check
+use compiler.verify.verifier.verify_mir
+use compiler.verify.verifier.verify_mir_own
+use compiler.verify.verifier.verify_mir_cap
+use compiler.verify.verifier.verify_mir_drop_flags
+use compiler.verify.verifier.verify_mir_text
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+const SYNTH_DROP_SYMBOL: u32 = 7001u32;
+const SYNTH_NAMES: [13]u8 = [68u8, 114u8, 111u8, 112u8, 71u8, 117u8, 97u8, 114u8, 100u8, 100u8, 114u8, 111u8, 112u8];
+
+const MSG_STORED_VIEW_SELF_REF: [69]u8 = [
+    115u8, 101u8, 108u8, 102u8, 45u8, 114u8, 101u8, 102u8, 101u8, 114u8, 101u8, 110u8, 99u8, 105u8, 110u8, 103u8,
+    32u8, 115u8, 116u8, 111u8, 114u8, 101u8, 100u8, 32u8, 118u8, 105u8, 101u8, 119u8, 115u8, 32u8, 119u8, 105u8,
+    116u8, 104u8, 105u8, 110u8, 32u8, 116u8, 104u8, 101u8, 32u8, 115u8, 97u8, 109u8, 101u8, 32u8, 115u8, 116u8,
+    114u8, 117u8, 99u8, 116u8, 32u8, 97u8, 114u8, 101u8, 32u8, 102u8, 111u8, 114u8, 98u8, 105u8, 100u8, 100u8,
+    101u8, 110u8, 0u8, 0u8, 0u8
+];
+
+const MSG_STORED_VIEW_ESCAPE: [58]u8 = [
+    115u8, 116u8, 111u8, 114u8, 101u8, 100u8, 32u8, 118u8, 105u8, 101u8, 119u8, 32u8, 109u8, 105u8, 103u8, 104u8,
+    116u8, 32u8, 111u8, 117u8, 116u8, 108u8, 105u8, 118u8, 101u8, 32u8, 116u8, 104u8, 101u8, 32u8, 111u8, 119u8,
+    110u8, 101u8, 114u8, 32u8, 111u8, 102u8, 32u8, 116u8, 104u8, 101u8, 32u8, 114u8, 101u8, 102u8, 101u8, 114u8,
+    101u8, 110u8, 99u8, 101u8, 100u8, 32u8, 100u8, 97u8, 116u8, 97u8
+];
+
+fn interner_mut_ptr(s: mut_view<StrInterner>) -> *mut StrInterner {
+    unsafe { address_of_mut(s.bytes.head) as *mut StrInterner }
+}
+
+fn source_db_const_ptr(db: view<SourceDatabase>) -> *const SourceDatabase {
+    unsafe { address_of(db.arena.head) as *const SourceDatabase }
+}
+
+fn thir_mut_ptr(t: mut_view<Thir>) -> *mut Thir {
+    unsafe { address_of_mut(t.interner.arena.head) as *mut Thir }
+}
+
+fn thir_const_ptr(t: view<Thir>) -> *const Thir {
+    unsafe { address_of(t.interner.arena.head) as *const Thir }
+}
+
+fn hir_const_ptr(h: view<HirFile>) -> *const HirFile {
+    unsafe { address_of(h.items) as *const HirFile }
+}
+
+fn diag_buf_mut_ptr(b: mut_view<DiagBuffer>) -> *mut DiagBuffer {
+    unsafe { address_of_mut(b.ptr) as *mut DiagBuffer }
+}
+
+fn sv_equals(a: view<StrView>, b: view<StrView>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if (unsafe { *(a.ptr + i) }) != (unsafe { *(b.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn emit_stored_view_diag(sink: mut_view<DiagSink>, code_v: u32, sp: view<Span>) {
+    let mut msg_len: usize = 58;
+    if code_v == AX_TYPE_STORED_VIEW_SELF_REF {
+        msg_len = 66;
+    }
+    let buf = arena_alloc_raw(mut_view(sink.arena), msg_len + 1, 1);
+    let mut i: usize = 0;
+    if code_v == AX_TYPE_STORED_VIEW_SELF_REF {
+        while i < 66 {
+            unsafe { *(buf + i) = MSG_STORED_VIEW_SELF_REF[i]; }
+            i = i + 1;
+        }
+    } else {
+        while i < 58 {
+            unsafe { *(buf + i) = MSG_STORED_VIEW_ESCAPE[i]; }
+            i = i + 1;
+        }
+    }
+    unsafe { *(buf + msg_len) = 0u8; }
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf as *const u8, len: msg_len },
+        primary: Span { file: FileId { v: sp.file.v }, start: sp.start, end: sp.end },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(sink, view(d));
+}
+
+fn type_contains_view(thir: view<Thir>, id_v: u32, target_v: u32) -> bool {
+    if id_v == 0u32 {
+        return false;
+    }
+    let ty = type_get(view(thir.interner), (TypeId { v: id_v }));
+    if (ty as usize) == 0 {
+        return false;
+    }
+    let k = unsafe { (*ty).kind };
+    if k == TY_VIEW || k == TY_MUT_VIEW {
+        let pt_v = unsafe { (*ty).pointee.v };
+        if target_v == 0u32 || pt_v == target_v {
+            return true;
+        }
+        return type_contains_view(thir, pt_v, target_v);
+    }
+    if k == TY_ARRAY {
+        let el_v = unsafe { (*ty).elem.v };
+        return type_contains_view(thir, el_v, target_v);
+    }
+    if k == TY_TUPLE || k == TY_STRUCT {
+        if k == TY_STRUCT && target_v != 0u32 && id_v == target_v {
+            return false;
+        }
+        let fcnt = unsafe { (*ty).field_count };
+        let flds = unsafe { (*ty).fields };
+        let mut i: usize = 0;
+        while i < fcnt {
+            let f_ptr = ((flds as usize) + (i * size_of<TypeId>())) as *const TypeId;
+            let fid_v = unsafe { (*f_ptr).v };
+            if type_contains_view(thir, fid_v, target_v) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    if k == TY_ENUM {
+        if target_v != 0u32 && id_v == target_v {
+            return false;
+        }
+        let vcnt = unsafe { (*ty).variant_count };
+        let vflds = unsafe { (*ty).variant_fields };
+        let vfcnts = unsafe { (*ty).variant_field_counts };
+        let mut i: usize = 0;
+        while i < vcnt {
+            let fc_ptr = ((vfcnts as usize) + (i * size_of<usize>())) as *const usize;
+            let fc = unsafe { *fc_ptr };
+            let vf_ptr = ((vflds as usize) + (i * size_of<*mut TypeId>())) as *const *mut TypeId;
+            let vf = unsafe { *vf_ptr };
+            let mut j: usize = 0;
+            while j < fc {
+                let f_ptr = ((vf as usize) + (j * size_of<TypeId>())) as *const TypeId;
+                let fid_v = unsafe { (*f_ptr).v };
+                if type_contains_view(thir, fid_v, target_v) {
+                    return true;
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+    false
+}
+
+fn check_fn_stored_view_escape(sess: mut_view<CompilerSession>, thir: view<Thir>, it: *const HirItem) {
+    let rty_node = unsafe { (*it).ret_type };
+    if (rty_node as usize) == 0 {
+        return;
+    }
+    let fn_ty_ptr = thir_get_item_type(thir, it);
+    if (fn_ty_ptr as usize) == 0 {
+        return;
+    }
+    let fn_ty_v = unsafe { (*fn_ty_ptr).v };
+    let fn_ty = type_get(view(thir.interner), (TypeId { v: fn_ty_v }));
+    if (fn_ty as usize) == 0 {
+        return;
+    }
+    let ret_ty_v = unsafe { (*fn_ty).ret_type.v };
+    if type_contains_view(thir, ret_ty_v, 0u32) {
+        let sp = unsafe { (*rty_node).span };
+        emit_stored_view_diag(mut_view(sess.diag_sink), AX_TYPE_STORED_VIEW_ESCAPE, view(sp));
+    }
+}
+
+fn session_stored_view_check(
+    sess: mut_view<CompilerSession>,
+    hir: view<HirFile>,
+    thir: view<Thir>
+) {
+    let mut it: *const HirItem = hir.items as *const HirItem;
+    while (it as usize) != 0 {
+        let k = unsafe { (*it).kind };
+        if k == HIR_ITEM_STRUCT {
+            let it_name_v = unsafe { (*it).name.v };
+            let it_name = interner_get(view(sess.interner), (StrId { v: it_name_v }));
+            let mut f: *const HirFieldDecl = unsafe { (*it).struct_fields as *const HirFieldDecl };
+            while (f as usize) != 0 {
+                let fty: *const HirType = unsafe { (*f).ty as *const HirType };
+                if (fty as usize) != 0 && (unsafe { (*fty).kind }) == HIR_TYPE_VIEW {
+                    let elem: *const HirType = unsafe { (*fty).elem as *const HirType };
+                    if (elem as usize) != 0 && (unsafe { (*elem).kind }) == HIR_TYPE_PATH {
+                        let pspan = unsafe { (*elem).path.span };
+                        let mut pname = source_db_span_text(view(sess.source_db), pspan);
+                        if pname.len == 0 {
+                            let pn_v = unsafe { (*elem).path.name.v };
+                            if pn_v != 0u32 {
+                                pname = interner_get(view(sess.interner), (StrId { v: pn_v }));
+                            }
+                        }
+                        if sv_equals(view(pname), view(it_name)) {
+                            let fspan = unsafe { (*f).span };
+                            emit_stored_view_diag(
+                                mut_view(sess.diag_sink),
+                                AX_TYPE_STORED_VIEW_SELF_REF,
+                                view(fspan)
+                            );
+                            break;
+                        }
+                    }
+                }
+                f = unsafe { (*f).next as *const HirFieldDecl };
+            }
+        }
+        it = unsafe { (*it).next as *const HirItem };
+    }
+
+    it = hir.items as *const HirItem;
+    while (it as usize) != 0 {
+        let k = unsafe { (*it).kind };
+        if k == HIR_ITEM_FN && (unsafe { (*it).symbol.v }) != 0u32 && (unsafe { (*it).span.file.v }) != 0u32 {
+            check_fn_stored_view_escape(mut_view(*sess), thir, it);
+        } else if k == HIR_ITEM_IMPL || k == HIR_ITEM_TRAIT {
+            let mut m: *const HirItem = unsafe { (*it).members as *const HirItem };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    check_fn_stored_view_escape(mut_view(*sess), thir, m);
+                }
+                m = unsafe { (*m).next as *const HirItem };
+            }
+        }
+        it = unsafe { (*it).next as *const HirItem };
+    }
+}
+
+pub fn session_unsafe_check(
+    sess: mut_view<CompilerSession>,
+    hir: view<HirFile>,
+    thir: view<Thir>
+) -> bool {
+    session_stored_view_check(mut_view(*sess), hir, thir);
+    if session_has_errors(view(*sess)) {
+        return false;
+    }
+    unsafe_check(hir, thir, mut_view(sess.diag_sink), view(sess.interner));
+    !session_has_errors(view(*sess))
+}
+
+pub fn session_mark_body_copy_locals(
+    sess: view<CompilerSession>,
+    body: mut_view<MirBody>,
+    thir: view<Thir>
+) {
+    let mut l: usize = 0;
+    while l < body.local_count {
+        let ldecl = unsafe { mir_local_at(body.locals, l) };
+        let lty_v = unsafe { (*ldecl).ty.v };
+        let _ = own_type_is_copy(TypeId { v: lty_v }, thir, view(sess.interner));
+        unsafe {
+            if (*ldecl).location.file.v == 0u32 && (*ldecl).span.file.v != 0u32 {
+                (*ldecl).location.file.v = (*ldecl).span.file.v;
+                (*ldecl).location.start = (*ldecl).span.start;
+                (*ldecl).location.end = (*ldecl).span.end;
+            }
+        }
+        l = l + 1;
+    }
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            unsafe {
+                if (*st).location.file.v == 0u32 && (*st).span.file.v != 0u32 {
+                    (*st).location.file.v = (*st).span.file.v;
+                    (*st).location.start = (*st).span.start;
+                    (*st).location.end = (*st).span.end;
+                }
+            }
+            s = s + 1;
+        }
+        unsafe {
+            if (*bb).terminator.location.file.v == 0u32 && (*bb).terminator.span.file.v != 0u32 {
+                (*bb).terminator.location.file.v = (*bb).terminator.span.file.v;
+                (*bb).terminator.location.start = (*bb).terminator.span.start;
+                (*bb).terminator.location.end = (*bb).terminator.span.end;
+            }
+        }
+        b = b + 1;
+    }
+}
+
+pub fn session_own_check_body(
+    sess: mut_view<CompilerSession>,
+    it: *const HirItem,
+    body: mut_view<MirBody>,
+    thir: view<Thir>
+) -> bool {
+    session_mark_body_copy_locals(view(*sess), mut_view(*body), thir);
+    own_check(it, mut_view(*body), thir, mut_view(sess.diag_sink), view(sess.interner));
+    if !session_has_errors(view(*sess)) {
+        let thir_ptr = thir_const_ptr(thir);
+        verify_mir_own(view(*body), thir_ptr, mut_view(sess.diag_sink), it);
+        verify_mir_cap(view(*body), thir_ptr, mut_view(sess.diag_sink));
+    }
+    !session_has_errors(view(*sess))
+}
+
+pub fn session_drop_elaborate_body(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    body: mut_view<MirBody>,
+    thir: mut_view<Thir>,
+    hir: view<HirFile>
+) {
+    let db_ptr = source_db_const_ptr(view(sess.source_db));
+    mir_drop_elaborate(
+        mut_view(*body),
+        mut_view(*thir),
+        hir,
+        db_ptr,
+        view(sess.interner),
+        mut_view(*mir_arena)
+    );
+}
+
+pub fn session_verify_elaborated_body(
+    sess: mut_view<CompilerSession>,
+    it: *const HirItem,
+    body: view<MirBody>,
+    thir: view<Thir>
+) -> bool {
+    let thir_ptr = thir_const_ptr(thir);
+    verify_mir(body, thir_ptr, mut_view(sess.diag_sink), it);
+    verify_mir_own(body, thir_ptr, mut_view(sess.diag_sink), it);
+    verify_mir_cap(body, thir_ptr, mut_view(sess.diag_sink));
+    verify_mir_drop_flags(body, thir_ptr, mut_view(sess.diag_sink), it);
+    !session_has_errors(view(*sess))
+}
+
+pub fn session_own_mir_verify_fn(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    it: *mut HirItem,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    mono: *mut MonoEngine,
+    run_drop_elab: bool,
+    pre_mir_out: *mut DiagBuffer,
+    elab_mir_out: *mut DiagBuffer
+) -> *mut MirBody {
+    let thir_ptr = thir_mut_ptr(mut_view(*thir));
+    let hir_ptr = hir_const_ptr(hir);
+    let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));
+    let db_ptr = source_db_const_ptr(view(sess.source_db));
+
+    let body = mir_build_fn(
+        mut_view(*mir_arena),
+        it,
+        thir_ptr,
+        hir_ptr,
+        str_in_ptr,
+        db_ptr,
+        mono
+    );
+    if (body as usize) == 0 {
+        return 0 as *mut MirBody;
+    }
+
+    if (pre_mir_out as usize) != 0 {
+        unsafe {
+            mir_print(mut_view(*pre_mir_out), view(*body));
+        }
+    }
+
+    verify_mir(
+        unsafe { view(*body) },
+        thir_ptr as *const Thir,
+        mut_view(sess.diag_sink),
+        it as *const HirItem
+    );
+
+    let _ = session_own_check_body(
+        mut_view(*sess),
+        it as *const HirItem,
+        unsafe { mut_view(*body) },
+        view(*thir)
+    );
+
+    if run_drop_elab && !session_has_errors(view(*sess)) {
+        session_drop_elaborate_body(
+            mut_view(*sess),
+            mut_view(*mir_arena),
+            unsafe { mut_view(*body) },
+            mut_view(*thir),
+            hir
+        );
+        if !session_has_errors(view(*sess)) {
+            verify_mir_drop_flags(
+                unsafe { view(*body) },
+                thir_ptr as *const Thir,
+                mut_view(sess.diag_sink),
+                it as *const HirItem
+            );
+        }
+        if (elab_mir_out as usize) != 0 {
+            unsafe {
+                mir_print(mut_view(*elab_mir_out), view(*body));
+            }
+        }
+    }
+
+    body
+}
+
+fn zero_span() -> Span {
+    Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+}
+
+fn intern_synth_name(arena: mut_view<Arena>, str_in: *mut StrInterner, start: usize, slen: usize) -> StrId {
+    let bytes = arena_alloc_raw(mut_view(*arena), slen, 1);
+    let mut i: usize = 0;
+    while i < slen {
+        unsafe {
+            *(bytes + i) = SYNTH_NAMES[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe { interner_intern_bytes(mut_view(*str_in), bytes as *const u8, slen) }
+}
+
+fn synthesize_guard_drop_impl(arena: mut_view<Arena>, str_in: *mut StrInterner, hir: mut_view<HirFile>) {
+    let trait_path: *mut HirType = hir_alloc_type(mut_view(*arena), HIR_TYPE_PATH, zero_span());
+    let self_type: *mut HirType = hir_alloc_type(mut_view(*arena), HIR_TYPE_PATH, zero_span());
+    let method: *mut HirItem = hir_alloc_item(mut_view(*arena), HIR_ITEM_FN, zero_span());
+    let imp: *mut HirItem = hir_alloc_item(mut_view(*arena), HIR_ITEM_IMPL, zero_span());
+    let drop_trait_name = intern_synth_name(mut_view(*arena), str_in, 0, 4);
+    let guard_name = intern_synth_name(mut_view(*arena), str_in, 4, 5);
+    let drop_fn_name = intern_synth_name(mut_view(*arena), str_in, 9, 4);
+    unsafe {
+        (*trait_path).path.name.v = drop_trait_name.v;
+        (*self_type).path.name.v = guard_name.v;
+        (*method).name.v = drop_fn_name.v;
+        (*method).symbol.v = SYNTH_DROP_SYMBOL;
+        (*imp).trait_path = trait_path;
+        (*imp).self_type = self_type;
+        (*imp).members = method;
+        (*imp).next = hir.items;
+    }
+    hir.items = imp;
+}
+
+pub fn session_own_mir_verify_file_with_synth(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    mono: *mut MonoEngine,
+    run_drop_elab: bool,
+    pre_mir_out: *mut DiagBuffer,
+    elab_mir_out: *mut DiagBuffer,
+    synth_mir_out: *mut DiagBuffer
+) -> usize {
+    if !session_unsafe_check(mut_view(*sess), hir, view(*thir)) {
+        return 0;
+    }
+
+    let thir_ptr = thir_mut_ptr(mut_view(*thir));
+    let str_in_ptr = interner_mut_ptr(mut_view(sess.interner));
+
+    let mut fn_count: usize = 0;
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let it_file = unsafe { (*it).span.file.v };
+        let is_fn = (unsafe { (*it).kind }) == HIR_ITEM_FN;
+        if is_fn && (main_fid.v == 0u32 || it_file == 0u32 || it_file == main_fid.v) {
+            let body = session_own_mir_verify_fn(
+                mut_view(*sess),
+                mut_view(*mir_arena),
+                it,
+                hir,
+                mut_view(*thir),
+                mono,
+                run_drop_elab,
+                pre_mir_out,
+                elab_mir_out
+            );
+            if (body as usize) != 0 {
+                fn_count = fn_count + 1;
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+
+    if run_drop_elab && (synth_mir_out as usize) != 0 && !session_has_errors(view(*sess)) {
+        let mut synth_hir = HirFile { items: hir.items };
+        synthesize_guard_drop_impl(mut_view(*mir_arena), str_in_ptr, mut_view(synth_hir));
+        let synth_hir_ptr = hir_const_ptr(view(synth_hir));
+        let null_db = 0 as *const SourceDatabase;
+        let mut sit: *mut HirItem = synth_hir.items;
+        while (sit as usize) != 0 {
+            let sit_file = unsafe { (*sit).span.file.v };
+            let is_fn = (unsafe { (*sit).kind }) == HIR_ITEM_FN;
+            if is_fn && (main_fid.v == 0u32 || sit_file == 0u32 || sit_file == main_fid.v) {
+                let synth_body = mir_build_fn(
+                    mut_view(*mir_arena),
+                    sit,
+                    thir_ptr,
+                    synth_hir_ptr,
+                    str_in_ptr,
+                    null_db,
+                    mono
+                );
+                if (synth_body as usize) != 0 {
+                    mir_drop_elaborate(
+                        unsafe { mut_view(*synth_body) },
+                        mut_view(*thir),
+                        view(synth_hir),
+                        null_db,
+                        view(sess.interner),
+                        mut_view(*mir_arena)
+                    );
+                    unsafe {
+                        mir_print(mut_view(*synth_mir_out), view(*synth_body));
+                    }
+                }
+            }
+            sit = unsafe { (*sit).next };
+        }
+    }
+
+    fn_count
+}
+
+pub fn session_own_mir_verify_file(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    mono: *mut MonoEngine,
+    run_drop_elab: bool,
+    pre_mir_out: *mut DiagBuffer,
+    elab_mir_out: *mut DiagBuffer
+) -> usize {
+    session_own_mir_verify_file_with_synth(
+        sess,
+        mir_arena,
+        hir,
+        thir,
+        main_fid,
+        mono,
+        run_drop_elab,
+        pre_mir_out,
+        elab_mir_out,
+        0 as *mut DiagBuffer
+    )
+}
+
+pub fn session_emit_mir(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    out: mut_view<DiagBuffer>
+) -> usize {
+    let out_ptr = diag_buf_mut_ptr(out);
+    session_own_mir_verify_file(
+        sess,
+        mir_arena,
+        hir,
+        thir,
+        main_fid,
+        0 as *mut MonoEngine,
+        true,
+        out_ptr,
+        0 as *mut DiagBuffer
+    )
+}
+
+pub fn session_verify_mir_text(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    fid: FileId,
+    text: StrView
+) -> bool {
+    let _ = arena;
+    let _ = fid;
+    verify_mir_text(text, mut_view(sess.diag_sink))
+}
+
+pub fn session_own_mir_verify_and_render_human(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    out: mut_view<DiagBuffer>
+) {
+    let _ = session_own_mir_verify_file(
+        mut_view(*sess),
+        mir_arena,
+        hir,
+        thir,
+        main_fid,
+        0 as *mut MonoEngine,
+        true,
+        0 as *mut DiagBuffer,
+        0 as *mut DiagBuffer
+    );
+    session_render_human(sess, out);
+}
+
+pub fn session_own_mir_verify_and_render_json(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    out: mut_view<DiagBuffer>
+) {
+    let _ = session_own_mir_verify_file(
+        mut_view(*sess),
+        mir_arena,
+        hir,
+        thir,
+        main_fid,
+        0 as *mut MonoEngine,
+        true,
+        0 as *mut DiagBuffer,
+        0 as *mut DiagBuffer
+    );
+    session_render_json(sess, out);
+}
+
+pub fn session_verify_mir_text_and_render_human(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    fid: FileId,
+    text: StrView,
+    out: mut_view<DiagBuffer>
+) {
+    let _ = session_verify_mir_text(mut_view(*sess), arena, fid, text);
+    session_render_human(sess, out);
+}
+
+pub fn session_verify_mir_text_and_render_json(
+    sess: mut_view<CompilerSession>,
+    arena: mut_view<Arena>,
+    fid: FileId,
+    text: StrView,
+    out: mut_view<DiagBuffer>
+) {
+    let _ = session_verify_mir_text(mut_view(*sess), arena, fid, text);
+    session_render_json(sess, out);
+}

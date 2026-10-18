@@ -1,0 +1,740 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrView
+use compiler.diag.code.AX_VERIFY_UNTERMINATED_BLOCK
+use compiler.diag.code.AX_VERIFY_BAD_TARGET
+use compiler.diag.code.AX_VERIFY_UNINIT_USE
+use compiler.diag.code.AX_VERIFY_USE_AFTER_MOVE
+use compiler.diag.code.AX_VERIFY_DOUBLE_DROP
+use compiler.diag.code.AX_VERIFY_MISSING_DROP
+use compiler.diag.code.AX_VERIFY_TYPE_MISMATCH
+use compiler.diag.code.AX_VERIFY_UNKNOWN_LOCAL
+use compiler.diag.code.AX_VERIFY_RETURN_TYPE
+use compiler.diag.code.AX_VERIFY_CALL_SIGNATURE
+use compiler.diag.code.AX_VERIFY_MIR_SYNTAX
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
+use compiler.diag.code.AX_INIT_USE_UNINIT
+use compiler.diag.code.AX_CAP_OUTLIVES_OWNER
+use compiler.diag.code.AX_CAP_CONFLICT_MUT
+use compiler.diag.code.AX_CAP_CONFLICT_READ
+use compiler.diag.code.AX_UNSAFE_REQUIRED
+use compiler.diag.code.AX_TYPE_STORED_VIEW_SELF_REF
+use compiler.diag.code.AX_TYPE_STORED_VIEW_ESCAPE
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_new
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.kernel_source_diag.session.session_add_virtual_file
+use compiler.kernel_source_diag.session.session_render_human
+use compiler.kernel_source_diag.session.session_render_json
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.typeck.session.session_typeck_into
+use compiler.traits.mono.MonoEngine
+use compiler.own_mir_verify.session_emit_mir
+use compiler.own_mir_verify.session_own_mir_verify_fn
+use compiler.own_mir_verify.session_verify_elaborated_body
+use compiler.own_mir_verify.session_own_mir_verify_and_render_human
+use compiler.own_mir_verify.session_own_mir_verify_and_render_json
+use compiler.own_mir_verify.session_verify_mir_text_and_render_human
+use compiler.own_mir_verify.session_verify_mir_text_and_render_json
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+const AX_CASE_COUNT: usize = @AX_CASE_COUNT@;
+const MIR_CASE_COUNT: usize = @MIR_CASE_COUNT@;
+
+@AX_DATA_TABLE@
+@AX_OFFSET_TABLE@
+@AX_EXP_COUNTS@
+@AX_EXP_OFF@
+@AX_EXP_CODES@
+@AX_EXP_MOVED_LBL@
+
+@MIR_DATA_TABLE@
+@MIR_OFFSET_TABLE@
+@MIR_EXP_COUNTS@
+@MIR_EXP_OFF@
+@MIR_EXP_CODES@
+
+fn ax_blob_sv(a: mut_view<Arena>, idx: usize) -> StrView {
+    let start = AX_OFF[idx] as usize;
+    let end = AX_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = AX_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn mir_blob_sv(a: mut_view<Arena>, idx: usize) -> StrView {
+    let start = MIR_OFF[idx] as usize;
+    let end = MIR_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = MIR_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+unsafe fn diag_at(base: *mut Diagnostic, idx: usize) -> *mut Diagnostic {
+    let off = ((idx as isize) * (size_of<Diagnostic>() as isize)) as usize;
+    ((base as usize) + off) as *mut Diagnostic
+}
+
+fn dump_sv(sv: StrView) {
+    let s: str = unsafe { *(address_of(sv) as *const str) };
+    print(s);
+}
+
+fn bytes_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if (unsafe { *(a + i) }) != (unsafe { *(b + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn empty_node_map() -> NodeMap {
+    NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+fn run_ax_diag_case(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    human_out: mut_view<DiagBuffer>,
+    json_out: mut_view<DiagBuffer>,
+    case_idx: usize
+) -> i32 {
+    session_init(mut_view(*sess));
+    let int_arena = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena;
+        thir_init(mut_view(*thir_ptr));
+    }
+    human_out.len = 0;
+    json_out.len = 0;
+
+    let base = case_idx * 3;
+    let path_sv = ax_blob_sv(mut_view(*scratch), base);
+    let src_sv = ax_blob_sv(mut_view(*scratch), base + 1);
+    let exp_human = ax_blob_sv(mut_view(*scratch), base + 2);
+
+    let mut fid = FileId { v: 0u32 };
+    let parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len },
+        mut_view(fid)
+    );
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(parse_res.ast), mut_view(*rmap));
+    let hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(parse_res.ast), view(*rmap));
+    unsafe {
+        session_typeck_into(mut_view(*sess), view(hir), mut_view(*thir_ptr));
+    }
+
+    session_own_mir_verify_and_render_human(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        view(hir),
+        unsafe { mut_view(*thir_ptr) },
+        FileId { v: fid.v },
+        mut_view(*human_out)
+    );
+    session_render_json(mut_view(*sess), mut_view(*json_out));
+
+    let exp_cnt = AX_EXP_COUNTS[case_idx] as usize;
+    let code_base = AX_EXP_OFF[case_idx] as usize;
+    let mut rc: i32 = 0;
+
+    if sess.diag_sink.len != exp_cnt {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- DIAG COUNT MISMATCH ---\n");
+        dump_sv(StrView { ptr: human_out.ptr as *const u8, len: human_out.len });
+        rc = 100 + (case_idx as i32);
+    } else {
+        let mut j: usize = 0;
+        while j < exp_cnt {
+            let d = unsafe { diag_at(sess.diag_sink.diags, j) };
+            let got_code = unsafe { (*d).code.v };
+            let want_code = AX_EXP_CODES[code_base + j];
+            if got_code != want_code {
+                dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+                print("\n--- DIAG CODE MISMATCH ---\n");
+                dump_sv(StrView { ptr: human_out.ptr as *const u8, len: human_out.len });
+                rc = 200 + (case_idx as i32);
+                break;
+            }
+            j = j + 1;
+        }
+    }
+
+    if rc == 0 && AX_EXP_MOVED_LBL[case_idx] != 0u32 {
+        let d0 = unsafe { diag_at(sess.diag_sink.diags, 0) };
+        let lcnt = unsafe { (*d0).label_count };
+        let lbls = unsafe { (*d0).labels as *const DiagLabel };
+        if lcnt == 0 || (lbls as usize) == 0 {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- MISSING MOVED HERE LABEL ---\n");
+            rc = 250 + (case_idx as i32);
+        } else {
+            let lmsg = unsafe { (*lbls).message };
+            let lspan = unsafe { (*lbls).span };
+            if lmsg.len != 10 || lspan.file.v == 0u32 {
+                dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+                print("\n--- BAD MOVED HERE LABEL ---\n");
+                rc = 260 + (case_idx as i32);
+            }
+        }
+    }
+
+    if rc == 0 && !bytes_equal(human_out.ptr as *const u8, human_out.len, exp_human.ptr, exp_human.len) {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- HUMAN DIAG ACTUAL ---\n");
+        dump_sv(StrView { ptr: human_out.ptr as *const u8, len: human_out.len });
+        print("--- EXPECTED ---\n");
+        dump_sv(exp_human);
+        rc = 300 + (case_idx as i32);
+    }
+
+    if rc == 0 && json_out.len == 0 {
+        rc = 350 + (case_idx as i32);
+    }
+
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+    rc
+}
+
+fn run_mir_diag_case(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    human_out: mut_view<DiagBuffer>,
+    case_idx: usize
+) -> i32 {
+    session_init(mut_view(*sess));
+    human_out.len = 0;
+
+    let base = case_idx * 2;
+    let path_sv = mir_blob_sv(mut_view(*scratch), base);
+    let src_sv = mir_blob_sv(mut_view(*scratch), base + 1);
+    let fid = session_add_virtual_file(
+        mut_view(*sess),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len }
+    );
+
+    session_verify_mir_text_and_render_human(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        fid,
+        src_sv,
+        mut_view(*human_out)
+    );
+
+    let exp_cnt = MIR_EXP_COUNTS[case_idx] as usize;
+    let code_base = MIR_EXP_OFF[case_idx] as usize;
+    let mut rc: i32 = 0;
+
+    if sess.diag_sink.len != exp_cnt {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- MIR VERIFY DIAG COUNT MISMATCH ---\n");
+        dump_sv(StrView { ptr: human_out.ptr as *const u8, len: human_out.len });
+        rc = 500 + (case_idx as i32);
+    } else {
+        let mut j: usize = 0;
+        while j < exp_cnt {
+            let d = unsafe { diag_at(sess.diag_sink.diags, j) };
+            let got_code = unsafe { (*d).code.v };
+            let want_code = MIR_EXP_CODES[code_base + j];
+            if got_code != want_code {
+                dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+                print("\n--- MIR VERIFY DIAG CODE MISMATCH ---\n");
+                rc = 600 + (case_idx as i32);
+                break;
+            }
+            j = j + 1;
+        }
+    }
+
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+    rc
+}
+
+const QA_SEAM_DATA: [324]u8 = [
+    113u8, 97u8, 95u8, 114u8, 111u8, 117u8, 110u8, 100u8, 116u8, 114u8, 105u8, 112u8, 46u8, 97u8, 120u8, 102u8,
+    110u8, 32u8, 109u8, 97u8, 105u8, 110u8, 40u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 51u8, 50u8, 32u8,
+    123u8, 32u8, 114u8, 101u8, 116u8, 117u8, 114u8, 110u8, 32u8, 52u8, 48u8, 32u8, 43u8, 32u8, 50u8, 59u8,
+    32u8, 125u8, 10u8, 113u8, 97u8, 95u8, 101u8, 108u8, 97u8, 98u8, 95u8, 118u8, 101u8, 114u8, 105u8, 102u8,
+    121u8, 46u8, 97u8, 120u8, 115u8, 116u8, 114u8, 117u8, 99u8, 116u8, 32u8, 71u8, 117u8, 97u8, 114u8, 100u8,
+    32u8, 123u8, 32u8, 112u8, 58u8, 32u8, 42u8, 109u8, 117u8, 116u8, 32u8, 117u8, 56u8, 32u8, 125u8, 10u8,
+    102u8, 110u8, 32u8, 99u8, 111u8, 110u8, 100u8, 95u8, 109u8, 111u8, 118u8, 101u8, 40u8, 102u8, 108u8, 97u8,
+    103u8, 58u8, 32u8, 98u8, 111u8, 111u8, 108u8, 44u8, 32u8, 103u8, 58u8, 32u8, 71u8, 117u8, 97u8, 114u8,
+    100u8, 41u8, 32u8, 45u8, 62u8, 32u8, 105u8, 51u8, 50u8, 32u8, 123u8, 32u8, 105u8, 102u8, 32u8, 102u8,
+    108u8, 97u8, 103u8, 32u8, 123u8, 32u8, 108u8, 101u8, 116u8, 32u8, 104u8, 32u8, 61u8, 32u8, 103u8, 59u8,
+    32u8, 49u8, 32u8, 125u8, 32u8, 101u8, 108u8, 115u8, 101u8, 32u8, 123u8, 32u8, 48u8, 32u8, 125u8, 32u8,
+    125u8, 10u8, 113u8, 97u8, 95u8, 98u8, 114u8, 111u8, 107u8, 101u8, 110u8, 46u8, 109u8, 105u8, 114u8, 102u8,
+    110u8, 32u8, 98u8, 114u8, 111u8, 107u8, 101u8, 110u8, 40u8, 10u8, 113u8, 97u8, 95u8, 118u8, 105u8, 101u8,
+    119u8, 95u8, 101u8, 115u8, 99u8, 97u8, 112u8, 101u8, 46u8, 97u8, 120u8, 102u8, 110u8, 32u8, 101u8, 115u8,
+    99u8, 95u8, 116u8, 117u8, 112u8, 40u8, 120u8, 58u8, 32u8, 105u8, 51u8, 50u8, 41u8, 32u8, 45u8, 62u8,
+    32u8, 40u8, 105u8, 51u8, 50u8, 44u8, 32u8, 118u8, 105u8, 101u8, 119u8, 60u8, 105u8, 51u8, 50u8, 62u8,
+    41u8, 32u8, 123u8, 32u8, 40u8, 120u8, 44u8, 32u8, 118u8, 105u8, 101u8, 119u8, 40u8, 120u8, 41u8, 41u8,
+    32u8, 125u8, 10u8, 102u8, 110u8, 32u8, 101u8, 115u8, 99u8, 95u8, 97u8, 114u8, 114u8, 40u8, 120u8, 58u8,
+    32u8, 105u8, 51u8, 50u8, 41u8, 32u8, 45u8, 62u8, 32u8, 91u8, 49u8, 93u8, 118u8, 105u8, 101u8, 119u8,
+    60u8, 105u8, 51u8, 50u8, 62u8, 32u8, 123u8, 32u8, 91u8, 118u8, 105u8, 101u8, 119u8, 40u8, 120u8, 41u8,
+    93u8, 32u8, 125u8, 10u8,
+];
+
+const QA_SEAM_OFF: [9]u32 = [
+    0u32, 15u32, 51u32, 68u32, 178u32, 191u32, 202u32, 219u32, 324u32,
+];
+
+fn qa_seam_blob_sv(a: mut_view<Arena>, idx: usize) -> StrView {
+    let start = QA_SEAM_OFF[idx] as usize;
+    let end = QA_SEAM_OFF[idx + 1] as usize;
+    let n = end - start;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = QA_SEAM_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn copy_buf_to_sv(a: mut_view<Arena>, buf: view<DiagBuffer>) -> StrView {
+    let n = buf.len;
+    let dst = arena_alloc_raw(mut_view(*a), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = *(buf.ptr + i);
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn run_qa_boundary_seams(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    human_out: mut_view<DiagBuffer>,
+    json_out: mut_view<DiagBuffer>
+) -> i32 {
+    // Seam 1: session_emit_mir -> session_verify_mir_text_and_render_json round-trip
+    session_init(mut_view(*sess));
+    let int_arena1 = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena1;
+        thir_init(mut_view(*thir_ptr));
+    }
+    human_out.len = 0;
+    json_out.len = 0;
+    let rt_path = qa_seam_blob_sv(mut_view(*scratch), 0);
+    let rt_src = qa_seam_blob_sv(mut_view(*scratch), 1);
+    let mut rt_fid = FileId { v: 0u32 };
+    let rt_parse = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: rt_path.ptr, len: rt_path.len },
+        StrView { ptr: rt_src.ptr, len: rt_src.len },
+        mut_view(rt_fid)
+    );
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(rt_parse.ast), mut_view(*rmap));
+    let rt_hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(rt_parse.ast), view(*rmap));
+    unsafe {
+        session_typeck_into(mut_view(*sess), view(rt_hir), mut_view(*thir_ptr));
+    }
+    let fn_cnt = session_emit_mir(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        view(rt_hir),
+        unsafe { mut_view(*thir_ptr) },
+        FileId { v: rt_fid.v },
+        mut_view(*human_out)
+    );
+    if fn_cnt != 1 || sess.diag_sink.len != 0 || human_out.len == 0 {
+        return 701;
+    }
+    let emitted_mir_sv = copy_buf_to_sv(mut_view(*scratch), view(*human_out));
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    session_free(mut_view(*sess));
+
+    session_init(mut_view(*sess));
+    json_out.len = 0;
+    let mfid = session_add_virtual_file(
+        mut_view(*sess),
+        StrView { ptr: rt_path.ptr, len: rt_path.len },
+        StrView { ptr: emitted_mir_sv.ptr, len: emitted_mir_sv.len }
+    );
+    session_verify_mir_text_and_render_json(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        mfid,
+        emitted_mir_sv,
+        mut_view(*json_out)
+    );
+    if sess.diag_sink.len != 0 || (json_out.len) < 2 {
+        return 702;
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+
+    // Seam 2: session_own_mir_verify_fn + session_verify_elaborated_body on conditional drop
+    session_init(mut_view(*sess));
+    let int_arena2 = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena2;
+        thir_init(mut_view(*thir_ptr));
+    }
+    let el_path = qa_seam_blob_sv(mut_view(*scratch), 2);
+    let el_src = qa_seam_blob_sv(mut_view(*scratch), 3);
+    let mut el_fid = FileId { v: 0u32 };
+    let el_parse = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: el_path.ptr, len: el_path.len },
+        StrView { ptr: el_src.ptr, len: el_src.len },
+        mut_view(el_fid)
+    );
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(el_parse.ast), mut_view(*rmap));
+    let el_hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(el_parse.ast), view(*rmap));
+    unsafe {
+        session_typeck_into(mut_view(*sess), view(el_hir), mut_view(*thir_ptr));
+    }
+    let mut fn_it: *mut HirItem = el_hir.items;
+    while (fn_it as usize) != 0 && (unsafe { (*fn_it).kind }) != HIR_ITEM_FN {
+        fn_it = unsafe { (*fn_it).next };
+    }
+    if (fn_it as usize) == 0 {
+        return 703;
+    }
+    let el_body = session_own_mir_verify_fn(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        fn_it,
+        view(el_hir),
+        unsafe { mut_view(*thir_ptr) },
+        0 as *mut MonoEngine,
+        true,
+        0 as *mut DiagBuffer,
+        0 as *mut DiagBuffer
+    );
+    if (el_body as usize) == 0 || sess.diag_sink.len != 0 {
+        return 704;
+    }
+    let el_ok = session_verify_elaborated_body(
+        mut_view(*sess),
+        fn_it as *const HirItem,
+        unsafe { view(*el_body) },
+        unsafe { view(*thir_ptr) }
+    );
+    if !el_ok || sess.diag_sink.len != 0 {
+        return 705;
+    }
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+
+    // Seam 3: Malformed .mir syntax via human + JSON renderers
+    session_init(mut_view(*sess));
+    human_out.len = 0;
+    json_out.len = 0;
+    let br_path = qa_seam_blob_sv(mut_view(*scratch), 4);
+    let br_src = qa_seam_blob_sv(mut_view(*scratch), 5);
+    let br_fid = session_add_virtual_file(
+        mut_view(*sess),
+        StrView { ptr: br_path.ptr, len: br_path.len },
+        StrView { ptr: br_src.ptr, len: br_src.len }
+    );
+    session_verify_mir_text_and_render_human(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        br_fid,
+        StrView { ptr: br_src.ptr, len: br_src.len },
+        mut_view(*human_out)
+    );
+    if sess.diag_sink.len != 1 || human_out.len == 0 {
+        return 706;
+    }
+    let br_d0 = unsafe { diag_at(sess.diag_sink.diags, 0) };
+    if (unsafe { (*br_d0).code.v }) != AX_VERIFY_MIR_SYNTAX {
+        return 707;
+    }
+    arena_reset(mut_view(*mir_arena));
+    session_free(mut_view(*sess));
+
+    session_init(mut_view(*sess));
+    let br_fid2 = session_add_virtual_file(
+        mut_view(*sess),
+        StrView { ptr: br_path.ptr, len: br_path.len },
+        StrView { ptr: br_src.ptr, len: br_src.len }
+    );
+    session_verify_mir_text_and_render_json(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        br_fid2,
+        StrView { ptr: br_src.ptr, len: br_src.len },
+        mut_view(*json_out)
+    );
+    if sess.diag_sink.len != 1 || json_out.len <= 2 {
+        return 708;
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+
+    // Seam 4: Compound return-type stored-view escape (tuple & array) + session_emit_mir gate
+    session_init(mut_view(*sess));
+    let int_arena4 = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena4;
+        thir_init(mut_view(*thir_ptr));
+    }
+    human_out.len = 0;
+    json_out.len = 0;
+    let ve_path = qa_seam_blob_sv(mut_view(*scratch), 6);
+    let ve_src = qa_seam_blob_sv(mut_view(*scratch), 7);
+    let mut ve_fid = FileId { v: 0u32 };
+    let ve_parse = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: ve_path.ptr, len: ve_path.len },
+        StrView { ptr: ve_src.ptr, len: ve_src.len },
+        mut_view(ve_fid)
+    );
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(ve_parse.ast), mut_view(*rmap));
+    let ve_hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(ve_parse.ast), view(*rmap));
+    unsafe {
+        session_typeck_into(mut_view(*sess), view(ve_hir), mut_view(*thir_ptr));
+    }
+    session_own_mir_verify_and_render_json(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        view(ve_hir),
+        unsafe { mut_view(*thir_ptr) },
+        FileId { v: ve_fid.v },
+        mut_view(*json_out)
+    );
+    if sess.diag_sink.len != 2 || json_out.len <= 2 {
+        return 709;
+    }
+    let ve_d0 = unsafe { diag_at(sess.diag_sink.diags, 0) };
+    let ve_d1 = unsafe { diag_at(sess.diag_sink.diags, 1) };
+    if (unsafe { (*ve_d0).code.v }) != AX_TYPE_STORED_VIEW_ESCAPE || (unsafe { (*ve_d1).code.v }) != AX_TYPE_STORED_VIEW_ESCAPE {
+        return 710;
+    }
+    let gated_cnt = session_emit_mir(
+        mut_view(*sess),
+        mut_view(*mir_arena),
+        view(ve_hir),
+        unsafe { mut_view(*thir_ptr) },
+        FileId { v: ve_fid.v },
+        mut_view(*human_out)
+    );
+    if gated_cnt != 0 || human_out.len != 0 {
+        return 711;
+    }
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*mir_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+    0
+}
+
+fn new_arena(chunk: usize) -> Arena {
+    let mut a = arena_with_chunk_size(chunk);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+    a
+}
+
+fn new_buf(perm: mut_view<Arena>) -> DiagBuffer {
+    let mut b = diag_buf_new();
+    let p = arena_alloc_raw(perm, 65536, 1);
+    b.ptr = p;
+    b.cap = 65536;
+    b
+}
+
+pub fn main() -> i32 {
+    let mut sess = session_new();
+    let mut perm_arena = new_arena(262144);
+    let mut parse_arena = new_arena(262144);
+    let mut resolve_arena = new_arena(262144);
+    let mut hir_arena = new_arena(262144);
+    let mut mir_arena = new_arena(262144);
+    let mut scratch = new_arena(65536);
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    let mut human_out = new_buf(mut_view(perm_arena));
+    let mut json_out = new_buf(mut_view(perm_arena));
+    let mut rmap = ResolveMap {
+        node_map: empty_node_map(),
+        module_access_nodes: empty_node_map(),
+        extern_nodes: empty_node_map(),
+        next_symbol_v: 1u32,
+        next_std_symbol_v: 10000u32,
+        naming_ctx: 0 as *mut NamingCtx,
+    };
+
+    let mut idx: usize = 0;
+    while idx < AX_CASE_COUNT {
+        let rc = run_ax_diag_case(
+            mut_view(sess),
+            mut_view(parse_arena),
+            mut_view(resolve_arena),
+            mut_view(hir_arena),
+            mut_view(mir_arena),
+            mut_view(scratch),
+            mut_view(rmap),
+            thir_ptr,
+            mut_view(human_out),
+            mut_view(json_out),
+            idx
+        );
+        if rc != 0 {
+            return rc;
+        }
+        idx = idx + 1;
+    }
+
+    idx = 0;
+    while idx < MIR_CASE_COUNT {
+        let rc = run_mir_diag_case(
+            mut_view(sess),
+            mut_view(mir_arena),
+            mut_view(scratch),
+            mut_view(human_out),
+            idx
+        );
+        if rc != 0 {
+            return rc;
+        }
+        idx = idx + 1;
+    }
+
+    if AX_CASE_COUNT == 0 {
+        let seam_rc = run_qa_boundary_seams(
+            mut_view(sess),
+            mut_view(parse_arena),
+            mut_view(resolve_arena),
+            mut_view(hir_arena),
+            mut_view(mir_arena),
+            mut_view(scratch),
+            mut_view(rmap),
+            thir_ptr,
+            mut_view(human_out),
+            mut_view(json_out)
+        );
+        if seam_rc != 0 {
+            return seam_rc;
+        }
+    }
+
+    arena_destroy(mut_view(scratch));
+    arena_destroy(mut_view(mir_arena));
+    arena_destroy(mut_view(hir_arena));
+    arena_destroy(mut_view(resolve_arena));
+    arena_destroy(mut_view(parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK own_mir_verify diag @GROUP@ (@AX_CASE_COUNT@ ax + @MIR_CASE_COUNT@ mir)\n");
+    0
+}
