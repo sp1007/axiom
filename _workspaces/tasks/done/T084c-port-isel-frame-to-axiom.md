@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T084b, T084d]
 priority: 118
-status: doing
+status: done
 attempts: 1
 paths: [compiler/target/x64, tests/selfhost/isel]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-TGT-327, REQ-X64-001]
 started: 2026-10-18 15:53:32
-agent: T084c-impl
+finished: 2026-10-18 23:52:30
 ---
 # T084c — Port x64 instruction selection and frame lowering to Axiom
 
@@ -42,3 +42,4 @@ Port x86-64 instruction selection and stack frame layout (`compiler/target/x64/i
 
 ## Log
 - 2026-10-18 15:53:32 started (attempt 1) T084c-impl
+- 2026-10-18 23:52:30 accepted by QA -> done
