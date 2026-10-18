@@ -1,0 +1,592 @@
+// Axiom Compiler — Windows x64 ABI Classification & LIR ABI Lowering (compiler/abi/win64.ax)
+// Port of bootstrap/axiom0/src/abi/abi.h, bootstrap/axiom0/src/abi/win64.c,
+// and bootstrap/axiom0/src/abi/lower.c.
+module compiler.abi.win64
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.TypeId
+use compiler.types.types.AxType
+use compiler.types.types.TypeInterner
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_BUILTIN_PRINT
+use compiler.types.types.TY_BUILTIN_PRINT_INT
+use compiler.types.types.TY_STR
+use compiler.types.types.TY_I64
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.intern_singleton
+use compiler.types.layout.type_size
+use compiler.lir.lir.LIR_VREG_NONE
+use compiler.lir.lir.LIR_INST_CALL
+use compiler.lir.lir.LIR_INST_ABI_ARG
+use compiler.lir.lir.LIR_INST_ABI_RESULT
+use compiler.lir.lir.LirInst
+use compiler.lir.lir.LirBb
+use compiler.lir.lir.LirBody
+use compiler.lir.lir.lir_bb_at
+use compiler.lir.lir.lir_inst_at
+use compiler.lir.lir.lir_mul_usize
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// --- ABI Location Kinds (AxAbiLocKind) ---
+
+pub const ABI_LOC_REG: u32 = 0u32;
+pub const ABI_LOC_STACK: u32 = 1u32;
+pub const ABI_LOC_INDIRECT: u32 = 2u32;
+
+pub const AX_ABI_LOC_REG: u32 = 0u32;
+pub const AX_ABI_LOC_STACK: u32 = 1u32;
+pub const AX_ABI_LOC_INDIRECT: u32 = 2u32;
+
+// --- Target ABI Identifiers ---
+
+pub const ABI_KIND_WIN64: u8 = 0u8;
+
+// --- Windows x64 General-Purpose Register Identifiers (matching ax_x64_reg_t) ---
+
+pub const WIN64_REG_RAX: u32 = 0u32;
+pub const WIN64_REG_RCX: u32 = 1u32;
+pub const WIN64_REG_RDX: u32 = 2u32;
+pub const WIN64_REG_RBX: u32 = 3u32;
+pub const WIN64_REG_RSP: u32 = 4u32;
+pub const WIN64_REG_RBP: u32 = 5u32;
+pub const WIN64_REG_RSI: u32 = 6u32;
+pub const WIN64_REG_RDI: u32 = 7u32;
+pub const WIN64_REG_R8: u32 = 8u32;
+pub const WIN64_REG_R9: u32 = 9u32;
+pub const WIN64_REG_R10: u32 = 10u32;
+pub const WIN64_REG_R11: u32 = 11u32;
+pub const WIN64_REG_R12: u32 = 12u32;
+pub const WIN64_REG_R13: u32 = 13u32;
+pub const WIN64_REG_R14: u32 = 14u32;
+pub const WIN64_REG_R15: u32 = 15u32;
+pub const WIN64_REG_NONE: u32 = 0xFFFFFFFFu32;
+
+// --- Windows x64 Calling Convention Invariants ---
+
+pub const WIN64_SHADOW_SPACE: u32 = 32u32;
+pub const WIN64_STACK_ALIGN: u32 = 16u32;
+pub const WIN64_STACK_SLOT_SIZE: u32 = 8u32;
+pub const WIN64_MAX_REG_ARGS: u32 = 4u32;
+pub const WIN64_RET_REG: u32 = 0u32;
+pub const WIN64_CALLEE_SAVED_COUNT: u32 = 7u32;
+pub const WIN64_CALLEE_SAVED_BYTES: u32 = 56u32;
+
+// First four integer/pointer argument registers in Windows x64: RCX (1), RDX (2), R8 (8), R9 (9).
+pub const WIN64_ARG_REGS: [4]u32 = [
+    1u32,
+    2u32,
+    8u32,
+    9u32,
+];
+
+// Caller-saved (volatile) general-purpose registers in Windows x64: RAX, RCX, RDX, R8, R9, R10, R11.
+pub const WIN64_CALLER_SAVED_REGS: [7]u32 = [
+    0u32,
+    1u32,
+    2u32,
+    8u32,
+    9u32,
+    10u32,
+    11u32,
+];
+
+// Callee-saved (non-volatile) general-purpose registers saved in the frame prologue
+// (in addition to frame pointer RBP): RBX, RSI, RDI, R12, R13, R14, R15.
+pub const WIN64_CALLEE_SAVED_REGS: [7]u32 = [
+    3u32,
+    6u32,
+    7u32,
+    12u32,
+    13u32,
+    14u32,
+    15u32,
+];
+
+// --- ABI Data Model (AxAbiLoc, AxAbiArg, AxAbiSig, AxAbi) ---
+
+// In `bootstrap/axiom0/src/abi/abi.h`, `AxAbiLoc` uses a C union `{ uint32_t reg; uint32_t offset; }`.
+// Both `reg` and `offset` are populated with the location's 32-bit payload so that callers reading
+// either `.reg` or `.offset` (including indirect stack slots at offset >= 32) observe identical
+// values to the C union representation.
+pub struct AbiLoc {
+    pub kind: u32,
+    pub reg: u32,
+    pub offset: u32,
+}
+
+pub struct AbiArg {
+    pub ty: TypeId,
+    pub loc: AbiLoc,
+}
+
+pub struct AbiSig {
+    pub args: *mut AbiArg,
+    pub arg_count: usize,
+    pub ret: AbiArg,
+    pub shadow_space: u32,
+    pub stack_args_size: u32,
+}
+
+pub struct Abi {
+    pub kind: u8,
+}
+
+// --- Pointer Indexing & Location Constructors ---
+
+pub unsafe fn abi_arg_at(base: *mut AbiArg, idx: usize) -> *mut AbiArg {
+    let off = lir_mul_usize(idx, size_of<AbiArg>());
+    ((base as usize) + off) as *mut AbiArg
+}
+
+pub fn abi_loc_reg(reg: u32) -> AbiLoc {
+    AbiLoc {
+        kind: ABI_LOC_REG,
+        reg: reg,
+        offset: reg,
+    }
+}
+
+pub fn abi_loc_stack(offset: u32) -> AbiLoc {
+    AbiLoc {
+        kind: ABI_LOC_STACK,
+        reg: offset,
+        offset: offset,
+    }
+}
+
+pub fn abi_loc_indirect_reg(reg: u32) -> AbiLoc {
+    AbiLoc {
+        kind: ABI_LOC_INDIRECT,
+        reg: reg,
+        offset: reg,
+    }
+}
+
+pub fn abi_loc_indirect_stack(offset: u32) -> AbiLoc {
+    AbiLoc {
+        kind: ABI_LOC_INDIRECT,
+        reg: offset,
+        offset: offset,
+    }
+}
+
+pub fn abi_loc_reg_or_offset(loc: view<AbiLoc>) -> u32 {
+    if loc.kind == ABI_LOC_STACK {
+        loc.offset
+    } else {
+        loc.reg
+    }
+}
+
+pub fn abi_loc_is_indirect_in_reg(loc: view<AbiLoc>) -> bool {
+    let r = loc.reg;
+    loc.kind == ABI_LOC_INDIRECT && r < 16u32
+}
+
+pub fn abi_loc_is_indirect_on_stack(loc: view<AbiLoc>) -> bool {
+    let off = loc.offset;
+    loc.kind == ABI_LOC_INDIRECT && off >= WIN64_SHADOW_SPACE
+}
+
+pub fn abi_sig_empty() -> AbiSig {
+    AbiSig {
+        args: 0 as *mut AbiArg,
+        arg_count: 0,
+        ret: AbiArg {
+            ty: TypeId { v: 0u32 },
+            loc: AbiLoc {
+                kind: ABI_LOC_REG,
+                reg: 0u32,
+                offset: 0u32,
+            },
+        },
+        shadow_space: 0u32,
+        stack_args_size: 0u32,
+    }
+}
+
+pub fn abi_win64() -> Abi {
+    Abi {
+        kind: ABI_KIND_WIN64,
+    }
+}
+
+// --- Windows x64 Register & Layout Classification Helpers ---
+
+pub fn win64_arg_reg(index: u32) -> u32 {
+    if index < WIN64_MAX_REG_ARGS {
+        WIN64_ARG_REGS[index as usize]
+    } else {
+        WIN64_REG_NONE
+    }
+}
+
+pub fn win64_is_caller_saved(reg: u32) -> bool {
+    reg == WIN64_REG_RAX ||
+    reg == WIN64_REG_RCX ||
+    reg == WIN64_REG_RDX ||
+    reg == WIN64_REG_R8 ||
+    reg == WIN64_REG_R9 ||
+    reg == WIN64_REG_R10 ||
+    reg == WIN64_REG_R11
+}
+
+pub fn win64_is_nonvolatile_gp(reg: u32) -> bool {
+    reg == WIN64_REG_RBX ||
+    reg == WIN64_REG_RSI ||
+    reg == WIN64_REG_RDI ||
+    reg == WIN64_REG_R12 ||
+    reg == WIN64_REG_R13 ||
+    reg == WIN64_REG_R14 ||
+    reg == WIN64_REG_R15
+}
+
+pub fn win64_is_callee_saved(reg: u32) -> bool {
+    reg == WIN64_REG_RBP || win64_is_nonvolatile_gp(reg)
+}
+
+// Under Windows x64 ABI, values of size 0, 1, 2, 4, or 8 bytes are passed/returned directly
+// by value in a register or 8-byte stack slot. Aggregates of any other size (3, 5, 6, 7, or > 8)
+// are passed/returned indirectly via pointer (`ABI_LOC_INDIRECT`).
+pub fn win64_needs_indirect(size_bytes: u32) -> bool {
+    if size_bytes > 8u32 {
+        return true;
+    }
+    size_bytes != 0u32 &&
+    size_bytes != 1u32 &&
+    size_bytes != 2u32 &&
+    size_bytes != 4u32 &&
+    size_bytes != 8u32
+}
+
+// Aligns a byte count up to a 16-byte stack boundary (`WIN64_STACK_ALIGN`).
+pub fn win64_align_stack(bytes: u32) -> u32 {
+    let mask = WIN64_STACK_ALIGN - 1u32;
+    (bytes + mask) & (0xFFFFFFFFu32 ^ mask)
+}
+
+// Total outgoing argument area size (32-byte mandatory shadow space + stack arguments).
+pub fn win64_outgoing_args_size(sig: view<AbiSig>) -> u32 {
+    sig.shadow_space + sig.stack_args_size
+}
+
+// --- Windows x64 Signature Classification (`win64_classify`) ---
+
+pub fn win64_classify(
+    fn_ty: *const AxType,
+    interner: *mut TypeInterner,
+    arena: mut_view<Arena>
+) -> AbiSig {
+    let mut sig = abi_sig_empty();
+    if (fn_ty as usize) == 0 || (interner as usize) == 0 {
+        return sig;
+    }
+
+    let mut fty = fn_ty;
+    let init_kind = unsafe { (*fty).kind };
+    if init_kind == TY_CLOSURE {
+        let fn_ty_id = unsafe { (*fty).fn_type };
+        if fn_ty_id.v != 0u32 {
+            fty = unsafe { type_get(view(*interner), fn_ty_id) as *const AxType };
+            if (fty as usize) == 0 {
+                return sig;
+            }
+        }
+    }
+
+    let k = unsafe { (*fty).kind };
+    if k != TY_FN && k != TY_BUILTIN_PRINT && k != TY_BUILTIN_PRINT_INT {
+        return sig;
+    }
+
+    sig.shadow_space = WIN64_SHADOW_SPACE;
+    let mut stack_offset: u32 = WIN64_SHADOW_SPACE;
+    let mut arg_idx: u32 = 0u32;
+
+    let mut ret_size: u32 = 0u32;
+    let mut ret_ty_v: u32 = 0u32;
+    let mut param_count: usize = 0;
+    let mut builtin_param_ty_v: u32 = 0u32;
+
+    if k == TY_FN {
+        ret_ty_v = unsafe { (*fty).ret_type.v };
+        ret_size = unsafe { type_size(TypeId { v: ret_ty_v }, view(*interner)) };
+        param_count = unsafe { (*fty).param_count };
+    } else if k == TY_BUILTIN_PRINT {
+        param_count = 1;
+        let existing_str_v = unsafe { (*interner).t_str.v };
+        if existing_str_v != 0u32 {
+            builtin_param_ty_v = existing_str_v;
+        } else {
+            let tid = unsafe { intern_singleton(mut_view(*interner), TY_STR) };
+            builtin_param_ty_v = tid.v;
+        }
+    } else if k == TY_BUILTIN_PRINT_INT {
+        param_count = 1;
+        let existing_i64_v = unsafe { (*interner).t_i64.v };
+        if existing_i64_v != 0u32 {
+            builtin_param_ty_v = existing_i64_v;
+        } else {
+            let tid = unsafe { intern_singleton(mut_view(*interner), TY_I64) };
+            builtin_param_ty_v = tid.v;
+        }
+    }
+
+    let ret_in_mem = win64_needs_indirect(ret_size);
+    if ret_in_mem {
+        let sret_reg = WIN64_ARG_REGS[arg_idx as usize];
+        arg_idx = arg_idx + 1u32;
+        sig.ret.ty = TypeId { v: ret_ty_v };
+        sig.ret.loc = abi_loc_indirect_reg(sret_reg);
+    } else {
+        sig.ret.ty = TypeId { v: ret_ty_v };
+        sig.ret.loc = abi_loc_reg(WIN64_RET_REG);
+    }
+
+    sig.arg_count = param_count;
+    if param_count > 0 {
+        let args_bytes = lir_mul_usize(param_count, size_of<AbiArg>());
+        sig.args = arena_alloc_raw(mut_view(*arena), args_bytes, align_of<AbiArg>()) as *mut AbiArg;
+    }
+
+    let mut i: usize = 0;
+    while i < param_count {
+        let pty_v: u32 = if k == TY_FN {
+            let ptypes = unsafe { (*fty).param_types };
+            if (ptypes as usize) != 0 {
+                unsafe { (*typeid_at(ptypes, i)).v }
+            } else {
+                0u32
+            }
+        } else {
+            builtin_param_ty_v
+        };
+
+        let mut psize = unsafe { type_size(TypeId { v: pty_v }, view(*interner)) };
+        if k == TY_BUILTIN_PRINT && psize == 0u32 {
+            psize = 16u32;
+        } else if k == TY_BUILTIN_PRINT_INT && psize == 0u32 {
+            psize = 8u32;
+        }
+
+        let in_mem = win64_needs_indirect(psize);
+        let arg_ptr = unsafe { abi_arg_at(sig.args, i) };
+        unsafe {
+            (*arg_ptr).ty.v = pty_v;
+        }
+
+        if in_mem {
+            if arg_idx < WIN64_MAX_REG_ARGS {
+                let reg = WIN64_ARG_REGS[arg_idx as usize];
+                arg_idx = arg_idx + 1u32;
+                unsafe {
+                    (*arg_ptr).loc = abi_loc_indirect_reg(reg);
+                }
+            } else {
+                unsafe {
+                    (*arg_ptr).loc = abi_loc_indirect_stack(stack_offset);
+                }
+                stack_offset = stack_offset + WIN64_STACK_SLOT_SIZE;
+                arg_idx = arg_idx + 1u32;
+            }
+        } else {
+            if arg_idx < WIN64_MAX_REG_ARGS {
+                let reg = WIN64_ARG_REGS[arg_idx as usize];
+                arg_idx = arg_idx + 1u32;
+                unsafe {
+                    (*arg_ptr).loc = abi_loc_reg(reg);
+                }
+            } else {
+                unsafe {
+                    (*arg_ptr).loc = abi_loc_stack(stack_offset);
+                }
+                stack_offset = stack_offset + WIN64_STACK_SLOT_SIZE;
+                arg_idx = arg_idx + 1u32;
+            }
+        }
+
+        i = i + 1;
+    }
+
+    sig.stack_args_size = if stack_offset > WIN64_SHADOW_SPACE {
+        stack_offset - WIN64_SHADOW_SPACE
+    } else {
+        0u32
+    };
+
+    sig
+}
+
+pub fn abi_classify(
+    abi: view<Abi>,
+    fn_ty: *const AxType,
+    interner: *mut TypeInterner,
+    arena: mut_view<Arena>
+) -> AbiSig {
+    let _ = abi.kind;
+    win64_classify(fn_ty, interner, arena)
+}
+
+// --- LIR-to-LIR ABI Lowering Pass (`lir_lower_abi` / `ax_lir_lower_abi`) ---
+
+// Populates `loc_kind` and `loc_reg_or_offset` on all `LIR_INST_ABI_ARG` and `LIR_INST_ABI_RESULT`
+// instructions in `body`, and computes `body.frame_req.max_outgoing_args_bytes` and
+// `body.frame_req.requires_16_byte_alignment` using the caller-provided scratch `arena`.
+pub fn lir_lower_abi_in_arena(
+    body: *mut LirBody,
+    interner: *mut TypeInterner,
+    abi: view<Abi>,
+    fn_ty: *const AxType,
+    arena: mut_view<Arena>
+) {
+    if (body as usize) == 0 {
+        return;
+    }
+
+    let sig = abi_classify(abi, fn_ty, interner, mut_view(*arena));
+    unsafe {
+        (*body).frame_req.max_outgoing_args_bytes = sig.shadow_space;
+        (*body).frame_req.requires_16_byte_alignment = true;
+    }
+
+    let bb_count = unsafe { (*body).bb_count };
+    let bbs = unsafe { (*body).bbs };
+    let mut b: usize = 0;
+    while b < bb_count {
+        let bb = unsafe { lir_bb_at(bbs, b) };
+        let inst_count = unsafe { (*bb).inst_count };
+        let insts = unsafe { (*bb).insts };
+        let mut i: usize = 0;
+        while i < inst_count {
+            let inst = unsafe { lir_inst_at(insts, i) };
+            let kind = unsafe { (*inst).kind };
+
+            if kind == LIR_INST_ABI_ARG {
+                let idx = unsafe { (*inst).index as usize };
+                let dest_v = unsafe { (*inst).dest.v };
+                if dest_v != LIR_VREG_NONE {
+                    if idx < sig.arg_count {
+                        let arg_p = unsafe { abi_arg_at(sig.args, idx) };
+                        let loc_k = unsafe { (*arg_p).loc.kind };
+                        let loc_ro = unsafe { abi_loc_reg_or_offset(view((*arg_p).loc)) };
+                        unsafe {
+                            (*inst).loc_kind = loc_k;
+                            (*inst).loc_reg_or_offset = loc_ro;
+                        }
+                    }
+                } else {
+                    let mut call_inst: *mut LirInst = 0 as *mut LirInst;
+                    let mut j: usize = i + 1;
+                    while j < inst_count {
+                        let cand = unsafe { lir_inst_at(insts, j) };
+                        if (unsafe { (*cand).kind }) == LIR_INST_CALL {
+                            call_inst = cand;
+                            break;
+                        }
+                        j = j + 1;
+                    }
+
+                    if (call_inst as usize) != 0 && (interner as usize) != 0 {
+                        let callee_ty_id = unsafe { (*call_inst).callee_ty };
+                        let callee = unsafe { type_get(view(*interner), callee_ty_id) as *const AxType };
+                        if (callee as usize) != 0 {
+                            let call_sig = abi_classify(abi, callee, interner, mut_view(*arena));
+                            if idx < call_sig.arg_count {
+                                let carg_p = unsafe { abi_arg_at(call_sig.args, idx) };
+                                let loc_k = unsafe { (*carg_p).loc.kind };
+                                let loc_ro = unsafe { abi_loc_reg_or_offset(view((*carg_p).loc)) };
+                                unsafe {
+                                    (*inst).loc_kind = loc_k;
+                                    (*inst).loc_reg_or_offset = loc_ro;
+                                }
+                            }
+                            let outgoing = call_sig.shadow_space + call_sig.stack_args_size;
+                            let cur_max = unsafe { (*body).frame_req.max_outgoing_args_bytes };
+                            if outgoing > cur_max {
+                                unsafe {
+                                    (*body).frame_req.max_outgoing_args_bytes = outgoing;
+                                }
+                            }
+                        }
+                    }
+                }
+            } else if kind == LIR_INST_ABI_RESULT {
+                let mut call_inst: *mut LirInst = 0 as *mut LirInst;
+                let mut j: usize = i;
+                while j > 0 {
+                    let cand = unsafe { lir_inst_at(insts, j - 1) };
+                    if (unsafe { (*cand).kind }) == LIR_INST_CALL {
+                        call_inst = cand;
+                        break;
+                    }
+                    j = j - 1;
+                }
+
+                if (call_inst as usize) != 0 && (interner as usize) != 0 {
+                    let callee_ty_id = unsafe { (*call_inst).callee_ty };
+                    let callee = unsafe { type_get(view(*interner), callee_ty_id) as *const AxType };
+                    if (callee as usize) != 0 {
+                        let call_sig = abi_classify(abi, callee, interner, mut_view(*arena));
+                        let loc_k = call_sig.ret.loc.kind;
+                        let loc_ro = abi_loc_reg_or_offset(view(call_sig.ret.loc));
+                        unsafe {
+                            (*inst).loc_kind = loc_k;
+                            (*inst).loc_reg_or_offset = loc_ro;
+                        }
+                    }
+                } else {
+                    let loc_k = sig.ret.loc.kind;
+                    let loc_ro = abi_loc_reg_or_offset(view(sig.ret.loc));
+                    unsafe {
+                        (*inst).loc_kind = loc_k;
+                        (*inst).loc_reg_or_offset = loc_ro;
+                    }
+                }
+            }
+
+            i = i + 1;
+        }
+        b = b + 1;
+    }
+}
+
+pub fn lir_lower_abi(
+    body: *mut LirBody,
+    interner: *mut TypeInterner,
+    abi: view<Abi>,
+    fn_ty: *const AxType
+) {
+    let mut arena = arena_new();
+    lir_lower_abi_in_arena(body, interner, abi, fn_ty, mut_view(arena));
+    arena_destroy(mut_view(arena));
+}
+
+pub fn ax_lir_lower_abi(
+    body: *mut LirBody,
+    interner: *mut TypeInterner,
+    abi: *const Abi,
+    fn_ty: *const AxType
+) {
+    let default_abi = abi_win64();
+    if (abi as usize) != 0 {
+        lir_lower_abi(body, interner, unsafe { view(*abi) }, fn_ty);
+    } else {
+        lir_lower_abi(body, interner, view(default_abi), fn_ty);
+    }
+}
+
+pub fn lir_lower_win64_abi(
+    body: *mut LirBody,
+    interner: *mut TypeInterner,
+    fn_ty: *const AxType
+) {
+    let default_abi = abi_win64();
+    lir_lower_abi(body, interner, view(default_abi), fn_ty);
+}

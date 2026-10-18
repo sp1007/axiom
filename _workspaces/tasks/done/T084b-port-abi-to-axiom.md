@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T084a]
 priority: 118
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/abi, tests/selfhost/abi]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-ABI-106, REQ-ABI-107, REQ-ABI-108]
+started: 2026-10-18 10:53:20
+finished: 2026-10-18 12:54:10
 ---
 # T084b — Port Windows x64 ABI lowering to Axiom
 
@@ -37,3 +39,7 @@ Port Windows x64 calling conventions and ABI register allocation rules (`compile
 ## Notes
 - Sub-task of T084 split per ADR-0005 §8 and SPEC-20 §4.8.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-18 10:53:20 started (attempt 1) T084b-impl
+- 2026-10-18 12:54:10 accepted by QA -> done
