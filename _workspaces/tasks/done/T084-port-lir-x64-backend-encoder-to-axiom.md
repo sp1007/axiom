@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T083, T084a, T084b, T084c, T084d]
 priority: 118
-status: todo
-attempts: 0
-paths: [compiler/backend, tests/selfhost/backend]
+status: done
+attempts: 1
+paths: [compiler/backend, compiler/target/x64, tests/selfhost/backend]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-ABI-106, REQ-ABI-107, REQ-ABI-108, REQ-LAY-298, REQ-LIR-030, REQ-TGT-327, REQ-X64-001]
+started: 2026-10-19 03:17:03
+finished: 2026-10-19 10:36:59
 ---
 # T084 — Port LIR + x64 backend + encoder to Axiom (integration + differential)
 
@@ -38,3 +40,7 @@ Integrate LIR, ABI lowering, x64 backend, and encoder in Axiom and run different
 - Exact differential artefact: `inspect --emit=lir` and encoded machine code bytes.
 - Harness entry: `tests/selfhost/backend`.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-19 03:17:03 started (attempt 1) T084-impl
+- 2026-10-19 10:36:59 accepted by QA -> done

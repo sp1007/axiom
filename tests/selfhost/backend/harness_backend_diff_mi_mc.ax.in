@@ -1,0 +1,422 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.kernel_source_diag.session.session_error_count
+use compiler.parser.session.session_parse_virtual_file
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.resolve_hir.session.session_append_std_prelude
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.TypeInterner
+use compiler.types.types.type_interner_init
+use compiler.types.types.type_interner_free
+use compiler.types.types.Thir
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.typeck.session.session_typeck_into
+use compiler.obj.coff.ObjModel
+use compiler.obj.coff.objmodel_new
+use compiler.obj.coff.objmodel_free
+use compiler.obj.coff.objmodel_find_section_bytes
+use compiler.obj.coff.objmodel_get_section
+use compiler.obj.coff.section_bytes_len
+use compiler.backend.session.session_emit_mi_mir_text
+use compiler.backend.session.session_emit_mc_mir_text
+use compiler.backend.session.session_emit_mi_file
+use compiler.backend.session.session_emit_mc_file
+use compiler.backend.session.session_emit_objmodel_hir
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+const MIMC_TEXT_NAME: [5]u8 = [46u8, 116u8, 101u8, 120u8, 116u8];
+
+// __BLOB_TABLES__
+
+fn get_blob_sv(scratch: mut_view<Arena>, idx: usize) -> StrView {
+    let start = MIMC_OFFS[idx] as usize;
+    let end = MIMC_OFFS[idx + 1] as usize;
+    let slen = end - start;
+    if slen == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = arena_alloc_raw(mut_view(*scratch), slen + 1, 1);
+    let mut i: usize = 0;
+    while i < slen {
+        unsafe {
+            *(buf + i) = MIMC_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + slen) = 0u8;
+    }
+    StrView { ptr: buf as *const u8, len: slen }
+}
+
+fn mimc_text_ptr(scratch: mut_view<Arena>) -> *const u8 {
+    let buf = arena_alloc_raw(mut_view(*scratch), 6, 1);
+    let mut i: usize = 0;
+    while i < 5 {
+        unsafe {
+            *(buf + i) = MIMC_TEXT_NAME[i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + 5) = 0u8;
+    }
+    buf as *const u8
+}
+
+fn bytes_equal(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if (unsafe { *(a + i) }) != (unsafe { *(b + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn dump_sv(sv: StrView) {
+    if sv.len > 0 && (sv.ptr as usize) != 0 {
+        let s: str = unsafe { *(address_of(sv) as *const str) };
+        print(s);
+    }
+}
+
+fn run_ax_mimc_case(
+    sess: mut_view<CompilerSession>,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>,
+    backend_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    out: mut_view<DiagBuffer>,
+    case_idx: usize
+) -> i32 {
+    session_init(mut_view(*sess));
+    let int_arena = arena_with_chunk_size(65536);
+    unsafe {
+        (*thir_ptr).interner.arena = int_arena;
+        thir_init(mut_view(*thir_ptr));
+    }
+
+    let base = ((case_idx as i64) * 4i64) as usize;
+    let path_sv = get_blob_sv(mut_view(*scratch), base);
+    let src_sv = get_blob_sv(mut_view(*scratch), base + 1);
+    let exp_mi = get_blob_sv(mut_view(*scratch), base + 2);
+    let exp_mc = get_blob_sv(mut_view(*scratch), base + 3);
+    let load_prelude = MIMC_PRELUDE_FLAGS[case_idx] != 0u32;
+
+    let mut fid = FileId { v: 0u32 };
+    let mut parse_res = session_parse_virtual_file(
+        mut_view(*sess),
+        mut_view(*parse_arena),
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len },
+        mut_view(fid)
+    );
+    if load_prelude {
+        session_append_std_prelude(
+            mut_view(*sess),
+            mut_view(*parse_arena),
+            mut_view(parse_res.ast),
+            StrView { ptr: src_sv.ptr, len: src_sv.len }
+        );
+    }
+    session_resolve_ast_into(mut_view(*sess), mut_view(*resolve_arena), view(parse_res.ast), mut_view(*rmap));
+    let hir = session_lower_hir(mut_view(*sess), mut_view(*hir_arena), view(parse_res.ast), view(*rmap));
+
+    let mut rc: i32 = 0;
+    let fid_v = fid.v;
+    if session_error_count(view(*sess)) != 0 {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- RESOLVE/HIR FAILED ---\n");
+        rc = 100 + (case_idx as i32);
+    } else {
+        unsafe {
+            session_typeck_into(mut_view(*sess), view(hir), mut_view(*thir_ptr));
+        }
+        if session_error_count(view(*sess)) != 0 {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- TYPECK FAILED ---\n");
+            rc = 200 + (case_idx as i32);
+        }
+    }
+
+    if rc == 0 {
+        out.len = 0;
+        let _ = session_emit_mi_file(
+            mut_view(*sess),
+            mut_view(*mir_arena),
+            mut_view(*backend_arena),
+            view(hir),
+            unsafe { mut_view(*thir_ptr) },
+            FileId { v: fid_v },
+            mut_view(*out)
+        );
+        if !bytes_equal(out.ptr as *const u8, out.len, exp_mi.ptr, exp_mi.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- ACTUAL MI ---\n");
+            dump_sv(StrView { ptr: out.ptr as *const u8, len: out.len });
+            print("--- EXPECTED MI ---\n");
+            dump_sv(exp_mi);
+            rc = 300 + (case_idx as i32);
+        }
+        arena_reset(mut_view(*backend_arena));
+        arena_reset(mut_view(*mir_arena));
+    }
+
+    if rc == 0 {
+        out.len = 0;
+        let ok_mc = session_emit_mc_file(
+            mut_view(*sess),
+            mut_view(*mir_arena),
+            mut_view(*backend_arena),
+            view(hir),
+            unsafe { mut_view(*thir_ptr) },
+            FileId { v: fid_v },
+            mut_view(*out)
+        );
+        if !ok_mc {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- MC VERIFY FAILED ---\n");
+            rc = 350 + (case_idx as i32);
+        } else if !bytes_equal(out.ptr as *const u8, out.len, exp_mc.ptr, exp_mc.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- ACTUAL MC ---\n");
+            dump_sv(StrView { ptr: out.ptr as *const u8, len: out.len });
+            print("--- EXPECTED MC ---\n");
+            dump_sv(exp_mc);
+            rc = 400 + (case_idx as i32);
+        }
+        arena_reset(mut_view(*backend_arena));
+        arena_reset(mut_view(*mir_arena));
+    }
+
+    if rc == 0 {
+        let mut obj = objmodel_new();
+        let ok_obj = session_emit_objmodel_hir(
+            mut_view(*sess),
+            mut_view(*mir_arena),
+            mut_view(*backend_arena),
+            view(hir),
+            unsafe { mut_view(*thir_ptr) },
+            FileId { v: fid_v },
+            false,
+            false,
+            true,
+            mut_view(obj)
+        );
+        if !ok_obj {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- OBJMODEL EMIT FAILED ---\n");
+            rc = 450 + (case_idx as i32);
+        } else {
+            let text_name = mimc_text_ptr(mut_view(*scratch));
+            let text_id = objmodel_find_section_bytes(view(obj), text_name, 5);
+            let text_sec = objmodel_get_section(view(obj), text_id);
+            if (text_sec as usize) == 0 || (unsafe { section_bytes_len(view(*text_sec)) }) == 0 {
+                dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+                print("\n--- OBJMODEL EMPTY TEXT ---\n");
+                rc = 475 + (case_idx as i32);
+            }
+        }
+        objmodel_free(mut_view(obj));
+        arena_reset(mut_view(*backend_arena));
+        arena_reset(mut_view(*mir_arena));
+    }
+
+    resolve_map_free(mut_view(*rmap));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+    }
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    session_free(mut_view(*sess));
+    rc
+}
+
+fn run_mir_mimc_case(
+    backend_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    ti_ptr: *mut TypeInterner,
+    out: mut_view<DiagBuffer>,
+    mir_idx: usize
+) -> i32 {
+    let base = (((MIMC_AX_COUNT as i64) * 4i64) + ((mir_idx as i64) * 4i64)) as usize;
+    let path_sv = get_blob_sv(mut_view(*scratch), base);
+    let mir_sv = get_blob_sv(mut_view(*scratch), base + 1);
+    let exp_mi = get_blob_sv(mut_view(*scratch), base + 2);
+    let exp_mc = get_blob_sv(mut_view(*scratch), base + 3);
+
+    unsafe {
+        (*ti_ptr).arena = arena_with_chunk_size(65536);
+        type_interner_init(mut_view(*ti_ptr));
+    }
+    out.len = 0;
+    let ok_mi = session_emit_mi_mir_text(
+        mut_view(*backend_arena),
+        ti_ptr,
+        StrView { ptr: mir_sv.ptr, len: mir_sv.len },
+        mut_view(*out)
+    );
+    unsafe {
+        type_interner_free(mut_view(*ti_ptr));
+    }
+    arena_reset(mut_view(*backend_arena));
+
+    let mut rc: i32 = 0;
+    if !ok_mi {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- MIR->MI FAILED ---\n");
+        rc = 500 + (mir_idx as i32);
+    } else if !bytes_equal(out.ptr as *const u8, out.len, exp_mi.ptr, exp_mi.len) {
+        dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+        print("\n--- ACTUAL MIR MI ---\n");
+        dump_sv(StrView { ptr: out.ptr as *const u8, len: out.len });
+        print("--- EXPECTED MIR MI ---\n");
+        dump_sv(exp_mi);
+        rc = 600 + (mir_idx as i32);
+    }
+
+    if rc == 0 {
+        unsafe {
+            (*ti_ptr).arena = arena_with_chunk_size(65536);
+            type_interner_init(mut_view(*ti_ptr));
+        }
+        out.len = 0;
+        let ok_mc = session_emit_mc_mir_text(
+            mut_view(*backend_arena),
+            ti_ptr,
+            StrView { ptr: mir_sv.ptr, len: mir_sv.len },
+            mut_view(*out)
+        );
+        unsafe {
+            type_interner_free(mut_view(*ti_ptr));
+        }
+        arena_reset(mut_view(*backend_arena));
+        if !ok_mc {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- MIR->MC FAILED ---\n");
+            rc = 700 + (mir_idx as i32);
+        } else if !bytes_equal(out.ptr as *const u8, out.len, exp_mc.ptr, exp_mc.len) {
+            dump_sv(StrView { ptr: path_sv.ptr, len: path_sv.len });
+            print("\n--- ACTUAL MIR MC ---\n");
+            dump_sv(StrView { ptr: out.ptr as *const u8, len: out.len });
+            print("--- EXPECTED MIR MC ---\n");
+            dump_sv(exp_mc);
+            rc = 800 + (mir_idx as i32);
+        }
+    }
+
+    arena_reset(mut_view(*scratch));
+    rc
+}
+
+pub fn main() -> i32 {
+    let mut perm_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(perm_arena), 16, 8);
+    let sess_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<CompilerSession>(), align_of<CompilerSession>()) as *mut CompilerSession;
+    let ti_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<TypeInterner>(), align_of<TypeInterner>()) as *mut TypeInterner;
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+
+    let mut parse_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(parse_arena), 16, 8);
+    let mut resolve_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(resolve_arena), 16, 8);
+    let mut hir_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(hir_arena), 16, 8);
+    let mut mir_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(mir_arena), 16, 8);
+    let mut backend_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(backend_arena), 16, 8);
+    let mut scratch = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(scratch), 16, 8);
+
+    let mut out = diag_buf_new();
+    out.ptr = arena_alloc_raw(mut_view(perm_arena), 131072, 1);
+    out.cap = 131072;
+
+    let mut rmap = ResolveMap {
+        node_map: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        module_access_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        extern_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        next_symbol_v: 1u32,
+        next_std_symbol_v: 10000u32,
+        naming_ctx: 0 as *mut NamingCtx,
+    };
+
+    let mut idx: usize = 0;
+    while idx < MIMC_AX_COUNT {
+        let rc = run_ax_mimc_case(
+            unsafe { mut_view(*sess_ptr) },
+            mut_view(parse_arena),
+            mut_view(resolve_arena),
+            mut_view(hir_arena),
+            mut_view(mir_arena),
+            mut_view(backend_arena),
+            mut_view(scratch),
+            mut_view(rmap),
+            thir_ptr,
+            mut_view(out),
+            idx
+        );
+        if rc != 0 {
+            return rc;
+        }
+        idx = idx + 1;
+    }
+
+    let mut midx: usize = 0;
+    while midx < MIMC_MIR_COUNT {
+        let rc = run_mir_mimc_case(
+            mut_view(backend_arena),
+            mut_view(scratch),
+            ti_ptr,
+            mut_view(out),
+            midx
+        );
+        if rc != 0 {
+            return rc;
+        }
+        midx = midx + 1;
+    }
+
+    arena_destroy(mut_view(scratch));
+    arena_destroy(mut_view(backend_arena));
+    arena_destroy(mut_view(mir_arena));
+    arena_destroy(mut_view(hir_arena));
+    arena_destroy(mut_view(resolve_arena));
+    arena_destroy(mut_view(parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    // __OK_PRINT__
+    0
+}

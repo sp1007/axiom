@@ -1,0 +1,834 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.interner_intern_bytes
+use compiler.kernel.interner.interner_get
+use compiler.source.span.Span
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.kernel_source_diag.session.CompilerSession
+use compiler.kernel_source_diag.session.session_init
+use compiler.kernel_source_diag.session.session_free
+use compiler.lex.token.Token
+use compiler.lex.token.Comment
+use compiler.lex.token.LexResult
+use compiler.lex.scanner.ax_lex_result_free
+use compiler.lexer.session.session_lex_virtual_file
+use compiler.parser.session.session_parse_tokens
+use compiler.resolve.symtab.NodeMap
+use compiler.resolve.symtab.NamingCtx
+use compiler.resolve.symtab.ResolveMap
+use compiler.resolve.symtab.resolve_map_free
+use compiler.hir.hir.HIR_ITEM_STRUCT
+use compiler.hir.hir.HIR_ITEM_CONST
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.hir_alloc_item
+use compiler.resolve_hir.session.session_resolve_ast_into
+use compiler.resolve_hir.session.session_lower_hir
+use compiler.types.types.AxType
+use compiler.types.types.ConstValue
+use compiler.types.types.TypeInterner
+use compiler.types.types.Thir
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.CONST_INT
+use compiler.types.types.CONST_AGGREGATE
+use compiler.types.types.ax_type_reset
+use compiler.types.types.intern_type
+use compiler.types.types.intern_array_ty
+use compiler.types.types.intern_tuple_ty
+use compiler.types.types.type_interner_init
+use compiler.types.types.type_interner_free
+use compiler.types.types.thir_init
+use compiler.types.types.thir_free
+use compiler.types.types.thir_set_sym_type
+use compiler.types.types.sym_constmap_insert
+use compiler.types.types.sym_constmap_get
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_parse
+use compiler.lir.lir.LirBody
+use compiler.lir.lir.LirConstTable
+use compiler.obj.coff.SectionId
+use compiler.obj.coff.ObjModel
+use compiler.obj.coff.SEC_CODE
+use compiler.obj.coff.SEC_RODATA
+use compiler.obj.coff.SEC_FLAG_EXEC
+use compiler.obj.coff.SEC_FLAG_READ
+use compiler.obj.coff.SYM_LOCAL
+use compiler.obj.coff.SYM_EXTERNAL
+use compiler.obj.coff.RELOC_X86_64_PC32
+use compiler.obj.coff.RELOC_X86_64_64
+use compiler.obj.coff.ax_symbol_id_is_none
+use compiler.obj.coff.objmodel_new
+use compiler.obj.coff.objmodel_free
+use compiler.obj.coff.objmodel_add_section_bytes
+use compiler.obj.coff.objmodel_get_section
+use compiler.obj.coff.objmodel_get_section_mut
+use compiler.obj.coff.objmodel_find_symbol_bytes
+use compiler.obj.coff.objmodel_get_symbol
+use compiler.obj.coff.section_bytes_len
+use compiler.obj.coff.section_relocs_len
+use compiler.target.x64.isel.X64MIBody
+use compiler.target.x64.frame.X64_VERIFY_OK
+use compiler.target.x64.frame.X64FrameLayout
+use compiler.backend.session.backend_format_const_sym_name
+use compiler.backend.session.backend_promote_const_aggregates
+use compiler.backend.session.backend_populate_hir_const_aggregates
+use compiler.backend.session.backend_emit_const_tables
+use compiler.backend.session.backend_emit_fn_strings_rdata
+use compiler.backend.session.backend_emit_mi_body_full_obj
+use compiler.backend.session.backend_lower_fn_to_mc_checked
+use compiler.backend.session.session_emit_lir_mir_text
+use compiler.backend.session.session_emit_mi_mir_text
+use compiler.backend.session.session_emit_mc_mir_text
+use compiler.backend.session.session_compile_and_emit_lir
+use compiler.backend.session.session_compile_and_emit_objmodel
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+// __BLOB_TABLES__
+
+fn get_edge_sv(scratch: mut_view<Arena>, idx: usize) -> StrView {
+    let start = EDGE_OFFS[idx] as usize;
+    let end = EDGE_OFFS[idx + 1] as usize;
+    let slen = end - start;
+    if slen == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = arena_alloc_raw(mut_view(*scratch), slen + 1, 1);
+    let mut i: usize = 0;
+    while i < slen {
+        unsafe {
+            *(buf + i) = EDGE_DATA[start + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + slen) = 0u8;
+    }
+    StrView { ptr: buf as *const u8, len: slen }
+}
+
+fn sv_equals(a: view<StrView>, b: view<StrView>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if (unsafe { *(a.ptr + i) }) != (unsafe { *(b.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// 1. Negative tests on standalone `.mir` text emitters (empty and malformed `.mir`).
+fn test_negative_mir_text(
+    arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    ti_ptr: *mut TypeInterner,
+    out: mut_view<DiagBuffer>
+) -> i32 {
+    let bad_sv = get_edge_sv(mut_view(*scratch), 0); // "fn broken_mir {\n"
+
+    unsafe {
+        (*ti_ptr).arena = arena_with_chunk_size(16384);
+        type_interner_init(mut_view(*ti_ptr));
+    }
+    out.len = 0;
+    let ok0 = session_emit_lir_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: 0 as *const u8, len: 0 }, mut_view(*out));
+    let ok1 = session_emit_mi_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: 0 as *const u8, len: 0 }, mut_view(*out));
+    let ok2 = session_emit_mc_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: 0 as *const u8, len: 0 }, mut_view(*out));
+    let ok3 = session_emit_lir_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: bad_sv.ptr, len: bad_sv.len }, mut_view(*out));
+    let ok4 = session_emit_mi_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: bad_sv.ptr, len: bad_sv.len }, mut_view(*out));
+    let ok5 = session_emit_mc_mir_text(mut_view(*arena), ti_ptr, StrView { ptr: bad_sv.ptr, len: bad_sv.len }, mut_view(*out));
+    unsafe {
+        type_interner_free(mut_view(*ti_ptr));
+    }
+    arena_reset(mut_view(*arena));
+    arena_reset(mut_view(*scratch));
+
+    if ok0 || ok1 || ok2 || ok3 || ok4 || ok5 || out.len != 0 {
+        return 10;
+    }
+    0
+}
+
+// 2. Negative tests on `.ax` session drivers when name resolution fails (returns 100 cleanly).
+fn test_negative_ax_resolve(
+    sess_ptr: *mut CompilerSession,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    mir_arena: mut_view<Arena>,
+    backend_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    out: mut_view<DiagBuffer>
+) -> i32 {
+    let path_sv = get_edge_sv(mut_view(*scratch), 1);
+    let bad_ax_sv = get_edge_sv(mut_view(*scratch), 2);
+
+    unsafe {
+        session_init(mut_view(*sess_ptr));
+        (*thir_ptr).interner.arena = arena_with_chunk_size(16384);
+        thir_init(mut_view(*thir_ptr));
+    }
+    out.len = 0;
+    let rc_lir = session_compile_and_emit_lir(
+        unsafe { mut_view(*sess_ptr) },
+        mut_view(*parse_arena),
+        mut_view(*resolve_arena),
+        mut_view(*hir_arena),
+        mut_view(*mir_arena),
+        mut_view(*backend_arena),
+        mut_view(*rmap),
+        unsafe { mut_view(*thir_ptr) },
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: bad_ax_sv.ptr, len: bad_ax_sv.len },
+        false,
+        false,
+        false,
+        mut_view(*out)
+    );
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+        session_free(mut_view(*sess_ptr));
+    }
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*hir_arena));
+    if rc_lir != 100 {
+        return 20;
+    }
+
+    unsafe {
+        session_init(mut_view(*sess_ptr));
+        (*thir_ptr).interner.arena = arena_with_chunk_size(16384);
+        thir_init(mut_view(*thir_ptr));
+    }
+    let mut obj = objmodel_new();
+    let rc_obj = session_compile_and_emit_objmodel(
+        unsafe { mut_view(*sess_ptr) },
+        mut_view(*parse_arena),
+        mut_view(*resolve_arena),
+        mut_view(*hir_arena),
+        mut_view(*mir_arena),
+        mut_view(*backend_arena),
+        mut_view(*rmap),
+        unsafe { mut_view(*thir_ptr) },
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: bad_ax_sv.ptr, len: bad_ax_sv.len },
+        false,
+        false,
+        false,
+        true,
+        mut_view(obj)
+    );
+    objmodel_free(mut_view(obj));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+        session_free(mut_view(*sess_ptr));
+    }
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*scratch));
+    if rc_obj != 100 {
+        return 21;
+    }
+    0
+}
+
+// 3. Test `backend_populate_hir_const_aggregates`, `backend_format_const_sym_name` (including
+// `HIR_ITEM_IMPL` members), `backend_promote_const_aggregates`, and `backend_emit_const_tables`
+// (sorting, `Str` fat-pointer relocation extraction, and duplicate vs non-duplicate tables).
+fn test_const_aggregates_and_dedup(
+    sess_ptr: *mut CompilerSession,
+    parse_arena: mut_view<Arena>,
+    resolve_arena: mut_view<Arena>,
+    hir_arena: mut_view<Arena>,
+    backend_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    rmap: mut_view<ResolveMap>,
+    thir_ptr: *mut Thir,
+    lex_res: mut_view<LexResult>
+) -> i32 {
+    unsafe {
+        session_init(mut_view(*sess_ptr));
+        (*thir_ptr).interner.arena = arena_with_chunk_size(65536);
+        thir_init(mut_view(*thir_ptr));
+    }
+
+    let path_sv = get_edge_sv(mut_view(*scratch), 3);
+    let src_sv = get_edge_sv(mut_view(*scratch), 4);
+    let fid = session_lex_virtual_file(
+        unsafe { mut_view(*sess_ptr) },
+        StrView { ptr: path_sv.ptr, len: path_sv.len },
+        StrView { ptr: src_sv.ptr, len: src_sv.len },
+        mut_view(*lex_res)
+    );
+    let fid_v = fid.v;
+    let parse_res = session_parse_tokens(
+        unsafe { mut_view(*sess_ptr) },
+        mut_view(*parse_arena),
+        lex_res.tokens,
+        lex_res.token_count
+    );
+    session_resolve_ast_into(unsafe { mut_view(*sess_ptr) }, mut_view(*resolve_arena), view(parse_res.ast), mut_view(*rmap));
+    let mut hir = session_lower_hir(unsafe { mut_view(*sess_ptr) }, mut_view(*hir_arena), view(parse_res.ast), view(*rmap));
+
+    let name_k_base = get_edge_sv(mut_view(*scratch), 5);       // "K_BASE"
+    let name_k_arr = get_edge_sv(mut_view(*scratch), 6);        // "K_ARR"
+    let name_k_rep = get_edge_sv(mut_view(*scratch), 7);        // "K_REP"
+    let name_k_tup = get_edge_sv(mut_view(*scratch), 8);        // "K_TUP"
+    let name_k_pair_a = get_edge_sv(mut_view(*scratch), 9);     // "K_PAIR_A"
+    let name_k_pair_diff = get_edge_sv(mut_view(*scratch), 10); // "K_PAIR_DIFF"
+    let name_k_pair_b = get_edge_sv(mut_view(*scratch), 11);    // "K_PAIR_B"
+
+    let mut pair_def: *mut HirItem = 0 as *mut HirItem;
+    let mut sym_k_base: u32 = 0u32;
+    let mut sym_k_arr: u32 = 0u32;
+    let mut sym_k_rep: u32 = 0u32;
+    let mut sym_k_tup: u32 = 0u32;
+    let mut sym_k_pair_a: u32 = 0u32;
+    let mut sym_k_pair_diff: u32 = 0u32;
+    let str_in_mut_ptr = unsafe { address_of((*sess_ptr).interner.bytes.head) as *mut StrInterner };
+    let str_in_ptr = str_in_mut_ptr as *const StrInterner;
+
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_STRUCT {
+            pair_def = it;
+        } else if ik == HIR_ITEM_CONST {
+            let nm_id_v = unsafe { (*it).name.v };
+            let nm_sv = unsafe { interner_get(view(*str_in_ptr), StrId { v: nm_id_v }) };
+            let sv_id = unsafe { (*it).symbol.v };
+            if sv_equals(view(nm_sv), view(name_k_base)) {
+                sym_k_base = sv_id;
+            } else if sv_equals(view(nm_sv), view(name_k_arr)) {
+                sym_k_arr = sv_id;
+            } else if sv_equals(view(nm_sv), view(name_k_rep)) {
+                sym_k_rep = sv_id;
+            } else if sv_equals(view(nm_sv), view(name_k_tup)) {
+                sym_k_tup = sv_id;
+            } else if sv_equals(view(nm_sv), view(name_k_pair_a)) {
+                sym_k_pair_a = sv_id;
+            } else if sv_equals(view(nm_sv), view(name_k_pair_diff)) {
+                sym_k_pair_diff = sv_id;
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+
+    if (pair_def as usize) == 0 || sym_k_base == 0u32 || sym_k_arr == 0u32 ||
+       sym_k_rep == 0u32 || sym_k_tup == 0u32 || sym_k_pair_a == 0u32 || sym_k_pair_diff == 0u32 {
+        return 30;
+    }
+
+    // Construct types in `thir.interner`
+    let t_i64_v = unsafe { (*thir_ptr).interner.t_i64.v };
+    let t_i32_v = unsafe { (*thir_ptr).interner.t_i32.v };
+    let t_bool_v = unsafe { (*thir_ptr).interner.t_bool.v };
+    let t_str_v = unsafe { (*thir_ptr).interner.t_str.v };
+
+    let t_arr4_i64 = unsafe { intern_array_ty(mut_view((*thir_ptr).interner), TypeId { v: t_i64_v }, 4u64) };
+    let t_arr3_i32 = unsafe { intern_array_ty(mut_view((*thir_ptr).interner), TypeId { v: t_i32_v }, 3u64) };
+    let t_arr4_v = t_arr4_i64.v;
+    let t_arr3_v = t_arr3_i32.v;
+
+    let tup_flds = arena_alloc_raw(mut_view(*backend_arena), 3 * size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId;
+    unsafe {
+        (*tup_flds).v = t_i64_v;
+        (*((tup_flds as usize + size_of<TypeId>()) as *mut TypeId)).v = t_bool_v;
+        (*((tup_flds as usize + 2 * size_of<TypeId>()) as *mut TypeId)).v = t_str_v;
+    }
+    let t_tup = unsafe { intern_tuple_ty(mut_view((*thir_ptr).interner), tup_flds, 3) };
+    let t_tup_v = t_tup.v;
+
+    let pair_flds = arena_alloc_raw(mut_view(*backend_arena), 2 * size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId;
+    unsafe {
+        (*pair_flds).v = t_i64_v;
+        (*((pair_flds as usize + size_of<TypeId>()) as *mut TypeId)).v = t_str_v;
+    }
+    let pair_ax_ty = arena_alloc_raw(mut_view(*backend_arena), size_of<AxType>(), align_of<AxType>()) as *mut AxType;
+    unsafe {
+        ax_type_reset(mut_view(*pair_ax_ty), TY_STRUCT);
+        (*pair_ax_ty).fields = pair_flds;
+        (*pair_ax_ty).field_count = 2;
+        (*pair_ax_ty).def = pair_def as *const HirItem;
+    }
+    let t_pair = unsafe { intern_type(mut_view((*thir_ptr).interner), view(*pair_ax_ty)) };
+    let t_pair_v = t_pair.v;
+
+    // Register symbol types & K_BASE scalar value in `thir`
+    unsafe {
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_base }, TypeId { v: t_i64_v });
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_arr }, TypeId { v: t_arr4_v });
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_rep }, TypeId { v: t_arr3_v });
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_tup }, TypeId { v: t_tup_v });
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_pair_a }, TypeId { v: t_pair_v });
+        thir_set_sym_type(mut_view(*thir_ptr), SymbolId { v: sym_k_pair_diff }, TypeId { v: t_pair_v });
+    }
+    let cv_base = ConstValue {
+        kind: CONST_INT,
+        ty: TypeId { v: t_i64_v },
+        int_val: 32u64,
+        str_bytes: 0 as *const u8,
+        str_len: 0,
+        agg_data: 0 as *mut u8,
+        agg_size: 0,
+        agg_align: 0,
+        alloc_id: 0u32,
+    };
+    unsafe {
+        sym_constmap_insert(mut_view((*thir_ptr).symbol_consts), SymbolId { v: sym_k_base }, view(cv_base));
+        backend_populate_hir_const_aggregates(view(*sess_ptr), view(hir), mut_view(*thir_ptr));
+    }
+
+    // Check K_ARR == [-7, -1, 5, 32]
+    let cv_arr = unsafe { sym_constmap_get(view((*thir_ptr).symbol_consts), SymbolId { v: sym_k_arr }) };
+    if (cv_arr as usize) == 0 || (unsafe { (*cv_arr).kind }) != CONST_AGGREGATE || (unsafe { (*cv_arr).agg_size }) != 32 {
+        return 31;
+    }
+    let arr_p = unsafe { (*cv_arr).agg_data as *const i64 };
+    if (unsafe { *arr_p }) != -7i64 ||
+       (unsafe { *((arr_p as usize + 8) as *const i64) }) != -1i64 ||
+       (unsafe { *((arr_p as usize + 16) as *const i64) }) != 5i64 ||
+       (unsafe { *((arr_p as usize + 24) as *const i64) }) != 32i64 {
+        return 32;
+    }
+
+    // Check K_REP == [42, 42, 42]
+    let cv_rep = unsafe { sym_constmap_get(view((*thir_ptr).symbol_consts), SymbolId { v: sym_k_rep }) };
+    if (cv_rep as usize) == 0 || (unsafe { (*cv_rep).kind }) != CONST_AGGREGATE || (unsafe { (*cv_rep).agg_size }) != 12 {
+        return 33;
+    }
+    let rep_p = unsafe { (*cv_rep).agg_data as *const i32 };
+    if (unsafe { *rep_p }) != 42 ||
+       (unsafe { *((rep_p as usize + 4) as *const i32) }) != 42 ||
+       (unsafe { *((rep_p as usize + 8) as *const i32) }) != 42 {
+        return 34;
+    }
+
+    // Check K_TUP == (63, true, "alpha")
+    // Layout sorts fields by descending align/size: Str (off 0..16), i64 (off 16..24), bool (off 24)
+    let cv_tup = unsafe { sym_constmap_get(view((*thir_ptr).symbol_consts), SymbolId { v: sym_k_tup }) };
+    if (cv_tup as usize) == 0 || (unsafe { (*cv_tup).kind }) != CONST_AGGREGATE || (unsafe { (*cv_tup).agg_size }) != 32 {
+        return 35;
+    }
+    let tup_p = unsafe { (*cv_tup).agg_data };
+    if (unsafe { *((tup_p + 8) as *const u64) }) != 5u64 ||
+       (unsafe { *((tup_p + 16) as *const i64) }) != 63i64 ||
+       (unsafe { *(tup_p + 24) }) != 1u8 {
+        return 36;
+    }
+
+    // Check K_PAIR_A (out-of-order struct init `Pair { b: "alpha", a: 99i64 }`)
+    // Layout sorts fields by descending align/size: `b: Str` (off 0..16), `a: i64` (off 16..24)
+    let cv_pair_a = unsafe { sym_constmap_get(view((*thir_ptr).symbol_consts), SymbolId { v: sym_k_pair_a }) };
+    if (cv_pair_a as usize) == 0 || (unsafe { (*cv_pair_a).kind }) != CONST_AGGREGATE || (unsafe { (*cv_pair_a).agg_size }) != 24 {
+        return 37;
+    }
+    let pair_a_p = unsafe { (*cv_pair_a).agg_data };
+    if (unsafe { *((pair_a_p + 8) as *const u64) }) != 5u64 ||
+       (unsafe { *((pair_a_p + 16) as *const i64) }) != 99i64 {
+        return 38;
+    }
+
+    // Synthesize an `HIR_ITEM_IMPL` block containing `const K_PAIR_B` (symbol 777) with identical data to `K_PAIR_A`
+    let impl_item = hir_alloc_item(mut_view(*hir_arena), HIR_ITEM_IMPL, Span { file: FileId { v: fid_v }, start: 0u32, end: 0u32 });
+    let member_const = hir_alloc_item(mut_view(*hir_arena), HIR_ITEM_CONST, Span { file: FileId { v: fid_v }, start: 0u32, end: 0u32 });
+    let k_pair_b_str_id = unsafe { interner_intern_bytes(mut_view(*str_in_mut_ptr), name_k_pair_b.ptr, name_k_pair_b.len) };
+    unsafe {
+        (*member_const).name = k_pair_b_str_id;
+        (*member_const).symbol = SymbolId { v: 777u32 };
+        (*impl_item).members = member_const;
+        (*impl_item).next = hir.items;
+        hir.items = impl_item;
+        sym_constmap_insert(mut_view((*thir_ptr).symbol_consts), SymbolId { v: 777u32 }, view(*cv_pair_a));
+    }
+
+    // Verify `backend_format_const_sym_name` finds `K_PAIR_B` inside `HIR_ITEM_IMPL.members`
+    let hir_ptr = unsafe { address_of(hir.items) as *const HirFile };
+    let fmt_b = backend_format_const_sym_name(mut_view(*backend_arena), hir_ptr, str_in_ptr, 777u32);
+    let exp_fmt_b = get_edge_sv(mut_view(*scratch), 12); // ".Lconst_777_K_PAIR_B"
+    if !sv_equals(view(fmt_b), view(exp_fmt_b)) {
+        return 39;
+    }
+
+    // Parse a `.mir` body with 3 locals assigned from `MIR_OP_CONST` and patch their `constant.sym`
+    let mir_promote_sv = get_edge_sv(mut_view(*scratch), 13);
+    let mir_body = mir_parse(mir_promote_sv, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*backend_arena));
+    if (mir_body as usize) == 0 || (unsafe { (*mir_body).bb_count }) == 0 {
+        return 40;
+    }
+    let bb0 = unsafe { mir_bb_at((*mir_body).bbs, 0) };
+    if (unsafe { (*bb0).stmt_count }) < 3 {
+        return 41;
+    }
+    unsafe {
+        let st0 = mir_stmt_at((*bb0).stmts, 0);
+        let st1 = mir_stmt_at((*bb0).stmts, 1);
+        let st2 = mir_stmt_at((*bb0).stmts, 2);
+        (*st0).rvalue.use_op.constant.sym.v = sym_k_pair_a;
+        (*st1).rvalue.use_op.constant.sym.v = 777u32;
+        (*st2).rvalue.use_op.constant.sym.v = sym_k_pair_diff;
+    }
+
+    backend_promote_const_aggregates(unsafe { mut_view(*mir_body) }, unsafe { view(*thir_ptr) });
+
+    unsafe {
+        let l1 = mir_local_at((*mir_body).locals, 1);
+        let l2 = mir_local_at((*mir_body).locals, 2);
+        let l3 = mir_local_at((*mir_body).locals, 3);
+        if (*l1).kind != MIR_LOCAL_CONST || (*l1).const_sym.v != sym_k_pair_a ||
+           (*l2).kind != MIR_LOCAL_CONST || (*l2).const_sym.v != 777u32 ||
+           (*l3).kind != MIR_LOCAL_CONST || (*l3).const_sym.v != sym_k_pair_diff {
+            return 42;
+        }
+    }
+
+    // Emit constant tables into an `ObjModel` and verify deduplication & relocations
+    let mut obj = objmodel_new();
+    let rdata_name_sv = get_edge_sv(mut_view(*scratch), 14); // ".rdata"
+    let rdata_sec_id = objmodel_add_section_bytes(
+        mut_view(obj),
+        rdata_name_sv.ptr,
+        rdata_name_sv.len,
+        SEC_RODATA,
+        SEC_FLAG_READ,
+        16u32
+    );
+    let rdata_id_v = rdata_sec_id.v;
+    let bodies_arr = arena_alloc_raw(mut_view(*backend_arena), size_of<*mut MirBody>(), align_of<*mut MirBody>()) as *mut *mut MirBody;
+    unsafe {
+        *bodies_arr = mir_body;
+    }
+    let mut cstr_counter: u32 = 0u32;
+    let ctable = backend_emit_const_tables(
+        mut_view(*backend_arena),
+        bodies_arr as *const *mut MirBody,
+        1,
+        view(hir),
+        unsafe { view(*thir_ptr) },
+        unsafe { view(*str_in_ptr) },
+        mut_view(obj),
+        SectionId { v: rdata_id_v },
+        mut_view(cstr_counter)
+    );
+    if (ctable as usize) == 0 || (unsafe { (*ctable).count }) != 3 || cstr_counter != 2u32 {
+        objmodel_free(mut_view(obj));
+        return 43;
+    }
+
+    let fmt_a = backend_format_const_sym_name(mut_view(*backend_arena), hir_ptr, str_in_ptr, sym_k_pair_a);
+    let fmt_diff = backend_format_const_sym_name(mut_view(*backend_arena), hir_ptr, str_in_ptr, sym_k_pair_diff);
+    let sid_a = objmodel_find_symbol_bytes(view(obj), fmt_a.ptr, fmt_a.len);
+    let sid_b = objmodel_find_symbol_bytes(view(obj), fmt_b.ptr, fmt_b.len);
+    let sid_diff = objmodel_find_symbol_bytes(view(obj), fmt_diff.ptr, fmt_diff.len);
+    let sid_a_v = sid_a.v;
+    let sid_b_v = sid_b.v;
+    let sid_diff_v = sid_diff.v;
+    let none_a = ax_symbol_id_is_none(sid_a);
+    let none_b = ax_symbol_id_is_none(sid_b);
+    let none_diff = ax_symbol_id_is_none(sid_diff);
+    if none_a || none_b || none_diff {
+        objmodel_free(mut_view(obj));
+        return 44;
+    }
+    let sym_a_ptr = objmodel_get_symbol(view(obj), SymbolId { v: sid_a_v });
+    let sym_b_ptr = objmodel_get_symbol(view(obj), SymbolId { v: sid_b_v });
+    let sym_diff_ptr = objmodel_get_symbol(view(obj), SymbolId { v: sid_diff_v });
+    let val_a = unsafe { (*sym_a_ptr).value };
+    let val_b = unsafe { (*sym_b_ptr).value };
+    let val_diff = unsafe { (*sym_diff_ptr).value };
+
+    // K_PAIR_A and K_PAIR_B have identical bytes + identical "alpha" Str reloc -> deduplicated!
+    // K_PAIR_DIFF has "bravo" (same length 5, different bytes) -> NOT deduplicated!
+    if val_a != val_b || val_a == val_diff {
+        objmodel_free(mut_view(obj));
+        return 45;
+    }
+
+    let rdata_sec = objmodel_get_section(view(obj), SectionId { v: rdata_id_v });
+    if (unsafe { section_relocs_len(view(*rdata_sec)) }) != 2 {
+        objmodel_free(mut_view(obj));
+        return 46;
+    }
+    let rel0_kind = unsafe { (*(*rdata_sec).relocs).kind };
+    if rel0_kind != RELOC_X86_64_64 {
+        objmodel_free(mut_view(obj));
+        return 47;
+    }
+
+    objmodel_free(mut_view(obj));
+    resolve_map_free(mut_view(*rmap));
+    arena_reset(mut_view(*backend_arena));
+    arena_reset(mut_view(*hir_arena));
+    arena_reset(mut_view(*resolve_arena));
+    arena_reset(mut_view(*parse_arena));
+    arena_reset(mut_view(*scratch));
+    0
+}
+
+// 4. Test `backend_lower_fn_to_mc_checked` + `backend_emit_fn_strings_rdata` +
+// `backend_emit_mi_body_full_obj` on a multi-block `.mir` function with a loop
+// (backward + forward `JCC`/`JMP` fixups), string literal, and `assert` panic site.
+fn test_full_obj_branch_and_assert_emission(
+    backend_arena: mut_view<Arena>,
+    scratch: mut_view<Arena>,
+    ti_ptr: *mut TypeInterner
+) -> i32 {
+    unsafe {
+        (*ti_ptr).arena = arena_with_chunk_size(65536);
+        type_interner_init(mut_view(*ti_ptr));
+    }
+
+    let mir_loop_sv = get_edge_sv(mut_view(*scratch), 15);
+    let mir_body = mir_parse(mir_loop_sv, unsafe { mut_view(*ti_ptr) }, mut_view(*backend_arena));
+    if (mir_body as usize) == 0 {
+        return 50;
+    }
+
+    let fn_ty = arena_alloc_raw(mut_view(*backend_arena), size_of<AxType>(), align_of<AxType>()) as *mut AxType;
+    unsafe {
+        ax_type_reset(mut_view(*fn_ty), TY_FN);
+        (*fn_ty).ret_type.v = (*ti_ptr).t_i32.v;
+    }
+
+    let mut layout = X64FrameLayout {
+        slot_offsets: 0 as *mut i32,
+        slot_count: 0u32,
+        frame_size: 0u32,
+    };
+    let mut lir_body: *mut LirBody = 0 as *mut LirBody;
+    let mut mi_body: *mut X64MIBody = 0 as *mut X64MIBody;
+    let v_err = backend_lower_fn_to_mc_checked(
+        mut_view(*backend_arena),
+        mir_body,
+        0 as *const HirFile,
+        ti_ptr,
+        0 as *const StrInterner,
+        0 as *const LirConstTable,
+        fn_ty as *const AxType,
+        fn_ty as *const AxType,
+        mut_view(lir_body),
+        mut_view(mi_body),
+        mut_view(layout)
+    );
+    if v_err != X64_VERIFY_OK || (mi_body as usize) == 0 {
+        return 51;
+    }
+
+    let mut obj = objmodel_new();
+    let text_name_sv = get_edge_sv(mut_view(*scratch), 16);  // ".text"
+    let rdata_name_sv = get_edge_sv(mut_view(*scratch), 14); // ".rdata"
+    let text_sec_id = objmodel_add_section_bytes(
+        mut_view(obj),
+        text_name_sv.ptr,
+        text_name_sv.len,
+        SEC_CODE,
+        SEC_FLAG_EXEC | SEC_FLAG_READ,
+        16u32
+    );
+    let rdata_sec_id = objmodel_add_section_bytes(
+        mut_view(obj),
+        rdata_name_sv.ptr,
+        rdata_name_sv.len,
+        SEC_RODATA,
+        SEC_FLAG_READ,
+        16u32
+    );
+    let text_id_v = text_sec_id.v;
+    let rdata_id_v = rdata_sec_id.v;
+
+    backend_emit_fn_strings_rdata(
+        mut_view(*backend_arena),
+        unsafe { mut_view(*mi_body) },
+        mut_view(obj),
+        SectionId { v: rdata_id_v }
+    );
+
+    let text_sec = objmodel_get_section_mut(mut_view(obj), SectionId { v: text_id_v });
+    let mut panic_counter: u32 = 10u32;
+    backend_emit_mi_body_full_obj(
+        mut_view(*backend_arena),
+        unsafe { mut_view(*text_sec) },
+        SectionId { v: rdata_id_v },
+        unsafe { view(*mi_body) },
+        view(layout),
+        mut_view(obj),
+        mut_view(panic_counter)
+    );
+
+    // Check `.Lstr.100000` (SYM_LOCAL), `.Lcstr_10` (SYM_LOCAL), and `axiom_panic` (SYM_EXTERNAL)
+    let lstr_sv = get_edge_sv(mut_view(*scratch), 17);  // ".Lstr.100000"
+    let lcstr_sv = get_edge_sv(mut_view(*scratch), 18); // ".Lcstr_10"
+    let panic_sv = get_edge_sv(mut_view(*scratch), 19); // "axiom_panic"
+
+    let sid_lstr = objmodel_find_symbol_bytes(view(obj), lstr_sv.ptr, lstr_sv.len);
+    let sid_lcstr = objmodel_find_symbol_bytes(view(obj), lcstr_sv.ptr, lcstr_sv.len);
+    let sid_panic = objmodel_find_symbol_bytes(view(obj), panic_sv.ptr, panic_sv.len);
+    let sid_lstr_v = sid_lstr.v;
+    let sid_panic_v = sid_panic.v;
+    let none_lstr = ax_symbol_id_is_none(sid_lstr);
+    let none_lcstr = ax_symbol_id_is_none(sid_lcstr);
+    let none_panic = ax_symbol_id_is_none(sid_panic);
+    if none_lstr || none_lcstr || none_panic {
+        objmodel_free(mut_view(obj));
+        return 52;
+    }
+
+    let sym_lstr = objmodel_get_symbol(view(obj), SymbolId { v: sid_lstr_v });
+    let sym_panic = objmodel_get_symbol(view(obj), SymbolId { v: sid_panic_v });
+    if (unsafe { (*sym_lstr).linkage }) != SYM_LOCAL || (unsafe { (*sym_panic).linkage }) != SYM_EXTERNAL {
+        objmodel_free(mut_view(obj));
+        return 53;
+    }
+
+    // `.text` must have 3 PC32 relocations: `.Lstr.100000` (from `const_str`), `.Lcstr_10` (from assert msg), and `axiom_panic` (from assert call)
+    if (unsafe { section_bytes_len(view(*text_sec)) }) == 0 || (unsafe { section_relocs_len(view(*text_sec)) }) != 3 {
+        objmodel_free(mut_view(obj));
+        return 54;
+    }
+    let rel0 = unsafe { (*text_sec).relocs };
+    if (unsafe { (*rel0).kind }) != RELOC_X86_64_PC32 {
+        objmodel_free(mut_view(obj));
+        return 55;
+    }
+
+    objmodel_free(mut_view(obj));
+    unsafe { type_interner_free(mut_view(*ti_ptr)); }
+    arena_reset(mut_view(*backend_arena));
+    arena_reset(mut_view(*scratch));
+    0
+}
+
+pub fn main() -> i32 {
+    let mut perm_arena = arena_with_chunk_size(262144);
+    let _ = arena_alloc_raw(mut_view(perm_arena), 16, 8);
+    let sess_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<CompilerSession>(), align_of<CompilerSession>()) as *mut CompilerSession;
+    let ti_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<TypeInterner>(), align_of<TypeInterner>()) as *mut TypeInterner;
+    let thir_ptr = arena_alloc_raw(mut_view(perm_arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+
+    let mut parse_arena = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(parse_arena), 16, 8);
+    let mut resolve_arena = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(resolve_arena), 16, 8);
+    let mut hir_arena = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(hir_arena), 16, 8);
+    let mut mir_arena = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(mir_arena), 16, 8);
+    let mut backend_arena = arena_with_chunk_size(131072);
+    let _ = arena_alloc_raw(mut_view(backend_arena), 16, 8);
+    let mut scratch = arena_with_chunk_size(65536);
+    let _ = arena_alloc_raw(mut_view(scratch), 16, 8);
+
+    let mut out = diag_buf_new();
+    out.ptr = arena_alloc_raw(mut_view(perm_arena), 32768, 1);
+    out.cap = 32768;
+
+    let mut rmap = ResolveMap {
+        node_map: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        module_access_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        extern_nodes: NodeMap { keys: 0 as *mut usize, vals: 0 as *mut SymbolId, states: 0 as *mut u8, len: 0, cap: 0 },
+        next_symbol_v: 1u32,
+        next_std_symbol_v: 10000u32,
+        naming_ctx: 0 as *mut NamingCtx,
+    };
+
+    let rc1 = test_negative_mir_text(mut_view(backend_arena), mut_view(scratch), ti_ptr, mut_view(out));
+    if rc1 != 0 {
+        return rc1;
+    }
+
+    let rc2 = test_negative_ax_resolve(
+        sess_ptr,
+        mut_view(parse_arena),
+        mut_view(resolve_arena),
+        mut_view(hir_arena),
+        mut_view(mir_arena),
+        mut_view(backend_arena),
+        mut_view(scratch),
+        mut_view(rmap),
+        thir_ptr,
+        mut_view(out)
+    );
+    if rc2 != 0 {
+        return rc2;
+    }
+
+    let mut lex_res = LexResult {
+        arena: arena_new(),
+        tokens: 0 as *mut Token,
+        token_count: 0,
+        token_cap: 0,
+        comments: 0 as *mut Comment,
+        comment_count: 0,
+        comment_cap: 0,
+    };
+    let rc3 = test_const_aggregates_and_dedup(
+        sess_ptr,
+        mut_view(parse_arena),
+        mut_view(resolve_arena),
+        mut_view(hir_arena),
+        mut_view(backend_arena),
+        mut_view(scratch),
+        mut_view(rmap),
+        thir_ptr,
+        mut_view(lex_res)
+    );
+    ax_lex_result_free(mut_view(lex_res));
+    unsafe {
+        thir_free(mut_view(*thir_ptr));
+        session_free(mut_view(*sess_ptr));
+    }
+    if rc3 != 0 {
+        return rc3;
+    }
+
+    let rc4 = test_full_obj_branch_and_assert_emission(
+        mut_view(backend_arena),
+        mut_view(scratch),
+        ti_ptr
+    );
+    if rc4 != 0 {
+        return rc4;
+    }
+
+    arena_destroy(mut_view(scratch));
+    arena_destroy(mut_view(backend_arena));
+    arena_destroy(mut_view(mir_arena));
+    arena_destroy(mut_view(hir_arena));
+    arena_destroy(mut_view(resolve_arena));
+    arena_destroy(mut_view(parse_arena));
+    arena_destroy(mut_view(perm_arena));
+    print("OK Backend QA Edge & Seam Tests\n");
+    0
+}
