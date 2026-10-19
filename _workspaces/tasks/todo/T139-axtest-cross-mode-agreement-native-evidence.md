@@ -6,11 +6,11 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: sonnet
 gate_model: sonnet
-depends: [T134]
+depends: [T134, T140]
 priority: 100
 status: todo
 attempts: 0
-paths: [tools/tests/axtest]
+paths: [tools/tests/axtest, tests/lir, tests/hir]
 locks: [tools/axtest.py, tests/README.md]
 spec: [spec/ROADMAP.md, tasks/0361, tasks/0480]
 covers: [REQ-TST-046, REQ-TST-107]
@@ -42,16 +42,31 @@ from the interpreter. Only `test: diff` compares executors with each other.
 - Runner self-tests in `tools/tests/axtest` (stub compiler `stubcc.py`): agreement PASS, stdout
   disagreement FAIL, exit-code disagreement FAIL, interp-limit test not compared, weak-evidence flag
   set/unset.
-- `tests/README.md`: document the agreement check and `WEAK-NATIVE`.
+- **Golden comparison for inspect manifests (audit OI-10, ADR-0034 §3):** one new manifest
+  directive `stdout-file: <path>` (path relative to the manifest): the step's stdout is compared
+  byte-for-byte with that file, and `--bless` rewrites it. The 31 `tests/lir/*.test` manifests and
+  `tests/hir/more.test` gain it for their sibling golden (`.lir` / `.hir`); `tests/hir/more.test`
+  and any of these manifests that call `{build}/axiom0` use `{compiler}`. The goldens that differ
+  from current output (audit: `abi_arg`, `abi_result`, `call`, `offset`, `qa_multi_branch`, plus any
+  found) are reviewed one by one: a legitimate representation change is re-blessed with the reason
+  in the report; a lowering bug is a `## Follow-ups` entry (the golden stays, the test is
+  `xfail: <fix task>` once the architect files it). Orphaned goldens with no manifest get one or are
+  deleted with a reason. `tests/lir/COVERAGE.md` is corrected to state that these goldens are
+  self-snapshot (category C) evidence.
+- `tests/README.md`: document the agreement check, `WEAK-NATIVE` and `stdout-file:`.
 
 ## Acceptance
 - [ ] `python tools/tests/axtest/run_selftests.py` passes, including the new cases above.
 - [ ] Full suite in the snapshot `build-snap-T139`
       (`python tools/axtest.py --compiler build/axiom0.exe`) passes with the agreement check on; every
       test that newly fails is a real interp/native divergence and is listed in the report's
-      `## Follow-ups` (test, both observations, diagnosis) — the task does not edit tests or compiler
-      code to make it pass; the architect files the fix tasks.
-- [ ] The report states the `WEAK-NATIVE` count and the list of weak tests.
+      `## Follow-ups` (test, both observations, diagnosis) — the task does not edit tests (other than the
+      `tests/lir`/`tests/hir` golden work above) or compiler code to make it pass; the architect files the fix tasks.
+- [ ] The report states the `WEAK-NATIVE` count and the list of weak tests (T145 drives it to 0 in
+      the T086 directories).
+- [ ] Runner self-tests cover `stdout-file:` (match PASS, mismatch FAIL with byte diff, `--bless`
+      rewrites); every `tests/lir/*.test` and `tests/hir/more.test` compares its golden; the report
+      lists each drifted golden with its verdict (re-blessed + reason, or follow-up).
 - [ ] The final line format `TOTAL n PASS p FAIL f SKIP s XFAIL x` is unchanged (the WEAK-NATIVE
       line comes before it).
 - [ ] Python 3 standard library only.
@@ -59,7 +74,8 @@ from the interpreter. Only `test: diff` compares executors with each other.
 
 ## Out of scope
 - Rewriting weak tests (follow-ups for the owners of those test directories).
-- New directives; -O1 enablement; anything under `bootstrap/` or `tests/run`.
+- New directives other than `stdout-file:`; -O1 enablement; anything under `bootstrap/` or
+  `tests/run`.
 
 ## Notes
 - `tools/axtest.py` is owned by T005 (done) and listed as a shared file; this task locks it
@@ -70,6 +86,9 @@ from the interpreter. Only `test: diff` compares executors with each other.
   native executable (axiomc1) is the main evidence of correctness; undeclared-output divergences must
   be caught by the runner, not only by manual QA, before that gate.
 - Relevant code: `run_program`, `run_diff`, `judge`, `byte_diff`, `INTERP_LIMIT_EXIT` in
-  `tools/axtest.py`.
+  `tools/axtest.py`; exec manifests at `tools/axtest.py` ~956-993.
+- Amended 2026-10-20 (ADR-0034): LIR/HIR golden comparison folded in (audit OI-10); depends on T140
+  so the goldens are reviewed once, after the unsigned div/rem change to LIR.
+- Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale.
 
 ## Log

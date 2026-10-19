@@ -137,6 +137,11 @@ No task edits a file another running task may edit:
 
 ## Build & run
 
+**Never use an existing `build/axiom0.exe` of the main tree as evidence** — nothing keeps it current
+(on 2026-10-19 it dated from 2026-10-14, older than HEAD). Build fresh in your snapshot (below) and
+always pass `--compiler` explicitly; the runner's default `build/axiom0.exe` is only right when run
+from inside a freshly built snapshot.
+
 ```bash
 # single-agent example; parallel tasks use build-<ID> (below)
 cmake -S bootstrap/axiom0 -B build -G Ninja -DCMAKE_C_COMPILER=gcc -DCMAKE_BUILD_TYPE=Debug

@@ -23,6 +23,7 @@ axiomc compiles itself to a fixed point.
 
 ## Acceptance
 - [ ] Functional equivalence first (tasks/0262 §42): axiomc2 passes the same suite as axiomc1 with identical `--json` diagnostics and run results.
+- [ ] The ADR-0034 §3 independent subset (as listed in T086) passes with axiomc2, natively built; fixed-point equality alone (category B) is not accepted as correctness evidence.
 - [ ] Fixed point: axiomc2 and axiomc3 are byte-identical, built in two different directories with identical flags, checked at -O0 and at -O1, in CI.
 - [ ] No external tool in the chain (ABOOT-74/75): `tools/bootstrap.py` completes the axiomc stages with gcc/ld/as removed from PATH (they are needed only to build axiom0 and for test oracles).
 - [ ] Freeze (ROADMAP R3, ADR-0005 §15): `tools/build_axiomc.py --out <dir>` builds the stage-2 compiler for a task (inside its snapshot: `build-snap-<ID>/build`), and the exact command is stated in the report. spec/BOOTSTRAP.md documents the trust chain and the freeze rule: the orchestrator creates the local tag `axiom0-frozen` right after accepting this task (never pushed); from then on `harness_check.py` rejects any commit touching `bootstrap/axiom0` unless it belongs to a task titled `AX0-FIX-<nn> …` (phase `P10-selfhost`, filed by the architect).

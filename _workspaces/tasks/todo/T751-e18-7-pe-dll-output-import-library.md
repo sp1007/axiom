@@ -40,6 +40,7 @@ covers: [REQ-OWNER-006]
 - Owner requirement REQ-OWNER-006, roadmap epic E18.7: implemented in axiomc (Axiom, `compiler/`) right after self-hosting (P18 opens after P10). The C core emits only .obj/.exe but its data models reserve these artifact kinds (SPEC-04, T003a).
 - The P18 planning task T218 may split this task; keep this id for the first slice.
 - All Axiom code uses canonical syntax (axiom-syntax).
+- Carry-over (ADR-0034 §4, audit 2026-10-19 OI-07b): with import libraries, `--emit=obj` must reference imports as standard `__imp_<name>` and ship the runtime as a linkable object, so that gcc/ld can link real Axiom programs; add the deferred T028 oracle here — every native run test linked by GNU ld runs like the self-linked PE.
 
 ## Log
 - 2026-10-06 02:24:26 covers += REQ-OWNER-006 (metadata only)

@@ -104,7 +104,16 @@ python tools/axtest.py --bless parse/
 The runner builds nothing: build first. The build that counts for a task is the one in its snapshot
 (`taskctl.py snapshot <ID>` → `build-snap-<ID>/`, build directory `build-snap-<ID>/build`), so the
 runner takes `--compiler <path>` (default `build/axiom0.exe`, env `AXIOM0`) and is run from inside
-the snapshot for a verdict.
+the snapshot for a verdict. A `build/axiom0.exe` in the main working tree is not kept current (it
+was days older than HEAD on 2026-10-19): never use it as evidence or to build axiomc; rebuild the
+snapshot first.
+
+**Oracle independence (ADR-0034).** A test's expected result must come from outside the compiler
+under test whenever possible: the spec by hand, a Python reference (`gen_int_semantics.py`,
+`gen_hash_vectors.py`), GNU `as`/`objdump`, or the Windows loader. axiom0-vs-port bundles and
+self-snapshot goldens are supporting evidence only. A manifest whose oracle is an external tool
+FAILs when the tool is missing (no `skip-unless`). Exec manifests call `{compiler}`, never
+`{build}/axiom0`, unless they carry `requires: axiom0-internal`.
 It runs the compiler and test programs as binary subprocesses and compares stdout/stderr as raw
 bytes — never through text-mode decoding, which would hide CRLF/UTF-8 bugs.
 It must print a final line

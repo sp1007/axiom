@@ -39,4 +39,5 @@ the roadmap is invented.
 
 ## Notes
 - Critical board task (priority < 10): runs alone.
+- Carry-over (ADR-0034 §8, audit 2026-10-19 OI-13): plan an automated console-output check (WriteConsoleW path, not a pipe — e.g. via a pseudo-console) for `Xin chào thế giới`; pipe bytes are already pinned by 8 tests.
 

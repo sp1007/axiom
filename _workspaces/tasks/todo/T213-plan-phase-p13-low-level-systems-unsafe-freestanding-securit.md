@@ -39,4 +39,5 @@ the roadmap is invented.
 
 ## Notes
 - Critical board task (priority < 10): runs alone.
+- Carry-over (ADR-0034 §8, audit 2026-10-19 OI-12): plan an external Windows x64 ABI oracle before FFI breadth — a gcc-built test DLL (`gcc -shared`) exporting functions with 1..8 mixed-width arguments and structs of size 1/2/3/4/8/12/16/24 by value and return, called via `@link`, plus a gcc `offsetof`/`sizeof` table for `@repr(C)` layouts; `tests/mc/isel/cdriver_abi*.c` must not rely on `assert()` under NDEBUG.
 
