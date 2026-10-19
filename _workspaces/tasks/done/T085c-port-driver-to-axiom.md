@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T084, T085b]
 priority: 119
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/driver, tests/selfhost/driver]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-DRV-022]
+started: 2026-10-19 10:37:39
+finished: 2026-10-19 20:34:12
 ---
 # T085c — Port compiler driver & pipeline CLI to Axiom
 
@@ -38,3 +40,7 @@ Port the command-line driver and pipeline orchestrator (`compiler/driver/`) from
 ## Notes
 - Sub-task of T085 split per ADR-0005 §8 and SPEC-20 §4.9.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-10-19 10:37:39 started (attempt 1) T085c-impl
+- 2026-10-19 20:34:12 accepted by QA -> done

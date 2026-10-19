@@ -1,0 +1,2268 @@
+// Axiom Compiler — Driver CLI Options, Manifest, std_root & Project Discovery (compiler/driver/dopts.ax)
+// Port of bootstrap/axiom0/src/driver/{main.c,cmd_*.c,manifest.c,std_root.c,project.c}
+// and CLI option parsing from bootstrap/axiom0/src/driver/pipeline.c.
+module compiler.driver.opts
+
+use std.core.host.close
+use std.core.host.dir_close
+use std.core.host.dir_next
+use std.core.host.dir_open
+use std.core.host.env_get
+use std.core.host.exe_path
+use std.core.host.file_size
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.metadata
+use std.core.host.open
+use std.core.host.read
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.ArenaChunk
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.AX_IO_FILE_NOT_FOUND
+use compiler.diag.code.AX_DRIVER_NO_STD
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// =============================================================================
+// 1. Exit Codes, Command / Emitter / Stage Constants
+// =============================================================================
+
+pub const AX_EXIT_OK: i32 = 0;
+pub const AX_EXIT_DIAG: i32 = 1;
+pub const AX_EXIT_USAGE: i32 = 2;
+pub const AX_EXIT_ICE: i32 = 3;
+
+pub const CMD_NONE: u32 = 0u32;
+pub const CMD_HELP: u32 = 1u32;
+pub const CMD_VERSION: u32 = 2u32;
+pub const CMD_FEATURES: u32 = 3u32;
+pub const CMD_INSPECT: u32 = 4u32;
+pub const CMD_CHECK: u32 = 5u32;
+pub const CMD_BUILD: u32 = 6u32;
+pub const CMD_RUN: u32 = 7u32;
+
+pub const EMIT_NONE: u32 = 0u32;
+pub const EMIT_AST: u32 = 1u32;
+pub const EMIT_HIR: u32 = 2u32;
+pub const EMIT_LIR: u32 = 3u32;
+pub const EMIT_MC: u32 = 4u32;
+pub const EMIT_MI: u32 = 5u32;
+pub const EMIT_MIR: u32 = 6u32;
+pub const EMIT_MIR_OPT: u32 = 7u32;
+pub const EMIT_OBJ: u32 = 8u32;
+pub const EMIT_RESOLVED: u32 = 9u32;
+pub const EMIT_THIR: u32 = 10u32;
+pub const EMIT_TOKENS: u32 = 11u32;
+
+pub const STAGE_SOURCE: u32 = 0u32;
+pub const STAGE_LEX: u32 = 1u32;
+pub const STAGE_PARSE: u32 = 2u32;
+pub const STAGE_RESOLVE: u32 = 3u32;
+pub const STAGE_HIR: u32 = 4u32;
+pub const STAGE_TYPECK: u32 = 5u32;
+pub const STAGE_OWN: u32 = 6u32;
+pub const STAGE_INTERP: u32 = 7u32;
+pub const STAGE_MONO: u32 = 8u32;
+pub const STAGE_LIMIT: u32 = 9u32;
+
+// =============================================================================
+// 2. Constant Byte Tables for Stage-0 & Native Parity
+// =============================================================================
+
+// Usage text (`main.c:print_usage` + `ax_commands` sorted by filename):
+//   "usage: axiom0 <command> [arguments]\n\ncommands:\n"
+//   "  build        compile the program\n"
+//   "  check        check the program for errors\n"
+//   "  --features   list the capabilities of this build, one per line\n"
+//   "  inspect      dump an intermediate representation (--emit=<name>)\n"
+//   "  run          compile and run the program\n"
+//   "  version      print the compiler version\n"
+//   "  help         print this text\n\n"
+//   "exit codes: 0 ok, 1 diagnostics reported, 2 usage error, 3 internal compiler error\n"
+const USAGE_TEXT_BYTES: [458]u8 = [
+    117u8, 115u8, 97u8, 103u8, 101u8, 58u8, 32u8, 97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 32u8, 60u8, 99u8,
+    111u8, 109u8, 109u8, 97u8, 110u8, 100u8, 62u8, 32u8, 91u8, 97u8, 114u8, 103u8, 117u8, 109u8, 101u8, 110u8,
+    116u8, 115u8, 93u8, 10u8, 10u8, 99u8, 111u8, 109u8, 109u8, 97u8, 110u8, 100u8, 115u8, 58u8, 10u8, 32u8,
+    32u8, 98u8, 117u8, 105u8, 108u8, 100u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 99u8, 111u8,
+    109u8, 112u8, 105u8, 108u8, 101u8, 32u8, 116u8, 104u8, 101u8, 32u8, 112u8, 114u8, 111u8, 103u8, 114u8, 97u8,
+    109u8, 10u8, 32u8, 32u8, 99u8, 104u8, 101u8, 99u8, 107u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 99u8, 104u8, 101u8, 99u8, 107u8, 32u8, 116u8, 104u8, 101u8, 32u8, 112u8, 114u8, 111u8, 103u8, 114u8,
+    97u8, 109u8, 32u8, 102u8, 111u8, 114u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8, 115u8, 10u8, 32u8, 32u8,
+    45u8, 45u8, 102u8, 101u8, 97u8, 116u8, 117u8, 114u8, 101u8, 115u8, 32u8, 32u8, 32u8, 108u8, 105u8, 115u8,
+    116u8, 32u8, 116u8, 104u8, 101u8, 32u8, 99u8, 97u8, 112u8, 97u8, 98u8, 105u8, 108u8, 105u8, 116u8, 105u8,
+    101u8, 115u8, 32u8, 111u8, 102u8, 32u8, 116u8, 104u8, 105u8, 115u8, 32u8, 98u8, 117u8, 105u8, 108u8, 100u8,
+    44u8, 32u8, 111u8, 110u8, 101u8, 32u8, 112u8, 101u8, 114u8, 32u8, 108u8, 105u8, 110u8, 101u8, 10u8, 32u8,
+    32u8, 105u8, 110u8, 115u8, 112u8, 101u8, 99u8, 116u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 100u8, 117u8,
+    109u8, 112u8, 32u8, 97u8, 110u8, 32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 109u8, 101u8, 100u8, 105u8, 97u8,
+    116u8, 101u8, 32u8, 114u8, 101u8, 112u8, 114u8, 101u8, 115u8, 101u8, 110u8, 116u8, 97u8, 116u8, 105u8, 111u8,
+    110u8, 32u8, 40u8, 45u8, 45u8, 101u8, 109u8, 105u8, 116u8, 61u8, 60u8, 110u8, 97u8, 109u8, 101u8, 62u8,
+    41u8, 10u8, 32u8, 32u8, 114u8, 117u8, 110u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 99u8, 111u8, 109u8, 112u8, 105u8, 108u8, 101u8, 32u8, 97u8, 110u8, 100u8, 32u8, 114u8, 117u8, 110u8,
+    32u8, 116u8, 104u8, 101u8, 32u8, 112u8, 114u8, 111u8, 103u8, 114u8, 97u8, 109u8, 10u8, 32u8, 32u8, 118u8,
+    101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 112u8, 114u8, 105u8, 110u8,
+    116u8, 32u8, 116u8, 104u8, 101u8, 32u8, 99u8, 111u8, 109u8, 112u8, 105u8, 108u8, 101u8, 114u8, 32u8, 118u8,
+    101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 10u8, 32u8, 32u8, 104u8, 101u8, 108u8, 112u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 112u8, 114u8, 105u8, 110u8, 116u8, 32u8, 116u8, 104u8, 105u8, 115u8,
+    32u8, 116u8, 101u8, 120u8, 116u8, 10u8, 10u8, 101u8, 120u8, 105u8, 116u8, 32u8, 99u8, 111u8, 100u8, 101u8,
+    115u8, 58u8, 32u8, 48u8, 32u8, 111u8, 107u8, 44u8, 32u8, 49u8, 32u8, 100u8, 105u8, 97u8, 103u8, 110u8,
+    111u8, 115u8, 116u8, 105u8, 99u8, 115u8, 32u8, 114u8, 101u8, 112u8, 111u8, 114u8, 116u8, 101u8, 100u8, 44u8,
+    32u8, 50u8, 32u8, 117u8, 115u8, 97u8, 103u8, 101u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8, 44u8, 32u8,
+    51u8, 32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 97u8, 108u8, 32u8, 99u8, 111u8, 109u8, 112u8, 105u8,
+    108u8, 101u8, 114u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8, 10u8,
+];
+
+// Emitters list (`cmd_inspect.c:list_emitters`):
+//   "available emitters:\n"
+//   "  ast          dump the parsed AST\n"
+//   "  hir          dump the lowered HIR\n"
+//   "  lir          Emit LIR (parse from .mir or lower from .ax)\n"
+//   "  mc           dump final machine instructions and hex bytes\n"
+//   "  mi           dump the x64 machine IR\n"
+//   "  mir          Emit MIR (parse from .mir or lower from .ax)\n"
+//   "  obj          Emit COFF object file\n"
+//   "  resolved     dump the resolved AST\n"
+//   "  thir         dump the typed HIR\n"
+//   "  tokens       dump the lexer token stream\n"
+const EMITTERS_TEXT_BYTES: [462]u8 = [
+    97u8, 118u8, 97u8, 105u8, 108u8, 97u8, 98u8, 108u8, 101u8, 32u8, 101u8, 109u8, 105u8, 116u8, 116u8, 101u8,
+    114u8, 115u8, 58u8, 10u8, 32u8, 32u8, 97u8, 115u8, 116u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8, 116u8, 104u8, 101u8, 32u8, 112u8, 97u8, 114u8, 115u8,
+    101u8, 100u8, 32u8, 65u8, 83u8, 84u8, 10u8, 32u8, 32u8, 104u8, 105u8, 114u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8, 116u8, 104u8, 101u8, 32u8, 108u8,
+    111u8, 119u8, 101u8, 114u8, 101u8, 100u8, 32u8, 72u8, 73u8, 82u8, 10u8, 32u8, 32u8, 108u8, 105u8, 114u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 69u8, 109u8, 105u8, 116u8, 32u8, 76u8,
+    73u8, 82u8, 32u8, 40u8, 112u8, 97u8, 114u8, 115u8, 101u8, 32u8, 102u8, 114u8, 111u8, 109u8, 32u8, 46u8,
+    109u8, 105u8, 114u8, 32u8, 111u8, 114u8, 32u8, 108u8, 111u8, 119u8, 101u8, 114u8, 32u8, 102u8, 114u8, 111u8,
+    109u8, 32u8, 46u8, 97u8, 120u8, 41u8, 10u8, 32u8, 32u8, 109u8, 99u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8, 102u8, 105u8, 110u8, 97u8, 108u8,
+    32u8, 109u8, 97u8, 99u8, 104u8, 105u8, 110u8, 101u8, 32u8, 105u8, 110u8, 115u8, 116u8, 114u8, 117u8, 99u8,
+    116u8, 105u8, 111u8, 110u8, 115u8, 32u8, 97u8, 110u8, 100u8, 32u8, 104u8, 101u8, 120u8, 32u8, 98u8, 121u8,
+    116u8, 101u8, 115u8, 10u8, 32u8, 32u8, 109u8, 105u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8, 116u8, 104u8, 101u8, 32u8, 120u8, 54u8, 52u8, 32u8,
+    109u8, 97u8, 99u8, 104u8, 105u8, 110u8, 101u8, 32u8, 73u8, 82u8, 10u8, 32u8, 32u8, 109u8, 105u8, 114u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 69u8, 109u8, 105u8, 116u8, 32u8, 77u8,
+    73u8, 82u8, 32u8, 40u8, 112u8, 97u8, 114u8, 115u8, 101u8, 32u8, 102u8, 114u8, 111u8, 109u8, 32u8, 46u8,
+    109u8, 105u8, 114u8, 32u8, 111u8, 114u8, 32u8, 108u8, 111u8, 119u8, 101u8, 114u8, 32u8, 102u8, 114u8, 111u8,
+    109u8, 32u8, 46u8, 97u8, 120u8, 41u8, 10u8, 32u8, 32u8, 111u8, 98u8, 106u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 69u8, 109u8, 105u8, 116u8, 32u8, 67u8, 79u8, 70u8, 70u8, 32u8,
+    111u8, 98u8, 106u8, 101u8, 99u8, 116u8, 32u8, 102u8, 105u8, 108u8, 101u8, 10u8, 32u8, 32u8, 114u8, 101u8,
+    115u8, 111u8, 108u8, 118u8, 101u8, 100u8, 32u8, 32u8, 32u8, 32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8,
+    116u8, 104u8, 101u8, 32u8, 114u8, 101u8, 115u8, 111u8, 108u8, 118u8, 101u8, 100u8, 32u8, 65u8, 83u8, 84u8,
+    10u8, 32u8, 32u8, 116u8, 104u8, 105u8, 114u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    100u8, 117u8, 109u8, 112u8, 32u8, 116u8, 104u8, 101u8, 32u8, 116u8, 121u8, 112u8, 101u8, 100u8, 32u8, 72u8,
+    73u8, 82u8, 10u8, 32u8, 32u8, 116u8, 111u8, 107u8, 101u8, 110u8, 115u8, 32u8, 32u8, 32u8, 32u8, 32u8,
+    32u8, 32u8, 100u8, 117u8, 109u8, 112u8, 32u8, 116u8, 104u8, 101u8, 32u8, 108u8, 101u8, 120u8, 101u8, 114u8,
+    32u8, 116u8, 111u8, 107u8, 101u8, 110u8, 32u8, 115u8, 116u8, 114u8, 101u8, 97u8, 109u8, 10u8,
+];
+
+// Version & Features text:
+//   0..22 (22):  "axiom0 0.1.0 (stage0)\n"
+//   22..78 (56): "lex\nparse\nresolve\nhir\ntypeck\nown\ninterp\nmono\nnative\nopt\n"
+const VERSION_FEATURES_BYTES: [78]u8 = [
+    // "axiom0 0.1.0 (stage0)\n" (0, 22)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 32u8, 48u8, 46u8, 49u8, 46u8, 48u8, 32u8, 40u8, 115u8, 116u8,
+    97u8, 103u8, 101u8, 48u8, 41u8, 10u8,
+    // "lex\nparse\nresolve\nhir\ntypeck\nown\ninterp\nmono\nnative\nopt\n" (22, 54)
+    108u8, 101u8, 120u8, 10u8,
+    112u8, 97u8, 114u8, 115u8, 101u8, 10u8,
+    114u8, 101u8, 115u8, 111u8, 108u8, 118u8, 101u8, 10u8,
+    104u8, 105u8, 114u8, 10u8,
+    116u8, 121u8, 112u8, 101u8, 99u8, 107u8, 10u8,
+    111u8, 119u8, 110u8, 10u8,
+    105u8, 110u8, 116u8, 101u8, 114u8, 112u8, 10u8,
+    109u8, 111u8, 110u8, 111u8, 10u8,
+    110u8, 97u8, 116u8, 105u8, 118u8, 101u8, 10u8,
+    111u8, 112u8, 116u8, 10u8,
+];
+
+// Packed driver identifiers, options, error fragments, and paths:
+//    0..4   (4):  "help"
+//    4..10  (6):  "--help"
+//   10..12  (2):  "-h"
+//   12..19  (7):  "version"
+//   19..29  (10): "--features"
+//   29..36  (7):  "inspect"
+//   36..41  (5):  "check"
+//   41..46  (5):  "build"
+//   46..49  (3):  "run"
+//   49..52  (3):  "ast"
+//   52..55  (3):  "hir"
+//   55..58  (3):  "lir"
+//   58..60  (2):  "mc"
+//   60..62  (2):  "mi"
+//   62..65  (3):  "mir"
+//   65..72  (7):  "mir-opt"
+//   72..75  (3):  "obj"
+//   75..83  (8):  "resolved"
+//   83..87  (4):  "thir"
+//   87..93  (6):  "tokens"
+//   93..106 (13): "--color=never"
+//  106..119 (13): "--time-passes"
+//  119..125 (6):  "--json"
+//  125..128 (3):  "-O0"
+//  128..131 (3):  "-O1"
+//  131..144 (13): "--verify-each"
+//  144..152 (8):  "--target"
+//  152..162 (10): "--std-root"
+//  162..164 (2):  "-o"
+//  164..170 (6):  "--emit"
+//  170..185 (15): "--stack-reserve"
+//  185..193 (8):  "--interp"
+//  193..205 (12): "--step-limit"
+//  205..221 (16): "--max-call-depth"
+//  221..228 (7):  "1048576"
+//  228..236 (8):  "50000000"
+//  236..242 (6):  "100000"
+//  242..264 (22): "x86_64-pc-windows-msvc"
+//  264..266 (2):  "--"
+//  266..273 (7):  "--emit="
+//  273..276 (3):  "exe"
+//  276..285 (9):  "[package]"
+//  285..289 (4):  "name"
+//  289..293 (4):  "kind"
+//  293..302 (9):  "AXIOM_STD"
+//  302..312 (10): "axiom.toml"
+//  312..319 (7):  "main.ax"
+//  319..330 (11): "src/main.ax"
+//  330..346 (16): "<std>/core/host.ax" (wait: 18 bytes)
+const DRIVER_STR_TABLE: [1012]u8 = [
+    // 0..4: "help"
+    104u8, 101u8, 108u8, 112u8,
+    // 4..10: "--help"
+    45u8, 45u8, 104u8, 101u8, 108u8, 112u8,
+    // 10..12: "-h"
+    45u8, 104u8,
+    // 12..19: "version"
+    118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8,
+    // 19..29: "--features"
+    45u8, 45u8, 102u8, 101u8, 97u8, 116u8, 117u8, 114u8, 101u8, 115u8,
+    // 29..36: "inspect"
+    105u8, 110u8, 115u8, 112u8, 101u8, 99u8, 116u8,
+    // 36..41: "check"
+    99u8, 104u8, 101u8, 99u8, 107u8,
+    // 41..46: "build"
+    98u8, 117u8, 105u8, 108u8, 100u8,
+    // 46..49: "run"
+    114u8, 117u8, 110u8,
+    // 49..52: "ast"
+    97u8, 115u8, 116u8,
+    // 52..55: "hir"
+    104u8, 105u8, 114u8,
+    // 55..58: "lir"
+    108u8, 105u8, 114u8,
+    // 58..60: "mc"
+    109u8, 99u8,
+    // 60..62: "mi"
+    109u8, 105u8,
+    // 62..65: "mir"
+    109u8, 105u8, 114u8,
+    // 65..72: "mir-opt"
+    109u8, 105u8, 114u8, 45u8, 111u8, 112u8, 116u8,
+    // 72..75: "obj"
+    111u8, 98u8, 106u8,
+    // 75..83: "resolved"
+    114u8, 101u8, 115u8, 111u8, 108u8, 118u8, 101u8, 100u8,
+    // 83..87: "thir"
+    116u8, 104u8, 105u8, 114u8,
+    // 87..93: "tokens"
+    116u8, 111u8, 107u8, 101u8, 110u8, 115u8,
+    // 93..106: "--color=never"
+    45u8, 45u8, 99u8, 111u8, 108u8, 111u8, 114u8, 61u8, 110u8, 101u8, 118u8, 101u8, 114u8,
+    // 106..119: "--time-passes"
+    45u8, 45u8, 116u8, 105u8, 109u8, 101u8, 45u8, 112u8, 97u8, 115u8, 115u8, 101u8, 115u8,
+    // 119..125: "--json"
+    45u8, 45u8, 106u8, 115u8, 111u8, 110u8,
+    // 125..128: "-O0"
+    45u8, 79u8, 48u8,
+    // 128..131: "-O1"
+    45u8, 79u8, 49u8,
+    // 131..144: "--verify-each"
+    45u8, 45u8, 118u8, 101u8, 114u8, 105u8, 102u8, 121u8, 45u8, 101u8, 97u8, 99u8, 104u8,
+    // 144..152: "--target"
+    45u8, 45u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8,
+    // 152..162: "--std-root"
+    45u8, 45u8, 115u8, 116u8, 100u8, 45u8, 114u8, 111u8, 111u8, 116u8,
+    // 162..164: "-o"
+    45u8, 111u8,
+    // 164..170: "--emit"
+    45u8, 45u8, 101u8, 109u8, 105u8, 116u8,
+    // 170..185: "--stack-reserve"
+    45u8, 45u8, 115u8, 116u8, 97u8, 99u8, 107u8, 45u8, 114u8, 101u8, 115u8, 101u8, 114u8, 118u8, 101u8,
+    // 185..193: "--interp"
+    45u8, 45u8, 105u8, 110u8, 116u8, 101u8, 114u8, 112u8,
+    // 193..205: "--step-limit"
+    45u8, 45u8, 115u8, 116u8, 101u8, 112u8, 45u8, 108u8, 105u8, 109u8, 105u8, 116u8,
+    // 205..221: "--max-call-depth"
+    45u8, 45u8, 109u8, 97u8, 120u8, 45u8, 99u8, 97u8, 108u8, 108u8, 45u8, 100u8, 101u8, 112u8, 116u8, 104u8,
+    // 221..228: "1048576"
+    49u8, 48u8, 52u8, 56u8, 53u8, 55u8, 54u8,
+    // 228..236: "50000000"
+    53u8, 48u8, 48u8, 48u8, 48u8, 48u8, 48u8, 48u8,
+    // 236..242: "100000"
+    49u8, 48u8, 48u8, 48u8, 48u8, 48u8,
+    // 242..264: "x86_64-pc-windows-msvc"
+    120u8, 56u8, 54u8, 95u8, 54u8, 52u8, 45u8, 112u8, 99u8, 45u8, 119u8, 105u8, 110u8, 100u8, 111u8, 119u8,
+    115u8, 45u8, 109u8, 115u8, 118u8, 99u8,
+    // 264..266: "--"
+    45u8, 45u8,
+    // 266..273: "--emit="
+    45u8, 45u8, 101u8, 109u8, 105u8, 116u8, 61u8,
+    // 273..276: "exe"
+    101u8, 120u8, 101u8,
+    // 276..285: "[package]"
+    91u8, 112u8, 97u8, 99u8, 107u8, 97u8, 103u8, 101u8, 93u8,
+    // 285..289: "name"
+    110u8, 97u8, 109u8, 101u8,
+    // 289..293: "kind"
+    107u8, 105u8, 110u8, 100u8,
+    // 293..302: "AXIOM_STD"
+    65u8, 88u8, 73u8, 79u8, 77u8, 95u8, 83u8, 84u8, 68u8,
+    // 302..312: "axiom.toml"
+    97u8, 120u8, 105u8, 111u8, 109u8, 46u8, 116u8, 111u8, 109u8, 108u8,
+    // 312..319: "main.ax"
+    109u8, 97u8, 105u8, 110u8, 46u8, 97u8, 120u8,
+    // 319..330: "src/main.ax"
+    115u8, 114u8, 99u8, 47u8, 109u8, 97u8, 105u8, 110u8, 46u8, 97u8, 120u8,
+    // 330..350: "<std>/core/option.ax" (20)
+    60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 111u8, 112u8, 116u8, 105u8, 111u8,
+    110u8, 46u8, 97u8, 120u8,
+    // 350..366: "std.core.option" (15 + 1 pad = 15) -> let's use exact lengths:
+    // 350..365: "std.core.option" (15)
+    115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 111u8, 112u8, 116u8, 105u8, 111u8, 110u8,
+    // 365..385: "<std>/core/result.ax" (20)
+    60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 114u8, 101u8, 115u8, 117u8, 108u8,
+    116u8, 46u8, 97u8, 120u8,
+    // 385..400: "std.core.result" (15)
+    115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 114u8, 101u8, 115u8, 117u8, 108u8, 116u8,
+    // 400..421: "<std>/core/prelude.ax" (21)
+    60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 112u8, 114u8, 101u8, 108u8, 117u8,
+    100u8, 101u8, 46u8, 97u8, 120u8,
+    // 421..437: "std.core.prelude" (16)
+    115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 112u8, 114u8, 101u8, 108u8, 117u8, 100u8, 101u8,
+    // 437..455: "<std>/core/host.ax" (18)
+    60u8, 115u8, 116u8, 100u8, 62u8, 47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 104u8, 111u8, 115u8, 116u8, 46u8,
+    97u8, 120u8,
+    // 455..468: "std.core.host" (13)
+    115u8, 116u8, 100u8, 46u8, 99u8, 111u8, 114u8, 101u8, 46u8, 104u8, 111u8, 115u8, 116u8,
+    // 468..483: "/core/option.ax" (15)
+    47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 111u8, 112u8, 116u8, 105u8, 111u8, 110u8, 46u8, 97u8, 120u8,
+    // 483..498: "/core/result.ax" (15)
+    47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 114u8, 101u8, 115u8, 117u8, 108u8, 116u8, 46u8, 97u8, 120u8,
+    // 498..514: "/core/prelude.ax" (16)
+    47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 112u8, 114u8, 101u8, 108u8, 117u8, 100u8, 101u8, 46u8, 97u8, 120u8,
+    // 514..527: "/core/host.ax" (13)
+    47u8, 99u8, 111u8, 114u8, 101u8, 47u8, 104u8, 111u8, 115u8, 116u8, 46u8, 97u8, 120u8,
+    // 527..552: "axiom0: unknown command '" (25)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 32u8,
+    99u8, 111u8, 109u8, 109u8, 97u8, 110u8, 100u8, 32u8, 39u8,
+    // 552..554: "'\n" (2)
+    39u8, 10u8,
+    // 554..597: "axiom0: 'version' takes no arguments (got '" (43)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 39u8, 118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8,
+    39u8, 32u8, 116u8, 97u8, 107u8, 101u8, 115u8, 32u8, 110u8, 111u8, 32u8, 97u8, 114u8, 103u8, 117u8, 109u8,
+    101u8, 110u8, 116u8, 115u8, 32u8, 40u8, 103u8, 111u8, 116u8, 32u8, 39u8,
+    // 597..600: "')\n" (3)
+    39u8, 41u8, 10u8,
+    // 600..646: "axiom0: '--features' takes no arguments (got '" (46)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 39u8, 45u8, 45u8, 102u8, 101u8, 97u8, 116u8, 117u8,
+    114u8, 101u8, 115u8, 39u8, 32u8, 116u8, 97u8, 107u8, 101u8, 115u8, 32u8, 110u8, 111u8, 32u8, 97u8, 114u8,
+    103u8, 117u8, 109u8, 101u8, 110u8, 116u8, 115u8, 32u8, 40u8, 103u8, 111u8, 116u8, 32u8, 39u8,
+    // 646..699: "axiom0: usage: axiom0 inspect --emit=<name> [arguments]\n" (56)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 115u8, 97u8, 103u8, 101u8, 58u8, 32u8, 97u8,
+    120u8, 105u8, 111u8, 109u8, 48u8, 32u8, 105u8, 110u8, 115u8, 112u8, 101u8, 99u8, 116u8, 32u8, 45u8, 45u8,
+    101u8, 109u8, 105u8, 116u8, 61u8, 60u8, 110u8, 97u8, 109u8, 101u8, 62u8, 32u8, 91u8, 97u8, 114u8, 103u8,
+    117u8, 109u8, 101u8, 110u8, 116u8, 115u8, 93u8, 10u8,
+    // 702..727: "axiom0: unknown emitter '" (25)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 32u8,
+    101u8, 109u8, 105u8, 116u8, 116u8, 101u8, 114u8, 32u8, 39u8,
+    // 727..764: "axiom0: usage: axiom0 inspect --emit=" (37)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 115u8, 97u8, 103u8, 101u8, 58u8, 32u8, 97u8,
+    120u8, 105u8, 111u8, 109u8, 48u8, 32u8, 105u8, 110u8, 115u8, 112u8, 101u8, 99u8, 116u8, 32u8, 45u8, 45u8,
+    101u8, 109u8, 105u8, 116u8, 61u8,
+    // 764..772: " <file>\n" (8)
+    32u8, 60u8, 102u8, 105u8, 108u8, 101u8, 62u8, 10u8,
+    // 772..788: "axiom0: option '" (16)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 111u8, 112u8, 116u8, 105u8, 111u8, 110u8, 32u8, 39u8,
+    // 788..815: "' does not take an argument\n" (28)
+    39u8, 32u8, 100u8, 111u8, 101u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 116u8, 97u8, 107u8, 101u8, 32u8,
+    97u8, 110u8, 32u8, 97u8, 114u8, 103u8, 117u8, 109u8, 101u8, 110u8, 116u8, 10u8,
+    // 816..839: "' requires an argument\n" (23)
+    39u8, 32u8, 114u8, 101u8, 113u8, 117u8, 105u8, 114u8, 101u8, 115u8, 32u8, 97u8, 110u8, 32u8, 97u8, 114u8,
+    103u8, 117u8, 109u8, 101u8, 110u8, 116u8, 10u8,
+    // 839..863: "axiom0: unknown option '" (24)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 32u8,
+    111u8, 112u8, 116u8, 105u8, 111u8, 110u8, 32u8, 39u8,
+    // 863..897: "axiom0: check needs an input file\n" (34)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 99u8, 104u8, 101u8, 99u8, 107u8, 32u8, 110u8, 101u8,
+    101u8, 100u8, 115u8, 32u8, 97u8, 110u8, 32u8, 105u8, 110u8, 112u8, 117u8, 116u8, 32u8, 102u8, 105u8, 108u8,
+    101u8, 10u8,
+    // 897..931: "axiom0: build needs an input file\n" (34)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 98u8, 117u8, 105u8, 108u8, 100u8, 32u8, 110u8, 101u8,
+    101u8, 100u8, 115u8, 32u8, 97u8, 110u8, 32u8, 105u8, 110u8, 112u8, 117u8, 116u8, 32u8, 102u8, 105u8, 108u8,
+    101u8, 10u8,
+    // 931..971: "axiom0: build needs an output file (-o)\n" (40)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 98u8, 117u8, 105u8, 108u8, 100u8, 32u8, 110u8, 101u8,
+    101u8, 100u8, 115u8, 32u8, 97u8, 110u8, 32u8, 111u8, 117u8, 116u8, 112u8, 117u8, 116u8, 32u8, 102u8, 105u8,
+    108u8, 101u8, 32u8, 40u8, 45u8, 111u8, 41u8, 10u8,
+    // 971..1003: "axiom0: run needs an input file\n" (32)
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 114u8, 117u8, 110u8, 32u8, 110u8, 101u8, 101u8, 100u8,
+    115u8, 32u8, 97u8, 110u8, 32u8, 105u8, 110u8, 112u8, 117u8, 116u8, 32u8, 102u8, 105u8, 108u8, 101u8, 10u8,
+    // 1003..1012: "/../std\0\0" (7 + 2)
+    47u8, 46u8, 46u8, 47u8, 115u8, 116u8, 100u8, 0u8, 0u8,
+];
+
+// Diagnostic messages & target error suffix:
+//   0..25   (25): "input file does not exist"
+//   25..42  (17): "no std root found"
+//   42..90  (48): "malformed or invalid package manifest axiom.toml"
+//   90..119 (29): "' [AX_DRIVER_UNKNOWN_TARGET]\n"
+//   119..143(24): "axiom0: unknown target '"
+const DRIVER_DIAG_MSG_BYTES: [143]u8 = [
+    // 0..25: "input file does not exist"
+    105u8, 110u8, 112u8, 117u8, 116u8, 32u8, 102u8, 105u8, 108u8, 101u8, 32u8, 100u8, 111u8, 101u8, 115u8, 32u8,
+    110u8, 111u8, 116u8, 32u8, 101u8, 120u8, 105u8, 115u8, 116u8,
+    // 25..42: "no std root found"
+    110u8, 111u8, 32u8, 115u8, 116u8, 100u8, 32u8, 114u8, 111u8, 111u8, 116u8, 32u8, 102u8, 111u8, 117u8, 110u8,
+    100u8,
+    // 42..90: "malformed or invalid package manifest axiom.toml"
+    109u8, 97u8, 108u8, 102u8, 111u8, 114u8, 109u8, 101u8, 100u8, 32u8, 111u8, 114u8, 32u8, 105u8, 110u8, 118u8,
+    97u8, 108u8, 105u8, 100u8, 32u8, 112u8, 97u8, 99u8, 107u8, 97u8, 103u8, 101u8, 32u8, 109u8, 97u8, 110u8,
+    105u8, 102u8, 101u8, 115u8, 116u8, 32u8, 97u8, 120u8, 105u8, 111u8, 109u8, 46u8, 116u8, 111u8, 109u8, 108u8,
+    // 90..119: "' [AX_DRIVER_UNKNOWN_TARGET]\n"
+    39u8, 32u8, 91u8, 65u8, 88u8, 95u8, 68u8, 82u8, 73u8, 86u8, 69u8, 82u8, 95u8, 85u8, 78u8, 75u8,
+    78u8, 79u8, 87u8, 78u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 93u8, 10u8,
+    // 119..143: "axiom0: unknown target '"
+    97u8, 120u8, 105u8, 111u8, 109u8, 48u8, 58u8, 32u8, 117u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 32u8,
+    116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 32u8, 39u8,
+];
+
+// =============================================================================
+// 3. Low-Level Byte & String View Helpers
+// =============================================================================
+
+pub fn opts_mul_usize(a: usize, b: usize) -> usize {
+    (((a as isize) * (b as isize)) as usize)
+}
+
+pub unsafe fn sv_slot_at(base: *mut StrView, idx: usize) -> *mut StrView {
+    let off = opts_mul_usize(idx, size_of<StrView>());
+    ((base as *mut u8) + off) as *mut StrView
+}
+
+pub unsafe fn sv_const_slot_at(base: *const StrView, idx: usize) -> *const StrView {
+    let off = opts_mul_usize(idx, size_of<StrView>());
+    ((base as *const u8) + off) as *const StrView
+}
+
+pub fn sv_slot_get(base: *const StrView, idx: usize) -> StrView {
+    let p = unsafe { sv_const_slot_at(base, idx) };
+    let ptr_val = unsafe { (*p).ptr };
+    let len_val = unsafe { (*p).len };
+    StrView { ptr: ptr_val, len: len_val }
+}
+
+pub fn sv_slot_set(base: *mut StrView, idx: usize, val: view<StrView>) {
+    let p = unsafe { sv_slot_at(base, idx) };
+    unsafe {
+        (*p).ptr = val.ptr;
+        (*p).len = val.len;
+    }
+}
+
+pub fn sv_empty() -> StrView {
+    StrView { ptr: 0 as *const u8, len: 0 }
+}
+
+pub fn opts_arena_init(a: mut_view<Arena>) {
+    a.head = 0 as *mut ArenaChunk;
+    a.current = 0 as *mut ArenaChunk;
+    a.chunk_size = 65536;
+    a.bytes_requested = 0;
+    a.chunk_count = 0;
+    a.chunks_allocated = 0;
+    a.chunks_freed = 0;
+}
+
+pub fn sv_set(dst: mut_view<StrView>, ptr: *const u8, n: usize) {
+    dst.ptr = ptr;
+    dst.len = n;
+}
+
+pub fn sv_copy_to(dst: mut_view<StrView>, src: view<StrView>) {
+    dst.ptr = src.ptr;
+    dst.len = src.len;
+}
+
+pub fn sv_clear(dst: mut_view<StrView>) {
+    dst.ptr = 0 as *const u8;
+    dst.len = 0;
+}
+
+pub fn sv_eq(a: view<StrView>, b: view<StrView>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    if a.len == 0 {
+        return true;
+    }
+    if (a.ptr as usize) == 0 || (b.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        if (unsafe { *(a.ptr + i) }) != (unsafe { *(b.ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn sv_cmp(a: view<StrView>, b: view<StrView>) -> i32 {
+    let a_len = a.len;
+    let b_len = b.len;
+    let min_len: usize = if a_len < b_len { a_len } else { b_len };
+    let mut i: usize = 0;
+    while i < min_len {
+        let ca = unsafe { *(a.ptr + i) };
+        let cb = unsafe { *(b.ptr + i) };
+        if ca < cb {
+            return -1;
+        }
+        if ca > cb {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if a_len < b_len {
+        return -1;
+    }
+    if a_len > b_len {
+        return 1;
+    }
+    0
+}
+
+pub fn sv_eq_table(sv: view<StrView>, off: usize, n: usize) -> bool {
+    if sv.len != n {
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    if (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n {
+        if (unsafe { *(sv.ptr + i) }) != DRIVER_STR_TABLE[off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn sv_starts_with_table(sv: view<StrView>, off: usize, n: usize) -> bool {
+    let sv_len = sv.len;
+    if sv_len < n || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n {
+        if (unsafe { *(sv.ptr + i) }) != DRIVER_STR_TABLE[off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn sv_ends_with_ax(sv: view<StrView>) -> bool {
+    let n = sv.len;
+    if n < 3 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let b0 = unsafe { *(sv.ptr + n - 3) };
+    let b1 = unsafe { *(sv.ptr + n - 2) };
+    let b2 = unsafe { *(sv.ptr + n - 1) };
+    b0 == 46u8 && b1 == 97u8 && b2 == 120u8
+}
+
+pub fn sv_ends_with_mir(sv: view<StrView>) -> bool {
+    let n = sv.len;
+    if n < 4 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let b0 = unsafe { *(sv.ptr + n - 4) };
+    let b1 = unsafe { *(sv.ptr + n - 3) };
+    let b2 = unsafe { *(sv.ptr + n - 2) };
+    let b3 = unsafe { *(sv.ptr + n - 1) };
+    b0 == 46u8 && b1 == 109u8 && b2 == 105u8 && b3 == 114u8
+}
+
+pub fn arena_clone_sv(arena: mut_view<Arena>, sv: view<StrView>) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), sv.len + 1, 1);
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe {
+            *(dst + i) = *(sv.ptr + i);
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + sv.len) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: sv.len }
+}
+
+pub fn arena_table_sv(arena: mut_view<Arena>, off: usize, n: usize) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = DRIVER_STR_TABLE[off + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+pub fn arena_normalize_path(arena: mut_view<Arena>, sv: view<StrView>) -> StrView {
+    let mut n = sv.len;
+    while n > 1 {
+        let last = unsafe { *(sv.ptr + n - 1) };
+        if last == 47u8 || last == 92u8 {
+            n = n - 1;
+        } else {
+            break;
+        }
+    }
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        let mut b = unsafe { *(sv.ptr + i) };
+        if b == 92u8 {
+            b = 47u8;
+        }
+        unsafe {
+            *(dst + i) = b;
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+pub fn arena_join_path(arena: mut_view<Arena>, dir: view<StrView>, child: view<StrView>) -> StrView {
+    if dir.len == 0 {
+        return arena_normalize_path(mut_view(*arena), child);
+    }
+    let need_slash = (unsafe { *(dir.ptr + dir.len - 1) }) != 47u8 &&
+                     (unsafe { *(dir.ptr + dir.len - 1) }) != 92u8 &&
+                     (child.len == 0 || ((unsafe { *child.ptr }) != 47u8 && (unsafe { *child.ptr }) != 92u8));
+    let total = dir.len + (if need_slash { 1 } else { 0 }) + child.len;
+    let dst = arena_alloc_raw(mut_view(*arena), total + 1, 1);
+    let mut pos: usize = 0;
+    let mut i: usize = 0;
+    while i < dir.len {
+        let mut b = unsafe { *(dir.ptr + i) };
+        if b == 92u8 { b = 47u8; }
+        unsafe { *(dst + pos) = b; }
+        pos = pos + 1;
+        i = i + 1;
+    }
+    if need_slash {
+        unsafe { *(dst + pos) = 47u8; }
+        pos = pos + 1;
+    }
+    let mut j: usize = 0;
+    while j < child.len {
+        let mut b = unsafe { *(child.ptr + j) };
+        if b == 92u8 { b = 47u8; }
+        unsafe { *(dst + pos) = b; }
+        pos = pos + 1;
+        j = j + 1;
+    }
+    unsafe { *(dst + pos) = 0u8; }
+    StrView { ptr: dst as *const u8, len: pos }
+}
+
+fn push_table_slice(out: mut_view<DiagBuffer>, off: usize, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        diag_buf_push_byte(mut_view(*out), DRIVER_STR_TABLE[off + i]);
+        i = i + 1;
+    }
+}
+
+fn push_diag_msg_slice(out: mut_view<DiagBuffer>, off: usize, n: usize) {
+    let mut i: usize = 0;
+    while i < n {
+        diag_buf_push_byte(mut_view(*out), DRIVER_DIAG_MSG_BYTES[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn emit_driver_diag(sink: mut_view<DiagSink>, code_v: u32, msg_off: usize, msg_len: usize) {
+    let buf = arena_alloc_raw(mut_view(sink.arena), msg_len + 1, 1);
+    let mut i: usize = 0;
+    while i < msg_len {
+        unsafe {
+            *(buf + i) = DRIVER_DIAG_MSG_BYTES[msg_off + i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(buf + msg_len) = 0u8;
+    }
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf as *const u8, len: msg_len },
+        primary: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
+// =============================================================================
+// 4. Usage, Version, Features, and Emitter Registry Formatting
+// =============================================================================
+
+pub fn driver_format_usage(out: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < 458 {
+        diag_buf_push_byte(mut_view(*out), USAGE_TEXT_BYTES[i]);
+        i = i + 1;
+    }
+}
+
+pub fn driver_format_version(out: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < 22 {
+        diag_buf_push_byte(mut_view(*out), VERSION_FEATURES_BYTES[i]);
+        i = i + 1;
+    }
+}
+
+pub fn driver_format_features(out: mut_view<DiagBuffer>) {
+    let mut i: usize = 22;
+    while i < 78 {
+        diag_buf_push_byte(mut_view(*out), VERSION_FEATURES_BYTES[i]);
+        i = i + 1;
+    }
+}
+
+pub fn driver_format_emitters(out: mut_view<DiagBuffer>) {
+    let mut i: usize = 0;
+    while i < 462 {
+        diag_buf_push_byte(mut_view(*out), EMITTERS_TEXT_BYTES[i]);
+        i = i + 1;
+    }
+}
+
+pub fn driver_find_command(name: view<StrView>) -> u32 {
+    if sv_eq_table(name, 0, 4) || sv_eq_table(name, 4, 6) || sv_eq_table(name, 10, 2) {
+        return CMD_HELP;
+    }
+    if sv_eq_table(name, 12, 7) { return CMD_VERSION; }
+    if sv_eq_table(name, 19, 10) { return CMD_FEATURES; }
+    if sv_eq_table(name, 29, 7) { return CMD_INSPECT; }
+    if sv_eq_table(name, 36, 5) { return CMD_CHECK; }
+    if sv_eq_table(name, 41, 5) { return CMD_BUILD; }
+    if sv_eq_table(name, 46, 3) { return CMD_RUN; }
+    CMD_NONE
+}
+
+pub fn driver_find_emitter(name: view<StrView>) -> u32 {
+    if sv_eq_table(name, 49, 3) { return EMIT_AST; }
+    if sv_eq_table(name, 52, 3) { return EMIT_HIR; }
+    if sv_eq_table(name, 55, 3) { return EMIT_LIR; }
+    if sv_eq_table(name, 58, 2) { return EMIT_MC; }
+    if sv_eq_table(name, 60, 2) { return EMIT_MI; }
+    if sv_eq_table(name, 62, 3) { return EMIT_MIR; }
+    if sv_eq_table(name, 65, 7) { return EMIT_MIR_OPT; }
+    if sv_eq_table(name, 72, 3) { return EMIT_OBJ; }
+    if sv_eq_table(name, 75, 8) { return EMIT_RESOLVED; }
+    if sv_eq_table(name, 83, 4) { return EMIT_THIR; }
+    if sv_eq_table(name, 87, 6) { return EMIT_TOKENS; }
+    EMIT_NONE
+}
+
+// =============================================================================
+// 5. DriverOptions & CLI Option Parser
+// =============================================================================
+
+pub struct DriverOptions {
+    pub arena: Arena,
+    pub cmd: u32,
+    pub emit_kind: u32,
+    pub color_never: bool,
+    pub time_passes: bool,
+    pub json: bool,
+    pub opt_O0: bool,
+    pub opt_O1: bool,
+    pub verify_each: bool,
+    pub run_interp: bool,
+    pub target: StrView,
+    pub std_root: StrView,
+    pub output: StrView,
+    pub emit: StrView,
+    pub stack_reserve: StrView,
+    pub step_limit_str: StrView,
+    pub max_call_depth_str: StrView,
+    pub step_limit: i32,
+    pub max_call_depth: i32,
+    pub input_file: StrView,
+    pub pos_args: *mut StrView,
+    pub pos_argc: usize,
+    pub pos_cap: usize,
+    pub run_args: *mut StrView,
+    pub run_argc: usize,
+    pub run_cap: usize,
+    pub dash_dash: bool,
+}
+
+pub fn driver_parse_i32_decimal(sv: view<StrView>, default_val: i32) -> i32 {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return default_val;
+    }
+    let mut val: i64 = 0;
+    let mut i: usize = 0;
+    let mut any: bool = false;
+    while i < sv.len {
+        let ch = unsafe { *(sv.ptr + i) };
+        if ch >= 48u8 && ch <= 57u8 {
+            val = val * 10i64 + ((ch - 48u8) as i64);
+            any = true;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if !any {
+        return default_val;
+    }
+    val as i32
+}
+
+pub fn driver_parse_u32_decimal(sv: view<StrView>, default_val: u32) -> u32 {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return default_val;
+    }
+    let mut val: u64 = 0u64;
+    let mut i: usize = 0;
+    let mut any: bool = false;
+    while i < sv.len {
+        let ch = unsafe { *(sv.ptr + i) };
+        if ch >= 48u8 && ch <= 57u8 {
+            val = (((val as i64) * 10i64) as u64) + ((ch - 48u8) as u64);
+            any = true;
+        } else {
+            break;
+        }
+        i = i + 1;
+    }
+    if !any {
+        return default_val;
+    }
+    val as u32
+}
+
+pub fn driver_options_new() -> DriverOptions {
+    let mut a = arena_new();
+    let sr = arena_table_sv(mut_view(a), 221, 7);
+    let sl = arena_table_sv(mut_view(a), 228, 8);
+    let mcd = arena_table_sv(mut_view(a), 236, 6);
+    DriverOptions {
+        arena: a,
+        cmd: CMD_NONE,
+        emit_kind: EMIT_NONE,
+        color_never: false,
+        time_passes: false,
+        json: false,
+        opt_O0: false,
+        opt_O1: false,
+        verify_each: false,
+        run_interp: false,
+        target: sv_empty(),
+        std_root: sv_empty(),
+        output: sv_empty(),
+        emit: sv_empty(),
+        stack_reserve: sr,
+        step_limit_str: sl,
+        max_call_depth_str: mcd,
+        step_limit: 50000000,
+        max_call_depth: 100000,
+        input_file: sv_empty(),
+        pos_args: 0 as *mut StrView,
+        pos_argc: 0,
+        pos_cap: 0,
+        run_args: 0 as *mut StrView,
+        run_argc: 0,
+        run_cap: 0,
+        dash_dash: false,
+    }
+}
+
+pub fn driver_options_init(dopts: mut_view<DriverOptions>) {
+    opts_arena_init(mut_view(dopts.arena));
+    dopts.cmd = CMD_NONE;
+    dopts.emit_kind = EMIT_NONE;
+    dopts.color_never = false;
+    dopts.time_passes = false;
+    dopts.json = false;
+    dopts.opt_O0 = false;
+    dopts.opt_O1 = false;
+    dopts.verify_each = false;
+    dopts.run_interp = false;
+    sv_clear(mut_view(dopts.target));
+    sv_clear(mut_view(dopts.std_root));
+    sv_clear(mut_view(dopts.output));
+    sv_clear(mut_view(dopts.emit));
+    let sr = arena_table_sv(mut_view(dopts.arena), 221, 7);
+    let sl = arena_table_sv(mut_view(dopts.arena), 228, 8);
+    let mcd = arena_table_sv(mut_view(dopts.arena), 236, 6);
+    sv_copy_to(mut_view(dopts.stack_reserve), view(sr));
+    sv_copy_to(mut_view(dopts.step_limit_str), view(sl));
+    sv_copy_to(mut_view(dopts.max_call_depth_str), view(mcd));
+    dopts.step_limit = 50000000;
+    dopts.max_call_depth = 100000;
+    sv_clear(mut_view(dopts.input_file));
+    dopts.pos_args = 0 as *mut StrView;
+    dopts.pos_argc = 0;
+    dopts.pos_cap = 0;
+    dopts.run_args = 0 as *mut StrView;
+    dopts.run_argc = 0;
+    dopts.run_cap = 0;
+    dopts.dash_dash = false;
+}
+
+pub fn driver_options_free(dopts: mut_view<DriverOptions>) {
+    if dopts.pos_cap > 0 && (dopts.pos_args as usize) != 0 {
+        unsafe {
+            heap_free(dopts.pos_args as *mut u8, opts_mul_usize(dopts.pos_cap, size_of<StrView>()), align_of<StrView>());
+        }
+    }
+    if dopts.run_cap > 0 && (dopts.run_args as usize) != 0 {
+        unsafe {
+            heap_free(dopts.run_args as *mut u8, opts_mul_usize(dopts.run_cap, size_of<StrView>()), align_of<StrView>());
+        }
+    }
+    dopts.pos_args = 0 as *mut StrView;
+    dopts.pos_argc = 0;
+    dopts.pos_cap = 0;
+    dopts.run_args = 0 as *mut StrView;
+    dopts.run_argc = 0;
+    dopts.run_cap = 0;
+    arena_destroy(mut_view(dopts.arena));
+}
+
+pub fn driver_options_alloc() -> *mut DriverOptions {
+    let sz = size_of<DriverOptions>();
+    let raw = unsafe { heap_alloc(sz, align_of<DriverOptions>()) };
+    let mut i: usize = 0;
+    while i < sz {
+        unsafe { *(raw + i) = 0u8; }
+        i = i + 1;
+    }
+    let ptr = raw as *mut DriverOptions;
+    driver_options_init(unsafe { mut_view(*ptr) });
+    ptr
+}
+
+pub fn driver_options_dealloc(ptr: *mut DriverOptions) {
+    if (ptr as usize) == 0 {
+        return;
+    }
+    driver_options_free(unsafe { mut_view(*ptr) });
+    unsafe {
+        heap_free(ptr as *mut u8, size_of<DriverOptions>(), align_of<DriverOptions>());
+    }
+}
+
+fn push_pos_arg(dopts: mut_view<DriverOptions>, arg_sv: StrView) {
+    if dopts.pos_argc >= dopts.pos_cap {
+        let new_cap: usize = if dopts.pos_cap == 0 { 16 } else { opts_mul_usize(dopts.pos_cap, 2) };
+        let new_bytes = opts_mul_usize(new_cap, size_of<StrView>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<StrView>()) as *mut StrView };
+        if dopts.pos_argc > 0 && (dopts.pos_args as usize) != 0 {
+            let old_bytes = opts_mul_usize(dopts.pos_argc, size_of<StrView>());
+            let old_cap_bytes = opts_mul_usize(dopts.pos_cap, size_of<StrView>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(dopts.pos_args as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(dopts.pos_args as *mut u8, old_cap_bytes, align_of<StrView>());
+            }
+        }
+        dopts.pos_args = new_arr;
+        dopts.pos_cap = new_cap;
+    }
+    sv_slot_set(dopts.pos_args, dopts.pos_argc, view(arg_sv));
+    dopts.pos_argc = dopts.pos_argc + 1;
+}
+
+fn push_run_arg(dopts: mut_view<DriverOptions>, arg_sv: StrView) {
+    if dopts.run_argc >= dopts.run_cap {
+        let new_cap: usize = if dopts.run_cap == 0 { 16 } else { opts_mul_usize(dopts.run_cap, 2) };
+        let new_bytes = opts_mul_usize(new_cap, size_of<StrView>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<StrView>()) as *mut StrView };
+        if dopts.run_argc > 0 && (dopts.run_args as usize) != 0 {
+            let old_bytes = opts_mul_usize(dopts.run_argc, size_of<StrView>());
+            let old_cap_bytes = opts_mul_usize(dopts.run_cap, size_of<StrView>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(dopts.run_args as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(dopts.run_args as *mut u8, old_cap_bytes, align_of<StrView>());
+            }
+        }
+        dopts.run_args = new_arr;
+        dopts.run_cap = new_cap;
+    }
+    sv_slot_set(dopts.run_args, dopts.run_argc, view(arg_sv));
+    dopts.run_argc = dopts.run_argc + 1;
+}
+
+fn find_eq_index(sv: view<StrView>) -> isize {
+    let mut i: usize = 0;
+    while i < sv.len {
+        if (unsafe { *(sv.ptr + i) }) == 61u8 {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    -1isize
+}
+
+fn err_bool_takes_no_arg(err_out: mut_view<DiagBuffer>, opt_name: view<StrView>) {
+    // "axiom0: option '<name>' does not take an argument\n"
+    push_table_slice(mut_view(*err_out), 772, 16);
+    diag_buf_push_bytes(mut_view(*err_out), opt_name.ptr, opt_name.len);
+    push_table_slice(mut_view(*err_out), 788, 28);
+}
+
+fn err_opt_requires_arg(err_out: mut_view<DiagBuffer>, opt_name: view<StrView>) {
+    // "axiom0: option '<name>' requires an argument\n"
+    push_table_slice(mut_view(*err_out), 772, 16);
+    diag_buf_push_bytes(mut_view(*err_out), opt_name.ptr, opt_name.len);
+    push_table_slice(mut_view(*err_out), 816, 23);
+}
+
+fn err_unknown_option(err_out: mut_view<DiagBuffer>, arg_sv: view<StrView>) {
+    // "axiom0: unknown option '<arg>'\n"
+    push_table_slice(mut_view(*err_out), 839, 24);
+    diag_buf_push_bytes(mut_view(*err_out), arg_sv.ptr, arg_sv.len);
+    push_table_slice(mut_view(*err_out), 552, 2);
+}
+
+pub fn driver_validate_target(dopts: view<DriverOptions>, err_out: mut_view<DiagBuffer>) -> i32 {
+    if dopts.target.len == 0 {
+        return AX_EXIT_OK;
+    }
+    if sv_eq_table(view(dopts.target), 242, 22) {
+        return AX_EXIT_OK;
+    }
+    push_diag_msg_slice(mut_view(*err_out), 119, 24);
+    diag_buf_push_bytes(mut_view(*err_out), dopts.target.ptr, dopts.target.len);
+    push_diag_msg_slice(mut_view(*err_out), 90, 29);
+    AX_EXIT_USAGE
+}
+
+// Parses `args[0..argc]` where `args[0]` is the subcommand name (e.g. "build", "check", "run", "inspect"),
+// matching `ax_options_parse` in `bootstrap/axiom0/src/driver/pipeline.c`.
+pub fn driver_parse_options(
+    args: *const StrView,
+    argc: usize,
+    dopts: mut_view<DriverOptions>,
+    err_out: mut_view<DiagBuffer>
+) -> i32 {
+    let mut i: usize = 0;
+    while i < argc {
+        let arg_sv = sv_slot_get(args, i);
+        if !dopts.dash_dash && sv_eq_table(view(arg_sv), 264, 2) {
+            dopts.dash_dash = true;
+            dopts.run_argc = 0;
+            let mut j: usize = i + 1;
+            while j < argc {
+                let r_sv = sv_slot_get(args, j);
+                push_run_arg(mut_view(*dopts), r_sv);
+                j = j + 1;
+            }
+            i = i + 1;
+            continue;
+        }
+
+        let is_opt = !dopts.dash_dash && arg_sv.len > 0 && (unsafe { *arg_sv.ptr }) == 45u8;
+        if is_opt {
+            if sv_eq_table(view(arg_sv), 93, 13) {
+                dopts.color_never = true;
+                i = i + 1;
+                continue;
+            }
+            let eq_idx = find_eq_index(view(arg_sv));
+            let has_eq = eq_idx >= 0isize;
+            let name_len: usize = if has_eq { eq_idx as usize } else { arg_sv.len };
+            let name_sv = StrView { ptr: arg_sv.ptr, len: name_len };
+            let mut val_ptr: *const u8 = 0 as *const u8;
+            let mut val_len: usize = 0;
+            if has_eq {
+                let eq_off: usize = name_len + 1;
+                val_ptr = unsafe { arg_sv.ptr + eq_off };
+                val_len = arg_sv.len - eq_off;
+            }
+
+            // Boolean options: --time-passes, --json, -O0, -O1, --verify-each, --interp
+            if sv_eq_table(view(name_sv), 106, 13) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.time_passes = true;
+                i = i + 1;
+                continue;
+            }
+            if sv_eq_table(view(name_sv), 119, 6) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.json = true;
+                i = i + 1;
+                continue;
+            }
+            if sv_eq_table(view(name_sv), 125, 3) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.opt_O0 = true;
+                i = i + 1;
+                continue;
+            }
+            if sv_eq_table(view(name_sv), 128, 3) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.opt_O1 = true;
+                i = i + 1;
+                continue;
+            }
+            if sv_eq_table(view(name_sv), 131, 13) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.verify_each = true;
+                i = i + 1;
+                continue;
+            }
+            if sv_eq_table(view(name_sv), 185, 8) {
+                if has_eq {
+                    err_bool_takes_no_arg(mut_view(*err_out), view(name_sv));
+                    return AX_EXIT_USAGE;
+                }
+                dopts.run_interp = true;
+                i = i + 1;
+                continue;
+            }
+
+            // String options: --target, --std-root, -o, --emit, --stack-reserve, --step-limit, --max-call-depth
+            let mut is_str_opt: bool = false;
+            let mut opt_kind: u32 = 0u32;
+            if sv_eq_table(view(name_sv), 144, 8) {
+                is_str_opt = true;
+                opt_kind = 1u32;
+            } else if sv_eq_table(view(name_sv), 152, 10) {
+                is_str_opt = true;
+                opt_kind = 2u32;
+            } else if sv_eq_table(view(name_sv), 162, 2) {
+                is_str_opt = true;
+                opt_kind = 3u32;
+            } else if sv_eq_table(view(name_sv), 164, 6) {
+                is_str_opt = true;
+                opt_kind = 4u32;
+            } else if sv_eq_table(view(name_sv), 170, 15) {
+                is_str_opt = true;
+                opt_kind = 5u32;
+            } else if sv_eq_table(view(name_sv), 193, 12) {
+                is_str_opt = true;
+                opt_kind = 6u32;
+            } else if sv_eq_table(view(name_sv), 205, 16) {
+                is_str_opt = true;
+                opt_kind = 7u32;
+            }
+
+            if is_str_opt {
+                if !has_eq {
+                    if i + 1 >= argc {
+                        err_opt_requires_arg(mut_view(*err_out), view(name_sv));
+                        return AX_EXIT_USAGE;
+                    }
+                    i = i + 1;
+                    let next_sv = sv_slot_get(args, i);
+                    val_ptr = next_sv.ptr;
+                    val_len = next_sv.len;
+                }
+                let val_sv = StrView { ptr: val_ptr, len: val_len };
+                if opt_kind == 1u32 { sv_set(mut_view(dopts.target), val_ptr, val_len); }
+                else if opt_kind == 2u32 { sv_set(mut_view(dopts.std_root), val_ptr, val_len); }
+                else if opt_kind == 3u32 { sv_set(mut_view(dopts.output), val_ptr, val_len); }
+                else if opt_kind == 4u32 {
+                    let ek = driver_find_emitter(view(val_sv));
+                    dopts.emit_kind = ek;
+                    sv_set(mut_view(dopts.emit), val_ptr, val_len);
+                }
+                else if opt_kind == 5u32 { sv_set(mut_view(dopts.stack_reserve), val_ptr, val_len); }
+                else if opt_kind == 6u32 {
+                    let sl_v = driver_parse_i32_decimal(view(val_sv), 50000000);
+                    dopts.step_limit = sl_v;
+                    sv_set(mut_view(dopts.step_limit_str), val_ptr, val_len);
+                } else if opt_kind == 7u32 {
+                    let mcd_v = driver_parse_i32_decimal(view(val_sv), 100000);
+                    dopts.max_call_depth = mcd_v;
+                    sv_set(mut_view(dopts.max_call_depth_str), val_ptr, val_len);
+                }
+                i = i + 1;
+                continue;
+            }
+
+            err_unknown_option(mut_view(*err_out), view(arg_sv));
+            return AX_EXIT_USAGE;
+        }
+
+        push_pos_arg(mut_view(*dopts), arg_sv);
+        i = i + 1;
+    }
+    AX_EXIT_OK
+}
+
+// Top-level CLI parser for `argv[0..argc]` where `argv[0]` is the binary name ("axiom0").
+// Handles `help`/`--help`/`-h`, `version`, `--features`, `inspect`, `check`, `build`, `run`.
+pub fn driver_parse_cli(
+    args: *const StrView,
+    argc: usize,
+    dopts: mut_view<DriverOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    err_buf: mut_view<DiagBuffer>
+) -> i32 {
+    if argc < 2 {
+        driver_format_usage(mut_view(*err_buf));
+        return AX_EXIT_USAGE;
+    }
+
+    let cmd_sv = sv_slot_get(args, 1);
+    let cmd = driver_find_command(view(cmd_sv));
+    if cmd == CMD_NONE {
+        push_table_slice(mut_view(*err_buf), 527, 25);
+        diag_buf_push_bytes(mut_view(*err_buf), cmd_sv.ptr, cmd_sv.len);
+        push_table_slice(mut_view(*err_buf), 552, 2);
+        driver_format_usage(mut_view(*err_buf));
+        return AX_EXIT_USAGE;
+    }
+
+    dopts.cmd = cmd;
+    if cmd == CMD_HELP {
+        driver_format_usage(mut_view(*out_buf));
+        return AX_EXIT_OK;
+    }
+
+    if cmd == CMD_VERSION {
+        if argc != 2 {
+            let extra = sv_slot_get(args, 2);
+            push_table_slice(mut_view(*err_buf), 554, 43);
+            diag_buf_push_bytes(mut_view(*err_buf), extra.ptr, extra.len);
+            push_table_slice(mut_view(*err_buf), 597, 3);
+            return AX_EXIT_USAGE;
+        }
+        driver_format_version(mut_view(*out_buf));
+        return AX_EXIT_OK;
+    }
+
+    if cmd == CMD_FEATURES {
+        if argc != 2 {
+            let extra = sv_slot_get(args, 2);
+            push_table_slice(mut_view(*err_buf), 600, 46);
+            diag_buf_push_bytes(mut_view(*err_buf), extra.ptr, extra.len);
+            push_table_slice(mut_view(*err_buf), 597, 3);
+            return AX_EXIT_USAGE;
+        }
+        driver_format_features(mut_view(*out_buf));
+        return AX_EXIT_OK;
+    }
+
+    if cmd == CMD_INSPECT {
+        let mut emit_ptr: *const u8 = 0 as *const u8;
+        let mut emit_len: usize = 0;
+        let mut has_emit: bool = false;
+        let rest_bytes = opts_mul_usize(argc, size_of<StrView>());
+        let rest = unsafe { heap_alloc(rest_bytes, align_of<StrView>()) as *mut StrView };
+        let mut rest_n: usize = 0;
+        sv_slot_set(rest, rest_n, view(cmd_sv));
+        rest_n = rest_n + 1;
+
+        let mut i: usize = 2;
+        while i < argc {
+            let a_sv = sv_slot_get(args, i);
+            if sv_starts_with_table(view(a_sv), 266, 7) {
+                has_emit = true;
+                emit_ptr = unsafe { a_sv.ptr + 7 };
+                emit_len = a_sv.len - 7;
+            } else {
+                sv_slot_set(rest, rest_n, view(a_sv));
+                rest_n = rest_n + 1;
+            }
+            i = i + 1;
+        }
+
+        if !has_emit || emit_len == 0 {
+            unsafe { heap_free(rest as *mut u8, rest_bytes, align_of<StrView>()); }
+            push_table_slice(mut_view(*err_buf), 646, 56);
+            driver_format_emitters(mut_view(*err_buf));
+            return AX_EXIT_USAGE;
+        }
+
+        let emit_val = StrView { ptr: emit_ptr, len: emit_len };
+        let ek = driver_find_emitter(view(emit_val));
+        if ek == EMIT_NONE {
+            unsafe { heap_free(rest as *mut u8, rest_bytes, align_of<StrView>()); }
+            push_table_slice(mut_view(*err_buf), 702, 25);
+            diag_buf_push_bytes(mut_view(*err_buf), emit_ptr, emit_len);
+            push_table_slice(mut_view(*err_buf), 552, 2);
+            driver_format_emitters(mut_view(*err_buf));
+            return AX_EXIT_USAGE;
+        }
+
+        dopts.emit_kind = ek;
+        sv_set(mut_view(dopts.emit), emit_ptr, emit_len);
+        let rc = driver_parse_options(rest as *const StrView, rest_n, mut_view(*dopts), mut_view(*err_buf));
+        unsafe { heap_free(rest as *mut u8, rest_bytes, align_of<StrView>()); }
+        if rc != AX_EXIT_OK {
+            return rc;
+        }
+        if dopts.pos_argc != 2 {
+            push_table_slice(mut_view(*err_buf), 727, 37);
+            diag_buf_push_bytes(mut_view(*err_buf), emit_ptr, emit_len);
+            push_table_slice(mut_view(*err_buf), 764, 8);
+            return AX_EXIT_USAGE;
+        }
+        let in_sv = sv_slot_get(dopts.pos_args as *const StrView, 1);
+        sv_copy_to(mut_view(dopts.input_file), view(in_sv));
+        return driver_validate_target(view(*dopts), mut_view(*err_buf));
+    }
+
+    // check, build, run
+    let sub_args = unsafe { sv_const_slot_at(args, 1) };
+    let rc = driver_parse_options(sub_args, argc - 1, mut_view(*dopts), mut_view(*err_buf));
+    if rc != AX_EXIT_OK {
+        return rc;
+    }
+
+    let pos_n = dopts.pos_argc;
+    if cmd == CMD_CHECK {
+        if pos_n < 2 {
+            push_table_slice(mut_view(*err_buf), 863, 34);
+            return AX_EXIT_USAGE;
+        }
+        let in_sv = sv_slot_get(dopts.pos_args as *const StrView, 1);
+        sv_copy_to(mut_view(dopts.input_file), view(in_sv));
+        return driver_validate_target(view(*dopts), mut_view(*err_buf));
+    }
+
+    if cmd == CMD_BUILD {
+        if pos_n < 2 {
+            push_table_slice(mut_view(*err_buf), 897, 34);
+            return AX_EXIT_USAGE;
+        }
+        if dopts.output.len == 0 {
+            push_table_slice(mut_view(*err_buf), 931, 40);
+            return AX_EXIT_USAGE;
+        }
+        let in_sv = sv_slot_get(dopts.pos_args as *const StrView, 1);
+        sv_copy_to(mut_view(dopts.input_file), view(in_sv));
+        return driver_validate_target(view(*dopts), mut_view(*err_buf));
+    }
+
+    if cmd == CMD_RUN {
+        if pos_n < 2 {
+            push_table_slice(mut_view(*err_buf), 971, 32);
+            return AX_EXIT_USAGE;
+        }
+        let in_sv = sv_slot_get(dopts.pos_args as *const StrView, 1);
+        sv_copy_to(mut_view(dopts.input_file), view(in_sv));
+        return driver_validate_target(view(*dopts), mut_view(*err_buf));
+    }
+
+    AX_EXIT_USAGE
+}
+
+// =============================================================================
+// 6. Host Filesystem Helpers (via `std.core.host`)
+// =============================================================================
+
+pub fn host_path_kind(path: view<StrView>) -> u64 {
+    if path.len == 0 || (path.ptr as usize) == 0 {
+        return 0u64;
+    }
+    let mut meta: [2]u64 = [0u64, 0u64];
+    let pmeta = unsafe { address_of_mut(meta[0]) };
+    let rc = unsafe { metadata(path.ptr, path.len, pmeta) };
+    if rc != 0i64 {
+        return 0u64;
+    }
+    meta[0]
+}
+
+pub fn host_file_exists(path: view<StrView>) -> bool {
+    let k = host_path_kind(path);
+    k == 1u64 || k == 3u64
+}
+
+pub fn host_is_dir(path: view<StrView>) -> bool {
+    host_path_kind(path) == 2u64
+}
+
+pub fn host_read_file_in_arena(path: view<StrView>, arena: mut_view<Arena>, out_ok: *mut bool) -> StrView {
+    if (out_ok as usize) != 0 {
+        unsafe { *out_ok = false; }
+    }
+    if path.len == 0 || (path.ptr as usize) == 0 {
+        return sv_empty();
+    }
+    let h = unsafe { open(path.ptr, path.len, 0u32) };
+    if h < 0i64 {
+        return sv_empty();
+    }
+    let sz = file_size(h);
+    if sz < 0i64 {
+        let _ = close(h);
+        return sv_empty();
+    }
+    let ulen = sz as usize;
+    let buf = arena_alloc_raw(mut_view(*arena), ulen + 1, 1);
+    let mut total: usize = 0;
+    while total < ulen {
+        let rd = unsafe { read(h, buf + total, ulen - total) };
+        if rd <= 0i64 {
+            break;
+        }
+        total = total + (rd as usize);
+    }
+    let _ = close(h);
+    unsafe {
+        *(buf + total) = 0u8;
+        if (out_ok as usize) != 0 {
+            *out_ok = true;
+        }
+    }
+    StrView { ptr: buf as *const u8, len: total }
+}
+
+// =============================================================================
+// 7. Package Manifest (`axiom.toml`) Parser (`manifest.c`)
+// =============================================================================
+
+pub struct PackageManifest {
+    pub arena: Arena,
+    pub name: StrView,
+    pub version: StrView,
+    pub kind: StrView,
+}
+
+pub fn manifest_new() -> PackageManifest {
+    let mut a = arena_new();
+    let k = arena_table_sv(mut_view(a), 273, 3);
+    PackageManifest {
+        arena: a,
+        name: sv_empty(),
+        version: sv_empty(),
+        kind: k,
+    }
+}
+
+pub fn manifest_init(m: mut_view<PackageManifest>) {
+    opts_arena_init(mut_view(m.arena));
+    sv_clear(mut_view(m.name));
+    sv_clear(mut_view(m.version));
+    let k = arena_table_sv(mut_view(m.arena), 273, 3);
+    sv_copy_to(mut_view(m.kind), view(k));
+}
+
+pub fn manifest_free(m: mut_view<PackageManifest>) {
+    arena_destroy(mut_view(m.arena));
+    sv_clear(mut_view(m.name));
+    sv_clear(mut_view(m.version));
+    sv_clear(mut_view(m.kind));
+}
+
+pub fn manifest_alloc() -> *mut PackageManifest {
+    let sz = size_of<PackageManifest>();
+    let raw = unsafe { heap_alloc(sz, align_of<PackageManifest>()) };
+    let mut i: usize = 0;
+    while i < sz {
+        unsafe { *(raw + i) = 0u8; }
+        i = i + 1;
+    }
+    let ptr = raw as *mut PackageManifest;
+    manifest_init(unsafe { mut_view(*ptr) });
+    ptr
+}
+
+pub fn manifest_dealloc(ptr: *mut PackageManifest) {
+    if (ptr as usize) == 0 {
+        return;
+    }
+    manifest_free(unsafe { mut_view(*ptr) });
+    unsafe {
+        heap_free(ptr as *mut u8, size_of<PackageManifest>(), align_of<PackageManifest>());
+    }
+}
+
+fn is_ws_byte(b: u8) -> bool {
+    b == 32u8 || b == 9u8 || b == 13u8 || b == 10u8
+}
+
+fn trim_sv(sv: view<StrView>) -> StrView {
+    let mut start: usize = 0;
+    let mut end: usize = sv.len;
+    while start < end && is_ws_byte(unsafe { *(sv.ptr + start) }) {
+        start = start + 1;
+    }
+    while end > start && is_ws_byte(unsafe { *(sv.ptr + end - 1) }) {
+        end = end - 1;
+    }
+    StrView {
+        ptr: unsafe { sv.ptr + start },
+        len: end - start,
+    }
+}
+
+fn strip_toml_comment(sv: view<StrView>) -> StrView {
+    let mut in_quotes: bool = false;
+    let mut i: usize = 0;
+    while i < sv.len {
+        let ch = unsafe { *(sv.ptr + i) };
+        if ch == 34u8 {
+            in_quotes = !in_quotes;
+        } else if ch == 35u8 && !in_quotes {
+            let prefix = StrView { ptr: sv.ptr, len: i };
+            return trim_sv(view(prefix));
+        }
+        i = i + 1;
+    }
+    trim_sv(sv)
+}
+
+pub fn manifest_parse_text(text: view<StrView>, out: mut_view<PackageManifest>) -> bool {
+    sv_clear(mut_view(out.name));
+    sv_clear(mut_view(out.version));
+    let k0 = arena_table_sv(mut_view(out.arena), 273, 3);
+    sv_copy_to(mut_view(out.kind), view(k0));
+
+    let mut in_package: bool = false;
+    let mut found_package: bool = false;
+    let mut line_start: usize = 0;
+    let mut pos: usize = 0;
+
+    while pos <= text.len {
+        let is_end = pos == text.len;
+        let is_nl = if is_end { false } else { (unsafe { *(text.ptr + pos) }) == 10u8 };
+        if is_end || is_nl {
+            let raw_line = StrView {
+                ptr: unsafe { text.ptr + line_start },
+                len: pos - line_start,
+            };
+            let line = trim_sv(view(raw_line));
+            if line.len > 0 && (unsafe { *line.ptr }) != 35u8 {
+                if (unsafe { *line.ptr }) == 91u8 {
+                    if sv_eq_table(view(line), 276, 9) {
+                        in_package = true;
+                        found_package = true;
+                    } else {
+                        in_package = false;
+                    }
+                } else if in_package {
+                    let eq_idx = find_eq_index(view(line));
+                    if eq_idx < 0isize {
+                        return false;
+                    }
+                    let ueq = eq_idx as usize;
+                    let val_off: usize = ueq + 1;
+                    let key_raw = StrView { ptr: line.ptr, len: ueq };
+                    let val_raw = StrView {
+                        ptr: unsafe { line.ptr + val_off },
+                        len: line.len - val_off,
+                    };
+                    let key = trim_sv(view(key_raw));
+                    let val = strip_toml_comment(view(val_raw));
+                    let val_len = val.len;
+                    if val_len < 2 || (unsafe { *val.ptr }) != 34u8 || (unsafe { *(val.ptr + val_len - 1) }) != 34u8 {
+                        return false;
+                    }
+                    let unquoted = StrView {
+                        ptr: unsafe { val.ptr + 1 },
+                        len: val_len - 2,
+                    };
+                    if sv_eq_table(view(key), 285, 4) {
+                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                        sv_copy_to(mut_view(out.name), view(cloned));
+                    } else if sv_eq_table(view(key), 12, 7) {
+                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                        sv_copy_to(mut_view(out.version), view(cloned));
+                    } else if sv_eq_table(view(key), 289, 4) {
+                        let cloned = arena_clone_sv(mut_view(out.arena), view(unquoted));
+                        sv_copy_to(mut_view(out.kind), view(cloned));
+                    }
+                }
+            }
+            line_start = pos + 1;
+        }
+        pos = pos + 1;
+    }
+
+    found_package && out.name.len > 0
+}
+
+pub fn manifest_read_file(path: view<StrView>, out: mut_view<PackageManifest>) -> bool {
+    let mut ok: bool = false;
+    let ok_ptr = unsafe { address_of_mut(ok) };
+    let text = host_read_file_in_arena(path, mut_view(out.arena), ok_ptr);
+    if !ok {
+        return false;
+    }
+    manifest_parse_text(view(text), mut_view(*out))
+}
+
+// =============================================================================
+// 8. `std` Root Discovery (`std_root.c`) & Module Path Derivation (`project.c`)
+// =============================================================================
+
+pub fn parent_dir_sv(path: view<StrView>) -> StrView {
+    if path.len == 0 || (path.ptr as usize) == 0 {
+        return sv_empty();
+    }
+    let mut i: usize = path.len;
+    while i > 0 {
+        i = i - 1;
+        let b = unsafe { *(path.ptr + i) };
+        if b == 47u8 || b == 92u8 {
+            return StrView { ptr: path.ptr, len: i };
+        }
+    }
+    sv_empty()
+}
+
+pub fn find_std_root_with(
+    explicit_flag: view<StrView>,
+    env_std: view<StrView>,
+    exe_file_path: view<StrView>,
+    out_arena: mut_view<Arena>
+) -> StrView {
+    // 1. Explicit --std-root flag
+    if explicit_flag.len > 0 {
+        let norm = arena_normalize_path(mut_view(*out_arena), explicit_flag);
+        if host_is_dir(view(norm)) {
+            return norm;
+        }
+        return sv_empty();
+    }
+
+    // 2. AXIOM_STD environment variable
+    if env_std.len > 0 {
+        let norm = arena_normalize_path(mut_view(*out_arena), env_std);
+        if host_is_dir(view(norm)) {
+            return norm;
+        }
+    }
+
+    // 3. Relative to executable path (<exe_dir>/../std or <exe_dir>/std)
+    let exe_dir = parent_dir_sv(exe_file_path);
+    if exe_dir.len > 0 {
+        let rel_up = arena_table_sv(mut_view(*out_arena), 1003, 7);
+        let cand1 = arena_join_path(mut_view(*out_arena), view(exe_dir), view(rel_up));
+        if host_is_dir(view(cand1)) {
+            return cand1;
+        }
+        let rel_std = StrView {
+            ptr: unsafe { rel_up.ptr + 4 },
+            len: 3,
+        };
+        let cand2 = arena_join_path(mut_view(*out_arena), view(exe_dir), view(rel_std));
+        if host_is_dir(view(cand2)) {
+            return cand2;
+        }
+    }
+
+    sv_empty()
+}
+
+pub fn find_std_root(explicit_flag: view<StrView>, out_arena: mut_view<Arena>) -> StrView {
+    let env_name = arena_table_sv(mut_view(*out_arena), 293, 9);
+    let mut env_ptr: *const u8 = 0 as *const u8;
+    let mut env_ulen: usize = 0;
+    let env_len = unsafe { env_get(env_name.ptr, env_name.len, 0 as *mut u8, 0) };
+    if env_len > 0i64 {
+        let ulen = env_len as usize;
+        let ebuf = arena_alloc_raw(mut_view(*out_arena), ulen + 1, 1);
+        let _ = unsafe { env_get(env_name.ptr, env_name.len, ebuf, ulen) };
+        unsafe { *(ebuf + ulen) = 0u8; }
+        env_ptr = ebuf as *const u8;
+        env_ulen = ulen;
+    }
+    let env_sv = StrView { ptr: env_ptr, len: env_ulen };
+
+    let mut exe_ptr: *const u8 = 0 as *const u8;
+    let mut exe_ulen: usize = 0;
+    let exe_len = unsafe { exe_path(0 as *mut u8, 0) };
+    if exe_len > 0i64 {
+        let ulen = exe_len as usize;
+        let xbuf = arena_alloc_raw(mut_view(*out_arena), ulen + 1, 1);
+        let _ = unsafe { exe_path(xbuf, ulen) };
+        unsafe { *(xbuf + ulen) = 0u8; }
+        exe_ptr = xbuf as *const u8;
+        exe_ulen = ulen;
+    }
+    let exe_sv = StrView { ptr: exe_ptr, len: exe_ulen };
+
+    let res = find_std_root_with(explicit_flag, view(env_sv), view(exe_sv), mut_view(*out_arena));
+    if res.len > 0 || explicit_flag.len > 0 {
+        return res;
+    }
+    // Fallback to "std" in current working directory (e.g. when running test binaries from %TEMP%)
+    let cwd_std = arena_table_sv(mut_view(*out_arena), 1007, 3);
+    if host_is_dir(view(cwd_std)) {
+        return cwd_std;
+    }
+    sv_empty()
+}
+
+// Derives canonical dotted module path from relative file path (`project.c:derive_module_path`):
+// strips leading `src/` and trailing `.ax`, replaces `/` and `\` with `.`.
+pub fn derive_module_path(rel_path: view<StrView>, out_arena: mut_view<Arena>) -> StrView {
+    let mut start: usize = 0;
+    if rel_path.len >= 4 {
+        let b0 = unsafe { *(rel_path.ptr + 0) };
+        let b1 = unsafe { *(rel_path.ptr + 1) };
+        let b2 = unsafe { *(rel_path.ptr + 2) };
+        let b3 = unsafe { *(rel_path.ptr + 3) };
+        if b0 == 115u8 && b1 == 114u8 && b2 == 99u8 && (b3 == 47u8 || b3 == 92u8) {
+            start = 4;
+        }
+    }
+    let mut end: usize = rel_path.len;
+    if end >= start + 3 {
+        let e0 = unsafe { *(rel_path.ptr + end - 3) };
+        let e1 = unsafe { *(rel_path.ptr + end - 2) };
+        let e2 = unsafe { *(rel_path.ptr + end - 1) };
+        if e0 == 46u8 && e1 == 97u8 && e2 == 120u8 {
+            end = end - 3;
+        }
+    }
+    let out_len = end - start;
+    let dst = arena_alloc_raw(mut_view(*out_arena), out_len + 1, 1);
+    let mut i: usize = 0;
+    while i < out_len {
+        let idx = start + i;
+        let mut ch = unsafe { *(rel_path.ptr + idx) };
+        if ch == 47u8 || ch == 92u8 {
+            ch = 46u8;
+        }
+        unsafe {
+            *(dst + i) = ch;
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + out_len) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: out_len }
+}
+
+// =============================================================================
+// 9. Project & Multi-File Package Discovery (`project.c`)
+// =============================================================================
+
+pub struct ProjectFile {
+    pub disk_path: StrView,
+    pub display_path: StrView,
+    pub module_path: StrView,
+    pub text: StrView,
+    pub fid: FileId,
+    pub is_main: bool,
+    pub is_std: bool,
+}
+
+pub struct Project {
+    pub arena: Arena,
+    pub is_package: bool,
+    pub has_manifest: bool,
+    pub manifest: PackageManifest,
+    pub root_dir: StrView,
+    pub std_root: StrView,
+    pub files: *mut ProjectFile,
+    pub file_count: usize,
+    pub file_cap: usize,
+}
+
+pub unsafe fn project_file_at(base: *mut ProjectFile, idx: usize) -> *mut ProjectFile {
+    let off = opts_mul_usize(idx, size_of<ProjectFile>());
+    ((base as *mut u8) + off) as *mut ProjectFile
+}
+
+pub unsafe fn project_file_const_at(base: *const ProjectFile, idx: usize) -> *const ProjectFile {
+    let off = opts_mul_usize(idx, size_of<ProjectFile>());
+    ((base as *const u8) + off) as *const ProjectFile
+}
+
+pub fn pf_get_disk_path(pf: *const ProjectFile) -> StrView {
+    let p = unsafe { (*pf).disk_path.ptr };
+    let l = unsafe { (*pf).disk_path.len };
+    StrView { ptr: p, len: l }
+}
+
+pub fn pf_get_display_path(pf: *const ProjectFile) -> StrView {
+    let p = unsafe { (*pf).display_path.ptr };
+    let l = unsafe { (*pf).display_path.len };
+    StrView { ptr: p, len: l }
+}
+
+pub fn pf_get_module_path(pf: *const ProjectFile) -> StrView {
+    let p = unsafe { (*pf).module_path.ptr };
+    let l = unsafe { (*pf).module_path.len };
+    StrView { ptr: p, len: l }
+}
+
+pub fn pf_get_text(pf: *const ProjectFile) -> StrView {
+    let p = unsafe { (*pf).text.ptr };
+    let l = unsafe { (*pf).text.len };
+    StrView { ptr: p, len: l }
+}
+
+pub fn pf_set_text(pf: *mut ProjectFile, txt: view<StrView>) {
+    unsafe {
+        (*pf).text.ptr = txt.ptr;
+        (*pf).text.len = txt.len;
+    }
+}
+
+pub fn pf_get_fid_v(pf: *const ProjectFile) -> u32 {
+    unsafe { (*pf).fid.v }
+}
+
+pub fn pf_set_fid_v(pf: *mut ProjectFile, v: u32) {
+    unsafe {
+        (*pf).fid.v = v;
+    }
+}
+
+pub fn pf_is_main(pf: *const ProjectFile) -> bool {
+    unsafe { (*pf).is_main }
+}
+
+pub fn pf_is_std(pf: *const ProjectFile) -> bool {
+    unsafe { (*pf).is_std }
+}
+
+pub fn project_new() -> Project {
+    Project {
+        arena: arena_new(),
+        is_package: false,
+        has_manifest: false,
+        manifest: manifest_new(),
+        root_dir: sv_empty(),
+        std_root: sv_empty(),
+        files: 0 as *mut ProjectFile,
+        file_count: 0,
+        file_cap: 0,
+    }
+}
+
+pub fn project_init(proj: mut_view<Project>) {
+    opts_arena_init(mut_view(proj.arena));
+    proj.is_package = false;
+    proj.has_manifest = false;
+    manifest_init(mut_view(proj.manifest));
+    sv_clear(mut_view(proj.root_dir));
+    sv_clear(mut_view(proj.std_root));
+    proj.files = 0 as *mut ProjectFile;
+    proj.file_count = 0;
+    proj.file_cap = 0;
+}
+
+pub fn project_free(proj: mut_view<Project>) {
+    if proj.file_cap > 0 && (proj.files as usize) != 0 {
+        unsafe {
+            heap_free(
+                proj.files as *mut u8,
+                opts_mul_usize(proj.file_cap, size_of<ProjectFile>()),
+                align_of<ProjectFile>()
+            );
+        }
+    }
+    proj.files = 0 as *mut ProjectFile;
+    proj.file_count = 0;
+    proj.file_cap = 0;
+    manifest_free(mut_view(proj.manifest));
+    arena_destroy(mut_view(proj.arena));
+}
+
+pub fn project_alloc() -> *mut Project {
+    let sz = size_of<Project>();
+    let raw = unsafe { heap_alloc(sz, align_of<Project>()) };
+    let mut i: usize = 0;
+    while i < sz {
+        unsafe { *(raw + i) = 0u8; }
+        i = i + 1;
+    }
+    let ptr = raw as *mut Project;
+    project_init(unsafe { mut_view(*ptr) });
+    ptr
+}
+
+pub fn project_dealloc(ptr: *mut Project) {
+    if (ptr as usize) == 0 {
+        return;
+    }
+    project_free(unsafe { mut_view(*ptr) });
+    unsafe {
+        heap_free(ptr as *mut u8, size_of<Project>(), align_of<Project>());
+    }
+}
+
+pub fn project_add_file(
+    proj: mut_view<Project>,
+    disk_path: StrView,
+    display_path: StrView,
+    module_path: StrView,
+    text: StrView,
+    is_main: bool,
+    is_std: bool
+) {
+    if proj.file_count >= proj.file_cap {
+        let new_cap: usize = if proj.file_cap == 0 { 8 } else { opts_mul_usize(proj.file_cap, 2) };
+        let new_bytes = opts_mul_usize(new_cap, size_of<ProjectFile>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<ProjectFile>()) as *mut ProjectFile };
+        if proj.file_count > 0 && (proj.files as usize) != 0 {
+            let old_bytes = opts_mul_usize(proj.file_count, size_of<ProjectFile>());
+            let old_cap_bytes = opts_mul_usize(proj.file_cap, size_of<ProjectFile>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(proj.files as *const u8, new_arr as *mut u8, old_bytes);
+                heap_free(proj.files as *mut u8, old_cap_bytes, align_of<ProjectFile>());
+            }
+        }
+        proj.files = new_arr;
+        proj.file_cap = new_cap;
+    }
+    let pf = unsafe { project_file_at(proj.files, proj.file_count) };
+    unsafe {
+        (*pf).disk_path.ptr = disk_path.ptr;
+        (*pf).disk_path.len = disk_path.len;
+        (*pf).display_path.ptr = display_path.ptr;
+        (*pf).display_path.len = display_path.len;
+        (*pf).module_path.ptr = module_path.ptr;
+        (*pf).module_path.len = module_path.len;
+        (*pf).text.ptr = text.ptr;
+        (*pf).text.len = text.len;
+        (*pf).fid.v = 0u32;
+        (*pf).is_main = is_main;
+        (*pf).is_std = is_std;
+    }
+    proj.file_count = proj.file_count + 1;
+}
+
+pub fn project_sort_user_files(proj: mut_view<Project>, start_idx: usize, end_idx: usize) {
+    let mut i: usize = start_idx;
+    while i < end_idx {
+        let mut j: usize = i + 1;
+        while j < end_idx {
+            let pi = unsafe { project_file_at(proj.files, i) };
+            let pj = unsafe { project_file_at(proj.files, j) };
+            let disp_i = pf_get_display_path(pi as *const ProjectFile);
+            let disp_j = pf_get_display_path(pj as *const ProjectFile);
+            let cmp = sv_cmp(view(disp_i), view(disp_j));
+            if cmp > 0 {
+                unsafe {
+                    let tmp_disk_ptr = (*pi).disk_path.ptr;
+                    let tmp_disk_len = (*pi).disk_path.len;
+                    let tmp_disp_ptr = (*pi).display_path.ptr;
+                    let tmp_disp_len = (*pi).display_path.len;
+                    let tmp_mod_ptr = (*pi).module_path.ptr;
+                    let tmp_mod_len = (*pi).module_path.len;
+                    let tmp_txt_ptr = (*pi).text.ptr;
+                    let tmp_txt_len = (*pi).text.len;
+                    let tmp_fid_v = (*pi).fid.v;
+                    let tmp_main = (*pi).is_main;
+                    let tmp_std = (*pi).is_std;
+
+                    (*pi).disk_path.ptr = (*pj).disk_path.ptr;
+                    (*pi).disk_path.len = (*pj).disk_path.len;
+                    (*pi).display_path.ptr = (*pj).display_path.ptr;
+                    (*pi).display_path.len = (*pj).display_path.len;
+                    (*pi).module_path.ptr = (*pj).module_path.ptr;
+                    (*pi).module_path.len = (*pj).module_path.len;
+                    (*pi).text.ptr = (*pj).text.ptr;
+                    (*pi).text.len = (*pj).text.len;
+                    (*pi).fid.v = (*pj).fid.v;
+                    (*pi).is_main = (*pj).is_main;
+                    (*pi).is_std = (*pj).is_std;
+
+                    (*pj).disk_path.ptr = tmp_disk_ptr;
+                    (*pj).disk_path.len = tmp_disk_len;
+                    (*pj).display_path.ptr = tmp_disp_ptr;
+                    (*pj).display_path.len = tmp_disp_len;
+                    (*pj).module_path.ptr = tmp_mod_ptr;
+                    (*pj).module_path.len = tmp_mod_len;
+                    (*pj).text.ptr = tmp_txt_ptr;
+                    (*pj).text.len = tmp_txt_len;
+                    (*pj).fid.v = tmp_fid_v;
+                    (*pj).is_main = tmp_main;
+                    (*pj).is_std = tmp_std;
+                }
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+}
+
+fn scan_package_dir_recursive(
+    proj: mut_view<Project>,
+    base_dir: view<StrView>,
+    rel_prefix: view<StrView>
+) {
+    let cur_dir = if rel_prefix.len > 0 {
+        arena_join_path(mut_view(proj.arena), base_dir, rel_prefix)
+    } else {
+        StrView { ptr: base_dir.ptr, len: base_dir.len }
+    };
+
+    let dhid = unsafe { dir_open(cur_dir.ptr, cur_dir.len) };
+    if dhid <= 0i64 {
+        return;
+    }
+
+    loop {
+        let nlen = unsafe { dir_next(dhid, 0 as *mut u8, 0) };
+        if nlen <= 0i64 {
+            break;
+        }
+        let ulen = nlen as usize;
+        let ebuf = arena_alloc_raw(mut_view(proj.arena), ulen + 1, 1);
+        let got = unsafe { dir_next(dhid, ebuf, ulen) };
+        if got <= 0i64 {
+            break;
+        }
+        unsafe { *(ebuf + ulen) = 0u8; }
+        let entry_sv = StrView { ptr: ebuf as *const u8, len: ulen };
+        let next_rel = if rel_prefix.len > 0 {
+            arena_join_path(mut_view(proj.arena), rel_prefix, view(entry_sv))
+        } else {
+            arena_normalize_path(mut_view(proj.arena), view(entry_sv))
+        };
+        let full_path = arena_join_path(mut_view(proj.arena), base_dir, view(next_rel));
+        if host_is_dir(view(full_path)) {
+            scan_package_dir_recursive(mut_view(*proj), base_dir, view(next_rel));
+        } else if sv_ends_with_ax(view(entry_sv)) {
+            let mod_path = derive_module_path(view(next_rel), mut_view(proj.arena));
+            let is_main = sv_eq_table(view(next_rel), 319, 11) || sv_eq_table(view(next_rel), 312, 7);
+            project_add_file(
+                mut_view(*proj),
+                full_path,
+                next_rel,
+                mod_path,
+                sv_empty(),
+                is_main,
+                false
+            );
+        }
+    }
+
+    let _ = dir_close(dhid);
+}
+
+fn find_src_package_root(norm_input: view<StrView>, arena: mut_view<Arena>) -> StrView {
+    // Look for `/src/` in `norm_input` and check if `<root>/axiom.toml` exists on disk.
+    let norm_len = norm_input.len;
+    if norm_len < 6 || (norm_input.ptr as usize) == 0 {
+        return sv_empty();
+    }
+    let mut i: usize = 0;
+    while i + 5 <= norm_input.len {
+        let b0 = unsafe { *(norm_input.ptr + i) };
+        let b1 = unsafe { *(norm_input.ptr + i + 1) };
+        let b2 = unsafe { *(norm_input.ptr + i + 2) };
+        let b3 = unsafe { *(norm_input.ptr + i + 3) };
+        let b4 = unsafe { *(norm_input.ptr + i + 4) };
+        if b0 == 47u8 && b1 == 115u8 && b2 == 114u8 && b3 == 99u8 && b4 == 47u8 {
+            let cand_root = StrView { ptr: norm_input.ptr, len: i };
+            let toml_rel = arena_table_sv(mut_view(*arena), 302, 10);
+            let toml_path = arena_join_path(mut_view(*arena), view(cand_root), view(toml_rel));
+            if host_file_exists(view(toml_path)) {
+                return arena_clone_sv(mut_view(*arena), view(cand_root));
+            }
+        }
+        i = i + 1;
+    }
+    sv_empty()
+}
+
+pub fn project_append_std_core_files(proj: mut_view<Project>) {
+    if proj.std_root.len == 0 {
+        return;
+    }
+    // 1. <std>/core/option.ax -> std.core.option
+    let opt_rel = arena_table_sv(mut_view(proj.arena), 468, 15);
+    let opt_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(opt_rel));
+    if host_file_exists(view(opt_disk)) {
+        let opt_disp = arena_table_sv(mut_view(proj.arena), 330, 20);
+        let opt_mod = arena_table_sv(mut_view(proj.arena), 350, 15);
+        project_add_file(mut_view(*proj), opt_disk, opt_disp, opt_mod, sv_empty(), false, true);
+    }
+
+    // 2. <std>/core/result.ax -> std.core.result
+    let res_rel = arena_table_sv(mut_view(proj.arena), 483, 15);
+    let res_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(res_rel));
+    if host_file_exists(view(res_disk)) {
+        let res_disp = arena_table_sv(mut_view(proj.arena), 365, 20);
+        let res_mod = arena_table_sv(mut_view(proj.arena), 385, 15);
+        project_add_file(mut_view(*proj), res_disk, res_disp, res_mod, sv_empty(), false, true);
+    }
+
+    // 3. <std>/core/prelude.ax -> std.core.prelude
+    let prel_rel = arena_table_sv(mut_view(proj.arena), 498, 16);
+    let prel_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(prel_rel));
+    if host_file_exists(view(prel_disk)) {
+        let prel_disp = arena_table_sv(mut_view(proj.arena), 400, 21);
+        let prel_mod = arena_table_sv(mut_view(proj.arena), 421, 16);
+        project_add_file(mut_view(*proj), prel_disk, prel_disp, prel_mod, sv_empty(), false, true);
+    }
+}
+
+pub fn project_append_std_host_if_needed(proj: mut_view<Project>, uses_host: bool) {
+    if !uses_host || proj.std_root.len == 0 {
+        return;
+    }
+    let host_rel = arena_table_sv(mut_view(proj.arena), 514, 13);
+    let host_disk = arena_join_path(mut_view(proj.arena), view(proj.std_root), view(host_rel));
+    if !host_file_exists(view(host_disk)) {
+        return;
+    }
+    let mut i: usize = 0;
+    while i < proj.file_count {
+        let pf = unsafe { project_file_const_at(proj.files as *const ProjectFile, i) };
+        let pf_disk = pf_get_disk_path(pf);
+        if sv_eq(view(pf_disk), view(host_disk)) {
+            return;
+        }
+        i = i + 1;
+    }
+    let host_disp = arena_table_sv(mut_view(proj.arena), 437, 18);
+    let host_mod = arena_table_sv(mut_view(proj.arena), 455, 13);
+    project_add_file(mut_view(*proj), host_disk, host_disp, host_mod, sv_empty(), false, true);
+}
+
+pub fn project_discover(
+    input_path: view<StrView>,
+    explicit_std_root: view<StrView>,
+    proj: mut_view<Project>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let norm_input = arena_normalize_path(mut_view(proj.arena), input_path);
+    let is_dir = host_is_dir(view(norm_input));
+
+    if is_dir {
+        proj.is_package = true;
+        sv_copy_to(mut_view(proj.root_dir), view(norm_input));
+    } else {
+        if !host_file_exists(view(norm_input)) {
+            emit_driver_diag(mut_view(*sink), AX_IO_FILE_NOT_FOUND, 0, 25);
+            return false;
+        }
+        let pkg_root = find_src_package_root(view(norm_input), mut_view(proj.arena));
+        if pkg_root.len > 0 {
+            proj.is_package = true;
+            sv_copy_to(mut_view(proj.root_dir), view(pkg_root));
+        } else {
+            proj.is_package = false;
+        }
+    }
+
+    if proj.is_package {
+        let toml_rel = arena_table_sv(mut_view(proj.arena), 302, 10);
+        let toml_path = arena_join_path(mut_view(proj.arena), view(proj.root_dir), view(toml_rel));
+        if host_file_exists(view(toml_path)) {
+            if !manifest_read_file(view(toml_path), mut_view(proj.manifest)) {
+                emit_driver_diag(mut_view(*sink), AX_DRIVER_BAD_MANIFEST, 42, 48);
+                return false;
+            }
+            proj.has_manifest = true;
+        }
+
+        let src_rel = arena_table_sv(mut_view(proj.arena), 319, 3);
+        let src_dir = arena_join_path(mut_view(proj.arena), view(proj.root_dir), view(src_rel));
+        let user_start = proj.file_count;
+        let root_copy = StrView { ptr: proj.root_dir.ptr, len: proj.root_dir.len };
+        if host_is_dir(view(src_dir)) {
+            scan_package_dir_recursive(mut_view(*proj), view(root_copy), view(src_rel));
+        } else {
+            let empty_rel = sv_empty();
+            scan_package_dir_recursive(mut_view(*proj), view(root_copy), view(empty_rel));
+        }
+        project_sort_user_files(mut_view(*proj), user_start, proj.file_count);
+    } else {
+        let disp_copy = StrView { ptr: norm_input.ptr, len: norm_input.len };
+        project_add_file(
+            mut_view(*proj),
+            norm_input,
+            disp_copy,
+            sv_empty(),
+            sv_empty(),
+            true,
+            false
+        );
+    }
+
+    let std_root = find_std_root(explicit_std_root, mut_view(proj.arena));
+    if explicit_std_root.len > 0 && std_root.len == 0 {
+        emit_driver_diag(mut_view(*sink), AX_DRIVER_NO_STD, 25, 17);
+        return false;
+    }
+    sv_copy_to(mut_view(proj.std_root), view(std_root));
+    project_append_std_core_files(mut_view(*proj));
+    true
+}
