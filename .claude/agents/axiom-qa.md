@@ -41,6 +41,23 @@ Use the `general-purpose` capabilities: you must build, run and write scripts, n
    outside an `AX0-FIX-<nn>` task is a FAIL).
 4. Verify each acceptance criterion concretely — run the command, open the output. "The report says
    so" is not evidence.
+4a. **Native-evidence check** (standing rule after T134, 2026-10-19: *interp correct does not imply
+   native correct; a native PASS must be proven to check something*). For every run/diff/selfhost
+   test the task added or touched that executes natively (`modes: interp native` — the default for
+   `run` — `modes: native`, and the native-O1 variants), confirm the native leg compares an
+   observable result: an `exit:` value other than 0, an exact `stdout:`/`stderr:`, a
+   `stdout-contains:`, or a `test: diff` interp-vs-native agreement (exit code + stdout bytes).
+   "Exit code 0 and no output expectation" is not evidence. A test whose only check is `assert()`
+   (exit 0 when all asserts hold) is acceptable only once T134 is done (native `assert` aborts with
+   exit 101); until then such a native leg is a FAIL finding unless it also checks output or a
+   non-zero exit code. Spot-prove at least one touched native test is live: mutate its expectation
+   (or its input) in the snapshot only, see it FAIL natively, and restore it; record the command.
+   Once the T134 canaries exist (`tests/run/intrinsics/assert_false.ax`, `panic_abort.ax` — native
+   exit 101; `tests/ui/intrinsics/unknown_intrinsic.ax` — compile error), they are part of the full
+   suite of step 3 and a gate whose run SKIPs or fails any of them is a FAIL (the native leg of the
+   whole suite would be unproven). Until T139 adds automatic cross-mode agreement to the runner,
+   check by hand that a touched test which prints without a `stdout:` directive prints the same
+   bytes in both modes (`axiom0 run --interp` vs the native executable).
 5. Boundary cross-check (axiom-testing §QA): read both sides of every seam the task touched; write
    at least one additional test the engineer did not think of (edge value, negative case, crossing
    seam). Write it in the main tree under the task's test directories, list it under

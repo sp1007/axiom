@@ -34,7 +34,7 @@ Adding tests never requires editing shared files (ADR-0005 §2): the runner disc
 golden kind is derived from the sibling file extension (`x.tokens`, `x.ast`, `x.resolved`, `x.hir`,
 `x.thir`, `x.mir`, `x.lir`, `x.mi`, `x.mc` ↔ `inspect --emit=<ext>`), C unit tests are globbed from
 `tests/unit/**/*.c`, and C test drivers from `tests/**/cdriver_*.c` (run through `*.test` manifests of
-kind `exec`). Only T005 edits `tools/axtest.py`; only T004 edits CMakeLists.txt. Binary fixtures live
+kind `exec`). Only T005 (and a later task that lists it under `locks:`, e.g. T139) edits `tools/axtest.py`; only T004 edits CMakeLists.txt. Binary fixtures live
 under `tests/**/fixtures/` (everything else binary is git-ignored).
 
 ## Directives (first comment lines of an `.ax` file)
@@ -165,6 +165,29 @@ bugs from PE-linker bugs. It is a test oracle only; the production path never ca
 linker. Tests SKIP when gcc is not on PATH.
 
 ## Differential testing
+
+**Standing rule (T134, 2026-10-19): interp correct does not imply native correct; a native PASS
+must be proven to check something.** axiom0's native backend once compiled the placeholder bodies of
+`@intrinsic` functions (`assert`/`panic` were no-ops, wrapping/bit ops returned 0), so every native
+leg that relied on `assert()` passed vacuously for weeks. Differential means **comparing the
+observable results of interp and native** (exit code + stdout bytes, or an explicit expected
+value), never "both exited 0". Rules for test authors:
+- A run test that executes natively must pin an observable result: a computed value returned
+  through `exit:` (not 0), an exact `stdout:` (or `stdout-contains:`), or be a `test: diff`. Prefer
+  printing or returning the computed value over asserting on it: `exit: 42` from `return x` proves
+  the native code computed `x`; `assert(x == 42)` plus exit 0 proves it only if `assert` is live.
+- `assert()`-only tests (exit 0, no output check) are acceptable once T134 is done — native
+  `assert(false)` and `panic()` then abort with exit 101, guarded by the canaries
+  `tests/run/intrinsics/assert_false.ax`, `panic_abort.ax` and
+  `tests/ui/intrinsics/unknown_intrinsic.ax`, which run in every full suite. Never weaken or skip a
+  canary.
+- When a test prints, declare its `stdout:`; the runner judges each mode against the directives,
+  so undeclared output is not compared between modes until T139 adds automatic interp/native
+  agreement for run tests.
+- A new executor feature (intrinsic, MIR op, runtime call) ships with a test whose expected value
+  differs from what a stub (`0`, no-op, fall-through) would produce.
+- QA proves liveness at the gate (axiom-qa Gate protocol 4a): it mutates one touched expectation in
+  the snapshot and must see the native leg FAIL.
 
 `tests/diff/` programs are compiled at every optimisation level and run under the interpreter;
 all observable results (exit code, stdout) must match. When the optimizer lands, every `run` test

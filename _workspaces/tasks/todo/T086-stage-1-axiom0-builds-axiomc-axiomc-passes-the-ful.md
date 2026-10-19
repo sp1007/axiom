@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T085, T134]
+depends: [T085, T134, T139]
 priority: 120
 status: todo
 attempts: 0
