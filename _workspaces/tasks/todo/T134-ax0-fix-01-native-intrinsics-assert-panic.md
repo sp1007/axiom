@@ -120,5 +120,11 @@ native exits 0.
   vectors, the real `compiler/kernel/hash.ax` and a native leg for `qa_hash_vectors.ax`.
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale (2026-10-14) and is
   not evidence.
+- Parity registry (ADR-0035 §4, added 2026-10-20): the full suite runs `tests/selfhost/obj_link_driver/axiomc_e2e.test`,
+  which fails on XPASS/IMPROVED. Remove (by explicit line deletion) every `known_divergent.txt` entry this task makes
+  identical, update in place an entry that only improves, list the paths in the report; never add an entry (a newly
+  divergent program is a regression of this task).
+- Expected registry effect of T134: none directly (`compiler/` is not edited); the port half of the intrinsic table is
+  T150.
 
 ## Log

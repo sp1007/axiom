@@ -64,5 +64,9 @@ whose dropped tail still type-checks is miscompiled without any diagnostic.
   priority 0 runs alone. T144 and T145 run after it.
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+- Parity registry (ADR-0035 §4, added 2026-10-20): the full suite runs `tests/selfhost/obj_link_driver/axiomc_e2e.test`,
+  which fails on XPASS/IMPROVED. Remove (by explicit line deletion) every `known_divergent.txt` entry this task makes
+  identical, update in place an entry that only improves, list the paths in the report; never add an entry (a newly
+  divergent program is a regression of this task).
 
 ## Log

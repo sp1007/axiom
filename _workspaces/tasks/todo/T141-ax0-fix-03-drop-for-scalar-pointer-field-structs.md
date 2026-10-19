@@ -83,5 +83,9 @@ them (`compiler/mir/builder.ax`, `compiler/lir/builder.ax`, `compiler/mir/drop.a
 - Runs after T140 (shared `mir/build`, `lir`, `tests/selfhost`); priority 0 runs alone.
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale and is not evidence.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+- Parity registry (ADR-0035 §4, added 2026-10-20): the full suite runs `tests/selfhost/obj_link_driver/axiomc_e2e.test`,
+  which fails on XPASS/IMPROVED. Remove (by explicit line deletion) every `known_divergent.txt` entry this task makes
+  identical, update in place an entry that only improves, list the paths in the report; never add an entry (a newly
+  divergent program is a regression of this task).
 
 ## Log
