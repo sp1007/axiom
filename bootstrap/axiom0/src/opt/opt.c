@@ -89,6 +89,10 @@ static bool do_const_fold_binop(AxMirBinOp op, const AxMirConst *lhs, const AxMi
             }
             break;
         }
+        /* T134: same semantics as the interpreter and the native backend: modulo 2^bits, never fails. */
+        case AX_MIR_BINOP_WRAPPING_ADD: res = l + r; out->ty = lhs->ty; break;
+        case AX_MIR_BINOP_WRAPPING_SUB: res = l - r; out->ty = lhs->ty; break;
+        case AX_MIR_BINOP_WRAPPING_MUL: res = l * r; out->ty = lhs->ty; break;
         case AX_MIR_BINOP_BIT_XOR: res = l ^ r; break;
         case AX_MIR_BINOP_BIT_AND: res = l & r; break;
         case AX_MIR_BINOP_BIT_OR:  res = l | r; break;

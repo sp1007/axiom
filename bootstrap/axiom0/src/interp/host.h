@@ -54,7 +54,7 @@ struct InterpCtx {
 };
 
 typedef struct {
-    uint64_t vals[8];
+    uint64_t vals[32];
 } AxInterpValue;
 
 uint8_t *ax_interp_validate_raw_ptr(InterpCtx *ctx, uint64_t addr, uint64_t size, uint32_t align);

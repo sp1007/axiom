@@ -1,5 +1,6 @@
 
 #include "mir/build/build.h"
+#include "mir/build/intrinsics.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1155,6 +1156,269 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
     return op;
 }
 
+/* ------------------------------------------------------------------------------------------------
+ * T134: lowering of the intrinsics in the table mir/build/intrinsics.c that are not host calls.
+ *
+ * `assert(c)` becomes an AX_MIR_TERM_ASSERT, `panic(...)` / `unreachable()` an assert on constant false (the
+ * abort path with exit code 101, SPEC-03). wrapping_add/sub/mul_<w> become one AX_MIR_BINOP_WRAPPING_* operation;
+ * the rest (wrapping_neg, rotates, leading/trailing zeros, count_ones) is expanded into those operations plus
+ * the ordinary shift/and/or/add/sub operations on the unsigned type of the same width, so the MIR interpreter
+ * and the native back end execute the very same MIR with no per-name shortcut left in either of them.
+ * ---------------------------------------------------------------------------------------------- */
+
+static AxMirPlace intr_temp(Builder *b, TypeId ty) {
+    AxMirLocalId l = add_local(b, AX_MIR_LOCAL_TEMP, ty, false);
+    AxMirPlace p = { l, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+    return p;
+}
+
+static AxMirOperand intr_copy_op(AxMirPlace p) {
+    AxMirOperand op = {0};
+    op.kind = AX_MIR_OP_COPY;
+    op.place = p;
+    return op;
+}
+
+static AxMirOperand intr_const_op(TypeId ty, uint64_t v) {
+    AxMirOperand op = {0};
+    op.kind = AX_MIR_OP_CONST;
+    op.constant.kind = AX_MIR_CONST_INT;
+    op.constant.ty = ty;
+    op.constant.val = v;
+    return op;
+}
+
+static void intr_assign(Builder *b, AxMirPlace place, AxMirRvalue rv) {
+    AxMirStmt s = {0};
+    s.kind = AX_MIR_STMT_ASSIGN;
+    s.assign.place = place;
+    s.assign.rvalue = rv;
+    push_stmt(b, b->current_bb, s);
+}
+
+/* out = lhs <op> rhs; returns a copy operand of out. */
+static AxMirOperand intr_binop_into(Builder *b, AxMirPlace out, AxMirBinOp op, AxMirOperand lhs, AxMirOperand rhs) {
+    AxMirRvalue rv = {0};
+    rv.kind = AX_MIR_RVALUE_BINARY_OP;
+    rv.binary_op.op = op;
+    rv.binary_op.lhs = lhs;
+    rv.binary_op.rhs = rhs;
+    intr_assign(b, out, rv);
+    return intr_copy_op(out);
+}
+
+/* tmp = lhs <op> rhs, where tmp has type `ty`; returns a copy operand of tmp. */
+static AxMirOperand intr_binop(Builder *b, AxMirBinOp op, TypeId ty, AxMirOperand lhs, AxMirOperand rhs) {
+    return intr_binop_into(b, intr_temp(b, ty), op, lhs, rhs);
+}
+
+static void intr_cast_into(Builder *b, AxMirPlace out, AxMirOperand v, TypeId to) {
+    AxMirRvalue rv = {0};
+    rv.kind = AX_MIR_RVALUE_CAST;
+    rv.cast.kind = AX_MIR_CAST_INT_TO_INT;
+    rv.cast.op = v;
+    rv.cast.ty = to;
+    intr_assign(b, out, rv);
+}
+
+/* v as `to` (no statement when the operand already has that type). */
+static AxMirOperand intr_cast(Builder *b, AxMirOperand v, TypeId from, TypeId to) {
+    if (TypeId_eq(from, to)) return v;
+    AxMirPlace t = intr_temp(b, to);
+    intr_cast_into(b, t, v, to);
+    return intr_copy_op(t);
+}
+
+/* Copies an argument operand into a fresh typed temporary so it can be read any number of times. */
+static AxMirOperand intr_materialize(Builder *b, AxMirOperand v, TypeId ty) {
+    AxMirPlace t = intr_temp(b, ty);
+    AxMirRvalue rv = {0};
+    rv.kind = AX_MIR_RVALUE_USE;
+    rv.use = v;
+    intr_assign(b, t, rv);
+    return intr_copy_op(t);
+}
+
+/* Population count of a u64 operand (SWAR); every step is overflow free, the final multiply wraps. */
+static AxMirOperand intr_popcount64(Builder *b, AxMirOperand x) {
+    TypeId u64 = b->thir->interner.t_u64;
+    TypeId u32 = b->thir->interner.t_u32;
+    AxMirOperand c1 = intr_const_op(u32, 1), c2 = intr_const_op(u32, 2), c4 = intr_const_op(u32, 4), c56 = intr_const_op(u32, 56);
+    AxMirOperand m55 = intr_const_op(u64, 0x5555555555555555ULL);
+    AxMirOperand m33 = intr_const_op(u64, 0x3333333333333333ULL);
+    AxMirOperand m0f = intr_const_op(u64, 0x0F0F0F0F0F0F0F0FULL);
+    AxMirOperand m01 = intr_const_op(u64, 0x0101010101010101ULL);
+    AxMirOperand t = intr_binop(b, AX_MIR_BINOP_SHR, u64, x, c1);
+    t = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, t, m55);
+    AxMirOperand x1 = intr_binop(b, AX_MIR_BINOP_SUB, u64, x, t);
+    AxMirOperand lo = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, x1, m33);
+    AxMirOperand hi = intr_binop(b, AX_MIR_BINOP_SHR, u64, x1, c2);
+    hi = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, hi, m33);
+    AxMirOperand x2 = intr_binop(b, AX_MIR_BINOP_ADD, u64, lo, hi);
+    AxMirOperand sh = intr_binop(b, AX_MIR_BINOP_SHR, u64, x2, c4);
+    AxMirOperand sum = intr_binop(b, AX_MIR_BINOP_ADD, u64, x2, sh);
+    AxMirOperand x3 = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, sum, m0f);
+    AxMirOperand prod = intr_binop(b, AX_MIR_BINOP_WRAPPING_MUL, u64, x3, m01);
+    return intr_binop(b, AX_MIR_BINOP_SHR, u64, prod, c56);
+}
+
+/* The argument zero-extended (through the unsigned type of the same width) to u64. */
+static AxMirOperand intr_zext64(Builder *b, AxMirOperand a, TypeId w_ty, TypeId u_ty) {
+    AxMirOperand u = intr_cast(b, a, w_ty, u_ty);
+    return intr_cast(b, u, u_ty, b->thir->interner.t_u64);
+}
+
+static void intr_finish_use(Builder *b, AxMirPlace dest, AxMirOperand v) {
+    AxMirRvalue rv = {0};
+    rv.kind = AX_MIR_RVALUE_USE;
+    rv.use = v;
+    intr_assign(b, dest, rv);
+}
+
+/* Assert that aborts (exit code 101) when `cond` is false; execution continues in the new block. */
+static void intr_assert(Builder *b, AxMirOperand cond, const char *msg) {
+    AxMirPlace c = intr_temp(b, b->thir->interner.t_bool);
+    AxMirRvalue rv = {0};
+    rv.kind = AX_MIR_RVALUE_USE;
+    rv.use = cond;
+    intr_assign(b, c, rv);
+    AxMirTerminator term = {0};
+    term.kind = AX_MIR_TERM_ASSERT;
+    term.assert.cond = intr_copy_op(c);
+    term.assert.expected = true;
+    term.assert.msg = msg;
+    term.assert.target = add_bb(b);
+    term.assert.unwind = add_bb(b);
+    set_terminator(b, b->current_bb, term);
+    b->current_bb = term.assert.target;
+}
+
+/* Returns true when `expr` (a call) was an intrinsic that the builder expanded into `dest`. */
+static bool try_build_intrinsic_call(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
+    const uint32_t *code = AxExprVariantMap_get(&b->thir->expr_variants, expr->call.callee);
+    AxIntrinsicRef ref;
+    if (!code || !ax_intrinsic_decode(*code, &ref)) return false;
+    if (ref.desc->cls != AX_INTR_MIR_OP && ref.desc->cls != AX_INTR_MIR_TERM) return false;
+
+    size_t argc = 0;
+    for (const AxHirExpr *a = expr->call.args; a; a = a->next) argc++;
+    const TypeInterner *in = &b->thir->interner;
+
+    if (ref.desc->cls == AX_INTR_MIR_TERM) {
+        /* assert(c) takes one argument; panic([msg]) and unreachable() never return. */
+        AxMirOperand arg = {0};
+        if (argc > 1) return false;
+        if (ref.desc->op == AX_INTR_OP_ASSERT && argc != 1) return false;
+        if (ref.desc->op == AX_INTR_OP_UNREACHABLE && argc != 0) return false;
+        if (argc == 1) arg = build_expr_as_operand(b, expr->call.args);
+        if (ref.desc->op == AX_INTR_OP_ASSERT) {
+            intr_assert(b, arg, "assertion failed");
+            AxMirStmt unit = {0};
+            unit.kind = AX_MIR_STMT_ASSIGN;
+            unit.assign.place = dest;
+            unit.assign.rvalue.kind = AX_MIR_RVALUE_AGGREGATE;
+            push_stmt(b, b->current_bb, unit);
+        } else {
+            const char *msg = ref.desc->op == AX_INTR_OP_UNREACHABLE ? "entered unreachable code" : "explicit panic";
+            intr_assert(b, intr_const_op(in->t_bool, 0), msg);
+        }
+        return true;
+    }
+
+    TypeId w_ty = ax_intrinsic_width_type(ref.width, in);
+    TypeId u_ty = ax_intrinsic_width_unsigned_type(ref.width, in);
+    uint32_t bits = ax_intrinsic_width_bits(ref.width);
+    TypeId u32 = in->t_u32;
+    TypeId u64 = in->t_u64;
+    AxIntrinsicOp op = ref.desc->op;
+    size_t want = (op == AX_INTR_OP_WRAPPING_ADD || op == AX_INTR_OP_WRAPPING_SUB || op == AX_INTR_OP_WRAPPING_MUL ||
+                   op == AX_INTR_OP_ROTATE_LEFT || op == AX_INTR_OP_ROTATE_RIGHT) ? 2 : 1;
+    if (argc != want) return false;
+
+    AxMirOperand a = build_expr_as_operand(b, expr->call.args);
+    AxMirOperand a2 = {0};
+    if (want == 2) a2 = build_expr_as_operand(b, expr->call.args->next);
+
+    switch (op) {
+        case AX_INTR_OP_WRAPPING_ADD:
+        case AX_INTR_OP_WRAPPING_SUB:
+        case AX_INTR_OP_WRAPPING_MUL: {
+            AxMirBinOp bop = op == AX_INTR_OP_WRAPPING_ADD ? AX_MIR_BINOP_WRAPPING_ADD
+                           : op == AX_INTR_OP_WRAPPING_SUB ? AX_MIR_BINOP_WRAPPING_SUB : AX_MIR_BINOP_WRAPPING_MUL;
+            /* operands go through typed temporaries: the interpreter and LIR take the operation type from the
+             * operand's base local, which is wrong for a projected place such as `self.total_len` */
+            AxMirOperand xa = intr_materialize(b, a, w_ty);
+            AxMirOperand xb = intr_materialize(b, a2, w_ty);
+            intr_binop_into(b, dest, bop, xa, xb);
+            break;
+        }
+        case AX_INTR_OP_WRAPPING_NEG: {
+            /* -x modulo 2^bits is 0 - x */
+            AxMirOperand x = intr_materialize(b, a, w_ty);
+            intr_binop_into(b, dest, AX_MIR_BINOP_WRAPPING_SUB, intr_const_op(w_ty, 0), x);
+            break;
+        }
+        case AX_INTR_OP_ROTATE_LEFT:
+        case AX_INTR_OP_ROTATE_RIGHT: {
+            AxMirOperand x = intr_materialize(b, a, w_ty);
+            AxMirOperand n = intr_materialize(b, a2, u32);
+            AxMirOperand xu = intr_cast(b, x, w_ty, u_ty);
+            AxMirOperand mask = intr_const_op(u32, bits - 1);
+            /* both shift amounts lie in [0, bits - 1]: n mod bits and (bits - n mod bits) mod bits. A rotation
+             * by 0 shifts by 0 twice and or-s the value with itself. */
+            AxMirOperand nm = intr_binop(b, AX_MIR_BINOP_BIT_AND, u32, n, mask);
+            AxMirOperand inv = intr_binop(b, AX_MIR_BINOP_SUB, u32, intr_const_op(u32, bits), nm);
+            inv = intr_binop(b, AX_MIR_BINOP_BIT_AND, u32, inv, mask);
+            AxMirOperand left_amt = op == AX_INTR_OP_ROTATE_LEFT ? nm : inv;
+            AxMirOperand right_amt = op == AX_INTR_OP_ROTATE_LEFT ? inv : nm;
+            AxMirOperand hi = intr_binop(b, AX_MIR_BINOP_SHL, u_ty, xu, left_amt);
+            AxMirOperand lo = intr_binop(b, AX_MIR_BINOP_SHR, u_ty, xu, right_amt);
+            AxMirOperand r = intr_binop(b, AX_MIR_BINOP_BIT_OR, u_ty, hi, lo);
+            if (TypeId_eq(w_ty, u_ty)) intr_finish_use(b, dest, r);
+            else intr_cast_into(b, dest, r, w_ty);
+            break;
+        }
+        case AX_INTR_OP_COUNT_ONES: {
+            AxMirOperand x = intr_materialize(b, a, w_ty);
+            AxMirOperand cnt = intr_popcount64(b, intr_zext64(b, x, w_ty, u_ty));
+            intr_cast_into(b, dest, cnt, u32);
+            break;
+        }
+        case AX_INTR_OP_LEADING_ZEROS: {
+            /* smearing the highest set bit downwards leaves bit_length(x) ones, so
+             * leading_zeros = bits - popcount(smear); a zero argument gives bits */
+            AxMirOperand x = intr_materialize(b, a, w_ty);
+            AxMirOperand y = intr_zext64(b, x, w_ty, u_ty);
+            for (uint32_t s = 1; s < bits; s <<= 1) {
+                AxMirOperand sh = intr_binop(b, AX_MIR_BINOP_SHR, u64, y, intr_const_op(u32, s));
+                y = intr_binop(b, AX_MIR_BINOP_BIT_OR, u64, y, sh);
+            }
+            AxMirOperand ones = intr_cast(b, intr_popcount64(b, y), u64, u32);
+            intr_binop_into(b, dest, AX_MIR_BINOP_SUB, intr_const_op(u32, bits), ones);
+            break;
+        }
+        case AX_INTR_OP_TRAILING_ZEROS: {
+            /* ~x & (x - 1) has exactly the bits below the lowest set bit (all `bits` of them for zero) */
+            AxMirOperand x = intr_materialize(b, a, w_ty);
+            AxMirOperand y = intr_zext64(b, x, w_ty, u_ty);
+            AxMirOperand ym1 = intr_binop(b, AX_MIR_BINOP_WRAPPING_SUB, u64, y, intr_const_op(u64, 1));
+            AxMirPlace ny = intr_temp(b, u64);
+            AxMirRvalue nrv = {0};
+            nrv.kind = AX_MIR_RVALUE_UNARY_OP;
+            nrv.unary_op.op = AX_MIR_UNOP_BITNOT;
+            nrv.unary_op.operand = y;
+            intr_assign(b, ny, nrv);
+            AxMirOperand t = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, intr_copy_op(ny), ym1);
+            if (bits < 64) t = intr_binop(b, AX_MIR_BINOP_BIT_AND, u64, t, intr_const_op(u64, (1ULL << bits) - 1));
+            intr_cast_into(b, dest, intr_popcount64(b, t), u32);
+            break;
+        }
+        default:
+            AX_ICE("MIR builder: unhandled intrinsic operation");
+    }
+    return true;
+}
+
 static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace dest) {
     uint32_t *vidx_ptr = AxExprVariantMap_get(&b->thir->expr_variants, expr);
     if (vidx_ptr) {
@@ -2048,6 +2312,7 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
         b->loop_count--;
     } else if (expr->kind == AX_HIR_EXPR_CALL) {
         if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
+            if (try_build_intrinsic_call(b, expr, dest)) return;
             TypeId callee_ty = get_expr_type(b, expr->call.callee);
             if (!TypeId_is_none(callee_ty) && ax_type_get(&b->thir->interner, callee_ty)->kind == AX_TY_BUILTIN_DROP) {
                 AxMirOperand arg = build_expr_as_operand(b, expr->call.args);
@@ -2662,6 +2927,16 @@ static void build_block_into(Builder *b, const AxHirBlock *block, AxMirPlace des
 
 AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *arena) {
     if (!func || func->kind != AX_HIR_ITEM_FN || !func->fn.body) return NULL;
+    for (const AxHirAttr *at = func->attrs; at; at = at->next) {
+        if (at->args && !at->args->next && at->args->expr &&
+            at->args->expr->kind == AX_HIR_EXPR_LITERAL &&
+            at->args->expr->literal.kind == AX_TOK_INT) {
+            AxIntrinsicRef iref;
+            if (ax_intrinsic_decode((uint32_t)at->args->expr->literal.val.int_val.value, &iref)) {
+                return NULL;
+            }
+        }
+    }
     
     Builder b = {0};
     b.arena = arena;

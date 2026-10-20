@@ -207,6 +207,12 @@ def write_registry(entries):
 
 
 def main():
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002)
+        except Exception:
+            pass
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     update = "--update-registry" in sys.argv
     if len(args) < 3:

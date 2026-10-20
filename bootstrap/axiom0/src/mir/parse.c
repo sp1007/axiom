@@ -237,6 +237,16 @@ static AxMirRvalue parse_rvalue(MirParser *p) {
         expect_str(p, ",");
         rv.binary_op.rhs = parse_operand(p);
         expect_str(p, ")");
+    } else if (match_ident(p, "wrapping_add(") || match_ident(p, "wrapping_sub(") || match_ident(p, "wrapping_mul(")) {
+        /* the name just matched is the 12 characters before the opening parenthesis; its last letter
+         * ('d', 'b' or 'l') tells add, sub and mul apart */
+        char last = p->text[p->pos - 2];
+        rv.kind = AX_MIR_RVALUE_BINARY_OP;
+        rv.binary_op.op = last == 'd' ? AX_MIR_BINOP_WRAPPING_ADD : (last == 'b' ? AX_MIR_BINOP_WRAPPING_SUB : AX_MIR_BINOP_WRAPPING_MUL);
+        rv.binary_op.lhs = parse_operand(p);
+        expect_str(p, ",");
+        rv.binary_op.rhs = parse_operand(p);
+        expect_str(p, ")");
     } else if (match_str(p, "!")) {
         rv.kind = AX_MIR_RVALUE_UNARY_OP;
         rv.unary_op.op = AX_MIR_UNOP_NOT;

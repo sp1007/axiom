@@ -81,7 +81,11 @@ typedef enum AxMirBinOp {
     AX_MIR_BINOP_SHL, AX_MIR_BINOP_SHR,
     AX_MIR_BINOP_EQ, AX_MIR_BINOP_LT, AX_MIR_BINOP_LE,
     AX_MIR_BINOP_NE, AX_MIR_BINOP_GE, AX_MIR_BINOP_GT,
-    AX_MIR_BINOP_OFFSET
+    AX_MIR_BINOP_OFFSET,
+    /* Wrapping arithmetic (T134, ADR-0004 s1): the result is the mathematical result modulo 2^bits of the
+     * operand type (both operands have that type). Never panics, no separate overflow check; this is what
+     * the wrapping_<op>_<w> intrinsics lower to. */
+    AX_MIR_BINOP_WRAPPING_ADD, AX_MIR_BINOP_WRAPPING_SUB, AX_MIR_BINOP_WRAPPING_MUL
 } AxMirBinOp;
 
 typedef enum AxMirUnOp {

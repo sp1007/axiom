@@ -1,4 +1,5 @@
 #include "driver/driver.h"
+#include "driver/mono.h"
 #include "hir/lower.h"
 #include "mir/drop/drop.h"
 #include <string.h>
@@ -406,6 +407,7 @@ static void stage_hir(AxDriverState *st) {
 }
 
 #include "mir/build/build.h"
+#include "mir/build/intrinsics.h"
 #include "verify/verify.h"
 #include "own/unsafe/unsafe.h"
 #include "kernel/hashmap.h"
@@ -431,16 +433,12 @@ static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
         for (AxHirAttr *attr = it->attrs; attr; attr = attr->next) {
             StrView an = ax_interner_get(&st->interner, attr->name);
             if (ax_sv_eq_cstr(an, "intrinsic")) {
+                /* T134: @intrinsic functions have placeholder bodies in source; calls are lowered by
+                 * typeck (AX_INTR_BUILTIN), the MIR builder (AX_INTR_MIR_OP / AX_INTR_MIR_TERM), or LIR
+                 * host-call renaming (AX_INTR_HOST), so no placeholder body is ever compiled. */
                 StrView fn_name = ax_interner_get(&st->interner, it->fn.name);
-                static const char *const host_names[] = {
-                    "heap_alloc", "heap_realloc", "heap_free", "stdio", "open", "read",
-                    "write", "close", "file_size", "args_count", "arg", "env_get",
-                    "exe_path", "exit", "remove", "mkdir", "metadata", "dir_open",
-                    "dir_next", "dir_close", "monotonic_ns", NULL
-                };
-                for (int i = 0; host_names[i]; i++) {
-                    if (ax_sv_eq_cstr(fn_name, host_names[i])) return;
-                }
+                AxIntrinsicRef iref;
+                if (ax_intrinsic_lookup(fn_name, &iref)) return;
             }
         }
         AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
@@ -453,13 +451,83 @@ static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
         }
     }
 }
+/* ---- T134: the intrinsic table at the driver ------------------------------------------------------------------
+ * typeck sits below the MIR layer and cannot read the table, so the driver (1) writes the encoded table reference
+ * of every recognized `@intrinsic fn` into the attribute as one positional integer argument before typeck (low 32
+ * bits = ax_intrinsic_encode, high 32 bits = builtin_ty for AX_INTR_BUILTIN), and (2) after typeck rejects every
+ * `@intrinsic fn` that is not a table row with a matching signature (AX_TYPE_UNKNOWN_INTRINSIC), so a placeholder
+ * body is never compiled or run in its place. */
+
+static AxHirAttr *intrinsic_attr(AxDriverState *st, const AxHirItem *it) {
+    for (AxHirAttr *at = it->attrs; at; at = at->next) {
+        StrView an = ax_interner_get(&st->interner, at->name);
+        if (ax_sv_eq_cstr(an, "intrinsic")) return at;
+    }
+    return NULL;
+}
+
+static void annotate_intrinsic_item(AxDriverState *st, AxHirItem *it) {
+    if (it->kind != AX_HIR_ITEM_FN) return;
+    AxHirAttr *at = intrinsic_attr(st, it);
+    if (!at || at->args) return;
+    AxIntrinsicRef ref;
+    if (!ax_intrinsic_lookup(ax_interner_get(&st->interner, it->fn.name), &ref)) return;
+    AxHirAttrArg *arg = ax_arena_alloc(&st->hir_arena, sizeof(AxHirAttrArg), _Alignof(AxHirAttrArg));
+    AxHirExpr *lit = ax_arena_alloc(&st->hir_arena, sizeof(AxHirExpr), _Alignof(AxHirExpr));
+    memset(arg, 0, sizeof(*arg));
+    memset(lit, 0, sizeof(*lit));
+    lit->kind = AX_HIR_EXPR_LITERAL;
+    lit->span = at->span;
+    lit->literal.kind = AX_TOK_INT;
+    lit->literal.val.int_val.value = ((uint64_t)ref.desc->builtin_ty << 32) | (uint64_t)ax_intrinsic_encode(&ref);
+    arg->span = at->span;
+    arg->expr = lit;
+    at->args = arg;
+}
+
+static void check_intrinsic_item(AxDriverState *st, const AxHirItem *it) {
+    if (it->kind != AX_HIR_ITEM_FN || !intrinsic_attr(st, it)) return;
+    size_t generic_count = 0;
+    if (it->fn.generic_params) {
+        for (const AxHirGenericParam *p = it->fn.generic_params->params; p; p = p->next) generic_count++;
+    }
+    AxIntrinsicRef ref;
+    const TypeId *fty = AxItemTypeMap_get(&st->thir.item_types, it);
+    bool ok = fty && ax_intrinsic_lookup(ax_interner_get(&st->interner, it->fn.name), &ref) &&
+              ax_intrinsic_signature_ok(&ref, ax_type_get(&st->thir.interner, *fty), generic_count, &st->thir.interner);
+    if (!ok) {
+        AxDiagnostic d = {0};
+        d.code = AX_TYPE_UNKNOWN_INTRINSIC;
+        d.severity = AX_DIAG_ERROR;
+        d.message = ax_diag_code_default_message(AX_TYPE_UNKNOWN_INTRINSIC);
+        d.primary = it->span;
+        ax_diag_sink_report(&st->sink, &d);
+    }
+}
+
+static void for_each_fn_item(AxDriverState *st, void (*fn)(AxDriverState *, AxHirItem *)) {
+    for (AxHirItem *it = st->hir.items; it; it = it->next) {
+        fn(st, it);
+        if (it->kind == AX_HIR_ITEM_IMPL) {
+            for (AxHirItem *m = it->impl.members; m; m = m->next) fn(st, m);
+        } else if (it->kind == AX_HIR_ITEM_TRAIT) {
+            for (AxHirItem *m = it->trait.members; m; m = m->next) fn(st, m);
+        }
+    }
+}
+
+static void check_intrinsic_item_cb(AxDriverState *st, AxHirItem *it) { check_intrinsic_item(st, it); }
+
 static void stage_typeck(AxDriverState *st) {
     if (st->sink.errors > 0) return;
     extern void ax_traits_check_overlap(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in);
     ax_traits_check_overlap(&st->hir, &st->sink, &st->interner);
+    for_each_fn_item(st, annotate_intrinsic_item);
     AxConstEvaluator evaluator = ax_interp_create_const_evaluator(&st->hir, &st->interner, &st->resolve_map, &st->parse_res.ast, &st->sink);
     st->thir = ax_typeck_with_evaluator(&st->hir, &st->sink, &st->interner, &st->db, &evaluator);
     free(evaluator.ctx);
+    if (st->sink.errors > 0) return;
+    for_each_fn_item(st, check_intrinsic_item_cb);
     if (st->sink.errors > 0) return;
 
     ax_unsafe_check(&st->hir, &st->thir, &st->sink, &st->interner);
@@ -560,6 +628,61 @@ static void stage_run(AxDriverState *st) {
 extern void ax_stage_build_native(AxDriverState *st);
 extern void ax_stage_mono(AxDriverState *st);
 
+/* BOOTSTRAP-SHORTCUT (T134, follow-up: fix driver/mono.c, which is outside this task): mono.c reads the low 32 bits
+ * of EVERY const callee as a function symbol, but the builtin callees that take a type argument (ptr_add, ptr_sub,
+ * size_of, ...) carry a TypeId there. A TypeId equal to the symbol of some non-generic fn turned such a call into a
+ * call of that fn: before T134 silently into the placeholder body of an intrinsic (`interner_get` computed
+ * `strings + n` as `wrapping_add_u64(...)` = 0), now into an unresolved symbol. Move the TypeId into the high 32
+ * bits and put a sentinel in the low 32 bits that neither resolve.c (1..) nor hir/lower.c (0x80000000..) uses. */
+#define AX_MONO_TYPE_ARG_SENTINEL 0x7FFFFFFFull
+
+static bool callee_carries_type_arg(const AxMirTerminator *term, const TypeInterner *in) {
+    if (term->kind != AX_MIR_TERM_CALL || term->call.func.kind != AX_MIR_OP_CONST) return false;
+    TypeId ty = term->call.func.constant.ty;
+    if (ty.v == 0) return false;
+    switch ((int)ax_type_get(in, ty)->kind) {
+        case AX_TY_BUILTIN_PTR_ADD: case AX_TY_BUILTIN_PTR_SUB: case AX_TY_BUILTIN_SIZE_OF: case AX_TY_BUILTIN_ALIGN_OF:
+        case AX_TY_BUILTIN_NEEDS_DROP: case AX_TY_BUILTIN_DROP_IN_PLACE: case AX_TY_BUILTIN_PTR_COPY:
+        case AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING: case AX_TY_BUILTIN_PTR_WRITE_BYTES:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void tag_type_arg_callees(AxMirBody *body, const TypeInterner *in, bool tag) {
+    for (size_t i = 0; i < body->bb_count; i++) {
+        AxMirTerminator *term = &body->bbs[i].terminator;
+        if (!callee_carries_type_arg(term, in)) continue;
+        if (tag) {
+            if ((term->call.func.constant.val & 0xFFFFFFFFull) != AX_MONO_TYPE_ARG_SENTINEL) {
+                term->call.func.constant.val = (term->call.func.constant.val << 32) | AX_MONO_TYPE_ARG_SENTINEL;
+            }
+        } else {
+            if ((term->call.func.constant.val & 0xFFFFFFFFull) == AX_MONO_TYPE_ARG_SENTINEL) {
+                term->call.func.constant.val >>= 32;
+            }
+        }
+    }
+}
+
+static void stage_mono_shielded(AxDriverState *st) {
+    if (g_mir_initialized) {
+        uint32_t cur = 0;
+        AxMirMapEntry *e;
+        while (AxMirMap_next(&g_mir_map, &cur, &e)) tag_type_arg_callees(e->value, &st->thir.interner, true);
+    }
+    ax_stage_mono(st);
+    if (g_mir_initialized) {
+        uint32_t cur = 0;
+        AxMirMapEntry *e;
+        while (AxMirMap_next(&g_mir_map, &cur, &e)) tag_type_arg_callees(e->value, &st->thir.interner, false);
+    }
+    for (const AxMonoInstance *inst = st->mono_instances; inst; inst = inst->next) {
+        if (inst->body) tag_type_arg_callees(inst->body, &st->thir.interner, false);
+    }
+}
+
 const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_SOURCE, "source", NULL, stage_source},
     {AX_STAGE_LEX, "lex", "lex", stage_lex},
@@ -569,7 +692,7 @@ const AxStage ax_pipeline_stages[] = {
     {AX_STAGE_TYPECK, "typeck", "typeck", stage_typeck},
     {AX_STAGE_OWN, "own", "own", stage_own},
     {AX_STAGE_INTERP, "run", "interp", stage_run},
-    {AX_STAGE_MONO, "mono", "mono", ax_stage_mono},
+    {AX_STAGE_MONO, "mono", "mono", stage_mono_shielded},
     {AX_STAGE_LIMIT, "build", "native", ax_stage_build_native},
     {AX_STAGE_LIMIT + 1, "opt", "opt", stage_source},
     {AX_STAGE_LIMIT + 2, NULL, NULL, NULL}

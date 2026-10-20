@@ -84,6 +84,9 @@ typedef struct TypeckCtx {
     TypeId self_ty;
     uint32_t next_closure_id;
 
+    /* The fn item the last lookup_path_type call resolved to (T134: intrinsic call registration). */
+    const AxHirItem *last_fn_item;
+
     const AxConstEvaluator *evaluator;
     AxSymbolId *const_eval_stack;
     size_t const_eval_stack_len;
@@ -2147,32 +2150,22 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
 
             if (match) {
                 if (it->kind == AX_HIR_ITEM_FN) {
-                    StrView fn_name = ax_interner_get(cx->str_in, it->fn.name);
-                    bool is_intr = false;
+                    AxType st = {0};
                     for (const AxHirAttr *at = it->attrs; at; at = at->next) {
                         StrView an = ax_interner_get(cx->str_in, at->name);
-                        if (ax_sv_eq_cstr(an, "intrinsic")) { is_intr = true; break; }
+                        if (!ax_sv_eq_cstr(an, "intrinsic")) continue;
+                        const AxHirAttrArg *arg = at->args;
+                        if (arg && !arg->next && arg->expr && arg->expr->kind == AX_HIR_EXPR_LITERAL &&
+                            arg->expr->literal.kind == AX_TOK_INT) {
+                            st.kind = (AxTypeKind)(arg->expr->literal.val.int_val.value >> 32);
+                        }
+                        break;
                     }
-                    AxType st = {0};
-                    if (ax_sv_eq_cstr(fn_name, "size_of")) st.kind = AX_TY_BUILTIN_SIZE_OF;
-                    else if (ax_sv_eq_cstr(fn_name, "align_of")) st.kind = AX_TY_BUILTIN_ALIGN_OF;
-                    else if (ax_sv_eq_cstr(fn_name, "needs_drop")) st.kind = AX_TY_BUILTIN_NEEDS_DROP;
-                    else if (ax_sv_eq_cstr(fn_name, "drop_in_place")) st.kind = AX_TY_BUILTIN_DROP_IN_PLACE;
-                    else if (ax_sv_eq_cstr(fn_name, "forget")) st.kind = AX_TY_BUILTIN_FORGET;
-                    else if (ax_sv_eq_cstr(fn_name, "ptr_copy")) st.kind = AX_TY_BUILTIN_PTR_COPY;
-                    else if (ax_sv_eq_cstr(fn_name, "ptr_copy_nonoverlapping")) st.kind = AX_TY_BUILTIN_PTR_COPY_NONOVERLAPPING;
-                    else if (ax_sv_eq_cstr(fn_name, "ptr_write_bytes")) st.kind = AX_TY_BUILTIN_PTR_WRITE_BYTES;
-                    else if (ax_sv_eq_cstr(fn_name, "null")) st.kind = AX_TY_BUILTIN_NULL;
-                    else if (ax_sv_eq_cstr(fn_name, "null_mut")) st.kind = AX_TY_BUILTIN_NULL_MUT;
-                    else if (ax_sv_eq_cstr(fn_name, "is_null")) st.kind = AX_TY_BUILTIN_IS_NULL;
-                    else if (ax_sv_eq_cstr(fn_name, "ptr_add")) st.kind = AX_TY_BUILTIN_PTR_ADD;
-                    else if (ax_sv_eq_cstr(fn_name, "ptr_sub")) st.kind = AX_TY_BUILTIN_PTR_SUB;
-                    else if (ax_sv_eq_cstr(fn_name, "address_of")) st.kind = AX_TY_BUILTIN_ADDRESS_OF;
-                    else if (ax_sv_eq_cstr(fn_name, "address_of_mut")) st.kind = AX_TY_BUILTIN_ADDRESS_OF_MUT;
-                    if (st.kind != 0 && (is_intr || true)) {
+                    if (st.kind != 0) {
                         TypeId sty = ax_intern_type(&cx->thir->interner, &st);
                         return instantiate_path(cx, sty, it, path, out_args);
                     }
+                    cx->last_fn_item = it;
                 }
                 TypeId *it_t = AxItemTypeMap_get(&cx->thir->item_types, it);
                 if (it_t) return instantiate_path(cx, *it_t, it, path, out_args);
@@ -2603,12 +2596,33 @@ static TypeId check_unary(TypeckCtx *cx, const AxHirExpr *expr) {
     return in->t_error;
 }
 
+/* T134: the driver annotates the `@intrinsic` attribute of every table intrinsic that the MIR builder expands
+ * with one positional integer literal: the encoded table reference (mir/build/intrinsics.h; typeck sits below
+ * the MIR layer and neither includes the header nor looks at the value). A call whose callee path resolves to
+ * such a function gets that value recorded on the callee expression, where the builder reads it. The THIR has
+ * no dedicated map for it (types.h is outside this task), so expr_variants is reused: the builder only
+ * consults it for the enum-constructor expressions it builds itself, never for callee paths. */
+static void register_intrinsic_callee(TypeckCtx *cx, const AxHirExpr *callee, const AxHirItem *it) {
+    if (!it || it->kind != AX_HIR_ITEM_FN) return;
+    for (const AxHirAttr *at = it->attrs; at; at = at->next) {
+        StrView an = ax_interner_get(cx->str_in, at->name);
+        if (!ax_sv_eq_cstr(an, "intrinsic")) continue;
+        const AxHirAttrArg *arg = at->args;
+        if (arg && !arg->next && arg->expr && arg->expr->kind == AX_HIR_EXPR_LITERAL && arg->expr->literal.kind == AX_TOK_INT) {
+            AxExprVariantMap_insert(&cx->thir->expr_variants, callee, (uint32_t)arg->expr->literal.val.int_val.value);
+        }
+        return;
+    }
+}
+
 static TypeId check_call(TypeckCtx *cx, const AxHirExpr *expr) {
     TypeId callee_ty;
     if (expr->call.callee->kind == AX_HIR_EXPR_PATH) {
         AxGenericArgs gargs = {0};
+        cx->last_fn_item = NULL;
         callee_ty = resolve_ty(cx, lookup_path_type(cx, &expr->call.callee->path.path, &gargs));
         AxExprTypeMap_insert(&cx->thir->expr_types, expr->call.callee, callee_ty);
+        register_intrinsic_callee(cx, expr->call.callee, cx->last_fn_item);
         if (gargs.count > 0) {
             AxExprSubstMap_insert(&cx->thir->expr_substs, expr->call.callee, gargs);
         }

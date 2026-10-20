@@ -1,4 +1,5 @@
 #include "lir/lir.h"
+#include "mir/build/intrinsics.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -30,17 +31,9 @@ typedef struct LirBuilder {
     size_t cur_inst_cap;
 } LirBuilder;
 
+/* Host intrinsics are the AX_INTR_HOST rows of the intrinsic table (T134). */
 static bool is_host_intrinsic_name(StrView name) {
-    static const char *const host_names[] = {
-        "heap_alloc", "heap_realloc", "heap_free", "stdio", "open", "read",
-        "write", "close", "file_size", "args_count", "arg", "env_get",
-        "exe_path", "exit", "remove", "mkdir", "metadata", "dir_open",
-        "dir_next", "dir_close", "monotonic_ns", NULL
-    };
-    for (int i = 0; host_names[i]; i++) {
-        if (ax_sv_eq_cstr(name, host_names[i])) return true;
-    }
-    return false;
+    return ax_intrinsic_is_host(name);
 }
 
 static const char *get_fn_sym_name(const struct AxHir *hir, struct StrInterner *str_in, uint32_t sym_v) {
@@ -554,6 +547,11 @@ static AxLirInstKind lower_binop(AxMirBinOp op, bool is_signed) {
         case AX_MIR_BINOP_GT: return is_signed ? AX_LIR_INST_ICMP_SGT : AX_LIR_INST_ICMP_UGT;
         case AX_MIR_BINOP_GE: return is_signed ? AX_LIR_INST_ICMP_SGE : AX_LIR_INST_ICMP_UGE;
         case AX_MIR_BINOP_OFFSET: return AX_LIR_INST_ADD;
+        /* T134: LIR add/sub/mul wrap and the isel truncates to the destination type, which is exactly the
+         * wrapping_<op> semantics; the checked variants are guarded by separate overflow asserts. */
+        case AX_MIR_BINOP_WRAPPING_ADD: return AX_LIR_INST_ADD;
+        case AX_MIR_BINOP_WRAPPING_SUB: return AX_LIR_INST_SUB;
+        case AX_MIR_BINOP_WRAPPING_MUL: return AX_LIR_INST_MUL;
     }
     return AX_LIR_INST_ADD;
 }
@@ -1254,7 +1252,11 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                     callee_vreg = lower_operand(&b, &mbb->terminator.call.func);
                 }
                 
-                AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
+                TypeId dst_ty = {0};
+                AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, &dst_ty);
+                if (dst_ty.v == 0) {
+                    dst_ty = mir->locals[mbb->terminator.call.destination.local.v].ty;
+                }
 
                 for (size_t c = 0; c < cap_count && c < 64; c++) {
                     emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_ARG, .dest = { 0xFFFFFFFF }, .abi_arg = { .index = (uint32_t)c, .val = cap_vals[c] } });
@@ -1266,7 +1268,7 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 
                 emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_CALL, .dest = {0}, .call = { .sym_name = sym_name, .callee_ty = callee_ty, .dst_addr = dst_addr, .callee_vreg = callee_vreg } });
                 
-                AxLirVRegId res = make_vreg(&b, mir->locals[mbb->terminator.call.destination.local.v].ty);
+                AxLirVRegId res = make_vreg(&b, dst_ty);
                 emit_inst(&b, (AxLirInst){ .kind = AX_LIR_INST_ABI_RESULT, .dest = res, .abi_result = { .index = 0 } });
                 emit_store(&b, dst_addr, res);
                 

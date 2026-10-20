@@ -8,13 +8,15 @@ model: sonnet
 gate_model: opus
 depends: []
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/mir/mir.h, bootstrap/axiom0/src/mir/print.c, bootstrap/axiom0/src/mir/parse.c, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/verify, bootstrap/axiom0/src/opt, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/driver/pipeline.c, tests/run/numeric, tests/run/intrinsics, tests/ui/intrinsics, tests/mir, tests/lir, tests/mc, tests/selfhost, tests/std/core/qa_hash_vectors.ax]
 locks: [bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/diag/codes/TYPE.def]
 spec: [spec/decisions/ADR-0004-self-host-subset-additions.md, spec/SPEC-03-core-semantics.md, tasks/0327, tasks/0334]
 covers: [REQ-EXP-022, REQ-DRP-022]
 timeout_min: 300
+started: 2026-10-20 23:00:33
+finished: 2026-10-21 06:12:17
 ---
 # T134 — AX0-FIX-01: native lowering of wrapping/bit intrinsics, assert and panic
 
@@ -128,3 +130,7 @@ native exits 0.
   T150.
 
 ## Log
+- 2026-10-20 21:07:51 started (attempt 1) T134-impl
+- 2026-10-20 22:59:54 requeue: restart (not charged: attempt refunded)
+- 2026-10-20 23:00:33 started (attempt 1) T134-impl
+- 2026-10-21 06:12:17 accepted by QA -> done

@@ -122,9 +122,12 @@ static void print_rvalue(FILE *out, const AxMirRvalue *rv) {
                 case AX_MIR_BINOP_GE: op_str = ">="; break;
                 case AX_MIR_BINOP_GT: op_str = ">"; break;
                 case AX_MIR_BINOP_OFFSET: op_str = "offset"; break;
+                case AX_MIR_BINOP_WRAPPING_ADD: op_str = "wrapping_add"; break;
+                case AX_MIR_BINOP_WRAPPING_SUB: op_str = "wrapping_sub"; break;
+                case AX_MIR_BINOP_WRAPPING_MUL: op_str = "wrapping_mul"; break;
             }
-            if (rv->binary_op.op == AX_MIR_BINOP_OFFSET) {
-                fprintf(out, "offset(");
+            if (rv->binary_op.op == AX_MIR_BINOP_OFFSET || rv->binary_op.op >= AX_MIR_BINOP_WRAPPING_ADD) {
+                fprintf(out, "%s(", op_str);
                 print_operand(out, &rv->binary_op.lhs);
                 fprintf(out, ", ");
                 print_operand(out, &rv->binary_op.rhs);

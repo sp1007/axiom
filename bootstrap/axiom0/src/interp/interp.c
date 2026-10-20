@@ -1,6 +1,7 @@
 #include "interp/interp.h"
 #include "interp/host.h"
 #include "mir/build/build.h"
+#include "mir/build/intrinsics.h"
 #include "mir/drop/drop.h"
 #include "types/layout/layout.h"
 #include <stdlib.h>
@@ -18,7 +19,7 @@ typedef struct {
 } CallFrame;
 
 #define panic_interp ax_interp_panic
-static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret);
+static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size);
 static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size);
 
 static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
@@ -404,12 +405,16 @@ static uint8_t* get_place_ptr(InterpCtx *ctx, CallFrame *frame, const AxMirPlace
     return ptr;
 }
 
-static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperand *op) {
+/* Evaluates an operand and reports its type. For a place the type is the type of the projected place (`self.buf`
+ * is a u64 even though the local `self` is a view): operations take their width and signedness from it. */
+static uint64_t eval_operand_ty(InterpCtx *ctx, CallFrame *frame, const AxMirOperand *op, TypeId *out_ty) {
     if (op->kind == AX_MIR_OP_CONST) {
+        if (out_ty) *out_ty = op->constant.ty;
         return op->constant.val;
     } else {
         TypeId ty;
         uint8_t *ptr = get_place_ptr(ctx, frame, &op->place, &ty, NULL);
+        if (out_ty) *out_ty = ty;
         uint32_t size = ax_type_size(ty, &ctx->thir->interner);
         uint64_t val = 0;
         if (size == 1) val = *(uint8_t*)ptr;
@@ -419,6 +424,10 @@ static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperan
         else val = *(uint64_t*)ptr;
         return val;
     }
+}
+
+static uint64_t eval_operand(InterpCtx *ctx, CallFrame *frame, const AxMirOperand *op) {
+    return eval_operand_ty(ctx, frame, op, NULL);
 }
 
 
@@ -474,7 +483,7 @@ static void register_const_allocs(InterpCtx *ctx) {
 
 
 
-static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, AxInterpValue *out_ret) {
+static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, size_t arg_count, uint8_t *out_ret, size_t out_ret_size) {
     ctx->call_depth++;
     if (ctx->call_depth_limit > 0 && ctx->call_depth > ctx->call_depth_limit) {
         AxDiagnostic d = {0};
@@ -516,109 +525,21 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
 
     if (is_intrinsic) {
         StrView name = ax_interner_get(ctx->interner, func->fn.name);
-        if (ax_interp_eval_host_intrinsic(ctx, name, args, arg_count, out_ret)) {
+        AxInterpValue host_ret = {0};
+        if (ax_interp_eval_host_intrinsic(ctx, name, args, arg_count, &host_ret)) {
+            if (out_ret && out_ret_size > 0) {
+                size_t copy_sz = out_ret_size < sizeof(AxInterpValue) ? out_ret_size : sizeof(AxInterpValue);
+                memcpy(out_ret, &host_ret, copy_sz);
+            }
             ctx->call_depth--;
             return;
         }
-        if (ax_sv_eq_cstr(name, "assert")) {
-            if (arg_count > 0 && args[0] == 0) {
-                panic_interp(ctx, "assertion failed");
-            }
-            if (out_ret) out_ret->vals[0] = 0;
-            return;
-        } else if (ax_sv_eq_cstr(name, "unreachable")) {
-            panic_interp(ctx, "entered unreachable code");
-            return;
-        } else if (ax_sv_eq_cstr(name, "panic")) {
-            panic_interp(ctx, "panic");
-            return;
-        } else {
-            TypeId *fn_ty_ptr = AxItemTypeMap_get(&ctx->thir->item_types, func);
-            int bits = 64;
-            if (fn_ty_ptr) {
-                const AxType *fn_ty = ax_type_get(&ctx->thir->interner, *fn_ty_ptr);
-                if (fn_ty->kind == AX_TY_FN && fn_ty->fn.ret_type.v != 0) {
-                    // For intrinsics that return `u32` (like leading_zeros), the operand width is the parameter type.
-                    const AxType *op_ty = ax_type_get(&ctx->thir->interner, fn_ty->fn.param_types[0]);
-                    switch(op_ty->kind) {
-                        case AX_TY_I8: case AX_TY_U8: bits = 8; break;
-                        case AX_TY_I16: case AX_TY_U16: bits = 16; break;
-                        case AX_TY_I32: case AX_TY_U32: bits = 32; break;
-                        default: bits = 64; break;
-                    }
-                }
-            }
-            uint64_t mask = bits == 64 ? ~(uint64_t)0 : (((uint64_t)1 << bits) - 1);
-            
-            #define IS_OP(name, op) (name.len >= strlen(op) && memcmp(name.ptr, op, strlen(op)) == 0 && (name.len == strlen(op) || name.ptr[strlen(op)] == '_'))
-
-            if (IS_OP(name, "wrapping_add")) {
-                if (out_ret && arg_count == 2) {
-                    out_ret->vals[0] = (args[0] + args[1]) & mask;
-                    // printf("wrapping_add %llu + %llu = %llu\n", args[0], args[1], *out_ret);
-                }
-                return;
-            } else if (IS_OP(name, "wrapping_sub")) {
-                if (out_ret && arg_count == 2) out_ret->vals[0] = (args[0] - args[1]) & mask;
-                return;
-            } else if (IS_OP(name, "wrapping_mul")) {
-                if (out_ret && arg_count == 2) out_ret->vals[0] = (args[0] * args[1]) & mask;
-                return;
-            } else if (IS_OP(name, "wrapping_neg")) {
-                if (out_ret && arg_count == 1) out_ret->vals[0] = (0 - args[0]) & mask;
-                return;
-            } else if (IS_OP(name, "rotate_left")) {
-                if (out_ret && arg_count == 2) {
-                    uint32_t n = (uint32_t)args[1] % bits;
-                    out_ret->vals[0] = ((args[0] << n) | (args[0] >> ((bits - n) % bits))) & mask;
-                }
-                return;
-            } else if (IS_OP(name, "rotate_right")) {
-                if (out_ret && arg_count == 2) {
-                    uint32_t n = (uint32_t)args[1] % bits;
-                    out_ret->vals[0] = ((args[0] >> n) | (args[0] << ((bits - n) % bits))) & mask;
-                }
-                return;
-            } else if (IS_OP(name, "leading_zeros")) {
-                if (out_ret && arg_count == 1) {
-                    uint64_t val = args[0] & mask;
-                    if (val == 0) out_ret->vals[0] = bits;
-                    else {
-                        uint32_t lz = 0;
-                        for (int i = bits - 1; i >= 0; i--) {
-                            if ((val >> i) & 1) break;
-                            lz++;
-                        }
-                        out_ret->vals[0] = lz;
-                    }
-                }
-                return;
-            } else if (IS_OP(name, "trailing_zeros")) {
-                if (out_ret && arg_count == 1) {
-                    uint64_t val = args[0] & mask;
-                    if (val == 0) out_ret->vals[0] = bits;
-                    else {
-                        uint32_t tz = 0;
-                        for (int i = 0; i < bits; i++) {
-                            if ((val >> i) & 1) break;
-                            tz++;
-                        }
-                        out_ret->vals[0] = tz;
-                    }
-                }
-                return;
-            } else if (IS_OP(name, "count_ones")) {
-                if (out_ret && arg_count == 1) {
-                    uint64_t val = args[0] & mask;
-                    uint32_t ones = 0;
-                    for (int i = 0; i < bits; i++) {
-                        if ((val >> i) & 1) ones++;
-                    }
-                    out_ret->vals[0] = ones;
-                }
-                return;
-            }
-            #undef IS_OP
+        /* T134: every other intrinsic (assert, panic, wrapping/bit operations) is expanded by the MIR builder
+         * and never reaches the interpreter as a call; the by-name shortcuts that used to live here are gone
+         * so that the interpreter and native code run the very same MIR. */
+        AxIntrinsicRef iref;
+        if (ax_intrinsic_lookup(name, &iref) && (iref.desc->cls == AX_INTR_MIR_OP || iref.desc->cls == AX_INTR_MIR_TERM)) {
+            AX_ICE("interpreter: intrinsic call survived MIR lowering");
         }
     }
 
@@ -651,7 +572,7 @@ static void eval_call(InterpCtx *ctx, AxHirItem *func, AxInterpValue *args_raw, 
     }
     AxMirBody *body = *cached_body_ptr;
     
-    exec_mir_body(ctx, body, args_raw, arg_count, (uint8_t*)out_ret, sizeof(AxInterpValue));
+    exec_mir_body(ctx, body, args_raw, arg_count, out_ret, out_ret_size);
     ctx->call_depth--;
 }
 
@@ -891,25 +812,16 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                     }
                     case AX_MIR_RVALUE_BINARY_OP:
                     case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP: {
-                        uint64_t lhs = eval_operand(ctx, &frame, &stmt->assign.rvalue.binary_op.lhs);
-                        uint64_t rhs = eval_operand(ctx, &frame, &stmt->assign.rvalue.binary_op.rhs);
+                        /* T134: the operation type is the type of the operand place (projections included),
+                         * not the type of its base local: `self.buf | x` through a `mut_view<Hasher>` self
+                         * used to be taken as a 32-bit signed operation. */
+                        TypeId lhs_ty = {0}, rhs_ty = {0};
+                        uint64_t lhs = eval_operand_ty(ctx, &frame, &stmt->assign.rvalue.binary_op.lhs, &lhs_ty);
+                        uint64_t rhs = eval_operand_ty(ctx, &frame, &stmt->assign.rvalue.binary_op.rhs, &rhs_ty);
                         AxMirBinOp op = stmt->assign.rvalue.binary_op.op;
                         
-                        TypeId ty = {0};
-                        if (stmt->assign.rvalue.binary_op.lhs.kind == AX_MIR_OP_CONST) {
-                            ty = stmt->assign.rvalue.binary_op.lhs.constant.ty;
-                        } else {
-                            AxMirLocalId loc = stmt->assign.rvalue.binary_op.lhs.place.local;
-                            ty = frame.body->locals[loc.v].ty;
-                        }
-                        if (ty.v == 0) {
-                            if (stmt->assign.rvalue.binary_op.rhs.kind == AX_MIR_OP_CONST) {
-                                ty = stmt->assign.rvalue.binary_op.rhs.constant.ty;
-                            } else {
-                                AxMirLocalId loc = stmt->assign.rvalue.binary_op.rhs.place.local;
-                                ty = frame.body->locals[loc.v].ty;
-                            }
-                        }
+                        TypeId ty = lhs_ty;
+                        if (ty.v == 0) ty = rhs_ty;
                         const AxType *t = NULL;
                         if (ty.v != 0) {
                             t = ax_type_get(&ctx->thir->interner, ty);
@@ -937,6 +849,16 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                         
                         uint64_t res = 0;
                         bool overflow = false;
+                        if (op == AX_MIR_BINOP_WRAPPING_ADD || op == AX_MIR_BINOP_WRAPPING_SUB || op == AX_MIR_BINOP_WRAPPING_MUL) {
+                            /* T134: wrapping arithmetic works on the raw bit patterns and keeps the low
+                             * `bits` bits; the low bits of a sum, difference or product depend only on the
+                             * low bits of the operands, so signedness does not matter. */
+                            uint64_t wr = op == AX_MIR_BINOP_WRAPPING_ADD ? lhs + rhs
+                                        : op == AX_MIR_BINOP_WRAPPING_SUB ? lhs - rhs
+                                        : lhs * rhs;
+                            val = bits < 64 ? (wr & ((((uint64_t)1) << bits) - 1)) : wr;
+                            break;
+                        }
                         if (is_signed) {
                             int64_t a = 0;
                             int64_t b = 0;
@@ -1052,12 +974,7 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                                     if (t && t->kind == AX_TY_PTR) {
                                         uint32_t elem_sz = ax_type_size(t->ptr.pointee, &ctx->thir->interner);
                                         if (elem_sz == 0) elem_sz = 1;
-                                        TypeId r_ty = {0};
-                                        if (stmt->assign.rvalue.binary_op.rhs.kind == AX_MIR_OP_CONST) {
-                                            r_ty = stmt->assign.rvalue.binary_op.rhs.constant.ty;
-                                        } else {
-                                            r_ty = frame.body->locals[stmt->assign.rvalue.binary_op.rhs.place.local.v].ty;
-                                        }
+                                        TypeId r_ty = rhs_ty;
                                         const AxType *rt = r_ty.v ? ax_type_get(&ctx->thir->interner, r_ty) : NULL;
                                         if (rt && rt->kind == AX_TY_PTR) {
                                             r = (uint64_t)((int64_t)(a - b) / (int64_t)elem_sz);
@@ -1132,15 +1049,8 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                         break;
                     }
                     case AX_MIR_RVALUE_UNARY_OP: {
-                        uint64_t op_val = eval_operand(ctx, &frame, &stmt->assign.rvalue.unary_op.operand);
-                        
                         TypeId ty = {0};
-                        if (stmt->assign.rvalue.unary_op.operand.kind == AX_MIR_OP_CONST) {
-                            ty = stmt->assign.rvalue.unary_op.operand.constant.ty;
-                        } else {
-                            AxMirLocalId loc = stmt->assign.rvalue.unary_op.operand.place.local;
-                            ty = frame.body->locals[loc.v].ty;
-                        }
+                        uint64_t op_val = eval_operand_ty(ctx, &frame, &stmt->assign.rvalue.unary_op.operand, &ty);
                         const AxType *t = NULL;
                         if (ty.v != 0) {
                             t = ax_type_get(&ctx->thir->interner, ty);
@@ -1203,15 +1113,8 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                         break;
                     }
                     case AX_MIR_RVALUE_CAST: {
-                        uint64_t op_val = eval_operand(ctx, &frame, &stmt->assign.rvalue.cast.op);
-                        
                         TypeId src_ty = {0};
-                        if (stmt->assign.rvalue.cast.op.kind == AX_MIR_OP_CONST) {
-                            src_ty = stmt->assign.rvalue.cast.op.constant.ty;
-                        } else {
-                            AxMirLocalId loc = stmt->assign.rvalue.cast.op.place.local;
-                            src_ty = frame.body->locals[loc.v].ty;
-                        }
+                        uint64_t op_val = eval_operand_ty(ctx, &frame, &stmt->assign.rvalue.cast.op, &src_ty);
                         TypeId dest_ty = stmt->assign.rvalue.cast.ty;
                         
                         const AxType *s_t = NULL;
@@ -1387,7 +1290,7 @@ skip_write:;
                             AxInterpValue drop_arg = {0};
                             *(uint8_t**)&drop_arg = host_ptr;
                             AxInterpValue ret = {0};
-                            eval_call(ctx, drop_fn, &drop_arg, 1, &ret);
+                            eval_call(ctx, drop_fn, &drop_arg, 1, (uint8_t*)&ret, sizeof(ret));
                         }
                     }
                     current_bb = term->call.target;
@@ -1510,8 +1413,12 @@ skip_write:;
                     uint32_t a = ax_type_align(cap_field_ty, &ctx->thir->interner);
                     uint32_t s = ax_type_size(cap_field_ty, &ctx->thir->interner);
                     if (a > 0) offset = (offset + a - 1) & ~(a - 1);
-                    memcpy(&call_args[c], closure_ptr + offset, s ? s : 8);
-                    offset += (s ? s : 8);
+                    uint32_t copy_s = s ? s : 8;
+                    if (copy_s > sizeof(AxInterpValue)) {
+                        AX_ICE("interpreter: closure capture exceeds AxInterpValue capacity");
+                    }
+                    memcpy(&call_args[c], closure_ptr + offset, copy_s);
+                    offset += copy_s;
                 }
             }
             
@@ -1521,17 +1428,31 @@ skip_write:;
                 } else {
                     TypeId src_ty;
                     uint8_t* src = get_place_ptr(ctx, &frame, &term->call.args[i].place, &src_ty, NULL);
-                    memcpy(&call_args[cap_count + i], src, ax_type_size(src_ty, &ctx->thir->interner));
+                    uint32_t src_sz = ax_type_size(src_ty, &ctx->thir->interner);
+                    if (src_sz > sizeof(AxInterpValue)) {
+                        AX_ICE("interpreter: by-value call argument exceeds AxInterpValue capacity");
+                    }
+                    memcpy(&call_args[cap_count + i], src, src_sz);
                 }
             }
             
-            AxInterpValue ret_val = {0};
-            eval_call(ctx, callee, call_args, total_args, &ret_val);
+            TypeId dest_ty = {0};
+            uint8_t *dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL);
+            uint32_t dest_sz = ax_type_size(dest_ty, &ctx->thir->interner);
+            size_t ret_buf_sz = dest_sz > sizeof(AxInterpValue) ? (size_t)dest_sz : sizeof(AxInterpValue);
+            uint8_t *ret_buf = calloc(1, ret_buf_sz);
+            eval_call(ctx, callee, call_args, total_args, ret_buf, ret_buf_sz);
             free(call_args);
             
-            if (ctx->failed) break;
+            if (ctx->failed) {
+                free(ret_buf);
+                break;
+            }
             
-            TypeId dest_ty; uint8_t* dest = get_place_ptr(ctx, &frame, &term->call.destination, &dest_ty, NULL); memcpy(dest, &ret_val, ax_type_size(dest_ty, &ctx->thir->interner));
+            if (dest && dest_sz > 0) {
+                memcpy(dest, ret_buf, dest_sz);
+            }
+            free(ret_buf);
             current_bb = term->call.target;
         } else {
             panic_interp(ctx, "unsupported terminator");
@@ -1546,7 +1467,10 @@ skip_write:;
         }
     }
     if (out_ret && out_ret_size > 0 && body->local_count > 0) {
-        memcpy(out_ret, frame.local_ptrs[0], out_ret_size);
+        uint32_t ret_local_sz = ax_type_size(body->locals[0].ty, &ctx->thir->interner);
+        if (ret_local_sz < sizeof(AxInterpValue)) ret_local_sz = sizeof(AxInterpValue);
+        size_t copy_sz = out_ret_size < (size_t)ret_local_sz ? out_ret_size : (size_t)ret_local_sz;
+        memcpy(out_ret, frame.local_ptrs[0], copy_sz);
     }
     free(frame.local_ptrs);
     free(frame.storage);
@@ -1573,7 +1497,7 @@ int ax_interp_run(AxHirItem *main_fn, AxThir *thir, const AxHir *hir, StrInterne
     register_const_allocs(&ctx);
     
     AxInterpValue ret = {0};
-    eval_call(&ctx, main_fn, NULL, 0, &ret);
+    eval_call(&ctx, main_fn, NULL, 0, (uint8_t*)&ret, sizeof(ret));
     
     if (ctx.allocs) {
         for (size_t i = 0; i < ctx.alloc_count; i++) {
