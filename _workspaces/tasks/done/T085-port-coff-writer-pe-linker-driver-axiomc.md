@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T085a, T085b, T085c]
 priority: 119
-status: doing
+status: done
 attempts: 1
 paths: [compiler/obj_link_driver, tests/selfhost/obj_link_driver]
 spec: [0167, tasks/0261, spec/SPEC-20-selfhost.md, 0152]
 covers: [REQ-CORE-3181]
 started: 2026-10-19 22:54:14
-agent: T085-impl
+finished: 2026-10-20 09:45:53
 ---
 # T085 — Port COFF writer, PE linker, driver → axiomc (integration + differential)
 
@@ -45,3 +45,4 @@ Integrate COFF object writer, PE linker, and driver in Axiom to produce a fully 
 - 2026-10-19 20:34:35 started (attempt 1) T085-impl
 - 2026-10-19 22:54:02 requeue: recovered after session restart (not charged: attempt refunded)
 - 2026-10-19 22:54:14 started (attempt 1) T085-impl
+- 2026-10-20 09:45:53 accepted by QA -> done
