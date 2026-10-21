@@ -21,7 +21,7 @@ standard in ROADMAP §4, so that this phase looks exactly like every other phase
 the roadmap is invented.
 
 ## Scope
-- Read ROADMAP §3 (P12 epics), catalogue rows with `EPIC(E12.*)`, the epics' sources, and the gate reports of the phases this one depends on.
+- Read ROADMAP §3 (P12 epics), catalogue rows with `EPIC(E12.*)` (including `REQ-OWNER-007`: unsuffixed integer literals like `1`, `2` inside `f32`/`f64` expressions such as `let a: f64 = 123.45; let b: f64 = (a + 1)/2 + a*a/6.0` infer `f32`/`f64` directly from context without suffixes or `as` casts when exactly representable), the epics' sources, and the gate reports of the phases this one depends on.
 - Create 3–10 tasks per epic with ids in `T450`–`T499`, titles `E12.x <short title>`, owners by area, narrow `paths`, `spec:`, `covers:`, acceptance as tests; a spec task first where `spec/` lacks the area; a QA conformance task per epic exit criterion.
 - Implementation happens in `compiler/` (Axiom) and `std/` — axiom0 is frozen (ROADMAP R3).
 - Make gate task T312 depend on every new task; convert catalogue `EPIC(E12.*)` statuses to task ids.
