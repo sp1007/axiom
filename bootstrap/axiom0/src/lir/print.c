@@ -23,6 +23,8 @@ void ax_lir_print(FILE *out, const AxLirBody *body) {
                 case AX_LIR_INST_MUL: fprintf(out, "mul v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_DIV: fprintf(out, "div v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_REM: fprintf(out, "rem v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
+                case AX_LIR_INST_UDIV: fprintf(out, "udiv v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
+                case AX_LIR_INST_UREM: fprintf(out, "urem v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_BIT_XOR: fprintf(out, "xor v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_BIT_AND: fprintf(out, "and v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;
                 case AX_LIR_INST_BIT_OR:  fprintf(out, "or v%u, v%u;\n", inst->binary.lhs.v, inst->binary.rhs.v); break;

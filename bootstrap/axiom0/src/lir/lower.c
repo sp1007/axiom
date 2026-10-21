@@ -533,8 +533,8 @@ static AxLirInstKind lower_binop(AxMirBinOp op, bool is_signed) {
         case AX_MIR_BINOP_ADD: return AX_LIR_INST_ADD;
         case AX_MIR_BINOP_SUB: return AX_LIR_INST_SUB;
         case AX_MIR_BINOP_MUL: return AX_LIR_INST_MUL;
-        case AX_MIR_BINOP_DIV: return AX_LIR_INST_DIV;
-        case AX_MIR_BINOP_REM: return AX_LIR_INST_REM;
+        case AX_MIR_BINOP_DIV: return is_signed ? AX_LIR_INST_DIV : AX_LIR_INST_UDIV;
+        case AX_MIR_BINOP_REM: return is_signed ? AX_LIR_INST_REM : AX_LIR_INST_UREM;
         case AX_MIR_BINOP_BIT_XOR: return AX_LIR_INST_BIT_XOR;
         case AX_MIR_BINOP_BIT_AND: return AX_LIR_INST_BIT_AND;
         case AX_MIR_BINOP_BIT_OR: return AX_LIR_INST_BIT_OR;

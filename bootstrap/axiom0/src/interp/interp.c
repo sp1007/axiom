@@ -920,7 +920,9 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                                     break;
                                 case AX_MIR_BINOP_SHR:
                                     if (b < 0 || b >= bits) { overflow = true; break; }
-                                    if (a < 0) {
+                                    if (b == 0) {
+                                        r = a;
+                                    } else if (a < 0) {
                                         uint64_t ua = (uint64_t)a;
                                         ua >>= b;
                                         uint64_t sign_ext = ~(((uint64_t)1 << (64 - b)) - 1);

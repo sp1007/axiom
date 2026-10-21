@@ -251,8 +251,46 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                             emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(0), ax_x64_op_reg(2));
                             emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x2 /*B*/), ax_x64_op_reg(0));
                         } else {
-                            emit(mi, mbb, AX_X64_MI_MUL, ax_x64_op_reg(2), (AxX64Op){0});
-                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x2 /*B*/), ax_x64_op_reg(0)); // wait, MUL sets CF and OF. B is carry flag! So SETC works!
+                            /* 64-bit unsigned multiply overflow via 32-bit limbs (a = a1*2^32 + a0, b = b1*2^32 + b0):
+                             * overflow iff (a1*b1) != 0 || ((a1*b0) >> 32) != 0 || ((a0*b1) >> 32) != 0 ||
+                             * (((a1*b0 & 0xFFFFFFFF) + (a0*b1 & 0xFFFFFFFF) + ((a0*b0) >> 32)) >> 32) != 0. */
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(8 /*R8*/), ax_x64_op_reg(0 /*RAX*/));
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(8 /*R8*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(8 /*R8*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(9 /*R9*/), ax_x64_op_reg(0 /*RAX*/));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(9 /*R9*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(10 /*R10*/), ax_x64_op_reg(2 /*RDX*/));
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(10 /*R10*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(10 /*R10*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(11 /*R11*/), ax_x64_op_reg(2 /*RDX*/));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(11 /*R11*/), ax_x64_op_imm(32));
+
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(9 /*R9*/));
+                            emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(11 /*R11*/));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_reg(9 /*R9*/));
+                            emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_reg(10 /*R10*/));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(8 /*R8*/));
+                            emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(11 /*R11*/));
+                            emit(mi, mbb, AX_X64_MI_IMUL, ax_x64_op_reg(8 /*R8*/), ax_x64_op_reg(10 /*R10*/));
+
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(9 /*R9*/), ax_x64_op_reg(1 /*RCX*/));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(9 /*R9*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(9 /*R9*/));
+                            emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(9 /*R9*/), ax_x64_op_reg(2 /*RDX*/));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(9 /*R9*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(9 /*R9*/));
+
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(8 /*R8*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_reg(2 /*RDX*/));
+                            emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_reg(8 /*R8*/));
+                            emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(32));
+                            emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(1 /*RCX*/));
+                            emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(0));
+                            emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x5 /*NE*/), ax_x64_op_reg(0 /*RAX*/));
                         }
                     }
                     emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0), ax_x64_op_imm(1));
@@ -346,6 +384,43 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                     emit(mi, mbb, AX_X64_MI_SAR, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(63));
                     emit(mi, mbb, AX_X64_MI_IDIV, ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0), (AxX64Op){0});
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(2 /*RDX*/));
+                    break;
+                case AX_LIR_INST_UDIV:
+                case AX_LIR_INST_UREM:
+                    /* Branchless 64-bit unsigned div/rem via half-dividend signed idiv:
+                     * For d < 2^63: q_h = (n >> 1) / d, r_h = (n >> 1) % d, q = 2*q_h + (2*r_h + (n&1) >= d).
+                     * For d >= 2^63: q_h = 0, r_h = 0, r2 = n, q = (n >= d). */
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(8 /*R8*/), ax_x64_op_frame(slot_offset + inst->binary.lhs.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(9 /*R9*/), ax_x64_op_frame(slot_offset + inst->binary.rhs.v, 0));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(10 /*R10*/), ax_x64_op_reg(9 /*R9*/));
+                    emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(10 /*R10*/), ax_x64_op_imm(63));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(11 /*R11*/), ax_x64_op_reg(10 /*R10*/));
+                    emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(11 /*R11*/), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(8 /*R8*/));
+                    emit(mi, mbb, AX_X64_MI_SHR, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(11 /*R11*/));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(0));
+                    emit(mi, mbb, AX_X64_MI_IDIV, ax_x64_op_reg(9 /*R9*/), (AxX64Op){0});
+                    emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_SHL, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(11 /*R11*/), ax_x64_op_imm(0));
+                    emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(11 /*R11*/), ax_x64_op_reg(10 /*R10*/));
+                    emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(11 /*R11*/), ax_x64_op_imm(1));
+                    emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(8 /*R8*/), ax_x64_op_reg(11 /*R11*/));
+                    emit(mi, mbb, AX_X64_MI_OR, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(8 /*R8*/));
+                    emit(mi, mbb, AX_X64_MI_CMP, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(9 /*R9*/));
+                    emit(mi, mbb, AX_X64_MI_SETCC, ax_x64_op_imm(0x3 /*AE*/), ax_x64_op_reg(1 /*RCX*/));
+                    emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(1 /*RCX*/), ax_x64_op_imm(1));
+                    if (inst->kind == AX_LIR_INST_UDIV) {
+                        emit(mi, mbb, AX_X64_MI_ADD, ax_x64_op_reg(0 /*RAX*/), ax_x64_op_reg(1 /*RCX*/));
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(0 /*RAX*/));
+                    } else {
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(11 /*R11*/), ax_x64_op_imm(0));
+                        emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(11 /*R11*/), ax_x64_op_reg(1 /*RCX*/));
+                        emit(mi, mbb, AX_X64_MI_AND, ax_x64_op_reg(9 /*R9*/), ax_x64_op_reg(11 /*R11*/));
+                        emit(mi, mbb, AX_X64_MI_SUB, ax_x64_op_reg(2 /*RDX*/), ax_x64_op_reg(9 /*R9*/));
+                        emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_frame(slot_offset + inst->dest.v, 0), ax_x64_op_reg(2 /*RDX*/));
+                    }
                     break;
                 case AX_LIR_INST_NEG:
                     emit(mi, mbb, AX_X64_MI_MOV, ax_x64_op_reg(0), ax_x64_op_frame(slot_offset + inst->unary.operand.v, 0));

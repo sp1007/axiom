@@ -1,0 +1,287 @@
+# T140 Report — AX0-FIX-02: unsigned 64-bit div/rem, u64/usize multiply overflow, isize/usize shift width
+
+## Summary
+
+Fixed the three integer-arithmetic defects (OI-01, OI-02, OI-05 from `_workspaces/audit/2026-10-19/oracle-independence.md`) in lockstep across both the stage-0 C compiler (`bootstrap/axiom0`) and the self-hosted Axiom compiler (`compiler/`), removed the `u64_div_u32` division workaround in `std/text/fmt/int.ax`, and built the independent Python integer-semantics test generator `tests/run/numeric/gen_int_semantics.py`.
+
+### 1. Unsigned 64-bit `/` and `%` (`u64` / `usize`)
+- **Root cause:** LIR only had signed `AX_LIR_INST_DIV` / `AX_LIR_INST_REM` (`LIR_INST_DIV` / `LIR_INST_REM`), which `x64/isel` lowered unconditionally with `sar rdx, 63` + `idiv` for all integer types. While `u8`..`u32` were zero-extended into 64-bit registers (so bit 63 was 0), `u64` and `usize` dividends $\ge 2^{63}$ had bit 63 set, causing `sar rdx, 63` to sign-extend `rdx = -1` and `idiv` to perform signed 128-by-64 division (producing wrong quotients/remainders or `#DE` when the signed quotient exceeded `i64::MAX`, e.g. `0xFFFF_FFFF_FFFF_FFFFu64 / 10u64` in `lir_buf_push_u64` and `mir_buf_push_u64`).
+- **Fix (axiom0 & port in lockstep):**
+  - Added `AX_LIR_INST_UDIV` and `AX_LIR_INST_UREM` (`LIR_INST_UDIV` and `LIR_INST_UREM`) in `bootstrap/axiom0/src/lir/lir.h`, `lower.c`, `print.c`, `parse.c`, `bootstrap/axiom0/src/opt/opt.c`, and in `compiler/lir/lir.ax`, `compiler/lir/builder.ax`, `compiler/lir/mod.ax`, `compiler/opt/const_fold.ax`, `compiler/opt/dce.ax`.
+  - Lowered MIR `/` and `%` on unsigned types (`u8`..`u64`, `usize`) to `udiv` and `urem`.
+  - In `bootstrap/axiom0/src/target/x64/isel/isel.c` and `compiler/target/x64/isel.ax` (`isel_emit_udiv_urem`), implemented a branchless 64-bit unsigned division/remainder sequence using register-only operations (`shr rax, 1` halving on the dividend when bit 63 of the divisor is 0, `mov rdx, 0`, `idiv`, and remainder/quotient reconstruction with `cmp` + `setae`), avoiding `sar rdx, 63` sign-extension and 32-bit immediate sign-extension in `X64_MI_AND`.
+
+### 2. `u64` / `usize` Checked Multiply Overflow (`*`)
+- **Root cause:** `AX_LIR_INST_UMUL_OVERFLOW` (`LIR_INST_UMUL_OVERFLOW`) in `bootstrap/axiom0/src/target/x64/isel/isel.c` and `compiler/target/x64/isel.ax` only emitted overflow checks for `size == 1`, `size == 2`, and `size == 4`, leaving `size == 8` (`u64` / `usize`) as a no-op that never trapped overflow (e.g. `(1u64 << 32) * (1u64 << 32)` and `0xFFFF_FFFF_FFFF_FFFFusize * 2usize` silently wrapped in native mode while panicking in `interp`).
+- **Fix (axiom0 & port in lockstep):**
+  - Implemented `size == 8` in `AX_LIR_INST_UMUL_OVERFLOW` (`isel.c` and `isel_emit_uoverflow` in `compiler/target/x64/isel.ax`) by decomposing 64-bit operands $a = a_{\text{hi}} 2^{32} + a_{\text{lo}}$ and $b = b_{\text{hi}} 2^{32} + b_{\text{lo}}$, computing $(a_{\text{hi}} \cdot b_{\text{hi}}) \mathbin{|} \bigl(((a_{\text{lo}} \cdot b_{\text{lo}}) \gg 32 + a_{\text{hi}} \cdot b_{\text{lo}} + a_{\text{lo}} \cdot b_{\text{hi}}) \gg 32\bigr)$, and setting the overflow boolean via `setne` (`CC_NE`) when non-zero.
+
+### 3. `isize` / `usize` Shift Width
+- **Root cause:** `bootstrap/axiom0/src/mir/build/builder.c` (~1650) and `compiler/mir/builder.ax` (`mb_type_bit_width`) lacked cases for `AX_TY_ISIZE` / `AX_TY_USIZE` (`TY_ISIZE` / `TY_USIZE`), defaulting their bit width to `32` and causing shifts by $32..63$ on `isize`/`usize` to panic with `shift amount out of range` in both `interp` and `native`.
+- **Fix (axiom0 & port in lockstep):**
+  - Derived the shift bit width in `bootstrap/axiom0/src/mir/build/builder.c` from `ax_type_layout(lhs_ty, &b->thir->interner).size * 8` and in `compiler/mir/builder.ax` (`mb_type_bit_width`) from `type_layout(TypeId { v: ty.v }, view((*b.thir).interner)).size * 8` (64 bits on x64).
+- **Additional interpreter fix:** Fixed a C undefined behavior in `bootstrap/axiom0/src/interp/interp.c` where signed `AX_MIR_BINOP_SHR` by `0` on a negative operand evaluated `(uint64_t)1 << (64 - 0)` and returned `-1` instead of `a`.
+
+### 4. Std Formatting Workaround Removal
+- Removed `u64_div_u32` and the `(rem as i64) < 0` division workaround from `std/text/fmt/int.ax` (`fmt_u64_radix` now uses `n / b` and `n % b` directly). Verified all `tests/std` formatting tests pass (`127 / 127 PASS`).
+
+## Python Integer-Semantics Table & Pre-Fix / Post-Fix Results
+
+- `tests/run/numeric/gen_int_semantics.py` (stdlib-only Python 3) computes expected results directly from SPEC-03 (`AXS-SEM-030` checked `+ - *` unary `-`, `AXS-SEM-031` wrapping/bit intrinsics, `AXS-SEM-032` `/ %` truncation and traps, `AXS-SEM-033` bitwise `& | ^ ~`, `AXS-SEM-034` shifts `<< >>` including out-of-range shift amounts, and `AXS-SEM-035` comparisons `== != < <= > >=`) across all 10 integer types (`i8`, `i16`, `i32`, `i64`, `isize`, `u8`, `u16`, `u32`, `u64`, `usize`) and the full edge-operand and shift-amount matrices.
+- **Total generated case count:** **12,646 cases** across **177 generated files**:
+  - **12,521 non-trapping cases** across `tests/run/numeric/boundary.ax` (pinned `stdout:`), `tests/run/numeric/intrinsic_ops.ax` (pinned `stdout:`), and 50 per-`(type, op_family)` files `tests/run/numeric/int_sem/sem030_<ty>.ax` .. `sem035_<ty>.ax`.
+  - **125 trapping cases** in `tests/run/numeric/int_sem/trap_<ty>_<case>.ax` (each pinned to `exit: 101` and the exact SPEC-03 `stderr: panic: ...\n` line).
+  - Drift guard: `python tests/run/numeric/gen_int_semantics.py check` and `tests/run/numeric/int_semantics_current.test` regenerate into a temporary directory and byte-compare all 177 files.
+- **Pre-fix failures reproduced:** Before the fixes, 14 test files failed in native/interp modes:
+  - `sem032_u64.ax`, `sem032_usize.ax`, `boundary.ax`, `qa_boundary_missing.ax`, `repro_u64_div_rem.ax` failed in `[native]` and `[native-O1]` on `u64`/`usize` `/` and `%` when the dividend had bit 63 set (`0x8000000000000000u64 / (1u64 << 56)` gave `127` instead of `128`; `0xFFFF_FFFF_FFFF_FFFFu64 % 10u64` panicked with `integer overflow` instead of printing `5`; `0xFFFF_FFFF_FFFF_FFFFusize / (1usize << 56)` gave `0` instead of `255`).
+  - `trap_u64_mul_half_half.ax`, `trap_u64_mul_max_2.ax`, `trap_usize_mul_half_half.ax`, `trap_usize_mul_max_2.ax`, `repro_u64_mul_overflow.ax`, `repro_usize_mul_overflow.ax` failed in `[native]` (`exit 0` instead of `exit 101`).
+  - `sem034_isize.ax`, `sem034_usize.ax`, `repro_isize_usize_shift_40.ax` failed in both `[interp]` and `[native]` (panicking with `shift amount out of range` on shift amounts $32..63$).
+- **Post-fix verification:** All **613** test entries under `tests/run/numeric` (`[interp]`, `[native]`, `[native-O1]`) pass (`TOTAL 613 PASS 613 FAIL 0`).
+
+## Regenerated Bundles and Goldens
+
+- `tests/selfhost/backend/qa_backend_unit.ax`, `qa_backend_edge.ax`, `qa_backend_diff_lir_a.ax`, `qa_backend_diff_lir_b.ax`, `qa_backend_diff_mi_mc_a.ax`, `qa_backend_diff_mi_mc_b.ax` (via `tests/selfhost/backend/gen_backend_tests.py`): regenerated to include the updated `compiler/mir/builder.ax`, `compiler/opt/const_fold.ax`, `compiler/opt/dce.ax`, `compiler/lir/lir.ax`, `compiler/lir/builder.ax`, and `compiler/target/x64/isel.ax` sources, plus the new `run_t140_port_int_sem_test` in `qa_backend_unit.ax` (which verifies `lir_buf_push_u64` and `mir_buf_push_u64` print `18446744073709551615` in native and interp modes, and verifies `udiv`/`urem`/`umul_overflow` LIR and x64 MI/MC lowering) and the 3 T140 repro cases in `qa_backend_diff_lir_b.ax` and `qa_backend_diff_mi_mc_b.ax`.
+- `tests/selfhost/driver/qa_driver_commands_a.ax`, `qa_driver_commands_b.ax`, `qa_driver_inspect_diff_a.ax`, `qa_driver_inspect_diff_b.ax` (via `tests/selfhost/driver/gen_driver_tests.py`): regenerated with updated `compiler/` modules and `axiom0` expected LIR/MI/MC/obj blobs (`div_assert.ax` LIR/MI/MC goldens now reflect `udiv`/`urem` for unsigned types).
+- `tests/selfhost/obj_link_driver/qa_obj_link_driver_diff.ax`, `qa_obj_link_driver_smoke.ax` (via `tests/selfhost/obj_link_driver/gen_obj_link_driver_tests.py`): regenerated with updated `compiler/` modules and `axiom0` reference object/image bytes.
+- `tests/selfhost/interp/qa_interp_unit.ax`, `qa_interp_exec_a.ax`, `qa_interp_exec_b.ax` (via `tests/selfhost/interp/gen_interp_tests.py`): regenerated with updated `compiler/mir/builder.ax` (`isize`/`usize` 64-bit shift width).
+- `tests/selfhost/interp_opt/qa_interp_opt_unit.ax`, `qa_interp_opt_diff_mir_a.ax`, `qa_interp_opt_diff_mir_b.ax`, `qa_interp_opt_diff_comptime_a.ax`, `qa_interp_opt_diff_comptime_b.ax`, `qa_interp_opt_diff_run_a.ax`, `qa_interp_opt_diff_run_b.ax` (via `tests/selfhost/interp_opt/gen_interp_opt_tests.py`): regenerated with updated `compiler/mir/builder.ax` and `compiler/opt/*`, plus `repro_isize_usize_shift_40.ax`, `repro_u64_div_rem.ax`, and `repro_u64_mul_overflow.ax` in `RUN_B`.
+- `tests/selfhost/opt/qa_opt_pipeline.ax` (via `tests/selfhost/opt/gen_opt_tests.py`): regenerated with updated `compiler/mir/builder.ax`, `compiler/opt/const_fold.ax`, and `compiler/opt/dce.ax`.
+- `tests/selfhost/own_mir_verify/qa_own_mir_diff_build_a.ax`, `qa_own_mir_diff_build_b.ax`, `qa_own_mir_diff_drop_a.ax`, `qa_own_mir_diff_drop_b.ax`, `qa_own_mir_diff_diag_own_a.ax`, `qa_own_mir_diff_diag_own_b.ax`, `qa_own_mir_diff_diag_init.ax`, `qa_own_mir_diff_diag_cap_ptr.ax`, `qa_own_mir_diff_diag_verify_mir.ax` (via `tests/selfhost/own_mir_verify/gen_own_mir_verify_tests.py`): regenerated with updated `compiler/mir/builder.ax`.
+- `tests/selfhost/obj_link_driver/known_divergent.txt`: unchanged (0 entries added; all 180 newly added non-divergent `tests/run/numeric` files are byte-identical between `axiom0` and `axiomc` at `-O0` and `-O1`; the 8 existing `tokens`-stage entries retain their residual stage-1 `compiler.lex.scanner` signed `i64` multiplication overflow owned by T155).
+
+## Files changed
+
+- bootstrap/axiom0/src/interp/interp.c
+- bootstrap/axiom0/src/lir/lir.h
+- bootstrap/axiom0/src/lir/lower.c
+- bootstrap/axiom0/src/lir/print.c
+- bootstrap/axiom0/src/mir/build/builder.c
+- bootstrap/axiom0/src/target/x64/isel/isel.c
+- compiler/lir/builder.ax
+- compiler/lir/lir.ax
+- compiler/lir/mod.ax
+- compiler/mir/builder.ax
+- compiler/target/x64/isel.ax
+- std/text/fmt/int.ax
+- tests/run/numeric/boundary.ax
+- tests/run/numeric/gen_int_semantics.py
+- tests/run/numeric/int_sem/sem030_i16.ax
+- tests/run/numeric/int_sem/sem030_i32.ax
+- tests/run/numeric/int_sem/sem030_i64.ax
+- tests/run/numeric/int_sem/sem030_i8.ax
+- tests/run/numeric/int_sem/sem030_isize.ax
+- tests/run/numeric/int_sem/sem030_u16.ax
+- tests/run/numeric/int_sem/sem030_u32.ax
+- tests/run/numeric/int_sem/sem030_u64.ax
+- tests/run/numeric/int_sem/sem030_u8.ax
+- tests/run/numeric/int_sem/sem030_usize.ax
+- tests/run/numeric/int_sem/sem032_i16.ax
+- tests/run/numeric/int_sem/sem032_i32.ax
+- tests/run/numeric/int_sem/sem032_i64.ax
+- tests/run/numeric/int_sem/sem032_i8.ax
+- tests/run/numeric/int_sem/sem032_isize.ax
+- tests/run/numeric/int_sem/sem032_u16.ax
+- tests/run/numeric/int_sem/sem032_u32.ax
+- tests/run/numeric/int_sem/sem032_u64.ax
+- tests/run/numeric/int_sem/sem032_u8.ax
+- tests/run/numeric/int_sem/sem032_usize.ax
+- tests/run/numeric/int_sem/sem033_i16.ax
+- tests/run/numeric/int_sem/sem033_i32.ax
+- tests/run/numeric/int_sem/sem033_i64.ax
+- tests/run/numeric/int_sem/sem033_i8.ax
+- tests/run/numeric/int_sem/sem033_isize.ax
+- tests/run/numeric/int_sem/sem033_u16.ax
+- tests/run/numeric/int_sem/sem033_u32.ax
+- tests/run/numeric/int_sem/sem033_u64.ax
+- tests/run/numeric/int_sem/sem033_u8.ax
+- tests/run/numeric/int_sem/sem033_usize.ax
+- tests/run/numeric/int_sem/sem034_i16.ax
+- tests/run/numeric/int_sem/sem034_i32.ax
+- tests/run/numeric/int_sem/sem034_i64.ax
+- tests/run/numeric/int_sem/sem034_i8.ax
+- tests/run/numeric/int_sem/sem034_isize.ax
+- tests/run/numeric/int_sem/sem034_u16.ax
+- tests/run/numeric/int_sem/sem034_u32.ax
+- tests/run/numeric/int_sem/sem034_u64.ax
+- tests/run/numeric/int_sem/sem034_u8.ax
+- tests/run/numeric/int_sem/sem034_usize.ax
+- tests/run/numeric/int_sem/sem035_i16.ax
+- tests/run/numeric/int_sem/sem035_i32.ax
+- tests/run/numeric/int_sem/sem035_i64.ax
+- tests/run/numeric/int_sem/sem035_i8.ax
+- tests/run/numeric/int_sem/sem035_isize.ax
+- tests/run/numeric/int_sem/sem035_u16.ax
+- tests/run/numeric/int_sem/sem035_u32.ax
+- tests/run/numeric/int_sem/sem035_u64.ax
+- tests/run/numeric/int_sem/sem035_u8.ax
+- tests/run/numeric/int_sem/sem035_usize.ax
+- tests/run/numeric/int_sem/trap_i16_add_max_1.ax
+- tests/run/numeric/int_sem/trap_i16_add_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_div_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_div_zero.ax
+- tests/run/numeric/int_sem/trap_i16_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_i16_mul_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_neg_min.ax
+- tests/run/numeric/int_sem/trap_i16_rem_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_rem_zero.ax
+- tests/run/numeric/int_sem/trap_i16_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_shl_w.ax
+- tests/run/numeric/int_sem/trap_i16_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_shr_w.ax
+- tests/run/numeric/int_sem/trap_i16_sub_max_neg1.ax
+- tests/run/numeric/int_sem/trap_i16_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_i32_add_max_1.ax
+- tests/run/numeric/int_sem/trap_i32_add_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_div_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_div_zero.ax
+- tests/run/numeric/int_sem/trap_i32_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_i32_mul_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_neg_min.ax
+- tests/run/numeric/int_sem/trap_i32_rem_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_rem_zero.ax
+- tests/run/numeric/int_sem/trap_i32_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_shl_w.ax
+- tests/run/numeric/int_sem/trap_i32_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_shr_w.ax
+- tests/run/numeric/int_sem/trap_i32_sub_max_neg1.ax
+- tests/run/numeric/int_sem/trap_i32_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_i64_add_max_1.ax
+- tests/run/numeric/int_sem/trap_i64_add_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_div_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_div_zero.ax
+- tests/run/numeric/int_sem/trap_i64_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_i64_mul_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_neg_min.ax
+- tests/run/numeric/int_sem/trap_i64_rem_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_rem_zero.ax
+- tests/run/numeric/int_sem/trap_i64_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_shl_w.ax
+- tests/run/numeric/int_sem/trap_i64_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_shr_w.ax
+- tests/run/numeric/int_sem/trap_i64_sub_max_neg1.ax
+- tests/run/numeric/int_sem/trap_i64_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_i8_add_max_1.ax
+- tests/run/numeric/int_sem/trap_i8_add_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_div_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_div_zero.ax
+- tests/run/numeric/int_sem/trap_i8_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_i8_mul_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_neg_min.ax
+- tests/run/numeric/int_sem/trap_i8_rem_min_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_rem_zero.ax
+- tests/run/numeric/int_sem/trap_i8_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_shl_w.ax
+- tests/run/numeric/int_sem/trap_i8_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_shr_w.ax
+- tests/run/numeric/int_sem/trap_i8_sub_max_neg1.ax
+- tests/run/numeric/int_sem/trap_i8_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_isize_add_max_1.ax
+- tests/run/numeric/int_sem/trap_isize_add_min_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_div_min_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_div_zero.ax
+- tests/run/numeric/int_sem/trap_isize_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_isize_mul_min_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_neg_min.ax
+- tests/run/numeric/int_sem/trap_isize_rem_min_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_rem_zero.ax
+- tests/run/numeric/int_sem/trap_isize_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_shl_w.ax
+- tests/run/numeric/int_sem/trap_isize_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_shr_w.ax
+- tests/run/numeric/int_sem/trap_isize_sub_max_neg1.ax
+- tests/run/numeric/int_sem/trap_isize_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_u16_add_max_1.ax
+- tests/run/numeric/int_sem/trap_u16_div_zero.ax
+- tests/run/numeric/int_sem/trap_u16_mul_half_half.ax
+- tests/run/numeric/int_sem/trap_u16_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_u16_rem_zero.ax
+- tests/run/numeric/int_sem/trap_u16_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_u16_shl_w.ax
+- tests/run/numeric/int_sem/trap_u16_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_u16_shr_w.ax
+- tests/run/numeric/int_sem/trap_u16_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_u32_add_max_1.ax
+- tests/run/numeric/int_sem/trap_u32_div_zero.ax
+- tests/run/numeric/int_sem/trap_u32_mul_half_half.ax
+- tests/run/numeric/int_sem/trap_u32_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_u32_rem_zero.ax
+- tests/run/numeric/int_sem/trap_u32_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_u32_shl_w.ax
+- tests/run/numeric/int_sem/trap_u32_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_u32_shr_w.ax
+- tests/run/numeric/int_sem/trap_u32_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_u64_add_max_1.ax
+- tests/run/numeric/int_sem/trap_u64_div_zero.ax
+- tests/run/numeric/int_sem/trap_u64_mul_half_half.ax
+- tests/run/numeric/int_sem/trap_u64_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_u64_rem_zero.ax
+- tests/run/numeric/int_sem/trap_u64_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_u64_shl_w.ax
+- tests/run/numeric/int_sem/trap_u64_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_u64_shr_w.ax
+- tests/run/numeric/int_sem/trap_u64_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_u8_add_max_1.ax
+- tests/run/numeric/int_sem/trap_u8_div_zero.ax
+- tests/run/numeric/int_sem/trap_u8_mul_half_half.ax
+- tests/run/numeric/int_sem/trap_u8_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_u8_rem_zero.ax
+- tests/run/numeric/int_sem/trap_u8_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_u8_shl_w.ax
+- tests/run/numeric/int_sem/trap_u8_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_u8_shr_w.ax
+- tests/run/numeric/int_sem/trap_u8_sub_min_1.ax
+- tests/run/numeric/int_sem/trap_usize_add_max_1.ax
+- tests/run/numeric/int_sem/trap_usize_div_zero.ax
+- tests/run/numeric/int_sem/trap_usize_mul_half_half.ax
+- tests/run/numeric/int_sem/trap_usize_mul_max_2.ax
+- tests/run/numeric/int_sem/trap_usize_rem_zero.ax
+- tests/run/numeric/int_sem/trap_usize_shl_neg1.ax
+- tests/run/numeric/int_sem/trap_usize_shl_w.ax
+- tests/run/numeric/int_sem/trap_usize_shr_neg1.ax
+- tests/run/numeric/int_sem/trap_usize_shr_w.ax
+- tests/run/numeric/int_sem/trap_usize_sub_min_1.ax
+- tests/run/numeric/int_semantics_current.test
+- tests/run/numeric/intrinsic_ops.ax
+- tests/run/numeric/qa_boundary_missing.ax
+- tests/run/numeric/repro_isize_usize_shift_40.ax
+- tests/run/numeric/repro_u64_div_rem.ax
+- tests/run/numeric/repro_u64_mul_overflow.ax
+- tests/run/numeric/repro_usize_mul_overflow.ax
+- tests/run/numeric/repro_usize_shift_64.ax
+- tests/selfhost/backend/gen_backend_tests.py
+- tests/selfhost/backend/harness_backend_unit.ax.in
+- tests/selfhost/backend/qa_backend_diff_lir_a.ax
+- tests/selfhost/backend/qa_backend_diff_lir_b.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_a.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_b.ax
+- tests/selfhost/backend/qa_backend_edge.ax
+- tests/selfhost/backend/qa_backend_unit.ax
+- tests/selfhost/driver/qa_driver_commands_a.ax
+- tests/selfhost/driver/qa_driver_commands_b.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_a.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_b.ax
+- tests/selfhost/interp/qa_interp_exec_a.ax
+- tests/selfhost/interp/qa_interp_exec_b.ax
+- tests/selfhost/interp/qa_interp_unit.ax
+- tests/selfhost/interp_opt/gen_interp_opt_tests.py
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_unit.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_diff.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_smoke.ax
+- tests/selfhost/opt/qa_opt_pipeline.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_cap_ptr.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_verify_mir.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_b.ax
+
+STATUS: COMPLETE round=0

@@ -151,6 +151,24 @@ pub fn main() -> i32 {
 }
 """
 
+T140_MIR_SRC = b"""\
+mir_body {
+    let mut _0: u64;
+    let _1: u64;
+    let _2: u64;
+    let _3: u64;
+    let _4: u64;
+    let _5: bool;
+    bb0: {
+        _3 = copy _1 / copy _2;
+        _4 = copy _1 % copy _2;
+        _5 = overflows(copy _1 * copy _2);
+        _0 = copy _3 + copy _4;
+        return;
+    }
+}
+"""
+
 AX_CORPUS_SMALL_LIR = [
     ("tests/mc/frame/main_42.ax", False),
     ("tests/mc/isel/vs1_locals.ax", False),
@@ -193,6 +211,9 @@ AX_CORPUS_HEAVY = [
     ("tests/run/native_enum/03-nested.ax", False),
     ("tests/run/native_enum/04-large-payload.ax", False),
     ("tests/run/native_enum/05-nested-enum.ax", False),
+    ("tests/run/numeric/repro_u64_div_rem.ax", False),
+    ("tests/run/numeric/repro_u64_mul_overflow.ax", False),
+    ("tests/run/numeric/repro_isize_usize_shift_40.ax", False),
 ]
 
 MIR_ONLY_LIR = {
@@ -629,6 +650,7 @@ def gen_unit_test(modules_text, axiom0):
 
     blobs.append(b"tests/selfhost/backend/unit_obj.ax")
     blobs.append(UNIT_AX_SRC.replace(b"\r\n", b"\n"))
+    blobs.append(T140_MIR_SRC.replace(b"\r\n", b"\n"))
 
     packed, offsets = pack_blobs(blobs)
     tables = "\n\n".join([
@@ -643,6 +665,8 @@ def gen_unit_test(modules_text, axiom0):
     header = "\n".join([
         "// test: run",
         "// timeout: 1200",
+        "// stdout: 18446744073709551615\\n",
+        "// stdout: 18446744073709551615\\n",
         "// stdout: OK Backend Unit & ObjModel\\n",
         "",
     ])

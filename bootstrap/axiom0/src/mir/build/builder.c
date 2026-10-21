@@ -1,6 +1,7 @@
 
 #include "mir/build/build.h"
 #include "mir/build/intrinsics.h"
+#include "types/layout/layout.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -1909,14 +1910,8 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 lt_bits_stmt.assign.rvalue.binary_op.rhs.constant.ty = get_expr_type(b, expr->binary.right);
                 
                 TypeId lhs_ty = get_expr_type(b, expr->binary.left);
-                const AxType *ty = ax_type_get(&b->thir->interner, lhs_ty);
-                int bits = 32;
-                if (ty) {
-                    if (ty->kind == AX_TY_I8 || ty->kind == AX_TY_U8) bits = 8;
-                    else if (ty->kind == AX_TY_I16 || ty->kind == AX_TY_U16) bits = 16;
-                    else if (ty->kind == AX_TY_I32 || ty->kind == AX_TY_U32) bits = 32;
-                    else if (ty->kind == AX_TY_I64 || ty->kind == AX_TY_U64) bits = 64;
-                }
+                uint32_t lhs_sz = ax_type_layout(lhs_ty, &b->thir->interner).size;
+                uint64_t bits = lhs_sz ? (uint64_t)lhs_sz * 8 : 32;
                 lt_bits_stmt.assign.rvalue.binary_op.rhs.constant.val = bits;
                 push_stmt(b, b->current_bb, lt_bits_stmt);
 

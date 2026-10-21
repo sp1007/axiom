@@ -8,12 +8,14 @@ model: sonnet
 gate_model: opus
 depends: [T134]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/lir, bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/opt, bootstrap/axiom0/src/interp, compiler/lir, compiler/target/x64, compiler/mir/builder.ax, compiler/opt, compiler/interp, std/text/fmt/int.ax, tests/run/numeric, tests/lir, tests/mc, tests/mir, tests/selfhost, tests/encode]
 spec: [spec/SPEC-03-core-semantics.md, spec/decisions/ADR-0034-oracle-independence.md, tasks/0327, tasks/0334]
 covers: [REQ-CORE-028, REQ-TYP-035, REQ-EXP-219]
 timeout_min: 300
+started: 2026-10-21 06:12:46
+finished: 2026-10-21 14:31:25
 ---
 # T140 — AX0-FIX-02: unsigned 64-bit div/rem, u64/usize multiply overflow, isize/usize shift width
 
@@ -106,3 +108,5 @@ Confirmed defects (audit `_workspaces/audit/2026-10-19/oracle-independence.md` O
   literals; T155 owns the residual if any) may become identical or move to a later stage.
 
 ## Log
+- 2026-10-21 06:12:46 started (attempt 1) T140-impl
+- 2026-10-21 14:31:25 accepted by QA -> done

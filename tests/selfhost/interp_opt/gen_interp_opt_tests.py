@@ -457,6 +457,9 @@ RUN_GROUPS = [
     ], False),
     ("run_b", "RUN_B", [
         ("tests/opt/const_fold_run.ax", None, False, False, None, 0, 0, 500000, 128),
+        ("tests/run/numeric/repro_isize_usize_shift_40.ax", None, False, False, None, 0, 0, 50000, 64),
+        ("tests/run/numeric/repro_u64_div_rem.ax", None, False, False, None, 0, 0, 50000, 64),
+        ("tests/run/numeric/repro_u64_mul_overflow.ax", None, False, False, 101, 0, 0, 50000, 64),
         ("tests/opt/qa_dce_run.ax", None, False, False, None, 0, 0, 500000, 128),
         ("tests/opt/qa_edge_cases_run.ax", None, False, False, None, 0, 0, 500000, 128),
         ("tests/mir/build/bitnot.ax", None, False, False, None, 0, 0, 500000, 128),

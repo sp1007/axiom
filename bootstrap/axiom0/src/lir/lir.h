@@ -44,7 +44,9 @@ typedef enum AxLirInstKind {
     // Call
     AX_LIR_INST_CALL,
     AX_LIR_INST_ABI_ARG,
-    AX_LIR_INST_ABI_RESULT
+    AX_LIR_INST_ABI_RESULT,
+    AX_LIR_INST_UDIV,
+    AX_LIR_INST_UREM
 } AxLirInstKind;
 
 typedef struct AxLirInst {
