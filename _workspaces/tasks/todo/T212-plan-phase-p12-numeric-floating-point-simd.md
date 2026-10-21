@@ -21,7 +21,53 @@ standard in ROADMAP §4, so that this phase looks exactly like every other phase
 the roadmap is invented.
 
 ## Scope
-- Read ROADMAP §3 (P12 epics), catalogue rows with `EPIC(E12.*)` (including `REQ-OWNER-007`: unsuffixed integer literals like `1`, `2` inside `f32`/`f64` expressions such as `let a: f64 = 123.45; let b: f64 = (a + 1)/2 + a*a/6.0` infer `f32`/`f64` directly from context without suffixes or `as` casts when exactly representable), the epics' sources, and the gate reports of the phases this one depends on.
+- Read ROADMAP §3 (P12 epics), catalogue rows with `EPIC(E12.*)` (including `REQ-OWNER-007` below), the epics' sources, and the gate reports of the phases this one depends on.
+
+## Complex Mixed-Type Expression Matrix (`REQ-OWNER-007`)
+When expanding `E12.1` / `E12.2`, create dedicated spec + implementation + QA stress-test tasks for **complex expressions mixing unsuffixed literals and variables of different numeric types** without suffixes or manual `as` casts:
+1. **Architectural rule (preventing ad-hoc backend promotion bugs):**
+   - Resolve all unsuffixed literal unification (`IntVar` / `FloatVar`) and variable numeric promotions (`i8/u8 -> i16/u16 -> i32/u32 -> i64/isize -> f32 -> f64`) **exclusively in `typeck` + HIR->MIR lowering**.
+   - Emit every implicit promotion as an explicit `MIR_RVALUE_CAST` temporary before the binary/indexing operation so that **MIR, MIR verifier, MIR interpreter, optimizer, LIR, and x86-64 codegen still see 100% homogeneous operand types on every instruction** (never mixing GPR and XMM or narrow/wide widths inside backend isel).
+2. **Mandatory QA expression patterns (`tests/run/numeric/`):**
+   - **Pattern A (multi-level rational/polynomial mixing `i16`, `u16`, `i32`, `i64`, `usize`, `f32`, `f64` + unsuffixed int/float literals):**
+     ```axiom
+     let a: f64 = 123.45;
+     let w: f32 = 0.25;
+     let i: i32 = -7;
+     let k: i16 = 3;
+     let u: u16 = 12;
+     let n: usize = 5;
+     let base: i64 = 1000;
+     let y: f64 = ((a + i * k - 1) / (2 * n + u - 3)) * (w + 0.5)
+                + (base - u * 4 + i) / (a * a / 6.0 - k + 2);
+     ```
+   - **Pattern B (bitwise & shift sub-trees feeding signed/unsigned & floating-point arithmetic):**
+     ```axiom
+     let mask: u32 = 0x0FF0;
+     let sh: u8 = 4;
+     let delta: i8 = -3;
+     let step: isize = 9;
+     let scale: f64 = 2.5;
+     let z: f64 = (((mask >> sh) & 0x3F) + delta * step - 5) * scale / ((1 << sh) + 3);
+     ```
+   - **Pattern C (mixed-width array indexing, function/intrinsic arguments, and relational comparisons):**
+     ```axiom
+     let idx: u8 = 2;
+     let off: isize = 1;
+     let coeff: [4]f32 = [1.25, -0.5, 2.0, 4.5];
+     let x: f64 = 10.0;
+     let p: f64 = coeff[idx + off] * (x - 3) / (idx * 2 + 1) + coeff[idx - 1] * 4;
+     let ok: bool = (p + i * 0.5) > (base / 10 - u + 1.25);
+     ```
+   - **Pattern D (pure integer multi-width signed/unsigned promotions with negative operands and literals):**
+     ```axiom
+     let b8: u8 = 200;
+     let s8: i8 = -50;
+     let u16v: u16 = 3000;
+     let s32: i32 = -100000;
+     let s64: i64 = 5000000000;
+     let total: i64 = (s64 + s32 * 3) - (u16v + b8 * 2 + s8 - 7) / (4 - s8);
+     ```
 - Create 3–10 tasks per epic with ids in `T450`–`T499`, titles `E12.x <short title>`, owners by area, narrow `paths`, `spec:`, `covers:`, acceptance as tests; a spec task first where `spec/` lacks the area; a QA conformance task per epic exit criterion.
 - Implementation happens in `compiler/` (Axiom) and `std/` — axiom0 is frozen (ROADMAP R3).
 - Make gate task T312 depend on every new task; convert catalogue `EPIC(E12.*)` statuses to task ids.
