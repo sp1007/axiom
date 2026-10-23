@@ -1,6 +1,7 @@
 
 #include "mir/build/build.h"
 #include "mir/build/intrinsics.h"
+#include "mir/drop/drop.h"
 #include "types/layout/layout.h"
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +62,6 @@ typedef struct Builder {
 } Builder;
 
 static void push_drop(Builder *b, AxMirPlace place, TypeId ty, bool is_temp);
-static bool type_needs_drop(Builder *b, TypeId ty);
 static AxMirBbId build_drop_chain(Builder *b, AxMirBbId current_bb, DropNode *from, DropNode *to, AxMirBbId target_bb, AxLocation loc);
 static AxMirBbId build_pat_match_inner(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
 static AxMirBbId build_pat_match(Builder *b, AxMirBbId current_bb, AxMirPlace place, const AxHirPat *pat, AxMirBbId bb_fail);
@@ -171,45 +171,8 @@ static void set_terminator(Builder *b, AxMirBbId bb, AxMirTerminator term) {
 }
 
 
-static bool type_needs_drop(Builder *b, TypeId ty) {
-    if (TypeId_is_none(ty) || ty.v == 0) return false;
-    const AxType *t = ax_type_get(&b->thir->interner, ty);
-    if (!t) return false;
-    if (t->kind == AX_TY_STRUCT) {
-        if (t->strct.def->struct_decl.struct_fields == NULL) return true;
-        for (size_t i = 0; i < t->strct.field_count; i++) {
-            if (type_needs_drop(b, t->strct.fields[i])) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_TUPLE) {
-        for (size_t i = 0; i < t->tuple.field_count; i++) {
-            if (type_needs_drop(b, t->tuple.fields[i])) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_ENUM) {
-        for (size_t v = 0; v < t->enm.variant_count; v++) {
-            for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
-                if (type_needs_drop(b, t->enm.variant_fields[v][i])) return true;
-            }
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_CLOSURE) {
-        for (size_t i = 0; i < t->closure.capture_count; i++) {
-            if (t->closure.captures[i].mode == AX_CAP_MOVE) {
-                if (type_needs_drop(b, t->closure.captures[i].type)) return true;
-            }
-        }
-        return false;
-    }
-
-    return false;
-}
-
 static void push_drop(Builder *b, AxMirPlace place, TypeId ty, bool is_temp) {
-    if (type_needs_drop(b, ty)) {
+    if (ax_type_needs_drop(ty, b->thir, NULL, NULL, NULL)) {
         DropNode *node = ax_arena_alloc_array(b->arena, 1, sizeof(DropNode), _Alignof(DropNode));
         node->place = place;
         node->location = b->current_span;
@@ -2394,6 +2357,14 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
                 cast_stmt.assign.rvalue.cast.op.kind = AX_MIR_OP_COPY;
                 cast_stmt.assign.rvalue.cast.op.place = temp_place;
                 push_stmt(b, b->current_bb, cast_stmt);
+                if (p.local.v < b->local_count &&
+                    ax_type_needs_drop(b->locals[p.local.v].ty, b->thir, NULL, NULL, NULL)) {
+                    AxMirStmt dead_stmt = {0};
+                    dead_stmt.kind = AX_MIR_STMT_STORAGE_DEAD;
+                    dead_stmt.location = expr->span;
+                    dead_stmt.storage_dead = temp;
+                    push_stmt(b, b->current_bb, dead_stmt);
+                }
                 return;
             }
             if (callee_t && (callee_t->kind == AX_TY_BUILTIN_SIZE_OF ||
@@ -2807,6 +2778,41 @@ static void build_expr_into_inner(Builder *b, const AxHirExpr *expr, AxMirPlace 
     }
 }
 
+/* True when some DEREF projection of `p` goes through a raw pointer (or a base whose type is not
+ * known to be a view/mut_view). Such a store is raw and never drops the old value; a place
+ * reached only through view/mut_view derefs is an ordinary initialised place (SPEC-03
+ * AXS-SEM-043). The walk mirrors drop.c place_type. */
+static bool place_has_raw_deref(Builder *b, AxMirPlace p) {
+    TypeId cur = b->locals[p.local.v].ty;
+    for (size_t i = 0; i < p.proj_count; i++) {
+        const AxMirProjection *proj = &p.projs[i];
+        const AxType *ty = (TypeId_is_none(cur) || cur.v == 0) ? NULL : ax_type_get(&b->thir->interner, cur);
+        if (proj->kind == AX_MIR_PROJ_DEREF) {
+            if (!ty || (ty->kind != AX_TY_VIEW && ty->kind != AX_TY_MUT_VIEW)) return true;
+            cur = ty->view.pointee;
+            continue;
+        }
+        if (!ty) { cur = (TypeId){0}; continue; }
+        if (proj->kind == AX_MIR_PROJ_FIELD) {
+            if (ty->kind == AX_TY_STRUCT && proj->field_idx < ty->strct.field_count) cur = ty->strct.fields[proj->field_idx];
+            else if (ty->kind == AX_TY_TUPLE && proj->field_idx < ty->tuple.field_count) cur = ty->tuple.fields[proj->field_idx];
+            else cur = (TypeId){0};
+        } else if (proj->kind == AX_MIR_PROJ_DOWNCAST) {
+            if (ty->kind == AX_TY_ENUM && i + 1 < p.proj_count && p.projs[i + 1].kind == AX_MIR_PROJ_FIELD) {
+                cur = ty->enm.variant_fields[proj->variant_idx][p.projs[i + 1].field_idx];
+                i++;
+            } else cur = (TypeId){0};
+        } else if (proj->kind == AX_MIR_PROJ_INDEX) {
+            if (ty->kind == AX_TY_ARRAY) cur = ty->array.elem;
+            else if (ty->kind == AX_TY_SLICE) cur = ty->slice.elem;
+            else cur = (TypeId){0};
+        } else {
+            /* SUB_SLICE keeps the slice type. */
+        }
+    }
+    return false;
+}
+
 static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPlace dest) {
     DropNode *old_drops = b->current_drops;
     for (const AxHirStmt *stmt = block->stmts; stmt != NULL; stmt = stmt->next) {
@@ -2840,10 +2846,43 @@ static void build_block_into_inner(Builder *b, const AxHirBlock *block, AxMirPla
             }
 
         } else if (stmt->kind == AX_HIR_STMT_ASSIGN) {
-            AxMirPlace dest = build_place(b, stmt->assign.left);
-            if (dest.local.v == 0 && dest.proj_count == 0 && stmt->assign.left->kind != AX_HIR_EXPR_PATH) {
+            TypeId lhs_ty = get_expr_type(b, stmt->assign.left);
+            if (ax_type_needs_drop(lhs_ty, b->thir, NULL, NULL, NULL)) {
+                /* SPEC-03 AXS-SEM-043: (1) evaluate rhs into a temporary, (2) evaluate the place,
+                 * (3) drop the old value, (4) move the temporary into the place. The temporary is
+                 * consumed by the move, so it never needs its own drop. A place reached through a
+                 * raw-pointer deref is a raw store (std writes uninitialised slots with `*p = v`)
+                 * and does not drop the old value; a place reached only through view/mut_view
+                 * derefs always holds an initialised value and drops it like a local place. */
+                AxMirLocalId tmp = add_local(b, AX_MIR_LOCAL_TEMP, lhs_ty, false);
+                AxMirPlace tmp_place = { tmp, NULL, 0, AX_MIR_REGION_UNKNOWN, AX_MIR_VIEW_UNKNOWN, 0 };
+                build_expr_into(b, stmt->assign.right, tmp_place);
+                AxMirPlace dest = build_place(b, stmt->assign.left);
+                bool raw_store = place_has_raw_deref(b, dest);
+                if (dest.local.v != 0 && !raw_store && !b->bbs[b->current_bb.v].is_terminated) {
+                    AxMirBbId next_bb = add_bb(b);
+                    AxMirTerminator term = {0};
+                    term.kind = AX_MIR_TERM_DROP;
+                    term.location = stmt->span;
+                    term.drop.place = dest;
+                    term.drop.target = next_bb;
+                    term.drop.unwind = (AxMirBbId){0};
+                    set_terminator(b, b->current_bb, term);
+                    b->current_bb = next_bb;
+                }
+                if (!b->bbs[b->current_bb.v].is_terminated) {
+                    AxMirStmt s = {0};
+                    s.kind = AX_MIR_STMT_ASSIGN;
+                    s.assign.place = dest;
+                    s.assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                    s.assign.rvalue.use.kind = AX_MIR_OP_MOVE;
+                    s.assign.rvalue.use.place = tmp_place;
+                    push_stmt(b, b->current_bb, s);
+                }
+            } else {
+                AxMirPlace dest = build_place(b, stmt->assign.left);
+                build_expr_into(b, stmt->assign.right, dest);
             }
-            build_expr_into(b, stmt->assign.right, dest);
         }
 
         // Cleanup temporaries

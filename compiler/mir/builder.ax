@@ -301,7 +301,7 @@ use compiler.mir.mir.mir_rvalue_reset
 use compiler.mir.mir.mir_stmt_reset
 use compiler.mir.mir.mir_term_zero
 use compiler.mir.mir.mir_u64_at
-use compiler.mir.drop.mir_type_needs_drop
+use compiler.mir.drop.mir_type_needs_drop_in
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -651,14 +651,8 @@ fn mb_new_bb(b: mut_view<MirBuilder>, is_cleanup: bool) -> MirBbId {
     }
 }
 
-fn mb_type_needs_drop(b: view<MirBuilder>, ty: TypeId) -> bool {
-    unsafe {
-        mir_type_needs_drop((TypeId { v: ty.v }), view(*b.thir), view(*b.hir), view(*b.str_in))
-    }
-}
-
 fn mb_push_drop(b: mut_view<MirBuilder>, place: view<MirPlace>, ty: TypeId, is_temp: bool, sp: view<Span>) {
-    if mb_type_needs_drop(view(*b), (TypeId { v: ty.v })) {
+    if unsafe { mir_type_needs_drop_in((TypeId { v: ty.v }), view(*b.thir), view(*b.hir), b.db, view(*b.str_in)) } {
         let node = unsafe {
             arena_alloc_raw(mut_view(*b.arena), size_of<MirDropNode>(), align_of<MirDropNode>()) as *mut MirDropNode
         };
@@ -1115,15 +1109,65 @@ fn mb_operand_from_place(b: view<MirBuilder>, place: view<MirPlace>, ty: TypeId,
     mir_copy_place(mut_view(out_op.place), place);
 }
 
-fn mb_place_is_deref(place: view<MirPlace>) -> bool {
+// True when some DEREF projection of `place` goes through a raw pointer (or a base whose type is
+// not known to be a view/mut_view). Such a store is raw and never drops the old value; a place
+// reached only through view/mut_view derefs is an ordinary initialised place (SPEC-03
+// AXS-SEM-043). Mirrors axiom0 mir/build/builder.c place_has_raw_deref.
+fn mb_place_has_raw_deref(b: view<MirBuilder>, place: view<MirPlace>) -> bool {
+    let mut cur: u32 = 0u32;
+    if (place.local.v as usize) < (unsafe { (*b.body).local_count }) {
+        let decl = unsafe { mir_local_at((*b.body).locals, place.local.v as usize) };
+        cur = unsafe { (*decl).ty.v };
+    }
     let mut i: usize = 0;
-    while (i < place.proj_count) {
-        let pr = unsafe {
-            mir_proj_at(place.projs, i)
+    while i < place.proj_count {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        let t = if cur != 0u32 {
+            unsafe { type_get(view((*b.thir).interner), (TypeId { v: cur })) }
+        } else {
+            0 as *mut AxType
         };
-        if (unsafe { (*pr).kind }) == MIR_PROJ_DEREF {
-            return true;
+        let has_t = (t as usize) != 0;
+        let tk = if has_t { unsafe { (*t).kind } } else { TY_ERROR };
+        if pk == MIR_PROJ_DEREF {
+            if !has_t || (tk != TY_VIEW && tk != TY_MUT_VIEW) {
+                return true;
+            }
+            cur = unsafe { (*t).pointee.v };
+        } else if !has_t {
+            cur = 0u32;
+        } else if pk == MIR_PROJ_FIELD {
+            let fi = (unsafe { (*pr).field_idx }) as usize;
+            if (tk == TY_STRUCT || tk == TY_TUPLE) && fi < (unsafe { (*t).field_count }) {
+                cur = unsafe { (*typeid_at((*t).fields, fi)).v };
+            } else {
+                cur = 0u32;
+            }
+        } else if pk == MIR_PROJ_DOWNCAST {
+            let mut done = false;
+            if tk == TY_ENUM && i + 1 < place.proj_count {
+                let nx = unsafe { mir_proj_at(place.projs, i + 1) };
+                if (unsafe { (*nx).kind }) == MIR_PROJ_FIELD {
+                    let vi = (unsafe { (*pr).variant_idx }) as usize;
+                    let fi = (unsafe { (*nx).field_idx }) as usize;
+                    let row = unsafe { *typeid_ptr_at((*t).variant_fields, vi) };
+                    cur = unsafe { (*typeid_at(row, fi)).v };
+                    i = i + 1;
+                    done = true;
+                }
+            }
+            if !done {
+                cur = 0u32;
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            if tk == TY_ARRAY || tk == TY_SLICE {
+                cur = unsafe { (*t).elem.v };
+            } else {
+                cur = 0u32;
+            }
         }
+        // MIR_PROJ_SUB_SLICE keeps the slice type.
         i = i + 1;
     }
     false
@@ -1522,7 +1566,7 @@ fn mb_emit_scope_cleanup(b: mut_view<MirBuilder>, target_depth: usize, sp: view<
                         (*loc_decl).ty.v
                     }
                 };
-                if mb_type_needs_drop(view(*b), (TypeId { v: loc_ty.v })) {
+                if unsafe { mir_type_needs_drop_in((TypeId { v: loc_ty.v }), view(*b.thir), view(*b.hir), b.db, view(*b.str_in)) } {
                     let next_bb = mb_new_bb(mut_view(*b), false);
                     let ubb = mb_get_unwind_bb(mut_view(*b), sp);
                     let cur_bb_ptr = unsafe {
@@ -3082,20 +3126,9 @@ pub fn mir_build_lvalue(b: mut_view<MirBuilder>, expr: *mut HirExpr, out_is_slic
         };
         while ((ax as usize) != 0 && ((unsafe { (*ax).kind }) == TY_VIEW || (unsafe { (*ax).kind }) == TY_MUT_VIEW || (unsafe { (*ax).kind }) == TY_PTR)) {
             base_pl = mb_append_proj_deref(mut_view(*b), view(base_pl));
-            let k = unsafe {
-                (*ax).kind
-            };
-            let next_ty = if k == TY_PTR {
-                TypeId {
-                    v: unsafe {
-                        (*ax).pointee.v
-                    }
-                }
-            } else {
-                TypeId {
-                    v: unsafe {
-                        (*ax).elem.v
-                    }
+            let next_ty = TypeId {
+                v: unsafe {
+                    (*ax).pointee.v
                 }
             };
             base_ty = mb_resolve_ty(mut_view(*b), next_ty);
@@ -3134,20 +3167,9 @@ pub fn mir_build_lvalue(b: mut_view<MirBuilder>, expr: *mut HirExpr, out_is_slic
         };
         while ((ax as usize) != 0 && ((unsafe { (*ax).kind }) == TY_VIEW || (unsafe { (*ax).kind }) == TY_MUT_VIEW || (unsafe { (*ax).kind }) == TY_PTR)) {
             base_pl = mb_append_proj_deref(mut_view(*b), view(base_pl));
-            let k = unsafe {
-                (*ax).kind
-            };
-            let next_ty = if k == TY_PTR {
-                TypeId {
-                    v: unsafe {
-                        (*ax).pointee.v
-                    }
-                }
-            } else {
-                TypeId {
-                    v: unsafe {
-                        (*ax).elem.v
-                    }
+            let next_ty = TypeId {
+                v: unsafe {
+                    (*ax).pointee.v
                 }
             };
             base_ty = mb_resolve_ty(mut_view(*b), next_ty);
@@ -4617,9 +4639,7 @@ pub fn mir_build_expr(
                     }
                 }
             };
-            mb_operand_from_place(view(*b), view(pl), (TypeId {
-                v: e_ty.v
-            }), mut_view(op));
+            mir_copy_place(mut_view(op.place), view(pl));
             if has_dest {
                 mb_emit_assign_use(mut_view(*b), view(*dest), view(op), view(sp));
             }
@@ -5719,6 +5739,13 @@ fn mb_build_control_or_call_expr(
                         }
                     };
                     mb_emit_assign(mut_view(*b), view(*dest), view(cast_rv), view(sp));
+                    if (p.local.v as usize) < (unsafe { (*b.body).local_count }) {
+                        let p_loc_decl = unsafe { mir_local_at((*b.body).locals, p.local.v as usize) };
+                        let p_loc_ty = TypeId { v: unsafe { (*p_loc_decl).ty.v } };
+                        if unsafe { mir_type_needs_drop_in((TypeId { v: p_loc_ty.v }), view(*b.thir), view(*b.hir), b.db, view(*b.str_in)) } {
+                            mb_emit_storage_dead(mut_view(*b), MirLocalId { v: tmp.v }, view(sp));
+                        }
+                    }
                     return;
                 }
                 if ck == TY_BUILTIN_FORGET {
@@ -7225,13 +7252,69 @@ pub fn mir_build_stmt(b: mut_view<MirBuilder>, stmt: *mut HirStmt) {
             }));
         }
     } else if sk == HIR_STMT_ASSIGN {
-        let mut dummy_sl = false;
-        let mut lhs_pl = mir_build_lvalue(mut_view(*b), unsafe {
+        let lhs_ty = mb_expr_ty(mut_view(*b), unsafe {
             (*stmt).left
-        }, mut_view(dummy_sl));
-        mir_build_expr(mut_view(*b), unsafe {
-            (*stmt).right
-        }, mut_view(lhs_pl), true);
+        });
+        if unsafe { mir_type_needs_drop_in((TypeId { v: lhs_ty.v }), view(*b.thir), view(*b.hir), b.db, view(*b.str_in)) } {
+            // SPEC-03 AXS-SEM-043: (1) evaluate rhs into a temporary, (2) evaluate the place,
+            // (3) drop the old value, (4) move the temporary into the place. Places reached
+            // through a raw-pointer deref are raw stores (std writes uninitialised slots with
+            // `*p = v`); places reached only through view/mut_view derefs drop the old value.
+            // Mirrors axiom0 mir/build/builder.c AX_HIR_STMT_ASSIGN.
+            let tmp = mb_new_temp(mut_view(*b), (TypeId {
+                v: lhs_ty.v
+            }), view(sp));
+            let mut tmp_pl = mir_local_place(tmp.v);
+            mir_build_expr(mut_view(*b), unsafe {
+                (*stmt).right
+            }, mut_view(tmp_pl), true);
+            let mut dummy_sl = false;
+            let mut lhs_pl = mir_build_lvalue(mut_view(*b), unsafe {
+                (*stmt).left
+            }, mut_view(dummy_sl));
+            if lhs_pl.local.v != 0u32 && !mb_place_has_raw_deref(view(*b), view(lhs_pl)) && !b.is_diverged {
+                let next_bb = mb_new_bb(mut_view(*b), false);
+                let bb = unsafe {
+                    mir_bb_at((*b.body).bbs, b.curr_bb.v as usize)
+                };
+                unsafe {
+                    mir_term_zero(mut_view((*bb).terminator), MIR_TERM_DROP);
+                    (*bb).terminator.span.file.v = sp.file.v;
+                    (*bb).terminator.span.start = sp.start;
+                    (*bb).terminator.span.end = sp.end;
+                    mir_copy_place(mut_view((*bb).terminator.drop_place), view(lhs_pl));
+                    (*bb).terminator.drop_target.v = next_bb.v;
+                    (*bb).terminator.drop_unwind.v = 0u32;
+                    (*bb).has_terminator = true;
+                }
+                b.curr_bb.v = next_bb.v;
+                b.is_diverged = false;
+            }
+            if !b.is_diverged {
+                let mut mv_op = MirOperand {
+                    kind: MIR_OP_MOVE, location: Span {
+                        file: FileId {
+                            v: 0u32
+                        }, start: 0u32, end: 0u32
+                    }, place: mir_local_place(tmp.v), constant: MirConst {
+                        ty: TypeId {
+                            v: 0u32
+                        }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId {
+                            v: 0u32
+                        }
+                    }
+                };
+                mb_emit_assign_use(mut_view(*b), view(lhs_pl), view(mv_op), view(sp));
+            }
+        } else {
+            let mut dummy_sl = false;
+            let mut lhs_pl = mir_build_lvalue(mut_view(*b), unsafe {
+                (*stmt).left
+            }, mut_view(dummy_sl));
+            mir_build_expr(mut_view(*b), unsafe {
+                (*stmt).right
+            }, mut_view(lhs_pl), true);
+        }
     } else if sk == HIR_STMT_EXPR {
         let e: *mut HirExpr = unsafe {
             (*stmt).expr
@@ -7529,6 +7612,25 @@ pub fn mir_build_fn_subst(
 ) -> *mut MirBody {
     if (func as usize) == 0 || (unsafe { (*func).kind }) != HIR_ITEM_FN || (unsafe { (*func).body as usize }) == 0 {
         return 0 as *mut MirBody;
+    }
+    if (unsafe { (*func).generic_params as usize }) != 0 {
+        let mut at: *mut HirAttr = unsafe { (*func).attrs };
+        while (at as usize) != 0 {
+            let mut an = StrView { ptr: 0 as *const u8, len: 0 };
+            if (str_in as usize) != 0 && (unsafe { (*at).name.v }) != 0u32 {
+                an = unsafe { interner_get(view(*str_in), StrId { v: (*at).name.v }) };
+            }
+            if an.len == 9 && (an.ptr as usize) != 0 {
+                if unsafe {
+                    *(an.ptr + 0) == 105u8 && *(an.ptr + 1) == 110u8 && *(an.ptr + 2) == 116u8 &&
+                    *(an.ptr + 3) == 114u8 && *(an.ptr + 4) == 105u8 && *(an.ptr + 5) == 110u8 &&
+                    *(an.ptr + 6) == 115u8 && *(an.ptr + 7) == 105u8 && *(an.ptr + 8) == 99u8
+                } {
+                    return 0 as *mut MirBody;
+                }
+            }
+            at = unsafe { (*at).next };
+        }
     }
     let body = mir_body_new(mut_view(*arena));
     let mut b = MirBuilder {

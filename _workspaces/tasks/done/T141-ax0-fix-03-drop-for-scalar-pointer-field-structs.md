@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T140]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/mir/build, bootstrap/axiom0/src/mir/drop, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/verify, compiler/mir, compiler/lir, compiler/interp, compiler/verify, compiler/types/typeck.ax, std/alloc, std/bytes, std/core/iter/adapters/vec_iter.ax, std/core/arena, std/env, std/io, std/process, std/text/string.ax, tests/run/drop, tests/run/mangle, tests/selfhost]
-locks: [bootstrap/axiom0/src/types/typeck.c]
+locks: [bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/driver/pipeline.c, tests/run/numeric/qa_t140_edge_matrix.ax]
 spec: [spec/SPEC-12-drop.md, spec/decisions/ADR-0032-unblock-t131-drop-destructors.md, spec/decisions/ADR-0034-oracle-independence.md, tasks/0485]
 covers: [REQ-DRP-083, REQ-DRP-051, REQ-OBJ-004]
 timeout_min: 300
+started: 2026-10-21 14:32:01
+finished: 2026-10-23 18:54:18
 ---
 # T141 — AX0-FIX-03: implicit Drop for structs with only scalar/pointer fields
 
@@ -89,3 +91,5 @@ them (`compiler/mir/builder.ax`, `compiler/lir/builder.ax`, `compiler/mir/drop.a
   divergent program is a regression of this task).
 
 ## Log
+- 2026-10-21 14:32:01 started (attempt 1) T141-impl
+- 2026-10-23 18:54:18 accepted by QA -> done

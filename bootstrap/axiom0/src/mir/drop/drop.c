@@ -4,80 +4,118 @@
 #include <string.h>
 #include <stdlib.h>
 
-bool ax_type_needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db);
-static bool needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
-    return ax_type_needs_drop(ty, thir, interner, hir, db);
+static bool is_drop_trait_name(StrView sv) {
+    if (sv.len == 4 && memcmp(sv.ptr, "Drop", 4) == 0) return true;
+    if (sv.len > 5 && memcmp(sv.ptr + sv.len - 5, ".Drop", 5) == 0) return true;
+    return false;
 }
 
-bool ax_type_needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
-    if (TypeId_is_none(ty) || ty.v == 0) return false;
+const AxHirItem *ax_find_drop_impl_fn(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
+    if (!thir || TypeId_is_none(ty) || ty.v == 0) return NULL;
     const AxType *t = ax_type_get(&thir->interner, ty);
-    if (!t) return false;
+    if (!t || t->kind != AX_TY_STRUCT) return NULL;
 
-    if (t->kind == AX_TY_CLOSURE) {
-        for (size_t i = 0; i < t->closure.capture_count; i++) {
-            if (t->closure.captures[i].mode == AX_CAP_MOVE && needs_drop(t->closure.captures[i].type, thir, interner, hir, db)) {
-                return true;
-            }
+    if (thir->expr_methods.raw.entries != NULL) {
+        const AxHirExpr *key_ty = (const AxHirExpr *)(((uintptr_t)ty.v << 1) | (uintptr_t)1);
+        AxHirItemPtr *df = AxExprMethodMap_get(&thir->expr_methods, key_ty);
+        if (df && *df) return *df;
+        if (t->strct.def != NULL) {
+            const AxHirExpr *key_def = (const AxHirExpr *)(((uintptr_t)t->strct.def) | (uintptr_t)1);
+            df = AxExprMethodMap_get(&thir->expr_methods, key_def);
+            if (df && *df) return *df;
         }
-        return false;
     }
-    
-    if (t->kind == AX_TY_STRUCT) {
-        if (t->strct.def->struct_decl.struct_fields == NULL) return true;
-        
-        if (hir) {
-            StrView target_sname = ax_interner_get((StrInterner*)interner, t->strct.def->struct_decl.name);
-            for (AxHirItem *it = (AxHirItem*)hir->items; it; it = it->next) {
-                if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                    StrView trait_sname = {0};
-                    if (db) {
-                        trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
-                    } else if (it->impl.trait_path->path.path.name.v != 0) {
-                        trait_sname = ax_interner_get((StrInterner*)interner, it->impl.trait_path->path.path.name);
-                    }
-                    if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
+
+    if (hir && t->strct.def) {
+        AxSymbolId target_sym = t->strct.def->struct_decl.symbol;
+        StrView target_sname = {0};
+        if (interner && t->strct.def->struct_decl.name.v != 0) {
+            target_sname = ax_interner_get((StrInterner *)interner, t->strct.def->struct_decl.name);
+        } else if (db && t->strct.def->span.file.v != 0) {
+            target_sname = ax_source_db_span_text(db, t->strct.def->span);
+        }
+        for (const AxHirItem *it = hir->items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+                StrView trait_sname = {0};
+                if (db && it->impl.trait_path->span.file.v != 0) {
+                    trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
+                } else if (interner && it->impl.trait_path->path.path.name.v != 0) {
+                    trait_sname = ax_interner_get((StrInterner *)interner, it->impl.trait_path->path.path.name);
+                }
+                if (is_drop_trait_name(trait_sname)) {
+                    AxSymbolId impl_sym = it->impl.self_type->path.path.symbol;
+                    bool match = false;
+                    if (target_sym.v != 0 && impl_sym.v != 0) {
+                        match = (target_sym.v == impl_sym.v);
+                    } else {
                         StrView impl_sname = {0};
-                        if (db) {
+                        if (db && it->impl.self_type->path.path.span.file.v != 0) {
                             impl_sname = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
                             size_t less_idx = 0;
                             while (less_idx < impl_sname.len && impl_sname.ptr[less_idx] != '<') {
                                 less_idx++;
                             }
                             impl_sname.len = less_idx;
-                        } else if (it->impl.self_type->path.path.name.v != 0) {
-                            impl_sname = ax_interner_get((StrInterner*)interner, it->impl.self_type->path.path.name);
+                        } else if (interner && it->impl.self_type->path.path.name.v != 0) {
+                            impl_sname = ax_interner_get((StrInterner *)interner, it->impl.self_type->path.path.name);
                         }
-                        if (ax_sv_eq(target_sname, impl_sname)) {
-                            for (AxHirItem *m = it->impl.members; m; m = m->next) {
-                                if (m->kind == AX_HIR_ITEM_FN) {
-                                    return true;
-                                }
+                        if (target_sname.len > 0 && ax_sv_eq(target_sname, impl_sname)) {
+                            match = true;
+                        }
+                    }
+                    if (match) {
+                        for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                            if (m->kind == AX_HIR_ITEM_FN) {
+                                return m;
                             }
                         }
                     }
                 }
             }
         }
-        
+    }
+
+    return NULL;
+}
+
+bool ax_type_needs_drop(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
+    if (!thir || TypeId_is_none(ty) || ty.v == 0) return false;
+    const AxType *t = ax_type_get(&thir->interner, ty);
+    if (!t) return false;
+
+    if (t->kind == AX_TY_CLOSURE) {
+        for (size_t i = 0; i < t->closure.capture_count; i++) {
+            if (t->closure.captures[i].mode == AX_CAP_MOVE && ax_type_needs_drop(t->closure.captures[i].type, thir, interner, hir, db)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    if (t->kind == AX_TY_STRUCT) {
+        if (t->strct.def && t->strct.def->struct_decl.struct_fields == NULL) return true;
+        if (ax_find_drop_impl_fn(ty, thir, interner, hir, db) != NULL) return true;
         for (size_t i = 0; i < t->strct.field_count; i++) {
-            if (needs_drop(t->strct.fields[i], thir, interner, hir, db)) return true;
+            if (ax_type_needs_drop(t->strct.fields[i], thir, interner, hir, db)) return true;
         }
         return false;
     }
     if (t->kind == AX_TY_TUPLE) {
         for (size_t i = 0; i < t->tuple.field_count; i++) {
-            if (needs_drop(t->tuple.fields[i], thir, interner, hir, db)) return true;
+            if (ax_type_needs_drop(t->tuple.fields[i], thir, interner, hir, db)) return true;
         }
         return false;
     }
     if (t->kind == AX_TY_ENUM) {
         for (size_t v = 0; v < t->enm.variant_count; v++) {
             for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
-                if (needs_drop(t->enm.variant_fields[v][i], thir, interner, hir, db)) return true;
+                if (ax_type_needs_drop(t->enm.variant_fields[v][i], thir, interner, hir, db)) return true;
             }
         }
         return false;
+    }
+    if (t->kind == AX_TY_ARRAY) {
+        return t->array.len > 0 && ax_type_needs_drop(t->array.elem, thir, interner, hir, db);
     }
 
     return false;
@@ -111,34 +149,48 @@ static AxMirStmt make_flag_assign(AxMirLocalId flag_id, bool val, const AxThir *
     return s;
 }
 
-static void visit_op(const AxMirOperand *op, uint32_t *local_flags, size_t orig_local_count, AxMirStmt *out_stmts, size_t *out_idx, const AxThir *thir) {
+static TypeId place_type(AxMirPlace p, AxMirBody *body, const AxThir *thir);
+
+static bool place_has_deref(AxMirPlace p) {
+    for (size_t i = 0; i < p.proj_count; i++) {
+        if (p.projs[i].kind == AX_MIR_PROJ_DEREF) return true;
+    }
+    return false;
+}
+
+static void visit_op(const AxMirOperand *op, uint32_t *local_flags, size_t orig_local_count, AxMirStmt *out_stmts, size_t *out_idx, AxMirBody *body, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
     if (op->kind == AX_MIR_OP_MOVE || op->kind == AX_MIR_OP_COPY) {
         AxMirPlace src = op->place;
         if (src.local.v < orig_local_count && local_flags[src.local.v]) {
+            if (src.proj_count > 0) {
+                if (place_has_deref(src)) return;
+                TypeId pty = place_type(src, body, thir);
+                if (!ax_type_needs_drop(pty, thir, interner, hir, db)) return;
+            }
             out_stmts[(*out_idx)++] = make_flag_assign((AxMirLocalId){local_flags[src.local.v]}, false, thir);
         }
     }
 }
 
-static void visit_rvalue(const AxMirRvalue *rv, uint32_t *local_flags, size_t orig_local_count, AxMirStmt *out_stmts, size_t *out_idx, const AxThir *thir) {
+static void visit_rvalue(const AxMirRvalue *rv, uint32_t *local_flags, size_t orig_local_count, AxMirStmt *out_stmts, size_t *out_idx, AxMirBody *body, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
     switch (rv->kind) {
-        case AX_MIR_RVALUE_USE: visit_op(&rv->use, local_flags, orig_local_count, out_stmts, out_idx, thir); break;
+        case AX_MIR_RVALUE_USE: visit_op(&rv->use, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db); break;
         case AX_MIR_RVALUE_REPEAT:
-            visit_op(&rv->repeat.op, local_flags, orig_local_count, out_stmts, out_idx, thir);
-            visit_op(&rv->repeat.count, local_flags, orig_local_count, out_stmts, out_idx, thir);
+            visit_op(&rv->repeat.op, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
+            visit_op(&rv->repeat.count, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
             break;
-        case AX_MIR_RVALUE_CAST: visit_op(&rv->cast.op, local_flags, orig_local_count, out_stmts, out_idx, thir); break;
+        case AX_MIR_RVALUE_CAST: visit_op(&rv->cast.op, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db); break;
         case AX_MIR_RVALUE_OVERFLOWS_BINARY_OP:
         case AX_MIR_RVALUE_BINARY_OP:
-            visit_op(&rv->binary_op.lhs, local_flags, orig_local_count, out_stmts, out_idx, thir);
-            visit_op(&rv->binary_op.rhs, local_flags, orig_local_count, out_stmts, out_idx, thir);
+            visit_op(&rv->binary_op.lhs, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
+            visit_op(&rv->binary_op.rhs, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
             break;
         case AX_MIR_RVALUE_UNARY_OP:
-            visit_op(&rv->unary_op.operand, local_flags, orig_local_count, out_stmts, out_idx, thir);
+            visit_op(&rv->unary_op.operand, local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
             break;
         case AX_MIR_RVALUE_AGGREGATE:
             for (size_t i = 0; i < rv->aggregate.operand_count; i++) {
-                visit_op(&rv->aggregate.operands[i], local_flags, orig_local_count, out_stmts, out_idx, thir);
+                visit_op(&rv->aggregate.operands[i], local_flags, orig_local_count, out_stmts, out_idx, body, thir, interner, hir, db);
             }
             break;
         default: break;
@@ -192,32 +244,7 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
     const AxType *ty = ax_type_get(&thir->interner, ty_id);
     if (!ty) return false;
     
-    AxHirItem *drop_fn = NULL;
-    if (ty && ty->kind == AX_TY_STRUCT) {
-        StrView target_sname = ax_interner_get((StrInterner*)interner, ty->strct.def->struct_decl.name);
-        for (AxHirItem *it = (AxHirItem*)hir->items; it; it = it->next) {
-            if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                StrView trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
-                if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
-                    StrView impl_sname = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
-                    size_t less_idx = 0;
-                    while (less_idx < impl_sname.len && impl_sname.ptr[less_idx] != '<') {
-                        less_idx++;
-                    }
-                    impl_sname.len = less_idx;
-                    if (ax_sv_eq(target_sname, impl_sname)) {
-                        for (AxHirItem *m = it->impl.members; m; m = m->next) {
-                            if (m->kind == AX_HIR_ITEM_FN) {
-                                drop_fn = m;
-                                break;
-                            }
-                        }
-                        if (drop_fn) break;
-                    }
-                }
-            }
-        }
-    }
+    AxHirItem *drop_fn = (AxHirItem *)ax_find_drop_impl_fn(ty_id, thir, interner, hir, db);
     
     AxMirBbId inner_target = target;
     
@@ -227,7 +254,7 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
         for (size_t i = field_count; i > 0; i--) {
             size_t idx = i - 1;
             TypeId field_ty = (ty->kind == AX_TY_STRUCT) ? ty->strct.fields[idx] : ty->tuple.fields[idx];
-            if (needs_drop(field_ty, thir, interner, hir, db)) {
+            if (ax_type_needs_drop(field_ty, thir, interner, hir, db)) {
                 AxMirBb *bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
                 memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
                 body->bbs = bbs;
@@ -257,7 +284,7 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
             size_t idx = i - 1;
             if (ty->closure.captures[idx].mode == AX_CAP_MOVE) {
                 TypeId field_ty = ty->closure.captures[idx].type;
-                if (needs_drop(field_ty, thir, interner, hir, db)) {
+                if (ax_type_needs_drop(field_ty, thir, interner, hir, db)) {
                     AxMirBb *bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
                     memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
                     body->bbs = bbs;
@@ -312,21 +339,21 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
         targets.otherwise = inner_target;
 
         for (size_t v = 0; v < ty->enm.variant_count; v++) {
-            bool variant_needs_drop = false;
+            bool has_drop_field = false;
             for (size_t i = 0; i < ty->enm.variant_field_counts[v]; i++) {
-                if (needs_drop(ty->enm.variant_fields[v][i], thir, interner, hir, db)) {
-                    variant_needs_drop = true;
+                if (ax_type_needs_drop(ty->enm.variant_fields[v][i], thir, interner, hir, db)) {
+                    has_drop_field = true;
                     break;
                 }
             }
 
-            if (variant_needs_drop) {
+            if (has_drop_field) {
                 AxMirBbId variant_target = inner_target;
 
                 for (size_t i = ty->enm.variant_field_counts[v]; i > 0; i--) {
                     size_t idx = i - 1;
                     TypeId field_ty = ty->enm.variant_fields[v][idx];
-                    if (needs_drop(field_ty, thir, interner, hir, db)) {
+                    if (ax_type_needs_drop(field_ty, thir, interner, hir, db)) {
                         bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
                         memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
                         body->bbs = bbs;
@@ -366,6 +393,52 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
         body->bbs[switch_bb.v].terminator.switch_int.targets = targets;
 
         inner_target = switch_bb;
+    } else if (ty && ty->kind == AX_TY_ARRAY) {
+        if (ty->array.len > 0 && ax_type_needs_drop(ty->array.elem, thir, interner, hir, db)) {
+            for (size_t i = (size_t)ty->array.len; i > 0; i--) {
+                size_t idx = i - 1;
+                AxMirLocalDecl *decl = ax_arena_alloc(&body->arena, (body->local_count + 1) * sizeof(AxMirLocalDecl), _Alignof(AxMirLocalDecl));
+                memcpy(decl, body->locals, body->local_count * sizeof(AxMirLocalDecl));
+                body->locals = decl;
+                AxMirLocalId idx_local = { (uint32_t)body->local_count++ };
+                body->locals[idx_local.v].ty = thir->interner.t_usize;
+                body->locals[idx_local.v].kind = AX_MIR_LOCAL_TEMP;
+
+                AxMirBb *bbs = ax_arena_alloc(&body->arena, (body->bb_count + 1) * sizeof(AxMirBb), _Alignof(AxMirBb));
+                memcpy(bbs, body->bbs, body->bb_count * sizeof(AxMirBb));
+                body->bbs = bbs;
+                AxMirBbId elem_bb = { (uint32_t)body->bb_count++ };
+
+                AxMirStmt *idx_stmt = ax_arena_alloc(&body->arena, sizeof(AxMirStmt), _Alignof(AxMirStmt));
+                memset(idx_stmt, 0, sizeof(AxMirStmt));
+                idx_stmt->kind = AX_MIR_STMT_ASSIGN;
+                idx_stmt->assign.place = (AxMirPlace){ .local = idx_local };
+                idx_stmt->assign.rvalue.kind = AX_MIR_RVALUE_USE;
+                idx_stmt->assign.rvalue.use.kind = AX_MIR_OP_CONST;
+                idx_stmt->assign.rvalue.use.constant.ty = thir->interner.t_usize;
+                idx_stmt->assign.rvalue.use.constant.val = (uint64_t)idx;
+
+                AxMirProjection *projs = ax_arena_alloc(&body->arena, (place.proj_count + 1) * sizeof(AxMirProjection), _Alignof(AxMirProjection));
+                if (place.proj_count > 0) memcpy(projs, place.projs, place.proj_count * sizeof(AxMirProjection));
+                memset(&projs[place.proj_count], 0, sizeof(AxMirProjection));
+                projs[place.proj_count].kind = AX_MIR_PROJ_INDEX;
+                projs[place.proj_count].index_local = idx_local;
+
+                AxMirPlace elem_place = place;
+                elem_place.projs = projs;
+                elem_place.proj_count++;
+
+                body->bbs[elem_bb.v].stmts = idx_stmt;
+                body->bbs[elem_bb.v].stmt_count = 1;
+                body->bbs[elem_bb.v].stmt_cap = 1;
+                body->bbs[elem_bb.v].terminator.kind = AX_MIR_TERM_DROP;
+                body->bbs[elem_bb.v].terminator.drop.place = elem_place;
+                body->bbs[elem_bb.v].terminator.drop.target = inner_target;
+                body->bbs[elem_bb.v].terminator.drop_flag = 0;
+
+                inner_target = elem_bb;
+            }
+        }
     }
     
 
@@ -408,6 +481,10 @@ static bool expand_drop(AxMirBody *body, AxMirBbId bb_idx, const AxThir *thir, c
         call.call.func.constant.val = drop_fn->fn.symbol.v;
         AxType fn_t = { .kind = AX_TY_FN };
         call.call.func.constant.ty = ax_intern_type((TypeInterner*)&thir->interner, &fn_t);
+        const TypeId *item_fn_ty = AxItemTypeMap_get(&thir->item_types, drop_fn);
+        if (item_fn_ty && item_fn_ty->v != 0) {
+            call.call.func.constant.ty = *item_fn_ty;
+        }
         
         AxMirOperand *args = ax_arena_alloc(&body->arena, sizeof(AxMirOperand), _Alignof(AxMirOperand));
         args[0].kind = AX_MIR_OP_MOVE;
@@ -462,7 +539,7 @@ void ax_mir_drop_elaborate(AxMirBody *body, const AxThir *thir, const AxHir *hir
     uint32_t *local_flags = calloc(orig_local_count, sizeof(uint32_t));
     
     for (size_t i = 1; i < orig_local_count; i++) {
-        if (needs_drop(body->locals[i].ty, thir, interner, hir, db)) {
+        if (ax_type_needs_drop(body->locals[i].ty, thir, interner, hir, db)) {
             AxMirLocalId fid = add_drop_flag(body, thir);
             local_flags[i] = fid.v;
         }
@@ -526,7 +603,7 @@ void ax_mir_drop_elaborate(AxMirBody *body, const AxThir *thir, const AxHir *hir
             AxMirStmt *s = &bb->stmts[j];
             
             if (s->kind == AX_MIR_STMT_ASSIGN) {
-                visit_rvalue(&s->assign.rvalue, local_flags, orig_local_count, new_stmts, &idx, thir);
+                visit_rvalue(&s->assign.rvalue, local_flags, orig_local_count, new_stmts, &idx, body, thir, interner, hir, db);
             }
             
             new_stmts[idx++] = *s;
@@ -541,14 +618,14 @@ void ax_mir_drop_elaborate(AxMirBody *body, const AxThir *thir, const AxHir *hir
         
         AxMirTerminator *term = &bb->terminator;
         if (term->kind == AX_MIR_TERM_SWITCH_INT) {
-            visit_op(&term->switch_int.discr, local_flags, orig_local_count, new_stmts, &idx, thir);
+            visit_op(&term->switch_int.discr, local_flags, orig_local_count, new_stmts, &idx, body, thir, interner, hir, db);
         } else if (term->kind == AX_MIR_TERM_CALL) {
-            visit_op(&term->call.func, local_flags, orig_local_count, new_stmts, &idx, thir);
+            visit_op(&term->call.func, local_flags, orig_local_count, new_stmts, &idx, body, thir, interner, hir, db);
             for (size_t a = 0; a < term->call.arg_count; a++) {
-                visit_op(&term->call.args[a], local_flags, orig_local_count, new_stmts, &idx, thir);
+                visit_op(&term->call.args[a], local_flags, orig_local_count, new_stmts, &idx, body, thir, interner, hir, db);
             }
         } else if (term->kind == AX_MIR_TERM_ASSERT) {
-            visit_op(&term->assert.cond, local_flags, orig_local_count, new_stmts, &idx, thir);
+            visit_op(&term->assert.cond, local_flags, orig_local_count, new_stmts, &idx, body, thir, interner, hir, db);
         }
         
         bb->stmts = new_stmts;

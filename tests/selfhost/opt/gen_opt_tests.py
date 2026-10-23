@@ -29,6 +29,7 @@ CORE_MODULES = [
     ("compiler.hir.hir", "reference"),
     ("compiler.types.types", "reference"),
     ("compiler.mir.mir", "compiler"),
+    ("compiler.mir.drop", "compiler"),
     ("compiler.verify.verifier", "compiler"),
     ("compiler.verify", "compiler"),
     ("compiler.opt.const_fold", "compiler"),

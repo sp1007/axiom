@@ -97,6 +97,7 @@ GROUPS = [
     ("d09", "d09", ["d09_closures"]),
     ("d10", "d10", ["d10_destructor"]),
     ("d11", "d11", ["d11_qa_edges"]),
+    ("d12", "d12", ["d12_scalar_destructor"]),
 ]
 
 # Fixtures whose C goldens are kept (and checked by drop_oracle.test) but that no Axiom harness

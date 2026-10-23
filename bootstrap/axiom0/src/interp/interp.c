@@ -113,32 +113,7 @@ static AxHirItem *find_func_by_symbol(InterpCtx *ctx, uint64_t sym_v) {
 }
 
 static AxHirItem *find_drop_fn_for_type(InterpCtx *ctx, TypeId ty_id) {
-    if (TypeId_is_none(ty_id) || ty_id.v == 0) return NULL;
-    const AxType *ty = ax_type_get(&ctx->thir->interner, ty_id);
-    if (!ty || ty->kind != AX_TY_STRUCT) return NULL;
-    StrView target_sname = ax_interner_get(ctx->interner, ty->strct.def->struct_decl.name);
-    for (const AxHirItem *it = ctx->hir->items; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-            StrView trait_sname = {0};
-            if (it->impl.trait_path->path.path.name.v != 0) {
-                trait_sname = ax_interner_get(ctx->interner, it->impl.trait_path->path.path.name);
-            }
-            if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
-                StrView impl_sname = {0};
-                if (it->impl.self_type->path.path.name.v != 0) {
-                    impl_sname = ax_interner_get(ctx->interner, it->impl.self_type->path.path.name);
-                }
-                if (ax_sv_eq(target_sname, impl_sname)) {
-                    for (const AxHirItem *m = it->impl.members; m; m = m->next) {
-                        if (m->kind == AX_HIR_ITEM_FN) {
-                            return (AxHirItem*)m;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return NULL;
+    return (AxHirItem *)ax_find_drop_impl_fn(ty_id, ctx->thir, ctx->interner, ctx->hir, NULL);
 }
 
 void ax_interp_report_ub(InterpCtx *ctx, const char *msg) {
@@ -1290,7 +1265,7 @@ skip_write:;
                         AxHirItem *drop_fn = find_drop_fn_for_type(ctx, elem_ty);
                         if (drop_fn) {
                             AxInterpValue drop_arg = {0};
-                            *(uint8_t**)&drop_arg = host_ptr;
+                            memcpy(&drop_arg, &host_ptr, sizeof(host_ptr));
                             AxInterpValue ret = {0};
                             eval_call(ctx, drop_fn, &drop_arg, 1, (uint8_t*)&ret, sizeof(ret));
                         }

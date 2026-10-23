@@ -6715,6 +6715,10 @@ fn register_item_sig(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *co
             )
         };
         unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }
+        let isym = unsafe { (*it).symbol };
+        if isym.v != 0u32 && (unsafe { (*it).generic_params as usize }) == 0 {
+            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }
+        }
         cx.current_fn = 0 as *const HirItem;
         cx.current_impl = 0 as *const HirItem;
         cx.self_ty.v = 0u32;
@@ -6839,6 +6843,7 @@ pub fn typeck_into(
     };
     type_vars_init(mut_view(cx.type_vars));
 
+    tc_mangle_drop_impls(mut_view(cx), hir_file);
     typeck_pass1a(mut_view(cx), hir_file, thir_ptr);
     typeck_pass1b_and_2(mut_view(cx), hir_file, thir_ptr, sink_ptr, str_ptr, db);
 
@@ -6860,6 +6865,157 @@ pub fn typeck_into(
     }
 }
 
+fn tc_is_drop_trait_name(sv: view<StrView>) -> bool {
+    if (sv.len) < 4 {
+        return false;
+    }
+    let off = sv.len - 4;
+    if off > 0 && (unsafe { *(sv.ptr + off - 1) }) != 46u8 {
+        return false;
+    }
+    let b0 = unsafe { *(sv.ptr + off) };
+    let b1 = unsafe { *(sv.ptr + off + 1) };
+    let b2 = unsafe { *(sv.ptr + off + 2) };
+    let b3 = unsafe { *(sv.ptr + off + 3) };
+    b0 == 68u8 && b1 == 114u8 && b2 == 111u8 && b3 == 112u8
+}
+
+fn tc_write_u32_dec(buf: *mut u8, start: usize, val: u32) -> usize {
+    let mut tmp: [16]u8 = [0u8; 16];
+    let mut dlen: usize = 0;
+    let mut v = val;
+    if v == 0u32 {
+        unsafe { *(buf + start) = 48u8; }
+        return start + 1;
+    }
+    while v > 0u32 {
+        tmp[dlen] = (48u32 + (v % 10u32)) as u8;
+        v = v / 10u32;
+        dlen = dlen + 1;
+    }
+    let mut i: usize = 0;
+    while i < dlen {
+        unsafe { *(buf + start + i) = tmp[dlen - 1 - i]; }
+        i = i + 1;
+    }
+    start + dlen
+}
+
+fn tc_mangle_drop_impls(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>) {
+    if (cx.str_in as usize) == 0 {
+        return;
+    }
+    let mut drop_sym_counter: u32 = 0u32;
+    let mut it: *mut HirItem = hir_file.items;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {
+            let tp: *mut HirType = unsafe { (*it).trait_path };
+            let st: *mut HirType = unsafe { (*it).self_type };
+            if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH {
+                let mut tname = StrView { ptr: 0 as *const u8, len: 0 };
+                if (unsafe { (*tp).path.name.v }) != 0u32 {
+                    tname = unsafe { interner_get(view(*cx.str_in), (*tp).path.name) };
+                } else if (cx.db as usize) != 0 {
+                    tname = unsafe { source_db_span_text(view(*cx.db), (*tp).span) };
+                }
+                if tc_is_drop_trait_name(view(tname)) {
+                    let mut sname = StrView { ptr: 0 as *const u8, len: 0 };
+                    if (unsafe { (*st).path.name.v }) != 0u32 {
+                        sname = unsafe { interner_get(view(*cx.str_in), (*st).path.name) };
+                    } else if (cx.db as usize) != 0 {
+                        let raw_s = unsafe { source_db_span_text(view(*cx.db), (*st).path.span) };
+                        let mut lt: usize = 0;
+                        while (lt) < (raw_s.len) {
+                            if (unsafe { *(raw_s.ptr + lt) }) == 60u8 {
+                                break;
+                            }
+                            lt = lt + 1;
+                        }
+                        sname = StrView { ptr: raw_s.ptr, len: lt };
+                    }
+                    if sname.len > 0 {
+                        let mut m: *mut HirItem = unsafe { (*it).members };
+                        while (m as usize) != 0 {
+                            if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                                let mut mbuf: [256]u8 = [0u8; 256];
+                                let buf_ptr = unsafe { address_of(mbuf[0]) as *mut u8 };
+                                let copy_len: usize = if sname.len > 240 { 240 } else { sname.len };
+                                unsafe {
+                                    ptr_copy_nonoverlapping<u8>(sname.ptr, buf_ptr, copy_len);
+                                    *(buf_ptr + copy_len) = 36u8;
+                                    *(buf_ptr + copy_len + 1) = 100u8;
+                                    *(buf_ptr + copy_len + 2) = 114u8;
+                                    *(buf_ptr + copy_len + 3) = 111u8;
+                                    *(buf_ptr + copy_len + 4) = 112u8;
+                                }
+                                let base_len = copy_len + 5;
+                                let mut new_name = unsafe {
+                                    interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, base_len)
+                                };
+                                let mut disambig: u32 = 1u32;
+                                loop {
+                                    let mut collision = false;
+                                    let mut prev: *mut HirItem = hir_file.items;
+                                    while (prev as usize) != 0 && (prev as usize) != (it as usize) {
+                                        if (unsafe { (*prev).kind }) == HIR_ITEM_IMPL {
+                                            let mut pm: *mut HirItem = unsafe { (*prev).members };
+                                            while (pm as usize) != 0 {
+                                                if (unsafe { (*pm).kind }) == HIR_ITEM_FN &&
+                                                   (unsafe { (*pm).name.v }) == new_name.v {
+                                                    collision = true;
+                                                    break;
+                                                }
+                                                pm = unsafe { (*pm).next };
+                                            }
+                                        }
+                                        if collision {
+                                            break;
+                                        }
+                                        prev = unsafe { (*prev).next };
+                                    }
+                                    if !collision {
+                                        break;
+                                    }
+                                    disambig = disambig + 1u32;
+                                    unsafe { *(buf_ptr + base_len) = 36u8; }
+                                    let dlen = tc_write_u32_dec(buf_ptr, base_len + 1, disambig);
+                                    new_name = unsafe {
+                                        interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, dlen)
+                                    };
+                                }
+                                drop_sym_counter = drop_sym_counter + 1u32;
+                                let new_sym_v = 0x70000000u32 + drop_sym_counter;
+                                let old_name_v = unsafe { (*m).name.v };
+                                let m_body = unsafe { (*m).body };
+                                unsafe {
+                                    (*m).name.v = new_name.v;
+                                    (*m).symbol.v = new_sym_v;
+                                }
+                                let mut top: *mut HirItem = hir_file.items;
+                                while (top as usize) != 0 {
+                                    if (top as usize) != (m as usize) &&
+                                       (unsafe { (*top).kind }) == HIR_ITEM_FN &&
+                                       (unsafe { (*top).body as usize }) == (m_body as usize) &&
+                                       (unsafe { (*top).name.v }) == old_name_v {
+                                        unsafe {
+                                            (*top).name.v = new_name.v;
+                                            (*top).symbol.v = new_sym_v;
+                                        }
+                                        break;
+                                    }
+                                    top = unsafe { (*top).next };
+                                }
+                            }
+                            m = unsafe { (*m).next };
+                        }
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
 fn typeck_pass1a(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>, thir_ptr: *mut Thir) {
     // Pass 1a0: Pre-register Struct and Enum headers so self-referential and mutually-recursive types resolve.
     let mut top_it: *mut HirItem = hir_file.items;
@@ -6871,6 +7027,10 @@ fn typeck_pass1a(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>, thir_ptr: *mu
             let is_rc = item_has_repr_c(view(*cx), top_it);
             let st_id = unsafe { intern_struct_ty(mut_view((*thir_ptr).interner), is_rc, top_it, 0 as *mut TypeId, 0, args, arg_cnt) };
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }
+            let s_sym = unsafe { (*top_it).symbol };
+            if s_sym.v != 0u32 && arg_cnt == 0 {
+                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }
+            }
         } else if tk == HIR_ITEM_ENUM {
             let mut arg_cnt: usize = 0;
             let args = build_item_generic_param_args(mut_view(*cx), top_it, mut_view(arg_cnt));
@@ -6892,6 +7052,10 @@ fn typeck_pass1a(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>, thir_ptr: *mu
                 )
             };
             unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }
+            let e_sym = unsafe { (*top_it).symbol };
+            if e_sym.v != 0u32 && arg_cnt == 0 {
+                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }
+            }
         }
         top_it = unsafe { (*top_it).next };
     }
@@ -7071,6 +7235,38 @@ fn typeck_pass1b_and_2(
             while ((m as usize) != 0) {
                 register_item_sig(mut_view(*cx), m, top_it);
                 m = unsafe { (*m).next };
+            }
+            let tp_node: *mut HirType = unsafe { (*top_it).trait_path };
+            if (tp_node as usize) != 0 && impl_self_ty.v != 0u32 {
+                let mut tname = StrView { ptr: 0 as *const u8, len: 0 };
+                if (cx.str_in as usize) != 0 && (unsafe { (*tp_node).path.name.v }) != 0u32 {
+                    tname = unsafe { interner_get(view(*cx.str_in), (*tp_node).path.name) };
+                } else if (cx.db as usize) != 0 {
+                    tname = unsafe { source_db_span_text(view(*cx.db), (*tp_node).span) };
+                }
+                if tc_is_drop_trait_name(view(tname)) {
+                    let self_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: impl_self_ty.v })) };
+                    if (self_t as usize) != 0 && (unsafe { (*self_t).kind }) == TY_STRUCT {
+                        let mut dm: *mut HirItem = unsafe { (*top_it).members };
+                        while (dm as usize) != 0 {
+                            if (unsafe { (*dm).kind }) == HIR_ITEM_FN {
+                                let tk_key = ((impl_self_ty.v as usize) << 1) | 1;
+                                unsafe {
+                                    ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), tk_key, dm);
+                                }
+                                let def_ptr = unsafe { (*self_t).def };
+                                if (def_ptr as usize) != 0 {
+                                    let dk_key = (def_ptr as usize) | 1;
+                                    unsafe {
+                                        ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), dk_key, dm);
+                                    }
+                                }
+                                break;
+                            }
+                            dm = unsafe { (*dm).next };
+                        }
+                    }
+                }
             }
         } else if tk == HIR_ITEM_TRAIT {
             let mut m: *mut HirItem = unsafe { (*top_it).members };

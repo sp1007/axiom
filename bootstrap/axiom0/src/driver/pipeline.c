@@ -444,9 +444,6 @@ static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
         AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, it);
-            if (st->sink.errors == 0 && ax_opt_O1) {
-                ax_opt_run(body, &st->thir, &st->sink, it, ax_opt_verify_each);
-            }
             AxMirMap_insert(&g_mir_map, it, body);
         }
     }
@@ -573,6 +570,12 @@ static void stage_own(AxDriverState *st) {
             ax_verify_mir_own(body, &st->thir, &st->sink, it);
         }
         ax_mir_drop_elaborate(body, &st->thir, &st->hir, &st->db, &st->sink, &st->interner);
+        /* T141: -O1 runs on drop-elaborated MIR (as in the port, compiler/driver/pipeline.ax), so an
+         * optimisation can never remove or reorder a drop (SPEC-03 AXS-SEM-003) and both compilers
+         * optimise the same MIR (ADR-0034 §2 parity). */
+        if (st->sink.errors == 0 && ax_opt_O1) {
+            ax_opt_run(body, &st->thir, &st->sink, it, ax_opt_verify_each);
+        }
     }
 }
 

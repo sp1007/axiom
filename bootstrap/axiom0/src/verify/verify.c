@@ -1,4 +1,5 @@
 #include "verify/verify.h"
+#include "mir/drop/drop.h"
 #include "hir/hir.h"
 #include "types/types.h"
 #include <string.h>
@@ -422,45 +423,6 @@ static uint8_t merge_st(uint8_t a, uint8_t b) {
     return a | b;
 }
 
-static bool ax_type_needs_drop(const AxThir *thir, TypeId ty, const AxHirItem *func) {
-    if (ty.v == 0) return false;
-    // HACK for MIR tests: in MIR tests (func == NULL), type#10 is used to simulate a drop type
-    if (func == NULL && ty.v == 10) return true;
-
-    const AxType *t = ax_type_get(&thir->interner, ty);
-    if (!t) return false;
-    // if (t->kind == AX_TY_BUILTIN_DROP) return true;
-    if (t->kind == AX_TY_STRUCT) {
-        for (size_t i = 0; i < t->strct.field_count; i++) {
-            if (ax_type_needs_drop(thir, t->strct.fields[i], func)) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_TUPLE) {
-        for (size_t i = 0; i < t->tuple.field_count; i++) {
-            if (ax_type_needs_drop(thir, t->tuple.fields[i], func)) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_ENUM) {
-        for (size_t v = 0; v < t->enm.variant_count; v++) {
-            for (size_t i = 0; i < t->enm.variant_field_counts[v]; i++) {
-                if (ax_type_needs_drop(thir, t->enm.variant_fields[v][i], func)) return true;
-            }
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_CLOSURE) {
-        for (size_t i = 0; i < t->closure.capture_count; i++) {
-            if (t->closure.captures[i].mode == AX_CAP_MOVE) {
-                if (ax_type_needs_drop(thir, t->closure.captures[i].type, func)) return true;
-            }
-        }
-        return false;
-    }
-    return false;
-}
-
 void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *sink, const AxHirItem *func) {
     size_t lc = body->local_count;
     uint8_t *bb_in = malloc(body->bb_count * lc);
@@ -602,7 +564,7 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                 }
                 uint32_t dst_loc = stmt->assign.place.local.v;
                 if (dst_loc < lc) {
-                    if (ax_type_needs_drop(thir, body->locals[dst_loc].ty, func) && (cur[dst_loc] & ST_OWNED)) {
+                    if (func == NULL && (body->locals[dst_loc].ty.v == 10 || ax_type_needs_drop(body->locals[dst_loc].ty, thir, NULL, NULL, NULL)) && (cur[dst_loc] & ST_OWNED)) {
                         report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
                     }
                     cur[dst_loc] = ST_OWNED;
@@ -630,7 +592,7 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
             case AX_MIR_TERM_DROP:
                 if (term->drop.place.local.v < lc) {
                     uint32_t loc = term->drop.place.local.v;
-                    if (cur[loc] & ST_MOVED) report_verify_error(sink, func, AX_VERIFY_DOUBLE_DROP);
+                    if ((func == NULL || term->drop.is_explicit) && (cur[loc] & ST_MOVED)) report_verify_error(sink, func, AX_VERIFY_DOUBLE_DROP);
                     cur[loc] = ST_MOVED;
                 }
                 break;
@@ -656,7 +618,7 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                 }
                 if (term->call.destination.local.v < lc) {
                     uint32_t dst_loc = term->call.destination.local.v;
-                    if (ax_type_needs_drop(thir, body->locals[dst_loc].ty, func) && (cur[dst_loc] & ST_OWNED)) {
+                    if (func == NULL && (body->locals[dst_loc].ty.v == 10 || ax_type_needs_drop(body->locals[dst_loc].ty, thir, NULL, NULL, NULL)) && (cur[dst_loc] & ST_OWNED)) {
                         report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
                     }
                     cur[dst_loc] = ST_OWNED;
@@ -677,7 +639,7 @@ void ax_verify_mir_own(const AxMirBody *body, const AxThir *thir, AxDiagSink *si
                     if (cur[0] & ST_MOVED) report_verify_error(sink, func, AX_VERIFY_USE_AFTER_MOVE);
                 }
                 for (size_t l = 1; l < lc; l++) {
-                    if (ax_type_needs_drop(thir, body->locals[l].ty, func) && 
+                    if (func == NULL && (body->locals[l].ty.v == 10 || ax_type_needs_drop(body->locals[l].ty, thir, NULL, NULL, NULL)) && 
                         (cur[l] & ST_OWNED)) {
                         report_verify_error(sink, func, AX_VERIFY_MISSING_DROP);
                     }

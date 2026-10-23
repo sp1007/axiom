@@ -23,6 +23,8 @@ use compiler.kernel.id.FileId
 use compiler.kernel.id.StrId
 use compiler.kernel.id.SymbolId
 use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.interner_new
 use compiler.kernel.interner.StrView
 use compiler.source.span.Span
 use compiler.diag.code.DiagCode
@@ -45,6 +47,7 @@ use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagSink
 use compiler.diag.emitter.diag_sink_report
 use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirParam
 use compiler.types.types.AxType
@@ -163,6 +166,7 @@ use compiler.mir.mir.mir_mul_usize
 use compiler.mir.mir.mir_op_at
 use compiler.mir.mir.mir_operand_zero
 use compiler.mir.mir.mir_place_reset_u32
+use compiler.mir.drop.mir_type_needs_drop
 use compiler.mir.mir.mir_proj_at
 use compiler.mir.mir.mir_rvalue_reset
 use compiler.mir.mir.mir_stmt_at
@@ -1555,75 +1559,6 @@ fn verify_merge_st(a: u8, b: u8) -> u8 {
     a | b
 }
 
-pub fn verify_type_needs_drop(ty: TypeId, thir: *const Thir, func: *const HirItem) -> bool {
-    if ty.v == 0u32 {
-        return false;
-    }
-    if (func as usize) == 0 && ty.v == 10u32 {
-        return true;
-    }
-    if (thir as usize) == 0 {
-        return false;
-    }
-    let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty.v });
-    if (t as usize) == 0 {
-        return false;
-    }
-    let tk = unsafe { (*t).kind };
-    if tk == TY_STRUCT || tk == TY_TUPLE {
-        let fc = unsafe { (*t).field_count };
-        let flds = unsafe { (*t).fields };
-        let mut i: usize = 0;
-        while i < fc {
-            let fty = TypeId { v: unsafe { (*typeid_at(flds, i)).v } };
-            if verify_type_needs_drop(fty, thir, func) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-    if tk == TY_ENUM {
-        let v_fields = unsafe { (*t).variant_fields };
-        let v_counts = unsafe { (*t).variant_field_counts };
-        let v_cnt = unsafe { (*t).variant_count };
-        if (v_fields as usize) != 0 && (v_counts as usize) != 0 {
-            let mut v: usize = 0;
-            while v < v_cnt {
-                let fc = unsafe { *usize_at(v_counts, v) };
-                let vf = unsafe { *typeid_ptr_at(v_fields, v) };
-                let mut i: usize = 0;
-                while i < fc {
-                    let fty = TypeId { v: unsafe { (*typeid_at(vf, i)).v } };
-                    if verify_type_needs_drop(fty, thir, func) {
-                        return true;
-                    }
-                    i = i + 1;
-                }
-                v = v + 1;
-            }
-        }
-        return false;
-    }
-    if tk == TY_CLOSURE {
-        let cap_cnt = unsafe { (*t).capture_count };
-        let caps = unsafe { (*t).captures };
-        let mut i: usize = 0;
-        while i < cap_cnt {
-            let cap = unsafe { capture_at(caps, i) };
-            if (unsafe { (*cap).mode }) == CAP_MOVE {
-                let cty = TypeId { v: unsafe { (*cap).ty.v } };
-                if verify_type_needs_drop(cty, thir, func) {
-                    return true;
-                }
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-    false
-}
-
 fn verify_bb_is_pred(pbb: *const MirBb, target_idx: usize) -> bool {
     let has_term = unsafe { (*pbb).has_terminator };
     let tk = unsafe { (*pbb).terminator.kind };
@@ -1833,6 +1768,18 @@ fn verify_mir_own_fixpoint(
     }
 }
 
+fn verify_type_needs_drop_from_thir(thir: *const Thir, ty: TypeId) -> bool {
+    if (thir as usize) == 0 {
+        return false;
+    }
+    // No HIR or string interner is available here: pass real empty ones (never a view of a null
+    // pointer, which the oracle rejects as a null dereference). With no HIR items the `impl Drop`
+    // lookup falls back to the THIR method map only (C: `ax_type_needs_drop(.., NULL, NULL, NULL)`).
+    let empty_hir = HirFile { items: 0 as *mut HirItem };
+    let empty_str = interner_new();
+    unsafe { mir_type_needs_drop(ty, view(*thir), view(empty_hir), view(empty_str)) }
+}
+
 fn verify_mir_own_check_stmt(
     body: view<MirBody>,
     thir: *const Thir,
@@ -1868,7 +1815,9 @@ fn verify_mir_own_check_stmt(
         if dst_loc < lc && dst_pc == 0 {
             let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
             let dst_st = unsafe { *(cur + dst_loc) };
-            if verify_type_needs_drop(dst_ty, thir, func) && (dst_st & VERIFY_ST_OWNED) != 0u8 {
+            let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
+                verify_type_needs_drop_from_thir(thir, dst_ty));
+            if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(stmt.span), 45);
             }
             unsafe {
@@ -1948,7 +1897,9 @@ fn verify_mir_own_check_call_term(
     if dst_loc < lc && dst_pc == 0 {
         let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
         let dst_st = unsafe { *(cur + dst_loc) };
-        if verify_type_needs_drop(dst_ty, thir, func) && (dst_st & VERIFY_ST_OWNED) != 0u8 {
+        let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
+            verify_type_needs_drop_from_thir(thir, dst_ty));
+        if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
             verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, t_span, 53);
         }
         unsafe {
@@ -1990,7 +1941,7 @@ fn verify_mir_own_check_term(
         let pc = bb.terminator.drop_place.proj_count;
         if loc < lc && pc == 0 {
             let st = unsafe { *(cur + loc) };
-            if (st & VERIFY_ST_MOVED) != 0u8 {
+            if ((func as usize) == 0 || bb.terminator.drop_is_explicit) && (st & VERIFY_ST_MOVED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(t_span), 46);
             }
             unsafe {
@@ -2026,7 +1977,9 @@ fn verify_mir_own_check_term(
         while l < lc {
             let lty = TypeId { v: unsafe { (*mir_local_at(body.locals, l)).ty.v } };
             let lst = unsafe { *(cur + l) };
-            if verify_type_needs_drop(lty, thir, func) && (lst & VERIFY_ST_OWNED) != 0u8 {
+            let l_nd = (func as usize) == 0 && (lty.v == 10u32 ||
+                verify_type_needs_drop_from_thir(thir, lty));
+            if l_nd && (lst & VERIFY_ST_OWNED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(t_span), 58);
             }
             l = l + 1;
@@ -2384,7 +2337,9 @@ pub fn verify_mir_drop_flags(
             let dr_loc = (unsafe { (*bb).terminator.drop_place.local.v }) as usize;
             if dr_loc < lc {
                 let dr_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dr_loc)).ty.v } };
-                if verify_type_needs_drop(dr_ty, thir, func) {
+                let dr_nd = ((func as usize) == 0 && dr_ty.v == 10u32) ||
+                    verify_type_needs_drop_from_thir(thir, dr_ty);
+                if dr_nd {
                     verify_emit_diag(
                         mut_view(*sink),
                         AX_VERIFY_MISSING_DROP,

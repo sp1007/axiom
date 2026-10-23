@@ -1448,7 +1448,83 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
     cx.next_closure_id = 1;
     cx.evaluator = evaluator;
 
+    // ADR-0034 §6: Rewrite Drop::drop mangled names to `<Type>$drop` (with collision suffix if
+    // multiple modules define a same-named struct with Drop) and assign a non-colliding synthetic
+    // AxSymbolId so free functions named `<Type>_drop` and cross-module `impl Drop` never collide.
+    uint32_t drop_sym_counter = 0;
+    for (AxHirItem *it = (AxHirItem *)hir->items; it; it = it->next) {
+        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type &&
+            it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
+            StrView tr_sv = {0};
+            if (it->impl.trait_path->path.path.name.v != 0) {
+                tr_sv = ax_interner_get(str_in, it->impl.trait_path->path.path.name);
+            } else if (db && it->impl.trait_path->span.file.v != 0) {
+                tr_sv = ax_source_db_span_text(db, it->impl.trait_path->span);
+            }
+            bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
+                              (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
+            if (!is_drop_tr) continue;
 
+            StrView self_sv = {0};
+            if (it->impl.self_type->path.path.name.v != 0) {
+                self_sv = ax_interner_get(str_in, it->impl.self_type->path.path.name);
+            } else if (db && it->impl.self_type->path.path.span.file.v != 0) {
+                self_sv = ax_source_db_span_text(db, it->impl.self_type->path.path.span);
+                size_t lt = 0;
+                while (lt < self_sv.len && self_sv.ptr[lt] != '<') lt++;
+                self_sv.len = lt;
+            }
+            if (self_sv.len == 0) continue;
+
+            for (AxHirItem *m = it->impl.members; m; m = m->next) {
+                if (m->kind != AX_HIR_ITEM_FN) continue;
+                if (m->fn.symbol.v >= 0x70000000u && m->fn.symbol.v < 0x7FFFFFFFu) continue;
+                AxHirItem *copy = NULL;
+                for (AxHirItem *top = (AxHirItem *)hir->items; top; top = top->next) {
+                    if (top->kind == AX_HIR_ITEM_FN && top != m &&
+                        top->fn.body == m->fn.body &&
+                        top->span.start == m->span.start &&
+                        top->span.file.v == m->span.file.v) {
+                        copy = top;
+                        break;
+                    }
+                }
+                if (!copy) continue;
+
+                char mangled_buf[256];
+                uint32_t suffix_idx = 1;
+                StrId new_name = {0};
+                for (;;) {
+                    if (suffix_idx == 1) {
+                        snprintf(mangled_buf, sizeof(mangled_buf), "%.*s$drop", (int)self_sv.len, self_sv.ptr);
+                    } else {
+                        snprintf(mangled_buf, sizeof(mangled_buf), "%.*s$drop$%u", (int)self_sv.len, self_sv.ptr, suffix_idx);
+                    }
+                    new_name = ax_intern_cstr(str_in, mangled_buf);
+                    bool taken = false;
+                    for (const AxHirItem *prev = hir->items; prev && prev != it; prev = prev->next) {
+                        if (prev->kind == AX_HIR_ITEM_IMPL) {
+                            for (const AxHirItem *pm = prev->impl.members; pm; pm = pm->next) {
+                                if (pm->kind == AX_HIR_ITEM_FN && pm->fn.name.v == new_name.v) {
+                                    taken = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (taken) break;
+                    }
+                    if (!taken) break;
+                    suffix_idx++;
+                }
+
+                AxSymbolId new_sym = { 0x70000000u + (++drop_sym_counter) };
+                m->fn.name = new_name;
+                m->fn.symbol = new_sym;
+                copy->fn.name = new_name;
+                copy->fn.symbol = new_sym;
+            }
+        }
+    }
 
     // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
@@ -1653,6 +1729,32 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
             } else {
                 cx.self_ty = TypeId_none();
             }
+            if (top_it->impl.trait_path && !TypeId_is_none(cx.self_ty) && cx.self_ty.v != 0) {
+                StrView tr_sv = {0};
+                if (top_it->impl.trait_path->path.path.name.v != 0) {
+                    tr_sv = ax_interner_get(str_in, top_it->impl.trait_path->path.path.name);
+                } else if (db && top_it->impl.trait_path->span.file.v != 0) {
+                    tr_sv = ax_source_db_span_text(db, top_it->impl.trait_path->span);
+                }
+                bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
+                                  (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
+                if (is_drop_tr) {
+                    const AxType *self_t = ax_type_get(&thir.interner, cx.self_ty);
+                    if (self_t && self_t->kind == AX_TY_STRUCT) {
+                        for (const AxHirItem *m = top_it->impl.members; m; m = m->next) {
+                            if (m->kind == AX_HIR_ITEM_FN) {
+                                const AxHirExpr *key_ty = (const AxHirExpr *)(((uintptr_t)cx.self_ty.v << 1) | (uintptr_t)1);
+                                AxExprMethodMap_insert(&thir.expr_methods, key_ty, m);
+                                if (self_t->strct.def != NULL) {
+                                    const AxHirExpr *key_def = (const AxHirExpr *)(((uintptr_t)self_t->strct.def) | (uintptr_t)1);
+                                    AxExprMethodMap_insert(&thir.expr_methods, key_def, m);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
         } else if (top_it->kind == AX_HIR_ITEM_FN && top_it->fn.symbol.v != 0) {
             cx.current_impl = NULL;
             const AxHirItem *orig_m = NULL;
@@ -1770,6 +1872,32 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
                 cx.self_ty = hir_type_to_typeid(&cx, top_it->impl.self_type);
             } else {
                 cx.self_ty = TypeId_none();
+            }
+            if (top_it->impl.trait_path && !TypeId_is_none(cx.self_ty) && cx.self_ty.v != 0) {
+                StrView tr_sv = {0};
+                if (top_it->impl.trait_path->path.path.name.v != 0) {
+                    tr_sv = ax_interner_get(str_in, top_it->impl.trait_path->path.path.name);
+                } else if (db && top_it->impl.trait_path->span.file.v != 0) {
+                    tr_sv = ax_source_db_span_text(db, top_it->impl.trait_path->span);
+                }
+                bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
+                                  (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
+                if (is_drop_tr) {
+                    const AxType *self_t = ax_type_get(&thir.interner, cx.self_ty);
+                    if (self_t && self_t->kind == AX_TY_STRUCT) {
+                        for (const AxHirItem *m = top_it->impl.members; m; m = m->next) {
+                            if (m->kind == AX_HIR_ITEM_FN) {
+                                const AxHirExpr *key_ty = (const AxHirExpr *)(((uintptr_t)cx.self_ty.v << 1) | (uintptr_t)1);
+                                AxExprMethodMap_insert(&thir.expr_methods, key_ty, m);
+                                if (self_t->strct.def != NULL) {
+                                    const AxHirExpr *key_def = (const AxHirExpr *)(((uintptr_t)self_t->strct.def) | (uintptr_t)1);
+                                    AxExprMethodMap_insert(&thir.expr_methods, key_def, m);
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         } else if (top_it->kind == AX_HIR_ITEM_FN && top_it->fn.symbol.v != 0) {
             cx.current_impl = NULL;

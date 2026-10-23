@@ -1,5 +1,6 @@
 #include "lir/lir.h"
 #include "mir/build/intrinsics.h"
+#include "mir/drop/drop.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -194,88 +195,19 @@ static void finish_bb(LirBuilder *b, size_t bb_idx, AxLirTerminator term) {
     b->cur_inst_count = 0;
 }
 
-static bool lir_type_needs_drop(const LirBuilder *b, TypeId ty_id) {
-    if (TypeId_is_none(ty_id) || ty_id.v == 0) return false;
-    const AxType *t = ax_type_get(b->interner, ty_id);
-    if (!t) return false;
-
-    if (t->kind == AX_TY_STRUCT) {
-        if (t->strct.def && t->strct.def->struct_decl.struct_fields == NULL) return true;
-        if (b->hir && t->strct.def && t->strct.def->struct_decl.name.v != 0 && b->str_in) {
-            StrView target_sname = ax_interner_get(b->str_in, t->strct.def->struct_decl.name);
-            for (const struct AxHirItem *it = b->hir->items; it; it = it->next) {
-                if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                    StrView trait_sname = {0};
-                    if (it->impl.trait_path->path.path.name.v != 0) {
-                        trait_sname = ax_interner_get(b->str_in, it->impl.trait_path->path.path.name);
-                    }
-                    if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
-                        StrView impl_sname = {0};
-                        if (it->impl.self_type->path.path.name.v != 0) {
-                            impl_sname = ax_interner_get(b->str_in, it->impl.self_type->path.path.name);
-                        }
-                        if (ax_sv_eq(target_sname, impl_sname)) {
-                            for (const struct AxHirItem *m = it->impl.members; m; m = m->next) {
-                                if (m->kind == AX_HIR_ITEM_FN) {
-                                    return true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        for (size_t i = 0; i < t->strct.field_count; i++) {
-            if (lir_type_needs_drop(b, t->strct.fields[i])) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_TUPLE) {
-        for (size_t i = 0; i < t->tuple.field_count; i++) {
-            if (lir_type_needs_drop(b, t->tuple.fields[i])) return true;
-        }
-        return false;
-    }
-    if (t->kind == AX_TY_ARRAY) {
-        return lir_type_needs_drop(b, t->array.elem);
-    }
-    return false;
-}
-
 static const char *find_drop_fn_sym_name(const struct AxHir *hir, struct StrInterner *str_in, TypeId ty_id, const TypeInterner *interner) {
-    if (TypeId_is_none(ty_id) || ty_id.v == 0) return NULL;
-    const AxType *ty = ax_type_get(interner, ty_id);
-    if (!ty || ty->kind != AX_TY_STRUCT) return NULL;
-    StrView target_sname = ax_interner_get(str_in, ty->strct.def->struct_decl.name);
-    for (const struct AxHirItem *it = hir ? hir->items : NULL; it; it = it->next) {
-        if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-            StrView trait_sname = {0};
-            if (it->impl.trait_path->path.path.name.v != 0) {
-                trait_sname = ax_interner_get(str_in, it->impl.trait_path->path.path.name);
-            }
-            if (trait_sname.len == 4 && memcmp(trait_sname.ptr, "Drop", 4) == 0) {
-                StrView impl_sname = {0};
-                if (it->impl.self_type->path.path.name.v != 0) {
-                    impl_sname = ax_interner_get(str_in, it->impl.self_type->path.path.name);
-                }
-                if (ax_sv_eq(target_sname, impl_sname)) {
-                    for (const struct AxHirItem *m = it->impl.members; m; m = m->next) {
-                        if (m->kind == AX_HIR_ITEM_FN) {
-                            if (m->fn.name.v != 0) {
-                                StrView sv = ax_interner_get(str_in, m->fn.name);
-                                char *name = malloc(sv.len + 1);
-                                memcpy(name, sv.ptr, sv.len);
-                                name[sv.len] = '\0';
-                                return name;
-                            }
-                            return get_fn_sym_name(hir, str_in, m->fn.symbol.v);
-                        }
-                    }
-                }
-            }
-        }
+    if (!interner || TypeId_is_none(ty_id) || ty_id.v == 0) return NULL;
+    AxThir tmp_thir = { .interner = *interner };
+    const AxHirItem *m = ax_find_drop_impl_fn(ty_id, &tmp_thir, str_in, hir, NULL);
+    if (!m) return NULL;
+    if (m->fn.name.v != 0 && str_in) {
+        StrView sv = ax_interner_get(str_in, m->fn.name);
+        char *name = malloc(sv.len + 1);
+        memcpy(name, sv.ptr, sv.len);
+        name[sv.len] = '\0';
+        return name;
     }
-    return NULL;
+    return get_fn_sym_name(hir, str_in, m->fn.symbol.v);
 }
 
 
@@ -352,6 +284,9 @@ static TypeId get_place_type(const LirBuilder *b, const AxMirPlace *place) {
                 } else if (t && (t->kind == AX_TY_STRUCT || t->kind == AX_TY_TUPLE)) {
                     if (t->kind == AX_TY_STRUCT && idx < t->strct.field_count) ty = t->strct.fields[idx];
                     else if (t->kind == AX_TY_TUPLE && idx < t->tuple.field_count) ty = t->tuple.fields[idx];
+                } else if (t && t->kind == AX_TY_CLOSURE) {
+                    if (idx == 0) ty = b->interner->t_usize;
+                    else if (idx - 1 < t->closure.capture_count) ty = t->closure.captures[idx - 1].type;
                 }
                 break;
             }
@@ -425,6 +360,10 @@ static AxLirVRegId lower_place_addr(LirBuilder *b, const AxMirPlace *place, Type
                     offset = ax_type_field_offset(ty, idx, b->interner);
                     if (t->kind == AX_TY_STRUCT && idx < t->strct.field_count) next_ty = t->strct.fields[idx];
                     else if (t->kind == AX_TY_TUPLE && idx < t->tuple.field_count) next_ty = t->tuple.fields[idx];
+                } else if (t && t->kind == AX_TY_CLOSURE) {
+                    offset = ax_type_field_offset(ty, idx, b->interner);
+                    if (idx == 0) next_ty = b->interner->t_usize;
+                    else if (idx - 1 < t->closure.capture_count) next_ty = t->closure.captures[idx - 1].type;
                 }
                 
                 ty = next_ty;
@@ -920,7 +859,8 @@ AxLirBody *ax_lir_lower(const AxMirBody *mir, const struct AxHir *hir, TypeInter
                 }
                 if (cty && cty->kind == AX_TY_BUILTIN_NEEDS_DROP) {
                     TypeId elem_ty = { (uint32_t)mbb->terminator.call.func.constant.val };
-                    bool nd = lir_type_needs_drop(&b, elem_ty);
+                    AxThir tmp_thir = { .interner = *b.interner };
+                    bool nd = ax_type_needs_drop(elem_ty, &tmp_thir, b.str_in, b.hir, NULL);
                     AxLirVRegId val = emit_const(&b, nd ? 1 : 0, b.interner->t_bool);
                     AxLirVRegId dst_addr = lower_place_addr(&b, &mbb->terminator.call.destination, NULL);
                     emit_store(&b, dst_addr, val);

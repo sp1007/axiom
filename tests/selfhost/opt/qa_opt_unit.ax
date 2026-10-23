@@ -10113,6 +10113,33 @@ fn mp_parse_operand(
 }
 
 fn mp_try_parse_binop(p: mut_view<MirParser>) -> u8 {
+    mp_skip_ws(mut_view(*p));
+    if (p.pos + 12) <= p.len &&
+       (unsafe { *(p.src + p.pos + 0) }) == 119u8 &&
+       (unsafe { *(p.src + p.pos + 1) }) == 114u8 &&
+       (unsafe { *(p.src + p.pos + 2) }) == 97u8 &&
+       (unsafe { *(p.src + p.pos + 3) }) == 112u8 &&
+       (unsafe { *(p.src + p.pos + 4) }) == 112u8 &&
+       (unsafe { *(p.src + p.pos + 5) }) == 105u8 &&
+       (unsafe { *(p.src + p.pos + 6) }) == 110u8 &&
+       (unsafe { *(p.src + p.pos + 7) }) == 103u8 &&
+       (unsafe { *(p.src + p.pos + 8) }) == 95u8 {
+        let b9 = unsafe { *(p.src + p.pos + 9) };
+        let b10 = unsafe { *(p.src + p.pos + 10) };
+        let b11 = unsafe { *(p.src + p.pos + 11) };
+        if b9 == 97u8 && b10 == 100u8 && b11 == 100u8 {
+            p.pos = p.pos + 12;
+            return MIR_BINOP_ADD;
+        }
+        if b9 == 115u8 && b10 == 117u8 && b11 == 98u8 {
+            p.pos = p.pos + 12;
+            return MIR_BINOP_SUB;
+        }
+        if b9 == 109u8 && b10 == 117u8 && b11 == 108u8 {
+            p.pos = p.pos + 12;
+            return MIR_BINOP_MUL;
+        }
+    }
     if mp_match_bytes(mut_view(*p), 59, 6) { return MIR_BINOP_OFFSET; }
     else if mp_match_bytes(mut_view(*p), 47, 2) { return MIR_BINOP_SHL; }
     else if mp_match_bytes(mut_view(*p), 49, 2) { return MIR_BINOP_SHR; }
@@ -11101,6 +11128,1329 @@ pub fn mir_parse(text: StrView, interner: mut_view<TypeInterner>, arena: mut_vie
     body
 }
 
+// Axiom Compiler — MIR Drop Elaboration (compiler/mir/drop.ax)
+// Port of bootstrap/axiom0/src/mir/drop/drop.h and drop.c.
+//
+// Drop elaboration runs after ownership checking. It
+//   1. gives every local (except the return slot) whose type needs drop a boolean drop flag,
+//      initialised at the top of bb0 (true for arguments, false otherwise);
+//   2. arms the flag after every assignment to the local and in the return block of every call
+//      that writes it, and clears it in front of every statement or terminator that moves or
+//      copies the local out;
+//   3. rewrites every `drop(place)` terminator into explicit cleanup blocks: a flag test (for
+//      flagged locals), the user `Drop.drop` call for structs that implement it, and field-wise
+//      drops of compound structs, tuples, closure environments and enum variants (through a
+//      discriminant switch). The new field drops are expanded in later passes until no `drop`
+//      terminator whose type is known remains.
+//
+// Every block, local and statement is created in the same order as the C implementation, so the
+// elaborated body prints byte-identically with `ax_mir_print` (differential harness:
+// tests/selfhost/drop). Behaviour kept from the C implementation on purpose (reported in
+// _workspaces/reports/T082d-report.md):
+//   - the destructor argument is built with a shared borrow `&place` although its local has type
+//     `mut_view<T>`;
+//   - copies clear a drop flag exactly like moves;
+//   - field drop blocks inherit no flag, their unwind edge is bb0 and they are not cleanup blocks;
+//   - a struct declared without named fields (unit, empty `{}` or tuple struct) is treated as
+//     owning a resource, so it always needs drop;
+//   - `impl Drop for T` is matched on the trait and self type names (source text when a source
+//     database is given, interned names otherwise) and its first fn member is the destructor.
+module compiler.mir.drop
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.kernel.interner.interner_get
+use compiler.source.span.Span
+use compiler.source.manager.SourceDatabase
+use compiler.source.manager.source_db_span_text
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirType
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.types.types.AxType
+use compiler.types.types.Thir
+use compiler.types.types.CAP_MOVE
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.capture_at
+use compiler.types.types.intern_fn_ty
+use compiler.types.types.intern_view_ty
+use compiler.types.types.ptr_itemmap_get
+use compiler.types.types.thir_get_item_type
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.types.u32_at
+use compiler.types.types.usize_at
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MIR_BORROW_SHARED
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_TEMP
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_DOWNCAST
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.mir_add_bb
+use compiler.mir.mir.mir_add_local
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_id_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_mul_usize
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_operand_zero
+use compiler.mir.mir.mir_place_append_proj
+use compiler.mir.mir.mir_place_reset_u32
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_proj_reset
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_zero
+use compiler.mir.mir.mir_term_zero
+use compiler.mir.mir.mir_u64_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// The name of the destructor trait, compared byte-wise with the trait path of every impl.
+const DROP_TRAIT_NAME: [4]u8 = [68u8, 114u8, 111u8, 112u8];
+
+// =================================================================================================
+// String helpers
+// =================================================================================================
+
+fn drop_sv_eq(a: view<StrView>, b: view<StrView>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let byte_a = unsafe { *(a.ptr + i) };
+        let byte_b = unsafe { *(b.ptr + i) };
+        if byte_a != byte_b {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn drop_sv_is_drop_trait(sv: view<StrView>) -> bool {
+    let slen = sv.len;
+    if slen < 4 {
+        return false;
+    }
+    let off = sv.len - 4;
+    if off > 0 && (unsafe { *(sv.ptr + off - 1) }) != 46u8 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < 4 {
+        let byte = unsafe { *(sv.ptr + off + i) };
+        if byte != DROP_TRAIT_NAME[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Cuts a type path text at its first `<` (`Wrap<T>` -> `Wrap`).
+fn drop_sv_before_generics(sv: StrView) -> StrView {
+    let mut less_idx: usize = 0;
+    while less_idx < sv.len {
+        let byte = unsafe { *(sv.ptr + less_idx) };
+        if byte == 60u8 {
+            break;
+        }
+        less_idx = less_idx + 1;
+    }
+    StrView { ptr: sv.ptr, len: less_idx }
+}
+
+// =================================================================================================
+// User destructors (`impl Drop for T`)
+// =================================================================================================
+
+// The trait name of an impl: its source text when a source database is available, otherwise the
+// interned path name (C: `ax_source_db_span_text` / `ax_interner_get`).
+fn drop_impl_trait_name(
+    it: *const HirItem,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> StrView {
+    let trait_path: *mut HirType = unsafe { (*it).trait_path };
+    if (db as usize) != 0 {
+        let trait_span = unsafe { (*trait_path).span };
+        return unsafe { source_db_span_text(view(*db), trait_span) };
+    }
+    let str_ptr = unsafe { address_of(str_in.bytes.head) as usize };
+    let trait_name_v = unsafe { (*trait_path).path.name.v };
+    if trait_name_v != 0u32 && str_ptr != 0 {
+        return interner_get(str_in, StrId { v: trait_name_v });
+    }
+    StrView { ptr: 0 as *const u8, len: 0 }
+}
+
+// The self type name of an impl, without generic arguments when read from source text.
+fn drop_impl_self_name(
+    it: *const HirItem,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> StrView {
+    let self_type: *mut HirType = unsafe { (*it).self_type };
+    if (db as usize) != 0 {
+        let self_span = unsafe { (*self_type).path.span };
+        let text = unsafe { source_db_span_text(view(*db), self_span) };
+        return drop_sv_before_generics(text);
+    }
+    let str_ptr = unsafe { address_of(str_in.bytes.head) as usize };
+    let self_name_v = unsafe { (*self_type).path.name.v };
+    if self_name_v != 0u32 && str_ptr != 0 {
+        return interner_get(str_in, StrId { v: self_name_v });
+    }
+    StrView { ptr: 0 as *const u8, len: 0 }
+}
+
+// True when `it` is `impl Drop for <def>` with a path self type.
+fn drop_impl_is_drop_for(
+    it: *const HirItem,
+    def: *const HirItem,
+    target_name: view<StrView>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> bool {
+    let kind = unsafe { (*it).kind };
+    if kind != HIR_ITEM_IMPL {
+        return false;
+    }
+    let trait_path: *mut HirType = unsafe { (*it).trait_path };
+    let self_type: *mut HirType = unsafe { (*it).self_type };
+    if (trait_path as usize) == 0 || (self_type as usize) == 0 {
+        return false;
+    }
+    let self_kind = unsafe { (*self_type).kind };
+    if self_kind != HIR_TYPE_PATH {
+        return false;
+    }
+    let trait_name = drop_impl_trait_name(it, db, str_in);
+    if !drop_sv_is_drop_trait(view(trait_name)) {
+        return false;
+    }
+    let def_sym_v = unsafe { (*def).symbol.v };
+    let impl_sym_v = unsafe { (*self_type).path.symbol.v };
+    if def_sym_v != 0u32 && impl_sym_v != 0u32 {
+        return def_sym_v == impl_sym_v;
+    }
+    let impl_name = drop_impl_self_name(it, db, str_in);
+    drop_sv_eq(target_name, view(impl_name))
+}
+
+// The first fn member of the first `impl Drop for <def>` that has one, or null.
+pub fn mir_find_drop_impl_fn(
+    hir: view<HirFile>,
+    def: *const HirItem,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> *const HirItem {
+    let hir_ptr = unsafe { address_of(hir.items) as usize };
+    if (def as usize) == 0 || hir_ptr == 0 || (hir.items as usize) == 0 {
+        return 0 as *const HirItem;
+    }
+    let str_ptr = unsafe { address_of(str_in.bytes.head) as usize };
+    let def_name_v = unsafe { (*def).name.v };
+    let target_name = if def_name_v != 0u32 && str_ptr != 0 {
+        interner_get(str_in, StrId { v: def_name_v })
+    } else {
+        StrView { ptr: 0 as *const u8, len: 0 }
+    };
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        if drop_impl_is_drop_for(it as *const HirItem, def, view(target_name), db, str_in) {
+            let mut member: *mut HirItem = unsafe { (*it).members };
+            while (member as usize) != 0 {
+                let member_kind = unsafe { (*member).kind };
+                if member_kind == HIR_ITEM_FN {
+                    return member as *const HirItem;
+                }
+                member = unsafe { (*member).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *const HirItem
+}
+
+pub fn drop_find_impl_fn_with_thir(
+    ty: TypeId,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    def: *const HirItem,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> *const HirItem {
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as usize };
+    let mcap = thir.expr_methods.cap;
+    if thir_ptr != 0 && ty.v != 0u32 && mcap > 0 {
+        let tk = ((ty.v as usize) << 1) | 1;
+        let mp = ptr_itemmap_get(view(thir.expr_methods), tk);
+        if (mp as usize) != 0 && (unsafe { *mp as usize }) != 0 {
+            return unsafe { *mp };
+        }
+        if (def as usize) != 0 {
+            let dk = (def as usize) | 1;
+            let dp = ptr_itemmap_get(view(thir.expr_methods), dk);
+            if (dp as usize) != 0 && (unsafe { *dp as usize }) != 0 {
+                return unsafe { *dp };
+            }
+        }
+    }
+    mir_find_drop_impl_fn(hir, def, db, str_in)
+}
+
+// =================================================================================================
+// Which types need drop (port of ax_type_needs_drop)
+// =================================================================================================
+
+// The type behind `ty`, or null for the none id and ids outside the interner.
+fn drop_type_get(thir: view<Thir>, ty: TypeId) -> *mut AxType {
+    let thir_ptr = unsafe { address_of(thir.interner.arena.head) as usize };
+    if thir_ptr == 0 || ty.v == 0u32 {
+        return 0 as *mut AxType;
+    }
+    if (ty.v as usize) > thir.interner.len {
+        return 0 as *mut AxType;
+    }
+    type_get(view(thir.interner), TypeId { v: ty.v })
+}
+
+fn drop_field_type(fields: *mut TypeId, idx: usize) -> TypeId {
+    let v = unsafe { (*typeid_at(fields, idx)).v };
+    TypeId { v: v }
+}
+
+fn drop_variant_field_type(t: *mut AxType, variant: usize, idx: usize) -> TypeId {
+    let variant_fields = unsafe { *typeid_ptr_at((*t).variant_fields, variant) };
+    drop_field_type(variant_fields, idx)
+}
+
+fn drop_variant_field_count(t: *mut AxType, variant: usize) -> usize {
+    unsafe { *usize_at((*t).variant_field_counts, variant) }
+}
+
+// Does a value of type `ty` own something that must be dropped?
+//   - closures: a by-move capture that needs drop;
+//   - structs: no field list (unit, empty or tuple struct), a user `impl Drop`, or a field that
+//     needs drop;
+//   - tuples, arrays and enums: a field/element (of any variant) that needs drop;
+//   - every other type: no.
+// `db` may be null; `impl Drop` is then matched on interned names instead of source text.
+pub fn mir_type_needs_drop_in(
+    ty: TypeId,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>
+) -> bool {
+    let t = drop_type_get(thir, TypeId { v: ty.v });
+    if (t as usize) == 0 {
+        return false;
+    }
+    let kind = unsafe { (*t).kind };
+
+    if kind == TY_CLOSURE {
+        let capture_count = unsafe { (*t).capture_count };
+        let captures = unsafe { (*t).captures };
+        let mut i: usize = 0;
+        while i < capture_count {
+            let capture = unsafe { capture_at(captures, i) };
+            let mode = unsafe { (*capture).mode };
+            let capture_ty = TypeId { v: unsafe { (*capture).ty.v } };
+            if mode == CAP_MOVE && mir_type_needs_drop_in(capture_ty, thir, hir, db, str_in) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    if kind == TY_STRUCT {
+        let def = unsafe { (*t).def };
+        if (def as usize) != 0 {
+            let struct_fields = unsafe { (*def).struct_fields };
+            if (struct_fields as usize) == 0 {
+                return true;
+            }
+        }
+        let drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty.v }, thir, hir, def, db, str_in);
+        if (drop_fn as usize) != 0 {
+            return true;
+        }
+        let field_count = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut i: usize = 0;
+        while i < field_count {
+            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    if kind == TY_TUPLE {
+        let field_count = unsafe { (*t).field_count };
+        let fields = unsafe { (*t).fields };
+        let mut i: usize = 0;
+        while i < field_count {
+            if mir_type_needs_drop_in(drop_field_type(fields, i), thir, hir, db, str_in) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    if kind == TY_ENUM {
+        let variant_count = unsafe { (*t).variant_count };
+        let mut variant: usize = 0;
+        while variant < variant_count {
+            let field_count = drop_variant_field_count(t, variant);
+            let mut i: usize = 0;
+            while i < field_count {
+                let field_ty = drop_variant_field_type(t, variant, i);
+                if mir_type_needs_drop_in(field_ty, thir, hir, db, str_in) {
+                    return true;
+                }
+                i = i + 1;
+            }
+            variant = variant + 1;
+        }
+        return false;
+    }
+
+    if kind == TY_ARRAY {
+        let alen = unsafe { (*t).array_len };
+        let elem = TypeId { v: unsafe { (*t).elem.v } };
+        return alen > 0u64 && mir_type_needs_drop_in(elem, thir, hir, db, str_in);
+    }
+
+    false
+}
+
+// `mir_type_needs_drop_in` without a source database (C: `ax_type_needs_drop(..., db = NULL)`).
+pub fn mir_type_needs_drop(
+    ty: TypeId,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    str_in: view<StrInterner>
+) -> bool {
+    mir_type_needs_drop_in(TypeId { v: ty.v }, thir, hir, 0 as *const SourceDatabase, str_in)
+}
+
+// =================================================================================================
+// Place types (port of place_type)
+// =================================================================================================
+
+// The type of `place`, following its projections. A projection that does not apply to the
+// current type leaves it unchanged; an unknown type stops the walk (C semantics).
+pub fn mir_drop_place_type(body: view<MirBody>, thir: view<Thir>, place: view<MirPlace>) -> TypeId {
+    if (place.local.v as usize) >= body.local_count {
+        return TypeId { v: 0u32 };
+    }
+    let decl = unsafe { mir_local_at(body.locals, place.local.v as usize) };
+    let mut current = TypeId { v: unsafe { (*decl).ty.v } };
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let t = drop_type_get(thir, TypeId { v: current.v });
+        if (t as usize) == 0 {
+            break;
+        }
+        let kind = unsafe { (*t).kind };
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let proj_kind = unsafe { (*proj).kind };
+        if proj_kind == MIR_PROJ_DEREF {
+            current = TypeId { v: unsafe { (*t).pointee.v } };
+        } else if proj_kind == MIR_PROJ_FIELD {
+            let field_idx = (unsafe { (*proj).field_idx }) as usize;
+            if kind == TY_STRUCT || kind == TY_TUPLE {
+                let field_count = unsafe { (*t).field_count };
+                if field_idx < field_count {
+                    current = drop_field_type(unsafe { (*t).fields }, field_idx);
+                }
+            } else if kind == TY_CLOSURE {
+                // Field 0 of a closure environment is its code pointer, then one field per capture.
+                let capture_count = unsafe { (*t).capture_count };
+                if field_idx == 0 {
+                    current = TypeId { v: thir.interner.t_usize.v };
+                } else if field_idx - 1 < capture_count {
+                    let capture = unsafe { capture_at((*t).captures, field_idx - 1) };
+                    current = TypeId { v: unsafe { (*capture).ty.v } };
+                }
+            }
+        } else if proj_kind == MIR_PROJ_DOWNCAST {
+            // A downcast keeps the enum type; the field projection that follows reads the variant.
+            if kind == TY_ENUM && i + 1 < place.proj_count {
+                let next = unsafe { mir_proj_at(place.projs, i + 1) };
+                let next_kind = unsafe { (*next).kind };
+                if next_kind == MIR_PROJ_FIELD {
+                    let variant = (unsafe { (*proj).variant_idx }) as usize;
+                    let field_idx = (unsafe { (*next).field_idx }) as usize;
+                    let variant_count = unsafe { (*t).variant_count };
+                    if variant < variant_count && field_idx < drop_variant_field_count(t, variant) {
+                        current = drop_variant_field_type(t, variant, field_idx);
+                    }
+                    i = i + 1;
+                }
+            }
+        } else if proj_kind == MIR_PROJ_INDEX {
+            if kind == TY_ARRAY || kind == TY_SLICE {
+                current = TypeId { v: unsafe { (*t).elem.v } };
+            }
+        }
+        i = i + 1;
+    }
+    current
+}
+
+// =================================================================================================
+// Statement construction
+// =================================================================================================
+
+fn drop_zero_span() -> Span {
+    Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }
+}
+
+// Gives a fresh block a single `_dest = <use of _0>;` statement, allocated in the arena (as in C),
+// and returns it for the caller to fill in.
+fn drop_set_single_assign(body: mut_view<MirBody>, arena: mut_view<Arena>, bb_v: u32, dest_v: u32) -> *mut MirStmt {
+    let stmt = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+    let bb = unsafe { mir_bb_at(body.bbs, bb_v as usize) };
+    unsafe {
+        mir_stmt_zero(mut_view(*stmt), MIR_STMT_ASSIGN);
+        mir_place_reset_u32(mut_view((*stmt).place), dest_v);
+        (*bb).stmts = stmt;
+        (*bb).stmt_count = 1;
+        (*bb).stmt_cap = 1;
+    }
+    stmt
+}
+
+// `flag = const <value>;`
+fn drop_init_flag_assign(stmt: mut_view<MirStmt>, flag_local_v: u32, bool_ty_v: u32, value: bool) {
+    mir_stmt_zero(mut_view(*stmt), MIR_STMT_ASSIGN);
+    mir_place_reset_u32(mut_view(stmt.place), flag_local_v);
+    stmt.rvalue.kind = MIR_RVALUE_USE;
+    mir_operand_zero(mut_view(stmt.rvalue.use_op), MIR_OP_CONST);
+    stmt.rvalue.use_op.constant.ty.v = bool_ty_v;
+    stmt.rvalue.use_op.constant.kind = MIR_CONST_BOOL;
+    stmt.rvalue.use_op.constant.val = if value { 1u64 } else { 0u64 };
+}
+
+// A growable statement array allocated in the MIR arena.
+struct DropStmtBuf {
+    stmts: *mut MirStmt,
+    count: usize,
+    cap: usize,
+}
+
+fn drop_stmt_buf_new(arena: mut_view<Arena>, cap: usize) -> DropStmtBuf {
+    let real_cap: usize = if cap == 0 { 8 } else { cap };
+    let bytes = mir_mul_usize(real_cap, size_of<MirStmt>());
+    let stmts = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirStmt>()) as *mut MirStmt;
+    DropStmtBuf { stmts: stmts, count: 0, cap: real_cap }
+}
+
+// Reserves the next slot and returns it.
+fn drop_stmt_buf_next(buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>) -> *mut MirStmt {
+    if buf.count >= buf.cap {
+        let new_cap = buf.cap + buf.cap;
+        let new_bytes = mir_mul_usize(new_cap, size_of<MirStmt>());
+        let new_stmts = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<MirStmt>()) as *mut MirStmt;
+        if buf.count > 0 {
+            let old_bytes = mir_mul_usize(buf.count, size_of<MirStmt>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(buf.stmts as *const u8, new_stmts as *mut u8, old_bytes);
+            }
+        }
+        buf.stmts = new_stmts;
+        buf.cap = new_cap;
+    }
+    let slot = unsafe { mir_stmt_at(buf.stmts, buf.count) };
+    buf.count = buf.count + 1;
+    slot
+}
+
+fn drop_stmt_buf_push_flag(
+    buf: mut_view<DropStmtBuf>,
+    arena: mut_view<Arena>,
+    flag_local_v: u32,
+    bool_ty_v: u32,
+    value: bool
+) {
+    let slot = drop_stmt_buf_next(mut_view(*buf), mut_view(*arena));
+    unsafe {
+        drop_init_flag_assign(mut_view(*slot), flag_local_v, bool_ty_v, value);
+    }
+}
+
+fn drop_stmt_buf_push_copy(buf: mut_view<DropStmtBuf>, arena: mut_view<Arena>, stmt: view<MirStmt>) {
+    let slot = drop_stmt_buf_next(mut_view(*buf), mut_view(*arena));
+    unsafe {
+        mir_copy_stmt(mut_view(*slot), stmt);
+    }
+}
+
+// =================================================================================================
+// Drop-flag maintenance (port of visit_op / visit_rvalue)
+// =================================================================================================
+
+// The per-function drop flag table: `flags[local]` is the flag local of an original local that
+// needs drop, or 0.
+struct DropFlags {
+    flags: *mut u32,
+    orig_local_count: usize,
+    bool_ty_v: u32,
+}
+
+fn drop_flag_of(df: view<DropFlags>, local_v: u32) -> u32 {
+    if (local_v as usize) >= df.orig_local_count {
+        return 0u32;
+    }
+    unsafe { *u32_at(df.flags, local_v as usize) }
+}
+
+fn drop_place_has_deref(place: view<MirPlace>) -> bool {
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        if (unsafe { (*proj).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// A move or copy out of a flagged local clears its flag first.
+fn drop_visit_operand(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    df: view<DropFlags>,
+    op: view<MirOperand>,
+    buf: mut_view<DropStmtBuf>,
+    arena: mut_view<Arena>
+) {
+    if op.kind != MIR_OP_MOVE && op.kind != MIR_OP_COPY {
+        return;
+    }
+    let flag = drop_flag_of(df, op.place.local.v);
+    if flag != 0u32 {
+        if op.place.proj_count > 0 {
+            if drop_place_has_deref(view(op.place)) {
+                return;
+            }
+            let pty = mir_drop_place_type(body, thir, view(op.place));
+            if !mir_type_needs_drop_in(pty, thir, hir, db, str_in) {
+                return;
+            }
+        }
+        drop_stmt_buf_push_flag(mut_view(*buf), mut_view(*arena), flag, df.bool_ty_v, false);
+    }
+}
+
+fn drop_visit_rvalue(
+    body: view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    df: view<DropFlags>,
+    rv: view<MirRvalue>,
+    buf: mut_view<DropStmtBuf>,
+    arena: mut_view<Arena>
+) {
+    if rv.kind == MIR_RVALUE_USE || rv.kind == MIR_RVALUE_CAST || rv.kind == MIR_RVALUE_UNARY_OP {
+        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+    } else if rv.kind == MIR_RVALUE_REPEAT {
+        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.use_op), mut_view(*buf), mut_view(*arena));
+        if (rv.repeat_count_op as usize) != 0 {
+            unsafe {
+                drop_visit_operand(body, thir, hir, db, str_in, df, view(*rv.repeat_count_op), mut_view(*buf), mut_view(*arena));
+            }
+        }
+    } else if rv.kind == MIR_RVALUE_BINARY_OP || rv.kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.lhs), mut_view(*buf), mut_view(*arena));
+        drop_visit_operand(body, thir, hir, db, str_in, df, view(rv.rhs), mut_view(*buf), mut_view(*arena));
+    } else if rv.kind == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            unsafe {
+                drop_visit_operand(body, thir, hir, db, str_in, df, view(*op), mut_view(*buf), mut_view(*arena));
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Rewrites the statements of one block: flag set in a call's return block, flag clears before
+// moves and copies, flag sets after assignments; then records the flag of a `drop` terminator.
+fn drop_rewrite_block(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    df: view<DropFlags>,
+    bb_idx: usize,
+    call_init_local_v: u32,
+    arena: mut_view<Arena>
+) {
+    let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    let old_count = unsafe { (*bb).stmt_count };
+    let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + 16);
+
+    if call_init_local_v != 0u32 {
+        let flag = drop_flag_of(df, call_init_local_v);
+        drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, df.bool_ty_v, true);
+    }
+
+    let mut j: usize = 0;
+    while j < old_count {
+        let stmt = unsafe { mir_stmt_at((*bb).stmts, j) };
+        let stmt_kind = unsafe { (*stmt).kind };
+        if stmt_kind == MIR_STMT_ASSIGN {
+            unsafe {
+                drop_visit_rvalue(view(*body), thir, hir, db, str_in, df, view((*stmt).rvalue), mut_view(buf), mut_view(*arena));
+            }
+        }
+        unsafe {
+            drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*stmt));
+        }
+        if stmt_kind == MIR_STMT_ASSIGN {
+            let dest_v = unsafe { (*stmt).place.local.v };
+            let flag = drop_flag_of(df, dest_v);
+            if flag != 0u32 {
+                drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, df.bool_ty_v, true);
+            }
+        }
+        j = j + 1;
+    }
+
+    let term_kind = unsafe { (*bb).terminator.kind };
+    if term_kind == MIR_TERM_SWITCH_INT {
+        unsafe {
+            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.discr), mut_view(buf), mut_view(*arena));
+        }
+    } else if term_kind == MIR_TERM_CALL {
+        unsafe {
+            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.func), mut_view(buf), mut_view(*arena));
+        }
+        let arg_count = unsafe { (*bb).terminator.arg_count };
+        let args = unsafe { (*bb).terminator.args };
+        let mut a: usize = 0;
+        while a < arg_count {
+            let arg = unsafe { mir_op_at(args, a) };
+            unsafe {
+                drop_visit_operand(view(*body), thir, hir, db, str_in, df, view(*arg), mut_view(buf), mut_view(*arena));
+            }
+            a = a + 1;
+        }
+    } else if term_kind == MIR_TERM_ASSERT {
+        unsafe {
+            drop_visit_operand(view(*body), thir, hir, db, str_in, df, view((*bb).terminator.cond), mut_view(buf), mut_view(*arena));
+        }
+    }
+
+    unsafe {
+        (*bb).stmts = buf.stmts;
+        (*bb).stmt_count = buf.count;
+        (*bb).stmt_cap = buf.cap;
+    }
+
+    if term_kind == MIR_TERM_DROP {
+        let drop_local_v = unsafe { (*bb).terminator.drop_place.local.v };
+        let flag = drop_flag_of(df, drop_local_v);
+        if flag != 0u32 {
+            unsafe {
+                (*bb).terminator.drop_flag = flag;
+            }
+        }
+    }
+}
+
+// =================================================================================================
+// Cleanup block construction (port of expand_drop)
+// =================================================================================================
+
+fn drop_new_local(body: mut_view<MirBody>, arena: mut_view<Arena>, ty_v: u32, mut_flag: bool) -> MirLocalId {
+    let zero = drop_zero_span();
+    mir_add_local(
+        mut_view(*body),
+        mut_view(*arena),
+        TypeId { v: ty_v },
+        MIR_LOCAL_TEMP,
+        mut_flag,
+        StrId { v: 0u32 },
+        view(zero)
+    )
+}
+
+// `place` extended with one projection.
+fn drop_place_with_proj(arena: mut_view<Arena>, place: view<MirPlace>, kind: u8, idx: u32) -> MirPlace {
+    let mut proj = MirProjection {
+        kind: kind,
+        field_idx: 0u32,
+        index_local: MirLocalId { v: 0u32 },
+        from_local: MirLocalId { v: 0u32 },
+        to_local: MirLocalId { v: 0u32 },
+        has_from: false,
+        has_to: false,
+        variant_idx: 0u32,
+    };
+    mir_proj_reset(mut_view(proj), kind);
+    if kind == MIR_PROJ_DOWNCAST {
+        proj.variant_idx = idx;
+    } else if kind == MIR_PROJ_INDEX {
+        proj.index_local = MirLocalId { v: idx };
+    } else {
+        proj.field_idx = idx;
+    }
+    let mut out = mir_local_place(0u32);
+    mir_place_append_proj(mut_view(*arena), place, view(proj), mut_view(out));
+    out
+}
+
+// A fresh block whose terminator is `drop(place) -> [return: target, unwind: bb0]` without a flag.
+fn drop_new_field_drop_bb(
+    body: mut_view<MirBody>,
+    arena: mut_view<Arena>,
+    place: view<MirPlace>,
+    target_v: u32
+) -> MirBbId {
+    let bb_id = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+    let bb = unsafe { mir_bb_at(body.bbs, bb_id.v as usize) };
+    unsafe {
+        mir_term_zero(mut_view((*bb).terminator), MIR_TERM_DROP);
+        mir_copy_place(mut_view((*bb).terminator.drop_place), place);
+        (*bb).terminator.drop_place.drop_flag = MIR_DROP_FLAG_NONE;
+        (*bb).terminator.drop_target.v = target_v;
+        (*bb).terminator.drop_unwind.v = 0u32;
+        (*bb).terminator.drop_flag = 0u32;
+        (*bb).has_terminator = true;
+    }
+    bb_id
+}
+
+fn drop_set_goto(body: mut_view<MirBody>, bb_idx: usize, target_v: u32) {
+    let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    unsafe {
+        mir_term_zero(mut_view((*bb).terminator), MIR_TERM_GOTO);
+        (*bb).terminator.goto_target.v = target_v;
+        (*bb).has_terminator = true;
+    }
+}
+
+// Field drops of a struct or tuple, last field first; returns the new entry block.
+fn drop_expand_aggregate_fields(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>,
+    t: *mut AxType,
+    place: view<MirPlace>,
+    target_v: u32
+) -> u32 {
+    let mut inner_target_v = target_v;
+    let field_count = unsafe { (*t).field_count };
+    let fields = unsafe { (*t).fields };
+    let mut i: usize = field_count;
+    while i > 0 {
+        let idx = i - 1;
+        if mir_type_needs_drop_in(drop_field_type(fields, idx), thir, hir, db, str_in) {
+            let field_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, idx as u32);
+            let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), inner_target_v);
+            inner_target_v = field_bb.v;
+        }
+        i = i - 1;
+    }
+    inner_target_v
+}
+
+// Drops of the by-move captures of a closure environment, last capture first. Capture k lives in
+// environment field k + 1 (field 0 is the code pointer).
+fn drop_expand_closure_captures(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>,
+    t: *mut AxType,
+    place: view<MirPlace>,
+    target_v: u32
+) -> u32 {
+    let mut inner_target_v = target_v;
+    let capture_count = unsafe { (*t).capture_count };
+    let captures = unsafe { (*t).captures };
+    let mut i: usize = capture_count;
+    while i > 0 {
+        let idx = i - 1;
+        let capture = unsafe { capture_at(captures, idx) };
+        let mode = unsafe { (*capture).mode };
+        let capture_ty = TypeId { v: unsafe { (*capture).ty.v } };
+        if mode == CAP_MOVE && mir_type_needs_drop_in(capture_ty, thir, hir, db, str_in) {
+            let field_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_FIELD, (idx + 1) as u32);
+            let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), inner_target_v);
+            inner_target_v = field_bb.v;
+        }
+        i = i - 1;
+    }
+    inner_target_v
+}
+
+// Enum drop: `_d = discriminant(place); switchInt(move _d) -> [v: <variant v field drops>, ...,
+// otherwise: target]` with one arm per variant that has a field needing drop. Returns the switch
+// block.
+fn drop_expand_enum_variants(
+    body: mut_view<MirBody>,
+    thir: view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>,
+    t: *mut AxType,
+    place: view<MirPlace>,
+    target_v: u32
+) -> u32 {
+    let discr_local = drop_new_local(mut_view(*body), mut_view(*arena), thir.interner.t_isize.v, false);
+    let switch_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+
+    // `_d = discriminant(place);`
+    let discr_stmt = drop_set_single_assign(mut_view(*body), mut_view(*arena), switch_bb.v, discr_local.v);
+    unsafe {
+        (*discr_stmt).rvalue.kind = MIR_RVALUE_DISCRIMINANT;
+        mir_copy_place(mut_view((*discr_stmt).rvalue.place), place);
+    }
+
+    let variant_count = unsafe { (*t).variant_count };
+    let values_bytes = mir_mul_usize(variant_count, size_of<u64>());
+    let targets_bytes = mir_mul_usize(variant_count, size_of<MirBbId>());
+    let values = arena_alloc_raw(mut_view(*arena), values_bytes, align_of<u64>()) as *mut u64;
+    let targets = arena_alloc_raw(mut_view(*arena), targets_bytes, align_of<MirBbId>()) as *mut MirBbId;
+    let mut arm_count: usize = 0;
+
+    let mut variant: usize = 0;
+    while variant < variant_count {
+        let field_count = drop_variant_field_count(t, variant);
+        let mut variant_needs_drop = false;
+        let mut f: usize = 0;
+        while f < field_count {
+            if mir_type_needs_drop_in(drop_variant_field_type(t, variant, f), thir, hir, db, str_in) {
+                variant_needs_drop = true;
+                break;
+            }
+            f = f + 1;
+        }
+
+        if variant_needs_drop {
+            let mut variant_target_v = target_v;
+            let mut i: usize = field_count;
+            while i > 0 {
+                let idx = i - 1;
+                if mir_type_needs_drop_in(drop_variant_field_type(t, variant, idx), thir, hir, db, str_in) {
+                    let downcast_place = drop_place_with_proj(mut_view(*arena), place, MIR_PROJ_DOWNCAST, variant as u32);
+                    let field_place = drop_place_with_proj(mut_view(*arena), view(downcast_place), MIR_PROJ_FIELD, idx as u32);
+                    let field_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(field_place), variant_target_v);
+                    variant_target_v = field_bb.v;
+                }
+                i = i - 1;
+            }
+            unsafe {
+                *mir_u64_at(values, arm_count) = variant as u64;
+                (*mir_bb_id_at(targets, arm_count)).v = variant_target_v;
+            }
+            arm_count = arm_count + 1;
+        }
+        variant = variant + 1;
+    }
+
+    let switch_ptr_now = unsafe { mir_bb_at(body.bbs, switch_bb.v as usize) };
+    unsafe {
+        mir_term_zero(mut_view((*switch_ptr_now).terminator), MIR_TERM_SWITCH_INT);
+        mir_operand_zero(mut_view((*switch_ptr_now).terminator.discr), MIR_OP_MOVE);
+        mir_place_reset_u32(mut_view((*switch_ptr_now).terminator.discr.place), discr_local.v);
+        (*switch_ptr_now).terminator.values = values;
+        (*switch_ptr_now).terminator.targets = targets;
+        (*switch_ptr_now).terminator.switch_count = arm_count;
+        (*switch_ptr_now).terminator.otherwise.v = target_v;
+        (*switch_ptr_now).has_terminator = true;
+    }
+    switch_bb.v
+}
+
+// The destructor call block: `_a = &place; _t = const <drop fn>(move _a) -> [return: target,
+// unwind: bb0]`. Returns the call block.
+fn drop_expand_user_destructor(
+    body: mut_view<MirBody>,
+    thir: mut_view<Thir>,
+    arena: mut_view<Arena>,
+    drop_fn: *const HirItem,
+    ty: TypeId,
+    place: view<MirPlace>,
+    target_v: u32
+) -> u32 {
+    let result_local = drop_new_local(mut_view(*body), mut_view(*arena), thir.interner.t_unit.v, false);
+    let arg_ty = intern_view_ty(mut_view(thir.interner), TypeId { v: ty.v }, true);
+    let arg_local = drop_new_local(mut_view(*body), mut_view(*arena), arg_ty.v, false);
+    let call_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+
+    // `_a = &place;` — C leaves the borrow kind zero-initialised: a shared borrow (see the module
+    // header).
+    let ref_stmt = drop_set_single_assign(mut_view(*body), mut_view(*arena), call_bb.v, arg_local.v);
+    unsafe {
+        (*ref_stmt).rvalue.kind = MIR_RVALUE_REF;
+        (*ref_stmt).rvalue.borrow_kind = MIR_BORROW_SHARED;
+        mir_copy_place(mut_view((*ref_stmt).rvalue.place), place);
+    }
+
+    // Prefer the destructor's full function signature from THIR `item_types` so native ABI lowering
+    // sees the `self: mut_view<T>` parameter even without the separate monomorphization pass; fall
+    // back to the bare `fn` type (`AxType fn_t = { .kind = AX_TY_FN }`) when `item_types` is unpopulated.
+    let mut fn_ty = intern_fn_ty(mut_view(thir.interner), false, StrId { v: 0u32 }, 0 as *mut TypeId, 0, TypeId { v: 0u32 });
+    let item_fn_ty_ptr = thir_get_item_type(view(*thir), drop_fn);
+    if (item_fn_ty_ptr as usize) != 0 {
+        let item_fn_v = unsafe { (*item_fn_ty_ptr).v };
+        if item_fn_v != 0u32 {
+            fn_ty.v = item_fn_v;
+        }
+    }
+    let drop_sym_v = unsafe { (*drop_fn).symbol.v };
+
+    let args = arena_alloc_raw(mut_view(*arena), size_of<MirOperand>(), align_of<MirOperand>()) as *mut MirOperand;
+    unsafe {
+        mir_operand_zero(mut_view(*args), MIR_OP_MOVE);
+        mir_place_reset_u32(mut_view((*args).place), arg_local.v);
+    }
+
+    let call_ptr = unsafe { mir_bb_at(body.bbs, call_bb.v as usize) };
+    unsafe {
+        mir_term_zero(mut_view((*call_ptr).terminator), MIR_TERM_CALL);
+        mir_operand_zero(mut_view((*call_ptr).terminator.func), MIR_OP_CONST);
+        (*call_ptr).terminator.func.constant.kind = MIR_CONST_FN;
+        (*call_ptr).terminator.func.constant.ty.v = fn_ty.v;
+        (*call_ptr).terminator.func.constant.val = drop_sym_v as u64;
+        (*call_ptr).terminator.func.constant.sym.v = drop_sym_v;
+        (*call_ptr).terminator.args = args;
+        (*call_ptr).terminator.arg_count = 1;
+        mir_place_reset_u32(mut_view((*call_ptr).terminator.destination), result_local.v);
+        (*call_ptr).terminator.has_destination = true;
+        (*call_ptr).terminator.call_target.v = target_v;
+        (*call_ptr).terminator.call_unwind.v = 0u32;
+        (*call_ptr).has_terminator = true;
+    }
+    call_bb.v
+}
+
+// Rewrites the `drop` terminator of block `bb_idx` into explicit cleanup blocks. Returns false
+// (and leaves the terminator alone) when the block does not end in `drop` or the dropped place
+// has no known type.
+fn drop_expand_block(
+    body: mut_view<MirBody>,
+    thir: mut_view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>,
+    bb_idx: usize
+) -> bool {
+    let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    let has_terminator = unsafe { (*bb).has_terminator };
+    let term_kind = unsafe { (*bb).terminator.kind };
+    if !has_terminator || term_kind != MIR_TERM_DROP {
+        return false;
+    }
+
+    let mut place = mir_local_place(0u32);
+    unsafe {
+        mir_copy_place(mut_view(place), view((*bb).terminator.drop_place));
+    }
+    let target_v = unsafe { (*bb).terminator.drop_target.v };
+    let flag = unsafe { (*bb).terminator.drop_flag };
+
+    let ty = mir_drop_place_type(view(*body), view(*thir), view(place));
+    let t = drop_type_get(view(*thir), TypeId { v: ty.v });
+    if (t as usize) == 0 {
+        return false;
+    }
+    let kind = unsafe { (*t).kind };
+
+    let mut drop_fn: *const HirItem = 0 as *const HirItem;
+    if kind == TY_STRUCT {
+        let def = unsafe { (*t).def };
+        drop_fn = drop_find_impl_fn_with_thir(TypeId { v: ty.v }, view(*thir), hir, def, db, str_in);
+    }
+
+    let mut inner_target_v = target_v;
+    if kind == TY_STRUCT || kind == TY_TUPLE {
+        inner_target_v = drop_expand_aggregate_fields(
+            mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
+        );
+    } else if kind == TY_CLOSURE {
+        inner_target_v = drop_expand_closure_captures(
+            mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
+        );
+    } else if kind == TY_ENUM {
+        inner_target_v = drop_expand_enum_variants(
+            mut_view(*body), view(*thir), hir, db, str_in, mut_view(*arena), t, view(place), inner_target_v
+        );
+    } else if kind == TY_ARRAY {
+        let alen = (unsafe { (*t).array_len }) as usize;
+        let elem_ty = TypeId { v: unsafe { (*t).elem.v } };
+        if alen > 0 && mir_type_needs_drop_in(elem_ty, view(*thir), hir, db, str_in) {
+            let mut i: usize = alen;
+            while i > 0 {
+                let idx = i - 1;
+                let idx_local = drop_new_local(mut_view(*body), mut_view(*arena), thir.interner.t_usize.v, false);
+                let elem_place = drop_place_with_proj(mut_view(*arena), view(place), MIR_PROJ_INDEX, idx_local.v);
+                let elem_bb = drop_new_field_drop_bb(mut_view(*body), mut_view(*arena), view(elem_place), inner_target_v);
+                let idx_stmt = drop_set_single_assign(mut_view(*body), mut_view(*arena), elem_bb.v, idx_local.v);
+                unsafe {
+                    (*idx_stmt).rvalue.kind = MIR_RVALUE_USE;
+                    mir_operand_zero(mut_view((*idx_stmt).rvalue.use_op), MIR_OP_CONST);
+                    (*idx_stmt).rvalue.use_op.constant.kind = MIR_CONST_INT;
+                    (*idx_stmt).rvalue.use_op.constant.ty.v = thir.interner.t_usize.v;
+                    (*idx_stmt).rvalue.use_op.constant.val = idx as u64;
+                }
+                inner_target_v = elem_bb.v;
+                i = i - 1;
+            }
+        }
+    }
+
+    if (drop_fn as usize) != 0 {
+        inner_target_v = drop_expand_user_destructor(
+            mut_view(*body), mut_view(*thir), mut_view(*arena), drop_fn, TypeId { v: ty.v }, view(place), inner_target_v
+        );
+    }
+
+    if flag != 0u32 && flag != MIR_DROP_FLAG_NONE {
+        // `if flag { flag = false; <drop> }`
+        let clear_bb = mir_add_bb(mut_view(*body), mut_view(*arena), false);
+        let clear_ptr = unsafe { mir_bb_at(body.bbs, clear_bb.v as usize) };
+        let clear_stmts = arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt;
+        unsafe {
+            drop_init_flag_assign(mut_view(*clear_stmts), flag, thir.interner.t_bool.v, false);
+            (*clear_ptr).stmts = clear_stmts;
+            (*clear_ptr).stmt_count = 1;
+            (*clear_ptr).stmt_cap = 1;
+        }
+        drop_set_goto(mut_view(*body), clear_bb.v as usize, inner_target_v);
+
+        let values = arena_alloc_raw(mut_view(*arena), size_of<u64>(), align_of<u64>()) as *mut u64;
+        let targets = arena_alloc_raw(mut_view(*arena), size_of<MirBbId>(), align_of<MirBbId>()) as *mut MirBbId;
+        unsafe {
+            *values = 1u64;
+            (*targets).v = clear_bb.v;
+        }
+        let bb_now = unsafe { mir_bb_at(body.bbs, bb_idx) };
+        unsafe {
+            mir_term_zero(mut_view((*bb_now).terminator), MIR_TERM_SWITCH_INT);
+            mir_operand_zero(mut_view((*bb_now).terminator.discr), MIR_OP_COPY);
+            mir_place_reset_u32(mut_view((*bb_now).terminator.discr.place), flag);
+            (*bb_now).terminator.values = values;
+            (*bb_now).terminator.targets = targets;
+            (*bb_now).terminator.switch_count = 1;
+            (*bb_now).terminator.otherwise.v = target_v;
+            (*bb_now).has_terminator = true;
+        }
+    } else {
+        drop_set_goto(mut_view(*body), bb_idx, inner_target_v);
+    }
+    true
+}
+
+// =================================================================================================
+// Entry point (port of ax_mir_drop_elaborate)
+// =================================================================================================
+
+// Elaborates the drops of one MIR body in place. `db` may be null (destructor impls are then
+// matched on interned names); new blocks, locals, statements and projections are allocated in
+// `arena`; new types (`mut_view<T>` destructor arguments, the bare `fn` callee type) are interned
+// into `thir`.
+pub fn mir_drop_elaborate(
+    body: mut_view<MirBody>,
+    thir: mut_view<Thir>,
+    hir: view<HirFile>,
+    db: *const SourceDatabase,
+    str_in: view<StrInterner>,
+    arena: mut_view<Arena>
+) {
+    let orig_local_count = body.local_count;
+    let bool_ty_v = thir.interner.t_bool.v;
+    let flags_bytes = mir_mul_usize(orig_local_count + 1, size_of<u32>());
+    let flags = arena_alloc_raw(mut_view(*arena), flags_bytes, align_of<u32>()) as *mut u32;
+    let mut i: usize = 0;
+    while i <= orig_local_count {
+        unsafe {
+            *u32_at(flags, i) = 0u32;
+        }
+        i = i + 1;
+    }
+
+    // 1. One flag local per original local (the return slot excluded) whose type needs drop.
+    let mut flag_count: usize = 0;
+    i = 1;
+    while i < orig_local_count {
+        let decl = unsafe { mir_local_at(body.locals, i) };
+        let local_ty = TypeId { v: unsafe { (*decl).ty.v } };
+        if mir_type_needs_drop_in(local_ty, view(*thir), hir, db, str_in) {
+            let flag_local = drop_new_local(mut_view(*body), mut_view(*arena), bool_ty_v, true);
+            unsafe {
+                *u32_at(flags, i) = flag_local.v;
+            }
+            flag_count = flag_count + 1;
+        }
+        i = i + 1;
+    }
+    body.drop_flag_count = body.drop_flag_count + flag_count;
+    let df = DropFlags { flags: flags, orig_local_count: orig_local_count, bool_ty_v: bool_ty_v };
+
+    // 2. Flag initialisation at the top of bb0: arguments arrive initialised.
+    if body.bb_count > 0 && flag_count > 0 {
+        let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
+        let old_count = unsafe { (*bb0).stmt_count };
+        let mut buf = drop_stmt_buf_new(mut_view(*arena), old_count + flag_count);
+        i = 1;
+        while i < orig_local_count {
+            let flag = drop_flag_of(view(df), i as u32);
+            if flag != 0u32 {
+                let decl = unsafe { mir_local_at(body.locals, i) };
+                let is_arg = (unsafe { (*decl).kind }) == MIR_LOCAL_ARG;
+                drop_stmt_buf_push_flag(mut_view(buf), mut_view(*arena), flag, bool_ty_v, is_arg);
+            }
+            i = i + 1;
+        }
+        let mut j: usize = 0;
+        while j < old_count {
+            let stmt = unsafe { mir_stmt_at((*bb0).stmts, j) };
+            unsafe {
+                drop_stmt_buf_push_copy(mut_view(buf), mut_view(*arena), view(*stmt));
+            }
+            j = j + 1;
+        }
+        unsafe {
+            (*bb0).stmts = buf.stmts;
+            (*bb0).stmt_count = buf.count;
+            (*bb0).stmt_cap = buf.cap;
+        }
+    }
+
+    // 3. A call that writes a flagged local arms its flag at the start of its return block.
+    let bb_count = body.bb_count;
+    let call_inits_bytes = mir_mul_usize(bb_count + 1, size_of<MirLocalId>());
+    let call_inits = arena_alloc_raw(mut_view(*arena), call_inits_bytes, align_of<MirLocalId>()) as *mut MirLocalId;
+    i = 0;
+    while i <= bb_count {
+        unsafe {
+            (*mir_local_id_at(call_inits, i)).v = 0u32;
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, i) };
+        let term_kind = unsafe { (*bb).terminator.kind };
+        if term_kind == MIR_TERM_CALL {
+            let dest_v = unsafe { (*bb).terminator.destination.local.v };
+            if drop_flag_of(view(df), dest_v) != 0u32 {
+                let call_target = (unsafe { (*bb).terminator.call_target.v }) as usize;
+                if call_target < bb_count {
+                    unsafe {
+                        (*mir_local_id_at(call_inits, call_target)).v = dest_v;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // 4. Flag maintenance inside every original block.
+    i = 0;
+    while i < bb_count {
+        let call_init_v = unsafe { (*mir_local_id_at(call_inits, i)).v };
+        drop_rewrite_block(mut_view(*body), view(*thir), hir, db, str_in, view(df), i, call_init_v, mut_view(*arena));
+        i = i + 1;
+    }
+
+    // 5. Expand drop terminators until none with a known type remains; blocks created by one pass
+    //    are expanded by the next one.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let current_count = body.bb_count;
+        i = 0;
+        while i < current_count {
+            if drop_expand_block(mut_view(*body), mut_view(*thir), hir, db, str_in, mut_view(*arena), i) {
+                changed = true;
+            }
+            i = i + 1;
+        }
+    }
+}
+
 // Axiom Compiler — MIR Verifier (compiler/verify/verifier.ax)
 // Port of bootstrap/axiom0/src/verify/verify.h and verify.c, plus standalone MIR text verification.
 //
@@ -11126,6 +12476,8 @@ use compiler.kernel.id.FileId
 use compiler.kernel.id.StrId
 use compiler.kernel.id.SymbolId
 use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.interner_new
 use compiler.kernel.interner.StrView
 use compiler.source.span.Span
 use compiler.diag.code.DiagCode
@@ -11148,6 +12500,7 @@ use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagSink
 use compiler.diag.emitter.diag_sink_report
 use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirParam
 use compiler.types.types.AxType
@@ -11266,6 +12619,7 @@ use compiler.mir.mir.mir_mul_usize
 use compiler.mir.mir.mir_op_at
 use compiler.mir.mir.mir_operand_zero
 use compiler.mir.mir.mir_place_reset_u32
+use compiler.mir.drop.mir_type_needs_drop
 use compiler.mir.mir.mir_proj_at
 use compiler.mir.mir.mir_rvalue_reset
 use compiler.mir.mir.mir_stmt_at
@@ -12658,75 +14012,6 @@ fn verify_merge_st(a: u8, b: u8) -> u8 {
     a | b
 }
 
-pub fn verify_type_needs_drop(ty: TypeId, thir: *const Thir, func: *const HirItem) -> bool {
-    if ty.v == 0u32 {
-        return false;
-    }
-    if (func as usize) == 0 && ty.v == 10u32 {
-        return true;
-    }
-    if (thir as usize) == 0 {
-        return false;
-    }
-    let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty.v });
-    if (t as usize) == 0 {
-        return false;
-    }
-    let tk = unsafe { (*t).kind };
-    if tk == TY_STRUCT || tk == TY_TUPLE {
-        let fc = unsafe { (*t).field_count };
-        let flds = unsafe { (*t).fields };
-        let mut i: usize = 0;
-        while i < fc {
-            let fty = TypeId { v: unsafe { (*typeid_at(flds, i)).v } };
-            if verify_type_needs_drop(fty, thir, func) {
-                return true;
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-    if tk == TY_ENUM {
-        let v_fields = unsafe { (*t).variant_fields };
-        let v_counts = unsafe { (*t).variant_field_counts };
-        let v_cnt = unsafe { (*t).variant_count };
-        if (v_fields as usize) != 0 && (v_counts as usize) != 0 {
-            let mut v: usize = 0;
-            while v < v_cnt {
-                let fc = unsafe { *usize_at(v_counts, v) };
-                let vf = unsafe { *typeid_ptr_at(v_fields, v) };
-                let mut i: usize = 0;
-                while i < fc {
-                    let fty = TypeId { v: unsafe { (*typeid_at(vf, i)).v } };
-                    if verify_type_needs_drop(fty, thir, func) {
-                        return true;
-                    }
-                    i = i + 1;
-                }
-                v = v + 1;
-            }
-        }
-        return false;
-    }
-    if tk == TY_CLOSURE {
-        let cap_cnt = unsafe { (*t).capture_count };
-        let caps = unsafe { (*t).captures };
-        let mut i: usize = 0;
-        while i < cap_cnt {
-            let cap = unsafe { capture_at(caps, i) };
-            if (unsafe { (*cap).mode }) == CAP_MOVE {
-                let cty = TypeId { v: unsafe { (*cap).ty.v } };
-                if verify_type_needs_drop(cty, thir, func) {
-                    return true;
-                }
-            }
-            i = i + 1;
-        }
-        return false;
-    }
-    false
-}
-
 fn verify_bb_is_pred(pbb: *const MirBb, target_idx: usize) -> bool {
     let has_term = unsafe { (*pbb).has_terminator };
     let tk = unsafe { (*pbb).terminator.kind };
@@ -12936,6 +14221,18 @@ fn verify_mir_own_fixpoint(
     }
 }
 
+fn verify_type_needs_drop_from_thir(thir: *const Thir, ty: TypeId) -> bool {
+    if (thir as usize) == 0 {
+        return false;
+    }
+    // No HIR or string interner is available here: pass real empty ones (never a view of a null
+    // pointer, which the oracle rejects as a null dereference). With no HIR items the `impl Drop`
+    // lookup falls back to the THIR method map only (C: `ax_type_needs_drop(.., NULL, NULL, NULL)`).
+    let empty_hir = HirFile { items: 0 as *mut HirItem };
+    let empty_str = interner_new();
+    unsafe { mir_type_needs_drop(ty, view(*thir), view(empty_hir), view(empty_str)) }
+}
+
 fn verify_mir_own_check_stmt(
     body: view<MirBody>,
     thir: *const Thir,
@@ -12971,7 +14268,9 @@ fn verify_mir_own_check_stmt(
         if dst_loc < lc && dst_pc == 0 {
             let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
             let dst_st = unsafe { *(cur + dst_loc) };
-            if verify_type_needs_drop(dst_ty, thir, func) && (dst_st & VERIFY_ST_OWNED) != 0u8 {
+            let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
+                verify_type_needs_drop_from_thir(thir, dst_ty));
+            if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(stmt.span), 45);
             }
             unsafe {
@@ -13051,7 +14350,9 @@ fn verify_mir_own_check_call_term(
     if dst_loc < lc && dst_pc == 0 {
         let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
         let dst_st = unsafe { *(cur + dst_loc) };
-        if verify_type_needs_drop(dst_ty, thir, func) && (dst_st & VERIFY_ST_OWNED) != 0u8 {
+        let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
+            verify_type_needs_drop_from_thir(thir, dst_ty));
+        if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
             verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, t_span, 53);
         }
         unsafe {
@@ -13093,7 +14394,7 @@ fn verify_mir_own_check_term(
         let pc = bb.terminator.drop_place.proj_count;
         if loc < lc && pc == 0 {
             let st = unsafe { *(cur + loc) };
-            if (st & VERIFY_ST_MOVED) != 0u8 {
+            if ((func as usize) == 0 || bb.terminator.drop_is_explicit) && (st & VERIFY_ST_MOVED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(t_span), 46);
             }
             unsafe {
@@ -13129,7 +14430,9 @@ fn verify_mir_own_check_term(
         while l < lc {
             let lty = TypeId { v: unsafe { (*mir_local_at(body.locals, l)).ty.v } };
             let lst = unsafe { *(cur + l) };
-            if verify_type_needs_drop(lty, thir, func) && (lst & VERIFY_ST_OWNED) != 0u8 {
+            let l_nd = (func as usize) == 0 && (lty.v == 10u32 ||
+                verify_type_needs_drop_from_thir(thir, lty));
+            if l_nd && (lst & VERIFY_ST_OWNED) != 0u8 {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(t_span), 58);
             }
             l = l + 1;
@@ -13487,7 +14790,9 @@ pub fn verify_mir_drop_flags(
             let dr_loc = (unsafe { (*bb).terminator.drop_place.local.v }) as usize;
             if dr_loc < lc {
                 let dr_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dr_loc)).ty.v } };
-                if verify_type_needs_drop(dr_ty, thir, func) {
+                let dr_nd = ((func as usize) == 0 && dr_ty.v == 10u32) ||
+                    verify_type_needs_drop_from_thir(thir, dr_ty);
+                if dr_nd {
                     verify_emit_diag(
                         mut_view(*sink),
                         AX_VERIFY_MISSING_DROP,
@@ -14757,7 +16062,6 @@ pub use compiler.verify.verifier.VERIFY_ST_MOVED
 pub use compiler.verify.verifier.verify_safe_type_get
 pub use compiler.verify.verifier.verify_types_compatible
 pub use compiler.verify.verifier.verify_check_place_projections
-pub use compiler.verify.verifier.verify_type_needs_drop
 
 pub use compiler.verify.verifier.verify_mir
 pub use compiler.verify.verifier.ax_verify_mir
