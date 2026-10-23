@@ -2,6 +2,7 @@
 
 ## Tóm tắt
 Đặc tả này quy định hệ thống Capability (`view<T>` và `mut_view<T>`). Axiom không đòi hỏi lập trình viên viết lifetime annotation, compiler sẽ tự động kiểm tra owner-outlives. Chấp nhận *implicit temporary views* cho biểu thức và method receiver (chỉ sống đến hết statement). Cho phép *stored views* (view nằm trong struct) với điều kiện struct không outlive owner và cấm self-reference. Capability có tính chất độc quyền rạch ròi: `view` chỉ được đọc, `mut_view` đọc/ghi độc quyền.
+Con trỏ thô từ `address_of`/`address_of_mut` không phải capability (AXS-CAP-008); local kiểu view khai báo sau owner chết trước khi owner bị drop ở cuối scope (AXS-CAP-009) — ADR-0036.
 
 ## 1. Capability Semantics
 
@@ -34,6 +35,23 @@ Views can be stored inside custom struct fields ("stored views").
 ### AXS-CAP-007: `Str` and Slices
 `Str` and generic slices (`[T]`) are implemented as views (not as bare pointer + length) and are subject to all standard capability conflict and lifetime rules.
 
+### AXS-CAP-008: Raw Pointers Are Not Capabilities
+`address_of(place)` / `address_of_mut(place)` (inside `unsafe`) take an ephemeral capability on the
+place only for the duration of that expression (AXS-CAP-005). The resulting `*const T` / `*mut T`
+holds no capability and has no region: the owner may afterwards be read, mutated, moved or dropped
+while raw pointers to it exist, and the checker reports nothing (a dangling raw pointer is the
+`unsafe` author's responsibility, REQ-FFI-011). In particular, a raw pointer local never produces
+`AX_CAP_OUTLIVES_OWNER`. [ADR-0036 §2; T141 QA N5]
+
+### AXS-CAP-009: View Locals and Scope-End Drops
+A view held in a local is active from its creation to its last use, and never past the end of its
+own scope. At a scope end the locals die in reverse declaration order (SPEC-12 AXS-DROP-002), so
+the implicit drop of an owner declared before a view local happens after that view is dead:
+`let a = S {}; let va: view<S> = view(a);` is valid whether or not `S` needs drop. The scope-end
+drop of an owner conflicts only with a view that is still used afterwards or that outlives the
+owner (stored in a longer-lived place, returned): that is AXS-CAP-004 / `AX_CAP_OUTLIVES_OWNER`.
+[ADR-0036 §3; T141 QA round 0 note]
+
 ## 2. Requirements for MIR
 
 The MIR must carry:
@@ -50,6 +68,9 @@ The MIR must carry:
 | AXS-CAP-005 | `let a = Object(); a.method();` | Yes (Implicit ephemeral) | T048 |
 | AXS-CAP-006 | `struct S { v: view<i32> }; let s: S; { let a = 1; s = S(view(a)); }` | No (Stored view escapes owner) | T048 |
 | AXS-CAP-007 | `let arr = [1, 2]; let s = arr.slice(); let m = mut_view(arr);` | No (Slice conflict) | T048b |
+| AXS-CAP-008 | `let mut b = D {}; let p: *mut D = unsafe { address_of_mut(b) };` (`impl Drop for D`) | Yes (raw pointer holds no capability) | T157 |
+| AXS-CAP-009 | `let a = D {}; let va: view<D> = view(a);` (`impl Drop for D`), end of function | Yes (`va` dies before `a` is dropped) | T157 |
+| AXS-CAP-009 | `let mut keep: view<D> = view(x0); { let a = D {}; keep = view(a); } use(keep);` | No (`AX_CAP_OUTLIVES_OWNER`) | T157 |
 
 ## References
 - `docs/base/specs/0177`, `docs/base/tasks/0541`, `docs/base/tasks/0270`

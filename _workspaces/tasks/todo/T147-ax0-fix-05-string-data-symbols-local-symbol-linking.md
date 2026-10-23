@@ -10,7 +10,7 @@ depends: [T146]
 priority: 0
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/driver/build_native, bootstrap/axiom0/src/driver/emit_obj.c, bootstrap/axiom0/src/link, compiler/backend, compiler/driver/pipeline.ax, compiler/link, compiler/obj, tests/link, tests/obj, tests/run/parity/strings, tests/selfhost]
+paths: [bootstrap/axiom0/src/driver/build_native, bootstrap/axiom0/src/driver/emit_obj.c, bootstrap/axiom0/src/link, compiler/backend, compiler/driver/pipeline.ax, compiler/link, compiler/obj, tests/link, tests/obj, tests/run/parity/strings, tests/run/numeric/qa_t140_edge_matrix.ax, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, 0185]
 covers: [REQ-CORE-3181, REQ-BLD-030]
 timeout_min: 240
@@ -74,6 +74,10 @@ Confirmed defects (architect probe 2026-10-20, `_workspaces/reports/plan-axiomc-
       `tests/run/native_str/*` and seven `tests/run/str/*` entries. Every remaining `tests/run/drop/*`
       entry is `same-behaviour` (no `different-behaviour` entry with a string-symbol cause remains);
       its line is updated in place. No entry is added (ADR-0035 §4).
+- [ ] `tests/run/numeric/qa_t140_edge_matrix.ax` is switched back to string literals (T141 round 0
+      rewrote it to print through one byte-buffer `put()` only to dodge the `.Lstr` divergence; T141
+      QA R0-4): every `stdout:` directive and every numeric `return n` check unchanged; passes in all
+      modes with axiom0 and is identical under axiomc_e2e (ADR-0036 §6).
 - [ ] `python tools/axtest.py --compiler build/axiom0.exe --filter selfhost/obj_link_driver` passes in
       `build-snap-T147`; full suite passes with native legs; build warning-free; archcheck clean.
 - [ ] Report `_workspaces/reports/T147-report.md` with exact `## Files changed`, the removed registry

@@ -207,6 +207,14 @@ operands of `place` left to right (base, index expressions) and perform its boun
 drop the old value of the place if it holds one that needs drop (SPEC-12, T049); (4) store the new
 value. The right side is therefore always evaluated before the destination is touched; `x =
 transform(x)` reads the old `x`. [0032 §7-8; 0041 §37, §39]
+Which places "hold" a value for step (3) (ADR-0036 §1, SPEC-12 AXS-DROP-007): every place whose
+projection chain contains no dereference of a raw pointer — locals, fields, tuple fields, array and
+slice elements, and places reached through a `view`/`mut_view` (explicit `*m`, auto-deref `w.f`,
+`self.f` with `self: mut_view<Self>`, an element of a `mut_view<[T]>`) drop their old value. A
+place whose chain contains a `Deref` of `*mut T`/`*const T` (including auto-deref `p.f` with
+`p: *mut S`) is a **raw store**: steps (1), (2), (4) only — the old bytes are overwritten and never
+dropped (raw pointers may target uninitialised memory; call `drop_in_place` first to drop).
+The classification follows the types along the projection path, not the syntax.
 
 **AXS-SEM-044 — Compound assignment.** `place op= rhs` is one operation, not textual expansion:
 (1) evaluate `rhs`; (2) evaluate the operands of `place` once, left to right, with bounds checks;
@@ -221,6 +229,15 @@ transform(x)` reads the old `x`. [0032 §7-8; 0041 §37, §39]
 exactly one branch. `match s { … }` evaluates `s` once; arms are tried top to bottom; a guard is
 evaluated only after its pattern matched, and the next arm is tried if it is `false`. A `while`
 condition is evaluated before each iteration. [0041 §9, §14, §23]
+
+**AXS-SEM-047 — Index through a view.** If the base of `base[i]` has type `view<X>` or
+`mut_view<X>` where `X` is an array `[N]T` (or another view of one), the base is dereferenced
+implicitly, one level at a time, exactly as for field access: `a[i]` means `(*a)[i]`. Reading needs
+`view` or `mut_view`; assigning to `a[i]` needs `mut_view`. A raw-pointer base is never
+auto-dereferenced (`p[i]` on `p: *mut [N]T` is `AX_TYPE_CANNOT_INDEX`; write `(*p)[i]` inside
+`unsafe`). Status: specified; implemented in axiomc after self-hosting (ROADMAP E14.5, R7). Until
+then `AX_TYPE_CANNOT_INDEX` with the hint `write (*a)[i]` is conforming for axiom0 and axiomc v0.1.
+[ADR-0036 §4; T141 QA N3]
 
 ## 6. Casts (`as`)
 

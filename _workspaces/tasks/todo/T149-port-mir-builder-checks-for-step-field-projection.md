@@ -52,6 +52,12 @@ normalised):
       `10..20` = 145 and of an inclusive range), `self_field_sum.ax` (method summing `(*self).0` and
       `(*self).1` of a two-field struct with distinct values prints their sum). All pass with axiom0
       and are identical under the e2e oracle.
+- [ ] `tests/run/parity/mir_builder/elem_store_through_view_drop.ax` (`modes: interp native`,
+      hand-written `stdout:`; deferred by T141 QA round 2 because of defect 5 / QA N2): an element
+      store `v[i] = S{..}` through `v: mut_view<[S]>` and `(*a)[i] = S{..}` through
+      `a: mut_view<[3]S>`, `S` with a printing `impl Drop` — the old element is dropped after the
+      rhs is evaluated (SPEC-12 AXS-DROP-007; T141 QA saw `2 1 5 3 ...` from both compilers), plus a
+      `u8` element variant; byte-identical under axiomc_e2e at -O0/-O1.
 - [ ] For every program of the plan table assigned to T149, `axiomc inspect --emit=mir` equals
       axiom0's after replacing `type#<n>` by a placeholder (a check script or test in the report).
 - [ ] `known_divergent.txt` shrinks by every entry that becomes identical — at least the 16

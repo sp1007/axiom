@@ -28,6 +28,10 @@ the roadmap is invented.
 - Scope not covered by an epic → ADR + new epic in ROADMAP (and change-log entry), never a stray task.
 - Add `depends` on the gate task of every phase ROADMAP lists as a prerequisite of an epic (for example E15.5 tasks depend on T312); take ids with `taskctl.py new-id --phase <P>`.
 
+- E14.5 (added by ADR-0036): index auto-deref through `view`/`mut_view` (SPEC-03 AXS-SEM-047) in
+  axiomc — typeck + MIR building + tests (`a[i]` read and write on `view<[N]T>`/`mut_view<[N]T>`,
+  negative: write through `view`, `p[i]` on a raw pointer); remove the v0.1 note in AXS-SEM-047.
+
 ## Acceptance
 - [ ] Every new task file passes `taskctl.py lint`; `taskctl.py validate` OK, `reqcov.py --strict` exits 0 and `harness_check.py` exits 0.
 - [ ] Every P14 epic has tasks; gate T314 depends on all of them.

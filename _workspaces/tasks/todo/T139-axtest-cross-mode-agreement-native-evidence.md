@@ -53,7 +53,11 @@ from the interpreter. Only `test: diff` compares executors with each other.
   `xfail: <fix task>` once the architect files it). Orphaned goldens with no manifest get one or are
   deleted with a reason. `tests/lir/COVERAGE.md` is corrected to state that these goldens are
   self-snapshot (category C) evidence.
-- `tests/README.md`: document the agreement check, `WEAK-NATIVE` and `stdout-file:`.
+- **Leg isolation (T141 QA round 2 N1, ADR-0036 §6):** the legs (interp, native-O0, native-O1) of one
+  test file never run concurrently: they are scheduled in one worker, in a fixed order (this also
+  serves the agreement check). Today every leg runs with `cwd=self.root`, so legs of
+  `tests/run/host/fs/dir.ax` (fixed relative directory `test_host_dir`) race under `-j > 1`.
+- `tests/README.md`: document the agreement check, leg serialisation, `WEAK-NATIVE` and `stdout-file:`.
 
 ## Acceptance
 - [ ] `python tools/tests/axtest/run_selftests.py` passes, including the new cases above.
@@ -69,6 +73,9 @@ from the interpreter. Only `test: diff` compares executors with each other.
       lists each drifted golden with its verdict (re-blessed + reason, or follow-up).
 - [ ] The final line format `TOTAL n PASS p FAIL f SKIP s XFAIL x` is unchanged (the WEAK-NATIVE
       line comes before it).
+- [ ] Runner self-test: two legs of one stub test that create and remove the same relative directory
+      never overlap under `-j 8`; `python tools/axtest.py --compiler build/axiom0.exe -j 8 --filter
+      run/host/fs` passes 20 consecutive times (log in the report).
 - [ ] Python 3 standard library only.
 - [ ] Report `_workspaces/reports/T139-report.md` with exact `## Files changed`.
 
