@@ -19,6 +19,7 @@ typedef struct Parser {
     bool allow_bodiless_fn;
     int tentative;
     bool tentative_failed;
+    size_t error_count; /* diagnostics reported so far (outside tentative parses) */
     size_t split_len;
     size_t split_idx[64];
     AxToken split_tok[64];
@@ -56,6 +57,7 @@ static void report(Parser *p, Span span, AxDiagCode code, const char *msg) {
         p->tentative_failed = true;
         return;
     }
+    p->error_count++;
     AxDiagnostic diag = {0};
     diag.code = code;
     diag.severity = AX_DIAG_ERROR;
@@ -217,6 +219,29 @@ static void split_rollback(Parser *p, size_t mark) {
         AxToken *mut_tok = (AxToken *)&p->tokens[p->split_idx[p->split_len]];
         *mut_tok = p->split_tok[p->split_len];
     }
+}
+
+/* AXS-GRM-011: every statement, item and trait/impl/extern member is followed by `Term`: a `;`
+   (consumed), a line break before the next token (newlines significant, AXS-GRM-010), or `}` /
+   EOF (not consumed). Anything else is reported at the next token; nothing is skipped, so the
+   caller goes on parsing that token as the start of the next statement or item. */
+static void expect_term(Parser *p, size_t errors_at_start, bool eat_semi) {
+    if (check(p, AX_TOK_SEMI)) {
+        /* An item's `;` is left for parse_item, which turns it into an empty item (kept so the
+           AST dumps stay unchanged); a statement's `;` is part of the statement. */
+        if (eat_semi) advance(p);
+        return;
+    }
+    if (check(p, AX_TOK_RBRACE) || check(p, AX_TOK_EOF)) return;
+    if (p->mode_on && (peek(p)->flags & AX_TOK_FLAG_NL_BEFORE)) return;
+    if (p->error_count != errors_at_start && p->tentative == 0) {
+        /* The statement or item already has a diagnostic: the tokens left on its line belong to
+           that error, so skip them (reported, not silent) instead of piling on a second error. */
+        sync_to_term(p);
+        if (eat_semi) consume(p, AX_TOK_SEMI);
+        return;
+    }
+    report(p, peek(p)->span, AX_PARSE_EXPECTED_TERMINATOR, "Expected a line break or ';'");
 }
 
 static AxAstGenericArgs *parse_generic_args(Parser *p) {
@@ -788,6 +813,8 @@ static AxAstExpr *parse_primary(Parser *p) {
         expr->kind = AX_EXPR_MATCH;
         expr->match.expr = parse_header_expr(p);
         expect(p, AX_TOK_LBRACE, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
+        bool old_match_mode = p->mode_on;
+        p->mode_on = true; /* AXS-GRM-010: `{` pushes ON */
         AxAstMatchArm **curr = &expr->match.arms;
         while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
             AxAstMatchArm *arm = NEW_NODE(p, AxAstMatchArm);
@@ -802,6 +829,7 @@ static AxAstExpr *parse_primary(Parser *p) {
             curr = &arm->next;
             consume(p, AX_TOK_COMMA); // optional comma
         }
+        p->mode_on = old_match_mode;
         expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
         return expr;
     } else if (check(p, AX_TOK_KW_LOOP) || (check(p, AX_TOK_LABEL) && peek_nth(p, 1)->kind == AX_TOK_COLON && peek_nth(p, 2)->kind == AX_TOK_KW_LOOP)) {
@@ -1149,12 +1177,16 @@ static AxAstBlock *parse_block(Parser *p) {
     block->stmts = NULL;
 
     expect(p, AX_TOK_LBRACE, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
-    
+
+    /* AXS-GRM-010: `{` pushes ON, also inside `(`/`[` (a closure body in a call argument) */
+    bool old_mode = p->mode_on;
+    p->mode_on = true;
     AxAstStmt **curr = &block->stmts;
     while (!check(p, AX_TOK_RBRACE) && !check(p, AX_TOK_EOF)) {
         *curr = parse_stmt(p);
         curr = &(*curr)->next;
     }
+    p->mode_on = old_mode;
 
     expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
     return block;
@@ -1194,6 +1226,7 @@ static AxAstStmt *parse_stmt(Parser *p) {
     AxAstStmt *stmt = NEW_NODE(p, AxAstStmt);
     stmt->span = peek(p)->span;
     stmt->next = NULL;
+    size_t errors_at_start = p->error_count;
 
     if (consume(p, AX_TOK_SEMI)) {
         stmt->kind = AX_STMT_EXPR; // empty stmt, represented as dummy expression maybe?
@@ -1207,6 +1240,7 @@ static AxAstStmt *parse_stmt(Parser *p) {
         report(p, peek(p)->span, AX_PARSE_IMPORT, "import is not a keyword");
         advance(p);
         stmt->kind = AX_STMT_ERROR;
+        /* already reported: skip the rest of the erroneous line, the terminator is then there */
         sync_to_term(p);
     } else if (check(p, AX_TOK_IDENT) && ax_sv_eq(ax_interner_get(p->interner, peek(p)->val.ident_val), ax_sv_cstr("var"))) {
         report(p, peek(p)->span, AX_PARSE_VAR, "replace var by let mut");
@@ -1273,16 +1307,14 @@ static AxAstStmt *parse_stmt(Parser *p) {
             advance(p);
             stmt->assign.left = expr;
             stmt->assign.right = parse_expr(p);
-            consume(p, AX_TOK_SEMI);
         } else {
             stmt->kind = AX_STMT_EXPR;
             stmt->expr_stmt.expr = expr;
-            stmt->expr_stmt.has_semi = consume(p, AX_TOK_SEMI);
+            stmt->expr_stmt.has_semi = check(p, AX_TOK_SEMI);
         }
     }
-    
-    sync_to_term(p);
-    consume(p, AX_TOK_SEMI);
+
+    expect_term(p, errors_at_start, true);
     return stmt;
 }
 
@@ -1419,8 +1451,11 @@ static AxAstItem *parse_synthetic_item(Parser *p, const char *text) {
 
 static void expand_derives(Parser *p, AxAstItem *item) {
     if (item->kind != AX_ITEM_STRUCT && item->kind != AX_ITEM_ENUM) return;
-    
-    const char *struct_name = ax_interner_get(p->interner, item->kind == AX_ITEM_STRUCT ? item->struct_decl.name : item->enum_decl.name).ptr;
+    if (!item->attrs) return;
+
+    /* a missing name (already reported by the parser) is the empty string, like the port's push_name */
+    StrId item_name = item->kind == AX_ITEM_STRUCT ? item->struct_decl.name : item->enum_decl.name;
+    const char *struct_name = item_name.v ? ax_interner_get(p->interner, item_name).ptr : "";
     
     AxAstItem **tail = &item->next;
     while (*tail) tail = &(*tail)->next;
@@ -1471,7 +1506,7 @@ static void expand_derives(Parser *p, AxAstItem *item) {
                         for (AxAstFieldDecl *f = item->struct_decl.struct_fields; f; f = f->next) {
                             const char *fname = ax_interner_get(p->interner, f->name).ptr;
                             char fbuf[128];
-                            snprintf(fbuf, sizeof(fbuf), "self.%s.hash(state); ", fname);
+                            snprintf(fbuf, sizeof(fbuf), "self.%s.hash(mut_view(*state)); ", fname); /* reborrow: a second field must not use a moved view */
                             strcat(body, fbuf);
                         }
                         snprintf(buf, sizeof(buf), "impl Hash for %s { fn hash<H: Hasher>(self: view<%s>, state: mut_view<H>) { %s } }", struct_name, struct_name, body);
@@ -1521,6 +1556,7 @@ static AxAstItem *parse_item(Parser *p) {
 
     AxAstItem *item = NEW_NODE(p, AxAstItem);
     item->span = peek(p)->span;
+    size_t errors_at_start = p->error_count;
     item->attrs = parse_attributes(p);
     item->vis = parse_visibility(p);
     item->next = NULL;
@@ -1542,11 +1578,9 @@ static AxAstItem *parse_item(Parser *p) {
         }
         item->kind = AX_ITEM_MODULE;
         item->module.path = parse_dotted_name(p);
-        sync_to_term(p);
     } else if (consume(p, AX_TOK_KW_USE)) {
         item->kind = AX_ITEM_USE;
         item->use.tree = parse_use_tree(p);
-        sync_to_term(p);
     } else if (consume(p, AX_TOK_KW_CONST)) {
         item->kind = AX_ITEM_CONST;
         item->const_decl.name = peek(p)->val.ident_val;
@@ -1556,7 +1590,6 @@ static AxAstItem *parse_item(Parser *p) {
         if (consume(p, AX_TOK_EQ)) {
             item->const_decl.expr = parse_expr(p);
         }
-        sync_to_term(p);
     } else if (check(p, AX_TOK_KW_STATIC) || (check(p, AX_TOK_KW_UNSAFE) && peek_nth(p, 1)->kind == AX_TOK_KW_STATIC)) {
         bool is_unsafe = consume(p, AX_TOK_KW_UNSAFE);
         consume(p, AX_TOK_KW_STATIC);
@@ -1572,7 +1605,6 @@ static AxAstItem *parse_item(Parser *p) {
         } else {
             item->static_decl.expr = NULL;
         }
-        sync_to_term(p);
     } else if (check(p, AX_TOK_KW_FN) || 
               (check(p, AX_TOK_KW_UNSAFE) && peek_nth(p, 1)->kind == AX_TOK_KW_FN) || 
               (check(p, AX_TOK_KW_EXTERN) && (peek_nth(p, 1)->kind == AX_TOK_KW_FN || (peek_nth(p, 1)->kind == AX_TOK_STR && peek_nth(p, 2)->kind == AX_TOK_KW_FN))) ||
@@ -1615,8 +1647,8 @@ static AxAstItem *parse_item(Parser *p) {
             item->fn.body = NULL;
             if (!p->allow_bodiless_fn) {
                 report(p, peek(p)->span, AX_PARSE_EXPECTED_TOKEN, "Expected '{'");
+                sync_to_term(p); /* already reported: skip the rest of the erroneous line */
             }
-            sync_to_term(p);
         }
     } else if (consume(p, AX_TOK_KW_STRUCT)) {
         item->kind = AX_ITEM_STRUCT;
@@ -1637,7 +1669,6 @@ static AxAstItem *parse_item(Parser *p) {
             }
             expect(p, AX_TOK_RPAREN, AX_PARSE_UNCLOSED_DELIMITER, "Expected ')'");
             item->struct_decl.where_clause = parse_where_clause(p);
-            sync_to_term(p);
         } else {
             item->struct_decl.where_clause = parse_where_clause(p);
             if (consume(p, AX_TOK_LBRACE)) {
@@ -1659,7 +1690,6 @@ static AxAstItem *parse_item(Parser *p) {
                 expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
             } else {
                 item->struct_decl.struct_fields = NULL;
-                sync_to_term(p);
             }
         }
     } else if (consume(p, AX_TOK_KW_ENUM)) {
@@ -1710,8 +1740,6 @@ static AxAstItem *parse_item(Parser *p) {
                 if (!consume(p, AX_TOK_COMMA)) break;
             }
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
-        } else {
-            sync_to_term(p);
         }
     } else if (consume(p, AX_TOK_KW_TRAIT)) {
         item->kind = AX_ITEM_TRAIT;
@@ -1732,8 +1760,6 @@ static AxAstItem *parse_item(Parser *p) {
             }
             p->allow_bodiless_fn = old_bodiless;
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
-        } else {
-            sync_to_term(p);
         }
     } else if (consume(p, AX_TOK_KW_IMPL)) {
         item->kind = AX_ITEM_IMPL;
@@ -1758,8 +1784,6 @@ static AxAstItem *parse_item(Parser *p) {
                 while (*curr) curr = &(*curr)->next;
             }
             expect(p, AX_TOK_RBRACE, AX_PARSE_UNCLOSED_DELIMITER, "Expected '}'");
-        } else {
-            sync_to_term(p);
         }
     } else if (consume(p, AX_TOK_KW_TYPE)) {
         item->kind = AX_ITEM_TYPE_ALIAS;
@@ -1778,7 +1802,6 @@ static AxAstItem *parse_item(Parser *p) {
         if (consume(p, AX_TOK_EQ)) {
             item->type_alias.type = parse_type(p);
         }
-        sync_to_term(p);
     } else if (consume(p, AX_TOK_KW_EXTERN)) {
         if (item->vis.kind != AX_VIS_PRIVATE) {
             report(p, item->span, AX_PARSE_VIS_NOT_ALLOWED, "vis not allowed on extern block");
@@ -1808,7 +1831,9 @@ static AxAstItem *parse_item(Parser *p) {
         advance(p);
         sync_to_term(p);
     }
-    
+
+    expect_term(p, errors_at_start, false);
+
     if (item->kind == AX_ITEM_STRUCT || item->kind == AX_ITEM_ENUM) {
         expand_derives(p, item);
     }

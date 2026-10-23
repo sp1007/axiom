@@ -8,14 +8,14 @@ model: sonnet
 gate_model: opus
 depends: [T085, T141]
 priority: 0
-status: doing
+status: done
 attempts: 1
 paths: [bootstrap/axiom0/src/syntax, compiler, std, tests]
 spec: [spec/SPEC-02-grammar.md, spec/decisions/ADR-0034-oracle-independence.md, tasks/0476]
 covers: [REQ-GRM-148]
 timeout_min: 240
 started: 2026-10-23 18:54:46
-agent: T146-impl
+finished: 2026-10-24 00:56:32
 ---
 # T146 — AX0-FIX-04: statement terminator enforced
 
@@ -73,3 +73,4 @@ whose dropped tail still type-checks is miscompiled without any diagnostic.
 
 ## Log
 - 2026-10-23 18:54:46 started (attempt 1) T146-impl
+- 2026-10-24 00:56:32 accepted by QA -> done
