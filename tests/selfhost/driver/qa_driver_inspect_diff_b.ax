@@ -16918,6 +16918,8 @@ pub fn lower_ast(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>,
     HirFile { items: items }
 }
 
+@intrinsic fn size_of<T>() -> usize { 0 }
+
 fn sv_eq_cstr4(sv: StrView, c0: u8, c1: u8, c2: u8, c3: u8) -> bool {
     if sv.len != 4 {
         return false;
@@ -16962,6 +16964,108 @@ fn clone_hir_item_shallow(arena: mut_view<Arena>, src: *mut HirItem) -> *mut Hir
     dst
 }
 
+// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait
+// path `P` resolves to the prelude lang item `Drop`. In v0.1 that lang item is reached only by the bare
+// name, so `P` is the language Drop iff
+//   (1) `P` is the single segment `Drop` without generic arguments (`m.Drop` is a path to a user item), and
+//   (2) the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor binds the
+//       name `Drop` with a `use` (a shadowing `trait Drop`, an imported `use m.Drop`): module scope
+//       shadows the prelude.
+// The same predicate decides the destructor renaming below, typeck's `$drop` mangling and registration
+// (compiler/types/typeck.ax tc_impl_is_lang_drop) and drop elaboration (compiler/mir/drop.ax
+// drop_impl_is_lang_drop); its C twin is ax_hir_impl_is_lang_drop in bootstrap/axiom0/src/mir/drop/drop.c.
+fn hir_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {
+    if id.v == 0u32 {
+        return false;
+    }
+    sv_eq_cstr4(interner_get(interner, id), 68u8, 114u8, 111u8, 112u8)
+}
+
+fn hir_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {
+    let mut cur: *mut HirUseTree = t;
+    while (cur as usize) != 0 {
+        let count = unsafe { (*cur).path.count };
+        if (unsafe { (*cur).subtrees as usize }) != 0 {
+            if hir_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {
+                return true;
+            }
+        } else if (unsafe { (*cur).alias.v }) != 0u32 {
+            if hir_name_is_drop(interner, unsafe { (*cur).alias }) {
+                return true;
+            }
+        } else if count > 0 {
+            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;
+            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;
+            if hir_name_is_drop(interner, unsafe { *seg_ptr }) {
+                return true;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn hir_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {
+    let count = unsafe { (*a).module_path.count };
+    if count != (unsafe { (*b).module_path.count }) {
+        return false;
+    }
+    let sa = unsafe { (*a).module_path.segments } as usize;
+    let sb = unsafe { (*b).module_path.segments } as usize;
+    let mut i: usize = 0;
+    while i < count {
+        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;
+        let pa = (sa + off) as *const StrId;
+        let pb = (sb + off) as *const StrId;
+        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn hir_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {
+    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {
+        return false;
+    }
+    let tp: *mut HirType = unsafe { (*impl_item).trait_path };
+    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    if (unsafe { (*tp).path.generic_args as usize }) != 0 {
+        return false;
+    }
+    if !hir_name_is_drop(interner, unsafe { (*tp).path.name }) {
+        return false;
+    }
+    // (1) a qualified path is longer than its last segment (spans of unspanned synthetic HIR are 0).
+    if (unsafe { (*tp).path.span.file.v }) != 0u32 {
+        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });
+        if span_len != 4u32 {
+            return false;
+        }
+    }
+    // (2) module scope shadows the prelude.
+    let mut it: *mut HirItem = items;
+    while (it as usize) != 0 {
+        if hir_module_path_eq(it, impl_item) {
+            let k = unsafe { (*it).kind };
+            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {
+                if hir_name_is_drop(interner, unsafe { (*it).name }) {
+                    return false;
+                }
+            } else if k == HIR_ITEM_USE {
+                if hir_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {
+                    return false;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    true
+}
+
 pub fn hir_postprocess_items(arena: mut_view<Arena>, hf: mut_view<HirFile>, interner: mut_view<StrInterner>) {
     let mut tail: *mut HirItem = hf.items;
     if (tail as usize) == 0 {
@@ -16979,9 +17083,9 @@ pub fn hir_postprocess_items(arena: mut_view<Arena>, hf: mut_view<HirFile>, inte
             let tp: *mut HirType = unsafe { (*it).trait_path };
             let st: *mut HirType = unsafe { (*it).self_type };
             if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH && (unsafe { (*tp).kind }) == HIR_TYPE_PATH {
-                if (unsafe { (*tp).path.generic_args as usize }) == 0 {
-                    let tname = interner_get(view(*interner), unsafe { (*tp).path.name });
-                    if sv_eq_cstr4(tname, 68u8, 114u8, 111u8, 112u8) {
+                {
+                    // T158 / AXS-DROP-008: the same predicate as typeck, drop elaboration and axiom0's pipeline.c.
+                    if hir_impl_is_lang_drop(hf.items, it, view(*interner)) {
                         let sname = interner_get(view(*interner), unsafe { (*st).path.name });
                         let buf = arena_alloc_raw(mut_view(*arena), sname.len + 5, 1);
                         let mut i: usize = 0;
@@ -30332,19 +30436,107 @@ fn check_item_body(cx: mut_view<TypeckCtx>, it: *mut HirItem, parent_impl: *cons
     }
 }
 
-fn tc_is_drop_trait_name(sv: view<StrView>) -> bool {
-    if (sv.len) < 4 {
+// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait
+// path `P` resolves to the prelude lang item `Drop`: `P` is the single segment `Drop` without generic
+// arguments, and the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor
+// binds the name `Drop` with a `use`. Same predicate as hir_impl_is_lang_drop (compiler/hir/lower.ax,
+// documented there) and ax_hir_impl_is_lang_drop / the twin in bootstrap/axiom0/src/types/typeck.c.
+fn tc_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {
+    if id.v == 0u32 {
         return false;
     }
-    let off = sv.len - 4;
-    if off > 0 && (unsafe { *(sv.ptr + off - 1) }) != 46u8 {
+    let sv = interner_get(interner, id);
+    if sv.len != 4 {
         return false;
     }
-    let b0 = unsafe { *(sv.ptr + off) };
-    let b1 = unsafe { *(sv.ptr + off + 1) };
-    let b2 = unsafe { *(sv.ptr + off + 2) };
-    let b3 = unsafe { *(sv.ptr + off + 3) };
+    let b0 = unsafe { *(sv.ptr + 0) };
+    let b1 = unsafe { *(sv.ptr + 1) };
+    let b2 = unsafe { *(sv.ptr + 2) };
+    let b3 = unsafe { *(sv.ptr + 3) };
     b0 == 68u8 && b1 == 114u8 && b2 == 111u8 && b3 == 112u8
+}
+
+fn tc_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {
+    let mut cur: *mut HirUseTree = t;
+    while (cur as usize) != 0 {
+        let count = unsafe { (*cur).path.count };
+        if (unsafe { (*cur).subtrees as usize }) != 0 {
+            if tc_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {
+                return true;
+            }
+        } else if (unsafe { (*cur).alias.v }) != 0u32 {
+            if tc_name_is_drop(interner, unsafe { (*cur).alias }) {
+                return true;
+            }
+        } else if count > 0 {
+            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;
+            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;
+            if tc_name_is_drop(interner, unsafe { *seg_ptr }) {
+                return true;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn tc_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {
+    let count = unsafe { (*a).module_path.count };
+    if count != (unsafe { (*b).module_path.count }) {
+        return false;
+    }
+    let sa = unsafe { (*a).module_path.segments } as usize;
+    let sb = unsafe { (*b).module_path.segments } as usize;
+    let mut i: usize = 0;
+    while i < count {
+        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;
+        let pa = (sa + off) as *const StrId;
+        let pb = (sb + off) as *const StrId;
+        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn tc_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {
+    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {
+        return false;
+    }
+    let tp: *mut HirType = unsafe { (*impl_item).trait_path };
+    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    if (unsafe { (*tp).path.generic_args as usize }) != 0 {
+        return false;
+    }
+    if !tc_name_is_drop(interner, unsafe { (*tp).path.name }) {
+        return false;
+    }
+    if (unsafe { (*tp).path.span.file.v }) != 0u32 {
+        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });
+        if span_len != 4u32 {
+            return false;
+        }
+    }
+    let mut it: *mut HirItem = items;
+    while (it as usize) != 0 {
+        if tc_module_path_eq(it, impl_item) {
+            let k = unsafe { (*it).kind };
+            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {
+                if tc_name_is_drop(interner, unsafe { (*it).name }) {
+                    return false;
+                }
+            } else if k == HIR_ITEM_USE {
+                if tc_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {
+                    return false;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    true
 }
 
 fn tc_write_u32_dec(buf: *mut u8, start: usize, val: u32) -> usize {
@@ -30379,13 +30571,7 @@ fn tc_mangle_drop_impls(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>) {
             let tp: *mut HirType = unsafe { (*it).trait_path };
             let st: *mut HirType = unsafe { (*it).self_type };
             if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH {
-                let mut tname = StrView { ptr: 0 as *const u8, len: 0 };
-                if (unsafe { (*tp).path.name.v }) != 0u32 {
-                    tname = unsafe { interner_get(view(*cx.str_in), (*tp).path.name) };
-                } else if (cx.db as usize) != 0 {
-                    tname = unsafe { source_db_span_text(view(*cx.db), (*tp).span) };
-                }
-                if tc_is_drop_trait_name(view(tname)) {
+                if tc_impl_is_lang_drop(hir_file.items, it, unsafe { view(*cx.str_in) }) {
                     let mut sname = StrView { ptr: 0 as *const u8, len: 0 };
                     if (unsafe { (*st).path.name.v }) != 0u32 {
                         sname = unsafe { interner_get(view(*cx.str_in), (*st).path.name) };
@@ -30740,13 +30926,7 @@ pub fn typeck_into(
             }
             let tp_node: *mut HirType = unsafe { (*top_it).trait_path };
             if (tp_node as usize) != 0 && impl_self_ty.v != 0u32 {
-                let mut tname = StrView { ptr: 0 as *const u8, len: 0 };
-                if (cx.str_in as usize) != 0 && (unsafe { (*tp_node).path.name.v }) != 0u32 {
-                    tname = unsafe { interner_get(view(*cx.str_in), (*tp_node).path.name) };
-                } else if (cx.db as usize) != 0 {
-                    tname = unsafe { source_db_span_text(view(*cx.db), (*tp_node).span) };
-                }
-                if tc_is_drop_trait_name(view(tname)) {
+                if (cx.str_in as usize) != 0 && tc_impl_is_lang_drop(hir_file.items, top_it, unsafe { view(*cx.str_in) }) {
                     let self_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: impl_self_ty.v })) };
                     if (self_t as usize) != 0 && (unsafe { (*self_t).kind }) == TY_STRUCT {
                         let mut dm: *mut HirItem = unsafe { (*top_it).members };
@@ -36150,9 +36330,15 @@ use compiler.source.manager.source_db_span_text
 use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirType
+use compiler.hir.hir.HIR_ITEM_ENUM
 use compiler.hir.hir.HIR_ITEM_FN
 use compiler.hir.hir.HIR_ITEM_IMPL
+use compiler.hir.hir.HIR_ITEM_STRUCT
+use compiler.hir.hir.HIR_ITEM_TRAIT
+use compiler.hir.hir.HIR_ITEM_TYPE_ALIAS
+use compiler.hir.hir.HIR_ITEM_USE
 use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.hir.hir.HirUseTree
 use compiler.types.types.AxType
 use compiler.types.types.Thir
 use compiler.types.types.CAP_MOVE
@@ -36237,7 +36423,7 @@ use compiler.mir.mir.mir_u64_at
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 @intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
 
-// The name of the destructor trait, compared byte-wise with the trait path of every impl.
+// The name of the destructor trait, compared byte-wise with the last segment of every impl trait path.
 const DROP_TRAIT_NAME: [4]u8 = [68u8, 114u8, 111u8, 112u8];
 
 // =================================================================================================
@@ -36253,26 +36439,6 @@ fn drop_sv_eq(a: view<StrView>, b: view<StrView>) -> bool {
         let byte_a = unsafe { *(a.ptr + i) };
         let byte_b = unsafe { *(b.ptr + i) };
         if byte_a != byte_b {
-            return false;
-        }
-        i = i + 1;
-    }
-    true
-}
-
-fn drop_sv_is_drop_trait(sv: view<StrView>) -> bool {
-    let slen = sv.len;
-    if slen < 4 {
-        return false;
-    }
-    let off = sv.len - 4;
-    if off > 0 && (unsafe { *(sv.ptr + off - 1) }) != 46u8 {
-        return false;
-    }
-    let mut i: usize = 0;
-    while i < 4 {
-        let byte = unsafe { *(sv.ptr + off + i) };
-        if byte != DROP_TRAIT_NAME[i] {
             return false;
         }
         i = i + 1;
@@ -36297,24 +36463,112 @@ fn drop_sv_before_generics(sv: StrView) -> StrView {
 // User destructors (`impl Drop for T`)
 // =================================================================================================
 
-// The trait name of an impl: its source text when a source database is available, otherwise the
-// interned path name (C: `ax_source_db_span_text` / `ax_interner_get`).
-fn drop_impl_trait_name(
-    it: *const HirItem,
-    db: *const SourceDatabase,
-    str_in: view<StrInterner>
-) -> StrView {
-    let trait_path: *mut HirType = unsafe { (*it).trait_path };
-    if (db as usize) != 0 {
-        let trait_span = unsafe { (*trait_path).span };
-        return unsafe { source_db_span_text(view(*db), trait_span) };
+// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait
+// path `P` resolves to the prelude lang item `Drop`: `P` is the single segment `Drop` without generic
+// arguments, and the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor
+// binds the name `Drop` with a `use`. Same predicate as hir_impl_is_lang_drop (compiler/hir/lower.ax,
+// documented there), tc_impl_is_lang_drop (compiler/types/typeck.ax) and ax_hir_impl_is_lang_drop
+// (bootstrap/axiom0/src/mir/drop/drop.c). The trait name is never read from source text.
+fn drop_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {
+    if id.v == 0u32 {
+        return false;
     }
-    let str_ptr = unsafe { address_of(str_in.bytes.head) as usize };
-    let trait_name_v = unsafe { (*trait_path).path.name.v };
-    if trait_name_v != 0u32 && str_ptr != 0 {
-        return interner_get(str_in, StrId { v: trait_name_v });
+    let sv = interner_get(interner, id);
+    if sv.len != 4 {
+        return false;
     }
-    StrView { ptr: 0 as *const u8, len: 0 }
+    let mut i: usize = 0;
+    while i < 4 {
+        let byte = unsafe { *(sv.ptr + i) };
+        if byte != DROP_TRAIT_NAME[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn drop_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {
+    let mut cur: *mut HirUseTree = t;
+    while (cur as usize) != 0 {
+        let count = unsafe { (*cur).path.count };
+        if (unsafe { (*cur).subtrees as usize }) != 0 {
+            if drop_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {
+                return true;
+            }
+        } else if (unsafe { (*cur).alias.v }) != 0u32 {
+            if drop_name_is_drop(interner, unsafe { (*cur).alias }) {
+                return true;
+            }
+        } else if count > 0 {
+            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;
+            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;
+            if drop_name_is_drop(interner, unsafe { *seg_ptr }) {
+                return true;
+            }
+        }
+        cur = unsafe { (*cur).next };
+    }
+    false
+}
+
+fn drop_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {
+    let count = unsafe { (*a).module_path.count };
+    if count != (unsafe { (*b).module_path.count }) {
+        return false;
+    }
+    let sa = unsafe { (*a).module_path.segments } as usize;
+    let sb = unsafe { (*b).module_path.segments } as usize;
+    let mut i: usize = 0;
+    while i < count {
+        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;
+        let pa = (sa + off) as *const StrId;
+        let pb = (sb + off) as *const StrId;
+        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn drop_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {
+    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {
+        return false;
+    }
+    let tp: *mut HirType = unsafe { (*impl_item).trait_path };
+    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {
+        return false;
+    }
+    if (unsafe { (*tp).path.generic_args as usize }) != 0 {
+        return false;
+    }
+    if !drop_name_is_drop(interner, unsafe { (*tp).path.name }) {
+        return false;
+    }
+    if (unsafe { (*tp).path.span.file.v }) != 0u32 {
+        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });
+        if span_len != 4u32 {
+            return false;
+        }
+    }
+    let mut it: *mut HirItem = items;
+    while (it as usize) != 0 {
+        if drop_module_path_eq(it, impl_item) {
+            let k = unsafe { (*it).kind };
+            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {
+                if drop_name_is_drop(interner, unsafe { (*it).name }) {
+                    return false;
+                }
+            } else if k == HIR_ITEM_USE {
+                if drop_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {
+                    return false;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    true
 }
 
 // The self type name of an impl, without generic arguments when read from source text.
@@ -36337,8 +36591,10 @@ fn drop_impl_self_name(
     StrView { ptr: 0 as *const u8, len: 0 }
 }
 
-// True when `it` is `impl Drop for <def>` with a path self type.
+// True when `it` is `impl Drop for <def>` (the language Drop, AXS-DROP-008) with a path self type. The
+// self type is compared first: the Drop predicate scans the impl's module.
 fn drop_impl_is_drop_for(
+    items: *mut HirItem,
     it: *const HirItem,
     def: *const HirItem,
     target_name: view<StrView>,
@@ -36358,17 +36614,23 @@ fn drop_impl_is_drop_for(
     if self_kind != HIR_TYPE_PATH {
         return false;
     }
-    let trait_name = drop_impl_trait_name(it, db, str_in);
-    if !drop_sv_is_drop_trait(view(trait_name)) {
+    let str_ptr = unsafe { address_of(str_in.bytes.head) as usize };
+    if str_ptr == 0 {
         return false;
     }
     let def_sym_v = unsafe { (*def).symbol.v };
     let impl_sym_v = unsafe { (*self_type).path.symbol.v };
+    let mut same_type = false;
     if def_sym_v != 0u32 && impl_sym_v != 0u32 {
-        return def_sym_v == impl_sym_v;
+        same_type = def_sym_v == impl_sym_v;
+    } else {
+        let impl_name = drop_impl_self_name(it, db, str_in);
+        same_type = drop_sv_eq(target_name, view(impl_name));
     }
-    let impl_name = drop_impl_self_name(it, db, str_in);
-    drop_sv_eq(target_name, view(impl_name))
+    if !same_type {
+        return false;
+    }
+    drop_impl_is_lang_drop(items, it as *mut HirItem, str_in)
 }
 
 // The first fn member of the first `impl Drop for <def>` that has one, or null.
@@ -36391,7 +36653,7 @@ pub fn mir_find_drop_impl_fn(
     };
     let mut it: *mut HirItem = hir.items;
     while (it as usize) != 0 {
-        if drop_impl_is_drop_for(it as *const HirItem, def, view(target_name), db, str_in) {
+        if drop_impl_is_drop_for(hir.items, it as *const HirItem, def, view(target_name), db, str_in) {
             let mut member: *mut HirItem = unsafe { (*it).members };
             while (member as usize) != 0 {
                 let member_kind = unsafe { (*member).kind };

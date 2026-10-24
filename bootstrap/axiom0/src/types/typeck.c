@@ -1432,6 +1432,70 @@ static void check_all_bounds(TypeckCtx *cx) {
     }
 }
 
+/* SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of T iff the trait
+ * path P resolves to the prelude lang item `Drop`. Twin of ax_hir_impl_is_lang_drop in mir/drop/drop.c
+ * (this layer sits below mir and cannot call it; the contract is documented there): P is the single
+ * segment `Drop` without generic arguments, and the impl's module neither declares a trait, struct,
+ * enum or type alias named `Drop` nor binds the name `Drop` with a `use`. */
+static bool tc_is_drop_str(StrInterner *in, StrId id) {
+    if (id.v == 0) return false;
+    StrView sv = ax_interner_get(in, id);
+    return sv.len == 4 && memcmp(sv.ptr, "Drop", 4) == 0;
+}
+
+static bool tc_dotted_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
+    if (a->count != b->count) return false;
+    for (size_t i = 0; i < a->count; i++) {
+        if (a->segments[i].v != b->segments[i].v) return false;
+    }
+    return true;
+}
+
+static bool tc_use_tree_binds_drop(StrInterner *in, const AxHirUseTree *t) {
+    for (; t; t = t->next) {
+        if (t->subtrees) {
+            if (tc_use_tree_binds_drop(in, t->subtrees)) return true;
+        } else if (t->alias.v != 0) {
+            if (tc_is_drop_str(in, t->alias)) return true;
+        } else if (t->path.count > 0) {
+            if (tc_is_drop_str(in, t->path.segments[t->path.count - 1])) return true;
+        }
+    }
+    return false;
+}
+
+static bool tc_impl_is_lang_drop(const AxHir *hir, const AxHirItem *impl, StrInterner *str_in, const SourceDatabase *db) {
+    if (!impl || impl->kind != AX_HIR_ITEM_IMPL) return false;
+    const AxHirType *tp = impl->impl.trait_path;
+    if (!tp || tp->kind != AX_HIR_TYPE_PATH || tp->path.path.generic_args != NULL) return false;
+    StrView name = {0};
+    if (str_in && tp->path.path.name.v != 0) {
+        name = ax_interner_get(str_in, tp->path.path.name);
+    } else if (db && tp->span.file.v != 0) {
+        name = ax_source_db_span_text(db, tp->span);
+        size_t start = name.len;
+        while (start > 0 && name.ptr[start - 1] != '.') start--;
+        name.ptr += start;
+        name.len -= start;
+    }
+    if (name.len != 4 || memcmp(name.ptr, "Drop", 4) != 0) return false;
+    const Span *sp = &tp->path.path.span;
+    if (sp->file.v != 0 && (size_t)(sp->end - sp->start) != name.len) return false;
+    if (!hir || !str_in) return true;
+    for (const AxHirItem *it = hir->items; it; it = it->next) {
+        if (!tc_dotted_eq(&it->module_path, &impl->module_path)) continue;
+        switch (it->kind) {
+            case AX_HIR_ITEM_TRAIT: if (tc_is_drop_str(str_in, it->trait.name)) return false; break;
+            case AX_HIR_ITEM_STRUCT: if (tc_is_drop_str(str_in, it->struct_decl.name)) return false; break;
+            case AX_HIR_ITEM_ENUM: if (tc_is_drop_str(str_in, it->enum_decl.name)) return false; break;
+            case AX_HIR_ITEM_TYPE_ALIAS: if (tc_is_drop_str(str_in, it->type_alias.name)) return false; break;
+            case AX_HIR_ITEM_USE: if (tc_use_tree_binds_drop(str_in, it->use.tree)) return false; break;
+            default: break;
+        }
+    }
+    return true;
+}
+
 AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner *str_in, const SourceDatabase *db, const AxConstEvaluator *evaluator) {
     AxThir thir;
     ax_thir_init(&thir);
@@ -1455,15 +1519,7 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
     for (AxHirItem *it = (AxHirItem *)hir->items; it; it = it->next) {
         if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type &&
             it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-            StrView tr_sv = {0};
-            if (it->impl.trait_path->path.path.name.v != 0) {
-                tr_sv = ax_interner_get(str_in, it->impl.trait_path->path.path.name);
-            } else if (db && it->impl.trait_path->span.file.v != 0) {
-                tr_sv = ax_source_db_span_text(db, it->impl.trait_path->span);
-            }
-            bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
-                              (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
-            if (!is_drop_tr) continue;
+            if (!tc_impl_is_lang_drop(hir, it, str_in, db)) continue;
 
             StrView self_sv = {0};
             if (it->impl.self_type->path.path.name.v != 0) {
@@ -1730,15 +1786,7 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
                 cx.self_ty = TypeId_none();
             }
             if (top_it->impl.trait_path && !TypeId_is_none(cx.self_ty) && cx.self_ty.v != 0) {
-                StrView tr_sv = {0};
-                if (top_it->impl.trait_path->path.path.name.v != 0) {
-                    tr_sv = ax_interner_get(str_in, top_it->impl.trait_path->path.path.name);
-                } else if (db && top_it->impl.trait_path->span.file.v != 0) {
-                    tr_sv = ax_source_db_span_text(db, top_it->impl.trait_path->span);
-                }
-                bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
-                                  (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
-                if (is_drop_tr) {
+                if (tc_impl_is_lang_drop(hir, top_it, str_in, db)) {
                     const AxType *self_t = ax_type_get(&thir.interner, cx.self_ty);
                     if (self_t && self_t->kind == AX_TY_STRUCT) {
                         for (const AxHirItem *m = top_it->impl.members; m; m = m->next) {
@@ -1874,15 +1922,7 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
                 cx.self_ty = TypeId_none();
             }
             if (top_it->impl.trait_path && !TypeId_is_none(cx.self_ty) && cx.self_ty.v != 0) {
-                StrView tr_sv = {0};
-                if (top_it->impl.trait_path->path.path.name.v != 0) {
-                    tr_sv = ax_interner_get(str_in, top_it->impl.trait_path->path.path.name);
-                } else if (db && top_it->impl.trait_path->span.file.v != 0) {
-                    tr_sv = ax_source_db_span_text(db, top_it->impl.trait_path->span);
-                }
-                bool is_drop_tr = (tr_sv.len == 4 && memcmp(tr_sv.ptr, "Drop", 4) == 0) ||
-                                  (tr_sv.len > 5 && memcmp(tr_sv.ptr + tr_sv.len - 5, ".Drop", 5) == 0);
-                if (is_drop_tr) {
+                if (tc_impl_is_lang_drop(hir, top_it, str_in, db)) {
                     const AxType *self_t = ax_type_get(&thir.interner, cx.self_ty);
                     if (self_t && self_t->kind == AX_TY_STRUCT) {
                         for (const AxHirItem *m = top_it->impl.members; m; m = m->next) {

@@ -361,8 +361,9 @@ static void stage_hir(AxDriverState *st) {
             if (it->kind == AX_HIR_ITEM_IMPL && it->impl.members) {
                 // BOOTSTRAP-SHORTCUT T131: Mangle destructor names
                 if (it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                    StrView trait_name = ax_source_db_span_text(&st->db, it->impl.trait_path->span);
-                    if (trait_name.len == 4 && memcmp(trait_name.ptr, "Drop", 4) == 0) {
+                    /* T158 / AXS-DROP-008: the same predicate as typeck, drop elaboration and the port's
+                     * hir_postprocess_items - the trait path resolves to the prelude lang item Drop. */
+                    if (ax_hir_impl_is_lang_drop(it, &st->hir, &st->interner, &st->db)) {
                         StrView self_name = ax_source_db_span_text(&st->db, it->impl.self_type->path.path.span);
                         size_t less_idx = 0;
                         while (less_idx < self_name.len && self_name.ptr[less_idx] != '<') {

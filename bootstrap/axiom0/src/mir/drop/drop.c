@@ -4,10 +4,81 @@
 #include <string.h>
 #include <stdlib.h>
 
-static bool is_drop_trait_name(StrView sv) {
-    if (sv.len == 4 && memcmp(sv.ptr, "Drop", 4) == 0) return true;
-    if (sv.len > 5 && memcmp(sv.ptr + sv.len - 5, ".Drop", 5) == 0) return true;
+/* SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of T iff the trait
+ * path P resolves to the prelude lang item `Drop`, never because its text ends in `.Drop`.
+ *
+ * In v0.1 the prelude lang item is reached only by the bare name, so P is the language Drop iff
+ *   (1) P is the single segment `Drop` without generic arguments (`m.Drop` is a path to a user item), and
+ *   (2) no trait, struct, enum or type alias named `Drop` is declared in the impl's module and no `use`
+ *       of that module binds the name `Drop` (a shadowing `trait Drop`, an imported `use m.Drop`):
+ *       module scope shadows the prelude (resolver lookup order local -> module -> import -> prelude).
+ * The decision is made from names of the module only, never from the position of items in the chain.
+ * The Axiom port implements exactly this predicate three times (compiler/hir/lower.ax
+ * hir_impl_is_lang_drop, compiler/types/typeck.ax tc_impl_is_lang_drop, compiler/mir/drop.ax
+ * drop_impl_is_lang_drop) and types/typeck.c has a twin of this function (that layer is below mir). */
+static bool dotted_eq(const AxAstDottedName *a, const AxAstDottedName *b) {
+    if (a->count != b->count) return false;
+    for (size_t i = 0; i < a->count; i++) {
+        if (a->segments[i].v != b->segments[i].v) return false;
+    }
+    return true;
+}
+
+static bool is_drop_name(StrInterner *interner, StrId id) {
+    if (id.v == 0) return false;
+    StrView sv = ax_interner_get(interner, id);
+    return sv.len == 4 && memcmp(sv.ptr, "Drop", 4) == 0;
+}
+
+static bool use_tree_binds_drop(StrInterner *interner, const AxHirUseTree *t) {
+    for (; t; t = t->next) {
+        if (t->subtrees) {
+            if (use_tree_binds_drop(interner, t->subtrees)) return true;
+        } else if (t->alias.v != 0) {
+            if (is_drop_name(interner, t->alias)) return true;
+        } else if (t->path.count > 0) {
+            if (is_drop_name(interner, t->path.segments[t->path.count - 1])) return true;
+        }
+    }
     return false;
+}
+
+bool ax_hir_impl_is_lang_drop(const AxHirItem *impl, const AxHir *hir, const StrInterner *interner, const struct SourceDatabase *db) {
+    if (!impl || impl->kind != AX_HIR_ITEM_IMPL) return false;
+    const AxHirType *tp = impl->impl.trait_path;
+    if (!tp || tp->kind != AX_HIR_TYPE_PATH || tp->path.path.generic_args != NULL) return false;
+
+    StrView name = {0};
+    if (interner && tp->path.path.name.v != 0) {
+        name = ax_interner_get((StrInterner *)interner, tp->path.path.name);
+    } else if (db && tp->span.file.v != 0) {
+        name = ax_source_db_span_text(db, tp->span);
+        size_t start = name.len;
+        while (start > 0 && name.ptr[start - 1] != '.') start--;
+        name.ptr += start;
+        name.len -= start;
+    }
+    if (name.len != 4 || memcmp(name.ptr, "Drop", 4) != 0) return false;
+
+    /* (1) a qualified path is longer than its last segment (spans of unspanned synthetic HIR are 0). */
+    const Span *sp = &tp->path.path.span;
+    if (sp->file.v != 0 && (size_t)(sp->end - sp->start) != name.len) return false;
+
+    /* (2) module scope shadows the prelude. Without an interner the module's names cannot be read. */
+    if (!hir || !interner) return true;
+    StrInterner *in = (StrInterner *)interner;
+    for (const AxHirItem *it = hir->items; it; it = it->next) {
+        if (!dotted_eq(&it->module_path, &impl->module_path)) continue;
+        switch (it->kind) {
+            case AX_HIR_ITEM_TRAIT: if (is_drop_name(in, it->trait.name)) return false; break;
+            case AX_HIR_ITEM_STRUCT: if (is_drop_name(in, it->struct_decl.name)) return false; break;
+            case AX_HIR_ITEM_ENUM: if (is_drop_name(in, it->enum_decl.name)) return false; break;
+            case AX_HIR_ITEM_TYPE_ALIAS: if (is_drop_name(in, it->type_alias.name)) return false; break;
+            case AX_HIR_ITEM_USE: if (use_tree_binds_drop(in, it->use.tree)) return false; break;
+            default: break;
+        }
+    }
+    return true;
 }
 
 const AxHirItem *ax_find_drop_impl_fn(TypeId ty, const AxThir *thir, const StrInterner *interner, const AxHir *hir, const struct SourceDatabase *db) {
@@ -36,13 +107,7 @@ const AxHirItem *ax_find_drop_impl_fn(TypeId ty, const AxThir *thir, const StrIn
         }
         for (const AxHirItem *it = hir->items; it; it = it->next) {
             if (it->kind == AX_HIR_ITEM_IMPL && it->impl.trait_path && it->impl.self_type && it->impl.self_type->kind == AX_HIR_TYPE_PATH) {
-                StrView trait_sname = {0};
-                if (db && it->impl.trait_path->span.file.v != 0) {
-                    trait_sname = ax_source_db_span_text(db, it->impl.trait_path->span);
-                } else if (interner && it->impl.trait_path->path.path.name.v != 0) {
-                    trait_sname = ax_interner_get((StrInterner *)interner, it->impl.trait_path->path.path.name);
-                }
-                if (is_drop_trait_name(trait_sname)) {
+                {
                     AxSymbolId impl_sym = it->impl.self_type->path.path.symbol;
                     bool match = false;
                     if (target_sym.v != 0 && impl_sym.v != 0) {
@@ -63,7 +128,8 @@ const AxHirItem *ax_find_drop_impl_fn(TypeId ty, const AxThir *thir, const StrIn
                             match = true;
                         }
                     }
-                    if (match) {
+                    /* The self type is compared first: the Drop predicate scans the module (AXS-DROP-008). */
+                    if (match && ax_hir_impl_is_lang_drop(it, hir, interner, db)) {
                         for (const AxHirItem *m = it->impl.members; m; m = m->next) {
                             if (m->kind == AX_HIR_ITEM_FN) {
                                 return m;

@@ -8,13 +8,15 @@ model: sonnet
 gate_model: opus
 depends: [T157]
 priority: 0
-status: todo
-attempts: 0
-paths: [bootstrap/axiom0/src/mir/drop/drop.c, compiler/hir/lower.ax, compiler/mir/drop.ax, tests/run/parity/drop_trait, tests/selfhost]
+status: done
+attempts: 1
+paths: [bootstrap/axiom0/src/mir/drop/drop.c, bootstrap/axiom0/src/mir/drop/drop.h, compiler/hir/lower.ax, compiler/mir/drop.ax, tests/run/parity/drop_trait, tests/selfhost]
 locks: [bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/types/typeck.c, compiler/types/typeck.ax]
 spec: [spec/SPEC-12-drop.md, spec/SPEC-04-core-extensibility.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-DRP-051, REQ-DRP-030]
 timeout_min: 180
+started: 2026-10-24 12:22:15
+finished: 2026-10-24 16:17:13
 ---
 # T158 — AX0-FIX-07: identity of the language `Drop`
 
@@ -66,3 +68,7 @@ shortcut in `compiler/hir/lower.ax` `hir_postprocess_items` renames the impl's `
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-24 11:31:41 started (attempt 1) T158-impl
+- 2026-10-24 12:22:14 requeue:  (not charged: attempt refunded)
+- 2026-10-24 12:22:15 started (attempt 1) T158-impl
+- 2026-10-24 16:17:13 accepted by QA -> done
