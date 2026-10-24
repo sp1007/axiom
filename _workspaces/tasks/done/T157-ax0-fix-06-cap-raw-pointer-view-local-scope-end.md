@@ -8,12 +8,14 @@ model: opus
 gate_model: opus
 depends: [T147]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/own/cap, compiler/own/cap.ax, tests/run/parity/cap, tests/ui/cap, tests/selfhost]
 spec: [spec/SPEC-11-capability.md, spec/SPEC-12-drop.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md, spec/decisions/ADR-0034-oracle-independence.md, 0160]
 covers: [REQ-OWN-002, REQ-OWN-159]
 timeout_min: 240
+started: 2026-10-24 07:22:56
+finished: 2026-10-24 11:31:21
 ---
 # T157 — AX0-FIX-06: capability false positives at scope end
 
@@ -74,3 +76,5 @@ liveness is the whole scope, and/or records `AddressOf` as an active view.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-24 07:22:56 started (attempt 1) T157-impl
+- 2026-10-24 11:31:21 accepted by QA -> done

@@ -18,7 +18,7 @@ integrated compiler.own_mir_verify session pipeline against axiom0 and cdriver_d
       7 negative fixtures in tests/ui/init/*.ax (definite-initialization & partial-init
       diagnostics vs `axiom0 check`).
   - qa_own_mir_diff_diag_cap_ptr.ax:
-      7 negative fixtures in tests/ui/cap/*.ax and tests/ui/ptr/*.ax (capability conflicts,
+      8 negative fixtures in tests/ui/cap/*.ax and tests/ui/ptr/*.ax (capability conflicts,
       view escape/outlives, unsafe required vs `axiom0 check`).
   - qa_own_mir_diff_diag_verify_mir.ax:
       21 `.mir` verifier corpus fixtures in tests/verify/**/*.mir via
@@ -192,6 +192,12 @@ DIAG_GROUPS = [
         ], 0),
         ("tests/ui/cap/test_view_qa.ax", [
             "AX_CAP_CONFLICT_MUT",
+            "AX_CAP_OUTLIVES_OWNER",
+        ], 0),
+        # T157 (SPEC-11 AXS-CAP-004/009): owner-outlives with droppable and i32 owners.
+        ("tests/ui/cap/view_outlives_drop_owner.ax", [
+            "AX_CAP_OUTLIVES_OWNER",
+            "AX_CAP_OUTLIVES_OWNER",
             "AX_CAP_OUTLIVES_OWNER",
         ], 0),
         ("tests/ui/ptr/addrof_outside_unsafe.ax", ["AX_UNSAFE_REQUIRED"], 0),

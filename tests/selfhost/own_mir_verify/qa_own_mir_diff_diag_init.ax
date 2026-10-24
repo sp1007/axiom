@@ -43989,6 +43989,12 @@ pub fn merge_states(dest: *mut OwnStateInfo, src: *const OwnStateInfo, count: us
 
 // Capability tracking (view / mut_view), region conflict checking, and borrow lifetime analysis.
 // Port of bootstrap/axiom0/src/mir/cap/cap.h, cap.c, mir/regions/region.c, and own/cap/cap.c.
+// T157 (SPEC-11 AXS-CAP-008/009, ADR-0036): the owner-outlives check on a drop or move of the owner
+// only reports a holder that is still used afterwards (a view local is active until its last use),
+// and a capability consumed by a cast (the `address_of` lowering `_t = &place; _p = copy _t as *T`)
+// ends at that cast when the temporary is not used again (a raw pointer holds no capability).
+// Same algorithm as axiom0 (ADR-0034 section 2): `cap_local_used_from` searches the normal
+// (non-unwind) CFG edges forward from the current position.
 module compiler.own.cap
 
 use compiler.kernel.id.heap_alloc
@@ -44041,6 +44047,7 @@ use compiler.mir.mir.MIR_TERM_ASSERT
 use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MIR_TERM_DROP
 use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
 use compiler.mir.mir.MIR_TERM_SWITCH_INT
 use compiler.mir.mir.MIR_VIEW_MUT
 use compiler.mir.mir.MIR_VIEW_READ
@@ -44399,11 +44406,51 @@ fn cap_check_conflict(
     }
 }
 
+// True when the body drops the whole local `l` somewhere. Such a local has a type that needs drop,
+// which is never Copy, so a `copy _l` of it is a move (the MIR builder writes `copy` for every use
+// of a named local; init.ax decides moves by type, this checker has no types).
+fn cap_local_is_dropped(body: view<MirBody>, l: u32) -> bool {
+    let mut b: usize = 0;
+    while (b < body.bb_count) {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let mut i: usize = 0;
+        while (i < sc) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, i) };
+            let sk = unsafe { (*st).kind };
+            let pc = unsafe { (*st).place.proj_count };
+            let pl = unsafe { (*st).place.local.v };
+            if sk == MIR_STMT_DROP && pc == 0 && pl == l {
+                return true;
+            }
+            i = i + 1;
+        }
+        let has_term = unsafe { (*bb).has_terminator };
+        let tk = unsafe { (*bb).terminator.kind };
+        let tpc = unsafe { (*bb).terminator.drop_place.proj_count };
+        let tpl = unsafe { (*bb).terminator.drop_place.local.v };
+        if has_term && tk == MIR_TERM_DROP && tpc == 0 && tpl == l {
+            return true;
+        }
+        b = b + 1;
+    }
+    false
+}
+
+// The owner `place` is moved or dropped at (`bb_idx`, `stmt_idx`). A holder declared before its
+// owner (lower local index) was already reported when the capability was bound (cap_visit_stmt), so
+// it is not reported a second time; any other holder is a violation only while it is still used
+// (AXS-CAP-009). `by_copy`: the place is read by a whole-local `copy`, which is a move only when the
+// local needs drop (cap_local_is_dropped).
 fn cap_check_invalidate(
     state: view<CapState>,
     local_count: usize,
     place: view<MirPlace>,
+    by_copy: bool,
     loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
     sink: mut_view<DiagSink>,
     report: bool
 ) {
@@ -44417,8 +44464,17 @@ fn cap_check_invalidate(
         if cv != MIR_VIEW_UNKNOWN {
             let rel = unsafe { own_region_relate(view((*ci).place), place) };
             if rel != MIR_REGION_DISJOINT {
-                emit_cap_diag(sink, AX_CAP_OUTLIVES_OWNER, loc);
-                return;
+                if by_copy && !cap_local_is_dropped(body, place.local.v) {
+                    return;
+                }
+                let owner_v = unsafe { (*ci).place.local.v };
+                let holder_v = i as u32;
+                if holder_v >= owner_v {
+                    if cap_local_used_from(body, bb_idx, stmt_idx, holder_v) {
+                        emit_cap_diag(sink, AX_CAP_OUTLIVES_OWNER, loc);
+                        return;
+                    }
+                }
             }
         }
         i = i + 1;
@@ -44429,16 +44485,273 @@ fn cap_span_copy(s: view<Span>) -> Span {
     Span { file: FileId { v: s.file.v }, start: s.start, end: s.end }
 }
 
+// ---- "is local `l` used at or after a position" (T157) ----
+
+const CAP_EFF_NONE: u8 = 0u8;
+const CAP_EFF_USE: u8 = 1u8;
+const CAP_EFF_KILL: u8 = 2u8;
+
+fn cap_place_uses(p: view<MirPlace>, l: u32) -> bool {
+    if p.local.v == l {
+        return true;
+    }
+    let mut i: usize = 0;
+    while (i < p.proj_count) {
+        let pr = unsafe { mir_proj_at(p.projs, i) };
+        let k = unsafe { (*pr).kind };
+        if k == MIR_PROJ_INDEX {
+            let il = unsafe { (*pr).index_local.v };
+            if il == l {
+                return true;
+            }
+        } else if k == MIR_PROJ_SUB_SLICE {
+            let hf = unsafe { (*pr).has_from };
+            let fl = unsafe { (*pr).from_local.v };
+            let ht = unsafe { (*pr).has_to };
+            let tl = unsafe { (*pr).to_local.v };
+            if hf && fl == l {
+                return true;
+            }
+            if ht && tl == l {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn cap_operand_uses(op: view<MirOperand>, l: u32) -> bool {
+    if op.kind != MIR_OP_COPY && op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    cap_place_uses(view(op.place), l)
+}
+
+fn cap_rvalue_uses(rv: view<MirRvalue>, l: u32) -> bool {
+    let k = rv.kind;
+    // REPEAT: only the element operand; the count is a usize, never a capability holder.
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_CAST || k == MIR_RVALUE_UNARY_OP || k == MIR_RVALUE_REPEAT {
+        return cap_operand_uses(view(rv.use_op), l);
+    }
+    if k == MIR_RVALUE_REF || k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        return cap_place_uses(view(rv.place), l);
+    }
+    if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        if cap_operand_uses(view(rv.lhs), l) {
+            return true;
+        }
+        return cap_operand_uses(view(rv.rhs), l);
+    }
+    if k == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while (i < rv.operand_count) {
+            let op = unsafe { mir_op_at(rv.operands, i) };
+            let u = unsafe { cap_operand_uses(view(*op), l) };
+            if u {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    false
+}
+
+fn cap_stmt_effect(stmt: view<MirStmt>, l: u32) -> u8 {
+    let sk = stmt.kind;
+    if sk == MIR_STMT_ASSIGN {
+        if cap_rvalue_uses(view(stmt.rvalue), l) {
+            return CAP_EFF_USE;
+        }
+        if stmt.place.proj_count > 0 {
+            if cap_place_uses(view(stmt.place), l) {
+                return CAP_EFF_USE;
+            }
+            return CAP_EFF_NONE;
+        }
+        if stmt.place.local.v == l {
+            return CAP_EFF_KILL;
+        }
+        return CAP_EFF_NONE;
+    }
+    if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+        if stmt.storage_local.v == l {
+            return CAP_EFF_KILL;
+        }
+        return CAP_EFF_NONE;
+    }
+    if sk == MIR_STMT_DROP {
+        if cap_place_uses(view(stmt.place), l) {
+            return CAP_EFF_USE;
+        }
+    }
+    CAP_EFF_NONE
+}
+
+fn cap_term_uses(t: view<MirTerminator>, l: u32) -> bool {
+    let tk = t.kind;
+    if tk == MIR_TERM_SWITCH_INT {
+        return cap_operand_uses(view(t.discr), l);
+    }
+    if tk == MIR_TERM_RETURN {
+        return l == 0u32;
+    }
+    if tk == MIR_TERM_DROP {
+        return cap_place_uses(view(t.drop_place), l);
+    }
+    if tk == MIR_TERM_CALL {
+        if cap_operand_uses(view(t.func), l) {
+            return true;
+        }
+        let mut a: usize = 0;
+        while (a < t.arg_count) {
+            let op = unsafe { mir_op_at(t.args, a) };
+            let u = unsafe { cap_operand_uses(view(*op), l) };
+            if u {
+                return true;
+            }
+            a = a + 1;
+        }
+        if t.destination.proj_count > 0 {
+            return cap_place_uses(view(t.destination), l);
+        }
+        return false;
+    }
+    if tk == MIR_TERM_ASSERT {
+        return cap_operand_uses(view(t.cond), l);
+    }
+    false
+}
+
+// Normal successors only (unwind edges carry no uses of a view local).
+fn cap_term_successors(t: view<MirTerminator>, out: mut_view<[16]u32>) -> usize {
+    let tk = t.kind;
+    let mut n: usize = 0;
+    if tk == MIR_TERM_GOTO {
+        (*out)[n] = t.goto_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_SWITCH_INT {
+        let mut j: usize = 0;
+        while (j < t.switch_count && n < 15) {
+            let tid = unsafe { (*mir_bb_id_at(t.targets, j)).v };
+            (*out)[n] = tid;
+            n = n + 1;
+            j = j + 1;
+        }
+        (*out)[n] = t.otherwise.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_DROP {
+        (*out)[n] = t.drop_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_CALL {
+        (*out)[n] = t.call_target.v;
+        n = n + 1;
+    } else if tk == MIR_TERM_ASSERT {
+        (*out)[n] = t.assert_target.v;
+        n = n + 1;
+    }
+    n
+}
+
+unsafe fn cap_usize_at(base: *mut usize, idx: usize) -> *mut usize {
+    ((base as usize) + mul_usize(idx, size_of<usize>())) as *mut usize
+}
+
+// True when some normal CFG path from statement `stmt_idx` of block `bb_idx` (inclusive; the
+// terminator is `stmt_idx == stmt_count`) reaches a use of local `l` before `l` is reassigned or its
+// storage ends.
+fn cap_local_used_from(body: view<MirBody>, bb_idx: usize, stmt_idx: usize, l: u32) -> bool {
+    let n = body.bb_count;
+    let queued = unsafe { heap_alloc(n, 1) };
+    let mut qi: usize = 0;
+    while (qi < n) {
+        unsafe { *(queued + qi) = 0u8; }
+        qi = qi + 1;
+    }
+    let work_bytes = mul_usize(n + 1, size_of<usize>());
+    let work_raw = unsafe { heap_alloc(work_bytes, align_of<usize>()) };
+    let work = work_raw as *mut usize;
+    let mut work_len: usize = 0;
+    let mut succ: [16]u32 = [0u32; 16];
+    let mut used = false;
+    let mut cur_bb = bb_idx;
+    let mut cur_stmt = stmt_idx;
+    let mut searching = true;
+    while searching {
+        let bb = unsafe { mir_bb_at(body.bbs, cur_bb) };
+        let sc_n = unsafe { (*bb).stmt_count };
+        let mut killed = false;
+        let mut i = cur_stmt;
+        while (i < sc_n && !used && !killed) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, i) };
+            let eff = unsafe { cap_stmt_effect(view(*st), l) };
+            if eff == CAP_EFF_USE {
+                used = true;
+            } else if eff == CAP_EFF_KILL {
+                killed = true;
+            }
+            i = i + 1;
+        }
+        let has_term = unsafe { (*bb).has_terminator };
+        if !used && !killed && has_term {
+            let tu = unsafe { cap_term_uses(view((*bb).terminator), l) };
+            if tu {
+                used = true;
+            } else {
+                let tk = unsafe { (*bb).terminator.kind };
+                let dpc = unsafe { (*bb).terminator.destination.proj_count };
+                let dl = unsafe { (*bb).terminator.destination.local.v };
+                let dest_kill = tk == MIR_TERM_CALL && dpc == 0 && dl == l;
+                if !dest_kill {
+                    let sc = unsafe { cap_term_successors(view((*bb).terminator), mut_view(succ)) };
+                    let mut j: usize = 0;
+                    while (j < sc) {
+                        let s = succ[j] as usize;
+                        if s < n {
+                            let q = unsafe { *(queued + s) };
+                            if q == 0u8 {
+                                unsafe {
+                                    *(queued + s) = 1u8;
+                                    *cap_usize_at(work, work_len) = s;
+                                }
+                                work_len = work_len + 1;
+                            }
+                        }
+                        j = j + 1;
+                    }
+                }
+            }
+        }
+        if used || work_len == 0 {
+            searching = false;
+        } else {
+            work_len = work_len - 1;
+            cur_bb = unsafe { *cap_usize_at(work, work_len) };
+            cur_stmt = 0;
+        }
+    }
+    unsafe {
+        heap_free(queued, n, 1);
+        heap_free(work as *mut u8, work_bytes, align_of<usize>());
+    }
+    used
+}
+
 fn cap_visit_operand(
     state: mut_view<CapState>,
     local_count: usize,
     op: view<MirOperand>,
     loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
     sink: mut_view<DiagSink>,
     report: bool
 ) {
     if op.kind == MIR_OP_MOVE {
-        cap_check_invalidate(view(*state), local_count, view(op.place), loc, sink, report);
+        cap_check_invalidate(view(*state), local_count, view(op.place), false, loc, body, bb_idx, stmt_idx, sink, report);
+    } else if op.kind == MIR_OP_COPY && op.place.proj_count == 0 {
+        cap_check_invalidate(view(*state), local_count, view(op.place), true, loc, body, bb_idx, stmt_idx, sink, report);
     }
 }
 
@@ -44447,26 +44760,29 @@ fn cap_visit_rvalue(
     local_count: usize,
     rv: view<MirRvalue>,
     loc: Span,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
     sink: mut_view<DiagSink>,
     report: bool
 ) {
     let k = rv.kind;
     if k == MIR_RVALUE_USE {
-        cap_visit_operand(state, local_count, view(rv.use_op), loc, sink, report);
+        cap_visit_operand(state, local_count, view(rv.use_op), loc, body, bb_idx, stmt_idx, sink, report);
     } else if k == MIR_RVALUE_REPEAT {
-        cap_visit_operand(state, local_count, view(rv.use_op), loc, sink, report);
+        cap_visit_operand(state, local_count, view(rv.use_op), loc, body, bb_idx, stmt_idx, sink, report);
     } else if k == MIR_RVALUE_REF {
         let v = if rv.borrow_kind == MIR_BORROW_MUT { MIR_VIEW_MUT } else { MIR_VIEW_READ };
         cap_check_conflict(view(*state), local_count, view(rv.place), v, loc, sink, report);
     } else if k == MIR_RVALUE_LEN {
         // no move or borrow conflict
     } else if k == MIR_RVALUE_CAST {
-        cap_visit_operand(state, local_count, view(rv.use_op), loc, sink, report);
+        cap_visit_operand(state, local_count, view(rv.use_op), loc, body, bb_idx, stmt_idx, sink, report);
     } else if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-        cap_visit_operand(mut_view(*state), local_count, view(rv.lhs), cap_span_copy(view(loc)), mut_view(*sink), report);
-        cap_visit_operand(state, local_count, view(rv.rhs), loc, sink, report);
+        cap_visit_operand(mut_view(*state), local_count, view(rv.lhs), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink), report);
+        cap_visit_operand(state, local_count, view(rv.rhs), loc, body, bb_idx, stmt_idx, sink, report);
     } else if k == MIR_RVALUE_UNARY_OP {
-        cap_visit_operand(state, local_count, view(rv.use_op), loc, sink, report);
+        cap_visit_operand(state, local_count, view(rv.use_op), loc, body, bb_idx, stmt_idx, sink, report);
     } else if k == MIR_RVALUE_DISCRIMINANT {
         // no move
     } else if k == MIR_RVALUE_AGGREGATE {
@@ -44474,7 +44790,7 @@ fn cap_visit_rvalue(
         while (i < rv.operand_count) {
             let op = unsafe { mir_op_at(rv.operands, i) };
             unsafe {
-                cap_visit_operand(mut_view(*state), local_count, view(*op), cap_span_copy(view(loc)), mut_view(*sink), report);
+                cap_visit_operand(mut_view(*state), local_count, view(*op), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink), report);
             }
             i = i + 1;
         }
@@ -44485,13 +44801,16 @@ fn cap_visit_stmt(
     state: mut_view<CapState>,
     local_count: usize,
     stmt: view<MirStmt>,
+    body: view<MirBody>,
+    bb_idx: usize,
+    stmt_idx: usize,
     sink: mut_view<DiagSink>,
     report: bool
 ) {
     let sk = stmt.kind;
     let loc = Span { file: FileId { v: stmt.span.file.v }, start: stmt.span.start, end: stmt.span.end };
     if sk == MIR_STMT_ASSIGN {
-        cap_visit_rvalue(mut_view(*state), local_count, view(stmt.rvalue), cap_span_copy(view(loc)), mut_view(*sink), report);
+        cap_visit_rvalue(mut_view(*state), local_count, view(stmt.rvalue), cap_span_copy(view(loc)), view(*body), bb_idx, stmt_idx, mut_view(*sink), report);
         let rvk = stmt.rvalue.kind;
         let dest_idx = stmt.place.local.v as usize;
         if rvk == MIR_RVALUE_REF {
@@ -44557,6 +44876,24 @@ fn cap_visit_stmt(
                     i = i + 1;
                 }
             }
+        } else if rvk == MIR_RVALUE_CAST {
+            // AXS-CAP-008: `_p = copy _t as *T` turns the ephemeral capability of the `address_of`
+            // temporary `_t` into a raw pointer that holds none; the capability ends here unless `_t`
+            // itself is used again.
+            let cop = stmt.rvalue.use_op.kind;
+            let c_pcount = stmt.rvalue.use_op.place.proj_count;
+            let c_lidx = stmt.rvalue.use_op.place.local.v as usize;
+            if (cop == MIR_OP_COPY || cop == MIR_OP_MOVE) && c_pcount == 0 && c_lidx < local_count {
+                let c_cap = unsafe { mir_cap_at_mut(state.caps, c_lidx) };
+                let c_view = unsafe { (*c_cap).view_kind };
+                if c_view != MIR_VIEW_UNKNOWN {
+                    if !cap_local_used_from(view(*body), bb_idx, stmt_idx + 1, c_lidx as u32) {
+                        unsafe {
+                            (*c_cap).view_kind = MIR_VIEW_UNKNOWN;
+                        }
+                    }
+                }
+            }
         }
 
         if rvk == MIR_RVALUE_USE && stmt.rvalue.use_op.kind == MIR_OP_MOVE {
@@ -44592,7 +44929,7 @@ fn cap_visit_stmt(
             }
         }
     } else if sk == MIR_STMT_DROP {
-        cap_check_invalidate(view(*state), local_count, view(stmt.place), loc, sink, report);
+        cap_check_invalidate(view(*state), local_count, view(stmt.place), false, loc, body, bb_idx, stmt_idx, sink, report);
     }
 }
 
@@ -44600,6 +44937,8 @@ fn cap_visit_bb(
     state: mut_view<CapState>,
     local_count: usize,
     bb: view<MirBb>,
+    body: view<MirBody>,
+    bb_idx: usize,
     sink: mut_view<DiagSink>,
     report: bool
 ) {
@@ -44607,7 +44946,7 @@ fn cap_visit_bb(
     while (i < bb.stmt_count) {
         let st = unsafe { mir_stmt_at(bb.stmts, i) };
         unsafe {
-            cap_visit_stmt(mut_view(*state), local_count, view(*st), mut_view(*sink), report);
+            cap_visit_stmt(mut_view(*state), local_count, view(*st), view(*body), bb_idx, i, mut_view(*sink), report);
         }
         i = i + 1;
     }
@@ -44621,13 +44960,13 @@ fn cap_visit_bb(
         end: bb.terminator.span.end,
     };
     if tk == MIR_TERM_DROP {
-        cap_check_invalidate(view(*state), local_count, view(bb.terminator.drop_place), loc, sink, report);
+        cap_check_invalidate(view(*state), local_count, view(bb.terminator.drop_place), false, loc, body, bb_idx, bb.stmt_count, sink, report);
     } else if tk == MIR_TERM_CALL {
         let mut a: usize = 0;
         while (a < bb.terminator.arg_count) {
             let op = unsafe { mir_op_at(bb.terminator.args, a) };
             unsafe {
-                cap_visit_operand(mut_view(*state), local_count, view(*op), cap_span_copy(view(loc)), mut_view(*sink), report);
+                cap_visit_operand(mut_view(*state), local_count, view(*op), cap_span_copy(view(loc)), view(*body), bb_idx, bb.stmt_count, mut_view(*sink), report);
             }
             let opk = unsafe { (*op).kind };
             let op_pcount = unsafe { (*op).place.proj_count };
@@ -44709,7 +45048,7 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
                 copy_cap_array(temp.caps, in_caps as *const MirCap, local_count);
                 let bb_p = unsafe { mir_bb_at(body.bbs, i) };
                 unsafe {
-                    cap_visit_bb(mut_view(temp), local_count, view(*bb_p), mut_view(*sink), false);
+                    cap_visit_bb(mut_view(temp), local_count, view(*bb_p), view(*body), i, mut_view(*sink), false);
                 }
 
                 let has_term = unsafe { (*bb_p).has_terminator };
@@ -44779,7 +45118,7 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
             copy_cap_array(temp.caps, in_caps as *const MirCap, local_count);
             let bb_p = unsafe { mir_bb_at(body.bbs, i) };
             unsafe {
-                cap_visit_bb(mut_view(temp), local_count, view(*bb_p), mut_view(*sink), true);
+                cap_visit_bb(mut_view(temp), local_count, view(*bb_p), view(*body), i, mut_view(*sink), true);
             }
         }
         i = i + 1;
