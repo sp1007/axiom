@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T158]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/verify, compiler/verify, tests/verify/drop, tests/selfhost]
 locks: [bootstrap/axiom0/src/driver/pipeline.c, compiler/driver/pipeline.ax]
 spec: [spec/SPEC-12-drop.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md, spec/decisions/ADR-0034-oracle-independence.md, 0161, 0178]
 covers: [REQ-VER-001, REQ-MIR-095]
 timeout_min: 240
+started: 2026-10-24 16:17:48
+finished: 2026-10-25 04:08:07
 ---
 # T159 — AX0-FIX-08: verifier drop checks on real code
 
@@ -64,3 +66,5 @@ is limited to explicit drops (`term->drop.is_explicit`).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-24 16:17:48 started (attempt 1) T159-impl
+- 2026-10-25 04:08:07 accepted by QA -> done

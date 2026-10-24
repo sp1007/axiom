@@ -42546,6 +42546,17 @@ pub const VERIFY_ST_UNINIT: u8 = 1u8;
 pub const VERIFY_ST_OWNED: u8 = 2u8;
 pub const VERIFY_ST_MOVED: u8 = 4u8;
 
+const VERIFY_ST_UNINIT_F1: u8 = 8u8;
+const VERIFY_ST_OWNED_F1: u8 = 16u8;
+const VERIFY_ST_MOVED_F1: u8 = 32u8;
+const VERIFY_ST_WAS_DROPPED: u8 = 64u8;
+
+const VERIFY_MASK_F0: u8 = 7u8;
+const VERIFY_MASK_F1: u8 = 56u8;
+const VERIFY_MASK_UNINIT: u8 = 9u8;
+const VERIFY_MASK_OWNED: u8 = 18u8;
+const VERIFY_MASK_MOVED: u8 = 36u8;
+
 const VERIFY_CAST_UNSIZE: u8 = 4u8;
 
 // =================================================================================================
@@ -43012,11 +43023,11 @@ fn verify_return_is_unit_or_error(body: view<MirBody>, thir: *const Thir, func: 
                 if rk == TY_UNIT || rk == TY_ERROR {
                     return true;
                 }
+                return false;
             }
         }
-        return false;
     }
-    if (func as usize) == 0 && (thir as usize) != 0 {
+    if (thir as usize) != 0 {
         let loc0_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, 0)).ty.v } };
         let ret_t = verify_safe_type_get(unsafe { view((*thir).interner) }, loc0_ty);
         if (ret_t as usize) == 0 {
@@ -43921,6 +43932,16 @@ fn verify_merge_st(a: u8, b: u8) -> u8 {
     a | b
 }
 
+fn verify_fill_u32(dst: *mut u32, val: u32, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe {
+            *u32_at(dst, i) = val;
+        }
+        i = i + 1;
+    }
+}
+
 fn verify_bb_is_pred(pbb: *const MirBb, target_idx: usize) -> bool {
     let has_term = unsafe { (*pbb).has_terminator };
     let tk = unsafe { (*pbb).terminator.kind };
@@ -43982,39 +44003,442 @@ fn verify_bb_is_pred(pbb: *const MirBb, target_idx: usize) -> bool {
     false
 }
 
-fn verify_mir_own_transfer_bb(
-    bb: view<MirBb>,
-    lc: usize,
-    cur: *mut u8
-) {
-    let mut j: usize = 0;
-    while j < bb.stmt_count {
-        let stmt = unsafe { mir_stmt_at(bb.stmts, j) };
-        let sk = unsafe { (*stmt).kind };
-        if sk == MIR_STMT_ASSIGN {
-            if (unsafe { (*stmt).rvalue.kind }) == MIR_RVALUE_USE {
-                let op_k = unsafe { (*stmt).rvalue.use_op.kind };
-                let op_loc = (unsafe { (*stmt).rvalue.use_op.place.local.v }) as usize;
-                let op_pc = unsafe { (*stmt).rvalue.use_op.place.proj_count };
-                if op_k == MIR_OP_MOVE && op_loc < lc && op_pc == 0 {
-                    unsafe {
-                        *(cur + op_loc) = VERIFY_ST_MOVED;
+fn verify_type_needs_drop_from_thir(thir: *const Thir, ty: TypeId) -> bool {
+    if (thir as usize) == 0 {
+        return false;
+    }
+    // No HIR or string interner is available here: pass real empty ones (never a view of a null
+    // pointer, which the oracle rejects as a null dereference). With no HIR items the `impl Drop`
+    // lookup falls back to the THIR method map only (C: `ax_type_needs_drop(.., NULL, NULL, NULL)`).
+    let empty_hir = HirFile { items: 0 as *mut HirItem };
+    let empty_str = interner_new();
+    unsafe { mir_type_needs_drop(ty, view(*thir), view(empty_hir), view(empty_str)) }
+}
+
+fn verify_own_type_needs_drop(thir: *const Thir, thir_has_items: bool, ty: TypeId) -> bool {
+    let ty_v = ty.v;
+    if ty_v == 0u32 {
+        return false;
+    }
+    if !thir_has_items && ty_v == 10u32 {
+        return true;
+    }
+    if (thir as usize) == 0 {
+        return false;
+    }
+    if !thir_has_items {
+        let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty_v });
+        if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_STRUCT &&
+            (unsafe { (*t).def as usize }) == 0 && (unsafe { (*t).field_count }) == 0 {
+            return true;
+        }
+    }
+    verify_type_needs_drop_from_thir(thir, TypeId { v: ty_v })
+}
+
+fn verify_own_place_has_deref(place: view<MirPlace>) -> bool {
+    if place.proj_count == 0 || (place.projs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        if (unsafe { (*proj).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn verify_own_projected_place_type(
+    body: view<MirBody>,
+    thir: *const Thir,
+    place: view<MirPlace>
+) -> TypeId {
+    if (place.local.v as usize) >= body.local_count {
+        return TypeId { v: 0u32 };
+    }
+    let decl = unsafe { mir_local_at(body.locals, place.local.v as usize) };
+    let mut cur_ty_v: u32 = unsafe { (*decl).ty.v };
+    if place.proj_count == 0 || (place.projs as usize) == 0 || (thir as usize) == 0 {
+        return TypeId { v: cur_ty_v };
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count {
+        let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: cur_ty_v });
+        if (t as usize) == 0 {
+            return TypeId { v: 0u32 };
+        }
+        let tk = unsafe { (*t).kind };
+        let proj = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*proj).kind };
+        if pk == MIR_PROJ_DEREF {
+            if tk == TY_PTR || tk == TY_VIEW || tk == TY_MUT_VIEW {
+                cur_ty_v = unsafe { (*t).pointee.v };
+            } else if tk == TY_SLICE || tk == TY_ARRAY {
+                cur_ty_v = unsafe { (*t).elem.v };
+            } else {
+                return TypeId { v: 0u32 };
+            }
+        } else if pk == MIR_PROJ_FIELD {
+            let f = (unsafe { (*proj).field_idx }) as usize;
+            if (tk == TY_TUPLE || tk == TY_STRUCT) && f < (unsafe { (*t).field_count }) && (unsafe { (*t).fields as usize }) != 0 {
+                cur_ty_v = unsafe { (*typeid_at((*t).fields, f)).v };
+            } else if tk == TY_CLOSURE {
+                if f == 0 {
+                    cur_ty_v = unsafe { (*thir).interner.t_usize.v };
+                } else if (f - 1) < (unsafe { (*t).capture_count }) && (unsafe { (*t).captures as usize }) != 0 {
+                    let cap = unsafe { capture_at((*t).captures, f - 1) };
+                    cur_ty_v = unsafe { (*cap).ty.v };
+                } else {
+                    return TypeId { v: 0u32 };
+                }
+            } else {
+                return TypeId { v: 0u32 };
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            if tk == TY_ARRAY || tk == TY_SLICE {
+                cur_ty_v = unsafe { (*t).elem.v };
+            } else if tk == TY_VIEW || tk == TY_MUT_VIEW {
+                let pt = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: unsafe { (*t).pointee.v } });
+                if (pt as usize) != 0 && ((unsafe { (*pt).kind }) == TY_ARRAY || (unsafe { (*pt).kind }) == TY_SLICE) {
+                    cur_ty_v = unsafe { (*pt).elem.v };
+                } else {
+                    return TypeId { v: 0u32 };
+                }
+            } else {
+                return TypeId { v: 0u32 };
+            }
+        } else if pk == MIR_PROJ_DOWNCAST {
+            let v = (unsafe { (*proj).variant_idx }) as usize;
+            if tk == TY_ENUM && (i + 1) < place.proj_count {
+                let next_proj = unsafe { mir_proj_at(place.projs, i + 1) };
+                if (unsafe { (*next_proj).kind }) == MIR_PROJ_FIELD {
+                    let f = (unsafe { (*next_proj).field_idx }) as usize;
+                    let vfc = unsafe { (*t).variant_field_counts };
+                    let vfp = unsafe { (*t).variant_fields };
+                    if v < (unsafe { (*t).variant_count }) && (vfc as usize) != 0 && (vfp as usize) != 0 &&
+                        f < (unsafe { *usize_at(vfc, v) }) {
+                        let vf_arr = unsafe { *typeid_ptr_at(vfp, v) };
+                        if (vf_arr as usize) != 0 {
+                            cur_ty_v = unsafe { (*typeid_at(vf_arr, f)).v };
+                            i = i + 1;
+                        } else {
+                            return TypeId { v: 0u32 };
+                        }
+                    } else {
+                        return TypeId { v: 0u32 };
                     }
                 }
+            } else {
+                return TypeId { v: 0u32 };
             }
+        } else {
+            return TypeId { v: 0u32 };
+        }
+        i = i + 1;
+    }
+    TypeId { v: cur_ty_v }
+}
+
+fn verify_own_is_bool_local(
+    body: view<MirBody>,
+    thir: *const Thir,
+    is_droppable: *const u8,
+    lc: usize,
+    loc: u32
+) -> bool {
+    let l = loc as usize;
+    if l == 0 || l >= lc || (unsafe { *(is_droppable + l) }) != 0u8 {
+        return false;
+    }
+    let ldecl = unsafe { mir_local_at(body.locals, l) };
+    if (unsafe { (*ldecl).kind }) == MIR_LOCAL_ARG {
+        return false;
+    }
+    let ty_v = unsafe { (*ldecl).ty.v };
+    if (thir as usize) != 0 {
+        let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty_v });
+        if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_BOOL {
+            return true;
+        }
+        if ty_v == (unsafe { (*thir).interner.t_bool.v }) {
+            return true;
+        }
+    }
+    ty_v == 4u32 || ty_v == 3u32
+}
+
+fn verify_own_is_bool_const_assign(
+    body: view<MirBody>,
+    thir: *const Thir,
+    is_droppable: *const u8,
+    lc: usize,
+    stmt: *const MirStmt,
+    out_loc: mut_view<u32>,
+    out_val: mut_view<u64>
+) -> bool {
+    if (unsafe { (*stmt).kind }) != MIR_STMT_ASSIGN || (unsafe { (*stmt).place.proj_count }) != 0 {
+        return false;
+    }
+    let loc = unsafe { (*stmt).place.local.v };
+    if !verify_own_is_bool_local(body, thir, is_droppable, lc, loc) {
+        return false;
+    }
+    if (unsafe { (*stmt).rvalue.kind }) != MIR_RVALUE_USE || (unsafe { (*stmt).rvalue.use_op.kind }) != MIR_OP_CONST {
+        return false;
+    }
+    let ck = unsafe { (*stmt).rvalue.use_op.constant.kind };
+    if ck != MIR_CONST_INT && ck != MIR_CONST_BOOL {
+        return false;
+    }
+    let val = unsafe { (*stmt).rvalue.use_op.constant.val };
+    if val > 1u64 {
+        return false;
+    }
+    *out_loc = loc;
+    *out_val = val;
+    true
+}
+
+fn verify_own_bb_has_direct_drop(bb: *const MirBb, v: u32) -> bool {
+    let sc = unsafe { (*bb).stmt_count };
+    let stmts = unsafe { (*bb).stmts };
+    let mut j: usize = 0;
+    while j < sc {
+        let st = unsafe { mir_stmt_at(stmts, j) };
+        if (unsafe { (*st).kind }) == MIR_STMT_DROP &&
+            (unsafe { (*st).place.proj_count }) == 0 &&
+            (unsafe { (*st).place.local.v }) == v {
+            return true;
+        }
+        j = j + 1;
+    }
+    if (unsafe { (*bb).has_terminator }) &&
+        (unsafe { (*bb).terminator.kind }) == MIR_TERM_DROP &&
+        (unsafe { (*bb).terminator.drop_place.proj_count }) == 0 &&
+        (unsafe { (*bb).terminator.drop_place.local.v }) == v {
+        return true;
+    }
+    false
+}
+
+fn verify_own_is_clear_bb_drop(
+    body: view<MirBody>,
+    is_flag_drop_bb: *const u32,
+    bb_idx: usize,
+    v: u32
+) -> bool {
+    if bb_idx >= body.bb_count || (unsafe { *u32_at(is_flag_drop_bb as *mut u32, bb_idx) }) != v {
+        return false;
+    }
+    let bb = unsafe { mir_bb_at(body.bbs, bb_idx) };
+    if verify_own_bb_has_direct_drop(bb as *const MirBb, v) {
+        return false;
+    }
+    if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_GOTO {
+        let gt = (unsafe { (*bb).terminator.goto_target.v }) as usize;
+        if gt < body.bb_count {
+            let gbb = unsafe { mir_bb_at(body.bbs, gt) };
+            if verify_own_bb_has_direct_drop(gbb as *const MirBb, v) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn verify_own_check_op_read(
+    op: view<MirOperand>,
+    lc: usize,
+    cur: *const u8,
+    emit: bool,
+    sink: mut_view<DiagSink>,
+    span: view<Span>,
+    uninit_msg_id: usize,
+    uam_msg_id: usize
+) {
+    if !emit || op.kind == MIR_OP_CONST || op.place.proj_count != 0 {
+        return;
+    }
+    let loc = op.place.local.v as usize;
+    if loc < lc {
+        let st = unsafe { *(cur + loc) };
+        if (st & VERIFY_MASK_UNINIT) != 0u8 {
+            verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(*span), uninit_msg_id);
+        }
+        if (st & VERIFY_MASK_MOVED) != 0u8 {
+            verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(*span), uam_msg_id);
+        }
+    }
+}
+
+fn verify_own_apply_op(
+    body: view<MirBody>,
+    thir: *const Thir,
+    thir_has_items: bool,
+    is_droppable: *const u8,
+    flag_of: *const u32,
+    lc: usize,
+    op: view<MirOperand>,
+    cur: *mut u8,
+    emit: bool,
+    sink: mut_view<DiagSink>,
+    span: view<Span>,
+    uninit_msg_id: usize,
+    uam_msg_id: usize
+) {
+    if op.kind == MIR_OP_CONST {
+        return;
+    }
+    let loc = op.place.local.v as usize;
+    let pc = op.place.proj_count;
+    verify_own_check_op_read(view(*op), lc, cur as *const u8, emit, mut_view(*sink), view(*span), uninit_msg_id, uam_msg_id);
+    if loc >= lc {
+        return;
+    }
+    if verify_own_place_has_deref(view(op.place)) {
+        return;
+    }
+    let mut moves_local = false;
+    let loc_drop = (unsafe { *(is_droppable + loc) }) != 0u8;
+    let loc_flag = unsafe { *u32_at(flag_of as *mut u32, loc) };
+    if pc == 0 {
+        if op.kind == MIR_OP_MOVE {
+            moves_local = true;
+        } else if op.kind == MIR_OP_COPY && loc_drop && loc_flag != 0u32 {
+            moves_local = true;
+        }
+    } else if loc_drop && (loc_flag != 0u32 || !thir_has_items) {
+        let pty = verify_own_projected_place_type(body, thir, view(op.place));
+        if verify_own_type_needs_drop(thir, thir_has_items, pty) {
+            moves_local = true;
+        }
+    }
+    if moves_local {
+        let old = unsafe { *(cur + loc) };
+        let dropped_bit = old & VERIFY_ST_WAS_DROPPED;
+        if loc_drop && loc_flag != 0u32 {
+            let m0: u8 = if (old & (VERIFY_ST_OWNED | VERIFY_ST_MOVED)) != 0u8 { VERIFY_ST_MOVED } else { 0u8 };
+            let m1: u8 = if (old & (VERIFY_ST_OWNED_F1 | VERIFY_ST_MOVED_F1)) != 0u8 { VERIFY_ST_MOVED_F1 } else { 0u8 };
+            unsafe {
+                *(cur + loc) = (old & VERIFY_MASK_UNINIT) | m0 | m1 | dropped_bit;
+            }
+        } else {
+            unsafe {
+                *(cur + loc) = VERIFY_ST_MOVED | dropped_bit;
+            }
+        }
+    }
+}
+
+fn verify_own_step_bb(
+    body: view<MirBody>,
+    thir: *const Thir,
+    thir_has_items: bool,
+    check_drops: bool,
+    is_droppable: *const u8,
+    flag_of: *const u32,
+    owner_of_flag: *const u32,
+    is_flag_drop_bb: *const u32,
+    lc: usize,
+    b_idx: usize,
+    cur: *mut u8,
+    sink: mut_view<DiagSink>,
+    func: *const HirItem,
+    emit: bool
+) {
+    let bb = unsafe { mir_bb_at(body.bbs, b_idx) };
+    let stmt_cnt = unsafe { (*bb).stmt_count };
+    let stmts_ptr = unsafe { (*bb).stmts };
+    let mut j: usize = 0;
+    while j < stmt_cnt {
+        let stmt = unsafe { mir_stmt_at(stmts_ptr, j) };
+        let sk = unsafe { (*stmt).kind };
+        let s_span = verify_copy_span(unsafe { view((*stmt).span) });
+
+        if sk == MIR_STMT_ASSIGN {
+            let mut f_loc: u32 = 0u32;
+            let mut f_val: u64 = 0u64;
+            if verify_own_is_bool_const_assign(body, thir, is_droppable, lc, stmt as *const MirStmt, mut_view(f_loc), mut_view(f_val)) &&
+                (f_loc as usize) < lc && (unsafe { *u32_at(owner_of_flag as *mut u32, f_loc as usize) }) != 0u32 {
+                let v_u32 = unsafe { *u32_at(owner_of_flag as *mut u32, f_loc as usize) };
+                let v = v_u32 as usize;
+                if v < lc {
+                    let old = unsafe { *(cur + v) };
+                    if f_val == 1u64 {
+                        let f0 = old & VERIFY_MASK_F0;
+                        unsafe {
+                            *(cur + v) = (old & (VERIFY_MASK_F1 | VERIFY_ST_WAS_DROPPED)) | (f0 << 3u8);
+                        }
+                    } else if verify_own_is_clear_bb_drop(body, is_flag_drop_bb, b_idx, v_u32) {
+                        if emit && check_drops && (old & VERIFY_MASK_MOVED) != 0u8 {
+                            verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(s_span), 46);
+                        }
+                        unsafe {
+                            *(cur + v) = VERIFY_ST_MOVED | VERIFY_ST_WAS_DROPPED;
+                        }
+                    } else {
+                        let f1 = (old & VERIFY_MASK_F1) >> 3u8;
+                        unsafe {
+                            *(cur + v) = (old & (VERIFY_MASK_F0 | VERIFY_ST_WAS_DROPPED)) | f1;
+                        }
+                    }
+                }
+                unsafe {
+                    *(cur + (f_loc as usize)) = VERIFY_ST_OWNED;
+                }
+                j = j + 1;
+                continue;
+            }
+
+            let rvk = unsafe { (*stmt).rvalue.kind };
+            if rvk == MIR_RVALUE_USE {
+                verify_own_apply_op(body, thir, thir_has_items, is_droppable, flag_of, lc, unsafe { view((*stmt).rvalue.use_op) }, cur, emit, mut_view(*sink), view(s_span), 14, 44);
+            } else if rvk == MIR_RVALUE_AGGREGATE {
+                let op_cnt = unsafe { (*stmt).rvalue.operand_count };
+                let ops_ptr = unsafe { (*stmt).rvalue.operands };
+                let mut k: usize = 0;
+                while k < op_cnt {
+                    let op_k = unsafe { mir_op_at(ops_ptr, k) };
+                    if (unsafe { (*op_k).kind }) != MIR_OP_CONST {
+                        let oloc = (unsafe { (*op_k).place.local.v }) as usize;
+                        if oloc < lc && (unsafe { *(is_droppable + oloc) }) != 0u8 {
+                            verify_own_apply_op(body, thir, thir_has_items, is_droppable, flag_of, lc, unsafe { view(*op_k) }, cur, false, mut_view(*sink), view(s_span), 14, 44);
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+
             let dst_loc = (unsafe { (*stmt).place.local.v }) as usize;
             let dst_pc = unsafe { (*stmt).place.proj_count };
-            if dst_loc < lc && dst_pc == 0 {
-                unsafe {
-                    *(cur + dst_loc) = VERIFY_ST_OWNED;
+            if dst_loc < lc {
+                if dst_pc == 0 {
+                    if emit && check_drops && (unsafe { *(is_droppable + dst_loc) }) != 0u8 &&
+                        ((unsafe { *(cur + dst_loc) }) & VERIFY_MASK_OWNED) != 0u8 {
+                        verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(s_span), 45);
+                    }
+                    unsafe {
+                        *(cur + dst_loc) = VERIFY_ST_OWNED;
+                    }
+                } else if !verify_own_place_has_deref(unsafe { view((*stmt).place) }) {
+                    unsafe {
+                        *(cur + dst_loc) = VERIFY_ST_OWNED;
+                    }
                 }
             }
         } else if sk == MIR_STMT_DROP {
             let dr_loc = (unsafe { (*stmt).place.local.v }) as usize;
             let dr_pc = unsafe { (*stmt).place.proj_count };
             if dr_loc < lc && dr_pc == 0 {
+                let dr_st = unsafe { *(cur + dr_loc) };
+                if emit && check_drops && (dr_st & VERIFY_MASK_MOVED) != 0u8 {
+                    verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(s_span), 46);
+                }
                 unsafe {
-                    *(cur + dr_loc) = VERIFY_ST_MOVED;
+                    *(cur + dr_loc) = VERIFY_ST_MOVED | VERIFY_ST_WAS_DROPPED;
                 }
             }
         } else if sk == MIR_STMT_STORAGE_DEAD {
@@ -44028,323 +44452,77 @@ fn verify_mir_own_transfer_bb(
         j = j + 1;
     }
 
-    if bb.has_terminator && bb.terminator.kind == MIR_TERM_DROP {
-        let dr_loc = bb.terminator.drop_place.local.v as usize;
-        let dr_pc = bb.terminator.drop_place.proj_count;
-        if dr_loc < lc && dr_pc == 0 {
-            unsafe {
-                *(cur + dr_loc) = VERIFY_ST_MOVED;
-            }
-        }
-    } else if bb.has_terminator && bb.terminator.kind == MIR_TERM_CALL {
-        let mut a: usize = 0;
-        while a < bb.terminator.arg_count {
-            let arg_op = unsafe { mir_op_at(bb.terminator.args, a) };
-            let ak = unsafe { (*arg_op).kind };
-            let aloc = (unsafe { (*arg_op).place.local.v }) as usize;
-            let apc = unsafe { (*arg_op).place.proj_count };
-            if ak == MIR_OP_MOVE && aloc < lc && apc == 0 {
-                unsafe {
-                    *(cur + aloc) = VERIFY_ST_MOVED;
-                }
-            }
-            a = a + 1;
-        }
-        let dst_loc = bb.terminator.destination.local.v as usize;
-        let dst_pc = bb.terminator.destination.proj_count;
-        if dst_loc < lc && dst_pc == 0 {
-            unsafe {
-                *(cur + dst_loc) = VERIFY_ST_OWNED;
-            }
-        }
-    }
-}
-
-fn verify_mir_own_fixpoint(
-    body: view<MirBody>,
-    bc: usize,
-    lc: usize,
-    bb_in: *mut u8,
-    bb_out: *mut u8,
-    cur: *mut u8
-) {
-    let mut changed = true;
-    while changed {
-        changed = false;
-        let mut i: usize = 0;
-        while i < bc {
-            let bb = unsafe { mir_bb_at(body.bbs, i) };
-            let row_off = mir_mul_usize(i, lc);
-            if i > 0 {
-                verify_fill_bytes(cur, 0u8, lc);
-                let mut p: usize = 0;
-                while p < bc {
-                    let pbb = unsafe { mir_bb_at(body.bbs, p) };
-                    if verify_bb_is_pred(pbb as *const MirBb, i) {
-                        let p_off = mir_mul_usize(p, lc);
-                        let mut l: usize = 0;
-                        while l < lc {
-                            let old_c = unsafe { *(cur + l) };
-                            let p_out = unsafe { *(bb_out + p_off + l) };
-                            let merged = verify_merge_st(old_c, p_out);
-                            unsafe {
-                                *(cur + l) = merged;
-                            }
-                            l = l + 1;
-                        }
-                    }
-                    p = p + 1;
-                }
-                let in_row_ptr = unsafe { bb_in + row_off };
-                if !verify_eq_bytes(cur as *const u8, in_row_ptr as *const u8, lc) {
-                    verify_copy_bytes(in_row_ptr, cur as *const u8, lc);
-                    changed = true;
-                }
-            }
-
-            let in_row_ptr = unsafe { bb_in + row_off };
-            verify_copy_bytes(cur, in_row_ptr as *const u8, lc);
-            let mut reachable = false;
-            let mut lr: usize = 0;
-            while lr < lc {
-                if (unsafe { *(cur + lr) }) != VERIFY_ST_BOTTOM {
-                    reachable = true;
-                    break;
-                }
-                lr = lr + 1;
-            }
-
-            if !reachable {
-                verify_fill_bytes(cur, 0u8, lc);
-            } else {
-                verify_mir_own_transfer_bb(unsafe { view(*bb) }, lc, cur);
-            }
-
-            let out_row_ptr = unsafe { bb_out + row_off };
-            if !verify_eq_bytes(cur as *const u8, out_row_ptr as *const u8, lc) {
-                verify_copy_bytes(out_row_ptr, cur as *const u8, lc);
-                changed = true;
-            }
-            i = i + 1;
-        }
-    }
-}
-
-fn verify_type_needs_drop_from_thir(thir: *const Thir, ty: TypeId) -> bool {
-    if (thir as usize) == 0 {
-        return false;
-    }
-    // No HIR or string interner is available here: pass real empty ones (never a view of a null
-    // pointer, which the oracle rejects as a null dereference). With no HIR items the `impl Drop`
-    // lookup falls back to the THIR method map only (C: `ax_type_needs_drop(.., NULL, NULL, NULL)`).
-    let empty_hir = HirFile { items: 0 as *mut HirItem };
-    let empty_str = interner_new();
-    unsafe { mir_type_needs_drop(ty, view(*thir), view(empty_hir), view(empty_str)) }
-}
-
-fn verify_mir_own_check_stmt(
-    body: view<MirBody>,
-    thir: *const Thir,
-    sink: mut_view<DiagSink>,
-    func: *const HirItem,
-    lc: usize,
-    stmt: view<MirStmt>,
-    cur: *mut u8
-) {
-    let sk = stmt.kind;
-    if sk == MIR_STMT_ASSIGN {
-        if stmt.rvalue.kind == MIR_RVALUE_USE {
-            let op_k = stmt.rvalue.use_op.kind;
-            let src_loc = stmt.rvalue.use_op.place.local.v as usize;
-            let src_pc = stmt.rvalue.use_op.place.proj_count;
-            if op_k != MIR_OP_CONST && src_loc < lc && src_pc == 0 {
-                let st = unsafe { *(cur + src_loc) };
-                if (st & VERIFY_ST_UNINIT) != 0u8 {
-                    verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(stmt.span), 14);
-                }
-                if (st & VERIFY_ST_MOVED) != 0u8 {
-                    verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(stmt.span), 44);
-                }
-                if op_k == MIR_OP_MOVE {
-                    unsafe {
-                        *(cur + src_loc) = VERIFY_ST_MOVED;
-                    }
-                }
-            }
-        }
-        let dst_loc = stmt.place.local.v as usize;
-        let dst_pc = stmt.place.proj_count;
-        if dst_loc < lc && dst_pc == 0 {
-            let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
-            let dst_st = unsafe { *(cur + dst_loc) };
-            let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
-                verify_type_needs_drop_from_thir(thir, dst_ty));
-            if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(stmt.span), 45);
-            }
-            unsafe {
-                *(cur + dst_loc) = VERIFY_ST_OWNED;
-            }
-        }
-    } else if sk == MIR_STMT_DROP {
-        let dr_loc = stmt.place.local.v as usize;
-        let dr_pc = stmt.place.proj_count;
-        if dr_loc < lc && dr_pc == 0 {
-            let dr_st = unsafe { *(cur + dr_loc) };
-            if (dr_st & VERIFY_ST_MOVED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(stmt.span), 46);
-            }
-            unsafe {
-                *(cur + dr_loc) = VERIFY_ST_MOVED;
-            }
-        }
-    } else if sk == MIR_STMT_STORAGE_DEAD {
-        let sd_loc = stmt.storage_local.v as usize;
-        if sd_loc < lc {
-            unsafe {
-                *(cur + sd_loc) = VERIFY_ST_UNINIT;
-            }
-        }
-    }
-}
-
-fn verify_mir_own_check_call_term(
-    body: view<MirBody>,
-    thir: *const Thir,
-    sink: mut_view<DiagSink>,
-    func: *const HirItem,
-    lc: usize,
-    bb: view<MirBb>,
-    t_span: view<Span>,
-    cur: *mut u8
-) {
-    let fk = bb.terminator.func.kind;
-    let floc = bb.terminator.func.place.local.v as usize;
-    let fpc = bb.terminator.func.place.proj_count;
-    if fk != MIR_OP_CONST && floc < lc && fpc == 0 {
-        let fst = unsafe { *(cur + floc) };
-        if (fst & VERIFY_ST_UNINIT) != 0u8 {
-            verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, t_span, 49);
-        }
-        if (fst & VERIFY_ST_MOVED) != 0u8 {
-            verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, t_span, 50);
-        }
-    }
-
-    let mut a: usize = 0;
-    while a < bb.terminator.arg_count {
-        let arg_op = unsafe { mir_op_at(bb.terminator.args, a) };
-        let ak = unsafe { (*arg_op).kind };
-        let aloc = (unsafe { (*arg_op).place.local.v }) as usize;
-        let apc = unsafe { (*arg_op).place.proj_count };
-        if ak != MIR_OP_CONST && aloc < lc && apc == 0 {
-            let ast = unsafe { *(cur + aloc) };
-            if (ast & VERIFY_ST_UNINIT) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, t_span, 51);
-            }
-            if (ast & VERIFY_ST_MOVED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, t_span, 52);
-            }
-            if ak == MIR_OP_MOVE {
-                unsafe {
-                    *(cur + aloc) = VERIFY_ST_MOVED;
-                }
-            }
-        }
-        a = a + 1;
-    }
-
-    let dst_loc = bb.terminator.destination.local.v as usize;
-    let dst_pc = bb.terminator.destination.proj_count;
-    if dst_loc < lc && dst_pc == 0 {
-        let dst_ty = TypeId { v: unsafe { (*mir_local_at(body.locals, dst_loc)).ty.v } };
-        let dst_st = unsafe { *(cur + dst_loc) };
-        let dst_nd = (func as usize) == 0 && (dst_ty.v == 10u32 ||
-            verify_type_needs_drop_from_thir(thir, dst_ty));
-        if dst_nd && (dst_st & VERIFY_ST_OWNED) != 0u8 {
-            verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, t_span, 53);
-        }
-        unsafe {
-            *(cur + dst_loc) = VERIFY_ST_OWNED;
-        }
-    }
-}
-
-fn verify_mir_own_check_term(
-    body: view<MirBody>,
-    thir: *const Thir,
-    sink: mut_view<DiagSink>,
-    func: *const HirItem,
-    lc: usize,
-    bb: view<MirBb>,
-    cur: *mut u8
-) {
-    if !bb.has_terminator {
+    if !(unsafe { (*bb).has_terminator }) {
         return;
     }
-    let tk = bb.terminator.kind;
-    let t_span = verify_copy_span(view(bb.terminator.span));
+    let tk = unsafe { (*bb).terminator.kind };
+    let t_span = verify_copy_span(unsafe { view((*bb).terminator.span) });
 
     if tk == MIR_TERM_SWITCH_INT {
-        let op_k = bb.terminator.discr.kind;
-        let loc = bb.terminator.discr.place.local.v as usize;
-        let pc = bb.terminator.discr.place.proj_count;
-        if op_k != MIR_OP_CONST && loc < lc && pc == 0 {
-            let st = unsafe { *(cur + loc) };
-            if (st & VERIFY_ST_UNINIT) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(t_span), 47);
-            }
-            if (st & VERIFY_ST_MOVED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(t_span), 48);
-            }
-        }
+        verify_own_check_op_read(unsafe { view((*bb).terminator.discr) }, lc, cur as *const u8, emit, mut_view(*sink), view(t_span), 47, 48);
     } else if tk == MIR_TERM_DROP {
-        let loc = bb.terminator.drop_place.local.v as usize;
-        let pc = bb.terminator.drop_place.proj_count;
+        let loc = (unsafe { (*bb).terminator.drop_place.local.v }) as usize;
+        let pc = unsafe { (*bb).terminator.drop_place.proj_count };
         if loc < lc && pc == 0 {
             let st = unsafe { *(cur + loc) };
-            if ((func as usize) == 0 || bb.terminator.drop_is_explicit) && (st & VERIFY_ST_MOVED) != 0u8 {
+            let df = unsafe { (*bb).terminator.drop_flag };
+            let guarded = df != 0u32 && df != MIR_DROP_FLAG_NONE;
+            if emit && check_drops && (st & VERIFY_MASK_MOVED) != 0u8 && !guarded {
                 verify_emit_diag(mut_view(*sink), AX_VERIFY_DOUBLE_DROP, view(t_span), 46);
             }
             unsafe {
-                *(cur + loc) = VERIFY_ST_MOVED;
+                *(cur + loc) = VERIFY_ST_MOVED | VERIFY_ST_WAS_DROPPED;
             }
         }
     } else if tk == MIR_TERM_CALL {
-        verify_mir_own_check_call_term(body, thir, mut_view(*sink), func, lc, bb, view(t_span), cur);
+        verify_own_apply_op(body, thir, thir_has_items, is_droppable, flag_of, lc, unsafe { view((*bb).terminator.func) }, cur, emit, mut_view(*sink), view(t_span), 49, 50);
+        let arg_cnt = unsafe { (*bb).terminator.arg_count };
+        let args_ptr = unsafe { (*bb).terminator.args };
+        let mut a: usize = 0;
+        while a < arg_cnt {
+            let arg_op = unsafe { mir_op_at(args_ptr, a) };
+            verify_own_apply_op(body, thir, thir_has_items, is_droppable, flag_of, lc, unsafe { view(*arg_op) }, cur, emit, mut_view(*sink), view(t_span), 51, 52);
+            a = a + 1;
+        }
+        let dst_loc = (unsafe { (*bb).terminator.destination.local.v }) as usize;
+        let dst_pc = unsafe { (*bb).terminator.destination.proj_count };
+        if dst_loc < lc {
+            if dst_pc == 0 {
+                if emit && check_drops && (unsafe { *(is_droppable + dst_loc) }) != 0u8 &&
+                    ((unsafe { *(cur + dst_loc) }) & VERIFY_MASK_OWNED) != 0u8 {
+                    verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(t_span), 53);
+                }
+                unsafe {
+                    *(cur + dst_loc) = VERIFY_ST_OWNED;
+                }
+            } else if !verify_own_place_has_deref(unsafe { view((*bb).terminator.destination) }) {
+                unsafe {
+                    *(cur + dst_loc) = VERIFY_ST_OWNED;
+                }
+            }
+        }
     } else if tk == MIR_TERM_ASSERT {
-        let ck = bb.terminator.cond.kind;
-        let cloc = bb.terminator.cond.place.local.v as usize;
-        let cpc = bb.terminator.cond.place.proj_count;
-        if ck != MIR_OP_CONST && cloc < lc && cpc == 0 {
-            let cst = unsafe { *(cur + cloc) };
-            if (cst & VERIFY_ST_UNINIT) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(t_span), 54);
-            }
-            if (cst & VERIFY_ST_MOVED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(t_span), 55);
-            }
-        }
+        verify_own_check_op_read(unsafe { view((*bb).terminator.cond) }, lc, cur as *const u8, emit, mut_view(*sink), view(t_span), 54, 55);
     } else if tk == MIR_TERM_RETURN {
-        if lc > 0 {
-            let st0 = unsafe { *cur };
-            if (st0 & VERIFY_ST_UNINIT) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(t_span), 56);
+        if emit {
+            if lc > 0 {
+                let st0 = unsafe { *cur };
+                if (st0 & VERIFY_MASK_UNINIT) != 0u8 {
+                    verify_emit_diag(mut_view(*sink), AX_VERIFY_UNINIT_USE, view(t_span), 56);
+                }
+                if (st0 & VERIFY_MASK_MOVED) != 0u8 {
+                    verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(t_span), 57);
+                }
             }
-            if (st0 & VERIFY_ST_MOVED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_USE_AFTER_MOVE, view(t_span), 57);
+            if check_drops {
+                let mut l: usize = 1;
+                while l < lc {
+                    if (unsafe { *(is_droppable + l) }) != 0u8 && ((unsafe { *(cur + l) }) & VERIFY_MASK_OWNED) != 0u8 {
+                        verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(t_span), 58);
+                    }
+                    l = l + 1;
+                }
             }
-        }
-        let mut l: usize = 1;
-        while l < lc {
-            let lty = TypeId { v: unsafe { (*mir_local_at(body.locals, l)).ty.v } };
-            let lst = unsafe { *(cur + l) };
-            let l_nd = (func as usize) == 0 && (lty.v == 10u32 ||
-                verify_type_needs_drop_from_thir(thir, lty));
-            if l_nd && (lst & VERIFY_ST_OWNED) != 0u8 {
-                verify_emit_diag(mut_view(*sink), AX_VERIFY_MISSING_DROP, view(t_span), 58);
-            }
-            l = l + 1;
         }
     }
 }
@@ -44367,25 +44545,237 @@ pub fn verify_mir_own(
     let bb_in = arena_alloc_raw(mut_view(scratch), total_cells, 1);
     let bb_out = arena_alloc_raw(mut_view(scratch), total_cells, 1);
     let cur = arena_alloc_raw(mut_view(scratch), lc, 1);
+    let is_droppable = arena_alloc_raw(mut_view(scratch), lc, 1);
+    let flag_of = arena_alloc_raw(mut_view(scratch), mir_mul_usize(lc, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let owner_of_flag = arena_alloc_raw(mut_view(scratch), mir_mul_usize(lc, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let is_flag_drop_bb = arena_alloc_raw(mut_view(scratch), mir_mul_usize(bc, size_of<u32>()), align_of<u32>()) as *mut u32;
     verify_fill_bytes(bb_in, 0u8, total_cells);
     verify_fill_bytes(bb_out, 0u8, total_cells);
     verify_fill_bytes(cur, 0u8, lc);
+    verify_fill_bytes(is_droppable, 0u8, lc);
+    verify_fill_u32(flag_of, 0u32, lc);
+    verify_fill_u32(owner_of_flag, 0u32, lc);
+    verify_fill_u32(is_flag_drop_bb, 0u32, bc);
 
-    let mut param_count = verify_fn_param_count(func);
-    if (func as usize) == 0 {
-        let mut l: usize = 1;
-        while l < lc {
-            let lk = unsafe { (*mir_local_at(body.locals, l)).kind };
-            if lk == MIR_LOCAL_ARG {
-                param_count = param_count + 1;
+    let is_real_fn = (func as usize) != 0 && (unsafe { (*func).body as usize }) != 0;
+    let thir_has_items = (thir as usize) != 0 && ((unsafe { (*thir).item_types.len }) > 0 || (unsafe { (*thir).expr_types.len }) > 0 || is_real_fn);
+    let mut any_droppable = false;
+    let mut ld: usize = 0;
+    while ld < lc {
+        let lty = TypeId { v: unsafe { (*mir_local_at(body.locals, ld)).ty.v } };
+        if verify_own_type_needs_drop(thir, thir_has_items, lty) {
+            unsafe {
+                *(is_droppable + ld) = 1u8;
             }
-            l = l + 1;
+            if ld > 0 {
+                any_droppable = true;
+            }
+        }
+        ld = ld + 1;
+    }
+
+    // 1. Match bb0 drop-flag prolog emitted by mir_drop_elaborate.
+    let bb0 = unsafe { mir_bb_at(body.bbs, 0) };
+    let bb0_sc = unsafe { (*bb0).stmt_count };
+    let bb0_stmts = unsafe { (*bb0).stmts };
+    let mut prolog_flags: usize = 0;
+    let mut first_flag_loc: u32 = 0u32;
+    while prolog_flags < bb0_sc {
+        let st_p = unsafe { mir_stmt_at(bb0_stmts, prolog_flags) };
+        let mut floc: u32 = 0u32;
+        let mut fval: u64 = 0u64;
+        if !verify_own_is_bool_const_assign(body, thir, is_droppable as *const u8, lc, st_p as *const MirStmt, mut_view(floc), mut_view(fval)) {
+            break;
+        }
+        if prolog_flags == 0 {
+            first_flag_loc = floc;
+        } else if floc != first_flag_loc + (prolog_flags as u32) {
+            break;
+        }
+        prolog_flags = prolog_flags + 1;
+    }
+    if prolog_flags > 0 {
+        let mut drop_cnt: usize = 0;
+        let mut v_idx: usize = 1;
+        while v_idx < (first_flag_loc as usize) && v_idx < lc {
+            if (unsafe { *(is_droppable + v_idx) }) != 0u8 {
+                drop_cnt = drop_cnt + 1;
+            }
+            v_idx = v_idx + 1;
+        }
+        if drop_cnt == prolog_flags {
+            let mut k_f: usize = 0;
+            let mut v_f: usize = 1;
+            while v_f < (first_flag_loc as usize) && v_f < lc {
+                if (unsafe { *(is_droppable + v_f) }) != 0u8 {
+                    let f = first_flag_loc + (k_f as u32);
+                    unsafe {
+                        *u32_at(flag_of, v_f) = f;
+                        *u32_at(owner_of_flag, f as usize) = v_f as u32;
+                    }
+                    k_f = k_f + 1;
+                }
+                v_f = v_f + 1;
+            }
         }
     }
 
+    // 2. Match explicit drop_flag annotations or hand-built switchInt/assign flag patterns.
+    let mut b_scan: usize = 0;
+    while !is_real_fn && b_scan < bc {
+        let bb = unsafe { mir_bb_at(body.bbs, b_scan) };
+        if (unsafe { (*bb).has_terminator }) {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_DROP {
+                let v = (unsafe { (*bb).terminator.drop_place.local.v }) as usize;
+                let f = unsafe { (*bb).terminator.drop_flag };
+                if v >= 1 && v < lc && (unsafe { *(is_droppable + v) }) != 0u8 &&
+                    f != MIR_DROP_FLAG_NONE && verify_own_is_bool_local(body, thir, is_droppable as *const u8, lc, f) {
+                    if (unsafe { *u32_at(flag_of, v) }) == 0u32 && (unsafe { *u32_at(owner_of_flag, f as usize) }) == 0u32 {
+                        unsafe {
+                            *u32_at(flag_of, v) = f;
+                            *u32_at(owner_of_flag, f as usize) = v as u32;
+                        }
+                    }
+                }
+            } else if tk == MIR_TERM_SWITCH_INT {
+                let dk = unsafe { (*bb).terminator.discr.kind };
+                let dpc = unsafe { (*bb).terminator.discr.place.proj_count };
+                if dk != MIR_OP_CONST && dpc == 0 {
+                    let f = unsafe { (*bb).terminator.discr.place.local.v };
+                    if verify_own_is_bool_local(body, thir, is_droppable as *const u8, lc, f) &&
+                        (unsafe { *u32_at(owner_of_flag, f as usize) }) == 0u32 {
+                        let sc = unsafe { (*bb).terminator.switch_count };
+                        let tgts = unsafe { (*bb).terminator.targets };
+                        let ow = unsafe { (*bb).terminator.otherwise.v };
+                        let mut k: usize = 0;
+                        while k <= sc {
+                            let t_idx: u32 = if k < sc {
+                                unsafe { (*mir_bb_id_at(tgts, k)).v }
+                            } else {
+                                ow
+                            };
+                            if (t_idx as usize) < bc {
+                                let tbb = unsafe { mir_bb_at(body.bbs, t_idx as usize) };
+                                let mut cand_v: u32 = 0u32;
+                                if (unsafe { (*tbb).has_terminator }) && (unsafe { (*tbb).terminator.kind }) == MIR_TERM_DROP &&
+                                    (unsafe { (*tbb).terminator.drop_place.proj_count }) == 0 {
+                                    cand_v = unsafe { (*tbb).terminator.drop_place.local.v };
+                                } else {
+                                    let tsc = unsafe { (*tbb).stmt_count };
+                                    let tstmts = unsafe { (*tbb).stmts };
+                                    let mut sj: usize = 0;
+                                    while sj < tsc {
+                                        let ts = unsafe { mir_stmt_at(tstmts, sj) };
+                                        if (unsafe { (*ts).kind }) == MIR_STMT_DROP && (unsafe { (*ts).place.proj_count }) == 0 {
+                                            cand_v = unsafe { (*ts).place.local.v };
+                                            break;
+                                        }
+                                        sj = sj + 1;
+                                    }
+                                }
+                                let cv = cand_v as usize;
+                                if cv >= 1 && cv < lc && (unsafe { *(is_droppable + cv) }) != 0u8 &&
+                                    (unsafe { *u32_at(flag_of, cv) }) == 0u32 &&
+                                    (unsafe { *u32_at(owner_of_flag, f as usize) }) == 0u32 {
+                                    unsafe {
+                                        *u32_at(flag_of, cv) = f;
+                                        *u32_at(owner_of_flag, f as usize) = cand_v;
+                                    }
+                                    break;
+                                }
+                            }
+                            k = k + 1;
+                        }
+                    }
+                }
+            }
+        }
+        let bsc = unsafe { (*bb).stmt_count };
+        let bstmts = unsafe { (*bb).stmts };
+        let mut sj: usize = 0;
+        while (sj + 1) < bsc {
+            let s0 = unsafe { mir_stmt_at(bstmts, sj) };
+            let s1 = unsafe { mir_stmt_at(bstmts, sj + 1) };
+            if (unsafe { (*s0).kind }) == MIR_STMT_ASSIGN && (unsafe { (*s0).place.proj_count }) == 0 {
+                let v = (unsafe { (*s0).place.local.v }) as usize;
+                let mut f: u32 = 0u32;
+                let mut fval: u64 = 0u64;
+                if v >= 1 && v < lc && (unsafe { *(is_droppable + v) }) != 0u8 &&
+                    (unsafe { *u32_at(flag_of, v) }) == 0u32 &&
+                    verify_own_is_bool_const_assign(body, thir, is_droppable as *const u8, lc, s1 as *const MirStmt, mut_view(f), mut_view(fval)) &&
+                    fval == 1u64 && (unsafe { *u32_at(owner_of_flag, f as usize) }) == 0u32 {
+                    unsafe {
+                        *u32_at(flag_of, v) = f;
+                        *u32_at(owner_of_flag, f as usize) = v as u32;
+                    }
+                }
+            }
+            sj = sj + 1;
+        }
+        b_scan = b_scan + 1;
+    }
+
+    // 3. Mark clear_bb / drop_bb targets of switchInt(copy flag).
+    let mut has_any_flag = body.drop_flag_count > 0;
+    let mut lf: usize = 1;
+    while lf < lc {
+        if (unsafe { *u32_at(flag_of, lf) }) != 0u32 {
+            has_any_flag = true;
+            break;
+        }
+        lf = lf + 1;
+    }
+    let check_drops = !is_real_fn || !any_droppable || has_any_flag;
+
+    let mut b_mark: usize = 0;
+    while b_mark < bc {
+        let bb = unsafe { mir_bb_at(body.bbs, b_mark) };
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_SWITCH_INT {
+            let dk = unsafe { (*bb).terminator.discr.kind };
+            let dpc = unsafe { (*bb).terminator.discr.place.proj_count };
+            let dloc = (unsafe { (*bb).terminator.discr.place.local.v }) as usize;
+            if dk != MIR_OP_CONST && dpc == 0 && dloc < lc {
+                let v = unsafe { *u32_at(owner_of_flag, dloc) };
+                if v != 0u32 {
+                    let sc = unsafe { (*bb).terminator.switch_count };
+                    let vals = unsafe { (*bb).terminator.values };
+                    let tgts = unsafe { (*bb).terminator.targets };
+                    let ow = unsafe { (*bb).terminator.otherwise.v };
+                    let mut has_zero = false;
+                    let mut has_one = false;
+                    let mut k: usize = 0;
+                    while k < sc {
+                        let val = unsafe { *mir_u64_at(vals, k) };
+                        let tgt = unsafe { (*mir_bb_id_at(tgts, k)).v };
+                        if val == 0u64 {
+                            has_zero = true;
+                        } else {
+                            has_one = true;
+                            if (tgt as usize) < bc {
+                                unsafe {
+                                    *u32_at(is_flag_drop_bb, tgt as usize) = v;
+                                }
+                            }
+                        }
+                        k = k + 1;
+                    }
+                    if has_zero && !has_one && (ow as usize) < bc {
+                        unsafe {
+                            *u32_at(is_flag_drop_bb, ow as usize) = v;
+                        }
+                    }
+                }
+            }
+        }
+        b_mark = b_mark + 1;
+    }
+
+    let param_count = verify_fn_param_count(func);
     let mut l_init: usize = 0;
     while l_init < lc {
-        let st: u8 = if l_init >= 1 && l_init <= param_count {
+        let lk = unsafe { (*mir_local_at(body.locals, l_init)).kind };
+        let st: u8 = if l_init >= 1 && (l_init <= param_count || lk == MIR_LOCAL_ARG) {
             VERIFY_ST_OWNED
         } else {
             VERIFY_ST_UNINIT
@@ -44402,11 +44792,156 @@ pub fn verify_mir_own(
         }
     }
 
-    verify_mir_own_fixpoint(body, bc, lc, bb_in, bb_out, cur);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i: usize = 0;
+        while i < bc {
+            let row_off = mir_mul_usize(i, lc);
+            if i > 0 {
+                verify_fill_bytes(cur, VERIFY_ST_BOTTOM, lc);
+                let mut j: usize = 0;
+                while j < bc {
+                    let pred = unsafe { mir_bb_at(body.bbs, j) };
+                    let p_off = mir_mul_usize(j, lc);
+                    let mut handled_switch = false;
+                    if (unsafe { (*pred).has_terminator }) && (unsafe { (*pred).terminator.kind }) == MIR_TERM_SWITCH_INT {
+                        let dk = unsafe { (*pred).terminator.discr.kind };
+                        let dpc = unsafe { (*pred).terminator.discr.place.proj_count };
+                        let dloc = (unsafe { (*pred).terminator.discr.place.local.v }) as usize;
+                        let f: usize = if dk != MIR_OP_CONST && dpc == 0 && dloc < lc { dloc } else { 0 };
+                        let v: usize = if f < lc { (unsafe { *u32_at(owner_of_flag, f) }) as usize } else { 0 };
+                        if v != 0 && v < lc {
+                            handled_switch = true;
+                            let sc = unsafe { (*pred).terminator.switch_count };
+                            let vals = unsafe { (*pred).terminator.values };
+                            let tgts = unsafe { (*pred).terminator.targets };
+                            let ow = (unsafe { (*pred).terminator.otherwise.v }) as usize;
+                            let mut f1_to_i = false;
+                            let mut f0_to_i = false;
+                            let mut has_zero = false;
+                            let mut has_one = false;
+                            let mut k: usize = 0;
+                            while k < sc {
+                                let val = unsafe { *mir_u64_at(vals, k) };
+                                let tgt = (unsafe { (*mir_bb_id_at(tgts, k)).v }) as usize;
+                                if val == 0u64 {
+                                    has_zero = true;
+                                    if tgt == i {
+                                        f0_to_i = true;
+                                    }
+                                } else {
+                                    has_one = true;
+                                    if tgt == i {
+                                        f1_to_i = true;
+                                    }
+                                }
+                                k = k + 1;
+                            }
+                            if ow == i {
+                                if has_zero && !has_one {
+                                    f1_to_i = true;
+                                } else if !has_zero {
+                                    f0_to_i = true;
+                                }
+                            }
+                            let v_out = unsafe { *(bb_out + p_off + v) };
+                            if f1_to_i && (v_out & VERIFY_MASK_F1) != 0u8 {
+                                let mut l: usize = 0;
+                                while l < lc {
+                                    let p_st: u8 = if l == v {
+                                        (v_out & VERIFY_MASK_F1) | (v_out & VERIFY_ST_WAS_DROPPED)
+                                    } else {
+                                        unsafe { *(bb_out + p_off + l) }
+                                    };
+                                    let old_c = unsafe { *(cur + l) };
+                                    unsafe {
+                                        *(cur + l) = verify_merge_st(old_c, p_st);
+                                    }
+                                    l = l + 1;
+                                }
+                            }
+                            if f0_to_i && (v_out & VERIFY_MASK_F0) != 0u8 {
+                                let mut l: usize = 0;
+                                while l < lc {
+                                    let p_st: u8 = if l == v {
+                                        (v_out & VERIFY_MASK_F0) | (v_out & VERIFY_ST_WAS_DROPPED)
+                                    } else {
+                                        unsafe { *(bb_out + p_off + l) }
+                                    };
+                                    let old_c = unsafe { *(cur + l) };
+                                    unsafe {
+                                        *(cur + l) = verify_merge_st(old_c, p_st);
+                                    }
+                                    l = l + 1;
+                                }
+                            }
+                        }
+                    }
+
+                    if !handled_switch && verify_bb_is_pred(pred as *const MirBb, i) {
+                        let mut l: usize = 0;
+                        while l < lc {
+                            let old_c = unsafe { *(cur + l) };
+                            let p_out = unsafe { *(bb_out + p_off + l) };
+                            unsafe {
+                                *(cur + l) = verify_merge_st(old_c, p_out);
+                            }
+                            l = l + 1;
+                        }
+                    }
+                    j = j + 1;
+                }
+                let in_row_ptr = unsafe { bb_in + row_off };
+                if !verify_eq_bytes(cur as *const u8, in_row_ptr as *const u8, lc) {
+                    verify_copy_bytes(in_row_ptr, cur as *const u8, lc);
+                    changed = true;
+                }
+            }
+
+            let in_row_ptr = unsafe { bb_in + row_off };
+            verify_copy_bytes(cur, in_row_ptr as *const u8, lc);
+            let mut reachable = false;
+            let mut lr: usize = 0;
+            while lr < lc {
+                if (unsafe { *(cur + lr) }) != VERIFY_ST_BOTTOM {
+                    reachable = true;
+                    break;
+                }
+                lr = lr + 1;
+            }
+            if !reachable {
+                verify_fill_bytes(cur, VERIFY_ST_BOTTOM, lc);
+            } else {
+                verify_own_step_bb(
+                    body,
+                    thir,
+                    thir_has_items,
+                    check_drops,
+                    is_droppable as *const u8,
+                    flag_of as *const u32,
+                    owner_of_flag as *const u32,
+                    is_flag_drop_bb as *const u32,
+                    lc,
+                    i,
+                    cur,
+                    mut_view(*sink),
+                    func,
+                    false
+                );
+            }
+
+            let out_row_ptr = unsafe { bb_out + row_off };
+            if !verify_eq_bytes(cur as *const u8, out_row_ptr as *const u8, lc) {
+                verify_copy_bytes(out_row_ptr, cur as *const u8, lc);
+                changed = true;
+            }
+            i = i + 1;
+        }
+    }
 
     let mut b_idx: usize = 0;
     while b_idx < bc {
-        let bb = unsafe { mir_bb_at(body.bbs, b_idx) };
         let row_off = mir_mul_usize(b_idx, lc);
         let in_row_ptr = unsafe { bb_in + row_off };
         verify_copy_bytes(cur, in_row_ptr as *const u8, lc);
@@ -44421,13 +44956,22 @@ pub fn verify_mir_own(
             lr = lr + 1;
         }
         if reachable {
-            let mut s_idx: usize = 0;
-            while s_idx < (unsafe { (*bb).stmt_count }) {
-                let stmt = unsafe { mir_stmt_at((*bb).stmts, s_idx) };
-                verify_mir_own_check_stmt(body, thir, mut_view(*sink), func, lc, unsafe { view(*stmt) }, cur);
-                s_idx = s_idx + 1;
-            }
-            verify_mir_own_check_term(body, thir, mut_view(*sink), func, lc, unsafe { view(*bb) }, cur);
+            verify_own_step_bb(
+                body,
+                thir,
+                thir_has_items,
+                check_drops,
+                is_droppable as *const u8,
+                flag_of as *const u32,
+                owner_of_flag as *const u32,
+                is_flag_drop_bb as *const u32,
+                lc,
+                b_idx,
+                cur,
+                mut_view(*sink),
+                func,
+                true
+            );
         }
         b_idx = b_idx + 1;
     }
@@ -44712,6 +45256,10 @@ pub fn verify_mir_drop_flags(
             }
         }
         b_idx = b_idx + 1;
+    }
+
+    if (func as usize) != 0 && sink.errors == 0 {
+        verify_mir_own(body, thir, mut_view(*sink), func);
     }
 }
 
@@ -45941,7 +46489,13 @@ pub fn verify_mir_text(text: StrView, sink: mut_view<DiagSink>) -> bool {
     if (body as usize) != 0 {
         verify_mir(unsafe { view(*body) }, thir_ptr as *const Thir, mut_view(*sink), 0 as *const HirItem);
         if sink.errors == 0 {
-            verify_mir_own(unsafe { view(*body) }, thir_ptr as *const Thir, mut_view(*sink), 0 as *const HirItem);
+            let mir_fn = arena_alloc_raw(mut_view(arena), size_of<HirItem>(), align_of<HirItem>()) as *mut HirItem;
+            unsafe {
+                (*mir_fn).kind = HIR_ITEM_FN;
+                (*mir_fn).params = 0 as *mut HirParam;
+                (*mir_fn).span = vp_zero_span();
+            }
+            verify_mir_own(unsafe { view(*body) }, thir_ptr as *const Thir, mut_view(*sink), mir_fn as *const HirItem);
         }
     } else {
         let zero_span = vp_zero_span();

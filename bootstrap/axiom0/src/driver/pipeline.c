@@ -567,10 +567,10 @@ static void stage_own(AxDriverState *st) {
             ax_type_is_copy(body->locals[i].ty, &st->thir, &st->interner);
         }
         ax_own_check(it, body, &st->thir, &st->sink, &st->interner);
+        ax_mir_drop_elaborate(body, &st->thir, &st->hir, &st->db, &st->sink, &st->interner);
         if (st->sink.errors == 0) {
             ax_verify_mir_own(body, &st->thir, &st->sink, it);
         }
-        ax_mir_drop_elaborate(body, &st->thir, &st->hir, &st->db, &st->sink, &st->interner);
         /* T141: -O1 runs on drop-elaborated MIR (as in the port, compiler/driver/pipeline.ax), so an
          * optimisation can never remove or reorder a drop (SPEC-03 AXS-SEM-003) and both compilers
          * optimise the same MIR (ADR-0034 §2 parity). */
@@ -748,9 +748,11 @@ int ax_pipeline_run(AxDriverState *st, AxStageId stop_after) {
         
         AxMirBody *body = ax_mir_parse(st->text.ptr, &st->thir.interner, &temp_arena);
         if (body) {
+            AxHirItem mir_fn = {0};
+            mir_fn.kind = AX_HIR_ITEM_FN;
             ax_verify_mir(body, &st->thir, &st->sink, NULL);
             if (st->sink.errors == 0) {
-                ax_verify_mir_own(body, &st->thir, &st->sink, NULL);
+                ax_verify_mir_own(body, &st->thir, &st->sink, &mir_fn);
             }
             if (st->sink.errors == 0 && ax_opt_O1) {
                 ax_opt_run(body, &st->thir, &st->sink, NULL, ax_opt_verify_each);

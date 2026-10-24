@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 110
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tools/gen_encode_tests.py, tests/encode]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, 0163, tasks/0361]
 covers: [REQ-TST-015, REQ-CORE-255]
 timeout_min: 240
+started: 2026-10-24 16:33:45
+agent: T143-impl
 ---
 # T143 — GNU-as encoder oracle widened, with an Axiom twin
 
@@ -66,3 +68,4 @@ vanishes at T086, and `tests/selfhost/encode/qa_encode_instructions.ax` partly u
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale.
 
 ## Log
+- 2026-10-24 16:33:45 started (attempt 1) T143-impl

@@ -143,6 +143,10 @@ MIR_FIXTURES = [
         "AX_VERIFY_MISSING_DROP",
         "AX_VERIFY_MISSING_DROP",
     ]),
+    ("tests/verify/drop/missing_drop_branch.mir", ["AX_VERIFY_MISSING_DROP"]),
+    ("tests/verify/drop/double_drop_implicit.mir", ["AX_VERIFY_DOUBLE_DROP"]),
+    ("tests/verify/drop/cond_drop_flag_ok.mir", []),
+    ("tests/verify/drop/raw_store_moved_ok.mir", []),
 ]
 
 

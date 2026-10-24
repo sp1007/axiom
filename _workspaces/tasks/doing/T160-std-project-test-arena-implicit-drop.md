@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T146]
 priority: 115
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/std/project]
 spec: [spec/SPEC-12-drop.md, spec/decisions/ADR-0006-bootstrap-forms-manifest-std-root.md]
 covers: [REQ-LAY-047, REQ-DRP-051]
+started: 2026-10-24 16:33:55
+agent: T160-impl
 ---
 # T160 — Project-mode std test for `Arena` implicit drop
 
@@ -50,3 +52,4 @@ Prove it with the real module through project mode (`axiom.toml` + std root, ADR
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-24 16:33:55 started (attempt 1) T160-impl
