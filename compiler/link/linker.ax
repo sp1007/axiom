@@ -41,7 +41,6 @@ use compiler.obj.coff.COFF_SYMBOL_SIZE
 use compiler.obj.coff.IMAGE_FILE_MACHINE_AMD64
 use compiler.obj.coff.IMAGE_SCN_CNT_INITIALIZED_DATA
 use compiler.obj.coff.IMAGE_SYM_CLASS_EXTERNAL
-use compiler.obj.coff.IMAGE_SYM_CLASS_STATIC
 use compiler.obj.coff.IMAGE_REL_AMD64_ADDR64
 use compiler.obj.coff.IMAGE_REL_AMD64_ADDR32
 use compiler.obj.coff.IMAGE_REL_AMD64_ADDR32NB
@@ -101,6 +100,7 @@ use compiler.link.pe.linker_get_or_create_section_str
 use compiler.link.pe.linker_append_section_data
 use compiler.link.pe.linker_add_global
 use compiler.link.pe.linker_add_reloc
+use compiler.link.pe.linker_add_reloc_direct
 use compiler.link.pe.linker_reloc_at
 
 use compiler.link.import.ImportTable
@@ -195,6 +195,15 @@ unsafe fn u32_slot_ptr(base: *mut u32, idx: usize) -> *mut u32 {
 
 unsafe fn cstr_slot_ptr(base: *mut *const u8, idx: usize) -> *mut *const u8 {
     ((base as usize) + coff_mul_usize(idx, size_of<*const u8>())) as *mut *const u8
+}
+
+unsafe fn msec_slot_ptr(base: *mut *mut MergedSection, idx: usize) -> *mut *mut MergedSection {
+    ((base as usize) + coff_mul_usize(idx, size_of<*mut MergedSection>())) as *mut *mut MergedSection
+}
+
+unsafe fn free_sym_target_arrays(sym_secs: *mut *mut MergedSection, sym_offs: *mut u32, cap: usize) {
+    heap_free(sym_secs as *mut u8, coff_mul_usize(cap, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
+    heap_free(sym_offs as *mut u8, coff_mul_usize(cap, size_of<u32>()), align_of<u32>());
 }
 
 fn read_cstr_at_offset(buf: *const u8, buf_len: usize, off: usize, out_len: mut_view<usize>) -> *const u8 {
@@ -321,10 +330,20 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
     let sym_names = unsafe {
         heap_alloc(coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>()) as *mut *const u8
     };
+    // Per-symbol definition (section + offset within the merged section), indexed by symbol-table index,
+    // so same-object relocations bind by index and not by name (ADR-0035 section 2).
+    let sym_secs = unsafe {
+        heap_alloc(coff_mul_usize(sym_names_cap, size_of<*mut MergedSection>()), align_of<*mut MergedSection>()) as *mut *mut MergedSection
+    };
+    let sym_offs = unsafe {
+        heap_alloc(coff_mul_usize(sym_names_cap, size_of<u32>()), align_of<u32>()) as *mut u32
+    };
     let mut sym_idx: usize = 0;
     while sym_idx < sym_names_cap {
         unsafe {
             *(cstr_slot_ptr(sym_names, sym_idx)) = 0 as *const u8;
+            *(msec_slot_ptr(sym_secs, sym_idx)) = 0 as *mut MergedSection;
+            *(u32_slot_ptr(sym_offs, sym_idx)) = 0u32;
         }
         sym_idx = sym_idx + 1;
     }
@@ -360,12 +379,18 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
                 let s_msec = unsafe { *(merged_sec_slot_ptr(obj_merged_secs, sec_num)) };
                 let s_base = unsafe { *(u32_slot_ptr(obj_sec_offsets, sec_num)) };
                 let s_offset: u32 = s_base + sym.value;
+                unsafe {
+                    *(msec_slot_ptr(sym_secs, sym_idx)) = s_msec;
+                    *(u32_slot_ptr(sym_offs, sym_idx)) = s_offset;
+                }
 
+                // Only EXTERNAL definitions enter the global name table; STATIC symbols never do.
                 if sym.storage_class == IMAGE_SYM_CLASS_EXTERNAL {
                     let g = linker_add_global(mut_view(*ctx), name_ptr);
                     if unsafe { (*g).defined } {
                         linker_report_duplicate_symbol(diag, name_ptr);
                         unsafe {
+                            free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
                             heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
                             heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
                             heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
@@ -376,15 +401,6 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
                         (*g).defined = true;
                         (*g).sec = s_msec;
                         (*g).offset = s_offset;
-                    }
-                } else if sym.storage_class == IMAGE_SYM_CLASS_STATIC {
-                    let g_static = linker_add_global(mut_view(*ctx), name_ptr);
-                    if !(unsafe { (*g_static).defined }) {
-                        unsafe {
-                            (*g_static).defined = true;
-                            (*g_static).sec = s_msec;
-                            (*g_static).offset = s_offset;
-                        }
                     }
                 }
             }
@@ -404,6 +420,7 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
             let rel_table_end: usize = rel_table_off + coff_mul_usize(num_rels, COFF_RELOC_SIZE);
             if rel_table_end > obj_len {
                 unsafe {
+                    free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
                     heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
                     heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
                     heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
@@ -433,13 +450,23 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
                 }
 
                 let sym_tab_idx: usize = rel.symbol_table_index as usize;
-                let target_sym_name: *const u8 = if sym_tab_idx < num_syms {
-                    unsafe { *(cstr_slot_ptr(sym_names, sym_tab_idx)) }
+                let tgt_sec: *mut MergedSection = if sym_tab_idx < num_syms {
+                    unsafe { *(msec_slot_ptr(sym_secs, sym_tab_idx)) }
                 } else {
-                    0 as *const u8
+                    0 as *mut MergedSection
                 };
-
-                linker_add_reloc(mut_view(*ctx), msec, off, rel.reloc_type, target_sym_name, addend);
+                if (tgt_sec as usize) != 0 {
+                    // Defined in this object (SectionNumber > 0): bind by symbol index (ADR-0035 section 2).
+                    let tgt_off: u32 = unsafe { *(u32_slot_ptr(sym_offs, sym_tab_idx)) };
+                    linker_add_reloc_direct(mut_view(*ctx), msec, off, rel.reloc_type, tgt_sec, tgt_off, addend);
+                } else {
+                    let target_sym_name: *const u8 = if sym_tab_idx < num_syms {
+                        unsafe { *(cstr_slot_ptr(sym_names, sym_tab_idx)) }
+                    } else {
+                        0 as *const u8
+                    };
+                    linker_add_reloc(mut_view(*ctx), msec, off, rel.reloc_type, target_sym_name, addend);
+                }
                 r = r + 1;
             }
         }
@@ -447,6 +474,7 @@ pub fn linker_load_coff_object(ctx: mut_view<LinkerContext>, obj_ptr: *const u8,
     }
 
     unsafe {
+        free_sym_target_arrays(sym_secs, sym_offs, sym_names_cap);
         heap_free(sym_names as *mut u8, coff_mul_usize(sym_names_cap, size_of<*const u8>()), align_of<*const u8>());
         heap_free(obj_merged_secs as *mut u8, coff_mul_usize(sec_slots_count, size_of<*mut MergedSection>()), align_of<*mut MergedSection>());
         heap_free(obj_sec_offsets as *mut u8, coff_mul_usize(sec_slots_count, size_of<u32>()), align_of<u32>());
@@ -526,16 +554,22 @@ pub fn linker_apply_relocations(ctx: mut_view<LinkerContext>, image_base: u64, d
     let mut i: usize = 0;
     while i < ctx.num_relocs {
         let r = linker_reloc_at(view(*ctx), i);
-        let sym_name = unsafe { (*r).sym_name };
-        let sym = linker_add_global(mut_view(*ctx), sym_name);
-        if !(unsafe { (*sym).defined }) {
-            linker_report_undefined_symbol(diag, sym_name);
-            return false;
+        let direct_sec = unsafe { (*r).dsec };
+        let mut sym_rva: u32 = 0u32;
+        if (direct_sec as usize) != 0 {
+            // Same-object target resolved by symbol index at load time.
+            sym_rva = (unsafe { (*direct_sec).rva }) + (unsafe { (*r).doffset });
+        } else {
+            let sym_name = unsafe { (*r).sym_name };
+            let sym = linker_add_global(mut_view(*ctx), sym_name);
+            if !(unsafe { (*sym).defined }) {
+                linker_report_undefined_symbol(diag, sym_name);
+                return false;
+            }
+            let sym_sec = unsafe { (*sym).sec };
+            let sym_off = unsafe { (*sym).offset };
+            sym_rva = (unsafe { (*sym_sec).rva }) + sym_off;
         }
-
-        let sym_sec = unsafe { (*sym).sec };
-        let sym_off = unsafe { (*sym).offset };
-        let sym_rva: u32 = (unsafe { (*sym_sec).rva }) + sym_off;
 
         let r_sec = unsafe { (*r).sec };
         let r_off = unsafe { (*r).offset };

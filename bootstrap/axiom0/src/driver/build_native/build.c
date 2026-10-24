@@ -12,6 +12,7 @@
 #include "obj/coff/writer.h"
 #include "link/pe/linker.h"
 #include "driver/mono.h"
+#include "driver/build_native/data_syms.h"
 #include "types/layout/layout.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -379,7 +380,7 @@ static void emit_const_tables(AxDriverState *st, ax_objmodel_t *obj, ax_section_
     }
 
     ax_section_t *rdata_sec = ax_objmodel_get_section(obj, rdata_sec_id);
-    static int s_cstr_counter = 0;
+    int s_cstr_counter = 0; /* per object (ADR-0035 section 1), never process-wide */
 
     for (size_t i = 0; i < table_count; i++) {
         ConstTableToEmit *entry = &tables[i];
@@ -448,6 +449,8 @@ void ax_stage_build_native(AxDriverState *st) {
     ax_section_t *text_sec = ax_objmodel_get_section(&obj, text_sec_id);
 
     emit_const_tables(st, &obj, my_rdata_sec_id);
+    uint32_t fn_ordinal = 0; /* emission-order ordinal of the next function body (ADR-0035 section 1) */
+    uint32_t panic_id = 0;   /* per-object panic-message counter */
 
     for (const AxMonoInstance *inst = st->mono_instances; inst != NULL; inst = inst->next) { const AxHirItem *item = inst->item;
         if (item->kind == AX_HIR_ITEM_FN) {
@@ -487,17 +490,7 @@ void ax_stage_build_native(AxDriverState *st) {
                     AxX64MIBody *mi_body = ax_x64_isel(lir_body, &st->thir.interner);
                     AxX64FrameLayout layout = ax_x64_frame_lower(mi_body, lir_body, &st->thir.interner, &st->hir_arena);
 
-    ax_section_t *rdata_sec = ax_objmodel_get_section(&obj, my_rdata_sec_id);
-    for (size_t i = 0; i < mi_body->string_count; i++) {
-        AxX64MIStr *str = &mi_body->strings[i];
-        uint32_t offset = rdata_sec->bytes_len;
-        ax_section_add_bytes(rdata_sec, str->bytes, str->len);
-        ax_section_add_byte(rdata_sec, 0); // null terminator for good measure
-        
-        char sym_name[64];
-        snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, str->sym_id);
-        ax_objmodel_add_symbol(&obj, strdup(sym_name), my_rdata_sec_id, offset, str->len, AX_SYM_GLOBAL);
-    }
+    ax_emit_fn_string_data(&obj, my_rdata_sec_id, mi_body, fn_ordinal++);
                     ax_x64_verify(mi_body, &layout);
 
                     uint64_t func_start = text_sec->bytes_len;
@@ -555,10 +548,8 @@ void ax_stage_build_native(AxDriverState *st) {
                                     }
                                     ax_x64_lea_sym(text_sec, inst->ops[0].reg, fn_sym);
                                 } else {
-                                    char sym_name[64];
-                                    snprintf(sym_name, sizeof(sym_name), ".Lstr.%zx.%u", (size_t)mi_body, inst->ops[1].sym);
-                                    ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(sym_name), ax_section_id_t_none(), 0, 0, AX_SYM_EXTERNAL);
-                                    ax_x64_lea_sym(text_sec, inst->ops[0].reg, str_sym);
+                                    /* operand was rewritten to the string symbol's own id by ax_emit_fn_string_data */
+                                    ax_x64_lea_sym(text_sec, inst->ops[0].reg, (ax_symbol_id_t){ inst->ops[1].sym });
                                 }
                             } else if (inst->opcode == AX_X64_MI_ASSERT) {
                                 fixups[num_fixups].fixup = text_sec->bytes_len + 2;
@@ -575,10 +566,9 @@ void ax_stage_build_native(AxDriverState *st) {
                                 ax_section_add_bytes(rdata_sec, (const uint8_t*)formatted_msg, len);
                                 ax_section_add_byte(rdata_sec, 0);
                                 
-                                static int panic_id = 0;
                                 char panic_sym_name[64];
-                                snprintf(panic_sym_name, sizeof(panic_sym_name), ".Lpanic_%d", panic_id++);
-                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(panic_sym_name), my_rdata_sec_id, str_offset, len + 1, AX_SYM_GLOBAL);
+                                ax_panic_sym_name(panic_sym_name, sizeof(panic_sym_name), panic_id++);
+                                ax_symbol_id_t str_sym = ax_objmodel_add_symbol(&obj, strdup(panic_sym_name), my_rdata_sec_id, str_offset, len + 1, AX_SYM_LOCAL);
                                 
                                 ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x83); ax_section_add_byte(text_sec, 0xEC); ax_section_add_byte(text_sec, 0x20); // sub rsp, 32
                                 ax_section_add_byte(text_sec, 0x48); ax_section_add_byte(text_sec, 0x8D); ax_section_add_byte(text_sec, 0x0D);

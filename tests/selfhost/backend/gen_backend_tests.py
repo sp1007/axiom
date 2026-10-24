@@ -1105,8 +1105,8 @@ def gen_edge_test(modules_text):
         b".rdata",
         EDGE_LOOP_ASSERT_MIR_SRC.replace(b"\r\n", b"\n"),
         b".text",
-        b".Lstr.100000",
-        b".Lcstr_10",
+        b".Lstr.0.100000",
+        b".Lpanic.10",
         b"axiom_panic",
     ]
     packed, offsets = pack_blobs(blobs)

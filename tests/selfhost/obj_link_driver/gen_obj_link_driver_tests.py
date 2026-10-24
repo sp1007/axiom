@@ -36,8 +36,9 @@ T085_MODULES = [
 ]
 
 # Programs of the in-process differential bundle (relative to the repository root). Every program
-# must build deterministically with axiom0 (no string literals: axiom0 names .rdata string symbols
-# after a heap address) and be byte-identical between axiom0 and the Axiom pipeline.
+# must build deterministically with axiom0 and be byte-identical between axiom0 and the Axiom
+# pipeline. Programs with string literals are allowed since T147 (ADR-0035 section 1: object-local
+# `.Lstr.<f>.<k>` symbols, resolved by symbol index).
 DIFF_CORPUS_FULL = [
     "tests/mc/frame/main_42.ax",
     "tests/mc/isel/vs1_arith.ax",
@@ -45,6 +46,7 @@ DIFF_CORPUS_FULL = [
     "tests/mc/isel/vs1_return.ax",
     "tests/modules/hello/src/main.ax",
     "tests/modules/nested/src/main.ax",
+    "tests/run/parity/strings/fn_literals_plain.ax",
 ]
 DIFF_CORPUS_SMOKE = [
     "tests/mc/frame/main_42.ax",

@@ -29,7 +29,9 @@ typedef struct {
     MergedSection *sec;
     uint32_t offset;
     uint16_t type;
-    char *sym_name;
+    char *sym_name;  // NULL when the target is defined in the same object (bound by symbol index)
+    MergedSection *dsec;  // same-object target (ADR-0035 section 2): section + offset, no name lookup
+    uint32_t doffset;
     int64_t addend; // read from the object file data
 } Reloc;
 
@@ -150,7 +152,7 @@ static void free_linker_context(LinkerContext *ctx) {
     if (ctx->globals) ax_xfree(ctx->globals);
     
     for (size_t i = 0; i < ctx->num_relocs; i++) {
-        ax_xfree(ctx->relocs[i].sym_name);
+        if (ctx->relocs[i].sym_name) ax_xfree(ctx->relocs[i].sym_name);
     }
     if (ctx->relocs) ax_xfree(ctx->relocs);
 }
@@ -214,6 +216,25 @@ static void add_reloc(LinkerContext *ctx, MergedSection *sec, uint32_t offset, u
     r->offset = offset;
     r->type = type;
     r->sym_name = ax_xstrdup(sym_name);
+    r->dsec = NULL;
+    r->doffset = 0;
+    r->addend = addend;
+}
+
+// Relocation whose target symbol is defined in the same object (SectionNumber > 0): bound by the
+// symbol-table index at load time, whatever its name or storage class (ADR-0035 section 2).
+static void add_reloc_direct(LinkerContext *ctx, MergedSection *sec, uint32_t offset, uint16_t type, MergedSection *dsec, uint32_t doffset, int64_t addend) {
+    if (ctx->num_relocs == ctx->cap_relocs) {
+        ctx->cap_relocs = ctx->cap_relocs == 0 ? 64 : ctx->cap_relocs * 2;
+        ctx->relocs = ax_xrealloc(ctx->relocs, ctx->cap_relocs * sizeof(Reloc));
+    }
+    Reloc *r = &ctx->relocs[ctx->num_relocs++];
+    r->sec = sec;
+    r->offset = offset;
+    r->type = type;
+    r->sym_name = NULL;
+    r->dsec = dsec;
+    r->doffset = doffset;
     r->addend = addend;
 }
 
@@ -344,6 +365,8 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
                 IMAGE_SYMBOL aux;
                 fread(&aux, sizeof(aux), 1, f);
                 sym_names[s + 1 + a] = NULL;
+                sym_secs[s + 1 + a] = NULL;
+                sym_offsets[s + 1 + a] = 0;
             }
             s += sym.NumberOfAuxSymbols;
         }
@@ -370,8 +393,13 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
                     memcpy(&addend32, msec->data + off, 4);
                     addend = addend32;
                 }
-                char *sym_name = sym_names[rels[r].SymbolTableIndex];
-                add_reloc(&ctx, msec, off, rels[r].Type, sym_name, addend);
+                uint32_t tgt = rels[r].SymbolTableIndex;
+                if (tgt < hdr.NumberOfSymbols && sym_secs[tgt] != NULL) {
+                    add_reloc_direct(&ctx, msec, off, rels[r].Type, sym_secs[tgt], sym_offsets[tgt], addend);
+                } else {
+                    const char *tgt_name = tgt < hdr.NumberOfSymbols ? sym_names[tgt] : NULL;
+                    add_reloc(&ctx, msec, off, rels[r].Type, tgt_name ? tgt_name : "", addend);
+                }
             }
             ax_xfree(rels);
         }
@@ -649,13 +677,18 @@ bool ax_pe_link(const char *const *input_paths, size_t input_count, const char *
     // Apply relocations
     for (size_t i = 0; i < ctx.num_relocs; i++) {
         Reloc *r = &ctx.relocs[i];
-        GlobalSymbol *sym = add_global(&ctx, r->sym_name);
-        if (!sym->defined) {
-            if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_UNDEFINED_SYMBOL, .severity=AX_DIAG_ERROR, .message=r->sym_name});
-            { free_import_dlls(import_dlls, num_import_dlls); free_linker_context(&ctx); return false; }
+        uint32_t sym_rva;
+        if (r->dsec) {
+            sym_rva = r->dsec->rva + r->doffset;
+        } else {
+            GlobalSymbol *sym = add_global(&ctx, r->sym_name);
+            if (!sym->defined) {
+                if (diag) ax_diag_sink_report(diag, &(AxDiagnostic){.code=AX_LINK_UNDEFINED_SYMBOL, .severity=AX_DIAG_ERROR, .message=r->sym_name});
+                { free_import_dlls(import_dlls, num_import_dlls); free_linker_context(&ctx); return false; }
+            }
+            sym_rva = sym->sec->rva + sym->offset;
         }
         
-        uint32_t sym_rva = sym->sec->rva + sym->offset;
         uint32_t reloc_rva = r->sec->rva + r->offset;
         
         if (r->type == IMAGE_REL_AMD64_REL32 || (r->type >= IMAGE_REL_AMD64_REL32_1 && r->type <= IMAGE_REL_AMD64_REL32_5)) {

@@ -8,12 +8,14 @@ model: sonnet
 gate_model: opus
 depends: [T146]
 priority: 0
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/driver/build_native, bootstrap/axiom0/src/driver/emit_obj.c, bootstrap/axiom0/src/link, compiler/backend, compiler/driver/pipeline.ax, compiler/link, compiler/obj, tests/link, tests/obj, tests/run/parity/strings, tests/run/numeric/qa_t140_edge_matrix.ax, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, 0185]
 covers: [REQ-CORE-3181, REQ-BLD-030]
 timeout_min: 240
+started: 2026-10-24 00:56:59
+finished: 2026-10-24 07:22:28
 ---
 # T147 — AX0-FIX-05: string/panic data symbols and local-symbol linking
 
@@ -95,3 +97,5 @@ Confirmed defects (architect probe 2026-10-20, `_workspaces/reports/plan-axiomc-
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-24 00:56:59 started (attempt 1) T147-impl
+- 2026-10-24 07:22:28 accepted by QA -> done
