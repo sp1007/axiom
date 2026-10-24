@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 110
-status: doing
+status: done
 attempts: 1
 paths: [tools/gen_encode_tests.py, tests/encode]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, 0163, tasks/0361]
 covers: [REQ-TST-015, REQ-CORE-255]
 timeout_min: 240
 started: 2026-10-24 16:33:45
-agent: T143-impl
+finished: 2026-10-25 05:27:54
 ---
 # T143 — GNU-as encoder oracle widened, with an Axiom twin
 
@@ -69,3 +69,4 @@ vanishes at T086, and `tests/selfhost/encode/qa_encode_instructions.ax` partly u
 
 ## Log
 - 2026-10-24 16:33:45 started (attempt 1) T143-impl
+- 2026-10-25 05:27:54 accepted by QA -> done

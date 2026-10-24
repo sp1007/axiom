@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T134, T140]
 priority: 100
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tools/tests/axtest, tests/lir, tests/hir]
 locks: [tools/axtest.py, tests/README.md]
 spec: [spec/ROADMAP.md, tasks/0361, tasks/0480]
 covers: [REQ-TST-046, REQ-TST-107]
+started: 2026-10-25 04:09:11
+agent: T139-impl
 ---
 # T139 — axtest cross-mode agreement and native-evidence report for run tests
 
@@ -99,3 +101,4 @@ from the interpreter. Only `test: diff` compares executors with each other.
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale.
 
 ## Log
+- 2026-10-25 04:09:11 started (attempt 1) T139-impl
