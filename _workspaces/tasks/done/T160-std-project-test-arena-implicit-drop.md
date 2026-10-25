@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T146]
 priority: 115
-status: doing
+status: done
 attempts: 1
 paths: [tests/std/project]
 spec: [spec/SPEC-12-drop.md, spec/decisions/ADR-0006-bootstrap-forms-manifest-std-root.md]
 covers: [REQ-LAY-047, REQ-DRP-051]
 started: 2026-10-24 16:33:55
-agent: T160-impl
+finished: 2026-10-25 07:36:09
 ---
 # T160 — Project-mode std test for `Arena` implicit drop
 
@@ -53,3 +53,4 @@ Prove it with the real module through project mode (`axiom.toml` + std root, ADR
 
 ## Log
 - 2026-10-24 16:33:55 started (attempt 1) T160-impl
+- 2026-10-25 07:36:09 accepted by QA -> done

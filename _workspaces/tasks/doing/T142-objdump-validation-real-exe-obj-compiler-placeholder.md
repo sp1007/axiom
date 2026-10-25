@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: []
 priority: 110
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/link, tests/obj, tests/driver, tests/verify]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0003-backend-pipeline-robustness.md, 0185, tasks/0361]
 covers: [REQ-TST-109, REQ-CORE-345, REQ-CORE-346]
+started: 2026-10-25 05:28:42
+agent: T142-impl
 ---
 # T142 — External COFF/PE oracle: objdump validation of real exe/obj
 
@@ -74,3 +76,4 @@ Audit OI-07: T026's objdump criterion and T028's "cross-link every native run te
   stale.
 
 ## Log
+- 2026-10-25 05:28:42 started (attempt 1) T142-impl
