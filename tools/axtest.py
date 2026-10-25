@@ -65,6 +65,7 @@ DIRECTIVES = {
     "cmd": "single",
     "native-after": "single",
     "xfail": "single",
+    "stdout-file": "single",
     "stdout": "multi",
     "stderr": "multi",
     "stdout-contains": "multi",
@@ -301,6 +302,7 @@ class Test:
         self.target = None
         self.xfail = None                # (task, reason)
         self.native_after = None
+        self.stdout_file = None
         self.stdout = None
         self.stderr = None
         self.stdout_contains = []
@@ -451,6 +453,13 @@ def parse_directives(test, found):
             test.xfail = (m.group(1), m.group(2).strip())
         else:
             err(v[0], "`xfail:` needs `<task-id> <reason>`, got `%s`" % v[1].strip())
+    v = first("stdout-file")
+    if v:
+        sf = v[1].strip()
+        if sf:
+            test.stdout_file = sf
+        else:
+            err(v[0], "`stdout-file:` needs a path")
 
     def joined(name):
         occ = test.dirs.get(name)
@@ -712,12 +721,12 @@ class Runner:
         if test.errors:
             return [Entry(test, "directives",
                           preset=failed("invalid test file: " + "; ".join(test.errors)))]
-        if bless and test.kind != "golden":
+        if bless and test.kind != "golden" and not (test.kind == "exec" and test.stdout_file is not None):
             return []
         skip = self.common_skip(test)
         kind = test.kind
         if kind == "exec":
-            return [Entry(test, "", self._with_skip(skip, lambda: self.run_exec(test)))]
+            return [Entry(test, "", self._with_skip(skip, lambda: self.run_exec(test, bless=bless)))]
         if kind == "ui":
             return [Entry(test, "", self._with_skip(skip, lambda: self.run_ui(test)))]
         if kind == "golden":
@@ -739,13 +748,15 @@ class Runner:
         return fn
 
     def run_entries(self, test, skip):
-        modes = test.modes or list(MODES)
+        raw_modes = test.modes or list(MODES)
+        modes = [m for m in MODES if m in raw_modes]
         variants = []  # (label, mode, extra flags)
         has_opt_flag = any(f.startswith("-O") for f in test.flags)
         for m in modes:
             variants.append((m, m, []))
             if m == "native" and not has_opt_flag and "opt" in self.features:
                 variants.append(("native-O1", "native", ["-O1"]))
+        ctx = {"interp_obs": None}
         entries = []
         for label, mode, extra in variants:
             if skip:
@@ -757,7 +768,7 @@ class Runner:
             elif label == "native-O1" and "native" not in self.features:
                 run = (lambda: skipped("mode unavailable: native"))
             else:
-                run = (lambda m=mode, x=extra: self.run_program(test, m, x))
+                run = (lambda m=mode, x=extra, lbl=label: self.run_program(test, m, x, lbl, ctx))
             entries.append(Entry(test, label, run))
         return entries
 
@@ -828,6 +839,14 @@ class Runner:
         if obs.rc != expected_exit:
             return failed("exit code %s, expected %s; stderr: %s" % (obs.rc, expected_exit, render(obs.err, 300)))
         problems = []
+        if test.stdout_file is not None:
+            gf = test.path.parent / test.stdout_file
+            if not gf.exists():
+                problems.append("stdout-file %s does not exist (run with --bless and review it)" % test.stdout_file)
+            else:
+                exp = gf.read_bytes()
+                if exp != obs.out:
+                    problems.append(byte_diff(exp, obs.out, "%s output" % test.stdout_file))
         for what, exp, act in (("stdout", test.stdout, obs.out), ("stderr", test.stderr, obs.err)):
             if exp is not None and exp != act:
                 problems.append(byte_diff(exp, act, what))
@@ -841,12 +860,26 @@ class Runner:
                           "\n".join(problems))
         return passed()
 
-    def run_program(self, test, mode, extra):
+    def run_program(self, test, mode, extra, label="", ctx=None):
         expected = 0 if test.exit_code is None else test.exit_code
         bad, obs = self.exec_variant(test, mode, extra, expected)
         if bad:
             return bad
-        return self.judge(test, obs, expected)
+        res = self.judge(test, obs, expected)
+        if mode == "interp":
+            is_limit = (obs.rc == INTERP_LIMIT_EXIT and INTERP_LIMIT_CODE_PREFIX in obs.err)
+            if ctx is not None and not is_limit and res.state == "PASS":
+                ctx["interp_obs"] = obs
+            return res
+        if ctx is not None and ctx.get("interp_obs") is not None:
+            iobs = ctx["interp_obs"]
+            if obs.rc != iobs.rc:
+                return failed("interp/native disagree: interp exit %s, %s exit %s; stderr: %s"
+                              % (iobs.rc, label or mode, obs.rc, render(obs.err, 300)))
+            if obs.out != iobs.out:
+                diff = byte_diff(iobs.out, obs.out, "stdout")
+                return failed("interp/native disagree: " + diff, diff)
+        return res
 
     def run_diff(self, test):
         variants = []  # (label, mode, extra)
@@ -953,7 +986,7 @@ class Runner:
 
     # -- exec manifests ---------------------------------------------------------------------
 
-    def run_exec(self, test):
+    def run_exec(self, test, bless=False):
         tmp = self.new_tmp()
         try:
             subst = {
@@ -987,6 +1020,15 @@ class Runner:
             expected = 0 if test.exit_code is None else test.exit_code
             if is_crash_status(r.rc) and r.rc != expected:
                 return Outcome("CRASH", "command died with status %s" % r.rc)
+            if bless and test.stdout_file is not None:
+                if r.rc != expected:
+                    return failed("exit code %s, expected %s; stderr: %s" % (r.rc, expected, render(r.err, 300)))
+                gf = test.path.parent / test.stdout_file
+                old = gf.read_bytes() if gf.exists() else None
+                if old == r.out:
+                    return passed("unchanged")
+                gf.write_bytes(r.out)
+                return passed("blessed (%s)" % ("new file" if old is None else "updated"))
             return self.judge(test, Observed(r.rc, r.out, r.err, tokens), expected)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -1028,6 +1070,24 @@ def execute_entry(entry):
         except Exception as e:  # a bug in the runner must not look like a pass
             out = failed("runner error: %s: %s" % (type(e).__name__, e))
     return entry, out, int((time.time() - t0) * 1000)
+
+
+def execute_group(group):
+    return [execute_entry(e) for e in group]
+
+
+def is_weak_native_evidence(entry, out):
+    t = entry.test
+    if t.kind != "run" or entry.label not in ("native", "native-O1"):
+        return False
+    if out.state == "SKIP":
+        return False
+    if t.exit_code is not None and t.exit_code != 0:
+        return False
+    if (t.stdout is not None or t.stderr is not None or t.stdout_contains
+            or t.stderr_contains or t.stdout_file is not None):
+        return False
+    return True
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1112,18 +1172,24 @@ def main(argv=None):
         return 0
 
     runner = Runner(opts)
-    entries = []
+    entry_groups = []
     for t in tests:
-        entries.extend(runner.entries_for(t, bless=opts.bless))
+        grp = runner.entries_for(t, bless=opts.bless)
+        if grp:
+            entry_groups.append(grp)
     if opts.list:
-        for e in entries:
-            print(e.name)
+        for grp in entry_groups:
+            for e in grp:
+                print(e.name)
         return 0
 
+    results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=opts.jobs) as pool:
-        results = list(pool.map(execute_entry, entries))
+        for grp_res in pool.map(execute_group, entry_groups):
+            results.extend(grp_res)
     results.sort(key=lambda r: (r[0].test.id, r[0].label))
 
+    weak_entries = [e for e, o, _ms in results if is_weak_native_evidence(e, o)]
     line = total_line(results)
     if opts.json:
         counts, fail, total = count(results)
@@ -1133,12 +1199,13 @@ def main(argv=None):
             "compiler": runner.compiler.as_posix(),
             "features": sorted(runner.features),
             "results": [
-                {"id": e.test.id, "mode": e.label, "state": o.state, "message": o.msg, "ms": ms}
+                {"id": e.test.id, "mode": e.label, "state": o.state, "message": o.msg, "ms": ms,
+                 "weak_native_evidence": is_weak_native_evidence(e, o)}
                 for e, o, ms in results
             ],
             "counts": {"total": total, "pass": counts["PASS"], "fail": fail, "skip": counts["SKIP"],
                        "xfail": counts["XFAIL"], "xpass": counts["XPASS"], "crash": counts["CRASH"],
-                       "timeout": counts["TIMEOUT"]},
+                       "timeout": counts["TIMEOUT"], "weak_native": len(weak_entries)},
             "total_line": line,
         }
         sys.stdout.write(json.dumps(doc, ensure_ascii=False, indent=1) + "\n")
@@ -1156,6 +1223,10 @@ def main(argv=None):
             if opts.verbose and o.detail and o.detail != o.msg:
                 for ln in o.detail.splitlines():
                     print("        " + ln)
+        if opts.verbose:
+            for e in weak_entries:
+                print("%-7s %s" % ("WEAK", e.name))
+        print("WEAK-NATIVE %d" % len(weak_entries))
         print(line)
         sys.stdout.flush()
     _c, fail, _t = count(results)

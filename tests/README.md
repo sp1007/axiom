@@ -29,10 +29,10 @@ The runner builds nothing. A task's verdict is given from inside its snapshot wi
 | `--exclude-requires NAME` | SKIP tests with `requires: NAME` (`axiom0-internal` when the compiler under test is axiomc) |
 | `--verbose` | print every result and mismatch details |
 | `--json` | one JSON document on stdout (`schema`, `features`, `results[]`, `counts`, `total_line`); the `TOTAL` line goes to stderr |
-| `--bless` | update golden files (only golden tests run) |
+| `--bless` | update golden files and `stdout-file:` targets |
 | `--list`, `--list-directive NAME[:VALUE]` | list entries / files and exit 0 |
 
-Output ends with `TOTAL n PASS p FAIL f SKIP s XFAIL x`; FAIL includes XPASS, CRASH and TIMEOUT.
+Text output prints `WEAK-NATIVE n` immediately before the final `TOTAL n PASS p FAIL f SKIP s XFAIL x` line (and with `--verbose` lists each `WEAK    <entry>` above `WEAK-NATIVE n`); FAIL includes XPASS, CRASH and TIMEOUT.
 Exit status: 0 when FAIL = 0, 1 otherwise, 2 for a usage error. Zero tests is not a failure.
 
 ## Test kinds
@@ -50,7 +50,7 @@ helper says `// test: helper`. Directories named `fixtures` are never scanned.
 
 | Kind | What the runner does | Result |
 |---|---|---|
-| `run` | per mode `interp`: `axiom0 run --interp [flags] file [-- args]`; per mode `native`: `axiom0 build [flags] -o exe file`, then the exe. When the compiler advertises `opt` (see Features) every native test also runs as `native-O1` (adds `-O1`) unless the test sets its own `-O` flag | exit code and exact bytes |
+| `run` | per mode `interp`: `axiom0 run --interp [flags] file [-- args]`; per mode `native`: `axiom0 build [flags] -o exe file`, then the exe. When the compiler advertises `opt` (see Features) every native test also runs as `native-O1` (adds `-O1`) unless the test sets its own `-O` flag. All legs of one test run sequentially in a single worker (`interp`, then `native`, then `native-O1`), and every executed native leg is also checked for exit-code and byte-for-byte stdout agreement against `interp` (when `interp` ran and did not hit an interpreter limit) | exit code, exact bytes, and cross-mode agreement |
 | `ui` | `axiom0 check --json [flags] file`; reads the JSON document (schema 1) from **stderr** and compares `(severity, code, line)` with the inline annotations. Missing and unexpected diagnostics both fail; the exit code must be 1 when there are errors, else 0 | annotations |
 | `golden` | for every sibling `x.<ext>` of `x.ax`: `axiom0 inspect --emit=<ext> file` stdout must equal the file byte for byte (`.tokens`, `.ast`, `.resolved`, `.hir`, `.thir`, `.mir`, `.lir`, `.mi`, `.mc`, or any new emitter: no runner edit). `emit: ext...` names extensions that `--bless` may create | bytes |
 | `diff` | compiles/runs the program as interp, native -O0 and (with `opt`) native -O1; all exit codes and stdout must agree (and match `exit`/`stdout` if given). Fewer than two available executors = SKIP | agreement |
@@ -86,6 +86,7 @@ gets `.exe` if needed. Commands run with the repository root as working director
 | `test: run\|ui\|golden\|diff\|helper` | .ax | the kind (manifests are `exec`) |
 | `exit: N` | run, diff, golden, exec | expected exit code (default 0; for `golden` the exit code of `inspect`) |
 | `stdout: TEXT` | run, diff, exec | exact expected stdout; repeated lines are concatenated; **no newline is implied**, write `\n` |
+| `stdout-file: PATH` | run, diff, exec | compare stdout byte-for-byte with `PATH` (relative to the test/manifest directory); `--bless` rewrites `PATH` on `exec` manifests |
 | `stderr: TEXT` | same | exact expected stderr |
 | `stdout-contains: TEXT`, `stderr-contains: TEXT` | same | substring must occur; repeatable |
 | `stdin: TEXT` | run, diff, exec | bytes sent to the program (interp: to the `run --interp` process) |
@@ -137,6 +138,18 @@ diagnostic whose code starts with `AX_DRIVER_INTERP_` (step limit or call-depth 
 FAIL. A test that deliberately expects the limit says `exit: 124` (and `stderr-contains:
 AX_DRIVER_INTERP_`); then it is an ordinary comparison. Exit 124 without such a diagnostic is a normal
 exit code. Exit 125 (`AX_UNSAFE_INTERP_UB`) is an ordinary exit code: tests of it say `exit: 125`.
+
+**Cross-mode agreement and leg serialization** (ADR-0034, T139): All legs (`interp`, `native`, `native-O1`)
+of a single test file are scheduled sequentially in one worker in fixed order (`interp`, then `native`,
+then `native-O1`), so legs of the same test never execute concurrently under `-j > 1`. When a `run` test
+executes in both `interp` (without hitting an interpreter limit) and `native` / `native-O1`, the native
+leg's observed exit code and stdout bytes are compared against `interp`; any difference makes the native
+entry FAIL with `interp/native disagree` and a byte diff.
+
+**Weak native evidence (`WEAK-NATIVE`)**: A `run` test entry is flagged with `"weak_native_evidence": true`
+in `--json` (and counted in `WEAK-NATIVE n` before `TOTAL`) when a native leg executed, expected `exit: 0`
+(or default 0), has no `stdout`, `stderr`, `stdout-contains`, `stderr-contains`, or `stdout-file` directive,
+and is not `test: diff`. With `--verbose`, each weak entry is listed as `WEAK    <entry>` before `WEAK-NATIVE n`.
 
 ## Byte exactness
 

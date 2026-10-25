@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T085, T146]
 priority: 115
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/selfhost]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, spec/SPEC-20-selfhost.md, tasks/0361]
 covers: [REQ-TST-089]
 timeout_min: 240
+started: 2026-10-25 07:36:28
+agent: T144-impl
 ---
 # T144 — Selfhost bundle freshness checks
 
@@ -61,3 +63,4 @@ because the compiler/ front-end files at HEAD do not build together"; only 3 of 
 - Build fresh in the snapshot; `build/axiom0.exe` in the main tree is stale.
 
 ## Log
+- 2026-10-25 07:36:28 started (attempt 1) T144-impl

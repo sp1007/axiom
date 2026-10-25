@@ -2,6 +2,12 @@
 
 This maps each `AxLirInstKind` to the hand-written MIR test that covers it.
 
+## Evidence Classification (ADR-0034)
+
+All `.lir` golden files in `tests/lir/` (paired with `tests/lir/*.test` via `stdout-file:`) are **Category C (self-snapshot / regression) evidence**: they freeze the current compiler's `inspect --emit=lir` text representation to catch unintended IR drift, not independent behavioral proof. Independent behavioral proof of LIR lowering comes from end-to-end execution of `tests/run/` (with cross-mode agreement against `--interp`) and `tests/diff/`.
+
+In addition to the 36 hand-written `.mir` lowering tests (`*.mir`), `tests/lir/` contains 17 `.test`/`.lir` snapshot pairs for `tests/run/basic/*.ax` (`001-return`..`010-early-return` and `t117_*`).
+
 | LIR Op | Test File |
 |---|---|
 | `AX_LIR_INST_ADD` | `tests/lir/add.mir` |

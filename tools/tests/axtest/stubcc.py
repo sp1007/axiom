@@ -9,6 +9,8 @@ runner directive, kind and state can be proven without the real compiler:
     //@ err TEXT          write TEXT to stderr
     //@ out-if COND TEXT  like out, only when COND holds: `interp`, `native`, or a compiler flag
     //@ exit N            program exit code (default 0)
+    //@ exit-if COND N    like exit, only when COND holds: `interp`, `native`, or a compiler flag
+    //@ touch-dir DIR S   mkdir relative DIR, sleep S seconds, rmdir DIR (exits 99 on overlap/race)
     //@ sleep S           sleep S seconds
     //@ echo-args         stdout: args=a|b|c
     //@ echo-env NAME     stdout: NAME=value (or NAME=<unset>)
@@ -105,6 +107,22 @@ def run_program(src, flags, mode, args=None, input_path=None):
                 w(sys.stdout, decode(text))
         elif op == "exit":
             code = int(rest)
+        elif op == "exit-if":
+            cond, _, val = rest.partition(" ")
+            if cond == mode or cond in flags:
+                code = int(val)
+        elif op == "touch-dir":
+            dname, _, s_str = rest.partition(" ")
+            try:
+                os.mkdir(dname)
+                time.sleep(float(s_str or "0.05"))
+                if not os.path.isdir(dname):
+                    w(sys.stderr, b"race: directory vanished during sleep\n")
+                    return 99
+                os.rmdir(dname)
+            except OSError as e:
+                w(sys.stderr, ("race: %s\n" % e).encode("utf-8"))
+                return 99
         elif op == "sleep":
             time.sleep(float(rest))
         elif op == "echo-args":

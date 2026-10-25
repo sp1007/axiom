@@ -322,6 +322,56 @@ class RunTests(Case):
         res = self.run_axtest()
         self.assertNotIn("run/o.ax [native-O1]", res)
 
+    def test_cross_mode_agreement_pass_undeclared_stdout(self):
+        self.put("run/agree.ax", hdr("test: run") + "//@ out undeclared output\\n\n")
+        res = self.run_axtest(env={"STUB_FEATURES": "interp,native,opt"})
+        self.assertEqual(self.state(res, "run/agree.ax [interp]"), "PASS", res)
+        self.assertEqual(self.state(res, "run/agree.ax [native]"), "PASS", res)
+        self.assertEqual(self.state(res, "run/agree.ax [native-O1]"), "PASS", res)
+        self.assertEqual(self.rc, 0)
+
+    def test_cross_mode_stdout_disagreement_fails_with_byte_diff(self):
+        self.put("run/dis_out.ax", hdr("test: run") + "//@ out-if interp alpha\\n\n//@ out-if native beta\\n\n")
+        self.put("run/dis_o1.ax", hdr("test: run") + "//@ out same\\n\n//@ out-if -O1 extra\\n\n")
+        res = self.run_axtest(env={"STUB_FEATURES": "interp,native,opt"})
+        self.assertEqual(self.state(res, "run/dis_out.ax [interp]"), "PASS", res)
+        st, msg = res["run/dis_out.ax [native]"]
+        self.assertEqual(st, "FAIL")
+        self.assertIn("interp/native disagree", msg)
+        self.assertIn("differs at byte 0", msg)
+        self.assertIn("61 6c 70 68 61", msg)
+        self.assertEqual(self.state(res, "run/dis_o1.ax [interp]"), "PASS", res)
+        self.assertEqual(self.state(res, "run/dis_o1.ax [native]"), "PASS", res)
+        st_o1, msg_o1 = res["run/dis_o1.ax [native-O1]"]
+        self.assertEqual(st_o1, "FAIL")
+        self.assertIn("interp/native disagree", msg_o1)
+        self.assertIn("differs at byte 5", msg_o1)
+        self.assertEqual(self.rc, 1)
+
+    def test_cross_mode_exit_disagreement_fails(self):
+        self.put("run/dis_rc.ax", hdr("test: run") + "//@ exit-if native 7\n")
+        res = self.run_axtest()
+        self.assertEqual(self.state(res, "run/dis_rc.ax [interp]"), "PASS", res)
+        st, msg = res["run/dis_rc.ax [native]"]
+        self.assertEqual(st, "FAIL")
+        self.assertIn("interp/native disagree", msg)
+        self.assertIn("interp exit 0, native exit 7", msg)
+        self.assertEqual(self.rc, 1)
+
+    def test_interp_limit_not_compared_across_modes(self):
+        self.put("run/lim_out.ax", hdr("test: run") + "//@ limit\n//@ out-if native finished\\n\n")
+        res = self.run_axtest()
+        self.assertEqual(self.state(res, "run/lim_out.ax [interp]"), "TIMEOUT", res)
+        self.assertEqual(self.state(res, "run/lim_out.ax [native]"), "PASS", res)
+
+    def test_leg_serialization_under_parallel_jobs(self):
+        self.put("run/race.ax", hdr("test: run", "modes: native interp") + "//@ touch-dir rel_race_dir 0.05\n")
+        res = self.run_axtest("-j", "8", env={"STUB_FEATURES": "interp,native,opt"})
+        self.assertEqual(self.state(res, "run/race.ax [interp]"), "PASS", res)
+        self.assertEqual(self.state(res, "run/race.ax [native]"), "PASS", res)
+        self.assertEqual(self.state(res, "run/race.ax [native-O1]"), "PASS", res)
+        self.assertEqual(self.rc, 0)
+
 
 # ----------------------------------------------------------------------------------------------
 # States: xfail / crash / timeout
@@ -609,6 +659,35 @@ class ExecProjectTests(Case):
                  "cmd: python -c \"import os,signal; os.kill(os.getpid(), signal.SIGSEGV)\"\n")
         self.assertEqual(self.state(self.run_axtest(), "unit/crash.test"), "CRASH")
 
+    def test_stdout_file_match_mismatch_and_bless(self):
+        self.put("lir/src.ax", hdr("test: helper") + "//@ emit lir LIR_V1\\n\n")
+        self.put("lir/ok.test", "cmd: python {compiler} inspect --emit=lir {test_dir}/src.ax\nexit: 0\nstdout-file: ok.lir\n")
+        self.put("lir/ok.lir", b"LIR_V1\n")
+        self.put("lir/bad.test", "cmd: python {compiler} inspect --emit=lir {test_dir}/src.ax\nexit: 0\nstdout-file: bad.lir\n")
+        self.put("lir/bad.lir", b"LIR_OLD\r\n")
+        self.put("lir/missing.test", "cmd: python {compiler} inspect --emit=lir {test_dir}/src.ax\nexit: 0\nstdout-file: created.lir\n")
+        res = self.run_axtest("lir/")
+        self.assertEqual(self.state(res, "lir/ok.test"), "PASS", res)
+        st, msg = res["lir/bad.test"]
+        self.assertEqual(st, "FAIL")
+        self.assertIn("bad.lir output differs at byte", msg)
+        self.assertIn("0d 0a", msg)
+        st_m, msg_m = res["lir/missing.test"]
+        self.assertEqual(st_m, "FAIL")
+        self.assertIn("stdout-file created.lir does not exist", msg_m)
+        self.assertEqual(self.rc, 1)
+
+        res_bless = self.run_axtest("--bless", "lir/")
+        self.assertEqual(self.rc, 0, res_bless)
+        self.assertEqual((self.tests / "lir/bad.lir").read_bytes(), b"LIR_V1\n")
+        self.assertEqual((self.tests / "lir/created.lir").read_bytes(), b"LIR_V1\n")
+
+        res_after = self.run_axtest("lir/")
+        self.assertEqual(self.state(res_after, "lir/ok.test"), "PASS", res_after)
+        self.assertEqual(self.state(res_after, "lir/bad.test"), "PASS", res_after)
+        self.assertEqual(self.state(res_after, "lir/missing.test"), "PASS", res_after)
+        self.assertEqual(self.rc, 0)
+
     def test_project_directory_is_one_test(self):
         p = "modules/proj"
         self.put(p + "/axiom.toml", "[package]\nname = \"proj\"\n")
@@ -709,6 +788,81 @@ class OutputTests(Case):
         leaked = [d for d in set(os.listdir(tempfile.gettempdir())) - before if d.startswith("axtest-") and
                   not d.startswith("axtest-self-")]
         self.assertEqual(leaked, [])
+
+    def test_weak_native_evidence_flag_and_text_report(self):
+        self.put("run/weak.ax", hdr("test: run") + "\n")
+        self.put("run/strong_out.ax", hdr("test: run", "stdout: ok\\n") + "//@ out ok\\n\n")
+        self.put("run/strong_contains.ax", hdr("test: run", "stdout-contains: ok") + "//@ out ok\\n\n")
+        self.put("run/strong_err.ax", hdr("test: run", "stderr-contains: warn") + "//@ err warn\\n\n")
+        self.put("run/strong_exit.ax", hdr("test: run", "exit: 3") + "//@ exit 3\n")
+        self.put("run/skip_nat.ax", hdr("test: run", "native-after: T099") + "\n")
+        self.put("diff/d.ax", hdr("test: diff") + "\n")
+        self.run_axtest(env={"STUB_FEATURES": "interp,native,opt"})
+        self.assertEqual(self.rc, 0)
+        by_key = {
+            r["id"] + ((" [%s]" % r["mode"]) if r["mode"] else ""): r["weak_native_evidence"]
+            for r in self.doc["results"]
+        }
+        self.assertFalse(by_key["run/weak.ax [interp]"])
+        self.assertTrue(by_key["run/weak.ax [native]"])
+        self.assertTrue(by_key["run/weak.ax [native-O1]"])
+        self.assertFalse(by_key["run/strong_out.ax [native]"])
+        self.assertFalse(by_key["run/strong_out.ax [native-O1]"])
+        self.assertFalse(by_key["run/strong_contains.ax [native]"])
+        self.assertFalse(by_key["run/strong_err.ax [native]"])
+        self.assertFalse(by_key["run/strong_exit.ax [native]"])
+        self.assertFalse(by_key["run/skip_nat.ax [native]"])
+        self.assertFalse(by_key["diff/d.ax [diff]"])
+        self.assertEqual(self.doc["counts"]["weak_native"], 2)
+
+        self.run_axtest(json_mode=False, env={"STUB_FEATURES": "interp,native,opt"})
+        lines = self.proc.stdout.decode("utf-8").splitlines()
+        self.assertEqual(lines[-2], "WEAK-NATIVE 2")
+        self.assertTrue(lines[-1].startswith("TOTAL "))
+
+        self.run_axtest("--verbose", json_mode=False, env={"STUB_FEATURES": "interp,native,opt"})
+        vlines = self.proc.stdout.decode("utf-8").splitlines()
+        self.assertIn("WEAK    run/weak.ax [native]", vlines)
+        self.assertIn("WEAK    run/weak.ax [native-O1]", vlines)
+        self.assertEqual(vlines[-2], "WEAK-NATIVE 2")
+
+    def test_qa_edge_cases_agreement_and_stdout_file(self):
+        # 1. Reversed `modes: native interp` still runs interp first and catches disagreement
+        self.put("run/rev_dis.ax",
+                 hdr("test: run", "modes: native interp") +
+                 "//@ out-if interp from_interp\\n\n//@ out-if native from_native\\n\n")
+        res = self.run_axtest("run/rev_dis")
+        self.assertEqual(self.state(res, "run/rev_dis.ax [interp]"), "PASS", res)
+        st, msg = res["run/rev_dis.ax [native]"]
+        self.assertEqual(st, "FAIL")
+        self.assertIn("interp/native disagree", msg)
+
+        # 2. `stdout-file:` on a `run` test counts as strong native evidence (not weak)
+        self.put("run/sf_strong.ax",
+                 hdr("test: run", "stdout-file: sf_strong.out") + "//@ out strong_bytes\\n\n")
+        self.put("run/sf_strong.out", b"strong_bytes\n")
+        res = self.run_axtest("run/sf_strong", env={"STUB_FEATURES": "interp,native,opt"})
+        self.assertEqual(self.rc, 0, res)
+        for r in self.doc["results"]:
+            self.assertFalse(r["weak_native_evidence"], r)
+        self.assertEqual(self.doc["counts"]["weak_native"], 0)
+
+        # 3. Failing exec command during `--bless` does not overwrite existing `stdout-file:`
+        self.put("lir/fail_bless.ax", hdr("test: helper") + "//@ emit lir CORRUPT\\n\n//@ compile-exit 1\n")
+        self.put("lir/fail_bless.test",
+                 "cmd: python {compiler} inspect --emit=lir {test_dir}/fail_bless.ax\n"
+                 "exit: 0\nstdout-file: keep.lir\n")
+        self.put("lir/keep.lir", b"KEEP_ORIGINAL\n")
+        self.run_axtest("--bless", "lir/fail_bless")
+        self.assertEqual(self.rc, 1)
+        self.assertEqual((self.tests / "lir/keep.lir").read_bytes(), b"KEEP_ORIGINAL\n")
+
+        # 4. Empty or duplicate `stdout-file:` directives fail directive validation
+        self.put("lir/empty_sf.test", "cmd: python {compiler} version\nstdout-file:   \n")
+        self.put("lir/dup_sf.test", "cmd: python {compiler} version\nstdout-file: a.lir\nstdout-file: b.lir\n")
+        res = self.run_axtest("lir/empty_sf", "lir/dup_sf")
+        self.assertEqual(self.state(res, "lir/empty_sf.test [directives]"), "FAIL")
+        self.assertEqual(self.state(res, "lir/dup_sf.test [directives]"), "FAIL")
 
 
 if __name__ == "__main__":
