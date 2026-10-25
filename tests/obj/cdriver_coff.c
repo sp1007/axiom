@@ -87,32 +87,67 @@ void test_relocs_obj(void) {
     ax_objmodel_free(&obj);
 }
 
+static const char *find_c_helper(void) {
+    static const char *const candidates[] = {
+        "tests/obj/fixtures/c_helper.c",
+        "../tests/obj/fixtures/c_helper.c",
+        "../../tests/obj/fixtures/c_helper.c",
+    };
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        FILE *f = fopen(candidates[i], "rb");
+        if (f) {
+            fclose(f);
+            return candidates[i];
+        }
+    }
+    return NULL;
+}
+
+static void cleanup_temp_files(void) {
+    remove("basic.obj");
+    remove("basic.exe");
+    remove("relocs.obj");
+    remove("relocs.exe");
+    remove("addr32nb.obj");
+}
+
 int main(void) {
     if (system("gcc --version > NUL 2>&1") != 0) {
-        printf("SKIP: gcc not on PATH\n");
-        return 0;
+        printf("FAIL: gcc not on PATH (ADR-0034 section 7)\n");
+        return 1;
+    }
+
+    const char *helper = find_c_helper();
+    if (!helper) {
+        printf("FAIL: cannot find tests/obj/fixtures/c_helper.c\n");
+        return 1;
     }
 
     test_basic_obj();
     if (system("gcc basic.obj -o basic.exe") != 0) {
         printf("FAIL: gcc failed to link basic.obj\n");
+        cleanup_temp_files();
         return 1;
     }
     int code = system(".\\basic.exe");
     if (code != 42) {
         printf("FAIL: basic.exe exit code was %d, expected 42\n", code);
+        cleanup_temp_files();
         return 1;
     }
 
     test_relocs_obj();
-    // The test driver runs in build/tests/, so we use ../../tests/obj/fixtures/c_helper.c
-    if (system("gcc relocs.obj ../../tests/obj/fixtures/c_helper.c -o relocs.exe") != 0) {
+    char link_cmd[512];
+    snprintf(link_cmd, sizeof(link_cmd), "gcc relocs.obj \"%s\" -o relocs.exe", helper);
+    if (system(link_cmd) != 0) {
         printf("FAIL: gcc failed to link relocs.obj\n");
+        cleanup_temp_files();
         return 1;
     }
     code = system(".\\relocs.exe");
     if (code != 0) {
         printf("FAIL: relocs.exe exit code was %d, expected 0\n", code);
+        cleanup_temp_files();
         return 1;
     }
 
@@ -128,6 +163,40 @@ int main(void) {
     ax_coff_write(&obj, "addr32nb.obj");
     ax_objmodel_free(&obj);
 
+    FILE *af = fopen("addr32nb.obj", "rb");
+    if (!af) {
+        printf("FAIL: cannot open addr32nb.obj\n");
+        cleanup_temp_files();
+        return 1;
+    }
+    uint8_t abuf[256];
+    size_t alen = fread(abuf, 1, sizeof(abuf), af);
+    fclose(af);
+    if (alen < 60) {
+        printf("FAIL: addr32nb.obj too short (%zu bytes)\n", alen);
+        cleanup_temp_files();
+        return 1;
+    }
+    uint32_t rel_ptr = 0;
+    uint16_t num_rels = 0;
+    memcpy(&rel_ptr, abuf + 20 + 24, sizeof(rel_ptr));
+    memcpy(&num_rels, abuf + 20 + 32, sizeof(num_rels));
+    if (num_rels != 1 || rel_ptr + 10 > alen) {
+        printf("FAIL: addr32nb.obj bad relocation header (num_rels=%u, rel_ptr=%u)\n",
+               (unsigned)num_rels, (unsigned)rel_ptr);
+        cleanup_temp_files();
+        return 1;
+    }
+    uint16_t rel_type = 0;
+    memcpy(&rel_type, abuf + rel_ptr + 8, sizeof(rel_type));
+    if (rel_type != 0x0003) { /* IMAGE_REL_AMD64_ADDR32NB */
+        printf("FAIL: addr32nb.obj relocation type was 0x%04x, expected 0x0003 (ADDR32NB)\n",
+               (unsigned)rel_type);
+        cleanup_temp_files();
+        return 1;
+    }
+
+    cleanup_temp_files();
     printf("PASS\n");
     return 0;
 }

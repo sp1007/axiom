@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T139, T146]
 priority: 115
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/run, tests/std]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, spec/SPEC-03-core-semantics.md, tasks/0361, tasks/0480]
 covers: [REQ-TST-002, REQ-TST-012]
 timeout_min: 240
+started: 2026-10-25 17:29:20
+agent: T145-impl
 ---
 # T145 — Native-evidence sweep of run and std tests
 
@@ -68,3 +70,4 @@ Audit OI-09: 37 run tests have a unit `main` and no output (e.g. `tests/run/vars
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-25 17:29:20 started (attempt 1) T145-impl
