@@ -10,7 +10,7 @@ depends: [T146]
 priority: 117
 status: todo
 attempts: 0
-paths: [bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/driver/build_native, compiler/target/x64, compiler/lir, compiler/opt, compiler/backend, compiler/driver/pipeline.ax, tests/run/parity/backend, tests/mc, tests/lir, tests/selfhost]
+paths: [bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/driver/build_native, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/link/pe, compiler/target/x64, compiler/lir, compiler/opt, compiler/backend, compiler/link, compiler/driver/pipeline.ax, tests/run/parity/backend, tests/mc, tests/lir, tests/selfhost]
 spec: [spec/SPEC-03-core-semantics.md, spec/decisions/ADR-0004-self-host-subset-additions.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-CORE-3181, REQ-BLD-030]
 ---
@@ -32,6 +32,19 @@ Confirmed differences (architect probe 2026-10-20; MIR and LIR equal unless stat
 3. **Const tables (ADR-0004)**: `tests/run/comptime/{table_str,qa_table_struct_str}.ax`,
    `native_const/qa_table_str_empty_and_multitables.ax` — `.rdata` of equal size but different
    content (axiom0 emits zero-filled slots, axiomc writes the string bytes inline).
+   - *Root cause from T145 QA (`_workspaces/reports/T145-qa.md`)*: `bootstrap/axiom0/src/interp/interp.c`
+     handles `AX_MIR_OP_CONST` of type `t_str` (`f_size == 16`) in `AX_MIR_RVALUE_USE` (lines 626–629),
+     but omits `t_str` (`f_size == 16`) in `AX_MIR_RVALUE_AGGREGATE` (lines 686–692) and
+     `AX_MIR_RVALUE_REPEAT` (lines 720–726), leaving every `Str` slot inside a `const` array or struct
+     zero-initialized (`ptr = 0, len = 0`) in both `--interp` and `build.c`'s `emit_const_tables`.
+4. **Native `__ax_host_print_int` Win64 shadow-space clobber (from T139 & T145 QA)**:
+   `tests/run/method/{builtins,inherent_methods,qa_run}.ax`,
+   `tests/run/{native_str,str}/qa_print_int.ax` — native legs emit `0x00` bytes instead of ASCII
+   digits because `print_int_code[]` in `bootstrap/axiom0/src/link/pe/linker.c` (line 468) and
+   `AXIOM_PRINT_INT_CODE` in `compiler/link/import.ax` (line 164) format digits into `[rsp + 0x00 ..
+   rsp + 0x1F]` (the 32-byte Win64 home/shadow space) **before** calling `GetStdHandle(-11)`, which
+   zeroes `[rsp + 0x18 .. rsp + 0x1F]`. Fix both in lockstep (ADR-0034 §2) so the digit buffer lives
+   above the 32-byte shadow space (or `GetStdHandle(-11)` is called before formatting digits).
 
 ## Scope
 - For each difference: an independent test (expected values derived by hand) that distinguishes the
