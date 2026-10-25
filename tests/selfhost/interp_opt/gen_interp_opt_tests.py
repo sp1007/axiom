@@ -37,7 +37,9 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-REFERENCE_BUNDLE = "tests/selfhost/mir/qa_mir_builder_and_drop_a.ax"
+sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
+
+import bundle_common as bc  # noqa: E402
 
 STD_SYS_WINDOWS_FILES = [
     "std/sys/windows/heap.ax",
@@ -48,41 +50,41 @@ STD_SYS_WINDOWS_FILES = [
 ]
 
 FULL_MODULES = [
-    ("compiler.kernel.id", "ref"),
-    ("compiler.kernel.hash", "ref"),
-    ("compiler.kernel.arena", "ref"),
-    ("compiler.kernel.interner", "ref"),
-    ("compiler.source.span", "ref"),
-    ("compiler.source.manager", "ref"),
-    ("compiler.diag.code", "ref"),
-    ("compiler.diag.emitter", "ref"),
-    ("compiler.diag.format", "ref"),
-    ("compiler.diag.json", "ref"),
-    ("compiler.kernel_source_diag.session", "ref"),
-    ("compiler.lex.token", "ref"),
-    ("compiler.lex.scanner", "ref"),
-    ("compiler.lexer.session", "ref"),
-    ("compiler.syntax.ast", "ref"),
-    ("compiler.syntax.parse", "ref"),
-    ("compiler.parser.session", "ref"),
-    ("compiler.resolve.symtab", "ref"),
-    ("compiler.resolve.rib", "ref"),
-    ("compiler.resolve.resolver", "ref"),
-    ("compiler.hir.hir", "ref"),
-    ("compiler.hir.lower", "ref"),
-    ("compiler.resolve_hir.session", "ref"),
-    ("compiler.types.types", "ref"),
-    ("compiler.types.layout", "ref"),
-    ("compiler.types.exhaust", "ref"),
-    ("compiler.traits.solver", "ref"),
-    ("compiler.traits.mono", "ref"),
-    ("compiler.types.typeck", "ref"),
-    ("compiler.types", "ref"),
-    ("compiler.traits", "ref"),
-    ("compiler.typeck.session", "ref"),
-    ("compiler.typeck", "ref"),
-    ("compiler.typeck_traits.session", "ref"),
-    ("compiler.typeck_traits", "ref"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.lex.scanner", "compiler"),
+    ("compiler.lexer.session", "compiler"),
+    ("compiler.syntax.ast", "compiler"),
+    ("compiler.syntax.parse", "compiler"),
+    ("compiler.parser.session", "compiler"),
+    ("compiler.resolve.symtab", "compiler"),
+    ("compiler.resolve.rib", "compiler"),
+    ("compiler.resolve.resolver", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.hir.lower", "compiler"),
+    ("compiler.resolve_hir.session", "compiler"),
+    ("compiler.types.types", "compiler"),
+    ("compiler.types.layout", "compiler"),
+    ("compiler.types.exhaust", "compiler"),
+    ("compiler.traits.solver", "compiler"),
+    ("compiler.traits.mono", "compiler"),
+    ("compiler.types.typeck", "compiler"),
+    ("compiler.types", "compiler"),
+    ("compiler.traits", "compiler"),
+    ("compiler.typeck.session", "compiler"),
+    ("compiler.typeck", "compiler"),
+    ("compiler.typeck_traits.session", "compiler"),
+    ("compiler.typeck_traits", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
@@ -588,649 +590,11 @@ def i32_table(name, vals):
 
 
 def build_prelude_text():
-    pad_variants = ", ".join("V%d" % i for i in range(800))
-    host_src = read_bytes(os.path.join(ROOT, "std/core/host.ax")).decode("utf-8").replace("\r\n", "\n")
-    host_src = host_src.replace("module std.core.host", "module host_intrinsics")
-    parts = [
-        "module __ax_sym_pad\n"
-        "enum __AxSymPad { %s }\n"
-        "struct __AxPtrPad { p0: *const u8, p1: *mut u8, p2: *mut *mut u8, p3: *const *const u8 }\n"
-        % pad_variants,
-        host_src.rstrip("\n") + "\n",
-    ]
-    for rel in STD_SYS_WINDOWS_FILES:
-        src = read_bytes(os.path.join(ROOT, rel)).decode("utf-8").replace("\r\n", "\n")
-        if rel == "std/sys/windows/heap.ax":
-            src = (
-                "module host_sys_heap\n"
-                "@link(\"kernel32\")\n"
-                "extern \"system\" {\n"
-                "    fn GetProcessHeap() -> *mut u8;\n"
-                "    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;\n"
-                "    fn HeapReAlloc(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8, dwBytes: usize) -> *mut u8;\n"
-                "    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {\n"
-                "    let h = GetProcessHeap();\n"
-                "    if (h as usize) == 0 { return 0 as *mut u8; }\n"
-                "    let alloc_bytes: usize = if size < 16 { 16 } else { size };\n"
-                "    HeapAlloc(h, 8u32, alloc_bytes)\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_realloc(p: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {\n"
-                "    if (p as usize) == 0 { return __ax_host_heap_alloc(new_size, align); }\n"
-                "    let h = GetProcessHeap();\n"
-                "    if (h as usize) == 0 { return 0 as *mut u8; }\n"
-                "    let alloc_bytes: usize = if new_size < 16 { 16 } else { new_size };\n"
-                "    HeapReAlloc(h, 8u32, p, alloc_bytes)\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {\n"
-                "    if (p as usize) != 0 {\n"
-                "        let h = GetProcessHeap();\n"
-                "        if (h as usize) != 0 { HeapFree(h, 0u32, p); }\n"
-                "    }\n"
-                "}\n"
-            )
-        else:
-            src = src.replace("module std.sys.windows.", "module host_sys_")
-            src = src.replace("let len = GetEnvironmentVariableW", "let vlen = GetEnvironmentVariableW")
-            src = src.replace("if len > 0 {", "if vlen > 0 {")
-            src = src.replace("while idx < len as usize {", "while idx < vlen as usize {")
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
-
-
-def adapt_own_module(name, src):
-    """Adapts compiler.own.* imports and keyword module names to canonical compiler/* modules."""
-    src = src.replace("module compiler.own.move", "module compiler.own.move_ck")
-    src = src.replace("module compiler.own.unsafe", "module compiler.own.unsafe_ck")
-    src = src.replace("compiler.own.move.", "compiler.own.move_ck.")
-    src = src.replace("compiler.own.unsafe.", "compiler.own.unsafe_ck.")
-    if not name.startswith("compiler.own."):
-        return src
-    use_map = {
-        "use compiler.driver.str_intern.StrId": "use compiler.kernel.id.StrId",
-        "use compiler.driver.str_intern.StrInterner": "use compiler.kernel.interner.StrInterner",
-        "use compiler.driver.str_intern.StrView": "use compiler.kernel.interner.StrView",
-        "use compiler.driver.str_intern.interner_get": "use compiler.kernel.interner.interner_get",
-        "use compiler.driver.str_intern.interner_lookup": "use compiler.kernel.interner.interner_lookup_bytes",
-        "use compiler.driver.span.FileId": "use compiler.kernel.id.FileId",
-        "use compiler.driver.span.Span": "use compiler.source.span.Span",
-        "use compiler.hir.def_id.SymbolId": "use compiler.kernel.id.SymbolId",
-        "use compiler.typeck.ty.TypeId": "use compiler.kernel.id.TypeId",
-        "use compiler.hir.ast.BINOP_ADD": "use compiler.syntax.ast.BINOP_ADD",
-        "use compiler.hir.ast.BINOP_SUB": "use compiler.syntax.ast.BINOP_SUB",
-        "use compiler.hir.ast.UNOP_DEREF": "use compiler.syntax.ast.UNOP_DEREF",
-        "use compiler.diag.diag.DiagSeverity": "use compiler.diag.code.DiagSeverity",
-        "use compiler.diag.diag.DiagCode": "use compiler.diag.code.DiagCode",
-    }
-    drop_uses = {
-        "use compiler.hir.ast.HirField",
-        "use compiler.hir.ast.HirVariant",
-        "use compiler.hir.ast.HirCallArg",
-        "use compiler.hir.ast.HirFieldExpr",
-        "use compiler.typeck.ty.Type",
-    }
-    out_lines = []
-    for line in src.split("\n"):
-        s = line.strip()
-        if s in drop_uses:
-            continue
-        if s in use_map:
-            line = use_map[s]
-        elif s.startswith("use compiler.hir.ast."):
-            line = "use compiler.hir.hir." + s[len("use compiler.hir.ast."):]
-        elif s.startswith("use compiler.typeck.ty."):
-            line = "use compiler.types.types." + s[len("use compiler.typeck.ty."):]
-        elif s.startswith("use compiler.diag.codes."):
-            line = "use compiler.diag.code." + s[len("use compiler.diag.codes."):]
-        elif s.startswith("use compiler.diag.diag."):
-            line = "use compiler.diag.emitter." + s[len("use compiler.diag.diag."):]
-        out_lines.append(line)
-
-    res = "\n".join(out_lines)
-    res = res.replace("use compiler.kernel.arena.ArenaChunk", "use compiler.kernel.arena.arena_new")
-    res = res.replace("(*cap_init_p).head = 0 as *mut ArenaChunk;", "let cap_a = arena_new();\n*cap_init_p = cap_a;")
-    res = res.replace("interner_lookup(", "interner_lookup_bytes(")
-    res = res.replace("if bb.terminator.expected {", "if bb.terminator.drop_is_explicit {")
-    res = res.replace("stmt.location", "stmt.span")
-    res = res.replace("(*st).location", "(*st).span")
-    res = res.replace("terminator.location", "terminator.span")
-    return res
-
-
-def compiler_module_files():
-    found = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
-        for fn in files:
-            if not fn.endswith(".ax"):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("module "):
-                        found[line.split()[1]] = path
-                        break
-    return found
-
-
-def reference_sections():
-    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
-    sections = {}
-    current = None
-    buf = []
-    for line in text.split("\n"):
-        if line.startswith("module "):
-            if current:
-                sections[current] = "\n".join(buf)
-            current = line.split()[1]
-            buf = [line]
-        elif current:
-            buf.append(line)
-    if current:
-        sections[current] = "\n".join(buf)
-    return sections
+    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=800, include_std_sys=True, root=ROOT)
 
 
 def assemble_modules():
-    files = compiler_module_files()
-    ref = reference_sections()
-    parts = []
-    for name, origin in FULL_MODULES:
-        if origin == "compiler":
-            src = read_bytes(files[name]).decode("utf-8").replace("\r\n", "\n")
-            src = adapt_own_module(name, src)
-        else:
-            src = ref[name]
-        if name == "compiler.kernel.hash":
-            src = src.replace(
-                "@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }",
-                "fn wrapping_add_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a_lo = a & 0xFFFFFFFFu64;\n"
-                "    let a_hi = (a >> 32u64) & 0xFFFFFFFFu64;\n"
-                "    let b_lo = b & 0xFFFFFFFFu64;\n"
-                "    let b_hi = (b >> 32u64) & 0xFFFFFFFFu64;\n"
-                "    let sum_lo = a_lo + b_lo;\n"
-                "    let carry = sum_lo >> 32u64;\n"
-                "    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;\n"
-                "    (sum_hi << 32u64) | (sum_lo & 0xFFFFFFFFu64)\n"
-                "}\n"
-                "fn mul_u16_hash(x: u64, y: u64) -> u64 {\n"
-                "    ((x as i64) * (y as i64)) as u64\n"
-                "}\n"
-                "fn wrapping_mul_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a0 = a & 0xFFFFu64;\n"
-                "    let a1 = (a >> 16u64) & 0xFFFFu64;\n"
-                "    let a2 = (a >> 32u64) & 0xFFFFu64;\n"
-                "    let a3 = (a >> 48u64) & 0xFFFFu64;\n"
-                "    let b0 = b & 0xFFFFu64;\n"
-                "    let b1 = (b >> 16u64) & 0xFFFFu64;\n"
-                "    let b2 = (b >> 32u64) & 0xFFFFu64;\n"
-                "    let b3 = (b >> 48u64) & 0xFFFFu64;\n"
-                "    let c0 = mul_u16_hash(a0, b0);\n"
-                "    let c1 = (c0 >> 16u64) + mul_u16_hash(a0, b1) + mul_u16_hash(a1, b0);\n"
-                "    let c2 = (c1 >> 16u64) + mul_u16_hash(a0, b2) + mul_u16_hash(a1, b1) + mul_u16_hash(a2, b0);\n"
-                "    let c3 = ((c2 >> 16u64) + mul_u16_hash(a0, b3) + mul_u16_hash(a1, b2) + mul_u16_hash(a2, b1) + mul_u16_hash(a3, b0)) & 0xFFFFu64;\n"
-                "    (c0 & 0xFFFFu64) | ((c1 & 0xFFFFu64) << 16u64) | ((c2 & 0xFFFFu64) << 32u64) | (c3 << 48u64)\n"
-                "}\n"
-                "fn rotate_left_u64(x: u64, n: u32) -> u64 {\n"
-                "    let s = (n & 63u32) as u64;\n"
-                "    if s == 0u64 { x } else { (x << s) | (x >> (64u64 - s)) }\n"
-                "}",
-            )
-        if name == "compiler.types.types":
-            src = src.replace(
-                "@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }",
-                "fn wrapping_add_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a_lo = a & 0xFFFFFFFFu64;\n"
-                "    let a_hi = a >> 32u32;\n"
-                "    let b_lo = b & 0xFFFFFFFFu64;\n"
-                "    let b_hi = b >> 32u32;\n"
-                "    let sum_lo = a_lo + b_lo;\n"
-                "    let carry = sum_lo >> 32u32;\n"
-                "    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;\n"
-                "    (sum_hi << 32u32) | (sum_lo & 0xFFFFFFFFu64)\n"
-                "}\n"
-                "fn rotate_left_u64(x: u64, n: u32) -> u64 {\n"
-                "    let s = (n & 63u32) as u64;\n"
-                "    if s == 0u64 { x } else { (x << s) | (x >> (64u64 - s)) }\n"
-                "}",
-            )
-        if name == "compiler.verify.verifier":
-            src = src.replace(
-                "val = val * 10u64 + ((c - 48u8) as u64);",
-                "val = (((val as i64) * 10i64) as u64) + ((c - 48u8) as u64);",
-            )
-        if name == "compiler.own_mir_verify.session":
-            src = src.replace(
-                "i * size_of<TypeId>()",
-                "(((i as isize) * (size_of<TypeId>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "i * size_of<usize>()",
-                "(((i as isize) * (size_of<usize>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "i * size_of<*mut TypeId>()",
-                "(((i as isize) * (size_of<*mut TypeId>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "j * size_of<TypeId>()",
-                "(((j as isize) * (size_of<TypeId>() as isize)) as usize)",
-            )
-        if name == "compiler.mir.builder":
-            src = src.replace(
-                "use compiler.lex.token.TOK_BYTE_STR",
-                "use compiler.lex.token.TOK_BYTE_STR\nuse compiler.lex.token.TOK_FLAG_BYTE_FORM",
-            )
-            src = src.replace(
-                "    if tok.int_val != 0u64 {\n"
-                "        if is_negated {\n"
-                "            return (0i64 - (tok.int_val as i64)) as u64;\n"
-                "        }\n"
-                "        return tok.int_val;\n"
-                "    }\n"
-                "    let sv = mb_span_sv(b, view(tok.span));\n"
-                "    mb_parse_int_sv(view(sv), is_negated)",
-                "    let sv = mb_span_sv(b, view(tok.span));\n"
-                "    if sv.len > 0 && (tok.flags & TOK_FLAG_BYTE_FORM) == 0u16 {\n"
-                "        return mb_parse_int_sv(view(sv), is_negated);\n"
-                "    }\n"
-                "    if tok.int_val != 0u64 {\n"
-                "        if is_negated {\n"
-                "            return (0i64 - (tok.int_val as i64)) as u64;\n"
-                "        }\n"
-                "        return tok.int_val;\n"
-                "    }\n"
-                "    0u64",
-            )
-            src = src.replace(
-                "    b.curr_bb = mb_new_bb(mut_view(b), false);",
-                "    let entry_bb = mb_new_bb(mut_view(b), false);\n    b.curr_bb = entry_bb;",
-            )
-            src = src.replace(
-                "                        (*cur_bb_ptr).terminator.drop_place = mir_local_place(loc_id_v);",
-                "                        let dp = mir_local_place(loc_id_v);\n"
-                "                        (*cur_bb_ptr).terminator.drop_place = dp;",
-            )
-            src = src.replace(
-                "            rv.repeat_count = mb_eval_const_int_expr(view(*b), count_expr);",
-                "            let rep_cnt = mb_eval_const_int_expr(view(*b), count_expr);\n"
-                "            rv.repeat_count = rep_cnt;",
-            )
-        if name == "compiler.types.typeck":
-            src = src.replace(
-                "    let cty_ptr: *mut HirType = unsafe { (*it).ty };\n"
-                "    let ty = hir_type_to_typeid(mut_view(*cx), cty_ptr);\n",
-                "    let cty_ptr: *mut HirType = unsafe { (*it).ty };\n"
-                "    let ty = hir_type_to_typeid(mut_view(*cx), cty_ptr);\n"
-                "    unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: ty.v })); }\n"
-                "    if sym_v != 0u32 {\n"
-                "        unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: sym_v }), (TypeId { v: ty.v })); }\n"
-                "    }\n",
-            )
-            src = src.replace(
-                "                    let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };\n"
-                "                    if it_t.v != 0u32 {\n"
-                "                        return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, out_args);\n"
-                "                    }\n",
-                "                    if ik == HIR_ITEM_CONST {\n"
-                "                        evaluate_const_item(mut_view(*cx), it);\n"
-                "                    }\n"
-                "                    let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };\n"
-                "                    if it_t.v != 0u32 {\n"
-                "                        return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, out_args);\n"
-                "                    }\n",
-            )
-            src = src.replace(
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n"
-                "        let isym = unsafe { (*it).symbol };\n"
-                "        if isym.v != 0u32 {\n"
-                "            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }\n"
-                "        }\n"
-                "        cx.current_fn = 0 as *const HirItem;",
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n"
-                "        let isym = unsafe { (*it).symbol };\n"
-                "        if isym.v != 0u32 && (unsafe { (*it).generic_params as usize }) == 0 {\n"
-                "            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }\n"
-                "        }\n"
-                "        cx.current_fn = 0 as *const HirItem;",
-            )
-            src = src.replace(
-                "                            if (fty_node as usize) != 0 && (unsafe { (*fty_node).kind }) == HIR_TYPE_VIEW {\n"
-                "                                let _ = unsafe { type_error(mut_view(cx), view((*f).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP) };\n"
-                "                            }\n",
-                "",
-            )
-            src = src.replace(
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n"
-                "    if sink.errors == 0 {\n"
-                "        unsafe_check(hir_file, view(*thir), mut_view(*sink), view(*str_in));\n"
-                "    }\n",
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n",
-            )
-            src = src.replace(
-                "pub fn typeck_into(",
-                "// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait\n"
-                "// path `P` resolves to the prelude lang item `Drop`: `P` is the single segment `Drop` without generic\n"
-                "// arguments, and the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor\n"
-                "// binds the name `Drop` with a `use`. Same predicate as hir_impl_is_lang_drop (compiler/hir/lower.ax,\n"
-                "// documented there) and ax_hir_impl_is_lang_drop / the twin in bootstrap/axiom0/src/types/typeck.c.\n"
-                "fn tc_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {\n"
-                "    if id.v == 0u32 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sv = interner_get(interner, id);\n"
-                "    if sv.len != 4 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let b0 = unsafe { *(sv.ptr + 0) };\n"
-                "    let b1 = unsafe { *(sv.ptr + 1) };\n"
-                "    let b2 = unsafe { *(sv.ptr + 2) };\n"
-                "    let b3 = unsafe { *(sv.ptr + 3) };\n"
-                "    b0 == 68u8 && b1 == 114u8 && b2 == 111u8 && b3 == 112u8\n"
-                "}\n"
-                "\n"
-                "fn tc_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {\n"
-                "    let mut cur: *mut HirUseTree = t;\n"
-                "    while (cur as usize) != 0 {\n"
-                "        let count = unsafe { (*cur).path.count };\n"
-                "        if (unsafe { (*cur).subtrees as usize }) != 0 {\n"
-                "            if tc_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if (unsafe { (*cur).alias.v }) != 0u32 {\n"
-                "            if tc_name_is_drop(interner, unsafe { (*cur).alias }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if count > 0 {\n"
-                "            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;\n"
-                "            if tc_name_is_drop(interner, unsafe { *seg_ptr }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        }\n"
-                "        cur = unsafe { (*cur).next };\n"
-                "    }\n"
-                "    false\n"
-                "}\n"
-                "\n"
-                "fn tc_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {\n"
-                "    let count = unsafe { (*a).module_path.count };\n"
-                "    if count != (unsafe { (*b).module_path.count }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sa = unsafe { (*a).module_path.segments } as usize;\n"
-                "    let sb = unsafe { (*b).module_path.segments } as usize;\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < count {\n"
-                "        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "        let pa = (sa + off) as *const StrId;\n"
-                "        let pb = (sb + off) as *const StrId;\n"
-                "        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {\n"
-                "            return false;\n"
-                "        }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {\n"
-                "    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let tp: *mut HirType = unsafe { (*impl_item).trait_path };\n"
-                "    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.generic_args as usize }) != 0 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if !tc_name_is_drop(interner, unsafe { (*tp).path.name }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.span.file.v }) != 0u32 {\n"
-                "        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });\n"
-                "        if span_len != 4u32 {\n"
-                "            return false;\n"
-                "        }\n"
-                "    }\n"
-                "    let mut it: *mut HirItem = items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if tc_module_path_eq(it, impl_item) {\n"
-                "            let k = unsafe { (*it).kind };\n"
-                "            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {\n"
-                "                if tc_name_is_drop(interner, unsafe { (*it).name }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            } else if k == HIR_ITEM_USE {\n"
-                "                if tc_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_write_u32_dec(buf: *mut u8, start: usize, val: u32) -> usize {\n"
-                "    let mut tmp: [16]u8 = [0u8; 16];\n"
-                "    let mut dlen: usize = 0;\n"
-                "    let mut v = val;\n"
-                "    if v == 0u32 {\n"
-                "        unsafe { *(buf + start) = 48u8; }\n"
-                "        return start + 1;\n"
-                "    }\n"
-                "    while v > 0u32 {\n"
-                "        tmp[dlen] = (48u32 + (v % 10u32)) as u8;\n"
-                "        v = v / 10u32;\n"
-                "        dlen = dlen + 1;\n"
-                "    }\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < dlen {\n"
-                "        unsafe { *(buf + start + i) = tmp[dlen - 1 - i]; }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    start + dlen\n"
-                "}\n\n"
-                "fn tc_mangle_drop_impls(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>) {\n"
-                "    if (cx.str_in as usize) == 0 {\n"
-                "        return;\n"
-                "    }\n"
-                "    let mut drop_sym_counter: u32 = 0u32;\n"
-                "    let mut it: *mut HirItem = hir_file.items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {\n"
-                "            let tp: *mut HirType = unsafe { (*it).trait_path };\n"
-                "            let st: *mut HirType = unsafe { (*it).self_type };\n"
-                "            if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH {\n"
-                "                if tc_impl_is_lang_drop(hir_file.items, it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let mut sname = StrView { ptr: 0 as *const u8, len: 0 };\n"
-                "                    if (unsafe { (*st).path.name.v }) != 0u32 {\n"
-                "                        sname = unsafe { interner_get(view(*cx.str_in), (*st).path.name) };\n"
-                "                    } else if (cx.db as usize) != 0 {\n"
-                "                        let raw_s = unsafe { source_db_span_text(view(*cx.db), (*st).path.span) };\n"
-                "                        let mut lt: usize = 0;\n"
-                "                        while (lt) < (raw_s.len) {\n"
-                "                            if (unsafe { *(raw_s.ptr + lt) }) == 60u8 {\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            lt = lt + 1;\n"
-                "                        }\n"
-                "                        sname = StrView { ptr: raw_s.ptr, len: lt };\n"
-                "                    }\n"
-                "                    if sname.len > 0 {\n"
-                "                        let mut m: *mut HirItem = unsafe { (*it).members };\n"
-                "                        while (m as usize) != 0 {\n"
-                "                            if (unsafe { (*m).kind }) == HIR_ITEM_FN {\n"
-                "                                let mut mbuf: [256]u8 = [0u8; 256];\n"
-                "                                let buf_ptr = unsafe { address_of(mbuf[0]) as *mut u8 };\n"
-                "                                let copy_len: usize = if sname.len > 240 { 240 } else { sname.len };\n"
-                "                                unsafe {\n"
-                "                                    ptr_copy_nonoverlapping<u8>(sname.ptr, buf_ptr, copy_len);\n"
-                "                                    *(buf_ptr + copy_len) = 36u8;\n"
-                "                                    *(buf_ptr + copy_len + 1) = 100u8;\n"
-                "                                    *(buf_ptr + copy_len + 2) = 114u8;\n"
-                "                                    *(buf_ptr + copy_len + 3) = 111u8;\n"
-                "                                    *(buf_ptr + copy_len + 4) = 112u8;\n"
-                "                                }\n"
-                "                                let base_len = copy_len + 5;\n"
-                "                                let mut new_name = unsafe {\n"
-                "                                    interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, base_len)\n"
-                "                                };\n"
-                "                                let mut disambig: u32 = 1u32;\n"
-                "                                loop {\n"
-                "                                    let mut collision = false;\n"
-                "                                    let mut prev: *mut HirItem = hir_file.items;\n"
-                "                                    while (prev as usize) != 0 && (prev as usize) != (it as usize) {\n"
-                "                                        if (unsafe { (*prev).kind }) == HIR_ITEM_IMPL {\n"
-                "                                            let mut pm: *mut HirItem = unsafe { (*prev).members };\n"
-                "                                            while (pm as usize) != 0 {\n"
-                "                                                if (unsafe { (*pm).kind }) == HIR_ITEM_FN && (unsafe { (*pm).name.v }) == new_name.v {\n"
-                "                                                    collision = true;\n"
-                "                                                    break;\n"
-                "                                                }\n"
-                "                                                pm = unsafe { (*pm).next };\n"
-                "                                            }\n"
-                "                                        }\n"
-                "                                        if collision {\n"
-                "                                            break;\n"
-                "                                        }\n"
-                "                                        prev = unsafe { (*prev).next };\n"
-                "                                    }\n"
-                "                                    if !collision {\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    disambig = disambig + 1u32;\n"
-                "                                    unsafe { *(buf_ptr + base_len) = 36u8; }\n"
-                "                                    let dlen = tc_write_u32_dec(buf_ptr, base_len + 1, disambig);\n"
-                "                                    new_name = unsafe {\n"
-                "                                        interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, dlen)\n"
-                "                                    };\n"
-                "                                }\n"
-                "                                drop_sym_counter = drop_sym_counter + 1u32;\n"
-                "                                let new_sym_v = 0x70000000u32 + drop_sym_counter;\n"
-                "                                let old_name_v = unsafe { (*m).name.v };\n"
-                "                                let m_body = unsafe { (*m).body };\n"
-                "                                unsafe {\n"
-                "                                    (*m).name.v = new_name.v;\n"
-                "                                    (*m).symbol.v = new_sym_v;\n"
-                "                                }\n"
-                "                                let mut top: *mut HirItem = hir_file.items;\n"
-                "                                while (top as usize) != 0 {\n"
-                "                                    if (top as usize) != (m as usize) &&\n"
-                "                                       (unsafe { (*top).kind }) == HIR_ITEM_FN &&\n"
-                "                                       (unsafe { (*top).body as usize }) == (m_body as usize) &&\n"
-                "                                       (unsafe { (*top).name.v }) == old_name_v {\n"
-                "                                        unsafe {\n"
-                "                                            (*top).name.v = new_name.v;\n"
-                "                                            (*top).symbol.v = new_sym_v;\n"
-                "                                        }\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    top = unsafe { (*top).next };\n"
-                "                                }\n"
-                "                            }\n"
-                "                            m = unsafe { (*m).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "}\n\n"
-                "pub fn typeck_into(",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-            )
-            src = src.replace(
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    // Pass 1a0:",
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    tc_mangle_drop_impls(mut_view(cx), hir_file);\n\n"
-                "    // Pass 1a0:",
-            )
-            src = src.replace(
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "            let tp_node: *mut HirType = unsafe { (*top_it).trait_path };\n"
-                "            if (tp_node as usize) != 0 && impl_self_ty.v != 0u32 {\n"
-                "                if (cx.str_in as usize) != 0 && tc_impl_is_lang_drop(hir_file.items, top_it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let self_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: impl_self_ty.v })) };\n"
-                "                    if (self_t as usize) != 0 && (unsafe { (*self_t).kind }) == TY_STRUCT {\n"
-                "                        let mut dm: *mut HirItem = unsafe { (*top_it).members };\n"
-                "                        while (dm as usize) != 0 {\n"
-                "                            if (unsafe { (*dm).kind }) == HIR_ITEM_FN {\n"
-                "                                let tk_key = ((impl_self_ty.v as usize) << 1) | 1;\n"
-                "                                unsafe {\n"
-                "                                    ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), tk_key, dm);\n"
-                "                                }\n"
-                "                                let def_ptr = unsafe { (*self_t).def };\n"
-                "                                if (def_ptr as usize) != 0 {\n"
-                "                                    let dk_key = (def_ptr as usize) | 1;\n"
-                "                                    unsafe {\n"
-                "                                        ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), dk_key, dm);\n"
-                "                                    }\n"
-                "                                }\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            dm = unsafe { (*dm).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-            )
-        src = src.replace("use std.core.host.", "use host_intrinsics.")
-        src = src.replace("; return ", ";\nreturn ")
-        src = src.replace("; break;", ";\nbreak;")
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
+    return bc.assemble_compiler_modules(FULL_MODULES, root=ROOT)
 
 
 def find_exe(default_rels):
@@ -1407,6 +771,14 @@ def run_axiom0_run(axiom0, rel_ax, opt_O1=False):
     return res.returncode, out, panic_msg
 
 
+def extract_i32_table_from_bundle(bundle_path, const_name):
+    text = read_bytes(bundle_path).decode("utf-8")
+    m = re.search(r"const\s+%s:\s*\[\d+\]i32\s*=\s*\[(.*?)\];" % re.escape(const_name), text, re.S)
+    if not m:
+        raise SystemExit("failed to extract %s from %s" % (const_name, bundle_path))
+    return [int(x) for x in re.findall(r"-?\d+", m.group(1))]
+
+
 def build_unit_bundle(prelude_text, modules_text):
     data = b"".join(UNIT_MIR_BLOBS)
     offsets = [0]
@@ -1427,16 +799,22 @@ def build_unit_bundle(prelude_text, modules_text):
     )
     full_text = header + prelude_text + "\n" + modules_text + "\n" + main_src
     out_path = os.path.join(HERE, "qa_interp_opt_unit.ax")
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text.encode("utf-8")
 
 
 def build_mir_opt_bundle(prelude_text, modules_text, axiom0, group, upper, spec_list, native_only):
+    out_path = os.path.join(HERE, "qa_interp_opt_diff_%s.ax" % group)
+    cached_blobs = None
+    if not axiom0:
+        cached_blobs = bc.extract_blobs_from_bundle(out_path, "CASE_DATA", "CASE_OFF")
     blobs = []
     prelude_flags = []
-    for rel_ax, needs_prelude in spec_list:
+    for idx, (rel_ax, needs_prelude) in enumerate(spec_list):
         src_bytes = read_bytes(os.path.join(ROOT, *rel_ax.split("/"))).replace(b"\r\n", b"\n")
-        exp_mir_opt = run_axiom0_mir_opt(axiom0, rel_ax)
+        if axiom0:
+            exp_mir_opt = run_axiom0_mir_opt(axiom0, rel_ax)
+        else:
+            exp_mir_opt = cached_blobs[idx * 3 + 2]
         blobs.append(rel_ax.encode("utf-8"))
         blobs.append(src_bytes)
         blobs.append(exp_mir_opt)
@@ -1467,12 +845,16 @@ def build_mir_opt_bundle(prelude_text, modules_text, axiom0, group, upper, spec_
         "// Generated by tests/selfhost/interp_opt/gen_interp_opt_tests.py; do not edit.\n\n"
     ) % (modes_line, upper, len(spec_list))
     full_text = header + prelude_text + "\n" + modules_text + "\n" + main_src
-    out_path = os.path.join(HERE, "qa_interp_opt_diff_%s.ax" % group)
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text.encode("utf-8")
 
 
 def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, upper, spec_list, native_only, twin_name):
+    out_path = os.path.join(HERE, "qa_interp_opt_diff_%s.ax" % group)
+    cached_blobs = None
+    cached_exits = None
+    if not axiom0:
+        cached_blobs = bc.extract_blobs_from_bundle(out_path, "CASE_DATA", "CASE_OFF")
+        cached_exits = extract_i32_table_from_bundle(out_path, "CASE_EXP_EXIT")
     blobs = []
     prelude_flags = []
     ui_err_flags = []
@@ -1482,7 +864,7 @@ def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, uppe
     step_limits = []
     depth_limits = []
 
-    for rel_ax, inline_src, needs_prelude, is_ui_err, exp_exit, diag0, diag1, step_limit, depth_limit in spec_list:
+    for idx, (rel_ax, inline_src, needs_prelude, is_ui_err, exp_exit, diag0, diag1, step_limit, depth_limit) in enumerate(spec_list):
         if inline_src is not None:
             src_bytes = inline_src
             exp_stdout = b""
@@ -1496,11 +878,15 @@ def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, uppe
                 exp_panic = b"index out of bounds"
         else:
             src_bytes = read_bytes(os.path.join(ROOT, *rel_ax.split("/"))).replace(b"\r\n", b"\n")
+            if exp_exit is None and not is_ui_err:
+                m_exit = re.search(rb"^//\s*exit:\s*(-?\d+)", src_bytes, re.M)
+                if m_exit:
+                    exp_exit = int(m_exit.group(1))
             if is_ui_err:
                 rc = exp_exit if exp_exit is not None else 1
                 exp_stdout = b""
                 exp_panic = b""
-            else:
+            elif axiom0:
                 rc0, out0, panic0 = run_axiom0_run(axiom0, rel_ax, opt_O1=False)
                 rc1, out1, panic1 = run_axiom0_run(axiom0, rel_ax, opt_O1=True)
                 if rc0 != rc1 or out0 != out1 or panic0 != panic1:
@@ -1508,6 +894,10 @@ def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, uppe
                 rc = exp_exit if exp_exit is not None else rc0
                 exp_stdout = out0
                 exp_panic = panic0
+            else:
+                rc = exp_exit if exp_exit is not None else cached_exits[idx]
+                exp_stdout = cached_blobs[idx * 4 + 2]
+                exp_panic = cached_blobs[idx * 4 + 3]
 
         blobs.append(rel_ax.encode("utf-8"))
         blobs.append(src_bytes)
@@ -1543,6 +933,7 @@ def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, uppe
     )
     modes_line = (
         "// modes: native\n"
+        "// flags: --stack-reserve=16777216\n"
         "// Reason: heavy selfhost -O0/-O1 execution differential batch; small interp twin is %s.\n" % twin_name
     ) if native_only else ""
     header = (
@@ -1553,37 +944,44 @@ def build_run_or_comptime_bundle(prelude_text, modules_text, axiom0, group, uppe
         "// Generated by tests/selfhost/interp_opt/gen_interp_opt_tests.py; do not edit.\n\n"
     ) % (modes_line, upper, len(spec_list))
     full_text = header + prelude_text + "\n" + modules_text + "\n" + main_src
-    out_path = os.path.join(HERE, "qa_interp_opt_diff_%s.ax" % group)
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text.encode("utf-8")
 
 
 def main():
     axiom0 = None
+    check_mode = False
+    refresh_goldens = False
     i = 1
     while i < len(sys.argv):
-        if sys.argv[i] == "--axiom0" and i + 1 < len(sys.argv):
+        if sys.argv[i] in ("--check", "check"):
+            check_mode = True
+            i += 1
+        elif sys.argv[i] == "--refresh-goldens":
+            refresh_goldens = True
+            i += 1
+        elif sys.argv[i] == "--axiom0" and i + 1 < len(sys.argv):
             axiom0 = sys.argv[i + 1]
             i += 2
         else:
             raise SystemExit("unknown arg: %s" % sys.argv[i])
 
-    if not axiom0:
+    if refresh_goldens and not axiom0:
         axiom0 = find_exe([
+            "build-snap-T144/build/axiom0.exe",
             "build-snap-T083/build/axiom0.exe",
             "build/axiom0.exe",
         ])
-    if not axiom0 or not os.path.isfile(axiom0):
+    if axiom0 and not os.path.isfile(axiom0):
         raise SystemExit("could not locate axiom0.exe")
 
     prelude_text = build_prelude_text()
     modules_text = assemble_modules()
 
-    build_unit_bundle(prelude_text, modules_text)
+    outputs = [build_unit_bundle(prelude_text, modules_text)]
     for group, upper, spec_list, native_only in MIR_OPT_GROUPS:
-        build_mir_opt_bundle(prelude_text, modules_text, axiom0, group, upper, spec_list, native_only)
+        outputs.append(build_mir_opt_bundle(prelude_text, modules_text, axiom0, group, upper, spec_list, native_only))
     for group, upper, spec_list, native_only in COMPTIME_GROUPS:
-        build_run_or_comptime_bundle(
+        outputs.append(build_run_or_comptime_bundle(
             prelude_text,
             modules_text,
             axiom0,
@@ -1592,9 +990,9 @@ def main():
             spec_list,
             native_only,
             "qa_interp_opt_diff_comptime_a.ax",
-        )
+        ))
     for group, upper, spec_list, native_only in RUN_GROUPS:
-        build_run_or_comptime_bundle(
+        outputs.append(build_run_or_comptime_bundle(
             prelude_text,
             modules_text,
             axiom0,
@@ -1603,8 +1001,8 @@ def main():
             spec_list,
             native_only,
             "qa_interp_opt_diff_run_a.ax",
-        )
-    return 0
+        ))
+    return bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":

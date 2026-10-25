@@ -1,0 +1,661 @@
+// test: run
+// timeout: 600
+// stdout: OK Own Init\n
+
+module main
+
+use host_intrinsics.heap_alloc
+use host_intrinsics.heap_free
+use host_intrinsics.exit
+use compiler.diag.code.AX_INIT_USE_UNINIT
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
+use compiler.diag.code.AX_UNSAFE_REQUIRED
+use compiler.kernel.arena.Arena
+use compiler.syntax.ast.BINOP_ADD
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.kernel.id.FileId
+use compiler.hir.hir.HIR_EXPR_BINARY
+use compiler.hir.hir.HIR_EXPR_PATH
+use compiler.hir.hir.HIR_EXPR_UNARY
+use compiler.hir.hir.HIR_EXPR_UNSAFE
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_STRUCT
+use compiler.hir.hir.HIR_STMT_EXPR
+use compiler.hir.hir.HirBlock
+use compiler.hir.hir.HirExpr
+use compiler.hir.hir.HirFile
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirStmt
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_RETURN
+use compiler.mir.mir.MIR_LOCAL_USER
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirStmt
+use compiler.source.span.Span
+use compiler.kernel.interner.StrInterner
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.Thir
+use compiler.kernel.id.TypeId
+use compiler.syntax.ast.UNOP_DEREF
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_new
+use compiler.types.types.ax_type_reset
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_init
+use compiler.types.types.intern_ptr_ty
+use compiler.types.types.intern_type
+use compiler.kernel.interner.interner_free
+use compiler.kernel.interner.interner_new
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_reset
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_place_local
+use compiler.mir.mir.mir_proj_reset
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.types.types.mul_usize
+use compiler.own.init.own_check
+use compiler.own.move_ck.own_type_is_copy
+use compiler.own.unsafe_ck.unsafe_check
+use compiler.types.types.thir_free
+use compiler.types.types.thir_init
+use compiler.types.types.thir_set_expr_type
+use compiler.types.types.typeid_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn null_mut<T>() -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }
+
+unsafe fn test_diag_ptr(diags: *mut Diagnostic, idx: usize) -> *mut Diagnostic {
+    diags + idx
+}
+
+fn test_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+// --- Test Helpers ---
+fn assert_true(cond: bool, code: i32) {
+    if !cond {
+        exit(code);
+    }
+}
+
+fn make_span(file_v: u32, start: u32, end: u32) -> Span {
+    Span {
+        file: FileId { v: file_v },
+        start: start,
+        end: end,
+    }
+}
+
+fn set_span(sp: mut_view<Span>, file_v: u32, start: u32, end: u32) {
+    sp.file.v = file_v;
+    sp.start = start;
+    sp.end = end;
+}
+
+fn set_place_local(p: mut_view<MirPlace>, local_v: u32) {
+    p.local.v = local_v;
+    p.projs = 0 as *mut MirProjection;
+    p.proj_count = 0;
+}
+
+fn set_place_field(arena: mut_view<Arena>, p: mut_view<MirPlace>, local_v: u32, field_idx: u32) {
+    let pr_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pr = pr_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pr), MIR_PROJ_FIELD);
+        (*pr).field_idx = field_idx;
+    }
+    p.local.v = local_v;
+    p.projs = pr;
+    p.proj_count = 1;
+}
+
+fn alloc_locals(arena: mut_view<Arena>, count: usize) -> *mut MirLocalDecl {
+    let bytes = mul_usize(count, size_of<MirLocalDecl>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirLocalDecl>());
+    let ptr = raw as *mut MirLocalDecl;
+    let mut i: usize = 0;
+    while (i < count) {
+        let lp = unsafe { mir_local_at(ptr, i) };
+        unsafe {
+            (*lp).kind = MIR_LOCAL_USER;
+            (*lp).mut_flag = true;
+            (*lp).ty.v = 0u32;
+            (*lp).location.file.v = 1u32;
+            (*lp).location.start = 0u32;
+            (*lp).location.end = 0u32;
+            (*lp).const_sym.v = 0u32;
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn set_local(locals: *mut MirLocalDecl, idx: usize, kind: u8, ty_v: u32) {
+    let lp = unsafe { mir_local_at(locals, idx) };
+    unsafe {
+        (*lp).kind = kind;
+        (*lp).mut_flag = true;
+        (*lp).ty.v = ty_v;
+    }
+}
+
+fn alloc_bbs(arena: mut_view<Arena>, count: usize) -> *mut MirBb {
+    let bytes = mul_usize(count, size_of<MirBb>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirBb>());
+    let ptr = raw as *mut MirBb;
+    let mut i: usize = 0;
+    while (i < count) {
+        let bp = unsafe { mir_bb_at(ptr, i) };
+        unsafe {
+            mir_bb_reset(mut_view(*bp), MirBbId { v: i as u32 });
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn alloc_stmts(arena: mut_view<Arena>, count: usize) -> *mut MirStmt {
+    let bytes = mul_usize(count, size_of<MirStmt>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirStmt>());
+    let ptr = raw as *mut MirStmt;
+    let zspan = make_span(1u32, 0u32, 0u32);
+    let mut i: usize = 0;
+    while (i < count) {
+        let sp = unsafe { mir_stmt_at(ptr, i) };
+        unsafe {
+            mir_stmt_reset(mut_view(*sp), MIR_STMT_ASSIGN, view(zspan));
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn alloc_mir_body(arena: mut_view<Arena>, fn_v: u32, arg_count: usize, local_count: usize, bb_count: usize) -> *mut MirBody {
+    let raw = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>());
+    let b = raw as *mut MirBody;
+    let locals = alloc_locals(mut_view(*arena), local_count);
+    let bbs = alloc_bbs(mut_view(*arena), bb_count);
+    unsafe {
+        (*b).fn_sym.v = fn_v;
+        (*b).fn_name.v = fn_v;
+        (*b).arg_count = arg_count;
+        (*b).locals = locals;
+        (*b).local_count = local_count;
+        (*b).local_cap = local_count;
+        (*b).bbs = bbs;
+        (*b).bb_count = bb_count;
+        (*b).bb_cap = bb_count;
+        (*b).drop_flag_count = 0;
+    }
+    b
+}
+
+fn make_field_place(arena: mut_view<Arena>, local_v: u32, field_idx: u32) -> MirPlace {
+    let mut p = mir_place_local(MirLocalId { v: local_v });
+    let pr_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pr = pr_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pr), MIR_PROJ_FIELD);
+        (*pr).field_idx = field_idx;
+    }
+    p.projs = pr;
+    p.proj_count = 1;
+    p
+}
+
+fn alloc_hir_expr(arena: mut_view<Arena>, kind: u8, span: view<Span>) -> *mut HirExpr {
+    let sz = size_of<HirExpr>();
+    let raw = arena_alloc_raw(mut_view(*arena), sz, align_of<HirExpr>());
+    test_zero_bytes(raw, sz);
+    let ptr = raw as *mut HirExpr;
+    unsafe {
+        (*ptr).kind = kind;
+        (*ptr).span.file.v = span.file.v;
+        (*ptr).span.start = span.start;
+        (*ptr).span.end = span.end;
+    }
+    ptr
+}
+
+fn alloc_hir_stmt(arena: mut_view<Arena>, kind: u8, span: view<Span>) -> *mut HirStmt {
+    let sz = size_of<HirStmt>();
+    let raw = arena_alloc_raw(mut_view(*arena), sz, align_of<HirStmt>());
+    test_zero_bytes(raw, sz);
+    let ptr = raw as *mut HirStmt;
+    unsafe {
+        (*ptr).kind = kind;
+        (*ptr).span.file.v = span.file.v;
+        (*ptr).span.start = span.start;
+        (*ptr).span.end = span.end;
+    }
+    ptr
+}
+
+fn alloc_hir_block(arena: mut_view<Arena>, span: view<Span>) -> *mut HirBlock {
+    let sz = size_of<HirBlock>();
+    let raw = arena_alloc_raw(mut_view(*arena), sz, align_of<HirBlock>());
+    test_zero_bytes(raw, sz);
+    let ptr = raw as *mut HirBlock;
+    unsafe {
+        (*ptr).span.file.v = span.file.v;
+        (*ptr).span.start = span.start;
+        (*ptr).span.end = span.end;
+    }
+    ptr
+}
+
+fn alloc_hir_item(arena: mut_view<Arena>, kind: u8, span: view<Span>) -> *mut HirItem {
+    let sz = size_of<HirItem>();
+    let raw = arena_alloc_raw(mut_view(*arena), sz, align_of<HirItem>());
+    test_zero_bytes(raw, sz);
+    let ptr = raw as *mut HirItem;
+    unsafe {
+        (*ptr).kind = kind;
+        (*ptr).span.file.v = span.file.v;
+        (*ptr).span.start = span.start;
+        (*ptr).span.end = span.end;
+    }
+    ptr
+}
+
+fn test_move_and_partial_move(
+    arena: mut_view<Arena>,
+    str_in: mut_view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    thir: mut_view<Thir>
+) {
+    thir_init(mut_view(*thir));
+
+    let unit_ty_v = thir.interner.t_unit.v;
+    let i32_ty_v = thir.interner.t_i32.v;
+    let sp_move = make_span(1u32, 10u32, 20u32);
+    let sp_use = make_span(1u32, 30u32, 40u32);
+
+    // Non-Copy struct Resource { v: i32 } (no @derive(Copy) attribute on def)
+    let res_def = alloc_hir_item(mut_view(*arena), HIR_ITEM_STRUCT, view(sp_move));
+    let res_flds_raw = arena_alloc_raw(mut_view(*arena), size_of<TypeId>(), align_of<TypeId>());
+    let res_flds = res_flds_raw as *mut TypeId;
+    unsafe {
+        (*typeid_at(res_flds, 0)).v = i32_ty_v;
+        ax_type_reset(mut_view(*thir.interner.scratch), TY_STRUCT);
+        (*thir.interner.scratch).def = res_def as *const HirItem;
+        (*thir.interner.scratch).fields = res_flds;
+        (*thir.interner.scratch).field_count = 1;
+    }
+    let sc1 = thir.interner.scratch;
+    let res_ty = unsafe { intern_type(mut_view(thir.interner), view(*sc1)) };
+    let res_ty_v = res_ty.v;
+
+    // Non-Copy struct Pair { a: Resource, b: Resource }
+    let pair_def = alloc_hir_item(mut_view(*arena), HIR_ITEM_STRUCT, view(sp_move));
+    let pair_flds_raw = arena_alloc_raw(mut_view(*arena), mul_usize(2, size_of<TypeId>()), align_of<TypeId>());
+    let pair_flds = pair_flds_raw as *mut TypeId;
+    unsafe {
+        (*typeid_at(pair_flds, 0)).v = res_ty_v;
+        (*typeid_at(pair_flds, 1)).v = res_ty_v;
+        ax_type_reset(mut_view(*thir.interner.scratch), TY_STRUCT);
+        (*thir.interner.scratch).def = pair_def as *const HirItem;
+        (*thir.interner.scratch).fields = pair_flds;
+        (*thir.interner.scratch).field_count = 2;
+    }
+    let sc2 = thir.interner.scratch;
+    let pair_ty = unsafe { intern_type(mut_view(thir.interner), view(*sc2)) };
+    let pair_ty_v = pair_ty.v;
+
+    let c1 = own_type_is_copy(TypeId { v: i32_ty_v }, view(*thir), view(*str_in));
+    let c2 = own_type_is_copy(TypeId { v: res_ty_v }, view(*thir), view(*str_in));
+    let c3 = own_type_is_copy(TypeId { v: pair_ty_v }, view(*thir), view(*str_in));
+    assert_true(c1, 1);
+    assert_true(!c2, 2);
+    assert_true(!c3, 3);
+
+    // 1. Test use of uninitialized local (_1: Resource used without init)
+    let body1 = alloc_mir_body(mut_view(*arena), 1u32, 0, 3, 1);
+    let b1_locals = unsafe { (*body1).locals };
+    let b1_bbs = unsafe { (*body1).bbs };
+    set_local(b1_locals, 0, MIR_LOCAL_RETURN, unit_ty_v);
+    set_local(b1_locals, 1, MIR_LOCAL_USER, res_ty_v);
+    set_local(b1_locals, 2, MIR_LOCAL_USER, res_ty_v);
+    let bb0 = unsafe { mir_bb_at(b1_bbs, 0) };
+    let stmts1 = alloc_stmts(mut_view(*arena), 1);
+    let st0 = unsafe { mir_stmt_at(stmts1, 0) };
+    let sp_uninit = make_span(1u32, 100u32, 110u32);
+    unsafe {
+        mir_stmt_reset(mut_view(*st0), MIR_STMT_ASSIGN, view(sp_uninit));
+        set_place_local(mut_view((*st0).place), 2u32);
+        (*st0).rvalue.kind = MIR_RVALUE_USE;
+        (*st0).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_span(mut_view((*st0).rvalue.use_op.location), 1u32, 100u32, 110u32);
+        set_place_local(mut_view((*st0).rvalue.use_op.place), 1u32);
+        (*bb0).stmts = stmts1;
+        (*bb0).stmt_count = 1;
+        (*bb0).has_terminator = true;
+        mir_term_reset(mut_view((*bb0).terminator), MIR_TERM_RETURN, view(sp_uninit));
+        own_check(0 as *const HirItem, mut_view(*body1), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 1, 4);
+    let d0 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d0).code.v }) == AX_INIT_USE_UNINIT, 5);
+
+    // 2. Test use after move with secondary "moved here" label
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    set_local(b1_locals, 1, MIR_LOCAL_ARG, res_ty_v);
+    let stmts2 = alloc_stmts(mut_view(*arena), 2);
+    let s2_0 = unsafe { mir_stmt_at(stmts2, 0) };
+    let s2_1 = unsafe { mir_stmt_at(stmts2, 1) };
+    unsafe {
+        mir_stmt_reset(mut_view(*s2_0), MIR_STMT_ASSIGN, view(sp_move));
+        set_place_local(mut_view((*s2_0).place), 2u32);
+        (*s2_0).rvalue.kind = MIR_RVALUE_USE;
+        (*s2_0).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_span(mut_view((*s2_0).rvalue.use_op.location), 1u32, 10u32, 20u32);
+        set_place_local(mut_view((*s2_0).rvalue.use_op.place), 1u32);
+
+        mir_stmt_reset(mut_view(*s2_1), MIR_STMT_ASSIGN, view(sp_use));
+        set_place_local(mut_view((*s2_1).place), 2u32);
+        (*s2_1).rvalue.kind = MIR_RVALUE_USE;
+        (*s2_1).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_span(mut_view((*s2_1).rvalue.use_op.location), 1u32, 30u32, 40u32);
+        set_place_local(mut_view((*s2_1).rvalue.use_op.place), 1u32);
+
+        (*bb0).stmts = stmts2;
+        (*bb0).stmt_count = 2;
+        own_check(0 as *const HirItem, mut_view(*body1), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 1, 6);
+    let d1 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d1).code.v }) == AX_MOVE_USE_AFTER_MOVE, 7);
+    assert_true((unsafe { (*d1).primary.start }) == 30u32, 8);
+    assert_true((unsafe { (*d1).label_count }) == 1, 9);
+    let lbl = unsafe { (*d1).labels };
+    assert_true((unsafe { (*lbl).span.start }) == 10u32, 10);
+    assert_true((unsafe { (*lbl).span.end }) == 20u32, 11);
+
+    // 3. Test partial move of Pair: move _1.0, then use _1.1 (OK!), then re-init _1.0 and _1.1 -> 0 errors!
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let body3 = alloc_mir_body(mut_view(*arena), 2u32, 2, 5, 1);
+    let b3_locals = unsafe { (*body3).locals };
+    let b3_bbs = unsafe { (*body3).bbs };
+    set_local(b3_locals, 0, MIR_LOCAL_RETURN, unit_ty_v);
+    set_local(b3_locals, 1, MIR_LOCAL_ARG, pair_ty_v);
+    set_local(b3_locals, 2, MIR_LOCAL_ARG, res_ty_v);
+    set_local(b3_locals, 3, MIR_LOCAL_USER, res_ty_v);
+    set_local(b3_locals, 4, MIR_LOCAL_USER, pair_ty_v);
+    let bb3_0 = unsafe { mir_bb_at(b3_bbs, 0) };
+    let stmts3 = alloc_stmts(mut_view(*arena), 4);
+    let s3_0 = unsafe { mir_stmt_at(stmts3, 0) };
+    let s3_1 = unsafe { mir_stmt_at(stmts3, 1) };
+    let s3_2 = unsafe { mir_stmt_at(stmts3, 2) };
+    let s3_3 = unsafe { mir_stmt_at(stmts3, 3) };
+    unsafe {
+        mir_stmt_reset(mut_view(*s3_0), MIR_STMT_ASSIGN, view(sp_move));
+        set_place_local(mut_view((*s3_0).place), 3u32);
+        (*s3_0).rvalue.kind = MIR_RVALUE_USE;
+        (*s3_0).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_place_field(mut_view(*arena), mut_view((*s3_0).rvalue.use_op.place), 1u32, 0u32);
+
+        mir_stmt_reset(mut_view(*s3_1), MIR_STMT_ASSIGN, view(sp_use));
+        set_place_local(mut_view((*s3_1).place), 3u32);
+        (*s3_1).rvalue.kind = MIR_RVALUE_USE;
+        (*s3_1).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_place_field(mut_view(*arena), mut_view((*s3_1).rvalue.use_op.place), 1u32, 1u32);
+
+        mir_stmt_reset(mut_view(*s3_2), MIR_STMT_ASSIGN, view(sp_use));
+        set_place_field(mut_view(*arena), mut_view((*s3_2).place), 1u32, 0u32);
+        (*s3_2).rvalue.kind = MIR_RVALUE_USE;
+        (*s3_2).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_place_local(mut_view((*s3_2).rvalue.use_op.place), 3u32);
+
+        mir_stmt_reset(mut_view(*s3_3), MIR_STMT_ASSIGN, view(sp_use));
+        set_place_field(mut_view(*arena), mut_view((*s3_3).place), 1u32, 1u32);
+        (*s3_3).rvalue.kind = MIR_RVALUE_USE;
+        (*s3_3).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_place_local(mut_view((*s3_3).rvalue.use_op.place), 2u32);
+
+        (*bb3_0).stmts = stmts3;
+        (*bb3_0).stmt_count = 4;
+        (*bb3_0).has_terminator = true;
+        mir_term_reset(mut_view((*bb3_0).terminator), MIR_TERM_RETURN, view(sp_use));
+        own_check(0 as *const HirItem, mut_view(*body3), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 0, 12);
+
+    // Moving _1.0 and then using whole _1 without re-initializing _1.0 triggers AX_MOVE_USE_AFTER_MOVE
+    unsafe {
+        set_place_local(mut_view((*s3_1).place), 4u32);
+        (*s3_1).rvalue.kind = MIR_RVALUE_USE;
+        (*s3_1).rvalue.use_op.kind = MIR_OP_MOVE;
+        set_place_local(mut_view((*s3_1).rvalue.use_op.place), 1u32);
+        (*bb3_0).stmt_count = 2;
+        own_check(0 as *const HirItem, mut_view(*body3), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 1, 13);
+    let d3 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d3).code.v }) == AX_MOVE_USE_AFTER_MOVE, 14);
+
+    // 4. Test branching CFG definite initialization (bb0 -> bb1 / bb2 -> bb3)
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let body4 = alloc_mir_body(mut_view(*arena), 4u32, 1, 4, 4);
+    let b4_locals = unsafe { (*body4).locals };
+    let b4_bbs = unsafe { (*body4).bbs };
+    set_local(b4_locals, 0, MIR_LOCAL_RETURN, i32_ty_v);
+    set_local(b4_locals, 1, MIR_LOCAL_ARG, i32_ty_v);
+    set_local(b4_locals, 2, MIR_LOCAL_USER, i32_ty_v);
+    set_local(b4_locals, 3, MIR_LOCAL_USER, i32_ty_v);
+    let b4_0 = unsafe { mir_bb_at(b4_bbs, 0) };
+    let b4_1 = unsafe { mir_bb_at(b4_bbs, 1) };
+    let b4_2 = unsafe { mir_bb_at(b4_bbs, 2) };
+    let b4_3 = unsafe { mir_bb_at(b4_bbs, 3) };
+
+    let sw_vals_raw = arena_alloc_raw(mut_view(*arena), 8, 8);
+    let sw_vals = sw_vals_raw as *mut u64;
+    unsafe { *sw_vals = 1u64; }
+    let sw_tgts_raw = arena_alloc_raw(mut_view(*arena), size_of<MirBbId>(), align_of<MirBbId>());
+    let sw_tgts = sw_tgts_raw as *mut MirBbId;
+    unsafe { (*sw_tgts).v = 1u32; }
+
+    let stmts_b1 = alloc_stmts(mut_view(*arena), 1);
+    let sb1_0 = unsafe { mir_stmt_at(stmts_b1, 0) };
+    let stmts_b3 = alloc_stmts(mut_view(*arena), 1);
+    let sb3_0 = unsafe { mir_stmt_at(stmts_b3, 0) };
+    unsafe {
+        (*b4_0).has_terminator = true;
+        mir_term_reset(mut_view((*b4_0).terminator), MIR_TERM_SWITCH_INT, view(sp_move));
+        (*b4_0).terminator.discr.kind = MIR_OP_COPY;
+        set_place_local(mut_view((*b4_0).terminator.discr.place), 1u32);
+        (*b4_0).terminator.values = sw_vals;
+        (*b4_0).terminator.targets = sw_tgts;
+        (*b4_0).terminator.switch_count = 1;
+        (*b4_0).terminator.otherwise.v = 2u32;
+
+        mir_stmt_reset(mut_view(*sb1_0), MIR_STMT_ASSIGN, view(sp_move));
+        set_place_local(mut_view((*sb1_0).place), 2u32);
+        (*sb1_0).rvalue.kind = MIR_RVALUE_USE;
+        (*sb1_0).rvalue.use_op.kind = MIR_OP_COPY;
+        set_place_local(mut_view((*sb1_0).rvalue.use_op.place), 1u32);
+        (*b4_1).stmts = stmts_b1;
+        (*b4_1).stmt_count = 1;
+        (*b4_1).has_terminator = true;
+        mir_term_reset(mut_view((*b4_1).terminator), MIR_TERM_GOTO, view(sp_move));
+        (*b4_1).terminator.goto_target.v = 3u32;
+
+        (*b4_2).has_terminator = true;
+        mir_term_reset(mut_view((*b4_2).terminator), MIR_TERM_GOTO, view(sp_move));
+        (*b4_2).terminator.goto_target.v = 3u32;
+
+        mir_stmt_reset(mut_view(*sb3_0), MIR_STMT_ASSIGN, view(sp_use));
+        set_place_local(mut_view((*sb3_0).place), 0u32);
+        (*sb3_0).rvalue.kind = MIR_RVALUE_USE;
+        (*sb3_0).rvalue.use_op.kind = MIR_OP_COPY;
+        set_place_local(mut_view((*sb3_0).rvalue.use_op.place), 2u32);
+        (*b4_3).stmts = stmts_b3;
+        (*b4_3).stmt_count = 1;
+        (*b4_3).has_terminator = true;
+        mir_term_reset(mut_view((*b4_3).terminator), MIR_TERM_RETURN, view(sp_use));
+
+        own_check(0 as *const HirItem, mut_view(*body4), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 1, 15);
+    let d4 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d4).code.v }) == AX_INIT_USE_UNINIT, 16);
+
+    // Initialize _2 in bb2 as well -> 0 errors!
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    unsafe {
+        (*b4_2).stmts = stmts_b1;
+        (*b4_2).stmt_count = 1;
+        own_check(0 as *const HirItem, mut_view(*body4), view(*thir), mut_view(*sink), view(*str_in));
+    }
+    assert_true(sink.errors == 0, 17);
+    thir_free(mut_view(*thir));
+}
+
+fn test_unsafe_checker(
+    arena: mut_view<Arena>,
+    str_in: mut_view<StrInterner>,
+    sink: mut_view<DiagSink>,
+    thir: mut_view<Thir>
+) {
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    thir_init(mut_view(*thir));
+
+    let i32_ty_v = thir.interner.t_i32.v;
+    let ptr_i32_ty = intern_ptr_ty(mut_view(thir.interner), TypeId { v: i32_ty_v }, false);
+    let ptr_i32_ty_v = ptr_i32_ty.v;
+
+    let sp = make_span(1u32, 50u32, 60u32);
+    let inner_ptr_expr = alloc_hir_expr(mut_view(*arena), HIR_EXPR_PATH, view(sp));
+    thir_set_expr_type(mut_view(*thir), inner_ptr_expr as *const HirExpr, TypeId { v: ptr_i32_ty_v });
+
+    let deref_expr = alloc_hir_expr(mut_view(*arena), HIR_EXPR_UNARY, view(sp));
+    unsafe {
+        (*deref_expr).op = UNOP_DEREF;
+        (*deref_expr).inner = inner_ptr_expr;
+    }
+    thir_set_expr_type(mut_view(*thir), deref_expr as *const HirExpr, TypeId { v: i32_ty_v });
+
+    let stmt = alloc_hir_stmt(mut_view(*arena), HIR_STMT_EXPR, view(sp));
+    unsafe { (*stmt).expr = deref_expr; }
+
+    let blk = alloc_hir_block(mut_view(*arena), view(sp));
+    unsafe { (*blk).stmts = stmt; }
+
+    let fn_item = alloc_hir_item(mut_view(*arena), HIR_ITEM_FN, view(sp));
+    unsafe {
+        (*fn_item).is_unsafe = false;
+        (*fn_item).body = blk;
+    }
+
+    let hir_file = HirFile { items: fn_item };
+
+    // 1. Deref raw pointer in safe fn -> AX_UNSAFE_REQUIRED
+    unsafe_check(view(hir_file), view(*thir), mut_view(*sink), view(*str_in));
+    assert_true(sink.errors == 1, 20);
+    let d0 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d0).code.v }) == AX_UNSAFE_REQUIRED, 21);
+
+    // 2. Wrap deref in HIR_EXPR_UNSAFE block -> 0 errors!
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let unsafe_blk = alloc_hir_block(mut_view(*arena), view(sp));
+    let inner_stmt = alloc_hir_stmt(mut_view(*arena), HIR_STMT_EXPR, view(sp));
+    unsafe {
+        (*inner_stmt).expr = deref_expr;
+        (*unsafe_blk).stmts = inner_stmt;
+    }
+    let unsafe_expr = alloc_hir_expr(mut_view(*arena), HIR_EXPR_UNSAFE, view(sp));
+    unsafe {
+        (*unsafe_expr).block = unsafe_blk;
+        (*stmt).expr = unsafe_expr;
+    }
+    unsafe_check(view(hir_file), view(*thir), mut_view(*sink), view(*str_in));
+    assert_true(sink.errors == 0, 22);
+
+    // 3. Pointer arithmetic (ptr + 1) outside unsafe -> AX_UNSAFE_REQUIRED
+    let rhs_expr = alloc_hir_expr(mut_view(*arena), HIR_EXPR_PATH, view(sp));
+    let add_expr = alloc_hir_expr(mut_view(*arena), HIR_EXPR_BINARY, view(sp));
+    thir_set_expr_type(mut_view(*thir), rhs_expr as *const HirExpr, TypeId { v: i32_ty_v });
+    unsafe {
+        (*add_expr).op = BINOP_ADD;
+        (*add_expr).left = inner_ptr_expr;
+        (*add_expr).right = rhs_expr;
+        (*stmt).expr = add_expr;
+    }
+    unsafe_check(view(hir_file), view(*thir), mut_view(*sink), view(*str_in));
+    assert_true(sink.errors == 1, 23);
+    let d1 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d1).code.v }) == AX_UNSAFE_REQUIRED, 24);
+
+    // 4. Mark enclosing function as unsafe fn -> 0 errors!
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    unsafe {
+        (*fn_item).is_unsafe = true;
+    }
+    unsafe_check(view(hir_file), view(*thir), mut_view(*sink), view(*str_in));
+    thir_free(mut_view(*thir));
+    assert_true(sink.errors == 0, 25);
+}
+
+pub fn main() -> i32 {
+    let mut arena: Arena = arena_new();
+    let mut str_in: StrInterner = interner_new();
+    let sink_ptr = arena_alloc_raw(mut_view(arena), size_of<DiagSink>(), align_of<DiagSink>()) as *mut DiagSink;
+    let thir_ptr = arena_alloc_raw(mut_view(arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    unsafe {
+        diag_sink_init(mut_view(*sink_ptr));
+        test_move_and_partial_move(
+            mut_view(arena),
+            mut_view(str_in),
+            mut_view(*sink_ptr),
+            mut_view(*thir_ptr)
+        );
+        test_unsafe_checker(
+            mut_view(arena),
+            mut_view(str_in),
+            mut_view(*sink_ptr),
+            mut_view(*thir_ptr)
+        );
+        diag_sink_free(mut_view(*sink_ptr));
+    }
+    interner_free(mut_view(str_in));
+    arena_destroy(mut_view(arena));
+    print("OK Own Init\n");
+    0
+}

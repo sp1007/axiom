@@ -4,76 +4,64 @@
 Assembles selfhost test bundles in tests/selfhost/own_mir_verify/ that test the
 integrated compiler.own_mir_verify session pipeline against axiom0 and cdriver_drop_oracle:
 
-  - qa_own_mir_diff_build_a.ax, qa_own_mir_diff_build_b.ax:
-      9 fixtures in tests/mir/build/*.ax (pre-drop MIR vs `axiom0 inspect --emit=mir`,
-      post-drop MIR vs `cdriver_drop_oracle`, plus unsafe_check, verify_mir, own_check,
-      verify_mir_own, verify_mir_cap, and verify_mir_drop_flags).
-  - qa_own_mir_diff_drop_a.ax, qa_own_mir_diff_drop_b.ax:
-      9 fixtures in tests/selfhost/drop/fixtures/*.ax (pre-drop MIR, post-drop MIR,
-      synthetic glue destructor MIR, plus full own/verify pipeline).
-  - qa_own_mir_diff_diag_own_a.ax, qa_own_mir_diff_diag_own_b.ax:
-      11 negative fixtures in tests/ui/own/*.ax (diagnostic codes, `moved here` labels,
-      byte-for-byte human diagnostic rendering vs `axiom0 check`, and JSON rendering).
-  - qa_own_mir_diff_diag_init.ax:
-      7 negative fixtures in tests/ui/init/*.ax (definite-initialization & partial-init
-      diagnostics vs `axiom0 check`).
-  - qa_own_mir_diff_diag_cap_ptr.ax:
-      8 negative fixtures in tests/ui/cap/*.ax and tests/ui/ptr/*.ax (capability conflicts,
-      view escape/outlives, unsafe required vs `axiom0 check`).
-  - qa_own_mir_diff_diag_verify_mir.ax:
-      21 `.mir` verifier corpus fixtures in tests/verify/**/*.mir via
-      `session_verify_mir_text_and_render_human`.
+  - qa_own_mir_diff_build_a.ax, qa_own_mir_diff_build_b.ax
+  - qa_own_mir_diff_drop_a.ax, qa_own_mir_diff_drop_b.ax
+  - qa_own_mir_diff_diag_own_a.ax, qa_own_mir_diff_diag_own_b.ax
+  - qa_own_mir_diff_diag_init.ax
+  - qa_own_mir_diff_diag_cap_ptr.ax
+  - qa_own_mir_diff_diag_verify_mir.ax
 
 Usage:
   python tests/selfhost/own_mir_verify/gen_own_mir_verify_tests.py \
-      [--axiom0 <path/to/axiom0.exe>] [--oracle <path/to/ct_selfhost_drop_cdriver_drop_oracle.exe>]
+      [--axiom0 <path/to/axiom0.exe>] [--oracle <path/to/ct_selfhost_drop_cdriver_drop_oracle.exe>] [--check]
 """
 
 import os
-import re
 import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-REFERENCE_BUNDLE = "tests/selfhost/mir/qa_mir_builder_and_drop_a.ax"
+sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
+
+import bundle_common as bc  # noqa: E402
 
 MODULES = [
-    ("compiler.kernel.id", "ref"),
-    ("compiler.kernel.hash", "ref"),
-    ("compiler.kernel.arena", "ref"),
-    ("compiler.kernel.interner", "ref"),
-    ("compiler.source.span", "ref"),
-    ("compiler.source.manager", "ref"),
-    ("compiler.diag.code", "ref"),
-    ("compiler.diag.emitter", "ref"),
-    ("compiler.diag.format", "ref"),
-    ("compiler.diag.json", "ref"),
-    ("compiler.kernel_source_diag.session", "ref"),
-    ("compiler.lex.token", "ref"),
-    ("compiler.lex.scanner", "ref"),
-    ("compiler.lexer.session", "ref"),
-    ("compiler.syntax.ast", "ref"),
-    ("compiler.syntax.parse", "ref"),
-    ("compiler.parser.session", "ref"),
-    ("compiler.resolve.symtab", "ref"),
-    ("compiler.resolve.rib", "ref"),
-    ("compiler.resolve.resolver", "ref"),
-    ("compiler.hir.hir", "ref"),
-    ("compiler.hir.lower", "ref"),
-    ("compiler.resolve_hir.session", "ref"),
-    ("compiler.types.types", "ref"),
-    ("compiler.types.layout", "ref"),
-    ("compiler.types.exhaust", "ref"),
-    ("compiler.traits.solver", "ref"),
-    ("compiler.traits.mono", "ref"),
-    ("compiler.types.typeck", "ref"),
-    ("compiler.types", "ref"),
-    ("compiler.traits", "ref"),
-    ("compiler.typeck.session", "ref"),
-    ("compiler.typeck", "ref"),
-    ("compiler.typeck_traits.session", "ref"),
-    ("compiler.typeck_traits", "ref"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.lex.scanner", "compiler"),
+    ("compiler.lexer.session", "compiler"),
+    ("compiler.syntax.ast", "compiler"),
+    ("compiler.syntax.parse", "compiler"),
+    ("compiler.parser.session", "compiler"),
+    ("compiler.resolve.symtab", "compiler"),
+    ("compiler.resolve.rib", "compiler"),
+    ("compiler.resolve.resolver", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.hir.lower", "compiler"),
+    ("compiler.resolve_hir.session", "compiler"),
+    ("compiler.types.types", "compiler"),
+    ("compiler.types.layout", "compiler"),
+    ("compiler.types.exhaust", "compiler"),
+    ("compiler.traits.solver", "compiler"),
+    ("compiler.traits.mono", "compiler"),
+    ("compiler.types.typeck", "compiler"),
+    ("compiler.types", "compiler"),
+    ("compiler.traits", "compiler"),
+    ("compiler.typeck.session", "compiler"),
+    ("compiler.typeck", "compiler"),
+    ("compiler.typeck_traits.session", "compiler"),
+    ("compiler.typeck_traits", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
@@ -89,34 +77,7 @@ MODULES = [
     ("compiler.own_mir_verify", "compiler"),
 ]
 
-PRELUDE = """@link("kernel32")
-extern "system" {
-    fn GetProcessHeap() -> *mut u8;
-    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
-    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
-}
-
-const HEAP_ZERO_MEMORY: u32 = 8u32;
-const MIN_HEAP_ALLOC: usize = 16;
-
-pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
-    let h = GetProcessHeap();
-    if (h as usize) == 0 {
-        return 0 as *mut u8;
-    }
-    let alloc_bytes: usize = if size < MIN_HEAP_ALLOC { MIN_HEAP_ALLOC } else { size };
-    HeapAlloc(h, HEAP_ZERO_MEMORY, alloc_bytes)
-}
-
-pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
-    if (p as usize) != 0 {
-        let h = GetProcessHeap();
-        if (h as usize) != 0 {
-            HeapFree(h, 0u32, p);
-        }
-    }
-}
-"""
+PRELUDE = bc.build_prelude_text(include_sym_pad=True, sym_pad_count=800, include_std_sys=False, root=ROOT)
 
 MIR_BUILD_GROUPS = [
     ("build_a", "BUILD_A", [
@@ -240,11 +201,6 @@ def read_bytes(path):
         return f.read()
 
 
-def write_bytes(path, data):
-    with open(path, "wb") as f:
-        f.write(data)
-
-
 def byte_table(name, data):
     if not data:
         return "const %s: [1]u8 = [0u8];" % name
@@ -277,471 +233,8 @@ def code_table(name, codes):
     return "\n".join(lines)
 
 
-def adapt_own_module(name, src):
-    """Adapts compiler.own.* imports and keyword module names to the canonical compiler/* modules."""
-    src = src.replace("module compiler.own.move", "module compiler.own.move_ck")
-    src = src.replace("module compiler.own.unsafe", "module compiler.own.unsafe_ck")
-    src = src.replace("compiler.own.move.", "compiler.own.move_ck.")
-    src = src.replace("compiler.own.unsafe.", "compiler.own.unsafe_ck.")
-    if not name.startswith("compiler.own."):
-        return src
-    use_map = {
-        "use compiler.driver.str_intern.StrId": "use compiler.kernel.id.StrId",
-        "use compiler.driver.str_intern.StrInterner": "use compiler.kernel.interner.StrInterner",
-        "use compiler.driver.str_intern.StrView": "use compiler.kernel.interner.StrView",
-        "use compiler.driver.str_intern.interner_get": "use compiler.kernel.interner.interner_get",
-        "use compiler.driver.str_intern.interner_lookup": "use compiler.kernel.interner.interner_lookup_bytes",
-        "use compiler.driver.span.FileId": "use compiler.kernel.id.FileId",
-        "use compiler.driver.span.Span": "use compiler.source.span.Span",
-        "use compiler.hir.def_id.SymbolId": "use compiler.kernel.id.SymbolId",
-        "use compiler.typeck.ty.TypeId": "use compiler.kernel.id.TypeId",
-        "use compiler.hir.ast.BINOP_ADD": "use compiler.syntax.ast.BINOP_ADD",
-        "use compiler.hir.ast.BINOP_SUB": "use compiler.syntax.ast.BINOP_SUB",
-        "use compiler.hir.ast.UNOP_DEREF": "use compiler.syntax.ast.UNOP_DEREF",
-        "use compiler.diag.diag.DiagSeverity": "use compiler.diag.code.DiagSeverity",
-        "use compiler.diag.diag.DiagCode": "use compiler.diag.code.DiagCode",
-    }
-    drop_uses = {
-        "use compiler.hir.ast.HirField",
-        "use compiler.hir.ast.HirVariant",
-        "use compiler.hir.ast.HirCallArg",
-        "use compiler.hir.ast.HirFieldExpr",
-        "use compiler.typeck.ty.Type",
-    }
-    out_lines = []
-    for line in src.split("\n"):
-        s = line.strip()
-        if s in drop_uses:
-            continue
-        if s in use_map:
-            line = use_map[s]
-        elif s.startswith("use compiler.hir.ast."):
-            line = "use compiler.hir.hir." + s[len("use compiler.hir.ast."):]
-        elif s.startswith("use compiler.typeck.ty."):
-            line = "use compiler.types.types." + s[len("use compiler.typeck.ty."):]
-        elif s.startswith("use compiler.diag.codes."):
-            line = "use compiler.diag.code." + s[len("use compiler.diag.codes."):]
-        elif s.startswith("use compiler.diag.diag."):
-            line = "use compiler.diag.emitter." + s[len("use compiler.diag.diag."):]
-        out_lines.append(line)
-
-    res = "\n".join(out_lines)
-    res = res.replace("use compiler.kernel.arena.ArenaChunk", "use compiler.kernel.arena.arena_new")
-    res = res.replace("(*cap_init_p).head = 0 as *mut ArenaChunk;", "let cap_a = arena_new(); *cap_init_p = cap_a;")
-    res = res.replace("interner_lookup(", "interner_lookup_bytes(")
-    res = res.replace("if bb.terminator.expected {", "if bb.terminator.drop_is_explicit {")
-    res = res.replace("stmt.location", "stmt.span")
-    res = res.replace("(*st).location", "(*st).span")
-    res = res.replace("terminator.location", "terminator.span")
-    return res
-
-
-def compiler_module_files():
-    found = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
-        for fn in files:
-            if not fn.endswith(".ax"):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("module "):
-                        found[line.split()[1]] = path
-                        break
-    return found
-
-
-def reference_sections():
-    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
-    sections = {}
-    current = None
-    buf = []
-    for line in text.split("\n"):
-        if line.startswith("module "):
-            if current:
-                sections[current] = "\n".join(buf)
-            current = line.split()[1]
-            buf = [line]
-        elif current:
-            buf.append(line)
-    if current:
-        sections[current] = "\n".join(buf)
-    return sections
-
-
 def assemble_modules():
-    files = compiler_module_files()
-    ref = reference_sections()
-    parts = []
-    for name, origin in MODULES:
-        if origin == "compiler":
-            src = read_bytes(files[name]).decode("utf-8").replace("\r\n", "\n")
-            src = adapt_own_module(name, src)
-        else:
-            src = ref[name]
-        if name == "compiler.mir.builder":
-            src = src.replace(
-                "    b.curr_bb = mb_new_bb(mut_view(b), false);",
-                "    let entry_bb = mb_new_bb(mut_view(b), false);\n    b.curr_bb = entry_bb;",
-            )
-            src = src.replace(
-                "                        (*cur_bb_ptr).terminator.drop_place = mir_local_place(loc_id_v);",
-                "                        let dp = mir_local_place(loc_id_v);\n"
-                "                        (*cur_bb_ptr).terminator.drop_place = dp;",
-            )
-            src = src.replace(
-                "            rv.repeat_count = mb_eval_const_int_expr(view(*b), count_expr);",
-                "            let rep_cnt = mb_eval_const_int_expr(view(*b), count_expr);\n"
-                "            rv.repeat_count = rep_cnt;",
-            )
-        if name == "compiler.types.typeck":
-            src = src.replace(
-                "                            if (fty_node as usize) != 0 && (unsafe { (*fty_node).kind }) == HIR_TYPE_VIEW {\n"
-                "                                let _ = unsafe { type_error(mut_view(cx), view((*f).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP) };\n"
-                "                            }\n",
-                "",
-            )
-            src = src.replace(
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n"
-                "        let isym = unsafe { (*it).symbol };\n"
-                "        if isym.v != 0u32 {\n"
-                "            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }\n"
-                "        }\n",
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n",
-            )
-            src = src.replace(
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n"
-                "    if sink.errors == 0 {\n"
-                "        unsafe_check(hir_file, view(*thir), mut_view(*sink), view(*str_in));\n"
-                "    }\n",
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n",
-            )
-            src = src.replace(
-                "pub fn typeck_into(",
-                "// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait\n"
-                "// path `P` resolves to the prelude lang item `Drop`: `P` is the single segment `Drop` without generic\n"
-                "// arguments, and the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor\n"
-                "// binds the name `Drop` with a `use`. Same predicate as hir_impl_is_lang_drop (compiler/hir/lower.ax,\n"
-                "// documented there) and ax_hir_impl_is_lang_drop / the twin in bootstrap/axiom0/src/types/typeck.c.\n"
-                "fn tc_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {\n"
-                "    if id.v == 0u32 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sv = interner_get(interner, id);\n"
-                "    if sv.len != 4 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let b0 = unsafe { *(sv.ptr + 0) };\n"
-                "    let b1 = unsafe { *(sv.ptr + 1) };\n"
-                "    let b2 = unsafe { *(sv.ptr + 2) };\n"
-                "    let b3 = unsafe { *(sv.ptr + 3) };\n"
-                "    b0 == 68u8 && b1 == 114u8 && b2 == 111u8 && b3 == 112u8\n"
-                "}\n"
-                "\n"
-                "fn tc_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {\n"
-                "    let mut cur: *mut HirUseTree = t;\n"
-                "    while (cur as usize) != 0 {\n"
-                "        let count = unsafe { (*cur).path.count };\n"
-                "        if (unsafe { (*cur).subtrees as usize }) != 0 {\n"
-                "            if tc_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if (unsafe { (*cur).alias.v }) != 0u32 {\n"
-                "            if tc_name_is_drop(interner, unsafe { (*cur).alias }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if count > 0 {\n"
-                "            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;\n"
-                "            if tc_name_is_drop(interner, unsafe { *seg_ptr }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        }\n"
-                "        cur = unsafe { (*cur).next };\n"
-                "    }\n"
-                "    false\n"
-                "}\n"
-                "\n"
-                "fn tc_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {\n"
-                "    let count = unsafe { (*a).module_path.count };\n"
-                "    if count != (unsafe { (*b).module_path.count }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sa = unsafe { (*a).module_path.segments } as usize;\n"
-                "    let sb = unsafe { (*b).module_path.segments } as usize;\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < count {\n"
-                "        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "        let pa = (sa + off) as *const StrId;\n"
-                "        let pb = (sb + off) as *const StrId;\n"
-                "        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {\n"
-                "            return false;\n"
-                "        }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {\n"
-                "    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let tp: *mut HirType = unsafe { (*impl_item).trait_path };\n"
-                "    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.generic_args as usize }) != 0 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if !tc_name_is_drop(interner, unsafe { (*tp).path.name }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.span.file.v }) != 0u32 {\n"
-                "        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });\n"
-                "        if span_len != 4u32 {\n"
-                "            return false;\n"
-                "        }\n"
-                "    }\n"
-                "    let mut it: *mut HirItem = items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if tc_module_path_eq(it, impl_item) {\n"
-                "            let k = unsafe { (*it).kind };\n"
-                "            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {\n"
-                "                if tc_name_is_drop(interner, unsafe { (*it).name }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            } else if k == HIR_ITEM_USE {\n"
-                "                if tc_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_write_u32_dec(buf: *mut u8, start: usize, val: u32) -> usize {\n"
-                "    let mut tmp: [16]u8 = [0u8; 16];\n"
-                "    let mut dlen: usize = 0;\n"
-                "    let mut v = val;\n"
-                "    if v == 0u32 {\n"
-                "        unsafe { *(buf + start) = 48u8; }\n"
-                "        return start + 1;\n"
-                "    }\n"
-                "    while v > 0u32 {\n"
-                "        tmp[dlen] = (48u32 + (v % 10u32)) as u8;\n"
-                "        v = v / 10u32;\n"
-                "        dlen = dlen + 1;\n"
-                "    }\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < dlen {\n"
-                "        unsafe { *(buf + start + i) = tmp[dlen - 1 - i]; }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    start + dlen\n"
-                "}\n\n"
-                "fn tc_mangle_drop_impls(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>) {\n"
-                "    if (cx.str_in as usize) == 0 {\n"
-                "        return;\n"
-                "    }\n"
-                "    let mut drop_sym_counter: u32 = 0u32;\n"
-                "    let mut it: *mut HirItem = hir_file.items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {\n"
-                "            let tp: *mut HirType = unsafe { (*it).trait_path };\n"
-                "            let st: *mut HirType = unsafe { (*it).self_type };\n"
-                "            if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH {\n"
-                "                if tc_impl_is_lang_drop(hir_file.items, it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let mut sname = StrView { ptr: 0 as *const u8, len: 0 };\n"
-                "                    if (unsafe { (*st).path.name.v }) != 0u32 {\n"
-                "                        sname = unsafe { interner_get(view(*cx.str_in), (*st).path.name) };\n"
-                "                    } else if (cx.db as usize) != 0 {\n"
-                "                        let raw_s = unsafe { source_db_span_text(view(*cx.db), (*st).path.span) };\n"
-                "                        let mut lt: usize = 0;\n"
-                "                        while (lt) < (raw_s.len) {\n"
-                "                            if (unsafe { *(raw_s.ptr + lt) }) == 60u8 {\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            lt = lt + 1;\n"
-                "                        }\n"
-                "                        sname = StrView { ptr: raw_s.ptr, len: lt };\n"
-                "                    }\n"
-                "                    if sname.len > 0 {\n"
-                "                        let mut m: *mut HirItem = unsafe { (*it).members };\n"
-                "                        while (m as usize) != 0 {\n"
-                "                            if (unsafe { (*m).kind }) == HIR_ITEM_FN {\n"
-                "                                let mut mbuf: [256]u8 = [0u8; 256];\n"
-                "                                let buf_ptr = unsafe { address_of(mbuf[0]) as *mut u8 };\n"
-                "                                let copy_len: usize = if sname.len > 240 { 240 } else { sname.len };\n"
-                "                                unsafe {\n"
-                "                                    ptr_copy_nonoverlapping<u8>(sname.ptr, buf_ptr, copy_len);\n"
-                "                                    *(buf_ptr + copy_len) = 36u8;\n"
-                "                                    *(buf_ptr + copy_len + 1) = 100u8;\n"
-                "                                    *(buf_ptr + copy_len + 2) = 114u8;\n"
-                "                                    *(buf_ptr + copy_len + 3) = 111u8;\n"
-                "                                    *(buf_ptr + copy_len + 4) = 112u8;\n"
-                "                                }\n"
-                "                                let base_len = copy_len + 5;\n"
-                "                                let mut new_name = unsafe {\n"
-                "                                    interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, base_len)\n"
-                "                                };\n"
-                "                                let mut disambig: u32 = 1u32;\n"
-                "                                loop {\n"
-                "                                    let mut collision = false;\n"
-                "                                    let mut prev: *mut HirItem = hir_file.items;\n"
-                "                                    while (prev as usize) != 0 && (prev as usize) != (it as usize) {\n"
-                "                                        if (unsafe { (*prev).kind }) == HIR_ITEM_IMPL {\n"
-                "                                            let mut pm: *mut HirItem = unsafe { (*prev).members };\n"
-                "                                            while (pm as usize) != 0 {\n"
-                "                                                if (unsafe { (*pm).kind }) == HIR_ITEM_FN && (unsafe { (*pm).name.v }) == new_name.v {\n"
-                "                                                    collision = true;\n"
-                "                                                    break;\n"
-                "                                                }\n"
-                "                                                pm = unsafe { (*pm).next };\n"
-                "                                            }\n"
-                "                                        }\n"
-                "                                        if collision {\n"
-                "                                            break;\n"
-                "                                        }\n"
-                "                                        prev = unsafe { (*prev).next };\n"
-                "                                    }\n"
-                "                                    if !collision {\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    disambig = disambig + 1u32;\n"
-                "                                    unsafe { *(buf_ptr + base_len) = 36u8; }\n"
-                "                                    let dlen = tc_write_u32_dec(buf_ptr, base_len + 1, disambig);\n"
-                "                                    new_name = unsafe {\n"
-                "                                        interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, dlen)\n"
-                "                                    };\n"
-                "                                }\n"
-                "                                drop_sym_counter = drop_sym_counter + 1u32;\n"
-                "                                let new_sym_v = 0x70000000u32 + drop_sym_counter;\n"
-                "                                let old_name_v = unsafe { (*m).name.v };\n"
-                "                                let m_body = unsafe { (*m).body };\n"
-                "                                unsafe {\n"
-                "                                    (*m).name.v = new_name.v;\n"
-                "                                    (*m).symbol.v = new_sym_v;\n"
-                "                                }\n"
-                "                                let mut top: *mut HirItem = hir_file.items;\n"
-                "                                while (top as usize) != 0 {\n"
-                "                                    if (top as usize) != (m as usize) &&\n"
-                "                                       (unsafe { (*top).kind }) == HIR_ITEM_FN &&\n"
-                "                                       (unsafe { (*top).body as usize }) == (m_body as usize) &&\n"
-                "                                       (unsafe { (*top).name.v }) == old_name_v {\n"
-                "                                        unsafe {\n"
-                "                                            (*top).name.v = new_name.v;\n"
-                "                                            (*top).symbol.v = new_sym_v;\n"
-                "                                        }\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    top = unsafe { (*top).next };\n"
-                "                                }\n"
-                "                            }\n"
-                "                            m = unsafe { (*m).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "}\n\n"
-                "pub fn typeck_into(",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-            )
-            src = src.replace(
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    // Pass 1a0:",
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    tc_mangle_drop_impls(mut_view(cx), hir_file);\n\n"
-                "    // Pass 1a0:",
-            )
-            src = src.replace(
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "            let tp_node: *mut HirType = unsafe { (*top_it).trait_path };\n"
-                "            if (tp_node as usize) != 0 && impl_self_ty.v != 0u32 {\n"
-                "                if (cx.str_in as usize) != 0 && tc_impl_is_lang_drop(hir_file.items, top_it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let self_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: impl_self_ty.v })) };\n"
-                "                    if (self_t as usize) != 0 && (unsafe { (*self_t).kind }) == TY_STRUCT {\n"
-                "                        let mut dm: *mut HirItem = unsafe { (*top_it).members };\n"
-                "                        while (dm as usize) != 0 {\n"
-                "                            if (unsafe { (*dm).kind }) == HIR_ITEM_FN {\n"
-                "                                let tk_key = ((impl_self_ty.v as usize) << 1) | 1;\n"
-                "                                unsafe {\n"
-                "                                    ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), tk_key, dm);\n"
-                "                                }\n"
-                "                                let def_ptr = unsafe { (*self_t).def };\n"
-                "                                if (def_ptr as usize) != 0 {\n"
-                "                                    let dk_key = (def_ptr as usize) | 1;\n"
-                "                                    unsafe {\n"
-                "                                        ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), dk_key, dm);\n"
-                "                                    }\n"
-                "                                }\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            dm = unsafe { (*dm).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-            )
-        if name == "compiler.kernel.id":
-            src = src.replace(
-                "use std.core.host.heap_alloc\nuse std.core.host.heap_free",
-                "@intrinsic pub unsafe fn heap_alloc(size: usize, align: usize) -> *mut u8 { 0 as *mut u8 }\n"
-                "@intrinsic pub unsafe fn heap_free(p: *mut u8, size: usize, align: usize) {}",
-            )
-        else:
-            src = src.replace("use std.core.host.heap_alloc", "use compiler.kernel.id.heap_alloc")
-            src = src.replace("use std.core.host.heap_free", "use compiler.kernel.id.heap_free")
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
+    return bc.assemble_compiler_modules(MODULES, root=ROOT)
 
 
 def find_exe(default_rels):
@@ -813,20 +306,27 @@ def build_mir_diff_bundle(modules_text, group, upper, items, native_only):
     ) % (modes_line, upper, len(items))
     full_text = header + PRELUDE + "\n" + modules_text + "\n" + main_src
     out_path = os.path.join(HERE, "qa_own_mir_diff_%s.ax" % group)
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text
 
 
 def build_diag_diff_bundle(modules_text, axiom0, group, upper, ax_cases, mir_cases, native_only):
+    out_path = os.path.join(HERE, "qa_own_mir_diff_diag_%s.ax" % group)
+    old_ax_blobs = None
+    if not axiom0 and ax_cases and os.path.isfile(out_path):
+        old_ax_blobs = bc.extract_blobs_from_bundle(out_path, "AX_DATA", "AX_OFF")
+
     ax_blobs = []
     ax_counts = []
     ax_code_offs = [0]
     ax_codes = []
     ax_moved_lbl = []
 
-    for rel_path, codes, has_moved_lbl in ax_cases:
+    for idx, (rel_path, codes, has_moved_lbl) in enumerate(ax_cases):
         src_bytes = read_bytes(os.path.join(ROOT, *rel_path.split("/"))).replace(b"\r\n", b"\n")
-        exp_human = run_axiom0_check_stderr(axiom0, rel_path)
+        if axiom0:
+            exp_human = run_axiom0_check_stderr(axiom0, rel_path)
+        else:
+            exp_human = old_ax_blobs[3 * idx + 2]
         ax_blobs.append(rel_path.encode("utf-8"))
         ax_blobs.append(src_bytes)
         ax_blobs.append(exp_human)
@@ -888,40 +388,39 @@ def build_diag_diff_bundle(modules_text, axiom0, group, upper, ax_cases, mir_cas
         "// Generated by tests/selfhost/own_mir_verify/gen_own_mir_verify_tests.py; do not edit.\n\n"
     ) % (modes_line, upper, len(ax_cases), len(mir_cases))
     full_text = header + PRELUDE + "\n" + modules_text + "\n" + main_src
-    out_path = os.path.join(HERE, "qa_own_mir_diff_diag_%s.ax" % group)
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text
 
 
 def main():
-    axiom0 = find_exe([
-        "build-snap-T082/build/axiom0.exe",
-        "build/axiom0.exe",
-    ])
-    oracle = find_exe([
-        "build-snap-T082/build/tests/ct_selfhost_drop_cdriver_drop_oracle.exe",
-        "build/tests/ct_selfhost_drop_cdriver_drop_oracle.exe",
-    ])
     args = sys.argv[1:]
+    check_mode = "--check" in args or "check" in args
+    axiom0 = None
+    oracle = None
     if "--axiom0" in args:
         axiom0 = args[args.index("--axiom0") + 1]
     if "--oracle" in args:
         oracle = args[args.index("--oracle") + 1]
-    if not axiom0 or not oracle:
-        raise SystemExit("could not locate axiom0.exe or ct_selfhost_drop_cdriver_drop_oracle.exe")
 
     modules_text = assemble_modules()
+    outs = []
 
     for group, upper, names, native_only in MIR_BUILD_GROUPS:
+        out_path = os.path.join(HERE, "qa_own_mir_diff_%s.ax" % group)
+        old_blobs = None
+        if not oracle and os.path.isfile(out_path):
+            old_blobs = bc.extract_blobs_from_bundle(out_path, "CASE_DATA", "CASE_OFF")
         items = []
-        for name in names:
+        for idx, name in enumerate(names):
             rel_ax = "tests/mir/build/%s.ax" % name
             rel_mir = "tests/mir/build/%s.mir" % name
             src_bytes = read_bytes(os.path.join(ROOT, *rel_ax.split("/"))).replace(b"\r\n", b"\n")
             pre_bytes = read_bytes(os.path.join(ROOT, *rel_mir.split("/"))).replace(b"\r\n", b"\n")
-            drop_bytes = run_oracle_drop(oracle, rel_ax)
+            if oracle:
+                drop_bytes = run_oracle_drop(oracle, rel_ax)
+            else:
+                drop_bytes = old_blobs[5 * idx + 3]
             items.append((rel_ax, src_bytes, pre_bytes, drop_bytes, b"", False, False))
-        build_mir_diff_bundle(modules_text, group, upper, items, native_only)
+        outs.append(build_mir_diff_bundle(modules_text, group, upper, items, native_only))
 
     prelude_drop_cases = {"d03_struct_fields", "d09_closures", "d10_destructor", "d11_qa_edges"}
     for group, upper, names, native_only in DROP_GROUPS:
@@ -937,12 +436,12 @@ def main():
             synth_bytes = read_bytes(synth_path).replace(b"\r\n", b"\n") if has_synth else b""
             needs_prelude = name in prelude_drop_cases
             items.append((rel_ax, src_bytes, pre_bytes, drop_bytes, synth_bytes, has_synth, needs_prelude))
-        build_mir_diff_bundle(modules_text, group, upper, items, native_only)
+        outs.append(build_mir_diff_bundle(modules_text, group, upper, items, native_only))
 
     for group, upper, ax_cases, mir_cases, native_only in DIAG_GROUPS:
-        build_diag_diff_bundle(modules_text, axiom0, group, upper, ax_cases, mir_cases, native_only)
+        outs.append(build_diag_diff_bundle(modules_text, axiom0, group, upper, ax_cases, mir_cases, native_only))
 
-    return 0
+    return bc.write_or_check_bundles(outs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":

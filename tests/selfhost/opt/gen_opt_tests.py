@@ -11,23 +11,24 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
-REFERENCE_BUNDLE = "tests/selfhost/mir/qa_mir_builder_and_drop_a.ax"
+import bundle_common as bc  # noqa: E402
 
 CORE_MODULES = [
-    ("compiler.kernel.id", "reference"),
-    ("compiler.kernel.hash", "reference"),
-    ("compiler.kernel.arena", "reference"),
-    ("compiler.kernel.interner", "reference"),
-    ("compiler.source.span", "reference"),
-    ("compiler.source.manager", "reference"),
-    ("compiler.diag.code", "reference"),
-    ("compiler.diag.emitter", "reference"),
-    ("compiler.diag.format", "reference"),
-    ("compiler.lex.token", "reference"),
-    ("compiler.syntax.ast", "reference"),
-    ("compiler.hir.hir", "reference"),
-    ("compiler.types.types", "reference"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.syntax.ast", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.types.types", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.verify.verifier", "compiler"),
@@ -39,41 +40,41 @@ CORE_MODULES = [
 ]
 
 PIPELINE_MODULES = [
-    ("compiler.kernel.id", "reference"),
-    ("compiler.kernel.hash", "reference"),
-    ("compiler.kernel.arena", "reference"),
-    ("compiler.kernel.interner", "reference"),
-    ("compiler.source.span", "reference"),
-    ("compiler.source.manager", "reference"),
-    ("compiler.diag.code", "reference"),
-    ("compiler.diag.emitter", "reference"),
-    ("compiler.diag.format", "reference"),
-    ("compiler.diag.json", "reference"),
-    ("compiler.kernel_source_diag.session", "reference"),
-    ("compiler.lex.token", "reference"),
-    ("compiler.lex.scanner", "reference"),
-    ("compiler.lexer.session", "reference"),
-    ("compiler.syntax.ast", "reference"),
-    ("compiler.syntax.parse", "reference"),
-    ("compiler.parser.session", "reference"),
-    ("compiler.resolve.symtab", "reference"),
-    ("compiler.resolve.rib", "reference"),
-    ("compiler.resolve.resolver", "reference"),
-    ("compiler.hir.hir", "reference"),
-    ("compiler.hir.lower", "reference"),
-    ("compiler.resolve_hir.session", "reference"),
-    ("compiler.types.types", "reference"),
-    ("compiler.types.layout", "reference"),
-    ("compiler.types.exhaust", "reference"),
-    ("compiler.traits.solver", "reference"),
-    ("compiler.traits.mono", "reference"),
-    ("compiler.types.typeck", "reference"),
-    ("compiler.types", "reference"),
-    ("compiler.traits", "reference"),
-    ("compiler.typeck.session", "reference"),
-    ("compiler.typeck", "reference"),
-    ("compiler.typeck_traits.session", "reference"),
-    ("compiler.typeck_traits", "reference"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.lex.scanner", "compiler"),
+    ("compiler.lexer.session", "compiler"),
+    ("compiler.syntax.ast", "compiler"),
+    ("compiler.syntax.parse", "compiler"),
+    ("compiler.parser.session", "compiler"),
+    ("compiler.resolve.symtab", "compiler"),
+    ("compiler.resolve.rib", "compiler"),
+    ("compiler.resolve.resolver", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.hir.lower", "compiler"),
+    ("compiler.resolve_hir.session", "compiler"),
+    ("compiler.types.types", "compiler"),
+    ("compiler.types.layout", "compiler"),
+    ("compiler.types.exhaust", "compiler"),
+    ("compiler.traits.solver", "compiler"),
+    ("compiler.traits.mono", "compiler"),
+    ("compiler.types.typeck", "compiler"),
+    ("compiler.types", "compiler"),
+    ("compiler.traits", "compiler"),
+    ("compiler.typeck.session", "compiler"),
+    ("compiler.typeck", "compiler"),
+    ("compiler.typeck_traits.session", "compiler"),
+    ("compiler.typeck_traits", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
@@ -86,35 +87,7 @@ PIPELINE_MODULES = [
     ("compiler.opt", "compiler"),
 ]
 
-PRELUDE = """\
-@link("kernel32")
-extern "system" {
-    fn GetProcessHeap() -> *mut u8;
-    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
-    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
-}
-
-const HEAP_ZERO_MEMORY: u32 = 8u32;
-const MIN_HEAP_ALLOC: usize = 16;
-
-pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
-    let h = GetProcessHeap();
-    if (h as usize) == 0 {
-        return 0 as *mut u8;
-    }
-    let alloc_bytes: usize = if size < MIN_HEAP_ALLOC { MIN_HEAP_ALLOC } else { size };
-    HeapAlloc(h, HEAP_ZERO_MEMORY, alloc_bytes)
-}
-
-pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
-    if (p as usize) != 0 {
-        let h = GetProcessHeap();
-        if (h as usize) != 0 {
-            HeapFree(h, 0u32, p);
-        }
-    }
-}
-"""
+PRELUDE = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=ROOT)
 
 
 def read_bytes(path):
@@ -127,47 +100,8 @@ def write_bytes(path, data):
         f.write(data)
 
 
-def compiler_module_files():
-    found = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
-        for fn in files:
-            if not fn.endswith(".ax"):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("module "):
-                        found[line.split()[1]] = path
-                        break
-    return found
-
-
-def reference_sections():
-    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
-    sections = {}
-    current = None
-    buf = []
-    for line in text.split("\n"):
-        if line.startswith("module "):
-            if current:
-                sections[current] = "\n".join(buf)
-            current = line.split()[1]
-            buf = [line]
-        elif current:
-            buf.append(line)
-    if current:
-        sections[current] = "\n".join(buf)
-    return sections
-
-
 def assemble_modules(mod_list):
-    files = compiler_module_files()
-    ref = reference_sections()
-    parts = []
-    for name, origin in mod_list:
-        src = read_bytes(files[name]).decode("utf-8") if origin == "compiler" else ref[name]
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
+    return bc.assemble_compiler_modules(mod_list, root=ROOT)
 
 
 def byte_table(name, data):
@@ -1049,8 +983,7 @@ def build_qa_opt_unit():
     )
     full_text = header + PRELUDE + "\n" + assemble_modules(CORE_MODULES) + "\n" + main_src
     out_path = os.path.join(HERE, "qa_opt_unit.ax")
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text
 
 
 def build_qa_opt_pipeline():
@@ -1064,14 +997,16 @@ def build_qa_opt_pipeline():
     )
     full_text = header + PRELUDE + "\n" + assemble_modules(PIPELINE_MODULES) + "\n" + main_src
     out_path = os.path.join(HERE, "qa_opt_pipeline.ax")
-    write_bytes(out_path, full_text.encode("utf-8"))
-    print("wrote", os.path.relpath(out_path, ROOT).replace(os.sep, "/"))
+    return out_path, full_text
 
 
 def main():
-    build_qa_opt_unit()
-    build_qa_opt_pipeline()
-    return 0
+    check_mode = "--check" in sys.argv[1:] or "check" in sys.argv[1:]
+    outs = [
+        build_qa_opt_unit(),
+        build_qa_opt_pipeline(),
+    ]
+    return bc.write_or_check_bundles(outs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":

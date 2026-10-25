@@ -46,67 +46,60 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
-REFERENCE_BUNDLE = "tests/selfhost/lir/qa_lir_from_ax_a.ax"
-
-STD_SYS_WINDOWS_FILES = [
-    "std/sys/windows/heap.ax",
-    "std/sys/windows/io.ax",
-    "std/sys/windows/fs.ax",
-    "std/sys/windows/process.ax",
-    "std/sys/windows/time.ax",
-]
+sys.path.insert(0, os.path.abspath(os.path.join(HERE, "..")))
+import bundle_common as bc
 
 LIGHT_MODULES = [
-    ("compiler.kernel.id", "ref"),
-    ("compiler.kernel.hash", "ref"),
-    ("compiler.kernel.arena", "ref"),
-    ("compiler.kernel.interner", "ref"),
-    ("compiler.source.span", "ref"),
-    ("compiler.source.manager", "ref"),
-    ("compiler.diag.code", "ref"),
-    ("compiler.diag.emitter", "ref"),
-    ("compiler.diag.format", "ref"),
-    ("compiler.diag.json", "ref"),
-    ("compiler.kernel_source_diag.session", "ref"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
     ("compiler.driver.opts", "compiler"),
 ]
 
 FULL_MODULES = [
-    ("compiler.kernel.id", "ref"),
-    ("compiler.kernel.hash", "ref"),
-    ("compiler.kernel.arena", "ref"),
-    ("compiler.kernel.interner", "ref"),
-    ("compiler.source.span", "ref"),
-    ("compiler.source.manager", "ref"),
-    ("compiler.diag.code", "ref"),
-    ("compiler.diag.emitter", "ref"),
-    ("compiler.diag.format", "ref"),
-    ("compiler.diag.json", "ref"),
-    ("compiler.kernel_source_diag.session", "ref"),
-    ("compiler.lex.token", "ref"),
-    ("compiler.lex.scanner", "ref"),
-    ("compiler.lexer.session", "ref"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.lex.scanner", "compiler"),
+    ("compiler.lexer.session", "compiler"),
     ("compiler.syntax.ast", "compiler"),
-    ("compiler.syntax.parse", "ref"),
-    ("compiler.parser.session", "ref"),
-    ("compiler.resolve.symtab", "ref"),
-    ("compiler.resolve.rib", "ref"),
-    ("compiler.resolve.resolver", "ref"),
-    ("compiler.hir.hir", "ref"),
-    ("compiler.hir.lower", "ref"),
-    ("compiler.resolve_hir.session", "ref"),
-    ("compiler.types.types", "ref"),
-    ("compiler.types.layout", "ref"),
-    ("compiler.types.exhaust", "ref"),
-    ("compiler.traits.solver", "ref"),
-    ("compiler.traits.mono", "ref"),
-    ("compiler.types.typeck", "ref"),
-    ("compiler.types", "ref"),
-    ("compiler.traits", "ref"),
-    ("compiler.typeck.session", "ref"),
-    ("compiler.typeck", "ref"),
-    ("compiler.typeck_traits.session", "ref"),
-    ("compiler.typeck_traits", "ref"),
+    ("compiler.syntax.parse", "compiler"),
+    ("compiler.parser.session", "compiler"),
+    ("compiler.resolve.symtab", "compiler"),
+    ("compiler.resolve.rib", "compiler"),
+    ("compiler.resolve.resolver", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.hir.lower", "compiler"),
+    ("compiler.resolve_hir.session", "compiler"),
+    ("compiler.types.types", "compiler"),
+    ("compiler.types.layout", "compiler"),
+    ("compiler.types.exhaust", "compiler"),
+    ("compiler.traits.solver", "compiler"),
+    ("compiler.traits.mono", "compiler"),
+    ("compiler.types.typeck", "compiler"),
+    ("compiler.types", "compiler"),
+    ("compiler.traits", "compiler"),
+    ("compiler.typeck.session", "compiler"),
+    ("compiler.typeck", "compiler"),
+    ("compiler.typeck_traits.session", "compiler"),
+    ("compiler.typeck_traits", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
@@ -177,888 +170,11 @@ def byte_table(name, data):
 
 
 def build_prelude_text():
-    pad_variants = ", ".join("V%d" % i for i in range(800))
-    host_src = read_bytes(os.path.join(ROOT, "std/core/host.ax")).decode("utf-8").replace("\r\n", "\n")
-    host_src = host_src.replace("module std.core.host", "module host_intrinsics")
-    parts = [
-        "module __ax_sym_pad\n"
-        "enum __AxSymPad { %s }\n"
-        "struct __AxPtrPad { p0: *const u8, p1: *mut u8, p2: *mut *mut u8, p3: *const *const u8 }\n"
-        % pad_variants,
-        host_src.rstrip("\n") + "\n",
-    ]
-    for rel in STD_SYS_WINDOWS_FILES:
-        src = read_bytes(os.path.join(ROOT, rel)).decode("utf-8").replace("\r\n", "\n")
-        if rel == "std/sys/windows/heap.ax":
-            src = (
-                "module host_sys_heap\n"
-                "@link(\"kernel32\")\n"
-                "extern \"system\" {\n"
-                "    fn GetProcessHeap() -> *mut u8;\n"
-                "    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;\n"
-                "    fn HeapReAlloc(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8, dwBytes: usize) -> *mut u8;\n"
-                "    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {\n"
-                "    let h = GetProcessHeap();\n"
-                "    if (h as usize) == 0 { return 0 as *mut u8; }\n"
-                "    let alloc_bytes: usize = if size < 16 { 16 } else { size };\n"
-                "    HeapAlloc(h, 8u32, alloc_bytes)\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_realloc(p: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {\n"
-                "    if (p as usize) == 0 { return __ax_host_heap_alloc(new_size, align); }\n"
-                "    let h = GetProcessHeap();\n"
-                "    if (h as usize) == 0 { return 0 as *mut u8; }\n"
-                "    let alloc_bytes: usize = if new_size < 16 { 16 } else { new_size };\n"
-                "    HeapReAlloc(h, 8u32, p, alloc_bytes)\n"
-                "}\n"
-                "pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {\n"
-                "    if (p as usize) != 0 {\n"
-                "        let h = GetProcessHeap();\n"
-                "        if (h as usize) != 0 { HeapFree(h, 0u32, p); }\n"
-                "    }\n"
-                "}\n"
-            )
-        else:
-            src = src.replace("module std.sys.windows.", "module host_sys_")
-            src = src.replace("let len = GetEnvironmentVariableW", "let vlen = GetEnvironmentVariableW")
-            src = src.replace("if len > 0 {", "if vlen > 0 {")
-            src = src.replace("while idx < len as usize {", "while idx < vlen as usize {")
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
-
-
-def adapt_own_module(name, src):
-    """Adapts compiler.own.* imports and keyword module names to canonical compiler/* modules."""
-    src = src.replace("module compiler.own.move", "module compiler.own.move_ck")
-    src = src.replace("module compiler.own.unsafe", "module compiler.own.unsafe_ck")
-    src = src.replace("compiler.own.move.", "compiler.own.move_ck.")
-    src = src.replace("compiler.own.unsafe.", "compiler.own.unsafe_ck.")
-    if not name.startswith("compiler.own."):
-        return src
-    use_map = {
-        "use compiler.driver.str_intern.StrId": "use compiler.kernel.id.StrId",
-        "use compiler.driver.str_intern.StrInterner": "use compiler.kernel.interner.StrInterner",
-        "use compiler.driver.str_intern.StrView": "use compiler.kernel.interner.StrView",
-        "use compiler.driver.str_intern.interner_get": "use compiler.kernel.interner.interner_get",
-        "use compiler.driver.str_intern.interner_lookup": "use compiler.kernel.interner.interner_lookup_bytes",
-        "use compiler.driver.span.FileId": "use compiler.kernel.id.FileId",
-        "use compiler.driver.span.Span": "use compiler.source.span.Span",
-        "use compiler.hir.def_id.SymbolId": "use compiler.kernel.id.SymbolId",
-        "use compiler.typeck.ty.TypeId": "use compiler.kernel.id.TypeId",
-        "use compiler.hir.ast.BINOP_ADD": "use compiler.syntax.ast.BINOP_ADD",
-        "use compiler.hir.ast.BINOP_SUB": "use compiler.syntax.ast.BINOP_SUB",
-        "use compiler.hir.ast.UNOP_DEREF": "use compiler.syntax.ast.UNOP_DEREF",
-        "use compiler.diag.diag.DiagSeverity": "use compiler.diag.code.DiagSeverity",
-        "use compiler.diag.diag.DiagCode": "use compiler.diag.code.DiagCode",
-    }
-    drop_uses = {
-        "use compiler.hir.ast.HirField",
-        "use compiler.hir.ast.HirVariant",
-        "use compiler.hir.ast.HirCallArg",
-        "use compiler.hir.ast.HirFieldExpr",
-        "use compiler.typeck.ty.Type",
-    }
-    out_lines = []
-    for line in src.split("\n"):
-        s = line.strip()
-        if s in drop_uses:
-            continue
-        if s in use_map:
-            line = use_map[s]
-        elif s.startswith("use compiler.hir.ast."):
-            line = "use compiler.hir.hir." + s[len("use compiler.hir.ast."):]
-        elif s.startswith("use compiler.typeck.ty."):
-            line = "use compiler.types.types." + s[len("use compiler.typeck.ty."):]
-        elif s.startswith("use compiler.diag.codes."):
-            line = "use compiler.diag.code." + s[len("use compiler.diag.codes."):]
-        elif s.startswith("use compiler.diag.diag."):
-            line = "use compiler.diag.emitter." + s[len("use compiler.diag.diag."):]
-        out_lines.append(line)
-
-    res = "\n".join(out_lines)
-    res = res.replace("use compiler.kernel.arena.ArenaChunk", "use compiler.kernel.arena.arena_new")
-    res = res.replace("(*cap_init_p).head = 0 as *mut ArenaChunk;", "let cap_a = arena_new();\n*cap_init_p = cap_a;")
-    res = res.replace("interner_lookup(", "interner_lookup_bytes(")
-    res = res.replace("if bb.terminator.expected {", "if bb.terminator.drop_is_explicit {")
-    res = res.replace("stmt.location", "stmt.span")
-    res = res.replace("(*st).location", "(*st).span")
-    res = res.replace("terminator.location", "terminator.span")
-    return res
-
-
-def compiler_module_files():
-    found = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
-        for fn in files:
-            if not fn.endswith(".ax"):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("module "):
-                        found[line.split()[1]] = path
-                        break
-    return found
-
-
-def reference_sections():
-    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
-    sections = {}
-    current = None
-    buf = []
-    for line in text.split("\n"):
-        if line.startswith("module "):
-            if current:
-                sections[current] = "\n".join(buf)
-            current = line.split()[1]
-            buf = [line]
-        elif current:
-            buf.append(line)
-    if current:
-        sections[current] = "\n".join(buf)
-    return sections
+    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=800, include_std_sys=True, root=ROOT)
 
 
 def assemble_modules(mod_list):
-    files = compiler_module_files()
-    ref = reference_sections()
-    parts = []
-    for name, origin in mod_list:
-        if origin == "compiler":
-            src = read_bytes(files[name]).decode("utf-8").replace("\r\n", "\n")
-            src = adapt_own_module(name, src)
-        else:
-            src = ref[name]
-        if name == "compiler.syntax.ast":
-            src = src.replace(
-                "pub fn ax_ast_render(ast: view<Ast>,",
-                "pub fn ax_ast_render(ast_root: view<Ast>,",
-            ).replace(
-                "d_item(mut_view(st), ast.items as *const AstItem);",
-                "d_item(mut_view(st), ast_root.items as *const AstItem);",
-            )
-        if name == "compiler.kernel.hash":
-            src = src.replace(
-                "@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }",
-                "fn wrapping_add_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a_lo = a & 0xFFFFFFFFu64;\n"
-                "    let a_hi = (a >> 32u64) & 0xFFFFFFFFu64;\n"
-                "    let b_lo = b & 0xFFFFFFFFu64;\n"
-                "    let b_hi = (b >> 32u64) & 0xFFFFFFFFu64;\n"
-                "    let sum_lo = a_lo + b_lo;\n"
-                "    let carry = sum_lo >> 32u64;\n"
-                "    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;\n"
-                "    (sum_hi << 32u64) | (sum_lo & 0xFFFFFFFFu64)\n"
-                "}\n"
-                "fn mul_u16_hash(x: u64, y: u64) -> u64 {\n"
-                "    ((x as i64) * (y as i64)) as u64\n"
-                "}\n"
-                "fn wrapping_mul_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a0 = a & 0xFFFFu64;\n"
-                "    let a1 = (a >> 16u64) & 0xFFFFu64;\n"
-                "    let a2 = (a >> 32u64) & 0xFFFFu64;\n"
-                "    let a3 = (a >> 48u64) & 0xFFFFu64;\n"
-                "    let b0 = b & 0xFFFFu64;\n"
-                "    let b1 = (b >> 16u64) & 0xFFFFu64;\n"
-                "    let b2 = (b >> 32u64) & 0xFFFFu64;\n"
-                "    let b3 = (b >> 48u64) & 0xFFFFu64;\n"
-                "    let c0 = mul_u16_hash(a0, b0);\n"
-                "    let c1 = (c0 >> 16u64) + mul_u16_hash(a0, b1) + mul_u16_hash(a1, b0);\n"
-                "    let c2 = (c1 >> 16u64) + mul_u16_hash(a0, b2) + mul_u16_hash(a1, b1) + mul_u16_hash(a2, b0);\n"
-                "    let c3 = ((c2 >> 16u64) + mul_u16_hash(a0, b3) + mul_u16_hash(a1, b2) + mul_u16_hash(a2, b1) + mul_u16_hash(a3, b0)) & 0xFFFFu64;\n"
-                "    (c0 & 0xFFFFu64) | ((c1 & 0xFFFFu64) << 16u64) | ((c2 & 0xFFFFu64) << 32u64) | (c3 << 48u64)\n"
-                "}\n"
-                "fn rotate_left_u64(x: u64, n: u32) -> u64 {\n"
-                "    let s = (n & 63u32) as u64;\n"
-                "    if s == 0u64 { x } else { (x << s) | (x >> (64u64 - s)) }\n"
-                "}",
-            )
-        if name == "compiler.types.types":
-            src = src.replace(
-                "@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }\n"
-                "@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }",
-                "fn wrapping_add_u64(a: u64, b: u64) -> u64 {\n"
-                "    let a_lo = a & 0xFFFFFFFFu64;\n"
-                "    let a_hi = a >> 32u32;\n"
-                "    let b_lo = b & 0xFFFFFFFFu64;\n"
-                "    let b_hi = b >> 32u32;\n"
-                "    let sum_lo = a_lo + b_lo;\n"
-                "    let carry = sum_lo >> 32u32;\n"
-                "    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;\n"
-                "    (sum_hi << 32u32) | (sum_lo & 0xFFFFFFFFu64)\n"
-                "}\n"
-                "fn rotate_left_u64(x: u64, n: u32) -> u64 {\n"
-                "    let s = (n & 63u32) as u64;\n"
-                "    if s == 0u64 { x } else { (x << s) | (x >> (64u64 - s)) }\n"
-                "}",
-            )
-        if name == "compiler.verify.verifier":
-            src = src.replace(
-                "val = val * 10u64 + ((c - 48u8) as u64);",
-                "val = (((val as i64) * 10i64) as u64) + ((c - 48u8) as u64);",
-            )
-        if name == "compiler.own_mir_verify.session":
-            src = src.replace(
-                "i * size_of<TypeId>()",
-                "(((i as isize) * (size_of<TypeId>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "i * size_of<usize>()",
-                "(((i as isize) * (size_of<usize>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "i * size_of<*mut TypeId>()",
-                "(((i as isize) * (size_of<*mut TypeId>() as isize)) as usize)",
-            )
-            src = src.replace(
-                "j * size_of<TypeId>()",
-                "(((j as isize) * (size_of<TypeId>() as isize)) as usize)",
-            )
-        if name == "compiler.mir.mir":
-            src = src.replace(
-                "        if mp_match_bytes(mut_view(*p), 541, 1) {\n"
-                "            let cty = mp_parse_type(mut_view(*p), mut_view(*interner), type_map);\n"
-                "            out.constant.ty.v = cty.v;\n"
-                "        }\n"
-                "    }\n"
-                "}",
-                "        if mp_match_bytes(mut_view(*p), 541, 1) {\n"
-                "            let cty = mp_parse_type(mut_view(*p), mut_view(*interner), type_map);\n"
-                "            out.constant.ty.v = cty.v;\n"
-                "        }\n"
-                "    } else {\n"
-                "        out.kind = MIR_OP_COPY;\n"
-                "        mp_parse_place(mut_view(*p), mut_view(*arena), mut_view(out.place));\n"
-                "    }\n"
-                "}",
-            )
-        if name == "compiler.mir.builder":
-            src = src.replace(
-                "use compiler.lex.token.TOK_BYTE_STR",
-                "use compiler.lex.token.TOK_BYTE_STR\nuse compiler.lex.token.TOK_FLAG_BYTE_FORM",
-            )
-            src = src.replace(
-                "    if tok.int_val != 0u64 {\n"
-                "        if is_negated {\n"
-                "            return (0i64 - (tok.int_val as i64)) as u64;\n"
-                "        }\n"
-                "        return tok.int_val;\n"
-                "    }\n"
-                "    let sv = mb_span_sv(b, view(tok.span));\n"
-                "    mb_parse_int_sv(view(sv), is_negated)",
-                "    let sv = mb_span_sv(b, view(tok.span));\n"
-                "    if sv.len > 0 && (tok.flags & TOK_FLAG_BYTE_FORM) == 0u16 {\n"
-                "        return mb_parse_int_sv(view(sv), is_negated);\n"
-                "    }\n"
-                "    if tok.int_val != 0u64 {\n"
-                "        if is_negated {\n"
-                "            return (0i64 - (tok.int_val as i64)) as u64;\n"
-                "        }\n"
-                "        return tok.int_val;\n"
-                "    }\n"
-                "    0u64",
-            )
-            src = src.replace(
-                "    b.curr_bb = mb_new_bb(mut_view(b), false);",
-                "    let entry_bb = mb_new_bb(mut_view(b), false);\n    b.curr_bb = entry_bb;",
-            )
-            src = src.replace(
-                "                        (*cur_bb_ptr).terminator.drop_place = mir_local_place(loc_id_v);",
-                "                        let dp = mir_local_place(loc_id_v);\n"
-                "                        (*cur_bb_ptr).terminator.drop_place = dp;",
-            )
-            src = src.replace(
-                "            rv.repeat_count = mb_eval_const_int_expr(view(*b), count_expr);",
-                "            let rep_cnt = mb_eval_const_int_expr(view(*b), count_expr);\n"
-                "            rv.repeat_count = rep_cnt;",
-            )
-            src = src.replace(
-                "                ci = ci + 1;\n"
-                "            }\n"
-                "        }\n"
-                "    } else if ek == HIR_EXPR_UNARY && (unsafe { (*expr).op }) == UNOP_DEREF {",
-                "                ci = ci + 1;\n"
-                "            }\n"
-                "        }\n"
-                "        if sym.v != 0u32 && (b.thir as usize) != 0 {\n"
-                "            let cval = unsafe { sym_constmap_get(view((*b.thir).symbol_consts), (SymbolId { v: sym.v })) };\n"
-                "            if (cval as usize) != 0 && (unsafe { (*cval).kind }) == CONST_AGGREGATE {\n"
-                "                let ty = mb_expr_ty(mut_view(*b), expr);\n"
-                "                let cloc = mb_new_local(mut_view(*b), (TypeId { v: ty.v }), MIR_LOCAL_CONST, false, StrId { v: 0u32 }, view(sp));\n"
-                "                let ldecl = unsafe { mir_local_at((*b.body).locals, cloc.v as usize) };\n"
-                "                unsafe { (*ldecl).const_sym.v = sym.v; }\n"
-                "                mb_register_sym(mut_view(*b), (SymbolId { v: sym.v }), (MirLocalId { v: cloc.v }), false);\n"
-                "                let p = mir_local_place(cloc.v);\n"
-                "                let mut cop = MirOperand {\n"
-                "                    kind: MIR_OP_CONST,\n"
-                "                    location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "                    place: mir_local_place(0u32),\n"
-                "                    constant: MirConst { ty: TypeId { v: ty.v }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } }\n"
-                "                };\n"
-                "                let saved_bb = b.curr_bb.v;\n"
-                "                let saved_div = b.is_diverged;\n"
-                "                b.curr_bb.v = 0u32;\n"
-                "                b.is_diverged = false;\n"
-                "                mb_emit_assign_use(mut_view(*b), view(p), view(cop), view(sp));\n"
-                "                b.curr_bb.v = saved_bb;\n"
-                "                b.is_diverged = saved_div;\n"
-                "                return p;\n"
-                "            }\n"
-                "        }\n"
-                "    } else if ek == HIR_EXPR_UNARY && (unsafe { (*expr).op }) == UNOP_DEREF {",
-            )
-            src = src.replace(
-                "                let ok_loc = mb_new_temp(mut_view(*b), (TypeId {\n"
-                "                    v: bool_ty.v\n"
-                "                }), view(sp));\n"
-                "                let ok_pl = mir_local_place(ok_loc.v);\n"
-                "                let idx_op = MirOperand {\n"
-                "                    kind: MIR_OP_COPY, location: Span {\n"
-                "                        file: FileId {\n"
-                "                            v: 0u32\n"
-                "                        }, start: 0u32, end: 0u32\n"
-                "                    }, place: MirPlace {\n"
-                "                        local: MirLocalId {\n"
-                "                            v: idx_loc.v\n"
-                "                        }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE\n"
-                "                    }, constant: MirConst {\n"
-                "                        ty: TypeId {\n"
-                "                            v: 0u32\n"
-                "                        }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId {\n"
-                "                            v: 0u32\n"
-                "                        }\n"
-                "                    }\n"
-                "                };",
-                "                let ok_loc = mb_new_temp(mut_view(*b), (TypeId {\n"
-                "                    v: bool_ty.v\n"
-                "                }), view(sp));\n"
-                "                let ok_pl = mir_local_place(ok_loc.v);\n"
-                "                let u_idx_loc = mb_new_temp(mut_view(*b), (TypeId { v: usize_ty.v }), view(sp));\n"
-                "                let u_idx_pl = mir_local_place(u_idx_loc.v);\n"
-                "                let raw_idx_op = MirOperand {\n"
-                "                    kind: MIR_OP_COPY,\n"
-                "                    location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "                    place: mir_local_place(idx_loc.v),\n"
-                "                    constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } }\n"
-                "                };\n"
-                "                let mut cast_rv = MirRvalue {\n"
-                "                    kind: MIR_RVALUE_CAST,\n"
-                "                    use_op: raw_idx_op,\n"
-                "                    repeat_count: 0u64,\n"
-                "                    repeat_count_op: 0 as *mut MirOperand,\n"
-                "                    borrow_kind: MIR_BORROW_SHARED,\n"
-                "                    place: mir_local_place(0u32),\n"
-                "                    cast_kind: MIR_CAST_INT_TO_INT,\n"
-                "                    target_ty: TypeId { v: usize_ty.v },\n"
-                "                    bin_op: MIR_BINOP_ADD,\n"
-                "                    lhs: MirOperand { kind: MIR_OP_COPY, location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }, place: mir_local_place(0u32), constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } } },\n"
-                "                    rhs: MirOperand { kind: MIR_OP_COPY, location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 }, place: mir_local_place(0u32), constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } } },\n"
-                "                    un_op: MIR_UNOP_NOT,\n"
-                "                    variant_idx: 0u32,\n"
-                "                    operands: 0 as *mut MirOperand,\n"
-                "                    operand_count: 0,\n"
-                "                };\n"
-                "                mb_emit_assign(mut_view(*b), view(u_idx_pl), view(cast_rv), view(sp));\n"
-                "                let idx_op = MirOperand {\n"
-                "                    kind: MIR_OP_COPY,\n"
-                "                    location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "                    place: mir_local_place(u_idx_loc.v),\n"
-                "                    constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } }\n"
-                "                };",
-            )
-            src = src.replace(
-                "            if (cv as usize) != 0 && (unsafe { (*cv).kind }) == CONST_STR {",
-                "            if (cv as usize) != 0 && (unsafe { (*cv).kind }) == CONST_AGGREGATE {\n"
-                "                let mut dummy_sl2 = false;\n"
-                "                let p_agg = mir_build_lvalue(mut_view(*b), expr, mut_view(dummy_sl2));\n"
-                "                mir_operand_zero(mut_view(*out_op), MIR_OP_COPY);\n"
-                "                mir_copy_place(mut_view(out_op.place), view(p_agg));\n"
-                "                return;\n"
-                "            }\n"
-                "            if (cv as usize) != 0 && (unsafe { (*cv).kind }) == CONST_STR {",
-            )
-            src = src.replace(
-                "        b.curr_bb.v = bb_end.v;\n        b.is_diverged = !any_arm_reached_end;",
-                "        let _ = any_arm_reached_end;\n        b.curr_bb.v = bb_end.v;\n        b.is_diverged = false;",
-            )
-            src = src.replace(
-                "            b.curr_bb.v = bb_end.v;\n            b.is_diverged = then_diverged && else_diverged;",
-                "            let _ = then_diverged;\n            let _ = else_diverged;\n            b.curr_bb.v = bb_end.v;\n            b.is_diverged = false;",
-            )
-            src = src.replace(
-                "        b.curr_bb.v = bb_end.v;\n        b.is_diverged = then_diverged && else_diverged;",
-                "        let _ = then_diverged;\n        let _ = else_diverged;\n        b.curr_bb.v = bb_end.v;\n        b.is_diverged = false;",
-            )
-            rv_pat = (
-                "MirRvalue {\n"
-                "        kind: MIR_RVALUE_USE,\n"
-                "        use_op: MirOperand {\n"
-                "            kind: MIR_OP_COPY,\n"
-                "            location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "            place: MirPlace { local: MirLocalId { v: 0u32 }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE },\n"
-                "            constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },\n"
-                "        },\n"
-                "        repeat_count: 0u64,\n"
-                "        repeat_count_op: 0 as *mut MirOperand,\n"
-                "        borrow_kind: MIR_BORROW_SHARED,\n"
-                "        place: MirPlace { local: MirLocalId { v: 0u32 }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE },\n"
-                "        cast_kind: MIR_CAST_INT_TO_INT,\n"
-                "        target_ty: TypeId { v: 0u32 },\n"
-                "        bin_op: MIR_BINOP_ADD,\n"
-                "        lhs: MirOperand {\n"
-                "            kind: MIR_OP_COPY,\n"
-                "            location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "            place: MirPlace { local: MirLocalId { v: 0u32 }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE },\n"
-                "            constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },\n"
-                "        },\n"
-                "        rhs: MirOperand {\n"
-                "            kind: MIR_OP_COPY,\n"
-                "            location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "            place: MirPlace { local: MirLocalId { v: 0u32 }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE },\n"
-                "            constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },\n"
-                "        },\n"
-                "        un_op: MIR_UNOP_NOT,\n"
-                "        variant_idx: 0u32,\n"
-                "        operands: 0 as *mut MirOperand,\n"
-                "        operand_count: 0,\n"
-                "    }"
-            )
-            src = src.replace(rv_pat, "mb_zero_rv()")
-            op_re = re.compile(
-                r"(let mut \w+ = )MirOperand \{\s*kind: MIR_OP_COPY,\s*location: Span \{\s*file: FileId \{\s*v: 0u32\s*\},\s*start: 0u32,\s*end: 0u32\s*\},\s*place: MirPlace \{\s*local: MirLocalId \{\s*v: 0u32\s*\},\s*region: 0u8,\s*view_kind: 0u8,\s*projs: 0 as \*mut MirProjection,\s*proj_count: 0,\s*drop_flag: MIR_DROP_FLAG_NONE\s*\},\s*constant: MirConst \{\s*ty: TypeId \{\s*v: 0u32\s*\},\s*kind: MIR_CONST_INT,\s*val: 0u64,\s*str_bytes: 0 as \*const u8,\s*str_len: 0,\s*sym: SymbolId \{\s*v: 0u32\s*\}\s*\}\s*\}"
-            )
-            src = op_re.sub(r"\1mb_zero_op()", src)
-            src = src.replace(
-                "fn mb_emit_stmt(b: mut_view<MirBuilder>, stmt: view<MirStmt>) {",
-                "fn mb_zero_op() -> MirOperand {\n"
-                "    MirOperand {\n"
-                "        kind: MIR_OP_COPY,\n"
-                "        location: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },\n"
-                "        place: MirPlace { local: MirLocalId { v: 0u32 }, region: 0u8, view_kind: 0u8, projs: 0 as *mut MirProjection, proj_count: 0, drop_flag: MIR_DROP_FLAG_NONE },\n"
-                "        constant: MirConst { ty: TypeId { v: 0u32 }, kind: MIR_CONST_INT, val: 0u64, str_bytes: 0 as *const u8, str_len: 0, sym: SymbolId { v: 0u32 } },\n"
-                "    }\n"
-                "}\n\n"
-                "fn mb_zero_rv() -> MirRvalue {\n"
-                "    " + rv_pat + "\n"
-                "}\n\n"
-                "fn mb_emit_stmt(b: mut_view<MirBuilder>, stmt: view<MirStmt>) {",
-            )
-        if name == "compiler.types.typeck":
-            src = src.replace(
-                "fn eval_array_len_expr(cx: mut_view<TypeckCtx>, len_expr: *const HirExpr, out_len: mut_view<u64>) -> bool {\n"
-                "    *out_len = 0u64;\n"
-                "    if (len_expr as usize) == 0 { return false; }",
-                "fn eval_array_len_expr(cx: mut_view<TypeckCtx>, len_expr: *const HirExpr, out_len: mut_view<u64>) -> bool {\n"
-                "    *out_len = 0u64;\n"
-                "    if (len_expr as usize) == 0 { return false; }\n"
-                "    if unsafe { (*len_expr).kind } == HIR_EXPR_LITERAL && unsafe { (*len_expr).literal.kind } == TOK_INT {\n"
-                "        let mut val0: u64 = 0u64;\n"
-                "        let mut err0: u32 = 0u32;\n"
-                "        if eval_const_expr_int(mut_view(*cx), len_expr, mut_view(val0), mut_view(err0)) {\n"
-                "            *out_len = val0;\n"
-                "            return true;\n"
-                "        }\n"
-                "    }",
-            )
-            src = src.replace(
-                "    let cty_ptr: *mut HirType = unsafe { (*it).ty };\n"
-                "    let ty = hir_type_to_typeid(mut_view(*cx), cty_ptr);\n",
-                "    let cty_ptr: *mut HirType = unsafe { (*it).ty };\n"
-                "    let ty = hir_type_to_typeid(mut_view(*cx), cty_ptr);\n"
-                "    unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: ty.v })); }\n"
-                "    if sym_v != 0u32 {\n"
-                "        unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: sym_v }), (TypeId { v: ty.v })); }\n"
-                "    }\n",
-            )
-            src = src.replace(
-                "                    let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };\n"
-                "                    if it_t.v != 0u32 {\n"
-                "                        return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, out_args);\n"
-                "                    }\n",
-                "                    if ik == HIR_ITEM_CONST {\n"
-                "                        evaluate_const_item(mut_view(*cx), it);\n"
-                "                    }\n"
-                "                    let it_t = unsafe { thir_get_item_type(view(*cx.thir), it) };\n"
-                "                    if it_t.v != 0u32 {\n"
-                "                        return instantiate_path(mut_view(*cx), (TypeId { v: it_t.v }), it, path, out_args);\n"
-                "                    }\n",
-            )
-            src = src.replace(
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n"
-                "        let isym = unsafe { (*it).symbol };\n"
-                "        if isym.v != 0u32 {\n"
-                "            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }\n"
-                "        }\n"
-                "        cx.current_fn = 0 as *const HirItem;",
-                "        unsafe { thir_set_item_type(mut_view(*cx.thir), it, (TypeId { v: fn_ty.v })); }\n"
-                "        let isym = unsafe { (*it).symbol };\n"
-                "        if isym.v != 0u32 && (unsafe { (*it).generic_params as usize }) == 0 {\n"
-                "            unsafe { thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: isym.v }), (TypeId { v: fn_ty.v })); }\n"
-                "        }\n"
-                "        cx.current_fn = 0 as *const HirItem;",
-            )
-            src = src.replace(
-                "                            if (fty_node as usize) != 0 && (unsafe { (*fty_node).kind }) == HIR_TYPE_VIEW {\n"
-                "                                let _ = unsafe { type_error(mut_view(cx), view((*f).span), AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP) };\n"
-                "                            }\n",
-                "",
-            )
-            src = src.replace(
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n"
-                "    if sink.errors == 0 {\n"
-                "        unsafe_check(hir_file, view(*thir), mut_view(*sink), view(*str_in));\n"
-                "    }\n",
-                "    typeck_into(hir_file, mut_view(*sink), mut_view(*str_in), db, evaluator, mut_view(*thir));\n",
-            )
-            src = src.replace(
-                "pub fn typeck_into(",
-                "// SPEC-12 AXS-DROP-008 (ADR-0036 section 5): `impl P for T` declares the destructor of `T` iff the trait\n"
-                "// path `P` resolves to the prelude lang item `Drop`: `P` is the single segment `Drop` without generic\n"
-                "// arguments, and the impl's module neither declares a trait, struct, enum or type alias named `Drop` nor\n"
-                "// binds the name `Drop` with a `use`. Same predicate as hir_impl_is_lang_drop (compiler/hir/lower.ax,\n"
-                "// documented there) and ax_hir_impl_is_lang_drop / the twin in bootstrap/axiom0/src/types/typeck.c.\n"
-                "fn tc_name_is_drop(interner: view<StrInterner>, id: StrId) -> bool {\n"
-                "    if id.v == 0u32 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sv = interner_get(interner, id);\n"
-                "    if sv.len != 4 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let b0 = unsafe { *(sv.ptr + 0) };\n"
-                "    let b1 = unsafe { *(sv.ptr + 1) };\n"
-                "    let b2 = unsafe { *(sv.ptr + 2) };\n"
-                "    let b3 = unsafe { *(sv.ptr + 3) };\n"
-                "    b0 == 68u8 && b1 == 114u8 && b2 == 111u8 && b3 == 112u8\n"
-                "}\n"
-                "\n"
-                "fn tc_use_tree_binds_drop(interner: view<StrInterner>, t: *mut HirUseTree) -> bool {\n"
-                "    let mut cur: *mut HirUseTree = t;\n"
-                "    while (cur as usize) != 0 {\n"
-                "        let count = unsafe { (*cur).path.count };\n"
-                "        if (unsafe { (*cur).subtrees as usize }) != 0 {\n"
-                "            if tc_use_tree_binds_drop(interner, unsafe { (*cur).subtrees }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if (unsafe { (*cur).alias.v }) != 0u32 {\n"
-                "            if tc_name_is_drop(interner, unsafe { (*cur).alias }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        } else if count > 0 {\n"
-                "            let off = (((count - 1) as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "            let seg_ptr = ((unsafe { (*cur).path.segments } as usize) + off) as *const StrId;\n"
-                "            if tc_name_is_drop(interner, unsafe { *seg_ptr }) {\n"
-                "                return true;\n"
-                "            }\n"
-                "        }\n"
-                "        cur = unsafe { (*cur).next };\n"
-                "    }\n"
-                "    false\n"
-                "}\n"
-                "\n"
-                "fn tc_module_path_eq(a: *mut HirItem, b: *mut HirItem) -> bool {\n"
-                "    let count = unsafe { (*a).module_path.count };\n"
-                "    if count != (unsafe { (*b).module_path.count }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let sa = unsafe { (*a).module_path.segments } as usize;\n"
-                "    let sb = unsafe { (*b).module_path.segments } as usize;\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < count {\n"
-                "        let off = ((i as isize) * (size_of<StrId>() as isize)) as usize;\n"
-                "        let pa = (sa + off) as *const StrId;\n"
-                "        let pb = (sb + off) as *const StrId;\n"
-                "        if (unsafe { (*pa).v }) != (unsafe { (*pb).v }) {\n"
-                "            return false;\n"
-                "        }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_impl_is_lang_drop(items: *mut HirItem, impl_item: *mut HirItem, interner: view<StrInterner>) -> bool {\n"
-                "    if (impl_item as usize) == 0 || (unsafe { (*impl_item).kind }) != HIR_ITEM_IMPL {\n"
-                "        return false;\n"
-                "    }\n"
-                "    let tp: *mut HirType = unsafe { (*impl_item).trait_path };\n"
-                "    if (tp as usize) == 0 || (unsafe { (*tp).kind }) != HIR_TYPE_PATH {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.generic_args as usize }) != 0 {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if !tc_name_is_drop(interner, unsafe { (*tp).path.name }) {\n"
-                "        return false;\n"
-                "    }\n"
-                "    if (unsafe { (*tp).path.span.file.v }) != 0u32 {\n"
-                "        let span_len = (unsafe { (*tp).path.span.end }) - (unsafe { (*tp).path.span.start });\n"
-                "        if span_len != 4u32 {\n"
-                "            return false;\n"
-                "        }\n"
-                "    }\n"
-                "    let mut it: *mut HirItem = items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if tc_module_path_eq(it, impl_item) {\n"
-                "            let k = unsafe { (*it).kind };\n"
-                "            if k == HIR_ITEM_TRAIT || k == HIR_ITEM_STRUCT || k == HIR_ITEM_ENUM || k == HIR_ITEM_TYPE_ALIAS {\n"
-                "                if tc_name_is_drop(interner, unsafe { (*it).name }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            } else if k == HIR_ITEM_USE {\n"
-                "                if tc_use_tree_binds_drop(interner, unsafe { (*it).use_tree }) {\n"
-                "                    return false;\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "    true\n"
-                "}\n"
-                "\n"
-                "fn tc_write_u32_dec(buf: *mut u8, start: usize, val: u32) -> usize {\n"
-                "    let mut tmp: [16]u8 = [0u8; 16];\n"
-                "    let mut dlen: usize = 0;\n"
-                "    let mut v = val;\n"
-                "    if v == 0u32 {\n"
-                "        unsafe { *(buf + start) = 48u8; }\n"
-                "        return start + 1;\n"
-                "    }\n"
-                "    while v > 0u32 {\n"
-                "        tmp[dlen] = (48u32 + (v % 10u32)) as u8;\n"
-                "        v = v / 10u32;\n"
-                "        dlen = dlen + 1;\n"
-                "    }\n"
-                "    let mut i: usize = 0;\n"
-                "    while i < dlen {\n"
-                "        unsafe { *(buf + start + i) = tmp[dlen - 1 - i]; }\n"
-                "        i = i + 1;\n"
-                "    }\n"
-                "    start + dlen\n"
-                "}\n\n"
-                "fn tc_mangle_drop_impls(cx: mut_view<TypeckCtx>, hir_file: view<HirFile>) {\n"
-                "    if (cx.str_in as usize) == 0 {\n"
-                "        return;\n"
-                "    }\n"
-                "    let mut drop_sym_counter: u32 = 0u32;\n"
-                "    let mut it: *mut HirItem = hir_file.items;\n"
-                "    while (it as usize) != 0 {\n"
-                "        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {\n"
-                "            let tp: *mut HirType = unsafe { (*it).trait_path };\n"
-                "            let st: *mut HirType = unsafe { (*it).self_type };\n"
-                "            if (tp as usize) != 0 && (st as usize) != 0 && (unsafe { (*st).kind }) == HIR_TYPE_PATH {\n"
-                "                if tc_impl_is_lang_drop(hir_file.items, it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let mut sname = StrView { ptr: 0 as *const u8, len: 0 };\n"
-                "                    if (unsafe { (*st).path.name.v }) != 0u32 {\n"
-                "                        sname = unsafe { interner_get(view(*cx.str_in), (*st).path.name) };\n"
-                "                    } else if (cx.db as usize) != 0 {\n"
-                "                        let raw_s = unsafe { source_db_span_text(view(*cx.db), (*st).path.span) };\n"
-                "                        let mut lt: usize = 0;\n"
-                "                        while (lt) < (raw_s.len) {\n"
-                "                            if (unsafe { *(raw_s.ptr + lt) }) == 60u8 {\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            lt = lt + 1;\n"
-                "                        }\n"
-                "                        sname = StrView { ptr: raw_s.ptr, len: lt };\n"
-                "                    }\n"
-                "                    if sname.len > 0 {\n"
-                "                        let mut m: *mut HirItem = unsafe { (*it).members };\n"
-                "                        while (m as usize) != 0 {\n"
-                "                            if (unsafe { (*m).kind }) == HIR_ITEM_FN {\n"
-                "                                let mut mbuf: [256]u8 = [0u8; 256];\n"
-                "                                let buf_ptr = unsafe { address_of(mbuf[0]) as *mut u8 };\n"
-                "                                let copy_len: usize = if sname.len > 240 { 240 } else { sname.len };\n"
-                "                                unsafe {\n"
-                "                                    ptr_copy_nonoverlapping<u8>(sname.ptr, buf_ptr, copy_len);\n"
-                "                                    *(buf_ptr + copy_len) = 36u8;\n"
-                "                                    *(buf_ptr + copy_len + 1) = 100u8;\n"
-                "                                    *(buf_ptr + copy_len + 2) = 114u8;\n"
-                "                                    *(buf_ptr + copy_len + 3) = 111u8;\n"
-                "                                    *(buf_ptr + copy_len + 4) = 112u8;\n"
-                "                                }\n"
-                "                                let base_len = copy_len + 5;\n"
-                "                                let mut new_name = unsafe {\n"
-                "                                    interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, base_len)\n"
-                "                                };\n"
-                "                                let mut disambig: u32 = 1u32;\n"
-                "                                loop {\n"
-                "                                    let mut collision = false;\n"
-                "                                    let mut prev: *mut HirItem = hir_file.items;\n"
-                "                                    while (prev as usize) != 0 && (prev as usize) != (it as usize) {\n"
-                "                                        if (unsafe { (*prev).kind }) == HIR_ITEM_IMPL {\n"
-                "                                            let mut pm: *mut HirItem = unsafe { (*prev).members };\n"
-                "                                            while (pm as usize) != 0 {\n"
-                "                                                if (unsafe { (*pm).kind }) == HIR_ITEM_FN && (unsafe { (*pm).name.v }) == new_name.v {\n"
-                "                                                    collision = true;\n"
-                "                                                    break;\n"
-                "                                                }\n"
-                "                                                pm = unsafe { (*pm).next };\n"
-                "                                            }\n"
-                "                                        }\n"
-                "                                        if collision {\n"
-                "                                            break;\n"
-                "                                        }\n"
-                "                                        prev = unsafe { (*prev).next };\n"
-                "                                    }\n"
-                "                                    if !collision {\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    disambig = disambig + 1u32;\n"
-                "                                    unsafe { *(buf_ptr + base_len) = 36u8; }\n"
-                "                                    let dlen = tc_write_u32_dec(buf_ptr, base_len + 1, disambig);\n"
-                "                                    new_name = unsafe {\n"
-                "                                        interner_intern_bytes(mut_view(*cx.str_in), buf_ptr as *const u8, dlen)\n"
-                "                                    };\n"
-                "                                }\n"
-                "                                drop_sym_counter = drop_sym_counter + 1u32;\n"
-                "                                let new_sym_v = 0x70000000u32 + drop_sym_counter;\n"
-                "                                let old_name_v = unsafe { (*m).name.v };\n"
-                "                                let m_body = unsafe { (*m).body };\n"
-                "                                unsafe {\n"
-                "                                    (*m).name.v = new_name.v;\n"
-                "                                    (*m).symbol.v = new_sym_v;\n"
-                "                                }\n"
-                "                                let mut top: *mut HirItem = hir_file.items;\n"
-                "                                while (top as usize) != 0 {\n"
-                "                                    if (top as usize) != (m as usize) &&\n"
-                "                                       (unsafe { (*top).kind }) == HIR_ITEM_FN &&\n"
-                "                                       (unsafe { (*top).body as usize }) == (m_body as usize) &&\n"
-                "                                       (unsafe { (*top).name.v }) == old_name_v {\n"
-                "                                        unsafe {\n"
-                "                                            (*top).name.v = new_name.v;\n"
-                "                                            (*top).symbol.v = new_sym_v;\n"
-                "                                        }\n"
-                "                                        break;\n"
-                "                                    }\n"
-                "                                    top = unsafe { (*top).next };\n"
-                "                                }\n"
-                "                            }\n"
-                "                            m = unsafe { (*m).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        }\n"
-                "        it = unsafe { (*it).next };\n"
-                "    }\n"
-                "}\n\n"
-                "pub fn typeck_into(",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: st_id.v })); }\n"
-                "            let s_sym = unsafe { (*top_it).symbol };\n"
-                "            if s_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: s_sym.v }), (TypeId { v: st_id.v })); }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_ENUM {",
-            )
-            src = src.replace(
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-                "            unsafe { thir_set_item_type(mut_view(*thir_ptr), top_it, (TypeId { v: en_id.v })); }\n"
-                "            let e_sym = unsafe { (*top_it).symbol };\n"
-                "            if e_sym.v != 0u32 && arg_cnt == 0 {\n"
-                "                unsafe { thir_set_sym_type(mut_view(*thir_ptr), (SymbolId { v: e_sym.v }), (TypeId { v: en_id.v })); }\n"
-                "            }\n"
-                "        }\n"
-                "        top_it = unsafe { (*top_it).next };\n"
-                "    }\n\n"
-                "    // Pass 1a1:",
-            )
-            src = src.replace(
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    // Pass 1a0:",
-                "    type_vars_init(mut_view(cx.type_vars));\n\n"
-                "    tc_mangle_drop_impls(mut_view(cx), hir_file);\n\n"
-                "    // Pass 1a0:",
-            )
-            src = src.replace(
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-                "            let mut m: *mut HirItem = unsafe { (*top_it).members };\n"
-                "            while ((m as usize) != 0) {\n"
-                "                register_item_sig(mut_view(cx), m, top_it);\n"
-                "                m = unsafe { (*m).next };\n"
-                "            }\n"
-                "            let tp_node: *mut HirType = unsafe { (*top_it).trait_path };\n"
-                "            if (tp_node as usize) != 0 && impl_self_ty.v != 0u32 {\n"
-                "                if (cx.str_in as usize) != 0 && tc_impl_is_lang_drop(hir_file.items, top_it, unsafe { view(*cx.str_in) }) {\n"
-                "                    let self_t = unsafe { type_get(view((*thir_ptr).interner), (TypeId { v: impl_self_ty.v })) };\n"
-                "                    if (self_t as usize) != 0 && (unsafe { (*self_t).kind }) == TY_STRUCT {\n"
-                "                        let mut dm: *mut HirItem = unsafe { (*top_it).members };\n"
-                "                        while (dm as usize) != 0 {\n"
-                "                            if (unsafe { (*dm).kind }) == HIR_ITEM_FN {\n"
-                "                                let tk_key = ((impl_self_ty.v as usize) << 1) | 1;\n"
-                "                                unsafe {\n"
-                "                                    ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), tk_key, dm);\n"
-                "                                }\n"
-                "                                let def_ptr = unsafe { (*self_t).def };\n"
-                "                                if (def_ptr as usize) != 0 {\n"
-                "                                    let dk_key = (def_ptr as usize) | 1;\n"
-                "                                    unsafe {\n"
-                "                                        ptr_itemmap_insert(mut_view((*thir_ptr).expr_methods), dk_key, dm);\n"
-                "                                    }\n"
-                "                                }\n"
-                "                                break;\n"
-                "                            }\n"
-                "                            dm = unsafe { (*dm).next };\n"
-                "                        }\n"
-                "                    }\n"
-                "                }\n"
-                "            }\n"
-                "        } else if tk == HIR_ITEM_TRAIT {",
-            )
-        if name == "compiler.kernel.interner":
-            src = src.replace(
-                "    in_.bytes = arena_new();",
-                "    let _a = arena_new();\n    in_.bytes = _a;",
-            )
-        if name == "compiler.source.manager":
-            src = src.replace(
-                "    db.arena = arena_new();",
-                "    let _a = arena_new();\n    db.arena = _a;",
-            )
-        if name == "compiler.diag.emitter":
-            src = src.replace(
-                "    sink.arena = arena_new();",
-                "    let _a = arena_new();\n    sink.arena = _a;",
-            )
-        if name == "compiler.kernel_source_diag.session":
-            src = src.replace(
-                "    s.arena = arena_new();\n"
-                "    interner_init(mut_view(s.interner));\n"
-                "    s.u32_pool = u32_interner_new();",
-                "    let _a = arena_new();\n"
-                "    s.arena = _a;\n"
-                "    interner_init(mut_view(s.interner));\n"
-                "    let _u = u32_interner_new();\n"
-                "    s.u32_pool = _u;",
-            )
-        src = src.replace("use std.core.host.", "use host_intrinsics.")
-        src = src.replace("; return ", ";\nreturn ")
-        src = src.replace("; break;", ";\nbreak;")
-        parts.append(src.rstrip("\n") + "\n")
-    return "\n".join(parts)
+    return bc.assemble_compiler_modules(mod_list, root=ROOT)
 
 
 def find_exe(default_rels):
@@ -1092,115 +208,120 @@ def pack_blobs(blobs):
 
 
 def gen_cli_and_project_bundle(prelude, light_mods, axiom0):
-    _, exp_help, _ = run_axiom0(axiom0, ["help"], expect_rc=0)
-    _, exp_version, _ = run_axiom0(axiom0, ["version"], expect_rc=0)
-    _, exp_features, _ = run_axiom0(axiom0, ["--features"], expect_rc=0)
-    _, _, exp_inspect_help = run_axiom0(axiom0, ["inspect", "--help"], expect_rc=2)
-    _, _, exp_unknown_cmd = run_axiom0(axiom0, ["bogus"], expect_rc=2)
-    _, _, exp_unknown_opt = run_axiom0(axiom0, ["check", "--unknown-flag", "tests/driver/test.ax"], expect_rc=2)
-    _, _, exp_missing_val = run_axiom0(axiom0, ["check", "--target"], expect_rc=2)
-    _, _, exp_unknown_emit = run_axiom0(axiom0, ["inspect", "--emit=bogus", "tests/driver/test.ax"], expect_rc=2)
-    _, _, exp_check_no_file = run_axiom0(axiom0, ["check"], expect_rc=2)
-    _, _, exp_build_no_file = run_axiom0(axiom0, ["build"], expect_rc=2)
-    _, _, exp_build_no_o = run_axiom0(axiom0, ["build", "tests/driver/test.ax"], expect_rc=2)
-    _, _, exp_run_no_file = run_axiom0(axiom0, ["run"], expect_rc=2)
-    _, _, exp_inspect_no_file = run_axiom0(axiom0, ["inspect", "--emit=tokens"], expect_rc=2)
+    out_path = os.path.join(HERE, "qa_driver_cli_and_project.ax")
+    if axiom0 is None:
+        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = pack_blobs(blobs)
+    else:
+        _, exp_help, _ = run_axiom0(axiom0, ["help"], expect_rc=0)
+        _, exp_version, _ = run_axiom0(axiom0, ["version"], expect_rc=0)
+        _, exp_features, _ = run_axiom0(axiom0, ["--features"], expect_rc=0)
+        _, _, exp_inspect_help = run_axiom0(axiom0, ["inspect", "--help"], expect_rc=2)
+        _, _, exp_unknown_cmd = run_axiom0(axiom0, ["bogus"], expect_rc=2)
+        _, _, exp_unknown_opt = run_axiom0(axiom0, ["check", "--unknown-flag", "tests/driver/test.ax"], expect_rc=2)
+        _, _, exp_missing_val = run_axiom0(axiom0, ["check", "--target"], expect_rc=2)
+        _, _, exp_unknown_emit = run_axiom0(axiom0, ["inspect", "--emit=bogus", "tests/driver/test.ax"], expect_rc=2)
+        _, _, exp_check_no_file = run_axiom0(axiom0, ["check"], expect_rc=2)
+        _, _, exp_build_no_file = run_axiom0(axiom0, ["build"], expect_rc=2)
+        _, _, exp_build_no_o = run_axiom0(axiom0, ["build", "tests/driver/test.ax"], expect_rc=2)
+        _, _, exp_run_no_file = run_axiom0(axiom0, ["run"], expect_rc=2)
+        _, _, exp_inspect_no_file = run_axiom0(axiom0, ["inspect", "--emit=tokens"], expect_rc=2)
 
-    blobs = [
-        exp_help,              # 0: help usage
-        exp_version,           # 1: version
-        exp_features,          # 2: --features
-        exp_inspect_help,      # 3: inspect --help stderr
-        exp_unknown_cmd,       # 4: unknown command 'bogus' stderr
-        exp_unknown_opt,       # 5: unknown option '--unknown-flag' stderr
-        exp_missing_val,       # 6: option '--target' requires an argument stderr
-        exp_unknown_emit,      # 7: unknown emitter 'bogus' stderr
-        exp_check_no_file,     # 8: check needs an input file
-        exp_build_no_file,     # 9: build needs an input file
-        exp_build_no_o,        # 10: build needs an output file (-o)
-        exp_run_no_file,       # 11: run needs an input file
-        exp_inspect_no_file,   # 12: usage: axiom0 inspect --emit=tokens <file>
-        # Strings for CLI, manifest, std_root, derive_module_path, project_discover:
-        b"axiom0",                       # 13
-        b"help",                         # 14
-        b"--help",                       # 15
-        b"-h",                           # 16
-        b"version",                      # 17
-        b"--features",                   # 18
-        b"inspect",                      # 19
-        b"check",                        # 20
-        b"build",                        # 21
-        b"run",                          # 22
-        b"bogus",                        # 23
-        b"--unknown-flag",               # 24
-        b"tests/driver/test.ax",         # 25
-        b"--target",                     # 26
-        b"--emit=bogus",                 # 27
-        b"--emit=tokens",                # 28
-        b"--color=never",                # 29
-        b"--time-passes",                # 30
-        b"--json",                       # 31
-        b"-O1",                          # 32
-        b"--verify-each",                # 33
-        b"--target=x86_64-pc-windows-msvc",  # 34
-        b"--std-root=std",               # 35
-        b"--interp",                     # 36
-        b"--step-limit=12345",           # 37
-        b"--max-call-depth=678",         # 38
-        b"--",                           # 39
-        b"arg1",                         # 40
-        b"arg2",                         # 41
-        b"x86_64-pc-windows-msvc",       # 42
-        b"std",                          # 43
-        b"--target=aarch64-unknown-linux-gnu",  # 44
-        b"--json=true",                  # 45
-        b"axiom0: option '--json' does not take an argument\n",  # 46
-        b"-o",                           # 47
-        b"out.exe",                      # 48
-        b"--stack-reserve",              # 49
-        b"2097152",                      # 50
-        # Manifest test inputs:
-        b"# Package manifest\r\n[package]\r\nname = \"my_pkg\" # inline comment\r\nkind = \"lib\"\r\n",  # 51
-        b"my_pkg",                       # 52
-        b"lib",                          # 53
-        b"name = \"no_section\"\n",      # 54: missing [package]
-        b"[dependencies]\nfoo = \"1\"\n", # 55: unknown section
-        b"[package]\nkind = \"bin\"\n",  # 56: missing name
-        b"[package]\nname = \"\"\n",     # 57: empty name
-        b"[package]\nname = unquoted\n", # 58: unquoted value
-        b"[package]\nname = \"ok\"\nbroken_no_eq\n",  # 59: missing '='
-        b"tests/modules/hello/axiom.toml",  # 60
-        b"hello",                        # 61
-        b"bin",                          # 62
-        # std_root & derive_module_path & project_discover inputs:
-        b".",                            # 63
-        b"./std",                        # 64
-        b"nonexistent_std_dir_xyz",      # 65
-        b"build/axiom0.exe",             # 66
-        b"main",                         # 67
-        b"src/main.ax",                  # 68
-        b"src/math.ax",                  # 69
-        b"math",                         # 70
-        b"src/utils/calc.ax",            # 71
-        b"utils.calc",                   # 72
-        b"src/a/b/c.ax",                 # 73
-        b"a.b.c",                        # 74
-        b"tests/modules/hello/src/main.ax",   # 75
-        b"tests/modules/nested/src/main.ax",  # 76
-        b"a",                            # 77
-        b"ast",                          # 78
-        b"hir",                          # 79
-        b"lir",                          # 80
-        b"mc",                           # 81
-        b"mi",                           # 82
-        b"mir",                          # 83
-        b"mir-opt",                      # 84
-        b"obj",                          # 85
-        b"resolved",                     # 86
-        b"thir",                         # 87
-        b"tokens",                       # 88
-    ]
-    blob_bytes, offs, lens = pack_blobs(blobs)
+        blobs = [
+            exp_help,              # 0: help usage
+            exp_version,           # 1: version
+            exp_features,          # 2: --features
+            exp_inspect_help,      # 3: inspect --help stderr
+            exp_unknown_cmd,       # 4: unknown command 'bogus' stderr
+            exp_unknown_opt,       # 5: unknown option '--unknown-flag' stderr
+            exp_missing_val,       # 6: option '--target' requires an argument stderr
+            exp_unknown_emit,      # 7: unknown emitter 'bogus' stderr
+            exp_check_no_file,     # 8: check needs an input file
+            exp_build_no_file,     # 9: build needs an input file
+            exp_build_no_o,        # 10: build needs an output file (-o)
+            exp_run_no_file,       # 11: run needs an input file
+            exp_inspect_no_file,   # 12: usage: axiom0 inspect --emit=tokens <file>
+            # Strings for CLI, manifest, std_root, derive_module_path, project_discover:
+            b"axiom0",                       # 13
+            b"help",                         # 14
+            b"--help",                       # 15
+            b"-h",                           # 16
+            b"version",                      # 17
+            b"--features",                   # 18
+            b"inspect",                      # 19
+            b"check",                        # 20
+            b"build",                        # 21
+            b"run",                          # 22
+            b"bogus",                        # 23
+            b"--unknown-flag",               # 24
+            b"tests/driver/test.ax",         # 25
+            b"--target",                     # 26
+            b"--emit=bogus",                 # 27
+            b"--emit=tokens",                # 28
+            b"--color=never",                # 29
+            b"--time-passes",                # 30
+            b"--json",                       # 31
+            b"-O1",                          # 32
+            b"--verify-each",                # 33
+            b"--target=x86_64-pc-windows-msvc",  # 34
+            b"--std-root=std",               # 35
+            b"--interp",                     # 36
+            b"--step-limit=12345",           # 37
+            b"--max-call-depth=678",         # 38
+            b"--",                           # 39
+            b"arg1",                         # 40
+            b"arg2",                         # 41
+            b"x86_64-pc-windows-msvc",       # 42
+            b"std",                          # 43
+            b"--target=aarch64-unknown-linux-gnu",  # 44
+            b"--json=true",                  # 45
+            b"axiom0: option '--json' does not take an argument\n",  # 46
+            b"-o",                           # 47
+            b"out.exe",                      # 48
+            b"--stack-reserve",              # 49
+            b"2097152",                      # 50
+            # Manifest test inputs:
+            b"# Package manifest\r\n[package]\r\nname = \"my_pkg\" # inline comment\r\nkind = \"lib\"\r\n",  # 51
+            b"my_pkg",                       # 52
+            b"lib",                          # 53
+            b"name = \"no_section\"\n",      # 54: missing [package]
+            b"[dependencies]\nfoo = \"1\"\n", # 55: unknown section
+            b"[package]\nkind = \"bin\"\n",  # 56: missing name
+            b"[package]\nname = \"\"\n",     # 57: empty name
+            b"[package]\nname = unquoted\n", # 58: unquoted value
+            b"[package]\nname = \"ok\"\nbroken_no_eq\n",  # 59: missing '='
+            b"tests/modules/hello/axiom.toml",  # 60
+            b"hello",                        # 61
+            b"bin",                          # 62
+            # std_root & derive_module_path & project_discover inputs:
+            b".",                            # 63
+            b"./std",                        # 64
+            b"nonexistent_std_dir_xyz",      # 65
+            b"build/axiom0.exe",             # 66
+            b"main",                         # 67
+            b"src/main.ax",                  # 68
+            b"src/math.ax",                  # 69
+            b"math",                         # 70
+            b"src/utils/calc.ax",            # 71
+            b"utils.calc",                   # 72
+            b"src/a/b/c.ax",                 # 73
+            b"a.b.c",                        # 74
+            b"tests/modules/hello/src/main.ax",   # 75
+            b"tests/modules/nested/src/main.ax",  # 76
+            b"a",                            # 77
+            b"ast",                          # 78
+            b"hir",                          # 79
+            b"lir",                          # 80
+            b"mc",                           # 81
+            b"mi",                           # 82
+            b"mir",                          # 83
+            b"mir-opt",                      # 84
+            b"obj",                          # 85
+            b"resolved",                     # 86
+            b"thir",                         # 87
+            b"tokens",                       # 88
+        ]
+        blob_bytes, offs, lens = pack_blobs(blobs)
 
     main_src = """\
 module selfhost_driver_cli_and_project_test
@@ -1759,38 +880,46 @@ pub fn main() -> i32 {
 }
 """ % {
         "blob_table": byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
     }
 
     header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
     full_text = header + prelude + "\n" + light_mods + "\n" + main_src
-    write_bytes(os.path.join(HERE, "qa_driver_cli_and_project.ax"), full_text.encode("utf-8"))
+    return out_path, full_text.encode("utf-8")
 
 
 def gen_inspect_diff_bundle(filename, modes, prelude, full_mods, axiom0, cases, fast_std=False):
-    blobs = [b"axiom0", b"inspect", b"-O1", b"--std-root=tests/driver"]
+    out_path = os.path.join(HERE, filename)
     case_meta = []
-    for emit_flag, opt_o1, input_path in cases:
-        emit_idx = len(blobs)
-        blobs.append(emit_flag.encode("utf-8"))
-        in_idx = len(blobs)
-        blobs.append(input_path.encode("utf-8"))
+    if axiom0 is None:
+        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = pack_blobs(blobs)
+        for idx, (_emit_flag, opt_o1, _input_path) in enumerate(cases):
+            base = 4 + 4 * idx
+            case_meta.append((base, 1 if opt_o1 else 0, base + 1, 0, base + 2, base + 3))
+    else:
+        blobs = [b"axiom0", b"inspect", b"-O1", b"--std-root=tests/driver"]
+        for emit_flag, opt_o1, input_path in cases:
+            emit_idx = len(blobs)
+            blobs.append(emit_flag.encode("utf-8"))
+            in_idx = len(blobs)
+            blobs.append(input_path.encode("utf-8"))
 
-        extra = ["--std-root=tests/driver"] if fast_std else []
-        if emit_flag == "--emit=mir-opt" or (emit_flag == "--emit=mir" and opt_o1):
-            args = ["inspect"] + extra + ["--emit=mir", "-O1", input_path]
-        else:
-            args = ["inspect"] + extra + [emit_flag] + (["-O1"] if opt_o1 else []) + [input_path]
-        rc, out_b, err_b = run_axiom0(axiom0, args, expect_rc=0)
-        out_idx = len(blobs)
-        blobs.append(out_b)
-        err_idx = len(blobs)
-        blobs.append(err_b)
-        case_meta.append((emit_idx, 1 if opt_o1 else 0, in_idx, rc, out_idx, err_idx))
+            extra = ["--std-root=tests/driver"] if fast_std else []
+            if emit_flag == "--emit=mir-opt" or (emit_flag == "--emit=mir" and opt_o1):
+                args = ["inspect"] + extra + ["--emit=mir", "-O1", input_path]
+            else:
+                args = ["inspect"] + extra + [emit_flag] + (["-O1"] if opt_o1 else []) + [input_path]
+            rc, out_b, err_b = run_axiom0(axiom0, args, expect_rc=0)
+            out_idx = len(blobs)
+            blobs.append(out_b)
+            err_idx = len(blobs)
+            blobs.append(err_b)
+            case_meta.append((emit_idx, 1 if opt_o1 else 0, in_idx, rc, out_idx, err_idx))
 
-    blob_bytes, offs, lens = pack_blobs(blobs)
+        blob_bytes, offs, lens = pack_blobs(blobs)
 
     main_src = """\
 module selfhost_driver_inspect_diff_test
@@ -1913,7 +1042,7 @@ pub fn main() -> i32 {
 }
 """ % {
         "blob_table": byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
         "num_cases": len(case_meta),
@@ -1928,46 +1057,51 @@ pub fn main() -> i32 {
 
     header = "// test: run\n// timeout: 1200\n// modes: %s\n\n" % modes
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    write_bytes(os.path.join(HERE, filename), full_text.encode("utf-8"))
+    return out_path, full_text.encode("utf-8")
 
 
 def gen_commands_a_bundle(prelude, full_mods, axiom0):
-    _, exp_version, _ = run_axiom0(axiom0, ["version"], expect_rc=0)
-    _, exp_features, _ = run_axiom0(axiom0, ["--features"], expect_rc=0)
-    _, exp_help, _ = run_axiom0(axiom0, ["help"], expect_rc=0)
-    _, _, exp_check_err = run_axiom0(axiom0, ["check", "--std-root=tests/driver", "tests/driver/error.ax"], expect_rc=1)
-    _, _, exp_json_err = run_axiom0(axiom0, ["check", "--std-root=tests/driver", "--json", "tests/driver/error.ax"], expect_rc=1)
+    out_path = os.path.join(HERE, "qa_driver_commands_a.ax")
+    if axiom0 is None:
+        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = pack_blobs(blobs)
+    else:
+        _, exp_version, _ = run_axiom0(axiom0, ["version"], expect_rc=0)
+        _, exp_features, _ = run_axiom0(axiom0, ["--features"], expect_rc=0)
+        _, exp_help, _ = run_axiom0(axiom0, ["help"], expect_rc=0)
+        _, _, exp_check_err = run_axiom0(axiom0, ["check", "--std-root=tests/driver", "tests/driver/error.ax"], expect_rc=1)
+        _, _, exp_json_err = run_axiom0(axiom0, ["check", "--std-root=tests/driver", "--json", "tests/driver/error.ax"], expect_rc=1)
 
-    blobs = [
-        b"axiom0",                           # 0
-        b"version",                          # 1
-        b"--features",                       # 2
-        b"help",                             # 3
-        b"check",                            # 4
-        b"run",                              # 5
-        b"--json",                           # 6
-        b"--time-passes",                    # 7
-        b"--interp",                         # 8
-        b"-O1",                              # 9
-        b"tests/driver/test.ax",             # 10
-        b"tests/driver/error.ax",            # 11
-        b"tests/lir/const.mir",              # 12
-        b"--std-root=tests/driver",          # 13
-        b"tests/opt/const_fold_run.ax",      # 14
-        exp_version,                         # 15
-        exp_features,                        # 16
-        exp_help,                            # 17
-        exp_check_err,                       # 18
-        exp_json_err,                        # 19
-        b"time: source    ",                 # 20
-        b"time: lex       ",                 # 21
-        b"time: parse     ",                 # 22
-        b"time: resolve   ",                 # 23
-        b"time: hir       ",                 # 24
-        b"time: typeck    ",                 # 25
-        b"time: own       ",                 # 26
-    ]
-    blob_bytes, offs, lens = pack_blobs(blobs)
+        blobs = [
+            b"axiom0",                           # 0
+            b"version",                          # 1
+            b"--features",                       # 2
+            b"help",                             # 3
+            b"check",                            # 4
+            b"run",                              # 5
+            b"--json",                           # 6
+            b"--time-passes",                    # 7
+            b"--interp",                         # 8
+            b"-O1",                              # 9
+            b"tests/driver/test.ax",             # 10
+            b"tests/driver/error.ax",            # 11
+            b"tests/lir/const.mir",              # 12
+            b"--std-root=tests/driver",          # 13
+            b"tests/opt/const_fold_run.ax",      # 14
+            exp_version,                         # 15
+            exp_features,                        # 16
+            exp_help,                            # 17
+            exp_check_err,                       # 18
+            exp_json_err,                        # 19
+            b"time: source    ",                 # 20
+            b"time: lex       ",                 # 21
+            b"time: parse     ",                 # 22
+            b"time: resolve   ",                 # 23
+            b"time: hir       ",                 # 24
+            b"time: typeck    ",                 # 25
+            b"time: own       ",                 # 26
+        ]
+        blob_bytes, offs, lens = pack_blobs(blobs)
 
     main_src = """\
 module selfhost_driver_commands_a_test
@@ -2152,66 +1286,71 @@ pub fn main() -> i32 {
 }
 """ % {
         "blob_table": byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
     }
 
     header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    write_bytes(os.path.join(HERE, "qa_driver_commands_a.ax"), full_text.encode("utf-8"))
+    return out_path, full_text.encode("utf-8")
 
 
 def gen_commands_b_bundle(prelude, full_mods, axiom0):
-    # Precompute reference COFF .obj and PE32+ .exe outputs from axiom0 build
-    tmp_obj = os.path.join(HERE, "_gen_tmp_ret42.obj")
-    tmp_exe = os.path.join(HERE, "_gen_tmp_ret42.exe")
-    tmp_exe_sr = os.path.join(HERE, "_gen_tmp_ret42_sr.exe")
-    tmp_exe_pkg = os.path.join(HERE, "_gen_tmp_hello.exe")
-    try:
-        run_axiom0(axiom0, ["build", "--emit=obj", "-o", tmp_obj, "tests/mc/frame/main_42.ax"], expect_rc=0)
-        exp_obj = read_bytes(tmp_obj)
-        run_axiom0(axiom0, ["build", "-o", tmp_exe, "tests/mc/frame/main_42.ax"], expect_rc=0)
-        exp_exe = read_bytes(tmp_exe)
-        run_axiom0(axiom0, ["build", "--stack-reserve=2097152", "-o", tmp_exe_sr, "tests/mc/frame/main_42.ax"], expect_rc=0)
-        exp_exe_sr = read_bytes(tmp_exe_sr)
-        run_axiom0(axiom0, ["build", "-o", tmp_exe_pkg, "tests/modules/hello/src/main.ax"], expect_rc=0)
-        exp_exe_pkg = read_bytes(tmp_exe_pkg)
-    finally:
-        for p in (tmp_obj, tmp_exe, tmp_exe_sr, tmp_exe_pkg):
-            if os.path.exists(p):
-                os.remove(p)
+    out_path = os.path.join(HERE, "qa_driver_commands_b.ax")
+    if axiom0 is None:
+        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = pack_blobs(blobs)
+    else:
+        # Precompute reference COFF .obj and PE32+ .exe outputs from axiom0 build
+        tmp_obj = os.path.join(HERE, "_gen_tmp_ret42.obj")
+        tmp_exe = os.path.join(HERE, "_gen_tmp_ret42.exe")
+        tmp_exe_sr = os.path.join(HERE, "_gen_tmp_ret42_sr.exe")
+        tmp_exe_pkg = os.path.join(HERE, "_gen_tmp_hello.exe")
+        try:
+            run_axiom0(axiom0, ["build", "--emit=obj", "-o", tmp_obj, "tests/mc/frame/main_42.ax"], expect_rc=0)
+            exp_obj = read_bytes(tmp_obj)
+            run_axiom0(axiom0, ["build", "-o", tmp_exe, "tests/mc/frame/main_42.ax"], expect_rc=0)
+            exp_exe = read_bytes(tmp_exe)
+            run_axiom0(axiom0, ["build", "--stack-reserve=2097152", "-o", tmp_exe_sr, "tests/mc/frame/main_42.ax"], expect_rc=0)
+            exp_exe_sr = read_bytes(tmp_exe_sr)
+            run_axiom0(axiom0, ["build", "-o", tmp_exe_pkg, "tests/modules/hello/src/main.ax"], expect_rc=0)
+            exp_exe_pkg = read_bytes(tmp_exe_pkg)
+        finally:
+            for p in (tmp_obj, tmp_exe, tmp_exe_sr, tmp_exe_pkg):
+                if os.path.exists(p):
+                    os.remove(p)
 
-    blobs = [
-        b"axiom0",                                     # 0
-        b"check",                                      # 1
-        b"run",                                        # 2
-        b"build",                                      # 3
-        b"--emit=obj",                                 # 4
-        b"-o",                                         # 5
-        b"out_mem.obj",                                # 6
-        b"out_mem.exe",                                # 7
-        b"--stack-reserve=2097152",                    # 8
-        b"tests/mc/frame/main_42.ax",                  # 9
-        b"tests/modules/hello/src/main.ax",            # 10
-        b"tests/modules/mutual/src/main.ax",           # 11
-        b"tests/modules/nested/src/main.ax",           # 12
-        b"tests/modules/prelude_implicit/src/main.ax", # 13
-        b"tests/modules/reexport/src/main.ax",         # 14
-        b"tests/lir/add.mir",                          # 15: uninitialized local -> check/run rc 1
-        exp_obj,                                       # 16
-        exp_exe,                                       # 17
-        exp_exe_sr,                                    # 18
-        exp_exe_pkg,                                   # 19
-        b"build/tmp_driver_test_",                     # 20
-        b".exe",                                       # 21
-        b"--interp",                                   # 22
-        b"-O1",                                        # 23
-        b"tests/opt/const_fold_run.ax",                # 24
-        b"tests/driver/test.ax",                       # 25
-        b"tests/lir/const.mir",                        # 26
-    ]
-    blob_bytes, offs, lens = pack_blobs(blobs)
+        blobs = [
+            b"axiom0",                                     # 0
+            b"check",                                      # 1
+            b"run",                                        # 2
+            b"build",                                      # 3
+            b"--emit=obj",                                 # 4
+            b"-o",                                         # 5
+            b"out_mem.obj",                                # 6
+            b"out_mem.exe",                                # 7
+            b"--stack-reserve=2097152",                    # 8
+            b"tests/mc/frame/main_42.ax",                  # 9
+            b"tests/modules/hello/src/main.ax",            # 10
+            b"tests/modules/mutual/src/main.ax",           # 11
+            b"tests/modules/nested/src/main.ax",           # 12
+            b"tests/modules/prelude_implicit/src/main.ax", # 13
+            b"tests/modules/reexport/src/main.ax",         # 14
+            b"tests/lir/add.mir",                          # 15: uninitialized local -> check/run rc 1
+            exp_obj,                                       # 16
+            exp_exe,                                       # 17
+            exp_exe_sr,                                    # 18
+            exp_exe_pkg,                                   # 19
+            b"build/tmp_driver_test_",                     # 20
+            b".exe",                                       # 21
+            b"--interp",                                   # 22
+            b"-O1",                                        # 23
+            b"tests/opt/const_fold_run.ax",                # 24
+            b"tests/driver/test.ax",                       # 25
+            b"tests/lir/const.mir",                        # 26
+        ]
+        blob_bytes, offs, lens = pack_blobs(blobs)
 
     main_src = """\
 module selfhost_driver_commands_b_test
@@ -2501,59 +1640,64 @@ pub fn main() -> i32 {
 }
 """ % {
         "blob_table": byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
     }
 
     header = "// test: run\n// timeout: 1200\n// modes: native\n\n"
     full_text = header + prelude + "\n" + full_mods + "\n" + main_src
-    write_bytes(os.path.join(HERE, "qa_driver_commands_b.ax"), full_text.encode("utf-8"))
+    return out_path, full_text.encode("utf-8")
 
 
 def gen_boundary_edges_bundle(prelude, light_mods, axiom0):
-    _, _, exp_ver_extra = run_axiom0(axiom0, ["version", "extra_arg"], expect_rc=2)
-    _, _, exp_feat_extra = run_axiom0(axiom0, ["--features", "--all"], expect_rc=2)
-    _, _, exp_emit_empty = run_axiom0(axiom0, ["inspect", "--emit=", "tests/driver/test.ax"], expect_rc=2)
-    _, _, exp_inspect_two = run_axiom0(
-        axiom0,
-        ["inspect", "--emit=ast", "tests/driver/test.ax", "tests/driver/error.ax"],
-        expect_rc=2,
-    )
+    out_path = os.path.join(HERE, "qa_driver_boundary_edges.ax")
+    if axiom0 is None:
+        blobs = bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = pack_blobs(blobs)
+    else:
+        _, _, exp_ver_extra = run_axiom0(axiom0, ["version", "extra_arg"], expect_rc=2)
+        _, _, exp_feat_extra = run_axiom0(axiom0, ["--features", "--all"], expect_rc=2)
+        _, _, exp_emit_empty = run_axiom0(axiom0, ["inspect", "--emit=", "tests/driver/test.ax"], expect_rc=2)
+        _, _, exp_inspect_two = run_axiom0(
+            axiom0,
+            ["inspect", "--emit=ast", "tests/driver/test.ax", "tests/driver/error.ax"],
+            expect_rc=2,
+        )
 
-    blobs = [
-        exp_ver_extra,                                                 # 0
-        exp_feat_extra,                                                # 1
-        exp_emit_empty,                                                # 2
-        exp_inspect_two,                                               # 3
-        b"axiom0: unknown target 'x86_64-unknown-linux-gnu' [AX_DRIVER_UNKNOWN_TARGET]\n",  # 4
-        b"axiom0",                                                     # 5
-        b"version",                                                    # 6
-        b"extra_arg",                                                  # 7
-        b"--features",                                                 # 8
-        b"--all",                                                      # 9
-        b"inspect",                                                    # 10
-        b"--emit=",                                                    # 11
-        b"--emit=ast",                                                 # 12
-        b"tests/driver/test.ax",                                       # 13
-        b"tests/driver/error.ax",                                      # 14
-        b"check",                                                      # 15
-        b"--target=x86_64-unknown-linux-gnu",                          # 16
-        b"run",                                                        # 17
-        b"--",                                                         # 18
-        b"-O1",                                                        # 19
-        b"--json",                                                     # 20
-        b"--unknown-opt",                                              # 21
-        b"src\\nested\\dir\\item.ax",                                  # 22
-        b"nested.dir.item",                                            # 23
-        b"standalone.ax",                                              # 24
-        b"standalone",                                                 # 25
-        b"nonexistent_input_file_xyz.ax",                              # 26
-        b"nonexistent_std_dir_xyz",                                    # 27
-        b"tests/modules/hello",                                        # 28
-        b"hello",                                                      # 29
-    ]
-    blob_bytes, offs, lens = pack_blobs(blobs)
+        blobs = [
+            exp_ver_extra,                                                 # 0
+            exp_feat_extra,                                                # 1
+            exp_emit_empty,                                                # 2
+            exp_inspect_two,                                               # 3
+            b"axiom0: unknown target 'x86_64-unknown-linux-gnu' [AX_DRIVER_UNKNOWN_TARGET]\n",  # 4
+            b"axiom0",                                                     # 5
+            b"version",                                                    # 6
+            b"extra_arg",                                                  # 7
+            b"--features",                                                 # 8
+            b"--all",                                                      # 9
+            b"inspect",                                                    # 10
+            b"--emit=",                                                    # 11
+            b"--emit=ast",                                                 # 12
+            b"tests/driver/test.ax",                                       # 13
+            b"tests/driver/error.ax",                                      # 14
+            b"check",                                                      # 15
+            b"--target=x86_64-unknown-linux-gnu",                          # 16
+            b"run",                                                        # 17
+            b"--",                                                         # 18
+            b"-O1",                                                        # 19
+            b"--json",                                                     # 20
+            b"--unknown-opt",                                              # 21
+            b"src\\nested\\dir\\item.ax",                                  # 22
+            b"nested.dir.item",                                            # 23
+            b"standalone.ax",                                              # 24
+            b"standalone",                                                 # 25
+            b"nonexistent_input_file_xyz.ax",                              # 26
+            b"nonexistent_std_dir_xyz",                                    # 27
+            b"tests/modules/hello",                                        # 28
+            b"hello",                                                      # 29
+        ]
+        blob_bytes, offs, lens = pack_blobs(blobs)
 
     main_src = """\
 module selfhost_driver_boundary_edges_test
@@ -2847,30 +1991,31 @@ pub fn main() -> i32 {
 }
 """ % {
         "blob_table": byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
     }
 
     header = "// test: run\n// timeout: 1200\n// modes: interp native\n\n"
     full_text = header + prelude + "\n" + light_mods + "\n" + main_src
-    write_bytes(os.path.join(HERE, "qa_driver_boundary_edges.ax"), full_text.encode("utf-8"))
+    return out_path, full_text.encode("utf-8")
 
 
 def main():
-    axiom0 = find_exe(["build/axiom0.exe", "build/axiom0"])
+    check_mode = ("--check" in sys.argv[1:]) or ("check" in sys.argv[1:])
+    refresh_goldens = "--refresh-goldens" in sys.argv[1:]
+    axiom0 = find_exe(["build/axiom0.exe", "build/axiom0"]) if refresh_goldens else None
     for i, a in enumerate(sys.argv[1:]):
         if a == "--axiom0" and i + 2 <= len(sys.argv[1:]):
             axiom0 = sys.argv[i + 2]
-    if not axiom0 or not os.path.isfile(axiom0):
-        raise SystemExit("Could not find axiom0 binary; pass --axiom0 <path>")
 
     prelude = build_prelude_text()
     light_mods = assemble_modules(LIGHT_MODULES)
     full_mods = assemble_modules(FULL_MODULES)
 
-    gen_cli_and_project_bundle(prelude, light_mods, axiom0)
-    gen_boundary_edges_bundle(prelude, light_mods, axiom0)
+    outputs = []
+    outputs.append(gen_cli_and_project_bundle(prelude, light_mods, axiom0))
+    outputs.append(gen_boundary_edges_bundle(prelude, light_mods, axiom0))
 
     inspect_cases_a = [
         ("--emit=tokens", False, "tests/driver/test.ax"),
@@ -2882,7 +2027,7 @@ def main():
         ("--emit=mir-opt", True, "tests/driver/test.ax"),
         ("--emit=mir", False, "tests/lir/const.mir"),
     ]
-    gen_inspect_diff_bundle(
+    outputs.append(gen_inspect_diff_bundle(
         "qa_driver_inspect_diff_a.ax",
         "interp native",
         prelude,
@@ -2890,7 +2035,7 @@ def main():
         axiom0,
         inspect_cases_a,
         fast_std=True,
-    )
+    ))
 
     inspect_cases_b = [
         ("--emit=tokens", False, "tests/mc/frame/main_42.ax"),
@@ -2908,7 +2053,7 @@ def main():
         ("--emit=mc", False, "tests/lir/const.mir"),
         ("--emit=hir", False, "tests/modules/hello/src/main.ax"),
     ]
-    gen_inspect_diff_bundle(
+    outputs.append(gen_inspect_diff_bundle(
         "qa_driver_inspect_diff_b.ax",
         "native",
         prelude,
@@ -2916,11 +2061,11 @@ def main():
         axiom0,
         inspect_cases_b,
         fast_std=False,
-    )
+    ))
 
-    gen_commands_a_bundle(prelude, full_mods, axiom0)
-    gen_commands_b_bundle(prelude, full_mods, axiom0)
-    print("Generated 6 selfhost driver test bundles in %s" % HERE)
+    outputs.append(gen_commands_a_bundle(prelude, full_mods, axiom0))
+    outputs.append(gen_commands_b_bundle(prelude, full_mods, axiom0))
+    bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":

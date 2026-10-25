@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T085, T146]
 priority: 115
-status: doing
+status: done
 attempts: 1
 paths: [tests/selfhost]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, spec/SPEC-20-selfhost.md, tasks/0361]
 covers: [REQ-TST-089]
 timeout_min: 240
 started: 2026-10-25 07:36:28
-agent: T144-impl
+finished: 2026-10-26 02:27:34
 ---
 # T144 — Selfhost bundle freshness checks
 
@@ -64,3 +64,5 @@ because the compiler/ front-end files at HEAD do not build together"; only 3 of 
 
 ## Log
 - 2026-10-25 07:36:28 started (attempt 1) T144-impl
+- 2026-10-25 23:39:04 completed T144: all 35 selfhost areas have gen_<area>_tests.py --check and bundles_current.test; 0 function-body divergences across 130,230 functions; all selfhost suites pass in build-snap-T144
+- 2026-10-26 02:27:34 accepted by QA -> done

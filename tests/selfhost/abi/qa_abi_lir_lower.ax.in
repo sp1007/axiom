@@ -1,0 +1,451 @@
+// test: run
+// timeout: 600
+// stdout: OK Win64 LIR ABI Lowering Pass\n
+
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_reset
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrInterner
+use compiler.kernel.interner.StrView
+use compiler.hir.hir.HirFile
+use compiler.types.types.AxType
+use compiler.types.types.TypeInterner
+use compiler.types.types.TY_BUILTIN_PRINT
+use compiler.types.types.TY_BUILTIN_PRINT_INT
+use compiler.types.types.intern_array_ty
+use compiler.types.types.intern_fn_ty
+use compiler.types.types.intern_singleton
+use compiler.types.types.type_get
+use compiler.types.types.type_interner_init
+use compiler.types.types.type_interner_free
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_parse
+use compiler.lir.LIR_VREG_NONE
+use compiler.lir.LIR_INST_ABI_ARG
+use compiler.lir.LIR_INST_ABI_RESULT
+use compiler.lir.LIR_INST_CALL
+use compiler.lir.LIR_TERM_RETURN
+use compiler.lir.LirBb
+use compiler.lir.LirBody
+use compiler.lir.LirInst
+use compiler.lir.lir_bb_at
+use compiler.lir.lir_bb_reset
+use compiler.lir.lir_body_new
+use compiler.lir.lir_inst_at
+use compiler.lir.lir_inst_reset
+use compiler.lir.lir_lower
+use compiler.lir.lir_term_reset
+use compiler.abi.ABI_LOC_REG
+use compiler.abi.ABI_LOC_STACK
+use compiler.abi.ABI_LOC_INDIRECT
+use compiler.abi.Abi
+use compiler.abi.abi_win64
+use compiler.abi.ax_lir_lower_abi
+use compiler.abi.lir_lower_abi
+use compiler.abi.lir_lower_abi_in_arena
+use compiler.abi.lir_lower_win64_abi
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+const MIR_ENTRY_ARGS: [167]u8 = [
+    109u8, 105u8, 114u8, 95u8, 98u8, 111u8, 100u8, 121u8, 32u8, 123u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 48u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 49u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 50u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 51u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 52u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 108u8, 101u8, 116u8, 32u8, 95u8, 53u8, 58u8, 32u8, 116u8, 121u8, 112u8, 101u8, 35u8, 55u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 98u8, 98u8, 48u8, 58u8, 32u8, 123u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 114u8, 101u8, 116u8, 117u8, 114u8, 110u8, 59u8, 10u8,
+    32u8, 32u8, 32u8, 32u8, 125u8, 10u8,
+    125u8, 10u8, 0u8
+];
+
+unsafe fn set_param(base: *mut TypeId, idx: usize, ty_v: u32) {
+    let off = ((idx as isize) * (size_of<TypeId>() as isize)) as usize;
+    let p = ((base as usize) + off) as *mut TypeId;
+    (*p).v = ty_v;
+}
+
+unsafe fn mk_arr(ti_ptr: *mut TypeInterner, elem_v: u32, count: u64) -> u32 {
+    let id = intern_array_ty(mut_view(*ti_ptr), TypeId { v: elem_v }, count);
+    id.v
+}
+
+unsafe fn mk_fn(ti_ptr: *mut TypeInterner, params: *mut TypeId, count: usize, ret_v: u32) -> u32 {
+    let id = intern_fn_ty(mut_view(*ti_ptr), false, StrId { v: 0u32 }, params, count, TypeId { v: ret_v });
+    id.v
+}
+
+unsafe fn get_ty(ti_ptr: *mut TypeInterner, id_v: u32) -> *const AxType {
+    type_get(view(*ti_ptr), TypeId { v: id_v }) as *const AxType
+}
+
+// Test 1: Incoming ABI_ARG instructions lowered from MIR + fn_ty through lir_lower + lir_lower_abi
+fn test_incoming_abi_args_from_mir(a: mut_view<Arena>, ti_ptr: *mut TypeInterner) -> i32 {
+    let sv = StrView {
+        ptr: unsafe { address_of(MIR_ENTRY_ARGS[0]) },
+        len: 166,
+    };
+    let mir_body = mir_parse(sv, unsafe { mut_view(*ti_ptr) }, mut_view(*a));
+    if (mir_body as usize) == 0 {
+        return 101;
+    }
+
+    let i32_v = unsafe { (*ti_ptr).t_i32.v };
+    let arr16_v = unsafe { mk_arr(ti_ptr, i32_v, 4u64) };
+    let params = arena_alloc_raw(mut_view(*a), 5 * size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId;
+    unsafe {
+        set_param(params, 0, i32_v);    // arg 0: scalar -> RCX (1)
+        set_param(params, 1, arr16_v);  // arg 1: 16B agg -> INDIRECT RDX (2)
+        set_param(params, 2, i32_v);    // arg 2: scalar -> R8 (8)
+        set_param(params, 3, i32_v);    // arg 3: scalar -> R9 (9)
+        set_param(params, 4, i32_v);    // arg 4: scalar -> STACK (32)
+    }
+    let fn_ty_v = unsafe { mk_fn(ti_ptr, params, 5, i32_v) };
+    let fn_ty_ptr = unsafe { get_ty(ti_ptr, fn_ty_v) };
+
+    let lir_body = lir_lower(
+        mut_view(*a),
+        mir_body,
+        0 as *const HirFile,
+        ti_ptr,
+        0 as *const StrInterner,
+        fn_ty_ptr
+    );
+    if (lir_body as usize) == 0 {
+        return 102;
+    }
+
+    lir_lower_win64_abi(lir_body, ti_ptr, fn_ty_ptr);
+
+    if (unsafe { (*lir_body).frame_req.max_outgoing_args_bytes }) != 32u32 {
+        return 103;
+    }
+    if !(unsafe { (*lir_body).frame_req.requires_16_byte_alignment }) {
+        return 104;
+    }
+
+    let bb0 = unsafe { lir_bb_at((*lir_body).bbs, 0) };
+    // Each of the 5 parameters emits: abi_arg, stack_addr, store (3 instructions per param = 15 insts)
+    if (unsafe { (*bb0).inst_count }) < 15 {
+        return 105;
+    }
+    let a0 = unsafe { lir_inst_at((*bb0).insts, 0) };
+    let a1 = unsafe { lir_inst_at((*bb0).insts, 3) };
+    let a2 = unsafe { lir_inst_at((*bb0).insts, 6) };
+    let a3 = unsafe { lir_inst_at((*bb0).insts, 9) };
+    let a4 = unsafe { lir_inst_at((*bb0).insts, 12) };
+
+    if (unsafe { (*a0).kind }) != LIR_INST_ABI_ARG ||
+       (unsafe { (*a0).loc_kind }) != ABI_LOC_REG ||
+       (unsafe { (*a0).loc_reg_or_offset }) != 1u32 {
+        return 106;
+    }
+    if (unsafe { (*a1).kind }) != LIR_INST_ABI_ARG ||
+       (unsafe { (*a1).loc_kind }) != ABI_LOC_INDIRECT ||
+       (unsafe { (*a1).loc_reg_or_offset }) != 2u32 {
+        return 107;
+    }
+    if (unsafe { (*a2).kind }) != LIR_INST_ABI_ARG ||
+       (unsafe { (*a2).loc_kind }) != ABI_LOC_REG ||
+       (unsafe { (*a2).loc_reg_or_offset }) != 8u32 {
+        return 108;
+    }
+    if (unsafe { (*a3).kind }) != LIR_INST_ABI_ARG ||
+       (unsafe { (*a3).loc_kind }) != ABI_LOC_REG ||
+       (unsafe { (*a3).loc_reg_or_offset }) != 9u32 {
+        return 109;
+    }
+    if (unsafe { (*a4).kind }) != LIR_INST_ABI_ARG ||
+       (unsafe { (*a4).loc_kind }) != ABI_LOC_STACK ||
+       (unsafe { (*a4).loc_reg_or_offset }) != 32u32 {
+        return 110;
+    }
+
+    arena_reset(mut_view(*a));
+    0
+}
+
+// Test 2: Outgoing call arguments, sret shifting, ABI_RESULT, and max_outgoing_args_bytes tracking
+fn test_outgoing_call_args_and_results(a: mut_view<Arena>, ti_ptr: *mut TypeInterner) -> i32 {
+    let i32_v = unsafe { (*ti_ptr).t_i32.v };
+    let unit_ty = unsafe { (*ti_ptr).t_unit };
+    let arr16_v = unsafe { mk_arr(ti_ptr, i32_v, 4u64) };
+
+    // Callee 1: 6 i32 params -> i32 (shadow_space=32, stack_args_size=16 -> outgoing=48)
+    let c1_params = arena_alloc_raw(mut_view(*a), 6 * size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId;
+    unsafe {
+        set_param(c1_params, 0, i32_v);
+        set_param(c1_params, 1, i32_v);
+        set_param(c1_params, 2, i32_v);
+        set_param(c1_params, 3, i32_v);
+        set_param(c1_params, 4, i32_v);
+        set_param(c1_params, 5, i32_v);
+    }
+    let callee1_ty_v = unsafe { mk_fn(ti_ptr, c1_params, 6, i32_v) };
+    let callee1_ty = TypeId { v: callee1_ty_v };
+
+    // Callee 2: sret [4]i32 return + 4 params ([4]i32, i32, i32, [4]i32)
+    // sret in RCX (1), arg0 in RDX (2, INDIRECT), arg1 in R8 (8, REG), arg2 in R9 (9, REG),
+    // arg3 on stack at 32 (INDIRECT, loc_reg_or_offset=32), outgoing = 40
+    let c2_params = arena_alloc_raw(mut_view(*a), 4 * size_of<TypeId>(), align_of<TypeId>()) as *mut TypeId;
+    unsafe {
+        set_param(c2_params, 0, arr16_v);
+        set_param(c2_params, 1, i32_v);
+        set_param(c2_params, 2, i32_v);
+        set_param(c2_params, 3, arr16_v);
+    }
+    let callee2_ty_v = unsafe { mk_fn(ti_ptr, c2_params, 4, arr16_v) };
+    let callee2_ty = TypeId { v: callee2_ty_v };
+
+    // Enclosing function: () -> [4]i32 (sret in RCX=1)
+    let outer_fn_ty_v = unsafe { mk_fn(ti_ptr, 0 as *mut TypeId, 0, arr16_v) };
+    let outer_fn_ptr = unsafe { get_ty(ti_ptr, outer_fn_ty_v) };
+
+    let body = lir_body_new(mut_view(*a));
+    let bbs = arena_alloc_raw(mut_view(*a), 2 * size_of<LirBb>(), align_of<LirBb>()) as *mut LirBb;
+    let bb0 = unsafe { lir_bb_at(bbs, 0) };
+    let bb1 = unsafe { lir_bb_at(bbs, 1) };
+    unsafe {
+        lir_bb_reset(mut_view(*bb0), 0u32);
+        lir_bb_reset(mut_view(*bb1), 1u32);
+    }
+
+    // bb0: 6 ABI_ARGs + CALL(callee1) + ABI_RESULT + 4 ABI_ARGs + CALL(callee2) + ABI_RESULT (14 insts)
+    let insts0 = arena_alloc_raw(mut_view(*a), 14 * size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    let mut k: usize = 0;
+    while k < 6 {
+        let p = unsafe { lir_inst_at(insts0, k) };
+        unsafe {
+            lir_inst_reset(mut_view(*p), LIR_INST_ABI_ARG);
+            (*p).dest.v = LIR_VREG_NONE;
+            (*p).index = k as u32;
+            (*p).val.v = k as u32;
+        }
+        k = k + 1;
+    }
+    let call1 = unsafe { lir_inst_at(insts0, 6) };
+    unsafe {
+        lir_inst_reset(mut_view(*call1), LIR_INST_CALL);
+        (*call1).callee_ty.v = callee1_ty.v;
+    }
+    let res1 = unsafe { lir_inst_at(insts0, 7) };
+    unsafe {
+        lir_inst_reset(mut_view(*res1), LIR_INST_ABI_RESULT);
+        (*res1).dest.v = 10u32;
+    }
+
+    let mut m: usize = 0;
+    while m < 4 {
+        let p = unsafe { lir_inst_at(insts0, 8 + m) };
+        unsafe {
+            lir_inst_reset(mut_view(*p), LIR_INST_ABI_ARG);
+            (*p).dest.v = LIR_VREG_NONE;
+            (*p).index = m as u32;
+            (*p).val.v = (20 + m) as u32;
+        }
+        m = m + 1;
+    }
+    let call2 = unsafe { lir_inst_at(insts0, 12) };
+    unsafe {
+        lir_inst_reset(mut_view(*call2), LIR_INST_CALL);
+        (*call2).callee_ty.v = callee2_ty.v;
+    }
+    let res2 = unsafe { lir_inst_at(insts0, 13) };
+    unsafe {
+        lir_inst_reset(mut_view(*res2), LIR_INST_ABI_RESULT);
+        (*res2).dest.v = 30u32;
+    }
+
+    // bb1: standalone ABI_RESULT without preceding CALL (falls back to outer_fn_ty sig.ret)
+    let insts1 = arena_alloc_raw(mut_view(*a), size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    let res_fallback = unsafe { lir_inst_at(insts1, 0) };
+    unsafe {
+        lir_inst_reset(mut_view(*res_fallback), LIR_INST_ABI_RESULT);
+        (*res_fallback).dest.v = 40u32;
+    }
+
+    unsafe {
+        (*bb0).insts = insts0;
+        (*bb0).inst_count = 14;
+        lir_term_reset(mut_view((*bb0).term), LIR_TERM_RETURN);
+
+        (*bb1).insts = insts1;
+        (*bb1).inst_count = 1;
+        lir_term_reset(mut_view((*bb1).term), LIR_TERM_RETURN);
+
+        (*body).bbs = bbs;
+        (*body).bb_count = 2;
+    }
+
+    let abi = abi_win64();
+    lir_lower_abi_in_arena(body, ti_ptr, view(abi), outer_fn_ptr, mut_view(*a));
+
+    // max_outgoing_args_bytes should be max(32, 48, 40) == 48
+    if (unsafe { (*body).frame_req.max_outgoing_args_bytes }) != 48u32 {
+        return 201;
+    }
+    if !(unsafe { (*body).frame_req.requires_16_byte_alignment }) {
+        return 202;
+    }
+
+    // Verify Call 1 outgoing args and result
+    let c1_a0 = unsafe { lir_inst_at(insts0, 0) };
+    let c1_a1 = unsafe { lir_inst_at(insts0, 1) };
+    let c1_a2 = unsafe { lir_inst_at(insts0, 2) };
+    let c1_a3 = unsafe { lir_inst_at(insts0, 3) };
+    let c1_a4 = unsafe { lir_inst_at(insts0, 4) };
+    let c1_a5 = unsafe { lir_inst_at(insts0, 5) };
+    if (unsafe { (*c1_a0).loc_kind }) != ABI_LOC_REG || (unsafe { (*c1_a0).loc_reg_or_offset }) != 1u32 ||
+       (unsafe { (*c1_a1).loc_kind }) != ABI_LOC_REG || (unsafe { (*c1_a1).loc_reg_or_offset }) != 2u32 ||
+       (unsafe { (*c1_a2).loc_kind }) != ABI_LOC_REG || (unsafe { (*c1_a2).loc_reg_or_offset }) != 8u32 ||
+       (unsafe { (*c1_a3).loc_kind }) != ABI_LOC_REG || (unsafe { (*c1_a3).loc_reg_or_offset }) != 9u32 ||
+       (unsafe { (*c1_a4).loc_kind }) != ABI_LOC_STACK || (unsafe { (*c1_a4).loc_reg_or_offset }) != 32u32 ||
+       (unsafe { (*c1_a5).loc_kind }) != ABI_LOC_STACK || (unsafe { (*c1_a5).loc_reg_or_offset }) != 40u32 {
+        return 203;
+    }
+    if (unsafe { (*res1).loc_kind }) != ABI_LOC_REG || (unsafe { (*res1).loc_reg_or_offset }) != 0u32 {
+        return 204;
+    }
+
+    // Verify Call 2 outgoing args (shifted by sret in RCX) and result
+    let c2_a0 = unsafe { lir_inst_at(insts0, 8) };
+    let c2_a1 = unsafe { lir_inst_at(insts0, 9) };
+    let c2_a2 = unsafe { lir_inst_at(insts0, 10) };
+    let c2_a3 = unsafe { lir_inst_at(insts0, 11) };
+    if (unsafe { (*c2_a0).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*c2_a0).loc_reg_or_offset }) != 2u32 {
+        return 205;
+    }
+    if (unsafe { (*c2_a1).loc_kind }) != ABI_LOC_REG || (unsafe { (*c2_a1).loc_reg_or_offset }) != 8u32 {
+        return 206;
+    }
+    if (unsafe { (*c2_a2).loc_kind }) != ABI_LOC_REG || (unsafe { (*c2_a2).loc_reg_or_offset }) != 9u32 {
+        return 207;
+    }
+    if (unsafe { (*c2_a3).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*c2_a3).loc_reg_or_offset }) != 32u32 {
+        return 208;
+    }
+    if (unsafe { (*res2).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*res2).loc_reg_or_offset }) != 1u32 {
+        return 209;
+    }
+
+    // Verify bb1 standalone ABI_RESULT fallback to outer_fn_ty (sret in RCX=1)
+    if (unsafe { (*res_fallback).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*res_fallback).loc_reg_or_offset }) != 1u32 {
+        return 210;
+    }
+
+    let _ = unit_ty.v;
+    arena_reset(mut_view(*a));
+    0
+}
+
+// Test 3: Builtin calls (TY_BUILTIN_PRINT and TY_BUILTIN_PRINT_INT) and ax_lir_lower_abi C-style entrypoint
+fn test_builtin_calls_and_c_entrypoints(a: mut_view<Arena>, ti_ptr: *mut TypeInterner) -> i32 {
+    // Null body guard should not crash
+    ax_lir_lower_abi(0 as *mut LirBody, ti_ptr, 0 as *const Abi, 0 as *const AxType);
+
+    let print_ty = unsafe { intern_singleton(mut_view(*ti_ptr), TY_BUILTIN_PRINT) };
+    let print_int_ty = unsafe { intern_singleton(mut_view(*ti_ptr), TY_BUILTIN_PRINT_INT) };
+
+    let body = lir_body_new(mut_view(*a));
+    let bbs = arena_alloc_raw(mut_view(*a), size_of<LirBb>(), align_of<LirBb>()) as *mut LirBb;
+    let bb0 = unsafe { lir_bb_at(bbs, 0) };
+    unsafe { lir_bb_reset(mut_view(*bb0), 0u32); }
+
+    let insts = arena_alloc_raw(mut_view(*a), 4 * size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    let i0 = unsafe { lir_inst_at(insts, 0) };
+    let i1 = unsafe { lir_inst_at(insts, 1) };
+    let i2 = unsafe { lir_inst_at(insts, 2) };
+    let i3 = unsafe { lir_inst_at(insts, 3) };
+    unsafe {
+        lir_inst_reset(mut_view(*i0), LIR_INST_ABI_ARG);
+        (*i0).dest.v = LIR_VREG_NONE;
+        (*i0).index = 0u32;
+        (*i0).val.v = 1u32;
+
+        lir_inst_reset(mut_view(*i1), LIR_INST_CALL);
+        (*i1).callee_ty.v = print_ty.v;
+
+        lir_inst_reset(mut_view(*i2), LIR_INST_ABI_ARG);
+        (*i2).dest.v = LIR_VREG_NONE;
+        (*i2).index = 0u32;
+        (*i2).val.v = 2u32;
+
+        lir_inst_reset(mut_view(*i3), LIR_INST_CALL);
+        (*i3).callee_ty.v = print_int_ty.v;
+
+        (*bb0).insts = insts;
+        (*bb0).inst_count = 4;
+        lir_term_reset(mut_view((*bb0).term), LIR_TERM_RETURN);
+
+        (*body).bbs = bbs;
+        (*body).bb_count = 1;
+    }
+
+    // Call with null Abi pointer (defaults to win64) and null fn_ty
+    ax_lir_lower_abi(body, ti_ptr, 0 as *const Abi, 0 as *const AxType);
+
+    if (unsafe { (*body).frame_req.max_outgoing_args_bytes }) != 32u32 {
+        return 301;
+    }
+    if !(unsafe { (*body).frame_req.requires_16_byte_alignment }) {
+        return 302;
+    }
+    // print(str) passes 16-byte str via ABI_LOC_INDIRECT in RCX (1)
+    if (unsafe { (*i0).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*i0).loc_reg_or_offset }) != 1u32 {
+        return 303;
+    }
+    // print_int(i64) passes 8-byte i64 via ABI_LOC_REG in RCX (1)
+    if (unsafe { (*i2).loc_kind }) != ABI_LOC_REG || (unsafe { (*i2).loc_reg_or_offset }) != 1u32 {
+        return 304;
+    }
+
+    let abi = abi_win64();
+    lir_lower_abi(body, ti_ptr, view(abi), 0 as *const AxType);
+    if (unsafe { (*i0).loc_kind }) != ABI_LOC_INDIRECT || (unsafe { (*i2).loc_kind }) != ABI_LOC_REG {
+        return 305;
+    }
+
+    arena_reset(mut_view(*a));
+    0
+}
+
+pub fn main() -> i32 {
+    let mut perm = arena_with_chunk_size(131072);
+    let _ = arena_alloc_raw(mut_view(perm), 16, 8);
+    let mut a = arena_with_chunk_size(131072);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+
+    let ti_ptr = arena_alloc_raw(mut_view(perm), size_of<TypeInterner>(), align_of<TypeInterner>()) as *mut TypeInterner;
+    unsafe { type_interner_init(mut_view(*ti_ptr)); }
+
+    let rc1 = test_incoming_abi_args_from_mir(mut_view(a), ti_ptr);
+    if rc1 != 0 {
+        return rc1;
+    }
+
+    let rc2 = test_outgoing_call_args_and_results(mut_view(a), ti_ptr);
+    if rc2 != 0 {
+        return rc2;
+    }
+
+    let rc3 = test_builtin_calls_and_c_entrypoints(mut_view(a), ti_ptr);
+    if rc3 != 0 {
+        return rc3;
+    }
+
+    unsafe { type_interner_free(mut_view(*ti_ptr)); }
+    arena_destroy(mut_view(a));
+    arena_destroy(mut_view(perm));
+    print("OK Win64 LIR ABI Lowering Pass\n");
+    0
+}

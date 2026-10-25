@@ -1,0 +1,365 @@
+// test: run
+// timeout: 600
+// stdout: OK Own Cap\n
+
+module main
+
+use host_intrinsics.heap_alloc
+use host_intrinsics.heap_free
+use host_intrinsics.exit
+use compiler.diag.code.AX_CAP_CONFLICT_MUT
+use compiler.diag.code.AX_CAP_CONFLICT_READ
+use compiler.diag.code.AX_CAP_OUTLIVES_OWNER
+use compiler.kernel.arena.Arena
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.kernel.id.FileId
+use compiler.mir.mir.MIR_BORROW_MUT
+use compiler.mir.mir.MIR_BORROW_SHARED
+use compiler.mir.mir.MIR_LOCAL_USER
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_REGION_CONTAINS
+use compiler.mir.mir.MIR_REGION_DISJOINT
+use compiler.mir.mir.MIR_REGION_OVERLAPS
+use compiler.mir.mir.MIR_REGION_SAME
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_VIEW_MUT
+use compiler.mir.mir.MIR_VIEW_READ
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirStmt
+use compiler.source.span.Span
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_new
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_init
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_reset
+use compiler.own.cap.mir_cap_tracker_add
+use compiler.own.cap.mir_cap_tracker_check_conflict
+use compiler.own.cap.mir_cap_tracker_new
+use compiler.own.cap.mir_cap_tracker_pop
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_place_local
+use compiler.mir.mir.mir_proj_reset
+use compiler.mir.mir.mir_region_relate
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.types.types.mul_usize
+use compiler.own.cap.own_cap_check
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn null_mut<T>() -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }
+
+unsafe fn test_diag_ptr(diags: *mut Diagnostic, idx: usize) -> *mut Diagnostic {
+    diags + idx
+}
+
+// --- Test Helpers ---
+fn assert_true(cond: bool, code: i32) {
+    if !cond {
+        exit(code);
+    }
+}
+
+fn make_span(file_v: u32, start: u32, end: u32) -> Span {
+    Span {
+        file: FileId { v: file_v },
+        start: start,
+        end: end,
+    }
+}
+
+fn set_span(sp: mut_view<Span>, file_v: u32, start: u32, end: u32) {
+    sp.file.v = file_v;
+    sp.start = start;
+    sp.end = end;
+}
+
+fn set_place_local(p: mut_view<MirPlace>, local_v: u32) {
+    p.local.v = local_v;
+    p.projs = 0 as *mut MirProjection;
+    p.proj_count = 0;
+}
+
+fn set_place_field(arena: mut_view<Arena>, p: mut_view<MirPlace>, local_v: u32, field_idx: u32) {
+    let pr_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pr = pr_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pr), MIR_PROJ_FIELD);
+        (*pr).field_idx = field_idx;
+    }
+    p.local.v = local_v;
+    p.projs = pr;
+    p.proj_count = 1;
+}
+
+fn alloc_locals(arena: mut_view<Arena>, count: usize) -> *mut MirLocalDecl {
+    let bytes = mul_usize(count, size_of<MirLocalDecl>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirLocalDecl>());
+    let ptr = raw as *mut MirLocalDecl;
+    let mut i: usize = 0;
+    while (i < count) {
+        let lp = unsafe { mir_local_at(ptr, i) };
+        unsafe {
+            (*lp).kind = MIR_LOCAL_USER;
+            (*lp).mut_flag = true;
+            (*lp).ty.v = 0u32;
+            (*lp).location.file.v = 1u32;
+            (*lp).location.start = 0u32;
+            (*lp).location.end = 0u32;
+            (*lp).const_sym.v = 0u32;
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn set_local(locals: *mut MirLocalDecl, idx: usize, kind: u8, ty_v: u32) {
+    let lp = unsafe { mir_local_at(locals, idx) };
+    unsafe {
+        (*lp).kind = kind;
+        (*lp).mut_flag = true;
+        (*lp).ty.v = ty_v;
+    }
+}
+
+fn alloc_bbs(arena: mut_view<Arena>, count: usize) -> *mut MirBb {
+    let bytes = mul_usize(count, size_of<MirBb>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirBb>());
+    let ptr = raw as *mut MirBb;
+    let mut i: usize = 0;
+    while (i < count) {
+        let bp = unsafe { mir_bb_at(ptr, i) };
+        unsafe {
+            mir_bb_reset(mut_view(*bp), MirBbId { v: i as u32 });
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn alloc_stmts(arena: mut_view<Arena>, count: usize) -> *mut MirStmt {
+    let bytes = mul_usize(count, size_of<MirStmt>());
+    let raw = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirStmt>());
+    let ptr = raw as *mut MirStmt;
+    let zspan = make_span(1u32, 0u32, 0u32);
+    let mut i: usize = 0;
+    while (i < count) {
+        let sp = unsafe { mir_stmt_at(ptr, i) };
+        unsafe {
+            mir_stmt_reset(mut_view(*sp), MIR_STMT_ASSIGN, view(zspan));
+        }
+        i = i + 1;
+    }
+    ptr
+}
+
+fn alloc_mir_body(arena: mut_view<Arena>, fn_v: u32, arg_count: usize, local_count: usize, bb_count: usize) -> *mut MirBody {
+    let raw = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>());
+    let b = raw as *mut MirBody;
+    let locals = alloc_locals(mut_view(*arena), local_count);
+    let bbs = alloc_bbs(mut_view(*arena), bb_count);
+    unsafe {
+        (*b).fn_sym.v = fn_v;
+        (*b).fn_name.v = fn_v;
+        (*b).arg_count = arg_count;
+        (*b).locals = locals;
+        (*b).local_count = local_count;
+        (*b).local_cap = local_count;
+        (*b).bbs = bbs;
+        (*b).bb_count = bb_count;
+        (*b).bb_cap = bb_count;
+        (*b).drop_flag_count = 0;
+    }
+    b
+}
+
+fn make_field_place(arena: mut_view<Arena>, local_v: u32, field_idx: u32) -> MirPlace {
+    let mut p = mir_place_local(MirLocalId { v: local_v });
+    let pr_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pr = pr_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pr), MIR_PROJ_FIELD);
+        (*pr).field_idx = field_idx;
+    }
+    p.projs = pr;
+    p.proj_count = 1;
+    p
+}
+
+fn test_mir_region_relate(arena: mut_view<Arena>) {
+    let p1 = mir_place_local(MirLocalId { v: 1u32 });
+    let p2 = mir_place_local(MirLocalId { v: 2u32 });
+    assert_true(mir_region_relate(view(p1), view(p2)) == MIR_REGION_DISJOINT, 1);
+    assert_true(mir_region_relate(view(p1), view(p1)) == MIR_REGION_SAME, 2);
+
+    let p1_f0 = make_field_place(mut_view(*arena), 1u32, 0u32);
+    let p1_f1 = make_field_place(mut_view(*arena), 1u32, 1u32);
+    assert_true(mir_region_relate(view(p1), view(p1_f0)) == MIR_REGION_CONTAINS, 3);
+    assert_true(mir_region_relate(view(p1_f0), view(p1)) == MIR_REGION_OVERLAPS, 4);
+    assert_true(mir_region_relate(view(p1_f0), view(p1_f1)) == MIR_REGION_DISJOINT, 5);
+    assert_true(mir_region_relate(view(p1_f0), view(p1_f0)) == MIR_REGION_SAME, 6);
+
+    // Adjacent sub-slices: _1[_2.._3] vs _1[_3.._4] -> DISJOINT
+    let mut s_a = mir_place_local(MirLocalId { v: 1u32 });
+    let pa_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pa = pa_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pa), MIR_PROJ_SUB_SLICE);
+        (*pa).has_from = true;
+        (*pa).from_local.v = 2u32;
+        (*pa).has_to = true;
+        (*pa).to_local.v = 3u32;
+    }
+    s_a.projs = pa;
+    s_a.proj_count = 1;
+
+    let mut s_b = mir_place_local(MirLocalId { v: 1u32 });
+    let pb_raw = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>());
+    let pb = pb_raw as *mut MirProjection;
+    unsafe {
+        mir_proj_reset(mut_view(*pb), MIR_PROJ_SUB_SLICE);
+        (*pb).has_from = true;
+        (*pb).from_local.v = 3u32;
+        (*pb).has_to = true;
+        (*pb).to_local.v = 4u32;
+    }
+    s_b.projs = pb;
+    s_b.proj_count = 1;
+
+    assert_true(mir_region_relate(view(s_a), view(s_b)) == MIR_REGION_DISJOINT, 7);
+    assert_true(mir_region_relate(view(s_b), view(s_a)) == MIR_REGION_DISJOINT, 8);
+    assert_true(mir_region_relate(view(s_a), view(s_a)) == MIR_REGION_SAME, 9);
+}
+
+fn test_cap_tracker_and_conflicts(arena: mut_view<Arena>, sink: mut_view<DiagSink>) {
+    let tracker = mir_cap_tracker_new(mut_view(*arena));
+    let p1_f0 = make_field_place(mut_view(*arena), 1u32, 0u32);
+    let p1_f1 = make_field_place(mut_view(*arena), 1u32, 1u32);
+    let p1 = mir_place_local(MirLocalId { v: 1u32 });
+
+    unsafe {
+        mir_cap_tracker_add(mut_view(*tracker), mut_view(*arena), view(p1_f0), MIR_VIEW_MUT);
+        assert_true((*tracker).count == 1, 10);
+        // Disjoint field _1.1 does not conflict with _1.0
+        assert_true(!mir_cap_tracker_check_conflict(view(*tracker), view(p1_f1), MIR_VIEW_MUT), 11);
+        // Whole _1 conflicts with active mutable borrow on _1.0
+        assert_true(mir_cap_tracker_check_conflict(view(*tracker), view(p1), MIR_VIEW_READ), 12);
+        mir_cap_tracker_pop(mut_view(*tracker));
+        assert_true(!mir_cap_tracker_check_conflict(view(*tracker), view(p1), MIR_VIEW_MUT), 13);
+    }
+
+    // Build MirBody to test own_cap_check:
+    // Case 1: _2 = &_1; _3 = &mut _1; _4 = copy _2 -> AX_CAP_CONFLICT_MUT (91)
+    let body = alloc_mir_body(mut_view(*arena), 1u32, 1, 5, 1);
+    let b_bbs = unsafe { (*body).bbs };
+    let bb0 = unsafe { mir_bb_at(b_bbs, 0) };
+    let stmts = alloc_stmts(mut_view(*arena), 3);
+    let s0 = unsafe { mir_stmt_at(stmts, 0) };
+    let s1 = unsafe { mir_stmt_at(stmts, 1) };
+    let s2 = unsafe { mir_stmt_at(stmts, 2) };
+    let sp1 = make_span(1u32, 10u32, 20u32);
+    let sp2 = make_span(1u32, 30u32, 40u32);
+    let sp3 = make_span(1u32, 50u32, 60u32);
+    unsafe {
+        mir_stmt_reset(mut_view(*s0), MIR_STMT_ASSIGN, view(sp1));
+        set_place_local(mut_view((*s0).place), 2u32);
+        (*s0).rvalue.kind = MIR_RVALUE_REF;
+        (*s0).rvalue.borrow_kind = MIR_BORROW_SHARED;
+        set_place_local(mut_view((*s0).rvalue.place), 1u32);
+
+        mir_stmt_reset(mut_view(*s1), MIR_STMT_ASSIGN, view(sp2));
+        set_place_local(mut_view((*s1).place), 3u32);
+        (*s1).rvalue.kind = MIR_RVALUE_REF;
+        (*s1).rvalue.borrow_kind = MIR_BORROW_MUT;
+        set_place_local(mut_view((*s1).rvalue.place), 1u32);
+
+        mir_stmt_reset(mut_view(*s2), MIR_STMT_ASSIGN, view(sp3));
+        set_place_local(mut_view((*s2).place), 4u32);
+        (*s2).rvalue.kind = MIR_RVALUE_USE;
+        (*s2).rvalue.use_op.kind = MIR_OP_COPY;
+        set_place_local(mut_view((*s2).rvalue.use_op.place), 2u32);
+
+        (*bb0).stmts = stmts;
+        (*bb0).stmt_count = 3;
+        (*bb0).has_terminator = true;
+        mir_term_reset(mut_view((*bb0).terminator), MIR_TERM_RETURN, view(sp3));
+        own_cap_check(view(*body), mut_view(*sink));
+    }
+    assert_true(sink.errors == 1, 14);
+    let d0 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d0).code.v }) == AX_CAP_CONFLICT_MUT, 15);
+
+    // Case 2: _2 = &mut _1; _3 = &_1; _4 = copy _2 -> AX_CAP_CONFLICT_READ (92)
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    unsafe {
+        (*s0).rvalue.borrow_kind = MIR_BORROW_MUT;
+        (*s1).rvalue.borrow_kind = MIR_BORROW_SHARED;
+        own_cap_check(view(*body), mut_view(*sink));
+    }
+    assert_true(sink.errors == 1, 16);
+    let d1 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d1).code.v }) == AX_CAP_CONFLICT_READ, 17);
+
+    // Case 3: Disjoint field mutable borrows: _2 = &mut _1.0; _3 = &mut _1.1; _4 = copy _2 -> 0 errors!
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    unsafe {
+        (*s0).rvalue.borrow_kind = MIR_BORROW_MUT;
+        set_place_field(mut_view(*arena), mut_view((*s0).rvalue.place), 1u32, 0u32);
+        (*s1).rvalue.borrow_kind = MIR_BORROW_MUT;
+        set_place_field(mut_view(*arena), mut_view((*s1).rvalue.place), 1u32, 1u32);
+        own_cap_check(view(*body), mut_view(*sink));
+    }
+    assert_true(sink.errors == 0, 18);
+
+    // Case 4: View outlives owner: _1 = &_3 (dest local 1 < owner local 3) -> AX_CAP_OUTLIVES_OWNER (93)
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    unsafe {
+        set_place_local(mut_view((*s0).place), 1u32);
+        (*s0).rvalue.kind = MIR_RVALUE_REF;
+        (*s0).rvalue.borrow_kind = MIR_BORROW_SHARED;
+        set_place_local(mut_view((*s0).rvalue.place), 3u32);
+        (*bb0).stmt_count = 1;
+        own_cap_check(view(*body), mut_view(*sink));
+    }
+    assert_true(sink.errors == 1, 19);
+    let d2 = unsafe { test_diag_ptr(sink.diags, 0) };
+    assert_true((unsafe { (*d2).code.v }) == AX_CAP_OUTLIVES_OWNER, 20);
+}
+
+pub fn main() -> i32 {
+    let mut arena: Arena = arena_new();
+    let sink_ptr = arena_alloc_raw(mut_view(arena), size_of<DiagSink>(), align_of<DiagSink>()) as *mut DiagSink;
+    unsafe {
+        diag_sink_init(mut_view(*sink_ptr));
+        test_mir_region_relate(mut_view(arena));
+        test_cap_tracker_and_conflicts(mut_view(arena), mut_view(*sink_ptr));
+        diag_sink_free(mut_view(*sink_ptr));
+    }
+    arena_destroy(mut_view(arena));
+    print("OK Own Cap\n");
+    0
+}

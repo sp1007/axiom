@@ -446,35 +446,41 @@ pub fn main() -> i32 {
 
 
 def gen_diff_bundle(filename, modes, corpus, prelude, full_mods, axiom0, lite=False):
-    nonexistent = "tests/nonexistent_t085.ax"
-    rc_a, _o_a, err_a = drv.run_axiom0(axiom0, ["build", "-o", "out_mem.exe", nonexistent])
-    rc_b, _o_b, err_b = drv.run_axiom0(axiom0, ["build"])
-    blobs = [
-        b"axiom0",
-        b"build",
-        b"--emit=obj",
-        b"-o",
-        b"out_mem.obj",
-        b"out_mem.exe",
-        b"-O1",
-        b"--stack-reserve=2097152",
-        b"build/tmp_obj_link_driver_",
-        b".exe",
-        nonexistent.encode("utf-8"),
-        err_a,
-        err_b,
-    ]
-    for rel in corpus:
-        blobs.append(rel.encode("utf-8"))
-        blobs.append(reference_build(axiom0, ["--emit=obj"], rel, "_gen_ref.obj"))
-        blobs.append(reference_build(axiom0, [], rel, "_gen_ref.exe"))
-        blobs.append(reference_build(axiom0, ["--emit=obj", "-O1"], rel, "_gen_ref_o1.obj"))
-        blobs.append(reference_build(axiom0, ["-O1"], rel, "_gen_ref_o1.exe"))
-        blobs.append(reference_build(axiom0, ["--stack-reserve=2097152"], rel, "_gen_ref_sr.exe"))
-    blob_bytes, offs, lens = drv.pack_blobs(blobs)
+    out_path = os.path.join(HERE, filename)
+    if axiom0 is None:
+        blobs = drv.bc.extract_blobs_from_bundle(out_path, "BLOBS", "BLOB_OFFS", "BLOB_LENS")
+        blob_bytes, offs, lens = drv.pack_blobs(blobs)
+        rc_a, rc_b = 1, 2
+    else:
+        nonexistent = "tests/nonexistent_t085.ax"
+        rc_a, _o_a, err_a = drv.run_axiom0(axiom0, ["build", "-o", "out_mem.exe", nonexistent])
+        rc_b, _o_b, err_b = drv.run_axiom0(axiom0, ["build"])
+        blobs = [
+            b"axiom0",
+            b"build",
+            b"--emit=obj",
+            b"-o",
+            b"out_mem.obj",
+            b"out_mem.exe",
+            b"-O1",
+            b"--stack-reserve=2097152",
+            b"build/tmp_obj_link_driver_",
+            b".exe",
+            nonexistent.encode("utf-8"),
+            err_a,
+            err_b,
+        ]
+        for rel in corpus:
+            blobs.append(rel.encode("utf-8"))
+            blobs.append(reference_build(axiom0, ["--emit=obj"], rel, "_gen_ref.obj"))
+            blobs.append(reference_build(axiom0, [], rel, "_gen_ref.exe"))
+            blobs.append(reference_build(axiom0, ["--emit=obj", "-O1"], rel, "_gen_ref_o1.obj"))
+            blobs.append(reference_build(axiom0, ["-O1"], rel, "_gen_ref_o1.exe"))
+            blobs.append(reference_build(axiom0, ["--stack-reserve=2097152"], rel, "_gen_ref_sr.exe"))
+        blob_bytes, offs, lens = drv.pack_blobs(blobs)
     main_src = MAIN_TEMPLATE % {
         "blob_table": drv.byte_table("BLOBS", blob_bytes),
-        "num_blobs": len(blobs),
+        "num_blobs": len(offs),
         "offs": ", ".join(str(x) for x in offs),
         "lens": ", ".join(str(x) for x in lens),
         "case_count": len(corpus),
@@ -484,22 +490,24 @@ def gen_diff_bundle(filename, modes, corpus, prelude, full_mods, axiom0, lite=Fa
     }
     header = "// test: run\n// timeout: 1800\n// modes: %s\n\n" % modes
     text = header + prelude + "\n" + full_mods + "\n" + main_src
-    drv.write_bytes(os.path.join(HERE, filename), text.encode("utf-8"))
+    return out_path, text.encode("utf-8")
 
 
 def main():
-    axiom0 = drv.find_exe(["build/axiom0.exe", "build/axiom0"])
+    check_mode = ("--check" in sys.argv[1:]) or ("check" in sys.argv[1:])
+    refresh_goldens = "--refresh-goldens" in sys.argv[1:]
+    axiom0 = drv.find_exe(["build/axiom0.exe", "build/axiom0"]) if refresh_goldens else None
     for i, a in enumerate(sys.argv[1:]):
         if a == "--axiom0" and i + 2 <= len(sys.argv[1:]):
             axiom0 = sys.argv[i + 2]
-    if not axiom0 or not os.path.isfile(axiom0):
-        raise SystemExit("Could not find axiom0 binary; pass --axiom0 <path>")
     prelude = drv.build_prelude_text()
     # the test bundles define their own `main`, so the axiomc entry module is left out
     full_mods = drv.assemble_modules(drv.FULL_MODULES + T085_MODULES[:1])
-    gen_diff_bundle("qa_obj_link_driver_diff.ax", "native", DIFF_CORPUS_FULL, prelude, full_mods, axiom0)
-    gen_diff_bundle("qa_obj_link_driver_smoke.ax", "interp native", DIFF_CORPUS_SMOKE, prelude, full_mods, axiom0, lite=True)
-    print("Generated 2 selfhost obj_link_driver test bundles in %s" % HERE)
+    outputs = [
+        gen_diff_bundle("qa_obj_link_driver_diff.ax", "native", DIFF_CORPUS_FULL, prelude, full_mods, axiom0),
+        gen_diff_bundle("qa_obj_link_driver_smoke.ax", "interp native", DIFF_CORPUS_SMOKE, prelude, full_mods, axiom0, lite=True),
+    ]
+    drv.bc.write_or_check_bundles(outputs, check_mode, root=ROOT)
 
 
 if __name__ == "__main__":

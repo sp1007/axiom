@@ -203,15 +203,20 @@ def outputs():
     ]
 
 
-def main():
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
     outs = outputs()
-    if "--check" in sys.argv[1:]:
+    if "--check" in argv or "check" in argv:
         ok = True
         for path, text in outs:
             with open(path, "r", encoding="utf-8", newline="") as f:
                 same = f.read() == text
             ok = ok and same
-            print("%s %s" % (os.path.relpath(path, ROOT).replace("\\", "/"), "up to date" if same else "DIFFERS"))
+            msg = "%s %s" % (os.path.relpath(path, ROOT).replace("\\", "/"), "up to date" if same else "DIFFERS")
+            print(msg)
+            if not same:
+                print(msg, file=sys.stderr)
         return 0 if ok else 1
     for path, text in outs:
         with open(path, "w", encoding="utf-8", newline="\n") as f:

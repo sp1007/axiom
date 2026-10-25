@@ -31,53 +31,47 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.normpath(os.path.join(HERE, "..", "..", ".."))
 FIXTURES = os.path.join(HERE, "fixtures")
+sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
-# Compiler modules in dependency order (the order of tests/selfhost/mir/qa_mir_builder_and_drop_*.ax),
-# each with its source: "compiler" = the file under compiler/, "reference" = the module section of
-# REFERENCE_BUNDLE. The MIR layer (data model, builder, drop elaboration) comes from compiler/. The
-# front end comes from the copies QA accepted with T082a, because the compiler/ front-end files at
-# HEAD do not build together (compiler/kernel/interner.ax has mangled expressions such as
-# `old_(mcap << 3)`; compiler/kernel_source_diag/session.ax calls
-# `compiler.diag.code.diag_code_severity` through a path the resolver rejects) and, patched, they
-# fail at run time with an out-of-bounds access (reported as a follow-up in
-# _workspaces/reports/T082d-report.md).
-REFERENCE_BUNDLE = "tests/selfhost/mir/qa_mir_builder_and_drop_a.ax"
+import bundle_common as bc  # noqa: E402
+
+# Compiler modules in dependency order, all loaded from HEAD `compiler/`.
 MODULES = [
-    ("compiler.kernel.id", "reference"),
-    ("compiler.kernel.hash", "reference"),
-    ("compiler.kernel.arena", "reference"),
-    ("compiler.kernel.interner", "reference"),
-    ("compiler.source.span", "reference"),
-    ("compiler.source.manager", "reference"),
-    ("compiler.diag.code", "reference"),
-    ("compiler.diag.emitter", "reference"),
-    ("compiler.diag.format", "reference"),
-    ("compiler.diag.json", "reference"),
-    ("compiler.kernel_source_diag.session", "reference"),
-    ("compiler.lex.token", "reference"),
-    ("compiler.lex.scanner", "reference"),
-    ("compiler.lexer.session", "reference"),
-    ("compiler.syntax.ast", "reference"),
-    ("compiler.syntax.parse", "reference"),
-    ("compiler.parser.session", "reference"),
-    ("compiler.resolve.symtab", "reference"),
-    ("compiler.resolve.rib", "reference"),
-    ("compiler.resolve.resolver", "reference"),
-    ("compiler.hir.hir", "reference"),
-    ("compiler.hir.lower", "reference"),
-    ("compiler.resolve_hir.session", "reference"),
-    ("compiler.types.types", "reference"),
-    ("compiler.types.layout", "reference"),
-    ("compiler.types.exhaust", "reference"),
-    ("compiler.traits.solver", "reference"),
-    ("compiler.traits.mono", "reference"),
-    ("compiler.types.typeck", "reference"),
-    ("compiler.types", "reference"),
-    ("compiler.traits", "reference"),
-    ("compiler.typeck.session", "reference"),
-    ("compiler.typeck", "reference"),
-    ("compiler.typeck_traits.session", "reference"),
-    ("compiler.typeck_traits", "reference"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
+    ("compiler.diag.format", "compiler"),
+    ("compiler.diag.json", "compiler"),
+    ("compiler.kernel_source_diag.session", "compiler"),
+    ("compiler.lex.token", "compiler"),
+    ("compiler.lex.scanner", "compiler"),
+    ("compiler.lexer.session", "compiler"),
+    ("compiler.syntax.ast", "compiler"),
+    ("compiler.syntax.parse", "compiler"),
+    ("compiler.parser.session", "compiler"),
+    ("compiler.resolve.symtab", "compiler"),
+    ("compiler.resolve.rib", "compiler"),
+    ("compiler.resolve.resolver", "compiler"),
+    ("compiler.hir.hir", "compiler"),
+    ("compiler.hir.lower", "compiler"),
+    ("compiler.resolve_hir.session", "compiler"),
+    ("compiler.types.types", "compiler"),
+    ("compiler.types.layout", "compiler"),
+    ("compiler.types.exhaust", "compiler"),
+    ("compiler.traits.solver", "compiler"),
+    ("compiler.traits.mono", "compiler"),
+    ("compiler.types.typeck", "compiler"),
+    ("compiler.types", "compiler"),
+    ("compiler.traits", "compiler"),
+    ("compiler.typeck.session", "compiler"),
+    ("compiler.typeck", "compiler"),
+    ("compiler.typeck_traits.session", "compiler"),
+    ("compiler.typeck_traits", "compiler"),
     ("compiler.mir.mir", "compiler"),
     ("compiler.mir.drop", "compiler"),
     ("compiler.mir.builder", "compiler"),
@@ -106,35 +100,7 @@ GROUPS = [
 #                            generic enum constructor with AX_TYPE_MISMATCH.
 BLOCKED_FIXTURES = ["d08_generic_containers"]
 
-PRELUDE = """\
-@link("kernel32")
-extern "system" {
-    fn GetProcessHeap() -> *mut u8;
-    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
-    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
-}
-
-const HEAP_ZERO_MEMORY: u32 = 8u32;
-const MIN_HEAP_ALLOC: usize = 16;
-
-pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
-    let h = GetProcessHeap();
-    if (h as usize) == 0 {
-        return 0 as *mut u8;
-    }
-    let alloc_bytes: usize = if size < MIN_HEAP_ALLOC { MIN_HEAP_ALLOC } else { size };
-    HeapAlloc(h, HEAP_ZERO_MEMORY, alloc_bytes)
-}
-
-pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
-    if (p as usize) != 0 {
-        let h = GetProcessHeap();
-        if (h as usize) != 0 {
-            HeapFree(h, 0u32, p);
-        }
-    }
-}
-"""
+PRELUDE = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=ROOT)
 
 SYNTH_MARK = "--- ACTUAL (synthetic destructor) ---"
 
@@ -345,48 +311,9 @@ def main_module(group_upper, names):
     return text
 
 
-def compiler_module_files():
-    found = {}
-    for dirpath, _dirs, files in os.walk(os.path.join(ROOT, "compiler")):
-        for fn in files:
-            if not fn.endswith(".ax"):
-                continue
-            path = os.path.join(dirpath, fn)
-            with open(path, encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("module "):
-                        found[line.split()[1]] = path
-                        break
-    return found
-
-
-def reference_sections():
-    """Module name -> text of that module's section in REFERENCE_BUNDLE."""
-    text = read_bytes(os.path.join(ROOT, REFERENCE_BUNDLE)).decode("utf-8")
-    sections = {}
-    current = None
-    buf = []
-    for line in text.split("\n"):
-        if line.startswith("module "):
-            if current:
-                sections[current] = "\n".join(buf)
-            current = line.split()[1]
-            buf = [line]
-        elif current:
-            buf.append(line)
-    if current:
-        sections[current] = "\n".join(buf)
-    return sections
-
-
-def cmd_bundles(_args):
-    files = compiler_module_files()
-    ref = reference_sections()
-    parts = []
-    for name, origin in MODULES:
-        src = read_bytes(files[name]).decode("utf-8") if origin == "compiler" else ref[name]
-        parts.append(src.rstrip("\n") + "\n")
-    modules_text = "\n".join(parts)
+def build_bundles():
+    modules_text = bc.assemble_compiler_modules(MODULES, root=ROOT)
+    outs = []
     for group, upper, names in GROUPS:
         header = (
             "// test: run\n"
@@ -398,8 +325,15 @@ def cmd_bundles(_args):
         ) % (upper, len(names))
         text = header + PRELUDE + "\n" + modules_text + "\n" + main_module(upper, names)
         out = os.path.join(HERE, "qa_drop_%s.ax" % group)
-        write_bytes(out, text.encode("utf-8"))
-        print("wrote", os.path.relpath(out, ROOT).replace(os.sep, "/"))
+        outs.append((out, text))
+    return outs
+
+
+def cmd_bundles(args):
+    check_mode = "--check" in args
+    rc = bc.write_or_check_bundles(build_bundles(), check_mode, root=ROOT)
+    if rc != 0:
+        raise SystemExit(rc)
 
 
 COMMANDS = {
@@ -411,10 +345,17 @@ COMMANDS = {
 
 
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+    args = sys.argv[1:]
+    if not args or args == ["--check"]:
+        cmd_bundles(args)
+        return 0
+    if args[0] == "check" and "--oracle" not in args:
+        cmd_bundles(["--check"])
+        return 0
+    if args[0] not in COMMANDS:
         print(__doc__)
         return 2
-    COMMANDS[sys.argv[1]](sys.argv[2:])
+    COMMANDS[args[0]](args[1:])
     return 0
 
 

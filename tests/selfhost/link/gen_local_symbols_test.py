@@ -12,7 +12,7 @@ specification, not by either compiler):
   * local_symbols.obj + dup_ext.obj: a duplicate EXTERNAL definition still fails with
     AX_LINK_DUPLICATE_SYMBOL.
 
-Usage: python tests/selfhost/link/gen_local_symbols_test.py
+Usage: python tests/selfhost/link/gen_local_symbols_test.py [--check]
 """
 
 import os
@@ -20,21 +20,23 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", ".."))
+sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost", "driver"))
 sys.path.insert(0, os.path.join(ROOT, "tests", "link", "local_symbols"))
 
+import bundle_common as bc  # noqa: E402
 import gen_driver_tests as drv  # noqa: E402
 import gen_local_symbols_obj as lso  # noqa: E402
 
 MODULES = [
-    ("compiler.kernel.id", "ref"),
-    ("compiler.kernel.hash", "ref"),
-    ("compiler.kernel.arena", "ref"),
-    ("compiler.kernel.interner", "ref"),
-    ("compiler.source.span", "ref"),
-    ("compiler.source.manager", "ref"),
-    ("compiler.diag.code", "ref"),
-    ("compiler.diag.emitter", "ref"),
+    ("compiler.kernel.id", "compiler"),
+    ("compiler.kernel.hash", "compiler"),
+    ("compiler.kernel.arena", "compiler"),
+    ("compiler.kernel.interner", "compiler"),
+    ("compiler.source.span", "compiler"),
+    ("compiler.source.manager", "compiler"),
+    ("compiler.diag.code", "compiler"),
+    ("compiler.diag.emitter", "compiler"),
     ("compiler.obj.coff", "compiler"),
     ("compiler.obj.writer", "compiler"),
     ("compiler.obj", "compiler"),
@@ -225,22 +227,36 @@ pub fn main() -> i32 {
 """
 
 
-def main():
-    prelude = drv.build_prelude_text()
-    mods = drv.assemble_modules(MODULES)
+def build_local_symbols_bundle():
+    prelude = bc.build_prelude_text(include_sym_pad=True, sym_pad_count=800, include_std_sys=True, root=ROOT)
+    mods = bc.assemble_compiler_modules(MODULES, root=ROOT)
     blobs = [lso.build_local_symbols_obj(), lso.build_dup_ext_obj()]
     blob_bytes, offs, lens = drv.pack_blobs(blobs)
-    main_src = (MAIN_TEMPLATE
-                .replace("@@BLOB_TABLE@@", drv.byte_table("BLOBS", blob_bytes))
-                .replace("@@OFFS@@", ", ".join(str(x) for x in offs))
-                .replace("@@LENS@@", ", ".join(str(x) for x in lens))
-                .replace("@@EXPECTED@@", str(lso.EXPECTED_EXIT_CODE)))
-    header = "// test: run\n// timeout: 600\n// modes: native\n// This bundle is native only, because it runs the linked image through direct kernel32 FFI (CreateProcessW), which the MIR interpreter cannot call (ADR-0002)\n// stdout: OK PE linker local symbols\\n\n\n"
-    text = header + prelude + "\n" + mods + "\n" + main_src
+    main_src = (
+        MAIN_TEMPLATE
+        .replace("@@BLOB_TABLE@@", drv.byte_table("BLOBS", blob_bytes))
+        .replace("@@OFFS@@", ", ".join(str(x) for x in offs))
+        .replace("@@LENS@@", ", ".join(str(x) for x in lens))
+        .replace("@@EXPECTED@@", str(lso.EXPECTED_EXIT_CODE))
+    )
+    header = (
+        "// test: run\n"
+        "// timeout: 600\n"
+        "// modes: native\n"
+        "// This bundle is native only, because it runs the linked image through direct kernel32 FFI (CreateProcessW), which the MIR interpreter cannot call (ADR-0002)\n"
+        "// stdout: OK PE linker local symbols\\n\n\n"
+    )
+    return header + prelude + "\n" + mods + "\n" + main_src
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    check_mode = "--check" in argv or "check" in argv
     out = os.path.join(HERE, "qa_pe_local_symbols.ax")
-    drv.write_bytes(out, text.encode("utf-8"))
-    print("wrote %s (%d bytes)" % (out, len(text)))
+    text = build_local_symbols_bundle()
+    return bc.write_or_check_bundles([(out, text)], check_mode, root=ROOT)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
