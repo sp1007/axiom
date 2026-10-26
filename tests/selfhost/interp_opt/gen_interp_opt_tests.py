@@ -835,6 +835,7 @@ def build_mir_opt_bundle(prelude_text, modules_text, axiom0, group, upper, spec_
     )
     modes_line = (
         "// modes: native\n"
+        "// flags: --stack-reserve=16777216\n"
         "// Reason: heavy selfhost MIR-opt differential batch; small interp twin is qa_interp_opt_diff_mir_a.ax.\n"
     ) if native_only else ""
     header = (

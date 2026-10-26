@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T146]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/mir, compiler/hir, tests/run/parity/mir_builder, tests/selfhost]
 spec: [spec/SPEC-03-core-semantics.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, 0161]
 covers: [REQ-EXP-035, REQ-MIR-058, REQ-BLD-030]
+started: 2026-10-26 17:39:28
+finished: 2026-10-27 03:21:00
 ---
 # T149 — Port MIR builder parity
 
@@ -82,3 +84,5 @@ normalised):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-26 17:39:28 started (attempt 1) T149-impl
+- 2026-10-27 03:21:00 accepted by QA -> done
