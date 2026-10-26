@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T146]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/target/x64, bootstrap/axiom0/src/lir, bootstrap/axiom0/src/driver/build_native, bootstrap/axiom0/src/interp, bootstrap/axiom0/src/link/pe, compiler/target/x64, compiler/lir, compiler/opt, compiler/backend, compiler/link, compiler/driver/pipeline.ax, tests/run/parity/backend, tests/mc, tests/lir, tests/selfhost]
 spec: [spec/SPEC-03-core-semantics.md, spec/decisions/ADR-0004-self-host-subset-additions.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-CORE-3181, REQ-BLD-030]
+started: 2026-10-26 02:28:32
+finished: 2026-10-26 09:13:47
 ---
 # T154 — Backend parity: narrow extension, -O1 path, const tables
 
@@ -78,3 +80,5 @@ Confirmed differences (architect probe 2026-10-20; MIR and LIR equal unless stat
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-26 02:28:32 started (attempt 1) T154-impl
+- 2026-10-26 09:13:47 accepted by QA -> done

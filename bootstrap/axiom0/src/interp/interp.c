@@ -684,11 +684,16 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                             
                             AxMirOperand *f_op = &stmt->assign.rvalue.aggregate.operands[i];
                             if (f_op->kind == AX_MIR_OP_CONST) {
-                                uint64_t val = f_op->constant.val;
-                                if (f_size == 1) *(uint8_t*)(dest + offset) = (uint8_t)val;
-                                else if (f_size == 2) *(uint16_t*)(dest + offset) = (uint16_t)val;
-                                else if (f_size == 4) *(uint32_t*)(dest + offset) = (uint32_t)val;
-                                else if (f_size == 8) *(uint64_t*)(dest + offset) = val;
+                                if (f_op->constant.ty.v != 0 && TypeId_eq(f_op->constant.ty, ctx->thir->interner.t_str)) {
+                                    *(const uint8_t**)(dest + offset) = f_op->constant.str.bytes;
+                                    *(uint64_t*)(dest + offset + 8) = f_op->constant.str.len;
+                                } else {
+                                    uint64_t val = f_op->constant.val;
+                                    if (f_size == 1) *(uint8_t*)(dest + offset) = (uint8_t)val;
+                                    else if (f_size == 2) *(uint16_t*)(dest + offset) = (uint16_t)val;
+                                    else if (f_size == 4) *(uint32_t*)(dest + offset) = (uint32_t)val;
+                                    else if (f_size == 8) *(uint64_t*)(dest + offset) = val;
+                                }
                             } else {
                                 TypeId s_ty;
                                 uint8_t *src = get_place_ptr(ctx, &frame, &f_op->place, &s_ty, NULL);
@@ -718,11 +723,16 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                         for (uint64_t i = 0; i < count_val; i++) {
                             uint32_t offset = i * f_size;
                             if (val_op->kind == AX_MIR_OP_CONST) {
-                                uint64_t val = val_op->constant.val;
-                                if (f_size == 1) *(uint8_t*)(dest + offset) = (uint8_t)val;
-                                else if (f_size == 2) *(uint16_t*)(dest + offset) = (uint16_t)val;
-                                else if (f_size == 4) *(uint32_t*)(dest + offset) = (uint32_t)val;
-                                else if (f_size == 8) *(uint64_t*)(dest + offset) = val;
+                                if (val_op->constant.ty.v != 0 && TypeId_eq(val_op->constant.ty, ctx->thir->interner.t_str)) {
+                                    *(const uint8_t**)(dest + offset) = val_op->constant.str.bytes;
+                                    *(uint64_t*)(dest + offset + 8) = val_op->constant.str.len;
+                                } else {
+                                    uint64_t val = val_op->constant.val;
+                                    if (f_size == 1) *(uint8_t*)(dest + offset) = (uint8_t)val;
+                                    else if (f_size == 2) *(uint16_t*)(dest + offset) = (uint16_t)val;
+                                    else if (f_size == 4) *(uint32_t*)(dest + offset) = (uint32_t)val;
+                                    else if (f_size == 8) *(uint64_t*)(dest + offset) = val;
+                                }
                             } else {
                                 TypeId s_ty;
                                 uint8_t *src = get_place_ptr(ctx, &frame, &val_op->place, &s_ty, NULL);
@@ -1105,7 +1115,7 @@ static void exec_mir_body(InterpCtx *ctx, AxMirBody *body, AxInterpValue *args_r
                             switch (s_t->kind) {
                                 case AX_TY_I8: src_signed = true; src_bits = 8; break;
                                 case AX_TY_I16: src_signed = true; src_bits = 16; break;
-                                case AX_TY_I32: src_signed = true; src_bits = 32; break;
+                                case AX_TY_I32: case AX_TY_INT_VAR: src_signed = true; src_bits = 32; break;
                                 case AX_TY_I64: case AX_TY_ISIZE: src_signed = true; src_bits = 64; break;
                                 case AX_TY_U8: src_signed = false; src_bits = 8; break;
                                 case AX_TY_U16: src_signed = false; src_bits = 16; break;

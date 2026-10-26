@@ -573,7 +573,7 @@ AxX64MIBody *ax_x64_isel(const AxLirBody *lir, TypeInterner *interner) {
                         uint32_t size = ax_type_size(inst->load.ty, interner);
                         bool is_signed = false;
                         const AxType *t = ax_type_get(interner, inst->load.ty);
-                        if (t && (t->kind == AX_TY_I8 || t->kind == AX_TY_I16 || t->kind == AX_TY_I32 || t->kind == AX_TY_I64 || t->kind == AX_TY_ISIZE)) {
+                        if (t && (t->kind == AX_TY_I8 || t->kind == AX_TY_I16 || t->kind == AX_TY_I32 || t->kind == AX_TY_I64 || t->kind == AX_TY_ISIZE || t->kind == AX_TY_INT_VAR)) {
                             is_signed = true;
                         }
                         if (size == 1) {
