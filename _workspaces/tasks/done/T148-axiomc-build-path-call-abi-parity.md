@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T147]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/driver, compiler/driver/pipeline.ax, compiler/backend, compiler/lir, compiler/abi, tests/run/parity/build_abi, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0032-unblock-t131-drop-destructors.md]
 covers: [REQ-BLD-030, REQ-CORE-3181]
+started: 2026-10-26 09:13:55
+finished: 2026-10-26 17:39:17
 ---
 # T148 — axiomc `build` path parity: call ABI, `inspect` == `build`
 
@@ -64,3 +66,5 @@ misbehave.
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-26 09:13:55 started (attempt 1) T148-impl
+- 2026-10-26 17:39:17 accepted by QA -> done

@@ -1,9 +1,49 @@
 #include "driver/driver.h"
+#include "hir/hir.h"
 #include "mir/mir.h"
 #include "mir/build/build.h"
 #include "lir/lir.h"
 #include <stdlib.h>
 #include <string.h>
+
+static void resolve_mir_call_types(AxDriverState *st, AxMirBody *body) {
+    if (!body) return;
+    for (size_t i = 0; i < body->bb_count; i++) {
+        AxMirTerminator *term = &body->bbs[i].terminator;
+        if (term->kind != AX_MIR_TERM_CALL || term->call.func.kind != AX_MIR_OP_CONST) continue;
+        TypeId orig_ty = term->call.func.constant.ty;
+        if (orig_ty.v != 0) {
+            const AxType *ot = ax_type_get(&st->thir.interner, orig_ty);
+            if (ot && ot->kind != AX_TY_FN) continue;
+        }
+        uint32_t sym_v = (uint32_t)term->call.func.constant.val;
+        const AxHirItem *callee = NULL;
+        for (const AxHirItem *it = st->hir.items; it; it = it->next) {
+            if (it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v == sym_v) {
+                callee = it;
+                break;
+            }
+            if (it->kind == AX_HIR_ITEM_IMPL) {
+                for (const AxHirItem *m = it->impl.members; m; m = m->next) {
+                    if (m->kind == AX_HIR_ITEM_FN && m->fn.symbol.v == sym_v) {
+                        callee = m;
+                        break;
+                    }
+                }
+                if (callee) break;
+            }
+        }
+        if (callee) {
+            bool is_generic = (callee->fn.generic_params && callee->fn.generic_params->params != NULL);
+            if (!is_generic) {
+                const TypeId *pty = AxItemTypeMap_get(&st->thir.item_types, callee);
+                if (pty && pty->v != 0) {
+                    term->call.func.constant.ty = *pty;
+                }
+            }
+        }
+    }
+}
 
 static int emit_lir_run(const AxIo *io, int argc, char **argv) {
     char **pos_argv = NULL;
@@ -66,8 +106,9 @@ static int emit_lir_run(const AxIo *io, int argc, char **argv) {
             continue;
         }
         if (item->kind == AX_HIR_ITEM_FN) {
-            AxMirBody *mir_body = ax_mir_build(item, &st.thir, &st.hir_arena);
+            AxMirBody *mir_body = ax_pipeline_get_mir(item);
             if (mir_body) {
+                resolve_mir_call_types(&st, mir_body);
                 AxLirBody *lir_body = ax_lir_lower(mir_body, &st.hir, &st.thir.interner, &st.interner, NULL);
                 if (lir_body) {
                     ax_lir_print(io->out, lir_body);

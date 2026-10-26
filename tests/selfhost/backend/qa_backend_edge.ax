@@ -54780,9 +54780,58 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
         callee_vreg = lower_operand(mut_view(*b), func_op);
     }
 
-    let dst_addr = lower_place_addr(mut_view(*b), dest_place, 0 as *mut u32);
+    let mut dst_ty_v: u32 = 0u32;
+    let dst_addr = lower_place_addr(mut_view(*b), dest_place, unsafe { address_of_mut(dst_ty_v) });
+    if dst_ty_v == 0u32 {
+        let dest_ldecl = unsafe { mir_local_at((*b.mir).locals, dest_place.local.v as usize) };
+        dst_ty_v = unsafe { (*dest_ldecl).ty.v };
+    }
 
     let max_caps = if cap_count < 64 { cap_count } else { 64 };
+    let total_args = max_caps + arg_count;
+    let need_synth_callee_ty = if callee_ty_v == 0u32 {
+        true
+    } else if (cty as usize) != 0 && cty_k == TY_FN {
+        let pcnt = unsafe { (*cty).param_count };
+        pcnt == 0 && total_args > 0
+    } else {
+        false
+    };
+    if need_synth_callee_ty {
+        let mut param_types: *mut TypeId = 0 as *mut TypeId;
+        if total_args > 0 {
+            let p_bytes = lir_mul_usize(total_args, size_of<TypeId>());
+            param_types = unsafe { arena_alloc_raw(mut_view(*b.arena), p_bytes, align_of<TypeId>()) as *mut TypeId };
+            let mut c0: usize = 0;
+            while c0 < max_caps {
+                let cv = unsafe { (*vreg_id_at(cap_vals, c0)).v };
+                let vp = unsafe { lir_vreg_at(b.vregs, cv as usize) };
+                let dst = unsafe { typeid_at(param_types, c0) };
+                unsafe { (*dst).v = (*vp).ty.v; }
+                c0 = c0 + 1;
+            }
+            let mut k2: usize = 0;
+            while k2 < arg_count {
+                let av = unsafe { (*vreg_id_at(arg_vals, k2)).v };
+                let vp = unsafe { lir_vreg_at(b.vregs, av as usize) };
+                let dst = unsafe { typeid_at(param_types, max_caps + k2) };
+                unsafe { (*dst).v = (*vp).ty.v; }
+                k2 = k2 + 1;
+            }
+        }
+        let synth_tid = unsafe {
+            intern_fn_ty(
+                mut_view(*b.interner),
+                false,
+                StrId { v: 0u32 },
+                param_types,
+                total_args,
+                TypeId { v: dst_ty_v }
+            )
+        };
+        callee_ty_v = synth_tid.v;
+    }
+
     if (cap_vals as usize) != 0 {
         let mut c: usize = 0;
         while c < max_caps {
@@ -54817,9 +54866,7 @@ fn lower_call_terminator(b: mut_view<LirBuilder>, mbb: *const MirBb, bb_idx: usi
         (*call_inst).callee_vreg.v = callee_vreg;
     }
 
-    let dest_ldecl = unsafe { mir_local_at((*b.mir).locals, dest_place.local.v as usize) };
-    let res_ty_v = unsafe { (*dest_ldecl).ty.v };
-    let res = make_vreg(mut_view(*b), res_ty_v);
+    let res = make_vreg(mut_view(*b), dst_ty_v);
     let rinst = push_new_inst(mut_view(*b), LIR_INST_ABI_RESULT);
     unsafe {
         (*rinst).dest.v = res;
@@ -62100,6 +62147,7 @@ use compiler.mir.mir.MIR_LOCAL_CONST
 use compiler.mir.mir.MIR_STMT_ASSIGN
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MirBody
 use compiler.mir.mir.mir_local_at
 use compiler.mir.mir.mir_bb_at
@@ -63944,6 +63992,71 @@ pub fn backend_resolve_item_fn_ty(
     dummy as *const AxType
 }
 
+fn backend_find_fn_item_by_sym(hir: view<HirFile>, sym_v: u32) -> *const HirItem {
+    if sym_v == 0u32 {
+        return 0 as *const HirItem;
+    }
+    let mut it: *mut HirItem = hir.items;
+    while (it as usize) != 0 {
+        let k = unsafe { (*it).kind };
+        if k == HIR_ITEM_FN && (unsafe { (*it).symbol.v }) == sym_v {
+            return it as *const HirItem;
+        }
+        if k == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN && (unsafe { (*m).symbol.v }) == sym_v {
+                    return m as *const HirItem;
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    0 as *const HirItem
+}
+
+pub fn backend_resolve_body_call_types(
+    body: mut_view<MirBody>,
+    hir: view<HirFile>,
+    thir: view<Thir>
+) {
+    let bb_cnt = body.bb_count;
+    let bbs = body.bbs;
+    let mut i: usize = 0;
+    while i < bb_cnt {
+        let mbb = unsafe { mir_bb_at(bbs, i) };
+        if (unsafe { (*mbb).terminator.kind }) == MIR_TERM_CALL &&
+           (unsafe { (*mbb).terminator.func.kind }) == MIR_OP_CONST {
+            let orig_ty_v = unsafe { (*mbb).terminator.func.constant.ty.v };
+            let mut skip = false;
+            if orig_ty_v != 0u32 {
+                let ot = type_get(view(thir.interner), TypeId { v: orig_ty_v });
+                if (ot as usize) != 0 && (unsafe { (*ot).kind }) != TY_FN {
+                    skip = true;
+                }
+            }
+            if !skip {
+                let sym_v = (unsafe { (*mbb).terminator.func.constant.val } & 0xFFFFFFFFu64) as u32;
+                let callee = backend_find_fn_item_by_sym(hir, sym_v);
+                if (callee as usize) != 0 {
+                    let gp = unsafe { (*callee).generic_params };
+                    let is_generic = (gp as usize) != 0 && (unsafe { (*gp).params as usize }) != 0;
+                    if !is_generic {
+                        let pty = thir_get_item_type(thir, callee);
+                        if (pty as usize) != 0 && (unsafe { (*pty).v }) != 0u32 {
+                            unsafe {
+                                (*mbb).terminator.func.constant.ty.v = (*pty).v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
 fn build_mir_for_item(
     sess: mut_view<CompilerSession>,
     mir_arena: mut_view<Arena>,
@@ -63992,6 +64105,7 @@ fn build_mir_for_item(
             it as *const HirItem
         );
     }
+    backend_resolve_body_call_types(unsafe { mut_view(*body) }, hir, view(*thir));
     body
 }
 
@@ -64063,7 +64177,7 @@ pub fn session_emit_lir_file(
         hir,
         mut_view(*thir),
         main_fid,
-        false,
+        true,
         false,
         mut_view(*out)
     )
@@ -64101,7 +64215,12 @@ pub fn session_emit_mi_hir(
                 run_opt
             );
             if (body as usize) != 0 {
-                let fn_ty = lookup_item_fn_ty(view(*thir), it as *const HirItem);
+                let fn_ty = backend_resolve_item_fn_ty(
+                    mut_view(*backend_arena),
+                    view(*thir),
+                    it as *const HirItem,
+                    body as *const MirBody
+                );
                 let mi_body = backend_lower_fn_to_mi(
                     mut_view(*backend_arena),
                     body,
@@ -64139,7 +64258,7 @@ pub fn session_emit_mi_file(
         hir,
         mut_view(*thir),
         main_fid,
-        false,
+        true,
         false,
         mut_view(*out)
     )
@@ -64188,7 +64307,12 @@ pub fn session_emit_mc_hir(
                 run_opt
             );
             if (body as usize) != 0 {
-                let fn_ty = lookup_item_fn_ty(view(*thir), it as *const HirItem);
+                let fn_ty = backend_resolve_item_fn_ty(
+                    mut_view(*backend_arena),
+                    view(*thir),
+                    it as *const HirItem,
+                    body as *const MirBody
+                );
                 let mut layout = X64FrameLayout {
                     slot_offsets: 0 as *mut i32,
                     slot_count: 0u32,
@@ -64203,7 +64327,7 @@ pub fn session_emit_mc_hir(
                     ti_ptr,
                     str_in_ptr,
                     0 as *const LirConstTable,
-                    0 as *const AxType,
+                    fn_ty,
                     fn_ty,
                     mut_view(lir_body),
                     mut_view(mi_body),
@@ -64244,7 +64368,7 @@ pub fn session_emit_mc_file(
         hir,
         mut_view(*thir),
         main_fid,
-        false,
+        true,
         false,
         mut_view(*out)
     )
@@ -64363,17 +64487,13 @@ pub fn session_emit_objmodel_hir(
     while fi < fn_count {
         let fn_item = unsafe { *hir_item_ptr_at(items_buf, fi) };
         let mir_body = unsafe { *mir_body_ptr_at(bodies_buf, fi) };
-        let fn_ty = if full_native_mode {
-            backend_resolve_item_fn_ty(
-                mut_view(*backend_arena),
-                view(*thir),
-                fn_item as *const HirItem,
-                mir_body as *const MirBody
-            )
-        } else {
-            lookup_item_fn_ty(view(*thir), fn_item as *const HirItem)
-        };
-        let lir_fn_ty = if full_native_mode { fn_ty } else { 0 as *const AxType };
+        let fn_ty = backend_resolve_item_fn_ty(
+            mut_view(*backend_arena),
+            view(*thir),
+            fn_item as *const HirItem,
+            mir_body as *const MirBody
+        );
+        let lir_fn_ty = fn_ty;
 
         let mut layout = X64FrameLayout {
             slot_offsets: 0 as *mut i32,
@@ -64751,6 +64871,8 @@ module compiler.backend
 pub use compiler.backend.session.backend_format_const_sym_name
 pub use compiler.backend.session.backend_promote_const_aggregates
 pub use compiler.backend.session.backend_populate_hir_const_aggregates
+pub use compiler.backend.session.backend_resolve_item_fn_ty
+pub use compiler.backend.session.backend_resolve_body_call_types
 pub use compiler.backend.session.backend_emit_const_tables
 pub use compiler.backend.session.backend_emit_fn_strings_rdata
 pub use compiler.backend.session.backend_emit_mi_body_full_obj
