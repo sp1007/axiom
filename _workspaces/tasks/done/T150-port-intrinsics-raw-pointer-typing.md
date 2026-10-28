@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T146]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types, compiler/typeck, compiler/mir, compiler/lir, compiler/verify, compiler/driver/pipeline.ax, tests/run/parity/intrinsics, tests/selfhost]
 spec: [spec/decisions/ADR-0004-self-host-subset-additions.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, spec/SPEC-03-core-semantics.md]
 covers: [REQ-TYP-065, REQ-BLD-030]
+started: 2026-10-27 22:48:07
+finished: 2026-10-28 13:17:24
 ---
 # T150 — Port intrinsics and raw-pointer typing
 
@@ -69,3 +71,7 @@ Confirmed defects (architect probe 2026-10-20):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-27 03:21:55 started (attempt 1) T150-impl
+- 2026-10-27 22:47:52 requeue: recover: previous session agent died (not charged: attempt refunded)
+- 2026-10-27 22:48:07 started (attempt 1) T150-impl
+- 2026-10-28 13:17:24 accepted by QA -> done
