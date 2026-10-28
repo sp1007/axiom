@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T146]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/lex, compiler/lexer, tests/run/parity/lexer, tests/selfhost]
 spec: [spec/SPEC-01-lexical.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-BLD-030]
+started: 2026-10-28 13:18:23
+finished: 2026-10-28 20:56:29
 ---
 # T155 — axiomc lexer panic on 20-digit literals
 
@@ -63,3 +65,5 @@ T134 (placeholder intrinsic bodies) or T140 (unsigned 64-bit div/rem).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-28 13:18:23 started (attempt 1) T155-impl
+- 2026-10-28 20:56:29 accepted by QA -> done

@@ -10,7 +10,11 @@ sys.path.insert(0, os.path.join(ROOT, "tests", "selfhost"))
 
 import bundle_common as bc  # noqa: E402
 
-BUNDLES = [('qa_lex_differential.ax', ['compiler.lex.scanner', 'compiler.diag.format']), ('qa_lex_tokens.ax', ['compiler.lex.scanner', 'compiler.diag.emitter'])]
+BUNDLES = [
+    ('qa_lex_differential.ax', ['compiler.lex.scanner', 'compiler.diag.format']),
+    ('qa_lex_tokens.ax', ['compiler.lex.scanner', 'compiler.diag.emitter']),
+    ('u64_max_literal.ax', ['compiler.lex.scanner', 'compiler.lexer.session']),
+]
 
 
 def main(argv=None):
