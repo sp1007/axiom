@@ -12097,6 +12097,22 @@ fn is_item_sym(k: u8) -> bool {
         k == SYM_CONST || k == SYM_STATIC
 }
 
+// T153 (REQ-TRT-012): `Self` is declared in a trait/impl scope as a SYM_LOCAL whose node is that trait or impl item.
+// axiom0's resolve_path_seg lets a path headed by it continue into the item's members (`Self.Item`, an associated
+// type, const or fn). A SYM_LOCAL head is only walked when it is that `Self` binding, because every other local's
+// node is not an AstItem.
+fn is_self_head(hkind: u8, head_node: usize, interner: view<StrInterner>, head_name: StrId) -> bool {
+    if hkind != SYM_LOCAL || head_node == 0 {
+        return false;
+    }
+    let sv = unsafe { interner_get(interner, head_name) };
+    if !res_sv_eq_idx(sv, 182) {
+        return false;
+    }
+    let ik = unsafe { (*(head_node as *mut AstItem)).kind };
+    ik == ITEM_TRAIT || ik == ITEM_IMPL
+}
+
 fn resolve_path_seg(
     env: mut_view<ResolverEnv>,
     arena: mut_view<Arena>,
@@ -12176,7 +12192,8 @@ fn resolve_path_seg(
                     AX_NAME_UNRESOLVED, view(seg_span));
                 break;
             }
-        } else if is_item_sym(hkind) && head_node != 0 {
+        } else if (is_item_sym(hkind) || is_self_head(hkind, head_node, view(*interner), unsafe { (*segs).name })) &&
+            head_node != 0 {
             let target_item = head_node as *mut AstItem;
             let tk = unsafe { (*target_item).kind };
             let mut found_member: *mut AstItem = 0 as *mut AstItem;
@@ -43453,6 +43470,45 @@ fn mb_build_expr_as_operand(b: mut_view<MirBuilder>, expr: *mut HirExpr, out_op:
         let mp = unsafe {
             thir_get_expr_method(view(*b.thir), expr as *const HirExpr)
         };
+        // T153: `Type.CONST` (an associated constant reached through a field-style path) is recorded by typeck as
+        // the const item in expr_methods. Its value is the operand (bootstrap/axiom0/src/mir/build/builder.c
+        // operand-of-FIELD branch); without this case the expression fell through to the temp path below and
+        // mir_build_expr called back into this function without end.
+        let mut const_item_cand = false;
+        if ek == HIR_EXPR_FIELD && (mp as usize) != 0 {
+            if (unsafe { *mp as usize }) != 0 {
+                if (unsafe { (**mp).kind }) == HIR_ITEM_CONST {
+                    const_item_cand = true;
+                }
+            }
+        }
+        if const_item_cand {
+            let cm: *const HirItem = unsafe { *mp };
+            let ccv = unsafe {
+                sym_constmap_get(view((*b.thir).symbol_consts), (SymbolId {
+                    v: (*cm).symbol.v
+                }))
+            };
+            if (ccv as usize) != 0 && (unsafe { (*ccv).kind }) == CONST_AGGREGATE {
+                let mut dummy_sl = false;
+                let p = mir_build_lvalue(mut_view(*b), expr, mut_view(dummy_sl));
+                mb_operand_from_place(view(*b), view(p), (TypeId {
+                    v: e_ty.v
+                }), mut_view(*out_op));
+                return;
+            }
+            mir_operand_zero(mut_view(*out_op), MIR_OP_CONST);
+            out_op.constant.ty.v = e_ty.v;
+            if (ccv as usize) != 0 && (unsafe { (*ccv).kind }) == CONST_STR {
+                out_op.constant.kind = MIR_CONST_STR;
+                out_op.constant.str_bytes = unsafe { (*ccv).str_bytes };
+                out_op.constant.str_len = unsafe { (*ccv).str_len };
+            } else {
+                out_op.constant.kind = MIR_CONST_INT;
+                out_op.constant.val = if (ccv as usize) != 0 { unsafe { (*ccv).int_val } } else { 0u64 };
+            }
+            return;
+        }
         if (vp as usize) == 0 && (mp as usize) == 0 {
             let mut dummy_sl = false;
             let p = mir_build_lvalue(mut_view(*b), expr, mut_view(dummy_sl));
@@ -84798,6 +84854,7 @@ use compiler.resolve.symtab.NamingCtx
 use compiler.resolve.symtab.ResolveMap
 use compiler.resolve.symtab.resolve_map_free
 use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HirBlock
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirFile
@@ -86247,6 +86304,92 @@ fn driver_emit_build_mi_body_obj(
 // - `is_build_mode == true`: `axiom0 build` (`build_native/build.c`), running drop elaboration + optional -O1,
 //   emitting incoming parameter ABI moves, branch fixups, panic blocks, and aliasing `main` -> `ax_main`
 //   immediately after `main` (`build.c:606`).
+// Builds the MIR of one function item for the object writer: MIR build, constant promotion, drop elaboration
+// plus ownership re-verification, optional -O1 and call-type resolution. Null when the item has no body.
+fn pipe_build_item_body(
+    ctx: mut_view<PipelineCtx>,
+    run_drop_elab: bool,
+    run_opt: bool,
+    it: *mut HirItem,
+    thir_ptr: *mut Thir,
+    hir_ptr: *const HirFile,
+    str_in_ptr: *mut StrInterner,
+    db_ptr: *mut SourceDatabase
+) -> *mut MirBody {
+    let body = mir_build_fn(
+        mut_view(ctx.mir_arena),
+        it,
+        thir_ptr,
+        hir_ptr,
+        str_in_ptr,
+        db_ptr,
+        0 as *mut MonoEngine
+    );
+    if (body as usize) == 0 {
+        return body;
+    }
+    backend_promote_const_aggregates(unsafe { mut_view(*body) }, view(ctx.thir));
+    if run_drop_elab {
+        mir_drop_elaborate(
+            unsafe { mut_view(*body) },
+            mut_view(ctx.thir),
+            view(ctx.hir),
+            db_ptr,
+            view(ctx.sess.interner),
+            mut_view(ctx.mir_arena)
+        );
+        if !session_has_errors(view(ctx.sess)) {
+            verify_mir_own(
+                unsafe { view(*body) },
+                thir_ptr as *const Thir,
+                mut_view(ctx.sess.diag_sink),
+                it as *const HirItem
+            );
+        }
+    }
+    if run_opt {
+        opt_run_in_arena(
+            unsafe { mut_view(*body) },
+            thir_ptr as *const Thir,
+            mut_view(ctx.mir_arena),
+            mut_view(ctx.sess.diag_sink),
+            false,
+            it as *const HirItem
+        );
+    }
+    backend_resolve_body_call_types(unsafe { mut_view(*body) }, view(ctx.hir), view(ctx.thir));
+    body
+}
+
+// True when `m` is a member of a TRAIT item of the file (a default-method body lives there, not in `hir.items`).
+fn pipe_is_trait_member(items: *mut HirItem, m: *mut HirItem) -> bool {
+    let mut t: *mut HirItem = items;
+    while (t as usize) != 0 {
+        if (unsafe { (*t).kind }) == HIR_ITEM_TRAIT {
+            let mut tm: *mut HirItem = unsafe { (*t).members };
+            while (tm as usize) != 0 {
+                if (tm as usize) == (m as usize) {
+                    return true;
+                }
+                tm = unsafe { (*tm).next };
+            }
+        }
+        t = unsafe { (*t).next };
+    }
+    false
+}
+
+fn pipe_item_in_buf(buf: *mut *mut HirItem, n: usize, m: *mut HirItem) -> bool {
+    let mut i: usize = 0;
+    while i < n {
+        if (unsafe { *pipe_hir_item_ptr_at(buf, i) }) == m {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
 fn driver_emit_objmodel(
     ctx: mut_view<PipelineCtx>,
     run_drop_elab: bool,
@@ -86303,6 +86446,12 @@ fn driver_emit_objmodel(
     while (it0 as usize) != 0 {
         if (unsafe { (*it0).kind }) == HIR_ITEM_FN {
             fn_cap = fn_cap + 1;
+        } else if (unsafe { (*it0).kind }) == HIR_ITEM_TRAIT {
+            let mut tm0: *mut HirItem = unsafe { (*it0).members };
+            while (tm0 as usize) != 0 {
+                fn_cap = fn_cap + 1;
+                tm0 = unsafe { (*tm0).next };
+            }
         }
         it0 = unsafe { (*it0).next };
     }
@@ -86332,46 +86481,10 @@ fn driver_emit_objmodel(
     let mut it: *mut HirItem = ctx.hir.items;
     while (it as usize) != 0 {
         if (unsafe { (*it).kind }) == HIR_ITEM_FN {
-            let body = mir_build_fn(
-                mut_view(ctx.mir_arena),
-                it,
-                thir_ptr,
-                hir_ptr,
-                str_in_ptr,
-                db_ptr,
-                0 as *mut MonoEngine
+            let body = pipe_build_item_body(
+                mut_view(*ctx), run_drop_elab, run_opt, it, thir_ptr, hir_ptr, str_in_ptr, db_ptr
             );
             if (body as usize) != 0 {
-                backend_promote_const_aggregates(unsafe { mut_view(*body) }, view(ctx.thir));
-                if run_drop_elab {
-                    mir_drop_elaborate(
-                        unsafe { mut_view(*body) },
-                        mut_view(ctx.thir),
-                        view(ctx.hir),
-                        db_ptr,
-                        view(ctx.sess.interner),
-                        mut_view(ctx.mir_arena)
-                    );
-                    if !session_has_errors(view(ctx.sess)) {
-                        verify_mir_own(
-                            unsafe { view(*body) },
-                            thir_ptr as *const Thir,
-                            mut_view(ctx.sess.diag_sink),
-                            it as *const HirItem
-                        );
-                    }
-                }
-                if run_opt {
-                    opt_run_in_arena(
-                        unsafe { mut_view(*body) },
-                        thir_ptr as *const Thir,
-                        mut_view(ctx.mir_arena),
-                        mut_view(ctx.sess.diag_sink),
-                        false,
-                        it as *const HirItem
-                    );
-                }
-                backend_resolve_body_call_types(unsafe { mut_view(*body) }, view(ctx.hir), view(ctx.thir));
                 unsafe {
                     *pipe_hir_item_ptr_at(items_buf, fn_count) = it;
                     *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;
@@ -86380,6 +86493,79 @@ fn driver_emit_objmodel(
             }
         }
         it = unsafe { (*it).next };
+    }
+
+    // T153 (REQ-TRT-005): axiom0's `build` emits every monomorphization instance (driver/mono.c), and an instance
+    // of a trait's default method has the trait member itself as its item - a member of a TRAIT item, which is not
+    // in `hir.items` (impl members and generic clones are). Build those bodies too, so the image defines the
+    // default method that the impls without an override call.
+    if is_build_mode {
+        let mut ei: *mut MonoInstance = ctx.mono.instances_head;
+        while (ei as usize) != 0 {
+            let ni: *mut HirItem = unsafe { (*ei).new_item };
+            if (unsafe { (*ei).mir_body }) != 0 && (ni as usize) != 0 && (unsafe { (*ni).kind }) == HIR_ITEM_FN &&
+                pipe_is_trait_member(ctx.hir.items, ni) && !pipe_item_in_buf(items_buf, fn_count, ni) {
+                let body = pipe_build_item_body(
+                    mut_view(*ctx), run_drop_elab, run_opt, ni, thir_ptr, hir_ptr, str_in_ptr, db_ptr
+                );
+                if (body as usize) != 0 && fn_count < fn_cap {
+                    unsafe {
+                        *pipe_hir_item_ptr_at(items_buf, fn_count) = ni;
+                        *pipe_mir_body_ptr_at(bodies_buf, fn_count) = body;
+                    }
+                    fn_count = fn_count + 1;
+                }
+            }
+            ei = unsafe { (*ei).next };
+        }
+    }
+
+    // Emission order. axiom0 writes the instances newest-first (the order of its instance list); the port's
+    // engine keeps the same list, so build mode follows it and puts anything the engine does not know last in
+    // reverse `hir.items` order. Other modes keep `hir.items` order.
+    let order_buf = arena_alloc_raw(
+        mut_view(ctx.backend_arena),
+        opts_mul_usize(fn_count + 1, size_of<u32>()),
+        align_of<u32>()
+    ) as *mut u32;
+    let used_buf = arena_alloc_raw(mut_view(ctx.backend_arena), fn_count + 1, 1);
+    let mut oi: usize = 0;
+    while oi < fn_count {
+        unsafe { *(used_buf + oi) = 0u8; }
+        oi = oi + 1;
+    }
+    let mut order_n: usize = 0;
+    if is_build_mode {
+        let mut oinst: *mut MonoInstance = ctx.mono.instances_head;
+        while (oinst as usize) != 0 {
+            let oni: *mut HirItem = unsafe { (*oinst).new_item };
+            let mut e: usize = 0;
+            while e < fn_count {
+                if (unsafe { *(used_buf + e) }) == 0u8 && (unsafe { *pipe_hir_item_ptr_at(items_buf, e) }) == oni {
+                    unsafe {
+                        *(used_buf + e) = 1u8;
+                        *pipe_u32_at(order_buf, order_n) = e as u32;
+                    }
+                    order_n = order_n + 1;
+                    break;
+                }
+                e = e + 1;
+            }
+            oinst = unsafe { (*oinst).next };
+        }
+        let mut r: usize = fn_count;
+        while r > 0 {
+            r = r - 1;
+            if (unsafe { *(used_buf + r) }) == 0u8 {
+                unsafe { *pipe_u32_at(order_buf, order_n) = r as u32; }
+                order_n = order_n + 1;
+            }
+        }
+    } else {
+        while order_n < fn_count {
+            unsafe { *pipe_u32_at(order_buf, order_n) = order_n as u32; }
+            order_n = order_n + 1;
+        }
     }
 
     let mut cstr_counter: u32 = 0u32;
@@ -86398,7 +86584,7 @@ fn driver_emit_objmodel(
 
     let mut fi: usize = 0;
     while fi < fn_count {
-        let idx = if is_build_mode { fn_count - 1 - fi } else { fi };
+        let idx = (unsafe { *pipe_u32_at(order_buf, fi) }) as usize;
         let fn_item = unsafe { *pipe_hir_item_ptr_at(items_buf, idx) };
         let mir_body = unsafe { *pipe_mir_body_ptr_at(bodies_buf, idx) };
         let fn_ty = backend_resolve_item_fn_ty(

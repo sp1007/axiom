@@ -50,8 +50,8 @@ def main():
         problems.append("duplicate paths")
     if rows != sorted(rows):
         problems.append("rows not sorted")
-    if not rows:
-        problems.append("empty registry")
+    # An empty registry is the goal state (every corpus program is identical, ADR-0035 section 4): T153 removed
+    # the last entries, so emptiness is valid; the e2e oracle enforces the live content.
     for p in problems:
         print("PROBLEM", p)
     if problems:

@@ -8,13 +8,14 @@ model: sonnet
 gate_model: opus
 depends: [T151]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/resolve, compiler/types, compiler/typeck_traits, compiler/traits, compiler/driver/pipeline.ax, compiler/mir/builder.ax, compiler/backend, tests/run/parity/traits, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0032-unblock-t131-drop-destructors.md, 0133]
 covers: [REQ-TRT-005, REQ-TRT-006, REQ-TRT-012, REQ-BLD-030]
-started: 2026-10-29 23:07:00
+started: 2026-10-30 01:04:35
 unblocks: 1
+finished: 2026-10-30 05:29:00
 ---
 # T153 — Port trait items parity in the build path
 
@@ -79,3 +80,5 @@ Confirmed defects (architect probe 2026-10-20):
 - 2026-10-29 23:07:00 started (attempt 1) T153-impl
 - 2026-10-30 01:01:00 block: needs compiler/mir/builder.ax (outside paths) for associated-const Type.CONST stack overflow; patch in report
 - 2026-10-30 01:02:55 unblocked (cycle 1) 
+- 2026-10-30 01:04:35 started (attempt 1) T153-impl
+- 2026-10-30 05:29:00 accepted by QA -> done
