@@ -8,11 +8,13 @@ model: sonnet
 gate_model: opus
 depends: [T151]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types, compiler/typeck, compiler/mir, compiler/lir, compiler/own, compiler/driver/pipeline.ax, compiler/backend, tests/run/parity/closures, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, 0116]
 covers: [REQ-OWN-017, REQ-BLD-030]
+started: 2026-10-29 09:11:09
+finished: 2026-10-29 22:33:13
 ---
 # T152 — Port closures and fn pointers parity
 
@@ -60,3 +62,5 @@ Confirmed defects (architect probe 2026-10-20):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-29 09:11:09 started (attempt 1) T152-impl
+- 2026-10-29 22:33:13 accepted by QA -> done
