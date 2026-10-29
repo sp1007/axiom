@@ -235,12 +235,12 @@ def check_guard(commands):
         return subprocess.run([bash, "-c", cmd], input=json.dumps(payload).encode("utf-8"), cwd=cwd, env=env,
                               capture_output=True, timeout=60)
 
-    push = {"tool_name": "Bash", "tool_input": {"command": "git push origin main"}, "cwd": ROOT}
+    push = {"tool_name": "Bash", "tool_input": {"command": "git push --force origin main"}, "cwd": ROOT}
     edit = {"tool_name": "Edit", "tool_input": {"file_path": os.path.join(ROOT, "docs", "x.md")}, "cwd": ROOT}
     okay = {"tool_name": "Bash", "tool_input": {"command": "git status --short"}, "cwd": ROOT}
     with tempfile.TemporaryDirectory() as elsewhere:
         for cmd in commands:
-            for name, payload in (("git push", push), ("Edit under docs/", edit)):
+            for name, payload in (("git push --force", push), ("Edit under docs/", edit)):
                 out = run(cmd, payload, ROOT, elsewhere)
                 if b'"permissionDecision": "deny"' not in out.stdout or out.returncode == 2:
                     p(f"guard hook does not refuse {name} when run as configured: {cmd}")
@@ -259,7 +259,8 @@ if "--settings" in sys.argv:  # check a proposed settings file before the owner 
 try:
     settings = json.load(open(SETTINGS, encoding="utf-8"))
     perms = settings.get("permissions", {})
-    for rule in ("Edit(docs/**)", "Write(docs/**)", "Bash(git push:*)", "PowerShell(git push:*)"):
+    for rule in ("Edit(docs/**)", "Write(docs/**)", "Bash(git push --force:*)", "Bash(git push -f:*)",
+                 "PowerShell(git push --force:*)", "PowerShell(git push -f:*)"):
         if rule not in perms.get("deny", []):
             p(f".claude/settings.json: deny rule {rule} missing")
     for tool in ("TaskStop", "ToolSearch", "SendMessage", "CronCreate", "CronDelete", "CronList"):

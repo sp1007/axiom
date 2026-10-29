@@ -91,7 +91,7 @@ LENS A4 — PROCESS & DOCUMENT CONSISTENCY. Read CLAUDE.md, .claude/agents/*, .c
 (including scripts taskctl.py, autopilot.py, overdue.py, reqcov.py, harness_check.py and
 axiom-spec-index/references/requirements-extraction.md), .claude/settings.json, .claude/hooks/guard.py,
 spec/ROADMAP.md, OWNER.md, ADRs, and the board. Owner rules: docs/ never edited/staged; commit locally
-after each QA-accepted task (`taskctl accept`), never push; autopilot never asks — decisions are
+after each QA-accepted task (`taskctl accept`) followed by a plain push by the orchestrator (never force); autopilot never asks — decisions are
 delegated (decide, record the rationale, report afterwards); max 3 parallel with disjoint paths/locks,
 QA gates on per-task snapshots; critical (priority < 10) alone with drain; QA fix round 2 escalates to
 opus; infrastructure failures never burn attempts; T224 deferred until the owner asks.

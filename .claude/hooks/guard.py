@@ -3,7 +3,8 @@
 
 Hard rules of the project owner, enforced for the main session and every subagent:
     1. docs/ belongs to the owner: never edited, moved, deleted, re-encoded or created by the harness.
-    2. Nothing is ever pushed (git push in any form, gh publishing commands).
+    2. History on the remote is never rewritten: only a plain fast-forward `git push` is allowed
+       (owner decision 2026-10-29); force/delete/mirror pushes and gh publishing commands are refused.
     3. docs/ is never staged or committed (git add / commit / rm / mv on docs/, and broad forms such
        as `git add -A` or `git commit -a` while docs/ has changes).
     4. Broad destructive git commands (reset --hard, checkout/restore of ".", clean, stash) are
@@ -59,6 +60,8 @@ OUTPUT_OPT_VERBS = {"curl": {"-o", "--output"}, "wget": {"-O", "-P", "--output-d
                     "cmake": {"-B"}, "pandoc": {"-o", "--output"}}
 NESTED_SHELLS = {"bash", "sh", "zsh", "dash", "cmd", "powershell", "pwsh", "wsl"}
 NESTED_FLAGS = {"-c", "-lc", "-ic", "/c", "/k", "-command", "-encodedcommand"}
+PUSH_FORBIDDEN = {"-f", "--force", "--force-with-lease", "--force-if-includes", "-d", "--delete",
+                  "--mirror", "--prune", "--all", "--tags"}
 GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--super-prefix",
                   "--config-env"}
 COMMIT_VALUE_OPTS = {"-m", "-F", "-C", "-c", "-t", "--message", "--file", "--author", "--date",
@@ -217,8 +220,15 @@ def check_git(args, cwd, depth):
     if i >= len(args):
         return
     sub, rest = args[i].lower(), args[i + 1:]
-    if sub in ("push", "send-pack"):
-        raise Deny("`git push` is forbidden: this project commits locally only and never pushes")
+    if sub == "send-pack":
+        raise Deny("`git send-pack` is forbidden: only a plain `git push` is allowed")
+    if sub == "push":
+        bad = [a for a in rest if a.lower() in PUSH_FORBIDDEN or a.lower().startswith("--force")
+               or (a.startswith("-") and not a.startswith("--") and "f" in a[1:])
+               or (not a.startswith("-") and (a.startswith("+") or a.startswith(":")))]
+        if bad:
+            raise Deny(f"`git push {' '.join(bad)}` rewrites or deletes remote history: only a plain "
+                       "fast-forward push is allowed")
     if not same_repo(cwd):
         return
     opts = [a for a in rest if a.startswith("-")]
@@ -436,7 +446,8 @@ def check_command(command, cwd, powershell=False, depth=0):
             seg.append(t)
 
 
-FALLBACK_PUSH = re.compile(r"(?:^|[;&|\n(]\s*)git(?:\.exe)?(?:\s+(?:-C\s+\S+|-c\s+\S+|--[\w-]+(?:=\S+)?))*\s+push\b")
+FALLBACK_PUSH = re.compile(r"(?:^|[;&|\n(]\s*)git(?:\.exe)?(?:\s+(?:-C\s+\S+|-c\s+\S+|--[\w-]+(?:=\S+)?))*\s+push\b"
+                           r"[^;&|\n]*?(?:\s-\w*f|--force|--delete|\s-d\b|--mirror|\s[+:])")
 
 
 def decide(tool, tool_input, cwd):
@@ -456,7 +467,7 @@ def decide(tool, tool_input, cwd):
             return str(d)
         except Exception:  # analysis failed: keep only the unambiguous rule
             if FALLBACK_PUSH.search(command):
-                return "`git push` is forbidden: this project commits locally only and never pushes"
+                return "force/delete `git push` is forbidden: only a plain fast-forward push is allowed"
         return None
     return None
 
@@ -498,15 +509,15 @@ def selftest():
     r = ROOT.replace("\\", "/")
     msys = "/" + r[0].lower() + r[2:] if re.match(r"^[A-Za-z]:", r) else r
     deny = [
-        ("Bash", "git push"),
-        ("Bash", "git push origin main"),
-        ("Bash", "git -C . push --dry-run"),
+        ("Bash", "git push -f"),
+        ("Bash", "git push --force origin main"),
+        ("Bash", "git -C . push --force-with-lease"),
         ("Bash", "git --no-pager -c x=y push -f"),
-        ("Bash", "cd build && git push"),
-        ("Bash", "echo ok; git push 2>&1 | tail -1"),
-        ("Bash", 'bash -c "git push origin HEAD"'),
-        ("PowerShell", "git push"),
-        ("PowerShell", "git status; git push origin main"),
+        ("Bash", "cd build && git push origin +main"),
+        ("Bash", "echo ok; git push origin :main 2>&1 | tail -1"),
+        ("Bash", 'bash -c "git push --delete origin x"'),
+        ("PowerShell", "git push --mirror"),
+        ("PowerShell", "git status; git push -uf origin main"),
         ("Bash", "git add docs/base/specs/0001.md"),
         ("Bash", "git add -f docs"),
         ("Bash", f'git add "{msys}/docs/base"'),
@@ -544,6 +555,9 @@ def selftest():
     allow = [
         ("Bash", "git status --short"),
         ("Bash", "git log --oneline --grep push -5"),
+        ("Bash", "git push"),
+        ("Bash", "git push origin main"),
+        ("PowerShell", "git status; git push origin main"),
         ("Bash", 'git commit -m "T010: lexer (never push, docs/ untouched)"'),
         ("Bash", "git add -- spec/SPEC-01.md _workspaces/tasks"),
         ("Bash", "git add _workspaces/reports/T010-report.md bootstrap/axiom0/src/lexer/lexer.c"),

@@ -23,7 +23,7 @@ finding that needs a choice, the consolidating architect lists the options, pick
 applies it and records the rationale where it belongs (ADR for language/compiler design, ROADMAP
 change log for scope or ordering, CLAUDE.md history for harness/process). The owner gets a report
 afterwards and can overturn any item. Hard limits that no decision may cross: never edit or stage
-`docs/`; never push; T224 stays `deferred`; a requirement in `spec/requirements/OWNER.md` is never
+`docs/`; never force-push; T224 stays `deferred`; a requirement in `spec/requirements/OWNER.md` is never
 dropped or weakened silently (changing how or when it is delivered needs an ADR that names it and a
 line in the report).
 

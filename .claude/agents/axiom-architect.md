@@ -36,7 +36,7 @@ plan toward a self-hosting compiler.
   human and never leave a question open. Decide, record the options considered and the rationale
   (ADR for architecture, ROADMAP change log for plan changes), apply it, and report afterwards.
   Flag decisions you consider high-risk in the ADR's "Revisit" line so the human can review later.
-  Hard limits no decision may cross: never edit or stage `docs/`, never push, T224/T324 stay
+  Hard limits no decision may cross: never edit or stage `docs/`, never push or force-push (only the orchestrator pushes), T224/T324 stay
   deferred, and an `OWNER.md` requirement is never dropped (re-sequencing is allowed and must be
   stated explicitly).
 - **Plan in time, not only in existence.** For every feature a task uses, the task that delivers it

@@ -16,7 +16,7 @@ tools (TeamCreate) are not assumed; if they are available, the same roles and fi
 decisions: neither the orchestrator nor any agent stops to ask. Whoever meets an open question
 chooses the best option, applies it, records the options and the rationale (ADR for language/compiler
 design, ROADMAP change log for scope/ordering, CLAUDE.md history for harness/process) and reports
-afterwards. Hard limits that no decision may cross: never edit or stage `docs/`; never push; T224
+afterwards. Hard limits that no decision may cross: never edit or stage `docs/`; never force-push or rewrite remote history (a plain `git push origin <branch>` after each accept is allowed, orchestrator only); T224
 stays `deferred`; a requirement in `spec/requirements/OWNER.md` is never dropped or weakened
 silently (re-planning it needs an ADR that names it and appears in the report to the owner).
 
@@ -101,7 +101,7 @@ them from any directory.
      --compiler pointing at that build. Quick local builds may use build-<ID> in the main tree.
      Write _workspaces/reports/<ID>-report.md (format in the axiom-tasks skill) with an exact
      "## Files changed" list (`- path` per line, every created/modified/deleted file) and, as its
-     LAST line, "STATUS: COMPLETE round=0" (or "STATUS: BLOCKED <reason>"). Do not commit; do not
+     LAST line, "STATUS: COMPLETE round=0" (or "STATUS: BLOCKED <reason>"). Do not commit or push; do not
      move task files; never edit docs/. Open questions: decide, record the rationale in the report
      (the architect turns design decisions into ADRs) — do not ask.
      Finish with "<ID> COMPLETE" or "<ID> BLOCKED: <reason>".
@@ -135,10 +135,14 @@ them from any directory.
 5. On the QA result (read the last `VERDICT:` line of `<ID>-qa.md`, not the chat summary):
    - **PASS** → `python $S/taskctl.py accept <ID>` — one command that re-checks the verdict, checks
      the change set, moves the task to `done/` and makes the single commit (code + both reports +
-     board; local, never push). Exit 1 = refused, task still in `doing/`: read the `REFUSED` lines. An
+     board). Exit 1 = refused, task still in `doing/`: read the `REFUSED` lines. An
      unlisted changed file under the task's paths → if it clearly belongs to the task, rerun with
      `--include-unlisted`; otherwise send it back to the owner agent. A failed git commit (hook) rolls
      the task back to `doing/`: fix the cause, rerun `accept`; never `--no-verify`.
+     Then push (owner decision 2026-10-29): `git push origin $(git rev-parse --abbrev-ref HEAD)` —
+     plain fast-forward only, never `--force`/`-f`/`--delete`. A rejected push (remote ahead) or a
+     network/auth error is logged (`<ID> push-failed <reason>`) and retried after the next accept or
+     tick; it never blocks, rolls back or requeues the task, and never triggers a pull/rebase/force.
      Then `python $S/autopilot.py drop <ID>`, `python $S/taskctl.py snapshot <ID> --remove`, delete
      `build-<ID>`, log.
    - **FAIL**, round 0 → round 1: `autopilot.py run <ID> --stage fix --agent <ID>-impl --round 1`;
@@ -193,6 +197,7 @@ report's `STATUS:` line, the QA `VERDICT:` line and their times):
 
 A dead `unblock` entry: `python $S/taskctl.py unblock-end <ID> --failed`, `autopilot.py drop <ID>`.
 `python $S/taskctl.py reconcile --commit` repairs a task that reached `done/` without its commit.
+Unpushed commits (`git status -sb` shows `ahead`) are pushed by the next accept or tick.
 
 ## Procedure: architect unblock
 
@@ -259,7 +264,7 @@ One unblock at a time, never beside a critical task, at most 2 cycles per task:
 ## After self-host: axiom0 freeze (ROADMAP R3)
 
 When T087 is accepted the Stage-0 compiler is frozen. Immediately after `accept T087`:
-1. `git tag axiom0-frozen` (local tag; nothing is pushed). From then on `harness_check.py` fails if a
+1. `git tag axiom0-frozen` (local tag; tags are not pushed). From then on `harness_check.py` fails if a
    commit after the tag touches `bootstrap/axiom0` unless its subject names an `AX0-FIX` task, and
    warns about uncommitted changes there.
 2. A change to axiom0 that is needed to keep rebuilding axiomc is its own task: title starting

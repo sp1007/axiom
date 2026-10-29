@@ -7,11 +7,11 @@ model: sonnet
 # /tu-dong — Axiom autopilot
 
 The user has given standing authorisation for this mode: pick tasks, run subagents, gate with QA,
-move task files, and **commit locally after every accepted task** — without asking. Do not push to
-any remote. Do not pause to ask questions: design and process decisions are delegated — the
+move task files, **commit after every accepted task and push it** (`git push origin <branch>`, plain
+fast-forward; owner decision 2026-10-29) — without asking. Do not pause to ask questions: design and process decisions are delegated — the
 architect (or whoever meets the question) decides the best option, applies it, records the rationale
 (ADR / ROADMAP change log / CLAUDE.md history) and it is reported afterwards. Hard limits: never edit
-or stage `docs/`, never push, T224 stays deferred, an OWNER.md requirement is never dropped silently.
+or stage `docs/`, never force-push or rewrite remote history, T224 stays deferred, an OWNER.md requirement is never dropped silently.
 Keep going until the board is finished, the board is stuck (reported, see below) or the user says stop.
 
 `S=.claude/skills/axiom-tasks/scripts`. `_workspaces/autopilot.json` is written only through

@@ -196,7 +196,7 @@ its own `## Files changed`, and as the last line `VERDICT: PASS round=<n>` or `V
 1. `start` (orchestrator) → spawn the owner agent with the task file path.
 2. Owner implements, runs the full suite in its snapshot, writes the report ending with `STATUS:`.
 3. Orchestrator runs `snapshot` and spawns the gate agent → `<ID>-qa.md`.
-4. PASS → `accept` (verdict check, change-set check, move to `done/`, one local commit; never push).
+4. PASS → `accept` (verdict check, change-set check, move to `done/`, one commit; the orchestrator then pushes it — plain fast-forward only).
    FAIL → findings go back to the owner (up to 2 fix rounds, the second on Opus) → gate again.
    Still failing, or the owner reports a spec contradiction → `block` with the reason; the architect
    resolves it (ADR, split, prerequisite or rescope) under the unblock lock.
@@ -217,6 +217,6 @@ audit fixes) is committed with `taskctl.py commit-report <report.md> --subject "
 stages exactly the report's `## Files changed` plus the board. The owner's files under `docs/` and
 git-ignored paths are never staged by these commands. `.claude/hooks/guard.py` is the PreToolUse
 safety hook (enabled in `.claude/settings.json` by the owner): it refuses any tool call that would
-edit `docs/`, stage it, or push, and nothing else. `.claude/settings.json` itself (permissions,
+edit `docs/`, stage it, or force-push, and nothing else. `.claude/settings.json` itself (permissions,
 hooks) is never changed by an agent: propose the change in a file and let the owner apply it
 (`harness_check.py --settings <file>` verifies a proposal).
