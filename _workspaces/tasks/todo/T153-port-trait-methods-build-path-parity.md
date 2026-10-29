@@ -10,9 +10,11 @@ depends: [T151]
 priority: 117
 status: todo
 attempts: 0
-paths: [compiler/resolve, compiler/types, compiler/typeck_traits, compiler/traits, compiler/driver/pipeline.ax, compiler/backend, tests/run/parity/traits, tests/selfhost]
+paths: [compiler/resolve, compiler/types, compiler/typeck_traits, compiler/traits, compiler/driver/pipeline.ax, compiler/mir/builder.ax, compiler/backend, tests/run/parity/traits, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0032-unblock-t131-drop-destructors.md, 0133]
 covers: [REQ-TRT-005, REQ-TRT-006, REQ-TRT-012, REQ-BLD-030]
+started: 2026-10-29 23:07:00
+unblocks: 1
 ---
 # T153 — Port trait items parity in the build path
 
@@ -51,6 +53,19 @@ Confirmed defects (architect probe 2026-10-20):
 
 ## Out of scope
 - `dyn Trait` (T058); operator-trait typing crash (T151).
+- Semantic per-implementing-type instantiation of default bodies (a default body calling a required
+  method must bind it to the implementing type; axiom0, port and interpreter all bind the first impl
+  today) — that is a lockstep axiom0+port fix, T161 (AX0-FIX-09). T153 keeps parity with axiom0's
+  current behaviour.
+
+## Unblock (2026-10-30, architect, unblock-T153)
+- `compiler/mir/builder.ax` added to `paths:` (no todo/doing task owns it concurrently: T156 depends
+  on T153; T058/T089 are post-self-host). Apply the `mb_build_expr_as_operand` FIELD→CONST-item case
+  from the attempt-1 report (mirrors axiom0 `mir/build/builder.c`), regenerate every selfhost bundle
+  named by `tests/selfhost/*/bundles_current.test`, remove `tests/run/trait2/test_assoc_items.ax`
+  from `known_divergent.txt`, and finish the full suite in `build-snap-T153` (not yet claimed).
+- Keep the attempt-1 changes already in the working tree (pipeline.ax, resolver.ax, parity tests,
+  bundles, registry edits).
 
 ## Notes
 - After T151 (shares typeck paths; generic default methods need instantiation).
@@ -59,3 +74,8 @@ Confirmed defects (architect probe 2026-10-20):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-29 22:34:11 started (attempt 1) T153-impl
+- 2026-10-29 23:06:49 requeue: recovered: previous session ended during impl (not charged: attempt refunded)
+- 2026-10-29 23:07:00 started (attempt 1) T153-impl
+- 2026-10-30 01:01:00 block: needs compiler/mir/builder.ax (outside paths) for associated-const Type.CONST stack overflow; patch in report
+- 2026-10-30 01:02:55 unblocked (cycle 1) 
