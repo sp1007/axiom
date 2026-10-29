@@ -47,6 +47,7 @@ UNIT_MODULES = [
 def bundle_one(in_name, out_name, stdout_line, prelude_text, modules_text):
     in_path = os.path.join(HERE, in_name)
     main_src = bc.read_bytes(in_path).decode("utf-8").replace("\r\n", "\n")
+    main_src = main_src.replace("use std.core.host.", "use host_intrinsics.")
     header = (
         "// test: run\n"
         "// timeout: 600\n"

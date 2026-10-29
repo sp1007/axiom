@@ -8,12 +8,14 @@ model: opus
 gate_model: opus
 depends: [T146]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/types, compiler/typeck, compiler/typeck_traits, compiler/traits, compiler/resolve, compiler/hir, compiler/mir, tests/run/parity/generics, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md, 0129, 0131]
 covers: [REQ-TYP-048, REQ-GEN-001, REQ-BLD-030]
 timeout_min: 240
+started: 2026-10-28 20:57:07
+finished: 2026-10-29 09:10:05
 ---
 # T151 — Port typeck parity: generics and the typeck crash
 
@@ -71,3 +73,5 @@ Confirmed defects (architect probe 2026-10-20):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-28 20:57:07 started (attempt 1) T151-impl
+- 2026-10-29 09:10:05 accepted by QA -> done
