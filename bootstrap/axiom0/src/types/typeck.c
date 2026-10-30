@@ -4,6 +4,18 @@
 #include <stdio.h>
 #include <inttypes.h>
 
+/* T161: `Self` inside a trait (no implementing type known) is a type parameter of its own, distinct
+ * from the generic parameters of the trait's methods (which are numbered from 0). The MIR instance of
+ * a default method for an implementing type replaces exactly this parameter (driver/mono.c
+ * AX_MONO_SELF_PARAM_INDEX must hold the same value). */
+#define TC_SELF_PARAM_INDEX 0xFFFFFF00u
+/* T161: symbols of the per-implementing-type instances of trait default methods (0133 §8, §9): an impl
+ * that does not override a default method gets a member that shares the trait member's HIR body. The
+ * range is unused by resolve (1..), closures (0x4...), synthetic locals (0x6...), drop (0x7...) and
+ * hir/lower.c (0x8...). */
+#define TC_DEFAULT_INST_SYM_BASE 0x50000000u
+#define TC_DEFAULT_INST_SYM_END 0x60000000u
+
 /* Type checker for the axiom0 subset (SPEC-03 §2-§4, §8).
  *
  * Diagnostic discipline (T115): a mismatch is reported exactly once, at the place where it is
@@ -82,6 +94,8 @@ typedef struct TypeckCtx {
     const AxHirItem *current_fn;
     const AxHirItem *current_impl;
     TypeId self_ty;
+    /* T161: when set, ax_subst_ty also replaces the trait `Self` parameter by this type. */
+    TypeId subst_self;
     uint32_t next_closure_id;
 
     /* The fn item the last lookup_path_type call resolved to (T134: intrinsic call registration). */
@@ -995,10 +1009,14 @@ static const AxHirItem *find_method(TypeckCtx *cx, TypeId base_ty, StrView metho
 
 TypeId ax_subst_ty(TypeckCtx *cx, TypeId ty, const AxGenericArgs *args) {
     if (TypeId_is_none(ty)) return ty;
-    if (args == NULL || args->count == 0) return ty;
+    bool sub_self = TypeId_is_some(cx->subst_self) && cx->subst_self.v != 0;
+    if ((args == NULL || args->count == 0) && !sub_self) return ty;
+    static const AxGenericArgs no_args = {NULL, 0};
+    if (args == NULL) args = &no_args;
     ty = resolve_ty(cx, ty);
     const AxType *t = ax_type_get(&cx->thir->interner, ty);
     if (t->kind == AX_TY_PARAM) {
+        if (sub_self && t->param.index == TC_SELF_PARAM_INDEX) return cx->subst_self;
         if (t->param.index < args->count) {
             return args->args[t->param.index];
         }
@@ -1464,6 +1482,61 @@ static bool tc_use_tree_binds_drop(StrInterner *in, const AxHirUseTree *t) {
     return false;
 }
 
+/* T161 (0133 §8, §9, §14; REQ-TRT-005, REQ-TRT-011): a trait default method behaves, for every
+ * implementing type that does not override it, as if its body had been written in that type's impl.
+ * Every such (impl, default member) pair gets a member of the impl: a copy of the trait member item
+ * that shares its HIR body, with a fresh symbol from TC_DEFAULT_INST_SYM_BASE (program order: impls in
+ * item order, then trait members in declaration order). Its signature is computed with `Self` = the
+ * impl's self type (pass 1b), method lookup on that type finds it like a hand-written member, and the
+ * MIR of its body is the trait member's MIR instantiated for the impl (driver/mono.c
+ * ax_mono_instantiate_default). The body itself is type-checked once, as the trait member. Defaults
+ * inherited from a supertrait are instantiated by the impl of that supertrait. */
+static const AxHirItem *tc_trait_of_impl(TypeckCtx *cx, const AxHirItem *impl) {
+    const AxHirType *tp = impl->impl.trait_path;
+    if (!tp) return NULL;
+    StrView tr_name = (tp->span.file.v != 0) ? ax_source_db_span_text(cx->db, tp->span) : (StrView){0};
+    if (tr_name.len == 0 && tp->path.path.name.v != 0) tr_name = ax_interner_get(cx->str_in, tp->path.path.name);
+    for (const AxHirItem *item = cx->hir->items; item; item = item->next) {
+        if (item->kind != AX_HIR_ITEM_TRAIT) continue;
+        if (tp->path.path.symbol.v != 0 && item->trait.symbol.v == tp->path.path.symbol.v) return item;
+        if (tr_name.len > 0 && ax_sv_eq(ax_interner_get(cx->str_in, item->trait.name), tr_name)) return item;
+    }
+    return NULL;
+}
+
+static void tc_instantiate_default_methods(TypeckCtx *cx) {
+    uint32_t counter = 0;
+    for (AxHirItem *it = (AxHirItem *)cx->hir->items; it; it = it->next) {
+        if (it->kind != AX_HIR_ITEM_IMPL || !it->impl.trait_path || !it->impl.self_type) continue;
+        const AxHirItem *tr = tc_trait_of_impl(cx, it);
+        if (!tr) continue;
+        for (const AxHirItem *m = tr->trait.members; m; m = m->next) {
+            if (m->kind != AX_HIR_ITEM_FN || m->fn.body == NULL) continue;
+            bool overridden = false;
+            AxHirItem **tail = &it->impl.members;
+            for (AxHirItem *im = it->impl.members; im; im = im->next) {
+                if (im->kind == AX_HIR_ITEM_FN && im->fn.name.v == m->fn.name.v) overridden = true;
+                tail = &im->next;
+            }
+            if (overridden) continue;
+            /* 0x0FFFFFFF instances cannot be reached by any program that fits in memory. */
+            if (TC_DEFAULT_INST_SYM_BASE + counter + 1 >= TC_DEFAULT_INST_SYM_END) return;
+            AxHirItem *inst = ax_arena_alloc(&cx->thir->interner.arena, sizeof(AxHirItem), _Alignof(AxHirItem));
+            *inst = *m;
+            inst->next = NULL;
+            inst->fn.symbol = (AxSymbolId){ TC_DEFAULT_INST_SYM_BASE + (++counter) };
+            *tail = inst;
+            /* The MIR builder reads the instance's impl under the item address tagged with 2. */
+            AxExprMethodMap_insert(&cx->thir->expr_methods, (const AxHirExpr *)((uintptr_t)inst | (uintptr_t)2), it);
+        }
+    }
+}
+
+static bool tc_is_default_inst(const AxHirItem *it) {
+    return it && it->kind == AX_HIR_ITEM_FN && it->fn.symbol.v > TC_DEFAULT_INST_SYM_BASE &&
+           it->fn.symbol.v < TC_DEFAULT_INST_SYM_END;
+}
+
 static bool tc_impl_is_lang_drop(const AxHir *hir, const AxHirItem *impl, StrInterner *str_in, const SourceDatabase *db) {
     if (!impl || impl->kind != AX_HIR_ITEM_IMPL) return false;
     const AxHirType *tp = impl->impl.trait_path;
@@ -1581,6 +1654,8 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
             }
         }
     }
+
+    tc_instantiate_default_methods(&cx);
 
     // Pass 1a: Structs and Enums (so function signatures can reference any struct/enum)
     for (const AxHirItem *it = hir->items; it; it = it->next) {
@@ -1880,6 +1955,11 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
 
             TypeId fn_ty = ax_intern_type(&thir.interner, &ft);
             AxItemTypeMap_insert(&thir.item_types, it, fn_ty);
+            /* T161: the implementing type of a default-method instance, under the item address
+             * tagged with 2, for the MIR instantiation (driver/mono.c). */
+            if (tc_is_default_inst(it) && cx.self_ty.v != 0) {
+                AxItemTypeMap_insert(&thir.item_types, (const AxHirItem *)((uintptr_t)it | (uintptr_t)2), cx.self_ty);
+            }
                 } else if (it->kind == AX_HIR_ITEM_TYPE_ALIAS) {
                     TypeId ty = TypeId_none();
                     if (it->type_alias.type) {
@@ -1965,7 +2045,8 @@ AxThir ax_typeck_with_evaluator(const AxHir *hir, AxDiagSink *sink, StrInterner 
                                   (top_it->kind == AX_HIR_ITEM_TRAIT ? top_it->trait.members : NULL));
             for (; it; it = (impl_pass == 0) ? NULL : it->next) {
                 bool is_closure = (it->fn.symbol.v >= 0x40000000 && it->fn.symbol.v < 0x50000000);
-                if (it->kind == AX_HIR_ITEM_FN && it->fn.body && !is_closure) {
+                /* T161: the body of a default-method instance is the trait member's, checked once there. */
+                if (it->kind == AX_HIR_ITEM_FN && it->fn.body && !is_closure && !tc_is_default_inst(it)) {
                     cx.current_fn = it;
             TypeId *fn_ty_ptr = AxItemTypeMap_get(&thir.item_types, it);
             if (!fn_ty_ptr) AX_ICE("typeck: fn item without a signature type");
@@ -2350,7 +2431,7 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
             memset(&pt, 0, sizeof(pt));
             pt.kind = AX_TY_PARAM;
             pt.param.name = ax_intern_cstr(cx->str_in, "Self");
-            pt.param.index = 0;
+            pt.param.index = TC_SELF_PARAM_INDEX;
             return ax_intern_type(&cx->thir->interner, &pt);
         }
         if (path->generic_args && out_args) {
@@ -2489,7 +2570,7 @@ static TypeId lookup_path_type(TypeckCtx *cx, const AxHirPath *path, AxGenericAr
         memset(&pt, 0, sizeof(pt));
         pt.kind = AX_TY_PARAM;
         pt.param.name = ax_intern_cstr(cx->str_in, "Self");
-        pt.param.index = 0;
+        pt.param.index = TC_SELF_PARAM_INDEX;
         return ax_intern_type(&cx->thir->interner, &pt);
     }
 
@@ -4898,8 +4979,15 @@ static TypeId check_expr_kind(TypeckCtx *cx, const AxHirExpr *expr, TypeId expec
                     fn_ty_id = ax_subst_ty(cx, fn_ty_id, &gargs);
                 }
             }
+            /* T161: in the signature of a trait member, `Self` is the receiver's type. */
+            {
+                TypeId saved_self = cx->subst_self;
+                cx->subst_self = base_ty;
+                fn_ty_id = ax_subst_ty(cx, fn_ty_id, NULL);
+                cx->subst_self = saved_self;
+            }
             const AxType *fn_ty = ax_type_get(&cx->thir->interner, fn_ty_id);
-            
+
             size_t expected_args = fn_ty->fn.param_count;
             bool has_self = (method_item->fn.params && ax_sv_eq_cstr(ax_interner_get(cx->str_in, method_item->fn.params->name), "self"));
             

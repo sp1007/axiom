@@ -59,7 +59,26 @@ typedef struct Builder {
     size_t var_count;
     size_t var_cap;
     DropNode *current_drops;
+    /* T161: the impl whose instance of a trait default method is being built (NULL otherwise). */
+    const AxHirItem *self_impl;
 } Builder;
+
+/* T161: must equal TC_SELF_PARAM_INDEX (types/typeck.c), the parameter index of the trait `Self`. */
+#define BUILD_SELF_PARAM_INDEX 0xFFFFFF00u
+
+/* T161: `Self.NAME` in a trait default body, built as the instance for b->self_impl, reads the
+ * constant of that impl (0133 §14). Any other constant reference is returned unchanged. */
+static const AxHirItem *self_impl_const(const Builder *b, const AxHirExpr *field_expr, const AxHirItem *m) {
+    if (!b->self_impl || !m || m->kind != AX_HIR_ITEM_CONST) return m;
+    const TypeId *base_ty = AxExprTypeMap_get(&b->thir->expr_types, field_expr->field.base);
+    if (!base_ty || base_ty->v == 0) return m;
+    const AxType *bt = ax_type_get(&b->thir->interner, *base_ty);
+    if (!bt || bt->kind != AX_TY_PARAM || bt->param.index != BUILD_SELF_PARAM_INDEX) return m;
+    for (const AxHirItem *im = b->self_impl->impl.members; im; im = im->next) {
+        if (im->kind == AX_HIR_ITEM_CONST && im->const_decl.name.v == m->const_decl.name.v) return im;
+    }
+    return m;
+}
 
 static void push_drop(Builder *b, AxMirPlace place, TypeId ty, bool is_temp);
 static AxMirBbId build_drop_chain(Builder *b, AxMirBbId current_bb, DropNode *from, DropNode *to, AxMirBbId target_bb, AxLocation loc);
@@ -1060,7 +1079,7 @@ static AxMirOperand build_expr_as_operand_inner(Builder *b, const AxHirExpr *exp
         if (expr->kind == AX_HIR_EXPR_FIELD) {
             const AxHirItem **m_ptr = AxExprMethodMap_get(&b->thir->expr_methods, expr);
             if (m_ptr && (*m_ptr)->kind == AX_HIR_ITEM_CONST) {
-                const AxHirItem *m = *m_ptr;
+                const AxHirItem *m = self_impl_const(b, expr, *m_ptr);
                 AxConstValue *cval = AxSymbolConstMap_get(&b->thir->symbol_consts, m->const_decl.symbol);
                 if (cval && cval->kind == AX_CONST_AGGREGATE) {
                     AxMirPlace p = build_place(b, expr);
@@ -2975,6 +2994,12 @@ AxMirBody *ax_mir_build(const AxHirItem *func, const AxThir *thir, AxArena *aren
     Builder b = {0};
     b.arena = arena;
     b.thir = thir;
+    /* T161: typeck records the impl of a default-method instance under the instance item's address
+     * tagged with 2 (expr nodes are 8-aligned; the drop-impl keys use tag 1). */
+    {
+        const AxHirItem **impl_ptr = AxExprMethodMap_get(&thir->expr_methods, (const AxHirExpr *)((uintptr_t)func | (uintptr_t)2));
+        b.self_impl = impl_ptr ? *impl_ptr : NULL;
+    }
     
     TypeId func_ty = {0};
     const TypeId *fty = AxItemTypeMap_get(&thir->item_types, func);

@@ -8,13 +8,15 @@ model: opus
 gate_model: opus
 depends: [T153]
 priority: 117
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [bootstrap/axiom0/src/driver/mono.c, bootstrap/axiom0/src/driver/mono.h, bootstrap/axiom0/src/traits, compiler/traits, tests/run/parity/trait_default, tests/selfhost]
 locks: [bootstrap/axiom0/src/types/typeck.c, bootstrap/axiom0/src/driver/pipeline.c, bootstrap/axiom0/src/mir/build/builder.c, compiler/types/typeck.ax, compiler/typeck_traits, compiler/driver/pipeline.ax, compiler/mir/builder.ax, compiler/interp, tests/selfhost/obj_link_driver/known_divergent.txt]
 spec: [spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md, 0133]
 covers: [REQ-TRT-005, REQ-TRT-011]
 timeout_min: 300
+started: 2026-10-30 05:32:28
+finished: 2026-10-30 17:41:54
 ---
 # T161 — AX0-FIX-09: trait default methods instantiated per implementing type
 
@@ -71,3 +73,5 @@ instance list; port: `compiler/traits/solver.ax` `find_trait_default_method`,
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-30 05:32:28 started (attempt 1) T161-impl
+- 2026-10-30 17:41:54 accepted by QA -> done

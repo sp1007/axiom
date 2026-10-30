@@ -443,6 +443,8 @@ static void build_mir_for_item(AxDriverState *st, AxHirItem *it) {
             }
         }
         AxMirBody *body = ax_mir_build(it, &st->thir, &g_mir_arena);
+        /* T161: a trait default method's instance for an implementing type (no-op for any other item). */
+        body = ax_mono_instantiate_default(st, it, body);
         if (body) {
             ax_verify_mir(body, &st->thir, &st->sink, it);
             AxMirMap_insert(&g_mir_map, it, body);
