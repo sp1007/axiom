@@ -134,6 +134,21 @@ fn give_potions() {
 `@entry` `DllMain`-style initialiser generated around the module initialisers of §5, base
 relocations (DLLs are relocatable). Linux counterpart (`.so`) is E16.2.
 
+### 7. Taking addresses of functions and variables (REQ-OWNER-008, 2026-10-31)
+
+To use, verify, and bind `@at(...)` declarations in practice, low-level/unsafe code must be able to
+obtain the address of any function or variable:
+
+- `address_of(x)` (`*const T`) and `address_of_mut(x)` (`*mut T`) accept any place expression
+  (local, deref, field, array/slice element, `static`, `static mut`, and `@at(...)` static overlay
+  or placement).
+- `addr_of(item_or_place) -> usize` (and casting a function item / function pointer `fn(...) -> R as
+  usize` or raw pointer `*const T` / `*mut T as usize`) returns the runtime/link-time memory address
+  of any function (`fn`, `extern fn`, `@at` function) or static/variable place as `usize`.
+- This enables verifying that `@at(addr)` placements/overlays reside at `addr`, computing
+  module-relative offsets (`addr_of(target) - image_self()`), populating vector/hook tables, and
+  binding `@at` overlays against live in-process functions and variables in tests and system code.
+
 ## Consequences
 
 - New roadmap epics **E13.6 Fixed-address declarations** and **E13.7 Module-relative bindings +

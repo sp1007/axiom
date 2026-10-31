@@ -168,13 +168,16 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
   tasks/0359 tasks/0370 tasks/0455.
 - **E13.4 Safety profiles & capability security** — profiles, sandboxing hooks, secure memory,
   constant-time annotations. Src tasks/0342 tasks/0449 tasks/0467 tasks/0703.
-- **E13.6 Fixed-address declarations (`@at`)** — owner requirement REQ-OWNER-003, ADR-0001:
-  overlay/placement of statics, arrays, structs, functions at absolute addresses, used with ordinary
-  syntax; `Volatile`/`Mmio` field types; overlap/alignment checks; absolute symbols and pinned
-  sections in object writers and linker; raw-binary/ELF freestanding images; oracle simulated
-  address space. Src ADR-0001, 0071 §31-32, 0044, 0097, tasks/0328.
+- **E13.6 Fixed-address declarations (`@at`)** — owner requirements REQ-OWNER-003, REQ-OWNER-008,
+  ADR-0001: overlay/placement of statics, arrays, structs, functions at absolute addresses, used
+  with ordinary syntax; taking addresses of functions and variables (`address_of` / `address_of_mut`
+  / `addr_of` -> `usize` and `fn as usize` casts) to inspect, verify, and bind `@at` items;
+  `Volatile`/`Mmio` field types; overlap/alignment checks; absolute symbols and pinned sections in
+  object writers and linker; raw-binary/ELF freestanding images; oracle simulated address space.
+  Src ADR-0001, 0071 §31-32, 0044, 0097, tasks/0328.
   Exit: a freestanding test image with an `@at` vector table and UART register block runs under the
-  oracle with a device model, and native images place every `@at` object at its address.
+  oracle with a device model, and native images place every `@at` object at its address (verified via
+  `addr_of` / `address_of`).
 - **E13.7 Module-relative bindings** — owner requirement REQ-OWNER-005,
   ADR-0001 §5-6: `@at(image("mod") + off)` / `image_self()` overlays resolved at module init in the
   hosted profile, hooked into the DLL/EXE initialisers of E18.7 (PE DLL output).
@@ -404,3 +407,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-10-20 | axiomc/axiom0 parity plan (T085 QA finding 3: 144/268 corpus programs not byte-identical, 22 run differently): new P10 tasks T147 AX0-FIX-05 (object-local deterministic `.Lstr.<f>.<k>`/`.Lpanic.<n>` data symbols + index-based local-symbol linking, axiom0 + port; priority 0 after T146), T148 (`build`-path call ABI parity, `inspect` == `build`; after T147), T149 (port MIR builder: missing slice/`as char` checks, `for` step, field index, temporaries), T150 (port intrinsic table + raw-pointer typing), T151 (typeck generics + typeck stack overflow), T152/T153 (closures; trait items; after T151), T154 (backend parity: narrow extension, -O1, const tables), T155 (native lexer panic on 20-digit literals), T156 (dump + diagnostic parity, oracle compares dumps, registry empty; after T147–T155); all depend on T146 (last AX0-FIX writer of `compiler/`); T086 depends on T147–T156 and requires an empty `known_divergent.txt`; zero-tolerance rule (no accepted byte-difference class) and registry maintenance rule for T134/T140/T141/T146 and every later task | ADR-0035 |
 | 2026-10-23 | T141 follow-ups: assignment-drop rule (view places drop, raw-pointer stores never drop) recorded in SPEC-03 AXS-SEM-043 / SPEC-12 AXS-DROP-007; raw pointers are not capabilities and view locals die before scope-end owner drops (SPEC-11 AXS-CAP-008/009); language `Drop` identified by resolution (AXS-DROP-008); index auto-deref through views specified (AXS-SEM-047) and deferred to new epic E14.5 by R7; new P10 tasks T157 AX0-FIX-06 (capability false `AX_CAP_OUTLIVES_OWNER`), T158 AX0-FIX-07 (`Drop` identity + `hir_postprocess_items`/pipeline.c renaming agreement), T159 AX0-FIX-08 (verifier drop checks on real bodies), T160 (project-mode std test for `Arena` implicit drop); T139 per-test leg serialisation (`dir.ax` race), T147 restores string literals in `qa_t140_edge_matrix.ax`, T149 adds the element-store-through-view drop test; T086 depends on T157–T159 | ADR-0036 |
 | 2026-10-30 | T153 unblock: `compiler/mir/builder.ax` added to T153 `paths:` (associated-const `Type.CONST` operand case; no concurrent owner); new P10 task T161 AX0-FIX-09 (trait default methods instantiated per implementing type, axiom0 + port + interpreter lockstep; REQ-TRT-005/011), depends on T153; T086 depends on T161 | unblock-T153 |
+| 2026-10-31 | Added owner requirement REQ-OWNER-008 to E13.6 (`@at`): low-level/unsafe code can obtain the memory address of any function (`fn`, `extern fn`, `@at fn`) or variable/static (`static`, `static mut`, `@at` item, local, field/element place) via `address_of` / `address_of_mut` / `addr_of` and pointer/fn-pointer `as usize` casts | ADR-0001 §7 |

@@ -8,13 +8,14 @@ model: sonnet
 gate_model: opus
 depends: [T147, T148, T149, T150, T151, T152, T153, T154, T155]
 priority: 118
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/resolve, compiler/resolve_hir, compiler/types, compiler/typeck, compiler/typeck_traits, compiler/diag, compiler/hir, compiler/mir, compiler/driver, bootstrap/axiom0/src/driver, tests/run/parity/diag, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-BOOT-085, REQ-TST-089, REQ-BLD-030]
-started: 2026-10-30 17:42:41
+started: 2026-10-31 14:56:04
 unblocks: 1
+agent: T156-impl
 ---
 # T156 — Dump and diagnostic parity; registry empty
 
@@ -100,3 +101,4 @@ Confirmed differences (architect probe 2026-10-20):
 - 2026-10-30 17:42:41 started (attempt 1) T156-impl
 - 2026-10-31 14:39:00 block: 20 residual inspect-only divergences rooted in compiler/driver/pipeline.ax and bootstrap/axiom0/src/driver/emit_*.c outside T156 paths
 - 2026-10-31 14:54:21 unblocked (cycle 1) 
+- 2026-10-31 14:56:04 started (attempt 1) T156-impl
