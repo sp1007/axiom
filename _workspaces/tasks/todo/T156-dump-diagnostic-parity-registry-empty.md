@@ -10,9 +10,11 @@ depends: [T147, T148, T149, T150, T151, T152, T153, T154, T155]
 priority: 118
 status: todo
 attempts: 0
-paths: [compiler/resolve, compiler/resolve_hir, compiler/types, compiler/typeck, compiler/typeck_traits, compiler/diag, compiler/hir, compiler/mir, tests/run/parity/diag, tests/selfhost]
+paths: [compiler/resolve, compiler/resolve_hir, compiler/types, compiler/typeck, compiler/typeck_traits, compiler/diag, compiler/hir, compiler/mir, compiler/driver, bootstrap/axiom0/src/driver, tests/run/parity/diag, tests/selfhost]
 spec: [spec/decisions/ADR-0035-axiomc-parity-symbols.md, spec/decisions/ADR-0034-oracle-independence.md]
 covers: [REQ-BOOT-085, REQ-TST-089, REQ-BLD-030]
+started: 2026-10-30 17:42:41
+unblocks: 1
 ---
 # T156 — Dump and diagnostic parity; registry empty
 
@@ -36,6 +38,39 @@ Confirmed differences (architect probe 2026-10-20):
 - Extend `tests/selfhost/obj_link_driver/axiomc_e2e_oracle.py`: a program is `equal` only if, in
   addition to today's checks, every `inspect --emit=<stage>` output of `INSPECT_STAGES` is identical
   (exit code, stdout, stderr).
+- Align driver `inspect` stage handling and object emission across `compiler/driver/pipeline.ax` and
+  `bootstrap/axiom0/src/driver/emit_{mir,lir,mi,mc,obj}.c` for the 20 residual `inspect`-only
+  divergences:
+  1. **Error-case `inspect` parity (4 programs: `tests/driver/error.ax`,
+     `tests/run/parity/traits/qa_self_missing_member.ax`,
+     `tests/run/parity/diag/cannot_index.ax`, `tests/run/parity/diag/not_callable.ax`)**:
+     - In `compiler/driver/pipeline.ax` (`driver_execute_inspect_ctx`, `EMIT_HIR`), when `!ok` after
+       `pipeline_run_stages(..., STAGE_HIR, ...)` because `STAGE_RESOLVE` reported errors (while
+       `(ctx.ast.items as usize) != 0` and `(ctx.hir.items as usize) == 0`), still run
+       `pipeline_stage_hir(mut_view(*ctx))` before `session_render_hir_into(...)` so `inspect --emit=hir`
+       lowers and dumps HIR alongside the resolve diagnostics and exits `AX_EXIT_DIAG` (`1`), matching
+       `bootstrap/axiom0/src/driver/pipeline.c` (`ax_pipeline_run(&st, AX_STAGE_HIR)`).
+     - In `bootstrap/axiom0/src/driver/emit_{mir,lir,mi,mc,obj}.c`, capture
+       `int rc = ax_pipeline_run(&st, AX_STAGE_TYPECK);` on the `.ax` path and return `rc` immediately
+       (after `ax_pipeline_free(&st); free(pos_argv);`) when `rc != AX_EXIT_OK` (matching
+       `emit_thir.c:385-386` and `compiler/driver/pipeline.ax`), instead of only checking `st.failed`.
+  2. **Closure & indirect-call `inspect --emit=obj` parity (16 programs: 15 closure programs +
+     `tests/run/native_p7/qa_fn_ptr.ax`)**:
+     - In `bootstrap/axiom0/src/driver/emit_obj.c` (`run_emit_obj`), guard `item->fn.name.v != 0`
+       before calling `ax_interner_get(&st.interner, item->fn.name)` and fall back to
+       `snprintf(name_buf, 256, "__ax_fn_%u", (uint32_t)item->fn.symbol.v);` for anonymous closure
+       functions (matching `build.c:505-510` and `lir/lower.c:127`).
+     - In `compiler/driver/pipeline.ax` (`driver_emit_objmodel`), use `if fname_id_v == 0u32` (instead
+       of `if is_build_mode && fname_id_v == 0u32`) to call
+       `backend_alloc_anon_fn_sym(mut_view(ctx.backend_arena), (*fn_item).symbol.v)` so anonymous
+       closure functions receive `"__ax_fn_%u"` in both `build` and `inspect --emit=obj`.
+     - In `bootstrap/axiom0/src/driver/emit_obj.c` (`encode_mi_to_sec`, `case AX_X64_MI_CALL:`), add
+       the indirect register call branch
+       `else if (inst->op_count > 0 && inst->ops[0].kind == AX_X64_OP_REG) { ax_x64_call_r(sec, inst->ops[0].reg); }`
+       (matching `build.c:169-171` and `compiler/target/x64/frame.ax:693-695`).
+  3. Regenerate affected selfhost bundles (`tests/selfhost/driver/gen_driver_tests.py` and
+     `tests/selfhost/obj_link_driver/gen_obj_link_driver_tests.py`) after updating
+     `compiler/driver/pipeline.ax` and `bootstrap/axiom0`.
 - Residuals: re-run the oracle; any entry still listed whose cause belongs to T147–T155 is fixed
   here if it lies in this task's paths, otherwise reported `STATUS: BLOCKED` with the entry list
   (the architect files the fix; the gate never passes with a non-empty registry).
@@ -62,3 +97,6 @@ Confirmed differences (architect probe 2026-10-20):
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-10-30 17:42:41 started (attempt 1) T156-impl
+- 2026-10-31 14:39:00 block: 20 residual inspect-only divergences rooted in compiler/driver/pipeline.ax and bootstrap/axiom0/src/driver/emit_*.c outside T156 paths
+- 2026-10-31 14:54:21 unblocked (cycle 1) 
