@@ -321,14 +321,6 @@ def gen_lir_diff_test(modules_text, axiom0, suffix, label, ax_items, mir_files, 
         src_bytes = read_bytes(os.path.join(ROOT, *rel_ax.split("/"))).replace(b"\r\n", b"\n")
         if axiom0:
             exp_lir = run_inspect(axiom0, "lir", rel_ax)
-            if needs_prelude:
-                exp_lir = (
-                    exp_lir
-                    .replace(b"    slot37: type#23;\n", b"    slot37: type#25;\n")
-                    .replace(b"    slot4: type#22;\n", b"    slot4: type#23;\n")
-                    .replace(b"    slot3: type#21;\n", b"    slot3: type#22;\n")
-                    .replace(b"    slot8: type#21;\n", b"    slot8: type#22;\n")
-                )
         else:
             exp_lir = cached_blobs[idx * 3 + 2]
         blobs.extend([rel_ax.encode("utf-8"), src_bytes, exp_lir])

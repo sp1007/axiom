@@ -11,6 +11,7 @@ Steps
   3. over the corpus (CORPUS_PATTERNS), compare axiomc with axiom0 on identical command lines:
          build -o x.exe            linked PE32+ image bytes + exit code + diagnostics   (-O0 and -O1)
          build --emit=obj -o x.obj COFF object bytes       + exit code + diagnostics   (-O0 and -O1)
+         inspect --emit=<stage>    exit code + stdout + stderr for every stage in INSPECT_STAGES
      and, for every program both compilers linked, run both executables and compare exit code and
      stdout (the image produced by axiomc is proven runnable, not only byte-identical).
   4. A program is EQUAL when all of that agrees. Programs that are not equal must be listed in
@@ -135,7 +136,16 @@ def first_divergent_stage(rel, axiom0, axiomc, root, std):
 
 def check_program(index, rel, axiom0, axiomc, root, std, tmp):
     case_id = "%03d" % index
-    result = {"rel": rel, "problems": [], "built": 0, "rejected": 0, "obj_equal": 0, "exe_equal": 0, "run_equal": 0}
+    result = {
+        "rel": rel,
+        "problems": [],
+        "first_divergent_stage": None,
+        "built": 0,
+        "rejected": 0,
+        "obj_equal": 0,
+        "exe_equal": 0,
+        "run_equal": 0,
+    }
     exe_pair = None
     for opt in ("O0", "O1"):
         for emit_obj in (True, False):
@@ -169,6 +179,21 @@ def check_program(index, rel, axiom0, axiomc, root, std, tmp):
                 "run: axiom0-built rc=%d / axiomc-built rc=%d" % (ref_run[0], got_run[0])
             )
     result["behaviour"] = behaviour
+    for stage in INSPECT_STAGES:
+        args = ["inspect", "--emit=" + stage, "--std-root", std, rel]
+        ref_ins = run([axiom0] + args, root)
+        got_ins = run([axiomc] + args, root)
+        if ref_ins != got_ins:
+            parts = []
+            if ref_ins[0] != got_ins[0]:
+                parts.append("exit code axiom0=%d axiomc=%d" % (ref_ins[0], got_ins[0]))
+            if ref_ins[1] != got_ins[1]:
+                parts.append("stdout differs")
+            if ref_ins[2] != got_ins[2]:
+                parts.append("stderr differs")
+            result["problems"].append("inspect %s: %s" % (stage, ", ".join(parts)))
+            if result["first_divergent_stage"] is None:
+                result["first_divergent_stage"] = stage
     for opt in ("O0", "O1"):
         for suffix in (".obj", ".exe"):
             for who in ("ref", "got"):
@@ -252,10 +277,10 @@ def main():
 
     diverging = [r for r in results if not r["equal"]]
     if update:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            stages = list(pool.map(
-                lambda r: first_divergent_stage(r["rel"], axiom0, axiomc, root, std), diverging
-            ))
+        stages = [
+            r["first_divergent_stage"] or first_divergent_stage(r["rel"], axiom0, axiomc, root, std)
+            for r in diverging
+        ]
         write_registry({r["rel"]: (s, r["behaviour"]) for r, s in zip(diverging, stages)})
         print("registry updated: %d divergent programs" % len(diverging))
         known = load_registry()

@@ -176,6 +176,8 @@ static void encode_mi_to_sec(ax_section_t *sec, const AxX64MI *inst, const AxX64
             if (inst->msg) {
                 ax_section_add_bytes(sec, (const uint8_t[]){0xE8, 0, 0, 0, 0}, 5);
                 ax_section_add_reloc(sec, sec->bytes_len - 4, AX_RELOC_X86_64_PC32, ax_objmodel_add_symbol(obj, inst->msg, (ax_section_id_t){0}, 0, 0, AX_SYM_EXTERNAL), -4);
+            } else if (inst->op_count > 0 && inst->ops[0].kind == AX_X64_OP_REG) {
+                ax_x64_call_r(sec, inst->ops[0].reg);
             }
             break;
     }
@@ -534,7 +536,12 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
     ax_pipeline_init(&st, io);
     st.main_file = path;
     
-    ax_pipeline_run(&st, AX_STAGE_TYPECK);
+    int rc = ax_pipeline_run(&st, AX_STAGE_TYPECK);
+    if (rc != AX_EXIT_OK) {
+        ax_pipeline_free(&st);
+        free(pos_argv);
+        return rc;
+    }
     if (st.failed) {
         ax_pipeline_free(&st);
         free(pos_argv);
@@ -573,9 +580,13 @@ static int run_emit_obj(const AxIo *io, int argc, char **argv) {
                     }
                     func_start = text_sec->bytes_len;
                     
-                    StrView name = ax_interner_get(&st.interner, item->fn.name);
                     char name_buf[256];
-                    snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+                    if (item->fn.name.v != 0) {
+                        StrView name = ax_interner_get(&st.interner, item->fn.name);
+                        snprintf(name_buf, 256, "%.*s", (int)name.len, name.ptr);
+                    } else {
+                        snprintf(name_buf, 256, "__ax_fn_%u", (uint32_t)item->fn.symbol.v);
+                    }
                     
                     ax_x64_frame_emit_prologue(text_sec, &layout);
                     

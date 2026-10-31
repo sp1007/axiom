@@ -226,7 +226,12 @@ static int run_emit_mc(const AxIo *io, int argc, char **argv) {
     ax_pipeline_init(&st, io);
     st.main_file = path;
     
-    ax_pipeline_run(&st, AX_STAGE_TYPECK);
+    int rc = ax_pipeline_run(&st, AX_STAGE_TYPECK);
+    if (rc != AX_EXIT_OK) {
+        ax_pipeline_free(&st);
+        free(pos_argv);
+        return rc;
+    }
     if (st.failed) {
         ax_pipeline_free(&st);
         free(pos_argv);
