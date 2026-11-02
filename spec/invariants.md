@@ -46,8 +46,8 @@ Rules for `gatecheck.py` (refining T022 scope item (a)):
 
 Groups: `KERN` kernel, `LAYER` architecture layers, `DIAG` diagnostics, `DET` determinism, `PIPE`
 pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM` frozen semantic model,
-`BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02. A new group is
-added by editing this list.
+`BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02, `CONC` concurrency
+and memory model (`SPEC-30`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -459,11 +459,41 @@ added by editing this list.
 - since: T011
 - check: rejected-spelling cases R01–R15 and multi-error files
 
+## 11. Concurrency and memory model (SPEC-30)
+
+### INV-CONC-001 — `Send` and `Share` are independent, zero-cost marker auto-traits
+- statement: `Send` (cross-context ownership transfer) and `Share` (concurrent shared read access via `view<T>`) are tracked as independent semantic properties (`Send != Share`). They are structurally synthesized for composite types, require `unsafe impl` for positive manual overrides, allow safe `impl !Send`/`impl !Share` opt-outs, and are completely erased after semantic checking with zero runtime representation or overhead (SPEC-30 AXS-CONC-010..019).
+- source: 0033; 0126 §5-§7; 0136 §101+; 0160 §27; tasks/0298; tasks/0482; SPEC-30 AXS-CONC-010..019
+- verify: tests/unit/sema/send_share, tests/ui/send_share
+- since: T089
+- check: unit and ui tests verify structural auto-derivation, `Send != Share` independence, `unsafe impl` requirement (`AX_CONC_SAFE_IMPL_MARKER`), negative impls, and zero runtime descriptor emission
+
+### INV-CONC-002 — Spawn and escaping closures enforce move ownership and forbid non-static views
+- statement: Closure `Send`/`Share` traits derive from execution-relevant captured fields. Unscoped `spawn` requires explicit `move` ownership transfer without implicit cloning of `!Copy` values and rejects any non-`'static` `view<T>` or `mut_view<T>` escape (`AX_CONC_ESCAPING_VIEW`, `AX_CONC_CAPTURE_NOT_SEND`), while `spawn_local` relaxes `Send` on the current OS thread without relaxing lifetime containment (SPEC-30 AXS-CONC-020..026).
+- source: 0079; 0091; 0126 §18-§25; SPEC-30 AXS-CONC-020..026
+- verify: tests/unit/sema/conc_capture, tests/ui/conc_capture
+- since: T401
+- check: unit and ui tests verify closure capture `Send`/`Share` inference, `move` capture invalidation, rejection of non-static views across `spawn`, and `spawn` vs `spawn_local` obligations
+
+### INV-CONC-003 — Compile-time data-race freedom and conservative region disjointness
+- statement: Safe Axiom code is statically free of data races on ordinary memory. Concurrent `READ`/`READ` requires `T: Share`, while unsynchronized `READ`/`WRITE` and `WRITE`/`WRITE` on overlapping regions are rejected (`AX_CONC_SHARED_MUT`). Place overlap analysis (`DISJOINT`, `CONTAINS`, `SAME`, `UNKNOWN`) never treats `UNKNOWN` as `DISJOINT`; only provably `DISJOINT` struct fields or slice partitions (`split_at_mut`) permit concurrent `mut_view` access inside a structured `scope`, and `unsafe` blocks do not disable concurrency checking once safe capabilities are re-established (SPEC-30 AXS-CONC-030..038).
+- source: 0126 §49-§59; 0136 §28-§51; tasks/0488; tasks/0685; SPEC-30 AXS-CONC-030..038
+- verify: tests/unit/sema/conc_race, tests/ui/conc_race
+- since: T402
+- check: unit and ui tests verify `READ`/`WRITE` and `WRITE`/`WRITE` rejection, `UNKNOWN != DISJOINT` conservatism, disjoint field/slice `mut_view` acceptance, `static mut` restriction (`AX_CONC_UNSYNC_STATIC`), and guard escape rejection (`AX_CONC_GUARD_ESCAPE`)
+
+### INV-CONC-004 — Happens-Before synchronization barriers are preserved by MIR optimization
+- statement: Every MIR/OptIR optimization pass preserves the `Happens-Before` partial order established by `spawn`, `join`, lock `acquire`/`release`, channel `send`/`recv`, `fence`, and `Release`/`Acquire`/`AcqRel`/`SeqCst` atomic operations. No memory read or write to potentially shared state may be hoisted above an `Acquire` boundary, sunk below a `Release` boundary, folded to a stale value across a synchronization edge, or introduced speculatively (SPEC-30 AXS-CONC-040..047).
+- source: 0105; 0126 §39; 0136 §79; tasks/0685; SPEC-30 AXS-CONC-040..047; SPEC-70 AXS-OPT-021
+- verify: tests/unit/opt/conc_hb, tests/conformance/concurrency
+- since: T403
+- check: optimizer unit tests (T403) and concurrency conformance tests (delivered by T404) verify that CSE/GVN/LICM/DSE do not reorder, fold, or eliminate shared memory operations across synchronization barriers and that concurrency verification is deterministic
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

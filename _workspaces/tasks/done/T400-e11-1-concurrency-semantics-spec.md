@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T211]
 priority: 120
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-30-concurrency.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [0033, 0040, 0079, 0091, 0105, 0126, 0136, tasks/0298, tasks/0488, tasks/0685]
 covers: [REQ-CONC-019, REQ-CONC-021, REQ-CONC-025, REQ-CONC-026, REQ-CONC-027, REQ-CONC-028, REQ-CONC-050, REQ-CONC-055, REQ-CONC-067, REQ-CONC-068, REQ-CONC-073, REQ-CONC-082, REQ-CONC-083, REQ-CONC-095, REQ-CONC-101, REQ-CONC-102, REQ-CONC-107, REQ-CONC-109, REQ-CONC-117, REQ-CONC-119, REQ-CONC-120, REQ-CONC-126, REQ-CONC-127, REQ-CONC-128, REQ-CONC-131, REQ-RT-022, REQ-CONC-136, REQ-CONC-137, REQ-CONC-138, REQ-CONC-139, REQ-CONC-140, REQ-CONC-141, REQ-CONC-145, REQ-CONC-156]
+started: 2026-11-03 05:55:52
+finished: 2026-11-03 06:12:58
 ---
 # T400 — E11.1 — Canonical concurrency semantics & memory model specification (SPEC-30)
 
@@ -45,3 +47,5 @@ Consolidate the concurrency and execution-domain design corpus into canonical `s
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 05:55:52 started (attempt 1) 
+- 2026-11-03 06:12:58 accepted by QA -> done

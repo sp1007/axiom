@@ -105,7 +105,10 @@ They map to the areas above as the last column shows. Three groups have no area 
 - `AX_RUNTIME_` / `AX_PANIC_` / `ERUNTIME`: program panics and traps are program outcomes (exit code,
   stderr text) defined by `spec/SPEC-03-core-semantics.md`, not compiler diagnostics (0146 §53).
 - `EASYNC`, `AX_ASYNC_`, `ECONCUR`, `AX_CONC_`, `AX_ATOM_`, `EGPU`, `AX_GPU_`: the epics that need them (E11.*,
-  E22.*) add an area by editing this table first (AXD-022).
+  E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`), the
+  `CONC` area (`AX_CONC_*`) is established for self-hosted `axiomc` (`compiler/diag/code.ax`, where `axiom0` is
+  frozen post-`T087`), covering `Send`/`Share` auto-traits (`T089`), closure/spawn captures (`T401`), the
+  compile-time data-race verifier (`T402`), and happens-before/lock-order diagnostics (`T403`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -492,9 +495,22 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_DRIVER_NO_STD` | E | T060 | no std root found (ADR-0006 §8) |
 | `AX_FFI_NOT_IN_ORACLE` | E | T065 | the interpreter reached a direct `extern` call (ADR-0002 §4) |
 | `AX_UNSAFE_AT_HOSTED` | E | E13.6 (axiomc) | `@at` placement in the hosted profile (ADR-0001; formerly `AX_ADDR_HOSTED`) |
+| `AX_CONC_NOT_SEND` | E | T089/T401 | value of type `T: !Send` transferred across an execution context boundary (`SPEC-30` AXS-CONC-050) |
+| `AX_CONC_NOT_SHARE` | E | T089/T401 | shared capability `view<T>` where `T: !Share` shared across execution contexts (`SPEC-30` AXS-CONC-050) |
+| `AX_CONC_SAFE_IMPL_MARKER` | E | T089 | positive `impl Send` or `impl Share` written without `unsafe` (`SPEC-30` AXS-CONC-018) |
+| `AX_CONC_CONFLICTING_MARKER_IMPL` | E | T089 | conflicting positive and negative `Send`/`Share` impls for overlapping types (`SPEC-30` AXS-CONC-017) |
+| `AX_CONC_CAPTURE_NOT_SEND` | E | T401 | closure or async `Future` passed to `spawn` captures a `!Send` field (`SPEC-30` AXS-CONC-020) |
+| `AX_CONC_ESCAPING_VIEW` | E | T401 | escaping closure or unscoped `spawn` captures a non-`'static` `view<T>` or `mut_view<T>` (`SPEC-30` AXS-CONC-023) |
+| `AX_CONC_SPAWN_REQUIRES_MOVE` | E | T401 | unscoped `spawn` closure captures outer bindings without `move` ownership transfer (`SPEC-30` AXS-CONC-022) |
+| `AX_CONC_SHARED_MUT` | E | T402/T403 | unsynchronized concurrent `READ`/`WRITE` or `WRITE`/`WRITE` on overlapping (`SAME`, `CONTAINS`, `UNKNOWN`) places (`SPEC-30` AXS-CONC-031) |
+| `AX_CONC_VIEW_NOT_SHARE` | E | T402 | concurrent `READ`/`READ` via `view<T>` across execution contexts when `T: !Share` (`SPEC-30` AXS-CONC-031) |
+| `AX_CONC_UNSYNC_STATIC` | E | T402 | safe code accesses unsynchronized mutable `static` or exports `@thread_local` view across threads (`SPEC-30` AXS-CONC-034) |
+| `AX_CONC_GUARD_ESCAPE` | E | T402 | capability derived from `MutexGuard`/`RwLock*Guard` escapes the guard or guard is held across `.await` (`SPEC-30` AXS-CONC-035) |
+| `AX_CONC_ATOMIC_MUT_VIEW` | E | T402 | concurrent non-atomic `mut_view<T>` access mixed with shared `Atomic<T>` access (`SPEC-30` AXS-CONC-036) |
+| `AX_CONC_LOCK_ORDER` | W/E | T403 | inverted lock acquisition order on the same lock pair across concurrent paths (`SPEC-30` AXS-CONC-007) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
