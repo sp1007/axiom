@@ -9,8 +9,8 @@ gate_model: sonnet
 depends: [T162]
 blocks: [T086]
 priority: 119
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/interp, compiler/types, compiler/verify, tests/selfhost, tests/run/native_ptr/write_bytes_1mb.ax]
 spec: [0167, 0150, tasks/0371, spec/SPEC-06-types.md, spec/SPEC-07-mir.md, spec/SPEC-20-architecture.md, spec/decisions/ADR-0001-triple-test-model.md, spec/decisions/ADR-0005-bootstrap-verification-protocol.md]
 spec_refs: [SPEC-06, SPEC-07, SPEC-20]
@@ -19,6 +19,8 @@ inv_refs: [INV-BOOT-001, INV-SEM-001, INV-MIR-001]
 req_refs: [REQ-BOOT-001, REQ-STD-001]
 covers: [REQ-BOOT-001, REQ-STD-001]
 timeout_min: 300
+started: 2026-11-02 14:09:42
+finished: 2026-11-02 17:37:59
 ---
 # T163 — Stage-1 final suite fixes: InterpValue 256-byte capacity, TY_STRUCT/TY_ENUM typeck finalization & verification, and write_bytes_1mb timeout
 
@@ -58,3 +60,5 @@ Resolve the final 3 root causes (8 test files / 11 entries out of 2,887 active e
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-11-02 14:09:42 started (attempt 1) 
+- 2026-11-02 17:37:59 accepted by QA -> done
