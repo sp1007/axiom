@@ -2,12 +2,12 @@
 |---|---|---|---|---|---|---|
 | REQ-OWNER-001 | grammar | v1-core | Binding and assignment use only `=` (`let x = …`, `let mut x = …`, `x = …`); `:=` and `var` are not Axiom syntax and get fix-it diagnostics | owner 2026-09-29; axiom-syntax Rule 1 | - | T001, T010, T011 |
 | REQ-OWNER-002 | grammar | v1-core | `.` is the only namespace/library/path separator (`use std.io.print`, `Result.Ok(v)`, `Self.Item`); `::` is not Axiom syntax and gets a fix-it diagnostic; the resolver disambiguates dotted chains | owner 2026-09-29; axiom-syntax Rule 2 | - | T001, T010, T014 |
-| REQ-OWNER-003 | layout | v1-full | In low-level code, variables, arrays, structs, functions (all static items with defined layout/ABI) can be declared at a fixed memory address (`@at(addr)`), as overlay or placement, and then used with ordinary syntax when the declaration is correct | owner 2026-09-29; ADR-0001 | - | EPIC(E13.6) |
+| REQ-OWNER-003 | layout | v1-full | In low-level code, variables, arrays, structs, functions (all static items with defined layout/ABI) can be declared at a fixed memory address (`@at(addr)`), as overlay or placement, and then used with ordinary syntax when the declaration is correct | owner 2026-09-29; ADR-0001 | - | T525, T526, T527, T528, T529 |
 | REQ-OWNER-004 | bootstrap | v1-core | The C Stage-0 compiler implements only the self-host subset; later features are written once, in Axiom, while core data models reserve extension points for them | owner 2026-09-29; ROADMAP R7 | - | T003a |
-| REQ-OWNER-005 | layout | v1-full | Code in a DLL/EXE can bind functions and data of another module loaded in the same process at `module base + offset` (`@at(image("game.exe") + 0x1A2B30)`), resolved at load time, and call/use them with ordinary syntax; Axiom can produce PE DLLs (exports, DllMain initialiser, relocations) | owner 2026-09-29; ADR-0001 §5-6 | - | EPIC(E13.7) |
+| REQ-OWNER-005 | layout | v1-full | Code in a DLL/EXE can bind functions and data of another module loaded in the same process at `module base + offset` (`@at(image("game.exe") + 0x1A2B30)`), resolved at load time, and call/use them with ordinary syntax; Axiom can produce PE DLLs (exports, DllMain initialiser, relocations) | owner 2026-09-29; ADR-0001 §5-6 | - | T530, T531, T532, T533 |
 | REQ-OWNER-006 | linker | v1-full | On x86_64-windows Axiom emits and consumes every artifact kind: .obj and .exe (core), static .lib archives and .dll with import libraries (right after self-hosting, in axiomc); the core's data models reserve these kinds from day one | owner 2026-09-29 | - | T026, T028, T750, T751 |
 | REQ-OWNER-007 | types | v1-full | In complex mathematical expressions mixing unsuffixed numeric literals (`1`, `-3`, `0x3F`, `0.5`, `6.0`) and variables of different numeric types (`i8..usize`, `f32`, `f64`) across nested arithmetic, bitwise/shift, unary, array-index, call, and comparison sub-expressions (e.g. `((a + i * k - 1) / (2 * n + u - 3)) * (w + 0.5) + (base - u * 4 + i) / (a * a / 6.0 - k + 2)` and `(((mask >> sh) & 0x3F) + delta * step - 5) * scale / ((1 << sh) + 3)`), the compiler automatically infers literal types and promotes narrower integer/float variables along a deterministic numeric lattice lowered to explicit MIR casts so no suffixes or manual `as` casts are required | owner 2026-10-21 | - | T450, T451, T455, T456, T457, T462 |
-| REQ-OWNER-008 | layout | v1-full | In low-level/unsafe code, the memory address of any function (`fn`, `extern fn`, `@at` function) or variable/static (`static`, `static mut`, `@at` item, local, field/element place) can be obtained as a raw pointer or `usize` address (`address_of` / `address_of_mut` / `addr_of` and pointer/fn-pointer `as usize` casts) so programs can inspect, verify, pass, and bind addresses directly with `@at(...)` declarations | owner 2026-10-31; ADR-0001 §7 | - | EPIC(E13.6) |
+| REQ-OWNER-008 | layout | v1-full | In low-level/unsafe code, the memory address of any function (`fn`, `extern fn`, `@at` function) or variable/static (`static`, `static mut`, `@at` item, local, field/element place) can be obtained as a raw pointer or `usize` address (`address_of` / `address_of_mut` / `addr_of` and pointer/fn-pointer `as usize` casts) so programs can inspect, verify, pass, and bind addresses directly with `@at(...)` declarations | owner 2026-10-31; ADR-0001 §7 | - | T500, T501, T502, T504, T505, T525, T526, T527, T528, T529 |
 | REQ-GRM-001 | grammar | v1-core | Binding and assignment are spelled only `=`. | init §1 | - | T001, T010, T011 |
 | REQ-GRM-002 | grammar | v1-core | `.` is the only namespace/library path separator. | init §1 | - | T001, T010, T011 |
 | REQ-CNF-001 | conformance | v1-full | The specification passes a global contradiction audit before v1.0. | 0149 §Còn lại | - | T091, EPIC(E23.2) |
@@ -49,36 +49,36 @@
 |REQ-TYP-004|types| v1-full |Generic public definitions are exported as typed generic IR or metadata.|0047 §B. Compiler tạo specializatio|-|T006, T042, T064|
 |REQ-TYP-005|types| v1-full |Traits define compile-time contracts, while dyn requests runtime polymorphism.|0042 §39. Dynamic dispatch phải có|-|T006, T042, T064|
 |REQ-TYP-006|types| v1-full |A pair of (Trait, Type) has at most one applicable implementation in a compilation universe.|0083 §5. Trait resolution phải dete|-|T006, T042, T064|
-| REQ-ABI-005 | ABI | v1-full | Default Axiom ABI is not stable. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-006 | ABI | v1-full | Compiler may optimize across internal ABI boundaries. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-007 | ABI | v1-full | Stable ABI requires an explicit contract. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-008 | ABI | v1-full | ABI stability is independent of source visibility. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-009 | ABI | v1-full | repr(C) controls representation, not calling convention. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-010 | ABI | v1-full | Calling convention is an explicit ABI property. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-011 | ABI | v1-full | repr(transparent) preserves distinct source type identity. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-012 | ABI | v1-full | Opaque foreign types have unknown internal layout. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-013 | ABI | v1-full | Raw FFI pointers do not implicitly become safe views. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-014 | ABI | v1-full | Closure representation is not stable ABI. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-015 | ABI | v1-full | Trait dispatch representation is not stable ABI. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-016 | ABI | v1-full | Generic Axiom ABI is not stable by default. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-017 | ABI | v1-full | Stable ABI genericity requires explicit erased representation. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-018 | ABI | v1-full | Linker symbol names are separate from source symbol identity. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-019 | ABI | v1-full | Explicit export names are stable only under their ABI contract. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-020 | ABI | v1-full | Stable ABI containers must define ownership and allocation. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-021 | ABI | v1-full | ABI struct evolution requires an explicit compatibility policy. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-022 | ABI | v1-full | Extensible ABI structs use version/size contracts. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-023 | ABI | v1-full | Axiom ADTs are not automatically C enums. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-024 | ABI | v1-full | ABI versioning is explicit. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-025 | ABI | v1-full | Major ABI changes may be breaking. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-026 | ABI | v1-full | ABI artifacts are machine-readable. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-027 | ABI | v1-full | ABI compatibility is independently checkable. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-028 | ABI | v1-full | FFI safety and ABI representation are independent. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-029 | ABI | v1-full | Foreign calls are conservative by default. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-030 | ABI | v1-full | Stable ABI does not expose compiler internals. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-031 | ABI | v1-full | Runtime ABI is versioned separately. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-032 | ABI | v1-full | Hot reload requires its own explicit ABI contract. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-033 | ABI | v1-full | Dynamic linking does not imply hot reload. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-ABI-034 | ABI | v1-full | ABI boundaries preserve internal optimization freedom. | 0104 §54 | - | EPIC(E13.1) |
+| REQ-ABI-005 | ABI | v1-full | Default Axiom ABI is not stable. | 0104 §54 | - | T500 |
+| REQ-ABI-006 | ABI | v1-full | Compiler may optimize across internal ABI boundaries. | 0104 §54 | - | T500 |
+| REQ-ABI-007 | ABI | v1-full | Stable ABI requires an explicit contract. | 0104 §54 | - | T500 |
+| REQ-ABI-008 | ABI | v1-full | ABI stability is independent of source visibility. | 0104 §54 | - | T500 |
+| REQ-ABI-009 | ABI | v1-full | repr(C) controls representation, not calling convention. | 0104 §54 | - | T503 |
+| REQ-ABI-010 | ABI | v1-full | Calling convention is an explicit ABI property. | 0104 §54 | - | T503 |
+| REQ-ABI-011 | ABI | v1-full | repr(transparent) preserves distinct source type identity. | 0104 §54 | - | T504 |
+| REQ-ABI-012 | ABI | v1-full | Opaque foreign types have unknown internal layout. | 0104 §54 | - | T510 |
+| REQ-ABI-013 | ABI | v1-full | Raw FFI pointers do not implicitly become safe views. | 0104 §54 | - | T500 |
+| REQ-ABI-014 | ABI | v1-full | Closure representation is not stable ABI. | 0104 §54 | - | T500 |
+| REQ-ABI-015 | ABI | v1-full | Trait dispatch representation is not stable ABI. | 0104 §54 | - | T500 |
+| REQ-ABI-016 | ABI | v1-full | Generic Axiom ABI is not stable by default. | 0104 §54 | - | T500 |
+| REQ-ABI-017 | ABI | v1-full | Stable ABI genericity requires explicit erased representation. | 0104 §54 | - | T500 |
+| REQ-ABI-018 | ABI | v1-full | Linker symbol names are separate from source symbol identity. | 0104 §54 | - | T504 |
+| REQ-ABI-019 | ABI | v1-full | Explicit export names are stable only under their ABI contract. | 0104 §54 | - | T504 |
+| REQ-ABI-020 | ABI | v1-full | Stable ABI containers must define ownership and allocation. | 0104 §54 | - | T500 |
+| REQ-ABI-021 | ABI | v1-full | ABI struct evolution requires an explicit compatibility policy. | 0104 §54 | - | T500 |
+| REQ-ABI-022 | ABI | v1-full | Extensible ABI structs use version/size contracts. | 0104 §54 | - | T503 |
+| REQ-ABI-023 | ABI | v1-full | Axiom ADTs are not automatically C enums. | 0104 §54 | - | T500 |
+| REQ-ABI-024 | ABI | v1-full | ABI versioning is explicit. | 0104 §54 | - | T504 |
+| REQ-ABI-025 | ABI | v1-full | Major ABI changes may be breaking. | 0104 §54 | - | T500 |
+| REQ-ABI-026 | ABI | v1-full | ABI artifacts are machine-readable. | 0104 §54 | - | T500 |
+| REQ-ABI-027 | ABI | v1-full | ABI compatibility is independently checkable. | 0104 §54 | - | T500 |
+| REQ-ABI-028 | ABI | v1-full | FFI safety and ABI representation are independent. | 0104 §54 | - | T500 |
+| REQ-ABI-029 | ABI | v1-full | Foreign calls are conservative by default. | 0104 §54 | - | T500 |
+| REQ-ABI-030 | ABI | v1-full | Stable ABI does not expose compiler internals. | 0104 §54 | - | T500 |
+| REQ-ABI-031 | ABI | v1-full | Runtime ABI is versioned separately. | 0104 §54 | - | T511, T512, T515 |
+| REQ-ABI-032 | ABI | v1-full | Hot reload requires its own explicit ABI contract. | 0104 §54 | - | T530 |
+| REQ-ABI-033 | ABI | v1-full | Dynamic linking does not imply hot reload. | 0104 §54 | - | T530 |
+| REQ-ABI-034 | ABI | v1-full | ABI boundaries preserve internal optimization freedom. | 0104 §54 | - | T500 |
 | REQ-CONC-003 | concurrency | v1-full | Thread cancellation must not forcibly interrupt arbitrary code. | 0105 §35 | - | T410 |
 | REQ-CONC-004 | concurrency | v1-full | Mutable global ordinary memory must be unsafe or wrapped in safe synchronization abstraction. | 0105 §40 | - | T402 |
 | REQ-ASY-003 | async | v1-full | mut_view or exclusive synchronous lock guard must not survive across await. | 0105 §52 | - | T417 |
@@ -95,7 +95,7 @@
 | REQ-ERR-006 | error | v1-core | Null is not a safe error representation. | 0107 §66 | - | T113 | 
 | REQ-ERR-007 | error | v1-core | ? is control-flow propagation. | 0107 §66 | - | T113 | 
 | REQ-ERR-008 | error | v1-core | ? preserves deterministic cleanup. | 0111 §47 | - | T113 | 
-| REQ-FFI-004 | ffi | v1-full | Panic must not unwind across FFI boundary by default. | 0107 §64 | - | EPIC(E13.1) |
+| REQ-FFI-004 | ffi | v1-full | Panic must not unwind across FFI boundary by default. | 0107 §64 | - | T521, T523, T524 |
 | REQ-MOD-003 | module | v1-core | Module is a semantic namespace. | 0108 §67 | - | T113 | 
 | REQ-MOD-004 | module | v1-core | File is not a semantic module boundary. | 0108 §67 | - | T113 | 
 | REQ-MOD-005 | module | v1-core | Import is a semantic dependency. | 0108 §67 | - | T113 | 
@@ -141,8 +141,8 @@
 | REQ-DRP-007 | drop | v1-core | User drop types forbid partial move. | 0110 §13 | - | T113 | 
 | REQ-DRP-008 | drop | v1-core | Compiler-derived drop types may support partial move. | 0110 §13 | - | T113 | 
 | REQ-DRP-009 | drop | v1-core | Moved fields are never dropped. | 0110 §13 | - | T113 | 
-| REQ-FFI-005 | ffi | v1-full | FFI allocation ownership must be explicit. | 0111 §47 | - | EPIC(E13.1) |
-| REQ-FFI-006 | ffi | v1-full | FFI must not guess allocation domains. | 0111 §47 | - | EPIC(E13.1) |
+| REQ-FFI-005 | ffi | v1-full | FFI allocation ownership must be explicit. | 0111 §47 | - | T515 |
+| REQ-FFI-006 | ffi | v1-full | FFI must not guess allocation domains. | 0111 §47 | - | T514 |
 | REQ-CTM-001 | comptime | v1-full | Comptime uses the same ownership semantics. | 0111 §47 | - | EPIC(E14.1) |
 | REQ-CTM-002 | comptime | v1-full | Comptime resources cannot escape into runtime. | 0111 §47 | - | EPIC(E14.1) |
 | REQ-CTM-003 | comptime | v1-full | Comptime cleanup is deterministic. | 0111 §47 | - | EPIC(E14.1) |
@@ -158,24 +158,24 @@
 | REQ-NUM-001 | enum | v1-core | Enum representation is compiler-controlled unless explicitly represented. | 0112 §84 | - | T113 | 
 | REQ-NUM-002 | enum | v1-core | Niche optimization is semantics-preserving. | 0112 §84 | - | T113 | 
 | REQ-CORE-006 | match | v1-core | Pattern binding preserves source capability. | 0112 §84 | - | T113 | 
-| REQ-ABI-035 | ABI | v1-full | Representation is flexible until an ABI contract freezes it. | 0112 §84 | - | EPIC(E13.1) |
-| REQ-FFI-007 | ffi | v1-full | Closure to C callback must not use implicit conversion. | 0112 §84 | - | EPIC(E13.1) |
+| REQ-ABI-035 | ABI | v1-full | Representation is flexible until an ABI contract freezes it. | 0112 §84 | - | T500 |
+| REQ-FFI-007 | ffi | v1-full | Closure to C callback must not use implicit conversion. | 0112 §84 | - | T504 |
 | REQ-CORE-007 | control-flow | v1-core | Return performs required cleanup. | 0113 §122 | - | T113 | 
 | REQ-CORE-008 | surface | v1-core | break has no value in v0.1. | 0113 §122 | - | T113 |
 | REQ-OPT-001 | optimization | v1-full | Proven bounds checks may be eliminated. | 0113 §122 | - | EPIC(E15.1) |
 | REQ-CORE-009 | unsafe | v1-core | Unchecked memory access requires explicit unsafe boundary. | 0113 §122 | - | T113 | 
 | REQ-TYP-007 | types | v1-core | never is bottom-like in non-returning control flow. | 0113 §122 | - | T113 |
 | REQ-CORE-010 | static | v1-core | Static initialization has no hidden runtime constructors. | 0113 §122 | - | T113 | 
-| REQ-ABI-036 | ABI | v1-full | Packed representation cannot create invalid aligned access. | 0113 §122 | - | EPIC(E13.1) |
+| REQ-ABI-036 | ABI | v1-full | Packed representation cannot create invalid aligned access. | 0113 §122 | - | T507 |
 | REQ-CORE-011 | methods | v1-core | Receiver mode MUST be explicit in the function type (AMETHOD-22). | 0114 §3 | - | T113 | 
 | REQ-OWN-009 | ownership | v1-core | Partial move of types with custom Drop MUST be forbidden. | 0114 §8 | - | T113 | 
-| REQ-CAP-001 | capability | v1-full | Every safe view MUST have compiler-tracked provenance (ACAP-20). | 0114 §24 | - | EPIC(E13.1) |
-| REQ-CAP-002 | capability | v1-full | Capability provenance MAY be erased after verification (ACAP-21). | 0114 §24 | - | EPIC(E13.1) |
-| REQ-CAP-003 | capability | v1-full | Capability lifetime MUST be determined semantically before physical optimization (ACAP-22). | 0114 §25 | - | EPIC(E13.1) |
-| REQ-CAP-004 | capability | v1-full | A capability MUST NOT transfer ownership (ACAP-23). | 0115 §34 | - | EPIC(E13.1) |
-| REQ-CAP-005 | capability | v1-full | A valid capability MUST require valid provenance (ACAP-24). | 0115 §34 | - | EPIC(E13.1) |
+| REQ-CAP-001 | capability | v1-full | Every safe view MUST have compiler-tracked provenance (ACAP-20). | 0114 §24 | - | T502 |
+| REQ-CAP-002 | capability | v1-full | Capability provenance MAY be erased after verification (ACAP-21). | 0114 §24 | - | T502 |
+| REQ-CAP-003 | capability | v1-full | Capability lifetime MUST be determined semantically before physical optimization (ACAP-22). | 0114 §25 | - | T501 |
+| REQ-CAP-004 | capability | v1-full | A capability MUST NOT transfer ownership (ACAP-23). | 0115 §34 | - | T500 |
+| REQ-CAP-005 | capability | v1-full | A valid capability MUST require valid provenance (ACAP-24). | 0115 §34 | - | T502 |
 | REQ-OWN-010 | ownership | v1-core | An owner MUST NOT be destroyed while dependent capabilities remain live (ACAP-25). | 0115 §34 | - | T113 | 
-| REQ-CAP-006 | capability | v1-full | Representation copyability MUST NOT imply semantic copyability (ACAP-26). | 0115 §36 | - | EPIC(E13.1) |
+| REQ-CAP-006 | capability | v1-full | Representation copyability MUST NOT imply semantic copyability (ACAP-26). | 0115 §36 | - | T500 |
 | REQ-OWN-011 | ownership | v1-core | Move MUST be an ownership-state transition, not a required physical copy (AOWN-20). | 0115 §37 | - | T113 | 
 | REQ-OWN-012 | ownership | v1-core | Copy MUST be a semantic value duplication, not a required memory copy (AOWN-21). | 0115 §38 | - | T113 | 
 | REQ-OWN-013 | ownership | v1-core | Drop MUST complete ownership cleanup, not necessarily memory deallocation (ADROP-20). | 0115 §39 | - | T113 | 
@@ -234,21 +234,21 @@
 | REQ-CONC-014 | concurrency | v1-full | Atomic ordering is semantic, and the compiler must preserve Acquire/Release and SeqCst orderings. (ACONC-25) | 0118 §193, §194, §210 | - | T406 |
 | REQ-CONC-015 | concurrency | v1-full | Mutex guards provide synchronization capability and their ownership is non-Copy. (ACONC-26, ACONC-27) | 0118 §197, §210 | - | T411 |
 | REQ-CONC-016 | concurrency | v1-full | Task cancellation drops owned state. (ACONC-28) | 0118 §210 | - | T404 |
-| REQ-CAP-007 | capabilities | v1-full | Synchronization context may be part of capability provenance for compiler-internal tracking. (ACAP-29) | 0118 §206 | - | EPIC(E13.1) |
-| REQ-ABI-037 | abi | v1-full | Type semantics are independent from machine representation, and the compiler may not infer semantic intent. (AABI-20) | 0119 §215, §259 | - | EPIC(E13.1) |
-| REQ-ABI-038 | abi | v1-full | Explicit C representation requires C-compatible components. (AABI-21) | 0119 §218, §259 | - | EPIC(E13.1) |
-| REQ-ABI-039 | abi | v1-full | Source visibility (`pub`) and linker export (`@export`) are independent concepts. (AABI-22) | 0119 §220, §259 | - | EPIC(E13.1) |
-| REQ-ABI-040 | abi | v1-full | Observable physical address (e.g. via FFI) constrains storage optimizations. (AABI-23) | 0119 §224, §259 | - | EPIC(E13.1) |
-| REQ-ABI-041 | abi | v1-full | Packed representation cannot imply invalid alignment. (AABI-24) | 0119 §226, §259 | - | EPIC(E13.1) |
-| REQ-ABI-042 | abi | v1-full | Representation optimization (like niche optimization) cannot introduce new source-level semantics. (AABI-25) | 0119 §228, §259 | - | EPIC(E13.1) |
-| REQ-ABI-043 | abi | v1-full | Generic code generation strategy (monomorphization vs sharing) is not an ABI semantics guarantee. (AABI-26) | 0119 §239, §259 | - | EPIC(E13.1) |
-| REQ-ABI-044 | abi | v1-full | Only explicit ABI contracts (e.g., `@repr`, `extern`, `@export`) freeze representation; default struct and enum layouts are not guaranteed. (AABI-27) | 0119 §258, §259 | - | EPIC(E13.1) |
-| REQ-FFI-008 | ffi | v1-full | Allocation ownership across FFI must be explicit. (AFFI-20) | 0119 §233, §259 | - | EPIC(E13.1) |
-| REQ-FFI-009 | ffi | v1-full | FFI never infers allocator compatibility automatically. (AFFI-21) | 0119 §233, §259 | - | EPIC(E13.1) |
-| REQ-FFI-010 | ffi | v1-full | Axiom panic does not cross foreign ABI boundaries by default. (AFFI-22) | 0119 §248, §259 | - | EPIC(E13.1) |
-| REQ-FFI-011 | ffi | v1-full | Foreign raw pointers are not automatically treated as safe capabilities like `view`. (AFFI-23) | 0119 §231, §259 | - | EPIC(E13.1) |
-| REQ-FFI-012 | ffi | v1-full | Capturing closures do not implicitly become foreign C callbacks; explicit adapters are required. (AFFI-24) | 0119 §235, §259 | - | EPIC(E13.1) |
-| REQ-FFI-013 | ffi | v1-full | Foreign layout integration requires an explicit representation contract like `@repr(C)`. (AFFI-25) | 0119 §259 | - | EPIC(E13.1) |
+| REQ-CAP-007 | capabilities | v1-full | Synchronization context may be part of capability provenance for compiler-internal tracking. (ACAP-29) | 0118 §206 | - | T502 |
+| REQ-ABI-037 | abi | v1-full | Type semantics are independent from machine representation, and the compiler may not infer semantic intent. (AABI-20) | 0119 §215, §259 | - | T500 |
+| REQ-ABI-038 | abi | v1-full | Explicit C representation requires C-compatible components. (AABI-21) | 0119 §218, §259 | - | T500 |
+| REQ-ABI-039 | abi | v1-full | Source visibility (`pub`) and linker export (`@export`) are independent concepts. (AABI-22) | 0119 §220, §259 | - | T504 |
+| REQ-ABI-040 | abi | v1-full | Observable physical address (e.g. via FFI) constrains storage optimizations. (AABI-23) | 0119 §224, §259 | - | T500 |
+| REQ-ABI-041 | abi | v1-full | Packed representation cannot imply invalid alignment. (AABI-24) | 0119 §226, §259 | - | T507 |
+| REQ-ABI-042 | abi | v1-full | Representation optimization (like niche optimization) cannot introduce new source-level semantics. (AABI-25) | 0119 §228, §259 | - | T500 |
+| REQ-ABI-043 | abi | v1-full | Generic code generation strategy (monomorphization vs sharing) is not an ABI semantics guarantee. (AABI-26) | 0119 §239, §259 | - | T500 |
+| REQ-ABI-044 | abi | v1-full | Only explicit ABI contracts (e.g., `@repr`, `extern`, `@export`) freeze representation; default struct and enum layouts are not guaranteed. (AABI-27) | 0119 §258, §259 | - | T510 |
+| REQ-FFI-008 | ffi | v1-full | Allocation ownership across FFI must be explicit. (AFFI-20) | 0119 §233, §259 | - | T515 |
+| REQ-FFI-009 | ffi | v1-full | FFI never infers allocator compatibility automatically. (AFFI-21) | 0119 §233, §259 | - | T514 |
+| REQ-FFI-010 | ffi | v1-full | Axiom panic does not cross foreign ABI boundaries by default. (AFFI-22) | 0119 §248, §259 | - | T521 |
+| REQ-FFI-011 | ffi | v1-full | Foreign raw pointers are not automatically treated as safe capabilities like `view`. (AFFI-23) | 0119 §231, §259 | - | T504 |
+| REQ-FFI-012 | ffi | v1-full | Capturing closures do not implicitly become foreign C callbacks; explicit adapters are required. (AFFI-24) | 0119 §235, §259 | - | T504 |
+| REQ-FFI-013 | ffi | v1-full | Foreign layout integration requires an explicit representation contract like `@repr(C)`. (AFFI-25) | 0119 §259 | - | T510 |
 | REQ-GPU-001 | gpu | post-v1 | GPU memory uses the same ownership and capability semantics as CPU. | 0120 §265 (AGPU-20) | - | EPIC(E22.3) |
 | REQ-GPU-002 | gpu | post-v1 | Host-to-device memory transfers must be explicit and cannot be implicitly performed by the compiler. | 0120 §267 (AGPU-21) | - | EPIC(E22.3) |
 | REQ-GPU-003 | gpu | post-v1 | Kernel code is valid only within its execution-domain contract. | 0120 §269 (AGPU-22) | - | EPIC(E22.3) |
@@ -261,8 +261,8 @@
 | REQ-TOOL-003 | tooling | v1-full | Semantic Oracle metadata has no production runtime requirement. | 0121 §309 (AORACLE-20) | - | EPIC(E19.1) |
 | REQ-OWN-026 | ownership | v1-core | A type that implements Drop is not copyable. | 0121 §317 (AOWN-30) | - | T113 | 
 | REQ-OWN-027 | ownership | v1-core | Returning a value transfers its semantic ownership. | 0121 §319 (AOWN-31) | - | T113 | 
-| REQ-CAP-008 | capability | v1-full | Duplicating a view capability is not a value copy. | 0121 §323 (ACAP-30) | - | EPIC(E13.1) |
-| REQ-CAP-009 | capability | v1-full | A mutable view cannot be duplicated. | 0121 §324 | - | EPIC(E13.1) |
+| REQ-CAP-008 | capability | v1-full | Duplicating a view capability is not a value copy. | 0121 §323 (ACAP-30) | - | T500 |
+| REQ-CAP-009 | capability | v1-full | A mutable view cannot be duplicated. | 0121 §324 | - | T500 |
 | REQ-LAY-003 | memory | v1-core | A stable address exists only when explicitly required by the storage contract. | 0121 §326 (AMEM-61) | - | T113 | 
 | REQ-CONC-017 | concurrency | v1-full | Synchronous lock guards cannot cross suspension points. | 0121 §328 (ACONC-29) | - | T417 |
 | REQ-CONC-018 | concurrency | v1-full | Synchronization is a property of a type or abstraction, not a property of a single operation. | 0121 §333 (ACONC-30) | - | T404 |
@@ -290,7 +290,7 @@
 | REQ-OWN-029 | ownership | v1-core | The programmer shall manage ownership semantics while the compiler manages lifetime, aliasing, and physical storage. | 0124 §0. Introduction | - | T113 | 
 | REQ-OWN-030 | ownership | v1-core | Every runtime value shall be classified as either an owning value or a non-owning capability. | 0124 §1. Ownership model | - | T113 | 
 | REQ-OWN-031 | ownership | v1-core | An owning value shall be responsible for semantic resource lifetime. | 0124 §1. Ownership model | - | T113 | 
-| REQ-CAP-010 | capability | v1-full | A non-owning capability shall only permit access to data belonging to an existing owning authority. | 0124 §1. Ownership model | - | EPIC(E13.1) |
+| REQ-CAP-010 | capability | v1-full | A non-owning capability shall only permit access to data belonging to an existing owning authority. | 0124 §1. Ownership model | - | T517, T516, T520 |
 | REQ-OWN-032 | ownership | v1-core | At any point in time, a resource or value shall have at most one owning authority. | 0124 §2. Ownership uniqueness | - | T113 | 
 | REQ-OWN-033 | ownership | v1-core | Safe code shall not permit two independent owners for the same resource identity. | 0124 §2. Ownership uniqueness | - | T113 | 
 | REQ-OWN-034 | ownership | v1-core | Shared ownership shall require an explicit abstraction such as Rc<T>, Arc<T>, or Shared<T>. | 0124 §2. Ownership uniqueness | - | T113 | 
@@ -302,7 +302,7 @@
 | REQ-OWN-040 | ownership | v1-core | AOWN-32: Attempting to use a value after it has been moved shall produce a compile-time error. | 0124 §8. Use-after-move | - | T113 | 
 | REQ-OWN-041 | ownership | v1-core | Use-after-move diagnostics should identify the move site, the use site, and the original declaration site. | 0124 §8. Use-after-move | - | T113 | 
 | REQ-OWN-042 | ownership | v1-core | Passing an owned non-Copy value by value to a function parameter shall transfer ownership via Move. | 0124 §9. Copy và Move trong function call | - | T113 | 
-| REQ-CAP-011 | capability | v1-full | Passing an argument to a view parameter shall create an ephemeral read capability without transferring ownership. | 0124 §9. Copy và Move trong function call | - | EPIC(E13.1) |
+| REQ-CAP-011 | capability | v1-full | Passing an argument to a view parameter shall create an ephemeral read capability without transferring ownership. | 0124 §9. Copy và Move trong function call | - | T500 |
 | REQ-OWN-043 | ownership | v1-core | AOWN-31: Returning an owned value transfers its semantic ownership without creating an implicit clone. | 0124 §10. Return ownership | - | T113 | 
 | REQ-OWN-044 | ownership | v1-core | Returning a value of a Copy type shall perform semantic value duplication. | 0124 §11. Returning Copy | - | T113 | 
 | REQ-OWN-045 | ownership | v1-core | AOWN-35: Duplicating a non-Copy resource shall require an explicit clone invocation and may incur arbitrary cost. | 0124 §12. Explicit Clone | - | T113 | 
@@ -312,7 +312,7 @@
 | REQ-OWN-049 | ownership | post-v1 | Arrays shall support element-level ownership tracking allowing individual non-Copy elements to be moved while keeping remaining elements owned. | 0124 §16. Arrays và partial move | REQ-OWN-047 | EPIC(E24.0) |
 | REQ-OWN-050 | ownership | v1-core | Moving an element out of a tuple shall preserve independent ownership of unaffected elements. | 0124 §17. Tuple partial move | REQ-OWN-047 | T113 | 
 | REQ-OWN-051 | ownership | v1-core | Pattern matching by value on an enum variant shall move extracted payload fields and mark the source variant as moved or partially moved. | 0124 §18. Pattern move | - | T113 | 
-| REQ-CAP-012 | capability | v1-full | ACAP-31: Pattern matching through a non-owning capability cannot transfer ownership and shall only produce capabilities. | 0124 §19. Pattern trên view | - | EPIC(E13.1) |
+| REQ-CAP-012 | capability | v1-full | ACAP-31: Pattern matching through a non-owning capability cannot transfer ownership and shall only produce capabilities. | 0124 §19. Pattern trên view | - | T500 |
 | REQ-DRP-012 | drop | v1-core | A user-defined Drop implementation shall forbid partial moves of fields from the containing value. | 0124 §20. Custom Drop và partial move | - | T113 | 
 | REQ-DRP-013 | drop | v1-core | ADROP-22: Compiler-derived Drop may support partial move. | 0124 §21. Derived Drop | - | T113 | 
 | REQ-DRP-014 | drop | v1-core | ADROP-23: A user-defined or custom Drop implementation forbids partial move of the containing value in v0.1. | 0124 §22. Custom Drop rule | - | T113 | 
@@ -328,35 +328,35 @@
 | REQ-DRP-024 | drop | v1-core | Resource cleanup operations that may fail shall be invoked explicitly before object destruction rather than deferred to Drop. | 0124 §29. Drop không fallible | - | T113 | 
 | REQ-DRP-025 | drop | v1-core | Calling explicit drop on a value shall terminate its ownership lifetime and requires that no dependent capabilities remain live. | 0124 §30. Explicit drop | - | T113 | 
 | REQ-DRP-026 | drop | v1-core | AOWN-42: Executing Drop on an object shall perform semantic resource cleanup without necessarily deallocating its underlying memory. | 0124 §31. Drop không nhất thiết deallocate | - | T113 | 
-| REQ-CAP-013 | capability | v1-full | The language shall define view<T> and mut_view<T> as its two source-level non-owning capability types. | 0124 §32. Capability model | - | EPIC(E13.1) |
-| REQ-CAP-014 | capability | v1-full | ACAP-32: A view<T> capability shall be non-owning and read-only over a valid region. | 0124 §33. view<T> | - | EPIC(E13.1) |
-| REQ-CAP-015 | capability | v1-full | ACAP-33: A mut_view<T> capability shall be non-owning and exclusive-write over a region, permitting no conflicting capabilities. | 0124 §34. mut_view<T> | - | EPIC(E13.1) |
-| REQ-CAP-016 | capability | v1-full | ACAP-30: Capability duplication is not value Copy and shall be an intrinsic property of view<T>. | 0124 §35. view có thể duplicate | - | EPIC(E13.1) |
-| REQ-CAP-017 | capability | v1-full | ACAP-34: A view<T> capability may be duplicated to create multiple read capabilities. | 0124 §35. view có thể duplicate | - | EPIC(E13.1) |
-| REQ-CAP-018 | capability | v1-full | ACAP-35: A mut_view<T> capability shall be non-duplicable and move-only. | 0124 §36. mut_view không duplicate | - | EPIC(E13.1) |
-| REQ-CAP-019 | capability | v1-full | ACAP-37: The compiler shall track capability provenance comprising owner, target region, access mode, and validity during verification. | 0124 §37. Capability provenance | - | EPIC(E13.1) |
-| REQ-CAP-020 | capability | v1-full | A capability region shall support addressing a single value, array, subarray, struct field, nested field, external buffer, or device memory. | 0124 §38. Capability region | - | EPIC(E13.1) |
-| REQ-CAP-021 | capability | v1-full | The compiler may choose any internal representation for view<T> unless a specific ABI contract requires otherwise. | 0124 §39. View representation | - | EPIC(E13.1) |
-| REQ-CAP-022 | capability | v1-full | A view capability may address an entire singular object as its target region rather than being restricted to sequential buffers. | 0124 §40. View của single value | - | EPIC(E13.1) |
-| REQ-CAP-023 | capability | v1-full | Projecting a field through a capability shall derive a sub-capability referencing that field region without creating new ownership. | 0124 §41. View field projection | - | EPIC(E13.1) |
-| REQ-CAP-024 | capability | v1-full | Implicit conversion from view<T> to owned T shall be forbidden, requiring either T: Copy or an explicit clone invocation. | 0124 §42. View → owned value | - | EPIC(E13.1) |
-| REQ-CAP-025 | capability | v1-full | ACAP-38: Capability lifetime shall span its semantic last-use interval rather than being bound to lexical scope. | 0124 §43. View lifetime | - | EPIC(E13.1) |
-| REQ-CAP-026 | capability | v1-full | ACAP-39: An owner value shall not be destroyed while any dependent capability remains live. | 0124 §44. Owner destruction constraint | - | EPIC(E13.1) |
-| REQ-CAP-027 | capability | v1-full | A capability shall not extend the semantic resource lifetime of its underlying owner. | 0124 §45. View không tự kéo dài owner | - | EPIC(E13.1) |
-| REQ-CAP-028 | capability | v1-full | ACAP-42: Safe code shall not assume two regions are disjoint when their aliasing relationship is unknown. | 0124 §46. Unknown aliasing | - | EPIC(E13.1) |
-| REQ-CAP-029 | capability | v1-full | The compiler shall classify region relations into DISJOINT, SAME, CONTAINS, OVERLAPS, CONTAINED_BY, or UNKNOWN. | 0124 §47. Region relations | - | EPIC(E13.1) |
-| REQ-CAP-030 | capability | v1-full | Multiple concurrently active read-only view capabilities may reference overlapping or identical regions. | 0124 §48. Read/read | - | EPIC(E13.1) |
-| REQ-CAP-031 | capability | v1-full | ACAP-40: A view capability and a mut_view capability shall not be concurrently active over overlapping regions. | 0124 §49. Read/write | - | EPIC(E13.1) |
-| REQ-CAP-032 | capability | v1-full | Multiple mut_view capabilities shall not be concurrently active if their regions may overlap. | 0124 §50. Write/write | - | EPIC(E13.1) |
-| REQ-CAP-033 | capability | v1-full | ACAP-41: Concurrently active mut_view capabilities shall be permitted if their target regions are proven disjoint. | 0124 §51. Disjoint mutable access | - | EPIC(E13.1) |
-| REQ-CAP-034 | capability | v1-full | An owner value shall not be mutated, moved, or dropped while an active capability conflicting with that operation exists on that value. | 0124 §52. Owner + capability | - | EPIC(E13.1) |
-| REQ-CAP-035 | capability | v1-full | Mutating an owner value shall be rejected if an active capability overlaps the mutated region, but permitted if the capability targets a provably disjoint region. | 0124 §53. Mutable owner access | - | EPIC(E13.1) |
-| REQ-CAP-036 | capability | v1-full | Function arguments passed to capability parameters shall automatically construct ephemeral capabilities without programmer-written borrow syntax. | 0124 §54. Compiler không cần borrow syntax | - | EPIC(E13.1) |
+| REQ-CAP-013 | capability | v1-full | The language shall define view<T> and mut_view<T> as its two source-level non-owning capability types. | 0124 §32. Capability model | - | T501 |
+| REQ-CAP-014 | capability | v1-full | ACAP-32: A view<T> capability shall be non-owning and read-only over a valid region. | 0124 §33. view<T> | - | T500 |
+| REQ-CAP-015 | capability | v1-full | ACAP-33: A mut_view<T> capability shall be non-owning and exclusive-write over a region, permitting no conflicting capabilities. | 0124 §34. mut_view<T> | - | T501 |
+| REQ-CAP-016 | capability | v1-full | ACAP-30: Capability duplication is not value Copy and shall be an intrinsic property of view<T>. | 0124 §35. view có thể duplicate | - | T500 |
+| REQ-CAP-017 | capability | v1-full | ACAP-34: A view<T> capability may be duplicated to create multiple read capabilities. | 0124 §35. view có thể duplicate | - | T500 |
+| REQ-CAP-018 | capability | v1-full | ACAP-35: A mut_view<T> capability shall be non-duplicable and move-only. | 0124 §36. mut_view không duplicate | - | T501 |
+| REQ-CAP-019 | capability | v1-full | ACAP-37: The compiler shall track capability provenance comprising owner, target region, access mode, and validity during verification. | 0124 §37. Capability provenance | - | T502 |
+| REQ-CAP-020 | capability | v1-full | A capability region shall support addressing a single value, array, subarray, struct field, nested field, external buffer, or device memory. | 0124 §38. Capability region | - | T500 |
+| REQ-CAP-021 | capability | v1-full | The compiler may choose any internal representation for view<T> unless a specific ABI contract requires otherwise. | 0124 §39. View representation | - | T500 |
+| REQ-CAP-022 | capability | v1-full | A view capability may address an entire singular object as its target region rather than being restricted to sequential buffers. | 0124 §40. View của single value | - | T500 |
+| REQ-CAP-023 | capability | v1-full | Projecting a field through a capability shall derive a sub-capability referencing that field region without creating new ownership. | 0124 §41. View field projection | - | T500 |
+| REQ-CAP-024 | capability | v1-full | Implicit conversion from view<T> to owned T shall be forbidden, requiring either T: Copy or an explicit clone invocation. | 0124 §42. View → owned value | - | T500 |
+| REQ-CAP-025 | capability | v1-full | ACAP-38: Capability lifetime shall span its semantic last-use interval rather than being bound to lexical scope. | 0124 §43. View lifetime | - | T501 |
+| REQ-CAP-026 | capability | v1-full | ACAP-39: An owner value shall not be destroyed while any dependent capability remains live. | 0124 §44. Owner destruction constraint | - | T501 |
+| REQ-CAP-027 | capability | v1-full | A capability shall not extend the semantic resource lifetime of its underlying owner. | 0124 §45. View không tự kéo dài owner | - | T501 |
+| REQ-CAP-028 | capability | v1-full | ACAP-42: Safe code shall not assume two regions are disjoint when their aliasing relationship is unknown. | 0124 §46. Unknown aliasing | - | T500 |
+| REQ-CAP-029 | capability | v1-full | The compiler shall classify region relations into DISJOINT, SAME, CONTAINS, OVERLAPS, CONTAINED_BY, or UNKNOWN. | 0124 §47. Region relations | - | T500 |
+| REQ-CAP-030 | capability | v1-full | Multiple concurrently active read-only view capabilities may reference overlapping or identical regions. | 0124 §48. Read/read | - | T500 |
+| REQ-CAP-031 | capability | v1-full | ACAP-40: A view capability and a mut_view capability shall not be concurrently active over overlapping regions. | 0124 §49. Read/write | - | T501 |
+| REQ-CAP-032 | capability | v1-full | Multiple mut_view capabilities shall not be concurrently active if their regions may overlap. | 0124 §50. Write/write | - | T501 |
+| REQ-CAP-033 | capability | v1-full | ACAP-41: Concurrently active mut_view capabilities shall be permitted if their target regions are proven disjoint. | 0124 §51. Disjoint mutable access | - | T501 |
+| REQ-CAP-034 | capability | v1-full | An owner value shall not be mutated, moved, or dropped while an active capability conflicting with that operation exists on that value. | 0124 §52. Owner + capability | - | T501 |
+| REQ-CAP-035 | capability | v1-full | Mutating an owner value shall be rejected if an active capability overlaps the mutated region, but permitted if the capability targets a provably disjoint region. | 0124 §53. Mutable owner access | - | T500 |
+| REQ-CAP-036 | capability | v1-full | Function arguments passed to capability parameters shall automatically construct ephemeral capabilities without programmer-written borrow syntax. | 0124 §54. Compiler không cần borrow syntax | - | T500 |
 | REQ-OWN-052 | ownership | v1-core | A runtime object shall have exactly one owner and either zero or more read capabilities or at most one exclusive write capability. | 0124 §55. Ownership vs capability | - | T113 | 
 | REQ-OWN-053 | ownership | v1-core | Shared ownership shall not implicitly convert an ordinary value into a reference-counted object. | 0124 §56. Shared ownership | - | T113 | 
 | REQ-OWN-054 | ownership | v1-core | Mutable access to data behind shared ownership abstractions shall require an explicit synchronization abstraction. | 0124 §57. Arc<T> và capability | - | T113 | 
-| REQ-CAP-037 | capability | v1-full | Raw pointers (*const T, *mut T) shall not be considered safe capabilities and are restricted to unsafe code and system boundaries. | 0124 §58. Raw pointer | - | EPIC(E13.1) |
-| REQ-CAP-038 | capability | v1-full | Unsafe code may construct view<T> or mut_view<T> capabilities from validated raw pointers, after which the compiler tracks provenance and lifetime. | 0124 §59. Unsafe → capability | - | EPIC(E13.1) |
+| REQ-CAP-037 | capability | v1-full | Raw pointers (*const T, *mut T) shall not be considered safe capabilities and are restricted to unsafe code and system boundaries. | 0124 §58. Raw pointer | - | T502 |
+| REQ-CAP-038 | capability | v1-full | Unsafe code may construct view<T> or mut_view<T> capabilities from validated raw pointers, after which the compiler tracks provenance and lifetime. | 0124 §59. Unsafe → capability | - | T502 |
 | REQ-OWN-055 | ownership | v1-core | An unsafe block shall only suppress specific proof obligations and shall not disable type checking, name resolution, ABI checks, or control-flow verification. | 0124 §60. Unsafe không tắt verifier | - | T113 | 
 | REQ-LAY-004 | memory | v1-core | AMEM-63: Ownership and type semantics shall not dictate physical storage medium when address identity is unobservable. | 0124 §61. Storage strategy | - | T113 | 
 | REQ-LAY-005 | memory | v1-core | The compiler may eliminate heap allocations and return values via registers, SSA scalars, or caller-allocated storage when address identity is unobservable. | 0124 §62. Allocation elimination | - | T113 | 
@@ -374,13 +374,13 @@
 | REQ-DRP-027 | drop | v1-core | AMEM-69: The compiler may drop an owned value before lexical scope exit based on last use only if observable side effects of its Drop implementation are preserved. | 0124 §75. Nhưng compiler không được tùy tiện Drop sớm | - | T113 | 
 | REQ-CORE-030 | lifetime | v1-core | The compiler verifier shall prove that every capability use occurs while owner storage is valid and every owner drop occurs only after dependent capabilities have ended. | 0124 §76. Lifetime proof | - | T113 | 
 | REQ-OWN-056 | ownership | v1-core | The MIR verifier shall track ownership transitions across UNINIT, OWNED, MOVED, PARTIAL, and DROPPED states. | 0124 §77. Ownership state machine | - | T113 | 
-| REQ-CAP-039 | capability | v1-full | AMEM-64: A capability shall never transition into an owning value. | 0124 §78. Capability state machine | - | EPIC(E13.1) |
-| REQ-CAP-040 | capability | v1-full | A capability shall terminate at its semantic last use or explicit scope boundary, and the compiler may shorten its lifetime accordingly. | 0124 §79. Capability end | - | EPIC(E13.1) |
+| REQ-CAP-039 | capability | v1-full | AMEM-64: A capability shall never transition into an owning value. | 0124 §78. Capability state machine | - | T500 |
+| REQ-CAP-040 | capability | v1-full | A capability shall terminate at its semantic last use or explicit scope boundary, and the compiler may shorten its lifetime accordingly. | 0124 §79. Capability end | - | T501 |
 | REQ-OWN-057 | ownership | v1-core | Ownership and capability verification shall run prior to semantic optimization, converting verified facts into optimization facts that may be erased from release binaries. | 0124 §80. Ownership verifier và optimizer | - | T113 | 
 | REQ-LAY-016 | memory | v1-core | AMEM-62: Ordinary values shall not imply heap allocation. | 0124 §81. Memory model invariants | - | T113 | 
-| REQ-CAP-041 | capability | v1-full | AMEM-65: Capability validity shall depend on its provenance. | 0124 §81. Memory model invariants | - | EPIC(E13.1) |
-| REQ-CAP-042 | capability | v1-full | AMEM-66: Owner destruction cannot invalidate a live capability. | 0124 §81. Memory model invariants | - | EPIC(E13.1) |
-| REQ-CAP-043 | capability | v1-full | AMEM-67: Safe code cannot create conflicting mutable capabilities. | 0124 §81. Memory model invariants | - | EPIC(E13.1) |
+| REQ-CAP-041 | capability | v1-full | AMEM-65: Capability validity shall depend on its provenance. | 0124 §81. Memory model invariants | - | T502 |
+| REQ-CAP-042 | capability | v1-full | AMEM-66: Owner destruction cannot invalidate a live capability. | 0124 §81. Memory model invariants | - | T500 |
+| REQ-CAP-043 | capability | v1-full | AMEM-67: Safe code cannot create conflicting mutable capabilities. | 0124 §81. Memory model invariants | - | T500 |
 | REQ-LAY-017 | memory | v1-core | AMEM-70: Observable address identity shall constrain storage optimization. | 0124 §81. Memory model invariants | - | T113 | 
 | REQ-LAY-018 | memory | v1-core | AMEM-72: A stable address shall require an explicit storage contract. | 0124 §81. Memory model invariants | - | T113 | 
 | REQ-OWN-058 | ownership | v1-core | AOWN-30: A Drop-bearing type shall not be Copyable. | 0124 §82. Ownership invariants | - | T113 | 
@@ -388,9 +388,9 @@
 | REQ-OWN-060 | ownership | v1-core | AOWN-34: Copy shall not require physical copying. | 0124 §82. Ownership invariants | - | T113 | 
 | REQ-DRP-028 | drop | v1-core | AOWN-38: A user-defined Drop implementation shall forbid partial moves. | 0124 §82. Ownership invariants | - | T113 | 
 | REQ-DRP-029 | drop | v1-core | AOWN-39: Compiler-derived Drop implementations may support partial moves. | 0124 §82. Ownership invariants | - | T113 | 
-| REQ-CAP-044 | capability | v1-full | ACAP-36: Capabilities shall not own their target. | 0124 §83. Capability invariants | - | EPIC(E13.1) |
+| REQ-CAP-044 | capability | v1-full | ACAP-36: Capabilities shall not own their target. | 0124 §83. Capability invariants | - | T500 |
 | REQ-OWN-061 | ownership | v1-core | Operations crossing semantic boundaries including explicit capability creation, move closures, unsafe blocks, dynamic allocations, and shared ownership shall be syntactically explicit. | 0124 §85. Nhưng Axiom không giấu semantic boundary | - | T113 | 
-| REQ-CAP-045 | capability | v1-full | Capability abstractions shall have zero runtime cost in release binaries unless exposed through an explicit ABI contract. | 0124 §87. Ví dụ compiler có thể tối ưu | - | EPIC(E13.1) |
+| REQ-CAP-045 | capability | v1-full | Capability abstractions shall have zero runtime cost in release binaries unless exposed through an explicit ABI contract. | 0124 §87. Ví dụ compiler có thể tối ưu | - | T500 |
 | REQ-LAY-019 | memory | v1-core | Value semantics, resource semantics, and storage semantics are separated into distinct architectural layers. | 0125 §1. Ba lớp cần tách biệt | - | T113 | 
 | REQ-LAY-020 | memory | v1-core | Value lifetime defines the duration a value remains semantically valid without requiring dedicated RAM storage. | 0125 §2. Value lifetime | - | T113 | 
 | REQ-LAY-021 | memory | v1-core | A resource must be released when its ownership terminates. | 0125 §3. Resource lifetime | - | T113 | 
@@ -526,8 +526,8 @@
 | REQ-CONC-043 | concurrency | v1-full | A successful channel receive following a send MUST establish a happens-before relationship between producer and consumer in accordance with the channel contract. | 0126 §23. Channel synchronization | - | T412 |
 | REQ-CONC-044 | concurrency | v1-full | `Mutex<T>` MUST provide exclusive synchronization access to its inner value by granting an owning synchronization guard upon lock acquisition. | 0126 §24. Mutex | - | T411 |
 | REQ-CONC-045 | concurrency | v1-full | `MutexGuard<T>` MUST be `!Copy`, and dropping the guard MUST release the mutex lock. | 0126 §25. MutexGuard | - | T411 |
-| REQ-CAP-046 | capability | v1-full | A lock guard MUST remain alive for the entire duration that its derived mut_view capability is in use. | 0126 §26. Guard → capability | - | EPIC(E13.1) |
-| REQ-CAP-047 | capability | v1-full | The compiler MUST reject any attempt to use a derived capability after its owning lock guard has been dropped. | 0126 §27. Guard và Drop dependency | - | EPIC(E13.1) |
+| REQ-CAP-046 | capability | v1-full | A lock guard MUST remain alive for the entire duration that its derived mut_view capability is in use. | 0126 §26. Guard → capability | - | T501 |
+| REQ-CAP-047 | capability | v1-full | The compiler MUST reject any attempt to use a derived capability after its owning lock guard has been dropped. | 0126 §27. Guard và Drop dependency | - | T501 |
 | REQ-CONC-046 | concurrency | v1-full | `RwLock<T>` MUST grant either concurrent shared read access via view<T> or single exclusive write access via mut_view<T>, preventing reader-writer and writer-writer conflicts. | 0126 §28. RwLock | - | T411 |
 | REQ-CONC-047 | concurrency | v1-full | Synchronization lock guards (including `MutexGuard`, `RwLockReadGuard`, and `RwLockWriteGuard`) MUST NOT implement `Copy`. | 0126 §29. Lock guards không Copy | - | T411 |
 |REQ-CONC-048|concurrency|v1-full|The compiler MUST reject holding synchronous lock guards across suspension points (`.await`).|0126 §30. Lock guard không được cross await|-|T417|
@@ -554,10 +554,10 @@
 |REQ-CONC-069|concurrency|v1-full|The language MUST NOT provide implicit shared mutable references, requiring synchronization primitives such as `Mutex`, `RwLock`, or `Atomic` for concurrent mutation.|0126 §51. Shared mutable data|-|T406|
 | REQ-CONC-070 | concurrency | v1-full | `Arc<T>` MUST only provide shared ownership and MUST NOT implicitly permit concurrent mutation without synchronization. | 0126 §52. `Arc<T>` không đủ | - | T411 |
 | REQ-CONC-071 | concurrency | v1-full | Concurrent shared mutable access MUST compose separate abstractions for shared ownership and synchronization rather than conflating them into a single mechanism. | 0126 §53. `Arc<Mutex<T>>` | - | T411 |
-| REQ-CAP-048 | capability | v1-full | A capability MUST NOT be treated as `Send` by default and MUST NOT cross execution context boundaries unless its underlying storage, provenance, region, and lifetime allow it. | 0126 §54. Send/Share và capabilities | - | EPIC(E13.1) |
-| REQ-CAP-049 | capability | v1-full | The compiler MUST reject any capability view that escapes the lifetime of its underlying owner. | 0126 §55. Không cho view escape owner | - | EPIC(E13.1) |
-| REQ-CAP-050 | capability | v1-full | Passing a view<T> to another execution context MUST be rejected unless the view, its underlying storage, and execution contract satisfy both Send and Share semantics. | 0126 §56. Cross-thread view | - | EPIC(E13.1) |
-| REQ-CAP-051 | capability | v1-full | The compiler MUST NOT permit parent and child execution contexts to simultaneously hold active mut_view capabilities for the same storage. | 0126 §57. `mut_view` cross-thread | - | EPIC(E13.1) |
+| REQ-CAP-048 | capability | v1-full | A capability MUST NOT be treated as `Send` by default and MUST NOT cross execution context boundaries unless its underlying storage, provenance, region, and lifetime allow it. | 0126 §54. Send/Share và capabilities | - | T502 |
+| REQ-CAP-049 | capability | v1-full | The compiler MUST reject any capability view that escapes the lifetime of its underlying owner. | 0126 §55. Không cho view escape owner | - | T501 |
+| REQ-CAP-050 | capability | v1-full | Passing a view<T> to another execution context MUST be rejected unless the view, its underlying storage, and execution contract satisfy both Send and Share semantics. | 0126 §56. Cross-thread view | - | T500 |
+| REQ-CAP-051 | capability | v1-full | The compiler MUST NOT permit parent and child execution contexts to simultaneously hold active mut_view capabilities for the same storage. | 0126 §57. `mut_view` cross-thread | - | T501 |
 |REQ-CONC-072|concurrency|v1-full|A `Send` operation transferring value across execution contexts MUST be a Move that permanently revokes access from the sender and establishes exclusive ownership in the receiver.|0126 §58. Send là ownership transfer|-|T401|
 |REQ-CONC-073|concurrency|v1-full|The Share property MUST permit creating concurrent read view<T> capabilities across execution contexts without permitting concurrent mutation.|0126 §59. Share là concurrent capability|-|T400|
 |REQ-CONC-074|concurrency|v1-full|Synchronization primitives MUST establish explicit happens-before relationships between execution contexts.|0126 §60. Happens-before|-|T403|
@@ -698,8 +698,8 @@
 | REQ-LAY-134 | memory-management | v1-core | In concurrent and lock-free structures, logical removal of a resource must remain distinct from physical memory deallocation and Drop execution (AMEM-43). | 0128 §55 | - | T113 | 
 | REQ-CORE-034 | safety | v1-core | Safe code errors including data races, out-of-bounds accesses, and use-after-free must be rejected statically or trigger defined runtime panic or trap behaviors, never undefined behavior exploited for optimization. | 0128 §57 | - | T113 | 
 | REQ-CORE-035 | safety | v1-core | Code enclosed in unsafe blocks must not permit the compiler to weaken atomic memory ordering or violate atomic synchronization semantics (AATOM-36). | 0128 §58, §59, §66 | - | T113 | 
-| REQ-FFI-014 | ffi | v1-full | FFI boundaries must be treated conservatively by default, requiring an explicit contract to establish atomic synchronization or happens-before relationships across foreign functions (AATOM-37). | 0128 §60, §61, §66 | - | EPIC(E13.1) |
-| REQ-FFI-015 | ffi | v1-full | Hardware and MMIO registers accessed across FFI must be mediated through explicit volatile operations rather than ordinary memory accesses. | 0128 §62 | - | EPIC(E13.1) |
+| REQ-FFI-014 | ffi | v1-full | FFI boundaries must be treated conservatively by default, requiring an explicit contract to establish atomic synchronization or happens-before relationships across foreign functions (AATOM-37). | 0128 §60, §61, §66 | - | T505 |
+| REQ-FFI-015 | ffi | v1-full | Hardware and MMIO registers accessed across FFI must be mediated through explicit volatile operations rather than ordinary memory accesses. | 0128 §62 | - | T508 |
 |REQ-GPU-005|gpu|post-v1|GPU atomic operations must extend the atomic memory model with hierarchical memory scopes without replacing or altering core atomic ordering semantics (AATOM-38) .|0128 §63, §64, §66|-|EPIC(E22.3)|
 | REQ-LAY-135 | layout | v1-core | The compiler shall be permitted to choose an optimized memory layout for data types unless an explicit ABI representation attribute is specified. | 0129 §1 | - | T113 | 
 | REQ-TYP-029 | types | v1-core | Type identity must be distinct from representation identity such that types sharing identical memory representations are not interchangeable without explicit conversion (ATYPE-20). | 0129 §2, 0129 §101 | - | T113 |
@@ -709,7 +709,7 @@
 | REQ-TYP-033 | types | post-v1 | The type system may support 128-bit integers (`i128`, `u128`) as post-v1 extensions without breaking existing primitive type architecture. | 0129 §6 | - | EPIC(E24.0) |
 | REQ-TYP-034 | types | v1-core | `usize` and `isize` must match the target architecture pointer width and be used for indices, lengths, and allocation sizes (ATYPE-25). | 0129 §7, 0129 §101 | - | T113 |
 | REQ-TYP-035 | types | v1-core | Fixed-width integer types must maintain target-independent bit widths, and `usize` shall not be considered equivalent to `u64` even on 64-bit targets (ATYPE-26). | 0129 §8, 0129 §101 | - | T113 |
-| REQ-FFI-016 | ffi | v1-full | Interoperability with C must use target-specific C integer aliases (such as `c_int`, `c_long`, `c_size`) rather than fixed-width integer types. | 0129 §9 | - | EPIC(E13.1) |
+| REQ-FFI-016 | ffi | v1-full | Interoperability with C must use target-specific C integer aliases (such as `c_int`, `c_long`, `c_size`) rather than fixed-width integer types. | 0129 §9 | - | T504 |
 | REQ-TYP-036 | types | v1-core | `bool` must only accept `true` or `false` values and shall not support implicit truthiness conversion from non-boolean types (ATYPE-27). | 0129 §10, 0129 §101 | - | T113 |
 | REQ-CORE-036 | conversions | v1-core | Implicit numeric type conversions must not exist, requiring explicit cast syntax via `as` (ATYPE-23). | 0129 §11, 0129 §101 | - | T113 | 
 | REQ-TYP-037 | types | v1-core | Numeric literal inference must be untyped initially and resolved from contextual constraints rather than via runtime conversion (ATYPE-24). | 0129 §13, 0129 §101 | - | T113 |
@@ -751,18 +751,18 @@
 | REQ-LAY-144 | layout | v1-core | Types annotated with `@repr(packed)` must not permit safe aligned reference creation and must require unaligned access instructions or unsafe/system access (ATYPE-42). | 0129 §59, 0129 §101 | - | T113 | 
 | REQ-LAY-145 | layout | v1-core | The `@align(N)` attribute must enforce a minimum type alignment and shall not reduce alignment below field ABI requirements. | 0129 §60 | - | T113 | 
 | REQ-TOOL-004 | tooling | v1-full | Tooling should provide command-line layout inspection commands to inspect type size, alignment, and field offsets. | 0129 §61 | - | EPIC(E19.1) |
-| REQ-ABI-045 | abi | v1-full | ABI representation must be distinct from source type semantics, supporting `axiom`, `C`, and `system` calling conventions in Core v0.1 (ATYPE-45). | 0129 §62, 0129 §63, 0129 §101 | - | EPIC(E13.1) |
-| REQ-ABI-046 | abi | v1-full | Target-specific calling conventions (such as stdcall, fastcall, vectorcall, wasm, and aapcs) may be added when required by the target platform. | 0129 §63 | - | EPIC(E13.1) |
-| REQ-ABI-047 | abi | v1-full | The native `axiom` ABI must prioritize register passing and optimization without guaranteeing binary compatibility across compiler versions unless an explicit ABI version is specified. | 0129 §64 | - | EPIC(E13.1) |
-| REQ-ABI-048 | abi | v1-full | Functions marked with `extern "C"` must adhere to the target C calling convention. | 0129 §65 | - | EPIC(E13.1) |
-| REQ-ABI-049 | abi | v1-full | The `pub` keyword must only govern source-level visibility, requiring explicit `@export` attributes to emit linker-visible external symbols. | 0129 §66 | - | EPIC(E13.1) |
-| REQ-ABI-050 | abi | v1-full | Function pointer types must explicitly include calling convention information within their ABI definition. | 0129 §67 | - | EPIC(E13.1) |
-| REQ-ABI-051 | abi | v1-full | Closure ABI must not be treated as a stable FFI ABI, and capturing closures shall not implicitly convert to C function pointers (ATYPE-50). | 0129 §68, 0129 §69, 0129 §70, 0129 §101 | - | EPIC(E13.1) |
-| REQ-ABI-052 | abi | v1-full | The machine layout of `dyn Trait` fat pointers must remain an internal compiler detail and not a stable ABI unless governed by an explicit representation contract. | 0129 §71 | - | EPIC(E13.1) |
-| REQ-ABI-053 | abi | v1-full | Generic types and functions must not have stable external ABIs across all types, and generic functions shall not be exported directly under `extern "C"` (ATYPE-49). | 0129 §72, 0129 §73, 0129 §101 | - | EPIC(E13.1) |
-| REQ-ABI-054 | abi | v1-full | Aggregate return conventions (such as register returns or caller-allocated return storage) must not imply heap allocation (ATYPE-48). | 0129 §74, 0129 §75, 0129 §101 | - | EPIC(E13.1) |
-| REQ-ABI-055 | abi | v1-full | Semantic `Move` operations represent ownership transfers and must not imply a physical memory copy (ATYPE-46). | 0129 §76, 0129 §101 | - | EPIC(E13.1) |
-| REQ-ABI-056 | abi | v1-full | Semantic `Copy` operations must not mandate physical memory copies if the compiler can optimize them via registers or scalarization (ATYPE-47). | 0129 §77, 0129 §101 | - | EPIC(E13.1) |
+| REQ-ABI-045 | abi | v1-full | ABI representation must be distinct from source type semantics, supporting `axiom`, `C`, and `system` calling conventions in Core v0.1 (ATYPE-45). | 0129 §62, 0129 §63, 0129 §101 | - | T503 |
+| REQ-ABI-046 | abi | v1-full | Target-specific calling conventions (such as stdcall, fastcall, vectorcall, wasm, and aapcs) may be added when required by the target platform. | 0129 §63 | - | T518 |
+| REQ-ABI-047 | abi | v1-full | The native `axiom` ABI must prioritize register passing and optimization without guaranteeing binary compatibility across compiler versions unless an explicit ABI version is specified. | 0129 §64 | - | T503 |
+| REQ-ABI-048 | abi | v1-full | Functions marked with `extern "C"` must adhere to the target C calling convention. | 0129 §65 | - | T503 |
+| REQ-ABI-049 | abi | v1-full | The `pub` keyword must only govern source-level visibility, requiring explicit `@export` attributes to emit linker-visible external symbols. | 0129 §66 | - | T504 |
+| REQ-ABI-050 | abi | v1-full | Function pointer types must explicitly include calling convention information within their ABI definition. | 0129 §67 | - | T503 |
+| REQ-ABI-051 | abi | v1-full | Closure ABI must not be treated as a stable FFI ABI, and capturing closures shall not implicitly convert to C function pointers (ATYPE-50). | 0129 §68, 0129 §69, 0129 §70, 0129 §101 | - | T500 |
+| REQ-ABI-052 | abi | v1-full | The machine layout of `dyn Trait` fat pointers must remain an internal compiler detail and not a stable ABI unless governed by an explicit representation contract. | 0129 §71 | - | T510 |
+| REQ-ABI-053 | abi | v1-full | Generic types and functions must not have stable external ABIs across all types, and generic functions shall not be exported directly under `extern "C"` (ATYPE-49). | 0129 §72, 0129 §73, 0129 §101 | - | T504 |
+| REQ-ABI-054 | abi | v1-full | Aggregate return conventions (such as register returns or caller-allocated return storage) must not imply heap allocation (ATYPE-48). | 0129 §74, 0129 §75, 0129 §101 | - | T503 |
+| REQ-ABI-055 | abi | v1-full | Semantic `Move` operations represent ownership transfers and must not imply a physical memory copy (ATYPE-46). | 0129 §76, 0129 §101 | - | T513, T526 |
+| REQ-ABI-056 | abi | v1-full | Semantic `Copy` operations must not mandate physical memory copies if the compiler can optimize them via registers or scalarization (ATYPE-47). | 0129 §77, 0129 §101 | - | T513, T526 |
 | REQ-CORE-037 | conversions | v1-core | `bit_cast<T>` must perform explicit bit reinterpretation between compatible types of identical size and alignment and must not be used to bypass type safety. | 0129 §78, 0129 §80 | - | T113 | 
 | REQ-CORE-038 | conversions | v1-core | The `as` cast syntax must be reserved for defined semantic conversions and shall not be used for bitwise reinterpretation. | 0129 §79, 0129 §80 | - | T113 | 
 | REQ-CORE-039 | conversions | v1-core | Raw pointer conversions (`addr_cast`, `ptr_cast`) must be explicit, restricted to unsafe/system operations, and prohibit implicit reference-to-pointer conversions (ATYPE-52). | 0129 §81, 0129 §101 | - | T113 | 
@@ -775,7 +775,7 @@
 | REQ-TYP-062 | types | v1-core | Operator resolution must resolve through trait implementations and cannot depend on implicit conversion ranking (ATYPE-56). | 0129 §92, 0129 §101 | - | T113 |
 | REQ-TYP-063 | types | v1-core | Function overload resolution must not implicitly convert arguments based on conversion proximity or ranking. | 0129 §93 | - | T113 |
 | REQ-TYP-064 | types | v1-core | Trait declarations must not introduce storage overhead or vtables into implementing types, reserving dynamic dispatch costs strictly for `dyn Trait`. | 0129 §94, 0129 §95 | - | T113 |
-| REQ-ABI-057 | abi | v1-full | Stable FFI callbacks must use `extern "C"` function pointer signatures or explicit callback structs rather than Axiom closures. | 0129 §96 | - | EPIC(E13.1) |
+| REQ-ABI-057 | abi | v1-full | Stable FFI callbacks must use `extern "C"` function pointer signatures or explicit callback structs rather than Axiom closures. | 0129 §96 | - | T504 |
 | REQ-TYP-065 | types | v1-core | `size_of<T>()`, `align_of<T>()`, and `layout_of<T>()` must be evaluatable at compile time for all types with compile-time known size. | 0129 §97, 0129 §98 | - | T113 |
 | REQ-TYP-066 | types | v1-core | Runtime type metadata and reflection structures must not be generated by default and shall require explicit metadata requests (ATYPE-53). | 0129 §99, 0129 §101 | - | T113 |
 | REQ-LAY-146 | layout | v1-core | Core v0.1 must not provide syntax for manual field offset specification (`@field_offset`, `@bitfield`, `@manual_layout`) outside standard representation attributes. | 0129 §104 | - | T113 | 
@@ -939,7 +939,7 @@
 | REQ-CORE-063 | functions | v1-core | The compiler shall not support named argument syntax in function calls within the Core language. | 0131 - Section 19 | - | T113 | 
 | REQ-CORE-064 | functions | v1-core | The compiler shall not support default function arguments. | 0131 - Section 20 | - | T113 | 
 | REQ-CORE-065 | functions | v1-core | Core language functions shall not support arbitrary variadic parameter lists, requiring explicit view slices or typed wrappers instead. | 0131 - Section 21 | - | T113 | 
-| REQ-FFI-017 | ffi | v1-full | C variadic parameter lists shall be permitted exclusively in `extern "C"` declarations and not in ordinary Axiom functions. | 0131 - Section 22 | - | EPIC(E13.1) |
+| REQ-FFI-017 | ffi | v1-full | C variadic parameter lists shall be permitted exclusively in `extern "C"` declarations and not in ordinary Axiom functions. | 0131 - Section 22 | - | T505 |
 | REQ-GEN-001 | generics | v1-core | Generic functions shall be compile-time abstractions implemented via monomorphization by default. | 0131 - Section 23 | - | T113 | 
 | REQ-GEN-002 | generics | v1-core | Compiler specialization of generic functions shall not alter source-level semantics across concrete type instances unless explicitly driven by trait implementations. | 0131 - Section 24 | - | T113 | 
 | REQ-GEN-003 | generics | v1-core | Programmers shall not write source-level type checks on generic parameters to branch on compiler specialization in v0.1. | 0131 - Section 25 | - | T113 | 
@@ -983,9 +983,9 @@
 | REQ-ASY-093 | async | v1-full | Dropping a Future shall not be assumed by the compiler to cancel external asynchronous operations, requiring cancellation to follow explicit API protocols. | 0131 - Section 62 | - | T418 |
 | REQ-ASY-094 | async | v1-full | The `?` operator inside an async function shall execute standard `Result` early-exit control flow without interacting with the async executor. | 0131 - Section 63 | - | T420 |
 | REQ-CORE-070 | functions | v1-core | Calling an `unsafe fn` shall require an explicit `unsafe` block or context while retaining full compiler enforcement of type checking, ownership, ABI correctness, and control-flow validity. | 0131 - Section 64 | - | T113 | 
-| REQ-FFI-018 | ffi | v1-full | An `extern` function declaration shall specify an explicit ABI contract defining calling convention, data representation, layout, and boundary behaviors. | 0131 - Section 65 | - | EPIC(E13.1) |
-| REQ-FFI-019 | ffi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries by default and must be converted to error codes or terminate execution according to policy. | 0131 - Section 66 | - | EPIC(E13.1) |
-| REQ-FFI-020 | ffi | v1-full | The compiler shall not infer memory allocation or deallocation domains across foreign function interfaces, requiring explicit ownership contracts. | 0131 - Section 67 | - | EPIC(E13.1) |
+| REQ-FFI-018 | ffi | v1-full | An `extern` function declaration shall specify an explicit ABI contract defining calling convention, data representation, layout, and boundary behaviors. | 0131 - Section 65 | - | T510 |
+| REQ-FFI-019 | ffi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries by default and must be converted to error codes or terminate execution according to policy. | 0131 - Section 66 | - | T521, T523, T524 |
+| REQ-FFI-020 | ffi | v1-full | The compiler shall not infer memory allocation or deallocation domains across foreign function interfaces, requiring explicit ownership contracts. | 0131 - Section 67 | - | T514 |
 | REQ-CTM-008 | comptime | v1-full | A `comptime fn` shall execute in a compile-time environment while adhering to the same type system, expression semantics, and ownership rules as runtime functions. | 0131 - Section 68 | - | EPIC(E14.1) |
 | REQ-CTM-009 | comptime | v1-full | Compile-time functions shall not leak runtime resource handles into runtime values. | 0131 - Section 69 | - | EPIC(E14.1) |
 | REQ-CORE-071 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without exposing mandatory source-level effect annotations in v0.1. | 0131 - Section 70 | - | T113 | 
@@ -997,12 +997,12 @@
 | REQ-OPT-007 | optimization | v1-full | Call optimizations such as inlining, devirtualization, and monomorphization shall preserve the distinct semantics established in typed IR. | 0131 - Section 75 | - | EPIC(E15.1) |
 | REQ-CORE-074 | functions | v1-core | Dynamic dispatch on trait objects shall use data and dispatch pointers without requiring an object header . | 0131 - Section 76 | REQ-TYP-018 | T113 | 
 | REQ-CORE-075 | functions | v1-core | Dynamic dispatch mechanisms and ownership mechanisms shall remain orthogonal, supporting both owning and non-owning dynamic trait objects . | 0131 - Section 77 | REQ-TYP-018 | T113 | 
-| REQ-ABI-058 | abi | v1-full | Source-level function signatures shall not expose machine ABI representation details. | 0131 - Section 78 | - | EPIC(E13.1) |
-| REQ-ABI-059 | abi | v1-full | The default native Axiom ABI shall not guarantee stability across compiler versions, requiring `extern "C"` for stable external interoperability. | 0131 - Section 79 | - | EPIC(E13.1) |
-| REQ-ABI-060 | abi | v1-full | Explicit ABI versioning shall be supported to provide stable inter-version Axiom ABIs. | 0131 - Section 79 | - | EPIC(E13.1) |
-| REQ-ABI-061 | abi | v1-full | The compiler shall be permitted to optimize register assignment, stack layout, and calling sequences internally as long as required boundary ABI contracts are satisfied. | 0131 - Section 80 | - | EPIC(E13.1) |
-| REQ-ABI-062 | abi | v1-full | A function value shall convert to a foreign function pointer only if its ABI is explicitly compatible. | 0131 - Section 81 | - | EPIC(E13.1) |
-| REQ-FFI-021 | ffi | v1-full | C callback adapters and trampolines for closures shall be implemented as FFI library mechanisms without injecting hidden allocations into ordinary closure semantics. | 0131 - Section 82 | - | EPIC(E13.1) |
+| REQ-ABI-058 | abi | v1-full | Source-level function signatures shall not expose machine ABI representation details. | 0131 - Section 78 | - | T500 |
+| REQ-ABI-059 | abi | v1-full | The default native Axiom ABI shall not guarantee stability across compiler versions, requiring `extern "C"` for stable external interoperability. | 0131 - Section 79 | - | T504 |
+| REQ-ABI-060 | abi | v1-full | Explicit ABI versioning shall be supported to provide stable inter-version Axiom ABIs. | 0131 - Section 79 | - | T504 |
+| REQ-ABI-061 | abi | v1-full | The compiler shall be permitted to optimize register assignment, stack layout, and calling sequences internally as long as required boundary ABI contracts are satisfied. | 0131 - Section 80 | - | T510 |
+| REQ-ABI-062 | abi | v1-full | A function value shall convert to a foreign function pointer only if its ABI is explicitly compatible. | 0131 - Section 81 | - | T500 |
+| REQ-FFI-021 | ffi | v1-full | C callback adapters and trampolines for closures shall be implemented as FFI library mechanisms without injecting hidden allocations into ordinary closure semantics. | 0131 - Section 82 | - | T504 |
 | REQ-RES-028 | closures | v1-core | Closures shall not provide special self-referential syntax in v0.1, requiring named functions or explicit storage abstractions for recursive calls. | 0131 - Section 83 | - | T113 | 
 | REQ-RES-029 | closures | v1-core | The runtime shall not provide a hidden cycle collector for closures, requiring reference cycles to be managed explicitly via abstractions like weak references or arenas. | 0131 - Section 84 | - | T113 | 
 | REQ-RES-030 | closures | v1-core | Local function value lifetimes shall be determined by semantic uses, allowing the compiler to store them in registers, on the stack, or in allocated storage via escape analysis. | 0131 - Section 85 | - | T113 | 
@@ -1041,9 +1041,9 @@
 | REQ-ASY-097 | async | v1-full | The async state machine shall own all values that remain live across suspension points [AFN-49]. | 0131 - Section 88 (AFN-49) | - | T417 |
 | REQ-ASY-098 | async | v1-full | Dropping a Future shall not imply cancellation of external asynchronous operations [AFN-50]. | 0131 - Section 88 (AFN-50) | - | T418 |
 | REQ-CORE-089 | functions | v1-core | Calling an `unsafe fn` shall require an explicit unsafe context [AFN-51] . | 0131 - Section 88 (AFN-51) | REQ-OWN-061 | T113 | 
-| REQ-FFI-022 | ffi | v1-full | Foreign function interfaces shall require explicit ABI declarations without compiler guessing [AFN-52]. | 0131 - Section 88 (AFN-52) | - | EPIC(E13.1) |
-| REQ-FFI-023 | ffi | v1-full | Axiom panics shall not cross FFI ABI boundaries by default and must be handled at the boundary [AFN-53]. | 0131 - Section 88 (AFN-53) | - | EPIC(E13.1) |
-| REQ-FFI-024 | ffi | v1-full | FFI memory allocation and deallocation domains shall be explicit without compiler assumptions [AFN-54]. | 0131 - Section 88 (AFN-54) | - | EPIC(E13.1) |
+| REQ-FFI-022 | ffi | v1-full | Foreign function interfaces shall require explicit ABI declarations without compiler guessing [AFN-52]. | 0131 - Section 88 (AFN-52) | - | T504 |
+| REQ-FFI-023 | ffi | v1-full | Axiom panics shall not cross FFI ABI boundaries by default and must be handled at the boundary [AFN-53]. | 0131 - Section 88 (AFN-53) | - | T521 |
+| REQ-FFI-024 | ffi | v1-full | FFI memory allocation and deallocation domains shall be explicit without compiler assumptions [AFN-54]. | 0131 - Section 88 (AFN-54) | - | T514 |
 | REQ-CTM-010 | comptime | v1-full | Compile-time functions shall adhere to the same type system and semantics as runtime functions without a separate type system [AFN-55]. | 0131 - Section 88 (AFN-55) | - | EPIC(E14.1) |
 | REQ-CTM-011 | comptime | v1-full | Compile-time resource handles shall not escape into runtime values [AFN-56]. | 0131 - Section 88 (AFN-56) | - | EPIC(E14.1) |
 | REQ-CORE-090 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without requiring programmer-written effect annotations in v0.1 [AFN-57]. | 0131 - Section 88 (AFN-57) | - | T113 | 
@@ -1065,8 +1065,8 @@
 | REQ-TYP-078 | types | v1-core | Compilers and programs must not infer unique storage identity from values of a Zero-Sized Type, requiring explicit handles or addresses when identity is necessary. | 0132 §11 | - | T113 |
 | REQ-TYP-079 | types | v1-core | Struct literal instantiation must explicitly initialize all mandatory fields without implicit zero-initialization, and omitting any field must produce a compile-time error. | 0132 §12, §62 (ADATA-27) | - | T113 |
 | REQ-LAY-147 | layout | v1-core | Source declaration field order does not freeze physical layout, permitting the compiler to reorder fields to optimize padding, alignment, and cache performance unless restricted by a layout contract. | 0132 §13, §62 (ADATA-29) | - | T113 | 
-| REQ-ABI-063 | abi | v1-full | Structs annotated with `@repr(C)` must freeze field order, alignment, and layout to match the target C ABI contract, prohibiting compiler optimization reordering. | 0132 §14, §62 (ADATA-30) | - | EPIC(E13.1) |
-| REQ-ABI-064 | abi | v1-full | The `@repr(transparent)` attribute guarantees ABI layout compatibility between a single-field wrapper struct and its underlying field type while maintaining a distinct nominal type identity. | 0132 §15 | - | EPIC(E13.1) |
+| REQ-ABI-063 | abi | v1-full | Structs annotated with `@repr(C)` must freeze field order, alignment, and layout to match the target C ABI contract, prohibiting compiler optimization reordering. | 0132 §14, §62 (ADATA-30) | - | T506 |
+| REQ-ABI-064 | abi | v1-full | The `@repr(transparent)` attribute guarantees ABI layout compatibility between a single-field wrapper struct and its underlying field type while maintaining a distinct nominal type identity. | 0132 §15 | - | T510 |
 | REQ-LAY-148 | layout | post-v1 | Structs annotated with `@repr(packed)` omit alignment padding, and safe field accesses must emit unaligned memory operations or require explicit unsafe operations to prevent hardware alignment faults. | 0132 §16, §62 (ADATA-31) | - | EPIC(E24.0) |
 | REQ-LAY-149 | layout | post-v1 | The `@align(N)` attribute enforces alignment contracts across all valid storage locations of the annotated type and must reject alignments impossible on the target architecture. | 0132 §17 | - | EPIC(E24.0) |
 | REQ-MOD-041 | module | v1-core | Struct fields not marked `pub` are private to their enclosing package and cannot be accessed from external packages. | 0132 §18, §62 (ADATA-28) | - | T113 | 
@@ -1107,9 +1107,9 @@
 | REQ-TYP-100 | types | v1-core | Generic type parameters are implicitly bound by `Sized` by default, requiring an explicit `?Sized` relaxation bound to permit unsized types. | 0132 §53 | - | T113 |
 | REQ-TYP-101 | types | v1-core | A `view<T>` may reference an unsized type `T` using a fat pointer containing a data pointer and type metadata or dynamic dispatch pointer. | 0132 §54 | - | T113 |
 | REQ-OWN-066 | ownership | v1-core | Field projection expressions preserve capability provenance and produce sub-region capabilities without transferring aggregate ownership. | 0132 §55, §62 (ADATA-45) | - | T113 | 
-| REQ-CAP-052 | capability | v1-full | Simultaneous mutable capabilities to disjoint struct fields may coexist without conflict because conflict is determined by memory region overlap rather than owner identity. | 0132 §56, §62 (ADATA-46) | - | EPIC(E13.1) |
-| REQ-CAP-053 | capability | v1-full | Simultaneous mutable capabilities referencing overlapping field regions must be rejected with a compile-time error. | 0132 §57 | - | EPIC(E13.1) |
-| REQ-CAP-054 | capability | v1-full | Safe code must not assume two memory regions are disjoint when disjointness cannot be proven at compile time, rejecting concurrent mutable capabilities without proof. | 0132 §58, §62 (ADATA-47) | - | EPIC(E13.1) |
+| REQ-CAP-052 | capability | v1-full | Simultaneous mutable capabilities to disjoint struct fields may coexist without conflict because conflict is determined by memory region overlap rather than owner identity. | 0132 §56, §62 (ADATA-46) | - | T500 |
+| REQ-CAP-053 | capability | v1-full | Simultaneous mutable capabilities referencing overlapping field regions must be rejected with a compile-time error. | 0132 §57 | - | T500 |
+| REQ-CAP-054 | capability | v1-full | Safe code must not assume two memory regions are disjoint when disjointness cannot be proven at compile time, rejecting concurrent mutable capabilities without proof. | 0132 §58, §62 (ADATA-47) | - | T500 |
 | REQ-TYP-102 | types | v1-core | Methods defined on structs do not introduce class hierarchies or dynamic virtual dispatch by default, enabling direct static dispatch and inlining. | 0132 §59 | - | T113 |
 | REQ-TYP-103 | types | v1-core | Implementing a trait for a struct establishes a compile-time relationship and does not automatically construct a runtime vtable. | 0132 §60 | - | T113 |
 | REQ-TYP-104 | types | v1-core | Dynamic trait dispatch and vtable representations are generated only when types are explicitly cast or stored as dynamic trait objects (`dyn Trait`) . | 0132 §61, §62 (ADATA-54) | REQ-LAY-036 | T113 |
@@ -1158,7 +1158,7 @@
 | REQ-TRT-018 | traits | v1-core | The impl Trait return type syntax MUST denote an unnamable concrete type resolved statically at compile time without dynamic dispatch or vtables. | 0133 §43, §44 | - | T113 | 
 | REQ-PAT-010 | dispatch | v1-core | Heterogeneous dynamic polymorphism MUST be explicitly declared using dyn Trait. | 0133 §45 | - | T113 | 
 | REQ-PAT-011 | dispatch | v1-core | A trait used as a dyn Trait object MUST satisfy object-safety rules including dispatchable dynamic receivers, erasable Self types, and absence of generic methods . | 0133 §46, §47 | REQ-PAT-011 | T113 | 
-| REQ-ABI-065 | abi | v1-full | Dynamic trait dispatch metadata layouts MUST NOT be treated as a stable ABI by default across compilers or compilation targets. | 0133 §48 | - | EPIC(E13.1) |
+| REQ-ABI-065 | abi | v1-full | Dynamic trait dispatch metadata layouts MUST NOT be treated as a stable ABI by default across compilers or compilation targets. | 0133 §48 | - | T510 |
 | REQ-PAT-012 | dispatch | v1-core | Dynamic trait capabilities MUST support distinct ownership models including owned (Box<dyn Trait>) and borrowed (view<dyn Trait>) representations. | 0133 §49 | - | T113 | 
 | REQ-PAT-013 | dispatch | v1-core | Dynamic trait dispatch MUST NOT mandate heap allocation and MUST support stack, static, or arena storage via view capabilities. | 0133 §50, §51 | - | T113 | 
 | REQ-PAT-014 | dispatch | v1-core | The compiler MAY devirtualize a dyn Trait call to a direct call when exactly one implementation is provably viable and observable semantics are preserved . | 0133 §52 | REQ-PAT-009 | T113 | 
@@ -1174,9 +1174,9 @@
 | REQ-TRT-025 | traits | v1-core | Public trait implementations MUST be included in a package's public semantic interface fingerprint. | 0133 §65 | - | T113 | 
 | REQ-CORE-097 | methods | v1-core | Replacing or monkey-patching methods of existing types across package boundaries MUST NOT be permitted. | 0133 §66 | - | T113 | 
 | REQ-TYP-107 | types | v1-core | Customization or reuse of existing type behavior MUST be achieved through newtypes, wrappers, or composition rather than class inheritance. | 0133 §67, §68 | - | T113 |
-| REQ-ABI-066 | abi | v1-full | Dynamic trait types (dyn Trait) MUST NOT be passed directly across extern C boundaries without explicit C ABI wrappers or function tables. | 0133 §69, §70 | - | EPIC(E13.1) |
+| REQ-ABI-066 | abi | v1-full | Dynamic trait types (dyn Trait) MUST NOT be passed directly across extern C boundaries without explicit C ABI wrappers or function tables. | 0133 §69, §70 | - | T503 |
 | REQ-TRT-026 | traits | v1-core | Trait implementations wrapping FFI resources MUST explicitly define and enforce ownership and resource safety contracts. | 0133 §71 | - | T113 | 
-| REQ-ABI-067 | abi | v1-full | Generic functions MUST NOT be exported directly as uninstantiated native ABI symbols. | 0133 §72 | - | EPIC(E13.1) |
+| REQ-ABI-067 | abi | v1-full | Generic functions MUST NOT be exported directly as uninstantiated native ABI symbols. | 0133 §72 | - | T504 |
 | REQ-TRT-027 | traits | v1-core | Implementation inheritance between structs MUST NOT be supported. | 0133 §77 | - | T113 | 
 | REQ-TRT-028 | traits | v1-core | Trait bounds and dispatch mechanisms MUST remain orthogonal to value ownership semantics. | 0133 §78 | - | T113 | 
 | REQ-TRT-029 | traits | v1-core | Trait resolution and capability analysis MUST NOT introduce programmer-written lifetime annotations. | 0133 §79 | - | T113 | 
@@ -1210,7 +1210,7 @@
 | REQ-PAT-018 | dispatch | v1-core | Dynamic trait dispatch MUST NOT imply or require heap allocation (ATRAIT-40). | 0133 §87 | - | T113 | 
 | REQ-PAT-019 | dispatch | v1-core | Ownership semantics and trait dispatch mechanisms MUST be orthogonal (ATRAIT-41). | 0133 §87 | - | T113 | 
 | REQ-PAT-020 | dispatch | v1-core | Traits utilized in dyn Trait dynamic dispatch MUST satisfy object-safety rules (ATRAIT-42) . | 0133 §87 | REQ-PAT-011 | T113 | 
-| REQ-ABI-068 | abi | v1-full | Internal dynamic trait object representation MUST NOT be treated as a stable ABI by default (ATRAIT-43). | 0133 §87 | - | EPIC(E13.1) |
+| REQ-ABI-068 | abi | v1-full | Internal dynamic trait object representation MUST NOT be treated as a stable ABI by default (ATRAIT-43). | 0133 §87 | - | T500 |
 | REQ-TRT-045 | traits | v1-core | Operator resolution MUST be based on trait implementations or compiler intrinsics without hidden overload mechanisms (ATRAIT-44). | 0133 §87 | - | T113 | 
 | REQ-TRT-046 | traits | v1-core | Implicit type conversions MUST NOT be utilized to resolve trait resolution ambiguity (ATRAIT-45). | 0133 §87 | - | T113 | 
 | REQ-CORE-099 | methods | v1-core | Extension methods MUST only extend name resolution and MUST NOT mutate type identity or storage layout (ATRAIT-46). | 0133 §87 | - | T113 | 
@@ -1386,48 +1386,48 @@
 | REQ-CORE-127 | unsafe | v1-core | ### aunsafe-55 — undefined unsafe preconditions must not be used as safe program assumptions | 0137 §78. Invariants chính thức | - | T113 | 
 | REQ-CORE-128 | unsafe | v1-core | Unsafe code has thể make all thứ needs thiết ở tầng hệ thống, but safe code is not gánh complexity of tầng that. | 0137 §Kết quả quan trọng của Part XVIII | - | T113 | 
 | REQ-CORE-129 | unsafe | v1-core | - `extern "c"` - c structs - c enums - unions - function pointers - callbacks - variadic functions - abi ownership - allocator boundary - string/bytes boundary - error boundary - panic boundary - thread boundary - `dyn trait` must not leak nhầm qua c abi - generic must not leak nhầm qua stable abi - `@repr(c)` - symbol export - import/export - static/dynamic linking - calling convention - platform abi - c header generation - axiom api gọi from c - c api gọi vào axiom - and đặc biệt: make thế nào to axiom cuối cùng tự build native binary mà not needs c compiler. | 0137 §Part XIX — FFI · ABI · C Interop · Foreign Ownership | - | T113 | 
-| REQ-FFI-025 | ffi | v1-full | Abi is biên giới of machine contract, is not biên giới of type system. | 0138 §Part XIX — FFI · ABI · C Interop · Foreign Ownership | - | EPIC(E13.1) |
-| REQ-FFI-026 | ffi | v1-full | Axiom must gọi is c/os/native library, đồng thời for phép c gọi ngược vào axiom, but must not to abi make rò rỉ the semantic machinery như ownership, generic, trait solver hay compiler lifetime. | 0138 §Part XIX — FFI · ABI · C Interop · Foreign Ownership | - | EPIC(E13.1) |
-| REQ-FFI-027 | ffi | v1-full | Then declaration/wrapper must encode boundary. | 0138 §6. Foreign function có thể yêu cầu unsafe | - | EPIC(E13.1) |
-| REQ-FFI-028 | ffi | v1-full | Do that axiom must not giả định c function tự hiểu ownership. | 0138 §7. C ABI không hiểu ownership | - | EPIC(E13.1) |
-| REQ-FFI-029 | ffi | v1-full | Compiler must not reorder fields to tối ưu layout. | 0138 §10. `@repr(C)` | - | EPIC(E13.1) |
-| REQ-FFI-030 | ffi | v1-full | Axiom must not hardcode assumption. | 0138 §16. C integer width | - | EPIC(E13.1) |
-| REQ-FFI-031 | ffi | v1-full | Must not automatically coi toàn bộ struct memory is meaningful bytes. | 0138 §19. Padding | - | EPIC(E13.1) |
-| REQ-FFI-032 | ffi | v1-full | Representation must be determine according to abi contract. | 0138 §22. C-compatible enum | - | EPIC(E13.1) |
-| REQ-FFI-033 | ffi | v1-full | Axiom safe enum must not automatically chấp nhận arbitrary discriminant. | 0138 §23. C enum unknown values | - | EPIC(E13.1) |
-| REQ-FFI-034 | ffi | v1-full | Compiler must generate đúng calling convention. | 0138 §28. Callback | - | EPIC(E13.1) |
-| REQ-FFI-035 | ffi | v1-full | Ownership of context must explicit. | 0138 §30. Callback + userdata | - | EPIC(E13.1) |
-| REQ-FFI-036 | ffi | v1-full | Then axiom must not for phép closure environment chết in when c still keep pointer. | 0138 §31. Closure callback lifetime | - | EPIC(E13.1) |
-| REQ-FFI-037 | ffi | v1-full | Axiom wrapper must biết contract. | 0138 §32. Foreign callbacks và thread | - | EPIC(E13.1) |
-| REQ-FFI-038 | ffi | v1-full | But call boundary must is unsafe/system-level. | 0138 §34. Variadic C functions | - | EPIC(E13.1) |
-| REQ-FFI-039 | ffi | v1-full | Axiom must not tự copy or own. | 0138 §39. C string output | - | EPIC(E13.1) |
-| REQ-FFI-040 | ffi | v1-full | Is not global ordinary variable. | 0138 §42. `errno` | - | EPIC(E13.1) |
-| REQ-FFI-041 | ffi | v1-full | Must not default unwind qua c. | 0138 §44. Panic không được vượt C ABI | - | EPIC(E13.1) |
-| REQ-FFI-042 | ffi | v1-full | But export surface must explicit. | 0138 §53. Dynamic library | - | EPIC(E13.1) |
-| REQ-FFI-043 | ffi | v1-full | But layout is not c abi. | 0138 §57. `dyn Trait` ABI | - | EPIC(E13.1) |
-| REQ-FFI-044 | ffi | v1-full | But exclusive access guarantee must be ensure ở axiom boundary. | 0138 §64. Mutable view qua C | - | EPIC(E13.1) |
-| REQ-FFI-045 | ffi | v1-full | Do that ffi borrowing apis must explicit. | 0138 §64. Mutable view qua C | - | EPIC(E13.1) |
-| REQ-FFI-046 | ffi | v1-full | Representation freedom ends at abi boundary. | 0138 §66. ABI boundary đóng băng representation | - | EPIC(E13.1) |
-| REQ-FFI-047 | ffi | v1-full | But must not change observable abi representation. | 0138 §67. ABI và optimization | - | EPIC(E13.1) |
-| REQ-FFI-048 | ffi | v1-full | If abi declaration not biết, default must conservative. | 0138 §69. FFI is not a compiler escape from semantics | - | EPIC(E13.1) |
-| REQ-FFI-049 | ffi | v1-full | Compiler/runtime must hỗ trợ if abi contract for phép. | 0138 §75. Reentrancy | - | EPIC(E13.1) |
-| REQ-FFI-050 | ffi | v1-full | But callback must have ownership/context hợp lệ. | 0138 §75. Reentrancy | - | EPIC(E13.1) |
-| REQ-FFI-051 | ffi | v1-full | Axiom runtime must not bắt buộc a global runtime only to callback tồn at. | 0138 §76. Foreign thread enters Axiom | - | EPIC(E13.1) |
-| REQ-FFI-052 | ffi | v1-full | Must not hidden global constructor. | 0138 §77. Runtime registration | - | EPIC(E13.1) |
-| REQ-FFI-053 | ffi | v1-full | Compiler ast/abi model must is source of truth. | 0138 §80. C header generation | - | EPIC(E13.1) |
-| REQ-FFI-054 | ffi | v1-full | This is library/api design, is not core language magic. | 0138 §87. Struct extension | - | EPIC(E13.1) |
-| REQ-FFI-055 | ffi | v1-full | Not nhất thiết programmer must viết tất cả bằng annotation. | 0138 §97. FFI contract summary | - | EPIC(E13.1) |
-| REQ-FFI-056 | ffi | v1-full | ### affi-23 — stable external abi must be explicit | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-057 | ffi | v1-full | ### affi-26 — foreign ownership must be explicitly wrapped | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-058 | ffi | v1-full | ### affi-27 — foreign allocation domains must not be mixed | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-059 | ffi | v1-full | ### affi-30 — generic types must not leak unresolved representation across stable abi | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-060 | ffi | v1-full | ### affi-35 — callback environment lifetime must be explicit | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-061 | ffi | v1-full | ### affi-41 — panic must not cross c abi by default | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-062 | ffi | v1-full | ### affi-59 — abi versioning must be explicit | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-063 | ffi | v1-full | ### affi-60 — calling convention must match target abi | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-064 | ffi | v1-full | ### affi-62 — foreign functions must not be granted stronger semantics than their contract | 0138 §100. Invariants chính thức | - | EPIC(E13.1) |
-| REQ-FFI-065 | ffi | v1-full | Safe axiom → explicit unsafe → explicit abi → native machine contract. | 0138 §Trạng thái sau Part XIX | - | EPIC(E13.1) |
-| REQ-FFI-066 | ffi | v1-full | A semantic model of axiom, nhiều execution domains — not create out a “ngôn ngữ gpu thứ hai”. | 0138 §Part XX — GPU · Accelerator · Device Memory · Kernel | - | EPIC(E13.1) |
+| REQ-FFI-025 | ffi | v1-full | Abi is biên giới of machine contract, is not biên giới of type system. | 0138 §Part XIX — FFI · ABI · C Interop · Foreign Ownership | - | T504 |
+| REQ-FFI-026 | ffi | v1-full | Axiom must gọi is c/os/native library, đồng thời for phép c gọi ngược vào axiom, but must not to abi make rò rỉ the semantic machinery như ownership, generic, trait solver hay compiler lifetime. | 0138 §Part XIX — FFI · ABI · C Interop · Foreign Ownership | - | T504 |
+| REQ-FFI-027 | ffi | v1-full | Then declaration/wrapper must encode boundary. | 0138 §6. Foreign function có thể yêu cầu unsafe | - | T502 |
+| REQ-FFI-028 | ffi | v1-full | Do that axiom must not giả định c function tự hiểu ownership. | 0138 §7. C ABI không hiểu ownership | - | T504 |
+| REQ-FFI-029 | ffi | v1-full | Compiler must not reorder fields to tối ưu layout. | 0138 §10. `@repr(C)` | - | T510 |
+| REQ-FFI-030 | ffi | v1-full | Axiom must not hardcode assumption. | 0138 §16. C integer width | - | T505 |
+| REQ-FFI-031 | ffi | v1-full | Must not automatically coi toàn bộ struct memory is meaningful bytes. | 0138 §19. Padding | - | T509 |
+| REQ-FFI-032 | ffi | v1-full | Representation must be determine according to abi contract. | 0138 §22. C-compatible enum | - | T504 |
+| REQ-FFI-033 | ffi | v1-full | Axiom safe enum must not automatically chấp nhận arbitrary discriminant. | 0138 §23. C enum unknown values | - | T505 |
+| REQ-FFI-034 | ffi | v1-full | Compiler must generate đúng calling convention. | 0138 §28. Callback | - | T504 |
+| REQ-FFI-035 | ffi | v1-full | Ownership of context must explicit. | 0138 §30. Callback + userdata | - | T504 |
+| REQ-FFI-036 | ffi | v1-full | Then axiom must not for phép closure environment chết in when c still keep pointer. | 0138 §31. Closure callback lifetime | - | T504 |
+| REQ-FFI-037 | ffi | v1-full | Axiom wrapper must biết contract. | 0138 §32. Foreign callbacks và thread | - | T504 |
+| REQ-FFI-038 | ffi | v1-full | But call boundary must is unsafe/system-level. | 0138 §34. Variadic C functions | - | T502 |
+| REQ-FFI-039 | ffi | v1-full | Axiom must not tự copy or own. | 0138 §39. C string output | - | T504 |
+| REQ-FFI-040 | ffi | v1-full | Is not global ordinary variable. | 0138 §42. `errno` | - | T505 |
+| REQ-FFI-041 | ffi | v1-full | Must not default unwind qua c. | 0138 §44. Panic không được vượt C ABI | - | T521, T522 |
+| REQ-FFI-042 | ffi | v1-full | But export surface must explicit. | 0138 §53. Dynamic library | - | T533 |
+| REQ-FFI-043 | ffi | v1-full | But layout is not c abi. | 0138 §57. `dyn Trait` ABI | - | T510 |
+| REQ-FFI-044 | ffi | v1-full | But exclusive access guarantee must be ensure ở axiom boundary. | 0138 §64. Mutable view qua C | - | T502 |
+| REQ-FFI-045 | ffi | v1-full | Do that ffi borrowing apis must explicit. | 0138 §64. Mutable view qua C | - | T502 |
+| REQ-FFI-046 | ffi | v1-full | Representation freedom ends at abi boundary. | 0138 §66. ABI boundary đóng băng representation | - | T504 |
+| REQ-FFI-047 | ffi | v1-full | But must not change observable abi representation. | 0138 §67. ABI và optimization | - | T504 |
+| REQ-FFI-048 | ffi | v1-full | If abi declaration not biết, default must conservative. | 0138 §69. FFI is not a compiler escape from semantics | - | T504 |
+| REQ-FFI-049 | ffi | v1-full | Compiler/runtime must hỗ trợ if abi contract for phép. | 0138 §75. Reentrancy | - | T504 |
+| REQ-FFI-050 | ffi | v1-full | But callback must have ownership/context hợp lệ. | 0138 §75. Reentrancy | - | T504 |
+| REQ-FFI-051 | ffi | v1-full | Axiom runtime must not bắt buộc a global runtime only to callback tồn at. | 0138 §76. Foreign thread enters Axiom | - | T504 |
+| REQ-FFI-052 | ffi | v1-full | Must not hidden global constructor. | 0138 §77. Runtime registration | - | T504 |
+| REQ-FFI-053 | ffi | v1-full | Compiler ast/abi model must is source of truth. | 0138 §80. C header generation | - | T504 |
+| REQ-FFI-054 | ffi | v1-full | This is library/api design, is not core language magic. | 0138 §87. Struct extension | - | T504 |
+| REQ-FFI-055 | ffi | v1-full | Not nhất thiết programmer must viết tất cả bằng annotation. | 0138 §97. FFI contract summary | - | T505 |
+| REQ-FFI-056 | ffi | v1-full | ### affi-23 — stable external abi must be explicit | 0138 §100. Invariants chính thức | - | T504 |
+| REQ-FFI-057 | ffi | v1-full | ### affi-26 — foreign ownership must be explicitly wrapped | 0138 §100. Invariants chính thức | - | T505 |
+| REQ-FFI-058 | ffi | v1-full | ### affi-27 — foreign allocation domains must not be mixed | 0138 §100. Invariants chính thức | - | T514 |
+| REQ-FFI-059 | ffi | v1-full | ### affi-30 — generic types must not leak unresolved representation across stable abi | 0138 §100. Invariants chính thức | - | T504 |
+| REQ-FFI-060 | ffi | v1-full | ### affi-35 — callback environment lifetime must be explicit | 0138 §100. Invariants chính thức | - | T504 |
+| REQ-FFI-061 | ffi | v1-full | ### affi-41 — panic must not cross c abi by default | 0138 §100. Invariants chính thức | - | T521 |
+| REQ-FFI-062 | ffi | v1-full | ### affi-59 — abi versioning must be explicit | 0138 §100. Invariants chính thức | - | T504 |
+| REQ-FFI-063 | ffi | v1-full | ### affi-60 — calling convention must match target abi | 0138 §100. Invariants chính thức | - | T504 |
+| REQ-FFI-064 | ffi | v1-full | ### affi-62 — foreign functions must not be granted stronger semantics than their contract | 0138 §100. Invariants chính thức | - | T505 |
+| REQ-FFI-065 | ffi | v1-full | Safe axiom → explicit unsafe → explicit abi → native machine contract. | 0138 §Trạng thái sau Part XIX | - | T504 |
+| REQ-FFI-066 | ffi | v1-full | A semantic model of axiom, nhiều execution domains — not create out a “ngôn ngữ gpu thứ hai”. | 0138 §Part XX — GPU · Accelerator · Device Memory · Kernel | - | T515 |
 | REQ-GPU-006 | gpu | post-v1 | One language semantics, many execution domains. | 0139 §# Part XX — GPU · Accelerator · Device Memory · Kernel | - | EPIC(E22.3) |
 | REQ-GPU-007 | gpu | post-v1 | - gpu kernel is axiom function has ràng buộc execution domain. - not needs ngôn ngữ kernel riêng. - ownership/view still has ý nghĩa trên gpu. - host ↔ device transfer must explicit. - not for kernel vô tình keep reference tới host memory. - not to gpu operation đang run is hủy tài nguyên a way unsafe. - gpu synchronization tích hợp with memory model. - gpu atomics dùng cùng semantics with cpu atomics, bổ sung scope. - compiler has thể optimize/fuse/vectorize/kernel-specialize. - not bắt buộc cuda/opencl runtime. - axiom has thể target cuda/ptx, spir-v, metal, vulkan, directx, rocm/amdgcn... thông qua backend. - has thể mở rộng sang npu/dsp/accelerator mà not sửa semantic core. | 0139 §XX.1. Mục tiêu | - | EPIC(E22.3) |
 | REQ-GPU-008 | gpu | post-v1 | `@kernel` is not magic runtime. | 0139 §XX.2. Execution Domain | - | EPIC(E22.3) |
@@ -1610,7 +1610,7 @@
 | REQ-CNF-005 | conformance | v1-core | Undefined unsafe behavior MUST be considered outside conformance semantics, and the Oracle MUST report it as UNDEFINED_UNSAFE. | 0150 §12 | - | T113 | 
 | REQ-CNF-006 | conformance | v1-core | The compiler MUST NOT crash when processing valid, invalid, or boundary programs generated by fuzzing, excluding well-defined internal compiler errors. | 0150 §25 | - | T113 | 
 | REQ-CORE-145 | library | v1-core | The reserve method on a collection MUST NOT provide a stable-address guarantee for the collection storage. | 0151 §4 | - | T113 | 
-|REQ-CAP-055|capability|v1-full|The validity of a program under capability semantics MUST NOT change based on the optimization level.|0151 §5|-|EPIC(E13.1)|
+|REQ-CAP-055|capability|v1-full|The validity of a program under capability semantics MUST NOT change based on the optimization level.|0151 §5|-|T500|
 | REQ-OWN-067 | ownership | v1-core | The implementation of a user-defined Drop MUST NOT propagate a second recoverable failure if an unwind is already in progress. | 0151 §9 | - | T113 | 
 | REQ-TYP-108 | types | v1-core | The compiler MUST automatically derive Send and Share traits based on the semantic capabilities of all fields, without allowing user-defined negative implementations. | 0151 §15 | - | T113 |
 | REQ-CORE-146 | compiler | v1-full | The bootstrap compiler implementation MUST NOT leak the semantics of its host language into the semantics of Axiom. | 0152 §5 | - | EPIC(E18.1) |
@@ -2040,7 +2040,7 @@
 | REQ-CORE-192 | control-flow | v1-core | The try operator (`?`) MUST lower to discriminant inspection and explicit conditional return without hidden stack unwinding. | 0159 §50. ? không phải exception | - | T113 | 
 | REQ-OWN-070 | ownership | v1-core | An early return induced by the try operator (`?`) MUST execute deterministic cleanup of all active local resources before returning. | 0159 §51. ? và Drop | - | T113 | 
 |REQ-ASY-139|async|v1-full|The `.await` expression MUST verify that the operand satisfies the Future trait relation and evaluate to the Future's output type .|0159 §52. await|-|T416|
-| REQ-CAP-056 | capability | v1-full | View types (`view<T>` and `mut_view<T>`) MUST NOT remain live across suspension points (`.await`) . | 0159 §53. View không được qua await | REQ-TRT-029 | EPIC(E13.1) |
+| REQ-CAP-056 | capability | v1-full | View types (`view<T>` and `mut_view<T>`) MUST NOT remain live across suspension points (`.await`) . | 0159 §53. View không được qua await | REQ-TRT-029 | T501 |
 | REQ-ASY-140 | async | v1-full | Owned values MAY cross suspension points (`.await`) by becoming fields in the compiler-generated async state machine. | 0159 §54. Owned value được qua await | - | T418 |
 | REQ-MIR-037 | hir | v1-core | A closure expression MUST be represented in Typed HIR with a unique ClosureId, parameters, body, capture candidates, and function type. | 0159 §55. Closure | - | T113 | 
 | REQ-OWN-071 | ownership | v1-core | Typed HIR MUST record capture candidates for closures, with capture modes (Read, Mutable, Move) finalized by subsequent ownership analysis . | 0159 §56. Closure capture | REQ-GRM-011 | T113 | 
@@ -2073,7 +2073,7 @@
 | REQ-TYP-292 | types | v1-core | Try expressions MUST preserve Result or Option semantics (ATHIR-38) . | 0159 §66. Typed HIR invariant | REQ-TYP-282 | T113 |
 |REQ-ASY-142|async|v1-full|Await expressions MUST preserve Future semantics (ATHIR-39) .|0159 §66. Typed HIR invariant|-|T419|
 | REQ-OWN-073 | ownership | v1-core | Typed HIR MUST NOT perform ownership verification (ATHIR-40). | 0159 §66. Typed HIR invariant | - | T113 | 
-| REQ-CAP-057 | capability | v1-full | Typed HIR MUST NOT perform capability verification (ATHIR-41). | 0159 §66. Typed HIR invariant | - | EPIC(E13.1) |
+| REQ-CAP-057 | capability | v1-full | Typed HIR MUST NOT perform capability verification (ATHIR-41). | 0159 §66. Typed HIR invariant | - | T500 |
 | REQ-CORE-200 | compiler | v1-full | Typed HIR MUST NOT perform physical storage allocation (ATHIR-42). | 0159 §66. Typed HIR invariant | - | EPIC(E18.1) |
 | REQ-MIR-046 | hir | v1-core | Typed HIR MUST remain immutable after semantic completion (ATHIR-43). | 0159 §66. Typed HIR invariant | - | T113 | 
 | REQ-TYP-293 | types | v1-core | Every expression MUST have exactly one semantic type (AEXPR-20). | 0159 §67. Expression semantic invariants | - | T113 |
@@ -2086,7 +2086,7 @@
 | REQ-CORE-204 | compiler | v1-full | Compiler optimizations MUST NOT alter expression semantics (AEXPR-27). | 0159 §67. Expression semantic invariants | - | EPIC(E18.1) |
 | REQ-CORE-205 | control-flow | v1-core | Control-flow expressions MUST preserve their declared result semantics (AEXPR-28). | 0159 §67. Expression semantic invariants | - | T113 | 
 | REQ-OWN-074 | ownership | v1-core | Place expressions MUST preserve their identity for later ownership analysis (AEXPR-29). | 0159 §67. Expression semantic invariants | - | T113 | 
-| REQ-CAP-058 | capability | v1-full | Value expressions MUST NOT implicitly create persistent capabilities (AEXPR-30). | 0159 §67. Expression semantic invariants | - | EPIC(E13.1) |
+| REQ-CAP-058 | capability | v1-full | Value expressions MUST NOT implicitly create persistent capabilities (AEXPR-30). | 0159 §67. Expression semantic invariants | - | T500 |
 | REQ-OWN-075 | ownership | v1-core | The compiler MUST synthesize ownership states and capability graphs from Typed HIR without requiring programmer-written lifetime or borrow annotations . | 0159 §69. Frontend semantic freeze | REQ-TRT-029 | T113 | 
 | REQ-OWN-076 | ownership | v1-core | The ownership analyzer MUST operate as a semantic dataflow analyzer on Typed HIR without requiring programmer-specified lifetime annotations. | 0160 §1 | - | T113 | 
 | REQ-OWN-077 | ownership | v1-core | The compiler MUST separate semantic ownership states (UNINIT, OWNED, PARTIAL, MOVED, DROPPED) from dataflow analysis states (MAYBE_UNINIT, MAYBE_OWNED, MAYBE_MOVED). | 0160 §2 | - | T113 | 
@@ -2101,25 +2101,25 @@
 | REQ-OWN-086 | ownership | v1-core | Assigning to a previously moved variable MUST transition its place to OWNED and restore it for subsequent use. | 0160 §10 | - | T113 | 
 | REQ-OWN-087 | ownership | v1-core | Moving a field out of a composite value MUST transition the field to MOVED and the container to PARTIAL while preserving OWNED status for unmoved fields. | 0160 §11 | - | T113 | 
 | REQ-OWN-088 | ownership | v1-core | Partial moves out of any type implementing a user-defined Drop MUST be forbidden. | 0160 §12 | - | T113 | 
-| REQ-CAP-059 | capability | v1-full | A view MUST be represented semantically as a Capability containing provenance, region, access permission, and validity duration. | 0160 §13 | - | EPIC(E13.1) |
-| REQ-CAP-060 | capability | v1-full | A view<T> capability MUST grant read-only access and MAY be duplicated without being considered a Copy type. | 0160 §14 | - | EPIC(E13.1) |
-| REQ-CAP-061 | capability | v1-full | A mut_view<T> capability MUST grant exclusive write access and MUST NOT be duplicated, requiring move semantics upon transfer. | 0160 §14 | - | EPIC(E13.1) |
-| REQ-CAP-062 | capability | v1-full | The compiler MUST reject simultaneous active capabilities over overlapping regions if at least one capability requires WRITE, MOVE, or DROP access. | 0160 §15 | - | EPIC(E13.1) |
-| REQ-CAP-063 | capability | v1-full | The region algebra MUST evaluate relationships as SAME, DISJOINT, CONTAINS, CONTAINED_BY, OVERLAPS, or UNKNOWN, permitting concurrent mutable views over provably disjoint regions. | 0160 §16 | - | EPIC(E13.1) |
-| REQ-CAP-064 | capability | v1-full | When region overlap is UNKNOWN, the compiler MUST NOT assume regions are disjoint and MUST reject conflicting mutable capabilities with diagnostic AX_VIEW_0001. | 0160 §17 | - | EPIC(E13.1) |
-| REQ-CAP-065 | capability | v1-full | The compiler MUST permit implicit conversion from an owner to an ephemeral view capability only when the compiler proves the capability does not escape. | 0160 §18 | - | EPIC(E13.1) |
-| REQ-CAP-066 | capability | v1-full | Binding a persistent view to a variable MUST require explicit capability construction via view(...). | 0160 §18 | - | EPIC(E13.1) |
-| REQ-CAP-067 | capability | v1-full | An owner MUST NOT be dropped, moved, or relocated while any capability dependent on its storage remains live. | 0160 §19 | - | EPIC(E13.1) |
-| REQ-CAP-068 | capability | v1-full | Collection operations that may relocate backing storage MUST be rejected if any live capability points into the collection. | 0160 §20 | - | EPIC(E13.1) |
+| REQ-CAP-059 | capability | v1-full | A view MUST be represented semantically as a Capability containing provenance, region, access permission, and validity duration. | 0160 §13 | - | T502 |
+| REQ-CAP-060 | capability | v1-full | A view<T> capability MUST grant read-only access and MAY be duplicated without being considered a Copy type. | 0160 §14 | - | T500 |
+| REQ-CAP-061 | capability | v1-full | A mut_view<T> capability MUST grant exclusive write access and MUST NOT be duplicated, requiring move semantics upon transfer. | 0160 §14 | - | T501 |
+| REQ-CAP-062 | capability | v1-full | The compiler MUST reject simultaneous active capabilities over overlapping regions if at least one capability requires WRITE, MOVE, or DROP access. | 0160 §15 | - | T501 |
+| REQ-CAP-063 | capability | v1-full | The region algebra MUST evaluate relationships as SAME, DISJOINT, CONTAINS, CONTAINED_BY, OVERLAPS, or UNKNOWN, permitting concurrent mutable views over provably disjoint regions. | 0160 §16 | - | T500 |
+| REQ-CAP-064 | capability | v1-full | When region overlap is UNKNOWN, the compiler MUST NOT assume regions are disjoint and MUST reject conflicting mutable capabilities with diagnostic AX_VIEW_0001. | 0160 §17 | - | T500 |
+| REQ-CAP-065 | capability | v1-full | The compiler MUST permit implicit conversion from an owner to an ephemeral view capability only when the compiler proves the capability does not escape. | 0160 §18 | - | T501 |
+| REQ-CAP-066 | capability | v1-full | Binding a persistent view to a variable MUST require explicit capability construction via view(...). | 0160 §18 | - | T500 |
+| REQ-CAP-067 | capability | v1-full | An owner MUST NOT be dropped, moved, or relocated while any capability dependent on its storage remains live. | 0160 §19 | - | T501 |
+| REQ-CAP-068 | capability | v1-full | Collection operations that may relocate backing storage MUST be rejected if any live capability points into the collection. | 0160 §20 | - | T500 |
 | REQ-TYP-297 | types | v1-core | The reserve method on a collection MUST guarantee capacity according to collection contract but MUST NOT guarantee a stable memory address. | 0160 §21 | - | T113 |
-| REQ-CAP-069 | capability | v1-full | Escape analysis MUST reject capabilities or references that outlive their owner across return, static storage, or heap escape boundaries. | 0160 §22 | - | EPIC(E13.1) |
+| REQ-CAP-069 | capability | v1-full | Escape analysis MUST reject capabilities or references that outlive their owner across return, static storage, or heap escape boundaries. | 0160 §22 | - | T501 |
 | REQ-OWN-089 | ownership | v1-core | Closure capture analysis MUST infer the minimal required capability (READ, MUT, or MOVE) according to variable usage within the closure body. | 0160 §23 | - | T113 | 
 | REQ-OWN-090 | ownership | v1-core | A closure marked with move MUST take ownership of captured variables, transferring them into the closure environment. | 0160 §24 | - | T113 | 
-| REQ-CAP-070 | capability | v1-full | Neither view<T> nor mut_view<T> capabilities MUST cross an .await suspension boundary. | 0160 §25 | - | EPIC(E13.1) |
+| REQ-CAP-070 | capability | v1-full | Neither view<T> nor mut_view<T> capabilities MUST cross an .await suspension boundary. | 0160 §25 | - | T501 |
 | REQ-CONC-129 | concurrency | v1-full | Spawning a multi-threaded task MUST require captured values to implement Send, emitting diagnostic AX_SEND_0001 if unsatisfied. | 0160 §26 | - | T402 |
 | REQ-CONC-130 | concurrency | v1-full | Spawning a thread-local task (spawn_local) MUST NOT require captured values to implement Send. | 0160 §26 | - | T421 |
 | REQ-CONC-131 | concurrency | v1-full | The compiler MUST treat Send (ownership transfer across contexts) and Share (safe concurrent sharing) as distinct semantic properties. | 0160 §27 | - | T400 |
-| REQ-CAP-071 | capability | v1-full | Capabilities originating from unsafe blocks MUST establish trusted preconditions and remain subject to normal capability conflict verification. | 0160 §28 | - | EPIC(E13.1) |
+| REQ-CAP-071 | capability | v1-full | Capabilities originating from unsafe blocks MUST establish trusted preconditions and remain subject to normal capability conflict verification. | 0160 §28 | - | T502 |
 | REQ-DRP-032 | drop | v1-core | Drop analysis MUST be performed after ownership analysis, dropping live local variables in reverse declaration order by default. | 0160 §29 | - | T113 | 
 | REQ-DRP-033 | drop | v1-core | The compiler MUST automatically emit drop cleanup operations for live variables along all early return and exit paths. | 0160 §30 | - | T113 | 
 | REQ-DRP-034 | drop | v1-core | Dropping a partially moved composite value MUST only drop unmoved fields and MUST NOT drop fields that have already been moved. | 0160 §31 | - | T113 | 
@@ -2142,17 +2142,17 @@
 | REQ-OWN-099 | ownership | v1-core | A partial move MUST preserve ownership of all unmoved fields (AOWN-38). | 0160 §40 | - | T113 | 
 | REQ-OWN-100 | ownership | v1-core | User-defined Drop implementations MUST forbid invalid partial moves (AOWN-39). | 0160 §40 | - | T113 | 
 | REQ-OWN-101 | ownership | v1-core | Ownership analysis MUST be path-sensitive at control-flow joins (AOWN-40). | 0160 §40 | - | T113 | 
-| REQ-CAP-072 | capability | v1-full | A view<T> capability MUST be read-only (ACAP-40). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-073 | capability | v1-full | A mut_view<T> capability MUST be an exclusive write capability (ACAP-41). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-074 | capability | v1-full | Simultaneous active READ and READ capabilities over overlapping regions MUST be permitted (ACAP-42). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-075 | capability | v1-full | Conflicting READ and WRITE capabilities over overlapping regions MUST be rejected (ACAP-43). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-076 | capability | v1-full | Conflicting WRITE and WRITE capabilities over overlapping regions MUST be rejected (ACAP-44). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-077 | capability | v1-full | Regions with UNKNOWN overlap MUST NOT be assumed to be disjoint (ACAP-45). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-078 | capability | v1-full | Capability validity MUST depend on the validity of its provenance (ACAP-46). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-079 | capability | v1-full | A capability MUST NOT transfer ownership of its referent (ACAP-47). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-080 | capability | v1-full | An owner MUST NOT invalidate a live capability referencing its storage (ACAP-48). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-081 | capability | v1-full | Storage relocation MUST NOT invalidate a live capability referencing that storage (ACAP-49). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-082 | capability | v1-full | Persistent views MUST require explicit capability construction (ACAP-50). | 0160 §40 | - | EPIC(E13.1) |
+| REQ-CAP-072 | capability | v1-full | A view<T> capability MUST be read-only (ACAP-40). | 0160 §40 | - | T500 |
+| REQ-CAP-073 | capability | v1-full | A mut_view<T> capability MUST be an exclusive write capability (ACAP-41). | 0160 §40 | - | T501 |
+| REQ-CAP-074 | capability | v1-full | Simultaneous active READ and READ capabilities over overlapping regions MUST be permitted (ACAP-42). | 0160 §40 | - | T500 |
+| REQ-CAP-075 | capability | v1-full | Conflicting READ and WRITE capabilities over overlapping regions MUST be rejected (ACAP-43). | 0160 §40 | - | T500 |
+| REQ-CAP-076 | capability | v1-full | Conflicting WRITE and WRITE capabilities over overlapping regions MUST be rejected (ACAP-44). | 0160 §40 | - | T500 |
+| REQ-CAP-077 | capability | v1-full | Regions with UNKNOWN overlap MUST NOT be assumed to be disjoint (ACAP-45). | 0160 §40 | - | T500 |
+| REQ-CAP-078 | capability | v1-full | Capability validity MUST depend on the validity of its provenance (ACAP-46). | 0160 §40 | - | T502 |
+| REQ-CAP-079 | capability | v1-full | A capability MUST NOT transfer ownership of its referent (ACAP-47). | 0160 §40 | - | T500 |
+| REQ-CAP-080 | capability | v1-full | An owner MUST NOT invalidate a live capability referencing its storage (ACAP-48). | 0160 §40 | - | T500 |
+| REQ-CAP-081 | capability | v1-full | Storage relocation MUST NOT invalidate a live capability referencing that storage (ACAP-49). | 0160 §40 | - | T500 |
+| REQ-CAP-082 | capability | v1-full | Persistent views MUST require explicit capability construction (ACAP-50). | 0160 §40 | - | T500 |
 | REQ-DRP-038 | drop | v1-core | Drop execution MUST be deterministic (ADROP-30). | 0160 §40 | - | T113 | 
 | REQ-DRP-039 | drop | v1-core | Drop execution order MUST be deterministic (ADROP-31). | 0160 §40 | - | T113 | 
 | REQ-DRP-040 | drop | v1-core | Fields that have been moved MUST NOT be dropped (ADROP-32). | 0160 §40 | - | T113 | 
@@ -2160,10 +2160,10 @@
 | REQ-DRP-042 | drop | v1-core | Early exits MUST perform all required cleanup drops for live variables (ADROP-34). | 0160 §40 | - | T113 | 
 | REQ-DRP-043 | drop | v1-core | Drop implementations MUST NOT propagate recoverable errors (ADROP-35). | 0160 §40 | - | T113 | 
 | REQ-DRP-044 | drop | v1-core | Executing a drop MUST NOT imply physical memory deallocation (ADROP-36). | 0160 §40 | - | T113 | 
-| REQ-CAP-083 | capability | v1-full | Dangling capabilities MUST be rejected by escape analysis (AESCAPE-20). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-084 | capability | v1-full | Returning a view from a function MUST require valid provenance outliving the function call (AESCAPE-21). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-085 | capability | v1-full | A view MUST NOT escape the lifetime of its owner (AESCAPE-22). | 0160 §40 | - | EPIC(E13.1) |
-| REQ-CAP-086 | capability | v1-full | A view MUST NOT cross forbidden suspension boundaries (AESCAPE-23). | 0160 §40 | - | EPIC(E13.1) |
+| REQ-CAP-083 | capability | v1-full | Dangling capabilities MUST be rejected by escape analysis (AESCAPE-20). | 0160 §40 | - | T501 |
+| REQ-CAP-084 | capability | v1-full | Returning a view from a function MUST require valid provenance outliving the function call (AESCAPE-21). | 0160 §40 | - | T502 |
+| REQ-CAP-085 | capability | v1-full | A view MUST NOT escape the lifetime of its owner (AESCAPE-22). | 0160 §40 | - | T501 |
+| REQ-CAP-086 | capability | v1-full | A view MUST NOT cross forbidden suspension boundaries (AESCAPE-23). | 0160 §40 | - | T501 |
 | REQ-OWN-102 | ownership | v1-core | Closure capture of values and capabilities MUST be verified by ownership analysis (AESCAPE-24). | 0160 §40 | - | T113 | 
 | REQ-CONC-132 | concurrency | v1-full | Thread migration of captured values MUST be checked for the Send trait (AESCAPE-25). | 0160 §40 | - | T401 |
 | REQ-CORE-210 | compiler | v1-full | The compiler source tree MUST NOT name the ownership subsystem borrow_checker and the language MUST NOT expose borrow syntax. | 0160 §41 | - | EPIC(E18.1) |
@@ -2182,20 +2182,20 @@
 | REQ-OWN-103 | ownership | v1-core | The compiler MUST represent semantic destruction in MIR using dedicated DROP or DROP_IF_OWNED instructions rather than lowering directly to destructor function calls. | 0161 §11. Drop là instruction riêng | - | T113 | 
 | REQ-OWN-104 | ownership | v1-core | Ownership transfer in MIR MUST be represented by an explicit MOVE instruction that transitions the source place to MOVED and destination place to OWNED rather than an immediate LOAD and STORE sequence. | 0161 §12. Move cũng phải là instruction riêng | - | T113 | 
 | REQ-OWN-105 | ownership | v1-core | The compiler MUST distinguish implicit value copying via a dedicated COPY instruction from ownership transfers via MOVE and explicit duplication via method calls. | 0161 §13. Copy cũng riêng | - | T113 | 
-| REQ-CAP-087 | capability | v1-full | Read-only views in MIR MUST be represented by the VIEW instruction preserving CapabilityFact metadata rather than being lowered directly to raw pointers. | 0161 §14. View trong MIR | - | EPIC(E13.1) |
-| REQ-CAP-088 | capability | v1-full | The MIR verifier MUST prove that every VIEW_MUT instruction has no conflicting live reads or writes, a valid owner, valid provenance, and a valid lifetime. | 0161 §15. VIEW_MUT | - | EPIC(E13.1) |
-| REQ-CAP-089 | capability | v1-full | The compiler MAY erase capability metadata from MIR after the Verified MIR checkpoint is completed. | 0161 §15. VIEW_MUT | - | EPIC(E13.1) |
-| REQ-CAP-090 | capability | v1-full | Capabilities MUST be treated as compile-time semantic concepts that do not require runtime representation after verification and optimization. | 0161 §16. Capability không nhất thiết tồn tại runtime | - | EPIC(E13.1) |
+| REQ-CAP-087 | capability | v1-full | Read-only views in MIR MUST be represented by the VIEW instruction preserving CapabilityFact metadata rather than being lowered directly to raw pointers. | 0161 §14. View trong MIR | - | T502 |
+| REQ-CAP-088 | capability | v1-full | The MIR verifier MUST prove that every VIEW_MUT instruction has no conflicting live reads or writes, a valid owner, valid provenance, and a valid lifetime. | 0161 §15. VIEW_MUT | - | T502 |
+| REQ-CAP-089 | capability | v1-full | The compiler MAY erase capability metadata from MIR after the Verified MIR checkpoint is completed. | 0161 §15. VIEW_MUT | - | T500 |
+| REQ-CAP-090 | capability | v1-full | Capabilities MUST be treated as compile-time semantic concepts that do not require runtime representation after verification and optimization. | 0161 §16. Capability không nhất thiết tồn tại runtime | - | T500 |
 | REQ-CORE-214 | compiler | v1-full | The compiler MUST enforce Verified MIR as a mandatory verification checkpoint before passing MIR to any optimizer pass. | 0161 §17. MIR verifier | - | EPIC(E18.1) |
 | REQ-OPT-010 | optimizer | v1-full | Optimization passes MUST NOT alter the observable semantics of a Verified MIR program. | 0161 §17. MIR verifier | - | EPIC(E15.1) |
 | REQ-OWN-106 | ownership | v1-core | Under invariant VOWN-01, the MIR verifier MUST ensure that no read operation accesses a moved place. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-107 | ownership | v1-core | Under invariant VOWN-02, the MIR verifier MUST ensure that no place is moved more than once without reinitialization. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-108 | ownership | v1-core | Under invariant VOWN-03, the MIR verifier MUST ensure that no uninitialized place is used. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-109 | ownership | v1-core | Under invariant VOWN-04, the MIR verifier MUST ensure that no invalid partial ownership state exists across composite places. | 0161 §18. Verified MIR invariants | - | T113 | 
-| REQ-CAP-091 | capability | v1-full | Under invariant VCAP-01, the MIR verifier MUST ensure that every capability has valid provenance traceable to a live owner. | 0161 §18. Verified MIR invariants | - | EPIC(E13.1) |
-| REQ-CAP-092 | capability | v1-full | Under invariant VCAP-02, the MIR verifier MUST ensure that no conflicting capabilities are live simultaneously on the same region. | 0161 §18. Verified MIR invariants | - | EPIC(E13.1) |
-| REQ-CAP-093 | capability | v1-full | Under invariant VCAP-03, the MIR verifier MUST ensure that no capability outlives its owner. | 0161 §18. Verified MIR invariants | - | EPIC(E13.1) |
-| REQ-CAP-094 | capability | v1-full | Under invariant VCAP-04, the MIR verifier MUST ensure that no capability crosses a forbidden suspension point. | 0161 §18. Verified MIR invariants | - | EPIC(E13.1) |
+| REQ-CAP-091 | capability | v1-full | Under invariant VCAP-01, the MIR verifier MUST ensure that every capability has valid provenance traceable to a live owner. | 0161 §18. Verified MIR invariants | - | T502 |
+| REQ-CAP-092 | capability | v1-full | Under invariant VCAP-02, the MIR verifier MUST ensure that no conflicting capabilities are live simultaneously on the same region. | 0161 §18. Verified MIR invariants | - | T500 |
+| REQ-CAP-093 | capability | v1-full | Under invariant VCAP-03, the MIR verifier MUST ensure that no capability outlives its owner. | 0161 §18. Verified MIR invariants | - | T501 |
+| REQ-CAP-094 | capability | v1-full | Under invariant VCAP-04, the MIR verifier MUST ensure that no capability crosses a forbidden suspension point. | 0161 §18. Verified MIR invariants | - | T500 |
 | REQ-OWN-110 | ownership | v1-core | Under invariant VDROP-01, the MIR verifier MUST ensure that every required resource is dropped exactly once along all reachable execution paths. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-111 | ownership | v1-core | Under invariant VDROP-02, the MIR verifier MUST ensure that moved resources are not dropped. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-LAY-159 | memory | v1-core | Under invariant VMEM-01, the MIR verifier MUST ensure that every memory access satisfies valid type, alignment, and lifetime semantics. | 0161 §18. Verified MIR invariants | - | T113 | 
@@ -2253,16 +2253,16 @@
 | REQ-CORE-229 | backend | v1-core | Checked arithmetic must be lowered by the backend into an arithmetic operation with explicit overflow check and branch, or target overflow instructions. | 0162 §17 | - | T113 | 
 | REQ-CORE-230 | backend | v1-core | Saturating arithmetic must preserve saturating result semantics across all target architectures via native saturation instructions or software fallback sequences. | 0162 §18 | - | T113 | 
 | REQ-LIR-008 | lir | v1-core | Every LIR call instruction must specify callee, argument registers, return value registers, calling convention, and attributes. | 0162 §19 | - | T113 | 
-| REQ-ABI-069 | abi | v1-full | Calling conventions (axiom, C, system, target-specific) and register/stack assignments must be resolved by ABI lowering prior to LIR. | 0162 §20 | - | EPIC(E13.1) |
-| REQ-ABI-070 | abi | v1-full | LIR must not infer C ABI calling conventions directly from high-level function types. | 0162 §20 | - | EPIC(E13.1) |
-| REQ-ABI-071 | abi | v1-full | Aggregate passing and return conventions must be lowered to registers or hidden pointers (`sret`) before backend lowering, requiring no knowledge of high-level struct semantics by the backend. | 0162 §21 | - | EPIC(E13.1) |
-| REQ-ABI-072 | abi | v1-full | Caller-allocated return storage pointers (`sret`) must be supported for function returns without requiring heap allocation. | 0162 §22 | - | EPIC(E13.1) |
-| REQ-ABI-073 | abi | v1-full | Tail call eligibility must be verified by semantic analysis or ABI lowering before emitting TAIL_CALL instructions. | 0162 §23 | - | EPIC(E13.1) |
+| REQ-ABI-069 | abi | v1-full | Calling conventions (axiom, C, system, target-specific) and register/stack assignments must be resolved by ABI lowering prior to LIR. | 0162 §20 | - | T503 |
+| REQ-ABI-070 | abi | v1-full | LIR must not infer C ABI calling conventions directly from high-level function types. | 0162 §20 | - | T503 |
+| REQ-ABI-071 | abi | v1-full | Aggregate passing and return conventions must be lowered to registers or hidden pointers (`sret`) before backend lowering, requiring no knowledge of high-level struct semantics by the backend. | 0162 §21 | - | T503 |
+| REQ-ABI-072 | abi | v1-full | Caller-allocated return storage pointers (`sret`) must be supported for function returns without requiring heap allocation. | 0162 §22 | - | T503 |
+| REQ-ABI-073 | abi | v1-full | Tail call eligibility must be verified by semantic analysis or ABI lowering before emitting TAIL_CALL instructions. | 0162 §23 | - | T500 |
 | REQ-CORE-231 | backend | v1-core | The backend may lower TAIL_CALL into a direct jump instruction when permitted by the target calling convention. | 0162 §23 | - | T113 | 
 | REQ-LIR-009 | lir | v1-core | Inline assembly in LIR must be structured with explicit template, inputs, outputs, clobbers, and memory effect metadata rather than an opaque string. | 0162 §24 | - | T113 | 
 | REQ-LIR-010 | lir | v1-core | LIR function metadata must distinguish compiler-proven facts from user contracts for attributes including noinline, alwaysinline, cold, hot, noreturn, readonly, writeonly, readnone, nounwind, and nosuspend. | 0162 §25 | - | T113 | 
 | REQ-CORE-232 | compiler | v1-full | The compiler must not assign the `readonly` attribute to a function unless proven by compiler analysis. | 0162 §25 | - | EPIC(E18.1) |
-| REQ-FFI-067 | ffi | v1-full | The compiler must not assume foreign functions are pure or free of memory effects unless guaranteed by explicit contract. | 0162 §26 | - | EPIC(E13.1) |
+| REQ-FFI-067 | ffi | v1-full | The compiler must not assume foreign functions are pure or free of memory effects unless guaranteed by explicit contract. | 0162 §26 | - | T505 |
 | REQ-LIR-011 | lir | v1-core | LIR must represent local stack allocations as abstract StackObjects with size, alignment, lifetime, and kind, without fixing concrete physical stack offsets. | 0162 §27 | - | T113 | 
 | REQ-LAY-163 | memory | v1-core | Semantic storage allocations that do not require heap lifetime must be lowered to STACK_OBJECT, DYNAMIC_ALLOC, or STATIC_ADDRESS rather than heap allocation calls. | 0162 §28 | - | T113 | 
 | REQ-OPT-012 | optimizer | v1-full | The compiler optimizer may eliminate unescaped allocations and pass values directly in registers when addresses are not observable. | 0162 §29 | - | EPIC(E15.1) |
@@ -2287,8 +2287,8 @@
 | REQ-LAY-164 | memory | v1-core | Every memory operation MUST have explicit size and alignment semantics (ALIR-22). | 0162 §43 | - | T113 | 
 | REQ-CONC-135 | concurrency | v1-full | Atomic operations MUST retain ordering until target lowering (ALIR-23). | 0162 §43 | - | T407 |
 | REQ-LAY-165 | memory | v1-core | Volatile operations MUST be distinct from atomic operations (ALIR-24). | 0162 §43 | - | T113 | 
-| REQ-ABI-074 | abi | v1-full | Function calls MUST have an explicit calling convention (ALIR-25). | 0162 §43 | - | EPIC(E13.1) |
-| REQ-ABI-075 | abi | v1-full | Aggregate ABI lowering MUST be explicit (ALIR-26). | 0162 §43 | - | EPIC(E13.1) |
+| REQ-ABI-074 | abi | v1-full | Function calls MUST have an explicit calling convention (ALIR-25). | 0162 §43 | - | T503 |
+| REQ-ABI-075 | abi | v1-full | Aggregate ABI lowering MUST be explicit (ALIR-26). | 0162 §43 | - | T503 |
 | REQ-OWN-116 | ownership | v1-core | No ownership semantics MUST remain required for correctness in LIR (ALIR-27). | 0162 §43 | - | T113 | 
 | REQ-TYP-303 | types | v1-core | No unresolved high-level type semantics MUST remain in LIR (ALIR-28). | 0162 §43 | - | T113 |
 | REQ-LIR-017 | lir | v1-core | LIR MUST be target-independent before legalization (ALIR-29). | 0162 §43 | - | T113 | 
@@ -2308,9 +2308,9 @@
 | REQ-GEN-024 | codegen | v1-core | The MVP register file MUST support 64-bit general-purpose registers and 128-bit XMM registers, deferring AVX and AVX-512 extensions to post-v1. | 0163 §2 | - | T113 | 
 | REQ-CORE-249 | regalloc | v1-core | The compiler MUST represent register aliases as distinct RegisterView instances sharing the same PhysicalRegister identity and associated bit range. | 0163 §3 | - | T113 | 
 | REQ-GEN-025 | codegen | v1-core | The compiler MUST map LIR types and conditions to target register classes, mapping Int to GPR64, Float to XMM, and Condition to FLAGS. | 0163 §4 | - | T113 | 
-| REQ-ABI-076 | abi | v1-full | The Linux x86-64 backend MUST implement the System V AMD64 ABI, passing the first six integer or pointer arguments in RDI, RSI, RDX, RCX, R8, and R9, and returning integer or pointer values in RAX. | 0163 §5 | - | EPIC(E13.1) |
-| REQ-ABI-077 | abi | v1-full | The Linux x86-64 backend MUST pass floating-point arguments starting in XMM0 and return floating-point values in XMM0 under the System V AMD64 ABI. | 0163 §5 | - | EPIC(E13.1) |
-| REQ-ABI-078 | abi | v1-full | Caller-saved and callee-saved register classifications MUST be defined by ABI metadata in CallingConventionDescription and MUST NOT be hard-coded inside the register allocator. | 0163 §6 | - | EPIC(E13.1) |
+| REQ-ABI-076 | abi | v1-full | The Linux x86-64 backend MUST implement the System V AMD64 ABI, passing the first six integer or pointer arguments in RDI, RSI, RDX, RCX, R8, and R9, and returning integer or pointer values in RAX. | 0163 §5 | - | T503 |
+| REQ-ABI-077 | abi | v1-full | The Linux x86-64 backend MUST pass floating-point arguments starting in XMM0 and return floating-point values in XMM0 under the System V AMD64 ABI. | 0163 §5 | - | T503 |
+| REQ-ABI-078 | abi | v1-full | Caller-saved and callee-saved register classifications MUST be defined by ABI metadata in CallingConventionDescription and MUST NOT be hard-coded inside the register allocator. | 0163 §6 | - | T514 |
 | REQ-GEN-026 | codegen | v1-core | The backend MUST enforce System V AMD64 stack alignment requirements at call boundaries using a structured FrameLayout rather than computing stack frames ad-hoc during instruction selection. | 0163 §7 | - | T113 | 
 | REQ-GEN-027 | codegen | v1-core | The x86 Machine IR MUST structure functions into MachineFunction containing MachineBlock, MachineInstr, and FrameInfo, with instructions tracking opcodes, operands, implicit uses, implicit defs, and flags. | 0163 §8 | - | T113 | 
 | REQ-GEN-028 | codegen | v1-core | The Machine IR MUST represent x86 memory operands with explicit base, index, scale (1, 2, 4, or 8), displacement, and optional segment fields. | 0163 §9 | - | T113 | 
@@ -2339,7 +2339,7 @@
 | REQ-CORE-261 | regalloc | post-v1 | Advanced register allocation algorithms such as graph coloring, coalescing, rematerialization, and register-pressure-aware scheduling MAY be implemented in post-MVP tiers. | 0163 §29 | - | EPIC(E24.0) |
 | REQ-CORE-262 | regalloc | v1-core | The register allocator MUST prioritize correctness, determinism, and debuggability over microarchitecture-specific register pressure optimizations in v1-core. | 0163 §30 | - | T113 | 
 | REQ-CORE-263 | regalloc | v1-core | Spill slots MUST be allocated and tracked by FrameInfo rather than allowing the register allocator to compute arbitrary stack offsets. | 0163 §31 | - | T113 | 
-| REQ-ABI-079 | abi | v1-full | Calling convention lowering MUST assign arguments and return values to physical registers deterministically according to target ABI specifications. | 0163 §32 | - | EPIC(E13.1) |
+| REQ-ABI-079 | abi | v1-full | Calling convention lowering MUST assign arguments and return values to physical registers deterministically according to target ABI specifications. | 0163 §32 | - | T503 |
 | REQ-CORE-264 | regalloc | v1-core | Function CALL instructions in Machine IR MUST declare implicit defs for all caller-saved registers defined by the calling convention so that the register allocator recognizes them as clobbered. | 0163 §33 | - | T113 | 
 | REQ-GEN-040 | codegen | v1-core | The x86-64 backend MUST support emitting native SYSCALL instructions with register arguments to allow standalone Linux execution without requiring libc. | 0163 §34 | - | T113 | 
 | REQ-TST-001 | testing | v1-core | The test and validation pipeline MUST decouple backend compiler correctness verification from the presence or completeness of the standard library. | 0163 §35 | - | T113 | 
@@ -2349,7 +2349,7 @@
 | REQ-TOOL-011 | tooling | v1-full | Emission of rich DWARF debugging sections including `.debug_info`, `.debug_abbrev`, and `.debug_str` MAY be deferred to post-MVP tiers. | 0163 §38 | - | EPIC(E19.1) |
 | REQ-CORE-265 | compiler | v1-full | The compiler MUST successfully compile an empty `fn main() {}` function through the full pipeline to an ELF64 executable producing exit code 0 without external compiler tools. | 0163 §39 | - | EPIC(E18.1) |
 | REQ-GEN-041 | codegen | v1-core | The compiler MUST correctly lower functions returning integer values in RAX and propagate the return value to the process exit code. | 0163 §40 | - | T113 | 
-| REQ-ABI-080 | abi | v1-full | The compiler MUST correctly lower function calls passing multiple integer parameters according to the calling convention and returning the computed result. | 0163 §41 | - | EPIC(E13.1) |
+| REQ-ABI-080 | abi | v1-full | The compiler MUST correctly lower function calls passing multiple integer parameters according to the calling convention and returning the computed result. | 0163 §41 | - | T503 |
 | REQ-GEN-042 | codegen | v1-core | The backend MVP MUST support local variables, constant loads, and integer arithmetic operations without requiring an optimization pass. | 0163 §42 | - | T113 | 
 | REQ-TST-002 | testing | v1-core | Backend conformance tests MUST compare native binary execution against the MIR interpreter oracle across return value, exit code, stdout, and stderr. | 0163 §43 | - | T113 | 
 | REQ-CORE-266 | encoder | v1-core | Every machine instruction form MUST have deterministic unit tests verifying the exact generated byte sequence against expected machine code. | 0163 §44 | - | T113 | 
@@ -2360,8 +2360,8 @@
 | REQ-GEN-045 | codegen | v1-core | Register aliases refer to the same physical register. (AX86-21) | 0163 §47 | - | T113 | 
 | REQ-GEN-046 | codegen | v1-core | Every selected instruction has a valid target encoding. (AX86-22) | 0163 §47 | - | T113 | 
 | REQ-GEN-047 | codegen | v1-core | Invalid operand combinations are rejected before encoding. (AX86-23) | 0163 §47 | - | T113 | 
-| REQ-ABI-081 | abi | v1-full | Calling convention lowering is deterministic. (AX86-24) | 0163 §47 | - | EPIC(E13.1) |
-| REQ-ABI-082 | abi | v1-full | Caller/callee-saved registers are defined by ABI metadata. (AX86-25) | 0163 §47 | - | EPIC(E13.1) |
+| REQ-ABI-081 | abi | v1-full | Calling convention lowering is deterministic. (AX86-24) | 0163 §47 | - | T503 |
+| REQ-ABI-082 | abi | v1-full | Caller/callee-saved registers are defined by ABI metadata. (AX86-25) | 0163 §47 | - | T503 |
 | REQ-GEN-048 | codegen | v1-core | Stack frame alignment satisfies target ABI. (AX86-26) | 0163 §47 | - | T113 | 
 | REQ-CORE-268 | regalloc | v1-core | Register allocation preserves virtual-register semantics. (AX86-27) | 0163 §47 | - | T113 | 
 | REQ-CORE-269 | regalloc | v1-core | Spill/reload preserves values. (AX86-28) | 0163 §47 | - | T113 | 
@@ -2585,13 +2585,13 @@
 | REQ-OWN-118 | ownership | v1-core | Move operations must not implicitly result in physical copies. | 0176 §11 | - | T113 | 
 | REQ-OWN-119 | ownership | v1-core | User-defined custom Drop must not allow partial moves. | 0176 §14 | - | T113 | 
 | REQ-OWN-120 | ownership | v1-core | Uninitialized variables must not be accessed before they are assigned. | 0176 §20 | - | T113 | 
-| REQ-CAP-095 | capability | v1-full | Every safe capability has valid provenance. [ACAP-32] | 0177 §4 | - | EPIC(E13.1) |
-| REQ-CAP-096 | capability | v1-full | A capability must not implicitly convert to a persistent view. | 0177 §9 | - | EPIC(E13.1) |
-| REQ-CAP-097 | capability | v1-full | A view escaping its owner must be rejected with the AX_VIEW_0002 diagnostic. | 0177 §15 | - | EPIC(E13.1) |
-| REQ-CAP-098 | capability | v1-full | A returned capability must not exceed the provenance of its input capability. | 0177 §17 | - | EPIC(E13.1) |
-| REQ-CAP-099 | capability | v1-full | Two WRITE capabilities for the same region must conflict and be rejected. | 0177 §20 | - | EPIC(E13.1) |
-| REQ-CAP-100 | capability | v1-full | A READ capability and a WRITE capability for the same region must conflict and be rejected. | 0177 §21 | - | EPIC(E13.1) |
-| REQ-CAP-101 | capability | v1-full | Disjoint proven regions may hold compatible capabilities concurrently. [ACAP-34] | 0177 §28 | - | EPIC(E13.1) |
+| REQ-CAP-095 | capability | v1-full | Every safe capability has valid provenance. [ACAP-32] | 0177 §4 | - | T502 |
+| REQ-CAP-096 | capability | v1-full | A capability must not implicitly convert to a persistent view. | 0177 §9 | - | T500 |
+| REQ-CAP-097 | capability | v1-full | A view escaping its owner must be rejected with the AX_VIEW_0002 diagnostic. | 0177 §15 | - | T500 |
+| REQ-CAP-098 | capability | v1-full | A returned capability must not exceed the provenance of its input capability. | 0177 §17 | - | T502 |
+| REQ-CAP-099 | capability | v1-full | Two WRITE capabilities for the same region must conflict and be rejected. | 0177 §20 | - | T500 |
+| REQ-CAP-100 | capability | v1-full | A READ capability and a WRITE capability for the same region must conflict and be rejected. | 0177 §21 | - | T500 |
+| REQ-CAP-101 | capability | v1-full | Disjoint proven regions may hold compatible capabilities concurrently. [ACAP-34] | 0177 §28 | - | T500 |
 | REQ-DRP-045 | drop | v1-core | Resource lifetime is distinct from memory lifetime. [AMEM-43] | 0178 §1 | - | T113 | 
 | REQ-DRP-046 | drop | v1-core | Drop does not necessarily deallocate memory. [AMEM-44] | 0178 §1 | - | T113 | 
 | REQ-DRP-047 | drop | v1-core | Default destruction order is reverse initialization order. [ADROP-20] | 0178 §3 | - | T113 | 
@@ -2823,7 +2823,7 @@
 | REQ-CORE-448 | compiler/semantics | v1-full | Compile-time execution results MUST be lowered into the HIR and MUST NOT directly mutate Machine IR. | 0261 §25 | - | EPIC(E18.1) |
 | REQ-RT-022 | runtime/concurrency | v1-full | The concurrency model MUST differentiate Task from Thread, and task state MUST be small and deterministic. | 1066 §2.C | - | T400 |
 | REQ-LAY-166 | semantics/memory | v1-core | The Axiom memory model MUST NOT include mandatory GC, mandatory explicit borrow checking, hidden reference counting, hidden allocations, or hidden ownership runtimes. | 1066 §2.B | - | T113 | 
-| REQ-CORE-449 | compiler/abi | v1-full | The compiler Core ABI specification MUST freeze a minimal version covering basic types, aggregates, alignment, and calling conventions before backend implementation. | 1066 §2.D | - | EPIC(E13.1) |
+| REQ-CORE-449 | compiler/abi | v1-full | The compiler Core ABI specification MUST freeze a minimal version covering basic types, aggregates, alignment, and calling conventions before backend implementation. | 1066 §2.D | - | T506 |
 | REQ-CORE-450 | semantic | v1-core | The compiler must explicitly track signature-changing effects (async, unsafe, GPU domain, FFI ABI) while internal effects (allocation, IO, panic) remain implicit. | 0225 §22 | - | T113 | 
 | REQ-CORE-451 | control-flow | v1-core | The compiler must raise an error if a view capability is alive across an await suspension point unless it is proven to terminate beforehand. | 0225 §5 | - | T113 | 
 | REQ-LNK-122 | type-system | v1-full | The trait solver must verify that either the implemented trait or the target type belongs to the current module to satisfy the orphan rule. | 0225 §31 | - | EPIC(E18.6) |
@@ -2833,15 +2833,15 @@
 | REQ-MIR-063 | mir | v1-core | The MIR blocks must contain exactly one terminator instruction. | 0227 §5 | - | T113 | 
 | REQ-MIR-064 | mir | v1-core | The MIR must track ownership state with projection awareness to correctly handle partial moves of struct fields. | 0227 §9 | - | T113 | 
 | REQ-MIR-065 | mir | v1-core | Early returns must undergo Drop elaboration to execute all pending drop obligations for the current scope before returning. | 0227 §23 | - | T113 | 
-| REQ-CAP-102 | capability | v1-full | The Facts Engine must flag a conflict if a mut_view<T> overlaps with any other active capability in the same region. | 0228 §14 | - | EPIC(E13.1) |
-| REQ-CAP-103 | capability | v1-full | The verifier must assign and track valid provenance identifiers for capabilities derived from unsafe raw pointers. | 0228 §22 | - | EPIC(E13.1) |
+| REQ-CAP-102 | capability | v1-full | The Facts Engine must flag a conflict if a mut_view<T> overlaps with any other active capability in the same region. | 0228 §14 | - | T501 |
+| REQ-CAP-103 | capability | v1-full | The verifier must assign and track valid provenance identifiers for capabilities derived from unsafe raw pointers. | 0228 §22 | - | T502 |
 | REQ-ERR-011 | error-handling | v1-core | The Result<T, E> type must be represented as a standard enum without hidden exception machinery or allocations. | 0229 §2 | - | T113 | 
 | REQ-ERR-012 | error-handling | v1-core | The ? operator must desugar into explicit control flow branching and must execute pending drop cleanups on the error path. | 0229 §11 | - | T113 | 
 | REQ-ERR-013 | error-handling | v1-core | A panic() invocation must be typed as never and must abort the process by default unless the unwind profile is configured. | 0229 §14 | - | T113 | 
 | REQ-ERR-014 | error-handling | v1-core | A Drop implementation must not return a Result type. | 0229 §21 | - | T113 | 
-| REQ-ABI-083 | abi | v1-full | Small aggregates must be passed and returned in registers when permitted by the Target ABI, avoiding physical memory copies. | 0230 §6 | - | EPIC(E13.1) |
-| REQ-ABI-084 | abi | v1-full | Indirect return values (sret) must allow caller-allocated slots and must not enforce physical heap allocations. | 0230 §8 | - | EPIC(E13.1) |
-| REQ-ABI-085 | abi | v1-full | The view<T> type must be passed as a scalar pair (pointer, length) or equivalent without creating a runtime object. | 0230 §11 | - | EPIC(E13.1) |
+| REQ-ABI-083 | abi | v1-full | Small aggregates must be passed and returned in registers when permitted by the Target ABI, avoiding physical memory copies. | 0230 §6 | - | T513, T526 |
+| REQ-ABI-084 | abi | v1-full | Indirect return values (sret) must allow caller-allocated slots and must not enforce physical heap allocations. | 0230 §8 | - | T503 |
+| REQ-ABI-085 | abi | v1-full | The view<T> type must be passed as a scalar pair (pointer, length) or equivalent without creating a runtime object. | 0230 §11 | - | T503 |
 | REQ-LIR-024 | lir | v1-core | The LIR must remain independent of specific CPU targets, using virtual registers and abstract StackSlots. | 0232 §1 | - | T113 | 
 | REQ-LIR-025 | lir | v1-core | LIR frame lowering must assign physical stack offsets to all StackSlots based on target alignment and calling conventions. | 0232 §15 | - | T113 | 
 | REQ-CORE-452 | machine-ir | v1-core | Machine IR must model overlapping register parts using register units to correctly detect allocation conflicts. | 0233 §6 | - | T113 | 
@@ -3027,11 +3027,11 @@
 | REQ-DRV-011 | driver | v1-full | The final toolchain must be capable of bootstrapping and producing freestanding native executables without external compilers, assemblers, or linkers. | 0257 §34 | - | EPIC(E18.1) |
 | REQ-DRV-012 | driver | v1-full | Build outputs must be bit-for-bit reproducible when reproducible configuration mode is active. | 0257 §34 | - | EPIC(E18.1) |
 | REQ-DRV-013 | driver | v1-full | Intermediate representations must be stable and inspectable for tooling and AI agent integration. | 0257 §34 | - | EPIC(E18.1) |
-| REQ-ABI-086 | abi | v1-full | Function identity is semantic. | 0266 §1 | - | EPIC(E13.1) |
-|REQ-ABI-087|abi|v1-full|Function declarations resolve before body analysis .|0266 §1|-|EPIC(E13.1)|
-|REQ-ABI-088|abi|v1-full|Function overload is not part of v1 .|0266 §4|-|EPIC(E13.1)|
-|REQ-ABI-089|abi|v1-full|Parameter passing follows ownership semantics .|0266 §5|-|EPIC(E13.1)|
-|REQ-ABI-090|abi|v1-full|Copy parameters do not consume source .|0266 §6|-|EPIC(E13.1)|
+| REQ-ABI-086 | abi | v1-full | Function identity is semantic. | 0266 §1 | - | T500 |
+|REQ-ABI-087|abi|v1-full|Function declarations resolve before body analysis .|0266 §1|-|T500|
+|REQ-ABI-088|abi|v1-full|Function overload is not part of v1 .|0266 §4|-|T500|
+|REQ-ABI-089|abi|v1-full|Parameter passing follows ownership semantics .|0266 §5|-|T503|
+|REQ-ABI-090|abi|v1-full|Copy parameters do not consume source .|0266 §6|-|T503|
 | REQ-TYP-312 | types | v1-core | Struct Identity Is Nominal. | 0267 §2 | - | T113 |
 | REQ-TYP-313 | types | v1-core | Field Identity Is Stable . | 0267 §14 | REQ-TYP-312 | T113 |
 | REQ-TYP-314 | types | v1-core | Field Lookup Resolves To FieldId . | 0267 §4 | REQ-TYP-313 | T113 |
@@ -3052,11 +3052,11 @@
 | REQ-OWN-129 | ownership | v1-core | Copy Duplicates Semantic Value . | 0270 §4 | REQ-OWN-128 | T113 | 
 | REQ-OWN-130 | ownership | v1-core | Copy Does Not Require Physical Copy . | 0270 §4 | REQ-OWN-129 | T113 | 
 | REQ-OWN-131 | ownership | v1-core | Ownership Is Field Sensitive . | 0270 §3 | REQ-OWN-130 | T113 | 
-| REQ-CAP-104 | capability | v1-full | View Is Read Capability. | 0270 §9 | - | EPIC(E13.1) |
-|REQ-CAP-105|capability|v1-full|Mut_view Is Exclusive Write Capability .|0270 §8|-|EPIC(E13.1)|
-|REQ-CAP-106|capability|v1-full|View Does Not Transfer Ownership .|0270 §13|-|EPIC(E13.1)|
-|REQ-CAP-107|capability|v1-full|Mut_view Does Not Transfer Ownership .|0270 §28|-|EPIC(E13.1)|
-|REQ-CAP-108|capability|v1-full|Multiple Read Capabilities May Coexist .|0270 §19|-|EPIC(E13.1)|
+| REQ-CAP-104 | capability | v1-full | View Is Read Capability. | 0270 §9 | - | T500 |
+|REQ-CAP-105|capability|v1-full|Mut_view Is Exclusive Write Capability .|0270 §8|-|T501|
+|REQ-CAP-106|capability|v1-full|View Does Not Transfer Ownership .|0270 §13|-|T500|
+|REQ-CAP-107|capability|v1-full|Mut_view Does Not Transfer Ownership .|0270 §28|-|T501|
+|REQ-CAP-108|capability|v1-full|Multiple Read Capabilities May Coexist .|0270 §19|-|T500|
 | REQ-SEC-001 | security | v1-core | Unsafe Does Not Disable All Verification. | 0270 §34 | - | T113 | 
 | REQ-SEC-002 | security | v1-core | Unsafe May Establish Trusted Preconditions . | 0270 §34 | REQ-SEC-001 | T113 | 
 | REQ-SEC-003 | security | v1-core | Safe Verification Resumes After Trusted Boundary . | 0270 §34 | REQ-SEC-002 | T113 | 
@@ -3087,11 +3087,11 @@
 | REQ-MOD-082 | module | v1-core | Workspace is a multi-package development unit . | 0287 §30, 0293 §1 | REQ-MOD-081 | T113 | 
 | REQ-MOD-083 | module | v1-core | Module identity is independent of filesystem layout . | 0287 §2, 0293 §48 | REQ-MOD-082 | T113 | 
 | REQ-MOD-084 | module | v1-core | Textual include is not a Core module mechanism . | 0287 §3, 0293 §2 | REQ-MOD-083 | T113 | 
-| REQ-FFI-068 | ffi | v1-full | FFI is an explicit semantic boundary. | 0292 §2, 0300 §94; tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-|REQ-FFI-069|ffi|v1-full|Axiom semantics are distinct from ABI representation .|0292 §19, 0300 §85|-|EPIC(E13.1)|
-|REQ-FFI-070|ffi|v1-full|Axiom ABI is distinct from foreign ABI .|0292 §19, 0300 §31|-|EPIC(E13.1)|
-|REQ-FFI-071|ffi|v1-full|Foreign ABI must be explicitly selected .|0292 §56, 0300 §2|-|EPIC(E13.1)|
-|REQ-FFI-072|ffi|v1-full|C ABI is explicitly requested .|0292 §7, 0300 §3|-|EPIC(E13.1)|
+| REQ-FFI-068 | ffi | v1-full | FFI is an explicit semantic boundary. | 0292 §2, 0300 §94; tasks/0413 §70. Invariants | - | T505 |
+|REQ-FFI-069|ffi|v1-full|Axiom semantics are distinct from ABI representation .|0292 §19, 0300 §85|-|T504|
+|REQ-FFI-070|ffi|v1-full|Axiom ABI is distinct from foreign ABI .|0292 §19, 0300 §31|-|T504|
+|REQ-FFI-071|ffi|v1-full|Foreign ABI must be explicitly selected .|0292 §56, 0300 §2|-|T504|
+|REQ-FFI-072|ffi|v1-full|C ABI is explicitly requested .|0292 §7, 0300 §3|-|T504|
 | REQ-GPU-056 | gpu | post-v1 | GPU is an explicit execution domain. | 0299 §24 | - | EPIC(E22.3) |
 |REQ-GPU-057|gpu|post-v1|GPU storage is an explicit storage domain .|0299 §7|-|EPIC(E22.3)|
 |REQ-GPU-058|gpu|post-v1|@kernel establishes GPU execution legality .|0299 §24|-|EPIC(E22.3)|
@@ -3193,19 +3193,19 @@
 | REQ-OWN-137 | ownership | v1-core | Ẩn complexity của implementation, không ẩn semantic cost. | tasks/0394 §92. Nhưng Axiom vẫn không “giấu mọi thứ” | - | T113 | 
 | REQ-OWN-138 | ownership | v1-core | 8. Move không phải physical copy | tasks/0394 §13. Partial Move và field independence | - | T113 | 
 | REQ-OWN-139 | ownership | v1-core | 80. Nhưng optimizer không được tạo safety proof | tasks/0394 §BOOTSTRAP-135 — Ownership, Initialization & Drop Verification Engine | - | T113 | 
-| REQ-CAP-109 | capability | v1-full | Compiler tự suy luận alias/no-alias từ ownership + capability + region + escape facts, thay vì bắt programmer viết restrict, lifetime annotation hoặc alias annotation trong phần lớn trường hợp. | tasks/0395 §BOOTSTRAP-136 — Capability & Alias Analysis | - | EPIC(E13.1) |
-| REQ-CAP-110 | capability | v1-full | UNKNOWN tuyệt đối không được suy thành NO_ALIAS. | tasks/0395 §3. Ý nghĩa | - | EPIC(E13.1) |
-| REQ-CAP-111 | capability | v1-full | Capability này bắt nguồn từ storage/owner nào? | tasks/0395 §8. Provenance | - | EPIC(E13.1) |
-| REQ-CAP-112 | capability | v1-full | Có được phép access không? | tasks/0395 §74. Alias analysis không phải borrow checker | - | EPIC(E13.1) |
-| REQ-CAP-113 | capability | v1-full | Hai access có quan hệ gì để tối ưu? | tasks/0395 §74. Alias analysis không phải borrow checker | - | EPIC(E13.1) |
-| REQ-CAP-114 | capability | v1-full | Safe-by-default nhưng không cần GC, không cần runtime reference counting mặc định, không cần borrow syntax, và vẫn cung cấp thông tin alias đủ mạnh cho optimizer. | tasks/0395 §Axiom hiện đã có một vòng khép kín rất quan trọng | - | EPIC(E13.1) |
-| REQ-CAP-115 | capability | v1-full | Compiler tự derive effect summary; programmer chỉ cần annotation khi semantic contract thực sự cần thiết. | tasks/0395 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | EPIC(E13.1) |
-| REQ-CAP-116 | capability | v1-full | 2. Alias không phải một boolean | tasks/0395 §48. Lock aliasing | - | EPIC(E13.1) |
-| REQ-CAP-117 | capability | v1-full | MUST_ALIAS | tasks/0395 §2. Alias không phải một boolean | - | EPIC(E13.1) |
-| REQ-CAP-118 | capability | v1-full | 7. Region không phải lifetime | tasks/0395 §39. NoAlias validity interval | - | EPIC(E13.1) |
-| REQ-CAP-119 | capability | v1-full | 25. reserve không phải stable address | tasks/0395 §11. Pointer equality không đủ để chứng minh alias | - | EPIC(E13.1) |
-| REQ-CAP-120 | capability | v1-full | 57. Alias checks không phải safety checks | tasks/0395 §81. Invariants | - | EPIC(E13.1) |
-| REQ-CAP-121 | capability | v1-full | 74. Alias analysis không phải borrow checker | tasks/0395 §74. Alias analysis không phải borrow checker | - | EPIC(E13.1) |
+| REQ-CAP-109 | capability | v1-full | Compiler tự suy luận alias/no-alias từ ownership + capability + region + escape facts, thay vì bắt programmer viết restrict, lifetime annotation hoặc alias annotation trong phần lớn trường hợp. | tasks/0395 §BOOTSTRAP-136 — Capability & Alias Analysis | - | T501 |
+| REQ-CAP-110 | capability | v1-full | UNKNOWN tuyệt đối không được suy thành NO_ALIAS. | tasks/0395 §3. Ý nghĩa | - | T500 |
+| REQ-CAP-111 | capability | v1-full | Capability này bắt nguồn từ storage/owner nào? | tasks/0395 §8. Provenance | - | T502 |
+| REQ-CAP-112 | capability | v1-full | Có được phép access không? | tasks/0395 §74. Alias analysis không phải borrow checker | - | T500 |
+| REQ-CAP-113 | capability | v1-full | Hai access có quan hệ gì để tối ưu? | tasks/0395 §74. Alias analysis không phải borrow checker | - | T500 |
+| REQ-CAP-114 | capability | v1-full | Safe-by-default nhưng không cần GC, không cần runtime reference counting mặc định, không cần borrow syntax, và vẫn cung cấp thông tin alias đủ mạnh cho optimizer. | tasks/0395 §Axiom hiện đã có một vòng khép kín rất quan trọng | - | T500 |
+| REQ-CAP-115 | capability | v1-full | Compiler tự derive effect summary; programmer chỉ cần annotation khi semantic contract thực sự cần thiết. | tasks/0395 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | T500 |
+| REQ-CAP-116 | capability | v1-full | 2. Alias không phải một boolean | tasks/0395 §48. Lock aliasing | - | T500 |
+| REQ-CAP-117 | capability | v1-full | MUST_ALIAS | tasks/0395 §2. Alias không phải một boolean | - | T500 |
+| REQ-CAP-118 | capability | v1-full | 7. Region không phải lifetime | tasks/0395 §39. NoAlias validity interval | - | T501 |
+| REQ-CAP-119 | capability | v1-full | 25. reserve không phải stable address | tasks/0395 §11. Pointer equality không đủ để chứng minh alias | - | T500 |
+| REQ-CAP-120 | capability | v1-full | 57. Alias checks không phải safety checks | tasks/0395 §81. Invariants | - | T500 |
+| REQ-CAP-121 | capability | v1-full | 74. Alias analysis không phải borrow checker | tasks/0395 §74. Alias analysis không phải borrow checker | - | T500 |
 | REQ-CORE-527 | core-lib | v1-core | Một function có thể làm gì với thế giới bên ngoài? | tasks/0396 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | T113 | 
 | REQ-CORE-528 | core-lib | v1-core | ALLOCATE là semantic possibility, không có nghĩa runtime chắc chắn gọi heap allocator. | tasks/0396 §6. `Allocate` | - | T113 | 
 | REQ-CORE-529 | core-lib | v1-core | Effect semantics không được phụ thuộc vào việc bật/tắt LTO. | tasks/0396 §59. Effect + LTO | - | T113 | 
@@ -3778,50 +3778,50 @@
 | REQ-TOOL-099 | pkg | v1-core | Reproducible builds require deterministic dependency resolution. | tasks/0412 §61. Invariants | - | T113 | 
 | REQ-TOOL-100 | pkg | v1-core | Dependency security policy is separate from language semantics. | tasks/0412 §61. Invariants | - | T113 | 
 | REQ-TOOL-101 | pkg | v1-core | The final executable must have inspectable dependency provenance. | tasks/0412 §61. Invariants | - | T113 | 
-| REQ-FFI-073 | ffi | v1-full | Axiom ABI, C ABI and System ABI are distinct. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-074 | ffi | v1-full | Foreign declarations require explicit ABI identity. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-075 | ffi | v1-full | Only FFI-safe representations may cross a declared C ABI boundary. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-076 | ffi | v1-full | `@repr(C)` establishes a representation contract. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-077 | ffi | v1-full | `@repr(C)` does not automatically make nested non-FFI-safe types safe. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-078 | ffi | v1-full | Opaque foreign types do not expose unknown layout. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-079 | ffi | v1-full | Foreign ownership must not be inferred from raw pointer representation. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-080 | ffi | v1-full | Foreign allocation and Axiom allocation domains are distinct unless explicitly compatible. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-081 | ffi | v1-full | Axiom strings are not implicitly C strings. | tasks/0413 §70. Invariants; tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-FFI-082 | ffi | v1-full | Nullability is explicit at FFI boundaries. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-083 | ffi | v1-full | Raw pointers do not establish safe capability provenance. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-084 | ffi | v1-full | Foreign calls with unknown effects are conservative. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-085 | ffi | v1-full | Unknown foreign aliasing is never treated as `NO_ALIAS`. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-086 | ffi | v1-full | Foreign contracts may refine compiler knowledge only when explicitly established. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-087 | ffi | v1-full | Unsafe FFI does not disable type, ABI or established verifier checks. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-088 | ffi | v1-full | Unsafe FFI may establish trusted machine-level preconditions. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-089 | ffi | v1-full | Safe verification resumes after a valid FFI contract boundary. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-090 | ffi | v1-full | Foreign callbacks require explicit lifetime/storage contracts when retained. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-091 | ffi | v1-full | Foreign-thread callbacks require appropriate Send/Share semantics. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-092 | ffi | v1-full | Foreign async operations require explicit async adapters. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-093 | ffi | v1-full | Foreign unwind cannot cross an ABI boundary without an explicit compatible contract. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-094 | ffi | v1-full | Axiom panic is not automatically equivalent to a foreign exception. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-095 | ffi | v1-full | Variadic ABI behavior is target-specific and explicit. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-096 | ffi | v1-full | C structs require compatible representation before crossing C ABI. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-097 | ffi | v1-full | Axiom enums do not automatically equal C enums/unions. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-098 | ffi | v1-full | Packed representations require unsafe/system handling. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-099 | ffi | v1-full | Alignment requirements are part of FFI validity. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-100 | ffi | v1-full | Foreign memory is an explicit external storage domain. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-101 | ffi | v1-full | Foreign memory may become a safe capability only after its validity contract is established. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-102 | ffi | v1-full | Foreign memory cannot be unmapped while dependent safe capabilities remain live. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-103 | ffi | v1-full | Exported Axiom functions require explicit native ABI/export contracts. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-104 | ffi | v1-full | Generic functions require concrete specialization before C ABI export. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-105 | ffi | v1-full | Capturing closures are not implicitly C function pointers. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-106 | ffi | v1-full | Noncapturing closures may decay to compatible function pointers. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-107 | ffi | v1-full | Dynamic symbol lookup cannot infer callable ABI from raw address alone. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-108 | ffi | v1-full | FFI metadata is part of ABI/build metadata. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-109 | ffi | v1-full | Generated FFI declarations re-enter ordinary compiler verification. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-110 | ffi | v1-full | FFI wrappers may provide safe ownership/capability abstractions over unsafe foreign APIs. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-111 | ffi | v1-full | System dependencies remain distinct from compiler dependencies. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-112 | ffi | v1-full | FFI cannot weaken Axiom semantic verification. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-113 | ffi | v1-full | FFI contracts participate in Effect, Alias, Escape and ABI analysis. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-114 | ffi | v1-full | Unknown foreign behavior may reduce optimization freedom but cannot alter semantics. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-115 | ffi | v1-full | FFI inspection must expose ABI and ownership contracts. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
-| REQ-FFI-116 | ffi | v1-full | The final native compiler must be capable of consuming its own canonical FFI representation without requiring a third-party compiler. | tasks/0413 §70. Invariants | - | EPIC(E13.1) |
+| REQ-FFI-073 | ffi | v1-full | Axiom ABI, C ABI and System ABI are distinct. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-074 | ffi | v1-full | Foreign declarations require explicit ABI identity. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-075 | ffi | v1-full | Only FFI-safe representations may cross a declared C ABI boundary. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-076 | ffi | v1-full | `@repr(C)` establishes a representation contract. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-077 | ffi | v1-full | `@repr(C)` does not automatically make nested non-FFI-safe types safe. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-078 | ffi | v1-full | Opaque foreign types do not expose unknown layout. | tasks/0413 §70. Invariants | - | T510 |
+| REQ-FFI-079 | ffi | v1-full | Foreign ownership must not be inferred from raw pointer representation. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-080 | ffi | v1-full | Foreign allocation and Axiom allocation domains are distinct unless explicitly compatible. | tasks/0413 §70. Invariants | - | T514 |
+| REQ-FFI-081 | ffi | v1-full | Axiom strings are not implicitly C strings. | tasks/0413 §70. Invariants; tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-FFI-082 | ffi | v1-full | Nullability is explicit at FFI boundaries. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-083 | ffi | v1-full | Raw pointers do not establish safe capability provenance. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-084 | ffi | v1-full | Foreign calls with unknown effects are conservative. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-085 | ffi | v1-full | Unknown foreign aliasing is never treated as `NO_ALIAS`. | tasks/0413 §70. Invariants | - | T502 |
+| REQ-FFI-086 | ffi | v1-full | Foreign contracts may refine compiler knowledge only when explicitly established. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-087 | ffi | v1-full | Unsafe FFI does not disable type, ABI or established verifier checks. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-088 | ffi | v1-full | Unsafe FFI may establish trusted machine-level preconditions. | tasks/0413 §70. Invariants | - | T502 |
+| REQ-FFI-089 | ffi | v1-full | Safe verification resumes after a valid FFI contract boundary. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-090 | ffi | v1-full | Foreign callbacks require explicit lifetime/storage contracts when retained. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-091 | ffi | v1-full | Foreign-thread callbacks require appropriate Send/Share semantics. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-092 | ffi | v1-full | Foreign async operations require explicit async adapters. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-093 | ffi | v1-full | Foreign unwind cannot cross an ABI boundary without an explicit compatible contract. | tasks/0413 §70. Invariants | - | T521, T522 |
+| REQ-FFI-094 | ffi | v1-full | Axiom panic is not automatically equivalent to a foreign exception. | tasks/0413 §70. Invariants | - | T523 |
+| REQ-FFI-095 | ffi | v1-full | Variadic ABI behavior is target-specific and explicit. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-096 | ffi | v1-full | C structs require compatible representation before crossing C ABI. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-097 | ffi | v1-full | Axiom enums do not automatically equal C enums/unions. | tasks/0413 §70. Invariants | - | T507 |
+| REQ-FFI-098 | ffi | v1-full | Packed representations require unsafe/system handling. | tasks/0413 §70. Invariants | - | T507 |
+| REQ-FFI-099 | ffi | v1-full | Alignment requirements are part of FFI validity. | tasks/0413 §70. Invariants | - | T506 |
+| REQ-FFI-100 | ffi | v1-full | Foreign memory is an explicit external storage domain. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-101 | ffi | v1-full | Foreign memory may become a safe capability only after its validity contract is established. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-102 | ffi | v1-full | Foreign memory cannot be unmapped while dependent safe capabilities remain live. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-103 | ffi | v1-full | Exported Axiom functions require explicit native ABI/export contracts. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-104 | ffi | v1-full | Generic functions require concrete specialization before C ABI export. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-105 | ffi | v1-full | Capturing closures are not implicitly C function pointers. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-106 | ffi | v1-full | Noncapturing closures may decay to compatible function pointers. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-107 | ffi | v1-full | Dynamic symbol lookup cannot infer callable ABI from raw address alone. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-108 | ffi | v1-full | FFI metadata is part of ABI/build metadata. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-109 | ffi | v1-full | Generated FFI declarations re-enter ordinary compiler verification. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-110 | ffi | v1-full | FFI wrappers may provide safe ownership/capability abstractions over unsafe foreign APIs. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-111 | ffi | v1-full | System dependencies remain distinct from compiler dependencies. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-112 | ffi | v1-full | FFI cannot weaken Axiom semantic verification. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-113 | ffi | v1-full | FFI contracts participate in Effect, Alias, Escape and ABI analysis. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-114 | ffi | v1-full | Unknown foreign behavior may reduce optimization freedom but cannot alter semantics. | tasks/0413 §70. Invariants | - | T505 |
+| REQ-FFI-115 | ffi | v1-full | FFI inspection must expose ABI and ownership contracts. | tasks/0413 §70. Invariants | - | T504 |
+| REQ-FFI-116 | ffi | v1-full | The final native compiler must be capable of consuming its own canonical FFI representation without requiring a third-party compiler. | tasks/0413 §70. Invariants | - | T505 |
 | REQ-SIMD-085 | simd | v1-full | ANUM-20 â€” Scalar numeric types are fundamental Axiom values. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T450 |
 | REQ-SIMD-086 | simd | v1-full | ANUM-21 â€” SIMD vectors are value-semantic types. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T463 |
 | REQ-SIMD-087 | simd | v1-full | ANUM-22 â€” SIMD vector semantics are distinct from array semantics. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T463 |
@@ -5965,56 +5965,56 @@
 | REQ-OPT-339 | Optimization | v1-full | Optimization may reorder operations only when effect and memory-ordering constraints permit it. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
 | REQ-OPT-340 | Optimization | v1-full | Optimization must preserve panic, Drop, synchronization, atomic, volatile, FFI, GPU, and async semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
 | REQ-OPT-341 | Optimization | v1-full | Optimization must preserve source-to-machine debug provenance. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-RES-130 | ABI & Representation | v1-full | Semantic type identity is distinct from physical representation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-131 | ABI & Representation | v1-full | Default Axiom representation is compiler-controlled unless explicitly constrained. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-132 | ABI & Representation | v1-full | Explicit representation attributes create representation contracts. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-133 | ABI & Representation | v1-full | `@repr(C)` provides a C-compatible representation contract within the defined FFI-safe subset. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-134 | ABI & Representation | v1-full | `@repr(transparent)` preserves the required underlying representation contract without merging semantic type identity. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-135 | ABI & Representation | v1-full | Packed representation may create alignment hazards and belongs to unsafe/system usage. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-136 | ABI & Representation | v1-full | Alignment is part of physical layout correctness. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-137 | ABI & Representation | v1-full | Padding is not semantic data. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-138 | ABI & Representation | v1-full | Semantic equality is not automatically bytewise equality. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-139 | ABI & Representation | v1-full | Enum representation is compiler-controlled unless explicitly constrained. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-140 | ABI & Representation | v1-full | Niche optimization may be used when representation semantics permit it. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-141 | ABI & Representation | v1-full | Niche representation is not exposed as a semantic assumption unless explicitly contracted. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-142 | ABI & Representation | v1-full | Small aggregates may be passed or returned in registers when the target ABI permits. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-143 | ABI & Representation | v1-full | Large aggregates may use indirect/caller-allocated return mechanisms. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-144 | ABI & Representation | v1-full | Caller allocation does not imply heap allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-145 | ABI & Representation | v1-full | Returning an owned value does not inherently require a physical memory copy. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-146 | ABI & Representation | v1-full | Move semantics do not imply physical movement. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-147 | ABI & Representation | v1-full | Copy semantics do not imply physical copying. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-148 | ABI & Representation | v1-full | `view<T>` and `mut_view<T>` representations are ABI details, not their complete semantic definitions. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-149 | ABI & Representation | v1-full | Compiler-only capability metadata may be erased after verification. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-150 | ABI & Representation | v1-full | Dynamic dispatch exists only when explicitly represented by the source semantics or required by an ABI boundary. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-151 | ABI & Representation | v1-full | Static trait dispatch does not require a vtable. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-152 | ABI & Representation | v1-full | `dyn Trait` may use explicit dynamic-dispatch metadata such as a vtable. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-153 | ABI & Representation | v1-full | Closure representation is compiler-controlled unless crossing an explicit ABI boundary. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-154 | ABI & Representation | v1-full | Noncapturing closures may lower to ordinary function pointers. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-155 | ABI & Representation | v1-full | Capturing closures do not inherently require heap allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-156 | ABI & Representation | v1-full | Drop glue is compiler-generated deterministic cleanup, not garbage collection. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-157 | ABI & Representation | v1-full | Trivially destructible values require no unnecessary runtime cleanup. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-158 | ABI & Representation | v1-full | Drop flags may be eliminated when control-flow analysis proves their state statically. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-159 | ABI & Representation | v1-full | Newtype semantic identity is preserved even when physical representation is transparent. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-160 | ABI & Representation | v1-full | `CAST` and `BITCAST` are semantically distinct operations. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-161 | ABI & Representation | v1-full | Bitcasts require valid representation, size, and alignment conditions. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-162 | ABI & Representation | v1-full | Memory representation is distinct from serialization/wire representation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-163 | ABI & Representation | v1-full | Endianness is explicit at serialization/device/FFI boundaries rather than implicit in ordinary semantic types. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-164 | ABI & Representation | v1-full | ABI classification is distinct from register allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-165 | ABI & Representation | v1-full | Calling conventions are explicit compiler concepts. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-166 | ABI & Representation | v1-full | Axiom ABI, C ABI, and System ABI are distinct contracts. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-167 | ABI & Representation | v1-full | `pub` visibility does not automatically export a binary symbol. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-168 | ABI & Representation | v1-full | Binary exports require explicit export semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-169 | ABI & Representation | v1-full | Generic functions cannot be directly exported through an ABI requiring a concrete signature without specialization. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-170 | ABI & Representation | v1-full | Foreign allocator ownership is explicit. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-171 | ABI & Representation | v1-full | Foreign pointers do not automatically establish safe ownership or capability validity. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-172 | ABI & Representation | v1-full | Foreign calls are conservatively modeled unless an explicit contract provides stronger facts. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-173 | ABI & Representation | v1-full | ABI lowering must preserve ownership, Drop, synchronization, atomic, volatile, FFI, async, and GPU semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-174 | ABI & Representation | v1-full | ABI MIR contains no unresolved generic or semantic representation decisions. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-175 | ABI & Representation | v1-full | Compiler-only abstractions must be erased, specialized, or lowered before machine code generation. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-176 | ABI & Representation | v1-full | ABI lowering must preserve source-to-machine debug provenance. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-177 | ABI & Representation | v1-full | ABI decisions are target-aware but must preserve target-independent Axiom semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-178 | ABI & Representation | v1-full | Representation constraints must never silently weaken safe-code guarantees. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
-| REQ-RES-179 | ABI & Representation | v1-full | ABI lowering cannot introduce mandatory heap allocation, object headers, GC, or runtime services unless explicitly required by the program's semantics or ABI contract. | tasks/0367 §82. Invariants — `AABI-20..` | - | EPIC(E13.1) |
+| REQ-RES-130 | ABI & Representation | v1-full | Semantic type identity is distinct from physical representation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-131 | ABI & Representation | v1-full | Default Axiom representation is compiler-controlled unless explicitly constrained. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-132 | ABI & Representation | v1-full | Explicit representation attributes create representation contracts. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-133 | ABI & Representation | v1-full | `@repr(C)` provides a C-compatible representation contract within the defined FFI-safe subset. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-134 | ABI & Representation | v1-full | `@repr(transparent)` preserves the required underlying representation contract without merging semantic type identity. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-135 | ABI & Representation | v1-full | Packed representation may create alignment hazards and belongs to unsafe/system usage. | tasks/0367 §82. Invariants — `AABI-20..` | - | T507 |
+| REQ-RES-136 | ABI & Representation | v1-full | Alignment is part of physical layout correctness. | tasks/0367 §82. Invariants — `AABI-20..` | - | T506 |
+| REQ-RES-137 | ABI & Representation | v1-full | Padding is not semantic data. | tasks/0367 §82. Invariants — `AABI-20..` | - | T509 |
+| REQ-RES-138 | ABI & Representation | v1-full | Semantic equality is not automatically bytewise equality. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-139 | ABI & Representation | v1-full | Enum representation is compiler-controlled unless explicitly constrained. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-140 | ABI & Representation | v1-full | Niche optimization may be used when representation semantics permit it. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-141 | ABI & Representation | v1-full | Niche representation is not exposed as a semantic assumption unless explicitly contracted. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-142 | ABI & Representation | v1-full | Small aggregates may be passed or returned in registers when the target ABI permits. | tasks/0367 §82. Invariants — `AABI-20..` | - | T503 |
+| REQ-RES-143 | ABI & Representation | v1-full | Large aggregates may use indirect/caller-allocated return mechanisms. | tasks/0367 §82. Invariants — `AABI-20..` | - | T503 |
+| REQ-RES-144 | ABI & Representation | v1-full | Caller allocation does not imply heap allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-145 | ABI & Representation | v1-full | Returning an owned value does not inherently require a physical memory copy. | tasks/0367 §82. Invariants — `AABI-20..` | - | T513, T526 |
+| REQ-RES-146 | ABI & Representation | v1-full | Move semantics do not imply physical movement. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-147 | ABI & Representation | v1-full | Copy semantics do not imply physical copying. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-148 | ABI & Representation | v1-full | `view<T>` and `mut_view<T>` representations are ABI details, not their complete semantic definitions. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-149 | ABI & Representation | v1-full | Compiler-only capability metadata may be erased after verification. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-150 | ABI & Representation | v1-full | Dynamic dispatch exists only when explicitly represented by the source semantics or required by an ABI boundary. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-151 | ABI & Representation | v1-full | Static trait dispatch does not require a vtable. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-152 | ABI & Representation | v1-full | `dyn Trait` may use explicit dynamic-dispatch metadata such as a vtable. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-153 | ABI & Representation | v1-full | Closure representation is compiler-controlled unless crossing an explicit ABI boundary. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-154 | ABI & Representation | v1-full | Noncapturing closures may lower to ordinary function pointers. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-155 | ABI & Representation | v1-full | Capturing closures do not inherently require heap allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-156 | ABI & Representation | v1-full | Drop glue is compiler-generated deterministic cleanup, not garbage collection. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-157 | ABI & Representation | v1-full | Trivially destructible values require no unnecessary runtime cleanup. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-158 | ABI & Representation | v1-full | Drop flags may be eliminated when control-flow analysis proves their state statically. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-159 | ABI & Representation | v1-full | Newtype semantic identity is preserved even when physical representation is transparent. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-160 | ABI & Representation | v1-full | `CAST` and `BITCAST` are semantically distinct operations. | tasks/0367 §82. Invariants — `AABI-20..` | - | T509 |
+| REQ-RES-161 | ABI & Representation | v1-full | Bitcasts require valid representation, size, and alignment conditions. | tasks/0367 §82. Invariants — `AABI-20..` | - | T509 |
+| REQ-RES-162 | ABI & Representation | v1-full | Memory representation is distinct from serialization/wire representation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-163 | ABI & Representation | v1-full | Endianness is explicit at serialization/device/FFI boundaries rather than implicit in ordinary semantic types. | tasks/0367 §82. Invariants — `AABI-20..` | - | T510 |
+| REQ-RES-164 | ABI & Representation | v1-full | ABI classification is distinct from register allocation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T503 |
+| REQ-RES-165 | ABI & Representation | v1-full | Calling conventions are explicit compiler concepts. | tasks/0367 §82. Invariants — `AABI-20..` | - | T503 |
+| REQ-RES-166 | ABI & Representation | v1-full | Axiom ABI, C ABI, and System ABI are distinct contracts. | tasks/0367 §82. Invariants — `AABI-20..` | - | T503 |
+| REQ-RES-167 | ABI & Representation | v1-full | `pub` visibility does not automatically export a binary symbol. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-168 | ABI & Representation | v1-full | Binary exports require explicit export semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-169 | ABI & Representation | v1-full | Generic functions cannot be directly exported through an ABI requiring a concrete signature without specialization. | tasks/0367 §82. Invariants — `AABI-20..` | - | T504 |
+| REQ-RES-170 | ABI & Representation | v1-full | Foreign allocator ownership is explicit. | tasks/0367 §82. Invariants — `AABI-20..` | - | T514 |
+| REQ-RES-171 | ABI & Representation | v1-full | Foreign pointers do not automatically establish safe ownership or capability validity. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-172 | ABI & Representation | v1-full | Foreign calls are conservatively modeled unless an explicit contract provides stronger facts. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-173 | ABI & Representation | v1-full | ABI lowering must preserve ownership, Drop, synchronization, atomic, volatile, FFI, async, and GPU semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | T508 |
+| REQ-RES-174 | ABI & Representation | v1-full | ABI MIR contains no unresolved generic or semantic representation decisions. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-175 | ABI & Representation | v1-full | Compiler-only abstractions must be erased, specialized, or lowered before machine code generation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-176 | ABI & Representation | v1-full | ABI lowering must preserve source-to-machine debug provenance. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-177 | ABI & Representation | v1-full | ABI decisions are target-aware but must preserve target-independent Axiom semantics. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-178 | ABI & Representation | v1-full | Representation constraints must never silently weaken safe-code guarantees. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
+| REQ-RES-179 | ABI & Representation | v1-full | ABI lowering cannot introduce mandatory heap allocation, object headers, GC, or runtime services unless explicitly required by the program's semantics or ABI contract. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
 | REQ-CORE-1263 | Backend | v1-core | ABI MIR is the input to target lowering. | tasks/0368 §80. Backend invariants — `ALIR-20..` | - | T113 | 
 | REQ-CORE-1264 | Backend | v1-core | Axiom LIR remains semantically equivalent to ABI MIR. | tasks/0368 §80. Backend invariants — `ALIR-20..` | - | T113 | 
 | REQ-CORE-1265 | Backend | v1-core | Axiom LIR does not reintroduce source-level ownership or capability semantics. | tasks/0368 §80. Backend invariants — `ALIR-20..` | - | T113 | 
@@ -6152,7 +6152,7 @@
 | REQ-COL-133 | collections | v1-core | Containers are library abstractions whose physical storage may be optimized (including stack scalarization and allocation elimination) provided documented semantic contracts are preserved. | tasks/0416 §1, tasks/0416 §71 (ACOLLECT-20, ACOLLECT-21, ACOLLECT-22, ACOLLECT-23) | - | T113 | 
 | REQ-COL-134 | collections | v1-core | Fixed arrays guarantee contiguous representation, `ArrayVec` provides fixed-capacity inline storage, and `SmallVec` provides inline storage with heap growth fallback. | tasks/0416 §71 (ACOLLECT-27, ACOLLECT-28, ACOLLECT-29) | - | T113 | 
 | REQ-COL-135 | collections | post-v1 | Arena containers provide bulk-lifetime deallocation, Pool containers provide element reuse, and Slab containers provide stable logical slot indices without exposing raw pointers. | tasks/0416 §71 (ACOLLECT-30, ACOLLECT-31, ACOLLECT-32, ACOLLECT-33) | - | EPIC(E24.0) |
-| REQ-CAP-122 | capability | v1-full | Active container views enforce capability and lifetime constraints, prohibiting mutation, growth, or storage relocation of the parent container while the view is active. | tasks/0416 §71 (ACOLLECT-42, ACOLLECT-43) | - | EPIC(E13.1) |
+| REQ-CAP-122 | capability | v1-full | Active container views enforce capability and lifetime constraints, prohibiting mutation, growth, or storage relocation of the parent container while the view is active. | tasks/0416 §71 (ACOLLECT-42, ACOLLECT-43) | - | T501 |
 | REQ-OPT-342 | optimizer | v1-full | Container bounds checks can only be eliminated when the compiler formally proves that out-of-bounds indexing is unreachable. | tasks/0416 §71 (ACOLLECT-44), tasks/0426 §85 (AITER-69) | - | EPIC(E15.1) |
 | REQ-TXT-002 | text | post-v1 | Short string optimization (SSO) is an internal representation optimization and is not part of the semantic string type contract unless explicitly declared in an ABI contract. | tasks/0416 §71 (ACOLLECT-51, ACOLLECT-52) | - | EPIC(E24.0) |
 | REQ-LAY-288 | layout | post-v1 | `SoA` is an explicit semantic container type, and compiler transformations between Array-of-Structures and Structure-of-Arrays are permitted only when layout is unconstrained by ABI. | tasks/0416 §71 (ACOLLECT-56, ACOLLECT-57, ACOLLECT-58) | - | EPIC(E24.0) |
@@ -6179,10 +6179,10 @@
 | REQ-DBG-032 | debug | post-v1 | Optimization provenance records explain why source values or operations were eliminated, folded, or relocated for developer and AI tooling. | tasks/0419 §70 (ADEBUG-59, ADEBUG-60) | - | EPIC(E24.0) |
 | REQ-SEC-106 | security | v1-core | Safe Axiom code enforces memory safety, use-after-move prevention, initialization tracking, dangling-capability prevention, and data-race freedom at compile time without tracing GC. | tasks/0420 §2, tasks/0420 §70 (ASEC-20, ASEC-21, ASEC-22, ASEC-23, ASEC-24, ASEC-25, ASEC-68) | - | T113 | 
 | REQ-SEC-107 | security | v1-core | `unsafe` blocks and functions establish explicit trusted boundaries requiring verified preconditions rather than globally disabling compiler safety checks. | tasks/0420 §1, tasks/0420 §70 (ASEC-26, ASEC-27, ASEC-28, ASEC-29, ASEC-30) | - | T113 | 
-| REQ-CAP-123 | capability | v1-full | Raw pointers and integer addresses do not possess capability provenance or ownership, and cannot be implicitly converted into safe capabilities. | tasks/0420 §70 (ASEC-31, ASEC-32, ASEC-33) | - | EPIC(E13.1) |
+| REQ-CAP-123 | capability | v1-full | Raw pointers and integer addresses do not possess capability provenance or ownership, and cannot be implicitly converted into safe capabilities. | tasks/0420 §70 (ASEC-31, ASEC-32, ASEC-33) | - | T516, T517, T520 |
 | REQ-SEC-108 | security | post-v1 | Explicit secure zeroization of sensitive memory is an observable semantic operation that optimization passes are prohibited from eliminating as dead stores. | tasks/0420 §70 (ASEC-46, ASEC-47) | - | EPIC(E24.0) |
 | REQ-SEC-109 | security | post-v1 | Constant-time contracts on secret data restrict data-dependent branching and table indexing during optimization, emitting compile-time diagnostics upon violation. | tasks/0420 §70 (ASEC-48, ASEC-49, ASEC-50, ASEC-51, ASEC-52), tasks/0427 §100 (ANUM-81) | - | EPIC(E24.0) |
-| REQ-FFI-117 | ffi | v1-full | Foreign function interfaces represent untrusted boundaries whose foreign side effects and pointer provenance are conservatively treated unless explicit verified contracts exist. | tasks/0420 §70 (ASEC-54, ASEC-55, ASEC-56) | - | EPIC(E13.1) |
+| REQ-FFI-117 | ffi | v1-full | Foreign function interfaces represent untrusted boundaries whose foreign side effects and pointer provenance are conservatively treated unless explicit verified contracts exist. | tasks/0420 §70 (ASEC-54, ASEC-55, ASEC-56) | - | T516 |
 | REQ-LIR-026 | lir | v1-core | Inline assembly blocks require explicit declarations of all input operands, output operands, clobbered registers, and memory side effects. | tasks/0420 §70 (ASEC-60, ASEC-61) | - | T113 | 
 | REQ-VER-010 | verifier | v1-core | Safety verification strictly precedes optimization, and optimization passes cannot create retroactive safety proofs. | tasks/0420 §70 (ASEC-73, ASEC-74) | - | T113 | 
 | REQ-DIAG-090 | diagnostics | v1-core | Compiler diagnostics are structured semantic objects identified by stable machine-readable codes rather than formatted human-readable text. | tasks/0421 §1, tasks/0421 §2, tasks/0421 §70 (ADIAG-20, ADIAG-21, ADIAG-22) | - | T113 | 
@@ -6220,7 +6220,7 @@
 | REQ-GEN-097 | generics | v1-core | Iterators are compile-time generic protocols without mandatory heap allocation or virtual dispatch, allowing optimizer passes to fully erase iterator objects into native loops. | tasks/0426 §1, tasks/0426 §85 (AITER-20, AITER-21, AITER-22, AITER-59) | - | T113 | 
 | REQ-EXP-146 | expr | v1-core | Range expressions define half-open (`..`) or inclusive (`..=`) bounds with defined integer arithmetic, preserving traversal order across forward and stepped iterations. | tasks/0426 §85 (AITER-24, AITER-25, AITER-26) | - | T113 | 
 | REQ-OPT-344 | optimizer | v1-full | Iterator adapters such as `map` and `filter` are lazy, and iterator pipeline fusion may eliminate intermediate buffers only when observable side effects are preserved. | tasks/0426 §85 (AITER-27, AITER-28, AITER-29, AITER-30) | - | EPIC(E15.1) |
-| REQ-CAP-124 | capability | v1-full | Mutable iterators provide exclusive capabilities, and overlapping mutable iteration over the same container is statically rejected unless provenance proves disjoint element subsets. | tasks/0426 §85 (AITER-31, AITER-32, AITER-33, AITER-35) | - | EPIC(E13.1) |
+| REQ-CAP-124 | capability | v1-full | Mutable iterators provide exclusive capabilities, and overlapping mutable iteration over the same container is statically rejected unless provenance proves disjoint element subsets. | tasks/0426 §85 (AITER-31, AITER-32, AITER-33, AITER-35) | - | T502 |
 | REQ-OWN-241 | ownership | v1-core | Container iteration distinguishes borrowing views (`iter`), exclusive views (`iter_mut`), and consuming ownership transfers (`into_iter`), ensuring partially consumed owning iterators drop unconsumed elements. | tasks/0426 §85 (AITER-36, AITER-37, AITER-38, AITER-39) | - | T113 | 
 | REQ-SIMD-328 | simd | v1-full | Iterators over contiguous memory expose layout and stride guarantees, enabling automatic loop vectorization when aliasing and profitability are verified. | tasks/0426 §85 (AITER-47, AITER-48, AITER-60) | - | T466 |
 | REQ-CORE-1316 | core-lib | v1-core | Standard algorithms maintain defined complexity bounds and documented semantic properties (such as sort stability), which the compiler cannot bypass for optimization. | tasks/0426 §85 (AITER-50, AITER-73, AITER-74) | - | T113 | 
@@ -6236,7 +6236,7 @@
 | REQ-COL-141 | collections | v1-core | `Array<T, N>` is a fixed-length contiguous inline value sequence without implicit heap allocation. | 0429 §2, 0429 §52 ACOL-20 | - | T113 | 
 | REQ-COL-142 | collections | v1-core | Collections other than `Array<T, N>`, `view<T>`, and `mut_view<T>` are standard library abstractions and not compiler primitive types. | 0429 §1, 0429 §52 ACOL-20 | - | T113 | 
 | REQ-COL-143 | collections | v1-core | `Vec<T>` is an owned growable sequence without guaranteed stable physical address across mutations or reallocations. | 0429 §4, 0429 §52 ACOL-23, ACOL-24 | - | T113 | 
-| REQ-CAP-125 | capability | v1-full | Collection operations that may relocate backing storage must be prevented while live `view<T>` or `mut_view<T>` capabilities to that storage exist. | 0429 §8, §9, 0429 §52 ACOL-25, ACOL-55 | - | EPIC(E13.1) |
+| REQ-CAP-125 | capability | v1-full | Collection operations that may relocate backing storage must be prevented while live `view<T>` or `mut_view<T>` capabilities to that storage exist. | 0429 §8, §9, 0429 §52 ACOL-25, ACOL-55 | - | T501 |
 | REQ-COL-144 | collections | v1-core | `view<T>` provides a read capability over collection elements without heap allocation or element copying. | 0429 §3, §21, 0429 §52 ACOL-26 | - | T113 | 
 | REQ-COL-145 | collections | v1-core | `into_iter` transfers element ownership without implicit cloning, and early loop exit must drop remaining elements deterministically. | 0429 §12, 0429 §52 ACOL-28 | - | T113 | 
 | REQ-OPT-345 | optimizer | v1-full | The compiler may promote non-escaping bounded collection storage to stack, registers, or inline storage, or eliminate allocation entirely when observable semantics are preserved. | 0429 §6, 0429 §52 ACOL-31, ACOL-32, ACOL-33 | - | EPIC(E15.1) |
@@ -6253,14 +6253,14 @@
 | REQ-TYP-331 | types | v1-core | `BITCAST` requires identical size and alignment and valid target bit representations, preserving bit patterns without serialization or value transformation. | 0431 §52 ACONV-41, ACONV-42, ACONV-43 | - | T113 |
 | REQ-TYP-332 | types | v1-core | Transparent newtypes preserve distinct semantic type identity while permitting zero-cost ABI representation equivalence. | 0431 §38, 0431 §52 ACONV-44 | - | T113 |
 | REQ-TXT-003 | text | v1-core | Conversion from raw `Bytes` to `Str` requires explicit UTF-8 validation or an explicit trusted unsafe contract. | 0431 §40, 0431 §52 ACONV-51 | - | T113 | 
-| REQ-CAP-126 | capability | v1-full | Conversion cannot implicitly convert `view<T>` to `mut_view<T>` or convert integer values to safe pointers with valid provenance. | 0431 §49, §50, 0431 §52 ACONV-52, ACONV-54 | - | EPIC(E13.1) |
+| REQ-CAP-126 | capability | v1-full | Conversion cannot implicitly convert `view<T>` to `mut_view<T>` or convert integer values to safe pointers with valid provenance. | 0431 §49, §50, 0431 §52 ACONV-52, ACONV-54 | - | T502 |
 | REQ-MOD-138 | module | v1-core | Module identity is independent of filesystem path, uses stable declaration identifiers, and performs declaration collection prior to body resolution. | 0432 §44, 0432 §58 AMOD-21, AMOD-22, AMOD-23 | - | T113 | 
 | REQ-MOD-139 | module | v1-core | Cyclic module dependencies within the same package are permitted, whereas import ordering must not affect resolution semantics. | 0432 §44, 0432 §58 AMOD-24, AMOD-25 | - | T113 | 
 | REQ-PKG-009 | package | v1-core | Package dependency graphs must be strictly acyclic, and packages cannot expose private declarations to external dependencies. | 0432 §43, 0432 §58 APKG-22, APKG-24, AMOD-27 | - | T113 | 
 | REQ-RES-180 | resolve | v1-core | The `pub` keyword specifies source-level visibility rather than native binary symbol export, which requires explicit `@export`. | 0432 §58 AAPI-20, AAPI-21 | - | T113 | 
 | REQ-BLD-096 | build | v1-core | Package public interfaces define semantic interface fingerprints distinct from implementation fingerprints, ensuring implementation-only changes do not invalidate dependent consumers. | 0432 §58 AAPI-22, AINTERFACE-20, AINTERFACE-22 | - | T113 | 
-| REQ-ABI-091 | abi | v1-full | Package boundaries do not default to binary ABI boundaries, and the default Axiom ABI does not guarantee cross-version binary stability unless explicitly marked stable. | 0432 §58 AABI-80, AABI-81, AABI-82 | - | EPIC(E13.1) |
-| REQ-ABI-092 | abi | v1-full | Exporting generic functions through C ABI requires concrete monomorphic specialization or ABI-erased interface handles. | 0432 §49, §50, 0432 §58 AABI-85 | - | EPIC(E13.1) |
+| REQ-ABI-091 | abi | v1-full | Package boundaries do not default to binary ABI boundaries, and the default Axiom ABI does not guarantee cross-version binary stability unless explicitly marked stable. | 0432 §58 AABI-80, AABI-81, AABI-82 | - | T504 |
+| REQ-ABI-092 | abi | v1-full | Exporting generic functions through C ABI requires concrete monomorphic specialization or ABI-erased interface handles. | 0432 §49, §50, 0432 §58 AABI-85 | - | T503 |
 | REQ-CTM-043 | comptime | v1-full | Compile-time reflection is the default reflection mechanism, where `Type` metadata is evaluated at comptime and erased from runtime binaries unless runtime RTTI is explicitly enabled. | 0433 §58, 0433 §71 AREFLECT-20, AREFLECT-21, AZREFLECT-20, AZREFLECT-21 | - | EPIC(E14.1) |
 | REQ-VER-012 | verifier | v1-core | Declarations generated via compile-time reflection must undergo standard type checking, ownership verification, and capability verification without bypass privileges. | 0433 §42, 0433 §71 AREFLECT-25 | - | T113 | 
 | REQ-TYP-333 | types | v1-core | Reflection enumeration follows deterministic semantic declaration order, and physical field reordering by optimizer does not alter semantic reflection order. | 0433 §44, §45, 0433 §71 AREFLECT-26, AREFLECT-27 | - | T113 |
@@ -6268,12 +6268,12 @@
 | REQ-TYP-334 | types | v1-core | Axiom Core does not include a universal `Any`, Object root class, or implicit dynamic method invocation by string name. | 0433 §56, §57, 0433 §71 ARTTI-24 | - | T113 |
 | REQ-TYP-335 | types | post-v1 | Opaque types hide internal field layout and representation from consumers at public API boundaries while preserving semantic type identity. | 0433 §67, §68, 0433 §71 AOPAQUE-20, AOPAQUE-21 | - | EPIC(E24.0) |
 | REQ-LNK-227 | linker | v1-full | Runtime reflection metadata acts as reachability roots for the linker, while unused reflection metadata may be stripped via dead-metadata elimination. | 0433 §34, §35, §63, 0433 §71 AREFLECT-29, AREFLECT-30, AMETA-26 | - | EPIC(E18.6) |
-| REQ-FFI-118 | ffi | v1-full | Foreign function declarations define an explicit ABI boundary with declared calling conventions, and unknown foreign calls are treated conservatively by compiler analysis. | 0434 §92 AFFI-20, AFFI-21, AFFI-22, AFFI-25 | - | EPIC(E13.1) |
+| REQ-FFI-118 | ffi | v1-full | Foreign function declarations define an explicit ABI boundary with declared calling conventions, and unknown foreign calls are treated conservatively by compiler analysis. | 0434 §92 AFFI-20, AFFI-21, AFFI-22, AFFI-25 | - | T504 |
 | REQ-OWN-243 | ownership | v1-core | Foreign pointers do not imply ownership or safe capability provenance, and foreign allocations require explicit allocator and deallocator contracts. | 0434 §35, §36, 0434 §92 AFFI-30, AFFI-31, AFFI-32 | - | T113 | 
-| REQ-ABI-093 | abi | v1-full | Default Axiom struct layout is not C-compatible; C-compatible layout requires explicit `@repr(C)`. | 0434 §92 AFFI-23, AFFI-60 | - | EPIC(E13.1) |
+| REQ-ABI-093 | abi | v1-full | Default Axiom struct layout is not C-compatible; C-compatible layout requires explicit `@repr(C)`. | 0434 §92 AFFI-23, AFFI-60 | - | T510 |
 | REQ-TXT-004 | text | v1-core | Axiom `String` and `Str` are UTF-8 and not null-terminated C strings, requiring explicit conversion for C ABI interoperation. | 0434 §92 AFFI-61 | - | T113 | 
 | REQ-CONC-144 | concurrency | v1-full | Foreign blocking operations and synchronization primitives must declare explicit memory ordering contracts or be treated conservatively across optimization boundaries. | 0434 §40, 0434 §92 AFFI-50, AFFI-53 | - | T403 |
-| REQ-FFI-119 | ffi | v1-full | Dynamic library loading creates an open-world optimization boundary that prohibits closed-world assumptions, devirtualization, or dead-code elimination across the boundary. | 0434 §53, 0434 §92 AFFI-70, AFFI-71 | - | EPIC(E13.1) |
+| REQ-FFI-119 | ffi | v1-full | Dynamic library loading creates an open-world optimization boundary that prohibits closed-world assumptions, devirtualization, or dead-code elimination across the boundary. | 0434 §53, 0434 §92 AFFI-70, AFFI-71 | - | T532 |
 | REQ-SEC-110 | security | v1-core | Unsafe operations must be confined to FFI boundaries, and safe wrapper types must reconstruct Axiom safety invariants before returning to safe code. | 0434 §91, §92 AFFI-90, AFFI-91, AFFI-94 | - | T113 | 
 | REQ-CONC-145 | concurrency | v1-full | Axiom does not mandate a monolithic concurrency runtime; thread execution and asynchronous task runtimes are independent, link-on-demand components. | 0435 §72, §73, 0435 §102 ARUNTIME-CONCUR-20, ARUNTIME-CONCUR-21, ARUNTIME-CONCUR-24 | - | T400 |
 | REQ-CONC-146 | concurrency | v1-full | OS thread execution is distinct from async task execution; cross-thread ownership transfer strictly requires the `Send` trait. | 0435 §102 ATHREAD-20, ATHREAD-21, ATHREAD-22 | - | T415 |
@@ -6286,11 +6286,11 @@
 | REQ-LAY-290 | layout | v1-core | Physical storage placement (registers, stack, inline, arena, pool, or heap) is not determined solely by high-level type declarations and is selected by compiler analysis. | 0436 §2014 AMEMALLOC-20, AMEMALLOC-21 | - | T113 | 
 | REQ-RT-140 | runtime | v1-full | Address stability is not guaranteed by default and must be explicitly contracted when required by foreign interfaces or address-sensitive collections. | 0436 §54, 0436 §2014 AMEMALLOC-24, AMEMALLOC-25 | - | EPIC(E21.1) |
 | REQ-OPT-346 | optimizer | v1-full | Storage for non-escaping allocations may be promoted to stack or registers or completely eliminated when address identity is unobservable. | 0436 §2014 AMEMALLOC-26, AMEMALLOC-27, AFRAG-23 | - | EPIC(E15.1) |
-| REQ-ABI-094 | abi | v1-full | Returning large aggregates by value represents an ownership transfer and may be lowered to caller-allocated destination slots without intermediate heap allocation or copying. | 0436 §79, §80, §81 | - | EPIC(E13.1) |
+| REQ-ABI-094 | abi | v1-full | Returning large aggregates by value represents an ownership transfer and may be lowered to caller-allocated destination slots without intermediate heap allocation or copying. | 0436 §79, §80, §81 | - | T503 |
 | REQ-DRP-057 | drop | v1-core | Batch deallocation in arenas or pools must preserve deterministic element destruction order for types with custom `Drop` implementations. | 0436 §78, 0436 §2014 AMEMALLOC-29, AALLOC-27 | - | T113 | 
 | REQ-SEC-111 | security | v1-core | Memory zeroization contracts for sensitive types (e.g., `Secret<T>`) cannot be eliminated by dead-store optimization even when memory is never subsequently read. | 0436 §68 | - | T113 | 
 | REQ-RT-141 | runtime | v1-full | Virtual memory reservation and memory commitment are distinct operations, and integer addresses do not establish safe pointer provenance. | 0437 §73 AVM-20, AVM-21, AVM-22, AVM-23 | - | EPIC(E21.1) |
-| REQ-CAP-127 | capability | v1-full | Safe memory capabilities cannot outlive their backing address-space mapping or survive page unmapping and protection revocation. | 0437 §73 AVM-28, AVM-29, AMAP-24 | - | EPIC(E13.1) |
+| REQ-CAP-127 | capability | v1-full | Safe memory capabilities cannot outlive their backing address-space mapping or survive page unmapping and protection revocation. | 0437 §73 AVM-28, AVM-29, AMAP-24 | - | T501 |
 | REQ-SEC-112 | security | v1-core | Memory protection permissions (READ, WRITE, EXECUTE) are distinct, and writable memory is not executable by default, supporting platform W^X policies. | 0437 §73 APROTECT-20, APROTECT-21, APROTECT-22 | - | T113 | 
 | REQ-RT-142 | runtime | v1-full | Memory-mapped I/O (MMIO) and volatile device accesses are distinct from ordinary RAM and cannot be eliminated or reordered by compiler optimizations. | 0437 §73 APROTECT-23, APROTECT-24, APROTECT-25 | - | EPIC(E21.1) |
 | REQ-RT-143 | runtime | v1-full | Shared memory mappings between execution contexts or processes do not imply memory synchronization and require explicit synchronization primitives. | 0437 §73 AMAP-21 | - | EPIC(E21.1) |
@@ -6320,7 +6320,7 @@
 | REQ-TST-104 | testing | post-v1 | Real clock dependencies can be replaced with deterministic virtual clocks that advance without consuming real elapsed time for reproducible testing. | 0440 §103, §106, 0440 §152 ATIMETEST-20, ATIMETEST-21, ATIMETEST-22 | - | EPIC(E24.0) |
 | REQ-RT-154 | runtime | v1-full | Socket handles are owned move-only resources that close deterministically upon `Drop` and are non-Copy. | 0441 §201 ANET-20, ANET-21, ANET-23 | - | EPIC(E21.1) |
 | REQ-RT-155 | runtime | v1-full | Network I/O payloads are raw byte buffers (`Bytes`, `view<u8>`) by default; UTF-8 string interpretation requires explicit validation. | 0441 §138, 0441 §201 ANET-30, ANET-31 | - | EPIC(E21.1) |
-| REQ-CAP-128 | capability | v1-full | Active network operations retain buffer capabilities for the operation duration, preventing buffer relocation, modification, or deallocation while I/O is in-flight. | 0441 §201 ANET-32, ANET-33 | - | EPIC(E13.1) |
+| REQ-CAP-128 | capability | v1-full | Active network operations retain buffer capabilities for the operation duration, preventing buffer relocation, modification, or deallocation while I/O is in-flight. | 0441 §201 ANET-32, ANET-33 | - | T500 |
 | REQ-ASY-155 | async | v1-full | Network async I/O is modeled as Future-based suspension, where operation cancellation does not guarantee external wire rollback. | 0441 §127, 0441 §201 ANET-40, ANET-44 | - | T428 |
 | REQ-CONC-152 | concurrency | v1-full | Sockets do not permit concurrent mutation; concurrent reading and writing requires explicit capability splitting (`split()`) into distinct Read and Write capabilities. | 0441 §108, §109, 0441 §201 ANET-62 | - | T427 |
 | REQ-RT-156 | runtime | v1-full | Portable networking semantics are decoupled from POSIX, mapping portably onto `io_uring`, `epoll`, `IOCP`, and `kqueue` backends without altering observable semantics. | 0441 §200, 0441 §201 ANET-50, ANET-51, ANET-52 | - | EPIC(E21.1) |
@@ -6330,7 +6330,7 @@
 | REQ-RT-158 | runtime | v1-full | `File` is a move-only, non-Copy owned OS resource that releases its file descriptor deterministically on `Drop`. | 0442 §148, §149, 0442 §181 AFS-30, AFS-31, AFS-35 | - | EPIC(E21.1) |
 | REQ-ERR-084 | error | v1-core | Fallible file closing or flushing must be invoked explicitly via `file.close()`, as `Drop` cannot return recoverable `Result` errors. | 0442 §149, 0442 §181 AFS-36 | - | T113 | 
 | REQ-RT-159 | runtime | v1-full | Stream-based sequential I/O and positional random-access I/O (`read_at`, `write_at`) are semantically distinct, where positional I/O does not mutate shared cursor state. | 0442 §106, §107, 0442 §181 AFS-40, AFS-41 | - | EPIC(E21.1) |
-| REQ-CAP-129 | capability | v1-full | `MappedRegion` owns memory-mapped file allocations; views into the mapped region cannot outlive the `MappedRegion` instance. | 0442 §160, 0442 §181 AFS-50, AFS-51, AFS-52 | - | EPIC(E13.1) |
+| REQ-CAP-129 | capability | v1-full | `MappedRegion` owns memory-mapped file allocations; views into the mapped region cannot outlive the `MappedRegion` instance. | 0442 §160, 0442 §181 AFS-50, AFS-51, AFS-52 | - | T501 |
 | REQ-RT-160 | runtime | v1-full | Filesystem mutations (rename, unlink, write) represent observable external effects, and durability (`sync_all`) is distinct from successful operation completion. | 0442 §123, §124, §134, §135, 0442 §181 AFS-63, AFS-67, AFS-81 | - | EPIC(E21.1) |
 | REQ-SEC-114 | security | post-v1 | Filesystem access can be sandboxed using directory-relative capabilities (`open_relative_to`) rather than ambient global filesystem authority to mitigate TOCTOU vulnerabilities. | 0442 §171, §172, §174, 0442 §181 AFS-70, AFS-71, AFS-72 | - | EPIC(E24.0) |
 | REQ-RT-161 | runtime | v1-full | OS resource types such as File, Socket, Process, Thread, and Device shall be distinct semantic types managed via compiler resource protocols without sharing a common inheritance base class. | tasks/0443 §184.145 (ARES-20, ARES-21, AOS-36, AOS-37) | - | EPIC(E21.1) |
@@ -6345,15 +6345,15 @@
 | REQ-CTM-045 | comptime | v1-full | Compile-time reflection shall be available independently of runtime reflection; runtime reflection shall be optional and impose zero mandatory binary overhead on programs that do not request it. | tasks/0444 §185.152 (AREFLECT-20, AREFLECT-21, AREFLECT-22) | - | EPIC(E14.1) |
 | REQ-VER-013 | verifier | v1-core | Reflection queries shall not bypass ownership, capability, Drop, or visibility rules, and exposing physical runtime layouts shall require an explicit representation contract. | tasks/0444 §185.152 (AREFLECT-23, AREFLECT-26) | - | T113 | 
 | REQ-MOD-141 | module | v1-core | Public API identity shall be computed as a semantic fingerprint over exported items, generic constraints, associated items, and ABI contracts; implementation-only changes shall not invalidate public API fingerprints. | tasks/0444 §185.152 (AAPI-20, AAPI-21, AAPI-22, AAPI-23, AAPI-24) | - | T113 | 
-| REQ-ABI-095 | abi | v1-full | Dynamic library loading shall be treated as an open-world boundary where raw imported symbols cannot be called in safe code without an explicit versioned contract. | tasks/0444 §185.152 (AABIAPI-22, AABIAPI-23, AABIAPI-26) | - | EPIC(E13.1) |
+| REQ-ABI-095 | abi | v1-full | Dynamic library loading shall be treated as an open-world boundary where raw imported symbols cannot be called in safe code without an explicit versioned contract. | tasks/0444 §185.152 (AABIAPI-22, AABIAPI-23, AABIAPI-26) | - | T530 |
 | REQ-PKG-010 | package | v1-core | Binary packages shall expose sufficient generic metadata to support downstream generic specialization, with package version and enabled features participating in artifact identity. | tasks/0444 §185.152 (APKGAPI-20, APKGAPI-21, APKGAPI-22, APKGAPI-23) | - | T113 | 
-| REQ-FFI-120 | ffi | v1-full | Foreign interoperability shall occur across explicit ABI boundaries; foreign functions shall be treated as unsafe by default, and ABI identity shall form part of foreign function type identity. | tasks/0445 §186.161 (AFFI-20, AFFI-21, AFFI-22, AFFI-23) | - | EPIC(E13.1) |
-| REQ-FFI-121 | ffi | v1-full | Foreign raw pointers shall not imply ownership; foreign ownership transfers, destructions, and distinct allocator domains shall be governed by explicit contracts. | tasks/0445 §186.161 (AFFI-30, AFFI-31, AFFI-32, AFFI-33) | - | EPIC(E13.1) |
-| REQ-CAP-130 | capability | v1-full | Converting a foreign pointer into a safe view shall require proof of validity, provenance, lifetime, alignment, and access permissions, with mut_view additionally requiring exclusive mutation proof. | tasks/0445 §186.161 (AFFI-40, AFFI-41, AFFI-42) | - | EPIC(E13.1) |
+| REQ-FFI-120 | ffi | v1-full | Foreign interoperability shall occur across explicit ABI boundaries; foreign functions shall be treated as unsafe by default, and ABI identity shall form part of foreign function type identity. | tasks/0445 §186.161 (AFFI-20, AFFI-21, AFFI-22, AFFI-23) | - | T504 |
+| REQ-FFI-121 | ffi | v1-full | Foreign raw pointers shall not imply ownership; foreign ownership transfers, destructions, and distinct allocator domains shall be governed by explicit contracts. | tasks/0445 §186.161 (AFFI-30, AFFI-31, AFFI-32, AFFI-33) | - | T514 |
+| REQ-CAP-130 | capability | v1-full | Converting a foreign pointer into a safe view shall require proof of validity, provenance, lifetime, alignment, and access permissions, with mut_view additionally requiring exclusive mutation proof. | tasks/0445 §186.161 (AFFI-40, AFFI-41, AFFI-42) | - | T506 |
 | REQ-VER-014 | verifier | v1-core | Foreign function calls shall not erase verifier state outside the declared contract, and unknown foreign aliasing shall never be assumed disjoint. | tasks/0445 §186.161 (AFFI-44, AFFI-45) | - | T113 | 
-| REQ-ABI-096 | abi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries, foreign exceptions shall not unwind across Axiom frames, and unwind behavior shall be declared in explicit ABI contracts. | tasks/0445 §186.161 (AFFI-60, AFFI-61, AFFI-62) | - | EPIC(E13.1) |
+| REQ-ABI-096 | abi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries, foreign exceptions shall not unwind across Axiom frames, and unwind behavior shall be declared in explicit ABI contracts. | tasks/0445 §186.161 (AFFI-60, AFFI-61, AFFI-62) | - | T521, T522, T523, T524 |
 | REQ-LAY-292 | layout | v1-core | Axiom types shall not use C layout unless explicitly annotated with @repr(C), opaque foreign types shall hide internal layout, and void* shall not be treated as dynamic Any. | tasks/0445 §186.161 (AFFI-70, AFFI-71, AFFI-72, AFFI-73) | - | T113 | 
-| REQ-FFI-122 | ffi | v1-full | Capturing closures shall not implicitly convert to C function pointers, and foreign callback invocations shall have explicit lifetime, threading, and reentrancy contracts. | tasks/0445 §186.161 (AFFI-80, AFFI-81, AFFI-82) | - | EPIC(E13.1) |
+| REQ-FFI-122 | ffi | v1-full | Capturing closures shall not implicitly convert to C function pointers, and foreign callback invocations shall have explicit lifetime, threading, and reentrancy contracts. | tasks/0445 §186.161 (AFFI-80, AFFI-81, AFFI-82) | - | T504 |
 | REQ-PKG-011 | package | v1-core | Package identity shall be content-addressable and distinct from module identity, different package versions shall have distinct semantic identities, and ordinary cyclic dependencies shall be rejected. | tasks/0446 §187.160 (APKG-20, APKG-21, APKG-22, APKG-23, ADEP-22) | - | T113 | 
 | REQ-PKG-012 | package | v1-core | Dependency resolution shall be deterministic and pinned by a lockfile in reproducible mode, maintaining strict separation between host and target dependency environments. | tasks/0446 §187.160 (ADEP-20, ADEP-21, ADEP-24) | - | T113 | 
 | REQ-BLD-097 | build | v1-core | Package feature resolution shall occur prior to semantic compilation, and build-time tools shall not become runtime dependencies unless explicitly linked. | tasks/0446 §187.160 (ADEP-23, ABUILD-21) | - | T113 | 
@@ -6375,7 +6375,7 @@
 | REQ-TOOL-187 | tooling | v1-full | Tooling artifacts including .axmeta, .axdb, and debug information shall not become runtime requirements of production binaries. | tasks/0448 §36 (ATOOL-33, ATOOL-39) | - | EPIC(E19.1) |
 | REQ-TOOL-188 | tooling | v1-full | Compiler tooling shall support querying incomplete source files and provide structured diagnostics on partially parsed programs. | tasks/0448 §36 (ATOOL-40) | - | EPIC(E19.1) |
 | REQ-SEC-115 | security | v1-core | Language memory safety shall remain distinct from trustworthiness; safe code does not imply trusted code, and unsafe code does not automatically grant operating system authority. | tasks/0449 §33 (ASEC-20, ASEC-21, ASEC-22) | - | T113 | 
-| REQ-CAP-131 | capability | v1-full | Access to external operating system authority shall require explicit capability policies; comptime authority shall not become runtime authority nor runtime authority become comptime authority. | tasks/0449 §33 (ASEC-23, ASEC-24, ASEC-25) | - | EPIC(E13.1) |
+| REQ-CAP-131 | capability | v1-full | Access to external operating system authority shall require explicit capability policies; comptime authority shall not become runtime authority nor runtime authority become comptime authority. | tasks/0449 §33 (ASEC-23, ASEC-24, ASEC-25) | - | T516, T517, T520 |
 | REQ-BLD-100 | build | v1-core | Package build scripts shall be treated as a distinct trust boundary; hermetic builds shall restrict network, filesystem, and subprocess access by default. | tasks/0449 §33 (ASEC-26, ASEC-27) | - | T113 | 
 | REQ-SEC-116 | security | v1-core | AI-generated code shall undergo the identical semantic verification as human-written code, without bypassing compiler checks or self-granting capabilities. | tasks/0449 §33 (ASEC-28, ASEC-29) | - | T113 | 
 | REQ-SEC-117 | security | post-v1 | Dynamic library lifetimes shall cover all live symbol capabilities derived from them, and capability escalation across package dependencies shall be explicit and observable. | tasks/0449 §33 (ASEC-33, ASEC-34) | - | EPIC(E24.0) |
@@ -6386,18 +6386,18 @@
 | REQ-DIAG-097 | diagnostics | v1-core | Compiler diagnostics shall establish causal relationships between errors, prioritizing root causes and suppressing cascading derived diagnostics. | tasks/0450 §36 (ADIAG-27, ADIAG-28, ADIAG-38) | - | T113 | 
 | REQ-TOOL-189 | tooling | v1-full | Code completion and IDE queries on partial programs shall respect visibility, ownership, capability, and type constraints without selecting ambiguous candidates via arbitrary heuristics. | tasks/0450 §36 (ADIAG-30, ADIAG-31, ADIAG-32) | - | EPIC(E19.1) |
 | REQ-DIAG-098 | diagnostics | v1-core | Fixing a root diagnostic shall automatically invalidate its derived diagnostics across the incremental dependency graph, and production compilation shall start only when all proofs reach Proven state. | tasks/0450 §36 (ADIAG-37, ADIAG-43) | - | T113 | 
-| REQ-FFI-123 | ffi | v1-full | C ABI shall serve as the primary foreign language interoperability baseline, with C++ ABI compatibility treated as target-specific unless an explicit ABI adapter is declared. | tasks/0451 §192.39 (AFFI-38, AFFI-39) | - | EPIC(E13.1) |
+| REQ-FFI-123 | ffi | v1-full | C ABI shall serve as the primary foreign language interoperability baseline, with C++ ABI compatibility treated as target-specific unless an explicit ABI adapter is declared. | tasks/0451 §192.39 (AFFI-38, AFFI-39) | - | T504 |
 | REQ-TYP-337 | types | v1-core | Safe views crossing FFI boundaries shall preserve provenance and validity; foreign nullable pointers shall not map to safe null values, and C strings shall remain distinct from UTF-8 string types. | tasks/0451 §192.39 (AFFI-24, AFFI-26, AFFI-27) | - | T113 |
-| REQ-CAP-132 | capability | v1-full | Dynamic library unloading shall not invalidate any live safe symbol capability; imported symbols shall retain a lifetime dependency on their originating library handle. | tasks/0451 §192.39 (AFFI-33, AFFI-34) | - | EPIC(E13.1) |
+| REQ-CAP-132 | capability | v1-full | Dynamic library unloading shall not invalidate any live safe symbol capability; imported symbols shall retain a lifetime dependency on their originating library handle. | tasks/0451 §192.39 (AFFI-33, AFFI-34) | - | T531 |
 | REQ-VER-015 | verifier | v1-core | Foreign memory wrapped into a safe Axiom capability shall re-enter normal compiler verification, ensuring unsafe adapters do not disable verification outside the boundary. | tasks/0451 §192.39 (AFFI-40, AFFI-41) | - | T113 | 
-| REQ-FFI-124 | ffi | v1-full | WASM linear-memory addresses shall not automatically acquire safe pointer provenance, and cross-module shared memory shall not imply Send, Share, or serialization safety. | tasks/0451 §192.39 (AFFI-46, AFFI-47) | - | EPIC(E13.1) |
+| REQ-FFI-124 | ffi | v1-full | WASM linear-memory addresses shall not automatically acquire safe pointer provenance, and cross-module shared memory shall not imply Send, Share, or serialization safety. | tasks/0451 §192.39 (AFFI-46, AFFI-47) | - | T518 |
 | REQ-TYP-338 | types | v1-core | Foreign object models (such as C++ inheritance, Objective-C ARC, or Swift ARC) shall not be incorporated into Axiom Core semantics. | tasks/0451 §192.39 (AFFI-37) | - | T113 |
-| REQ-ABI-097 | abi | v1-full | Internal Axiom ABI shall remain freely optimizable, public visibility shall not imply a stable binary ABI, and stable ABI shall require an explicit versioned contract. | tasks/0452 §193.47 (AABI-20, AABI-21, AABI-22) | - | EPIC(E13.1) |
-| REQ-ABI-098 | abi | v1-full | Stable ABI compatibility shall remain distinct from source compatibility and semantic compatibility, requiring explicit type layout and calling-convention specifications. | tasks/0452 §193.47 (AABI-23, AABI-24, AABI-25) | - | EPIC(E13.1) |
-| REQ-ABI-099 | abi | v1-full | Opaque public types shall permit internal implementation representation modifications while preserving external ABI contracts. | tasks/0452 §193.47 (AABI-27) | - | EPIC(E13.1) |
+| REQ-ABI-097 | abi | v1-full | Internal Axiom ABI shall remain freely optimizable, public visibility shall not imply a stable binary ABI, and stable ABI shall require an explicit versioned contract. | tasks/0452 §193.47 (AABI-20, AABI-21, AABI-22) | - | T504 |
+| REQ-ABI-098 | abi | v1-full | Stable ABI compatibility shall remain distinct from source compatibility and semantic compatibility, requiring explicit type layout and calling-convention specifications. | tasks/0452 §193.47 (AABI-23, AABI-24, AABI-25) | - | T510 |
+| REQ-ABI-099 | abi | v1-full | Opaque public types shall permit internal implementation representation modifications while preserving external ABI contracts. | tasks/0452 §193.47 (AABI-27) | - | T504 |
 | REQ-GEN-098 | generics | v1-core | Generic monomorphization shall remain unconstrained inside package boundaries, and exposing stable generic interfaces shall not require freezing compiler-private monomorphized representations. | tasks/0452 §193.47 (AABI-28, AABI-29) | - | T113 | 
-| REQ-ABI-100 | abi | v1-full | Compiler-generated closure representations and async state-machine layouts shall not constitute stable binary ABI by default. | tasks/0452 §193.47 (AABI-31, AABI-32) | - | EPIC(E13.1) |
-| REQ-ABI-101 | abi | v1-full | Stable binary symbols shall carry versioned ABI fingerprints, enabling multiple ABI versions to coexist via ABI adapters without penalizing internal optimization. | tasks/0452 §193.47 (AABI-34, AABI-37, AABI-42, AABI-43) | - | EPIC(E13.1) |
+| REQ-ABI-100 | abi | v1-full | Compiler-generated closure representations and async state-machine layouts shall not constitute stable binary ABI by default. | tasks/0452 §193.47 (AABI-31, AABI-32) | - | T510 |
+| REQ-ABI-101 | abi | v1-full | Stable binary symbols shall carry versioned ABI fingerprints, enabling multiple ABI versions to coexist via ABI adapters without penalizing internal optimization. | tasks/0452 §193.47 (AABI-34, AABI-37, AABI-42, AABI-43) | - | T504 |
 | REQ-RT-165 | runtime | v1-full | Application hot reloading shall require explicit stable ABI and state-migration contracts, and state migration shall not rely on unverified layout reinterpretation via memcpy. | tasks/0452 §193.47 (AABI-40, AABI-41) | - | EPIC(E21.1) |
 | REQ-DRV-017 | driver | v1-full | The Axiom compiler shall use a unified multi-target architecture where target selection is an explicit input to CompilerDB, avoiding separate target-specific compiler executables. | tasks/0453 §194.44 (ATARGET-20, ATARGET-21, ATARGET-46) | - | EPIC(E18.1) |
 | REQ-CTM-046 | comptime | v1-full | Host and target environments shall remain distinct; build tools run in host domain and comptime host capabilities shall not represent target runtime state. | tasks/0453 §194.44 (ATARGET-22, ATARGET-23, ATARGET-35, ATARGET-36) | - | EPIC(E14.1) |
@@ -6426,23 +6426,23 @@
 | REQ-TOOL-190 | tooling | v1-full | Standard library APIs shall expose allocation, blocking, synchronization, and effect metadata queryable through CompilerDB by AI and developer tooling. | tasks/0456 §197.51 (ASTDL-34, ASTDL-35, ASTDL-36, ASTDL-37) | - | EPIC(E19.1) |
 | REQ-CORE-1319 | core-lib | post-v1 | Tensor types (`Tensor<T, Shape, Layout>`) shall be library-level abstractions built on core primitives rather than mandatory Core types, supporting both static compile-time shape verification and dynamic runtime-checked shapes without introducing a dynamic object model. | tasks/0459 §200.1-6, ATENSOR-20, ATENSOR-23-25, ATENSOR-56; tasks/0468 §209.1-5, ATENSOR-20, ATENSOR-26-28 | - | EPIC(E24.0) |
 | REQ-OWN-245 | ownership | post-v1 | Tensor storage shall obey Axiom ownership semantics where large tensors do not implement `Copy`, moving a tensor transfers ownership, and duplicating tensor storage requires explicit `.clone()`. | tasks/0459 §200.13-14, ATENSOR-21, ATENSOR-31; tasks/0468 §209.10, ATENSOR-21-22 | - | EPIC(E24.0) |
-|REQ-CAP-133|capability|v1-full|Tensor views (`TensorView`, `TensorMutView`) shall obey capability, provenance, and lifetime rules without performing implicit data copies; mutable tensor views require provably disjoint regions or exclusive capability.|tasks/0459 §200.9-11, ATENSOR-22, ATENSOR-28; tasks/0468 §209.11-12, ATENSOR-23-24, ATENSOR-30-32|-|EPIC(E13.1)|
+|REQ-CAP-133|capability|v1-full|Tensor views (`TensorView`, `TensorMutView`) shall obey capability, provenance, and lifetime rules without performing implicit data copies; mutable tensor views require provably disjoint regions or exclusive capability.|tasks/0459 §200.9-11, ATENSOR-22, ATENSOR-28; tasks/0468 §209.11-12, ATENSOR-23-24, ATENSOR-30-32|-|T502|
 | REQ-LAY-293 | layout | post-v1 | Tensor layout metadata (shape, stride, format) shall remain distinct from logical tensor semantics; broadcasting operations shall produce non-copying virtual views without implicitly materializing storage. | tasks/0459 §200.8, §200.12, ATENSOR-26-27, ATENSOR-32; tasks/0468 §209.6, §209.9, ATENSOR-25, ATENSOR-29, ATENSOR-32 | - | EPIC(E24.0) |
 | REQ-GPU-061 | gpu | post-v1 | Tensor storage domains (CPU, GPU, NPU/accelerator) shall remain distinct, prohibiting implicit cross-device data transfers and requiring explicit transfer operations (`tensor.to(device)`, `tensor.to_async(device)`). | tasks/0459 §200.15-17, ATENSOR-29, ATENSOR-42-44; tasks/0468 §209.14-16, ATENSOR-35-36, ATENSOR-53-56 | - | EPIC(E22.3) |
 | REQ-TYP-339 | types | post-v1 | Eager execution tensors (`Tensor<T>`) and lazy graph tensors (`GraphTensor<T>`) shall have distinct semantic types; graph optimization, operator fusion, and memory planning may reuse storage buffers only after proving lifetime non-overlap and effect preservation. | tasks/0459 §200.20-27, ATENSOR-33-36; tasks/0468 §209.20-27, ATENSOR-40-43, ATENSOR-51, ATENSOR-61 | - | EPIC(E24.0) |
 | REQ-MIR-130 | mir | post-v1 | Automatic differentiation shall lower to ordinary verified Axiom MIR functions that undergo type, ownership, capability, and GPU verification; gradients shall be first-class owned values and stop-gradient shall be explicit. | tasks/0459 §200.28-38, ATENSOR-38-41; tasks/0468 §209.28-38, ATENSOR-44-48 | - | EPIC(E24.0) |
-| REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | EPIC(E13.1) |
+| REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | T500 |
 | REQ-RT-172 | runtime | v1-full | Tensor and AI framework libraries shall not require a mandatory garbage collector or global runtime, enabling inference builds to dead-strip training, autodiff, and unused kernel components. | tasks/0459 §200.47-48, §200.58-59, ATENSOR-47-48, ATENSOR-58-59; tasks/0468 §209.58-59, ATENSOR-66-67, ATENSOR-79-80 | - | EPIC(E21.1) |
 | REQ-STD-161 | std-lib | post-v1 | Sockets and network resources shall be modeled as owned OS resources distinct from raw OS handles (`int`/`HANDLE`), with typed abstractions distinguishing protocol capabilities (`TcpListener`, `TcpStream`, `UdpSocket`, `UnixStream`). | tasks/0461 §202.2-4, ANET-20-22 | - | EPIC(E24.0) |
 | REQ-ASY-157 | async | v1-full | Asynchronous network I/O shall preserve buffer validity until operation completion without requiring programmer-written lifetime annotations, permitting either owned buffer moves into pending operations or borrow capabilities proven safe by the compiler. | tasks/0461 §202.23-26, ANET-23-26 | - | T427 |
-| REQ-CAP-135 | capability | v1-full | Zero-copy network I/O and scatter/gather operations shall enforce capability non-overlap rules and shall never silently alter buffer ownership semantics. | tasks/0461 §202.27-29, ANET-27-29 | - | EPIC(E13.1) |
+| REQ-CAP-135 | capability | v1-full | Zero-copy network I/O and scatter/gather operations shall enforce capability non-overlap rules and shall never silently alter buffer ownership semantics. | tasks/0461 §202.27-29, ANET-27-29 | - | T519 |
 | REQ-LAY-294 | layout | post-v1 | Network wire representation shall remain distinct from memory representation, requiring explicit wire endianness and framing; raw network bytes shall be validated before creating safe typed values. | tasks/0461 §202.30-34, ANET-30-34 | - | EPIC(E24.0) |
 | REQ-ASY-158 | async | v1-full | Network Future cancellation shall be semantically distinct from dropping a Future; platform completion backends (`io_uring`, `IOCP`, `epoll`, `kqueue`) shall be hidden beneath portable asynchronous I/O abstractions. | tasks/0461 §202.37-38, §202.43-44, ANET-37-38, ANET-43-44 | - | T426 |
 | REQ-RT-173 | runtime | v1-full | High-performance networking runtimes shall be optional, tree-shakeable, and free of mandatory garbage collection, providing bounded worker scheduling without requiring a thread-per-connection architecture. | tasks/0461 §202.57-58, §202.63-64, §202.70-71, ANET-57-58, ANET-63-64, ANET-70-71 | - | EPIC(E21.1) |
 | REQ-STD-162 | std-lib | v1-core | Filesystem APIs shall model files and directories as owned OS resources, maintaining a semantic distinction between `Path` data, `FileId`, and `FileHandle`. | tasks/0462 §203.1-3, ASTORE-20-22 | - | T113 | 
-| REQ-CAP-136 | capability | v1-full | Memory mappings shall have explicit ownership and lifetime; mapped views shall not outlive their backing mapping, and writable mappings shall obey exclusive mutable capability rules. | tasks/0462 §203.23-25, ASTORE-23-25 | - | EPIC(E13.1) |
+| REQ-CAP-136 | capability | v1-full | Memory mappings shall have explicit ownership and lifetime; mapped views shall not outlive their backing mapping, and writable mappings shall obey exclusive mutable capability rules. | tasks/0462 §203.23-25, ASTORE-23-25 | - | T519 |
 | REQ-LAY-295 | layout | post-v1 | Persistent storage representations shall remain distinct from in-memory layouts, prohibiting raw process pointer identities and requiring validated logical identifiers or relative offsets. | tasks/0462 §203.26-28, §203.41-42, ASTORE-26-28, ASTORE-41-42 | - | EPIC(E24.0) |
-| REQ-CAP-137 | capability | v1-full | Database page buffer pools shall maintain explicit pin lifetimes; page eviction shall not invalidate live safe capabilities referencing buffer contents. | tasks/0462 §203.29-31, ASTORE-29-31 | - | EPIC(E13.1) |
+| REQ-CAP-137 | capability | v1-full | Database page buffer pools shall maintain explicit pin lifetimes; page eviction shall not invalidate live safe capabilities referencing buffer contents. | tasks/0462 §203.29-31, ASTORE-29-31 | - | T520 |
 | REQ-DRP-059 | drop | post-v1 | Write-ahead logging (WAL) shall distinguish written, flushed, and durable states; dropping an active transaction shall trigger a rollback and shall never implicitly commit. | tasks/0462 §203.34-36, ASTORE-34-36 | - | EPIC(E24.0) |
 | REQ-RT-174 | runtime | v1-full | Storage engines shall not require a garbage collector, supporting native asynchronous I/O and deterministic crash-recovery testing without thread-per-operation designs. | tasks/0462 §203.61-62, §203.66-67, ASTORE-61-62, ASTORE-66-67 | - | EPIC(E21.1) |
 | REQ-STD-163 | std-lib | post-v1 | Distributed systems shall represent `NodeId`, `ProcessId`, and `ActorId` as logical identities distinct from physical network or memory addresses. | tasks/0463 §204.1-4, ADIST-20-23 | - | EPIC(E24.0) |
@@ -6454,20 +6454,20 @@
 | REQ-STD-166 | std-lib | v1-core | Temporal types (`Duration`, `Instant`, `Deadline`, `WallClock`, `MonotonicClock`, `LogicalClock`) shall remain distinct semantic types with no implicit conversion between clock domains. | tasks/0464 §205.1-3, ATIME-20, ATIME-23 | - | T113 | 
 | REQ-STD-167 | std-lib | v1-core | Monotonic clocks shall be used for elapsed-time measurement and timeouts; instant arithmetic shall permit `Instant - Instant -> Duration` and `Instant + Duration -> Instant` within the same domain, while prohibiting `Instant + Instant`. | tasks/0464 §205.3-4, ATIME-21-22, ATIME-24-25 | - | T113 | 
 | REQ-ASY-159 | async | v1-full | Timeouts and deadlines shall be explicit policy types distinct from cancellation; periodic timers shall explicitly declare fixed-rate or fixed-delay semantics, drift policies, and missed tick behavior. | tasks/0464 §205.6-8, ATIME-26-27, ATIME-29-31 | - | T426 |
-| REQ-CAP-138 | capability | v1-full | Timer cancellation shall preserve callback resource safety; timer callbacks shall not outlive captured capabilities or resources. | tasks/0464 §205.9, ATIME-32-33 | - | EPIC(E13.1) |
+| REQ-CAP-138 | capability | v1-full | Timer cancellation shall preserve callback resource safety; timer callbacks shall not outlive captured capabilities or resources. | tasks/0464 §205.9, ATIME-32-33 | - | T519 |
 | REQ-RT-176 | runtime | v1-full | Real-time execution profiles may prohibit unbounded allocation, blocking operations, or thread synchronization, while ensuring async code does not acquire hidden blocking semantics. | tasks/0464 §205.14-16, ATIME-39-42 | - | EPIC(E21.1) |
 | REQ-CTM-047 | comptime | v1-full | Access to time during comptime shall require explicit capability and participate in build cache identity; reproducible builds shall control or prohibit nondeterministic time inputs. | tasks/0464 §205.19, ATIME-47-49 | - | EPIC(E14.1) |
 | REQ-STD-168 | std-lib | post-v1 | Network endpoint identity shall remain distinct from socket resource identity; socket `Drop` shall not imply graceful protocol shutdown. | tasks/0465 §206.3, §206.5, ANET2-21-23 | - | EPIC(E24.0) |
 | REQ-STD-169 | std-lib | post-v1 | TCP streams shall be modeled as continuous byte streams requiring explicit application framing; partial TCP writes shall not be treated as complete writes. | tasks/0465 §206.7-8, ANET2-24-27 | - | EPIC(E24.0) |
-| REQ-CAP-139 | capability | v1-full | Zero-copy views into network buffers shall not outlive backing storage; scatter/gather operations shall enforce capability non-overlap across segments. | tasks/0465 §206.17-18, ANET2-35-36 | - | EPIC(E13.1) |
-| REQ-CAP-140 | capability | v1-full | CPU mutable access to a buffer shall be prohibited while active DMA or hardware device transfers are in progress on that buffer. | tasks/0465 §206.24, ANET2-44-45 | - | EPIC(E13.1) |
+| REQ-CAP-139 | capability | v1-full | Zero-copy views into network buffers shall not outlive backing storage; scatter/gather operations shall enforce capability non-overlap across segments. | tasks/0465 §206.17-18, ANET2-35-36 | - | T519 |
+| REQ-CAP-140 | capability | v1-full | CPU mutable access to a buffer shall be prohibited while active DMA or hardware device transfers are in progress on that buffer. | tasks/0465 §206.24, ANET2-44-45 | - | T513, T526 |
 | REQ-CONC-153 | concurrency | v1-full | RDMA memory registrations shall remain valid for all dependent operations, and RDMA completion notifications shall govern buffer reuse. | tasks/0465 §206.25, ANET2-46-47 | - | T428 |
 | REQ-OPT-352 | optimizer | v1-full | Security-sensitive memory zeroization operations in network and protocol layers shall be semantically observable and immune to dead-code elimination. | tasks/0465 §206.28, ANET2-56 | - | EPIC(E15.1) |
 | REQ-LAY-296 | layout | v1-core | Semantic values, in-memory representations, wire formats, persistent storage formats, and IPC representations shall remain distinct contracts. | tasks/0466 §207.1-4, ADATA-20-21 | - | T113 | 
 | REQ-SEC-120 | security | v1-core | Deserialization shall validate external untrusted input bounds, layout, alignment, and representation before creating safe typed values. | tasks/0466 §207.5-6, ADATA-22-23 | - | T113 | 
 | REQ-TYP-340 | types | post-v1 | Schema identity shall remain distinct from ABI identity; schema evolution shall support explicit forward and backward compatibility without relying solely on declaration order. | tasks/0466 §207.7-8, ADATA-25-29 | - | EPIC(E24.0) |
 | REQ-TXT-005 | text | v1-core | External text encodings shall be explicit at external boundaries; invalid UTF-8 bytes shall not become safe `Str` without validation or an explicit unsafe contract. | tasks/0466 §207.11, ADATA-32-33 | - | T113 | 
-| REQ-CAP-141 | capability | v1-full | Zero-copy deserialization shall require compiler-proven provenance, lifetime, alignment, and representation compatibility; borrowed decoded values shall not outlive backing storage. | tasks/0466 §207.12, ADATA-34-35 | - | EPIC(E13.1) |
+| REQ-CAP-141 | capability | v1-full | Zero-copy deserialization shall require compiler-proven provenance, lifetime, alignment, and representation compatibility; borrowed decoded values shall not outlive backing storage. | tasks/0466 §207.12, ADATA-34-35 | - | T518 |
 | REQ-ERR-085 | error | v1-core | Malformed serialized input shall produce recoverable decode errors rather than panics; deserializers shall enforce configurable recursion depth and memory resource limits. | tasks/0466 §207.21, ADATA-49-51 | - | T113 | 
 | REQ-SEC-121 | security | post-v1 | Cryptographic keys and nonces shall use typed semantic representations distinct from raw byte slices; secret data shall be redacted from compiler diagnostics, debug output, and AI queries. | tasks/0467 §208.2-5, ASEC2-21-24, ASEC2-57-58 | - | EPIC(E24.0) |
 | REQ-OPT-353 | optimizer | v1-full | Secure zeroization operations on sensitive cryptographic memory shall remain semantically observable to compiler optimization passes and shall not be removed as dead writes. | tasks/0467 §208.7, ASEC2-25 | - | EPIC(E15.1) |
@@ -6485,13 +6485,13 @@
 | REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | EPIC(E15.1) |
 | REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | EPIC(E22.3) |
 | REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
-| REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | EPIC(E13.1) |
+| REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | T500 |
 | REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | EPIC(E22.3) |
 | REQ-TGT-002 | target-other | v1-full | The freestanding compilation profile shall not require an operating system, garbage collector, heap allocator, or monolithic runtime; Core semantics shall remain identical across hosted and freestanding profiles. | tasks/0471 §212.1-3, AKERNEL-20-24 | - | EPIC(E16.1) |
 | REQ-TGT-003 | target-other | v1-full | Freestanding targets shall support custom entry points (e.g., `_start`), and compilation shall not mandate implicit global initialization code. | tasks/0471 §212.4, §212.27, AKERNEL-25-27 | - | EPIC(E16.1) |
-| REQ-ABI-102 | abi | v1-full | Hardware interrupt handlers shall declare explicit calling convention and execution domain contracts, and shall not implicitly allocate memory, block, or await. | tasks/0471 §212.5-6, AKERNEL-28-29 | - | EPIC(E13.1) |
+| REQ-ABI-102 | abi | v1-full | Hardware interrupt handlers shall declare explicit calling convention and execution domain contracts, and shall not implicitly allocate memory, block, or await. | tasks/0471 §212.5-6, AKERNEL-28-29 | - | T512, T511, T515 |
 | REQ-LAY-297 | layout | v1-core | Memory-mapped I/O (MMIO) shall remain distinct from ordinary memory; volatile accesses shall not be confused with atomic synchronization, and MMIO side effects shall be preserved by the optimizer. | tasks/0471 §212.8-10, AKERNEL-31-33 | - | T113 | 
-| REQ-CAP-143 | capability | v1-full | Physical memory addresses shall remain distinct from safe Axiom pointers; DMA operations shall track CPU versus device ownership, keeping buffers valid until completion and respecting cache coherency. | tasks/0471 §212.11-14, AKERNEL-34-37 | - | EPIC(E13.1) |
+| REQ-CAP-143 | capability | v1-full | Physical memory addresses shall remain distinct from safe Axiom pointers; DMA operations shall track CPU versus device ownership, keeping buffers valid until completion and respecting cache coherency. | tasks/0471 §212.11-14, AKERNEL-34-37 | - | T513, T526 |
 | REQ-SEC-122 | security | v1-core | Kernel and user address domains shall remain distinct; user memory pointers shall require explicit capability validation before dereference in kernel mode, guarding against concurrent modification. | tasks/0471 §212.17-19, AKERNEL-40-42 | - | T113 | 
 | REQ-VER-019 | verifier | v1-core | Kernel and bare-metal compilation shall enforce the same ownership verifier as application compilation, establishing explicit preconditions at unsafe hardware boundaries and resuming safe verification. | tasks/0471 §212.28-30, AKERNEL-58-60, AKERNEL-67 | - | T113 | 
 | REQ-TGT-004 | target-other | v1-full | Core language semantics shall remain ISA-independent; instruction set features (AVX2, AVX-512, NEON, SVE, RVV, AMX) shall be modeled as TargetSpec capabilities, prohibiting emission of unsupported instructions. | tasks/0472 §213.1-5, §213.95, AHW-20-22, AHW-24 | - | EPIC(E16.1) |
@@ -6518,7 +6518,7 @@
 | REQ-TYP-342 | types | v1-core | Safe Core Axiom v1.0 shall exclude garbage collection, class inheritance, exceptions, runtime reflection, mandatory runtime, mandatory heap allocation, and implicit null references. | tasks/0475 216.8, ASPEC-28, ASPEC-29, ASPEC-30, ASPEC-33, ASPEC-34, ASPEC-35 | - | T113 |
 | REQ-OWN-247 | ownership | v1-core | The Core language shall require zero programmer-written lifetime annotations and zero borrow-checking annotations in surface code. | tasks/0475 216.10, ASPEC-31, ASPEC-32 | - | T113 | 
 | REQ-TYP-343 | types | v1-core | Type conversions shall be strictly separated into four non-interchangeable tiers: Coercion, Cast, Bitcast, and Unsafe Reinterpretation, with no implicit narrowing numeric conversions. | tasks/0475 216.37, 216.38 | - | T113 |
-| REQ-ABI-103 | abi | v1-full | Public declaration visibility (`pub fn`) shall not freeze binary layout; a stable public ABI shall require an explicit `@abi(stable)` contract attribute. | tasks/0475 216.42, 216.43, ASPEC-40 | - | EPIC(E13.1) |
+| REQ-ABI-103 | abi | v1-full | Public declaration visibility (`pub fn`) shall not freeze binary layout; a stable public ABI shall require an explicit `@abi(stable)` contract attribute. | tasks/0475 216.42, 216.43, ASPEC-40 | - | T510 |
 | REQ-BOOT-091 | bootstrap | v1-core | The production compiler shall compile code deterministically in an offline environment without any dependency on online AI models or network services. | tasks/0475 216.96, ASPEC-43 | - | T113 | 
 | REQ-GRM-148 | grammar | v1-core | Statements shall terminate deterministically using newline sensitivity in canonical style, with semicolons accepted as optional compatibility syntax stripped by formatting. | tasks/0476 217.3, 217.107, ASYNTAX-22 | - | T113 |
 | REQ-EXP-148 | expr | v1-core | A block `{ ... }` shall evaluate to the value of its final expression if no trailing terminator is present, and to `unit` otherwise. | tasks/0476 217.4, ASYNTAX-23 | - | T113 | 
@@ -6526,7 +6526,7 @@
 | REQ-TYP-344 | types | v1-core | Fixed-size array types shall be declared using canonical syntax `[N]T`, distinguishing them from view and dynamic collection syntax. | tasks/0476 217.17 | - | T113 |
 | REQ-PAT-099 | pattern | v1-core | Pattern matching via `match` shall be statically exhaustive in Complete Semantic Mode, rejecting unhandled patterns at compile time. | tasks/0476 217.27, ASYNTAX-40 | - | T113 | 
 | REQ-EXP-149 | expr | v1-core | Method call syntax `x.method(args)` shall be syntactic sugar desugared to function invocation `method(x, args)`. | tasks/0476 217.39, ASYNTAX-29 | REQ-GRM-148 | T113 | 
-| REQ-CAP-144 | capability | v1-full | Read capabilities shall be written syntactically as `view<T>` and mutable exclusive capabilities as `mut_view<T>`, without reference address-of operators `&` or `&mut` in safe code. | tasks/0476 217.51, 217.58, ASYNTAX-32, ASYNTAX-33, ASYNTAX-34 | REQ-OWN-247 | EPIC(E13.1) |
+| REQ-CAP-144 | capability | v1-full | Read capabilities shall be written syntactically as `view<T>` and mutable exclusive capabilities as `mut_view<T>`, without reference address-of operators `&` or `&mut` in safe code. | tasks/0476 217.51, 217.58, ASYNTAX-32, ASYNTAX-33, ASYNTAX-34 | REQ-OWN-247 | T501 |
 | REQ-ERR-086 | error | v1-core | Recoverable error propagation shall use postfix `?` on `Result<T, E>` and `Option<T>` to continue on success or return early on error. | tasks/0476 217.65, ASYNTAX-42 | - | T113 | 
 | REQ-RES-181 | resolve | v1-core | Member call resolution shall follow fixed priority: inherent functions > trait implementations > imported extensions > generic extensions, rejecting ambiguity. | tasks/0476 217.88 | REQ-EXP-149 | T113 | 
 | REQ-EXP-150 | expr | v1-core | Logical operators `&&` and `&#124;&#124;` shall evaluate short-circuit control flow and shall not be treated as ordinary eager binary operator overloads. | tasks/0476 217.83, 217.84 | - | T113 | 
@@ -6541,7 +6541,7 @@
 | REQ-MIR-135 | mir | v1-core | Divergent expressions evaluating to type `never` shall produce a termination edge with no normal control-flow successor in the MIR control flow graph. | tasks/0478 20, ASEM-21 | - | T113 | 
 | REQ-ATM-032 | atomics | v1-full | Atomic operations shall support Relaxed, Acquire, Release, AcqRel, and SeqCst memory orderings defining explicit happens-before and synchronizes-with semantic edges. | tasks/0478 32, ASEM-43 | - | T408 |
 | REQ-ASY-160 | async | v1-full | Async function suspension via `await` shall be represented as an explicit `SuspensionPointId` in MIR, with values live across suspension tracked by compiler analysis. | tasks/0478 34, ASEM-44 | - | T417 |
-| REQ-FFI-125 | ffi | v1-full | Foreign functions (`extern "C"`) lacking explicit semantic contracts shall be conservatively modeled as potentially reading, writing, escaping, panicking, and synchronizing. | tasks/0478 40, ASEM-49 | - | EPIC(E13.1) |
+| REQ-FFI-125 | ffi | v1-full | Foreign functions (`extern "C"`) lacking explicit semantic contracts shall be conservatively modeled as potentially reading, writing, escaping, panicking, and synchronizing. | tasks/0478 40, ASEM-49 | - | T521 |
 | REQ-TOOL-191 | tooling | v1-full | Compiler semantic entities shall be identified by typed generational IDs (`LocalId`, `FunctionId`, `TypeId`, `PlaceId`) that detect stale references and prohibit raw index reuse. | tasks/0479 3, 4, ACDB-21, ACDB-22 | - | EPIC(E19.1) |
 | REQ-TYP-345 | types | v1-core | Canonical semantic types shall be interned in `TypeDB` such that structurally identical types map to identical `TypeId` handles within a compilation revision. | tasks/0479 17, 18, ACDB-23 | - | T113 |
 | REQ-MIR-136 | mir | v1-core | MIR representations shall separate projection identity (`Place`) from analysis state, with operands explicitly typed as `Copy(Place)`, `Move(Place)`, or `Constant(ConstValue)`. | tasks/0479 20, 21, 22 | REQ-MIR-134 | T113 | 
@@ -6563,7 +6563,7 @@
 | REQ-TYP-346 | types | v1-core | Tuple structs and newtypes `struct UserId(u64)` shall establish distinct nominal type identities that cannot implicitly unify with their underlying representation types. | tasks/0482 9, 10, ATYPE-IMPLEMENT-22, ATYPE-IMPLEMENT-23 | - | T113 |
 | REQ-TYP-347 | types | v1-core | Type variable unification shall perform an occurs-check to detect and reject recursive type constraints that lack explicit recursive type constructors. | tasks/0482 30, 31, ATYPE-IMPLEMENT-26 | - | T113 |
 | REQ-TYP-348 | types | v1-core | In the absence of contextual type constraints or suffixes, unconstrained integer literals shall default to `i32` and float literals shall default to `f64`. | tasks/0482 34 | - | T113 |
-|REQ-TYP-349|types|v1-full|The type checker shall insert implicit coercions only for specification-defined cases: `String` to `Str`, `[N]T` to `view<T>`, owner to ephemeral `view<T>`, `mut_view<T>` to `view<T>`, and `never` to `T`.|tasks/0482 37, 39, ATYPE-IMPLEMENT-28|-|EPIC(E13.1)|
+|REQ-TYP-349|types|v1-full|The type checker shall insert implicit coercions only for specification-defined cases: `String` to `Str`, `[N]T` to `view<T>`, owner to ephemeral `view<T>`, `mut_view<T>` to `view<T>`, and `never` to `T`.|tasks/0482 37, 39, ATYPE-IMPLEMENT-28|-|T501|
 | REQ-TYP-350 | types | v1-core | Types with Drop obligations shall not be marked with the `Copy` property. | tasks/0482 44, ATYPE-IMPLEMENT-33 | REQ-TYP-342 | T113 |
 | REQ-CONC-156 | concurrency | v1-full | `Send` (safe transfer between execution domains) and `Share` (safe concurrent shared access) shall be tracked as independent semantic properties. | tasks/0482 49, 50, ATYPE-IMPLEMENT-34 | - | T400 |
 | REQ-TYP-351 | types | v1-core | Associated-type projections `<T as Trait>.Item` shall be normalized lazily upon query request rather than during initial type construction. | tasks/0482 61, 63, ATYPE-IMPLEMENT-43 | - | T113 |
@@ -6581,7 +6581,7 @@
 | REQ-MIR-139 | mir | v1-core | Every basic block in MIR shall end with exactly one terminator (`Goto`, `Branch`, `Switch`, `Return`, `Unreachable`, `Call`, `Panic`, `Await`), with no dead instructions permitted after the terminator. | tasks/0484 16, 17, AMIR-23 | - | T113 | 
 | REQ-MIR-140 | mir | v1-core | Logical operators `&&` and `&#124;&#124;` shall be lowered into explicit branching control flow blocks to preserve conditional side-effect evaluation. | tasks/0484 24, 25, AMIR-32 | REQ-EXP-150 | T113 | 
 | REQ-MIR-141 | mir | v1-core | MIR lowering shall generate explicit temporary locals for subexpressions whose semantic lifetime must be tracked by ownership and drop analysis. | tasks/0484 28, 29 | - | T113 | 
-|REQ-MIR-142|mir|v1-full|Creation of `view<T>` and `mut_view<T>` shall lower to explicit `MakeView` and `MakeMutView` semantic instructions recording provenance, region, and access mode.|tasks/0484 36, 37, 82, AMIR-35, AMIR-36|-|EPIC(E13.1)|
+|REQ-MIR-142|mir|v1-full|Creation of `view<T>` and `mut_view<T>` shall lower to explicit `MakeView` and `MakeMutView` semantic instructions recording provenance, region, and access mode.|tasks/0484 36, 37, 82, AMIR-35, AMIR-36|-|T502|
 | REQ-MIR-143 | mir | v1-core | Raw MIR shall model values through mutable `Place` projections before ownership verification and SSA transformation. | tasks/0484 93, 94 | REQ-MIR-134 | T113 | 
 |REQ-MIR-144|mir|v1-full|Atomic operations with memory orderings and volatile memory accesses shall be lowered to dedicated MIR instructions that cannot be merged, reordered, or removed by ordinary memory optimizations.|tasks/0484 65, 66, AMIR-40, AMIR-41|-|T405|
 | REQ-OWN-248 | ownership | v1-core | Ownership states (`Uninit`, `Owned`, `Moved`, `PartiallyMoved`, `Dropped`) shall be tracked at field-sensitive Place Tree granularity. | tasks/0485 5, 6, 8, AOWN-20, AOWN-21 | REQ-MIR-143 | T113 | 
@@ -6594,15 +6594,15 @@
 | REQ-DRP-064 | drop | v1-core | The Drop destructor shall be infallible (returning no `Result`) and strictly synchronous (cannot await). | tasks/0485 79, 80, ADROP-28, ADROP-29 | REQ-DRP-062 | T113 | 
 | REQ-DRP-065 | drop | v1-core | Dynamic drop flags shall be eliminated by static analysis whenever compile-time control flow proves the initialization state at exit. | tasks/0485 56, 57, 58, ADROP-31 | REQ-DRP-062 | T113 | 
 | REQ-OWN-251 | ownership | v1-core | Returning an owned value from a function shall transfer ownership to the caller return place without executing local drop cleanup on that value. | tasks/0485 42, AOWN-30 | REQ-DRP-062 | T113 | 
-|REQ-CAP-145|capability|v1-full|Every safe capability (`view<T>`, `mut_view<T>`) shall have explicit compiler-tracked storage provenance and cannot outlive the lifetime of its underlying owner.|tasks/0486 4, 30, ACAP-20, ACAP-30|-|EPIC(E13.1)|
-|REQ-CAP-146|capability|v1-full|Multiple active capabilities over overlapping regions shall be rejected if any capability has WRITE access mode (`mut_view<T>`).|tasks/0486 10, 11, 13, ACAP-24, ACAP-25, ACAP-26|-|EPIC(E13.1)|
-|REQ-CAP-147|capability|v1-full|Multiple read capabilities (`view<T>`) over the same region may coexist concurrently provided no mutable capability overlaps that region.|tasks/0486 9, 12, ACAP-23|-|EPIC(E13.1)|
-|REQ-CAP-148|capability|v1-full|Independent mutable capabilities (`mut_view<T>`) shall be permitted concurrently over disjoint fields or disjoint slice ranges of the same parent aggregate.|tasks/0486 14, 15, 17, ACAP-33, ACAP-34, ACAP-35|-|EPIC(E13.1)|
-|REQ-CAP-149|capability|v1-full|A value cannot be dropped, moved, or deallocated while any dependent capability referencing its region remains active.|tasks/0486 48, 49, ACAP-38, ACAP-39|-|EPIC(E13.1)|
-|REQ-CAP-150|capability|v1-full|An ephemeral view created implicitly from an owned argument shall not escape beyond the scope of the called function.|tasks/0486 25, 26, ACAP-41|-|EPIC(E13.1)|
-|REQ-CAP-151|capability|v1-full|`mut_view<T>` shall not implement capability duplication; moving a mutable view transfers the capability and invalidates the source view binding.|tasks/0486 34, ACAP-28|-|EPIC(E13.1)|
+|REQ-CAP-145|capability|v1-full|Every safe capability (`view<T>`, `mut_view<T>`) shall have explicit compiler-tracked storage provenance and cannot outlive the lifetime of its underlying owner.|tasks/0486 4, 30, ACAP-20, ACAP-30|-|T502|
+|REQ-CAP-146|capability|v1-full|Multiple active capabilities over overlapping regions shall be rejected if any capability has WRITE access mode (`mut_view<T>`).|tasks/0486 10, 11, 13, ACAP-24, ACAP-25, ACAP-26|-|T501|
+|REQ-CAP-147|capability|v1-full|Multiple read capabilities (`view<T>`) over the same region may coexist concurrently provided no mutable capability overlaps that region.|tasks/0486 9, 12, ACAP-23|-|T500|
+|REQ-CAP-148|capability|v1-full|Independent mutable capabilities (`mut_view<T>`) shall be permitted concurrently over disjoint fields or disjoint slice ranges of the same parent aggregate.|tasks/0486 14, 15, 17, ACAP-33, ACAP-34, ACAP-35|-|T501|
+|REQ-CAP-149|capability|v1-full|A value cannot be dropped, moved, or deallocated while any dependent capability referencing its region remains active.|tasks/0486 48, 49, ACAP-38, ACAP-39|-|T501|
+|REQ-CAP-150|capability|v1-full|An ephemeral view created implicitly from an owned argument shall not escape beyond the scope of the called function.|tasks/0486 25, 26, ACAP-41|-|T501|
+|REQ-CAP-151|capability|v1-full|`mut_view<T>` shall not implement capability duplication; moving a mutable view transfers the capability and invalidates the source view binding.|tasks/0486 34, ACAP-28|-|T501|
 |REQ-OPT-358|optimizer|v1-full|Verified disjoint mutable capability regions shall be exported to `AliasInfo` as internal `NO_ALIAS` facts for compiler vectorization and memory optimization.|tasks/0486 43, 44, ACAP-45, ACAP-46|-|EPIC(E15.1)|
-| REQ-CAP-152 | capability | v1-full | Converting a raw pointer to a safe view shall be restricted to `unsafe` blocks, requiring the programmer to establish provenance, alignment, and validity preconditions before ordinary verification resumes. | tasks/0486 78, 79, 80, ACAP-42, ACAP-43, ACAP-44 | - | EPIC(E13.1) |
+| REQ-CAP-152 | capability | v1-full | Converting a raw pointer to a safe view shall be restricted to `unsafe` blocks, requiring the programmer to establish provenance, alignment, and validity preconditions before ordinary verification resumes. | tasks/0486 78, 79, 80, ACAP-42, ACAP-43, ACAP-44 | - | T506 |
 | REQ-VER-024 | verifier | v1-core | Function effects shall be inferred automatically by the compiler across the call graph without requiring mandatory programmer effect annotations on ordinary function declarations. | tasks/0487 1, 20, AEFFECT-20, AEFFECT-21, AEFFECT-23 | - | T113 | 
 |REQ-VER-025|verifier|v1-full|Asynchronous suspension (`AsyncSuspend`) and thread blocking (`Blocking`) shall be tracked as distinct effects, enabling static rejection of blocking calls in async contexts.|tasks/0487 33, 34, 35, AEFFECT-30|-|T416|
 | REQ-VER-026 | verifier | v1-core | Operations accessing the environment, system clock, random number generators, filesystems, network sockets, or processes shall be classified as external state effects and shall never be assumed pure. | tasks/0487 36, 37, 38, 39, 40, AEFFECT-34, AEFFECT-35, AEFFECT-36, AEFFECT-37, AEFFECT-38 | REQ-VER-024 | T113 | 
@@ -8716,8 +8716,8 @@
 | REQ-MIR-335 | mir | v1-core | [ACFG-123] Optimized execution must be observationally equivalent to Verified MIR. | 0516 §172 | - | T113 | 
 | REQ-MIR-336 | mir | v1-core | [ACFG-124] Native code generation must preserve CFG semantics. | 0516 §172 | - | T113 | 
 | REQ-MIR-337 | mir | v1-core | [ACFG-125] Axiom control-flow semantics are deterministic. | 0516 §172 | - | T113 | 
-| REQ-ABI-104 | abi | v1-full | Function, method, generic, closure và trait abstraction phải có thể biến mất hoàn toàn sau compile-time khi semantics cho phép. | 0517 BOOTSTRAP-258 — AXIOM CALLING CONVENTION, FUNCTION ABI, PARAMETER PASSING, RETURN ABI & CALL LOWERING | - | EPIC(E13.1) |
-| REQ-ABI-105 | abi | v1-full | Panic must not cross an extern "C" boundary unless an explicit ABI adapter contract exists. | 0517 §192 | - | EPIC(E13.1) |
+| REQ-ABI-104 | abi | v1-full | Function, method, generic, closure và trait abstraction phải có thể biến mất hoàn toàn sau compile-time khi semantics cho phép. | 0517 BOOTSTRAP-258 — AXIOM CALLING CONVENTION, FUNCTION ABI, PARAMETER PASSING, RETURN ABI & CALL LOWERING | - | T503 |
+| REQ-ABI-105 | abi | v1-full | Panic must not cross an extern "C" boundary unless an explicit ABI adapter contract exists. | 0517 §192 | - | T521, T522 |
 | REQ-TGT-005 | tgt | v1-full | Một backend có mô hình machine đủ mạnh để khai thác CPU hiện đại, nhưng kiến trúc đủ rõ ràng để sau này compiler Axiom có thể tự implement backend và self-host. | 0518 BOOTSTRAP-259 — AXIOM MACHINE IR, REGISTER MODEL, INSTRUCTION SELECTION & TARGET LOWERING | - | EPIC(E16.1) |
 | REQ-TGT-006 | tgt | v1-full | Pattern-based instruction selection + target-specific legalization hooks. | 0518 §46 | - | EPIC(E16.1) |
 | REQ-TGT-007 | tgt | v1-full | Linear Scan | 0518 §96 | - | EPIC(E16.1) |
@@ -10165,8 +10165,8 @@
 | REQ-CORE-3112 | compiler | v1-full | The system must not use a single fingerprint to represent all types of compatibility, but must independently track source, API, semantic, ABI, binary, target, and FFI compatibility. | 0583 §324.2 | - | EPIC(E18.1) |
 | REQ-CORE-3113 | compiler | v1-full | The system must support static linking, dynamic libraries, plugins, components, runtime loading, optional unloading, hot reloading, version negotiation, capability negotiation, and sandbox boundaries, while still preserving ownership, capability, effects, concurrency, ABI, and security guarantees. | 0584 §325.1 | - | EPIC(E18.1) |
 | REQ-CORE-3114 | compiler | v1-full | Version matching alone is insufficient for component resolution; the system must also verify ABI, capabilities, target, runtime, and security requirements. | 0584 §325.7 | - | EPIC(E18.1) |
-| REQ-FFI-126 | ffi | v1-full | Axiom must be capable of calling and being called by C, C++, Rust/Swift/Objective-C at the appropriate ABI level, Win32/POSIX/Linux syscall interfaces, macOS/iOS frameworks, Android NDK, native libraries (.dll/.so/.dylib/.a/.lib), GPU/driver APIs, Axiom components/plugins, and assembly or foreign object code. | 0585 §1 | - | EPIC(E13.1) |
-| REQ-FFI-127 | ffi | v1-full | Foreign Function Interface (FFI) integration must not break Axiom's semantic model, and Axiom must not assume that foreign code adheres to its ownership, aliasing, lifetime, panic, thread-safety, or ABI rules. | 0585 §1 | - | EPIC(E13.1) |
+| REQ-FFI-126 | ffi | v1-full | Axiom must be capable of calling and being called by C, C++, Rust/Swift/Objective-C at the appropriate ABI level, Win32/POSIX/Linux syscall interfaces, macOS/iOS frameworks, Android NDK, native libraries (.dll/.so/.dylib/.a/.lib), GPU/driver APIs, Axiom components/plugins, and assembly or foreign object code. | 0585 §1 | - | T504 |
+| REQ-FFI-127 | ffi | v1-full | Foreign Function Interface (FFI) integration must not break Axiom's semantic model, and Axiom must not assume that foreign code adheres to its ownership, aliasing, lifetime, panic, thread-safety, or ABI rules. | 0585 §1 | - | T524 |
 | REQ-CORE-3115 | compiler | v1-full | The platform integration specification must define how Axiom organizes and standardizes system APIs across multiple platforms without making the core language dependent on a specific OS, rather than introducing a new FFI. | 0586 §327 | - | EPIC(E18.1) |
 | REQ-CORE-3116 | compiler | v1-full | Axiom must support platform operations such as file opening, socket connection, thread spawning, process spawning, memory mapping, window creation, and GPU device creation, but these APIs must reside in the library or platform layer rather than being integrated into the core language. | 0586 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3117 | compiler | v1-full | The build system enhancements must add target orchestration and cross-target semantics to the existing build graph defined in BOOTSTRAP-305, rather than defining a completely new build graph. | 0587 §328 | - | EPIC(E18.1) |
@@ -22816,7 +22816,7 @@
 | REQ-CORE-3201 | compiler | v1-full | Cleanup paths must contribute effects vào summary. | tasks/0795 §573.45 | - | EPIC(E18.1) |
 | REQ-CORE-3202 | compiler | v1-full | Blocking operation must được đánh dấu `Block`. | tasks/0795 §573.57 | - | EPIC(E18.1) |
 | REQ-CORE-3203 | compiler | v1-full | Nếu borrow escape function boundary, summary must reflect lifetime/resource consequence. | tasks/0795 §573.69 | - | EPIC(E18.1) |
-| REQ-FFI-128 | ffi | v1-full | Compiler không tự tin vào FFI contract nếu function must not đánh dấu trusted/verified theo FFI rules. | tasks/0795 §573.71 | - | EPIC(E13.1) |
+| REQ-FFI-128 | ffi | v1-full | Compiler không tự tin vào FFI contract nếu function must not đánh dấu trusted/verified theo FFI rules. | tasks/0795 §573.71 | - | T502 |
 | REQ-CORE-3204 | compiler | v1-full | Function passed as callback must satisfy required effect bound. | tasks/0795 §573.82 | - | EPIC(E18.1) |
 | REQ-CORE-3205 | compiler | v1-full | Function accepting callbacks must include callback effects trong summary nếu callback được invoke. | tasks/0795 §573.85 | - | EPIC(E18.1) |
 | REQ-RT-184 | runtime | v1-full | Runtime không mandatory must carry effect metadata nếu compiler đã resolve statically. | tasks/0795 §573.88 | - | EPIC(E21.1) |

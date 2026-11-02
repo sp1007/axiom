@@ -101,7 +101,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090, T400–T428 | T211 | T311 | P10 |
 | P12 numeric & SIMD | T450–T479 | T212 | T312 | P10 |
-| P13 low-level & security | — | T213 | T313 | P10 |
+| P13 low-level & security | T500–T533 | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066 | T216 | T316 | P13 |
@@ -160,14 +160,14 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
 ### P13 — Low-level systems, unsafe, freestanding, security
 - **E13.1 Unsafe & UB model** — builds on the minimal core version (T061a: raw pointers, unsafe blocks,
   memory intrinsics); here: full unsafe blocks/fns rules, raw pointer rules, provenance, trusted-unsafe
-  boundaries. Src 0071 0044 tasks/0339 tasks/0282.
+  boundaries. Src 0071 0044 tasks/0339 tasks/0282. *(T500–T505)*
 - **E13.2 Raw memory, volatile, MMIO, layout control** — volatile, packed/aligned repr, unions (0072),
-  address spaces. Src tasks/0328 tasks/0515 0067 0072.
+  address spaces. Src tasks/0328 tasks/0515 0067 0072. *(T506–T510)*
 - **E13.3 Runtime composition & freestanding profile** — hosted vs freestanding, `@entry`, optional
   runtime, startup/static init/global state, runtime capability graph. Src 0143 0097 tasks/0358
-  tasks/0359 tasks/0370 tasks/0455.
+  tasks/0359 tasks/0370 tasks/0455. *(T511–T515)*
 - **E13.4 Safety profiles & capability security** — profiles, sandboxing hooks, secure memory,
-  constant-time annotations. Src tasks/0342 tasks/0449 tasks/0467 tasks/0703.
+  constant-time annotations. Src tasks/0342 tasks/0449 tasks/0467 tasks/0703. *(T516–T520)*
 - **E13.6 Fixed-address declarations (`@at`)** — owner requirements REQ-OWNER-003, REQ-OWNER-008,
   ADR-0001: overlay/placement of statics, arrays, structs, functions at absolute addresses, used
   with ordinary syntax; taking addresses of functions and variables (`address_of` / `address_of_mut`
@@ -177,14 +177,14 @@ Exit (phase): numeric conformance + differential interp/native for float and vec
   Src ADR-0001, 0071 §31-32, 0044, 0097, tasks/0328.
   Exit: a freestanding test image with an `@at` vector table and UART register block runs under the
   oracle with a device model, and native images place every `@at` object at its address (verified via
-  `addr_of` / `address_of`).
+  `addr_of` / `address_of`). *(T525–T529)*
 - **E13.7 Module-relative bindings** — owner requirement REQ-OWNER-005,
   ADR-0001 §5-6: `@at(image("mod") + off)` / `image_self()` overlays resolved at module init in the
   hosted profile, hooked into the DLL/EXE initialisers of E18.7 (PE DLL output).
   Src ADR-0001, 0187, 0104, tasks/0336. Exit: a test DLL loaded into a test host EXE calls host
-  functions and reads host data through module-relative bindings; missing module → DllMain FALSE.
+  functions and reads host data through module-relative bindings; missing module → DllMain FALSE. *(T530–T533)*
 - **E13.5 Panic & unwinding strategy** — panic=abort vs unwind decision per profile, cleanup
-  guarantees across unwinding. Src 0229 tasks/0351 tasks/0700.
+  guarantees across unwinding. Src 0229 tasks/0351 tasks/0700. *(T521–T524)*
 Exit: freestanding program boots without std; UB/safety conformance suite.
 
 ### P14 — Language completion: comptime 2.0, reflection, generators, dyn
@@ -411,3 +411,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-01 | T086 (Stage-1 gate) unblock: new P10 fix task T162 (`owner: axiom-semantics`) fixes 8 port/test defects blocking `axiomc1` full-suite pass (`compiler/interp/interp.ax` wrapping binops, `compiler/mir/builder.ax` + `bundle_common.py` unterminated join blocks in `interp_opt.session`, `bundle_common.py` `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` suppression vs duplicate `HIR_ITEM_STATIC` report in `typeck.ax`, `typeck.ax` + `verifier.ax` array-repeat `TY_INT_VAR` resolution, `compiler/mir/mir.ax` bare-place `MIR_OP_COPY` fallback, `pipeline.ax` + `interp_opt/session.ax` exit codes `124`/`125` and host CLI args, `interp_opt/session.ax` trait default-method `mir_map` aliasing after T161, and `gnu_as_vectors.ax` `gatecheck.py` rule (c) inline `xfail` comments + `qa_axiomc_cli_edges.test`); T086 depends on T162 | unblock-T086 |
 | 2026-11-02 | T211 P11 phase expansion (`P11-concurrency-async`): expanded E11.1–E11.6 into 29 new tasks `T400`–`T428` alongside refined existing tasks `T088`–`T090` (32 tasks total across 6 epics: E11.1 6 tasks `T089, T400–T404`; E11.2 5 tasks `T405–T409`; E11.3 6 tasks `T090, T410–T414`; E11.4 6 tasks `T088, T415–T419`; E11.5 5 tasks `T420–T424`; E11.6 4 tasks `T425–T428`), converted all 417 `EPIC(E11.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T311` (`depends: [T211, T088–T090, T400–T428]`) | T211 |
 | 2026-11-03 | T212 P12 phase expansion (`P12-numeric-floating-point-simd`): expanded E12.1–E12.5 into 30 new tasks `T450`–`T479` (30 tasks total across 5 epics: E12.1 6 tasks `T450–T455`; E12.2 7 tasks `T456–T462` including dedicated spec/implementation/QA stress-test tasks for `REQ-OWNER-007` complex mixed-type expression matrix Patterns A–D; E12.3 6 tasks `T463–T468`; E12.4 6 tasks `T469–T474`; E12.5 5 tasks `T475–T479`), converted all 335 `EPIC(E12.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T312` (`depends: [T212, T450–T479]`) | T212 |
+| 2026-11-03 | T213 P13 phase expansion (`P13-low-level-systems-unsafe-frees`): expanded E13.1–E13.7 into 34 new tasks `T500`–`T533` (34 tasks total across 7 epics: E13.1 6 tasks `T500–T505` including `REQ-OWNER-008` `fn_addr`/`static_addr`/`address_of`/`@addr` spec, implementation, and QA conformance plus `T503` ADR-0034 §8 OI-12 external Windows x64 ABI gcc DLL oracle before FFI breadth `T504`; E13.2 5 tasks `T506–T510`; E13.3 5 tasks `T511–T515`; E13.4 5 tasks `T516–T520`; E13.5 4 tasks `T521–T524`; E13.6 5 tasks `T525–T529` for `REQ-OWNER-003` & `REQ-OWNER-008` `@at`/`@addr` fixed-address placement; E13.7 4 tasks `T530–T533` for `REQ-OWNER-005` module-relative bindings), converted all 434 `EPIC(E13.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T313` (`depends: [T213, T500–T533]`) | T213 |

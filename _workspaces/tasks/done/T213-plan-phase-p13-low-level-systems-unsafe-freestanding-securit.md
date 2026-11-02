@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 00:43:23
+finished: 2026-11-03 02:14:13
 ---
 # T213 — Plan phase P13: Low-level systems, unsafe, freestanding, security
 
@@ -41,3 +43,6 @@ the roadmap is invented.
 - Critical board task (priority < 10): runs alone.
 - Carry-over (ADR-0034 §8, audit 2026-10-19 OI-12): plan an external Windows x64 ABI oracle before FFI breadth — a gcc-built test DLL (`gcc -shared`) exporting functions with 1..8 mixed-width arguments and structs of size 1/2/3/4/8/12/16/24 by value and return, called via `@link`, plus a gcc `offsetof`/`sizeof` table for `@repr(C)` layouts; `tests/mc/isel/cdriver_abi*.c` must not rely on `assert()` under NDEBUG.
 
+## Log
+- 2026-11-03 00:43:23 started (attempt 1) 
+- 2026-11-03 02:14:13 accepted by QA -> done
