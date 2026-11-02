@@ -325,6 +325,13 @@ added by editing this list.
 - since: T615
 - check: dump and differential conformance tests in tests/opt2 (T064), tests/run/opt_ipa_devirt (T614), and tests/conformance/p15/e15_4_inline_specialize_devirt (T615) verify copy/move propagation, deep SROA, RVO/NRVO, bounded SCC inlining, constant/closure specialization, proven vs open-world devirtualization, O(1)-stack tail-recursion lowering, and observable agreement across --interp, -O0, -O1, and -O2
 
+### INV-PIPE-012 — Whole-program LTO, section GC/ICF, and PGO profitability-only safety
+- statement: Link-Time Optimization (`--lto`) and whole-program reachability (`WPO`) operate only within proven closed-world boundaries while preserving `@export`, dynamic-lookup, reflection, FFI, `@at`, `volatile`, and `atomic` roots and deduplicating generics without erasing observable function-pointer identity; the linker's mark-sweep section GC (`COMDAT`) and safe Identical Code Folding (`ICF`) consume explicit object section-graph contracts without inferring source ownership; and Profile-Guided Optimization (`--pgo-gen` / `--pgo-use`) treats profile data strictly as `Observed` profitability weights that never fabricate semantic/safety/alias/devirtualization proofs, never bypass `Verified MIR`, degrade gracefully on stale profiles, and produce deterministic byte-identical builds (SPEC-75 AXS-LTO-001..030, AXS-PGO-001..015).
+- source: SPEC-75 AXS-LTO-001..030, AXS-PGO-001..015; tasks/0355 ALTO-20..58; tasks/0366 AOPT-20..65; tasks/0408 APGO-20..53; tasks/0409 ALTO-20..55; tasks/0410 ABINOPT-20..50; tasks/0580 AWPA-01..25; tasks/0581 APGO-20..44; tasks/0594 AWP-01..25; tasks/0595 ALAYOUT-01..25; tasks/0597 APROF-01..25
+- verify: tests/run/opt_lto, tests/run/opt_pgo_gc, tests/conformance/p15/e15_6_lto_pgo_gc
+- since: T623
+- check: dump and differential conformance tests in tests/run/opt_lto (T621), tests/run/opt_pgo_gc (T622), and tests/conformance/p15/e15_6_lto_pgo_gc (T623) verify cross-module inlining/specialization/devirt, generic deduplication, COMDAT dead stripping, address-safe ICF, deterministic `--pgo-gen`/`--pgo-use` round-trips, stale-profile fallback, and observable agreement across --interp, -O0, -O2, --lto, and --pgo-use
+
 ## 7. Oracle and agreement
 
 ### INV-ORACLE-001 — Semantics are explicit, not inherited from C
@@ -449,7 +456,7 @@ added by editing this list.
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

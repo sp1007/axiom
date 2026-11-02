@@ -161,11 +161,11 @@ printed by default (tasks/0360 §23). When compiler-built MIR fails the verifier
 `OptIR` fails its post-pass structural, SSA/`MemorySSA`, effect-preservation, or MIR-reverification contract
 (`spec/SPEC-70-optir-ssa-memoryssa.md`, rule `AXS-OPT-034`; `spec/SPEC-71-alias-escape-promotion.md`,
 rule `AXS-ESC-016`; `spec/SPEC-72-loops-scev-bce.md`, rule `AXS-LOOP-017`; `spec/SPEC-73-inlining-specialization-devirt.md`,
-rule `AXS-INL-034`), the compiler reports `AX_ICE_MIR_VERIFY` /
+rule `AXS-INL-034`; `spec/SPEC-75-lto-wpo-section-gc-pgo.md`, rule `AXS-LTO-030`), the compiler reports `AX_ICE_MIR_VERIFY` /
 `AX_ICE_INTERNAL` (`data.stage = "optir_verify"`) and emits no artifact, whereas unproven optimization
 preconditions (`Certainty.Possible` / `Certainty.Unknown`, `MayAlias` / `UnknownAlias`, `GlobalEscape` /
-`UnknownEscape`, `address_observable == true`, unproven `InBounds` / `TripCount` / `NoOverflow`, or `INLINE_ILLEGAL` / `UnknownTarget` / exhausted `InlineBudget` or `SpecializationBudget`) fail closed and leave the IR unchanged without
-emitting a user diagnostic (`AXS-OPT-032`, `AXS-ESC-016`, `AXS-LOOP-001`, `AXS-BCE-002`, `AXS-INL-021`, `AXS-INL-032`, `AXS-INL-034`, `tasks/0395 AALIAS-55`, `tasks/0397 AESCAPE-65/80`, `tasks/0399 AOPT-96/97`, `tasks/0401 AINLINE-32/ADEvirt-24`, `tasks/0402 ABCE-21/ALOOP-55`, `tasks/0551 §45`). Likewise, when
+`UnknownEscape`, `address_observable == true`, unproven `InBounds` / `TripCount` / `NoOverflow`, `INLINE_ILLEGAL` / `UnknownTarget` / exhausted `InlineBudget` or `SpecializationBudget`, open-world `LTO` boundaries, `address_taken == true` preventing `ICF` merge, or stale `PGO` `cfg_fingerprint` fallback) fail closed and leave the IR unchanged without
+emitting a user error (`AXS-OPT-032`, `AXS-ESC-016`, `AXS-LOOP-001`, `AXS-BCE-002`, `AXS-INL-021`, `AXS-INL-032`, `AXS-INL-034`, `AXS-LTO-022`, `AXS-LTO-030`, `AXS-PGO-002`, `AXS-PGO-005`, `tasks/0355 ALTO-44`, `tasks/0395 AALIAS-55`, `tasks/0397 AESCAPE-65/80`, `tasks/0399 AOPT-96/97`, `tasks/0401 AINLINE-32/ADEvirt-24`, `tasks/0402 ABCE-21/ALOOP-55`, `tasks/0408 APGO-26/45`, `tasks/0551 §45`, `tasks/0581 APGO-26/44`). Likewise, when
 post-RA or post-peephole Machine IR fails `x64_verify_checked` (`spec/SPEC-77-regalloc-machine-opt.md`,
 rules `AXS-RA-027` and `AXS-MCOPT-026`), the compiler reports `AX_ICE_INTERNAL` (`data.stage = "x64_verify"`)
 and emits no artifact; profitability or legality rejections during instruction selection, branchless
@@ -497,4 +497,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-77; axiom-c-stage0; axiom-testing.

@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215, T613]
 priority: 114
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-75-lto-wpo-section-gc-pgo.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-73-inlining-specialization-devirt.md, tasks/0355, tasks/0366, tasks/0408, tasks/0409, tasks/0410, tasks/0580, tasks/0581, tasks/0594, tasks/0595, tasks/0597]
 covers: [REQ-OPT-223, REQ-OPT-224, REQ-OPT-225, REQ-OPT-226, REQ-OPT-227, REQ-OPT-228, REQ-OPT-229, REQ-OPT-230, REQ-OPT-231, REQ-OPT-232, REQ-OPT-233, REQ-OPT-234, REQ-OPT-235, REQ-OPT-257, REQ-OPT-258, REQ-OPT-259, REQ-OPT-260, REQ-OPT-261, REQ-OPT-262, REQ-OPT-263, REQ-OPT-264, REQ-OPT-265, REQ-OPT-266, REQ-OPT-267, REQ-OPT-268, REQ-OPT-269, REQ-OPT-270, REQ-OPT-319, REQ-OPT-320]
+started: 2026-11-03 05:26:14
+finished: 2026-11-03 05:41:14
 ---
 # T620 — E15.6 — Canonical LTO, whole-program optimization, section GC & PGO specification (SPEC-75)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Link-Time Optimization (`LTO`), whol
 
 ## Log
 - 2026-11-03 02:43:00 created by T215 (P15 phase planning)
+- 2026-11-03 05:26:14 started (attempt 1) 
+- 2026-11-03 05:41:14 accepted by QA -> done
