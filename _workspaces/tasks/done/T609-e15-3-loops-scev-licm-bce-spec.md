@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215, T600]
 priority: 102
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-72-loops-scev-bce.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-70-optir-ssa-memoryssa.md, 0113, 0165, tasks/0366, tasks/0402, tasks/0416, tasks/0426, tasks/0549]
 covers: [REQ-OPT-001, REQ-OPT-026, REQ-OPT-125, REQ-OPT-126, REQ-OPT-127, REQ-OPT-128, REQ-OPT-129, REQ-OPT-130, REQ-OPT-131, REQ-OPT-132, REQ-OPT-133, REQ-OPT-134, REQ-OPT-135, REQ-OPT-136, REQ-OPT-137, REQ-OPT-138, REQ-OPT-139, REQ-OPT-140, REQ-OPT-141, REQ-OPT-142, REQ-OPT-311, REQ-OPT-367, REQ-OPT-368]
+started: 2026-11-03 04:02:08
+finished: 2026-11-03 05:12:07
 ---
 # T609 — E15.3 — Canonical loop analysis, SCEV, LICM & bounds-check elimination specification (SPEC-72)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for CFG loop discovery, loop canonicaliz
 
 ## Log
 - 2026-11-03 02:40:00 created by T215 (P15 phase planning)
+- 2026-11-03 04:02:08 started (attempt 1) 
+- 2026-11-03 05:12:07 accepted by QA -> done

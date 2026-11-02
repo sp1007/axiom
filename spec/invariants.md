@@ -311,6 +311,13 @@ added by editing this list.
 - since: T608
 - check: alias/escape dump and differential conformance tests in tests/run/opt_alias (T606), tests/run/opt_escape (T607), and tests/conformance/p15/e15_2_alias_escape (T608) verify capability NoAlias forwarding, DSE, Box/closure/buffer stack and register promotion, address-observability barriers, and observable agreement across --interp, -O0, -O1, and -O2
 
+### INV-PIPE-010 — Canonical loop analysis, overflow-faithful SCEV, bounds-check elimination, and loop transformation safety
+- statement: Natural loop discovery, `LoopSimplify`/`LCSSA` canonicalization, Scalar Evolution (`SCEV`), `RangeInfo`, Bounds-Check Elimination (`BCE`), `LICM`, strength reduction, loop peeling/unswitching/unrolling/versioning/fusion, and iterator pipeline fusion preserve checked vs wrapping overflow semantics, retain bounds checks whenever `InBounds` is not `Certainty.Proven`, block hoisting of trapping instructions out of potentially zero-trip loops, and preserve `Drop`, capability, `atomic`, `volatile`, async `await`, and FFI barriers (SPEC-72 AXS-LOOP-001..017, AXS-BCE-001..006).
+- source: SPEC-72 AXS-LOOP-001..017, AXS-BCE-001..006; 0113 §122 AOPT-20; 0165 §21-30; tasks/0366 AOPT-35; tasks/0402 ALOOP-20..70, ABCE-20..27, ALICM-20..24; tasks/0416 ACOLLECT-44..47; tasks/0426 AITER-20..75; tasks/0549 ALOOP-20..90
+- verify: tests/run/opt_bce, tests/run/opt_loops, tests/conformance/p15/e15_3_loops_bce
+- since: T612
+- check: loop/BCE dump and differential conformance tests in tests/run/opt_bce (T610), tests/run/opt_loops (T611), and tests/conformance/p15/e15_3_loops_bce (T612) verify SCEV overflow fidelity, proven BCE vs retained out-of-bounds panics, LICM hoisting and zero-trip trap safety, iterator pipeline fusion, and observable agreement across --interp, -O0, -O1, and -O2
+
 ## 7. Oracle and agreement
 
 ### INV-ORACLE-001 — Semantics are explicit, not inherited from C
@@ -435,7 +442,7 @@ added by editing this list.
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

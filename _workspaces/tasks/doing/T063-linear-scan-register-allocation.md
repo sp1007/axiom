@@ -10,7 +10,7 @@ depends: [T215, T627]
 priority: 90
 status: doing
 attempts: 1
-paths: [compiler/target/x64, tests/mc/regalloc, tests/selfhost, tests/perf]
+paths: [compiler/target/x64, compiler/driver, tests/mc/regalloc, tests/selfhost, tests/perf]
 spec: [spec/SPEC-77-regalloc-machine-opt.md, 0182, 0235, 0252, tasks/0406, tasks/0557]
 covers: [REQ-OPT-203, REQ-OPT-204, REQ-OPT-212, REQ-OPT-218]
 started: 2026-11-03 03:25:30
