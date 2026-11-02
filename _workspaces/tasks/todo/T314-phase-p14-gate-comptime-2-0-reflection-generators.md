@@ -6,7 +6,7 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T214, T058]
+depends: [T214, T058, T550, T551, T552, T553, T554, T555, T556, T557, T558, T559, T560, T561, T562, T563, T564, T565, T566, T567, T568, T569, T570, T571, T572]
 priority: 314
 status: todo
 attempts: 0
@@ -39,3 +39,4 @@ requirements mapped to the phase are implemented.
 
 ## Log
 - 2026-10-06 02:23:56 covers += REQ-CTM-048, REQ-CTM-049 (metadata only)
+- 2026-11-03 02:25:00 wired P14 tasks (T058, T550-T572) into depends in T214

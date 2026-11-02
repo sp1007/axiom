@@ -143,9 +143,9 @@
 | REQ-DRP-009 | drop | v1-core | Moved fields are never dropped. | 0110 §13 | - | T113 | 
 | REQ-FFI-005 | ffi | v1-full | FFI allocation ownership must be explicit. | 0111 §47 | - | T515 |
 | REQ-FFI-006 | ffi | v1-full | FFI must not guess allocation domains. | 0111 §47 | - | T514 |
-| REQ-CTM-001 | comptime | v1-full | Comptime uses the same ownership semantics. | 0111 §47 | - | EPIC(E14.1) |
-| REQ-CTM-002 | comptime | v1-full | Comptime resources cannot escape into runtime. | 0111 §47 | - | EPIC(E14.1) |
-| REQ-CTM-003 | comptime | v1-full | Comptime cleanup is deterministic. | 0111 §47 | - | EPIC(E14.1) |
+| REQ-CTM-001 | comptime | v1-full | Comptime uses the same ownership semantics. | 0111 §47 | - | T550 |
+| REQ-CTM-002 | comptime | v1-full | Comptime resources cannot escape into runtime. | 0111 §47 | - | T550 |
+| REQ-CTM-003 | comptime | v1-full | Comptime cleanup is deterministic. | 0111 §47 | - | T550 |
 | REQ-ASY-005 | async | v1-full | Async state contains only semantically live state. | 0111 §47 | - | T417 |
 | REQ-ASY-006 | async | v1-full | Owned values may live across await. | 0111 §47 | - | T417 |
 | REQ-ASY-007 | async | v1-full | Suspended future owns its live state. | 0111 §47 | - | T418 |
@@ -181,8 +181,8 @@
 | REQ-OWN-013 | ownership | v1-core | Drop MUST complete ownership cleanup, not necessarily memory deallocation (ADROP-20). | 0115 §39 | - | T113 | 
 | REQ-LAY-002 | memory | v1-core | Reserve MUST NOT imply stable address (AMEM-23). | 0115 §42 | - | T113 | 
 | REQ-CORE-012 | unsafe | v1-core | Unsafe MUST suppress specific proof obligations, not compiler correctness checks (AUNSAFE-20). | 0115 §45 | - | T113 | 
-| REQ-CTM-004 | comptime | v1-full | Compile-time resources MUST NOT implicitly escape into runtime (ACOMP-20). | 0115 §59 | - | EPIC(E14.1) |
-| REQ-CTM-005 | comptime | v1-full | Comptime MUST produce runtime values, not hidden runtime resources (ACOMP-21). | 0115 §59 | - | EPIC(E14.1) |
+| REQ-CTM-004 | comptime | v1-full | Compile-time resources MUST NOT implicitly escape into runtime (ACOMP-20). | 0115 §59 | - | T550 |
+| REQ-CTM-005 | comptime | v1-full | Comptime MUST produce runtime values, not hidden runtime resources (ACOMP-21). | 0115 §59 | - | T550 |
 | REQ-OWN-014 | ownership | v1-core | Capability duplication is intrinsic to capability semantics and must not depend on user-visible traits like Copy. | 0116 §67 | - | T113 | 
 | REQ-OWN-015 | ownership | v1-core | Unknown aliasing cannot be assumed to be disjoint in safe code. | 0116 §70 | - | T113 | 
 | REQ-OWN-016 | ownership | v1-core | Lifetime analysis is internal compiler semantics and must not be exposed as source syntax. | 0116 §73 | - | T113 | 
@@ -253,8 +253,8 @@
 | REQ-GPU-002 | gpu | post-v1 | Host-to-device memory transfers must be explicit and cannot be implicitly performed by the compiler. | 0120 §267 (AGPU-21) | - | EPIC(E22.3) |
 | REQ-GPU-003 | gpu | post-v1 | Kernel code is valid only within its execution-domain contract. | 0120 §269 (AGPU-22) | - | EPIC(E22.3) |
 | REQ-GPU-004 | gpu | post-v1 | Asynchronous device operations must explicitly establish resource lifetime dependencies. | 0120 §274 (AGPU-23) | - | EPIC(E22.3) |
-| REQ-CTM-006 | comptime | v1-full | Compile-time resources cannot implicitly escape into the runtime environment. | 0120 §276 (ACOMP-22) | - | EPIC(E14.1) |
-| REQ-CTM-007 | comptime | v1-full | Compile-time execution must be deterministic based on its declared inputs and explicit capabilities. | 0120 §278 (ACOMP-23) | - | EPIC(E14.1) |
+| REQ-CTM-006 | comptime | v1-full | Compile-time resources cannot implicitly escape into the runtime environment. | 0120 §276 (ACOMP-22) | - | T550 |
+| REQ-CTM-007 | comptime | v1-full | Compile-time execution must be deterministic based on its declared inputs and explicit capabilities. | 0120 §278 (ACOMP-23) | - | T550 |
 | REQ-CORE-020 | reflection | v1-core | Reflection metadata must not be included in the runtime binary by default. | 0120 §283 (AREFLECT-20) | - | T113 | 
 | REQ-TOOL-002 | tooling | v1-full | Build features must not change core language semantics. | 0120 §293 (APKG-36) | - | EPIC(E19.1) |
 | REQ-CORE-021 | compiler | v1-full | Lowering phases must preserve program semantics. | 0121 §305 (ACOMPILER-20) | - | EPIC(E18.1) |
@@ -986,8 +986,8 @@
 | REQ-FFI-018 | ffi | v1-full | An `extern` function declaration shall specify an explicit ABI contract defining calling convention, data representation, layout, and boundary behaviors. | 0131 - Section 65 | - | T510 |
 | REQ-FFI-019 | ffi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries by default and must be converted to error codes or terminate execution according to policy. | 0131 - Section 66 | - | T521, T523, T524 |
 | REQ-FFI-020 | ffi | v1-full | The compiler shall not infer memory allocation or deallocation domains across foreign function interfaces, requiring explicit ownership contracts. | 0131 - Section 67 | - | T514 |
-| REQ-CTM-008 | comptime | v1-full | A `comptime fn` shall execute in a compile-time environment while adhering to the same type system, expression semantics, and ownership rules as runtime functions. | 0131 - Section 68 | - | EPIC(E14.1) |
-| REQ-CTM-009 | comptime | v1-full | Compile-time functions shall not leak runtime resource handles into runtime values. | 0131 - Section 69 | - | EPIC(E14.1) |
+| REQ-CTM-008 | comptime | v1-full | A `comptime fn` shall execute in a compile-time environment while adhering to the same type system, expression semantics, and ownership rules as runtime functions. | 0131 - Section 68 | - | T551 |
+| REQ-CTM-009 | comptime | v1-full | Compile-time functions shall not leak runtime resource handles into runtime values. | 0131 - Section 69 | - | T551 |
 | REQ-CORE-071 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without exposing mandatory source-level effect annotations in v0.1. | 0131 - Section 70 | - | T113 | 
 | REQ-CORE-072 | functions | v1-core | Internal effect analysis shall serve compiler optimizations and diagnostics without introducing syntax complexity to the programmer. | 0131 - Section 71 | - | T113 | 
 | REQ-CORE-073 | functions | v1-core | The compiler shall prove a function is pure only when all observable side effects are demonstrably absent, and must not infer purity solely from the lack of explicit source mutation. | 0131 - Section 72 | - | T113 | 
@@ -1044,8 +1044,8 @@
 | REQ-FFI-022 | ffi | v1-full | Foreign function interfaces shall require explicit ABI declarations without compiler guessing [AFN-52]. | 0131 - Section 88 (AFN-52) | - | T504 |
 | REQ-FFI-023 | ffi | v1-full | Axiom panics shall not cross FFI ABI boundaries by default and must be handled at the boundary [AFN-53]. | 0131 - Section 88 (AFN-53) | - | T521 |
 | REQ-FFI-024 | ffi | v1-full | FFI memory allocation and deallocation domains shall be explicit without compiler assumptions [AFN-54]. | 0131 - Section 88 (AFN-54) | - | T514 |
-| REQ-CTM-010 | comptime | v1-full | Compile-time functions shall adhere to the same type system and semantics as runtime functions without a separate type system [AFN-55]. | 0131 - Section 88 (AFN-55) | - | EPIC(E14.1) |
-| REQ-CTM-011 | comptime | v1-full | Compile-time resource handles shall not escape into runtime values [AFN-56]. | 0131 - Section 88 (AFN-56) | - | EPIC(E14.1) |
+| REQ-CTM-010 | comptime | v1-full | Compile-time functions shall adhere to the same type system and semantics as runtime functions without a separate type system [AFN-55]. | 0131 - Section 88 (AFN-55) | - | T551 |
+| REQ-CTM-011 | comptime | v1-full | Compile-time resource handles shall not escape into runtime values [AFN-56]. | 0131 - Section 88 (AFN-56) | - | T551 |
 | REQ-CORE-090 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without requiring programmer-written effect annotations in v0.1 [AFN-57]. | 0131 - Section 88 (AFN-57) | - | T113 | 
 | REQ-OPT-009 | optimization | v1-full | Function inlining shall preserve all observable function semantics and behavior [AFN-58]. | 0131 - Section 88 (AFN-58) | - | EPIC(E15.1) |
 | REQ-CORE-091 | functions | v1-core | Dynamic dispatch shall be invoked only when explicitly specified using `dyn Trait` [AFN-59] . | 0131 - Section 88 (AFN-59) | REQ-TYP-018 | T113 | 
@@ -1476,37 +1476,37 @@
 | REQ-GPU-051 | gpu | post-v1 | This is điểm rất quan trọng for mục tiêu ban đầu of axiom: not hy sinh hiệu năng thấp tầng to has abstraction cao tầng, but also not bắt programmer must học hai or ba memory models khác nhau. | 0139 §XX.45. Chốt Part XX | - | EPIC(E22.3) |
 | REQ-GPU-052 | gpu | post-v1 | Make sao has metaprogramming mạnh như rust/modern c++ but not biến compiler into a mớ macro/plugin khó kiểm soát? | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E22.3) |
 | REQ-GPU-053 | gpu | post-v1 | Tức is comptime is not a ngôn ngữ thứ hai. | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E22.3) |
-| REQ-CTM-012 | comptime | v1-full | - macro language thứ hai; - compiler plugin arbitrarily phá compiler; - build script has toàn quyền máy; - compile-time code has semantics khác runtime; - compiler build not reproducible; - programmer must học a hệ thống ownership khác. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E14.1) |
-| REQ-CTM-013 | comptime | v1-full | Compile-time is another execution phase, not another language. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E14.1) |
-| REQ-CTM-014 | comptime | v1-full | Comptime uses the same type system, ownership model, and semantic verifier as runtime code. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E14.1) |
-| REQ-CTM-015 | comptime | v1-full | `const` is not a biến runtime is tối ưu hóa. | 0140 §XXI.2. `const` không phải `static` | - | EPIC(E14.1) |
-| REQ-CTM-016 | comptime | v1-full | If `buffer` is resource compile-time, nó still must be cleanup đúng semantics. | 0140 §XXI.5. Comptime Ownership | - | EPIC(E14.1) |
-| REQ-CTM-017 | comptime | v1-full | If capability must not khai báo. | 0140 §XXI.11. Deterministic Comptime | - | EPIC(E14.1) |
-| REQ-CTM-018 | comptime | v1-full | Must trở into build input. | 0140 §XXI.12. Explicit External Inputs | - | EPIC(E14.1) |
-| REQ-CTM-019 | comptime | v1-full | This is not textual expansion. | 0140 §XXI.15. `@derive` | - | EPIC(E14.1) |
-| REQ-CTM-020 | comptime | v1-full | Compiler must not after that tự ý reorder field. | 0140 §XXI.23. Reflection Không Được Phá Optimization | - | EPIC(E14.1) |
-| REQ-CTM-021 | comptime | v1-full | Reflection can make previously unobservable metadata observable. | 0140 §XXI.23. Reflection Không Được Phá Optimization | - | EPIC(E14.1) |
-| REQ-CTM-022 | comptime | v1-full | Then source that must trở into a build input/output is quản lý. | 0140 §XXI.25. Generated Source | - | EPIC(E14.1) |
-| REQ-CTM-023 | comptime | v1-full | Comptime execution must run in oracle/sandbox-like execution environment. | 0140 §XXI.28. Comptime Panic | - | EPIC(E14.1) |
-| REQ-CTM-024 | comptime | v1-full | Compiler process must not is arbitrary user code make crash. | 0140 §XXI.28. Comptime Panic | - | EPIC(E14.1) |
-| REQ-CTM-025 | comptime | v1-full | But this must is semantic type generation, not đơn thuần text injection. | 0140 §XXI.33. Comptime Type Generation | - | EPIC(E14.1) |
-| REQ-CTM-026 | comptime | v1-full | If type generation is đưa vào core, compiler must create a type identity ổn định for generated type. | 0140 §XXI.33. Comptime Type Generation | - | EPIC(E14.1) |
-| REQ-CTM-027 | comptime | v1-full | A package must not tự ý đọc private internals of package khác only vì đang run comptime. | 0140 §XXI.35. Comptime và Package Boundary | - | EPIC(E14.1) |
-| REQ-CTM-028 | comptime | v1-full | Then constraint needs thiết must xuất hiện in semantic api fingerprint. | 0140 §XXI.36. Public API và Comptime | - | EPIC(E14.1) |
-| REQ-CTM-029 | comptime | v1-full | Must not has side effect external. | 0140 §XXI.37. Compile-Time Side Effects | - | EPIC(E14.1) |
-| REQ-CTM-030 | comptime | v1-full | Then must explicit capability. | 0140 §XXI.37. Compile-Time Side Effects | - | EPIC(E14.1) |
-| REQ-CTM-031 | comptime | v1-full | Artifact byte-for-byte reproducibility has thể còn phụ thuộc linker/build timestamp if profile for phép; but semantic compilation must not phụ thuộc hidden state. | 0140 §XXI.38. Build Reproducibility | - | EPIC(E14.1) |
-| REQ-CTM-032 | comptime | v1-full | After that network input must trở into build dependency/input. | 0140 §XXI.39. Compile-Time Network | - | EPIC(E14.1) |
-| REQ-CTM-033 | comptime | v1-full | Must not coi external tool is invisible magic. | 0140 §XXI.40. Execute Tool | - | EPIC(E14.1) |
-| REQ-CTM-034 | comptime | v1-full | But is not semantic authority. | 0140 §XXI.42. AI Integration | - | EPIC(E14.1) |
-| REQ-CTM-035 | comptime | v1-full | But must not change semantics. | 0140 §XXI.44. Comptime Optimization | - | EPIC(E14.1) |
-| REQ-CTM-036 | comptime | v1-full | → tất cả still must run. | 0140 §XXI.47. Negative Examples | - | EPIC(E14.1) |
-| REQ-CTM-037 | comptime | v1-full | Acomp-25 — comptime code must pass normal semantic verification | 0140 §XXI.48. Normative Invariants | - | EPIC(E14.1) |
-| REQ-CTM-038 | comptime | v1-full | Acomp-34 — nondeterministic inputs must be explicit | 0140 §XXI.48. Normative Invariants | - | EPIC(E14.1) |
-| REQ-CTM-039 | comptime | v1-full | Areflect-24 — runtime reflection must be explicitly requested | 0140 §XXI.48. Normative Invariants | - | EPIC(E14.1) |
-| REQ-CTM-040 | comptime | v1-full | Agen-20 — generated code must pass normal compilation | 0140 §XXI.48. Normative Invariants | - | EPIC(E14.1) |
-| REQ-CTM-041 | comptime | v1-full | Acomp-44 — comptime caching must preserve semantics | 0140 §XXI.48. Normative Invariants | - | EPIC(E14.1) |
-| REQ-CTM-042 | comptime | v1-full | Đặc biệt will must chốt luôn `import` and `use` has actually needs tồn at đồng thời hay nên bỏ a keyword, thay vì to syntax dư thừa in axiom. | 0140 §Tiếp theo: Part XXII — Modules · Packages · Workspace · API Boundary | - | EPIC(E14.1) |
+| REQ-CTM-012 | comptime | v1-full | - macro language thứ hai; - compiler plugin arbitrarily phá compiler; - build script has toàn quyền máy; - compile-time code has semantics khác runtime; - compiler build not reproducible; - programmer must học a hệ thống ownership khác. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
+| REQ-CTM-013 | comptime | v1-full | Compile-time is another execution phase, not another language. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
+| REQ-CTM-014 | comptime | v1-full | Comptime uses the same type system, ownership model, and semantic verifier as runtime code. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
+| REQ-CTM-015 | comptime | v1-full | `const` is not a biến runtime is tối ưu hóa. | 0140 §XXI.2. `const` không phải `static` | - | T550 |
+| REQ-CTM-016 | comptime | v1-full | If `buffer` is resource compile-time, nó still must be cleanup đúng semantics. | 0140 §XXI.5. Comptime Ownership | - | T550 |
+| REQ-CTM-017 | comptime | v1-full | If capability must not khai báo. | 0140 §XXI.11. Deterministic Comptime | - | T550 |
+| REQ-CTM-018 | comptime | v1-full | Must trở into build input. | 0140 §XXI.12. Explicit External Inputs | - | T550 |
+| REQ-CTM-019 | comptime | v1-full | This is not textual expansion. | 0140 §XXI.15. `@derive` | - | T556 |
+| REQ-CTM-020 | comptime | v1-full | Compiler must not after that tự ý reorder field. | 0140 §XXI.23. Reflection Không Được Phá Optimization | - | T556 |
+| REQ-CTM-021 | comptime | v1-full | Reflection can make previously unobservable metadata observable. | 0140 §XXI.23. Reflection Không Được Phá Optimization | - | T556 |
+| REQ-CTM-022 | comptime | v1-full | Then source that must trở into a build input/output is quản lý. | 0140 §XXI.25. Generated Source | - | T556 |
+| REQ-CTM-023 | comptime | v1-full | Comptime execution must run in oracle/sandbox-like execution environment. | 0140 §XXI.28. Comptime Panic | - | T550 |
+| REQ-CTM-024 | comptime | v1-full | Compiler process must not is arbitrary user code make crash. | 0140 §XXI.28. Comptime Panic | - | T550 |
+| REQ-CTM-025 | comptime | v1-full | But this must is semantic type generation, not đơn thuần text injection. | 0140 §XXI.33. Comptime Type Generation | - | T550 |
+| REQ-CTM-026 | comptime | v1-full | If type generation is đưa vào core, compiler must create a type identity ổn định for generated type. | 0140 §XXI.33. Comptime Type Generation | - | T550 |
+| REQ-CTM-027 | comptime | v1-full | A package must not tự ý đọc private internals of package khác only vì đang run comptime. | 0140 §XXI.35. Comptime và Package Boundary | - | T550 |
+| REQ-CTM-028 | comptime | v1-full | Then constraint needs thiết must xuất hiện in semantic api fingerprint. | 0140 §XXI.36. Public API và Comptime | - | T550 |
+| REQ-CTM-029 | comptime | v1-full | Must not has side effect external. | 0140 §XXI.37. Compile-Time Side Effects | - | T550 |
+| REQ-CTM-030 | comptime | v1-full | Then must explicit capability. | 0140 §XXI.37. Compile-Time Side Effects | - | T550 |
+| REQ-CTM-031 | comptime | v1-full | Artifact byte-for-byte reproducibility has thể còn phụ thuộc linker/build timestamp if profile for phép; but semantic compilation must not phụ thuộc hidden state. | 0140 §XXI.38. Build Reproducibility | - | T550 |
+| REQ-CTM-032 | comptime | v1-full | After that network input must trở into build dependency/input. | 0140 §XXI.39. Compile-Time Network | - | T550 |
+| REQ-CTM-033 | comptime | v1-full | Must not coi external tool is invisible magic. | 0140 §XXI.40. Execute Tool | - | T550 |
+| REQ-CTM-034 | comptime | v1-full | But is not semantic authority. | 0140 §XXI.42. AI Integration | - | T550 |
+| REQ-CTM-035 | comptime | v1-full | But must not change semantics. | 0140 §XXI.44. Comptime Optimization | - | T550 |
+| REQ-CTM-036 | comptime | v1-full | → tất cả still must run. | 0140 §XXI.47. Negative Examples | - | T550 |
+| REQ-CTM-037 | comptime | v1-full | Acomp-25 — comptime code must pass normal semantic verification | 0140 §XXI.48. Normative Invariants | - | T550 |
+| REQ-CTM-038 | comptime | v1-full | Acomp-34 — nondeterministic inputs must be explicit | 0140 §XXI.48. Normative Invariants | - | T550 |
+| REQ-CTM-039 | comptime | v1-full | Areflect-24 — runtime reflection must be explicitly requested | 0140 §XXI.48. Normative Invariants | - | T556 |
+| REQ-CTM-040 | comptime | v1-full | Agen-20 — generated code must pass normal compilation | 0140 §XXI.48. Normative Invariants | - | T556 |
+| REQ-CTM-041 | comptime | v1-full | Acomp-44 — comptime caching must preserve semantics | 0140 §XXI.48. Normative Invariants | - | T553 |
+| REQ-CTM-042 | comptime | v1-full | Đặc biệt will must chốt luôn `import` and `use` has actually needs tồn at đồng thời hay nên bỏ a keyword, thay vì to syntax dư thừa in axiom. | 0140 §Tiếp theo: Part XXII — Modules · Packages · Workspace · API Boundary | - | T553 |
 | REQ-MOD-042 | modules | v1-core | Axiom must phân biệt rõ “code nằm ở đâu”, “tên is nhìn thấy ở đâu”, “package nào sở hữu type”, and “api nào actually ổn định”. | 0141 §# Part XXII — Modules · Packages · Workspace · API Boundary | - | T113 | 
 | REQ-MOD-043 | modules | v1-core | Axiom v0.1 only dùng `import`. not needs `use` như a cơ chế thứ hai. | 0141 §# Part XXII — Modules · Packages · Workspace · API Boundary | - | T113 | 
 | REQ-MOD-044 | modules | v1-core | Mà is not change language semantics. | 0141 §XXII.2. Module Không Đồng Nhất Với File | - | T113 | 
@@ -3984,87 +3984,87 @@
 | REQ-SEC-084 | sec | v1-core | ASEC-98 â€” Axiom does not require a monolithic security runtime. | tasks/0342 §100. Frozen Invariants — `ASEC-20..100` | - | T113 | 
 | REQ-SEC-085 | sec | v1-core | ASEC-99 â€” Security abstractions should remain erasable where their semantics permit. | tasks/0342 §100. Frozen Invariants — `ASEC-20..100` | - | T113 | 
 | REQ-SEC-086 | sec | v1-core | ASEC-100 â€” All security mechanisms preserve ownership, capability, memory, concurrency, async, GPU, comptime and FFI invariants. | tasks/0342 §100. Frozen Invariants — `ASEC-20..100` | - | T113 | 
-| REQ-CORE-602 | ctm | v1-full | AMETA-20 â€” Generic abstraction and metaprogramming are distinct mechanisms. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-603 | ctm | v1-full | AMETA-21 â€” Comptime is Axiom execution performed during compilation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-604 | ctm | v1-full | AMETA-22 â€” Comptime uses the ordinary Axiom semantic model. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-605 | ctm | v1-full | AMETA-23 â€” Comptime is not a second programming language. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-606 | ctm | v1-full | AMETA-24 â€” Reflection inspects compiler-known semantic information. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-607 | ctm | v1-full | AMETA-25 â€” Compile-time reflection is the default reflection model. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-608 | ctm | v1-full | AMETA-26 â€” Runtime reflection is optional and explicit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-609 | ctm | v1-full | AMETA-27 â€” Compile-time `Type` does not imply a runtime type object. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-610 | ctm | v1-full | AMETA-28 â€” Runtime reflection metadata does not require object headers. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-611 | ctm | v1-full | AMETA-29 â€” Reflection does not alter semantic type identity. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-612 | ctm | v1-full | AMETA-30 â€” Reflection does not automatically create representation or ABI contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-613 | ctm | v1-full | AMETA-31 â€” `size_of`, `align_of` and `offset_of` obey representation contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-614 | ctm | v1-full | AMETA-32 â€” Default compiler-controlled layout remains non-stable unless explicitly contracted. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-615 | ctm | v1-full | AMETA-33 â€” Reflection respects visibility rules. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-616 | ctm | v1-full | AMETA-34 â€” Reflection cannot silently convert private declarations into public API. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-617 | ctm | v1-full | AMETA-35 â€” Trait reflection does not bypass the trait solver. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-618 | ctm | v1-full | AMETA-36 â€” Generic reflection does not bypass generic constraint checking. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-619 | ctm | v1-full | AMETA-37 â€” Enum reflection observes semantic variants, not arbitrary memory layout. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-620 | ctm | v1-full | AMETA-38 â€” Runtime metadata emission is explicit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-621 | ctm | v1-full | AMETA-39 â€” Runtime reflection incurs no mandatory cost when unused. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-622 | ctm | v1-full | AMETA-40 â€” `derive` is typed semantic generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-623 | ctm | v1-full | AMETA-41 â€” Compiler-known derives are verified as ordinary semantic implementations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-624 | ctm | v1-full | AMETA-42 â€” Derived implementations do not become trusted merely because the compiler generated them. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-625 | ctm | v1-full | AMETA-43 â€” Generated declarations re-enter normal semantic analysis. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-626 | ctm | v1-full | AMETA-44 â€” Generated declarations undergo type checking. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-627 | ctm | v1-full | AMETA-45 â€” Generated declarations undergo ownership verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-628 | ctm | v1-full | AMETA-46 â€” Generated declarations undergo capability verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-629 | ctm | v1-full | AMETA-47 â€” Generated declarations undergo concurrency verification where applicable. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-630 | ctm | v1-full | AMETA-48 â€” Generated GPU code undergoes GPU legality and semantic verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-631 | ctm | v1-full | AMETA-49 â€” Generated FFI declarations undergo FFI and ABI verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-632 | ctm | v1-full | AMETA-50 â€” Arbitrary AST mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-633 | ctm | v1-full | AMETA-51 â€” Arbitrary HIR mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-634 | ctm | v1-full | AMETA-52 â€” Arbitrary MIR mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-635 | ctm | v1-full | AMETA-53 â€” Textual procedural macros are not the foundational metaprogramming mechanism. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-636 | ctm | v1-full | AMETA-54 â€” Typed generation is preferred over textual source generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-637 | ctm | v1-full | AMETA-55 â€” Source generation and typed generation are distinct mechanisms. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-638 | ctm | v1-full | AMETA-56 â€” Generated source is compiled through the ordinary compiler pipeline. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-639 | ctm | v1-full | AMETA-57 â€” Generated declarations possess compiler identities. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-640 | ctm | v1-full | AMETA-58 â€” Generated declarations retain generation provenance. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-641 | ctm | v1-full | AMETA-59 â€” Generated declarations participate in source/semantic mapping. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-642 | ctm | v1-full | AMETA-60 â€” Diagnostics may trace generated entities to their generator and originating source. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-643 | ctm | v1-full | AMETA-61 â€” Generation dependencies participate in incremental compilation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-644 | ctm | v1-full | AMETA-62 â€” Reflection dependencies participate in incremental invalidation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-645 | ctm | v1-full | AMETA-63 â€” Generation cache identity includes semantic inputs. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-646 | ctm | v1-full | AMETA-64 â€” Generation cache identity includes relevant comptime dependencies. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-647 | ctm | v1-full | AMETA-65 â€” External comptime inputs participate in cache identity. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-648 | ctm | v1-full | AMETA-66 â€” Generation must be deterministic under deterministic build profiles. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-649 | ctm | v1-full | AMETA-67 â€” Independent generators may execute in parallel. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-650 | ctm | v1-full | AMETA-68 â€” Parallel generation must be semantically equivalent to deterministic serial generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-651 | ctm | v1-full | AMETA-69 â€” Generation conflicts are diagnosed deterministically. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-652 | ctm | v1-full | AMETA-70 â€” Generation cycles are rejected deterministically. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-653 | ctm | v1-full | AMETA-71 â€” Comptime execution is subject to resource limits. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-654 | ctm | v1-full | AMETA-72 â€” Comptime execution remains subject to capability restrictions. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-655 | ctm | v1-full | AMETA-73 â€” Unsafe does not bypass comptime sandbox restrictions. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-656 | ctm | v1-full | AMETA-74 â€” Comptime panic produces compiler failure diagnostics, not runtime panic. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-657 | ctm | v1-full | AMETA-75 â€” Comptime resources obey ownership and deterministic cleanup semantics. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-658 | ctm | v1-full | AMETA-76 â€” Comptime execution does not imply runtime allocation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-659 | ctm | v1-full | AMETA-77 â€” Comptime helpers disappear from runtime unless explicitly materialized. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-660 | ctm | v1-full | AMETA-78 â€” Compile-time generated constants may materialize directly as static data. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-661 | ctm | v1-full | AMETA-79 â€” Comptime does not imply runtime initialization code. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-662 | ctm | v1-full | AMETA-80 â€” Specialization and generation are distinct compiler operations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-663 | ctm | v1-full | AMETA-81 â€” Generic specialization may occur without source generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-664 | ctm | v1-full | AMETA-82 â€” Generated generic declarations enter the normal generic subsystem. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-665 | ctm | v1-full | AMETA-83 â€” Generated public declarations affect public semantic fingerprints. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-666 | ctm | v1-full | AMETA-84 â€” Private generated implementation need not invalidate unrelated downstream users. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-667 | ctm | v1-full | AMETA-85 â€” `.axmeta` may contain reflection and semantic metadata when requested. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-668 | ctm | v1-full | AMETA-86 â€” Runtime artifacts need not embed complete compiler metadata. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-669 | ctm | v1-full | AMETA-87 â€” Reflection is implemented through compiler semantic data rather than an independent semantic database. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-670 | ctm | v1-full | AMETA-88 â€” Reflection cannot directly mutate compiler semantic state. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-671 | ctm | v1-full | AMETA-89 â€” Typed generation uses explicit compiler generation interfaces. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-672 | ctm | v1-full | AMETA-90 â€” Generated names participate in ordinary namespace and collision rules. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-673 | ctm | v1-full | AMETA-91 â€” Generated declarations do not silently overwrite existing declarations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-674 | ctm | v1-full | AMETA-92 â€” Generated helpers may remain private unless explicitly exported. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-675 | ctm | v1-full | AMETA-93 â€” Compiler extensions are distinct from ordinary language metaprogramming. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-676 | ctm | v1-full | AMETA-94 â€” Untrusted packages cannot arbitrarily mutate compiler internals. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-677 | ctm | v1-full | AMETA-95 â€” Compiler extension APIs, if introduced later, require explicit versioned contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-678 | ctm | v1-full | AMETA-96 â€” AI tooling may inspect and generate semantic structures but does not determine language semantics. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-679 | ctm | v1-full | AMETA-97 â€” Compiler semantic verification remains authoritative over AI-generated code. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-680 | ctm | v1-full | AMETA-98 â€” Metaprogramming mechanisms must preserve ownership, capability, ABI, concurrency, GPU, FFI and security invariants. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-681 | ctm | v1-full | AMETA-99 â€” Metaprogramming abstractions should be erased when their observable runtime semantics permit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-682 | ctm | v1-full | AMETA-100 â€” Axiom metaprogramming is based on generic abstraction, comptime execution, reflection and typed generation rather than unrestricted macro expansion. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | EPIC(E14.1) |
+| REQ-CORE-602 | ctm | v1-full | AMETA-20 â€” Generic abstraction and metaprogramming are distinct mechanisms. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-603 | ctm | v1-full | AMETA-21 â€” Comptime is Axiom execution performed during compilation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-604 | ctm | v1-full | AMETA-22 â€” Comptime uses the ordinary Axiom semantic model. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-605 | ctm | v1-full | AMETA-23 â€” Comptime is not a second programming language. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-606 | ctm | v1-full | AMETA-24 â€” Reflection inspects compiler-known semantic information. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-607 | ctm | v1-full | AMETA-25 â€” Compile-time reflection is the default reflection model. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-608 | ctm | v1-full | AMETA-26 â€” Runtime reflection is optional and explicit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-609 | ctm | v1-full | AMETA-27 â€” Compile-time `Type` does not imply a runtime type object. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-610 | ctm | v1-full | AMETA-28 â€” Runtime reflection metadata does not require object headers. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-611 | ctm | v1-full | AMETA-29 â€” Reflection does not alter semantic type identity. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-612 | ctm | v1-full | AMETA-30 â€” Reflection does not automatically create representation or ABI contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-613 | ctm | v1-full | AMETA-31 â€” `size_of`, `align_of` and `offset_of` obey representation contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-614 | ctm | v1-full | AMETA-32 â€” Default compiler-controlled layout remains non-stable unless explicitly contracted. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-615 | ctm | v1-full | AMETA-33 â€” Reflection respects visibility rules. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-616 | ctm | v1-full | AMETA-34 â€” Reflection cannot silently convert private declarations into public API. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-617 | ctm | v1-full | AMETA-35 â€” Trait reflection does not bypass the trait solver. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-618 | ctm | v1-full | AMETA-36 â€” Generic reflection does not bypass generic constraint checking. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-619 | ctm | v1-full | AMETA-37 â€” Enum reflection observes semantic variants, not arbitrary memory layout. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-620 | ctm | v1-full | AMETA-38 â€” Runtime metadata emission is explicit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-621 | ctm | v1-full | AMETA-39 â€” Runtime reflection incurs no mandatory cost when unused. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T556 |
+| REQ-CORE-622 | ctm | v1-full | AMETA-40 â€” `derive` is typed semantic generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-623 | ctm | v1-full | AMETA-41 â€” Compiler-known derives are verified as ordinary semantic implementations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-624 | ctm | v1-full | AMETA-42 â€” Derived implementations do not become trusted merely because the compiler generated them. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-625 | ctm | v1-full | AMETA-43 â€” Generated declarations re-enter normal semantic analysis. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-626 | ctm | v1-full | AMETA-44 â€” Generated declarations undergo type checking. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-627 | ctm | v1-full | AMETA-45 â€” Generated declarations undergo ownership verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-628 | ctm | v1-full | AMETA-46 â€” Generated declarations undergo capability verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-629 | ctm | v1-full | AMETA-47 â€” Generated declarations undergo concurrency verification where applicable. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-630 | ctm | v1-full | AMETA-48 â€” Generated GPU code undergoes GPU legality and semantic verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-631 | ctm | v1-full | AMETA-49 â€” Generated FFI declarations undergo FFI and ABI verification. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-632 | ctm | v1-full | AMETA-50 â€” Arbitrary AST mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-633 | ctm | v1-full | AMETA-51 â€” Arbitrary HIR mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-634 | ctm | v1-full | AMETA-52 â€” Arbitrary MIR mutation is not part of Core v1. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-635 | ctm | v1-full | AMETA-53 â€” Textual procedural macros are not the foundational metaprogramming mechanism. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-636 | ctm | v1-full | AMETA-54 â€” Typed generation is preferred over textual source generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-637 | ctm | v1-full | AMETA-55 â€” Source generation and typed generation are distinct mechanisms. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-638 | ctm | v1-full | AMETA-56 â€” Generated source is compiled through the ordinary compiler pipeline. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-639 | ctm | v1-full | AMETA-57 â€” Generated declarations possess compiler identities. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T557 |
+| REQ-CORE-640 | ctm | v1-full | AMETA-58 â€” Generated declarations retain generation provenance. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-641 | ctm | v1-full | AMETA-59 â€” Generated declarations participate in source/semantic mapping. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-642 | ctm | v1-full | AMETA-60 â€” Diagnostics may trace generated entities to their generator and originating source. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-643 | ctm | v1-full | AMETA-61 â€” Generation dependencies participate in incremental compilation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-644 | ctm | v1-full | AMETA-62 â€” Reflection dependencies participate in incremental invalidation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-645 | ctm | v1-full | AMETA-63 â€” Generation cache identity includes semantic inputs. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-646 | ctm | v1-full | AMETA-64 â€” Generation cache identity includes relevant comptime dependencies. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-647 | ctm | v1-full | AMETA-65 â€” External comptime inputs participate in cache identity. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-648 | ctm | v1-full | AMETA-66 â€” Generation must be deterministic under deterministic build profiles. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-649 | ctm | v1-full | AMETA-67 â€” Independent generators may execute in parallel. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-650 | ctm | v1-full | AMETA-68 â€” Parallel generation must be semantically equivalent to deterministic serial generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-651 | ctm | v1-full | AMETA-69 â€” Generation conflicts are diagnosed deterministically. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-652 | ctm | v1-full | AMETA-70 â€” Generation cycles are rejected deterministically. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-653 | ctm | v1-full | AMETA-71 â€” Comptime execution is subject to resource limits. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-654 | ctm | v1-full | AMETA-72 â€” Comptime execution remains subject to capability restrictions. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-655 | ctm | v1-full | AMETA-73 â€” Unsafe does not bypass comptime sandbox restrictions. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-656 | ctm | v1-full | AMETA-74 â€” Comptime panic produces compiler failure diagnostics, not runtime panic. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-657 | ctm | v1-full | AMETA-75 â€” Comptime resources obey ownership and deterministic cleanup semantics. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-658 | ctm | v1-full | AMETA-76 â€” Comptime execution does not imply runtime allocation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-659 | ctm | v1-full | AMETA-77 â€” Comptime helpers disappear from runtime unless explicitly materialized. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T558 |
+| REQ-CORE-660 | ctm | v1-full | AMETA-78 â€” Compile-time generated constants may materialize directly as static data. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-661 | ctm | v1-full | AMETA-79 â€” Comptime does not imply runtime initialization code. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-662 | ctm | v1-full | AMETA-80 â€” Specialization and generation are distinct compiler operations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-663 | ctm | v1-full | AMETA-81 â€” Generic specialization may occur without source generation. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-664 | ctm | v1-full | AMETA-82 â€” Generated generic declarations enter the normal generic subsystem. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-665 | ctm | v1-full | AMETA-83 â€” Generated public declarations affect public semantic fingerprints. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-666 | ctm | v1-full | AMETA-84 â€” Private generated implementation need not invalidate unrelated downstream users. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-667 | ctm | v1-full | AMETA-85 â€” `.axmeta` may contain reflection and semantic metadata when requested. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-668 | ctm | v1-full | AMETA-86 â€” Runtime artifacts need not embed complete compiler metadata. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-669 | ctm | v1-full | AMETA-87 â€” Reflection is implemented through compiler semantic data rather than an independent semantic database. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-670 | ctm | v1-full | AMETA-88 â€” Reflection cannot directly mutate compiler semantic state. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-671 | ctm | v1-full | AMETA-89 â€” Typed generation uses explicit compiler generation interfaces. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-672 | ctm | v1-full | AMETA-90 â€” Generated names participate in ordinary namespace and collision rules. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T559 |
+| REQ-CORE-673 | ctm | v1-full | AMETA-91 â€” Generated declarations do not silently overwrite existing declarations. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-674 | ctm | v1-full | AMETA-92 â€” Generated helpers may remain private unless explicitly exported. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-675 | ctm | v1-full | AMETA-93 â€” Compiler extensions are distinct from ordinary language metaprogramming. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-676 | ctm | v1-full | AMETA-94 â€” Untrusted packages cannot arbitrarily mutate compiler internals. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-677 | ctm | v1-full | AMETA-95 â€” Compiler extension APIs, if introduced later, require explicit versioned contracts. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-678 | ctm | v1-full | AMETA-96 â€” AI tooling may inspect and generate semantic structures but does not determine language semantics. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-679 | ctm | v1-full | AMETA-97 â€” Compiler semantic verification remains authoritative over AI-generated code. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-680 | ctm | v1-full | AMETA-98 â€” Metaprogramming mechanisms must preserve ownership, capability, ABI, concurrency, GPU, FFI and security invariants. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-681 | ctm | v1-full | AMETA-99 â€” Metaprogramming abstractions should be erased when their observable runtime semantics permit. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
+| REQ-CORE-682 | ctm | v1-full | AMETA-100 â€” Axiom metaprogramming is based on generic abstraction, comptime execution, reflection and typed generation rather than unrestricted macro expansion. | tasks/0343 §100. Frozen Invariants — `AMETA-20..100` | - | T560 |
 | REQ-SIMD-166 | simd | v1-full | ASIMD-20 â€” Vector types have explicit semantic lane structure. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T463 |
 | REQ-SIMD-167 | simd | v1-full | ASIMD-21 â€” Vector types are distinct from arrays. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T463 |
 | REQ-SIMD-168 | simd | v1-full | ASIMD-22 â€” Vector width does not imply a particular physical register width. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T463 |
@@ -4146,87 +4146,87 @@
 | REQ-SIMD-244 | simd | v1-full | ASIMD-98 â€” Optimization may select different vector widths without changing program semantics. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T470 |
 | REQ-SIMD-245 | simd | v1-full | ASIMD-99 â€” SIMD abstractions should disappear into native instructions whenever observable semantics permit. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T468 |
 | REQ-SIMD-246 | simd | v1-full | ASIMD-100 â€” Axiom SIMD exists to expose hardware performance without exposing unnecessary hardware complexity to the programmer. | tasks/0344 §100. Frozen Invariants — `ASIMD-20..100`; tasks/0347 §100. Frozen Invariants — `ASIMD-20..100` | - | T468 |
-| REQ-CORE-683 | ctm | v1-full | ACOMP2-20 â€” `const`, `comptime`, and runtime are distinct evaluation modes of the same Axiom language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-684 | ctm | v1-full | ACOMP2-21 â€” Comptime is not a second source language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-685 | ctm | v1-full | ACOMP2-22 â€” Comptime uses the ordinary Axiom type system. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-686 | ctm | v1-full | ACOMP2-23 â€” Comptime follows ordinary ownership semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-687 | ctm | v1-full | ACOMP2-24 â€” Comptime follows ordinary Drop semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-688 | ctm | v1-full | ACOMP2-25 â€” Comptime follows ordinary capability semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-689 | ctm | v1-full | ACOMP2-26 â€” Comptime follows ordinary type and trait semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-690 | ctm | v1-full | ACOMP2-27 â€” Unsafe does not bypass comptime sandbox restrictions. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-691 | ctm | v1-full | ACOMP2-28 â€” External comptime effects require explicit capabilities. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-692 | ctm | v1-full | ACOMP2-29 â€” Comptime capabilities participate in dependency tracking. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-693 | ctm | v1-full | ACOMP2-30 â€” Comptime external inputs contribute to cache identity. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-694 | ctm | v1-full | ACOMP2-31 â€” Reproducible builds constrain nondeterministic comptime inputs. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-695 | ctm | v1-full | ACOMP2-32 â€” Comptime values cannot implicitly become runtime external resources. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-696 | ctm | v1-full | ACOMP2-33 â€” Comptime resources are cleaned up in the compiler execution environment. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-697 | ctm | v1-full | ACOMP2-34 â€” `const` values are compile-time semantic values, not textual macros. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-698 | ctm | v1-full | ACOMP2-35 â€” `comptime fn` is callable only during compile-time evaluation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-699 | ctm | v1-full | ACOMP2-36 â€” `comptime` blocks execute before required runtime execution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-700 | ctm | v1-full | ACOMP2-37 â€” Compile-time failure produces compiler diagnostics rather than runtime panic. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-701 | ctm | v1-full | ACOMP2-38 â€” Comptime-generated declarations re-enter normal semantic compilation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-702 | ctm | v1-full | ACOMP2-39 â€” Generated declarations are subject to normal name resolution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-703 | ctm | v1-full | ACOMP2-40 â€” Generated declarations are subject to normal type checking. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-704 | ctm | v1-full | ACOMP2-41 â€” Generated declarations are subject to ownership verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-705 | ctm | v1-full | ACOMP2-42 â€” Generated declarations are subject to capability verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-706 | ctm | v1-full | ACOMP2-43 â€” Generated declarations are subject to ABI and representation verification when applicable. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-707 | ctm | v1-full | ACOMP2-44 â€” Core comptime does not permit arbitrary IR mutation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-708 | ctm | v1-full | ACOMP2-45 â€” Core comptime does not provide an unrestricted procedural macro language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-709 | ctm | v1-full | ACOMP2-46 â€” Typed generation is preferred over textual source generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-710 | ctm | v1-full | ACOMP2-47 â€” `@derive` generation is compiler-known typed generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-711 | ctm | v1-full | ACOMP2-48 â€” Compile-time reflection respects visibility rules. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-712 | ctm | v1-full | ACOMP2-49 â€” Compile-time reflection respects representation contracts. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-713 | ctm | v1-full | ACOMP2-50 â€” `Type` is a compile-time semantic value by default. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-714 | ctm | v1-full | ACOMP2-51 â€” Runtime type metadata is not emitted unless explicitly required. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-715 | ctm | v1-full | ACOMP2-52 â€” `size_of`, `align_of`, and applicable layout queries are compile-time operations. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-716 | ctm | v1-full | ACOMP2-53 â€” Default layout contracts do not imply stable physical offsets across builds. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-717 | ctm | v1-full | ACOMP2-54 â€” Compile-time assertions produce compile-time diagnostics on failure. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-718 | ctm | v1-full | ACOMP2-55 â€” Comptime evaluation is bounded against uncontrolled resource consumption. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-719 | ctm | v1-full | ACOMP2-56 â€” Evaluation-budget exhaustion is a normal compiler diagnostic, not an ICE. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-720 | ctm | v1-full | ACOMP2-57 â€” Comptime allocation is compiler-execution allocation unless explicitly materialized. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-721 | ctm | v1-full | ACOMP2-58 â€” Compiler allocation does not imply runtime heap allocation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-722 | ctm | v1-full | ACOMP2-59 â€” Materialized comptime values use ordinary target representation rules. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-723 | ctm | v1-full | ACOMP2-60 â€” Comptime-generated data may be emitted directly into static program data. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-724 | ctm | v1-full | ACOMP2-61 â€” Unused generated declarations may be eliminated. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-725 | ctm | v1-full | ACOMP2-62 â€” Comptime-generated runtime code may be optimized normally. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-726 | ctm | v1-full | ACOMP2-63 â€” Partial evaluation is permitted as a compiler optimization. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-727 | ctm | v1-full | ACOMP2-64 â€” Partial evaluation does not require source-level `comptime`. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-728 | ctm | v1-full | ACOMP2-65 â€” `comptime` provides a programmer-visible compile-time guarantee. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-729 | ctm | v1-full | ACOMP2-66 â€” Ordinary optimizer folding provides no stronger compile-time guarantee unless specified. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-730 | ctm | v1-full | ACOMP2-67 â€” Constant folding must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-731 | ctm | v1-full | ACOMP2-68 â€” Constant propagation must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-732 | ctm | v1-full | ACOMP2-69 â€” Compile-time branch elimination must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-733 | ctm | v1-full | ACOMP2-70 â€” Generic specialization is compile-time semantic specialization. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-734 | ctm | v1-full | ACOMP2-71 â€” Concrete generic instances are subject to applicable semantic verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-735 | ctm | v1-full | ACOMP2-72 â€” Generic specialization does not imply runtime generic metadata. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-736 | ctm | v1-full | ACOMP2-73 â€” Generic specialization may be deduplicated when semantic and target contracts permit. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-737 | ctm | v1-full | ACOMP2-74 â€” Specialization is controlled to prevent unbounded code explosion. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-738 | ctm | v1-full | ACOMP2-75 â€” Compiler specialization may use a cost model. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-739 | ctm | v1-full | ACOMP2-76 â€” Specialization policy cannot change program semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-740 | ctm | v1-full | ACOMP2-77 â€” Partial evaluation may specialize constant arguments. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-741 | ctm | v1-full | ACOMP2-78 â€” Partial evaluation may specialize closure environments. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-742 | ctm | v1-full | ACOMP2-79 â€” Partial evaluation may reduce async state-machine size. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-743 | ctm | v1-full | ACOMP2-80 â€” Partial evaluation may specialize GPU kernels. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-744 | ctm | v1-full | ACOMP2-81 â€” Foreign calls remain conservative unless an applicable contract exists. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-745 | ctm | v1-full | ACOMP2-82 â€” Unsafe assumptions cannot automatically become safe semantic facts. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-746 | ctm | v1-full | ACOMP2-83 â€” Generated unsafe code remains subject to the applicable unsafe boundaries. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-747 | ctm | v1-full | ACOMP2-84 â€” Generated code retains source provenance where practical. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-748 | ctm | v1-full | ACOMP2-85 â€” Comptime source mappings support diagnostics and debugging. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-749 | ctm | v1-full | ACOMP2-86 â€” Independent comptime evaluations may execute in parallel. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-750 | ctm | v1-full | ACOMP2-87 â€” Parallel comptime execution must be semantically equivalent to valid serial execution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-751 | ctm | v1-full | ACOMP2-88 â€” External comptime side effects require ordering where semantics require it. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-752 | ctm | v1-full | ACOMP2-89 â€” Comptime caching requires dependency-aware invalidation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-753 | ctm | v1-full | ACOMP2-90 â€” Comptime cache identity includes semantic compiler version. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-754 | ctm | v1-full | ACOMP2-91 â€” Comptime cache identity includes target and relevant configuration. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-755 | ctm | v1-full | ACOMP2-92 â€” Cross-compilation separates host execution context from target semantic context. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-756 | ctm | v1-full | ACOMP2-93 â€” Target-dependent compile-time queries use target semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-757 | ctm | v1-full | ACOMP2-94 â€” `@cfg` performs configuration selection, while comptime performs computation/generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-758 | ctm | v1-full | ACOMP2-95 â€” Comptime does not imply a runtime dependency on the comptime evaluator. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-759 | ctm | v1-full | ACOMP2-96 â€” Compiler optimizations may erase compile-time abstractions completely. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-760 | ctm | v1-full | ACOMP2-97 â€” Runtime reflection is explicit rather than implicit. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-761 | ctm | v1-full | ACOMP2-98 â€” AI tooling may consume comptime/semantic metadata but cannot define language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-762 | ctm | v1-full | ACOMP2-99 â€” Comptime, specialization, and optimization share semantic foundations but remain distinct mechanisms. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
-| REQ-CORE-763 | ctm | v1-full | ACOMP2-100 â€” Axiom compile-time execution provides strong compile-time guarantees without creating a second programming language or mandatory runtime. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | EPIC(E14.1) |
+| REQ-CORE-683 | ctm | v1-full | ACOMP2-20 â€” `const`, `comptime`, and runtime are distinct evaluation modes of the same Axiom language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-684 | ctm | v1-full | ACOMP2-21 â€” Comptime is not a second source language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-685 | ctm | v1-full | ACOMP2-22 â€” Comptime uses the ordinary Axiom type system. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-686 | ctm | v1-full | ACOMP2-23 â€” Comptime follows ordinary ownership semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-687 | ctm | v1-full | ACOMP2-24 â€” Comptime follows ordinary Drop semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-688 | ctm | v1-full | ACOMP2-25 â€” Comptime follows ordinary capability semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-689 | ctm | v1-full | ACOMP2-26 â€” Comptime follows ordinary type and trait semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-690 | ctm | v1-full | ACOMP2-27 â€” Unsafe does not bypass comptime sandbox restrictions. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-691 | ctm | v1-full | ACOMP2-28 â€” External comptime effects require explicit capabilities. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-692 | ctm | v1-full | ACOMP2-29 â€” Comptime capabilities participate in dependency tracking. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-693 | ctm | v1-full | ACOMP2-30 â€” Comptime external inputs contribute to cache identity. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-694 | ctm | v1-full | ACOMP2-31 â€” Reproducible builds constrain nondeterministic comptime inputs. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-695 | ctm | v1-full | ACOMP2-32 â€” Comptime values cannot implicitly become runtime external resources. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-696 | ctm | v1-full | ACOMP2-33 â€” Comptime resources are cleaned up in the compiler execution environment. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-697 | ctm | v1-full | ACOMP2-34 â€” `const` values are compile-time semantic values, not textual macros. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T550 |
+| REQ-CORE-698 | ctm | v1-full | ACOMP2-35 â€” `comptime fn` is callable only during compile-time evaluation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-699 | ctm | v1-full | ACOMP2-36 â€” `comptime` blocks execute before required runtime execution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-700 | ctm | v1-full | ACOMP2-37 â€” Compile-time failure produces compiler diagnostics rather than runtime panic. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-701 | ctm | v1-full | ACOMP2-38 â€” Comptime-generated declarations re-enter normal semantic compilation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-702 | ctm | v1-full | ACOMP2-39 â€” Generated declarations are subject to normal name resolution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-703 | ctm | v1-full | ACOMP2-40 â€” Generated declarations are subject to normal type checking. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-704 | ctm | v1-full | ACOMP2-41 â€” Generated declarations are subject to ownership verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-705 | ctm | v1-full | ACOMP2-42 â€” Generated declarations are subject to capability verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-706 | ctm | v1-full | ACOMP2-43 â€” Generated declarations are subject to ABI and representation verification when applicable. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-707 | ctm | v1-full | ACOMP2-44 â€” Core comptime does not permit arbitrary IR mutation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-708 | ctm | v1-full | ACOMP2-45 â€” Core comptime does not provide an unrestricted procedural macro language. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-709 | ctm | v1-full | ACOMP2-46 â€” Typed generation is preferred over textual source generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-710 | ctm | v1-full | ACOMP2-47 â€” `@derive` generation is compiler-known typed generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-711 | ctm | v1-full | ACOMP2-48 â€” Compile-time reflection respects visibility rules. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-712 | ctm | v1-full | ACOMP2-49 â€” Compile-time reflection respects representation contracts. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T551 |
+| REQ-CORE-713 | ctm | v1-full | ACOMP2-50 â€” `Type` is a compile-time semantic value by default. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-714 | ctm | v1-full | ACOMP2-51 â€” Runtime type metadata is not emitted unless explicitly required. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-715 | ctm | v1-full | ACOMP2-52 â€” `size_of`, `align_of`, and applicable layout queries are compile-time operations. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-716 | ctm | v1-full | ACOMP2-53 â€” Default layout contracts do not imply stable physical offsets across builds. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-717 | ctm | v1-full | ACOMP2-54 â€” Compile-time assertions produce compile-time diagnostics on failure. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-718 | ctm | v1-full | ACOMP2-55 â€” Comptime evaluation is bounded against uncontrolled resource consumption. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-719 | ctm | v1-full | ACOMP2-56 â€” Evaluation-budget exhaustion is a normal compiler diagnostic, not an ICE. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-720 | ctm | v1-full | ACOMP2-57 â€” Comptime allocation is compiler-execution allocation unless explicitly materialized. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-721 | ctm | v1-full | ACOMP2-58 â€” Compiler allocation does not imply runtime heap allocation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-722 | ctm | v1-full | ACOMP2-59 â€” Materialized comptime values use ordinary target representation rules. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-723 | ctm | v1-full | ACOMP2-60 â€” Comptime-generated data may be emitted directly into static program data. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-724 | ctm | v1-full | ACOMP2-61 â€” Unused generated declarations may be eliminated. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-725 | ctm | v1-full | ACOMP2-62 â€” Comptime-generated runtime code may be optimized normally. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-726 | ctm | v1-full | ACOMP2-63 â€” Partial evaluation is permitted as a compiler optimization. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-727 | ctm | v1-full | ACOMP2-64 â€” Partial evaluation does not require source-level `comptime`. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-728 | ctm | v1-full | ACOMP2-65 â€” `comptime` provides a programmer-visible compile-time guarantee. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-729 | ctm | v1-full | ACOMP2-66 â€” Ordinary optimizer folding provides no stronger compile-time guarantee unless specified. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T552 |
+| REQ-CORE-730 | ctm | v1-full | ACOMP2-67 â€” Constant folding must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-731 | ctm | v1-full | ACOMP2-68 â€” Constant propagation must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-732 | ctm | v1-full | ACOMP2-69 â€” Compile-time branch elimination must preserve language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-733 | ctm | v1-full | ACOMP2-70 â€” Generic specialization is compile-time semantic specialization. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-734 | ctm | v1-full | ACOMP2-71 â€” Concrete generic instances are subject to applicable semantic verification. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-735 | ctm | v1-full | ACOMP2-72 â€” Generic specialization does not imply runtime generic metadata. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-736 | ctm | v1-full | ACOMP2-73 â€” Generic specialization may be deduplicated when semantic and target contracts permit. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-737 | ctm | v1-full | ACOMP2-74 â€” Specialization is controlled to prevent unbounded code explosion. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-738 | ctm | v1-full | ACOMP2-75 â€” Compiler specialization may use a cost model. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-739 | ctm | v1-full | ACOMP2-76 â€” Specialization policy cannot change program semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-740 | ctm | v1-full | ACOMP2-77 â€” Partial evaluation may specialize constant arguments. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-741 | ctm | v1-full | ACOMP2-78 â€” Partial evaluation may specialize closure environments. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-742 | ctm | v1-full | ACOMP2-79 â€” Partial evaluation may reduce async state-machine size. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-743 | ctm | v1-full | ACOMP2-80 â€” Partial evaluation may specialize GPU kernels. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-744 | ctm | v1-full | ACOMP2-81 â€” Foreign calls remain conservative unless an applicable contract exists. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-745 | ctm | v1-full | ACOMP2-82 â€” Unsafe assumptions cannot automatically become safe semantic facts. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-746 | ctm | v1-full | ACOMP2-83 â€” Generated unsafe code remains subject to the applicable unsafe boundaries. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-747 | ctm | v1-full | ACOMP2-84 â€” Generated code retains source provenance where practical. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-748 | ctm | v1-full | ACOMP2-85 â€” Comptime source mappings support diagnostics and debugging. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-749 | ctm | v1-full | ACOMP2-86 â€” Independent comptime evaluations may execute in parallel. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-750 | ctm | v1-full | ACOMP2-87 â€” Parallel comptime execution must be semantically equivalent to valid serial execution. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-751 | ctm | v1-full | ACOMP2-88 â€” External comptime side effects require ordering where semantics require it. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-752 | ctm | v1-full | ACOMP2-89 â€” Comptime caching requires dependency-aware invalidation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-753 | ctm | v1-full | ACOMP2-90 â€” Comptime cache identity includes semantic compiler version. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-754 | ctm | v1-full | ACOMP2-91 â€” Comptime cache identity includes target and relevant configuration. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T553 |
+| REQ-CORE-755 | ctm | v1-full | ACOMP2-92 â€” Cross-compilation separates host execution context from target semantic context. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-756 | ctm | v1-full | ACOMP2-93 â€” Target-dependent compile-time queries use target semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-757 | ctm | v1-full | ACOMP2-94 â€” `@cfg` performs configuration selection, while comptime performs computation/generation. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-758 | ctm | v1-full | ACOMP2-95 â€” Comptime does not imply a runtime dependency on the comptime evaluator. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-759 | ctm | v1-full | ACOMP2-96 â€” Compiler optimizations may erase compile-time abstractions completely. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-760 | ctm | v1-full | ACOMP2-97 â€” Runtime reflection is explicit rather than implicit. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-761 | ctm | v1-full | ACOMP2-98 â€” AI tooling may consume comptime/semantic metadata but cannot define language semantics. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-762 | ctm | v1-full | ACOMP2-99 â€” Comptime, specialization, and optimization share semantic foundations but remain distinct mechanisms. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
+| REQ-CORE-763 | ctm | v1-full | ACOMP2-100 â€” Axiom compile-time execution provides strong compile-time guarantees without creating a second programming language or mandatory runtime. | tasks/0346 §100. Frozen Invariants — `ACOMP2-20..100` | - | T555 |
 | REQ-COL-001 | col | v1-core | ADATA-20 â€” Collection semantics are distinct from physical storage representation. | tasks/0348 §100. Frozen Invariants — `ADATA-20..100` | - | T113 | 
 | REQ-COL-002 | col | v1-core | ADATA-21 â€” Array is a fixed-size contiguous semantic value. | tasks/0348 §100. Frozen Invariants — `ADATA-20..100` | - | T113 | 
 | REQ-COL-003 | col | v1-core | ADATA-22 â€” Array allocation location is compiler-selected. | tasks/0348 §100. Frozen Invariants — `ADATA-20..100` | - | T113 | 
@@ -6261,7 +6261,7 @@
 | REQ-BLD-096 | build | v1-core | Package public interfaces define semantic interface fingerprints distinct from implementation fingerprints, ensuring implementation-only changes do not invalidate dependent consumers. | 0432 §58 AAPI-22, AINTERFACE-20, AINTERFACE-22 | - | T113 | 
 | REQ-ABI-091 | abi | v1-full | Package boundaries do not default to binary ABI boundaries, and the default Axiom ABI does not guarantee cross-version binary stability unless explicitly marked stable. | 0432 §58 AABI-80, AABI-81, AABI-82 | - | T504 |
 | REQ-ABI-092 | abi | v1-full | Exporting generic functions through C ABI requires concrete monomorphic specialization or ABI-erased interface handles. | 0432 §49, §50, 0432 §58 AABI-85 | - | T503 |
-| REQ-CTM-043 | comptime | v1-full | Compile-time reflection is the default reflection mechanism, where `Type` metadata is evaluated at comptime and erased from runtime binaries unless runtime RTTI is explicitly enabled. | 0433 §58, 0433 §71 AREFLECT-20, AREFLECT-21, AZREFLECT-20, AZREFLECT-21 | - | EPIC(E14.1) |
+| REQ-CTM-043 | comptime | v1-full | Compile-time reflection is the default reflection mechanism, where `Type` metadata is evaluated at comptime and erased from runtime binaries unless runtime RTTI is explicitly enabled. | 0433 §58, 0433 §71 AREFLECT-20, AREFLECT-21, AZREFLECT-20, AZREFLECT-21 | - | T557 |
 | REQ-VER-012 | verifier | v1-core | Declarations generated via compile-time reflection must undergo standard type checking, ownership verification, and capability verification without bypass privileges. | 0433 §42, 0433 §71 AREFLECT-25 | - | T113 | 
 | REQ-TYP-333 | types | v1-core | Reflection enumeration follows deterministic semantic declaration order, and physical field reordering by optimizer does not alter semantic reflection order. | 0433 §44, §45, 0433 §71 AREFLECT-26, AREFLECT-27 | - | T113 |
 | REQ-RT-138 | runtime | v1-full | Runtime type information (RTTI) is opt-in, does not impose a mandatory global type registry, and assigns TypeIds independent of physical memory addresses. | 0433 §71 ARTTI-20, ARTTI-21, ARTTI-22 | - | EPIC(E21.1) |
@@ -6338,11 +6338,11 @@
 | REQ-DRP-058 | drop | v1-core | Safe resource wrappers shall invoke deterministic release upon Drop, prohibit double-release, and require explicit method calls for recoverable close operations. | tasks/0443 §184.145 (ARES-25, ARES-26, ARES-27) | - | T113 | 
 | REQ-RT-162 | runtime | v1-full | ProcessId value identity and ChildProcess ownership handle shall be distinct; dropping a child handle shall not implicitly terminate the process, and child termination or kill operations must be explicit. | tasks/0443 §184.145 (APROC-20, APROC-21, APROC-22, APROC-23) | - | EPIC(E21.1) |
 | REQ-RT-163 | runtime | v1-full | Child process wait operations shall establish a synchronization edge with process completion, and ExitStatus shall retain platform-specific exit codes, signals, and core dump metadata. | tasks/0443 §184.145 (APROC-24, APROC-26) | - | EPIC(E21.1) |
-| REQ-CTM-044 | comptime | v1-full | Process environment variables shall be modeled as external state where reads are impure; compile-time environment access shall require explicit capabilities and participate in build identity. | tasks/0443 §184.145 (APROC-30, APROC-31, APROC-33, APROC-34) | - | EPIC(E14.1) |
+| REQ-CTM-044 | comptime | v1-full | Process environment variables shall be modeled as external state where reads are impure; compile-time environment access shall require explicit capabilities and participate in build identity. | tasks/0443 §184.145 (APROC-30, APROC-31, APROC-33, APROC-34) | - | T551 |
 | REQ-OPT-349 | optimizer | v1-full | OS resource effects shall participate in compiler EffectInfo, and the optimizer shall not eliminate or reorder observable external side-effects. | tasks/0443 §184.145 (AOS-30, AOS-31) | - | EPIC(E15.1) |
 | REQ-TOOL-182 | tooling | v1-full | Compile-time metadata (.axmeta), runtime reflection metadata, and debug metadata shall be distinct artifacts; .axmeta shall not be required to be embedded into production executables. | tasks/0444 §185.152 (AMETA-20, AMETA-21, AMETA-22) | - | EPIC(E19.1) |
 | REQ-MOD-140 | module | v1-core | Semantic metadata identities shall use canonical semantic IDs (TypeId, FunctionId, TraitId) rather than declaration names, deterministically generated under reproducible builds without altering program semantics. | tasks/0444 §185.152 (AMETA-23, AMETA-24, AMETA-25) | - | T113 | 
-| REQ-CTM-045 | comptime | v1-full | Compile-time reflection shall be available independently of runtime reflection; runtime reflection shall be optional and impose zero mandatory binary overhead on programs that do not request it. | tasks/0444 §185.152 (AREFLECT-20, AREFLECT-21, AREFLECT-22) | - | EPIC(E14.1) |
+| REQ-CTM-045 | comptime | v1-full | Compile-time reflection shall be available independently of runtime reflection; runtime reflection shall be optional and impose zero mandatory binary overhead on programs that do not request it. | tasks/0444 §185.152 (AREFLECT-20, AREFLECT-21, AREFLECT-22) | - | T557 |
 | REQ-VER-013 | verifier | v1-core | Reflection queries shall not bypass ownership, capability, Drop, or visibility rules, and exposing physical runtime layouts shall require an explicit representation contract. | tasks/0444 §185.152 (AREFLECT-23, AREFLECT-26) | - | T113 | 
 | REQ-MOD-141 | module | v1-core | Public API identity shall be computed as a semantic fingerprint over exported items, generic constraints, associated items, and ABI contracts; implementation-only changes shall not invalidate public API fingerprints. | tasks/0444 §185.152 (AAPI-20, AAPI-21, AAPI-22, AAPI-23, AAPI-24) | - | T113 | 
 | REQ-ABI-095 | abi | v1-full | Dynamic library loading shall be treated as an open-world boundary where raw imported symbols cannot be called in safe code without an explicit versioned contract. | tasks/0444 §185.152 (AABIAPI-22, AABIAPI-23, AABIAPI-26) | - | T530 |
@@ -6400,7 +6400,7 @@
 | REQ-ABI-101 | abi | v1-full | Stable binary symbols shall carry versioned ABI fingerprints, enabling multiple ABI versions to coexist via ABI adapters without penalizing internal optimization. | tasks/0452 §193.47 (AABI-34, AABI-37, AABI-42, AABI-43) | - | T504 |
 | REQ-RT-165 | runtime | v1-full | Application hot reloading shall require explicit stable ABI and state-migration contracts, and state migration shall not rely on unverified layout reinterpretation via memcpy. | tasks/0452 §193.47 (AABI-40, AABI-41) | - | EPIC(E21.1) |
 | REQ-DRV-017 | driver | v1-full | The Axiom compiler shall use a unified multi-target architecture where target selection is an explicit input to CompilerDB, avoiding separate target-specific compiler executables. | tasks/0453 §194.44 (ATARGET-20, ATARGET-21, ATARGET-46) | - | EPIC(E18.1) |
-| REQ-CTM-046 | comptime | v1-full | Host and target environments shall remain distinct; build tools run in host domain and comptime host capabilities shall not represent target runtime state. | tasks/0453 §194.44 (ATARGET-22, ATARGET-23, ATARGET-35, ATARGET-36) | - | EPIC(E14.1) |
+| REQ-CTM-046 | comptime | v1-full | Host and target environments shall remain distinct; build tools run in host domain and comptime host capabilities shall not represent target runtime state. | tasks/0453 §194.44 (ATARGET-22, ATARGET-23, ATARGET-35, ATARGET-36) | - | T551 |
 | REQ-MIR-129 | mir | v1-core | Verified MIR shall remain target-independent, while target identity parameters (architecture, OS, ABI, pointer model, atomics, SIMD) are lowered during backend code generation. | tasks/0453 §194.44 (ATARGET-24, ATARGET-27, ATARGET-28, ATARGET-30, ATARGET-31, ATARGET-32) | - | T113 | 
 | REQ-BLD-101 | build | v1-core | Target-specific source declarations shall be selected prior to semantic verification, and cross-target build caches shall prevent machine artifact collisions using target-specific cache keys. | tasks/0453 §194.44 (ATARGET-34, ATARGET-39, ATARGET-40) | - | T113 | 
 | REQ-TGT-001 | target-other | v1-full | WASM shall be modeled as a first-class native target backend, GPU targets shall be explicit execution domains, and universal binaries shall be created by composing multi-target native artifacts. | tasks/0453 §194.44 (ATARGET-41, ATARGET-42, ATARGET-43) | - | EPIC(E16.1) |
@@ -6456,7 +6456,7 @@
 | REQ-ASY-159 | async | v1-full | Timeouts and deadlines shall be explicit policy types distinct from cancellation; periodic timers shall explicitly declare fixed-rate or fixed-delay semantics, drift policies, and missed tick behavior. | tasks/0464 §205.6-8, ATIME-26-27, ATIME-29-31 | - | T426 |
 | REQ-CAP-138 | capability | v1-full | Timer cancellation shall preserve callback resource safety; timer callbacks shall not outlive captured capabilities or resources. | tasks/0464 §205.9, ATIME-32-33 | - | T519 |
 | REQ-RT-176 | runtime | v1-full | Real-time execution profiles may prohibit unbounded allocation, blocking operations, or thread synchronization, while ensuring async code does not acquire hidden blocking semantics. | tasks/0464 §205.14-16, ATIME-39-42 | - | EPIC(E21.1) |
-| REQ-CTM-047 | comptime | v1-full | Access to time during comptime shall require explicit capability and participate in build cache identity; reproducible builds shall control or prohibit nondeterministic time inputs. | tasks/0464 §205.19, ATIME-47-49 | - | EPIC(E14.1) |
+| REQ-CTM-047 | comptime | v1-full | Access to time during comptime shall require explicit capability and participate in build cache identity; reproducible builds shall control or prohibit nondeterministic time inputs. | tasks/0464 §205.19, ATIME-47-49 | - | T551 |
 | REQ-STD-168 | std-lib | post-v1 | Network endpoint identity shall remain distinct from socket resource identity; socket `Drop` shall not imply graceful protocol shutdown. | tasks/0465 §206.3, §206.5, ANET2-21-23 | - | EPIC(E24.0) |
 | REQ-STD-169 | std-lib | post-v1 | TCP streams shall be modeled as continuous byte streams requiring explicit application framing; partial TCP writes shall not be treated as complete writes. | tasks/0465 §206.7-8, ANET2-24-27 | - | EPIC(E24.0) |
 | REQ-CAP-139 | capability | v1-full | Zero-copy views into network buffers shall not outlive backing storage; scatter/gather operations shall enforce capability non-overlap across segments. | tasks/0465 §206.17-18, ANET2-35-36 | - | T519 |
@@ -7980,90 +7980,90 @@
 | REQ-CORE-2127 | typ | v1-core | [AEFFECT-99] Effect analysis must preserve the Semantic Oracle behavior. | 0508 §201 | - | T113 |
 | REQ-CORE-2128 | typ | v1-core | [AEFFECT-100] Optimized execution must be observationally equivalent to the effect semantics established by Verified MIR. | 0508 §201 | - | T113 |
 | REQ-CORE-2129 | typ | v1-core | Axiom có thể dùng comptime mạnh đến đâu để thay thế macro/procedural-macro/type-level machinery mà vẫn giữ ngôn ngữ đơn giản và compiler implementation khả thi? | 0508 Task tiếp theo: **BOOTSTRAP-250 — AXIOM CONSTANT EVALUATION, COMPTIME EXECUTION & BUILD-TIME SEMANTICS** | - | T113 |
-| REQ-CORE-2130 | ctm | v1-full | Comptime mạnh, nhưng không trở thành một ngôn ngữ thứ hai. | 0509 BOOTSTRAP-250 — AXIOM CONSTANT EVALUATION, COMPTIME EXECUTION & BUILD-TIME SEMANTICS | - | EPIC(E14.1) |
-| REQ-CORE-2131 | ctm | v1-full | Comptime là Axiom chạy trong compiler environment với một tập capability được kiểm soát. | 0509 BOOTSTRAP-250 — AXIOM CONSTANT EVALUATION, COMPTIME EXECUTION & BUILD-TIME SEMANTICS | - | EPIC(E14.1) |
-| REQ-CORE-2132 | ctm | v1-full | [COMPTIME-20] Comptime uses Axiom semantic rules. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2133 | ctm | v1-full | [COMPTIME-21] Comptime is not a separate programming language. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2134 | ctm | v1-full | [COMPTIME-22] Const evaluation and comptime execution are distinct concepts. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2135 | ctm | v1-full | [COMPTIME-23] Comptime execution occurs in the compiler environment. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2136 | ctm | v1-full | [COMPTIME-24] Comptime execution does not imply runtime dependency. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2137 | ctm | v1-full | [COMPTIME-25] Comptime VM is not linked into runtime binaries by default. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2138 | ctm | v1-full | [COMPTIME-26] Comptime obeys type checking. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2139 | ctm | v1-full | [COMPTIME-27] Comptime obeys ownership semantics. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2140 | ctm | v1-full | [COMPTIME-28] Comptime obeys capability semantics. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2141 | ctm | v1-full | [COMPTIME-29] Comptime obeys effect semantics. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2142 | ctm | v1-full | [COMPTIME-30] Comptime cannot bypass safety verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2143 | ctm | v1-full | [COMPTIME-31] Comptime-generated code re-enters normal semantic verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2144 | ctm | v1-full | [COMPTIME-32] Generated code cannot directly mutate MIR or machine code. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2145 | ctm | v1-full | [COMPTIME-33] Textual macro substitution is not required by Core v1. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2146 | ctm | v1-full | [COMPTIME-34] Typed generation is the preferred metaprogramming mechanism. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2147 | ctm | v1-full | [COMPTIME-35] Compile-time reflection respects visibility. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2148 | ctm | v1-full | [COMPTIME-36] Compile-time reflection does not imply runtime reflection. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2149 | ctm | v1-full | [COMPTIME-37] Type metadata is compile-time data unless explicitly materialized. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2150 | ctm | v1-full | [COMPTIME-38] Comptime external capabilities are explicit. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2151 | ctm | v1-full | [COMPTIME-39] Comptime has sandboxed authority by default. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2152 | ctm | v1-full | [COMPTIME-40] Unsafe does not bypass comptime authority restrictions. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2153 | ctm | v1-full | [COMPTIME-41] External comptime inputs participate in dependency tracking. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2154 | ctm | v1-full | [COMPTIME-42] External comptime inputs participate in build identity. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2155 | ctm | v1-full | [COMPTIME-43] Comptime cache results must be semantically equivalent to cache misses. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2156 | ctm | v1-full | [COMPTIME-44] Cache identity includes all semantic dependencies. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2157 | ctm | v1-full | [COMPTIME-45] Comptime evaluation is deterministic for deterministic inputs. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2158 | ctm | v1-full | [COMPTIME-46] Compiler may parallelize independent comptime evaluations. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2159 | ctm | v1-full | [COMPTIME-47] Parallel comptime execution must preserve semantic determinism. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2160 | ctm | v1-full | [COMPTIME-48] Comptime evaluation cycles are detected. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2161 | ctm | v1-full | [COMPTIME-49] Comptime resource exhaustion produces structured diagnostics. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2162 | ctm | v1-full | [COMPTIME-50] Comptime panic is distinct from compiler ICE. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2163 | ctm | v1-full | [COMPTIME-51] Comptime memory is compiler execution memory. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2164 | ctm | v1-full | [COMPTIME-52] Comptime allocation does not imply runtime allocation. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2165 | ctm | v1-full | [COMPTIME-53] Comptime Drop is deterministic. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2166 | ctm | v1-full | [COMPTIME-54] Comptime capabilities cannot leak into runtime authority. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2167 | ctm | v1-full | [COMPTIME-55] Comptime-owned resources cannot escape into runtime implicitly. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2168 | ctm | v1-full | [COMPTIME-56] Comptime views cannot outlive their owners. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2169 | ctm | v1-full | [COMPTIME-57] Generated runtime values must have valid runtime representations. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2170 | ctm | v1-full | [COMPTIME-58] Generated declarations have compiler-tracked semantic identity. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2171 | ctm | v1-full | [COMPTIME-59] Generated declarations retain provenance to their generator. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2172 | ctm | v1-full | [COMPTIME-60] Diagnostics can trace generated code back to generation source. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2173 | ctm | v1-full | [COMPTIME-61] Generation name collisions are deterministic errors. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2174 | ctm | v1-full | [COMPTIME-62] Generation cycles are deterministic errors. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2175 | ctm | v1-full | [COMPTIME-63] Generated declarations participate in normal name resolution. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2176 | ctm | v1-full | [COMPTIME-64] Generated declarations participate in normal trait resolution. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2177 | ctm | v1-full | [COMPTIME-65] Generated declarations participate in normal ownership verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2178 | ctm | v1-full | [COMPTIME-66] Generated declarations participate in normal effect verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2179 | ctm | v1-full | [COMPTIME-67] Generated declarations participate in normal ABI verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2180 | ctm | v1-full | [COMPTIME-68] Comptime and runtime effect summaries are distinct. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2181 | ctm | v1-full | [COMPTIME-69] Comptime filesystem/network/process effects are not runtime effects. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2182 | ctm | v1-full | [COMPTIME-70] Host and target semantics are explicitly distinguished during comptime. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2183 | ctm | v1-full | [COMPTIME-71] Target-dependent compile-time layout uses target facts. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2184 | ctm | v1-full | [COMPTIME-72] Cross-compilation cannot silently substitute host layout for target layout. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2185 | ctm | v1-full | [COMPTIME-73] Comptime-generated GPU code is reverified under GPU legality rules. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2186 | ctm | v1-full | [COMPTIME-74] Comptime-generated FFI declarations are reverified under FFI rules. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2187 | ctm | v1-full | [COMPTIME-75] Comptime-generated serialization code is reverified under representation rules. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2188 | ctm | v1-full | [COMPTIME-76] Const generic values are compile-time validated. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2189 | ctm | v1-full | [COMPTIME-77] Const generic evaluation is deterministic. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2190 | ctm | v1-full | [COMPTIME-78] Constant folding is an optimization and is distinct from comptime guarantees. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2191 | ctm | v1-full | [COMPTIME-79] A comptime guarantee cannot be weakened into an optimizer-only behavior. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2192 | ctm | v1-full | [COMPTIME-80] An ordinary function may be constant-folded without becoming a comptime function. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2193 | ctm | v1-full | [COMPTIME-81] Comptime-generated static data may be emitted directly into runtime sections. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2194 | ctm | v1-full | [COMPTIME-82] Generated runtime data contains no implicit compiler authority. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2195 | ctm | v1-full | [COMPTIME-83] Comptime metadata is versioned. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2196 | ctm | v1-full | [COMPTIME-84] Comptime dependency changes invalidate affected generated results. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2197 | ctm | v1-full | [COMPTIME-85] Comptime dependency tracking is incremental where possible. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2198 | ctm | v1-full | [COMPTIME-86] Comptime results may be stored in compiler cache. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2199 | ctm | v1-full | [COMPTIME-87] Comptime cache invalidation is semantic, not timestamp-only. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2200 | ctm | v1-full | [COMPTIME-88] Comptime capability policy participates in build identity. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2201 | ctm | v1-full | [COMPTIME-89] Hermetic/reproducible builds may restrict comptime external capabilities. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2202 | ctm | v1-full | [COMPTIME-90] Network/time/random/environment dependencies are never hidden. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2203 | ctm | v1-full | [COMPTIME-91] Build-system policy may deny requested comptime capabilities. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2204 | ctm | v1-full | [COMPTIME-92] Third-party comptime code receives no implicit OS authority. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2205 | ctm | v1-full | [COMPTIME-93] AI-generated comptime code has the same semantic verification requirements as human-written code. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2206 | ctm | v1-full | [COMPTIME-94] Comptime tooling may expose evaluation traces. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2207 | ctm | v1-full | [COMPTIME-95] Comptime tooling cannot override semantic verification. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2208 | ctm | v1-full | [COMPTIME-96] Comptime semantics are independent of ComptimeVM implementation strategy. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2209 | ctm | v1-full | [COMPTIME-97] Compiler implementation may optimize comptime execution without changing results. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2210 | ctm | v1-full | [COMPTIME-98] Comptime failures are structured compiler diagnostics. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2211 | ctm | v1-full | [COMPTIME-99] Comptime semantics are part of the Semantic Oracle. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2212 | ctm | v1-full | [COMPTIME-100] A cache hit, interpreter execution, optimized VM execution, and future native comptime execution must produce observationally equivalent compile-time results. | 0509 §183 | - | EPIC(E14.1) |
-| REQ-CORE-2213 | ctm | v1-full | Một ngôn ngữ duy nhất, một type system, một ownership model, một effect model, một verifier — nhưng compiler có thể chạy code trước runtime. | 0509 Một quyết định kiến trúc rất quan trọng đã được chốt | - | EPIC(E14.1) |
+| REQ-CORE-2130 | ctm | v1-full | Comptime mạnh, nhưng không trở thành một ngôn ngữ thứ hai. | 0509 BOOTSTRAP-250 — AXIOM CONSTANT EVALUATION, COMPTIME EXECUTION & BUILD-TIME SEMANTICS | - | T550 |
+| REQ-CORE-2131 | ctm | v1-full | Comptime là Axiom chạy trong compiler environment với một tập capability được kiểm soát. | 0509 BOOTSTRAP-250 — AXIOM CONSTANT EVALUATION, COMPTIME EXECUTION & BUILD-TIME SEMANTICS | - | T550 |
+| REQ-CORE-2132 | ctm | v1-full | [COMPTIME-20] Comptime uses Axiom semantic rules. | 0509 §183 | - | T550 |
+| REQ-CORE-2133 | ctm | v1-full | [COMPTIME-21] Comptime is not a separate programming language. | 0509 §183 | - | T550 |
+| REQ-CORE-2134 | ctm | v1-full | [COMPTIME-22] Const evaluation and comptime execution are distinct concepts. | 0509 §183 | - | T550 |
+| REQ-CORE-2135 | ctm | v1-full | [COMPTIME-23] Comptime execution occurs in the compiler environment. | 0509 §183 | - | T550 |
+| REQ-CORE-2136 | ctm | v1-full | [COMPTIME-24] Comptime execution does not imply runtime dependency. | 0509 §183 | - | T550 |
+| REQ-CORE-2137 | ctm | v1-full | [COMPTIME-25] Comptime VM is not linked into runtime binaries by default. | 0509 §183 | - | T550 |
+| REQ-CORE-2138 | ctm | v1-full | [COMPTIME-26] Comptime obeys type checking. | 0509 §183 | - | T550 |
+| REQ-CORE-2139 | ctm | v1-full | [COMPTIME-27] Comptime obeys ownership semantics. | 0509 §183 | - | T550 |
+| REQ-CORE-2140 | ctm | v1-full | [COMPTIME-28] Comptime obeys capability semantics. | 0509 §183 | - | T550 |
+| REQ-CORE-2141 | ctm | v1-full | [COMPTIME-29] Comptime obeys effect semantics. | 0509 §183 | - | T550 |
+| REQ-CORE-2142 | ctm | v1-full | [COMPTIME-30] Comptime cannot bypass safety verification. | 0509 §183 | - | T550 |
+| REQ-CORE-2143 | ctm | v1-full | [COMPTIME-31] Comptime-generated code re-enters normal semantic verification. | 0509 §183 | - | T558 |
+| REQ-CORE-2144 | ctm | v1-full | [COMPTIME-32] Generated code cannot directly mutate MIR or machine code. | 0509 §183 | - | T558 |
+| REQ-CORE-2145 | ctm | v1-full | [COMPTIME-33] Textual macro substitution is not required by Core v1. | 0509 §183 | - | T558 |
+| REQ-CORE-2146 | ctm | v1-full | [COMPTIME-34] Typed generation is the preferred metaprogramming mechanism. | 0509 §183 | - | T558 |
+| REQ-CORE-2147 | ctm | v1-full | [COMPTIME-35] Compile-time reflection respects visibility. | 0509 §183 | - | T558 |
+| REQ-CORE-2148 | ctm | v1-full | [COMPTIME-36] Compile-time reflection does not imply runtime reflection. | 0509 §183 | - | T558 |
+| REQ-CORE-2149 | ctm | v1-full | [COMPTIME-37] Type metadata is compile-time data unless explicitly materialized. | 0509 §183 | - | T558 |
+| REQ-CORE-2150 | ctm | v1-full | [COMPTIME-38] Comptime external capabilities are explicit. | 0509 §183 | - | T551 |
+| REQ-CORE-2151 | ctm | v1-full | [COMPTIME-39] Comptime has sandboxed authority by default. | 0509 §183 | - | T551 |
+| REQ-CORE-2152 | ctm | v1-full | [COMPTIME-40] Unsafe does not bypass comptime authority restrictions. | 0509 §183 | - | T551 |
+| REQ-CORE-2153 | ctm | v1-full | [COMPTIME-41] External comptime inputs participate in dependency tracking. | 0509 §183 | - | T551 |
+| REQ-CORE-2154 | ctm | v1-full | [COMPTIME-42] External comptime inputs participate in build identity. | 0509 §183 | - | T551 |
+| REQ-CORE-2155 | ctm | v1-full | [COMPTIME-43] Comptime cache results must be semantically equivalent to cache misses. | 0509 §183 | - | T551 |
+| REQ-CORE-2156 | ctm | v1-full | [COMPTIME-44] Cache identity includes all semantic dependencies. | 0509 §183 | - | T551 |
+| REQ-CORE-2157 | ctm | v1-full | [COMPTIME-45] Comptime evaluation is deterministic for deterministic inputs. | 0509 §183 | - | T551 |
+| REQ-CORE-2158 | ctm | v1-full | [COMPTIME-46] Compiler may parallelize independent comptime evaluations. | 0509 §183 | - | T551 |
+| REQ-CORE-2159 | ctm | v1-full | [COMPTIME-47] Parallel comptime execution must preserve semantic determinism. | 0509 §183 | - | T551 |
+| REQ-CORE-2160 | ctm | v1-full | [COMPTIME-48] Comptime evaluation cycles are detected. | 0509 §183 | - | T551 |
+| REQ-CORE-2161 | ctm | v1-full | [COMPTIME-49] Comptime resource exhaustion produces structured diagnostics. | 0509 §183 | - | T551 |
+| REQ-CORE-2162 | ctm | v1-full | [COMPTIME-50] Comptime panic is distinct from compiler ICE. | 0509 §183 | - | T551 |
+| REQ-CORE-2163 | ctm | v1-full | [COMPTIME-51] Comptime memory is compiler execution memory. | 0509 §183 | - | T551 |
+| REQ-CORE-2164 | ctm | v1-full | [COMPTIME-52] Comptime allocation does not imply runtime allocation. | 0509 §183 | - | T551 |
+| REQ-CORE-2165 | ctm | v1-full | [COMPTIME-53] Comptime Drop is deterministic. | 0509 §183 | - | T551 |
+| REQ-CORE-2166 | ctm | v1-full | [COMPTIME-54] Comptime capabilities cannot leak into runtime authority. | 0509 §183 | - | T551 |
+| REQ-CORE-2167 | ctm | v1-full | [COMPTIME-55] Comptime-owned resources cannot escape into runtime implicitly. | 0509 §183 | - | T551 |
+| REQ-CORE-2168 | ctm | v1-full | [COMPTIME-56] Comptime views cannot outlive their owners. | 0509 §183 | - | T551 |
+| REQ-CORE-2169 | ctm | v1-full | [COMPTIME-57] Generated runtime values must have valid runtime representations. | 0509 §183 | - | T551 |
+| REQ-CORE-2170 | ctm | v1-full | [COMPTIME-58] Generated declarations have compiler-tracked semantic identity. | 0509 §183 | - | T558 |
+| REQ-CORE-2171 | ctm | v1-full | [COMPTIME-59] Generated declarations retain provenance to their generator. | 0509 §183 | - | T558 |
+| REQ-CORE-2172 | ctm | v1-full | [COMPTIME-60] Diagnostics can trace generated code back to generation source. | 0509 §183 | - | T558 |
+| REQ-CORE-2173 | ctm | v1-full | [COMPTIME-61] Generation name collisions are deterministic errors. | 0509 §183 | - | T558 |
+| REQ-CORE-2174 | ctm | v1-full | [COMPTIME-62] Generation cycles are deterministic errors. | 0509 §183 | - | T558 |
+| REQ-CORE-2175 | ctm | v1-full | [COMPTIME-63] Generated declarations participate in normal name resolution. | 0509 §183 | - | T558 |
+| REQ-CORE-2176 | ctm | v1-full | [COMPTIME-64] Generated declarations participate in normal trait resolution. | 0509 §183 | - | T558 |
+| REQ-CORE-2177 | ctm | v1-full | [COMPTIME-65] Generated declarations participate in normal ownership verification. | 0509 §183 | - | T558 |
+| REQ-CORE-2178 | ctm | v1-full | [COMPTIME-66] Generated declarations participate in normal effect verification. | 0509 §183 | - | T558 |
+| REQ-CORE-2179 | ctm | v1-full | [COMPTIME-67] Generated declarations participate in normal ABI verification. | 0509 §183 | - | T558 |
+| REQ-CORE-2180 | ctm | v1-full | [COMPTIME-68] Comptime and runtime effect summaries are distinct. | 0509 §183 | - | T552 |
+| REQ-CORE-2181 | ctm | v1-full | [COMPTIME-69] Comptime filesystem/network/process effects are not runtime effects. | 0509 §183 | - | T552 |
+| REQ-CORE-2182 | ctm | v1-full | [COMPTIME-70] Host and target semantics are explicitly distinguished during comptime. | 0509 §183 | - | T552 |
+| REQ-CORE-2183 | ctm | v1-full | [COMPTIME-71] Target-dependent compile-time layout uses target facts. | 0509 §183 | - | T552 |
+| REQ-CORE-2184 | ctm | v1-full | [COMPTIME-72] Cross-compilation cannot silently substitute host layout for target layout. | 0509 §183 | - | T552 |
+| REQ-CORE-2185 | ctm | v1-full | [COMPTIME-73] Comptime-generated GPU code is reverified under GPU legality rules. | 0509 §183 | - | T552 |
+| REQ-CORE-2186 | ctm | v1-full | [COMPTIME-74] Comptime-generated FFI declarations are reverified under FFI rules. | 0509 §183 | - | T552 |
+| REQ-CORE-2187 | ctm | v1-full | [COMPTIME-75] Comptime-generated serialization code is reverified under representation rules. | 0509 §183 | - | T552 |
+| REQ-CORE-2188 | ctm | v1-full | [COMPTIME-76] Const generic values are compile-time validated. | 0509 §183 | - | T552 |
+| REQ-CORE-2189 | ctm | v1-full | [COMPTIME-77] Const generic evaluation is deterministic. | 0509 §183 | - | T552 |
+| REQ-CORE-2190 | ctm | v1-full | [COMPTIME-78] Constant folding is an optimization and is distinct from comptime guarantees. | 0509 §183 | - | T552 |
+| REQ-CORE-2191 | ctm | v1-full | [COMPTIME-79] A comptime guarantee cannot be weakened into an optimizer-only behavior. | 0509 §183 | - | T552 |
+| REQ-CORE-2192 | ctm | v1-full | [COMPTIME-80] An ordinary function may be constant-folded without becoming a comptime function. | 0509 §183 | - | T552 |
+| REQ-CORE-2193 | ctm | v1-full | [COMPTIME-81] Comptime-generated static data may be emitted directly into runtime sections. | 0509 §183 | - | T552 |
+| REQ-CORE-2194 | ctm | v1-full | [COMPTIME-82] Generated runtime data contains no implicit compiler authority. | 0509 §183 | - | T552 |
+| REQ-CORE-2195 | ctm | v1-full | [COMPTIME-83] Comptime metadata is versioned. | 0509 §183 | - | T552 |
+| REQ-CORE-2196 | ctm | v1-full | [COMPTIME-84] Comptime dependency changes invalidate affected generated results. | 0509 §183 | - | T552 |
+| REQ-CORE-2197 | ctm | v1-full | [COMPTIME-85] Comptime dependency tracking is incremental where possible. | 0509 §183 | - | T552 |
+| REQ-CORE-2198 | ctm | v1-full | [COMPTIME-86] Comptime results may be stored in compiler cache. | 0509 §183 | - | T552 |
+| REQ-CORE-2199 | ctm | v1-full | [COMPTIME-87] Comptime cache invalidation is semantic, not timestamp-only. | 0509 §183 | - | T552 |
+| REQ-CORE-2200 | ctm | v1-full | [COMPTIME-88] Comptime capability policy participates in build identity. | 0509 §183 | - | T555 |
+| REQ-CORE-2201 | ctm | v1-full | [COMPTIME-89] Hermetic/reproducible builds may restrict comptime external capabilities. | 0509 §183 | - | T555 |
+| REQ-CORE-2202 | ctm | v1-full | [COMPTIME-90] Network/time/random/environment dependencies are never hidden. | 0509 §183 | - | T555 |
+| REQ-CORE-2203 | ctm | v1-full | [COMPTIME-91] Build-system policy may deny requested comptime capabilities. | 0509 §183 | - | T555 |
+| REQ-CORE-2204 | ctm | v1-full | [COMPTIME-92] Third-party comptime code receives no implicit OS authority. | 0509 §183 | - | T555 |
+| REQ-CORE-2205 | ctm | v1-full | [COMPTIME-93] AI-generated comptime code has the same semantic verification requirements as human-written code. | 0509 §183 | - | T555 |
+| REQ-CORE-2206 | ctm | v1-full | [COMPTIME-94] Comptime tooling may expose evaluation traces. | 0509 §183 | - | T555 |
+| REQ-CORE-2207 | ctm | v1-full | [COMPTIME-95] Comptime tooling cannot override semantic verification. | 0509 §183 | - | T555 |
+| REQ-CORE-2208 | ctm | v1-full | [COMPTIME-96] Comptime semantics are independent of ComptimeVM implementation strategy. | 0509 §183 | - | T555 |
+| REQ-CORE-2209 | ctm | v1-full | [COMPTIME-97] Compiler implementation may optimize comptime execution without changing results. | 0509 §183 | - | T555 |
+| REQ-CORE-2210 | ctm | v1-full | [COMPTIME-98] Comptime failures are structured compiler diagnostics. | 0509 §183 | - | T555 |
+| REQ-CORE-2211 | ctm | v1-full | [COMPTIME-99] Comptime semantics are part of the Semantic Oracle. | 0509 §183 | - | T555 |
+| REQ-CORE-2212 | ctm | v1-full | [COMPTIME-100] A cache hit, interpreter execution, optimized VM execution, and future native comptime execution must produce observationally equivalent compile-time results. | 0509 §183 | - | T555 |
+| REQ-CORE-2213 | ctm | v1-full | Một ngôn ngữ duy nhất, một type system, một ownership model, một effect model, một verifier — nhưng compiler có thể chạy code trước runtime. | 0509 Một quyết định kiến trúc rất quan trọng đã được chốt | - | T555 |
 | REQ-PAT-207 | pat | v1-core | Pattern matching xác định các places được bind; ownership model xác định binding operation. | 0510 §130 | - | T113 |
 | REQ-PAT-208 | pat | v1-core | [AMATCH-20] Pattern matching is a structural value decomposition mechanism. | 0510 §142 | - | T113 |
 | REQ-PAT-209 | pat | v1-core | [AMATCH-21] Patterns do not constitute a separate ownership system. | 0510 §142 | - | T113 |
@@ -8383,153 +8383,153 @@
 | REQ-DRP-180 | drp | v1-core | [ACLEAN-133] Immediate process termination operations may bypass ordinary cleanup only when their explicit semantics permit it. | 0513 §196 | - | T113 | 
 | REQ-DRP-181 | drp | v1-core | [ACLEAN-134] Axiom does not guarantee cleanup after explicit abort-like termination. | 0513 §196 | - | T113 | 
 | REQ-DRP-182 | drp | v1-core | [ACLEAN-135] Cleanup semantics are deterministic and target-independent at the semantic level. | 0513 §196 | - | T113 | 
-| REQ-CORE-2214 | ctm | v1-full | const denotes a compile-time value. static denotes program/module-lifetime storage. TLS denotes execution-context-lifetime storage. | 0514 §200 | - | EPIC(E14.1) |
-| REQ-CORE-2215 | ctm | v1-full | [AGLOBAL-20] const denotes a compile-time value. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2216 | ctm | v1-full | [AGLOBAL-21] A const does not require runtime storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2217 | ctm | v1-full | [AGLOBAL-22] A compiler may materialize a const when required by ABI or observable semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2218 | ctm | v1-full | [AGLOBAL-23] static denotes a storage location with explicit lifetime semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2219 | ctm | v1-full | [AGLOBAL-24] Static storage identity is distinct from const value identity. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2220 | ctm | v1-full | [AGLOBAL-25] Static storage does not require heap allocation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2221 | ctm | v1-full | [AGLOBAL-26] Static storage does not require garbage collection. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2222 | ctm | v1-full | [AGLOBAL-27] Static storage does not require a monolithic runtime. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2223 | ctm | v1-full | [AGLOBAL-28] Static layout is compiler-controlled unless an explicit representation/ABI contract exists. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2224 | ctm | v1-full | [AGLOBAL-29] Static address identity is preserved when address observability is part of the semantic contract. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2225 | ctm | v1-full | [AGLOBAL-30] Unobservable immutable static storage may be folded into constants. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2226 | ctm | v1-full | [AGLOBAL-31] Mutable static state is not implicitly safe for concurrent mutation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2227 | ctm | v1-full | [AGLOBAL-32] Unsafe mutable static access cannot bypass the Axiom memory model. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2228 | ctm | v1-full | [AGLOBAL-33] Safe mutable global state requires an appropriate synchronization abstraction. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2229 | ctm | v1-full | [AGLOBAL-34] Atomic static state obeys ordinary Axiom atomic semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2230 | ctm | v1-full | [AGLOBAL-35] Mutex-protected static state obeys ordinary mutex capability semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2231 | ctm | v1-full | [AGLOBAL-36] Atomic<T> cannot implicitly become mut_view<T>. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2232 | ctm | v1-full | [AGLOBAL-37] A static read-only value may produce a long-lived read capability when provenance permits. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2233 | ctm | v1-full | [AGLOBAL-38] A static owner cannot be implicitly moved out of static storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2234 | ctm | v1-full | [AGLOBAL-39] Global ownership is distinct from lexical local ownership. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2235 | ctm | v1-full | [AGLOBAL-40] Static values are not ordinary lexical locals. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2236 | ctm | v1-full | [AGLOBAL-41] Static declarations are module/package-level in Core v1. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2237 | ctm | v1-full | [AGLOBAL-42] Core v1 does not require function-local static storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2238 | ctm | v1-full | [AGLOBAL-43] Lazy function-local state is expressible using explicit library abstractions. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2239 | ctm | v1-full | [AGLOBAL-44] Constant static initialization requires a compile-time-valid initializer. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2240 | ctm | v1-full | [AGLOBAL-45] Constant static initialization does not require runtime startup code. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2241 | ctm | v1-full | [AGLOBAL-46] Comptime-generated static data may be materialized directly into the binary. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2242 | ctm | v1-full | [AGLOBAL-47] Comptime static generation obeys comptime capability restrictions. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2243 | ctm | v1-full | [AGLOBAL-48] Comptime execution cannot silently acquire runtime capabilities. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2244 | ctm | v1-full | [AGLOBAL-49] Arbitrary runtime IO is not permitted in constant initialization. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2245 | ctm | v1-full | [AGLOBAL-50] Arbitrary dynamic global constructors are not implicit Core semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2246 | ctm | v1-full | [AGLOBAL-51] Runtime-dependent global initialization requires an explicit mechanism. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2247 | ctm | v1-full | [AGLOBAL-52] Lazy initialization is a library abstraction. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2248 | ctm | v1-full | [AGLOBAL-53] Lazy initialization must define its concurrency semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2249 | ctm | v1-full | [AGLOBAL-54] Lazy initialization must define failure semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2250 | ctm | v1-full | [AGLOBAL-55] Lazy initialization cycles are not implicitly resolved by the language. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2251 | ctm | v1-full | [AGLOBAL-56] Package import does not imply runtime global initialization. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2252 | ctm | v1-full | [AGLOBAL-57] Module import does not imply arbitrary constructor execution. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2253 | ctm | v1-full | [AGLOBAL-58] Global initialization order cannot depend on source-file order. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2254 | ctm | v1-full | [AGLOBAL-59] Global initialization order cannot depend on linker input order. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2255 | ctm | v1-full | [AGLOBAL-60] Dynamic initialization dependencies must be explicit. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2256 | ctm | v1-full | [AGLOBAL-61] Explicit startup initialization may be provided by system/application layers. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2257 | ctm | v1-full | [AGLOBAL-62] Startup dependencies must be represented explicitly when ordering matters. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2258 | ctm | v1-full | [AGLOBAL-63] Startup execution order must be deterministic. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2259 | ctm | v1-full | [AGLOBAL-64] Static initialization does not require a universal constructor registry. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2260 | ctm | v1-full | [AGLOBAL-65] Static Drop does not imply mandatory process-exit destructor execution. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2261 | ctm | v1-full | [AGLOBAL-66] Core v1 does not require arbitrary static destructors at process exit. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2262 | ctm | v1-full | [AGLOBAL-67] Applications may perform explicit global shutdown. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2263 | ctm | v1-full | [AGLOBAL-68] Runtime profiles may provide optional shutdown facilities. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2264 | ctm | v1-full | [AGLOBAL-69] Static Drop semantics must not create an implicit global destruction-order dependency. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2265 | ctm | v1-full | [AGLOBAL-70] Static resources may have process or module lifetime. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2266 | ctm | v1-full | [AGLOBAL-71] Static resource cleanup remains subject to its explicit resource contract. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2267 | ctm | v1-full | [AGLOBAL-72] Static Drop is distinct from process termination. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2268 | ctm | v1-full | [AGLOBAL-73] Explicit abort-like termination may bypass ordinary static cleanup. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2269 | ctm | v1-full | [AGLOBAL-74] TLS denotes storage with an execution-context-specific instance. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2270 | ctm | v1-full | [AGLOBAL-75] TLS is distinct from ordinary static storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2271 | ctm | v1-full | [AGLOBAL-76] Each supported thread receives a distinct TLS storage instance. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2272 | ctm | v1-full | [AGLOBAL-77] TLS access does not imply shared mutable storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2273 | ctm | v1-full | [AGLOBAL-78] TLS access obeys ordinary ownership and capability rules. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2274 | ctm | v1-full | [AGLOBAL-79] A TLS capability cannot outlive its TLS execution context. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2275 | ctm | v1-full | [AGLOBAL-80] A TLS address cannot implicitly become a valid cross-thread capability. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2276 | ctm | v1-full | [AGLOBAL-81] TLS values do not automatically become Send merely because the declaration is TLS. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2277 | ctm | v1-full | [AGLOBAL-82] TLS values do not automatically become Share. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2278 | ctm | v1-full | [AGLOBAL-83] TLS initialization may use constant initialization. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2279 | ctm | v1-full | [AGLOBAL-84] Dynamic TLS initialization requires an explicit supported mechanism. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2280 | ctm | v1-full | [AGLOBAL-85] Core v1 does not require arbitrary TLS constructor execution. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2281 | ctm | v1-full | [AGLOBAL-86] Core v1 does not require arbitrary TLS destructor execution. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2282 | ctm | v1-full | [AGLOBAL-87] Platform TLS behavior may be exposed through system-layer contracts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2283 | ctm | v1-full | [AGLOBAL-88] TLS ABI is target-specific. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2284 | ctm | v1-full | [AGLOBAL-89] Dynamic-library TLS follows the platform/module lifetime contract. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2285 | ctm | v1-full | [AGLOBAL-90] A dynamically unloaded module cannot leave valid Axiom capabilities pointing into unloaded static/TLS storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2286 | ctm | v1-full | [AGLOBAL-91] External static declarations require explicit FFI contracts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2287 | ctm | v1-full | [AGLOBAL-92] Foreign static representation is not inferred solely from source type syntax. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2288 | ctm | v1-full | [AGLOBAL-93] Foreign mutable globals are conservative synchronization boundaries. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2289 | ctm | v1-full | [AGLOBAL-94] FFI global access contributes appropriate effects. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2290 | ctm | v1-full | [AGLOBAL-95] Volatile global access remains observable. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2291 | ctm | v1-full | [AGLOBAL-96] Atomic global access follows atomic ordering semantics. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2292 | ctm | v1-full | [AGLOBAL-97] Ordinary global reads are not automatically compiler barriers. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2293 | ctm | v1-full | [AGLOBAL-98] Global writes cannot be reordered across synchronization when forbidden by the memory model. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2294 | ctm | v1-full | [AGLOBAL-99] Global state contributes to effect analysis. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2295 | ctm | v1-full | [AGLOBAL-100] Global state contributes to alias analysis. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2296 | ctm | v1-full | [AGLOBAL-101] Global state contributes to concurrency analysis. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2297 | ctm | v1-full | [AGLOBAL-102] LTO may optimize global state only when all relevant observability conditions are proven. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2298 | ctm | v1-full | [AGLOBAL-103] Externally visible globals remain optimization roots. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2299 | ctm | v1-full | [AGLOBAL-104] Reflection-retained globals remain optimization roots when requested. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2300 | ctm | v1-full | [AGLOBAL-105] Exported globals have explicit symbol identity. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2301 | ctm | v1-full | [AGLOBAL-106] Exported global representation is part of ABI when stable ABI is declared. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2302 | ctm | v1-full | [AGLOBAL-107] Static ABI compatibility is independent of source visibility. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2303 | ctm | v1-full | [AGLOBAL-108] TLS ABI compatibility is target- and platform-dependent. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2304 | ctm | v1-full | [AGLOBAL-109] Static section placement is a linker concern. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2305 | ctm | v1-full | [AGLOBAL-110] Static section placement does not change semantic storage identity. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2306 | ctm | v1-full | [AGLOBAL-111] Read-only statics may reside in read-only sections. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2307 | ctm | v1-full | [AGLOBAL-112] Zero-initialized statics may use BSS-like representation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2308 | ctm | v1-full | [AGLOBAL-113] TLS statics may use platform TLS sections. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2309 | ctm | v1-full | [AGLOBAL-114] Unused statics may be eliminated when no observable identity remains. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2310 | ctm | v1-full | [AGLOBAL-115] Address-observable statics cannot be eliminated. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2311 | ctm | v1-full | [AGLOBAL-116] Static merging is legal only when semantic identity remains preserved. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2312 | ctm | v1-full | [AGLOBAL-117] Const merging is generally permitted because const has no required storage identity. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2313 | ctm | v1-full | [AGLOBAL-118] Static storage is not automatically heap storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2314 | ctm | v1-full | [AGLOBAL-119] Static storage is not automatically process-global across dynamic-library instances. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2315 | ctm | v1-full | [AGLOBAL-120] Module lifetime and process lifetime are distinct concepts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2316 | ctm | v1-full | [AGLOBAL-121] Dynamic library lifetime may be shorter than process lifetime. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2317 | ctm | v1-full | [AGLOBAL-122] Capabilities into dynamic-library static storage cannot outlive the module contract. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2318 | ctm | v1-full | [AGLOBAL-123] Freestanding programs may use static storage without a hosted runtime. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2319 | ctm | v1-full | [AGLOBAL-124] Kernel and embedded profiles may define explicit static initialization contracts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2320 | ctm | v1-full | [AGLOBAL-125] Freestanding execution does not require a universal global constructor mechanism. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2321 | ctm | v1-full | [AGLOBAL-126] WASM global/storage lowering is target-specific. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2322 | ctm | v1-full | [AGLOBAL-127] Axiom semantic static identity is distinct from a numeric WASM linear-memory address. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2323 | ctm | v1-full | [AGLOBAL-128] GPU/device static storage is a separate storage-domain concern. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2324 | ctm | v1-full | [AGLOBAL-129] CPU static storage does not implicitly become GPU storage. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2325 | ctm | v1-full | [AGLOBAL-130] Device static resources require explicit GPU/system contracts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2326 | ctm | v1-full | [AGLOBAL-131] Static values may be serialized through ordinary serialization abstractions. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2327 | ctm | v1-full | [AGLOBAL-132] Static addresses are not persistent logical identities. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2328 | ctm | v1-full | [AGLOBAL-133] Global cryptographic secrets do not gain security merely by being static. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2329 | ctm | v1-full | [AGLOBAL-134] Secure global storage requires explicit security-library contracts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2330 | ctm | v1-full | [AGLOBAL-135] Global constant-time requirements remain subject to the constant-time subsystem. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2331 | ctm | v1-full | [AGLOBAL-136] Static initialization is part of the build dependency graph when external inputs are involved. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2332 | ctm | v1-full | [AGLOBAL-137] Comptime external dependencies contribute to build identity. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2333 | ctm | v1-full | [AGLOBAL-138] Static initialization must be deterministic under reproducible-build mode. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2334 | ctm | v1-full | [AGLOBAL-139] Global initialization diagnostics must identify the initialization mechanism. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2335 | ctm | v1-full | [AGLOBAL-140] The compiler must distinguish constant, lazy, explicit-startup, and unsupported dynamic initialization. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2336 | ctm | v1-full | [AGLOBAL-141] Unknown global initialization behavior is not treated as constant initialization. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2337 | ctm | v1-full | [AGLOBAL-142] AI tooling may inspect global storage and initialization facts. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2338 | ctm | v1-full | [AGLOBAL-143] AI tooling cannot override global safety verification. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2339 | ctm | v1-full | [AGLOBAL-144] Global state semantics are independent of optimization level. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2340 | ctm | v1-full | [AGLOBAL-145] Global state semantics are independent of section placement. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2341 | ctm | v1-full | [AGLOBAL-146] Global state semantics are independent of linker implementation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2342 | ctm | v1-full | [AGLOBAL-147] Global state semantics are independent of allocator implementation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2343 | ctm | v1-full | [AGLOBAL-148] Global state semantics are independent of runtime composition unless an explicit runtime contract is selected. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2344 | ctm | v1-full | [AGLOBAL-149] The semantic distinction between const, static, and TLS is preserved through MIR. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2345 | ctm | v1-full | [AGLOBAL-150] Global storage facts are available to ABI lowering and linker stages. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2346 | ctm | v1-full | [AGLOBAL-151] Global storage facts are available to debugger/source mapping. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2347 | ctm | v1-full | [AGLOBAL-152] Global initialization is covered by conformance testing. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2348 | ctm | v1-full | [AGLOBAL-153] Global concurrency behavior is covered by concurrency testing. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2349 | ctm | v1-full | [AGLOBAL-154] Global FFI behavior is covered by ABI testing. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2350 | ctm | v1-full | [AGLOBAL-155] Global behavior is covered by freestanding and cross-target testing. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2351 | ctm | v1-full | [AGLOBAL-156] Global storage behavior is covered by dynamic-linking tests. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2352 | ctm | v1-full | [AGLOBAL-157] Global storage behavior is covered by reproducible-build tests. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2353 | ctm | v1-full | [AGLOBAL-158] No safe global mutable access may introduce a data race. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2354 | ctm | v1-full | [AGLOBAL-159] No global initialization mechanism may silently introduce an unspecified dependency order. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2355 | ctm | v1-full | [AGLOBAL-160] No static storage operation may implicitly require garbage collection. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2356 | ctm | v1-full | [AGLOBAL-161] No static storage operation may implicitly require heap allocation. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2357 | ctm | v1-full | [AGLOBAL-162] No TLS operation may implicitly require a monolithic runtime. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2358 | ctm | v1-full | [AGLOBAL-163] No global mechanism may silently introduce a hidden synchronization cost. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2359 | ctm | v1-full | [AGLOBAL-164] No global mechanism may silently introduce process-exit destructor ordering. | 0514 §201 | - | EPIC(E14.1) |
-| REQ-CORE-2360 | ctm | v1-full | [AGLOBAL-165] The programmer-visible global model remains explicit while compiler implementation may optimize aggressively. | 0514 §201 | - | EPIC(E14.1) |
+| REQ-CORE-2214 | ctm | v1-full | const denotes a compile-time value. static denotes program/module-lifetime storage. TLS denotes execution-context-lifetime storage. | 0514 §200 | - | T550 |
+| REQ-CORE-2215 | ctm | v1-full | [AGLOBAL-20] const denotes a compile-time value. | 0514 §201 | - | T550 |
+| REQ-CORE-2216 | ctm | v1-full | [AGLOBAL-21] A const does not require runtime storage. | 0514 §201 | - | T550 |
+| REQ-CORE-2217 | ctm | v1-full | [AGLOBAL-22] A compiler may materialize a const when required by ABI or observable semantics. | 0514 §201 | - | T550 |
+| REQ-CORE-2218 | ctm | v1-full | [AGLOBAL-23] static denotes a storage location with explicit lifetime semantics. | 0514 §201 | - | T550 |
+| REQ-CORE-2219 | ctm | v1-full | [AGLOBAL-24] Static storage identity is distinct from const value identity. | 0514 §201 | - | T550 |
+| REQ-CORE-2220 | ctm | v1-full | [AGLOBAL-25] Static storage does not require heap allocation. | 0514 §201 | - | T550 |
+| REQ-CORE-2221 | ctm | v1-full | [AGLOBAL-26] Static storage does not require garbage collection. | 0514 §201 | - | T550 |
+| REQ-CORE-2222 | ctm | v1-full | [AGLOBAL-27] Static storage does not require a monolithic runtime. | 0514 §201 | - | T550 |
+| REQ-CORE-2223 | ctm | v1-full | [AGLOBAL-28] Static layout is compiler-controlled unless an explicit representation/ABI contract exists. | 0514 §201 | - | T550 |
+| REQ-CORE-2224 | ctm | v1-full | [AGLOBAL-29] Static address identity is preserved when address observability is part of the semantic contract. | 0514 §201 | - | T550 |
+| REQ-CORE-2225 | ctm | v1-full | [AGLOBAL-30] Unobservable immutable static storage may be folded into constants. | 0514 §201 | - | T550 |
+| REQ-CORE-2226 | ctm | v1-full | [AGLOBAL-31] Mutable static state is not implicitly safe for concurrent mutation. | 0514 §201 | - | T550 |
+| REQ-CORE-2227 | ctm | v1-full | [AGLOBAL-32] Unsafe mutable static access cannot bypass the Axiom memory model. | 0514 §201 | - | T550 |
+| REQ-CORE-2228 | ctm | v1-full | [AGLOBAL-33] Safe mutable global state requires an appropriate synchronization abstraction. | 0514 §201 | - | T550 |
+| REQ-CORE-2229 | ctm | v1-full | [AGLOBAL-34] Atomic static state obeys ordinary Axiom atomic semantics. | 0514 §201 | - | T550 |
+| REQ-CORE-2230 | ctm | v1-full | [AGLOBAL-35] Mutex-protected static state obeys ordinary mutex capability semantics. | 0514 §201 | - | T550 |
+| REQ-CORE-2231 | ctm | v1-full | [AGLOBAL-36] Atomic<T> cannot implicitly become mut_view<T>. | 0514 §201 | - | T550 |
+| REQ-CORE-2232 | ctm | v1-full | [AGLOBAL-37] A static read-only value may produce a long-lived read capability when provenance permits. | 0514 §201 | - | T550 |
+| REQ-CORE-2233 | ctm | v1-full | [AGLOBAL-38] A static owner cannot be implicitly moved out of static storage. | 0514 §201 | - | T550 |
+| REQ-CORE-2234 | ctm | v1-full | [AGLOBAL-39] Global ownership is distinct from lexical local ownership. | 0514 §201 | - | T550 |
+| REQ-CORE-2235 | ctm | v1-full | [AGLOBAL-40] Static values are not ordinary lexical locals. | 0514 §201 | - | T550 |
+| REQ-CORE-2236 | ctm | v1-full | [AGLOBAL-41] Static declarations are module/package-level in Core v1. | 0514 §201 | - | T550 |
+| REQ-CORE-2237 | ctm | v1-full | [AGLOBAL-42] Core v1 does not require function-local static storage. | 0514 §201 | - | T550 |
+| REQ-CORE-2238 | ctm | v1-full | [AGLOBAL-43] Lazy function-local state is expressible using explicit library abstractions. | 0514 §201 | - | T550 |
+| REQ-CORE-2239 | ctm | v1-full | [AGLOBAL-44] Constant static initialization requires a compile-time-valid initializer. | 0514 §201 | - | T550 |
+| REQ-CORE-2240 | ctm | v1-full | [AGLOBAL-45] Constant static initialization does not require runtime startup code. | 0514 §201 | - | T550 |
+| REQ-CORE-2241 | ctm | v1-full | [AGLOBAL-46] Comptime-generated static data may be materialized directly into the binary. | 0514 §201 | - | T550 |
+| REQ-CORE-2242 | ctm | v1-full | [AGLOBAL-47] Comptime static generation obeys comptime capability restrictions. | 0514 §201 | - | T550 |
+| REQ-CORE-2243 | ctm | v1-full | [AGLOBAL-48] Comptime execution cannot silently acquire runtime capabilities. | 0514 §201 | - | T550 |
+| REQ-CORE-2244 | ctm | v1-full | [AGLOBAL-49] Arbitrary runtime IO is not permitted in constant initialization. | 0514 §201 | - | T552 |
+| REQ-CORE-2245 | ctm | v1-full | [AGLOBAL-50] Arbitrary dynamic global constructors are not implicit Core semantics. | 0514 §201 | - | T552 |
+| REQ-CORE-2246 | ctm | v1-full | [AGLOBAL-51] Runtime-dependent global initialization requires an explicit mechanism. | 0514 §201 | - | T552 |
+| REQ-CORE-2247 | ctm | v1-full | [AGLOBAL-52] Lazy initialization is a library abstraction. | 0514 §201 | - | T552 |
+| REQ-CORE-2248 | ctm | v1-full | [AGLOBAL-53] Lazy initialization must define its concurrency semantics. | 0514 §201 | - | T552 |
+| REQ-CORE-2249 | ctm | v1-full | [AGLOBAL-54] Lazy initialization must define failure semantics. | 0514 §201 | - | T552 |
+| REQ-CORE-2250 | ctm | v1-full | [AGLOBAL-55] Lazy initialization cycles are not implicitly resolved by the language. | 0514 §201 | - | T552 |
+| REQ-CORE-2251 | ctm | v1-full | [AGLOBAL-56] Package import does not imply runtime global initialization. | 0514 §201 | - | T552 |
+| REQ-CORE-2252 | ctm | v1-full | [AGLOBAL-57] Module import does not imply arbitrary constructor execution. | 0514 §201 | - | T552 |
+| REQ-CORE-2253 | ctm | v1-full | [AGLOBAL-58] Global initialization order cannot depend on source-file order. | 0514 §201 | - | T552 |
+| REQ-CORE-2254 | ctm | v1-full | [AGLOBAL-59] Global initialization order cannot depend on linker input order. | 0514 §201 | - | T552 |
+| REQ-CORE-2255 | ctm | v1-full | [AGLOBAL-60] Dynamic initialization dependencies must be explicit. | 0514 §201 | - | T552 |
+| REQ-CORE-2256 | ctm | v1-full | [AGLOBAL-61] Explicit startup initialization may be provided by system/application layers. | 0514 §201 | - | T552 |
+| REQ-CORE-2257 | ctm | v1-full | [AGLOBAL-62] Startup dependencies must be represented explicitly when ordering matters. | 0514 §201 | - | T552 |
+| REQ-CORE-2258 | ctm | v1-full | [AGLOBAL-63] Startup execution order must be deterministic. | 0514 §201 | - | T552 |
+| REQ-CORE-2259 | ctm | v1-full | [AGLOBAL-64] Static initialization does not require a universal constructor registry. | 0514 §201 | - | T552 |
+| REQ-CORE-2260 | ctm | v1-full | [AGLOBAL-65] Static Drop does not imply mandatory process-exit destructor execution. | 0514 §201 | - | T552 |
+| REQ-CORE-2261 | ctm | v1-full | [AGLOBAL-66] Core v1 does not require arbitrary static destructors at process exit. | 0514 §201 | - | T552 |
+| REQ-CORE-2262 | ctm | v1-full | [AGLOBAL-67] Applications may perform explicit global shutdown. | 0514 §201 | - | T552 |
+| REQ-CORE-2263 | ctm | v1-full | [AGLOBAL-68] Runtime profiles may provide optional shutdown facilities. | 0514 §201 | - | T552 |
+| REQ-CORE-2264 | ctm | v1-full | [AGLOBAL-69] Static Drop semantics must not create an implicit global destruction-order dependency. | 0514 §201 | - | T552 |
+| REQ-CORE-2265 | ctm | v1-full | [AGLOBAL-70] Static resources may have process or module lifetime. | 0514 §201 | - | T552 |
+| REQ-CORE-2266 | ctm | v1-full | [AGLOBAL-71] Static resource cleanup remains subject to its explicit resource contract. | 0514 §201 | - | T552 |
+| REQ-CORE-2267 | ctm | v1-full | [AGLOBAL-72] Static Drop is distinct from process termination. | 0514 §201 | - | T552 |
+| REQ-CORE-2268 | ctm | v1-full | [AGLOBAL-73] Explicit abort-like termination may bypass ordinary static cleanup. | 0514 §201 | - | T552 |
+| REQ-CORE-2269 | ctm | v1-full | [AGLOBAL-74] TLS denotes storage with an execution-context-specific instance. | 0514 §201 | - | T552 |
+| REQ-CORE-2270 | ctm | v1-full | [AGLOBAL-75] TLS is distinct from ordinary static storage. | 0514 §201 | - | T552 |
+| REQ-CORE-2271 | ctm | v1-full | [AGLOBAL-76] Each supported thread receives a distinct TLS storage instance. | 0514 §201 | - | T552 |
+| REQ-CORE-2272 | ctm | v1-full | [AGLOBAL-77] TLS access does not imply shared mutable storage. | 0514 §201 | - | T552 |
+| REQ-CORE-2273 | ctm | v1-full | [AGLOBAL-78] TLS access obeys ordinary ownership and capability rules. | 0514 §201 | - | T552 |
+| REQ-CORE-2274 | ctm | v1-full | [AGLOBAL-79] A TLS capability cannot outlive its TLS execution context. | 0514 §201 | - | T552 |
+| REQ-CORE-2275 | ctm | v1-full | [AGLOBAL-80] A TLS address cannot implicitly become a valid cross-thread capability. | 0514 §201 | - | T552 |
+| REQ-CORE-2276 | ctm | v1-full | [AGLOBAL-81] TLS values do not automatically become Send merely because the declaration is TLS. | 0514 §201 | - | T552 |
+| REQ-CORE-2277 | ctm | v1-full | [AGLOBAL-82] TLS values do not automatically become Share. | 0514 §201 | - | T552 |
+| REQ-CORE-2278 | ctm | v1-full | [AGLOBAL-83] TLS initialization may use constant initialization. | 0514 §201 | - | T552 |
+| REQ-CORE-2279 | ctm | v1-full | [AGLOBAL-84] Dynamic TLS initialization requires an explicit supported mechanism. | 0514 §201 | - | T552 |
+| REQ-CORE-2280 | ctm | v1-full | [AGLOBAL-85] Core v1 does not require arbitrary TLS constructor execution. | 0514 §201 | - | T552 |
+| REQ-CORE-2281 | ctm | v1-full | [AGLOBAL-86] Core v1 does not require arbitrary TLS destructor execution. | 0514 §201 | - | T552 |
+| REQ-CORE-2282 | ctm | v1-full | [AGLOBAL-87] Platform TLS behavior may be exposed through system-layer contracts. | 0514 §201 | - | T552 |
+| REQ-CORE-2283 | ctm | v1-full | [AGLOBAL-88] TLS ABI is target-specific. | 0514 §201 | - | T552 |
+| REQ-CORE-2284 | ctm | v1-full | [AGLOBAL-89] Dynamic-library TLS follows the platform/module lifetime contract. | 0514 §201 | - | T553 |
+| REQ-CORE-2285 | ctm | v1-full | [AGLOBAL-90] A dynamically unloaded module cannot leave valid Axiom capabilities pointing into unloaded static/TLS storage. | 0514 §201 | - | T553 |
+| REQ-CORE-2286 | ctm | v1-full | [AGLOBAL-91] External static declarations require explicit FFI contracts. | 0514 §201 | - | T553 |
+| REQ-CORE-2287 | ctm | v1-full | [AGLOBAL-92] Foreign static representation is not inferred solely from source type syntax. | 0514 §201 | - | T553 |
+| REQ-CORE-2288 | ctm | v1-full | [AGLOBAL-93] Foreign mutable globals are conservative synchronization boundaries. | 0514 §201 | - | T553 |
+| REQ-CORE-2289 | ctm | v1-full | [AGLOBAL-94] FFI global access contributes appropriate effects. | 0514 §201 | - | T553 |
+| REQ-CORE-2290 | ctm | v1-full | [AGLOBAL-95] Volatile global access remains observable. | 0514 §201 | - | T553 |
+| REQ-CORE-2291 | ctm | v1-full | [AGLOBAL-96] Atomic global access follows atomic ordering semantics. | 0514 §201 | - | T553 |
+| REQ-CORE-2292 | ctm | v1-full | [AGLOBAL-97] Ordinary global reads are not automatically compiler barriers. | 0514 §201 | - | T553 |
+| REQ-CORE-2293 | ctm | v1-full | [AGLOBAL-98] Global writes cannot be reordered across synchronization when forbidden by the memory model. | 0514 §201 | - | T553 |
+| REQ-CORE-2294 | ctm | v1-full | [AGLOBAL-99] Global state contributes to effect analysis. | 0514 §201 | - | T553 |
+| REQ-CORE-2295 | ctm | v1-full | [AGLOBAL-100] Global state contributes to alias analysis. | 0514 §201 | - | T553 |
+| REQ-CORE-2296 | ctm | v1-full | [AGLOBAL-101] Global state contributes to concurrency analysis. | 0514 §201 | - | T553 |
+| REQ-CORE-2297 | ctm | v1-full | [AGLOBAL-102] LTO may optimize global state only when all relevant observability conditions are proven. | 0514 §201 | - | T553 |
+| REQ-CORE-2298 | ctm | v1-full | [AGLOBAL-103] Externally visible globals remain optimization roots. | 0514 §201 | - | T553 |
+| REQ-CORE-2299 | ctm | v1-full | [AGLOBAL-104] Reflection-retained globals remain optimization roots when requested. | 0514 §201 | - | T553 |
+| REQ-CORE-2300 | ctm | v1-full | [AGLOBAL-105] Exported globals have explicit symbol identity. | 0514 §201 | - | T553 |
+| REQ-CORE-2301 | ctm | v1-full | [AGLOBAL-106] Exported global representation is part of ABI when stable ABI is declared. | 0514 §201 | - | T553 |
+| REQ-CORE-2302 | ctm | v1-full | [AGLOBAL-107] Static ABI compatibility is independent of source visibility. | 0514 §201 | - | T553 |
+| REQ-CORE-2303 | ctm | v1-full | [AGLOBAL-108] TLS ABI compatibility is target- and platform-dependent. | 0514 §201 | - | T553 |
+| REQ-CORE-2304 | ctm | v1-full | [AGLOBAL-109] Static section placement is a linker concern. | 0514 §201 | - | T554 |
+| REQ-CORE-2305 | ctm | v1-full | [AGLOBAL-110] Static section placement does not change semantic storage identity. | 0514 §201 | - | T554 |
+| REQ-CORE-2306 | ctm | v1-full | [AGLOBAL-111] Read-only statics may reside in read-only sections. | 0514 §201 | - | T554 |
+| REQ-CORE-2307 | ctm | v1-full | [AGLOBAL-112] Zero-initialized statics may use BSS-like representation. | 0514 §201 | - | T554 |
+| REQ-CORE-2308 | ctm | v1-full | [AGLOBAL-113] TLS statics may use platform TLS sections. | 0514 §201 | - | T554 |
+| REQ-CORE-2309 | ctm | v1-full | [AGLOBAL-114] Unused statics may be eliminated when no observable identity remains. | 0514 §201 | - | T554 |
+| REQ-CORE-2310 | ctm | v1-full | [AGLOBAL-115] Address-observable statics cannot be eliminated. | 0514 §201 | - | T554 |
+| REQ-CORE-2311 | ctm | v1-full | [AGLOBAL-116] Static merging is legal only when semantic identity remains preserved. | 0514 §201 | - | T554 |
+| REQ-CORE-2312 | ctm | v1-full | [AGLOBAL-117] Const merging is generally permitted because const has no required storage identity. | 0514 §201 | - | T554 |
+| REQ-CORE-2313 | ctm | v1-full | [AGLOBAL-118] Static storage is not automatically heap storage. | 0514 §201 | - | T554 |
+| REQ-CORE-2314 | ctm | v1-full | [AGLOBAL-119] Static storage is not automatically process-global across dynamic-library instances. | 0514 §201 | - | T554 |
+| REQ-CORE-2315 | ctm | v1-full | [AGLOBAL-120] Module lifetime and process lifetime are distinct concepts. | 0514 §201 | - | T554 |
+| REQ-CORE-2316 | ctm | v1-full | [AGLOBAL-121] Dynamic library lifetime may be shorter than process lifetime. | 0514 §201 | - | T554 |
+| REQ-CORE-2317 | ctm | v1-full | [AGLOBAL-122] Capabilities into dynamic-library static storage cannot outlive the module contract. | 0514 §201 | - | T554 |
+| REQ-CORE-2318 | ctm | v1-full | [AGLOBAL-123] Freestanding programs may use static storage without a hosted runtime. | 0514 §201 | - | T554 |
+| REQ-CORE-2319 | ctm | v1-full | [AGLOBAL-124] Kernel and embedded profiles may define explicit static initialization contracts. | 0514 §201 | - | T554 |
+| REQ-CORE-2320 | ctm | v1-full | [AGLOBAL-125] Freestanding execution does not require a universal global constructor mechanism. | 0514 §201 | - | T554 |
+| REQ-CORE-2321 | ctm | v1-full | [AGLOBAL-126] WASM global/storage lowering is target-specific. | 0514 §201 | - | T554 |
+| REQ-CORE-2322 | ctm | v1-full | [AGLOBAL-127] Axiom semantic static identity is distinct from a numeric WASM linear-memory address. | 0514 §201 | - | T554 |
+| REQ-CORE-2323 | ctm | v1-full | [AGLOBAL-128] GPU/device static storage is a separate storage-domain concern. | 0514 §201 | - | T554 |
+| REQ-CORE-2324 | ctm | v1-full | [AGLOBAL-129] CPU static storage does not implicitly become GPU storage. | 0514 §201 | - | T554 |
+| REQ-CORE-2325 | ctm | v1-full | [AGLOBAL-130] Device static resources require explicit GPU/system contracts. | 0514 §201 | - | T554 |
+| REQ-CORE-2326 | ctm | v1-full | [AGLOBAL-131] Static values may be serialized through ordinary serialization abstractions. | 0514 §201 | - | T554 |
+| REQ-CORE-2327 | ctm | v1-full | [AGLOBAL-132] Static addresses are not persistent logical identities. | 0514 §201 | - | T554 |
+| REQ-CORE-2328 | ctm | v1-full | [AGLOBAL-133] Global cryptographic secrets do not gain security merely by being static. | 0514 §201 | - | T554 |
+| REQ-CORE-2329 | ctm | v1-full | [AGLOBAL-134] Secure global storage requires explicit security-library contracts. | 0514 §201 | - | T554 |
+| REQ-CORE-2330 | ctm | v1-full | [AGLOBAL-135] Global constant-time requirements remain subject to the constant-time subsystem. | 0514 §201 | - | T554 |
+| REQ-CORE-2331 | ctm | v1-full | [AGLOBAL-136] Static initialization is part of the build dependency graph when external inputs are involved. | 0514 §201 | - | T554 |
+| REQ-CORE-2332 | ctm | v1-full | [AGLOBAL-137] Comptime external dependencies contribute to build identity. | 0514 §201 | - | T554 |
+| REQ-CORE-2333 | ctm | v1-full | [AGLOBAL-138] Static initialization must be deterministic under reproducible-build mode. | 0514 §201 | - | T554 |
+| REQ-CORE-2334 | ctm | v1-full | [AGLOBAL-139] Global initialization diagnostics must identify the initialization mechanism. | 0514 §201 | - | T554 |
+| REQ-CORE-2335 | ctm | v1-full | [AGLOBAL-140] The compiler must distinguish constant, lazy, explicit-startup, and unsupported dynamic initialization. | 0514 §201 | - | T554 |
+| REQ-CORE-2336 | ctm | v1-full | [AGLOBAL-141] Unknown global initialization behavior is not treated as constant initialization. | 0514 §201 | - | T554 |
+| REQ-CORE-2337 | ctm | v1-full | [AGLOBAL-142] AI tooling may inspect global storage and initialization facts. | 0514 §201 | - | T554 |
+| REQ-CORE-2338 | ctm | v1-full | [AGLOBAL-143] AI tooling cannot override global safety verification. | 0514 §201 | - | T554 |
+| REQ-CORE-2339 | ctm | v1-full | [AGLOBAL-144] Global state semantics are independent of optimization level. | 0514 §201 | - | T554 |
+| REQ-CORE-2340 | ctm | v1-full | [AGLOBAL-145] Global state semantics are independent of section placement. | 0514 §201 | - | T554 |
+| REQ-CORE-2341 | ctm | v1-full | [AGLOBAL-146] Global state semantics are independent of linker implementation. | 0514 §201 | - | T554 |
+| REQ-CORE-2342 | ctm | v1-full | [AGLOBAL-147] Global state semantics are independent of allocator implementation. | 0514 §201 | - | T554 |
+| REQ-CORE-2343 | ctm | v1-full | [AGLOBAL-148] Global state semantics are independent of runtime composition unless an explicit runtime contract is selected. | 0514 §201 | - | T554 |
+| REQ-CORE-2344 | ctm | v1-full | [AGLOBAL-149] The semantic distinction between const, static, and TLS is preserved through MIR. | 0514 §201 | - | T554 |
+| REQ-CORE-2345 | ctm | v1-full | [AGLOBAL-150] Global storage facts are available to ABI lowering and linker stages. | 0514 §201 | - | T554 |
+| REQ-CORE-2346 | ctm | v1-full | [AGLOBAL-151] Global storage facts are available to debugger/source mapping. | 0514 §201 | - | T555 |
+| REQ-CORE-2347 | ctm | v1-full | [AGLOBAL-152] Global initialization is covered by conformance testing. | 0514 §201 | - | T555 |
+| REQ-CORE-2348 | ctm | v1-full | [AGLOBAL-153] Global concurrency behavior is covered by concurrency testing. | 0514 §201 | - | T555 |
+| REQ-CORE-2349 | ctm | v1-full | [AGLOBAL-154] Global FFI behavior is covered by ABI testing. | 0514 §201 | - | T555 |
+| REQ-CORE-2350 | ctm | v1-full | [AGLOBAL-155] Global behavior is covered by freestanding and cross-target testing. | 0514 §201 | - | T555 |
+| REQ-CORE-2351 | ctm | v1-full | [AGLOBAL-156] Global storage behavior is covered by dynamic-linking tests. | 0514 §201 | - | T555 |
+| REQ-CORE-2352 | ctm | v1-full | [AGLOBAL-157] Global storage behavior is covered by reproducible-build tests. | 0514 §201 | - | T555 |
+| REQ-CORE-2353 | ctm | v1-full | [AGLOBAL-158] No safe global mutable access may introduce a data race. | 0514 §201 | - | T555 |
+| REQ-CORE-2354 | ctm | v1-full | [AGLOBAL-159] No global initialization mechanism may silently introduce an unspecified dependency order. | 0514 §201 | - | T555 |
+| REQ-CORE-2355 | ctm | v1-full | [AGLOBAL-160] No static storage operation may implicitly require garbage collection. | 0514 §201 | - | T555 |
+| REQ-CORE-2356 | ctm | v1-full | [AGLOBAL-161] No static storage operation may implicitly require heap allocation. | 0514 §201 | - | T555 |
+| REQ-CORE-2357 | ctm | v1-full | [AGLOBAL-162] No TLS operation may implicitly require a monolithic runtime. | 0514 §201 | - | T555 |
+| REQ-CORE-2358 | ctm | v1-full | [AGLOBAL-163] No global mechanism may silently introduce a hidden synchronization cost. | 0514 §201 | - | T555 |
+| REQ-CORE-2359 | ctm | v1-full | [AGLOBAL-164] No global mechanism may silently introduce process-exit destructor ordering. | 0514 §201 | - | T555 |
+| REQ-CORE-2360 | ctm | v1-full | [AGLOBAL-165] The programmer-visible global model remains explicit while compiler implementation may optimize aggressively. | 0514 §201 | - | T555 |
 | REQ-CORE-2361 | compiler | v1-full | Programmer sees values and capabilities; compiler sees memory topology. | 0515 §158 | - | EPIC(E18.1) |
 | REQ-CORE-2362 | compiler | v1-full | [AMEM-96] FFI contracts may narrow foreign memory effects. | 0515 §196 | - | EPIC(E18.1) |
 | REQ-CORE-2363 | compiler | v1-full | [AMEM-97] Unknown foreign aliasing is never treated as NO_ALIAS. | 0515 §196 | - | EPIC(E18.1) |
@@ -9838,78 +9838,78 @@
 | REQ-CORE-2986 | typ | v1-core | [AHIR-88] HIR does not require mandatory heap allocation. | 0538 §69 | - | T113 |
 | REQ-CORE-2987 | typ | v1-core | [AHIR-89] HIR semantics remain independent of optimization level. | 0538 §69 | - | T113 |
 | REQ-CORE-2988 | typ | v1-core | [AHIR-90] Typed HIR is a semantic boundary between source language and executable IR. | 0538 §69 | - | T113 |
-| REQ-CORE-2989 | ctm | v1-full | MIR không được suy đoán lại semantics mà HIR đã xác định. | 0539 §1 | - | EPIC(E14.1) |
-| REQ-CORE-2990 | ctm | v1-full | [AMIR-20] Every production MIR function has exactly one entry block. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2991 | ctm | v1-full | [AMIR-21] Every basic block has exactly one terminator. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2992 | ctm | v1-full | [AMIR-22] All MIR block references resolve to valid BasicBlockIds. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2993 | ctm | v1-full | [AMIR-23] MIR uses typed compiler identifiers. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2994 | ctm | v1-full | [AMIR-24] MIR places use semantic LocalIds and FieldIds. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2995 | ctm | v1-full | [AMIR-25] MIR operands distinguish Copy from Move. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2996 | ctm | v1-full | [AMIR-26] Semantic Copy does not imply physical machine copy. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2997 | ctm | v1-full | [AMIR-27] Semantic Move does not imply physical machine move. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2998 | ctm | v1-full | [AMIR-28] MIR does not perform overload resolution. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-2999 | ctm | v1-full | [AMIR-29] MIR does not perform generic type inference. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3000 | ctm | v1-full | [AMIR-30] MIR does not perform name resolution. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3001 | ctm | v1-full | [AMIR-31] MIR does not invent implicit coercions. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3002 | ctm | v1-full | [AMIR-32] All semantic coercions are explicit before or within validated lowering. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3003 | ctm | v1-full | [AMIR-33] MIR preserves source evaluation order. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3004 | ctm | v1-full | [AMIR-34] MIR preserves semantic ownership operations. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3005 | ctm | v1-full | [AMIR-35] MIR preserves capability creation and destruction semantics. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3006 | ctm | v1-full | [AMIR-36] MIR contains sufficient information for ownership verification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3007 | ctm | v1-full | [AMIR-37] MIR contains sufficient information for capability verification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3008 | ctm | v1-full | [AMIR-38] MIR contains sufficient information for Drop verification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3009 | ctm | v1-full | [AMIR-39] Every reachable control-flow path has valid cleanup semantics. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3010 | ctm | v1-full | [AMIR-40] Return paths pass through required cleanup. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3011 | ctm | v1-full | [AMIR-41] Break paths pass through required cleanup. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3012 | ctm | v1-full | [AMIR-42] Continue paths pass through required cleanup. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3013 | ctm | v1-full | [AMIR-43] Panic/unwind paths respect configured cleanup semantics. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3014 | ctm | v1-full | [AMIR-44] Moved values are not implicitly dropped. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3015 | ctm | v1-full | [AMIR-45] Partially moved values are represented at place granularity. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3016 | ctm | v1-full | [AMIR-46] Custom-Drop restrictions are preserved. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3017 | ctm | v1-full | [AMIR-47] Capability lifetimes are represented sufficiently for verification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3018 | ctm | v1-full | [AMIR-48] Live capabilities block incompatible relocation. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3019 | ctm | v1-full | [AMIR-49] MIR preserves unsafe boundaries. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3020 | ctm | v1-full | [AMIR-50] Unsafe operations do not erase provenance contracts. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3021 | ctm | v1-full | [AMIR-51] Atomic operations remain distinct from ordinary loads/stores. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3022 | ctm | v1-full | [AMIR-52] Volatile operations remain distinct from ordinary loads/stores. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3023 | ctm | v1-full | [AMIR-53] Synchronization semantics are preserved. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3024 | ctm | v1-full | [AMIR-54] Async suspension points are explicit. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3025 | ctm | v1-full | [AMIR-55] Values live across suspension remain identifiable. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3026 | ctm | v1-full | [AMIR-56] Closure capture semantics are preserved. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3027 | ctm | v1-full | [AMIR-57] GPU execution/storage domains remain explicit. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3028 | ctm | v1-full | [AMIR-58] FFI boundaries remain explicit. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3029 | ctm | v1-full | [AMIR-59] Comptime evaluation does not become implicit runtime execution. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3030 | ctm | v1-full | [AMIR-60] MIR does not require heap allocation for high-level constructs. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3031 | ctm | v1-full | [AMIR-61] MIR does not require GC. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3032 | ctm | v1-full | [AMIR-62] MIR does not require object headers. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3033 | ctm | v1-full | [AMIR-63] MIR does not require a monolithic runtime. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3034 | ctm | v1-full | [AMIR-64] MIR supports caller-allocated result construction. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3035 | ctm | v1-full | [AMIR-65] MIR permits physical move/copy elimination. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3036 | ctm | v1-full | [AMIR-66] MIR does not perform machine register allocation. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3037 | ctm | v1-full | [AMIR-67] MIR does not perform target instruction selection. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3038 | ctm | v1-full | [AMIR-68] MIR does not encode final ABI register classification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3039 | ctm | v1-full | [AMIR-69] MIR source provenance remains available. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3040 | ctm | v1-full | [AMIR-70] Generated cleanup retains source and semantic provenance. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3041 | ctm | v1-full | [AMIR-71] MIR CFG construction is deterministic. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3042 | ctm | v1-full | [AMIR-72] MIR construction is independent of worker completion order. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3043 | ctm | v1-full | [AMIR-73] MIR structural validation precedes semantic verification. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3044 | ctm | v1-full | [AMIR-74] Invalid MIR cannot enter optimization. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3045 | ctm | v1-full | [AMIR-75] Only Verified MIR may enter optimization. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3046 | ctm | v1-full | [AMIR-76] MIR transformations preserve semantic types. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3047 | ctm | v1-full | [AMIR-77] MIR transformations preserve ownership semantics. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3048 | ctm | v1-full | [AMIR-78] MIR transformations preserve capability semantics. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3049 | ctm | v1-full | [AMIR-79] MIR transformations preserve evaluation order. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3050 | ctm | v1-full | [AMIR-80] MIR transformations preserve externally observable effects. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3051 | ctm | v1-full | [AMIR-81] MIR is independent of physical storage strategy. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3052 | ctm | v1-full | [AMIR-82] MIR does not determine stack versus heap placement. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3053 | ctm | v1-full | [AMIR-83] MIR does not determine register allocation. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3054 | ctm | v1-full | [AMIR-84] MIR does not determine vector register usage. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3055 | ctm | v1-full | [AMIR-85] MIR is target-independent unless an explicit semantic execution domain requires target facts. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3056 | ctm | v1-full | [AMIR-86] MIR lowering consumes Typed HIR semantic facts. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3057 | ctm | v1-full | [AMIR-87] MIR lowering must not rediscover source-level semantic meaning. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3058 | ctm | v1-full | [AMIR-88] MIR ownership state is analyzed by the authoritative verifier. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3059 | ctm | v1-full | [AMIR-89] MIR capability state is analyzed by the authoritative verifier. | 0539 §89 | - | EPIC(E14.1) |
-| REQ-CORE-3060 | ctm | v1-full | [AMIR-90] MIR is the semantic executable boundary before verification and optimization. | 0539 §89 | - | EPIC(E14.1) |
+| REQ-CORE-2989 | ctm | v1-full | MIR không được suy đoán lại semantics mà HIR đã xác định. | 0539 §1 | - | T561 |
+| REQ-CORE-2990 | ctm | v1-full | [AMIR-20] Every production MIR function has exactly one entry block. | 0539 §89 | - | T561 |
+| REQ-CORE-2991 | ctm | v1-full | [AMIR-21] Every basic block has exactly one terminator. | 0539 §89 | - | T561 |
+| REQ-CORE-2992 | ctm | v1-full | [AMIR-22] All MIR block references resolve to valid BasicBlockIds. | 0539 §89 | - | T561 |
+| REQ-CORE-2993 | ctm | v1-full | [AMIR-23] MIR uses typed compiler identifiers. | 0539 §89 | - | T561 |
+| REQ-CORE-2994 | ctm | v1-full | [AMIR-24] MIR places use semantic LocalIds and FieldIds. | 0539 §89 | - | T561 |
+| REQ-CORE-2995 | ctm | v1-full | [AMIR-25] MIR operands distinguish Copy from Move. | 0539 §89 | - | T561 |
+| REQ-CORE-2996 | ctm | v1-full | [AMIR-26] Semantic Copy does not imply physical machine copy. | 0539 §89 | - | T561 |
+| REQ-CORE-2997 | ctm | v1-full | [AMIR-27] Semantic Move does not imply physical machine move. | 0539 §89 | - | T561 |
+| REQ-CORE-2998 | ctm | v1-full | [AMIR-28] MIR does not perform overload resolution. | 0539 §89 | - | T561 |
+| REQ-CORE-2999 | ctm | v1-full | [AMIR-29] MIR does not perform generic type inference. | 0539 §89 | - | T562 |
+| REQ-CORE-3000 | ctm | v1-full | [AMIR-30] MIR does not perform name resolution. | 0539 §89 | - | T562 |
+| REQ-CORE-3001 | ctm | v1-full | [AMIR-31] MIR does not invent implicit coercions. | 0539 §89 | - | T562 |
+| REQ-CORE-3002 | ctm | v1-full | [AMIR-32] All semantic coercions are explicit before or within validated lowering. | 0539 §89 | - | T562 |
+| REQ-CORE-3003 | ctm | v1-full | [AMIR-33] MIR preserves source evaluation order. | 0539 §89 | - | T562 |
+| REQ-CORE-3004 | ctm | v1-full | [AMIR-34] MIR preserves semantic ownership operations. | 0539 §89 | - | T562 |
+| REQ-CORE-3005 | ctm | v1-full | [AMIR-35] MIR preserves capability creation and destruction semantics. | 0539 §89 | - | T562 |
+| REQ-CORE-3006 | ctm | v1-full | [AMIR-36] MIR contains sufficient information for ownership verification. | 0539 §89 | - | T562 |
+| REQ-CORE-3007 | ctm | v1-full | [AMIR-37] MIR contains sufficient information for capability verification. | 0539 §89 | - | T562 |
+| REQ-CORE-3008 | ctm | v1-full | [AMIR-38] MIR contains sufficient information for Drop verification. | 0539 §89 | - | T563 |
+| REQ-CORE-3009 | ctm | v1-full | [AMIR-39] Every reachable control-flow path has valid cleanup semantics. | 0539 §89 | - | T563 |
+| REQ-CORE-3010 | ctm | v1-full | [AMIR-40] Return paths pass through required cleanup. | 0539 §89 | - | T563 |
+| REQ-CORE-3011 | ctm | v1-full | [AMIR-41] Break paths pass through required cleanup. | 0539 §89 | - | T563 |
+| REQ-CORE-3012 | ctm | v1-full | [AMIR-42] Continue paths pass through required cleanup. | 0539 §89 | - | T563 |
+| REQ-CORE-3013 | ctm | v1-full | [AMIR-43] Panic/unwind paths respect configured cleanup semantics. | 0539 §89 | - | T563 |
+| REQ-CORE-3014 | ctm | v1-full | [AMIR-44] Moved values are not implicitly dropped. | 0539 §89 | - | T563 |
+| REQ-CORE-3015 | ctm | v1-full | [AMIR-45] Partially moved values are represented at place granularity. | 0539 §89 | - | T563 |
+| REQ-CORE-3016 | ctm | v1-full | [AMIR-46] Custom-Drop restrictions are preserved. | 0539 §89 | - | T563 |
+| REQ-CORE-3017 | ctm | v1-full | [AMIR-47] Capability lifetimes are represented sufficiently for verification. | 0539 §89 | - | T563 |
+| REQ-CORE-3018 | ctm | v1-full | [AMIR-48] Live capabilities block incompatible relocation. | 0539 §89 | - | T563 |
+| REQ-CORE-3019 | ctm | v1-full | [AMIR-49] MIR preserves unsafe boundaries. | 0539 §89 | - | T564 |
+| REQ-CORE-3020 | ctm | v1-full | [AMIR-50] Unsafe operations do not erase provenance contracts. | 0539 §89 | - | T564 |
+| REQ-CORE-3021 | ctm | v1-full | [AMIR-51] Atomic operations remain distinct from ordinary loads/stores. | 0539 §89 | - | T564 |
+| REQ-CORE-3022 | ctm | v1-full | [AMIR-52] Volatile operations remain distinct from ordinary loads/stores. | 0539 §89 | - | T564 |
+| REQ-CORE-3023 | ctm | v1-full | [AMIR-53] Synchronization semantics are preserved. | 0539 §89 | - | T564 |
+| REQ-CORE-3024 | ctm | v1-full | [AMIR-54] Async suspension points are explicit. | 0539 §89 | - | T564 |
+| REQ-CORE-3025 | ctm | v1-full | [AMIR-55] Values live across suspension remain identifiable. | 0539 §89 | - | T564 |
+| REQ-CORE-3026 | ctm | v1-full | [AMIR-56] Closure capture semantics are preserved. | 0539 §89 | - | T565 |
+| REQ-CORE-3027 | ctm | v1-full | [AMIR-57] GPU execution/storage domains remain explicit. | 0539 §89 | - | T565 |
+| REQ-CORE-3028 | ctm | v1-full | [AMIR-58] FFI boundaries remain explicit. | 0539 §89 | - | T565 |
+| REQ-CORE-3029 | ctm | v1-full | [AMIR-59] Comptime evaluation does not become implicit runtime execution. | 0539 §89 | - | T565 |
+| REQ-CORE-3030 | ctm | v1-full | [AMIR-60] MIR does not require heap allocation for high-level constructs. | 0539 §89 | - | T565 |
+| REQ-CORE-3031 | ctm | v1-full | [AMIR-61] MIR does not require GC. | 0539 §89 | - | T566 |
+| REQ-CORE-3032 | ctm | v1-full | [AMIR-62] MIR does not require object headers. | 0539 §89 | - | T566 |
+| REQ-CORE-3033 | ctm | v1-full | [AMIR-63] MIR does not require a monolithic runtime. | 0539 §89 | - | T566 |
+| REQ-CORE-3034 | ctm | v1-full | [AMIR-64] MIR supports caller-allocated result construction. | 0539 §89 | - | T566 |
+| REQ-CORE-3035 | ctm | v1-full | [AMIR-65] MIR permits physical move/copy elimination. | 0539 §89 | - | T566 |
+| REQ-CORE-3036 | ctm | v1-full | [AMIR-66] MIR does not perform machine register allocation. | 0539 §89 | - | T058 |
+| REQ-CORE-3037 | ctm | v1-full | [AMIR-67] MIR does not perform target instruction selection. | 0539 §89 | - | T058 |
+| REQ-CORE-3038 | ctm | v1-full | [AMIR-68] MIR does not encode final ABI register classification. | 0539 §89 | - | T058 |
+| REQ-CORE-3039 | ctm | v1-full | [AMIR-69] MIR source provenance remains available. | 0539 §89 | - | T058 |
+| REQ-CORE-3040 | ctm | v1-full | [AMIR-70] Generated cleanup retains source and semantic provenance. | 0539 §89 | - | T058 |
+| REQ-CORE-3041 | ctm | v1-full | [AMIR-71] MIR CFG construction is deterministic. | 0539 §89 | - | T567 |
+| REQ-CORE-3042 | ctm | v1-full | [AMIR-72] MIR construction is independent of worker completion order. | 0539 §89 | - | T567 |
+| REQ-CORE-3043 | ctm | v1-full | [AMIR-73] MIR structural validation precedes semantic verification. | 0539 §89 | - | T567 |
+| REQ-CORE-3044 | ctm | v1-full | [AMIR-74] Invalid MIR cannot enter optimization. | 0539 §89 | - | T567 |
+| REQ-CORE-3045 | ctm | v1-full | [AMIR-75] Only Verified MIR may enter optimization. | 0539 §89 | - | T568 |
+| REQ-CORE-3046 | ctm | v1-full | [AMIR-76] MIR transformations preserve semantic types. | 0539 §89 | - | T568 |
+| REQ-CORE-3047 | ctm | v1-full | [AMIR-77] MIR transformations preserve ownership semantics. | 0539 §89 | - | T568 |
+| REQ-CORE-3048 | ctm | v1-full | [AMIR-78] MIR transformations preserve capability semantics. | 0539 §89 | - | T568 |
+| REQ-CORE-3049 | ctm | v1-full | [AMIR-79] MIR transformations preserve evaluation order. | 0539 §89 | - | T569 |
+| REQ-CORE-3050 | ctm | v1-full | [AMIR-80] MIR transformations preserve externally observable effects. | 0539 §89 | - | T569 |
+| REQ-CORE-3051 | ctm | v1-full | [AMIR-81] MIR is independent of physical storage strategy. | 0539 §89 | - | T569 |
+| REQ-CORE-3052 | ctm | v1-full | [AMIR-82] MIR does not determine stack versus heap placement. | 0539 §89 | - | T569 |
+| REQ-CORE-3053 | ctm | v1-full | [AMIR-83] MIR does not determine register allocation. | 0539 §89 | - | T570 |
+| REQ-CORE-3054 | ctm | v1-full | [AMIR-84] MIR does not determine vector register usage. | 0539 §89 | - | T570 |
+| REQ-CORE-3055 | ctm | v1-full | [AMIR-85] MIR is target-independent unless an explicit semantic execution domain requires target facts. | 0539 §89 | - | T570 |
+| REQ-CORE-3056 | ctm | v1-full | [AMIR-86] MIR lowering consumes Typed HIR semantic facts. | 0539 §89 | - | T571 |
+| REQ-CORE-3057 | ctm | v1-full | [AMIR-87] MIR lowering must not rediscover source-level semantic meaning. | 0539 §89 | - | T571 |
+| REQ-CORE-3058 | ctm | v1-full | [AMIR-88] MIR ownership state is analyzed by the authoritative verifier. | 0539 §89 | - | T571 |
+| REQ-CORE-3059 | ctm | v1-full | [AMIR-89] MIR capability state is analyzed by the authoritative verifier. | 0539 §89 | - | T572 |
+| REQ-CORE-3060 | ctm | v1-full | [AMIR-90] MIR is the semantic executable boundary before verification and optimization. | 0539 §89 | - | T572 |
 | REQ-OWN-252 | own | v1-core | Programmer describes ownership semantically; compiler proves ownership automatically. | 0540 §1 | - | T113 | 
 | REQ-OWN-253 | own | v1-core | Moved-from place có thể được reinitialized. | 0540 §11 | - | T113 | 
 | REQ-OWN-254 | own | v1-core | Ownership is a compile-time semantic property, not a runtime bookkeeping mechanism. | 0540 §110 | - | T113 | 

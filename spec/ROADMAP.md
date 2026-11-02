@@ -102,7 +102,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P11 concurrency & async | T088–T090, T400–T428 | T211 | T311 | P10 |
 | P12 numeric & SIMD | T450–T479 | T212 | T312 | P10 |
 | P13 low-level & security | T500–T533 | T213 | T313 | P10 |
-| P14 language completion: comptime 2.0, reflection, generators, dyn | T058 | T214 | T314 | P10 |
+| P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068 | T217 | T317 | P16 |
@@ -189,15 +189,15 @@ Exit: freestanding program boots without std; UB/safety conformance suite.
 
 ### P14 — Language completion: comptime 2.0, reflection, generators, dyn
 - **E14.1 Comptime completion** — full comptime execution model, partial evaluation, specialization.
-  Src 0102 0140 tasks/0340 tasks/0346 tasks/0509.
+  Src 0102 0140 tasks/0340 tasks/0346 tasks/0509. *(T550–T555)*
 - **E14.2 Reflection & derive** — compile-time reflection API, derive framework, code generation
-  boundary (no textual macros unless specified). Src tasks/0343 tasks/0296 tasks/0433.
-- **E14.3 Generators & `yield`** — iterator state machines, lazy control flow. Src tasks/0512.
+  boundary (no textual macros unless specified). Src tasks/0343 tasks/0296 tasks/0433. *(T556–T560)*
+- **E14.3 Generators & `yield`** — iterator state machines, lazy control flow. Src tasks/0512. *(T561–T565)*
 - **E14.4 dyn Trait & vtables** — dyn compatibility, coercion, vtable layout, native emission.
-  Src tasks/0476 217.49-50, 0212. *(T058)*
+  Src tasks/0476 217.49-50, 0212. *(T058, T566–T569)*
 - **E14.5 Surface ergonomics deferred by R7** — index auto-deref through `view`/`mut_view`
   (SPEC-03 AXS-SEM-047, ADR-0036 §4), axiomc only; plus any later R7-deferred surface conveniences.
-  Src ADR-0036, T141 QA N3.
+  Src ADR-0036, T141 QA N3. *(T570–T572)*
 Exit: derive(Debug/Eq/Hash/Serialize-style) implemented via reflection in std; generator tests.
 
 ### P15 — Optimizer 2.0
@@ -412,3 +412,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-02 | T211 P11 phase expansion (`P11-concurrency-async`): expanded E11.1–E11.6 into 29 new tasks `T400`–`T428` alongside refined existing tasks `T088`–`T090` (32 tasks total across 6 epics: E11.1 6 tasks `T089, T400–T404`; E11.2 5 tasks `T405–T409`; E11.3 6 tasks `T090, T410–T414`; E11.4 6 tasks `T088, T415–T419`; E11.5 5 tasks `T420–T424`; E11.6 4 tasks `T425–T428`), converted all 417 `EPIC(E11.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T311` (`depends: [T211, T088–T090, T400–T428]`) | T211 |
 | 2026-11-03 | T212 P12 phase expansion (`P12-numeric-floating-point-simd`): expanded E12.1–E12.5 into 30 new tasks `T450`–`T479` (30 tasks total across 5 epics: E12.1 6 tasks `T450–T455`; E12.2 7 tasks `T456–T462` including dedicated spec/implementation/QA stress-test tasks for `REQ-OWNER-007` complex mixed-type expression matrix Patterns A–D; E12.3 6 tasks `T463–T468`; E12.4 6 tasks `T469–T474`; E12.5 5 tasks `T475–T479`), converted all 335 `EPIC(E12.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T312` (`depends: [T212, T450–T479]`) | T212 |
 | 2026-11-03 | T213 P13 phase expansion (`P13-low-level-systems-unsafe-frees`): expanded E13.1–E13.7 into 34 new tasks `T500`–`T533` (34 tasks total across 7 epics: E13.1 6 tasks `T500–T505` including `REQ-OWNER-008` `fn_addr`/`static_addr`/`address_of`/`@addr` spec, implementation, and QA conformance plus `T503` ADR-0034 §8 OI-12 external Windows x64 ABI gcc DLL oracle before FFI breadth `T504`; E13.2 5 tasks `T506–T510`; E13.3 5 tasks `T511–T515`; E13.4 5 tasks `T516–T520`; E13.5 4 tasks `T521–T524`; E13.6 5 tasks `T525–T529` for `REQ-OWNER-003` & `REQ-OWNER-008` `@at`/`@addr` fixed-address placement; E13.7 4 tasks `T530–T533` for `REQ-OWNER-005` module-relative bindings), converted all 434 `EPIC(E13.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T313` (`depends: [T213, T500–T533]`) | T213 |
+| 2026-11-03 | T214 P14 phase expansion (`P14-comptime-2-0-reflection-genera`): expanded E14.1–E14.5 into 23 new tasks `T550`–`T572` alongside refined `T058` (24 tasks total across 5 epics: E14.1 6 tasks `T550–T555`; E14.2 5 tasks `T556–T560`; E14.3 5 tasks `T561–T565`; E14.4 5 tasks `T058, T566–T569`; E14.5 3 tasks `T570–T572` for `ADR-0036` §4 / `SPEC-03 AXS-SEM-047` index auto-deref through `view`/`mut_view`), converted all 512 `EPIC(E14.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T314` (`depends: [T214, T058, T550–T572]`) | T214 |
