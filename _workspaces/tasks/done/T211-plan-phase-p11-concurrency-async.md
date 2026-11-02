@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-02 23:58:07
+finished: 2026-11-03 00:23:26
 ---
 # T211 — Plan phase P11: Concurrency & async
 
@@ -40,3 +42,6 @@ the roadmap is invented.
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-02 23:58:07 started (attempt 1) 
+- 2026-11-03 00:23:26 accepted by QA -> done

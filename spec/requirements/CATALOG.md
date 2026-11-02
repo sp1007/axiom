@@ -79,13 +79,13 @@
 | REQ-ABI-032 | ABI | v1-full | Hot reload requires its own explicit ABI contract. | 0104 §54 | - | EPIC(E13.1) |
 | REQ-ABI-033 | ABI | v1-full | Dynamic linking does not imply hot reload. | 0104 §54 | - | EPIC(E13.1) |
 | REQ-ABI-034 | ABI | v1-full | ABI boundaries preserve internal optimization freedom. | 0104 §54 | - | EPIC(E13.1) |
-| REQ-CONC-003 | concurrency | v1-full | Thread cancellation must not forcibly interrupt arbitrary code. | 0105 §35 | - | EPIC(E11.1) |
-| REQ-CONC-004 | concurrency | v1-full | Mutable global ordinary memory must be unsafe or wrapped in safe synchronization abstraction. | 0105 §40 | - | EPIC(E11.1) |
-| REQ-ASY-003 | async | v1-full | mut_view or exclusive synchronous lock guard must not survive across await. | 0105 §52 | - | EPIC(E11.1) |
-| REQ-ASY-004 | async | v1-full | view cannot survive across await in v0.1. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-CONC-005 | concurrency | v1-full | Escaping closure cannot capture non-escaping view. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-CONC-006 | concurrency | v1-full | Spawn requires ownership-safe captures. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-CONC-007 | concurrency | v1-full | Channels transfer ownership, not unbounded borrowed views. | 0111 §47 | - | EPIC(E11.1) |
+| REQ-CONC-003 | concurrency | v1-full | Thread cancellation must not forcibly interrupt arbitrary code. | 0105 §35 | - | T410 |
+| REQ-CONC-004 | concurrency | v1-full | Mutable global ordinary memory must be unsafe or wrapped in safe synchronization abstraction. | 0105 §40 | - | T402 |
+| REQ-ASY-003 | async | v1-full | mut_view or exclusive synchronous lock guard must not survive across await. | 0105 §52 | - | T417 |
+| REQ-ASY-004 | async | v1-full | view cannot survive across await in v0.1. | 0111 §47 | - | T417 |
+| REQ-CONC-005 | concurrency | v1-full | Escaping closure cannot capture non-escaping view. | 0111 §47 | - | T401 |
+| REQ-CONC-006 | concurrency | v1-full | Spawn requires ownership-safe captures. | 0111 §47 | - | T401 |
+| REQ-CONC-007 | concurrency | v1-full | Channels transfer ownership, not unbounded borrowed views. | 0111 §47 | - | T412 |
 | REQ-LAY-001 | memory | v1-core | Allocator abstraction must not be an obligatory generic type parameter in standard collections. | 0106 §38 | - | T113 | 
 | REQ-DRP-004 | drop | v1-core | Drop semantics must not fail or return Result. | 0106 §63 | - | T113 | 
 | REQ-DRP-005 | drop | v1-core | OOM handling must not go through Drop. | 0106 §41 | - | T113 | 
@@ -146,10 +146,10 @@
 | REQ-CTM-001 | comptime | v1-full | Comptime uses the same ownership semantics. | 0111 §47 | - | EPIC(E14.1) |
 | REQ-CTM-002 | comptime | v1-full | Comptime resources cannot escape into runtime. | 0111 §47 | - | EPIC(E14.1) |
 | REQ-CTM-003 | comptime | v1-full | Comptime cleanup is deterministic. | 0111 §47 | - | EPIC(E14.1) |
-| REQ-ASY-005 | async | v1-full | Async state contains only semantically live state. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-ASY-006 | async | v1-full | Owned values may live across await. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-ASY-007 | async | v1-full | Suspended future owns its live state. | 0111 §47 | - | EPIC(E11.1) |
-| REQ-ATM-001 | atomics | v1-full | Atomicity and volatility are distinct semantics. | 0111 §47 | - | EPIC(E11.1) |
+| REQ-ASY-005 | async | v1-full | Async state contains only semantically live state. | 0111 §47 | - | T417 |
+| REQ-ASY-006 | async | v1-full | Owned values may live across await. | 0111 §47 | - | T417 |
+| REQ-ASY-007 | async | v1-full | Suspended future owns its live state. | 0111 §47 | - | T418 |
+| REQ-ATM-001 | atomics | v1-full | Atomicity and volatility are distinct semantics. | 0111 §47 | - | T405 |
 | REQ-CORE-003 | unsafe | v1-core | Unsafe does not disable subsequent safe verification. | 0111 §47 | - | T113 | 
 | REQ-CORE-004 | methods | v1-core | Method resolution is deterministic. | 0112 §84 | - | T113 | 
 | REQ-CORE-005 | methods | v1-core | Ambiguous method resolution is a compile error. | 0112 §84 | - | T113 | 
@@ -188,7 +188,7 @@
 | REQ-OWN-016 | ownership | v1-core | Lifetime analysis is internal compiler semantics and must not be exposed as source syntax. | 0116 §73 | - | T113 | 
 | REQ-OWN-017 | ownership | v1-core | Closure captures must have explicit ownership and capability semantics. | 0116 §81 | - | T113 | 
 | REQ-OWN-018 | ownership | v1-core | Escaping closures cannot implicitly retain non-escaping capabilities. | 0116 §81 | - | T113 | 
-| REQ-CONC-008 | concurrency | v1-full | The Send property of a closure is determined by its execution-relevant captured state. | 0116 §84 | - | EPIC(E11.1) |
+| REQ-CONC-008 | concurrency | v1-full | The Send property of a closure is determined by its execution-relevant captured state. | 0116 §84 | - | T401 |
 | REQ-OWN-019 | ownership | v1-core | Explicit drop requires that there are no live dependent capabilities. | 0116 §94 | - | T113 | 
 | REQ-OWN-020 | ownership | v1-core | Compiler-derived Drop may support partial moves. | 0116 §99 | - | T113 | 
 | REQ-OWN-021 | ownership | v1-core | User-defined Drop forbids partial moves. | 0116 §99 | - | T113 | 
@@ -220,20 +220,20 @@
 | REQ-CORE-018 | control-flow | v1-core | Loop expressions evaluate to unit and `break` cannot carry a value in v0.1. (ACFLOW-25) | 0118 §159, §210 | - | T113 | 
 | REQ-CORE-019 | control-flow | v1-core | Both branches of an `if` expression must have compatible types; implicit boxing or conversion is not allowed. (ACFLOW-) | 0118 §161 | - | T113 | 
 | REQ-DRP-011 | drop | v1-core | Safe Drop is non-propagating and destructors must not introduce recoverable/error control flow. (ADROP-25, ADROP-26) | 0118 §168 | - | T113 | 
-| REQ-ASY-008 | async | v1-full | Async state must contain only semantically live state. (AASYNC-20) | 0118 §172 | - | EPIC(E11.1) |
-| REQ-ASY-009 | async | v1-full | Dropping a suspended Future drops its owned live state. (AASYNC-25) | 0118 §173, §210 | - | EPIC(E11.1) |
-| REQ-ASY-010 | async | v1-full | Await does not imply thread migration. (AASYNC-26) | 0118 §210 | - | EPIC(E11.1) |
-| REQ-ASY-011 | async | v1-full | Future state owns live values across suspension. (AASYNC-27) | 0118 §210 | - | EPIC(E11.1) |
-| REQ-ASY-012 | async | v1-full | Borrowed views cannot survive await in v0.1. (AASYNC-28) | 0118 §176, §210 | - | EPIC(E11.1) |
-| REQ-ASY-013 | async | v1-full | Cancellation is ownership destruction, not an exception. (AASYNC-29) | 0118 §174, §210 | - | EPIC(E11.1) |
-| REQ-CONC-009 | concurrency | v1-full | Send represents execution-domain transfer safety; captures of tasks that can migrate threads must satisfy Send. (ACONC-20) | 0118 §180, §210 | - | EPIC(E11.1) |
-| REQ-CONC-010 | concurrency | v1-full | Lock guards (MutexGuard/RwLockGuard) cannot survive await. (ACONC-21) | 0118 §178, §210 | - | EPIC(E11.1) |
-| REQ-CONC-011 | concurrency | v1-full | Channel transfer moves ownership of the value. (ACONC-22) | 0118 §185, §210 | - | EPIC(E11.1) |
-| REQ-CONC-012 | concurrency | v1-full | Safe code cannot create data races. (ACONC-23) | 0118 §196, §210 | - | EPIC(E11.1) |
-| REQ-CONC-013 | concurrency | v1-full | Atomic operations are distinct from ordinary memory access; ordinary mutable capabilities cannot be used for atomic operations via casting. (ACONC-24) | 0118 §189, §195, §210 | - | EPIC(E11.1) |
-| REQ-CONC-014 | concurrency | v1-full | Atomic ordering is semantic, and the compiler must preserve Acquire/Release and SeqCst orderings. (ACONC-25) | 0118 §193, §194, §210 | - | EPIC(E11.1) |
-| REQ-CONC-015 | concurrency | v1-full | Mutex guards provide synchronization capability and their ownership is non-Copy. (ACONC-26, ACONC-27) | 0118 §197, §210 | - | EPIC(E11.1) |
-| REQ-CONC-016 | concurrency | v1-full | Task cancellation drops owned state. (ACONC-28) | 0118 §210 | - | EPIC(E11.1) |
+| REQ-ASY-008 | async | v1-full | Async state must contain only semantically live state. (AASYNC-20) | 0118 §172 | - | T417 |
+| REQ-ASY-009 | async | v1-full | Dropping a suspended Future drops its owned live state. (AASYNC-25) | 0118 §173, §210 | - | T418 |
+| REQ-ASY-010 | async | v1-full | Await does not imply thread migration. (AASYNC-26) | 0118 §210 | - | T419 |
+| REQ-ASY-011 | async | v1-full | Future state owns live values across suspension. (AASYNC-27) | 0118 §210 | - | T419 |
+| REQ-ASY-012 | async | v1-full | Borrowed views cannot survive await in v0.1. (AASYNC-28) | 0118 §176, §210 | - | T417 |
+| REQ-ASY-013 | async | v1-full | Cancellation is ownership destruction, not an exception. (AASYNC-29) | 0118 §174, §210 | - | T418 |
+| REQ-CONC-009 | concurrency | v1-full | Send represents execution-domain transfer safety; captures of tasks that can migrate threads must satisfy Send. (ACONC-20) | 0118 §180, §210 | - | T401 |
+| REQ-CONC-010 | concurrency | v1-full | Lock guards (MutexGuard/RwLockGuard) cannot survive await. (ACONC-21) | 0118 §178, §210 | - | T411 |
+| REQ-CONC-011 | concurrency | v1-full | Channel transfer moves ownership of the value. (ACONC-22) | 0118 §185, §210 | - | T412 |
+| REQ-CONC-012 | concurrency | v1-full | Safe code cannot create data races. (ACONC-23) | 0118 §196, §210 | - | T402 |
+| REQ-CONC-013 | concurrency | v1-full | Atomic operations are distinct from ordinary memory access; ordinary mutable capabilities cannot be used for atomic operations via casting. (ACONC-24) | 0118 §189, §195, §210 | - | T405 |
+| REQ-CONC-014 | concurrency | v1-full | Atomic ordering is semantic, and the compiler must preserve Acquire/Release and SeqCst orderings. (ACONC-25) | 0118 §193, §194, §210 | - | T406 |
+| REQ-CONC-015 | concurrency | v1-full | Mutex guards provide synchronization capability and their ownership is non-Copy. (ACONC-26, ACONC-27) | 0118 §197, §210 | - | T411 |
+| REQ-CONC-016 | concurrency | v1-full | Task cancellation drops owned state. (ACONC-28) | 0118 §210 | - | T404 |
 | REQ-CAP-007 | capabilities | v1-full | Synchronization context may be part of capability provenance for compiler-internal tracking. (ACAP-29) | 0118 §206 | - | EPIC(E13.1) |
 | REQ-ABI-037 | abi | v1-full | Type semantics are independent from machine representation, and the compiler may not infer semantic intent. (AABI-20) | 0119 §215, §259 | - | EPIC(E13.1) |
 | REQ-ABI-038 | abi | v1-full | Explicit C representation requires C-compatible components. (AABI-21) | 0119 §218, §259 | - | EPIC(E13.1) |
@@ -264,9 +264,9 @@
 | REQ-CAP-008 | capability | v1-full | Duplicating a view capability is not a value copy. | 0121 §323 (ACAP-30) | - | EPIC(E13.1) |
 | REQ-CAP-009 | capability | v1-full | A mutable view cannot be duplicated. | 0121 §324 | - | EPIC(E13.1) |
 | REQ-LAY-003 | memory | v1-core | A stable address exists only when explicitly required by the storage contract. | 0121 §326 (AMEM-61) | - | T113 | 
-| REQ-CONC-017 | concurrency | v1-full | Synchronous lock guards cannot cross suspension points. | 0121 §328 (ACONC-29) | - | EPIC(E11.1) |
-| REQ-CONC-018 | concurrency | v1-full | Synchronization is a property of a type or abstraction, not a property of a single operation. | 0121 §333 (ACONC-30) | - | EPIC(E11.1) |
-| REQ-ASY-014 | async | v1-full | Dropping a Future does not imply cancellation of external operations. | 0121 §339 (AASYNC-30) | - | EPIC(E11.1) |
+| REQ-CONC-017 | concurrency | v1-full | Synchronous lock guards cannot cross suspension points. | 0121 §328 (ACONC-29) | - | T417 |
+| REQ-CONC-018 | concurrency | v1-full | Synchronization is a property of a type or abstraction, not a property of a single operation. | 0121 §333 (ACONC-30) | - | T404 |
+| REQ-ASY-014 | async | v1-full | Dropping a Future does not imply cancellation of external operations. | 0121 §339 (AASYNC-30) | - | T418 |
 | REQ-ERR-009 | error | v1-core | Panics must not unwind across extern C boundaries by default. | 0121 §344 | - | T113 | 
 | REQ-CORE-022 | compiler | v1-full | The compiler must reject ambiguous semantics rather than guessing the semantic intent. | 0121 §365 | - | EPIC(E18.1) |
 | REQ-LEX-001 | lexical | v1-core | Axiom source MUST be UTF-8. | Part I §2.1 | - | T113 | 
@@ -284,8 +284,8 @@
 | REQ-RES-001 | resolution | v1-core | The compiler MUST find exactly one unique semantic implementation for an operator; otherwise, it is an ambiguity error. | Part II §12 | - | T113 |
 | REQ-TYP-025 | types | v1-core | Implicit mixed numeric operator conversions are prohibited. | Part II §15 | - | T113 |
 | REQ-CORE-028 | semantics | v1-core | Invalid shift count in safe code is a runtime failure, not undefined behavior. | Part II §19 | - | T113 | 
-| REQ-ASY-015 | async | v1-full | Capabilities (view<T>, mut_view<T>) MUST NOT live across an await suspension point. | Part II §63 | - | EPIC(E11.1) |
-| REQ-ASY-016 | async | v1-full | Async Future MUST NOT inherently require heap allocation. | Part II §67 | - | EPIC(E11.1) |
+| REQ-ASY-015 | async | v1-full | Capabilities (view<T>, mut_view<T>) MUST NOT live across an await suspension point. | Part II §63 | - | T417 |
+| REQ-ASY-016 | async | v1-full | Async Future MUST NOT inherently require heap allocation. | Part II §67 | - | T418 |
 | REQ-OWN-028 | ownership | v1-core | Safe code shall not require programmer-written lifetime annotations, borrow annotations, or pointer bookkeeping. | 0124 §0. Introduction | - | T113 | 
 | REQ-OWN-029 | ownership | v1-core | The programmer shall manage ownership semantics while the compiler manages lifetime, aliasing, and physical storage. | 0124 §0. Introduction | - | T113 | 
 | REQ-OWN-030 | ownership | v1-core | Every runtime value shall be classified as either an owning value or a non-owning capability. | 0124 §1. Ownership model | - | T113 | 
@@ -496,205 +496,205 @@
 | REQ-LAY-121 | memory | v1-core | Allocation elimination is a compiler responsibility (AMEM-59). | 0125 §62. Allocation invariants | - | T113 | 
 | REQ-LAY-122 | memory | v1-core | Memory strategy is explicit only when semantically relevant (AMEM-60). | 0125 §62. Allocation invariants | - | T113 | 
 | REQ-LAY-123 | memory | v1-core | The compiler must not inject mandatory runtime machinery into machine code solely to enforce safety abstractions. | 0125 §64. Nhưng có một giới hạn cần ghi rõ | - | T113 | 
-| REQ-CONC-019 | concurrency | v1-full | Concurrency semantics MUST share the unified semantic model of ownership, capabilities, and synchronization across execution contexts rather than creating separate concurrency checkers or a secondary memory model. | 0126 §Part V — Concurrency | - | EPIC(E11.1) |
-| REQ-CONC-020 | concurrency | v1-full | The compiler and runtime MUST distinguish an execution context from concrete scheduling abstractions, including threads, tasks, futures, coroutines, and GPU invocations. | 0126 §1. Execution context | - | EPIC(E11.1) |
-| REQ-CONC-021 | concurrency | v1-full | Every execution context MUST encapsulate its own local state, control flow, capabilities, and owned values. | 0126 §1. Execution context | - | EPIC(E11.1) |
-| REQ-CONC-022 | concurrency | v1-full | Spawning via `spawn` MUST create a new execution context scheduled independently by the operating system or runtime. | 0126 §2. Thread | - | EPIC(E11.1) |
-| REQ-CONC-023 | concurrency | v1-full | An async task execution context MUST be managed by an executor and need not correspond one-to-one to an OS thread. | 0126 §3. Task | - | EPIC(E11.1) |
-| REQ-CONC-024 | concurrency | v1-full | The compiler and runtime MUST NOT equate async tasks with threads, treating them as independent abstractions. | 0126 §4. Thread ≠ async task | - | EPIC(E11.1) |
-|REQ-CONC-025|concurrency|v1-full|Transferring ownership of an owned value across execution context boundaries MUST require the value's type to implement `Send`.|0126 §5. `Send`|-|EPIC(E11.1)|
-|REQ-CONC-026|concurrency|v1-full|The type system MUST treat `Send` and `Share` as distinct properties such that a type being `Send` does not imply it is `Share`.|0126 §6. `Send` không phải `Share`|-|EPIC(E11.1)|
-|REQ-CONC-027|concurrency|v1-full|Concurrent access to a value or capability across multiple execution contexts MUST require the underlying type or capability to satisfy `Share`.|0126 §7. `Share`|-|EPIC(E11.1)|
-| REQ-CONC-028 | concurrency | v1-full | Shared ownership of mutable data MUST NOT automatically grant the `Share` capability. | 0126 §7. `Share` | - | EPIC(E11.1) |
-| REQ-CONC-029 | concurrency | v1-full | Raw pointer types MUST NOT implement `Send` or `Share` by default. | 0126 §8. Hai chiều khác nhau | - | EPIC(E11.1) |
-| REQ-CONC-030 | concurrency | v1-full | Thread-local resources MUST NOT implement `Share` by default and MUST satisfy explicit contracts to implement `Send`. | 0126 §8. Hai chiều khác nhau | - | EPIC(E11.1) |
+| REQ-CONC-019 | concurrency | v1-full | Concurrency semantics MUST share the unified semantic model of ownership, capabilities, and synchronization across execution contexts rather than creating separate concurrency checkers or a secondary memory model. | 0126 §Part V — Concurrency | - | T400 |
+| REQ-CONC-020 | concurrency | v1-full | The compiler and runtime MUST distinguish an execution context from concrete scheduling abstractions, including threads, tasks, futures, coroutines, and GPU invocations. | 0126 §1. Execution context | - | T415 |
+| REQ-CONC-021 | concurrency | v1-full | Every execution context MUST encapsulate its own local state, control flow, capabilities, and owned values. | 0126 §1. Execution context | - | T400 |
+| REQ-CONC-022 | concurrency | v1-full | Spawning via `spawn` MUST create a new execution context scheduled independently by the operating system or runtime. | 0126 §2. Thread | - | T410 |
+| REQ-CONC-023 | concurrency | v1-full | An async task execution context MUST be managed by an executor and need not correspond one-to-one to an OS thread. | 0126 §3. Task | - | T420 |
+| REQ-CONC-024 | concurrency | v1-full | The compiler and runtime MUST NOT equate async tasks with threads, treating them as independent abstractions. | 0126 §4. Thread ≠ async task | - | T415 |
+|REQ-CONC-025|concurrency|v1-full|Transferring ownership of an owned value across execution context boundaries MUST require the value's type to implement `Send`.|0126 §5. `Send`|-|T400|
+|REQ-CONC-026|concurrency|v1-full|The type system MUST treat `Send` and `Share` as distinct properties such that a type being `Send` does not imply it is `Share`.|0126 §6. `Send` không phải `Share`|-|T400|
+|REQ-CONC-027|concurrency|v1-full|Concurrent access to a value or capability across multiple execution contexts MUST require the underlying type or capability to satisfy `Share`.|0126 §7. `Share`|-|T400|
+| REQ-CONC-028 | concurrency | v1-full | Shared ownership of mutable data MUST NOT automatically grant the `Share` capability. | 0126 §7. `Share` | - | T400 |
+| REQ-CONC-029 | concurrency | v1-full | Raw pointer types MUST NOT implement `Send` or `Share` by default. | 0126 §8. Hai chiều khác nhau | - | T401 |
+| REQ-CONC-030 | concurrency | v1-full | Thread-local resources MUST NOT implement `Share` by default and MUST satisfy explicit contracts to implement `Send`. | 0126 §8. Hai chiều khác nhau | - | T413 |
 | REQ-TYP-026 | types | v1-core | The compiler MUST automatically derive `Send` and `Share` for a type when all of its constituent fields satisfy the respective semantics. | 0126 §9. Auto derivation | - | T113 |
 | REQ-TYP-027 | types | v1-core | Programmers MUST NOT arbitrarily implement `Send` or `Share` in safe user code to bypass compiler semantic requirements. | 0126 §10. Không phải trait implementation tùy ý | - | T113 |
 | REQ-TYP-028 | types | v1-core | Any unsafe implementation of `Send` or `Share` at the system layer MUST be governed by an explicit proof contract. | 0126 §10. Không phải trait implementation tùy ý | - | T113 |
-|REQ-CONC-031|concurrency|v1-full|Capturing an owned value into a spawned closure via `move` MUST transfer ownership, marking the variable as MOVED in the parent execution context.|0126 §11. Spawn ownership|-|EPIC(E11.1)|
-| REQ-CONC-032 | concurrency | v1-full | Spawning a closure with captured `!Copy` values MUST NOT implicitly copy or clone the values and MUST transfer ownership. | 0126 §12. Spawn không tự copy | - | EPIC(E11.1) |
-| REQ-CONC-033 | concurrency | v1-full | Captured owned values whose ownership crosses execution boundaries via `spawn` MUST implement `Send`. | 0126 §13. Spawn và Send | - | EPIC(E11.1) |
-| REQ-CONC-034 | concurrency | v1-full | Tasks executed via `spawn_local` within the same execution context DO NOT require captured types to implement `Send`, but MUST strictly obey ownership, capability, lifetime, and aliasing rules. | 0126 §14. `spawn_local` | - | EPIC(E11.1) |
-| REQ-CONC-035 | concurrency | v1-full | Tasks scheduled via `spawn_local` MUST NOT bypass aliasing rules whenever execution can interleave with the owner or other tasks. | 0126 §15. `spawn_local` không phá Share safety | - | EPIC(E11.1) |
-| REQ-CONC-036 | concurrency | v1-full | A successful thread `join` MUST establish a synchronization boundary where child execution completion happens-before the parent continuation and transfers ownership of the result. | 0126 §16. Thread Join | - | EPIC(E11.1) |
-| REQ-CONC-037 | concurrency | v1-full | A thread join on a panicked execution context MUST return an explicit failure representation without requiring an exception runtime. | 0126 §17. Join và panic | - | EPIC(E11.1) |
-| REQ-CONC-038 | concurrency | v1-full | Thread detachment MUST be explicit, and the parent execution context MUST NOT assume a detached thread has completed. | 0126 §18. Detached thread | - | EPIC(E11.1) |
-| REQ-CONC-039 | concurrency | v1-full | The ownership and resources of a detached thread MUST be bound strictly to the task lifecycle. | 0126 §18. Detached thread | - | EPIC(E11.1) |
-| REQ-CONC-040 | concurrency | v1-full | A structured concurrency scope MUST guarantee that spawned child execution contexts cannot outlive the lifetime of the enclosing scope. | 0126 §19. Structured concurrency | - | EPIC(E11.1) |
-| REQ-CONC-041 | concurrency | v1-full | Sending a message through a channel MUST transfer ownership of the message to the channel. | 0126 §21. Channel | - | EPIC(E11.1) |
-| REQ-CONC-042 | concurrency | v1-full | Transmitting a `!Copy` message through a channel MUST move the message without implicit copying or serialization unless specified by the channel contract. | 0126 §22. Channel không copy mặc định | - | EPIC(E11.1) |
-| REQ-CONC-043 | concurrency | v1-full | A successful channel receive following a send MUST establish a happens-before relationship between producer and consumer in accordance with the channel contract. | 0126 §23. Channel synchronization | - | EPIC(E11.1) |
-| REQ-CONC-044 | concurrency | v1-full | `Mutex<T>` MUST provide exclusive synchronization access to its inner value by granting an owning synchronization guard upon lock acquisition. | 0126 §24. Mutex | - | EPIC(E11.1) |
-| REQ-CONC-045 | concurrency | v1-full | `MutexGuard<T>` MUST be `!Copy`, and dropping the guard MUST release the mutex lock. | 0126 §25. MutexGuard | - | EPIC(E11.1) |
+|REQ-CONC-031|concurrency|v1-full|Capturing an owned value into a spawned closure via `move` MUST transfer ownership, marking the variable as MOVED in the parent execution context.|0126 §11. Spawn ownership|-|T401|
+| REQ-CONC-032 | concurrency | v1-full | Spawning a closure with captured `!Copy` values MUST NOT implicitly copy or clone the values and MUST transfer ownership. | 0126 §12. Spawn không tự copy | - | T401 |
+| REQ-CONC-033 | concurrency | v1-full | Captured owned values whose ownership crosses execution boundaries via `spawn` MUST implement `Send`. | 0126 §13. Spawn và Send | - | T401 |
+| REQ-CONC-034 | concurrency | v1-full | Tasks executed via `spawn_local` within the same execution context DO NOT require captured types to implement `Send`, but MUST strictly obey ownership, capability, lifetime, and aliasing rules. | 0126 §14. `spawn_local` | - | T421 |
+| REQ-CONC-035 | concurrency | v1-full | Tasks scheduled via `spawn_local` MUST NOT bypass aliasing rules whenever execution can interleave with the owner or other tasks. | 0126 §15. `spawn_local` không phá Share safety | - | T421 |
+| REQ-CONC-036 | concurrency | v1-full | A successful thread `join` MUST establish a synchronization boundary where child execution completion happens-before the parent continuation and transfers ownership of the result. | 0126 §16. Thread Join | - | T414 |
+| REQ-CONC-037 | concurrency | v1-full | A thread join on a panicked execution context MUST return an explicit failure representation without requiring an exception runtime. | 0126 §17. Join và panic | - | T414 |
+| REQ-CONC-038 | concurrency | v1-full | Thread detachment MUST be explicit, and the parent execution context MUST NOT assume a detached thread has completed. | 0126 §18. Detached thread | - | T414 |
+| REQ-CONC-039 | concurrency | v1-full | The ownership and resources of a detached thread MUST be bound strictly to the task lifecycle. | 0126 §18. Detached thread | - | T414 |
+| REQ-CONC-040 | concurrency | v1-full | A structured concurrency scope MUST guarantee that spawned child execution contexts cannot outlive the lifetime of the enclosing scope. | 0126 §19. Structured concurrency | - | T422 |
+| REQ-CONC-041 | concurrency | v1-full | Sending a message through a channel MUST transfer ownership of the message to the channel. | 0126 §21. Channel | - | T412 |
+| REQ-CONC-042 | concurrency | v1-full | Transmitting a `!Copy` message through a channel MUST move the message without implicit copying or serialization unless specified by the channel contract. | 0126 §22. Channel không copy mặc định | - | T412 |
+| REQ-CONC-043 | concurrency | v1-full | A successful channel receive following a send MUST establish a happens-before relationship between producer and consumer in accordance with the channel contract. | 0126 §23. Channel synchronization | - | T412 |
+| REQ-CONC-044 | concurrency | v1-full | `Mutex<T>` MUST provide exclusive synchronization access to its inner value by granting an owning synchronization guard upon lock acquisition. | 0126 §24. Mutex | - | T411 |
+| REQ-CONC-045 | concurrency | v1-full | `MutexGuard<T>` MUST be `!Copy`, and dropping the guard MUST release the mutex lock. | 0126 §25. MutexGuard | - | T411 |
 | REQ-CAP-046 | capability | v1-full | A lock guard MUST remain alive for the entire duration that its derived mut_view capability is in use. | 0126 §26. Guard → capability | - | EPIC(E13.1) |
 | REQ-CAP-047 | capability | v1-full | The compiler MUST reject any attempt to use a derived capability after its owning lock guard has been dropped. | 0126 §27. Guard và Drop dependency | - | EPIC(E13.1) |
-| REQ-CONC-046 | concurrency | v1-full | `RwLock<T>` MUST grant either concurrent shared read access via view<T> or single exclusive write access via mut_view<T>, preventing reader-writer and writer-writer conflicts. | 0126 §28. RwLock | - | EPIC(E11.1) |
-| REQ-CONC-047 | concurrency | v1-full | Synchronization lock guards (including `MutexGuard`, `RwLockReadGuard`, and `RwLockWriteGuard`) MUST NOT implement `Copy`. | 0126 §29. Lock guards không Copy | - | EPIC(E11.1) |
-|REQ-CONC-048|concurrency|v1-full|The compiler MUST reject holding synchronous lock guards across suspension points (`.await`).|0126 §30. Lock guard không được cross await|-|EPIC(E11.1)|
-| REQ-CONC-049 | concurrency | v1-full | Asynchronous lock guards yielded by `AsyncMutex<T>` MUST strictly obey ownership, capability, and cancellation semantics. | 0126 §32. AsyncMutex | - | EPIC(E11.1) |
-|REQ-CONC-050|concurrency|v1-full|Synchronization contracts MUST be established at the type or abstraction boundary rather than treated merely as properties of isolated operations.|0126 §33. Synchronization là type property|-|EPIC(E11.1)|
-| REQ-CONC-051 | concurrency | v1-full | `Atomic<T>` MUST be a type-level memory abstraction restricted to target-supported types. | 0126 §34. Atomic | - | EPIC(E11.1) |
-| REQ-CONC-052 | concurrency | v1-full | The atomic concurrency model MUST support `Relaxed`, `Acquire`, `Release`, `AcqRel`, and `SeqCst` memory orderings for atomic operations. | 0126 §36. Memory orderings | - | EPIC(E11.1) |
-| REQ-CONC-053 | concurrency | v1-full | A `Relaxed` atomic operation MUST guarantee atomicity of the operation but MUST NOT enforce ordering constraints on surrounding ordinary memory accesses. | 0126 §37. Relaxed | - | EPIC(E11.1) |
-| REQ-CONC-054 | concurrency | v1-full | An `Acquire` load MUST guarantee visibility of writes published by a compatible `Release` operation on the same atomic location. | 0126 §38. Acquire | - | EPIC(E11.1) |
-| REQ-CONC-055 | concurrency | v1-full | A `Release` store or read-modify-write operation MUST make prior memory operations visible to subsequent acquiring execution contexts. | 0126 §39. Release | - | EPIC(E11.1) |
-| REQ-CONC-056 | concurrency | v1-full | An `AcqRel` ordering on a read-modify-write operation MUST combine Acquire ordering on the read with Release ordering on the write. | 0126 §40. AcqRel | - | EPIC(E11.1) |
-| REQ-CONC-057 | concurrency | v1-full | The compiler MUST NOT weaken `SeqCst` memory ordering during optimization or code generation. | 0126 §41. SeqCst | - | EPIC(E11.1) |
-| REQ-CONC-058 | concurrency | v1-full | The failure memory ordering in a compare-and-swap operation MUST NOT be stronger than permitted by atomic memory model rules. | 0126 §42. Failure ordering | - | EPIC(E11.1) |
-| REQ-CONC-059 | concurrency | v1-full | The compiler and runtime MUST distinguish `Atomic` concurrency operations from volatile observable hardware memory accesses. | 0126 §43. Atomic ≠ volatile | - | EPIC(E11.1) |
-| REQ-CONC-060 | concurrency | v1-full | Volatile memory accesses MUST NOT be assumed or treated as creating inter-thread synchronization. | 0126 §43. Atomic ≠ volatile | - | EPIC(E11.1) |
-| REQ-CONC-061 | concurrency | v1-full | `Atomic<T>` MUST NOT guarantee lock-free execution across all targets, permitting internal lock implementations when native hardware atomics are unavailable. | 0126 §44. Atomic ≠ lock-free | - | EPIC(E11.1) |
-| REQ-CONC-062 | concurrency | v1-full | A memory location MUST NOT be accessed concurrently through both ordinary mutable access and atomic access in a manner that creates a data race. | 0126 §45. Ordinary memory và Atomic memory | - | EPIC(E11.1) |
-|REQ-CONC-063|concurrency|v1-full|The compiler MUST NOT allow creating an ordinary mut_view<T> directly from an `Atomic<T>` to bypass atomic semantics.|0126 §45. Ordinary memory và Atomic memory|-|EPIC(E11.1)|
-| REQ-CONC-064 | concurrency | v1-full | `Atomic<T>` MUST NOT implicitly convert to mut_view<T>, requiring all operations to use explicit atomic APIs. | 0126 §46. Atomic view | - | EPIC(E11.1) |
-|REQ-CONC-065|concurrency|v1-full|Safe Axiom programs MUST NOT produce data races, and the compiler or safe abstractions MUST reject unsynchronized concurrent writes to overlapping memory.|0126 §47. Data race|-|EPIC(E11.1)|
-| REQ-CONC-066 | concurrency | v1-full | Concurrent accesses to distinct fields of an aggregate MUST be permitted when proven by the compiler or capability model to access disjoint memory regions. | 0126 §48. Race với disjoint fields | - | EPIC(E11.1) |
-| REQ-CONC-067 | concurrency | v1-full | Concurrent writes to the same memory field across execution contexts MUST be rejected unless valid synchronization is established. | 0126 §49. Race với same field | - | EPIC(E11.1) |
-|REQ-CONC-068|concurrency|v1-full|Multiple execution contexts MUST be permitted to concurrently read an immutable region via view<T> if T: Share.|0126 §50. Shared immutable data|-|EPIC(E11.1)|
-|REQ-CONC-069|concurrency|v1-full|The language MUST NOT provide implicit shared mutable references, requiring synchronization primitives such as `Mutex`, `RwLock`, or `Atomic` for concurrent mutation.|0126 §51. Shared mutable data|-|EPIC(E11.1)|
-| REQ-CONC-070 | concurrency | v1-full | `Arc<T>` MUST only provide shared ownership and MUST NOT implicitly permit concurrent mutation without synchronization. | 0126 §52. `Arc<T>` không đủ | - | EPIC(E11.1) |
-| REQ-CONC-071 | concurrency | v1-full | Concurrent shared mutable access MUST compose separate abstractions for shared ownership and synchronization rather than conflating them into a single mechanism. | 0126 §53. `Arc<Mutex<T>>` | - | EPIC(E11.1) |
+| REQ-CONC-046 | concurrency | v1-full | `RwLock<T>` MUST grant either concurrent shared read access via view<T> or single exclusive write access via mut_view<T>, preventing reader-writer and writer-writer conflicts. | 0126 §28. RwLock | - | T411 |
+| REQ-CONC-047 | concurrency | v1-full | Synchronization lock guards (including `MutexGuard`, `RwLockReadGuard`, and `RwLockWriteGuard`) MUST NOT implement `Copy`. | 0126 §29. Lock guards không Copy | - | T411 |
+|REQ-CONC-048|concurrency|v1-full|The compiler MUST reject holding synchronous lock guards across suspension points (`.await`).|0126 §30. Lock guard không được cross await|-|T417|
+| REQ-CONC-049 | concurrency | v1-full | Asynchronous lock guards yielded by `AsyncMutex<T>` MUST strictly obey ownership, capability, and cancellation semantics. | 0126 §32. AsyncMutex | - | T421 |
+|REQ-CONC-050|concurrency|v1-full|Synchronization contracts MUST be established at the type or abstraction boundary rather than treated merely as properties of isolated operations.|0126 §33. Synchronization là type property|-|T400|
+| REQ-CONC-051 | concurrency | v1-full | `Atomic<T>` MUST be a type-level memory abstraction restricted to target-supported types. | 0126 §34. Atomic | - | T406 |
+| REQ-CONC-052 | concurrency | v1-full | The atomic concurrency model MUST support `Relaxed`, `Acquire`, `Release`, `AcqRel`, and `SeqCst` memory orderings for atomic operations. | 0126 §36. Memory orderings | - | T406 |
+| REQ-CONC-053 | concurrency | v1-full | A `Relaxed` atomic operation MUST guarantee atomicity of the operation but MUST NOT enforce ordering constraints on surrounding ordinary memory accesses. | 0126 §37. Relaxed | - | T406 |
+| REQ-CONC-054 | concurrency | v1-full | An `Acquire` load MUST guarantee visibility of writes published by a compatible `Release` operation on the same atomic location. | 0126 §38. Acquire | - | T408 |
+| REQ-CONC-055 | concurrency | v1-full | A `Release` store or read-modify-write operation MUST make prior memory operations visible to subsequent acquiring execution contexts. | 0126 §39. Release | - | T400 |
+| REQ-CONC-056 | concurrency | v1-full | An `AcqRel` ordering on a read-modify-write operation MUST combine Acquire ordering on the read with Release ordering on the write. | 0126 §40. AcqRel | - | T406 |
+| REQ-CONC-057 | concurrency | v1-full | The compiler MUST NOT weaken `SeqCst` memory ordering during optimization or code generation. | 0126 §41. SeqCst | - | T406 |
+| REQ-CONC-058 | concurrency | v1-full | The failure memory ordering in a compare-and-swap operation MUST NOT be stronger than permitted by atomic memory model rules. | 0126 §42. Failure ordering | - | T406 |
+| REQ-CONC-059 | concurrency | v1-full | The compiler and runtime MUST distinguish `Atomic` concurrency operations from volatile observable hardware memory accesses. | 0126 §43. Atomic ≠ volatile | - | T405 |
+| REQ-CONC-060 | concurrency | v1-full | Volatile memory accesses MUST NOT be assumed or treated as creating inter-thread synchronization. | 0126 §43. Atomic ≠ volatile | - | T405 |
+| REQ-CONC-061 | concurrency | v1-full | `Atomic<T>` MUST NOT guarantee lock-free execution across all targets, permitting internal lock implementations when native hardware atomics are unavailable. | 0126 §44. Atomic ≠ lock-free | - | T406 |
+| REQ-CONC-062 | concurrency | v1-full | A memory location MUST NOT be accessed concurrently through both ordinary mutable access and atomic access in a manner that creates a data race. | 0126 §45. Ordinary memory và Atomic memory | - | T406 |
+|REQ-CONC-063|concurrency|v1-full|The compiler MUST NOT allow creating an ordinary mut_view<T> directly from an `Atomic<T>` to bypass atomic semantics.|0126 §45. Ordinary memory và Atomic memory|-|T406|
+| REQ-CONC-064 | concurrency | v1-full | `Atomic<T>` MUST NOT implicitly convert to mut_view<T>, requiring all operations to use explicit atomic APIs. | 0126 §46. Atomic view | - | T406 |
+|REQ-CONC-065|concurrency|v1-full|Safe Axiom programs MUST NOT produce data races, and the compiler or safe abstractions MUST reject unsynchronized concurrent writes to overlapping memory.|0126 §47. Data race|-|T402|
+| REQ-CONC-066 | concurrency | v1-full | Concurrent accesses to distinct fields of an aggregate MUST be permitted when proven by the compiler or capability model to access disjoint memory regions. | 0126 §48. Race với disjoint fields | - | T402 |
+| REQ-CONC-067 | concurrency | v1-full | Concurrent writes to the same memory field across execution contexts MUST be rejected unless valid synchronization is established. | 0126 §49. Race với same field | - | T400 |
+|REQ-CONC-068|concurrency|v1-full|Multiple execution contexts MUST be permitted to concurrently read an immutable region via view<T> if T: Share.|0126 §50. Shared immutable data|-|T400|
+|REQ-CONC-069|concurrency|v1-full|The language MUST NOT provide implicit shared mutable references, requiring synchronization primitives such as `Mutex`, `RwLock`, or `Atomic` for concurrent mutation.|0126 §51. Shared mutable data|-|T406|
+| REQ-CONC-070 | concurrency | v1-full | `Arc<T>` MUST only provide shared ownership and MUST NOT implicitly permit concurrent mutation without synchronization. | 0126 §52. `Arc<T>` không đủ | - | T411 |
+| REQ-CONC-071 | concurrency | v1-full | Concurrent shared mutable access MUST compose separate abstractions for shared ownership and synchronization rather than conflating them into a single mechanism. | 0126 §53. `Arc<Mutex<T>>` | - | T411 |
 | REQ-CAP-048 | capability | v1-full | A capability MUST NOT be treated as `Send` by default and MUST NOT cross execution context boundaries unless its underlying storage, provenance, region, and lifetime allow it. | 0126 §54. Send/Share và capabilities | - | EPIC(E13.1) |
 | REQ-CAP-049 | capability | v1-full | The compiler MUST reject any capability view that escapes the lifetime of its underlying owner. | 0126 §55. Không cho view escape owner | - | EPIC(E13.1) |
 | REQ-CAP-050 | capability | v1-full | Passing a view<T> to another execution context MUST be rejected unless the view, its underlying storage, and execution contract satisfy both Send and Share semantics. | 0126 §56. Cross-thread view | - | EPIC(E13.1) |
 | REQ-CAP-051 | capability | v1-full | The compiler MUST NOT permit parent and child execution contexts to simultaneously hold active mut_view capabilities for the same storage. | 0126 §57. `mut_view` cross-thread | - | EPIC(E13.1) |
-|REQ-CONC-072|concurrency|v1-full|A `Send` operation transferring value across execution contexts MUST be a Move that permanently revokes access from the sender and establishes exclusive ownership in the receiver.|0126 §58. Send là ownership transfer|-|EPIC(E11.1)|
-|REQ-CONC-073|concurrency|v1-full|The Share property MUST permit creating concurrent read view<T> capabilities across execution contexts without permitting concurrent mutation.|0126 §59. Share là concurrent capability|-|EPIC(E11.1)|
-|REQ-CONC-074|concurrency|v1-full|Synchronization primitives MUST establish explicit happens-before relationships between execution contexts.|0126 §60. Happens-before|-|EPIC(E11.1)|
+|REQ-CONC-072|concurrency|v1-full|A `Send` operation transferring value across execution contexts MUST be a Move that permanently revokes access from the sender and establishes exclusive ownership in the receiver.|0126 §58. Send là ownership transfer|-|T401|
+|REQ-CONC-073|concurrency|v1-full|The Share property MUST permit creating concurrent read view<T> capabilities across execution contexts without permitting concurrent mutation.|0126 §59. Share là concurrent capability|-|T400|
+|REQ-CONC-074|concurrency|v1-full|Synchronization primitives MUST establish explicit happens-before relationships between execution contexts.|0126 §60. Happens-before|-|T403|
 |REQ-CORE-031|compiler|v1-full|The compiler optimizer MAY reorder ordinary memory operations but MUST preserve observable single-thread semantics, atomic orderings, synchronization happens-before relations, volatile semantics, and FFI contracts.|0126 §61. Compiler optimization|-|EPIC(E18.1)|
-| REQ-CONC-075 | concurrency | v1-full | The compiler backend MUST preserve explicit atomic fence semantics according to the specified memory ordering. | 0126 §62. Atomic fence | - | EPIC(E11.1) |
-| REQ-CONC-076 | concurrency | v1-full | The core language compiler MUST NOT attempt implicit ABA mitigation, delegating pointer reuse safety to library or system-layer abstractions. | 0126 §63. ABA | - | EPIC(E11.1) |
-| REQ-CONC-077 | concurrency | v1-full | Atomic pointer operations MUST NOT be assumed to guarantee safe memory reclamation. | 0126 §64. Memory reclamation | - | EPIC(E11.1) |
-| REQ-CONC-078 | concurrency | v1-full | An `Atomic<*mut T>` raw pointer MUST preserve raw pointer semantics and MUST NOT be assumed to be safe, owned, valid, or dereferenceable. | 0126 §65. Atomic pointer | - | EPIC(E11.1) |
-| REQ-CONC-079 | concurrency | v1-full | Lock-free data structures using unsafe atomic techniques MUST encapsulate their invariants within safe abstractions before exposing them to safe code. | 0126 §66. Unsafe lock-free structures | - | EPIC(E11.1) |
-| REQ-CONC-080 | concurrency | v1-full | Thread cancellation in Axiom Core MUST be cooperative, and the core runtime MUST NOT provide safe asynchronous thread killing. | 0126 §67. Cancellation | - | EPIC(E11.1) |
-|REQ-ASY-017|async|v1-full|Dropping a suspended Future MUST release internal Future state and owned values, but MUST NOT imply cancellation of external operations initiated by the Future.|0126 §68. Future cancellation|-|EPIC(E11.1)|
-| REQ-ASY-018 | async | v1-full | Dropping a Future MUST deterministically clean up all owned resources and internal state within the Future. | 0126 §69. Cancellation và Drop | - | EPIC(E11.1) |
-| REQ-CONC-081 | concurrency | v1-full | A panic in a child thread MUST NOT implicitly unwind the parent thread directly, communicating failure through the JoinHandle unless configured for `panic=abort`. | 0126 §70. Panic trong thread | - | EPIC(E11.1) |
-| REQ-ASY-019 | async | v1-full | An executor MUST capture a panicked async task state and expose it as an explicit task failure representation upon joining or awaiting. | 0126 §71. Panic trong task | - | EPIC(E11.1) |
-| REQ-CONC-082 | concurrency | v1-full | The runtime and standard library MUST NOT conflate panic semantics with cancellation semantics, treating them as separate operational states. | 0126 §72. Panic ≠ cancellation | - | EPIC(E11.1) |
-| REQ-CONC-083 | concurrency | v1-full | The core language compiler MUST NOT be required to detect all dynamic deadlocks or enforce static lock acquisition hierarchies in user code. | 0126 §73. Deadlock | - | EPIC(E11.1) |
-| REQ-CONC-084 | concurrency | v1-full | Safe Axiom code MUST NOT create data races (ACONC-20). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-085 | concurrency | v1-full | The `Send` property MUST permit ownership transfer across execution contexts (ACONC-21). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-086 | concurrency | v1-full | The `Share` property MUST permit safe concurrent read sharing when its contract is satisfied (ACONC-22). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-087 | concurrency | v1-full | The compiler MUST treat `Send` and `Share` as independent properties (ACONC-23). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-088 | concurrency | v1-full | Cross-context ownership transfer MUST be a Move operation (ACONC-24). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-089 | concurrency | v1-full | Concurrent access to values or capabilities MUST require valid synchronization or immutable sharing (ACONC-25). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-090 | concurrency | v1-full | Synchronization operations MUST establish explicit happens-before relations (ACONC-26). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-091 | concurrency | v1-full | Atomic ordering MUST be preserved by compiler optimization passes (ACONC-27). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-092 | concurrency | v1-full | Atomic access MUST NOT be bypassed through ordinary mutable capabilities (ACONC-28). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-093 | concurrency | v1-full | Synchronous lock guards MUST NOT cross suspension points (ACONC-29). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-094 | concurrency | v1-full | Synchronization MUST be defined as a property of types and abstractions (ACONC-30). | 0126 §75. Thread safety invariant | - | EPIC(E11.1) |
-| REQ-CONC-095 | concurrency | v1-full | The language MUST NOT introduce separate concurrency pointer types such as `ThreadRef` or `SharedRef`, relying on unified ownership and capability semantics. | 0126 §79. Không tạo concurrency pointer type | - | EPIC(E11.1) |
-| REQ-CONC-096 | concurrency | v1-full | The compiler and runtime MUST NOT define separate ownership systems for threads, async tasks, and GPU invocations, maintaining a single unified ownership model. | 0126 §80. Kiến trúc cuối cùng | - | EPIC(E11.1) |
-| REQ-CONC-097 | concurrency | v1-full | The language architecture MUST keep distinct the foundational concepts of Send and Share, Move and Copy, Ownership and Capability, Capability and Synchronization, Atomic and Volatile, Thread and Task, Panic and Cancellation, Arc and Mutex, and Mutex and Atomic. | 0126 §81. Freeze Part V | - | EPIC(E11.1) |
-| REQ-ASY-020 | async | v1-full | An `async fn` must construct an uncompleted computation represented by a Future that yields Pending or Ready(T) upon polling rather than executing synchronously to completion. | 0127 §2. `async fn` | - | EPIC(E11.1) |
-| REQ-ASY-021 | async | v1-full | The compiler must support storing Futures in registers, the stack, inline structs, caller-provided storage, arenas, or the heap without mandating heap allocation. | 0127 §4. Future không bắt buộc heap | - | EPIC(E11.1) |
-| REQ-ASY-022 | async | v1-full | The compiler is permitted to lower an async function lacking suspension points into an ordinary synchronous function only when the async abstraction is not observable. | 0127 §5. Future không bắt buộc runtime | - | EPIC(E11.1) |
-| REQ-ASY-023 | async | v1-full | The compiler must not alter an observable public API type contract even if the implementation requires no suspension, maintaining the async computation contract. | 0127 §6. Nhưng semantic type vẫn phải nhất quán | - | EPIC(E11.1) |
-|REQ-ASY-024|async|v1-full|The compiler must drop variables whose live ranges end prior to an `.await` suspension point before suspension and exclude them from the Future state .|0127 §9. Chỉ lưu state cần thiết|-|EPIC(E11.1)|
-|REQ-ASY-025|async|v1-full|The compiler must perform live-across-await analysis combining liveness, ownership, and drop analysis so that only values live across suspension become fields of the Future state .|0127 §10. Live-across-await analysis|-|EPIC(E11.1)|
-| REQ-ASY-026 | async | v1-full | Owned values may cross `.await` suspension points via compiler-managed internal ownership transfer into the Future state and back to local ownership upon resumption. | 0127 §12. Owned values qua await | - | EPIC(E11.1) |
-| REQ-ASY-027 | async | v1-full | The compiler must infer all Future and async lifetime dependencies automatically without requiring explicit lifetime syntax on Futures or async functions. | 0127 §13. Không có lifetime syntax | - | EPIC(E11.1) |
-| REQ-ASY-028 | async | v1-full | The compiler must reject any program where a `view<T>` capability crosses an `.await` suspension boundary in v0.1. | 0127 §14. `view<T>` qua await | - | EPIC(E11.1) |
-| REQ-ASY-029 | async | v1-full | The compiler must reject any program where a `mut_view<T>` capability crosses an `.await` suspension boundary in v0.1. | 0127 §15. `mut_view<T>` qua await | - | EPIC(E11.1) |
-| REQ-ASY-030 | async | v1-full | Capabilities including `view<T>` and `mut_view<T>` may be re-borrowed after an `.await` boundary, but their lifetimes are strictly confined to the immediate synchronous execution region. | 0127 §17. Có thể tạo view lại sau await | - | EPIC(E11.1) |
-| REQ-ASY-031 | async | v1-full | The compiler must prevent Future state machines from persisting mutable capabilities referencing state-owned data across suspension points. | 0127 §18. `mut_view` và Future state | - | EPIC(E11.1) |
-| REQ-ASY-032 | async | v1-full | The `.await` expression must act as a semantic suspension boundary where drop, ownership, capability expiration, panic, cancellation, and Send constraints are validated before state machine lowering. | 0127 §19. Await là suspension boundary | - | EPIC(E11.1) |
-| REQ-ASY-033 | async | v1-full | Local resources whose lexical scope closes before an `.await` point must be dropped before suspension rather than held until function exit. | 0127 §20. Cleanup trước suspension | - | EPIC(E11.1) |
-| REQ-ASY-034 | async | v1-full | Dropping a Future while Pending must deterministically drop all owned values held within the Future state without triggering a panic or terminating the OS thread. | 0127 §21. Cancellation | - | EPIC(E11.1) |
-| REQ-ASY-035 | async | v1-full | Dropping a Future does not imply automatic cancellation of external OS or network operations, requiring explicit cooperative cancellation mechanisms. | 0127 §23. External operation | - | EPIC(E11.1) |
-| REQ-ASY-036 | async | v1-full | The language core must not require a specific executor or large runtime, allowing async execution in freestanding and embedded environments. | 0127 §25. Executor | - | EPIC(E11.1) |
-| REQ-ASY-037 | async | v1-full | Future wake notifications must operate through library or runtime Waker abstractions without implicitly spawning OS threads. | 0127 §27. Waker | - | EPIC(E11.1) |
-| REQ-ASY-038 | async | v1-full | The `.await` expression must not spawn a new task or execution context, performing only in-place polling and suspension. | 0127 §29. `await` không spawn | - | EPIC(E11.1) |
-| REQ-ASY-039 | async | v1-full | Creating a concurrent task execution context must be performed explicitly via `spawn` primitives rather than implicitly via `.await`. | 0127 §30. `spawn` mới tạo concurrent execution | - | EPIC(E11.1) |
-|REQ-ASY-040|async|v1-full|A Future passed to `spawn` in a multi-threaded executor must satisfy the `Send` contract together with all values live across its suspension points .|0127 §32. `spawn`|-|EPIC(E11.1)|
-| REQ-ASY-041 | async | v1-full | A Future passed to `spawn_local` on a same-thread executor must not be required to satisfy the `Send` contract. | 0127 §33. `spawn_local` | - | EPIC(E11.1) |
-| REQ-ASY-042 | async | v1-full | The compiler must determine Future `Send` qualification strictly from the live-across-await set, never disqualifying a Future due to non-Send types that were dropped prior to suspension. | 0127 §35. Đây là một optimization nhưng cũng là semantic analysis | - | EPIC(E11.1) |
-| REQ-ASY-043 | async | v1-full | Polling a Future requires exclusive access (`&mut Future`), and concurrent polling of the same Future across threads without synchronization is prohibited as Futures do not implicitly implement `Share`. | 0127 §37. Poll độc quyền | - | EPIC(E11.1) |
-| REQ-ASY-044 | async | v1-full | Direct async recursive functions must be rejected at compile time unless wrapped in an explicit finite dynamic indirection such as heap allocation. | 0127 §38. Async recursion | - | EPIC(E11.1) |
-|REQ-ASY-045|async|v1-full|The compiler toolchain should provide inspection commands to report Future memory layout and state sizes .|0127 §39. Async state size|-|EPIC(E11.1)|
-| REQ-ASY-046 | async | v1-full | Futures that do not escape their local scope must be eligible for stack allocation and complete heap allocation elimination. | 0127 §40. Heap allocation optimization | - | EPIC(E11.1) |
-| REQ-ASY-047 | async | v1-full | Compiler-generated state machines must ensure relocation safety through layout design or storage strategies without requiring `Pin` primitives in language core v0.1. | 0127 §42. Self-referential Future | - | EPIC(E11.1) |
-|REQ-ASY-048|async|v1-full|Traits may declare `async fn` methods, which the compiler must lower to associated Future semantics and monomorphize for static dispatch .|0127 §44. Async trait|-|EPIC(E11.1)|
-|REQ-ASY-049|async|v1-full|Dynamic async dispatch on `dyn Trait` must use a dynamic Future representation and must not be assumed to achieve zero heap allocation .|0127 §46. Dynamic async dispatch|-|EPIC(E11.1)|
-| REQ-ASY-050 | async | v1-full | The `?` operator within an async function must lower to standard branching over `Poll` variants without invoking an exception runtime. | 0127 §48. Async error handling | - | EPIC(E11.1) |
-|REQ-ASY-051|async|v1-full|Panics within an async computation must be handled according to runtime profile and executor policy, triggering process termination when `panic=abort` is configured .|0127 §49. Panic trong async|-|EPIC(E11.1)|
-| REQ-ASY-052 | async | v1-full | Upon Future completion or cancellation, all remaining owned fields within the Future state must be dropped in deterministic order according to standard ownership rules. | 0127 §50. Drop order trong Future | - | EPIC(E11.1) |
-| REQ-ASY-053 | async | v1-full | The compiler must prohibit synchronous `MutexGuard` values from crossing `.await` boundaries, while permitting `Mutex` instances to reside in Future state if guards are dropped before suspension. | 0127 §51. Async + lock | - | EPIC(E11.1) |
-| REQ-ASY-054 | async | v1-full | Holding a lock across an `.await` boundary requires an async-aware synchronization primitive and must not use synchronous blocking primitives. | 0127 §52. Async mutex | - | EPIC(E11.1) |
-|REQ-ASY-055|async|v1-full|Tooling should provide diagnostics when blocking operations are invoked inside an async context .|0127 §53. Blocking trong async|-|EPIC(E11.1)|
-| REQ-ASY-056 | async | v1-full | The core async semantic model must rely solely on `Future<T>` and compiler-known lowering without creating auxiliary effect wrapper types. | 0127 §54. Async effect không phải type pollution | - | EPIC(E11.1) |
-|REQ-ASY-057|async|v1-full|Async functions must be lowered into explicit state-machine MIR before ownership verification and Verified MIR emission .|0127 §55. MIR lowering|-|EPIC(E11.1)|
-| REQ-ASY-058 | async | v1-full | State machine lowering must guarantee that transitions preserve ownership, suspension preserves live values, resume restores local state, cancellation prevents double-drops, and await cannot resurrect moved values. | 0127 §56. State-machine invariants | - | EPIC(E11.1) |
-|REQ-ASY-059|async|v1-full|The semantic test oracle must support observable async lifecycle trace events including SUSPEND, RESUME, POLL, WAKE, TASK_CREATE, and TASK_DROP .|0127 §57. Oracle|-|EPIC(E11.1)|
-|REQ-ASY-060|async|v1-full|The semantic test oracle must provide a deterministic single-threaded executor to verify async poll order, wake order, cancellation, and drop behavior independently of wall-clock timing .|0127 §58. Deterministic async testing|-|EPIC(E11.1)|
-|REQ-ASY-061|async|v1-full|Concurrency sanitizers and testing tooling may inject scheduling yield points around atomic operations and locks to detect race conditions without altering language semantics .|0127 §59. Race testing|-|EPIC(E11.1)|
-| REQ-ASY-062 | async | v1-full | The compiler is permitted to optimize Futures by state merging, inlining, scalarization, stack allocation, and await fusion provided observable ordering, side effects, cleanups, panics, atomics, and FFI contracts are preserved. | 0127 §60. Async optimization | - | EPIC(E11.1) |
-| REQ-ASY-063 | async | v1-full | The compiler may eliminate runtime state fields for local variables if their values can be directly encoded within state machine transitions. | 0127 §61. State elimination | - | EPIC(E11.1) |
-| REQ-ASY-064 | async | v1-full | Rule AASYNC-20: `async` must be a control-flow abstraction rather than an OS thread or runtime model. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-065 | async | v1-full | Rule AASYNC-21: `await` must serve as a suspension and resumption boundary without creating a new execution context. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-066 | async | v1-full | Rule AASYNC-22: A Future must not inherently require heap allocation. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-067 | async | v1-full | Rule AASYNC-23: A Future must not inherently require an executor. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-068 | async | v1-full | Rule AASYNC-24: An executor must be treated as a library or runtime abstraction rather than a language primitive. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-069 | async | v1-full | Rule AASYNC-25: Only values live across suspension points shall become Future state. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-070 | async | v1-full | Rule AASYNC-26: Owned values may cross suspension boundaries via internal ownership transfer into Future state. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-071 | async | v1-full | Rule AASYNC-27: The compiler must reject any `view<T>` capability crossing `.await` in v0.1. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-072 | async | v1-full | Rule AASYNC-28: The compiler must reject any `mut_view<T>` capability crossing `.await` in v0.1. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-073 | async | v1-full | Rule AASYNC-29: Future cancellation must deterministically drop all owned Future state. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-074 | async | v1-full | Rule AASYNC-30: Dropping a Future does not imply cancellation of external operations. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-|REQ-ASY-075|async|v1-full|Rule AASYNC-31: A Future passed to `spawn` may require `Send` conformance depending on the multi-threaded execution model .|0127 §64. Core async invariants|-|EPIC(E11.1)|
-| REQ-ASY-076 | async | v1-full | Rule AASYNC-32: A Future passed to `spawn_local` must not require cross-thread `Send`. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-077 | async | v1-full | Rule AASYNC-33: A Future must not implicitly implement `Share`. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-078 | async | v1-full | Rule AASYNC-34: Async recursion must require a finite runtime representation. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-079 | async | v1-full | Rule AASYNC-35: Async state lowering must preserve language ownership semantics across all state transitions. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-080 | async | v1-full | Rule AASYNC-36: Async lowering must preserve deterministic Drop semantics for all state fields. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-081 | async | v1-full | Rule AASYNC-37: Async lowering must preserve panic semantics according to the active runtime profile. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-082 | async | v1-full | Rule AASYNC-38: Async lowering must preserve synchronization semantics across suspension boundaries. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-| REQ-ASY-083 | async | v1-full | Rule AASYNC-39: Async optimization must not alter observable suspension behavior where observable. | 0127 §64. Core async invariants | - | EPIC(E11.1) |
-|REQ-ASY-084|async|v1-full|Rule AASYNC-40: Dynamic async dispatch must be explicitly distinguishable from static async dispatch in representation and cost model .|0127 §64. Core async invariants|-|EPIC(E11.1)|
+| REQ-CONC-075 | concurrency | v1-full | The compiler backend MUST preserve explicit atomic fence semantics according to the specified memory ordering. | 0126 §62. Atomic fence | - | T407 |
+| REQ-CONC-076 | concurrency | v1-full | The core language compiler MUST NOT attempt implicit ABA mitigation, delegating pointer reuse safety to library or system-layer abstractions. | 0126 §63. ABA | - | T409 |
+| REQ-CONC-077 | concurrency | v1-full | Atomic pointer operations MUST NOT be assumed to guarantee safe memory reclamation. | 0126 §64. Memory reclamation | - | T409 |
+| REQ-CONC-078 | concurrency | v1-full | An `Atomic<*mut T>` raw pointer MUST preserve raw pointer semantics and MUST NOT be assumed to be safe, owned, valid, or dereferenceable. | 0126 §65. Atomic pointer | - | T409 |
+| REQ-CONC-079 | concurrency | v1-full | Lock-free data structures using unsafe atomic techniques MUST encapsulate their invariants within safe abstractions before exposing them to safe code. | 0126 §66. Unsafe lock-free structures | - | T409 |
+| REQ-CONC-080 | concurrency | v1-full | Thread cancellation in Axiom Core MUST be cooperative, and the core runtime MUST NOT provide safe asynchronous thread killing. | 0126 §67. Cancellation | - | T410 |
+|REQ-ASY-017|async|v1-full|Dropping a suspended Future MUST release internal Future state and owned values, but MUST NOT imply cancellation of external operations initiated by the Future.|0126 §68. Future cancellation|-|T418|
+| REQ-ASY-018 | async | v1-full | Dropping a Future MUST deterministically clean up all owned resources and internal state within the Future. | 0126 §69. Cancellation và Drop | - | T418 |
+| REQ-CONC-081 | concurrency | v1-full | A panic in a child thread MUST NOT implicitly unwind the parent thread directly, communicating failure through the JoinHandle unless configured for `panic=abort`. | 0126 §70. Panic trong thread | - | T414 |
+| REQ-ASY-019 | async | v1-full | An executor MUST capture a panicked async task state and expose it as an explicit task failure representation upon joining or awaiting. | 0126 §71. Panic trong task | - | T422 |
+| REQ-CONC-082 | concurrency | v1-full | The runtime and standard library MUST NOT conflate panic semantics with cancellation semantics, treating them as separate operational states. | 0126 §72. Panic ≠ cancellation | - | T400 |
+| REQ-CONC-083 | concurrency | v1-full | The core language compiler MUST NOT be required to detect all dynamic deadlocks or enforce static lock acquisition hierarchies in user code. | 0126 §73. Deadlock | - | T400 |
+| REQ-CONC-084 | concurrency | v1-full | Safe Axiom code MUST NOT create data races (ACONC-20). | 0126 §75. Thread safety invariant | - | T402 |
+| REQ-CONC-085 | concurrency | v1-full | The `Send` property MUST permit ownership transfer across execution contexts (ACONC-21). | 0126 §75. Thread safety invariant | - | T404 |
+| REQ-CONC-086 | concurrency | v1-full | The `Share` property MUST permit safe concurrent read sharing when its contract is satisfied (ACONC-22). | 0126 §75. Thread safety invariant | - | T404 |
+| REQ-CONC-087 | concurrency | v1-full | The compiler MUST treat `Send` and `Share` as independent properties (ACONC-23). | 0126 §75. Thread safety invariant | - | T404 |
+| REQ-CONC-088 | concurrency | v1-full | Cross-context ownership transfer MUST be a Move operation (ACONC-24). | 0126 §75. Thread safety invariant | - | T401 |
+| REQ-CONC-089 | concurrency | v1-full | Concurrent access to values or capabilities MUST require valid synchronization or immutable sharing (ACONC-25). | 0126 §75. Thread safety invariant | - | T404 |
+| REQ-CONC-090 | concurrency | v1-full | Synchronization operations MUST establish explicit happens-before relations (ACONC-26). | 0126 §75. Thread safety invariant | - | T403 |
+| REQ-CONC-091 | concurrency | v1-full | Atomic ordering MUST be preserved by compiler optimization passes (ACONC-27). | 0126 §75. Thread safety invariant | - | T406 |
+| REQ-CONC-092 | concurrency | v1-full | Atomic access MUST NOT be bypassed through ordinary mutable capabilities (ACONC-28). | 0126 §75. Thread safety invariant | - | T406 |
+| REQ-CONC-093 | concurrency | v1-full | Synchronous lock guards MUST NOT cross suspension points (ACONC-29). | 0126 §75. Thread safety invariant | - | T417 |
+| REQ-CONC-094 | concurrency | v1-full | Synchronization MUST be defined as a property of types and abstractions (ACONC-30). | 0126 §75. Thread safety invariant | - | T404 |
+| REQ-CONC-095 | concurrency | v1-full | The language MUST NOT introduce separate concurrency pointer types such as `ThreadRef` or `SharedRef`, relying on unified ownership and capability semantics. | 0126 §79. Không tạo concurrency pointer type | - | T400 |
+| REQ-CONC-096 | concurrency | v1-full | The compiler and runtime MUST NOT define separate ownership systems for threads, async tasks, and GPU invocations, maintaining a single unified ownership model. | 0126 §80. Kiến trúc cuối cùng | - | T415 |
+| REQ-CONC-097 | concurrency | v1-full | The language architecture MUST keep distinct the foundational concepts of Send and Share, Move and Copy, Ownership and Capability, Capability and Synchronization, Atomic and Volatile, Thread and Task, Panic and Cancellation, Arc and Mutex, and Mutex and Atomic. | 0126 §81. Freeze Part V | - | T405 |
+| REQ-ASY-020 | async | v1-full | An `async fn` must construct an uncompleted computation represented by a Future that yields Pending or Ready(T) upon polling rather than executing synchronously to completion. | 0127 §2. `async fn` | - | T418 |
+| REQ-ASY-021 | async | v1-full | The compiler must support storing Futures in registers, the stack, inline structs, caller-provided storage, arenas, or the heap without mandating heap allocation. | 0127 §4. Future không bắt buộc heap | - | T418 |
+| REQ-ASY-022 | async | v1-full | The compiler is permitted to lower an async function lacking suspension points into an ordinary synchronous function only when the async abstraction is not observable. | 0127 §5. Future không bắt buộc runtime | - | T415 |
+| REQ-ASY-023 | async | v1-full | The compiler must not alter an observable public API type contract even if the implementation requires no suspension, maintaining the async computation contract. | 0127 §6. Nhưng semantic type vẫn phải nhất quán | - | T416 |
+|REQ-ASY-024|async|v1-full|The compiler must drop variables whose live ranges end prior to an `.await` suspension point before suspension and exclude them from the Future state .|0127 §9. Chỉ lưu state cần thiết|-|T415|
+|REQ-ASY-025|async|v1-full|The compiler must perform live-across-await analysis combining liveness, ownership, and drop analysis so that only values live across suspension become fields of the Future state .|0127 §10. Live-across-await analysis|-|T417|
+| REQ-ASY-026 | async | v1-full | Owned values may cross `.await` suspension points via compiler-managed internal ownership transfer into the Future state and back to local ownership upon resumption. | 0127 §12. Owned values qua await | - | T415 |
+| REQ-ASY-027 | async | v1-full | The compiler must infer all Future and async lifetime dependencies automatically without requiring explicit lifetime syntax on Futures or async functions. | 0127 §13. Không có lifetime syntax | - | T416 |
+| REQ-ASY-028 | async | v1-full | The compiler must reject any program where a `view<T>` capability crosses an `.await` suspension boundary in v0.1. | 0127 §14. `view<T>` qua await | - | T417 |
+| REQ-ASY-029 | async | v1-full | The compiler must reject any program where a `mut_view<T>` capability crosses an `.await` suspension boundary in v0.1. | 0127 §15. `mut_view<T>` qua await | - | T417 |
+| REQ-ASY-030 | async | v1-full | Capabilities including `view<T>` and `mut_view<T>` may be re-borrowed after an `.await` boundary, but their lifetimes are strictly confined to the immediate synchronous execution region. | 0127 §17. Có thể tạo view lại sau await | - | T417 |
+| REQ-ASY-031 | async | v1-full | The compiler must prevent Future state machines from persisting mutable capabilities referencing state-owned data across suspension points. | 0127 §18. `mut_view` và Future state | - | T417 |
+| REQ-ASY-032 | async | v1-full | The `.await` expression must act as a semantic suspension boundary where drop, ownership, capability expiration, panic, cancellation, and Send constraints are validated before state machine lowering. | 0127 §19. Await là suspension boundary | - | T418 |
+| REQ-ASY-033 | async | v1-full | Local resources whose lexical scope closes before an `.await` point must be dropped before suspension rather than held until function exit. | 0127 §20. Cleanup trước suspension | - | T415 |
+| REQ-ASY-034 | async | v1-full | Dropping a Future while Pending must deterministically drop all owned values held within the Future state without triggering a panic or terminating the OS thread. | 0127 §21. Cancellation | - | T418 |
+| REQ-ASY-035 | async | v1-full | Dropping a Future does not imply automatic cancellation of external OS or network operations, requiring explicit cooperative cancellation mechanisms. | 0127 §23. External operation | - | T425 |
+| REQ-ASY-036 | async | v1-full | The language core must not require a specific executor or large runtime, allowing async execution in freestanding and embedded environments. | 0127 §25. Executor | - | T420 |
+| REQ-ASY-037 | async | v1-full | Future wake notifications must operate through library or runtime Waker abstractions without implicitly spawning OS threads. | 0127 §27. Waker | - | T421 |
+| REQ-ASY-038 | async | v1-full | The `.await` expression must not spawn a new task or execution context, performing only in-place polling and suspension. | 0127 §29. `await` không spawn | - | T418 |
+| REQ-ASY-039 | async | v1-full | Creating a concurrent task execution context must be performed explicitly via `spawn` primitives rather than implicitly via `.await`. | 0127 §30. `spawn` mới tạo concurrent execution | - | T415 |
+|REQ-ASY-040|async|v1-full|A Future passed to `spawn` in a multi-threaded executor must satisfy the `Send` contract together with all values live across its suspension points .|0127 §32. `spawn`|-|T420|
+| REQ-ASY-041 | async | v1-full | A Future passed to `spawn_local` on a same-thread executor must not be required to satisfy the `Send` contract. | 0127 §33. `spawn_local` | - | T421 |
+| REQ-ASY-042 | async | v1-full | The compiler must determine Future `Send` qualification strictly from the live-across-await set, never disqualifying a Future due to non-Send types that were dropped prior to suspension. | 0127 §35. Đây là một optimization nhưng cũng là semantic analysis | - | T417 |
+| REQ-ASY-043 | async | v1-full | Polling a Future requires exclusive access (`&mut Future`), and concurrent polling of the same Future across threads without synchronization is prohibited as Futures do not implicitly implement `Share`. | 0127 §37. Poll độc quyền | - | T418 |
+| REQ-ASY-044 | async | v1-full | Direct async recursive functions must be rejected at compile time unless wrapped in an explicit finite dynamic indirection such as heap allocation. | 0127 §38. Async recursion | - | T416 |
+|REQ-ASY-045|async|v1-full|The compiler toolchain should provide inspection commands to report Future memory layout and state sizes .|0127 §39. Async state size|-|T415|
+| REQ-ASY-046 | async | v1-full | Futures that do not escape their local scope must be eligible for stack allocation and complete heap allocation elimination. | 0127 §40. Heap allocation optimization | - | T418 |
+| REQ-ASY-047 | async | v1-full | Compiler-generated state machines must ensure relocation safety through layout design or storage strategies without requiring `Pin` primitives in language core v0.1. | 0127 §42. Self-referential Future | - | T418 |
+|REQ-ASY-048|async|v1-full|Traits may declare `async fn` methods, which the compiler must lower to associated Future semantics and monomorphize for static dispatch .|0127 §44. Async trait|-|T416|
+|REQ-ASY-049|async|v1-full|Dynamic async dispatch on `dyn Trait` must use a dynamic Future representation and must not be assumed to achieve zero heap allocation .|0127 §46. Dynamic async dispatch|-|T416|
+| REQ-ASY-050 | async | v1-full | The `?` operator within an async function must lower to standard branching over `Poll` variants without invoking an exception runtime. | 0127 §48. Async error handling | - | T416 |
+|REQ-ASY-051|async|v1-full|Panics within an async computation must be handled according to runtime profile and executor policy, triggering process termination when `panic=abort` is configured .|0127 §49. Panic trong async|-|T420|
+| REQ-ASY-052 | async | v1-full | Upon Future completion or cancellation, all remaining owned fields within the Future state must be dropped in deterministic order according to standard ownership rules. | 0127 §50. Drop order trong Future | - | T418 |
+| REQ-ASY-053 | async | v1-full | The compiler must prohibit synchronous `MutexGuard` values from crossing `.await` boundaries, while permitting `Mutex` instances to reside in Future state if guards are dropped before suspension. | 0127 §51. Async + lock | - | T417 |
+| REQ-ASY-054 | async | v1-full | Holding a lock across an `.await` boundary requires an async-aware synchronization primitive and must not use synchronous blocking primitives. | 0127 §52. Async mutex | - | T421 |
+|REQ-ASY-055|async|v1-full|Tooling should provide diagnostics when blocking operations are invoked inside an async context .|0127 §53. Blocking trong async|-|T415|
+| REQ-ASY-056 | async | v1-full | The core async semantic model must rely solely on `Future<T>` and compiler-known lowering without creating auxiliary effect wrapper types. | 0127 §54. Async effect không phải type pollution | - | T418 |
+|REQ-ASY-057|async|v1-full|Async functions must be lowered into explicit state-machine MIR before ownership verification and Verified MIR emission .|0127 §55. MIR lowering|-|T418|
+| REQ-ASY-058 | async | v1-full | State machine lowering must guarantee that transitions preserve ownership, suspension preserves live values, resume restores local state, cancellation prevents double-drops, and await cannot resurrect moved values. | 0127 §56. State-machine invariants | - | T418 |
+|REQ-ASY-059|async|v1-full|The semantic test oracle must support observable async lifecycle trace events including SUSPEND, RESUME, POLL, WAKE, TASK_CREATE, and TASK_DROP .|0127 §57. Oracle|-|T418|
+|REQ-ASY-060|async|v1-full|The semantic test oracle must provide a deterministic single-threaded executor to verify async poll order, wake order, cancellation, and drop behavior independently of wall-clock timing .|0127 §58. Deterministic async testing|-|T420|
+|REQ-ASY-061|async|v1-full|Concurrency sanitizers and testing tooling may inject scheduling yield points around atomic operations and locks to detect race conditions without altering language semantics .|0127 §59. Race testing|-|T406|
+| REQ-ASY-062 | async | v1-full | The compiler is permitted to optimize Futures by state merging, inlining, scalarization, stack allocation, and await fusion provided observable ordering, side effects, cleanups, panics, atomics, and FFI contracts are preserved. | 0127 §60. Async optimization | - | T406 |
+| REQ-ASY-063 | async | v1-full | The compiler may eliminate runtime state fields for local variables if their values can be directly encoded within state machine transitions. | 0127 §61. State elimination | - | T418 |
+| REQ-ASY-064 | async | v1-full | Rule AASYNC-20: `async` must be a control-flow abstraction rather than an OS thread or runtime model. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-065 | async | v1-full | Rule AASYNC-21: `await` must serve as a suspension and resumption boundary without creating a new execution context. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-066 | async | v1-full | Rule AASYNC-22: A Future must not inherently require heap allocation. | 0127 §64. Core async invariants | - | T418 |
+| REQ-ASY-067 | async | v1-full | Rule AASYNC-23: A Future must not inherently require an executor. | 0127 §64. Core async invariants | - | T420 |
+| REQ-ASY-068 | async | v1-full | Rule AASYNC-24: An executor must be treated as a library or runtime abstraction rather than a language primitive. | 0127 §64. Core async invariants | - | T420 |
+| REQ-ASY-069 | async | v1-full | Rule AASYNC-25: Only values live across suspension points shall become Future state. | 0127 §64. Core async invariants | - | T417 |
+| REQ-ASY-070 | async | v1-full | Rule AASYNC-26: Owned values may cross suspension boundaries via internal ownership transfer into Future state. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-071 | async | v1-full | Rule AASYNC-27: The compiler must reject any `view<T>` capability crossing `.await` in v0.1. | 0127 §64. Core async invariants | - | T417 |
+| REQ-ASY-072 | async | v1-full | Rule AASYNC-28: The compiler must reject any `mut_view<T>` capability crossing `.await` in v0.1. | 0127 §64. Core async invariants | - | T417 |
+| REQ-ASY-073 | async | v1-full | Rule AASYNC-29: Future cancellation must deterministically drop all owned Future state. | 0127 §64. Core async invariants | - | T418 |
+| REQ-ASY-074 | async | v1-full | Rule AASYNC-30: Dropping a Future does not imply cancellation of external operations. | 0127 §64. Core async invariants | - | T418 |
+|REQ-ASY-075|async|v1-full|Rule AASYNC-31: A Future passed to `spawn` may require `Send` conformance depending on the multi-threaded execution model .|0127 §64. Core async invariants|-|T419|
+| REQ-ASY-076 | async | v1-full | Rule AASYNC-32: A Future passed to `spawn_local` must not require cross-thread `Send`. | 0127 §64. Core async invariants | - | T421 |
+| REQ-ASY-077 | async | v1-full | Rule AASYNC-33: A Future must not implicitly implement `Share`. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-078 | async | v1-full | Rule AASYNC-34: Async recursion must require a finite runtime representation. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-079 | async | v1-full | Rule AASYNC-35: Async state lowering must preserve language ownership semantics across all state transitions. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-080 | async | v1-full | Rule AASYNC-36: Async lowering must preserve deterministic Drop semantics for all state fields. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-081 | async | v1-full | Rule AASYNC-37: Async lowering must preserve panic semantics according to the active runtime profile. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-082 | async | v1-full | Rule AASYNC-38: Async lowering must preserve synchronization semantics across suspension boundaries. | 0127 §64. Core async invariants | - | T419 |
+| REQ-ASY-083 | async | v1-full | Rule AASYNC-39: Async optimization must not alter observable suspension behavior where observable. | 0127 §64. Core async invariants | - | T419 |
+|REQ-ASY-084|async|v1-full|Rule AASYNC-40: Dynamic async dispatch must be explicitly distinguishable from static async dispatch in representation and cost model .|0127 §64. Core async invariants|-|T416|
 | REQ-LAY-124 | memory-model | v1-core | The memory model must distinguish between ordinary memory access and atomic memory access, prohibiting arbitrary mixing of ordinary and atomic access modes on the same storage. | 0128 §1 | - | T113 | 
-| REQ-ATM-002 | atomics | v1-full | Atomicity must be a property of the underlying storage rather than of ordinary values subjected to atomic operations (AATOM-20). | 0128 §2, §66 | - | EPIC(E11.1) |
-| REQ-ATM-003 | atomics | v1-full | Atomic storage must not be accessed through ordinary mutable capabilities such as mut_view to bypass atomic semantics (AATOM-21). | 0128 §3, §66 | - | EPIC(E11.1) |
-| REQ-ATM-004 | atomics | v1-full | An atomic load operation must return an ordinary non-atomic value upon completion. | 0128 §5 | - | EPIC(E11.1) |
-| REQ-ATM-005 | atomics | v1-full | An atomic store operation must write a value atomically and establish release ordering constraints for preceding ordinary memory operations when specified. | 0128 §6 | - | EPIC(E11.1) |
-| REQ-ATM-006 | atomics | v1-full | Relaxed atomic operations must provide atomicity and object modification order without establishing synchronization with ordinary memory (AATOM-22). | 0128 §7, §66 | - | EPIC(E11.1) |
-| REQ-ATM-007 | atomics | v1-full | Acquire atomic operations must establish acquire ordering such that prior writes in a releasing thread are ordered before subsequent reads in the acquiring thread (AATOM-23). | 0128 §8, §66 | - | EPIC(E11.1) |
-| REQ-ATM-008 | atomics | v1-full | Release atomic operations must establish release ordering such that preceding writes are published and ordered before the release operation becomes visible (AATOM-24). | 0128 §9, §66 | - | EPIC(E11.1) |
-| REQ-ATM-009 | atomics | v1-full | The compiler must not automatically upgrade Relaxed atomic operations to Acquire or Release ordering. | 0128 §10 | - | EPIC(E11.1) |
-| REQ-ATM-010 | atomics | v1-full | AcqRel atomic operations must combine acquire and release semantics on read-modify-write operations to simultaneously synchronize with prior writes and publish subsequent modifications (AATOM-25). | 0128 §11, §66 | - | EPIC(E11.1) |
-| REQ-ATM-011 | atomics | v1-full | Sequentially consistent (SeqCst) atomic operations must provide the strongest atomic ordering and must not be weakened to Acquire, Release, or Relaxed by compiler optimizations (AATOM-26). | 0128 §12, §66 | - | EPIC(E11.1) |
-| REQ-ATM-012 | atomics | v1-full | Each atomic object must maintain a single, consistent total modification order across all atomic modifications performed upon it. | 0128 §13 | - | EPIC(E11.1) |
-| REQ-ATM-013 | atomics | v1-full | Atomic operations must be indivisible without partial atomic reads or writes, requiring runtime emulation if unsupported natively by the target architecture. | 0128 §14 | - | EPIC(E11.1) |
-| REQ-ATM-014 | atomics | v1-full | Atomic operations must not be assumed to be lock-free by default (AATOM-29). | 0128 §15, §16, §66 | - | EPIC(E11.1) |
-| REQ-ATM-015 | atomics | v1-full | Atomic operations must not be assumed to be wait-free by default (AATOM-30). | 0128 §15, §17, §66 | - | EPIC(E11.1) |
-| REQ-ATM-016 | atomics | v1-full | The standard library or compiler must provide a target-aware mechanism to query whether an atomic type or operation is lock-free on the target platform. | 0128 §18 | - | EPIC(E11.1) |
-| REQ-ATM-017 | atomics | v1-full | The language and runtime must support both strong compare-and-exchange and weak compare-and-exchange operations. | 0128 §19 | - | EPIC(E11.1) |
-| REQ-ATM-018 | atomics | v1-full | Strong compare-and-exchange (compare_exchange) must not fail spuriously when the current value matches the expected value. | 0128 §20 | - | EPIC(E11.1) |
-| REQ-ATM-019 | atomics | v1-full | Weak compare-and-exchange (compare_exchange_weak) is permitted to fail spuriously even when the current value matches the expected value. | 0128 §21 | - | EPIC(E11.1) |
-| REQ-ATM-020 | atomics | v1-full | The compiler must validate that failure memory ordering in compare-and-exchange operations does not specify Release or AcqRel semantics. | 0128 §22 | - | EPIC(E11.1) |
-| REQ-ATM-021 | atomics | v1-full | Primitive atomic read-modify-write operations (fetch_add, fetch_sub, fetch_and, fetch_or, fetch_xor, swap) must execute as a single atomic modification in the object's modification order. | 0128 §23 | - | EPIC(E11.1) |
-| REQ-ATM-022 | atomics | v1-full | Atomic read-modify-write integer operations must use wrapping two's-complement arithmetic based on the bit-width of the atomic integer type (AATOM-39). | 0128 §25, §66 | - | EPIC(E11.1) |
-| REQ-ATM-023 | atomics | v1-full | The memory model must support explicit memory fences parameterized by Acquire, Release, AcqRel, and SeqCst orderings. | 0128 §26 | - | EPIC(E11.1) |
-| REQ-ATM-024 | atomics | v1-full | Memory fences must establish execution ordering constraints without reading from or writing to memory. | 0128 §27, §28 | - | EPIC(E11.1) |
+| REQ-ATM-002 | atomics | v1-full | Atomicity must be a property of the underlying storage rather than of ordinary values subjected to atomic operations (AATOM-20). | 0128 §2, §66 | - | T405 |
+| REQ-ATM-003 | atomics | v1-full | Atomic storage must not be accessed through ordinary mutable capabilities such as mut_view to bypass atomic semantics (AATOM-21). | 0128 §3, §66 | - | T406 |
+| REQ-ATM-004 | atomics | v1-full | An atomic load operation must return an ordinary non-atomic value upon completion. | 0128 §5 | - | T406 |
+| REQ-ATM-005 | atomics | v1-full | An atomic store operation must write a value atomically and establish release ordering constraints for preceding ordinary memory operations when specified. | 0128 §6 | - | T406 |
+| REQ-ATM-006 | atomics | v1-full | Relaxed atomic operations must provide atomicity and object modification order without establishing synchronization with ordinary memory (AATOM-22). | 0128 §7, §66 | - | T408 |
+| REQ-ATM-007 | atomics | v1-full | Acquire atomic operations must establish acquire ordering such that prior writes in a releasing thread are ordered before subsequent reads in the acquiring thread (AATOM-23). | 0128 §8, §66 | - | T408 |
+| REQ-ATM-008 | atomics | v1-full | Release atomic operations must establish release ordering such that preceding writes are published and ordered before the release operation becomes visible (AATOM-24). | 0128 §9, §66 | - | T408 |
+| REQ-ATM-009 | atomics | v1-full | The compiler must not automatically upgrade Relaxed atomic operations to Acquire or Release ordering. | 0128 §10 | - | T406 |
+| REQ-ATM-010 | atomics | v1-full | AcqRel atomic operations must combine acquire and release semantics on read-modify-write operations to simultaneously synchronize with prior writes and publish subsequent modifications (AATOM-25). | 0128 §11, §66 | - | T408 |
+| REQ-ATM-011 | atomics | v1-full | Sequentially consistent (SeqCst) atomic operations must provide the strongest atomic ordering and must not be weakened to Acquire, Release, or Relaxed by compiler optimizations (AATOM-26). | 0128 §12, §66 | - | T406 |
+| REQ-ATM-012 | atomics | v1-full | Each atomic object must maintain a single, consistent total modification order across all atomic modifications performed upon it. | 0128 §13 | - | T408 |
+| REQ-ATM-013 | atomics | v1-full | Atomic operations must be indivisible without partial atomic reads or writes, requiring runtime emulation if unsupported natively by the target architecture. | 0128 §14 | - | T408 |
+| REQ-ATM-014 | atomics | v1-full | Atomic operations must not be assumed to be lock-free by default (AATOM-29). | 0128 §15, §16, §66 | - | T405 |
+| REQ-ATM-015 | atomics | v1-full | Atomic operations must not be assumed to be wait-free by default (AATOM-30). | 0128 §15, §17, §66 | - | T405 |
+| REQ-ATM-016 | atomics | v1-full | The standard library or compiler must provide a target-aware mechanism to query whether an atomic type or operation is lock-free on the target platform. | 0128 §18 | - | T406 |
+| REQ-ATM-017 | atomics | v1-full | The language and runtime must support both strong compare-and-exchange and weak compare-and-exchange operations. | 0128 §19 | - | T406 |
+| REQ-ATM-018 | atomics | v1-full | Strong compare-and-exchange (compare_exchange) must not fail spuriously when the current value matches the expected value. | 0128 §20 | - | T408 |
+| REQ-ATM-019 | atomics | v1-full | Weak compare-and-exchange (compare_exchange_weak) is permitted to fail spuriously even when the current value matches the expected value. | 0128 §21 | - | T408 |
+| REQ-ATM-020 | atomics | v1-full | The compiler must validate that failure memory ordering in compare-and-exchange operations does not specify Release or AcqRel semantics. | 0128 §22 | - | T406 |
+| REQ-ATM-021 | atomics | v1-full | Primitive atomic read-modify-write operations (fetch_add, fetch_sub, fetch_and, fetch_or, fetch_xor, swap) must execute as a single atomic modification in the object's modification order. | 0128 §23 | - | T408 |
+| REQ-ATM-022 | atomics | v1-full | Atomic read-modify-write integer operations must use wrapping two's-complement arithmetic based on the bit-width of the atomic integer type (AATOM-39). | 0128 §25, §66 | - | T406 |
+| REQ-ATM-023 | atomics | v1-full | The memory model must support explicit memory fences parameterized by Acquire, Release, AcqRel, and SeqCst orderings. | 0128 §26 | - | T406 |
+| REQ-ATM-024 | atomics | v1-full | Memory fences must establish execution ordering constraints without reading from or writing to memory. | 0128 §27, §28 | - | T406 |
 | REQ-CORE-032 | compiler | v1-full | The system layer may provide a compiler-only barrier (compiler_fence) that restricts instruction reordering by the compiler without emitting hardware atomic synchronization instructions. | 0128 §29 | - | EPIC(E18.1) |
 | REQ-LAY-125 | memory-model | v1-core | Volatile memory accesses must guarantee the execution of external observable memory effects without establishing thread synchronization or happens-before relations (AATOM-28). | 0128 §30, §31, §66 | - | T113 | 
 | REQ-LAY-126 | memory-model | post-v1 | The system layer must provide volatile load and store operations for accessing external and device memory-mapped I/O registers. | 0128 §32 | - | EPIC(E24.0) |
 | REQ-LAY-127 | memory-model | v1-core | Compiler optimizations on safe ordinary memory must preserve capability rules, ownership rules, and observable program semantics. | 0128 §33 | - | T113 | 
-| REQ-ATM-025 | atomics | v1-full | Compiler optimizations must not weaken atomic ordering or eliminate atomic operations unless it is formally proven that complete atomic memory model semantics are preserved (AATOM-27, AATOM-40). | 0128 §34, §35, §66 | - | EPIC(E11.1) |
+| REQ-ATM-025 | atomics | v1-full | Compiler optimizations must not weaken atomic ordering or eliminate atomic operations unless it is formally proven that complete atomic memory model semantics are preserved (AATOM-27, AATOM-40). | 0128 §34, §35, §66 | - | T406 |
 | REQ-LAY-128 | memory-model | v1-core | The memory model must define a formal happens-before relation established by sequenced-before order and synchronizes-with contracts (AATOM-35). | 0128 §36, §66 | - | T113 | 
 | REQ-LAY-129 | memory-model | v1-core | Within a single thread context, compiler instruction reordering must preserve sequenced-before evaluation order and observable execution results. | 0128 §37 | - | T113 | 
-| REQ-ATM-026 | atomics | v1-full | An Acquire atomic read that observes a Release atomic write must establish a synchronizes-with relationship that orders prior writes before subsequent reads. | 0128 §38 | - | EPIC(E11.1) |
+| REQ-ATM-026 | atomics | v1-full | An Acquire atomic read that observes a Release atomic write must establish a synchronizes-with relationship that orders prior writes before subsequent reads. | 0128 §38 | - | T408 |
 | REQ-CORE-033 | safety | v1-core | Safe ordinary memory must not participate in a data race, and concurrent access combining ordinary and atomic access to the same storage must be prohibited (AATOM-34). | 0128 §39, §66 | - | T113 | 
-| REQ-ATM-027 | atomics | v1-full | Atomic synchronization semantics must bind to distinct storage identities rather than type identities alone. | 0128 §40 | - | EPIC(E11.1) |
+| REQ-ATM-027 | atomics | v1-full | Atomic synchronization semantics must bind to distinct storage identities rather than type identities alone. | 0128 §40 | - | T406 |
 | REQ-LAY-130 | memory-layout | post-v1 | The standard library must provide target-aware alignment constants to allow atomic storage structures to prevent false sharing. | 0128 §41, §42 | - | EPIC(E24.0) |
 | REQ-LAY-131 | memory-layout | post-v1 | A @cache_align attribute for automatic target-specific cache-line padding shall be deferred as a post-v1 system feature. | 0128 §43 | - | EPIC(E24.0) |
-| REQ-ATM-028 | atomics | v1-full | Atomic pointer operations (Atomic<*mut T>) must only ensure atomicity of the pointer address manipulation without guaranteeing or extending the referenced object's lifetime, validity, or ownership (AATOM-31). | 0128 §44, §45, §66 | - | EPIC(E11.1) |
-|REQ-ATM-029|atomics|v1-full|Lock-free structures built on raw pointers must be encapsulated in safe abstractions where lifetime and memory reclamation safety are proven .|0128 §46|-|EPIC(E11.1)|
-| REQ-ATM-030 | atomics | v1-full | Primitive atomic operations must not be expected to detect or prevent the ABA problem (AATOM-32). | 0128 §47, §48, §66 | - | EPIC(E11.1) |
+| REQ-ATM-028 | atomics | v1-full | Atomic pointer operations (Atomic<*mut T>) must only ensure atomicity of the pointer address manipulation without guaranteeing or extending the referenced object's lifetime, validity, or ownership (AATOM-31). | 0128 §44, §45, §66 | - | T409 |
+|REQ-ATM-029|atomics|v1-full|Lock-free structures built on raw pointers must be encapsulated in safe abstractions where lifetime and memory reclamation safety are proven .|0128 §46|-|T409|
+| REQ-ATM-030 | atomics | v1-full | Primitive atomic operations must not be expected to detect or prevent the ABA problem (AATOM-32). | 0128 §47, §48, §66 | - | T409 |
 | REQ-LAY-132 | memory-management | post-v1 | Safe memory reclamation mechanisms for lock-free pointer structures must be implemented at the library or system layer and kept distinct from primitive atomic synchronization (AATOM-33). | 0128 §50, §66 | - | EPIC(E24.0) |
 | REQ-LAY-133 | memory-management | v1-core | Reference counting must never be implicitly inserted for atomic pointers or references and must only exist when explicitly chosen via library abstractions. | 0128 §51 | - | T113 | 
-| REQ-CONC-098 | concurrency | v1-full | The Arc<T> library abstraction must not imply that access to the inner payload is atomic, and concurrent mutation through Arc<T> must require explicit synchronization primitives . | 0128 §52, §53, §54 | REQ-LAY-068 | EPIC(E11.1) |
+| REQ-CONC-098 | concurrency | v1-full | The Arc<T> library abstraction must not imply that access to the inner payload is atomic, and concurrent mutation through Arc<T> must require explicit synchronization primitives . | 0128 §52, §53, §54 | REQ-LAY-068 | T406 |
 | REQ-LAY-134 | memory-management | v1-core | In concurrent and lock-free structures, logical removal of a resource must remain distinct from physical memory deallocation and Drop execution (AMEM-43). | 0128 §55 | - | T113 | 
 | REQ-CORE-034 | safety | v1-core | Safe code errors including data races, out-of-bounds accesses, and use-after-free must be rejected statically or trigger defined runtime panic or trap behaviors, never undefined behavior exploited for optimization. | 0128 §57 | - | T113 | 
 | REQ-CORE-035 | safety | v1-core | Code enclosed in unsafe blocks must not permit the compiler to weaken atomic memory ordering or violate atomic synchronization semantics (AATOM-36). | 0128 §58, §59, §66 | - | T113 | 
@@ -969,19 +969,19 @@
 | REQ-RES-022 | closures | v1-core | Closure invocation syntax `f(x)` shall deterministically resolve to the corresponding `Fn::call`, `FnMut::call_mut`, or `FnOnce::call_once` trait method . | 0131 - Section 48 | REQ-RES-022 | T113 | 
 | REQ-RES-023 | closures | v1-core | Invoking a closure that consumes captured non-`Copy` resources shall consume the closure, and subsequent invocation attempts shall result in a compile error. | 0131 - Section 49 | - | T113 | 
 | REQ-RES-024 | closures | v1-core | The compiler shall enforce exclusive access without conflicting reads or writes during mutable closure invocation without requiring explicit lifetime annotations. | 0131 - Section 50 | - | T113 | 
-|REQ-ASY-085|async|v1-full|A closure spawned across execution threads must satisfy the `Send` trait, and capturing any non-`Send` value shall cause a compile error .|0131 - Section 51|-|EPIC(E11.1)|
-| REQ-ASY-086 | async | v1-full | Thread-local execution via `spawn_local` shall not require `Send`, but the compiler must enforce lifetime and capability safety on all captured state. | 0131 - Section 52 | - | EPIC(E11.1) |
+|REQ-ASY-085|async|v1-full|A closure spawned across execution threads must satisfy the `Send` trait, and capturing any non-`Send` value shall cause a compile error .|0131 - Section 51|-|T415|
+| REQ-ASY-086 | async | v1-full | Thread-local execution via `spawn_local` shall not require `Send`, but the compiler must enforce lifetime and capability safety on all captured state. | 0131 - Section 52 | - | T421 |
 | REQ-RES-025 | closures | v1-core | Unsafe operations within a closure body shall be contained within an explicit `unsafe` block without rendering the outer closure type or context unsafe. | 0131 - Section 53 | - | T113 | 
 | REQ-RES-026 | closures | v1-core | A closure capturing a `view` or `mut_view` shall not outlive the owner of the referenced data, and returning such a closure beyond the owner's scope shall cause a compile error. | 0131 - Section 54 | - | T113 | 
 | REQ-RES-027 | closures | v1-core | A closure capturing a `mut_view` shall hold an exclusive mutable capability, and any conflicting access to the underlying data while the closure is live shall cause a compile error. | 0131 - Section 55 | - | T113 | 
-|REQ-ASY-087|async|v1-full|The compiler shall reject any async function or closure environment where a `view` or `mut_view` capability is held across an `.await` suspension point .|0131 - Section 56|-|EPIC(E11.1)|
-| REQ-ASY-088 | async | v1-full | An `async fn` declaration shall return a compiler-generated `Future` state machine rather than evaluating immediately. | 0131 - Section 57 | - | EPIC(E11.1) |
-| REQ-ASY-089 | async | v1-full | Invoking an `async fn` shall construct a state machine without automatically spawning a thread or relying on a built-in runtime executor. | 0131 - Section 58 | - | EPIC(E11.1) |
-| REQ-ASY-090 | async | v1-full | The compiler shall lower an `async fn` into a state machine where local variables that remain live across suspension points become state-machine fields. | 0131 - Section 59 | - | EPIC(E11.1) |
-| REQ-ASY-091 | async | v1-full | An async state machine shall own all values that remain live across `.await` suspension points. | 0131 - Section 60 | - | EPIC(E11.1) |
-| REQ-ASY-092 | async | v1-full | A Future shall be a first-class value governed by standard value, Drop, and Send semantics without hidden garbage-collected objects. | 0131 - Section 61 | - | EPIC(E11.1) |
-| REQ-ASY-093 | async | v1-full | Dropping a Future shall not be assumed by the compiler to cancel external asynchronous operations, requiring cancellation to follow explicit API protocols. | 0131 - Section 62 | - | EPIC(E11.1) |
-| REQ-ASY-094 | async | v1-full | The `?` operator inside an async function shall execute standard `Result` early-exit control flow without interacting with the async executor. | 0131 - Section 63 | - | EPIC(E11.1) |
+|REQ-ASY-087|async|v1-full|The compiler shall reject any async function or closure environment where a `view` or `mut_view` capability is held across an `.await` suspension point .|0131 - Section 56|-|T417|
+| REQ-ASY-088 | async | v1-full | An `async fn` declaration shall return a compiler-generated `Future` state machine rather than evaluating immediately. | 0131 - Section 57 | - | T418 |
+| REQ-ASY-089 | async | v1-full | Invoking an `async fn` shall construct a state machine without automatically spawning a thread or relying on a built-in runtime executor. | 0131 - Section 58 | - | T420 |
+| REQ-ASY-090 | async | v1-full | The compiler shall lower an `async fn` into a state machine where local variables that remain live across suspension points become state-machine fields. | 0131 - Section 59 | - | T417 |
+| REQ-ASY-091 | async | v1-full | An async state machine shall own all values that remain live across `.await` suspension points. | 0131 - Section 60 | - | T417 |
+| REQ-ASY-092 | async | v1-full | A Future shall be a first-class value governed by standard value, Drop, and Send semantics without hidden garbage-collected objects. | 0131 - Section 61 | - | T415 |
+| REQ-ASY-093 | async | v1-full | Dropping a Future shall not be assumed by the compiler to cancel external asynchronous operations, requiring cancellation to follow explicit API protocols. | 0131 - Section 62 | - | T418 |
+| REQ-ASY-094 | async | v1-full | The `?` operator inside an async function shall execute standard `Result` early-exit control flow without interacting with the async executor. | 0131 - Section 63 | - | T420 |
 | REQ-CORE-070 | functions | v1-core | Calling an `unsafe fn` shall require an explicit `unsafe` block or context while retaining full compiler enforcement of type checking, ownership, ABI correctness, and control-flow validity. | 0131 - Section 64 | - | T113 | 
 | REQ-FFI-018 | ffi | v1-full | An `extern` function declaration shall specify an explicit ABI contract defining calling convention, data representation, layout, and boundary behaviors. | 0131 - Section 65 | - | EPIC(E13.1) |
 | REQ-FFI-019 | ffi | v1-full | Axiom panics shall not unwind across foreign ABI boundaries by default and must be converted to error codes or terminate execution according to policy. | 0131 - Section 66 | - | EPIC(E13.1) |
@@ -1035,11 +1035,11 @@
 | REQ-RES-041 | closures | v1-core | Callable trait resolution among `Fn`, `FnMut`, and `FnOnce` shall be deterministic and unambiguous [AFN-43] . | 0131 - Section 88 (AFN-43) | REQ-RES-022 | T113 | 
 | REQ-RES-042 | closures | v1-core | The compiler shall track closure consumption such that invoking an `FnOnce` closure consumes it and prevents reuse [AFN-44] . | 0131 - Section 88 (AFN-44) | REQ-RES-042 | T113 | 
 | REQ-RES-043 | closures | v1-core | Closure capture shall strictly obey ownership rules and must not create implicit alias ownership [AFN-45]. | 0131 - Section 88 (AFN-45) | - | T113 | 
-|REQ-RES-044|closures|v1-full|A closure capturing a `view` or `mut_view` shall not extend the capability lifetime beyond the lifetime of the underlying owner [AFN-46] .|0131 - Section 88 (AFN-46)|-|EPIC(E11.1)|
-|REQ-ASY-095|async|v1-full|A closure or future state machine shall not hold a live `view` or `mut_view` capability across an `.await` suspension point [AFN-47] .|0131 - Section 88 (AFN-47)|-|EPIC(E11.1)|
-| REQ-ASY-096 | async | v1-full | An async function shall construct a future or state machine without automatically spawning a thread [AFN-48]. | 0131 - Section 88 (AFN-48) | - | EPIC(E11.1) |
-| REQ-ASY-097 | async | v1-full | The async state machine shall own all values that remain live across suspension points [AFN-49]. | 0131 - Section 88 (AFN-49) | - | EPIC(E11.1) |
-| REQ-ASY-098 | async | v1-full | Dropping a Future shall not imply cancellation of external asynchronous operations [AFN-50]. | 0131 - Section 88 (AFN-50) | - | EPIC(E11.1) |
+|REQ-RES-044|closures|v1-full|A closure capturing a `view` or `mut_view` shall not extend the capability lifetime beyond the lifetime of the underlying owner [AFN-46] .|0131 - Section 88 (AFN-46)|-|T401|
+|REQ-ASY-095|async|v1-full|A closure or future state machine shall not hold a live `view` or `mut_view` capability across an `.await` suspension point [AFN-47] .|0131 - Section 88 (AFN-47)|-|T417|
+| REQ-ASY-096 | async | v1-full | An async function shall construct a future or state machine without automatically spawning a thread [AFN-48]. | 0131 - Section 88 (AFN-48) | - | T418 |
+| REQ-ASY-097 | async | v1-full | The async state machine shall own all values that remain live across suspension points [AFN-49]. | 0131 - Section 88 (AFN-49) | - | T417 |
+| REQ-ASY-098 | async | v1-full | Dropping a Future shall not imply cancellation of external asynchronous operations [AFN-50]. | 0131 - Section 88 (AFN-50) | - | T418 |
 | REQ-CORE-089 | functions | v1-core | Calling an `unsafe fn` shall require an explicit unsafe context [AFN-51] . | 0131 - Section 88 (AFN-51) | REQ-OWN-061 | T113 | 
 | REQ-FFI-022 | ffi | v1-full | Foreign function interfaces shall require explicit ABI declarations without compiler guessing [AFN-52]. | 0131 - Section 88 (AFN-52) | - | EPIC(E13.1) |
 | REQ-FFI-023 | ffi | v1-full | Axiom panics shall not cross FFI ABI boundaries by default and must be handled at the boundary [AFN-53]. | 0131 - Section 88 (AFN-53) | - | EPIC(E13.1) |
@@ -1052,7 +1052,7 @@
 | REQ-CORE-092 | functions | v1-core | Static callable abstractions using generics or `impl Trait` shall compile directly without requiring runtime dispatch machinery [AFN-60]. | 0131 - Section 88 (AFN-60) | - | T113 | 
 | REQ-TYP-067 | types | v1-core | Structs serve as the primary aggregate data primitive in Axiom, defining a set of named fields with declared types without object headers or inheritance. | 0132 §1, §62 (ADATA-20) | - | T113 |
 | REQ-TYP-068 | types | v1-core | Structs must not contain implicit runtime overhead including object headers, vtables, garbage collection metadata, runtime type IDs, or reference counts. | 0132 §1, §62 (ADATA-21) | - | T113 |
-|REQ-TYP-069|types|v1-full|Structs do not support inheritance, base class references, or virtual inheritance, requiring behavior reuse to occur via traits and composition .|0132 §2, §62 (ADATA-22)|-|EPIC(E11.1)|
+|REQ-TYP-069|types|v1-full|Structs do not support inheritance, base class references, or virtual inheritance, requiring behavior reuse to occur via traits and composition .|0132 §2, §62 (ADATA-22)|-|T401|
 | REQ-TYP-070 | types | v1-core | Data and behavior are strictly decoupled such that struct declarations contain only data fields, while behaviors are defined via separate functions or trait implementations. | 0132 §3, §62 (ADATA-23) | - | T113 |
 | REQ-GRM-004 | grammar | v1-core | Method invocation syntax `v.method()` is syntactic sugar for a standalone function call passing `self` without an implicit `this` pointer or runtime object dispatch. | 0132 §3, §62 (ADATA-24) | - | T113 |
 | REQ-TYP-071 | types | v1-core | Structs support inherent `impl` blocks defining associated functions and methods directly on the struct type. | 0132 §4 | - | T113 |
@@ -1114,7 +1114,7 @@
 | REQ-TYP-103 | types | v1-core | Implementing a trait for a struct establishes a compile-time relationship and does not automatically construct a runtime vtable. | 0132 §60 | - | T113 |
 | REQ-TYP-104 | types | v1-core | Dynamic trait dispatch and vtable representations are generated only when types are explicitly cast or stored as dynamic trait objects (`dyn Trait`) . | 0132 §61, §62 (ADATA-54) | REQ-LAY-036 | T113 |
 | REQ-TYP-105 | types | v1-core | Logical identities such as handles or entity IDs are managed at the library level rather than being derived from raw storage addresses. | 0132 §42, §43, §62 (ADATA-51) | - | T113 |
-|REQ-TYP-106|types|v1-full|Method overriding based on class inheritance is prohibited, replacing it with compile-time trait implementation selection and explicit dynamic dispatch .|0132 §Part XII|-|EPIC(E11.1)|
+|REQ-TYP-106|types|v1-full|Method overriding based on class inheritance is prohibited, replacing it with compile-time trait implementation selection and explicit dynamic dispatch .|0132 §Part XII|-|T401|
 | REQ-CNF-002 | conformance | v1-core | The compiler and runtime must not impose a universal object runtime or runtime performance overhead for language abstractions that are not explicitly utilized. | 0132 §64 | - | T113 | 
 | REQ-TRT-002 | traits | v1-core | Polymorphism MUST be achieved through trait implementation, default behavior, static dispatch, and explicit dynamic dispatch instead of class inheritance. | 0133 §Preamble | - | T113 | 
 | REQ-TRT-003 | traits | v1-core | A trait MUST specify a behavioral contract for a type without requiring an object header, vtable pointer, or runtime type information. | 0133 §1 | - | T113 | 
@@ -1287,76 +1287,76 @@
 | REQ-PAT-087 | pattern-matching | v1-core | Async must not biến into a runtime bắt buộc. | 0134 §Part XVI — Async · Futures · Coroutines · Cancellation | - | T113 | 
 | REQ-PAT-088 | pattern-matching | v1-core | Axiom has needs `pin`/pinning như rust not, hay compiler/state-machine lowering has thể loại bỏ completely khái niệm this khỏi source language? | 0134 §Part XVI — Async · Futures · Coroutines · Cancellation | - | T113 | 
 | REQ-PAT-089 | pattern-matching | v1-core | Compiler complexity is not language complexity. | 0134 §Part XVI — Async · Futures · Coroutines · Cancellation, 0136 §Điểm rất quan trọng: Axiom đang hình thành một mô hình concurrency khá gọn | - | T113 | 
-| REQ-ASY-099 | async | v1-full | Async is a control-flow abstraction, is not a runtime model. | 0135 §Part XVI — Async · Future · Coroutine · Cancellation | - | EPIC(E11.1) |
-| REQ-ASY-100 | async | v1-full | Future is semantic abstraction, is not bắt buộc runtime allocation. | 0135 §7. Future có thể không tồn tại ở machine level | - | EPIC(E11.1) |
-| REQ-ASY-101 | async | v1-full | But `poll` not nhất thiết must is public core syntax. | 0135 §8. Poll model | - | EPIC(E11.1) |
-| REQ-ASY-102 | async | v1-full | Is not all async program đều needs a global waker runtime. | 0135 §9. Waker | - | EPIC(E11.1) |
-| REQ-ASY-103 | async | v1-full | Điểm this must rất rõ. | 0135 §13. Creating Future ≠ starting external operation | - | EPIC(E11.1) |
-| REQ-ASY-104 | async | v1-full | Axiom not yêu cầu all future must lazy or eager ở all api. | 0135 §13. Creating Future ≠ starting external operation | - | EPIC(E11.1) |
-| REQ-ASY-105 | async | v1-full | But semantics must be api define rõ. | 0135 §13. Creating Future ≠ starting external operation | - | EPIC(E11.1) |
-| REQ-ASY-106 | async | v1-full | Capability lifetime not cross suspension. | 0135 §18. Vì sao không cho view qua await? | - | EPIC(E11.1) |
-| REQ-ASY-107 | async | v1-full | Is not all local từng tồn at in function đều ảnh hưởng. | 0135 §23. Send của Future | - | EPIC(E11.1) |
-| REQ-ASY-108 | async | v1-full | Điều this tránh ép all async abstraction must thread-safe. | 0135 §26. `spawn_local` | - | EPIC(E11.1) |
-| REQ-ASY-109 | async | v1-full | If caller not keep task handle, behavior must according to api `detach`. | 0135 §29. Task ownership | - | EPIC(E11.1) |
-| REQ-ASY-110 | async | v1-full | Cooperative control flow, is not forced thread termination. | 0135 §30. Cancellation | - | EPIC(E11.1) |
-| REQ-ASY-111 | async | v1-full | Future must have cancellation-safe semantics. | 0135 §30. Cancellation | - | EPIC(E11.1) |
-| REQ-ASY-112 | async | v1-full | Drop future ≠ cancel external operation. | 0135 §33. Dropping Future | - | EPIC(E11.1) |
-| REQ-ASY-113 | async | v1-full | Cancellation semantics must be api define rõ. | 0135 §34. Explicit cancellation handle | - | EPIC(E11.1) |
-| REQ-ASY-114 | async | v1-full | Then compiler must cleanup state machine fields đang owned. | 0135 §35. Future Drop | - | EPIC(E11.1) |
-| REQ-ASY-115 | async | v1-full | Vì drop must deterministic and not-suspend. | 0135 §38. Drop không await | - | EPIC(E11.1) |
-| REQ-ASY-116 | async | v1-full | Drop not create hidden scheduler dependency. | 0135 §38. Drop không await | - | EPIC(E11.1) |
-| REQ-ASY-117 | async | v1-full | Compiler must detect recursive future size problem. | 0135 §43. Async recursive function | - | EPIC(E11.1) |
-| REQ-ASY-118 | async | v1-full | Recursive value representation must hữu hạn. | 0135 §44. Explicit indirection cho recursive async | - | EPIC(E11.1) |
-| REQ-ASY-119 | async | v1-full | Compiler has thể extend physical storage lifetime to tối ưu, but semantic owner/capability rules still must đúng. | 0135 §47. No implicit lifetime extension | - | EPIC(E11.1) |
-| REQ-ASY-120 | async | v1-full | Must yêu cầu explicit stable storage. | 0135 §48. Stable address và async | - | EPIC(E11.1) |
-| REQ-ASY-121 | async | v1-full | ```text "this object must never move" ``` | 0135 §49. Vì sao Axiom không cần `Pin` | - | EPIC(E11.1) |
-| REQ-ASY-122 | async | v1-full | From that compiler must not relocate storage if that vi phạm contract. | 0135 §50. Khi address thực sự observable | - | EPIC(E11.1) |
-| REQ-ASY-123 | async | v1-full | Async functions must not automatically trở into c abi functions. | 0135 §51. Async FFI | - | EPIC(E11.1) |
-| REQ-ASY-124 | async | v1-full | Then event must keep resource dependencies needs thiết. | 0135 §53. GPU async | - | EPIC(E11.1) |
-| REQ-ASY-125 | async | v1-full | Compiler must not đoán hidden gpu lifetime. | 0135 §53. GPU async | - | EPIC(E11.1) |
-| REQ-ASY-126 | async | v1-full | Api/ownership model must ngăn that. | 0135 §54. Async GPU ownership | - | EPIC(E11.1) |
-| REQ-ASY-127 | async | v1-full | Must have abstraction phù hợp. | 0135 §57. Async + Share | - | EPIC(E11.1) |
-| REQ-ASY-128 | async | v1-full | Synchronous lock guard must not live qua suspension. | 0135 §58. Async critical section | - | EPIC(E11.1) |
-| REQ-ASY-129 | async | v1-full | If needs keep logical lock qua async suspension, library must provide abstraction riêng: | 0135 §59. Async-aware lock | - | EPIC(E11.1) |
-| REQ-ASY-130 | async | v1-full | Async synchronization primitive must define cancellation behavior. | 0135 §60. Cancellation và lock | - | EPIC(E11.1) |
-| REQ-ASY-131 | async | v1-full | This is responsibility of abstraction, is not magic compiler. | 0135 §60. Cancellation và lock | - | EPIC(E11.1) |
-| REQ-ASY-132 | async | v1-full | Is not keep tất cả state đến cuối future. | 0135 §62. Future state machine và Drop | - | EPIC(E11.1) |
-| REQ-ASY-133 | async | v1-full | Async is not thread. | 0135 §66. Async invariants | - | EPIC(E11.1) |
-| REQ-ASY-134 | async | v1-full | ### aasync-46 — gpu async lifetime must be explicit | 0135 §66. Async invariants | - | EPIC(E11.1) |
-| REQ-ASY-135 | async | v1-full | ### aasync-49 — recursive futures must have finite representation | 0135 §66. Async invariants | - | EPIC(E11.1) |
-| REQ-ASY-136 | async | v1-full | Nó giúp axiom tránh việc programmer must hiểu lifetime graph of async state machine. | 0135 §Quyết định quan trọng đã khóa | - | EPIC(E11.1) |
-| REQ-ASY-137 | async | v1-full | Axiom nên make for việc create thread/task đơn giản đến mức nào mà still keep is hiệu năng c/c++ and not biến compiler into a runtime bắt buộc? | 0135 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | EPIC(E11.1) |
-| REQ-ASY-138 | async | v1-full | Tức is compiler biết đủ to kiểm chứng safety, but is not tự carry according to a scheduler/runtime khổng lồ. | 0135 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | EPIC(E11.1) |
-| REQ-CONC-099 | concurrency | v1-full | Concurrency must is a thuộc tính of chương trình and type system, is not a runtime model bắt buộc. | 0136 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | EPIC(E11.1) |
-| REQ-CONC-100 | concurrency | v1-full | Detached task must have ownership model riêng. | 0136 §19. Detached execution là escape hatch | - | EPIC(E11.1) |
-| REQ-CONC-101 | concurrency | v1-full | Must not acquire into công according to lock semantics. | 0136 §32. Write guard | - | EPIC(E11.1) |
-| REQ-CONC-102 | concurrency | v1-full | Must not xem chúng is cùng a cơ chế. | 0136 §33. Locking không phải memory ordering | - | EPIC(E11.1) |
-| REQ-CONC-103 | concurrency | v1-full | But allocation/backpressure semantics must rõ. | 0136 §39. Unbounded channel | - | EPIC(E11.1) |
-| REQ-CONC-104 | concurrency | v1-full | This is design choice of library, is not language restriction. | 0136 §42. Channel thay thế shared mutable state trong nhiều trường hợp | - | EPIC(E11.1) |
-| REQ-CONC-105 | concurrency | v1-full | But `t` not nhất thiết must `share`, vì nó is bảo vệ by mutex. | 0136 §43. `Share` và Mutex | - | EPIC(E11.1) |
-| REQ-CONC-106 | concurrency | v1-full | This is lý do `share` must is type contract, is not property lan truyền đơn giản from field. | 0136 §43. `Share` và Mutex | - | EPIC(E11.1) |
-| REQ-CONC-107 | concurrency | v1-full | But api safe bên outside must khôi phục invariant. | 0136 §47. `unsafe` synchronization | - | EPIC(E11.1) |
-| REQ-CONC-108 | concurrency | v1-full | Must not automatically coi is safe. | 0136 §50. Atomic/ordinary interaction | - | EPIC(E11.1) |
-| REQ-CONC-109 | concurrency | v1-full | Volatile is not synchronization. | 0136 §51. Volatile | - | EPIC(E11.1) |
-| REQ-CONC-110 | concurrency | v1-full | Must not giả định tls luôn has global process lifetime. | 0136 §53. TLS lifetime | - | EPIC(E11.1) |
-| REQ-CONC-111 | concurrency | v1-full | Compiler must reject unsafe concurrent access in safe code. | 0136 §54. Global mutable state | - | EPIC(E11.1) |
-| REQ-CONC-112 | concurrency | v1-full | But mỗi api must define chính xác edge nào is create. | 0136 §62. Happens-before | - | EPIC(E11.1) |
-| REQ-CONC-113 | concurrency | v1-full | Compiler must not tự suy diễn mạnh hơn contract. | 0136 §62. Happens-before | - | EPIC(E11.1) |
-| REQ-CONC-114 | concurrency | v1-full | Child must thấy the writes is contract spawn công bố. | 0136 §63. Spawn happens-before | - | EPIC(E11.1) |
-| REQ-CONC-115 | concurrency | v1-full | Cancellation must not make mất ownership. | 0136 §71. Cancellation và channel | - | EPIC(E11.1) |
-| REQ-CONC-116 | concurrency | v1-full | Must not has ownership ambiguity. | 0136 §71. Cancellation và channel | - | EPIC(E11.1) |
-| REQ-CONC-117 | concurrency | v1-full | Abi contract must khai báo semantics needs thiết. | 0136 §73. Concurrency và FFI | - | EPIC(E11.1) |
-| REQ-CONC-118 | concurrency | v1-full | Atomicity is semantic property, is not optimization arbitrarily. | 0136 §77. No hidden atomic promotion | - | EPIC(E11.1) |
-| REQ-CONC-119 | concurrency | v1-full | But must not make change synchronization observable behavior giữa threads. | 0136 §79. Lock elision | - | EPIC(E11.1) |
-| REQ-CONC-120 | concurrency | v1-full | Is not language safety issue. | 0136 §80. False sharing | - | EPIC(E11.1) |
-| REQ-CONC-121 | concurrency | v1-full | Lock-free capability must query target/implementation. | 0136 §82. Lock-free | - | EPIC(E11.1) |
-| REQ-CONC-122 | concurrency | v1-full | But automatic parallelization must not change observable behavior. | 0136 §92. Data parallelism | - | EPIC(E11.1) |
-| REQ-CONC-123 | concurrency | v1-full | Ffi/system apis must khai báo if reentrancy is a contract. | 0136 §97. Reentrancy | - | EPIC(E11.1) |
-| REQ-CONC-124 | concurrency | v1-full | ### aconc-76 — synchronization semantics must be preserved by optimization | 0136 §101. Bộ invariants chính thức | - | EPIC(E11.1) |
-| REQ-CONC-125 | concurrency | v1-full | ### aconc-78 — spawn/join synchronization must be explicitly defined | 0136 §101. Bộ invariants chính thức | - | EPIC(E11.1) |
-| REQ-CONC-126 | concurrency | v1-full | If muốn override compiler proof, must đi qua a boundary rõ ràng kiểu: | 0136 §Một điều cần khóa thêm về `Send` / `Share` | - | EPIC(E11.1) |
-| REQ-CONC-127 | concurrency | v1-full | And compiler still must kiểm tra the phần has thể kiểm tra. | 0136 §Một điều cần khóa thêm về `Send` / `Share` | - | EPIC(E11.1) |
-| REQ-CONC-128 | concurrency | v1-full | Axiom make thế nào to safe code cực kỳ đơn giản, but when xuống mức kernel/driver/allocator/compiler/runtime then still has toàn bộ sức mạnh mà c/c++ has — mà not biến `unsafe` into a “vùng đất not luật”? | 0136 §Phần tiếp theo | - | EPIC(E11.1) |
+| REQ-ASY-099 | async | v1-full | Async is a control-flow abstraction, is not a runtime model. | 0135 §Part XVI — Async · Future · Coroutine · Cancellation | - | T418 |
+| REQ-ASY-100 | async | v1-full | Future is semantic abstraction, is not bắt buộc runtime allocation. | 0135 §7. Future có thể không tồn tại ở machine level | - | T415 |
+| REQ-ASY-101 | async | v1-full | But `poll` not nhất thiết must is public core syntax. | 0135 §8. Poll model | - | T418 |
+| REQ-ASY-102 | async | v1-full | Is not all async program đều needs a global waker runtime. | 0135 §9. Waker | - | T421 |
+| REQ-ASY-103 | async | v1-full | Điểm this must rất rõ. | 0135 §13. Creating Future ≠ starting external operation | - | T415 |
+| REQ-ASY-104 | async | v1-full | Axiom not yêu cầu all future must lazy or eager ở all api. | 0135 §13. Creating Future ≠ starting external operation | - | T415 |
+| REQ-ASY-105 | async | v1-full | But semantics must be api define rõ. | 0135 §13. Creating Future ≠ starting external operation | - | T415 |
+| REQ-ASY-106 | async | v1-full | Capability lifetime not cross suspension. | 0135 §18. Vì sao không cho view qua await? | - | T417 |
+| REQ-ASY-107 | async | v1-full | Is not all local từng tồn at in function đều ảnh hưởng. | 0135 §23. Send của Future | - | T417 |
+| REQ-ASY-108 | async | v1-full | Điều this tránh ép all async abstraction must thread-safe. | 0135 §26. `spawn_local` | - | T421 |
+| REQ-ASY-109 | async | v1-full | If caller not keep task handle, behavior must according to api `detach`. | 0135 §29. Task ownership | - | T422 |
+| REQ-ASY-110 | async | v1-full | Cooperative control flow, is not forced thread termination. | 0135 §30. Cancellation | - | T418 |
+| REQ-ASY-111 | async | v1-full | Future must have cancellation-safe semantics. | 0135 §30. Cancellation | - | T418 |
+| REQ-ASY-112 | async | v1-full | Drop future ≠ cancel external operation. | 0135 §33. Dropping Future | - | T418 |
+| REQ-ASY-113 | async | v1-full | Cancellation semantics must be api define rõ. | 0135 §34. Explicit cancellation handle | - | T418 |
+| REQ-ASY-114 | async | v1-full | Then compiler must cleanup state machine fields đang owned. | 0135 §35. Future Drop | - | T418 |
+| REQ-ASY-115 | async | v1-full | Vì drop must deterministic and not-suspend. | 0135 §38. Drop không await | - | T418 |
+| REQ-ASY-116 | async | v1-full | Drop not create hidden scheduler dependency. | 0135 §38. Drop không await | - | T415 |
+| REQ-ASY-117 | async | v1-full | Compiler must detect recursive future size problem. | 0135 §43. Async recursive function | - | T416 |
+| REQ-ASY-118 | async | v1-full | Recursive value representation must hữu hạn. | 0135 §44. Explicit indirection cho recursive async | - | T416 |
+| REQ-ASY-119 | async | v1-full | Compiler has thể extend physical storage lifetime to tối ưu, but semantic owner/capability rules still must đúng. | 0135 §47. No implicit lifetime extension | - | T415 |
+| REQ-ASY-120 | async | v1-full | Must yêu cầu explicit stable storage. | 0135 §48. Stable address và async | - | T415 |
+| REQ-ASY-121 | async | v1-full | ```text "this object must never move" ``` | 0135 §49. Vì sao Axiom không cần `Pin` | - | T418 |
+| REQ-ASY-122 | async | v1-full | From that compiler must not relocate storage if that vi phạm contract. | 0135 §50. Khi address thực sự observable | - | T415 |
+| REQ-ASY-123 | async | v1-full | Async functions must not automatically trở into c abi functions. | 0135 §51. Async FFI | - | T416 |
+| REQ-ASY-124 | async | v1-full | Then event must keep resource dependencies needs thiết. | 0135 §53. GPU async | - | T415 |
+| REQ-ASY-125 | async | v1-full | Compiler must not đoán hidden gpu lifetime. | 0135 §53. GPU async | - | T415 |
+| REQ-ASY-126 | async | v1-full | Api/ownership model must ngăn that. | 0135 §54. Async GPU ownership | - | T415 |
+| REQ-ASY-127 | async | v1-full | Must have abstraction phù hợp. | 0135 §57. Async + Share | - | T415 |
+| REQ-ASY-128 | async | v1-full | Synchronous lock guard must not live qua suspension. | 0135 §58. Async critical section | - | T417 |
+| REQ-ASY-129 | async | v1-full | If needs keep logical lock qua async suspension, library must provide abstraction riêng: | 0135 §59. Async-aware lock | - | T421 |
+| REQ-ASY-130 | async | v1-full | Async synchronization primitive must define cancellation behavior. | 0135 §60. Cancellation và lock | - | T421 |
+| REQ-ASY-131 | async | v1-full | This is responsibility of abstraction, is not magic compiler. | 0135 §60. Cancellation và lock | - | T418 |
+| REQ-ASY-132 | async | v1-full | Is not keep tất cả state đến cuối future. | 0135 §62. Future state machine và Drop | - | T418 |
+| REQ-ASY-133 | async | v1-full | Async is not thread. | 0135 §66. Async invariants | - | T419 |
+| REQ-ASY-134 | async | v1-full | ### aasync-46 — gpu async lifetime must be explicit | 0135 §66. Async invariants | - | T419 |
+| REQ-ASY-135 | async | v1-full | ### aasync-49 — recursive futures must have finite representation | 0135 §66. Async invariants | - | T416 |
+| REQ-ASY-136 | async | v1-full | Nó giúp axiom tránh việc programmer must hiểu lifetime graph of async state machine. | 0135 §Quyết định quan trọng đã khóa | - | T418 |
+| REQ-ASY-137 | async | v1-full | Axiom nên make for việc create thread/task đơn giản đến mức nào mà still keep is hiệu năng c/c++ and not biến compiler into a runtime bắt buộc? | 0135 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | T415 |
+| REQ-ASY-138 | async | v1-full | Tức is compiler biết đủ to kiểm chứng safety, but is not tự carry according to a scheduler/runtime khổng lồ. | 0135 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | T415 |
+| REQ-CONC-099 | concurrency | v1-full | Concurrency must is a thuộc tính of chương trình and type system, is not a runtime model bắt buộc. | 0136 §Part XVII — Concurrency · Threads · Tasks · Channels · Synchronization | - | T412 |
+| REQ-CONC-100 | concurrency | v1-full | Detached task must have ownership model riêng. | 0136 §19. Detached execution là escape hatch | - | T422 |
+| REQ-CONC-101 | concurrency | v1-full | Must not acquire into công according to lock semantics. | 0136 §32. Write guard | - | T400 |
+| REQ-CONC-102 | concurrency | v1-full | Must not xem chúng is cùng a cơ chế. | 0136 §33. Locking không phải memory ordering | - | T400 |
+| REQ-CONC-103 | concurrency | v1-full | But allocation/backpressure semantics must rõ. | 0136 §39. Unbounded channel | - | T412 |
+| REQ-CONC-104 | concurrency | v1-full | This is design choice of library, is not language restriction. | 0136 §42. Channel thay thế shared mutable state trong nhiều trường hợp | - | T412 |
+| REQ-CONC-105 | concurrency | v1-full | But `t` not nhất thiết must `share`, vì nó is bảo vệ by mutex. | 0136 §43. `Share` và Mutex | - | T411 |
+| REQ-CONC-106 | concurrency | v1-full | This is lý do `share` must is type contract, is not property lan truyền đơn giản from field. | 0136 §43. `Share` và Mutex | - | T411 |
+| REQ-CONC-107 | concurrency | v1-full | But api safe bên outside must khôi phục invariant. | 0136 §47. `unsafe` synchronization | - | T400 |
+| REQ-CONC-108 | concurrency | v1-full | Must not automatically coi is safe. | 0136 §50. Atomic/ordinary interaction | - | T406 |
+| REQ-CONC-109 | concurrency | v1-full | Volatile is not synchronization. | 0136 §51. Volatile | - | T400 |
+| REQ-CONC-110 | concurrency | v1-full | Must not giả định tls luôn has global process lifetime. | 0136 §53. TLS lifetime | - | T413 |
+| REQ-CONC-111 | concurrency | v1-full | Compiler must reject unsafe concurrent access in safe code. | 0136 §54. Global mutable state | - | T402 |
+| REQ-CONC-112 | concurrency | v1-full | But mỗi api must define chính xác edge nào is create. | 0136 §62. Happens-before | - | T403 |
+| REQ-CONC-113 | concurrency | v1-full | Compiler must not tự suy diễn mạnh hơn contract. | 0136 §62. Happens-before | - | T403 |
+| REQ-CONC-114 | concurrency | v1-full | Child must thấy the writes is contract spawn công bố. | 0136 §63. Spawn happens-before | - | T403 |
+| REQ-CONC-115 | concurrency | v1-full | Cancellation must not make mất ownership. | 0136 §71. Cancellation và channel | - | T412 |
+| REQ-CONC-116 | concurrency | v1-full | Must not has ownership ambiguity. | 0136 §71. Cancellation và channel | - | T412 |
+| REQ-CONC-117 | concurrency | v1-full | Abi contract must khai báo semantics needs thiết. | 0136 §73. Concurrency và FFI | - | T400 |
+| REQ-CONC-118 | concurrency | v1-full | Atomicity is semantic property, is not optimization arbitrarily. | 0136 §77. No hidden atomic promotion | - | T406 |
+| REQ-CONC-119 | concurrency | v1-full | But must not make change synchronization observable behavior giữa threads. | 0136 §79. Lock elision | - | T400 |
+| REQ-CONC-120 | concurrency | v1-full | Is not language safety issue. | 0136 §80. False sharing | - | T400 |
+| REQ-CONC-121 | concurrency | v1-full | Lock-free capability must query target/implementation. | 0136 §82. Lock-free | - | T406 |
+| REQ-CONC-122 | concurrency | v1-full | But automatic parallelization must not change observable behavior. | 0136 §92. Data parallelism | - | T403 |
+| REQ-CONC-123 | concurrency | v1-full | Ffi/system apis must khai báo if reentrancy is a contract. | 0136 §97. Reentrancy | - | T410 |
+| REQ-CONC-124 | concurrency | v1-full | ### aconc-76 — synchronization semantics must be preserved by optimization | 0136 §101. Bộ invariants chính thức | - | T403 |
+| REQ-CONC-125 | concurrency | v1-full | ### aconc-78 — spawn/join synchronization must be explicitly defined | 0136 §101. Bộ invariants chính thức | - | T401 |
+| REQ-CONC-126 | concurrency | v1-full | If muốn override compiler proof, must đi qua a boundary rõ ràng kiểu: | 0136 §Một điều cần khóa thêm về `Send` / `Share` | - | T400 |
+| REQ-CONC-127 | concurrency | v1-full | And compiler still must kiểm tra the phần has thể kiểm tra. | 0136 §Một điều cần khóa thêm về `Send` / `Share` | - | T400 |
+| REQ-CONC-128 | concurrency | v1-full | Axiom make thế nào to safe code cực kỳ đơn giản, but when xuống mức kernel/driver/allocator/compiler/runtime then still has toàn bộ sức mạnh mà c/c++ has — mà not biến `unsafe` into a “vùng đất not luật”? | 0136 §Phần tiếp theo | - | T400 |
 | REQ-CORE-101 | unsafe | v1-core | `unsafe` mở quyền biểu diễn the thứ compiler not thể tự prove; nó not tắt semantic checking of axiom. | 0137 §Part XVIII — Unsafe · Raw Pointer · Provenance · Volatile · Intrinsics | - | T113 | 
 | REQ-CORE-102 | unsafe | v1-core | Safe code must thỏa the invariant of language. | 0137 §1. Safe và unsafe | - | T113 | 
 | REQ-CORE-103 | unsafe | v1-core | Raw pointer is not ownership. | 0137 §4. Raw pointer | - | T113 | 
@@ -2039,14 +2039,14 @@
 | REQ-TYP-282 | types | v1-core | The try operator (`?`) MUST verify that the operand's error or none type is compatible with the enclosing function's return type . | 0159 §49. ? | REQ-TYP-282 | T113 |
 | REQ-CORE-192 | control-flow | v1-core | The try operator (`?`) MUST lower to discriminant inspection and explicit conditional return without hidden stack unwinding. | 0159 §50. ? không phải exception | - | T113 | 
 | REQ-OWN-070 | ownership | v1-core | An early return induced by the try operator (`?`) MUST execute deterministic cleanup of all active local resources before returning. | 0159 §51. ? và Drop | - | T113 | 
-|REQ-ASY-139|async|v1-full|The `.await` expression MUST verify that the operand satisfies the Future trait relation and evaluate to the Future's output type .|0159 §52. await|-|EPIC(E11.1)|
+|REQ-ASY-139|async|v1-full|The `.await` expression MUST verify that the operand satisfies the Future trait relation and evaluate to the Future's output type .|0159 §52. await|-|T416|
 | REQ-CAP-056 | capability | v1-full | View types (`view<T>` and `mut_view<T>`) MUST NOT remain live across suspension points (`.await`) . | 0159 §53. View không được qua await | REQ-TRT-029 | EPIC(E13.1) |
-| REQ-ASY-140 | async | v1-full | Owned values MAY cross suspension points (`.await`) by becoming fields in the compiler-generated async state machine. | 0159 §54. Owned value được qua await | - | EPIC(E11.1) |
+| REQ-ASY-140 | async | v1-full | Owned values MAY cross suspension points (`.await`) by becoming fields in the compiler-generated async state machine. | 0159 §54. Owned value được qua await | - | T418 |
 | REQ-MIR-037 | hir | v1-core | A closure expression MUST be represented in Typed HIR with a unique ClosureId, parameters, body, capture candidates, and function type. | 0159 §55. Closure | - | T113 | 
 | REQ-OWN-071 | ownership | v1-core | Typed HIR MUST record capture candidates for closures, with capture modes (Read, Mutable, Move) finalized by subsequent ownership analysis . | 0159 §56. Closure capture | REQ-GRM-011 | T113 | 
 | REQ-OWN-072 | ownership | v1-core | A closure declared with `move` MUST set explicit_move_capture to true and force captured variables to be transferred by ownership. | 0159 §57. move closure | - | T113 | 
 | REQ-TYP-283 | types | v1-core | Each closure expression MUST possess a unique anonymous type identity. | 0159 §58. Closure type identity | - | T113 |
-|REQ-ASY-141|async|v1-full|An `async fn` MUST produce an anonymous compiler-generated state machine type implementing `Future<Output = ReturnType>` .|0159 §59. async fn|-|EPIC(E11.1)|
+|REQ-ASY-141|async|v1-full|An `async fn` MUST produce an anonymous compiler-generated state machine type implementing `Future<Output = ReturnType>` .|0159 §59. async fn|-|T416|
 | REQ-CORE-193 | semantics | v1-core | The `panic` expression MUST evaluate to type never and trigger the profile-defined panic strategy. | 0159 §60. panic | - | T113 | 
 | REQ-CORE-194 | semantics | v1-core | The `unreachable` expression MUST evaluate to type never and lower to an unreachable instruction in MIR. | 0159 §61. unreachable | - | T113 | 
 | REQ-CORE-195 | semantics | v1-core | The `assert` expression MUST require a condition of type bool and panic on failure, while `debug_assert` MUST NOT be used to establish safety proofs. | 0159 §62. assert | - | T113 | 
@@ -2071,7 +2071,7 @@
 | REQ-TYP-290 | types | v1-core | Cast semantics MUST be explicit in Typed HIR (ATHIR-36). | 0159 §66. Typed HIR invariant | - | T113 |
 | REQ-TYP-291 | types | v1-core | The `bit_cast` operation MUST be distinct from semantic conversions in Typed HIR (ATHIR-37). | 0159 §66. Typed HIR invariant | - | T113 |
 | REQ-TYP-292 | types | v1-core | Try expressions MUST preserve Result or Option semantics (ATHIR-38) . | 0159 §66. Typed HIR invariant | REQ-TYP-282 | T113 |
-|REQ-ASY-142|async|v1-full|Await expressions MUST preserve Future semantics (ATHIR-39) .|0159 §66. Typed HIR invariant|-|EPIC(E11.1)|
+|REQ-ASY-142|async|v1-full|Await expressions MUST preserve Future semantics (ATHIR-39) .|0159 §66. Typed HIR invariant|-|T419|
 | REQ-OWN-073 | ownership | v1-core | Typed HIR MUST NOT perform ownership verification (ATHIR-40). | 0159 §66. Typed HIR invariant | - | T113 | 
 | REQ-CAP-057 | capability | v1-full | Typed HIR MUST NOT perform capability verification (ATHIR-41). | 0159 §66. Typed HIR invariant | - | EPIC(E13.1) |
 | REQ-CORE-200 | compiler | v1-full | Typed HIR MUST NOT perform physical storage allocation (ATHIR-42). | 0159 §66. Typed HIR invariant | - | EPIC(E18.1) |
@@ -2116,9 +2116,9 @@
 | REQ-OWN-089 | ownership | v1-core | Closure capture analysis MUST infer the minimal required capability (READ, MUT, or MOVE) according to variable usage within the closure body. | 0160 §23 | - | T113 | 
 | REQ-OWN-090 | ownership | v1-core | A closure marked with move MUST take ownership of captured variables, transferring them into the closure environment. | 0160 §24 | - | T113 | 
 | REQ-CAP-070 | capability | v1-full | Neither view<T> nor mut_view<T> capabilities MUST cross an .await suspension boundary. | 0160 §25 | - | EPIC(E13.1) |
-| REQ-CONC-129 | concurrency | v1-full | Spawning a multi-threaded task MUST require captured values to implement Send, emitting diagnostic AX_SEND_0001 if unsatisfied. | 0160 §26 | - | EPIC(E11.1) |
-| REQ-CONC-130 | concurrency | v1-full | Spawning a thread-local task (spawn_local) MUST NOT require captured values to implement Send. | 0160 §26 | - | EPIC(E11.1) |
-| REQ-CONC-131 | concurrency | v1-full | The compiler MUST treat Send (ownership transfer across contexts) and Share (safe concurrent sharing) as distinct semantic properties. | 0160 §27 | - | EPIC(E11.1) |
+| REQ-CONC-129 | concurrency | v1-full | Spawning a multi-threaded task MUST require captured values to implement Send, emitting diagnostic AX_SEND_0001 if unsatisfied. | 0160 §26 | - | T402 |
+| REQ-CONC-130 | concurrency | v1-full | Spawning a thread-local task (spawn_local) MUST NOT require captured values to implement Send. | 0160 §26 | - | T421 |
+| REQ-CONC-131 | concurrency | v1-full | The compiler MUST treat Send (ownership transfer across contexts) and Share (safe concurrent sharing) as distinct semantic properties. | 0160 §27 | - | T400 |
 | REQ-CAP-071 | capability | v1-full | Capabilities originating from unsafe blocks MUST establish trusted preconditions and remain subject to normal capability conflict verification. | 0160 §28 | - | EPIC(E13.1) |
 | REQ-DRP-032 | drop | v1-core | Drop analysis MUST be performed after ownership analysis, dropping live local variables in reverse declaration order by default. | 0160 §29 | - | T113 | 
 | REQ-DRP-033 | drop | v1-core | The compiler MUST automatically emit drop cleanup operations for live variables along all early return and exit paths. | 0160 §30 | - | T113 | 
@@ -2165,7 +2165,7 @@
 | REQ-CAP-085 | capability | v1-full | A view MUST NOT escape the lifetime of its owner (AESCAPE-22). | 0160 §40 | - | EPIC(E13.1) |
 | REQ-CAP-086 | capability | v1-full | A view MUST NOT cross forbidden suspension boundaries (AESCAPE-23). | 0160 §40 | - | EPIC(E13.1) |
 | REQ-OWN-102 | ownership | v1-core | Closure capture of values and capabilities MUST be verified by ownership analysis (AESCAPE-24). | 0160 §40 | - | T113 | 
-| REQ-CONC-132 | concurrency | v1-full | Thread migration of captured values MUST be checked for the Send trait (AESCAPE-25). | 0160 §40 | - | EPIC(E11.1) |
+| REQ-CONC-132 | concurrency | v1-full | Thread migration of captured values MUST be checked for the Send trait (AESCAPE-25). | 0160 §40 | - | T401 |
 | REQ-CORE-210 | compiler | v1-full | The compiler source tree MUST NOT name the ownership subsystem borrow_checker and the language MUST NOT expose borrow syntax. | 0160 §41 | - | EPIC(E18.1) |
 | REQ-ORC-008 | oracle | v1-core | The semantic oracle MUST verify that compiler MIR destruction and ownership events match oracle semantic model events. | 0160 §44 | - | T113 | 
 | REQ-CORE-211 | compiler | v1-full | The core ownership milestones OWN-001 through VERIFY-001 MUST be completed before stabilizing additional language features. | 0160 §45 | - | EPIC(E18.1) |
@@ -2212,9 +2212,9 @@
 | REQ-MIR-057 | mir | v1-core | Pattern matching constructs MUST NOT be retained in MIR, and MUST be lowered into ENUM_TAG, SWITCH, and ENUM_PAYLOAD instructions. | 0161 §26. match | - | T113 | 
 | REQ-MIR-058 | mir | v1-core | For loops MUST be eliminated prior to MIR and lowered into iterator protocol calls and explicit loop basic blocks. | 0161 §27. for | - | T113 | 
 | REQ-MIR-059 | mir | v1-core | The `?` error propagation operator MUST lower to result tag checks and explicit cleanup branching rather than using exception handling machinery. | 0161 §28. ? | - | T113 | 
-| REQ-ASY-143 | async | v1-full | Async functions MUST be lowered into state machines using SUSPEND and RESUME instructions in MIR. | 0161 §29. Async | - | EPIC(E11.1) |
+| REQ-ASY-143 | async | v1-full | Async functions MUST be lowered into state machines using SUSPEND and RESUME instructions in MIR. | 0161 §29. Async | - | T418 |
 | REQ-OWN-113 | ownership | v1-core | Ownership analysis for async functions MUST determine which values remain live across suspension points during lowering. | 0161 §29. Async | - | T113 | 
-| REQ-CONC-133 | concurrency | v1-full | Atomic operations MUST NOT be lowered to ordinary memory instructions in MIR, and MUST retain explicit ordering attributes. | 0161 §30. Atomic | - | EPIC(E11.1) |
+| REQ-CONC-133 | concurrency | v1-full | Atomic operations MUST NOT be lowered to ordinary memory instructions in MIR, and MUST retain explicit ordering attributes. | 0161 §30. Atomic | - | T406 |
 | REQ-MIR-060 | mir | v1-core | Trait method invocations on dynamic trait objects MUST lower to DYNAMIC_CALL instructions specifying target data, dispatch table, and method slot. | 0161 §31. Dynamic dispatch | - | T113 | 
 | REQ-GEN-021 | generics | v1-core | Generic functions prior to monomorphization in MIR MUST retain TypeParam and TraitObligation metadata for semantic instantiation. | 0161 §32. Generic | - | T113 | 
 | REQ-MIR-061 | mir | v1-core | Closures in MIR MUST be represented by an aggregate environment capturing variables via MOVE or VIEW accompanied by a function identifier. | 0161 §33. Closure | - | T113 | 
@@ -2243,7 +2243,7 @@
 | REQ-LAY-160 | memory | v1-core | LIR memory load and store operations must specify exact transfer sizes in bytes or bits. | 0162 §9 | - | T113 | 
 | REQ-LAY-161 | memory | v1-core | Every LIR memory operation must include alignment, volatile, atomic, and address_space metadata. | 0162 §10 | - | T113 | 
 | REQ-LAY-162 | memory | v1-core | Volatile memory operations must be represented as distinct operations from atomic operations and must not be treated as equivalent to atomic. | 0162 §11 | - | T113 | 
-| REQ-CONC-134 | concurrency | v1-full | LIR atomic operations (ATOMIC_LOAD, ATOMIC_STORE, ATOMIC_RMW, ATOMIC_CAS, FENCE) must specify ordering, scope, size, and address_space metadata. | 0162 §12 | - | EPIC(E11.1) |
+| REQ-CONC-134 | concurrency | v1-full | LIR atomic operations (ATOMIC_LOAD, ATOMIC_STORE, ATOMIC_RMW, ATOMIC_CAS, FENCE) must specify ordering, scope, size, and address_space metadata. | 0162 §12 | - | T407 |
 | REQ-CORE-225 | backend | v1-core | The compiler backend must preserve explicit atomic ordering and must not substitute default instructions without proving valid target mapping. | 0162 §13 | - | T113 | 
 | REQ-CORE-226 | control-flow | v1-core | LIR control flow instructions must include JMP, BR, SWITCH, RETURN, TRAP, and UNREACHABLE. | 0162 §14 | - | T113 | 
 | REQ-CORE-227 | control-flow | v1-core | LIR conditional branches must use target-independent condition code abstractions (EQ, NE, LT, LE, GT, GE, ULT, ULE, UGT, UGE). | 0162 §14 | - | T113 | 
@@ -2285,7 +2285,7 @@
 | REQ-TYP-302 | types | v1-core | Every LIR value MUST have a machine-relevant type (ALIR-20). | 0162 §43 | - | T113 |
 | REQ-LIR-016 | lir | v1-core | Every virtual register MUST have exactly one register class (ALIR-21). | 0162 §43 | - | T113 | 
 | REQ-LAY-164 | memory | v1-core | Every memory operation MUST have explicit size and alignment semantics (ALIR-22). | 0162 §43 | - | T113 | 
-| REQ-CONC-135 | concurrency | v1-full | Atomic operations MUST retain ordering until target lowering (ALIR-23). | 0162 §43 | - | EPIC(E11.1) |
+| REQ-CONC-135 | concurrency | v1-full | Atomic operations MUST retain ordering until target lowering (ALIR-23). | 0162 §43 | - | T407 |
 | REQ-LAY-165 | memory | v1-core | Volatile operations MUST be distinct from atomic operations (ALIR-24). | 0162 §43 | - | T113 | 
 | REQ-ABI-074 | abi | v1-full | Function calls MUST have an explicit calling convention (ALIR-25). | 0162 §43 | - | EPIC(E13.1) |
 | REQ-ABI-075 | abi | v1-full | Aggregate ABI lowering MUST be explicit (ALIR-26). | 0162 §43 | - | EPIC(E13.1) |
@@ -2821,7 +2821,7 @@
 | REQ-CORE-446 | compiler/mir | v1-full | The generation of MIR instructions MUST be exclusively routed through a centralized MirBuilder API to prevent malformed instructions. | 0261 §23 | - | EPIC(E18.1) |
 | REQ-CORE-447 | compiler/optimizer | v1-full | The optimizer Pass Manager MUST explicitly track pass dependencies, preserved analyses, and invalidated analyses. | 0261 §27 | - | EPIC(E15.1) |
 | REQ-CORE-448 | compiler/semantics | v1-full | Compile-time execution results MUST be lowered into the HIR and MUST NOT directly mutate Machine IR. | 0261 §25 | - | EPIC(E18.1) |
-| REQ-RT-022 | runtime/concurrency | v1-full | The concurrency model MUST differentiate Task from Thread, and task state MUST be small and deterministic. | 1066 §2.C | - | EPIC(E11.1) |
+| REQ-RT-022 | runtime/concurrency | v1-full | The concurrency model MUST differentiate Task from Thread, and task state MUST be small and deterministic. | 1066 §2.C | - | T400 |
 | REQ-LAY-166 | semantics/memory | v1-core | The Axiom memory model MUST NOT include mandatory GC, mandatory explicit borrow checking, hidden reference counting, hidden allocations, or hidden ownership runtimes. | 1066 §2.B | - | T113 | 
 | REQ-CORE-449 | compiler/abi | v1-full | The compiler Core ABI specification MUST freeze a minimal version covering basic types, aggregates, alignment, and calling conventions before backend implementation. | 1066 §2.D | - | EPIC(E13.1) |
 | REQ-CORE-450 | semantic | v1-core | The compiler must explicitly track signature-changing effects (async, unsafe, GPU domain, FFI ABI) while internal effects (allocation, IO, panic) remain implicit. | 0225 §22 | - | T113 | 
@@ -3062,11 +3062,11 @@
 | REQ-SEC-003 | security | v1-core | Safe Verification Resumes After Trusted Boundary . | 0270 §34 | REQ-SEC-002 | T113 | 
 | REQ-SEC-004 | security | v1-core | Unsafe Cannot Implicitly Restore Invalid Ownership . | 0270 §35 | REQ-SEC-003 | T113 | 
 | REQ-SEC-005 | security | v1-core | Raw Pointers Are Distinct From Safe Capabilities . | 0270 §1 | REQ-SEC-004 | T113 | 
-| REQ-CONC-136 | concurrency | v1-full | Send Represents Ownership Transfer Across Execution Domains. | 0270 §27, 0298 §9 | - | EPIC(E11.1) |
-|REQ-CONC-137|concurrency|v1-full|Share Represents Concurrent Access Capability .|0270 §8, 0298 §4|-|EPIC(E11.1)|
-|REQ-CONC-138|concurrency|v1-full|Send And Share Are Distinct .|0270 §39, 0298 §4|-|EPIC(E11.1)|
-|REQ-CONC-139|concurrency|v1-full|Safe Concurrent Writes Require Exclusive Access .|0270 §20, 0298 §1|-|EPIC(E11.1)|
-|REQ-CONC-140|concurrency|v1-full|Safe Concurrent Read Sharing Requires Valid Share Semantics .|0270 §21, 0298 §6|-|EPIC(E11.1)|
+| REQ-CONC-136 | concurrency | v1-full | Send Represents Ownership Transfer Across Execution Domains. | 0270 §27, 0298 §9 | - | T400 |
+|REQ-CONC-137|concurrency|v1-full|Share Represents Concurrent Access Capability .|0270 §8, 0298 §4|-|T400|
+|REQ-CONC-138|concurrency|v1-full|Send And Share Are Distinct .|0270 §39, 0298 §4|-|T400|
+|REQ-CONC-139|concurrency|v1-full|Safe Concurrent Writes Require Exclusive Access .|0270 §20, 0298 §1|-|T400|
+|REQ-CONC-140|concurrency|v1-full|Safe Concurrent Read Sharing Requires Valid Share Semantics .|0270 §21, 0298 §6|-|T400|
 | REQ-GEN-050 | generics | v1-core | Generic Parameters Are Compile-Time Entities. | 0271 §1 | - | T113 | 
 | REQ-GEN-051 | generics | v1-core | Generic Types Have Canonical Identity . | 0271 §4 | REQ-GEN-050 | T113 | 
 | REQ-GEN-052 | generics | v1-core | Generic Functions Have Canonical Identity . | 0271 §4 | REQ-GEN-051 | T113 | 
@@ -3077,11 +3077,11 @@
 | REQ-BOOT-019 | bootstrap | v1-core | Inherent Methods Are Ordinary Functions . | 0272 §5, 0305 §2 | REQ-BOOT-018 | T113 | 
 | REQ-BOOT-020 | bootstrap | v1-core | Method Syntax Does Not Imply Object Identity . | 0272 §29, 0305 §8 | REQ-BOOT-019 | T113 | 
 | REQ-BOOT-021 | bootstrap | v1-core | Static Dispatch Is Default . | 0272 §21, 0305 §5 | REQ-BOOT-020 | T113 | 
-| REQ-ASY-144 | async | v1-full | Async Is A Control-Flow Abstraction. | 0275 §2, 0297 §80 | - | EPIC(E11.1) |
-|REQ-ASY-145|async|v1-full|Async Does Not Imply Thread Creation .|0275 §2, 0297 §2|-|EPIC(E11.1)|
-|REQ-ASY-146|async|v1-full|Async Does Not Imply Task Spawning .|0275 §2, 0297 §74|-|EPIC(E11.1)|
-|REQ-ASY-147|async|v1-full|Calling Async Produces A Future .|0275 §2, 0297 §2|-|EPIC(E11.1)|
-|REQ-ASY-148|async|v1-full|Future Is A Compiler-Generated State Machine .|0275 §4, 0297 §4|-|EPIC(E11.1)|
+| REQ-ASY-144 | async | v1-full | Async Is A Control-Flow Abstraction. | 0275 §2, 0297 §80 | - | T415 |
+|REQ-ASY-145|async|v1-full|Async Does Not Imply Thread Creation .|0275 §2, 0297 §2|-|T415|
+|REQ-ASY-146|async|v1-full|Async Does Not Imply Task Spawning .|0275 §2, 0297 §74|-|T415|
+|REQ-ASY-147|async|v1-full|Calling Async Produces A Future .|0275 §2, 0297 §2|-|T415|
+|REQ-ASY-148|async|v1-full|Future Is A Compiler-Generated State Machine .|0275 §4, 0297 §4|-|T418|
 | REQ-MOD-080 | module | v1-core | Module is a compiler-visible semantic unit. | 0287 §2, 0293 §2 | - | T113 | 
 | REQ-MOD-081 | module | v1-core | Package is a distribution/dependency unit . | 0287 §23, 0293 §11 | REQ-MOD-080 | T113 | 
 | REQ-MOD-082 | module | v1-core | Workspace is a multi-package development unit . | 0287 §30, 0293 §1 | REQ-MOD-081 | T113 | 
@@ -6139,7 +6139,7 @@
 | REQ-OWN-240 | ownership | v1-core | Operating system resources are represented as logical handles with explicit ownership semantics and Drop cleanup rather than raw memory pointers, and dropping a process handle does not implicitly terminate the underlying process. | tasks/0414 §4, tasks/0414 §70 (AOS-24, AOS-25, AOS-26, AOS-42, AOS-43) | - | T113 | 
 | REQ-RT-133 | runtime | v1-full | Direct system calls can be emitted in system and freestanding targets without requiring libc, CRT, or external C compilers. | tasks/0414 §8, tasks/0414 §64, tasks/0414 §70 (AOS-27, AOS-28, AOS-29, AOS-64, AOS-70) | - | EPIC(E21.1) |
 | REQ-CORE-1314 | core-lib | v1-core | Freestanding and kernel profiles can omit hosted OS facilities while retaining `std.core` abstractions. | tasks/0414 §33, tasks/0414 §70 (AOS-33, AOS-34, AOS-57), tasks/0424 §100 (ASTD2-20, ASTD2-61, ASTD2-62) | - | T113 | 
-| REQ-ATM-031 | atomics | v1-full | Physical memory access is unsafe, MMIO operations require explicit volatile semantics, and volatile semantics are distinct from atomic ordering and CPU fences. | tasks/0414 §70 (AOS-36, AOS-37, AOS-38, AOS-39, AOS-56) | - | EPIC(E11.1) |
+| REQ-ATM-031 | atomics | v1-full | Physical memory access is unsafe, MMIO operations require explicit volatile semantics, and volatile semantics are distinct from atomic ordering and CPU fences. | tasks/0414 §70 (AOS-36, AOS-37, AOS-38, AOS-39, AOS-56) | - | T405 |
 | REQ-RT-134 | runtime | v1-full | Program startup is structured as composable runtime components rather than a mandatory universal runtime. | tasks/0414 §68, tasks/0414 §69, tasks/0414 §70 (AOS-66, AOS-67) | - | EPIC(E21.1) |
 | REQ-CORE-1315 | core-lib | v1-core | Compiler builtins are restricted to operations requiring compiler or target knowledge, and standard library abstractions are implemented in Axiom source code wherever practical. | tasks/0415 §2, tasks/0415 §70 (ACORELIB-21, ACORELIB-22, ACORELIB-23, ACORELIB-60) | - | T113 | 
 | REQ-TYP-325 | types | v1-core | `Option<T>` and `Result<T, E>` are ordinary algebraic data types whose semantic representation is not redefined by niche layout optimizations. | tasks/0415 §70 (ACORELIB-24, ACORELIB-25) | - | T113 |
@@ -6156,7 +6156,7 @@
 | REQ-OPT-342 | optimizer | v1-full | Container bounds checks can only be eliminated when the compiler formally proves that out-of-bounds indexing is unreachable. | tasks/0416 §71 (ACOLLECT-44), tasks/0426 §85 (AITER-69) | - | EPIC(E15.1) |
 | REQ-TXT-002 | text | post-v1 | Short string optimization (SSO) is an internal representation optimization and is not part of the semantic string type contract unless explicitly declared in an ABI contract. | tasks/0416 §71 (ACOLLECT-51, ACOLLECT-52) | - | EPIC(E24.0) |
 | REQ-LAY-288 | layout | post-v1 | `SoA` is an explicit semantic container type, and compiler transformations between Array-of-Structures and Structure-of-Arrays are permitted only when layout is unconstrained by ABI. | tasks/0416 §71 (ACOLLECT-56, ACOLLECT-57, ACOLLECT-58) | - | EPIC(E24.0) |
-| REQ-CONC-141 | concurrency | v1-full | Collections are not implicitly thread-safe, concurrent containers require explicit synchronization, and Send and Share traits are derived independently. | tasks/0416 §71 (ACOLLECT-63, ACOLLECT-64) | - | EPIC(E11.1) |
+| REQ-CONC-141 | concurrency | v1-full | Collections are not implicitly thread-safe, concurrent containers require explicit synchronization, and Send and Share traits are derived independently. | tasks/0416 §71 (ACOLLECT-63, ACOLLECT-64) | - | T400 |
 | REQ-ERR-078 | error | v1-core | Failure semantics distinguish recoverable errors via `Result`, contract violations via `panic`, and process-level termination via `abort` or system faults. | tasks/0417 §1, tasks/0417 §62 (AERROR-20, AERROR-21, AERROR-30, AERROR-33) | - | T113 | 
 | REQ-EXP-145 | expr | v1-core | The `?` operator provides explicit typed control flow over `Result` and `Option`, and Axiom Core v1 defines no general exception hierarchy, no `try/catch` syntax, and no implicit `throw` statements. | tasks/0417 §60, tasks/0417 §62 (AERROR-24, AERROR-25, AERROR-27, AERROR-28, AERROR-29) | - | T113 | 
 | REQ-RT-136 | runtime | v1-full | Panic behavior is configured per build profile via `panic=abort` or `panic=unwind`, where unwinding preserves all active Drop obligations and ownership invariants. | tasks/0417 §62 (AERROR-36, AERROR-37, AERROR-38, AERROR-39, AERROR-40) | - | EPIC(E21.1) |
@@ -6206,8 +6206,8 @@
 | REQ-STD-155 | std-lib | v1-core | Standard library modules are independently linkable components, ensuring that using one module does not transitively link unused runtime or subsystem code. | tasks/0424 §1, tasks/0424 §100 (ASTD2-21, ASTD2-22, ASTD2-64) | - | T113 | 
 | REQ-STD-156 | std-lib | v1-core | Standard library APIs preserve deterministic resource cleanup through Drop without relying on tracing garbage collection or hidden global runtimes. | tasks/0424 §100 (ASTD2-25, ASTD2-26, ASTD2-27) | - | T113 | 
 | REQ-TRT-063 | traits | v1-core | Standard library generic functions and algorithms use static monomorphization by default, requiring explicit opt-in for dynamic trait object dispatch. | tasks/0424 §100 (ASTD2-36, ASTD2-37) | - | T113 | 
-| REQ-CONC-142 | concurrency | v1-full | Shared ownership requires explicit types (`Rc` for non-thread-safe reference counting and `Arc` for atomic thread-safe reference counting), and `Arc` does not grant mutable access without synchronization. | tasks/0424 §100 (ASTD2-40, ASTD2-41, ASTD2-42) | - | EPIC(E11.1) |
-| REQ-CONC-143 | concurrency | v1-full | Synchronization primitives conform to the Axiom memory model, mutex guards operate as ownership-bearing capabilities, and channels transfer element ownership across threads. | tasks/0424 §100 (ASTD2-43, ASTD2-44, ASTD2-45, ASTD2-46) | - | EPIC(E11.1) |
+| REQ-CONC-142 | concurrency | v1-full | Shared ownership requires explicit types (`Rc` for non-thread-safe reference counting and `Arc` for atomic thread-safe reference counting), and `Arc` does not grant mutable access without synchronization. | tasks/0424 §100 (ASTD2-40, ASTD2-41, ASTD2-42) | - | T406 |
+| REQ-CONC-143 | concurrency | v1-full | Synchronization primitives conform to the Axiom memory model, mutex guards operate as ownership-bearing capabilities, and channels transfer element ownership across threads. | tasks/0424 §100 (ASTD2-43, ASTD2-44, ASTD2-45, ASTD2-46) | - | T412 |
 | REQ-STD-157 | std-lib | post-v1 | Async executors and GPU device runtimes are optional library packages rather than mandatory Core language components. | tasks/0424 §100 (ASTD2-47, ASTD2-48, ASTD2-49, ASTD2-63) | - | EPIC(E24.0) |
 | REQ-STD-158 | std-lib | v1-core | Standard library APIs do not mandate hidden global allocator, executor, logger, or random number generator state. | tasks/0424 §100 (ASTD2-73) | - | T113 | 
 | REQ-COL-136 | collections | v1-core | `Vec<T>` operations that can relocate underlying storage are rejected at compile time if active capabilities to its elements are in scope. | tasks/0425 §80 (ACONT-26, ACONT-27, ACONT-28, ACONT-58) | - | T113 | 
@@ -6272,15 +6272,15 @@
 | REQ-OWN-243 | ownership | v1-core | Foreign pointers do not imply ownership or safe capability provenance, and foreign allocations require explicit allocator and deallocator contracts. | 0434 §35, §36, 0434 §92 AFFI-30, AFFI-31, AFFI-32 | - | T113 | 
 | REQ-ABI-093 | abi | v1-full | Default Axiom struct layout is not C-compatible; C-compatible layout requires explicit `@repr(C)`. | 0434 §92 AFFI-23, AFFI-60 | - | EPIC(E13.1) |
 | REQ-TXT-004 | text | v1-core | Axiom `String` and `Str` are UTF-8 and not null-terminated C strings, requiring explicit conversion for C ABI interoperation. | 0434 §92 AFFI-61 | - | T113 | 
-| REQ-CONC-144 | concurrency | v1-full | Foreign blocking operations and synchronization primitives must declare explicit memory ordering contracts or be treated conservatively across optimization boundaries. | 0434 §40, 0434 §92 AFFI-50, AFFI-53 | - | EPIC(E11.1) |
+| REQ-CONC-144 | concurrency | v1-full | Foreign blocking operations and synchronization primitives must declare explicit memory ordering contracts or be treated conservatively across optimization boundaries. | 0434 §40, 0434 §92 AFFI-50, AFFI-53 | - | T403 |
 | REQ-FFI-119 | ffi | v1-full | Dynamic library loading creates an open-world optimization boundary that prohibits closed-world assumptions, devirtualization, or dead-code elimination across the boundary. | 0434 §53, 0434 §92 AFFI-70, AFFI-71 | - | EPIC(E13.1) |
 | REQ-SEC-110 | security | v1-core | Unsafe operations must be confined to FFI boundaries, and safe wrapper types must reconstruct Axiom safety invariants before returning to safe code. | 0434 §91, §92 AFFI-90, AFFI-91, AFFI-94 | - | T113 | 
-| REQ-CONC-145 | concurrency | v1-full | Axiom does not mandate a monolithic concurrency runtime; thread execution and asynchronous task runtimes are independent, link-on-demand components. | 0435 §72, §73, 0435 §102 ARUNTIME-CONCUR-20, ARUNTIME-CONCUR-21, ARUNTIME-CONCUR-24 | - | EPIC(E11.1) |
-| REQ-CONC-146 | concurrency | v1-full | OS thread execution is distinct from async task execution; cross-thread ownership transfer strictly requires the `Send` trait. | 0435 §102 ATHREAD-20, ATHREAD-21, ATHREAD-22 | - | EPIC(E11.1) |
-| REQ-ASY-149 | async | v1-full | Async functions and Future states do not implicitly spawn OS threads or create dedicated executors. | 0435 §102 AASYNC-RUNTIME-20, AASYNC-RUNTIME-21 | - | EPIC(E11.1) |
-| REQ-ASY-150 | async | v1-full | Future polling requires exclusive access, and Future state retains only values semantically live across await suspension points. | 0435 §102 AASYNC-RUNTIME-25, AASYNC-RUNTIME-26 | - | EPIC(E11.1) |
-| REQ-CONC-147 | concurrency | v1-full | Synchronization guards (such as `MutexGuard`) are ownership-bearing capabilities that are non-Copy, release resources on Drop, and cannot cross await points unless explicitly async-aware. | 0435 §102 ASYNC-LOCK-20, ASYNC-LOCK-21, ASYNC-LOCK-22, ASYNC-LOCK-23 | - | EPIC(E11.1) |
-| REQ-CONC-148 | concurrency | v1-full | Work-stealing schedulers may migrate tasks across workers only when tasks satisfy `Send` contracts, and scheduling order cannot serve as semantic memory ordering. | 0435 §102 ASCHED-20, ASCHED-21, ASCHED-22, AMEMCONCUR-20 | - | EPIC(E11.1) |
+| REQ-CONC-145 | concurrency | v1-full | Axiom does not mandate a monolithic concurrency runtime; thread execution and asynchronous task runtimes are independent, link-on-demand components. | 0435 §72, §73, 0435 §102 ARUNTIME-CONCUR-20, ARUNTIME-CONCUR-21, ARUNTIME-CONCUR-24 | - | T400 |
+| REQ-CONC-146 | concurrency | v1-full | OS thread execution is distinct from async task execution; cross-thread ownership transfer strictly requires the `Send` trait. | 0435 §102 ATHREAD-20, ATHREAD-21, ATHREAD-22 | - | T415 |
+| REQ-ASY-149 | async | v1-full | Async functions and Future states do not implicitly spawn OS threads or create dedicated executors. | 0435 §102 AASYNC-RUNTIME-20, AASYNC-RUNTIME-21 | - | T420 |
+| REQ-ASY-150 | async | v1-full | Future polling requires exclusive access, and Future state retains only values semantically live across await suspension points. | 0435 §102 AASYNC-RUNTIME-25, AASYNC-RUNTIME-26 | - | T417 |
+| REQ-CONC-147 | concurrency | v1-full | Synchronization guards (such as `MutexGuard`) are ownership-bearing capabilities that are non-Copy, release resources on Drop, and cannot cross await points unless explicitly async-aware. | 0435 §102 ASYNC-LOCK-20, ASYNC-LOCK-21, ASYNC-LOCK-22, ASYNC-LOCK-23 | - | T421 |
+| REQ-CONC-148 | concurrency | v1-full | Work-stealing schedulers may migrate tasks across workers only when tasks satisfy `Send` contracts, and scheduling order cannot serve as semantic memory ordering. | 0435 §102 ASCHED-20, ASCHED-21, ASCHED-22, AMEMCONCUR-20 | - | T421 |
 | REQ-TST-103 | testing | post-v1 | A deterministic executor with controllable task scheduling and timer advancement must be provided for reproducible concurrency testing. | 0435 §61, 0435 §102 ASCHED-25 | - | EPIC(E24.0) |
 | REQ-RT-139 | runtime | v1-full | Axiom does not mandate a global heap allocator, mandatory garbage collection, or implicit reference counting. | 0436 §62, §63, 0436 §2014 AALLOC-20, AALLOC-21, AALLOC-22 | - | EPIC(E21.1) |
 | REQ-LAY-290 | layout | v1-core | Physical storage placement (registers, stack, inline, arena, pool, or heap) is not determined solely by high-level type declarations and is selected by compiler analysis. | 0436 §2014 AMEMALLOC-20, AMEMALLOC-21 | - | T113 | 
@@ -6297,32 +6297,32 @@
 | REQ-DRV-014 | driver | v1-full | Physical address manipulation, page-table operations, and DMA memory configurations are restricted to system and unsafe APIs with explicit storage-domain contracts. | 0437 §73 ASYS-MEM-20, ASYS-MEM-21, ASYS-MEM-22, ASYS-MEM-24 | - | EPIC(E18.1) |
 | REQ-LAY-291 | layout | post-v1 | Memory mappings must preserve target page alignment and platform protection contracts when materializing memory slices. | 0437 §73 AMAP-25, AVM-24 | - | EPIC(E24.0) |
 | REQ-RT-144 | runtime | v1-full | I/O resources (descriptors, handles) are distinct from data buffers and must preserve ownership and capability validity throughout active in-flight operations. | 0438 §2097 AIO-20, AIO-21, AIO-22 | - | EPIC(E21.1) |
-| REQ-ASY-151 | async | v1-full | Asynchronous I/O is represented as Future-based suspension without requiring thread creation, and operation completion occurs at most once. | 0438 §2097 AIO-23, AIOASYNC-24 | - | EPIC(E11.1) |
-| REQ-ASY-152 | async | v1-full | Dropping an async I/O Future does not implicitly cancel the in-flight physical operation, and buffer storage cannot be reclaimed while the operation may still access it. | 0438 §2097 AIO-24, AIOASYNC-21, AIOASYNC-22 | - | EPIC(E11.1) |
+| REQ-ASY-151 | async | v1-full | Asynchronous I/O is represented as Future-based suspension without requiring thread creation, and operation completion occurs at most once. | 0438 §2097 AIO-23, AIOASYNC-24 | - | T425 |
+| REQ-ASY-152 | async | v1-full | Dropping an async I/O Future does not implicitly cancel the in-flight physical operation, and buffer storage cannot be reclaimed while the operation may still access it. | 0438 §2097 AIO-24, AIOASYNC-21, AIOASYNC-22 | - | T427 |
 | REQ-ERR-083 | error | v1-core | I/O operations report recoverable failures using `Result<T, IoError>` and support partial read and write representations. | 0438 §2097 AIO-25, AIO-27 | - | T113 | 
 | REQ-OPT-347 | optimizer | v1-full | Zero-copy data paths (including DMA, mmap, and scatter/gather) are optimizations that require compile-time proofs of capability non-aliasing and lifetime validity. | 0438 §2097 AZCOPY-20, AZCOPY-21, AZCOPY-25 | - | EPIC(E15.1) |
 | REQ-OPT-348 | optimizer | v1-full | I/O operations are observable effects whose external ordering cannot be altered by compiler reordering unless operations are proven independent. | 0438 §95, §96, 0438 §2097 AIOOPT-20, AIOOPT-21, AIOOPT-22 | - | EPIC(E15.1) |
 | REQ-DRV-015 | driver | v1-full | DMA buffers possess explicit storage domains where device completion releases or transfers buffer capabilities back to CPU execution domains. | 0438 §2097 ADMA-20, ADMA-21, ADMA-25 | - | EPIC(E18.1) |
 | REQ-RT-145 | runtime | v1-full | Process, Thread, Fiber, Task, and Future are distinct execution concepts: processes define isolation boundaries, threads own native stacks, fibers own user stacks, and tasks represent schedulable work. | 0439 §149, §151 AEXEC-20, APROC-20 | - | EPIC(E21.1) |
-| REQ-CONC-149 | concurrency | v1-full | Forced external thread termination is prohibited as a safe primitive to preserve resource Drop consistency. | 0439 §151 AEXEC-26 | - | EPIC(E11.1) |
+| REQ-CONC-149 | concurrency | v1-full | Forced external thread termination is prohibited as a safe primitive to preserve resource Drop consistency. | 0439 §151 AEXEC-26 | - | T420 |
 | REQ-RT-146 | runtime | v1-full | Process exit does not guarantee invocation of ordinary variable `Drop` cleanup handlers unless explicitly coordinated. | 0439 §151 APROC-22, APROC-23 | - | EPIC(E21.1) |
 | REQ-RT-147 | runtime | v1-full | OS resource handles (files, sockets, processes) must distinguish owned handles from borrowed views, and resource Drop semantics are defined per resource type. | 0439 §151 ARES-EXEC-20, ARES-EXEC-21, ARES-EXEC-24 | - | EPIC(E21.1) |
-| REQ-CONC-150 | concurrency | v1-full | Structured concurrency groups child tasks such that the enclosing scope cannot complete until child tasks complete, cancel, or detach explicitly. | 0439 §120, 0439 §151 AEXEC-27 | - | EPIC(E11.1) |
+| REQ-CONC-150 | concurrency | v1-full | Structured concurrency groups child tasks such that the enclosing scope cannot complete until child tasks complete, cancel, or detach explicitly. | 0439 §120, 0439 §151 AEXEC-27 | - | T422 |
 | REQ-RT-148 | runtime | v1-full | IPC channels transfer ownership across process boundaries without copying where shared memory permits, while serialized IPC remains distinct from memory ownership transfer. | 0439 §151 AIPC-20, AIPC-21, AIPC-24 | - | EPIC(E21.1) |
-| REQ-CONC-151 | concurrency | v1-full | Non-Send tasks are pinned to their creation thread or execution domain and cannot be migrated across threads by schedulers. | 0439 §126, 0439 §151 AEXEC-24, ASCHED-21 | - | EPIC(E11.1) |
+| REQ-CONC-151 | concurrency | v1-full | Non-Send tasks are pinned to their creation thread or execution domain and cannot be migrated across threads by schedulers. | 0439 §126, 0439 §151 AEXEC-24, ASCHED-21 | - | T423 |
 | REQ-RT-149 | runtime | v1-full | Process environment, current working directory, and signal handlers are treated as external state effects whose observation cannot be eliminated across calls. | 0439 §94, §95, 0439 §151 APROC-25 | - | EPIC(E21.1) |
 | REQ-RT-150 | runtime | v1-full | `Duration` (elapsed span) is distinct from `Instant` (point in time), and monotonic time is distinct from civil/wall-clock time. | 0440 §151, §152 ATIME-20, ATIME-21 | - | EPIC(E21.1) |
 | REQ-RT-151 | runtime | v1-full | Monotonic clocks must never move backward, and wall-clock adjustments (NTP, leap seconds) do not alter monotonic time measurements. | 0440 §152 ATIME-22, ATIME-23 | - | EPIC(E21.1) |
 | REQ-RT-152 | runtime | v1-full | Time arithmetic (`Instant - Instant` yielding `Duration`, or `Instant + Duration` yielding `Instant`) is restricted to identical clock domains and rejects inter-domain arithmetic. | 0440 §129, §130, 0440 §152 ATIME-24, ATIME-30, ATIME-31 | - | EPIC(E21.1) |
 | REQ-RT-153 | runtime | v1-full | The passage of time or `sleep` calls cannot serve as a substitute for memory synchronization or establish happens-before ordering. | 0440 §110, §111, §151, §152 ATIME-25, ATIMER-23 | - | EPIC(E21.1) |
-| REQ-ASY-153 | async | v1-full | `Deadline` represents an absolute temporal point, and deadlines are propagated to manage nested timeout budgets without implicit task cancellation. | 0440 §152 ATIME-32, ATIME-33, ATIMEOUT-20, ATIMEOUT-21 | - | EPIC(E11.1) |
-| REQ-ASY-154 | async | v1-full | Async timers do not allocate dedicated OS threads per timer and use timer wheels or reactor backends. | 0440 §152 ATIMER-27 | - | EPIC(E11.1) |
+| REQ-ASY-153 | async | v1-full | `Deadline` represents an absolute temporal point, and deadlines are propagated to manage nested timeout budgets without implicit task cancellation. | 0440 §152 ATIME-32, ATIME-33, ATIMEOUT-20, ATIMEOUT-21 | - | T426 |
+| REQ-ASY-154 | async | v1-full | Async timers do not allocate dedicated OS threads per timer and use timer wheels or reactor backends. | 0440 §152 ATIMER-27 | - | T426 |
 | REQ-TST-104 | testing | post-v1 | Real clock dependencies can be replaced with deterministic virtual clocks that advance without consuming real elapsed time for reproducible testing. | 0440 §103, §106, 0440 §152 ATIMETEST-20, ATIMETEST-21, ATIMETEST-22 | - | EPIC(E24.0) |
 | REQ-RT-154 | runtime | v1-full | Socket handles are owned move-only resources that close deterministically upon `Drop` and are non-Copy. | 0441 §201 ANET-20, ANET-21, ANET-23 | - | EPIC(E21.1) |
 | REQ-RT-155 | runtime | v1-full | Network I/O payloads are raw byte buffers (`Bytes`, `view<u8>`) by default; UTF-8 string interpretation requires explicit validation. | 0441 §138, 0441 §201 ANET-30, ANET-31 | - | EPIC(E21.1) |
 | REQ-CAP-128 | capability | v1-full | Active network operations retain buffer capabilities for the operation duration, preventing buffer relocation, modification, or deallocation while I/O is in-flight. | 0441 §201 ANET-32, ANET-33 | - | EPIC(E13.1) |
-| REQ-ASY-155 | async | v1-full | Network async I/O is modeled as Future-based suspension, where operation cancellation does not guarantee external wire rollback. | 0441 §127, 0441 §201 ANET-40, ANET-44 | - | EPIC(E11.1) |
-| REQ-CONC-152 | concurrency | v1-full | Sockets do not permit concurrent mutation; concurrent reading and writing requires explicit capability splitting (`split()`) into distinct Read and Write capabilities. | 0441 §108, §109, 0441 §201 ANET-62 | - | EPIC(E11.1) |
+| REQ-ASY-155 | async | v1-full | Network async I/O is modeled as Future-based suspension, where operation cancellation does not guarantee external wire rollback. | 0441 §127, 0441 §201 ANET-40, ANET-44 | - | T428 |
+| REQ-CONC-152 | concurrency | v1-full | Sockets do not permit concurrent mutation; concurrent reading and writing requires explicit capability splitting (`split()`) into distinct Read and Write capabilities. | 0441 §108, §109, 0441 §201 ANET-62 | - | T427 |
 | REQ-RT-156 | runtime | v1-full | Portable networking semantics are decoupled from POSIX, mapping portably onto `io_uring`, `epoll`, `IOCP`, and `kqueue` backends without altering observable semantics. | 0441 §200, 0441 §201 ANET-50, ANET-51, ANET-52 | - | EPIC(E21.1) |
 | REQ-RT-157 | runtime | v1-full | TCP streams model byte streams without application frame boundaries; framing protocols and higher-level protocols (TLS, HTTP, QUIC) reside in protocol libraries. | 0441 §113, §145, §146, 0441 §201 ANET-70, ANET-72, ANET-73 | - | EPIC(E21.1) |
 | REQ-SEC-113 | security | post-v1 | Comptime network access requires explicit build capability grants, and raw packet or kernel-bypass access is restricted to system and unsafe APIs. | 0441 §201 ANET-83, ANET-86 | - | EPIC(E24.0) |
@@ -6416,7 +6416,7 @@
 | REQ-RT-169 | runtime | v1-full | Memory allocator, TLS, thread runtime, async executor, reflection, and Unicode tables shall be optional runtime components omitted from the final binary when unused. | tasks/0455 §196.47 (ART-28, ART-29, ART-30, ART-31, ART-32, ART-33) | - | EPIC(E21.1) |
 | REQ-RT-170 | runtime | v1-full | Freestanding and embedded programs shall execute without the hosted Axiom runtime while preserving all Core language safety guarantees. | tasks/0455 §196.47 (ART-34, ART-43, ART-48) | - | EPIC(E21.1) |
 | REQ-RT-171 | runtime | v1-full | Runtime component initialization ordering shall be dependency-derived and deterministic, and initialization cycles shall be diagnosed and rejected. | tasks/0455 §196.47 (ART-35, ART-36) | - | EPIC(E21.1) |
-| REQ-ASY-156 | async | v1-full | Async language syntax shall not implicitly link a runtime executor, and thread-safe semantics shall not require a thread runtime when no threads are spawned. | tasks/0455 §196.47 (ART-46, ART-47) | - | EPIC(E11.1) |
+| REQ-ASY-156 | async | v1-full | Async language syntax shall not implicitly link a runtime executor, and thread-safe semantics shall not require a thread runtime when no threads are spawned. | tasks/0455 §196.47 (ART-46, ART-47) | - | T420 |
 | REQ-CORE-1317 | core-lib | v1-core | Language Core and the core library shall remain independent of the hosted standard library and shall not require a heap, OS, filesystem, network, or thread runtime. | tasks/0456 §197.51 (ASTDL-20, ASTDL-21, ASTDL-39, ASTDL-44) | - | T113 | 
 | REQ-CORE-1318 | core-lib | v1-core | Dynamic memory allocation facilities shall reside in an explicit alloc library layer above core, and hosted std APIs shall not be mandatory dependencies of freestanding programs. | tasks/0456 §197.51 (ASTDL-22, ASTDL-23) | - | T113 | 
 | REQ-LNK-231 | linker | v1-full | Standard library linking shall operate on declaration reachability, ensuring importing a module does not link unreferenced declarations and unused subsystems are stripped. | tasks/0456 §197.51 (ASTDL-24, ASTDL-25, ASTDL-26) | - | EPIC(E18.6) |
@@ -6434,10 +6434,10 @@
 | REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | EPIC(E13.1) |
 | REQ-RT-172 | runtime | v1-full | Tensor and AI framework libraries shall not require a mandatory garbage collector or global runtime, enabling inference builds to dead-strip training, autodiff, and unused kernel components. | tasks/0459 §200.47-48, §200.58-59, ATENSOR-47-48, ATENSOR-58-59; tasks/0468 §209.58-59, ATENSOR-66-67, ATENSOR-79-80 | - | EPIC(E21.1) |
 | REQ-STD-161 | std-lib | post-v1 | Sockets and network resources shall be modeled as owned OS resources distinct from raw OS handles (`int`/`HANDLE`), with typed abstractions distinguishing protocol capabilities (`TcpListener`, `TcpStream`, `UdpSocket`, `UnixStream`). | tasks/0461 §202.2-4, ANET-20-22 | - | EPIC(E24.0) |
-| REQ-ASY-157 | async | v1-full | Asynchronous network I/O shall preserve buffer validity until operation completion without requiring programmer-written lifetime annotations, permitting either owned buffer moves into pending operations or borrow capabilities proven safe by the compiler. | tasks/0461 §202.23-26, ANET-23-26 | - | EPIC(E11.1) |
+| REQ-ASY-157 | async | v1-full | Asynchronous network I/O shall preserve buffer validity until operation completion without requiring programmer-written lifetime annotations, permitting either owned buffer moves into pending operations or borrow capabilities proven safe by the compiler. | tasks/0461 §202.23-26, ANET-23-26 | - | T427 |
 | REQ-CAP-135 | capability | v1-full | Zero-copy network I/O and scatter/gather operations shall enforce capability non-overlap rules and shall never silently alter buffer ownership semantics. | tasks/0461 §202.27-29, ANET-27-29 | - | EPIC(E13.1) |
 | REQ-LAY-294 | layout | post-v1 | Network wire representation shall remain distinct from memory representation, requiring explicit wire endianness and framing; raw network bytes shall be validated before creating safe typed values. | tasks/0461 §202.30-34, ANET-30-34 | - | EPIC(E24.0) |
-| REQ-ASY-158 | async | v1-full | Network Future cancellation shall be semantically distinct from dropping a Future; platform completion backends (`io_uring`, `IOCP`, `epoll`, `kqueue`) shall be hidden beneath portable asynchronous I/O abstractions. | tasks/0461 §202.37-38, §202.43-44, ANET-37-38, ANET-43-44 | - | EPIC(E11.1) |
+| REQ-ASY-158 | async | v1-full | Network Future cancellation shall be semantically distinct from dropping a Future; platform completion backends (`io_uring`, `IOCP`, `epoll`, `kqueue`) shall be hidden beneath portable asynchronous I/O abstractions. | tasks/0461 §202.37-38, §202.43-44, ANET-37-38, ANET-43-44 | - | T426 |
 | REQ-RT-173 | runtime | v1-full | High-performance networking runtimes shall be optional, tree-shakeable, and free of mandatory garbage collection, providing bounded worker scheduling without requiring a thread-per-connection architecture. | tasks/0461 §202.57-58, §202.63-64, §202.70-71, ANET-57-58, ANET-63-64, ANET-70-71 | - | EPIC(E21.1) |
 | REQ-STD-162 | std-lib | v1-core | Filesystem APIs shall model files and directories as owned OS resources, maintaining a semantic distinction between `Path` data, `FileId`, and `FileHandle`. | tasks/0462 §203.1-3, ASTORE-20-22 | - | T113 | 
 | REQ-CAP-136 | capability | v1-full | Memory mappings shall have explicit ownership and lifetime; mapped views shall not outlive their backing mapping, and writable mappings shall obey exclusive mutable capability rules. | tasks/0462 §203.23-25, ASTORE-23-25 | - | EPIC(E13.1) |
@@ -6453,7 +6453,7 @@
 | REQ-RT-175 | runtime | v1-full | Distributed system abstractions shall not introduce remote pointers, distributed garbage collection, or mandatory local garbage collection into Core. | tasks/0463 §204.69-71, ADIST-69-71 | - | EPIC(E21.1) |
 | REQ-STD-166 | std-lib | v1-core | Temporal types (`Duration`, `Instant`, `Deadline`, `WallClock`, `MonotonicClock`, `LogicalClock`) shall remain distinct semantic types with no implicit conversion between clock domains. | tasks/0464 §205.1-3, ATIME-20, ATIME-23 | - | T113 | 
 | REQ-STD-167 | std-lib | v1-core | Monotonic clocks shall be used for elapsed-time measurement and timeouts; instant arithmetic shall permit `Instant - Instant -> Duration` and `Instant + Duration -> Instant` within the same domain, while prohibiting `Instant + Instant`. | tasks/0464 §205.3-4, ATIME-21-22, ATIME-24-25 | - | T113 | 
-| REQ-ASY-159 | async | v1-full | Timeouts and deadlines shall be explicit policy types distinct from cancellation; periodic timers shall explicitly declare fixed-rate or fixed-delay semantics, drift policies, and missed tick behavior. | tasks/0464 §205.6-8, ATIME-26-27, ATIME-29-31 | - | EPIC(E11.1) |
+| REQ-ASY-159 | async | v1-full | Timeouts and deadlines shall be explicit policy types distinct from cancellation; periodic timers shall explicitly declare fixed-rate or fixed-delay semantics, drift policies, and missed tick behavior. | tasks/0464 §205.6-8, ATIME-26-27, ATIME-29-31 | - | T426 |
 | REQ-CAP-138 | capability | v1-full | Timer cancellation shall preserve callback resource safety; timer callbacks shall not outlive captured capabilities or resources. | tasks/0464 §205.9, ATIME-32-33 | - | EPIC(E13.1) |
 | REQ-RT-176 | runtime | v1-full | Real-time execution profiles may prohibit unbounded allocation, blocking operations, or thread synchronization, while ensuring async code does not acquire hidden blocking semantics. | tasks/0464 §205.14-16, ATIME-39-42 | - | EPIC(E21.1) |
 | REQ-CTM-047 | comptime | v1-full | Access to time during comptime shall require explicit capability and participate in build cache identity; reproducible builds shall control or prohibit nondeterministic time inputs. | tasks/0464 §205.19, ATIME-47-49 | - | EPIC(E14.1) |
@@ -6461,7 +6461,7 @@
 | REQ-STD-169 | std-lib | post-v1 | TCP streams shall be modeled as continuous byte streams requiring explicit application framing; partial TCP writes shall not be treated as complete writes. | tasks/0465 §206.7-8, ANET2-24-27 | - | EPIC(E24.0) |
 | REQ-CAP-139 | capability | v1-full | Zero-copy views into network buffers shall not outlive backing storage; scatter/gather operations shall enforce capability non-overlap across segments. | tasks/0465 §206.17-18, ANET2-35-36 | - | EPIC(E13.1) |
 | REQ-CAP-140 | capability | v1-full | CPU mutable access to a buffer shall be prohibited while active DMA or hardware device transfers are in progress on that buffer. | tasks/0465 §206.24, ANET2-44-45 | - | EPIC(E13.1) |
-| REQ-CONC-153 | concurrency | v1-full | RDMA memory registrations shall remain valid for all dependent operations, and RDMA completion notifications shall govern buffer reuse. | tasks/0465 §206.25, ANET2-46-47 | - | EPIC(E11.1) |
+| REQ-CONC-153 | concurrency | v1-full | RDMA memory registrations shall remain valid for all dependent operations, and RDMA completion notifications shall govern buffer reuse. | tasks/0465 §206.25, ANET2-46-47 | - | T428 |
 | REQ-OPT-352 | optimizer | v1-full | Security-sensitive memory zeroization operations in network and protocol layers shall be semantically observable and immune to dead-code elimination. | tasks/0465 §206.28, ANET2-56 | - | EPIC(E15.1) |
 | REQ-LAY-296 | layout | v1-core | Semantic values, in-memory representations, wire formats, persistent storage formats, and IPC representations shall remain distinct contracts. | tasks/0466 §207.1-4, ADATA-20-21 | - | T113 | 
 | REQ-SEC-120 | security | v1-core | Deserialization shall validate external untrusted input bounds, layout, alignment, and representation before creating safe typed values. | tasks/0466 §207.5-6, ADATA-22-23 | - | T113 | 
@@ -6481,10 +6481,10 @@
 | REQ-NUM-011 | numeric | post-v1 | Parallel numerical reductions shall define reduction ordering semantics; strict reductions shall preserve sequential order, while relaxed reductions may permit reassociation only under an explicit profile. | tasks/0469 §210.16, AMATH-42-44 | - | EPIC(E24.0) |
 | REQ-TYP-341 | types | post-v1 | Physical units of measurement shall be encoded via comptime generics; invalid dimensional expressions shall be rejected at compile time, and unit metadata shall be erased at runtime when zero-cost. | tasks/0469 §210.18-19, AMATH-47-50 | - | EPIC(E24.0) |
 | REQ-SIMD-332 | simd | v1-full | Floating-point fused multiply-add (FMA) contractions and SIMD mathematical operations shall be applied only when permitted by the active numerical profile. | tasks/0469 §210.24, AMATH-60-61 | - | EPIC(E12.3) |
-| REQ-CONC-154 | concurrency | v1-full | Parallel execution shall not weaken ownership verification; concurrent mutable access requires proven disjointness or explicit synchronization, and unknown aliasing shall never be treated as independent parallel access. | tasks/0470 §211.3, §211.20, §211.23-24, APAR-20, APAR-22-24 | - | EPIC(E11.1) |
+| REQ-CONC-154 | concurrency | v1-full | Parallel execution shall not weaken ownership verification; concurrent mutable access requires proven disjointness or explicit synchronization, and unknown aliasing shall never be treated as independent parallel access. | tasks/0470 §211.3, §211.20, §211.23-24, APAR-20, APAR-22-24 | - | T402 |
 | REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | EPIC(E15.1) |
 | REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | EPIC(E22.3) |
-| REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | EPIC(E11.1) |
+| REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
 | REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | EPIC(E13.1) |
 | REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | EPIC(E22.3) |
 | REQ-TGT-002 | target-other | v1-full | The freestanding compilation profile shall not require an operating system, garbage collector, heap allocator, or monolithic runtime; Core semantics shall remain identical across hosted and freestanding profiles. | tasks/0471 §212.1-3, AKERNEL-20-24 | - | EPIC(E16.1) |
@@ -6539,8 +6539,8 @@
 | REQ-MIR-134 | mir | v1-core | A MIR `Place` shall represent a semantic storage location whose identity is independent of physical machine addresses. | tasks/0478 5, 6, ASEM-22 | - | T113 | 
 | REQ-EXP-151 | expr | v1-core | Expression evaluation shall follow deterministic order: callee evaluated first, followed by arguments evaluated left-to-right, prior to call dispatch. | tasks/0478 18 | - | T113 | 
 | REQ-MIR-135 | mir | v1-core | Divergent expressions evaluating to type `never` shall produce a termination edge with no normal control-flow successor in the MIR control flow graph. | tasks/0478 20, ASEM-21 | - | T113 | 
-| REQ-ATM-032 | atomics | v1-full | Atomic operations shall support Relaxed, Acquire, Release, AcqRel, and SeqCst memory orderings defining explicit happens-before and synchronizes-with semantic edges. | tasks/0478 32, ASEM-43 | - | EPIC(E11.1) |
-| REQ-ASY-160 | async | v1-full | Async function suspension via `await` shall be represented as an explicit `SuspensionPointId` in MIR, with values live across suspension tracked by compiler analysis. | tasks/0478 34, ASEM-44 | - | EPIC(E11.1) |
+| REQ-ATM-032 | atomics | v1-full | Atomic operations shall support Relaxed, Acquire, Release, AcqRel, and SeqCst memory orderings defining explicit happens-before and synchronizes-with semantic edges. | tasks/0478 32, ASEM-43 | - | T408 |
+| REQ-ASY-160 | async | v1-full | Async function suspension via `await` shall be represented as an explicit `SuspensionPointId` in MIR, with values live across suspension tracked by compiler analysis. | tasks/0478 34, ASEM-44 | - | T417 |
 | REQ-FFI-125 | ffi | v1-full | Foreign functions (`extern "C"`) lacking explicit semantic contracts shall be conservatively modeled as potentially reading, writing, escaping, panicking, and synchronizing. | tasks/0478 40, ASEM-49 | - | EPIC(E13.1) |
 | REQ-TOOL-191 | tooling | v1-full | Compiler semantic entities shall be identified by typed generational IDs (`LocalId`, `FunctionId`, `TypeId`, `PlaceId`) that detect stale references and prohibit raw index reuse. | tasks/0479 3, 4, ACDB-21, ACDB-22 | - | EPIC(E19.1) |
 | REQ-TYP-345 | types | v1-core | Canonical semantic types shall be interned in `TypeDB` such that structurally identical types map to identical `TypeId` handles within a compilation revision. | tasks/0479 17, 18, ACDB-23 | - | T113 |
@@ -6565,7 +6565,7 @@
 | REQ-TYP-348 | types | v1-core | In the absence of contextual type constraints or suffixes, unconstrained integer literals shall default to `i32` and float literals shall default to `f64`. | tasks/0482 34 | - | T113 |
 |REQ-TYP-349|types|v1-full|The type checker shall insert implicit coercions only for specification-defined cases: `String` to `Str`, `[N]T` to `view<T>`, owner to ephemeral `view<T>`, `mut_view<T>` to `view<T>`, and `never` to `T`.|tasks/0482 37, 39, ATYPE-IMPLEMENT-28|-|EPIC(E13.1)|
 | REQ-TYP-350 | types | v1-core | Types with Drop obligations shall not be marked with the `Copy` property. | tasks/0482 44, ATYPE-IMPLEMENT-33 | REQ-TYP-342 | T113 |
-| REQ-CONC-156 | concurrency | v1-full | `Send` (safe transfer between execution domains) and `Share` (safe concurrent shared access) shall be tracked as independent semantic properties. | tasks/0482 49, 50, ATYPE-IMPLEMENT-34 | - | EPIC(E11.1) |
+| REQ-CONC-156 | concurrency | v1-full | `Send` (safe transfer between execution domains) and `Share` (safe concurrent shared access) shall be tracked as independent semantic properties. | tasks/0482 49, 50, ATYPE-IMPLEMENT-34 | - | T400 |
 | REQ-TYP-351 | types | v1-core | Associated-type projections `<T as Trait>.Item` shall be normalized lazily upon query request rather than during initial type construction. | tasks/0482 61, 63, ATYPE-IMPLEMENT-43 | - | T113 |
 | REQ-TYP-352 | types | v1-core | Function declaration signatures shall be resolved before checking function bodies to support arbitrary mutual recursion without declaration order dependence. | tasks/0482 70, 71 | - | T113 |
 | REQ-TYP-353 | types | v1-core | `ErrorType` nodes generated during recovery shall contain errors locally and shall never satisfy trait obligations or type constraints in production builds. | tasks/0482 75, ATYPE-IMPLEMENT-41 | - | T113 |
@@ -6583,7 +6583,7 @@
 | REQ-MIR-141 | mir | v1-core | MIR lowering shall generate explicit temporary locals for subexpressions whose semantic lifetime must be tracked by ownership and drop analysis. | tasks/0484 28, 29 | - | T113 | 
 |REQ-MIR-142|mir|v1-full|Creation of `view<T>` and `mut_view<T>` shall lower to explicit `MakeView` and `MakeMutView` semantic instructions recording provenance, region, and access mode.|tasks/0484 36, 37, 82, AMIR-35, AMIR-36|-|EPIC(E13.1)|
 | REQ-MIR-143 | mir | v1-core | Raw MIR shall model values through mutable `Place` projections before ownership verification and SSA transformation. | tasks/0484 93, 94 | REQ-MIR-134 | T113 | 
-|REQ-MIR-144|mir|v1-full|Atomic operations with memory orderings and volatile memory accesses shall be lowered to dedicated MIR instructions that cannot be merged, reordered, or removed by ordinary memory optimizations.|tasks/0484 65, 66, AMIR-40, AMIR-41|-|EPIC(E11.1)|
+|REQ-MIR-144|mir|v1-full|Atomic operations with memory orderings and volatile memory accesses shall be lowered to dedicated MIR instructions that cannot be merged, reordered, or removed by ordinary memory optimizations.|tasks/0484 65, 66, AMIR-40, AMIR-41|-|T405|
 | REQ-OWN-248 | ownership | v1-core | Ownership states (`Uninit`, `Owned`, `Moved`, `PartiallyMoved`, `Dropped`) shall be tracked at field-sensitive Place Tree granularity. | tasks/0485 5, 6, 8, AOWN-20, AOWN-21 | REQ-MIR-143 | T113 | 
 | REQ-OWN-249 | ownership | v1-core | Reading, moving, or dropping a place in `Moved` or `PartiallyMoved` state shall be rejected with diagnostic `AMOVE-01`/`AMOVE-02`. | tasks/0485 11, 12, AOWN-25 | REQ-OWN-248 | T113 | 
 | REQ-DRP-061 | drop | v1-core | Types implementing custom `Drop` logic shall prohibit partial moves of their fields. | tasks/0485 44, AOWN-27, AMIR-48 | REQ-OWN-248, REQ-OWN-249 | T113 | 
@@ -6604,70 +6604,70 @@
 |REQ-OPT-358|optimizer|v1-full|Verified disjoint mutable capability regions shall be exported to `AliasInfo` as internal `NO_ALIAS` facts for compiler vectorization and memory optimization.|tasks/0486 43, 44, ACAP-45, ACAP-46|-|EPIC(E15.1)|
 | REQ-CAP-152 | capability | v1-full | Converting a raw pointer to a safe view shall be restricted to `unsafe` blocks, requiring the programmer to establish provenance, alignment, and validity preconditions before ordinary verification resumes. | tasks/0486 78, 79, 80, ACAP-42, ACAP-43, ACAP-44 | - | EPIC(E13.1) |
 | REQ-VER-024 | verifier | v1-core | Function effects shall be inferred automatically by the compiler across the call graph without requiring mandatory programmer effect annotations on ordinary function declarations. | tasks/0487 1, 20, AEFFECT-20, AEFFECT-21, AEFFECT-23 | - | T113 | 
-|REQ-VER-025|verifier|v1-full|Asynchronous suspension (`AsyncSuspend`) and thread blocking (`Blocking`) shall be tracked as distinct effects, enabling static rejection of blocking calls in async contexts.|tasks/0487 33, 34, 35, AEFFECT-30|-|EPIC(E11.1)|
+|REQ-VER-025|verifier|v1-full|Asynchronous suspension (`AsyncSuspend`) and thread blocking (`Blocking`) shall be tracked as distinct effects, enabling static rejection of blocking calls in async contexts.|tasks/0487 33, 34, 35, AEFFECT-30|-|T416|
 | REQ-VER-026 | verifier | v1-core | Operations accessing the environment, system clock, random number generators, filesystems, network sockets, or processes shall be classified as external state effects and shall never be assumed pure. | tasks/0487 36, 37, 38, 39, 40, AEFFECT-34, AEFFECT-35, AEFFECT-36, AEFFECT-37, AEFFECT-38 | REQ-VER-024 | T113 | 
 |REQ-VER-027|verifier|v1-full|Effect verification shall enforce execution profile boundaries (rejecting forbidden OS effects in `@kernel` GPU code and tracking comptime external inputs in `BuildFingerprint`) and shall constrain dead-code elimination from removing observable external effects.|tasks/0487 41, 42, 45, 49, 50, 92, AEFFECT-40, AEFFECT-41, AEFFECT-42, AEFFECT-49, AEFFECT-50, AEFFECT-70|-|EPIC(E15.1)|
-| REQ-CONC-157 | concurrency | v1-full | Ownership quyết định ai sở hữu. Capability quyết định ai được truy cập. Effect quyết định đang làm gì. Concurrency quyết định các hành động đó có thể xảy ra đồng thời và được quan sát theo thứ tự nào. | 0488 BOOTSTRAP-229 — CONCURRENCY SEMANTICS & DATA-RACE VERIFIER | - | EPIC(E11.1) |
-| REQ-CONC-158 | concurrency | v1-full | [ACONCUR-140] Send and Share are distinct semantic properties. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-159 | concurrency | v1-full | [ACONCUR-141] Send permits ownership transfer between compatible execution domains. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-160 | concurrency | v1-full | [ACONCUR-142] Share permits concurrent shared access according to the type contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-161 | concurrency | v1-full | [ACONCUR-143] Send does not imply Share. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-162 | concurrency | v1-full | [ACONCUR-144] Share does not imply mutable concurrent access. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-163 | concurrency | v1-full | [ACONCUR-145] Send and Share are compiler-derived by default. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-164 | concurrency | v1-full | [ACONCUR-146] Programmer annotations cannot bypass concurrency verification. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-165 | concurrency | v1-full | [ACONCUR-147] Safe code cannot contain an unverified ordinary-memory data race. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-166 | concurrency | v1-full | [ACONCUR-148] Conflicting concurrent ordinary accesses require happens-before or valid synchronization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-167 | concurrency | v1-full | [ACONCUR-149] READ/READ concurrent accesses do not constitute a data race. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-168 | concurrency | v1-full | [ACONCUR-150] READ/WRITE conflicting accesses are rejected unless synchronized or otherwise proven safe. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-169 | concurrency | v1-full | [ACONCUR-151] WRITE/WRITE conflicting accesses are rejected unless synchronized or otherwise proven safe. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-170 | concurrency | v1-full | [ACONCUR-152] UNKNOWN region overlap is never treated as DISJOINT. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-171 | concurrency | v1-full | [ACONCUR-153] Disjoint region proofs may eliminate race candidates. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-172 | concurrency | v1-full | [ACONCUR-154] Atomic memory is semantically distinct from ordinary memory. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-173 | concurrency | v1-full | [ACONCUR-155] Atomic operations are not ordinary mutable capabilities. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-174 | concurrency | v1-full | [ACONCUR-156] Atomicity and memory ordering are distinct properties. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-175 | concurrency | v1-full | [ACONCUR-157] Relaxed atomic operations do not create stronger synchronization than specified. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-176 | concurrency | v1-full | [ACONCUR-158] Acquire/Release synchronization is represented explicitly in the memory model. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-177 | concurrency | v1-full | [ACONCUR-159] SeqCst operations participate in the global sequentially-consistent order. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-178 | concurrency | v1-full | [ACONCUR-160] Volatile access is distinct from atomic synchronization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-179 | concurrency | v1-full | [ACONCUR-161] Compiler fences and CPU memory fences are distinct semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-180 | concurrency | v1-full | [ACONCUR-162] Mutex unlock/lock establishes the synchronization specified by its contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-181 | concurrency | v1-full | [ACONCUR-163] Synchronization guards are ownership-bearing and non-Copy. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-182 | concurrency | v1-full | [ACONCUR-164] Guard Drop performs the semantic release operation specified by its contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-183 | concurrency | v1-full | [ACONCUR-165] Synchronous guards cannot cross await unless explicitly supported by contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-184 | concurrency | v1-full | [ACONCUR-166] Async synchronization primitives are distinct from blocking primitives. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-185 | concurrency | v1-full | [ACONCUR-167] Channel send/receive establishes the ownership and synchronization semantics specified by the channel contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-186 | concurrency | v1-full | [ACONCUR-168] Channel ownership transfer does not imply serialization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-187 | concurrency | v1-full | [ACONCUR-169] Thread completion and join establish the specified synchronization relation. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-188 | concurrency | v1-full | [ACONCUR-170] Detached execution provides no implicit completion synchronization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-189 | concurrency | v1-full | [ACONCUR-171] Task migration requires Send unless execution affinity explicitly prevents migration. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-190 | concurrency | v1-full | [ACONCUR-172] spawn_local may avoid Send requirements only under a verified local-execution contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-191 | concurrency | v1-full | [ACONCUR-173] Future state crossing await is checked for lifetime, capability, storage and migration safety. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-192 | concurrency | v1-full | [ACONCUR-174] Views cannot outlive their provenance owner or storage contract. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-193 | concurrency | v1-full | [ACONCUR-175] Mutable capabilities cannot be concurrently duplicated. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-194 | concurrency | v1-full | [ACONCUR-176] Disjoint mutable capabilities may execute concurrently. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-195 | concurrency | v1-full | [ACONCUR-177] Unsafe does not disable concurrency verification after a safe capability is re-established. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-196 | concurrency | v1-full | [ACONCUR-178] Unsafe contracts may establish trusted preconditions for subsequent verification. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-197 | concurrency | v1-full | [ACONCUR-179] Cancellation is distinct from panic and forced termination. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-198 | concurrency | v1-full | [ACONCUR-180] Safe Axiom code does not support forced thread termination semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-199 | concurrency | v1-full | [ACONCUR-181] Structured concurrency is preferred but detached execution is explicit. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-200 | concurrency | v1-full | [ACONCUR-182] Scheduler implementation is outside Core semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-201 | concurrency | v1-full | [ACONCUR-183] Fairness, starvation-freedom and deadlock-freedom are not general Core guarantees. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-202 | concurrency | v1-full | [ACONCUR-184] Notification is distinct from memory publication. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-203 | concurrency | v1-full | [ACONCUR-185] GPU synchronization uses execution-domain-specific semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-204 | concurrency | v1-full | [ACONCUR-186] Host/device synchronization must be explicit. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-205 | concurrency | v1-full | [ACONCUR-187] Cross-process Send is distinct from serialization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-206 | concurrency | v1-full | [ACONCUR-188] Shared-memory access requires explicit layout, lifetime and synchronization contracts. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-207 | concurrency | v1-full | [ACONCUR-189] Distributed communication is not automatically memory synchronization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-208 | concurrency | v1-full | [ACONCUR-190] Concurrency proofs are erased unless required by runtime semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-209 | concurrency | v1-full | [ACONCUR-191] Send/Share verification introduces no mandatory runtime overhead. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-210 | concurrency | v1-full | [ACONCUR-192] Race analysis is part of the correctness boundary before optimization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-211 | concurrency | v1-full | [ACONCUR-193] Concurrency facts are available to optimization. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-212 | concurrency | v1-full | [ACONCUR-194] Concurrency facts may enable vectorization and parallelization when semantic dependencies permit. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-213 | concurrency | v1-full | [ACONCUR-195] Optimization may not invalidate established concurrency semantics. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-214 | concurrency | v1-full | [ACONCUR-196] Concurrency verification is deterministic. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-215 | concurrency | v1-full | [ACONCUR-197] Concurrency diagnostics expose conflicting accesses, regions, domains and synchronization state. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-216 | concurrency | v1-full | [ACONCUR-198] AI-generated concurrency code is subject to the same verifier. | 0488 §130 | - | EPIC(E11.1) |
-| REQ-CONC-217 | concurrency | v1-full | [ACONCUR-199] The concurrency model composes with ownership, capability, effect, async and GPU semantics. | 0488 §130 | - | EPIC(E11.1) |
+| REQ-CONC-157 | concurrency | v1-full | Ownership quyết định ai sở hữu. Capability quyết định ai được truy cập. Effect quyết định đang làm gì. Concurrency quyết định các hành động đó có thể xảy ra đồng thời và được quan sát theo thứ tự nào. | 0488 BOOTSTRAP-229 — CONCURRENCY SEMANTICS & DATA-RACE VERIFIER | - | T402 |
+| REQ-CONC-158 | concurrency | v1-full | [ACONCUR-140] Send and Share are distinct semantic properties. | 0488 §130 | - | T404 |
+| REQ-CONC-159 | concurrency | v1-full | [ACONCUR-141] Send permits ownership transfer between compatible execution domains. | 0488 §130 | - | T404 |
+| REQ-CONC-160 | concurrency | v1-full | [ACONCUR-142] Share permits concurrent shared access according to the type contract. | 0488 §130 | - | T404 |
+| REQ-CONC-161 | concurrency | v1-full | [ACONCUR-143] Send does not imply Share. | 0488 §130 | - | T404 |
+| REQ-CONC-162 | concurrency | v1-full | [ACONCUR-144] Share does not imply mutable concurrent access. | 0488 §130 | - | T404 |
+| REQ-CONC-163 | concurrency | v1-full | [ACONCUR-145] Send and Share are compiler-derived by default. | 0488 §130 | - | T404 |
+| REQ-CONC-164 | concurrency | v1-full | [ACONCUR-146] Programmer annotations cannot bypass concurrency verification. | 0488 §130 | - | T404 |
+| REQ-CONC-165 | concurrency | v1-full | [ACONCUR-147] Safe code cannot contain an unverified ordinary-memory data race. | 0488 §130 | - | T402 |
+| REQ-CONC-166 | concurrency | v1-full | [ACONCUR-148] Conflicting concurrent ordinary accesses require happens-before or valid synchronization. | 0488 §130 | - | T403 |
+| REQ-CONC-167 | concurrency | v1-full | [ACONCUR-149] READ/READ concurrent accesses do not constitute a data race. | 0488 §130 | - | T402 |
+| REQ-CONC-168 | concurrency | v1-full | [ACONCUR-150] READ/WRITE conflicting accesses are rejected unless synchronized or otherwise proven safe. | 0488 §130 | - | T402 |
+| REQ-CONC-169 | concurrency | v1-full | [ACONCUR-151] WRITE/WRITE conflicting accesses are rejected unless synchronized or otherwise proven safe. | 0488 §130 | - | T402 |
+| REQ-CONC-170 | concurrency | v1-full | [ACONCUR-152] UNKNOWN region overlap is never treated as DISJOINT. | 0488 §130 | - | T402 |
+| REQ-CONC-171 | concurrency | v1-full | [ACONCUR-153] Disjoint region proofs may eliminate race candidates. | 0488 §130 | - | T402 |
+| REQ-CONC-172 | concurrency | v1-full | [ACONCUR-154] Atomic memory is semantically distinct from ordinary memory. | 0488 §130 | - | T405 |
+| REQ-CONC-173 | concurrency | v1-full | [ACONCUR-155] Atomic operations are not ordinary mutable capabilities. | 0488 §130 | - | T406 |
+| REQ-CONC-174 | concurrency | v1-full | [ACONCUR-156] Atomicity and memory ordering are distinct properties. | 0488 §130 | - | T405 |
+| REQ-CONC-175 | concurrency | v1-full | [ACONCUR-157] Relaxed atomic operations do not create stronger synchronization than specified. | 0488 §130 | - | T406 |
+| REQ-CONC-176 | concurrency | v1-full | [ACONCUR-158] Acquire/Release synchronization is represented explicitly in the memory model. | 0488 §130 | - | T404 |
+| REQ-CONC-177 | concurrency | v1-full | [ACONCUR-159] SeqCst operations participate in the global sequentially-consistent order. | 0488 §130 | - | T406 |
+| REQ-CONC-178 | concurrency | v1-full | [ACONCUR-160] Volatile access is distinct from atomic synchronization. | 0488 §130 | - | T405 |
+| REQ-CONC-179 | concurrency | v1-full | [ACONCUR-161] Compiler fences and CPU memory fences are distinct semantics. | 0488 §130 | - | T407 |
+| REQ-CONC-180 | concurrency | v1-full | [ACONCUR-162] Mutex unlock/lock establishes the synchronization specified by its contract. | 0488 §130 | - | T411 |
+| REQ-CONC-181 | concurrency | v1-full | [ACONCUR-163] Synchronization guards are ownership-bearing and non-Copy. | 0488 §130 | - | T404 |
+| REQ-CONC-182 | concurrency | v1-full | [ACONCUR-164] Guard Drop performs the semantic release operation specified by its contract. | 0488 §130 | - | T404 |
+| REQ-CONC-183 | concurrency | v1-full | [ACONCUR-165] Synchronous guards cannot cross await unless explicitly supported by contract. | 0488 §130 | - | T404 |
+| REQ-CONC-184 | concurrency | v1-full | [ACONCUR-166] Async synchronization primitives are distinct from blocking primitives. | 0488 §130 | - | T421 |
+| REQ-CONC-185 | concurrency | v1-full | [ACONCUR-167] Channel send/receive establishes the ownership and synchronization semantics specified by the channel contract. | 0488 §130 | - | T412 |
+| REQ-CONC-186 | concurrency | v1-full | [ACONCUR-168] Channel ownership transfer does not imply serialization. | 0488 §130 | - | T412 |
+| REQ-CONC-187 | concurrency | v1-full | [ACONCUR-169] Thread completion and join establish the specified synchronization relation. | 0488 §130 | - | T414 |
+| REQ-CONC-188 | concurrency | v1-full | [ACONCUR-170] Detached execution provides no implicit completion synchronization. | 0488 §130 | - | T422 |
+| REQ-CONC-189 | concurrency | v1-full | [ACONCUR-171] Task migration requires Send unless execution affinity explicitly prevents migration. | 0488 §130 | - | T423 |
+| REQ-CONC-190 | concurrency | v1-full | [ACONCUR-172] spawn_local may avoid Send requirements only under a verified local-execution contract. | 0488 §130 | - | T421 |
+| REQ-CONC-191 | concurrency | v1-full | [ACONCUR-173] Future state crossing await is checked for lifetime, capability, storage and migration safety. | 0488 §130 | - | T415 |
+| REQ-CONC-192 | concurrency | v1-full | [ACONCUR-174] Views cannot outlive their provenance owner or storage contract. | 0488 §130 | - | T404 |
+| REQ-CONC-193 | concurrency | v1-full | [ACONCUR-175] Mutable capabilities cannot be concurrently duplicated. | 0488 §130 | - | T404 |
+| REQ-CONC-194 | concurrency | v1-full | [ACONCUR-176] Disjoint mutable capabilities may execute concurrently. | 0488 §130 | - | T402 |
+| REQ-CONC-195 | concurrency | v1-full | [ACONCUR-177] Unsafe does not disable concurrency verification after a safe capability is re-established. | 0488 §130 | - | T402 |
+| REQ-CONC-196 | concurrency | v1-full | [ACONCUR-178] Unsafe contracts may establish trusted preconditions for subsequent verification. | 0488 §130 | - | T402 |
+| REQ-CONC-197 | concurrency | v1-full | [ACONCUR-179] Cancellation is distinct from panic and forced termination. | 0488 §130 | - | T404 |
+| REQ-CONC-198 | concurrency | v1-full | [ACONCUR-180] Safe Axiom code does not support forced thread termination semantics. | 0488 §130 | - | T410 |
+| REQ-CONC-199 | concurrency | v1-full | [ACONCUR-181] Structured concurrency is preferred but detached execution is explicit. | 0488 §130 | - | T422 |
+| REQ-CONC-200 | concurrency | v1-full | [ACONCUR-182] Scheduler implementation is outside Core semantics. | 0488 §130 | - | T420 |
+| REQ-CONC-201 | concurrency | v1-full | [ACONCUR-183] Fairness, starvation-freedom and deadlock-freedom are not general Core guarantees. | 0488 §130 | - | T406 |
+| REQ-CONC-202 | concurrency | v1-full | [ACONCUR-184] Notification is distinct from memory publication. | 0488 §130 | - | T404 |
+| REQ-CONC-203 | concurrency | v1-full | [ACONCUR-185] GPU synchronization uses execution-domain-specific semantics. | 0488 §130 | - | T404 |
+| REQ-CONC-204 | concurrency | v1-full | [ACONCUR-186] Host/device synchronization must be explicit. | 0488 §130 | - | T404 |
+| REQ-CONC-205 | concurrency | v1-full | [ACONCUR-187] Cross-process Send is distinct from serialization. | 0488 §130 | - | T404 |
+| REQ-CONC-206 | concurrency | v1-full | [ACONCUR-188] Shared-memory access requires explicit layout, lifetime and synchronization contracts. | 0488 §130 | - | T404 |
+| REQ-CONC-207 | concurrency | v1-full | [ACONCUR-189] Distributed communication is not automatically memory synchronization. | 0488 §130 | - | T404 |
+| REQ-CONC-208 | concurrency | v1-full | [ACONCUR-190] Concurrency proofs are erased unless required by runtime semantics. | 0488 §130 | - | T403 |
+| REQ-CONC-209 | concurrency | v1-full | [ACONCUR-191] Send/Share verification introduces no mandatory runtime overhead. | 0488 §130 | - | T403 |
+| REQ-CONC-210 | concurrency | v1-full | [ACONCUR-192] Race analysis is part of the correctness boundary before optimization. | 0488 §130 | - | T403 |
+| REQ-CONC-211 | concurrency | v1-full | [ACONCUR-193] Concurrency facts are available to optimization. | 0488 §130 | - | T403 |
+| REQ-CONC-212 | concurrency | v1-full | [ACONCUR-194] Concurrency facts may enable vectorization and parallelization when semantic dependencies permit. | 0488 §130 | - | T403 |
+| REQ-CONC-213 | concurrency | v1-full | [ACONCUR-195] Optimization may not invalidate established concurrency semantics. | 0488 §130 | - | T403 |
+| REQ-CONC-214 | concurrency | v1-full | [ACONCUR-196] Concurrency verification is deterministic. | 0488 §130 | - | T403 |
+| REQ-CONC-215 | concurrency | v1-full | [ACONCUR-197] Concurrency diagnostics expose conflicting accesses, regions, domains and synchronization state. | 0488 §130 | - | T403 |
+| REQ-CONC-216 | concurrency | v1-full | [ACONCUR-198] AI-generated concurrency code is subject to the same verifier. | 0488 §130 | - | T403 |
+| REQ-CONC-217 | concurrency | v1-full | [ACONCUR-199] The concurrency model composes with ownership, capability, effect, async and GPU semantics. | 0488 §130 | - | T415 |
 | REQ-MIR-145 | mir | v1-core | Được phép reorder cái gì, không được reorder cái gì, và khi nào một giá trị được phép được thread khác quan sát. | 0489 BOOTSTRAP-230 — AXIOM MEMORY MODEL FORMALIZATION & MACHINE MEMORY ORDERING | - | T113 | 
 | REQ-MIR-146 | mir | v1-core | Memory model phức tạp nằm trong compiler; programmer chỉ cần sử dụng các abstraction như ordinary value, Atomic<T>, Mutex<T>, channel, async... | 0489 BOOTSTRAP-230 — AXIOM MEMORY MODEL FORMALIZATION & MACHINE MEMORY ORDERING | - | T113 | 
 | REQ-MIR-147 | mir | v1-core | Memory location là semantic concept, không nhất thiết là physical RAM address. | 0489 §2 | - | T113 | 
@@ -10233,12 +10233,12 @@
 | REQ-CORE-3160 | compiler | v1-full | The control flow must be simple at the source level, while the MIR must accurately represent every execution path without needing to re-infer semantics, in order to precisely determine execution order, value lifetimes, function exit points, and mandatory cleanups. | 0617 §358 | - | EPIC(E18.1) |
 | REQ-CORE-3161 | compiler | v1-full | The rules for Drop, defer, return, break, continue, and panic must be unified into a single cleanup mechanism in the compiler so that async execution, exception or unwind operations, closures, coroutines, and the optimizer do not have to handle each case individually. | 0618 §359 | - | EPIC(E18.1) |
 | REQ-CORE-3162 | compiler | v1-full | The compiler must ensure that every exit path from a scope goes through the exact required cleanups in the correct order and exactly once, and that cleanups are deterministic, avoid double-drops, do not drop moved values, do not use expired capabilities, create no hidden allocations, incur no avoidable runtime overhead, behave identically in debug and release builds, are compatible with async lowering and panic abort or unwind, and can be optimized directly into machine code. | 0618 §1 | - | EPIC(E18.1) |
-| REQ-ASY-161 | async | v1-full | The compiler must transform async and await constructs into a state machine based on control-flow and storage transformations rather than a runtime object model, and it must not make the executor or runtime a mandatory part of the Core. | 0619 §360 | - | EPIC(E11.1) |
-| REQ-ASY-162 | async | v1-full | The async and await constructs must be implemented as a compiler transformation of control-flow and storage rather than as a runtime object model, ensuring that the executor or runtime does not become a mandatory part of the Core. | 0619 §360 | - | EPIC(E11.1) |
-| REQ-ASY-163 | async | v1-full | The Executor and Task components must not be made mandatory parts of the Core, but instead must be treated as a runtime or library subsystem with a clear compiler contract for scheduling and executing Futures. | 0620 §361 | - | EPIC(E11.1) |
-| REQ-ASY-164 | async | v1-full | Axiom must keep the concepts of Future as computation, Task as an owned execution instance, and Executor as a scheduler completely independent, and must not conflate an asynchronous function directly with a Task. | 0620 §1 | - | EPIC(E11.1) |
-| REQ-ASY-165 | async | v1-full | Axiom must provide a unified synchronization model for threads, async tasks, and other execution domains without making every synchronization primitive a mandatory runtime dependency. | 0621 §362 | - | EPIC(E11.1) |
-| REQ-ASY-166 | async | v1-full | Axiom must clearly separate the semantic primitives for Ownership, Capability, Synchronization, and Execution, meaning that Arc does not inherently make its type thread-safe, Mutex does not inherently create shared ownership, and Atomic does not function as a lock. | 0621 §1 | - | EPIC(E11.1) |
+| REQ-ASY-161 | async | v1-full | The compiler must transform async and await constructs into a state machine based on control-flow and storage transformations rather than a runtime object model, and it must not make the executor or runtime a mandatory part of the Core. | 0619 §360 | - | T420 |
+| REQ-ASY-162 | async | v1-full | The async and await constructs must be implemented as a compiler transformation of control-flow and storage rather than as a runtime object model, ensuring that the executor or runtime does not become a mandatory part of the Core. | 0619 §360 | - | T420 |
+| REQ-ASY-163 | async | v1-full | The Executor and Task components must not be made mandatory parts of the Core, but instead must be treated as a runtime or library subsystem with a clear compiler contract for scheduling and executing Futures. | 0620 §361 | - | T420 |
+| REQ-ASY-164 | async | v1-full | Axiom must keep the concepts of Future as computation, Task as an owned execution instance, and Executor as a scheduler completely independent, and must not conflate an asynchronous function directly with a Task. | 0620 §1 | - | T420 |
+| REQ-ASY-165 | async | v1-full | Axiom must provide a unified synchronization model for threads, async tasks, and other execution domains without making every synchronization primitive a mandatory runtime dependency. | 0621 §362 | - | T424 |
+| REQ-ASY-166 | async | v1-full | Axiom must clearly separate the semantic primitives for Ownership, Capability, Synchronization, and Execution, meaning that Arc does not inherently make its type thread-safe, Mutex does not inherently create shared ownership, and Atomic does not function as a lock. | 0621 §1 | - | T406 |
 | REQ-CORE-3163 | compiler | v1-full | The compiler must freeze its memory model by explicitly defining permitted reorderings, the conditions for data visibility between threads, and the methodology for proving that safe programs are free of data races. | 0622 §363 | - | EPIC(E18.1) |
 | REQ-CORE-3164 | compiler | v1-full | The compiler's memory model must serve as the semantic foundation for all Thread, Async, GPU, Atomic, and Optimizer subsystems rather than just designing additional concurrency primitives like Mutex or Channel. | 0622 §363 | - | EPIC(E18.1) |
 | REQ-CORE-3165 | compiler | v1-full | The execution model must clearly define how a program maps to OS threads and how the compiler differentiates between CPU threads, tasks, workers, interrupts, and GPU executions without forcing the entire language to depend on a runtime, strictly keeping threads, Futures, Tasks, and synchronization as separate concepts. | 0623 §364 | - | EPIC(E18.1) |

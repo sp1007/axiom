@@ -99,7 +99,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P8 FFI (backend maturity trimmed by R7) | T065 | — | (T075) | T060, T061b |
 | P9 libraries (self-host std subset) | T069–T075, T071b, T071c, T073a, T074b | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
-| P11 concurrency & async | T088–T090 | T211 | T311 | P10 |
+| P11 concurrency & async | T088–T090, T400–T428 | T211 | T311 | P10 |
 | P12 numeric & SIMD | — | T212 | T312 | P10 |
 | P13 low-level & security | — | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058 | T214 | T314 | P10 |
@@ -127,20 +127,20 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
 ### P11 — Concurrency & async (compiler/ + std/)
 - **E11.1 Concurrency semantics** — Send/Share auto-traits, spawn capture rules, data-race = compile
   error, memory model. Src 0079 0091 0105 0033 0040 tasks/0298 tasks/0488 tasks/0685. Exit: race
-  conformance suite green. *(T089)*
+  conformance suite green. *(T089, T400–T404)*
 - **E11.2 Atomics & memory ordering** — Atomic<T>, orderings, fences, lowering to x64/other targets,
   oracle scheduler exploration. Src 0092 0208 tasks/0328 tasks/0515. Exit: litmus tests pass under
-  oracle and native stress.
+  oracle and native stress. *(T405–T409)*
 - **E11.3 Threads & synchronisation library** — thread spawn/join, Mutex, RwLock, Condvar, Once,
   channels, thread-local storage. Src 0203 0206 0207 0209 tasks/0329 tasks/0623. Exit: native stress
-  suite. *(T090)*
+  suite. *(T090, T410–T414)*
 - **E11.4 Async/await** — Future lang item, state-machine lowering, cancellation & drop, Waker.
-  Src 0093 0201 0202 0248 tasks/0275 tasks/0297. Exit: async conformance. *(T088)*
+  Src 0093 0201 0202 0248 tasks/0275 tasks/0297. Exit: async conformance. *(T088, T415–T419)*
 - **E11.5 Executors, fibers & structured concurrency** — single/multi-thread executor, task groups,
   fiber/stackful model, scheduler. Src 0204 0205 tasks/0277 tasks/0278 tasks/0620. Exit: executor
-  benchmarks + structured-cancellation tests.
+  benchmarks + structured-cancellation tests. *(T420–T424)*
 - **E11.6 Async IO integration** — IOCP (Windows), epoll/io_uring (Linux) reactor, unified IO model.
-  Src 0221 tasks/0335. Exit: async file/socket tests.
+  Src 0221 tasks/0335. Exit: async file/socket tests. *(T425–T428)*
 
 ### P12 — Numeric, floating point & SIMD
 - **E12.1 Integer model completion** — all widths incl. i128/u128 if specified, wrapping/checked/
@@ -409,3 +409,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-10-30 | T153 unblock: `compiler/mir/builder.ax` added to T153 `paths:` (associated-const `Type.CONST` operand case; no concurrent owner); new P10 task T161 AX0-FIX-09 (trait default methods instantiated per implementing type, axiom0 + port + interpreter lockstep; REQ-TRT-005/011), depends on T153; T086 depends on T161 | unblock-T153 |
 | 2026-10-31 | Added owner requirement REQ-OWNER-008 to E13.6 (`@at`): low-level/unsafe code can obtain the memory address of any function (`fn`, `extern fn`, `@at fn`) or variable/static (`static`, `static mut`, `@at` item, local, field/element place) via `address_of` / `address_of_mut` / `addr_of` and pointer/fn-pointer `as usize` casts | ADR-0001 §7 |
 | 2026-11-01 | T086 (Stage-1 gate) unblock: new P10 fix task T162 (`owner: axiom-semantics`) fixes 8 port/test defects blocking `axiomc1` full-suite pass (`compiler/interp/interp.ax` wrapping binops, `compiler/mir/builder.ax` + `bundle_common.py` unterminated join blocks in `interp_opt.session`, `bundle_common.py` `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` suppression vs duplicate `HIR_ITEM_STATIC` report in `typeck.ax`, `typeck.ax` + `verifier.ax` array-repeat `TY_INT_VAR` resolution, `compiler/mir/mir.ax` bare-place `MIR_OP_COPY` fallback, `pipeline.ax` + `interp_opt/session.ax` exit codes `124`/`125` and host CLI args, `interp_opt/session.ax` trait default-method `mir_map` aliasing after T161, and `gnu_as_vectors.ax` `gatecheck.py` rule (c) inline `xfail` comments + `qa_axiomc_cli_edges.test`); T086 depends on T162 | unblock-T086 |
+| 2026-11-02 | T211 P11 phase expansion (`P11-concurrency-async`): expanded E11.1–E11.6 into 29 new tasks `T400`–`T428` alongside refined existing tasks `T088`–`T090` (32 tasks total across 6 epics: E11.1 6 tasks `T089, T400–T404`; E11.2 5 tasks `T405–T409`; E11.3 6 tasks `T090, T410–T414`; E11.4 6 tasks `T088, T415–T419`; E11.5 5 tasks `T420–T424`; E11.6 4 tasks `T425–T428`), converted all 417 `EPIC(E11.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T311` (`depends: [T211, T088–T090, T400–T428]`) | T211 |
