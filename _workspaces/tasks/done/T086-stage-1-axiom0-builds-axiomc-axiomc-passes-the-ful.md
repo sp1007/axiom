@@ -8,13 +8,14 @@ model: opus
 gate_model: opus
 depends: [T085, T134, T139, T140, T141, T142, T143, T144, T145, T146, T147, T148, T149, T150, T151, T152, T153, T154, T155, T156, T157, T158, T159, T161, T162, T163]
 priority: 120
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tools/bootstrap.py, tests/selfhost/stage1, tests/perf]
 spec: [0167, 0150, tasks/0371]
 covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
-started: 2026-11-02 08:30:49
+started: 2026-11-02 17:38:44
 unblocks: 2
+finished: 2026-11-02 18:56:33
 ---
 # T086 — Stage-1: axiom0 builds axiomc; axiomc passes the full suite
 
@@ -66,3 +67,5 @@ The Axiom compiler, written in Axiom, works.
 - 2026-11-02 08:30:49 started (attempt 1) T086-impl
 - 2026-11-02 14:06:22 block: 3 root causes in compiler/interp (InterpValue 64B vs 256B truncation), compiler/types+verify (TY_STRUCT/TY_ENUM finalize_types + verify_types_compatible), and tests/run/native_ptr/write_bytes_1mb.ax timeout (11 failing entries across 8 test files; see T086-report.md Section 7)
 - 2026-11-02 14:08:48 unblocked (cycle 2) 
+- 2026-11-02 17:38:44 started (attempt 1) 
+- 2026-11-02 18:56:33 accepted by QA -> done
