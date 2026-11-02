@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215]
 priority: 93
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-70-optir-ssa-memoryssa.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, 0161, 0162, 0165, tasks/0315, tasks/0366, tasks/0398, tasks/0399, tasks/0545, tasks/0546]
 covers: [REQ-OPT-010, REQ-OPT-016, REQ-OPT-017, REQ-OPT-018, REQ-OPT-019, REQ-OPT-020, REQ-OPT-021, REQ-OPT-022, REQ-OPT-023, REQ-OPT-047, REQ-OPT-048, REQ-OPT-049, REQ-OPT-050, REQ-OPT-051, REQ-OPT-052, REQ-OPT-053, REQ-OPT-054, REQ-OPT-055, REQ-OPT-056, REQ-OPT-057, REQ-OPT-058, REQ-OPT-059, REQ-OPT-296, REQ-OPT-297, REQ-OPT-298, REQ-OPT-321, REQ-OPT-322, REQ-OPT-323, REQ-OPT-324, REQ-OPT-325, REQ-OPT-326, REQ-OPT-327, REQ-OPT-328, REQ-OPT-329, REQ-OPT-330, REQ-OPT-331, REQ-OPT-332, REQ-OPT-333, REQ-OPT-359, REQ-OPT-360, REQ-OPT-361, REQ-OPT-362]
+started: 2026-11-03 03:25:30
+finished: 2026-11-03 03:47:37
 ---
 # T600 — E15.1 — Canonical OptIR, SSA/MemorySSA & pass-legality specification (SPEC-70)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Axiom's Unified Dataflow Optimizatio
 
 ## Log
 - 2026-11-03 02:38:00 created by T215 (P15 phase planning)
+- 2026-11-03 03:25:30 started (attempt 1) 
+- 2026-11-03 03:47:37 accepted by QA -> done
