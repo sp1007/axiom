@@ -6,15 +6,15 @@ owner: axiom-qa
 reviewer: axiom-architect
 model: opus
 gate_model: opus
-depends: [T085, T134, T139, T140, T141, T142, T143, T144, T145, T146, T147, T148, T149, T150, T151, T152, T153, T154, T155, T156, T157, T158, T159, T161, T162]
+depends: [T085, T134, T139, T140, T141, T142, T143, T144, T145, T146, T147, T148, T149, T150, T151, T152, T153, T154, T155, T156, T157, T158, T159, T161, T162, T163]
 priority: 120
 status: todo
 attempts: 0
 paths: [tools/bootstrap.py, tests/selfhost/stage1, tests/perf]
 spec: [0167, 0150, tasks/0371]
 covers: [REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006]
-started: 2026-10-31 23:45:16
-unblocks: 1
+started: 2026-11-02 08:30:49
+unblocks: 2
 ---
 # T086 — Stage-1: axiom0 builds axiomc; axiomc passes the full suite
 
@@ -56,9 +56,13 @@ The Axiom compiler, written in Axiom, works.
 - Parity plan added 2026-10-20 (ADR-0035, `_workspaces/reports/plan-axiomc-divergence.md`): T147 (AX0-FIX-05
   string/data symbols + local-symbol linking), T148–T156 (port parity fixes, registry empty) are prerequisites.
 - Unblock 2026-11-01 (`unblock-T086`): prerequisite fix task T162 resolves the 8 port interpreter/typeck/MIR-parser/gatecheck defects reported in `_workspaces/reports/T086-report.md` (lines 111–201). `tools/bootstrap.py`, `tests/perf/selfhost.csv`, and `tests/selfhost/stage1/*` from attempt 1 remain in place; after T162 completes, rebuild `axiomc1.exe` in `build-snap-T086` and re-run the full verification suite.
+- Unblock 2026-11-02 (`unblock-T086` cycle 2): prerequisite fix task T163 resolves the remaining 3 root causes (8 test files / 11 entries out of 2,887 active entries: `InterpValue` 256-byte capacity in `compiler/interp`, `TY_STRUCT`/`TY_ENUM` typeck finalization & verifier compatibility in `compiler/types` + `compiler/verify`, and `write_bytes_1mb.ax` timeout) reported in `_workspaces/reports/T086-report.md` Section 7.
 
 ## Log
 - 2026-10-06 02:24:24 covers += REQ-OWN-001, REQ-OWN-002, REQ-OWN-003, REQ-OWN-004, REQ-OWN-005, REQ-OWN-006 (metadata only)
 - 2026-10-31 23:45:16 started (attempt 1) T086-impl
 - 2026-11-01 10:18:49 block: 8 root causes in compiler/ and tests/ blocking axiomc1 full suite pass (see T086-report.md)
 - 2026-11-01 10:22:17 unblocked (cycle 1) 
+- 2026-11-02 08:30:49 started (attempt 1) T086-impl
+- 2026-11-02 14:06:22 block: 3 root causes in compiler/interp (InterpValue 64B vs 256B truncation), compiler/types+verify (TY_STRUCT/TY_ENUM finalize_types + verify_types_compatible), and tests/run/native_ptr/write_bytes_1mb.ax timeout (11 failing entries across 8 test files; see T086-report.md Section 7)
+- 2026-11-02 14:08:48 unblocked (cycle 2) 
