@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T086]
 priority: 121
-status: todo
-attempts: 0
-paths: [tools/bootstrap.py, tools/build_axiomc.py, tests/selfhost/fixedpoint, spec/BOOTSTRAP.md]
+status: done
+attempts: 1
+paths: [tools/bootstrap.py, tools/build_axiomc.py, tests/selfhost/fixedpoint, tests/selfhost/interp, spec/BOOTSTRAP.md]
 spec: [0167, tasks/0473, 0150]
+started: 2026-11-02 18:57:08
+finished: 2026-11-02 23:54:17
 ---
 # T087 — Stage-2/3 fixed point + reproducible bootstrap (VS2 of 0263 §51, BOOT-36..38)
 
@@ -39,3 +41,7 @@ axiomc compiles itself to a fixed point.
 - After this task the compiler under test is axiomc: the runner's default compiler and tests/README.md are owned by T005 (done) — document the switch in spec/BOOTSTRAP.md and pass `--compiler` explicitly; do not edit tools/axtest.py.
 - Spec refs are docs/base/specs numbers unless prefixed `tasks/` or `spec/`; read `spec/` canonical docs first (axiom-spec-index).
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
+
+## Log
+- 2026-11-02 18:57:08 started (attempt 1) 
+- 2026-11-02 23:54:17 accepted by QA -> done
