@@ -600,6 +600,40 @@ pub fn verify_types_compatible(thir: *const Thir, a: TypeId, b: TypeId) -> bool 
             TypeId { v: unsafe { (*tb).pointee.v } }
         );
     }
+    if ka == TY_ARRAY && kb == TY_ARRAY {
+        if (unsafe { (*ta).array_len }) != (unsafe { (*tb).array_len }) {
+            return false;
+        }
+        return verify_types_compatible(
+            thir,
+            TypeId { v: unsafe { (*ta).elem.v } },
+            TypeId { v: unsafe { (*tb).elem.v } }
+        );
+    }
+    if ka == TY_SLICE && kb == TY_SLICE {
+        return verify_types_compatible(
+            thir,
+            TypeId { v: unsafe { (*ta).elem.v } },
+            TypeId { v: unsafe { (*tb).elem.v } }
+        );
+    }
+    if ka == TY_TUPLE && kb == TY_TUPLE {
+        let fca = unsafe { (*ta).field_count };
+        let fcb = unsafe { (*tb).field_count };
+        if fca != fcb {
+            return false;
+        }
+        let mut ti: usize = 0;
+        while ti < fca {
+            let fa = TypeId { v: unsafe { (*typeid_at((*ta).fields, ti)).v } };
+            let fb = TypeId { v: unsafe { (*typeid_at((*tb).fields, ti)).v } };
+            if !verify_types_compatible(thir, fa, fb) {
+                return false;
+            }
+            ti = ti + 1;
+        }
+        return true;
+    }
     if ka == TY_CLOSURE && kb == TY_CLOSURE {
         return (unsafe { (*ta).closure_id }) == (unsafe { (*tb).closure_id });
     }
@@ -1667,9 +1701,16 @@ fn verify_own_type_needs_drop(thir: *const Thir, thir_has_items: bool, ty: TypeI
     if (thir as usize) == 0 {
         return false;
     }
+    let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty_v });
+    if (t as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*t).kind };
+    if tk != TY_STRUCT && tk != TY_ENUM && tk != TY_TUPLE && tk != TY_ARRAY && tk != TY_CLOSURE {
+        return false;
+    }
     if !thir_has_items {
-        let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: ty_v });
-        if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_STRUCT &&
+        if tk == TY_STRUCT &&
             (unsafe { (*t).def as usize }) == 0 && (unsafe { (*t).field_count }) == 0 {
             return true;
         }
@@ -2237,6 +2278,51 @@ fn verify_own_push_target_masked(
     any_changed
 }
 
+fn verify_own_dfs_postorder(body: view<MirBody>, b: usize, vis: *mut u8, post: *mut u32, post_len: mut_view<usize>) {
+    if b >= body.bb_count || (unsafe { *(vis + b) }) != 0u8 {
+        return;
+    }
+    unsafe { *(vis + b) = 1u8; }
+    let bb = unsafe { mir_bb_at(body.bbs, b) };
+    if unsafe { (*bb).has_terminator } {
+        let tk = unsafe { (*bb).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            verify_own_dfs_postorder(body, (unsafe { (*bb).terminator.goto_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_SWITCH_INT {
+            let sc = unsafe { (*bb).terminator.switch_count };
+            let tgts = unsafe { (*bb).terminator.targets };
+            let mut k: usize = 0;
+            while k < sc {
+                let tid = (unsafe { (*mir_bb_id_at(tgts, k)).v }) as usize;
+                verify_own_dfs_postorder(body, tid, vis, post, mut_view(*post_len));
+                k = k + 1;
+            }
+            verify_own_dfs_postorder(body, (unsafe { (*bb).terminator.otherwise.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_DROP {
+            verify_own_dfs_postorder(body, (unsafe { (*bb).terminator.drop_target.v }) as usize, vis, post, mut_view(*post_len));
+            let du = (unsafe { (*bb).terminator.drop_unwind.v }) as usize;
+            if du > 0 {
+                verify_own_dfs_postorder(body, du, vis, post, mut_view(*post_len));
+            }
+        } else if tk == MIR_TERM_CALL {
+            verify_own_dfs_postorder(body, (unsafe { (*bb).terminator.call_target.v }) as usize, vis, post, mut_view(*post_len));
+            let cu = (unsafe { (*bb).terminator.call_unwind.v }) as usize;
+            if cu > 0 {
+                verify_own_dfs_postorder(body, cu, vis, post, mut_view(*post_len));
+            }
+        } else if tk == MIR_TERM_ASSERT {
+            verify_own_dfs_postorder(body, (unsafe { (*bb).terminator.assert_target.v }) as usize, vis, post, mut_view(*post_len));
+            let au = (unsafe { (*bb).terminator.assert_unwind.v }) as usize;
+            if au > 0 {
+                verify_own_dfs_postorder(body, au, vis, post, mut_view(*post_len));
+            }
+        }
+    }
+    let idx = *post_len;
+    unsafe { *u32_at(post, idx) = b as u32; }
+    *post_len = idx + 1;
+}
+
 pub fn verify_mir_own(
     body: view<MirBody>,
     thir: *const Thir,
@@ -2507,13 +2593,20 @@ pub fn verify_mir_own(
         }
     }
 
+    let rpo_vis = arena_alloc_raw(mut_view(scratch), bc, 1);
+    let rpo_post = arena_alloc_raw(mut_view(scratch), mir_mul_usize(bc, size_of<u32>()), align_of<u32>()) as *mut u32;
+    verify_fill_bytes(rpo_vis, 0u8, bc);
+    let mut rpo_len: usize = 0;
+    verify_own_dfs_postorder(body, 0, rpo_vis, rpo_post, mut_view(rpo_len));
+
     let mut changed = true;
     while changed {
         changed = false;
-        let mut i: usize = 0;
-        while i < bc {
+        let mut rpo_idx: usize = rpo_len;
+        while rpo_idx > 0 {
+            rpo_idx = rpo_idx - 1;
+            let i: usize = (unsafe { *u32_at(rpo_post, rpo_idx) }) as usize;
             if (unsafe { *(dirty + i) }) == 0u8 {
-                i = i + 1;
                 continue;
             }
             unsafe {
@@ -2659,7 +2752,6 @@ pub fn verify_mir_own(
                     }
                 }
             }
-            i = i + 1;
         }
     }
 
@@ -2981,7 +3073,7 @@ pub fn verify_mir_drop_flags(
         b_idx = b_idx + 1;
     }
 
-    if (func as usize) != 0 && sink.errors == 0 {
+    if (func as usize) != 0 && sink.errors == 0 && df_count > 0 {
         verify_mir_own(body, thir, mut_view(*sink), func);
     }
 }

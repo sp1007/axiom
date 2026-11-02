@@ -1162,7 +1162,7 @@ def render_ax_vectors(vecs: list[Vector], gnu_bytes_list: list[list[int]], encod
             if v.xfail_task is not None:
                 assert v.xfail_enc is not None
                 lines.append(
-                    f"    // xfail: {v.xfail_task} — {v.asm} "
+                    f"    // skip-enc: {v.xfail_task} — {v.asm} "
                     f"(gnu_as: {fmt_hex_space(gnu_b)}; actual: {fmt_hex_space(v.xfail_enc)})"
                 )
                 lines.append(f"    {v.ax_stmt}")

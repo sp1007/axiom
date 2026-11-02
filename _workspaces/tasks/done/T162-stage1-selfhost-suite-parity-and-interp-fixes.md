@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T085, T143, T144, T156, T159, T161]
 priority: 119
-status: todo
-attempts: 0
-paths: [compiler/interp, compiler/interp_opt, compiler/mir, compiler/types, compiler/verify, compiler/driver, tests/selfhost, tests/encode/axiom, tests/run/parity]
+status: done
+attempts: 1
+paths: [compiler/interp, compiler/interp_opt, compiler/mir, compiler/syntax, compiler/types, compiler/verify, compiler/driver, tools/gen_encode_tests.py, tests/selfhost, tests/encode/axiom, tests/run/parity]
 spec: [0167, 0150, tasks/0371, spec/decisions/ADR-0034-oracle-independence.md, spec/decisions/ADR-0035-axiomc-parity-symbols.md]
 covers: [REQ-OWN-001, REQ-OWN-002]
 timeout_min: 300
+started: 2026-11-01 10:24:50
+finished: 2026-11-02 08:29:23
 ---
 # T162 — Stage-1 selfhost suite fixes: port interpreter, typeck array-repeat UF, MIR bare-place parser, and gatecheck cleanup
 
@@ -67,3 +69,5 @@ Resolve the 8 implementation and test-hygiene defects uncovered by the Stage-1 g
 - All Axiom code uses canonical syntax (axiom-syntax): `=` only, `.` paths only.
 
 ## Log
+- 2026-11-01 10:24:50 started (attempt 1) T162-impl
+- 2026-11-02 08:29:23 accepted by QA -> done

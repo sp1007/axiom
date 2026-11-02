@@ -12625,6 +12625,9 @@ fn mp_parse_operand(
             let cty = mp_parse_type(mut_view(*p), mut_view(*interner), type_map);
             out.constant.ty.v = cty.v;
         }
+    } else {
+        out.kind = MIR_OP_COPY;
+        mp_parse_place(mut_view(*p), mut_view(*arena), mut_view(out.place));
     }
 }
 
@@ -14675,6 +14678,40 @@ fn copy_cap_array(dst: *mut MirCap, src: *const MirCap, local_count: usize) {
     }
 }
 
+fn cap_dfs_postorder(body: view<MirBody>, b: usize, vis: *mut u8, post: *mut u32, post_len: mut_view<usize>) {
+    if b >= body.bb_count || (unsafe { *(vis + b) }) != 0u8 {
+        return;
+    }
+    unsafe { *(vis + b) = 1u8; }
+    let bb_p: *mut MirBb = unsafe { mir_bb_at(body.bbs, b) };
+    if unsafe { (*bb_p).has_terminator } {
+        let tk: u8 = unsafe { (*bb_p).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.goto_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_SWITCH_INT {
+            let sc: usize = unsafe { (*bb_p).terminator.switch_count };
+            let tgts = unsafe { (*bb_p).terminator.targets };
+            let mut sj: usize = 0;
+            while sj < sc {
+                let tid = (unsafe { (*mir_bb_id_at(tgts, sj)).v }) as usize;
+                cap_dfs_postorder(body, tid, vis, post, mut_view(*post_len));
+                sj = sj + 1;
+            }
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.otherwise.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_DROP {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.drop_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_CALL {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.call_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_ASSERT {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.assert_target.v }) as usize, vis, post, mut_view(*post_len));
+        }
+    }
+    let idx = *post_len;
+    let p_slot: *mut u32 = unsafe { ((post as usize) + (idx << 2usize)) as *mut u32 };
+    unsafe { *p_slot = b as u32; }
+    *post_len = idx + 1;
+}
+
 pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
     if body.bb_count == 0 || body.local_count == 0 {
         return;
@@ -14718,12 +14755,27 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
     let temp_raw = unsafe { heap_alloc(cap_arr_bytes, align_of<MirCap>()) };
     let mut temp = CapState { caps: temp_raw as *mut MirCap };
 
+    let rpo_vis: *mut u8 = unsafe { heap_alloc(bb_count, 1) };
+    let rpo_post: *mut u32 = unsafe { heap_alloc(bb_count << 2usize, 4) as *mut u32 };
+    let mut rpo_len: usize = 0;
+    i = 0;
+    while i < bb_count {
+        unsafe { *(rpo_vis + i) = 0u8; }
+        i = i + 1;
+    }
+    cap_dfs_postorder(view(*body), 0, rpo_vis, rpo_post, mut_view(rpo_len));
+    unsafe { heap_free(rpo_vis, bb_count, 1); }
+
     let mut changed = true;
     while changed {
         changed = false;
-        i = 0;
-        while (i < bb_count) {
-            if (unsafe { *(visited + i) }) != 0u8 {
+        let mut rpo_idx: usize = rpo_len;
+        while (rpo_idx > 0) {
+            rpo_idx = rpo_idx - 1;
+            let p_slot: *const u32 = unsafe { ((rpo_post as usize) + (rpo_idx << 2usize)) as *const u32 };
+            i = (unsafe { *p_slot }) as usize;
+            if (unsafe { *(visited + i) }) == 1u8 {
+                unsafe { *(visited + i) = 2u8; }
                 let in_st = unsafe { cap_state_at_mut(bb_in, i) };
                 let in_caps = unsafe { (*in_st).caps };
                 copy_cap_array(temp.caps, in_caps as *const MirCap, local_count);
@@ -14779,6 +14831,7 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
                             } else {
                                 let merged = unsafe { merge_cap_states(mut_view(*tgt_st), view(temp), local_count) };
                                 if merged {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
                                     changed = true;
                                 }
                             }
@@ -14787,9 +14840,9 @@ pub fn own_cap_check(body: view<MirBody>, sink: mut_view<DiagSink>) {
                     }
                 }
             }
-            i = i + 1;
         }
     }
+    unsafe { heap_free(rpo_post as *mut u8, bb_count << 2usize, 4); }
 
     i = 0;
     while (i < bb_count) {

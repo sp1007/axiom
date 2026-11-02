@@ -77,7 +77,6 @@ use compiler.kernel.id.FileId
 use compiler.kernel.interner.StrView
 use compiler.source.span.Span
 use compiler.diag.code.DiagCode
-use compiler.diag.code.AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP
 use compiler.diag.code.AX_UNSAFE_REQUIRED
 use compiler.diag.code.diag_code_severity
 use compiler.diag.emitter.DiagSink
@@ -88,7 +87,7 @@ use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.diag_sink_report as raw_diag_sink_report
 const _SHIM_TC_MSG: [10]u8 = [116u8, 121u8, 112u8, 101u8, 32u8, 101u8, 114u8, 114u8, 111u8, 114u8];
 pub fn _shim_diag_sink_report(sink: mut_view<DiagSink>, d: view<Diagnostic>) {
-    if d.code.v == AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP || d.code.v == AX_UNSAFE_REQUIRED {
+    if d.code.v == AX_UNSAFE_REQUIRED {
         return;
     }
     raw_diag_sink_report(sink, d);
@@ -468,6 +467,586 @@ def assemble_compiler_modules(mod_list, root=ROOT):
 
         if raw_name == "compiler.kernel_source_diag.session":
             parts.append(SESSION_SHIM_MODULE)
+
+        if raw_name in ("compiler.own.unsafe", "compiler.own.unsafe_ck"):
+            src = src.replace(
+                "            if ftk == TY_FN && (unsafe { (*ft).is_unsafe }) {\n                return true;\n            }",
+                "            if ftk == TY_FN {\n                return unsafe { (*ft).is_unsafe };\n            }",
+                1,
+            )
+
+        if raw_name in ("compiler.own.move", "compiler.own.move_ck"):
+            src = src.replace(
+                "use compiler.mir.mir.MIR_PROJ_FIELD\n",
+                "use compiler.mir.mir.MIR_PROJ_DEREF\n"
+                "use compiler.mir.mir.MIR_PROJ_FIELD\n"
+                "use compiler.mir.mir.MIR_STMT_ASSIGN\n"
+                "use compiler.mir.mir.MIR_STMT_DROP\n"
+                "use compiler.mir.mir.MIR_RVALUE_USE\n"
+                "use compiler.mir.mir.MIR_RVALUE_REPEAT\n"
+                "use compiler.mir.mir.MIR_RVALUE_REF\n"
+                "use compiler.mir.mir.MIR_RVALUE_LEN\n"
+                "use compiler.mir.mir.MIR_RVALUE_CAST\n"
+                "use compiler.mir.mir.MIR_RVALUE_BINARY_OP\n"
+                "use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP\n"
+                "use compiler.mir.mir.MIR_RVALUE_UNARY_OP\n"
+                "use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT\n"
+                "use compiler.mir.mir.MIR_RVALUE_AGGREGATE\n"
+                "use compiler.mir.mir.MIR_TERM_SWITCH_INT\n"
+                "use compiler.mir.mir.MIR_TERM_DROP\n"
+                "use compiler.mir.mir.MIR_TERM_CALL\n"
+                "use compiler.mir.mir.MIR_TERM_ASSERT\n"
+                "use compiler.mir.mir.MirBb\n"
+                "use compiler.mir.mir.MirOperand\n"
+                "use compiler.mir.mir.MirProjection\n"
+                "use compiler.mir.mir.MirStmt\n"
+                "use compiler.mir.mir.mir_bb_at\n"
+                "use compiler.mir.mir.mir_stmt_at\n"
+                "use compiler.mir.mir.mir_op_at\n",
+                1,
+            )
+            src = src.replace(
+                """pub fn populate_path_tree(
+    ctx: mut_view<PathCtx>,
+    node_idx: u32,
+    ty_id: TypeId,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    if ty_id.v == 0u32 || ty_id.v == 0xFFFFFFFFu32 {
+        return;
+    }
+    let ty = type_get(view(thir.interner), ty_id);
+    if (ty as usize) == 0 {
+        return;
+    }
+    let tk = unsafe { (*ty).kind };
+    let mut field_count: usize = 0;
+    let mut fields: *mut TypeId = 0 as *mut TypeId;
+
+    if tk == TY_TUPLE || tk == TY_STRUCT {
+        field_count = unsafe { (*ty).field_count };
+        fields = unsafe { (*ty).fields };
+    }
+
+    if field_count > 0 && (fields as usize) != 0 {
+        let first_child = ctx.count as u32;
+        let new_count = ctx.count + field_count;
+        path_ctx_ensure_cap(mut_view(*ctx), new_count);
+        ctx.count = new_count;
+
+        let parent_np = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*parent_np).first_child = first_child;
+            (*parent_np).num_children = field_count as u32;
+        }
+
+        let mut i: usize = 0;
+        while (i < field_count) {
+            let fty_p = unsafe { own_type_id_at(fields as *const TypeId, i) };
+            let fty_v = unsafe { (*fty_p).v };
+            let is_cp = type_is_copy(TypeId { v: fty_v }, thir, str_in);
+            let child_np = unsafe { path_node_at_mut(ctx.nodes, (first_child as usize) + i) };
+            unsafe {
+                (*child_np).parent = node_idx;
+                (*child_np).first_child = 0u32;
+                (*child_np).num_children = 0u32;
+                (*child_np).is_copy = is_cp;
+            }
+            i = i + 1;
+        }
+
+        i = 0;
+        while (i < field_count) {
+            let fty_p = unsafe { own_type_id_at(fields as *const TypeId, i) };
+            let fty_v = unsafe { (*fty_p).v };
+            populate_path_tree(mut_view(*ctx), first_child + (i as u32), TypeId { v: fty_v }, thir, str_in);
+            i = i + 1;
+        }
+    }
+}
+
+pub fn path_ctx_init(
+    ctx: mut_view<PathCtx>,
+    body: view<MirBody>,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    let init_cap: usize = if body.local_count > 0 { mul_usize(body.local_count, 2) } else { 8 };
+    let nodes_bytes = mul_usize(init_cap, size_of<PathNode>());
+    let nodes_raw = unsafe { heap_alloc(nodes_bytes, align_of<PathNode>()) };
+    ctx.nodes = nodes_raw as *mut PathNode;
+    ctx.count = 0;
+    ctx.cap = init_cap;
+
+    let roots_count = if body.local_count > 0 { body.local_count } else { 1 };
+    let roots_bytes = roots_count << 2usize;
+    let roots_raw = unsafe { heap_alloc(roots_bytes, 4) };
+    ctx.local_roots = roots_raw as *mut u32;
+    ctx.local_count = body.local_count;
+
+    let mut i: usize = 0;
+    while (i < body.local_count) {
+        let node_idx = ctx.count as u32;
+        path_ctx_ensure_cap(mut_view(*ctx), ctx.count + 1);
+        ctx.count = ctx.count + 1;
+
+        let root_p = unsafe { own_u32_at_mut(ctx.local_roots, i) };
+        unsafe { *root_p = node_idx; }
+
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lty_v = unsafe { (*ldecl).ty.v };
+        let is_cp = type_is_copy(TypeId { v: lty_v }, thir, str_in);
+
+        let np = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*np).parent = OWN_NODE_NONE;
+            (*np).first_child = 0u32;
+            (*np).num_children = 0u32;
+            (*np).is_copy = is_cp;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < body.local_count) {
+        let root_p = unsafe { own_u32_at(ctx.local_roots as *const u32, i) };
+        let root_idx = unsafe { *root_p };
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lty_v = unsafe { (*ldecl).ty.v };
+        populate_path_tree(mut_view(*ctx), root_idx, TypeId { v: lty_v }, thir, str_in);
+        i = i + 1;
+    }
+}""",
+                """fn record_place_field_depth(depths: *mut u32, lc: usize, p: view<MirPlace>) {
+    if p.proj_count == 0 || (p.projs as usize) == 0 {
+        return;
+    }
+    let lv = p.local.v as usize;
+    if lv >= lc {
+        return;
+    }
+    let mut d: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < p.proj_count {
+        let pr: *mut MirProjection = unsafe { mir_proj_at(p.projs, i) };
+        let pk: u8 = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            break;
+        }
+        if pk == MIR_PROJ_FIELD {
+            d = d + 1u32;
+        }
+        i = i + 1;
+    }
+    if d > 0u32 {
+        let dp: *mut u32 = unsafe { own_u32_at_mut(depths, lv) };
+        if d > (unsafe { *dp }) {
+            unsafe { *dp = d; }
+        }
+    }
+}
+
+fn record_op_field_depth(depths: *mut u32, lc: usize, op: view<MirOperand>) {
+    if op.kind == 0u8 || op.kind == 1u8 {
+        record_place_field_depth(depths, lc, view(op.place));
+    }
+}
+
+pub fn populate_path_tree_depth(
+    ctx: mut_view<PathCtx>,
+    node_idx: u32,
+    ty_id: TypeId,
+    thir: view<Thir>,
+    str_in: view<StrInterner>,
+    rem_depth: u32
+) {
+    if rem_depth == 0u32 || ty_id.v == 0u32 || ty_id.v == 0xFFFFFFFFu32 {
+        return;
+    }
+    let ty = type_get(view(thir.interner), ty_id);
+    if (ty as usize) == 0 {
+        return;
+    }
+    let tk: u8 = unsafe { (*ty).kind };
+    let mut field_count: usize = 0;
+    let mut fields: *mut TypeId = 0 as *mut TypeId;
+
+    if tk == TY_TUPLE || tk == TY_STRUCT {
+        field_count = unsafe { (*ty).field_count };
+        fields = unsafe { (*ty).fields };
+    }
+
+    if field_count > 0 && (fields as usize) != 0 {
+        let first_child = ctx.count as u32;
+        let new_count = ctx.count + field_count;
+        path_ctx_ensure_cap(mut_view(*ctx), new_count);
+        ctx.count = new_count;
+
+        let parent_np: *mut PathNode = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*parent_np).first_child = first_child;
+            (*parent_np).num_children = field_count as u32;
+        }
+
+        let mut i: usize = 0;
+        while (i < field_count) {
+            let fty_p: *const TypeId = unsafe { own_type_id_at(fields as *const TypeId, i) };
+            let fty_v: u32 = unsafe { (*fty_p).v };
+            let is_cp = type_is_copy(TypeId { v: fty_v }, thir, str_in);
+            let child_np: *mut PathNode = unsafe { path_node_at_mut(ctx.nodes, (first_child as usize) + i) };
+            unsafe {
+                (*child_np).parent = node_idx;
+                (*child_np).first_child = 0u32;
+                (*child_np).num_children = 0u32;
+                (*child_np).is_copy = is_cp;
+            }
+            i = i + 1;
+        }
+
+        if rem_depth > 1u32 {
+            i = 0;
+            while (i < field_count) {
+                let fty_p: *const TypeId = unsafe { own_type_id_at(fields as *const TypeId, i) };
+                let fty_v: u32 = unsafe { (*fty_p).v };
+                populate_path_tree_depth(mut_view(*ctx), first_child + (i as u32), TypeId { v: fty_v }, thir, str_in, rem_depth - 1u32);
+                i = i + 1;
+            }
+        }
+    }
+}
+
+pub fn populate_path_tree(
+    ctx: mut_view<PathCtx>,
+    node_idx: u32,
+    ty_id: TypeId,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    populate_path_tree_depth(ctx, node_idx, ty_id, thir, str_in, 64u32);
+}
+
+pub fn path_ctx_init(
+    ctx: mut_view<PathCtx>,
+    body: view<MirBody>,
+    thir: view<Thir>,
+    str_in: view<StrInterner>
+) {
+    let init_cap: usize = if body.local_count > 0 { mul_usize(body.local_count, 2) } else { 8 };
+    let nodes_bytes = mul_usize(init_cap, size_of<PathNode>());
+    let nodes_raw: *mut u8 = unsafe { heap_alloc(nodes_bytes, align_of<PathNode>()) };
+    ctx.nodes = nodes_raw as *mut PathNode;
+    ctx.count = 0;
+    ctx.cap = init_cap;
+
+    let roots_count = if body.local_count > 0 { body.local_count } else { 1 };
+    let roots_bytes = roots_count << 2usize;
+    let roots_raw: *mut u8 = unsafe { heap_alloc(roots_bytes, 4) };
+    ctx.local_roots = roots_raw as *mut u32;
+    ctx.local_count = body.local_count;
+
+    let depths_raw: *mut u8 = unsafe { heap_alloc(roots_bytes, 4) };
+    let depths: *mut u32 = depths_raw as *mut u32;
+    let mut di: usize = 0;
+    while di < roots_count {
+        let dp: *mut u32 = unsafe { own_u32_at_mut(depths, di) };
+        unsafe { *dp = 0u32; }
+        di = di + 1;
+    }
+    let lc = body.local_count;
+    let mut bi: usize = 0;
+    while bi < body.bb_count {
+        let bb: *mut MirBb = unsafe { mir_bb_at(body.bbs, bi) };
+        let sc: usize = unsafe { (*bb).stmt_count };
+        let mut si: usize = 0;
+        while si < sc {
+            let st: *mut MirStmt = unsafe { mir_stmt_at((*bb).stmts, si) };
+            let sk: u8 = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                record_place_field_depth(depths, lc, unsafe { view((*st).place) });
+                let rvk: u8 = unsafe { (*st).rvalue.kind };
+                if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_REPEAT || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP {
+                    record_op_field_depth(depths, lc, unsafe { view((*st).rvalue.use_op) });
+                } else if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+                    record_place_field_depth(depths, lc, unsafe { view((*st).rvalue.place) });
+                } else if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                    record_op_field_depth(depths, lc, unsafe { view((*st).rvalue.lhs) });
+                    record_op_field_depth(depths, lc, unsafe { view((*st).rvalue.rhs) });
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let oc: usize = unsafe { (*st).rvalue.operand_count };
+                    let mut oi: usize = 0;
+                    while oi < oc {
+                        let op: *mut MirOperand = unsafe { mir_op_at((*st).rvalue.operands, oi) };
+                        record_op_field_depth(depths, lc, unsafe { view(*op) });
+                        oi = oi + 1;
+                    }
+                }
+            } else if sk == MIR_STMT_DROP {
+                record_place_field_depth(depths, lc, unsafe { view((*st).place) });
+            }
+            si = si + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk: u8 = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                record_op_field_depth(depths, lc, unsafe { view((*bb).terminator.discr) });
+            } else if tk == MIR_TERM_DROP {
+                record_place_field_depth(depths, lc, unsafe { view((*bb).terminator.drop_place) });
+            } else if tk == MIR_TERM_CALL {
+                record_op_field_depth(depths, lc, unsafe { view((*bb).terminator.func) });
+                let ac: usize = unsafe { (*bb).terminator.arg_count };
+                let mut ai: usize = 0;
+                while ai < ac {
+                    let aop: *mut MirOperand = unsafe { mir_op_at((*bb).terminator.args, ai) };
+                    record_op_field_depth(depths, lc, unsafe { view(*aop) });
+                    ai = ai + 1;
+                }
+                record_place_field_depth(depths, lc, unsafe { view((*bb).terminator.destination) });
+            } else if tk == MIR_TERM_ASSERT {
+                record_op_field_depth(depths, lc, unsafe { view((*bb).terminator.cond) });
+            }
+        }
+        bi = bi + 1;
+    }
+
+    let mut i: usize = 0;
+    while (i < body.local_count) {
+        let node_idx = ctx.count as u32;
+        path_ctx_ensure_cap(mut_view(*ctx), ctx.count + 1);
+        ctx.count = ctx.count + 1;
+
+        let root_p: *mut u32 = unsafe { own_u32_at_mut(ctx.local_roots, i) };
+        unsafe { *root_p = node_idx; }
+
+        let ldecl = unsafe { mir_local_at(body.locals, i) };
+        let lty_v: u32 = unsafe { (*ldecl).ty.v };
+        let is_cp = type_is_copy(TypeId { v: lty_v }, thir, str_in);
+
+        let np: *mut PathNode = unsafe { path_node_at_mut(ctx.nodes, node_idx as usize) };
+        unsafe {
+            (*np).parent = OWN_NODE_NONE;
+            (*np).first_child = 0u32;
+            (*np).num_children = 0u32;
+            (*np).is_copy = is_cp;
+        }
+        i = i + 1;
+    }
+
+    i = 0;
+    while (i < body.local_count) {
+        let max_d: u32 = unsafe { *own_u32_at(depths as *const u32, i) };
+        if max_d > 0u32 {
+            let root_p: *const u32 = unsafe { own_u32_at(ctx.local_roots as *const u32, i) };
+            let root_idx: u32 = unsafe { *root_p };
+            let ldecl = unsafe { mir_local_at(body.locals, i) };
+            let lty_v: u32 = unsafe { (*ldecl).ty.v };
+            populate_path_tree_depth(mut_view(*ctx), root_idx, TypeId { v: lty_v }, thir, str_in, max_d);
+        }
+        i = i + 1;
+    }
+    unsafe {
+        heap_free(depths as *mut u8, roots_bytes, 4);
+    }
+}""",
+                1,
+            )
+
+        if raw_name == "compiler.own.cap":
+            src = src.replace(
+                "pub fn own_cap_check(",
+                """fn cap_dfs_postorder(body: view<MirBody>, b: usize, vis: *mut u8, post: *mut u32, post_len: mut_view<usize>) {
+    if b >= body.bb_count || (unsafe { *(vis + b) }) != 0u8 {
+        return;
+    }
+    unsafe { *(vis + b) = 1u8; }
+    let bb_p: *mut MirBb = unsafe { mir_bb_at(body.bbs, b) };
+    if unsafe { (*bb_p).has_terminator } {
+        let tk: u8 = unsafe { (*bb_p).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.goto_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_SWITCH_INT {
+            let sc: usize = unsafe { (*bb_p).terminator.switch_count };
+            let tgts = unsafe { (*bb_p).terminator.targets };
+            let mut sj: usize = 0;
+            while sj < sc {
+                let tid = (unsafe { (*mir_bb_id_at(tgts, sj)).v }) as usize;
+                cap_dfs_postorder(body, tid, vis, post, mut_view(*post_len));
+                sj = sj + 1;
+            }
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.otherwise.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_DROP {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.drop_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_CALL {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.call_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_ASSERT {
+            cap_dfs_postorder(body, (unsafe { (*bb_p).terminator.assert_target.v }) as usize, vis, post, mut_view(*post_len));
+        }
+    }
+    let idx = *post_len;
+    let p_slot: *mut u32 = unsafe { ((post as usize) + (idx << 2usize)) as *mut u32 };
+    unsafe { *p_slot = b as u32; }
+    *post_len = idx + 1;
+}
+
+pub fn own_cap_check(""",
+                1,
+            )
+            src = src.replace(
+                """    let mut changed = true;
+    while changed {
+        changed = false;
+        i = 0;
+        while (i < bb_count) {
+            if (unsafe { *(visited + i) }) != 0u8 {
+                let in_st = unsafe { cap_state_at_mut(bb_in, i) };""",
+                """    let rpo_vis: *mut u8 = unsafe { heap_alloc(bb_count, 1) };
+    let rpo_post: *mut u32 = unsafe { heap_alloc(bb_count << 2usize, 4) as *mut u32 };
+    let mut rpo_len: usize = 0;
+    i = 0;
+    while i < bb_count {
+        unsafe { *(rpo_vis + i) = 0u8; }
+        i = i + 1;
+    }
+    cap_dfs_postorder(view(*body), 0, rpo_vis, rpo_post, mut_view(rpo_len));
+    unsafe { heap_free(rpo_vis, bb_count, 1); }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut rpo_idx: usize = rpo_len;
+        while (rpo_idx > 0) {
+            rpo_idx = rpo_idx - 1;
+            let p_slot: *const u32 = unsafe { ((rpo_post as usize) + (rpo_idx << 2usize)) as *const u32 };
+            i = (unsafe { *p_slot }) as usize;
+            if (unsafe { *(visited + i) }) == 1u8 {
+                unsafe { *(visited + i) = 2u8; }
+                let in_st = unsafe { cap_state_at_mut(bb_in, i) };""",
+                1,
+            )
+            src = src.replace(
+                """                                let merged = unsafe { merge_cap_states(mut_view(*tgt_st), view(temp), local_count) };
+                                if merged {
+                                    changed = true;
+                                }""",
+                """                                let merged = unsafe { merge_cap_states(mut_view(*tgt_st), view(temp), local_count) };
+                                if merged {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
+                                    changed = true;
+                                }""",
+                1,
+            )
+            src = src.replace(
+                """            i = i + 1;
+        }
+    }
+
+    i = 0;
+    while (i < bb_count) {""",
+                """        }
+    }
+    unsafe { heap_free(rpo_post as *mut u8, bb_count << 2usize, 4); }
+
+    i = 0;
+    while (i < bb_count) {""",
+                1,
+            )
+
+        if raw_name == "compiler.own.init":
+            src = src.replace(
+                "pub fn own_check(",
+                """fn own_dfs_postorder(body: view<MirBody>, b: usize, vis: *mut u8, post: *mut u32, post_len: mut_view<usize>) {
+    if b >= body.bb_count || (unsafe { *(vis + b) }) != 0u8 {
+        return;
+    }
+    unsafe { *(vis + b) = 1u8; }
+    let bb_p: *mut MirBb = unsafe { mir_bb_at(body.bbs, b) };
+    if unsafe { (*bb_p).has_terminator } {
+        let tk: u8 = unsafe { (*bb_p).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            own_dfs_postorder(body, (unsafe { (*bb_p).terminator.goto_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_SWITCH_INT {
+            let sc: usize = unsafe { (*bb_p).terminator.switch_count };
+            let tgts = unsafe { (*bb_p).terminator.targets };
+            let mut sj: usize = 0;
+            while sj < sc {
+                let tid = (unsafe { (*mir_bb_id_at(tgts, sj)).v }) as usize;
+                own_dfs_postorder(body, tid, vis, post, mut_view(*post_len));
+                sj = sj + 1;
+            }
+            own_dfs_postorder(body, (unsafe { (*bb_p).terminator.otherwise.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_DROP {
+            own_dfs_postorder(body, (unsafe { (*bb_p).terminator.drop_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_CALL {
+            own_dfs_postorder(body, (unsafe { (*bb_p).terminator.call_target.v }) as usize, vis, post, mut_view(*post_len));
+        } else if tk == MIR_TERM_ASSERT {
+            own_dfs_postorder(body, (unsafe { (*bb_p).terminator.assert_target.v }) as usize, vis, post, mut_view(*post_len));
+        }
+    }
+    let idx = *post_len;
+    let p_slot: *mut u32 = unsafe { ((post as usize) + (idx << 2usize)) as *mut u32 };
+    unsafe { *p_slot = b as u32; }
+    *post_len = idx + 1;
+}
+
+pub fn own_check(""",
+                1,
+            )
+            src = src.replace(
+                """    let mut changed = true;
+    while changed {
+        changed = false;
+        i = 0;
+        while (i < bb_count) {
+            if (unsafe { *(visited + i) }) != 0u8 {
+                let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };""",
+                """    let rpo_vis: *mut u8 = unsafe { heap_alloc(bb_count, 1) };
+    let rpo_post: *mut u32 = unsafe { heap_alloc(bb_count << 2usize, 4) as *mut u32 };
+    let mut rpo_len: usize = 0;
+    i = 0;
+    while i < bb_count {
+        unsafe { *(rpo_vis + i) = 0u8; }
+        i = i + 1;
+    }
+    own_dfs_postorder(view(*body), 0, rpo_vis, rpo_post, mut_view(rpo_len));
+    unsafe { heap_free(rpo_vis, bb_count, 1); }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut rpo_idx: usize = rpo_len;
+        while (rpo_idx > 0) {
+            rpo_idx = rpo_idx - 1;
+            i = (unsafe { *own_u32_at(rpo_post as *const u32, rpo_idx) }) as usize;
+            if (unsafe { *(visited + i) }) == 1u8 {
+                unsafe { *(visited + i) = 2u8; }
+                let row_i = unsafe { *own_state_ptr_at_mut(bb_in, i) };""",
+                1,
+            )
+            src = src.replace(
+                """                                let merged = merge_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                if merged {
+                                    changed = true;
+                                }""",
+                """                                let merged = merge_states(tgt_row, temp as *const OwnStateInfo, ctx_cnt);
+                                if merged {
+                                    unsafe { *(visited + tgt_v) = 1u8; }
+                                    changed = true;
+                                }""",
+                1,
+            )
+            src = src.replace(
+                """            i = i + 1;
+        }
+    }
+
+    v.report = true;""",
+                """        }
+    }
+    unsafe { heap_free(rpo_post as *mut u8, bb_count << 2usize, 4); }
+
+    v.report = true;""",
+                1,
+            )
 
         if raw_name in ("compiler.own.cap", "compiler.own.init"):
             if not emitted_own_mir_shim:

@@ -112,11 +112,13 @@ use compiler.types.types.usize_at
 use compiler.types.types.thir_get_item_type
 use compiler.types.types.thir_get_sym_type
 use compiler.types.types.thir_get_expr_type
+use compiler.types.types.ptr_itemmap_get
 use compiler.types.types.sym_constmap_insert
 use compiler.types.types.sym_constmap_get
 use compiler.types.layout.type_size
 use compiler.types.layout.type_align
 use compiler.types.typeck.report_typeck_diag
+use compiler.types.typeck.tc_is_default_inst
 use compiler.traits.mono.MonoEngine
 use compiler.traits.mono.MonoInstance
 use compiler.mir.mir.MIR_LOCAL_TEMP
@@ -160,6 +162,8 @@ use compiler.interp.interp_ctx_alloc_zeroed
 use compiler.interp.interp_ctx_dealloc
 use compiler.interp.interp_ctx_free_allocs
 use compiler.interp.interp_host_init
+use compiler.interp.interp_host_set_custom_args
+use compiler.interp.interp_host_push_arg
 use compiler.interp.interp_host_cleanup
 use compiler.interp.interp_is_host_intrinsic_name
 use compiler.interp.interp_register_const_allocs
@@ -1129,21 +1133,42 @@ pub fn session_interp_opt_fn(
     body
 }
 
-fn insert_impl_alias_in_mir_map(mir_map: mut_view<MirBodyMap>, hir: view<HirFile>, it: *const HirItem, body: *mut MirBody) {
+fn insert_impl_alias_in_mir_map(
+    mir_map: mut_view<MirBodyMap>,
+    hir: view<HirFile>,
+    thir: view<Thir>,
+    it: *const HirItem,
+    body: *mut MirBody
+) {
     let it_sym_v = unsafe { (*it).symbol.v };
     let it_body = unsafe { (*it).body as usize };
     let it_start = unsafe { (*it).span.start };
     mir_body_map_insert(mut_view(*mir_map), it, it_sym_v, body);
-    if it_body == 0 {
+    if it_body == 0 || tc_is_default_inst(it) || (unsafe { (*it).span.file.v }) == 0xFFFFFFFEu32 {
         return;
+    }
+    if thir.expr_methods.cap > 0 && it_sym_v != 0u32 {
+        let indexed: *mut *const HirItem = ptr_itemmap_get(view(thir.expr_methods), 4usize);
+        if (indexed as usize) != 0 {
+            let imk: usize = ((it_sym_v as usize) << 3) | 6usize;
+            let mp: *mut *const HirItem = ptr_itemmap_get(view(thir.expr_methods), imk);
+            if (mp as usize) != 0 {
+                let m: *const HirItem = unsafe { *mp };
+                if (m as usize) != 0 && m != it && !tc_is_default_inst(m) {
+                    let m_sym_v = unsafe { (*m).symbol.v };
+                    mir_body_map_insert(mut_view(*mir_map), m, m_sym_v, body);
+                }
+            }
+            return;
+        }
     }
     let mut top: *mut HirItem = hir.items;
     while (top as usize) != 0 {
         let tk = unsafe { (*top).kind };
-        if tk == HIR_ITEM_IMPL || tk == HIR_ITEM_TRAIT {
+        if tk == HIR_ITEM_IMPL {
             let mut m: *mut HirItem = unsafe { (*top).members };
             while (m as usize) != 0 {
-                if (m as *const HirItem) != it && (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                if (m as *const HirItem) != it && (unsafe { (*m).kind }) == HIR_ITEM_FN && !tc_is_default_inst(m as *const HirItem) {
                     if (unsafe { (*m).body as usize }) == it_body && (unsafe { (*m).span.start }) == it_start {
                         let m_sym_v = unsafe { (*m).symbol.v };
                         mir_body_map_insert(mut_view(*mir_map), m as *const HirItem, m_sym_v, body);
@@ -1197,7 +1222,7 @@ pub fn session_interp_opt_file(
             if (body as usize) != 0 {
                 fn_count = fn_count + 1;
                 if (mir_map as usize) != 0 {
-                    insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, it as *const HirItem, body);
+                    insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, view(*thir), it as *const HirItem, body);
                 }
             }
         } else if is_fn && (mir_map as usize) != 0 {
@@ -1215,7 +1240,7 @@ pub fn session_interp_opt_file(
                 0 as *mut DiagBuffer
             );
             if (prelude_body as usize) != 0 {
-                insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, it as *const HirItem, prelude_body);
+                insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, view(*thir), it as *const HirItem, prelude_body);
             }
         } else if (it_kind == HIR_ITEM_IMPL || it_kind == HIR_ITEM_TRAIT) && (mir_map as usize) != 0 {
             let mut m: *mut HirItem = unsafe { (*it).members };
@@ -1237,7 +1262,12 @@ pub fn session_interp_opt_file(
                             0 as *mut DiagBuffer
                         );
                         if (m_body as usize) != 0 {
-                            insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, m as *const HirItem, m_body);
+                            if it_kind == HIR_ITEM_TRAIT {
+                                let m_sym_v = unsafe { (*m).symbol.v };
+                                mir_body_map_insert(unsafe { mut_view(*mir_map) }, m as *const HirItem, m_sym_v, m_body);
+                            } else {
+                                insert_impl_alias_in_mir_map(unsafe { mut_view(*mir_map) }, hir, view(*thir), m as *const HirItem, m_body);
+                            }
                         }
                     }
                 }
@@ -1252,9 +1282,9 @@ pub fn session_interp_opt_file(
         while (inst as usize) != 0 {
             let nitem = unsafe { (*inst).new_item };
             if (nitem as usize) != 0 && (unsafe { (*nitem).kind }) == HIR_ITEM_FN && (unsafe { (*nitem).body as usize }) != 0 {
-                let cached_inst = unsafe { mir_body_map_get_by_item(view(*mir_map), nitem as *const HirItem) };
-                if (cached_inst as usize) == 0 {
-                    let inst_body = session_interp_opt_fn(
+                let mut inst_body = unsafe { mir_body_map_get_by_item(view(*mir_map), nitem as *const HirItem) };
+                if (inst_body as usize) == 0 {
+                    inst_body = session_interp_opt_fn(
                         mut_view(*sess),
                         mut_view(*mir_arena),
                         nitem,
@@ -1267,12 +1297,12 @@ pub fn session_interp_opt_file(
                         0 as *mut DiagBuffer,
                         0 as *mut DiagBuffer
                     );
-                    if (inst_body as usize) != 0 {
-                        let msym_v = unsafe { (*inst).mangled_sym.v };
-                        unsafe {
-                            (*inst).mir_body = inst_body as usize;
-                            mir_body_map_insert(mut_view(*mir_map), nitem as *const HirItem, msym_v, inst_body);
-                        }
+                }
+                if (inst_body as usize) != 0 {
+                    let msym_v = unsafe { (*inst).mangled_sym.v };
+                    unsafe {
+                        (*inst).mir_body = inst_body as usize;
+                        mir_body_map_insert(mut_view(*mir_map), nitem as *const HirItem, msym_v, inst_body);
                     }
                 }
             }
@@ -1323,7 +1353,7 @@ pub fn session_find_main_fn(sess: view<CompilerSession>, hir: view<HirFile>) -> 
     0 as *mut HirItem
 }
 
-pub fn session_run_interp(
+pub fn session_run_interp_with_args(
     sess: mut_view<CompilerSession>,
     mir_arena: mut_view<Arena>,
     ast: view<Ast>,
@@ -1338,7 +1368,10 @@ pub fn session_run_interp(
     call_depth_limit: i32,
     out_buf: *mut DiagBuffer,
     capture_stdout: bool,
-    out_panic_sv: *mut StrView
+    out_panic_sv: *mut StrView,
+    arg0: StrView,
+    run_args: *const StrView,
+    run_argc: usize
 ) -> i32 {
     if session_has_errors(view(*sess)) {
         return 1;
@@ -1399,6 +1432,20 @@ pub fn session_run_interp(
         capture_stdout
     );
     interp_host_init(unsafe { mut_view(*ctx_ptr) });
+    interp_host_set_custom_args(unsafe { mut_view(*ctx_ptr) }, true);
+    if arg0.len > 0 && (arg0.ptr as usize) != 0 {
+        interp_host_push_arg(unsafe { mut_view(*ctx_ptr) }, arg0);
+    } else {
+        let def_arg0 = StrView { ptr: unsafe { address_of(SESSION_IDENT_BYTES[9]) }, len: 4 };
+        interp_host_push_arg(unsafe { mut_view(*ctx_ptr) }, def_arg0);
+    }
+    let mut ai: usize = 0;
+    while ai < run_argc && (run_args as usize) != 0 {
+        let a_ptr = ((run_args as usize) + interp_mul_usize(ai, size_of<StrView>())) as *const StrView;
+        let a_sv = unsafe { StrView { ptr: (*a_ptr).ptr, len: (*a_ptr).len } };
+        interp_host_push_arg(unsafe { mut_view(*ctx_ptr) }, a_sv);
+        ai = ai + 1;
+    }
     interp_register_const_allocs(unsafe { mut_view(*ctx_ptr) });
     let mut ret_val: u64 = 0u64;
     let ret_ptr = unsafe { address_of_mut(ret_val) as *mut u8 };
@@ -1436,6 +1483,45 @@ pub fn session_run_interp(
     interp_ctx_dealloc(ctx_ptr);
     mir_body_map_free(mut_view(mir_map));
     code
+}
+
+pub fn session_run_interp(
+    sess: mut_view<CompilerSession>,
+    mir_arena: mut_view<Arena>,
+    ast: view<Ast>,
+    rmap: view<ResolveMap>,
+    hir: view<HirFile>,
+    thir: mut_view<Thir>,
+    main_fid: FileId,
+    mono: *mut MonoEngine,
+    opt_O1: bool,
+    verify_each: bool,
+    step_limit: i32,
+    call_depth_limit: i32,
+    out_buf: *mut DiagBuffer,
+    capture_stdout: bool,
+    out_panic_sv: *mut StrView
+) -> i32 {
+    session_run_interp_with_args(
+        sess,
+        mir_arena,
+        ast,
+        rmap,
+        hir,
+        thir,
+        main_fid,
+        mono,
+        opt_O1,
+        verify_each,
+        step_limit,
+        call_depth_limit,
+        out_buf,
+        capture_stdout,
+        out_panic_sv,
+        StrView { ptr: 0 as *const u8, len: 0 },
+        0 as *const StrView,
+        0
+    )
 }
 
 // =============================================================================
