@@ -103,7 +103,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P12 numeric & SIMD | T450–T479 | T212 | T312 | P10 |
 | P13 low-level & security | T500–T533 | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
-| P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
+| P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750, T751 | T218 | T318 | P10 |
@@ -201,17 +201,17 @@ Exit: freestanding program boots without std; UB/safety conformance suite.
 Exit: derive(Debug/Eq/Hash/Serialize-style) implemented via reflection in std; generator tests.
 
 ### P15 — Optimizer 2.0
-- **E15.1 OptIR: SSA / MemorySSA** — Src tasks/0398 0315 tasks/0366.
-- **E15.2 Alias & escape analysis, allocation promotion** — Src tasks/0395 tasks/0397.
-- **E15.3 Loops & bounds-check elimination** — SCEV, LICM, unrolling, BCE. Src tasks/0402.
+- **E15.1 OptIR: SSA / MemorySSA** — Src tasks/0398 0315 tasks/0366. *(T600–T604)*
+- **E15.2 Alias & escape analysis, allocation promotion** — Src tasks/0395 tasks/0397. *(T605–T608)*
+- **E15.3 Loops & bounds-check elimination** — SCEV, LICM, unrolling, BCE. Src tasks/0402. *(T609–T612)*
 - **E15.4 Inlining, specialization, devirtualization** (+ copy propagation, SROA) — Src tasks/0401
-  tasks/0551. *(T064)*
-- **E15.5 Auto-vectorization** — Src tasks/0403 tasks/0407 0095.
-- **E15.6 LTO / whole-program / section GC / PGO** — Src tasks/0355 tasks/0408 tasks/0409 tasks/0410.
+  tasks/0551. *(T064, T613–T615)*
+- **E15.5 Auto-vectorization** — Src tasks/0403 tasks/0407 0095. *(T616–T619)*
+- **E15.6 LTO / whole-program / section GC / PGO** — Src tasks/0355 tasks/0408 tasks/0409 tasks/0410. *(T620–T623)*
 - **E15.8 Register allocation (linear scan) & better instruction selection** — first P15 task so
-  axiomc itself becomes fast. Src 0182 0235 0252 tasks/0557. *(T063)*
+  axiomc itself becomes fast. Src 0182 0235 0252 tasks/0557. *(T063, T627–T629)*
 - **E15.7 Performance contract** — benchmark suite, code-size & compile-time budgets, regression CI.
-  Src tasks/0706 0074.
+  Src tasks/0706 0074. *(T624–T626)*
 Exit: differential green at -O2; benchmark targets met and tracked in CI.
 
 ### P16 — Targets & platforms
@@ -413,3 +413,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T212 P12 phase expansion (`P12-numeric-floating-point-simd`): expanded E12.1–E12.5 into 30 new tasks `T450`–`T479` (30 tasks total across 5 epics: E12.1 6 tasks `T450–T455`; E12.2 7 tasks `T456–T462` including dedicated spec/implementation/QA stress-test tasks for `REQ-OWNER-007` complex mixed-type expression matrix Patterns A–D; E12.3 6 tasks `T463–T468`; E12.4 6 tasks `T469–T474`; E12.5 5 tasks `T475–T479`), converted all 335 `EPIC(E12.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T312` (`depends: [T212, T450–T479]`) | T212 |
 | 2026-11-03 | T213 P13 phase expansion (`P13-low-level-systems-unsafe-frees`): expanded E13.1–E13.7 into 34 new tasks `T500`–`T533` (34 tasks total across 7 epics: E13.1 6 tasks `T500–T505` including `REQ-OWNER-008` `fn_addr`/`static_addr`/`address_of`/`@addr` spec, implementation, and QA conformance plus `T503` ADR-0034 §8 OI-12 external Windows x64 ABI gcc DLL oracle before FFI breadth `T504`; E13.2 5 tasks `T506–T510`; E13.3 5 tasks `T511–T515`; E13.4 5 tasks `T516–T520`; E13.5 4 tasks `T521–T524`; E13.6 5 tasks `T525–T529` for `REQ-OWNER-003` & `REQ-OWNER-008` `@at`/`@addr` fixed-address placement; E13.7 4 tasks `T530–T533` for `REQ-OWNER-005` module-relative bindings), converted all 434 `EPIC(E13.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T313` (`depends: [T213, T500–T533]`) | T213 |
 | 2026-11-03 | T214 P14 phase expansion (`P14-comptime-2-0-reflection-genera`): expanded E14.1–E14.5 into 23 new tasks `T550`–`T572` alongside refined `T058` (24 tasks total across 5 epics: E14.1 6 tasks `T550–T555`; E14.2 5 tasks `T556–T560`; E14.3 5 tasks `T561–T565`; E14.4 5 tasks `T058, T566–T569`; E14.5 3 tasks `T570–T572` for `ADR-0036` §4 / `SPEC-03 AXS-SEM-047` index auto-deref through `view`/`mut_view`), converted all 512 `EPIC(E14.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T314` (`depends: [T214, T058, T550–T572]`) | T214 |
+| 2026-11-03 | T215 P15 phase expansion (`P15-optimizer-2-0`): expanded E15.1–E15.8 into 30 new tasks `T600`–`T629` alongside refined `T063` and `T064` (32 tasks total across 8 epics: E15.1 5 tasks `T600–T604`; E15.2 4 tasks `T605–T608`; E15.3 4 tasks `T609–T612`; E15.4 4 tasks `T064, T613–T615`; E15.5 4 tasks `T616–T619` depending on P12 gate `T312`; E15.6 4 tasks `T620–T623`; E15.7 3 tasks `T624–T626`; E15.8 4 tasks `T063, T627–T629` scheduled first in P15), converted all 405 `EPIC(E15.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T315` (`depends: [T215, T063, T064, T600–T629]`) | T215 |

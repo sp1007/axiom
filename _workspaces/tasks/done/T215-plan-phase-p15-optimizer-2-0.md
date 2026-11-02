@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 02:31:36
+finished: 2026-11-03 02:52:20
 ---
 # T215 — Plan phase P15: Optimizer 2.0
 
@@ -41,3 +43,6 @@ the roadmap is invented.
 - P15 opens right after self-hosting (ROADMAP R7: axiomc must become fast early). Only E15.5 auto-vectorization tasks depend on the P12 gate T312.
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-03 02:31:36 started (attempt 1) 
+- 2026-11-03 02:52:20 accepted by QA -> done

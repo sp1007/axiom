@@ -162,7 +162,7 @@
 | REQ-FFI-007 | ffi | v1-full | Closure to C callback must not use implicit conversion. | 0112 §84 | - | T504 |
 | REQ-CORE-007 | control-flow | v1-core | Return performs required cleanup. | 0113 §122 | - | T113 | 
 | REQ-CORE-008 | surface | v1-core | break has no value in v0.1. | 0113 §122 | - | T113 |
-| REQ-OPT-001 | optimization | v1-full | Proven bounds checks may be eliminated. | 0113 §122 | - | EPIC(E15.1) |
+| REQ-OPT-001 | optimization | v1-full | Proven bounds checks may be eliminated. | 0113 §122 | - | T609 |
 | REQ-CORE-009 | unsafe | v1-core | Unchecked memory access requires explicit unsafe boundary. | 0113 §122 | - | T113 | 
 | REQ-TYP-007 | types | v1-core | never is bottom-like in non-returning control flow. | 0113 §122 | - | T113 |
 | REQ-CORE-010 | static | v1-core | Static initialization has no hidden runtime constructors. | 0113 §122 | - | T113 | 
@@ -945,8 +945,8 @@
 | REQ-GEN-003 | generics | v1-core | Programmers shall not write source-level type checks on generic parameters to branch on compiler specialization in v0.1. | 0131 - Section 25 | - | T113 | 
 | REQ-CORE-066 | functions | v1-core | The compiler shall reject unrestricted same-name function overload sets based on implicit conversions, using trait-based dispatch as the primary dispatch mechanism. | 0131 - Section 26 | - | T113 | 
 | REQ-CORE-067 | functions | v1-core | Recursive functions shall be supported natively without requiring specialized runtime stack objects. | 0131 - Section 27 | - | T113 | 
-| REQ-OPT-002 | optimization | v1-full | The compiler is permitted to optimize tail recursion into jumps when ABI and control-flow semantics allow, but tail-call optimization is not guaranteed across all targets in v0.1. | 0131 - Section 28 | - | EPIC(E15.1) |
-| REQ-OPT-003 | optimization | v1-full | An explicit low-level attribute shall be provided to guarantee tail-call optimization when required by the ABI. | 0131 - Section 28 | - | EPIC(E15.1) |
+| REQ-OPT-002 | optimization | v1-full | The compiler is permitted to optimize tail recursion into jumps when ABI and control-flow semantics allow, but tail-call optimization is not guaranteed across all targets in v0.1. | 0131 - Section 28 | - | T613 |
+| REQ-OPT-003 | optimization | v1-full | An explicit low-level attribute shall be provided to guarantee tail-call optimization when required by the ABI. | 0131 - Section 28 | - | T613 |
 | REQ-CORE-068 | functions | v1-core | Function values shall have semantic identity derived from their function declarations, and raw code addresses must not be treated as stable portable identity. | 0131 - Section 29 | - | T113 | 
 | REQ-CORE-069 | functions | v1-core | Named functions shall be passable as first-class values to parameters expecting matching function types. | 0131 - Section 30 | - | T113 | 
 | REQ-RES-005 | closures | v1-core | Closures shall be callable values capable of capturing lexical environments, possessing anonymous compiler-generated types that do not require heap allocation. | 0131 - Section 31 | - | T113 | 
@@ -991,10 +991,10 @@
 | REQ-CORE-071 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without exposing mandatory source-level effect annotations in v0.1. | 0131 - Section 70 | - | T113 | 
 | REQ-CORE-072 | functions | v1-core | Internal effect analysis shall serve compiler optimizations and diagnostics without introducing syntax complexity to the programmer. | 0131 - Section 71 | - | T113 | 
 | REQ-CORE-073 | functions | v1-core | The compiler shall prove a function is pure only when all observable side effects are demonstrably absent, and must not infer purity solely from the lack of explicit source mutation. | 0131 - Section 72 | - | T113 | 
-| REQ-OPT-004 | optimization | v1-full | The compiler shall be permitted to inline any function whose semantic preconditions permit inlining without requiring an explicit keyword. | 0131 - Section 73 | - | EPIC(E15.1) |
-| REQ-OPT-005 | optimization | v1-full | The `@inline` attribute shall be treated as an optimization hint rather than a semantic mandate. | 0131 - Section 74 | - | EPIC(E15.1) |
-| REQ-OPT-006 | optimization | v1-full | Attributes `@inline(always)` and `@inline(never)` shall be supported at the system or compiler layer. | 0131 - Section 74 | - | EPIC(E15.1) |
-| REQ-OPT-007 | optimization | v1-full | Call optimizations such as inlining, devirtualization, and monomorphization shall preserve the distinct semantics established in typed IR. | 0131 - Section 75 | - | EPIC(E15.1) |
+| REQ-OPT-004 | optimization | v1-full | The compiler shall be permitted to inline any function whose semantic preconditions permit inlining without requiring an explicit keyword. | 0131 - Section 73 | - | T613 |
+| REQ-OPT-005 | optimization | v1-full | The `@inline` attribute shall be treated as an optimization hint rather than a semantic mandate. | 0131 - Section 74 | - | T613 |
+| REQ-OPT-006 | optimization | v1-full | Attributes `@inline(always)` and `@inline(never)` shall be supported at the system or compiler layer. | 0131 - Section 74 | - | T613 |
+| REQ-OPT-007 | optimization | v1-full | Call optimizations such as inlining, devirtualization, and monomorphization shall preserve the distinct semantics established in typed IR. | 0131 - Section 75 | - | T613 |
 | REQ-CORE-074 | functions | v1-core | Dynamic dispatch on trait objects shall use data and dispatch pointers without requiring an object header . | 0131 - Section 76 | REQ-TYP-018 | T113 | 
 | REQ-CORE-075 | functions | v1-core | Dynamic dispatch mechanisms and ownership mechanisms shall remain orthogonal, supporting both owning and non-owning dynamic trait objects . | 0131 - Section 77 | REQ-TYP-018 | T113 | 
 | REQ-ABI-058 | abi | v1-full | Source-level function signatures shall not expose machine ABI representation details. | 0131 - Section 78 | - | T500 |
@@ -1006,7 +1006,7 @@
 | REQ-RES-028 | closures | v1-core | Closures shall not provide special self-referential syntax in v0.1, requiring named functions or explicit storage abstractions for recursive calls. | 0131 - Section 83 | - | T113 | 
 | REQ-RES-029 | closures | v1-core | The runtime shall not provide a hidden cycle collector for closures, requiring reference cycles to be managed explicitly via abstractions like weak references or arenas. | 0131 - Section 84 | - | T113 | 
 | REQ-RES-030 | closures | v1-core | Local function value lifetimes shall be determined by semantic uses, allowing the compiler to store them in registers, on the stack, or in allocated storage via escape analysis. | 0131 - Section 85 | - | T113 | 
-| REQ-OPT-008 | optimization | v1-full | The compiler shall use escape analysis to place non-escaping closures and futures on the stack or in registers without requiring explicit stack or heap closure syntax. | 0131 - Section 86 | - | EPIC(E15.1) |
+| REQ-OPT-008 | optimization | v1-full | The compiler shall use escape analysis to place non-escaping closures and futures on the stack or in registers without requiring explicit stack or heap closure syntax. | 0131 - Section 86 | - | T605 |
 | REQ-CORE-076 | functions | v1-core | Core v0.1 shall not support dependent function contract syntax such as `requires` or `ensures` clauses on function declarations. | 0131 - Section 87 | - | T113 | 
 | REQ-CORE-077 | functions | post-v1 | A contract system with `requires` and `ensures` integrated with the verifier or oracle may be introduced post-v1 without introducing a runtime exception model. | 0131 - Section 87 | - | EPIC(E24.0) |
 | REQ-CORE-078 | functions | v1-core | Functions shall be the fundamental first-class behavior abstraction in Axiom [AFN-20]. | 0131 - Section 88 (AFN-20) | - | T113 | 
@@ -1047,7 +1047,7 @@
 | REQ-CTM-010 | comptime | v1-full | Compile-time functions shall adhere to the same type system and semantics as runtime functions without a separate type system [AFN-55]. | 0131 - Section 88 (AFN-55) | - | T551 |
 | REQ-CTM-011 | comptime | v1-full | Compile-time resource handles shall not escape into runtime values [AFN-56]. | 0131 - Section 88 (AFN-56) | - | T551 |
 | REQ-CORE-090 | functions | v1-core | Function effects shall be tracked as internal compiler metadata without requiring programmer-written effect annotations in v0.1 [AFN-57]. | 0131 - Section 88 (AFN-57) | - | T113 | 
-| REQ-OPT-009 | optimization | v1-full | Function inlining shall preserve all observable function semantics and behavior [AFN-58]. | 0131 - Section 88 (AFN-58) | - | EPIC(E15.1) |
+| REQ-OPT-009 | optimization | v1-full | Function inlining shall preserve all observable function semantics and behavior [AFN-58]. | 0131 - Section 88 (AFN-58) | - | T613 |
 | REQ-CORE-091 | functions | v1-core | Dynamic dispatch shall be invoked only when explicitly specified using `dyn Trait` [AFN-59] . | 0131 - Section 88 (AFN-59) | REQ-TYP-018 | T113 | 
 | REQ-CORE-092 | functions | v1-core | Static callable abstractions using generics or `impl Trait` shall compile directly without requiring runtime dispatch machinery [AFN-60]. | 0131 - Section 88 (AFN-60) | - | T113 | 
 | REQ-TYP-067 | types | v1-core | Structs serve as the primary aggregate data primitive in Axiom, defining a set of named fields with declared types without object headers or inheritance. | 0132 §1, §62 (ADATA-20) | - | T113 |
@@ -2187,7 +2187,7 @@
 | REQ-CAP-089 | capability | v1-full | The compiler MAY erase capability metadata from MIR after the Verified MIR checkpoint is completed. | 0161 §15. VIEW_MUT | - | T500 |
 | REQ-CAP-090 | capability | v1-full | Capabilities MUST be treated as compile-time semantic concepts that do not require runtime representation after verification and optimization. | 0161 §16. Capability không nhất thiết tồn tại runtime | - | T500 |
 | REQ-CORE-214 | compiler | v1-full | The compiler MUST enforce Verified MIR as a mandatory verification checkpoint before passing MIR to any optimizer pass. | 0161 §17. MIR verifier | - | EPIC(E18.1) |
-| REQ-OPT-010 | optimizer | v1-full | Optimization passes MUST NOT alter the observable semantics of a Verified MIR program. | 0161 §17. MIR verifier | - | EPIC(E15.1) |
+| REQ-OPT-010 | optimizer | v1-full | Optimization passes MUST NOT alter the observable semantics of a Verified MIR program. | 0161 §17. MIR verifier | - | T600 |
 | REQ-OWN-106 | ownership | v1-core | Under invariant VOWN-01, the MIR verifier MUST ensure that no read operation accesses a moved place. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-107 | ownership | v1-core | Under invariant VOWN-02, the MIR verifier MUST ensure that no place is moved more than once without reinitialization. | 0161 §18. Verified MIR invariants | - | T113 | 
 | REQ-OWN-108 | ownership | v1-core | Under invariant VOWN-03, the MIR verifier MUST ensure that no uninitialized place is used. | 0161 §18. Verified MIR invariants | - | T113 | 
@@ -2222,7 +2222,7 @@
 | REQ-MIR-062 | mir | v1-core | Each MIR instruction MUST maintain internal effect metadata denoting memory reads, writes, allocations, deallocations, atomics, calls, or control flow effects. | 0161 §35. Memory effects | - | T113 | 
 | REQ-TYP-299 | types | v1-core | The source language MUST NOT expose a programmer-facing effect system in version 1.0. | 0161 §36. Call effect | - | T113 |
 | REQ-CORE-219 | compiler | v1-full | The compiler MUST maintain internal CallEffects metadata capturing memory effects, allocation, panics, suspension, blocking, and atomic behavior. | 0161 §36. Call effect | - | EPIC(E18.1) |
-| REQ-OPT-011 | optimizer | v1-full | The compiler optimizer MUST treat the black_box intrinsic as an optimization barrier and MUST NOT optimize away its operand due to lack of visible uses. | 0161 §37. black_box | - | EPIC(E15.1) |
+| REQ-OPT-011 | optimizer | v1-full | The compiler optimizer MUST treat the black_box intrinsic as an optimization barrier and MUST NOT optimize away its operand due to lack of visible uses. | 0161 §37. black_box | - | T603 |
 | REQ-DIAG-018 | diagnostics | v1-core | Every MIR instruction MUST associate an instruction identifier with its source span and origin AST or HIR node for diagnostic and debugging mapping. | 0161 §38. MIR Debug Mapping | - | T113 | 
 | REQ-CORE-220 | serialization | v1-core | Canonical MIR serialization in both text and binary formats MUST be deterministic across compiler builds for identical semantic inputs. | 0161 §39. MIR Serialization | - | T113 | 
 | REQ-CORE-221 | compiler | v1-full | Every MIR function MUST have a SemanticMIRHash that does not depend on memory addresses, arena pointers, random identifiers, or thread scheduling. | 0161 §40. MIR Hash | - | EPIC(E18.1) |
@@ -2265,10 +2265,10 @@
 | REQ-FFI-067 | ffi | v1-full | The compiler must not assume foreign functions are pure or free of memory effects unless guaranteed by explicit contract. | 0162 §26 | - | T505 |
 | REQ-LIR-011 | lir | v1-core | LIR must represent local stack allocations as abstract StackObjects with size, alignment, lifetime, and kind, without fixing concrete physical stack offsets. | 0162 §27 | - | T113 | 
 | REQ-LAY-163 | memory | v1-core | Semantic storage allocations that do not require heap lifetime must be lowered to STACK_OBJECT, DYNAMIC_ALLOC, or STATIC_ADDRESS rather than heap allocation calls. | 0162 §28 | - | T113 | 
-| REQ-OPT-012 | optimizer | v1-full | The compiler optimizer may eliminate unescaped allocations and pass values directly in registers when addresses are not observable. | 0162 §29 | - | EPIC(E15.1) |
+| REQ-OPT-012 | optimizer | v1-full | The compiler optimizer may eliminate unescaped allocations and pass values directly in registers when addresses are not observable. | 0162 §29 | - | T605 |
 | REQ-LIR-012 | lir | v1-core | LIR must support target-independent vector types (V128, V256, V512) and vector operations. | 0162 §30 | - | T113 | 
 | REQ-CORE-233 | backend | v1-core | The target legalizer must split vector operations when the target architecture lacks native support for the vector width. | 0162 §30 | - | T113 | 
-| REQ-OPT-013 | optimizer | v1-full | Auto-vectorization must be performed by the optimizer before LIR lowering without requiring mandatory source annotations. | 0162 §31 | - | EPIC(E15.1) |
+| REQ-OPT-013 | optimizer | v1-full | Auto-vectorization must be performed by the optimizer before LIR lowering without requiring mandatory source annotations. | 0162 §31 | - | T616 |
 | REQ-LIR-013 | lir | v1-core | LIR must preserve distinct address spaces (Generic, Host, Device, Shared, Local, Private, Constant, External). | 0162 §32 | - | T113 | 
 | REQ-GPU-054 | gpu | post-v1 | GPU backends must not collapse GPU device address spaces into a generic address space. | 0162 §32 | - | EPIC(E22.3) |
 | REQ-GPU-055 | gpu | post-v1 | LIR functions targeting GPU kernels must specify an execution domain of GPU and memory operations targeting device address spaces. | 0162 §33 | - | EPIC(E22.3) |
@@ -2278,8 +2278,8 @@
 | REQ-CORE-237 | regalloc | v1-core | The initial compiler backend MVP must implement linear scan register allocation before supporting graph coloring or PBQP. | 0162 §37 | - | T113 | 
 | REQ-CORE-238 | regalloc | v1-core | Spill and reload code generation must occur during or after register allocation. | 0162 §38 | - | T113 | 
 | REQ-CORE-239 | isel | v1-core | Instruction selection may pattern-match combinations of arithmetic and memory operations into single target instructions with memory operands. | 0162 §39 | - | T113 | 
-| REQ-OPT-014 | optimizer | v1-full | Target-independent optimizations (constant folding, CSE, DCE, GVN, LICM, inlining, SROA) must be performed at the LIR level. | 0162 §40 | - | EPIC(E15.1) |
-| REQ-OPT-015 | optimizer | v1-full | Target-specific optimizations (instruction scheduling, peephole optimizations, register coalescing) must be performed at the Machine IR level. | 0162 §40 | - | EPIC(E15.1) |
+| REQ-OPT-014 | optimizer | v1-full | Target-independent optimizations (constant folding, CSE, DCE, GVN, LICM, inlining, SROA) must be performed at the LIR level. | 0162 §40 | - | T603 |
+| REQ-OPT-015 | optimizer | v1-full | Target-specific optimizations (instruction scheduling, peephole optimizations, register coalescing) must be performed at the Machine IR level. | 0162 §40 | - | T627 |
 | REQ-LIR-014 | lir | v1-core | LIR v0.1 must not include GC safepoints, exception landing pads, object headers, vtable primitives, coroutine objects, or trait solver metadata unless mandated by runtime ABI. | 0162 §41 | - | T113 | 
 | REQ-LIR-015 | lir | v1-core | LIR must support a canonical textual format (`.alir`) and binary serialization format. | 0162 §42 | - | T113 | 
 | REQ-TYP-302 | types | v1-core | Every LIR value MUST have a machine-relevant type (ALIR-20). | 0162 §43 | - | T113 |
@@ -2443,17 +2443,17 @@
 | REQ-TOOL-017 | toolchain | v1-core | The Axiom binary utility toolset must provide subcommands or tools for linking (`axiom-link`), archiving (`axiom-ar`), and object dumping (`axiom-objdump`). | 0164 §39. Toolchain Axiom bắt đầu hình thành | - | T113 | 
 | REQ-TOOL-018 | toolchain | v1-core | The `axiom build` driver must orchestrate compilation and linking across decoupled subsystem boundaries without embedding linker logic directly in the compiler driver. | 0164 §40. axiom build | - | T113 | 
 | REQ-LNK-056 | linker | v1-full | The linker must support linking Axiom object files with foreign C object files conforming to the target ABI. | 0164 §41. Milestones tiếp theo | - | EPIC(E18.6) |
-| REQ-OPT-016 | optimizer | v1-full | optimizer.phase = after Verified MIR. | 0165 §1 | - | EPIC(E15.1) |
-|REQ-OPT-017|optimizer|v1-full|optimizer.inference = None .|0165 §1|-|EPIC(E15.1)|
-| REQ-OPT-018 | optimizer | v1-full | optimizer.behavior = unchanged observable behavior. | 0165 §3 | - | EPIC(E15.1) |
-| REQ-OPT-019 | optimizer | v1-full | optimizer.preserved_behavior = result, panic, I/O, atomic, volatile, FFI, Drop. | 0165 §3 | - | EPIC(E15.1) |
-| REQ-OPT-020 | optimizer | v1-full | optimizer.checked_arithmetic = preserves panic/trap. | 0165 §8 | - | EPIC(E15.1) |
-| REQ-OPT-021 | optimizer | v1-full | optimizer.semantics.wrapping = distinct from checked arithmetic. | 0165 §9 | - | EPIC(E15.1) |
-| REQ-OPT-022 | optimizer | v1-full | optimizer.dce.side_effects = preserved. | 0165 §11 | - | EPIC(E15.1) |
-| REQ-OPT-023 | optimizer | v1-full | optimizer.move.propagation = preserves move semantics. | 0165 §13 | - | EPIC(E15.1) |
-| REQ-OPT-024 | optimizer | v1-full | optimizer.allocation.elimination = allowed if storage identity is not observable. | 0165 §17 | - | EPIC(E15.1) |
-| REQ-OPT-025 | optimizer | v1-full | optimizer.allocation.escape = prevents elimination. (AMEM-55, AMEM-70, AMEM-72) | 0165 §19 | - | EPIC(E15.1) |
-| REQ-OPT-026 | optimizer | v1-full | optimizer.bounds_check.elimination = allowed if verifier proves safety. | 0165 §21 | - | EPIC(E15.1) |
+| REQ-OPT-016 | optimizer | v1-full | optimizer.phase = after Verified MIR. | 0165 §1 | - | T600 |
+|REQ-OPT-017|optimizer|v1-full|optimizer.inference = None .|0165 §1|-|T600|
+| REQ-OPT-018 | optimizer | v1-full | optimizer.behavior = unchanged observable behavior. | 0165 §3 | - | T600 |
+| REQ-OPT-019 | optimizer | v1-full | optimizer.preserved_behavior = result, panic, I/O, atomic, volatile, FFI, Drop. | 0165 §3 | - | T600 |
+| REQ-OPT-020 | optimizer | v1-full | optimizer.checked_arithmetic = preserves panic/trap. | 0165 §8 | - | T600 |
+| REQ-OPT-021 | optimizer | v1-full | optimizer.semantics.wrapping = distinct from checked arithmetic. | 0165 §9 | - | T600 |
+| REQ-OPT-022 | optimizer | v1-full | optimizer.dce.side_effects = preserved. | 0165 §11 | - | T600 |
+| REQ-OPT-023 | optimizer | v1-full | optimizer.move.propagation = preserves move semantics. | 0165 §13 | - | T600 |
+| REQ-OPT-024 | optimizer | v1-full | optimizer.allocation.elimination = allowed if storage identity is not observable. | 0165 §17 | - | T605 |
+| REQ-OPT-025 | optimizer | v1-full | optimizer.allocation.escape = prevents elimination. (AMEM-55, AMEM-70, AMEM-72) | 0165 §19 | - | T605 |
+| REQ-OPT-026 | optimizer | v1-full | optimizer.bounds_check.elimination = allowed if verifier proves safety. | 0165 §21 | - | T609 |
 | REQ-TST-005 | testing | v1-core | harness.benchmark = no semantic definition. | 0166 §1 | - | T113 | 
 | REQ-TST-006 | testing | v1-core | harness.systems = Oracle, Native, Reference separated. | 0166 §1 | - | T113 | 
 | REQ-TST-007 | testing | v1-core | harness.optimization_tests.assertion = semantic result and optimization invariant. | 0166 §4 | - | T113 | 
@@ -2819,7 +2819,7 @@
 | REQ-CORE-444 | compiler/semantics | v1-full | The trait solving phase MUST resolve all method calls and associated types before MIR generation begins. | 0261 §16 | - | EPIC(E18.1) |
 | REQ-CORE-445 | compiler/semantics | v1-full | The compiler MUST explicitly separate frontend source-level ownership checking from backend MIR invariant verification. | 0261 §20 | - | EPIC(E18.1) |
 | REQ-CORE-446 | compiler/mir | v1-full | The generation of MIR instructions MUST be exclusively routed through a centralized MirBuilder API to prevent malformed instructions. | 0261 §23 | - | EPIC(E18.1) |
-| REQ-CORE-447 | compiler/optimizer | v1-full | The optimizer Pass Manager MUST explicitly track pass dependencies, preserved analyses, and invalidated analyses. | 0261 §27 | - | EPIC(E15.1) |
+| REQ-CORE-447 | compiler/optimizer | v1-full | The optimizer Pass Manager MUST explicitly track pass dependencies, preserved analyses, and invalidated analyses. | 0261 §27 | - | T602 |
 | REQ-CORE-448 | compiler/semantics | v1-full | Compile-time execution results MUST be lowered into the HIR and MUST NOT directly mutate Machine IR. | 0261 §25 | - | EPIC(E18.1) |
 | REQ-RT-022 | runtime/concurrency | v1-full | The concurrency model MUST differentiate Task from Thread, and task state MUST be small and deterministic. | 1066 §2.C | - | T400 |
 | REQ-LAY-166 | semantics/memory | v1-core | The Axiom memory model MUST NOT include mandatory GC, mandatory explicit borrow checking, hidden reference counting, hidden allocations, or hidden ownership runtimes. | 1066 §2.B | - | T113 | 
@@ -2827,9 +2827,9 @@
 | REQ-CORE-450 | semantic | v1-core | The compiler must explicitly track signature-changing effects (async, unsafe, GPU domain, FFI ABI) while internal effects (allocation, IO, panic) remain implicit. | 0225 §22 | - | T113 | 
 | REQ-CORE-451 | control-flow | v1-core | The compiler must raise an error if a view capability is alive across an await suspension point unless it is proven to terminate beforehand. | 0225 §5 | - | T113 | 
 | REQ-LNK-122 | type-system | v1-full | The trait solver must verify that either the implemented trait or the target type belongs to the current module to satisfy the orphan rule. | 0225 §31 | - | EPIC(E18.6) |
-| REQ-OPT-027 | optimization | v1-full | The optimizer must respect address observability as an optimization barrier, preventing transformations that alter observable stable-address contracts. | 0226 §11 | - | EPIC(E15.1) |
-| REQ-OPT-028 | optimization | v1-full | The optimizer must not treat unknown alias relationships as disjoint memory regions without explicit proof or API contract. | 0226 §6 | - | EPIC(E15.1) |
-| REQ-OPT-029 | optimization | v1-full | The compiler must preserve volatile memory operations and their observable machine accesses without reordering them. | 0226 §14 | - | EPIC(E15.1) |
+| REQ-OPT-027 | optimization | v1-full | The optimizer must respect address observability as an optimization barrier, preventing transformations that alter observable stable-address contracts. | 0226 §11 | - | T605 |
+| REQ-OPT-028 | optimization | v1-full | The optimizer must not treat unknown alias relationships as disjoint memory regions without explicit proof or API contract. | 0226 §6 | - | T605 |
+| REQ-OPT-029 | optimization | v1-full | The compiler must preserve volatile memory operations and their observable machine accesses without reordering them. | 0226 §14 | - | T605 |
 | REQ-MIR-063 | mir | v1-core | The MIR blocks must contain exactly one terminator instruction. | 0227 §5 | - | T113 | 
 | REQ-MIR-064 | mir | v1-core | The MIR must track ownership state with projection awareness to correctly handle partial moves of struct fields. | 0227 §9 | - | T113 | 
 | REQ-MIR-065 | mir | v1-core | Early returns must undergo Drop elaboration to execute all pending drop obligations for the current scope before returning. | 0227 §23 | - | T113 | 
@@ -2858,13 +2858,13 @@
 | REQ-LNK-129 | pipeline | v1-full | The compiler MUST ensure that dynamic stack allocations align to the requested alignment and accurately restore the stack pointer upon region exit. | 0236 §20 | - | EPIC(E18.6) |
 | REQ-LNK-130 | pipeline | v1-full | The compiler MUST NOT unconditionally require a default frame pointer for all functions. | 0236 §22 | - | EPIC(E18.6) |
 | REQ-LNK-131 | pipeline | v1-full | The prologue generator MUST decide the exact sequence for saving callee-saved registers based on target-specific capabilities. | 0236 §28 | - | EPIC(E18.6) |
-| REQ-OPT-030 | optimizer | v1-full | The post-RA machine optimizer MUST NOT change the semantics of the program. | 0237 §1 | - | EPIC(E15.1) |
-| REQ-OPT-031 | optimizer | v1-full | The machine optimizer MUST operate solely on physical registers, memory, flags, control flow, ABI, and target features, without accessing high-level source abstractions. | 0237 §3 | - | EPIC(E15.1) |
-| REQ-OPT-032 | optimizer | v1-full | The compiler MUST NOT eliminate dead instructions that possess memory side-effects such as volatile, atomic, trap, or unproven call semantics. | 0237 §5 | - | EPIC(E15.1) |
-| REQ-OPT-033 | optimizer | v1-full | The optimizer MUST NOT eliminate an identity operation if the operation's flags modification is subsequently used. | 0237 §9 | - | EPIC(E15.1) |
-| REQ-OPT-034 | optimizer | v1-full | A peephole pattern MUST NOT eliminate a preceding memory store unless it is proven dead and lacks volatile, atomic, or unproven aliasing side effects. | 0237 §19 | - | EPIC(E15.1) |
-| REQ-OPT-035 | optimizer | v1-full | The compiler MUST NOT perform store-to-load forwarding across an intervening call unless it can mathematically prove no memory aliasing or mutation occurs. | 0237 §21 | - | EPIC(E15.1) |
-| REQ-OPT-036 | optimizer | v1-full | The machine optimizer MUST NOT infer branch probabilities solely from user intent assumptions, but must rely on static analysis, profile data, or compiler hints. | 0237 §35 | - | EPIC(E15.1) |
+| REQ-OPT-030 | optimizer | v1-full | The post-RA machine optimizer MUST NOT change the semantics of the program. | 0237 §1 | - | T627 |
+| REQ-OPT-031 | optimizer | v1-full | The machine optimizer MUST operate solely on physical registers, memory, flags, control flow, ABI, and target features, without accessing high-level source abstractions. | 0237 §3 | - | T627 |
+| REQ-OPT-032 | optimizer | v1-full | The compiler MUST NOT eliminate dead instructions that possess memory side-effects such as volatile, atomic, trap, or unproven call semantics. | 0237 §5 | - | T627 |
+| REQ-OPT-033 | optimizer | v1-full | The optimizer MUST NOT eliminate an identity operation if the operation's flags modification is subsequently used. | 0237 §9 | - | T627 |
+| REQ-OPT-034 | optimizer | v1-full | A peephole pattern MUST NOT eliminate a preceding memory store unless it is proven dead and lacks volatile, atomic, or unproven aliasing side effects. | 0237 §19 | - | T628 |
+| REQ-OPT-035 | optimizer | v1-full | The compiler MUST NOT perform store-to-load forwarding across an intervening call unless it can mathematically prove no memory aliasing or mutation occurs. | 0237 §21 | - | T628 |
+| REQ-OPT-036 | optimizer | v1-full | The machine optimizer MUST NOT infer branch probabilities solely from user intent assumptions, but must rely on static analysis, profile data, or compiler hints. | 0237 §35 | - | T628 |
 | REQ-OBJ-001 | object | v1-core | The instruction encoder MUST operate independently of the target object file format. | 0238 §1 | - | T113 | 
 | REQ-OBJ-002 | object | v1-core | The final compiler MUST emit encoded machine bytes directly from the machine IR without generating intermediate assembler text. | 0238 §3 | - | T113 | 
 | REQ-OBJ-003 | object | v1-core | The encoder MUST immediately resolve local branch offsets within the same function without generating object relocations. | 0238 §12 | - | T113 | 
@@ -3102,11 +3102,11 @@
 | REQ-STD-021 | std-lib | v1-core | Standard Library is not part of the language type system . | 0303 §3 | REQ-STD-020 | T113 | 
 | REQ-STD-022 | std-lib | v1-core | Runtime components are independently linkable . | 0303 §4 | REQ-STD-021 | T113 | 
 | REQ-STD-023 | std-lib | v1-core | Unused runtime components must not be required . | 0303 §4 | REQ-STD-022 | T113 | 
-| REQ-OPT-037 | optimizer | v1-full | Axiom native execution is AOT by default. | 0309 §1 | - | EPIC(E15.1) |
-|REQ-OPT-038|optimizer|v1-full|Native execution does not require a virtual machine .|0309 §1|-|EPIC(E15.1)|
-|REQ-OPT-039|optimizer|v1-full|Language abstractions may be fully erased when unobservable .|0309 §1|-|EPIC(E15.1)|
-|REQ-OPT-040|optimizer|v1-full|Zero-cost abstraction means no mandatory overhead beyond observable semantics .|0309 §3|-|EPIC(E15.1)|
-|REQ-OPT-041|optimizer|v1-full|Optimization must preserve observable language semantics .|0309 §4|-|EPIC(E15.1)|
+| REQ-OPT-037 | optimizer | v1-full | Axiom native execution is AOT by default. | 0309 §1 | - | T604 |
+|REQ-OPT-038|optimizer|v1-full|Native execution does not require a virtual machine .|0309 §1|-|T604|
+|REQ-OPT-039|optimizer|v1-full|Language abstractions may be fully erased when unobservable .|0309 §1|-|T604|
+|REQ-OPT-040|optimizer|v1-full|Zero-cost abstraction means no mandatory overhead beyond observable semantics .|0309 §3|-|T604|
+|REQ-OPT-041|optimizer|v1-full|Optimization must preserve observable language semantics .|0309 §4|-|T604|
 | REQ-VER-002 | verifier | v1-core | Semantic verification is performed over CFG-based MIR. | 0314 §1 | - | T113 | 
 | REQ-VER-003 | verifier | v1-core | Verification uses shared compiler dataflow infrastructure . | 0314 §1 | REQ-VER-002 | T113 | 
 | REQ-VER-004 | verifier | v1-core | Ownership state is tracked at Place granularity . | 0314 §5 | REQ-VER-003 | T113 | 
@@ -3214,161 +3214,161 @@
 | REQ-CORE-532 | core-lib | v1-core | 28. Pure không phải chỉ “không write” | tasks/0396 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | T113 | 
 | REQ-CORE-533 | core-lib | v1-core | 51. Programmer không được giả mạo pure | tasks/0396 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | T113 | 
 | REQ-CORE-534 | core-lib | v1-core | 79. Effect contracts phải được verify | tasks/0396 §BOOTSTRAP-137 — Effect System, Side Effects & Function Purity Model | - | T113 | 
-| REQ-OPT-042 | optimizer | v1-full | Programmer không phải quyết định stack/heap/register. Compiler quyết định storage tối ưu nhất dựa trên semantic lifetime, escape và observable address. | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | EPIC(E15.1) |
-| REQ-OPT-043 | optimizer | v1-full | Giá trị được truyền qua function boundary. | tasks/0397 §6. Argument escape | - | EPIC(E15.1) |
-| REQ-OPT-044 | optimizer | v1-full | Không cần ép programmer chọn stack hay heap. Không cần bắt programmer viết lifetime. Không cần bắt programmer viết borrow checker syntax. Không cần restrict. Không cần pure. | tasks/0397 §Kết quả quan trọng của BOOTSTRAP-138 | - | EPIC(E15.1) |
-| REQ-OPT-045 | optimizer | v1-full | 3. Escape không phải lifetime | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | EPIC(E15.1) |
-| REQ-OPT-046 | optimizer | v1-full | 46. Không phải mọi allocation đều có thể promote | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | EPIC(E15.1) |
-| REQ-OPT-047 | optimizer | v1-full | MIR biểu diễn chương trình đúng về mặt semantics; OptIR biểu diễn chương trình theo cách thuận lợi nhất cho optimizer. | tasks/0398 §BOOTSTRAP-139 — SSA, MemorySSA & Unified Dataflow Optimization IR | - | EPIC(E15.1) |
-| REQ-OPT-048 | optimizer | v1-full | Semantic execution model | tasks/0398 §2. MIR và OptIR có vai trò khác nhau | - | EPIC(E15.1) |
-| REQ-OPT-049 | optimizer | v1-full | Optimization model | tasks/0398 §2. MIR và OptIR có vai trò khác nhau | - | EPIC(E15.1) |
-| REQ-OPT-050 | optimizer | v1-full | Scalar Replacement of Aggregates — SROA | tasks/0398 §9. Aggregate SSA | - | EPIC(E15.1) |
-| REQ-OPT-051 | optimizer | v1-full | Store này có thực sự clobber load kia không? | tasks/0398 §15. MemorySSA + AliasInfo | - | EPIC(E15.1) |
-| REQ-OPT-052 | optimizer | v1-full | mỗi optimization phải có precondition, legality proof, preserved analyses, invalidated analyses và rollback/failure semantics. | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | EPIC(E15.1) |
-| REQ-OPT-053 | optimizer | v1-full | 3. Không được tối ưu trực tiếp trên MIR | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | EPIC(E15.1) |
-| REQ-OPT-054 | optimizer | v1-full | 7. SSA value không phải ownership object | tasks/0398 §BOOTSTRAP-139 — SSA, MemorySSA & Unified Dataflow Optimization IR | - | EPIC(E15.1) |
-| REQ-OPT-055 | optimizer | v1-full | 11. Nhưng Drop phải được giữ | tasks/0398 §41. Partial move + SSA | - | EPIC(E15.1) |
-| REQ-OPT-056 | optimizer | v1-full | 18. MUST_ALIAS | tasks/0398 §18. MUST_ALIAS | - | EPIC(E15.1) |
-| REQ-OPT-057 | optimizer | v1-full | 63. MemorySSA không phải runtime memory | tasks/0398 §55. External state | - | EPIC(E15.1) |
-| REQ-OPT-058 | optimizer | v1-full | 69. MemoryRegion không phải source region | tasks/0398 §69. MemoryRegion không phải source region | - | EPIC(E15.1) |
-| REQ-OPT-059 | optimizer | v1-full | Một quyết định kiến trúc rất quan trọng đã được khóa | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | EPIC(E15.1) |
-| REQ-OPT-060 | optimizer | v1-full | Optimization is a proof-producing transformation, not a guess. | tasks/0399 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | EPIC(E15.1) |
-| REQ-OPT-061 | optimizer | v1-full | Compiler có thể nhìn xuyên qua abstraction boundary khi semantics cho phép, nhưng không được nhìn xuyên qua một boundary mà chương trình có quyền quan sát. | tasks/0399 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | EPIC(E15.1) |
-| REQ-OPT-062 | optimizer | v1-full | 2. Optimizer không được tự quyết semantics | tasks/0399 §73. Các nguyên tắc đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-063 | optimizer | v1-full | 12. Atomic không được DCE tùy tiện | tasks/0399 §13. Volatile càng nghiêm ngặt | - | EPIC(E15.1) |
-| REQ-OPT-064 | optimizer | v1-full | 34. Không được biến shared thành unique | tasks/0399 §73. Các nguyên tắc đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-065 | optimizer | v1-full | 39. -O0 vẫn phải đúng | tasks/0399 §12. Atomic không được DCE tùy tiện | - | EPIC(E15.1) |
-| REQ-OPT-066 | optimizer | v1-full | Compiler được phép nhìn xuyên abstraction boundary khi boundary không observable; compiler phải tôn trọng boundary khi nó là một phần của semantics/ABI. | tasks/0400 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | EPIC(E15.1) |
-| REQ-OPT-067 | optimizer | v1-full | không có observable external effect ngoài giá trị/termination semantics được mô hình hóa. | tasks/0400 §16. Pure không có nghĩa “không có code” | - | EPIC(E15.1) |
-| REQ-OPT-068 | optimizer | v1-full | 18. Result không phải Panic | tasks/0400 §18. Result không phải Panic | - | EPIC(E15.1) |
-| REQ-OPT-069 | optimizer | v1-full | 53. Function summaries không được thay semantics | tasks/0400 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | EPIC(E15.1) |
-| REQ-OPT-070 | opt | v1-full | Inlining preserves observable semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-071 | opt | v1-full | Inlining legality is independent from profitability. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-072 | opt | v1-full | CostModel cannot override legality. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-073 | opt | v1-full | Inlining cannot bypass verification. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-074 | opt | v1-full | Recursive inlining has bounded expansion. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-075 | opt | v1-full | Mutually recursive SCCs cannot cause unbounded inline expansion. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-076 | opt | v1-full | Inlining preserves Drop semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-077 | opt | v1-full | Inlining preserves capability semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-078 | opt | v1-full | Inlining preserves ownership semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-079 | opt | v1-full | Inlining preserves atomic and synchronization semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-080 | opt | v1-full | Inlining preserves FFI-visible behavior. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-081 | opt | v1-full | Inlining preserves ABI contracts at externally visible boundaries. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-082 | opt | v1-full | `@inline(always)` cannot force an illegal transformation. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-083 | opt | v1-full | `@inline(never)` is an optimization constraint, not a semantic distinction. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-084 | opt | v1-full | Closure inlining preserves capture semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-085 | opt | v1-full | Closure elimination requires non-observable closure identity. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-086 | opt | v1-full | Function-pointer identity prevents invalid function elimination. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-087 | opt | v1-full | Generic specialization preserves generic semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-088 | opt | v1-full | Specialization is performed only after semantic generic resolution. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-089 | opt | v1-full | Specialized instances have canonical identities. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-090 | opt | v1-full | Specialization cannot bypass ownership verification. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-091 | opt | v1-full | Specialization cannot fabricate trait obligations. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-092 | opt | v1-full | Specialization cannot weaken safety. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-093 | opt | v1-full | Specialization may refine representation. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-094 | opt | v1-full | Specialization may refine effect summaries. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-095 | opt | v1-full | Specialization may refine alias information only when proven. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-096 | opt | v1-full | Specialization may exploit constant generic arguments. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-097 | opt | v1-full | Specialization is bounded by compile-time and code-size budgets. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-098 | opt | v1-full | Equivalent generic instances may share implementation when semantics permit. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-099 | opt | v1-full | Code sharing cannot merge observably distinct identities. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-100 | opt | v1-full | Generic specialization may be partial. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-101 | opt | v1-full | Generic specialization may use profile information. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-102 | opt | v1-full | PGO cannot alter specialization legality. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-103 | opt | v1-full | Static trait dispatch does not require runtime dispatch. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-104 | opt | v1-full | `dyn Trait` is explicitly dynamic. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-105 | opt | v1-full | Devirtualization requires a proven concrete target. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-106 | opt | v1-full | Finite target sets may use guarded or multi-target dispatch. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-107 | opt | v1-full | Unknown target sets remain dynamically dispatched. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-108 | opt | v1-full | Closed-world assumptions must be explicitly valid. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-109 | opt | v1-full | Exports prevent invalid closed-world assumptions. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-110 | opt | v1-full | Dynamic loading prevents unsafe whole-program assumptions. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-111 | opt | v1-full | Reflection-preserved entities remain reachable. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-112 | opt | v1-full | Successful devirtualization may enable inlining. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-113 | opt | v1-full | Devirtualization cannot alter externally observable dispatch semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-114 | opt | v1-full | Source-level abstraction may be erased when non-observability is proven. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-115 | opt | v1-full | Abstraction erasure must preserve observable semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-116 | opt | v1-full | Compiler optimization is not part of language semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-117 | opt | v1-full | Different optimization levels must preserve semantics. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-118 | opt | v1-full | Observable identity prevents invalid abstraction erasure. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-119 | opt | v1-full | Observable address prevents invalid abstraction erasure. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-120 | opt | v1-full | FFI boundaries prevent invalid ABI erasure. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-121 | opt | v1-full | Reflection can prevent invalid reachability elimination. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-122 | opt | v1-full | Optimization metadata must not create mandatory runtime overhead. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-123 | opt | v1-full | AI/compiler inspection can explain abstraction-erasure decisions. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-124 | opt | v1-full | Specialized/generated code re-enters appropriate verification boundaries. | tasks/0401 §74. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-125 | opt | v1-full | Loop transformations preserve observable semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-126 | opt | v1-full | Loop discovery is CFG-based. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-127 | opt | v1-full | Loop canonicalization preserves semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-128 | opt | v1-full | Induction variables are compiler facts, not source-level ownership constructs. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-129 | opt | v1-full | Scalar Evolution respects Axiom integer overflow semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-130 | opt | v1-full | Wrapping arithmetic cannot be treated as mathematical unbounded arithmetic without proof. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-131 | opt | v1-full | Trip counts require valid proofs. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-132 | opt | v1-full | Unknown trip counts remain conservative. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-133 | opt | v1-full | Range analysis is distinct from ownership verification. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-134 | opt | v1-full | Range facts may be consumed by optimization only after validity is established. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-135 | opt | v1-full | Bounds-check elimination requires proof of bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-136 | opt | v1-full | Failure to prove bounds validity retains the required check. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-137 | opt | v1-full | Optimization never converts an unsafe access into a safe access by assumption. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-138 | opt | v1-full | Dominating range facts may establish bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-139 | opt | v1-full | Loop induction facts may establish bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-140 | opt | v1-full | Array/view lengths are semantic facts. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-141 | opt | v1-full | Adjacent half-open ranges are disjoint. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-142 | opt | v1-full | Unknown dynamic index relations are never assumed disjoint. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-143 | opt | v1-full | Loop-invariant code motion requires effect and dependency proof. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-144 | opt | v1-full | Observable external state prevents invalid hoisting. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-145 | opt | v1-full | Alias uncertainty prevents unsafe hoisting. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-146 | opt | v1-full | MemorySSA must validate load/store dependencies. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-147 | opt | v1-full | Atomic and volatile operations remain observable according to their semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-148 | opt | v1-full | Vectorization requires memory-dependence legality. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-149 | opt | v1-full | Compiler-proven capability disjointness may enable vectorization. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-150 | opt | v1-full | Unknown aliasing cannot be treated as NoAlias. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-151 | opt | v1-full | Vectorization preserves atomic semantics. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-152 | opt | v1-full | Vectorization preserves volatile semantics. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-153 | opt | v1-full | Vectorization preserves floating-point semantics unless relaxed semantics are explicitly enabled. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-154 | opt | v1-full | Reduction transformations preserve the semantics of the reduction operator. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-155 | opt | v1-full | Loop transformations must preserve Drop semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-156 | opt | v1-full | Loop transformations must preserve ownership semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-157 | opt | v1-full | Loop transformations must preserve capability validity. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-158 | opt | v1-full | Loop transformations cannot invalidate stable-address contracts. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-159 | opt | v1-full | Loop transformations cannot weaken synchronization semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-160 | opt | v1-full | Loop transformations respect async suspension boundaries. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-161 | opt | v1-full | Loop transformations respect GPU execution/storage domains. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-162 | opt | v1-full | Loop transformations respect FFI/foreign effects. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-163 | opt | v1-full | Runtime optimization guards are not safety proofs. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-164 | opt | v1-full | Optimization guards must retain a semantically correct fallback. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-165 | opt | v1-full | Loop versioning cannot change observable behavior. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-166 | opt | v1-full | Loop fusion requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-167 | opt | v1-full | Loop distribution requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-168 | opt | v1-full | Loop interchange requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-169 | opt | v1-full | Loop unrolling is bounded by code-size/resource policy. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-170 | opt | v1-full | Loop peeling preserves iteration semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-171 | opt | v1-full | Loop unswitching preserves branch effects. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-172 | opt | v1-full | Reduction reassociation requires operator/FP legality. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-173 | opt | v1-full | Integer strength reduction preserves overflow semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-174 | opt | v1-full | Address evolution is an optimizer representation, not a programmer-visible pointer semantic. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-175 | opt | v1-full | Target-specific loop transformations respect target feature availability. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-176 | opt | v1-full | Optimization level cannot alter program semantics. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-177 | opt | v1-full | Debug and release builds share the same semantic rules. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-178 | opt | v1-full | Loop optimization may consume AliasInfo, EffectInfo, EscapeInfo, RangeInfo and MemorySSA. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-179 | opt | v1-full | Loop optimization cannot create safety proofs. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-180 | opt | v1-full | Loop optimization cannot weaken existing safety proofs. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-181 | opt | v1-full | Failed optimization proofs reduce optimization opportunity rather than program validity. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-182 | opt | v1-full | Loop analyses are deterministic. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-183 | opt | v1-full | Independent loop analyses may run in parallel. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-184 | opt | v1-full | Loop analysis is incrementally cacheable. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-185 | opt | v1-full | Loop transformations preserve source provenance. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-186 | opt | v1-full | AI/compiler tooling can explain loop optimization decisions. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-187 | opt | v1-full | Compiler-generated loop transformations must remain verifiable. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-188 | opt | v1-full | No optimization may introduce mandatory runtime ownership machinery. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-189 | opt | v1-full | Safe array/view indexing may compile to unchecked machine addressing when bounds validity is proven. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-190 | opt | v1-full | Eliminated bounds checks are an optimization consequence, not a semantic relaxation. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-191 | opt | v1-full | Vectorized safe code must remain semantically equivalent to its scalar form. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-192 | opt | v1-full | Parallelization requires explicit semantic permission when ordering is observable. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-193 | opt | v1-full | Atomic operations cannot be silently converted into ordinary operations. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-194 | opt | v1-full | Volatile operations cannot be silently eliminated or reordered. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-195 | opt | v1-full | Observable Drop ordering cannot be changed by loop optimization. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
-| REQ-OPT-196 | opt | v1-full | Verified MIR remains the ultimate safety/semantic authority. | tasks/0402 §80. Các invariants đã khóa | - | EPIC(E15.1) |
+| REQ-OPT-042 | optimizer | v1-full | Programmer không phải quyết định stack/heap/register. Compiler quyết định storage tối ưu nhất dựa trên semantic lifetime, escape và observable address. | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | T607 |
+| REQ-OPT-043 | optimizer | v1-full | Giá trị được truyền qua function boundary. | tasks/0397 §6. Argument escape | - | T607 |
+| REQ-OPT-044 | optimizer | v1-full | Không cần ép programmer chọn stack hay heap. Không cần bắt programmer viết lifetime. Không cần bắt programmer viết borrow checker syntax. Không cần restrict. Không cần pure. | tasks/0397 §Kết quả quan trọng của BOOTSTRAP-138 | - | T607 |
+| REQ-OPT-045 | optimizer | v1-full | 3. Escape không phải lifetime | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | T607 |
+| REQ-OPT-046 | optimizer | v1-full | 46. Không phải mọi allocation đều có thể promote | tasks/0397 §BOOTSTRAP-138 — Escape Analysis, Allocation Promotion & Storage Optimization | - | T607 |
+| REQ-OPT-047 | optimizer | v1-full | MIR biểu diễn chương trình đúng về mặt semantics; OptIR biểu diễn chương trình theo cách thuận lợi nhất cho optimizer. | tasks/0398 §BOOTSTRAP-139 — SSA, MemorySSA & Unified Dataflow Optimization IR | - | T600 |
+| REQ-OPT-048 | optimizer | v1-full | Semantic execution model | tasks/0398 §2. MIR và OptIR có vai trò khác nhau | - | T600 |
+| REQ-OPT-049 | optimizer | v1-full | Optimization model | tasks/0398 §2. MIR và OptIR có vai trò khác nhau | - | T600 |
+| REQ-OPT-050 | optimizer | v1-full | Scalar Replacement of Aggregates — SROA | tasks/0398 §9. Aggregate SSA | - | T600 |
+| REQ-OPT-051 | optimizer | v1-full | Store này có thực sự clobber load kia không? | tasks/0398 §15. MemorySSA + AliasInfo | - | T600 |
+| REQ-OPT-052 | optimizer | v1-full | mỗi optimization phải có precondition, legality proof, preserved analyses, invalidated analyses và rollback/failure semantics. | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | T600 |
+| REQ-OPT-053 | optimizer | v1-full | 3. Không được tối ưu trực tiếp trên MIR | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | T600 |
+| REQ-OPT-054 | optimizer | v1-full | 7. SSA value không phải ownership object | tasks/0398 §BOOTSTRAP-139 — SSA, MemorySSA & Unified Dataflow Optimization IR | - | T600 |
+| REQ-OPT-055 | optimizer | v1-full | 11. Nhưng Drop phải được giữ | tasks/0398 §41. Partial move + SSA | - | T600 |
+| REQ-OPT-056 | optimizer | v1-full | 18. MUST_ALIAS | tasks/0398 §18. MUST_ALIAS | - | T600 |
+| REQ-OPT-057 | optimizer | v1-full | 63. MemorySSA không phải runtime memory | tasks/0398 §55. External state | - | T600 |
+| REQ-OPT-058 | optimizer | v1-full | 69. MemoryRegion không phải source region | tasks/0398 §69. MemoryRegion không phải source region | - | T600 |
+| REQ-OPT-059 | optimizer | v1-full | Một quyết định kiến trúc rất quan trọng đã được khóa | tasks/0398 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | T600 |
+| REQ-OPT-060 | optimizer | v1-full | Optimization is a proof-producing transformation, not a guess. | tasks/0399 §BOOTSTRAP-140 — Optimization Pass Manager & Legality Framework | - | T602 |
+| REQ-OPT-061 | optimizer | v1-full | Compiler có thể nhìn xuyên qua abstraction boundary khi semantics cho phép, nhưng không được nhìn xuyên qua một boundary mà chương trình có quyền quan sát. | tasks/0399 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | T602 |
+| REQ-OPT-062 | optimizer | v1-full | 2. Optimizer không được tự quyết semantics | tasks/0399 §73. Các nguyên tắc đã khóa | - | T602 |
+| REQ-OPT-063 | optimizer | v1-full | 12. Atomic không được DCE tùy tiện | tasks/0399 §13. Volatile càng nghiêm ngặt | - | T602 |
+| REQ-OPT-064 | optimizer | v1-full | 34. Không được biến shared thành unique | tasks/0399 §73. Các nguyên tắc đã khóa | - | T602 |
+| REQ-OPT-065 | optimizer | v1-full | 39. -O0 vẫn phải đúng | tasks/0399 §12. Atomic không được DCE tùy tiện | - | T602 |
+| REQ-OPT-066 | optimizer | v1-full | Compiler được phép nhìn xuyên abstraction boundary khi boundary không observable; compiler phải tôn trọng boundary khi nó là một phần của semantics/ABI. | tasks/0400 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | T613 |
+| REQ-OPT-067 | optimizer | v1-full | không có observable external effect ngoài giá trị/termination semantics được mô hình hóa. | tasks/0400 §16. Pure không có nghĩa “không có code” | - | T613 |
+| REQ-OPT-068 | optimizer | v1-full | 18. Result không phải Panic | tasks/0400 §18. Result không phải Panic | - | T613 |
+| REQ-OPT-069 | optimizer | v1-full | 53. Function summaries không được thay semantics | tasks/0400 §BOOTSTRAP-141 — Interprocedural Analysis, Call Graph & Whole-Program Optimization | - | T613 |
+| REQ-OPT-070 | opt | v1-full | Inlining preserves observable semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-071 | opt | v1-full | Inlining legality is independent from profitability. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-072 | opt | v1-full | CostModel cannot override legality. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-073 | opt | v1-full | Inlining cannot bypass verification. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-074 | opt | v1-full | Recursive inlining has bounded expansion. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-075 | opt | v1-full | Mutually recursive SCCs cannot cause unbounded inline expansion. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-076 | opt | v1-full | Inlining preserves Drop semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-077 | opt | v1-full | Inlining preserves capability semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-078 | opt | v1-full | Inlining preserves ownership semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-079 | opt | v1-full | Inlining preserves atomic and synchronization semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-080 | opt | v1-full | Inlining preserves FFI-visible behavior. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-081 | opt | v1-full | Inlining preserves ABI contracts at externally visible boundaries. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-082 | opt | v1-full | `@inline(always)` cannot force an illegal transformation. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-083 | opt | v1-full | `@inline(never)` is an optimization constraint, not a semantic distinction. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-084 | opt | v1-full | Closure inlining preserves capture semantics. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-085 | opt | v1-full | Closure elimination requires non-observable closure identity. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-086 | opt | v1-full | Function-pointer identity prevents invalid function elimination. | tasks/0401 §74. Invariants | - | T613 |
+| REQ-OPT-087 | opt | v1-full | Generic specialization preserves generic semantics. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-088 | opt | v1-full | Specialization is performed only after semantic generic resolution. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-089 | opt | v1-full | Specialized instances have canonical identities. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-090 | opt | v1-full | Specialization cannot bypass ownership verification. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-091 | opt | v1-full | Specialization cannot fabricate trait obligations. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-092 | opt | v1-full | Specialization cannot weaken safety. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-093 | opt | v1-full | Specialization may refine representation. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-094 | opt | v1-full | Specialization may refine effect summaries. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-095 | opt | v1-full | Specialization may refine alias information only when proven. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-096 | opt | v1-full | Specialization may exploit constant generic arguments. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-097 | opt | v1-full | Specialization is bounded by compile-time and code-size budgets. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-098 | opt | v1-full | Equivalent generic instances may share implementation when semantics permit. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-099 | opt | v1-full | Code sharing cannot merge observably distinct identities. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-100 | opt | v1-full | Generic specialization may be partial. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-101 | opt | v1-full | Generic specialization may use profile information. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-102 | opt | v1-full | PGO cannot alter specialization legality. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-103 | opt | v1-full | Static trait dispatch does not require runtime dispatch. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-104 | opt | v1-full | `dyn Trait` is explicitly dynamic. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-105 | opt | v1-full | Devirtualization requires a proven concrete target. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-106 | opt | v1-full | Finite target sets may use guarded or multi-target dispatch. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-107 | opt | v1-full | Unknown target sets remain dynamically dispatched. | tasks/0401 §74. Invariants | - | T614 |
+| REQ-OPT-108 | opt | v1-full | Closed-world assumptions must be explicitly valid. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-109 | opt | v1-full | Exports prevent invalid closed-world assumptions. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-110 | opt | v1-full | Dynamic loading prevents unsafe whole-program assumptions. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-111 | opt | v1-full | Reflection-preserved entities remain reachable. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-112 | opt | v1-full | Successful devirtualization may enable inlining. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-113 | opt | v1-full | Devirtualization cannot alter externally observable dispatch semantics. | tasks/0401 §74. Invariants | - | T615 |
+| REQ-OPT-114 | opt | v1-full | Source-level abstraction may be erased when non-observability is proven. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-115 | opt | v1-full | Abstraction erasure must preserve observable semantics. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-116 | opt | v1-full | Compiler optimization is not part of language semantics. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-117 | opt | v1-full | Different optimization levels must preserve semantics. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-118 | opt | v1-full | Observable identity prevents invalid abstraction erasure. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-119 | opt | v1-full | Observable address prevents invalid abstraction erasure. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-120 | opt | v1-full | FFI boundaries prevent invalid ABI erasure. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-121 | opt | v1-full | Reflection can prevent invalid reachability elimination. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-122 | opt | v1-full | Optimization metadata must not create mandatory runtime overhead. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-123 | opt | v1-full | AI/compiler inspection can explain abstraction-erasure decisions. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-124 | opt | v1-full | Specialized/generated code re-enters appropriate verification boundaries. | tasks/0401 §74. Invariants | - | T064 |
+| REQ-OPT-125 | opt | v1-full | Loop transformations preserve observable semantics. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-126 | opt | v1-full | Loop discovery is CFG-based. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-127 | opt | v1-full | Loop canonicalization preserves semantics. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-128 | opt | v1-full | Induction variables are compiler facts, not source-level ownership constructs. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-129 | opt | v1-full | Scalar Evolution respects Axiom integer overflow semantics. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-130 | opt | v1-full | Wrapping arithmetic cannot be treated as mathematical unbounded arithmetic without proof. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-131 | opt | v1-full | Trip counts require valid proofs. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-132 | opt | v1-full | Unknown trip counts remain conservative. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-133 | opt | v1-full | Range analysis is distinct from ownership verification. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-134 | opt | v1-full | Range facts may be consumed by optimization only after validity is established. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-135 | opt | v1-full | Bounds-check elimination requires proof of bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-136 | opt | v1-full | Failure to prove bounds validity retains the required check. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-137 | opt | v1-full | Optimization never converts an unsafe access into a safe access by assumption. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-138 | opt | v1-full | Dominating range facts may establish bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-139 | opt | v1-full | Loop induction facts may establish bounds validity. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-140 | opt | v1-full | Array/view lengths are semantic facts. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-141 | opt | v1-full | Adjacent half-open ranges are disjoint. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-142 | opt | v1-full | Unknown dynamic index relations are never assumed disjoint. | tasks/0402 §80. Các invariants đã khóa | - | T609 |
+| REQ-OPT-143 | opt | v1-full | Loop-invariant code motion requires effect and dependency proof. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-144 | opt | v1-full | Observable external state prevents invalid hoisting. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-145 | opt | v1-full | Alias uncertainty prevents unsafe hoisting. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-146 | opt | v1-full | MemorySSA must validate load/store dependencies. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-147 | opt | v1-full | Atomic and volatile operations remain observable according to their semantics. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-148 | opt | v1-full | Vectorization requires memory-dependence legality. | tasks/0402 §80. Các invariants đã khóa | - | T616 |
+| REQ-OPT-149 | opt | v1-full | Compiler-proven capability disjointness may enable vectorization. | tasks/0402 §80. Các invariants đã khóa | - | T616 |
+| REQ-OPT-150 | opt | v1-full | Unknown aliasing cannot be treated as NoAlias. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | T616 |
+| REQ-OPT-151 | opt | v1-full | Vectorization preserves atomic semantics. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | T616 |
+| REQ-OPT-152 | opt | v1-full | Vectorization preserves volatile semantics. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | T616 |
+| REQ-OPT-153 | opt | v1-full | Vectorization preserves floating-point semantics unless relaxed semantics are explicitly enabled. | tasks/0402 §80. Các invariants đã khóa | - | T616 |
+| REQ-OPT-154 | opt | v1-full | Reduction transformations preserve the semantics of the reduction operator. | tasks/0402 §80. Các invariants đã khóa | - | T616 |
+| REQ-OPT-155 | opt | v1-full | Loop transformations must preserve Drop semantics. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-156 | opt | v1-full | Loop transformations must preserve ownership semantics. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-157 | opt | v1-full | Loop transformations must preserve capability validity. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-158 | opt | v1-full | Loop transformations cannot invalidate stable-address contracts. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-159 | opt | v1-full | Loop transformations cannot weaken synchronization semantics. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-160 | opt | v1-full | Loop transformations respect async suspension boundaries. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-161 | opt | v1-full | Loop transformations respect GPU execution/storage domains. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-162 | opt | v1-full | Loop transformations respect FFI/foreign effects. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-163 | opt | v1-full | Runtime optimization guards are not safety proofs. | tasks/0402 §80. Các invariants đã khóa; tasks/0403 §82. Invariants đã khóa | - | T611 |
+| REQ-OPT-164 | opt | v1-full | Optimization guards must retain a semantically correct fallback. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-165 | opt | v1-full | Loop versioning cannot change observable behavior. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-166 | opt | v1-full | Loop fusion requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-167 | opt | v1-full | Loop distribution requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-168 | opt | v1-full | Loop interchange requires dependency legality. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-169 | opt | v1-full | Loop unrolling is bounded by code-size/resource policy. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-170 | opt | v1-full | Loop peeling preserves iteration semantics. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-171 | opt | v1-full | Loop unswitching preserves branch effects. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-172 | opt | v1-full | Reduction reassociation requires operator/FP legality. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-173 | opt | v1-full | Integer strength reduction preserves overflow semantics. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-174 | opt | v1-full | Address evolution is an optimizer representation, not a programmer-visible pointer semantic. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-175 | opt | v1-full | Target-specific loop transformations respect target feature availability. | tasks/0402 §80. Các invariants đã khóa | - | T611 |
+| REQ-OPT-176 | opt | v1-full | Optimization level cannot alter program semantics. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-177 | opt | v1-full | Debug and release builds share the same semantic rules. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-178 | opt | v1-full | Loop optimization may consume AliasInfo, EffectInfo, EscapeInfo, RangeInfo and MemorySSA. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-179 | opt | v1-full | Loop optimization cannot create safety proofs. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-180 | opt | v1-full | Loop optimization cannot weaken existing safety proofs. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-181 | opt | v1-full | Failed optimization proofs reduce optimization opportunity rather than program validity. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-182 | opt | v1-full | Loop analyses are deterministic. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-183 | opt | v1-full | Independent loop analyses may run in parallel. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-184 | opt | v1-full | Loop analysis is incrementally cacheable. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-185 | opt | v1-full | Loop transformations preserve source provenance. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-186 | opt | v1-full | AI/compiler tooling can explain loop optimization decisions. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-187 | opt | v1-full | Compiler-generated loop transformations must remain verifiable. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-188 | opt | v1-full | No optimization may introduce mandatory runtime ownership machinery. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-189 | opt | v1-full | Safe array/view indexing may compile to unchecked machine addressing when bounds validity is proven. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-190 | opt | v1-full | Eliminated bounds checks are an optimization consequence, not a semantic relaxation. | tasks/0402 §80. Các invariants đã khóa | - | T610 |
+| REQ-OPT-191 | opt | v1-full | Vectorized safe code must remain semantically equivalent to its scalar form. | tasks/0402 §80. Các invariants đã khóa | - | T616 |
+| REQ-OPT-192 | opt | v1-full | Parallelization requires explicit semantic permission when ordering is observable. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-193 | opt | v1-full | Atomic operations cannot be silently converted into ordinary operations. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-194 | opt | v1-full | Volatile operations cannot be silently eliminated or reordered. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-195 | opt | v1-full | Observable Drop ordering cannot be changed by loop optimization. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
+| REQ-OPT-196 | opt | v1-full | Verified MIR remains the ultimate safety/semantic authority. | tasks/0402 §80. Các invariants đã khóa | - | T612 |
 | REQ-SIMD-001 | simd | v1-full | Vector semantics are independent of target ISA. | tasks/0403 §82. Invariants đã khóa | - | T463 |
 | REQ-SIMD-002 | simd | v1-full | Core does not expose ISA-specific vector register types. | tasks/0403 §82. Invariants đã khóa | - | T463 |
 | REQ-SIMD-003 | simd | v1-full | Vector semantic types are distinct from physical register representations. | tasks/0403 §82. Invariants đã khóa | - | T463 |
@@ -3547,32 +3547,32 @@
 | REQ-LAY-285 | layout | v1-core | Compiler tooling can explain layout decisions. | tasks/0405 §86. Invariants đã khóa | - | T113 | 
 | REQ-LAY-286 | layout | v1-core | AI tooling can inspect semantic-to-physical field mapping. | tasks/0405 §86. Invariants đã khóa | - | T113 | 
 | REQ-LAY-287 | layout | v1-core | Layout optimization cannot create safety proofs. | tasks/0405 §86. Invariants đã khóa | - | T113 | 
-| REQ-OPT-197 | opt | v1-full | Microarchitecture optimization never changes Axiom semantics. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-198 | opt | v1-full | ISA semantics and microarchitecture cost are distinct. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-199 | opt | v1-full | Cost models influence optimization decisions only. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-200 | opt | v1-full | Latency and throughput are distinct cost dimensions. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-201 | opt | v1-full | Register pressure must participate in profitability decisions. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-202 | opt | v1-full | Spill cost must be modeled explicitly. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-203 | opt | v1-full | Instruction scheduling preserves all semantic dependencies. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-204 | opt | v1-full | Memory, atomic, volatile and foreign effects constrain scheduling. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-205 | opt | v1-full | Instruction fusion requires semantic equivalence. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-206 | opt | v1-full | Floating-point reassociation requires permitted FP semantics. | tasks/0406 §30. Invariants; tasks/0407 §35. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-207 | opt | v1-full | Branch optimization preserves observable evaluation order. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-208 | opt | v1-full | Branchless transformation is optional optimization, not semantic lowering. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-209 | opt | v1-full | SIMD selection depends on target capabilities and legality. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-210 | opt | v1-full | AVX/SSE/vector-domain interactions are backend concerns. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-211 | opt | v1-full | ISA feature availability and microarchitectural performance are separate. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-212 | opt | v1-full | PGO changes profitability decisions, never semantics. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-213 | opt | v1-full | CPU-specific profiles must not become language semantics. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-214 | opt | v1-full | Optimization must remain valid on the declared target profile. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-215 | opt | v1-full | Unknown aliasing cannot be converted into NoAlias by cost optimization. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-216 | opt | v1-full | Optimization cannot weaken ownership/capability verification. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-217 | opt | v1-full | Optimization cannot create a safety proof. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-218 | opt | v1-full | Machine scheduling is deterministic under reproducible configuration. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-219 | opt | v1-full | Target-specific optimization remains isolated from Core language semantics. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-220 | opt | v1-full | Cost-model uncertainty may reduce optimization aggressiveness but never invalidate correctness. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-221 | opt | v1-full | Source→MIR→OptIR→LIR→Machine provenance must remain inspectable. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-222 | opt | v1-full | AI-facing optimization explanations must identify the rejected/selected transformation and its relevant constraints. | tasks/0406 §30. Invariants | - | EPIC(E15.1) |
+| REQ-OPT-197 | opt | v1-full | Microarchitecture optimization never changes Axiom semantics. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-198 | opt | v1-full | ISA semantics and microarchitecture cost are distinct. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-199 | opt | v1-full | Cost models influence optimization decisions only. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-200 | opt | v1-full | Latency and throughput are distinct cost dimensions. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-201 | opt | v1-full | Register pressure must participate in profitability decisions. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-202 | opt | v1-full | Spill cost must be modeled explicitly. | tasks/0406 §30. Invariants | - | T627 |
+| REQ-OPT-203 | opt | v1-full | Instruction scheduling preserves all semantic dependencies. | tasks/0406 §30. Invariants | - | T063 |
+| REQ-OPT-204 | opt | v1-full | Memory, atomic, volatile and foreign effects constrain scheduling. | tasks/0406 §30. Invariants | - | T063 |
+| REQ-OPT-205 | opt | v1-full | Instruction fusion requires semantic equivalence. | tasks/0406 §30. Invariants | - | T628 |
+| REQ-OPT-206 | opt | v1-full | Floating-point reassociation requires permitted FP semantics. | tasks/0406 §30. Invariants; tasks/0407 §35. Invariants | - | T617 |
+| REQ-OPT-207 | opt | v1-full | Branch optimization preserves observable evaluation order. | tasks/0406 §30. Invariants | - | T628 |
+| REQ-OPT-208 | opt | v1-full | Branchless transformation is optional optimization, not semantic lowering. | tasks/0406 §30. Invariants | - | T628 |
+| REQ-OPT-209 | opt | v1-full | SIMD selection depends on target capabilities and legality. | tasks/0406 §30. Invariants | - | T617 |
+| REQ-OPT-210 | opt | v1-full | AVX/SSE/vector-domain interactions are backend concerns. | tasks/0406 §30. Invariants | - | T617 |
+| REQ-OPT-211 | opt | v1-full | ISA feature availability and microarchitectural performance are separate. | tasks/0406 §30. Invariants | - | T617 |
+| REQ-OPT-212 | opt | v1-full | PGO changes profitability decisions, never semantics. | tasks/0406 §30. Invariants | - | T063 |
+| REQ-OPT-213 | opt | v1-full | CPU-specific profiles must not become language semantics. | tasks/0406 §30. Invariants | - | T618 |
+| REQ-OPT-214 | opt | v1-full | Optimization must remain valid on the declared target profile. | tasks/0406 §30. Invariants | - | T618 |
+| REQ-OPT-215 | opt | v1-full | Unknown aliasing cannot be converted into NoAlias by cost optimization. | tasks/0406 §30. Invariants | - | T618 |
+| REQ-OPT-216 | opt | v1-full | Optimization cannot weaken ownership/capability verification. | tasks/0406 §30. Invariants | - | T618 |
+| REQ-OPT-217 | opt | v1-full | Optimization cannot create a safety proof. | tasks/0406 §30. Invariants | - | T618 |
+| REQ-OPT-218 | opt | v1-full | Machine scheduling is deterministic under reproducible configuration. | tasks/0406 §30. Invariants | - | T063 |
+| REQ-OPT-219 | opt | v1-full | Target-specific optimization remains isolated from Core language semantics. | tasks/0406 §30. Invariants | - | T619 |
+| REQ-OPT-220 | opt | v1-full | Cost-model uncertainty may reduce optimization aggressiveness but never invalidate correctness. | tasks/0406 §30. Invariants | - | T619 |
+| REQ-OPT-221 | opt | v1-full | Source→MIR→OptIR→LIR→Machine provenance must remain inspectable. | tasks/0406 §30. Invariants | - | T619 |
+| REQ-OPT-222 | opt | v1-full | AI-facing optimization explanations must identify the rejected/selected transformation and its relevant constraints. | tasks/0406 §30. Invariants | - | T619 |
 | REQ-SIMD-058 | simd | v1-full | Vectorization must preserve observable semantics. | tasks/0407 §35. Invariants | - | T472 |
 | REQ-SIMD-059 | simd | v1-full | Vectorization requires a proven legal transformation. | tasks/0407 §35. Invariants | - | T472 |
 | REQ-SIMD-060 | simd | v1-full | Unknown aliasing cannot be treated as independent. | tasks/0407 §35. Invariants | - | T472 |
@@ -3600,40 +3600,40 @@
 | REQ-SIMD-082 | simd | v1-full | Vectorization remains deterministic under reproducible compilation. | tasks/0407 §35. Invariants | - | T472 |
 | REQ-SIMD-083 | simd | v1-full | Source→loop→vector transformation provenance remains inspectable. | tasks/0407 §35. Invariants | - | T472 |
 | REQ-SIMD-084 | simd | v1-full | Failed vectorization reduces optimization only; it never changes program validity. | tasks/0407 §35. Invariants | - | T472 |
-| REQ-OPT-223 | opt | v1-full | Profile data never changes program semantics. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-224 | opt | v1-full | Profile observations are not semantic proofs. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-225 | opt | v1-full | Profile cannot establish ownership, capability, alias, safety or concurrency guarantees. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-226 | opt | v1-full | Profile-guided optimization must remain valid for all semantically legal executions. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-227 | opt | v1-full | Profile affects optimization profitability and strategy only. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-228 | opt | v1-full | Profile validity is tied to program and target identity. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-229 | opt | v1-full | Stale profiles must be rejected or assigned reduced confidence. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-230 | opt | v1-full | Profile data has provenance and confidence. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-231 | opt | v1-full | Function, call, branch, loop and value profiles are independently representable. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-232 | opt | v1-full | PGO may guide inlining. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-233 | opt | v1-full | PGO may guide specialization. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-234 | opt | v1-full | PGO may guide devirtualization but cannot prove dynamic target identity. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-235 | opt | v1-full | PGO may guide vectorization and vector width selection. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-236 | opt | v1-full | PGO may guide loop unrolling and peeling. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-237 | opt | v1-full | PGO may guide data-layout optimization only where layout is not semantically observable. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-238 | opt | v1-full | PGO may guide hot/cold code splitting. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-239 | opt | v1-full | PGO may guide branch layout. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-240 | opt | v1-full | PGO may guide memory/cache optimization. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-241 | opt | v1-full | PGO may guide CPU microarchitecture decisions. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-242 | opt | v1-full | Auto-tuning results are optimization feedback, not semantic information. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-243 | opt | v1-full | Auto-tuning must have explicit resource/time boundaries. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-244 | opt | v1-full | Profile-dependent artifacts must record profile identity. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-245 | opt | v1-full | Normal reproducible builds must not depend on uncontrolled external measurement noise. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-246 | opt | v1-full | Security contracts constrain PGO transformations. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-247 | opt | v1-full | Atomic, volatile, synchronization and FFI semantics constrain PGO transformations. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-248 | opt | v1-full | Unknown analysis facts cannot become proven solely from observed executions. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-249 | opt | v1-full | Optimization decisions distinguish legality from profitability. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-250 | opt | v1-full | Profile confidence must not override semantic legality. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-251 | opt | v1-full | PGO remains optional. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-252 | opt | v1-full | Programs must compile and remain semantically valid without profile data. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-253 | opt | v1-full | Profile data is inspectable and machine-readable. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-254 | opt | v1-full | Profile transformations preserve source provenance. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-255 | opt | v1-full | Profile analysis is deterministic given identical profile input and compiler configuration. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
-| REQ-OPT-256 | opt | v1-full | PGO does not weaken the Verified MIR boundary. | tasks/0408 §40. Invariants | - | EPIC(E15.1) |
+| REQ-OPT-223 | opt | v1-full | Profile data never changes program semantics. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-224 | opt | v1-full | Profile observations are not semantic proofs. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-225 | opt | v1-full | Profile cannot establish ownership, capability, alias, safety or concurrency guarantees. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-226 | opt | v1-full | Profile-guided optimization must remain valid for all semantically legal executions. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-227 | opt | v1-full | Profile affects optimization profitability and strategy only. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-228 | opt | v1-full | Profile validity is tied to program and target identity. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-229 | opt | v1-full | Stale profiles must be rejected or assigned reduced confidence. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-230 | opt | v1-full | Profile data has provenance and confidence. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-231 | opt | v1-full | Function, call, branch, loop and value profiles are independently representable. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-232 | opt | v1-full | PGO may guide inlining. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-233 | opt | v1-full | PGO may guide specialization. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-234 | opt | v1-full | PGO may guide devirtualization but cannot prove dynamic target identity. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-235 | opt | v1-full | PGO may guide vectorization and vector width selection. | tasks/0408 §40. Invariants | - | T620 |
+| REQ-OPT-236 | opt | v1-full | PGO may guide loop unrolling and peeling. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-237 | opt | v1-full | PGO may guide data-layout optimization only where layout is not semantically observable. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-238 | opt | v1-full | PGO may guide hot/cold code splitting. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-239 | opt | v1-full | PGO may guide branch layout. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-240 | opt | v1-full | PGO may guide memory/cache optimization. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-241 | opt | v1-full | PGO may guide CPU microarchitecture decisions. | tasks/0408 §40. Invariants | - | T622 |
+| REQ-OPT-242 | opt | v1-full | Auto-tuning results are optimization feedback, not semantic information. | tasks/0408 §40. Invariants | - | T625 |
+| REQ-OPT-243 | opt | v1-full | Auto-tuning must have explicit resource/time boundaries. | tasks/0408 §40. Invariants | - | T625 |
+| REQ-OPT-244 | opt | v1-full | Profile-dependent artifacts must record profile identity. | tasks/0408 §40. Invariants | - | T625 |
+| REQ-OPT-245 | opt | v1-full | Normal reproducible builds must not depend on uncontrolled external measurement noise. | tasks/0408 §40. Invariants | - | T625 |
+| REQ-OPT-246 | opt | v1-full | Security contracts constrain PGO transformations. | tasks/0408 §40. Invariants | - | T623 |
+| REQ-OPT-247 | opt | v1-full | Atomic, volatile, synchronization and FFI semantics constrain PGO transformations. | tasks/0408 §40. Invariants | - | T623 |
+| REQ-OPT-248 | opt | v1-full | Unknown analysis facts cannot become proven solely from observed executions. | tasks/0408 §40. Invariants | - | T623 |
+| REQ-OPT-249 | opt | v1-full | Optimization decisions distinguish legality from profitability. | tasks/0408 §40. Invariants | - | T623 |
+| REQ-OPT-250 | opt | v1-full | Profile confidence must not override semantic legality. | tasks/0408 §40. Invariants | - | T623 |
+| REQ-OPT-251 | opt | v1-full | PGO remains optional. | tasks/0408 §40. Invariants | - | T626 |
+| REQ-OPT-252 | opt | v1-full | Programs must compile and remain semantically valid without profile data. | tasks/0408 §40. Invariants | - | T626 |
+| REQ-OPT-253 | opt | v1-full | Profile data is inspectable and machine-readable. | tasks/0408 §40. Invariants | - | T626 |
+| REQ-OPT-254 | opt | v1-full | Profile transformations preserve source provenance. | tasks/0408 §40. Invariants | - | T626 |
+| REQ-OPT-255 | opt | v1-full | Profile analysis is deterministic given identical profile input and compiler configuration. | tasks/0408 §40. Invariants | - | T626 |
+| REQ-OPT-256 | opt | v1-full | PGO does not weaken the Verified MIR boundary. | tasks/0408 §40. Invariants | - | T626 |
 | REQ-CORE-535 | lnk | v1-full | Whole-program optimization preserves program semantics. | tasks/0409 §40. Invariants | - | EPIC(E18.6) |
 | REQ-CORE-536 | lnk | v1-full | LTO may optimize across modules when semantic boundaries permit. | tasks/0409 §40. Invariants | - | EPIC(E18.6) |
 | REQ-CORE-537 | lnk | v1-full | `pub` does not inherently create a machine-code optimization boundary. | tasks/0409 §40. Invariants | - | EPIC(E18.6) |
@@ -4623,45 +4623,45 @@
 | REQ-GEN-094 | gen | v1-core | AGEN2-59 â€” Generic Instance Count Is Resource-Bounded | tasks/0354 §73. Frozen invariants | - | T113 | 
 | REQ-GEN-095 | gen | v1-core | AGEN2-60 â€” Generic Compilation Budget Failure Is A Normal Diagnostic | tasks/0354 §73. Frozen invariants | - | T113 | 
 | REQ-GEN-096 | gen | v1-core | AGEN2-61 â€” Parallel Generic Compilation Must Be Semantically Equivalent To Serial Compilation | tasks/0354 §73. Frozen invariants | - | T113 | 
-| REQ-OPT-257 | opt | v1-full | ALTO-20 â€” Link-Time Optimization Is Optional | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-258 | opt | v1-full | ALTO-21 â€” Link-Time Optimization Must Preserve Language Semantics | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-259 | opt | v1-full | ALTO-22 â€” Linker Operates On Explicit Object Contracts | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-260 | opt | v1-full | ALTO-23 â€” Linker Does Not Infer Source Ownership Semantics | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-261 | opt | v1-full | ALTO-24 â€” Whole-Program Optimization Requires A Closed-World Contract | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-262 | opt | v1-full | ALTO-25 â€” Executable Roots Define Initial Reachability | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-263 | opt | v1-full | ALTO-26 â€” Unreachable Runtime Code May Be Removed | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-264 | opt | v1-full | ALTO-27 â€” Exported ABI Symbols Are Reachability Roots | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-265 | opt | v1-full | ALTO-28 â€” Dynamic Lookup Symbols Are Conservative Roots | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-266 | opt | v1-full | ALTO-29 â€” FFI Boundaries Are Conservative By Default | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-267 | opt | v1-full | ALTO-30 â€” Generic Instances May Be Deduplicated At Link Time | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-268 | opt | v1-full | ALTO-31 â€” Generic Deduplication Must Preserve ABI | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-269 | opt | v1-full | ALTO-32 â€” Generic Deduplication Must Preserve Observable Identity | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-270 | opt | v1-full | ALTO-33 â€” Generic Code Sharing May Occur Across Modules | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-271 | opt | v1-full | ALTO-34 â€” Cross-Module Inlining Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-272 | opt | v1-full | ALTO-35 â€” Cross-Module Constant Propagation Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-273 | opt | v1-full | ALTO-36 â€” Cross-Module Devirtualization Requires Proof | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-274 | opt | v1-full | ALTO-37 â€” Cross-Module Escape Analysis Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-275 | opt | v1-full | ALTO-38 â€” Cross-Module Alias Analysis Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-276 | opt | v1-full | ALTO-39 â€” Unknown Alias Information Must Not Become NoAlias Without Proof | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-277 | opt | v1-full | ALTO-40 â€” Synchronization Semantics Must Be Preserved | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-278 | opt | v1-full | ALTO-41 â€” Volatile Operations Remain Observable | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-279 | opt | v1-full | ALTO-42 â€” PGO Changes Optimization Decisions, Not Program Semantics | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-280 | opt | v1-full | ALTO-43 â€” PGO Profile Is A Build Input | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-281 | opt | v1-full | ALTO-44 â€” Stale Profiles Must Not Produce Incorrect Semantics | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-282 | opt | v1-full | ALTO-45 â€” PGO Builds Are Deterministic Given Their Profile | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-283 | opt | v1-full | ALTO-46 â€” Dead Code Elimination Is Mandatory Where Reachability Proves Deadness | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-284 | opt | v1-full | ALTO-47 â€” Dead Data Elimination Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-285 | opt | v1-full | ALTO-48 â€” Function Merging Is Permitted | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-286 | opt | v1-full | ALTO-49 â€” Identical Code Folding Must Respect Observable Identity | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-287 | opt | v1-full | ALTO-50 â€” Runtime Components Must Be Linkable Independently | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-288 | opt | v1-full | ALTO-51 â€” Unused Runtime Components Must Not Be Required By The Executable | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-289 | opt | v1-full | ALTO-52 â€” Parallel Optimization Must Be Semantically Equivalent To Serial Optimization | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-290 | opt | v1-full | ALTO-53 â€” Reproducible Linking Must Not Depend On Hash Iteration Order | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-291 | opt | v1-full | ALTO-54 â€” Optimization Cache Identity Must Include Relevant Build Inputs | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-292 | opt | v1-full | ALTO-55 â€” Optimization Profiles May Trade Code Size Against Performance | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-293 | opt | v1-full | ALTO-56 â€” Tiny Profile Must Prefer Code Sharing And Dead Stripping | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-294 | opt | v1-full | ALTO-57 â€” Speed Profile May Prefer Specialization And Inlining | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
-| REQ-OPT-295 | opt | v1-full | ALTO-58 â€” Debug And Release Must Preserve Core Language Semantics | tasks/0355 §80. Frozen invariants | - | EPIC(E15.1) |
+| REQ-OPT-257 | opt | v1-full | ALTO-20 â€” Link-Time Optimization Is Optional | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-258 | opt | v1-full | ALTO-21 â€” Link-Time Optimization Must Preserve Language Semantics | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-259 | opt | v1-full | ALTO-22 â€” Linker Operates On Explicit Object Contracts | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-260 | opt | v1-full | ALTO-23 â€” Linker Does Not Infer Source Ownership Semantics | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-261 | opt | v1-full | ALTO-24 â€” Whole-Program Optimization Requires A Closed-World Contract | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-262 | opt | v1-full | ALTO-25 â€” Executable Roots Define Initial Reachability | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-263 | opt | v1-full | ALTO-26 â€” Unreachable Runtime Code May Be Removed | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-264 | opt | v1-full | ALTO-27 â€” Exported ABI Symbols Are Reachability Roots | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-265 | opt | v1-full | ALTO-28 â€” Dynamic Lookup Symbols Are Conservative Roots | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-266 | opt | v1-full | ALTO-29 â€” FFI Boundaries Are Conservative By Default | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-267 | opt | v1-full | ALTO-30 â€” Generic Instances May Be Deduplicated At Link Time | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-268 | opt | v1-full | ALTO-31 â€” Generic Deduplication Must Preserve ABI | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-269 | opt | v1-full | ALTO-32 â€” Generic Deduplication Must Preserve Observable Identity | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-270 | opt | v1-full | ALTO-33 â€” Generic Code Sharing May Occur Across Modules | tasks/0355 §80. Frozen invariants | - | T620 |
+| REQ-OPT-271 | opt | v1-full | ALTO-34 â€” Cross-Module Inlining Is Permitted | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-272 | opt | v1-full | ALTO-35 â€” Cross-Module Constant Propagation Is Permitted | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-273 | opt | v1-full | ALTO-36 â€” Cross-Module Devirtualization Requires Proof | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-274 | opt | v1-full | ALTO-37 â€” Cross-Module Escape Analysis Is Permitted | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-275 | opt | v1-full | ALTO-38 â€” Cross-Module Alias Analysis Is Permitted | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-276 | opt | v1-full | ALTO-39 â€” Unknown Alias Information Must Not Become NoAlias Without Proof | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-277 | opt | v1-full | ALTO-40 â€” Synchronization Semantics Must Be Preserved | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-278 | opt | v1-full | ALTO-41 â€” Volatile Operations Remain Observable | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-279 | opt | v1-full | ALTO-42 â€” PGO Changes Optimization Decisions, Not Program Semantics | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-280 | opt | v1-full | ALTO-43 â€” PGO Profile Is A Build Input | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-281 | opt | v1-full | ALTO-44 â€” Stale Profiles Must Not Produce Incorrect Semantics | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-282 | opt | v1-full | ALTO-45 â€” PGO Builds Are Deterministic Given Their Profile | tasks/0355 §80. Frozen invariants | - | T621 |
+| REQ-OPT-283 | opt | v1-full | ALTO-46 â€” Dead Code Elimination Is Mandatory Where Reachability Proves Deadness | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-284 | opt | v1-full | ALTO-47 â€” Dead Data Elimination Is Permitted | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-285 | opt | v1-full | ALTO-48 â€” Function Merging Is Permitted | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-286 | opt | v1-full | ALTO-49 â€” Identical Code Folding Must Respect Observable Identity | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-287 | opt | v1-full | ALTO-50 â€” Runtime Components Must Be Linkable Independently | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-288 | opt | v1-full | ALTO-51 â€” Unused Runtime Components Must Not Be Required By The Executable | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-289 | opt | v1-full | ALTO-52 â€” Parallel Optimization Must Be Semantically Equivalent To Serial Optimization | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-290 | opt | v1-full | ALTO-53 â€” Reproducible Linking Must Not Depend On Hash Iteration Order | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-291 | opt | v1-full | ALTO-54 â€” Optimization Cache Identity Must Include Relevant Build Inputs | tasks/0355 §80. Frozen invariants | - | T622 |
+| REQ-OPT-292 | opt | v1-full | ALTO-55 â€” Optimization Profiles May Trade Code Size Against Performance | tasks/0355 §80. Frozen invariants | - | T624 |
+| REQ-OPT-293 | opt | v1-full | ALTO-56 â€” Tiny Profile Must Prefer Code Sharing And Dead Stripping | tasks/0355 §80. Frozen invariants | - | T624 |
+| REQ-OPT-294 | opt | v1-full | ALTO-57 â€” Speed Profile May Prefer Specialization And Inlining | tasks/0355 §80. Frozen invariants | - | T624 |
+| REQ-OPT-295 | opt | v1-full | ALTO-58 â€” Debug And Release Must Preserve Core Language Semantics | tasks/0355 §80. Frozen invariants | - | T624 |
 | REQ-SIMD-247 | simd | v1-full | ANUM-20 — Scalar numeric types are fundamental Axiom values. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T451 |
 | REQ-SIMD-248 | simd | v1-full | ANUM-21 — SIMD vectors are value-semantic types. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T464 |
 | REQ-SIMD-249 | simd | v1-full | ANUM-22 — SIMD vector semantics are distinct from array semantics. | tasks/0341 §100. Frozen Invariants — `ANUM-20..100`; tasks/0345 §100. Frozen Invariants — `ANUM-20..100` | - | T464 |
@@ -5919,52 +5919,52 @@
 | REQ-CORE-1260 | Verification | v1-core | The verifier does not require every valid program to expose its internal ownership graph to source syntax. | tasks/0365 §80. Invariants — `AVERIFY-20..` | - | T113 | 
 | REQ-CORE-1261 | Verification | v1-core | Verification diagnostics are structured and machine-readable. | tasks/0365 §80. Invariants — `AVERIFY-20..` | - | T113 | 
 | REQ-CORE-1262 | Verification | v1-core | The trusted semantic verifier is part of the compiler's correctness boundary. | tasks/0365 §80. Invariants — `AVERIFY-20..` | - | T113 | 
-| REQ-OPT-296 | Optimization | v1-full | Only Verified MIR enters optimization. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-297 | Optimization | v1-full | Optimization preserves observable program semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-298 | Optimization | v1-full | Optimization is independent of source-level ownership annotations because ownership facts are compiler-derived. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-299 | Optimization | v1-full | Verified disjointness may be lowered to internal NoAlias facts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-300 | Optimization | v1-full | Unknown aliasing is never treated as NoAlias. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-301 | Optimization | v1-full | Capability READ facts may enable read caching and load optimization when no invalidating effect exists. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-302 | Optimization | v1-full | Capability WRITE facts constrain memory reordering. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-303 | Optimization | v1-full | Ownership facts may enable scalar replacement and allocation elimination. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-304 | Optimization | v1-full | Move semantics do not require physical data movement. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-305 | Optimization | v1-full | Copy semantics do not require physical copying. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-306 | Optimization | v1-full | Clone remains an explicit semantic operation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-307 | Optimization | v1-full | Allocation elimination is legal only when allocation-observable semantics are preserved. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-308 | Optimization | v1-full | Stable-address observation prevents invalid storage promotion or relocation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-309 | Optimization | v1-full | Escape analysis may promote or eliminate storage. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-310 | Optimization | v1-full | Caller-allocated returns may replace physical return allocation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-311 | Optimization | v1-full | Bounds checks may be removed only when range facts prove their conditions. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-312 | Optimization | v1-full | Atomic operations are not replaced by ordinary memory operations unless semantics explicitly permit it. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-313 | Optimization | v1-full | Volatile operations are not removed or reordered as ordinary memory operations. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-314 | Optimization | v1-full | Foreign calls are optimized conservatively according to their effect contracts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-315 | Optimization | v1-full | Dynamic dispatch may be removed only when concrete target identity is proven. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-316 | Optimization | v1-full | Generic specialization must preserve generic semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-317 | Optimization | v1-full | Code sharing is permitted only when representation and semantics remain equivalent. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-318 | Optimization | v1-full | Inlining is an optimization decision, not a semantic requirement. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-319 | Optimization | v1-full | PGO may influence optimization decisions but never semantic validity. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-320 | Optimization | v1-full | LTO may introduce cross-module optimizations without changing language semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-321 | Optimization | v1-full | Effect information constrains elimination and reordering. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-322 | Optimization | v1-full | Optimization does not introduce mandatory runtime services. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-323 | Optimization | v1-full | Optimization may erase compiler-only capability metadata after all required verification. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-324 | Optimization | v1-full | OptIR is not required to preserve source-level syntax. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-325 | Optimization | v1-full | MIR remains the semantic source of truth. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-326 | Optimization | v1-full | SSA construction does not redefine ownership semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-327 | Optimization | v1-full | MemorySSA does not redefine the language memory model. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-328 | Optimization | v1-full | Alias analysis may only use proven facts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-329 | Optimization | v1-full | Optimization diagnostics must be explainable. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-330 | Optimization | v1-full | Optimization results are deterministic under the same optimization configuration and compiler semantic version. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-331 | Optimization | v1-full | Optimization passes must declare or encode their semantic preconditions. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-332 | Optimization | v1-full | A failed optimization proof results in no transformation rather than an unsafe assumption. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-333 | Optimization | v1-full | Target-specific optimization must preserve target-independent semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-334 | Optimization | v1-full | Binary-size optimization must not require a monolithic runtime. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-335 | Optimization | v1-full | Unobservable allocations may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-336 | Optimization | v1-full | Unobservable closure environments may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-337 | Optimization | v1-full | Unobservable copies may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-338 | Optimization | v1-full | Unobservable moves may be lowered as value renaming. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-339 | Optimization | v1-full | Optimization may reorder operations only when effect and memory-ordering constraints permit it. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-340 | Optimization | v1-full | Optimization must preserve panic, Drop, synchronization, atomic, volatile, FFI, GPU, and async semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
-| REQ-OPT-341 | Optimization | v1-full | Optimization must preserve source-to-machine debug provenance. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | EPIC(E15.1) |
+| REQ-OPT-296 | Optimization | v1-full | Only Verified MIR enters optimization. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-297 | Optimization | v1-full | Optimization preserves observable program semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-298 | Optimization | v1-full | Optimization is independent of source-level ownership annotations because ownership facts are compiler-derived. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-299 | Optimization | v1-full | Verified disjointness may be lowered to internal NoAlias facts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T605 |
+| REQ-OPT-300 | Optimization | v1-full | Unknown aliasing is never treated as NoAlias. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T605 |
+| REQ-OPT-301 | Optimization | v1-full | Capability READ facts may enable read caching and load optimization when no invalidating effect exists. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T605 |
+| REQ-OPT-302 | Optimization | v1-full | Capability WRITE facts constrain memory reordering. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T605 |
+| REQ-OPT-303 | Optimization | v1-full | Ownership facts may enable scalar replacement and allocation elimination. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T605 |
+| REQ-OPT-304 | Optimization | v1-full | Move semantics do not require physical data movement. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T603 |
+| REQ-OPT-305 | Optimization | v1-full | Copy semantics do not require physical copying. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T603 |
+| REQ-OPT-306 | Optimization | v1-full | Clone remains an explicit semantic operation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T603 |
+| REQ-OPT-307 | Optimization | v1-full | Allocation elimination is legal only when allocation-observable semantics are preserved. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T608 |
+| REQ-OPT-308 | Optimization | v1-full | Stable-address observation prevents invalid storage promotion or relocation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T608 |
+| REQ-OPT-309 | Optimization | v1-full | Escape analysis may promote or eliminate storage. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T608 |
+| REQ-OPT-310 | Optimization | v1-full | Caller-allocated returns may replace physical return allocation. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T608 |
+| REQ-OPT-311 | Optimization | v1-full | Bounds checks may be removed only when range facts prove their conditions. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T609 |
+| REQ-OPT-312 | Optimization | v1-full | Atomic operations are not replaced by ordinary memory operations unless semantics explicitly permit it. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T606 |
+| REQ-OPT-313 | Optimization | v1-full | Volatile operations are not removed or reordered as ordinary memory operations. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T606 |
+| REQ-OPT-314 | Optimization | v1-full | Foreign calls are optimized conservatively according to their effect contracts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T606 |
+| REQ-OPT-315 | Optimization | v1-full | Dynamic dispatch may be removed only when concrete target identity is proven. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T064 |
+| REQ-OPT-316 | Optimization | v1-full | Generic specialization must preserve generic semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T064 |
+| REQ-OPT-317 | Optimization | v1-full | Code sharing is permitted only when representation and semantics remain equivalent. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T064 |
+| REQ-OPT-318 | Optimization | v1-full | Inlining is an optimization decision, not a semantic requirement. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T064 |
+| REQ-OPT-319 | Optimization | v1-full | PGO may influence optimization decisions but never semantic validity. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T620 |
+| REQ-OPT-320 | Optimization | v1-full | LTO may introduce cross-module optimizations without changing language semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T620 |
+| REQ-OPT-321 | Optimization | v1-full | Effect information constrains elimination and reordering. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-322 | Optimization | v1-full | Optimization does not introduce mandatory runtime services. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-323 | Optimization | v1-full | Optimization may erase compiler-only capability metadata after all required verification. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-324 | Optimization | v1-full | OptIR is not required to preserve source-level syntax. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-325 | Optimization | v1-full | MIR remains the semantic source of truth. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-326 | Optimization | v1-full | SSA construction does not redefine ownership semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-327 | Optimization | v1-full | MemorySSA does not redefine the language memory model. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-328 | Optimization | v1-full | Alias analysis may only use proven facts. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-329 | Optimization | v1-full | Optimization diagnostics must be explainable. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-330 | Optimization | v1-full | Optimization results are deterministic under the same optimization configuration and compiler semantic version. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-331 | Optimization | v1-full | Optimization passes must declare or encode their semantic preconditions. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-332 | Optimization | v1-full | A failed optimization proof results in no transformation rather than an unsafe assumption. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-333 | Optimization | v1-full | Target-specific optimization must preserve target-independent semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T600 |
+| REQ-OPT-334 | Optimization | v1-full | Binary-size optimization must not require a monolithic runtime. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T624 |
+| REQ-OPT-335 | Optimization | v1-full | Unobservable allocations may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T607 |
+| REQ-OPT-336 | Optimization | v1-full | Unobservable closure environments may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T607 |
+| REQ-OPT-337 | Optimization | v1-full | Unobservable copies may be eliminated. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T601 |
+| REQ-OPT-338 | Optimization | v1-full | Unobservable moves may be lowered as value renaming. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T601 |
+| REQ-OPT-339 | Optimization | v1-full | Optimization may reorder operations only when effect and memory-ordering constraints permit it. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T603 |
+| REQ-OPT-340 | Optimization | v1-full | Optimization must preserve panic, Drop, synchronization, atomic, volatile, FFI, GPU, and async semantics. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T601 |
+| REQ-OPT-341 | Optimization | v1-full | Optimization must preserve source-to-machine debug provenance. | tasks/0366 §71. Optimization invariants — `AOPT-20..` | - | T601 |
 | REQ-RES-130 | ABI & Representation | v1-full | Semantic type identity is distinct from physical representation. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
 | REQ-RES-131 | ABI & Representation | v1-full | Default Axiom representation is compiler-controlled unless explicitly constrained. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
 | REQ-RES-132 | ABI & Representation | v1-full | Explicit representation attributes create representation contracts. | tasks/0367 §82. Invariants — `AABI-20..` | - | T500 |
@@ -6153,7 +6153,7 @@
 | REQ-COL-134 | collections | v1-core | Fixed arrays guarantee contiguous representation, `ArrayVec` provides fixed-capacity inline storage, and `SmallVec` provides inline storage with heap growth fallback. | tasks/0416 §71 (ACOLLECT-27, ACOLLECT-28, ACOLLECT-29) | - | T113 | 
 | REQ-COL-135 | collections | post-v1 | Arena containers provide bulk-lifetime deallocation, Pool containers provide element reuse, and Slab containers provide stable logical slot indices without exposing raw pointers. | tasks/0416 §71 (ACOLLECT-30, ACOLLECT-31, ACOLLECT-32, ACOLLECT-33) | - | EPIC(E24.0) |
 | REQ-CAP-122 | capability | v1-full | Active container views enforce capability and lifetime constraints, prohibiting mutation, growth, or storage relocation of the parent container while the view is active. | tasks/0416 §71 (ACOLLECT-42, ACOLLECT-43) | - | T501 |
-| REQ-OPT-342 | optimizer | v1-full | Container bounds checks can only be eliminated when the compiler formally proves that out-of-bounds indexing is unreachable. | tasks/0416 §71 (ACOLLECT-44), tasks/0426 §85 (AITER-69) | - | EPIC(E15.1) |
+| REQ-OPT-342 | optimizer | v1-full | Container bounds checks can only be eliminated when the compiler formally proves that out-of-bounds indexing is unreachable. | tasks/0416 §71 (ACOLLECT-44), tasks/0426 §85 (AITER-69) | - | T610 |
 | REQ-TXT-002 | text | post-v1 | Short string optimization (SSO) is an internal representation optimization and is not part of the semantic string type contract unless explicitly declared in an ABI contract. | tasks/0416 §71 (ACOLLECT-51, ACOLLECT-52) | - | EPIC(E24.0) |
 | REQ-LAY-288 | layout | post-v1 | `SoA` is an explicit semantic container type, and compiler transformations between Array-of-Structures and Structure-of-Arrays are permitted only when layout is unconstrained by ABI. | tasks/0416 §71 (ACOLLECT-56, ACOLLECT-57, ACOLLECT-58) | - | EPIC(E24.0) |
 | REQ-CONC-141 | concurrency | v1-full | Collections are not implicitly thread-safe, concurrent containers require explicit synchronization, and Send and Share traits are derived independently. | tasks/0416 §71 (ACOLLECT-63, ACOLLECT-64) | - | T400 |
@@ -6199,7 +6199,7 @@
 | REQ-BLD-094 | build | v1-core | The persistent artifact cache is content-addressed and validated against compiler version and schema identity, ensuring cache hits produce semantically equivalent output to clean builds. | tasks/0422 §80 (ACOMPIL-50, ACOMPIL-51, ACOMPIL-52, ACOMPIL-60, ACOMPIL-79) | - | T113 | 
 | REQ-BLD-095 | build | post-v1 | Target-independent frontend and middle-end IR queries are cached across compatible target configurations, invalidating queries only upon encountering the first target-dependent phase. | tasks/0422 §80 (ACOMPIL-68, ACOMPIL-69, ACOMPIL-70) | - | EPIC(E24.0) |
 | REQ-CNF-010 | conformance | v1-core | Every normative language rule requires conformance test coverage, and semantically invalid testcases must never compile successfully. | tasks/0423 §80 (ATEST2-20, ATEST2-21) | - | T113 | 
-| REQ-OPT-343 | optimizer | v1-full | Programs compiled under `-O0` and optimized configurations (including `-O2`, `-O3`, and LTO) must produce equivalent observable execution results. | tasks/0423 §80 (ATEST2-28, ATEST2-29, ATEST2-73) | - | EPIC(E15.1) |
+| REQ-OPT-343 | optimizer | v1-full | Programs compiled under `-O0` and optimized configurations (including `-O2`, `-O3`, and LTO) must produce equivalent observable execution results. | tasks/0423 §80 (ATEST2-28, ATEST2-29, ATEST2-73) | - | T604 |
 | REQ-VER-011 | verifier | v1-core | Independent structural verifiers validate intermediate artifacts across MIR, OptIR, Machine IR, object files, and linked binaries. | tasks/0423 §80 (ATEST2-31, ATEST2-32, ATEST2-33, ATEST2-34, ATEST2-35) | - | T113 | 
 | REQ-TST-102 | testing | v1-core | Multi-stage fuzzers independently target grammar parsing, MIR validity, optimizer passes, and backend code generators. | tasks/0423 §80 (ATEST2-36, ATEST2-37, ATEST2-38, ATEST2-39, ATEST2-40) | - | T113 | 
 | REQ-CNF-011 | conformance | v1-core | Compiler releases enforce gates verifying that serial, parallel, clean, incremental, cached, and uncached compilations yield identical binary or semantic outputs. | tasks/0423 §80 (ATEST2-49, ATEST2-50, ATEST2-51, ATEST2-52, ATEST2-69) | - | T113 | 
@@ -6219,7 +6219,7 @@
 | REQ-TOOL-181 | tooling | v1-full | Container semantic properties including storage kind, relocatability, address stability, and invalidation rules are exported into `.axmeta` for compiler, IDE, and AI inspection. | tasks/0425 §78, tasks/0425 §80 (ACONT-76) | - | EPIC(E19.1) |
 | REQ-GEN-097 | generics | v1-core | Iterators are compile-time generic protocols without mandatory heap allocation or virtual dispatch, allowing optimizer passes to fully erase iterator objects into native loops. | tasks/0426 §1, tasks/0426 §85 (AITER-20, AITER-21, AITER-22, AITER-59) | - | T113 | 
 | REQ-EXP-146 | expr | v1-core | Range expressions define half-open (`..`) or inclusive (`..=`) bounds with defined integer arithmetic, preserving traversal order across forward and stepped iterations. | tasks/0426 §85 (AITER-24, AITER-25, AITER-26) | - | T113 | 
-| REQ-OPT-344 | optimizer | v1-full | Iterator adapters such as `map` and `filter` are lazy, and iterator pipeline fusion may eliminate intermediate buffers only when observable side effects are preserved. | tasks/0426 §85 (AITER-27, AITER-28, AITER-29, AITER-30) | - | EPIC(E15.1) |
+| REQ-OPT-344 | optimizer | v1-full | Iterator adapters such as `map` and `filter` are lazy, and iterator pipeline fusion may eliminate intermediate buffers only when observable side effects are preserved. | tasks/0426 §85 (AITER-27, AITER-28, AITER-29, AITER-30) | - | T611 |
 | REQ-CAP-124 | capability | v1-full | Mutable iterators provide exclusive capabilities, and overlapping mutable iteration over the same container is statically rejected unless provenance proves disjoint element subsets. | tasks/0426 §85 (AITER-31, AITER-32, AITER-33, AITER-35) | - | T502 |
 | REQ-OWN-241 | ownership | v1-core | Container iteration distinguishes borrowing views (`iter`), exclusive views (`iter_mut`), and consuming ownership transfers (`into_iter`), ensuring partially consumed owning iterators drop unconsumed elements. | tasks/0426 §85 (AITER-36, AITER-37, AITER-38, AITER-39) | - | T113 | 
 | REQ-SIMD-328 | simd | v1-full | Iterators over contiguous memory expose layout and stride guarantees, enabling automatic loop vectorization when aliasing and profitability are verified. | tasks/0426 §85 (AITER-47, AITER-48, AITER-60) | - | T466 |
@@ -6239,7 +6239,7 @@
 | REQ-CAP-125 | capability | v1-full | Collection operations that may relocate backing storage must be prevented while live `view<T>` or `mut_view<T>` capabilities to that storage exist. | 0429 §8, §9, 0429 §52 ACOL-25, ACOL-55 | - | T501 |
 | REQ-COL-144 | collections | v1-core | `view<T>` provides a read capability over collection elements without heap allocation or element copying. | 0429 §3, §21, 0429 §52 ACOL-26 | - | T113 | 
 | REQ-COL-145 | collections | v1-core | `into_iter` transfers element ownership without implicit cloning, and early loop exit must drop remaining elements deterministically. | 0429 §12, 0429 §52 ACOL-28 | - | T113 | 
-| REQ-OPT-345 | optimizer | v1-full | The compiler may promote non-escaping bounded collection storage to stack, registers, or inline storage, or eliminate allocation entirely when observable semantics are preserved. | 0429 §6, 0429 §52 ACOL-31, ACOL-32, ACOL-33 | - | EPIC(E15.1) |
+| REQ-OPT-345 | optimizer | v1-full | The compiler may promote non-escaping bounded collection storage to stack, registers, or inline storage, or eliminate allocation entirely when observable semantics are preserved. | 0429 §6, 0429 §52 ACOL-31, ACOL-32, ACOL-33 | - | T607 |
 | REQ-ERR-081 | error | v1-core | `Option<T>` represents absence of value with `Some(T)` and `None` variants and without a `null` value. | 0430 §2, 0430 §50 AERR-20 | - | T113 | 
 | REQ-ERR-082 | error | v1-core | `Result<T, E>` represents recoverable failure with value semantics (`Ok(T)` and `Err(E)`) without requiring runtime exceptions, unwinding machinery, or heap allocation. | 0430 §3, §8, 0430 §50 AERR-21, AERR-22, AERR-24 | - | T113 | 
 | REQ-EXP-147 | expr | v1-core | The `?` operator lowers directly to early return control flow on `Err(e)` while unwinding local resources in the current scope via deterministic Drop edges. | 0430 §4, §5, 0430 §50 AERR-23 | - | T113 | 
@@ -6285,7 +6285,7 @@
 | REQ-RT-139 | runtime | v1-full | Axiom does not mandate a global heap allocator, mandatory garbage collection, or implicit reference counting. | 0436 §62, §63, 0436 §2014 AALLOC-20, AALLOC-21, AALLOC-22 | - | EPIC(E21.1) |
 | REQ-LAY-290 | layout | v1-core | Physical storage placement (registers, stack, inline, arena, pool, or heap) is not determined solely by high-level type declarations and is selected by compiler analysis. | 0436 §2014 AMEMALLOC-20, AMEMALLOC-21 | - | T113 | 
 | REQ-RT-140 | runtime | v1-full | Address stability is not guaranteed by default and must be explicitly contracted when required by foreign interfaces or address-sensitive collections. | 0436 §54, 0436 §2014 AMEMALLOC-24, AMEMALLOC-25 | - | EPIC(E21.1) |
-| REQ-OPT-346 | optimizer | v1-full | Storage for non-escaping allocations may be promoted to stack or registers or completely eliminated when address identity is unobservable. | 0436 §2014 AMEMALLOC-26, AMEMALLOC-27, AFRAG-23 | - | EPIC(E15.1) |
+| REQ-OPT-346 | optimizer | v1-full | Storage for non-escaping allocations may be promoted to stack or registers or completely eliminated when address identity is unobservable. | 0436 §2014 AMEMALLOC-26, AMEMALLOC-27, AFRAG-23 | - | T607 |
 | REQ-ABI-094 | abi | v1-full | Returning large aggregates by value represents an ownership transfer and may be lowered to caller-allocated destination slots without intermediate heap allocation or copying. | 0436 §79, §80, §81 | - | T503 |
 | REQ-DRP-057 | drop | v1-core | Batch deallocation in arenas or pools must preserve deterministic element destruction order for types with custom `Drop` implementations. | 0436 §78, 0436 §2014 AMEMALLOC-29, AALLOC-27 | - | T113 | 
 | REQ-SEC-111 | security | v1-core | Memory zeroization contracts for sensitive types (e.g., `Secret<T>`) cannot be eliminated by dead-store optimization even when memory is never subsequently read. | 0436 §68 | - | T113 | 
@@ -6300,8 +6300,8 @@
 | REQ-ASY-151 | async | v1-full | Asynchronous I/O is represented as Future-based suspension without requiring thread creation, and operation completion occurs at most once. | 0438 §2097 AIO-23, AIOASYNC-24 | - | T425 |
 | REQ-ASY-152 | async | v1-full | Dropping an async I/O Future does not implicitly cancel the in-flight physical operation, and buffer storage cannot be reclaimed while the operation may still access it. | 0438 §2097 AIO-24, AIOASYNC-21, AIOASYNC-22 | - | T427 |
 | REQ-ERR-083 | error | v1-core | I/O operations report recoverable failures using `Result<T, IoError>` and support partial read and write representations. | 0438 §2097 AIO-25, AIO-27 | - | T113 | 
-| REQ-OPT-347 | optimizer | v1-full | Zero-copy data paths (including DMA, mmap, and scatter/gather) are optimizations that require compile-time proofs of capability non-aliasing and lifetime validity. | 0438 §2097 AZCOPY-20, AZCOPY-21, AZCOPY-25 | - | EPIC(E15.1) |
-| REQ-OPT-348 | optimizer | v1-full | I/O operations are observable effects whose external ordering cannot be altered by compiler reordering unless operations are proven independent. | 0438 §95, §96, 0438 §2097 AIOOPT-20, AIOOPT-21, AIOOPT-22 | - | EPIC(E15.1) |
+| REQ-OPT-347 | optimizer | v1-full | Zero-copy data paths (including DMA, mmap, and scatter/gather) are optimizations that require compile-time proofs of capability non-aliasing and lifetime validity. | 0438 §2097 AZCOPY-20, AZCOPY-21, AZCOPY-25 | - | T606 |
+| REQ-OPT-348 | optimizer | v1-full | I/O operations are observable effects whose external ordering cannot be altered by compiler reordering unless operations are proven independent. | 0438 §95, §96, 0438 §2097 AIOOPT-20, AIOOPT-21, AIOOPT-22 | - | T602 |
 | REQ-DRV-015 | driver | v1-full | DMA buffers possess explicit storage domains where device completion releases or transfers buffer capabilities back to CPU execution domains. | 0438 §2097 ADMA-20, ADMA-21, ADMA-25 | - | EPIC(E18.1) |
 | REQ-RT-145 | runtime | v1-full | Process, Thread, Fiber, Task, and Future are distinct execution concepts: processes define isolation boundaries, threads own native stacks, fibers own user stacks, and tasks represent schedulable work. | 0439 §149, §151 AEXEC-20, APROC-20 | - | EPIC(E21.1) |
 | REQ-CONC-149 | concurrency | v1-full | Forced external thread termination is prohibited as a safe primitive to preserve resource Drop consistency. | 0439 §151 AEXEC-26 | - | T420 |
@@ -6339,7 +6339,7 @@
 | REQ-RT-162 | runtime | v1-full | ProcessId value identity and ChildProcess ownership handle shall be distinct; dropping a child handle shall not implicitly terminate the process, and child termination or kill operations must be explicit. | tasks/0443 §184.145 (APROC-20, APROC-21, APROC-22, APROC-23) | - | EPIC(E21.1) |
 | REQ-RT-163 | runtime | v1-full | Child process wait operations shall establish a synchronization edge with process completion, and ExitStatus shall retain platform-specific exit codes, signals, and core dump metadata. | tasks/0443 §184.145 (APROC-24, APROC-26) | - | EPIC(E21.1) |
 | REQ-CTM-044 | comptime | v1-full | Process environment variables shall be modeled as external state where reads are impure; compile-time environment access shall require explicit capabilities and participate in build identity. | tasks/0443 §184.145 (APROC-30, APROC-31, APROC-33, APROC-34) | - | T551 |
-| REQ-OPT-349 | optimizer | v1-full | OS resource effects shall participate in compiler EffectInfo, and the optimizer shall not eliminate or reorder observable external side-effects. | tasks/0443 §184.145 (AOS-30, AOS-31) | - | EPIC(E15.1) |
+| REQ-OPT-349 | optimizer | v1-full | OS resource effects shall participate in compiler EffectInfo, and the optimizer shall not eliminate or reorder observable external side-effects. | tasks/0443 §184.145 (AOS-30, AOS-31) | - | T602 |
 | REQ-TOOL-182 | tooling | v1-full | Compile-time metadata (.axmeta), runtime reflection metadata, and debug metadata shall be distinct artifacts; .axmeta shall not be required to be embedded into production executables. | tasks/0444 §185.152 (AMETA-20, AMETA-21, AMETA-22) | - | EPIC(E19.1) |
 | REQ-MOD-140 | module | v1-core | Semantic metadata identities shall use canonical semantic IDs (TypeId, FunctionId, TraitId) rather than declaration names, deterministically generated under reproducible builds without altering program semantics. | tasks/0444 §185.152 (AMETA-23, AMETA-24, AMETA-25) | - | T113 | 
 | REQ-CTM-045 | comptime | v1-full | Compile-time reflection shall be available independently of runtime reflection; runtime reflection shall be optional and impose zero mandatory binary overhead on programs that do not request it. | tasks/0444 §185.152 (AREFLECT-20, AREFLECT-21, AREFLECT-22) | - | T557 |
@@ -6363,7 +6363,7 @@
 | REQ-RT-164 | runtime | v1-full | Package management tooling and unused runtime components shall never be implicitly linked into application binaries. | tasks/0446 §187.160 (ARUNTIMEPKG-20, ARUNTIMEPKG-21, ARUNTIMEPKG-22, ARUNTIMEPKG-23) | - | EPIC(E21.1) |
 | REQ-ORC-010 | oracle | v1-core | Every compiler transformation shall preserve observable semantics, with formal reference semantics serving as the authoritative semantic oracle. | tasks/0447 §29 (ATEST-20, ATEST-21, ATEST-40) | - | T113 | 
 | REQ-MIR-128 | mir | v1-core | Verified MIR shall serve as the correctness boundary prior to optimization, and the MIR interpreter shall execute according to Verified MIR semantics. | tasks/0447 §29 (ATEST-22, ATEST-23) | - | T113 | 
-| REQ-OPT-350 | optimizer | v1-full | Every optimization pass shall specify explicit preconditions and preserved invariants; unproven optimization proofs shall abort the pass, and unknown aliases shall not be treated as disjoint. | tasks/0447 §29 (ATEST-24, ATEST-25, ATEST-26, ATEST-27) | - | EPIC(E15.1) |
+| REQ-OPT-350 | optimizer | v1-full | Every optimization pass shall specify explicit preconditions and preserved invariants; unproven optimization proofs shall abort the pass, and unknown aliases shall not be treated as disjoint. | tasks/0447 §29 (ATEST-24, ATEST-25, ATEST-26, ATEST-27) | - | T602 |
 | REQ-TST-105 | testing | v1-core | The compiler test suite shall support differential execution across the reference VM, the MIR interpreter, and the production compiler. | tasks/0447 §29 (ATEST-28) | - | T113 | 
 | REQ-CNF-012 | conformance | v1-core | Ownership, capability, and concurrency semantics shall have adversarial conformance suites, and every discovered compiler miscompilation shall become a permanent regression test. | tasks/0447 §29 (ATEST-30, ATEST-38) | - | T113 | 
 | REQ-DRV-016 | driver | v1-full | The compiler shall be deterministic in semantic outputs, treat crashes on valid source inputs as compiler defects, and assign stable diagnostic codes to semantic errors. | tasks/0447 §29 (ATEST-31, ATEST-32, ATEST-33) | - | EPIC(E18.1) |
@@ -6421,7 +6421,7 @@
 | REQ-CORE-1318 | core-lib | v1-core | Dynamic memory allocation facilities shall reside in an explicit alloc library layer above core, and hosted std APIs shall not be mandatory dependencies of freestanding programs. | tasks/0456 §197.51 (ASTDL-22, ASTDL-23) | - | T113 | 
 | REQ-LNK-231 | linker | v1-full | Standard library linking shall operate on declaration reachability, ensuring importing a module does not link unreferenced declarations and unused subsystems are stripped. | tasks/0456 §197.51 (ASTDL-24, ASTDL-25, ASTDL-26) | - | EPIC(E18.6) |
 | REQ-STD-160 | std-lib | v1-core | Safe standard library wrappers shall encapsulate unsafe platform boundaries without leaking foreign ownership models into safe Axiom APIs. | tasks/0456 §197.51 (ASTDL-28, ASTDL-47) | - | T113 | 
-| REQ-OPT-351 | optimizer | v1-full | Compiler intrinsics shall have explicit semantic contracts recognized by semantic identity rather than symbol names alone. | tasks/0456 §197.51 (ASTDL-29, ASTDL-30, ASTDL-41) | - | EPIC(E15.1) |
+| REQ-OPT-351 | optimizer | v1-full | Compiler intrinsics shall have explicit semantic contracts recognized by semantic identity rather than symbol names alone. | tasks/0456 §197.51 (ASTDL-29, ASTDL-30, ASTDL-41) | - | T603 |
 | REQ-GEN-099 | generics | v1-core | Generic library abstractions shall be zero-cost where contracts permit compile-time elimination, supporting monomorphization or sharing without violating type-specific ABI constraints. | tasks/0456 §197.51 (ASTDL-31, ASTDL-32, ASTDL-48) | - | T113 | 
 | REQ-TOOL-190 | tooling | v1-full | Standard library APIs shall expose allocation, blocking, synchronization, and effect metadata queryable through CompilerDB by AI and developer tooling. | tasks/0456 §197.51 (ASTDL-34, ASTDL-35, ASTDL-36, ASTDL-37) | - | EPIC(E19.1) |
 | REQ-CORE-1319 | core-lib | post-v1 | Tensor types (`Tensor<T, Shape, Layout>`) shall be library-level abstractions built on core primitives rather than mandatory Core types, supporting both static compile-time shape verification and dynamic runtime-checked shapes without introducing a dynamic object model. | tasks/0459 §200.1-6, ATENSOR-20, ATENSOR-23-25, ATENSOR-56; tasks/0468 §209.1-5, ATENSOR-20, ATENSOR-26-28 | - | EPIC(E24.0) |
@@ -6462,7 +6462,7 @@
 | REQ-CAP-139 | capability | v1-full | Zero-copy views into network buffers shall not outlive backing storage; scatter/gather operations shall enforce capability non-overlap across segments. | tasks/0465 §206.17-18, ANET2-35-36 | - | T519 |
 | REQ-CAP-140 | capability | v1-full | CPU mutable access to a buffer shall be prohibited while active DMA or hardware device transfers are in progress on that buffer. | tasks/0465 §206.24, ANET2-44-45 | - | T513, T526 |
 | REQ-CONC-153 | concurrency | v1-full | RDMA memory registrations shall remain valid for all dependent operations, and RDMA completion notifications shall govern buffer reuse. | tasks/0465 §206.25, ANET2-46-47 | - | T428 |
-| REQ-OPT-352 | optimizer | v1-full | Security-sensitive memory zeroization operations in network and protocol layers shall be semantically observable and immune to dead-code elimination. | tasks/0465 §206.28, ANET2-56 | - | EPIC(E15.1) |
+| REQ-OPT-352 | optimizer | v1-full | Security-sensitive memory zeroization operations in network and protocol layers shall be semantically observable and immune to dead-code elimination. | tasks/0465 §206.28, ANET2-56 | - | T603 |
 | REQ-LAY-296 | layout | v1-core | Semantic values, in-memory representations, wire formats, persistent storage formats, and IPC representations shall remain distinct contracts. | tasks/0466 §207.1-4, ADATA-20-21 | - | T113 | 
 | REQ-SEC-120 | security | v1-core | Deserialization shall validate external untrusted input bounds, layout, alignment, and representation before creating safe typed values. | tasks/0466 §207.5-6, ADATA-22-23 | - | T113 | 
 | REQ-TYP-340 | types | post-v1 | Schema identity shall remain distinct from ABI identity; schema evolution shall support explicit forward and backward compatibility without relying solely on declaration order. | tasks/0466 §207.7-8, ADATA-25-29 | - | EPIC(E24.0) |
@@ -6470,7 +6470,7 @@
 | REQ-CAP-141 | capability | v1-full | Zero-copy deserialization shall require compiler-proven provenance, lifetime, alignment, and representation compatibility; borrowed decoded values shall not outlive backing storage. | tasks/0466 §207.12, ADATA-34-35 | - | T518 |
 | REQ-ERR-085 | error | v1-core | Malformed serialized input shall produce recoverable decode errors rather than panics; deserializers shall enforce configurable recursion depth and memory resource limits. | tasks/0466 §207.21, ADATA-49-51 | - | T113 | 
 | REQ-SEC-121 | security | post-v1 | Cryptographic keys and nonces shall use typed semantic representations distinct from raw byte slices; secret data shall be redacted from compiler diagnostics, debug output, and AI queries. | tasks/0467 §208.2-5, ASEC2-21-24, ASEC2-57-58 | - | EPIC(E24.0) |
-| REQ-OPT-353 | optimizer | v1-full | Secure zeroization operations on sensitive cryptographic memory shall remain semantically observable to compiler optimization passes and shall not be removed as dead writes. | tasks/0467 §208.7, ASEC2-25 | - | EPIC(E15.1) |
+| REQ-OPT-353 | optimizer | v1-full | Secure zeroization operations on sensitive cryptographic memory shall remain semantically observable to compiler optimization passes and shall not be removed as dead writes. | tasks/0467 §208.7, ASEC2-25 | - | T603 |
 | REQ-VER-016 | verifier | post-v1 | Constant-time execution shall be an explicit compiler-visible security contract; secret-dependent control flow and secret-dependent memory indexing shall be rejected in constant-time regions. | tasks/0467 §208.8-10, ASEC2-26-28 | - | EPIC(E24.0) |
 | REQ-VER-017 | verifier | post-v1 | Security taint shall propagate through derived cryptographic values according to primitive contracts; declassification of secret data shall be explicit. | tasks/0467 §208.11, ASEC2-30-31 | - | EPIC(E24.0) |
 | REQ-MIR-131 | mir | post-v1 | Constant-time equality comparison shall use a dedicated semantic primitive; backend instruction selection and optimization shall not introduce variable-latency instructions or timing side channels into protected regions. | tasks/0467 §208.12-14, ASEC2-32-35 | - | EPIC(E24.0) |
@@ -6482,7 +6482,7 @@
 | REQ-TYP-341 | types | post-v1 | Physical units of measurement shall be encoded via comptime generics; invalid dimensional expressions shall be rejected at compile time, and unit metadata shall be erased at runtime when zero-cost. | tasks/0469 §210.18-19, AMATH-47-50 | - | EPIC(E24.0) |
 | REQ-SIMD-332 | simd | v1-full | Floating-point fused multiply-add (FMA) contractions and SIMD mathematical operations shall be applied only when permitted by the active numerical profile. | tasks/0469 §210.24, AMATH-60-61 | - | T459 |
 | REQ-CONC-154 | concurrency | v1-full | Parallel execution shall not weaken ownership verification; concurrent mutable access requires proven disjointness or explicit synchronization, and unknown aliasing shall never be treated as independent parallel access. | tasks/0470 §211.3, §211.20, §211.23-24, APAR-20, APAR-22-24 | - | T402 |
-| REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | EPIC(E15.1) |
+| REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | T611 |
 | REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | EPIC(E22.3) |
 | REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
 | REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | T500 |
@@ -6510,7 +6510,7 @@
 | REQ-BOOT-090 | bootstrap | v1-core | The self-hosted compiler must be capable of compiling the entire language specification and compiling its own source tree, operating in hosted and freestanding configurations without requiring a garbage collector or mandatory runtime. | tasks/0473 §214.61-66, ACOMPILER-61-66 | - | T113 | 
 | REQ-ORC-012 | oracle | v1-core | Axiom shall maintain exactly one authoritative semantic model across all compiler phases, reference interpreters, optimizers, and target backends. | tasks/0474 215.1, ASEM-20 | - | T113 | 
 | REQ-MIR-133 | mir | v1-core | Verified MIR shall represent the executable semantic meaning of Axiom programs and serve as the semantic boundary between frontend analysis and backend code generation. | tasks/0474 215.82, ASEM-23 | REQ-ORC-012 | T113 | 
-| REQ-OPT-355 | optimizer | v1-full | Compiler transformations and optimizations shall preserve observable program behavior across all permitted execution paths. | tasks/0474 215.70, ASEM-51, ASEM-52 | REQ-ORC-012 | EPIC(E15.1) |
+| REQ-OPT-355 | optimizer | v1-full | Compiler transformations and optimizations shall preserve observable program behavior across all permitted execution paths. | tasks/0474 215.70, ASEM-51, ASEM-52 | REQ-ORC-012 | T602 |
 | REQ-VER-020 | verifier | v1-core | Compiler verification and optimization passes shall never infer or treat an unknown aliasing or region relationship as proven disjoint. | tasks/0474 215.27, ASEM-36 | - | T113 | 
 | REQ-ORC-013 | oracle | v1-core | The reference interpreter (`ax-ref`) shall execute the formal semantic model directly on Verified MIR to serve as the definitive semantic oracle for language conformance. | tasks/0474 215.79, ASEM-22 | REQ-MIR-133 | T113 | 
 | REQ-VER-021 | verifier | v1-core | Semantic verification rules and program safety validity shall be strictly independent of the optimization level, compiler parallelism, and cache state. | tasks/0474 ASEM-67, ASEM-68, ASEM-69 | - | T113 | 
@@ -6548,8 +6548,8 @@
 | REQ-DIAG-099 | diagnostics | v1-core | Compiler diagnostics shall include structured error codes, primary and secondary source spans, semantic rules, and proof trees rather than unstructured text alone. | tasks/0479 39, 40, ACDB-32 | - | T113 | 
 | REQ-BLD-104 | build | v1-core | The compiler shall maintain distinct fingerprints for `SemanticFingerprint`, `AbiFingerprint`, `CodegenFingerprint`, and `BuildFingerprint` to prevent unnecessary invalidation cascades. | tasks/0479 37, 38, ACDB-29 | REQ-BLD-103 | T113 | 
 | REQ-MIR-137 | mir | v1-core | `VerifiedMir` shall be represented as a distinct type-state holding a `VerificationProofId`, preventing unverified MIR from reaching optimization or code generation. | tasks/0480 19, ACOMP-221-06 | REQ-MIR-133 | T113 | 
-|REQ-OPT-356|optimizer|v1-full|Every optimization pass shall have an explicit contract declaring required semantic facts and shall omit transformations when required proof facts are absent.|tasks/0480 26, ACOMP-221-07|-|EPIC(E15.1)|
-| REQ-OPT-357 | optimizer | v1-full | Escape analysis shall categorize places into `NoEscape`, `ArgumentEscape`, `ReturnEscape`, `HeapEscape`, `ThreadEscape`, and `ExternalEscape` to guide stack promotion and allocation elimination. | tasks/0480 28 | - | EPIC(E15.1) |
+|REQ-OPT-356|optimizer|v1-full|Every optimization pass shall have an explicit contract declaring required semantic facts and shall omit transformations when required proof facts are absent.|tasks/0480 26, ACOMP-221-07|-|T602|
+| REQ-OPT-357 | optimizer | v1-full | Escape analysis shall categorize places into `NoEscape`, `ArgumentEscape`, `ReturnEscape`, `HeapEscape`, `ThreadEscape`, and `ExternalEscape` to guide stack promotion and allocation elimination. | tasks/0480 28 | - | T607 |
 | REQ-DRV-019 | driver | v1-full | The compiler driver shall expose intermediate representations via `ax emit` (`ast`, `hir`, `mir`, `verified-mir`, `optir`, `lir`, `asm`, `obj`) and structured semantic proofs via `ax explain` (`move`, `capability`, `allocation`, `trait`). | tasks/0480 37, 38, ACOMP-221-14 | - | EPIC(E18.1) |
 | REQ-TST-107 | testing | v1-core | Semantic test suites shall execute across both the reference interpreter (`ax-ref`) and native backend binaries, verifying identical observable behavior. | tasks/0480 42 | REQ-ORC-013 | T113 | 
 | REQ-TXT-006 | text | v1-core | Source files shall be validated as conformant UTF-8 prior to tokenization, rejecting invalid byte sequences with diagnostic `AXUTF-001`. | tasks/0481 2, AFRONT-20, AFRONT-21 | - | T113 | 
@@ -6601,12 +6601,12 @@
 |REQ-CAP-149|capability|v1-full|A value cannot be dropped, moved, or deallocated while any dependent capability referencing its region remains active.|tasks/0486 48, 49, ACAP-38, ACAP-39|-|T501|
 |REQ-CAP-150|capability|v1-full|An ephemeral view created implicitly from an owned argument shall not escape beyond the scope of the called function.|tasks/0486 25, 26, ACAP-41|-|T501|
 |REQ-CAP-151|capability|v1-full|`mut_view<T>` shall not implement capability duplication; moving a mutable view transfers the capability and invalidates the source view binding.|tasks/0486 34, ACAP-28|-|T501|
-|REQ-OPT-358|optimizer|v1-full|Verified disjoint mutable capability regions shall be exported to `AliasInfo` as internal `NO_ALIAS` facts for compiler vectorization and memory optimization.|tasks/0486 43, 44, ACAP-45, ACAP-46|-|EPIC(E15.1)|
+|REQ-OPT-358|optimizer|v1-full|Verified disjoint mutable capability regions shall be exported to `AliasInfo` as internal `NO_ALIAS` facts for compiler vectorization and memory optimization.|tasks/0486 43, 44, ACAP-45, ACAP-46|-|T606|
 | REQ-CAP-152 | capability | v1-full | Converting a raw pointer to a safe view shall be restricted to `unsafe` blocks, requiring the programmer to establish provenance, alignment, and validity preconditions before ordinary verification resumes. | tasks/0486 78, 79, 80, ACAP-42, ACAP-43, ACAP-44 | - | T506 |
 | REQ-VER-024 | verifier | v1-core | Function effects shall be inferred automatically by the compiler across the call graph without requiring mandatory programmer effect annotations on ordinary function declarations. | tasks/0487 1, 20, AEFFECT-20, AEFFECT-21, AEFFECT-23 | - | T113 | 
 |REQ-VER-025|verifier|v1-full|Asynchronous suspension (`AsyncSuspend`) and thread blocking (`Blocking`) shall be tracked as distinct effects, enabling static rejection of blocking calls in async contexts.|tasks/0487 33, 34, 35, AEFFECT-30|-|T416|
 | REQ-VER-026 | verifier | v1-core | Operations accessing the environment, system clock, random number generators, filesystems, network sockets, or processes shall be classified as external state effects and shall never be assumed pure. | tasks/0487 36, 37, 38, 39, 40, AEFFECT-34, AEFFECT-35, AEFFECT-36, AEFFECT-37, AEFFECT-38 | REQ-VER-024 | T113 | 
-|REQ-VER-027|verifier|v1-full|Effect verification shall enforce execution profile boundaries (rejecting forbidden OS effects in `@kernel` GPU code and tracking comptime external inputs in `BuildFingerprint`) and shall constrain dead-code elimination from removing observable external effects.|tasks/0487 41, 42, 45, 49, 50, 92, AEFFECT-40, AEFFECT-41, AEFFECT-42, AEFFECT-49, AEFFECT-50, AEFFECT-70|-|EPIC(E15.1)|
+|REQ-VER-027|verifier|v1-full|Effect verification shall enforce execution profile boundaries (rejecting forbidden OS effects in `@kernel` GPU code and tracking comptime external inputs in `BuildFingerprint`) and shall constrain dead-code elimination from removing observable external effects.|tasks/0487 41, 42, 45, 49, 50, 92, AEFFECT-40, AEFFECT-41, AEFFECT-42, AEFFECT-49, AEFFECT-50, AEFFECT-70|-|T602|
 | REQ-CONC-157 | concurrency | v1-full | Ownership quyết định ai sở hữu. Capability quyết định ai được truy cập. Effect quyết định đang làm gì. Concurrency quyết định các hành động đó có thể xảy ra đồng thời và được quan sát theo thứ tự nào. | 0488 BOOTSTRAP-229 — CONCURRENCY SEMANTICS & DATA-RACE VERIFIER | - | T402 |
 | REQ-CONC-158 | concurrency | v1-full | [ACONCUR-140] Send and Share are distinct semantic properties. | 0488 §130 | - | T404 |
 | REQ-CONC-159 | concurrency | v1-full | [ACONCUR-141] Send permits ownership transfer between compatible execution domains. | 0488 §130 | - | T404 |
@@ -10085,24 +10085,24 @@
 | REQ-CORE-3064 | compiler | v1-full | Axiom must distinguish between semantic lifetime and physical storage lifetime, using escape analysis to determine where and how long storage needs to exist, and ownership to determine semantic ownership. | 0543 §284.2 | - | EPIC(E18.1) |
 | REQ-CORE-3065 | compiler | v1-full | Axiom must not build separate systems for ownership, effect, escape, and capability call graphs, but must instead use a single call graph for multiple semantic analyses. | 0544 §285.2 | - | EPIC(E18.1) |
 | REQ-CORE-3066 | compiler | v1-full | The compiler must only materialize the necessary fields in the semantic summary for each callable, as not every function requires all fields. | 0544 §285.3 | - | EPIC(E18.1) |
-| REQ-OPT-359 | optimizer | v1-full | The architecture must orchestrate how the different semantic analyses coordinate with one another instead of letting optimizers call each analysis independently, which would create a complex cross-dependent system. | 0545 §1 | - | EPIC(E15.1) |
-| REQ-OPT-360 | optimizer | v1-full | The optimizer must not independently infer semantic safety. | 0545 §1 | - | EPIC(E15.1) |
-| REQ-OPT-361 | optimizer | v1-full | The compilation pipeline must strictly follow the optimization and reverification stages, and must not allow a pass to produce an IR that is merely assumed to be correct. | 0546 §2 | - | EPIC(E15.1) |
-| REQ-OPT-362 | optimizer | v1-full | OptIR is permitted to contain richer information than MIR for optimization purposes, but must not become an independent semantic model and must not define semantics differently from MIR. | 0546 §3 | - | EPIC(E15.1) |
-| REQ-OPT-363 | optimizer | v1-full | Scalar optimization must not just act as a multi-pass optimizer, but must ensure that every transformation is based on semantic facts and proofs, and must not rely on C/C++ style undefined behavior assumptions. | 0547 §1 | - | EPIC(E15.1) |
-| REQ-OPT-364 | optimizer | v1-full | Every transformation must be based on semantic facts and proofs, and must not be based on C/C++ style undefined behavior assumptions. | 0547 §1 | - | EPIC(E15.1) |
-| REQ-OPT-365 | optimizer | v1-full | Memory optimization must use a unified engine for the compiler to understand operations including load, store, copy, move, memcpy, memmove, memset, allocation, deallocation, field access, array access, view access, atomic access, and volatile access. | 0548 §1 | - | EPIC(E15.1) |
-| REQ-OPT-366 | optimizer | v1-full | The compiler must distinguish between semantic memory access and physical machine memory access, and memory optimization is only permitted to change physical memory operations when the semantic memory behavior remains equivalent. | 0548 §3 | - | EPIC(E15.1) |
-| REQ-OPT-367 | optimizer | v1-full | Loop optimization must utilize existing proofs including ownership, capability, alias, range, effect, escape, MemorySSA, and scalar facts rather than building a separate loop optimization system. | 0549 §1 | - | EPIC(E15.1) |
-| REQ-OPT-368 | optimizer | v1-full | Loop optimization must be based on semantic proofs and must not be based on C/C++ style undefined behavior assumptions. | 0549 §3 | - | EPIC(E15.1) |
+| REQ-OPT-359 | optimizer | v1-full | The architecture must orchestrate how the different semantic analyses coordinate with one another instead of letting optimizers call each analysis independently, which would create a complex cross-dependent system. | 0545 §1 | - | T600 |
+| REQ-OPT-360 | optimizer | v1-full | The optimizer must not independently infer semantic safety. | 0545 §1 | - | T600 |
+| REQ-OPT-361 | optimizer | v1-full | The compilation pipeline must strictly follow the optimization and reverification stages, and must not allow a pass to produce an IR that is merely assumed to be correct. | 0546 §2 | - | T600 |
+| REQ-OPT-362 | optimizer | v1-full | OptIR is permitted to contain richer information than MIR for optimization purposes, but must not become an independent semantic model and must not define semantics differently from MIR. | 0546 §3 | - | T600 |
+| REQ-OPT-363 | optimizer | v1-full | Scalar optimization must not just act as a multi-pass optimizer, but must ensure that every transformation is based on semantic facts and proofs, and must not rely on C/C++ style undefined behavior assumptions. | 0547 §1 | - | T603 |
+| REQ-OPT-364 | optimizer | v1-full | Every transformation must be based on semantic facts and proofs, and must not be based on C/C++ style undefined behavior assumptions. | 0547 §1 | - | T603 |
+| REQ-OPT-365 | optimizer | v1-full | Memory optimization must use a unified engine for the compiler to understand operations including load, store, copy, move, memcpy, memmove, memset, allocation, deallocation, field access, array access, view access, atomic access, and volatile access. | 0548 §1 | - | T606 |
+| REQ-OPT-366 | optimizer | v1-full | The compiler must distinguish between semantic memory access and physical machine memory access, and memory optimization is only permitted to change physical memory operations when the semantic memory behavior remains equivalent. | 0548 §3 | - | T606 |
+| REQ-OPT-367 | optimizer | v1-full | Loop optimization must utilize existing proofs including ownership, capability, alias, range, effect, escape, MemorySSA, and scalar facts rather than building a separate loop optimization system. | 0549 §1 | - | T609 |
+| REQ-OPT-368 | optimizer | v1-full | Loop optimization must be based on semantic proofs and must not be based on C/C++ style undefined behavior assumptions. | 0549 §3 | - | T609 |
 | REQ-CORE-3067 | compiler | v1-full | The vectorization stage must determine whether a loop can execute multiple iterations simultaneously without changing the semantics of Axiom, while leaving the SIMD instruction encoding to the backend. | 0550 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3068 | compiler | v1-full | The compiler must distinguish between Axiom semantic types and machine vector types, and must not create vector types solely for the purpose of vectorizing scalar code. | 0550 §3 | - | EPIC(E18.1) |
 | REQ-CORE-3069 | compiler | v1-full | A function must be treated as a semantic abstraction, and its call boundary does not necessarily have to exist in the machine code. | 0551 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3070 | compiler | v1-full | Function inlining must serve as an optimization boundary without changing the program's semantics. | 0551 §2 | - | EPIC(E18.1) |
 | REQ-CORE-3071 | compiler | v1-full | The compiler must be capable of propagating known facts across function boundaries without necessarily having to inline the entire function. | 0552 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3072 | compiler | v1-full | The compiler is not required to copy the entire function into the caller, but may instead create interprocedural specializations based on invariants. | 0552 §1 | - | EPIC(E18.1) |
-| REQ-OPT-369 | optimizer | v1-full | The compiler must recognize that the most optimal control flow at the machine level may not remain in the form of a branch, and can be transformed into select, conditional move, or masked operations. | 0553 §1 | - | EPIC(E15.1) |
-| REQ-OPT-370 | optimizer | v1-full | An `if` statement in Axiom must not mandate the presence of a branch in machine code, provided that the control flow conversion engine preserves the semantics. | 0553 §2 | - | EPIC(E15.1) |
+| REQ-OPT-369 | optimizer | v1-full | The compiler must recognize that the most optimal control flow at the machine level may not remain in the form of a branch, and can be transformed into select, conditional move, or masked operations. | 0553 §1 | - | T628 |
+| REQ-OPT-370 | optimizer | v1-full | An `if` statement in Axiom must not mandate the presence of a branch in machine code, provided that the control flow conversion engine preserves the semantics. | 0553 §2 | - | T628 |
 | REQ-CORE-3073 | compiler | v1-full | Operation scheduling must be target-aware, but must not act as a complete machine instruction scheduler. | 0554 §2 | - | EPIC(E18.1) |
 | REQ-CORE-3074 | compiler | v1-full | Operation scheduling must preserve memory dependencies unless the compiler can prove that the memory accesses are disjoint. | 0554 §9 | - | EPIC(E18.1) |
 | REQ-CORE-3075 | compiler | v1-full | The compilation process must use target-specific lowering rather than converting OptIR directly to instructions, avoiding the need for the backend to simultaneously handle calling conventions, register classes, addressing modes, immediate constraints, instruction constraints, target-specific types, flags, vector registers, stack slots, ABI, memory addressing, and instruction legality. | 0555 §2 | - | EPIC(E18.1) |
@@ -10113,8 +10113,8 @@
 | REQ-CORE-3080 | compiler | v1-full | The register allocator must not arbitrarily change ownership, lifetime, alias, capability, memory ordering, atomic semantics, volatile semantics, ABI semantics, or panic/unwind behavior. | 0557 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3081 | compiler | v1-full | Machine scheduling must only reorder instructions if the new order is semantically equivalent, and must not violate atomic ordering, volatile ordering, synchronization, memory dependencies, exception/panic semantics, ownership/drop order, observable IO, or FFI contracts. | 0558 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3082 | compiler | v1-full | Machine scheduling must be based on a dependency graph produced by dependency analysis. | 0558 §3 | - | EPIC(E18.1) |
-| REQ-OPT-371 | optimizer | v1-full | The late machine optimization stage is the final optimization step and must not serve as the place where semantics are defined. | 0559 §1 | - | EPIC(E15.1) |
-| REQ-OPT-372 | optimizer | v1-full | The final machine function representation must remain an intermediate representation and must not yet be byte-encoded. | 0559 §3 | - | EPIC(E15.1) |
+| REQ-OPT-371 | optimizer | v1-full | The late machine optimization stage is the final optimization step and must not serve as the place where semantics are defined. | 0559 §1 | - | T629 |
+| REQ-OPT-372 | optimizer | v1-full | The final machine function representation must remain an intermediate representation and must not yet be byte-encoded. | 0559 §3 | - | T629 |
 | REQ-CORE-3083 | compiler | v1-full | The encoder must not reinterpret the semantics of the program, but must only encode a verified Machine IR into a valid target encoding. | 0560 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3084 | compiler | v1-full | The encoder must not attempt to alter instructions (such as swapping an instruction for one with a shorter encoding), as this responsibility belongs to late machine optimization. | 0560 §6 | - | EPIC(E18.1) |
 | REQ-CORE-3085 | compiler | v1-full | Phase 302 must not perform linking operations, such as determining final symbol addresses, resolving external symbols, or creating the final executable. | 0561 §302.1 | - | EPIC(E18.1) |
@@ -10153,12 +10153,12 @@
 | REQ-CORE-3106 | compiler | v1-full | Every compiler transformation must possess a semantic contract, and the compiler must be able to verify that the transformation does not alter the program's observable behavior. | 0577 §318.1 | - | EPIC(E18.1) |
 | REQ-CORE-3107 | compiler | v1-full | Every compiler pass must mandatorily adhere to the semantic equivalence checking mechanism. | 0578 §319 | - | EPIC(E18.1) |
 | REQ-CORE-3108 | compiler | v1-full | A compiler pass must no longer be just a piece of code that attempts to mutate the IR, but rather each pass must declare its requirements, its products, the facts it invalidates, the semantic properties it preserves, and how its results can be verified. | 0578 §319 | - | EPIC(E18.1) |
-| REQ-OPT-373 | optimizer | v1-full | The optimizer must not use a fixed list of passes; instead, the compiler must plan optimizations based on existing semantic facts, facts required by the optimization, target, code characteristics, profile, compile-time budget, binary-size budget, correctness contracts, incremental cache, and any available PGO/runtime information. | 0579 §320 | - | EPIC(E15.1) |
-| REQ-OPT-374 | optimizer | v1-full | The compiler must optimize according to an objective profile that includes execution speed, binary size, compile time, memory usage, code locality, vectorization, energy, and startup time. | 0579 §320.2 | - | EPIC(E15.1) |
-| REQ-OPT-375 | optimizer | v1-full | The compiler must analyze across function, module, and package boundaries to accurately determine optimizations such as inlining, allocation removal, argument aliasing, object escaping, and the necessity of dynamic dispatch. | 0580 §321 | - | EPIC(E15.1) |
-| REQ-OPT-376 | optimizer | v1-full | When expanding analysis to the whole program, the compiler must still preserve correctness, incremental compilation, separate compilation, FFI safety, dynamic boundaries, deterministic behavior, and compilation scalability. | 0580 §321.1 | - | EPIC(E15.1) |
-| REQ-OPT-377 | optimizer | v1-full | The compilation pipeline's goal must not be to turn Axiom into a JIT-compiled language. | 0581 §322.1 | - | EPIC(E15.1) |
-| REQ-OPT-378 | optimizer | v1-full | Profile-Guided Optimization (PGO) must work well even for native executables, embedded systems, servers, desktops, CLIs, GPU workloads, cross-compilation, and offline builds. | 0581 §322.1 | - | EPIC(E15.1) |
+| REQ-OPT-373 | optimizer | v1-full | The optimizer must not use a fixed list of passes; instead, the compiler must plan optimizations based on existing semantic facts, facts required by the optimization, target, code characteristics, profile, compile-time budget, binary-size budget, correctness contracts, incremental cache, and any available PGO/runtime information. | 0579 §320 | - | T602 |
+| REQ-OPT-374 | optimizer | v1-full | The compiler must optimize according to an objective profile that includes execution speed, binary size, compile time, memory usage, code locality, vectorization, energy, and startup time. | 0579 §320.2 | - | T602 |
+| REQ-OPT-375 | optimizer | v1-full | The compiler must analyze across function, module, and package boundaries to accurately determine optimizations such as inlining, allocation removal, argument aliasing, object escaping, and the necessity of dynamic dispatch. | 0580 §321 | - | T621 |
+| REQ-OPT-376 | optimizer | v1-full | When expanding analysis to the whole program, the compiler must still preserve correctness, incremental compilation, separate compilation, FFI safety, dynamic boundaries, deterministic behavior, and compilation scalability. | 0580 §321.1 | - | T621 |
+| REQ-OPT-377 | optimizer | v1-full | The compilation pipeline's goal must not be to turn Axiom into a JIT-compiled language. | 0581 §322.1 | - | T622 |
+| REQ-OPT-378 | optimizer | v1-full | Profile-Guided Optimization (PGO) must work well even for native executables, embedded systems, servers, desktops, CLIs, GPU workloads, cross-compilation, and offline builds. | 0581 §322.1 | - | T622 |
 | REQ-CORE-3109 | compiler | v1-full | The compiler must be able to transmit proven semantic facts between compilations without needing to reread the source implementation of dependencies. | 0582 §323 | - | EPIC(E18.1) |
 | REQ-CORE-3110 | compiler | v1-full | The system must clearly distinguish between source files (.axm), semantic interfaces (.axif), relocatable objects (.axo), static libraries (.axlib), shared images (.axso/.dll/.dylib), and debug information (.debug). | 0582 §323.2 | - | EPIC(E18.1) |
 | REQ-CORE-3111 | compiler | v1-full | Axiom must clearly distinguish between four types of compatibility: source compatible, semantic compatible, ABI compatible, and binary compatible. | 0583 §324.1 | - | EPIC(E18.1) |
@@ -10183,14 +10183,14 @@
 | REQ-PKG-019 | package | v1-core | The build system must not simply recompile everything when a file changes, but must instead perform dependency analysis to determine affected semantic queries, invalidate only the minimal required nodes, recompute them, and reuse everything else. | 0592 §1 | - | T113 | 
 | REQ-CORE-3125 | compiler | v1-full | The compiler must automatically determine the optimal level of parallelism without breaking deterministic builds, exhausting RAM, or losing the advantages of incremental compilation. | 0593 §334 | - | EPIC(E18.1) |
 | REQ-CORE-3126 | compiler | v1-full | The compiler must treat `cpu_cost` and `memory_cost` for build nodes as performance estimates rather than strict semantic facts. | 0593 §3 | - | EPIC(E18.1) |
-| REQ-OPT-379 | optimizer | v1-full | Because individual objects normally preserve significant metadata when the compiler lacks whole-program context, the linker must function as a semantic optimization boundary utilizing Axiom's comprehensive metadata rather than merely resolving symbols and relocating. | 0594 §1 | - | EPIC(E15.1) |
-| REQ-OPT-380 | optimizer | v1-full | Not all optimization passes must run at link time; the compiler must be able to push certain passes ahead of the linker if sufficient information is available. | 0594 §2 | - | EPIC(E15.1) |
-| REQ-OPT-381 | optimizer | v1-full | The generated binary must not only be small in byte size, but it must also have an optimal layout for startup time, instruction cache utilization, page locality, relocation cost, loading time, and memory footprint. | 0595 §336 | - | EPIC(E15.1) |
-| REQ-OPT-382 | optimizer | v1-full | Axiom must evaluate and distinguish between a binary's file size, mapped size, and working set, rather than evaluating it based on file size alone. | 0595 §1 | - | EPIC(E15.1) |
+| REQ-OPT-379 | optimizer | v1-full | Because individual objects normally preserve significant metadata when the compiler lacks whole-program context, the linker must function as a semantic optimization boundary utilizing Axiom's comprehensive metadata rather than merely resolving symbols and relocating. | 0594 §1 | - | T621 |
+| REQ-OPT-380 | optimizer | v1-full | Not all optimization passes must run at link time; the compiler must be able to push certain passes ahead of the linker if sufficient information is available. | 0594 §2 | - | T621 |
+| REQ-OPT-381 | optimizer | v1-full | The generated binary must not only be small in byte size, but it must also have an optimal layout for startup time, instruction cache utilization, page locality, relocation cost, loading time, and memory footprint. | 0595 §336 | - | T624 |
+| REQ-OPT-382 | optimizer | v1-full | Axiom must evaluate and distinguish between a binary's file size, mapped size, and working set, rather than evaluating it based on file size alone. | 0595 §1 | - | T624 |
 | REQ-CORE-3127 | compiler | v1-full | Debugging must not pollute the release binary and must not force the compiler to retain unnecessary runtime information. | 0596 §337 | - | EPIC(E18.1) |
 | REQ-CORE-3128 | compiler | v1-full | A heavily optimized binary must still be accurately debuggable from source to HIR, MIR, and machine instructions, while all debug information can be separated from the executable. | 0596 §337 | - | EPIC(E18.1) |
-| REQ-OPT-383 | optimizer | v1-full | Profile data must be traceable back to the semantic source, MIR, machine code, and optimization decisions, and must be reusable for PGO without making profiling a part of the program's semantics. | 0597 §338 | - | EPIC(E15.1) |
-| REQ-OPT-384 | optimizer | v1-full | Changing the profile must not change the program meaning, but rather only affect optimization decisions. | 0597 §2 | - | EPIC(E15.1) |
+| REQ-OPT-383 | optimizer | v1-full | Profile data must be traceable back to the semantic source, MIR, machine code, and optimization decisions, and must be reusable for PGO without making profiling a part of the program's semantics. | 0597 §338 | - | T622 |
+| REQ-OPT-384 | optimizer | v1-full | Changing the profile must not change the program meaning, but rather only affect optimization decisions. | 0597 §2 | - | T622 |
 | REQ-CORE-3129 | compiler | v1-full | Signing must not change the semantics of the program. | 0598 §339 | - | EPIC(E18.1) |
 | REQ-CORE-3130 | compiler | v1-full | Axiom must not conflate integrity, authenticity, and trust, as a binary with a valid signature does not automatically mean it is trusted. | 0598 §1 | - | EPIC(E18.1) |
 | REQ-RT-181 | runtime | v1-full | A sanitizer must not introduce new semantics, and instrumentation is only allowed to detect errors, record telemetry, terminate execution, and generate diagnostics. | 0599 §1 | - | EPIC(E21.1) |
@@ -10225,8 +10225,8 @@
 | REQ-PKG-021 | package | v1-core | The module system must be powerful enough to build applications, libraries, operating systems, compilers, GPU libraries, packages, plugins, components, and multi-target projects. | 0613 §354 | - | T113 | 
 | REQ-CORE-3155 | compiler | v1-full | Axiom must achieve that for a valid expression, the compiler always knows exactly what it does, what type it returns, what it reads, writes, or moves, and how it can be lowered to machine code, while concurrently ensuring no runtime-based overload resolution, no implicit boxing, no implicit allocation, no automatic dynamic dispatch creation, no dangerous implicit conversions, no syntax sugar creating different semantics, a completely deterministic evaluation order, and that the compiler is allowed to optimize but must not change the observable semantics. | 0614 §1 | - | EPIC(E18.1) |
 | REQ-CORE-3156 | compiler | v1-full | While the compiler is allowed to optimize, it must not change the observable semantics of a valid expression, and must ensure that it knows exactly what the expression does, its return type, its read, write, or move operations, and how it lowers to machine code, alongside enforcing no runtime-based overload resolution, no implicit boxing, no implicit allocation, no automatic dynamic dispatch, no dangerous implicit conversions, no syntax sugar with different semantics, and a completely deterministic evaluation order. | 0614 §1 | - | EPIC(E18.1) |
-| REQ-OPT-385 | optimizer | v1-full | The compiler must store the semantic signature of a closure, and its attributes, such as whether it is sync, async, unsafe, or comptime, must not be ambiguously inferred. | 0615 §3 | - | EPIC(E15.1) |
-| REQ-OPT-386 | optimizer | v1-full | The compiler must detect the capabilities required by a closure, ensure the closure has the appropriate exclusive capability, detect conflicts if the closure exists concurrently with other code accessing the same variables, and must not silently create shared mutable references. | 0615 §7 | - | EPIC(E15.1) |
+| REQ-OPT-385 | optimizer | v1-full | The compiler must store the semantic signature of a closure, and its attributes, such as whether it is sync, async, unsafe, or comptime, must not be ambiguously inferred. | 0615 §3 | - | T608 |
+| REQ-OPT-386 | optimizer | v1-full | The compiler must detect the capabilities required by a closure, ensure the closure has the appropriate exclusive capability, detect conflicts if the closure exists concurrently with other code accessing the same variables, and must not silently create shared mutable references. | 0615 §7 | - | T608 |
 | REQ-CORE-3157 | compiler | v1-full | A function call must have a single semantic contract from source to HIR, MIR, ABI, and machine code, without requiring the programmer to manage registers, stacks, or calling conventions in ordinary code. | 0616 §357 | - | EPIC(E18.1) |
 | REQ-CORE-3158 | compiler | v1-full | The function name must not be its final identity; instead, the compiler must use specific identifiers such as FunctionId, DeclarationId, and GenericInstanceId to map functions and their generic specializations back to their original templates. | 0616 §2 | - | EPIC(E18.1) |
 | REQ-CORE-3159 | compiler | v1-full | The control-flow semantics must precisely determine the execution order, value lifetimes, function exit points, and mandatory cleanups, ensuring that the control flow remains simple at the source level while the MIR accurately represents every path without requiring semantic re-evaluation. | 0617 §358 | - | EPIC(E18.1) |
@@ -22804,10 +22804,10 @@
 | REQ-TST-113 | testing | v1-core | Critical analyses must được test bằng reference semantics. | tasks/0794 §572.186 | - | T113 | 
 | REQ-CORE-3193 | compiler | v1-full | Known violation must luôn được phát hiện trong các analyses được cam kết sound. | tasks/0794 §572.191 | - | EPIC(E18.1) |
 | REQ-CORE-3194 | compiler | v1-full | Unknown state must not biến thành safe state. | tasks/0794 §572.192 | - | EPIC(E18.1) |
-| REQ-OPT-390 | optimizer | v1-full | Mọi fixed bug must trở thành permanent analysis test. | tasks/0794 §572.193 | - | EPIC(E15.1) |
+| REQ-OPT-390 | optimizer | v1-full | Mọi fixed bug must trở thành permanent analysis test. | tasks/0794 §572.193 | - | T601 |
 | REQ-CORE-3195 | compiler | v1-full | Standard profile must phù hợp incremental IDE usage. | tasks/0794 §572.194 | - | EPIC(E18.1) |
-| REQ-OPT-391 | optimizer | v1-full | Static analysis must not biến thành mandatory Rust-style borrow/lifetime checker. | tasks/0794 §572.196 | - | EPIC(E15.1) |
-| REQ-OPT-392 | optimizer | v1-full | Axiom Static Analysis 3.0 must phân biệt tuyệt đối giữa “đã chứng minh”, “có khả năng”, và “chưa biết”. Mọi analysis safety-critical must conservative; timeout, thiếu metadata, dynamic dispatch, FFI hoặc open-world assumptions chỉ có thể làm giảm mức độ chắc chắn chứ must not biến thành proof giả. Static analysis must not biến Axiom thành một borrow-checker nặng; nó là một tầng phân tích độc lập, có thể incremental, parallel, cached và whole-program, nhưng semantic correctness vẫn thuộc compiler language rules và canonical semantic engine. | tasks/0794 §572.200 | - | EPIC(E15.1) |
+| REQ-OPT-391 | optimizer | v1-full | Static analysis must not biến thành mandatory Rust-style borrow/lifetime checker. | tasks/0794 §572.196 | - | T601 |
+| REQ-OPT-392 | optimizer | v1-full | Axiom Static Analysis 3.0 must phân biệt tuyệt đối giữa “đã chứng minh”, “có khả năng”, và “chưa biết”. Mọi analysis safety-critical must conservative; timeout, thiếu metadata, dynamic dispatch, FFI hoặc open-world assumptions chỉ có thể làm giảm mức độ chắc chắn chứ must not biến thành proof giả. Static analysis must not biến Axiom thành một borrow-checker nặng; nó là một tầng phân tích độc lập, có thể incremental, parallel, cached và whole-program, nhưng semantic correctness vẫn thuộc compiler language rules và canonical semantic engine. | tasks/0794 §572.200 | - | T601 |
 | REQ-CORE-3196 | compiler | v1-full | Không must mọi effect category đều dùng cùng một total ordering; mỗi category có lattice riêng. | tasks/0795 §573.14 | - | EPIC(E18.1) |
 | REQ-CORE-3197 | compiler | v1-full | Unknown` must not tự động hạ xuống thành một effect cụ thể. | tasks/0795 §573.14 | - | EPIC(E18.1) |
 | REQ-CORE-3198 | compiler | v1-full | Nếu callee effect change, caller summaries phụ thuộc vào callee must invalidate. | tasks/0795 §573.24 | - | EPIC(E18.1) |
@@ -22820,7 +22820,7 @@
 | REQ-CORE-3204 | compiler | v1-full | Function passed as callback must satisfy required effect bound. | tasks/0795 §573.82 | - | EPIC(E18.1) |
 | REQ-CORE-3205 | compiler | v1-full | Function accepting callbacks must include callback effects trong summary nếu callback được invoke. | tasks/0795 §573.85 | - | EPIC(E18.1) |
 | REQ-RT-184 | runtime | v1-full | Runtime không mandatory must carry effect metadata nếu compiler đã resolve statically. | tasks/0795 §573.88 | - | EPIC(E21.1) |
-| REQ-OPT-393 | optimizer | v1-full | Effect analysis must hướng tới zero runtime overhead trong native optimized builds. | tasks/0795 §573.89 | - | EPIC(E15.1) |
+| REQ-OPT-393 | optimizer | v1-full | Effect analysis must hướng tới zero runtime overhead trong native optimized builds. | tasks/0795 §573.89 | - | T602 |
 | REQ-CORE-3206 | compiler | v1-full | Impure call must not eliminate chỉ vì return value không dùng. | tasks/0795 §573.92 | - | EPIC(E18.1) |
 | REQ-CORE-3207 | compiler | v1-full | Caller must not assume callee purity chỉ vì caller itself được declared pure. | tasks/0795 §573.108 | - | EPIC(E18.1) |
 | REQ-CORE-3208 | compiler | v1-full | Explicit effect declarations có thể được compiler trust theo policy nhưng must giữ provenance. | tasks/0795 §573.109 | - | EPIC(E18.1) |
@@ -22850,10 +22850,10 @@
 | REQ-CORE-3228 | compiler | v1-full | Missing metadata must produce conservative `Unknown`. | tasks/0795 §573.191 | - | EPIC(E18.1) |
 | REQ-CORE-3229 | compiler | v1-full | Cùng MIR snapshot must produce byte-identical canonical effect summary. | tasks/0795 §573.192 | - | EPIC(E18.1) |
 | REQ-CORE-3230 | compiler | v1-full | Local effect inference must O(number of relevant MIR operations + dependency edges) ở mức cơ bản. | tasks/0795 §573.193 | - | EPIC(E18.1) |
-| REQ-OPT-394 | optimizer | v1-full | Small source change must not trigger whole-program analysis khi dependency graph chứng minh không cần. | tasks/0795 §573.194 | - | EPIC(E15.1) |
+| REQ-OPT-394 | optimizer | v1-full | Small source change must not trigger whole-program analysis khi dependency graph chứng minh không cần. | tasks/0795 §573.194 | - | T602 |
 | REQ-CORE-3231 | compiler | v1-full | Effect summaries must compact và có thể intern/shared. | tasks/0795 §573.195 | - | EPIC(E18.1) |
-| REQ-OPT-395 | optimizer | v1-full | Effect analysis must not trở thành một semantic type system thứ hai cạnh type checker. | tasks/0795 §573.199 | - | EPIC(E15.1) |
-| REQ-OPT-396 | optimizer | v1-full | Axiom Effect System must là một hệ thống suy luận effect canonical, deterministic và conservative. Function effects được suy ra từ MIR và transitive call summaries; `Unknown` không bao giờ được coi là `Pure` hay `Safe`; declared effects must not tự tạo proof nếu chưa được xác minh theo policy. Effect metadata must có thể được compiler, optimizer, static analyzer, concurrency engine, FFI, async runtime, IDE và AI dùng chung. Effect analysis không tạo runtime overhead mandatory và không làm Axiom thành một ngôn ngữ must viết effect annotation ở mọi nơi. | tasks/0795 §573.200 | - | EPIC(E15.1) |
+| REQ-OPT-395 | optimizer | v1-full | Effect analysis must not trở thành một semantic type system thứ hai cạnh type checker. | tasks/0795 §573.199 | - | T602 |
+| REQ-OPT-396 | optimizer | v1-full | Axiom Effect System must là một hệ thống suy luận effect canonical, deterministic và conservative. Function effects được suy ra từ MIR và transitive call summaries; `Unknown` không bao giờ được coi là `Pure` hay `Safe`; declared effects must not tự tạo proof nếu chưa được xác minh theo policy. Effect metadata must có thể được compiler, optimizer, static analyzer, concurrency engine, FFI, async runtime, IDE và AI dùng chung. Effect analysis không tạo runtime overhead mandatory và không làm Axiom thành một ngôn ngữ must viết effect annotation ở mọi nơi. | tasks/0795 §573.200 | - | T602 |
 | REQ-CORE-3232 | compiler | v1-full | Trọng tâm sẽ là **proof engine có giới hạn tài nguyên**, không biến Axiom compiler thành một theorem prover nặng. Nó must tận dụng tối đa facts từ `571–573`, chỉ đi sâu symbolic execution khi việc đó thực sự giúp chứng minh một property hoặc tìm bug. | tasks/0795 §573.200 | - | EPIC(E18.1) |
 | REQ-CORE-3233 | compiler | v1-full | The goal is not biến Axiom thành theorem-proving language. The goal là dùng symbolic reasoning **có giới hạn** để chứng minh những property thực dụng của compiler: | tasks/0796 §574.200 | - | EPIC(E18.1) |
 | REQ-CORE-3234 | compiler | v1-full | Symbolic engine chỉ must chứng minh các property nằm trong supported abstract domains. | tasks/0796 §574.2 | - | EPIC(E18.1) |
@@ -22865,12 +22865,12 @@
 | REQ-CORE-3240 | compiler | v1-full | Saturating operation must preserve saturation semantics. | tasks/0796 §574.13 | - | EPIC(E18.1) |
 | REQ-CORE-3241 | compiler | v1-full | Float symbolic reasoning must conservative hơn integer reasoning. | tasks/0796 §574.14 | - | EPIC(E18.1) |
 | REQ-CORE-3242 | compiler | v1-full | Floating-point domain must có trạng thái NaN khi cần. | tasks/0796 §574.15 | - | EPIC(E18.1) |
-| REQ-OPT-397 | optimizer | v1-full | +∞/-∞` must được model khi analysis hỗ trợ. | tasks/0796 §574.1 | - | EPIC(E15.1) |
+| REQ-OPT-397 | optimizer | v1-full | +∞/-∞` must được model khi analysis hỗ trợ. | tasks/0796 §574.1 | - | T601 |
 | REQ-CORE-3243 | compiler | v1-full | IEEE semantics must được preserve khi relevant. | tasks/0796 §574.17 | - | EPIC(E18.1) |
 | REQ-CORE-3244 | compiler | v1-full | Engine must giới hạn số path/disjunct. | tasks/0796 §574.31 | - | EPIC(E18.1) |
 | REQ-CORE-3245 | compiler | v1-full | Không được enumerate vô hạn paths. | tasks/0796 §574.32 | - | EPIC(E18.1) |
 | REQ-CORE-3246 | compiler | v1-full | Loops must đạt fixed point hoặc conservative approximation. | tasks/0796 §574.36 | - | EPIC(E18.1) |
-| REQ-OPT-398 | optimizer | v1-full | Mọi optimization proof must lưu provenance nội bộ: | tasks/0796 §574.43 | - | EPIC(E15.1) |
+| REQ-OPT-398 | optimizer | v1-full | Mọi optimization proof must lưu provenance nội bộ: | tasks/0796 §574.43 | - | T601 |
 | REQ-CORE-3247 | compiler | v1-full | Proof object không nhất thiết must lưu trong release binary. | tasks/0796 §574.44 | - | EPIC(E18.1) |
 | REQ-CORE-3248 | compiler | v1-full | MIR/semantic/dataflow change must invalidate proof liên quan. | tasks/0796 §574.47 | - | EPIC(E18.1) |
 | REQ-CORE-3249 | compiler | v1-full | Engine must detect: | tasks/0796 §574.48 | - | EPIC(E18.1) |
@@ -22882,14 +22882,14 @@
 | REQ-CORE-3255 | compiler | v1-full | Atomic access must giữ synchronization semantics. | tasks/0796 §574.66 | - | EPIC(E18.1) |
 | REQ-CORE-3256 | compiler | v1-full | Unknown call must conservative. | tasks/0796 §574.71 | - | EPIC(E18.1) |
 | REQ-CORE-3257 | compiler | v1-full | Contract must phân biệt: | tasks/0796 §574.73 | - | EPIC(E18.1) |
-| REQ-OPT-399 | optimizer | v1-full | Không được dùng cho hard optimizer proof nếu policy không cho phép. | tasks/0796 §574.76 | - | EPIC(E15.1) |
-| REQ-OPT-400 | optimizer | v1-full | Incomplete path analysis → finding must được đánh dấu potential/unknown. | tasks/0796 §574.88 | - | EPIC(E15.1) |
+| REQ-OPT-399 | optimizer | v1-full | Không được dùng cho hard optimizer proof nếu policy không cho phép. | tasks/0796 §574.76 | - | T601 |
+| REQ-OPT-400 | optimizer | v1-full | Incomplete path analysis → finding must được đánh dấu potential/unknown. | tasks/0796 §574.88 | - | T601 |
 | REQ-CORE-3258 | compiler | v1-full | Engine must detect ít nhất contradiction của supported domains. | tasks/0796 §574.92 | - | EPIC(E18.1) |
 | REQ-CORE-3259 | compiler | v1-full | Core native compiler must not phụ thuộc mandatory vào external SMT solver. | tasks/0796 §574.95 | - | EPIC(E18.1) |
 | REQ-CORE-3260 | compiler | v1-full | Solver result must bind với exact query/input snapshot. | tasks/0796 §574.97 | - | EPIC(E18.1) |
 | REQ-CORE-3261 | compiler | v1-full | Abstract counterexample must được ghi rõ nếu chưa concretized. | tasks/0796 §574.102 | - | EPIC(E18.1) |
 | REQ-CORE-3262 | compiler | v1-full | Engine must có bounded exploration. | tasks/0796 §574.108 | - | EPIC(E18.1) |
-| REQ-OPT-401 | optimizer | v1-full | Cùng budget + snapshot must cho deterministic analysis outcome. | tasks/0796 §574.110 | - | EPIC(E15.1) |
+| REQ-OPT-401 | optimizer | v1-full | Cùng budget + snapshot must cho deterministic analysis outcome. | tasks/0796 §574.110 | - | T601 |
 | REQ-CORE-3263 | compiler | v1-full | Transformation yêu cầu proof must fail-closed. | tasks/0796 §574.123 | - | EPIC(E18.1) |
 | REQ-CORE-3264 | compiler | v1-full | Một input fact invalidated must invalidate dependent proofs. | tasks/0796 §574.128 | - | EPIC(E18.1) |
 | REQ-CORE-3265 | compiler | v1-full | Equivalent proof facts must canonicalize để cache hiệu quả. | tasks/0796 §574.130 | - | EPIC(E18.1) |
@@ -22908,14 +22908,14 @@
 | REQ-CORE-3277 | compiler | v1-full | AI must not tự tạo proof. | tasks/0796 §574.1 | - | EPIC(E18.1) |
 | REQ-CORE-3278 | compiler | v1-full | Cache hit/miss must not change semantic result. | tasks/0796 §574.184 | - | EPIC(E18.1) |
 | REQ-CORE-3279 | compiler | v1-full | Optional solver execution must được sandbox/trust-boundary kiểm soát. | tasks/0796 §574.186 | - | EPIC(E18.1) |
-| REQ-OPT-402 | optimizer | v1-full | Nếu proof verifier reject proof → optimization must not áp dụng. | tasks/0796 §574.190 | - | EPIC(E15.1) |
+| REQ-OPT-402 | optimizer | v1-full | Nếu proof verifier reject proof → optimization must not áp dụng. | tasks/0796 §574.190 | - | T601 |
 | REQ-CORE-3280 | compiler | v1-full | Corpus must chứa: | tasks/0796 §574.194 | - | EPIC(E18.1) |
 | REQ-CORE-3281 | compiler | v1-full | Common proofs must chạy trong compiler hot path với low overhead. | tasks/0796 §574.195 | - | EPIC(E18.1) |
 | REQ-CORE-3282 | compiler | v1-full | Expensive symbolic execution must not làm compilation baseline chậm đáng kể. | tasks/0796 §574.196 | - | EPIC(E18.1) |
-| REQ-OPT-403 | optimizer | v1-full | Axiom Symbolic Execution 2.0 must là một proof engine có giới hạn, deterministic, incremental và fail-closed. Nó được phép dùng abstract interpretation, symbolic values, path constraints và optional solver để chứng minh các property thực dụng, nhưng must not biến compiler thành theorem prover mandatory. `Unknown` luôn khác `Proven`; timeout, thiếu metadata, external effects, floating-point uncertainty hoặc path explosion must dẫn đến approximation/conservative result. Mọi optimization dựa trên proof must có provenance và chỉ được áp dụng khi proof đủ mạnh cho transformation đó. | tasks/0796 §574.200 | - | EPIC(E15.1) |
-| REQ-OPT-404 | optimizer | v1-full | Trọng tâm `575` sẽ là tạo **hàng rào cuối cùng giữa optimizer và miscompilation**: mỗi optimization quan trọng must khai báo transformation contract, preconditions, preserved properties và postconditions; verifier kiểm tra chúng trước khi native codegen tiếp tục. | tasks/0796 §574.200 | - | EPIC(E15.1) |
-| REQ-OPT-405 | optimizer | v1-full | Optimizer được phép rất mạnh, nhưng **must not biến một giả định chưa chứng minh thành machine code**. | tasks/0797 §575.200 | - | EPIC(E15.1) |
-| REQ-OPT-406 | optimizer | v1-full | Mỗi optimization pass must khai báo contract: | tasks/0797 §575.2 | - | EPIC(E15.1) |
+| REQ-OPT-403 | optimizer | v1-full | Axiom Symbolic Execution 2.0 must là một proof engine có giới hạn, deterministic, incremental và fail-closed. Nó được phép dùng abstract interpretation, symbolic values, path constraints và optional solver để chứng minh các property thực dụng, nhưng must not biến compiler thành theorem prover mandatory. `Unknown` luôn khác `Proven`; timeout, thiếu metadata, external effects, floating-point uncertainty hoặc path explosion must dẫn đến approximation/conservative result. Mọi optimization dựa trên proof must có provenance và chỉ được áp dụng khi proof đủ mạnh cho transformation đó. | tasks/0796 §574.200 | - | T601 |
+| REQ-OPT-404 | optimizer | v1-full | Trọng tâm `575` sẽ là tạo **hàng rào cuối cùng giữa optimizer và miscompilation**: mỗi optimization quan trọng must khai báo transformation contract, preconditions, preserved properties và postconditions; verifier kiểm tra chúng trước khi native codegen tiếp tục. | tasks/0796 §574.200 | - | T602 |
+| REQ-OPT-405 | optimizer | v1-full | Optimizer được phép rất mạnh, nhưng **must not biến một giả định chưa chứng minh thành machine code**. | tasks/0797 §575.200 | - | T602 |
+| REQ-OPT-406 | optimizer | v1-full | Mỗi optimization pass must khai báo contract: | tasks/0797 §575.2 | - | T602 |
 | REQ-CORE-3283 | compiler | v1-full | Pass must khai báo IR level yêu cầu: | tasks/0797 §575.4 | - | EPIC(E18.1) |
 | REQ-CORE-3284 | compiler | v1-full | Postcondition mô tả property must đúng sau transformation. | tasks/0797 §575.6 | - | EPIC(E18.1) |
 | REQ-CORE-3285 | compiler | v1-full | Pass must khai báo properties must not change: | tasks/0797 §575.2 | - | EPIC(E18.1) |
