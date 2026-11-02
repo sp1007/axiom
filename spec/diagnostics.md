@@ -105,10 +105,11 @@ They map to the areas above as the last column shows. Three groups have no area 
 - `AX_RUNTIME_` / `AX_PANIC_` / `ERUNTIME`: program panics and traps are program outcomes (exit code,
   stderr text) defined by `spec/SPEC-03-core-semantics.md`, not compiler diagnostics (0146 §53).
 - `EASYNC`, `AX_ASYNC_`, `ECONCUR`, `AX_CONC_`, `AX_ATOM_`, `EGPU`, `AX_GPU_`: the epics that need them (E11.*,
-  E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`), the
-  `CONC` area (`AX_CONC_*`) is established for self-hosted `axiomc` (`compiler/diag/code.ax`, where `axiom0` is
-  frozen post-`T087`), covering `Send`/`Share` auto-traits (`T089`), closure/spawn captures (`T401`), the
-  compile-time data-race verifier (`T402`), and happens-before/lock-order diagnostics (`T403`).
+  E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`) and E11.2
+  (`T405` / `SPEC-31 §7`), the `CONC` area (`AX_CONC_*`) is established for self-hosted `axiomc`
+  (`compiler/diag/code.ax`, where `axiom0` is frozen post-`T087`), covering `Send`/`Share` auto-traits (`T089`),
+  closure/spawn captures (`T401`), the compile-time data-race verifier (`T402`), happens-before/lock-order
+  diagnostics (`T403`), and atomic type/ordering/alignment/capability diagnostics (`T406`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -506,11 +507,14 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CONC_VIEW_NOT_SHARE` | E | T402 | concurrent `READ`/`READ` via `view<T>` across execution contexts when `T: !Share` (`SPEC-30` AXS-CONC-031) |
 | `AX_CONC_UNSYNC_STATIC` | E | T402 | safe code accesses unsynchronized mutable `static` or exports `@thread_local` view across threads (`SPEC-30` AXS-CONC-034) |
 | `AX_CONC_GUARD_ESCAPE` | E | T402 | capability derived from `MutexGuard`/`RwLock*Guard` escapes the guard or guard is held across `.await` (`SPEC-30` AXS-CONC-035) |
-| `AX_CONC_ATOMIC_MUT_VIEW` | E | T402 | concurrent non-atomic `mut_view<T>` access mixed with shared `Atomic<T>` access (`SPEC-30` AXS-CONC-036) |
+| `AX_CONC_ATOMIC_MUT_VIEW` | E | T402/T406 | concurrent non-atomic `mut_view<T>` access mixed with shared `Atomic<T>` access or attempt to borrow `Atomic<T>` inner storage as `mut_view<T>` (`SPEC-30` AXS-CONC-036, `SPEC-31` AXS-ATM-005) |
 | `AX_CONC_LOCK_ORDER` | W/E | T403 | inverted lock acquisition order on the same lock pair across concurrent paths (`SPEC-30` AXS-CONC-007) |
+| `AX_CONC_INVALID_ATOMIC_TYPE` | E | T406 | `Atomic<T>` instantiated with a type outside the allowed 1-, 2-, 4-, or 8-byte integer, `bool`, or raw-pointer set (`SPEC-31` AXS-ATM-010, AXS-ATM-060) |
+| `AX_CONC_INVALID_ATOMIC_ORDERING` | E | T406 | disallowed `Ordering` for an atomic operation or fence (`load` with `Release`/`AcqRel`, `store` with `Acquire`/`AcqRel`, `fence`/`compiler_fence` with `Relaxed`, CAS `failure` with `Release`/`AcqRel`, or CAS `failure` stronger than `success`; `SPEC-31` AXS-ATM-026, AXS-ATM-060) |
+| `AX_CONC_INVALID_ATOMIC_ALIGNMENT` | E | T406 | `Atomic<T>` placed inside a `@packed` struct or given a sub-natural `@align(N)` where `N < size_of::<T>()` (`SPEC-31` AXS-ATM-011, AXS-ATM-060) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

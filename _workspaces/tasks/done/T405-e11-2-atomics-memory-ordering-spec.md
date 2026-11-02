@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T400]
 priority: 126
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-31-atomics.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [0092, 0128, 0161, 0162, 0208, tasks/0328, tasks/0515]
 covers: [REQ-ATM-001, REQ-CONC-013, REQ-CONC-059, REQ-CONC-060, REQ-CONC-097, REQ-ATM-002, REQ-ATM-014, REQ-ATM-015, REQ-ATM-031, REQ-MIR-144, REQ-CONC-172, REQ-CONC-174, REQ-CONC-178]
+started: 2026-11-03 06:13:14
+finished: 2026-11-03 06:33:21
 ---
 # T405 — E11.2 — Canonical atomics & memory ordering specification (SPEC-31)
 
@@ -44,3 +46,5 @@ Write canonical `spec/SPEC-31-atomics.md` (`AXS-ATM-*` rule IDs) defining `Atomi
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 06:13:14 started (attempt 1) 
+- 2026-11-03 06:33:21 accepted by QA -> done

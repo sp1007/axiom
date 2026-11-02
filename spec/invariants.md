@@ -459,7 +459,7 @@ and memory model (`SPEC-30`). A new group is added by editing this list.
 - since: T011
 - check: rejected-spelling cases R01–R15 and multi-error files
 
-## 11. Concurrency and memory model (SPEC-30)
+## 11. Concurrency and memory model (SPEC-30, SPEC-31)
 
 ### INV-CONC-001 — `Send` and `Share` are independent, zero-cost marker auto-traits
 - statement: `Send` (cross-context ownership transfer) and `Share` (concurrent shared read access via `view<T>`) are tracked as independent semantic properties (`Send != Share`). They are structurally synthesized for composite types, require `unsafe impl` for positive manual overrides, allow safe `impl !Send`/`impl !Share` opt-outs, and are completely erased after semantic checking with zero runtime representation or overhead (SPEC-30 AXS-CONC-010..019).
@@ -489,11 +489,32 @@ and memory model (`SPEC-30`). A new group is added by editing this list.
 - since: T403
 - check: optimizer unit tests (T403) and concurrency conformance tests (delivered by T404) verify that CSE/GVN/LICM/DSE do not reorder, fold, or eliminate shared memory operations across synchronization barriers and that concurrency verification is deterministic
 
+### INV-CONC-005 — `Atomic<T>` width/alignment/ordering legality and MIR optimizer preservation
+- statement: `Atomic<T>` is restricted to naturally aligned 1-, 2-, 4-, and 8-byte integers, `bool`, and raw pointers (`AX_CONC_INVALID_ATOMIC_TYPE`, `AX_CONC_INVALID_ATOMIC_ALIGNMENT`), forbids `mut_view<T>` into its inner storage (`AX_CONC_ATOMIC_MUT_VIEW`), requires explicit `Ordering` validated against the operation/fence/CAS legality matrix (`AX_CONC_INVALID_ATOMIC_ORDERING`), and lowers to dedicated `MIR_STMT_ATOMIC` statements that `const_fold`, `dce`, and all MIR optimization passes never fold, coalesce, reorder across acquire/release barriers, weaken, or eliminate (SPEC-31 AXS-ATM-001..034, AXS-ATM-060).
+- source: 0092 §1-14; 0128 §1-35, §58; 0161 §30; 0208 §1-39; SPEC-04 AXS-EXT-043; SPEC-31 AXS-ATM-001..034, AXS-ATM-060
+- verify: tests/mir/atomics, tests/ui/concurrency/atomics
+- since: T406
+- check: MIR dump and UI diagnostic tests in tests/mir/atomics and tests/ui/concurrency/atomics verify `Atomic<T>` type/alignment/ordering validation, rejection of `mut_view` inner borrows, and preservation of `MIR_STMT_ATOMIC` across `const_fold` and `dce`
+
+### INV-CONC-006 — LIR atomic preservation and x86-64 TSO instruction selection / byte-exact encoding
+- statement: `MIR_STMT_ATOMIC` lowers to dedicated `LIR_INST_ATOMIC_*`, `LIR_INST_FENCE`, and `LIR_INST_PAUSE` nodes preserved up to x86-64 instruction selection, where `SeqCst` stores emit `XCHG`, RMW `fetch_add`/`fetch_sub` emit `LOCK XADD`, bitwise RMW and CAS emit `LOCK CMPXCHG`, `fence(SeqCst)` emits `MFENCE`, `fence(Acquire|Release|AcqRel)` and `compiler_fence` emit compiler scheduling barriers (`0` machine bytes), and `spin_loop_hint` emits `PAUSE` (`F3 90`) across 8-, 16-, 32-, and 64-bit widths (SPEC-31 AXS-ATM-040..047).
+- source: 0092 §15-17; 0162 §30 ALIR-23; tasks/0328 §7; tasks/0515 §12; SPEC-04 AXS-EXT-051; SPEC-31 AXS-ATM-040..047
+- verify: tests/lir/atomics, tests/encode/atomics, tests/run/concurrency/atomics_native
+- since: T407
+- check: LIR dump, machine-code byte encoding (`F0` `LOCK`, `0F C0`/`0F C1` `XADD`, `0F B0`/`0F B1` `CMPXCHG`, `86`/`87` `XCHG`, `0F AE F0` `MFENCE`, `F3 90` `PAUSE`), and native execution tests verify x86-64 atomic codegen across all widths and orderings
+
+### INV-CONC-007 — Oracle atomic modification-order & vector-clock model agrees with native litmus conformance
+- statement: The MIR interpreter oracle models per-location modification orders, release/acquire vector clocks, release sequences across RMW chains, `SeqCst` total ordering, deterministic spurious failures on `compare_exchange_weak`, and `AX_UNSAFE_INTERP_UB` detection on unsynchronized ordinary/atomic races, agreeing with native x86-64 execution across the `E11.2` litmus conformance suite (`LITMUS-MP`, `LITMUS-MP-FENCE`, `LITMUS-SB`, `LITMUS-LB`, `LITMUS-RMW`, `LITMUS-CAS-ABA`) (SPEC-31 AXS-ATM-050..066).
+- source: 0092 §18-28; 0128 §19-33, §59; tasks/0515 §6, §11-12; SPEC-31 AXS-ATM-050..066
+- verify: tests/run/concurrency/atomics_oracle, tests/conformance/p11/e11_2_atomics
+- since: T408
+- check: oracle memory-model tests (T408) and end-to-end litmus conformance tests (delivered by T409) verify message passing, store/load buffering, lossless RMW counters, weak/strong CAS retry loops, ABA tag protection, and differential agreement between `--interp` and native x86-64 binaries
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).
