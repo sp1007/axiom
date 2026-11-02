@@ -10,7 +10,7 @@ depends: [T600]
 priority: 94
 status: todo
 attempts: 0
-paths: [compiler/opt/optir, tests/run/optir_ssa]
+paths: [compiler/opt/optir, compiler/driver, tests/run/optir_ssa, tests/selfhost]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, tasks/0315, tasks/0366, tasks/0398, tasks/0794, tasks/0796]
 covers: [REQ-OPT-337, REQ-OPT-338, REQ-OPT-340, REQ-OPT-341, REQ-OPT-390, REQ-OPT-391, REQ-OPT-392, REQ-OPT-397, REQ-OPT-398, REQ-OPT-399, REQ-OPT-400, REQ-OPT-401, REQ-OPT-402, REQ-OPT-403]
 ---

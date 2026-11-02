@@ -47,6 +47,7 @@ ADR when semantics change), **frozen** (v1.0 freeze at E23.2 / T091; nothing is 
 | `spec/SPEC-12-drop.md` | planned | T045 | 0178, 0030, 0118, tasks/0674 | T049, T054b |
 | `spec/SPEC-20-selfhost.md` | canonical | T076 | 0167, 0150, tasks/0260, tasks/0261, tasks/0371, tasks/0473 | T077–T087 |
 | `spec/SPEC-70-optir-ssa-memoryssa.md` | draft | T600 | 0161 §17/§37, 0162 §40, 0165 §1-16, tasks/0315, tasks/0366, tasks/0398, tasks/0399, tasks/0545, tasks/0546, tasks/0547, tasks/0794-0797, SPEC-03, SPEC-04 §5 | T601, T602, T603, T604 |
+| `spec/SPEC-71-alias-escape-promotion.md` | draft | T605 | 0131 §86, 0162 §29, 0165 §15-20, 0226 §1-26, tasks/0366, tasks/0395, tasks/0397, tasks/0429, tasks/0436, tasks/0438, tasks/0480, tasks/0486, tasks/0548, tasks/0615, SPEC-10..12, SPEC-70 | T606, T607, T608 |
 | `spec/SPEC-77-regalloc-machine-opt.md` | draft | T627 | 0162 §36-40, 0182, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559, SPEC-04 §6-7 | T063, T628, T629 |
 | `spec/BOOTSTRAP.md` | canonical | T087 | 0167, tasks/0473, 0150 | trust chain, freeze rule (INV-BOOT-004) |
 | `spec/RELEASE-v1.md` | planned | T091 | 0150, 0151, tasks/0602, 0121 | v1.0 release |
@@ -81,6 +82,8 @@ to this table at the next INDEX update.
 | `AXS-LEX-NNN` | lexical rules | SPEC-01 |
 | `AXS-GRM-NNN` | grammar rules | SPEC-02 |
 | `AXS-OPT-NNN` | OptIR, SSA/MemorySSA, pass-manager legality & scalar optimization rules | SPEC-70 |
+| `AXS-ALIAS-NNN` | capability- & provenance-driven alias analysis and MemorySSA memory optimization rules | SPEC-71 |
+| `AXS-ESC-NNN` | escape analysis, storage selection & allocation promotion rules | SPEC-71 |
 | `AXS-RA-NNN` | register allocation, liveness, spill/reload & frame integration rules | SPEC-77 |
 | `AXS-MCOPT-NNN` | instruction selection, branchless if-conversion, microarchitectural cost & post-RA machine optimization rules | SPEC-77 |
 | `AXD-NNN` | diagnostics rules | `spec/diagnostics.md` |
@@ -110,7 +113,7 @@ the corpus reuses them (§6).
 | Types, literals, arithmetic, panics | SPEC-03 (draft) | 0157, 0175, 0245, tasks/0388, tasks/0327, 0068 |
 | Traits, generics | ADR-0004; task texts T053–T056 | 0158, 0212, tasks/0389, tasks/0611 |
 | Ownership, capability, drop | invariants §8; SPEC-10/11/12 (T045) | 0160, 0176, 0177, 0178, tasks/0394, tasks/0395 |
-| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt) | 0161, 0165, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0366, tasks/0398, tasks/0399, tasks/0545–0547, tasks/0794–0797 |
+| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt); SPEC-71 (AliasInfo, EscapeInfo, allocation promotion) | 0161, 0165, 0226, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0366, tasks/0395, tasks/0397, tasks/0398, tasks/0399, tasks/0545–0548, tasks/0794–0797 |
 | LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds); SPEC-77 (RA, isel, machine opt) | 0162, 0179, 0181, 0182, 0184–0187, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559 |
 | Tests and conformance | skill axiom-testing; ADR-0005 §1/§3 | 0166, 0017, 0022, 0026, 0114 |
 | Self-hosting | SPEC-20 (T076), BOOTSTRAP.md (T087) | 0167, 0150, tasks/0259–0262, tasks/0371 |

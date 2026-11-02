@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215, T600]
 priority: 98
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-71-alias-escape-promotion.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-10-ownership.md, spec/SPEC-11-capability.md, spec/SPEC-70-optir-ssa-memoryssa.md, 0131, 0162, 0165, 0226, tasks/0366, tasks/0395, tasks/0397, tasks/0480, tasks/0486, tasks/0548]
 covers: [REQ-OPT-008, REQ-OPT-012, REQ-OPT-024, REQ-OPT-025, REQ-OPT-027, REQ-OPT-028, REQ-OPT-029, REQ-OPT-299, REQ-OPT-300, REQ-OPT-301, REQ-OPT-302, REQ-OPT-303]
+started: 2026-11-03 03:48:31
+finished: 2026-11-03 04:01:51
 ---
 # T605 — E15.2 — Canonical alias analysis, escape analysis & allocation promotion specification (SPEC-71)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Axiom's capability- and provenance-d
 
 ## Log
 - 2026-11-03 02:39:00 created by T215 (P15 phase planning)
+- 2026-11-03 03:48:31 started (attempt 1) 
+- 2026-11-03 04:01:51 accepted by QA -> done

@@ -304,6 +304,13 @@ added by editing this list.
 - since: T604
 - check: OptIR/MemorySSA dump and differential conformance tests in tests/run/optir_ssa (T601), tests/run/opt_passmgr (T602), tests/run/opt_scalar (T603), and tests/conformance/p15/e15_1_optir_ssa (T604) verify SSA/MemorySSA construction, PassManager invalidation and `--verify-each` contracts, and observable equivalence across --interp, -O0, -O1, and -O2
 
+### INV-PIPE-009 — Capability-driven alias analysis, escape analysis, and allocation promotion safety
+- statement: `AliasInfo` derives `NoAlias` and `MustAlias` exclusively from verified ownership, capability (`view`/`mut_view`), allocation-root, field-layout, and range proofs while keeping raw-pointer and FFI aliasing conservative (`MayAlias`/`UnknownAlias`), and `EscapeInfo` promotes or eliminates allocations, closure environments, bounded collections, and return slots only when escape and address-observability (`address_of`, `@at`, `volatile`) barriers and deterministic `Drop` ordering are preserved (SPEC-71 AXS-ALIAS-001..006, AXS-ESC-001..017).
+- source: SPEC-71 AXS-ALIAS-001..006, AXS-ESC-001..017; 0131 §86; 0162 §29; 0165 §17-20; 0226 §5-16; tasks/0366 AOPT-23..38, AOPT-59..60; tasks/0395 AALIAS-20..70; tasks/0397 AESCAPE-20..80; tasks/0548 AMEMOPT-20..85; tasks/0615 ACLOS-01..30
+- verify: tests/run/opt_alias, tests/run/opt_escape, tests/conformance/p15/e15_2_alias_escape
+- since: T608
+- check: alias/escape dump and differential conformance tests in tests/run/opt_alias (T606), tests/run/opt_escape (T607), and tests/conformance/p15/e15_2_alias_escape (T608) verify capability NoAlias forwarding, DSE, Box/closure/buffer stack and register promotion, address-observability barriers, and observable agreement across --interp, -O0, -O1, and -O2
+
 ## 7. Oracle and agreement
 
 ### INV-ORACLE-001 — Semantics are explicit, not inherited from C
@@ -428,7 +435,7 @@ added by editing this list.
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

@@ -159,10 +159,12 @@ printed by default (tasks/0360 §23). When compiler-built MIR fails the verifier
 (`AX_ICE_MIR_VERIFY`) with the `AX_VERIFY_*` findings attached as notes. Hand-written MIR that fails
 (T018 parser, `tests/verify`) gets plain `AX_VERIFY_*` errors and exit code 1. When compiler-transformed
 `OptIR` fails its post-pass structural, SSA/`MemorySSA`, effect-preservation, or MIR-reverification contract
-(`spec/SPEC-70-optir-ssa-memoryssa.md`, rule `AXS-OPT-034`), the compiler reports `AX_ICE_MIR_VERIFY` /
+(`spec/SPEC-70-optir-ssa-memoryssa.md`, rule `AXS-OPT-034`; `spec/SPEC-71-alias-escape-promotion.md`,
+rule `AXS-ESC-016`), the compiler reports `AX_ICE_MIR_VERIFY` /
 `AX_ICE_INTERNAL` (`data.stage = "optir_verify"`) and emits no artifact, whereas unproven optimization
-preconditions (`Certainty.Possible` / `Certainty.Unknown`) fail closed and leave the IR unchanged without
-emitting a user diagnostic (`AXS-OPT-032`, `tasks/0399 AOPT-96/97`). Likewise, when
+preconditions (`Certainty.Possible` / `Certainty.Unknown`, `MayAlias` / `UnknownAlias`, `GlobalEscape` /
+`UnknownEscape`, or `address_observable == true`) fail closed and leave the IR unchanged without
+emitting a user diagnostic (`AXS-OPT-032`, `AXS-ESC-016`, `tasks/0395 AALIAS-55`, `tasks/0397 AESCAPE-65/80`, `tasks/0399 AOPT-96/97`). Likewise, when
 post-RA or post-peephole Machine IR fails `x64_verify_checked` (`spec/SPEC-77-regalloc-machine-opt.md`,
 rules `AXS-RA-027` and `AXS-MCOPT-026`), the compiler reports `AX_ICE_INTERNAL` (`data.stage = "x64_verify"`)
 and emits no artifact; profitability or legality rejections during instruction selection, branchless
@@ -494,4 +496,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-70; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-70; SPEC-71; SPEC-77; axiom-c-stage0; axiom-testing.
