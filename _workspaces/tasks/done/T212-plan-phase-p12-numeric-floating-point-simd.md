@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 00:23:42
+finished: 2026-11-03 00:43:07
 ---
 # T212 — Plan phase P12: Numeric, floating point & SIMD
 
@@ -86,3 +88,6 @@ When expanding `E12.1` / `E12.2`, create dedicated spec + implementation + QA st
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-03 00:23:42 started (attempt 1) 
+- 2026-11-03 00:43:07 accepted by QA -> done

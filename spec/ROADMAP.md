@@ -100,7 +100,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P9 libraries (self-host std subset) | T069–T075, T071b, T071c, T073a, T074b | — | T075 | P7, P8 |
 | P10 self-hosting | T076–T087 | — | T087 | P9 |
 | P11 concurrency & async | T088–T090, T400–T428 | T211 | T311 | P10 |
-| P12 numeric & SIMD | — | T212 | T312 | P10 |
+| P12 numeric & SIMD | T450–T479 | T212 | T312 | P10 |
 | P13 low-level & security | — | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064 | T215 | T315 | P10 (E15.5 needs P12) |
@@ -144,17 +144,17 @@ pulls every catalogue requirement marked `EPIC(<id>)`.
 
 ### P12 — Numeric, floating point & SIMD
 - **E12.1 Integer model completion** — all widths incl. i128/u128 if specified, wrapping/checked/
-  saturating families, bit ops, conversions. Src tasks/0327 tasks/0334 tasks/0431.
+  saturating families, bit ops, conversions. Src tasks/0327 tasks/0334 tasks/0431. *(T450–T455)*
 - **E12.2 Floating-point semantics** — f32/f64 types enter the language here (axiom0 has none; T034),
   SSE2 scalar codegen and XMM argument passing in the Windows x64 ABI, IEEE-754 rules, NaN/signed zero, rounding, float formatting/
-  parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331.
+  parsing, math library accuracy contract. Src tasks/0338 tasks/0345 tasks/0331. *(T456–T462)*
 - **E12.3 SIMD & vector types** — portable vector types, masks, lane ops, target feature detection.
-  Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347.
+  Src 0095 tasks/0337 tasks/0341 tasks/0344 tasks/0347. *(T463–T468)*
 - **E12.5 CPU feature detection & function multiversioning** — explicit `@target_feature` /
   multiversioned functions with a generated dispatcher; features never change language semantics.
-  Src tasks/0453 §194.14-15, 0095 §8, tasks/0341 (ASIMD-14).
+  Src tasks/0453 §194.14-15, 0095 §8, tasks/0341 (ASIMD-14). *(T475–T479)*
 - **E12.4 SIMD backend** — SSE2/AVX2 (and NEON in P16) instruction selection/encoding for vector ops.
-  Src tasks/0403 tasks/0407.
+  Src tasks/0403 tasks/0407. *(T469–T474)*
 Exit (phase): numeric conformance + differential interp/native for float and vector programs.
 
 ### P13 — Low-level systems, unsafe, freestanding, security
@@ -410,3 +410,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-10-31 | Added owner requirement REQ-OWNER-008 to E13.6 (`@at`): low-level/unsafe code can obtain the memory address of any function (`fn`, `extern fn`, `@at fn`) or variable/static (`static`, `static mut`, `@at` item, local, field/element place) via `address_of` / `address_of_mut` / `addr_of` and pointer/fn-pointer `as usize` casts | ADR-0001 §7 |
 | 2026-11-01 | T086 (Stage-1 gate) unblock: new P10 fix task T162 (`owner: axiom-semantics`) fixes 8 port/test defects blocking `axiomc1` full-suite pass (`compiler/interp/interp.ax` wrapping binops, `compiler/mir/builder.ax` + `bundle_common.py` unterminated join blocks in `interp_opt.session`, `bundle_common.py` `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` suppression vs duplicate `HIR_ITEM_STATIC` report in `typeck.ax`, `typeck.ax` + `verifier.ax` array-repeat `TY_INT_VAR` resolution, `compiler/mir/mir.ax` bare-place `MIR_OP_COPY` fallback, `pipeline.ax` + `interp_opt/session.ax` exit codes `124`/`125` and host CLI args, `interp_opt/session.ax` trait default-method `mir_map` aliasing after T161, and `gnu_as_vectors.ax` `gatecheck.py` rule (c) inline `xfail` comments + `qa_axiomc_cli_edges.test`); T086 depends on T162 | unblock-T086 |
 | 2026-11-02 | T211 P11 phase expansion (`P11-concurrency-async`): expanded E11.1–E11.6 into 29 new tasks `T400`–`T428` alongside refined existing tasks `T088`–`T090` (32 tasks total across 6 epics: E11.1 6 tasks `T089, T400–T404`; E11.2 5 tasks `T405–T409`; E11.3 6 tasks `T090, T410–T414`; E11.4 6 tasks `T088, T415–T419`; E11.5 5 tasks `T420–T424`; E11.6 4 tasks `T425–T428`), converted all 417 `EPIC(E11.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T311` (`depends: [T211, T088–T090, T400–T428]`) | T211 |
+| 2026-11-03 | T212 P12 phase expansion (`P12-numeric-floating-point-simd`): expanded E12.1–E12.5 into 30 new tasks `T450`–`T479` (30 tasks total across 5 epics: E12.1 6 tasks `T450–T455`; E12.2 7 tasks `T456–T462` including dedicated spec/implementation/QA stress-test tasks for `REQ-OWNER-007` complex mixed-type expression matrix Patterns A–D; E12.3 6 tasks `T463–T468`; E12.4 6 tasks `T469–T474`; E12.5 5 tasks `T475–T479`), converted all 335 `EPIC(E12.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T312` (`depends: [T212, T450–T479]`) | T212 |
