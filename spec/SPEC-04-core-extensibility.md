@@ -465,7 +465,8 @@ through a cast pointer cover every self-host need.
   handles are small integers (0–2 for stdio, then 3, 4, … in opening order — deterministic).
 - A fallible call returns `i64`: `>= 0` success value, `< 0` a negated **host error kind**:
   `-1` NotFound, `-2` PermissionDenied, `-3` AlreadyExists, `-4` InvalidInput (bad handle, bad mode,
-  invalid UTF-8), `-9` Other. The OS error number is not observable (determinism, SPEC-03 AXS-SEM-003).
+  invalid UTF-8), `-5` TimedOut (`futex_wait` timeout, E11.3 / SPEC-32 AXS-SYNC-002), `-9` Other.
+  The OS error number is not observable (determinism, SPEC-03 AXS-SEM-003).
 - Buffer-returning calls take `(buf: *mut u8, cap: usize)` and return the **full** length `n`; they
   write `min(n, cap)` bytes; the caller retries with a larger buffer when `n > cap`.
 - Every pointer argument must lie inside a live allocation (oracle bounds check →
@@ -494,9 +495,18 @@ through a cast pointer cover every self-host need.
 | `dir_next` | `unsafe fn(h: i64, buf: *mut u8, cap: usize) -> i64` (length of the next entry name without `.`/`..`; 0 at the end; when `n > cap` the entry is not consumed) | `fs.ax` / T074b |
 | `dir_close` | `fn(h: i64) -> i64` | `fs.ax` / T074b |
 | `monotonic_ns` | `fn() -> u64` (non-decreasing; origin unspecified) | `time.ax` / T074b |
+| `thread_spawn` | `unsafe fn(entry: *const u8, ctx: *mut u8, stack_size: usize) -> i64` (handle `>= 1`, `< 0` on error; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `thread_join` | `fn(handle: i64) -> i64` (`0` normal exit, `1` uncaught panic, `< 0` invalid/already joined; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `thread_detach` | `fn(handle: i64) -> i64` (`0` success, `< 0` invalid handle; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `thread_current_id` | `fn() -> u64` (unique non-zero 64-bit thread id; `1` for main thread in oracle; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `thread_yield` | `fn()` (cooperative scheduler / OS thread yield; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `thread_sleep_ns` | `fn(ns: u64)` (blocks calling thread for at least `ns` ns; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `futex_wait` | `unsafe fn(addr: *const u32, expected: u32, timeout_ns: i64) -> i64` (`0` woken or `*addr != expected`, `-5` timeout, `-4` misaligned/null; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `futex_wake` | `unsafe fn(addr: *const u32, count: u32) -> i64` (wakes up to `count` waiters on `addr`; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
 
 Directory order is unspecified (std sorts, T074b); time is the only other non-deterministic result.
-Thread, socket, memory-mapping and async-IO host calls are appended by E11.3, E21.4, E21.6 and E11.6.
+Thread/futex calls above are specified in SPEC-32 (`T410`) and implemented in `T090`; socket,
+memory-mapping and async-IO host calls are appended by E21.4, E21.6 and E11.6.
 Every host call is the single OS boundary of std, which is also the record/replay point of E17.7.
 
 ## 12. Const evaluation and test infrastructure

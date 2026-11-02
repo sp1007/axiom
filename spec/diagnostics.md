@@ -105,11 +105,12 @@ They map to the areas above as the last column shows. Three groups have no area 
 - `AX_RUNTIME_` / `AX_PANIC_` / `ERUNTIME`: program panics and traps are program outcomes (exit code,
   stderr text) defined by `spec/SPEC-03-core-semantics.md`, not compiler diagnostics (0146 §53).
 - `EASYNC`, `AX_ASYNC_`, `ECONCUR`, `AX_CONC_`, `AX_ATOM_`, `EGPU`, `AX_GPU_`: the epics that need them (E11.*,
-  E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`) and E11.2
-  (`T405` / `SPEC-31 §7`), the `CONC` area (`AX_CONC_*`) is established for self-hosted `axiomc`
-  (`compiler/diag/code.ax`, where `axiom0` is frozen post-`T087`), covering `Send`/`Share` auto-traits (`T089`),
-  closure/spawn captures (`T401`), the compile-time data-race verifier (`T402`), happens-before/lock-order
-  diagnostics (`T403`), and atomic type/ordering/alignment/capability diagnostics (`T406`).
+  E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`), E11.2
+  (`T405` / `SPEC-31 §7`), and E11.3 (`T410` / `SPEC-32 §6`), the `CONC` area (`AX_CONC_*`) is established for
+  self-hosted `axiomc` (`compiler/diag/code.ax`, where `axiom0` is frozen post-`T087`), covering `Send`/`Share`
+  auto-traits (`T089`), closure/spawn captures (`T401`), the compile-time data-race verifier (`T402`),
+  happens-before/lock-order diagnostics (`T403`), atomic type/ordering/alignment/capability diagnostics (`T406`),
+  and thread/guard/channel/`@thread_local` TLS escape diagnostics (`T090`, `T411`–`T413`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -512,9 +513,11 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CONC_INVALID_ATOMIC_TYPE` | E | T406 | `Atomic<T>` instantiated with a type outside the allowed 1-, 2-, 4-, or 8-byte integer, `bool`, or raw-pointer set (`SPEC-31` AXS-ATM-010, AXS-ATM-060) |
 | `AX_CONC_INVALID_ATOMIC_ORDERING` | E | T406 | disallowed `Ordering` for an atomic operation or fence (`load` with `Release`/`AcqRel`, `store` with `Acquire`/`AcqRel`, `fence`/`compiler_fence` with `Relaxed`, CAS `failure` with `Release`/`AcqRel`, or CAS `failure` stronger than `success`; `SPEC-31` AXS-ATM-026, AXS-ATM-060) |
 | `AX_CONC_INVALID_ATOMIC_ALIGNMENT` | E | T406 | `Atomic<T>` placed inside a `@packed` struct or given a sub-natural `@align(N)` where `N < size_of::<T>()` (`SPEC-31` AXS-ATM-011, AXS-ATM-060) |
+| `AX_CONC_TLS_ESCAPE` | E | T413 | `view<T>` or `mut_view<T>` rooted at a `@thread_local static` item or `LocalKey<T>.with` callback escapes its lexical scope, is stored in a global/heap place, is captured into `spawn`, or is held across `.await` (`SPEC-32` AXS-SYNC-020..022, AXS-SYNC-050) |
+| `AX_TYPE_INVALID_TLS_DECL` | E | T413 | `@thread_local` attached to a non-`static` item (`fn`, `struct`, `enum`, `const`, `type`, or local `let`), or `@thread_local static` initialized with a non-constant expression (`SPEC-32` AXS-SYNC-022, AXS-SYNC-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T400, T405]
 priority: 131
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-32-threads-sync.md]
 locks: [spec/INDEX.md, spec/SPEC-04-core-extensibility.md, spec/diagnostics.md]
 spec: [0136, 0203, 0206, 0207, 0209, tasks/0278, tasks/0329, tasks/0621, tasks/0623, tasks/0837]
 covers: [REQ-CONC-003, REQ-CONC-022, REQ-CONC-080, REQ-CONC-123, REQ-CONC-198]
+started: 2026-11-03 06:33:36
+finished: 2026-11-03 06:55:11
 ---
 # T410 — E11.3 — Canonical threads, TLS & synchronization library specification (SPEC-32)
 
@@ -44,3 +46,5 @@ Write canonical `spec/SPEC-32-threads-sync.md` (`AXS-SYNC-*` rule IDs) defining 
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 06:33:36 started (attempt 1) 
+- 2026-11-03 06:55:11 accepted by QA -> done
