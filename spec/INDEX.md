@@ -51,6 +51,7 @@ ADR when semantics change), **frozen** (v1.0 freeze at E23.2 / T091; nothing is 
 | `spec/SPEC-72-loops-scev-bce.md` | draft | T609 | 0113 §94/§122, 0165 §2/§21-30, tasks/0366, tasks/0402, tasks/0416, tasks/0426, tasks/0470, tasks/0549, SPEC-03, SPEC-70, SPEC-71 | T610, T611, T612 |
 | `spec/SPEC-73-inlining-specialization-devirt.md` | draft | T613 | 0131 §28-29/§73-76/§86/§88, 0152 §73-75, 0165 §13-16, tasks/0366, tasks/0400, tasks/0401, tasks/0551, SPEC-03, SPEC-04, SPEC-70, SPEC-71 | T064, T614, T615 |
 | `spec/SPEC-75-lto-wpo-section-gc-pgo.md` | draft | T620 | tasks/0355, tasks/0366, tasks/0408, tasks/0409, tasks/0410, tasks/0580, tasks/0581, tasks/0594, tasks/0595, tasks/0597, SPEC-03, SPEC-04 §8, SPEC-70..73, SPEC-77 | T621, T622, T623, T624–T626 |
+| `spec/SPEC-76-performance-contract.md` | draft | T624 | 0074, tasks/0355, tasks/0366, tasks/0408, tasks/0595, tasks/0706, SPEC-20, SPEC-70..75, SPEC-77 | T625, T626, T315 |
 | `spec/SPEC-77-regalloc-machine-opt.md` | draft | T627 | 0162 §36-40, 0182, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559, SPEC-04 §6-7 | T063, T628, T629 |
 | `spec/BOOTSTRAP.md` | canonical | T087 | 0167, tasks/0473, 0150 | trust chain, freeze rule (INV-BOOT-004) |
 | `spec/RELEASE-v1.md` | planned | T091 | 0150, 0151, tasks/0602, 0121 | v1.0 release |
@@ -92,6 +93,7 @@ to this table at the next INDEX update.
 | `AXS-INL-NNN` | call-graph SCC, copy/move propagation, `SROA`, `RVO`/`NRVO`, function/closure inlining, call-site specialization, devirtualization & tail-call rules | SPEC-73 |
 | `AXS-LTO-NNN` | Link-Time Optimization (`LTO`), whole-program closed-world reachability (`WPO`), generic deduplication, section GC (`COMDAT`) & safe Identical Code Folding (`ICF`) rules | SPEC-75 |
 | `AXS-PGO-NNN` | Profile-Guided Optimization (`PGO`), `--pgo-gen`/`--pgo-use`, profile provenance/confidence/staleness & profitability-only rules | SPEC-75 |
+| `AXS-PERF-NNN` | runtime performance contract, optimization profiles (`-O0`..`-Oz`), 3D binary footprint (`FileSize`/`MappedSize`/`WorkingSet`), `--time-passes`/`--size-report` telemetry, canonical benchmark suite & CI regression budget rules | SPEC-76 |
 | `AXS-RA-NNN` | register allocation, liveness, spill/reload & frame integration rules | SPEC-77 |
 | `AXS-MCOPT-NNN` | instruction selection, branchless if-conversion, microarchitectural cost & post-RA machine optimization rules | SPEC-77 |
 | `AXD-NNN` | diagnostics rules | `spec/diagnostics.md` |
@@ -121,9 +123,9 @@ the corpus reuses them (§6).
 | Types, literals, arithmetic, panics | SPEC-03 (draft) | 0157, 0175, 0245, tasks/0388, tasks/0327, 0068 |
 | Traits, generics | ADR-0004; task texts T053–T056; SPEC-73 (specialization, static vs `dyn` dispatch, devirtualization) | 0158, 0212, tasks/0389, tasks/0401, tasks/0551, tasks/0611 |
 | Ownership, capability, drop | invariants §8; SPEC-10/11/12 (T045) | 0160, 0176, 0177, 0178, tasks/0394, tasks/0395 |
-| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt); SPEC-71 (AliasInfo, EscapeInfo, allocation promotion); SPEC-72 (loops, SCEV, BCE, LICM, iterator fusion); SPEC-73 (CallGraph/SCC, copy/move prop, SROA, RVO/NRVO, inlining, specialization, devirt, TCO); SPEC-75 (LTO, WPO, PGO) | 0161, 0165, 0226, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0355, tasks/0366, tasks/0395, tasks/0397, tasks/0398, tasks/0399, tasks/0400, tasks/0401, tasks/0402, tasks/0408, tasks/0409, tasks/0545–0549, tasks/0551, tasks/0580, tasks/0581, tasks/0594, tasks/0597, tasks/0794–0797 |
-| LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds); SPEC-75 (section GC, COMDAT, safe ICF, binary layout); SPEC-77 (RA, isel, machine opt) | 0162, 0179, 0181, 0182, 0184–0187, 0235, 0237, 0252, tasks/0355, tasks/0406, tasks/0410, tasks/0553, tasks/0557, tasks/0559, tasks/0594, tasks/0595 |
-| Tests and conformance | skill axiom-testing; ADR-0005 §1/§3 | 0166, 0017, 0022, 0026, 0114 |
+| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt); SPEC-71 (AliasInfo, EscapeInfo, allocation promotion); SPEC-72 (loops, SCEV, BCE, LICM, iterator fusion); SPEC-73 (CallGraph/SCC, copy/move prop, SROA, RVO/NRVO, inlining, specialization, devirt, TCO); SPEC-75 (LTO, WPO, PGO); SPEC-76 (optimization profiles `-O0`..`-Oz`, performance contract) | 0074, 0161, 0165, 0226, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0355, tasks/0366, tasks/0395, tasks/0397, tasks/0398, tasks/0399, tasks/0400, tasks/0401, tasks/0402, tasks/0408, tasks/0409, tasks/0545–0549, tasks/0551, tasks/0580, tasks/0581, tasks/0594, tasks/0597, tasks/0706, tasks/0794–0797 |
+| LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds); SPEC-75 (section GC, COMDAT, safe ICF, binary layout); SPEC-76 (3D binary footprint `FileSize`/`MappedSize`/`WorkingSet`, startup layout, `--size-report`); SPEC-77 (RA, isel, machine opt) | 0162, 0179, 0181, 0182, 0184–0187, 0235, 0237, 0252, tasks/0355, tasks/0406, tasks/0410, tasks/0553, tasks/0557, tasks/0559, tasks/0594, tasks/0595, tasks/0706 |
+| Tests and conformance | skill axiom-testing; ADR-0005 §1/§3; SPEC-76 (`tools/bench`, `tools/perf.py`, `--time-passes`, CI budgets) | 0074, 0166, 0017, 0022, 0026, 0114, tasks/0706 |
 | Self-hosting | SPEC-20 (T076), BOOTSTRAP.md (T087) | 0167, 0150, tasks/0259–0262, tasks/0371 |
 | Fixed addresses, module-relative bindings | ADR-0001, OWNER.md | 0071, 0044, 0097, tasks/0328 |
 

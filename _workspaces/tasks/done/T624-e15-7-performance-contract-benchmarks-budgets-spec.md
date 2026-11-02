@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215, T600]
 priority: 118
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-76-performance-contract.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-20-selfhost.md, spec/SPEC-70-optir-ssa-memoryssa.md, 0074, tasks/0355, tasks/0366, tasks/0408, tasks/0595, tasks/0706]
 covers: [REQ-OPT-292, REQ-OPT-293, REQ-OPT-294, REQ-OPT-295, REQ-OPT-334, REQ-OPT-381, REQ-OPT-382]
+started: 2026-11-03 05:41:29
+finished: 2026-11-03 05:55:23
 ---
 # T624 — E15.7 — Canonical performance contract, benchmark suite & compile-time/code-size budget specification (SPEC-76)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Axiom's runtime performance contract
 
 ## Log
 - 2026-11-03 02:44:00 created by T215 (P15 phase planning)
+- 2026-11-03 05:41:29 started (attempt 1) 
+- 2026-11-03 05:55:23 accepted by QA -> done
