@@ -49,6 +49,7 @@ ADR when semantics change), **frozen** (v1.0 freeze at E23.2 / T091; nothing is 
 | `spec/SPEC-70-optir-ssa-memoryssa.md` | draft | T600 | 0161 §17/§37, 0162 §40, 0165 §1-16, tasks/0315, tasks/0366, tasks/0398, tasks/0399, tasks/0545, tasks/0546, tasks/0547, tasks/0794-0797, SPEC-03, SPEC-04 §5 | T601, T602, T603, T604 |
 | `spec/SPEC-71-alias-escape-promotion.md` | draft | T605 | 0131 §86, 0162 §29, 0165 §15-20, 0226 §1-26, tasks/0366, tasks/0395, tasks/0397, tasks/0429, tasks/0436, tasks/0438, tasks/0480, tasks/0486, tasks/0548, tasks/0615, SPEC-10..12, SPEC-70 | T606, T607, T608 |
 | `spec/SPEC-72-loops-scev-bce.md` | draft | T609 | 0113 §94/§122, 0165 §2/§21-30, tasks/0366, tasks/0402, tasks/0416, tasks/0426, tasks/0470, tasks/0549, SPEC-03, SPEC-70, SPEC-71 | T610, T611, T612 |
+| `spec/SPEC-73-inlining-specialization-devirt.md` | draft | T613 | 0131 §28-29/§73-76/§86/§88, 0152 §73-75, 0165 §13-16, tasks/0366, tasks/0400, tasks/0401, tasks/0551, SPEC-03, SPEC-04, SPEC-70, SPEC-71 | T064, T614, T615 |
 | `spec/SPEC-77-regalloc-machine-opt.md` | draft | T627 | 0162 §36-40, 0182, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559, SPEC-04 §6-7 | T063, T628, T629 |
 | `spec/BOOTSTRAP.md` | canonical | T087 | 0167, tasks/0473, 0150 | trust chain, freeze rule (INV-BOOT-004) |
 | `spec/RELEASE-v1.md` | planned | T091 | 0150, 0151, tasks/0602, 0121 | v1.0 release |
@@ -87,6 +88,7 @@ to this table at the next INDEX update.
 | `AXS-ESC-NNN` | escape analysis, storage selection & allocation promotion rules | SPEC-71 |
 | `AXS-LOOP-NNN` | CFG natural loop discovery, canonicalization, SCEV, LICM, loop transformations & iterator fusion rules | SPEC-72 |
 | `AXS-BCE-NNN` | range analysis (`RangeInfo`) & bounds-check elimination (`BCE`) rules | SPEC-72 |
+| `AXS-INL-NNN` | call-graph SCC, copy/move propagation, `SROA`, `RVO`/`NRVO`, function/closure inlining, call-site specialization, devirtualization & tail-call rules | SPEC-73 |
 | `AXS-RA-NNN` | register allocation, liveness, spill/reload & frame integration rules | SPEC-77 |
 | `AXS-MCOPT-NNN` | instruction selection, branchless if-conversion, microarchitectural cost & post-RA machine optimization rules | SPEC-77 |
 | `AXD-NNN` | diagnostics rules | `spec/diagnostics.md` |
@@ -114,9 +116,9 @@ the corpus reuses them (§6).
 | Diagnostics | `spec/diagnostics.md` | tasks/0360, 0146 |
 | Resolver, HIR, modules | SPEC-02 §4, axiom-syntax (DottedChain), ADR-0006 §8 (std root) | 0156, 0244, tasks/0387, tasks/0357, tasks/0497 |
 | Types, literals, arithmetic, panics | SPEC-03 (draft) | 0157, 0175, 0245, tasks/0388, tasks/0327, 0068 |
-| Traits, generics | ADR-0004; task texts T053–T056 | 0158, 0212, tasks/0389, tasks/0611 |
+| Traits, generics | ADR-0004; task texts T053–T056; SPEC-73 (specialization, static vs `dyn` dispatch, devirtualization) | 0158, 0212, tasks/0389, tasks/0401, tasks/0551, tasks/0611 |
 | Ownership, capability, drop | invariants §8; SPEC-10/11/12 (T045) | 0160, 0176, 0177, 0178, tasks/0394, tasks/0395 |
-| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt); SPEC-71 (AliasInfo, EscapeInfo, allocation promotion); SPEC-72 (loops, SCEV, BCE, LICM, iterator fusion) | 0161, 0165, 0226, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0366, tasks/0395, tasks/0397, tasks/0398, tasks/0399, tasks/0402, tasks/0545–0549, tasks/0794–0797 |
+| MIR, verifier, oracle, OptIR | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements; SPEC-70 (OptIR, SSA/MemorySSA, pass contracts, scalar opt); SPEC-71 (AliasInfo, EscapeInfo, allocation promotion); SPEC-72 (loops, SCEV, BCE, LICM, iterator fusion); SPEC-73 (CallGraph/SCC, copy/move prop, SROA, RVO/NRVO, inlining, specialization, devirt, TCO) | 0161, 0165, 0226, 0227, 0247, 0027, 0025, 0031, 0145, tasks/0366, tasks/0395, tasks/0397, tasks/0398, tasks/0399, tasks/0400, tasks/0401, tasks/0402, tasks/0545–0549, tasks/0551, tasks/0794–0797 |
 | LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds); SPEC-77 (RA, isel, machine opt) | 0162, 0179, 0181, 0182, 0184–0187, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559 |
 | Tests and conformance | skill axiom-testing; ADR-0005 §1/§3 | 0166, 0017, 0022, 0026, 0114 |
 | Self-hosting | SPEC-20 (T076), BOOTSTRAP.md (T087) | 0167, 0150, tasks/0259–0262, tasks/0371 |

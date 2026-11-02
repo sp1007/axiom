@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215, T600]
 priority: 106
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-73-inlining-specialization-devirt.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, spec/SPEC-70-optir-ssa-memoryssa.md, 0131, 0165, tasks/0366, tasks/0400, tasks/0401, tasks/0551]
 covers: [REQ-OPT-002, REQ-OPT-003, REQ-OPT-004, REQ-OPT-005, REQ-OPT-006, REQ-OPT-007, REQ-OPT-009, REQ-OPT-066, REQ-OPT-067, REQ-OPT-068, REQ-OPT-069, REQ-OPT-070, REQ-OPT-071, REQ-OPT-072, REQ-OPT-073, REQ-OPT-074, REQ-OPT-075, REQ-OPT-076, REQ-OPT-077, REQ-OPT-078, REQ-OPT-079, REQ-OPT-080, REQ-OPT-081, REQ-OPT-082, REQ-OPT-083, REQ-OPT-084, REQ-OPT-085, REQ-OPT-086]
+started: 2026-11-03 05:12:24
+finished: 2026-11-03 05:26:01
 ---
 # T613 — E15.4 — Canonical inlining, specialization, devirtualization & SROA specification (SPEC-73)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for interprocedural call-graph analysis,
 
 ## Log
 - 2026-11-03 02:41:00 created by T215 (P15 phase planning)
+- 2026-11-03 05:12:24 started (attempt 1) 
+- 2026-11-03 05:26:01 accepted by QA -> done

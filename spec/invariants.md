@@ -318,6 +318,13 @@ added by editing this list.
 - since: T612
 - check: loop/BCE dump and differential conformance tests in tests/run/opt_bce (T610), tests/run/opt_loops (T611), and tests/conformance/p15/e15_3_loops_bce (T612) verify SCEV overflow fidelity, proven BCE vs retained out-of-bounds panics, LICM hoisting and zero-trip trap safety, iterator pipeline fusion, and observable agreement across --interp, -O0, -O1, and -O2
 
+### INV-PIPE-011 — Interprocedural inlining, SROA, specialization, devirtualization, and tail-call safety
+- statement: Call-graph `SCC` summary propagation, ownership-aware copy/move propagation, Scalar Replacement of Aggregates (`SROA`), caller return-slot construction (`RVO`/`NRVO`), function and closure inlining (`@inline`, `@inline(always)`, `@inline(never)`), call-site/generic specialization, `dyn Trait` and function-pointer devirtualization, and tail-call optimization (`@tailcall`) strictly separate legality from `CostModel` profitability, bound recursive `SCC` expansion, retain dynamic dispatch when target identity is not `Certainty.Proven`, and preserve `Drop`, ownership, capability, `atomic`, `volatile`, address-observability, and external FFI/export ABI contracts (SPEC-73 AXS-INL-001..035).
+- source: SPEC-73 AXS-INL-001..035; 0131 §28-29, §73-76, §86, §88 AFN-58; 0152 §73-75; 0165 §13-16; tasks/0366 AOPT-27..38, AOPT-60..62; tasks/0400 AIP-20..70; tasks/0401 AINLINE-20..36, ASPEC-20..35, ADEvirt-20..30, AABST-20..30; tasks/0551 AINLINE-20..95
+- verify: tests/opt2, tests/run/opt_ipa_devirt, tests/conformance/p15/e15_4_inline_specialize_devirt
+- since: T615
+- check: dump and differential conformance tests in tests/opt2 (T064), tests/run/opt_ipa_devirt (T614), and tests/conformance/p15/e15_4_inline_specialize_devirt (T615) verify copy/move propagation, deep SROA, RVO/NRVO, bounded SCC inlining, constant/closure specialization, proven vs open-world devirtualization, O(1)-stack tail-recursion lowering, and observable agreement across --interp, -O0, -O1, and -O2
+
 ## 7. Oracle and agreement
 
 ### INV-ORACLE-001 — Semantics are explicit, not inherited from C
@@ -442,7 +449,7 @@ added by editing this list.
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).
