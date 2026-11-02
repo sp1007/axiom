@@ -106,7 +106,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068 | T217 | T317 | P16 |
-| P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750, T751 | T218 | T318 | P10 |
+| P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | — | T219 | T319 | P18 |
 | P20 build & packages | — | T220 | T320 | P16, P18 |
 | P21 std completion | — | T221 | T321 | P11, P13 |
@@ -265,20 +265,20 @@ Exit: step-through debugging in a standard debugger on Windows and Linux; saniti
 
 ### P18 — Compiler architecture 2.0
 - **E18.1 Query engine / semantic database** — demand-driven queries, cycle handling, invalidation.
-  Src tasks/0530 tasks/0533 tasks/0781 tasks/0384.
+  Src tasks/0530 tasks/0533 tasks/0781 tasks/0384. *(T752–T755)*
 - **E18.2 Incremental compilation** — API/semantic/codegen fingerprints (0152 §78). Src 0142
-  tasks/0778.
-- **E18.3 Parallel compilation** — Src tasks/0530 tasks/0790.
+  tasks/0778. *(T756–T759)*
+- **E18.3 Parallel compilation** — Src tasks/0530 tasks/0790. *(T760–T763)*
 - **E18.4 Artifact format & module interface files** — Axiom object/LTO/semantic package sections.
-  Src tasks/0787 tasks/0739.
-- **E18.5 Pass contracts & proof-carrying transformations** — Src tasks/0578 tasks/0545.
+  Src tasks/0787 tasks/0739. *(T764–T767)*
+- **E18.5 Pass contracts & proof-carrying transformations** — Src tasks/0578 tasks/0545. *(T768–T771)*
 - **E18.7 Windows x64 artifact kinds: static `.lib`, `.dll` + import `.lib`** — owner requirement
   REQ-OWNER-006; first P18 tasks (P18 opens right after P10). COFF archive writer/reader, `--kind
   exe|obj|lib|dll`, PE DLL with exports/DllMain initialiser/.reloc, import-library generation;
   consume third-party .lib/.dll. The C core emits only .obj/.exe but reserves these kinds (SPEC-04).
-  Src 0164 0217 0563 0186 0187 tasks/0369. *(T750, T751)*
+  Src 0164 0217 0563 0186 0187 tasks/0369. *(T772, T750, T751, T773)*
 - **E18.6 Separate compilation, multiple objects, archives, section GC** — Src 0164 0217 0099
-  tasks/0369. *(T067)*
+  tasks/0369. *(T774, T067, T775, T776)*
 Exit: no-op rebuild < 100 ms on the compiler itself; edit-one-private-fn rebuild re-typechecks only
 that module.
 
@@ -414,3 +414,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T213 P13 phase expansion (`P13-low-level-systems-unsafe-frees`): expanded E13.1–E13.7 into 34 new tasks `T500`–`T533` (34 tasks total across 7 epics: E13.1 6 tasks `T500–T505` including `REQ-OWNER-008` `fn_addr`/`static_addr`/`address_of`/`@addr` spec, implementation, and QA conformance plus `T503` ADR-0034 §8 OI-12 external Windows x64 ABI gcc DLL oracle before FFI breadth `T504`; E13.2 5 tasks `T506–T510`; E13.3 5 tasks `T511–T515`; E13.4 5 tasks `T516–T520`; E13.5 4 tasks `T521–T524`; E13.6 5 tasks `T525–T529` for `REQ-OWNER-003` & `REQ-OWNER-008` `@at`/`@addr` fixed-address placement; E13.7 4 tasks `T530–T533` for `REQ-OWNER-005` module-relative bindings), converted all 434 `EPIC(E13.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T313` (`depends: [T213, T500–T533]`) | T213 |
 | 2026-11-03 | T214 P14 phase expansion (`P14-comptime-2-0-reflection-genera`): expanded E14.1–E14.5 into 23 new tasks `T550`–`T572` alongside refined `T058` (24 tasks total across 5 epics: E14.1 6 tasks `T550–T555`; E14.2 5 tasks `T556–T560`; E14.3 5 tasks `T561–T565`; E14.4 5 tasks `T058, T566–T569`; E14.5 3 tasks `T570–T572` for `ADR-0036` §4 / `SPEC-03 AXS-SEM-047` index auto-deref through `view`/`mut_view`), converted all 512 `EPIC(E14.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T314` (`depends: [T214, T058, T550–T572]`) | T214 |
 | 2026-11-03 | T215 P15 phase expansion (`P15-optimizer-2-0`): expanded E15.1–E15.8 into 30 new tasks `T600`–`T629` alongside refined `T063` and `T064` (32 tasks total across 8 epics: E15.1 5 tasks `T600–T604`; E15.2 4 tasks `T605–T608`; E15.3 4 tasks `T609–T612`; E15.4 4 tasks `T064, T613–T615`; E15.5 4 tasks `T616–T619` depending on P12 gate `T312`; E15.6 4 tasks `T620–T623`; E15.7 3 tasks `T624–T626`; E15.8 4 tasks `T063, T627–T629` scheduled first in P15), converted all 405 `EPIC(E15.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T315` (`depends: [T215, T063, T064, T600–T629]`) | T215 |
+| 2026-11-03 | T218 P18 phase expansion (`P18-compiler-architecture-2-0`): expanded E18.1–E18.7 into 25 new tasks `T752`–`T776` alongside refined `T067`, `T750`, and `T751` (28 tasks total across 7 epics: E18.1 4 tasks `T752–T755`; E18.2 4 tasks `T756–T759`; E18.3 4 tasks `T760–T763`; E18.4 4 tasks `T764–T767`; E18.5 4 tasks `T768–T771`; E18.7 4 tasks `T772, T750, T751, T773` scheduled first in P18 for `REQ-OWNER-006` and `ADR-0034` §4 OI-07b GNU `ld` cross-linking; E18.6 4 tasks `T774, T067, T775, T776`), converted all 5,523 `EPIC(E18.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T318` (`depends: [T218, T067, T750–T776]`) | T218 |

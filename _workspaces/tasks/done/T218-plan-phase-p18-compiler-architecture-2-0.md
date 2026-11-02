@@ -8,10 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 6
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 02:52:37
+finished: 2026-11-03 03:09:38
 ---
 # T218 — Plan phase P18: Compiler architecture 2.0
 
@@ -40,3 +42,6 @@ the roadmap is invented.
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-03 02:52:37 started (attempt 1) 
+- 2026-11-03 03:09:38 accepted by QA -> done
