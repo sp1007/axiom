@@ -283,6 +283,20 @@ added by editing this list.
 - since: T025b
 - check: malformed machine IR fixtures are rejected; frames over 4 KiB carry probes
 
+### INV-PIPE-006 — Linear-scan register allocation and frame preservation
+- statement: Post-RA Machine IR contains no virtual registers, satisfies all register-class, fixed-register (`rcx` shifts, `rax`/`rdx` div/mul), and call-clobber constraints, and saves/restores every modified callee-saved register in `FrameLayout` without altering observable program semantics (SPEC-77 AXS-RA-010..027).
+- source: SPEC-77 AXS-RA-010..027; 0182 AREG-20..36, AFRAME-20..30; 0235 ARA-20..44; 0252 ARALLOC-20..60; tasks/0557 AREG-20..51
+- verify: tests/mc/regalloc
+- since: T063
+- check: machine IR and differential run tests in tests/mc/regalloc verify high register pressure, call clobbers, fixed-register constraints, and callee-saved register restoration across -O0, -O1, and -O2
+
+### INV-PIPE-007 — Instruction selection, branchless if-conversion, and post-RA peephole safety
+- statement: Complex instruction selection (`lea` scaled addressing, constant division/modulo), branchless `cmovcc`/`setcc` if-conversion, and post-RA machine peephole rewrites preserve `EFLAGS` liveness, checked-arithmetic traps, and volatile/atomic/alias memory barriers, and pass the Machine IR verifier before encoding (SPEC-77 AXS-MCOPT-001..026).
+- source: SPEC-77 AXS-MCOPT-001..026; 0162 §39-40; 0237 AMOPT-20..42; tasks/0406 AMICRO-20..45; tasks/0553 ACTRL-20..100; tasks/0559 AFINAL-20..50
+- verify: tests/mc/isel_peephole, tests/conformance/p15/e15_8_regalloc_isel
+- since: T629
+- check: machine IR dump and differential conformance tests in tests/mc/isel_peephole (T628) and tests/conformance/p15/e15_8_regalloc_isel (T629) verify lea addressing, branchless cmov diamonds, flag-safe xor/test peepholes, and observable agreement across --interp, -O0, -O1, and -O2
+
 ## 7. Oracle and agreement
 
 ### INV-ORACLE-001 — Semantics are explicit, not inherited from C
@@ -407,7 +421,7 @@ added by editing this list.
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

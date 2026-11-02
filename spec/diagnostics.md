@@ -157,7 +157,12 @@ plus the ICE, writes no artifact (ADIAG-38) and exits with code 3. `data.stage` 
 `data.detail` gives the C source location (`file.c:line`) of the failed check. No stack trace is
 printed by default (tasks/0360 §23). When compiler-built MIR fails the verifier, that is an ICE
 (`AX_ICE_MIR_VERIFY`) with the `AX_VERIFY_*` findings attached as notes. Hand-written MIR that fails
-(T018 parser, `tests/verify`) gets plain `AX_VERIFY_*` errors and exit code 1.
+(T018 parser, `tests/verify`) gets plain `AX_VERIFY_*` errors and exit code 1. Likewise, when
+post-RA or post-peephole Machine IR fails `x64_verify_checked` (`spec/SPEC-77-regalloc-machine-opt.md`,
+rules `AXS-RA-027` and `AXS-MCOPT-026`), the compiler reports `AX_ICE_INTERNAL` (`data.stage = "x64_verify"`)
+and emits no artifact; profitability or legality rejections during instruction selection, branchless
+if-conversion, or peephole optimization fall back to the unoptimized sequence and never emit a user
+diagnostic (`tasks/0553 ACTRL-99`).
 
 **AXD-043 — Exit codes** (driver, T016): 0 means no error (warnings allowed). 1 means at least one
 error diagnostic. 2 means a usage error: the code is one of `AX_DRIVER_USAGE`,
@@ -484,4 +489,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-77; axiom-c-stage0; axiom-testing.

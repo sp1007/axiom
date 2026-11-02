@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T215]
 priority: 89
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-77-regalloc-machine-opt.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0162, 0182, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559]
 covers: [REQ-OPT-015, REQ-OPT-030, REQ-OPT-031, REQ-OPT-032, REQ-OPT-033, REQ-OPT-197, REQ-OPT-198, REQ-OPT-199, REQ-OPT-200, REQ-OPT-201, REQ-OPT-202]
+started: 2026-11-03 03:09:56
+finished: 2026-11-03 03:25:10
 ---
 # T627 — E15.8 — Canonical register allocation, instruction selection & machine optimization specification (SPEC-77)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for linear-scan register allocation, spi
 
 ## Log
 - 2026-11-03 02:44:30 created by T215 (P15 phase planning)
+- 2026-11-03 03:09:56 started (attempt 1) 
+- 2026-11-03 03:25:10 accepted by QA -> done

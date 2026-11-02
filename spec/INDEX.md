@@ -45,8 +45,9 @@ ADR when semantics change), **frozen** (v1.0 freeze at E23.2 / T091; nothing is 
 | `spec/SPEC-10-ownership.md` | planned | T045 | 0004, 0005, 0160, 0176, 0019, 0020, 0086, tasks/0394, 0263 | T018, T046, T047, T050 |
 | `spec/SPEC-11-capability.md` | planned | T045 | 0177, 0021, 0028, tasks/0395, tasks/0541, tasks/0270 | T048, T048b, T050 |
 | `spec/SPEC-12-drop.md` | planned | T045 | 0178, 0030, 0118, tasks/0674 | T049, T054b |
-| `spec/SPEC-20-selfhost.md` | planned | T076 | 0167, 0150, tasks/0260, tasks/0261, tasks/0371, tasks/0473 | T077–T087 |
-| `spec/BOOTSTRAP.md` | planned | T087 | 0167, tasks/0473, 0150 | trust chain, freeze rule (INV-BOOT-004) |
+| `spec/SPEC-20-selfhost.md` | canonical | T076 | 0167, 0150, tasks/0260, tasks/0261, tasks/0371, tasks/0473 | T077–T087 |
+| `spec/SPEC-77-regalloc-machine-opt.md` | draft | T627 | 0162 §36-40, 0182, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559, SPEC-04 §6-7 | T063, T628, T629 |
+| `spec/BOOTSTRAP.md` | canonical | T087 | 0167, tasks/0473, 0150 | trust chain, freeze rule (INV-BOOT-004) |
 | `spec/RELEASE-v1.md` | planned | T091 | 0150, 0151, tasks/0602, 0121 | v1.0 release |
 | `spec/requirements/OWNER.md` | canonical | owner / architect | owner decisions (REQ-OWNER-*) | everyone; never dropped silently |
 | `spec/requirements/raw/C01.md` … `C18.md` | planned | T092 … T109 | the 18 extraction chunks of `docs/base` (`spec/requirements/chunks`) | T110 |
@@ -78,6 +79,8 @@ to this table at the next INDEX update.
 |---|---|---|
 | `AXS-LEX-NNN` | lexical rules | SPEC-01 |
 | `AXS-GRM-NNN` | grammar rules | SPEC-02 |
+| `AXS-RA-NNN` | register allocation, liveness, spill/reload & frame integration rules | SPEC-77 |
+| `AXS-MCOPT-NNN` | instruction selection, branchless if-conversion, microarchitectural cost & post-RA machine optimization rules | SPEC-77 |
 | `AXD-NNN` | diagnostics rules | `spec/diagnostics.md` |
 | `INV-<GROUP>-NNN` | architecture/semantic invariants | `spec/invariants.md` |
 | `AX_<AREA>_<NAME>` | diagnostic codes (18 areas) | `spec/diagnostics.md` §3, §10–11; registry `bootstrap/axiom0/src/diag/codes/<AREA>.def` |
@@ -106,7 +109,7 @@ the corpus reuses them (§6).
 | Traits, generics | ADR-0004; task texts T053–T056 | 0158, 0212, tasks/0389, tasks/0611 |
 | Ownership, capability, drop | invariants §8; SPEC-10/11/12 (T045) | 0160, 0176, 0177, 0178, tasks/0394, tasks/0395 |
 | MIR, verifier, oracle | invariants §6–7; ADR-0002; SPEC-10..12 MIR requirements | 0161, 0227, 0247, 0027, 0025, 0031, 0145 |
-| LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds) | 0162, 0179, 0181, 0184–0187 |
+| LIR, ABI, x86-64, COFF, PE | ADR-0003; skill axiom-x64-backend; SPEC-04 (object model, artifact kinds); SPEC-77 (RA, isel, machine opt) | 0162, 0179, 0181, 0182, 0184–0187, 0235, 0237, 0252, tasks/0406, tasks/0553, tasks/0557, tasks/0559 |
 | Tests and conformance | skill axiom-testing; ADR-0005 §1/§3 | 0166, 0017, 0022, 0026, 0114 |
 | Self-hosting | SPEC-20 (T076), BOOTSTRAP.md (T087) | 0167, 0150, tasks/0259–0262, tasks/0371 |
 | Fixed addresses, module-relative bindings | ADR-0001, OWNER.md | 0071, 0044, 0097, tasks/0328 |
