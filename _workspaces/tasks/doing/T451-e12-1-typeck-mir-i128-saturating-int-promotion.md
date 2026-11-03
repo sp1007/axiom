@@ -14,7 +14,7 @@ paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mi
 locks: [compiler/verify/verifier.ax, compiler/diag/code.ax]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-OWNER-007, REQ-SIMD-247, REQ-SIMD-263, REQ-SIMD-268, REQ-SIMD-318]
-started: 2026-11-03 09:58:12
+started: 2026-11-03 22:52:04
 agent: T451-impl
 ---
 # T451 — E12.1 — Frontend, typeck & MIR lowering for i128/u128, saturating ops & integer promotion lattice
@@ -46,3 +46,5 @@ Activate `TypeKind.Int128` (`i128`, `u128`), `ConstValue.Int128`, and `MirBinOp.
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-03 09:58:12 started (attempt 1) T451-impl
+- 2026-11-03 22:51:47 requeue: restart (not charged: attempt refunded)
+- 2026-11-03 22:52:04 started (attempt 1) T451-impl

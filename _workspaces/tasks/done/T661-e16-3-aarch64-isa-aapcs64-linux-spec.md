@@ -6,14 +6,16 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T216, T313, T653]
+depends: [T216, T511, T653]
 priority: 104
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-83-aarch64-linux.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-81-target-desc-isa-conformance.md, 0193, tasks/0521, tasks/0784]
 covers: [REQ-TGT-113, REQ-TGT-114, REQ-TGT-115, REQ-TGT-116, REQ-TGT-117, REQ-TGT-118, REQ-TGT-119, REQ-TGT-120, REQ-TGT-121, REQ-TGT-122]
+started: 2026-11-03 22:52:04
+finished: 2026-11-03 23:18:03
 ---
 # T661 — E16.3 — Canonical AArch64 ISA backend, AAPCS64 ABI & aarch64-linux ELF64 specification (SPEC-83)
 
@@ -43,3 +45,7 @@ Consolidate the canonical specification for Axiom's AArch64 (ARM64) backend arch
 
 ## Log
 - 2026-11-03 08:38:00 created by T216 (P16 phase planning)
+- 2026-11-03 15:22:57 started (attempt 1) 
+- 2026-11-03 21:09:29 requeue: 429 RESOURCE_EXHAUSTED: Individual quota reached (infrastructure failure: attempt refunded)
+- 2026-11-03 22:52:04 started (attempt 1) T661-impl
+- 2026-11-03 23:18:03 accepted by QA -> done
