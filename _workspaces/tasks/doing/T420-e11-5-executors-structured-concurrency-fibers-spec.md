@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T410, T415]
 priority: 143
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-34-executors-fibers.md]
 locks: [spec/INDEX.md, spec/SPEC-04-core-extensibility.md]
 spec: [0202, 0204, 0205, tasks/0277, tasks/0278, tasks/0620, tasks/0621, tasks/0834, tasks/0835, tasks/0836]
 covers: [REQ-CONC-023, REQ-ASY-036, REQ-ASY-040, REQ-ASY-051, REQ-ASY-060, REQ-ASY-067, REQ-ASY-068, REQ-ASY-089, REQ-ASY-094, REQ-ASY-149, REQ-CONC-149, REQ-ASY-156, REQ-CONC-200, REQ-ASY-161, REQ-ASY-162, REQ-ASY-163, REQ-ASY-164]
+started: 2026-11-03 07:37:44
 ---
 # T420 — E11.5 — Canonical executors, structured concurrency & fiber specification (SPEC-34)
 
@@ -45,3 +46,4 @@ Write canonical `spec/SPEC-34-executors-fibers.md` (`AXS-EXEC-*` rule IDs) speci
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 07:37:44 started (attempt 1) 

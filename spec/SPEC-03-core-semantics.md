@@ -15,19 +15,21 @@ axiom0/axiomc **phải cho cùng một kết quả**. Các quyết định chín
 - **`main`**: `fn main()` (thoát 0), `fn main() -> i32` hoặc `-> u32` (mã thoát = giá trị),
   `-> never`.
 - **Thứ tự đánh giá** trái sang phải; phép gán đánh giá vế phải trước rồi mới tới vị trí đích;
-  `&&`/`||` ngắn mạch.
+  `&&`/`||` ngắn mạch; truy cập chỉ số `a[i]` qua `view<[N]T>` / `mut_view<[N]T>` tự giải tham
+  chiếu từng mức như truy cập trường (`AXS-SEM-047`, `E14.5`), trong khi con trỏ thô `p[i]` luôn bị
+  từ chối (`AX_TYPE_CANNOT_INDEX`).
 - **Bảng ép kiểu `as`** đầy đủ (số nguyên cắt bớt theo modulo; `u8 as char` luôn hợp lệ; `u32 as
   char` có kiểm tra; `char as u32`; `enum as uN` cho enum không có trường).
 - Oracle có **giới hạn số bước** mặc định 50 triệu (`--step-limit`), vượt thì báo
   `AX_DRIVER_INTERP_STEP_LIMIT`, mã thoát 124.
 Mỗi quy tắc có mã `AXS-SEM-NNN` để test và code tham chiếu.
 
-Status: canonical (T003, 2026-10-04). Decisions: ADR-0012 (this spec), ADR-0004 §1 (wrapping/bit
+Status: canonical (T003, 2026-10-04; updated T570, 2026-11-03 for E14.5 `AXS-SEM-047`). Decisions: ADR-0012 (this spec), ADR-0004 §1 (wrapping/bit
 intrinsics), ADR-0006 §2-3 (char cast, built-in helpers), ADR-0002 §5 (pointer↔integer in the
-oracle). Syntax: `spec/SPEC-01-lexical.md`, `spec/SPEC-02-grammar.md`. Milestones (which task
+oracle), ADR-0036 §1/§4 (assignment drop through views vs raw stores, index auto-deref through views). Syntax: `spec/SPEC-01-lexical.md`, `spec/SPEC-02-grammar.md`. Milestones (which task
 delivers which rule): `spec/SPEC-00-bootstrap.md`. Ownership, capabilities and drop: SPEC-10..12
 (T045). Consumers: T017 (typing), T019 (MIR building), T020 (verifier), T021 (oracle), T023–T025b
-(native lowering), T030–T043 (language core), T061 (const evaluation), the ports in P10.
+(native lowering), T030–T043 (language core), T061 (const evaluation), the ports in P10, E14.5 (`T570`–`T572`).
 
 Diagnostic code names below follow `AX_<AREA>_<NAME>`; the registry `spec/diagnostics.md` (T002)
 is authoritative for areas, and each implementing task registers its codes in its area file.
@@ -36,14 +38,17 @@ is authoritative for areas, and each implementing task registers its codes in it
 
 ## 1. Principles
 
-**AXS-SEM-001 — One semantics, two executors.** Every rule here is target-independent. The MIR
+**AXS-SEM-001 — One semantics, two executors.** Every rule here is target-independent. MIR is the
+target-independent semantic executable boundary before verification and optimisation (`AMIR-85`,
+`AMIR-90`): it does not determine physical storage strategy, stack-versus-heap placement, general
+register allocation, or vector register usage (`AMIR-81..84`). The MIR
 interpreter (T021) is the reference: native code at every optimisation level must produce the same
 observable behaviour (AXS-SEM-003) for every program accepted by the type checker. Neither executor
 may inherit behaviour from the host C compiler (overflow, shifts, division, signed char, ...).
 While a feature's native support is still missing, axiom0 refuses to build the program
 (`AX_DRIVER_NOT_YET_SUPPORTED`, AXD-014) rather than produce code that differs; no check is ever
 dropped (SPEC-00 AXS-BOOT-006/007).
-[0263 §25; tasks/0262 §10; tasks/0260 ABOOT-48, ABOOT-76; 0032 §50 AES-27]
+[0263 §25; tasks/0262 §10; tasks/0260 ABOOT-48, ABOOT-76; 0032 §50 AES-27; tasks/0539 §89 AMIR-80..85, AMIR-90; REQ-CORE-3050..3055, REQ-CORE-3060]
 
 **AXS-SEM-002 — No undefined behaviour in safe code.** A program that uses no `unsafe` has no
 undefined behaviour: every operation either produces its defined result, panics (§7), or is rejected
@@ -196,10 +201,14 @@ performs its check (overflow, division, shift) and operation. [0032 §1-3; 0010 
 name), then the arguments left to right, then transfers control. A method call `r.m(a, b)`
 evaluates the receiver first, then `a`, then `b`. [0041 §35-36]
 
-**AXS-SEM-042 — Places.** For `base[i]`: evaluate the base place, then `i`, then the bounds check
-(`0 <= i < len`, otherwise panic `index out of bounds`), then the access. The index operand has type
-`usize` (an unsuffixed literal is typed `usize`). Field and tuple-index projections evaluate the
-base place only. [0010 §13, §18; 0032 §33; T036]
+**AXS-SEM-042 — Places.** For `base[i]`: evaluate the base place (including any implicit view
+dereferences, AXS-SEM-047), then `i`, then the bounds check (`0 <= i < len`, otherwise panic
+`index out of bounds`), then the access. The index operand has type `usize` (an unsuffixed literal
+is typed `usize`; in `axiomc`, narrower unsigned integers promote via `SPEC-40 AXS-INT-053`). For
+chained or multidimensional indexing `base[i][j]`, each indexing step evaluates its base, evaluates
+its index, and performs its bounds check in left-to-right order before proceeding to the next step.
+Field and tuple-index projections evaluate the base place only. [0010 §13, §18; 0032 §33; T036;
+tasks/0539 §89 AMIR-79]
 
 **AXS-SEM-043 — Assignment.** `place = rhs`: (1) evaluate `rhs` to a value; (2) evaluate the
 operands of `place` left to right (base, index expressions) and perform its bounds checks; (3)
@@ -209,9 +218,9 @@ transform(x)` reads the old `x`. [0032 §7-8; 0041 §37, §39]
 Which places "hold" a value for step (3) (ADR-0036 §1, SPEC-12 AXS-DROP-007): every place whose
 projection chain contains no dereference of a raw pointer — locals, fields, tuple fields, array and
 slice elements, and places reached through a `view`/`mut_view` (explicit `*m`, auto-deref `w.f`,
-`self.f` with `self: mut_view<Self>`, an element of a `mut_view<[T]>`) drop their old value. A
+`self.f` with `self: mut_view<Self>`, an element `a[i]` of a `mut_view<[N]T>` or `mut_view<[T]>`) drop their old value. A
 place whose chain contains a `Deref` of `*mut T`/`*const T` (including auto-deref `p.f` with
-`p: *mut S`) is a **raw store**: steps (1), (2), (4) only — the old bytes are overwritten and never
+`p: *mut S` or explicit `(*p)[i]` inside `unsafe`) is a **raw store**: steps (1), (2), (4) only — the old bytes are overwritten and never
 dropped (raw pointers may target uninitialised memory; call `drop_in_place` first to drop).
 The classification follows the types along the projection path, not the syntax.
 
@@ -229,14 +238,37 @@ exactly one branch. `match s { … }` evaluates `s` once; arms are tried top to 
 evaluated only after its pattern matched, and the next arm is tried if it is `false`. A `while`
 condition is evaluated before each iteration. [0041 §9, §14, §23]
 
-**AXS-SEM-047 — Index through a view.** If the base of `base[i]` has type `view<X>` or
-`mut_view<X>` where `X` is an array `[N]T` (or another view of one), the base is dereferenced
-implicitly, one level at a time, exactly as for field access: `a[i]` means `(*a)[i]`. Reading needs
-`view` or `mut_view`; assigning to `a[i]` needs `mut_view`. A raw-pointer base is never
-auto-dereferenced (`p[i]` on `p: *mut [N]T` is `AX_TYPE_CANNOT_INDEX`; write `(*p)[i]` inside
-`unsafe`). Status: specified; implemented in axiomc after self-hosting (ROADMAP E14.5, R7). Until
-then `AX_TYPE_CANNOT_INDEX` with the hint `write (*a)[i]` is conforming for axiom0 and axiomc v0.1.
-[ADR-0036 §4; T141 QA N3]
+**AXS-SEM-047 — Index through a view.** If the base of `base[i]` (or range slice `base[lo..hi]`) has
+type `view<X>` or `mut_view<X>` where `X` resolves (after one or more view levels) to an array
+`[N]T` or a slice `[T]`, the base is dereferenced implicitly, one level at a time, exactly as for
+field access: `a[i]` means `(*a)[i]` (and `(**a)[i]` for nested views `view<view<[N]T>>`).
+- **Mutability:** Reading `a[i]` is valid when every traversed view level is `view` or `mut_view`.
+  Assigning `a[i] = v` (`AXS-SEM-043`), compound-assigning `a[i] op= v` (`AXS-SEM-044`), or taking
+  `mut_view(a[i])` requires every traversed view level along the base chain to be `mut_view`; if
+  any traversed level is an immutable `view` (for example `a: view<[N]T>` or
+  `a: mut_view<view<[N]T>>`), the compiler rejects the mutation with `AX_TYPE_ASSIGN_IMMUTABLE` (or
+  `AX_CAP_CONFLICT_MUT` when taking `mut_view(a[i])`).
+- **Evaluation order, bounds checks, and `Drop`:** `typeck` resolves the implicit view dereference
+  steps in Typed HIR (`THIR`), and MIR lowering consumes those `THIR` semantic facts without
+  rediscovering source-level meaning (`AMIR-86..87`) to emit explicit `PlaceElem.Deref`
+  (`MIR_PROJ_DEREF`) projections before `PlaceElem.Index` (`MIR_PROJ_INDEX`) on the MIR place
+  projection chain. The base and index evaluate left to right with the bounds check of
+  `AXS-SEM-042` (`0 <= i < N`, panicking with `index out of bounds` on failure). Because the
+  projection chain `Local(a) -> Deref -> Index(i)` contains only view dereferences and no
+  raw-pointer `Deref`, assigning `a[i] = v` through `mut_view<[N]T>` drops the old element value at
+  step (3) of `AXS-SEM-043` (`SPEC-12 AXS-DROP-007`), and the authoritative MIR verifier analyzes
+  ownership, capability, and drop state directly on that verified projection chain (`AMIR-88..90`).
+- **No raw-pointer index auto-deref:** A raw-pointer base (`p: *const [N]T`, `p: *mut [N]T`,
+  `p: *const T`, `p: *mut T`, or a view chain terminating at a raw pointer) is **never**
+  auto-dereferenced for indexing: `p[i]` is rejected at compile time with `AX_TYPE_CANNOT_INDEX`
+  (with help `write (*p)[i]` inside `unsafe`), avoiding silent C-style pointer-offset indexing.
+  Inside an `unsafe` block, explicit `(*p)[i]` on `p: *mut [N]T` is valid and its projection chain
+  contains a raw-pointer `Deref`, so `(*p)[i] = v` is a raw store (`AXS-SEM-043` / `AXS-DROP-007`)
+  that overwrites without dropping.
+- **Delivery:** Active in `axiomc` (`ROADMAP E14.5`: spec `T570`, implementation `T571`, conformance
+  `T572`); `bootstrap/axiom0` stays frozen at `axiom0-frozen` per `ROADMAP R3` (where `(*a)[i]` is
+  used in Stage-0-compiled compiler sources).
+[ADR-0036 §1, §4; T141 QA N3; tasks/0539 §89 AMIR-83..90; REQ-CORE-3053..3060]
 
 ## 6. Casts (`as`)
 
@@ -382,6 +414,11 @@ Each line: program fragment → expected result in both executors (`exit` = proc
 | SEM-T16 | `let a: i32 = 1` ↵ `let b: i64 = a` | compile error `AX_TYPE_MISMATCH` | 022 |
 | SEM-T17 | `let c = 'a'` ↵ `return (c as u8) as i32` | compile error `AX_TYPE_INVALID_CAST` | 060 |
 | SEM-T18 | `return rotate_left(0x81u8, 9) as i32` | exit 3 | 031 |
+| SEM-T20 | `let a: [3]i32 = [10, 20, 30]` ↵ `let v: view<[3]i32> = view(a)` ↵ `return v[1] - 20` | exit 0 | 042, 047 |
+| SEM-T21 | `let mut a: [3]i32 = [10, 20, 30]` ↵ `let mv: mut_view<[3]i32> = mut_view(a)` ↵ `mv[1] = 25` ↵ `mv[1] += 5` ↵ `return a[1] - 30` | exit 0 | 042, 043, 044, 047 |
+| SEM-T22 | `let a: [2]i32 = [1, 2]` ↵ `let v: view<[2]i32> = view(a)` ↵ `let i: usize = 2` ↵ `return v[i]` | panic, exit 101 | 042, 047, 070 |
+| SEM-T23 | `let a: [2]i32 = [1, 2]` ↵ `let v: view<[2]i32> = view(a)` ↵ `v[0] = 9` ↵ `return 0` | compile error `AX_TYPE_ASSIGN_IMMUTABLE` | 043, 047 |
+| SEM-T24 | `let mut a: [2]i32 = [1, 2]` ↵ `let p: *mut [2]i32 = unsafe { address_of_mut(a) }` ↵ `return unsafe { p[0] }` | compile error `AX_TYPE_CANNOT_INDEX` | 047 |
 
 Evaluation-order test (SEM-T19). It needs `let mut`, compound assignment, arrays and block
 expressions (T030–T036), so it belongs to the P5 milestone (T044 conformance). Expected exit 34 in
@@ -397,5 +434,28 @@ fn main() -> i32 {
     a[{ n = step(n, 2); 0 }] = { n = step(n, 1); 7 }
     a[{ n = step(n, 4); 1 }] += { n = step(n, 3); 1 }
     n - 1200
+}
+```
+
+Index auto-deref and assignment-drop test (SEM-T25, E14.5 `T571`–`T572`). Assigning `mv[0] = Tracked { id: 9 }` through `mv: mut_view<[2]Tracked>` evaluates the new `Tracked` value first, auto-dereferences `mv` (`(*mv)[0]`), drops the old element (`id: 1`, AXS-SEM-043 / SPEC-12 AXS-DROP-007), and stores `id: 9`; at scope end the array drops `id: 2` and `id: 9` in element order:
+
+```axiom
+struct Tracked { id: i32 }
+
+impl Drop for Tracked {
+    fn drop(self: mut_view<Tracked>) {
+        println(self.id)
+    }
+}
+
+fn overwrite_first(mv: mut_view<[2]Tracked>) -> i32 {
+    mv[0] = Tracked { id: 9 }
+    mv[0].id + mv[1].id
+}
+
+fn main() -> i32 {
+    let mut arr: [2]Tracked = [Tracked { id: 1 }, Tracked { id: 2 }]
+    let sum = overwrite_first(mut_view(arr))
+    sum - 11
 }
 ```

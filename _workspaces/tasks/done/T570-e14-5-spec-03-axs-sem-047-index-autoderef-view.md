@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T214]
 priority: 191
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-03-core-semantics.md]
 locks: [spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-12-drop.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md]
 covers: [REQ-CORE-3053, REQ-CORE-3054, REQ-CORE-3055]
+started: 2026-11-03 07:37:44
+finished: 2026-11-03 07:49:17
 ---
 # T570 — E14.5 — Finalize SPEC-03 AXS-SEM-047 index auto-deref through view/mut_view (retire bootstrap v0.1 note)
 
@@ -40,3 +42,5 @@ Update `spec/SPEC-03-core-semantics.md` `AXS-SEM-047` to mark one-level-at-a-tim
 
 ## Log
 - 2026-11-03 02:24:30 created by T214 (P14 phase planning)
+- 2026-11-03 07:37:44 started (attempt 1) 
+- 2026-11-03 07:49:17 accepted by QA -> done

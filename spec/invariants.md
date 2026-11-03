@@ -250,22 +250,22 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 ## 6. Pipeline and verifier boundary
 
 ### INV-PIPE-001 — Fixed pipeline, no shortcuts
-- statement: Every program goes Source → Lexer → Parser → AST → Resolver → HIR → Typeck → THIR → ownership/capability → MIR (+ drop elaboration) → Verifier → {Interpreter | Optimizer → LIR → machine IR → Encoder → Object → Linker}. No stage is skipped, no machine code is generated from AST or HIR, and there is no textual assembly in the production path.
-- source: 0152 (pipeline); 0263 §28; ABOOT-46; skill axiom-spec-index
+- statement: Every program goes Source → Lexer → Parser → AST → Resolver → HIR → Typeck → THIR → ownership/capability → MIR (+ drop elaboration) → Verifier → {Interpreter | Optimizer → LIR → machine IR → Encoder → Object → Linker}. No stage is skipped, no machine code is generated from AST or HIR, and there is no textual assembly in the production path. MIR is target-independent and independent of physical storage strategy, stack-vs-heap placement, general register allocation, and vector register usage, and MIR lowering consumes Typed HIR (`THIR`) semantic facts without rediscovering source-level meaning (`SPEC-03` AXS-SEM-001, AXS-SEM-047).
+- source: 0152 (pipeline); 0263 §28; ABOOT-46; tasks/0539 §89 AMIR-81..87; REQ-CORE-3051..3057; skill axiom-spec-index
 - verify: tools/archcheck.py
 - since: T006
 - check: enforced structurally through INV-LAYER-005; driver stage list in `driver/pipeline.c` (T016)
 
 ### INV-PIPE-002 — Verified MIR is the checkpoint
 - statement: The interpreter, the optimizer and MIR-to-LIR lowering consume only MIR that passed the verifier in the same compilation. The driver refuses to go on with unverified MIR.
-- source: 0153 APASS-23; tasks/0260 ABOOT-47; T020; T050
+- source: 0153 APASS-23; tasks/0260 ABOOT-47; tasks/0539 §89 AMIR-90; REQ-CORE-3060; T020; T050
 - verify: tests/verify
 - since: T020
 - check: hand-written invalid MIR is rejected with `AX_VERIFY_*` and never executed
 
 ### INV-PIPE-003 — The verifier does not trust the analyses
 - statement: The verifier re-checks move, drop and view invariants on the MIR itself and does not rely on the results of the analyses that produced it.
-- source: T050; 0027; 0029
+- source: T050; 0027; 0029; tasks/0539 §89 AMIR-88..89; REQ-CORE-3058..3059
 - verify: tests/verify/own
 - since: T050
 - check: hand-written MIR with a double drop, a use after move and a missing drop is rejected
@@ -406,6 +406,13 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 - verify: tests/ui/ptr
 - since: T061a
 - check: ui tests produce `AX_UNSAFE_REQUIRED`; ownership errors still reported inside `unsafe`
+
+### INV-SEM-007 — Index auto-deref through views vs raw-pointer indexing and store-drop rules
+- statement: Indexing `base[i]` where `base` has type `view<X>` or `mut_view<X>` and `X` resolves (after one or more view levels) to `[N]T` or `[T]` implicitly dereferences `base` one level at a time (`a[i]` lowers in MIR to explicit `Deref` projections before `Index` consumed from Typed HIR / THIR facts, without rediscovering source semantics or determining physical storage or register allocation); reading requires `view` or `mut_view`, mutating (`a[i] = v`, `a[i] op= v`, `mut_view(a[i])`) requires every traversed view level to be `mut_view` (`AX_TYPE_ASSIGN_IMMUTABLE`), assigning through `mut_view` drops the old element value (`AXS-SEM-043`, `AXS-DROP-007`), and raw-pointer bases (`*const [N]T`, `*mut [N]T`, `*const T`, `*mut T`) are never auto-dereferenced for indexing (`AX_TYPE_CANNOT_INDEX`) while explicit `(*p)[i] = v` inside `unsafe` is a raw store that never drops the old value (SPEC-03 AXS-SEM-042/043/047, SPEC-12 AXS-DROP-007).
+- source: ADR-0036 §1, §4; SPEC-03 AXS-SEM-042, AXS-SEM-043, AXS-SEM-047; SPEC-12 AXS-DROP-007; tasks/0539 §89 AMIR-83..90; REQ-CORE-3053..3060
+- verify: tests/run/index_autoderef, tests/ui/index_autoderef, tests/conformance/p14/e14_5_index_autoderef
+- since: T572
+- check: execution, UI diagnostic, and conformance tests in tests/run/index_autoderef (T571), tests/ui/index_autoderef (T571), and tests/conformance/p14/e14_5_index_autoderef (T572) verify view/mut_view index auto-deref, evaluation order, bounds checks, old-element Drop on assignment, rejection of writes through immutable views (`AX_TYPE_ASSIGN_IMMUTABLE`), and rejection of raw-pointer indexing (`AX_TYPE_CANNOT_INDEX`)
 
 ## 9. Bootstrap scope
 
@@ -559,7 +566,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

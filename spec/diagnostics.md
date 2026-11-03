@@ -488,7 +488,8 @@ variants. Each is appended to its area file by the task named (AXD-032).
 
 | Code | Sev | Task | Meaning |
 |---|---|---|---|
-| `AX_TYPE_ASSIGN_IMMUTABLE` | E | T030 | assignment to a binding not declared `mut` |
+| `AX_TYPE_ASSIGN_IMMUTABLE` | E | T030/T571 | assignment to a binding not declared `mut`, or through an immutable `view` (`w.f = v`, `*v = x`, or `a[i] = v` where any traversed view level is `view`; `SPEC-03` AXS-SEM-043, AXS-SEM-047) |
+| `AX_TYPE_CANNOT_INDEX` | E | T036/T571 | indexing `base[i]` where `base` is not an array `[N]T`, slice view, `Str`, `view`/`mut_view` chain resolving to `[N]T`/`[T]` in `axiomc`, or `Index` impl — including raw pointers `*const [N]T`, `*mut [N]T`, `*const T`, `*mut T` which are never auto-dereferenced for indexing (`SPEC-03` AXS-SEM-042, AXS-SEM-047; help `write (*p)[i]` inside `unsafe`) |
 | `AX_PAT_NONEXHAUSTIVE` | E | T038 | `match` misses patterns (`data.missing` lists them) |
 | `AX_PAT_UNREACHABLE` | W | T038 | an arm can never match |
 | `AX_PAT_REFUTABLE` | E | T038b | refutable pattern where an irrefutable one is required |
@@ -534,4 +535,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
