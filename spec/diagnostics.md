@@ -563,9 +563,23 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_TYPE_MMIO_WRITE_READONLY` | E | T508/T509 | writing to or calling `.write`/`.modify` on a read-only `MmioRO<T>` register field (`SPEC-51` AXS-MEM-005..006, AXS-MEM-050) |
 | `AX_TYPE_MMIO_READ_WRITEONLY` | E | T508/T509 | reading from or calling `.read`/`.modify` on a write-only `MmioWO<T>` register field (`SPEC-51` AXS-MEM-005..006, AXS-MEM-050) |
 | `AX_UNSAFE_INVALID_VOLATILE_WIDTH` | E | T508/T509 | `volatile_load`/`volatile_store`/`Volatile<T>` instantiated with `!Copy`, or `Mmio*<T>` instantiated with `size_of<T>() not in {1, 2, 4, 8}` (`SPEC-51` AXS-MEM-002, AXS-MEM-005, AXS-MEM-050) |
+| `AX_DRIVER_INVALID_PROFILE` | E | T512 | unknown `--profile <name>` or `axiom.toml` `profile` value outside `{hosted, freestanding, kernel, system}` (exit code 2; `SPEC-52` AXS-FRE-002, AXS-FRE-050) |
+| `AX_DRIVER_PROFILE_FORBIDDEN_CAP` | E | T512 | reachable function in `--profile freestanding` or `--profile kernel` transitively requires a forbidden runtime capability (`os_io`, `os_env_process`, `thread`, `blocking`, `async_reactor`, `tls`, `unwind`, or `heap_alloc` without `@global_allocator`) (`SPEC-52` AXS-FRE-022, AXS-FRE-050) |
+| `AX_NAME_FREESTANDING_FORBIDDEN_IMPORT` | E | T512 | importing a hosted Layer-3 OS module (`std.os`, `std.io`, `std.fs`, `std.net`, `std.process`, `std.thread`, `std.env`, `std.time`) in `--profile freestanding` or `--profile kernel` (`SPEC-52` AXS-FRE-003, AXS-FRE-050) |
+| `AX_TYPE_ENTRY_MISSING` | E | T512 | executable compiled in `--profile freestanding` or `--profile kernel` defines no `@entry` function (`SPEC-52` AXS-FRE-010, AXS-FRE-050) |
+| `AX_TYPE_DUPLICATE_ENTRY` | E | T512 | more than one `@entry` function defined in the compilation unit (`SPEC-52` AXS-FRE-010, AXS-FRE-050) |
+| `AX_TYPE_ENTRY_SIGNATURE` | E | T512 | `@entry` function is generic, `async`, or has an invalid parameter/return signature (`SPEC-52` AXS-FRE-010, AXS-FRE-050) |
+| `AX_TYPE_INVALID_PANIC_HANDLER` | E | T512 | `@panic_handler` function is generic, `async`, or does not have signature `fn(view<PanicInfo>) -> never` / `fn() -> never` (`SPEC-52` AXS-FRE-011, AXS-FRE-050) |
+| `AX_TYPE_DUPLICATE_PANIC_HANDLER` | E | T512 | more than one `@panic_handler` function defined in the binary (`SPEC-52` AXS-FRE-011, AXS-FRE-050) |
+| `AX_TYPE_INVALID_GLOBAL_ALLOCATOR` | E | T512/T514 | `@global_allocator` attached to a non-`static` item or a type not implementing `GlobalAlloc` / `Allocator` (`SPEC-52` AXS-FRE-012, AXS-FRE-050) |
+| `AX_TYPE_DUPLICATE_GLOBAL_ALLOCATOR` | E | T512/T514 | more than one `@global_allocator` item defined in the binary (`SPEC-52` AXS-FRE-012, AXS-FRE-050) |
+| `AX_TYPE_INVALID_NAKED_FN` | E | T512/T513 | `@naked` function is not declared `unsafe`, is `async`, or allocates local stack frame slots (`SPEC-52` AXS-FRE-013, AXS-FRE-050) |
+| `AX_TYPE_INVALID_SECTION` | E | T512/T513 | `@section("...")` or `@used` applied to a non-`fn`/non-`static` item, or `@section` given an invalid section name (`SPEC-52` AXS-FRE-014, AXS-FRE-050) |
+| `AX_UNSAFE_INTERRUPT_FORBIDDEN_OP` | E | T512 | `extern "interrupt"` handler directly or transitively performs heap allocation (`heap_alloc`), blocking (`blocking`), thread creation (`thread`), `.await` (`async`), or OS I/O (`os_io`) (`REQ-ABI-102`, `SPEC-52` AXS-FRE-016, AXS-FRE-050) |
+| `AX_CAP_DMA_ACTIVE_CONFLICT` | E | T513/T514 | CPU `view<T>` or `mut_view<T>` access attempted on a `DmaBuffer<T>` while an active `DmaTransfer<T>` owns the buffer (`REQ-CAP-140`, `REQ-CAP-143`, `SPEC-52` AXS-FRE-005, AXS-FRE-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

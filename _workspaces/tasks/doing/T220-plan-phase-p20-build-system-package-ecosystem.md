@@ -6,13 +6,14 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T316, T318]
-priority: 6
-status: todo
-attempts: 0
+depends: [T087]
+priority: 20
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
 covers: [REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-03 10:05:18
 ---
 # T220 — Plan phase P20: Build system & package ecosystem
 
@@ -43,3 +44,4 @@ the roadmap is invented.
 
 ## Log
 - 2026-10-06 02:24:26 covers += REQ-PKG-024, REQ-PKG-025 (metadata only)
+- 2026-11-03 10:05:18 started (attempt 1) 

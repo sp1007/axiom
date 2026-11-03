@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T213]
 priority: 160
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-52-freestanding-runtime-composition.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, 0143, 0097, tasks/0358, tasks/0359, tasks/0370, tasks/0455]
 covers: [REQ-ABI-031, REQ-ABI-102]
 started: 2026-11-03 10:00:49
+finished: 2026-11-03 10:14:13
 ---
 # T511 — E13.3 — Canonical runtime composition, hosted vs freestanding profiles, @entry & capability graph specification (SPEC-52)
 
@@ -44,3 +45,4 @@ Specify Axiom's modular runtime composition model, `hosted`, `freestanding`, `ke
 ## Log
 - 2026-11-03 02:02:00 created by T213 (P13 phase planning)
 - 2026-11-03 10:00:49 started (attempt 1) 
+- 2026-11-03 10:14:13 accepted by QA -> done

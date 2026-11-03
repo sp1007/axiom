@@ -52,7 +52,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
 data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, and x86-64 SSE2/AVX2/VEX encoding (`SPEC-42`, `SPEC-43`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
-address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`). A new group is added by editing this list.
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -476,9 +476,9 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 ### INV-CONC-001 — `Send` and `Share` are independent, zero-cost marker auto-traits
 - statement: `Send` (cross-context ownership transfer) and `Share` (concurrent shared read access via `view<T>`) are tracked as independent semantic properties (`Send != Share`). They are structurally synthesized for composite types, require `unsafe impl` for positive manual overrides, allow safe `impl !Send`/`impl !Share` opt-outs, and are completely erased after semantic checking with zero runtime representation or overhead (SPEC-30 AXS-CONC-010..019).
 - source: 0033; 0126 §5-§7; 0136 §101+; 0160 §27; tasks/0298; tasks/0482; SPEC-30 AXS-CONC-010..019
-- verify: tests/unit/sema/send_share, tests/ui/send_share
+- verify: tests/ui/concurrency/send_share, tests/run/concurrency/send_share
 - since: T089
-- check: unit and ui tests verify structural auto-derivation, `Send != Share` independence, `unsafe impl` requirement (`AX_CONC_SAFE_IMPL_MARKER`), negative impls, and zero runtime descriptor emission
+- check: UI and execution tests in tests/ui/concurrency/send_share and tests/run/concurrency/send_share verify structural auto-derivation, `Send != Share` independence, `unsafe impl` requirement (`AX_CONC_SAFE_IMPL_MARKER`), negative impls, and zero runtime descriptor emission
 
 ### INV-CONC-002 — Spawn and escaping closures enforce move ownership and forbid non-static views
 - statement: Closure `Send`/`Share` traits derive from execution-relevant captured fields. Unscoped `spawn` requires explicit `move` ownership transfer without implicit cloning of `!Copy` values and rejects any non-`'static` `view<T>` or `mut_view<T>` escape (`AX_CONC_ESCAPING_VIEW`, `AX_CONC_CAPTURE_NOT_SEND`), while `spawn_local` relaxes `Send` on the current OS thread without relaxing lifetime containment (SPEC-30 AXS-CONC-020..026).
@@ -721,11 +721,41 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T510
 - check: conformance tests in tests/conformance/p13/e13_2_volatile_mmio_layout (delivered by T510) pass in both `--interp` and native modes with `0 WEAK-NATIVE`
 
+## 17. Freestanding execution, modular runtime composition, and capability graph (SPEC-52)
+
+### INV-FRE-001 — Compilation profiles (`--profile hosted|freestanding|kernel|system`), `@entry`/`@panic_handler`/`@naked`/`@section`/`@used` checking, `extern "interrupt"` restrictions (`REQ-ABI-102`), and `RuntimeCapabilityGraph`
+- statement: `compiler/driver/` and `compiler/sema/` validate `--profile hosted|freestanding|kernel|system` (`AX_DRIVER_INVALID_PROFILE`), enforce `@entry` (`AX_TYPE_ENTRY_MISSING`, `AX_TYPE_DUPLICATE_ENTRY`, `AX_TYPE_ENTRY_SIGNATURE`), `@panic_handler` (`AX_TYPE_INVALID_PANIC_HANDLER`, `AX_TYPE_DUPLICATE_PANIC_HANDLER`), `@global_allocator` (`AX_TYPE_INVALID_GLOBAL_ALLOCATOR`, `AX_TYPE_DUPLICATE_GLOBAL_ALLOCATOR`), `@naked` (`AX_TYPE_INVALID_NAKED_FN`), `@section("...")`, and `@used` (`AX_TYPE_INVALID_SECTION`), reject hosted Layer-3 OS imports in `freestanding`/`kernel` (`AX_NAME_FREESTANDING_FORBIDDEN_IMPORT`), reject implicit heap allocation, blocking, thread creation, OS I/O, or `.await` directly or transitively inside `extern "interrupt"` handlers (`AX_UNSAFE_INTERRUPT_FORBIDDEN_OP`, `REQ-ABI-102`), and compute the transitive `RuntimeCapabilityGraph` rejecting forbidden capabilities per profile (`AX_DRIVER_PROFILE_FORBIDDEN_CAP`) while versioning Runtime ABI separately (`REQ-ABI-031`) (SPEC-52 AXS-FRE-001..022, AXS-FRE-050).
+- source: 0097 AOS-01..35; 0104 §54; 0143 §1-65, ARUNTIME-20..63; tasks/0358 AINIT-20..80; tasks/0359 ARUNTIME-20..90; tasks/0370 ARUNTIME-20..57; tasks/0455 ART-20..50; tasks/0471 AKERNEL-20..70; REQ-ABI-031, REQ-ABI-102; SPEC-52 AXS-FRE-001..022, AXS-FRE-050
+- verify: tests/ui/freestanding
+- since: T512
+- check: positive and negative UI tests in tests/ui/freestanding (delivered by T512) verify `--profile freestanding` rejection of hosted OS modules and forbidden capabilities, `extern "interrupt"` allocation/blocking/`await` rejection (`REQ-ABI-102`), and `@entry`/`@panic_handler`/`@naked`/`@section` validation
+
+### INV-FRE-002 — CRT-free and `kernel32.dll`-free freestanding native image emission, `@entry` direct entrypoint, `@naked` frame suppression, `extern "interrupt"` `IRETQ`, and custom `@section` / `@used` retention
+- statement: Under `--profile freestanding` and `--profile kernel`, `compiler/lir/`, `compiler/target/x64/`, `compiler/obj/`, and `compiler/link/` emit native PE32+/COFF executables with zero default DLL imports (`objdump -p` shows no `.idata` import directory), bind `AddressOfEntryPoint` directly to `@entry`, omit prologue/epilogue frames on `@naked` functions, preserve all modified GPRs and return via `IRETQ` (`48 CF`) on `extern "interrupt"` handlers (`REQ-ABI-078`), place `@section("...")` items into named COFF sections, and retain `@used` symbols as live roots against dead-section GC (SPEC-52 AXS-FRE-004..005, AXS-FRE-010, AXS-FRE-013..015, AXS-FRE-023).
+- source: 0097 AOS-09..12, AOS-26..27; 0129 §76-77 ATYPE-46..47; 0143 §5-15; 0163 §6; 0230 §6; tasks/0358 AINIT-20..80; tasks/0370; tasks/0455; tasks/0471 AKERNEL-25..30, AKERNEL-63; REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145; SPEC-52 AXS-FRE-004..005, AXS-FRE-010, AXS-FRE-013..015, AXS-FRE-023
+- verify: tests/link/freestanding
+- since: T513
+- check: link and objdump tests in tests/link/freestanding (delivered by T513) verify zero DLL imports (`objdump -p`), `@entry` entry point, `@naked` prologue-free codegen, `extern "interrupt"` `IRETQ` emission, custom `@section` placement, `@used` retention, and native execution
+
+### INV-FRE-003 — Zero-OS `std.core` freestanding foundation, pluggable `@panic_handler` / `@global_allocator`, `ForeignBox<T, A>`, and `DmaBuffer<T>` capability ownership
+- statement: `std/core/` compiles and executes in `--profile freestanding` with zero references to `std.os`, `std.io`, or `kernel32.dll`; `std/core/panic.ax` and `std/alloc/` expose pluggable `@panic_handler` (`PanicInfo`) and `@global_allocator` (`Allocator` / `GlobalAlloc`) hooks; `ForeignBox<T, A: ForeignDeleter>` enforces explicit foreign allocation domain cleanup without guessing allocator compatibility (`REQ-FFI-005..009`, `REQ-FFI-020`, `REQ-FFI-024`, `REQ-FFI-058`, `REQ-FFI-080`, `REQ-FFI-121`, `REQ-RES-170`); and `DmaBuffer<T>` / `DmaTransfer<T>` statically prevent CPU `mut_view<T>` access while a device DMA transfer is active (`REQ-CAP-140`, `REQ-CAP-143`, `AX_CAP_DMA_ACTIVE_CONFLICT`) (SPEC-52 AXS-FRE-003, AXS-FRE-005, AXS-FRE-011..012).
+- source: 0097; 0111 §47; 0119 §233, §259 AFFI-20..21; 0131 §67, §88 AFN-54; 0138 §100 AFFI-27; 0143 §28-41; 0163 §6; tasks/0358; tasks/0359; tasks/0367 §82; tasks/0413 §70; tasks/0445 §186.161 AFFI-30..33; tasks/0465 §206.24 ANET2-44..45; tasks/0471 AKERNEL-34..37; REQ-ABI-078, REQ-CAP-140, REQ-CAP-143, REQ-FFI-005..009, REQ-FFI-020, REQ-FFI-024, REQ-FFI-058, REQ-FFI-080, REQ-FFI-121, REQ-RES-170; SPEC-52 AXS-FRE-003, AXS-FRE-005, AXS-FRE-011..012
+- verify: tests/std/freestanding_core
+- since: T514
+- check: freestanding stdlib tests in tests/std/freestanding_core (delivered by T514) compile and run `std.core` and static-arena `std.alloc` (`ForeignBox`, `DmaBuffer`) under `--profile freestanding` in both `--interp` and native modes with zero OS imports
+
+### INV-FRE-004 — End-to-end E13.3 freestanding boot-without-std and modular runtime composition conformance
+- statement: The E13.3 conformance suite certifies that a freestanding Axiom program (`--profile freestanding`) with `@entry`, `@panic_handler`, custom `@section` / `@used` placement, `extern "interrupt"` handlers, and `std.core` boots and runs without `std` or any OS/CRT import across `--interp` and native x86-64 (`0 WEAK-NATIVE`, verified zero DLL imports via `objdump -p`), while rejecting forbidden ambient OS/heap/blocking operations in freestanding and interrupt contexts (SPEC-52 AXS-FRE-001..053).
+- source: SPEC-52 AXS-FRE-001..053; 0097; 0143; tasks/0358; tasks/0359; tasks/0370; tasks/0455; tasks/0471; REQ-ABI-031, REQ-ABI-102, REQ-FFI-005, REQ-FFI-008, REQ-FFI-066
+- verify: tests/conformance/p13/e13_3_freestanding_runtime
+- since: T515
+- check: positive and negative conformance tests in tests/conformance/p13/e13_3_freestanding_runtime (delivered by T515) pass in `--interp` and native execution with `0 WEAK-NATIVE` and zero DLL imports
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).
