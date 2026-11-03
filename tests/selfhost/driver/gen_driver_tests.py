@@ -117,6 +117,7 @@ FULL_MODULES = [
     ("compiler.opt.dce", "compiler"),
     ("compiler.opt.cfg_simp", "compiler"),
     ("compiler.opt", "compiler"),
+    ("compiler.opt.optir", "compiler"),
     ("compiler.interp.value", "compiler"),
     ("compiler.interp.oracle", "compiler"),
     ("compiler.interp.frame", "compiler"),
@@ -361,6 +362,8 @@ use compiler.driver.opts.EMIT_OBJ
 use compiler.driver.opts.EMIT_RESOLVED
 use compiler.driver.opts.EMIT_THIR
 use compiler.driver.opts.EMIT_TOKENS
+use compiler.driver.opts.EMIT_OPTIR
+use compiler.driver.opts.EMIT_MEMSSA
 use compiler.driver.opts.DriverOptions
 use compiler.driver.opts.opts_mul_usize
 use compiler.driver.opts.sv_slot_get
@@ -561,6 +564,19 @@ fn test_cli_formatting_and_lookup() -> i32 {
     if find_emit_blob(87) != EMIT_THIR { return 32; }
     if find_emit_blob(88) != EMIT_TOKENS { return 33; }
     if find_emit_blob(23) != EMIT_NONE { return 34; }
+    let optir_buf = unsafe { heap_alloc(6, 1) };
+    let memssa_buf = unsafe { heap_alloc(7, 1) };
+    unsafe {
+        *(optir_buf + 0) = 111u8; *(optir_buf + 1) = 112u8; *(optir_buf + 2) = 116u8;
+        *(optir_buf + 3) = 105u8; *(optir_buf + 4) = 114u8; *(optir_buf + 5) = 0u8;
+        *(memssa_buf + 0) = 109u8; *(memssa_buf + 1) = 101u8; *(memssa_buf + 2) = 109u8;
+        *(memssa_buf + 3) = 115u8; *(memssa_buf + 4) = 115u8; *(memssa_buf + 5) = 97u8;
+        *(memssa_buf + 6) = 0u8;
+    }
+    let optir_sv = StrView { ptr: optir_buf as *const u8, len: 5 };
+    let memssa_sv = StrView { ptr: memssa_buf as *const u8, len: 6 };
+    if driver_find_emitter(view(optir_sv)) != EMIT_OPTIR { return 35; }
+    if driver_find_emitter(view(memssa_sv)) != EMIT_MEMSSA { return 36; }
     0
 }
 

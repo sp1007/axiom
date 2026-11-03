@@ -21,6 +21,7 @@ use compiler.types.types.Thir
 use compiler.types.types.typemap_free
 use compiler.mir.mir.MirConst
 use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirBody
 use compiler.mir.mir.MIR_BINOP_ADD
 use compiler.mir.mir.MIR_BINOP_SUB
 use compiler.mir.mir.MIR_BINOP_MUL
@@ -63,6 +64,42 @@ use compiler.opt.opt_init_minimal_thir
 use compiler.opt.opt_free_minimal_thir
 use compiler.opt.opt_mir_text
 use compiler.opt.opt_mir_text_in_arena
+use compiler.opt.optir.CERTAINTY_UNKNOWN
+use compiler.opt.optir.CERTAINTY_POSSIBLE
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.certainty_and
+use compiler.opt.optir.certainty_join_paths
+use compiler.opt.optir.certainty_negate_hazard
+use compiler.opt.optir.certainty_can_rewrite
+use compiler.opt.optir.certainty_should_emit_remark
+use compiler.opt.optir.ALIAS_NO_ALIAS
+use compiler.opt.optir.ALIAS_MUST_ALIAS
+use compiler.opt.optir.MEM_DEF_LIVE_ON_ENTRY
+use compiler.opt.optir.MEM_DEF_INST
+use compiler.opt.optir.OPT_LOCAL_SROA
+use compiler.opt.optir.OPT_LOCAL_MEMORY
+use compiler.opt.optir.OPT_FLAG_MOVE
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.MemSsaId
+use compiler.opt.optir.opt_u8_at
+use compiler.opt.optir.opt_u32_at
+use compiler.opt.optir.opt_bbid_at
+use compiler.opt.optir.opt_phi_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_memdef_at
+use compiler.opt.optir.opt_dominates
+use compiler.opt.optir.opt_strictly_dominates
+use compiler.opt.optir.optir_extract_memory_region
+use compiler.opt.optir.optir_alias_query
+use compiler.opt.optir.memssa_does_clobber
+use compiler.opt.optir.memssa_find_clobbering_def
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_inspect_mir_text
 
 
 @intrinsic fn size_of<T>() -> usize { 0 }
@@ -508,6 +545,269 @@ fn test_mir_passes(arena: mut_view<Arena>, sink: mut_view<DiagSink>, out_ptr: *m
     0
 }
 
+// 3. OptIR, Cooper-Harvey-Kennedy dominators & dominance frontier, minimal SSA (OptPhi, Copy/Move
+//    value sharing, SROA), MemorySSA (LiveOnEntry, MemoryDef, MemoryUse, MemoryPhi, AliasResult,
+//    clobber walker), 3-valued Certainty lattice, ProofProvenance, contract verification,
+//    MIR reconstruction, and unverified MIR rejection (E15.1 / SPEC-70).
+fn test_optir_ssa_memssa_certainty(arena: mut_view<Arena>, sink: mut_view<DiagSink>, out_ptr: *mut u8) -> i32 {
+    // 3.1 Three-valued Certainty lattice laws (REQ-OPT-397..402)
+    if certainty_and(CERTAINTY_PROVEN, CERTAINTY_PROVEN) != CERTAINTY_PROVEN { return 301; }
+    if certainty_and(CERTAINTY_PROVEN, CERTAINTY_POSSIBLE) != CERTAINTY_POSSIBLE { return 302; }
+    if certainty_and(CERTAINTY_POSSIBLE, CERTAINTY_POSSIBLE) != CERTAINTY_POSSIBLE { return 303; }
+    if certainty_and(CERTAINTY_PROVEN, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 304; }
+    if certainty_and(CERTAINTY_POSSIBLE, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 305; }
+    if certainty_and(CERTAINTY_UNKNOWN, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 306; }
+
+    if certainty_join_paths(CERTAINTY_PROVEN, CERTAINTY_PROVEN) != CERTAINTY_PROVEN { return 307; }
+    if certainty_join_paths(CERTAINTY_PROVEN, CERTAINTY_POSSIBLE) != CERTAINTY_POSSIBLE { return 308; }
+    if certainty_join_paths(CERTAINTY_PROVEN, CERTAINTY_UNKNOWN) != CERTAINTY_POSSIBLE { return 309; }
+    if certainty_join_paths(CERTAINTY_POSSIBLE, CERTAINTY_UNKNOWN) != CERTAINTY_POSSIBLE { return 310; }
+    if certainty_join_paths(CERTAINTY_UNKNOWN, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 311; }
+
+    if certainty_negate_hazard(false, CERTAINTY_PROVEN) != CERTAINTY_PROVEN { return 312; }
+    if certainty_negate_hazard(false, CERTAINTY_POSSIBLE) != CERTAINTY_POSSIBLE { return 313; }
+    if certainty_negate_hazard(false, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 314; }
+    if certainty_negate_hazard(true, CERTAINTY_PROVEN) != CERTAINTY_POSSIBLE { return 315; }
+    if certainty_negate_hazard(true, CERTAINTY_POSSIBLE) != CERTAINTY_UNKNOWN { return 316; }
+    if certainty_negate_hazard(true, CERTAINTY_UNKNOWN) != CERTAINTY_UNKNOWN { return 317; }
+
+    if !certainty_can_rewrite(CERTAINTY_PROVEN) { return 318; }
+    if certainty_can_rewrite(CERTAINTY_POSSIBLE) { return 319; }
+    if certainty_can_rewrite(CERTAINTY_UNKNOWN) { return 320; }
+    if certainty_should_emit_remark(CERTAINTY_PROVEN) { return 321; }
+    if !certainty_should_emit_remark(CERTAINTY_POSSIBLE) { return 322; }
+    if certainty_should_emit_remark(CERTAINTY_UNKNOWN) { return 323; }
+
+    // 3.2 Lower Verified MIR fixture (blob 17) into OptIR + SSA + MemorySSA
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let thir_ptr = arena_alloc_raw(mut_view(*arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    opt_init_minimal_thir(thir_ptr, mut_view(*arena));
+    let in17 = unit_mir_blob(mut_view(*arena), 17);
+    let body17 = verify_parse_mir(
+        in17,
+        unsafe { mut_view((*thir_ptr).interner) },
+        mut_view(*arena)
+    );
+    if (body17 as usize) == 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 324;
+    }
+    let opt_body = optir_build_from_mir(
+        unsafe { view(*body17) },
+        thir_ptr as *const Thir,
+        mut_view(*arena),
+        mut_view(*sink),
+        0 as *const HirItem
+    );
+    if (opt_body as usize) == 0 || sink.errors != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 325;
+    }
+
+    // 3.3 Check CFG, RPO, Cooper-Harvey-Kennedy dominator tree, and dominance frontier (AXS-OPT-011)
+    let bbc = unsafe { (*opt_body).bb_count };
+    let rpoc = unsafe { (*opt_body).rpo_count };
+    if bbc != 6 || rpoc != 6 {
+        opt_free_minimal_thir(thir_ptr);
+        return 326;
+    }
+    let obb0 = unsafe { opt_block_at((*opt_body).blocks, 0) };
+    let obb1 = unsafe { opt_block_at((*opt_body).blocks, 1) };
+    let obb2 = unsafe { opt_block_at((*opt_body).blocks, 2) };
+    let obb3 = unsafe { opt_block_at((*opt_body).blocks, 3) };
+    let obb4 = unsafe { opt_block_at((*opt_body).blocks, 4) };
+    let obb5 = unsafe { opt_block_at((*opt_body).blocks, 5) };
+    if (unsafe { (*obb0).idom.v }) != 0u32 || (unsafe { (*obb0).dom_depth }) != 0u32 ||
+       (unsafe { (*obb1).idom.v }) != 0u32 || (unsafe { (*obb1).dom_depth }) != 1u32 ||
+       (unsafe { (*obb2).idom.v }) != 0u32 || (unsafe { (*obb2).dom_depth }) != 1u32 ||
+       (unsafe { (*obb3).idom.v }) != 0u32 || (unsafe { (*obb3).dom_depth }) != 1u32 ||
+       (unsafe { (*obb4).idom.v }) != 3u32 || (unsafe { (*obb4).dom_depth }) != 2u32 ||
+       (unsafe { (*obb5).idom.v }) != 3u32 || (unsafe { (*obb5).dom_depth }) != 2u32 {
+        opt_free_minimal_thir(thir_ptr);
+        return 327;
+    }
+    let bb0_id = OptBbId { v: 0u32 };
+    let bb1_id = OptBbId { v: 1u32 };
+    let bb3_id = OptBbId { v: 3u32 };
+    let bb4_id = OptBbId { v: 4u32 };
+    let bb5_id = OptBbId { v: 5u32 };
+    if !opt_dominates(unsafe { view(*opt_body) }, bb0_id, bb5_id) ||
+       !opt_strictly_dominates(unsafe { view(*opt_body) }, bb3_id, bb4_id) ||
+       opt_dominates(unsafe { view(*opt_body) }, bb1_id, bb3_id) {
+        opt_free_minimal_thir(thir_ptr);
+        return 328;
+    }
+    // DF(bb1) = {bb3}, DF(bb2) = {bb3}, DF(bb4) = {bb3}
+    if (unsafe { (*obb1).dom_frontier_count }) != 1 ||
+       (unsafe { (*opt_bbid_at((*obb1).dom_frontier, 0)).v }) != 3u32 ||
+       (unsafe { (*obb2).dom_frontier_count }) != 1 ||
+       (unsafe { (*opt_bbid_at((*obb2).dom_frontier, 0)).v }) != 3u32 ||
+       (unsafe { (*obb4).dom_frontier_count }) != 1 ||
+       (unsafe { (*opt_bbid_at((*obb4).dom_frontier, 0)).v }) != 3u32 {
+        opt_free_minimal_thir(thir_ptr);
+        return 329;
+    }
+
+    // 3.4 Check Copy/Move SSA value sharing (REQ-OPT-337, REQ-OPT-338)
+    let inst0 = unsafe { opt_inst_at((*obb0).insts, 0) }; // _1 = const 5
+    let inst1 = unsafe { opt_inst_at((*obb0).insts, 1) }; // _2 = copy _1
+    let inst2 = unsafe { opt_inst_at((*obb0).insts, 2) }; // _3 = move _2
+    let v0_id = unsafe { (*inst0).result.v };
+    let v1_id = unsafe { (*inst1).result.v };
+    let v2_id = unsafe { (*inst2).result.v };
+    let inst2_flags = unsafe { (*inst2).flags };
+    if v0_id == 0u32 || v0_id != v1_id || v1_id != v2_id || (inst2_flags & OPT_FLAG_MOVE) == 0u16 {
+        opt_free_minimal_thir(thir_ptr);
+        return 330;
+    }
+
+    // 3.5 Check SROA aggregate field projection on local _4 (AXS-OPT-014)
+    let mode4 = unsafe { *opt_u8_at((*opt_body).local_modes, 4) };
+    let sroa4_cnt = unsafe { *opt_u32_at((*opt_body).local_sroa_count, 4) };
+    if mode4 != OPT_LOCAL_SROA || sroa4_cnt != 2u32 {
+        opt_free_minimal_thir(thir_ptr);
+        return 331;
+    }
+    let inst4 = unsafe { opt_inst_at((*obb0).insts, 4) }; // (_4.0) = const 20
+    let inst5 = unsafe { opt_inst_at((*obb0).insts, 5) }; // _5 = copy (_4.0) + copy (_4.1)
+    if (unsafe { (*inst5).lhs.v }) != (unsafe { (*inst4).result.v }) {
+        opt_free_minimal_thir(thir_ptr);
+        return 332;
+    }
+
+    // 3.6 Check minimal SSA OptPhi placement at bb3 (AXS-OPT-013)
+    let bb3_phis = unsafe { (*obb3).phi_count };
+    if bb3_phis == 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 333;
+    }
+    let phi0 = unsafe { opt_phi_at((*obb3).phis, 0) };
+    if (unsafe { (*phi0).src_local.v }) != 9u32 || (unsafe { (*phi0).arity }) != 3 {
+        opt_free_minimal_thir(thir_ptr);
+        return 334;
+    }
+
+    // 3.7 Check MemorySSA (LiveOnEntry, MemoryDef, MemoryUse, MemoryPhi, AliasResult, clobber walker)
+    let mode7 = unsafe { *opt_u8_at((*opt_body).local_modes, 7) };
+    let mode10 = unsafe { *opt_u8_at((*opt_body).local_modes, 10) };
+    if mode7 != OPT_LOCAL_MEMORY || mode10 != OPT_LOCAL_MEMORY {
+        opt_free_minimal_thir(thir_ptr);
+        return 335;
+    }
+    if (unsafe { (*opt_body).mem_ssa_count }) < 4 {
+        opt_free_minimal_thir(thir_ptr);
+        return 336;
+    }
+    let mdef0 = unsafe { opt_memdef_at((*opt_body).mem_defs, 0) };
+    if (unsafe { (*mdef0).kind }) != MEM_DEF_LIVE_ON_ENTRY {
+        opt_free_minimal_thir(thir_ptr);
+        return 337;
+    }
+    if !(unsafe { (*obb3).has_mem_phi }) {
+        opt_free_minimal_thir(thir_ptr);
+        return 338;
+    }
+    let inst6 = unsafe { opt_inst_at((*obb0).insts, 6) }; // _7 = const 50 (Store -> mem1)
+    let inst7 = unsafe { opt_inst_at((*obb0).insts, 7) }; // _10 = const 77 (Store -> mem2)
+    let inst8 = unsafe { opt_inst_at((*obb0).insts, 8) }; // _12 = copy _7 (Load -> uses mem2)
+    if (unsafe { (*inst6).opcode }) != OPT_INST_STORE ||
+       (unsafe { (*inst7).opcode }) != OPT_INST_STORE ||
+       (unsafe { (*inst8).opcode }) != OPT_INST_LOAD {
+        opt_free_minimal_thir(thir_ptr);
+        return 339;
+    }
+    let mem1_id = MemSsaId { v: unsafe { (*inst6).mem_def.v } };
+    let mem2_id = MemSsaId { v: unsafe { (*inst7).mem_def.v } };
+    let load_use_id = MemSsaId { v: unsafe { (*inst8).mem_use.v } };
+    if mem1_id.v == 0u32 || mem2_id.v == 0u32 || load_use_id.v != mem2_id.v {
+        opt_free_minimal_thir(thir_ptr);
+        return 340;
+    }
+    let mdef1 = unsafe { opt_memdef_at((*opt_body).mem_defs, mem1_id.v as usize) };
+    if (unsafe { (*mdef1).kind }) != MEM_DEF_INST || (unsafe { (*mdef1).prev_mem.v }) != 0u32 {
+        opt_free_minimal_thir(thir_ptr);
+        return 341;
+    }
+    let reg7 = optir_extract_memory_region(unsafe { view(*opt_body) }, unsafe { view((*inst6).place) });
+    let reg10 = optir_extract_memory_region(unsafe { view(*opt_body) }, unsafe { view((*inst7).place) });
+    let al_same = optir_alias_query(unsafe { view(*opt_body) }, view(reg7), view(reg7));
+    let al_diff = optir_alias_query(unsafe { view(*opt_body) }, view(reg7), view(reg10));
+    if al_same != ALIAS_MUST_ALIAS || al_diff != ALIAS_NO_ALIAS {
+        opt_free_minimal_thir(thir_ptr);
+        return 342;
+    }
+    // mem2 (store to _10) must NOT clobber reg7, whereas mem1 (store to _7) MUST clobber reg7
+    if memssa_does_clobber(unsafe { view(*opt_body) }, mem2_id, view(reg7)) ||
+       !memssa_does_clobber(unsafe { view(*opt_body) }, mem1_id, view(reg7)) {
+        opt_free_minimal_thir(thir_ptr);
+        return 343;
+    }
+    let clobber_def = memssa_find_clobbering_def(
+        unsafe { view(*opt_body) },
+        load_use_id,
+        view(reg7),
+        64u32
+    );
+    if clobber_def.v != mem1_id.v {
+        opt_free_minimal_thir(thir_ptr);
+        return 344;
+    }
+
+    // 3.8 Check ProofProvenance & OptIR contract verification & MIR reconstruction
+    if (unsafe { (*opt_body).provenance_count }) < 4 {
+        opt_free_minimal_thir(thir_ptr);
+        return 345;
+    }
+    if !optir_verify_contract(unsafe { view(*opt_body) }) {
+        opt_free_minimal_thir(thir_ptr);
+        return 346;
+    }
+    let recon_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(unsafe { view(*opt_body) }, unsafe { mut_view(*recon_mir) }, mut_view(*arena)) {
+        opt_free_minimal_thir(thir_ptr);
+        return 347;
+    }
+    verify_mir(
+        unsafe { view(*recon_mir) },
+        thir_ptr as *const Thir,
+        mut_view(*sink),
+        0 as *const HirItem
+    );
+    if sink.errors != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        return 348;
+    }
+    opt_free_minimal_thir(thir_ptr);
+    arena_reset(mut_view(*arena));
+
+    // 3.9 Check optir_inspect_mir_text (--emit=optir and --emit=memssa) & negative unverified MIR rejection
+    let mut out = DiagBuffer { ptr: out_ptr, len: 0, cap: 32768 };
+    let in17_b = unit_mir_blob(mut_view(*arena), 17);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    out.len = 0;
+    if !optir_inspect_mir_text(in17_b, false, true, mut_view(out), mut_view(*sink), mut_view(*arena)) || sink.errors != 0 || out.len == 0 {
+        return 349;
+    }
+    let in17_c = unit_mir_blob(mut_view(*arena), 17);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    out.len = 0;
+    if !optir_inspect_mir_text(in17_c, true, true, mut_view(out), mut_view(*sink), mut_view(*arena)) || sink.errors != 0 || out.len == 0 {
+        return 350;
+    }
+    let in18_bad = unit_mir_blob(mut_view(*arena), 18);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    out.len = 0;
+    if optir_inspect_mir_text(in18_bad, false, false, mut_view(out), mut_view(*sink), mut_view(*arena)) || sink.errors == 0 {
+        return 351;
+    }
+    arena_reset(mut_view(*arena));
+    0
+}
+
 pub fn main() -> i32 {
     let mut perm_arena = arena_new();
     let out_ptr = arena_alloc_raw(mut_view(perm_arena), 32768, 1);
@@ -530,6 +830,14 @@ pub fn main() -> i32 {
         arena_destroy(mut_view(arena));
         arena_destroy(mut_view(perm_arena));
         return rc2;
+    }
+
+    let rc3 = test_optir_ssa_memssa_certainty(mut_view(arena), unsafe { mut_view(*sink_ptr) }, out_ptr);
+    if rc3 != 0 {
+        unsafe { diag_sink_free(mut_view(*sink_ptr)); }
+        arena_destroy(mut_view(arena));
+        arena_destroy(mut_view(perm_arena));
+        return rc3;
     }
 
     unsafe { diag_sink_free(mut_view(*sink_ptr)); }

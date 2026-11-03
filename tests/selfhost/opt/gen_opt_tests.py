@@ -37,6 +37,7 @@ CORE_MODULES = [
     ("compiler.opt.dce", "compiler"),
     ("compiler.opt.cfg_simp", "compiler"),
     ("compiler.opt", "compiler"),
+    ("compiler.opt.optir", "compiler"),
 ]
 
 PIPELINE_MODULES = [
@@ -85,6 +86,7 @@ PIPELINE_MODULES = [
     ("compiler.opt.dce", "compiler"),
     ("compiler.opt.cfg_simp", "compiler"),
     ("compiler.opt", "compiler"),
+    ("compiler.opt.optir", "compiler"),
 ]
 
 PRELUDE = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=ROOT)
@@ -910,6 +912,74 @@ UNIT_MIR_SNIPPETS = [
         b"    }\n"
         b"    bb32: {\n"
         b"        goto -> bb29;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 17: OptIR / Dominator / SSA / SROA / MemorySSA fixture (diamond + loop + copy/move + sroa + memphi)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let _1: type#8;\n"
+        b"    let _2: type#8;\n"
+        b"    let _3: type#8;\n"
+        b"    let mut _4: type#1;\n"
+        b"    let _5: type#8;\n"
+        b"    let _6: type#1;\n"
+        b"    let mut _7: type#8;\n"
+        b"    let _8: type#8;\n"
+        b"    let mut _9: type#8;\n"
+        b"    let mut _10: type#8;\n"
+        b"    let _11: type#1;\n"
+        b"    let _12: type#8;\n"
+        b"    let _13: type#4;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 5: type#8;\n"
+        b"        _2 = copy _1;\n"
+        b"        _3 = move _2;\n"
+        b"        _4 = aggregate(variant#0, [copy _3, const 10: type#8]);\n"
+        b"        (_4).0 = const 20: type#8;\n"
+        b"        _5 = copy (_4).0 + copy (_4).1;\n"
+        b"        _7 = const 50: type#8;\n"
+        b"        _10 = const 77: type#8;\n"
+        b"        _12 = copy _7;\n"
+        b"        _9 = copy _5;\n"
+        b"        switchInt(copy _1) -> [0: bb2, otherwise: bb1];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        _9 = const 30: type#8;\n"
+        b"        _7 = const 100: type#8;\n"
+        b"        goto -> bb3;\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _9 = const 40: type#8;\n"
+        b"        _7 = const 200: type#8;\n"
+        b"        goto -> bb3;\n"
+        b"    }\n"
+        b"    bb3: {\n"
+        b"        _8 = copy _7;\n"
+        b"        _13 = copy _9 < const 35: type#8;\n"
+        b"        switchInt(move _13) -> [0: bb5, otherwise: bb4];\n"
+        b"    }\n"
+        b"    bb4: {\n"
+        b"        _9 = copy _9 + const 10: type#8;\n"
+        b"        goto -> bb3;\n"
+        b"    }\n"
+        b"    bb5: {\n"
+        b"        _6 = &_7;\n"
+        b"        _11 = &_10;\n"
+        b"        _0 = copy _9 + copy _8;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 18: Unverified MIR fixture (reads uninitialized _1 -> rejected by OptIR lowering)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let _1: type#8;\n"
+        b"    bb0: {\n"
+        b"        _0 = copy _1;\n"
+        b"        return;\n"
         b"    }\n"
         b"}\n"
     ),
