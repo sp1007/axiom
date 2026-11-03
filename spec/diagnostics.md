@@ -106,11 +106,14 @@ They map to the areas above as the last column shows. Three groups have no area 
   stderr text) defined by `spec/SPEC-03-core-semantics.md`, not compiler diagnostics (0146 §53).
 - `EASYNC`, `AX_ASYNC_`, `ECONCUR`, `AX_CONC_`, `AX_ATOM_`, `EGPU`, `AX_GPU_`: the epics that need them (E11.*,
   E22.*) add an area by editing this section and §11 first (AXD-022). For E11.1 (`T400` / `SPEC-30 §6`), E11.2
-  (`T405` / `SPEC-31 §7`), and E11.3 (`T410` / `SPEC-32 §6`), the `CONC` area (`AX_CONC_*`) is established for
-  self-hosted `axiomc` (`compiler/diag/code.ax`, where `axiom0` is frozen post-`T087`), covering `Send`/`Share`
-  auto-traits (`T089`), closure/spawn captures (`T401`), the compile-time data-race verifier (`T402`),
-  happens-before/lock-order diagnostics (`T403`), atomic type/ordering/alignment/capability diagnostics (`T406`),
-  and thread/guard/channel/`@thread_local` TLS escape diagnostics (`T090`, `T411`–`T413`).
+  (`T405` / `SPEC-31 §7`), E11.3 (`T410` / `SPEC-32 §6`), and E11.4 (`T415` / `SPEC-33 §6`), the `CONC` area
+  (`AX_CONC_*`) and `ASYNC` area (`AX_ASYNC_*`) are established for self-hosted `axiomc` (`compiler/diag/code.ax`,
+  where `axiom0` is frozen post-`T087`), covering `Send`/`Share` auto-traits (`T089`), closure/spawn captures (`T401`),
+  the compile-time data-race verifier (`T402`), happens-before/lock-order diagnostics (`T403`), atomic
+  type/ordering/alignment/capability diagnostics (`T406`), thread/guard/channel/`@thread_local` TLS escape
+  diagnostics (`T090`, `T411`–`T413`), and `async`/`await` syntax/type/recursion/FFI checks (`T416`),
+  live-across-await capability/guard/`Future: Send` checks (`T417`), and `Future` state-machine polling
+  diagnostics (`T088`, `T418`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -515,9 +518,19 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CONC_INVALID_ATOMIC_ALIGNMENT` | E | T406 | `Atomic<T>` placed inside a `@packed` struct or given a sub-natural `@align(N)` where `N < size_of::<T>()` (`SPEC-31` AXS-ATM-011, AXS-ATM-060) |
 | `AX_CONC_TLS_ESCAPE` | E | T413 | `view<T>` or `mut_view<T>` rooted at a `@thread_local static` item or `LocalKey<T>.with` callback escapes its lexical scope, is stored in a global/heap place, is captured into `spawn`, or is held across `.await` (`SPEC-32` AXS-SYNC-020..022, AXS-SYNC-050) |
 | `AX_TYPE_INVALID_TLS_DECL` | E | T413 | `@thread_local` attached to a non-`static` item (`fn`, `struct`, `enum`, `const`, `type`, or local `let`), or `@thread_local static` initialized with a non-constant expression (`SPEC-32` AXS-SYNC-022, AXS-SYNC-050) |
+| `AX_ASYNC_AWAIT_OUTSIDE_ASYNC` | E | T416 | `.await` expression used outside an `async fn` body or `async { ... }` block (`SPEC-33` AXS-ASY-021, AXS-ASY-051) |
+| `AX_ASYNC_NOT_A_FUTURE` | E | T416 | operand `e` of `e.await` has a type `F` that does not implement `std.future.Future` (`SPEC-33` AXS-ASY-021, AXS-ASY-051) |
+| `AX_ASYNC_EXTERN_ABI` | E | T416 | `async` modifier combined with `extern "<abi>" fn` (`SPEC-33` AXS-ASY-026, AXS-ASY-051) |
+| `AX_ASYNC_RECURSIVE_FUTURE` | E | T416 | direct or mutual recursion among `async fn` bodies creates an unboxed infinite-size `Future` state machine (`SPEC-33` AXS-ASY-025, AXS-ASY-051) |
+| `AX_ASYNC_AWAIT_IN_DROP` | E | T416 | `impl Drop` method is declared `async` or contains `.await` (`SPEC-33` AXS-ASY-021, AXS-ASY-045, AXS-ASY-051) |
+| `AX_ASYNC_BLOCKING_IN_ASYNC` | W/E | T416 | operation carrying the `Blocking` effect (`Thread.sleep`, `JoinHandle.join`, synchronous socket/file I/O) invoked inside an `async` body (`SPEC-33` AXS-ASY-027, AXS-ASY-051) |
+| `AX_ASYNC_VIEW_ACROSS_AWAIT` | E | T417 | `view<T>`, `mut_view<T>`, or view-containing composite is live across an `.await` suspension point (`SPEC-33` AXS-ASY-034, AXS-ASY-051) |
+| `AX_ASYNC_GUARD_ACROSS_AWAIT` | E | T417 | synchronous lock guard (`MutexGuard<T>`, `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`) is live across an `.await` suspension point (`SPEC-33` AXS-ASY-035, AXS-ASY-051) |
+| `AX_ASYNC_FUTURE_NOT_SEND` | E | T417 | `Future` required to satisfy `Send` has a parameter or live-across-await local/sub-future whose type is `!Send` (`SPEC-33` AXS-ASY-036, AXS-ASY-051) |
+| `AX_ASYNC_POLL_AFTER_COMPLETE` | E | T088/T418 | oracle or debug check detects `Future.poll` called on a state machine already in `STATE_COMPLETE` or `STATE_POISONED` (`SPEC-33` AXS-ASY-042, AXS-ASY-050, AXS-ASY-051) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

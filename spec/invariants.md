@@ -46,8 +46,8 @@ Rules for `gatecheck.py` (refining T022 scope item (a)):
 
 Groups: `KERN` kernel, `LAYER` architecture layers, `DIAG` diagnostics, `DET` determinism, `PIPE`
 pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM` frozen semantic model,
-`BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02, `CONC` concurrency
-and memory model (`SPEC-30`). A new group is added by editing this list.
+`BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02, `CONC` concurrency,
+memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -459,7 +459,7 @@ and memory model (`SPEC-30`). A new group is added by editing this list.
 - since: T011
 - check: rejected-spelling cases R01–R15 and multi-error files
 
-## 11. Concurrency and memory model (SPEC-30, SPEC-31)
+## 11. Concurrency, memory model, and async state machines (SPEC-30, SPEC-31, SPEC-32, SPEC-33)
 
 ### INV-CONC-001 — `Send` and `Share` are independent, zero-cost marker auto-traits
 - statement: `Send` (cross-context ownership transfer) and `Share` (concurrent shared read access via `view<T>`) are tracked as independent semantic properties (`Send != Share`). They are structurally synthesized for composite types, require `unsafe impl` for positive manual overrides, allow safe `impl !Send`/`impl !Share` opt-outs, and are completely erased after semantic checking with zero runtime representation or overhead (SPEC-30 AXS-CONC-010..019).
@@ -510,11 +510,32 @@ and memory model (`SPEC-30`). A new group is added by editing this list.
 - since: T408
 - check: oracle memory-model tests (T408) and end-to-end litmus conformance tests (delivered by T409) verify message passing, store/load buffering, lossless RMW counters, weak/strong CAS retry loops, ABA tag protection, and differential agreement between `--interp` and native x86-64 binaries
 
+### INV-CONC-008 — `async`/`await` and `Future<T>` are zero-overhead cold state machines without `Pin<T>`
+- statement: `async fn` and `async { ... }` lower to cold, inline compiler-generated `Coroutine` state machines implementing `std.future.Future` (`fn poll(self: mut_view<Self>, cx: mut_view<Context>) -> Poll<Self.Output>`) with zero mandatory heap allocation, no `Pin<T>` wrapper in Core v1.0, and deterministic `std.future.block_on` single-thread execution; `.await` is rejected outside async contexts (`AX_ASYNC_AWAIT_OUTSIDE_ASYNC`), inside `Drop.drop` (`AX_ASYNC_AWAIT_IN_DROP`), and on non-`Future` operands (`AX_ASYNC_NOT_A_FUTURE`), while unboxed recursive `async fn` cycles (`AX_ASYNC_RECURSIVE_FUTURE`) and `async extern` ABIs (`AX_ASYNC_EXTERN_ABI`) are rejected at compile time (SPEC-33 AXS-ASY-001..027).
+- source: 0093; 0127; 0135; 0159 §8; 0201; 0202; 0248; tasks/0275; tasks/0297; tasks/0619; SPEC-33 AXS-ASY-001..027
+- verify: tests/run/async/block_on, tests/ui/async/syntax_type
+- since: T416
+- check: execution and UI diagnostic tests verify `Poll`/`Waker`/`Context`/`Future` lang items, cold-future semantics, `std.future.block_on`, and rejection of `.await` outside async or in `Drop`, non-`Future` `.await`, recursive `async fn`, and `async extern` ABI
+
+### INV-CONC-009 — Live-across-await analysis forbids views and sync guards across `.await` and derives `Future: Send` strictly from live state
+- statement: Pre-lowering MIR dataflow computes `LiveAcross(s) = Gen(s) ∪ (LiveIn(bb_resume(s)) \ Def(bb_resume(s)))` after pre-suspension drop elaboration; any `view<T>`, `mut_view<T>`, or view-containing composite in `LiveAcross(s)` is unconditionally rejected (`AX_ASYNC_VIEW_ACROSS_AWAIT`), synchronous lock guards (`MutexGuard`, `RwLockReadGuard`, `RwLockWriteGuard`) in `LiveAcross(s)` are rejected (`AX_ASYNC_GUARD_ACROSS_AWAIT`), and `Future: Send` is derived strictly from parameters plus `LiveAcross(s)` locals and awaited sub-futures (`AX_ASYNC_FUTURE_NOT_SEND`) while every state-machine `Future` is `!Share` (SPEC-33 AXS-ASY-030..037).
+- source: 0093 §3; 0127 §11-§14, §26; 0135 §3-§11, §24, §29, §33; 0202 §5-§12; 0248 §6-§15; tasks/0275 §8-§9; tasks/0297 §6-§9; SPEC-33 AXS-ASY-030..037
+- verify: tests/ui/async/live_across_await
+- since: T417
+- check: UI and unit tests verify that `view`/`mut_view` and `!Send` temporaries confined within a single poll step or dropped before `.await` are accepted, while views, sync guards, or `!Send` values live across `.await` are rejected with exact spans
+
+### INV-CONC-010 — MIR async state-machine lowering, per-state cancellation `Drop` glue, and oracle lifecycle agreement
+- statement: `compiler/mir/async_lower.ax` transforms each `async` body into a `__AsyncState_f` struct (`state_tag: u32` with `0 = Unstarted`, `1..K = Suspended(s)`, `0xFFFF_FFFE = Complete`, `0xFFFF_FFFF = Poisoned`), reconstructs self-views from the `self: mut_view<__AsyncState_f>` argument on every resume, generates state-driven `Drop` glue that drops the active sub-future before live locals in reverse declaration order when cancelled at `Suspended(s)`, and preserves byte-exact equivalence between `--interp` (including `POLL`/`SUSPEND`/`WAKE`/`RESUME`/`COMPLETE`/`CANCEL_DROP` lifecycle traces) and native x86-64 execution (SPEC-33 AXS-ASY-040..052).
+- source: 0093 §7; 0127 §16-§22, §36; 0135 §7, §14-§21, §34-§38; 0202 §6-§11; 0248 §16-§18; tasks/0275 §6-§13; tasks/0297 §10-§11; tasks/0619 §5-§11; SPEC-33 AXS-ASY-040..052
+- verify: tests/mir/async/state_machine, tests/run/async/cancellation_drop
+- since: T418
+- check: MIR state-machine dump tests (`T088`/`T418`), cancellation drop-order tests (`T418`), and E11.4 conformance tests (`T419`) verify state transitions, reverse-order cancellation drop glue, panic/completed re-poll rejection (`AX_ASYNC_POLL_AFTER_COMPLETE`), and oracle vs native x86-64 agreement
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

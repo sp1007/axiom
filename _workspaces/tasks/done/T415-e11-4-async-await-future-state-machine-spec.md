@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T400]
 priority: 137
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-33-async.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [0093, 0127, 0135, 0159, 0161, 0201, 0202, 0248, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-CONC-020, REQ-CONC-024, REQ-CONC-096, REQ-ASY-022, REQ-ASY-024, REQ-ASY-026, REQ-ASY-033, REQ-ASY-039, REQ-ASY-045, REQ-ASY-055, REQ-ASY-085, REQ-ASY-092, REQ-ASY-100, REQ-ASY-103, REQ-ASY-104, REQ-ASY-105, REQ-ASY-116, REQ-ASY-119, REQ-ASY-120, REQ-ASY-122, REQ-ASY-124, REQ-ASY-125, REQ-ASY-126, REQ-ASY-127, REQ-ASY-137, REQ-ASY-138, REQ-ASY-144, REQ-ASY-145, REQ-ASY-146, REQ-ASY-147, REQ-CONC-146, REQ-CONC-191, REQ-CONC-217]
+started: 2026-11-03 06:55:41
+finished: 2026-11-03 07:13:10
 ---
 # T415 — E11.4 — Canonical async/await, Future & state-machine specification (SPEC-33)
 
@@ -44,3 +46,5 @@ Write canonical `spec/SPEC-33-async.md` (`AXS-ASY-*` rule IDs) specifying `Futur
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 06:55:41 started (attempt 1) 
+- 2026-11-03 07:13:10 accepted by QA -> done
