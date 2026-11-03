@@ -10,7 +10,7 @@ depends: [T512, T513]
 priority: 163
 status: todo
 attempts: 0
-paths: [std/core, std/alloc, tests/std/freestanding_core, tests/selfhost]
+paths: [std/core, std/alloc, tests/std/freestanding_core]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0358, tasks/0359]
 covers: [REQ-FFI-006, REQ-FFI-009, REQ-FFI-020, REQ-FFI-024, REQ-FFI-058, REQ-ABI-078, REQ-FFI-080, REQ-RES-170, REQ-FFI-121]
 ---

@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T211, T400]
 priority: 121
-status: todo
-attempts: 0
-paths: [compiler/traits, std/core/marker.ax, tests/ui/concurrency/send_share, tests/run/concurrency/send_share, tests/selfhost]
-locks: [compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost]
+status: doing
+attempts: 1
+paths: [compiler/traits, std/core/marker.ax, tests/ui/concurrency/send_share, tests/run/concurrency/send_share, tests/selfhost/traits]
+locks: [compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/diag/code.ax, std/core/prelude.ax]
 spec: [spec/SPEC-30-concurrency.md, 0091, 0092, 0079, 0126, tasks/0276, tasks/0298, tasks/0488, 0208]
 covers: [REQ-CONC-218, REQ-CONC-219]
+started: 2026-11-03 08:23:12
+agent: T089-impl
 ---
 # T089 — E11.1 — Send and Share auto-trait derivation & negative impl solver
 
@@ -45,3 +47,4 @@ Implement the `Send` and `Share` auto-traits in `std/core/marker.ax` and the `ax
 ## Log
 - 2026-10-06 02:23:55 covers += REQ-CONC-218, REQ-CONC-219 (metadata only)
 - 2026-11-03 00:10:00 refined scope, paths, locks, and dependencies in T211 (P11 phase planning)
+- 2026-11-03 08:23:12 started (attempt 1) T089-impl

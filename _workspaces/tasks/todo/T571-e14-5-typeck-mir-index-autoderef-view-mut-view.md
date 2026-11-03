@@ -10,17 +10,17 @@ depends: [T570]
 priority: 192
 status: todo
 attempts: 0
-paths: [compiler/sema, compiler/mir, tests/run/index_autoderef, tests/ui/index_autoderef, tests/selfhost]
+paths: [compiler/types, compiler/mir, tests/run/index_autoderef, tests/ui/index_autoderef, tests/selfhost/typeck, tests/selfhost/mir]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-12-drop.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md]
 covers: [REQ-CORE-3056, REQ-CORE-3057, REQ-CORE-3058]
 ---
 # T571 — E14.5 — Index auto-deref through view<[N]T> and mut_view<[N]T> in typeck and MIR builder
 
 ## Goal
-Implement index auto-deref through `view<[N]T>` and `mut_view<[N]T>` (`SPEC-03 AXS-SEM-047`, `ADR-0036 §4`) in `axiomc`'s type checker (`compiler/sema`) and MIR builder (`compiler/mir`), with positive run tests and negative UI tests.
+Implement index auto-deref through `view<[N]T>` and `mut_view<[N]T>` (`SPEC-03 AXS-SEM-047`, `ADR-0036 §4`) in `axiomc`'s type checker (`compiler/types`) and MIR builder (`compiler/mir`), with positive run tests and negative UI tests.
 
 ## Scope
-- In `compiler/sema` (`typeck.ax`), when indexing `base[i]` where `base` has type `view<X>` or `mut_view<X>` and `X` resolves (after one or more view levels) to `[N]T` (or slice `[T]`), implicitly dereference `base` one level at a time just like field access (`a[i]` -> `(*a)[i]`).
+- In `compiler/types` (`typeck.ax`), when indexing `base[i]` where `base` has type `view<X>` or `mut_view<X>` and `X` resolves (after one or more view levels) to `[N]T` (or slice `[T]`), implicitly dereference `base` one level at a time just like field access (`a[i]` -> `(*a)[i]`).
 - Enforce mutability rules: reading `a[i]` is valid on both `view<[N]T>` and `mut_view<[N]T>`; assigning `a[i] = v`, compound-assigning `a[i] += v`, or taking `mut_view(a[i])` requires every traversed view level to be `mut_view` (rejecting writes through `view<[N]T>` with the immutable-place diagnostic).
 - Never auto-dereference raw pointers for indexing: `p[i]` on `p: *const [N]T` or `p: *mut [N]T` (or `*const T` / `*mut T`) remains a compile error `AX_TYPE_CANNOT_INDEX` with hint `write (*p)[i]` inside `unsafe`.
 - In `compiler/mir` (`builder.ax`), emit the implicit `PlaceElem.Deref` projections before `PlaceElem.Index` on the place projection chain so bounds checks (`AXS-SEM-042`) and old-element drop on assignment (`AXS-SEM-043` / `SPEC-12 AXS-DROP-007`) work identically to `(*a)[i]`.

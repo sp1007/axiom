@@ -10,7 +10,7 @@ depends: [T476, T473]
 priority: 167
 status: todo
 attempts: 0
-paths: [std/arch/detect.ax, compiler/interp, tests/std/arch_detect, tests/selfhost]
+paths: [std/arch/detect.ax, compiler/interp, tests/std/arch_detect]
 locks: [std/arch/x86_64.ax, compiler/target/x64/isel.ax, compiler/target/x64/encode.ax, compiler/driver/opts.ax, compiler/interp_opt/session.ax, tests/selfhost]
 spec: [spec/SPEC-44-cpu-features-multiversioning.md, 0095, tasks/0341, tasks/0344, tasks/0453]
 covers: [REQ-SIMD-095, REQ-SIMD-257]

@@ -10,7 +10,7 @@ depends: [T500]
 priority: 151
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/sema, compiler/mir, tests/ui/unsafe, tests/mir/unsafe, tests/selfhost]
+paths: [compiler/hir, compiler/sema, compiler/mir, tests/ui/unsafe, tests/mir/unsafe]
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0071, 0044, tasks/0339, tasks/0282]
 covers: [REQ-OWNER-008, REQ-CAP-003, REQ-CAP-013, REQ-CAP-015, REQ-CAP-018, REQ-CAP-025, REQ-CAP-026, REQ-CAP-027, REQ-CAP-031, REQ-CAP-032, REQ-CAP-033, REQ-CAP-034, REQ-CAP-040, REQ-CAP-046, REQ-CAP-047, REQ-CAP-049, REQ-CAP-051, REQ-CAP-056, REQ-CAP-061, REQ-CAP-062, REQ-CAP-065, REQ-CAP-067, REQ-CAP-069, REQ-CAP-070, REQ-CAP-073, REQ-CAP-083, REQ-CAP-085, REQ-CAP-086, REQ-CAP-093, REQ-CAP-102, REQ-CAP-105, REQ-CAP-107, REQ-CAP-109, REQ-CAP-118, REQ-CAP-122, REQ-CAP-125, REQ-CAP-127, REQ-CAP-129, REQ-CAP-144, REQ-TYP-349, REQ-CAP-146, REQ-CAP-148, REQ-CAP-149, REQ-CAP-150, REQ-CAP-151]
 ---

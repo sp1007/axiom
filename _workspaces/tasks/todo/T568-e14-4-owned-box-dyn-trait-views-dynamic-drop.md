@@ -10,7 +10,7 @@ depends: [T058, T567]
 priority: 189
 status: todo
 attempts: 0
-paths: [std/box, compiler/mir/drop.ax, tests/run/dyn_box, tests/selfhost]
+paths: [std/box, compiler/mir/drop.ax, tests/run/dyn_box]
 spec: [spec/SPEC-63-dyn-trait-vtables.md, spec/SPEC-12-drop.md, 0212]
 covers: [REQ-CORE-3045, REQ-CORE-3046, REQ-CORE-3047, REQ-CORE-3048]
 ---

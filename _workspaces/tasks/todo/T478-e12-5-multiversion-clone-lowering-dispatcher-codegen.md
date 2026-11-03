@@ -10,7 +10,7 @@ depends: [T477]
 priority: 168
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/mir, compiler/lir, compiler/target/x64, tests/mir/multiversion, tests/run/simd/multiversion, tests/selfhost]
+paths: [compiler/hir, compiler/mir, compiler/lir, compiler/target/x64, tests/mir/multiversion, tests/run/simd/multiversion]
 locks: [compiler/types/typeck.ax, compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-44-cpu-features-multiversioning.md, 0095, tasks/0341, tasks/0344, tasks/0453]
 covers: [REQ-SIMD-221, REQ-SIMD-222, REQ-SIMD-223]

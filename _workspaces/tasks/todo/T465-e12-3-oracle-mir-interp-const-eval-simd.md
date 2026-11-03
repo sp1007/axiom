@@ -10,7 +10,7 @@ depends: [T464, T458]
 priority: 155
 status: todo
 attempts: 0
-paths: [compiler/interp, compiler/opt, tests/mir/simd_interp, tests/opt/simd_const, tests/selfhost]
+paths: [compiler/interp, compiler/opt, tests/mir/simd_interp, tests/opt/simd_const]
 locks: [compiler/interp_opt/session.ax, tests/selfhost]
 spec: [spec/SPEC-42-simd.md, 0095, tasks/0341, tasks/0344, tasks/0347]
 covers: [REQ-SIMD-016, REQ-SIMD-017, REQ-SIMD-018, REQ-SIMD-028, REQ-SIMD-124, REQ-SIMD-125, REQ-SIMD-180, REQ-SIMD-181, REQ-SIMD-182, REQ-SIMD-185, REQ-SIMD-258, REQ-SIMD-259, REQ-SIMD-260, REQ-SIMD-261, REQ-SIMD-269, REQ-SIMD-273, REQ-SIMD-274, REQ-SIMD-275, REQ-SIMD-276, REQ-SIMD-277, REQ-SIMD-278, REQ-SIMD-330]

@@ -10,7 +10,7 @@ depends: [T216]
 priority: 93
 status: todo
 attempts: 0
-paths: [compiler/abi, compiler/obj, compiler/link, tests/run/linux, tests/selfhost]
+paths: [compiler/abi, compiler/obj, compiler/link, tests/run/linux]
 spec: [0192, 0053, 0255, 0256]
 ---
 # T066 — Linux x86-64: SysV ABI, ELF64 writer, static ELF linker

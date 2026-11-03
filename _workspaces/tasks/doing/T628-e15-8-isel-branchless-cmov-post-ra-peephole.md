@@ -10,7 +10,7 @@ depends: [T063]
 priority: 91
 status: doing
 attempts: 1
-paths: [compiler/lir, compiler/backend/peephole, tests/mc/isel_peephole, compiler/target/x64, tests/selfhost]
+paths: [compiler/lir, compiler/backend/peephole, tests/mc/isel_peephole, compiler/target/x64, tests/selfhost/lir, tests/selfhost/isel, tests/selfhost/encode, tests/selfhost/backend]
 spec: [spec/SPEC-77-regalloc-machine-opt.md, 0162, 0237, tasks/0406, tasks/0553, tasks/0559]
 covers: [REQ-OPT-034, REQ-OPT-035, REQ-OPT-036, REQ-OPT-205, REQ-OPT-207, REQ-OPT-208, REQ-OPT-369, REQ-OPT-370]
 started: 2026-11-03 07:16:36

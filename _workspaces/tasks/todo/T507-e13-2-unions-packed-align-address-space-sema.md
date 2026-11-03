@@ -10,7 +10,7 @@ depends: [T506]
 priority: 156
 status: todo
 attempts: 0
-paths: [compiler/ast, compiler/parser, compiler/hir, compiler/sema, tests/ui/layout, tests/selfhost]
+paths: [compiler/ast, compiler/parser, compiler/hir, compiler/sema, tests/ui/layout]
 spec: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md, 0067, 0072, tasks/0328]
 covers: [REQ-ABI-036, REQ-ABI-041, REQ-FFI-097, REQ-FFI-098, REQ-RES-135]
 ---

@@ -10,7 +10,7 @@ depends: [T502, T526]
 priority: 176
 status: todo
 attempts: 0
-paths: [compiler/interp, tests/run/fixed_addr_oracle, tests/selfhost]
+paths: [compiler/interp, tests/run/fixed_addr_oracle]
 spec: [spec/SPEC-55-fixed-address-declarations.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0071, 0097, tasks/0328]
 covers: [REQ-OWNER-008, REQ-OWNER-003]
 ---

@@ -10,7 +10,7 @@ depends: [T405, T089]
 priority: 127
 status: todo
 attempts: 0
-paths: [compiler/mir, std/sync/atomic.ax, tests/mir/atomics, tests/ui/concurrency/atomics, tests/selfhost]
+paths: [compiler/mir, std/sync/atomic.ax, tests/mir/atomics, tests/ui/concurrency/atomics]
 locks: [compiler/types/typeck.ax, compiler/verify/verifier.ax, compiler/opt/const_fold.ax, compiler/opt/dce.ax, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-31-atomics.md, 0092, 0128, 0161, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-014, REQ-CONC-051, REQ-CONC-052, REQ-CONC-053, REQ-CONC-056, REQ-CONC-057, REQ-CONC-058, REQ-CONC-061, REQ-CONC-062, REQ-CONC-063, REQ-CONC-064, REQ-CONC-069, REQ-CONC-091, REQ-CONC-092, REQ-ASY-061, REQ-ASY-062, REQ-ATM-003, REQ-ATM-004, REQ-ATM-005, REQ-ATM-009, REQ-ATM-011, REQ-ATM-016, REQ-ATM-017, REQ-ATM-020, REQ-ATM-022, REQ-ATM-023, REQ-ATM-024, REQ-ATM-025, REQ-ATM-027, REQ-CONC-098, REQ-CONC-108, REQ-CONC-118, REQ-CONC-121, REQ-CONC-133, REQ-CONC-142, REQ-CONC-173, REQ-CONC-175, REQ-CONC-177, REQ-CONC-201, REQ-ASY-166]

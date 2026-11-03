@@ -10,7 +10,7 @@ depends: [T516]
 priority: 166
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/sema, tests/ui/security_profiles, tests/selfhost]
+paths: [compiler/driver, compiler/sema, tests/ui/security_profiles]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0342, tasks/0449, tasks/0703]
 covers: [REQ-CAP-010, REQ-CAP-123, REQ-CAP-131]
 ---

@@ -10,7 +10,7 @@ depends: [T558]
 priority: 179
 status: todo
 attempts: 0
-paths: [std/reflect, std/derive, tests/run/derive_std, tests/selfhost]
+paths: [std/reflect, std/derive, tests/run/derive_std]
 spec: [spec/SPEC-61-reflection-derive.md, tasks/0343, tasks/0296, tasks/0433]
 covers: [REQ-CORE-660, REQ-CORE-661, REQ-CORE-662, REQ-CORE-663, REQ-CORE-664, REQ-CORE-665, REQ-CORE-666, REQ-CORE-667, REQ-CORE-668, REQ-CORE-669, REQ-CORE-670, REQ-CORE-671, REQ-CORE-672]
 ---

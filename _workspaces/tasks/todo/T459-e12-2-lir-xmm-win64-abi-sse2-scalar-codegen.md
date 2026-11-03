@@ -10,7 +10,7 @@ depends: [T457, T453]
 priority: 149
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/float, tests/encode/sse2_scalar, tests/abi/win64_float, tests/selfhost]
+paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/float, tests/encode/sse2_scalar, tests/abi/win64_float]
 locks: [compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0331, tasks/0338]
 covers: [REQ-SIMD-325, REQ-SIMD-332]

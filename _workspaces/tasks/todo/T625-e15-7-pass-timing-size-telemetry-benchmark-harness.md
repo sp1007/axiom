@@ -10,7 +10,7 @@ depends: [T622, T624, T628]
 priority: 119
 status: todo
 attempts: 0
-paths: [compiler/driver/perf_telemetry, tools/bench, tests/run/perf_contract, tests/selfhost]
+paths: [compiler/driver/perf_telemetry, tools/bench, tests/run/perf_contract]
 locks: [tools/perf.py]
 spec: [spec/SPEC-76-performance-contract.md, 0074, tasks/0408, tasks/0595, tasks/0706]
 covers: [REQ-OPT-242, REQ-OPT-243, REQ-OPT-244, REQ-OPT-245]

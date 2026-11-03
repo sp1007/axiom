@@ -10,7 +10,7 @@ depends: [T772]
 priority: 700
 status: todo
 attempts: 0
-paths: [compiler/obj, compiler/link, compiler/driver, tests/link/lib, tests/selfhost]
+paths: [compiler/obj, compiler/link, compiler/driver, tests/link/lib]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, 0164, 0217, 0099, tasks/0369, 0185]
 covers: [REQ-OWNER-006, REQ-LNK-057, REQ-LNK-058, REQ-LNK-059, REQ-LNK-060, REQ-LNK-061, REQ-LNK-062, REQ-LNK-063, REQ-LNK-064, REQ-LNK-065, REQ-LNK-066, REQ-LNK-067, REQ-LNK-068, REQ-LNK-069, REQ-LNK-070, REQ-LNK-071, REQ-LNK-072, REQ-LNK-211, REQ-LNK-212, REQ-LNK-213, REQ-LNK-214, REQ-LNK-215, REQ-LNK-216, REQ-LNK-217, REQ-LNK-218, REQ-LNK-219, REQ-LNK-220, REQ-LNK-221, REQ-LNK-222, REQ-LNK-223, REQ-LNK-224, REQ-LNK-225, REQ-LNK-226]
 ---

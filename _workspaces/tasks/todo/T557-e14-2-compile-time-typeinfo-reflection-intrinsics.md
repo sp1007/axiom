@@ -10,7 +10,7 @@ depends: [T552, T556]
 priority: 177
 status: todo
 attempts: 0
-paths: [compiler/sema/reflect.ax, compiler/interp/reflect.ax, tests/run/reflect, tests/ui/reflect, tests/selfhost]
+paths: [compiler/sema/reflect.ax, compiler/interp/reflect.ax, tests/run/reflect, tests/ui/reflect]
 spec: [spec/SPEC-61-reflection-derive.md, tasks/0343, tasks/0296, tasks/0433]
 covers: [REQ-CTM-043, REQ-CTM-045, REQ-CORE-622, REQ-CORE-623, REQ-CORE-624, REQ-CORE-625, REQ-CORE-626, REQ-CORE-627, REQ-CORE-628, REQ-CORE-629, REQ-CORE-630, REQ-CORE-631, REQ-CORE-632, REQ-CORE-633, REQ-CORE-634, REQ-CORE-635, REQ-CORE-636, REQ-CORE-637, REQ-CORE-638, REQ-CORE-639]
 ---

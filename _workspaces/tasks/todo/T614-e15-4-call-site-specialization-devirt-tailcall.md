@@ -10,7 +10,7 @@ depends: [T064]
 priority: 108
 status: todo
 attempts: 0
-paths: [compiler/opt/ipa, compiler/opt/devirt, tests/run/opt_ipa_devirt, tests/selfhost]
+paths: [compiler/opt/ipa, compiler/opt/devirt, tests/run/opt_ipa_devirt]
 spec: [spec/SPEC-73-inlining-specialization-devirt.md, 0131, tasks/0400, tasks/0401, tasks/0551]
 covers: [REQ-OPT-087, REQ-OPT-088, REQ-OPT-089, REQ-OPT-090, REQ-OPT-091, REQ-OPT-092, REQ-OPT-093, REQ-OPT-094, REQ-OPT-095, REQ-OPT-096, REQ-OPT-097, REQ-OPT-098, REQ-OPT-099, REQ-OPT-100, REQ-OPT-101, REQ-OPT-102, REQ-OPT-103, REQ-OPT-104, REQ-OPT-105, REQ-OPT-106, REQ-OPT-107]
 ---

@@ -10,7 +10,7 @@ depends: [T511]
 priority: 161
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/hir, compiler/sema, tests/ui/freestanding, tests/selfhost]
+paths: [compiler/driver, compiler/hir, compiler/sema, tests/ui/freestanding]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0358, tasks/0359, tasks/0455]
 covers: [REQ-ABI-102, REQ-ABI-031]
 ---

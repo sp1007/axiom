@@ -10,8 +10,8 @@ depends: [T450]
 priority: 141
 status: todo
 attempts: 0
-paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/int128, tests/mir/int128, tests/selfhost]
-locks: [compiler/verify/verifier.ax, compiler/diag/code.ax, tests/selfhost]
+paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/int128, tests/mir/int128, tests/selfhost/lex, tests/selfhost/parse, tests/selfhost/hir, tests/selfhost/typeck, tests/selfhost/mir]
+locks: [compiler/verify/verifier.ax, compiler/diag/code.ax]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-OWNER-007, REQ-SIMD-247, REQ-SIMD-263, REQ-SIMD-268, REQ-SIMD-318]
 ---

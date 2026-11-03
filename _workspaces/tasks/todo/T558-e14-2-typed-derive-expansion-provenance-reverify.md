@@ -10,7 +10,7 @@ depends: [T557]
 priority: 178
 status: todo
 attempts: 0
-paths: [compiler/hir/derive.ax, compiler/sema/derive_check.ax, compiler/mir, tests/ui/derive, tests/mir/derive, tests/selfhost]
+paths: [compiler/hir/derive.ax, compiler/sema/derive_check.ax, compiler/mir, tests/ui/derive, tests/mir/derive]
 spec: [spec/SPEC-61-reflection-derive.md, tasks/0343, tasks/0509]
 covers: [REQ-CORE-640, REQ-CORE-641, REQ-CORE-642, REQ-CORE-643, REQ-CORE-644, REQ-CORE-645, REQ-CORE-646, REQ-CORE-647, REQ-CORE-648, REQ-CORE-649, REQ-CORE-650, REQ-CORE-651, REQ-CORE-652, REQ-CORE-653, REQ-CORE-654, REQ-CORE-655, REQ-CORE-656, REQ-CORE-657, REQ-CORE-658, REQ-CORE-659, REQ-CORE-2143, REQ-CORE-2144, REQ-CORE-2145, REQ-CORE-2146, REQ-CORE-2147, REQ-CORE-2148, REQ-CORE-2149, REQ-CORE-2170, REQ-CORE-2171, REQ-CORE-2172, REQ-CORE-2173, REQ-CORE-2174, REQ-CORE-2175, REQ-CORE-2176, REQ-CORE-2177, REQ-CORE-2178, REQ-CORE-2179]
 ---

@@ -10,7 +10,7 @@ depends: [T521]
 priority: 171
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/sema, compiler/mir, compiler/interp, std/panic, tests/ui/panic, tests/run/panic_oracle, tests/selfhost]
+paths: [compiler/driver, compiler/sema, compiler/mir, compiler/interp, std/panic, tests/ui/panic, tests/run/panic_oracle]
 spec: [spec/SPEC-54-panic-unwinding.md, 0229, tasks/0351, tasks/0700]
 covers: [REQ-FFI-041, REQ-FFI-093, REQ-ABI-096, REQ-ABI-105]
 ---

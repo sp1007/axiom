@@ -10,7 +10,7 @@ depends: [T475, T464]
 priority: 166
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/types, compiler/verify, compiler/driver, tests/ui/simd/target_feature, tests/selfhost]
+paths: [compiler/hir, compiler/types, compiler/verify, compiler/driver, tests/ui/simd/target_feature]
 locks: [compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-44-cpu-features-multiversioning.md, spec/SPEC-04-core-extensibility.md, 0095, tasks/0344, tasks/0453]
 covers: [REQ-SIMD-051, REQ-SIMD-079, REQ-SIMD-243, REQ-SIMD-256]

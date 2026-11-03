@@ -10,7 +10,7 @@ depends: [T501]
 priority: 152
 status: todo
 attempts: 0
-paths: [compiler/interp, tests/run/unsafe/oracle_ub, tests/selfhost]
+paths: [compiler/interp, tests/run/unsafe/oracle_ub]
 spec: [spec/SPEC-50-unsafe-ub-ffi.md, 0071, 0044, tasks/0339]
 covers: [REQ-OWNER-008, REQ-CAP-001, REQ-CAP-002, REQ-CAP-005, REQ-CAP-007, REQ-CAP-019, REQ-CAP-037, REQ-CAP-038, REQ-CAP-041, REQ-CAP-048, REQ-FFI-027, REQ-FFI-038, REQ-FFI-044, REQ-FFI-045, REQ-CAP-059, REQ-CAP-071, REQ-CAP-078, REQ-CAP-084, REQ-CAP-087, REQ-CAP-088, REQ-CAP-091, REQ-CAP-095, REQ-CAP-098, REQ-CAP-103, REQ-CAP-111, REQ-FFI-085, REQ-FFI-088, REQ-CAP-124, REQ-CAP-126, REQ-CAP-133, REQ-MIR-142, REQ-CAP-145, REQ-FFI-128]
 ---

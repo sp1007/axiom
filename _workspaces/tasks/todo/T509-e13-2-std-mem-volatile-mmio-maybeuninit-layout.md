@@ -10,7 +10,7 @@ depends: [T508]
 priority: 158
 status: todo
 attempts: 0
-paths: [std/mem, tests/std/mem_volatile_mmio, tests/selfhost]
+paths: [std/mem, tests/std/mem_volatile_mmio]
 spec: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0067, 0072, tasks/0328]
 covers: [REQ-FFI-031, REQ-RES-137, REQ-RES-160, REQ-RES-161]
 ---

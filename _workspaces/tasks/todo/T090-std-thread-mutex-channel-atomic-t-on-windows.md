@@ -10,7 +10,7 @@ depends: [T211, T089, T401, T407, T408, T410]
 priority: 132
 status: todo
 attempts: 0
-paths: [std/thread, std/sys/windows/thread.ax, tests/std/thread, tests/selfhost]
+paths: [std/thread, std/sys/windows/thread.ax, tests/std/thread]
 locks: [std/core/host.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax, tests/selfhost]
 spec: [spec/SPEC-32-threads-sync.md, 0203, 0206, 0207, 0208, tasks/0329, tasks/0623]
 covers: [REQ-CONC-219]

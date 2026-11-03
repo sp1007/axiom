@@ -10,7 +10,7 @@ depends: [T451]
 priority: 143
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native, tests/selfhost]
+paths: [compiler/lir, compiler/abi, compiler/target/x64, tests/lir/int128, tests/encode/int128, tests/run/int128_native]
 locks: [compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, 0162, 0179, 0181, tasks/0327]
 covers: [REQ-SIMD-027, REQ-SIMD-266, REQ-SIMD-267]

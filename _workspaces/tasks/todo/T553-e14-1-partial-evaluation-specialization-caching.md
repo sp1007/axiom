@@ -10,7 +10,7 @@ depends: [T552]
 priority: 173
 status: todo
 attempts: 0
-paths: [compiler/opt, compiler/sema/specialize.ax, compiler/driver, tests/mir/specialize, tests/run/specialize, tests/selfhost]
+paths: [compiler/opt, compiler/sema/specialize.ax, compiler/driver, tests/mir/specialize, tests/run/specialize]
 spec: [spec/SPEC-60-comptime-2-0.md, tasks/0346, tasks/0509, tasks/0514]
 covers: [REQ-CTM-041, REQ-CTM-042, REQ-CORE-730, REQ-CORE-731, REQ-CORE-732, REQ-CORE-733, REQ-CORE-734, REQ-CORE-735, REQ-CORE-736, REQ-CORE-737, REQ-CORE-738, REQ-CORE-739, REQ-CORE-740, REQ-CORE-741, REQ-CORE-742, REQ-CORE-743, REQ-CORE-744, REQ-CORE-745, REQ-CORE-746, REQ-CORE-747, REQ-CORE-748, REQ-CORE-749, REQ-CORE-750, REQ-CORE-751, REQ-CORE-752, REQ-CORE-753, REQ-CORE-754, REQ-CORE-2284, REQ-CORE-2285, REQ-CORE-2286, REQ-CORE-2287, REQ-CORE-2288, REQ-CORE-2289, REQ-CORE-2290, REQ-CORE-2291, REQ-CORE-2292, REQ-CORE-2293, REQ-CORE-2294, REQ-CORE-2295, REQ-CORE-2296, REQ-CORE-2297, REQ-CORE-2298, REQ-CORE-2299, REQ-CORE-2300, REQ-CORE-2301, REQ-CORE-2302, REQ-CORE-2303]
 ---

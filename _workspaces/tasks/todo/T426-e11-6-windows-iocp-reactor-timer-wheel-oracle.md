@@ -10,7 +10,7 @@ depends: [T425, T422, T423]
 priority: 149
 status: todo
 attempts: 0
-paths: [std/sys/windows/iocp.ax, std/async/reactor.ax, std/async/timer.ax, tests/std/async/reactor, tests/selfhost]
+paths: [std/sys/windows/iocp.ax, std/async/reactor.ax, std/async/timer.ax, tests/std/async/reactor]
 locks: [std/core/host.ax, std/async/mod.ax, std/async/executor.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax, tests/selfhost]
 spec: [spec/SPEC-35-async-io.md, 0221, tasks/0335, tasks/0438, tasks/0440, tasks/0464]
 covers: [REQ-ASY-153, REQ-ASY-154, REQ-ASY-158, REQ-ASY-159]

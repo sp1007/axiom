@@ -66,7 +66,7 @@ panic relative to observable effects. [0032 §42-44, §50; tasks/0327 ANUM-34]
 **AXS-SEM-010 — Scalar types of v0.1.** The integer types `i8 i16 i32 i64 isize u8 u16 u32 u64
 usize`, `bool`, `char`, the unit type `()` and `never`. `Str` (string view, T041) is defined with
 strings; float types `f32`/`f64` are reserved and rejected by axiom0 type checking with
-`AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` (they arrive in E12.2); `i128`/`u128` are not part of v0.1
+`AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` (they arrive in E12.2, specified in `spec/SPEC-41-floating-point.md` `AXS-FLT-001..006`); `i128`/`u128` are not part of v0.1
 (they arrive in E12.1, specified in `spec/SPEC-40-integers.md` `AXS-INT-001..012`). [tasks/0327 ANUM-24; tasks/0494 §5; ROADMAP R7]
 
 **AXS-SEM-011 — Integer representation.** `iN`/`uN` are N-bit two's-complement / unsigned
@@ -121,7 +121,7 @@ is `AX_TYPE_NEG_UNSIGNED`, except `-0`. [SPEC-01 AXS-LEX-050, AXS-LEX-054; tasks
 **AXS-SEM-022 — No implicit conversions.** In v0.1 (`axiom0`), values never change type implicitly: no widening, no
 narrowing, no signed/unsigned mixing, no integer↔bool, no integer↔char. Operands of every binary
 arithmetic, bitwise and comparison operator have the same type (shift amounts excepted,
-AXS-SEM-034). `let y: i64 = x` with `x: i32` is `AX_TYPE_MISMATCH`. In `axiomc` (`E12.1`, `spec/SPEC-40-integers.md` `AXS-INT-050..054`), multi-width integer arithmetic, bitwise, comparison, and array-index expressions promote narrower integer operands deterministically along the `REQ-OWNER-007` integer promotion sub-lattice via explicit `MIR_RVALUE_CAST` (`IntToInt`) lowering, while standalone bindings/assignments/returns/arguments (`let y: i64 = x`) and standalone same-width signed/unsigned operations continue to emit `AX_TYPE_MISMATCH`. [tasks/0327 ANUM-35..37; 0032
+AXS-SEM-034). `let y: i64 = x` with `x: i32` is `AX_TYPE_MISMATCH`. In `axiomc` (`E12.1`, `spec/SPEC-40-integers.md` `AXS-INT-050..054`; `E12.2`, `spec/SPEC-41-floating-point.md` `AXS-FLT-030..037`), multi-width integer and mixed integer/float binary arithmetic, bitwise, comparison, and array-index expressions (`x_f64 + n_i32`, `a_f64 + i_i32 * k_i16`, `w_f32 + 0.5`) promote narrower integer/float operands and unsuffixed literals deterministically along the `REQ-OWNER-007` numeric promotion lattice (`join_num`, where `join_num(F, Int) = F`) via explicit `MIR_RVALUE_CAST` (`IntToInt`, `IntToFloat`, `FloatConvert`) lowering, while standalone variable bindings/assignments/returns/arguments (`let y: i64 = x_i32`, `let x: f64 = n_i32`, `let n: i32 = x_f64`, `let x: f64 = w_f32`), narrowing conversions, and standalone same-width signed↔unsigned integer operations (`u32_v + i32_v`) continue to emit `AX_TYPE_MISMATCH`. [tasks/0327 ANUM-35..37; 0032
 §13, §21; 0041 §46; OWNER.md REQ-OWNER-007]
 
 ## 4. Integer operations
@@ -171,7 +171,7 @@ arithmetic shift for signed `T` and a logical shift for unsigned `T`. `<<=`, `>>
 [tasks/0327 §14, ANUM-45..47; tasks/0334 §14, §16; 0032 §20; 0041 §45]
 
 **AXS-SEM-035 — Comparisons.** `== != < <= > >=` on two operands of the same type, for integer
-types (numeric order), `bool` (`false < true`) and `char` (scalar order). In axiom0 these are the
+types (numeric order), `bool` (`false < true`) and `char` (scalar order); in `axiomc` (`E12.2`, `spec/SPEC-41-floating-point.md` `AXS-FLT-020..021`), `f32` and `f64` implement IEEE-754 partial ordering (`PartialEq`/`PartialOrd`, where `NaN` compares `false` for `== < <= > >=` and `true` for `!=`, and `-0.0 == +0.0`). In axiom0 these are the
 only built-in comparisons: aggregates, enums and `Str` compare through `Eq`/`Ord` impls (derive,
 T056; std, T069/T071) or explicit `as` casts of fieldless enums. Comparisons do not chain
 (AXS-GRM-051). [0032 §22; 0041 §46]
@@ -288,7 +288,7 @@ every other pair is `AX_TYPE_INVALID_CAST` (with a hint naming the closest valid
 | `*const T` / `*mut T` | `usize`, `isize` | the address (oracle: ADR-0002 §5) | T061a |
 | `usize`, `isize` | `*const T` / `*mut T` | the address; dereferencing stays `unsafe` | T061a |
 | `T` | `T` (same type) | identity | T034 |
-| `f32`, `f64` on either side | — | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` in axiom0 (E12.2) | T034 |
+| `f32`, `f64` on either side | `IntTy`, `f32`, `f64` | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` in axiom0; in `axiomc` (`E12.2`, `spec/SPEC-41-floating-point.md` `AXS-FLT-022..024`), `FloatToInt` is saturating (`NaN -> 0`, clamped to `[T.MIN, T.MAX]`), `IntToFloat` uses IEEE-754 `roundTiesToEven`, and `FloatConvert` converts between `f32` and `f64` | T034 / T458 |
 
 Not allowed: integer → `bool` (write `x != 0`), integer → `enum`, `char` → `u8`/`u16`/`i8`/`i16`
 (write `c as u32` and narrow explicitly), other integers → `char` (go through `u32`), anything on

@@ -10,7 +10,7 @@ depends: [T528, T531, T751]
 priority: 181
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/module_rel_dll, tests/selfhost]
+paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/module_rel_dll]
 spec: [spec/SPEC-56-module-relative-bindings.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0187, 0104, tasks/0336]
 covers: [REQ-OWNER-005, REQ-FFI-119]
 ---

@@ -10,7 +10,7 @@ depends: [T217]
 priority: 95
 status: todo
 attempts: 0
-paths: [compiler/target/x64, compiler/link, tests/run/unwind, tests/selfhost]
+paths: [compiler/target/x64, compiler/link, tests/run/unwind]
 spec: [0188, 0190]
 covers: [REQ-ERR-001, REQ-ERR-002, REQ-ERR-003]
 ---

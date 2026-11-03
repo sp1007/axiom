@@ -10,7 +10,7 @@ depends: [T562]
 priority: 183
 status: todo
 attempts: 0
-paths: [compiler/mir/gen_lower.ax, compiler/verify, compiler/interp, tests/mir/generators, tests/run/generators, tests/selfhost]
+paths: [compiler/mir/gen_lower.ax, compiler/verify, compiler/interp, tests/mir/generators, tests/run/generators]
 spec: [spec/SPEC-62-generators.md, tasks/0512, tasks/0539]
 covers: [REQ-CORE-3008, REQ-CORE-3009, REQ-CORE-3010, REQ-CORE-3011, REQ-CORE-3012, REQ-CORE-3013, REQ-CORE-3014, REQ-CORE-3015, REQ-CORE-3016, REQ-CORE-3017, REQ-CORE-3018]
 ---

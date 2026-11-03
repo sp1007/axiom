@@ -48,7 +48,9 @@ Groups: `KERN` kernel, `LAYER` architecture layers, `DIAG` diagnostics, `DET` de
 pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM` frozen semantic model,
 `BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02, `CONC` concurrency,
 memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`), `INT` scalar integer
-model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`). A new group is added by editing this list.
+model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`), `FLT` IEEE-754
+floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
+`std.math` (`SPEC-41`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -562,11 +564,41 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 - since: T455
 - check: execution tests in tests/run/numeric (T455, Pattern D) and UI tests in tests/ui/typeck verify deterministic multi-width integer promotion in expressions, explicit `MIR_RVALUE_CAST` emission, homogeneous MIR verifier enforcement, and `AX_TYPE_MISMATCH` preservation on standalone bindings and same-width signed/unsigned mixing
 
+## 13. Floating-point semantics, mixed-type promotion lattice, and deterministic math (SPEC-41)
+
+### INV-FLT-001 — Complete 12-primitive promotion lattice (`join_num`) and contextual literal adaptation lower to explicit `MIR_RVALUE_CAST`
+- statement: The typechecker (`compiler/types/typeck.ax`) and MIR builder (`compiler/mir/builder.ax`) evaluate mixed numeric expressions over all scalar numeric types (`i8..i128`, `u8..u128`, `isize`, `usize`, `f32`, `f64`) plus `IntVar` and `FloatVar` using the partial join operator `join_num` (`SPEC-41` AXS-FLT-030..037, `REQ-OWNER-007` Patterns A, B, C, D): in binary arithmetic and comparison expressions, `f32` widens to `f64` (`FloatConvert`), concrete integer operands (`i8..i128`, `u8..u128`, `isize`, `usize`) and unsuffixed `IntVar` literals promote to a floating-point peer `F` (`join_num(F, Int) = F` via `MIR_CAST_INT_TO_FLOAT`), narrower integers widen along `join_int` (`MIR_CAST_INT_TO_INT`), array indices convert to `usize` (`MIR_CAST_INT_TO_INT`), and unconstrained `FloatVar` defaults to `f64`, while standalone variable/return/argument type mismatches (`let x: f64 = n_i32`, `let n: i32 = x_f64`, `let x: f64 = w_f32`) and standalone same-width signed/unsigned integer operations (`u32_v + i32_v`) are rejected with `AX_TYPE_MISMATCH` (`AXS-FLT-035`), and every implicit promotion is materialized as an explicit `MIR_RVALUE_CAST` (`IntToInt`, `IntToFloat`, `FloatConvert`) so `compiler/verify/verifier.ax` observes strictly homogeneous binary MIR operands.
+- source: OWNER.md REQ-OWNER-007; tasks/0331; tasks/0338; tasks/0345; SPEC-40 AXS-INT-050..054; SPEC-41 AXS-FLT-030..037
+- verify: tests/typeck/float, tests/mir/float_mixed
+- since: T457
+- check: typeck and MIR dump tests in tests/typeck/float (T457), tests/mir/float_mixed (T457), and execution tests in tests/run/numeric/mixed_expr_matrix (T462 Patterns A/B/C/D) verify `f32 -> f64` widening, concrete integer and `IntVar -> Float` promotion (`MIR_CAST_INT_TO_FLOAT`), explicit `MIR_RVALUE_CAST` generation, and `AX_TYPE_MISMATCH` on standalone bindings/narrowing or same-width signed/unsigned mixing
+
+### INV-FLT-002 — Strict IEEE-754 binary32/binary64 arithmetic, canonical quiet `NaN`, signed zero (`-0.0`), and saturating `FloatToInt` casts
+- statement: Scalar `f32` and `f64` operations obey IEEE-754-2019 binary32 and binary64 with `roundTiesToEven`, canonical quiet `NaN` (`0x7FC0_0000u32` / `0x7FF8_0000_0000_0000u64`), signed zero (`+0.0` vs `-0.0`) preservation, non-trapping division by zero (`±inf` / `NaN`), partial `UCOMISS`/`UCOMISD` comparisons (`NaN != NaN` is `true`, all other relational predicates on `NaN` are `false`, `-0.0 == +0.0` is `true`), no implicit `-ffast-math` reassociation or silent FMA contraction, and saturating `FloatToInt` `as` casts (`NaN -> 0`, clamped to `[T.MIN, T.MAX]`, never undefined behaviour or raw `0x8000...` hardware sentinel) with bit-for-bit agreement between `--interp` and native x86-64 (SPEC-41 AXS-FLT-001..025).
+- source: tasks/0331; tasks/0345; tasks/0469; CATALOG.md REQ-SIMD-108..110, REQ-SIMD-163, REQ-SIMD-186..188; SPEC-41 AXS-FLT-001..025
+- verify: tests/mir/float_interp, tests/opt/float_strict
+- since: T458
+- check: float oracle and strict-FP optimizer tests in tests/mir/float_interp (T458), tests/opt/float_strict (T458), and E12.2 conformance tests in tests/conformance/p12/e12_2_floating_point (T462) verify IEEE-754 arithmetic, signed zero, `NaN` propagation, partial and total comparisons, saturating `FloatToInt` casts, and differential oracle vs native parity
+
+### INV-FLT-003 — LIR `Xmm` register class, Windows x64 ABI `XMM0`–`XMM3` parameter slots, `XMM6`–`XMM15` callee-saved preservation, and SSE2 unordered comparison lowering
+- statement: `compiler/lir/` and `compiler/target/x64/` lower `f32` and `f64` through `RegClass.Xmm` (`XMM0`–`XMM15`), pass floating-point arguments in positional slots `0..3` via `XMM0`–`XMM3` (mirroring to `RCX`/`RDX`/`R8`/`R9` on variadic `extern "C"` calls) and return scalars in `XMM0`, save and restore full 128-bit non-volatile `XMM6`–`XMM15` registers in `FrameLayout` whenever clobbered, deduplicate `.rdata` float constants by exact bit pattern (`+0.0` distinct from `-0.0`), and lower `UCOMISS`/`UCOMISD` `==`/`!=` with explicit parity (`PF`) checks (`SETE+SETNP+AND` for `==`, `SETNE+SETP+OR` for `!=`) (SPEC-41 AXS-FLT-040..044).
+- source: 0162; 0179; 0181; 0182; SPEC-04 AXS-EXT-050, AXS-EXT-052; SPEC-41 AXS-FLT-040..044
+- verify: tests/lir/float, tests/encode/sse2_scalar, tests/abi/win64_float
+- since: T459
+- check: LIR, SSE2 encoding, and Win64 ABI float tests in tests/lir/float (T459), tests/encode/sse2_scalar (T459), tests/abi/win64_float (T459), and E12.2 conformance tests in tests/conformance/p12/e12_2_floating_point (T462) verify mixed integer/float Win64 ABI calls (>4 parameters, variadic FFI), `XMM6`–`XMM15` preservation across calls, `.rdata` `-0.0` vs `+0.0` constant pooling, and `UCOMISS`/`UCOMISD` `NaN` comparison flags
+
+### INV-FLT-004 — Pure-Axiom deterministic `std.text.fmt.float` round-trip formatting/parsing and `std.math` transcendental accuracy without OS `libm`
+- statement: `std.text.fmt.float` (`T460`) and `std.math` (`T461`) are implemented in 100% pure Axiom without calling host C `snprintf`/`strtod` or OS `libm`, guaranteeing exact round-trip formatting (`parse(format(x)).unwrap().to_bits() == x.to_bits()`), canonical `"NaN"`/`"inf"`/`"-inf"`/`"-0.0"` formatting, exact `roundTiesToEven` decimal parsing, exact ($\le 0.5\text{ ULP}$) elementary operations (`sqrt`, `fma`, `floor`, `ceil`, `trunc`, `round`, `round_ties_even`, `frexp`, `ldexp`), and bounded ($\le 1.0\text{ ULP}$ / $\le 1.5\text{ ULP}$) minimax + Cody-Waite/Payne-Hanek transcendentals with bit-identical results across all platforms and compiler stages (SPEC-41 AXS-FLT-050..064).
+- source: tasks/0427; tasks/0469; CATALOG.md REQ-SIMD-110, REQ-SIMD-163, REQ-SIMD-186..189; SPEC-41 AXS-FLT-050..064
+- verify: tests/std/float_fmt, tests/std/math, tests/conformance/p12/e12_2_floating_point
+- since: T462
+- check: float formatting/parsing tests in tests/std/float_fmt (T460), `std.math` accuracy/special-value tests in tests/std/math (T461), and E12.2 conformance tests in tests/conformance/p12/e12_2_floating_point (T462) verify round-trip identity, special string formatting, ULP bounds, and IEEE-754 special-value identities
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

@@ -404,23 +404,23 @@ index. The meaning column is the registry summary.
 | `AX_NAME_BREAK_OUTSIDE_LOOP` | E | `break` or `continue` outside a loop | `fn f() { break }` |
 | `AX_NAME_NOT_YET_SUPPORTED` | E | construct parsed but not lowered by this build yet (AXD-014) | a `trait` item before T015b; `data.construct` |
 
-### 10.4 TYPE (tasks T017, T021/T028 for the entry point, T034 for floats)
+### 10.4 TYPE (tasks T017, T021/T028 for the entry point, T034/T457/T458 for floats and mixed-type promotion)
 
 | Code | Sev | Meaning | Example |
 |---|---|---|---|
-| `AX_TYPE_MISMATCH` | E | expression type differs from the expected type | `return true` in a function returning `i32`; `data.expected`, `data.found` |
+| `AX_TYPE_MISMATCH` | E | expression type differs from the expected type in a binding/assignment/return/argument, or same-width signed/unsigned integer operands are mixed without a common supertype (`SPEC-03` AXS-SEM-022, `SPEC-40` AXS-INT-050..051, `SPEC-41` AXS-FLT-035) | `return true` in a function returning `i32`; `let x: f64 = n_i32`; `u32_v + i32_v`; `data.expected`, `data.found` |
 | `AX_TYPE_UNKNOWN` | E | the type cannot be inferred; add an annotation | `let xs = []` |
 | `AX_TYPE_NOT_CALLABLE` | E | callee is not a function | `let x = 1` then `x(2)` |
 | `AX_TYPE_ARG_COUNT` | E | wrong number of arguments | `f(1, 2)` where `fn f(a: i32)`; `data.expected`, `data.found` |
 | `AX_TYPE_RETURN` | E | body can reach its end without producing the declared non-unit value | `fn f(c: bool) -> i32 { if c { return 1 } }` |
-| `AX_TYPE_OPERATOR` | E | operator not defined for these operand types | `true + 1`; `data.operator` |
-| `AX_TYPE_LITERAL_OUT_OF_RANGE` | E | integer literal does not fit its type (`SPEC-03` AXS-SEM-021, `SPEC-40` AXS-INT-004) | `let b: u8 = 300`; `let h: i128 = 170141183460469231731687303715884105728i128` |
+| `AX_TYPE_OPERATOR` | E | operator not defined for these operand types (`SPEC-41` AXS-FLT-033) | `true + 1`; `x_f64 & 1.0`; `data.operator` |
+| `AX_TYPE_LITERAL_OUT_OF_RANGE` | E | numeric literal does not fit its type (`SPEC-03` AXS-SEM-021, `SPEC-40` AXS-INT-004, `SPEC-41` AXS-FLT-003) | `let b: u8 = 300`; `let h: i128 = 170141183460469231731687303715884105728i128`; `let f: f32 = 1e40f32` |
 | `AX_TYPE_NEG_UNSIGNED` | E | unary minus applied to an unsigned type | `let n: u32 = -1` |
-| `AX_TYPE_INVALID_CAST` | E | `as` cast between types SPEC-03 / SPEC-40 does not allow | `true as u8 as bool` (cast to `bool`) |
+| `AX_TYPE_INVALID_CAST` | E | `as` cast between types SPEC-03 / SPEC-40 / SPEC-41 does not allow | `true as u8 as bool` (cast to `bool`); `1.5f64 as bool` |
 | `AX_TYPE_NEVER_RETURNS` | E | a function declared to return `never` can return normally | `fn fail() -> never { }` |
 | `AX_TYPE_MAIN_MISSING` | E | the root file has no `fn main` (build/run) | a file containing only `fn f() {}` |
 | `AX_TYPE_MAIN_SIGNATURE` | E | `main` signature not allowed by SPEC-03 | `fn main(x: i32) -> i32 { x }` |
-| `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E | valid Axiom outside the axiom0 subset (AXD-013) | `let x = 1.5`; `static N: i32 = 1`; `@at(0x1000) static R: u32`; `data.construct`, `data.epic` |
+| `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E | valid Axiom outside the axiom0 subset (AXD-013) | `let x = 1.5` (supported in `axiomc` via `SPEC-41`); `static N: i32 = 1`; `@at(0x1000) static R: u32`; `data.construct`, `data.epic` |
 
 ### 10.5 VERIFY (tasks T018, T020)
 
@@ -535,4 +535,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

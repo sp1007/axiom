@@ -10,7 +10,7 @@ depends: [T420, T090]
 priority: 146
 status: todo
 attempts: 0
-paths: [std/fiber, std/sys/windows/fiber.ax, tests/std/fiber, tests/selfhost]
+paths: [std/fiber, std/sys/windows/fiber.ax, tests/std/fiber]
 locks: [std/core/host.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax, tests/selfhost]
 spec: [spec/SPEC-34-executors-fibers.md, 0204, 0205, tasks/0277, tasks/0836]
 covers: [REQ-CONC-151, REQ-CONC-189]

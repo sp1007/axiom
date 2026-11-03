@@ -10,7 +10,7 @@ depends: [T456, T451]
 priority: 147
 status: todo
 attempts: 0
-paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/float, tests/mir/float_mixed, tests/selfhost]
+paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/float, tests/mir/float_mixed]
 locks: [compiler/verify/verifier.ax, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-41-floating-point.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-OWNER-007, REQ-SIMD-174, REQ-SIMD-175, REQ-SIMD-270]

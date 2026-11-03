@@ -10,7 +10,7 @@ depends: [T458, T459, T454]
 priority: 150
 status: todo
 attempts: 0
-paths: [std/core/float.ax, std/text/fmt/float.ax, tests/std/float_fmt, tests/selfhost]
+paths: [std/core/float.ax, std/text/fmt/float.ax, tests/std/float_fmt]
 locks: [std/core/prelude.ax, std/text/fmt/format.ax, tests/selfhost]
 spec: [spec/SPEC-41-floating-point.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-SIMD-160, REQ-SIMD-322]

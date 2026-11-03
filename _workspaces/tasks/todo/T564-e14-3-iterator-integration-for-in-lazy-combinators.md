@@ -10,7 +10,7 @@ depends: [T563]
 priority: 184
 status: todo
 attempts: 0
-paths: [std/iter, compiler/lowering, tests/run/iter_gen, tests/selfhost]
+paths: [std/iter, compiler/lowering, tests/run/iter_gen]
 spec: [spec/SPEC-62-generators.md, tasks/0512]
 covers: [REQ-CORE-3019, REQ-CORE-3020, REQ-CORE-3021, REQ-CORE-3022, REQ-CORE-3023, REQ-CORE-3024, REQ-CORE-3025]
 ---

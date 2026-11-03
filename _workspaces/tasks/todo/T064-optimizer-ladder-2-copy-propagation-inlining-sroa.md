@@ -10,7 +10,7 @@ depends: [T215, T603, T607, T613]
 priority: 107
 status: todo
 attempts: 0
-paths: [compiler/opt, tests/opt2, tests/selfhost]
+paths: [compiler/opt, tests/opt2]
 spec: [spec/SPEC-73-inlining-specialization-devirt.md, 0165, 0226, tasks/0366, tasks/0399, tasks/0401, tasks/0551]
 covers: [REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006, REQ-OPT-114, REQ-OPT-115, REQ-OPT-116, REQ-OPT-117, REQ-OPT-118, REQ-OPT-119, REQ-OPT-120, REQ-OPT-121, REQ-OPT-122, REQ-OPT-123, REQ-OPT-124, REQ-OPT-315, REQ-OPT-316, REQ-OPT-317, REQ-OPT-318]
 ---

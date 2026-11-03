@@ -10,7 +10,7 @@ depends: [T522]
 priority: 172
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/run/panic_native, tests/selfhost]
+paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/run/panic_native]
 spec: [spec/SPEC-54-panic-unwinding.md, 0188, 0229, tasks/0351, tasks/0700]
 covers: [REQ-FFI-094, REQ-FFI-004, REQ-FFI-019, REQ-ABI-096]
 ---

@@ -10,7 +10,7 @@ depends: [T312, T611, T616]
 priority: 111
 status: todo
 attempts: 0
-paths: [compiler/opt/vectorize, tests/run/opt_loop_vec, tests/selfhost]
+paths: [compiler/opt/vectorize, tests/run/opt_loop_vec]
 spec: [spec/SPEC-74-auto-vectorization.md, 0095, tasks/0402, tasks/0403, tasks/0406, tasks/0407]
 covers: [REQ-OPT-206, REQ-OPT-209, REQ-OPT-210, REQ-OPT-211]
 ---

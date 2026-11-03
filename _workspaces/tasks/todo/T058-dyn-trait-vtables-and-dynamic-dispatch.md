@@ -10,7 +10,7 @@ depends: [T214, T566]
 priority: 187
 status: todo
 attempts: 0
-paths: [compiler/traits, compiler/mir, compiler/interp, tests/run/dyn, tests/ui/dyn, tests/selfhost]
+paths: [compiler/traits, compiler/mir, compiler/interp, tests/run/dyn, tests/ui/dyn]
 spec: [spec/SPEC-63-dyn-trait-vtables.md, tasks/0476, 0212]
 covers: [REQ-CORE-3036, REQ-CORE-3037, REQ-CORE-3038, REQ-CORE-3039, REQ-CORE-3040]
 ---

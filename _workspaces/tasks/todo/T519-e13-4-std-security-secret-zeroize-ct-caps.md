@@ -10,7 +10,7 @@ depends: [T517, T518]
 priority: 168
 status: todo
 attempts: 0
-paths: [std/security, tests/std/security, tests/selfhost]
+paths: [std/security, tests/std/security]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0342, tasks/0449, tasks/0467, tasks/0703]
 covers: [REQ-CAP-135, REQ-CAP-136, REQ-CAP-138, REQ-CAP-139]
 ---

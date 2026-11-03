@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T450]
 priority: 146
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-41-floating-point.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md, spec/SPEC-03-core-semantics.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0331, tasks/0338, tasks/0345, tasks/0427, tasks/0431, tasks/0469]
 covers: [REQ-OWNER-007, REQ-SIMD-108, REQ-SIMD-109, REQ-SIMD-110, REQ-SIMD-163, REQ-SIMD-186, REQ-SIMD-187, REQ-SIMD-188, REQ-SIMD-189]
+started: 2026-11-03 07:51:56
+finished: 2026-11-03 08:25:20
 ---
 # T456 — E12.2 — Canonical IEEE-754 floating-point, mixed-type promotion lattice & math specification (SPEC-41)
 
@@ -45,3 +47,5 @@ Specify canonical `spec/SPEC-41-floating-point.md` (`AXS-FLT-*`), defining `f32`
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-03 07:51:56 started (attempt 1) 
+- 2026-11-03 08:25:20 accepted by QA -> done
