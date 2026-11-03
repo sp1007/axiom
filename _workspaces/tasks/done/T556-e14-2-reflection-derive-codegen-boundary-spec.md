@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T214, T550]
 priority: 176
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-61-reflection-derive.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-60-comptime-2-0.md, 0102, 0140, tasks/0343, tasks/0296, tasks/0433]
 covers: [REQ-CTM-019, REQ-CTM-020, REQ-CTM-021, REQ-CTM-022, REQ-CTM-039, REQ-CTM-040, REQ-CORE-602, REQ-CORE-603, REQ-CORE-604, REQ-CORE-605, REQ-CORE-606, REQ-CORE-607, REQ-CORE-608, REQ-CORE-609, REQ-CORE-610, REQ-CORE-611, REQ-CORE-612, REQ-CORE-613, REQ-CORE-614, REQ-CORE-615, REQ-CORE-616, REQ-CORE-617, REQ-CORE-618, REQ-CORE-619, REQ-CORE-620, REQ-CORE-621]
+started: 2026-11-03 11:17:37
+finished: 2026-11-03 11:28:37
 ---
 # T556 — E14.2 — Canonical compile-time reflection API, @derive framework & typed codegen boundary specification (SPEC-61)
 
@@ -42,3 +44,5 @@ Define the canonical compile-time reflection data model (`TypeInfo`, `StructInfo
 
 ## Log
 - 2026-11-03 02:21:00 created by T214 (P14 phase planning)
+- 2026-11-03 11:17:37 started (attempt 1) 
+- 2026-11-03 11:28:37 accepted by QA -> done

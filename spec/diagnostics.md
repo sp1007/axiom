@@ -133,9 +133,15 @@ They map to the areas above as the last column shows. Three groups have no area 
   `AX_CONST_*` in `compiler/diag/code.ax`, `T551`–`T552`) is established for self-hosted `axiomc`, covering
   `comptime fn` runtime call rejection (`AX_CTM_RUNTIME_CALL_FORBIDDEN`, `AX_CTM_NON_CONST_CAPTURE`), sandboxed
   comptime capability verification (`AX_CTM_CAPABILITY_DENIED`), comptime-to-runtime resource no-escape
-  (`AX_CTM_RESOURCE_ESCAPE`), cycle/budget/panic diagnostics (`AX_CTM_CYCLE`, `AX_CTM_STEP_LIMIT`,
+  (`AX_CTM_ESCAPE` / `AX_CTM_RESOURCE_ESCAPE`), cycle/budget/panic diagnostics (`AX_CTM_CYCLE`, `AX_CTM_STEP_LIMIT`,
   `AX_CTM_MEM_LIMIT`, `AX_CTM_PANIC`), and constant static initialization / static move enforcement
-  (`AX_CTM_NON_CONST_STATIC_INIT`, `AX_CTM_STATIC_MOVE_FORBIDDEN`).
+  (`AX_CTM_NON_CONST_STATIC_INIT`, `AX_CTM_STATIC_MOVE_FORBIDDEN`). For E14.2 (`T556` / `SPEC-61 §4`), the `REFLECT`
+  (`AX_REFLECT_*`) and `DERIVE` (`AX_DERIVE_*`) prefixes (alongside `AX_TRAIT_UNKNOWN_DERIVE` in `compiler/diag/code.ax`,
+  `T557`–`T558`) are established for self-hosted `axiomc`, covering private cross-module reflection rejection
+  (`AX_REFLECT_PRIVATE_FIELD`), unspecified layout offset queries (`AX_REFLECT_UNSPECIFIED_LAYOUT`), opt-in runtime
+  reflection enforcement (`AX_REFLECT_RUNTIME_NOT_ENABLED`), unsatisfied derived field/variant bounds with provenance
+  (`AX_DERIVE_FIELD_BOUND`), duplicate or conflicting derived impls (`AX_DERIVE_CONFLICT`), derive/generation cycles
+  (`AX_DERIVE_CYCLE`), and unsupported derive targets (`AX_DERIVE_UNSUPPORTED_ITEM`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -628,9 +634,16 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CTM_PANIC` | E | T552 | explicit `panic(...)` or failed `assert(...)` executed during comptime evaluation (`SPEC-60` AXS-CTM-012, AXS-CTM-050) |
 | `AX_CTM_NON_CONST_STATIC_INIT` | E | T551/T552 | `const`, `static`, or `@thread_local static` initialized with a runtime-only expression (`SPEC-60` AXS-CTM-032, AXS-CTM-050) |
 | `AX_CTM_STATIC_MOVE_FORBIDDEN` | E | T551/T552 | moving a `!Copy` value out of a `static` or `@thread_local static` storage place (`SPEC-60` AXS-CTM-031, AXS-CTM-050) |
+| `AX_REFLECT_PRIVATE_FIELD` | E | T557 | cross-module compile-time reflection (`fields_of<T>()`, `type_info<T>()`, `offset_of<T, F>()`) accesses private fields of `T` without defining-module or `@derive` authority (`SPEC-61` AXS-RFL-010, AXS-RFL-050) |
+| `AX_REFLECT_UNSPECIFIED_LAYOUT` | E | T557 | `offset_of` queried on a non-existent field or a type whose representation does not define a valid addressable field offset (`SPEC-61` AXS-RFL-012, AXS-RFL-050) |
+| `AX_REFLECT_RUNTIME_NOT_ENABLED` | E | T557 | `runtime_type_info<T>()` requested for a type `T` not explicitly opted into runtime reflection via `@reflect(runtime)` (`REQ-CTM-039`, `SPEC-61` AXS-RFL-002, AXS-RFL-050) |
+| `AX_DERIVE_FIELD_BOUND` | E | T558 | `@derive(Trait)` applied to a struct or enum whose field or variant payload type does not implement `Trait`, with provenance spans for `@derive` and the offending field/variant (`SPEC-61` AXS-RFL-021..022, AXS-RFL-050) |
+| `AX_DERIVE_CONFLICT` | E | T558 | duplicate `@derive(Trait)` on the same type, or conflict between `@derive(Trait)` and an explicit `impl Trait for T` (`SPEC-61` AXS-RFL-022, AXS-RFL-050) |
+| `AX_DERIVE_CYCLE` | E | T558 | cyclic derive or compile-time declaration generation dependency (`SPEC-61` AXS-RFL-022, AXS-RFL-050) |
+| `AX_DERIVE_UNSUPPORTED_ITEM` | E | T558 | `@derive(...)` attached to an unsupported declaration kind or illegal combination such as `@derive(Copy)` on a `Drop` type (`SPEC-61` AXS-RFL-021, AXS-RFL-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-60; SPEC-61; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
