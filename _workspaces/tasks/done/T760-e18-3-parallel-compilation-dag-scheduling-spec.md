@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T756]
 priority: 710
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-23-parallel-compilation.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, tasks/0473, tasks/0528, tasks/0530, tasks/0593, tasks/0789, tasks/0790]
 covers: [REQ-DRV-018, REQ-CORE-2669, REQ-CORE-2670, REQ-CORE-2671, REQ-CORE-2672, REQ-CORE-2673, REQ-CORE-2674, REQ-CORE-2675, REQ-CORE-2676, REQ-CORE-2677, REQ-CORE-2678, REQ-CORE-2679, REQ-CORE-2680, REQ-CORE-2681, REQ-CORE-2682, REQ-CORE-2683, REQ-CORE-2684, REQ-CORE-2685, REQ-CORE-2686, REQ-CORE-2687, REQ-CORE-2688, REQ-CORE-2689, REQ-CORE-2690, REQ-CORE-2691, REQ-CORE-2692, REQ-CORE-2693, REQ-CORE-2694, REQ-CORE-2695, REQ-CORE-2696, REQ-CORE-2697, REQ-CORE-2698, REQ-CORE-2699, REQ-CORE-2700, REQ-CORE-2701, REQ-CORE-2702, REQ-CORE-2703, REQ-CORE-2704, REQ-CORE-2705, REQ-CORE-2706, REQ-CORE-2707, REQ-CORE-2708, REQ-CORE-2709, REQ-CORE-2710, REQ-CORE-2711, REQ-CORE-3125, REQ-CORE-3126]
+started: 2026-11-03 12:41:32
+finished: 2026-11-03 13:00:37
 ---
 # T760 — E18.3 — Canonical parallel compilation & deterministic DAG scheduling specification (SPEC-23)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Axiom's parallel compilation archite
 
 ## Log
 - 2026-11-03 02:58:15 created by T218 (P18 phase planning)
+- 2026-11-03 12:41:32 started (attempt 1) 
+- 2026-11-03 13:00:37 accepted by QA -> done
