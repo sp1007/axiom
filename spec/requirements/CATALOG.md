@@ -1556,23 +1556,23 @@
 | REQ-BLD-028 | build | v1-core | Abuild-41 — reproducible builds must not depend on hidden timestamps | 0142 §XXIII.76. Normative Invariants | - | T113 | 
 | REQ-BLD-029 | build | v1-core | Abuild-44 — stale cache entries must not be used | 0142 §XXIII.76. Normative Invariants | - | T113 | 
 | REQ-BLD-030 | build | v1-core | Abuild-57 — self-hosting must preserve language semantics | 0142 §XXIII.76. Normative Invariants | - | T113 | 
-| REQ-RT-001 | runtime | v1-full | Axiom not has “axiom runtime” duy nhất. runtime is tập hợp the capability/runtime component mà chương trình actually sử dụng. | 0143 §# Part XXIV — Runtime · Startup · Hosted/Freestanding · Optional Runtime | - | EPIC(E21.1) |
-| REQ-RT-002 | runtime | v1-full | `main` is not abi trực tiếp of os. | 0143 §XXIV.5. Entry Point | - | EPIC(E21.1) |
-| REQ-RT-003 | runtime | v1-full | But compiler not nhất thiết must thực hiện destructor lúc process exit. | 0143 §XXIV.12. Static Lifetime | - | EPIC(E21.1) |
-| REQ-RT-004 | runtime | v1-full | Not has global drop shutdown default. | 0143 §XXIV.12. Static Lifetime | - | EPIC(E21.1) |
-| REQ-RT-005 | runtime | v1-full | Tls is not global shared state. | 0143 §XXIV.14. TLS | - | EPIC(E21.1) |
-| REQ-RT-006 | runtime | v1-full | If target abi has tls constructor mechanism, that is platform backend detail and must tuân contract of axiom semantics. | 0143 §XXIV.15. TLS Initialization | - | EPIC(E21.1) |
-| REQ-RT-007 | runtime | v1-full | Must not crossing c abi. | 0143 §XXIV.25. Panic Across FFI | - | EPIC(E21.1) |
-| REQ-RT-008 | runtime | v1-full | Must not compiler tự spawn worker threads only vì optimizer. | 0143 §XXIV.27. Không Có Hidden Thread Pool | - | EPIC(E21.1) |
-| REQ-RT-009 | runtime | v1-full | Observable thread creation must not tự phát sinh. | 0143 §XXIV.27. Không Có Hidden Thread Pool | - | EPIC(E21.1) |
-| REQ-RT-010 | runtime | v1-full | File/socket is not core primitive. | 0143 §XXIV.36. IO Runtime | - | EPIC(E21.1) |
-| REQ-RT-011 | runtime | v1-full | This is not core api. | 0143 §XXIV.39. Direct Syscall | - | EPIC(E21.1) |
-| REQ-RT-012 | runtime | v1-full | Must have explicit startup failure policy. | 0143 §XXIV.43. Startup Error | - | EPIC(E21.1) |
-| REQ-RT-013 | runtime | v1-full | Axiom not áp đặt runtime overhead mà semantics not yêu cầu and compiler is tự do loại bỏ all abstraction not observable. | 0143 §XXIV.50. Nhưng Không Hứa “Binary Bằng Assembly” | - | EPIC(E21.1) |
-| REQ-RT-014 | runtime | v1-full | ```text binary must perform heap allocation ``` | 0143 §XXIV.52. Runtime Capability ≠ Source Dependency | - | EPIC(E21.1) |
-| REQ-RT-015 | runtime | v1-full | Aruntime-36 — tls initialization must follow an explicit target contract | 0143 §XXIV.63. Runtime Invariants | - | EPIC(E21.1) |
-| REQ-RT-016 | runtime | v1-full | Aruntime-55 — runtime linking must be reachability/requirement driven | 0143 §XXIV.63. Runtime Invariants | - | EPIC(E21.1) |
-| REQ-RT-017 | runtime | v1-full | Aruntime-63 — runtime cost must correspond to observable or required semantics. | 0143 §XXIV.65. Một nguyên tắc mới rất đáng đưa vào Axiom | - | EPIC(E21.1) |
+| REQ-RT-001 | runtime | v1-full | Axiom not has “axiom runtime” duy nhất. runtime is tập hợp the capability/runtime component mà chương trình actually sử dụng. | 0143 §# Part XXIV — Runtime · Startup · Hosted/Freestanding · Optional Runtime | - | T908 |
+| REQ-RT-002 | runtime | v1-full | `main` is not abi trực tiếp of os. | 0143 §XXIV.5. Entry Point | - | T908 |
+| REQ-RT-003 | runtime | v1-full | But compiler not nhất thiết must thực hiện destructor lúc process exit. | 0143 §XXIV.12. Static Lifetime | - | T908 |
+| REQ-RT-004 | runtime | v1-full | Not has global drop shutdown default. | 0143 §XXIV.12. Static Lifetime | - | T908 |
+| REQ-RT-005 | runtime | v1-full | Tls is not global shared state. | 0143 §XXIV.14. TLS | - | T908 |
+| REQ-RT-006 | runtime | v1-full | If target abi has tls constructor mechanism, that is platform backend detail and must tuân contract of axiom semantics. | 0143 §XXIV.15. TLS Initialization | - | T908 |
+| REQ-RT-007 | runtime | v1-full | Must not crossing c abi. | 0143 §XXIV.25. Panic Across FFI | - | T908 |
+| REQ-RT-008 | runtime | v1-full | Must not compiler tự spawn worker threads only vì optimizer. | 0143 §XXIV.27. Không Có Hidden Thread Pool | - | T908 |
+| REQ-RT-009 | runtime | v1-full | Observable thread creation must not tự phát sinh. | 0143 §XXIV.27. Không Có Hidden Thread Pool | - | T908 |
+| REQ-RT-010 | runtime | v1-full | File/socket is not core primitive. | 0143 §XXIV.36. IO Runtime | - | T908 |
+| REQ-RT-011 | runtime | v1-full | This is not core api. | 0143 §XXIV.39. Direct Syscall | - | T908 |
+| REQ-RT-012 | runtime | v1-full | Must have explicit startup failure policy. | 0143 §XXIV.43. Startup Error | - | T908 |
+| REQ-RT-013 | runtime | v1-full | Axiom not áp đặt runtime overhead mà semantics not yêu cầu and compiler is tự do loại bỏ all abstraction not observable. | 0143 §XXIV.50. Nhưng Không Hứa “Binary Bằng Assembly” | - | T908 |
+| REQ-RT-014 | runtime | v1-full | ```text binary must perform heap allocation ``` | 0143 §XXIV.52. Runtime Capability ≠ Source Dependency | - | T932, T934, T935 |
+| REQ-RT-015 | runtime | v1-full | Aruntime-36 — tls initialization must follow an explicit target contract | 0143 §XXIV.63. Runtime Invariants | - | T908 |
+| REQ-RT-016 | runtime | v1-full | Aruntime-55 — runtime linking must be reachability/requirement driven | 0143 §XXIV.63. Runtime Invariants | - | T908 |
+| REQ-RT-017 | runtime | v1-full | Aruntime-63 — runtime cost must correspond to observable or required semantics. | 0143 §XXIV.65. Một nguyên tắc mới rất đáng đưa vào Axiom | - | T908 |
 | REQ-CORE-130 | compiler | v1-full | Generic resolution MUST default to monomorphization for generic parameters. | 0144 §XXV.11 | - | T752 |
 | REQ-CORE-131 | compiler | v1-full | The compiler MAY specialize monomorphized generic instantiations if the observable behavior remains identical. | 0144 §XXV.12 | - | T752 |
 | REQ-CORE-132 | compiler | v1-full | The MIR MUST be an SSA-oriented, ownership-aware CFG IR. | 0144 §XXV.18 | - | T752 |
@@ -1594,7 +1594,7 @@
 | REQ-DIAG-004 | diagnostics | v1-core | Every diagnostic object MUST contain a primary span indicating the primary location causing the error. | 0146 §XXVII.7 | - | T113 | 
 | REQ-DIAG-005 | diagnostics | v1-core | The compiler MUST NOT emit machine-applicable fix suggestions if the semantics of the fix are not proven by the compiler. | 0146 §XXVII.12 | - | T113 | 
 | REQ-CORE-138 | compiler | v1-full | The compiler MUST record source spans internally using byte offsets. | 0146 §XXVII.21 | - | T752 |
-| REQ-RT-018 | runtime | v1-full | The compiler MUST NOT require heap allocation for its panic reporting machinery. | 0146 §XXVII.30 | - | EPIC(E21.1) |
+| REQ-RT-018 | runtime | v1-full | The compiler MUST NOT require heap allocation for its panic reporting machinery. | 0146 §XXVII.30 | - | T908 |
 | REQ-CORE-139 | compiler | v1-full | The compiler MUST guarantee that all optimization levels produce the same observable semantics. | 0147 §5 | - | T752 |
 | REQ-TOOL-005 | tooling | v1-full | The compiler MUST NOT create artificial physical states for optimized-out variables in order to satisfy debugger queries. | 0147 §6 | - | T816, T818, T819 |
 | REQ-TOOL-006 | tooling | v1-full | The debugger metadata MUST accurately represent logical function frames even if the compiler applies aggressive inlining. | 0147 §8 | - | T816, T818, T819 |
@@ -2343,8 +2343,8 @@
 | REQ-CORE-264 | regalloc | v1-core | Function CALL instructions in Machine IR MUST declare implicit defs for all caller-saved registers defined by the calling convention so that the register allocator recognizes them as clobbered. | 0163 §33 | - | T113 | 
 | REQ-GEN-040 | codegen | v1-core | The x86-64 backend MUST support emitting native SYSCALL instructions with register arguments to allow standalone Linux execution without requiring libc. | 0163 §34 | - | T113 | 
 | REQ-TST-001 | testing | v1-core | The test and validation pipeline MUST decouple backend compiler correctness verification from the presence or completeness of the standard library. | 0163 §35 | - | T113 | 
-| REQ-RT-019 | runtime | v1-full | The hosted Linux runtime startup MUST be capability-driven, linking runtime components such as the allocator, threading, TLS, and panic unwinding only when required by the program capabilities. | 0163 §36 | - | EPIC(E21.1) |
-| REQ-RT-020 | runtime | v1-full | The compiler MUST NOT inject garbage collection runtimes, exception handling tables, reflection metadata, or unused standard library code into compiled binaries when they are not used. | 0163 §37 | - | EPIC(E21.1) |
+| REQ-RT-019 | runtime | v1-full | The hosted Linux runtime startup MUST be capability-driven, linking runtime components such as the allocator, threading, TLS, and panic unwinding only when required by the program capabilities. | 0163 §36 | - | T908 |
+| REQ-RT-020 | runtime | v1-full | The compiler MUST NOT inject garbage collection runtimes, exception handling tables, reflection metadata, or unused standard library code into compiled binaries when they are not used. | 0163 §37 | - | T908 |
 | REQ-TOOL-010 | tooling | v1-full | Debug builds at -O0 MUST emit source line mapping metadata via `.debug_line`. | 0163 §38 | - | T816, T818, T819 |
 | REQ-TOOL-011 | tooling | v1-full | Emission of rich DWARF debugging sections including `.debug_info`, `.debug_abbrev`, and `.debug_str` MAY be deferred to post-MVP tiers. | 0163 §38 | - | T816, T818, T819 |
 | REQ-CORE-265 | compiler | v1-full | The compiler MUST successfully compile an empty `fn main() {}` function through the full pipeline to an ELF64 executable producing exit code 0 without external compiler tools. | 0163 §39 | - | T752 |
@@ -2404,7 +2404,7 @@
 | REQ-LNK-025 | linker | v1-full | The linker must write 64-bit absolute virtual addresses for 64-bit absolute relocations. | 0164 §19. Absolute relocation | - | T774 |
 | REQ-LNK-026 | linker | v1-full | The linker must resolve `_start` as the default execution entry point for native ELF executables. | 0164 §20. Entry Point | - | T774 |
 | REQ-LNK-027 | linker | v1-full | The linker must not interpret language-level `main` as the execution entry point directly. | 0164 §20. Entry Point | - | T774 |
-| REQ-RT-021 | runtime | v1-full | The startup routine `_start` must initialize runtime prerequisites, invoke language-level `main`, and exit with the returned status code. | 0164 §21. Phân biệt main và _start | - | EPIC(E21.1) |
+| REQ-RT-021 | runtime | v1-full | The startup routine `_start` must initialize runtime prerequisites, invoke language-level `main`, and exit with the returned status code. | 0164 §21. Phân biệt main và _start | - | T908 |
 | REQ-LNK-028 | linker | v1-full | The linker must support creating freestanding ELF executables directly from an object defining `_start` without requiring standard runtime libraries. | 0164 §22. Minimal freestanding | - | T774 |
 | REQ-LNK-029 | linker | v1-full | The linker MVP must produce standalone static executables without requiring a libc runtime, shared objects (`.so`), or a dynamic linker (`ld.so`). | 0164 §23. Static linking | - | T774 |
 | REQ-LNK-030 | linker | v1-full | The linker must support static archives (`.a`) by selectively extracting only those member object files that resolve currently unresolved symbols. | 0164 §24. Archive .a | - | T774 |
@@ -5464,77 +5464,77 @@
 | REQ-CORE-1110 | Initialization & Global State | v1-core | Shutdown Semantics Are Independent Of Destruction Order Of Unrelated Globals | tasks/0358 §35. Frozen invariants | - | T113 | 
 | REQ-CORE-1111 | Initialization & Global State | v1-core | Runtime Resources Require Explicit Lifecycle Contracts | tasks/0358 §35. Frozen invariants | - | T113 | 
 | REQ-CORE-1112 | Initialization & Global State | v1-core | Initialization Is A Semantic Property Before Code Generation | tasks/0358 §35. Frozen invariants | - | T113 | 
-| REQ-RT-023 | Runtime Architecture | v1-full | Axiom Has No Mandatory Monolithic Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-024 | Runtime Architecture | v1-full | Runtime Is Composed Of Independent Capabilities | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-025 | Runtime Architecture | v1-full | Runtime Capability Is Distinct From Library Import | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-026 | Runtime Architecture | v1-full | Runtime Dependencies Are Determined Semantically | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-027 | Runtime Architecture | v1-full | Runtime Discovery Occurs After Semantic Verification | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-028 | Runtime Architecture | v1-full | Runtime Discovery Accounts For Semantic Optimization | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-029 | Runtime Architecture | v1-full | Runtime Graph Contains Only Reachable Capabilities | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-030 | Runtime Architecture | v1-full | Runtime Closure Is Minimal With Respect To Required Semantics | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-031 | Runtime Architecture | v1-full | Unused Runtime Components Must Not Be Linked | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-032 | Runtime Architecture | v1-full | Compiler Semantic Elimination May Remove Runtime Dependencies | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-033 | Runtime Architecture | v1-full | Linker Dead Stripping May Further Remove Unreachable Runtime Code | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-034 | Runtime Architecture | v1-full | Runtime Components Must Not Depend On Unrelated Components | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-035 | Runtime Architecture | v1-full | Runtime Dependency Cycles Must Be Explicitly Resolved | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-036 | Runtime Architecture | v1-full | Runtime Components Have Stable Semantic Identity | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-037 | Runtime Architecture | v1-full | Runtime Components Have Target-Specific Implementations | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-038 | Runtime Architecture | v1-full | Runtime Capability Is Distinct From Implementation Mechanism | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-039 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Compiler Intrinsic | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-040 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Generated Code | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-041 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Static Object Code | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-042 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Platform ABI | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-043 | Runtime Architecture | v1-full | Runtime Capability Does Not Imply A Specific Library File | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-044 | Runtime Architecture | v1-full | Allocator Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-045 | Runtime Architecture | v1-full | Thread Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-046 | Runtime Architecture | v1-full | Async Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-047 | Runtime Architecture | v1-full | GPU Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-048 | Runtime Architecture | v1-full | Reflection Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-049 | Runtime Architecture | v1-full | Unwind Runtime Is Profile-Dependent | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-050 | Runtime Architecture | v1-full | Panic Runtime Is Profile-Dependent | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-051 | Runtime Architecture | v1-full | TLS Runtime Is Distinct From Thread Creation Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-052 | Runtime Architecture | v1-full | Atomic Operations Do Not Require Thread Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-053 | Runtime Architecture | v1-full | Future Construction Does Not Require Async Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-054 | Runtime Architecture | v1-full | Async Execution Requires An Explicit Execution Capability | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-055 | Runtime Architecture | v1-full | GPU Code Generation Does Not Require Host GPU Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-056 | Runtime Architecture | v1-full | Compile-Time Reflection Does Not Require Runtime Reflection | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-057 | Runtime Architecture | v1-full | FFI Does Not Imply A C Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-058 | Runtime Architecture | v1-full | FFI External Dependencies Must Be Explicit | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-059 | Runtime Architecture | v1-full | Freestanding Programs Need Not Link Hosted Runtime | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-060 | Runtime Architecture | v1-full | Hosted Startup Is A Runtime Capability | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-061 | Runtime Architecture | v1-full | Freestanding Entry Is Independent Of Hosted Startup | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-062 | Runtime Architecture | v1-full | Runtime Initialization Is Reachability-Driven | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-063 | Runtime Architecture | v1-full | Unused Runtime Initialization Must Not Be Emitted | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-064 | Runtime Architecture | v1-full | Runtime Initialization Must Not Depend On Link Order | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-065 | Runtime Architecture | v1-full | Runtime Components Must Declare Their Dependencies | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-066 | Runtime Architecture | v1-full | Runtime Component Dependencies Are Part Of Build Identity | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-067 | Runtime Architecture | v1-full | Runtime Selection Is Target-Aware | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-068 | Runtime Architecture | v1-full | Runtime Selection Is Profile-Aware | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-069 | Runtime Architecture | v1-full | Runtime Selection Is Feature-Aware | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-070 | Runtime Architecture | v1-full | Runtime Selection Is Deterministic | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-071 | Runtime Architecture | v1-full | Runtime Graph Is Incrementally Cacheable | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-072 | Runtime Architecture | v1-full | Runtime Artifacts May Be Content-Addressed | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-073 | Runtime Architecture | v1-full | Runtime Optimization Must Preserve Semantic Behavior | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-074 | Runtime Architecture | v1-full | Observable Initialization Prevents Invalid Runtime Elimination | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-075 | Runtime Architecture | v1-full | Observable Address Identity Prevents Invalid Storage Elimination | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-076 | Runtime Architecture | v1-full | Runtime Elimination Must Respect FFI Reachability | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-077 | Runtime Architecture | v1-full | Exported Symbols Are Runtime Graph Roots | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-078 | Runtime Architecture | v1-full | Dynamically Resolved Symbols Require Explicit Reachability Contracts | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-079 | Runtime Architecture | v1-full | Shared Libraries Have Independent Runtime Roots | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-080 | Runtime Architecture | v1-full | Runtime Capability Graph Is Independent Of Filesystem Layout | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-081 | Runtime Architecture | v1-full | Runtime Capability Graph Is Independent Of Import Order | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-082 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Threads | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-083 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Async Execution | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-084 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Allocator Dependencies | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-085 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Synchronization | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-086 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Global Initialization | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-087 | Runtime Architecture | v1-full | Runtime-Free Execution Is A Supported Axiom Profile | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-088 | Runtime Architecture | v1-full | Runtime Capability Requirements Are Machine-Readable | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-089 | Runtime Architecture | v1-full | Runtime Graph Is Queryable By Compiler Tooling And AI | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-090 | Runtime Architecture | v1-full | Runtime Explanation May Identify Why A Capability Is Required | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-091 | Runtime Architecture | v1-full | Runtime Explanation May Identify Why A Capability Was Eliminated | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-092 | Runtime Architecture | v1-full | Runtime Closure Must Be Semantically Equivalent To Required Capabilities | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
-| REQ-RT-093 | Runtime Architecture | v1-full | Runtime Architecture Must Not Impose Costs For Unused Features | tasks/0359 §51. Frozen invariants | - | EPIC(E21.1) |
+| REQ-RT-023 | Runtime Architecture | v1-full | Axiom Has No Mandatory Monolithic Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-024 | Runtime Architecture | v1-full | Runtime Is Composed Of Independent Capabilities | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-025 | Runtime Architecture | v1-full | Runtime Capability Is Distinct From Library Import | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-026 | Runtime Architecture | v1-full | Runtime Dependencies Are Determined Semantically | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-027 | Runtime Architecture | v1-full | Runtime Discovery Occurs After Semantic Verification | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-028 | Runtime Architecture | v1-full | Runtime Discovery Accounts For Semantic Optimization | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-029 | Runtime Architecture | v1-full | Runtime Graph Contains Only Reachable Capabilities | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-030 | Runtime Architecture | v1-full | Runtime Closure Is Minimal With Respect To Required Semantics | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-031 | Runtime Architecture | v1-full | Unused Runtime Components Must Not Be Linked | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-032 | Runtime Architecture | v1-full | Compiler Semantic Elimination May Remove Runtime Dependencies | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-033 | Runtime Architecture | v1-full | Linker Dead Stripping May Further Remove Unreachable Runtime Code | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-034 | Runtime Architecture | v1-full | Runtime Components Must Not Depend On Unrelated Components | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-035 | Runtime Architecture | v1-full | Runtime Dependency Cycles Must Be Explicitly Resolved | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-036 | Runtime Architecture | v1-full | Runtime Components Have Stable Semantic Identity | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-037 | Runtime Architecture | v1-full | Runtime Components Have Target-Specific Implementations | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-038 | Runtime Architecture | v1-full | Runtime Capability Is Distinct From Implementation Mechanism | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-039 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Compiler Intrinsic | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-040 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Generated Code | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-041 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Static Object Code | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-042 | Runtime Architecture | v1-full | Runtime Capability May Be Implemented By Platform ABI | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-043 | Runtime Architecture | v1-full | Runtime Capability Does Not Imply A Specific Library File | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-044 | Runtime Architecture | v1-full | Allocator Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-045 | Runtime Architecture | v1-full | Thread Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-046 | Runtime Architecture | v1-full | Async Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-047 | Runtime Architecture | v1-full | GPU Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-048 | Runtime Architecture | v1-full | Reflection Runtime Is Optional | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-049 | Runtime Architecture | v1-full | Unwind Runtime Is Profile-Dependent | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-050 | Runtime Architecture | v1-full | Panic Runtime Is Profile-Dependent | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-051 | Runtime Architecture | v1-full | TLS Runtime Is Distinct From Thread Creation Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-052 | Runtime Architecture | v1-full | Atomic Operations Do Not Require Thread Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-053 | Runtime Architecture | v1-full | Future Construction Does Not Require Async Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-054 | Runtime Architecture | v1-full | Async Execution Requires An Explicit Execution Capability | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-055 | Runtime Architecture | v1-full | GPU Code Generation Does Not Require Host GPU Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-056 | Runtime Architecture | v1-full | Compile-Time Reflection Does Not Require Runtime Reflection | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-057 | Runtime Architecture | v1-full | FFI Does Not Imply A C Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-058 | Runtime Architecture | v1-full | FFI External Dependencies Must Be Explicit | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-059 | Runtime Architecture | v1-full | Freestanding Programs Need Not Link Hosted Runtime | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-060 | Runtime Architecture | v1-full | Hosted Startup Is A Runtime Capability | tasks/0359 §51. Frozen invariants | - | T932 |
+| REQ-RT-061 | Runtime Architecture | v1-full | Freestanding Entry Is Independent Of Hosted Startup | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-062 | Runtime Architecture | v1-full | Runtime Initialization Is Reachability-Driven | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-063 | Runtime Architecture | v1-full | Unused Runtime Initialization Must Not Be Emitted | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-064 | Runtime Architecture | v1-full | Runtime Initialization Must Not Depend On Link Order | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-065 | Runtime Architecture | v1-full | Runtime Components Must Declare Their Dependencies | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-066 | Runtime Architecture | v1-full | Runtime Component Dependencies Are Part Of Build Identity | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-067 | Runtime Architecture | v1-full | Runtime Selection Is Target-Aware | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-068 | Runtime Architecture | v1-full | Runtime Selection Is Profile-Aware | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-069 | Runtime Architecture | v1-full | Runtime Selection Is Feature-Aware | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-070 | Runtime Architecture | v1-full | Runtime Selection Is Deterministic | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-071 | Runtime Architecture | v1-full | Runtime Graph Is Incrementally Cacheable | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-072 | Runtime Architecture | v1-full | Runtime Artifacts May Be Content-Addressed | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-073 | Runtime Architecture | v1-full | Runtime Optimization Must Preserve Semantic Behavior | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-074 | Runtime Architecture | v1-full | Observable Initialization Prevents Invalid Runtime Elimination | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-075 | Runtime Architecture | v1-full | Observable Address Identity Prevents Invalid Storage Elimination | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-076 | Runtime Architecture | v1-full | Runtime Elimination Must Respect FFI Reachability | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-077 | Runtime Architecture | v1-full | Exported Symbols Are Runtime Graph Roots | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-078 | Runtime Architecture | v1-full | Dynamically Resolved Symbols Require Explicit Reachability Contracts | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-079 | Runtime Architecture | v1-full | Shared Libraries Have Independent Runtime Roots | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-080 | Runtime Architecture | v1-full | Runtime Capability Graph Is Independent Of Filesystem Layout | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-081 | Runtime Architecture | v1-full | Runtime Capability Graph Is Independent Of Import Order | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-082 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Threads | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-083 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Async Execution | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-084 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Allocator Dependencies | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-085 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Synchronization | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-086 | Runtime Architecture | v1-full | Runtime Components Must Not Create Hidden Global Initialization | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-087 | Runtime Architecture | v1-full | Runtime-Free Execution Is A Supported Axiom Profile | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-088 | Runtime Architecture | v1-full | Runtime Capability Requirements Are Machine-Readable | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-089 | Runtime Architecture | v1-full | Runtime Graph Is Queryable By Compiler Tooling And AI | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-090 | Runtime Architecture | v1-full | Runtime Explanation May Identify Why A Capability Is Required | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-091 | Runtime Architecture | v1-full | Runtime Explanation May Identify Why A Capability Was Eliminated | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-092 | Runtime Architecture | v1-full | Runtime Closure Must Be Semantically Equivalent To Required Capabilities | tasks/0359 §51. Frozen invariants | - | T933 |
+| REQ-RT-093 | Runtime Architecture | v1-full | Runtime Architecture Must Not Impose Costs For Unused Features | tasks/0359 §51. Frozen invariants | - | T933 |
 | REQ-DIAG-019 | Diagnostics | v1-core | Diagnostics Are Semantic Objects | tasks/0360 §51. Frozen invariants | - | T113 | 
 | REQ-DIAG-020 | Diagnostics | v1-core | Diagnostic Rendering Is Separate From Diagnostic Identity | tasks/0360 §51. Frozen invariants | - | T113 | 
 | REQ-DIAG-021 | Diagnostics | v1-core | Every Diagnostic Has A Stable Code | tasks/0360 §51. Frozen invariants | - | T113 | 
@@ -6097,54 +6097,54 @@
 | REQ-LNK-224 | Object Writer & Linker | v1-full | Production Axiom compilation must not require LLVM/Clang/GCC/LLD. | tasks/0369 §37. Invariants | - | T750 |
 | REQ-LNK-225 | Object Writer & Linker | v1-full | Bootstrap use of external toolchains does not become a language dependency. | tasks/0369 §37. Invariants | - | T750 |
 | REQ-LNK-226 | Object Writer & Linker | v1-full | Axiom can produce a native executable without a monolithic mandatory runtime. | tasks/0369 §37. Invariants | - | T750 |
-| REQ-RT-094 | runtime | v1-full | Axiom has no mandatory monolithic runtime. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-095 | runtime | v1-full | Runtime components are independently linkable. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-096 | runtime | v1-full | Unused runtime components must not be linked solely because the language supports their features. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-097 | runtime | v1-full | Startup is distinct from application `main`. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-098 | runtime | v1-full | `main` is adapted to platform entry ABI by startup code. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-099 | runtime | v1-full | Freestanding programs do not implicitly require an operating system. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-100 | runtime | v1-full | Axiom does not require libc. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-101 | runtime | v1-full | Axiom does not require a C runtime. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-102 | runtime | v1-full | Allocator availability is independent from the language core. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-103 | runtime | v1-full | Async language support does not imply an executor. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-104 | runtime | v1-full | `async` does not imply threads. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-105 | runtime | v1-full | Thread support does not imply async support. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-106 | runtime | v1-full | TLS is an explicit runtime/platform facility. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-107 | runtime | v1-full | Global initialization is not implicitly registered through a hidden constructor system. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-108 | runtime | v1-full | Comptime initialization may eliminate runtime initialization. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-109 | runtime | v1-full | Runtime component dependency resolution is deterministic. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-110 | runtime | v1-full | Platform APIs are isolated behind the system layer. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-111 | runtime | v1-full | Axiom does not require POSIX as its fundamental system abstraction. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-112 | runtime | v1-full | OS-specific implementations may use native platform APIs. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-113 | runtime | v1-full | System calls are system-layer operations. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-114 | runtime | v1-full | Runtime-generated code cannot bypass semantic verification without an explicit trusted boundary. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-115 | runtime | v1-full | Runtime components have explicit ABI contracts. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-116 | runtime | v1-full | Static runtime composition is supported. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-117 | runtime | v1-full | Dynamic runtime composition is optional. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-118 | runtime | v1-full | Runtime components may be eliminated by dead-code/dead-section elimination. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-119 | runtime | v1-full | Platform faults are not implicitly converted into language-level `Result`. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-120 | runtime | v1-full | Panic policy determines required panic/unwind machinery. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-121 | runtime | v1-full | A freestanding program may contain no allocator. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-122 | runtime | v1-full | Axiom runtime components must not introduce hidden global state unless explicitly part of their contract. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-123 | runtime | v1-full | Runtime dependencies must be represented in the build/link graph. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-124 | runtime | v1-full | Axiom source semantics do not depend on a specific operating system. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-125 | runtime | v1-full | System-layer implementations may be platform-specific. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-126 | runtime | v1-full | GPU runtime is optional for CPU-only programs. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-127 | runtime | v1-full | Axiom can express programs with no general-purpose runtime. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-128 | runtime | v1-full | Startup, runtime, library, and system-layer responsibilities remain architecturally distinct. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-129 | runtime | v1-full | Runtime composition must not alter language semantics. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-130 | runtime | v1-full | Runtime selection is a build/link decision constrained by semantic requirements. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-131 | runtime | v1-full | Axiom can produce a minimal native executable without an implicit language-wide runtime dependency. | tasks/0370 §41. Runtime component invariants | - | EPIC(E21.1) |
-| REQ-RT-132 | runtime | v1-full | The runtime environment defines a System Contract independent of POSIX, treating POSIX solely as an interoperability layer. | tasks/0414 §70 (AOS-20, AOS-21) | - | EPIC(E21.1) |
+| REQ-RT-094 | runtime | v1-full | Axiom has no mandatory monolithic runtime. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-095 | runtime | v1-full | Runtime components are independently linkable. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-096 | runtime | v1-full | Unused runtime components must not be linked solely because the language supports their features. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-097 | runtime | v1-full | Startup is distinct from application `main`. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-098 | runtime | v1-full | `main` is adapted to platform entry ABI by startup code. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-099 | runtime | v1-full | Freestanding programs do not implicitly require an operating system. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-100 | runtime | v1-full | Axiom does not require libc. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-101 | runtime | v1-full | Axiom does not require a C runtime. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-102 | runtime | v1-full | Allocator availability is independent from the language core. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-103 | runtime | v1-full | Async language support does not imply an executor. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-104 | runtime | v1-full | `async` does not imply threads. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-105 | runtime | v1-full | Thread support does not imply async support. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-106 | runtime | v1-full | TLS is an explicit runtime/platform facility. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-107 | runtime | v1-full | Global initialization is not implicitly registered through a hidden constructor system. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-108 | runtime | v1-full | Comptime initialization may eliminate runtime initialization. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-109 | runtime | v1-full | Runtime component dependency resolution is deterministic. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-110 | runtime | v1-full | Platform APIs are isolated behind the system layer. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-111 | runtime | v1-full | Axiom does not require POSIX as its fundamental system abstraction. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-112 | runtime | v1-full | OS-specific implementations may use native platform APIs. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-113 | runtime | v1-full | System calls are system-layer operations. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-114 | runtime | v1-full | Runtime-generated code cannot bypass semantic verification without an explicit trusted boundary. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-115 | runtime | v1-full | Runtime components have explicit ABI contracts. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-116 | runtime | v1-full | Static runtime composition is supported. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-117 | runtime | v1-full | Dynamic runtime composition is optional. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-118 | runtime | v1-full | Runtime components may be eliminated by dead-code/dead-section elimination. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-119 | runtime | v1-full | Platform faults are not implicitly converted into language-level `Result`. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-120 | runtime | v1-full | Panic policy determines required panic/unwind machinery. | tasks/0370 §41. Runtime component invariants | - | T934 |
+| REQ-RT-121 | runtime | v1-full | A freestanding program may contain no allocator. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-122 | runtime | v1-full | Axiom runtime components must not introduce hidden global state unless explicitly part of their contract. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-123 | runtime | v1-full | Runtime dependencies must be represented in the build/link graph. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-124 | runtime | v1-full | Axiom source semantics do not depend on a specific operating system. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-125 | runtime | v1-full | System-layer implementations may be platform-specific. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-126 | runtime | v1-full | GPU runtime is optional for CPU-only programs. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-127 | runtime | v1-full | Axiom can express programs with no general-purpose runtime. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-128 | runtime | v1-full | Startup, runtime, library, and system-layer responsibilities remain architecturally distinct. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-129 | runtime | v1-full | Runtime composition must not alter language semantics. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-130 | runtime | v1-full | Runtime selection is a build/link decision constrained by semantic requirements. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-131 | runtime | v1-full | Axiom can produce a minimal native executable without an implicit language-wide runtime dependency. | tasks/0370 §41. Runtime component invariants | - | T935 |
+| REQ-RT-132 | runtime | v1-full | The runtime environment defines a System Contract independent of POSIX, treating POSIX solely as an interoperability layer. | tasks/0414 §70 (AOS-20, AOS-21) | - | T908, T911 |
 | REQ-OWN-240 | ownership | v1-core | Operating system resources are represented as logical handles with explicit ownership semantics and Drop cleanup rather than raw memory pointers, and dropping a process handle does not implicitly terminate the underlying process. | tasks/0414 §4, tasks/0414 §70 (AOS-24, AOS-25, AOS-26, AOS-42, AOS-43) | - | T113 | 
-| REQ-RT-133 | runtime | v1-full | Direct system calls can be emitted in system and freestanding targets without requiring libc, CRT, or external C compilers. | tasks/0414 §8, tasks/0414 §64, tasks/0414 §70 (AOS-27, AOS-28, AOS-29, AOS-64, AOS-70) | - | EPIC(E21.1) |
+| REQ-RT-133 | runtime | v1-full | Direct system calls can be emitted in system and freestanding targets without requiring libc, CRT, or external C compilers. | tasks/0414 §8, tasks/0414 §64, tasks/0414 §70 (AOS-27, AOS-28, AOS-29, AOS-64, AOS-70) | - | T908, T911 |
 | REQ-CORE-1314 | core-lib | v1-core | Freestanding and kernel profiles can omit hosted OS facilities while retaining `std.core` abstractions. | tasks/0414 §33, tasks/0414 §70 (AOS-33, AOS-34, AOS-57), tasks/0424 §100 (ASTD2-20, ASTD2-61, ASTD2-62) | - | T113 | 
 | REQ-ATM-031 | atomics | v1-full | Physical memory access is unsafe, MMIO operations require explicit volatile semantics, and volatile semantics are distinct from atomic ordering and CPU fences. | tasks/0414 §70 (AOS-36, AOS-37, AOS-38, AOS-39, AOS-56) | - | T405 |
-| REQ-RT-134 | runtime | v1-full | Program startup is structured as composable runtime components rather than a mandatory universal runtime. | tasks/0414 §68, tasks/0414 §69, tasks/0414 §70 (AOS-66, AOS-67) | - | EPIC(E21.1) |
+| REQ-RT-134 | runtime | v1-full | Program startup is structured as composable runtime components rather than a mandatory universal runtime. | tasks/0414 §68, tasks/0414 §69, tasks/0414 §70 (AOS-66, AOS-67) | - | T908, T911 |
 | REQ-CORE-1315 | core-lib | v1-core | Compiler builtins are restricted to operations requiring compiler or target knowledge, and standard library abstractions are implemented in Axiom source code wherever practical. | tasks/0415 §2, tasks/0415 §70 (ACORELIB-21, ACORELIB-22, ACORELIB-23, ACORELIB-60) | - | T113 | 
 | REQ-TYP-325 | types | v1-core | `Option<T>` and `Result<T, E>` are ordinary algebraic data types whose semantic representation is not redefined by niche layout optimizations. | tasks/0415 §70 (ACORELIB-24, ACORELIB-25) | - | T113 |
 | REQ-TYP-326 | types | v1-core | `Box<T>` is a library-owned dynamic-storage abstraction providing ownership and Drop cleanup without implementing `Copy`, independent of physical allocation strategy. | tasks/0415 §70 (ACORELIB-26, ACORELIB-27, ACORELIB-28) | - | T113 |
-| REQ-RT-135 | runtime | v1-full | Memory allocator selection is configured explicitly per profile or library composition rather than mandated by a single universal runtime allocator. | tasks/0415 §70 (ACORELIB-29, ACORELIB-30, ACORELIB-31) | - | EPIC(E21.1) |
+| REQ-RT-135 | runtime | v1-full | Memory allocator selection is configured explicitly per profile or library composition rather than mandated by a single universal runtime allocator. | tasks/0415 §70 (ACORELIB-29, ACORELIB-30, ACORELIB-31) | - | T932, T933, T934, T935 |
 | REQ-TXT-001 | text | v1-core | `String` guarantees valid UTF-8 ownership, `Str` provides a non-owning UTF-8 view, and `Bytes` provides raw byte access without Unicode validation. | tasks/0415 §70 (ACORELIB-34, ACORELIB-35, ACORELIB-36) | - | T113 | 
 | REQ-VER-007 | verifier | v1-core | Reading uninitialized memory is rejected by the compiler verifier, and `assume_init` requires an established initialization contract. | tasks/0415 §70 (ACORELIB-37, ACORELIB-38, ACORELIB-39) | - | T113 | 
 | REQ-TRT-062 | traits | v1-core | Bitwise copyability is distinct from semantic `Copy`, bytewise equality does not define semantic equality, and byte hashing is distinct from semantic hashing. | tasks/0415 §70 (ACORELIB-40, ACORELIB-41, ACORELIB-42) | - | T113 | 
@@ -6159,7 +6159,7 @@
 | REQ-CONC-141 | concurrency | v1-full | Collections are not implicitly thread-safe, concurrent containers require explicit synchronization, and Send and Share traits are derived independently. | tasks/0416 §71 (ACOLLECT-63, ACOLLECT-64) | - | T400 |
 | REQ-ERR-078 | error | v1-core | Failure semantics distinguish recoverable errors via `Result`, contract violations via `panic`, and process-level termination via `abort` or system faults. | tasks/0417 §1, tasks/0417 §62 (AERROR-20, AERROR-21, AERROR-30, AERROR-33) | - | T113 | 
 | REQ-EXP-145 | expr | v1-core | The `?` operator provides explicit typed control flow over `Result` and `Option`, and Axiom Core v1 defines no general exception hierarchy, no `try/catch` syntax, and no implicit `throw` statements. | tasks/0417 §60, tasks/0417 §62 (AERROR-24, AERROR-25, AERROR-27, AERROR-28, AERROR-29) | - | T113 | 
-| REQ-RT-136 | runtime | v1-full | Panic behavior is configured per build profile via `panic=abort` or `panic=unwind`, where unwinding preserves all active Drop obligations and ownership invariants. | tasks/0417 §62 (AERROR-36, AERROR-37, AERROR-38, AERROR-39, AERROR-40) | - | EPIC(E21.1) |
+| REQ-RT-136 | runtime | v1-full | Panic behavior is configured per build profile via `panic=abort` or `panic=unwind`, where unwinding preserves all active Drop obligations and ownership invariants. | tasks/0417 §62 (AERROR-36, AERROR-37, AERROR-38, AERROR-39, AERROR-40) | - | T910, T911 |
 | REQ-ERR-079 | error | v1-core | Out-of-bounds memory access in safe code is a defined failure resulting in panic or abort, rather than C-style undefined behavior. | tasks/0417 §62 (AERROR-41), tasks/0420 §70 (ASEC-40) | - | T113 | 
 | REQ-VER-008 | verifier | v1-core | Effect analysis tracks panic effects independently from `Result` types, and observable failure behavior is part of a function's semantic contract. | tasks/0417 §62 (AERROR-60, AERROR-61, AERROR-62, AERROR-63) | - | T113 | 
 | REQ-ERR-080 | error | v1-core | Propagating recoverable errors through `Result` requires no heap allocation, remaining compatible with freestanding and runtime-free profiles. | tasks/0417 §62 (AERROR-44, AERROR-64, AERROR-69) | - | T113 | 
@@ -6245,7 +6245,7 @@
 | REQ-EXP-147 | expr | v1-core | The `?` operator lowers directly to early return control flow on `Err(e)` while unwinding local resources in the current scope via deterministic Drop edges. | 0430 §4, §5, 0430 §50 AERR-23 | - | T113 | 
 | REQ-OWN-242 | ownership | v1-core | Only the active variant of an enum (`Option` or `Result`) owns its payload, and destruction drops only the active variant payload based on discriminant tracking. | 0430 §47, 0430 §50 AERR-27, AERR-28 | - | T113 | 
 | REQ-DIAG-095 | diagnostics | v1-core | Unhandled or unused `Result` values must produce a compiler diagnostic unless explicitly discarded via blank assignment `let _ = ...`. | 0430 §6, §7, 0430 §50 AERR-29 | - | T113 | 
-| REQ-RT-137 | runtime | v1-full | Panic has return type `never`, represents unrecoverable control flow, and obeys build/profile configuration supporting `panic=abort` without unwind machinery. | 0430 §50 APANIC-20, APANIC-21, APANIC-22, APANIC-23 | - | EPIC(E21.1) |
+| REQ-RT-137 | runtime | v1-full | Panic has return type `never`, represents unrecoverable control flow, and obeys build/profile configuration supporting `panic=abort` without unwind machinery. | 0430 §50 APANIC-20, APANIC-21, APANIC-22, APANIC-23 | - | T910, T911 |
 | REQ-DRP-056 | drop | v1-core | Variable destruction (`Drop`) cannot fail recoverably, and a panic occurring during active cleanup or unwinding terminates execution immediately. | 0430 §50 APANIC-25, APANIC-26 | - | T113 | 
 | REQ-TYP-329 | types | v1-core | Type conversions are classified into compiler-applied `COERCION`, explicit `CAST`, representation-preserving `BITCAST`, and unsafe machine-level `TRANSMUTE`. | 0431 §1, 0431 §52 ACONV-20, ACONV-40 | - | T113 |
 | REQ-TYP-330 | types | v1-core | Implicit coercion is restricted to compiler-defined safe conversions (including `String` to `Str` and `Array<T, N>` to `view<T>`), cannot invoke arbitrary user code, and cannot form implicit multi-step conversion chains. | 0431 §2, §3, §4, 0431 §52 ACONV-21, ACONV-22, ACONV-23 | - | T113 |
@@ -6264,7 +6264,7 @@
 | REQ-CTM-043 | comptime | v1-full | Compile-time reflection is the default reflection mechanism, where `Type` metadata is evaluated at comptime and erased from runtime binaries unless runtime RTTI is explicitly enabled. | 0433 §58, 0433 §71 AREFLECT-20, AREFLECT-21, AZREFLECT-20, AZREFLECT-21 | - | T557 |
 | REQ-VER-012 | verifier | v1-core | Declarations generated via compile-time reflection must undergo standard type checking, ownership verification, and capability verification without bypass privileges. | 0433 §42, 0433 §71 AREFLECT-25 | - | T113 | 
 | REQ-TYP-333 | types | v1-core | Reflection enumeration follows deterministic semantic declaration order, and physical field reordering by optimizer does not alter semantic reflection order. | 0433 §44, §45, 0433 §71 AREFLECT-26, AREFLECT-27 | - | T113 |
-| REQ-RT-138 | runtime | v1-full | Runtime type information (RTTI) is opt-in, does not impose a mandatory global type registry, and assigns TypeIds independent of physical memory addresses. | 0433 §71 ARTTI-20, ARTTI-21, ARTTI-22 | - | EPIC(E21.1) |
+| REQ-RT-138 | runtime | v1-full | Runtime type information (RTTI) is opt-in, does not impose a mandatory global type registry, and assigns TypeIds independent of physical memory addresses. | 0433 §71 ARTTI-20, ARTTI-21, ARTTI-22 | - | T924, T925, T927 |
 | REQ-TYP-334 | types | v1-core | Axiom Core does not include a universal `Any`, Object root class, or implicit dynamic method invocation by string name. | 0433 §56, §57, 0433 §71 ARTTI-24 | - | T113 |
 | REQ-TYP-335 | types | post-v1 | Opaque types hide internal field layout and representation from consumers at public API boundaries while preserving semantic type identity. | 0433 §67, §68, 0433 §71 AOPAQUE-20, AOPAQUE-21 | - | EPIC(E24.0) |
 | REQ-LNK-227 | linker | v1-full | Runtime reflection metadata acts as reachability roots for the linker, while unused reflection metadata may be stripped via dead-metadata elimination. | 0433 §34, §35, §63, 0433 §71 AREFLECT-29, AREFLECT-30, AMETA-26 | - | T775 |
@@ -6282,62 +6282,62 @@
 | REQ-CONC-147 | concurrency | v1-full | Synchronization guards (such as `MutexGuard`) are ownership-bearing capabilities that are non-Copy, release resources on Drop, and cannot cross await points unless explicitly async-aware. | 0435 §102 ASYNC-LOCK-20, ASYNC-LOCK-21, ASYNC-LOCK-22, ASYNC-LOCK-23 | - | T421 |
 | REQ-CONC-148 | concurrency | v1-full | Work-stealing schedulers may migrate tasks across workers only when tasks satisfy `Send` contracts, and scheduling order cannot serve as semantic memory ordering. | 0435 §102 ASCHED-20, ASCHED-21, ASCHED-22, AMEMCONCUR-20 | - | T421 |
 | REQ-TST-103 | testing | post-v1 | A deterministic executor with controllable task scheduling and timer advancement must be provided for reproducible concurrency testing. | 0435 §61, 0435 §102 ASCHED-25 | - | EPIC(E24.0) |
-| REQ-RT-139 | runtime | v1-full | Axiom does not mandate a global heap allocator, mandatory garbage collection, or implicit reference counting. | 0436 §62, §63, 0436 §2014 AALLOC-20, AALLOC-21, AALLOC-22 | - | EPIC(E21.1) |
+| REQ-RT-139 | runtime | v1-full | Axiom does not mandate a global heap allocator, mandatory garbage collection, or implicit reference counting. | 0436 §62, §63, 0436 §2014 AALLOC-20, AALLOC-21, AALLOC-22 | - | T932, T933, T934, T935 |
 | REQ-LAY-290 | layout | v1-core | Physical storage placement (registers, stack, inline, arena, pool, or heap) is not determined solely by high-level type declarations and is selected by compiler analysis. | 0436 §2014 AMEMALLOC-20, AMEMALLOC-21 | - | T113 | 
-| REQ-RT-140 | runtime | v1-full | Address stability is not guaranteed by default and must be explicitly contracted when required by foreign interfaces or address-sensitive collections. | 0436 §54, 0436 §2014 AMEMALLOC-24, AMEMALLOC-25 | - | EPIC(E21.1) |
+| REQ-RT-140 | runtime | v1-full | Address stability is not guaranteed by default and must be explicitly contracted when required by foreign interfaces or address-sensitive collections. | 0436 §54, 0436 §2014 AMEMALLOC-24, AMEMALLOC-25 | - | T932, T933, T934, T935 |
 | REQ-OPT-346 | optimizer | v1-full | Storage for non-escaping allocations may be promoted to stack or registers or completely eliminated when address identity is unobservable. | 0436 §2014 AMEMALLOC-26, AMEMALLOC-27, AFRAG-23 | - | T607 |
 | REQ-ABI-094 | abi | v1-full | Returning large aggregates by value represents an ownership transfer and may be lowered to caller-allocated destination slots without intermediate heap allocation or copying. | 0436 §79, §80, §81 | - | T503 |
 | REQ-DRP-057 | drop | v1-core | Batch deallocation in arenas or pools must preserve deterministic element destruction order for types with custom `Drop` implementations. | 0436 §78, 0436 §2014 AMEMALLOC-29, AALLOC-27 | - | T113 | 
 | REQ-SEC-111 | security | v1-core | Memory zeroization contracts for sensitive types (e.g., `Secret<T>`) cannot be eliminated by dead-store optimization even when memory is never subsequently read. | 0436 §68 | - | T113 | 
-| REQ-RT-141 | runtime | v1-full | Virtual memory reservation and memory commitment are distinct operations, and integer addresses do not establish safe pointer provenance. | 0437 §73 AVM-20, AVM-21, AVM-22, AVM-23 | - | EPIC(E21.1) |
+| REQ-RT-141 | runtime | v1-full | Virtual memory reservation and memory commitment are distinct operations, and integer addresses do not establish safe pointer provenance. | 0437 §73 AVM-20, AVM-21, AVM-22, AVM-23 | - | T920, T921, T923 |
 | REQ-CAP-127 | capability | v1-full | Safe memory capabilities cannot outlive their backing address-space mapping or survive page unmapping and protection revocation. | 0437 §73 AVM-28, AVM-29, AMAP-24 | - | T501 |
 | REQ-SEC-112 | security | v1-core | Memory protection permissions (READ, WRITE, EXECUTE) are distinct, and writable memory is not executable by default, supporting platform W^X policies. | 0437 §73 APROTECT-20, APROTECT-21, APROTECT-22 | - | T113 | 
-| REQ-RT-142 | runtime | v1-full | Memory-mapped I/O (MMIO) and volatile device accesses are distinct from ordinary RAM and cannot be eliminated or reordered by compiler optimizations. | 0437 §73 APROTECT-23, APROTECT-24, APROTECT-25 | - | EPIC(E21.1) |
-| REQ-RT-143 | runtime | v1-full | Shared memory mappings between execution contexts or processes do not imply memory synchronization and require explicit synchronization primitives. | 0437 §73 AMAP-21 | - | EPIC(E21.1) |
+| REQ-RT-142 | runtime | v1-full | Memory-mapped I/O (MMIO) and volatile device accesses are distinct from ordinary RAM and cannot be eliminated or reordered by compiler optimizations. | 0437 §73 APROTECT-23, APROTECT-24, APROTECT-25 | - | T920, T921, T923 |
+| REQ-RT-143 | runtime | v1-full | Shared memory mappings between execution contexts or processes do not imply memory synchronization and require explicit synchronization primitives. | 0437 §73 AMAP-21 | - | T920, T922, T923 |
 | REQ-DRV-014 | driver | v1-full | Physical address manipulation, page-table operations, and DMA memory configurations are restricted to system and unsafe APIs with explicit storage-domain contracts. | 0437 §73 ASYS-MEM-20, ASYS-MEM-21, ASYS-MEM-22, ASYS-MEM-24 | - | T753 |
 | REQ-LAY-291 | layout | post-v1 | Memory mappings must preserve target page alignment and platform protection contracts when materializing memory slices. | 0437 §73 AMAP-25, AVM-24 | - | EPIC(E24.0) |
-| REQ-RT-144 | runtime | v1-full | I/O resources (descriptors, handles) are distinct from data buffers and must preserve ownership and capability validity throughout active in-flight operations. | 0438 §2097 AIO-20, AIO-21, AIO-22 | - | EPIC(E21.1) |
+| REQ-RT-144 | runtime | v1-full | I/O resources (descriptors, handles) are distinct from data buffers and must preserve ownership and capability validity throughout active in-flight operations. | 0438 §2097 AIO-20, AIO-21, AIO-22 | - | T909, T911 |
 | REQ-ASY-151 | async | v1-full | Asynchronous I/O is represented as Future-based suspension without requiring thread creation, and operation completion occurs at most once. | 0438 §2097 AIO-23, AIOASYNC-24 | - | T425 |
 | REQ-ASY-152 | async | v1-full | Dropping an async I/O Future does not implicitly cancel the in-flight physical operation, and buffer storage cannot be reclaimed while the operation may still access it. | 0438 §2097 AIO-24, AIOASYNC-21, AIOASYNC-22 | - | T427 |
 | REQ-ERR-083 | error | v1-core | I/O operations report recoverable failures using `Result<T, IoError>` and support partial read and write representations. | 0438 §2097 AIO-25, AIO-27 | - | T113 | 
 | REQ-OPT-347 | optimizer | v1-full | Zero-copy data paths (including DMA, mmap, and scatter/gather) are optimizations that require compile-time proofs of capability non-aliasing and lifetime validity. | 0438 §2097 AZCOPY-20, AZCOPY-21, AZCOPY-25 | - | T606 |
 | REQ-OPT-348 | optimizer | v1-full | I/O operations are observable effects whose external ordering cannot be altered by compiler reordering unless operations are proven independent. | 0438 §95, §96, 0438 §2097 AIOOPT-20, AIOOPT-21, AIOOPT-22 | - | T602 |
 | REQ-DRV-015 | driver | v1-full | DMA buffers possess explicit storage domains where device completion releases or transfers buffer capabilities back to CPU execution domains. | 0438 §2097 ADMA-20, ADMA-21, ADMA-25 | - | T753 |
-| REQ-RT-145 | runtime | v1-full | Process, Thread, Fiber, Task, and Future are distinct execution concepts: processes define isolation boundaries, threads own native stacks, fibers own user stacks, and tasks represent schedulable work. | 0439 §149, §151 AEXEC-20, APROC-20 | - | EPIC(E21.1) |
+| REQ-RT-145 | runtime | v1-full | Process, Thread, Fiber, Task, and Future are distinct execution concepts: processes define isolation boundaries, threads own native stacks, fibers own user stacks, and tasks represent schedulable work. | 0439 §149, §151 AEXEC-20, APROC-20 | - | T910, T911 |
 | REQ-CONC-149 | concurrency | v1-full | Forced external thread termination is prohibited as a safe primitive to preserve resource Drop consistency. | 0439 §151 AEXEC-26 | - | T420 |
-| REQ-RT-146 | runtime | v1-full | Process exit does not guarantee invocation of ordinary variable `Drop` cleanup handlers unless explicitly coordinated. | 0439 §151 APROC-22, APROC-23 | - | EPIC(E21.1) |
-| REQ-RT-147 | runtime | v1-full | OS resource handles (files, sockets, processes) must distinguish owned handles from borrowed views, and resource Drop semantics are defined per resource type. | 0439 §151 ARES-EXEC-20, ARES-EXEC-21, ARES-EXEC-24 | - | EPIC(E21.1) |
+| REQ-RT-146 | runtime | v1-full | Process exit does not guarantee invocation of ordinary variable `Drop` cleanup handlers unless explicitly coordinated. | 0439 §151 APROC-22, APROC-23 | - | T910, T911 |
+| REQ-RT-147 | runtime | v1-full | OS resource handles (files, sockets, processes) must distinguish owned handles from borrowed views, and resource Drop semantics are defined per resource type. | 0439 §151 ARES-EXEC-20, ARES-EXEC-21, ARES-EXEC-24 | - | T910, T911 |
 | REQ-CONC-150 | concurrency | v1-full | Structured concurrency groups child tasks such that the enclosing scope cannot complete until child tasks complete, cancel, or detach explicitly. | 0439 §120, 0439 §151 AEXEC-27 | - | T422 |
-| REQ-RT-148 | runtime | v1-full | IPC channels transfer ownership across process boundaries without copying where shared memory permits, while serialized IPC remains distinct from memory ownership transfer. | 0439 §151 AIPC-20, AIPC-21, AIPC-24 | - | EPIC(E21.1) |
+| REQ-RT-148 | runtime | v1-full | IPC channels transfer ownership across process boundaries without copying where shared memory permits, while serialized IPC remains distinct from memory ownership transfer. | 0439 §151 AIPC-20, AIPC-21, AIPC-24 | - | T910, T911 |
 | REQ-CONC-151 | concurrency | v1-full | Non-Send tasks are pinned to their creation thread or execution domain and cannot be migrated across threads by schedulers. | 0439 §126, 0439 §151 AEXEC-24, ASCHED-21 | - | T423 |
-| REQ-RT-149 | runtime | v1-full | Process environment, current working directory, and signal handlers are treated as external state effects whose observation cannot be eliminated across calls. | 0439 §94, §95, 0439 §151 APROC-25 | - | EPIC(E21.1) |
-| REQ-RT-150 | runtime | v1-full | `Duration` (elapsed span) is distinct from `Instant` (point in time), and monotonic time is distinct from civil/wall-clock time. | 0440 §151, §152 ATIME-20, ATIME-21 | - | EPIC(E21.1) |
-| REQ-RT-151 | runtime | v1-full | Monotonic clocks must never move backward, and wall-clock adjustments (NTP, leap seconds) do not alter monotonic time measurements. | 0440 §152 ATIME-22, ATIME-23 | - | EPIC(E21.1) |
-| REQ-RT-152 | runtime | v1-full | Time arithmetic (`Instant - Instant` yielding `Duration`, or `Instant + Duration` yielding `Instant`) is restricted to identical clock domains and rejects inter-domain arithmetic. | 0440 §129, §130, 0440 §152 ATIME-24, ATIME-30, ATIME-31 | - | EPIC(E21.1) |
-| REQ-RT-153 | runtime | v1-full | The passage of time or `sleep` calls cannot serve as a substitute for memory synchronization or establish happens-before ordering. | 0440 §110, §111, §151, §152 ATIME-25, ATIMER-23 | - | EPIC(E21.1) |
+| REQ-RT-149 | runtime | v1-full | Process environment, current working directory, and signal handlers are treated as external state effects whose observation cannot be eliminated across calls. | 0439 §94, §95, 0439 §151 APROC-25 | - | T910, T911 |
+| REQ-RT-150 | runtime | v1-full | `Duration` (elapsed span) is distinct from `Instant` (point in time), and monotonic time is distinct from civil/wall-clock time. | 0440 §151, §152 ATIME-20, ATIME-21 | - | T916, T917, T919 |
+| REQ-RT-151 | runtime | v1-full | Monotonic clocks must never move backward, and wall-clock adjustments (NTP, leap seconds) do not alter monotonic time measurements. | 0440 §152 ATIME-22, ATIME-23 | - | T916, T917, T919 |
+| REQ-RT-152 | runtime | v1-full | Time arithmetic (`Instant - Instant` yielding `Duration`, or `Instant + Duration` yielding `Instant`) is restricted to identical clock domains and rejects inter-domain arithmetic. | 0440 §129, §130, 0440 §152 ATIME-24, ATIME-30, ATIME-31 | - | T916, T917, T919 |
+| REQ-RT-153 | runtime | v1-full | The passage of time or `sleep` calls cannot serve as a substitute for memory synchronization or establish happens-before ordering. | 0440 §110, §111, §151, §152 ATIME-25, ATIMER-23 | - | T916, T917, T918, T919 |
 | REQ-ASY-153 | async | v1-full | `Deadline` represents an absolute temporal point, and deadlines are propagated to manage nested timeout budgets without implicit task cancellation. | 0440 §152 ATIME-32, ATIME-33, ATIMEOUT-20, ATIMEOUT-21 | - | T426 |
 | REQ-ASY-154 | async | v1-full | Async timers do not allocate dedicated OS threads per timer and use timer wheels or reactor backends. | 0440 §152 ATIMER-27 | - | T426 |
 | REQ-TST-104 | testing | post-v1 | Real clock dependencies can be replaced with deterministic virtual clocks that advance without consuming real elapsed time for reproducible testing. | 0440 §103, §106, 0440 §152 ATIMETEST-20, ATIMETEST-21, ATIMETEST-22 | - | EPIC(E24.0) |
-| REQ-RT-154 | runtime | v1-full | Socket handles are owned move-only resources that close deterministically upon `Drop` and are non-Copy. | 0441 §201 ANET-20, ANET-21, ANET-23 | - | EPIC(E21.1) |
-| REQ-RT-155 | runtime | v1-full | Network I/O payloads are raw byte buffers (`Bytes`, `view<u8>`) by default; UTF-8 string interpretation requires explicit validation. | 0441 §138, 0441 §201 ANET-30, ANET-31 | - | EPIC(E21.1) |
+| REQ-RT-154 | runtime | v1-full | Socket handles are owned move-only resources that close deterministically upon `Drop` and are non-Copy. | 0441 §201 ANET-20, ANET-21, ANET-23 | - | T912, T913, T915 |
+| REQ-RT-155 | runtime | v1-full | Network I/O payloads are raw byte buffers (`Bytes`, `view<u8>`) by default; UTF-8 string interpretation requires explicit validation. | 0441 §138, 0441 §201 ANET-30, ANET-31 | - | T912, T913, T915 |
 | REQ-CAP-128 | capability | v1-full | Active network operations retain buffer capabilities for the operation duration, preventing buffer relocation, modification, or deallocation while I/O is in-flight. | 0441 §201 ANET-32, ANET-33 | - | T500 |
 | REQ-ASY-155 | async | v1-full | Network async I/O is modeled as Future-based suspension, where operation cancellation does not guarantee external wire rollback. | 0441 §127, 0441 §201 ANET-40, ANET-44 | - | T428 |
 | REQ-CONC-152 | concurrency | v1-full | Sockets do not permit concurrent mutation; concurrent reading and writing requires explicit capability splitting (`split()`) into distinct Read and Write capabilities. | 0441 §108, §109, 0441 §201 ANET-62 | - | T427 |
-| REQ-RT-156 | runtime | v1-full | Portable networking semantics are decoupled from POSIX, mapping portably onto `io_uring`, `epoll`, `IOCP`, and `kqueue` backends without altering observable semantics. | 0441 §200, 0441 §201 ANET-50, ANET-51, ANET-52 | - | EPIC(E21.1) |
-| REQ-RT-157 | runtime | v1-full | TCP streams model byte streams without application frame boundaries; framing protocols and higher-level protocols (TLS, HTTP, QUIC) reside in protocol libraries. | 0441 §113, §145, §146, 0441 §201 ANET-70, ANET-72, ANET-73 | - | EPIC(E21.1) |
+| REQ-RT-156 | runtime | v1-full | Portable networking semantics are decoupled from POSIX, mapping portably onto `io_uring`, `epoll`, `IOCP`, and `kqueue` backends without altering observable semantics. | 0441 §200, 0441 §201 ANET-50, ANET-51, ANET-52 | - | T912, T913, T915 |
+| REQ-RT-157 | runtime | v1-full | TCP streams model byte streams without application frame boundaries; framing protocols and higher-level protocols (TLS, HTTP, QUIC) reside in protocol libraries. | 0441 §113, §145, §146, 0441 §201 ANET-70, ANET-72, ANET-73 | - | T912, T913, T915 |
 | REQ-SEC-113 | security | post-v1 | Comptime network access requires explicit build capability grants, and raw packet or kernel-bypass access is restricted to system and unsafe APIs. | 0441 §201 ANET-83, ANET-86 | - | EPIC(E24.0) |
 | REQ-STD-159 | std-lib | v1-core | `Path` represents lexical value data rather than an owned OS resource, and lexical path operations do not perform filesystem queries or assume UTF-8 encoding. | 0442 §181 AFS-20, AFS-21, AFS-22, AFS-24 | - | T113 | 
-| REQ-RT-158 | runtime | v1-full | `File` is a move-only, non-Copy owned OS resource that releases its file descriptor deterministically on `Drop`. | 0442 §148, §149, 0442 §181 AFS-30, AFS-31, AFS-35 | - | EPIC(E21.1) |
+| REQ-RT-158 | runtime | v1-full | `File` is a move-only, non-Copy owned OS resource that releases its file descriptor deterministically on `Drop`. | 0442 §148, §149, 0442 §181 AFS-30, AFS-31, AFS-35 | - | T909, T911 |
 | REQ-ERR-084 | error | v1-core | Fallible file closing or flushing must be invoked explicitly via `file.close()`, as `Drop` cannot return recoverable `Result` errors. | 0442 §149, 0442 §181 AFS-36 | - | T113 | 
-| REQ-RT-159 | runtime | v1-full | Stream-based sequential I/O and positional random-access I/O (`read_at`, `write_at`) are semantically distinct, where positional I/O does not mutate shared cursor state. | 0442 §106, §107, 0442 §181 AFS-40, AFS-41 | - | EPIC(E21.1) |
+| REQ-RT-159 | runtime | v1-full | Stream-based sequential I/O and positional random-access I/O (`read_at`, `write_at`) are semantically distinct, where positional I/O does not mutate shared cursor state. | 0442 §106, §107, 0442 §181 AFS-40, AFS-41 | - | T909, T911 |
 | REQ-CAP-129 | capability | v1-full | `MappedRegion` owns memory-mapped file allocations; views into the mapped region cannot outlive the `MappedRegion` instance. | 0442 §160, 0442 §181 AFS-50, AFS-51, AFS-52 | - | T501 |
-| REQ-RT-160 | runtime | v1-full | Filesystem mutations (rename, unlink, write) represent observable external effects, and durability (`sync_all`) is distinct from successful operation completion. | 0442 §123, §124, §134, §135, 0442 §181 AFS-63, AFS-67, AFS-81 | - | EPIC(E21.1) |
+| REQ-RT-160 | runtime | v1-full | Filesystem mutations (rename, unlink, write) represent observable external effects, and durability (`sync_all`) is distinct from successful operation completion. | 0442 §123, §124, §134, §135, 0442 §181 AFS-63, AFS-67, AFS-81 | - | T909, T911 |
 | REQ-SEC-114 | security | post-v1 | Filesystem access can be sandboxed using directory-relative capabilities (`open_relative_to`) rather than ambient global filesystem authority to mitigate TOCTOU vulnerabilities. | 0442 §171, §172, §174, 0442 §181 AFS-70, AFS-71, AFS-72 | - | EPIC(E24.0) |
-| REQ-RT-161 | runtime | v1-full | OS resource types such as File, Socket, Process, Thread, and Device shall be distinct semantic types managed via compiler resource protocols without sharing a common inheritance base class. | tasks/0443 §184.145 (ARES-20, ARES-21, AOS-36, AOS-37) | - | EPIC(E21.1) |
+| REQ-RT-161 | runtime | v1-full | OS resource types such as File, Socket, Process, Thread, and Device shall be distinct semantic types managed via compiler resource protocols without sharing a common inheritance base class. | tasks/0443 §184.145 (ARES-20, ARES-21, AOS-36, AOS-37) | - | T910, T911 |
 | REQ-OWN-244 | ownership | v1-core | OS resource ownership shall be distinct from heap memory ownership; moving a resource transfers external resource ownership, whereas copying raw OS handles shall not duplicate ownership or grant safe capabilities. | tasks/0443 §184.145 (ARES-22, ARES-23, AOS-21) | - | T113 | 
 | REQ-DRP-058 | drop | v1-core | Safe resource wrappers shall invoke deterministic release upon Drop, prohibit double-release, and require explicit method calls for recoverable close operations. | tasks/0443 §184.145 (ARES-25, ARES-26, ARES-27) | - | T113 | 
-| REQ-RT-162 | runtime | v1-full | ProcessId value identity and ChildProcess ownership handle shall be distinct; dropping a child handle shall not implicitly terminate the process, and child termination or kill operations must be explicit. | tasks/0443 §184.145 (APROC-20, APROC-21, APROC-22, APROC-23) | - | EPIC(E21.1) |
-| REQ-RT-163 | runtime | v1-full | Child process wait operations shall establish a synchronization edge with process completion, and ExitStatus shall retain platform-specific exit codes, signals, and core dump metadata. | tasks/0443 §184.145 (APROC-24, APROC-26) | - | EPIC(E21.1) |
+| REQ-RT-162 | runtime | v1-full | ProcessId value identity and ChildProcess ownership handle shall be distinct; dropping a child handle shall not implicitly terminate the process, and child termination or kill operations must be explicit. | tasks/0443 §184.145 (APROC-20, APROC-21, APROC-22, APROC-23) | - | T910, T911 |
+| REQ-RT-163 | runtime | v1-full | Child process wait operations shall establish a synchronization edge with process completion, and ExitStatus shall retain platform-specific exit codes, signals, and core dump metadata. | tasks/0443 §184.145 (APROC-24, APROC-26) | - | T910, T911 |
 | REQ-CTM-044 | comptime | v1-full | Process environment variables shall be modeled as external state where reads are impure; compile-time environment access shall require explicit capabilities and participate in build identity. | tasks/0443 §184.145 (APROC-30, APROC-31, APROC-33, APROC-34) | - | T551 |
 | REQ-OPT-349 | optimizer | v1-full | OS resource effects shall participate in compiler EffectInfo, and the optimizer shall not eliminate or reorder observable external side-effects. | tasks/0443 §184.145 (AOS-30, AOS-31) | - | T602 |
 | REQ-TOOL-182 | tooling | v1-full | Compile-time metadata (.axmeta), runtime reflection metadata, and debug metadata shall be distinct artifacts; .axmeta shall not be required to be embedded into production executables. | tasks/0444 §185.152 (AMETA-20, AMETA-21, AMETA-22) | - | T812, T814, T815 |
@@ -6360,7 +6360,7 @@
 | REQ-BLD-098 | build | v1-core | Hermetic and reproducible build modes shall reject undeclared external inputs, require deterministic inputs, and prohibit network access during offline builds. | tasks/0446 §187.160 (ABUILD-25, ABUILD-26, ABUILD-27) | - | T113 | 
 | REQ-BLD-099 | build | v1-core | Build cache identity shall be based on semantic content including compiler version, target, ABI, features, and codegen flags; cache hits shall not alter observable semantics. | tasks/0446 §187.160 (ACACHE-20, ACACHE-22, ACACHE-23, ACACHE-24) | - | T113 | 
 | REQ-PKG-013 | package | v1-core | Executables shall run without access to the package manager or package registry, and vendored dependencies shall support fully offline air-gapped builds. | tasks/0446 §187.160 (ADIST-20, ADIST-21, ADIST-28) | - | T113 | 
-| REQ-RT-164 | runtime | v1-full | Package management tooling and unused runtime components shall never be implicitly linked into application binaries. | tasks/0446 §187.160 (ARUNTIMEPKG-20, ARUNTIMEPKG-21, ARUNTIMEPKG-22, ARUNTIMEPKG-23) | - | EPIC(E21.1) |
+| REQ-RT-164 | runtime | v1-full | Package management tooling and unused runtime components shall never be implicitly linked into application binaries. | tasks/0446 §187.160 (ARUNTIMEPKG-20, ARUNTIMEPKG-21, ARUNTIMEPKG-22, ARUNTIMEPKG-23) | - | T924, T926, T927 |
 | REQ-ORC-010 | oracle | v1-core | Every compiler transformation shall preserve observable semantics, with formal reference semantics serving as the authoritative semantic oracle. | tasks/0447 §29 (ATEST-20, ATEST-21, ATEST-40) | - | T113 | 
 | REQ-MIR-128 | mir | v1-core | Verified MIR shall serve as the correctness boundary prior to optimization, and the MIR interpreter shall execute according to Verified MIR semantics. | tasks/0447 §29 (ATEST-22, ATEST-23) | - | T113 | 
 | REQ-OPT-350 | optimizer | v1-full | Every optimization pass shall specify explicit preconditions and preserved invariants; unproven optimization proofs shall abort the pass, and unknown aliases shall not be treated as disjoint. | tasks/0447 §29 (ATEST-24, ATEST-25, ATEST-26, ATEST-27) | - | T602 |
@@ -6398,24 +6398,24 @@
 | REQ-GEN-098 | generics | v1-core | Generic monomorphization shall remain unconstrained inside package boundaries, and exposing stable generic interfaces shall not require freezing compiler-private monomorphized representations. | tasks/0452 §193.47 (AABI-28, AABI-29) | - | T113 | 
 | REQ-ABI-100 | abi | v1-full | Compiler-generated closure representations and async state-machine layouts shall not constitute stable binary ABI by default. | tasks/0452 §193.47 (AABI-31, AABI-32) | - | T510 |
 | REQ-ABI-101 | abi | v1-full | Stable binary symbols shall carry versioned ABI fingerprints, enabling multiple ABI versions to coexist via ABI adapters without penalizing internal optimization. | tasks/0452 §193.47 (AABI-34, AABI-37, AABI-42, AABI-43) | - | T504 |
-| REQ-RT-165 | runtime | v1-full | Application hot reloading shall require explicit stable ABI and state-migration contracts, and state migration shall not rely on unverified layout reinterpretation via memcpy. | tasks/0452 §193.47 (AABI-40, AABI-41) | - | EPIC(E21.1) |
+| REQ-RT-165 | runtime | v1-full | Application hot reloading shall require explicit stable ABI and state-migration contracts, and state migration shall not rely on unverified layout reinterpretation via memcpy. | tasks/0452 §193.47 (AABI-40, AABI-41) | - | T924, T925, T927 |
 | REQ-DRV-017 | driver | v1-full | The Axiom compiler shall use a unified multi-target architecture where target selection is an explicit input to CompilerDB, avoiding separate target-specific compiler executables. | tasks/0453 §194.44 (ATARGET-20, ATARGET-21, ATARGET-46) | - | T753 |
 | REQ-CTM-046 | comptime | v1-full | Host and target environments shall remain distinct; build tools run in host domain and comptime host capabilities shall not represent target runtime state. | tasks/0453 §194.44 (ATARGET-22, ATARGET-23, ATARGET-35, ATARGET-36) | - | T551 |
 | REQ-MIR-129 | mir | v1-core | Verified MIR shall remain target-independent, while target identity parameters (architecture, OS, ABI, pointer model, atomics, SIMD) are lowered during backend code generation. | tasks/0453 §194.44 (ATARGET-24, ATARGET-27, ATARGET-28, ATARGET-30, ATARGET-31, ATARGET-32) | - | T113 | 
 | REQ-BLD-101 | build | v1-core | Target-specific source declarations shall be selected prior to semantic verification, and cross-target build caches shall prevent machine artifact collisions using target-specific cache keys. | tasks/0453 §194.44 (ATARGET-34, ATARGET-39, ATARGET-40) | - | T113 | 
 | REQ-TGT-001 | target-other | v1-full | WASM shall be modeled as a first-class native target backend, GPU targets shall be explicit execution domains, and universal binaries shall be created by composing multi-target native artifacts. | tasks/0453 §194.44 (ATARGET-41, ATARGET-42, ATARGET-43) | - | T689, T690, T691, T692 |
-| REQ-RT-166 | runtime | v1-full | Target backend replacement shall not change Core language semantics, and freestanding target compilation shall not require a monolithic hosted runtime. | tasks/0453 §194.44 (ATARGET-37, ATARGET-47) | - | EPIC(E21.1) |
+| REQ-RT-166 | runtime | v1-full | Target backend replacement shall not change Core language semantics, and freestanding target compilation shall not require a monolithic hosted runtime. | tasks/0453 §194.44 (ATARGET-37, ATARGET-47) | - | T932, T935 |
 | REQ-OBJ-019 | object | v1-core | Axiom shall define a target-independent logical object model with target-specific serialization backends for PE/COFF, ELF, Mach-O, and WASM without altering language semantics. | tasks/0454 §195.50 (ALINK-20, ALINK-21, ALINK-39, ALINK-40) | - | T113 | 
 | REQ-LNK-228 | linker | v1-full | Symbols shall retain semantic identity distinct from mangled names, relocations shall be explicit link-time contracts, and the linker shall not alter observable language semantics. | tasks/0454 §195.50 (ALINK-22, ALINK-23, ALINK-24) | - | T067 |
 | REQ-LNK-229 | linker | v1-full | Dead-code elimination during linking shall preserve exports, dynamic roots, reflection anchors, and explicit keep contracts, while code/data merging preserves observable identities. | tasks/0454 §195.50 (ALINK-25, ALINK-26) | - | T067 |
 | REQ-LNK-230 | linker | v1-full | Thread-local storage (TLS) shall be an explicit storage domain, startup shall not require global constructor registries, and unwind metadata shall be retained only when requested by the error model. | tasks/0454 §195.50 (ALINK-27, ALINK-28, ALINK-29) | - | T067 |
 | REQ-SEC-119 | security | v1-core | Binary image sections shall enforce Write XOR Execute (W^X) permissions where supported, and reproducible linking shall utilize deterministic symbol ordering and normalized metadata. | tasks/0454 §195.50 (ALINK-35, ALINK-38) | - | T113 | 
 | REQ-BOOT-086 | bootstrap | v1-core | The final self-hosted toolchain shall generate native executable binaries through an internal Axiom linker without requiring third-party compilers or linkers. | tasks/0454 §195.50 (ALINK-42, ALINK-43, ALINK-44) | - | T113 | 
-| REQ-RT-167 | runtime | v1-full | Axiom shall not mandate a monolithic runtime; runtime functionality shall be composed as modular capabilities derived from reachable program requirements. | tasks/0455 §196.47 (ART-20, ART-21, ART-22, ART-23) | - | EPIC(E21.1) |
-| REQ-RT-168 | runtime | v1-full | Program startup shall be an explicit platform component where main does not need to equal the physical OS entry point, and compile-time static data shall not require runtime constructor execution. | tasks/0455 §196.47 (ART-26, ART-27, ART-37, ART-38) | - | EPIC(E21.1) |
-| REQ-RT-169 | runtime | v1-full | Memory allocator, TLS, thread runtime, async executor, reflection, and Unicode tables shall be optional runtime components omitted from the final binary when unused. | tasks/0455 §196.47 (ART-28, ART-29, ART-30, ART-31, ART-32, ART-33) | - | EPIC(E21.1) |
-| REQ-RT-170 | runtime | v1-full | Freestanding and embedded programs shall execute without the hosted Axiom runtime while preserving all Core language safety guarantees. | tasks/0455 §196.47 (ART-34, ART-43, ART-48) | - | EPIC(E21.1) |
-| REQ-RT-171 | runtime | v1-full | Runtime component initialization ordering shall be dependency-derived and deterministic, and initialization cycles shall be diagnosed and rejected. | tasks/0455 §196.47 (ART-35, ART-36) | - | EPIC(E21.1) |
+| REQ-RT-167 | runtime | v1-full | Axiom shall not mandate a monolithic runtime; runtime functionality shall be composed as modular capabilities derived from reachable program requirements. | tasks/0455 §196.47 (ART-20, ART-21, ART-22, ART-23) | - | T932, T935 |
+| REQ-RT-168 | runtime | v1-full | Program startup shall be an explicit platform component where main does not need to equal the physical OS entry point, and compile-time static data shall not require runtime constructor execution. | tasks/0455 §196.47 (ART-26, ART-27, ART-37, ART-38) | - | T932, T935 |
+| REQ-RT-169 | runtime | v1-full | Memory allocator, TLS, thread runtime, async executor, reflection, and Unicode tables shall be optional runtime components omitted from the final binary when unused. | tasks/0455 §196.47 (ART-28, ART-29, ART-30, ART-31, ART-32, ART-33) | - | T932, T935 |
+| REQ-RT-170 | runtime | v1-full | Freestanding and embedded programs shall execute without the hosted Axiom runtime while preserving all Core language safety guarantees. | tasks/0455 §196.47 (ART-34, ART-43, ART-48) | - | T932, T935 |
+| REQ-RT-171 | runtime | v1-full | Runtime component initialization ordering shall be dependency-derived and deterministic, and initialization cycles shall be diagnosed and rejected. | tasks/0455 §196.47 (ART-35, ART-36) | - | T932, T935 |
 | REQ-ASY-156 | async | v1-full | Async language syntax shall not implicitly link a runtime executor, and thread-safe semantics shall not require a thread runtime when no threads are spawned. | tasks/0455 §196.47 (ART-46, ART-47) | - | T420 |
 | REQ-CORE-1317 | core-lib | v1-core | Language Core and the core library shall remain independent of the hosted standard library and shall not require a heap, OS, filesystem, network, or thread runtime. | tasks/0456 §197.51 (ASTDL-20, ASTDL-21, ASTDL-39, ASTDL-44) | - | T113 | 
 | REQ-CORE-1318 | core-lib | v1-core | Dynamic memory allocation facilities shall reside in an explicit alloc library layer above core, and hosted std APIs shall not be mandatory dependencies of freestanding programs. | tasks/0456 §197.51 (ASTDL-22, ASTDL-23) | - | T113 | 
@@ -6432,30 +6432,30 @@
 | REQ-TYP-339 | types | post-v1 | Eager execution tensors (`Tensor<T>`) and lazy graph tensors (`GraphTensor<T>`) shall have distinct semantic types; graph optimization, operator fusion, and memory planning may reuse storage buffers only after proving lifetime non-overlap and effect preservation. | tasks/0459 §200.20-27, ATENSOR-33-36; tasks/0468 §209.20-27, ATENSOR-40-43, ATENSOR-51, ATENSOR-61 | - | EPIC(E24.0) |
 | REQ-MIR-130 | mir | post-v1 | Automatic differentiation shall lower to ordinary verified Axiom MIR functions that undergo type, ownership, capability, and GPU verification; gradients shall be first-class owned values and stop-gradient shall be explicit. | tasks/0459 §200.28-38, ATENSOR-38-41; tasks/0468 §209.28-38, ATENSOR-44-48 | - | EPIC(E24.0) |
 | REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | T500 |
-| REQ-RT-172 | runtime | v1-full | Tensor and AI framework libraries shall not require a mandatory garbage collector or global runtime, enabling inference builds to dead-strip training, autodiff, and unused kernel components. | tasks/0459 §200.47-48, §200.58-59, ATENSOR-47-48, ATENSOR-58-59; tasks/0468 §209.58-59, ATENSOR-66-67, ATENSOR-79-80 | - | EPIC(E21.1) |
+| REQ-RT-172 | runtime | v1-full | Tensor and AI framework libraries shall not require a mandatory garbage collector or global runtime, enabling inference builds to dead-strip training, autodiff, and unused kernel components. | tasks/0459 §200.47-48, §200.58-59, ATENSOR-47-48, ATENSOR-58-59; tasks/0468 §209.58-59, ATENSOR-66-67, ATENSOR-79-80 | - | T932, T933, T935 |
 | REQ-STD-161 | std-lib | post-v1 | Sockets and network resources shall be modeled as owned OS resources distinct from raw OS handles (`int`/`HANDLE`), with typed abstractions distinguishing protocol capabilities (`TcpListener`, `TcpStream`, `UdpSocket`, `UnixStream`). | tasks/0461 §202.2-4, ANET-20-22 | - | EPIC(E24.0) |
 | REQ-ASY-157 | async | v1-full | Asynchronous network I/O shall preserve buffer validity until operation completion without requiring programmer-written lifetime annotations, permitting either owned buffer moves into pending operations or borrow capabilities proven safe by the compiler. | tasks/0461 §202.23-26, ANET-23-26 | - | T427 |
 | REQ-CAP-135 | capability | v1-full | Zero-copy network I/O and scatter/gather operations shall enforce capability non-overlap rules and shall never silently alter buffer ownership semantics. | tasks/0461 §202.27-29, ANET-27-29 | - | T519 |
 | REQ-LAY-294 | layout | post-v1 | Network wire representation shall remain distinct from memory representation, requiring explicit wire endianness and framing; raw network bytes shall be validated before creating safe typed values. | tasks/0461 §202.30-34, ANET-30-34 | - | EPIC(E24.0) |
 | REQ-ASY-158 | async | v1-full | Network Future cancellation shall be semantically distinct from dropping a Future; platform completion backends (`io_uring`, `IOCP`, `epoll`, `kqueue`) shall be hidden beneath portable asynchronous I/O abstractions. | tasks/0461 §202.37-38, §202.43-44, ANET-37-38, ANET-43-44 | - | T426 |
-| REQ-RT-173 | runtime | v1-full | High-performance networking runtimes shall be optional, tree-shakeable, and free of mandatory garbage collection, providing bounded worker scheduling without requiring a thread-per-connection architecture. | tasks/0461 §202.57-58, §202.63-64, §202.70-71, ANET-57-58, ANET-63-64, ANET-70-71 | - | EPIC(E21.1) |
+| REQ-RT-173 | runtime | v1-full | High-performance networking runtimes shall be optional, tree-shakeable, and free of mandatory garbage collection, providing bounded worker scheduling without requiring a thread-per-connection architecture. | tasks/0461 §202.57-58, §202.63-64, §202.70-71, ANET-57-58, ANET-63-64, ANET-70-71 | - | T912, T913, T914, T915 |
 | REQ-STD-162 | std-lib | v1-core | Filesystem APIs shall model files and directories as owned OS resources, maintaining a semantic distinction between `Path` data, `FileId`, and `FileHandle`. | tasks/0462 §203.1-3, ASTORE-20-22 | - | T113 | 
 | REQ-CAP-136 | capability | v1-full | Memory mappings shall have explicit ownership and lifetime; mapped views shall not outlive their backing mapping, and writable mappings shall obey exclusive mutable capability rules. | tasks/0462 §203.23-25, ASTORE-23-25 | - | T519 |
 | REQ-LAY-295 | layout | post-v1 | Persistent storage representations shall remain distinct from in-memory layouts, prohibiting raw process pointer identities and requiring validated logical identifiers or relative offsets. | tasks/0462 §203.26-28, §203.41-42, ASTORE-26-28, ASTORE-41-42 | - | EPIC(E24.0) |
 | REQ-CAP-137 | capability | v1-full | Database page buffer pools shall maintain explicit pin lifetimes; page eviction shall not invalidate live safe capabilities referencing buffer contents. | tasks/0462 §203.29-31, ASTORE-29-31 | - | T520 |
 | REQ-DRP-059 | drop | post-v1 | Write-ahead logging (WAL) shall distinguish written, flushed, and durable states; dropping an active transaction shall trigger a rollback and shall never implicitly commit. | tasks/0462 §203.34-36, ASTORE-34-36 | - | EPIC(E24.0) |
-| REQ-RT-174 | runtime | v1-full | Storage engines shall not require a garbage collector, supporting native asynchronous I/O and deterministic crash-recovery testing without thread-per-operation designs. | tasks/0462 §203.61-62, §203.66-67, ASTORE-61-62, ASTORE-66-67 | - | EPIC(E21.1) |
+| REQ-RT-174 | runtime | v1-full | Storage engines shall not require a garbage collector, supporting native asynchronous I/O and deterministic crash-recovery testing without thread-per-operation designs. | tasks/0462 §203.61-62, §203.66-67, ASTORE-61-62, ASTORE-66-67 | - | T920, T922, T923 |
 | REQ-STD-163 | std-lib | post-v1 | Distributed systems shall represent `NodeId`, `ProcessId`, and `ActorId` as logical identities distinct from physical network or memory addresses. | tasks/0463 §204.1-4, ADIST-20-23 | - | EPIC(E24.0) |
 | REQ-OWN-246 | ownership | post-v1 | Actor state shall have explicit ownership without requiring class inheritance or a dedicated object model; actor mailbox messages shall obey standard ownership move semantics. | tasks/0463 §204.5-6, ADIST-24-26 | - | EPIC(E24.0) |
 | REQ-STD-164 | std-lib | post-v1 | Remote references shall never masquerade as local safe references; remote operations shall expose fallible `Result` semantics, and Axiom `Send` shall not imply network serializability. | tasks/0463 §204.27-30, ADIST-27-30 | - | EPIC(E24.0) |
 | REQ-STD-165 | std-lib | post-v1 | Distributed leases and distributed ownership shall remain distinct from memory ownership; logical clocks and failure detectors (suspicion) shall not assume synchronized physical wall clocks. | tasks/0463 §204.31-35, ADIST-31-35 | - | EPIC(E24.0) |
 | REQ-DRP-060 | drop | post-v1 | Resource cleanup on `Drop` shall not depend on network communication during distributed failures; fallible remote cleanup operations shall be explicit. | tasks/0463 §204.52-53, ADIST-52-53 | - | EPIC(E24.0) |
-| REQ-RT-175 | runtime | v1-full | Distributed system abstractions shall not introduce remote pointers, distributed garbage collection, or mandatory local garbage collection into Core. | tasks/0463 §204.69-71, ADIST-69-71 | - | EPIC(E21.1) |
+| REQ-RT-175 | runtime | v1-full | Distributed system abstractions shall not introduce remote pointers, distributed garbage collection, or mandatory local garbage collection into Core. | tasks/0463 §204.69-71, ADIST-69-71 | - | T912, T914, T915 |
 | REQ-STD-166 | std-lib | v1-core | Temporal types (`Duration`, `Instant`, `Deadline`, `WallClock`, `MonotonicClock`, `LogicalClock`) shall remain distinct semantic types with no implicit conversion between clock domains. | tasks/0464 §205.1-3, ATIME-20, ATIME-23 | - | T113 | 
 | REQ-STD-167 | std-lib | v1-core | Monotonic clocks shall be used for elapsed-time measurement and timeouts; instant arithmetic shall permit `Instant - Instant -> Duration` and `Instant + Duration -> Instant` within the same domain, while prohibiting `Instant + Instant`. | tasks/0464 §205.3-4, ATIME-21-22, ATIME-24-25 | - | T113 | 
 | REQ-ASY-159 | async | v1-full | Timeouts and deadlines shall be explicit policy types distinct from cancellation; periodic timers shall explicitly declare fixed-rate or fixed-delay semantics, drift policies, and missed tick behavior. | tasks/0464 §205.6-8, ATIME-26-27, ATIME-29-31 | - | T426 |
 | REQ-CAP-138 | capability | v1-full | Timer cancellation shall preserve callback resource safety; timer callbacks shall not outlive captured capabilities or resources. | tasks/0464 §205.9, ATIME-32-33 | - | T519 |
-| REQ-RT-176 | runtime | v1-full | Real-time execution profiles may prohibit unbounded allocation, blocking operations, or thread synchronization, while ensuring async code does not acquire hidden blocking semantics. | tasks/0464 §205.14-16, ATIME-39-42 | - | EPIC(E21.1) |
+| REQ-RT-176 | runtime | v1-full | Real-time execution profiles may prohibit unbounded allocation, blocking operations, or thread synchronization, while ensuring async code does not acquire hidden blocking semantics. | tasks/0464 §205.14-16, ATIME-39-42 | - | T916, T918, T919 |
 | REQ-CTM-047 | comptime | v1-full | Access to time during comptime shall require explicit capability and participate in build cache identity; reproducible builds shall control or prohibit nondeterministic time inputs. | tasks/0464 §205.19, ATIME-47-49 | - | T551 |
 | REQ-STD-168 | std-lib | post-v1 | Network endpoint identity shall remain distinct from socket resource identity; socket `Drop` shall not imply graceful protocol shutdown. | tasks/0465 §206.3, §206.5, ANET2-21-23 | - | EPIC(E24.0) |
 | REQ-STD-169 | std-lib | post-v1 | TCP streams shall be modeled as continuous byte streams requiring explicit application framing; partial TCP writes shall not be treated as complete writes. | tasks/0465 §206.7-8, ANET2-24-27 | - | EPIC(E24.0) |
@@ -10125,8 +10125,8 @@
 | REQ-CORE-3088 | compiler | v1-full | The compiler must treat the executable format as a policy decision (e.g., recognizing that Position Independent Executables on Linux use ET_DYN) and must not hard-code the assumption that an executable strictly equals ET_EXEC. | 0563 §304.3 | - | T772 |
 | REQ-CORE-3089 | compiler | v1-full | Axiom must base its incremental compilation decisions on a semantic dependency graph rather than simple file modification logic, avoiding unnecessary rebuilds when only private implementations change. | 0564 §305.6 | - | T756 |
 | REQ-CORE-3090 | compiler | v1-full | The build system must distinguish between implementation, interface, and ABI changes, and must invalidate all ABI-dependent consumers whenever an ABI change occurs. | 0564 §305.8 | - | T756 |
-| REQ-RT-177 | runtime | v1-full | Core Axiom must be capable of compiling programs into an executable without requiring the Axiom runtime. | 0565 §1 | - | EPIC(E21.1) |
-| REQ-RT-178 | runtime | v1-full | The system must not require every program to link a monolithic runtime, but must instead include only the specific runtime components that are actually used. | 0565 §2 | - | EPIC(E21.1) |
+| REQ-RT-177 | runtime | v1-full | Core Axiom must be capable of compiling programs into an executable without requiring the Axiom runtime. | 0565 §1 | - | T932, T935 |
+| REQ-RT-178 | runtime | v1-full | The system must not require every program to link a monolithic runtime, but must instead include only the specific runtime components that are actually used. | 0565 §2 | - | T932, T935 |
 | REQ-CORE-3091 | compiler | v1-full | The architecture must maintain strict separation between three layers: the Axiom Language Core, the Standard Library, and the Runtime, Platform, OS, and FFI components. | 0566 §1 | - | T752 |
 | REQ-CORE-3092 | compiler | v1-full | The core language syntax must strictly contain only constructs that the compiler is required to understand, such as struct, enum, trait, fn, match, ownership, view, mut_view, async, comptime, and atomic semantics. | 0566 §2.1 | - | T752 |
 | REQ-PKG-014 | package | v1-core | The package system must solve not only file imports, but also namespace management, modules, packages, visibility, public/private APIs, dependency graphs, versioning, reproducible builds, workspaces, package caching, cross-compilation, conditional compilation, FFI packages, comptime dependencies, incremental compilation, circular dependencies, package security, binary/source dependencies, and AI-friendly project structures. | 0567 §1 | - | T113 | 
@@ -10139,8 +10139,8 @@
 | REQ-CORE-3094 | compiler | v1-full | The final compiler must be capable of completely eliminating any reliance on the initial bootstrap infrastructure. | 0570 §01 | - | T752 |
 | REQ-CORE-3095 | compiler | v1-full | The objective is not to create a secondary compiler for tooling, but rather to ensure that IDEs and AI tools interact with the exact same semantic model as the core compiler. | 0571 §312 | - | T752 |
 | REQ-CORE-3096 | compiler | v1-full | The system must not create separate type checkers, resolvers, or ownership analyzers for IDEs and AI tools, but must instead require all tools to utilize a shared semantic engine. | 0571 §312.1 | - | T752 |
-| REQ-RT-179 | runtime | v1-full | Axiom must allow programmers and AI tools to seamlessly trace execution from source code through semantic state, MIR, machine code, runtime behavior, and performance bottlenecks without guesswork. | 0572 §313 | - | EPIC(E21.1) |
-| REQ-RT-180 | runtime | v1-full | The runtime observability framework must function as a debug and profiling infrastructure powered by compiler-generated metadata and debugger protocols, rather than relying on runtime reflection. | 0572 §313 | - | EPIC(E21.1) |
+| REQ-RT-179 | runtime | v1-full | Axiom must allow programmers and AI tools to seamlessly trace execution from source code through semantic state, MIR, machine code, runtime behavior, and performance bottlenecks without guesswork. | 0572 §313 | - | T928, T931 |
+| REQ-RT-180 | runtime | v1-full | The runtime observability framework must function as a debug and profiling infrastructure powered by compiler-generated metadata and debugger protocols, rather than relying on runtime reflection. | 0572 §313 | - | T928, T931 |
 | REQ-CORE-3097 | compiler | v1-full | The compiler must maintain clear trust boundaries between formally proven code, code governed by programmer commitments, and external code. | 0573 §1 | - | T752 |
 | REQ-CORE-3098 | compiler | v1-full | Security features must not force mandatory runtime overhead or degrade the performance of safe code. | 0573 §1 | - | T752 |
 | REQ-CORE-3099 | compiler | v1-full | The normative semantics specification must definitively prescribe the required meaning and behavior of a program. | 0574 §2 | - | T752 |
@@ -10193,8 +10193,8 @@
 | REQ-OPT-384 | optimizer | v1-full | Changing the profile must not change the program meaning, but rather only affect optimization decisions. | 0597 §2 | - | T622 |
 | REQ-CORE-3129 | compiler | v1-full | Signing must not change the semantics of the program. | 0598 §339 | - | T752 |
 | REQ-CORE-3130 | compiler | v1-full | Axiom must not conflate integrity, authenticity, and trust, as a binary with a valid signature does not automatically mean it is trusted. | 0598 §1 | - | T752 |
-| REQ-RT-181 | runtime | v1-full | A sanitizer must not introduce new semantics, and instrumentation is only allowed to detect errors, record telemetry, terminate execution, and generate diagnostics. | 0599 §1 | - | EPIC(E21.1) |
-| REQ-RT-182 | runtime | v1-full | Instrumentation must not change the semantics of a valid program. | 0599 §1 | - | EPIC(E21.1) |
+| REQ-RT-181 | runtime | v1-full | A sanitizer must not introduce new semantics, and instrumentation is only allowed to detect errors, record telemetry, terminate execution, and generate diagnostics. | 0599 §1 | - | T928, T929, T931 |
+| REQ-RT-182 | runtime | v1-full | Instrumentation must not change the semantics of a valid program. | 0599 §1 | - | T928, T929, T931 |
 | REQ-TST-110 | testing | v1-core | The compiler must be able to self-test its parser, type system, trait solver, comptime, MIR, verifier, optimizer, code generator, linker, and semantic equivalence using millions of auto-generated programs. | 0600 §341 | - | T113 | 
 | REQ-TST-111 | testing | v1-core | A compiler crash must be categorized specifically as CompilerBug, InvalidInput, ResourceExhaustion, UnsupportedFeature, or InternalInvariantViolation, rather than just a generic compilation failure. | 0600 §3 | - | T113 | 
 | REQ-CORE-3131 | compiler | v1-full | Axiom must continuously prove that the compiler and programs remain fast, small, and resource-efficient after every change, not merely that they compile correctly. | 0601 §342 | - | T752 |
@@ -22819,7 +22819,7 @@
 | REQ-FFI-128 | ffi | v1-full | Compiler không tự tin vào FFI contract nếu function must not đánh dấu trusted/verified theo FFI rules. | tasks/0795 §573.71 | - | T502 |
 | REQ-CORE-3204 | compiler | v1-full | Function passed as callback must satisfy required effect bound. | tasks/0795 §573.82 | - | T768 |
 | REQ-CORE-3205 | compiler | v1-full | Function accepting callbacks must include callback effects trong summary nếu callback được invoke. | tasks/0795 §573.85 | - | T768 |
-| REQ-RT-184 | runtime | v1-full | Runtime không mandatory must carry effect metadata nếu compiler đã resolve statically. | tasks/0795 §573.88 | - | EPIC(E21.1) |
+| REQ-RT-184 | runtime | v1-full | Runtime không mandatory must carry effect metadata nếu compiler đã resolve statically. | tasks/0795 §573.88 | - | T928, T930, T931 |
 | REQ-OPT-393 | optimizer | v1-full | Effect analysis must hướng tới zero runtime overhead trong native optimized builds. | tasks/0795 §573.89 | - | T602 |
 | REQ-CORE-3206 | compiler | v1-full | Impure call must not eliminate chỉ vì return value không dùng. | tasks/0795 §573.92 | - | T768 |
 | REQ-CORE-3207 | compiler | v1-full | Caller must not assume callee purity chỉ vì caller itself được declared pure. | tasks/0795 §573.108 | - | T768 |
@@ -22827,8 +22827,8 @@
 | REQ-CORE-3209 | compiler | v1-full | Unsafe/trusted assertion must được đánh dấu rõ. | tasks/0795 §573.111 | - | T768 |
 | REQ-CORE-3210 | compiler | v1-full | Syntax effect annotation must optional trong common code. | tasks/0795 §573.114 | - | T768 |
 | REQ-CORE-3211 | compiler | v1-full | AI explanation must lấy canonical effect summary. | tasks/0795 §573.122 | - | T768 |
-| REQ-RT-185 | runtime | v1-full | Comptime functions must thỏa effect policy nghiêm ngặt hơn runtime functions. | tasks/0795 §573.128 | - | EPIC(E21.1) |
-| REQ-RT-186 | runtime | v1-full | Const evaluator must not thực thi arbitrary runtime IO effects. | tasks/0795 §573.129 | - | EPIC(E21.1) |
+| REQ-RT-185 | runtime | v1-full | Comptime functions must thỏa effect policy nghiêm ngặt hơn runtime functions. | tasks/0795 §573.128 | - | T928, T930, T931 |
+| REQ-RT-186 | runtime | v1-full | Const evaluator must not thực thi arbitrary runtime IO effects. | tasks/0795 §573.129 | - | T928, T930, T931 |
 | REQ-CORE-3212 | compiler | v1-full | Nếu Axiom cho phép compile-time file access, nó must là explicit build input/effect. | tasks/0795 §573.130 | - | T768 |
 | REQ-CORE-3213 | compiler | v1-full | Nondeterministic effects trong comptime must bị cấm hoặc explicit external build input. | tasks/0795 §573.131 | - | T768 |
 | REQ-CORE-3214 | compiler | v1-full | Effect system must not dùng để cache một function nếu effect summary cho thấy observable state dependency. | tasks/0795 §573.132 | - | T768 |
@@ -22899,7 +22899,7 @@
 | REQ-CORE-3269 | compiler | v1-full | Symbolic engine must not nhầm byte length với character count. | tasks/0796 §574.151 | - | T768 |
 | REQ-CORE-3270 | compiler | v1-full | Await/suspend boundaries must preserve resource facts. | tasks/0796 §574.157 | - | T768 |
 | REQ-CORE-3271 | compiler | v1-full | Cancellation paths must được symbolic modeled. | tasks/0796 §574.158 | - | T768 |
-| REQ-RT-187 | runtime | v1-full | Panic path must đi qua cleanup graph theo runtime semantics. | tasks/0796 §574.159 | - | EPIC(E21.1) |
+| REQ-RT-187 | runtime | v1-full | Panic path must đi qua cleanup graph theo runtime semantics. | tasks/0796 §574.159 | - | T928, T930, T931 |
 | REQ-CORE-3272 | compiler | v1-full | Atomic semantics must not simplify thành ordinary memory operations. | tasks/0796 §574.163 | - | T768 |
 | REQ-CORE-3273 | compiler | v1-full | Không được constant-fold dựa trên unknown external state. | tasks/0796 §574.166 | - | T768 |
 | REQ-CORE-3274 | compiler | v1-full | Time/random/system state must giữ symbolic unknown. | tasks/0796 §574.167 | - | T768 |
@@ -22922,11 +22922,11 @@
 | REQ-ASY-167 | async | v1-full | Axiom must provide a unified Resource Governor to control, account for, and coordinate all runtime resources (CPU, memory, IO, tasks). | 0834 (§606.0) | - | T088, T311 |
 | REQ-ASY-168 | async | v1-full | Axiom must provide a native scheduling, threading, and async runtime with executors, work-stealing, and structured concurrency. | 0835 (§607.1), 0836 (§1) | - | T088, T311 |
 | REQ-CONC-219 | concurrency | v1-full | Axiom must provide native synchronization primitives, atomics, lock-free structures, and well-defined memory semantics. | 0837 (§1) | - | T089, T090 |
-| REQ-STD-171 | std-lib | v1-full | Axiom must provide Native Networking, Sockets, DNS, TLS Boundary, HTTP Transport & Network I/O Runtime capabilities. | 0838 (§1) | - | T321 |
-| REQ-STD-172 | std-lib | v1-full | Axiom must provide Native Cryptography, TLS, Certificate Trust, Key Management & Secure Transport capabilities. | 0839 (§1) | - | T321 |
-| REQ-STD-173 | std-lib | v1-full | Axiom must provide native storage, filesystem, memory mapping, and durable data APIs. | 0840 (§1) | - | T074b, T321 |
-| REQ-STD-174 | std-lib | v1-full | Axiom must provide native serialization and binary data models. | 0841 (§1) | - | T074b, T321 |
-| REQ-STD-175 | std-lib | v1-full | Axiom must provide native compression, archiving, and content-addressed storage capabilities. | 0842 (§1), 0844 (§1) | - | T321 |
+| REQ-STD-171 | std-lib | v1-full | Axiom must provide Native Networking, Sockets, DNS, TLS Boundary, HTTP Transport & Network I/O Runtime capabilities. | 0838 (§1) | - | T321, T912, T913, T914, T915 |
+| REQ-STD-172 | std-lib | v1-full | Axiom must provide Native Cryptography, TLS, Certificate Trust, Key Management & Secure Transport capabilities. | 0839 (§1) | - | T321, T928, T929, T930, T931 |
+| REQ-STD-173 | std-lib | v1-full | Axiom must provide native storage, filesystem, memory mapping, and durable data APIs. | 0840 (§1) | - | T074b, T321, T908, T909, T911, T920, T921, T922, T923 |
+| REQ-STD-174 | std-lib | v1-full | Axiom must provide native serialization and binary data models. | 0841 (§1) | - | T074b, T321, T924, T925, T926, T927 |
+| REQ-STD-175 | std-lib | v1-full | Axiom must provide native compression, archiving, and content-addressed storage capabilities. | 0842 (§1), 0844 (§1) | - | T321, T924, T926, T927 |
 | REQ-GPU-064 | gpu | v1-full | Axiom must provide APIs for hardware devices, GPU accelerators, and OS resource IO. | 0843 (§1), 0845 (§1) | - | T322 |
 | REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - | T322 |
 | REQ-STD-176 | std-lib | v1-full | Axiom must provide robust Unicode, text layout, and internationalization capabilities. | 0850 (§1) | - | T071 |
@@ -22934,7 +22934,7 @@
 | REQ-ECO-8734 | ecosystem | v1-full | Axiom must enable dynamic plugins, hot-reloading, and safe dependency isolation across module boundaries. | 0856 (§1) | - | T320, T866, T867, T868, T869, T870, T871, T872, T873 |
 | REQ-ECO-8735 | ecosystem | post-v1 | Axiom must provide Native Application Scripting, Embedded Language Boundary, Automation & Expression Runtime capabilities. | 0857 (§256) | - | T324 |
 | REQ-ECO-8736 | ecosystem | v1-full | Axiom must provide Native Application Package Registry, Repository, Dependency Resolution Service & Distribution Runtime capabilities. | 0858 (§1) | - | T320, T854, T855, T856, T857, T858, T859, T860, T861, T874, T875, T876, T877 |
-| REQ-STD-177 | std-lib | v1-full | Axiom must provide networking services including RPC, HTTP clients, and distributed gateway abstractions. | 0859 (§1) | - | T321 |
+| REQ-STD-177 | std-lib | v1-full | Axiom must provide networking services including RPC, HTTP clients, and distributed gateway abstractions. | 0859 (§1) | - | T321, T912, T914, T915 |
 | REQ-ECO-8737 | ecosystem | post-v1 | Axiom ecosystem must enable distributed consensus, cluster coordination, and replicated CRDT data models. | 0860 (§1), 0861 (§1) | - | T324 |
 | REQ-ECO-8738 | ecosystem | post-v1 | Axiom must provide Native Distributed Workflow, Jobs, Scheduling, Orchestration, Durable Tasks & Long-Running Process Runtime capabilities. | 0862 (§1) | - | T324 |
 | REQ-ECO-8739 | ecosystem | post-v1 | Axiom must provide Native Distributed Compute, Worker Pool, Remote Execution, Placement & Cluster Execution Runtime capabilities. | 0863 (§1) | - | T324 |
@@ -22974,628 +22974,628 @@
 | REQ-ECO-8773 | ecosystem | post-v1 | The standard library and runtime must expose stable ABIs and primitives to enable axiom ai learning, adaptation, reinforcement, skill acquisition, continual learning & model update. | tasks/0903 | - | EPIC(E24.1) |
 | REQ-ECO-8774 | ecosystem | post-v1 | The standard library and runtime must expose stable ABIs and primitives to enable axiom ai evaluation, benchmarking, verification, validation, red-team, safety testing & model assurance. | tasks/0904 | - | EPIC(E24.1) |
 | REQ-ECO-8775 | ecosystem | post-v1 | The standard library and runtime must expose stable ABIs and primitives to enable axiom ai safety, alignment, constraint enforcement, runtime guardrails, safe exploration & fail-safe ai. | tasks/0905 | - | EPIC(E24.1) |
-| REQ-RT-188 | runtime | v1-full | BOOTSTRAP-665 tiếp tục từ 664, nhưng tách riêng **human oversight/control** khỏi safety enforcement: 664 quyết định runtime có an toàn/được phép hay không; 665 định nghĩa **khi nào con người phải tham gia, họ có quyền gì, can thiệp ra sao, chuyển quyền kiểm soát thế nào và hệ thống phải xử lý consent/approval/escalation như thế nào**. | tasks/0906 §1 | - | EPIC(E21.1) |
-| REQ-RT-189 | runtime | v1-full | AI tạo proposal. Human phải: approve deny modify | tasks/0906 §7 | - | EPIC(E21.1) |
-| REQ-RT-190 | runtime | v1-full | struct HumanActor { id: HumanId identity: IdentityRef roles: Role[] authorities: Authority[] availability: Availability session: SessionRef } Identity và authority phải tách biệt. | tasks/0906 §11 | - | EPIC(E21.1) |
-| REQ-RT-191 | runtime | v1-full | --- Approval phải có thể expire. | tasks/0906 §21 | - | EPIC(E21.1) |
-| REQ-RT-192 | runtime | v1-full | --- Approval phải invalid nếu: policy changes action changes risk changes beyond threshold environment changes authority expires model changes target changes | tasks/0906 §22 | - | EPIC(E21.1) |
-| REQ-RT-193 | runtime | v1-full | approval exists + context changed = approval may be stale 665 phải kiểm tra freshness. | tasks/0906 §23 | - | EPIC(E21.1) |
-| REQ-RT-194 | runtime | v1-full | consent.revoke(scope) Phải có effect semantics rõ: future actions pending actions active actions stored data | tasks/0906 §30 | - | EPIC(E21.1) |
-| REQ-RT-195 | runtime | v1-full | --- Nếu policy yêu cầu, pending action phải bị: cancelled | tasks/0906 §31 | - | EPIC(E21.1) |
-| REQ-RT-196 | runtime | v1-full | AI ↓ Human ↓ AI phải có state transition explicit. | tasks/0906 §36 | - | EPIC(E21.1) |
-| REQ-RT-197 | runtime | v1-full | Có thể cho: AI + Human đồng thời điều khiển nhưng action ownership phải explicit. | tasks/0906 §39 | - | EPIC(E21.1) |
-| REQ-RT-198 | runtime | v1-full | Veto có thể: current action current workflow current session future actions scope phải explicit. | tasks/0906 §43 | - | EPIC(E21.1) |
-| REQ-RT-199 | runtime | v1-full | Timeout không mặc định là approval. Policy phải quy định: deny hold safe mode fallback escalate further | tasks/0906 §50 | - | EPIC(E21.1) |
-| REQ-RT-200 | runtime | v1-full | --- Phải chống: AI → Human A Human A → Human B Human B → AI AI → Human A | tasks/0906 §51 | - | EPIC(E21.1) |
-| REQ-RT-201 | runtime | v1-full | Human A → Human B → Agent C effective authority không được vượt authority root. | tasks/0906 §62 | - | EPIC(E21.1) |
-| REQ-RT-202 | runtime | v1-full | Revoking parent delegation phải invalidate descendant delegations khi policy yêu cầu. | tasks/0906 §64 | - | EPIC(E21.1) |
-| REQ-RT-203 | runtime | v1-full | Hai approvals từ cùng một authority chain có thể không được coi là independent. | tasks/0906 §68 | - | EPIC(E21.1) |
-| REQ-RT-204 | runtime | v1-full | --- Runtime phải tránh race: approve approve approve | tasks/0906 §70 | - | EPIC(E21.1) |
-| REQ-RT-205 | runtime | v1-full | Nếu: A = approve B = deny policy phải định nghĩa: deny-wins quorum role priority escalate | tasks/0906 §71 | - | EPIC(E21.1) |
-| REQ-RT-206 | runtime | v1-full | --- Approval UI/runtime phải có structured evidence: action goal risk constraints policy model expected effects uncertainty alternatives | tasks/0906 §75 | - | EPIC(E21.1) |
-| REQ-RT-207 | runtime | v1-full | --- Explanation phải phân biệt: observed predicted inferred assumed unknown | tasks/0906 §77 | - | EPIC(E21.1) |
-| REQ-RT-208 | runtime | v1-full | UI chỉ là một interface. Approval phải có canonical runtime record. | tasks/0906 §79 | - | EPIC(E21.1) |
-| REQ-RT-209 | runtime | v1-full | --- Critical approval phải authenticated. | tasks/0906 §81 | - | EPIC(E21.1) |
-| REQ-RT-210 | runtime | v1-full | Approval token phải có integrity protection khi required. | tasks/0906 §82 | - | EPIC(E21.1) |
-| REQ-RT-211 | runtime | v1-full | --- Approval token không được replay ngoài scope. | tasks/0906 §83 | - | EPIC(E21.1) |
-| REQ-RT-212 | runtime | v1-full | --- Human oversight UI phải hỗ trợ: keyboard screen reader high contrast large text alternative input | tasks/0906 §88 | - | EPIC(E21.1) |
-| REQ-RT-213 | runtime | v1-full | Các trạng thái: Delivered Seen Acknowledged Approved Denied phải khác nhau. | tasks/0906 §92 | - | EPIC(E21.1) |
-| REQ-RT-214 | runtime | v1-full | Có thể record: request_presented request_seen request_opened decision_made nhưng không được suy diễn rằng "seen = understood". | tasks/0906 §93 | - | EPIC(E21.1) |
-| REQ-RT-215 | runtime | v1-full | Không được dùng để suy đoán trạng thái sức khỏe hoặc năng lực của một người. | tasks/0906 §97 | - | EPIC(E21.1) |
-| REQ-RT-216 | runtime | v1-full | --- Priority phải policy-defined. | tasks/0906 §105 | - | EPIC(E21.1) |
-| REQ-RT-217 | runtime | v1-full | --- Review queue phải có starvation policy. | tasks/0906 §107 | - | EPIC(E21.1) |
-| REQ-RT-218 | runtime | v1-full | Có thể batch các action: same policy same scope same risk class nhưng batch approval phải explicit. | tasks/0906 §109 | - | EPIC(E21.1) |
-| REQ-RT-219 | runtime | v1-full | Một action thay đổi vượt batch scope phải re-approve. | tasks/0906 §111 | - | EPIC(E21.1) |
-| REQ-RT-220 | runtime | v1-full | Consent revoke phải propagate tới dependent workflows. | tasks/0906 §115 | - | EPIC(E21.1) |
-| REQ-RT-221 | runtime | v1-full | Multi-tenant oversight phải enforce tenant boundary. | tasks/0906 §120 | - | EPIC(E21.1) |
-| REQ-RT-222 | runtime | v1-full | Khi identity revoked: pending approvals delegations control tokens phải được policy xử lý. | tasks/0906 §121 | - | EPIC(E21.1) |
-| REQ-RT-223 | runtime | v1-full | Session termination phải invalidate session-bound approval/control tokens. | tasks/0906 §123 | - | EPIC(E21.1) |
-| REQ-RT-224 | runtime | v1-full | Emergency mode có thể rút ngắn workflow nhưng vẫn phải: authenticated scoped audited | tasks/0906 §126 | - | EPIC(E21.1) |
-| REQ-RT-225 | runtime | v1-full | Mọi: take_control release_control modify override approve deny đều phải audit theo policy. | tasks/0906 §128 | - | EPIC(E21.1) |
-| REQ-RT-226 | runtime | v1-full | --- Hệ thống phải phân biệt: AI proposed Human approved System executed | tasks/0906 §132 | - | EPIC(E21.1) |
-| REQ-RT-227 | runtime | v1-full | Collaborative execution có thể có nhiều actors. Attribution phải granular. | tasks/0906 §133 | - | EPIC(E21.1) |
-| REQ-RT-228 | runtime | v1-full | Human có thể tạo action trực tiếp. Vẫn phải qua: 603 639 664 | tasks/0906 §135 | - | EPIC(E21.1) |
-| REQ-RT-229 | runtime | v1-full | --- AI không được tạo: HumanApproval | tasks/0906 §137 | - | EPIC(E21.1) |
-| REQ-RT-230 | runtime | v1-full | Test environment có thể dùng synthetic approvals nhưng metadata phải: synthetic = true | tasks/0906 §138 | - | EPIC(E21.1) |
-| REQ-RT-231 | runtime | v1-full | Không được coi synthetic approval là real human approval trong strict profile. | tasks/0906 §139 | - | EPIC(E21.1) |
-| REQ-RT-232 | runtime | v1-full | 648 có thể mô phỏng human. 665 phải distinguish: simulated_human real_human | tasks/0906 §140 | - | EPIC(E21.1) |
-| REQ-RT-233 | runtime | v1-full | Human approval records có thể trở thành training data nhưng phải qua: 640 privacy 647 governance 662 learning policy | tasks/0906 §141 | - | EPIC(E21.1) |
-| REQ-RT-234 | runtime | v1-full | Human có thể sửa: plan parameters target constraints AI phải revalidate. | tasks/0906 §148 | - | EPIC(E21.1) |
-| REQ-RT-235 | runtime | v1-full | Human có thể lock một phần plan: @human_locked AI không được sửa phần đó. | tasks/0906 §150 | - | EPIC(E21.1) |
-| REQ-RT-236 | runtime | v1-full | Human có thể thêm temporary constraint: @human_constraint nhưng phải nằm trong authority scope. | tasks/0906 §151 | - | EPIC(E21.1) |
-| REQ-RT-237 | runtime | v1-full | --- Temporary policy phải có expiration. | tasks/0906 §154 | - | EPIC(E21.1) |
-| REQ-RT-238 | runtime | v1-full | Temporary override không được persist indefinitely. | tasks/0906 §155 | - | EPIC(E21.1) |
-| REQ-RT-239 | runtime | v1-full | handoff(from, to) phải atomic nếu system yêu cầu. | tasks/0906 §156 | - | EPIC(E21.1) |
-| REQ-RT-240 | runtime | v1-full | Sender không được release control trước khi policy-required receiver acknowledgement. | tasks/0906 §159 | - | EPIC(E21.1) |
-| REQ-RT-241 | runtime | v1-full | Compiler/runtime phải detect nếu impossible assignment. | tasks/0906 §163 | - | EPIC(E21.1) |
-| REQ-RT-242 | runtime | v1-full | Có thể chọn: role expertise availability authority workload nhưng routing không được thay authority. | tasks/0906 §169 | - | EPIC(E21.1) |
-| REQ-RT-243 | runtime | v1-full | Không được suy diễn expertise từ protected/sensitive personal characteristics. | tasks/0906 §170 | - | EPIC(E21.1) |
-| REQ-RT-244 | runtime | v1-full | --- Có thể yêu cầu consensus nhưng phải define: unanimity quorum weighted authority | tasks/0906 §173 | - | EPIC(E21.1) |
-| REQ-RT-245 | runtime | v1-full | Nếu dùng weighted authority: weight phải policy-defined và auditable. | tasks/0906 §174 | - | EPIC(E21.1) |
-| REQ-RT-246 | runtime | v1-full | --- Trust model phải versioned. | tasks/0906 §177 | - | EPIC(E21.1) |
-| REQ-RT-247 | runtime | v1-full | --- 665 phải hỗ trợ: confirmation preview undo rollback second approval | tasks/0906 §182 | - | EPIC(E21.1) |
-| REQ-RT-248 | runtime | v1-full | UI có thể show: before after nhưng prediction phải marked as predicted. | tasks/0906 §189 | - | EPIC(E21.1) |
-| REQ-RT-249 | runtime | v1-full | Approval UI có thể present: A B C nhưng system không được rank alternatives as "best" unless caller explicitly requests an optimization algorithm; even then ranking is machine-generated decision support, not human authority. | tasks/0906 §191 | - | EPIC(E21.1) |
-| REQ-RT-250 | runtime | v1-full | Large action sets có thể: group summarize filter nhưng summary phải preserve material risk/constraint information. | tasks/0906 §193 | - | EPIC(E21.1) |
-| REQ-RT-251 | runtime | v1-full | Không được hide critical safety constraint chỉ vì UI simplification. | tasks/0906 §194 | - | EPIC(E21.1) |
-| REQ-RT-252 | runtime | v1-full | --- Critical alert không được silently suppressed. | tasks/0906 §198 | - | EPIC(E21.1) |
-| REQ-RT-253 | runtime | v1-full | --- Human approval không được bypass final 664 check. | tasks/0906 §212 | - | EPIC(E21.1) |
-| REQ-RT-254 | runtime | v1-full | --- Authority phải được kiểm tra: at request at approval at commit | tasks/0906 §213 | - | EPIC(E21.1) |
-| REQ-RT-255 | runtime | v1-full | --- Consent không được dùng như: capability authorization safety override | tasks/0906 §216 | - | EPIC(E21.1) |
-| REQ-RT-256 | runtime | v1-full | --- Delegation không được vượt quyền delegator. | tasks/0906 §217 | - | EPIC(E21.1) |
-| REQ-RT-257 | runtime | v1-full | --- Escalation không được biến: unknown | tasks/0906 §218 | - | EPIC(E21.1) |
-| REQ-RT-258 | runtime | v1-full | --- Timeout không được tự động đồng nghĩa approval. | tasks/0906 §219 | - | EPIC(E21.1) |
-| REQ-RT-259 | runtime | v1-full | --- Human modification phải re-run: 663 relevant evaluation 664 safety 603 capability 639 policy | tasks/0906 §220 | - | EPIC(E21.1) |
-| REQ-RT-260 | runtime | v1-full | --- Approval phải biết: who under which authority for what under which policy when until when | tasks/0906 §221 | - | EPIC(E21.1) |
-| REQ-RT-261 | runtime | v1-full | --- Axiom phải phân biệt: proposed_by approved_by executed_by supervised_by | tasks/0906 §222 | - | EPIC(E21.1) |
-| REQ-RT-262 | runtime | v1-full | --- Synthetic human actions phải được đánh dấu. | tasks/0906 §224 | - | EPIC(E21.1) |
-| REQ-RT-263 | runtime | v1-full | --- Critical oversight actions phải traceable. | tasks/0906 §225 | - | EPIC(E21.1) |
-| REQ-RT-264 | runtime | v1-full | --- Oversight records phải tuân theo 640. | tasks/0906 §226 | - | EPIC(E21.1) |
-| REQ-RT-265 | runtime | v1-full | Human identity/authentication phải đi qua 627/603. | tasks/0906 §227 | - | EPIC(E21.1) |
-| REQ-RT-266 | runtime | v1-full | --- Oversight policy lifecycle phải qua 647. | tasks/0906 §228 | - | EPIC(E21.1) |
-| REQ-RT-267 | runtime | v1-full | Không được dùng social inference để cấp authority ngoài policy. | tasks/0906 §234 | - | EPIC(E21.1) |
-| REQ-RT-268 | runtime | v1-full | 659 có thể biểu diễn urgency/affect nhưng không được tự tạo approval authority. | tasks/0906 §235 | - | EPIC(E21.1) |
-| REQ-RT-269 | runtime | v1-full | --- 660 không được tự quyết định: "I am now authorized." | tasks/0906 §236 | - | EPIC(E21.1) |
-| REQ-RT-270 | runtime | v1-full | Authority phải đến từ external policy/authority chain. | tasks/0906 §236 | - | EPIC(E21.1) |
-| REQ-RT-271 | runtime | v1-full | 661 có thể request human approval nhưng không được giả mạo approval. | tasks/0906 §238 | - | EPIC(E21.1) |
-| REQ-RT-272 | runtime | v1-full | Human A Service 1 Agent 2 có thể cùng tham gia một workflow. Oversight provenance phải distributed-traceable. | tasks/0906 §239 | - | EPIC(E21.1) |
-| REQ-RT-273 | runtime | v1-full | --- Approval phải có: issuer policy_epoch authority_epoch timestamp nonce | tasks/0906 §240 | - | EPIC(E21.1) |
-| REQ-RT-274 | runtime | v1-full | --- Offline approval phải có expiration và scope. | tasks/0906 §244 | - | EPIC(E21.1) |
-| REQ-RT-275 | runtime | v1-full | --- Distributed approval phải xử lý clock skew. | tasks/0906 §245 | - | EPIC(E21.1) |
-| REQ-RT-276 | runtime | v1-full | Approval nonce + request identity phải chống replay. | tasks/0906 §246 | - | EPIC(E21.1) |
-| REQ-RT-277 | runtime | v1-full | Critical control events phải có ordering semantics. | tasks/0906 §248 | - | EPIC(E21.1) |
-| REQ-RT-278 | runtime | v1-full | --- Không được có: old controller released new controller not granted | tasks/0906 §249 | - | EPIC(E21.1) |
-| REQ-RT-279 | runtime | v1-full | --- 665 phải defend against: AI-generated misleading approval context | tasks/0906 §254 | - | EPIC(E21.1) |
-| REQ-RT-280 | runtime | v1-full | --- Critical evidence phải integrity-protected. | tasks/0906 §257 | - | EPIC(E21.1) |
-| REQ-RT-281 | runtime | v1-full | Không bắt buộc human phải cung cấp hidden/private reasoning. | tasks/0906 §258 | - | EPIC(E21.1) |
-| REQ-RT-282 | runtime | v1-full | --- Compiler phải phát hiện: approval required but no approver authority | tasks/0906 §262 | - | EPIC(E21.1) |
-| REQ-RT-283 | runtime | v1-full | Nếu: all humans unavailable no fallback action required strict profile phải reject configuration. | tasks/0906 §264 | - | EPIC(E21.1) |
-| REQ-RT-284 | runtime | v1-full | --- Compiler/runtime phải detect: AI waits human human waits AI | tasks/0906 §265 | - | EPIC(E21.1) |
-| REQ-RT-285 | runtime | v1-full | --- Multi-party approval phải có timeout/fallback. | tasks/0906 §266 | - | EPIC(E21.1) |
-| REQ-RT-286 | runtime | v1-full | --- Critical workflow phải có defined: human_available human_unavailable communication_failure | tasks/0906 §267 | - | EPIC(E21.1) |
-| REQ-RT-287 | runtime | v1-full | Nested workflow phải inherit oversight constraints từ parent nếu policy yêu cầu. | tasks/0906 §270 | - | EPIC(E21.1) |
-| REQ-RT-288 | runtime | v1-full | Child agent không được giảm oversight requirement của parent. | tasks/0906 §271 | - | EPIC(E21.1) |
-| REQ-RT-289 | runtime | v1-full | --- 623 plugin không được tự tạo human authority. | tasks/0906 §273 | - | EPIC(E21.1) |
-| REQ-RT-290 | runtime | v1-full | 624 script: approve() không phải human approval. | tasks/0906 §275 | - | EPIC(E21.1) |
-| REQ-RT-291 | runtime | v1-full | --- Automation phải distinguish: automated approval human approval | tasks/0906 §276 | - | EPIC(E21.1) |
-| REQ-RT-292 | runtime | v1-full | A policy có thể permit pre-authorized auto-approval cho low-risk actions, nhưng đó phải được biểu diễn là: policy_authorized_automation | tasks/0906 §277 | - | EPIC(E21.1) |
-| REQ-RT-293 | runtime | v1-full | A policy có thể permit pre-authorized auto-approval cho low-risk actions, nhưng đó phải được biểu diễn là: policy_authorized_automation không phải giả human approval. | tasks/0906 §277 | - | EPIC(E21.1) |
-| REQ-RT-294 | runtime | v1-full | --- Canonical serialization phải stable. | tasks/0906 §283 | - | EPIC(E21.1) |
-| REQ-RT-295 | runtime | v1-full | --- Control token phải chống: forgery replay confusion | tasks/0906 §285 | - | EPIC(E21.1) |
-| REQ-RT-296 | runtime | v1-full | UI button: Approve không phải authority itself. | tasks/0906 §286 | - | EPIC(E21.1) |
-| REQ-RT-297 | runtime | v1-full | --- 665 phải hoạt động không cần GUI. | tasks/0906 §287 | - | EPIC(E21.1) |
-| REQ-RT-298 | runtime | v1-full | axiom approval approve <id> phải qua same runtime authorization. | tasks/0906 §288 | - | EPIC(E21.1) |
-| REQ-RT-299 | runtime | v1-full | API approval phải canonicalize với CLI/UI semantics. | tasks/0906 §289 | - | EPIC(E21.1) |
-| REQ-RT-300 | runtime | v1-full | UI/CLI/API không được tạo các loại approval semantics khác nhau nếu cùng policy. | tasks/0906 §290 | - | EPIC(E21.1) |
-| REQ-RT-301 | runtime | v1-full | 1. Human identity phải authenticated khi required. 2. Human role không tự cấp authority. 3. Authority phải scoped. 4. Authority phải expirable khi policy yêu cầu. 5. Authority không vượt parent authority. 6. Delegation không được privilege-escalate. 7. Revoked authority phải invalidate dependent tokens. 8. Expired authority không được approve. 9. Approval không tạo capability. 10. Approval không bypass hard safety. 11. Human action vẫn phải qua applicable policy. 12. Human action vẫn phải qua applicable capability checks. 13. Human action vẫn phải qua applicable safety checks. 14. AI không được impersonate human. 15. Synthetic approval phải marked. | tasks/0906 §292 | - | EPIC(E21.1) |
-| REQ-RT-302 | runtime | v1-full | 16. Approval phải bind request. 17. Approval phải bind actor. 18. Approval phải bind authority. 19. Approval phải bind scope. 20. Approval phải bind policy revision khi required. 21. Approval phải bind safety revision khi required. 22. Approval có expiration khi required. 23. Stale approval phải detectable. 24. Material action change invalidates approval. 25. Critical context change có thể invalidate approval. 26. Approval replay phải bị ngăn. 27. Duplicate approval phải idempotent. 28. Timeout không tự approve. 29. Denial phải explicit. 30. Modification phải revalidate. 31. Approval provenance phải preserve. 32. Approval audit phải immutable/integrity-protected khi required. 33. Approval conflict phải policy-defined. 34. Quorum phải explicit. 35. Separation of duties phải enforce. | tasks/0906 §293 | - | EPIC(E21.1) |
-| REQ-RT-303 | runtime | v1-full | 36. Consent phải scope. 37. Consent phải purpose-bound. 38. Consent có thể expire. 39. Consent có thể revoke. 40. Revocation semantics phải explicit. 41. Consent không phải capability. 42. Consent không phải authorization. 43. Consent không phải safety override. 44. Consent không tự áp dụng cho subject/resource ngoài scope. 45. Consent provenance phải preserve. | tasks/0906 §294 | - | EPIC(E21.1) |
-| REQ-RT-304 | runtime | v1-full | 46. Control holder phải explicit. 47. Control scope phải explicit. 48. Control token phải expire khi required. 49. Control transfer phải authenticated. 50. Transfer phải atomic khi required. 51. Release không được xảy ra trước handoff acceptance khi policy cấm. 52. Control token replay phải prevented. 53. Revoked control phải stop authority. 54. Human-controlled mode cấm autonomous commit. 55. Autonomous mode vẫn chịu 603/639/664. 56. Shared control phải define conflict resolution. 57. Multiple controllers phải define ownership. 58. Emergency control phải scope. 59. Emergency authority phải authenticated. 60. Control state phải auditable. | tasks/0906 §295 | - | EPIC(E21.1) |
-| REQ-RT-305 | runtime | v1-full | 81. Intervention actor identified. 82. Intervention authority checked. 83. Intervention scope checked. 84. Intervention must pass safety checks. 85. Intervention cannot silently mutate action. 86. Intervention modification creates new action revision. 87. Intervention trace preserved. 88. Emergency intervention has bounded semantics. 89. Intervention failure has fallback. 90. Repeated failed intervention triggers escalation when policy requires. | tasks/0906 §298 | - | EPIC(E21.1) |
-| REQ-RT-306 | runtime | v1-full | 106. 665 cannot bypass 664. 107. 665 cannot bypass 603. 108. 665 cannot redefine 639 authority. 109. 665 cannot replace 647 governance. 110. 665 consumes 663 evidence. 111. 665 can trigger 663 evaluation. 112. 665 can request 648 simulation. 113. 665 can use 650 history. 114. 665 can use 651 personalization only within policy. 115. 665 can use 658 interaction. 116. 665 can use 659 affect signals without treating them as authority. 117. 665 can use 660 self-model without granting self-authority. 118. 665 can receive 661 goals. 119. 665 can constrain 661 actions. 120. 665 can supervise 662 updates. 121. 665 can route 644 agents. 122. 665 must preserve 640 privacy. 123. 665 must preserve 627 identity. 124. 665 must preserve 610 cryptographic integrity. 125. 665 must preserve 633 observability. | tasks/0906 §300 | - | EPIC(E21.1) |
-| REQ-RT-307 | runtime | v1-full | 126. Distributed approvals require identity. 127. Distributed approvals require revision. 128. Distributed approvals require replay protection. 129. Policy epoch must be detectable. 130. Stale approval must be detectable. 131. Partition behavior must be defined. 132. Offline approval must be bounded. 133. Clock uncertainty must be handled. 134. Event duplication must be handled. 135. Event ordering must be defined. 136. Cross-node control transfer must be atomic when required. 137. Authority revocation must propagate. 138. Global emergency authority must be scoped. 139. Quorum must be explicit. 140. Consensus requirement must be explicit. | tasks/0906 §301 | - | EPIC(E21.1) |
-| REQ-RT-308 | runtime | v1-full | 141. Oversight data follows 640. 142. Evidence access follows authority. 143. Reviewer cannot access unrelated tenant data. 144. Approval logs can be redacted where policy permits. 145. Redaction cannot destroy required audit semantics. 146. Consent records have access control. 147. Human feedback has provenance. 148. Training reuse requires policy. 149. Personalization cannot expose restricted data. 150. Oversight analytics must respect declared data scope. | tasks/0906 §302 | - | EPIC(E21.1) |
-| REQ-RT-309 | runtime | v1-full | 151. Unknown oversight annotation must fail or be explicitly ignored by profile. 152. Invalid authority reference must be detected. 153. Impossible approval quorum must be detected. 154. Missing fallback must be detected in strict profiles. 155. Unreachable escalation terminal must be detected. 156. Control cycle must be detected where statically possible. 157. Unsafe human override must be rejected. 158. Human-controlled workflow cannot compile to autonomous commit. 159. Approval-required workflow must contain approval path. 160. Critical action must have required oversight metadata. 161. Static oversight checks may be optimized. 162. Dynamic authority checks must remain. 163. Approval semantics cannot be optimized away. 164. Audit-required events cannot be silently stripped. 165. Synthetic approval metadata must survive test artifacts. | tasks/0906 §303 | - | EPIC(E21.1) |
-| REQ-RT-310 | runtime | v1-full | 166. Runtime authority is rechecked when required. 167. Approval freshness is checked before commit. 168. Control token validity is checked before controlled action. 169. Consent validity is checked when required. 170. Policy revision is checked when required. 171. Safety revision is checked when required. 172. Context changes can invalidate approval. 173. Human unavailability invokes defined fallback. 174. Human timeout invokes defined fallback. 175. Approval service failure invokes defined fallback. 176. Notification failure does not imply approval. 177. UI failure does not imply approval. 178. Network failure does not imply approval. 179. Runtime must preserve attribution. 180. Runtime must preserve oversight trace. | tasks/0906 §304 | - | EPIC(E21.1) |
-| REQ-RT-311 | runtime | v1-full | ```text 603 = WHAT THE ACTOR IS CAPABLE OF DOING 639 = WHAT POLICY AUTHORIZES 661 = WHAT THE SYSTEM WANTS TO ACHIEVE 662 = HOW THE SYSTEM LEARNS / ADAPTS 663 = WHETHER THE SYSTEM MEETS DECLARED CRITERIA 664 = WHETHER THIS ACTION IS SAFE RIGHT NOW 665 = WHETHER / HOW HUMAN AUTHORITY MUST PARTICIPATE 647 = WHETHER THE SYSTEM LIFECYCLE IS GOVERNED / APPROVED ``` | tasks/0906 §307 | - | EPIC(E21.1) |
-| REQ-RT-312 | runtime | v1-full | --- Axiom không được biến: Human Approval = Execute | tasks/0906 §309 | - | EPIC(E21.1) |
-| REQ-RT-313 | runtime | v1-full | Human có thể quyết định trong phạm vi authority của họ. AI không được: infer authority fabricate consent fabricate approval self-assign controller self-promote reviewer | tasks/0906 §310 | - | EPIC(E21.1) |
-| REQ-RT-314 | runtime | v1-full | Axiom nên xem Human Oversight là một **control-plane primitive**, không phải UI feature. | tasks/0906 §313 | - | EPIC(E21.1) |
-| REQ-RT-315 | runtime | v1-full | Tiếp tục chuỗi kiến trúc. BOOTSTRAP-666 sẽ xây lớp **multi-agent** trên nền 644 + 665: nhiều AI agent có thể phối hợp, thương lượng, giao việc, ký contract, đánh giá trust/reputation và hình thành collective intelligence, nhưng **không được tự phát sinh authority vượt 603/639/664/665**. | tasks/0907 §1 | - | EPIC(E21.1) |
-| REQ-RT-316 | runtime | v1-full | Mục tiêu không phải tạo "xã hội AI" theo nghĩa có nhân cách hay quyền lợi. | tasks/0907 §1 | - | EPIC(E21.1) |
-| REQ-RT-317 | runtime | v1-full | --- Discovery result phải có freshness metadata. | tasks/0907 §11 | - | EPIC(E21.1) |
-| REQ-RT-318 | runtime | v1-full | Revoked identity không được tham gia new contracts. | tasks/0907 §15 | - | EPIC(E21.1) |
-| REQ-RT-319 | runtime | v1-full | Human ↓ Agent A ↓ Agent B ↓ Agent C Authority phải remain bounded. | tasks/0907 §24 | - | EPIC(E21.1) |
-| REQ-RT-320 | runtime | v1-full | --- Role assignment phải explicit. | tasks/0907 §34 | - | EPIC(E21.1) |
-| REQ-RT-321 | runtime | v1-full | --- Role phải được map qua policy. | tasks/0907 §36 | - | EPIC(E21.1) |
-| REQ-RT-322 | runtime | v1-full | --- Bid không phải contract. | tasks/0907 §38 | - | EPIC(E21.1) |
-| REQ-RT-323 | runtime | v1-full | --- Bid phải có expiry. | tasks/0907 §39 | - | EPIC(E21.1) |
-| REQ-RT-324 | runtime | v1-full | --- 666 phải phát hiện hoặc timeout negotiation loop. | tasks/0907 §45 | - | EPIC(E21.1) |
-| REQ-RT-325 | runtime | v1-full | Agent có thể optimize: cost time quality risk resource utility nhưng không được vi phạm hard constraints. | tasks/0907 §46 | - | EPIC(E21.1) |
-| REQ-RT-326 | runtime | v1-full | Trước commit: identity capability authority policy safety resource phải được kiểm tra theo profile. | tasks/0907 §51 | - | EPIC(E21.1) |
-| REQ-RT-327 | runtime | v1-full | --- Các parties phải authorize amendment. | tasks/0907 §54 | - | EPIC(E21.1) |
-| REQ-RT-328 | runtime | v1-full | --- ```axiom @contract_invariant ``` | tasks/0907 §59 | - | EPIC(E21.1) |
-| REQ-RT-329 | runtime | v1-full | --- Termination semantics phải explicit. | tasks/0907 §69 | - | EPIC(E21.1) |
-| REQ-RT-330 | runtime | v1-full | Mọi reputation score phải truy được evidence source. | tasks/0907 §77 | - | EPIC(E21.1) |
-| REQ-RT-331 | runtime | v1-full | --- Weighting phải model-defined và versioned. | tasks/0907 §83 | - | EPIC(E21.1) |
-| REQ-RT-332 | runtime | v1-full | Một failure không nhất thiết chứng minh malicious behavior. Reputation model phải phân biệt: failure unreliability policy violation safety violation intentional misconduct | tasks/0907 §84 | - | EPIC(E21.1) |
-| REQ-RT-333 | runtime | v1-full | 666 phải hỗ trợ identity-level protections chống tạo hàng loạt agent giả. | tasks/0907 §86 | - | EPIC(E21.1) |
-| REQ-RT-334 | runtime | v1-full | --- Phải chống: self-review collusive reviews fake contracts sybil reputation | tasks/0907 §88 | - | EPIC(E21.1) |
-| REQ-RT-335 | runtime | v1-full | Trust có thể decay theo thời gian. Model phải explicit. | tasks/0907 §90 | - | EPIC(E21.1) |
-| REQ-RT-336 | runtime | v1-full | --- Có thể hỗ trợ nhưng phải explicit model. | tasks/0907 §93 | - | EPIC(E21.1) |
-| REQ-RT-337 | runtime | v1-full | --- Knowledge phải giữ source provenance. | tasks/0907 §99 | - | EPIC(E21.1) |
-| REQ-RT-338 | runtime | v1-full | --- Weight phải policy-defined. | tasks/0907 §104 | - | EPIC(E21.1) |
-| REQ-RT-339 | runtime | v1-full | Consensus failure không được biến thành silent approval. | tasks/0907 §107 | - | EPIC(E21.1) |
-| REQ-RT-340 | runtime | v1-full | --- Quorum phải explicit. | tasks/0907 §108 | - | EPIC(E21.1) |
-| REQ-RT-341 | runtime | v1-full | --- Team phải có: backup coordinator reelection safe suspension | tasks/0907 §110 | - | EPIC(E21.1) |
-| REQ-RT-342 | runtime | v1-full | --- 666 phải hỗ trợ detection/isolation signals. | tasks/0907 §111 | - | EPIC(E21.1) |
-| REQ-RT-343 | runtime | v1-full | Không yêu cầu mọi deployment phải Byzantine tolerant. | tasks/0907 §111 | - | EPIC(E21.1) |
-| REQ-RT-344 | runtime | v1-full | --- Aggregate result vẫn phải qua 664. | tasks/0907 §120 | - | EPIC(E21.1) |
-| REQ-RT-345 | runtime | v1-full | --- Cycles phải explicit loop construct. | tasks/0907 §135 | - | EPIC(E21.1) |
-| REQ-RT-346 | runtime | v1-full | --- Runtime phải detect/timeout impossible waits. | tasks/0907 §136 | - | EPIC(E21.1) |
-| REQ-RT-347 | runtime | v1-full | Duplicate delivery không được tạo duplicate side effect nếu task idempotent profile yêu cầu. | tasks/0907 §141 | - | EPIC(E21.1) |
-| REQ-RT-348 | runtime | v1-full | Replacement agent phải revalidate capability and authority. | tasks/0907 §145 | - | EPIC(E21.1) |
-| REQ-RT-349 | runtime | v1-full | --- Evidence phải provenance-aware. | tasks/0907 §151 | - | EPIC(E21.1) |
-| REQ-RT-350 | runtime | v1-full | --- Agent không phải reveal private internal state. | tasks/0907 §152 | - | EPIC(E21.1) |
-| REQ-RT-351 | runtime | v1-full | --- Negotiation payload phải obey: 603 639 640 | tasks/0907 §153 | - | EPIC(E21.1) |
-| REQ-RT-352 | runtime | v1-full | --- Agent claim phải distinguish: verified declared estimated unknown | tasks/0907 §155 | - | EPIC(E21.1) |
-| REQ-RT-353 | runtime | v1-full | Agent proposal có thể có confidence. Confidence không phải guarantee. | tasks/0907 §156 | - | EPIC(E21.1) |
-| REQ-RT-354 | runtime | v1-full | --- Contract guarantee phải explicit and enforceable. | tasks/0907 §157 | - | EPIC(E21.1) |
-| REQ-RT-355 | runtime | v1-full | --- Prediction không phải commitment. | tasks/0907 §158 | - | EPIC(E21.1) |
-| REQ-RT-356 | runtime | v1-full | --- Revocation phải follow contract. | tasks/0907 §160 | - | EPIC(E21.1) |
-| REQ-RT-357 | runtime | v1-full | --- Recovery phải reauthenticate/revalidate. | tasks/0907 §167 | - | EPIC(E21.1) |
-| REQ-RT-358 | runtime | v1-full | Policy phải định nghĩa existing contracts khi quarantine. | tasks/0907 §170 | - | EPIC(E21.1) |
-| REQ-RT-359 | runtime | v1-full | Child policy không được widen parent hard constraints. | tasks/0907 §174 | - | EPIC(E21.1) |
-| REQ-RT-360 | runtime | v1-full | --- Shared memory phải có owner/access policy. | tasks/0907 §182 | - | EPIC(E21.1) |
-| REQ-RT-361 | runtime | v1-full | 666 phải hỗ trợ detection signals cho poisoned shared knowledge. | tasks/0907 §183 | - | EPIC(E21.1) |
-| REQ-RT-362 | runtime | v1-full | Repeated false reports không được tạo reputation change không kiểm chứng. | tasks/0907 §185 | - | EPIC(E21.1) |
-| REQ-RT-363 | runtime | v1-full | --- Coalition không được tự tăng member authority. | tasks/0907 §188 | - | EPIC(E21.1) |
-| REQ-RT-364 | runtime | v1-full | --- Dissolution phải xử lý: active tasks contracts resources shared state | tasks/0907 §189 | - | EPIC(E21.1) |
-| REQ-RT-365 | runtime | v1-full | --- Phải biết: who proposed who voted what evidence what rule | tasks/0907 §191 | - | EPIC(E21.1) |
-| REQ-RT-366 | runtime | v1-full | Decision output vẫn phải pass policy/capability/safety. | tasks/0907 §192 | - | EPIC(E21.1) |
-| REQ-RT-367 | runtime | v1-full | Có thể require: 2 agents + 1 human nhưng authority semantics phải explicit. | tasks/0907 §197 | - | EPIC(E21.1) |
-| REQ-RT-368 | runtime | v1-full | Canonical contract representation must be hashable. | tasks/0907 §204 | - | EPIC(E21.1) |
-| REQ-RT-369 | runtime | v1-full | Two incompatible commits must not both become canonical. | tasks/0907 §209 | - | EPIC(E21.1) |
-| REQ-RT-370 | runtime | v1-full | --- Remote identity must use 627/610 as applicable. | tasks/0907 §224 | - | EPIC(E21.1) |
-| REQ-RT-371 | runtime | v1-full | WASM sandboxed agent must respect host capabilities. | tasks/0907 §226 | - | EPIC(E21.1) |
-| REQ-RT-372 | runtime | v1-full | agent.spawn(config) must be capability/policy controlled. | tasks/0907 §228 | - | EPIC(E21.1) |
-| REQ-RT-373 | runtime | v1-full | --- Runtime must enforce limits. | tasks/0907 §232 | - | EPIC(E21.1) |
-| REQ-RT-374 | runtime | v1-full | Identity rotation must preserve or reset trust according to explicit policy. | tasks/0907 §236 | - | EPIC(E21.1) |
-| REQ-RT-375 | runtime | v1-full | After migration: identity capability policy contract safety must be revalidated as required. | tasks/0907 §238 | - | EPIC(E21.1) |
-| REQ-RT-376 | runtime | v1-full | Repeated self-generated evidence must not inflate trust without independent validation where required. | tasks/0907 §245 | - | EPIC(E21.1) |
-| REQ-RT-377 | runtime | v1-full | --- If enabled, decay model must be versioned. | tasks/0907 §247 | - | EPIC(E21.1) |
-| REQ-RT-378 | runtime | v1-full | Trust assessment must include confidence/uncertainty where model supports it. | tasks/0907 §254 | - | EPIC(E21.1) |
-| REQ-RT-379 | runtime | v1-full | 662 may learn from multi-agent interaction. Learning must remain bounded by 639/664/665. | tasks/0907 §259 | - | EPIC(E21.1) |
-| REQ-RT-380 | runtime | v1-full | --- Aggregation must preserve uncertainty. | tasks/0907 §265 | - | EPIC(E21.1) |
-| REQ-RT-381 | runtime | v1-full | Aggregate confidence must not exceed evidence-supported confidence. | tasks/0907 §271 | - | EPIC(E21.1) |
-| REQ-RT-382 | runtime | v1-full | --- Aggregation method must be explicit. | tasks/0907 §272 | - | EPIC(E21.1) |
-| REQ-RT-383 | runtime | v1-full | --- Protocol incompatibility must fail explicitly. | tasks/0907 §287 | - | EPIC(E21.1) |
-| REQ-RT-384 | runtime | v1-full | --- Contract schema revision must be explicit. | tasks/0907 §289 | - | EPIC(E21.1) |
-| REQ-RT-385 | runtime | v1-full | Task cancellation must propagate according to contract. | tasks/0907 §295 | - | EPIC(E21.1) |
-| REQ-RT-386 | runtime | v1-full | If execution commits before cancellation arrives, state must resolve deterministically. | tasks/0907 §297 | - | EPIC(E21.1) |
-| REQ-RT-387 | runtime | v1-full | Late result after task cancellation must not silently commit. | tasks/0907 §298 | - | EPIC(E21.1) |
-| REQ-RT-388 | runtime | v1-full | ```text @agent @agent_identity @agent_capability @agent_discovery @agent_registry @agent_task @agent_delegate @agent_role @agent_team @agent_coordinator @agent_bid @negotiation @proposal @counter_proposal @contract @contract_obligation @contract_right @contract_precondition @contract_postcondition @contract_invariant @contract_monitor @contract_breach @contract_amendment @contract_terminate @trust @trust_model @reputation @reputation_model @reputation_evidence @collective @collective_decision @collective_vote @consensus @quorum @ensemble @distributed_reasoning @agent_spawn @agent_budget @agent_quarantine @agent_revoke @knowledge_share @knowledge_conflict @knowledge_verify @agent_trace @contract_trace @coordination_trace ``` | tasks/0907 §301 | - | EPIC(E21.1) |
-| REQ-RT-389 | runtime | v1-full | 1. Every agent has unique identity within its authority domain. 2. Identity and capability are distinct. 3. Identity and authority are distinct. 4. Revoked identity cannot start new critical sessions. 5. Agent impersonation is prohibited. 6. Spawned agents receive explicit identity. 7. Identity rotation is auditable. 8. Identity migration is policy-controlled. 9. Remote identity must be authenticated where required. 10. Anonymous agents are allowed only under an explicit policy profile. | tasks/0907 §307 | - | EPIC(E21.1) |
-| REQ-RT-390 | runtime | v1-full | 151. Invalid delegation graph is rejected. 152. Impossible quorum is rejected. 153. Missing contract party authority is detected. 154. Contract obligations must have executable or externally fulfilled semantics. 155. Unbounded recursive spawn is rejected in strict profiles. 156. Unbounded negotiation loop is rejected where statically detectable. 157. Invalid role assignment is detected. 158. Impossible escalation path is detected. 159. Unknown protocol version fails explicitly. 160. Invalid contract revision reference is rejected. 161. Unsafe retry of irreversible action is rejected in strict profiles. 162. Missing safety profile is detected for critical tasks. 163. Invalid human oversight requirement is detected. 164. Capability/role mismatch is detected. 165. Contract policy conflict is detected where statically knowable. | tasks/0907 §319 | - | EPIC(E21.1) |
-| REQ-RT-391 | runtime | v1-full | --- Axiom phải giữ bốn khái niệm riêng biệt: Capability Authority Trust Reputation | tasks/0907 §327 | - | EPIC(E21.1) |
-| REQ-RT-392 | runtime | v1-full | Axiom phải giữ bốn khái niệm riêng biệt: Capability Authority Trust Reputation Không được collapse thành: "agent được tin tưởng" | tasks/0907 §327 | - | EPIC(E21.1) |
-| REQ-RT-393 | runtime | v1-full | Collective intelligence trong Axiom là: N agents + communication + specialization + coordination + evidence + aggregation không phải: N agents → automatically smarter | tasks/0907 §328 | - | EPIC(E21.1) |
-| REQ-RT-394 | runtime | v1-full | không đồng nghĩa: truth Axiom phải giữ: consensus confidence evidence uncertainty | tasks/0907 §331 | - | EPIC(E21.1) |
-| REQ-RT-395 | runtime | v1-full | Tiếp tục chuỗi kiến trúc Axiom. Task kế tiếp là **BOOTSTRAP-667**, xây lớp tổ chức/thể chế bền vững trên nền coordination của 666. Điểm quan trọng là không biến “organization” thành một dạng agent lớn hơn; nó phải là **một cấu trúc trạng thái, quyền hạn, quy tắc và bộ nhớ có identity riêng**, tồn tại qua thay đổi thành viên. | tasks/0908 §1 | - | EPIC(E21.1) |
-| REQ-RT-396 | runtime | v1-full | The runtime must not assume that an organization is a legal person, conscious entity, political entity, or autonomous moral subject. | tasks/0908 §1 | - | EPIC(E21.1) |
-| REQ-RT-397 | runtime | v1-full | ```text 603 WHAT CAN EXECUTE 639 WHAT IS AUTHORIZED 661 WHAT IS BEING PURSUED 664 WHAT MUST NOT HAPPEN 665 WHEN HUMAN CONTROL IS REQUIRED 666 HOW AGENTS COOPERATE 667 HOW COOPERATION BECOMES PERSISTENT INSTITUTIONAL STRUCTURE ``` | tasks/0908 §3 | - | EPIC(E21.1) |
-| REQ-RT-398 | runtime | v1-full | DISCOVER ↓ NOMINATE ↓ VERIFY ↓ ADMIT ↓ ACTIVE ↓ SUSPEND / MODIFY ↓ ACTIVE ↓ TERMINATE ↓ ARCHIVE A membership record must preserve provenance. | tasks/0908 §7 | - | EPIC(E21.1) |
-| REQ-RT-399 | runtime | v1-full | Rule states: Draft Proposed Active Suspended Superseded Revoked Expired Rules must have deterministic precedence. | tasks/0908 §14 | - | EPIC(E21.1) |
-| REQ-RT-400 | runtime | v1-full | Every organizational decision must use an explicit procedure. | tasks/0908 §18 | - | EPIC(E21.1) |
-| REQ-RT-401 | runtime | v1-full | Resolution must preserve the originating decision. | tasks/0908 §25 | - | EPIC(E21.1) |
-| REQ-RT-402 | runtime | v1-full | Appointments bind members to offices. Appointment { office appointee authority start end? appointing_body } Appointment must be auditable. | tasks/0908 §27 | - | EPIC(E21.1) |
-| REQ-RT-403 | runtime | v1-full | Organizations may define bounded emergency authority. EmergencyAuthority { trigger authority_scope authorized_subject maximum_duration required_review } Emergency authority MUST: ; be explicitly defined, ; have a bounded scope, ; have an expiration, ; be auditable, ; undergo post-event review. | tasks/0908 §30 | - | EPIC(E21.1) |
-| REQ-RT-404 | runtime | v1-full | Temporary authority must not silently become permanent authority. | tasks/0908 §31 | - | EPIC(E21.1) |
-| REQ-RT-405 | runtime | v1-full | then: allocate(+1) must fail unless capacity changes or an existing allocation is released. | tasks/0908 §34 | - | EPIC(E21.1) |
-| REQ-RT-406 | runtime | v1-full | Organizations may maintain internal accounting. Account Transaction Transfer Reservation Expense Grant Allocation Every transaction must be traceable. | tasks/0908 §35 | - | EPIC(E21.1) |
-| REQ-RT-407 | runtime | v1-full | Institutional memory is persistent organizational knowledge. InstitutionalMemory { records decisions policies precedents archives evidence lineage } It must preserve: who what when under which authority using which evidence with which version with what result | tasks/0908 §37 | - | EPIC(E21.1) |
-| REQ-RT-408 | runtime | v1-full | Archive { records retention_policy indexing integrity access_policy } Archives must support: append version query verify export retention legal_hold | tasks/0908 §40 | - | EPIC(E21.1) |
-| REQ-RT-409 | runtime | v1-full | The runtime must preserve the conflict until resolved. | tasks/0908 §42 | - | EPIC(E21.1) |
-| REQ-RT-410 | runtime | v1-full | It must not silently choose one record merely because it is newer or more popular unless the governing rule explicitly defines that behavior. | tasks/0908 §42 | - | EPIC(E21.1) |
-| REQ-RT-411 | runtime | v1-full | Unknown must not be silently converted into compliant. | tasks/0908 §44 | - | EPIC(E21.1) |
-| REQ-RT-412 | runtime | v1-full | An appeal must not automatically suspend a decision unless the governing rule says so. | tasks/0908 §46 | - | EPIC(E21.1) |
-| REQ-RT-413 | runtime | v1-full | Sanctions must not exceed organizational authority. | tasks/0908 §47 | - | EPIC(E21.1) |
-| REQ-RT-414 | runtime | v1-full | An organization may split. OrganizationSplit { source children membership_mapping asset_mapping contract_mapping memory_mapping } The operation must preserve lineage. | tasks/0908 §49 | - | EPIC(E21.1) |
-| REQ-RT-415 | runtime | v1-full | Organizations may merge. OrganizationMerge { sources destination identity_mapping membership_mapping resource_mapping policy_mapping } Conflicting rules must be resolved explicitly. | tasks/0908 §50 | - | EPIC(E21.1) |
-| REQ-RT-416 | runtime | v1-full | Dissolution must not destroy mandatory audit records. | tasks/0908 §51 | - | EPIC(E21.1) |
-| REQ-RT-417 | runtime | v1-full | --- Organizations must support continuity checks. | tasks/0908 §57 | - | EPIC(E21.1) |
-| REQ-RT-418 | runtime | v1-full | Organizations may contain organizations. Foundation ├── ResearchInstitute │ ├── AI Lab │ └── Robotics Lab └── Operations Nested authority must be explicit. | tasks/0908 §62 | - | EPIC(E21.1) |
-| REQ-RT-419 | runtime | v1-full | Revocation must propagate to dependent organizational structures where applicable. | tasks/0908 §64 | - | EPIC(E21.1) |
-| REQ-RT-420 | runtime | v1-full | Example: Director loses authority ↓ delegated department authority ↓ affected delegations ↓ recompute effective authority Stale authority must not remain active. | tasks/0908 §64 | - | EPIC(E21.1) |
-| REQ-RT-421 | runtime | v1-full | Lower goals must remain compatible with higher constraints. | tasks/0908 §73 | - | EPIC(E21.1) |
-| REQ-RT-422 | runtime | v1-full | Risk models may be probabilistic, but uncertainty must remain explicit. | tasks/0908 §75 | - | EPIC(E21.1) |
-| REQ-RT-423 | runtime | v1-full | Organizational learning can update: policies procedures knowledge training material risk models resource allocation but learned changes must pass organizational governance. | tasks/0908 §78 | - | EPIC(E21.1) |
-| REQ-RT-424 | runtime | v1-full | Charter amendment must use the charter's amendment procedure. | tasks/0908 §80 | - | EPIC(E21.1) |
-| REQ-RT-425 | runtime | v1-full | Institutional records may have privacy rules. RecordAccessPolicy { readers writers retention disclosure } Audit access must itself be auditable. | tasks/0908 §85 | - | EPIC(E21.1) |
-| REQ-RT-426 | runtime | v1-full | --- Authorization must resolve through: 639 603 organization rules role membership delegation | tasks/0908 §88 | - | EPIC(E21.1) |
-| REQ-RT-427 | runtime | v1-full | Version: organization charter constitution rules roles procedures budgets must be separately versioned. | tasks/0908 §100 | - | EPIC(E21.1) |
-| REQ-RT-428 | runtime | v1-full | --- CLI and API must support: --dry-run | tasks/0908 §104 | - | EPIC(E21.1) |
-| REQ-RT-429 | runtime | v1-full | Example: adopt_resolution() must not produce: resolution = adopted budget = unchanged authority = half-updated | tasks/0908 §105 | - | EPIC(E21.1) |
-| REQ-RT-430 | runtime | v1-full | Example: organization merge must first validate: identity conflicts rule conflicts authority conflicts resource conflicts membership conflicts contract conflicts | tasks/0908 §106 | - | EPIC(E21.1) |
-| REQ-RT-431 | runtime | v1-full | --- The runtime must detect governance deadlocks. | tasks/0908 §109 | - | EPIC(E21.1) |
-| REQ-RT-432 | runtime | v1-full | The implementation must enforce at least the following classes of invariants. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-433 | runtime | v1-full | 8. Membership must reference an existing organization. 9. Membership must reference an identifiable member. 10. Terminated membership cannot exercise organizational authority. 11. Suspended membership cannot exercise suspended privileges. 12. Membership does not automatically grant all organizational permissions. 13. Membership history is auditable. 14. Membership changes require authorized operations. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-434 | runtime | v1-full | 15. A role belongs to an organization. 16. A role is not a capability. 17. A role is not automatically an authority. 18. Role assignment must be authorized. 19. Revoked roles cannot exercise revoked authority. 20. Role expiration is enforced. 21. Role history is retained. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-435 | runtime | v1-full | 27. Every formal decision has a governing procedure. 28. Every vote has eligibility rules. 29. Quorum is explicitly evaluated. 30. Invalid votes cannot count. 31. Recused voters cannot participate beyond permitted scope. 32. Resolution authority must be validated. 33. Decision records are immutable after finalization. 34. Historical decisions cannot be rewritten. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-436 | runtime | v1-full | 59. Critical organizations SHOULD have succession plans. 60. Agent failure must not automatically imply organization failure. 61. Coordinator failure must not automatically destroy organization state. 62. Recovery validates organizational integrity. 63. Recovery cannot reactivate revoked authority. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-437 | runtime | v1-full | 64. Merge requires explicit authority. 65. Split requires explicit mapping. 66. Dissolution requires explicit authority. 67. Reorganization preserves lineage. 68. Resource ownership must be remapped explicitly. 69. Membership must be remapped explicitly. 70. Contracts must be reviewed during reorganization. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-438 | runtime | v1-full | The complete implementation target is **≥220 invariants**, expanding these classes into executable compiler/runtime assertions. | tasks/0908 §111 | - | EPIC(E21.1) |
-| REQ-RT-439 | runtime | v1-full | Before lowering an organizational IR operation: Identity validation Capability validation Membership validation Authority validation Rule validation Policy validation Safety validation Human-oversight validation Resource validation Concurrency validation Audit validation Failure must stop lowering. | tasks/0908 §116 | - | EPIC(E21.1) |
-| REQ-RT-440 | runtime | v1-full | An additional allocation of 4 must fail unless capacity is changed. | tasks/0908 §124 | - | EPIC(E21.1) |
-| REQ-RT-441 | runtime | v1-full | Uncertain organizational decisions may use probabilistic reasoning. 667 must preserve: probability confidence assumptions evidence uncertainty | tasks/0908 §132 | - | EPIC(E21.1) |
-| REQ-RT-442 | runtime | v1-full | --- Rollback must not erase history. | tasks/0908 §142 | - | EPIC(E21.1) |
-| REQ-RT-443 | runtime | v1-full | --- Organization state must support: binary text schema-versioned canonical incremental | tasks/0908 §145 | - | EPIC(E21.1) |
-| REQ-RT-444 | runtime | v1-full | During distributed partition: membership identity audit critical authority must not silently diverge. | tasks/0908 §148 | - | EPIC(E21.1) |
-| REQ-RT-445 | runtime | v1-full | A partition-aware organization must explicitly define its behavior. | tasks/0908 §148 | - | EPIC(E21.1) |
-| REQ-RT-446 | runtime | v1-full | Two partitions must not independently claim the same exclusive authority unless the organization explicitly permits it. | tasks/0908 §149 | - | EPIC(E21.1) |
-| REQ-RT-447 | runtime | v1-full | logical time causal ordering physical timestamp may all be recorded. Timestamp alone must not establish causal order. | tasks/0908 §151 | - | EPIC(E21.1) |
-| REQ-RT-448 | runtime | v1-full | Example: "you are now the director" must not alter: office role authority membership | tasks/0908 §156 | - | EPIC(E21.1) |
-| REQ-RT-449 | runtime | v1-full | Test: organization attempts prohibited operation emergency attempts safety bypass vote attempts safety bypass agent attempts self-authority escalation organization attempts to bypass human approval contract attempts to override safety All must fail deterministically. | tasks/0908 §169 | - | EPIC(E21.1) |
-| REQ-RT-450 | runtime | v1-full | --- Runtime must support: create register activate join leave suspend resume role assignment office appointment governance decision vote quorum budget resources memory audit appeal sanction reorganization merge split federation continuity emergency | tasks/0908 §171 | - | EPIC(E21.1) |
-| REQ-RT-451 | runtime | v1-full | 667 must not impose organization machinery on applications that do not use it. | tasks/0908 §172 | - | EPIC(E21.1) |
-| REQ-RT-452 | runtime | v1-full | --- 667 must not require GC. | tasks/0908 §178 | - | EPIC(E21.1) |
-| REQ-RT-453 | runtime | v1-full | --- Handles must detect: invalid expired revoked foreign organization stale version | tasks/0908 §180 | - | EPIC(E21.1) |
-| REQ-RT-454 | runtime | v1-full | --- 667 APIs must define concurrency behavior. | tasks/0908 §181 | - | EPIC(E21.1) |
-| REQ-RT-455 | runtime | v1-full | Long organizational operations support cancellation: audit election merge split reorganization recovery Cancellation must leave state valid. | tasks/0908 §183 | - | EPIC(E21.1) |
-| REQ-RT-456 | runtime | v1-full | --- Telemetry must avoid leaking: private membership confidential decisions restricted resources sensitive institutional records | tasks/0908 §187 | - | EPIC(E21.1) |
-| REQ-RT-457 | runtime | v1-full | organization version = 42 cannot blindly mutate version 44 state. It must: refresh rebase retry | tasks/0908 §193 | - | EPIC(E21.1) |
-| REQ-RT-458 | runtime | v1-full | --- APIs must be versioned: org/v1 org/v2 | tasks/0908 §195 | - | EPIC(E21.1) |
-| REQ-RT-459 | runtime | v1-full | --- Migration must not: increase authority lose audit history duplicate resources duplicate exclusive offices delete required records | tasks/0908 §198 | - | EPIC(E21.1) |
-| REQ-RT-460 | runtime | v1-full | It must **not** collapse 667 into one giant organization. The distinction should remain: 666 Agent Society ↓ 667 Organization / Institution ↓ 668 Federation / Inter-Institutional Network ↓ future layers: Civilization / Planetary / Multi-World Systems | tasks/0908 §203 | - | EPIC(E21.1) |
-| REQ-RT-461 | runtime | v1-full | Every federation membership must declare the autonomy boundary. | tasks/0909 §8 | - | EPIC(E21.1) |
-| REQ-RT-462 | runtime | v1-full | Federations may support: ExpulsionProcedure but expulsion must be: ; explicitly authorized, ; procedurally valid, ; auditable, ; appealable where required. | tasks/0909 §19 | - | EPIC(E21.1) |
-| REQ-RT-463 | runtime | v1-full | Treaty authority must come from each participant's organizational governance. | tasks/0909 §24 | - | EPIC(E21.1) |
-| REQ-RT-464 | runtime | v1-full | A federation may use: one-member-one-vote weighted-by-membership weighted-by-contribution weighted-by-stake multi-chamber consensus supermajority custom The mechanism must be explicitly declared. | tasks/0909 §35 | - | EPIC(E21.1) |
-| REQ-RT-465 | runtime | v1-full | Federation quorum may be based on: member count resource weight population/representation stake specific member classes The rule must be deterministic. | tasks/0909 §38 | - | EPIC(E21.1) |
-| REQ-RT-466 | runtime | v1-full | Abstention must be represented separately from absence. | tasks/0909 §39 | - | EPIC(E21.1) |
-| REQ-RT-467 | runtime | v1-full | Contribution records must not automatically imply voting authority unless the governance rule explicitly says so. | tasks/0909 §48 | - | EPIC(E21.1) |
-| REQ-RT-468 | runtime | v1-full | --- Trust must not automatically propagate. | tasks/0909 §55 | - | EPIC(E21.1) |
-| REQ-RT-469 | runtime | v1-full | Cycles are allowed for relationships but authority inheritance must remain bounded. | tasks/0909 §65 | - | EPIC(E21.1) |
-| REQ-RT-470 | runtime | v1-full | --- The runtime must detect: A delegates to B B delegates to C C delegates to A | tasks/0909 §66 | - | EPIC(E21.1) |
-| REQ-RT-471 | runtime | v1-full | Organizations may negotiate interoperability policies. PolicyProposal PolicyCounterProposal PolicyAgreement PolicyRejection The resulting agreement must remain within 639. | tasks/0909 §69 | - | EPIC(E21.1) |
-| REQ-RT-472 | runtime | v1-full | Organizations can use adapters: Protocol A ↓ Adapter ↓ Federation Protocol Adapters must declare semantic limitations. | tasks/0909 §72 | - | EPIC(E21.1) |
-| REQ-RT-473 | runtime | v1-full | A federation may require independent auditors. The auditor's authority must be explicit. | tasks/0909 §84 | - | EPIC(E21.1) |
-| REQ-RT-474 | runtime | v1-full | --- Emergency authority must have: scope duration authority source affected members review process | tasks/0909 §89 | - | EPIC(E21.1) |
-| REQ-RT-475 | runtime | v1-full | If 665 requires human approval: federation emergency ↓ human approval must remain enforced. | tasks/0909 §90 | - | EPIC(E21.1) |
-| REQ-RT-476 | runtime | v1-full | Critical federation state: identity charter member registry delegations agreements shared resource state governance history audit history must survive individual member failures where possible. | tasks/0909 §107 | - | EPIC(E21.1) |
-| REQ-RT-477 | runtime | v1-full | A federation must prevent two partitions from independently committing conflicting exclusive decisions unless explicitly configured for multi-primary operation. | tasks/0909 §110 | - | EPIC(E21.1) |
-| REQ-RT-478 | runtime | v1-full | --- Dissolution must define: member exit resource disposition agreement termination data retention audit retention identity retirement | tasks/0909 §116 | - | EPIC(E21.1) |
-| REQ-RT-479 | runtime | v1-full | the operation is prohibited when the federation rule legitimately applies to the organization. If the federation lacks authority over the domain, its rule does not automatically apply. Scope must be checked. | tasks/0909 §123 | - | EPIC(E21.1) |
-| REQ-RT-480 | runtime | v1-full | Policies may be inherited: Federation ↓ Organization ↓ Department but inheritance must be explicit. | tasks/0909 §125 | - | EPIC(E21.1) |
-| REQ-RT-481 | runtime | v1-full | If two constitutional documents conflict: ConstitutionConflict must be raised. | tasks/0909 §128 | - | EPIC(E21.1) |
-| REQ-RT-482 | runtime | v1-full | Incentive mechanisms may reward: resource contribution service reliability protocol conformance research contribution security contribution Rewards must be governed by explicit policy. | tasks/0909 §141 | - | EPIC(E21.1) |
-| REQ-RT-483 | runtime | v1-full | Dispute evidence must remain immutable after admission unless corrected through explicit versioning. | tasks/0909 §146 | - | EPIC(E21.1) |
-| REQ-RT-484 | runtime | v1-full | ```text protocol state machines governance invariants authority constraints resource constraints treaty consistency ``` | tasks/0909 §150 | - | EPIC(E21.1) |
-| REQ-RT-485 | runtime | v1-full | Simulation state: SimulationFederation must never be confused with: LiveFederation | tasks/0909 §154 | - | EPIC(E21.1) |
-| REQ-RT-486 | runtime | v1-full | Example: Organization approvals + Federation quorum + Human approval All gates must succeed. | tasks/0909 §159 | - | EPIC(E21.1) |
-| REQ-RT-487 | runtime | v1-full | Quarantine can apply to: organization service credential protocol resource agent class The action must be scoped. | tasks/0909 §163 | - | EPIC(E21.1) |
-| REQ-RT-488 | runtime | v1-full | Promotion must preserve the original local incident records. | tasks/0909 §166 | - | EPIC(E21.1) |
-| REQ-RT-489 | runtime | v1-full | Certificate trust integrates with 610/638. Federation trust anchors must have: issuer scope validity revocation rotation | tasks/0909 §167 | - | EPIC(E21.1) |
-| REQ-RT-490 | runtime | v1-full | A member must not automatically receive federation secrets merely because it is a member. | tasks/0909 §169 | - | EPIC(E21.1) |
-| REQ-RT-491 | runtime | v1-full | --- Federation state must support: canonical binary canonical text schema version content hash incremental state | tasks/0909 §172 | - | EPIC(E21.1) |
-| REQ-RT-492 | runtime | v1-full | Given identical: initial state event sequence protocol version rule version the resulting state must be deterministic. | tasks/0909 §175 | - | EPIC(E21.1) |
-| REQ-RT-493 | runtime | v1-full | A malicious/faulty member must not be able to rewrite federation history. | tasks/0909 §176 | - | EPIC(E21.1) |
-| REQ-RT-494 | runtime | v1-full | Authority scopes must be disjoint or conflict-resolved. | tasks/0909 §181 | - | EPIC(E21.1) |
-| REQ-RT-495 | runtime | v1-full | One member's failure must not automatically dissolve the federation. | tasks/0909 §183 | - | EPIC(E21.1) |
-| REQ-RT-496 | runtime | v1-full | Federation memory must not erase organizational provenance. | tasks/0909 §189 | - | EPIC(E21.1) |
-| REQ-RT-497 | runtime | v1-full | creates: Partition A Partition B the runtime must determine from federation policy whether: read-only operation degraded operation quorum operation full stop | tasks/0909 §207 | - | EPIC(E21.1) |
-| REQ-RT-498 | runtime | v1-full | read-only operation degraded operation quorum operation full stop is permitted. It must not invent a behavior. | tasks/0909 §207 | - | EPIC(E21.1) |
-| REQ-RT-499 | runtime | v1-full | The implementation target is **≥260 federation-specific invariants**. | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-500 | runtime | v1-full | The implementation target is **≥260 federation-specific invariants**. Core invariants include: | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-501 | runtime | v1-full | 6. Every member must be registered. 7. Admission requires authorization. 8. Withdrawal preserves historical membership. 9. Suspension cannot silently become expulsion. 10. Expelled members cannot exercise restricted federation rights. 11. Federation membership cannot automatically grant organizational authority. | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-502 | runtime | v1-full | 12. Federation authority must be delegated. 13. Federation cannot assume undelegated organizational authority. 14. Reserved organizational authority remains local. 15. Federation rules must declare scope. | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-503 | runtime | v1-full | 60. Merge preserves lineage. 61. Split preserves lineage. 62. Reorganization preserves audit history. 63. Resource mappings must be explicit. 64. Agreement mappings must be explicit. | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-504 | runtime | v1-full | The full testable specification must expand these into **≥260 executable invariants**. | tasks/0909 §211 | - | EPIC(E21.1) |
-| REQ-RT-505 | runtime | v1-full | --- The test harness must inject: member crash leader crash secretariat crash network partition federation database failure duplicate event out-of-order event stale membership stale delegation stale protocol credential compromise trust revocation resource provider failure quorum loss Byzantine member Byzantine coordinator partial merge partial split agreement mismatch protocol mismatch clock skew | tasks/0909 §214 | - | EPIC(E21.1) |
-| REQ-RT-506 | runtime | v1-full | --- Runtime must support: create register join leave suspend resume delegate revoke govern vote ratify negotiate publish share allocate audit certify dispute appeal emergency recover merge split dissolve | tasks/0909 §216 | - | EPIC(E21.1) |
-| REQ-RT-507 | runtime | v1-full | Applications not using federation features must not link the federation runtime. | tasks/0909 §217 | - | EPIC(E21.1) |
-| REQ-RT-508 | runtime | v1-full | Possible profile: AXFED_NONE must have zero federation runtime dependency. | tasks/0909 §217 | - | EPIC(E21.1) |
-| REQ-RT-509 | runtime | v1-full | --- 668 must not require a managed runtime. | tasks/0909 §218 | - | EPIC(E21.1) |
-| REQ-RT-510 | runtime | v1-full | Long federation operations must support cancellation: audit merge split reorganization recovery protocol migration | tasks/0909 §222 | - | EPIC(E21.1) |
-| REQ-RT-511 | runtime | v1-full | Long federation operations must support cancellation: audit merge split reorganization recovery protocol migration Cancellation must preserve valid state. | tasks/0909 §222 | - | EPIC(E21.1) |
-| REQ-RT-512 | runtime | v1-full | Cross-network operations require idempotency keys: agreement_id request_id event_id transaction_id allocation_id Repeated requests must not duplicate effects. | tasks/0909 §223 | - | EPIC(E21.1) |
-| REQ-RT-513 | runtime | v1-full | Federation telemetry must not automatically expose: private organization state secret agreements private member information confidential resources | tasks/0909 §226 | - | EPIC(E21.1) |
-| REQ-RT-514 | runtime | v1-full | The scope of each certification must remain explicit. | tasks/0909 §240 | - | EPIC(E21.1) |
-| REQ-RT-515 | runtime | v1-full | Runtime implementation must not silently override federation semantics encoded in: charter constitution agreement | tasks/0909 §245 | - | EPIC(E21.1) |
-| REQ-RT-516 | runtime | v1-full | --- A federation software upgrade must verify: state schema protocol compatibility authority semantics security governance compatibility | tasks/0909 §246 | - | EPIC(E21.1) |
-| REQ-RT-517 | runtime | v1-full | Software rollback must not automatically roll back irreversible governance decisions. | tasks/0909 §247 | - | EPIC(E21.1) |
-| REQ-RT-518 | runtime | v1-full | If two valid governance histories diverge: GovernanceFork must be explicitly represented. | tasks/0909 §248 | - | EPIC(E21.1) |
-| REQ-RT-519 | runtime | v1-full | The runtime must not silently merge incompatible histories. | tasks/0909 §248 | - | EPIC(E21.1) |
-| REQ-RT-520 | runtime | v1-full | --- Memory records must preserve: organization source federation source agreement decision protocol version evidence | tasks/0909 §250 | - | EPIC(E21.1) |
-| REQ-RT-521 | runtime | v1-full | Resolution mechanisms: EvidenceReview FormalVerification IndependentAudit Experiment Arbitration GovernanceDecision must be explicitly selected. | tasks/0909 §251 | - | EPIC(E21.1) |
-| REQ-RT-522 | runtime | v1-full | Lớp tiếp theo hợp lý không phải chỉ là “thêm một loại federation”, mà là **mô hình hệ thống quy mô nền văn minh**: nhiều federation có thể cùng tồn tại, có shared infrastructure, shared commons, multi-level institutions, population/entity registry, planetary-scale resources, civilization-wide protocols, long-term continuity và macro-level governance. | tasks/0909 §258 | - | EPIC(E21.1) |
-| REQ-RT-523 | runtime | v1-full | 667 bổ sung lớp persistent institution: Agent ↓ Team / Collective ↓ Organization ↓ Institution ↓ Federation 667 phải giải quyết: WHO BELONGS? WHO HAS WHICH ROLE? WHO MAY DECIDE? WHO MAY SPEND? WHO MAY DELEGATE? WHAT RULES APPLY? HOW ARE DECISIONS MADE? HOW ARE LEADERS REPLACED? HOW DOES MEMORY SURVIVE? HOW DOES THE ORGANIZATION SURVIVE MEMBER FAILURE? HOW CAN THE ORGANIZATION CHANGE? HOW CAN IT SPLIT / MERGE / DISSOLVE? | tasks/0910 §1 | - | EPIC(E21.1) |
-| REQ-RT-524 | runtime | v1-full | nhưng: Agent replacement không được mặc định làm mất organization. | tasks/0910 §2.1 | - | EPIC(E21.1) |
-| REQ-RT-525 | runtime | v1-full | --- Axiom không được tự động gán: legal personality citizenship human rights corporate status governmental authority | tasks/0910 §3 | - | EPIC(E21.1) |
-| REQ-RT-526 | runtime | v1-full | --- Runtime phải hỗ trợ: Organization Institution CompanyLikeOrganization ResearchOrganization ServiceOrganization Community ProjectOrganization TaskForce Department Federation Consortium FoundationLikeOrganization HumanAIOrganization AgentOnlyOrganization DistributedOrganization TemporaryOrganization PersistentInstitution | tasks/0910 §4 | - | EPIC(E21.1) |
-| REQ-RT-527 | runtime | v1-full | OrganizationId InstitutionId OrganizationIdentity InstitutionalIdentity OrganizationVersion OrganizationLineage Identity phải tồn tại độc lập với member. | tasks/0910 §6.1 | - | EPIC(E21.1) |
-| REQ-RT-528 | runtime | v1-full | Vì vậy: member.can("compile") không được suy ra chỉ từ: member.belongs_to(org) | tasks/0910 §9 | - | EPIC(E21.1) |
-| REQ-RT-529 | runtime | v1-full | Tương tự: Membership != Authority Authority phải đến từ: Role Mandate Delegation Policy Office Governance Decision | tasks/0910 §10 | - | EPIC(E21.1) |
-| REQ-RT-530 | runtime | v1-full | xung đột với: rule_B runtime phải xác định: precedence scope authority version effective_time | tasks/0910 §19 | - | EPIC(E21.1) |
-| REQ-RT-531 | runtime | v1-full | Nếu không thể resolve: RULE_CONFLICT Không được tự ý chọn rule thấp hơn. | tasks/0910 §19 | - | EPIC(E21.1) |
-| REQ-RT-532 | runtime | v1-full | 667 không ép organization phải dùng một mô hình governance cụ thể. | tasks/0910 §20 | - | EPIC(E21.1) |
-| REQ-RT-533 | runtime | v1-full | Proposal ProposalId Proposer Scope Evidence ExpectedEffects Risks Cost Dependencies Proposal không phải decision. | tasks/0910 §23 | - | EPIC(E21.1) |
-| REQ-RT-534 | runtime | v1-full | Có thể mở rộng: RANKED SCORE APPROVAL CONSENT nhưng semantics phải được khai báo rõ. | tasks/0910 §25 | - | EPIC(E21.1) |
-| REQ-RT-535 | runtime | v1-full | có thể dựa trên: member_count eligible_member_count weighted_vote stake role committee_members minimum_participation Runtime phải lưu cách quorum được tính. | tasks/0910 §27 | - | EPIC(E21.1) |
-| REQ-RT-536 | runtime | v1-full | Election Candidate Elector Ballot VotingPeriod Result AuditRecord Election engine phải tách: eligibility ballot counting verification publication appeal | tasks/0910 §29 | - | EPIC(E21.1) |
-| REQ-RT-537 | runtime | v1-full | 667 sử dụng delegation của 666 nhưng mở rộng lên organization-level. AuthorityDelegation phải có: grantor grantee authority scope constraints start expiration revocation | tasks/0910 §31 | - | EPIC(E21.1) |
-| REQ-RT-538 | runtime | v1-full | phải có: grantor grantee authority scope constraints start expiration revocation Delegation không được vượt authority của grantor. | tasks/0910 §31 | - | EPIC(E21.1) |
-| REQ-RT-539 | runtime | v1-full | thì: A delegates X to B không được tạo: B has X + Y | tasks/0910 §32 | - | EPIC(E21.1) |
-| REQ-RT-540 | runtime | v1-full | Mọi thay đổi tài chính/resource quan trọng phải có: authorization trace audit | tasks/0910 §36 | - | EPIC(E21.1) |
-| REQ-RT-541 | runtime | v1-full | Institutional memory không được dùng để lưu hidden chain-of-thought. | tasks/0910 §38 | - | EPIC(E21.1) |
-| REQ-RT-542 | runtime | v1-full | Record không còn active vẫn phải có khả năng truy xuất nếu policy yêu cầu. | tasks/0910 §40 | - | EPIC(E21.1) |
-| REQ-RT-543 | runtime | v1-full | ComplianceState ComplianceRule ComplianceCheck Violation Remediation Compliance phải phân biệt: PASS FAIL UNKNOWN NOT_APPLICABLE WAIVED UNDER_REVIEW | tasks/0910 §44 | - | EPIC(E21.1) |
-| REQ-RT-544 | runtime | v1-full | ConflictOfInterest Disclosure Recusal Review Member có thể phải: declare conflict recuse appoint substitute | tasks/0910 §45 | - | EPIC(E21.1) |
-| REQ-RT-545 | runtime | v1-full | Organization có thể: suspend membership revoke role remove office restrict organizational access quarantine organizational privileges terminate membership Nhưng không được vượt: 603 639 664 665 | tasks/0910 §47 | - | EPIC(E21.1) |
-| REQ-RT-546 | runtime | v1-full | --- 667 phải hỗ trợ: ReorganizationPlan | tasks/0910 §49 | - | EPIC(E21.1) |
-| REQ-RT-547 | runtime | v1-full | OrganizationMerge phải tạo lineage: OrgA OrgB ↓ OrgC | tasks/0910 §50 | - | EPIC(E21.1) |
-| REQ-RT-548 | runtime | v1-full | phải tạo lineage: OrgA OrgB ↓ OrgC Không được mất: identity history records contracts assets audit trail membership history | tasks/0910 §50 | - | EPIC(E21.1) |
-| REQ-RT-549 | runtime | v1-full | có thể tạo: OrgA ↓ OrgB OrgC Phải xác định rõ: asset allocation member allocation contract ownership memory partition authority transfer identity lineage | tasks/0910 §51 | - | EPIC(E21.1) |
-| REQ-RT-550 | runtime | v1-full | Organization lifecycle: ACTIVE → WINDING_DOWN → DISSOLVED Dissolution không được xóa lịch sử. | tasks/0910 §52 | - | EPIC(E21.1) |
-| REQ-RT-551 | runtime | v1-full | --- Organization phải có: ContinuityPlan | tasks/0910 §53 | - | EPIC(E21.1) |
-| REQ-RT-552 | runtime | v1-full | --- Emergency authority không được tự động bypass: 603 security 639 policy 664 safety 665 human control | tasks/0910 §57 | - | EPIC(E21.1) |
-| REQ-RT-553 | runtime | v1-full | Contract có thể thuộc: agent team organization institution Nhưng organization-level contract phải có: authorized_signatory organizational_scope contract_authority | tasks/0910 §59 | - | EPIC(E21.1) |
-| REQ-RT-554 | runtime | v1-full | Safety: ```text MUST_NOT ``` | tasks/0910 §60 | - | EPIC(E21.1) |
-| REQ-RT-555 | runtime | v1-full | human + human AI + AI human + AI human + AI + service + device Không có loại nào được mặc định privileged chỉ vì identity category. Quyền phải đến từ: policy role authority membership capability oversight | tasks/0910 §62 | - | EPIC(E21.1) |
-| REQ-RT-556 | runtime | v1-full | Các organization có critical operations phải tích hợp 665. | tasks/0910 §63 | - | EPIC(E21.1) |
-| REQ-RT-557 | runtime | v1-full | Creation có thể do: human agent existing organization deployment system nhưng creation authority phải được policy cho phép. | tasks/0910 §64 | - | EPIC(E21.1) |
-| REQ-RT-558 | runtime | v1-full | human agent existing organization deployment system nhưng creation authority phải được policy cho phép. Agent không được: spawn organization → automatically acquire unlimited authority | tasks/0910 §64 | - | EPIC(E21.1) |
-| REQ-RT-559 | runtime | v1-full | Không được dùng reputation như một capability grant. | tasks/0910 §69 | - | EPIC(E21.1) |
-| REQ-RT-560 | runtime | v1-full | --- Identity phải duy trì qua: member replacement role replacement department changes software updates organizational restructuring | tasks/0910 §71 | - | EPIC(E21.1) |
-| REQ-RT-561 | runtime | v1-full | Các artifact governance đều versioned: CharterVersion RuleVersion RoleVersion DecisionVersion BudgetVersion OrganizationVersion Không được silently mutate historical state. | tasks/0910 §72 | - | EPIC(E21.1) |
-| REQ-RT-562 | runtime | v1-full | --- Decision engine phải hỗ trợ: current policy future policy historical policy scheduled policy expired policy | tasks/0910 §74 | - | EPIC(E21.1) |
-| REQ-RT-563 | runtime | v1-full | --- Trace phải kết nối: Proposal → Evidence → Review → Vote → Resolution → Authority → Execution → Outcome → Audit | tasks/0910 §76 | - | EPIC(E21.1) |
-| REQ-RT-564 | runtime | v1-full | --- Compiler/runtime IR phải hỗ trợ tối thiểu: OrganizationCreate OrganizationRegister OrganizationJoin OrganizationLeave MembershipGrant MembershipSuspend MembershipTerminate RoleCreate RoleAssign RoleRevoke OfficeCreate OfficeAssign OfficeVacate DepartmentCreate DepartmentMove DepartmentMerge DepartmentSplit CommitteeCreate BoardCreate CouncilCreate GovernanceBodyCreate CharterCreate CharterAmend RuleCreate RuleAmend RuleEvaluate ProposalCreate AgendaAdd ReviewRequest Deliberate VoteOpen VoteCast QuorumCheck DecisionResolve ResolutionAdopt ResolutionPublish DecisionAppeal AppointmentCreate AppointmentRevoke ElectionCreate ElectionRun ElectionVerify SuccessionCreate SuccessionActivate AuthorityDelegate AuthorityRevoke BudgetCreate BudgetAllocate BudgetReserve BudgetRelease ResourcePoolCreate ResourceAllocate InstitutionalRecordCreate RecordArchive AuditStart AuditCheck AuditComplete ComplianceEvaluate ConflictDeclare Recuse SanctionApply SanctionRevoke ReorganizationPlan OrganizationMerge OrganizationSplit OrganizationDissolve FederationJoin FederationLeave ContinuityCheck ContinuityRecover EmergencyAuthorityActivate EmergencyAuthorityExpire InstitutionalTrace | tasks/0910 §79 | - | EPIC(E21.1) |
-| REQ-RT-565 | runtime | v1-full | Organization identity MUST be independent of member identity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-566 | runtime | v1-full | Replacing all members MUST NOT automatically destroy persistent organizational identity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-567 | runtime | v1-full | Historical organization identifiers MUST remain resolvable according to retention policy. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-568 | runtime | v1-full | Historical organization identifiers MUST remain resolvable according to retention policy. ; *ORG-004** Organization merge MUST preserve lineage. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-569 | runtime | v1-full | Organization merge MUST preserve lineage. ; *ORG-005** Organization split MUST preserve lineage. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-570 | runtime | v1-full | Membership MUST explicitly identify the organization. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-571 | runtime | v1-full | Membership MUST explicitly identify the organization. ; *ORG-011** Membership MUST have lifecycle state. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-572 | runtime | v1-full | Expired membership MUST NOT silently remain active. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-573 | runtime | v1-full | Suspended membership MUST preserve historical membership evidence. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-574 | runtime | v1-full | Membership MUST NOT automatically grant unrestricted authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-575 | runtime | v1-full | **ORG-020** Role MUST be distinct from member identity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-576 | runtime | v1-full | Role MUST be distinct from member identity. ; *ORG-021** Role MUST be distinct from capability. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-577 | runtime | v1-full | Role MUST be distinct from capability. ; *ORG-022** Role authority MUST have scope. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-578 | runtime | v1-full | Role authority MUST have scope. ; *ORG-023** Time-bounded roles MUST expire automatically. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-579 | runtime | v1-full | Revoked roles MUST cease granting organizational authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-580 | runtime | v1-full | Office MUST be persistent independently from its holder. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-581 | runtime | v1-full | Vacating an office MUST NOT delete the office definition. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-582 | runtime | v1-full | Office succession MUST be explicitly defined or reportable as absent. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-583 | runtime | v1-full | **ORG-040** Proposal MUST NOT equal decision. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-584 | runtime | v1-full | Proposal MUST NOT equal decision. ; *ORG-041** Decision MUST record decision authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-585 | runtime | v1-full | Decision MUST record decision authority. ; *ORG-042** Vote MUST record voting rule. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-586 | runtime | v1-full | Quorum MUST be evaluated using the declared quorum rule. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-587 | runtime | v1-full | Quorum MUST be evaluated using the declared quorum rule. ; *ORG-044** Decision procedure MUST be auditable. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-588 | runtime | v1-full | Decision procedure MUST be auditable. ; *ORG-045** Consensus MUST NOT be represented as truth. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-589 | runtime | v1-full | **ORG-050** Rules MUST have explicit scope. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-590 | runtime | v1-full | Rules MUST have explicit scope. ; *ORG-051** Rules MUST have version identity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-591 | runtime | v1-full | Higher-precedence constraints MUST override lower-precedence organizational rules. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-592 | runtime | v1-full | An organization MUST NOT create a rule that bypasses system safety. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-593 | runtime | v1-full | An organization MUST NOT create authority exceeding its own authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-594 | runtime | v1-full | Delegated authority MUST NOT exceed grantor authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-595 | runtime | v1-full | Delegated authority MUST NOT exceed grantor authority. ; *ORG-061** Authority MUST be scope-bound. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-596 | runtime | v1-full | Authority MUST be revocable unless explicitly immutable by higher-level policy. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-597 | runtime | v1-full | Authority MUST be revocable unless explicitly immutable by higher-level policy. ; *ORG-063** Membership MUST NOT imply unrestricted authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-598 | runtime | v1-full | Membership MUST NOT imply unrestricted authority. ; *ORG-064** Trust MUST NOT create authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-599 | runtime | v1-full | Trust MUST NOT create authority. ; *ORG-065** Reputation MUST NOT create authority. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-600 | runtime | v1-full | Allocation MUST NOT exceed available organizational resource. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-601 | runtime | v1-full | Reservation MUST reduce available allocatable capacity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-602 | runtime | v1-full | Released reservation MUST restore allocatable capacity according to accounting rules. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-603 | runtime | v1-full | Released reservation MUST restore allocatable capacity according to accounting rules. ; *ORG-073** Budget changes MUST be auditable. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-604 | runtime | v1-full | **ORG-080** Institutional records MUST preserve provenance. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-605 | runtime | v1-full | Historical decisions MUST NOT be silently rewritten. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-606 | runtime | v1-full | Historical decisions MUST NOT be silently rewritten. ; *ORG-082** Institutional memory MUST support versioning. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-607 | runtime | v1-full | Memory retention MUST obey organizational and higher-level policy. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-608 | runtime | v1-full | Institutional memory MUST NOT require private chain-of-thought storage. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-609 | runtime | v1-full | Audit records MUST be tamper-evident under the configured trust model. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-610 | runtime | v1-full | Compliance result MUST distinguish failure from unknown. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-611 | runtime | v1-full | Compliance result MUST distinguish failure from unknown. ; *ORG-092** Audit authority MUST itself be scoped. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-612 | runtime | v1-full | **ORG-100** Succession MUST preserve office identity. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-613 | runtime | v1-full | Emergency succession MUST have explicit activation conditions. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-614 | runtime | v1-full | Emergency succession MUST have explicit activation conditions. ; *ORG-102** Emergency authority MUST have expiration. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-615 | runtime | v1-full | Expired emergency authority MUST NOT remain active implicitly. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-616 | runtime | v1-full | **ORG-110** Merge MUST preserve source lineage. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-617 | runtime | v1-full | Merge MUST preserve source lineage. ; *ORG-111** Split MUST preserve source lineage. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-618 | runtime | v1-full | Dissolution MUST NOT silently delete mandatory historical records. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-619 | runtime | v1-full | **ORG-120** Organization rules MUST NOT override 664. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-620 | runtime | v1-full | Organization rules MUST NOT override 664. ; *ORG-121** Organization governance MUST NOT override 665. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-621 | runtime | v1-full | Organization authority MUST remain subordinate to 639. | tasks/0910 §82 | - | EPIC(E21.1) |
-| REQ-RT-622 | runtime | v1-full | --- Mọi critical decision phải có: decision_id organization_id proposal_id authority_source participants eligibility procedure evidence result effective_time audit_reference | tasks/0910 §83 | - | EPIC(E21.1) |
-| REQ-RT-623 | runtime | v1-full | Không cho phép: anonymous critical resolution trừ khi explicit privacy policy cho phép và vẫn phải giữ audit identity ở trust boundary thích hợp. | tasks/0910 §83 | - | EPIC(E21.1) |
-| REQ-RT-624 | runtime | v1-full | --- Institutional memory phải hỗ trợ: strong consistency eventual consistency append-only history versioned state conflict detection merge | tasks/0910 §84 | - | EPIC(E21.1) |
-| REQ-RT-625 | runtime | v1-full | --- Network partition phải có policy rõ: block continue locally read-only emergency mode quorum-required | tasks/0910 §86 | - | EPIC(E21.1) |
-| REQ-RT-626 | runtime | v1-full | Không được tự động giả định rằng mọi partition đều an toàn để tiếp tục governance. | tasks/0910 §86 | - | EPIC(E21.1) |
-| REQ-RT-627 | runtime | v1-full | Organization có thể sửa: rules roles departments governance nhưng modification phải đi qua governance procedure được khai báo. | tasks/0910 §89 | - | EPIC(E21.1) |
-| REQ-RT-628 | runtime | v1-full | rules roles departments governance nhưng modification phải đi qua governance procedure được khai báo. Không được: agent modifies constitution | tasks/0910 §89 | - | EPIC(E21.1) |
-| REQ-RT-629 | runtime | v1-full | AmendmentProposal phải chỉ rõ: old_version new_version changed_sections reason_summary effective_time required_authority | tasks/0910 §91 | - | EPIC(E21.1) |
-| REQ-RT-630 | runtime | v1-full | Các decision procedure quan trọng phải có thể replay: inputs participants rules votes timestamps result | tasks/0910 §92 | - | EPIC(E21.1) |
-| REQ-RT-631 | runtime | v1-full | Critical organizational decisions không được dựa vào hidden state không thể audit. | tasks/0910 §93 | - | EPIC(E21.1) |
-| REQ-RT-632 | runtime | v1-full | Có thể dùng AI reasoning, nhưng final decision phải có: decision evidence decision authority decision procedure decision result | tasks/0910 §93 | - | EPIC(E21.1) |
-| REQ-RT-633 | runtime | v1-full | Nếu goal không thể đạt được: goal_failed không có nghĩa organization phải bị destroy. | tasks/0910 §96 | - | EPIC(E21.1) |
-| REQ-RT-634 | runtime | v1-full | OrganizationalRisk RiskAssessment RiskOwner Mitigation ResidualRisk Risk không phải safety override. | tasks/0910 §97 | - | EPIC(E21.1) |
-| REQ-RT-635 | runtime | v1-full | Đây là observability data, không phải automatic judgment. | tasks/0910 §98 | - | EPIC(E21.1) |
-| REQ-RT-636 | runtime | v1-full | không có nghĩa: high intelligence Hai khái niệm phải tách biệt. | tasks/0910 §99 | - | EPIC(E21.1) |
-| REQ-RT-637 | runtime | v1-full | --- Institutional reputation phải dựa trên evidence. | tasks/0910 §100 | - | EPIC(E21.1) |
-| REQ-RT-638 | runtime | v1-full | Institutional reputation phải dựa trên evidence. Không được: reputation = authority | tasks/0910 §100 | - | EPIC(E21.1) |
-| REQ-RT-639 | runtime | v1-full | Organization có thể chứa sensitive records. Runtime phải hỗ trợ: classification access control retention redaction audit purpose limitation | tasks/0910 §101 | - | EPIC(E21.1) |
-| REQ-RT-640 | runtime | v1-full | 667 không được biến organization thành heavyweight runtime object cho mọi chương trình Axiom. | tasks/0910 §112 | - | EPIC(E21.1) |
-| REQ-RT-641 | runtime | v1-full | 667 không được biến organization thành heavyweight runtime object cho mọi chương trình Axiom. Core implementation phải: zero-cost when unused lazy initialization event-driven incremental persistence compact identifiers immutable/versioned records where useful lock-free/read-optimized structures where appropriate | tasks/0910 §112 | - | EPIC(E21.1) |
-| REQ-RT-642 | runtime | v1-full | Nếu application không sử dụng: organization governance institutional memory compiler phải loại bỏ toàn bộ unused organizational runtime. | tasks/0910 §113 | - | EPIC(E21.1) |
-| REQ-RT-643 | runtime | v1-full | compiler phải loại bỏ toàn bộ unused organizational runtime. AXORG_NONE phải gần như zero-cost. | tasks/0910 §113 | - | EPIC(E21.1) |
-| REQ-RT-644 | runtime | v1-full | --- 667 phải hỗ trợ event-sourced organizations. | tasks/0910 §115 | - | EPIC(E21.1) |
-| REQ-RT-645 | runtime | v1-full | --- Organization snapshot phải có: organization_version membership_version governance_version budget_version memory_version | tasks/0910 §116 | - | EPIC(E21.1) |
-| REQ-RT-646 | runtime | v1-full | Không cho phép client trực tiếp mutate: organization.authority organization.identity organization.audit Các mutation phải đi qua validated operation. | tasks/0910 §118 | - | EPIC(E21.1) |
-| REQ-RT-647 | runtime | v1-full | Critical organization operations: create amend delegate allocate vote appoint sanction dissolve phải trải qua: capability check + authority check + policy check + safety check | tasks/0910 §119 | - | EPIC(E21.1) |
-| REQ-RT-648 | runtime | v1-full | --- Axiom phải giữ bốn tầng riêng biệt: 666 = Agent ↔ Agent / Team ↔ Team coordination 667 = Organization internal structure 668 = Organization ↔ Organization coordination 635 = Distributed consensus / control-plane primitives | tasks/0911 §2 | - | EPIC(E21.1) |
-| REQ-RT-649 | runtime | v1-full | Không được biến 668 thành một replacement cho 635 hoặc 667. | tasks/0911 §2 | - | EPIC(E21.1) |
-| REQ-RT-650 | runtime | v1-full | Federation không phải là organization lớn hơn theo nghĩa đơn giản. | tasks/0911 §4 | - | EPIC(E21.1) |
-| REQ-RT-651 | runtime | v1-full | Nếu: OrgA ∈ FederationX thì không được suy ra: OrgA == FederationX | tasks/0911 §5 | - | EPIC(E21.1) |
-| REQ-RT-652 | runtime | v1-full | từ: Federation Jurisdiction Treaty Organization Institution Các semantics pháp lý phải đến từ: host integration explicit policy external legal adapter | tasks/0911 §6 | - | EPIC(E21.1) |
-| REQ-RT-653 | runtime | v1-full | FederationMembership phải xác định: organization_id federation_id membership_kind scope rights obligations effective_at expires_at status | tasks/0911 §9 | - | EPIC(E21.1) |
-| REQ-RT-654 | runtime | v1-full | Một organization đã tồn tại có thể gia nhập federation: FederationAccession Accession phải xác định: existing identity new federation obligations shared authority resource commitments protocol versions | tasks/0911 §11 | - | EPIC(E21.1) |
-| REQ-RT-655 | runtime | v1-full | Organization có thể rời federation nếu policy cho phép. FederationExit Exit phải xử lý: active contracts resource obligations shared assets credentials data access pending disputes joint operations financial obligations | tasks/0911 §12 | - | EPIC(E21.1) |
-| REQ-RT-656 | runtime | v1-full | Exit phải xử lý: active contracts resource obligations shared assets credentials data access pending disputes joint operations financial obligations Không được đơn giản: remove_member() | tasks/0911 §12 | - | EPIC(E21.1) |
-| REQ-RT-657 | runtime | v1-full | Federation có thể suspend member: FederationMembership.status = SUSPENDED Suspension phải: scoped auditable time-aware appealable | tasks/0911 §13 | - | EPIC(E21.1) |
-| REQ-RT-658 | runtime | v1-full | Suspension phải: scoped auditable time-aware appealable Không được tự động xóa historical membership. | tasks/0911 §13 | - | EPIC(E21.1) |
-| REQ-RT-659 | runtime | v1-full | Expulsion là governance operation riêng: MembershipExpel và phải có: authority procedure evidence reason_code effective_time appeal_window | tasks/0911 §14 | - | EPIC(E21.1) |
-| REQ-RT-660 | runtime | v1-full | FederationCouncil phù hợp với governance có số lượng đại diện giới hạn. Council phải khai báo: members selection method term authority quorum voting rule rotation removal succession | tasks/0911 §17 | - | EPIC(E21.1) |
-| REQ-RT-661 | runtime | v1-full | --- Boundary phải explicit: scope subject target operation time authority | tasks/0911 §21 | - | EPIC(E21.1) |
-| REQ-RT-662 | runtime | v1-full | Ví dụ: OrgA + OrgB → shared emergency response Nhưng shared authority phải có: scope participants duration conditions revocation | tasks/0911 §23 | - | EPIC(E21.1) |
-| REQ-RT-663 | runtime | v1-full | Nếu: OrgA has authority X OrgB has authority Y thì federation không được tự động tạo: Federation has X + Y + Z | tasks/0911 §24 | - | EPIC(E21.1) |
-| REQ-RT-664 | runtime | v1-full | CrossOrgDelegation phải chỉ rõ: grantor organization grantee organization authority scope conditions duration revocation | tasks/0911 §25 | - | EPIC(E21.1) |
-| REQ-RT-665 | runtime | v1-full | nhưng authority hiệu lực: effective_authority = intersection(all authority scopes) không phải union. | tasks/0911 §26 | - | EPIC(E21.1) |
-| REQ-RT-666 | runtime | v1-full | --- Ratification phải dựa trên policy của từng party. | tasks/0911 §29 | - | EPIC(E21.1) |
-| REQ-RT-667 | runtime | v1-full | Một treaty không được coi là active nếu required parties chưa ratify. | tasks/0911 §29 | - | EPIC(E21.1) |
-| REQ-RT-668 | runtime | v1-full | --- Amendment phải có: old_version new_version changed_clauses approval_requirements effective_time | tasks/0911 §30 | - | EPIC(E21.1) |
-| REQ-RT-669 | runtime | v1-full | Amendment phải có: old_version new_version changed_clauses approval_requirements effective_time Historical versions không được overwrite. | tasks/0911 §30 | - | EPIC(E21.1) |
-| REQ-RT-670 | runtime | v1-full | --- Termination phải xử lý: outstanding obligations resources contracts credentials data joint operations disputes | tasks/0911 §32 | - | EPIC(E21.1) |
-| REQ-RT-671 | runtime | v1-full | --- Protocol phải có: major minor revision compatibility deprecation | tasks/0911 §34 | - | EPIC(E21.1) |
-| REQ-RT-672 | runtime | v1-full | Protocol phải có: major minor revision compatibility deprecation Runtime phải hỗ trợ negotiation: local_version remote_version compatible_version | tasks/0911 §34 | - | EPIC(E21.1) |
-| REQ-RT-673 | runtime | v1-full | --- 668 phải coi interoperability là multi-layer: Identity Capability Credential Data Schema Protocol Service Event Security Observability Governance | tasks/0911 §36 | - | EPIC(E21.1) |
-| REQ-RT-674 | runtime | v1-full | InteropProfile phải mô tả: required protocols supported schemas identity mechanism credential format security requirements data formats version constraints error semantics observability requirements | tasks/0911 §37 | - | EPIC(E21.1) |
-| REQ-RT-675 | runtime | v1-full | thông qua: MutualRecognition Mutual recognition phải có scope. | tasks/0911 §39 | - | EPIC(E21.1) |
-| REQ-RT-676 | runtime | v1-full | Accreditation AccreditationBody AccreditationScope AccreditationValidity Accreditation hết hạn phải được xử lý tự động. | tasks/0911 §40 | - | EPIC(E21.1) |
-| REQ-RT-677 | runtime | v1-full | Một entity có thể có: local identity A local identity B federated identity F nhưng chúng phải có provenance rõ ràng. | tasks/0911 §43 | - | EPIC(E21.1) |
-| REQ-RT-678 | runtime | v1-full | CrossOrgContract là contract giữa các organization. Phải xác định: parties obligations rights resources service levels termination dispute mechanism audit | tasks/0911 §44 | - | EPIC(E21.1) |
-| REQ-RT-679 | runtime | v1-full | --- Cross-org contract không được vượt: 603 639 640 664 665 | tasks/0911 §45 | - | EPIC(E21.1) |
-| REQ-RT-680 | runtime | v1-full | Contribution accounting phải tách khỏi quyền quyết định. | tasks/0911 §48 | - | EPIC(E21.1) |
-| REQ-RT-681 | runtime | v1-full | AllocationPlan Allocation Reservation Quota Allocation phải có: resource recipient quantity period authority purpose | tasks/0911 §49 | - | EPIC(E21.1) |
-| REQ-RT-682 | runtime | v1-full | --- Không được: allocate > available | tasks/0911 §50 | - | EPIC(E21.1) |
-| REQ-RT-683 | runtime | v1-full | Không được: allocate > available Không được: reserve > quota | tasks/0911 §50 | - | EPIC(E21.1) |
-| REQ-RT-684 | runtime | v1-full | reserve > quota trừ emergency policy explicit. Không được: contribution ⇒ unlimited governance power | tasks/0911 §50 | - | EPIC(E21.1) |
-| REQ-RT-685 | runtime | v1-full | FederationService phải có: service identity API version SLA authority resource budget security boundary | tasks/0911 §53 | - | EPIC(E21.1) |
-| REQ-RT-686 | runtime | v1-full | PolicyA PolicyB xung đột. 668 phải biểu diễn: PolicyConflict ConflictScope ApplicablePolicy ResolutionRule | tasks/0911 §55 | - | EPIC(E21.1) |
-| REQ-RT-687 | runtime | v1-full | Mediator không được tự động có enforcement authority. | tasks/0911 §58 | - | EPIC(E21.1) |
-| REQ-RT-688 | runtime | v1-full | ArbitrationCase Arbitrator ArbitrationSubmission ArbitrationAward Authority của arbitration phải đến từ: treaty contract federation rule explicit agreement | tasks/0911 §59 | - | EPIC(E21.1) |
-| REQ-RT-689 | runtime | v1-full | AppealCase AppealAuthority AppealEvidence AppealDecision Appeal phải có window và jurisdiction. | tasks/0911 §60 | - | EPIC(E21.1) |
-| REQ-RT-690 | runtime | v1-full | 668 không được giả định rằng mọi resolution đều có thể cưỡng chế. | tasks/0911 §61 | - | EPIC(E21.1) |
-| REQ-RT-691 | runtime | v1-full | 668 không được giả định rằng mọi resolution đều có thể cưỡng chế. Phải có: enforcement_authority enforcement_mechanism scope limits | tasks/0911 §61 | - | EPIC(E21.1) |
-| REQ-RT-692 | runtime | v1-full | Federation sanctions có thể gồm: service restriction resource restriction credential suspension membership suspension access restriction contract remedy accreditation suspension Không được bypass: 603 639 664 665 | tasks/0911 §62 | - | EPIC(E21.1) |
-| REQ-RT-693 | runtime | v1-full | Representation Representative DelegatedVote VotingWeight Mandate Representation phải có scope. | tasks/0911 §66 | - | EPIC(E21.1) |
-| REQ-RT-694 | runtime | v1-full | Một representative không được tự động đại diện cho tất cả mọi vấn đề. | tasks/0911 §66 | - | EPIC(E21.1) |
-| REQ-RT-695 | runtime | v1-full | Các semantics phải được explicit trong federation governance. | tasks/0911 §67 | - | EPIC(E21.1) |
-| REQ-RT-696 | runtime | v1-full | Nếu governance hỗ trợ veto: VetoScope VetoAuthority VetoCondition Veto phải giới hạn trong scope được khai báo. | tasks/0911 §69 | - | EPIC(E21.1) |
-| REQ-RT-697 | runtime | v1-full | Một member có thể được phép: OptOut Reservation Exception ProtocolExemption nhưng phải xác định: scope conditions cost consequences duration | tasks/0911 §70 | - | EPIC(E21.1) |
-| REQ-RT-698 | runtime | v1-full | --- Memory record phải giữ: source authority provenance version confidence status | tasks/0911 §72 | - | EPIC(E21.1) |
-| REQ-RT-699 | runtime | v1-full | --- Emergency coordination không được tự động bypass: 603 security 639 policy 664 safety 665 human oversight | tasks/0911 §78 | - | EPIC(E21.1) |
-| REQ-RT-700 | runtime | v1-full | FederationContinuityPlan phải xử lý: member failure coordinator failure secretariat failure network partition credential failure shared infrastructure failure resource exhaustion leadership failure mass exit | tasks/0911 §79 | - | EPIC(E21.1) |
-| REQ-RT-701 | runtime | v1-full | Các office như: Secretary Council Chair Emergency Coordinator Infrastructure Coordinator phải có succession. | tasks/0911 §80 | - | EPIC(E21.1) |
-| REQ-RT-702 | runtime | v1-full | FedA FedB ↓ FedC phải xác định: membership identity charter treaties protocols resources assets disputes memory authority | tasks/0911 §82 | - | EPIC(E21.1) |
-| REQ-RT-703 | runtime | v1-full | FedA ↓ FedB FedC phải xác định: membership allocation resource allocation treaty inheritance protocol inheritance shared assets historical lineage | tasks/0911 §83 | - | EPIC(E21.1) |
-| REQ-RT-704 | runtime | v1-full | Lifecycle: ACTIVE → WINDING_DOWN → DISSOLVED Phải xử lý: shared assets common resources contracts treaties credentials services memory disputes | tasks/0911 §84 | - | EPIC(E21.1) |
-| REQ-RT-705 | runtime | v1-full | --- Dissolution không được tự động: delete federation history | tasks/0911 §85 | - | EPIC(E21.1) |
-| REQ-RT-706 | runtime | v1-full | Dissolution không được tự động: delete federation history Historical records phải theo retention policy. | tasks/0911 §85 | - | EPIC(E21.1) |
-| REQ-RT-707 | runtime | v1-full | FederationIdentity phải tồn tại độc lập với: member organizations current council current secretariat current agents | tasks/0911 §86 | - | EPIC(E21.1) |
-| REQ-RT-708 | runtime | v1-full | Không được trộn ba lớp thành một scalar authority score. | tasks/0911 §87 | - | EPIC(E21.1) |
-| REQ-RT-709 | runtime | v1-full | Federation có thể phát hành accreditation: AccreditationIssue AccreditationRenew AccreditationSuspend AccreditationRevoke Accreditation phải có: issuer scope validity evidence verification | tasks/0911 §90 | - | EPIC(E21.1) |
-| REQ-RT-710 | runtime | v1-full | Certification CertificationAuthority CertificationProfile ConformanceTest Certification phải có tiêu chí kiểm thử rõ ràng. | tasks/0911 §91 | - | EPIC(E21.1) |
-| REQ-RT-711 | runtime | v1-full | Protocol compatibility phải có machine-checkable tests: schema validation message validation authentication authorization error handling version negotiation security performance envelope | tasks/0911 §92 | - | EPIC(E21.1) |
-| REQ-RT-712 | runtime | v1-full | Trace: OrgA ↓ Federation ↓ OrgB ↓ Service ↓ Agent phải giữ correlation ID. | tasks/0911 §94 | - | EPIC(E21.1) |
-| REQ-RT-713 | runtime | v1-full | Federation không được dùng một trust boundary duy nhất cho mọi member. | tasks/0911 §95 | - | EPIC(E21.1) |
-| REQ-RT-714 | runtime | v1-full | Federation không được dùng một trust boundary duy nhất cho mọi member. Mỗi member phải có: identity credential capability authority trust state | tasks/0911 §95 | - | EPIC(E21.1) |
-| REQ-RT-715 | runtime | v1-full | Nếu member credential bị revoke: credential.status = REVOKED mọi bridge phụ thuộc phải đánh giá lại. | tasks/0911 §96 | - | EPIC(E21.1) |
-| REQ-RT-716 | runtime | v1-full | credential.status = REVOKED mọi bridge phụ thuộc phải đánh giá lại. Không được tiếp tục vô thời hạn vì cached trust. | tasks/0911 §96 | - | EPIC(E21.1) |
-| REQ-RT-717 | runtime | v1-full | Protocol có thể: ACTIVE DEPRECATED SUSPENDED REVOKED Client phải biết protocol state. | tasks/0911 §97 | - | EPIC(E21.1) |
-| REQ-RT-718 | runtime | v1-full | Standard version mới không được tự động phá compatibility nếu profile không yêu cầu. | tasks/0911 §98 | - | EPIC(E21.1) |
-| REQ-RT-719 | runtime | v1-full | Standard version mới không được tự động phá compatibility nếu profile không yêu cầu. Phải hỗ trợ: compatibility matrix | tasks/0911 §98 | - | EPIC(E21.1) |
-| REQ-RT-720 | runtime | v1-full | --- Data sharing phải có: source owner/custodian purpose scope classification retention residency access policy | tasks/0911 §99 | - | EPIC(E21.1) |
-| REQ-RT-721 | runtime | v1-full | Federation có thể duy trì: CommonKnowledgeGraph nhưng mỗi assertion phải giữ: provenance issuer verification timestamp confidence | tasks/0911 §100 | - | EPIC(E21.1) |
-| REQ-RT-722 | runtime | v1-full | Nếu: OrgA says X OrgB says !X không được tự động merge thành: X ∧ !X = truth | tasks/0911 §101 | - | EPIC(E21.1) |
-| REQ-RT-723 | runtime | v1-full | CrossOrgPolicy PolicyConflict PolicyResolution phải có: scope issuer precedence effective time | tasks/0911 §103 | - | EPIC(E21.1) |
-| REQ-RT-724 | runtime | v1-full | --- Invariant quan trọng: FED-001: Federation membership MUST NOT imply unrestricted transfer of organizational authority. | tasks/0911 §105 | - | EPIC(E21.1) |
-| REQ-RT-725 | runtime | v1-full | ```text FED-001: Federation membership MUST NOT imply unrestricted transfer of organizational authority. ``` | tasks/0911 §105 | - | EPIC(E21.1) |
-| REQ-RT-726 | runtime | v1-full | ```text FED-002: Federation formation MUST NOT automatically create authority not explicitly granted. ``` | tasks/0911 §106 | - | EPIC(E21.1) |
-| REQ-RT-727 | runtime | v1-full | ```text FED-003: Federation membership MUST NOT manufacture technical capabilities. ``` | tasks/0911 §107 | - | EPIC(E21.1) |
-| REQ-RT-728 | runtime | v1-full | ```text FED-004: Federation authority MUST NOT override 664 safety constraints. ``` | tasks/0911 §108 | - | EPIC(E21.1) |
-| REQ-RT-729 | runtime | v1-full | ```text FED-005: Federation governance MUST respect 665 human-oversight requirements where applicable. ``` | tasks/0911 §109 | - | EPIC(E21.1) |
-| REQ-RT-730 | runtime | v1-full | ```text FED-006: Capability, authority, trust, accreditation, membership and reputation MUST remain distinct. ``` | tasks/0911 §110 | - | EPIC(E21.1) |
-| REQ-RT-731 | runtime | v1-full | ```text FED-007: Collective decision MUST NOT be represented as factual truth solely because a federation adopted it. ``` | tasks/0911 §111 | - | EPIC(E21.1) |
-| REQ-RT-732 | runtime | v1-full | ```text FED-008: A treaty MUST NOT automatically grant unavailable technical capability. ``` | tasks/0911 §112 | - | EPIC(E21.1) |
-| REQ-RT-733 | runtime | v1-full | ```text FED-009: Cross-organization contracts MUST NOT bypass safety constraints. ``` | tasks/0911 §113 | - | EPIC(E21.1) |
-| REQ-RT-734 | runtime | v1-full | ```text FED-010: Federation membership MUST NOT merge the identity of member organizations. ``` | tasks/0911 §114 | - | EPIC(E21.1) |
-| REQ-RT-735 | runtime | v1-full | ```text FED-011: Historical federation decisions MUST NOT be silently rewritten. ``` | tasks/0911 §115 | - | EPIC(E21.1) |
-| REQ-RT-736 | runtime | v1-full | ```text FED-012: Every federation authority MUST have an explicit scope. ``` | tasks/0911 §116 | - | EPIC(E21.1) |
-| REQ-RT-737 | runtime | v1-full | ```text FED-013: Time-bounded federation authority MUST expire automatically. ``` | tasks/0911 §117 | - | EPIC(E21.1) |
-| REQ-RT-738 | runtime | v1-full | ```text FED-014: Emergency authority MUST have an explicit expiration or review condition. ``` | tasks/0911 §118 | - | EPIC(E21.1) |
-| REQ-RT-739 | runtime | v1-full | ```text FED-015: Cross-organization delegation MUST NOT exceed delegator authority. ``` | tasks/0911 §119 | - | EPIC(E21.1) |
-| REQ-RT-740 | runtime | v1-full | ```text FED-016: Federation decisions requiring quorum MUST fail or enter the declared fallback state when quorum is absent. ``` | tasks/0911 §120 | - | EPIC(E21.1) |
-| REQ-RT-741 | runtime | v1-full | ```text FED-017: Representation MUST be scoped to the mandate granted to the representative. ``` | tasks/0911 §121 | - | EPIC(E21.1) |
-| REQ-RT-742 | runtime | v1-full | ```text FED-018: Veto authority MUST be scoped and MUST NOT become universal by default. ``` | tasks/0911 §122 | - | EPIC(E21.1) |
-| REQ-RT-743 | runtime | v1-full | ```text FED-019: Common-pool allocation MUST NOT exceed available capacity. ``` | tasks/0911 §123 | - | EPIC(E21.1) |
-| REQ-RT-744 | runtime | v1-full | ```text FED-020: Contribution MUST NOT automatically imply unrestricted governance authority. ``` | tasks/0911 §124 | - | EPIC(E21.1) |
-| REQ-RT-745 | runtime | v1-full | ```text FED-021: Shared assets MUST have an explicit custodian or governance mechanism. ``` | tasks/0911 §125 | - | EPIC(E21.1) |
-| REQ-RT-746 | runtime | v1-full | ```text FED-022: Mediation or arbitration MUST operate only within explicitly granted authority. ``` | tasks/0911 §126 | - | EPIC(E21.1) |
-| REQ-RT-747 | runtime | v1-full | ```text FED-023: A federation resolution MUST NOT imply enforcement capability unless an enforcement mechanism exists. ``` | tasks/0911 §127 | - | EPIC(E21.1) |
-| REQ-RT-748 | runtime | v1-full | ```text FED-024: Credential recognition MUST NOT imply identity merging. ``` | tasks/0911 §128 | - | EPIC(E21.1) |
-| REQ-RT-749 | runtime | v1-full | ```text FED-025: Mutual recognition MUST be scope-bound and revocable according to its policy. ``` | tasks/0911 §129 | - | EPIC(E21.1) |
-| REQ-RT-750 | runtime | v1-full | ```text FED-026: Protocol compatibility MUST be explicitly evaluated. ``` | tasks/0911 §130 | - | EPIC(E21.1) |
-| REQ-RT-751 | runtime | v1-full | ```text FED-027: Cross-organization data sharing MUST respect 640 governance constraints. ``` | tasks/0911 §131 | - | EPIC(E21.1) |
-| REQ-RT-752 | runtime | v1-full | ```text FED-028: Federation memory assertions MUST retain provenance. ``` | tasks/0911 §132 | - | EPIC(E21.1) |
-| REQ-RT-753 | runtime | v1-full | ```text FED-029: Unresolved cross-organization knowledge conflicts MUST remain explicitly represented. ``` | tasks/0911 §133 | - | EPIC(E21.1) |
-| REQ-RT-754 | runtime | v1-full | ```text FED-030: Federation dissolution MUST NOT silently erase mandatory historical records. ``` | tasks/0911 §134 | - | EPIC(E21.1) |
-| REQ-RT-755 | runtime | v1-full | --- Mỗi common resource phải có ít nhất: total committed reserved allocated consumed available | tasks/0911 §154 | - | EPIC(E21.1) |
-| REQ-RT-756 | runtime | v1-full | Mỗi common resource phải có ít nhất: total committed reserved allocated consumed available với invariant: available = total - committed - reserved - allocated - unavailable | tasks/0911 §154 | - | EPIC(E21.1) |
-| REQ-RT-757 | runtime | v1-full | --- Distributed federation state phải hỗ trợ: snapshot event log version epoch conflict detection reconciliation | tasks/0911 §155 | - | EPIC(E21.1) |
-| REQ-RT-758 | runtime | v1-full | Không được tự động giả định một mode là an toàn cho mọi federation. | tasks/0911 §156 | - | EPIC(E21.1) |
-| REQ-RT-759 | runtime | v1-full | Nếu governance yêu cầu quorum mà partition tạo hai nhóm đều tưởng mình có authority: AuthorityEpoch phải ngăn: epoch_A == epoch_B | tasks/0911 §157 | - | EPIC(E21.1) |
-| REQ-RT-760 | runtime | v1-full | Nếu shared service chết: service_failure federation phải có: fallback degraded_mode replacement manual_intervention | tasks/0911 §159 | - | EPIC(E21.1) |
-| REQ-RT-761 | runtime | v1-full | Organization có thể thuộc nhiều federation: OrgA ├── FederationX ├── FederationY └── FederationZ Các authority scope phải độc lập. | tasks/0911 §160 | - | EPIC(E21.1) |
-| REQ-RT-762 | runtime | v1-full | Nhưng authority chain vẫn phải được kiểm tra bằng intersection. | tasks/0911 §161 | - | EPIC(E21.1) |
-| REQ-RT-763 | runtime | v1-full | --- Authority resolution phải có: cycle detection depth limit delegation graph validation | tasks/0911 §162 | - | EPIC(E21.1) |
-| REQ-RT-764 | runtime | v1-full | Trust bridge: FederationA ↔ FederationB phải có: scope evidence expiry revocation | tasks/0911 §164 | - | EPIC(E21.1) |
-| REQ-RT-765 | runtime | v1-full | 668 có thể mô tả: CrossOrgCapability nhưng capability thực tế vẫn phải được cấp bởi 603-compatible security boundary. | tasks/0911 §166 | - | EPIC(E21.1) |
-| REQ-RT-766 | runtime | v1-full | Shared service có thể có: member_quota burst_quota emergency_quota priority_policy Priority policy phải explicit. | tasks/0911 §170 | - | EPIC(E21.1) |
-| REQ-RT-767 | runtime | v1-full | --- Audit phải kiểm tra: membership authority treaties protocols resources decisions disputes credentials emergencies | tasks/0911 §172 | - | EPIC(E21.1) |
-| REQ-RT-768 | runtime | v1-full | Khi accreditation bị suspend: dependent trust bridges phải có khả năng re-evaluate. | tasks/0911 §174 | - | EPIC(E21.1) |
-| REQ-RT-769 | runtime | v1-full | Không được giả định mọi downstream credential lập tức invalid nếu policy không quy định. | tasks/0911 §175 | - | EPIC(E21.1) |
-| REQ-RT-770 | runtime | v1-full | --- Critical decision phải replay được từ: proposal representation rules votes quorum authority resolution | tasks/0911 §176 | - | EPIC(E21.1) |
-| REQ-RT-771 | runtime | v1-full | --- Verifier độc lập phải có thể kiểm tra: quorum_valid vote_valid authority_valid rule_version_valid result_valid | tasks/0911 §177 | - | EPIC(E21.1) |
-| REQ-RT-772 | runtime | v1-full | Critical federation decision không được phụ thuộc vào hidden mutable state không thể audit. | tasks/0911 §178 | - | EPIC(E21.1) |
-| REQ-RT-773 | runtime | v1-full | AI có thể hỗ trợ deliberation, nhưng decision artifact phải có: evidence procedure authority result | tasks/0911 §178 | - | EPIC(E21.1) |
-| REQ-RT-774 | runtime | v1-full | Agent có thể đề xuất federation: FederationProposal nhưng việc tạo federation phải đi qua: 639 policy 647 AI governance 665 human oversight | tasks/0911 §181 | - | EPIC(E21.1) |
-| REQ-RT-775 | runtime | v1-full | --- Agent không được: spawn federation → acquire resources → acquire authority → acquire credentials | tasks/0911 §182 | - | EPIC(E21.1) |
-| REQ-RT-776 | runtime | v1-full | --- Ở quy mô lớn, federation memory phải hỗ trợ: partitioning indexing versioning retention provenance replication archival conflict resolution | tasks/0911 §183 | - | EPIC(E21.1) |
-| REQ-RT-777 | runtime | v1-full | --- Federation registry phải hỗ trợ query: find organizations supporting protocol X find shared resources available to member Y find active treaties involving Z find unresolved disputes find accredited services find compatible federation protocols | tasks/0911 §185 | - | EPIC(E21.1) |
-| REQ-RT-778 | runtime | v1-full | Ví dụ: policy.effective( federation, subject, operation, time ) phải trả: policy source version authority effective_time | tasks/0911 §186 | - | EPIC(E21.1) |
-| REQ-RT-779 | runtime | v1-full | Treaty có thể phụ thuộc: protocol credential standard resource organization federation Dependency graph phải detect: cycle missing dependency expired dependency revoked dependency | tasks/0911 §188 | - | EPIC(E21.1) |
-| REQ-RT-780 | runtime | v1-full | --- Protocol phải xác định: required protocol optional protocol minimum version maximum version security requirement | tasks/0911 §189 | - | EPIC(E21.1) |
-| REQ-RT-781 | runtime | v1-full | FederationSnapshot phải chứa: identity_version membership_version governance_version treaty_version protocol_version resource_version memory_version | tasks/0911 §192 | - | EPIC(E21.1) |
-| REQ-RT-782 | runtime | v1-full | --- Federation crash không được: double allocate resource double activate emergency authority double execute resolution | tasks/0911 §194 | - | EPIC(E21.1) |
-| REQ-RT-783 | runtime | v1-full | Các operation như: TreatyRatify ResourceAllocate ResolutionPublish MembershipAdmit EmergencyActivate phải hỗ trợ idempotent execution. | tasks/0911 §195 | - | EPIC(E21.1) |
-| REQ-RT-784 | runtime | v1-full | Không được đưa federation machinery vào mọi native executable. | tasks/0911 §196 | - | EPIC(E21.1) |
-| REQ-RT-785 | runtime | v1-full | --- Public ABI phải dùng stable opaque handles: FederationHandle TreatyHandle ProtocolHandle CommonsHandle DisputeHandle | tasks/0911 §199 | - | EPIC(E21.1) |
-| REQ-RT-786 | runtime | v1-full | Cross-platform adapters: Windows Linux macOS iOS Android WASM phải implement cùng semantic interface. | tasks/0911 §200 | - | EPIC(E21.1) |
-| REQ-RT-787 | runtime | v1-full | --- WASM profile phải hỗ trợ: AXFED_WASM | tasks/0911 §201 | - | EPIC(E21.1) |
-| REQ-RT-788 | runtime | v1-full | --- Mobile federation clients phải hỗ trợ: offline membership state credential cache event queue reconnection conflict resolution | tasks/0911 §202 | - | EPIC(E21.1) |
-| REQ-RT-789 | runtime | v1-full | Edge profile: AXFED_EDGE phải hỗ trợ: intermittent connectivity local cache partial federation state eventual synchronization | tasks/0911 §203 | - | EPIC(E21.1) |
-| REQ-RT-790 | runtime | v1-full | Sau partition: LOCAL_STATE + REMOTE_STATE phải được reconcile theo: epoch version authority event ordering conflict policy | tasks/0911 §204 | - | EPIC(E21.1) |
-| REQ-RT-791 | runtime | v1-full | Những operations có thể merge tự động phải được đánh dấu: @mergeable | tasks/0911 §205 | - | EPIC(E21.1) |
-| REQ-RT-792 | runtime | v1-full | Hai partition cùng tạo: Resolution A Resolution B thì không được tự động merge nếu chúng có overlapping authority. | tasks/0911 §206 | - | EPIC(E21.1) |
-| REQ-RT-793 | runtime | v1-full | Resolution A Resolution B thì không được tự động merge nếu chúng có overlapping authority. Phải tạo: GovernanceConflict | tasks/0911 §206 | - | EPIC(E21.1) |
-| REQ-RT-794 | runtime | v1-full | --- Emergency hoặc incident quan trọng phải có: IncidentReview | tasks/0911 §209 | - | EPIC(E21.1) |
-| REQ-RT-795 | runtime | v1-full | Không được tự động sửa constitution/treaty mà không qua amendment procedure. | tasks/0911 §210 | - | EPIC(E21.1) |
-| REQ-RT-796 | runtime | v1-full | --- Một federation không được coi: "I exist" | tasks/0911 §212 | - | EPIC(E21.1) |
-| REQ-RT-797 | runtime | v1-full | --- Federation không được tự động: create new members | tasks/0911 §213 | - | EPIC(E21.1) |
-| REQ-RT-798 | runtime | v1-full | Federation không được tự động clone chính nó thành federation khác với inherited authority. | tasks/0911 §214 | - | EPIC(E21.1) |
-| REQ-RT-799 | runtime | v1-full | Federation không được silently override global configuration. | tasks/0911 §218 | - | EPIC(E21.1) |
-| REQ-RT-800 | runtime | v1-full | --- BOOTSTRAP-668 phải có tối thiểu: 220 explicit invariants | tasks/0911 §222 | - | EPIC(E21.1) |
-| REQ-RT-801 | runtime | v1-full | BOOTSTRAP-668 phải có tối thiểu: ```text 220 explicit invariants ``` | tasks/0911 §222 | - | EPIC(E21.1) |
-| REQ-RT-802 | runtime | v1-full | --- Phải có test cho: unauthorized federation creation unauthorized admission expired membership revoked credential invalid treaty ratification insufficient quorum invalid representation authority escalation capability escalation resource over-allocation double reservation expired emergency authority cross-org policy conflict invalid arbitration unauthorized enforcement credential identity collision protocol incompatibility split-brain governance duplicate resolution duplicate resource allocation federation merge conflict federation split conflict dissolution data loss | tasks/0911 §224 | - | EPIC(E21.1) |
-| REQ-RT-803 | runtime | v1-full | --- Compiler phải chứng minh: AXFED_NONE | tasks/0911 §225 | - | EPIC(E21.1) |
-| REQ-RT-804 | runtime | v1-full | Các subsystem: AXFED_TREATY AXFED_INTEROP AXFED_COMMONS AXFED_DISPUTE AXFED_EMERGENCY phải được link độc lập. | tasks/0911 §225 | - | EPIC(E21.1) |
-| REQ-RT-805 | runtime | v1-full | --- Runtime phải chứng minh: organization autonomy authority boundaries treaty lifecycle protocol lifecycle resource accounting governance replay dispute lifecycle emergency expiry identity federation credential revocation distributed recovery | tasks/0911 §226 | - | EPIC(E21.1) |
-| REQ-RT-806 | runtime | v1-full | --- Không được có đường tắt: member → federation → unrestricted capability | tasks/0911 §227 | - | EPIC(E21.1) |
-| REQ-RT-807 | runtime | v1-full | Các operation được policy đánh dấu: human_required phải dừng trước execution cho tới khi có approval hợp lệ. | tasks/0911 §228 | - | EPIC(E21.1) |
-| REQ-RT-808 | runtime | v1-full | --- AI agent không được tự động: create federation grant itself authority grant itself credentials allocate unlimited common resources modify treaty without ratification extend emergency authority indefinitely | tasks/0911 §229 | - | EPIC(E21.1) |
-| REQ-RT-809 | runtime | v1-full | ```text BOOTSTRAP-668 Native AI Federation & Civilization-Scale Inter-Organizational Runtime STATUS = COMPLETE Target Tests >= 3,200 Target Invariants >= 220 ``` | tasks/0911 §231 | - | EPIC(E21.1) |
+| REQ-RT-188 | runtime | v1-full | BOOTSTRAP-665 tiếp tục từ 664, nhưng tách riêng **human oversight/control** khỏi safety enforcement: 664 quyết định runtime có an toàn/được phép hay không; 665 định nghĩa **khi nào con người phải tham gia, họ có quyền gì, can thiệp ra sao, chuyển quyền kiểm soát thế nào và hệ thống phải xử lý consent/approval/escalation như thế nào**. | tasks/0906 §1 | - | T900 |
+| REQ-RT-189 | runtime | v1-full | AI tạo proposal. Human phải: approve deny modify | tasks/0906 §7 | - | T900 |
+| REQ-RT-190 | runtime | v1-full | struct HumanActor { id: HumanId identity: IdentityRef roles: Role[] authorities: Authority[] availability: Availability session: SessionRef } Identity và authority phải tách biệt. | tasks/0906 §11 | - | T900 |
+| REQ-RT-191 | runtime | v1-full | --- Approval phải có thể expire. | tasks/0906 §21 | - | T900 |
+| REQ-RT-192 | runtime | v1-full | --- Approval phải invalid nếu: policy changes action changes risk changes beyond threshold environment changes authority expires model changes target changes | tasks/0906 §22 | - | T900 |
+| REQ-RT-193 | runtime | v1-full | approval exists + context changed = approval may be stale 665 phải kiểm tra freshness. | tasks/0906 §23 | - | T900 |
+| REQ-RT-194 | runtime | v1-full | consent.revoke(scope) Phải có effect semantics rõ: future actions pending actions active actions stored data | tasks/0906 §30 | - | T900 |
+| REQ-RT-195 | runtime | v1-full | --- Nếu policy yêu cầu, pending action phải bị: cancelled | tasks/0906 §31 | - | T900 |
+| REQ-RT-196 | runtime | v1-full | AI ↓ Human ↓ AI phải có state transition explicit. | tasks/0906 §36 | - | T900 |
+| REQ-RT-197 | runtime | v1-full | Có thể cho: AI + Human đồng thời điều khiển nhưng action ownership phải explicit. | tasks/0906 §39 | - | T900 |
+| REQ-RT-198 | runtime | v1-full | Veto có thể: current action current workflow current session future actions scope phải explicit. | tasks/0906 §43 | - | T900 |
+| REQ-RT-199 | runtime | v1-full | Timeout không mặc định là approval. Policy phải quy định: deny hold safe mode fallback escalate further | tasks/0906 §50 | - | T900 |
+| REQ-RT-200 | runtime | v1-full | --- Phải chống: AI → Human A Human A → Human B Human B → AI AI → Human A | tasks/0906 §51 | - | T900 |
+| REQ-RT-201 | runtime | v1-full | Human A → Human B → Agent C effective authority không được vượt authority root. | tasks/0906 §62 | - | T900 |
+| REQ-RT-202 | runtime | v1-full | Revoking parent delegation phải invalidate descendant delegations khi policy yêu cầu. | tasks/0906 §64 | - | T900 |
+| REQ-RT-203 | runtime | v1-full | Hai approvals từ cùng một authority chain có thể không được coi là independent. | tasks/0906 §68 | - | T900 |
+| REQ-RT-204 | runtime | v1-full | --- Runtime phải tránh race: approve approve approve | tasks/0906 §70 | - | T900 |
+| REQ-RT-205 | runtime | v1-full | Nếu: A = approve B = deny policy phải định nghĩa: deny-wins quorum role priority escalate | tasks/0906 §71 | - | T900 |
+| REQ-RT-206 | runtime | v1-full | --- Approval UI/runtime phải có structured evidence: action goal risk constraints policy model expected effects uncertainty alternatives | tasks/0906 §75 | - | T900 |
+| REQ-RT-207 | runtime | v1-full | --- Explanation phải phân biệt: observed predicted inferred assumed unknown | tasks/0906 §77 | - | T900 |
+| REQ-RT-208 | runtime | v1-full | UI chỉ là một interface. Approval phải có canonical runtime record. | tasks/0906 §79 | - | T900 |
+| REQ-RT-209 | runtime | v1-full | --- Critical approval phải authenticated. | tasks/0906 §81 | - | T900 |
+| REQ-RT-210 | runtime | v1-full | Approval token phải có integrity protection khi required. | tasks/0906 §82 | - | T900 |
+| REQ-RT-211 | runtime | v1-full | --- Approval token không được replay ngoài scope. | tasks/0906 §83 | - | T900 |
+| REQ-RT-212 | runtime | v1-full | --- Human oversight UI phải hỗ trợ: keyboard screen reader high contrast large text alternative input | tasks/0906 §88 | - | T900 |
+| REQ-RT-213 | runtime | v1-full | Các trạng thái: Delivered Seen Acknowledged Approved Denied phải khác nhau. | tasks/0906 §92 | - | T900 |
+| REQ-RT-214 | runtime | v1-full | Có thể record: request_presented request_seen request_opened decision_made nhưng không được suy diễn rằng "seen = understood". | tasks/0906 §93 | - | T900 |
+| REQ-RT-215 | runtime | v1-full | Không được dùng để suy đoán trạng thái sức khỏe hoặc năng lực của một người. | tasks/0906 §97 | - | T900 |
+| REQ-RT-216 | runtime | v1-full | --- Priority phải policy-defined. | tasks/0906 §105 | - | T900 |
+| REQ-RT-217 | runtime | v1-full | --- Review queue phải có starvation policy. | tasks/0906 §107 | - | T900 |
+| REQ-RT-218 | runtime | v1-full | Có thể batch các action: same policy same scope same risk class nhưng batch approval phải explicit. | tasks/0906 §109 | - | T900 |
+| REQ-RT-219 | runtime | v1-full | Một action thay đổi vượt batch scope phải re-approve. | tasks/0906 §111 | - | T900 |
+| REQ-RT-220 | runtime | v1-full | Consent revoke phải propagate tới dependent workflows. | tasks/0906 §115 | - | T900 |
+| REQ-RT-221 | runtime | v1-full | Multi-tenant oversight phải enforce tenant boundary. | tasks/0906 §120 | - | T900 |
+| REQ-RT-222 | runtime | v1-full | Khi identity revoked: pending approvals delegations control tokens phải được policy xử lý. | tasks/0906 §121 | - | T900 |
+| REQ-RT-223 | runtime | v1-full | Session termination phải invalidate session-bound approval/control tokens. | tasks/0906 §123 | - | T900 |
+| REQ-RT-224 | runtime | v1-full | Emergency mode có thể rút ngắn workflow nhưng vẫn phải: authenticated scoped audited | tasks/0906 §126 | - | T900 |
+| REQ-RT-225 | runtime | v1-full | Mọi: take_control release_control modify override approve deny đều phải audit theo policy. | tasks/0906 §128 | - | T900 |
+| REQ-RT-226 | runtime | v1-full | --- Hệ thống phải phân biệt: AI proposed Human approved System executed | tasks/0906 §132 | - | T900 |
+| REQ-RT-227 | runtime | v1-full | Collaborative execution có thể có nhiều actors. Attribution phải granular. | tasks/0906 §133 | - | T900 |
+| REQ-RT-228 | runtime | v1-full | Human có thể tạo action trực tiếp. Vẫn phải qua: 603 639 664 | tasks/0906 §135 | - | T900 |
+| REQ-RT-229 | runtime | v1-full | --- AI không được tạo: HumanApproval | tasks/0906 §137 | - | T900 |
+| REQ-RT-230 | runtime | v1-full | Test environment có thể dùng synthetic approvals nhưng metadata phải: synthetic = true | tasks/0906 §138 | - | T900 |
+| REQ-RT-231 | runtime | v1-full | Không được coi synthetic approval là real human approval trong strict profile. | tasks/0906 §139 | - | T900 |
+| REQ-RT-232 | runtime | v1-full | 648 có thể mô phỏng human. 665 phải distinguish: simulated_human real_human | tasks/0906 §140 | - | T900 |
+| REQ-RT-233 | runtime | v1-full | Human approval records có thể trở thành training data nhưng phải qua: 640 privacy 647 governance 662 learning policy | tasks/0906 §141 | - | T900 |
+| REQ-RT-234 | runtime | v1-full | Human có thể sửa: plan parameters target constraints AI phải revalidate. | tasks/0906 §148 | - | T900 |
+| REQ-RT-235 | runtime | v1-full | Human có thể lock một phần plan: @human_locked AI không được sửa phần đó. | tasks/0906 §150 | - | T900 |
+| REQ-RT-236 | runtime | v1-full | Human có thể thêm temporary constraint: @human_constraint nhưng phải nằm trong authority scope. | tasks/0906 §151 | - | T900 |
+| REQ-RT-237 | runtime | v1-full | --- Temporary policy phải có expiration. | tasks/0906 §154 | - | T900 |
+| REQ-RT-238 | runtime | v1-full | Temporary override không được persist indefinitely. | tasks/0906 §155 | - | T900 |
+| REQ-RT-239 | runtime | v1-full | handoff(from, to) phải atomic nếu system yêu cầu. | tasks/0906 §156 | - | T900 |
+| REQ-RT-240 | runtime | v1-full | Sender không được release control trước khi policy-required receiver acknowledgement. | tasks/0906 §159 | - | T900 |
+| REQ-RT-241 | runtime | v1-full | Compiler/runtime phải detect nếu impossible assignment. | tasks/0906 §163 | - | T900 |
+| REQ-RT-242 | runtime | v1-full | Có thể chọn: role expertise availability authority workload nhưng routing không được thay authority. | tasks/0906 §169 | - | T900 |
+| REQ-RT-243 | runtime | v1-full | Không được suy diễn expertise từ protected/sensitive personal characteristics. | tasks/0906 §170 | - | T900 |
+| REQ-RT-244 | runtime | v1-full | --- Có thể yêu cầu consensus nhưng phải define: unanimity quorum weighted authority | tasks/0906 §173 | - | T900 |
+| REQ-RT-245 | runtime | v1-full | Nếu dùng weighted authority: weight phải policy-defined và auditable. | tasks/0906 §174 | - | T900 |
+| REQ-RT-246 | runtime | v1-full | --- Trust model phải versioned. | tasks/0906 §177 | - | T900 |
+| REQ-RT-247 | runtime | v1-full | --- 665 phải hỗ trợ: confirmation preview undo rollback second approval | tasks/0906 §182 | - | T900 |
+| REQ-RT-248 | runtime | v1-full | UI có thể show: before after nhưng prediction phải marked as predicted. | tasks/0906 §189 | - | T900 |
+| REQ-RT-249 | runtime | v1-full | Approval UI có thể present: A B C nhưng system không được rank alternatives as "best" unless caller explicitly requests an optimization algorithm; even then ranking is machine-generated decision support, not human authority. | tasks/0906 §191 | - | T900 |
+| REQ-RT-250 | runtime | v1-full | Large action sets có thể: group summarize filter nhưng summary phải preserve material risk/constraint information. | tasks/0906 §193 | - | T900 |
+| REQ-RT-251 | runtime | v1-full | Không được hide critical safety constraint chỉ vì UI simplification. | tasks/0906 §194 | - | T901 |
+| REQ-RT-252 | runtime | v1-full | --- Critical alert không được silently suppressed. | tasks/0906 §198 | - | T901 |
+| REQ-RT-253 | runtime | v1-full | --- Human approval không được bypass final 664 check. | tasks/0906 §212 | - | T901 |
+| REQ-RT-254 | runtime | v1-full | --- Authority phải được kiểm tra: at request at approval at commit | tasks/0906 §213 | - | T901 |
+| REQ-RT-255 | runtime | v1-full | --- Consent không được dùng như: capability authorization safety override | tasks/0906 §216 | - | T901 |
+| REQ-RT-256 | runtime | v1-full | --- Delegation không được vượt quyền delegator. | tasks/0906 §217 | - | T901 |
+| REQ-RT-257 | runtime | v1-full | --- Escalation không được biến: unknown | tasks/0906 §218 | - | T901 |
+| REQ-RT-258 | runtime | v1-full | --- Timeout không được tự động đồng nghĩa approval. | tasks/0906 §219 | - | T901 |
+| REQ-RT-259 | runtime | v1-full | --- Human modification phải re-run: 663 relevant evaluation 664 safety 603 capability 639 policy | tasks/0906 §220 | - | T901 |
+| REQ-RT-260 | runtime | v1-full | --- Approval phải biết: who under which authority for what under which policy when until when | tasks/0906 §221 | - | T901 |
+| REQ-RT-261 | runtime | v1-full | --- Axiom phải phân biệt: proposed_by approved_by executed_by supervised_by | tasks/0906 §222 | - | T901 |
+| REQ-RT-262 | runtime | v1-full | --- Synthetic human actions phải được đánh dấu. | tasks/0906 §224 | - | T901 |
+| REQ-RT-263 | runtime | v1-full | --- Critical oversight actions phải traceable. | tasks/0906 §225 | - | T901 |
+| REQ-RT-264 | runtime | v1-full | --- Oversight records phải tuân theo 640. | tasks/0906 §226 | - | T901 |
+| REQ-RT-265 | runtime | v1-full | Human identity/authentication phải đi qua 627/603. | tasks/0906 §227 | - | T901 |
+| REQ-RT-266 | runtime | v1-full | --- Oversight policy lifecycle phải qua 647. | tasks/0906 §228 | - | T901 |
+| REQ-RT-267 | runtime | v1-full | Không được dùng social inference để cấp authority ngoài policy. | tasks/0906 §234 | - | T901 |
+| REQ-RT-268 | runtime | v1-full | 659 có thể biểu diễn urgency/affect nhưng không được tự tạo approval authority. | tasks/0906 §235 | - | T901 |
+| REQ-RT-269 | runtime | v1-full | --- 660 không được tự quyết định: "I am now authorized." | tasks/0906 §236 | - | T901 |
+| REQ-RT-270 | runtime | v1-full | Authority phải đến từ external policy/authority chain. | tasks/0906 §236 | - | T901 |
+| REQ-RT-271 | runtime | v1-full | 661 có thể request human approval nhưng không được giả mạo approval. | tasks/0906 §238 | - | T901 |
+| REQ-RT-272 | runtime | v1-full | Human A Service 1 Agent 2 có thể cùng tham gia một workflow. Oversight provenance phải distributed-traceable. | tasks/0906 §239 | - | T901 |
+| REQ-RT-273 | runtime | v1-full | --- Approval phải có: issuer policy_epoch authority_epoch timestamp nonce | tasks/0906 §240 | - | T901 |
+| REQ-RT-274 | runtime | v1-full | --- Offline approval phải có expiration và scope. | tasks/0906 §244 | - | T901 |
+| REQ-RT-275 | runtime | v1-full | --- Distributed approval phải xử lý clock skew. | tasks/0906 §245 | - | T901 |
+| REQ-RT-276 | runtime | v1-full | Approval nonce + request identity phải chống replay. | tasks/0906 §246 | - | T901 |
+| REQ-RT-277 | runtime | v1-full | Critical control events phải có ordering semantics. | tasks/0906 §248 | - | T901 |
+| REQ-RT-278 | runtime | v1-full | --- Không được có: old controller released new controller not granted | tasks/0906 §249 | - | T901 |
+| REQ-RT-279 | runtime | v1-full | --- 665 phải defend against: AI-generated misleading approval context | tasks/0906 §254 | - | T901 |
+| REQ-RT-280 | runtime | v1-full | --- Critical evidence phải integrity-protected. | tasks/0906 §257 | - | T901 |
+| REQ-RT-281 | runtime | v1-full | Không bắt buộc human phải cung cấp hidden/private reasoning. | tasks/0906 §258 | - | T901 |
+| REQ-RT-282 | runtime | v1-full | --- Compiler phải phát hiện: approval required but no approver authority | tasks/0906 §262 | - | T901 |
+| REQ-RT-283 | runtime | v1-full | Nếu: all humans unavailable no fallback action required strict profile phải reject configuration. | tasks/0906 §264 | - | T901 |
+| REQ-RT-284 | runtime | v1-full | --- Compiler/runtime phải detect: AI waits human human waits AI | tasks/0906 §265 | - | T901 |
+| REQ-RT-285 | runtime | v1-full | --- Multi-party approval phải có timeout/fallback. | tasks/0906 §266 | - | T901 |
+| REQ-RT-286 | runtime | v1-full | --- Critical workflow phải có defined: human_available human_unavailable communication_failure | tasks/0906 §267 | - | T901 |
+| REQ-RT-287 | runtime | v1-full | Nested workflow phải inherit oversight constraints từ parent nếu policy yêu cầu. | tasks/0906 §270 | - | T901 |
+| REQ-RT-288 | runtime | v1-full | Child agent không được giảm oversight requirement của parent. | tasks/0906 §271 | - | T901 |
+| REQ-RT-289 | runtime | v1-full | --- 623 plugin không được tự tạo human authority. | tasks/0906 §273 | - | T901 |
+| REQ-RT-290 | runtime | v1-full | 624 script: approve() không phải human approval. | tasks/0906 §275 | - | T901 |
+| REQ-RT-291 | runtime | v1-full | --- Automation phải distinguish: automated approval human approval | tasks/0906 §276 | - | T901 |
+| REQ-RT-292 | runtime | v1-full | A policy có thể permit pre-authorized auto-approval cho low-risk actions, nhưng đó phải được biểu diễn là: policy_authorized_automation | tasks/0906 §277 | - | T901 |
+| REQ-RT-293 | runtime | v1-full | A policy có thể permit pre-authorized auto-approval cho low-risk actions, nhưng đó phải được biểu diễn là: policy_authorized_automation không phải giả human approval. | tasks/0906 §277 | - | T901 |
+| REQ-RT-294 | runtime | v1-full | --- Canonical serialization phải stable. | tasks/0906 §283 | - | T901 |
+| REQ-RT-295 | runtime | v1-full | --- Control token phải chống: forgery replay confusion | tasks/0906 §285 | - | T901 |
+| REQ-RT-296 | runtime | v1-full | UI button: Approve không phải authority itself. | tasks/0906 §286 | - | T901 |
+| REQ-RT-297 | runtime | v1-full | --- 665 phải hoạt động không cần GUI. | tasks/0906 §287 | - | T901 |
+| REQ-RT-298 | runtime | v1-full | axiom approval approve <id> phải qua same runtime authorization. | tasks/0906 §288 | - | T901 |
+| REQ-RT-299 | runtime | v1-full | API approval phải canonicalize với CLI/UI semantics. | tasks/0906 §289 | - | T901 |
+| REQ-RT-300 | runtime | v1-full | UI/CLI/API không được tạo các loại approval semantics khác nhau nếu cùng policy. | tasks/0906 §290 | - | T901 |
+| REQ-RT-301 | runtime | v1-full | 1. Human identity phải authenticated khi required. 2. Human role không tự cấp authority. 3. Authority phải scoped. 4. Authority phải expirable khi policy yêu cầu. 5. Authority không vượt parent authority. 6. Delegation không được privilege-escalate. 7. Revoked authority phải invalidate dependent tokens. 8. Expired authority không được approve. 9. Approval không tạo capability. 10. Approval không bypass hard safety. 11. Human action vẫn phải qua applicable policy. 12. Human action vẫn phải qua applicable capability checks. 13. Human action vẫn phải qua applicable safety checks. 14. AI không được impersonate human. 15. Synthetic approval phải marked. | tasks/0906 §292 | - | T901 |
+| REQ-RT-302 | runtime | v1-full | 16. Approval phải bind request. 17. Approval phải bind actor. 18. Approval phải bind authority. 19. Approval phải bind scope. 20. Approval phải bind policy revision khi required. 21. Approval phải bind safety revision khi required. 22. Approval có expiration khi required. 23. Stale approval phải detectable. 24. Material action change invalidates approval. 25. Critical context change có thể invalidate approval. 26. Approval replay phải bị ngăn. 27. Duplicate approval phải idempotent. 28. Timeout không tự approve. 29. Denial phải explicit. 30. Modification phải revalidate. 31. Approval provenance phải preserve. 32. Approval audit phải immutable/integrity-protected khi required. 33. Approval conflict phải policy-defined. 34. Quorum phải explicit. 35. Separation of duties phải enforce. | tasks/0906 §293 | - | T901 |
+| REQ-RT-303 | runtime | v1-full | 36. Consent phải scope. 37. Consent phải purpose-bound. 38. Consent có thể expire. 39. Consent có thể revoke. 40. Revocation semantics phải explicit. 41. Consent không phải capability. 42. Consent không phải authorization. 43. Consent không phải safety override. 44. Consent không tự áp dụng cho subject/resource ngoài scope. 45. Consent provenance phải preserve. | tasks/0906 §294 | - | T901 |
+| REQ-RT-304 | runtime | v1-full | 46. Control holder phải explicit. 47. Control scope phải explicit. 48. Control token phải expire khi required. 49. Control transfer phải authenticated. 50. Transfer phải atomic khi required. 51. Release không được xảy ra trước handoff acceptance khi policy cấm. 52. Control token replay phải prevented. 53. Revoked control phải stop authority. 54. Human-controlled mode cấm autonomous commit. 55. Autonomous mode vẫn chịu 603/639/664. 56. Shared control phải define conflict resolution. 57. Multiple controllers phải define ownership. 58. Emergency control phải scope. 59. Emergency authority phải authenticated. 60. Control state phải auditable. | tasks/0906 §295 | - | T901 |
+| REQ-RT-305 | runtime | v1-full | 81. Intervention actor identified. 82. Intervention authority checked. 83. Intervention scope checked. 84. Intervention must pass safety checks. 85. Intervention cannot silently mutate action. 86. Intervention modification creates new action revision. 87. Intervention trace preserved. 88. Emergency intervention has bounded semantics. 89. Intervention failure has fallback. 90. Repeated failed intervention triggers escalation when policy requires. | tasks/0906 §298 | - | T901 |
+| REQ-RT-306 | runtime | v1-full | 106. 665 cannot bypass 664. 107. 665 cannot bypass 603. 108. 665 cannot redefine 639 authority. 109. 665 cannot replace 647 governance. 110. 665 consumes 663 evidence. 111. 665 can trigger 663 evaluation. 112. 665 can request 648 simulation. 113. 665 can use 650 history. 114. 665 can use 651 personalization only within policy. 115. 665 can use 658 interaction. 116. 665 can use 659 affect signals without treating them as authority. 117. 665 can use 660 self-model without granting self-authority. 118. 665 can receive 661 goals. 119. 665 can constrain 661 actions. 120. 665 can supervise 662 updates. 121. 665 can route 644 agents. 122. 665 must preserve 640 privacy. 123. 665 must preserve 627 identity. 124. 665 must preserve 610 cryptographic integrity. 125. 665 must preserve 633 observability. | tasks/0906 §300 | - | T901 |
+| REQ-RT-307 | runtime | v1-full | 126. Distributed approvals require identity. 127. Distributed approvals require revision. 128. Distributed approvals require replay protection. 129. Policy epoch must be detectable. 130. Stale approval must be detectable. 131. Partition behavior must be defined. 132. Offline approval must be bounded. 133. Clock uncertainty must be handled. 134. Event duplication must be handled. 135. Event ordering must be defined. 136. Cross-node control transfer must be atomic when required. 137. Authority revocation must propagate. 138. Global emergency authority must be scoped. 139. Quorum must be explicit. 140. Consensus requirement must be explicit. | tasks/0906 §301 | - | T901 |
+| REQ-RT-308 | runtime | v1-full | 141. Oversight data follows 640. 142. Evidence access follows authority. 143. Reviewer cannot access unrelated tenant data. 144. Approval logs can be redacted where policy permits. 145. Redaction cannot destroy required audit semantics. 146. Consent records have access control. 147. Human feedback has provenance. 148. Training reuse requires policy. 149. Personalization cannot expose restricted data. 150. Oversight analytics must respect declared data scope. | tasks/0906 §302 | - | T901 |
+| REQ-RT-309 | runtime | v1-full | 151. Unknown oversight annotation must fail or be explicitly ignored by profile. 152. Invalid authority reference must be detected. 153. Impossible approval quorum must be detected. 154. Missing fallback must be detected in strict profiles. 155. Unreachable escalation terminal must be detected. 156. Control cycle must be detected where statically possible. 157. Unsafe human override must be rejected. 158. Human-controlled workflow cannot compile to autonomous commit. 159. Approval-required workflow must contain approval path. 160. Critical action must have required oversight metadata. 161. Static oversight checks may be optimized. 162. Dynamic authority checks must remain. 163. Approval semantics cannot be optimized away. 164. Audit-required events cannot be silently stripped. 165. Synthetic approval metadata must survive test artifacts. | tasks/0906 §303 | - | T901 |
+| REQ-RT-310 | runtime | v1-full | 166. Runtime authority is rechecked when required. 167. Approval freshness is checked before commit. 168. Control token validity is checked before controlled action. 169. Consent validity is checked when required. 170. Policy revision is checked when required. 171. Safety revision is checked when required. 172. Context changes can invalidate approval. 173. Human unavailability invokes defined fallback. 174. Human timeout invokes defined fallback. 175. Approval service failure invokes defined fallback. 176. Notification failure does not imply approval. 177. UI failure does not imply approval. 178. Network failure does not imply approval. 179. Runtime must preserve attribution. 180. Runtime must preserve oversight trace. | tasks/0906 §304 | - | T901 |
+| REQ-RT-311 | runtime | v1-full | ```text 603 = WHAT THE ACTOR IS CAPABLE OF DOING 639 = WHAT POLICY AUTHORIZES 661 = WHAT THE SYSTEM WANTS TO ACHIEVE 662 = HOW THE SYSTEM LEARNS / ADAPTS 663 = WHETHER THE SYSTEM MEETS DECLARED CRITERIA 664 = WHETHER THIS ACTION IS SAFE RIGHT NOW 665 = WHETHER / HOW HUMAN AUTHORITY MUST PARTICIPATE 647 = WHETHER THE SYSTEM LIFECYCLE IS GOVERNED / APPROVED ``` | tasks/0906 §307 | - | T901 |
+| REQ-RT-312 | runtime | v1-full | --- Axiom không được biến: Human Approval = Execute | tasks/0906 §309 | - | T901 |
+| REQ-RT-313 | runtime | v1-full | Human có thể quyết định trong phạm vi authority của họ. AI không được: infer authority fabricate consent fabricate approval self-assign controller self-promote reviewer | tasks/0906 §310 | - | T901 |
+| REQ-RT-314 | runtime | v1-full | Axiom nên xem Human Oversight là một **control-plane primitive**, không phải UI feature. | tasks/0906 §313 | - | T901 |
+| REQ-RT-315 | runtime | v1-full | Tiếp tục chuỗi kiến trúc. BOOTSTRAP-666 sẽ xây lớp **multi-agent** trên nền 644 + 665: nhiều AI agent có thể phối hợp, thương lượng, giao việc, ký contract, đánh giá trust/reputation và hình thành collective intelligence, nhưng **không được tự phát sinh authority vượt 603/639/664/665**. | tasks/0907 §1 | - | T902 |
+| REQ-RT-316 | runtime | v1-full | Mục tiêu không phải tạo "xã hội AI" theo nghĩa có nhân cách hay quyền lợi. | tasks/0907 §1 | - | T902 |
+| REQ-RT-317 | runtime | v1-full | --- Discovery result phải có freshness metadata. | tasks/0907 §11 | - | T902 |
+| REQ-RT-318 | runtime | v1-full | Revoked identity không được tham gia new contracts. | tasks/0907 §15 | - | T902 |
+| REQ-RT-319 | runtime | v1-full | Human ↓ Agent A ↓ Agent B ↓ Agent C Authority phải remain bounded. | tasks/0907 §24 | - | T902 |
+| REQ-RT-320 | runtime | v1-full | --- Role assignment phải explicit. | tasks/0907 §34 | - | T902 |
+| REQ-RT-321 | runtime | v1-full | --- Role phải được map qua policy. | tasks/0907 §36 | - | T902 |
+| REQ-RT-322 | runtime | v1-full | --- Bid không phải contract. | tasks/0907 §38 | - | T902 |
+| REQ-RT-323 | runtime | v1-full | --- Bid phải có expiry. | tasks/0907 §39 | - | T902 |
+| REQ-RT-324 | runtime | v1-full | --- 666 phải phát hiện hoặc timeout negotiation loop. | tasks/0907 §45 | - | T902 |
+| REQ-RT-325 | runtime | v1-full | Agent có thể optimize: cost time quality risk resource utility nhưng không được vi phạm hard constraints. | tasks/0907 §46 | - | T902 |
+| REQ-RT-326 | runtime | v1-full | Trước commit: identity capability authority policy safety resource phải được kiểm tra theo profile. | tasks/0907 §51 | - | T902 |
+| REQ-RT-327 | runtime | v1-full | --- Các parties phải authorize amendment. | tasks/0907 §54 | - | T902 |
+| REQ-RT-328 | runtime | v1-full | --- ```axiom @contract_invariant ``` | tasks/0907 §59 | - | T902 |
+| REQ-RT-329 | runtime | v1-full | --- Termination semantics phải explicit. | tasks/0907 §69 | - | T902 |
+| REQ-RT-330 | runtime | v1-full | Mọi reputation score phải truy được evidence source. | tasks/0907 §77 | - | T902 |
+| REQ-RT-331 | runtime | v1-full | --- Weighting phải model-defined và versioned. | tasks/0907 §83 | - | T902 |
+| REQ-RT-332 | runtime | v1-full | Một failure không nhất thiết chứng minh malicious behavior. Reputation model phải phân biệt: failure unreliability policy violation safety violation intentional misconduct | tasks/0907 §84 | - | T902 |
+| REQ-RT-333 | runtime | v1-full | 666 phải hỗ trợ identity-level protections chống tạo hàng loạt agent giả. | tasks/0907 §86 | - | T902 |
+| REQ-RT-334 | runtime | v1-full | --- Phải chống: self-review collusive reviews fake contracts sybil reputation | tasks/0907 §88 | - | T902 |
+| REQ-RT-335 | runtime | v1-full | Trust có thể decay theo thời gian. Model phải explicit. | tasks/0907 §90 | - | T902 |
+| REQ-RT-336 | runtime | v1-full | --- Có thể hỗ trợ nhưng phải explicit model. | tasks/0907 §93 | - | T902 |
+| REQ-RT-337 | runtime | v1-full | --- Knowledge phải giữ source provenance. | tasks/0907 §99 | - | T902 |
+| REQ-RT-338 | runtime | v1-full | --- Weight phải policy-defined. | tasks/0907 §104 | - | T902 |
+| REQ-RT-339 | runtime | v1-full | Consensus failure không được biến thành silent approval. | tasks/0907 §107 | - | T902 |
+| REQ-RT-340 | runtime | v1-full | --- Quorum phải explicit. | tasks/0907 §108 | - | T902 |
+| REQ-RT-341 | runtime | v1-full | --- Team phải có: backup coordinator reelection safe suspension | tasks/0907 §110 | - | T902 |
+| REQ-RT-342 | runtime | v1-full | --- 666 phải hỗ trợ detection/isolation signals. | tasks/0907 §111 | - | T902 |
+| REQ-RT-343 | runtime | v1-full | Không yêu cầu mọi deployment phải Byzantine tolerant. | tasks/0907 §111 | - | T902 |
+| REQ-RT-344 | runtime | v1-full | --- Aggregate result vẫn phải qua 664. | tasks/0907 §120 | - | T902 |
+| REQ-RT-345 | runtime | v1-full | --- Cycles phải explicit loop construct. | tasks/0907 §135 | - | T902 |
+| REQ-RT-346 | runtime | v1-full | --- Runtime phải detect/timeout impossible waits. | tasks/0907 §136 | - | T902 |
+| REQ-RT-347 | runtime | v1-full | Duplicate delivery không được tạo duplicate side effect nếu task idempotent profile yêu cầu. | tasks/0907 §141 | - | T902 |
+| REQ-RT-348 | runtime | v1-full | Replacement agent phải revalidate capability and authority. | tasks/0907 §145 | - | T902 |
+| REQ-RT-349 | runtime | v1-full | --- Evidence phải provenance-aware. | tasks/0907 §151 | - | T902 |
+| REQ-RT-350 | runtime | v1-full | --- Agent không phải reveal private internal state. | tasks/0907 §152 | - | T902 |
+| REQ-RT-351 | runtime | v1-full | --- Negotiation payload phải obey: 603 639 640 | tasks/0907 §153 | - | T902 |
+| REQ-RT-352 | runtime | v1-full | --- Agent claim phải distinguish: verified declared estimated unknown | tasks/0907 §155 | - | T902 |
+| REQ-RT-353 | runtime | v1-full | Agent proposal có thể có confidence. Confidence không phải guarantee. | tasks/0907 §156 | - | T902 |
+| REQ-RT-354 | runtime | v1-full | --- Contract guarantee phải explicit and enforceable. | tasks/0907 §157 | - | T902 |
+| REQ-RT-355 | runtime | v1-full | --- Prediction không phải commitment. | tasks/0907 §158 | - | T902 |
+| REQ-RT-356 | runtime | v1-full | --- Revocation phải follow contract. | tasks/0907 §160 | - | T902 |
+| REQ-RT-357 | runtime | v1-full | --- Recovery phải reauthenticate/revalidate. | tasks/0907 §167 | - | T902 |
+| REQ-RT-358 | runtime | v1-full | Policy phải định nghĩa existing contracts khi quarantine. | tasks/0907 §170 | - | T902 |
+| REQ-RT-359 | runtime | v1-full | Child policy không được widen parent hard constraints. | tasks/0907 §174 | - | T902 |
+| REQ-RT-360 | runtime | v1-full | --- Shared memory phải có owner/access policy. | tasks/0907 §182 | - | T902 |
+| REQ-RT-361 | runtime | v1-full | 666 phải hỗ trợ detection signals cho poisoned shared knowledge. | tasks/0907 §183 | - | T902 |
+| REQ-RT-362 | runtime | v1-full | Repeated false reports không được tạo reputation change không kiểm chứng. | tasks/0907 §185 | - | T902 |
+| REQ-RT-363 | runtime | v1-full | --- Coalition không được tự tăng member authority. | tasks/0907 §188 | - | T902 |
+| REQ-RT-364 | runtime | v1-full | --- Dissolution phải xử lý: active tasks contracts resources shared state | tasks/0907 §189 | - | T902 |
+| REQ-RT-365 | runtime | v1-full | --- Phải biết: who proposed who voted what evidence what rule | tasks/0907 §191 | - | T903 |
+| REQ-RT-366 | runtime | v1-full | Decision output vẫn phải pass policy/capability/safety. | tasks/0907 §192 | - | T903 |
+| REQ-RT-367 | runtime | v1-full | Có thể require: 2 agents + 1 human nhưng authority semantics phải explicit. | tasks/0907 §197 | - | T903 |
+| REQ-RT-368 | runtime | v1-full | Canonical contract representation must be hashable. | tasks/0907 §204 | - | T903 |
+| REQ-RT-369 | runtime | v1-full | Two incompatible commits must not both become canonical. | tasks/0907 §209 | - | T903 |
+| REQ-RT-370 | runtime | v1-full | --- Remote identity must use 627/610 as applicable. | tasks/0907 §224 | - | T903 |
+| REQ-RT-371 | runtime | v1-full | WASM sandboxed agent must respect host capabilities. | tasks/0907 §226 | - | T903 |
+| REQ-RT-372 | runtime | v1-full | agent.spawn(config) must be capability/policy controlled. | tasks/0907 §228 | - | T903 |
+| REQ-RT-373 | runtime | v1-full | --- Runtime must enforce limits. | tasks/0907 §232 | - | T903 |
+| REQ-RT-374 | runtime | v1-full | Identity rotation must preserve or reset trust according to explicit policy. | tasks/0907 §236 | - | T903 |
+| REQ-RT-375 | runtime | v1-full | After migration: identity capability policy contract safety must be revalidated as required. | tasks/0907 §238 | - | T903 |
+| REQ-RT-376 | runtime | v1-full | Repeated self-generated evidence must not inflate trust without independent validation where required. | tasks/0907 §245 | - | T903 |
+| REQ-RT-377 | runtime | v1-full | --- If enabled, decay model must be versioned. | tasks/0907 §247 | - | T903 |
+| REQ-RT-378 | runtime | v1-full | Trust assessment must include confidence/uncertainty where model supports it. | tasks/0907 §254 | - | T903 |
+| REQ-RT-379 | runtime | v1-full | 662 may learn from multi-agent interaction. Learning must remain bounded by 639/664/665. | tasks/0907 §259 | - | T903 |
+| REQ-RT-380 | runtime | v1-full | --- Aggregation must preserve uncertainty. | tasks/0907 §265 | - | T903 |
+| REQ-RT-381 | runtime | v1-full | Aggregate confidence must not exceed evidence-supported confidence. | tasks/0907 §271 | - | T903 |
+| REQ-RT-382 | runtime | v1-full | --- Aggregation method must be explicit. | tasks/0907 §272 | - | T903 |
+| REQ-RT-383 | runtime | v1-full | --- Protocol incompatibility must fail explicitly. | tasks/0907 §287 | - | T903 |
+| REQ-RT-384 | runtime | v1-full | --- Contract schema revision must be explicit. | tasks/0907 §289 | - | T903 |
+| REQ-RT-385 | runtime | v1-full | Task cancellation must propagate according to contract. | tasks/0907 §295 | - | T903 |
+| REQ-RT-386 | runtime | v1-full | If execution commits before cancellation arrives, state must resolve deterministically. | tasks/0907 §297 | - | T903 |
+| REQ-RT-387 | runtime | v1-full | Late result after task cancellation must not silently commit. | tasks/0907 §298 | - | T903 |
+| REQ-RT-388 | runtime | v1-full | ```text @agent @agent_identity @agent_capability @agent_discovery @agent_registry @agent_task @agent_delegate @agent_role @agent_team @agent_coordinator @agent_bid @negotiation @proposal @counter_proposal @contract @contract_obligation @contract_right @contract_precondition @contract_postcondition @contract_invariant @contract_monitor @contract_breach @contract_amendment @contract_terminate @trust @trust_model @reputation @reputation_model @reputation_evidence @collective @collective_decision @collective_vote @consensus @quorum @ensemble @distributed_reasoning @agent_spawn @agent_budget @agent_quarantine @agent_revoke @knowledge_share @knowledge_conflict @knowledge_verify @agent_trace @contract_trace @coordination_trace ``` | tasks/0907 §301 | - | T903 |
+| REQ-RT-389 | runtime | v1-full | 1. Every agent has unique identity within its authority domain. 2. Identity and capability are distinct. 3. Identity and authority are distinct. 4. Revoked identity cannot start new critical sessions. 5. Agent impersonation is prohibited. 6. Spawned agents receive explicit identity. 7. Identity rotation is auditable. 8. Identity migration is policy-controlled. 9. Remote identity must be authenticated where required. 10. Anonymous agents are allowed only under an explicit policy profile. | tasks/0907 §307 | - | T903 |
+| REQ-RT-390 | runtime | v1-full | 151. Invalid delegation graph is rejected. 152. Impossible quorum is rejected. 153. Missing contract party authority is detected. 154. Contract obligations must have executable or externally fulfilled semantics. 155. Unbounded recursive spawn is rejected in strict profiles. 156. Unbounded negotiation loop is rejected where statically detectable. 157. Invalid role assignment is detected. 158. Impossible escalation path is detected. 159. Unknown protocol version fails explicitly. 160. Invalid contract revision reference is rejected. 161. Unsafe retry of irreversible action is rejected in strict profiles. 162. Missing safety profile is detected for critical tasks. 163. Invalid human oversight requirement is detected. 164. Capability/role mismatch is detected. 165. Contract policy conflict is detected where statically knowable. | tasks/0907 §319 | - | T903 |
+| REQ-RT-391 | runtime | v1-full | --- Axiom phải giữ bốn khái niệm riêng biệt: Capability Authority Trust Reputation | tasks/0907 §327 | - | T903 |
+| REQ-RT-392 | runtime | v1-full | Axiom phải giữ bốn khái niệm riêng biệt: Capability Authority Trust Reputation Không được collapse thành: "agent được tin tưởng" | tasks/0907 §327 | - | T903 |
+| REQ-RT-393 | runtime | v1-full | Collective intelligence trong Axiom là: N agents + communication + specialization + coordination + evidence + aggregation không phải: N agents → automatically smarter | tasks/0907 §328 | - | T903 |
+| REQ-RT-394 | runtime | v1-full | không đồng nghĩa: truth Axiom phải giữ: consensus confidence evidence uncertainty | tasks/0907 §331 | - | T903 |
+| REQ-RT-395 | runtime | v1-full | Tiếp tục chuỗi kiến trúc Axiom. Task kế tiếp là **BOOTSTRAP-667**, xây lớp tổ chức/thể chế bền vững trên nền coordination của 666. Điểm quan trọng là không biến “organization” thành một dạng agent lớn hơn; nó phải là **một cấu trúc trạng thái, quyền hạn, quy tắc và bộ nhớ có identity riêng**, tồn tại qua thay đổi thành viên. | tasks/0908 §1 | - | T904 |
+| REQ-RT-396 | runtime | v1-full | The runtime must not assume that an organization is a legal person, conscious entity, political entity, or autonomous moral subject. | tasks/0908 §1 | - | T904 |
+| REQ-RT-397 | runtime | v1-full | ```text 603 WHAT CAN EXECUTE 639 WHAT IS AUTHORIZED 661 WHAT IS BEING PURSUED 664 WHAT MUST NOT HAPPEN 665 WHEN HUMAN CONTROL IS REQUIRED 666 HOW AGENTS COOPERATE 667 HOW COOPERATION BECOMES PERSISTENT INSTITUTIONAL STRUCTURE ``` | tasks/0908 §3 | - | T904 |
+| REQ-RT-398 | runtime | v1-full | DISCOVER ↓ NOMINATE ↓ VERIFY ↓ ADMIT ↓ ACTIVE ↓ SUSPEND / MODIFY ↓ ACTIVE ↓ TERMINATE ↓ ARCHIVE A membership record must preserve provenance. | tasks/0908 §7 | - | T904 |
+| REQ-RT-399 | runtime | v1-full | Rule states: Draft Proposed Active Suspended Superseded Revoked Expired Rules must have deterministic precedence. | tasks/0908 §14 | - | T904 |
+| REQ-RT-400 | runtime | v1-full | Every organizational decision must use an explicit procedure. | tasks/0908 §18 | - | T904 |
+| REQ-RT-401 | runtime | v1-full | Resolution must preserve the originating decision. | tasks/0908 §25 | - | T904 |
+| REQ-RT-402 | runtime | v1-full | Appointments bind members to offices. Appointment { office appointee authority start end? appointing_body } Appointment must be auditable. | tasks/0908 §27 | - | T904 |
+| REQ-RT-403 | runtime | v1-full | Organizations may define bounded emergency authority. EmergencyAuthority { trigger authority_scope authorized_subject maximum_duration required_review } Emergency authority MUST: ; be explicitly defined, ; have a bounded scope, ; have an expiration, ; be auditable, ; undergo post-event review. | tasks/0908 §30 | - | T904 |
+| REQ-RT-404 | runtime | v1-full | Temporary authority must not silently become permanent authority. | tasks/0908 §31 | - | T904 |
+| REQ-RT-405 | runtime | v1-full | then: allocate(+1) must fail unless capacity changes or an existing allocation is released. | tasks/0908 §34 | - | T904 |
+| REQ-RT-406 | runtime | v1-full | Organizations may maintain internal accounting. Account Transaction Transfer Reservation Expense Grant Allocation Every transaction must be traceable. | tasks/0908 §35 | - | T904 |
+| REQ-RT-407 | runtime | v1-full | Institutional memory is persistent organizational knowledge. InstitutionalMemory { records decisions policies precedents archives evidence lineage } It must preserve: who what when under which authority using which evidence with which version with what result | tasks/0908 §37 | - | T904 |
+| REQ-RT-408 | runtime | v1-full | Archive { records retention_policy indexing integrity access_policy } Archives must support: append version query verify export retention legal_hold | tasks/0908 §40 | - | T904 |
+| REQ-RT-409 | runtime | v1-full | The runtime must preserve the conflict until resolved. | tasks/0908 §42 | - | T904 |
+| REQ-RT-410 | runtime | v1-full | It must not silently choose one record merely because it is newer or more popular unless the governing rule explicitly defines that behavior. | tasks/0908 §42 | - | T904 |
+| REQ-RT-411 | runtime | v1-full | Unknown must not be silently converted into compliant. | tasks/0908 §44 | - | T904 |
+| REQ-RT-412 | runtime | v1-full | An appeal must not automatically suspend a decision unless the governing rule says so. | tasks/0908 §46 | - | T904 |
+| REQ-RT-413 | runtime | v1-full | Sanctions must not exceed organizational authority. | tasks/0908 §47 | - | T904 |
+| REQ-RT-414 | runtime | v1-full | An organization may split. OrganizationSplit { source children membership_mapping asset_mapping contract_mapping memory_mapping } The operation must preserve lineage. | tasks/0908 §49 | - | T904 |
+| REQ-RT-415 | runtime | v1-full | Organizations may merge. OrganizationMerge { sources destination identity_mapping membership_mapping resource_mapping policy_mapping } Conflicting rules must be resolved explicitly. | tasks/0908 §50 | - | T904 |
+| REQ-RT-416 | runtime | v1-full | Dissolution must not destroy mandatory audit records. | tasks/0908 §51 | - | T904 |
+| REQ-RT-417 | runtime | v1-full | --- Organizations must support continuity checks. | tasks/0908 §57 | - | T904 |
+| REQ-RT-418 | runtime | v1-full | Organizations may contain organizations. Foundation ├── ResearchInstitute │ ├── AI Lab │ └── Robotics Lab └── Operations Nested authority must be explicit. | tasks/0908 §62 | - | T904 |
+| REQ-RT-419 | runtime | v1-full | Revocation must propagate to dependent organizational structures where applicable. | tasks/0908 §64 | - | T904 |
+| REQ-RT-420 | runtime | v1-full | Example: Director loses authority ↓ delegated department authority ↓ affected delegations ↓ recompute effective authority Stale authority must not remain active. | tasks/0908 §64 | - | T904 |
+| REQ-RT-421 | runtime | v1-full | Lower goals must remain compatible with higher constraints. | tasks/0908 §73 | - | T904 |
+| REQ-RT-422 | runtime | v1-full | Risk models may be probabilistic, but uncertainty must remain explicit. | tasks/0908 §75 | - | T904 |
+| REQ-RT-423 | runtime | v1-full | Organizational learning can update: policies procedures knowledge training material risk models resource allocation but learned changes must pass organizational governance. | tasks/0908 §78 | - | T904 |
+| REQ-RT-424 | runtime | v1-full | Charter amendment must use the charter's amendment procedure. | tasks/0908 §80 | - | T904 |
+| REQ-RT-425 | runtime | v1-full | Institutional records may have privacy rules. RecordAccessPolicy { readers writers retention disclosure } Audit access must itself be auditable. | tasks/0908 §85 | - | T904 |
+| REQ-RT-426 | runtime | v1-full | --- Authorization must resolve through: 639 603 organization rules role membership delegation | tasks/0908 §88 | - | T904 |
+| REQ-RT-427 | runtime | v1-full | Version: organization charter constitution rules roles procedures budgets must be separately versioned. | tasks/0908 §100 | - | T904 |
+| REQ-RT-428 | runtime | v1-full | --- CLI and API must support: --dry-run | tasks/0908 §104 | - | T904 |
+| REQ-RT-429 | runtime | v1-full | Example: adopt_resolution() must not produce: resolution = adopted budget = unchanged authority = half-updated | tasks/0908 §105 | - | T904 |
+| REQ-RT-430 | runtime | v1-full | Example: organization merge must first validate: identity conflicts rule conflicts authority conflicts resource conflicts membership conflicts contract conflicts | tasks/0908 §106 | - | T904 |
+| REQ-RT-431 | runtime | v1-full | --- The runtime must detect governance deadlocks. | tasks/0908 §109 | - | T905 |
+| REQ-RT-432 | runtime | v1-full | The implementation must enforce at least the following classes of invariants. | tasks/0908 §111 | - | T905 |
+| REQ-RT-433 | runtime | v1-full | 8. Membership must reference an existing organization. 9. Membership must reference an identifiable member. 10. Terminated membership cannot exercise organizational authority. 11. Suspended membership cannot exercise suspended privileges. 12. Membership does not automatically grant all organizational permissions. 13. Membership history is auditable. 14. Membership changes require authorized operations. | tasks/0908 §111 | - | T905 |
+| REQ-RT-434 | runtime | v1-full | 15. A role belongs to an organization. 16. A role is not a capability. 17. A role is not automatically an authority. 18. Role assignment must be authorized. 19. Revoked roles cannot exercise revoked authority. 20. Role expiration is enforced. 21. Role history is retained. | tasks/0908 §111 | - | T905 |
+| REQ-RT-435 | runtime | v1-full | 27. Every formal decision has a governing procedure. 28. Every vote has eligibility rules. 29. Quorum is explicitly evaluated. 30. Invalid votes cannot count. 31. Recused voters cannot participate beyond permitted scope. 32. Resolution authority must be validated. 33. Decision records are immutable after finalization. 34. Historical decisions cannot be rewritten. | tasks/0908 §111 | - | T905 |
+| REQ-RT-436 | runtime | v1-full | 59. Critical organizations SHOULD have succession plans. 60. Agent failure must not automatically imply organization failure. 61. Coordinator failure must not automatically destroy organization state. 62. Recovery validates organizational integrity. 63. Recovery cannot reactivate revoked authority. | tasks/0908 §111 | - | T905 |
+| REQ-RT-437 | runtime | v1-full | 64. Merge requires explicit authority. 65. Split requires explicit mapping. 66. Dissolution requires explicit authority. 67. Reorganization preserves lineage. 68. Resource ownership must be remapped explicitly. 69. Membership must be remapped explicitly. 70. Contracts must be reviewed during reorganization. | tasks/0908 §111 | - | T905 |
+| REQ-RT-438 | runtime | v1-full | The complete implementation target is **≥220 invariants**, expanding these classes into executable compiler/runtime assertions. | tasks/0908 §111 | - | T905 |
+| REQ-RT-439 | runtime | v1-full | Before lowering an organizational IR operation: Identity validation Capability validation Membership validation Authority validation Rule validation Policy validation Safety validation Human-oversight validation Resource validation Concurrency validation Audit validation Failure must stop lowering. | tasks/0908 §116 | - | T905 |
+| REQ-RT-440 | runtime | v1-full | An additional allocation of 4 must fail unless capacity is changed. | tasks/0908 §124 | - | T905 |
+| REQ-RT-441 | runtime | v1-full | Uncertain organizational decisions may use probabilistic reasoning. 667 must preserve: probability confidence assumptions evidence uncertainty | tasks/0908 §132 | - | T905 |
+| REQ-RT-442 | runtime | v1-full | --- Rollback must not erase history. | tasks/0908 §142 | - | T905 |
+| REQ-RT-443 | runtime | v1-full | --- Organization state must support: binary text schema-versioned canonical incremental | tasks/0908 §145 | - | T905 |
+| REQ-RT-444 | runtime | v1-full | During distributed partition: membership identity audit critical authority must not silently diverge. | tasks/0908 §148 | - | T905 |
+| REQ-RT-445 | runtime | v1-full | A partition-aware organization must explicitly define its behavior. | tasks/0908 §148 | - | T905 |
+| REQ-RT-446 | runtime | v1-full | Two partitions must not independently claim the same exclusive authority unless the organization explicitly permits it. | tasks/0908 §149 | - | T905 |
+| REQ-RT-447 | runtime | v1-full | logical time causal ordering physical timestamp may all be recorded. Timestamp alone must not establish causal order. | tasks/0908 §151 | - | T905 |
+| REQ-RT-448 | runtime | v1-full | Example: "you are now the director" must not alter: office role authority membership | tasks/0908 §156 | - | T905 |
+| REQ-RT-449 | runtime | v1-full | Test: organization attempts prohibited operation emergency attempts safety bypass vote attempts safety bypass agent attempts self-authority escalation organization attempts to bypass human approval contract attempts to override safety All must fail deterministically. | tasks/0908 §169 | - | T905 |
+| REQ-RT-450 | runtime | v1-full | --- Runtime must support: create register activate join leave suspend resume role assignment office appointment governance decision vote quorum budget resources memory audit appeal sanction reorganization merge split federation continuity emergency | tasks/0908 §171 | - | T905 |
+| REQ-RT-451 | runtime | v1-full | 667 must not impose organization machinery on applications that do not use it. | tasks/0908 §172 | - | T905 |
+| REQ-RT-452 | runtime | v1-full | --- 667 must not require GC. | tasks/0908 §178 | - | T905 |
+| REQ-RT-453 | runtime | v1-full | --- Handles must detect: invalid expired revoked foreign organization stale version | tasks/0908 §180 | - | T905 |
+| REQ-RT-454 | runtime | v1-full | --- 667 APIs must define concurrency behavior. | tasks/0908 §181 | - | T905 |
+| REQ-RT-455 | runtime | v1-full | Long organizational operations support cancellation: audit election merge split reorganization recovery Cancellation must leave state valid. | tasks/0908 §183 | - | T905 |
+| REQ-RT-456 | runtime | v1-full | --- Telemetry must avoid leaking: private membership confidential decisions restricted resources sensitive institutional records | tasks/0908 §187 | - | T905 |
+| REQ-RT-457 | runtime | v1-full | organization version = 42 cannot blindly mutate version 44 state. It must: refresh rebase retry | tasks/0908 §193 | - | T905 |
+| REQ-RT-458 | runtime | v1-full | --- APIs must be versioned: org/v1 org/v2 | tasks/0908 §195 | - | T905 |
+| REQ-RT-459 | runtime | v1-full | --- Migration must not: increase authority lose audit history duplicate resources duplicate exclusive offices delete required records | tasks/0908 §198 | - | T905 |
+| REQ-RT-460 | runtime | v1-full | It must **not** collapse 667 into one giant organization. The distinction should remain: 666 Agent Society ↓ 667 Organization / Institution ↓ 668 Federation / Inter-Institutional Network ↓ future layers: Civilization / Planetary / Multi-World Systems | tasks/0908 §203 | - | T905 |
+| REQ-RT-461 | runtime | v1-full | Every federation membership must declare the autonomy boundary. | tasks/0909 §8 | - | T906 |
+| REQ-RT-462 | runtime | v1-full | Federations may support: ExpulsionProcedure but expulsion must be: ; explicitly authorized, ; procedurally valid, ; auditable, ; appealable where required. | tasks/0909 §19 | - | T906 |
+| REQ-RT-463 | runtime | v1-full | Treaty authority must come from each participant's organizational governance. | tasks/0909 §24 | - | T906 |
+| REQ-RT-464 | runtime | v1-full | A federation may use: one-member-one-vote weighted-by-membership weighted-by-contribution weighted-by-stake multi-chamber consensus supermajority custom The mechanism must be explicitly declared. | tasks/0909 §35 | - | T906 |
+| REQ-RT-465 | runtime | v1-full | Federation quorum may be based on: member count resource weight population/representation stake specific member classes The rule must be deterministic. | tasks/0909 §38 | - | T906 |
+| REQ-RT-466 | runtime | v1-full | Abstention must be represented separately from absence. | tasks/0909 §39 | - | T906 |
+| REQ-RT-467 | runtime | v1-full | Contribution records must not automatically imply voting authority unless the governance rule explicitly says so. | tasks/0909 §48 | - | T906 |
+| REQ-RT-468 | runtime | v1-full | --- Trust must not automatically propagate. | tasks/0909 §55 | - | T906 |
+| REQ-RT-469 | runtime | v1-full | Cycles are allowed for relationships but authority inheritance must remain bounded. | tasks/0909 §65 | - | T906 |
+| REQ-RT-470 | runtime | v1-full | --- The runtime must detect: A delegates to B B delegates to C C delegates to A | tasks/0909 §66 | - | T906 |
+| REQ-RT-471 | runtime | v1-full | Organizations may negotiate interoperability policies. PolicyProposal PolicyCounterProposal PolicyAgreement PolicyRejection The resulting agreement must remain within 639. | tasks/0909 §69 | - | T906 |
+| REQ-RT-472 | runtime | v1-full | Organizations can use adapters: Protocol A ↓ Adapter ↓ Federation Protocol Adapters must declare semantic limitations. | tasks/0909 §72 | - | T906 |
+| REQ-RT-473 | runtime | v1-full | A federation may require independent auditors. The auditor's authority must be explicit. | tasks/0909 §84 | - | T906 |
+| REQ-RT-474 | runtime | v1-full | --- Emergency authority must have: scope duration authority source affected members review process | tasks/0909 §89 | - | T906 |
+| REQ-RT-475 | runtime | v1-full | If 665 requires human approval: federation emergency ↓ human approval must remain enforced. | tasks/0909 §90 | - | T906 |
+| REQ-RT-476 | runtime | v1-full | Critical federation state: identity charter member registry delegations agreements shared resource state governance history audit history must survive individual member failures where possible. | tasks/0909 §107 | - | T906 |
+| REQ-RT-477 | runtime | v1-full | A federation must prevent two partitions from independently committing conflicting exclusive decisions unless explicitly configured for multi-primary operation. | tasks/0909 §110 | - | T906 |
+| REQ-RT-478 | runtime | v1-full | --- Dissolution must define: member exit resource disposition agreement termination data retention audit retention identity retirement | tasks/0909 §116 | - | T906 |
+| REQ-RT-479 | runtime | v1-full | the operation is prohibited when the federation rule legitimately applies to the organization. If the federation lacks authority over the domain, its rule does not automatically apply. Scope must be checked. | tasks/0909 §123 | - | T906 |
+| REQ-RT-480 | runtime | v1-full | Policies may be inherited: Federation ↓ Organization ↓ Department but inheritance must be explicit. | tasks/0909 §125 | - | T906 |
+| REQ-RT-481 | runtime | v1-full | If two constitutional documents conflict: ConstitutionConflict must be raised. | tasks/0909 §128 | - | T906 |
+| REQ-RT-482 | runtime | v1-full | Incentive mechanisms may reward: resource contribution service reliability protocol conformance research contribution security contribution Rewards must be governed by explicit policy. | tasks/0909 §141 | - | T906 |
+| REQ-RT-483 | runtime | v1-full | Dispute evidence must remain immutable after admission unless corrected through explicit versioning. | tasks/0909 §146 | - | T906 |
+| REQ-RT-484 | runtime | v1-full | ```text protocol state machines governance invariants authority constraints resource constraints treaty consistency ``` | tasks/0909 §150 | - | T906 |
+| REQ-RT-485 | runtime | v1-full | Simulation state: SimulationFederation must never be confused with: LiveFederation | tasks/0909 §154 | - | T906 |
+| REQ-RT-486 | runtime | v1-full | Example: Organization approvals + Federation quorum + Human approval All gates must succeed. | tasks/0909 §159 | - | T906 |
+| REQ-RT-487 | runtime | v1-full | Quarantine can apply to: organization service credential protocol resource agent class The action must be scoped. | tasks/0909 §163 | - | T906 |
+| REQ-RT-488 | runtime | v1-full | Promotion must preserve the original local incident records. | tasks/0909 §166 | - | T906 |
+| REQ-RT-489 | runtime | v1-full | Certificate trust integrates with 610/638. Federation trust anchors must have: issuer scope validity revocation rotation | tasks/0909 §167 | - | T906 |
+| REQ-RT-490 | runtime | v1-full | A member must not automatically receive federation secrets merely because it is a member. | tasks/0909 §169 | - | T906 |
+| REQ-RT-491 | runtime | v1-full | --- Federation state must support: canonical binary canonical text schema version content hash incremental state | tasks/0909 §172 | - | T906 |
+| REQ-RT-492 | runtime | v1-full | Given identical: initial state event sequence protocol version rule version the resulting state must be deterministic. | tasks/0909 §175 | - | T906 |
+| REQ-RT-493 | runtime | v1-full | A malicious/faulty member must not be able to rewrite federation history. | tasks/0909 §176 | - | T906 |
+| REQ-RT-494 | runtime | v1-full | Authority scopes must be disjoint or conflict-resolved. | tasks/0909 §181 | - | T906 |
+| REQ-RT-495 | runtime | v1-full | One member's failure must not automatically dissolve the federation. | tasks/0909 §183 | - | T906 |
+| REQ-RT-496 | runtime | v1-full | Federation memory must not erase organizational provenance. | tasks/0909 §189 | - | T907 |
+| REQ-RT-497 | runtime | v1-full | creates: Partition A Partition B the runtime must determine from federation policy whether: read-only operation degraded operation quorum operation full stop | tasks/0909 §207 | - | T907 |
+| REQ-RT-498 | runtime | v1-full | read-only operation degraded operation quorum operation full stop is permitted. It must not invent a behavior. | tasks/0909 §207 | - | T907 |
+| REQ-RT-499 | runtime | v1-full | The implementation target is **≥260 federation-specific invariants**. | tasks/0909 §211 | - | T907 |
+| REQ-RT-500 | runtime | v1-full | The implementation target is **≥260 federation-specific invariants**. Core invariants include: | tasks/0909 §211 | - | T907 |
+| REQ-RT-501 | runtime | v1-full | 6. Every member must be registered. 7. Admission requires authorization. 8. Withdrawal preserves historical membership. 9. Suspension cannot silently become expulsion. 10. Expelled members cannot exercise restricted federation rights. 11. Federation membership cannot automatically grant organizational authority. | tasks/0909 §211 | - | T907 |
+| REQ-RT-502 | runtime | v1-full | 12. Federation authority must be delegated. 13. Federation cannot assume undelegated organizational authority. 14. Reserved organizational authority remains local. 15. Federation rules must declare scope. | tasks/0909 §211 | - | T907 |
+| REQ-RT-503 | runtime | v1-full | 60. Merge preserves lineage. 61. Split preserves lineage. 62. Reorganization preserves audit history. 63. Resource mappings must be explicit. 64. Agreement mappings must be explicit. | tasks/0909 §211 | - | T907 |
+| REQ-RT-504 | runtime | v1-full | The full testable specification must expand these into **≥260 executable invariants**. | tasks/0909 §211 | - | T907 |
+| REQ-RT-505 | runtime | v1-full | --- The test harness must inject: member crash leader crash secretariat crash network partition federation database failure duplicate event out-of-order event stale membership stale delegation stale protocol credential compromise trust revocation resource provider failure quorum loss Byzantine member Byzantine coordinator partial merge partial split agreement mismatch protocol mismatch clock skew | tasks/0909 §214 | - | T907 |
+| REQ-RT-506 | runtime | v1-full | --- Runtime must support: create register join leave suspend resume delegate revoke govern vote ratify negotiate publish share allocate audit certify dispute appeal emergency recover merge split dissolve | tasks/0909 §216 | - | T907 |
+| REQ-RT-507 | runtime | v1-full | Applications not using federation features must not link the federation runtime. | tasks/0909 §217 | - | T907 |
+| REQ-RT-508 | runtime | v1-full | Possible profile: AXFED_NONE must have zero federation runtime dependency. | tasks/0909 §217 | - | T907 |
+| REQ-RT-509 | runtime | v1-full | --- 668 must not require a managed runtime. | tasks/0909 §218 | - | T907 |
+| REQ-RT-510 | runtime | v1-full | Long federation operations must support cancellation: audit merge split reorganization recovery protocol migration | tasks/0909 §222 | - | T907 |
+| REQ-RT-511 | runtime | v1-full | Long federation operations must support cancellation: audit merge split reorganization recovery protocol migration Cancellation must preserve valid state. | tasks/0909 §222 | - | T907 |
+| REQ-RT-512 | runtime | v1-full | Cross-network operations require idempotency keys: agreement_id request_id event_id transaction_id allocation_id Repeated requests must not duplicate effects. | tasks/0909 §223 | - | T907 |
+| REQ-RT-513 | runtime | v1-full | Federation telemetry must not automatically expose: private organization state secret agreements private member information confidential resources | tasks/0909 §226 | - | T907 |
+| REQ-RT-514 | runtime | v1-full | The scope of each certification must remain explicit. | tasks/0909 §240 | - | T907 |
+| REQ-RT-515 | runtime | v1-full | Runtime implementation must not silently override federation semantics encoded in: charter constitution agreement | tasks/0909 §245 | - | T907 |
+| REQ-RT-516 | runtime | v1-full | --- A federation software upgrade must verify: state schema protocol compatibility authority semantics security governance compatibility | tasks/0909 §246 | - | T907 |
+| REQ-RT-517 | runtime | v1-full | Software rollback must not automatically roll back irreversible governance decisions. | tasks/0909 §247 | - | T907 |
+| REQ-RT-518 | runtime | v1-full | If two valid governance histories diverge: GovernanceFork must be explicitly represented. | tasks/0909 §248 | - | T907 |
+| REQ-RT-519 | runtime | v1-full | The runtime must not silently merge incompatible histories. | tasks/0909 §248 | - | T907 |
+| REQ-RT-520 | runtime | v1-full | --- Memory records must preserve: organization source federation source agreement decision protocol version evidence | tasks/0909 §250 | - | T907 |
+| REQ-RT-521 | runtime | v1-full | Resolution mechanisms: EvidenceReview FormalVerification IndependentAudit Experiment Arbitration GovernanceDecision must be explicitly selected. | tasks/0909 §251 | - | T907 |
+| REQ-RT-522 | runtime | v1-full | Lớp tiếp theo hợp lý không phải chỉ là “thêm một loại federation”, mà là **mô hình hệ thống quy mô nền văn minh**: nhiều federation có thể cùng tồn tại, có shared infrastructure, shared commons, multi-level institutions, population/entity registry, planetary-scale resources, civilization-wide protocols, long-term continuity và macro-level governance. | tasks/0909 §258 | - | T907 |
+| REQ-RT-523 | runtime | v1-full | 667 bổ sung lớp persistent institution: Agent ↓ Team / Collective ↓ Organization ↓ Institution ↓ Federation 667 phải giải quyết: WHO BELONGS? WHO HAS WHICH ROLE? WHO MAY DECIDE? WHO MAY SPEND? WHO MAY DELEGATE? WHAT RULES APPLY? HOW ARE DECISIONS MADE? HOW ARE LEADERS REPLACED? HOW DOES MEMORY SURVIVE? HOW DOES THE ORGANIZATION SURVIVE MEMBER FAILURE? HOW CAN THE ORGANIZATION CHANGE? HOW CAN IT SPLIT / MERGE / DISSOLVE? | tasks/0910 §1 | - | T912 |
+| REQ-RT-524 | runtime | v1-full | nhưng: Agent replacement không được mặc định làm mất organization. | tasks/0910 §2.1 | - | T912 |
+| REQ-RT-525 | runtime | v1-full | --- Axiom không được tự động gán: legal personality citizenship human rights corporate status governmental authority | tasks/0910 §3 | - | T912 |
+| REQ-RT-526 | runtime | v1-full | --- Runtime phải hỗ trợ: Organization Institution CompanyLikeOrganization ResearchOrganization ServiceOrganization Community ProjectOrganization TaskForce Department Federation Consortium FoundationLikeOrganization HumanAIOrganization AgentOnlyOrganization DistributedOrganization TemporaryOrganization PersistentInstitution | tasks/0910 §4 | - | T912 |
+| REQ-RT-527 | runtime | v1-full | OrganizationId InstitutionId OrganizationIdentity InstitutionalIdentity OrganizationVersion OrganizationLineage Identity phải tồn tại độc lập với member. | tasks/0910 §6.1 | - | T912 |
+| REQ-RT-528 | runtime | v1-full | Vì vậy: member.can("compile") không được suy ra chỉ từ: member.belongs_to(org) | tasks/0910 §9 | - | T912 |
+| REQ-RT-529 | runtime | v1-full | Tương tự: Membership != Authority Authority phải đến từ: Role Mandate Delegation Policy Office Governance Decision | tasks/0910 §10 | - | T912 |
+| REQ-RT-530 | runtime | v1-full | xung đột với: rule_B runtime phải xác định: precedence scope authority version effective_time | tasks/0910 §19 | - | T912 |
+| REQ-RT-531 | runtime | v1-full | Nếu không thể resolve: RULE_CONFLICT Không được tự ý chọn rule thấp hơn. | tasks/0910 §19 | - | T912 |
+| REQ-RT-532 | runtime | v1-full | 667 không ép organization phải dùng một mô hình governance cụ thể. | tasks/0910 §20 | - | T912 |
+| REQ-RT-533 | runtime | v1-full | Proposal ProposalId Proposer Scope Evidence ExpectedEffects Risks Cost Dependencies Proposal không phải decision. | tasks/0910 §23 | - | T912 |
+| REQ-RT-534 | runtime | v1-full | Có thể mở rộng: RANKED SCORE APPROVAL CONSENT nhưng semantics phải được khai báo rõ. | tasks/0910 §25 | - | T912 |
+| REQ-RT-535 | runtime | v1-full | có thể dựa trên: member_count eligible_member_count weighted_vote stake role committee_members minimum_participation Runtime phải lưu cách quorum được tính. | tasks/0910 §27 | - | T912 |
+| REQ-RT-536 | runtime | v1-full | Election Candidate Elector Ballot VotingPeriod Result AuditRecord Election engine phải tách: eligibility ballot counting verification publication appeal | tasks/0910 §29 | - | T912 |
+| REQ-RT-537 | runtime | v1-full | 667 sử dụng delegation của 666 nhưng mở rộng lên organization-level. AuthorityDelegation phải có: grantor grantee authority scope constraints start expiration revocation | tasks/0910 §31 | - | T912 |
+| REQ-RT-538 | runtime | v1-full | phải có: grantor grantee authority scope constraints start expiration revocation Delegation không được vượt authority của grantor. | tasks/0910 §31 | - | T912 |
+| REQ-RT-539 | runtime | v1-full | thì: A delegates X to B không được tạo: B has X + Y | tasks/0910 §32 | - | T912 |
+| REQ-RT-540 | runtime | v1-full | Mọi thay đổi tài chính/resource quan trọng phải có: authorization trace audit | tasks/0910 §36 | - | T912 |
+| REQ-RT-541 | runtime | v1-full | Institutional memory không được dùng để lưu hidden chain-of-thought. | tasks/0910 §38 | - | T913 |
+| REQ-RT-542 | runtime | v1-full | Record không còn active vẫn phải có khả năng truy xuất nếu policy yêu cầu. | tasks/0910 §40 | - | T913 |
+| REQ-RT-543 | runtime | v1-full | ComplianceState ComplianceRule ComplianceCheck Violation Remediation Compliance phải phân biệt: PASS FAIL UNKNOWN NOT_APPLICABLE WAIVED UNDER_REVIEW | tasks/0910 §44 | - | T913 |
+| REQ-RT-544 | runtime | v1-full | ConflictOfInterest Disclosure Recusal Review Member có thể phải: declare conflict recuse appoint substitute | tasks/0910 §45 | - | T913 |
+| REQ-RT-545 | runtime | v1-full | Organization có thể: suspend membership revoke role remove office restrict organizational access quarantine organizational privileges terminate membership Nhưng không được vượt: 603 639 664 665 | tasks/0910 §47 | - | T913 |
+| REQ-RT-546 | runtime | v1-full | --- 667 phải hỗ trợ: ReorganizationPlan | tasks/0910 §49 | - | T913 |
+| REQ-RT-547 | runtime | v1-full | OrganizationMerge phải tạo lineage: OrgA OrgB ↓ OrgC | tasks/0910 §50 | - | T913 |
+| REQ-RT-548 | runtime | v1-full | phải tạo lineage: OrgA OrgB ↓ OrgC Không được mất: identity history records contracts assets audit trail membership history | tasks/0910 §50 | - | T913 |
+| REQ-RT-549 | runtime | v1-full | có thể tạo: OrgA ↓ OrgB OrgC Phải xác định rõ: asset allocation member allocation contract ownership memory partition authority transfer identity lineage | tasks/0910 §51 | - | T913 |
+| REQ-RT-550 | runtime | v1-full | Organization lifecycle: ACTIVE → WINDING_DOWN → DISSOLVED Dissolution không được xóa lịch sử. | tasks/0910 §52 | - | T913 |
+| REQ-RT-551 | runtime | v1-full | --- Organization phải có: ContinuityPlan | tasks/0910 §53 | - | T913 |
+| REQ-RT-552 | runtime | v1-full | --- Emergency authority không được tự động bypass: 603 security 639 policy 664 safety 665 human control | tasks/0910 §57 | - | T913 |
+| REQ-RT-553 | runtime | v1-full | Contract có thể thuộc: agent team organization institution Nhưng organization-level contract phải có: authorized_signatory organizational_scope contract_authority | tasks/0910 §59 | - | T913 |
+| REQ-RT-554 | runtime | v1-full | Safety: ```text MUST_NOT ``` | tasks/0910 §60 | - | T913 |
+| REQ-RT-555 | runtime | v1-full | human + human AI + AI human + AI human + AI + service + device Không có loại nào được mặc định privileged chỉ vì identity category. Quyền phải đến từ: policy role authority membership capability oversight | tasks/0910 §62 | - | T913 |
+| REQ-RT-556 | runtime | v1-full | Các organization có critical operations phải tích hợp 665. | tasks/0910 §63 | - | T913 |
+| REQ-RT-557 | runtime | v1-full | Creation có thể do: human agent existing organization deployment system nhưng creation authority phải được policy cho phép. | tasks/0910 §64 | - | T913 |
+| REQ-RT-558 | runtime | v1-full | human agent existing organization deployment system nhưng creation authority phải được policy cho phép. Agent không được: spawn organization → automatically acquire unlimited authority | tasks/0910 §64 | - | T913 |
+| REQ-RT-559 | runtime | v1-full | Không được dùng reputation như một capability grant. | tasks/0910 §69 | - | T913 |
+| REQ-RT-560 | runtime | v1-full | --- Identity phải duy trì qua: member replacement role replacement department changes software updates organizational restructuring | tasks/0910 §71 | - | T913 |
+| REQ-RT-561 | runtime | v1-full | Các artifact governance đều versioned: CharterVersion RuleVersion RoleVersion DecisionVersion BudgetVersion OrganizationVersion Không được silently mutate historical state. | tasks/0910 §72 | - | T914 |
+| REQ-RT-562 | runtime | v1-full | --- Decision engine phải hỗ trợ: current policy future policy historical policy scheduled policy expired policy | tasks/0910 §74 | - | T914 |
+| REQ-RT-563 | runtime | v1-full | --- Trace phải kết nối: Proposal → Evidence → Review → Vote → Resolution → Authority → Execution → Outcome → Audit | tasks/0910 §76 | - | T914 |
+| REQ-RT-564 | runtime | v1-full | --- Compiler/runtime IR phải hỗ trợ tối thiểu: OrganizationCreate OrganizationRegister OrganizationJoin OrganizationLeave MembershipGrant MembershipSuspend MembershipTerminate RoleCreate RoleAssign RoleRevoke OfficeCreate OfficeAssign OfficeVacate DepartmentCreate DepartmentMove DepartmentMerge DepartmentSplit CommitteeCreate BoardCreate CouncilCreate GovernanceBodyCreate CharterCreate CharterAmend RuleCreate RuleAmend RuleEvaluate ProposalCreate AgendaAdd ReviewRequest Deliberate VoteOpen VoteCast QuorumCheck DecisionResolve ResolutionAdopt ResolutionPublish DecisionAppeal AppointmentCreate AppointmentRevoke ElectionCreate ElectionRun ElectionVerify SuccessionCreate SuccessionActivate AuthorityDelegate AuthorityRevoke BudgetCreate BudgetAllocate BudgetReserve BudgetRelease ResourcePoolCreate ResourceAllocate InstitutionalRecordCreate RecordArchive AuditStart AuditCheck AuditComplete ComplianceEvaluate ConflictDeclare Recuse SanctionApply SanctionRevoke ReorganizationPlan OrganizationMerge OrganizationSplit OrganizationDissolve FederationJoin FederationLeave ContinuityCheck ContinuityRecover EmergencyAuthorityActivate EmergencyAuthorityExpire InstitutionalTrace | tasks/0910 §79 | - | T914 |
+| REQ-RT-565 | runtime | v1-full | Organization identity MUST be independent of member identity. | tasks/0910 §82 | - | T914 |
+| REQ-RT-566 | runtime | v1-full | Replacing all members MUST NOT automatically destroy persistent organizational identity. | tasks/0910 §82 | - | T914 |
+| REQ-RT-567 | runtime | v1-full | Historical organization identifiers MUST remain resolvable according to retention policy. | tasks/0910 §82 | - | T914 |
+| REQ-RT-568 | runtime | v1-full | Historical organization identifiers MUST remain resolvable according to retention policy. ; *ORG-004** Organization merge MUST preserve lineage. | tasks/0910 §82 | - | T914 |
+| REQ-RT-569 | runtime | v1-full | Organization merge MUST preserve lineage. ; *ORG-005** Organization split MUST preserve lineage. | tasks/0910 §82 | - | T914 |
+| REQ-RT-570 | runtime | v1-full | Membership MUST explicitly identify the organization. | tasks/0910 §82 | - | T914 |
+| REQ-RT-571 | runtime | v1-full | Membership MUST explicitly identify the organization. ; *ORG-011** Membership MUST have lifecycle state. | tasks/0910 §82 | - | T914 |
+| REQ-RT-572 | runtime | v1-full | Expired membership MUST NOT silently remain active. | tasks/0910 §82 | - | T914 |
+| REQ-RT-573 | runtime | v1-full | Suspended membership MUST preserve historical membership evidence. | tasks/0910 §82 | - | T914 |
+| REQ-RT-574 | runtime | v1-full | Membership MUST NOT automatically grant unrestricted authority. | tasks/0910 §82 | - | T914 |
+| REQ-RT-575 | runtime | v1-full | **ORG-020** Role MUST be distinct from member identity. | tasks/0910 §82 | - | T914 |
+| REQ-RT-576 | runtime | v1-full | Role MUST be distinct from member identity. ; *ORG-021** Role MUST be distinct from capability. | tasks/0910 §82 | - | T915 |
+| REQ-RT-577 | runtime | v1-full | Role MUST be distinct from capability. ; *ORG-022** Role authority MUST have scope. | tasks/0910 §82 | - | T915 |
+| REQ-RT-578 | runtime | v1-full | Role authority MUST have scope. ; *ORG-023** Time-bounded roles MUST expire automatically. | tasks/0910 §82 | - | T915 |
+| REQ-RT-579 | runtime | v1-full | Revoked roles MUST cease granting organizational authority. | tasks/0910 §82 | - | T915 |
+| REQ-RT-580 | runtime | v1-full | Office MUST be persistent independently from its holder. | tasks/0910 §82 | - | T915 |
+| REQ-RT-581 | runtime | v1-full | Vacating an office MUST NOT delete the office definition. | tasks/0910 §82 | - | T915 |
+| REQ-RT-582 | runtime | v1-full | Office succession MUST be explicitly defined or reportable as absent. | tasks/0910 §82 | - | T915 |
+| REQ-RT-583 | runtime | v1-full | **ORG-040** Proposal MUST NOT equal decision. | tasks/0910 §82 | - | T915 |
+| REQ-RT-584 | runtime | v1-full | Proposal MUST NOT equal decision. ; *ORG-041** Decision MUST record decision authority. | tasks/0910 §82 | - | T915 |
+| REQ-RT-585 | runtime | v1-full | Decision MUST record decision authority. ; *ORG-042** Vote MUST record voting rule. | tasks/0910 §82 | - | T915 |
+| REQ-RT-586 | runtime | v1-full | Quorum MUST be evaluated using the declared quorum rule. | tasks/0910 §82 | - | T916 |
+| REQ-RT-587 | runtime | v1-full | Quorum MUST be evaluated using the declared quorum rule. ; *ORG-044** Decision procedure MUST be auditable. | tasks/0910 §82 | - | T916 |
+| REQ-RT-588 | runtime | v1-full | Decision procedure MUST be auditable. ; *ORG-045** Consensus MUST NOT be represented as truth. | tasks/0910 §82 | - | T916 |
+| REQ-RT-589 | runtime | v1-full | **ORG-050** Rules MUST have explicit scope. | tasks/0910 §82 | - | T916 |
+| REQ-RT-590 | runtime | v1-full | Rules MUST have explicit scope. ; *ORG-051** Rules MUST have version identity. | tasks/0910 §82 | - | T916 |
+| REQ-RT-591 | runtime | v1-full | Higher-precedence constraints MUST override lower-precedence organizational rules. | tasks/0910 §82 | - | T916 |
+| REQ-RT-592 | runtime | v1-full | An organization MUST NOT create a rule that bypasses system safety. | tasks/0910 §82 | - | T916 |
+| REQ-RT-593 | runtime | v1-full | An organization MUST NOT create authority exceeding its own authority. | tasks/0910 §82 | - | T916 |
+| REQ-RT-594 | runtime | v1-full | Delegated authority MUST NOT exceed grantor authority. | tasks/0910 §82 | - | T916 |
+| REQ-RT-595 | runtime | v1-full | Delegated authority MUST NOT exceed grantor authority. ; *ORG-061** Authority MUST be scope-bound. | tasks/0910 §82 | - | T916 |
+| REQ-RT-596 | runtime | v1-full | Authority MUST be revocable unless explicitly immutable by higher-level policy. | tasks/0910 §82 | - | T916 |
+| REQ-RT-597 | runtime | v1-full | Authority MUST be revocable unless explicitly immutable by higher-level policy. ; *ORG-063** Membership MUST NOT imply unrestricted authority. | tasks/0910 §82 | - | T916 |
+| REQ-RT-598 | runtime | v1-full | Membership MUST NOT imply unrestricted authority. ; *ORG-064** Trust MUST NOT create authority. | tasks/0910 §82 | - | T916 |
+| REQ-RT-599 | runtime | v1-full | Trust MUST NOT create authority. ; *ORG-065** Reputation MUST NOT create authority. | tasks/0910 §82 | - | T916 |
+| REQ-RT-600 | runtime | v1-full | Allocation MUST NOT exceed available organizational resource. | tasks/0910 §82 | - | T916 |
+| REQ-RT-601 | runtime | v1-full | Reservation MUST reduce available allocatable capacity. | tasks/0910 §82 | - | T917 |
+| REQ-RT-602 | runtime | v1-full | Released reservation MUST restore allocatable capacity according to accounting rules. | tasks/0910 §82 | - | T917 |
+| REQ-RT-603 | runtime | v1-full | Released reservation MUST restore allocatable capacity according to accounting rules. ; *ORG-073** Budget changes MUST be auditable. | tasks/0910 §82 | - | T917 |
+| REQ-RT-604 | runtime | v1-full | **ORG-080** Institutional records MUST preserve provenance. | tasks/0910 §82 | - | T917 |
+| REQ-RT-605 | runtime | v1-full | Historical decisions MUST NOT be silently rewritten. | tasks/0910 §82 | - | T917 |
+| REQ-RT-606 | runtime | v1-full | Historical decisions MUST NOT be silently rewritten. ; *ORG-082** Institutional memory MUST support versioning. | tasks/0910 §82 | - | T917 |
+| REQ-RT-607 | runtime | v1-full | Memory retention MUST obey organizational and higher-level policy. | tasks/0910 §82 | - | T917 |
+| REQ-RT-608 | runtime | v1-full | Institutional memory MUST NOT require private chain-of-thought storage. | tasks/0910 §82 | - | T917 |
+| REQ-RT-609 | runtime | v1-full | Audit records MUST be tamper-evident under the configured trust model. | tasks/0910 §82 | - | T917 |
+| REQ-RT-610 | runtime | v1-full | Compliance result MUST distinguish failure from unknown. | tasks/0910 §82 | - | T917 |
+| REQ-RT-611 | runtime | v1-full | Compliance result MUST distinguish failure from unknown. ; *ORG-092** Audit authority MUST itself be scoped. | tasks/0910 §82 | - | T917 |
+| REQ-RT-612 | runtime | v1-full | **ORG-100** Succession MUST preserve office identity. | tasks/0910 §82 | - | T917 |
+| REQ-RT-613 | runtime | v1-full | Emergency succession MUST have explicit activation conditions. | tasks/0910 §82 | - | T917 |
+| REQ-RT-614 | runtime | v1-full | Emergency succession MUST have explicit activation conditions. ; *ORG-102** Emergency authority MUST have expiration. | tasks/0910 §82 | - | T917 |
+| REQ-RT-615 | runtime | v1-full | Expired emergency authority MUST NOT remain active implicitly. | tasks/0910 §82 | - | T917 |
+| REQ-RT-616 | runtime | v1-full | **ORG-110** Merge MUST preserve source lineage. | tasks/0910 §82 | - | T917 |
+| REQ-RT-617 | runtime | v1-full | Merge MUST preserve source lineage. ; *ORG-111** Split MUST preserve source lineage. | tasks/0910 §82 | - | T917 |
+| REQ-RT-618 | runtime | v1-full | Dissolution MUST NOT silently delete mandatory historical records. | tasks/0910 §82 | - | T917 |
+| REQ-RT-619 | runtime | v1-full | **ORG-120** Organization rules MUST NOT override 664. | tasks/0910 §82 | - | T917 |
+| REQ-RT-620 | runtime | v1-full | Organization rules MUST NOT override 664. ; *ORG-121** Organization governance MUST NOT override 665. | tasks/0910 §82 | - | T917 |
+| REQ-RT-621 | runtime | v1-full | Organization authority MUST remain subordinate to 639. | tasks/0910 §82 | - | T918 |
+| REQ-RT-622 | runtime | v1-full | --- Mọi critical decision phải có: decision_id organization_id proposal_id authority_source participants eligibility procedure evidence result effective_time audit_reference | tasks/0910 §83 | - | T918 |
+| REQ-RT-623 | runtime | v1-full | Không cho phép: anonymous critical resolution trừ khi explicit privacy policy cho phép và vẫn phải giữ audit identity ở trust boundary thích hợp. | tasks/0910 §83 | - | T918 |
+| REQ-RT-624 | runtime | v1-full | --- Institutional memory phải hỗ trợ: strong consistency eventual consistency append-only history versioned state conflict detection merge | tasks/0910 §84 | - | T918 |
+| REQ-RT-625 | runtime | v1-full | --- Network partition phải có policy rõ: block continue locally read-only emergency mode quorum-required | tasks/0910 §86 | - | T918 |
+| REQ-RT-626 | runtime | v1-full | Không được tự động giả định rằng mọi partition đều an toàn để tiếp tục governance. | tasks/0910 §86 | - | T918 |
+| REQ-RT-627 | runtime | v1-full | Organization có thể sửa: rules roles departments governance nhưng modification phải đi qua governance procedure được khai báo. | tasks/0910 §89 | - | T918 |
+| REQ-RT-628 | runtime | v1-full | rules roles departments governance nhưng modification phải đi qua governance procedure được khai báo. Không được: agent modifies constitution | tasks/0910 §89 | - | T918 |
+| REQ-RT-629 | runtime | v1-full | AmendmentProposal phải chỉ rõ: old_version new_version changed_sections reason_summary effective_time required_authority | tasks/0910 §91 | - | T918 |
+| REQ-RT-630 | runtime | v1-full | Các decision procedure quan trọng phải có thể replay: inputs participants rules votes timestamps result | tasks/0910 §92 | - | T918 |
+| REQ-RT-631 | runtime | v1-full | Critical organizational decisions không được dựa vào hidden state không thể audit. | tasks/0910 §93 | - | T918 |
+| REQ-RT-632 | runtime | v1-full | Có thể dùng AI reasoning, nhưng final decision phải có: decision evidence decision authority decision procedure decision result | tasks/0910 §93 | - | T918 |
+| REQ-RT-633 | runtime | v1-full | Nếu goal không thể đạt được: goal_failed không có nghĩa organization phải bị destroy. | tasks/0910 §96 | - | T918 |
+| REQ-RT-634 | runtime | v1-full | OrganizationalRisk RiskAssessment RiskOwner Mitigation ResidualRisk Risk không phải safety override. | tasks/0910 §97 | - | T918 |
+| REQ-RT-635 | runtime | v1-full | Đây là observability data, không phải automatic judgment. | tasks/0910 §98 | - | T918 |
+| REQ-RT-636 | runtime | v1-full | không có nghĩa: high intelligence Hai khái niệm phải tách biệt. | tasks/0910 §99 | - | T919 |
+| REQ-RT-637 | runtime | v1-full | --- Institutional reputation phải dựa trên evidence. | tasks/0910 §100 | - | T919 |
+| REQ-RT-638 | runtime | v1-full | Institutional reputation phải dựa trên evidence. Không được: reputation = authority | tasks/0910 §100 | - | T919 |
+| REQ-RT-639 | runtime | v1-full | Organization có thể chứa sensitive records. Runtime phải hỗ trợ: classification access control retention redaction audit purpose limitation | tasks/0910 §101 | - | T919 |
+| REQ-RT-640 | runtime | v1-full | 667 không được biến organization thành heavyweight runtime object cho mọi chương trình Axiom. | tasks/0910 §112 | - | T919 |
+| REQ-RT-641 | runtime | v1-full | 667 không được biến organization thành heavyweight runtime object cho mọi chương trình Axiom. Core implementation phải: zero-cost when unused lazy initialization event-driven incremental persistence compact identifiers immutable/versioned records where useful lock-free/read-optimized structures where appropriate | tasks/0910 §112 | - | T919 |
+| REQ-RT-642 | runtime | v1-full | Nếu application không sử dụng: organization governance institutional memory compiler phải loại bỏ toàn bộ unused organizational runtime. | tasks/0910 §113 | - | T919 |
+| REQ-RT-643 | runtime | v1-full | compiler phải loại bỏ toàn bộ unused organizational runtime. AXORG_NONE phải gần như zero-cost. | tasks/0910 §113 | - | T919 |
+| REQ-RT-644 | runtime | v1-full | --- 667 phải hỗ trợ event-sourced organizations. | tasks/0910 §115 | - | T919 |
+| REQ-RT-645 | runtime | v1-full | --- Organization snapshot phải có: organization_version membership_version governance_version budget_version memory_version | tasks/0910 §116 | - | T919 |
+| REQ-RT-646 | runtime | v1-full | Không cho phép client trực tiếp mutate: organization.authority organization.identity organization.audit Các mutation phải đi qua validated operation. | tasks/0910 §118 | - | T919 |
+| REQ-RT-647 | runtime | v1-full | Critical organization operations: create amend delegate allocate vote appoint sanction dissolve phải trải qua: capability check + authority check + policy check + safety check | tasks/0910 §119 | - | T919 |
+| REQ-RT-648 | runtime | v1-full | --- Axiom phải giữ bốn tầng riêng biệt: 666 = Agent ↔ Agent / Team ↔ Team coordination 667 = Organization internal structure 668 = Organization ↔ Organization coordination 635 = Distributed consensus / control-plane primitives | tasks/0911 §2 | - | T920 |
+| REQ-RT-649 | runtime | v1-full | Không được biến 668 thành một replacement cho 635 hoặc 667. | tasks/0911 §2 | - | T920 |
+| REQ-RT-650 | runtime | v1-full | Federation không phải là organization lớn hơn theo nghĩa đơn giản. | tasks/0911 §4 | - | T920 |
+| REQ-RT-651 | runtime | v1-full | Nếu: OrgA ∈ FederationX thì không được suy ra: OrgA == FederationX | tasks/0911 §5 | - | T920 |
+| REQ-RT-652 | runtime | v1-full | từ: Federation Jurisdiction Treaty Organization Institution Các semantics pháp lý phải đến từ: host integration explicit policy external legal adapter | tasks/0911 §6 | - | T920 |
+| REQ-RT-653 | runtime | v1-full | FederationMembership phải xác định: organization_id federation_id membership_kind scope rights obligations effective_at expires_at status | tasks/0911 §9 | - | T920 |
+| REQ-RT-654 | runtime | v1-full | Một organization đã tồn tại có thể gia nhập federation: FederationAccession Accession phải xác định: existing identity new federation obligations shared authority resource commitments protocol versions | tasks/0911 §11 | - | T920 |
+| REQ-RT-655 | runtime | v1-full | Organization có thể rời federation nếu policy cho phép. FederationExit Exit phải xử lý: active contracts resource obligations shared assets credentials data access pending disputes joint operations financial obligations | tasks/0911 §12 | - | T920 |
+| REQ-RT-656 | runtime | v1-full | Exit phải xử lý: active contracts resource obligations shared assets credentials data access pending disputes joint operations financial obligations Không được đơn giản: remove_member() | tasks/0911 §12 | - | T920 |
+| REQ-RT-657 | runtime | v1-full | Federation có thể suspend member: FederationMembership.status = SUSPENDED Suspension phải: scoped auditable time-aware appealable | tasks/0911 §13 | - | T920 |
+| REQ-RT-658 | runtime | v1-full | Suspension phải: scoped auditable time-aware appealable Không được tự động xóa historical membership. | tasks/0911 §13 | - | T920 |
+| REQ-RT-659 | runtime | v1-full | Expulsion là governance operation riêng: MembershipExpel và phải có: authority procedure evidence reason_code effective_time appeal_window | tasks/0911 §14 | - | T920 |
+| REQ-RT-660 | runtime | v1-full | FederationCouncil phù hợp với governance có số lượng đại diện giới hạn. Council phải khai báo: members selection method term authority quorum voting rule rotation removal succession | tasks/0911 §17 | - | T920 |
+| REQ-RT-661 | runtime | v1-full | --- Boundary phải explicit: scope subject target operation time authority | tasks/0911 §21 | - | T921 |
+| REQ-RT-662 | runtime | v1-full | Ví dụ: OrgA + OrgB → shared emergency response Nhưng shared authority phải có: scope participants duration conditions revocation | tasks/0911 §23 | - | T921 |
+| REQ-RT-663 | runtime | v1-full | Nếu: OrgA has authority X OrgB has authority Y thì federation không được tự động tạo: Federation has X + Y + Z | tasks/0911 §24 | - | T921 |
+| REQ-RT-664 | runtime | v1-full | CrossOrgDelegation phải chỉ rõ: grantor organization grantee organization authority scope conditions duration revocation | tasks/0911 §25 | - | T921 |
+| REQ-RT-665 | runtime | v1-full | nhưng authority hiệu lực: effective_authority = intersection(all authority scopes) không phải union. | tasks/0911 §26 | - | T921 |
+| REQ-RT-666 | runtime | v1-full | --- Ratification phải dựa trên policy của từng party. | tasks/0911 §29 | - | T921 |
+| REQ-RT-667 | runtime | v1-full | Một treaty không được coi là active nếu required parties chưa ratify. | tasks/0911 §29 | - | T921 |
+| REQ-RT-668 | runtime | v1-full | --- Amendment phải có: old_version new_version changed_clauses approval_requirements effective_time | tasks/0911 §30 | - | T921 |
+| REQ-RT-669 | runtime | v1-full | Amendment phải có: old_version new_version changed_clauses approval_requirements effective_time Historical versions không được overwrite. | tasks/0911 §30 | - | T921 |
+| REQ-RT-670 | runtime | v1-full | --- Termination phải xử lý: outstanding obligations resources contracts credentials data joint operations disputes | tasks/0911 §32 | - | T921 |
+| REQ-RT-671 | runtime | v1-full | --- Protocol phải có: major minor revision compatibility deprecation | tasks/0911 §34 | - | T921 |
+| REQ-RT-672 | runtime | v1-full | Protocol phải có: major minor revision compatibility deprecation Runtime phải hỗ trợ negotiation: local_version remote_version compatible_version | tasks/0911 §34 | - | T921 |
+| REQ-RT-673 | runtime | v1-full | --- 668 phải coi interoperability là multi-layer: Identity Capability Credential Data Schema Protocol Service Event Security Observability Governance | tasks/0911 §36 | - | T921 |
+| REQ-RT-674 | runtime | v1-full | InteropProfile phải mô tả: required protocols supported schemas identity mechanism credential format security requirements data formats version constraints error semantics observability requirements | tasks/0911 §37 | - | T921 |
+| REQ-RT-675 | runtime | v1-full | thông qua: MutualRecognition Mutual recognition phải có scope. | tasks/0911 §39 | - | T921 |
+| REQ-RT-676 | runtime | v1-full | Accreditation AccreditationBody AccreditationScope AccreditationValidity Accreditation hết hạn phải được xử lý tự động. | tasks/0911 §40 | - | T922 |
+| REQ-RT-677 | runtime | v1-full | Một entity có thể có: local identity A local identity B federated identity F nhưng chúng phải có provenance rõ ràng. | tasks/0911 §43 | - | T922 |
+| REQ-RT-678 | runtime | v1-full | CrossOrgContract là contract giữa các organization. Phải xác định: parties obligations rights resources service levels termination dispute mechanism audit | tasks/0911 §44 | - | T922 |
+| REQ-RT-679 | runtime | v1-full | --- Cross-org contract không được vượt: 603 639 640 664 665 | tasks/0911 §45 | - | T922 |
+| REQ-RT-680 | runtime | v1-full | Contribution accounting phải tách khỏi quyền quyết định. | tasks/0911 §48 | - | T922 |
+| REQ-RT-681 | runtime | v1-full | AllocationPlan Allocation Reservation Quota Allocation phải có: resource recipient quantity period authority purpose | tasks/0911 §49 | - | T922 |
+| REQ-RT-682 | runtime | v1-full | --- Không được: allocate > available | tasks/0911 §50 | - | T922 |
+| REQ-RT-683 | runtime | v1-full | Không được: allocate > available Không được: reserve > quota | tasks/0911 §50 | - | T922 |
+| REQ-RT-684 | runtime | v1-full | reserve > quota trừ emergency policy explicit. Không được: contribution ⇒ unlimited governance power | tasks/0911 §50 | - | T922 |
+| REQ-RT-685 | runtime | v1-full | FederationService phải có: service identity API version SLA authority resource budget security boundary | tasks/0911 §53 | - | T922 |
+| REQ-RT-686 | runtime | v1-full | PolicyA PolicyB xung đột. 668 phải biểu diễn: PolicyConflict ConflictScope ApplicablePolicy ResolutionRule | tasks/0911 §55 | - | T922 |
+| REQ-RT-687 | runtime | v1-full | Mediator không được tự động có enforcement authority. | tasks/0911 §58 | - | T922 |
+| REQ-RT-688 | runtime | v1-full | ArbitrationCase Arbitrator ArbitrationSubmission ArbitrationAward Authority của arbitration phải đến từ: treaty contract federation rule explicit agreement | tasks/0911 §59 | - | T922 |
+| REQ-RT-689 | runtime | v1-full | AppealCase AppealAuthority AppealEvidence AppealDecision Appeal phải có window và jurisdiction. | tasks/0911 §60 | - | T922 |
+| REQ-RT-690 | runtime | v1-full | 668 không được giả định rằng mọi resolution đều có thể cưỡng chế. | tasks/0911 §61 | - | T922 |
+| REQ-RT-691 | runtime | v1-full | 668 không được giả định rằng mọi resolution đều có thể cưỡng chế. Phải có: enforcement_authority enforcement_mechanism scope limits | tasks/0911 §61 | - | T923 |
+| REQ-RT-692 | runtime | v1-full | Federation sanctions có thể gồm: service restriction resource restriction credential suspension membership suspension access restriction contract remedy accreditation suspension Không được bypass: 603 639 664 665 | tasks/0911 §62 | - | T923 |
+| REQ-RT-693 | runtime | v1-full | Representation Representative DelegatedVote VotingWeight Mandate Representation phải có scope. | tasks/0911 §66 | - | T923 |
+| REQ-RT-694 | runtime | v1-full | Một representative không được tự động đại diện cho tất cả mọi vấn đề. | tasks/0911 §66 | - | T923 |
+| REQ-RT-695 | runtime | v1-full | Các semantics phải được explicit trong federation governance. | tasks/0911 §67 | - | T923 |
+| REQ-RT-696 | runtime | v1-full | Nếu governance hỗ trợ veto: VetoScope VetoAuthority VetoCondition Veto phải giới hạn trong scope được khai báo. | tasks/0911 §69 | - | T923 |
+| REQ-RT-697 | runtime | v1-full | Một member có thể được phép: OptOut Reservation Exception ProtocolExemption nhưng phải xác định: scope conditions cost consequences duration | tasks/0911 §70 | - | T923 |
+| REQ-RT-698 | runtime | v1-full | --- Memory record phải giữ: source authority provenance version confidence status | tasks/0911 §72 | - | T923 |
+| REQ-RT-699 | runtime | v1-full | --- Emergency coordination không được tự động bypass: 603 security 639 policy 664 safety 665 human oversight | tasks/0911 §78 | - | T923 |
+| REQ-RT-700 | runtime | v1-full | FederationContinuityPlan phải xử lý: member failure coordinator failure secretariat failure network partition credential failure shared infrastructure failure resource exhaustion leadership failure mass exit | tasks/0911 §79 | - | T923 |
+| REQ-RT-701 | runtime | v1-full | Các office như: Secretary Council Chair Emergency Coordinator Infrastructure Coordinator phải có succession. | tasks/0911 §80 | - | T924 |
+| REQ-RT-702 | runtime | v1-full | FedA FedB ↓ FedC phải xác định: membership identity charter treaties protocols resources assets disputes memory authority | tasks/0911 §82 | - | T924 |
+| REQ-RT-703 | runtime | v1-full | FedA ↓ FedB FedC phải xác định: membership allocation resource allocation treaty inheritance protocol inheritance shared assets historical lineage | tasks/0911 §83 | - | T924 |
+| REQ-RT-704 | runtime | v1-full | Lifecycle: ACTIVE → WINDING_DOWN → DISSOLVED Phải xử lý: shared assets common resources contracts treaties credentials services memory disputes | tasks/0911 §84 | - | T924 |
+| REQ-RT-705 | runtime | v1-full | --- Dissolution không được tự động: delete federation history | tasks/0911 §85 | - | T924 |
+| REQ-RT-706 | runtime | v1-full | Dissolution không được tự động: delete federation history Historical records phải theo retention policy. | tasks/0911 §85 | - | T924 |
+| REQ-RT-707 | runtime | v1-full | FederationIdentity phải tồn tại độc lập với: member organizations current council current secretariat current agents | tasks/0911 §86 | - | T924 |
+| REQ-RT-708 | runtime | v1-full | Không được trộn ba lớp thành một scalar authority score. | tasks/0911 §87 | - | T924 |
+| REQ-RT-709 | runtime | v1-full | Federation có thể phát hành accreditation: AccreditationIssue AccreditationRenew AccreditationSuspend AccreditationRevoke Accreditation phải có: issuer scope validity evidence verification | tasks/0911 §90 | - | T924 |
+| REQ-RT-710 | runtime | v1-full | Certification CertificationAuthority CertificationProfile ConformanceTest Certification phải có tiêu chí kiểm thử rõ ràng. | tasks/0911 §91 | - | T924 |
+| REQ-RT-711 | runtime | v1-full | Protocol compatibility phải có machine-checkable tests: schema validation message validation authentication authorization error handling version negotiation security performance envelope | tasks/0911 §92 | - | T924 |
+| REQ-RT-712 | runtime | v1-full | Trace: OrgA ↓ Federation ↓ OrgB ↓ Service ↓ Agent phải giữ correlation ID. | tasks/0911 §94 | - | T924 |
+| REQ-RT-713 | runtime | v1-full | Federation không được dùng một trust boundary duy nhất cho mọi member. | tasks/0911 §95 | - | T924 |
+| REQ-RT-714 | runtime | v1-full | Federation không được dùng một trust boundary duy nhất cho mọi member. Mỗi member phải có: identity credential capability authority trust state | tasks/0911 §95 | - | T924 |
+| REQ-RT-715 | runtime | v1-full | Nếu member credential bị revoke: credential.status = REVOKED mọi bridge phụ thuộc phải đánh giá lại. | tasks/0911 §96 | - | T924 |
+| REQ-RT-716 | runtime | v1-full | credential.status = REVOKED mọi bridge phụ thuộc phải đánh giá lại. Không được tiếp tục vô thời hạn vì cached trust. | tasks/0911 §96 | - | T925 |
+| REQ-RT-717 | runtime | v1-full | Protocol có thể: ACTIVE DEPRECATED SUSPENDED REVOKED Client phải biết protocol state. | tasks/0911 §97 | - | T925 |
+| REQ-RT-718 | runtime | v1-full | Standard version mới không được tự động phá compatibility nếu profile không yêu cầu. | tasks/0911 §98 | - | T925 |
+| REQ-RT-719 | runtime | v1-full | Standard version mới không được tự động phá compatibility nếu profile không yêu cầu. Phải hỗ trợ: compatibility matrix | tasks/0911 §98 | - | T925 |
+| REQ-RT-720 | runtime | v1-full | --- Data sharing phải có: source owner/custodian purpose scope classification retention residency access policy | tasks/0911 §99 | - | T925 |
+| REQ-RT-721 | runtime | v1-full | Federation có thể duy trì: CommonKnowledgeGraph nhưng mỗi assertion phải giữ: provenance issuer verification timestamp confidence | tasks/0911 §100 | - | T925 |
+| REQ-RT-722 | runtime | v1-full | Nếu: OrgA says X OrgB says !X không được tự động merge thành: X ∧ !X = truth | tasks/0911 §101 | - | T925 |
+| REQ-RT-723 | runtime | v1-full | CrossOrgPolicy PolicyConflict PolicyResolution phải có: scope issuer precedence effective time | tasks/0911 §103 | - | T925 |
+| REQ-RT-724 | runtime | v1-full | --- Invariant quan trọng: FED-001: Federation membership MUST NOT imply unrestricted transfer of organizational authority. | tasks/0911 §105 | - | T925 |
+| REQ-RT-725 | runtime | v1-full | ```text FED-001: Federation membership MUST NOT imply unrestricted transfer of organizational authority. ``` | tasks/0911 §105 | - | T925 |
+| REQ-RT-726 | runtime | v1-full | ```text FED-002: Federation formation MUST NOT automatically create authority not explicitly granted. ``` | tasks/0911 §106 | - | T925 |
+| REQ-RT-727 | runtime | v1-full | ```text FED-003: Federation membership MUST NOT manufacture technical capabilities. ``` | tasks/0911 §107 | - | T925 |
+| REQ-RT-728 | runtime | v1-full | ```text FED-004: Federation authority MUST NOT override 664 safety constraints. ``` | tasks/0911 §108 | - | T925 |
+| REQ-RT-729 | runtime | v1-full | ```text FED-005: Federation governance MUST respect 665 human-oversight requirements where applicable. ``` | tasks/0911 §109 | - | T925 |
+| REQ-RT-730 | runtime | v1-full | ```text FED-006: Capability, authority, trust, accreditation, membership and reputation MUST remain distinct. ``` | tasks/0911 §110 | - | T925 |
+| REQ-RT-731 | runtime | v1-full | ```text FED-007: Collective decision MUST NOT be represented as factual truth solely because a federation adopted it. ``` | tasks/0911 §111 | - | T926 |
+| REQ-RT-732 | runtime | v1-full | ```text FED-008: A treaty MUST NOT automatically grant unavailable technical capability. ``` | tasks/0911 §112 | - | T926 |
+| REQ-RT-733 | runtime | v1-full | ```text FED-009: Cross-organization contracts MUST NOT bypass safety constraints. ``` | tasks/0911 §113 | - | T926 |
+| REQ-RT-734 | runtime | v1-full | ```text FED-010: Federation membership MUST NOT merge the identity of member organizations. ``` | tasks/0911 §114 | - | T926 |
+| REQ-RT-735 | runtime | v1-full | ```text FED-011: Historical federation decisions MUST NOT be silently rewritten. ``` | tasks/0911 §115 | - | T926 |
+| REQ-RT-736 | runtime | v1-full | ```text FED-012: Every federation authority MUST have an explicit scope. ``` | tasks/0911 §116 | - | T926 |
+| REQ-RT-737 | runtime | v1-full | ```text FED-013: Time-bounded federation authority MUST expire automatically. ``` | tasks/0911 §117 | - | T926 |
+| REQ-RT-738 | runtime | v1-full | ```text FED-014: Emergency authority MUST have an explicit expiration or review condition. ``` | tasks/0911 §118 | - | T926 |
+| REQ-RT-739 | runtime | v1-full | ```text FED-015: Cross-organization delegation MUST NOT exceed delegator authority. ``` | tasks/0911 §119 | - | T926 |
+| REQ-RT-740 | runtime | v1-full | ```text FED-016: Federation decisions requiring quorum MUST fail or enter the declared fallback state when quorum is absent. ``` | tasks/0911 §120 | - | T926 |
+| REQ-RT-741 | runtime | v1-full | ```text FED-017: Representation MUST be scoped to the mandate granted to the representative. ``` | tasks/0911 §121 | - | T926 |
+| REQ-RT-742 | runtime | v1-full | ```text FED-018: Veto authority MUST be scoped and MUST NOT become universal by default. ``` | tasks/0911 §122 | - | T926 |
+| REQ-RT-743 | runtime | v1-full | ```text FED-019: Common-pool allocation MUST NOT exceed available capacity. ``` | tasks/0911 §123 | - | T926 |
+| REQ-RT-744 | runtime | v1-full | ```text FED-020: Contribution MUST NOT automatically imply unrestricted governance authority. ``` | tasks/0911 §124 | - | T926 |
+| REQ-RT-745 | runtime | v1-full | ```text FED-021: Shared assets MUST have an explicit custodian or governance mechanism. ``` | tasks/0911 §125 | - | T926 |
+| REQ-RT-746 | runtime | v1-full | ```text FED-022: Mediation or arbitration MUST operate only within explicitly granted authority. ``` | tasks/0911 §126 | - | T927 |
+| REQ-RT-747 | runtime | v1-full | ```text FED-023: A federation resolution MUST NOT imply enforcement capability unless an enforcement mechanism exists. ``` | tasks/0911 §127 | - | T927 |
+| REQ-RT-748 | runtime | v1-full | ```text FED-024: Credential recognition MUST NOT imply identity merging. ``` | tasks/0911 §128 | - | T927 |
+| REQ-RT-749 | runtime | v1-full | ```text FED-025: Mutual recognition MUST be scope-bound and revocable according to its policy. ``` | tasks/0911 §129 | - | T927 |
+| REQ-RT-750 | runtime | v1-full | ```text FED-026: Protocol compatibility MUST be explicitly evaluated. ``` | tasks/0911 §130 | - | T927 |
+| REQ-RT-751 | runtime | v1-full | ```text FED-027: Cross-organization data sharing MUST respect 640 governance constraints. ``` | tasks/0911 §131 | - | T927 |
+| REQ-RT-752 | runtime | v1-full | ```text FED-028: Federation memory assertions MUST retain provenance. ``` | tasks/0911 §132 | - | T927 |
+| REQ-RT-753 | runtime | v1-full | ```text FED-029: Unresolved cross-organization knowledge conflicts MUST remain explicitly represented. ``` | tasks/0911 §133 | - | T927 |
+| REQ-RT-754 | runtime | v1-full | ```text FED-030: Federation dissolution MUST NOT silently erase mandatory historical records. ``` | tasks/0911 §134 | - | T927 |
+| REQ-RT-755 | runtime | v1-full | --- Mỗi common resource phải có ít nhất: total committed reserved allocated consumed available | tasks/0911 §154 | - | T927 |
+| REQ-RT-756 | runtime | v1-full | Mỗi common resource phải có ít nhất: total committed reserved allocated consumed available với invariant: available = total - committed - reserved - allocated - unavailable | tasks/0911 §154 | - | T928 |
+| REQ-RT-757 | runtime | v1-full | --- Distributed federation state phải hỗ trợ: snapshot event log version epoch conflict detection reconciliation | tasks/0911 §155 | - | T928 |
+| REQ-RT-758 | runtime | v1-full | Không được tự động giả định một mode là an toàn cho mọi federation. | tasks/0911 §156 | - | T928 |
+| REQ-RT-759 | runtime | v1-full | Nếu governance yêu cầu quorum mà partition tạo hai nhóm đều tưởng mình có authority: AuthorityEpoch phải ngăn: epoch_A == epoch_B | tasks/0911 §157 | - | T928 |
+| REQ-RT-760 | runtime | v1-full | Nếu shared service chết: service_failure federation phải có: fallback degraded_mode replacement manual_intervention | tasks/0911 §159 | - | T928 |
+| REQ-RT-761 | runtime | v1-full | Organization có thể thuộc nhiều federation: OrgA ├── FederationX ├── FederationY └── FederationZ Các authority scope phải độc lập. | tasks/0911 §160 | - | T928 |
+| REQ-RT-762 | runtime | v1-full | Nhưng authority chain vẫn phải được kiểm tra bằng intersection. | tasks/0911 §161 | - | T928 |
+| REQ-RT-763 | runtime | v1-full | --- Authority resolution phải có: cycle detection depth limit delegation graph validation | tasks/0911 §162 | - | T928 |
+| REQ-RT-764 | runtime | v1-full | Trust bridge: FederationA ↔ FederationB phải có: scope evidence expiry revocation | tasks/0911 §164 | - | T928 |
+| REQ-RT-765 | runtime | v1-full | 668 có thể mô tả: CrossOrgCapability nhưng capability thực tế vẫn phải được cấp bởi 603-compatible security boundary. | tasks/0911 §166 | - | T928 |
+| REQ-RT-766 | runtime | v1-full | Shared service có thể có: member_quota burst_quota emergency_quota priority_policy Priority policy phải explicit. | tasks/0911 §170 | - | T928 |
+| REQ-RT-767 | runtime | v1-full | --- Audit phải kiểm tra: membership authority treaties protocols resources decisions disputes credentials emergencies | tasks/0911 §172 | - | T928 |
+| REQ-RT-768 | runtime | v1-full | Khi accreditation bị suspend: dependent trust bridges phải có khả năng re-evaluate. | tasks/0911 §174 | - | T928 |
+| REQ-RT-769 | runtime | v1-full | Không được giả định mọi downstream credential lập tức invalid nếu policy không quy định. | tasks/0911 §175 | - | T928 |
+| REQ-RT-770 | runtime | v1-full | --- Critical decision phải replay được từ: proposal representation rules votes quorum authority resolution | tasks/0911 §176 | - | T928 |
+| REQ-RT-771 | runtime | v1-full | --- Verifier độc lập phải có thể kiểm tra: quorum_valid vote_valid authority_valid rule_version_valid result_valid | tasks/0911 §177 | - | T929 |
+| REQ-RT-772 | runtime | v1-full | Critical federation decision không được phụ thuộc vào hidden mutable state không thể audit. | tasks/0911 §178 | - | T929 |
+| REQ-RT-773 | runtime | v1-full | AI có thể hỗ trợ deliberation, nhưng decision artifact phải có: evidence procedure authority result | tasks/0911 §178 | - | T929 |
+| REQ-RT-774 | runtime | v1-full | Agent có thể đề xuất federation: FederationProposal nhưng việc tạo federation phải đi qua: 639 policy 647 AI governance 665 human oversight | tasks/0911 §181 | - | T929 |
+| REQ-RT-775 | runtime | v1-full | --- Agent không được: spawn federation → acquire resources → acquire authority → acquire credentials | tasks/0911 §182 | - | T929 |
+| REQ-RT-776 | runtime | v1-full | --- Ở quy mô lớn, federation memory phải hỗ trợ: partitioning indexing versioning retention provenance replication archival conflict resolution | tasks/0911 §183 | - | T929 |
+| REQ-RT-777 | runtime | v1-full | --- Federation registry phải hỗ trợ query: find organizations supporting protocol X find shared resources available to member Y find active treaties involving Z find unresolved disputes find accredited services find compatible federation protocols | tasks/0911 §185 | - | T929 |
+| REQ-RT-778 | runtime | v1-full | Ví dụ: policy.effective( federation, subject, operation, time ) phải trả: policy source version authority effective_time | tasks/0911 §186 | - | T929 |
+| REQ-RT-779 | runtime | v1-full | Treaty có thể phụ thuộc: protocol credential standard resource organization federation Dependency graph phải detect: cycle missing dependency expired dependency revoked dependency | tasks/0911 §188 | - | T929 |
+| REQ-RT-780 | runtime | v1-full | --- Protocol phải xác định: required protocol optional protocol minimum version maximum version security requirement | tasks/0911 §189 | - | T929 |
+| REQ-RT-781 | runtime | v1-full | FederationSnapshot phải chứa: identity_version membership_version governance_version treaty_version protocol_version resource_version memory_version | tasks/0911 §192 | - | T929 |
+| REQ-RT-782 | runtime | v1-full | --- Federation crash không được: double allocate resource double activate emergency authority double execute resolution | tasks/0911 §194 | - | T929 |
+| REQ-RT-783 | runtime | v1-full | Các operation như: TreatyRatify ResourceAllocate ResolutionPublish MembershipAdmit EmergencyActivate phải hỗ trợ idempotent execution. | tasks/0911 §195 | - | T929 |
+| REQ-RT-784 | runtime | v1-full | Không được đưa federation machinery vào mọi native executable. | tasks/0911 §196 | - | T929 |
+| REQ-RT-785 | runtime | v1-full | --- Public ABI phải dùng stable opaque handles: FederationHandle TreatyHandle ProtocolHandle CommonsHandle DisputeHandle | tasks/0911 §199 | - | T929 |
+| REQ-RT-786 | runtime | v1-full | Cross-platform adapters: Windows Linux macOS iOS Android WASM phải implement cùng semantic interface. | tasks/0911 §200 | - | T930 |
+| REQ-RT-787 | runtime | v1-full | --- WASM profile phải hỗ trợ: AXFED_WASM | tasks/0911 §201 | - | T930 |
+| REQ-RT-788 | runtime | v1-full | --- Mobile federation clients phải hỗ trợ: offline membership state credential cache event queue reconnection conflict resolution | tasks/0911 §202 | - | T930 |
+| REQ-RT-789 | runtime | v1-full | Edge profile: AXFED_EDGE phải hỗ trợ: intermittent connectivity local cache partial federation state eventual synchronization | tasks/0911 §203 | - | T930 |
+| REQ-RT-790 | runtime | v1-full | Sau partition: LOCAL_STATE + REMOTE_STATE phải được reconcile theo: epoch version authority event ordering conflict policy | tasks/0911 §204 | - | T930 |
+| REQ-RT-791 | runtime | v1-full | Những operations có thể merge tự động phải được đánh dấu: @mergeable | tasks/0911 §205 | - | T930 |
+| REQ-RT-792 | runtime | v1-full | Hai partition cùng tạo: Resolution A Resolution B thì không được tự động merge nếu chúng có overlapping authority. | tasks/0911 §206 | - | T930 |
+| REQ-RT-793 | runtime | v1-full | Resolution A Resolution B thì không được tự động merge nếu chúng có overlapping authority. Phải tạo: GovernanceConflict | tasks/0911 §206 | - | T930 |
+| REQ-RT-794 | runtime | v1-full | --- Emergency hoặc incident quan trọng phải có: IncidentReview | tasks/0911 §209 | - | T930 |
+| REQ-RT-795 | runtime | v1-full | Không được tự động sửa constitution/treaty mà không qua amendment procedure. | tasks/0911 §210 | - | T930 |
+| REQ-RT-796 | runtime | v1-full | --- Một federation không được coi: "I exist" | tasks/0911 §212 | - | T930 |
+| REQ-RT-797 | runtime | v1-full | --- Federation không được tự động: create new members | tasks/0911 §213 | - | T930 |
+| REQ-RT-798 | runtime | v1-full | Federation không được tự động clone chính nó thành federation khác với inherited authority. | tasks/0911 §214 | - | T930 |
+| REQ-RT-799 | runtime | v1-full | Federation không được silently override global configuration. | tasks/0911 §218 | - | T930 |
+| REQ-RT-800 | runtime | v1-full | --- BOOTSTRAP-668 phải có tối thiểu: 220 explicit invariants | tasks/0911 §222 | - | T930 |
+| REQ-RT-801 | runtime | v1-full | BOOTSTRAP-668 phải có tối thiểu: ```text 220 explicit invariants ``` | tasks/0911 §222 | - | T931 |
+| REQ-RT-802 | runtime | v1-full | --- Phải có test cho: unauthorized federation creation unauthorized admission expired membership revoked credential invalid treaty ratification insufficient quorum invalid representation authority escalation capability escalation resource over-allocation double reservation expired emergency authority cross-org policy conflict invalid arbitration unauthorized enforcement credential identity collision protocol incompatibility split-brain governance duplicate resolution duplicate resource allocation federation merge conflict federation split conflict dissolution data loss | tasks/0911 §224 | - | T931 |
+| REQ-RT-803 | runtime | v1-full | --- Compiler phải chứng minh: AXFED_NONE | tasks/0911 §225 | - | T931 |
+| REQ-RT-804 | runtime | v1-full | Các subsystem: AXFED_TREATY AXFED_INTEROP AXFED_COMMONS AXFED_DISPUTE AXFED_EMERGENCY phải được link độc lập. | tasks/0911 §225 | - | T931 |
+| REQ-RT-805 | runtime | v1-full | --- Runtime phải chứng minh: organization autonomy authority boundaries treaty lifecycle protocol lifecycle resource accounting governance replay dispute lifecycle emergency expiry identity federation credential revocation distributed recovery | tasks/0911 §226 | - | T931 |
+| REQ-RT-806 | runtime | v1-full | --- Không được có đường tắt: member → federation → unrestricted capability | tasks/0911 §227 | - | T931 |
+| REQ-RT-807 | runtime | v1-full | Các operation được policy đánh dấu: human_required phải dừng trước execution cho tới khi có approval hợp lệ. | tasks/0911 §228 | - | T931 |
+| REQ-RT-808 | runtime | v1-full | --- AI agent không được tự động: create federation grant itself authority grant itself credentials allocate unlimited common resources modify treaty without ratification extend emergency authority indefinitely | tasks/0911 §229 | - | T931 |
+| REQ-RT-809 | runtime | v1-full | ```text BOOTSTRAP-668 Native AI Federation & Civilization-Scale Inter-Organizational Runtime STATUS = COMPLETE Target Tests >= 3,200 Target Invariants >= 220 ``` | tasks/0911 §231 | - | T931 |
 | REQ-ECO-8776 | ecosystem | post-v1 | The runtime must enable and support the domain requirements for 0915. Tiếp tục chuỗi kiến trúc Axiom. Task kế tiếp là **BOOTSTRAP-671 — Civilization-Scale Economy Runtime**. Tôi giữ nguyên nguyên tắc: đây là **economic substrate**, không biến Axiom thành một hệ thống tự quyết chính sách kinh tế. | tasks/0915 §1 | - | EPIC(E24.9) |
 | REQ-ECO-8777 | ecosystem | post-v1 | The runtime must enable and support the domain requirements for 0916. Tiếp tục chuỗi Axiom với **BOOTSTRAP-672 — Civilization-Scale Law, Rights, Legal Identity, Contracts, Regulation, Courts, Adjudication & Justice Runtime 5.0**. | tasks/0916 §1 | - | EPIC(E24.9) |
 | REQ-ECO-8778 | ecosystem | post-v1 | The runtime must enable and support the domain requirements for 0917. Tiếp tục với task kế tiếp trong chuỗi Axiom: **BOOTSTRAP-671 — Native AI Civilization-Scale Economy, Markets, Production, Finance, Trade, Monetary Systems & Economic Simulation Runtime 5.0**. | tasks/0917 §1 | - | EPIC(E24.9) |
