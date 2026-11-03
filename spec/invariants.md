@@ -52,7 +52,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
 data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, x86-64 SSE2/AVX2/VEX encoding, `TargetDesc` CPU feature hierarchy, `@target_feature` legality, `std.arch` `CPUID`/`XGETBV` detection, and `@multiversion` dispatch (`SPEC-42`, `SPEC-43`, `SPEC-44`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
-address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`). A new group is added by editing this list.
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`), `SEC` safety profiles, capability-based OS authority, `Secret<T>` zeroization, and `@constant_time` execution (`SPEC-53`), `PAN` panic strategies (`--panic abort|unwind`), `catch_unwind`, deterministic `Drop` unwinding, `@no_panic` verification, Windows x64 SEH `.pdata`/`.xdata` unwind tables, and `extern "C"` FFI no-unwind barrier (`SPEC-54`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -795,11 +795,34 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T520
 - check: positive and negative conformance tests in tests/conformance/p13/e13_4_security_profiles (delivered by T520) pass in `--interp` and native modes with `0 WEAK-NATIVE`
 
+## 19. Panic strategy, deterministic drop unwinding, @no_panic verification, and FFI no-unwind barrier (SPEC-54)
+
+### INV-PAN-001 — `--panic abort|unwind` driver flag, `@no_panic` transitive call-graph verification, MIR unwind cleanup edges, FFI boundary abort guard, and oracle `std.panic.catch_unwind`
+- statement: The compiler driver accepts `--panic abort|unwind` and `axiom.toml` `panic = "abort" | "unwind"` (`REQ-FFI-125`), emitting `AX_DRIVER_INVALID_PANIC_STRATEGY` (exit code 2) on invalid values or unsupported `--no-std` unwind requests. Semantic analysis enforces `@no_panic` (`REQ-ABI-105`), rejecting any direct or transitive panic source (`panic`, `assert`, `unwrap`, unchecked indexing, unverified division/remainder, or non-`@no_panic` calls) with `AX_PANIC_FORBIDDEN_IN_NO_PANIC` and non-function `@no_panic` attributes with `AX_TYPE_INVALID_NO_PANIC_ATTR`. Under `--panic unwind`, MIR lowering emits explicit unwind cleanup edges executing reverse-order `Drop` glue (`REQ-FFI-094`), synthesized `AbortOnUnwind` guards on `extern "C"` boundaries (`REQ-FFI-004`, `REQ-FFI-010`, `REQ-FFI-019`, `REQ-FFI-023`, `REQ-FFI-041`, `REQ-FFI-061`, `REQ-FFI-093`, `REQ-ABI-096`), double-panic abort guards, and `std.panic.catch_unwind` recovery (`REQ-FFI-127`) (SPEC-54 AXS-PAN-001..023, AXS-PAN-050..053).
+- source: 0107 §7; 0119; 0131; 0138; 0188 AFINAL-26..27; 0229; tasks/0351 AFFI-27; tasks/0413 AUNSAFE-32; tasks/0445; tasks/0478 AGOV2-26; tasks/0517 APANIC-20..40; tasks/0585; tasks/0700; REQ-FFI-004, REQ-FFI-010, REQ-FFI-019, REQ-FFI-023, REQ-FFI-041, REQ-FFI-061, REQ-FFI-093, REQ-FFI-094, REQ-ABI-096, REQ-FFI-125, REQ-FFI-127, REQ-ABI-105; SPEC-54 AXS-PAN-001..023, AXS-PAN-050..053
+- verify: tests/ui/panic, tests/run/panic_oracle
+- since: T522
+- check: UI tests in tests/ui/panic and oracle execution tests in tests/run/panic_oracle (delivered by T522) verify `--panic abort|unwind` CLI validation, `@no_panic` call-graph diagnostics, reverse-order `Drop` execution during unwinding, `std.panic.catch_unwind` recovery, double-panic abort, and `extern "C"` boundary abort barriers
+
+### INV-PAN-002 — Native x86-64 MIR cleanup landing pads, Windows x64 SEH `.pdata`/`.xdata` unwind metadata, and native `catch_unwind` / `extern "C"` no-unwind barrier parity
+- statement: The native x86-64 backend lowers MIR unwind cleanup edges into native cleanup landing pads (`REQ-FFI-094`), emits Windows x64 SEH `.pdata` (`RUNTIME_FUNCTION`) and `.xdata` (`UNWIND_INFO`) unwind metadata tables in COFF/PE outputs, and executes `std.panic.catch_unwind` (`REQ-FFI-127`), double-panic abort, and `extern "C"` callback panic abort barriers (`REQ-FFI-004`, `REQ-FFI-010`, `REQ-FFI-019`, `REQ-FFI-023`, `REQ-FFI-041`, `REQ-FFI-061`, `REQ-FFI-093`, `REQ-ABI-096`) identically to `--interp` (`0 WEAK-NATIVE`) (SPEC-54 AXS-PAN-010..023, AXS-PAN-051..053).
+- source: 0188 AFINAL-26..27; tasks/0351 AFFI-27; tasks/0517 APANIC-20..40; tasks/0585; tasks/0700; REQ-FFI-004, REQ-FFI-010, REQ-FFI-019, REQ-FFI-023, REQ-FFI-041, REQ-FFI-061, REQ-FFI-093, REQ-FFI-094, REQ-ABI-096, REQ-FFI-127; SPEC-54 AXS-PAN-010..023, AXS-PAN-051..053
+- verify: tests/run/panic_native
+- since: T523
+- check: native execution tests in tests/run/panic_native (delivered by T523) verify native reverse-order `Drop` unwinding, `std.panic.catch_unwind` recovery, double-panic abort, `extern "C"` callback no-unwind abort barrier, and PE `.pdata`/`.xdata` unwind table generation on Windows x64
+
+### INV-PAN-003 — End-to-end E13.5 `--panic abort|unwind`, `@no_panic`, `std.panic.catch_unwind`, and FFI no-unwind barrier conformance
+- statement: The E13.5 conformance suite certifies `--panic abort|unwind` (`REQ-FFI-125`), `@no_panic` transitive panic-freedom verification (`REQ-ABI-105`), reverse-order `Drop` cleanup during stack unwinding (`REQ-FFI-094`), `std.panic.catch_unwind` isolation (`REQ-FFI-127`), double-panic abort, and `extern "C"` / WASM / plugin / GPU FFI no-unwind abort barriers (`REQ-FFI-004`, `REQ-FFI-010`, `REQ-FFI-019`, `REQ-FFI-023`, `REQ-FFI-041`, `REQ-FFI-061`, `REQ-FFI-093`, `REQ-ABI-096`) across `--interp` and native x86-64 with `0 WEAK-NATIVE` (SPEC-54 AXS-PAN-001..053).
+- source: SPEC-54 AXS-PAN-001..053; 0107; 0119; 0131; 0138; 0188; 0229; tasks/0351; tasks/0413; tasks/0445; tasks/0478; tasks/0517; tasks/0585; tasks/0700; REQ-FFI-004, REQ-FFI-010, REQ-FFI-019, REQ-FFI-023, REQ-FFI-041, REQ-FFI-061, REQ-FFI-093, REQ-FFI-094, REQ-ABI-096, REQ-FFI-125, REQ-FFI-127, REQ-ABI-105
+- verify: tests/conformance/p13/e13_5_panic_unwinding
+- since: T524
+- check: positive and negative conformance tests in tests/conformance/p13/e13_5_panic_unwinding (delivered by T524) pass in `--interp` and native modes with `0 WEAK-NATIVE`
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
-(ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+(ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0188; 0229; 0263 §28, §46-§47; tasks/0351; tasks/0517; tasks/0700; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

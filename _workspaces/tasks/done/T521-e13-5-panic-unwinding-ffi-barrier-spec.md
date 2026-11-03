@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T213]
 priority: 170
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-54-panic-unwinding.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md, spec/SPEC-12-drop.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-12-drop.md, 0229, tasks/0351, tasks/0700]
 covers: [REQ-FFI-004, REQ-FFI-010, REQ-FFI-019, REQ-FFI-023, REQ-FFI-041, REQ-FFI-061, REQ-FFI-093, REQ-ABI-096, REQ-FFI-125, REQ-ABI-105]
+started: 2026-11-03 10:38:26
+finished: 2026-11-03 10:51:24
 ---
 # T521 — E13.5 — Canonical panic strategy (abort vs unwind), FFI no-unwind barrier & drop cleanup specification (SPEC-54)
 
@@ -42,3 +44,5 @@ Specify Axiom's per-profile panic strategy (`--panic abort|unwind`), determinist
 
 ## Log
 - 2026-11-03 02:04:00 created by T213 (P13 phase planning)
+- 2026-11-03 10:38:26 started (attempt 1) 
+- 2026-11-03 10:51:24 accepted by QA -> done

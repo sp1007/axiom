@@ -126,7 +126,10 @@ They map to the areas above as the last column shows. Three groups have no area 
   (`AX_SEC_UNSAFE_FORBIDDEN`, `AX_SEC_CONFLICTING_SAFETY_POLICY`), `sandbox`/`comptime` ambient OS authority ban
   (`AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN`), capability provenance forgery rejection (`AX_SEC_CAPABILITY_FORGERY`), and
   `@constant_time` / `Secret<T>` verification (`AX_SEC_TIMING_LEAK`, `AX_SEC_SECRET_IMPLICIT_COPY`,
-  `AX_SEC_SECRET_EXPOSURE`, `AX_SEC_INVALID_CONSTANT_TIME_ATTR`).
+  `AX_SEC_SECRET_EXPOSURE`, `AX_SEC_INVALID_CONSTANT_TIME_ATTR`). For E13.5 (`T521` / `SPEC-54 §4`), the `PANIC`
+  prefix (`AX_PANIC_*`, alongside `AX_DRIVER_*`, `AX_TYPE_*`, and `AX_FFI_*` in `compiler/diag/code.ax`, `T522`) is
+  established for self-hosted `axiomc`, covering `@no_panic` call-graph and checked-operation verification
+  (`AX_PANIC_FORBIDDEN_IN_NO_PANIC`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -602,9 +605,13 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_SEC_INVALID_CONSTANT_TIME_ATTR` | E | T518 | `@constant_time` or `@secret` applied to an invalid item (`async fn`, `extern fn` without body, or non-zeroizable type) (`SPEC-53` AXS-SEC-020, AXS-SEC-023, AXS-SEC-050) |
 | `AX_CAP_ZERO_COPY_DESERIALIZE_UNPROVEN` | E | T518 | zero-copy deserialization requested for a type `T` lacking proven bit-validity, alignment, or `@repr(C)` layout (`REQ-CAP-141`, `SPEC-53` AXS-SEC-014, AXS-SEC-050) |
 | `AX_CAP_IO_BUFFER_OVERLAP` | E | T519 | scatter/gather I/O vector constructed with overlapping mutable buffer slices (`REQ-CAP-135`, `REQ-CAP-139`, `SPEC-53` AXS-SEC-013, AXS-SEC-050) |
+| `AX_DRIVER_INVALID_PANIC_STRATEGY` | E | T522 | unknown `--panic <mode>` or `axiom.toml` `panic` value outside `{abort, unwind}`, or `--panic unwind` requested on a freestanding `--no-std` target lacking an unwinder (`REQ-FFI-125`, `SPEC-54` AXS-PAN-001, AXS-PAN-004, AXS-PAN-050) |
+| `AX_PANIC_FORBIDDEN_IN_NO_PANIC` | E | T522 | `@no_panic` function directly or transitively calls `panic`, `unreachable`, `assert`, `Option.unwrap`, `Result.unwrap`, unchecked indexing, checked division/remainder without a non-zero proof, or a non-`@no_panic` function (`REQ-ABI-105`, `SPEC-54` AXS-PAN-005, AXS-PAN-050) |
+| `AX_TYPE_INVALID_NO_PANIC_ATTR` | E | T522 | `@no_panic` attribute applied to a non-function item (`struct`, `enum`, `trait`, `type`, `let`, `const`, `static`) (`SPEC-54` AXS-PAN-005, AXS-PAN-050) |
+| `AX_FFI_INVALID_UNWIND_CONTRACT` | E | T522 | invalid unwind-crossing attribute or calling-convention modifier applied to an `extern "C"` declaration or exported function (`REQ-FFI-004`, `REQ-FFI-041`, `REQ-FFI-093`, `SPEC-54` AXS-PAN-010, AXS-PAN-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

@@ -24,7 +24,7 @@ An explicit call to `drop(x)` immediately triggers the destructor (per ADR-0006 
 When generic types or traits are dropped, the compiler synthesizes drop glue (`drop_in_place`) to recursively invoke destructors for inner fields.
 
 ### AXS-DROP-006: Panic Interaction
-Drop is not a recoverable-error mechanism. If a panic occurs, the unwinder executes pending drops. If a destructor panics while the system is already unwinding (double panic), the process MUST immediately abort.
+Drop is not a recoverable-error mechanism. Under `--panic unwind` (`spec/SPEC-54-panic-unwinding.md` `AXS-PAN-010`..`012`), if a panic occurs, the unwinder executes pending drops for all live initialized local places in reverse declaration order across each unwinding stack frame up to the nearest `std.panic.catch_unwind` recovery boundary, thread/task root, or `extern "C"` FFI no-unwind barrier (`AXS-PAN-020`). If a destructor panics while the system is already unwinding (double panic), the process MUST immediately abort with exit code `101` (`AXS-PAN-011`). Under `--panic abort` (`AXS-PAN-003`), panics terminate immediately without running unwind drops.
 
 ### AXS-DROP-007: Drop on Assignment; Raw-Pointer Stores Never Drop
 An assignment `place = rhs` whose place type needs drop runs, in this order (SPEC-03 AXS-SEM-043):
@@ -69,6 +69,7 @@ The MIR must carry:
 | AXS-DROP-008 | `trait Drop` in module `m`; `impl m.Drop for S { fn drop(...) { print } }` | Yes (no destructor output at scope end) | T158 |
 
 ## References
-- `docs/base/specs/0178`, `docs/base/specs/0030`, `docs/base/specs/0118`, `docs/base/tasks/0674`
+- `docs/base/specs/0178`, `docs/base/specs/0030`, `docs/base/specs/0118`, `docs/base/specs/0229`, `docs/base/tasks/0351`, `docs/base/tasks/0674`, `docs/base/tasks/0700`
+- [SPEC-54: Panic Strategy, Drop Unwinding & FFI No-Unwind Barrier](SPEC-54-panic-unwinding.md) (`AXS-PAN-001`..`023`)
 - [ADR-0014](../decisions/ADR-0014-ownership-capabilities-drop-semantics.md)
 - [ADR-0036](../decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md)
