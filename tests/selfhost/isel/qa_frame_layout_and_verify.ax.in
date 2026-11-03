@@ -23,6 +23,7 @@ use compiler.types.types.intern_array_ty
 use compiler.types.types.type_interner_init
 use compiler.types.types.type_interner_free
 use compiler.lir.lir.LIR_INST_CONST
+use compiler.lir.lir.LIR_INST_ADD
 use compiler.lir.lir.LIR_INST_STACK_ADDR
 use compiler.lir.lir.LIR_INST_STORE
 use compiler.lir.lir.LIR_TERM_RETURN
@@ -120,6 +121,29 @@ use compiler.target.x64.x64_verify
 use compiler.target.x64.x64_emit_mi_body_mc
 use compiler.target.x64.x64_emit_mi_body_obj
 use compiler.target.x64.x64_dump_mc_hex
+use compiler.target.x64.REG_CLASS_GPR
+use compiler.target.x64.REG_CLASS_XMM
+use compiler.target.x64.REG_XMM0
+use compiler.target.x64.X64TargetDesc
+use compiler.target.x64.X64LivenessInfo
+use compiler.target.x64.X64LiveRange
+use compiler.target.x64.X64UsePos
+use compiler.target.x64.X64LiveInterval
+use compiler.target.x64.X64ColoredSpillSlot
+use compiler.target.x64.X64StackSlotAllocator
+use compiler.target.x64.X64ParallelCopy
+use compiler.target.x64.X64RegAllocResult
+use compiler.target.x64.x64_target_desc_win64
+use compiler.target.x64.x64_reg_is_gpr
+use compiler.target.x64.x64_reg_is_xmm
+use compiler.target.x64.x64_compute_liveness_in_arena
+use compiler.target.x64.x64_liveness_loop_depth
+use compiler.target.x64.x64_loop_weight_multiplier
+use compiler.target.x64.x64_emit_parallel_copies_in_arena
+use compiler.target.x64.x64_regalloc_in_arena
+use compiler.target.x64.x64_frame_lower_opt_in_arena
+use compiler.target.x64.x64_frame_callee_saved_mask
+use compiler.target.x64.x64_frame_callee_saved_bytes
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 @intrinsic fn align_of<T>() -> usize { 0 }
@@ -522,6 +546,143 @@ fn test_mc_and_obj_emission(a: mut_view<Arena>, ti_ptr: *mut TypeInterner, out: 
     0
 }
 
+fn test_linear_scan_ra_and_opt_frame(a: mut_view<Arena>, ti_ptr: *mut TypeInterner) -> i32 {
+    let td = x64_target_desc_win64();
+    if td.gpr_count != 14u8 || td.xmm_count != 16u8 {
+        return 501;
+    }
+    if !x64_reg_is_gpr(REG_RAX) || !x64_reg_is_xmm(REG_XMM0) || REG_CLASS_GPR == REG_CLASS_XMM {
+        return 502;
+    }
+    if x64_loop_weight_multiplier(0u32) != 1u64 ||
+       x64_loop_weight_multiplier(1u32) != 10u64 ||
+       x64_loop_weight_multiplier(2u32) != 100u64 {
+        return 503;
+    }
+
+    // Test parallel copy cycle breaking (`rax <-> rcx`).
+    let b_pc = x64_mi_body_new(mut_view(*a), 1);
+    let mbb_pc = unsafe { x64_mi_bb_at((*b_pc).bbs, 0) };
+    let copies = arena_alloc_raw(
+        mut_view(*a), 2 * size_of<X64ParallelCopy>(), align_of<X64ParallelCopy>()
+    ) as *mut X64ParallelCopy;
+    unsafe {
+        let c0 = copies;
+        let c1 = ((copies as usize) + size_of<X64ParallelCopy>()) as *mut X64ParallelCopy;
+        (*c0).dst_reg = REG_RAX;
+        (*c0).src_reg = REG_RCX;
+        (*c0).size = 8u8;
+        (*c1).dst_reg = REG_RCX;
+        (*c1).src_reg = REG_RAX;
+        (*c1).size = 8u8;
+        x64_emit_parallel_copies_in_arena(mut_view(*a), mut_view(*b_pc), mut_view(*mbb_pc), copies, 2, REG_RDX);
+    }
+    let pc_i0 = unsafe { bb_inst_at(mbb_pc, 0) };
+    let pc_i2 = unsafe { bb_inst_at(mbb_pc, 2) };
+    if (pc_i0 as usize) == 0 || (pc_i2 as usize) == 0 {
+        return 504;
+    }
+
+    // Build a 6-vreg LIR body and test liveness, RA, and `-O0`/`-O1`/`-O2` frame lowering.
+    let i64_v = unsafe { (*ti_ptr).t_i64.v };
+    let lir = lir_body_new(mut_view(*a));
+    let vregs = arena_alloc_raw(mut_view(*a), 6 * size_of<LirVReg>(), align_of<LirVReg>()) as *mut LirVReg;
+    let bbs = arena_alloc_raw(mut_view(*a), size_of<LirBb>(), align_of<LirBb>()) as *mut LirBb;
+    let insts = arena_alloc_raw(mut_view(*a), 5 * size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    unsafe {
+        let mut v: usize = 0;
+        while v < 6 {
+            (*lir_vreg_at(vregs, v)).ty.v = i64_v;
+            v = v + 1;
+        }
+        (*lir).vregs = vregs;
+        (*lir).vreg_count = 6;
+
+        let i0 = lir_inst_at(insts, 0);
+        lir_inst_reset(mut_view(*i0), LIR_INST_CONST);
+        (*i0).dest.v = 0u32;
+        (*i0).const_val = 10u64;
+
+        let i1 = lir_inst_at(insts, 1);
+        lir_inst_reset(mut_view(*i1), LIR_INST_CONST);
+        (*i1).dest.v = 1u32;
+        (*i1).const_val = 20u64;
+
+        let i2 = lir_inst_at(insts, 2);
+        lir_inst_reset(mut_view(*i2), LIR_INST_ADD);
+        (*i2).dest.v = 2u32;
+        (*i2).lhs.v = 0u32;
+        (*i2).rhs.v = 1u32;
+
+        let i3 = lir_inst_at(insts, 3);
+        lir_inst_reset(mut_view(*i3), LIR_INST_ADD);
+        (*i3).dest.v = 3u32;
+        (*i3).lhs.v = 2u32;
+        (*i3).rhs.v = 0u32;
+
+        let i4 = lir_inst_at(insts, 4);
+        lir_inst_reset(mut_view(*i4), LIR_INST_ADD);
+        (*i4).dest.v = 4u32;
+        (*i4).lhs.v = 3u32;
+        (*i4).rhs.v = 1u32;
+
+        let bb0 = lir_bb_at(bbs, 0);
+        lir_bb_reset(mut_view(*bb0), 0u32);
+        (*bb0).insts = insts;
+        (*bb0).inst_count = 5;
+        lir_term_reset(mut_view((*bb0).term), LIR_TERM_RETURN);
+        (*lir).bbs = bbs;
+        (*lir).bb_count = 1;
+    }
+
+    let mi_o0 = x64_isel(unsafe { view(*lir) }, unsafe { view(*ti_ptr) });
+    let lv = x64_compute_liveness_in_arena(mut_view(*a), unsafe { view(*lir) }, unsafe { view(*mi_o0) });
+    if lv.bb_count != 1u32 || x64_liveness_loop_depth(view(lv), 0) != 0u32 {
+        return 505;
+    }
+    let lay_o0 = x64_frame_lower_opt_in_arena(
+        mut_view(*a), unsafe { mut_view(*mi_o0) }, unsafe { view(*lir) }, unsafe { view(*ti_ptr) }, 0u8
+    );
+    if x64_verify_checked(unsafe { view(*mi_o0) }, view(lay_o0)) != X64_VERIFY_OK {
+        return 506;
+    }
+
+    let mi_o1 = x64_isel(unsafe { view(*lir) }, unsafe { view(*ti_ptr) });
+    let lay_o1 = x64_frame_lower_opt_in_arena(
+        mut_view(*a), unsafe { mut_view(*mi_o1) }, unsafe { view(*lir) }, unsafe { view(*ti_ptr) }, 1u8
+    );
+    if x64_verify_checked(unsafe { view(*mi_o1) }, view(lay_o1)) != X64_VERIFY_OK {
+        return 507;
+    }
+
+    let mi_o2 = x64_isel(unsafe { view(*lir) }, unsafe { view(*ti_ptr) });
+    let lay_o2 = x64_frame_lower_opt_in_arena(
+        mut_view(*a), unsafe { mut_view(*mi_o2) }, unsafe { view(*lir) }, unsafe { view(*ti_ptr) }, 2u8
+    );
+    if x64_verify_checked(unsafe { view(*mi_o2) }, view(lay_o2)) != X64_VERIFY_OK {
+        return 508;
+    }
+
+    // Optimizing frame lowering should shrink frame_size and callee-saved pushes relative to baseline `-O0`.
+    if lay_o1.frame_size > lay_o0.frame_size || x64_frame_callee_saved_bytes(view(lay_o1)) > 56u32 {
+        return 509;
+    }
+    if x64_frame_callee_saved_mask(view(lay_o2)) != x64_frame_callee_saved_mask(view(lay_o1)) {
+        return 510;
+    }
+
+    let mi_ra = x64_isel(unsafe { view(*lir) }, unsafe { view(*ti_ptr) });
+    let ra_res = x64_regalloc_in_arena(
+        mut_view(*a), unsafe { mut_view(*mi_ra) }, unsafe { view(*lir) }, unsafe { view(*ti_ptr) }
+    );
+    if ra_res.interval_count != 6 {
+        return 511;
+    }
+
+    arena_reset(mut_view(*a));
+    0
+}
+
 pub fn main() -> i32 {
     let mut perm = arena_with_chunk_size(131072);
     let _ = arena_alloc_raw(mut_view(perm), 16, 8);
@@ -546,6 +707,11 @@ pub fn main() -> i32 {
 
     let rc4 = test_mc_and_obj_emission(mut_view(a), ti_ptr, mut_view(out));
     if rc4 != 0 { return rc4; }
+
+    let rc5 = test_linear_scan_ra_and_opt_frame(mut_view(a), ti_ptr);
+    if rc5 != 0 {
+        return rc5;
+    }
 
     unsafe { type_interner_free(mut_view(*ti_ptr)); }
     arena_destroy(mut_view(a));

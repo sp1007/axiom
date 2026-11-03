@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T212]
 priority: 140
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-40-integers.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md, spec/SPEC-03-core-semantics.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, 0157, 0175, 0245, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-OWNER-007, REQ-SIMD-085, REQ-SIMD-101, REQ-SIMD-102, REQ-SIMD-103, REQ-SIMD-104, REQ-SIMD-105, REQ-SIMD-106, REQ-SIMD-156]
+started: 2026-11-03 07:13:34
 ---
 # T450 — E12.1 — Canonical integer model, 128-bit arithmetic & conversion specification (SPEC-40)
 
@@ -46,3 +47,4 @@ Consolidate the full integer arithmetic, 128-bit width (`i128`/`u128`), bit mani
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-03 07:13:34 started (attempt 1) 

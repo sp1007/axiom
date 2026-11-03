@@ -8,12 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T215, T627]
 priority: 90
-status: doing
+status: done
 attempts: 1
 paths: [compiler/target/x64, compiler/driver, tests/mc/regalloc, tests/selfhost, tests/perf]
 spec: [spec/SPEC-77-regalloc-machine-opt.md, 0182, 0235, 0252, tasks/0406, tasks/0557]
 covers: [REQ-OPT-203, REQ-OPT-204, REQ-OPT-212, REQ-OPT-218]
 started: 2026-11-03 03:25:30
+finished: 2026-11-03 07:14:19
 ---
 # T063 — E15.8 — Linear-scan register allocation, spill/reload & callee-saved frame integration
 
@@ -44,3 +45,4 @@ Replace the fixed-register stack-slot baseline at `-O1`/`-O2` with linear-scan r
 ## Log
 - 2026-11-03 02:44:30 refined scope, covers, and dependencies in T215 (P15 phase planning)
 - 2026-11-03 03:25:30 started (attempt 1) 
+- 2026-11-03 07:14:19 accepted by QA -> done
