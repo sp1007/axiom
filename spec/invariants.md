@@ -1090,8 +1090,31 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T763
 - check: conformance tests in tests/conformance/p18/e18_3_parallel (delivered by T763) pass across `--jobs 1`, `--jobs 2`, `--jobs 4`, and `--jobs 8` and in `--interp` and native modes with `0 WEAK-NATIVE`
 
+## 30. Canonical artifact format, module interfaces (`.axmi`), and embedded object/LTO sections (SPEC-24)
+
+### INV-ART-001 — Deterministic `.axmi` module interface serialization, source-free `CompilerDB` ingestion, and exported generic/capability/const summaries
+- statement: `compiler/artifact/axmi` emits and loads byte-deterministic `.axmi` module interface artifacts (`ArtifactHeader`, `SectionDescriptor[]`, BLAKE3-128 `content_hash`, zero pointers/timestamps) containing exported item signatures, canonical nominal `TypeId` tables, trait/impl coherence records, interprocedural ownership/capability/effect/panic/concurrency summaries (`tasks/0582`), evaluated `const` payloads, and pre-verified generic/`@inline`/`comptime` MIR templates (`tasks/0739`), populates `CompilerDB` directly from `.axmi` so downstream modules compile and instantiate generics without reading upstream `.ax` source files, and exposes `--emit=axmi` and `inspect --axmi <file>` (`SPEC-24` AXS-ART-001..014, AXS-ART-050).
+- source: SPEC-24 AXS-ART-001..014, AXS-ART-050; SPEC-04 AXS-EXT-070..074; tasks/0582 §323.1-20; tasks/0591 §1-12; tasks/0739 §493.1-30; tasks/0787 §565.1-140; REQ-CORE-3109, REQ-CORE-3110, REQ-CORE-3123, REQ-CORE-3124, REQ-LNK-434..573
+- verify: tests/run/artifact_axmi
+- since: T765
+- check: tests in tests/run/artifact_axmi (delivered by T765) compile an upstream module to `.axmi` + `.obj`, remove/hide the upstream `.ax` source, and compile a downstream consumer using only `.axmi` + `.obj` across generics, traits, capabilities, and `const` items
+
+### INV-ART-002 — Embedded non-alloc `.axmeta` / `.axlto` COFF object sections, schema/target/checksum validation, and final `.exe`/`.dll` stripping
+- statement: `compiler/artifact/container` and `compiler/obj/` embed non-alloc discardable `.axmeta` and `.axlto` (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_MEM_DISCARDABLE`) sections into COFF `.obj` and `.lib` artifacts carrying the module's `InterfaceFingerprint`, `AbiFingerprint`, `TargetFingerprint`, and LTO `Verified MIR` summary, validate magic, `schema_version`, target/ABI compatibility, bounds, and BLAKE3 checksums on load (diagnosing `AX_LINK_BAD_ARTIFACT`, `AX_LINK_ARTIFACT_SCHEMA_MISMATCH`, and `AX_LINK_ARTIFACT_TARGET_MISMATCH`), and strip all `.axmeta`/`.axmir`/`.axlto` sections when linking final `.exe` and `.dll` images (`SPEC-24` AXS-ART-020..024, AXS-ART-050).
+- source: SPEC-24 AXS-ART-020..024, AXS-ART-050; SPEC-04 AXS-EXT-071; 0164; tasks/0591; tasks/0739; tasks/0787 §565.141-180; tasks/0803 §581.1-110; REQ-LNK-574..613, REQ-LNK-3634..3743
+- verify: tests/run/artifact_container
+- since: T766
+- check: tests in tests/run/artifact_container (delivered by T766) verify `.axmeta`/`.axlto` embedding in `.obj`, round-trip extraction, rejection of corrupted or mismatched-schema/target sections with `AX_LINK_*` diagnostics, and stripping from final `.exe`
+
+### INV-ART-003 — End-to-end E18.4 `.axmi` module interface, `.axmeta`/`.axlto` container section, and source-free separate-compilation conformance
+- statement: The E18.4 conformance suite certifies multi-module separate compilation using `.axmi` and embedded `.axmeta`/`.axlto` sections without upstream `.ax` source files across generics, traits, capabilities, and `const` items, byte-identical `.axmi` and `.obj` emission across repeated runs, deterministic `AX_LINK_BAD_ARTIFACT` / `AX_LINK_ARTIFACT_SCHEMA_MISMATCH` / `AX_LINK_ARTIFACT_TARGET_MISMATCH` rejection on corrupt, wrong-schema, or wrong-target artifacts, and differential equivalence between `--interp` and native execution with `0 WEAK-NATIVE` (`SPEC-24` AXS-ART-001..053).
+- source: SPEC-24 AXS-ART-001..053; tasks/0739; tasks/0787 §565.181-200; tasks/0803 §581.111-200; REQ-LNK-614..633, REQ-LNK-3744..3784
+- verify: tests/conformance/p18/e18_4_artifacts
+- since: T767
+- check: positive and negative conformance tests in tests/conformance/p18/e18_4_artifacts (delivered by T767) pass in `--interp` and native modes with `0 WEAK-NATIVE`
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
-(ADIAG-20..90); 0142; 0146 §50-§58; 0151 §1-§25, §56-§57; 0152 §78-§79; 0185; 0186; 0187; 0188; 0212; 0229; 0263 §28, §46-§47; tasks/0351; tasks/0356; tasks/0369; tasks/0384; tasks/0389; tasks/0473; tasks/0476; tasks/0512; tasks/0517; tasks/0528; tasks/0530; tasks/0532; tasks/0533; tasks/0539; tasks/0562; tasks/0563; tasks/0564; tasks/0593; tasks/0700; tasks/0778; tasks/0781; tasks/0788; tasks/0789; tasks/0790; tasks/0791; tasks/0792; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §4, §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-21; SPEC-22; SPEC-23; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+(ADIAG-20..90); 0142; 0146 §50-§58; 0151 §1-§25, §56-§57; 0152 §78-§79; 0164; 0185; 0186; 0187; 0188; 0212; 0229; 0263 §28, §46-§47; tasks/0351; tasks/0356; tasks/0369; tasks/0384; tasks/0389; tasks/0473; tasks/0476; tasks/0512; tasks/0517; tasks/0528; tasks/0530; tasks/0532; tasks/0533; tasks/0539; tasks/0562; tasks/0563; tasks/0564; tasks/0582; tasks/0591; tasks/0593; tasks/0700; tasks/0739; tasks/0778; tasks/0781; tasks/0787; tasks/0788; tasks/0789; tasks/0790; tasks/0791; tasks/0792; tasks/0803; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §4, §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-21; SPEC-22; SPEC-23; SPEC-24; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
