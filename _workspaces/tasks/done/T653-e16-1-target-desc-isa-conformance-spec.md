@@ -6,14 +6,16 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T216, T313, T650]
+depends: [T216, T511, T650]
 priority: 96
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-81-target-desc-isa-conformance.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0162, 0163, tasks/0472, tasks/0518, tasks/0520, tasks/0521, tasks/0524, tasks/0784]
 covers: [REQ-TGT-004, REQ-TGT-005, REQ-TGT-006, REQ-TGT-007, REQ-TGT-008, REQ-TGT-009, REQ-TGT-010, REQ-TGT-011, REQ-TGT-285, REQ-TGT-286]
+started: 2026-11-03 14:48:53
+finished: 2026-11-03 15:02:52
 ---
 # T653 — E16.1 — Canonical declarative TargetDesc, ISA tables & backend conformance specification (SPEC-81)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Axiom's declarative target descripti
 
 ## Log
 - 2026-11-03 08:36:00 created by T216 (P16 phase planning)
+- 2026-11-03 14:48:53 started (attempt 1) 
+- 2026-11-03 15:02:52 accepted by QA -> done
