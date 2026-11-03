@@ -552,9 +552,19 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_SIMD_LANE_OUT_OF_RANGE` | E | T464 | compile-time constant lane index `idx >= N` in `extract` / `insert` (`SPEC-42` AXS-SIMD-011, AXS-SIMD-060) |
 | `AX_SIMD_SHUFFLE_OUT_OF_RANGE` | E | T464 | non-constant shuffle selector array or selector index `>= 2 * N` (`>= N` in single-vector `swizzle`) (`SPEC-42` AXS-SIMD-012, AXS-SIMD-060) |
 | `AX_SIMD_BITCAST_SIZE_MISMATCH` | E | T464 | `bitcast` / `simd_bitcast` between vector types of different total byte sizes or involving `Mask<N>` (`SPEC-42` AXS-SIMD-025, AXS-SIMD-060) |
+| `AX_TYPE_UNION_NON_COPY_FIELD` | E | T507 | untagged `union` field is neither `Copy` nor wrapped in `ManuallyDrop<T>` (`SPEC-51` AXS-MEM-011, AXS-MEM-050) |
+| `AX_TYPE_UNION_INIT_FIELD_COUNT` | E | T507 | `union` literal initializes zero fields or more than one field (`SPEC-51` AXS-MEM-012, AXS-MEM-050) |
+| `AX_TYPE_INVALID_ALIGN` | E | T507 | `@align(N)` or `@repr(packed(N))` specifies `N` that is `0`, not a power of two, or `> 2^29` (`SPEC-51` AXS-MEM-021..022, AXS-MEM-050) |
+| `AX_TYPE_CONFLICTING_REPR` | E | T507 | conflicting representation attributes on the same type (`@repr(packed)` combined with `@align(N)` or `@repr(transparent)`) (`SPEC-51` AXS-MEM-022, AXS-MEM-050) |
+| `AX_TYPE_UNALIGNED_PACKED_REF` | E | T507 | taking `view<T>`, `mut_view<T>`, or an aligned `*const T` / `*mut T` reference to an unaligned field of a `@repr(packed)` / `@repr(packed(N))` struct (`SPEC-51` AXS-MEM-023, AXS-MEM-050) |
+| `AX_TYPE_ADDR_SPACE_MISMATCH` | E | T507 | implicit conversion or cast between pointers of different `@addr_space(N)` qualifiers, or creating a host view from a non-host address space (`SPEC-51` AXS-MEM-024, AXS-MEM-050) |
+| `AX_TYPE_BITCAST_SIZE_MISMATCH` | E | T509 | `std.mem.bitcast<From, To>(v)` called when `size_of<From>() != size_of<To>()` or when either type is not bitcast-eligible (`SPEC-51` AXS-MEM-015, AXS-MEM-050) |
+| `AX_TYPE_MMIO_WRITE_READONLY` | E | T508/T509 | writing to or calling `.write`/`.modify` on a read-only `MmioRO<T>` register field (`SPEC-51` AXS-MEM-005..006, AXS-MEM-050) |
+| `AX_TYPE_MMIO_READ_WRITEONLY` | E | T508/T509 | reading from or calling `.read`/`.modify` on a write-only `MmioWO<T>` register field (`SPEC-51` AXS-MEM-005..006, AXS-MEM-050) |
+| `AX_UNSAFE_INVALID_VOLATILE_WIDTH` | E | T508/T509 | `volatile_load`/`volatile_store`/`Volatile<T>` instantiated with `!Copy`, or `Mmio*<T>` instantiated with `size_of<T>() not in {1, 2, 4, 8}` (`SPEC-51` AXS-MEM-002, AXS-MEM-005, AXS-MEM-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

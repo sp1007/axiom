@@ -6,13 +6,14 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T318]
-priority: 6
-status: todo
-attempts: 0
+depends: [T087]
+priority: 20
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
 covers: [REQ-TOOL-300]
+started: 2026-11-03 09:42:14
 ---
 # T219 — Plan phase P19: Developer tooling
 
@@ -43,3 +44,4 @@ the roadmap is invented.
 
 ## Log
 - 2026-10-06 02:31:22 covers += REQ-TOOL-300 (metadata only)
+- 2026-11-03 09:42:14 started (attempt 1) 

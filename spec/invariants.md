@@ -52,7 +52,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety, and
 data-oriented `TensorView`/`MatrixView` (`SPEC-42`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
-address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`). A new group is added by editing this list.
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -663,11 +663,41 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`). A new 
 - since: T468
 - check: tensor/matrix tests in tests/std/tensor_matrix (T467), UI capability tests in tests/ui/simd/capability_bounds (T468), and E12.3 conformance tests in tests/conformance/p12/e12_3_simd_vectors (T468) verify zero-copy views, tiled `matmul`, `SoA` vectorization, and capability conflict/escape rejection
 
+## 16. Raw memory, volatile/MMIO register wrappers, untagged unions, packed/aligned layout, and address spaces (SPEC-51)
+
+### INV-MEM-001 — Untagged `union` ownership safety, `@repr(packed)` / `@align(N)` layout, unaligned packed-field view prohibition, and `@addr_space(N)` checking
+- statement: Untagged `union` types place all fields at offset `0` (`size = align_up(max_field_size, align)`, `align = max_field_align`), restrict fields to `Copy` or `ManuallyDrop<T>` (`AX_TYPE_UNION_NON_COPY_FIELD`), require single-field initialization (`AX_TYPE_UNION_INIT_FIELD_COUNT`), permit safe field writes, and require `unsafe` for field reads or pattern matching (`AX_UNSAFE_REQUIRED`); `@align(N)` and `@repr(packed(N))` enforce power-of-two alignments (`AX_TYPE_INVALID_ALIGN`) and reject conflicting `@repr(packed)` + `@align(N)` combinations (`AX_TYPE_CONFLICTING_REPR`); creating a `view<T>`, `mut_view<T>`, or aligned `*const T`/`*mut T` to a potentially unaligned field of a `@repr(packed)` struct is rejected (`AX_TYPE_UNALIGNED_PACKED_REF`) while by-value copy loads/stores remain legal; and pointers with distinct `@addr_space(N)` qualifiers cannot implicitly coerce (`AX_TYPE_ADDR_SPACE_MISMATCH`) (SPEC-51 AXS-MEM-010..012, AXS-MEM-020..024, AXS-MEM-050).
+- source: 0067 §7-10, AREP-06..07; 0072 §1-13, AREP-13..16; 0113 §122; 0119 §226; 0132 §13-16, ADATA-29..31; tasks/0328 §26-27; tasks/0367 §82; tasks/0413 §70; tasks/0515 §84-88; SPEC-04 AXS-EXT-020..021, AXS-EXT-030; SPEC-51 AXS-MEM-010..012, AXS-MEM-020..024, AXS-MEM-050
+- verify: tests/ui/layout
+- since: T507
+- check: UI and layout tests in tests/ui/layout (delivered by T507) verify `union` size/alignment and `Copy`/`ManuallyDrop` field enforcement, `unsafe` union reads, `@repr(packed)`/`@align(N)` layout calculations, `AX_TYPE_UNALIGNED_PACKED_REF`, and `AX_TYPE_ADDR_SPACE_MISMATCH`
+
+### INV-MEM-002 — Non-elidable, non-reordering, exact-width non-tearing volatile and `Mmio*<T>` lowering plus unaligned packed codegen
+- statement: `volatile_load`, `volatile_store`, `volatile_copy`, `compiler_fence`, `memory_barrier`/`write_barrier`/`read_barrier`, and direct field reads/writes on `Volatile<T>`, `Mmio<T>`, `MmioRO<T>`, and `MmioWO<T>` (`ADR-0001 §2`) lower through `MirStmtKind.VolatileLoad`/`VolatileStore` and `LIR_MEM_FLAG_VOLATILE` without CSE, dead-store elimination, coalescing, loop hoisting, or cross-volatile reordering at `-O1`/`-O2`, emit exact-width non-tearing x86-64 instructions (`MOV r8/m8`, `MOV r16/m16`, `MOV r32/m32`, `MOV r64/m64`, `MFENCE`/`SFENCE`/`LFENCE`) for 1-, 2-, 4-, and 8-byte accesses, and lower `read_unaligned`, `write_unaligned`, and `@repr(packed)` by-value field loads/stores with alignment `1` (SPEC-51 AXS-MEM-001..005, AXS-MEM-023).
+- source: ADR-0001 §2; 0071 §31-32; 0097 AOS-26..30; 0128 §62; 0161 §30-31; 0162 §9-12, §32; tasks/0328 §13-16, §37-39, AMEMLOW-41..48, AMEMLOW-90..97; tasks/0515 §109, §112-115, §136-140, §149, AMEM-74..78, AMEM-93, AMEM-122; SPEC-04 AXS-EXT-043, AXS-EXT-051; SPEC-51 AXS-MEM-001..005, AXS-MEM-023
+- verify: tests/lir/volatile, tests/run/volatile
+- since: T508
+- check: LIR golden tests in tests/lir/volatile and differential execution tests in tests/run/volatile (delivered by T508) verify non-elision and non-merging of consecutive volatile loads/stores at `-O1`, exact-width `MOV` emission, and unaligned `@repr(packed)` field access in `--interp` and native x86-64
+
+### INV-MEM-003 — `std.mem` `Volatile<T>` / `Mmio<T>` / `MmioRO<T>` / `MmioWO<T>`, `MaybeUninit<T>`, `ManuallyDrop<T>`, `bitcast`, and `offset_of` contracts
+- statement: `std/mem/` provides `Volatile<T>`, `Mmio<T>`, `MmioRO<T>` (rejecting writes with `AX_TYPE_MMIO_WRITE_READONLY`), and `MmioWO<T>` (rejecting reads with `AX_TYPE_MMIO_READ_WRITEONLY`) with `read`, `write`, `modify`, and bitmask helpers (`set_bits`, `clear_bits`, `test_bits`, `extract_bits`, `insert_bits`), `MaybeUninit<T>` (`uninit`, `zeroed`, `new`, `write`, `assume_init`, `as_ptr`, `as_mut_ptr`), `ManuallyDrop<T>`, size-checked `bitcast<From, To>(v: From) -> To` (`AX_TYPE_BITCAST_SIZE_MISMATCH`), and `offset_of(Type, field)` with bit-exact parity between `--interp` and native execution (SPEC-51 AXS-MEM-005..006, AXS-MEM-013..015, AXS-MEM-020).
+- source: ADR-0001 §2; ADR-0013 §2; 0067 §11-13, §35-36, AREP-10; 0072 §7-9, §14-17, §26-31, §51-54, AREP-15, AREP-18..19, AREP-22; tasks/0328 §24-25, §30, AMEMLOW-60..64; tasks/0367 §82; tasks/0515 AMEM-39..46, AMEM-61..62; SPEC-51 AXS-MEM-005..006, AXS-MEM-013..015, AXS-MEM-020
+- verify: tests/std/mem_volatile_mmio
+- since: T509
+- check: unit and differential tests in tests/std/mem_volatile_mmio (delivered by T509) verify `Volatile<T>`, `Mmio<T>`/`MmioRO<T>`/`MmioWO<T>`, `MaybeUninit<T>`, `ManuallyDrop<T>`, `bitcast`, and `offset_of` across `--interp` and native x86-64
+
+### INV-MEM-004 — End-to-end E13.2 raw memory, volatile, MMIO, untagged union, `@repr(packed)` / `@align(N)`, `MaybeUninit<T>`, and `bitcast` conformance
+- statement: The E13.2 conformance suite certifies the complete `SPEC-51` contract across volatile ordering and non-tearing width guarantees, `Mmio<T>`/`MmioRO<T>`/`MmioWO<T>` register wrappers, untagged `union` initialization and `unsafe` field reads, `@repr(packed)` unaligned-view rejection, `MaybeUninit<T>`/`ManuallyDrop<T>`, `bitcast`, and `@addr_space(N)` isolation with differential agreement between `--interp` and native x86-64 (SPEC-51 AXS-MEM-001..053).
+- source: SPEC-51 AXS-MEM-001..053; ADR-0001 §2; 0067; 0072; tasks/0328; tasks/0515
+- verify: tests/conformance/p13/e13_2_volatile_mmio_layout
+- since: T510
+- check: conformance tests in tests/conformance/p13/e13_2_volatile_mmio_layout (delivered by T510) pass in both `--interp` and native modes with `0 WEAK-NATIVE`
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).
