@@ -6,8 +6,8 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T311, T313]
-priority: 6
+depends: [T087]
+priority: 20
 status: todo
 attempts: 0
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]

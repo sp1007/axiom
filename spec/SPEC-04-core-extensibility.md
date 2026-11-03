@@ -145,7 +145,7 @@ discriminants are implicit (0, 1, 2, … — SPEC-03 AXS-SEM-062); the layout re
 target_features}`. `abi = Axiom | C | System` implemented (T032, T065); reserved: `Interrupt` (E13.x
 freestanding), `ThisCall`/`StdCall`/`FastCall` (i686 epic candidate, ADR-0001 §5), `GpuKernel`
 (E22.1). `domain = Host` implemented; `Device(kind)` reserved (E22.1). `target_features` is an empty
-set in axiom0 (E12.5). `is_unsafe` implemented (T061a).
+set in axiom0 and a 64-bit feature mask in `axiomc` (`SPEC-44` AXS-CPU-001, AXS-CPU-010; E12.5). `is_unsafe` implemented (T061a).
 
 **AXS-EXT-023 — Lang-item table (§3.3).** A table `LangItem → DefId` filled from `std` attributes or
 known paths: implemented entries `Option`, `Result`, `Drop`, `Copy`, `Clone`, `Eq`, `PartialEq`,
@@ -181,7 +181,7 @@ Interpreted attributes become entries of extension tables keyed by `ItemId`:
   ConstExprId }, region: Option<StrId> }` — reserved (E13.6, E13.7; ADR-0001 §4-5). axiom0 lowers
   nothing: `@at(...)` → `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` with `construct = "@at"`, `epic = "E13.6"`
   (`"E13.7"` when the argument uses `image(...)`/`image_self()`).
-- `Export { name }` (E18.7), `Entry` (E13.3), `TargetFeature { features }` (E12.5), `Cfg { predicate
+- `Export { name }` (E18.7), `Entry` (E13.3), `TargetFeature { features }` and `Multiversion { clones }` (E12.5, `SPEC-44` AXS-CPU-010, AXS-CPU-030), `Cfg { predicate
   }` (E16.8), `Align` (E13.2), `Domain` (E22.1), `ThreadLocal` (E11.3) — reserved.
 - `Repr`, `Link { library }` (T065), `Derive { traits }` (T046 Copy marker, T056 general), `Intrinsic`
   (T034 built-ins, T061a/T061c declarations), `Inline` (accepted and ignored; hint for E15.4) —
@@ -288,14 +288,14 @@ function (prologue size, pushed callee-saved registers, stack allocation, frame 
 axiom0 uses it only for the machine verifier. E17.3 serialises it into `.pdata`/`.xdata`. Every LIR
 and machine instruction keeps the source span of its MIR origin; the encoder can emit a
 `(code offset, span)` table — E17.1/E17.2 turn it into line tables. Function attributes `naked`
-(E13.x), `target_features` (E12.5) and `domain` (E22.1) are reserved fields.
+(E13.x), `target_features` (E12.5, `SPEC-44` AXS-CPU-010/031) and `domain` (E22.1) are reserved fields.
 
 ## 7. Target description
 
 **AXS-EXT-060 — TargetDesc is data.** One record per target: triple (`arch`, `os`, `env`), pointer
 width, endianness, object format id, image format id, default `CallConv`, register file (names,
 encodings, classes, aliases), caller/callee-saved sets, stack alignment, shadow space / red zone,
-ABI classification table, feature set, and the target hooks (`isel`, `abi_lower`, `frame_lower`,
+ABI classification table, feature set (x86-64 baseline `sse`/`sse2`, optional `sse3`..`avx512f`, and implication DAG specified in `SPEC-44` AXS-CPU-001..002), and the target hooks (`isel`, `abi_lower`, `frame_lower`,
 `encode`, `object_writer`, `image_writer`). axiom0 contains exactly one record, `x86_64-windows`
 (MS x64 ABI, COFF, PE32+). [0163 §1-7; ROADMAP R6, E16.1]
 
@@ -399,7 +399,8 @@ of T015b (it registers the NAME-area code, AXD-032). Status per name:
 | `@entry` | fn | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` (the entry is `main`, SPEC-03 AXS-SEM-080) | E13.3 |
 | `@align(n)` | struct, field | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E13.2 |
 | `@cfg(...)` | any item, field | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E16.8 |
-| `@target_feature(...)` | fn | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E12.5 |
+| `@target_feature(...)` | fn | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E12.5 (`SPEC-44` AXS-CPU-010, T476) |
+| `@multiversion(...)` | fn | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E12.5 (`SPEC-44` AXS-CPU-030, T478) |
 | `@thread_local` | static | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` | E11.3 |
 
 Before the delivering task of an implemented attribute is done, a stage that meets it reports
@@ -572,7 +573,7 @@ tooling or process only). Planning tasks T211–T222 start from this table.
 | E12.2 Floating point | types, consts, MIR, LIR, ABI | `Float` AXS-EXT-020/024; float casts AXS-EXT-042; `Xmm` class AXS-EXT-050; ABI table AXS-EXT-052 |
 | E12.3 SIMD & vector types | types, MIR, LIR | `Vector`/`Mask` AXS-EXT-020; `VectorOp` AXS-EXT-042; vector classes AXS-EXT-050 |
 | E12.4 SIMD backend | machine IR, encoder | opcode maps/VEX/EVEX AXS-EXT-053; `nontemporal` flag AXS-EXT-051 |
-| E12.5 CPU features & multiversioning | signatures, target | `target_features` AXS-EXT-022/054; `@target_feature` AXS-EXT-091; feature set AXS-EXT-060 |
+| E12.5 CPU features & multiversioning | signatures, target | `target_features` AXS-EXT-022/054; `@target_feature`/`@multiversion` AXS-EXT-032/091; feature set & implication DAG AXS-EXT-060 (`SPEC-44`) |
 | E13.1 Unsafe & UB model | MIR, oracle | provenance AXS-EXT-041; trait `is_unsafe` AXS-EXT-031; oracle memory model (T061a) |
 | E13.2 Raw memory, volatile, layout | types, MIR, LIR | `Union`/`Repr` AXS-EXT-021; address space AXS-EXT-020/051; volatile ops AXS-EXT-043; `@align` AXS-EXT-091 |
 | E13.3 Runtime composition, freestanding | items, places, driver | `Static` AXS-EXT-030/041; `Profile` AXS-EXT-062; `@entry` AXS-EXT-091; init list AXS-EXT-074 |

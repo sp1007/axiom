@@ -115,7 +115,12 @@ They map to the areas above as the last column shows. Three groups have no area 
   live-across-await capability/guard/`Future: Send` checks (`T417`), and `Future` state-machine polling
   diagnostics (`T088`, `T418`). For E12.3 (`T463` / `SPEC-42 §7`), the `SIMD` area (`AX_SIMD_*`) is established
   for self-hosted `axiomc` (`compiler/diag/code.ax`, `T464`), covering `Vector<T, N>` / `Mask<N>` element/lane-count
-  validation, constant lane extract/insert bounds, shuffle selector validation, and bitcast size checks.
+  validation, constant lane extract/insert bounds, shuffle selector validation, and bitcast size checks. For E12.5
+  (`T475` / `SPEC-44 §5`), the `TARGET` area (`AX_TARGET_*`, alongside `AX_SIMD_*` in `compiler/diag/code.ax`,
+  `T476`–`T478`) is established for self-hosted `axiomc`, covering unknown CPU target features
+  (`AX_TARGET_UNKNOWN_FEATURE`), invalid `@target_feature` / `@multiversion` attribute placement or arguments
+  (`AX_TARGET_INVALID_ATTRIBUTE`), and unguarded call-site target feature mismatches (`AX_TARGET_FEATURE_MISMATCH` /
+  `AX_SIMD_TARGET_FEATURE_MISMATCH` / `AX_SIMD_TARGET_FEATURE_REQUIRED`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -553,6 +558,9 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_SIMD_LANE_OUT_OF_RANGE` | E | T464 | compile-time constant lane index `idx >= N` in `extract` / `insert` (`SPEC-42` AXS-SIMD-011, AXS-SIMD-060) |
 | `AX_SIMD_SHUFFLE_OUT_OF_RANGE` | E | T464 | non-constant shuffle selector array or selector index `>= 2 * N` (`>= N` in single-vector `swizzle`) (`SPEC-42` AXS-SIMD-012, AXS-SIMD-060) |
 | `AX_SIMD_BITCAST_SIZE_MISMATCH` | E | T464 | `bitcast` / `simd_bitcast` between vector types of different total byte sizes or involving `Mask<N>` (`SPEC-42` AXS-SIMD-025, AXS-SIMD-060) |
+| `AX_TARGET_UNKNOWN_FEATURE` | E | T476 | unknown CPU feature name (or disallowed `-sse`/`-sse2` baseline removal) in `--target-feature`, `@target_feature("...")`, or `@multiversion("...")` (`SPEC-44` AXS-CPU-003, AXS-CPU-010, AXS-CPU-030, AXS-CPU-040) |
+| `AX_TARGET_INVALID_ATTRIBUTE` | E | T476/T478 | `@target_feature` or `@multiversion` attached to a non-function item (`struct`, `enum`, `const`, `static`, `extern`), empty `@multiversion()`, duplicate clone feature sets, or `@multiversion` combined with `@target_feature` (`SPEC-44` AXS-CPU-010, AXS-CPU-030, AXS-CPU-040) |
+| `AX_TARGET_FEATURE_MISMATCH` | E | T476 | calling a `@target_feature` function or target-gated `std.arch.x86_64` intrinsic (or coercing a `@target_feature` function to `fn(...)`) from a caller lacking the required features without an enclosing `unsafe` block or dominating `is_x86_feature_detected` guard (`SPEC-44` AXS-CPU-011..012, AXS-CPU-040; synonym `AX_SIMD_TARGET_FEATURE_MISMATCH` / `AX_SIMD_TARGET_FEATURE_REQUIRED`) |
 | `AX_TYPE_UNION_NON_COPY_FIELD` | E | T507 | untagged `union` field is neither `Copy` nor wrapped in `ManuallyDrop<T>` (`SPEC-51` AXS-MEM-011, AXS-MEM-050) |
 | `AX_TYPE_UNION_INIT_FIELD_COUNT` | E | T507 | `union` literal initializes zero fields or more than one field (`SPEC-51` AXS-MEM-012, AXS-MEM-050) |
 | `AX_TYPE_INVALID_ALIGN` | E | T507 | `@align(N)` or `@repr(packed(N))` specifies `N` that is `0`, not a power of two, or `> 2^29` (`SPEC-51` AXS-MEM-021..022, AXS-MEM-050) |
@@ -582,4 +590,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

@@ -51,7 +51,7 @@ memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC
 model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`), `FLT` IEEE-754
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
-data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, and x86-64 SSE2/AVX2/VEX encoding (`SPEC-42`, `SPEC-43`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
+data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, x86-64 SSE2/AVX2/VEX encoding, `TargetDesc` CPU feature hierarchy, `@target_feature` legality, `std.arch` `CPUID`/`XGETBV` detection, and `@multiversion` dispatch (`SPEC-42`, `SPEC-43`, `SPEC-44`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
 address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`). A new group is added by editing this list.
 
 ## 2. Kernel
@@ -633,7 +633,7 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T505
 - check: end-to-end conformance suite in tests/conformance/p13/e13_1_unsafe_ffi (delivered by T505) exercises `UNS-T01..T15`, `--interp` UB exit 125 verdicts, external C DLL calls and callbacks, and `REQ-OWNER-008` round-trip address identities
 
-## 15. Portable SIMD vectors, masks, masked memory safety, data-oriented tensor/matrix views, and SIMD backend lowering (SPEC-42, SPEC-43)
+## 15. Portable SIMD vectors, masks, masked memory safety, data-oriented tensor/matrix views, SIMD backend lowering, and CPU feature multiversioning (SPEC-42, SPEC-43, SPEC-44)
 
 ### INV-SIMD-001 — First-class `Vector<T, N>` and `Mask<N>` type system, alignment layout, diagnostic validation, and MIR SIMD rvalue verification
 - statement: `compiler/types/` and `compiler/mir/` represent portable SIMD vectors (`TypeKind.Vector { elem, lanes }`) and lane masks (`TypeKind.Mask { lanes }`) as `Copy + Send + Share` value types for `elem in {i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64}` and `lanes in {2, 4, 8, 16, 32, 64}`, enforce natural power-of-two alignment capped at 32 bytes (`align_of<Vector<T, N>>() == min(N * size_of<T>(), 32)` and `align_of<Mask<N>>() == min(N, 16)`), reject invalid element types, lane counts, constant lane indices, shuffle selectors, and mismatched bitcasts (`AX_SIMD_INVALID_ELEMENT`, `AX_SIMD_INVALID_LANES`, `AX_SIMD_LANE_OUT_OF_RANGE`, `AX_SIMD_SHUFFLE_OUT_OF_RANGE`, `AX_SIMD_BITCAST_SIZE_MISMATCH`), and verify `MIR_RVALUE_VECTOR_OP`, `MIR_RVALUE_SPLAT`, `MIR_RVALUE_EXTRACT`, `MIR_RVALUE_INSERT`, `MIR_RVALUE_SHUFFLE`, and `MIR_RVALUE_REDUCE` in `compiler/verify/verifier.ax` (SPEC-42 AXS-SIMD-001..025, AXS-SIMD-033, AXS-SIMD-060).
@@ -690,6 +690,20 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - verify: tests/lir/simd_avx2, tests/run/simd/avx2_native, tests/conformance/p12/e12_4_simd_backend
 - since: T474
 - check: AVX2 LIR golden tests in tests/lir/simd_avx2 (T473), runtime-dispatched AVX2/FMA execution tests in tests/run/simd/avx2_native (T473), and E12.4 conformance tests in tests/conformance/p12/e12_4_simd_backend (T474) verify `x86_64_v1` vs `x86_64_v3` parity, `AX_SIMD_TARGET_FEATURE_REQUIRED` diagnostics, `VZEROUPPER` hygiene, and `0 WEAK-NATIVE`
+
+### INV-SIMD-009 — `TargetDesc` feature implication DAG, `@target_feature` call-site/inliner legality, and `std.arch` `CPUID`/`XGETBV` runtime feature detection
+- statement: `TargetDesc` models the x86-64 feature implication DAG (`avx512f -> avx2 -> avx -> sse4.2 -> sse4.1 -> ssse3 -> sse3 -> sse2 -> sse`, `fma -> avx`, `sse4.2 -> popcnt`, `bmi2 -> bmi1`) controlled via `--target-feature=+feat,-feat` without altering Core language semantics (`AXS-CPU-001..005`); `compiler/hir/`, `compiler/types/`, and `compiler/verify/` enforce `@target_feature("...")` (`AX_TARGET_UNKNOWN_FEATURE`, `AX_TARGET_INVALID_ATTRIBUTE`) and reject unguarded calls or function-pointer coercions from narrower-feature callers with `AX_TARGET_FEATURE_MISMATCH` unless inside `unsafe`, a dominating `is_x86_feature_detected` branch, or a `@multiversion` dispatcher while forbidding inlining of wider-feature callees into narrower callers (`AXS-CPU-010..014`); and `std/arch/detect.ax` (`is_x86_feature_detected`, `detected_feature_mask`, `has_*`) verifies both `CPUID` leaves `1`/`7`/`0x80000001` and OS `XGETBV(0)` (`XCR0` XMM/YMM/ZMM state), caches the result atomically, and is simulated deterministically in `--interp` via `--interp-cpu-features` (SPEC-44 AXS-CPU-001..023).
+- source: 0095 §7-8, ASIMD-14; 0163 §1-7; tasks/0341 §100 ANUM-29..30; tasks/0344 §100 ASIMD-71..73, 97; tasks/0403 §82; tasks/0407 §35; tasks/0453 §194.14-15; CATALOG.md REQ-SIMD-011..013, REQ-SIMD-051, REQ-SIMD-079, REQ-SIMD-094..095, REQ-SIMD-217..219, REQ-SIMD-243, REQ-SIMD-256..257; SPEC-04 AXS-EXT-022/032/054/060/091; SPEC-44 AXS-CPU-001..023
+- verify: tests/ui/simd/target_feature, tests/std/arch_detect
+- since: T477
+- check: UI diagnostic tests in tests/ui/simd/target_feature (T476) and runtime detection / oracle simulation tests in tests/std/arch_detect (T477) verify feature DAG closure, `AX_TARGET_UNKNOWN_FEATURE`, `AX_TARGET_INVALID_ATTRIBUTE`, `AX_TARGET_FEATURE_MISMATCH` on unguarded calls, dominating `is_x86_feature_detected` acceptance, and `CPUID`/`XGETBV` parity across `--interp-cpu-features` profiles and native x86-64
+
+### INV-SIMD-010 — `@multiversion` clone synthesis, deterministic runtime/compile-time dispatcher, external ABI preservation, and E12.5 conformance
+- statement: `@multiversion("...")` synthesizes per-feature specialized clones (`<fn>$mv$<slug>`) plus a mandatory baseline fallback (`<fn>$mv$default`), lowers each clone with its own `effective_features` while preserving a single common semantic contract and identical external `Win64` ABI (`VZEROUPPER` hygiene at public boundaries), emits a deterministic descending feature-priority runtime dispatcher via `std.arch.detect.detected_feature_mask()`, eliminates runtime dispatch statically when compile-time `--target-feature` satisfies the highest clone, and passes the E12.5 conformance suite across `--interp-cpu-features=sse2`, `sse4.1`, `avx2,fma`, and native x86-64 with `0 WEAK-NATIVE` (SPEC-44 AXS-CPU-030..042).
+- source: 0095 §8; tasks/0344 §100 ASIMD-73..78; tasks/0347 §100 ASIMD-73..78; tasks/0453 §194.14-15; CATALOG.md REQ-SIMD-218..224; SPEC-44 AXS-CPU-030..042
+- verify: tests/mir/multiversion, tests/run/simd/multiversion, tests/conformance/p12/e12_5_multiversioning
+- since: T479
+- check: MIR/LIR clone and static-dispatch dump tests in tests/mir/multiversion (T478), differential execution tests in tests/run/simd/multiversion (T478), and E12.5 conformance tests in tests/conformance/p12/e12_5_multiversioning (T479) verify clone synthesis, runtime dispatch across simulated CPU profiles, static dispatch elimination under `--target-feature=+avx2,+fma`, and bit-identical oracle vs native x86-64 results (`0 WEAK-NATIVE`)
 
 ## 16. Raw memory, volatile/MMIO register wrappers, untagged unions, packed/aligned layout, and address spaces (SPEC-51)
 
@@ -755,7 +769,7 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T463, T469]
 priority: 165
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-44-cpu-features-multiversioning.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md, spec/SPEC-04-core-extensibility.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0095, tasks/0341, tasks/0344, tasks/0347, tasks/0453]
 covers: [REQ-SIMD-011, REQ-SIMD-012, REQ-SIMD-013, REQ-SIMD-094, REQ-SIMD-217, REQ-SIMD-219]
 started: 2026-11-03 10:14:51
+finished: 2026-11-03 10:27:08
 ---
 # T475 — E12.5 — Canonical CPU feature detection, @target_feature legality & function multiversioning specification (SPEC-44)
 
@@ -47,3 +48,4 @@ Consolidate the CPU feature hierarchy (`TargetDesc` feature DAG), `@target_featu
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-03 10:14:51 started (attempt 1) 
+- 2026-11-03 10:27:08 accepted by QA -> done
