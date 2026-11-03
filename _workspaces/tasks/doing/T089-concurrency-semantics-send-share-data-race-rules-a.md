@@ -11,7 +11,7 @@ priority: 121
 status: doing
 attempts: 1
 paths: [compiler/traits, std/core/marker.ax, tests/ui/concurrency/send_share, tests/run/concurrency/send_share, tests/selfhost/traits]
-locks: [compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/diag/code.ax, std/core/prelude.ax]
+locks: [compiler/syntax/ast.ax, compiler/syntax/parse.ax, compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost/ast, tests/selfhost/parse, tests/selfhost/parser, tests/selfhost/diag, tests/selfhost/kernel_source_diag, tests/selfhost/hir, tests/selfhost/resolve_hir, tests/selfhost/typeck, tests/selfhost/typeck_traits, tests/selfhost/mir, tests/selfhost/drop, tests/selfhost/own, tests/selfhost/cap, tests/selfhost/verify, tests/selfhost/own_mir_verify, tests/selfhost/interp, tests/selfhost/interp_opt]
 spec: [spec/SPEC-30-concurrency.md, 0091, 0092, 0079, 0126, tasks/0276, tasks/0298, tasks/0488, 0208]
 covers: [REQ-CONC-218, REQ-CONC-219]
 started: 2026-11-03 08:23:12

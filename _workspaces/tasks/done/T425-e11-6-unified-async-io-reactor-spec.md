@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T420]
 priority: 148
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-35-async-io.md]
 locks: [spec/INDEX.md, spec/SPEC-04-core-extensibility.md]
 spec: [0221, tasks/0335, tasks/0438, tasks/0440, tasks/0441, tasks/0461, tasks/0464]
 covers: [REQ-ASY-035, REQ-ASY-151]
+started: 2026-11-03 08:26:19
+finished: 2026-11-03 08:40:22
 ---
 # T425 — E11.6 — Canonical unified async I/O & reactor specification (SPEC-35)
 
@@ -43,3 +45,5 @@ Write canonical `spec/SPEC-35-async-io.md` (`AXS-AIO-*` rule IDs) defining the u
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-03 08:26:19 started (attempt 1) T425-impl
+- 2026-11-03 08:40:22 accepted by QA -> done

@@ -6,12 +6,14 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T310]
+depends: [T087]
 priority: 20
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 08:26:19
+agent: T216-impl
 ---
 # T216 — Plan phase P16: Targets & platforms
 
@@ -40,3 +42,5 @@ the roadmap is invented.
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-03 08:26:19 started (attempt 1) T216-impl
