@@ -8,10 +8,11 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 20
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 10:27:14
 ---
 # T221 — Plan phase P21: Standard library completion
 
@@ -41,3 +42,5 @@ the roadmap is invented.
 - Critical board task (priority < 10): runs alone.
 - Carry-over (ADR-0034 §8, audit 2026-10-19 OI-13): plan an automated console-output check (WriteConsoleW path, not a pipe — e.g. via a pseudo-console) for `Xin chào thế giới`; pipe bytes are already pinned by 8 tests.
 
+## Log
+- 2026-11-03 10:27:14 started (attempt 1) 

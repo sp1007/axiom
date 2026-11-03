@@ -120,7 +120,13 @@ They map to the areas above as the last column shows. Three groups have no area 
   `T476`–`T478`) is established for self-hosted `axiomc`, covering unknown CPU target features
   (`AX_TARGET_UNKNOWN_FEATURE`), invalid `@target_feature` / `@multiversion` attribute placement or arguments
   (`AX_TARGET_INVALID_ATTRIBUTE`), and unguarded call-site target feature mismatches (`AX_TARGET_FEATURE_MISMATCH` /
-  `AX_SIMD_TARGET_FEATURE_MISMATCH` / `AX_SIMD_TARGET_FEATURE_REQUIRED`).
+  `AX_SIMD_TARGET_FEATURE_MISMATCH` / `AX_SIMD_TARGET_FEATURE_REQUIRED`). For E13.4 (`T516` / `SPEC-53 §4`), the `SEC`
+  area (`AX_SEC_*`, alongside `AX_DRIVER_*` and `AX_CAP_*` in `compiler/diag/code.ax`, `T517`–`T519`) is established
+  for self-hosted `axiomc`, covering `@forbid_unsafe` and `--safety-profile safe|sandbox` unsafe rejection
+  (`AX_SEC_UNSAFE_FORBIDDEN`, `AX_SEC_CONFLICTING_SAFETY_POLICY`), `sandbox`/`comptime` ambient OS authority ban
+  (`AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN`), capability provenance forgery rejection (`AX_SEC_CAPABILITY_FORGERY`), and
+  `@constant_time` / `Secret<T>` verification (`AX_SEC_TIMING_LEAK`, `AX_SEC_SECRET_IMPLICIT_COPY`,
+  `AX_SEC_SECRET_EXPOSURE`, `AX_SEC_INVALID_CONSTANT_TIME_ATTR`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -585,9 +591,20 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_TYPE_INVALID_SECTION` | E | T512/T513 | `@section("...")` or `@used` applied to a non-`fn`/non-`static` item, or `@section` given an invalid section name (`SPEC-52` AXS-FRE-014, AXS-FRE-050) |
 | `AX_UNSAFE_INTERRUPT_FORBIDDEN_OP` | E | T512 | `extern "interrupt"` handler directly or transitively performs heap allocation (`heap_alloc`), blocking (`blocking`), thread creation (`thread`), `.await` (`async`), or OS I/O (`os_io`) (`REQ-ABI-102`, `SPEC-52` AXS-FRE-016, AXS-FRE-050) |
 | `AX_CAP_DMA_ACTIVE_CONFLICT` | E | T513/T514 | CPU `view<T>` or `mut_view<T>` access attempted on a `DmaBuffer<T>` while an active `DmaTransfer<T>` owns the buffer (`REQ-CAP-140`, `REQ-CAP-143`, `SPEC-52` AXS-FRE-005, AXS-FRE-050) |
+| `AX_DRIVER_INVALID_SAFETY_PROFILE` | E | T517 | unknown `--safety-profile <mode>` or `axiom.toml` `safety_profile` value outside `{safe, sandbox, system}` (exit code 2; `SPEC-53` AXS-SEC-002, AXS-SEC-050) |
+| `AX_SEC_UNSAFE_FORBIDDEN` | E | T517 | `unsafe` block, `unsafe fn`, `unsafe trait`/`unsafe impl`, raw-pointer dereference/arithmetic, `extern` block, `static mut`, or `@addr`/`@at` used under `@forbid_unsafe` or `--safety-profile safe\|sandbox` (`SPEC-53` AXS-SEC-003, AXS-SEC-050) |
+| `AX_SEC_CONFLICTING_SAFETY_POLICY` | E | T517 | `@allow_unsafe` applied inside a scope already locked by `@forbid_unsafe` or `--safety-profile safe\|sandbox`, or invalid safety policy attribute syntax (`SPEC-53` AXS-SEC-003, AXS-SEC-050) |
+| `AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN` | E | T517 | calling an ambient OS API (`std.fs`, `std.net`, `std.env`, `std.process`, `std.time`, `host.*`) in `--safety-profile sandbox` or `comptime` without an explicit authority capability token (`FsCap`, `NetCap`, `EnvCap`, `ProcessCap`, `ClockCap`), or bridging `comptime` and `runtime` authority (`REQ-CAP-131`, `SPEC-53` AXS-SEC-011, AXS-SEC-050) |
+| `AX_SEC_CAPABILITY_FORGERY` | E | T517 | implicitly converting or casting a raw pointer (`*const T`, `*mut T`), integer address (`usize`), or WASM linear-memory offset into a safe capability (`view<T>`, `mut_view<T>`) or authority token (`FsCap`, `NetCap`, etc.) without an explicit `unsafe` precondition boundary (`REQ-CAP-010`, `REQ-CAP-123`, `REQ-FFI-124`, `SPEC-53` AXS-SEC-004, AXS-SEC-050) |
+| `AX_SEC_TIMING_LEAK` | E | T518 | secret-dependent branch (`if`/`match`/`while`/`&&`/`||`), secret-dependent memory/array indexing (`arr[secret]`), variable-latency instruction (`/` `DIV`/`IDIV`, `%` `REM`), or non-`@constant_time` call on `@secret` / `Secret<T>` data inside a `@constant_time` function (`SPEC-53` AXS-SEC-023, AXS-SEC-050) |
+| `AX_SEC_SECRET_IMPLICIT_COPY` | E | T518/T519 | attempting to implicitly `Copy` a `Secret<T>` value instead of moving or calling `clone_secret()` (`SPEC-53` AXS-SEC-020, AXS-SEC-050) |
+| `AX_SEC_SECRET_EXPOSURE` | E | T518/T519 | passing `Secret<T>` across an untrusted FFI boundary or public sink without explicit `expose_secret()` / `declassify` (`REQ-FFI-117`, `SPEC-53` AXS-SEC-005, AXS-SEC-020, AXS-SEC-050) |
+| `AX_SEC_INVALID_CONSTANT_TIME_ATTR` | E | T518 | `@constant_time` or `@secret` applied to an invalid item (`async fn`, `extern fn` without body, or non-zeroizable type) (`SPEC-53` AXS-SEC-020, AXS-SEC-023, AXS-SEC-050) |
+| `AX_CAP_ZERO_COPY_DESERIALIZE_UNPROVEN` | E | T518 | zero-copy deserialization requested for a type `T` lacking proven bit-validity, alignment, or `@repr(C)` layout (`REQ-CAP-141`, `SPEC-53` AXS-SEC-014, AXS-SEC-050) |
+| `AX_CAP_IO_BUFFER_OVERLAP` | E | T519 | scatter/gather I/O vector constructed with overlapping mutable buffer slices (`REQ-CAP-135`, `REQ-CAP-139`, `SPEC-53` AXS-SEC-013, AXS-SEC-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

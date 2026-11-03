@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T213]
 priority: 165
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-53-safety-profiles-capability-security.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-11-capability.md, tasks/0342, tasks/0449, tasks/0467, tasks/0703]
 covers: [REQ-CAP-123, REQ-FFI-117, REQ-CAP-131, REQ-CAP-010]
+started: 2026-11-03 10:27:39
+finished: 2026-11-03 10:37:54
 ---
 # T516 — E13.4 — Canonical safety profiles, ambient-authority ban, secure memory & constant-time specification (SPEC-53)
 
@@ -42,3 +44,5 @@ Specify Axiom's safety profiles (`@forbid_unsafe`, `--safety-profile safe|sandbo
 
 ## Log
 - 2026-11-03 02:03:00 created by T213 (P13 phase planning)
+- 2026-11-03 10:27:39 started (attempt 1) 
+- 2026-11-03 10:37:54 accepted by QA -> done

@@ -765,11 +765,41 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T515
 - check: positive and negative conformance tests in tests/conformance/p13/e13_3_freestanding_runtime (delivered by T515) pass in `--interp` and native execution with `0 WEAK-NATIVE` and zero DLL imports
 
+## 18. Safety profiles, capability-based OS authority, secure memory, and constant-time execution (SPEC-53)
+
+### INV-SEC-001 — Safety profiles (`--safety-profile safe|sandbox|system`), monotonic `@forbid_unsafe` enforcement, ambient-authority ban (`REQ-CAP-131`), and capability non-forgery (`REQ-CAP-010`, `REQ-CAP-123`)
+- statement: `compiler/driver/` and `compiler/sema/` validate `--safety-profile safe|sandbox|system` (`AX_DRIVER_INVALID_SAFETY_PROFILE`), reject all `unsafe` blocks, `unsafe fn`, `unsafe trait`/`unsafe impl`, raw-pointer dereferences/arithmetic, `extern` blocks, `static mut`, and `@addr`/`@at` declarations under `@forbid_unsafe` or `--safety-profile safe|sandbox` (`AX_SEC_UNSAFE_FORBIDDEN`) while preventing inner `@allow_unsafe` escalation (`AX_SEC_CONFLICTING_SAFETY_POLICY`), reject ambient OS calls in `sandbox` and `comptime` without explicit authority capability tokens (`FsCap`, `NetCap`, `EnvCap`, `ProcessCap`, `ClockCap`) and prevent `comptime` $\leftrightarrow$ `runtime` authority leakage (`AX_SEC_AMBIENT_AUTHORITY_FORBIDDEN`, `REQ-CAP-131`), enforce that every non-owning capability (`view<T>` / `mut_view<T>`) derives from a live owning authority (`REQ-CAP-010`), and forbid implicit conversions from raw pointers or integer addresses into safe capabilities or authority tokens (`AX_SEC_CAPABILITY_FORGERY`, `REQ-CAP-123`) while treating FFI boundaries conservatively as untrusted (`REQ-FFI-117`) (SPEC-53 AXS-SEC-001..011, AXS-SEC-050).
+- source: 0124 §1; tasks/0342 ASEC-20..100; tasks/0420 §70 ASEC-31..33, ASEC-54..56; tasks/0449 ASEC-20..44; tasks/0703 §445.1-200; REQ-CAP-010, REQ-CAP-123, REQ-CAP-131, REQ-FFI-117; SPEC-53 AXS-SEC-001..011, AXS-SEC-050
+- verify: tests/ui/security_profiles
+- since: T517
+- check: positive and negative UI diagnostic tests in tests/ui/security_profiles (delivered by T517) verify `@forbid_unsafe`, `--safety-profile sandbox` ambient-authority rejection, capability-token acceptance, and raw-pointer/integer capability forgery rejection
+
+### INV-SEC-002 — `@constant_time` and `Secret<T>` taint verification, branchless `ct_select` (`CMOVcc`) lowering, and non-elidable `zeroize_memory` / `black_box` barriers
+- statement: `compiler/mir/`, `compiler/lir/`, and `compiler/target/x64/` propagate `SecClass.Secret` taint across `@secret` / `Secret<T>` values and reject secret-dependent control-flow branches, secret-dependent array/memory indexing, and variable-latency instructions (`DIV`/`IDIV`/`REM` or non-`@constant_time` calls) inside `@constant_time` functions with `AX_SEC_TIMING_LEAK` (`AXS-SEC-022..023`), lower `ct_select` to branchless x86-64 `CMOVcc` / bitwise masks without `-O1` branch re-introduction (`AXS-SEC-024`), preserve `zeroize_memory` and `black_box` as volatile optimization barriers immune to Dead-Store Elimination (`REQ-OPT-353`, `AXS-SEC-021`), enforce WASM linear-memory provenance isolation (`REQ-FFI-124`) and compiler-proven zero-copy deserialization (`REQ-CAP-141`, `AX_CAP_ZERO_COPY_DESERIALIZE_UNPROVEN`), and support target-specific calling conventions in `TargetDesc` (`REQ-ABI-046`) (SPEC-53 AXS-SEC-004..005, AXS-SEC-014, AXS-SEC-020..024).
+- source: 0129 §63; tasks/0451 §192.39 AFFI-46..47; tasks/0466 §207.12 ADATA-34..35; tasks/0467 §208.1-100 ASEC2-20..75; tasks/0703 §445.111-114; REQ-ABI-046, REQ-CAP-141, REQ-FFI-124, REQ-OPT-353; SPEC-53 AXS-SEC-004..005, AXS-SEC-014, AXS-SEC-020..024
+- verify: tests/ui/constant_time, tests/lir/constant_time
+- since: T518
+- check: UI tests in tests/ui/constant_time and LIR golden tests in tests/lir/constant_time (delivered by T518) verify rejection of secret branches/indexing/division (`AX_SEC_TIMING_LEAK`), branchless `CMOVcc` emission for `ct_select`, and retention of `zeroize_memory` stores under `-O1`
+
+### INV-SEC-003 — `std.security` `Secret<T>` zeroize-on-drop, constant-time primitives (`ct_eq`, `ct_select`, `ct_swap_if`), attenuated capability tokens (`FsCap`, `NetCap`, `EnvCap`), and zero-copy I/O/mmap/timer lifetime guards
+- statement: `std/security/` provides non-`Copy` `Secret<T>` with redacted `"<secret>"` formatting (`AX_SEC_SECRET_IMPLICIT_COPY`, `AX_SEC_SECRET_EXPOSURE`) and deterministic `Zeroize` scrubbing on `Drop` via `zeroize_memory`, constant-time primitives (`ct_eq_bytes`, `ct_select_u8..u64`, `ct_swap_if_u64`, `ct_copy_if_bytes`) verified under `@constant_time`, monotonically attenuated `FsCap` / `NetCap` / `EnvCap` / `ProcessCap` / `ClockCap` tokens rejecting `..` path traversal, and lifetime-checked zero-copy scatter/gather I/O slices (`REQ-CAP-135`, `REQ-CAP-139`, `AX_CAP_IO_BUFFER_OVERLAP`), `MappedRegion` exclusive/shared views (`REQ-CAP-136`), and scoped timer callbacks (`REQ-CAP-138`) (SPEC-53 AXS-SEC-010..013, AXS-SEC-020..024).
+- source: tasks/0342; tasks/0449; tasks/0461 ANET-27..29; tasks/0462 ASTORE-23..25; tasks/0464 ATIME-32..33; tasks/0465 ANET2-35..36; tasks/0467 ASEC2-20..40; REQ-CAP-135, REQ-CAP-136, REQ-CAP-138, REQ-CAP-139; SPEC-53 AXS-SEC-010..013, AXS-SEC-020..024
+- verify: tests/std/security
+- since: T519
+- check: execution tests in tests/std/security (delivered by T519) verify `Secret<T>` zeroization on drop, redacted formatting, constant-time comparisons/selections, attenuated `FsCap`/`NetCap` path/endpoint confinement, and scatter/gather/mmap/timer capability lifetime enforcement in `--interp` and native modes
+
+### INV-SEC-004 — End-to-end E13.4 safety profiles, capability security, buffer-pool pin lifetimes (`REQ-CAP-137`), `Secret<T>` zeroization, and `@constant_time` conformance
+- statement: The E13.4 conformance suite certifies `@forbid_unsafe`, `--safety-profile safe|sandbox|system`, explicit capability-token OS access (`REQ-CAP-131`), raw-pointer/integer capability non-forgery (`REQ-CAP-010`, `REQ-CAP-123`), buffer-pool `PagePin<T>` eviction prevention while page views are live (`REQ-CAP-137`), `Secret<T>` non-elidable zeroization on drop, and `@constant_time` timing-leak rejection across `--interp` and native x86-64 with `0 WEAK-NATIVE` (SPEC-53 AXS-SEC-001..053).
+- source: SPEC-53 AXS-SEC-001..053; tasks/0342; tasks/0449; tasks/0462 ASTORE-29..31; tasks/0467; tasks/0703; REQ-CAP-010, REQ-CAP-123, REQ-CAP-131, REQ-CAP-137
+- verify: tests/conformance/p13/e13_4_security_profiles
+- since: T520
+- check: positive and negative conformance tests in tests/conformance/p13/e13_4_security_profiles (delivered by T520) pass in `--interp` and native modes with `0 WEAK-NATIVE`
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).
