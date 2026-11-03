@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T218]
 priority: 699
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-26-windows-artifact-kinds.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/decisions/ADR-0001-fixed-address-declarations.md, spec/decisions/ADR-0034-oracle-independence-audit.md, 0104, 0164, 0185, 0186, 0187, 0217, tasks/0369, tasks/0563]
 covers: [REQ-LNK-161, REQ-LNK-162, REQ-LNK-163, REQ-LNK-164, REQ-LNK-196, REQ-LNK-197, REQ-LNK-198, REQ-LNK-199, REQ-LNK-200, REQ-LNK-201, REQ-LNK-202, REQ-LNK-203, REQ-LNK-204, REQ-LNK-205, REQ-LNK-206, REQ-LNK-207, REQ-LNK-208, REQ-LNK-209, REQ-LNK-210, REQ-LNK-232, REQ-LNK-233, REQ-CORE-3087, REQ-CORE-3088]
 started: 2026-11-03 12:06:54
+finished: 2026-11-03 12:19:18
 ---
 # T772 — E18.7 — Canonical Windows x64 static .lib, PE DLL & import library specification (SPEC-26)
 
@@ -45,3 +46,4 @@ Consolidate the canonical specification for Axiom's Windows x64 library artifact
 ## Log
 - 2026-11-03 03:00:20 created by T218 (P18 phase planning)
 - 2026-11-03 12:06:54 started (attempt 1) 
+- 2026-11-03 12:19:18 accepted by QA -> done

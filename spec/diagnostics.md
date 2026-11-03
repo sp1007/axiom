@@ -659,9 +659,13 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_GEN_RECURSIVE` | E | T562 | direct or mutual recursion among `gen fn` bodies creates an unboxed infinite-size generator state machine (`SPEC-62` AXS-GEN-002, AXS-GEN-050) |
 | `AX_GEN_GPU_FORBIDDEN` | E | T562 | `gen fn` or `yield` used inside a `@gpu` kernel execution domain (`SPEC-62` AXS-GEN-023, AXS-GEN-050) |
 | `AX_DYN_NOT_OBJECT_SAFE` | E | T058 | `dyn Trait` formed with a trait that violates object safety: requires `Self: Sized`, declares an associated `const`, has an unbound associated `type`, declares a method without a `view<Self>`/`mut_view<Self>`/`Box<Self>` receiver, declares a generic method `fn m<U>(...)`, mentions `Self` in non-receiver parameter/return position, or combines multiple non-auto principal traits (`SPEC-63` AXS-DYN-002..003, AXS-DYN-050) |
+| `AX_DRIVER_INVALID_ARTIFACT_KIND` | E | T750 | unknown `--kind <k>` or `axiom.toml` `kind` value outside `{exe, obj, lib, dll}` (exit code 2; `SPEC-26` AXS-WLIB-002, AXS-WLIB-050) |
+| `AX_LINK_BAD_ARCHIVE` | E | T750 | input `.lib`/`.a` archive lacks `!<arch>\n` magic, has truncated/corrupt 60-byte member headers, or invalid linker symbol directory offsets (`SPEC-26` AXS-WLIB-012, AXS-WLIB-050) |
+| `AX_LINK_LIBRARY_NOT_FOUND` | E | T750 | library requested via `-l<name>` or `@link("<name>")` cannot be found in any `-L<dir>` search path or resolved import table (`data.library`; `SPEC-26` AXS-WLIB-003, AXS-WLIB-050) |
+| `AX_LINK_DUPLICATE_EXPORT` | E | T751 | two `@export` items in the same linked image resolve to the identical external export symbol name (`data.symbol`; `SPEC-26` AXS-WLIB-004, AXS-WLIB-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

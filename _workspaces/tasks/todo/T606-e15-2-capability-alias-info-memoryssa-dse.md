@@ -6,11 +6,12 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T601, T605]
+depends: [T601, T602, T605]
 priority: 99
 status: todo
 attempts: 0
 paths: [compiler/opt/alias, compiler/opt/memopt, tests/run/opt_alias]
+locks: [compiler/opt/mod.ax, compiler/opt/optir/mod.ax, tests/selfhost/opt]
 spec: [spec/SPEC-71-alias-escape-promotion.md, 0226, tasks/0366, tasks/0395, tasks/0486, tasks/0548]
 covers: [REQ-OPT-312, REQ-OPT-313, REQ-OPT-314, REQ-OPT-347, REQ-OPT-358, REQ-OPT-365, REQ-OPT-366]
 ---
