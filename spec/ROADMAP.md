@@ -108,7 +108,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P17 debugging & introspection | T068, T700–T726 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | T800–T819 | T219 | T319 | P18 |
-| P20 build & packages | — | T220 | T320 | P16, P18 |
+| P20 build & packages | T850–T877 | T220 | T320 | P16, P18 |
 | P21 std completion | — | T221 | T321 | P11, P13 |
 | P22 GPU & heterogeneous | — | T222 | T322 | P11, P12, P16 |
 | P23 v1.0 release | T091 | T223 | T323 | P11–P22 |
@@ -292,16 +292,16 @@ that module.
 Exit: VS Code extension using the LSP; formatter idempotence over the whole corpus.
 
 ### P20 — Build system & package ecosystem
-- **E20.1 Build graph & driver** — Src 0168 tasks/0356 tasks/0372 tasks/0411.
-- **E20.2 Package manager, resolution, lockfiles** — Src 0098 tasks/0412 tasks/0446.
-- **E20.3 Registry & distribution** — Src tasks/0665.
-- **E20.4 Hermetic/reproducible builds & supply-chain trust** — Src tasks/0590 tasks/0449 tasks/0772.
-- **E20.5 ABI stability, versioning, binary compatibility** — Src 0104 tasks/0452.
+- **E20.1 Build graph & driver** — Src 0168 tasks/0356 tasks/0372 tasks/0411. *(T850–T853)*
+- **E20.2 Package manager, resolution, lockfiles** — Src 0098 tasks/0412 tasks/0446. *(T854–T857)*
+- **E20.3 Registry & distribution** — Src tasks/0665. *(T858–T861)*
+- **E20.4 Hermetic/reproducible builds & supply-chain trust** — Src tasks/0590 tasks/0449 tasks/0772. *(T862–T865)*
+- **E20.5 ABI stability, versioning, binary compatibility** — Src 0104 tasks/0452. *(T866–T869)*
 - **E20.7 Axiom dynamic components: plugins, hot-reload, versioned Axiom ABI** — Axiom-to-Axiom
   dynamic libraries with a stable, versioned interface (not just C ABI), component discovery/loading,
   hot-reload with state hand-off, ownership/capability rules preserved across the boundary.
-  Src tasks/0584 tasks/0583 0104 tasks/0739 tasks/0856.
-- **E20.6 SDK / sysroot / toolchain distribution** — Src tasks/0605 tasks/1034.
+  Src tasks/0584 tasks/0583 0104 tasks/0739 tasks/0856. *(T870–T873)*
+- **E20.6 SDK / sysroot / toolchain distribution** — Src tasks/0605 tasks/1034. *(T874–T877)*
 Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 
 ### P21 — Standard library completion
@@ -418,3 +418,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T216 P16 phase expansion (`P16-targets-platforms`): expanded E16.9 and E16.1–E16.8, E16.10–E16.12 into 47 new tasks `T650`–`T696` alongside refined `T066` (48 tasks total across 12 epics: E16.9 4 tasks `T650, T066, T651, T652` scheduled first in P16; E16.1 4 tasks `T653–T656`; E16.2 4 tasks `T657–T660`; E16.3 4 tasks `T661–T664`; E16.4 4 tasks `T665–T668`; E16.5 4 tasks `T669–T672`; E16.6 4 tasks `T673–T676`; E16.7 4 tasks `T677–T680`; E16.8 4 tasks `T681–T684`; E16.10 4 tasks `T685–T688`; E16.11 4 tasks `T689–T692`; E16.12 4 tasks `T693–T696`), converted all 327 `EPIC(E16.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T316` (`depends: [T216, T313, T066, T650–T696]`) | T216 |
 | 2026-11-03 | T217 P17 phase expansion (`P17-debugging-runtime-introspectio`): expanded E17.1–E17.7 into 27 new tasks `T700`–`T726` alongside refined `T068` (28 tasks total across 7 epics: E17.1 4 tasks `T700–T703`; E17.2 4 tasks `T704–T707`; E17.3 4 tasks `T708, T068, T709, T710`; E17.4 4 tasks `T711–T714`; E17.5 4 tasks `T715–T718`; E17.6 4 tasks `T719–T722`; E17.7 4 tasks `T723–T726`, all depending on P16 gate `T316`), mapped P17 catalogue rows (`REQ-DBG-116`–`REQ-DBG-121`, `REQ-ERR-001`–`REQ-ERR-003`) to concrete task IDs (`T068`, `T700`–`T726`), and wired `T317` (`depends: [T217, T316, T068, T700–T726]`) | T217 |
 | 2026-11-03 | T219 P19 phase expansion (`P19-developer-tooling`): expanded E19.1–E19.5 into 20 new tasks `T800`–`T819` (20 tasks total across 5 epics: E19.1 4 tasks `T800–T803`; E19.2 4 tasks `T804–T807`; E19.3 4 tasks `T808–T811`; E19.4 4 tasks `T812–T815`; E19.5 4 tasks `T816–T819`, all depending on P18 gate `T318`), converted all 29 `EPIC(E19.1)` rows in `spec/requirements/CATALOG.md` (plus `REQ-TOOL-300`, `REQ-TOOL-297`, `REQ-TOOL-298`, `REQ-TST-112`) to concrete task IDs (`T800`–`T819`), and wired `T319` (`depends: [T219, T318, T800–T819]`) | T219 |
+| 2026-11-03 | T220 P20 phase expansion (`P20-build-system-package-ecosystem`): expanded E20.1–E20.7 into 28 new tasks `T850`–`T877` (28 tasks total across 7 epics: E20.1 4 tasks `T850–T853`; E20.2 4 tasks `T854–T857`; E20.3 4 tasks `T858–T861`; E20.4 4 tasks `T862–T865`; E20.5 4 tasks `T866–T869`; E20.7 4 tasks `T870–T873`; E20.6 4 tasks `T874–T877`, all depending on P16 gate `T316` and P18 gate `T318`), mapped all P20 catalogue rows (`REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`, `REQ-ECO-8734`, `REQ-ECO-8736`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T850`–`T877`), and wired `T320` (`depends: [T220, T316, T318, T850–T877]`) | T220 |

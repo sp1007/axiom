@@ -10282,7 +10282,7 @@
 | REQ-ECO-023 | ecosystem | post-v1 | The standard library and compiler must expose sufficient primitive capabilities (memory layout, concurrency, numeric semantics) to support Storage, Filesystem, Virtual Filesystem & High-Performance Persistent IO Engine without requiring them as core language features. | 0659 §Goal | - | EPIC(E24.9) |
 | REQ-ECO-024 | ecosystem | post-v1 | The standard library and compiler must expose sufficient primitive capabilities (memory layout, concurrency, numeric semantics) to support Networking, Protocol, Packet, Transport & High-Performance Network IO Engine without requiring them as core language features. | 0660 §Goal | - | EPIC(E24.9) |
 | REQ-ECO-025 | ecosystem | post-v1 | The standard library and compiler must expose sufficient primitive capabilities (memory layout, concurrency, numeric semantics) to support Package Registry, Dependency Trust, Distribution, ABI Artifact Ecosystem without requiring them as core language features. | 0665 §Goal | - | EPIC(E24.9) |
-| REQ-PKG-022 | package | v1-full | The build system must support reproducible builds, workspace dependency resolution, and semantic versioning of packages. | 0661 §Goal | - | T320 |
+| REQ-PKG-022 | package | v1-full | The build system must support reproducible builds, workspace dependency resolution, and semantic versioning of packages. | 0661 §Goal | - | T320, T850, T851, T852, T853, T854, T855, T856, T857, T862, T863, T864, T865, T866, T867, T868, T869, T874, T875, T876, T877 |
 | REQ-TST-112 | testing | v1-full | The toolchain must integrate testing, verification, debugging and profiling diagnostics natively. | 0662 §Goal | - | T319, T816, T818, T819 |
 | REQ-CTM-048 | comptime | v1-full | The compiler must support typed metaprogramming, constant evaluation, and code generation via a compile-time execution engine. | 0663 §Goal | - | T314 |
 | REQ-TOOL-297 | tooling | v1-full | The compiler must function as a Language Server and IDE Semantic Engine, providing fast AI-native and developer interfaces. | 0664 §Goal | - | T319, T800, T801, T802, T803 |
@@ -22931,9 +22931,9 @@
 | REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - | T322 |
 | REQ-STD-176 | std-lib | v1-full | Axiom must provide robust Unicode, text layout, and internationalization capabilities. | 0850 (§1) | - | T071 |
 | REQ-ECO-8733 | ecosystem | post-v1 | Axiom ecosystem must enable UI state synchronization, reactive data binding, and application layout routing. | 0853 (§243), 0855 (§1) | - | T324 |
-| REQ-ECO-8734 | ecosystem | v1-full | Axiom must enable dynamic plugins, hot-reloading, and safe dependency isolation across module boundaries. | 0856 (§1) | - | T320 |
+| REQ-ECO-8734 | ecosystem | v1-full | Axiom must enable dynamic plugins, hot-reloading, and safe dependency isolation across module boundaries. | 0856 (§1) | - | T320, T866, T867, T868, T869, T870, T871, T872, T873 |
 | REQ-ECO-8735 | ecosystem | post-v1 | Axiom must provide Native Application Scripting, Embedded Language Boundary, Automation & Expression Runtime capabilities. | 0857 (§256) | - | T324 |
-| REQ-ECO-8736 | ecosystem | v1-full | Axiom must provide Native Application Package Registry, Repository, Dependency Resolution Service & Distribution Runtime capabilities. | 0858 (§1) | - | T320 |
+| REQ-ECO-8736 | ecosystem | v1-full | Axiom must provide Native Application Package Registry, Repository, Dependency Resolution Service & Distribution Runtime capabilities. | 0858 (§1) | - | T320, T854, T855, T856, T857, T858, T859, T860, T861, T874, T875, T876, T877 |
 | REQ-STD-177 | std-lib | v1-full | Axiom must provide networking services including RPC, HTTP clients, and distributed gateway abstractions. | 0859 (§1) | - | T321 |
 | REQ-ECO-8737 | ecosystem | post-v1 | Axiom ecosystem must enable distributed consensus, cluster coordination, and replicated CRDT data models. | 0860 (§1), 0861 (§1) | - | T324 |
 | REQ-ECO-8738 | ecosystem | post-v1 | Axiom must provide Native Distributed Workflow, Jobs, Scheduling, Orchestration, Durable Tasks & Long-Running Process Runtime capabilities. | 0862 (§1) | - | T324 |
@@ -31960,8 +31960,8 @@
 | REQ-TOOL-303 | tooling | v1-full | The ecosystem must support AXPATCH for robust application of AST-based and text-based patches | 1061 §1, 1064 §1 | - | T808, T810, T811 |
 | REQ-TOOL-304 | tooling | v1-full | The ecosystem must support AXHISTORY for tracking semantic lineage and refactoring history across commits | 1062 §1 | - | T808, T810, T811 |
 | REQ-TOOL-305 | tooling | v1-full | The ecosystem must support an integrated AXVCS that is semantic-aware and uses deterministic ordering | 1063 §1 | - | T808, T810, T811 |
-| REQ-PKG-024 | package | v1-full | The ecosystem must support AXPACKAGE for deterministic, dependency-isolated package management without requiring runtime resolution | 1065 §1 | - | T220 |
-| REQ-PKG-025 | package | v1-full | The package dependency graph must not silently disable required features and metadata must not implicitly alter source semantics | 1065 §1 | - | T220 |
+| REQ-PKG-024 | package | v1-full | The ecosystem must support AXPACKAGE for deterministic, dependency-isolated package management without requiring runtime resolution | 1065 §1 | - | T220, T850, T851, T852, T853, T854, T855, T856, T857, T858, T859, T860, T861, T862, T863, T864, T865, T866, T867, T868, T869 |
+| REQ-PKG-025 | package | v1-full | The package dependency graph must not silently disable required features and metadata must not implicitly alter source semantics | 1065 §1 | - | T220, T850, T851, T852, T853, T854, T855, T856, T857 |
 | REQ-ECO-11155 | ecosystem | post-v1 | Axiom must enable architecture and capabilities for BOOTSTRAP-198 — GUI, Application Framework, Event Loop & Native UI Architecture | 0457 | - | EPIC(E24.0) |
 | REQ-ECO-11156 | ecosystem | post-v1 | GUI shall not be part of the mandatory Axiom language runtime. | 0457 § AGUI-20 | - | EPIC(E24.9) |
 | REQ-ECO-11157 | ecosystem | post-v1 | GUI shall not be required by Core or freestanding programs. | 0457 § AGUI-21 | - | EPIC(E24.9) |
