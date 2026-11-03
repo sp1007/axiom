@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T214]
 priority: 186
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-63-dyn-trait-vtables.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, tasks/0476, 0212]
 covers: [REQ-CORE-3031, REQ-CORE-3032, REQ-CORE-3033, REQ-CORE-3034, REQ-CORE-3035]
+started: 2026-11-03 11:53:57
+finished: 2026-11-03 12:06:39
 ---
 # T566 — E14.4 — Canonical dyn Trait object safety, fat-pointer coercion & vtable ABI specification (SPEC-63)
 
@@ -42,3 +44,5 @@ Define the canonical object-safety rules for `dyn Trait`, two-word fat-pointer r
 
 ## Log
 - 2026-11-03 02:23:30 created by T214 (P14 phase planning)
+- 2026-11-03 11:53:57 started (attempt 1) 
+- 2026-11-03 12:06:39 accepted by QA -> done
