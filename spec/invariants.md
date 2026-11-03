@@ -50,8 +50,8 @@ pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM
 memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`), `INT` scalar integer
 model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`), `FLT` IEEE-754
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
-`std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety, and
-data-oriented `TensorView`/`MatrixView` (`SPEC-42`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
+`std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
+data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, and x86-64 SSE2/AVX2/VEX encoding (`SPEC-42`, `SPEC-43`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
 address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`). A new group is added by editing this list.
 
 ## 2. Kernel
@@ -633,7 +633,7 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T505
 - check: end-to-end conformance suite in tests/conformance/p13/e13_1_unsafe_ffi (delivered by T505) exercises `UNS-T01..T15`, `--interp` UB exit 125 verdicts, external C DLL calls and callbacks, and `REQ-OWNER-008` round-trip address identities
 
-## 15. Portable SIMD vectors, masks, masked memory safety, and data-oriented tensor/matrix views (SPEC-42)
+## 15. Portable SIMD vectors, masks, masked memory safety, data-oriented tensor/matrix views, and SIMD backend lowering (SPEC-42, SPEC-43)
 
 ### INV-SIMD-001 — First-class `Vector<T, N>` and `Mask<N>` type system, alignment layout, diagnostic validation, and MIR SIMD rvalue verification
 - statement: `compiler/types/` and `compiler/mir/` represent portable SIMD vectors (`TypeKind.Vector { elem, lanes }`) and lane masks (`TypeKind.Mask { lanes }`) as `Copy + Send + Share` value types for `elem in {i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64}` and `lanes in {2, 4, 8, 16, 32, 64}`, enforce natural power-of-two alignment capped at 32 bytes (`align_of<Vector<T, N>>() == min(N * size_of<T>(), 32)` and `align_of<Mask<N>>() == min(N, 16)`), reject invalid element types, lane counts, constant lane indices, shuffle selectors, and mismatched bitcasts (`AX_SIMD_INVALID_ELEMENT`, `AX_SIMD_INVALID_LANES`, `AX_SIMD_LANE_OUT_OF_RANGE`, `AX_SIMD_SHUFFLE_OUT_OF_RANGE`, `AX_SIMD_BITCAST_SIZE_MISMATCH`), and verify `MIR_RVALUE_VECTOR_OP`, `MIR_RVALUE_SPLAT`, `MIR_RVALUE_EXTRACT`, `MIR_RVALUE_INSERT`, `MIR_RVALUE_SHUFFLE`, and `MIR_RVALUE_REDUCE` in `compiler/verify/verifier.ax` (SPEC-42 AXS-SIMD-001..025, AXS-SIMD-033, AXS-SIMD-060).
@@ -662,6 +662,34 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - verify: tests/std/tensor_matrix, tests/conformance/p12/e12_3_simd_vectors, tests/ui/simd/capability_bounds
 - since: T468
 - check: tensor/matrix tests in tests/std/tensor_matrix (T467), UI capability tests in tests/ui/simd/capability_bounds (T468), and E12.3 conformance tests in tests/conformance/p12/e12_3_simd_vectors (T468) verify zero-copy views, tiled `matmul`, `SoA` vectorization, and capability conflict/escape rejection
+
+### INV-SIMD-005 — LIR vector type model (`v128`/`v256`/`v512`), `RegClass`, MIR-to-LIR vector legalizer, and Windows x64 vector ABI
+- statement: `compiler/lir/` represents vector values via `v128`, `v256`, and `v512` `LirType` tags with lane element/count metadata and `Vec128`/`Vec256`/`Vec512`/`Mask` `RegClass` entries, lowers MIR SIMD operations (`MIR_RVALUE_VECTOR_OP`, `Splat`, `Extract`, `Insert`, `Shuffle`, `Reduce`, `nontemporal`, `prefetch`) into canonical `LirOp.V*` instructions, deterministically splits `v256`/`v512` operations into lo/hi `v128` pairs when target ISA width is 128 bits (`x86_64_v1`) while preserving ordered and pairwise float reduction trees, and classifies `Vector<T, N>` / `Mask<N>` arguments and returns under Windows x64 ABI (`ByRef` in `RCX..R9`, `sret` in `RCX`, `XMM6..XMM15` 128-bit callee-saved preservation, and `VZEROUPPER` hygiene) (SPEC-43 AXS-SBE-001..023).
+- source: 0162 §36-41, ALIR-36..41; 0179 §26-34, AWINABI-11, AWINABI-16..18, AWINABI-30..33; tasks/0403; tasks/0407; CATALOG.md REQ-SIMD-019..021, REQ-SIMD-023..025, REQ-SIMD-029..039; SPEC-43 AXS-SBE-001..023
+- verify: tests/lir/simd, tests/abi/win64_simd
+- since: T470
+- check: LIR golden tests in tests/lir/simd and Windows x64 ABI tests in tests/abi/win64_simd (delivered by T470) verify `v128`/`v256`/`v512` LIR construction, legalizer `v256 -> 2x v128` splitting, ordered vs pairwise float reduction lowering, `ByRef`/`sret` classification, `XMM6..XMM15` save/restore, and `VZEROUPPER` emission
+
+### INV-SIMD-006 — Pure-Axiom x86-64 SSE2/SSE4.1 (`0F`/`0F 38`/`0F 3A`) and 2-byte/3-byte `VEX` (`C5`/`C4`) machine-code encoder
+- statement: `compiler/target/x64/encode.ax` encodes SSE2/SSE4.1 (`0F`, `0F 38`, `0F 3A`) and AVX/AVX2/FMA 2-byte (`C5`) and 3-byte (`C4`) `VEX` instructions with exact inverted `~R`/`~X`/`~B`/`~vvvv` bits, shortest-form `C5` selection whenever `X == 1 && B == 1 && W == 0 && mmmmm == 0b00001`, mandatory `SIB` (`0x24`) on `RSP`/`R12` base addressing and `disp8 = 0x00` on `RBP`/`R13` base addressing, `VSIB` (`mod != 0b11`, `index = ymm/xmm`) encoding for `VGATHER*`, and bit-exact 128-bit/256-bit `.rdata` vector constant emission (SPEC-43 AXS-SBE-030..035).
+- source: 0181 §32, AX64-28; tasks/0403; tasks/0407; CATALOG.md REQ-SIMD-042..043; SPEC-43 AXS-SBE-030..035
+- verify: tests/encode/simd_vex
+- since: T471
+- check: encoder unit tests in tests/encode/simd_vex (delivered by T471) assert byte-for-byte machine code for SSE2, SSE4.1 (`0F 38`/`0F 3A`), 2-byte `C5` and 3-byte `C4` VEX instructions across low/extended `XMM0..15`/`YMM0..15` registers, `RSP`/`RBP` memory edge cases, and `VSIB` gather addressing
+
+### INV-SIMD-007 — Native x86-64 baseline SSE2 SIMD instruction selection, stack frame alignment, and fault-suppressing masked memory
+- statement: `compiler/target/x64/isel.ax` and `compiler/target/x64/frame.ax` lower all `v128` LIR vector operations to baseline SSE2 (`x86_64_v1`) instructions without requiring SSE4.1/AVX2 on the host CPU, align 16-byte and 32-byte vector spill slots (`MOVDQA`/`MOVUPS` or `VMOVDQA`/`VMOVUPS`), enforce inactive-lane fault suppression on `VLoadMasked`, `VStoreMasked`, `VGather`, and `VScatter` by guarding per-lane memory accesses when `VMOVMASKPS`/`VMOVMASKPD` (with `VTESTPS`/`VTESTPD` fast-paths) indicates partial masks, and promote `tests/std/simd` and `tests/std/tensor_matrix` to native execution with `0 WEAK-NATIVE` (SPEC-43 AXS-SBE-016, AXS-SBE-021, AXS-SBE-040..045).
+- source: 0179; 0181; tasks/0403; tasks/0407; CATALOG.md REQ-SIMD-019..022, REQ-SIMD-031..039, REQ-SIMD-046..050; SPEC-43 AXS-SBE-016, AXS-SBE-021, AXS-SBE-040..045
+- verify: tests/run/simd/sse2_native, tests/std/simd, tests/std/tensor_matrix
+- since: T472
+- check: differential execution tests in tests/run/simd/sse2_native, tests/std/simd, and tests/std/tensor_matrix (delivered by T472) pass in both `--interp` and native x86-64 modes with `0 WEAK-NATIVE`
+
+### INV-SIMD-008 — Target-gated AVX2/FMA 256-bit `YMM` codegen, `std.arch.x86_64` intrinsic surface, and E12.4 conformance
+- statement: Under `-C target-feature=+avx2,+fma` (`x86_64_v3`) or `@target_feature("avx2,fma")`, `compiler/target/x64/isel.ax` keeps `v256` values in `YMM0..YMM15`, emits 3-operand VEX instructions (`VPADDD`, `VFMADD213PS`, `VPERM2I128`/`VPERMD`, `VMASKMOVPS`/`VMASKMOVPD` loads, `VZEROUPPER`), exposes `std.arch.x86_64` (`__m128*`, `__m256*`, SSE2/SSE4.1/AVX2/FMA intrinsics, `cpuid`, `xgetbv`, `has_avx2`, `has_fma`) with compile-time `AX_SIMD_TARGET_FEATURE_REQUIRED` (`AXD-042`) and `AX_UNSAFE_REQUIRED` checks, and satisfies the E12.4 conformance suite with `0 WEAK-NATIVE` (SPEC-43 AXS-SBE-023, AXS-SBE-040..052).
+- source: SPEC-04 AXS-EXT-010..013, AXS-EXT-044; SPEC-43 AXS-SBE-001..052; tasks/0403; tasks/0407; CATALOG.md REQ-SIMD-019..025, REQ-SIMD-029..039, REQ-SIMD-042..043, REQ-SIMD-046..050
+- verify: tests/lir/simd_avx2, tests/run/simd/avx2_native, tests/conformance/p12/e12_4_simd_backend
+- since: T474
+- check: AVX2 LIR golden tests in tests/lir/simd_avx2 (T473), runtime-dispatched AVX2/FMA execution tests in tests/run/simd/avx2_native (T473), and E12.4 conformance tests in tests/conformance/p12/e12_4_simd_backend (T474) verify `x86_64_v1` vs `x86_64_v3` parity, `AX_SIMD_TARGET_FEATURE_REQUIRED` diagnostics, `VZEROUPPER` hygiene, and `0 WEAK-NATIVE`
 
 ## 16. Raw memory, volatile/MMIO register wrappers, untagged unions, packed/aligned layout, and address spaces (SPEC-51)
 
@@ -697,7 +725,7 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

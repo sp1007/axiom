@@ -176,11 +176,12 @@ rule `AXS-INL-034`; `spec/SPEC-75-lto-wpo-section-gc-pgo.md`, rule `AXS-LTO-030`
 preconditions (`Certainty.Possible` / `Certainty.Unknown`, `MayAlias` / `UnknownAlias`, `GlobalEscape` /
 `UnknownEscape`, `address_observable == true`, unproven `InBounds` / `TripCount` / `NoOverflow`, `INLINE_ILLEGAL` / `UnknownTarget` / exhausted `InlineBudget` or `SpecializationBudget`, open-world `LTO` boundaries, `address_taken == true` preventing `ICF` merge, stale `PGO` `cfg_fingerprint` fallback, or `-Os`/`-Oz` size-budget profitability rejections) fail closed and leave the IR unchanged without
 emitting a user error (`AXS-OPT-032`, `AXS-ESC-016`, `AXS-LOOP-001`, `AXS-BCE-002`, `AXS-INL-021`, `AXS-INL-032`, `AXS-INL-034`, `AXS-LTO-022`, `AXS-LTO-030`, `AXS-PGO-002`, `AXS-PGO-005`, `AXS-PERF-002`, `AXS-PERF-010`, `tasks/0355 ALTO-44/55..58`, `tasks/0395 AALIAS-55`, `tasks/0397 AESCAPE-65/80`, `tasks/0399 AOPT-96/97`, `tasks/0401 AINLINE-32/ADEvirt-24`, `tasks/0402 ABCE-21/ALOOP-55`, `tasks/0408 APGO-26/45`, `tasks/0551 §45`, `tasks/0581 APGO-26/44`). Likewise, when
-post-RA or post-peephole Machine IR fails `x64_verify_checked` (`spec/SPEC-77-regalloc-machine-opt.md`,
+post-RA or post-peephole Machine IR fails `x64_verify_checked` (`spec/SPEC-43-simd-backend.md`,
+rule `AXS-SBE-050`; `spec/SPEC-77-regalloc-machine-opt.md`,
 rules `AXS-RA-027` and `AXS-MCOPT-026`), the compiler reports `AX_ICE_INTERNAL` (`data.stage = "x64_verify"`)
-and emits no artifact; profitability or legality rejections during instruction selection, branchless
+and emits no artifact; profitability or legality rejections during vectorization, instruction selection, branchless
 if-conversion, or peephole optimization fall back to the unoptimized sequence and never emit a user
-diagnostic (`tasks/0553 ACTRL-99`).
+diagnostic (`AXS-SBE-004`, `AXS-SBE-050`, `tasks/0403 ASIMD-72`, `tasks/0407 AVEC-47`, `tasks/0553 ACTRL-99`).
 
 **AXD-043 — Exit codes** (driver, T016): 0 means no error (warnings allowed). 1 means at least one
 error diagnostic. 2 means a usage error: the code is one of `AX_DRIVER_USAGE`,
@@ -496,7 +497,7 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_PAT_UNREACHABLE` | W | T038 | an arm can never match |
 | `AX_PAT_REFUTABLE` | E | T038b | refutable pattern where an irrefutable one is required |
 | `AX_MOVE_USE_AFTER_MOVE` | E | T046 | use of a value after it was moved (label at the move) |
-| `AX_UNSAFE_REQUIRED` | E | T061a/T501 | raw-pointer dereference, pointer arithmetic, `MakeView`/`MakeMutView` capability creation from raw pointers, mutable `static` access, `@addr`/`@at` fixed-address access, or `unsafe fn` / `extern` call outside `unsafe` (`SPEC-50` AXS-UNS-001..005, AXS-UNS-050) |
+| `AX_UNSAFE_REQUIRED` | E | T061a/T501/T473 | raw-pointer dereference, pointer arithmetic, `MakeView`/`MakeMutView` capability creation from raw pointers, mutable `static` access, `@addr`/`@at` fixed-address access, or `unsafe fn` / `extern` / `std.arch.x86_64` non-temporal/raw-pointer intrinsic call outside `unsafe` (`SPEC-43` AXS-SBE-043, AXS-SBE-050; `SPEC-50` AXS-UNS-001..005, AXS-UNS-050) |
 | `AX_UNSAFE_INTERP_UB` | E | T061a/T061c/T502 | undefined behaviour detected by the MIR interpreter oracle (`UB-01..UB-12`: null/dangling/out-of-bounds/misaligned/uninit/invalid-value/read-only-write/provenance-forgery/capability-conflict/overlapping-copy/invalid-fn-ptr/ffi-abi violation; exit code 125; `SPEC-50` AXS-UNS-015..016, AXS-UNS-050) |
 | `AX_CONST_OVERFLOW` | E | T061/T451 | arithmetic overflow during constant evaluation (`SPEC-03` AXS-SEM-030, `SPEC-40` AXS-INT-005) |
 | `AX_CONST_DIV_ZERO` | E | T061/T451 | division by zero during constant evaluation (`SPEC-03` AXS-SEM-032, `SPEC-40` AXS-INT-005) |
@@ -567,4 +568,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-50; SPEC-51; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
