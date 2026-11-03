@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T214]
 priority: 181
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-62-generators.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-10-ownership.md, spec/SPEC-11-capability.md, spec/SPEC-12-drop.md, tasks/0512, tasks/0539]
 covers: [REQ-CORE-2989, REQ-CORE-2990, REQ-CORE-2991, REQ-CORE-2992, REQ-CORE-2993, REQ-CORE-2994, REQ-CORE-2995, REQ-CORE-2996, REQ-CORE-2997, REQ-CORE-2998]
+started: 2026-11-03 11:39:30
+finished: 2026-11-03 11:53:29
 ---
 # T561 — E14.3 — Canonical generators, yield suspension, iterator state machines & MIR verification specification (SPEC-62)
 
@@ -42,3 +44,5 @@ Define the canonical language and MIR semantics for synchronous generators (`gen
 
 ## Log
 - 2026-11-03 02:22:30 created by T214 (P14 phase planning)
+- 2026-11-03 11:39:30 started (attempt 1) 
+- 2026-11-03 11:53:29 accepted by QA -> done

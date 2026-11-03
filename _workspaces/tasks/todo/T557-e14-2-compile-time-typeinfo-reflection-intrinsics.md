@@ -10,14 +10,14 @@ depends: [T552, T556]
 priority: 177
 status: todo
 attempts: 0
-paths: [compiler/sema/reflect.ax, compiler/interp/reflect.ax, tests/run/reflect, tests/ui/reflect]
+paths: [compiler/types/reflect.ax, compiler/interp/reflect.ax, tests/run/reflect, tests/ui/reflect]
 spec: [spec/SPEC-61-reflection-derive.md, tasks/0343, tasks/0296, tasks/0433]
 covers: [REQ-CTM-043, REQ-CTM-045, REQ-CORE-622, REQ-CORE-623, REQ-CORE-624, REQ-CORE-625, REQ-CORE-626, REQ-CORE-627, REQ-CORE-628, REQ-CORE-629, REQ-CORE-630, REQ-CORE-631, REQ-CORE-632, REQ-CORE-633, REQ-CORE-634, REQ-CORE-635, REQ-CORE-636, REQ-CORE-637, REQ-CORE-638, REQ-CORE-639]
 ---
 # T557 — E14.2 — Compile-time TypeInfo reflection intrinsics, visibility enforcement & layout queries
 
 ## Goal
-Implement compile-time type reflection intrinsics (`type_info<T>()`, `type_name<T>()`, `fields_of<T>()`, `variants_of<T>()`, `attributes_of<T>()`, `offset_of<T, F>()`, `implements<T, Trait>()`) in `compiler/sema/reflect.ax` and `compiler/interp/reflect.ax`.
+Implement compile-time type reflection intrinsics (`type_info<T>()`, `type_name<T>()`, `fields_of<T>()`, `variants_of<T>()`, `attributes_of<T>()`, `offset_of<T, F>()`, `implements<T, Trait>()`) in `compiler/types/reflect.ax` and `compiler/interp/reflect.ax`.
 
 ## Scope
 - Implement deterministic compile-time reflection intrinsics returning structured `TypeInfo` descriptors for primitives, structs, enums, tuples, arrays, slices, views, pointers, functions, and traits in declaration order (`AREFLECT-26..27`).

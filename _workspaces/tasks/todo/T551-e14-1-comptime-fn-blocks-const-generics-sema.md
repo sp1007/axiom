@@ -10,7 +10,7 @@ depends: [T550]
 priority: 171
 status: todo
 attempts: 0
-paths: [compiler/ast, compiler/parser, compiler/hir, compiler/sema, tests/ui/comptime]
+paths: [compiler/syntax, compiler/hir, compiler/types, tests/ui/comptime]
 spec: [spec/SPEC-60-comptime-2-0.md, 0102, 0140, tasks/0340, tasks/0346, tasks/0509]
 covers: [REQ-CTM-008, REQ-CTM-009, REQ-CTM-010, REQ-CTM-011, REQ-CTM-044, REQ-CTM-046, REQ-CTM-047, REQ-CORE-698, REQ-CORE-699, REQ-CORE-700, REQ-CORE-701, REQ-CORE-702, REQ-CORE-703, REQ-CORE-704, REQ-CORE-705, REQ-CORE-706, REQ-CORE-707, REQ-CORE-708, REQ-CORE-709, REQ-CORE-710, REQ-CORE-711, REQ-CORE-712, REQ-CORE-2150, REQ-CORE-2151, REQ-CORE-2152, REQ-CORE-2153, REQ-CORE-2154, REQ-CORE-2155, REQ-CORE-2156, REQ-CORE-2157, REQ-CORE-2158, REQ-CORE-2159, REQ-CORE-2160, REQ-CORE-2161, REQ-CORE-2162, REQ-CORE-2163, REQ-CORE-2164, REQ-CORE-2165, REQ-CORE-2166, REQ-CORE-2167, REQ-CORE-2168, REQ-CORE-2169]
 ---
@@ -21,7 +21,7 @@ Implement surface parsing, HIR lowering, and semantic/capability verification fo
 
 ## Scope
 - Extend `compiler/ast`, `compiler/parser`, and `compiler/hir` to support `comptime fn`, `comptime { ... }` expression blocks, and `comptime` function/type parameters (`[T, comptime N: usize]`).
-- Enforce unified type checking, ownership, and capability rules inside `comptime` contexts in `compiler/sema`, rejecting undeclared external capabilities (ambient filesystem, network, process environment, wall-clock time, or arbitrary FFI calls) with `AX_CTM_CAPABILITY_DENIED` (`REQ-CTM-044, 047`, `COMPTIME-38..42`).
+- Enforce unified type checking, ownership, and capability rules inside `comptime` contexts in `compiler/types`, rejecting undeclared external capabilities (ambient filesystem, network, process environment, wall-clock time, or arbitrary FFI calls) with `AX_CTM_CAPABILITY_DENIED` (`REQ-CTM-044, 047`, `COMPTIME-38..42`).
 - Enforce the compile-time vs runtime effect boundary and verify that `unsafe` blocks inside `comptime` do not bypass comptime sandbox restrictions (`ACOMP2-36..49`, `COMPTIME-40`).
 
 ## Acceptance

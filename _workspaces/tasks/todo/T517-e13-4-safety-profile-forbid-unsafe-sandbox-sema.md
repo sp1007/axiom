@@ -10,17 +10,17 @@ depends: [T516]
 priority: 166
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/sema, tests/ui/security_profiles]
+paths: [compiler/driver, compiler/types, tests/ui/security_profiles]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0342, tasks/0449, tasks/0703]
 covers: [REQ-CAP-010, REQ-CAP-123, REQ-CAP-131]
 ---
 # T517 — E13.4 — Safety profile enforcement (@forbid_unsafe, capability-only IO/net/fs, sandbox verification)
 
 ## Goal
-Implement `--safety-profile safe|sandbox|system`, `@forbid_unsafe` module/crate enforcement, and ambient-authority ban verification in `compiler/driver` and `compiler/sema`.
+Implement `--safety-profile safe|sandbox|system`, `@forbid_unsafe` module/crate enforcement, and ambient-authority ban verification in `compiler/driver` and `compiler/types`.
 
 ## Scope
-- Enforce `@forbid_unsafe` and `--safety-profile safe|sandbox` in `compiler/sema`: reject `unsafe` blocks, `unsafe fn` definitions, raw pointer dereferences, `extern` blocks, and `@at`/`@addr` declarations with `AX_SEC_UNSAFE_FORBIDDEN`.
+- Enforce `@forbid_unsafe` and `--safety-profile safe|sandbox` in `compiler/types`: reject `unsafe` blocks, `unsafe fn` definitions, raw pointer dereferences, `extern` blocks, and `@at`/`@addr` declarations with `AX_SEC_UNSAFE_FORBIDDEN`.
 - Enforce the `sandbox` and `comptime` ambient-authority ban (`REQ-CAP-131`): reject calls to ambient OS APIs unless an explicit authority capability token (`FsCap`, `NetCap`, `EnvCap`, `ProcessCap`) is passed.
 - Reject attempts to forge safe capabilities from integer addresses or raw pointers outside `unsafe` (`REQ-CAP-123`).
 

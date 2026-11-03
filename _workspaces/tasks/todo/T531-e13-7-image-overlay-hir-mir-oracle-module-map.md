@@ -10,7 +10,7 @@ depends: [T526, T527, T530]
 priority: 180
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/sema, compiler/mir, compiler/interp, tests/ui/module_rel, tests/run/module_rel_oracle]
+paths: [compiler/hir, compiler/types, compiler/mir, compiler/interp, tests/ui/module_rel, tests/run/module_rel_oracle]
 spec: [spec/SPEC-56-module-relative-bindings.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0187, 0104, tasks/0336]
 covers: [REQ-OWNER-005, REQ-CAP-132]
 ---
@@ -20,7 +20,7 @@ covers: [REQ-OWNER-005, REQ-CAP-132]
 Implement `image("name") + offset` and `image_self() + offset` overlay expressions in HIR, `typeck`, MIR slot lowering, and the MIR oracle (`--interp`) simulated module map (`ADR-0001 §5`, `REQ-OWNER-005`).
 
 ## Scope
-- Typecheck `image("name")` and `image_self()` in `compiler/sema` as hosted-profile module-base descriptors valid inside `@at(...)` / `@addr(...)` overlay declarations (`static`, `static mut`, `extern fn`) and runtime `usize` offset calculations (`addr_of(target) - image_self()`).
+- Typecheck `image("name")` and `image_self()` in `compiler/types` as hosted-profile module-base descriptors valid inside `@at(...)` / `@addr(...)` overlay declarations (`static`, `static mut`, `extern fn`) and runtime `usize` offset calculations (`addr_of(target) - image_self()`).
 - Reject placements (initializers or function bodies) at `image("foreign") + offset` (`AX_UNSAFE_AT_FOREIGN_PLACEMENT`), while permitting overlays with `@repr(C)` / primitive layout and valid alignment.
 - Lower module-relative overlays in `compiler/mir` to load-time resolved pointer slots populated by a compiler-generated module init table, with indirect call/place dereferencing through the resolved slot.
 - Add a simulated process module table in `compiler/interp` so `--interp` resolves `image("game.exe") + off` and `image_self() + off` against registered mock modules and reports deterministic module-init failure when a module is missing.

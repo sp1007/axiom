@@ -10,7 +10,7 @@ depends: [T521]
 priority: 171
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/sema, compiler/mir, compiler/interp, std/panic, tests/ui/panic, tests/run/panic_oracle]
+paths: [compiler/driver, compiler/types, compiler/mir, compiler/interp, std/panic, tests/ui/panic, tests/run/panic_oracle]
 spec: [spec/SPEC-54-panic-unwinding.md, 0229, tasks/0351, tasks/0700]
 covers: [REQ-FFI-041, REQ-FFI-093, REQ-ABI-096, REQ-ABI-105]
 ---
@@ -21,7 +21,7 @@ Implement `--panic abort|unwind` configuration, `@no_panic` static call-graph ch
 
 ## Scope
 - Add `--panic abort|unwind` to `compiler/driver` and `axiom.toml` profiles, defaulting `freestanding` to `abort`.
-- Implement `@no_panic` verification in `compiler/sema`/`compiler/mir` rejecting calls to panicking functions, unchecked indexing/arithmetic, or `panic(...)` inside `@no_panic` functions (`AX_PANIC_FORBIDDEN_IN_NO_PANIC`).
+- Implement `@no_panic` verification in `compiler/types`/`compiler/mir` rejecting calls to panicking functions, unchecked indexing/arithmetic, or `panic(...)` inside `@no_panic` functions (`AX_PANIC_FORBIDDEN_IN_NO_PANIC`).
 - Lower MIR unwind cleanup edges on fallible calls under `--panic unwind`, inserting mandatory abort landing pads on `extern "C"` entry points (`REQ-ABI-096`, `REQ-ABI-105`) and double-panic guards inside `Drop.drop`.
 - Implement stack unwinding, reverse-order `Drop` execution, FFI boundary abort, and `std.panic.catch_unwind` in `compiler/interp` and `std/panic`.
 

@@ -141,7 +141,13 @@ They map to the areas above as the last column shows. Three groups have no area 
   (`AX_REFLECT_PRIVATE_FIELD`), unspecified layout offset queries (`AX_REFLECT_UNSPECIFIED_LAYOUT`), opt-in runtime
   reflection enforcement (`AX_REFLECT_RUNTIME_NOT_ENABLED`), unsatisfied derived field/variant bounds with provenance
   (`AX_DERIVE_FIELD_BOUND`), duplicate or conflicting derived impls (`AX_DERIVE_CONFLICT`), derive/generation cycles
-  (`AX_DERIVE_CYCLE`), and unsupported derive targets (`AX_DERIVE_UNSUPPORTED_ITEM`).
+  (`AX_DERIVE_CYCLE`), and unsupported derive targets (`AX_DERIVE_UNSUPPORTED_ITEM`). For E14.3 (`T561` / `SPEC-62 §4`),
+  the `GEN` prefix (`AX_GEN_*`, alongside `AX_PARSE_RESERVED_KEYWORD` and `AX_CAP_*` in `compiler/diag/code.ax`, `T562`–`T563`)
+  is established for self-hosted `axiomc`, covering `yield` outside a generator context (`AX_GEN_YIELD_OUTSIDE_GEN`),
+  self-referential borrows of generator locals across `yield` (`AX_GEN_SELF_BORROW_ACROSS_YIELD`), ephemeral or escaping
+  capabilities across `yield` (`AX_GEN_VIEW_ACROSS_YIELD`), value-bearing `return <expr>` inside `gen fn`
+  (`AX_GEN_RETURN_VALUE`), unboxed recursive generator state machines (`AX_GEN_RECURSIVE`), and generator suspension
+  inside `@gpu` kernels (`AX_GEN_GPU_FORBIDDEN`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -644,9 +650,15 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_UNSAFE_AT_FOREIGN_PLACEMENT` | E | T531 | `@at(image("...") + off)` or `@at(image_self() + off)` declaration has an initializer `= init` or a function body `{ ... }` (`ADR-0001 §5`, `SPEC-56` AXS-MOD-003, AXS-MOD-050) |
 | `AX_TYPE_INVALID_IMAGE_ARG` | E | T531 | `image(...)` called with a non-string-literal argument, an empty string `""`, or wrong argument count, or `image_self(...)` called with arguments (`SPEC-56` AXS-MOD-001, AXS-MOD-050) |
 | `AX_UNSAFE_MODULE_NOT_LOADED` | E | T531 | oracle (`--interp`) pre-entry module-relative binding resolution failed because a target module named in `image("...")` is not loaded in `ProcessModuleMap` (`ADR-0001 §5`, `SPEC-56` AXS-MOD-014, AXS-MOD-050) |
+| `AX_GEN_YIELD_OUTSIDE_GEN` | E | T562 | `yield` expression used outside a `gen fn` body (`SPEC-62` AXS-GEN-002, AXS-GEN-050) |
+| `AX_GEN_SELF_BORROW_ACROSS_YIELD` | E | T562 | capability (`view<T>`, `mut_view<T>`, `Str`, slice view) borrowing a generator local or captured parameter is held live across a `yield` suspension point (`SPEC-62` AXS-GEN-012, AXS-GEN-050) |
+| `AX_GEN_VIEW_ACROSS_YIELD` | E | T562 | ephemeral capability (`view<T>`, `mut_view<T>`), `@thread_local` view, or view into a generator-owned local escapes through `yield` or is held across `yield` without proven outer provenance (`SPEC-62` AXS-GEN-012..013, AXS-GEN-050) |
+| `AX_GEN_RETURN_VALUE` | E | T562 | `return <expr>` with a value used inside a `gen fn` body instead of bare `return` (`SPEC-62` AXS-GEN-002, AXS-GEN-050) |
+| `AX_GEN_RECURSIVE` | E | T562 | direct or mutual recursion among `gen fn` bodies creates an unboxed infinite-size generator state machine (`SPEC-62` AXS-GEN-002, AXS-GEN-050) |
+| `AX_GEN_GPU_FORBIDDEN` | E | T562 | `gen fn` or `yield` used inside a `@gpu` kernel execution domain (`SPEC-62` AXS-GEN-023, AXS-GEN-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

@@ -10,18 +10,18 @@ depends: [T511]
 priority: 161
 status: todo
 attempts: 0
-paths: [compiler/driver, compiler/hir, compiler/sema, tests/ui/freestanding]
+paths: [compiler/driver, compiler/hir, compiler/types, tests/ui/freestanding]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0358, tasks/0359, tasks/0455]
 covers: [REQ-ABI-102, REQ-ABI-031]
 ---
 # T512 — E13.3 — Profile checking (--profile freestanding|kernel|system|hosted), @entry/@naked/@section & runtime capability graph
 
 ## Goal
-Implement `--profile hosted|freestanding|kernel|system` CLI/manifest selection, `@entry` / `@panic_handler` / `@naked` / `@section` / `@used` semantic checking, interrupt-domain restrictions (`REQ-ABI-102`), and the compile-time runtime capability graph in `compiler/driver` and `compiler/sema`.
+Implement `--profile hosted|freestanding|kernel|system` CLI/manifest selection, `@entry` / `@panic_handler` / `@naked` / `@section` / `@used` semantic checking, interrupt-domain restrictions (`REQ-ABI-102`), and the compile-time runtime capability graph in `compiler/driver` and `compiler/types`.
 
 ## Scope
 - Add `--profile hosted|freestanding|kernel|system` to `compiler/driver` and `axiom.toml` target configuration.
-- Validate `@entry`, `@panic_handler`, `@naked`, `@section("...")`, `@used`, and `extern "interrupt"` fn attributes in `compiler/sema`.
+- Validate `@entry`, `@panic_handler`, `@naked`, `@section("...")`, `@used`, and `extern "interrupt"` fn attributes in `compiler/types`.
 - Build the call-graph runtime capability verifier: reject implicit heap allocation, thread spawning, blocking OS calls, or `await` inside `extern "interrupt"` handlers (`REQ-ABI-102`) and reject hosted OS/runtime imports under `--profile freestanding`.
 
 ## Acceptance
