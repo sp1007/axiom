@@ -503,9 +503,14 @@ through a cast pointer cover every self-host need.
 | `thread_sleep_ns` | `fn(ns: u64)` (blocks calling thread for at least `ns` ns; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
 | `futex_wait` | `unsafe fn(addr: *const u32, expected: u32, timeout_ns: i64) -> i64` (`0` woken or `*addr != expected`, `-5` timeout, `-4` misaligned/null; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
 | `futex_wake` | `unsafe fn(addr: *const u32, count: u32) -> i64` (wakes up to `count` waiters on `addr`; SPEC-32 AXS-SYNC-002) | `thread.ax` / T090 |
+| `fiber_create` | `unsafe fn(entry: fn(*mut u8) -> i64, ctx: *mut u8, stack_commit: usize, stack_reserve: usize) -> i64` (handle `>= 1`, `< 0` on error; SPEC-34 AXS-EXEC-054) | `fiber.ax` / T423 |
+| `fiber_resume` | `unsafe fn(h: i64, arg: i64, out_val: *mut i64) -> i64` (`0` yielded, `1` completed, `2` panicked, `< 0` invalid/running handle; SPEC-34 AXS-EXEC-054) | `fiber.ax` / T423 |
+| `fiber_yield` | `fn(val: i64) -> i64` (suspends current fiber, returns resumer's `arg` on next resume or `< 0` outside fiber; SPEC-34 AXS-EXEC-054) | `fiber.ax` / T423 |
+| `fiber_destroy` | `fn(h: i64) -> i64` (`0` success, `< 0` invalid or currently executing handle; SPEC-34 AXS-EXEC-054) | `fiber.ax` / T423 |
 
 Directory order is unspecified (std sorts, T074b); time is the only other non-deterministic result.
-Thread/futex calls above are specified in SPEC-32 (`T410`) and implemented in `T090`; socket,
+Thread/futex calls above are specified in SPEC-32 (`T410`) and implemented in `T090`; fiber calls above
+are specified in SPEC-34 (`T420`) and implemented in `T423`; socket,
 memory-mapping and async-IO host calls are appended by E21.4, E21.6 and E11.6.
 Every host call is the single OS boundary of std, which is also the record/replay point of E17.7.
 
@@ -541,7 +546,7 @@ tooling or process only). Planning tasks T211–T222 start from this table.
 | E11.2 Atomics & ordering | MIR, LIR, oracle | `Atomic` statement AXS-EXT-043; LIR atomics AXS-EXT-051; lang item `Atomic` |
 | E11.3 Threads & sync | items, object model | `@thread_local` AXS-EXT-091; section `Tls` AXS-EXT-071; reloc `TlsRel` AXS-EXT-073; host calls AXS-EXT-110 |
 | E11.4 Async/await | HIR, types, MIR | `Await`/`AsyncBlock` AXS-EXT-033; `is_async` AXS-EXT-031; `Coroutine` AXS-EXT-020/040; `Suspend` AXS-EXT-044 |
-| E11.5 Executors & fibers | — (library) | intrinsic table append AXS-EXT-100 |
+| E11.5 Executors & fibers | — (library) | intrinsic table append AXS-EXT-100; host-interface append AXS-EXT-110 (`fiber_*`, SPEC-34) |
 | E11.6 Async IO | — (library) | host-interface append AXS-EXT-110 |
 | E12.1 Integer model completion | types, MIR, LIR | `Int128` AXS-EXT-020; `Sat*` ops AXS-EXT-042; LIR `i128` AXS-EXT-050 |
 | E12.2 Floating point | types, consts, MIR, LIR, ABI | `Float` AXS-EXT-020/024; float casts AXS-EXT-042; `Xmm` class AXS-EXT-050; ABI table AXS-EXT-052 |
