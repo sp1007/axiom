@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511, T653]
 priority: 116
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-86-wasm32-backend.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-81-target-desc-isa-conformance.md, 0220, tasks/0453, tasks/0523, tasks/0784]
 covers: [REQ-TGT-079, REQ-TGT-207, REQ-TGT-208, REQ-TGT-209, REQ-TGT-210, REQ-TGT-211, REQ-TGT-212, REQ-TGT-213, REQ-TGT-214, REQ-TGT-215, REQ-TGT-216, REQ-TGT-217, REQ-TGT-218, REQ-TGT-219, REQ-TGT-220, REQ-TGT-221, REQ-TGT-222, REQ-TGT-223, REQ-TGT-224, REQ-TGT-225]
+started: 2026-11-04 01:49:46
+finished: 2026-11-04 03:14:26
 ---
 # T673 — E16.6 — Canonical WASM32 stack-machine backend, CFG stackification, binary .wasm & WASI specification (SPEC-86)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Axiom's `wasm32` (`wasm32-freestandi
 
 ## Log
 - 2026-11-03 08:41:00 created by T216 (P16 phase planning)
+- 2026-11-04 01:49:46 started (attempt 1) T673-impl
+- 2026-11-04 03:14:26 accepted by QA -> done
