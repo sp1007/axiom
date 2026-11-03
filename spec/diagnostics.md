@@ -149,7 +149,10 @@ They map to the areas above as the last column shows. Three groups have no area 
   (`AX_GEN_RETURN_VALUE`), unboxed recursive generator state machines (`AX_GEN_RECURSIVE`), and generator suspension
   inside `@gpu` kernels (`AX_GEN_GPU_FORBIDDEN`). For E14.4 (`T566` / `SPEC-63 §4`), the `DYN` prefix (`AX_DYN_*`,
   alongside `AX_TRAIT_*` and `AX_CAP_*` in `compiler/diag/code.ax`, `T058`) is established for self-hosted `axiomc`,
-  covering `dyn Trait` object-safety verification (`AX_DYN_NOT_OBJECT_SAFE`).
+  covering `dyn Trait` object-safety verification (`AX_DYN_NOT_OBJECT_SAFE`). For E18.1 (`T752` / `SPEC-21 §5`), the
+  `QUERY` prefix (`AX_QUERY_CYCLE`, `AX_QUERY_DEPTH_LIMIT`, alongside `AX_TYPE_CYCLE`, `AX_TRAIT_CYCLE`, and `AX_CTM_CYCLE`
+  in `compiler/diag/code.ax`, `T754`) is established for self-hosted `axiomc`, covering active-stack query cycle
+  detection with canonical `SemanticKey` rotation (`AXS-QRY-021..022`) and depth-limited query evaluation.
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -663,9 +666,13 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_LINK_BAD_ARCHIVE` | E | T750 | input `.lib`/`.a` archive lacks `!<arch>\n` magic, has truncated/corrupt 60-byte member headers, or invalid linker symbol directory offsets (`SPEC-26` AXS-WLIB-012, AXS-WLIB-050) |
 | `AX_LINK_LIBRARY_NOT_FOUND` | E | T750 | library requested via `-l<name>` or `@link("<name>")` cannot be found in any `-L<dir>` search path or resolved import table (`data.library`; `SPEC-26` AXS-WLIB-003, AXS-WLIB-050) |
 | `AX_LINK_DUPLICATE_EXPORT` | E | T751 | two `@export` items in the same linked image resolve to the identical external export symbol name (`data.symbol`; `SPEC-26` AXS-WLIB-004, AXS-WLIB-050) |
+| `AX_QUERY_CYCLE` | E | T754 | generic illegal cyclic query dependency detected on the active `QueryStack` after canonical `SemanticKey` rotation (`SPEC-21` AXS-QRY-021..022, AXS-QRY-050) |
+| `AX_TYPE_CYCLE` | E | T754 | cyclic type alias definition (`type A = B; type B = A`) or infinite value-sized struct/enum layout recursion without indirection (`SPEC-21` AXS-QRY-020..022, AXS-QRY-050) |
+| `AX_TRAIT_CYCLE` | E | T754 | cyclic trait or obligation resolution goal under `CyclePolicy.Reject` or `DepthLimited` (`SPEC-21` AXS-QRY-020..022, AXS-QRY-050) |
+| `AX_QUERY_DEPTH_LIMIT` | E | T754 | demand-driven query evaluation stack depth exceeded configured recursion limit (`SPEC-21` AXS-QRY-021, AXS-QRY-050) |
 
 ## Sources
-tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
+tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); tasks/0791 (BOOTSTRAP-569: §10-§11); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-21; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
