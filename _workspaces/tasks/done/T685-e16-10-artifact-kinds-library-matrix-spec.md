@@ -7,13 +7,15 @@ reviewer: axiom-qa
 model: opus
 gate_model: sonnet
 priority: 128
-status: todo
-attempts: 0
+status: done
+attempts: 1
 depends: [T216, T511, T657, T665, T772]
 paths: [spec/SPEC-89-artifact-library-matrix.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-82-linux-elf-dynamic.md, spec/SPEC-84-macos-aarch64-macho.md, 0164, 0197, 0217, tasks/0369, tasks/0453, tasks/0563]
 covers: [REQ-TGT-101, REQ-TGT-103, REQ-TGT-104, REQ-TGT-184, REQ-TGT-307, REQ-TGT-308]
+started: 2026-11-04 05:52:26
+finished: 2026-11-04 06:53:27
 ---
 # T685 — E16.10 — Artifact kinds & library matrix specification (SPEC-89)
 
@@ -44,3 +46,5 @@ Author `spec/SPEC-89-artifact-library-matrix.md` — the normative specification
 
 ## Log
 - 2026-11-03 08:50:00 created by T216 (P16 phase planning)
+- 2026-11-04 05:52:26 started (attempt 1) T685-impl
+- 2026-11-04 06:53:27 accepted by QA -> done
