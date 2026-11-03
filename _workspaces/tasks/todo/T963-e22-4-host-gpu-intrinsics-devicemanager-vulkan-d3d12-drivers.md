@@ -1,0 +1,47 @@
+---
+id: T963
+title: E22.4 Host GPU intrinsics, DeviceManager enumeration & Vulkan / D3D12 compute backend drivers
+phase: P22-gpu-heterogeneous-computing
+owner: axiom-stdlib
+reviewer: axiom-qa
+model: sonnet
+gate_model: sonnet
+depends: [T222, T311, T312, T316, T956, T960, T962]
+priority: 233
+status: todo
+attempts: 0
+paths: [std/device, std/sys/gpu/vulkan, std/sys/gpu/d3d12, std/sys/gpu/cpu_fallback, compiler/interp/host_gpu, tests/run/gpu_host_driver]
+locks: [std/core/host.ax, compiler/interp/interp.ax]
+spec: [spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md, spec/SPEC-04-core-extensibility.md, tasks/0626, tasks/0843, tasks/0845, tasks/0846]
+covers: [REQ-GPU-035, REQ-GPU-036, REQ-GPU-064, REQ-GPU-065]
+---
+# T963 — E22.4 Host GPU intrinsics, DeviceManager enumeration & Vulkan / D3D12 compute backend drivers
+
+## Goal
+Implement the `host.gpu_*` intrinsics, `std.device` hardware/GPU discovery (`REQ-GPU-064`), and the Vulkan, Windows Direct3D 12, and deterministic CPU-fallback compute backend drivers per `spec/SPEC-133-host-runtime-vulkan-d3d12-compute.md`.
+
+## Scope
+- Declare the `host.gpu_*` intrinsics in `std/core/host.ax` and wire their oracle execution in `compiler/interp/host_gpu` and `compiler/interp/interp.ax` (`SPEC-04 AXS-EXT-110`).
+- Implement `std/device` (`REQ-GPU-064`, `tasks/0843`, `tasks/0845`): `DeviceManager.enumerate`, `DeviceManager.find`, generational `DeviceId`, `DeviceClass`, `DeviceState`, `DeviceCapability`, and `GpuAdapter` capability/memory discovery.
+- Implement `std/sys/gpu/vulkan`: dynamic Vulkan compute loader (`vulkan-1.dll` on Windows, `libvulkan.so.1` on Linux), `VkInstance`/`VkPhysicalDevice`/`VkDevice` initialization, compute `VkQueue`, device/staging buffer allocation, `.spv` `VkShaderModule` and `VkComputePipeline` creation, descriptor-set binding, `vkCmdDispatch`, and timeline semaphore / `VkFence` synchronization.
+- Implement `std/sys/gpu/d3d12`: dynamic Windows Direct3D 12 compute backend (`d3d12.dll` / `dxgi.dll`), DXGI adapter enumeration, `ID3D12Device`, compute `ID3D12CommandQueue` / `ID3D12GraphicsCommandList`, root signature and compute PSO binding, UAV/SRV/CBV heaps, `Dispatch`, and `ID3D12Fence` event synchronization.
+- Implement `std/sys/gpu/cpu_fallback`: deterministic software compute backend executing `.spv`/`AGIR` kernels on host worker pools when explicit fallback policy is selected or when running in headless CI without physical GPU hardware (`tasks/0626 §27`, `tasks/0846 §2.9-10`, `AGPU-23`).
+- Add driver enumeration, buffer round-trip, and low-level kernel dispatch tests in `tests/run/gpu_host_driver`.
+
+## Acceptance
+- [ ] Run tests in `tests/run/gpu_host_driver` pass in `--interp` and native modes with `0 WEAK-NATIVE`, verifying `DeviceManager` enumeration, generational `DeviceId` validation, buffer upload/download, and compute dispatch across available hardware backends (Vulkan / D3D12) and the deterministic software compute backend.
+- [ ] Full test suite passes in the snapshot (`axiomc2.exe`).
+- [ ] Report `_workspaces/reports/T963-report.md` with exact `## Files changed`.
+
+## Out of scope
+- High-level `ComputePipeline`, `CommandEncoder`, and `RenderGraph` runtime API (`T964`).
+- Editing `docs/` or `bootstrap/axiom0/` (frozen at `axiom0-frozen`).
+
+## Notes
+- Phase P22 (`P22-gpu-heterogeneous-computing`), depends on P11 gate `T311`, P12 gate `T312`, and P16 gate `T316` (`ROADMAP.md` §2–§3).
+- `bootstrap/axiom0` is frozen at tag `axiom0-frozen` (ROADMAP R3); all compiler and library changes live in `compiler/` and `std/`.
+- Build and test inside the task snapshot (`python tools/build_axiomc.py --out build-snap-T963/build` and `python tools/axtest.py --compiler build-snap-T963/build/axiomc2.exe --exclude-requires axiom0-internal`).
+- All Axiom source code and examples use canonical syntax (`axiom-syntax`): `=` for binding/assignment (no `:=`, no `var`), `.` for module/type paths (no `::`).
+
+## Log
+- 2026-11-03 10:55:00 created by T222 (P22 phase planning)

@@ -110,7 +110,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P19 developer tooling | T800–T819 | T219 | T319 | P18 |
 | P20 build & packages | T850–T877 | T220 | T320 | P16, P18 |
 | P21 std completion | T900–T935 | T221 | T321 | P11, P13 |
-| P22 GPU & heterogeneous | — | T222 | T322 | P11, P12, P16 |
+| P22 GPU & heterogeneous | T950–T965 | T222 | T322 | P11, P12, P16 |
 | P23 v1.0 release | T091 | T223 | T323 | P11–P22 |
 | P24 ecosystem (post-v1) | — | T224 (deferred) | T324 (deferred) | P23 + owner decision |
 
@@ -319,10 +319,10 @@ Exit: multi-package workspace builds reproducibly from lockfile on two machines.
 Exit: std API reference complete; std conformance suite on all tier-1 targets.
 
 ### P22 — GPU & heterogeneous computing
-- **E22.1 Execution domains & kernel model** — Src 0096 0139 0120 tasks/0299.
-- **E22.2 Device memory & ownership across devices** — Src 0120 tasks/0626.
-- **E22.3 GPU codegen backend (SPIR-V first unless ADR decides otherwise)** — Src tasks/0626.
-- **E22.4 Host runtime (Vulkan/D3D12 compute)** — Src tasks/0626.
+- **E22.1 Execution domains & kernel model** — Src 0096 0139 0120 tasks/0299. *(T950–T953)*
+- **E22.2 Device memory & ownership across devices** — Src 0120 tasks/0626. *(T954–T957)*
+- **E22.3 GPU codegen backend (SPIR-V first unless ADR decides otherwise)** — Src tasks/0626. *(T958–T961)*
+- **E22.4 Host runtime (Vulkan/D3D12 compute)** — Src tasks/0626. *(T962–T965)*
 Exit: kernel conformance examples run on a GPU with oracle-checked results.
 
 ### P23 — v1.0 conformance, freeze, release
@@ -420,3 +420,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T219 P19 phase expansion (`P19-developer-tooling`): expanded E19.1–E19.5 into 20 new tasks `T800`–`T819` (20 tasks total across 5 epics: E19.1 4 tasks `T800–T803`; E19.2 4 tasks `T804–T807`; E19.3 4 tasks `T808–T811`; E19.4 4 tasks `T812–T815`; E19.5 4 tasks `T816–T819`, all depending on P18 gate `T318`), converted all 29 `EPIC(E19.1)` rows in `spec/requirements/CATALOG.md` (plus `REQ-TOOL-300`, `REQ-TOOL-297`, `REQ-TOOL-298`, `REQ-TST-112`) to concrete task IDs (`T800`–`T819`), and wired `T319` (`depends: [T219, T318, T800–T819]`) | T219 |
 | 2026-11-03 | T220 P20 phase expansion (`P20-build-system-package-ecosystem`): expanded E20.1–E20.7 into 28 new tasks `T850`–`T877` (28 tasks total across 7 epics: E20.1 4 tasks `T850–T853`; E20.2 4 tasks `T854–T857`; E20.3 4 tasks `T858–T861`; E20.4 4 tasks `T862–T865`; E20.5 4 tasks `T866–T869`; E20.7 4 tasks `T870–T873`; E20.6 4 tasks `T874–T877`, all depending on P16 gate `T316` and P18 gate `T318`), mapped all P20 catalogue rows (`REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`, `REQ-ECO-8734`, `REQ-ECO-8736`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T850`–`T877`), and wired `T320` (`depends: [T220, T316, T318, T850–T877]`) | T220 |
 | 2026-11-03 | T221 P21 phase expansion (`P21-standard-library-completion`): expanded E21.1–E21.9 into 36 new tasks `T900`–`T935` (36 tasks total across 9 epics: E21.1 4 tasks `T900–T903`; E21.2 4 tasks `T904–T907`; E21.3 4 tasks `T908–T911` including `ADR-0034` §8 OI-13 automated Windows ConPTY `WriteConsoleW` check for `Xin chào thế giới`; E21.4 4 tasks `T912–T915`; E21.5 4 tasks `T916–T919`; E21.6 4 tasks `T920–T923`; E21.7 4 tasks `T924–T927`; E21.8 4 tasks `T928–T931`; E21.9 4 tasks `T932–T935`, all depending on P11 gate `T311` and P13 gate `T313`), converted all 807 `EPIC(E21.1)` rows (plus `REQ-STD-171`–`REQ-STD-175`, `REQ-STD-177`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T900`–`T935`), and wired `T321` (`depends: [T221, T311, T313, T900–T935]`) | T221 |
+| 2026-11-03 | T222 P22 phase expansion (`P22-gpu-heterogeneous-computing`): expanded E22.1–E22.4 into 16 new tasks `T950`–`T965` (16 tasks total across 4 epics: E22.1 4 tasks `T950–T953`; E22.2 4 tasks `T954–T957`; E22.3 4 tasks `T958–T961`; E22.4 4 tasks `T962–T965`, all depending on P11 gate `T311`, P12 gate `T312`, and P16 gate `T316`), converted all 63 `EPIC(E22.3)` rows (plus `REQ-GPU-064`, `REQ-GPU-065`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T950`–`T965`), and wired `T322` (`depends: [T222, T311, T312, T316, T950–T965]`) | T222 |

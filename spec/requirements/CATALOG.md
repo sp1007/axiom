@@ -249,10 +249,10 @@
 | REQ-FFI-011 | ffi | v1-full | Foreign raw pointers are not automatically treated as safe capabilities like `view`. (AFFI-23) | 0119 §231, §259 | - | T504 |
 | REQ-FFI-012 | ffi | v1-full | Capturing closures do not implicitly become foreign C callbacks; explicit adapters are required. (AFFI-24) | 0119 §235, §259 | - | T504 |
 | REQ-FFI-013 | ffi | v1-full | Foreign layout integration requires an explicit representation contract like `@repr(C)`. (AFFI-25) | 0119 §259 | - | T510 |
-| REQ-GPU-001 | gpu | post-v1 | GPU memory uses the same ownership and capability semantics as CPU. | 0120 §265 (AGPU-20) | - | EPIC(E22.3) |
-| REQ-GPU-002 | gpu | post-v1 | Host-to-device memory transfers must be explicit and cannot be implicitly performed by the compiler. | 0120 §267 (AGPU-21) | - | EPIC(E22.3) |
-| REQ-GPU-003 | gpu | post-v1 | Kernel code is valid only within its execution-domain contract. | 0120 §269 (AGPU-22) | - | EPIC(E22.3) |
-| REQ-GPU-004 | gpu | post-v1 | Asynchronous device operations must explicitly establish resource lifetime dependencies. | 0120 §274 (AGPU-23) | - | EPIC(E22.3) |
+| REQ-GPU-001 | gpu | post-v1 | GPU memory uses the same ownership and capability semantics as CPU. | 0120 §265 (AGPU-20) | - | T954, T955, T956, T957 |
+| REQ-GPU-002 | gpu | post-v1 | Host-to-device memory transfers must be explicit and cannot be implicitly performed by the compiler. | 0120 §267 (AGPU-21) | - | T954, T955, T956, T957 |
+| REQ-GPU-003 | gpu | post-v1 | Kernel code is valid only within its execution-domain contract. | 0120 §269 (AGPU-22) | - | T950, T951, T953 |
+| REQ-GPU-004 | gpu | post-v1 | Asynchronous device operations must explicitly establish resource lifetime dependencies. | 0120 §274 (AGPU-23) | - | T954, T955, T956, T957 |
 | REQ-CTM-006 | comptime | v1-full | Compile-time resources cannot implicitly escape into the runtime environment. | 0120 §276 (ACOMP-22) | - | T550 |
 | REQ-CTM-007 | comptime | v1-full | Compile-time execution must be deterministic based on its declared inputs and explicit capabilities. | 0120 §278 (ACOMP-23) | - | T550 |
 | REQ-CORE-020 | reflection | v1-core | Reflection metadata must not be included in the runtime binary by default. | 0120 §283 (AREFLECT-20) | - | T113 | 
@@ -700,7 +700,7 @@
 | REQ-CORE-035 | safety | v1-core | Code enclosed in unsafe blocks must not permit the compiler to weaken atomic memory ordering or violate atomic synchronization semantics (AATOM-36). | 0128 §58, §59, §66 | - | T113 | 
 | REQ-FFI-014 | ffi | v1-full | FFI boundaries must be treated conservatively by default, requiring an explicit contract to establish atomic synchronization or happens-before relationships across foreign functions (AATOM-37). | 0128 §60, §61, §66 | - | T505 |
 | REQ-FFI-015 | ffi | v1-full | Hardware and MMIO registers accessed across FFI must be mediated through explicit volatile operations rather than ordinary memory accesses. | 0128 §62 | - | T508 |
-|REQ-GPU-005|gpu|post-v1|GPU atomic operations must extend the atomic memory model with hierarchical memory scopes without replacing or altering core atomic ordering semantics (AATOM-38) .|0128 §63, §64, §66|-|EPIC(E22.3)|
+|REQ-GPU-005|gpu|post-v1|GPU atomic operations must extend the atomic memory model with hierarchical memory scopes without replacing or altering core atomic ordering semantics (AATOM-38) .|0128 §63, §64, §66|-|T950, T952, T953, T958, T960, T961|
 | REQ-LAY-135 | layout | v1-core | The compiler shall be permitted to choose an optimized memory layout for data types unless an explicit ABI representation attribute is specified. | 0129 §1 | - | T113 | 
 | REQ-TYP-029 | types | v1-core | Type identity must be distinct from representation identity such that types sharing identical memory representations are not interchangeable without explicit conversion (ATYPE-20). | 0129 §2, 0129 §101 | - | T113 |
 | REQ-TYP-030 | types | v1-core | Type aliases must not create a new type identity or runtime wrapper (ATYPE-21). | 0129 §3, 0129 §101 | - | T113 |
@@ -1428,54 +1428,54 @@
 | REQ-FFI-064 | ffi | v1-full | ### affi-62 — foreign functions must not be granted stronger semantics than their contract | 0138 §100. Invariants chính thức | - | T505 |
 | REQ-FFI-065 | ffi | v1-full | Safe axiom → explicit unsafe → explicit abi → native machine contract. | 0138 §Trạng thái sau Part XIX | - | T504 |
 | REQ-FFI-066 | ffi | v1-full | A semantic model of axiom, nhiều execution domains — not create out a “ngôn ngữ gpu thứ hai”. | 0138 §Part XX — GPU · Accelerator · Device Memory · Kernel | - | T515 |
-| REQ-GPU-006 | gpu | post-v1 | One language semantics, many execution domains. | 0139 §# Part XX — GPU · Accelerator · Device Memory · Kernel | - | EPIC(E22.3) |
-| REQ-GPU-007 | gpu | post-v1 | - gpu kernel is axiom function has ràng buộc execution domain. - not needs ngôn ngữ kernel riêng. - ownership/view still has ý nghĩa trên gpu. - host ↔ device transfer must explicit. - not for kernel vô tình keep reference tới host memory. - not to gpu operation đang run is hủy tài nguyên a way unsafe. - gpu synchronization tích hợp with memory model. - gpu atomics dùng cùng semantics with cpu atomics, bổ sung scope. - compiler has thể optimize/fuse/vectorize/kernel-specialize. - not bắt buộc cuda/opencl runtime. - axiom has thể target cuda/ptx, spir-v, metal, vulkan, directx, rocm/amdgcn... thông qua backend. - has thể mở rộng sang npu/dsp/accelerator mà not sửa semantic core. | 0139 §XX.1. Mục tiêu | - | EPIC(E22.3) |
-| REQ-GPU-008 | gpu | post-v1 | `@kernel` is not magic runtime. | 0139 §XX.2. Execution Domain | - | EPIC(E22.3) |
-| REQ-GPU-009 | gpu | post-v1 | Nó is semantic declaration to compiler biết function this must thỏa kernel legality rules. | 0139 §XX.2. Execution Domain | - | EPIC(E22.3) |
-| REQ-GPU-010 | gpu | post-v1 | A `@kernel` must not tùy tiện gọi all api of axiom. | 0139 §XX.4. Kernel Legality | - | EPIC(E22.3) |
-| REQ-GPU-011 | gpu | post-v1 | Compiler must kiểm tra execution-domain legality. | 0139 §XX.4. Kernel Legality | - | EPIC(E22.3) |
-| REQ-GPU-012 | gpu | post-v1 | Kernel legality must be kiểm tra transitively. | 0139 §XX.5. Kernel Call Graph | - | EPIC(E22.3) |
-| REQ-GPU-013 | gpu | post-v1 | Must not only vì `helper` not has `@kernel`. | 0139 §XX.5. Kernel Call Graph | - | EPIC(E22.3) |
-| REQ-GPU-014 | gpu | post-v1 | A function `host_device` must have implementation hợp lệ for cả hai domain. | 0139 §XX.5. Kernel Call Graph | - | EPIC(E22.3) |
-| REQ-GPU-015 | gpu | post-v1 | Điều quan trọng is semantic model must keep distinction. | 0139 §XX.7. Address Space Là Type/Capability Property | - | EPIC(E22.3) |
-| REQ-GPU-016 | gpu | post-v1 | Device pointer must not automatically trở into host pointer. | 0139 §XX.8. Device Pointer | - | EPIC(E22.3) |
-| REQ-GPU-017 | gpu | post-v1 | - exclusive write capability - not copy according to value semantics - must not alias with conflicting mutable access - provenance must hợp lệ. | 0139 §XX.11. Device Mutable View | - | EPIC(E22.3) |
-| REQ-GPU-018 | gpu | post-v1 | Or api must provide contract bảo đảm that. | 0139 §XX.11. Device Mutable View | - | EPIC(E22.3) |
-| REQ-GPU-019 | gpu | post-v1 | Then safe kernel must is reject or sử dụng abstraction has contract rõ ràng. | 0139 §XX.11. Device Mutable View | - | EPIC(E22.3) |
-| REQ-GPU-020 | gpu | post-v1 | Is operation library/device chứ is not implicit type conversion. | 0139 §XX.13. Transfer Không Phải Copy Value Bình Thường | - | EPIC(E22.3) |
-| REQ-GPU-021 | gpu | post-v1 | Must not has hidden assumption. | 0139 §XX.16. Event và Ownership | - | EPIC(E22.3) |
-| REQ-GPU-022 | gpu | post-v1 | Then relocation must is chặn or backend must update abstraction mà not make invalid capability. | 0139 §XX.17. Relocation và GPU Operation | - | EPIC(E22.3) |
-| REQ-GPU-023 | gpu | post-v1 | Compiler must not di chuyển memory operation qua barrier if make change synchronization semantics. | 0139 §XX.20. Barrier | - | EPIC(E22.3) |
-| REQ-GPU-024 | gpu | post-v1 | Kernel parameter must have representation mà target hỗ trợ. | 0139 §XX.25. Kernel Parameter Restrictions | - | EPIC(E22.3) |
-| REQ-GPU-025 | gpu | post-v1 | Core semantics not yêu cầu gpu kernel must have heap. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | EPIC(E22.3) |
-| REQ-GPU-026 | gpu | post-v1 | Must not âm thầm chuyển allocation về host. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | EPIC(E22.3) |
-| REQ-GPU-027 | gpu | post-v1 | Is not semantic violation tự thân. | 0139 §XX.28. Recursion | - | EPIC(E22.3) |
-| REQ-GPU-028 | gpu | post-v1 | Chứ is not a change in core language. | 0139 §XX.28. Recursion | - | EPIC(E22.3) |
-| REQ-GPU-029 | gpu | post-v1 | Must not phá hỏng operation đang run. | 0139 §XX.31. Device Resource Drop | - | EPIC(E22.3) |
-| REQ-GPU-030 | gpu | post-v1 | Or library abstraction must retain resource for tới completion. | 0139 §XX.31. Device Resource Drop | - | EPIC(E22.3) |
-| REQ-GPU-031 | gpu | post-v1 | This is cùng a ownership rule, is not gpu-specific hack. | 0139 §XX.31. Device Resource Drop | - | EPIC(E22.3) |
-| REQ-GPU-032 | gpu | post-v1 | Compiler specialization must not observable. | 0139 §XX.36. Kernel Specialization | - | EPIC(E22.3) |
-| REQ-GPU-033 | gpu | post-v1 | Điểm this giúp compiler is not xây a memory-safety model riêng for gpu. | 0139 §XX.38. GPU và Ownership | - | EPIC(E22.3) |
-| REQ-GPU-034 | gpu | post-v1 | But gpu operation not bắt buộc must sử dụng async runtime. | 0139 §XX.39. GPU và Async | - | EPIC(E22.3) |
-| REQ-GPU-035 | gpu | post-v1 | Cross-domain synchronization must explicit. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | EPIC(E22.3) |
-| REQ-GPU-036 | gpu | post-v1 | Semantic contract of event must define happens-before. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | EPIC(E22.3) |
-| REQ-GPU-037 | gpu | post-v1 | A kernel must not gọi dependency host-only. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-038 | gpu | post-v1 | Device allocation must have owner/storage contract rõ ràng. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-039 | gpu | post-v1 | Conversion must be compiler prove or nằm in unsafe/system abstraction. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-040 | gpu | post-v1 | Owner must not is destroy when device capability còn live. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-041 | gpu | post-v1 | Agpu-33 — in-flight operations must retain valid resources | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-042 | gpu | post-v1 | Gpu operation must not truy cập resource đã mất hiệu lực. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-043 | gpu | post-v1 | Relocatable device storage must tôn trọng capability lifetime. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-044 | gpu | post-v1 | Barrier/event/fence semantics must be biểu diễn in program or abstraction contract. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-045 | gpu | post-v1 | Kernel must not create invalid divergent collective synchronization. | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-046 | gpu | post-v1 | Agpu-46 — kernel parameters must be device-representable | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-047 | gpu | post-v1 | Agpu-51 — kernel fusion must preserve observable semantics | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-048 | gpu | post-v1 | Agpu-57 — device apis must preserve common ownership semantics | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-049 | gpu | post-v1 | Agpu-58 — device apis must preserve common capability semantics | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-050 | gpu | post-v1 | Agpu-59 — device execution must not introduce a second ownership model | 0139 §XX.44. Normative Invariants | - | EPIC(E22.3) |
-| REQ-GPU-051 | gpu | post-v1 | This is điểm rất quan trọng for mục tiêu ban đầu of axiom: not hy sinh hiệu năng thấp tầng to has abstraction cao tầng, but also not bắt programmer must học hai or ba memory models khác nhau. | 0139 §XX.45. Chốt Part XX | - | EPIC(E22.3) |
-| REQ-GPU-052 | gpu | post-v1 | Make sao has metaprogramming mạnh như rust/modern c++ but not biến compiler into a mớ macro/plugin khó kiểm soát? | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E22.3) |
-| REQ-GPU-053 | gpu | post-v1 | Tức is comptime is not a ngôn ngữ thứ hai. | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | EPIC(E22.3) |
+| REQ-GPU-006 | gpu | post-v1 | One language semantics, many execution domains. | 0139 §# Part XX — GPU · Accelerator · Device Memory · Kernel | - | T950, T951, T953 |
+| REQ-GPU-007 | gpu | post-v1 | - gpu kernel is axiom function has ràng buộc execution domain. - not needs ngôn ngữ kernel riêng. - ownership/view still has ý nghĩa trên gpu. - host ↔ device transfer must explicit. - not for kernel vô tình keep reference tới host memory. - not to gpu operation đang run is hủy tài nguyên a way unsafe. - gpu synchronization tích hợp with memory model. - gpu atomics dùng cùng semantics with cpu atomics, bổ sung scope. - compiler has thể optimize/fuse/vectorize/kernel-specialize. - not bắt buộc cuda/opencl runtime. - axiom has thể target cuda/ptx, spir-v, metal, vulkan, directx, rocm/amdgcn... thông qua backend. - has thể mở rộng sang npu/dsp/accelerator mà not sửa semantic core. | 0139 §XX.1. Mục tiêu | - | T950, T954, T958, T962, T965 |
+| REQ-GPU-008 | gpu | post-v1 | `@kernel` is not magic runtime. | 0139 §XX.2. Execution Domain | - | T950, T951, T953 |
+| REQ-GPU-009 | gpu | post-v1 | Nó is semantic declaration to compiler biết function this must thỏa kernel legality rules. | 0139 §XX.2. Execution Domain | - | T950, T951, T953 |
+| REQ-GPU-010 | gpu | post-v1 | A `@kernel` must not tùy tiện gọi all api of axiom. | 0139 §XX.4. Kernel Legality | - | T950, T951, T953 |
+| REQ-GPU-011 | gpu | post-v1 | Compiler must kiểm tra execution-domain legality. | 0139 §XX.4. Kernel Legality | - | T950, T951, T953 |
+| REQ-GPU-012 | gpu | post-v1 | Kernel legality must be kiểm tra transitively. | 0139 §XX.5. Kernel Call Graph | - | T950, T951, T953 |
+| REQ-GPU-013 | gpu | post-v1 | Must not only vì `helper` not has `@kernel`. | 0139 §XX.5. Kernel Call Graph | - | T950, T951, T953 |
+| REQ-GPU-014 | gpu | post-v1 | A function `host_device` must have implementation hợp lệ for cả hai domain. | 0139 §XX.5. Kernel Call Graph | - | T950, T951, T953 |
+| REQ-GPU-015 | gpu | post-v1 | Điều quan trọng is semantic model must keep distinction. | 0139 §XX.7. Address Space Là Type/Capability Property | - | T954, T955, T957 |
+| REQ-GPU-016 | gpu | post-v1 | Device pointer must not automatically trở into host pointer. | 0139 §XX.8. Device Pointer | - | T954, T955, T957 |
+| REQ-GPU-017 | gpu | post-v1 | - exclusive write capability - not copy according to value semantics - must not alias with conflicting mutable access - provenance must hợp lệ. | 0139 §XX.11. Device Mutable View | - | T954, T955, T956, T957 |
+| REQ-GPU-018 | gpu | post-v1 | Or api must provide contract bảo đảm that. | 0139 §XX.11. Device Mutable View | - | T954, T955, T956, T957 |
+| REQ-GPU-019 | gpu | post-v1 | Then safe kernel must is reject or sử dụng abstraction has contract rõ ràng. | 0139 §XX.11. Device Mutable View | - | T954, T955, T957 |
+| REQ-GPU-020 | gpu | post-v1 | Is operation library/device chứ is not implicit type conversion. | 0139 §XX.13. Transfer Không Phải Copy Value Bình Thường | - | T954, T955, T956, T957 |
+| REQ-GPU-021 | gpu | post-v1 | Must not has hidden assumption. | 0139 §XX.16. Event và Ownership | - | T954, T955, T956, T957 |
+| REQ-GPU-022 | gpu | post-v1 | Then relocation must is chặn or backend must update abstraction mà not make invalid capability. | 0139 §XX.17. Relocation và GPU Operation | - | T954, T955, T956, T957 |
+| REQ-GPU-023 | gpu | post-v1 | Compiler must not di chuyển memory operation qua barrier if make change synchronization semantics. | 0139 §XX.20. Barrier | - | T950, T952, T953, T958, T959, T960, T961 |
+| REQ-GPU-024 | gpu | post-v1 | Kernel parameter must have representation mà target hỗ trợ. | 0139 §XX.25. Kernel Parameter Restrictions | - | T950, T951, T953, T958, T959 |
+| REQ-GPU-025 | gpu | post-v1 | Core semantics not yêu cầu gpu kernel must have heap. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | T950, T951, T953 |
+| REQ-GPU-026 | gpu | post-v1 | Must not âm thầm chuyển allocation về host. | 0139 §XX.27. Dynamic Allocation trong Kernel | - | T950, T951, T953 |
+| REQ-GPU-027 | gpu | post-v1 | Is not semantic violation tự thân. | 0139 §XX.28. Recursion | - | T950, T951, T953 |
+| REQ-GPU-028 | gpu | post-v1 | Chứ is not a change in core language. | 0139 §XX.28. Recursion | - | T950, T951, T953 |
+| REQ-GPU-029 | gpu | post-v1 | Must not phá hỏng operation đang run. | 0139 §XX.31. Device Resource Drop | - | T954, T955, T956, T957 |
+| REQ-GPU-030 | gpu | post-v1 | Or library abstraction must retain resource for tới completion. | 0139 §XX.31. Device Resource Drop | - | T954, T955, T956, T957 |
+| REQ-GPU-031 | gpu | post-v1 | This is cùng a ownership rule, is not gpu-specific hack. | 0139 §XX.31. Device Resource Drop | - | T954, T955, T957 |
+| REQ-GPU-032 | gpu | post-v1 | Compiler specialization must not observable. | 0139 §XX.36. Kernel Specialization | - | T950, T951, T958, T959, T961 |
+| REQ-GPU-033 | gpu | post-v1 | Điểm this giúp compiler is not xây a memory-safety model riêng for gpu. | 0139 §XX.38. GPU và Ownership | - | T954, T955, T957 |
+| REQ-GPU-034 | gpu | post-v1 | But gpu operation not bắt buộc must sử dụng async runtime. | 0139 §XX.39. GPU và Async | - | T954, T956, T957, T962, T964, T965 |
+| REQ-GPU-035 | gpu | post-v1 | Cross-domain synchronization must explicit. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | T954, T956, T957, T962, T963, T965 |
+| REQ-GPU-036 | gpu | post-v1 | Semantic contract of event must define happens-before. | 0139 §XX.40. Memory Ordering Across CPU/GPU | - | T954, T956, T957, T962, T963, T965 |
+| REQ-GPU-037 | gpu | post-v1 | A kernel must not gọi dependency host-only. | 0139 §XX.44. Normative Invariants | - | T950, T951, T953 |
+| REQ-GPU-038 | gpu | post-v1 | Device allocation must have owner/storage contract rõ ràng. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
+| REQ-GPU-039 | gpu | post-v1 | Conversion must be compiler prove or nằm in unsafe/system abstraction. | 0139 §XX.44. Normative Invariants | - | T954, T955, T957 |
+| REQ-GPU-040 | gpu | post-v1 | Owner must not is destroy when device capability còn live. | 0139 §XX.44. Normative Invariants | - | T954, T955, T957 |
+| REQ-GPU-041 | gpu | post-v1 | Agpu-33 — in-flight operations must retain valid resources | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957, T962, T964, T965 |
+| REQ-GPU-042 | gpu | post-v1 | Gpu operation must not truy cập resource đã mất hiệu lực. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
+| REQ-GPU-043 | gpu | post-v1 | Relocatable device storage must tôn trọng capability lifetime. | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
+| REQ-GPU-044 | gpu | post-v1 | Barrier/event/fence semantics must be biểu diễn in program or abstraction contract. | 0139 §XX.44. Normative Invariants | - | T950, T952, T953, T954, T956 |
+| REQ-GPU-045 | gpu | post-v1 | Kernel must not create invalid divergent collective synchronization. | 0139 §XX.44. Normative Invariants | - | T950, T952, T953, T958, T959, T961 |
+| REQ-GPU-046 | gpu | post-v1 | Agpu-46 — kernel parameters must be device-representable | 0139 §XX.44. Normative Invariants | - | T950, T951, T953, T958, T959, T961 |
+| REQ-GPU-047 | gpu | post-v1 | Agpu-51 — kernel fusion must preserve observable semantics | 0139 §XX.44. Normative Invariants | - | T958, T959, T961 |
+| REQ-GPU-048 | gpu | post-v1 | Agpu-57 — device apis must preserve common ownership semantics | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
+| REQ-GPU-049 | gpu | post-v1 | Agpu-58 — device apis must preserve common capability semantics | 0139 §XX.44. Normative Invariants | - | T954, T955, T956, T957 |
+| REQ-GPU-050 | gpu | post-v1 | Agpu-59 — device execution must not introduce a second ownership model | 0139 §XX.44. Normative Invariants | - | T954, T955, T957 |
+| REQ-GPU-051 | gpu | post-v1 | This is điểm rất quan trọng for mục tiêu ban đầu of axiom: not hy sinh hiệu năng thấp tầng to has abstraction cao tầng, but also not bắt programmer must học hai or ba memory models khác nhau. | 0139 §XX.45. Chốt Part XX | - | T954, T955, T957 |
+| REQ-GPU-052 | gpu | post-v1 | Make sao has metaprogramming mạnh như rust/modern c++ but not biến compiler into a mớ macro/plugin khó kiểm soát? | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | T950, T951, T958, T959, T961 |
+| REQ-GPU-053 | gpu | post-v1 | Tức is comptime is not a ngôn ngữ thứ hai. | 0139 §Part XXI — Comptime · Reflection · Compile-Time Programming | - | T950, T951, T958, T959, T961 |
 | REQ-CTM-012 | comptime | v1-full | - macro language thứ hai; - compiler plugin arbitrarily phá compiler; - build script has toàn quyền máy; - compile-time code has semantics khác runtime; - compiler build not reproducible; - programmer must học a hệ thống ownership khác. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
 | REQ-CTM-013 | comptime | v1-full | Compile-time is another execution phase, not another language. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
 | REQ-CTM-014 | comptime | v1-full | Comptime uses the same type system, ownership model, and semantic verifier as runtime code. | 0140 §# Part XXI — Comptime · Reflection · Compile-Time Programming | - | T550 |
@@ -2270,8 +2270,8 @@
 | REQ-CORE-233 | backend | v1-core | The target legalizer must split vector operations when the target architecture lacks native support for the vector width. | 0162 §30 | - | T113 | 
 | REQ-OPT-013 | optimizer | v1-full | Auto-vectorization must be performed by the optimizer before LIR lowering without requiring mandatory source annotations. | 0162 §31 | - | T616 |
 | REQ-LIR-013 | lir | v1-core | LIR must preserve distinct address spaces (Generic, Host, Device, Shared, Local, Private, Constant, External). | 0162 §32 | - | T113 | 
-| REQ-GPU-054 | gpu | post-v1 | GPU backends must not collapse GPU device address spaces into a generic address space. | 0162 §32 | - | EPIC(E22.3) |
-| REQ-GPU-055 | gpu | post-v1 | LIR functions targeting GPU kernels must specify an execution domain of GPU and memory operations targeting device address spaces. | 0162 §33 | - | EPIC(E22.3) |
+| REQ-GPU-054 | gpu | post-v1 | GPU backends must not collapse GPU device address spaces into a generic address space. | 0162 §32 | - | T955, T958, T959, T960, T961 |
+| REQ-GPU-055 | gpu | post-v1 | LIR functions targeting GPU kernels must specify an execution domain of GPU and memory operations targeting device address spaces. | 0162 §33 | - | T952, T955, T958, T959, T960, T961 |
 | REQ-CORE-234 | backend | v1-core | Target properties and CPU features must be encapsulated in FunctionTargetInfo rather than hard-coded into generic optimizer passes. | 0162 §34 | - | T113 | 
 | REQ-CORE-235 | backend | v1-core | The target legalizer must rewrite unsupported types and operations in LIR into legal target sequences before machine instruction selection. | 0162 §35 | - | T113 | 
 | REQ-CORE-236 | machine-ir | v1-core | Machine IR must represent physical and virtual registers, target instructions, register constraints, immediates, addressing modes, flags, and implicit operands. | 0162 §36 | - | T113 | 
@@ -3092,11 +3092,11 @@
 |REQ-FFI-070|ffi|v1-full|Axiom ABI is distinct from foreign ABI .|0292 §19, 0300 §31|-|T504|
 |REQ-FFI-071|ffi|v1-full|Foreign ABI must be explicitly selected .|0292 §56, 0300 §2|-|T504|
 |REQ-FFI-072|ffi|v1-full|C ABI is explicitly requested .|0292 §7, 0300 §3|-|T504|
-| REQ-GPU-056 | gpu | post-v1 | GPU is an explicit execution domain. | 0299 §24 | - | EPIC(E22.3) |
-|REQ-GPU-057|gpu|post-v1|GPU storage is an explicit storage domain .|0299 §7|-|EPIC(E22.3)|
-|REQ-GPU-058|gpu|post-v1|@kernel establishes GPU execution legality .|0299 §24|-|EPIC(E22.3)|
-|REQ-GPU-059|gpu|post-v1|Async device operations explicitly establish resource lifetime .|0299 §9|-|EPIC(E22.3)|
-|REQ-GPU-060|gpu|post-v1|Host storage is not implicitly device-accessible .|0299 §7|-|EPIC(E22.3)|
+| REQ-GPU-056 | gpu | post-v1 | GPU is an explicit execution domain. | 0299 §24 | - | T950, T951, T952, T953 |
+|REQ-GPU-057|gpu|post-v1|GPU storage is an explicit storage domain .|0299 §7|-|T954, T955, T956, T957|
+|REQ-GPU-058|gpu|post-v1|@kernel establishes GPU execution legality .|0299 §24|-|T950, T951, T953|
+|REQ-GPU-059|gpu|post-v1|Async device operations explicitly establish resource lifetime .|0299 §9|-|T954, T955, T956, T957|
+|REQ-GPU-060|gpu|post-v1|Host storage is not implicitly device-accessible .|0299 §7|-|T954, T955, T956, T957|
 | REQ-STD-019 | std-lib | v1-core | Core language defines semantics, not library implementation. | 0303 §2 | - | T113 | 
 | REQ-STD-020 | std-lib | v1-core | Core Library does not imply runtime linkage . | 0303 §2 | REQ-STD-019 | T113 | 
 | REQ-STD-021 | std-lib | v1-core | Standard Library is not part of the language type system . | 0303 §3 | REQ-STD-020 | T113 | 
@@ -6428,7 +6428,7 @@
 | REQ-OWN-245 | ownership | post-v1 | Tensor storage shall obey Axiom ownership semantics where large tensors do not implement `Copy`, moving a tensor transfers ownership, and duplicating tensor storage requires explicit `.clone()`. | tasks/0459 §200.13-14, ATENSOR-21, ATENSOR-31; tasks/0468 §209.10, ATENSOR-21-22 | - | EPIC(E24.0) |
 |REQ-CAP-133|capability|v1-full|Tensor views (`TensorView`, `TensorMutView`) shall obey capability, provenance, and lifetime rules without performing implicit data copies; mutable tensor views require provably disjoint regions or exclusive capability.|tasks/0459 §200.9-11, ATENSOR-22, ATENSOR-28; tasks/0468 §209.11-12, ATENSOR-23-24, ATENSOR-30-32|-|T502|
 | REQ-LAY-293 | layout | post-v1 | Tensor layout metadata (shape, stride, format) shall remain distinct from logical tensor semantics; broadcasting operations shall produce non-copying virtual views without implicitly materializing storage. | tasks/0459 §200.8, §200.12, ATENSOR-26-27, ATENSOR-32; tasks/0468 §209.6, §209.9, ATENSOR-25, ATENSOR-29, ATENSOR-32 | - | EPIC(E24.0) |
-| REQ-GPU-061 | gpu | post-v1 | Tensor storage domains (CPU, GPU, NPU/accelerator) shall remain distinct, prohibiting implicit cross-device data transfers and requiring explicit transfer operations (`tensor.to(device)`, `tensor.to_async(device)`). | tasks/0459 §200.15-17, ATENSOR-29, ATENSOR-42-44; tasks/0468 §209.14-16, ATENSOR-35-36, ATENSOR-53-56 | - | EPIC(E22.3) |
+| REQ-GPU-061 | gpu | post-v1 | Tensor storage domains (CPU, GPU, NPU/accelerator) shall remain distinct, prohibiting implicit cross-device data transfers and requiring explicit transfer operations (`tensor.to(device)`, `tensor.to_async(device)`). | tasks/0459 §200.15-17, ATENSOR-29, ATENSOR-42-44; tasks/0468 §209.14-16, ATENSOR-35-36, ATENSOR-53-56 | - | T954, T956, T957 |
 | REQ-TYP-339 | types | post-v1 | Eager execution tensors (`Tensor<T>`) and lazy graph tensors (`GraphTensor<T>`) shall have distinct semantic types; graph optimization, operator fusion, and memory planning may reuse storage buffers only after proving lifetime non-overlap and effect preservation. | tasks/0459 §200.20-27, ATENSOR-33-36; tasks/0468 §209.20-27, ATENSOR-40-43, ATENSOR-51, ATENSOR-61 | - | EPIC(E24.0) |
 | REQ-MIR-130 | mir | post-v1 | Automatic differentiation shall lower to ordinary verified Axiom MIR functions that undergo type, ownership, capability, and GPU verification; gradients shall be first-class owned values and stop-gradient shall be explicit. | tasks/0459 §200.28-38, ATENSOR-38-41; tasks/0468 §209.28-38, ATENSOR-44-48 | - | EPIC(E24.0) |
 | REQ-CAP-134 | capability | v1-full | In-place tensor mutations (`x += y`) shall require exclusive mutable capability and shall be rejected when live read views exist, without compiler insertion of silent cloning. | tasks/0459 §200.39-40, ATENSOR-30; tasks/0468 §209.39-40, ATENSOR-52 | - | T500 |
@@ -6483,10 +6483,10 @@
 | REQ-SIMD-332 | simd | v1-full | Floating-point fused multiply-add (FMA) contractions and SIMD mathematical operations shall be applied only when permitted by the active numerical profile. | tasks/0469 §210.24, AMATH-60-61 | - | T459 |
 | REQ-CONC-154 | concurrency | v1-full | Parallel execution shall not weaken ownership verification; concurrent mutable access requires proven disjointness or explicit synchronization, and unknown aliasing shall never be treated as independent parallel access. | tasks/0470 §211.3, §211.20, §211.23-24, APAR-20, APAR-22-24 | - | T402 |
 | REQ-OPT-354 | optimizer | v1-full | Automatic loop parallelization and compiler-derived parallelism shall require dependency analysis and shall preserve observable program semantics. | tasks/0470 §211.25-26, APAR-25-26 | - | T611 |
-| REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | EPIC(E22.3) |
+| REQ-GPU-062 | gpu | post-v1 | SIMT GPU execution shall remain distinct from CPU threading; warp-level and wave-level execution behavior shall not be assumed portable across architectures unless explicitly declared. | tasks/0470 §211.31-32, APAR-31-32 | - | T950, T952, T953 |
 | REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
 | REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | T500 |
-| REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | EPIC(E22.3) |
+| REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | T954, T956, T957 |
 | REQ-TGT-002 | target-other | v1-full | The freestanding compilation profile shall not require an operating system, garbage collector, heap allocator, or monolithic runtime; Core semantics shall remain identical across hosted and freestanding profiles. | tasks/0471 §212.1-3, AKERNEL-20-24 | - | T650 |
 | REQ-TGT-003 | target-other | v1-full | Freestanding targets shall support custom entry points (e.g., `_start`), and compilation shall not mandate implicit global initialization code. | tasks/0471 §212.4, §212.27, AKERNEL-25-27 | - | T650 |
 | REQ-ABI-102 | abi | v1-full | Hardware interrupt handlers shall declare explicit calling convention and execution domain contracts, and shall not implicitly allocate memory, block, or await. | tasks/0471 §212.5-6, AKERNEL-28-29 | - | T512, T511, T515 |
@@ -22927,8 +22927,8 @@
 | REQ-STD-173 | std-lib | v1-full | Axiom must provide native storage, filesystem, memory mapping, and durable data APIs. | 0840 (§1) | - | T074b, T321, T908, T909, T911, T920, T921, T922, T923 |
 | REQ-STD-174 | std-lib | v1-full | Axiom must provide native serialization and binary data models. | 0841 (§1) | - | T074b, T321, T924, T925, T926, T927 |
 | REQ-STD-175 | std-lib | v1-full | Axiom must provide native compression, archiving, and content-addressed storage capabilities. | 0842 (§1), 0844 (§1) | - | T321, T924, T926, T927 |
-| REQ-GPU-064 | gpu | v1-full | Axiom must provide APIs for hardware devices, GPU accelerators, and OS resource IO. | 0843 (§1), 0845 (§1) | - | T322 |
-| REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - | T322 |
+| REQ-GPU-064 | gpu | v1-full | Axiom must provide APIs for hardware devices, GPU accelerators, and OS resource IO. | 0843 (§1), 0845 (§1) | - | T322, T962, T963, T964, T965 |
+| REQ-GPU-065 | gpu | v1-full | Axiom must provide Native Graphics, Windowing, Display Composition, Rendering Pipeline & GPU Command Runtime capabilities. | 0846 (§1) | - | T322, T962, T963, T964, T965 |
 | REQ-STD-176 | std-lib | v1-full | Axiom must provide robust Unicode, text layout, and internationalization capabilities. | 0850 (§1) | - | T071 |
 | REQ-ECO-8733 | ecosystem | post-v1 | Axiom ecosystem must enable UI state synchronization, reactive data binding, and application layout routing. | 0853 (§243), 0855 (§1) | - | T324 |
 | REQ-ECO-8734 | ecosystem | v1-full | Axiom must enable dynamic plugins, hot-reloading, and safe dependency isolation across module boundaries. | 0856 (§1) | - | T320, T866, T867, T868, T869, T870, T871, T872, T873 |

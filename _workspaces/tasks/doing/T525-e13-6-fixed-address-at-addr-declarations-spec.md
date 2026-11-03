@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T500, T506, T511]
 priority: 174
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-55-fixed-address-declarations.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/decisions/ADR-0001-fixed-address-declarations.md, spec/SPEC-50-unsafe-ub-ffi.md, spec/SPEC-51-raw-memory-volatile-mmio-layout.md, spec/SPEC-52-freestanding-runtime-composition.md, 0071, 0044, 0097, tasks/0328]
 covers: [REQ-OWNER-008, REQ-OWNER-003]
+started: 2026-11-03 11:07:34
 ---
 # T525 — E13.6 — Canonical fixed-address declarations (@at / @addr) & address introspection specification (SPEC-55)
 
@@ -45,3 +46,4 @@ Finalise `ADR-0001` §1–4 & §7 (`REQ-OWNER-003`, `REQ-OWNER-008`) into canoni
 
 ## Log
 - 2026-11-03 02:05:00 created by T213 (P13 phase planning)
+- 2026-11-03 11:07:34 started (attempt 1) 
