@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511, T657, T661]
 priority: 112
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-85-android-aarch64-jni.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-82-linux-elf-dynamic.md, spec/SPEC-83-aarch64-linux.md, 0198, 0200, 0220, tasks/0453]
 covers: [REQ-TGT-069, REQ-TGT-070, REQ-TGT-071, REQ-TGT-072]
+started: 2026-11-04 00:32:24
+finished: 2026-11-04 01:48:39
 ---
 # T669 — E16.5 — Canonical Android AArch64 Bionic ELF target & capability-safe JNI binding specification (SPEC-85)
 
@@ -45,3 +47,5 @@ Consolidate the canonical specification for Axiom's `aarch64-android` target, Bi
 
 ## Log
 - 2026-11-03 08:40:00 created by T216 (P16 phase planning)
+- 2026-11-04 00:32:24 started (attempt 1) T669-impl
+- 2026-11-04 01:48:39 accepted by QA -> done
