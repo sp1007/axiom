@@ -524,7 +524,7 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CONST_SHIFT_RANGE` | E | T061/T451 | shift count out of range during constant evaluation (`SPEC-03` AXS-SEM-034, `SPEC-40` AXS-INT-005) |
 | `AX_DRIVER_NO_STD` | E | T060 | no std root found (ADR-0006 §8) |
 | `AX_FFI_NOT_IN_ORACLE` | E | T065/T503 | the interpreter reached a direct `extern` call without a host intrinsic or mock binding (ADR-0002 §4, `SPEC-50` AXS-UNS-036) |
-| `AX_UNSAFE_AT_HOSTED` | E | T504/T525 | `@addr` / `@at` placement on `static` or `fn` in the `hosted` profile without `--freestanding` or `--allow-fixed-addr` (ADR-0001, `SPEC-50` AXS-UNS-023, AXS-UNS-050; formerly `AX_ADDR_HOSTED`) |
+| `AX_UNSAFE_AT_HOSTED` | E | T504/T525/T526 | `@addr` / `@at` placement on `static` or `fn` in the `hosted` profile without `--freestanding` or `--allow-fixed-addr` (ADR-0001, `SPEC-50` AXS-UNS-023, AXS-UNS-050; `SPEC-55` AXS-ADR-014, AXS-ADR-050; formerly `AX_ADDR_HOSTED`) |
 | `AX_CONC_NOT_SEND` | E | T089/T401 | value of type `T: !Send` transferred across an execution context boundary (`SPEC-30` AXS-CONC-050) |
 | `AX_CONC_NOT_SHARE` | E | T089/T401 | shared capability `view<T>` where `T: !Share` shared across execution contexts (`SPEC-30` AXS-CONC-050) |
 | `AX_CONC_SAFE_IMPL_MARKER` | E | T089 | positive `impl Send` or `impl Share` written without `unsafe` (`SPEC-30` AXS-CONC-018) |
@@ -555,8 +555,11 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_ASYNC_POLL_AFTER_COMPLETE` | E | T088/T418 | oracle or debug check detects `Future.poll` called on a state machine already in `STATE_COMPLETE` or `STATE_POISONED` (`SPEC-33` AXS-ASY-042, AXS-ASY-050, AXS-ASY-051) |
 | `AX_UNSAFE_TRAIT_IMPL` | E | T501 | `impl Trait for T` written without `unsafe` when `Trait` is declared `unsafe trait` (`SPEC-50` AXS-UNS-004, AXS-UNS-050) |
 | `AX_UNSAFE_UNNECESSARY_IMPL` | E | T501 | `unsafe impl Trait for T` written when `Trait` is not declared `unsafe trait` (`SPEC-50` AXS-UNS-004, AXS-UNS-050) |
-| `AX_UNSAFE_MISALIGNED_AT` | E | T504/T525 | `@addr(A)` / `@at(A)` has `A == 0` or `A % align_of::<T>() != 0` (`SPEC-50` AXS-UNS-022..024, AXS-UNS-050) |
-| `AX_UNSAFE_INVALID_AT_LAYOUT` | E | T504/T525 | `@addr(A)` / `@at(A)` applied to a type with dynamically sized or non-fixed layout (`SPEC-50` AXS-UNS-023..024, AXS-UNS-050) |
+| `AX_UNSAFE_MISALIGNED_AT` | E | T504/T525/T526 | `@addr(A)` / `@at(A)` has `A == 0` or `A % align_of<T>() != 0` (`SPEC-50` AXS-UNS-022..024, AXS-UNS-050; `SPEC-55` AXS-ADR-014, AXS-ADR-050; canonical alias `AX_UNSAFE_AT_MISALIGNED`) |
+| `AX_UNSAFE_AT_MISALIGNED` | E | T526 | constant `@at(A)` / `@addr(A)` address `A` is not aligned to `align_of<T>()` (`SPEC-55` AXS-ADR-014, AXS-ADR-050; canonical alias of `AX_UNSAFE_MISALIGNED_AT`) |
+| `AX_UNSAFE_AT_OVERLAP` | E | T526 | two constant `@at` / `@addr` items in the same module have overlapping address ranges (`ADR-0001 §3`, `SPEC-55` AXS-ADR-014, AXS-ADR-050) |
+| `AX_LINK_AT_OVERLAP` | E | T528 | two pinned `@at` / `@addr` sections or symbols across linked objects overlap in VMA space (`ADR-0001 §3–4`, `SPEC-55` AXS-ADR-014, AXS-ADR-023, AXS-ADR-050) |
+| `AX_UNSAFE_INVALID_AT_LAYOUT` | E | T504/T525/T526 | `@addr(A)` / `@at(A)` applied to a type with dynamically sized or non-fixed layout (`SPEC-50` AXS-UNS-023..024, AXS-UNS-050; `SPEC-55` AXS-ADR-014, AXS-ADR-050) |
 | `AX_FFI_UNKNOWN_ABI` | E | T503 | unknown ABI string in `extern "<abi>"` or `@abi(<mode>)` (`SPEC-50` AXS-UNS-031..032, AXS-UNS-050) |
 | `AX_FFI_BAD_TYPE` | E | T503 | non-FFI-safe parameter or return type in an `extern "C"` / `"system"` signature (`SPEC-50` AXS-UNS-032..033, AXS-UNS-050) |
 | `AX_FFI_INVALID_TRANSPARENT` | E | T503 | `@repr(transparent)` applied to a type that does not have exactly one non-zero-sized field (`SPEC-50` AXS-UNS-031, AXS-UNS-050) |
@@ -630,4 +633,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.

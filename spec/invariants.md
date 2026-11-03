@@ -52,7 +52,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
 data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, x86-64 SSE2/AVX2/VEX encoding, `TargetDesc` CPU feature hierarchy, `@target_feature` legality, `std.arch` `CPUID`/`XGETBV` detection, and `@multiversion` dispatch (`SPEC-42`, `SPEC-43`, `SPEC-44`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
-address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`), `SEC` safety profiles, capability-based OS authority, `Secret<T>` zeroization, and `@constant_time` execution (`SPEC-53`), `PAN` panic strategies (`--panic abort|unwind`), `catch_unwind`, deterministic `Drop` unwinding, `@no_panic` verification, Windows x64 SEH `.pdata`/`.xdata` unwind tables, and `extern "C"` FFI no-unwind barrier (`SPEC-54`), `CTM` Comptime 2.0 unified execution model, sandboxed authority, value lifting & resource no-escape barrier, partial evaluation, specialization, dependency-tracked caching, and `const`/`static`/`TLS` initialization (`SPEC-60`). A new group is added by editing this list.
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`), `SEC` safety profiles, capability-based OS authority, `Secret<T>` zeroization, and `@constant_time` execution (`SPEC-53`), `PAN` panic strategies (`--panic abort|unwind`), `catch_unwind`, deterministic `Drop` unwinding, `@no_panic` verification, Windows x64 SEH `.pdata`/`.xdata` unwind tables, and `extern "C"` FFI no-unwind barrier (`SPEC-54`), `ADR` fixed-address `@at` / `@addr` overlay and placement declarations (`REQ-OWNER-003`), ordinary-syntax MMIO register access, `REQ-OWNER-008` address introspection, COFF `IMAGE_SYM_ABSOLUTE` symbols, pinned VMA sections, `--format bin` raw binary output, and oracle simulated address space & device model (`SPEC-55`), `CTM` Comptime 2.0 unified execution model, sandboxed authority, value lifting & resource no-escape barrier, partial evaluation, specialization, dependency-tracked caching, and `const`/`static`/`TLS` initialization (`SPEC-60`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -855,11 +855,41 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T555
 - check: positive and negative conformance tests in tests/conformance/p14/e14_1_comptime (delivered by T555) pass in `--interp` and native modes with `0 WEAK-NATIVE`
 
+## 21. Fixed-address declarations (`@at` / `@addr`), MMIO overlay/placement, and address introspection (SPEC-55)
+
+### INV-ADR-001 — `@at` / `@addr` overlay vs placement HIR/THIR/MIR lowering, `fixed` provenance, alignment/overlap/layout verification, and automatic `Volatile`/`Mmio*` field lowering
+- statement: `compiler/hir/`, `compiler/sema/`, and `compiler/mir/` lower `@at(<expr>)` and `@addr(<expr>)` on `static`, `static mut`, `let`, `fn`, and `extern fn` into `Placement { kind: Overlay | Place, addr, region }`, enforce `unsafe` declaration trust (`ADR-0001 §2`), defined `@repr(C)`/primitive layout (`AX_UNSAFE_INVALID_AT_LAYOUT`), natural address alignment (`AX_UNSAFE_AT_MISALIGNED` / `AX_UNSAFE_MISALIGNED_AT`), intra-module address range non-overlap (`AX_UNSAFE_AT_OVERLAP`), and profile/region rules (`AX_UNSAFE_AT_HOSTED`), lower fixed-address statics to `PlaceBase.FixedStatic(SymbolId)` with `Provenance.Fixed` (never moved, never dropped) and `Volatile<T>`/`Mmio<T>`/`MmioRO<T>`/`MmioWO<T>` field projections directly to `VolatileLoad`/`VolatileStore` (`AX_TYPE_MMIO_WRITE_READONLY`, `AX_TYPE_MMIO_READ_WRITEONLY`), and support `REQ-OWNER-008` dynamic `base + offset` expressions (`let base = fn_addr(foo); @addr(base + 0x100) static mut REG: u32`) (SPEC-55 AXS-ADR-001..020, AXS-ADR-050).
+- source: ADR-0001 §1-4, §7; OWNER.md REQ-OWNER-003, REQ-OWNER-008; 0044; 0071; 0097; tasks/0328; REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145, REQ-CAP-140, REQ-CAP-143; SPEC-55 AXS-ADR-001..020, AXS-ADR-050
+- verify: tests/ui/fixed_addr
+- since: T526
+- check: positive and negative UI diagnostic tests in tests/ui/fixed_addr (delivered by T526) verify `@at`/`@addr` overlay and placement declarations, alignment errors, overlap errors, layout-unspecified struct rejection, `MmioRO`/`MmioWO` direction checks, and `REQ-OWNER-008` address expressions
+
+### INV-ADR-002 — Oracle (`--interp`) sparse simulated address space, scriptable MMIO/UART/vector-table device model, and `REQ-OWNER-008` round-trip equality
+- statement: `compiler/interp/` maintains a sparse simulated address-space map (`FixedAddrMap`) backing `@at` and `@addr` overlays and placements at their exact `usize` addresses, executes a deterministic scriptable MMIO device model (UART status/tx/rx registers and interrupt vector table dispatch) without hardware, and guarantees `fn_addr(f) == A`, `static_addr(s) == A`, `addr_of(v) == A`, and `(address_of(v) as usize) == A` for both constant and dynamic `base + offset` placements (SPEC-55 AXS-ADR-010..012, AXS-ADR-024).
+- source: ADR-0001 §4, §7; OWNER.md REQ-OWNER-003, REQ-OWNER-008; 0071; 0097; tasks/0328; SPEC-55 AXS-ADR-010..012, AXS-ADR-024
+- verify: tests/run/fixed_addr_oracle
+- since: T527
+- check: oracle execution tests in tests/run/fixed_addr_oracle (delivered by T527) verify simulated `@at` vector table dispatch, ROM function overlay calls, UART status polling and data transmission (`UART0.status`, `UART0.data`), dynamic `@addr(base + 0x100)` placement, and `REQ-OWNER-008` round-trip address equality
+
+### INV-ADR-003 — COFF `IMAGE_SYM_ABSOLUTE` overlay symbols, pinned VMA sections, cross-object overlap detection, and freestanding `--format bin` raw-binary output
+- statement: `compiler/lir/`, `compiler/target/x64/`, `compiler/obj/`, and `compiler/link/` emit COFF `IMAGE_SYM_ABSOLUTE` (`SectionNumber = -1`) symbols for constant `@at`/`@addr` overlays, emit per-item pinned sections (`.at.text.*`, `.at.data.*`, `.at.rdata.*` with `pinned_vma = Some(A)`) for placements, reject cross-object VMA overlaps (`AX_LINK_AT_OVERLAP`), emit headerless `--format bin` (`ImageFormat.RawBinary`) freestanding images alongside PE32+ images, and preserve `fn_addr`/`static_addr`/`address_of` round-trip equality in native x86-64 execution (SPEC-55 AXS-ADR-021..023).
+- source: ADR-0001 §4, §7; OWNER.md REQ-OWNER-003, REQ-OWNER-008; 0071; 0097; tasks/0328; SPEC-04 AXS-EXT-070..072; SPEC-55 AXS-ADR-021..023
+- verify: tests/link/fixed_addr
+- since: T528
+- check: link, `objdump`, and native execution tests in tests/link/fixed_addr (delivered by T528) verify `IMAGE_SYM_ABSOLUTE` symbols, pinned VMA sections, cross-object overlap rejection, `--format bin` raw binary output, and native `fn_addr(isr) == 0x2000_0000usize` / `static_addr` / `address_of` round-trip equality
+
+### INV-ADR-004 — End-to-end E13.6 fixed-address (`@at` / `@addr`) vector table, UART MMIO, and `REQ-OWNER-003`/`REQ-OWNER-008` round-trip conformance
+- statement: The E13.6 conformance suite certifies `@at` and `@addr` overlays and placements across `static`, `static mut`, `let`, arrays, `@repr(C)` structs with `Mmio<T>`/`MmioRO<T>`/`MmioWO<T>` fields, `fn`, and `extern "C" fn`, verifying `REQ-OWNER-003` ordinary-syntax MMIO/vector-table usage and `REQ-OWNER-008` address introspection (`fn_addr`, `static_addr`, `addr_of`, `address_of(v) as usize`, dynamic `base + 0x100` placement) across `--interp` and native x86-64 with `0 WEAK-NATIVE` (SPEC-55 AXS-ADR-001..053).
+- source: SPEC-55 AXS-ADR-001..053; ADR-0001 §1-4, §7; OWNER.md REQ-OWNER-003, REQ-OWNER-008
+- verify: tests/conformance/p13/e13_6_fixed_addr
+- since: T529
+- check: positive and negative conformance tests in tests/conformance/p13/e13_6_fixed_addr (delivered by T529) pass in `--interp` and native modes with `0 WEAK-NATIVE` and `objdump` verification
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0188; 0229; 0263 §28, §46-§47; tasks/0351; tasks/0517; tasks/0700; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

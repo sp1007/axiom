@@ -6,12 +6,13 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T311, T312, T313, T314, T315, T316, T317, T318, T319, T320, T321, T322]
-priority: 6
-status: todo
-attempts: 0
+depends: [T087]
+priority: 20
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
+started: 2026-11-03 11:11:11
 ---
 # T223 — Plan phase P23: v1.0 conformance, freeze & release
 
@@ -40,3 +41,5 @@ the roadmap is invented.
 ## Notes
 - Critical board task (priority < 10): runs alone.
 
+## Log
+- 2026-11-03 11:11:11 started (attempt 1) 
