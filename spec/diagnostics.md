@@ -165,7 +165,7 @@ They map to the areas above as the last column shows. Three groups have no area 
   obligations (`Certainty.Possible` or `Certainty.Unknown`) roll back cleanly with zero user diagnostics (`AXS-PCT-010`,
   `AXS-PCT-050`), while a committed pass contract or translation validation failure under `--verify-pass-contracts` or
   `--validate-translations` (`T769`–`T770`) reports `AX_ICE_MIR_VERIFY` or `AX_ICE_INTERNAL` (`data.stage = "pass_contract"`
-  or `"translation_val"`, `AXD-042`).
+  or `"translation_val"`, `AXD-042`). For E18.6 (`T774` / `SPEC-27 §4`), separate compilation and `LinkIR` multi-object/archive linking (`T067`, `T775`) enrich `AX_LINK_UNDEFINED_SYMBOL` and `AX_LINK_DUPLICATE_SYMBOL` with demangled Axiom paths (`data.demangled`) and `.axmeta` source spans (`AXS-LNK-014`), and add `AX_LINK_ABI_MISMATCH` in the `LINK` area for cross-object calling-convention or `.axmeta` `AbiFingerprint` mismatches (`AXS-LNK-005`, `AXS-LNK-050`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -686,9 +686,10 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_LINK_BAD_ARTIFACT` | E | T765/T766 | invalid magic, truncated header or section table, out-of-bounds offset/size, overlapping sections, or failed BLAKE3 `content_hash`/`checksum` in `.axmi`, `.axmeta`, `.axlto`, or `.axpkg` (`SPEC-24` AXS-ART-002..004, AXS-ART-022, AXS-ART-050) |
 | `AX_LINK_ARTIFACT_SCHEMA_MISMATCH` | E | T765/T766 | unsupported `schema_version`, unknown non-optional section (`RequiredUnknown`), or incompatible MIR/LTO/interface schema version in `.axmi` or `.axmeta`/`.axlto` (`data.expected_version`, `data.found_version`; `SPEC-24` AXS-ART-005, AXS-ART-013, AXS-ART-050) |
 | `AX_LINK_ARTIFACT_TARGET_MISMATCH` | E | T765/T766 | `TargetFingerprint`, endianness, pointer width, required CPU features, `AbiFingerprint`, or profile/panic strategy in `.axmi`/`.axmeta`/`.obj` conflicts with the active compilation target (`data.expected_target`, `data.found_target`; `SPEC-24` AXS-ART-022..023, AXS-ART-050) |
+| `AX_LINK_ABI_MISMATCH` | E | T067 | cross-object calling convention, symbol kind, or `.axmeta` `AbiFingerprint` mismatch for the same external symbol (`data.symbol`, `data.demangled`, `data.expected_abi`, `data.found_abi`; `SPEC-27` AXS-LNK-005, AXS-LNK-014, AXS-LNK-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); tasks/0791 (BOOTSTRAP-569: §10-§11); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-21; SPEC-22; SPEC-23; SPEC-24; SPEC-25; SPEC-26; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-21; SPEC-22; SPEC-23; SPEC-24; SPEC-25; SPEC-26; SPEC-27; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-62; SPEC-63; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
