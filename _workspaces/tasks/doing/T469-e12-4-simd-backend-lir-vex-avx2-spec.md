@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T463]
 priority: 159
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-43-simd-backend.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0095, 0162, 0179, 0181, tasks/0403, tasks/0407]
 covers: [REQ-SIMD-019, REQ-SIMD-020, REQ-SIMD-021, REQ-SIMD-022, REQ-SIMD-023, REQ-SIMD-024, REQ-SIMD-025, REQ-SIMD-029, REQ-SIMD-030, REQ-SIMD-031, REQ-SIMD-032, REQ-SIMD-033, REQ-SIMD-034, REQ-SIMD-035, REQ-SIMD-036, REQ-SIMD-037, REQ-SIMD-038, REQ-SIMD-039, REQ-SIMD-042, REQ-SIMD-043, REQ-SIMD-046, REQ-SIMD-047, REQ-SIMD-048, REQ-SIMD-049, REQ-SIMD-050]
+started: 2026-11-03 09:44:52
 ---
 # T469 — E12.4 — Canonical SIMD backend, LIR vector lowering & SSE2/AVX2 encoding specification (SPEC-43)
 
@@ -45,3 +46,4 @@ Specify canonical `spec/SPEC-43-simd-backend.md` (`AXS-SBE-*`), defining LIR vec
 
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
+- 2026-11-03 09:44:52 started (attempt 1) 
