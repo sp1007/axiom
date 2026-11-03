@@ -52,7 +52,7 @@ model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
 `std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety,
 data-oriented `TensorView`/`MatrixView`, LIR vector lowering/legalization, Windows x64 vector ABI, x86-64 SSE2/AVX2/VEX encoding, `TargetDesc` CPU feature hierarchy, `@target_feature` legality, `std.arch` `CPUID`/`XGETBV` detection, and `@multiversion` dispatch (`SPEC-42`, `SPEC-43`, `SPEC-44`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
-address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`), `SEC` safety profiles, capability-based OS authority, `Secret<T>` zeroization, and `@constant_time` execution (`SPEC-53`), `PAN` panic strategies (`--panic abort|unwind`), `catch_unwind`, deterministic `Drop` unwinding, `@no_panic` verification, Windows x64 SEH `.pdata`/`.xdata` unwind tables, and `extern "C"` FFI no-unwind barrier (`SPEC-54`). A new group is added by editing this list.
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` raw memory access, volatile/MMIO register wrappers, untagged `union` types, `@repr(packed)`/`@align(N)` layout, `MaybeUninit<T>`, `bitcast`, and pointer address spaces (`SPEC-51`), `FRE` freestanding execution, modular runtime composition, compilation profiles, `@entry`/`@naked`/`@section`/`@used`, interrupt handlers, and runtime capability graph (`SPEC-52`), `SEC` safety profiles, capability-based OS authority, `Secret<T>` zeroization, and `@constant_time` execution (`SPEC-53`), `PAN` panic strategies (`--panic abort|unwind`), `catch_unwind`, deterministic `Drop` unwinding, `@no_panic` verification, Windows x64 SEH `.pdata`/`.xdata` unwind tables, and `extern "C"` FFI no-unwind barrier (`SPEC-54`), `CTM` Comptime 2.0 unified execution model, sandboxed authority, value lifting & resource no-escape barrier, partial evaluation, specialization, dependency-tracked caching, and `const`/`static`/`TLS` initialization (`SPEC-60`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -818,11 +818,48 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`), `MEM` 
 - since: T524
 - check: positive and negative conformance tests in tests/conformance/p13/e13_5_panic_unwinding (delivered by T524) pass in `--interp` and native modes with `0 WEAK-NATIVE`
 
+## 20. Comptime 2.0, value lifting, partial evaluation, specialization, and const/static/TLS initialization (SPEC-60)
+
+### INV-CTM-001 — Unified Comptime 2.0 type/ownership/capability verification and default capability sandbox (`AX_CTM_CAPABILITY_DENIED`)
+- statement: `const`, `comptime fn`, `comptime { ... }` blocks, and `[T, comptime N: usize]` const generics execute as evaluation modes of the single Axiom language using the identical type system, move/`Copy` ownership rules, `view`/`mut_view` capability verifier, and package visibility boundaries as runtime code (`AXS-CTM-001..004`), reject runtime calls to `comptime fn` (`AX_CTM_RUNTIME_CALL_FORBIDDEN`) and runtime captures inside `comptime { ... }` (`AX_CTM_NON_CONST_CAPTURE`), and run in a default sandboxed environment that rejects undeclared ambient OS filesystem, network, process environment (`env`), wall-clock/monotonic time (`time`), or foreign FFI operations with `AX_CTM_CAPABILITY_DENIED` even inside `unsafe` blocks (SPEC-60 AXS-CTM-001..004, AXS-CTM-050).
+- source: 0102; 0131 §68-69, §88 AFN-55..56; 0140 Part XXI; tasks/0340; tasks/0346 ACOMP2-20..49; tasks/0443 APROC-30..34; tasks/0453 ATARGET-22..23, 35..36; tasks/0464 ATIME-47..49; tasks/0509 COMPTIME-20..42; REQ-CTM-001, REQ-CTM-007..014, REQ-CTM-017..018, REQ-CTM-025..034, REQ-CTM-037..038, REQ-CTM-044, REQ-CTM-046..047, REQ-CORE-683..712, REQ-CORE-2130..2154; SPEC-60 AXS-CTM-001..004, AXS-CTM-050
+- verify: tests/ui/comptime
+- since: T551
+- check: positive and negative UI tests in tests/ui/comptime (delivered by T551) verify `comptime fn`, `comptime { ... }` blocks, `comptime` parameters, `AX_CTM_RUNTIME_CALL_FORBIDDEN`, `AX_CTM_NON_CONST_CAPTURE`, `AX_CTM_CAPABILITY_DENIED`, and `unsafe`-in-comptime sandbox enforcement
+
+### INV-CTM-002 — Comptime MIR evaluation, transient compiler-heap `Drop`, resource no-escape barrier (`AX_CTM_RESOURCE_ESCAPE`), and deterministic `const`/`static` initialization
+- statement: `compiler/interp` executes `comptime fn` and `comptime { ... }` bodies on Verified MIR in isolated compiler arena memory, runs deterministic reverse-order `Drop` cleanup on all transient comptime heap allocations (`Vec`, `String`, `Box`) before comptime completion, enforces the Comptime-to-Runtime Value Lifting Barrier by rejecting any escaping unpromoted heap handle, `mut_view`, dead-owner `view`, raw comptime pointer, or authority token with `AX_CTM_RESOURCE_ESCAPE`, uses target `TargetDesc` layout for all compile-time layout queries, and enforces dependency-ordered constant initialization for `const`, `static`, and `@thread_local static` items while detecting cycles (`AX_CTM_CYCLE`), panics (`AX_CTM_PANIC`), and step/memory budget exhaustion (`AX_CTM_STEP_LIMIT`, `AX_CTM_MEM_LIMIT`) without compiler crashes or ICEs (SPEC-60 AXS-CTM-010..013, AXS-CTM-030..032, AXS-CTM-050).
+- source: 0111 §47; 0115 §59 ACOMP-20..21; 0120 §276-278 ACOMP-22..23; 0140 Part XXI; tasks/0346 ACOMP2-50..66; tasks/0509 COMPTIME-48..82; tasks/0514 AGLOBAL-20..88; REQ-CTM-002..006, REQ-CTM-015..016, REQ-CTM-023..024, REQ-CTM-036, REQ-CORE-713..729, REQ-CORE-2160..2199, REQ-CORE-2214..2283; SPEC-60 AXS-CTM-010..013, AXS-CTM-030..032, AXS-CTM-050
+- verify: tests/run/comptime, tests/mir/comptime
+- since: T552
+- check: execution and MIR tests in tests/run/comptime and tests/mir/comptime (delivered by T552) verify transient comptime heap allocation and deterministic `Drop`, complex value lifting, `AX_CTM_RESOURCE_ESCAPE` rejection, `AX_CTM_CYCLE`/`AX_CTM_STEP_LIMIT`/`AX_CTM_MEM_LIMIT`, and deterministic `const`/`static` initialization
+
+### INV-CTM-003 — Partial evaluation, `if comptime` specialization, and dependency-tracked comptime cache identity (`ComptimeCacheKey`)
+- statement: `compiler/sema/specialize.ax` and `compiler/opt/` specialize functions and closures over `comptime` parameters and constant arguments, fold `if comptime` branches while preserving runtime overflow/bounds/division traps on remaining runtime paths, respect global effect/alias/synchronization barriers (`AGLOBAL-89..108`), and cache comptime evaluations in `compiler/driver` under a content-addressed `ComptimeCacheKey` covering compiler version, target configuration, transitive callees, capability policy, and declared external inputs so cache hits are 100% observationally equivalent to fresh evaluations (SPEC-60 AXS-CTM-020..022, AXS-CTM-033).
+- source: 0140 §XXI.48 ACOMP-44; tasks/0346 ACOMP2-67..91; tasks/0509 COMPTIME-41..47, COMPTIME-83..87; tasks/0514 AGLOBAL-89..108; REQ-CTM-035, REQ-CTM-041..042, REQ-CORE-730..754, REQ-CORE-2153..2159, REQ-CORE-2195..2199, REQ-CORE-2284..2303; SPEC-60 AXS-CTM-020..022, AXS-CTM-033
+- verify: tests/mir/specialize, tests/run/specialize
+- since: T553
+- check: MIR golden tests in tests/mir/specialize and differential run tests in tests/run/specialize (delivered by T553) verify `comptime` parameter specialization, `if comptime` dead-branch elimination, preservation of runtime traps on untaken paths, and `ComptimeCacheKey` invalidation
+
+### INV-CTM-004 — Native materialization of lifted comptime aggregates into `.rdata`, `.data`, `.bss`, and `.tls` without runtime ComptimeVM overhead
+- statement: `compiler/lir`, `compiler/target/x64`, and `compiler/obj` lower comptime-lifted structs, enums, arrays, and promoted static slices (`view<[T]>`, `Str`) into deterministic global data objects with `Addr64` internal relocations, emit read-only constants and immutable statics into `.rdata`, non-zero mutable statics into `.data`, zero-initialized mutable statics into `.bss`, and `@thread_local` templates into `.tls`, preserve unique address identity for address-observable `static` items while permitting `const` deduplication, and link zero ComptimeVM or interpreter symbols into native binaries (SPEC-60 AXS-CTM-030, AXS-CTM-034).
+- source: tasks/0509 COMPTIME-24..25, COMPTIME-81; tasks/0514 AGLOBAL-109..150; REQ-CORE-2136..2137, REQ-CORE-2304..2345; SPEC-60 AXS-CTM-030, AXS-CTM-034
+- verify: tests/run/comptime_native
+- since: T554
+- check: differential (`--interp` and native) tests in tests/run/comptime_native (delivered by T554) verify comptime lookup tables, nested structs/enums/slices, `.rdata`/`.data`/`.bss` placement, `static` address identity vs `const` value semantics, and `0 WEAK-NATIVE`
+
+### INV-CTM-005 — End-to-end E14.1 Comptime 2.0, partial evaluation, specialization, and `const`/`static` initialization conformance
+- statement: The E14.1 conformance suite certifies `comptime fn`, `comptime { ... }` blocks, `comptime` generic parameters, sandboxed capability enforcement (`AX_CTM_CAPABILITY_DENIED`), transient compiler-heap `Drop` cleanup, the comptime-to-runtime resource no-escape barrier (`AX_CTM_RESOURCE_ESCAPE`), `if comptime` partial evaluation and specialization, dependency-tracked `ComptimeCacheKey` equivalence, and deterministic `const` vs `static` vs `TLS` initialization and `.rdata`/`.data`/`.bss` materialization across `--interp` and native x86-64 with `0 WEAK-NATIVE` (SPEC-60 AXS-CTM-001..053).
+- source: SPEC-60 AXS-CTM-001..053; 0102; 0140; tasks/0346 ACOMP2-92..100; tasks/0509 COMPTIME-88..100; tasks/0514 AGLOBAL-151..165; REQ-CORE-755..763, REQ-CORE-2200..2213, REQ-CORE-2346..2360
+- verify: tests/conformance/p14/e14_1_comptime
+- since: T555
+- check: positive and negative conformance tests in tests/conformance/p14/e14_1_comptime (delivered by T555) pass in `--interp` and native modes with `0 WEAK-NATIVE`
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0188; 0229; 0263 §28, §46-§47; tasks/0351; tasks/0517; tasks/0700; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

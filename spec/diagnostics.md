@@ -129,7 +129,13 @@ They map to the areas above as the last column shows. Three groups have no area 
   `AX_SEC_SECRET_EXPOSURE`, `AX_SEC_INVALID_CONSTANT_TIME_ATTR`). For E13.5 (`T521` / `SPEC-54 §4`), the `PANIC`
   prefix (`AX_PANIC_*`, alongside `AX_DRIVER_*`, `AX_TYPE_*`, and `AX_FFI_*` in `compiler/diag/code.ax`, `T522`) is
   established for self-hosted `axiomc`, covering `@no_panic` call-graph and checked-operation verification
-  (`AX_PANIC_FORBIDDEN_IN_NO_PANIC`).
+  (`AX_PANIC_FORBIDDEN_IN_NO_PANIC`). For E14.1 (`T550` / `SPEC-60 §5`), the `CTM` prefix (`AX_CTM_*`, alongside
+  `AX_CONST_*` in `compiler/diag/code.ax`, `T551`–`T552`) is established for self-hosted `axiomc`, covering
+  `comptime fn` runtime call rejection (`AX_CTM_RUNTIME_CALL_FORBIDDEN`, `AX_CTM_NON_CONST_CAPTURE`), sandboxed
+  comptime capability verification (`AX_CTM_CAPABILITY_DENIED`), comptime-to-runtime resource no-escape
+  (`AX_CTM_RESOURCE_ESCAPE`), cycle/budget/panic diagnostics (`AX_CTM_CYCLE`, `AX_CTM_STEP_LIMIT`,
+  `AX_CTM_MEM_LIMIT`, `AX_CTM_PANIC`), and constant static initialization / static move enforcement
+  (`AX_CTM_NON_CONST_STATIC_INIT`, `AX_CTM_STATIC_MOVE_FORBIDDEN`).
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -609,9 +615,19 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_PANIC_FORBIDDEN_IN_NO_PANIC` | E | T522 | `@no_panic` function directly or transitively calls `panic`, `unreachable`, `assert`, `Option.unwrap`, `Result.unwrap`, unchecked indexing, checked division/remainder without a non-zero proof, or a non-`@no_panic` function (`REQ-ABI-105`, `SPEC-54` AXS-PAN-005, AXS-PAN-050) |
 | `AX_TYPE_INVALID_NO_PANIC_ATTR` | E | T522 | `@no_panic` attribute applied to a non-function item (`struct`, `enum`, `trait`, `type`, `let`, `const`, `static`) (`SPEC-54` AXS-PAN-005, AXS-PAN-050) |
 | `AX_FFI_INVALID_UNWIND_CONTRACT` | E | T522 | invalid unwind-crossing attribute or calling-convention modifier applied to an `extern "C"` declaration or exported function (`REQ-FFI-004`, `REQ-FFI-041`, `REQ-FFI-093`, `SPEC-54` AXS-PAN-010, AXS-PAN-050) |
+| `AX_CTM_RUNTIME_CALL_FORBIDDEN` | E | T551 | `comptime fn` called from a runtime expression context (`SPEC-60` AXS-CTM-002, AXS-CTM-050) |
+| `AX_CTM_NON_CONST_CAPTURE` | E | T551 | `comptime { ... }` block or `const`/`static` initializer references a runtime local or non-`comptime` parameter (`SPEC-60` AXS-CTM-002, AXS-CTM-050) |
+| `AX_CTM_CAPABILITY_DENIED` | E | T551 | `comptime` evaluation invokes ambient OS filesystem, network, environment (`env`), clock (`time`), process, or foreign `extern` FFI without an explicit granted comptime capability (`REQ-CTM-044`, `REQ-CTM-047`, `SPEC-60` AXS-CTM-003, AXS-CTM-050) |
+| `AX_CTM_RESOURCE_ESCAPE` | E | T551/T552 | unpromoted comptime heap handle (`Vec`, `String`, `Box`), `mut_view`, `view` to a dead comptime local, raw comptime pointer, or authority token escapes across the comptime-to-runtime value lifting barrier (`REQ-CTM-002`, `REQ-CTM-004..006`, `REQ-CTM-009`, `REQ-CTM-011`, `SPEC-60` AXS-CTM-011, AXS-CTM-050) |
+| `AX_CTM_CYCLE` | E | T552 | cyclic evaluation dependency among `const`, `static`, or `comptime` items (`SPEC-60` AXS-CTM-012, AXS-CTM-032, AXS-CTM-050; aliases `AX_CONST_CYCLE`) |
+| `AX_CTM_STEP_LIMIT` | E | T552 | comptime evaluation exceeded the step limit or call-depth budget (`SPEC-60` AXS-CTM-012, AXS-CTM-050; aliases `AX_CONST_EVAL_LIMIT`) |
+| `AX_CTM_MEM_LIMIT` | E | T552 | comptime evaluation exceeded the compiler arena memory budget (`SPEC-60` AXS-CTM-012, AXS-CTM-050) |
+| `AX_CTM_PANIC` | E | T552 | explicit `panic(...)` or failed `assert(...)` executed during comptime evaluation (`SPEC-60` AXS-CTM-012, AXS-CTM-050) |
+| `AX_CTM_NON_CONST_STATIC_INIT` | E | T551/T552 | `const`, `static`, or `@thread_local static` initialized with a runtime-only expression (`SPEC-60` AXS-CTM-032, AXS-CTM-050) |
+| `AX_CTM_STATIC_MOVE_FORBIDDEN` | E | T551/T552 | moving a `!Copy` value out of a `static` or `@thread_local static` storage place (`SPEC-60` AXS-CTM-031, AXS-CTM-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-60; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
