@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511, T650]
 priority: 100
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-82-linux-elf-dynamic.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-80-linux-x86-64-elf-static.md, 0164, 0192, 0197, 0217, tasks/0369, tasks/0563]
 covers: [REQ-TGT-061, REQ-TGT-062, REQ-TGT-063, REQ-TGT-064, REQ-TGT-065]
+started: 2026-11-03 15:03:40
+finished: 2026-11-03 15:21:50
 ---
 # T657 — E16.2 — Canonical Linux ELF dynamic linking, PIE, GOT/PLT, .so & libc interop specification (SPEC-82)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Linux ELF64 dynamic linking, Positio
 
 ## Log
 - 2026-11-03 08:37:00 created by T216 (P16 phase planning)
+- 2026-11-03 15:03:40 started (attempt 1) 
+- 2026-11-03 15:21:50 accepted by QA -> done
