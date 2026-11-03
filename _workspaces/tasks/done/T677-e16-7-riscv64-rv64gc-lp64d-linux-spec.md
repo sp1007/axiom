@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511, T653]
 priority: 120
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-87-riscv64-linux.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-81-target-desc-isa-conformance.md, 0152, tasks/0522, tasks/0784]
 covers: [REQ-TGT-166, REQ-TGT-167, REQ-TGT-168, REQ-TGT-169, REQ-TGT-170, REQ-TGT-171, REQ-TGT-172, REQ-TGT-173, REQ-TGT-174, REQ-TGT-175]
+started: 2026-11-04 03:16:29
+finished: 2026-11-04 04:40:54
 ---
 # T677 — E16.7 — Canonical RISC-V 64 (RV64GC) backend, LP64D ABI & riscv64-linux ELF64 specification (SPEC-87)
 
@@ -43,3 +45,5 @@ Consolidate the canonical specification for Axiom's `riscv64-linux` (`RV64GC`) b
 
 ## Log
 - 2026-11-03 08:42:00 created by T216 (P16 phase planning)
+- 2026-11-04 03:16:29 started (attempt 1) T677-impl
+- 2026-11-04 04:40:54 accepted by QA -> done
