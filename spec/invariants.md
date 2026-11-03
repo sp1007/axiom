@@ -50,7 +50,8 @@ pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM
 memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`), `INT` scalar integer
 model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`), `FLT` IEEE-754
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
-`std.math` (`SPEC-41`). A new group is added by editing this list.
+`std.math` (`SPEC-41`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
+address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -594,11 +595,48 @@ floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering,
 - since: T462
 - check: float formatting/parsing tests in tests/std/float_fmt (T460), `std.math` accuracy/special-value tests in tests/std/math (T461), and E12.2 conformance tests in tests/conformance/p12/e12_2_floating_point (T462) verify round-trip identity, special string formatting, ULP bounds, and IEEE-754 special-value identities
 
+## 14. Unsafe boundary, pointer provenance, FFI/ABI, and address introspection (SPEC-50)
+
+### INV-UNS-001 — Narrow unsafe boundary and immediate resumption of safe capability verification
+- statement: `unsafe { ... }` blocks, `unsafe fn` bodies, and `unsafe trait` / `unsafe impl` declarations authorize only the seven primitive unsafe operation categories (`SPEC-50` AXS-UNS-002..004) without disabling typechecking, definite initialization, move/drop tracking, or safe capability conflict checking (`AX_UNSAFE_REQUIRED`, `AX_UNSAFE_TRAIT_IMPL`, `AX_UNSAFE_UNNECESSARY_IMPL`), and any `view<T>` / `mut_view<T>` or slice view synthesized from a raw pointer via `MakeView` / `MakeMutView` (`view.from_raw`, `mut_view.from_raw`, `slice.from_raw_parts`, `slice.from_raw_parts_mut`) immediately re-enters full compile-time capability and lifetime verification (`AX_CAP_CONFLICT_MUT`, `AX_CAP_OUTLIVES_OWNER`, `AX_CAP_CONTAINER_RELOC`) (SPEC-50 AXS-UNS-001..007).
+- source: 0071 §1-13, §24; tasks/0282; tasks/0339; tasks/0395; SPEC-11; SPEC-50 AXS-UNS-001..007
+- verify: tests/ui/unsafe, tests/run/unsafe
+- since: T501
+- check: UI and execution tests in tests/ui/unsafe and tests/run/unsafe verify `AX_UNSAFE_REQUIRED`, `AX_UNSAFE_TRAIT_IMPL`, `AX_UNSAFE_UNNECESSARY_IMPL`, `MakeView`/`MakeMutView` lowering, and preservation of move/init/capability checks inside and after `unsafe` blocks
+
+### INV-UNS-002 — Strict pointer provenance and deterministic `--interp` UB detection (`UB-01..UB-12`)
+- statement: Raw pointers (`*const T`, `*mut T`) carry strict allocation provenance `(AllocId, Bounds, Perm, AddrSpace)` preserved across pointer arithmetic (`offset`, `add`, `sub`, `wrapping_offset`, `byte_add`, `byte_sub`) and `with_addr` (`SPEC-50` AXS-UNS-010..014); integer-to-pointer casts (`addr as *const T` / `ptr.from_exposed_addr`) never guess or synthesize arbitrary stack/heap provenance, and the MIR interpreter (`--interp`) deterministically traps every violation in the closed `UB-01..UB-12` taxonomy (null/dangling/out-of-bounds/misaligned/uninitialized/invalid-scalar/read-only-store/provenance-forgery/capability-conflict/overlapping-copy/invalid-fn-ptr/ffi-abi mismatch) with `AX_UNSAFE_INTERP_UB` and exit code `125` (SPEC-50 AXS-UNS-010..016).
+- source: 0044 §10-16; 0071 §8-21, §25; tasks/0282; tasks/0339; SPEC-03 AXS-SEM-092; SPEC-50 AXS-UNS-010..016
+- verify: tests/run/unsafe/ub_interp, tests/unit/mir/provenance
+- since: T502
+- check: oracle UB tests in tests/run/unsafe/ub_interp and provenance unit tests in tests/unit/mir/provenance verify deterministic `AX_UNSAFE_INTERP_UB` (exit 125) across `UB-01..UB-12` and strict provenance preservation across pointer arithmetic and `with_addr`
+
+### INV-UNS-003 — Explicit `@repr(C)` / `@repr(transparent)` / `@abi(stable)` layout, Win64 `1..24`-byte struct ABI, and external C DLL FFI parity
+- statement: Internal Axiom types have no implicit C layout guarantee unless annotated with `@repr(C)`, `@repr(transparent)` (`AX_FFI_INVALID_TRANSPARENT`), or `@abi(stable)` (`SPEC-50` AXS-UNS-030..031); `extern "C"` / `"system"` declarations validate FFI-safe types (`AX_FFI_BAD_TYPE`, `AX_FFI_UNKNOWN_ABI`, `AX_FFI_OPAQUE_BY_VALUE`, `AX_FFI_GENERIC_EXPORT`, `AX_FFI_CAPTURING_CLOSURE_CALLBACK`, `AX_FFI_VARIADIC_NOT_EXTERN_C`), classify Win64 struct values of sizes `1, 2, 4, 8` into `RCX`/`RDX`/`R8`/`R9`/`RAX` and sizes `3, 5..7, 9..24` (including `3, 12, 16, 24`) by hidden pointer in caller-allocated 16-byte-aligned stack memory (`AXS-UNS-035`), and pass the external `gcc -shared` C DLL interop oracle (`ADR-0034 §8 / OI-12`) (SPEC-50 AXS-UNS-030..036).
+- source: 0104; 0138; 0181; tasks/0367; tasks/0413; ADR-0002 §4; ADR-0034 §8; SPEC-50 AXS-UNS-030..036
+- verify: tests/abi/win64_struct, tests/ffi/c_dll, tests/ui/ffi
+- since: T503
+- check: Win64 struct ABI tests in tests/abi/win64_struct (sizes 1, 2, 3, 4, 8, 12, 16, 24), external C DLL tests in tests/ffi/c_dll (compiled with `gcc -shared`), and UI tests in tests/ui/ffi verify C layout, calling convention, callbacks, and FFI diagnostics
+
+### INV-UNS-004 — `REQ-OWNER-008` address introspection (`fn_addr`, `static_addr`, `address_of`, `f as usize`) and `@addr` / `@at` placement round-trip
+- statement: `fn_addr(f) -> usize`, `static_addr(s) -> usize`, `address_of(v) -> *const T`, `address_of_mut(v) -> *mut T`, `addr_of(v) -> usize`, and `f as usize` query symbol and place addresses without moving or copying the operand (`AX_TYPE_NOT_A_PLACE` on temporaries), while `@addr(<expr>)` and `@at(<expr>)` place `static`, local `let`, and `fn` items at constant or runtime-computed addresses (validating alignment via `AX_UNSAFE_MISALIGNED_AT`, fixed layout via `AX_UNSAFE_INVALID_AT_LAYOUT`, and hosted-profile gating via `AX_UNSAFE_AT_HOSTED`) and satisfy the round-trip identities (`fn_addr(isr) == 0x2000_0000usize`, `let base = fn_addr(foo); @addr(base + 0x100) static mut REG: u32;`, `address_of(local_reg) as usize == addr`) across `--interp` and native x86-64 (SPEC-50 AXS-UNS-020..025).
+- source: OWNER.md REQ-OWNER-008; ADR-0001; 0044 §3-9; 0071 §15; tasks/0339; SPEC-50 AXS-UNS-020..025
+- verify: tests/run/unsafe/addr_introspect, tests/ui/unsafe/addr
+- since: T504
+- check: execution and UI tests in tests/run/unsafe/addr_introspect and tests/ui/unsafe/addr verify `fn_addr`, `static_addr`, `address_of(v) as usize`, `f as usize`, `@addr`/`@at` on `static`/`let`/`fn`, dynamic `base + 0x100` offset placement, and alignment/place diagnostics
+
+### INV-UNS-005 — End-to-end E13.1 unsafe, UB, provenance, FFI/ABI, and address-introspection conformance
+- statement: The E13.1 conformance suite verifies the complete `SPEC-50` contract across the unsafe boundary, raw pointer strict provenance, `--interp` UB detection (`UB-01..UB-12`), `@repr(C)` / `@repr(transparent)` / `@abi(stable)` FFI interop with an external C DLL (`ADR-0034 §8`), and `REQ-OWNER-008` address introspection and fixed-address placement (`fn_addr`, `static_addr`, `address_of`, `@addr`/`@at`) in both `--interp` and native x86-64 execution (SPEC-50 AXS-UNS-001..053).
+- source: SPEC-50 AXS-UNS-001..053; OWNER.md REQ-OWNER-008; ADR-0001; ADR-0034 §8
+- verify: tests/conformance/p13/e13_1_unsafe_ffi
+- since: T505
+- check: end-to-end conformance suite in tests/conformance/p13/e13_1_unsafe_ffi (delivered by T505) exercises `UNS-T01..T15`, `--interp` UB exit 125 verdicts, external C DLL calls and callbacks, and `REQ-OWNER-008` round-trip address identities
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
-(ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+(ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

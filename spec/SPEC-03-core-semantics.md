@@ -284,9 +284,10 @@ every other pair is `AX_TYPE_INVALID_CAST` (with a hint naming the closest valid
 | `u32` | `char` | **checked**: panics `invalid char value` unless `n <= 0x10FFFF && !(0xD800 <= n && n <= 0xDFFF)` | T034 |
 | `char` | `u32`, `i32`, `u64`, `i64`, `usize`, `isize` | the scalar value (lossless) | T034 |
 | fieldless `enum` | `IntTy` | the discriminant (AXS-SEM-062) | T038 |
-| `*const T` / `*mut T` | `*const U` / `*mut U` | same address, new pointee type | T061a |
-| `*const T` / `*mut T` | `usize`, `isize` | the address (oracle: ADR-0002 §5) | T061a |
-| `usize`, `isize` | `*const T` / `*mut T` | the address; dereferencing stays `unsafe` | T061a |
+| `*const T` / `*mut T` | `*const U` / `*mut U` | same address and provenance, new pointee type (`SPEC-50` AXS-UNS-010..011) | T061a / T501 |
+| `*const T` / `*mut T` | `usize`, `isize` | expose the address (`ptr.expose_addr`; oracle: ADR-0002 §5, `SPEC-50` AXS-UNS-011, AXS-UNS-021) | T061a / T502 |
+| `usize`, `isize` | `*const T` / `*mut T` | construct pointer at address (`ptr.from_exposed_addr`; dereferencing stays `unsafe`, `SPEC-50` AXS-UNS-011) | T061a / T502 |
+| `fn(...) -> R` / `unsafe fn(...) -> R` / `extern "<abi>" fn(...) -> R` | `usize`, `*const u8` | function entry address (`fn_addr(f)`, `REQ-OWNER-008`, `SPEC-50` AXS-UNS-020..021) | T061a / T504 |
 | `T` | `T` (same type) | identity | T034 |
 | `f32`, `f64` on either side | `IntTy`, `f32`, `f64` | `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` in axiom0; in `axiomc` (`E12.2`, `spec/SPEC-41-floating-point.md` `AXS-FLT-022..024`), `FloatToInt` is saturating (`NaN -> 0`, clamped to `[T.MIN, T.MAX]`), `IntToFloat` uses IEEE-754 `roundTiesToEven`, and `FloatConvert` converts between `f32` and `f64` | T034 / T458 |
 
@@ -385,8 +386,8 @@ test as TIMEOUT. [T021; 0264 §18]
 exhaustion terminates the process with the OS status. Stack exhaustion is outside the differential
 contract: no test may depend on it (stack reserve: ADR-0003).
 
-**AXS-SEM-092 — Oracle-detected undefined behaviour.** In `unsafe` code (T061a) the interpreter
-detects invalid pointer use, out-of-allocation accesses and use of freed memory and reports
+**AXS-SEM-092 — Oracle-detected undefined behaviour.** In `unsafe` code (`T061a`, `E13.1` `spec/SPEC-50-unsafe-ub-ffi.md` `AXS-UNS-015..016`, `T502`) the interpreter
+detects invalid pointer use, out-of-allocation accesses, use of freed memory, misaligned accesses, uninitialized reads, invalid scalar bit patterns, provenance forgery, capability aliasing violations, overlapping `copy_nonoverlapping`, invalid function-pointer calls, and covers the closed `UB-01..UB-12` catalog by reporting
 `AX_UNSAFE_INTERP_UB` with exit code **125**. Native behaviour of such a program is undefined; tests of it
 run in interp mode only.
 

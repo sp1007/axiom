@@ -494,14 +494,14 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_PAT_UNREACHABLE` | W | T038 | an arm can never match |
 | `AX_PAT_REFUTABLE` | E | T038b | refutable pattern where an irrefutable one is required |
 | `AX_MOVE_USE_AFTER_MOVE` | E | T046 | use of a value after it was moved (label at the move) |
-| `AX_UNSAFE_REQUIRED` | E | T061a | raw-pointer dereference, pointer arithmetic or unsafe call outside `unsafe` |
-| `AX_UNSAFE_INTERP_UB` | E | T061a/T061c | undefined behaviour detected by the oracle (out-of-bounds, dangling or misaligned raw access) |
+| `AX_UNSAFE_REQUIRED` | E | T061a/T501 | raw-pointer dereference, pointer arithmetic, `MakeView`/`MakeMutView` capability creation from raw pointers, mutable `static` access, `@addr`/`@at` fixed-address access, or `unsafe fn` / `extern` call outside `unsafe` (`SPEC-50` AXS-UNS-001..005, AXS-UNS-050) |
+| `AX_UNSAFE_INTERP_UB` | E | T061a/T061c/T502 | undefined behaviour detected by the MIR interpreter oracle (`UB-01..UB-12`: null/dangling/out-of-bounds/misaligned/uninit/invalid-value/read-only-write/provenance-forgery/capability-conflict/overlapping-copy/invalid-fn-ptr/ffi-abi violation; exit code 125; `SPEC-50` AXS-UNS-015..016, AXS-UNS-050) |
 | `AX_CONST_OVERFLOW` | E | T061/T451 | arithmetic overflow during constant evaluation (`SPEC-03` AXS-SEM-030, `SPEC-40` AXS-INT-005) |
 | `AX_CONST_DIV_ZERO` | E | T061/T451 | division by zero during constant evaluation (`SPEC-03` AXS-SEM-032, `SPEC-40` AXS-INT-005) |
 | `AX_CONST_SHIFT_RANGE` | E | T061/T451 | shift count out of range during constant evaluation (`SPEC-03` AXS-SEM-034, `SPEC-40` AXS-INT-005) |
 | `AX_DRIVER_NO_STD` | E | T060 | no std root found (ADR-0006 §8) |
-| `AX_FFI_NOT_IN_ORACLE` | E | T065 | the interpreter reached a direct `extern` call (ADR-0002 §4) |
-| `AX_UNSAFE_AT_HOSTED` | E | E13.6 (axiomc) | `@at` placement in the hosted profile (ADR-0001; formerly `AX_ADDR_HOSTED`) |
+| `AX_FFI_NOT_IN_ORACLE` | E | T065/T503 | the interpreter reached a direct `extern` call without a host intrinsic or mock binding (ADR-0002 §4, `SPEC-50` AXS-UNS-036) |
+| `AX_UNSAFE_AT_HOSTED` | E | T504/T525 | `@addr` / `@at` placement on `static` or `fn` in the `hosted` profile without `--freestanding` or `--allow-fixed-addr` (ADR-0001, `SPEC-50` AXS-UNS-023, AXS-UNS-050; formerly `AX_ADDR_HOSTED`) |
 | `AX_CONC_NOT_SEND` | E | T089/T401 | value of type `T: !Send` transferred across an execution context boundary (`SPEC-30` AXS-CONC-050) |
 | `AX_CONC_NOT_SHARE` | E | T089/T401 | shared capability `view<T>` where `T: !Share` shared across execution contexts (`SPEC-30` AXS-CONC-050) |
 | `AX_CONC_SAFE_IMPL_MARKER` | E | T089 | positive `impl Send` or `impl Share` written without `unsafe` (`SPEC-30` AXS-CONC-018) |
@@ -530,9 +530,24 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_ASYNC_GUARD_ACROSS_AWAIT` | E | T417 | synchronous lock guard (`MutexGuard<T>`, `RwLockReadGuard<T>`, `RwLockWriteGuard<T>`) is live across an `.await` suspension point (`SPEC-33` AXS-ASY-035, AXS-ASY-051) |
 | `AX_ASYNC_FUTURE_NOT_SEND` | E | T417 | `Future` required to satisfy `Send` has a parameter or live-across-await local/sub-future whose type is `!Send` (`SPEC-33` AXS-ASY-036, AXS-ASY-051) |
 | `AX_ASYNC_POLL_AFTER_COMPLETE` | E | T088/T418 | oracle or debug check detects `Future.poll` called on a state machine already in `STATE_COMPLETE` or `STATE_POISONED` (`SPEC-33` AXS-ASY-042, AXS-ASY-050, AXS-ASY-051) |
+| `AX_UNSAFE_TRAIT_IMPL` | E | T501 | `impl Trait for T` written without `unsafe` when `Trait` is declared `unsafe trait` (`SPEC-50` AXS-UNS-004, AXS-UNS-050) |
+| `AX_UNSAFE_UNNECESSARY_IMPL` | E | T501 | `unsafe impl Trait for T` written when `Trait` is not declared `unsafe trait` (`SPEC-50` AXS-UNS-004, AXS-UNS-050) |
+| `AX_UNSAFE_MISALIGNED_AT` | E | T504/T525 | `@addr(A)` / `@at(A)` has `A == 0` or `A % align_of::<T>() != 0` (`SPEC-50` AXS-UNS-022..024, AXS-UNS-050) |
+| `AX_UNSAFE_INVALID_AT_LAYOUT` | E | T504/T525 | `@addr(A)` / `@at(A)` applied to a type with dynamically sized or non-fixed layout (`SPEC-50` AXS-UNS-023..024, AXS-UNS-050) |
+| `AX_FFI_UNKNOWN_ABI` | E | T503 | unknown ABI string in `extern "<abi>"` or `@abi(<mode>)` (`SPEC-50` AXS-UNS-031..032, AXS-UNS-050) |
+| `AX_FFI_BAD_TYPE` | E | T503 | non-FFI-safe parameter or return type in an `extern "C"` / `"system"` signature (`SPEC-50` AXS-UNS-032..033, AXS-UNS-050) |
+| `AX_FFI_INVALID_TRANSPARENT` | E | T503 | `@repr(transparent)` applied to a type that does not have exactly one non-zero-sized field (`SPEC-50` AXS-UNS-031, AXS-UNS-050) |
+| `AX_FFI_OPAQUE_BY_VALUE` | E | T503 | opaque foreign type (`extern "C" { type T; }`) instantiated, passed by value, or queried with `size_of` (`SPEC-50` AXS-UNS-033, AXS-UNS-050) |
+| `AX_FFI_GENERIC_EXPORT` | E | T503 | `@no_mangle` or `extern "C"` export declared with unmonomorphized type parameters (`SPEC-50` AXS-UNS-032, AXS-UNS-050) |
+| `AX_FFI_CAPTURING_CLOSURE_CALLBACK` | E | T503 | closure with non-empty capture environment converted to `extern "C" fn(...)` (`SPEC-50` AXS-UNS-033, AXS-UNS-050) |
+| `AX_FFI_VARIADIC_NOT_EXTERN_C` | E | T503 | variadic parameter list `...` used outside an `extern "C"` import declaration (`SPEC-50` AXS-UNS-032, AXS-UNS-050) |
+| `AX_TYPE_NOT_A_PLACE` | E | T504 | `address_of(e)` / `address_of_mut(e)` / `addr_of(e)` applied to a temporary rvalue rather than a place expression (`SPEC-50` AXS-UNS-021, AXS-UNS-050) |
+| `AX_CAP_CONFLICT_MUT` | E | T125/T501 | `mut_view<T>` overlaps another live `view<T>` or `mut_view<T>` (`SPEC-11`, `SPEC-50` AXS-UNS-005..006, AXS-UNS-050) |
+| `AX_CAP_OUTLIVES_OWNER` | E | T125/T501 | `view<T>` or `mut_view<T>` escapes or outlives its backing owner (`SPEC-11`, `SPEC-50` AXS-UNS-005..006, AXS-UNS-050) |
+| `AX_CAP_CONTAINER_RELOC` | E | T125/T501 | mutating or reallocating a container (`Vec<T>`, `String`, `HashMap<K, V>`) while an element `view` / `mut_view` is live (`SPEC-11`, `SPEC-50` AXS-UNS-006, AXS-UNS-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
