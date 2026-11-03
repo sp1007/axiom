@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T213]
 priority: 155
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-04-core-extensibility.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0067, 0072, tasks/0328, tasks/0515]
 covers: [REQ-ABI-063, REQ-CORE-449, REQ-FFI-099, REQ-RES-136, REQ-CAP-130, REQ-CAP-152]
+started: 2026-11-03 09:22:25
 ---
 # T506 — E13.2 — Canonical raw memory, volatile, MMIO, unions, packed/aligned repr & address spaces specification (SPEC-51)
 
@@ -43,3 +44,4 @@ Specify raw memory access semantics, volatile load/store/fence guarantees, MMIO 
 
 ## Log
 - 2026-11-03 02:01:00 created by T213 (P13 phase planning)
+- 2026-11-03 09:22:25 started (attempt 1) 

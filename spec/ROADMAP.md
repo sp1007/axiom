@@ -105,7 +105,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
 | P16 targets & platforms | T066, T650–T696 | T216 | T316 | P13 |
-| P17 debugging & introspection | T068 | T217 | T317 | P16 |
+| P17 debugging & introspection | T068, T700–T726 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | — | T219 | T319 | P18 |
 | P20 build & packages | — | T220 | T320 | P16, P18 |
@@ -254,13 +254,13 @@ Artifact matrix (E16.10–E16.12; ✔ = must be produced *and* consumed with tes
 | riscv64-linux | ELF | `.a` | `.so` | E16.7, tier-2 |
 
 ### P17 — Debugging & runtime introspection
-- **E17.1 Debug IR + CodeView/PDB (Windows)** — Src 0190 0191.
-- **E17.2 DWARF (ELF/Mach-O)** — Src tasks/0596.
-- **E17.3 Unwinding & backtraces on all targets** — Src 0188 tasks/0700. *(T068 = Windows slice)*
-- **E17.4 Debugger contract & symbolication** — Src 0100 0147 tasks/0811.
-- **E17.5 Profiler & performance introspection** — Src tasks/0572 tasks/0730.
-- **E17.6 Sanitizers & runtime verification** — Src tasks/0599 tasks/0733.
-- **E17.7 Trace & replay** — Src tasks/1058 (AXREPLAY) 0147.
+- **E17.1 Debug IR + CodeView/PDB (Windows)** — Src 0190 0191. *(T700–T703)*
+- **E17.2 DWARF (ELF/Mach-O)** — Src tasks/0596. *(T704–T707)*
+- **E17.3 Unwinding & backtraces on all targets** — Src 0188 tasks/0700. *(T708, T068, T709, T710)*
+- **E17.4 Debugger contract & symbolication** — Src 0100 0147 tasks/0811. *(T711–T714)*
+- **E17.5 Profiler & performance introspection** — Src tasks/0572 tasks/0730. *(T715–T718)*
+- **E17.6 Sanitizers & runtime verification** — Src tasks/0599 tasks/0733. *(T719–T722)*
+- **E17.7 Trace & replay** — Src tasks/1058 (AXREPLAY) 0147. *(T723–T726)*
 Exit: step-through debugging in a standard debugger on Windows and Linux; sanitizer suite.
 
 ### P18 — Compiler architecture 2.0
@@ -416,3 +416,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T215 P15 phase expansion (`P15-optimizer-2-0`): expanded E15.1–E15.8 into 30 new tasks `T600`–`T629` alongside refined `T063` and `T064` (32 tasks total across 8 epics: E15.1 5 tasks `T600–T604`; E15.2 4 tasks `T605–T608`; E15.3 4 tasks `T609–T612`; E15.4 4 tasks `T064, T613–T615`; E15.5 4 tasks `T616–T619` depending on P12 gate `T312`; E15.6 4 tasks `T620–T623`; E15.7 3 tasks `T624–T626`; E15.8 4 tasks `T063, T627–T629` scheduled first in P15), converted all 405 `EPIC(E15.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T315` (`depends: [T215, T063, T064, T600–T629]`) | T215 |
 | 2026-11-03 | T218 P18 phase expansion (`P18-compiler-architecture-2-0`): expanded E18.1–E18.7 into 25 new tasks `T752`–`T776` alongside refined `T067`, `T750`, and `T751` (28 tasks total across 7 epics: E18.1 4 tasks `T752–T755`; E18.2 4 tasks `T756–T759`; E18.3 4 tasks `T760–T763`; E18.4 4 tasks `T764–T767`; E18.5 4 tasks `T768–T771`; E18.7 4 tasks `T772, T750, T751, T773` scheduled first in P18 for `REQ-OWNER-006` and `ADR-0034` §4 OI-07b GNU `ld` cross-linking; E18.6 4 tasks `T774, T067, T775, T776`), converted all 5,523 `EPIC(E18.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T318` (`depends: [T218, T067, T750–T776]`) | T218 |
 | 2026-11-03 | T216 P16 phase expansion (`P16-targets-platforms`): expanded E16.9 and E16.1–E16.8, E16.10–E16.12 into 47 new tasks `T650`–`T696` alongside refined `T066` (48 tasks total across 12 epics: E16.9 4 tasks `T650, T066, T651, T652` scheduled first in P16; E16.1 4 tasks `T653–T656`; E16.2 4 tasks `T657–T660`; E16.3 4 tasks `T661–T664`; E16.4 4 tasks `T665–T668`; E16.5 4 tasks `T669–T672`; E16.6 4 tasks `T673–T676`; E16.7 4 tasks `T677–T680`; E16.8 4 tasks `T681–T684`; E16.10 4 tasks `T685–T688`; E16.11 4 tasks `T689–T692`; E16.12 4 tasks `T693–T696`), converted all 327 `EPIC(E16.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T316` (`depends: [T216, T313, T066, T650–T696]`) | T216 |
+| 2026-11-03 | T217 P17 phase expansion (`P17-debugging-runtime-introspectio`): expanded E17.1–E17.7 into 27 new tasks `T700`–`T726` alongside refined `T068` (28 tasks total across 7 epics: E17.1 4 tasks `T700–T703`; E17.2 4 tasks `T704–T707`; E17.3 4 tasks `T708, T068, T709, T710`; E17.4 4 tasks `T711–T714`; E17.5 4 tasks `T715–T718`; E17.6 4 tasks `T719–T722`; E17.7 4 tasks `T723–T726`, all depending on P16 gate `T316`), mapped P17 catalogue rows (`REQ-DBG-116`–`REQ-DBG-121`, `REQ-ERR-001`–`REQ-ERR-003`) to concrete task IDs (`T068`, `T700`–`T726`), and wired `T317` (`depends: [T217, T316, T068, T700–T726]`) | T217 |
