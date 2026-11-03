@@ -107,7 +107,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P16 targets & platforms | T066, T650–T696 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068, T700–T726 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
-| P19 developer tooling | — | T219 | T319 | P18 |
+| P19 developer tooling | T800–T819 | T219 | T319 | P18 |
 | P20 build & packages | — | T220 | T320 | P16, P18 |
 | P21 std completion | — | T221 | T321 | P11, P13 |
 | P22 GPU & heterogeneous | — | T222 | T322 | P11, P12, P16 |
@@ -283,12 +283,12 @@ Exit: no-op rebuild < 100 ms on the compiler itself; edit-one-private-fn rebuild
 that module.
 
 ### P19 — Developer tooling
-- **E19.1 LSP server** — diagnostics, go-to-definition, hover, completion, rename. Src 0101 tasks/0374.
-- **E19.2 Formatter (canonical form)** — Src tasks/0476 (canonical language form).
-- **E19.3 Refactoring engine** — Src 0101.
+- **E19.1 LSP server** — diagnostics, go-to-definition, hover, completion, rename. Src 0101 tasks/0374. *(T800–T803)*
+- **E19.2 Formatter (canonical form)** — Src tasks/0476 (canonical language form). *(T804–T807)*
+- **E19.3 Refactoring engine** — Src 0101. *(T808–T811)*
 - **E19.4 Diagnostics UX 2.0 & AI-agent interface** — machine-readable fixes, explain codes. Src 0146
-  tasks/0360 tasks/0421.
-- **E19.5 Documentation generator & test framework UX** — Src tasks/0418 tasks/0361.
+  tasks/0360 tasks/0421. *(T812–T815)*
+- **E19.5 Documentation generator & test framework UX** — Src tasks/0418 tasks/0361. *(T816–T819)*
 Exit: VS Code extension using the LSP; formatter idempotence over the whole corpus.
 
 ### P20 — Build system & package ecosystem
@@ -417,3 +417,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T218 P18 phase expansion (`P18-compiler-architecture-2-0`): expanded E18.1–E18.7 into 25 new tasks `T752`–`T776` alongside refined `T067`, `T750`, and `T751` (28 tasks total across 7 epics: E18.1 4 tasks `T752–T755`; E18.2 4 tasks `T756–T759`; E18.3 4 tasks `T760–T763`; E18.4 4 tasks `T764–T767`; E18.5 4 tasks `T768–T771`; E18.7 4 tasks `T772, T750, T751, T773` scheduled first in P18 for `REQ-OWNER-006` and `ADR-0034` §4 OI-07b GNU `ld` cross-linking; E18.6 4 tasks `T774, T067, T775, T776`), converted all 5,523 `EPIC(E18.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T318` (`depends: [T218, T067, T750–T776]`) | T218 |
 | 2026-11-03 | T216 P16 phase expansion (`P16-targets-platforms`): expanded E16.9 and E16.1–E16.8, E16.10–E16.12 into 47 new tasks `T650`–`T696` alongside refined `T066` (48 tasks total across 12 epics: E16.9 4 tasks `T650, T066, T651, T652` scheduled first in P16; E16.1 4 tasks `T653–T656`; E16.2 4 tasks `T657–T660`; E16.3 4 tasks `T661–T664`; E16.4 4 tasks `T665–T668`; E16.5 4 tasks `T669–T672`; E16.6 4 tasks `T673–T676`; E16.7 4 tasks `T677–T680`; E16.8 4 tasks `T681–T684`; E16.10 4 tasks `T685–T688`; E16.11 4 tasks `T689–T692`; E16.12 4 tasks `T693–T696`), converted all 327 `EPIC(E16.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T316` (`depends: [T216, T313, T066, T650–T696]`) | T216 |
 | 2026-11-03 | T217 P17 phase expansion (`P17-debugging-runtime-introspectio`): expanded E17.1–E17.7 into 27 new tasks `T700`–`T726` alongside refined `T068` (28 tasks total across 7 epics: E17.1 4 tasks `T700–T703`; E17.2 4 tasks `T704–T707`; E17.3 4 tasks `T708, T068, T709, T710`; E17.4 4 tasks `T711–T714`; E17.5 4 tasks `T715–T718`; E17.6 4 tasks `T719–T722`; E17.7 4 tasks `T723–T726`, all depending on P16 gate `T316`), mapped P17 catalogue rows (`REQ-DBG-116`–`REQ-DBG-121`, `REQ-ERR-001`–`REQ-ERR-003`) to concrete task IDs (`T068`, `T700`–`T726`), and wired `T317` (`depends: [T217, T316, T068, T700–T726]`) | T217 |
+| 2026-11-03 | T219 P19 phase expansion (`P19-developer-tooling`): expanded E19.1–E19.5 into 20 new tasks `T800`–`T819` (20 tasks total across 5 epics: E19.1 4 tasks `T800–T803`; E19.2 4 tasks `T804–T807`; E19.3 4 tasks `T808–T811`; E19.4 4 tasks `T812–T815`; E19.5 4 tasks `T816–T819`, all depending on P18 gate `T318`), converted all 29 `EPIC(E19.1)` rows in `spec/requirements/CATALOG.md` (plus `REQ-TOOL-300`, `REQ-TOOL-297`, `REQ-TOOL-298`, `REQ-TST-112`) to concrete task IDs (`T800`–`T819`), and wired `T319` (`depends: [T219, T318, T800–T819]`) | T219 |
