@@ -50,7 +50,8 @@ pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM
 memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`), `INT` scalar integer
 model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`), `FLT` IEEE-754
 floating-point semantics, mixed-type promotion lattice, SSE2/`Xmm` ABI lowering, formatting, and pure-Axiom
-`std.math` (`SPEC-41`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
+`std.math` (`SPEC-41`), `SIMD` portable SIMD vectors, masks, masked memory/gather/scatter safety, and
+data-oriented `TensorView`/`MatrixView` (`SPEC-42`), `UNS` unsafe boundary, raw pointer strict provenance, UB detector, `REQ-OWNER-008`
 address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`). A new group is added by editing this list.
 
 ## 2. Kernel
@@ -632,11 +633,41 @@ address introspection & fixed-address placement, and FFI/ABI (`SPEC-50`). A new 
 - since: T505
 - check: end-to-end conformance suite in tests/conformance/p13/e13_1_unsafe_ffi (delivered by T505) exercises `UNS-T01..T15`, `--interp` UB exit 125 verdicts, external C DLL calls and callbacks, and `REQ-OWNER-008` round-trip address identities
 
+## 15. Portable SIMD vectors, masks, masked memory safety, and data-oriented tensor/matrix views (SPEC-42)
+
+### INV-SIMD-001 — First-class `Vector<T, N>` and `Mask<N>` type system, alignment layout, diagnostic validation, and MIR SIMD rvalue verification
+- statement: `compiler/types/` and `compiler/mir/` represent portable SIMD vectors (`TypeKind.Vector { elem, lanes }`) and lane masks (`TypeKind.Mask { lanes }`) as `Copy + Send + Share` value types for `elem in {i8, i16, i32, i64, u8, u16, u32, u64, isize, usize, f32, f64}` and `lanes in {2, 4, 8, 16, 32, 64}`, enforce natural power-of-two alignment capped at 32 bytes (`align_of<Vector<T, N>>() == min(N * size_of<T>(), 32)` and `align_of<Mask<N>>() == min(N, 16)`), reject invalid element types, lane counts, constant lane indices, shuffle selectors, and mismatched bitcasts (`AX_SIMD_INVALID_ELEMENT`, `AX_SIMD_INVALID_LANES`, `AX_SIMD_LANE_OUT_OF_RANGE`, `AX_SIMD_SHUFFLE_OUT_OF_RANGE`, `AX_SIMD_BITCAST_SIZE_MISMATCH`), and verify `MIR_RVALUE_VECTOR_OP`, `MIR_RVALUE_SPLAT`, `MIR_RVALUE_EXTRACT`, `MIR_RVALUE_INSERT`, `MIR_RVALUE_SHUFFLE`, and `MIR_RVALUE_REDUCE` in `compiler/verify/verifier.ax` (SPEC-42 AXS-SIMD-001..025, AXS-SIMD-033, AXS-SIMD-060).
+- source: 0095; tasks/0341; tasks/0344; tasks/0347; CATALOG.md REQ-SIMD-001..008, REQ-SIMD-086..090, REQ-SIMD-166..168; SPEC-42 AXS-SIMD-001..025, AXS-SIMD-033, AXS-SIMD-060
+- verify: tests/typeck/simd, tests/mir/simd
+- since: T464
+- check: typechecker and MIR SIMD tests in tests/typeck/simd and tests/mir/simd (delivered by T464) verify `Vector<T, N>` / `Mask<N>` layout, `AX_SIMD_*` diagnostics, and MIR verifier rules for all SIMD rvalue variants
+
+### INV-SIMD-002 — Bit-exact MIR interpreter (`--interp`) and compile-time `const` evaluator for `Vector<T, N>` and `Mask<N>`
+- statement: `compiler/interp/` and `compiler/opt/const_fold.ax` evaluate `Vector<T, N>` and `Mask<N>` across all lane operations, shuffles, reductions, casts/bitcasts, and masked memory intrinsics in both `--interp` and `const` items, enforce inactive-lane fault suppression on `load_masked`, `store_masked`, `gather`, and `scatter` (`mask.test(i) == false` performs zero memory/bounds touches), trap out-of-bounds active lanes deterministically, and execute floating-point `reduce_add_ordered` strictly left-to-right and `reduce_add` / `reduce_mul` in canonical pairwise binary-tree halving order without host-dependent associative reordering (SPEC-42 AXS-SIMD-007, AXS-SIMD-030..033, AXS-SIMD-040..042).
+- source: 0095; tasks/0341; tasks/0344; tasks/0347; tasks/0403; CATALOG.md REQ-SIMD-088..092, REQ-SIMD-171; SPEC-42 AXS-SIMD-007, AXS-SIMD-030..033, AXS-SIMD-040..042
+- verify: tests/mir/simd_interp, tests/opt/simd_const
+- since: T465
+- check: SIMD oracle and const-folding tests in tests/mir/simd_interp and tests/opt/simd_const (delivered by T465) verify bit-exact lane execution, ordered and pairwise binary-tree float reductions, inactive-lane fault suppression on masked/gather/scatter accesses, and compile-time SIMD constant folding
+
+### INV-SIMD-003 — `std.simd` portable `Vector<T, N>`, `Mask<N>`, fixed-width aliases, lane operations, reductions, and capability-checked masked memory API
+- statement: `std/simd/mod.ax` provides portable `Vector<T, N>`, `Mask<N>`, and canonical fixed-width aliases (`i8x16`..`f64x4`, `mask8x16`..`mask64x4`) with `splat`/`from_array`/`to_array` constructors, `extract`/`insert`, compile-time `shuffle`/`swizzle`/`interleave_lo`/`interleave_hi`/`deinterleave`/`reverse`/`rotate_lanes_*`, `Mask<N>` bitmask (`bitmask`/`from_bitmask`) and predicate queries (`all`/`any`/`none`/`count_ones`/`select`), explicit integer overflow families (`wrapping_*`, `saturating_*`, `checked_*`, `overflowing_*`), strict IEEE-754 float lane operations (`fma`, `sqrt`, `abs`, `copysign`, `min`, `max`, `floor`, `ceil`, `round`, `trunc`), deterministic reductions (`reduce_add_ordered`, `reduce_add`), and safe `view<[T]>` / `mut_view<[T]>` memory operations (`from_slice`, `copy_to_slice`, `load_unaligned`, `store_unaligned`, `load_masked`, `store_masked`, `gather`, `scatter`) without exposing target ISA intrinsics (SPEC-42 AXS-SIMD-001..043).
+- source: 0095; tasks/0337; tasks/0341; tasks/0344; tasks/0347; tasks/0427; CATALOG.md REQ-SIMD-001..008, REQ-SIMD-086..092, REQ-SIMD-096..097, REQ-SIMD-166..168, REQ-SIMD-171; SPEC-42 AXS-SIMD-001..043
+- verify: tests/std/simd
+- since: T466
+- check: `std.simd` unit and execution tests in tests/std/simd (delivered by T466) verify all vector/mask constructors, lane shuffles, arithmetic/bitwise/mask operations, reductions, and masked/gather/scatter memory safety
+
+### INV-SIMD-004 — Data-oriented `SoA`, `Vec2..4`/`Mat2..4`, and rank-parameterized `TensorView<T, R>` / `TensorMutView<T, R>` / `MatrixView<T>` capability discipline and E12.3 conformance
+- statement: `std/simd/tensor.ax` and `std/simd/matrix.ax` provide `TensorView<T, const R: usize>`, `TensorMutView<T, const R: usize>`, `MatrixView<T>`, `MatrixMutView<T>`, and value-semantic `Vec2..4<T>` / `Mat2..4<T>` backed by a single flat `view<[T]>` / `mut_view<[T]>` capability and `[R]usize` / `[R]isize` shape/stride metadata without nested views, ensuring zero-copy `subview`/`transpose`/`reshape_contiguous` transformations, read-only `broadcast_to` (forbidding zero or overlapping mutable strides on `TensorMutView`), disjoint `split_axis_mut` borrows, deterministic SIMD `dot`/`axpy`/`gemv`/tiled `matmul`, and full compile-time capability lifetime enforcement (`AX_CAP_CONFLICT_MUT`, `AX_CAP_OUTLIVES_OWNER`, `AX_CAP_CONTAINER_RELOC`) across `--interp` and native x86-64 (SPEC-42 AXS-SIMD-050..063).
+- source: 0095; tasks/0337; tasks/0341; tasks/0344; tasks/0472; CATALOG.md REQ-SIMD-096, REQ-SIMD-097, REQ-SIMD-333; SPEC-42 AXS-SIMD-050..063
+- verify: tests/std/tensor_matrix, tests/conformance/p12/e12_3_simd_vectors, tests/ui/simd/capability_bounds
+- since: T468
+- check: tensor/matrix tests in tests/std/tensor_matrix (T467), UI capability tests in tests/ui/simd/capability_bounds (T468), and E12.3 conformance tests in tests/conformance/p12/e12_3_simd_vectors (T468) verify zero-copy views, tiled `matmul`, `SoA` vectorization, and capability conflict/escape rejection
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0001; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; ADR-0034 §8; ADR-0036; SPEC-01 §11; SPEC-02 §10; SPEC-03; SPEC-12; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T456]
 priority: 153
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-42-simd.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0095, tasks/0337, tasks/0341, tasks/0344, tasks/0347, tasks/0426, tasks/0427, tasks/0472]
 covers: [REQ-SIMD-001, REQ-SIMD-002, REQ-SIMD-003, REQ-SIMD-004, REQ-SIMD-005, REQ-SIMD-006, REQ-SIMD-007, REQ-SIMD-008, REQ-SIMD-086, REQ-SIMD-087, REQ-SIMD-088, REQ-SIMD-089, REQ-SIMD-090, REQ-SIMD-091, REQ-SIMD-092, REQ-SIMD-096, REQ-SIMD-097, REQ-SIMD-166, REQ-SIMD-167, REQ-SIMD-168, REQ-SIMD-171, REQ-SIMD-333]
 started: 2026-11-03 09:00:27
-agent: T463-impl
+finished: 2026-11-03 09:20:58
 ---
 # T463 — E12.3 — Canonical portable SIMD, mask semantics & data-oriented tensor/matrix view specification (SPEC-42)
 
@@ -48,3 +48,4 @@ Consolidate the portable SIMD vector model (`Vector<T, N>`, `Mask<N>`), lane ope
 ## Log
 - 2026-11-03 00:30:00 created by T212 (P12 phase planning)
 - 2026-11-03 09:00:27 started (attempt 1) T463-impl
+- 2026-11-03 09:20:58 accepted by QA -> done

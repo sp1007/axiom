@@ -6,13 +6,14 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T316]
-priority: 6
-status: todo
-attempts: 0
+depends: [T087]
+priority: 20
+status: doing
+attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
 covers: [REQ-DBG-118, REQ-DBG-119, REQ-DBG-120, REQ-DBG-121]
+started: 2026-11-03 09:15:34
 ---
 # T217 — Plan phase P17: Debugging & runtime introspection
 
@@ -43,3 +44,4 @@ the roadmap is invented.
 
 ## Log
 - 2026-10-06 02:23:57 covers += REQ-DBG-118, REQ-DBG-119, REQ-DBG-120, REQ-DBG-121 (metadata only)
+- 2026-11-03 09:15:34 started (attempt 1) 

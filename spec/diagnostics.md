@@ -113,7 +113,9 @@ They map to the areas above as the last column shows. Three groups have no area 
   type/ordering/alignment/capability diagnostics (`T406`), thread/guard/channel/`@thread_local` TLS escape
   diagnostics (`T090`, `T411`–`T413`), and `async`/`await` syntax/type/recursion/FFI checks (`T416`),
   live-across-await capability/guard/`Future: Send` checks (`T417`), and `Future` state-machine polling
-  diagnostics (`T088`, `T418`).
+  diagnostics (`T088`, `T418`). For E12.3 (`T463` / `SPEC-42 §7`), the `SIMD` area (`AX_SIMD_*`) is established
+  for self-hosted `axiomc` (`compiler/diag/code.ax`, `T464`), covering `Vector<T, N>` / `Mask<N>` element/lane-count
+  validation, constant lane extract/insert bounds, shuffle selector validation, and bitcast size checks.
 - `W…` warning codes of tasks/0360 §28 (`WUNUSED_VARIABLE` …): warnings use the same `AX_<AREA>_`
   shape and the area of the rule they report.
 
@@ -545,9 +547,14 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_CAP_CONFLICT_MUT` | E | T125/T501 | `mut_view<T>` overlaps another live `view<T>` or `mut_view<T>` (`SPEC-11`, `SPEC-50` AXS-UNS-005..006, AXS-UNS-050) |
 | `AX_CAP_OUTLIVES_OWNER` | E | T125/T501 | `view<T>` or `mut_view<T>` escapes or outlives its backing owner (`SPEC-11`, `SPEC-50` AXS-UNS-005..006, AXS-UNS-050) |
 | `AX_CAP_CONTAINER_RELOC` | E | T125/T501 | mutating or reallocating a container (`Vec<T>`, `String`, `HashMap<K, V>`) while an element `view` / `mut_view` is live (`SPEC-11`, `SPEC-50` AXS-UNS-006, AXS-UNS-050) |
+| `AX_SIMD_INVALID_ELEMENT` | E | T464 | `Vector<T, N>` instantiated with an element type `T` outside the supported `SimdElement` scalar integer/float set (`SPEC-42` AXS-SIMD-002, AXS-SIMD-060) |
+| `AX_SIMD_INVALID_LANES` | E | T464 | `Vector<T, N>` or `Mask<N>` instantiated with a lane count `N` outside `{2, 4, 8, 16, 32, 64}` (`SPEC-42` AXS-SIMD-002, AXS-SIMD-060) |
+| `AX_SIMD_LANE_OUT_OF_RANGE` | E | T464 | compile-time constant lane index `idx >= N` in `extract` / `insert` (`SPEC-42` AXS-SIMD-011, AXS-SIMD-060) |
+| `AX_SIMD_SHUFFLE_OUT_OF_RANGE` | E | T464 | non-constant shuffle selector array or selector index `>= 2 * N` (`>= N` in single-vector `swizzle`) (`SPEC-42` AXS-SIMD-012, AXS-SIMD-060) |
+| `AX_SIMD_BITCAST_SIZE_MISMATCH` | E | T464 | `bitcast` / `simd_bitcast` between vector types of different total byte sizes or involving `Mask<N>` (`SPEC-42` AXS-SIMD-025, AXS-SIMD-060) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-50; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
