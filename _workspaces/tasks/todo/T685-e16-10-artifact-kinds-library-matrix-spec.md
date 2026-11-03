@@ -9,7 +9,7 @@ gate_model: sonnet
 priority: 128
 status: todo
 attempts: 0
-depends: [T216, T313, T657, T665, T772]
+depends: [T216, T511, T657, T665, T772]
 paths: [spec/SPEC-89-artifact-library-matrix.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-82-linux-elf-dynamic.md, spec/SPEC-84-macos-aarch64-macho.md, 0164, 0197, 0217, tasks/0369, tasks/0453, tasks/0563]

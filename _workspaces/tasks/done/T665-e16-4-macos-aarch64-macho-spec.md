@@ -6,14 +6,16 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T216, T313, T661]
+depends: [T216, T511, T661]
 priority: 108
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-84-macos-aarch64-macho.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-83-aarch64-linux.md, 0193, 0196, 0217, 0220, tasks/0369, tasks/0453, tasks/0563]
 covers: [REQ-TGT-147, REQ-TGT-296, REQ-TGT-297, REQ-TGT-298]
+started: 2026-11-03 23:19:57
+finished: 2026-11-04 00:31:04
 ---
 # T665 — E16.4 — Canonical macOS AArch64 Darwin ABI, Mach-O 64 object/image & ad-hoc codesign specification (SPEC-84)
 
@@ -44,3 +46,5 @@ Consolidate the canonical specification for Axiom's `aarch64-macos` target: Appl
 
 ## Log
 - 2026-11-03 08:39:00 created by T216 (P16 phase planning)
+- 2026-11-03 23:19:57 started (attempt 1) T665-impl
+- 2026-11-04 00:31:04 accepted by QA -> done

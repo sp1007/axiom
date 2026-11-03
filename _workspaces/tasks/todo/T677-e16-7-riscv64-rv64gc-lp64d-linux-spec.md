@@ -6,7 +6,7 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T216, T313, T653]
+depends: [T216, T511, T653]
 priority: 120
 status: todo
 attempts: 0

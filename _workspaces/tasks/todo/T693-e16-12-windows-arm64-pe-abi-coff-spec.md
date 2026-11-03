@@ -9,7 +9,7 @@ gate_model: sonnet
 priority: 136
 status: todo
 attempts: 0
-depends: [T216, T313, T661, T772]
+depends: [T216, T511, T661, T772]
 paths: [spec/SPEC-91-windows-arm64.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-83-aarch64-linux.md, 0181, 0185, 0186, 0187, 0193, tasks/0453, tasks/0521]
