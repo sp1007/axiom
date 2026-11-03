@@ -10,7 +10,7 @@ depends: [T089]
 priority: 122
 status: todo
 attempts: 0
-paths: [compiler/types, tests/ui/concurrency/spawn_capture, tests/run/concurrency/spawn_capture]
+paths: [compiler/types, tests/ui/concurrency/spawn_capture, tests/run/concurrency/spawn_capture, tests/selfhost]
 locks: [compiler/own/cap.ax, compiler/own/move.ax, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-30-concurrency.md, 0091, 0105, 0111, 0116, 0126, 0160, tasks/0298, tasks/0488]
 covers: [REQ-CONC-005, REQ-CONC-006, REQ-CONC-008, REQ-CONC-009, REQ-CONC-029, REQ-CONC-031, REQ-CONC-032, REQ-CONC-033, REQ-CONC-072, REQ-CONC-088, REQ-RES-044, REQ-TYP-069, REQ-TYP-106, REQ-CONC-125, REQ-CONC-132]

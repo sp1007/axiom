@@ -10,7 +10,7 @@ depends: [T058]
 priority: 188
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, compiler/obj, tests/run/dyn_native, tests/mc/dyn]
+paths: [compiler/lir, compiler/target/x64, compiler/obj, tests/run/dyn_native, tests/mc/dyn, tests/selfhost]
 spec: [spec/SPEC-63-dyn-trait-vtables.md, tasks/0476, 0212]
 covers: [REQ-CORE-3041, REQ-CORE-3042, REQ-CORE-3043, REQ-CORE-3044]
 ---

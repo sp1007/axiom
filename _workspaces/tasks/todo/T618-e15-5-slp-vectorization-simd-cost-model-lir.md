@@ -10,7 +10,7 @@ depends: [T312, T617]
 priority: 112
 status: todo
 attempts: 0
-paths: [compiler/opt/slp, compiler/lir/vec_lower, tests/run/opt_slp_vec]
+paths: [compiler/opt/slp, compiler/lir/vec_lower, tests/run/opt_slp_vec, tests/selfhost]
 spec: [spec/SPEC-74-auto-vectorization.md, 0095, 0162, tasks/0403, tasks/0406, tasks/0407]
 covers: [REQ-OPT-213, REQ-OPT-214, REQ-OPT-215, REQ-OPT-216, REQ-OPT-217]
 ---

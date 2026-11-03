@@ -10,7 +10,7 @@ depends: [T421]
 priority: 145
 status: todo
 attempts: 0
-paths: [std/async/group.ax, std/async/cancel.ax, std/async/timeout.ax, std/async/governor.ax, tests/std/async/structured]
+paths: [std/async/group.ax, std/async/cancel.ax, std/async/timeout.ax, std/async/governor.ax, tests/std/async/structured, tests/selfhost]
 locks: [std/async/mod.ax]
 spec: [spec/SPEC-34-executors-fibers.md, 0126, 0127, 0135, 0202, 0205, tasks/0277, tasks/0620, tasks/0834, tasks/0836]
 covers: [REQ-CONC-040, REQ-ASY-019, REQ-ASY-109, REQ-CONC-100, REQ-CONC-150, REQ-CONC-155, REQ-CONC-188, REQ-CONC-199]

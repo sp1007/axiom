@@ -10,7 +10,7 @@ depends: [T517]
 priority: 167
 status: todo
 attempts: 0
-paths: [compiler/mir, compiler/lir, compiler/target/x64, tests/ui/constant_time, tests/lir/constant_time]
+paths: [compiler/mir, compiler/lir, compiler/target/x64, tests/ui/constant_time, tests/lir/constant_time, tests/selfhost]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0467, tasks/0703]
 covers: [REQ-ABI-046, REQ-FFI-124, REQ-CAP-141]
 ---

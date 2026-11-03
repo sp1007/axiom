@@ -10,7 +10,7 @@ depends: [T601]
 priority: 95
 status: todo
 attempts: 0
-paths: [compiler/opt/passmgr, compiler/opt/effects, tests/run/opt_passmgr]
+paths: [compiler/opt/passmgr, compiler/opt/effects, tests/run/opt_passmgr, tests/selfhost]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, tasks/0399, tasks/0438, tasks/0443, tasks/0447, tasks/0474, tasks/0480, tasks/0487, tasks/0545, tasks/0546, tasks/0579, tasks/0795, tasks/0797]
 covers: [REQ-CORE-447, REQ-VER-027, REQ-OPT-060, REQ-OPT-061, REQ-OPT-062, REQ-OPT-063, REQ-OPT-064, REQ-OPT-065, REQ-OPT-348, REQ-OPT-349, REQ-OPT-350, REQ-OPT-355, REQ-OPT-356, REQ-OPT-373, REQ-OPT-374, REQ-OPT-393, REQ-OPT-394, REQ-OPT-395, REQ-OPT-396, REQ-OPT-404, REQ-OPT-405, REQ-OPT-406]
 ---

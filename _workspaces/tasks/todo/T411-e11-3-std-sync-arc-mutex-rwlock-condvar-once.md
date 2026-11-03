@@ -10,7 +10,7 @@ depends: [T090]
 priority: 133
 status: todo
 attempts: 0
-paths: [std/sync/arc.ax, std/sync/rc.ax, std/sync/mutex.ax, std/sync/rwlock.ax, std/sync/condvar.ax, std/sync/once.ax, std/sync/barrier.ax, std/sync/mod.ax, tests/std/sync]
+paths: [std/sync/arc.ax, std/sync/rc.ax, std/sync/mutex.ax, std/sync/rwlock.ax, std/sync/condvar.ax, std/sync/once.ax, std/sync/barrier.ax, std/sync/mod.ax, tests/std/sync, tests/selfhost]
 locks: [std/sys/windows/thread.ax, std/core/host.ax, compiler/interp/oracle.ax, tests/selfhost]
 spec: [spec/SPEC-32-threads-sync.md, 0136, 0207, 0209, tasks/0329, tasks/0621, tasks/0837]
 covers: [REQ-CONC-010, REQ-CONC-015, REQ-CONC-044, REQ-CONC-045, REQ-CONC-046, REQ-CONC-047, REQ-CONC-070, REQ-CONC-071, REQ-CONC-105, REQ-CONC-106, REQ-CONC-180]

@@ -10,7 +10,7 @@ depends: [T470]
 priority: 161
 status: todo
 attempts: 0
-paths: [compiler/target/x64/encode.ax, tests/encode/simd_vex]
+paths: [compiler/target/x64/encode.ax, tests/encode/simd_vex, tests/selfhost]
 locks: [compiler/target/x64/mod.ax, tests/selfhost]
 spec: [spec/SPEC-43-simd-backend.md, spec/SPEC-04-core-extensibility.md, 0179, tasks/0403]
 covers: [REQ-SIMD-064, REQ-SIMD-065, REQ-SIMD-066, REQ-SIMD-067, REQ-SIMD-213, REQ-SIMD-214, REQ-SIMD-215, REQ-SIMD-216]

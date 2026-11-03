@@ -10,7 +10,7 @@ depends: [T606, T609]
 priority: 103
 status: todo
 attempts: 0
-paths: [compiler/opt/loops, compiler/opt/bce, tests/run/opt_bce]
+paths: [compiler/opt/loops, compiler/opt/bce, tests/run/opt_bce, tests/selfhost]
 spec: [spec/SPEC-72-loops-scev-bce.md, 0113, 0165, tasks/0366, tasks/0402, tasks/0416, tasks/0549]
 covers: [REQ-OPT-143, REQ-OPT-144, REQ-OPT-145, REQ-OPT-146, REQ-OPT-147, REQ-OPT-155, REQ-OPT-156, REQ-OPT-157, REQ-OPT-158, REQ-OPT-159, REQ-OPT-160, REQ-OPT-161, REQ-OPT-162, REQ-OPT-189, REQ-OPT-190, REQ-OPT-342]
 ---

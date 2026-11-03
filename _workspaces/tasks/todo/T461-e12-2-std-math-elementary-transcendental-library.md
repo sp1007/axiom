@@ -10,7 +10,7 @@ depends: [T460]
 priority: 151
 status: todo
 attempts: 0
-paths: [std/math, tests/std/math]
+paths: [std/math, tests/std/math, tests/selfhost]
 locks: [std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-41-floating-point.md, tasks/0334, tasks/0338, tasks/0345, tasks/0469]
 covers: [REQ-SIMD-142, REQ-SIMD-143, REQ-SIMD-304, REQ-SIMD-305]

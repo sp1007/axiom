@@ -10,7 +10,7 @@ depends: [T470, T471, T466, T467]
 priority: 162
 status: todo
 attempts: 0
-paths: [compiler/target/x64/isel.ax, compiler/target/x64/frame.ax, tests/run/simd/sse2_native]
+paths: [compiler/target/x64/isel.ax, compiler/target/x64/frame.ax, tests/run/simd/sse2_native, tests/selfhost]
 locks: [compiler/target/x64/mod.ax, tests/std/simd, tests/std/tensor_matrix, tests/selfhost]
 spec: [spec/SPEC-43-simd-backend.md, 0095, 0179, tasks/0403, tasks/0407]
 covers: [REQ-SIMD-058, REQ-SIMD-059, REQ-SIMD-060, REQ-SIMD-061, REQ-SIMD-062, REQ-SIMD-063, REQ-SIMD-068, REQ-SIMD-069, REQ-SIMD-070, REQ-SIMD-071, REQ-SIMD-072, REQ-SIMD-073, REQ-SIMD-074, REQ-SIMD-075, REQ-SIMD-076, REQ-SIMD-077, REQ-SIMD-080, REQ-SIMD-081, REQ-SIMD-082, REQ-SIMD-083, REQ-SIMD-084]

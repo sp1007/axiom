@@ -10,7 +10,7 @@ depends: [T469, T464, T459]
 priority: 160
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/abi, tests/lir/simd, tests/abi/win64_simd]
+paths: [compiler/lir, compiler/abi, tests/lir/simd, tests/abi/win64_simd, tests/selfhost]
 locks: [compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-43-simd-backend.md, spec/SPEC-04-core-extensibility.md, 0162, 0181, tasks/0403, tasks/0407]
 covers: [REQ-SIMD-014, REQ-SIMD-015, REQ-SIMD-040, REQ-SIMD-157, REQ-SIMD-169, REQ-SIMD-170, REQ-SIMD-208, REQ-SIMD-209, REQ-SIMD-210, REQ-SIMD-244, REQ-SIMD-319]

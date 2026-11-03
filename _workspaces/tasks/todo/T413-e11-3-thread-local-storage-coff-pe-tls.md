@@ -10,7 +10,7 @@ depends: [T090]
 priority: 135
 status: todo
 attempts: 0
-paths: [std/thread/local.ax, tests/run/concurrency/tls, tests/ui/concurrency/tls]
+paths: [std/thread/local.ax, tests/run/concurrency/tls, tests/ui/concurrency/tls, tests/selfhost]
 locks: [compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/mir/builder.ax, compiler/interp/interp.ax, compiler/lir/builder.ax, compiler/target/x64/isel.ax, compiler/obj/coff.ax, compiler/link/pe.ax, std/thread/mod.ax, tests/selfhost]
 spec: [spec/SPEC-32-threads-sync.md, spec/SPEC-04-core-extensibility.md, 0136, 0203, tasks/0329, tasks/0623]
 covers: [REQ-CONC-030, REQ-CONC-110]

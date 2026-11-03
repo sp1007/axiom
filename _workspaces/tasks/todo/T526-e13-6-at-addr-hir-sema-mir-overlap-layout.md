@@ -10,7 +10,7 @@ depends: [T501, T508, T512, T525]
 priority: 175
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/sema, compiler/mir, tests/ui/fixed_addr]
+paths: [compiler/hir, compiler/sema, compiler/mir, tests/ui/fixed_addr, tests/selfhost]
 spec: [spec/SPEC-55-fixed-address-declarations.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0071, 0044, 0097, tasks/0328]
 covers: [REQ-OWNER-008, REQ-OWNER-003, REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145, REQ-CAP-140, REQ-CAP-143]
 ---

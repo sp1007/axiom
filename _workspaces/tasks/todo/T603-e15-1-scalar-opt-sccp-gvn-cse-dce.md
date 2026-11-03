@@ -10,7 +10,7 @@ depends: [T602]
 priority: 96
 status: todo
 attempts: 0
-paths: [compiler/opt/scalar, tests/run/opt_scalar]
+paths: [compiler/opt/scalar, tests/run/opt_scalar, tests/selfhost]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, 0161, 0162, 0165, tasks/0366, tasks/0456, tasks/0465, tasks/0467, tasks/0547]
 covers: [REQ-OPT-011, REQ-OPT-014, REQ-OPT-304, REQ-OPT-305, REQ-OPT-306, REQ-OPT-339, REQ-OPT-351, REQ-OPT-352, REQ-OPT-353, REQ-OPT-363, REQ-OPT-364]
 ---

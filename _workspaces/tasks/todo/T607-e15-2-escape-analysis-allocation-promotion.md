@@ -10,7 +10,7 @@ depends: [T606]
 priority: 100
 status: todo
 attempts: 0
-paths: [compiler/opt/escape, tests/run/opt_escape]
+paths: [compiler/opt/escape, tests/run/opt_escape, tests/selfhost]
 spec: [spec/SPEC-71-alias-escape-promotion.md, 0131, 0162, 0165, tasks/0366, tasks/0397, tasks/0480]
 covers: [REQ-OPT-042, REQ-OPT-043, REQ-OPT-044, REQ-OPT-045, REQ-OPT-046, REQ-OPT-335, REQ-OPT-336, REQ-OPT-345, REQ-OPT-346, REQ-OPT-357]
 ---

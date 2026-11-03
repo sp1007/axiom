@@ -10,7 +10,7 @@ depends: [T507]
 priority: 157
 status: todo
 attempts: 0
-paths: [compiler/mir, compiler/lir, compiler/target/x64, tests/lir/volatile, tests/run/volatile]
+paths: [compiler/mir, compiler/lir, compiler/target/x64, tests/lir/volatile, tests/run/volatile, tests/selfhost]
 spec: [spec/SPEC-51-raw-memory-volatile-mmio-layout.md, tasks/0328, tasks/0515]
 covers: [REQ-FFI-015, REQ-RES-173]
 ---

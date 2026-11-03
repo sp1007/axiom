@@ -10,7 +10,7 @@ depends: [T452, T453]
 priority: 144
 status: todo
 attempts: 0
-paths: [std/core/num.ax, std/core/convert.ax, std/text/fmt/int.ax, tests/std/num]
+paths: [std/core/num.ax, std/core/convert.ax, std/text/fmt/int.ax, tests/std/num, tests/selfhost]
 locks: [std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-40-integers.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-SIMD-211, REQ-SIMD-241, REQ-SIMD-242]

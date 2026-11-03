@@ -10,7 +10,7 @@ depends: [T211, T417]
 priority: 140
 status: todo
 attempts: 0
-paths: [compiler/mir/async_lower.ax, std/future/block_on.ax, tests/run/async, tests/mir/async]
+paths: [compiler/mir/async_lower.ax, std/future/block_on.ax, tests/run/async, tests/mir/async, tests/selfhost]
 locks: [compiler/mir/mir.ax, compiler/mir/drop.ax, compiler/mir/builder.ax, compiler/verify/verifier.ax, compiler/types/layout.ax, compiler/driver/pipeline.ax, compiler/interp/interp.ax, std/future/mod.ax, tests/selfhost]
 spec: [spec/SPEC-33-async.md, 0093, 0127, 0135, 0201, 0202, 0248, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-ASY-167, REQ-ASY-168]

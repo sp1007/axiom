@@ -10,7 +10,7 @@ depends: [T426]
 priority: 150
 status: todo
 attempts: 0
-paths: [std/io/async_io.ax, std/fs/async_file.ax, std/net, tests/std/async/io]
+paths: [std/io/async_io.ax, std/fs/async_file.ax, std/net, tests/std/async/io, tests/selfhost]
 locks: [std/io/io.ax, std/fs/fs.ax, std/sys/windows/iocp.ax]
 spec: [spec/SPEC-35-async-io.md, 0221, tasks/0335, tasks/0438, tasks/0441, tasks/0461]
 covers: [REQ-ASY-152, REQ-CONC-152, REQ-ASY-157]

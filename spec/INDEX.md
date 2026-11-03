@@ -50,6 +50,7 @@ ADR when semantics change), **frozen** (v1.0 freeze at E23.2 / T091; nothing is 
 | `spec/SPEC-31-atomics.md` | draft | T405 | 0092, 0128, 0161 §30, 0162 §30, 0208, tasks/0328, tasks/0515, SPEC-04, SPEC-30 | T406, T407, T408, T409 |
 | `spec/SPEC-32-threads-sync.md` | draft | T410 | 0136, 0203, 0206, 0207, 0209, tasks/0278, tasks/0329, tasks/0621, tasks/0623, tasks/0837, SPEC-04, SPEC-30, SPEC-31 | T090, T411, T412, T413, T414 |
 | `spec/SPEC-33-async.md` | draft | T415 | 0093, 0127, 0135, 0159, 0161, 0201, 0202, 0248, tasks/0275, tasks/0297, tasks/0619, SPEC-04, SPEC-30, SPEC-31, SPEC-32 | T088, T416, T417, T418, T419, E11.5–E11.6 |
+| `spec/SPEC-40-integers.md` | draft | T450 | 0157, 0175, 0245, tasks/0327 §84.1/§84.3/§84.10-16, tasks/0334, tasks/0341, tasks/0431 §172.1-14, SPEC-01, SPEC-03, SPEC-04, OWNER.md REQ-OWNER-007 | T451, T452, T453, T454, T455, T456, T457 |
 | `spec/SPEC-70-optir-ssa-memoryssa.md` | draft | T600 | 0161 §17/§37, 0162 §40, 0165 §1-16, tasks/0315, tasks/0366, tasks/0398, tasks/0399, tasks/0545, tasks/0546, tasks/0547, tasks/0794-0797, SPEC-03, SPEC-04 §5 | T601, T602, T603, T604 |
 | `spec/SPEC-71-alias-escape-promotion.md` | draft | T605 | 0131 §86, 0162 §29, 0165 §15-20, 0226 §1-26, tasks/0366, tasks/0395, tasks/0397, tasks/0429, tasks/0436, tasks/0438, tasks/0480, tasks/0486, tasks/0548, tasks/0615, SPEC-10..12, SPEC-70 | T606, T607, T608 |
 | `spec/SPEC-72-loops-scev-bce.md` | draft | T609 | 0113 §94/§122, 0165 §2/§21-30, tasks/0366, tasks/0402, tasks/0416, tasks/0426, tasks/0470, tasks/0549, SPEC-03, SPEC-70, SPEC-71 | T610, T611, T612 |
@@ -93,6 +94,7 @@ to this table at the next INDEX update.
 | `AXS-ATM-NNN` | atomic types (`Atomic<T>`), memory orderings (`Ordering`), fences, MIR/LIR atomic lowering, x86-64 TSO atomic codegen, oracle memory model & litmus conformance rules | SPEC-31 |
 | `AXS-SYNC-NNN` | OS threads (`std.thread`), `@thread_local` TLS & `LocalKey<T>`, reference counting (`Rc`/`Arc`/`Weak`), synchronization primitives (`Mutex`, `RwLock`, `Condvar`, `Once`, `OnceCell`, `Barrier`), and ownership-transferring channels (`std.sync.channel`) | SPEC-32 |
 | `AXS-ASY-NNN` | `async fn`, `async { }`, `.await`, `Future<T>`/`Poll<T>`/`Waker`/`Context`, `std.future.block_on`, live-across-await analysis, MIR state-machine lowering, per-state cancellation `Drop` glue & oracle async trace rules | SPEC-33 |
+| `AXS-INT-NNN` | scalar integer model (`i8..i128`, `u8..u128`, `isize`, `usize`), 128-bit register-pair & Win64 ABI lowering, checked/wrapping/saturating/overflowing arithmetic families, bit & endian conversions, `COERCION`/`CAST`/`TRY_CAST`/`BITCAST` classes, and `REQ-OWNER-007` multi-width integer promotion lattice rules | SPEC-40 |
 | `AXS-OPT-NNN` | OptIR, SSA/MemorySSA, pass-manager legality & scalar optimization rules | SPEC-70 |
 | `AXS-ALIAS-NNN` | capability- & provenance-driven alias analysis and MemorySSA memory optimization rules | SPEC-71 |
 | `AXS-ESC-NNN` | escape analysis, storage selection & allocation promotion rules | SPEC-71 |
@@ -128,7 +130,7 @@ the corpus reuses them (§6).
 | Kernel: IDs, arenas, interner, source DB | invariants §2, axiom-c-stage0 | 0153, 0171, 0172, tasks/0533, tasks/0479 |
 | Diagnostics | `spec/diagnostics.md` | tasks/0360, 0146 |
 | Resolver, HIR, modules | SPEC-02 §4, axiom-syntax (DottedChain), ADR-0006 §8 (std root) | 0156, 0244, tasks/0387, tasks/0357, tasks/0497 |
-| Types, literals, arithmetic, panics | SPEC-03 (draft) | 0157, 0175, 0245, tasks/0388, tasks/0327, 0068 |
+| Types, literals, arithmetic, panics | SPEC-03 (draft); SPEC-40 (T450, 128-bit integers, overflow families, bit/endian APIs, `From`/`TryFrom`, `REQ-OWNER-007` integer promotion sub-lattice) | 0157, 0175, 0245, tasks/0388, tasks/0327, tasks/0334, tasks/0341, tasks/0431, 0068 |
 | Traits, generics | ADR-0004; task texts T053–T056; SPEC-73 (specialization, static vs `dyn` dispatch, devirtualization) | 0158, 0212, tasks/0389, tasks/0401, tasks/0551, tasks/0611 |
 | Ownership, capability, drop | invariants §8; SPEC-10/11/12 (T045) | 0160, 0176, 0177, 0178, tasks/0394, tasks/0395 |
 | Concurrency, `Send`/`Share`, race verifier, memory model, atomics, threads, TLS, sync, channels & async (`async`/`await`, `Future`, state machines) | invariants §11; SPEC-30 (T400); SPEC-31 (T405); SPEC-32 (T410); SPEC-33 (T415) | 0033, 0040, 0079, 0091, 0092, 0093, 0105, 0126, 0127, 0128, 0135, 0136, 0159, 0161 §30, 0162 §30, 0201, 0202, 0203, 0206, 0207, 0208, 0209, 0248, tasks/0275, tasks/0278, tasks/0297, tasks/0298, tasks/0328, tasks/0329, tasks/0488, tasks/0515, tasks/0619, tasks/0621, tasks/0623, tasks/0685, tasks/0837 |

@@ -10,7 +10,7 @@ depends: [T463, T457]
 priority: 154
 status: todo
 attempts: 0
-paths: [compiler/types, compiler/hir, compiler/mir, tests/typeck/simd, tests/mir/simd]
+paths: [compiler/types, compiler/hir, compiler/mir, tests/typeck/simd, tests/mir/simd, tests/selfhost]
 locks: [compiler/verify/verifier.ax, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-42-simd.md, spec/SPEC-04-core-extensibility.md, 0095, tasks/0341, tasks/0344, tasks/0347]
 covers: [REQ-SIMD-054, REQ-SIMD-055, REQ-SIMD-056, REQ-SIMD-057, REQ-SIMD-098, REQ-SIMD-099, REQ-SIMD-107, REQ-SIMD-111, REQ-SIMD-112, REQ-SIMD-113, REQ-SIMD-114, REQ-SIMD-115, REQ-SIMD-116, REQ-SIMD-178, REQ-SIMD-179, REQ-SIMD-183, REQ-SIMD-184, REQ-SIMD-248, REQ-SIMD-249, REQ-SIMD-250, REQ-SIMD-251, REQ-SIMD-252, REQ-SIMD-253, REQ-SIMD-254, REQ-SIMD-329]

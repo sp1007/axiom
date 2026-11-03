@@ -10,7 +10,7 @@ depends: [T472]
 priority: 163
 status: todo
 attempts: 0
-paths: [compiler/target/x64/isel.ax, std/arch/x86_64.ax, tests/lir/simd_avx2, tests/run/simd/avx2_native]
+paths: [compiler/target/x64/isel.ax, std/arch/x86_64.ax, tests/lir/simd_avx2, tests/run/simd/avx2_native, tests/selfhost]
 locks: [std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-43-simd-backend.md, 0095, tasks/0341, tasks/0344, tasks/0403, tasks/0407]
 covers: [REQ-SIMD-009, REQ-SIMD-010, REQ-SIMD-093, REQ-SIMD-117, REQ-SIMD-172, REQ-SIMD-173, REQ-SIMD-255, REQ-SIMD-279]

@@ -10,7 +10,7 @@ depends: [T570]
 priority: 192
 status: todo
 attempts: 0
-paths: [compiler/sema, compiler/mir, tests/run/index_autoderef, tests/ui/index_autoderef]
+paths: [compiler/sema, compiler/mir, tests/run/index_autoderef, tests/ui/index_autoderef, tests/selfhost]
 spec: [spec/SPEC-03-core-semantics.md, spec/SPEC-12-drop.md, spec/decisions/ADR-0036-assignment-drop-raw-store-cap-followups.md]
 covers: [REQ-CORE-3056, REQ-CORE-3057, REQ-CORE-3058]
 ---

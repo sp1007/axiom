@@ -47,7 +47,8 @@ Rules for `gatecheck.py` (refining T022 scope item (a)):
 Groups: `KERN` kernel, `LAYER` architecture layers, `DIAG` diagnostics, `DET` determinism, `PIPE`
 pipeline and verifier boundary, `ORACLE` oracle and differential agreement, `SEM` frozen semantic model,
 `BOOT` bootstrap scope, `LEX` / `GRM` invariants already stated in SPEC-01 / SPEC-02, `CONC` concurrency,
-memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`). A new group is added by editing this list.
+memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC-33`), `INT` scalar integer
+model, 128-bit arithmetic, conversions, and multi-width integer promotion (`SPEC-40`). A new group is added by editing this list.
 
 ## 2. Kernel
 
@@ -531,11 +532,34 @@ memory model, atomics, threads, sync, and async state machines (`SPEC-30`..`SPEC
 - since: T418
 - check: MIR state-machine dump tests (`T088`/`T418`), cancellation drop-order tests (`T418`), and E11.4 conformance tests (`T419`) verify state transitions, reverse-order cancellation drop glue, panic/completed re-poll rejection (`AX_ASYNC_POLL_AFTER_COMPLETE`), and oracle vs native x86-64 agreement
 
+## 12. Scalar integer model, 128-bit arithmetic, and multi-width promotion (SPEC-40)
+
+### INV-INT-001 — 128-bit scalar integers (`i128`, `u128`) are 16-byte values lowered to LIR register pairs `(lo, hi)` with oracle-native agreement
+- statement: `i128` and `u128` are first-class 16-byte, 16-byte-aligned scalar integer types (`TypeKind.Int128`, `ConstValue.Int128`) with exact two's-complement limb representation `(lo: u64, hi: u64)` in MIR and the MIR interpreter, lowered in LIR to a pair of 64-bit GPRs `(lo: Gpr, hi: Gpr)` with a deterministic Win64 16-byte calling convention contract and x86-64 multi-word instruction selection (`ADD`/`ADC`, `SUB`/`SBB`, `MUL`/`IMUL`, `udiv128`/`sdiv128`, `SHLD`/`SHRD`, `BSWAP`, `LZCNT`/`TZCNT`/`POPCNT`) that matches the MIR interpreter bit-for-bit (SPEC-40 AXS-INT-001..012).
+- source: 0157; 0175; 0245; tasks/0327 §84.1, §84.10-16; SPEC-04 AXS-EXT-020, AXS-EXT-024, AXS-EXT-050; SPEC-40 AXS-INT-001..012
+- verify: tests/run/numeric
+- since: T453
+- check: 128-bit integer tests in tests/run/numeric (T451, T453) verify `i128`/`u128` size/align 16, literal bounds (`AX_LEX_INT_OVERFLOW`, `AX_TYPE_LITERAL_OUT_OF_RANGE`), MIR interpreter evaluation, LIR register-pair lowering, Win64 ABI calls, and x86-64 native parity
+
+### INV-INT-002 — Five explicit integer overflow families and distinct conversion classes (`COERCION`, `CAST`, `TRY_CAST`, `BITCAST`)
+- statement: All twelve integer types (`i8..i128`, `u8..u128`, `isize`, `usize`) maintain five explicit overflow families — default checked operators (`+`, `-`, `*`, `/`, `%`, `-`, `<<`, `>>`), `wrapping_*`, `saturating_*` (lowered to `MirBinOp.SatAdd`/`SatSub`/`SatMul`), `checked_*` (`Option<Self>`), and `overflowing_*` (`(Self, bool)`) — without SIMD or optimizer weakening (`ANUM-36`), and partition conversions into lossless `COERCION`, explicit primitive `CAST` (`as`), trait-based `TRY_CAST` (`From`/`Into`/`TryFrom`/`TryInto` with `TryFromIntError`), and bit-preserving `BITCAST` (`to_*_bytes`/`from_*_bytes`) (SPEC-40 AXS-INT-013, AXS-INT-020..044).
+- source: tasks/0327 §84.10-11; tasks/0431 §172.1-14; SPEC-04 AXS-EXT-042; SPEC-40 AXS-INT-013, AXS-INT-020..044
+- verify: tests/run/numeric
+- since: T454
+- check: execution and UI tests in tests/run/numeric (T452, T454) verify default checked traps, `wrapping_*`, `saturating_*`, `checked_*`, `overflowing_*`, bit/endian helpers, and `From`/`TryFrom` vs `as`/bitcast across all 12 integer widths
+
+### INV-INT-003 — Multi-width integer expression promotion lowers to explicit `MIR_RVALUE_CAST` (`IntToInt`) before MIR verification
+- statement: Multi-width integer arithmetic, bitwise, comparison, and array-index expressions promote narrower integer operands deterministically along the integer promotion sub-lattice (`SPEC-40` AXS-INT-050..053, `REQ-OWNER-007` Pattern D) in `typeck` and `compiler/mir/builder.ax` by inserting explicit `MIR_RVALUE_CAST` (`MIR_CAST_INT_TO_INT`) temporaries prior to every binary operation and index projection; `compiler/verify/verifier.ax` enforces homogeneous operand types on all MIR binary rvalues, while standalone variable bindings, assignments, return statements, call arguments, and standalone same-width signed/unsigned operations continue to reject mismatched types with `AX_TYPE_MISMATCH` (SPEC-40 AXS-INT-050..054).
+- source: OWNER.md REQ-OWNER-007; tasks/0431 §172.1-14; SPEC-40 AXS-INT-050..054
+- verify: tests/run/numeric, tests/ui/typeck
+- since: T455
+- check: execution tests in tests/run/numeric (T455, Pattern D) and UI tests in tests/ui/typeck verify deterministic multi-width integer promotion in expressions, explicit `MIR_RVALUE_CAST` emission, homogeneous MIR verifier enforcement, and `AX_TYPE_MISMATCH` preservation on standalone bindings and same-width signed/unsigned mixing
+
 ## Sources
 0153 §37 (ACKERNEL, ASOURCE, AINTERN, AQUERY, APAR, ADIAG-20..24, APASS, ACACHE, ADET); 0171 §40
 (AKERNEL-24..37); 0172 §1-§24; tasks/0260 §45 (ABOOT-41..80); tasks/0262 §42-§49; tasks/0360 §51
 (ADIAG-20..90); 0146 §50-§58; 0151 §1-§25, §56-§57; 0263 §28, §46-§47; ROADMAP R3, R6–R8; ADR-0002;
-ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
+ADR-0003; ADR-0004 §2, §4, §8; ADR-0005 §2, §15; ADR-0011; SPEC-01 §11; SPEC-02 §10; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0.
 Not catalogued here because they belong to later architecture (E18.1 query engine, E18.2 caches):
 0153 AQUERY-21..25, ACACHE-20..24, ACKERNEL-22, 0171 AKERNEL-31..33. They are added when E18 is
 planned (T218).

@@ -10,7 +10,7 @@ depends: [T411]
 priority: 134
 status: todo
 attempts: 0
-paths: [std/sync/channel, tests/std/channel]
+paths: [std/sync/channel, tests/std/channel, tests/selfhost]
 locks: [std/sync/mod.ax]
 spec: [spec/SPEC-32-threads-sync.md, 0136, 0206, tasks/0278, tasks/0329, tasks/0837]
 covers: [REQ-CONC-007, REQ-CONC-011, REQ-CONC-041, REQ-CONC-042, REQ-CONC-043, REQ-CONC-099, REQ-CONC-103, REQ-CONC-104, REQ-CONC-115, REQ-CONC-116, REQ-CONC-143, REQ-CONC-185, REQ-CONC-186]

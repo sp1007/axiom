@@ -10,7 +10,7 @@ depends: [T211, T400]
 priority: 121
 status: todo
 attempts: 0
-paths: [compiler/traits, std/core/marker.ax, tests/ui/concurrency/send_share, tests/run/concurrency/send_share]
+paths: [compiler/traits, std/core/marker.ax, tests/ui/concurrency/send_share, tests/run/concurrency/send_share, tests/selfhost]
 locks: [compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/typeck.ax, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-30-concurrency.md, 0091, 0092, 0079, 0126, tasks/0276, tasks/0298, tasks/0488, 0208]
 covers: [REQ-CONC-218, REQ-CONC-219]

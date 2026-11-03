@@ -10,7 +10,7 @@ depends: [T401]
 priority: 123
 status: todo
 attempts: 0
-paths: [compiler/own, compiler/verify, tests/ui/concurrency/data_race, tests/run/concurrency/disjoint]
+paths: [compiler/own, compiler/verify, tests/ui/concurrency/data_race, tests/run/concurrency/disjoint, tests/selfhost]
 locks: [compiler/mir/mir.ax, compiler/own_mir_verify/session.ax, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-30-concurrency.md, 0079, 0091, 0105, 0126, 0136, tasks/0298, tasks/0488, tasks/0685]
 covers: [REQ-CONC-004, REQ-CONC-012, REQ-CONC-065, REQ-CONC-066, REQ-CONC-084, REQ-CONC-111, REQ-CONC-129, REQ-CONC-154, REQ-CONC-157, REQ-CONC-165, REQ-CONC-167, REQ-CONC-168, REQ-CONC-169, REQ-CONC-170, REQ-CONC-171, REQ-CONC-194, REQ-CONC-195, REQ-CONC-196]

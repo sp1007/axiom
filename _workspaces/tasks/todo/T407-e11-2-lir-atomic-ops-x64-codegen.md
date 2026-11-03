@@ -10,7 +10,7 @@ depends: [T406]
 priority: 128
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, tests/lir/atomics, tests/encode/atomics, tests/run/concurrency/atomics_native]
+paths: [compiler/lir, compiler/target/x64, tests/lir/atomics, tests/encode/atomics, tests/run/concurrency/atomics_native, tests/selfhost]
 locks: [compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-31-atomics.md, 0092, 0162, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-075, REQ-CONC-134, REQ-CONC-135, REQ-CONC-179]

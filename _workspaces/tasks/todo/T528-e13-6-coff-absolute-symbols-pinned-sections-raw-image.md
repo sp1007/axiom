@@ -10,7 +10,7 @@ depends: [T504, T513, T526]
 priority: 177
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/fixed_addr]
+paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/fixed_addr, tests/selfhost]
 spec: [spec/SPEC-55-fixed-address-declarations.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0071, 0097, tasks/0328]
 covers: [REQ-OWNER-008, REQ-OWNER-003]
 ---

@@ -10,7 +10,7 @@ depends: [T512]
 priority: 162
 status: todo
 attempts: 0
-paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/freestanding]
+paths: [compiler/lir, compiler/target/x64, compiler/obj, compiler/link, tests/link/freestanding, tests/selfhost]
 spec: [spec/SPEC-52-freestanding-runtime-composition.md, 0143, 0097, tasks/0370, tasks/0455]
 covers: [REQ-ABI-055, REQ-ABI-056, REQ-ABI-083, REQ-RES-145, REQ-CAP-140, REQ-CAP-143]
 ---

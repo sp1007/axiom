@@ -10,7 +10,7 @@ depends: [T451]
 priority: 142
 status: todo
 attempts: 0
-paths: [compiler/interp, compiler/opt, tests/run/int128_interp, tests/opt/int128]
+paths: [compiler/interp, compiler/opt, tests/run/int128_interp, tests/opt/int128, tests/selfhost]
 locks: [compiler/interp_opt/session.ax, tests/selfhost]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-03-core-semantics.md, tasks/0327, tasks/0334]
 covers: [REQ-SIMD-176, REQ-SIMD-177, REQ-SIMD-264, REQ-SIMD-265]

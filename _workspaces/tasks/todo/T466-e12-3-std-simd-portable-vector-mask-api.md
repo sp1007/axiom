@@ -10,7 +10,7 @@ depends: [T465, T460]
 priority: 156
 status: todo
 attempts: 0
-paths: [std/simd, tests/std/simd]
+paths: [std/simd, tests/std/simd, tests/selfhost]
 locks: [std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-42-simd.md, 0095, tasks/0337, tasks/0341, tasks/0344, tasks/0347, tasks/0427]
 covers: [REQ-SIMD-041, REQ-SIMD-052, REQ-SIMD-053, REQ-SIMD-126, REQ-SIMD-127, REQ-SIMD-128, REQ-SIMD-190, REQ-SIMD-191, REQ-SIMD-192, REQ-SIMD-193, REQ-SIMD-212, REQ-SIMD-225, REQ-SIMD-226, REQ-SIMD-227, REQ-SIMD-228, REQ-SIMD-286, REQ-SIMD-287, REQ-SIMD-288, REQ-SIMD-289, REQ-SIMD-290, REQ-SIMD-328]

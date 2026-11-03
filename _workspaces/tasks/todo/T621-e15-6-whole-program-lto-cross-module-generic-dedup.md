@@ -10,7 +10,7 @@ depends: [T614, T620]
 priority: 115
 status: todo
 attempts: 0
-paths: [compiler/opt/lto, tests/run/opt_lto]
+paths: [compiler/opt/lto, tests/run/opt_lto, tests/selfhost]
 spec: [spec/SPEC-75-lto-wpo-section-gc-pgo.md, tasks/0355, tasks/0409, tasks/0580, tasks/0594]
 covers: [REQ-OPT-271, REQ-OPT-272, REQ-OPT-273, REQ-OPT-274, REQ-OPT-275, REQ-OPT-276, REQ-OPT-277, REQ-OPT-278, REQ-OPT-279, REQ-OPT-280, REQ-OPT-281, REQ-OPT-282, REQ-OPT-375, REQ-OPT-376, REQ-OPT-379, REQ-OPT-380]
 ---

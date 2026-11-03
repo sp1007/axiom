@@ -62,7 +62,7 @@ panic relative to observable effects. [0032 §42-44, §50; tasks/0327 ANUM-34]
 usize`, `bool`, `char`, the unit type `()` and `never`. `Str` (string view, T041) is defined with
 strings; float types `f32`/`f64` are reserved and rejected by axiom0 type checking with
 `AX_TYPE_UNSUPPORTED_IN_BOOTSTRAP` (they arrive in E12.2); `i128`/`u128` are not part of v0.1
-(E12.1). [tasks/0327 ANUM-24; tasks/0494 §5; ROADMAP R7]
+(they arrive in E12.1, specified in `spec/SPEC-40-integers.md` `AXS-INT-001..012`). [tasks/0327 ANUM-24; tasks/0494 §5; ROADMAP R7]
 
 **AXS-SEM-011 — Integer representation.** `iN`/`uN` are N-bit two's-complement / unsigned
 integers, size N/8 bytes, alignment N/8. `isize`/`usize` have the pointer width of the target; every
@@ -113,11 +113,11 @@ applied directly to an integer literal (after removing parentheses) is folded fi
 `let m: i32 = -2147483648` are valid; `-129i8` is out of range. A negated literal of an unsigned type
 is `AX_TYPE_NEG_UNSIGNED`, except `-0`. [SPEC-01 AXS-LEX-050, AXS-LEX-054; tasks/0334 §34]
 
-**AXS-SEM-022 — No implicit conversions.** Values never change type implicitly: no widening, no
+**AXS-SEM-022 — No implicit conversions.** In v0.1 (`axiom0`), values never change type implicitly: no widening, no
 narrowing, no signed/unsigned mixing, no integer↔bool, no integer↔char. Operands of every binary
 arithmetic, bitwise and comparison operator have the same type (shift amounts excepted,
-AXS-SEM-034). `let y: i64 = x` with `x: i32` is `AX_TYPE_MISMATCH`. [tasks/0327 ANUM-35..37; 0032
-§13, §21; 0041 §46]
+AXS-SEM-034). `let y: i64 = x` with `x: i32` is `AX_TYPE_MISMATCH`. In `axiomc` (`E12.1`, `spec/SPEC-40-integers.md` `AXS-INT-050..054`), multi-width integer arithmetic, bitwise, comparison, and array-index expressions promote narrower integer operands deterministically along the `REQ-OWNER-007` integer promotion sub-lattice via explicit `MIR_RVALUE_CAST` (`IntToInt`) lowering, while standalone bindings/assignments/returns/arguments (`let y: i64 = x`) and standalone same-width signed/unsigned operations continue to emit `AX_TYPE_MISMATCH`. [tasks/0327 ANUM-35..37; 0032
+§13, §21; 0041 §46; OWNER.md REQ-OWNER-007]
 
 ## 4. Integer operations
 
@@ -145,8 +145,7 @@ operations without an overflow check:
 | `count_ones(x: T) -> u32` | number of 1 bits of the N-bit pattern |
 
 For signed `T` the bit pattern is the two's-complement pattern. "mod 2^N, read back in T" means the
-unique value of `T` congruent to the mathematical result modulo 2^N. Saturating and `checked_*`
-families are library/E12.1. [ADR-0004 §1; tasks/0327 §15; 0032 §17]
+unique value of `T` congruent to the mathematical result modulo 2^N. Saturating (`saturating_*`, `MirBinOp.SatAdd`/`SatSub`/`SatMul`), `checked_*`, `overflowing_*`, and full bit/endian families across all twelve integer widths (`i8..i128`, `u8..u128`, `isize`, `usize`) are specified in `spec/SPEC-40-integers.md` (`E12.1`, `AXS-INT-020..032`). [ADR-0004 §1; tasks/0327 §15; 0032 §17]
 
 **AXS-SEM-032 — Division and remainder.** `a / b` truncates toward zero; `a % b` has the sign of
 `a` (or is 0), so `a == (a / b) * b + a % b`. `-7 / 3 == -2`, `-7 % 3 == -1`, `7 % -3 == 1`.
@@ -270,8 +269,8 @@ unique value of `T` congruent to the value of `e` modulo 2^N(T): widening sign-e
 source and zero-extends an unsigned one; narrowing keeps the low N(T) bits; same width reinterprets
 the bit pattern (`-1i32 as u32 == 0xFFFF_FFFF`, `300 as u8 == 44`, `0x80u8 as i8 == -128`). `as`
 is a numeric conversion, not a bitcast: there is no `as` between types of different kinds other
-than the rows above. Checked narrowing (`try_from`) is library code (E12.1).
-[tasks/0327 §7; tasks/0334 §17-18 — truncating chosen for `as`, ADR-0012 §5]
+than the rows above. Lossless (`From`/`Into`) and checked narrowing (`TryFrom`/`TryInto` with `TryFromIntError`) conversions, along with the four conversion classes (`COERCION`, `CAST`, `TRY_CAST`, `BITCAST`), are specified in `spec/SPEC-40-integers.md` (`E12.1`, `AXS-INT-040..044`).
+[tasks/0327 §7; tasks/0334 §17-18; tasks/0431 §172.1-14 — truncating chosen for `as`, ADR-0012 §5]
 
 **AXS-SEM-062 — Enum discriminants.** In v0.1 a fieldless enum's variants have discriminants 0, 1,
 2, … in declaration order (explicit discriminants are deferred, SPEC-02 §12). `e as T` is allowed

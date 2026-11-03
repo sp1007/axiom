@@ -10,7 +10,7 @@ depends: [T457, T452]
 priority: 148
 status: todo
 attempts: 0
-paths: [compiler/interp, compiler/opt, tests/mir/float_interp, tests/opt/float_strict]
+paths: [compiler/interp, compiler/opt, tests/mir/float_interp, tests/opt/float_strict, tests/selfhost]
 locks: [compiler/interp_opt/session.ax, tests/selfhost]
 spec: [spec/SPEC-41-floating-point.md, tasks/0331, tasks/0338, tasks/0345]
 covers: [REQ-SIMD-026, REQ-SIMD-271, REQ-SIMD-272]

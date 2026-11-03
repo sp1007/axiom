@@ -10,7 +10,7 @@ depends: [T420, T412, T088, T418]
 priority: 144
 status: todo
 attempts: 0
-paths: [std/async/executor.ax, std/async/task.ax, std/async/waker.ax, std/async/sync.ax, std/async/channel.ax, std/async/mod.ax, tests/std/async/executor]
+paths: [std/async/executor.ax, std/async/task.ax, std/async/waker.ax, std/async/sync.ax, std/async/channel.ax, std/async/mod.ax, tests/std/async/executor, tests/selfhost]
 spec: [spec/SPEC-34-executors-fibers.md, 0202, 0205, tasks/0277, tasks/0278, tasks/0620, tasks/0621, tasks/0835, tasks/0836]
 covers: [REQ-CONC-034, REQ-CONC-035, REQ-CONC-049, REQ-ASY-037, REQ-ASY-041, REQ-ASY-054, REQ-ASY-076, REQ-ASY-086, REQ-ASY-102, REQ-ASY-108, REQ-ASY-129, REQ-ASY-130, REQ-CONC-130, REQ-CONC-147, REQ-CONC-148, REQ-CONC-184, REQ-CONC-190]
 ---

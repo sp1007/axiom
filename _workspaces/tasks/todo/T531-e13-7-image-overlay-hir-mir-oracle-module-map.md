@@ -10,7 +10,7 @@ depends: [T526, T527, T530]
 priority: 180
 status: todo
 attempts: 0
-paths: [compiler/hir, compiler/sema, compiler/mir, compiler/interp, tests/ui/module_rel, tests/run/module_rel_oracle]
+paths: [compiler/hir, compiler/sema, compiler/mir, compiler/interp, tests/ui/module_rel, tests/run/module_rel_oracle, tests/selfhost]
 spec: [spec/SPEC-56-module-relative-bindings.md, spec/decisions/ADR-0001-fixed-address-declarations.md, 0187, 0104, tasks/0336]
 covers: [REQ-OWNER-005, REQ-CAP-132]
 ---

@@ -355,7 +355,7 @@ index. The meaning column is the registry summary.
 | `AX_LEX_INVALID_DIGIT` | digit not valid for the base | `0b102` (E15) |
 | `AX_LEX_BAD_DIGIT_SEPARATOR` | misplaced `_` in a number | `1__000` (E04) |
 | `AX_LEX_INVALID_SUFFIX` | unknown or mismatched literal suffix | `2foo` (E05) |
-| `AX_LEX_INT_OVERFLOW` | integer literal above 2^64 − 1 | `18446744073709551616` (E16) |
+| `AX_LEX_INT_OVERFLOW` | integer literal above 2^64 − 1 in axiom0, or above 2^128 − 1 in axiomc (`SPEC-40` AXS-INT-004, T451) | `18446744073709551616` in axiom0 (E16); `340282366920938463463374607431768211456u128` in axiomc |
 | `AX_LEX_INVALID_OPERATOR` | three or more dots | `a...b` (E13) |
 | `AX_LEX_COLON_COLON` | `::` is not a token; paths use `.` | `a::b` (E01, fix `.`) |
 | `AX_LEX_COLON_EQ` | `:=` is not a token; bind with `=` | `x := 1` (E02, fix `=`) |
@@ -414,9 +414,9 @@ index. The meaning column is the registry summary.
 | `AX_TYPE_ARG_COUNT` | E | wrong number of arguments | `f(1, 2)` where `fn f(a: i32)`; `data.expected`, `data.found` |
 | `AX_TYPE_RETURN` | E | body can reach its end without producing the declared non-unit value | `fn f(c: bool) -> i32 { if c { return 1 } }` |
 | `AX_TYPE_OPERATOR` | E | operator not defined for these operand types | `true + 1`; `data.operator` |
-| `AX_TYPE_LITERAL_OUT_OF_RANGE` | E | integer literal does not fit its type | `let b: u8 = 300` |
+| `AX_TYPE_LITERAL_OUT_OF_RANGE` | E | integer literal does not fit its type (`SPEC-03` AXS-SEM-021, `SPEC-40` AXS-INT-004) | `let b: u8 = 300`; `let h: i128 = 170141183460469231731687303715884105728i128` |
 | `AX_TYPE_NEG_UNSIGNED` | E | unary minus applied to an unsigned type | `let n: u32 = -1` |
-| `AX_TYPE_INVALID_CAST` | E | `as` cast between types SPEC-03 does not allow | `true as u8 as bool` (cast to `bool`) |
+| `AX_TYPE_INVALID_CAST` | E | `as` cast between types SPEC-03 / SPEC-40 does not allow | `true as u8 as bool` (cast to `bool`) |
 | `AX_TYPE_NEVER_RETURNS` | E | a function declared to return `never` can return normally | `fn fail() -> never { }` |
 | `AX_TYPE_MAIN_MISSING` | E | the root file has no `fn main` (build/run) | a file containing only `fn f() {}` |
 | `AX_TYPE_MAIN_SIGNATURE` | E | `main` signature not allowed by SPEC-03 | `fn main(x: i32) -> i32 { x }` |
@@ -495,8 +495,9 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_MOVE_USE_AFTER_MOVE` | E | T046 | use of a value after it was moved (label at the move) |
 | `AX_UNSAFE_REQUIRED` | E | T061a | raw-pointer dereference, pointer arithmetic or unsafe call outside `unsafe` |
 | `AX_UNSAFE_INTERP_UB` | E | T061a/T061c | undefined behaviour detected by the oracle (out-of-bounds, dangling or misaligned raw access) |
-| `AX_CONST_OVERFLOW` | E | T061 | arithmetic overflow during constant evaluation |
-| `AX_CONST_DIV_ZERO` | E | T061 | division by zero during constant evaluation |
+| `AX_CONST_OVERFLOW` | E | T061/T451 | arithmetic overflow during constant evaluation (`SPEC-03` AXS-SEM-030, `SPEC-40` AXS-INT-005) |
+| `AX_CONST_DIV_ZERO` | E | T061/T451 | division by zero during constant evaluation (`SPEC-03` AXS-SEM-032, `SPEC-40` AXS-INT-005) |
+| `AX_CONST_SHIFT_RANGE` | E | T061/T451 | shift count out of range during constant evaluation (`SPEC-03` AXS-SEM-034, `SPEC-40` AXS-INT-005) |
 | `AX_DRIVER_NO_STD` | E | T060 | no std root found (ADR-0006 §8) |
 | `AX_FFI_NOT_IN_ORACLE` | E | T065 | the interpreter reached a direct `extern` call (ADR-0002 §4) |
 | `AX_UNSAFE_AT_HOSTED` | E | E13.6 (axiomc) | `@at` placement in the hosted profile (ADR-0001; formerly `AX_ADDR_HOSTED`) |
@@ -533,4 +534,4 @@ variants. Each is appended to its area file by the task named (AXD-032).
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
