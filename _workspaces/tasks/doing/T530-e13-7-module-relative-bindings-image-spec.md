@@ -8,12 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T525]
 priority: 179
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-56-module-relative-bindings.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/decisions/ADR-0001-fixed-address-declarations.md, spec/SPEC-55-fixed-address-declarations.md, 0187, 0104, tasks/0336]
 covers: [REQ-OWNER-005, REQ-ABI-032, REQ-ABI-033, REQ-ABI-095]
+started: 2026-11-03 11:29:16
 ---
 # T530 — E13.7 — Canonical module-relative bindings (@at(image("mod") + off), image_self()) specification (SPEC-56)
 
@@ -43,3 +44,4 @@ Finalise `ADR-0001 §5–6` (`REQ-OWNER-005`) into canonical `spec/SPEC-56-modul
 
 ## Log
 - 2026-11-03 02:06:00 created by T213 (P13 phase planning)
+- 2026-11-03 11:29:16 started (attempt 1) 

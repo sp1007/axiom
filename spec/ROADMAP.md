@@ -111,7 +111,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P20 build & packages | T850–T877 | T220 | T320 | P16, P18 |
 | P21 std completion | T900–T935 | T221 | T321 | P11, P13 |
 | P22 GPU & heterogeneous | T950–T965 | T222 | T322 | P11, P12, P16 |
-| P23 v1.0 release | T091 | T223 | T323 | P11–P22 |
+| P23 v1.0 release | T091, T1000–T1010 | T223 | T323 | P11–P22 |
 | P24 ecosystem (post-v1) | — | T224 (deferred) | T324 (deferred) | P23 + owner decision |
 
 Core vertical-slice names (ADR-0005; SPEC-00 holds the full BOOT-00..38 map): VS0 = T022 (oracle),
@@ -326,9 +326,9 @@ Exit: std API reference complete; std conformance suite on all tier-1 targets.
 Exit: kernel conformance examples run on a GPU with oracle-checked results.
 
 ### P23 — v1.0 conformance, freeze, release
-- **E23.1 Full conformance suite & compiler qualification** — Src 0017 0145 0150 tasks/0602.
-- **E23.2 Global contradiction audit & spec freeze** — Src 0151 0121. *(T091)*
-- **E23.3 Release engineering** — binaries, installer, docs site, versioning policy.
+- **E23.1 Full conformance suite & compiler qualification** — Src 0017 0145 0150 tasks/0602. *(T1000–T1003)*
+- **E23.2 Global contradiction audit & spec freeze** — Src 0151 0121 tasks/0603. *(T091, T1004–T1006)*
+- **E23.3 Release engineering** — binaries, installer, docs site, versioning policy — Src 0145 others/0149 0150 0151 tasks/0604. *(T1007–T1010)*
 Exit: Axiom v1.0 tagged; `reqcov.py --strict` shows every v1-core and v1-full requirement implemented.
 
 ### P24 — Ecosystem runtimes (post-v1, deferred)
@@ -421,3 +421,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T220 P20 phase expansion (`P20-build-system-package-ecosystem`): expanded E20.1–E20.7 into 28 new tasks `T850`–`T877` (28 tasks total across 7 epics: E20.1 4 tasks `T850–T853`; E20.2 4 tasks `T854–T857`; E20.3 4 tasks `T858–T861`; E20.4 4 tasks `T862–T865`; E20.5 4 tasks `T866–T869`; E20.7 4 tasks `T870–T873`; E20.6 4 tasks `T874–T877`, all depending on P16 gate `T316` and P18 gate `T318`), mapped all P20 catalogue rows (`REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`, `REQ-ECO-8734`, `REQ-ECO-8736`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T850`–`T877`), and wired `T320` (`depends: [T220, T316, T318, T850–T877]`) | T220 |
 | 2026-11-03 | T221 P21 phase expansion (`P21-standard-library-completion`): expanded E21.1–E21.9 into 36 new tasks `T900`–`T935` (36 tasks total across 9 epics: E21.1 4 tasks `T900–T903`; E21.2 4 tasks `T904–T907`; E21.3 4 tasks `T908–T911` including `ADR-0034` §8 OI-13 automated Windows ConPTY `WriteConsoleW` check for `Xin chào thế giới`; E21.4 4 tasks `T912–T915`; E21.5 4 tasks `T916–T919`; E21.6 4 tasks `T920–T923`; E21.7 4 tasks `T924–T927`; E21.8 4 tasks `T928–T931`; E21.9 4 tasks `T932–T935`, all depending on P11 gate `T311` and P13 gate `T313`), converted all 807 `EPIC(E21.1)` rows (plus `REQ-STD-171`–`REQ-STD-175`, `REQ-STD-177`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T900`–`T935`), and wired `T321` (`depends: [T221, T311, T313, T900–T935]`) | T221 |
 | 2026-11-03 | T222 P22 phase expansion (`P22-gpu-heterogeneous-computing`): expanded E22.1–E22.4 into 16 new tasks `T950`–`T965` (16 tasks total across 4 epics: E22.1 4 tasks `T950–T953`; E22.2 4 tasks `T954–T957`; E22.3 4 tasks `T958–T961`; E22.4 4 tasks `T962–T965`, all depending on P11 gate `T311`, P12 gate `T312`, and P16 gate `T316`), converted all 63 `EPIC(E22.3)` rows (plus `REQ-GPU-064`, `REQ-GPU-065`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T950`–`T965`), and wired `T322` (`depends: [T222, T311, T312, T316, T950–T965]`) | T222 |
+| 2026-11-03 | T223 P23 phase expansion (`P23-v1-0-conformance-freeze-releas`): expanded E23.1–E23.3 into 11 new tasks `T1000`–`T1010` alongside refined `T091` (12 tasks total across 3 epics: E23.1 4 tasks `T1000–T1003`; E23.2 4 tasks `T091, T1004–T1006`; E23.3 4 tasks `T1007–T1010`, all depending on P11–P22 gates `T311`–`T322`), converted `EPIC(E23.2)` (`REQ-CNF-001`) plus 15 P23 catalogue rows (`REQ-TOOL-001`, `REQ-CORE-021`, `REQ-TOOL-003`, `REQ-CORE-022`, `REQ-CONC-097`, `REQ-CAP-055`, `REQ-CORE-3133`–`REQ-CORE-3138`, `REQ-PKG-022`, `REQ-TST-112`, `REQ-ECO-8736`) in `spec/requirements/CATALOG.md` to concrete task IDs (`T091`, `T1000`–`T1010`, `T323`), leaving 0 `EPIC(...)` rows in `v1-core` and `v1-full`, and wired `T323` (`depends: [T223, T311–T322, T091, T1000–T1010]`) | T223 |
