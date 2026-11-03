@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511, T653]
 priority: 124
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-88-cross-compilation-platform-layer.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-81-target-desc-isa-conformance.md, 0097, 0220, tasks/0336, tasks/0453, tasks/0587]
 covers: [REQ-TOOL-001, REQ-TGT-080, REQ-TGT-081, REQ-TGT-082, REQ-TGT-083, REQ-TGT-084]
+started: 2026-11-04 04:41:24
+finished: 2026-11-04 05:52:06
 ---
 # T681 — E16.8 — Canonical cross-compilation, @cfg target matrix, sysroot/SDK & 3-level OS platform layer specification (SPEC-88)
 
@@ -48,3 +50,5 @@ Consolidate the canonical specification for Axiom's any-host-to-any-target cross
 
 ## Log
 - 2026-11-03 08:43:00 created by T216 (P16 phase planning)
+- 2026-11-04 04:41:24 started (attempt 1) T681-impl
+- 2026-11-04 05:52:06 accepted by QA -> done
