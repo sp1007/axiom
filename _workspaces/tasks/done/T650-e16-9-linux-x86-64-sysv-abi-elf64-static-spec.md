@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T216, T511]
 priority: 92
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-80-linux-x86-64-elf-static.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, 0053, 0163, 0164, 0192, 0217, 0255, 0256, tasks/0369, tasks/0563]
 covers: [REQ-TGT-002, REQ-TGT-003, REQ-TGT-037, REQ-TGT-038, REQ-TGT-039, REQ-TGT-040]
+started: 2026-11-03 14:06:08
+finished: 2026-11-03 14:48:21
 ---
 # T650 — E16.9 — Canonical Linux x86-64 SysV ABI, ELF64 object & static ELF executable specification (SPEC-80)
 
@@ -45,3 +47,5 @@ Consolidate the canonical specification for Axiom's second native target (`x86_6
 
 ## Log
 - 2026-11-03 08:35:00 created by T216 (P16 phase planning)
+- 2026-11-03 14:06:08 started (attempt 1) 
+- 2026-11-03 14:48:21 accepted by QA -> done
