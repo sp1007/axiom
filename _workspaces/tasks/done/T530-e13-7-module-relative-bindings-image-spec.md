@@ -8,13 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T525]
 priority: 179
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-56-module-relative-bindings.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/decisions/ADR-0001-fixed-address-declarations.md, spec/SPEC-55-fixed-address-declarations.md, 0187, 0104, tasks/0336]
 covers: [REQ-OWNER-005, REQ-ABI-032, REQ-ABI-033, REQ-ABI-095]
 started: 2026-11-03 11:29:16
+finished: 2026-11-03 11:39:04
 ---
 # T530 — E13.7 — Canonical module-relative bindings (@at(image("mod") + off), image_self()) specification (SPEC-56)
 
@@ -30,9 +31,9 @@ Finalise `ADR-0001 §5–6` (`REQ-OWNER-005`) into canonical `spec/SPEC-56-modul
 - Update `spec/INDEX.md`, `spec/diagnostics.md`, and `spec/invariants.md`.
 
 ## Acceptance
-- [ ] `spec/SPEC-56-module-relative-bindings.md` exists with a Vietnamese `## Tóm tắt`, numbered `AXS-MOD-NNN` rules, positive/negative canonical Axiom examples, and source citations.
-- [ ] `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
-- [ ] Report `_workspaces/reports/T530-report.md` with exact `## Files changed`.
+- [x] `spec/SPEC-56-module-relative-bindings.md` exists with a Vietnamese `## Tóm tắt`, numbered `AXS-MOD-NNN` rules, positive/negative canonical Axiom examples, and source citations.
+- [x] `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` and `python .claude/skills/axiom-tasks/scripts/harness_check.py` exit 0.
+- [x] Report `_workspaces/reports/T530-report.md` with exact `## Files changed`.
 
 ## Out of scope
 - Compiler/linker implementation (handled by `T531`–`T532`).
@@ -45,3 +46,4 @@ Finalise `ADR-0001 §5–6` (`REQ-OWNER-005`) into canonical `spec/SPEC-56-modul
 ## Log
 - 2026-11-03 02:06:00 created by T213 (P13 phase planning)
 - 2026-11-03 11:29:16 started (attempt 1) 
+- 2026-11-03 11:39:04 accepted by QA -> done

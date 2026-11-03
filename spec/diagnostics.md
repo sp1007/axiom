@@ -641,9 +641,12 @@ variants. Each is appended to its area file by the task named (AXD-032).
 | `AX_DERIVE_CONFLICT` | E | T558 | duplicate `@derive(Trait)` on the same type, or conflict between `@derive(Trait)` and an explicit `impl Trait for T` (`SPEC-61` AXS-RFL-022, AXS-RFL-050) |
 | `AX_DERIVE_CYCLE` | E | T558 | cyclic derive or compile-time declaration generation dependency (`SPEC-61` AXS-RFL-022, AXS-RFL-050) |
 | `AX_DERIVE_UNSUPPORTED_ITEM` | E | T558 | `@derive(...)` attached to an unsupported declaration kind or illegal combination such as `@derive(Copy)` on a `Drop` type (`SPEC-61` AXS-RFL-021, AXS-RFL-050) |
+| `AX_UNSAFE_AT_FOREIGN_PLACEMENT` | E | T531 | `@at(image("...") + off)` or `@at(image_self() + off)` declaration has an initializer `= init` or a function body `{ ... }` (`ADR-0001 §5`, `SPEC-56` AXS-MOD-003, AXS-MOD-050) |
+| `AX_TYPE_INVALID_IMAGE_ARG` | E | T531 | `image(...)` called with a non-string-literal argument, an empty string `""`, or wrong argument count, or `image_self(...)` called with arguments (`SPEC-56` AXS-MOD-001, AXS-MOD-050) |
+| `AX_UNSAFE_MODULE_NOT_LOADED` | E | T531 | oracle (`--interp`) pre-entry module-relative binding resolution failed because a target module named in `image("...")` is not loaded in `ProcessModuleMap` (`ADR-0001 §5`, `SPEC-56` AXS-MOD-014, AXS-MOD-050) |
 
 ## Sources
 tasks/0360 (BOOTSTRAP-101, frozen: §1-§51, ADIAG-20..90); 0146 Part XXVII §3-§12, §19-§21, §50-§58;
 0153 §37 (ADIAG-20..24, APAR-23); 0171 §40 (AKERNEL-27/28/34); 0172 §10-§12; tasks/0260 ABOOT-60..62;
 tasks/0262 §46; SPEC-01 §9; SPEC-02 §10; ADR-0001; ADR-0002 §4; ADR-0004 §2; ADR-0005 §2-3, §14;
-ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-60; SPEC-61; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
+ADR-0006 §8; ADR-0007; ADR-0011; ADR-0036 §4; SPEC-03; SPEC-30; SPEC-31; SPEC-32; SPEC-33; SPEC-40; SPEC-41; SPEC-42; SPEC-43; SPEC-44; SPEC-50; SPEC-51; SPEC-52; SPEC-53; SPEC-54; SPEC-55; SPEC-56; SPEC-60; SPEC-61; SPEC-70; SPEC-71; SPEC-72; SPEC-73; SPEC-75; SPEC-76; SPEC-77; axiom-c-stage0; axiom-testing.
