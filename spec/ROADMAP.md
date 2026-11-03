@@ -104,7 +104,7 @@ P0 foundation+traceability → P1 kernel → P2 frontend → P3 semantic core (o
 | P13 low-level & security | T500–T533 | T213 | T313 | P10 |
 | P14 language completion: comptime 2.0, reflection, generators, dyn | T058, T550–T572 | T214 | T314 | P10 |
 | P15 optimizer 2.0 + regalloc | T063, T064, T600–T629 | T215 | T315 | P10 (E15.5 needs P12) |
-| P16 targets & platforms | T066 | T216 | T316 | P13 |
+| P16 targets & platforms | T066, T650–T696 | T216 | T316 | P13 |
 | P17 debugging & introspection | T068 | T217 | T317 | P16 |
 | P18 compiler architecture 2.0 + Windows artifact kinds | T067, T750–T776 | T218 | T318 | P10 |
 | P19 developer tooling | — | T219 | T319 | P18 |
@@ -216,27 +216,27 @@ Exit: differential green at -O2; benchmark targets met and tracked in CI.
 
 ### P16 — Targets & platforms
 - **E16.9 Linux x86-64 static** — SysV ABI, ELF64 writer, static linker, WSL test runs. Src 0192
-  0053. *(T066; first P16 task)*
+  0053. *(T650, T066, T651, T652; first P16 tasks)*
 - **E16.1 Target description as data** — TargetDesc/ISA tables, backend conformance. Src 0163
-  tasks/0524 tasks/0784.
-- **E16.2 Linux ELF dynamic** — PIE, GOT/PLT, shared objects, libc interop. Src 0197.
-- **E16.3 AArch64 Linux** — Src 0193 tasks/0521.
-- **E16.4 macOS AArch64 + Mach-O** — Src 0196.
-- **E16.5 Android AArch64 (+JNI layer)** — Src 0198 0200.
-- **E16.6 WASM32** — Src tasks/0784.
-- **E16.7 RISC-V64** — Src 0152 §59 tasks/0784.
+  tasks/0524 tasks/0784. *(T653–T656)*
+- **E16.2 Linux ELF dynamic** — PIE, GOT/PLT, shared objects, libc interop. Src 0197. *(T657–T660)*
+- **E16.3 AArch64 Linux** — Src 0193 tasks/0521. *(T661–T664)*
+- **E16.4 macOS AArch64 + Mach-O** — Src 0196. *(T665–T668)*
+- **E16.5 Android AArch64 (+JNI layer)** — Src 0198 0200. *(T669–T672)*
+- **E16.6 WASM32** — Src tasks/0784. *(T673–T676)*
+- **E16.7 RISC-V64** — Src 0152 §59 tasks/0784. *(T677–T680)*
 - **E16.8 Cross-compilation & target matrix, OS platform layer** — any host builds for any target
-  from one frontend; target SDK/sysroot selection. Src tasks/0453 tasks/0587 0220 tasks/0336.
+  from one frontend; target SDK/sysroot selection. Src tasks/0453 tasks/0587 0220 tasks/0336. *(T681–T684)*
 - **E16.10 Artifact kinds & library matrix** — for every tier-1 target: executables, **static
   libraries** (produce Axiom `.lib`/`.a`; consume C/system archives), **dynamic libraries** (produce
   PE DLL + import `.lib` / ELF `.so` / Mach-O `.dylib`; consume system and third-party dynamic libs,
   lazy/eager binding, versioned symbols where the format supports them), import-library generation
   from `.def`-like declarations. Generalises E18.7 (Windows libraries) and E16.2 (ELF dynamic). Src 0563 0197
-  0164 0217 tasks/0369 tasks/0453.
+  0164 0217 tasks/0369 tasks/0453. *(T685–T688)*
 - **E16.11 Universal / multi-architecture artifacts** — explicit multi-target artifact composition
-  (Mach-O universal x64+arm64 first; bundle formats elsewhere), never implicit. Src tasks/0453 §194.29.
+  (Mach-O universal x64+arm64 first; bundle formats elsewhere), never implicit. Src tasks/0453 §194.29. *(T689–T692)*
 - **E16.12 Windows on ARM64** — PE/COFF ARM64, Windows ARM64 ABI, reuse of the AArch64 backend.
-  Src 0181 0193 tasks/0453.
+  Src 0181 0193 tasks/0453. *(T693–T696)*
 Exit: full run suite on each tier-1 target (Windows x64, Windows ARM64, Linux x64, Linux AArch64,
 macOS AArch64); WASM/RISC-V tier-2; the artifact matrix below is green.
 
@@ -415,3 +415,4 @@ Exit (phase): defined by T224 per epic when the owner schedules P24.
 | 2026-11-03 | T214 P14 phase expansion (`P14-comptime-2-0-reflection-genera`): expanded E14.1–E14.5 into 23 new tasks `T550`–`T572` alongside refined `T058` (24 tasks total across 5 epics: E14.1 6 tasks `T550–T555`; E14.2 5 tasks `T556–T560`; E14.3 5 tasks `T561–T565`; E14.4 5 tasks `T058, T566–T569`; E14.5 3 tasks `T570–T572` for `ADR-0036` §4 / `SPEC-03 AXS-SEM-047` index auto-deref through `view`/`mut_view`), converted all 512 `EPIC(E14.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T314` (`depends: [T214, T058, T550–T572]`) | T214 |
 | 2026-11-03 | T215 P15 phase expansion (`P15-optimizer-2-0`): expanded E15.1–E15.8 into 30 new tasks `T600`–`T629` alongside refined `T063` and `T064` (32 tasks total across 8 epics: E15.1 5 tasks `T600–T604`; E15.2 4 tasks `T605–T608`; E15.3 4 tasks `T609–T612`; E15.4 4 tasks `T064, T613–T615`; E15.5 4 tasks `T616–T619` depending on P12 gate `T312`; E15.6 4 tasks `T620–T623`; E15.7 3 tasks `T624–T626`; E15.8 4 tasks `T063, T627–T629` scheduled first in P15), converted all 405 `EPIC(E15.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T315` (`depends: [T215, T063, T064, T600–T629]`) | T215 |
 | 2026-11-03 | T218 P18 phase expansion (`P18-compiler-architecture-2-0`): expanded E18.1–E18.7 into 25 new tasks `T752`–`T776` alongside refined `T067`, `T750`, and `T751` (28 tasks total across 7 epics: E18.1 4 tasks `T752–T755`; E18.2 4 tasks `T756–T759`; E18.3 4 tasks `T760–T763`; E18.4 4 tasks `T764–T767`; E18.5 4 tasks `T768–T771`; E18.7 4 tasks `T772, T750, T751, T773` scheduled first in P18 for `REQ-OWNER-006` and `ADR-0034` §4 OI-07b GNU `ld` cross-linking; E18.6 4 tasks `T774, T067, T775, T776`), converted all 5,523 `EPIC(E18.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T318` (`depends: [T218, T067, T750–T776]`) | T218 |
+| 2026-11-03 | T216 P16 phase expansion (`P16-targets-platforms`): expanded E16.9 and E16.1–E16.8, E16.10–E16.12 into 47 new tasks `T650`–`T696` alongside refined `T066` (48 tasks total across 12 epics: E16.9 4 tasks `T650, T066, T651, T652` scheduled first in P16; E16.1 4 tasks `T653–T656`; E16.2 4 tasks `T657–T660`; E16.3 4 tasks `T661–T664`; E16.4 4 tasks `T665–T668`; E16.5 4 tasks `T669–T672`; E16.6 4 tasks `T673–T676`; E16.7 4 tasks `T677–T680`; E16.8 4 tasks `T681–T684`; E16.10 4 tasks `T685–T688`; E16.11 4 tasks `T689–T692`; E16.12 4 tasks `T693–T696`), converted all 327 `EPIC(E16.*)` rows in `spec/requirements/CATALOG.md` to concrete task IDs, and wired `T316` (`depends: [T216, T313, T066, T650–T696]`) | T216 |

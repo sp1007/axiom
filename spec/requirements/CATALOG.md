@@ -11,7 +11,7 @@
 | REQ-GRM-001 | grammar | v1-core | Binding and assignment are spelled only `=`. | init §1 | - | T001, T010, T011 |
 | REQ-GRM-002 | grammar | v1-core | `.` is the only namespace/library path separator. | init §1 | - | T001, T010, T011 |
 | REQ-CNF-001 | conformance | v1-full | The specification passes a global contradiction audit before v1.0. | 0149 §Còn lại | - | T091, EPIC(E23.2) |
-| REQ-TOOL-001 | toolchain | v1-full | The native toolchain produces final artifacts without third-party compilers. | 0097 §27. Static library | - | T024, T026, EPIC(E16.8) |
+| REQ-TOOL-001 | toolchain | v1-full | The native toolchain produces final artifacts without third-party compilers. | 0097 §27. Static library | - | T024, T026, T681, T682, T683, T684, T686 |
 | REQ-ABI-001 | abi | v1-core | Panics must not cross the C ABI boundary by default. | 0068 §39. FFI panic boundary | - | T043 |
 | REQ-ABI-002 | abi | v1-core | Custom allocation strategies are exposed as library/ABI abstractions. | 0058 §**ACK-01 — Semantic Oracle In | - | T043 |
 | REQ-ABI-003 | abi | v1-core | Data layout must be compatible with C ABI rules for the target when explicitly requested. | 0016 §21. ABI/layout | - | T043 |
@@ -6403,7 +6403,7 @@
 | REQ-CTM-046 | comptime | v1-full | Host and target environments shall remain distinct; build tools run in host domain and comptime host capabilities shall not represent target runtime state. | tasks/0453 §194.44 (ATARGET-22, ATARGET-23, ATARGET-35, ATARGET-36) | - | T551 |
 | REQ-MIR-129 | mir | v1-core | Verified MIR shall remain target-independent, while target identity parameters (architecture, OS, ABI, pointer model, atomics, SIMD) are lowered during backend code generation. | tasks/0453 §194.44 (ATARGET-24, ATARGET-27, ATARGET-28, ATARGET-30, ATARGET-31, ATARGET-32) | - | T113 | 
 | REQ-BLD-101 | build | v1-core | Target-specific source declarations shall be selected prior to semantic verification, and cross-target build caches shall prevent machine artifact collisions using target-specific cache keys. | tasks/0453 §194.44 (ATARGET-34, ATARGET-39, ATARGET-40) | - | T113 | 
-| REQ-TGT-001 | target-other | v1-full | WASM shall be modeled as a first-class native target backend, GPU targets shall be explicit execution domains, and universal binaries shall be created by composing multi-target native artifacts. | tasks/0453 §194.44 (ATARGET-41, ATARGET-42, ATARGET-43) | - | EPIC(E16.1) |
+| REQ-TGT-001 | target-other | v1-full | WASM shall be modeled as a first-class native target backend, GPU targets shall be explicit execution domains, and universal binaries shall be created by composing multi-target native artifacts. | tasks/0453 §194.44 (ATARGET-41, ATARGET-42, ATARGET-43) | - | T689, T690, T691, T692 |
 | REQ-RT-166 | runtime | v1-full | Target backend replacement shall not change Core language semantics, and freestanding target compilation shall not require a monolithic hosted runtime. | tasks/0453 §194.44 (ATARGET-37, ATARGET-47) | - | EPIC(E21.1) |
 | REQ-OBJ-019 | object | v1-core | Axiom shall define a target-independent logical object model with target-specific serialization backends for PE/COFF, ELF, Mach-O, and WASM without altering language semantics. | tasks/0454 §195.50 (ALINK-20, ALINK-21, ALINK-39, ALINK-40) | - | T113 | 
 | REQ-LNK-228 | linker | v1-full | Symbols shall retain semantic identity distinct from mangled names, relocations shall be explicit link-time contracts, and the linker shall not alter observable language semantics. | tasks/0454 §195.50 (ALINK-22, ALINK-23, ALINK-24) | - | T067 |
@@ -6487,14 +6487,14 @@
 | REQ-CONC-155 | concurrency | v1-full | Structured parallel scopes shall not implicitly detach child tasks; detached execution shall be explicit, and parallel cancellation shall be cooperative by default. | tasks/0470 §211.35-37, APAR-35-37 | - | T422 |
 | REQ-CAP-142 | capability | v1-full | Independent computational regions and chunked mutable iterations may execute concurrently when capability analysis proves disjointness of accessed data. | tasks/0470 §211.49, §211.51, APAR-49, APAR-51 | - | T500 |
 | REQ-GPU-063 | gpu | post-v1 | Multi-GPU systems shall treat each device as an independent execution and storage domain; peer GPU memory access shall require explicit platform capability. | tasks/0470 §211.63-64, APAR-63-64 | - | EPIC(E22.3) |
-| REQ-TGT-002 | target-other | v1-full | The freestanding compilation profile shall not require an operating system, garbage collector, heap allocator, or monolithic runtime; Core semantics shall remain identical across hosted and freestanding profiles. | tasks/0471 §212.1-3, AKERNEL-20-24 | - | EPIC(E16.1) |
-| REQ-TGT-003 | target-other | v1-full | Freestanding targets shall support custom entry points (e.g., `_start`), and compilation shall not mandate implicit global initialization code. | tasks/0471 §212.4, §212.27, AKERNEL-25-27 | - | EPIC(E16.1) |
+| REQ-TGT-002 | target-other | v1-full | The freestanding compilation profile shall not require an operating system, garbage collector, heap allocator, or monolithic runtime; Core semantics shall remain identical across hosted and freestanding profiles. | tasks/0471 §212.1-3, AKERNEL-20-24 | - | T650 |
+| REQ-TGT-003 | target-other | v1-full | Freestanding targets shall support custom entry points (e.g., `_start`), and compilation shall not mandate implicit global initialization code. | tasks/0471 §212.4, §212.27, AKERNEL-25-27 | - | T650 |
 | REQ-ABI-102 | abi | v1-full | Hardware interrupt handlers shall declare explicit calling convention and execution domain contracts, and shall not implicitly allocate memory, block, or await. | tasks/0471 §212.5-6, AKERNEL-28-29 | - | T512, T511, T515 |
 | REQ-LAY-297 | layout | v1-core | Memory-mapped I/O (MMIO) shall remain distinct from ordinary memory; volatile accesses shall not be confused with atomic synchronization, and MMIO side effects shall be preserved by the optimizer. | tasks/0471 §212.8-10, AKERNEL-31-33 | - | T113 | 
 | REQ-CAP-143 | capability | v1-full | Physical memory addresses shall remain distinct from safe Axiom pointers; DMA operations shall track CPU versus device ownership, keeping buffers valid until completion and respecting cache coherency. | tasks/0471 §212.11-14, AKERNEL-34-37 | - | T513, T526 |
 | REQ-SEC-122 | security | v1-core | Kernel and user address domains shall remain distinct; user memory pointers shall require explicit capability validation before dereference in kernel mode, guarding against concurrent modification. | tasks/0471 §212.17-19, AKERNEL-40-42 | - | T113 | 
 | REQ-VER-019 | verifier | v1-core | Kernel and bare-metal compilation shall enforce the same ownership verifier as application compilation, establishing explicit preconditions at unsafe hardware boundaries and resuming safe verification. | tasks/0471 §212.28-30, AKERNEL-58-60, AKERNEL-67 | - | T113 | 
-| REQ-TGT-004 | target-other | v1-full | Core language semantics shall remain ISA-independent; instruction set features (AVX2, AVX-512, NEON, SVE, RVV, AMX) shall be modeled as TargetSpec capabilities, prohibiting emission of unsupported instructions. | tasks/0472 §213.1-5, §213.95, AHW-20-22, AHW-24 | - | EPIC(E16.1) |
+| REQ-TGT-004 | target-other | v1-full | Core language semantics shall remain ISA-independent; instruction set features (AVX2, AVX-512, NEON, SVE, RVV, AMX) shall be modeled as TargetSpec capabilities, prohibiting emission of unsupported instructions. | tasks/0472 §213.1-5, §213.95, AHW-20-22, AHW-24 | - | T653 |
 | REQ-LIR-027 | lir | post-v1 | Function multiversioning shall present a single logical API; runtime CPU dispatch shall be removable when target CPU features are statically declared at compile time. | tasks/0472 §213.6-7, AHW-25-26, AHW-51 | - | EPIC(E24.0) |
 | REQ-SIMD-333 | simd | v1-full | Vector semantics shall remain distinct from physical register width; scalable vector ISAs (SVE, RVV) shall be representable without hard-coding fixed vector lengths into Core. | tasks/0472 §213.8-9, AHW-27-28 | - | T463 |
 | REQ-SIMD-334 | simd | v1-full | Auto-vectorization and SIMD transformations shall require compiler-proven `NoAlias` conditions; unknown aliasing shall never justify vectorization without explicit runtime alias checks and fallback code. | tasks/0472 §213.10-12, AHW-29-32 | - | T474 |
@@ -8718,112 +8718,112 @@
 | REQ-MIR-337 | mir | v1-core | [ACFG-125] Axiom control-flow semantics are deterministic. | 0516 §172 | - | T113 | 
 | REQ-ABI-104 | abi | v1-full | Function, method, generic, closure và trait abstraction phải có thể biến mất hoàn toàn sau compile-time khi semantics cho phép. | 0517 BOOTSTRAP-258 — AXIOM CALLING CONVENTION, FUNCTION ABI, PARAMETER PASSING, RETURN ABI & CALL LOWERING | - | T503 |
 | REQ-ABI-105 | abi | v1-full | Panic must not cross an extern "C" boundary unless an explicit ABI adapter contract exists. | 0517 §192 | - | T521, T522 |
-| REQ-TGT-005 | tgt | v1-full | Một backend có mô hình machine đủ mạnh để khai thác CPU hiện đại, nhưng kiến trúc đủ rõ ràng để sau này compiler Axiom có thể tự implement backend và self-host. | 0518 BOOTSTRAP-259 — AXIOM MACHINE IR, REGISTER MODEL, INSTRUCTION SELECTION & TARGET LOWERING | - | EPIC(E16.1) |
-| REQ-TGT-006 | tgt | v1-full | Pattern-based instruction selection + target-specific legalization hooks. | 0518 §46 | - | EPIC(E16.1) |
-| REQ-TGT-007 | tgt | v1-full | Linear Scan | 0518 §96 | - | EPIC(E16.1) |
-| REQ-TGT-008 | tgt | v1-full | Hybrid / graph-based allocator | 0518 §97 | - | EPIC(E16.1) |
-| REQ-TGT-009 | tgt | v1-full | [AMACHINE-20] Machine IR is derived only from verified semantic IR. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-010 | tgt | v1-full | [AMACHINE-21] Machine lowering cannot introduce semantic behavior not present in the source contract. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-011 | tgt | v1-full | [AMACHINE-22] Machine lowering must preserve observable behavior. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-012 | tgt | v1-full | [AMACHINE-23] Virtual registers are distinct from semantic source variables. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-013 | tgt | v1-full | [AMACHINE-24] Physical register assignment is a backend concern. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-014 | tgt | v1-full | [AMACHINE-25] Register classes are target-specific. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-015 | tgt | v1-full | [AMACHINE-26] Physical registers may have aliases and subregisters. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-016 | tgt | v1-full | [AMACHINE-27] Register aliasing must be represented explicitly. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-017 | tgt | v1-full | [AMACHINE-28] Spilling must preserve semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-018 | tgt | v1-full | [AMACHINE-29] Stack slots are physical storage, not semantic variables. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-019 | tgt | v1-full | [AMACHINE-30] Stack-slot reuse requires non-overlapping physical lifetimes. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-020 | tgt | v1-full | [AMACHINE-31] Machine memory operands must respect target addressing rules. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-021 | tgt | v1-full | [AMACHINE-32] Target addressing modes must not leak into Core semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-022 | tgt | v1-full | [AMACHINE-33] Instruction selection is target-specific. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-023 | tgt | v1-full | [AMACHINE-34] Instruction selection must preserve operation semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-024 | tgt | v1-full | [AMACHINE-35] Illegal target operations must be legalized or expanded before encoding. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-025 | tgt | v1-full | [AMACHINE-36] Legalization must preserve overflow semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-026 | tgt | v1-full | [AMACHINE-37] Legalization must preserve atomic semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-027 | tgt | v1-full | [AMACHINE-38] Legalization must preserve volatile semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-028 | tgt | v1-full | [AMACHINE-39] Legalization must preserve synchronization semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-029 | tgt | v1-full | [AMACHINE-40] Legalization must preserve panic/termination semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-030 | tgt | v1-full | [AMACHINE-41] Strict floating-point semantics must not be weakened by instruction selection. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-031 | tgt | v1-full | [AMACHINE-42] Fast-math transformations require explicit authorization. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-032 | tgt | v1-full | [AMACHINE-43] Atomic operations cannot be lowered to ordinary non-atomic operations. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-033 | tgt | v1-full | [AMACHINE-44] Volatile operations cannot be eliminated as ordinary dead loads/stores. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-034 | tgt | v1-full | [AMACHINE-45] Memory ordering must be preserved during machine lowering. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-035 | tgt | v1-full | [AMACHINE-46] Machine instruction implicit register uses/defs must be represented. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-036 | tgt | v1-full | [AMACHINE-47] Condition-code dependencies must be represented. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-037 | tgt | v1-full | [AMACHINE-48] Call instructions must model ABI register clobbers. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-038 | tgt | v1-full | [AMACHINE-49] Callee-saved register requirements must be honored. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-039 | tgt | v1-full | [AMACHINE-50] Caller-saved registers must not be assumed live across calls. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-040 | tgt | v1-full | [AMACHINE-51] ABI stack alignment must be preserved. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-041 | tgt | v1-full | [AMACHINE-52] Parallel argument moves must be resolved without semantic loss. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-042 | tgt | v1-full | [AMACHINE-53] Return values must obey ABI return classification. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-043 | tgt | v1-full | [AMACHINE-54] sret/caller-allocated returns must preserve ownership semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-044 | tgt | v1-full | [AMACHINE-55] Phi elimination must preserve CFG semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-045 | tgt | v1-full | [AMACHINE-56] Critical-edge handling must preserve control-flow semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-046 | tgt | v1-full | [AMACHINE-57] Spill/reload insertion cannot invalidate memory or capability semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-047 | tgt | v1-full | [AMACHINE-58] Machine scheduling must preserve data dependencies. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-048 | tgt | v1-full | [AMACHINE-59] Machine scheduling must preserve memory dependencies. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-049 | tgt | v1-full | [AMACHINE-60] Machine scheduling must preserve atomic and volatile ordering. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-050 | tgt | v1-full | [AMACHINE-61] Machine scheduling must preserve call effects. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-051 | tgt | v1-full | [AMACHINE-62] Machine scheduling must preserve condition-code dependencies. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-052 | tgt | v1-full | [AMACHINE-63] Instruction latency is an optimization fact, not language semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-053 | tgt | v1-full | [AMACHINE-64] Microarchitectural tuning cannot alter observable program semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-054 | tgt | v1-full | [AMACHINE-65] Target CPU features must be explicitly known by compilation configuration or explicit dispatch mechanisms. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-055 | tgt | v1-full | [AMACHINE-66] Axiom must not silently introduce runtime CPU feature dispatch. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-056 | tgt | v1-full | [AMACHINE-67] Target-specific instructions require corresponding target feature availability. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-057 | tgt | v1-full | [AMACHINE-68] Machine IR must be target-verifiable before encoding. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-058 | tgt | v1-full | [AMACHINE-69] Invalid Machine IR must never reach the encoder. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-059 | tgt | v1-full | [AMACHINE-70] Instruction encoding must be deterministic. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-060 | tgt | v1-full | [AMACHINE-71] Relocation requirements must be represented explicitly. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-061 | tgt | v1-full | [AMACHINE-72] Instruction size changes must be handled before final object emission. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-062 | tgt | v1-full | [AMACHINE-73] Branch relaxation must preserve branch semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-063 | tgt | v1-full | [AMACHINE-74] Machine code layout must preserve required alignment contracts. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-064 | tgt | v1-full | [AMACHINE-75] Debug information must retain source-to-machine provenance. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-065 | tgt | v1-full | [AMACHINE-76] Machine transformations must preserve debug provenance where possible. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-066 | tgt | v1-full | [AMACHINE-77] Machine optimization may remove physical operations only when semantic equivalence is preserved. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-067 | tgt | v1-full | [AMACHINE-78] Equivalent machine operations may be merged only when observable identity is unaffected. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-068 | tgt | v1-full | [AMACHINE-79] Function-address observability constrains machine-level code merging. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-069 | tgt | v1-full | [AMACHINE-80] Machine code generation is independent of source-level pointer/reference syntax. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-070 | tgt | v1-full | [AMACHINE-81] Machine backend may use pointer representations internally without exposing them to safe Core. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-071 | tgt | v1-full | [AMACHINE-82] Machine backend may introduce physical temporaries without semantic temporaries. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-072 | tgt | v1-full | [AMACHINE-83] Physical copies do not imply semantic Copy. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-073 | tgt | v1-full | [AMACHINE-84] Semantic Move does not require physical movement. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-074 | tgt | v1-full | [AMACHINE-85] Machine backend must preserve ownership/drop behavior. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-075 | tgt | v1-full | [AMACHINE-86] Machine backend must preserve capability validity. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-076 | tgt | v1-full | [AMACHINE-87] Machine backend must preserve execution-domain constraints. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-077 | tgt | v1-full | [AMACHINE-88] GPU machine lowering is distinct from CPU machine lowering. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-078 | tgt | v1-full | [AMACHINE-89] GPU address spaces must not be confused with CPU address spaces. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-079 | tgt | v1-full | [AMACHINE-90] WASM machine lowering uses WASM-specific value and memory semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-080 | tgt | v1-full | [AMACHINE-91] Backend target isolation must prevent frontend dependence on ISA details. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-081 | tgt | v1-full | [AMACHINE-92] Target backends must implement a common machine backend contract. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-082 | tgt | v1-full | [AMACHINE-93] A bootstrap LLVM backend may exist without making LLVM a language semantic dependency. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-083 | tgt | v1-full | [AMACHINE-94] The final compiler must be capable of replacing the bootstrap backend with native Axiom backends. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-084 | tgt | v1-full | [AMACHINE-95] Native Axiom backend design must be self-hostable. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-085 | tgt | v1-full | [AMACHINE-96] Machine IR must be serializable for debugging/testing. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-086 | tgt | v1-full | [AMACHINE-97] Instruction selection must be independently testable. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-087 | tgt | v1-full | [AMACHINE-98] Register allocation must be independently testable. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-088 | tgt | v1-full | [AMACHINE-99] Instruction encoding must be independently testable. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-089 | tgt | v1-full | [AMACHINE-100] Machine backend conformance is part of compiler correctness. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-090 | tgt | v1-full | [AMACHINE-101] Backend failures must be distinguishable from semantic compiler failures. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-091 | tgt | v1-full | [AMACHINE-102] AI tooling may inspect machine decisions but cannot override machine verification. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-092 | tgt | v1-full | [AMACHINE-103] Optimization profiles may change machine code but not language semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-093 | tgt | v1-full | [AMACHINE-104] Size optimization may trade execution speed for binary size without changing semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-094 | tgt | v1-full | [AMACHINE-105] Performance optimization may trade binary size for execution speed without changing semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-095 | tgt | v1-full | [AMACHINE-106] Debug optimization settings must not change observable language semantics. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-096 | tgt | v1-full | [AMACHINE-107] Freestanding targets must not require hosted runtime machinery. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-097 | tgt | v1-full | [AMACHINE-108] Machine lowering must not introduce mandatory garbage collection. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-098 | tgt | v1-full | [AMACHINE-109] Machine lowering must not introduce mandatory reference counting. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-099 | tgt | v1-full | [AMACHINE-110] Machine lowering must not introduce mandatory object headers. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-100 | tgt | v1-full | [AMACHINE-111] Machine lowering must not require programmer-visible pointer syntax. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-101 | tgt | v1-full | [AMACHINE-112] Machine backend must support direct native object emission. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-102 | tgt | v1-full | [AMACHINE-113] Assembly emission is an optional diagnostic artifact. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-103 | tgt | v1-full | [AMACHINE-114] Object emission must not require assembly as an intermediate representation. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-104 | tgt | v1-full | [AMACHINE-115] The native backend must be capable of directly producing PE, ELF, Mach-O and WASM-compatible output paths through the appropriate object backend. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-105 | tgt | v1-full | [AMACHINE-116] Machine backend target selection is determined by TargetSpec. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-106 | tgt | v1-full | [AMACHINE-117] Machine backend must be deterministic for a fixed compiler semantic/codegen configuration. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-107 | tgt | v1-full | [AMACHINE-118] Machine code differences caused by optimization are allowed when semantics remain equivalent. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-108 | tgt | v1-full | [AMACHINE-119] Machine-level correctness is verified before object emission. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-109 | tgt | v1-full | [AMACHINE-120] The Machine IR is the final compiler abstraction before target-specific binary encoding. | 0518 §151 | - | EPIC(E16.1) |
-| REQ-TGT-110 | tgt | v1-full | Compiler được phép dùng pointer và address ở bên dưới, nhưng programmer không phải gánh complexity của pointer/reference; đồng thời optimizer tuyệt đối không được biến một access hợp lệ thành access sai provenance hoặc sai alias. | 0518 **AXIOM MEMORY CODEGEN, POINTER PROVENANCE, ADDRESS CALCULATION & LOAD/STORE LOWERING** | - | EPIC(E16.1) |
+| REQ-TGT-005 | tgt | v1-full | Một backend có mô hình machine đủ mạnh để khai thác CPU hiện đại, nhưng kiến trúc đủ rõ ràng để sau này compiler Axiom có thể tự implement backend và self-host. | 0518 BOOTSTRAP-259 — AXIOM MACHINE IR, REGISTER MODEL, INSTRUCTION SELECTION & TARGET LOWERING | - | T653 |
+| REQ-TGT-006 | tgt | v1-full | Pattern-based instruction selection + target-specific legalization hooks. | 0518 §46 | - | T653 |
+| REQ-TGT-007 | tgt | v1-full | Linear Scan | 0518 §96 | - | T653 |
+| REQ-TGT-008 | tgt | v1-full | Hybrid / graph-based allocator | 0518 §97 | - | T653 |
+| REQ-TGT-009 | tgt | v1-full | [AMACHINE-20] Machine IR is derived only from verified semantic IR. | 0518 §151 | - | T653 |
+| REQ-TGT-010 | tgt | v1-full | [AMACHINE-21] Machine lowering cannot introduce semantic behavior not present in the source contract. | 0518 §151 | - | T653 |
+| REQ-TGT-011 | tgt | v1-full | [AMACHINE-22] Machine lowering must preserve observable behavior. | 0518 §151 | - | T653 |
+| REQ-TGT-012 | tgt | v1-full | [AMACHINE-23] Virtual registers are distinct from semantic source variables. | 0518 §151 | - | T654 |
+| REQ-TGT-013 | tgt | v1-full | [AMACHINE-24] Physical register assignment is a backend concern. | 0518 §151 | - | T654 |
+| REQ-TGT-014 | tgt | v1-full | [AMACHINE-25] Register classes are target-specific. | 0518 §151 | - | T654 |
+| REQ-TGT-015 | tgt | v1-full | [AMACHINE-26] Physical registers may have aliases and subregisters. | 0518 §151 | - | T654 |
+| REQ-TGT-016 | tgt | v1-full | [AMACHINE-27] Register aliasing must be represented explicitly. | 0518 §151 | - | T654 |
+| REQ-TGT-017 | tgt | v1-full | [AMACHINE-28] Spilling must preserve semantics. | 0518 §151 | - | T654 |
+| REQ-TGT-018 | tgt | v1-full | [AMACHINE-29] Stack slots are physical storage, not semantic variables. | 0518 §151 | - | T654 |
+| REQ-TGT-019 | tgt | v1-full | [AMACHINE-30] Stack-slot reuse requires non-overlapping physical lifetimes. | 0518 §151 | - | T654 |
+| REQ-TGT-020 | tgt | v1-full | [AMACHINE-31] Machine memory operands must respect target addressing rules. | 0518 §151 | - | T654 |
+| REQ-TGT-021 | tgt | v1-full | [AMACHINE-32] Target addressing modes must not leak into Core semantics. | 0518 §151 | - | T654 |
+| REQ-TGT-022 | tgt | v1-full | [AMACHINE-33] Instruction selection is target-specific. | 0518 §151 | - | T655 |
+| REQ-TGT-023 | tgt | v1-full | [AMACHINE-34] Instruction selection must preserve operation semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-024 | tgt | v1-full | [AMACHINE-35] Illegal target operations must be legalized or expanded before encoding. | 0518 §151 | - | T655 |
+| REQ-TGT-025 | tgt | v1-full | [AMACHINE-36] Legalization must preserve overflow semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-026 | tgt | v1-full | [AMACHINE-37] Legalization must preserve atomic semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-027 | tgt | v1-full | [AMACHINE-38] Legalization must preserve volatile semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-028 | tgt | v1-full | [AMACHINE-39] Legalization must preserve synchronization semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-029 | tgt | v1-full | [AMACHINE-40] Legalization must preserve panic/termination semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-030 | tgt | v1-full | [AMACHINE-41] Strict floating-point semantics must not be weakened by instruction selection. | 0518 §151 | - | T655 |
+| REQ-TGT-031 | tgt | v1-full | [AMACHINE-42] Fast-math transformations require explicit authorization. | 0518 §151 | - | T655 |
+| REQ-TGT-032 | tgt | v1-full | [AMACHINE-43] Atomic operations cannot be lowered to ordinary non-atomic operations. | 0518 §151 | - | T655 |
+| REQ-TGT-033 | tgt | v1-full | [AMACHINE-44] Volatile operations cannot be eliminated as ordinary dead loads/stores. | 0518 §151 | - | T655 |
+| REQ-TGT-034 | tgt | v1-full | [AMACHINE-45] Memory ordering must be preserved during machine lowering. | 0518 §151 | - | T655 |
+| REQ-TGT-035 | tgt | v1-full | [AMACHINE-46] Machine instruction implicit register uses/defs must be represented. | 0518 §151 | - | T655 |
+| REQ-TGT-036 | tgt | v1-full | [AMACHINE-47] Condition-code dependencies must be represented. | 0518 §151 | - | T655 |
+| REQ-TGT-037 | tgt | v1-full | [AMACHINE-48] Call instructions must model ABI register clobbers. | 0518 §151 | - | T650 |
+| REQ-TGT-038 | tgt | v1-full | [AMACHINE-49] Callee-saved register requirements must be honored. | 0518 §151 | - | T650 |
+| REQ-TGT-039 | tgt | v1-full | [AMACHINE-50] Caller-saved registers must not be assumed live across calls. | 0518 §151 | - | T650 |
+| REQ-TGT-040 | tgt | v1-full | [AMACHINE-51] ABI stack alignment must be preserved. | 0518 §151 | - | T650 |
+| REQ-TGT-041 | tgt | v1-full | [AMACHINE-52] Parallel argument moves must be resolved without semantic loss. | 0518 §151 | - | T066 |
+| REQ-TGT-042 | tgt | v1-full | [AMACHINE-53] Return values must obey ABI return classification. | 0518 §151 | - | T066 |
+| REQ-TGT-043 | tgt | v1-full | [AMACHINE-54] sret/caller-allocated returns must preserve ownership semantics. | 0518 §151 | - | T066 |
+| REQ-TGT-044 | tgt | v1-full | [AMACHINE-55] Phi elimination must preserve CFG semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-045 | tgt | v1-full | [AMACHINE-56] Critical-edge handling must preserve control-flow semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-046 | tgt | v1-full | [AMACHINE-57] Spill/reload insertion cannot invalidate memory or capability semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-047 | tgt | v1-full | [AMACHINE-58] Machine scheduling must preserve data dependencies. | 0518 §151 | - | T655 |
+| REQ-TGT-048 | tgt | v1-full | [AMACHINE-59] Machine scheduling must preserve memory dependencies. | 0518 §151 | - | T655 |
+| REQ-TGT-049 | tgt | v1-full | [AMACHINE-60] Machine scheduling must preserve atomic and volatile ordering. | 0518 §151 | - | T655 |
+| REQ-TGT-050 | tgt | v1-full | [AMACHINE-61] Machine scheduling must preserve call effects. | 0518 §151 | - | T655 |
+| REQ-TGT-051 | tgt | v1-full | [AMACHINE-62] Machine scheduling must preserve condition-code dependencies. | 0518 §151 | - | T655 |
+| REQ-TGT-052 | tgt | v1-full | [AMACHINE-63] Instruction latency is an optimization fact, not language semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-053 | tgt | v1-full | [AMACHINE-64] Microarchitectural tuning cannot alter observable program semantics. | 0518 §151 | - | T655 |
+| REQ-TGT-054 | tgt | v1-full | [AMACHINE-65] Target CPU features must be explicitly known by compilation configuration or explicit dispatch mechanisms. | 0518 §151 | - | T654 |
+| REQ-TGT-055 | tgt | v1-full | [AMACHINE-66] Axiom must not silently introduce runtime CPU feature dispatch. | 0518 §151 | - | T654 |
+| REQ-TGT-056 | tgt | v1-full | [AMACHINE-67] Target-specific instructions require corresponding target feature availability. | 0518 §151 | - | T654 |
+| REQ-TGT-057 | tgt | v1-full | [AMACHINE-68] Machine IR must be target-verifiable before encoding. | 0518 §151 | - | T655 |
+| REQ-TGT-058 | tgt | v1-full | [AMACHINE-69] Invalid Machine IR must never reach the encoder. | 0518 §151 | - | T655 |
+| REQ-TGT-059 | tgt | v1-full | [AMACHINE-70] Instruction encoding must be deterministic. | 0518 §151 | - | T066 |
+| REQ-TGT-060 | tgt | v1-full | [AMACHINE-71] Relocation requirements must be represented explicitly. | 0518 §151 | - | T066, T687 |
+| REQ-TGT-061 | tgt | v1-full | [AMACHINE-72] Instruction size changes must be handled before final object emission. | 0518 §151 | - | T657 |
+| REQ-TGT-062 | tgt | v1-full | [AMACHINE-73] Branch relaxation must preserve branch semantics. | 0518 §151 | - | T657 |
+| REQ-TGT-063 | tgt | v1-full | [AMACHINE-74] Machine code layout must preserve required alignment contracts. | 0518 §151 | - | T657 |
+| REQ-TGT-064 | tgt | v1-full | [AMACHINE-75] Debug information must retain source-to-machine provenance. | 0518 §151 | - | T657 |
+| REQ-TGT-065 | tgt | v1-full | [AMACHINE-76] Machine transformations must preserve debug provenance where possible. | 0518 §151 | - | T657 |
+| REQ-TGT-066 | tgt | v1-full | [AMACHINE-77] Machine optimization may remove physical operations only when semantic equivalence is preserved. | 0518 §151 | - | T658 |
+| REQ-TGT-067 | tgt | v1-full | [AMACHINE-78] Equivalent machine operations may be merged only when observable identity is unaffected. | 0518 §151 | - | T658 |
+| REQ-TGT-068 | tgt | v1-full | [AMACHINE-79] Function-address observability constrains machine-level code merging. | 0518 §151 | - | T658 |
+| REQ-TGT-069 | tgt | v1-full | [AMACHINE-80] Machine code generation is independent of source-level pointer/reference syntax. | 0518 §151 | - | T669 |
+| REQ-TGT-070 | tgt | v1-full | [AMACHINE-81] Machine backend may use pointer representations internally without exposing them to safe Core. | 0518 §151 | - | T669 |
+| REQ-TGT-071 | tgt | v1-full | [AMACHINE-82] Machine backend may introduce physical temporaries without semantic temporaries. | 0518 §151 | - | T669 |
+| REQ-TGT-072 | tgt | v1-full | [AMACHINE-83] Physical copies do not imply semantic Copy. | 0518 §151 | - | T669 |
+| REQ-TGT-073 | tgt | v1-full | [AMACHINE-84] Semantic Move does not require physical movement. | 0518 §151 | - | T670 |
+| REQ-TGT-074 | tgt | v1-full | [AMACHINE-85] Machine backend must preserve ownership/drop behavior. | 0518 §151 | - | T671 |
+| REQ-TGT-075 | tgt | v1-full | [AMACHINE-86] Machine backend must preserve capability validity. | 0518 §151 | - | T671 |
+| REQ-TGT-076 | tgt | v1-full | [AMACHINE-87] Machine backend must preserve execution-domain constraints. | 0518 §151 | - | T670 |
+| REQ-TGT-077 | tgt | v1-full | [AMACHINE-88] GPU machine lowering is distinct from CPU machine lowering. | 0518 §151 | - | T670 |
+| REQ-TGT-078 | tgt | v1-full | [AMACHINE-89] GPU address spaces must not be confused with CPU address spaces. | 0518 §151 | - | T670 |
+| REQ-TGT-079 | tgt | v1-full | [AMACHINE-90] WASM machine lowering uses WASM-specific value and memory semantics. | 0518 §151 | - | T673 |
+| REQ-TGT-080 | tgt | v1-full | [AMACHINE-91] Backend target isolation must prevent frontend dependence on ISA details. | 0518 §151 | - | T681 |
+| REQ-TGT-081 | tgt | v1-full | [AMACHINE-92] Target backends must implement a common machine backend contract. | 0518 §151 | - | T681 |
+| REQ-TGT-082 | tgt | v1-full | [AMACHINE-93] A bootstrap LLVM backend may exist without making LLVM a language semantic dependency. | 0518 §151 | - | T681 |
+| REQ-TGT-083 | tgt | v1-full | [AMACHINE-94] The final compiler must be capable of replacing the bootstrap backend with native Axiom backends. | 0518 §151 | - | T681 |
+| REQ-TGT-084 | tgt | v1-full | [AMACHINE-95] Native Axiom backend design must be self-hostable. | 0518 §151 | - | T681 |
+| REQ-TGT-085 | tgt | v1-full | [AMACHINE-96] Machine IR must be serializable for debugging/testing. | 0518 §151 | - | T656 |
+| REQ-TGT-086 | tgt | v1-full | [AMACHINE-97] Instruction selection must be independently testable. | 0518 §151 | - | T656 |
+| REQ-TGT-087 | tgt | v1-full | [AMACHINE-98] Register allocation must be independently testable. | 0518 §151 | - | T656 |
+| REQ-TGT-088 | tgt | v1-full | [AMACHINE-99] Instruction encoding must be independently testable. | 0518 §151 | - | T656 |
+| REQ-TGT-089 | tgt | v1-full | [AMACHINE-100] Machine backend conformance is part of compiler correctness. | 0518 §151 | - | T656 |
+| REQ-TGT-090 | tgt | v1-full | [AMACHINE-101] Backend failures must be distinguishable from semantic compiler failures. | 0518 §151 | - | T656 |
+| REQ-TGT-091 | tgt | v1-full | [AMACHINE-102] AI tooling may inspect machine decisions but cannot override machine verification. | 0518 §151 | - | T656 |
+| REQ-TGT-092 | tgt | v1-full | [AMACHINE-103] Optimization profiles may change machine code but not language semantics. | 0518 §151 | - | T656 |
+| REQ-TGT-093 | tgt | v1-full | [AMACHINE-104] Size optimization may trade execution speed for binary size without changing semantics. | 0518 §151 | - | T656 |
+| REQ-TGT-094 | tgt | v1-full | [AMACHINE-105] Performance optimization may trade binary size for execution speed without changing semantics. | 0518 §151 | - | T656 |
+| REQ-TGT-095 | tgt | v1-full | [AMACHINE-106] Debug optimization settings must not change observable language semantics. | 0518 §151 | - | T656 |
+| REQ-TGT-096 | tgt | v1-full | [AMACHINE-107] Freestanding targets must not require hosted runtime machinery. | 0518 §151 | - | T651 |
+| REQ-TGT-097 | tgt | v1-full | [AMACHINE-108] Machine lowering must not introduce mandatory garbage collection. | 0518 §151 | - | T651 |
+| REQ-TGT-098 | tgt | v1-full | [AMACHINE-109] Machine lowering must not introduce mandatory reference counting. | 0518 §151 | - | T651 |
+| REQ-TGT-099 | tgt | v1-full | [AMACHINE-110] Machine lowering must not introduce mandatory object headers. | 0518 §151 | - | T651 |
+| REQ-TGT-100 | tgt | v1-full | [AMACHINE-111] Machine lowering must not require programmer-visible pointer syntax. | 0518 §151 | - | T651 |
+| REQ-TGT-101 | tgt | v1-full | [AMACHINE-112] Machine backend must support direct native object emission. | 0518 §151 | - | T066, T685, T686 |
+| REQ-TGT-102 | tgt | v1-full | [AMACHINE-113] Assembly emission is an optional diagnostic artifact. | 0518 §151 | - | T652 |
+| REQ-TGT-103 | tgt | v1-full | [AMACHINE-114] Object emission must not require assembly as an intermediate representation. | 0518 §151 | - | T066, T685 |
+| REQ-TGT-104 | tgt | v1-full | [AMACHINE-115] The native backend must be capable of directly producing PE, ELF, Mach-O and WASM-compatible output paths through the appropriate object backend. | 0518 §151 | - | T066, T685, T687, T689, T690, T695 |
+| REQ-TGT-105 | tgt | v1-full | [AMACHINE-116] Machine backend target selection is determined by TargetSpec. | 0518 §151 | - | T652, T689 |
+| REQ-TGT-106 | tgt | v1-full | [AMACHINE-117] Machine backend must be deterministic for a fixed compiler semantic/codegen configuration. | 0518 §151 | - | T652, T688, T690 |
+| REQ-TGT-107 | tgt | v1-full | [AMACHINE-118] Machine code differences caused by optimization are allowed when semantics remain equivalent. | 0518 §151 | - | T656 |
+| REQ-TGT-108 | tgt | v1-full | [AMACHINE-119] Machine-level correctness is verified before object emission. | 0518 §151 | - | T655 |
+| REQ-TGT-109 | tgt | v1-full | [AMACHINE-120] The Machine IR is the final compiler abstraction before target-specific binary encoding. | 0518 §151 | - | T655 |
+| REQ-TGT-110 | tgt | v1-full | Compiler được phép dùng pointer và address ở bên dưới, nhưng programmer không phải gánh complexity của pointer/reference; đồng thời optimizer tuyệt đối không được biến một access hợp lệ thành access sai provenance hoặc sai alias. | 0518 **AXIOM MEMORY CODEGEN, POINTER PROVENANCE, ADDRESS CALCULATION & LOAD/STORE LOWERING** | - | T671 |
 | REQ-CORE-2437 | compiler | v1-full | Programmer không cần quản lý pointer/reference để viết code an toàn, nhưng compiler vẫn phải có một mô hình địa chỉ, provenance, alias và memory access đủ chính xác để tạo machine code tối ưu. | 0519 BOOTSTRAP-260 — AXIOM MEMORY CODEGEN, POINTER PROVENANCE, ADDRESS CALCULATION & LOAD/STORE LOWERING | - | T752 |
 | REQ-CORE-2438 | compiler | v1-full | Address calculation là semantic LIR operation, còn addressing mode là Machine IR/target concern. | 0519 §125 | - | T752 |
 | REQ-CORE-2439 | compiler | v1-full | Semantic memory access is typed, capability-checked and provenance-aware; physical memory access is target-specific and may be radically different. | 0519 §200 | - | T752 |
@@ -8928,222 +8928,222 @@
 | REQ-CORE-2538 | compiler | v1-full | [AMEMCODE-118] Memory semantics are independent of optimization level. | 0519 §201 | - | T752 |
 | REQ-CORE-2539 | compiler | v1-full | [AMEMCODE-119] Safe memory verification occurs before target-specific memory optimization. | 0519 §201 | - | T752 |
 | REQ-CORE-2540 | compiler | v1-full | [AMEMCODE-120] Memory code generation is the boundary where semantic Places become target-specific memory operations. | 0519 §201 | - | T752 |
-| REQ-TGT-111 | tgt | v1-full | Axiom LIR phải target-independent; x86-64 chỉ là backend đầu tiên thực hiện Target Lowering + Instruction Selection + Register Allocation + Encoding. | 0520 BOOTSTRAP-261 — AXIOM x86-64 BACKEND V1 | - | EPIC(E16.1) |
-| REQ-TGT-112 | tgt | v1-full | Linear scan cho debug/fast compilation + graph coloring hoặc PBQP-like allocator cho optimized release. | 0520 §13 | - | EPIC(E16.1) |
-| REQ-TGT-113 | tgt | v1-full | Mỗi tầng chịu trách nhiệm chứng minh một loại invariant riêng. | 0521 §155 | - | EPIC(E16.1) |
-| REQ-TGT-114 | tgt | v1-full | [AARM-20] ARM64 is a backend target and is not part of Axiom Core semantics. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-115 | tgt | v1-full | [AARM-21] Axiom LIR must not contain x86-specific concepts. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-116 | tgt | v1-full | [AARM-22] TargetBackend provides target-specific lowering behind a stable compiler contract. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-117 | tgt | v1-full | [AARM-23] AArch64 register classes are isolated from frontend semantics. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-118 | tgt | v1-full | [AARM-24] X/W register aliasing must be modeled correctly. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-119 | tgt | v1-full | [AARM-25] SP is not an ordinary allocatable GPR. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-120 | tgt | v1-full | [AARM-26] XZR/WZR are explicit architectural zero registers. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-121 | tgt | v1-full | [AARM-27] NZCV dependencies must be modeled. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-122 | tgt | v1-full | [AARM-28] Register allocation cannot alter semantic behavior. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-123 | tgt | v1-full | [AARM-29] AAPCS64 classification is an ABI concern. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-124 | tgt | v1-full | [AARM-30] Windows ARM64 and other platform ABIs may differ. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-125 | tgt | v1-full | [AARM-31] Aggregate arguments use ABI classification. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-126 | tgt | v1-full | [AARM-32] sret is ABI-generated and invisible to source semantics. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-127 | tgt | v1-full | [AARM-33] Caller/callee save rules are ABI-specific. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-128 | tgt | v1-full | [AARM-34] LR is modeled as an architectural call/return resource. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-129 | tgt | v1-full | [AARM-35] Frame layout is target/ABI controlled. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-130 | tgt | v1-full | [AARM-36] ARM64 has no x86 red-zone assumption. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-131 | tgt | v1-full | [AARM-37] Stack alignment is enforced at ABI boundaries. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-132 | tgt | v1-full | [AARM-38] Address calculations are represented semantically before target lowering. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-133 | tgt | v1-full | [AARM-39] ARM64 load/store addressing is target-specific. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-134 | tgt | v1-full | [AARM-40] ARM64 PC-relative addressing is backend/linker behavior. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-135 | tgt | v1-full | [AARM-41] SIMD semantics are independent of V-register naming. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-136 | tgt | v1-full | [AARM-42] NEON/SVE/SME are target capabilities, not Core language concepts. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-137 | tgt | v1-full | [AARM-43] FP instruction selection must preserve Axiom FP semantics. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-138 | tgt | v1-full | [AARM-44] FMA is selected only when semantically legal. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-139 | tgt | v1-full | [AARM-45] Conditional execution optimizations must preserve observable behavior. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-140 | tgt | v1-full | [AARM-46] Atomic lowering must preserve Axiom memory ordering. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-141 | tgt | v1-full | [AARM-47] LSE is optional and feature-controlled. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-142 | tgt | v1-full | [AARM-48] Without LSE, atomic operations may be expanded to LL/SC sequences. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-143 | tgt | v1-full | [AARM-49] Volatile operations remain observable. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-144 | tgt | v1-full | [AARM-50] Device/MMIO operations preserve required ordering contracts. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-145 | tgt | v1-full | [AARM-51] TLS lowering is target/ABI specific. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-146 | tgt | v1-full | [AARM-52] PIC/GOT/PLT behavior is target/linker specific. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-147 | tgt | v1-full | [AARM-53] Pointer authentication is system/ABI functionality, not Core semantics. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-148 | tgt | v1-full | [AARM-54] Instruction encoding occurs only after machine verification. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-149 | tgt | v1-full | [AARM-55] Relocations are emitted explicitly. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-150 | tgt | v1-full | [AARM-56] Branch range limitations may require backend or linker relaxation. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-151 | tgt | v1-full | [AARM-57] Object serialization is separated from instruction encoding. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-152 | tgt | v1-full | [AARM-58] Debug/unwind metadata is generated according to target ABI. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-153 | tgt | v1-full | [AARM-59] Backend code generation must be deterministic in reproducible mode. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-154 | tgt | v1-full | [AARM-60] Backend caches include target and codegen identity. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-155 | tgt | v1-full | [AARM-61] Semantic tests are independent of machine instruction sequences. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-156 | tgt | v1-full | [AARM-62] Assembly golden tests are implementation tests, not semantic authority. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-157 | tgt | v1-full | [AARM-63] x86-64 and ARM64 must produce equivalent observable behavior for equivalent targets. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-158 | tgt | v1-full | [AARM-64] Target-independent optimization must not depend on ARM64-specific instructions. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-159 | tgt | v1-full | [AARM-65] Target-dependent optimization begins only after target lowering. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-160 | tgt | v1-full | [AARM-66] Unsupported operations require legal expansion or explicit rejection. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-161 | tgt | v1-full | [AARM-67] Target features must never be silently assumed. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-162 | tgt | v1-full | [AARM-68] Machine verification must precede encoding. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-163 | tgt | v1-full | [AARM-69] ABI verification must precede final machine generation. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-164 | tgt | v1-full | [AARM-70] Target backend complexity must not leak into Axiom Core syntax. | 0521 §156 | - | EPIC(E16.1) |
-| REQ-TGT-165 | tgt | v1-full | một Backend Contract + nhiều Target Implementation. | 0521 §158 | - | EPIC(E16.1) |
-| REQ-TGT-166 | tgt | v1-full | [ABACKEND-20] Target backends must implement a common compiler contract. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-167 | tgt | v1-full | [ABACKEND-21] Axiom LIR must not encode ISA-specific physical registers. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-168 | tgt | v1-full | [ABACKEND-22] Axiom LIR must not require an ISA-specific flags register. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-169 | tgt | v1-full | [ABACKEND-23] Axiom LIR must support targets without flags-based comparison. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-170 | tgt | v1-full | [ABACKEND-24] Axiom LIR must support fixed-width and scalable vector targets. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-171 | tgt | v1-full | [ABACKEND-25] Address expressions must remain target-independent before lowering. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-172 | tgt | v1-full | [ABACKEND-26] Calling convention classification is target/ABI specific. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-173 | tgt | v1-full | [ABACKEND-27] Aggregate ABI classification is never a Core type-system rule. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-174 | tgt | v1-full | [ABACKEND-28] Target features are explicit data. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-175 | tgt | v1-full | [ABACKEND-29] Unavailable instructions must never be emitted. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-176 | tgt | v1-full | [ABACKEND-30] Unsupported operations require legal expansion or explicit rejection. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-177 | tgt | v1-full | [ABACKEND-31] Machine verification precedes encoding. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-178 | tgt | v1-full | [ABACKEND-32] Register allocation is semantically transparent. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-179 | tgt | v1-full | [ABACKEND-33] Frame lowering is target/ABI specific. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-180 | tgt | v1-full | [ABACKEND-34] Atomic lowering must preserve Axiom memory semantics. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-181 | tgt | v1-full | [ABACKEND-35] Volatile lowering must preserve observability. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-182 | tgt | v1-full | [ABACKEND-36] TLS lowering is target/platform specific. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-183 | tgt | v1-full | [ABACKEND-37] Relocation semantics remain explicit. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-184 | tgt | v1-full | [ABACKEND-38] Object serialization remains separate from ISA encoding. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-185 | tgt | v1-full | [ABACKEND-39] Debug provenance survives backend lowering where possible. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-186 | tgt | v1-full | [ABACKEND-40] Unwind metadata must correspond to generated frame semantics. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-187 | tgt | v1-full | [ABACKEND-41] Target-specific optimization cannot alter Core semantics. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-188 | tgt | v1-full | [ABACKEND-42] CPU cost models affect code generation decisions only. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-189 | tgt | v1-full | [ABACKEND-43] Compressed instructions are encoding/code-size optimizations. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-190 | tgt | v1-full | [ABACKEND-44] Scalable vectors must not be modeled as fixed-width vectors. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-191 | tgt | v1-full | [ABACKEND-45] Special architectural registers cannot be treated as ordinary allocatable registers. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-192 | tgt | v1-full | [ABACKEND-46] Pseudo instructions must be expanded before final encoding. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-193 | tgt | v1-full | [ABACKEND-47] Relocation-sensitive sequences must remain valid without optional linker relaxation. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-194 | tgt | v1-full | [ABACKEND-48] Custom ISA extensions require explicit target feature contracts. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-195 | tgt | v1-full | [ABACKEND-49] Inline assembly must declare machine-visible effects. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-196 | tgt | v1-full | [ABACKEND-50] Backend failures must be diagnosable rather than silently producing invalid code. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-197 | tgt | v1-full | [ABACKEND-51] All target backends must pass common conformance suites. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-198 | tgt | v1-full | [ABACKEND-52] Semantic correctness is determined independently of assembly golden files. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-199 | tgt | v1-full | [ABACKEND-53] Equivalent Axiom programs must have equivalent observable behavior across targets. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-200 | tgt | v1-full | [ABACKEND-54] Backend caches include TargetId, feature set, ABI and codegen identity. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-201 | tgt | v1-full | [ABACKEND-55] Parallel backend compilation must preserve deterministic semantics. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-202 | tgt | v1-full | [ABACKEND-56] Backend implementation complexity must not leak into Core syntax. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-203 | tgt | v1-full | [ABACKEND-57] Adding a new ISA must not require changing Core semantics merely to accommodate its register architecture. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-204 | tgt | v1-full | [ABACKEND-58] Adding a new ABI must not require changing the language type system. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-205 | tgt | v1-full | [ABACKEND-59] Adding a new object format must not require changing frontend semantics. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-206 | tgt | v1-full | [ABACKEND-60] The TargetBackend Contract is the portability boundary of the native compiler. | 0522 §159 | - | EPIC(E16.1) |
-| REQ-TGT-207 | tgt | v1-full | Axiom LIR có thực sự độc lập với cả register machine lẫn stack machine hay không? | 0522 BOOTSTRAP-264 — WASM BACKEND + TARGET CLASSIFICATION | - | EPIC(E16.1) |
-| REQ-TGT-208 | tgt | v1-full | portable virtual machine target với module/linking/runtime contract riêng. | 0523 §1 | - | EPIC(E16.1) |
-| REQ-TGT-209 | tgt | v1-full | [AWASM-20] WASM is a target family, not a Core semantic model. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-210 | tgt | v1-full | [AWASM-21] Axiom LIR must remain independent of WASM operand-stack representation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-211 | tgt | v1-full | [AWASM-22] WASM stackification occurs only after semantic optimization. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-212 | tgt | v1-full | [AWASM-23] WASM locals are backend representation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-213 | tgt | v1-full | [AWASM-24] Linear-memory offsets are not automatically Axiom pointers. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-214 | tgt | v1-full | [AWASM-25] Integer-to-pointer conversion does not establish Axiom provenance. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-215 | tgt | v1-full | [AWASM-26] WASM memory is an explicit storage domain. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-216 | tgt | v1-full | [AWASM-27] WASM32 and WASM64 differ in physical address width, not Core pointer semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-217 | tgt | v1-full | [AWASM-28] Axiom ownership and capability rules remain active on WASM. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-218 | tgt | v1-full | [AWASM-29] view and mut_view preserve their semantic capabilities after lowering. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-219 | tgt | v1-full | [AWASM-30] WASM memory growth must respect storage invalidation contracts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-220 | tgt | v1-full | [AWASM-31] Address observability constrains storage elimination and relocation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-221 | tgt | v1-full | [AWASM-32] Bounds-check elimination requires Axiom-level proof. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-222 | tgt | v1-full | [AWASM-33] WASM traps do not replace Axiom semantic verification. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-223 | tgt | v1-full | [AWASM-34] Atomic operations must preserve Axiom memory ordering. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-224 | tgt | v1-full | [AWASM-35] Shared memory does not imply Axiom Share. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-225 | tgt | v1-full | [AWASM-36] WASM threads do not alter Send semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-226 | tgt | v1-full | [AWASM-37] WASI is a platform contract, not Core. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-227 | tgt | v1-full | [AWASM-38] Browser host APIs are explicit FFI/capability boundaries. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-228 | tgt | v1-full | [AWASM-39] Host imports carry appropriate effect/resource contracts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-229 | tgt | v1-full | [AWASM-40] Imported memory is not implicitly Axiom-owned memory. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-230 | tgt | v1-full | [AWASM-41] Imported resources require explicit lifetime/ownership contracts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-231 | tgt | v1-full | [AWASM-42] Function references do not imply Axiom object headers. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-232 | tgt | v1-full | [AWASM-43] call_indirect is an explicit dynamic dispatch representation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-233 | tgt | v1-full | [AWASM-44] Static dispatch must not silently become dynamic dispatch. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-234 | tgt | v1-full | [AWASM-45] Closure environments need no mandatory heap allocation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-235 | tgt | v1-full | [AWASM-46] Async remains a Future state machine on WASM. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-236 | tgt | v1-full | [AWASM-47] Axiom does not require WASM GC. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-237 | tgt | v1-full | [AWASM-48] WASM reference types are platform/FFI representations, not universal Core references. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-238 | tgt | v1-full | [AWASM-49] WASM SIMD does not redefine Axiom vector semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-239 | tgt | v1-full | [AWASM-50] WASM scalable-vector absence must not contaminate Core. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-240 | tgt | v1-full | [AWASM-51] Aggregate ABI classification is target-specific. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-241 | tgt | v1-full | [AWASM-52] sret is an ABI lowering mechanism, not a source-level feature. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-242 | tgt | v1-full | [AWASM-53] WASM variadic limitations must remain in ABI/FFI layers. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-243 | tgt | v1-full | [AWASM-54] WASM exception facilities do not introduce Axiom exceptions. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-244 | tgt | v1-full | [AWASM-55] Panic implementation may use WASM trap/host runtime according to profile. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-245 | tgt | v1-full | [AWASM-56] WASM module exports are linker roots. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-246 | tgt | v1-full | [AWASM-57] WASM imports are explicit external dependencies. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-247 | tgt | v1-full | [AWASM-58] Unused runtime components must not be linked. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-248 | tgt | v1-full | [AWASM-59] WASM custom metadata must remain removable when not requested. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-249 | tgt | v1-full | [AWASM-60] WASM output must be deterministic under reproducible build mode. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-250 | tgt | v1-full | [AWASM-61] WASM feature sets are explicit target facts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-251 | tgt | v1-full | [AWASM-62] Unavailable WASM features must cause compile-time rejection or legal fallback. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-252 | tgt | v1-full | [AWASM-63] WASM validation precedes binary emission. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-253 | tgt | v1-full | [AWASM-64] The compiler must not rely on external validation to guarantee internal correctness. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-254 | tgt | v1-full | [AWASM-65] Structured control flow is a backend representation. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-255 | tgt | v1-full | [AWASM-66] Axiom MIR may retain arbitrary CFG structure. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-256 | tgt | v1-full | [AWASM-67] CFG structuring must preserve observable semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-257 | tgt | v1-full | [AWASM-68] Irreducible CFGs require explicit backend legalization. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-258 | tgt | v1-full | [AWASM-69] Stackification must preserve SSA value semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-259 | tgt | v1-full | [AWASM-70] Local allocation must preserve value liveness. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-260 | tgt | v1-full | [AWASM-71] WASM memory ordering remains distinct from host synchronization contracts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-261 | tgt | v1-full | [AWASM-72] WASI/host capabilities never appear implicitly. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-262 | tgt | v1-full | [AWASM-73] Axiom FFI safety rules apply to WASM imports and exports. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-263 | tgt | v1-full | [AWASM-74] Debug source provenance should survive WASM lowering. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-264 | tgt | v1-full | [AWASM-75] WASM code generation is semantically equivalent to reference execution. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-265 | tgt | v1-full | [AWASM-76] WASM target-specific optimization cannot alter Core semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-266 | tgt | v1-full | [AWASM-77] WASM backend caches include target/features/ABI/profile identity. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-267 | tgt | v1-full | [AWASM-78] WASM binary stripping must respect exports, reflection and FFI roots. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-268 | tgt | v1-full | [AWASM-79] Component Model integration is an ABI/platform layer. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-269 | tgt | v1-full | [AWASM-80] WIT mappings must not redefine Axiom types. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-270 | tgt | v1-full | [AWASM-81] Host callbacks must preserve resource/lifetime contracts. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-271 | tgt | v1-full | [AWASM-82] WASM memory addresses exposed externally become observable state. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-272 | tgt | v1-full | [AWASM-83] Linear-memory numeric identity is distinct from logical identity. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-273 | tgt | v1-full | [AWASM-84] Handle values remain logical identities, not memory capabilities. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-274 | tgt | v1-full | [AWASM-85] WASM backend must pass common TargetBackend conformance tests. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-275 | tgt | v1-full | [AWASM-86] Native and WASM implementations must agree on observable semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-276 | tgt | v1-full | [AWASM-87] Differences in physical representation are not semantic differences. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-277 | tgt | v1-full | [AWASM-88] No WASM-specific syntax is required in Core v1. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-278 | tgt | v1-full | [AWASM-89] Adding WASM features must not require changing ownership semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-279 | tgt | v1-full | [AWASM-90] Adding WASM features must not require changing trait semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-280 | tgt | v1-full | [AWASM-91] Adding WASM features must not require changing async semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-281 | tgt | v1-full | [AWASM-92] Adding WASM features must not require changing numeric semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-282 | tgt | v1-full | [AWASM-93] Adding WASM features must not require changing FFI safety semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-283 | tgt | v1-full | [AWASM-94] The WASM backend must remain replaceable without changing frontend semantics. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-284 | tgt | v1-full | [AWASM-95] WASM is a validation target for the portability of Axiom LIR. | 0523 §155 | - | EPIC(E16.1) |
-| REQ-TGT-285 | tgt | v1-full | Backend được tự do chọn instruction sequence, nhưng không được tự do chọn semantics. | 0524 BOOTSTRAP-265 — AXIOM TARGET-INDEPENDENT MACHINE SEMANTICS + BACKEND CONFORMANCE FORMALIZATION | - | EPIC(E16.1) |
-| REQ-TGT-286 | tgt | v1-full | [ABACKEND-61] For every Verified Axiom LIR program P and supported target T, the generated target program must preserve all observable Axiom semantics defined for the selected target profile. | 0524 §111; 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-287 | tgt | v1-full | [ABACKEND-62] Target lowering must preserve LIR observable behavior. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-288 | tgt | v1-full | [ABACKEND-63] Instruction selection cannot redefine Axiom semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-289 | tgt | v1-full | [ABACKEND-64] Legalization may expand operations only when semantics are preserved. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-290 | tgt | v1-full | [ABACKEND-65] Unsupported operations must be rejected or legally expanded. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-291 | tgt | v1-full | [ABACKEND-66] Unsupported atomics must never silently become ordinary memory operations. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-292 | tgt | v1-full | [ABACKEND-67] Volatile semantics must be preserved through all backend stages. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-293 | tgt | v1-full | [ABACKEND-68] Memory ordering must be preserved through all backend stages. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-294 | tgt | v1-full | [ABACKEND-69] Trap behavior must be explicitly modeled. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-295 | tgt | v1-full | [ABACKEND-70] A target trap must not silently replace an Axiom panic semantic. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-296 | tgt | v1-full | [ABACKEND-71] ABI lowering cannot alter source-level type semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-297 | tgt | v1-full | [ABACKEND-72] Aggregate ABI classification is target-specific. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-298 | tgt | v1-full | [ABACKEND-73] Register allocation must be semantically transparent. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-299 | tgt | v1-full | [ABACKEND-74] Spilling must preserve ownership and memory semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-300 | tgt | v1-full | [ABACKEND-75] Frame lowering must preserve calling and unwinding semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-301 | tgt | v1-full | [ABACKEND-76] Address lowering must preserve provenance and access semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-302 | tgt | v1-full | [ABACKEND-77] Target addressing modes are implementation details. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-303 | tgt | v1-full | [ABACKEND-78] Control-flow lowering must preserve semantic CFG behavior. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-304 | tgt | v1-full | [ABACKEND-79] WASM structured control flow is backend representation only. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-305 | tgt | v1-full | [ABACKEND-80] Machine instruction sequences must declare their machine-visible effects. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-306 | tgt | v1-full | [ABACKEND-81] Machine verification must precede encoding. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-307 | tgt | v1-full | [ABACKEND-82] Object verification must follow encoding. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-308 | tgt | v1-full | [ABACKEND-83] Linking must preserve symbol and relocation semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-309 | tgt | v1-full | [ABACKEND-84] Target feature use must be explicitly declared. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-310 | tgt | v1-full | [ABACKEND-85] Unavailable target features cannot be emitted. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-311 | tgt | v1-full | [ABACKEND-86] Target-specific optimizations cannot weaken safety guarantees. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-312 | tgt | v1-full | [ABACKEND-87] Target-specific optimizations cannot alter observable behavior. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-313 | tgt | v1-full | [ABACKEND-88] Different physical layouts may represent the same semantic type. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-314 | tgt | v1-full | [ABACKEND-89] Different instruction sequences may represent the same LIR semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-315 | tgt | v1-full | [ABACKEND-90] Assembly golden tests are not the semantic authority. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-316 | tgt | v1-full | [ABACKEND-91] Reference and differential execution are semantic validation mechanisms. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-317 | tgt | v1-full | [ABACKEND-92] Backend conformance tests are target-independent at the semantic level. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-318 | tgt | v1-full | [ABACKEND-93] All supported targets must pass common semantic conformance tests. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-319 | tgt | v1-full | [ABACKEND-94] Backend cache identity includes target and code-generation facts. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-320 | tgt | v1-full | [ABACKEND-95] Reproducible backend compilation is deterministic. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-321 | tgt | v1-full | [ABACKEND-96] Backend diagnostics must identify unsupported target requirements. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-322 | tgt | v1-full | [ABACKEND-97] Backend implementation details must not leak into Core syntax. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-323 | tgt | v1-full | [ABACKEND-98] Adding a target must not require changing existing Core semantics. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-324 | tgt | v1-full | [ABACKEND-99] Axiom LIR is the semantic portability boundary of the native compiler. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-325 | tgt | v1-full | [ABACKEND-100] No target backend is permitted to become a second semantic compiler. | 0524 §112 | - | EPIC(E16.1) |
-| REQ-TGT-326 | tgt | v1-full | Frontend quyết định chương trình có nghĩa gì. Backend chỉ quyết định thực hiện nghĩa đó bằng phần cứng/VM nào. | 0524 §113 | - | EPIC(E16.1) |
+| REQ-TGT-111 | tgt | v1-full | Axiom LIR phải target-independent; x86-64 chỉ là backend đầu tiên thực hiện Target Lowering + Instruction Selection + Register Allocation + Encoding. | 0520 BOOTSTRAP-261 — AXIOM x86-64 BACKEND V1 | - | T652 |
+| REQ-TGT-112 | tgt | v1-full | Linear scan cho debug/fast compilation + graph coloring hoặc PBQP-like allocator cho optimized release. | 0520 §13 | - | T652 |
+| REQ-TGT-113 | tgt | v1-full | Mỗi tầng chịu trách nhiệm chứng minh một loại invariant riêng. | 0521 §155 | - | T661 |
+| REQ-TGT-114 | tgt | v1-full | [AARM-20] ARM64 is a backend target and is not part of Axiom Core semantics. | 0521 §156 | - | T661, T693 |
+| REQ-TGT-115 | tgt | v1-full | [AARM-21] Axiom LIR must not contain x86-specific concepts. | 0521 §156 | - | T661 |
+| REQ-TGT-116 | tgt | v1-full | [AARM-22] TargetBackend provides target-specific lowering behind a stable compiler contract. | 0521 §156 | - | T661 |
+| REQ-TGT-117 | tgt | v1-full | [AARM-23] AArch64 register classes are isolated from frontend semantics. | 0521 §156 | - | T661 |
+| REQ-TGT-118 | tgt | v1-full | [AARM-24] X/W register aliasing must be modeled correctly. | 0521 §156 | - | T661 |
+| REQ-TGT-119 | tgt | v1-full | [AARM-25] SP is not an ordinary allocatable GPR. | 0521 §156 | - | T661 |
+| REQ-TGT-120 | tgt | v1-full | [AARM-26] XZR/WZR are explicit architectural zero registers. | 0521 §156 | - | T661 |
+| REQ-TGT-121 | tgt | v1-full | [AARM-27] NZCV dependencies must be modeled. | 0521 §156 | - | T661 |
+| REQ-TGT-122 | tgt | v1-full | [AARM-28] Register allocation cannot alter semantic behavior. | 0521 §156 | - | T661 |
+| REQ-TGT-123 | tgt | v1-full | [AARM-29] AAPCS64 classification is an ABI concern. | 0521 §156 | - | T662 |
+| REQ-TGT-124 | tgt | v1-full | [AARM-30] Windows ARM64 and other platform ABIs may differ. | 0521 §156 | - | T693, T694, T695, T696 |
+| REQ-TGT-125 | tgt | v1-full | [AARM-31] Aggregate arguments use ABI classification. | 0521 §156 | - | T662, T694 |
+| REQ-TGT-126 | tgt | v1-full | [AARM-32] sret is ABI-generated and invisible to source semantics. | 0521 §156 | - | T662 |
+| REQ-TGT-127 | tgt | v1-full | [AARM-33] Caller/callee save rules are ABI-specific. | 0521 §156 | - | T662, T693 |
+| REQ-TGT-128 | tgt | v1-full | [AARM-34] LR is modeled as an architectural call/return resource. | 0521 §156 | - | T662 |
+| REQ-TGT-129 | tgt | v1-full | [AARM-35] Frame layout is target/ABI controlled. | 0521 §156 | - | T662, T693 |
+| REQ-TGT-130 | tgt | v1-full | [AARM-36] ARM64 has no x86 red-zone assumption. | 0521 §156 | - | T662, T694 |
+| REQ-TGT-131 | tgt | v1-full | [AARM-37] Stack alignment is enforced at ABI boundaries. | 0521 §156 | - | T662, T694 |
+| REQ-TGT-132 | tgt | v1-full | [AARM-38] Address calculations are represented semantically before target lowering. | 0521 §156 | - | T662 |
+| REQ-TGT-133 | tgt | v1-full | [AARM-39] ARM64 load/store addressing is target-specific. | 0521 §156 | - | T662 |
+| REQ-TGT-134 | tgt | v1-full | [AARM-40] ARM64 PC-relative addressing is backend/linker behavior. | 0521 §156 | - | T663 |
+| REQ-TGT-135 | tgt | v1-full | [AARM-41] SIMD semantics are independent of V-register naming. | 0521 §156 | - | T662 |
+| REQ-TGT-136 | tgt | v1-full | [AARM-42] NEON/SVE/SME are target capabilities, not Core language concepts. | 0521 §156 | - | T662 |
+| REQ-TGT-137 | tgt | v1-full | [AARM-43] FP instruction selection must preserve Axiom FP semantics. | 0521 §156 | - | T662 |
+| REQ-TGT-138 | tgt | v1-full | [AARM-44] FMA is selected only when semantically legal. | 0521 §156 | - | T662 |
+| REQ-TGT-139 | tgt | v1-full | [AARM-45] Conditional execution optimizations must preserve observable behavior. | 0521 §156 | - | T662 |
+| REQ-TGT-140 | tgt | v1-full | [AARM-46] Atomic lowering must preserve Axiom memory ordering. | 0521 §156 | - | T662 |
+| REQ-TGT-141 | tgt | v1-full | [AARM-47] LSE is optional and feature-controlled. | 0521 §156 | - | T662 |
+| REQ-TGT-142 | tgt | v1-full | [AARM-48] Without LSE, atomic operations may be expanded to LL/SC sequences. | 0521 §156 | - | T662 |
+| REQ-TGT-143 | tgt | v1-full | [AARM-49] Volatile operations remain observable. | 0521 §156 | - | T662 |
+| REQ-TGT-144 | tgt | v1-full | [AARM-50] Device/MMIO operations preserve required ordering contracts. | 0521 §156 | - | T662 |
+| REQ-TGT-145 | tgt | v1-full | [AARM-51] TLS lowering is target/ABI specific. | 0521 §156 | - | T658 |
+| REQ-TGT-146 | tgt | v1-full | [AARM-52] PIC/GOT/PLT behavior is target/linker specific. | 0521 §156 | - | T658, T687 |
+| REQ-TGT-147 | tgt | v1-full | [AARM-53] Pointer authentication is system/ABI functionality, not Core semantics. | 0521 §156 | - | T665 |
+| REQ-TGT-148 | tgt | v1-full | [AARM-54] Instruction encoding occurs only after machine verification. | 0521 §156 | - | T663 |
+| REQ-TGT-149 | tgt | v1-full | [AARM-55] Relocations are emitted explicitly. | 0521 §156 | - | T663, T694 |
+| REQ-TGT-150 | tgt | v1-full | [AARM-56] Branch range limitations may require backend or linker relaxation. | 0521 §156 | - | T663 |
+| REQ-TGT-151 | tgt | v1-full | [AARM-57] Object serialization is separated from instruction encoding. | 0521 §156 | - | T663, T686, T695 |
+| REQ-TGT-152 | tgt | v1-full | [AARM-58] Debug/unwind metadata is generated according to target ABI. | 0521 §156 | - | T663, T695 |
+| REQ-TGT-153 | tgt | v1-full | [AARM-59] Backend code generation must be deterministic in reproducible mode. | 0521 §156 | - | T663, T690 |
+| REQ-TGT-154 | tgt | v1-full | [AARM-60] Backend caches include target and codegen identity. | 0521 §156 | - | T663, T691 |
+| REQ-TGT-155 | tgt | v1-full | [AARM-61] Semantic tests are independent of machine instruction sequences. | 0521 §156 | - | T664 |
+| REQ-TGT-156 | tgt | v1-full | [AARM-62] Assembly golden tests are implementation tests, not semantic authority. | 0521 §156 | - | T664 |
+| REQ-TGT-157 | tgt | v1-full | [AARM-63] x86-64 and ARM64 must produce equivalent observable behavior for equivalent targets. | 0521 §156 | - | T664, T696 |
+| REQ-TGT-158 | tgt | v1-full | [AARM-64] Target-independent optimization must not depend on ARM64-specific instructions. | 0521 §156 | - | T664 |
+| REQ-TGT-159 | tgt | v1-full | [AARM-65] Target-dependent optimization begins only after target lowering. | 0521 §156 | - | T664 |
+| REQ-TGT-160 | tgt | v1-full | [AARM-66] Unsupported operations require legal expansion or explicit rejection. | 0521 §156 | - | T664 |
+| REQ-TGT-161 | tgt | v1-full | [AARM-67] Target features must never be silently assumed. | 0521 §156 | - | T664 |
+| REQ-TGT-162 | tgt | v1-full | [AARM-68] Machine verification must precede encoding. | 0521 §156 | - | T664 |
+| REQ-TGT-163 | tgt | v1-full | [AARM-69] ABI verification must precede final machine generation. | 0521 §156 | - | T664 |
+| REQ-TGT-164 | tgt | v1-full | [AARM-70] Target backend complexity must not leak into Axiom Core syntax. | 0521 §156 | - | T664 |
+| REQ-TGT-165 | tgt | v1-full | một Backend Contract + nhiều Target Implementation. | 0521 §158 | - | T664 |
+| REQ-TGT-166 | tgt | v1-full | [ABACKEND-20] Target backends must implement a common compiler contract. | 0522 §159 | - | T677 |
+| REQ-TGT-167 | tgt | v1-full | [ABACKEND-21] Axiom LIR must not encode ISA-specific physical registers. | 0522 §159 | - | T677 |
+| REQ-TGT-168 | tgt | v1-full | [ABACKEND-22] Axiom LIR must not require an ISA-specific flags register. | 0522 §159 | - | T677 |
+| REQ-TGT-169 | tgt | v1-full | [ABACKEND-23] Axiom LIR must support targets without flags-based comparison. | 0522 §159 | - | T677 |
+| REQ-TGT-170 | tgt | v1-full | [ABACKEND-24] Axiom LIR must support fixed-width and scalable vector targets. | 0522 §159 | - | T677 |
+| REQ-TGT-171 | tgt | v1-full | [ABACKEND-25] Address expressions must remain target-independent before lowering. | 0522 §159 | - | T677 |
+| REQ-TGT-172 | tgt | v1-full | [ABACKEND-26] Calling convention classification is target/ABI specific. | 0522 §159 | - | T677 |
+| REQ-TGT-173 | tgt | v1-full | [ABACKEND-27] Aggregate ABI classification is never a Core type-system rule. | 0522 §159 | - | T677 |
+| REQ-TGT-174 | tgt | v1-full | [ABACKEND-28] Target features are explicit data. | 0522 §159 | - | T677 |
+| REQ-TGT-175 | tgt | v1-full | [ABACKEND-29] Unavailable instructions must never be emitted. | 0522 §159 | - | T677 |
+| REQ-TGT-176 | tgt | v1-full | [ABACKEND-30] Unsupported operations require legal expansion or explicit rejection. | 0522 §159 | - | T678 |
+| REQ-TGT-177 | tgt | v1-full | [ABACKEND-31] Machine verification precedes encoding. | 0522 §159 | - | T678 |
+| REQ-TGT-178 | tgt | v1-full | [ABACKEND-32] Register allocation is semantically transparent. | 0522 §159 | - | T678 |
+| REQ-TGT-179 | tgt | v1-full | [ABACKEND-33] Frame lowering is target/ABI specific. | 0522 §159 | - | T678 |
+| REQ-TGT-180 | tgt | v1-full | [ABACKEND-34] Atomic lowering must preserve Axiom memory semantics. | 0522 §159 | - | T678 |
+| REQ-TGT-181 | tgt | v1-full | [ABACKEND-35] Volatile lowering must preserve observability. | 0522 §159 | - | T678 |
+| REQ-TGT-182 | tgt | v1-full | [ABACKEND-36] TLS lowering is target/platform specific. | 0522 §159 | - | T659 |
+| REQ-TGT-183 | tgt | v1-full | [ABACKEND-37] Relocation semantics remain explicit. | 0522 §159 | - | T659 |
+| REQ-TGT-184 | tgt | v1-full | [ABACKEND-38] Object serialization remains separate from ISA encoding. | 0522 §159 | - | T659, T685, T686 |
+| REQ-TGT-185 | tgt | v1-full | [ABACKEND-39] Debug provenance survives backend lowering where possible. | 0522 §159 | - | T679 |
+| REQ-TGT-186 | tgt | v1-full | [ABACKEND-40] Unwind metadata must correspond to generated frame semantics. | 0522 §159 | - | T679 |
+| REQ-TGT-187 | tgt | v1-full | [ABACKEND-41] Target-specific optimization cannot alter Core semantics. | 0522 §159 | - | T678 |
+| REQ-TGT-188 | tgt | v1-full | [ABACKEND-42] CPU cost models affect code generation decisions only. | 0522 §159 | - | T678 |
+| REQ-TGT-189 | tgt | v1-full | [ABACKEND-43] Compressed instructions are encoding/code-size optimizations. | 0522 §159 | - | T679 |
+| REQ-TGT-190 | tgt | v1-full | [ABACKEND-44] Scalable vectors must not be modeled as fixed-width vectors. | 0522 §159 | - | T678 |
+| REQ-TGT-191 | tgt | v1-full | [ABACKEND-45] Special architectural registers cannot be treated as ordinary allocatable registers. | 0522 §159 | - | T678 |
+| REQ-TGT-192 | tgt | v1-full | [ABACKEND-46] Pseudo instructions must be expanded before final encoding. | 0522 §159 | - | T679 |
+| REQ-TGT-193 | tgt | v1-full | [ABACKEND-47] Relocation-sensitive sequences must remain valid without optional linker relaxation. | 0522 §159 | - | T679 |
+| REQ-TGT-194 | tgt | v1-full | [ABACKEND-48] Custom ISA extensions require explicit target feature contracts. | 0522 §159 | - | T679 |
+| REQ-TGT-195 | tgt | v1-full | [ABACKEND-49] Inline assembly must declare machine-visible effects. | 0522 §159 | - | T679 |
+| REQ-TGT-196 | tgt | v1-full | [ABACKEND-50] Backend failures must be diagnosable rather than silently producing invalid code. | 0522 §159 | - | T679 |
+| REQ-TGT-197 | tgt | v1-full | [ABACKEND-51] All target backends must pass common conformance suites. | 0522 §159 | - | T680, T696 |
+| REQ-TGT-198 | tgt | v1-full | [ABACKEND-52] Semantic correctness is determined independently of assembly golden files. | 0522 §159 | - | T680 |
+| REQ-TGT-199 | tgt | v1-full | [ABACKEND-53] Equivalent Axiom programs must have equivalent observable behavior across targets. | 0522 §159 | - | T680, T692 |
+| REQ-TGT-200 | tgt | v1-full | [ABACKEND-54] Backend caches include TargetId, feature set, ABI and codegen identity. | 0522 §159 | - | T680, T689, T691 |
+| REQ-TGT-201 | tgt | v1-full | [ABACKEND-55] Parallel backend compilation must preserve deterministic semantics. | 0522 §159 | - | T680 |
+| REQ-TGT-202 | tgt | v1-full | [ABACKEND-56] Backend implementation complexity must not leak into Core syntax. | 0522 §159 | - | T680 |
+| REQ-TGT-203 | tgt | v1-full | [ABACKEND-57] Adding a new ISA must not require changing Core semantics merely to accommodate its register architecture. | 0522 §159 | - | T680 |
+| REQ-TGT-204 | tgt | v1-full | [ABACKEND-58] Adding a new ABI must not require changing the language type system. | 0522 §159 | - | T680 |
+| REQ-TGT-205 | tgt | v1-full | [ABACKEND-59] Adding a new object format must not require changing frontend semantics. | 0522 §159 | - | T680 |
+| REQ-TGT-206 | tgt | v1-full | [ABACKEND-60] The TargetBackend Contract is the portability boundary of the native compiler. | 0522 §159 | - | T680 |
+| REQ-TGT-207 | tgt | v1-full | Axiom LIR có thực sự độc lập với cả register machine lẫn stack machine hay không? | 0522 BOOTSTRAP-264 — WASM BACKEND + TARGET CLASSIFICATION | - | T673 |
+| REQ-TGT-208 | tgt | v1-full | portable virtual machine target với module/linking/runtime contract riêng. | 0523 §1 | - | T673 |
+| REQ-TGT-209 | tgt | v1-full | [AWASM-20] WASM is a target family, not a Core semantic model. | 0523 §155 | - | T673 |
+| REQ-TGT-210 | tgt | v1-full | [AWASM-21] Axiom LIR must remain independent of WASM operand-stack representation. | 0523 §155 | - | T673 |
+| REQ-TGT-211 | tgt | v1-full | [AWASM-22] WASM stackification occurs only after semantic optimization. | 0523 §155 | - | T673 |
+| REQ-TGT-212 | tgt | v1-full | [AWASM-23] WASM locals are backend representation. | 0523 §155 | - | T673 |
+| REQ-TGT-213 | tgt | v1-full | [AWASM-24] Linear-memory offsets are not automatically Axiom pointers. | 0523 §155 | - | T673 |
+| REQ-TGT-214 | tgt | v1-full | [AWASM-25] Integer-to-pointer conversion does not establish Axiom provenance. | 0523 §155 | - | T673 |
+| REQ-TGT-215 | tgt | v1-full | [AWASM-26] WASM memory is an explicit storage domain. | 0523 §155 | - | T673 |
+| REQ-TGT-216 | tgt | v1-full | [AWASM-27] WASM32 and WASM64 differ in physical address width, not Core pointer semantics. | 0523 §155 | - | T673 |
+| REQ-TGT-217 | tgt | v1-full | [AWASM-28] Axiom ownership and capability rules remain active on WASM. | 0523 §155 | - | T673 |
+| REQ-TGT-218 | tgt | v1-full | [AWASM-29] view and mut_view preserve their semantic capabilities after lowering. | 0523 §155 | - | T673 |
+| REQ-TGT-219 | tgt | v1-full | [AWASM-30] WASM memory growth must respect storage invalidation contracts. | 0523 §155 | - | T673 |
+| REQ-TGT-220 | tgt | v1-full | [AWASM-31] Address observability constrains storage elimination and relocation. | 0523 §155 | - | T673 |
+| REQ-TGT-221 | tgt | v1-full | [AWASM-32] Bounds-check elimination requires Axiom-level proof. | 0523 §155 | - | T673 |
+| REQ-TGT-222 | tgt | v1-full | [AWASM-33] WASM traps do not replace Axiom semantic verification. | 0523 §155 | - | T673 |
+| REQ-TGT-223 | tgt | v1-full | [AWASM-34] Atomic operations must preserve Axiom memory ordering. | 0523 §155 | - | T673 |
+| REQ-TGT-224 | tgt | v1-full | [AWASM-35] Shared memory does not imply Axiom Share. | 0523 §155 | - | T673 |
+| REQ-TGT-225 | tgt | v1-full | [AWASM-36] WASM threads do not alter Send semantics. | 0523 §155 | - | T673 |
+| REQ-TGT-226 | tgt | v1-full | [AWASM-37] WASI is a platform contract, not Core. | 0523 §155 | - | T675 |
+| REQ-TGT-227 | tgt | v1-full | [AWASM-38] Browser host APIs are explicit FFI/capability boundaries. | 0523 §155 | - | T675 |
+| REQ-TGT-228 | tgt | v1-full | [AWASM-39] Host imports carry appropriate effect/resource contracts. | 0523 §155 | - | T675 |
+| REQ-TGT-229 | tgt | v1-full | [AWASM-40] Imported memory is not implicitly Axiom-owned memory. | 0523 §155 | - | T675 |
+| REQ-TGT-230 | tgt | v1-full | [AWASM-41] Imported resources require explicit lifetime/ownership contracts. | 0523 §155 | - | T671 |
+| REQ-TGT-231 | tgt | v1-full | [AWASM-42] Function references do not imply Axiom object headers. | 0523 §155 | - | T674 |
+| REQ-TGT-232 | tgt | v1-full | [AWASM-43] call_indirect is an explicit dynamic dispatch representation. | 0523 §155 | - | T674 |
+| REQ-TGT-233 | tgt | v1-full | [AWASM-44] Static dispatch must not silently become dynamic dispatch. | 0523 §155 | - | T674 |
+| REQ-TGT-234 | tgt | v1-full | [AWASM-45] Closure environments need no mandatory heap allocation. | 0523 §155 | - | T674 |
+| REQ-TGT-235 | tgt | v1-full | [AWASM-46] Async remains a Future state machine on WASM. | 0523 §155 | - | T674 |
+| REQ-TGT-236 | tgt | v1-full | [AWASM-47] Axiom does not require WASM GC. | 0523 §155 | - | T674 |
+| REQ-TGT-237 | tgt | v1-full | [AWASM-48] WASM reference types are platform/FFI representations, not universal Core references. | 0523 §155 | - | T674 |
+| REQ-TGT-238 | tgt | v1-full | [AWASM-49] WASM SIMD does not redefine Axiom vector semantics. | 0523 §155 | - | T674 |
+| REQ-TGT-239 | tgt | v1-full | [AWASM-50] WASM scalable-vector absence must not contaminate Core. | 0523 §155 | - | T674 |
+| REQ-TGT-240 | tgt | v1-full | [AWASM-51] Aggregate ABI classification is target-specific. | 0523 §155 | - | T674 |
+| REQ-TGT-241 | tgt | v1-full | [AWASM-52] sret is an ABI lowering mechanism, not a source-level feature. | 0523 §155 | - | T674 |
+| REQ-TGT-242 | tgt | v1-full | [AWASM-53] WASM variadic limitations must remain in ABI/FFI layers. | 0523 §155 | - | T674 |
+| REQ-TGT-243 | tgt | v1-full | [AWASM-54] WASM exception facilities do not introduce Axiom exceptions. | 0523 §155 | - | T674 |
+| REQ-TGT-244 | tgt | v1-full | [AWASM-55] Panic implementation may use WASM trap/host runtime according to profile. | 0523 §155 | - | T674 |
+| REQ-TGT-245 | tgt | v1-full | [AWASM-56] WASM module exports are linker roots. | 0523 §155 | - | T675, T687 |
+| REQ-TGT-246 | tgt | v1-full | [AWASM-57] WASM imports are explicit external dependencies. | 0523 §155 | - | T675, T687 |
+| REQ-TGT-247 | tgt | v1-full | [AWASM-58] Unused runtime components must not be linked. | 0523 §155 | - | T675, T686 |
+| REQ-TGT-248 | tgt | v1-full | [AWASM-59] WASM custom metadata must remain removable when not requested. | 0523 §155 | - | T675 |
+| REQ-TGT-249 | tgt | v1-full | [AWASM-60] WASM output must be deterministic under reproducible build mode. | 0523 §155 | - | T675 |
+| REQ-TGT-250 | tgt | v1-full | [AWASM-61] WASM feature sets are explicit target facts. | 0523 §155 | - | T675 |
+| REQ-TGT-251 | tgt | v1-full | [AWASM-62] Unavailable WASM features must cause compile-time rejection or legal fallback. | 0523 §155 | - | T675 |
+| REQ-TGT-252 | tgt | v1-full | [AWASM-63] WASM validation precedes binary emission. | 0523 §155 | - | T675 |
+| REQ-TGT-253 | tgt | v1-full | [AWASM-64] The compiler must not rely on external validation to guarantee internal correctness. | 0523 §155 | - | T675 |
+| REQ-TGT-254 | tgt | v1-full | [AWASM-65] Structured control flow is a backend representation. | 0523 §155 | - | T674 |
+| REQ-TGT-255 | tgt | v1-full | [AWASM-66] Axiom MIR may retain arbitrary CFG structure. | 0523 §155 | - | T674 |
+| REQ-TGT-256 | tgt | v1-full | [AWASM-67] CFG structuring must preserve observable semantics. | 0523 §155 | - | T674 |
+| REQ-TGT-257 | tgt | v1-full | [AWASM-68] Irreducible CFGs require explicit backend legalization. | 0523 §155 | - | T674 |
+| REQ-TGT-258 | tgt | v1-full | [AWASM-69] Stackification must preserve SSA value semantics. | 0523 §155 | - | T674 |
+| REQ-TGT-259 | tgt | v1-full | [AWASM-70] Local allocation must preserve value liveness. | 0523 §155 | - | T674 |
+| REQ-TGT-260 | tgt | v1-full | [AWASM-71] WASM memory ordering remains distinct from host synchronization contracts. | 0523 §155 | - | T675 |
+| REQ-TGT-261 | tgt | v1-full | [AWASM-72] WASI/host capabilities never appear implicitly. | 0523 §155 | - | T675 |
+| REQ-TGT-262 | tgt | v1-full | [AWASM-73] Axiom FFI safety rules apply to WASM imports and exports. | 0523 §155 | - | T675 |
+| REQ-TGT-263 | tgt | v1-full | [AWASM-74] Debug source provenance should survive WASM lowering. | 0523 §155 | - | T675 |
+| REQ-TGT-264 | tgt | v1-full | [AWASM-75] WASM code generation is semantically equivalent to reference execution. | 0523 §155 | - | T676 |
+| REQ-TGT-265 | tgt | v1-full | [AWASM-76] WASM target-specific optimization cannot alter Core semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-266 | tgt | v1-full | [AWASM-77] WASM backend caches include target/features/ABI/profile identity. | 0523 §155 | - | T675 |
+| REQ-TGT-267 | tgt | v1-full | [AWASM-78] WASM binary stripping must respect exports, reflection and FFI roots. | 0523 §155 | - | T675 |
+| REQ-TGT-268 | tgt | v1-full | [AWASM-79] Component Model integration is an ABI/platform layer. | 0523 §155 | - | T675 |
+| REQ-TGT-269 | tgt | v1-full | [AWASM-80] WIT mappings must not redefine Axiom types. | 0523 §155 | - | T675 |
+| REQ-TGT-270 | tgt | v1-full | [AWASM-81] Host callbacks must preserve resource/lifetime contracts. | 0523 §155 | - | T672 |
+| REQ-TGT-271 | tgt | v1-full | [AWASM-82] WASM memory addresses exposed externally become observable state. | 0523 §155 | - | T675 |
+| REQ-TGT-272 | tgt | v1-full | [AWASM-83] Linear-memory numeric identity is distinct from logical identity. | 0523 §155 | - | T672 |
+| REQ-TGT-273 | tgt | v1-full | [AWASM-84] Handle values remain logical identities, not memory capabilities. | 0523 §155 | - | T672 |
+| REQ-TGT-274 | tgt | v1-full | [AWASM-85] WASM backend must pass common TargetBackend conformance tests. | 0523 §155 | - | T676 |
+| REQ-TGT-275 | tgt | v1-full | [AWASM-86] Native and WASM implementations must agree on observable semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-276 | tgt | v1-full | [AWASM-87] Differences in physical representation are not semantic differences. | 0523 §155 | - | T676 |
+| REQ-TGT-277 | tgt | v1-full | [AWASM-88] No WASM-specific syntax is required in Core v1. | 0523 §155 | - | T676 |
+| REQ-TGT-278 | tgt | v1-full | [AWASM-89] Adding WASM features must not require changing ownership semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-279 | tgt | v1-full | [AWASM-90] Adding WASM features must not require changing trait semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-280 | tgt | v1-full | [AWASM-91] Adding WASM features must not require changing async semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-281 | tgt | v1-full | [AWASM-92] Adding WASM features must not require changing numeric semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-282 | tgt | v1-full | [AWASM-93] Adding WASM features must not require changing FFI safety semantics. | 0523 §155 | - | T672 |
+| REQ-TGT-283 | tgt | v1-full | [AWASM-94] The WASM backend must remain replaceable without changing frontend semantics. | 0523 §155 | - | T676 |
+| REQ-TGT-284 | tgt | v1-full | [AWASM-95] WASM is a validation target for the portability of Axiom LIR. | 0523 §155 | - | T676 |
+| REQ-TGT-285 | tgt | v1-full | Backend được tự do chọn instruction sequence, nhưng không được tự do chọn semantics. | 0524 BOOTSTRAP-265 — AXIOM TARGET-INDEPENDENT MACHINE SEMANTICS + BACKEND CONFORMANCE FORMALIZATION | - | T653 |
+| REQ-TGT-286 | tgt | v1-full | [ABACKEND-61] For every Verified Axiom LIR program P and supported target T, the generated target program must preserve all observable Axiom semantics defined for the selected target profile. | 0524 §111; 0524 §112 | - | T653 |
+| REQ-TGT-287 | tgt | v1-full | [ABACKEND-62] Target lowering must preserve LIR observable behavior. | 0524 §112 | - | T656 |
+| REQ-TGT-288 | tgt | v1-full | [ABACKEND-63] Instruction selection cannot redefine Axiom semantics. | 0524 §112 | - | T656 |
+| REQ-TGT-289 | tgt | v1-full | [ABACKEND-64] Legalization may expand operations only when semantics are preserved. | 0524 §112 | - | T656 |
+| REQ-TGT-290 | tgt | v1-full | [ABACKEND-65] Unsupported operations must be rejected or legally expanded. | 0524 §112 | - | T656 |
+| REQ-TGT-291 | tgt | v1-full | [ABACKEND-66] Unsupported atomics must never silently become ordinary memory operations. | 0524 §112 | - | T656 |
+| REQ-TGT-292 | tgt | v1-full | [ABACKEND-67] Volatile semantics must be preserved through all backend stages. | 0524 §112 | - | T656 |
+| REQ-TGT-293 | tgt | v1-full | [ABACKEND-68] Memory ordering must be preserved through all backend stages. | 0524 §112 | - | T656 |
+| REQ-TGT-294 | tgt | v1-full | [ABACKEND-69] Trap behavior must be explicitly modeled. | 0524 §112 | - | T656 |
+| REQ-TGT-295 | tgt | v1-full | [ABACKEND-70] A target trap must not silently replace an Axiom panic semantic. | 0524 §112 | - | T656 |
+| REQ-TGT-296 | tgt | v1-full | [ABACKEND-71] ABI lowering cannot alter source-level type semantics. | 0524 §112 | - | T665 |
+| REQ-TGT-297 | tgt | v1-full | [ABACKEND-72] Aggregate ABI classification is target-specific. | 0524 §112 | - | T665 |
+| REQ-TGT-298 | tgt | v1-full | [ABACKEND-73] Register allocation must be semantically transparent. | 0524 §112 | - | T665 |
+| REQ-TGT-299 | tgt | v1-full | [ABACKEND-74] Spilling must preserve ownership and memory semantics. | 0524 §112 | - | T666 |
+| REQ-TGT-300 | tgt | v1-full | [ABACKEND-75] Frame lowering must preserve calling and unwinding semantics. | 0524 §112 | - | T666 |
+| REQ-TGT-301 | tgt | v1-full | [ABACKEND-76] Address lowering must preserve provenance and access semantics. | 0524 §112 | - | T666 |
+| REQ-TGT-302 | tgt | v1-full | [ABACKEND-77] Target addressing modes are implementation details. | 0524 §112 | - | T666 |
+| REQ-TGT-303 | tgt | v1-full | [ABACKEND-78] Control-flow lowering must preserve semantic CFG behavior. | 0524 §112 | - | T667 |
+| REQ-TGT-304 | tgt | v1-full | [ABACKEND-79] WASM structured control flow is backend representation only. | 0524 §112 | - | T674 |
+| REQ-TGT-305 | tgt | v1-full | [ABACKEND-80] Machine instruction sequences must declare their machine-visible effects. | 0524 §112 | - | T660 |
+| REQ-TGT-306 | tgt | v1-full | [ABACKEND-81] Machine verification must precede encoding. | 0524 §112 | - | T660 |
+| REQ-TGT-307 | tgt | v1-full | [ABACKEND-82] Object verification must follow encoding. | 0524 §112 | - | T659, T685, T688 |
+| REQ-TGT-308 | tgt | v1-full | [ABACKEND-83] Linking must preserve symbol and relocation semantics. | 0524 §112 | - | T659, T685, T687, T688, T695 |
+| REQ-TGT-309 | tgt | v1-full | [ABACKEND-84] Target feature use must be explicitly declared. | 0524 §112 | - | T660 |
+| REQ-TGT-310 | tgt | v1-full | [ABACKEND-85] Unavailable target features cannot be emitted. | 0524 §112 | - | T660 |
+| REQ-TGT-311 | tgt | v1-full | [ABACKEND-86] Target-specific optimizations cannot weaken safety guarantees. | 0524 §112 | - | T667 |
+| REQ-TGT-312 | tgt | v1-full | [ABACKEND-87] Target-specific optimizations cannot alter observable behavior. | 0524 §112 | - | T667 |
+| REQ-TGT-313 | tgt | v1-full | [ABACKEND-88] Different physical layouts may represent the same semantic type. | 0524 §112 | - | T667 |
+| REQ-TGT-314 | tgt | v1-full | [ABACKEND-89] Different instruction sequences may represent the same LIR semantics. | 0524 §112 | - | T668 |
+| REQ-TGT-315 | tgt | v1-full | [ABACKEND-90] Assembly golden tests are not the semantic authority. | 0524 §112 | - | T668 |
+| REQ-TGT-316 | tgt | v1-full | [ABACKEND-91] Reference and differential execution are semantic validation mechanisms. | 0524 §112 | - | T668 |
+| REQ-TGT-317 | tgt | v1-full | [ABACKEND-92] Backend conformance tests are target-independent at the semantic level. | 0524 §112 | - | T668 |
+| REQ-TGT-318 | tgt | v1-full | [ABACKEND-93] All supported targets must pass common semantic conformance tests. | 0524 §112 | - | T684, T688, T692, T696 |
+| REQ-TGT-319 | tgt | v1-full | [ABACKEND-94] Backend cache identity includes target and code-generation facts. | 0524 §112 | - | T682, T691 |
+| REQ-TGT-320 | tgt | v1-full | [ABACKEND-95] Reproducible backend compilation is deterministic. | 0524 §112 | - | T683, T688, T692 |
+| REQ-TGT-321 | tgt | v1-full | [ABACKEND-96] Backend diagnostics must identify unsupported target requirements. | 0524 §112 | - | T682 |
+| REQ-TGT-322 | tgt | v1-full | [ABACKEND-97] Backend implementation details must not leak into Core syntax. | 0524 §112 | - | T682 |
+| REQ-TGT-323 | tgt | v1-full | [ABACKEND-98] Adding a target must not require changing existing Core semantics. | 0524 §112 | - | T682 |
+| REQ-TGT-324 | tgt | v1-full | [ABACKEND-99] Axiom LIR is the semantic portability boundary of the native compiler. | 0524 §112 | - | T683 |
+| REQ-TGT-325 | tgt | v1-full | [ABACKEND-100] No target backend is permitted to become a second semantic compiler. | 0524 §112 | - | T683 |
+| REQ-TGT-326 | tgt | v1-full | Frontend quyết định chương trình có nghĩa gì. Backend chỉ quyết định thực hiện nghĩa đó bằng phần cứng/VM nào. | 0524 §113 | - | T684 |
 | REQ-DBG-033 | dbg | v1-core | Debug information mô tả mối quan hệ giữa semantic program và physical machine state; nó không định nghĩa semantics của chương trình. | 0525 BOOTSTRAP-266 — AXIOM DEBUG INFO, UNWINDING, STACK TRACE & SOURCE-TO-MACHINE PROVENANCE | - | T113 | 
 | REQ-DBG-034 | dbg | v1-core | Khi source-level state không còn tồn tại trong machine program, debugger phải nói “optimized out”, không được dựng lại một giá trị giả. | 0525 §136 | - | T113 | 
 | REQ-DBG-035 | dbg | v1-core | [ADEBUG-20] Debug information does not define Axiom program semantics. | 0525 §188 | - | T113 | 

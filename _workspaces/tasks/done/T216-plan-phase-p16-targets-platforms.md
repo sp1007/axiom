@@ -8,12 +8,12 @@ model: opus
 gate_model: sonnet
 depends: [T087]
 priority: 20
-status: doing
+status: done
 attempts: 1
 paths: [_workspaces/tasks/todo, spec/requirements/CATALOG.md, spec/ROADMAP.md]
 spec: [spec/ROADMAP.md, spec/requirements/CATALOG.md]
 started: 2026-11-03 08:26:19
-agent: T216-impl
+finished: 2026-11-03 09:14:58
 ---
 # T216 — Plan phase P16: Targets & platforms
 
@@ -44,3 +44,4 @@ the roadmap is invented.
 
 ## Log
 - 2026-11-03 08:26:19 started (attempt 1) T216-impl
+- 2026-11-03 09:14:58 accepted by QA -> done
