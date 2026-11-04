@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T628]
 priority: 92
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p15/e15_8_regalloc_isel]
 spec: [spec/SPEC-77-regalloc-machine-opt.md, 0182, 0235, 0237, 0252, tasks/0553, tasks/0557, tasks/0559]
 covers: [REQ-OPT-371, REQ-OPT-372]
+started: 2026-11-04 22:10:05
+finished: 2026-11-04 23:49:59
 ---
 # T629 — E15.8 — Register allocation, instruction selection & post-RA machine optimization conformance suite
 
@@ -40,3 +42,5 @@ Certify E15.8 exit criteria with an end-to-end differential and machine-verifier
 
 ## Log
 - 2026-11-03 02:44:30 created by T215 (P15 phase planning)
+- 2026-11-04 22:10:05 started (attempt 1) T629-impl
+- 2026-11-04 23:49:59 accepted by QA -> done
