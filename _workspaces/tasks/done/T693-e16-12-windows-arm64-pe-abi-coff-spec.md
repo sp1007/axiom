@@ -7,7 +7,7 @@ reviewer: axiom-qa
 model: opus
 gate_model: sonnet
 priority: 136
-status: doing
+status: done
 attempts: 1
 depends: [T216, T511, T661, T772]
 paths: [spec/SPEC-91-windows-arm64.md]
@@ -15,7 +15,7 @@ locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-83-aarch64-linux.md, 0181, 0185, 0186, 0187, 0193, tasks/0453, tasks/0521]
 covers: [REQ-TGT-114, REQ-TGT-124, REQ-TGT-127, REQ-TGT-129]
 started: 2026-11-04 08:11:54
-agent: T693-impl
+finished: 2026-11-04 09:44:19
 ---
 # T693 — E16.12 — Windows ARM64 (aarch64-pc-windows-msvc) PE/COFF & ABI specification (SPEC-91)
 
@@ -48,3 +48,4 @@ Author `spec/SPEC-91-windows-arm64.md` — the normative specification for Axiom
 ## Log
 - 2026-11-03 08:50:00 created by T216 (P16 phase planning)
 - 2026-11-04 08:11:54 started (attempt 1) T693-impl
+- 2026-11-04 09:44:19 accepted by QA -> done
