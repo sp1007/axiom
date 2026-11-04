@@ -7,13 +7,15 @@ reviewer: axiom-qa
 model: opus
 gate_model: sonnet
 priority: 132
-status: todo
-attempts: 0
+status: done
+attempts: 1
 depends: [T216, T511, T665, T685]
 paths: [spec/SPEC-90-universal-multiarch-artifacts.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-84-macos-aarch64-macho.md, spec/SPEC-89-artifact-library-matrix.md, 0196, tasks/0453, tasks/0587]
 covers: [REQ-TGT-001, REQ-TGT-104, REQ-TGT-105, REQ-TGT-200]
+started: 2026-11-04 06:53:50
+finished: 2026-11-04 08:11:31
 ---
 # T689 — E16.11 — Universal / multi-arch artifacts specification (SPEC-90)
 
@@ -45,3 +47,5 @@ Author `spec/SPEC-90-universal-multiarch-artifacts.md` — the normative specifi
 
 ## Log
 - 2026-11-03 08:50:00 created by T216 (P16 phase planning)
+- 2026-11-04 06:53:50 started (attempt 1) T689-impl
+- 2026-11-04 08:11:31 accepted by QA -> done
