@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T603]
 priority: 97
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p15/e15_1_optir_ssa]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, 0165, tasks/0366, tasks/0398, tasks/0399, tasks/0423]
 covers: [REQ-OPT-037, REQ-OPT-038, REQ-OPT-039, REQ-OPT-040, REQ-OPT-041, REQ-OPT-343]
+started: 2026-11-04 17:00:03
+finished: 2026-11-04 20:15:42
 ---
 # T604 — E15.1 — OptIR SSA/MemorySSA, pass-contract verifier & scalar optimization conformance suite
 
@@ -40,3 +42,5 @@ Certify E15.1 exit criteria with an end-to-end differential conformance suite co
 
 ## Log
 - 2026-11-03 02:38:00 created by T215 (P15 phase planning)
+- 2026-11-04 17:00:03 started (attempt 1) T604-impl
+- 2026-11-04 20:15:42 accepted by QA -> done
