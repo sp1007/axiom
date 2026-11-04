@@ -11,6 +11,7 @@ priority: 701
 status: todo
 attempts: 0
 paths: [compiler/link, tests/link/dll]
+locks: [compiler/obj, compiler/driver, compiler/diag/code.ax, tests/selfhost/link, tests/selfhost/obj, tests/selfhost/driver, tests/selfhost/obj_link_driver, tests/selfhost/diag]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, 0186, 0187, tasks/0563, 0104, spec/decisions/ADR-0001-fixed-address-declarations.md, spec/decisions/ADR-0034-oracle-independence-audit.md]
 covers: [REQ-OWNER-006, REQ-LNK-073, REQ-LNK-074, REQ-LNK-075, REQ-LNK-076, REQ-LNK-077, REQ-LNK-078, REQ-LNK-079, REQ-LNK-080, REQ-LNK-081, REQ-LNK-082, REQ-LNK-083, REQ-LNK-084, REQ-LNK-085, REQ-LNK-086, REQ-LNK-087, REQ-LNK-088, REQ-LNK-089, REQ-LNK-090, REQ-LNK-091, REQ-LNK-092, REQ-LNK-093, REQ-LNK-094, REQ-LNK-095, REQ-LNK-096, REQ-LNK-097, REQ-LNK-098, REQ-LNK-099, REQ-LNK-100, REQ-LNK-101, REQ-LNK-102, REQ-LNK-103, REQ-LNK-104, REQ-LNK-105, REQ-LNK-106, REQ-LNK-107, REQ-LNK-108, REQ-LNK-109, REQ-LNK-110, REQ-LNK-111, REQ-LNK-112]
 ---

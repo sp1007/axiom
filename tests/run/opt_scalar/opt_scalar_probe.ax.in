@@ -1,0 +1,1019 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.SymbolId
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.mir.mir.MIR_BINOP_WRAPPING_ADD
+use compiler.verify.verify_parse_mir
+use compiler.opt.opt_init_minimal_thir
+use compiler.opt.opt_free_minimal_thir
+use compiler.opt.optir.ANALYSIS_MEMORY_SSA
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ALLOCATES
+use compiler.opt.optir.EFFECT_READS_MEM
+use compiler.opt.optir.EFFECT_WRITES_MEM
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BINOP
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_CONST
+use compiler.opt.optir.OPT_INST_COPY
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_NOP
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_WRAPPING_BINOP
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_TERM_ASSERT
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_GOTO
+use compiler.opt.optir.OPT_TERM_UNREACHABLE
+use compiler.opt.optir.OPT_VALUE_NONE
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_DEAD_STORE
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_range_at
+use compiler.opt.optir.opt_val_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_construct_memssa
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.effect_call_table_init
+use compiler.opt.effects.effect_call_table_register
+use compiler.opt.effects.effect_summary_empty
+use compiler.opt.effects.effect_summary_from_flags
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_BALANCED_O1
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SPEED_O2
+use compiler.opt.passmgr.PASS_DCE
+use compiler.opt.passmgr.PASS_GVN_CSE
+use compiler.opt.passmgr.PASS_INST_COMBINE
+use compiler.opt.passmgr.PASS_SCCP
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_get_pass_rollback_count
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_verify_postconditions
+use compiler.opt.scalar.INTRINSIC_SEM_ATOMIC
+use compiler.opt.scalar.INTRINSIC_SEM_BLACK_BOX
+use compiler.opt.scalar.INTRINSIC_SEM_EXPLICIT_CLONE_OR_IMPURE
+use compiler.opt.scalar.INTRINSIC_SEM_PURE_CALL
+use compiler.opt.scalar.INTRINSIC_SEM_VOLATILE_LOAD
+use compiler.opt.scalar.INTRINSIC_SEM_VOLATILE_STORE
+use compiler.opt.scalar.INTRINSIC_SEM_WRAPPING_ARITH
+use compiler.opt.scalar.INTRINSIC_SEM_ZEROIZE
+use compiler.opt.scalar.ScalarOptStats
+use compiler.opt.scalar.scalar_classify_call_intrinsic
+use compiler.opt.scalar.scalar_classify_inst_intrinsic
+use compiler.opt.scalar.scalar_optimize_mir_body
+use compiler.opt.scalar.scalar_run_inst_combine
+use compiler.opt.scalar.scalar_run_pass
+use compiler.opt.scalar.scalar_run_pipeline
+use compiler.opt.scalar.scalar_stats_zero
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+@PROBE_MIR_FN@
+
+fn probe_mir_blob(arena: mut_view<Arena>, idx: usize) -> StrView {
+    let s: str = probe_mir_raw(idx);
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(dst + i) = bytes[i];
+        }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + n) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn verify_sccp_and_intrinsics(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let in0 = probe_mir_blob(mut_view(*arena), 0);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m0 = verify_parse_mir(in0, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m0 as usize) == 0 {
+        return 11;
+    }
+    let o0 = optir_build_from_mir(unsafe { view(*m0) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o0 as usize) == 0 || sink.errors != 0 {
+        return 12;
+    }
+
+    let bb0 = unsafe { opt_block_at((*o0).blocks, 0) };
+    let inst_bb = unsafe { opt_inst_at((*bb0).insts, 3) };
+    unsafe {
+        (*inst_bb).opcode = OPT_INST_BLACK_BOX;
+        (*inst_bb).flags = (*inst_bb).flags | OPT_FLAG_BARRIER;
+    }
+    optir_construct_memssa(unsafe { mut_view(*o0) }, mut_view(*arena));
+    if scalar_classify_inst_intrinsic(unsafe { view(*inst_bb) }) != INTRINSIC_SEM_BLACK_BOX {
+        return 13;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget_o2 = opt_budget_for_profile(OPT_PROFILE_SPEED_O2, true);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o0) }, mut_view(*arena));
+
+    let mut stats = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+    scalar_stats_zero(mut_view(stats));
+
+    let ch = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o0) },
+        PASS_SCCP,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if !ch ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       passmgr_get_pass_rollback_count(unsafe { view(*pm_ptr) }, PASS_SCCP) != 0u32 {
+        return 14;
+    }
+
+    if (stats.sccp_consts_folded) < 2u32 ||
+       stats.sccp_branches_folded != 2u32 ||
+       (stats.sccp_blocks_pruned) < 2u32 {
+        return 15;
+    }
+
+    let bb0_after = unsafe { opt_block_at((*o0).blocks, 0) };
+    let inst_ovf = unsafe { opt_inst_at((*bb0_after).insts, 1) };
+    let inst_divz = unsafe { opt_inst_at((*bb0_after).insts, 2) };
+    let inst_bbox = unsafe { opt_inst_at((*bb0_after).insts, 3) };
+    if (unsafe { (*inst_ovf).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*inst_divz).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*inst_bbox).opcode }) != OPT_INST_BLACK_BOX {
+        return 16;
+    }
+
+    let bb2_after = unsafe { opt_block_at((*o0).blocks, 2) };
+    let bb4_after = unsafe { opt_block_at((*o0).blocks, 4) };
+    let bb5_after = unsafe { opt_block_at((*o0).blocks, 5) };
+    if (unsafe { (*bb2_after).is_reachable }) ||
+       (unsafe { (*bb2_after).term.kind }) != OPT_TERM_UNREACHABLE ||
+       (unsafe { (*bb5_after).is_reachable }) ||
+       (unsafe { (*bb5_after).term.kind }) != OPT_TERM_UNREACHABLE {
+        return 17;
+    }
+
+    let ret_inst = unsafe { opt_inst_at((*bb4_after).insts, 0) };
+    if (unsafe { (*ret_inst).opcode }) != OPT_INST_CONST {
+        return 18;
+    }
+    let ret_val = unsafe { opt_val_at((*o0).values, (*ret_inst).result.v as usize) };
+    if (unsafe { (*ret_val).const_val.val }) != 42u64 {
+        return 19;
+    }
+
+    print("PROBE_INTRINSIC_CONTRACTS=OK\n");
+    print("PROBE_SCCP_LATTICE_AND_PRUNE=OK\n");
+    0
+}
+
+fn verify_inst_combine_overflow_and_fp(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let in1 = probe_mir_blob(mut_view(*arena), 1);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m1 = verify_parse_mir(in1, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m1 as usize) == 0 {
+        return 21;
+    }
+    let o1 = optir_build_from_mir(unsafe { view(*m1) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o1 as usize) == 0 || sink.errors != 0 {
+        return 22;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget_o2 = opt_budget_for_profile(OPT_PROFILE_SPEED_O2, true);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o1) }, mut_view(*arena));
+
+    let bb0 = unsafe { opt_block_at((*o1).blocks, 3) };
+    let inst_wrap = unsafe { opt_inst_at((*bb0).insts, 1) };
+    if scalar_classify_inst_intrinsic(unsafe { view(*inst_wrap) }) != INTRINSIC_SEM_WRAPPING_ARITH {
+        return 23;
+    }
+
+    // Mark _4 (lhs of insts[6]: _11 = _4 / _4) as Proven NonZero in [5, 10]
+    let inst_nz_div = unsafe { opt_inst_at((*bb0).insts, 6) };
+    let nz_vid = (unsafe { (*inst_nz_div).lhs.v }) as usize;
+    let nz_rng = unsafe { opt_range_at((*o1).ranges, nz_vid) };
+    unsafe {
+        (*nz_rng).has_range = true;
+        (*nz_rng).non_zero_certainty = CERTAINTY_PROVEN;
+        (*nz_rng).lo = 5u64;
+        (*nz_rng).hi = 10u64;
+    }
+
+    // Mark _3 (lhs of insts[9]: _14 = _3 + 0) with NaN / -0.0 floating-point hazard (REQ-OPT-397)
+    let inst_fp = unsafe { opt_inst_at((*bb0).insts, 9) };
+    let fp_vid = (unsafe { (*inst_fp).lhs.v }) as usize;
+    let fp_rng = unsafe { opt_range_at((*o1).ranges, fp_vid) };
+    unsafe {
+        (*fp_rng).has_range = true;
+        (*fp_rng).has_fp_hazard = true;
+    }
+
+    let mut stats = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+    scalar_stats_zero(mut_view(stats));
+
+    let ch = scalar_run_inst_combine(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o1) },
+        mut_view(stats),
+        mut_view(*arena)
+    );
+    if !ch {
+        return 24;
+    }
+    let vst = passmgr_verify_postconditions(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o1) },
+        PASS_INST_COMBINE,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if vst != CONTRACT_OK {
+        return 25;
+    }
+
+    let i_canon_add0 = unsafe { opt_inst_at((*bb0).insts, 0) };
+    let i_wrap_cancel = unsafe { opt_inst_at((*bb0).insts, 2) };
+    let i_chk_cancel = unsafe { opt_inst_at((*bb0).insts, 4) };
+    let i_unk_div = unsafe { opt_inst_at((*bb0).insts, 5) };
+    let i_prov_div = unsafe { opt_inst_at((*bb0).insts, 6) };
+    let i_wrap_reassoc = unsafe { opt_inst_at((*bb0).insts, 8) };
+    let i_fp_haz = unsafe { opt_inst_at((*bb0).insts, 9) };
+
+    // Positive rewrites: 0 + _1 -> copy _1; (_1 +w _2) -w _2 -> copy _1; _4 / _4 (NonZero) -> const 1; (_1 +w 10) +w 22 -> _1 +w 32
+    if (unsafe { (*i_canon_add0).opcode }) != OPT_INST_COPY ||
+       (unsafe { (*i_wrap_cancel).opcode }) != OPT_INST_COPY ||
+       (unsafe { (*i_prov_div).opcode }) != OPT_INST_CONST ||
+       (unsafe { (*i_wrap_reassoc).opcode }) != OPT_INST_WRAPPING_BINOP ||
+       (unsafe { (*i_wrap_reassoc).sub_op }) != MIR_BINOP_WRAPPING_ADD {
+        return 26;
+    }
+    let reassoc_rhs = unsafe { opt_val_at((*o1).values, (*i_wrap_reassoc).rhs.v as usize) };
+    if (unsafe { (*reassoc_rhs).const_val.val }) != 32u64 {
+        return 27;
+    }
+
+    // Fail-closed rejections: checked (_1 + _2) - _2, unbounded _1 / _1, and fp-hazard _3 + 0 must NOT fold!
+    if (unsafe { (*i_chk_cancel).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*i_unk_div).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*i_fp_haz).opcode }) != OPT_INST_BINOP ||
+       (stats.rejected_candidates) < 3u32 ||
+       (stats.inst_combine_rewrites) < 4u32 {
+        return 28;
+    }
+
+    print("PROBE_INST_COMBINE_OVERFLOW_FP=OK\n");
+    0
+}
+
+fn verify_gvn_cse_alias_and_pure_calls(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    // Part A: Blob 2 — commutative CSE, clobbered local non-forwarding, and NoAlias store-to-load forwarding
+    let in2 = probe_mir_blob(mut_view(*arena), 2);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m2 = verify_parse_mir(in2, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m2 as usize) == 0 {
+        return 31;
+    }
+    let o2 = optir_build_from_mir(unsafe { view(*m2) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o2 as usize) == 0 || sink.errors != 0 {
+        return 32;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget_o2 = opt_budget_for_profile(OPT_PROFILE_SPEED_O2, true);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o2) }, mut_view(*arena));
+
+    let mut stats_a = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+    scalar_stats_zero(mut_view(stats_a));
+
+    let ch_a = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o2) },
+        PASS_GVN_CSE,
+        0 as *const EffectCallTable,
+        mut_view(stats_a),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if !ch_a ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       (stats_a.gvn_cse_eliminated) < 1u32 ||
+       stats_a.gvn_loads_forwarded != 1u32 {
+        return 33;
+    }
+
+    let bb0_a = unsafe { opt_block_at((*o2).blocks, 3) };
+    let i_clobbered_or = unsafe { opt_inst_at((*bb0_a).insts, 2) };
+    let i_comm_xor = unsafe { opt_inst_at((*bb0_a).insts, 4) };
+    let i_fwd_load = unsafe { opt_inst_at((*bb0_a).insts, 7) };
+    if (unsafe { (*i_clobbered_or).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*i_comm_xor).opcode }) != OPT_INST_COPY ||
+       (unsafe { (*i_fwd_load).opcode }) != OPT_INST_CONST {
+        return 34;
+    }
+    let fwd_val = unsafe { opt_val_at((*o2).values, (*i_fwd_load).result.v as usize) };
+    if (unsafe { (*fwd_val).const_val.val }) != 77u64 {
+        return 35;
+    }
+
+    // Part B: Blob 3 — PureCall CSE vs explicit Clone / impure call preservation (REQ-OPT-306, REQ-OPT-351)
+    let in3 = probe_mir_blob(mut_view(*arena), 3);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m3 = verify_parse_mir(in3, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m3 as usize) == 0 {
+        return 36;
+    }
+    let o3 = optir_build_from_mir(unsafe { view(*m3) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o3 as usize) == 0 || sink.errors != 0 {
+        return 37;
+    }
+
+    let bb0_b = unsafe { opt_block_at((*o3).blocks, 0) };
+    let bb2_b = unsafe { opt_block_at((*o3).blocks, 2) };
+    let pure_callee = (OptValueId { v: unsafe { (*bb0_b).term.callee.v } });
+    let clone_callee = (OptValueId { v: unsafe { (*bb2_b).term.callee.v } });
+
+    let ctab = arena_alloc_raw(mut_view(*arena), size_of<EffectCallTable>(), align_of<EffectCallTable>()) as *mut EffectCallTable;
+    effect_call_table_init(unsafe { mut_view(*ctab) }, mut_view(*arena), 8);
+    effect_call_table_register(
+        unsafe { mut_view(*ctab) },
+        mut_view(*arena),
+        (SymbolId { v: 901u32 }),
+        pure_callee,
+        effect_summary_empty(SymbolId { v: 901u32 })
+    );
+    effect_call_table_register(
+        unsafe { mut_view(*ctab) },
+        mut_view(*arena),
+        (SymbolId { v: 902u32 }),
+        clone_callee,
+        effect_summary_from_flags(SymbolId { v: 902u32 }, EFFECT_ALLOCATES | EFFECT_READS_MEM | EFFECT_WRITES_MEM)
+    );
+
+    if scalar_classify_call_intrinsic(unsafe { view(*o3) }, unsafe { view((*bb0_b).term) }, ctab as *const EffectCallTable) != INTRINSIC_SEM_PURE_CALL ||
+       scalar_classify_call_intrinsic(unsafe { view(*o3) }, unsafe { view((*bb2_b).term) }, ctab as *const EffectCallTable) != INTRINSIC_SEM_EXPLICIT_CLONE_OR_IMPURE {
+        return 38;
+    }
+
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o3) }, mut_view(*arena));
+
+    let mut stats_b = stats_a;
+    scalar_stats_zero(mut_view(stats_b));
+
+    let ch_b = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o3) },
+        PASS_GVN_CSE,
+        ctab as *const EffectCallTable,
+        mut_view(stats_b),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    let bb1_b = unsafe { opt_block_at((*o3).blocks, 1) };
+    let bb3_b = unsafe { opt_block_at((*o3).blocks, 3) };
+    if !ch_b ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       stats_b.gvn_pure_calls_eliminated != 1u32 ||
+       (unsafe { (*bb1_b).term.kind }) != OPT_TERM_GOTO ||
+       (unsafe { (*bb2_b).term.kind }) != OPT_TERM_CALL ||
+       (unsafe { (*bb3_b).term.kind }) != OPT_TERM_CALL {
+        return 39;
+    }
+
+    print("PROBE_GVN_CSE_ALIAS_PURE_CALL=OK\n");
+    0
+}
+
+fn verify_dce_dead_store_and_barriers(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let in4 = probe_mir_blob(mut_view(*arena), 4);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m4 = verify_parse_mir(in4, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m4 as usize) == 0 {
+        return 41;
+    }
+    let o4 = optir_build_from_mir(unsafe { view(*m4) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o4 as usize) == 0 || sink.errors != 0 {
+        return 42;
+    }
+
+    let bb0 = unsafe { opt_block_at((*o4).blocks, 3) };
+    let i_bbox = unsafe { opt_inst_at((*bb0).insts, 9) };
+    let i_zero = unsafe { opt_inst_at((*bb0).insts, 10) };
+    let i_vld = unsafe { opt_inst_at((*bb0).insts, 11) };
+    let i_vst = unsafe { opt_inst_at((*bb0).insts, 12) };
+    let i_ato = unsafe { opt_inst_at((*bb0).insts, 13) };
+
+    unsafe {
+        (*i_bbox).opcode = OPT_INST_BLACK_BOX;
+        (*i_bbox).flags = (*i_bbox).flags | OPT_FLAG_BARRIER;
+        (*i_zero).opcode = OPT_INST_ZEROIZE;
+        (*i_zero).flags = (*i_zero).flags | OPT_FLAG_BARRIER;
+        (*i_vld).opcode = OPT_INST_VOLATILE_LOAD;
+        (*i_vld).flags = (*i_vld).flags | OPT_FLAG_BARRIER;
+        (*i_vst).opcode = OPT_INST_VOLATILE_STORE;
+        (*i_vst).flags = (*i_vst).flags | OPT_FLAG_BARRIER;
+        (*i_ato).opcode = OPT_INST_ATOMIC;
+        (*i_ato).flags = (*i_ato).flags | OPT_FLAG_BARRIER;
+    }
+    optir_construct_memssa(unsafe { mut_view(*o4) }, mut_view(*arena));
+
+    if scalar_classify_inst_intrinsic(unsafe { view(*i_bbox) }) != INTRINSIC_SEM_BLACK_BOX ||
+       scalar_classify_inst_intrinsic(unsafe { view(*i_zero) }) != INTRINSIC_SEM_ZEROIZE ||
+       scalar_classify_inst_intrinsic(unsafe { view(*i_vld) }) != INTRINSIC_SEM_VOLATILE_LOAD ||
+       scalar_classify_inst_intrinsic(unsafe { view(*i_vst) }) != INTRINSIC_SEM_VOLATILE_STORE ||
+       scalar_classify_inst_intrinsic(unsafe { view(*i_ato) }) != INTRINSIC_SEM_ATOMIC {
+        return 43;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget_o2 = opt_budget_for_profile(OPT_PROFILE_SPEED_O2, true);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o4) }, mut_view(*arena));
+
+    let mut stats = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+    scalar_stats_zero(mut_view(stats));
+
+    let ch = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o4) },
+        PASS_DCE,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if !ch ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       passmgr_get_pass_rollback_count(unsafe { view(*pm_ptr) }, PASS_DCE) != 0u32 {
+        return 44;
+    }
+
+    if (stats.dce_insts_eliminated) < 5u32 ||
+       (stats.dce_dead_stores_eliminated) < 1u32 ||
+       (stats.dce_move_copy_elided) < 2u32 {
+        return 45;
+    }
+
+    // Dead store insts[5] (_5 = 100) must be eliminated, live store insts[6] (_5 = 200) kept
+    let i_dead_store = unsafe { opt_inst_at((*bb0).insts, 5) };
+    let i_live_store = unsafe { opt_inst_at((*bb0).insts, 6) };
+    if (unsafe { (*i_dead_store).opcode }) != OPT_INST_NOP ||
+       (unsafe { (*i_live_store).opcode }) != OPT_INST_STORE {
+        return 46;
+    }
+
+    // All 5 barriers (black_box, zeroize, volatile_load, volatile_store, atomic) must remain intact!
+    if (unsafe { (*i_bbox).opcode }) != OPT_INST_BLACK_BOX ||
+       (unsafe { (*i_zero).opcode }) != OPT_INST_ZEROIZE ||
+       (unsafe { (*i_vld).opcode }) != OPT_INST_VOLATILE_LOAD ||
+       (unsafe { (*i_vst).opcode }) != OPT_INST_VOLATILE_STORE ||
+       (unsafe { (*i_ato).opcode }) != OPT_INST_ATOMIC {
+        return 47;
+    }
+
+    print("PROBE_DCE_DEAD_STORE_BARRIERS=OK\n");
+    0
+}
+
+fn verify_pipeline_and_mir_entry_gate(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let mut stats = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+
+    // 1. Check -O0 skips optional scalar passes (fixedpoint_rounds_executed == 0)
+    let in5_o0 = probe_mir_blob(mut_view(*arena), 5);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m5_o0 = verify_parse_mir(in5_o0, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m5_o0 as usize) == 0 {
+        return 51;
+    }
+    let o5_o0 = optir_build_from_mir(unsafe { view(*m5_o0) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o5_o0 as usize) == 0 || sink.errors != 0 {
+        return 52;
+    }
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, opt_budget_for_profile(OPT_PROFILE_DEBUG_O0, true), mut_view(*arena));
+    scalar_stats_zero(mut_view(stats));
+    if !scalar_run_pipeline(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o5_o0) },
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    ) || (unsafe { (*pm_ptr).fixedpoint_rounds_executed }) != 0u32 {
+        return 53;
+    }
+
+    // 2. End-to-end MirBody optimization + reconstruction + verify_mir across -O0, -O1, -O2
+    let mut prof_idx: usize = 0;
+    while prof_idx < 3 {
+        let prof: u8 = if prof_idx == 0 {
+            OPT_PROFILE_DEBUG_O0
+        } else if prof_idx == 1 {
+            OPT_PROFILE_BALANCED_O1
+        } else {
+            OPT_PROFILE_SPEED_O2
+        };
+        let in5 = probe_mir_blob(mut_view(*arena), 5);
+        diag_sink_free(mut_view(*sink));
+        diag_sink_init(mut_view(*sink));
+        let m5 = verify_parse_mir(in5, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+        if (m5 as usize) == 0 {
+            return 54;
+        }
+        if !scalar_optimize_mir_body(
+            unsafe { mut_view(*m5) },
+            thir_ptr as *const Thir,
+            prof,
+            true,
+            0 as *const EffectCallTable,
+            mut_view(stats),
+            mut_view(*arena),
+            mut_view(*sink),
+            0 as *const HirItem
+        ) || sink.errors != 0 {
+            return (55 + prof_idx) as i32;
+        }
+        if prof == OPT_PROFILE_SPEED_O2 && (stats.sccp_branches_folded == 0u32 || stats.dce_insts_eliminated == 0u32) {
+            return 58;
+        }
+        prof_idx = prof_idx + 1;
+    }
+
+    // 3. AXS-OPT-001 entry gate: unverified MirBody (uninitialized _1 read) must be rejected
+    let in6 = probe_mir_blob(mut_view(*arena), 6);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m6 = verify_parse_mir(in6, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m6 as usize) == 0 {
+        return 59;
+    }
+    if scalar_optimize_mir_body(
+        unsafe { mut_view(*m6) },
+        thir_ptr as *const Thir,
+        OPT_PROFILE_SPEED_O2,
+        true,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink),
+        0 as *const HirItem
+    ) {
+        return 60;
+    }
+
+    print("PROBE_PIPELINE_E2E_PROFILES=OK\n");
+    0
+}
+
+fn verify_round1_qa_regressions(
+    thir_ptr: *mut Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let mut stats = ScalarOptStats {
+        sccp_consts_folded: 0u32,
+        sccp_branches_folded: 0u32,
+        sccp_blocks_pruned: 0u32,
+        inst_combine_rewrites: 0u32,
+        gvn_cse_eliminated: 0u32,
+        gvn_loads_forwarded: 0u32,
+        gvn_pure_calls_eliminated: 0u32,
+        dce_insts_eliminated: 0u32,
+        dce_dead_stores_eliminated: 0u32,
+        dce_move_copy_elided: 0u32,
+        cfg_edges_simplified: 0u32,
+        rejected_candidates: 0u32,
+    };
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget_o2 = opt_budget_for_profile(OPT_PROFILE_SPEED_O2, true);
+
+    // 1. Blob 7 (Finding 1): Subword i32/i8 signed MIN / -1 and MIN % -1 must preserve overflows(), assert, and dead DIV/REM!
+    let in7 = probe_mir_blob(mut_view(*arena), 7);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m7 = verify_parse_mir(in7, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m7 as usize) == 0 {
+        return 71;
+    }
+    let o7 = optir_build_from_mir(unsafe { view(*m7) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o7 as usize) == 0 || sink.errors != 0 {
+        return 72;
+    }
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    scalar_stats_zero(mut_view(stats));
+    if !scalar_run_pipeline(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o7) },
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    ) || (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 {
+        return 73;
+    }
+    let b7_2 = unsafe { opt_block_at((*o7).blocks, 2) };
+    let b7_3 = unsafe { opt_block_at((*o7).blocks, 3) };
+    let i7_ovf32 = unsafe { opt_inst_at((*b7_2).insts, 1) };
+    let i7_rem32 = unsafe { opt_inst_at((*b7_2).insts, 3) };
+    let i7_ovf8 = unsafe { opt_inst_at((*b7_2).insts, 5) };
+    let i7_div8 = unsafe { opt_inst_at((*b7_2).insts, 6) };
+    if (unsafe { (*i7_ovf32).opcode }) != OPT_INST_CHECKED_BINOP ||
+       (unsafe { (*i7_rem32).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*i7_ovf8).opcode }) != OPT_INST_CHECKED_BINOP ||
+       (unsafe { (*i7_div8).opcode }) != OPT_INST_BINOP ||
+       (unsafe { (*b7_2).term.kind }) != OPT_TERM_ASSERT ||
+       !(unsafe { (*b7_3).is_reachable }) ||
+       (unsafe { (*b7_3).term.kind }) != OPT_TERM_ASSERT {
+        return 74;
+    }
+
+    // 2. Blob 8 (Finding 2): Loop-backedge clobber on call-dest local _4 must block PureCall CSE!
+    let in8 = probe_mir_blob(mut_view(*arena), 8);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m8 = verify_parse_mir(in8, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m8 as usize) == 0 {
+        return 75;
+    }
+    let o8 = optir_build_from_mir(unsafe { view(*m8) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o8 as usize) == 0 || sink.errors != 0 {
+        return 76;
+    }
+    let b8_1 = unsafe { opt_block_at((*o8).blocks, 1) };
+    let pure_cal8 = (OptValueId { v: unsafe { (*b8_1).term.callee.v } });
+    let ctab8 = arena_alloc_raw(mut_view(*arena), size_of<EffectCallTable>(), align_of<EffectCallTable>()) as *mut EffectCallTable;
+    effect_call_table_init(unsafe { mut_view(*ctab8) }, mut_view(*arena), 8);
+    effect_call_table_register(
+        unsafe { mut_view(*ctab8) },
+        mut_view(*arena),
+        (SymbolId { v: 950u32 }),
+        pure_cal8,
+        effect_summary_empty(SymbolId { v: 950u32 })
+    );
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    scalar_stats_zero(mut_view(stats));
+    if !scalar_run_pipeline(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o8) },
+        ctab8 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    ) || (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 {
+        return 77;
+    }
+    let b8_4 = unsafe { opt_block_at((*o8).blocks, 4) };
+    if stats.gvn_pure_calls_eliminated != 0u32 ||
+       (unsafe { (*b8_4).term.kind }) != OPT_TERM_CALL {
+        return 78;
+    }
+
+    // 3. Blob 9 (Finding 3): OPT_LOCAL_MEMORY non-OPT_INST_STORE overwrite must emit OPT_INST_STORE on fold
+    //    and forward 5 (not 10), while runtime non-OPT_INST_STORE overwrite must block stale load forwarding!
+    let in9 = probe_mir_blob(mut_view(*arena), 9);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m9 = verify_parse_mir(in9, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m9 as usize) == 0 {
+        return 79;
+    }
+    let o9 = optir_build_from_mir(unsafe { view(*m9) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o9 as usize) == 0 || sink.errors != 0 {
+        return 80;
+    }
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o9) }, mut_view(*arena));
+    scalar_stats_zero(mut_view(stats));
+    let ch9_sccp = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o9) },
+        PASS_SCCP,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    let b9_1 = unsafe { opt_block_at((*o9).blocks, 1) };
+    let i9_folded_store = unsafe { opt_inst_at((*b9_1).insts, 2) };
+    if !ch9_sccp ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       (unsafe { (*i9_folded_store).opcode }) != OPT_INST_STORE {
+        return 81;
+    }
+    let ch9_gvn = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o9) },
+        PASS_GVN_CSE,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    let i9_load_a = unsafe { opt_inst_at((*b9_1).insts, 3) };
+    let i9_load_b = unsafe { opt_inst_at((*b9_1).insts, 7) };
+    if !ch9_gvn ||
+       (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       (unsafe { (*i9_load_a).opcode }) != OPT_INST_CONST ||
+       (unsafe { (*i9_load_b).opcode }) != OPT_INST_LOAD {
+        return 82;
+    }
+    let v9_a = unsafe { opt_val_at((*o9).values, (*i9_load_a).result.v as usize) };
+    if (unsafe { (*v9_a).const_val.val }) != 5u64 {
+        return 83;
+    }
+
+    // 4. Blob 10 (Finding 4): Stale/unvalidated PROP_DEAD_STORE across &_2 and copy (*_3) must NOT delete store,
+    //    and non-scalar address-taken overwrite must NOT be DCE'd!
+    let in10 = probe_mir_blob(mut_view(*arena), 10);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m10 = verify_parse_mir(in10, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m10 as usize) == 0 {
+        return 84;
+    }
+    let o10 = optir_build_from_mir(unsafe { view(*m10) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o10 as usize) == 0 || sink.errors != 0 {
+        return 85;
+    }
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*o10) }, mut_view(*arena));
+    let b10_1 = unsafe { opt_block_at((*o10).blocks, 1) };
+    let i10_st0 = unsafe { opt_inst_at((*b10_1).insts, 0) };
+    let i10_wrap = unsafe { opt_inst_at((*b10_1).insts, 2) };
+    let i10_load = unsafe { opt_inst_at((*b10_1).insts, 3) };
+    optir_record_provenance(
+        unsafe { mut_view(*o10) },
+        mut_view(*arena),
+        PROP_DEAD_STORE,
+        CERTAINTY_PROVEN,
+        ANALYSIS_MEMORY_SSA,
+        (OptValueId { v: OPT_VALUE_NONE }),
+        (OptValueId { v: OPT_VALUE_NONE }),
+        (OptBbId { v: 1u32 }),
+        (OptInstId { v: unsafe { (*i10_st0).id.v } }),
+        PASS_DCE
+    );
+    scalar_stats_zero(mut_view(stats));
+    let _ = scalar_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o10) },
+        PASS_DCE,
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 ||
+       passmgr_get_pass_rollback_count(unsafe { view(*pm_ptr) }, PASS_DCE) != 0u32 ||
+       (unsafe { (*i10_st0).opcode }) != OPT_INST_STORE ||
+       (unsafe { (*i10_wrap).opcode }) != OPT_INST_WRAPPING_BINOP ||
+       (unsafe { (*i10_load).opcode }) != OPT_INST_LOAD {
+        return 86;
+    }
+
+    // 5. Blob 11 (Finding 2b): Loop-backedge clobber on call-dest _1 must block InstCombine (x +w 1) -w 1 -> copy _1!
+    let in11 = probe_mir_blob(mut_view(*arena), 11);
+    diag_sink_free(mut_view(*sink));
+    diag_sink_init(mut_view(*sink));
+    let m11 = verify_parse_mir(in11, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+    if (m11 as usize) == 0 {
+        return 87;
+    }
+    let o11 = optir_build_from_mir(unsafe { view(*m11) }, thir_ptr as *const Thir, mut_view(*arena), mut_view(*sink), 0 as *const HirItem);
+    if (o11 as usize) == 0 || sink.errors != 0 {
+        return 88;
+    }
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget_o2, mut_view(*arena));
+    scalar_stats_zero(mut_view(stats));
+    if !scalar_run_pipeline(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*o11) },
+        0 as *const EffectCallTable,
+        mut_view(stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    ) || (unsafe { (*pm_ptr).verify_fail_count }) != 0u32 {
+        return 89;
+    }
+    let b11_4 = unsafe { opt_block_at((*o11).blocks, 4) };
+    let i11_sub = unsafe { opt_inst_at((*b11_4).insts, 0) };
+    if (unsafe { (*i11_sub).opcode }) != OPT_INST_WRAPPING_BINOP {
+        return 90;
+    }
+
+    // 6. End-to-end MirBody optimization + verify_mir on all Round 1 blobs 7..11
+    let mut b_idx: usize = 7;
+    while b_idx <= 11 {
+        let in_b = probe_mir_blob(mut_view(*arena), b_idx);
+        diag_sink_free(mut_view(*sink));
+        diag_sink_init(mut_view(*sink));
+        let m_b = verify_parse_mir(in_b, unsafe { mut_view((*thir_ptr).interner) }, mut_view(*arena));
+        if (m_b as usize) == 0 {
+            return (91 + (b_idx - 7)) as i32;
+        }
+        if !scalar_optimize_mir_body(
+            unsafe { mut_view(*m_b) },
+            thir_ptr as *const Thir,
+            OPT_PROFILE_SPEED_O2,
+            true,
+            0 as *const EffectCallTable,
+            mut_view(stats),
+            mut_view(*arena),
+            mut_view(*sink),
+            0 as *const HirItem
+        ) || sink.errors != 0 {
+            return (96 + (b_idx - 7)) as i32;
+        }
+        b_idx = b_idx + 1;
+    }
+
+    print("PROBE_ROUND1_QA_REGRESSIONS=OK\n");
+    0
+}
+
+fn main() -> i32 {
+    let mut arena = arena_new();
+    let mut sink: DiagSink = unsafe { *(arena_alloc_raw(mut_view(arena), size_of<DiagSink>(), align_of<DiagSink>()) as *const DiagSink) };
+    diag_sink_init(mut_view(sink));
+
+    let thir_ptr = arena_alloc_raw(mut_view(arena), size_of<Thir>(), align_of<Thir>()) as *mut Thir;
+    opt_init_minimal_thir(thir_ptr, mut_view(arena));
+
+    let r1 = verify_sccp_and_intrinsics(thir_ptr, mut_view(arena), mut_view(sink));
+    if r1 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r1;
+    }
+
+    let r2 = verify_inst_combine_overflow_and_fp(thir_ptr, mut_view(arena), mut_view(sink));
+    if r2 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r2;
+    }
+
+    let r3 = verify_gvn_cse_alias_and_pure_calls(thir_ptr, mut_view(arena), mut_view(sink));
+    if r3 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r3;
+    }
+
+    let r4 = verify_dce_dead_store_and_barriers(thir_ptr, mut_view(arena), mut_view(sink));
+    if r4 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r4;
+    }
+
+    let r5 = verify_pipeline_and_mir_entry_gate(thir_ptr, mut_view(arena), mut_view(sink));
+    if r5 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r5;
+    }
+
+    let r6 = verify_round1_qa_regressions(thir_ptr, mut_view(arena), mut_view(sink));
+    if r6 != 0 {
+        opt_free_minimal_thir(thir_ptr);
+        diag_sink_free(mut_view(sink));
+        arena_destroy(mut_view(arena));
+        return r6;
+    }
+
+    opt_free_minimal_thir(thir_ptr);
+    diag_sink_free(mut_view(sink));
+    arena_destroy(mut_view(arena));
+    print("PROBE_ALL=OK\n");
+    0
+}

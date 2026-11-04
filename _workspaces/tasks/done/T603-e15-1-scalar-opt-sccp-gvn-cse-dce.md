@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T602]
 priority: 96
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/scalar, tests/run/opt_scalar]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, 0161, 0162, 0165, tasks/0366, tasks/0456, tasks/0465, tasks/0467, tasks/0547]
 covers: [REQ-OPT-011, REQ-OPT-014, REQ-OPT-304, REQ-OPT-305, REQ-OPT-306, REQ-OPT-339, REQ-OPT-351, REQ-OPT-352, REQ-OPT-353, REQ-OPT-363, REQ-OPT-364]
 started: 2026-11-04 09:02:29
-agent: T603-impl
+finished: 2026-11-04 16:58:37
 ---
 # T603 — E15.1 — Unified scalar optimization engine (SCCP, GVN, CSE, DCE & algebraic simplification)
 
@@ -43,3 +43,4 @@ Implement the unified `OptIR` scalar optimization engine (sparse conditional con
 ## Log
 - 2026-11-03 02:38:00 created by T215 (P15 phase planning)
 - 2026-11-04 09:02:29 started (attempt 1) T603-impl
+- 2026-11-04 16:58:37 accepted by QA -> done
