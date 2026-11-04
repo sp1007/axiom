@@ -5,8 +5,11 @@ module compiler.obj.writer
 use std.core.host.open
 use std.core.host.write
 use std.core.host.close
+use std.core.host.heap_alloc
+use std.core.host.heap_free
 
 use compiler.obj.coff.CoffBuf
+use compiler.obj.coff.coff_buf_new
 use compiler.obj.coff.coff_buf_with_capacity
 use compiler.obj.coff.coff_buf_free
 use compiler.obj.coff.coff_buf_reserve
@@ -14,6 +17,8 @@ use compiler.obj.coff.coff_buf_put_u8
 use compiler.obj.coff.coff_buf_put_u16
 use compiler.obj.coff.coff_buf_put_i16
 use compiler.obj.coff.coff_buf_put_u32
+use compiler.obj.coff.coff_buf_put_u32_be
+use compiler.obj.coff.coff_buf_put_bytes
 use compiler.obj.coff.SectionId
 use compiler.obj.coff.SymbolId
 use compiler.obj.coff.Reloc
@@ -30,12 +35,26 @@ use compiler.obj.coff.COFF_FILE_HEADER_SIZE
 use compiler.obj.coff.COFF_SECTION_HEADER_SIZE
 use compiler.obj.coff.COFF_RELOC_SIZE
 use compiler.obj.coff.COFF_SYMBOL_SIZE
+use compiler.obj.coff.COFF_ARCHIVE_MAGIC_SIZE
+use compiler.obj.coff.COFF_ARCHIVE_MEMBER_HEADER_SIZE
+use compiler.obj.coff.COFF_SHORT_IMPORT_HEADER_SIZE
+use compiler.obj.coff.IMPORT_OBJECT_HDR_SIG1
+use compiler.obj.coff.IMPORT_OBJECT_HDR_SIG2
+use compiler.obj.coff.IMPORT_OBJECT_CODE
+use compiler.obj.coff.IMPORT_OBJECT_DATA
+use compiler.obj.coff.IMPORT_OBJECT_NAME
+use compiler.obj.coff.CoffArchiveMember
 use compiler.obj.coff.IMAGE_FILE_MACHINE_AMD64
+use compiler.obj.coff.IMAGE_SYM_CLASS_EXTERNAL
 use compiler.obj.coff.coff_section_characteristics
 use compiler.obj.coff.coff_reloc_type
 use compiler.obj.coff.coff_storage_class
+use compiler.obj.coff.coff_read_u16_le
 use compiler.obj.coff.coff_write_u32_le
 use compiler.obj.coff.coff_write_u64_le
+use compiler.obj.coff.coff_decode_file_header
+use compiler.obj.coff.coff_decode_symbol_record
+use compiler.obj.coff.coff_decode_short_import_header
 use compiler.obj.coff.cstr_len
 use compiler.obj.coff.objmodel_get_section
 use compiler.obj.coff.objmodel_get_symbol
@@ -43,7 +62,10 @@ use compiler.obj.coff.section_reloc_at
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
 
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
 @intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
 
 fn compute_bss_raw_size(model: view<ObjModel>, sec_id: SectionId, sec: view<Section>) -> u32 {
     let mut bss_size: u32 = sec.bytes_len as u32;
@@ -367,5 +389,631 @@ pub fn coff_write_str(model: view<ObjModel>, output_path: Str) -> bool {
     coff_buf_put_u8(mut_view(path_buf), 0u8);
     let ok = coff_write_path_bytes(model, path_buf.ptr as *const u8, plen);
     coff_buf_free(mut_view(path_buf));
+    ok
+}
+
+// --- COFF Archive (.lib) and Short Import Object Writer (SPEC-26) ---
+
+pub fn coff_write_short_import_to_buf(
+    out: mut_view<CoffBuf>,
+    sym_name: *const u8,
+    sym_len: usize,
+    dll_name: *const u8,
+    dll_len: usize,
+    hint: u16,
+    is_data: bool
+) -> bool {
+    if sym_name as usize == 0 || sym_len == 0 || dll_name as usize == 0 || dll_len == 0 {
+        return false;
+    }
+    let payload_len: usize = sym_len + 1 + dll_len + 1;
+    coff_buf_reserve(mut_view(*out), COFF_SHORT_IMPORT_HEADER_SIZE + payload_len);
+    coff_buf_put_u16(mut_view(*out), IMPORT_OBJECT_HDR_SIG1);
+    coff_buf_put_u16(mut_view(*out), IMPORT_OBJECT_HDR_SIG2);
+    coff_buf_put_u16(mut_view(*out), 0u16); // Version = 0
+    coff_buf_put_u16(mut_view(*out), IMAGE_FILE_MACHINE_AMD64);
+    coff_buf_put_u32(mut_view(*out), 0u32); // TimeDateStamp = 0 (deterministic)
+    coff_buf_put_u32(mut_view(*out), payload_len as u32);
+    coff_buf_put_u16(mut_view(*out), hint);
+    let imp_type: u16 = if is_data { IMPORT_OBJECT_DATA } else { IMPORT_OBJECT_CODE };
+    let type_info: u16 = imp_type | (IMPORT_OBJECT_NAME << 2);
+    coff_buf_put_u16(mut_view(*out), type_info);
+    coff_buf_put_bytes(mut_view(*out), sym_name, sym_len);
+    coff_buf_put_u8(mut_view(*out), 0u8);
+    coff_buf_put_bytes(mut_view(*out), dll_name, dll_len);
+    coff_buf_put_u8(mut_view(*out), 0u8);
+    true
+}
+
+struct ArchiveSymEntry {
+    member_idx: usize,
+    name_off: usize,
+    name_len: usize,
+}
+
+struct ArchiveSymList {
+    ptr: *mut ArchiveSymEntry,
+    len: usize,
+    cap: usize,
+    str_pool: CoffBuf,
+}
+
+fn archive_sym_list_new() -> ArchiveSymList {
+    ArchiveSymList {
+        ptr: 0 as *mut ArchiveSymEntry,
+        len: 0,
+        cap: 0,
+        str_pool: coff_buf_with_capacity(256),
+    }
+}
+
+fn archive_sym_list_free(list: mut_view<ArchiveSymList>) {
+    if list.cap > 0 && list.ptr as usize != 0 {
+        unsafe {
+            heap_free(
+                list.ptr as *mut u8,
+                coff_mul_usize(list.cap, size_of<ArchiveSymEntry>()),
+                align_of<ArchiveSymEntry>()
+            );
+        }
+    }
+    list.ptr = 0 as *mut ArchiveSymEntry;
+    list.len = 0;
+    list.cap = 0;
+    coff_buf_free(mut_view(list.str_pool));
+}
+
+unsafe fn archive_sym_slot(base: *mut ArchiveSymEntry, idx: usize) -> *mut ArchiveSymEntry {
+    ((base as usize) + coff_mul_usize(idx, size_of<ArchiveSymEntry>())) as *mut ArchiveSymEntry
+}
+
+fn archive_sym_list_reserve(list: mut_view<ArchiveSymList>, min_cap: usize) {
+    if min_cap <= list.cap {
+        return;
+    }
+    let mut new_cap = if list.cap == 0 { 16 } else { list.cap + list.cap };
+    while new_cap < min_cap {
+        new_cap = new_cap + new_cap;
+    }
+    let esz = size_of<ArchiveSymEntry>();
+    let eal = align_of<ArchiveSymEntry>();
+    let new_ptr = unsafe { heap_alloc(coff_mul_usize(new_cap, esz), eal) as *mut ArchiveSymEntry };
+    if list.len > 0 && list.ptr as usize != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(
+                list.ptr as *const u8,
+                new_ptr as *mut u8,
+                coff_mul_usize(list.len, esz)
+            );
+            heap_free(list.ptr as *mut u8, coff_mul_usize(list.cap, esz), eal);
+        }
+    } else if list.cap > 0 && list.ptr as usize != 0 {
+        unsafe {
+            heap_free(list.ptr as *mut u8, coff_mul_usize(list.cap, esz), eal);
+        }
+    }
+    list.ptr = new_ptr;
+    list.cap = new_cap;
+}
+
+fn archive_sym_list_push(
+    list: mut_view<ArchiveSymList>,
+    member_idx: usize,
+    name_ptr: *const u8,
+    name_len: usize
+) {
+    if name_ptr as usize == 0 || name_len == 0 {
+        return;
+    }
+    if list.len == list.cap {
+        archive_sym_list_reserve(mut_view(*list), list.len + 1);
+    }
+    let name_off = list.str_pool.len;
+    coff_buf_put_bytes(mut_view(list.str_pool), name_ptr, name_len);
+    coff_buf_put_u8(mut_view(list.str_pool), 0u8);
+    let slot = unsafe { archive_sym_slot(list.ptr, list.len) };
+    unsafe {
+        (*slot).member_idx = member_idx;
+        (*slot).name_off = name_off;
+        (*slot).name_len = name_len;
+    }
+    list.len = list.len + 1;
+}
+
+fn archive_sym_list_push_imp_prefix(
+    list: mut_view<ArchiveSymList>,
+    member_idx: usize,
+    name_ptr: *const u8,
+    name_len: usize
+) {
+    if name_ptr as usize == 0 || name_len == 0 {
+        return;
+    }
+    if list.len == list.cap {
+        archive_sym_list_reserve(mut_view(*list), list.len + 1);
+    }
+    let name_off = list.str_pool.len;
+    // "__imp_"
+    coff_buf_put_u8(mut_view(list.str_pool), 95u8);
+    coff_buf_put_u8(mut_view(list.str_pool), 95u8);
+    coff_buf_put_u8(mut_view(list.str_pool), 105u8);
+    coff_buf_put_u8(mut_view(list.str_pool), 109u8);
+    coff_buf_put_u8(mut_view(list.str_pool), 112u8);
+    coff_buf_put_u8(mut_view(list.str_pool), 95u8);
+    coff_buf_put_bytes(mut_view(list.str_pool), name_ptr, name_len);
+    coff_buf_put_u8(mut_view(list.str_pool), 0u8);
+    let slot = unsafe { archive_sym_slot(list.ptr, list.len) };
+    unsafe {
+        (*slot).member_idx = member_idx;
+        (*slot).name_off = name_off;
+        (*slot).name_len = 6 + name_len;
+    }
+    list.len = list.len + 1;
+}
+
+fn archive_scan_member_symbols(
+    list: mut_view<ArchiveSymList>,
+    member_idx: usize,
+    data: *const u8,
+    data_len: usize
+) {
+    if data as usize == 0 || data_len < COFF_FILE_HEADER_SIZE {
+        return;
+    }
+    let sig1 = coff_read_u16_le(data, 0);
+    let sig2 = coff_read_u16_le(data, 2);
+    if sig1 == IMPORT_OBJECT_HDR_SIG1 && sig2 == IMPORT_OBJECT_HDR_SIG2 {
+        let shdr = coff_decode_short_import_header(data, 0);
+        let payload_off = COFF_SHORT_IMPORT_HEADER_SIZE;
+        let payload_len = shdr.size_of_data as usize;
+        if payload_len > 0 && payload_off + payload_len <= data_len {
+            let mut slen: usize = 0;
+            while slen < payload_len && (unsafe { *(data + payload_off + slen) }) != 0u8 {
+                slen = slen + 1;
+            }
+            if slen > 0 && slen < payload_len {
+                let imp_type = shdr.type_info & 3u16;
+                if imp_type == IMPORT_OBJECT_CODE {
+                    archive_sym_list_push(mut_view(*list), member_idx, unsafe { data + payload_off }, slen);
+                }
+                archive_sym_list_push_imp_prefix(mut_view(*list), member_idx, unsafe { data + payload_off }, slen);
+            }
+        }
+        return;
+    }
+
+    let hdr = coff_decode_file_header(data, 0);
+    if hdr.machine != IMAGE_FILE_MACHINE_AMD64 {
+        return;
+    }
+    let symtab_off = hdr.pointer_to_symbol_table as usize;
+    let num_syms = hdr.number_of_symbols as usize;
+    if num_syms == 0 || symtab_off == 0 {
+        return;
+    }
+    let symtab_bytes = coff_mul_usize(num_syms, COFF_SYMBOL_SIZE);
+    if symtab_off + symtab_bytes > data_len {
+        return;
+    }
+    let strtab_off = symtab_off + symtab_bytes;
+    let mut s: usize = 0;
+    while s < num_syms {
+        let rec_off = symtab_off + coff_mul_usize(s, COFF_SYMBOL_SIZE);
+        let rec = coff_decode_symbol_record(data, rec_off);
+        if rec.storage_class == IMAGE_SYM_CLASS_EXTERNAL && rec.section_number > 0i16 {
+            if rec.zeroes == 0u32 {
+                let abs_off = strtab_off + (rec.offset as usize);
+                if abs_off < data_len {
+                    let mut nlen: usize = 0;
+                    while abs_off + nlen < data_len && (unsafe { *(data + abs_off + nlen) }) != 0u8 {
+                        nlen = nlen + 1;
+                    }
+                    if nlen > 0 {
+                        archive_sym_list_push(mut_view(*list), member_idx, unsafe { data + abs_off }, nlen);
+                    }
+                }
+            } else {
+                let mut nlen: usize = 0;
+                while nlen < 8 && (unsafe { *(data + rec_off + nlen) }) != 0u8 {
+                    nlen = nlen + 1;
+                }
+                if nlen > 0 {
+                    archive_sym_list_push(mut_view(*list), member_idx, unsafe { data + rec_off }, nlen);
+                }
+            }
+        }
+        s = s + 1 + (rec.number_of_aux_symbols as usize);
+    }
+}
+
+fn archive_cstr_cmp(a: *const u8, b: *const u8) -> i32 {
+    let mut i: usize = 0;
+    while true {
+        let ca = unsafe { *(a + i) };
+        let cb = unsafe { *(b + i) };
+        if ca != cb {
+            return if ca < cb { -1i32 } else { 1i32 };
+        }
+        if ca == 0u8 {
+            return 0i32;
+        }
+        i = i + 1;
+    }
+    0i32
+}
+
+fn coff_put_dec_padded(out: mut_view<CoffBuf>, val: usize, width: usize) {
+    let mut digits: [20]u8 = [0u8; 20];
+    let mut dlen: usize = 0;
+    if val == 0 {
+        digits[0] = 48u8;
+        dlen = 1;
+    } else {
+        let mut tmp: usize = val;
+        while tmp > 0 && dlen < 20 {
+            let rem = tmp - coff_mul_usize(tmp / 10, 10);
+            digits[dlen] = (48 + rem) as u8;
+            dlen = dlen + 1;
+            tmp = tmp / 10;
+        }
+    }
+    let mut written: usize = 0;
+    while dlen > 0 && written < width {
+        dlen = dlen - 1;
+        coff_buf_put_u8(mut_view(*out), digits[dlen]);
+        written = written + 1;
+    }
+    while written < width {
+        coff_buf_put_u8(mut_view(*out), 32u8);
+        written = written + 1;
+    }
+}
+
+fn coff_write_archive_header_raw_name(
+    out: mut_view<CoffBuf>,
+    name_16: *const u8,
+    size: usize
+) {
+    coff_buf_put_bytes(mut_view(*out), name_16, 16);
+    coff_put_dec_padded(mut_view(*out), 0, 12); // Date = "0           "
+    coff_put_dec_padded(mut_view(*out), 0, 6);  // UserID = "0     "
+    coff_put_dec_padded(mut_view(*out), 0, 6);  // GroupID = "0     "
+    coff_put_dec_padded(mut_view(*out), 0, 8);  // Mode = "0       "
+    coff_put_dec_padded(mut_view(*out), size, 10); // Size
+    coff_buf_put_u8(mut_view(*out), 0x60u8); // '`'
+    coff_buf_put_u8(mut_view(*out), 0x0Au8); // '\n'
+}
+
+fn archive_member_basename(name: *const u8, name_len: usize, out_len: *mut usize) -> *const u8 {
+    if name as usize == 0 || name_len == 0 {
+        unsafe { *out_len = 0; }
+        return name;
+    }
+    let mut last_sep: usize = 0;
+    let mut has_sep: bool = false;
+    let mut i: usize = 0;
+    while i < name_len {
+        let ch = unsafe { *(name + i) };
+        if ch == 47u8 || ch == 92u8 {
+            last_sep = i + 1;
+            has_sep = true;
+        }
+        i = i + 1;
+    }
+    if has_sep && last_sep < name_len {
+        unsafe {
+            *out_len = name_len - last_sep;
+            return name + last_sep;
+        }
+    }
+    unsafe { *out_len = name_len; }
+    name
+}
+
+unsafe fn archive_member_slot(base: *const CoffArchiveMember, idx: usize) -> *const CoffArchiveMember {
+    ((base as usize) + coff_mul_usize(idx, size_of<CoffArchiveMember>())) as *const CoffArchiveMember
+}
+
+pub fn coff_write_archive_to_buf(
+    members: *const CoffArchiveMember,
+    num_members: usize,
+    out: mut_view<CoffBuf>
+) -> bool {
+    if num_members > 0 && members as usize == 0 {
+        return false;
+    }
+
+    let mut sym_list = archive_sym_list_new();
+    let mut longnames_pool = coff_buf_new();
+
+    // Format 16-byte header names for each member (populating longnames_pool when > 15 chars)
+    let mut hdr_names_buf = coff_buf_with_capacity(coff_mul_usize(num_members, 16) + 16);
+    let mut m: usize = 0;
+    while m < num_members {
+        let mem = unsafe { archive_member_slot(members, m) };
+        let m_data = unsafe { (*mem).data };
+        let m_dlen = unsafe { (*mem).data_len };
+        archive_scan_member_symbols(mut_view(sym_list), m, m_data, m_dlen);
+
+        let mut base_len: usize = 0;
+        let base_ptr = archive_member_basename(
+            unsafe { (*mem).name },
+            unsafe { (*mem).name_len },
+            unsafe { address_of(base_len) as *mut usize }
+        );
+
+        if base_len <= 15 {
+            let mut k: usize = 0;
+            while k < base_len {
+                coff_buf_put_u8(mut_view(hdr_names_buf), unsafe { *(base_ptr + k) });
+                k = k + 1;
+            }
+            coff_buf_put_u8(mut_view(hdr_names_buf), 47u8); // '/'
+            k = k + 1;
+            while k < 16 {
+                coff_buf_put_u8(mut_view(hdr_names_buf), 32u8); // ' '
+                k = k + 1;
+            }
+        } else {
+            let long_off = longnames_pool.len;
+            coff_buf_put_bytes(mut_view(longnames_pool), base_ptr, base_len);
+            coff_buf_put_u8(mut_view(longnames_pool), 0u8);
+            coff_buf_put_u8(mut_view(hdr_names_buf), 47u8); // '/'
+            coff_put_dec_padded(mut_view(hdr_names_buf), long_off, 15);
+        }
+        m = m + 1;
+    }
+
+    let total_syms = sym_list.len;
+    let sum_sym_str_bytes = sym_list.str_pool.len;
+    let first_linker_size: usize = 4 + coff_mul_usize(total_syms, 4) + sum_sym_str_bytes;
+    let second_linker_size: usize = 4 + coff_mul_usize(num_members, 4) + 4 + coff_mul_usize(total_syms, 2) + sum_sym_str_bytes;
+    let has_longnames: bool = longnames_pool.len > 0;
+
+    // Precompute exact file offsets of each object member header
+    let mut member_offsets_buf = coff_buf_with_capacity(coff_mul_usize(num_members, 4) + 4);
+    let mut cur_off: usize = COFF_ARCHIVE_MAGIC_SIZE;
+    cur_off = cur_off + COFF_ARCHIVE_MEMBER_HEADER_SIZE + first_linker_size + (first_linker_size & 1);
+    cur_off = cur_off + COFF_ARCHIVE_MEMBER_HEADER_SIZE + second_linker_size + (second_linker_size & 1);
+    if has_longnames {
+        cur_off = cur_off + COFF_ARCHIVE_MEMBER_HEADER_SIZE + longnames_pool.len + (longnames_pool.len & 1);
+    }
+    m = 0;
+    while m < num_members {
+        let mem = unsafe { archive_member_slot(members, m) };
+        let m_dlen = unsafe { (*mem).data_len };
+        coff_buf_put_u32(mut_view(member_offsets_buf), cur_off as u32);
+        cur_off = cur_off + COFF_ARCHIVE_MEMBER_HEADER_SIZE + m_dlen + (m_dlen & 1);
+        m = m + 1;
+    }
+
+    coff_buf_reserve(mut_view(*out), cur_off);
+
+    // 1. Archive File Signature: "!<arch>\n" (8 bytes)
+    coff_buf_put_u8(mut_view(*out), 0x21u8); // '!'
+    coff_buf_put_u8(mut_view(*out), 0x3Cu8); // '<'
+    coff_buf_put_u8(mut_view(*out), 0x61u8); // 'a'
+    coff_buf_put_u8(mut_view(*out), 0x72u8); // 'r'
+    coff_buf_put_u8(mut_view(*out), 0x63u8); // 'c'
+    coff_buf_put_u8(mut_view(*out), 0x68u8); // 'h'
+    coff_buf_put_u8(mut_view(*out), 0x3Eu8); // '>'
+    coff_buf_put_u8(mut_view(*out), 0x0Au8); // '\n'
+
+    // Special 16-byte header names for "/" and "//"
+    let mut slash_name: [16]u8 = [32u8; 16];
+    slash_name[0] = 47u8; // '/'
+    let mut slash_slash_name: [16]u8 = [32u8; 16];
+    slash_slash_name[0] = 47u8; // '/'
+    slash_slash_name[1] = 47u8; // '/'
+
+    // 2. First Linker Member ("/")
+    coff_write_archive_header_raw_name(
+        mut_view(*out),
+        unsafe { address_of(slash_name[0]) },
+        first_linker_size
+    );
+    coff_buf_put_u32_be(mut_view(*out), total_syms as u32);
+    let mut s_idx: usize = 0;
+    while s_idx < total_syms {
+        let entry = unsafe { archive_sym_slot(sym_list.ptr, s_idx) };
+        let mem_idx = unsafe { (*entry).member_idx };
+        let mem_off = coff_read_u32_le_from_buf(view(member_offsets_buf), coff_mul_usize(mem_idx, 4));
+        coff_buf_put_u32_be(mut_view(*out), mem_off);
+        s_idx = s_idx + 1;
+    }
+    if sum_sym_str_bytes > 0 {
+        coff_buf_put_bytes(mut_view(*out), sym_list.str_pool.ptr as *const u8, sum_sym_str_bytes);
+    }
+    if (first_linker_size & 1) != 0 {
+        coff_buf_put_u8(mut_view(*out), 0x0Au8);
+    }
+
+    // 3. Second Linker Member ("/") — symbols sorted lexicographically
+    let mut sorted_indices = coff_buf_with_capacity(coff_mul_usize(total_syms, 4) + 4);
+    s_idx = 0;
+    while s_idx < total_syms {
+        coff_buf_put_u32(mut_view(sorted_indices), s_idx as u32);
+        s_idx = s_idx + 1;
+    }
+    // Insertion sort on sorted_indices by symbol name in ascending ASCII order
+    let mut i_sort: usize = 1;
+    while i_sort < total_syms {
+        let key_idx = coff_read_u32_le_from_buf(view(sorted_indices), coff_mul_usize(i_sort, 4)) as usize;
+        let key_entry = unsafe { archive_sym_slot(sym_list.ptr, key_idx) };
+        let key_name = unsafe { (sym_list.str_pool.ptr as *const u8) + (*key_entry).name_off };
+        let key_mem = unsafe { (*key_entry).member_idx };
+
+        let mut j_sort: usize = i_sort;
+        while j_sort > 0 {
+            let prev_idx = coff_read_u32_le_from_buf(view(sorted_indices), coff_mul_usize(j_sort - 1, 4)) as usize;
+            let prev_entry = unsafe { archive_sym_slot(sym_list.ptr, prev_idx) };
+            let prev_name = unsafe { (sym_list.str_pool.ptr as *const u8) + (*prev_entry).name_off };
+            let prev_mem = unsafe { (*prev_entry).member_idx };
+            let cmp = archive_cstr_cmp(prev_name, key_name);
+            if cmp > 0i32 || (cmp == 0i32 && prev_mem > key_mem) {
+                coff_write_u32_le(sorted_indices.ptr, coff_mul_usize(j_sort, 4), prev_idx as u32);
+                j_sort = j_sort - 1;
+            } else {
+                break;
+            }
+        }
+        coff_write_u32_le(sorted_indices.ptr, coff_mul_usize(j_sort, 4), key_idx as u32);
+        i_sort = i_sort + 1;
+    }
+
+    coff_write_archive_header_raw_name(
+        mut_view(*out),
+        unsafe { address_of(slash_name[0]) },
+        second_linker_size
+    );
+    coff_buf_put_u32(mut_view(*out), num_members as u32);
+    m = 0;
+    while m < num_members {
+        let mem_off = coff_read_u32_le_from_buf(view(member_offsets_buf), coff_mul_usize(m, 4));
+        coff_buf_put_u32(mut_view(*out), mem_off);
+        m = m + 1;
+    }
+    coff_buf_put_u32(mut_view(*out), total_syms as u32);
+    s_idx = 0;
+    while s_idx < total_syms {
+        let orig_idx = coff_read_u32_le_from_buf(view(sorted_indices), coff_mul_usize(s_idx, 4)) as usize;
+        let entry = unsafe { archive_sym_slot(sym_list.ptr, orig_idx) };
+        let mem_idx_1based = ((unsafe { (*entry).member_idx }) + 1) as u16;
+        coff_buf_put_u16(mut_view(*out), mem_idx_1based);
+        s_idx = s_idx + 1;
+    }
+    s_idx = 0;
+    while s_idx < total_syms {
+        let orig_idx = coff_read_u32_le_from_buf(view(sorted_indices), coff_mul_usize(s_idx, 4)) as usize;
+        let entry = unsafe { archive_sym_slot(sym_list.ptr, orig_idx) };
+        let name_ptr = unsafe { (sym_list.str_pool.ptr as *const u8) + (*entry).name_off };
+        let name_len = unsafe { (*entry).name_len };
+        coff_buf_put_bytes(mut_view(*out), name_ptr, name_len + 1);
+        s_idx = s_idx + 1;
+    }
+    if (second_linker_size & 1) != 0 {
+        coff_buf_put_u8(mut_view(*out), 0x0Au8);
+    }
+
+    // 4. Longnames Member ("//") if any member name exceeded 15 bytes
+    if has_longnames {
+        coff_write_archive_header_raw_name(
+            mut_view(*out),
+            unsafe { address_of(slash_slash_name[0]) },
+            longnames_pool.len
+        );
+        coff_buf_put_bytes(mut_view(*out), longnames_pool.ptr as *const u8, longnames_pool.len);
+        if (longnames_pool.len & 1) != 0 {
+            coff_buf_put_u8(mut_view(*out), 0x0Au8);
+        }
+    }
+
+    // 5. Object Members
+    m = 0;
+    while m < num_members {
+        let mem = unsafe { archive_member_slot(members, m) };
+        let m_data = unsafe { (*mem).data };
+        let m_dlen = unsafe { (*mem).data_len };
+        let hdr_name_ptr = unsafe { (hdr_names_buf.ptr as *const u8) + coff_mul_usize(m, 16) };
+        coff_write_archive_header_raw_name(mut_view(*out), hdr_name_ptr, m_dlen);
+        if m_dlen > 0 && m_data as usize != 0 {
+            coff_buf_put_bytes(mut_view(*out), m_data, m_dlen);
+        }
+        if (m_dlen & 1) != 0 {
+            coff_buf_put_u8(mut_view(*out), 0x0Au8);
+        }
+        m = m + 1;
+    }
+
+    coff_buf_free(mut_view(sorted_indices));
+    coff_buf_free(mut_view(member_offsets_buf));
+    coff_buf_free(mut_view(hdr_names_buf));
+    coff_buf_free(mut_view(longnames_pool));
+    archive_sym_list_free(mut_view(sym_list));
+    true
+}
+
+fn coff_read_u32_le_from_buf(b: view<CoffBuf>, off: usize) -> u32 {
+    let p = b.ptr as *const u8;
+    let b0 = (unsafe { *(p + off) }) as u32;
+    let b1 = (unsafe { *(p + off + 1) }) as u32;
+    let b2 = (unsafe { *(p + off + 2) }) as u32;
+    let b3 = (unsafe { *(p + off + 3) }) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+pub fn coff_write_archive_path_bytes(
+    members: *const CoffArchiveMember,
+    num_members: usize,
+    path_ptr: *const u8,
+    path_len: usize
+) -> bool {
+    if path_ptr as usize == 0 || path_len == 0 {
+        return false;
+    }
+    let mut buf = coff_buf_with_capacity(512);
+    if !coff_write_archive_to_buf(members, num_members, mut_view(buf)) {
+        coff_buf_free(mut_view(buf));
+        return false;
+    }
+    let h = unsafe { open(path_ptr, path_len, 1u32) };
+    if h < 0 {
+        coff_buf_free(mut_view(buf));
+        return false;
+    }
+    let n = buf.len;
+    if n > 0 && buf.ptr as usize != 0 {
+        let mut total_written: usize = 0;
+        while total_written < n {
+            let src = unsafe { (buf.ptr as *const u8) + total_written };
+            let remaining = n - total_written;
+            let wr = unsafe { write(h, src, remaining) };
+            if wr <= 0 {
+                let _ = close(h);
+                coff_buf_free(mut_view(buf));
+                return false;
+            }
+            total_written = total_written + (wr as usize);
+        }
+    }
+    let cl = close(h);
+    coff_buf_free(mut_view(buf));
+    cl >= 0
+}
+
+pub fn coff_write_lib_to_buf(
+    model: view<ObjModel>,
+    member_name: *const u8,
+    member_name_len: usize,
+    out: mut_view<CoffBuf>
+) -> bool {
+    let mut obj_buf = coff_encode_bytes(model);
+    let mem = CoffArchiveMember {
+        name: member_name,
+        name_len: member_name_len,
+        data: obj_buf.ptr as *const u8,
+        data_len: obj_buf.len,
+    };
+    let ok = coff_write_archive_to_buf(unsafe { address_of(mem) }, 1, out);
+    coff_buf_free(mut_view(obj_buf));
+    ok
+}
+
+pub fn coff_write_lib_path_bytes(
+    model: view<ObjModel>,
+    member_name: *const u8,
+    member_name_len: usize,
+    path_ptr: *const u8,
+    path_len: usize
+) -> bool {
+    let mut obj_buf = coff_encode_bytes(model);
+    let mem = CoffArchiveMember {
+        name: member_name,
+        name_len: member_name_len,
+        data: obj_buf.ptr as *const u8,
+        data_len: obj_buf.len,
+    };
+    let ok = coff_write_archive_path_bytes(unsafe { address_of(mem) }, 1, path_ptr, path_len);
+    coff_buf_free(mut_view(obj_buf));
     ok
 }

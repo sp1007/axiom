@@ -181,6 +181,8 @@ pub fn linker_emit_runtime_stubs(ctx: mut_view<LinkerContext>) -> u32 {
 pub struct ImportFunc {
     pub name: *const u8,
     pub full_sym: *const u8,
+    pub hint: u16,
+    pub emit_thunk: bool,
     pub hint_offset: u32,
     pub iat_offset: u32,
     pub thunk_offset: u32,
@@ -386,7 +388,14 @@ pub fn import_find_or_add_dll_str(tbl: mut_view<ImportTable>, ctx: mut_view<Link
     res
 }
 
-pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_name: *const u8, full_sym: *const u8) -> *mut ImportFunc {
+pub fn import_add_func_ex(
+    ctx: mut_view<LinkerContext>,
+    dll: *mut ImportDll,
+    func_name: *const u8,
+    full_sym: *const u8,
+    hint: u16,
+    emit_thunk: bool
+) -> *mut ImportFunc {
     if (dll as usize) == 0 {
         return 0 as *mut ImportFunc;
     }
@@ -402,6 +411,16 @@ pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_n
                 let dup_full = linker_dup_cstr(mut_view(*ctx), full_sym);
                 unsafe {
                     (*fn_ptr).full_sym = dup_full;
+                }
+            }
+            if (unsafe { (*fn_ptr).hint }) == 0u16 && hint != 0u16 {
+                unsafe {
+                    (*fn_ptr).hint = hint;
+                }
+            }
+            if emit_thunk {
+                unsafe {
+                    (*fn_ptr).emit_thunk = true;
                 }
             }
             return fn_ptr;
@@ -447,6 +466,8 @@ pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_n
         *slot = ImportFunc {
             name: dup_name,
             full_sym: dup_full,
+            hint: hint,
+            emit_thunk: emit_thunk,
             hint_offset: 0u32,
             iat_offset: 0u32,
             thunk_offset: 0u32,
@@ -454,6 +475,33 @@ pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_n
         (*dll).num_funcs = num_funcs + 1;
     }
     slot
+}
+
+pub fn import_add_func(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_name: *const u8, full_sym: *const u8) -> *mut ImportFunc {
+    import_add_func_ex(ctx, dll, func_name, full_sym, 0u16, true)
+}
+
+pub fn import_has_func(tbl: view<ImportTable>, func_name: *const u8) -> bool {
+    if func_name as usize == 0 {
+        return false;
+    }
+    let f0 = unsafe { *func_name };
+    let mut d: usize = 0;
+    while d < tbl.num_dlls {
+        let dll = import_dll_at(tbl, d);
+        let n = unsafe { (*dll).num_funcs };
+        let mut i: usize = 0;
+        while i < n {
+            let fn_ptr = import_func_at(dll as *const ImportDll, i);
+            let existing = unsafe { (*fn_ptr).name };
+            if (unsafe { *existing }) == f0 && cstr_eq(existing, func_name) {
+                return true;
+            }
+            i = i + 1;
+        }
+        d = d + 1;
+    }
+    false
 }
 
 pub fn import_add_func_str(ctx: mut_view<LinkerContext>, dll: *mut ImportDll, func_name: Str) -> *mut ImportFunc {
@@ -474,7 +522,7 @@ pub fn import_add_base_kernel32(tbl: mut_view<ImportTable>, ctx: mut_view<Linker
     let _ = import_add_func_str(mut_view(*ctx), k32, { "GetConsoleOutputCP" });
 }
 
-fn has_iat_prefix_cstr(s: *const u8) -> bool {
+pub fn has_iat_prefix_cstr(s: *const u8) -> bool {
     let slen = cstr_len(s);
     if slen < 6 {
         return false;
@@ -488,7 +536,21 @@ fn has_iat_prefix_cstr(s: *const u8) -> bool {
     b0 == 95u8 && b1 == 95u8 && b2 == 73u8 && b3 == 65u8 && b4 == 84u8 && b5 == 95u8
 }
 
-// 2. Discovers DLL imports (`DLL$func` or `__IAT_func`) from unresolved relocations.
+pub fn has_imp_prefix_cstr(s: *const u8) -> bool {
+    let slen = cstr_len(s);
+    if slen < 6 {
+        return false;
+    }
+    let b0 = unsafe { *s };
+    let b1 = unsafe { *(s + 1) };
+    let b2 = unsafe { *(s + 2) };
+    let b3 = unsafe { *(s + 3) };
+    let b4 = unsafe { *(s + 4) };
+    let b5 = unsafe { *(s + 5) };
+    b0 == 95u8 && b1 == 95u8 && b2 == 105u8 && b3 == 109u8 && b4 == 112u8 && b5 == 95u8
+}
+
+// 2. Discovers DLL imports (`DLL$func`, `__IAT_func`, or `__imp_DLL$func`) from unresolved relocations.
 pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>) {
     let num_relocs = ctx.num_relocs;
     let mut i: usize = 0;
@@ -505,7 +567,8 @@ pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<Lin
 
             if !is_defined {
                 let starts_iat = has_iat_prefix_cstr(sname);
-                let target = if starts_iat {
+                let starts_imp = has_imp_prefix_cstr(sname);
+                let target = if starts_iat || starts_imp {
                     unsafe { sname + 6 }
                 } else {
                     sname
@@ -518,8 +581,10 @@ pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<Lin
                     let dll = import_find_or_add_dll_bytes(mut_view(*tbl), mut_view(*ctx), target, dlen);
                     let _ = import_add_func(mut_view(*ctx), dll, fname, target);
                 } else if starts_iat {
-                    let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
-                    let _ = import_add_func(mut_view(*ctx), dll, target, 0 as *const u8);
+                    if !import_has_func(view(*tbl), target) {
+                        let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
+                        let _ = import_add_func(mut_view(*ctx), dll, target, 0 as *const u8);
+                    }
                 }
             }
         }
@@ -527,9 +592,22 @@ pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<Lin
     }
 }
 
-fn make_iat_sym_cstr(ctx: mut_view<LinkerContext>, suffix: *const u8) -> *const u8 {
+pub fn make_iat_sym_cstr(ctx: mut_view<LinkerContext>, suffix: *const u8) -> *const u8 {
     let slen = cstr_len(suffix);
     let prefix: [6]u8 = [95u8, 95u8, 73u8, 65u8, 84u8, 95u8]; // "__IAT_"
+    let p_prefix = unsafe { address_of(prefix[0]) };
+    let mut tmp = coff_buf_with_capacity(6 + slen + 1);
+    coff_buf_put_bytes(mut_view(tmp), p_prefix, 6);
+    coff_buf_put_bytes(mut_view(tmp), suffix, slen);
+    coff_buf_put_u8(mut_view(tmp), 0u8);
+    let res = linker_dup_bytes(ctx, tmp.ptr as *const u8, 6 + slen);
+    coff_buf_free(mut_view(tmp));
+    res
+}
+
+pub fn make_imp_sym_cstr(ctx: mut_view<LinkerContext>, suffix: *const u8) -> *const u8 {
+    let slen = cstr_len(suffix);
+    let prefix: [6]u8 = [95u8, 95u8, 105u8, 109u8, 112u8, 95u8]; // "__imp_"
     let p_prefix = unsafe { address_of(prefix[0]) };
     let mut tmp = coff_buf_with_capacity(6 + slen + 1);
     coff_buf_put_bytes(mut_view(tmp), p_prefix, 6);
@@ -550,33 +628,35 @@ pub fn import_emit_thunks(tbl: view<ImportTable>, ctx: mut_view<LinkerContext>, 
         let mut f: usize = 0;
         while f < num_funcs {
             let fn_ptr = import_func_at(dll as *const ImportDll, f);
-            let fn_name = unsafe { (*fn_ptr).name };
-            let fn_full = unsafe { (*fn_ptr).full_sym };
+            if unsafe { (*fn_ptr).emit_thunk } {
+                let fn_name = unsafe { (*fn_ptr).name };
+                let fn_full = unsafe { (*fn_ptr).full_sym };
 
-            let iat_sym_name = make_iat_sym_cstr(mut_view(*ctx), fn_name);
-            let thunk_off = linker_append_section_slice(text_sec, view(thunk_bytes), 8u32);
-            unsafe {
-                (*fn_ptr).thunk_offset = thunk_off;
-            }
-
-            linker_add_reloc(mut_view(*ctx), text_sec, thunk_off + 2u32, IMAGE_REL_AMD64_REL32, iat_sym_name, 0i64);
-
-            let g_fn = linker_add_global(mut_view(*ctx), fn_name);
-            if !(unsafe { (*g_fn).defined }) {
+                let iat_sym_name = make_iat_sym_cstr(mut_view(*ctx), fn_name);
+                let thunk_off = linker_append_section_slice(text_sec, view(thunk_bytes), 8u32);
                 unsafe {
-                    (*g_fn).defined = true;
-                    (*g_fn).sec = text_sec;
-                    (*g_fn).offset = thunk_off;
+                    (*fn_ptr).thunk_offset = thunk_off;
                 }
-            }
 
-            if (fn_full as usize) != 0 {
-                let g_full = linker_add_global(mut_view(*ctx), fn_full);
-                if !(unsafe { (*g_full).defined }) {
+                linker_add_reloc(mut_view(*ctx), text_sec, thunk_off + 2u32, IMAGE_REL_AMD64_REL32, iat_sym_name, 0i64);
+
+                let g_fn = linker_add_global(mut_view(*ctx), fn_name);
+                if !(unsafe { (*g_fn).defined }) {
                     unsafe {
-                        (*g_full).defined = true;
-                        (*g_full).sec = text_sec;
-                        (*g_full).offset = thunk_off;
+                        (*g_fn).defined = true;
+                        (*g_fn).sec = text_sec;
+                        (*g_fn).offset = thunk_off;
+                    }
+                }
+
+                if (fn_full as usize) != 0 {
+                    let g_full = linker_add_global(mut_view(*ctx), fn_full);
+                    if !(unsafe { (*g_full).defined }) {
+                        unsafe {
+                            (*g_full).defined = true;
+                            (*g_full).sec = text_sec;
+                            (*g_full).offset = thunk_off;
+                        }
                     }
                 }
             }
@@ -657,8 +737,9 @@ pub fn import_build_idata_section(tbl: mut_view<ImportTable>, ctx: mut_view<Link
             unsafe {
                 (*fn_ptr).hint_offset = idata_buf.len as u32;
             }
-            coff_buf_put_u8(mut_view(idata_buf), 0u8);
-            coff_buf_put_u8(mut_view(idata_buf), 0u8);
+            let fn_hint = unsafe { (*fn_ptr).hint };
+            coff_buf_put_u8(mut_view(idata_buf), (fn_hint & 0xFFu16) as u8);
+            coff_buf_put_u8(mut_view(idata_buf), ((fn_hint >> 8) & 0xFFu16) as u8);
             let fn_name = unsafe { (*fn_ptr).name };
             let nlen = cstr_len(fn_name);
             coff_buf_put_bytes(mut_view(idata_buf), fn_name, nlen);
@@ -719,6 +800,14 @@ pub fn import_build_idata_section(tbl: mut_view<ImportTable>, ctx: mut_view<Link
                 (*g).offset = tbl.idata_base + fn_iat_off;
             }
 
+            let imp_sym = make_imp_sym_cstr(mut_view(*ctx), fn_name);
+            let g_imp = linker_add_global(mut_view(*ctx), imp_sym);
+            unsafe {
+                (*g_imp).defined = true;
+                (*g_imp).sec = idata_sec;
+                (*g_imp).offset = tbl.idata_base + fn_iat_off;
+            }
+
             if (fn_full as usize) != 0 {
                 let iat_full = make_iat_sym_cstr(mut_view(*ctx), fn_full);
                 let g2 = linker_add_global(mut_view(*ctx), iat_full);
@@ -726,6 +815,14 @@ pub fn import_build_idata_section(tbl: mut_view<ImportTable>, ctx: mut_view<Link
                     (*g2).defined = true;
                     (*g2).sec = idata_sec;
                     (*g2).offset = tbl.idata_base + fn_iat_off;
+                }
+
+                let imp_full = make_imp_sym_cstr(mut_view(*ctx), fn_full);
+                let g2_imp = linker_add_global(mut_view(*ctx), imp_full);
+                unsafe {
+                    (*g2_imp).defined = true;
+                    (*g2_imp).sec = idata_sec;
+                    (*g2_imp).offset = tbl.idata_base + fn_iat_off;
                 }
             }
             f = f + 1;
