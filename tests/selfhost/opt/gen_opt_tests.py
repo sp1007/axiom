@@ -38,6 +38,8 @@ CORE_MODULES = [
     ("compiler.opt.cfg_simp", "compiler"),
     ("compiler.opt", "compiler"),
     ("compiler.opt.optir", "compiler"),
+    ("compiler.opt.effects", "compiler"),
+    ("compiler.opt.passmgr", "compiler"),
 ]
 
 PIPELINE_MODULES = [
@@ -87,6 +89,8 @@ PIPELINE_MODULES = [
     ("compiler.opt.cfg_simp", "compiler"),
     ("compiler.opt", "compiler"),
     ("compiler.opt.optir", "compiler"),
+    ("compiler.opt.effects", "compiler"),
+    ("compiler.opt.passmgr", "compiler"),
 ]
 
 PRELUDE = bc.build_prelude_text(include_sym_pad=True, include_std_sys=False, root=ROOT)
@@ -979,6 +983,132 @@ UNIT_MIR_SNIPPETS = [
         b"    let _1: type#8;\n"
         b"    bb0: {\n"
         b"        _0 = copy _1;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 19: GVN/CSE MIR local clobber safety fixture (_5 overwritten between j and i vs unclobbered _7)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let mut _1: type#8;\n"
+        b"    let mut _2: type#8;\n"
+        b"    let _3: type#4;\n"
+        b"    let _4: type#8;\n"
+        b"    let mut _5: type#8;\n"
+        b"    let _6: type#8;\n"
+        b"    let _7: type#8;\n"
+        b"    let _8: type#8;\n"
+        b"    bb0: {\n"
+        b"        _3 = const true;\n"
+        b"        switchInt(copy _3) -> [0: bb2, otherwise: bb1];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        _1 = const 3: type#8;\n"
+        b"        _2 = const 12: type#8;\n"
+        b"        goto -> bb3;\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _1 = const 5: type#8;\n"
+        b"        _2 = const 9: type#8;\n"
+        b"        goto -> bb3;\n"
+        b"    }\n"
+        b"    bb3: {\n"
+        b"        _5 = copy _1 | copy _2;\n"
+        b"        _5 = const 999: type#8;\n"
+        b"        _6 = copy _1 | copy _2;\n"
+        b"        _7 = copy _1 ^ copy _2;\n"
+        b"        _8 = copy _1 ^ copy _2;\n"
+        b"        _4 = wrapping_add(copy _5, copy _6);\n"
+        b"        _0 = wrapping_add(copy _4, copy _8);\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 20: OPT_TERM_BRANCH loop latch backedge (bb1 -> bb1 via conditional switchInt)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let mut _1: type#8;\n"
+        b"    let _2: type#4;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 0: type#8;\n"
+        b"        goto -> bb1;\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        _1 = wrapping_add(copy _1, const 1: type#8);\n"
+        b"        _2 = copy _1 < const 10: type#8;\n"
+        b"        switchInt(copy _2) -> [0: bb2, otherwise: bb1];\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _0 = copy _1;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 21: OPT_TERM_SWITCH_INT multi-arm loop backedge (bb1 -> bb1 via multi-value switchInt)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let mut _1: type#8;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 1: type#8;\n"
+        b"        goto -> bb1;\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        switchInt(copy _1) -> [0: bb2, 1: bb1, otherwise: bb2];\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _0 = copy _1;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 22: SCCP TY_BOOL MIR_CONST_BOOL + operand clearing + DCE dead value & DeadStore elimination
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let _1: type#4;\n"
+        b"    let _2: type#4;\n"
+        b"    let _3: type#4;\n"
+        b"    let _4: type#8;\n"
+        b"    let mut _5: type#8;\n"
+        b"    let _6: type#1;\n"
+        b"    bb0: {\n"
+        b"        _1 = const true;\n"
+        b"        _2 = const false;\n"
+        b"        _3 = copy _1 & copy _2;\n"
+        b"        _4 = wrapping_add(const 10: type#8, const 32: type#8);\n"
+        b"        _5 = const 100: type#8;\n"
+        b"        _5 = const 200: type#8;\n"
+        b"        _6 = &_5;\n"
+        b"        switchInt(copy _3) -> [0: bb1, otherwise: bb2];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        _0 = copy _5;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _0 = const 999: type#8;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"}\n"
+    ),
+    # 23: Stale RangeInfo invalidation guard fixture (singleton range on non-Const SSA value)
+    (
+        b"mir_body {\n"
+        b"    let mut _0: type#8;\n"
+        b"    let _1: type#8;\n"
+        b"    bb0: {\n"
+        b"        _1 = const 0: type#8 + const 1: type#8;\n"
+        b"        switchInt(copy _1) -> [0: bb2, otherwise: bb1];\n"
+        b"    }\n"
+        b"    bb1: {\n"
+        b"        _0 = const 42: type#8;\n"
+        b"        return;\n"
+        b"    }\n"
+        b"    bb2: {\n"
+        b"        _0 = const 7: type#8;\n"
         b"        return;\n"
         b"    }\n"
         b"}\n"

@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T601]
 priority: 95
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/passmgr, compiler/opt/effects, tests/run/opt_passmgr]
 locks: [compiler/opt/mod.ax, compiler/opt/optir/mod.ax, tests/selfhost/opt]
 spec: [spec/SPEC-70-optir-ssa-memoryssa.md, tasks/0399, tasks/0438, tasks/0443, tasks/0447, tasks/0474, tasks/0480, tasks/0487, tasks/0545, tasks/0546, tasks/0579, tasks/0795, tasks/0797]
 covers: [REQ-CORE-447, REQ-VER-027, REQ-OPT-060, REQ-OPT-061, REQ-OPT-062, REQ-OPT-063, REQ-OPT-064, REQ-OPT-065, REQ-OPT-348, REQ-OPT-349, REQ-OPT-350, REQ-OPT-355, REQ-OPT-356, REQ-OPT-373, REQ-OPT-374, REQ-OPT-393, REQ-OPT-394, REQ-OPT-395, REQ-OPT-396, REQ-OPT-404, REQ-OPT-405, REQ-OPT-406]
 started: 2026-11-03 22:52:04
-agent: T602-impl
+finished: 2026-11-04 09:01:14
 ---
 # T602 — E15.1 — Optimization pass manager, effect/proof summaries & transformation contract verifier
 
@@ -46,3 +46,4 @@ Implement the `OptIR` Pass Manager, canonical `EffectInfo` inference engine, ana
 - 2026-11-03 12:16:28 started (attempt 1) 
 - 2026-11-03 22:51:47 requeue: restart (not charged: attempt refunded)
 - 2026-11-03 22:52:04 started (attempt 1) T602-impl
+- 2026-11-04 09:01:14 accepted by QA -> done

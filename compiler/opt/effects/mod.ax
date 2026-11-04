@@ -1,0 +1,1208 @@
+// Canonical, deterministic, conservative EffectInfo inference and call-graph effect summary
+// propagation over MIR/OptIR (T602 / E15.1).
+// Implements SPEC-70 §7.3-7.4 (AXS-OPT-023, AXS-OPT-024, AXS-OPT-044,
+// REQ-OPT-321, REQ-OPT-348, REQ-OPT-349, REQ-OPT-393..398, REQ-VER-027).
+module compiler.opt.effects
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.mir_proj_at
+use compiler.opt.optir.ANALYSIS_EFFECT_INFO
+use compiler.opt.optir.CERTAINTY_POSSIBLE
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.CERTAINTY_UNKNOWN
+use compiler.opt.optir.EFFECT_ALLOCATES
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_FFI
+use compiler.opt.optir.EFFECT_IO
+use compiler.opt.optir.EFFECT_MAY_PANIC
+use compiler.opt.optir.EFFECT_NONTERM
+use compiler.opt.optir.EFFECT_PURE
+use compiler.opt.optir.EFFECT_READS_MEM
+use compiler.opt.optir.EFFECT_UNKNOWN
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.EFFECT_WRITES_MEM
+use compiler.opt.optir.ALIAS_NO_ALIAS
+use compiler.opt.optir.OPT_BB_NONE
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_FLAG_MAY_TRAP
+use compiler.opt.optir.OPT_FLAG_STORAGE_DEAD
+use compiler.opt.optir.OPT_FLAG_STORAGE_LIVE
+use compiler.opt.optir.OPT_INST_ADDR_OF
+use compiler.opt.optir.OPT_INST_AGGREGATE
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BINOP
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_CAST
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_CONST
+use compiler.opt.optir.OPT_INST_COPY
+use compiler.opt.optir.OPT_INST_DISCRIMINANT
+use compiler.opt.optir.OPT_INST_DROP_FLAG
+use compiler.opt.optir.OPT_INST_EXTRACT_FIELD
+use compiler.opt.optir.OPT_INST_INSERT_FIELD
+use compiler.opt.optir.OPT_INST_LEN
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_NONE
+use compiler.opt.optir.OPT_INST_NOP
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_UNOP
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_WRAPPING_BINOP
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_LOCAL_MEMORY
+use compiler.opt.optir.OPT_PASS_MEMSSA_CONSTRUCT
+use compiler.opt.optir.OPT_TERM_ASSERT
+use compiler.opt.optir.OPT_TERM_BRANCH
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_DROP
+use compiler.opt.optir.OPT_TERM_GOTO
+use compiler.opt.optir.OPT_TERM_RETURN
+use compiler.opt.optir.OPT_TERM_SWITCH_INT
+use compiler.opt.optir.OPT_TERM_UNREACHABLE
+use compiler.opt.optir.OPT_VALUE_NONE
+use compiler.opt.optir.PROP_PURE_CALL
+use compiler.opt.optir.STORAGE_STACK_LOCAL
+use compiler.opt.optir.MemoryRegion
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBlock
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInst
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptTerminator
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.opt_bbid_at
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_bool_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_u8_at
+use compiler.opt.optir.opt_u32_at
+use compiler.opt.optir.optir_query_no_overflow_certainty
+use compiler.opt.optir.optir_query_non_zero_certainty
+use compiler.opt.optir.optir_record_provenance
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// --- Composite Effect Masks (AXS-OPT-023, REQ-OPT-321, REQ-OPT-348..349) ---
+
+pub const EFFECT_MASK_ALL_OBSERVABLE: u16 = 1022u16; // Everything except EFFECT_READS_MEM (1)
+pub const EFFECT_MASK_NON_STORE_OBSERVABLE: u16 = 1020u16; // Observable effects other than EFFECT_WRITES_MEM (2)
+pub const EFFECT_MASK_SIDE_EFFECT: u16 = 1022u16;    // WritesMem | MayPanic | Allocates | IO | Atomic | Volatile | FFI | NonTerm | Unknown
+pub const EFFECT_MASK_ORDERING_BARRIER: u16 = 1012u16; // MayPanic(4) | IO(16) | Atomic(32) | Volatile(64) | FFI(128) | NonTerm(256) | Unknown(512)
+pub const EFFECT_MASK_HARDWARE_BARRIER: u16 = 240u16;  // IO(16) | Atomic(32) | Volatile(64) | FFI(128)
+pub const EFFECT_MASK_CONSERVATIVE_CALL: u16 = 519u16; // ReadsMem(1) | WritesMem(2) | MayPanic(4) | Unknown(512)
+
+// --- Intrinsic & Host Call Classifications (AXS-OPT-023, AXS-OPT-044) ---
+
+pub const CALL_KIND_PURE_INTRINSIC: u8 = 0u8;
+pub const CALL_KIND_READ_ONLY_INTRINSIC: u8 = 1u8;
+pub const CALL_KIND_MEM_COPY_INTRINSIC: u8 = 2u8;
+pub const CALL_KIND_ALLOC_INTRINSIC: u8 = 3u8;
+pub const CALL_KIND_PANIC_ABORT: u8 = 4u8;
+pub const CALL_KIND_HOST_IO: u8 = 5u8;
+pub const CALL_KIND_VOLATILE_INTRINSIC: u8 = 6u8;
+pub const CALL_KIND_ATOMIC_INTRINSIC: u8 = 7u8;
+pub const CALL_KIND_BLACK_BOX: u8 = 8u8;
+pub const CALL_KIND_ZEROIZE: u8 = 9u8;
+pub const CALL_KIND_FFI_EXTERNAL: u8 = 10u8;
+pub const CALL_KIND_INDIRECT_UNKNOWN: u8 = 11u8;
+
+// --- Execution Domain Profiles (REQ-VER-027, REQ-OPT-349) ---
+
+pub const EXEC_DOMAIN_HOST: u8 = 0u8;
+pub const EXEC_DOMAIN_COMPTIME: u8 = 1u8;
+pub const EXEC_DOMAIN_KERNEL: u8 = 2u8;
+
+// --- EffectSummary & Call Summary Table Structures ---
+
+@derive(Copy)
+pub struct EffectSummary {
+    pub fn_sym: SymbolId,
+    pub flags: u16,
+    pub pure_certainty: u8,
+    pub no_panic_certainty: u8,
+    pub read_only_certainty: u8,
+    pub inst_barriers: u32,
+    pub call_count: u32,
+    pub unknown_call_count: u32,
+    pub volatile_count: u32,
+    pub atomic_count: u32,
+    pub io_count: u32,
+    pub panic_count: u32,
+    pub alloc_count: u32,
+    pub drop_count: u32,
+}
+
+@derive(Copy)
+pub struct CallEffectEntry {
+    pub callee_sym: SymbolId,
+    pub callee_val: OptValueId,
+    pub summary: EffectSummary,
+}
+
+pub struct EffectCallTable {
+    pub entries: *mut CallEffectEntry,
+    pub count: usize,
+    pub cap: usize,
+}
+
+@derive(Copy)
+pub struct EffectCallEdge {
+    pub caller_idx: u32,
+    pub callee_idx: u32,
+}
+
+pub struct EffectCallGraph {
+    pub node_syms: *mut SymbolId,
+    pub local_flags: *mut u16,
+    pub prop_flags: *mut u16,
+    pub has_unresolved_call: *mut bool,
+    pub is_recursive: *mut bool,
+    pub scratch_visited: *mut bool,
+    pub scratch_queue: *mut u32,
+    pub scratch_affected: *mut bool,
+    pub scratch_saved_prop: *mut u16,
+    pub node_count: usize,
+    pub node_cap: usize,
+    pub edges: *mut EffectCallEdge,
+    pub edge_count: usize,
+    pub edge_cap: usize,
+}
+
+// --- Pointer Indexing Helpers ---
+
+fn eff_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn eff_u16_at(base: *mut u16, idx: usize) -> *mut u16 {
+    let off = ((idx as isize) * (size_of<u16>() as isize)) as usize;
+    ((base as usize) + off) as *mut u16
+}
+
+pub unsafe fn eff_sym_at(base: *mut SymbolId, idx: usize) -> *mut SymbolId {
+    let off = ((idx as isize) * (size_of<SymbolId>() as isize)) as usize;
+    ((base as usize) + off) as *mut SymbolId
+}
+
+pub unsafe fn eff_entry_at(base: *mut CallEffectEntry, idx: usize) -> *mut CallEffectEntry {
+    let off = ((idx as isize) * (size_of<CallEffectEntry>() as isize)) as usize;
+    ((base as usize) + off) as *mut CallEffectEntry
+}
+
+pub unsafe fn eff_edge_at(base: *mut EffectCallEdge, idx: usize) -> *mut EffectCallEdge {
+    let off = ((idx as isize) * (size_of<EffectCallEdge>() as isize)) as usize;
+    ((base as usize) + off) as *mut EffectCallEdge
+}
+
+// --- Lattice & Fail-Closed Purity Predicates (REQ-OPT-348, REQ-OPT-398) ---
+
+pub fn effect_join(a: u16, b: u16) -> u16 {
+    a | b
+}
+
+pub fn effect_is_pure(flags: u16) -> bool {
+    // Fail-closed: EFFECT_UNKNOWN or any other flag is NEVER treated as EFFECT_PURE (REQ-OPT-348).
+    flags == EFFECT_PURE
+}
+
+pub fn effect_is_unknown(flags: u16) -> bool {
+    (flags & EFFECT_UNKNOWN) != 0u16
+}
+
+pub fn effect_is_read_only(flags: u16) -> bool {
+    (flags & EFFECT_MASK_SIDE_EFFECT) == 0u16
+}
+
+pub fn effect_has_side_effects(flags: u16) -> bool {
+    (flags & EFFECT_MASK_SIDE_EFFECT) != 0u16
+}
+
+pub fn effect_is_ordering_barrier(flags: u16) -> bool {
+    (flags & EFFECT_MASK_ORDERING_BARRIER) != 0u16
+}
+
+pub fn effect_pure_certainty(flags: u16) -> u8 {
+    if flags == EFFECT_PURE {
+        return CERTAINTY_PROVEN;
+    }
+    if (flags & EFFECT_UNKNOWN) != 0u16 {
+        return CERTAINTY_UNKNOWN;
+    }
+    CERTAINTY_UNKNOWN
+}
+
+pub fn effect_no_panic_certainty(flags: u16) -> u8 {
+    if (flags & (EFFECT_MAY_PANIC | EFFECT_NONTERM | EFFECT_UNKNOWN)) == 0u16 {
+        return CERTAINTY_PROVEN;
+    }
+    if (flags & EFFECT_UNKNOWN) != 0u16 {
+        return CERTAINTY_UNKNOWN;
+    }
+    CERTAINTY_POSSIBLE
+}
+
+pub fn effect_read_only_certainty(flags: u16) -> u8 {
+    if (flags & EFFECT_MASK_SIDE_EFFECT) == 0u16 {
+        return CERTAINTY_PROVEN;
+    }
+    if (flags & EFFECT_UNKNOWN) != 0u16 {
+        return CERTAINTY_UNKNOWN;
+    }
+    CERTAINTY_UNKNOWN
+}
+
+pub fn effect_annotation_matches_inferred(inferred_flags: u16, declared_flags: u16) -> bool {
+    // Declared annotations are only sound against inferred facts when no Unknown call remains
+    // and every inferred effect bit is permitted by declared_flags (REQ-OPT-396).
+    if (inferred_flags & EFFECT_UNKNOWN) != 0u16 {
+        return false;
+    }
+    (inferred_flags & (0xFFFFu16 ^ declared_flags)) == 0u16
+}
+
+pub fn effect_resolve_declared_flags(
+    inferred_flags: u16,
+    declared_flags: u16,
+    policy_verified: bool
+) -> u16 {
+    // Unverified annotations NEVER weaken inferred effects or turn Unknown into Pure (REQ-OPT-396).
+    if !policy_verified {
+        return effect_join(inferred_flags, declared_flags);
+    }
+    // Policy-verified intrinsic / FFI boundary may refine opaque conservative call effects,
+    // while still preserving any concrete inferred effect bits.
+    if (inferred_flags & EFFECT_UNKNOWN) != 0u16 {
+        let concrete = inferred_flags & (0xFFFFu16 ^ EFFECT_MASK_CONSERVATIVE_CALL);
+        return effect_join(concrete, declared_flags);
+    }
+    effect_join(inferred_flags, declared_flags)
+}
+
+pub fn effect_for_call_kind(call_kind: u8) -> u16 {
+    if call_kind == CALL_KIND_PURE_INTRINSIC {
+        return EFFECT_PURE;
+    }
+    if call_kind == CALL_KIND_READ_ONLY_INTRINSIC {
+        return EFFECT_READS_MEM;
+    }
+    if call_kind == CALL_KIND_MEM_COPY_INTRINSIC {
+        return EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_ALLOC_INTRINSIC {
+        return EFFECT_ALLOCATES | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_PANIC_ABORT {
+        return EFFECT_MAY_PANIC | EFFECT_NONTERM;
+    }
+    if call_kind == CALL_KIND_HOST_IO {
+        return EFFECT_IO | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC;
+    }
+    if call_kind == CALL_KIND_VOLATILE_INTRINSIC {
+        return EFFECT_VOLATILE | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_ATOMIC_INTRINSIC {
+        return EFFECT_ATOMIC | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_BLACK_BOX {
+        return EFFECT_VOLATILE | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_ZEROIZE {
+        return EFFECT_VOLATILE | EFFECT_WRITES_MEM;
+    }
+    if call_kind == CALL_KIND_FFI_EXTERNAL {
+        return EFFECT_FFI | EFFECT_IO | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC | EFFECT_UNKNOWN;
+    }
+    // CALL_KIND_INDIRECT_UNKNOWN or any unrecognized call kind fails closed to Unknown
+    EFFECT_MASK_CONSERVATIVE_CALL
+}
+
+// --- EffectSummary Constructors & Queries ---
+
+pub fn effect_summary_empty(fn_sym: SymbolId) -> EffectSummary {
+    EffectSummary {
+        fn_sym: SymbolId { v: fn_sym.v },
+        flags: EFFECT_PURE,
+        pure_certainty: CERTAINTY_PROVEN,
+        no_panic_certainty: CERTAINTY_PROVEN,
+        read_only_certainty: CERTAINTY_PROVEN,
+        inst_barriers: 0u32,
+        call_count: 0u32,
+        unknown_call_count: 0u32,
+        volatile_count: 0u32,
+        atomic_count: 0u32,
+        io_count: 0u32,
+        panic_count: 0u32,
+        alloc_count: 0u32,
+        drop_count: 0u32,
+    }
+}
+
+pub fn effect_summary_from_flags(fn_sym: SymbolId, flags: u16) -> EffectSummary {
+    EffectSummary {
+        fn_sym: SymbolId { v: fn_sym.v },
+        flags: flags,
+        pure_certainty: effect_pure_certainty(flags),
+        no_panic_certainty: effect_no_panic_certainty(flags),
+        read_only_certainty: effect_read_only_certainty(flags),
+        inst_barriers: if (flags & EFFECT_MASK_ORDERING_BARRIER) != 0u16 { 1u32 } else { 0u32 },
+        call_count: 0u32,
+        unknown_call_count: if (flags & EFFECT_UNKNOWN) != 0u16 { 1u32 } else { 0u32 },
+        volatile_count: if (flags & EFFECT_VOLATILE) != 0u16 { 1u32 } else { 0u32 },
+        atomic_count: if (flags & EFFECT_ATOMIC) != 0u16 { 1u32 } else { 0u32 },
+        io_count: if (flags & EFFECT_IO) != 0u16 { 1u32 } else { 0u32 },
+        panic_count: if (flags & EFFECT_MAY_PANIC) != 0u16 { 1u32 } else { 0u32 },
+        alloc_count: if (flags & EFFECT_ALLOCATES) != 0u16 { 1u32 } else { 0u32 },
+        drop_count: 0u32,
+    }
+}
+
+pub fn effect_summary_merge(dst: mut_view<EffectSummary>, src: view<EffectSummary>) {
+    let joined = effect_join(dst.flags, src.flags);
+    dst.flags = joined;
+    dst.pure_certainty = effect_pure_certainty(joined);
+    dst.no_panic_certainty = effect_no_panic_certainty(joined);
+    dst.read_only_certainty = effect_read_only_certainty(joined);
+    dst.inst_barriers = dst.inst_barriers + src.inst_barriers;
+    dst.call_count = dst.call_count + src.call_count;
+    dst.unknown_call_count = dst.unknown_call_count + src.unknown_call_count;
+    dst.volatile_count = dst.volatile_count + src.volatile_count;
+    dst.atomic_count = dst.atomic_count + src.atomic_count;
+    dst.io_count = dst.io_count + src.io_count;
+    dst.panic_count = dst.panic_count + src.panic_count;
+    dst.alloc_count = dst.alloc_count + src.alloc_count;
+    dst.drop_count = dst.drop_count + src.drop_count;
+}
+
+pub fn effect_summary_is_pure(s: view<EffectSummary>) -> bool {
+    s.flags == EFFECT_PURE && s.pure_certainty == CERTAINTY_PROVEN
+}
+
+pub fn effect_summary_has_io(s: view<EffectSummary>) -> bool {
+    (s.flags & EFFECT_IO) != 0u16
+}
+
+pub fn effect_summary_has_volatile(s: view<EffectSummary>) -> bool {
+    (s.flags & EFFECT_VOLATILE) != 0u16
+}
+
+pub fn effect_summary_has_atomic(s: view<EffectSummary>) -> bool {
+    (s.flags & EFFECT_ATOMIC) != 0u16
+}
+
+pub fn effect_summary_may_panic(s: view<EffectSummary>) -> bool {
+    (s.flags & EFFECT_MAY_PANIC) != 0u16
+}
+
+pub fn effect_summary_is_unknown(s: view<EffectSummary>) -> bool {
+    (s.flags & EFFECT_UNKNOWN) != 0u16
+}
+
+// --- Call Summary Table Operations ---
+
+pub fn effect_call_table_init(table: mut_view<EffectCallTable>, arena: mut_view<Arena>, initial_cap: usize) {
+    let cap: usize = if initial_cap == 0 { 16 } else { initial_cap };
+    let bytes = eff_mul_usize(cap, size_of<CallEffectEntry>());
+    table.entries = arena_alloc_raw(mut_view(*arena), bytes, align_of<CallEffectEntry>()) as *mut CallEffectEntry;
+    table.count = 0;
+    table.cap = cap;
+}
+
+pub fn effect_call_table_register(
+    table: mut_view<EffectCallTable>,
+    arena: mut_view<Arena>,
+    callee_sym: SymbolId,
+    callee_val: OptValueId,
+    summary: EffectSummary
+) {
+    let mut i: usize = 0;
+    while i < table.count {
+        let ep = unsafe { eff_entry_at(table.entries, i) };
+        let match_sym = callee_sym.v != 0u32 && (unsafe { (*ep).callee_sym.v }) == callee_sym.v;
+        let match_val = callee_val.v != OPT_VALUE_NONE && (unsafe { (*ep).callee_val.v }) == callee_val.v;
+        if match_sym || match_val {
+            unsafe { (*ep).summary = summary; }
+            return;
+        }
+        i = i + 1;
+    }
+    if table.count >= table.cap {
+        let new_cap: usize = if table.cap == 0 { 16 } else { table.cap + table.cap };
+        let new_bytes = eff_mul_usize(new_cap, size_of<CallEffectEntry>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<CallEffectEntry>()) as *mut CallEffectEntry;
+        let mut j: usize = 0;
+        while j < table.count {
+            let src_e = unsafe { eff_entry_at(table.entries, j) };
+            let dst_e = unsafe { eff_entry_at(new_arr, j) };
+            unsafe { *dst_e = *src_e; }
+            j = j + 1;
+        }
+        table.entries = new_arr;
+        table.cap = new_cap;
+    }
+    let idx = table.count;
+    table.count = idx + 1;
+    let dst = unsafe { eff_entry_at(table.entries, idx) };
+    unsafe {
+        (*dst).callee_sym = SymbolId { v: callee_sym.v };
+        (*dst).callee_val = OptValueId { v: callee_val.v };
+        (*dst).summary = summary;
+    }
+}
+
+pub fn effect_call_table_lookup(
+    table: *const EffectCallTable,
+    callee_sym: SymbolId,
+    callee_val: OptValueId
+) -> EffectSummary {
+    if (table as usize) != 0 {
+        let cnt = unsafe { (*table).count };
+        let entries = unsafe { (*table).entries };
+        let mut i: usize = 0;
+        while i < cnt {
+            let ep = unsafe { eff_entry_at(entries, i) };
+            if callee_sym.v != 0u32 && (unsafe { (*ep).callee_sym.v }) == callee_sym.v {
+                return unsafe { (*ep).summary };
+            }
+            if callee_val.v != OPT_VALUE_NONE && (unsafe { (*ep).callee_val.v }) == callee_val.v {
+                return unsafe { (*ep).summary };
+            }
+            i = i + 1;
+        }
+    }
+    // Unresolved / unknown callee fails closed to conservative call effects (REQ-OPT-348, REQ-OPT-398).
+    effect_summary_from_flags(SymbolId { v: callee_sym.v }, EFFECT_MASK_CONSERVATIVE_CALL)
+}
+
+// --- Instruction, Terminator, Block & Body Effect Inference ---
+
+fn eff_place_has_dynamic_index(place_projs: usize, proj_count: usize) -> bool {
+    if proj_count == 0 || place_projs == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < proj_count {
+        let pr = unsafe { mir_proj_at(place_projs as *mut MirProjection, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX || pk == MIR_PROJ_SUB_SLICE {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn effect_infer_inst(body: view<OptBody>, inst: view<OptInst>, max_steps: u32) -> u16 {
+    let opc = inst.opcode;
+    let mut eff = EFFECT_PURE;
+
+    // 1. Check arithmetic / trap / panic effects using Proven range certainty when available
+    if opc == OPT_INST_CHECKED_BINOP {
+        let ovf_cert = optir_query_no_overflow_certainty(
+            view(*body),
+            inst.sub_op,
+            TypeId { v: inst.ty.v },
+            OptValueId { v: inst.lhs.v },
+            OptValueId { v: inst.rhs.v },
+            max_steps
+        );
+        if ovf_cert != CERTAINTY_PROVEN {
+            eff = eff | EFFECT_MAY_PANIC;
+        }
+    } else if opc == OPT_INST_BINOP {
+        let sub = inst.sub_op;
+        if sub == MIR_BINOP_DIV || sub == MIR_BINOP_REM {
+            let nz = optir_query_non_zero_certainty(view(*body), OptValueId { v: inst.rhs.v }, max_steps);
+            let ovf = optir_query_no_overflow_certainty(
+                view(*body),
+                sub,
+                TypeId { v: inst.ty.v },
+                OptValueId { v: inst.lhs.v },
+                OptValueId { v: inst.rhs.v },
+                max_steps
+            );
+            if nz != CERTAINTY_PROVEN || ovf != CERTAINTY_PROVEN {
+                eff = eff | EFFECT_MAY_PANIC;
+            }
+        } else if (inst.flags & OPT_FLAG_MAY_TRAP) != 0u16 {
+            let ovf = optir_query_no_overflow_certainty(
+                view(*body),
+                sub,
+                TypeId { v: inst.ty.v },
+                OptValueId { v: inst.lhs.v },
+                OptValueId { v: inst.rhs.v },
+                max_steps
+            );
+            if ovf != CERTAINTY_PROVEN {
+                eff = eff | EFFECT_MAY_PANIC;
+            }
+        }
+    } else if (inst.flags & OPT_FLAG_MAY_TRAP) != 0u16 {
+        eff = eff | EFFECT_MAY_PANIC;
+    }
+
+    // 2. Check dynamic slice/array index bounds trap hazard
+    if eff_place_has_dynamic_index(inst.place.projs as usize, inst.place.proj_count) ||
+       eff_place_has_dynamic_index(inst.rhs_place.projs as usize, inst.rhs_place.proj_count) {
+        eff = eff | EFFECT_MAY_PANIC;
+    }
+
+    // 3. Check memory, volatile, atomic, and barrier opcodes (REQ-OPT-393..396)
+    if opc == OPT_INST_LOAD || opc == OPT_INST_LEN || opc == OPT_INST_DISCRIMINANT {
+        eff = eff | EFFECT_READS_MEM;
+    } else if opc == OPT_INST_EXTRACT_FIELD {
+        if inst.mem_use.v != 0xFFFFFFFFu32 {
+            eff = eff | EFFECT_READS_MEM;
+        }
+    } else if opc == OPT_INST_STORE {
+        eff = eff | EFFECT_WRITES_MEM;
+    } else if opc == OPT_INST_INSERT_FIELD {
+        if inst.mem_def.v != 0xFFFFFFFFu32 {
+            eff = eff | EFFECT_WRITES_MEM;
+        }
+    } else if opc == OPT_INST_AGGREGATE {
+        let lv = inst.place.local.v as usize;
+        if lv < body.local_count && (body.local_modes as usize) != 0 {
+            let mode = unsafe { *opt_u8_at(body.local_modes, lv) };
+            if mode == OPT_LOCAL_MEMORY {
+                eff = eff | EFFECT_WRITES_MEM;
+            }
+        }
+    } else if opc == OPT_INST_VOLATILE_LOAD {
+        eff = eff | EFFECT_READS_MEM | EFFECT_VOLATILE;
+    } else if opc == OPT_INST_VOLATILE_STORE {
+        eff = eff | EFFECT_WRITES_MEM | EFFECT_VOLATILE;
+    } else if opc == OPT_INST_ATOMIC {
+        eff = eff | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_ATOMIC;
+    } else if opc == OPT_INST_BLACK_BOX {
+        eff = eff | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_VOLATILE;
+    } else if opc == OPT_INST_ZEROIZE {
+        eff = eff | EFFECT_WRITES_MEM | EFFECT_VOLATILE;
+    } else if opc == OPT_INST_DROP_FLAG {
+        eff = eff | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+    } else if opc == OPT_INST_CONST || opc == OPT_INST_COPY || opc == OPT_INST_BINOP ||
+              opc == OPT_INST_CHECKED_BINOP || opc == OPT_INST_WRAPPING_BINOP ||
+              opc == OPT_INST_UNOP || opc == OPT_INST_CAST || opc == OPT_INST_ADDR_OF || opc == OPT_INST_NOP {
+        // Pure scalar/SSA value operations unless flagged above
+    } else {
+        eff = eff | EFFECT_UNKNOWN;
+    }
+
+    eff
+}
+
+pub fn effect_infer_term_with_table(
+    body: view<OptBody>,
+    term: view<OptTerminator>,
+    call_table: *const EffectCallTable
+) -> EffectSummary {
+    let _ = body;
+    let tk = term.kind;
+    if tk == OPT_TERM_GOTO || tk == OPT_TERM_BRANCH || tk == OPT_TERM_SWITCH_INT || tk == OPT_TERM_RETURN {
+        return effect_summary_empty(SymbolId { v: 0u32 });
+    }
+    if tk == OPT_TERM_ASSERT || tk == OPT_TERM_UNREACHABLE {
+        let mut s = effect_summary_from_flags(SymbolId { v: 0u32 }, EFFECT_MAY_PANIC);
+        s.panic_count = 1u32;
+        s.inst_barriers = 1u32;
+        return s;
+    }
+    if tk == OPT_TERM_DROP {
+        let mut s = effect_summary_from_flags(
+            SymbolId { v: 0u32 },
+            EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC
+        );
+        s.drop_count = 1u32;
+        s.panic_count = 1u32;
+        s.inst_barriers = 1u32;
+        return s;
+    }
+    if tk == OPT_TERM_CALL {
+        let mut cs = effect_call_table_lookup(
+            call_table,
+            SymbolId { v: 0u32 },
+            OptValueId { v: term.callee.v }
+        );
+        cs.call_count = 1u32;
+        if (cs.flags & EFFECT_UNKNOWN) != 0u16 {
+            cs.unknown_call_count = 1u32;
+        } else {
+            cs.unknown_call_count = 0u32;
+        }
+        return cs;
+    }
+    effect_summary_from_flags(SymbolId { v: 0u32 }, EFFECT_UNKNOWN)
+}
+
+pub fn effect_infer_block_with_table(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    call_table: *const EffectCallTable,
+    max_steps: u32
+) -> EffectSummary {
+    let mut sum = effect_summary_empty(SymbolId { v: body.fn_sym.v });
+    let icnt = bb.inst_count;
+    let insts = bb.insts;
+    let mut i: usize = 0;
+    while i < icnt {
+        let inst = unsafe { opt_inst_at(insts, i) };
+        let ieff = effect_infer_inst(view(*body), unsafe { view(*inst) }, max_steps);
+        let opc = unsafe { (*inst).opcode };
+        let flags = unsafe { (*inst).flags };
+        sum.flags = effect_join(sum.flags, ieff);
+        if (ieff & EFFECT_VOLATILE) != 0u16 || opc == OPT_INST_VOLATILE_LOAD ||
+           opc == OPT_INST_VOLATILE_STORE || opc == OPT_INST_BLACK_BOX || opc == OPT_INST_ZEROIZE {
+            sum.volatile_count = sum.volatile_count + 1u32;
+        }
+        if (ieff & EFFECT_ATOMIC) != 0u16 || opc == OPT_INST_ATOMIC {
+            sum.atomic_count = sum.atomic_count + 1u32;
+        }
+        if (ieff & EFFECT_IO) != 0u16 {
+            sum.io_count = sum.io_count + 1u32;
+        }
+        if (ieff & EFFECT_MAY_PANIC) != 0u16 {
+            sum.panic_count = sum.panic_count + 1u32;
+        }
+        if (ieff & EFFECT_ALLOCATES) != 0u16 {
+            sum.alloc_count = sum.alloc_count + 1u32;
+        }
+        if (flags & OPT_FLAG_BARRIER) != 0u16 || (ieff & EFFECT_MASK_ORDERING_BARRIER) != 0u16 {
+            sum.inst_barriers = sum.inst_barriers + 1u32;
+        }
+        i = i + 1;
+    }
+    if bb.has_term {
+        let tsum = effect_infer_term_with_table(view(*body), view(bb.term), call_table);
+        effect_summary_merge(mut_view(sum), view(tsum));
+    }
+    sum.pure_certainty = effect_pure_certainty(sum.flags);
+    sum.no_panic_certainty = effect_no_panic_certainty(sum.flags);
+    sum.read_only_certainty = effect_read_only_certainty(sum.flags);
+    sum
+}
+
+pub fn effect_infer_body_with_table(
+    body: mut_view<OptBody>,
+    arena: mut_view<Arena>,
+    call_table: *const EffectCallTable,
+    max_steps: u32
+) -> EffectSummary {
+    let mut total = effect_summary_empty(SymbolId { v: body.fn_sym.v });
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { opt_block_at(body.blocks, b) };
+        if unsafe { (*bb).is_reachable } {
+            let bsum = effect_infer_block_with_table(view(*body), unsafe { view(*bb) }, call_table, max_steps);
+            effect_summary_merge(mut_view(total), view(bsum));
+
+            // Record PROP_PURE_CALL ProofProvenance for call terminators (REQ-OPT-401, REQ-OPT-405)
+            if (unsafe { (*bb).has_term }) && (unsafe { (*bb).term.kind }) == OPT_TERM_CALL {
+                let csum = effect_infer_term_with_table(view(*body), unsafe { view((*bb).term) }, call_table);
+                let callee_v = unsafe { (*bb).term.callee.v };
+                optir_record_provenance(
+                    mut_view(*body),
+                    mut_view(*arena),
+                    PROP_PURE_CALL,
+                    csum.pure_certainty,
+                    ANALYSIS_EFFECT_INFO,
+                    OptValueId { v: callee_v },
+                    OptValueId { v: OPT_VALUE_NONE },
+                    OptBbId { v: b as u32 },
+                    OptInstId { v: OPT_INST_NONE },
+                    OPT_PASS_MEMSSA_CONSTRUCT
+                );
+            }
+
+            // Detect CFG backedges (u -> v where v.rpo_idx <= u.rpo_idx) that could be unbounded loops
+            let u_rpo = unsafe { (*bb).rpo_idx };
+            let scnt = unsafe { (*bb).succ_count };
+            let succs = unsafe { (*bb).succs };
+            let mut s: usize = 0;
+            while s < scnt {
+                let sv = (unsafe { (*opt_bbid_at(succs, s)).v }) as usize;
+                if sv < body.bb_count {
+                    let sbb = unsafe { opt_block_at(body.blocks, sv) };
+                    let v_rpo = unsafe { (*sbb).rpo_idx };
+                    if (unsafe { (*sbb).is_reachable }) && v_rpo != OPT_BB_NONE && u_rpo != OPT_BB_NONE && v_rpo <= u_rpo {
+                        // Conservative loop non-termination tracking across all terminator kinds unless bounded
+                        total.flags = effect_join(total.flags, EFFECT_NONTERM);
+                    }
+                }
+                s = s + 1;
+            }
+        }
+        b = b + 1;
+    }
+    total.pure_certainty = effect_pure_certainty(total.flags);
+    total.no_panic_certainty = effect_no_panic_certainty(total.flags);
+    total.read_only_certainty = effect_read_only_certainty(total.flags);
+    total
+}
+
+pub fn effect_infer_body(
+    body: mut_view<OptBody>,
+    arena: mut_view<Arena>,
+    max_steps: u32
+) -> EffectSummary {
+    effect_infer_body_with_table(body, arena, 0 as *const EffectCallTable, max_steps)
+}
+
+// --- Call-Graph Bottom-Up SCC Fixed-Point Propagation (AXS-OPT-023, REQ-OPT-321) ---
+
+pub fn effect_call_graph_init(
+    cg: mut_view<EffectCallGraph>,
+    arena: mut_view<Arena>,
+    max_nodes: usize,
+    max_edges: usize
+) {
+    let ncap: usize = if max_nodes == 0 { 16 } else { max_nodes };
+    let ecap: usize = if max_edges == 0 { 32 } else { max_edges };
+    cg.node_syms = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<SymbolId>()), align_of<SymbolId>()) as *mut SymbolId;
+    cg.local_flags = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<u16>()), align_of<u16>()) as *mut u16;
+    cg.prop_flags = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<u16>()), align_of<u16>()) as *mut u16;
+    cg.has_unresolved_call = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<bool>()), align_of<bool>()) as *mut bool;
+    cg.is_recursive = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<bool>()), align_of<bool>()) as *mut bool;
+    cg.scratch_visited = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<bool>()), align_of<bool>()) as *mut bool;
+    cg.scratch_queue = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<u32>()), align_of<u32>()) as *mut u32;
+    cg.scratch_affected = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<bool>()), align_of<bool>()) as *mut bool;
+    cg.scratch_saved_prop = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ncap, size_of<u16>()), align_of<u16>()) as *mut u16;
+    cg.node_count = 0;
+    cg.node_cap = ncap;
+    cg.edges = arena_alloc_raw(mut_view(*arena), eff_mul_usize(ecap, size_of<EffectCallEdge>()), align_of<EffectCallEdge>()) as *mut EffectCallEdge;
+    cg.edge_count = 0;
+    cg.edge_cap = ecap;
+}
+
+pub fn effect_call_graph_add_node(
+    cg: mut_view<EffectCallGraph>,
+    fn_sym: SymbolId,
+    local_effects: u16,
+    unresolved_call: bool
+) -> u32 {
+    if cg.node_count >= cg.node_cap {
+        return 0xFFFFFFFFu32;
+    }
+    let idx = cg.node_count;
+    cg.node_count = idx + 1;
+    let init_eff: u16 = if unresolved_call {
+        effect_join(local_effects, EFFECT_MASK_CONSERVATIVE_CALL)
+    } else {
+        local_effects
+    };
+    unsafe {
+        *eff_sym_at(cg.node_syms, idx) = SymbolId { v: fn_sym.v };
+        *eff_u16_at(cg.local_flags, idx) = local_effects;
+        *eff_u16_at(cg.prop_flags, idx) = init_eff;
+        *opt_bool_at(cg.has_unresolved_call, idx) = unresolved_call;
+        *opt_bool_at(cg.is_recursive, idx) = false;
+    }
+    idx as u32
+}
+
+pub fn effect_call_graph_add_edge(
+    cg: mut_view<EffectCallGraph>,
+    caller_idx: u32,
+    callee_idx: u32
+) {
+    if (caller_idx as usize) >= cg.node_count || (callee_idx as usize) >= cg.node_count {
+        return;
+    }
+    if cg.edge_count >= cg.edge_cap {
+        return;
+    }
+    let eidx = cg.edge_count;
+    cg.edge_count = eidx + 1;
+    let ep = unsafe { eff_edge_at(cg.edges, eidx) };
+    unsafe {
+        (*ep).caller_idx = caller_idx;
+        (*ep).callee_idx = callee_idx;
+    }
+    if caller_idx == callee_idx {
+        unsafe { *opt_bool_at(cg.is_recursive, caller_idx as usize) = true; }
+    }
+}
+
+fn eff_cg_can_reach(cg: view<EffectCallGraph>, start_idx: u32, target_idx: u32) -> bool {
+    let n = cg.node_count;
+    if n == 0 || (start_idx as usize) >= n || (target_idx as usize) >= n {
+        return false;
+    }
+    if (cg.scratch_visited as usize) == 0 || (cg.scratch_queue as usize) == 0 {
+        return false;
+    }
+    let mut z: usize = 0;
+    while z < n {
+        unsafe { *opt_bool_at(cg.scratch_visited, z) = false; }
+        z = z + 1;
+    }
+    let mut head: usize = 0;
+    let mut tail: usize = 0;
+    let mut i: usize = 0;
+    while i < cg.edge_count {
+        let ep = unsafe { eff_edge_at(cg.edges, i) };
+        if (unsafe { (*ep).caller_idx }) == start_idx {
+            let dst = unsafe { (*ep).callee_idx };
+            if dst == target_idx {
+                return true;
+            }
+            let dst_u = dst as usize;
+            if dst_u < n && !(unsafe { *opt_bool_at(cg.scratch_visited, dst_u) }) {
+                unsafe {
+                    *opt_bool_at(cg.scratch_visited, dst_u) = true;
+                    *opt_u32_at(cg.scratch_queue, tail) = dst;
+                }
+                tail = tail + 1;
+            }
+        }
+        i = i + 1;
+    }
+    while head < tail {
+        let u = unsafe { *opt_u32_at(cg.scratch_queue, head) };
+        head = head + 1;
+        let mut e: usize = 0;
+        while e < cg.edge_count {
+            let ep = unsafe { eff_edge_at(cg.edges, e) };
+            if (unsafe { (*ep).caller_idx }) == u {
+                let v = unsafe { (*ep).callee_idx };
+                if v == target_idx {
+                    return true;
+                }
+                let v_u = v as usize;
+                if v_u < n && !(unsafe { *opt_bool_at(cg.scratch_visited, v_u) }) {
+                    unsafe {
+                        *opt_bool_at(cg.scratch_visited, v_u) = true;
+                        *opt_u32_at(cg.scratch_queue, tail) = v;
+                    }
+                    tail = tail + 1;
+                }
+            }
+            e = e + 1;
+        }
+    }
+    false
+}
+
+pub fn effect_call_graph_propagate(cg: mut_view<EffectCallGraph>) -> u32 {
+    let n = cg.node_count;
+    if n == 0 {
+        return 0u32;
+    }
+    // 1. Detect direct or mutual recursion cycles (SCCs) -> mark recursive & NonTerm
+    let mut i: usize = 0;
+    while i < n {
+        if eff_cg_can_reach(view(*cg), i as u32, i as u32) {
+            unsafe {
+                *opt_bool_at(cg.is_recursive, i) = true;
+                let cur = *eff_u16_at(cg.prop_flags, i);
+                *eff_u16_at(cg.prop_flags, i) = effect_join(cur, EFFECT_NONTERM);
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Monotone bottom-up fixed-point propagation along call edges
+    let mut rounds: u32 = 0u32;
+    let mut changed = true;
+    while changed && (rounds as usize) <= n + 1 {
+        changed = false;
+        rounds = rounds + 1u32;
+        let mut e: usize = 0;
+        while e < cg.edge_count {
+            let ep = unsafe { eff_edge_at(cg.edges, e) };
+            let u = (unsafe { (*ep).caller_idx }) as usize;
+            let v = (unsafe { (*ep).callee_idx }) as usize;
+            if u < n && v < n {
+                let u_eff = unsafe { *eff_u16_at(cg.prop_flags, u) };
+                let v_eff = unsafe { *eff_u16_at(cg.prop_flags, v) };
+                let joined = effect_join(u_eff, v_eff);
+                if joined != u_eff {
+                    unsafe { *eff_u16_at(cg.prop_flags, u) = joined; }
+                    changed = true;
+                }
+            }
+            e = e + 1;
+        }
+    }
+    rounds
+}
+
+pub fn effect_call_graph_node_summary(cg: view<EffectCallGraph>, node_idx: u32) -> EffectSummary {
+    if (node_idx as usize) >= cg.node_count {
+        return effect_summary_from_flags(SymbolId { v: 0u32 }, EFFECT_UNKNOWN);
+    }
+    let sym = unsafe { *eff_sym_at(cg.node_syms, node_idx as usize) };
+    let flags = unsafe { *eff_u16_at(cg.prop_flags, node_idx as usize) };
+    effect_summary_from_flags(sym, flags)
+}
+
+fn eff_cg_node_base_flags(cg: view<EffectCallGraph>, idx: usize) -> u16 {
+    let loc = unsafe { *eff_u16_at(cg.local_flags, idx) };
+    let unres = unsafe { *opt_bool_at(cg.has_unresolved_call, idx) };
+    let rec = unsafe { *opt_bool_at(cg.is_recursive, idx) };
+    let mut base: u16 = if unres {
+        effect_join(loc, EFFECT_MASK_CONSERVATIVE_CALL)
+    } else {
+        loc
+    };
+    if rec {
+        base = effect_join(base, EFFECT_NONTERM);
+    }
+    base
+}
+
+pub fn effect_call_graph_update_node_local(
+    cg: mut_view<EffectCallGraph>,
+    node_idx: u32,
+    new_local_effects: u16,
+    unresolved_call: bool
+) -> u32 {
+    // Incremental interprocedural summary invalidation along reverse call-graph edges (REQ-OPT-394):
+    // body-local edits that do not change a function's propagated summary return 0 without
+    // reanalyzing callers; otherwise only reverse-reachable callers are re-evaluated.
+    let n = cg.node_count;
+    let idx = node_idx as usize;
+    if idx >= n {
+        return 0u32;
+    }
+    let old_local = unsafe { *eff_u16_at(cg.local_flags, idx) };
+    let old_unres = unsafe { *opt_bool_at(cg.has_unresolved_call, idx) };
+    if old_local == new_local_effects && old_unres == unresolved_call {
+        return 0u32;
+    }
+    let is_rec = unsafe { *opt_bool_at(cg.is_recursive, idx) };
+    unsafe {
+        *eff_u16_at(cg.local_flags, idx) = new_local_effects;
+        *opt_bool_at(cg.has_unresolved_call, idx) = unresolved_call;
+    }
+
+    if (cg.scratch_affected as usize) == 0 || (cg.scratch_saved_prop as usize) == 0 {
+        let _ = effect_call_graph_propagate(mut_view(*cg));
+        return n as u32;
+    }
+
+    // Snapshot propagated summaries and isolate node_idx's SCC first so upstream callers are
+    // skipped completely whenever the SCC's propagated summaries remain unchanged (REQ-OPT-394).
+    let mut z: usize = 0;
+    while z < n {
+        unsafe {
+            *opt_bool_at(cg.scratch_affected, z) = false;
+            *eff_u16_at(cg.scratch_saved_prop, z) = *eff_u16_at(cg.prop_flags, z);
+        }
+        z = z + 1;
+    }
+    unsafe { *opt_bool_at(cg.scratch_affected, idx) = true; }
+    if is_rec {
+        let mut s_idx: usize = 0;
+        while s_idx < n {
+            if s_idx != idx &&
+               eff_cg_can_reach(view(*cg), node_idx, s_idx as u32) &&
+               eff_cg_can_reach(view(*cg), s_idx as u32, node_idx) {
+                unsafe { *opt_bool_at(cg.scratch_affected, s_idx) = true; }
+            }
+            s_idx = s_idx + 1;
+        }
+    }
+
+    let mut r0: usize = 0;
+    while r0 < n {
+        if unsafe { *opt_bool_at(cg.scratch_affected, r0) } {
+            let base = eff_cg_node_base_flags(view(*cg), r0);
+            unsafe { *eff_u16_at(cg.prop_flags, r0) = base; }
+        }
+        r0 = r0 + 1;
+    }
+
+    let mut scc_rounds: usize = 0;
+    let mut scc_iter_changed = true;
+    while scc_iter_changed && scc_rounds <= n + 1 {
+        scc_iter_changed = false;
+        scc_rounds = scc_rounds + 1;
+        let mut e0: usize = 0;
+        while e0 < cg.edge_count {
+            let ep = unsafe { eff_edge_at(cg.edges, e0) };
+            let u = (unsafe { (*ep).caller_idx }) as usize;
+            let v = (unsafe { (*ep).callee_idx }) as usize;
+            if u < n && v < n && (unsafe { *opt_bool_at(cg.scratch_affected, u) }) {
+                let u_eff = unsafe { *eff_u16_at(cg.prop_flags, u) };
+                let v_eff = unsafe { *eff_u16_at(cg.prop_flags, v) };
+                let joined = effect_join(u_eff, v_eff);
+                if joined != u_eff {
+                    unsafe { *eff_u16_at(cg.prop_flags, u) = joined; }
+                    scc_iter_changed = true;
+                }
+            }
+            e0 = e0 + 1;
+        }
+    }
+
+    let mut scc_summary_changed = false;
+    let mut c0: usize = 0;
+    while c0 < n {
+        if (unsafe { *opt_bool_at(cg.scratch_affected, c0) }) &&
+           (unsafe { *eff_u16_at(cg.prop_flags, c0) }) != (unsafe { *eff_u16_at(cg.scratch_saved_prop, c0) }) {
+            scc_summary_changed = true;
+        }
+        c0 = c0 + 1;
+    }
+    if !scc_summary_changed {
+        return 0u32;
+    }
+
+    // SCC summary changed: expand affected set to reverse-reachable upstream callers and propagate.
+    let mut reevaluated_count: u32 = 0u32;
+    let mut u_idx: usize = 0;
+    while u_idx < n {
+        if unsafe { *opt_bool_at(cg.scratch_affected, u_idx) } {
+            reevaluated_count = reevaluated_count + 1u32;
+        } else if eff_cg_can_reach(view(*cg), u_idx as u32, node_idx) {
+            unsafe { *opt_bool_at(cg.scratch_affected, u_idx) = true; }
+            reevaluated_count = reevaluated_count + 1u32;
+        }
+        u_idx = u_idx + 1;
+    }
+
+    let mut r_idx: usize = 0;
+    while r_idx < n {
+        if unsafe { *opt_bool_at(cg.scratch_affected, r_idx) } {
+            let base = eff_cg_node_base_flags(view(*cg), r_idx);
+            unsafe { *eff_u16_at(cg.prop_flags, r_idx) = base; }
+        }
+        r_idx = r_idx + 1;
+    }
+
+    let mut rounds: usize = 0;
+    let mut changed = true;
+    while changed && rounds <= n + 1 {
+        changed = false;
+        rounds = rounds + 1;
+        let mut e: usize = 0;
+        while e < cg.edge_count {
+            let ep = unsafe { eff_edge_at(cg.edges, e) };
+            let u = (unsafe { (*ep).caller_idx }) as usize;
+            let v = (unsafe { (*ep).callee_idx }) as usize;
+            if u < n && v < n && (unsafe { *opt_bool_at(cg.scratch_affected, u) }) {
+                let u_eff = unsafe { *eff_u16_at(cg.prop_flags, u) };
+                let v_eff = unsafe { *eff_u16_at(cg.prop_flags, v) };
+                let joined = effect_join(u_eff, v_eff);
+                if joined != u_eff {
+                    unsafe { *eff_u16_at(cg.prop_flags, u) = joined; }
+                    changed = true;
+                }
+            }
+            e = e + 1;
+        }
+    }
+
+    let mut any_changed = false;
+    let mut chk: usize = 0;
+    while chk < n {
+        if (unsafe { *eff_u16_at(cg.prop_flags, chk) }) != (unsafe { *eff_u16_at(cg.scratch_saved_prop, chk) }) {
+            any_changed = true;
+        }
+        chk = chk + 1;
+    }
+    if !any_changed {
+        return 0u32;
+    }
+    reevaluated_count
+}
+
+// --- Legality Queries for DCE, Reordering & Clobbering (AXS-OPT-023..024, REQ-OPT-348..349, REQ-OPT-393..396) ---
+
+pub fn effect_can_dce(flags: u16) -> bool {
+    // Only pure or read-only operations withoutMayPanic/Volatile/Atomic/IO/WritesMem/Allocates/FFI/NonTerm/Unknown may be DCE'd
+    (flags & EFFECT_MASK_ALL_OBSERVABLE) == 0u16
+}
+
+pub fn effect_can_dce_inst(body: view<OptBody>, inst: view<OptInst>, max_steps: u32) -> bool {
+    let opc = inst.opcode;
+    let flags = inst.flags;
+    if (flags & (OPT_FLAG_BARRIER | OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) != 0u16 {
+        return false;
+    }
+    if opc == OPT_INST_VOLATILE_LOAD || opc == OPT_INST_VOLATILE_STORE ||
+       opc == OPT_INST_ATOMIC || opc == OPT_INST_BLACK_BOX ||
+       opc == OPT_INST_ZEROIZE || opc == OPT_INST_DROP_FLAG {
+        return false;
+    }
+    let eff = effect_infer_inst(body, inst, max_steps);
+    effect_can_dce(eff)
+}
+
+pub fn effect_can_reorder(eff_a: u16, eff_b: u16, alias_kind: u8) -> bool {
+    // 1. Hardware, OS, FFI, Volatile, Atomic, Panic, NonTerm, or Unknown barriers preserve strict relative order
+    let bar_a = (eff_a & EFFECT_MASK_ORDERING_BARRIER) != 0u16;
+    let bar_b = (eff_b & EFFECT_MASK_ORDERING_BARRIER) != 0u16;
+    if bar_a && bar_b {
+        return false;
+    }
+    let hw_a = (eff_a & (EFFECT_VOLATILE | EFFECT_ATOMIC | EFFECT_IO | EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16;
+    let hw_b = (eff_b & (EFFECT_VOLATILE | EFFECT_ATOMIC | EFFECT_IO | EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16;
+    let mem_a = (eff_a & (EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_ALLOCATES)) != 0u16;
+    let mem_b = (eff_b & (EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_ALLOCATES)) != 0u16;
+    if (hw_a && mem_b) || (hw_b && mem_a) {
+        return false;
+    }
+    // 2. MayPanic cannot be reordered across memory writes or other side effects (REQ-OPT-061, REQ-OPT-394)
+    let panic_a = (eff_a & (EFFECT_MAY_PANIC | EFFECT_NONTERM)) != 0u16;
+    let panic_b = (eff_b & (EFFECT_MAY_PANIC | EFFECT_NONTERM)) != 0u16;
+    let write_a = (eff_a & (EFFECT_WRITES_MEM | EFFECT_ALLOCATES)) != 0u16;
+    let write_b = (eff_b & (EFFECT_WRITES_MEM | EFFECT_ALLOCATES)) != 0u16;
+    if (panic_a && write_b) || (panic_b && write_a) {
+        return false;
+    }
+    // 3. Ordinary memory accesses: if either writes, reordering requires Proven NoAlias (AXS-OPT-022)
+    if write_a || write_b {
+        if mem_a && mem_b {
+            return alias_kind == ALIAS_NO_ALIAS;
+        }
+    }
+    true
+}
+
+pub fn effect_call_clobbers_region(
+    call_effects: u16,
+    region: view<MemoryRegion>,
+    local_escaped: bool
+) -> bool {
+    if call_effects == EFFECT_PURE {
+        return false;
+    }
+    if (call_effects & (EFFECT_WRITES_MEM | EFFECT_IO | EFFECT_ATOMIC | EFFECT_VOLATILE | EFFECT_FFI | EFFECT_UNKNOWN)) == 0u16 {
+        // Read-only call does not clobber memory definitions (AXS-OPT-024)
+        return false;
+    }
+    if region.domain == STORAGE_STACK_LOCAL && !local_escaped && (call_effects & EFFECT_VOLATILE) == 0u16 {
+        // Non-address-taken stack local with Proven NoEscape cannot be modified by a callee (AXS-OPT-024)
+        return false;
+    }
+    true
+}
+
+// --- Execution-Domain Boundary Verification (REQ-VER-027, REQ-OPT-349) ---
+
+pub fn effect_forbidden_for_domain(domain: u8) -> u16 {
+    if domain == EXEC_DOMAIN_COMPTIME {
+        // comptime forbids host I/O, FFI, volatile, atomic, and unresolved Unknown calls
+        return EFFECT_IO | EFFECT_FFI | EFFECT_VOLATILE | EFFECT_ATOMIC | EFFECT_UNKNOWN;
+    }
+    if domain == EXEC_DOMAIN_KERNEL {
+        // @kernel GPU/device compute forbids host I/O, FFI, heap allocation, and Unknown calls
+        return EFFECT_IO | EFFECT_FFI | EFFECT_ALLOCATES | EFFECT_UNKNOWN;
+    }
+    0u16
+}
+
+pub fn effect_verify_execution_domain(summary: view<EffectSummary>, domain: u8) -> bool {
+    let forbidden = effect_forbidden_for_domain(domain);
+    (summary.flags & forbidden) == 0u16
+}
