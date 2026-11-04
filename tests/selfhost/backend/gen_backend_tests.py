@@ -91,6 +91,8 @@ MODULES = [
     ("compiler.obj.coff", "compiler"),
     ("compiler.target.x64.encode", "compiler"),
     ("compiler.target.x64.isel", "compiler"),
+    ("compiler.backend.peephole.peephole", "compiler"),
+    ("compiler.backend.peephole", "compiler"),
     ("compiler.target.x64.frame", "compiler"),
     ("compiler.target.x64", "compiler"),
     ("compiler.backend.session", "compiler"),

@@ -22,10 +22,15 @@ use compiler.types.types.TypeInterner
 use compiler.types.types.intern_array_ty
 use compiler.types.types.type_interner_init
 use compiler.types.types.type_interner_free
+use compiler.abi.ABI_LOC_REG
 use compiler.lir.lir.LIR_INST_CONST
 use compiler.lir.lir.LIR_INST_ADD
+use compiler.lir.lir.LIR_INST_BIT_XOR
+use compiler.lir.lir.LIR_INST_LOAD
 use compiler.lir.lir.LIR_INST_STACK_ADDR
 use compiler.lir.lir.LIR_INST_STORE
+use compiler.lir.lir.LIR_INST_ABI_ARG
+use compiler.lir.lir.LIR_TERM_SWITCH
 use compiler.lir.lir.LIR_TERM_RETURN
 use compiler.lir.lir.LirVRegId
 use compiler.lir.lir.LirStackSlotId
@@ -41,6 +46,7 @@ use compiler.lir.lir.LirBody
 use compiler.lir.lir.lir_slot_at
 use compiler.lir.lir.lir_vreg_at
 use compiler.lir.lir.lir_inst_at
+use compiler.lir.lir.lir_switch_target_at
 use compiler.lir.lir.lir_bb_at
 use compiler.lir.lir.lir_inst_reset
 use compiler.lir.lir.lir_term_reset
@@ -65,23 +71,32 @@ use compiler.target.x64.REG_RBX
 use compiler.target.x64.REG_RSP
 use compiler.target.x64.REG_RBP
 use compiler.target.x64.REG_R8
+use compiler.target.x64.REG_R9
 use compiler.target.x64.REG_NONE
 use compiler.target.x64.CC_E
+use compiler.target.x64.CC_L
+use compiler.target.x64.X64_OP_IMM
 use compiler.target.x64.X64_OP_MEM
 use compiler.target.x64.X64_MI_MOV
 use compiler.target.x64.X64_MI_ADD
 use compiler.target.x64.X64_MI_SUB
 use compiler.target.x64.X64_MI_IMUL
 use compiler.target.x64.X64_MI_IDIV
+use compiler.target.x64.X64_MI_XOR
 use compiler.target.x64.X64_MI_SHL
 use compiler.target.x64.X64_MI_SAR
 use compiler.target.x64.X64_MI_SHR
 use compiler.target.x64.X64_MI_LEA
 use compiler.target.x64.X64_MI_CMP
+use compiler.target.x64.X64_MI_TEST
 use compiler.target.x64.X64_MI_JMP
 use compiler.target.x64.X64_MI_JCC
 use compiler.target.x64.X64_MI_CALL
+use compiler.target.x64.X64_MI_ASSERT
 use compiler.target.x64.X64_MI_RET
+use compiler.target.x64.X64_MI_CMOVCC
+use compiler.target.x64.FLAGS_USE
+use compiler.target.x64.FLAGS_KILL
 use compiler.target.x64.X64Mem
 use compiler.target.x64.X64FrameOp
 use compiler.target.x64.X64Op
@@ -110,7 +125,12 @@ use compiler.target.x64.x64_op_sym
 use compiler.target.x64.x64_mi_bb_at
 use compiler.target.x64.x64_mi_body_new
 use compiler.target.x64.x64_mi_emit
+use compiler.target.x64.x64_mi_emit_cmovcc
 use compiler.target.x64.x64_isel
+use compiler.target.x64.x64_isel_opt_in_arena
+use compiler.target.x64.x64_mi_flags_effect
+use compiler.target.x64.x64_flags_are_dead_after
+use compiler.target.x64.x64_peephole_opt_in_arena
 use compiler.target.x64.x64_frame_slot_offset
 use compiler.target.x64.x64_frame_lower
 use compiler.target.x64.x64_frame_lower_raw
@@ -683,6 +703,264 @@ fn test_linear_scan_ra_and_opt_frame(a: mut_view<Arena>, ti_ptr: *mut TypeIntern
     0
 }
 
+unsafe fn bb_has_opcode(mbb: *mut X64MIBb, opc: u32) -> bool {
+    let mut cur = (*mbb).first_inst;
+    while (cur as usize) != 0 {
+        if (*cur).opcode == opc {
+            return true;
+        }
+        cur = (*cur).next;
+    }
+    false
+}
+
+fn test_isel_opt_and_peephole_regressions(a: mut_view<Arena>, ti_ptr: *mut TypeInterner) -> i32 {
+    let i64_v = unsafe { (*ti_ptr).t_i64.v };
+    let u8_v = unsafe { (*ti_ptr).t_u8.v };
+    let bool_v = unsafe { (*ti_ptr).t_bool.v };
+
+    // 1. Finding 1: Narrowing cast constant propagation (`(-300i64 as u8) as i64 == 212i64`).
+    let lir_cast = lir_body_new(mut_view(*a));
+    let c_slots = arena_alloc_raw(mut_view(*a), 2 * size_of<LirStackSlot>(), align_of<LirStackSlot>()) as *mut LirStackSlot;
+    let c_vregs = arena_alloc_raw(mut_view(*a), 5 * size_of<LirVReg>(), align_of<LirVReg>()) as *mut LirVReg;
+    let c_bbs = arena_alloc_raw(mut_view(*a), size_of<LirBb>(), align_of<LirBb>()) as *mut LirBb;
+    let c_insts = arena_alloc_raw(mut_view(*a), 6 * size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    unsafe {
+        (*lir_cast).is_opt = true;
+        (*lir_slot_at(c_slots, 0)).ty.v = i64_v;
+        (*lir_slot_at(c_slots, 0)).is_const = false;
+        (*lir_slot_at(c_slots, 1)).ty.v = u8_v;
+        (*lir_slot_at(c_slots, 1)).is_const = false;
+        (*lir_cast).slots = c_slots;
+        (*lir_cast).slot_count = 2;
+
+        (*lir_vreg_at(c_vregs, 0)).ty.v = u8_v;
+        (*lir_vreg_at(c_vregs, 1)).ty.v = i64_v;
+        (*lir_vreg_at(c_vregs, 2)).ty.v = i64_v;
+        (*lir_vreg_at(c_vregs, 3)).ty.v = i64_v;
+        (*lir_vreg_at(c_vregs, 4)).ty.v = i64_v;
+        (*lir_cast).vregs = c_vregs;
+        (*lir_cast).vreg_count = 5;
+
+        // v0(u8) = const(-300, i64)  [MIR_RVALUE_CAST from -300i64 to u8]
+        let ci0 = lir_inst_at(c_insts, 0);
+        lir_inst_reset(mut_view(*ci0), LIR_INST_CONST);
+        (*ci0).dest.v = 0u32;
+        (*ci0).ty.v = i64_v;
+        (*ci0).const_val = (-300i64) as u64;
+
+        let ci1 = lir_inst_at(c_insts, 1);
+        lir_inst_reset(mut_view(*ci1), LIR_INST_STACK_ADDR);
+        (*ci1).dest.v = 1u32;
+        (*ci1).slot.v = 1u32;
+
+        let ci2 = lir_inst_at(c_insts, 2);
+        lir_inst_reset(mut_view(*ci2), LIR_INST_STORE);
+        (*ci2).ptr.v = 1u32;
+        (*ci2).val.v = 0u32;
+
+        // v2(i64) = load(slot 1, u8)  [MIR_RVALUE_CAST from u8 to i64]
+        let ci3 = lir_inst_at(c_insts, 3);
+        lir_inst_reset(mut_view(*ci3), LIR_INST_LOAD);
+        (*ci3).dest.v = 2u32;
+        (*ci3).ptr.v = 1u32;
+        (*ci3).ty.v = u8_v;
+
+        let ci4 = lir_inst_at(c_insts, 4);
+        lir_inst_reset(mut_view(*ci4), LIR_INST_STACK_ADDR);
+        (*ci4).dest.v = 3u32;
+        (*ci4).slot.v = 0u32;
+
+        let ci5 = lir_inst_at(c_insts, 5);
+        lir_inst_reset(mut_view(*ci5), LIR_INST_STORE);
+        (*ci5).ptr.v = 3u32;
+        (*ci5).val.v = 2u32;
+
+        let c_bb0 = lir_bb_at(c_bbs, 0);
+        lir_bb_reset(mut_view(*c_bb0), 0u32);
+        (*c_bb0).insts = c_insts;
+        (*c_bb0).inst_count = 6;
+        lir_term_reset(mut_view((*c_bb0).term), LIR_TERM_RETURN);
+        (*lir_cast).bbs = c_bbs;
+        (*lir_cast).bb_count = 1;
+    }
+    let mi_cast = x64_isel_opt_in_arena(mut_view(*a), unsafe { view(*lir_cast) }, unsafe { view(*ti_ptr) }, true);
+    let mc_bb0 = unsafe { x64_mi_bb_at((*mi_cast).bbs, 0) };
+    let mut found_212 = false;
+    let mut found_neg300 = false;
+    unsafe {
+        let mut cur = (*mc_bb0).first_inst;
+        while (cur as usize) != 0 {
+            if (*cur).opcode == X64_MI_MOV && (*cur).ops[1usize].kind == X64_OP_IMM {
+                if (*cur).ops[1usize].imm == 212i64 {
+                    found_212 = true;
+                }
+                if (*cur).ops[1usize].imm == -300i64 {
+                    found_neg300 = true;
+                }
+            }
+            cur = (*cur).next;
+        }
+    }
+    if !found_212 || found_neg300 {
+        return 601;
+    }
+
+    // 2. Finding 3: `v2 = xor v1, 1` on `i64` feeding `switch v2 [0: bb1, otherwise: bb2]` MUST NOT strip `xor`,
+    //    whereas `v2 = xor v1, 1` on `bool` DOES strip `xor` and invert condition.
+    let lir_sw = lir_body_new(mut_view(*a));
+    let sw_slots = arena_alloc_raw(mut_view(*a), size_of<LirStackSlot>(), align_of<LirStackSlot>()) as *mut LirStackSlot;
+    let sw_vregs = arena_alloc_raw(mut_view(*a), 3 * size_of<LirVReg>(), align_of<LirVReg>()) as *mut LirVReg;
+    let sw_bbs = arena_alloc_raw(mut_view(*a), 3 * size_of<LirBb>(), align_of<LirBb>()) as *mut LirBb;
+    let sw_insts = arena_alloc_raw(mut_view(*a), 3 * size_of<LirInst>(), align_of<LirInst>()) as *mut LirInst;
+    let sw_tgts = arena_alloc_raw(mut_view(*a), size_of<LirSwitchTarget>(), align_of<LirSwitchTarget>()) as *mut LirSwitchTarget;
+    unsafe {
+        (*lir_sw).is_opt = true;
+        (*lir_slot_at(sw_slots, 0)).ty.v = i64_v;
+        (*lir_slot_at(sw_slots, 0)).is_const = false;
+        (*lir_sw).slots = sw_slots;
+        (*lir_sw).slot_count = 1;
+
+        (*lir_vreg_at(sw_vregs, 0)).ty.v = i64_v;
+        (*lir_vreg_at(sw_vregs, 1)).ty.v = i64_v;
+        (*lir_vreg_at(sw_vregs, 2)).ty.v = i64_v;
+        (*lir_sw).vregs = sw_vregs;
+        (*lir_sw).vreg_count = 3;
+
+        let si0 = lir_inst_at(sw_insts, 0);
+        lir_inst_reset(mut_view(*si0), LIR_INST_ABI_ARG);
+        (*si0).dest.v = 0u32;
+        (*si0).loc_kind = ABI_LOC_REG;
+        (*si0).loc_reg_or_offset = REG_RCX as u32;
+
+        let si1 = lir_inst_at(sw_insts, 1);
+        lir_inst_reset(mut_view(*si1), LIR_INST_CONST);
+        (*si1).dest.v = 1u32;
+        (*si1).ty.v = i64_v;
+        (*si1).const_val = 1u64;
+
+        let si2 = lir_inst_at(sw_insts, 2);
+        lir_inst_reset(mut_view(*si2), LIR_INST_BIT_XOR);
+        (*si2).dest.v = 2u32;
+        (*si2).lhs.v = 0u32;
+        (*si2).rhs.v = 1u32;
+
+        (*lir_switch_target_at(sw_tgts, 0)).val = 0u64;
+        (*lir_switch_target_at(sw_tgts, 0)).target.v = 1u32;
+
+        let sbb0 = lir_bb_at(sw_bbs, 0);
+        let sbb1 = lir_bb_at(sw_bbs, 1);
+        let sbb2 = lir_bb_at(sw_bbs, 2);
+        lir_bb_reset(mut_view(*sbb0), 0u32);
+        (*sbb0).insts = sw_insts;
+        (*sbb0).inst_count = 3;
+        lir_term_reset(mut_view((*sbb0).term), LIR_TERM_SWITCH);
+        (*sbb0).term.cond.v = 2u32;
+        (*sbb0).term.targets = sw_tgts;
+        (*sbb0).term.count = 1;
+        (*sbb0).term.otherwise.v = 2u32;
+
+        lir_bb_reset(mut_view(*sbb1), 1u32);
+        lir_term_reset(mut_view((*sbb1).term), LIR_TERM_RETURN);
+        lir_bb_reset(mut_view(*sbb2), 2u32);
+        lir_term_reset(mut_view((*sbb2).term), LIR_TERM_RETURN);
+
+        (*lir_sw).bbs = sw_bbs;
+        (*lir_sw).bb_count = 3;
+    }
+    let mi_sw_i64 = x64_isel_opt_in_arena(mut_view(*a), unsafe { view(*lir_sw) }, unsafe { view(*ti_ptr) }, true);
+    let mbb_sw_i64 = unsafe { x64_mi_bb_at((*mi_sw_i64).bbs, 0) };
+    if !(unsafe { bb_has_opcode(mbb_sw_i64, X64_MI_XOR) }) {
+        return 602;
+    }
+
+    unsafe {
+        (*lir_vreg_at(sw_vregs, 0)).ty.v = bool_v;
+        (*lir_vreg_at(sw_vregs, 1)).ty.v = bool_v;
+        (*lir_vreg_at(sw_vregs, 2)).ty.v = bool_v;
+        (*lir_inst_at(sw_insts, 1)).ty.v = bool_v;
+    }
+    let mi_sw_bool = x64_isel_opt_in_arena(mut_view(*a), unsafe { view(*lir_sw) }, unsafe { view(*ti_ptr) }, true);
+    let mbb_sw_bool = unsafe { x64_mi_bb_at((*mi_sw_bool).bbs, 0) };
+    if (unsafe { bb_has_opcode(mbb_sw_bool, X64_MI_XOR) }) || !(unsafe { bb_has_opcode(mbb_sw_bool, X64_MI_TEST) }) {
+        return 603;
+    }
+
+    // 3. Finding 4: `x64_mi_flags_effect`, `x64_flags_are_dead_after`, and `x64_peephole_opt_in_arena`.
+    // 3a. QA Repro A: Fallthrough `bb0: cmp rcx, rdx; mov rax, 0; jmp 1` -> `bb1: cmovcc CC_L, rax, r8; ret`.
+    let mi_ft = x64_mi_body_new(mut_view(*a), 2);
+    let ft_bb0 = unsafe { x64_mi_bb_at((*mi_ft).bbs, 0) };
+    let ft_bb1 = unsafe { x64_mi_bb_at((*mi_ft).bbs, 1) };
+    let mut ft_mov: *mut X64MI = 0 as *mut X64MI;
+    unsafe {
+        x64_mi_emit(mut_view(*mi_ft), mut_view(*ft_bb0), X64_MI_CMP, x64_op_reg(REG_RCX), x64_op_reg(REG_RDX));
+        ft_mov = x64_mi_emit(mut_view(*mi_ft), mut_view(*ft_bb0), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(0i64));
+        x64_mi_emit(mut_view(*mi_ft), mut_view(*ft_bb0), X64_MI_JMP, x64_op_imm(1i64), x64_op_none());
+
+        x64_mi_emit_cmovcc(mut_view(*mi_ft), mut_view(*ft_bb1), CC_L, x64_op_reg(REG_RAX), x64_op_reg(REG_R8));
+        let ft_ret = x64_mi_emit(mut_view(*mi_ft), mut_view(*ft_bb1), X64_MI_RET, x64_op_none(), x64_op_none());
+        if x64_mi_flags_effect(view(*ft_ret)) != FLAGS_KILL {
+            return 604;
+        }
+    }
+    if x64_flags_are_dead_after(ft_mov) {
+        return 605;
+    }
+    let _ = x64_peephole_opt_in_arena(mut_view(*a), unsafe { mut_view(*mi_ft) });
+    if (unsafe { bb_has_opcode(ft_bb0, X64_MI_JMP) }) {
+        return 606;
+    }
+    if (unsafe { (*ft_mov).opcode }) != X64_MI_MOV || (unsafe { bb_has_opcode(ft_bb0, X64_MI_XOR) }) {
+        return 607;
+    }
+
+    // 3b. QA Repro B: Variable shift `cmp rcx, rdx; mov rax, 0; shl r8, rcx; cmovcc CC_L, rax, r9; ret`.
+    let mi_cl = x64_mi_body_new(mut_view(*a), 1);
+    let cl_bb0 = unsafe { x64_mi_bb_at((*mi_cl).bbs, 0) };
+    let mut cl_mov: *mut X64MI = 0 as *mut X64MI;
+    unsafe {
+        x64_mi_emit(mut_view(*mi_cl), mut_view(*cl_bb0), X64_MI_CMP, x64_op_reg(REG_RCX), x64_op_reg(REG_RDX));
+        cl_mov = x64_mi_emit(mut_view(*mi_cl), mut_view(*cl_bb0), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(0i64));
+        x64_mi_emit(mut_view(*mi_cl), mut_view(*cl_bb0), X64_MI_SHL, x64_op_reg(REG_R8), x64_op_reg(REG_RCX));
+        x64_mi_emit_cmovcc(mut_view(*mi_cl), mut_view(*cl_bb0), CC_L, x64_op_reg(REG_RAX), x64_op_reg(REG_R9));
+        x64_mi_emit(mut_view(*mi_cl), mut_view(*cl_bb0), X64_MI_RET, x64_op_none(), x64_op_none());
+    }
+    if x64_flags_are_dead_after(cl_mov) {
+        return 608;
+    }
+    let _ = x64_peephole_opt_in_arena(mut_view(*a), unsafe { mut_view(*mi_cl) });
+    if (unsafe { (*cl_mov).opcode }) != X64_MI_MOV {
+        return 609;
+    }
+
+    // 3c. Positive contrast: Non-zero immediate shift `shl r8, 3` DOES kill EFLAGS, rewriting `mov rax, 0` -> `xor rax, rax`,
+    //     and `X64_MI_ASSERT` is classified as `FLAGS_USE`.
+    let mi_imm_sh = x64_mi_body_new(mut_view(*a), 1);
+    let is_bb0 = unsafe { x64_mi_bb_at((*mi_imm_sh).bbs, 0) };
+    let mut is_mov: *mut X64MI = 0 as *mut X64MI;
+    let mut as_mi: *mut X64MI = 0 as *mut X64MI;
+    unsafe {
+        is_mov = x64_mi_emit(mut_view(*mi_imm_sh), mut_view(*is_bb0), X64_MI_MOV, x64_op_reg(REG_RAX), x64_op_imm(0i64));
+        x64_mi_emit(mut_view(*mi_imm_sh), mut_view(*is_bb0), X64_MI_SHL, x64_op_reg(REG_R8), x64_op_imm(3i64));
+        x64_mi_emit(mut_view(*mi_imm_sh), mut_view(*is_bb0), X64_MI_CMP, x64_op_reg(REG_R8), x64_op_imm(1i64));
+        as_mi = x64_mi_emit(mut_view(*mi_imm_sh), mut_view(*is_bb0), X64_MI_ASSERT, x64_op_imm(0i64), x64_op_none());
+        x64_mi_emit(mut_view(*mi_imm_sh), mut_view(*is_bb0), X64_MI_RET, x64_op_none(), x64_op_none());
+        if x64_mi_flags_effect(view(*as_mi)) != FLAGS_USE {
+            return 610;
+        }
+    }
+    if !x64_flags_are_dead_after(is_mov) {
+        return 611;
+    }
+    let _ = x64_peephole_opt_in_arena(mut_view(*a), unsafe { mut_view(*mi_imm_sh) });
+    if (unsafe { (*is_mov).opcode }) != X64_MI_XOR {
+        return 612;
+    }
+
+    arena_reset(mut_view(*a));
+    0
+}
+
 pub fn main() -> i32 {
     let mut perm = arena_with_chunk_size(131072);
     let _ = arena_alloc_raw(mut_view(perm), 16, 8);
@@ -711,6 +989,11 @@ pub fn main() -> i32 {
     let rc5 = test_linear_scan_ra_and_opt_frame(mut_view(a), ti_ptr);
     if rc5 != 0 {
         return rc5;
+    }
+
+    let rc6 = test_isel_opt_and_peephole_regressions(mut_view(a), ti_ptr);
+    if rc6 != 0 {
+        return rc6;
     }
 
     unsafe { type_interner_free(mut_view(*ti_ptr)); }

@@ -137,6 +137,8 @@ FULL_MODULES = [
     ("compiler.target.x64.isel", "compiler"),
     ("compiler.target.x64.frame", "compiler"),
     ("compiler.target.x64", "compiler"),
+    ("compiler.backend.peephole.peephole", "compiler"),
+    ("compiler.backend.peephole", "compiler"),
     ("compiler.backend.session", "compiler"),
     ("compiler.backend", "compiler"),
     ("compiler.link.pe", "compiler"),
@@ -171,7 +173,7 @@ def byte_table(name, data):
 
 
 def build_prelude_text():
-    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=800, include_std_sys=True, root=ROOT)
+    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=256, include_std_sys=True, root=ROOT)
 
 
 def assemble_modules(mod_list):

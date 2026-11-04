@@ -8,13 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T063]
 priority: 91
-status: doing
+status: done
 attempts: 1
 paths: [compiler/lir, compiler/backend/peephole, tests/mc/isel_peephole, compiler/target/x64, tests/selfhost/lir, tests/selfhost/isel, tests/selfhost/encode, tests/selfhost/backend]
 locks: [compiler/backend/session.ax, compiler/backend/mod.ax, compiler/driver/pipeline.ax, tests/selfhost/driver, tests/selfhost/obj_link_driver]
 spec: [spec/SPEC-77-regalloc-machine-opt.md, 0162, 0237, tasks/0406, tasks/0553, tasks/0559]
 covers: [REQ-OPT-034, REQ-OPT-035, REQ-OPT-036, REQ-OPT-205, REQ-OPT-207, REQ-OPT-208, REQ-OPT-369, REQ-OPT-370]
 started: 2026-11-03 07:16:36
+finished: 2026-11-04 22:08:29
 ---
 # T628 — E15.8 — Better instruction selection, branchless if-conversion & post-RA machine peephole optimization
 
@@ -43,3 +44,4 @@ Implement pattern-matching instruction selection (`lea` scaled addressing, immed
 ## Log
 - 2026-11-03 02:44:30 created by T215 (P15 phase planning)
 - 2026-11-03 07:16:36 started (attempt 1) 
+- 2026-11-04 22:08:29 accepted by QA -> done
