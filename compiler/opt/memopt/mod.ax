@@ -1,0 +1,2911 @@
+// MemorySSA Dependence Classification, Store-to-Load Forwarding, Redundant Load Elimination (RLE),
+// Dead Store Elimination (DSE), and Memory Intrinsic Rewrites over Capability-Aware AliasInfo (T606 / E15.2).
+// Implements SPEC-71 §1.7-§1.8 & §3.6-§3.7 (AXS-ALIAS-006, AXS-ESC-016, AXS-ESC-017) & SPEC-70 (AXS-OPT-022):
+//   - 17-kind `MemAccessKind` classification (`REQ-OPT-365`)
+//   - 4-value `MemDependence` (`NoDepend`, `MustDepend`, `MayDepend`, `UnknownDepend`)
+//   - Store-to-load forwarding & `view<T>` redundant load elimination (`REQ-OPT-366`, `REQ-OPT-301`)
+//   - Post-dominating overwrite & dead local store elimination (`REQ-OPT-366`)
+//   - Strict barrier preservation: atomic (`REQ-OPT-312`), volatile/MMIO (`REQ-OPT-313`),
+//     foreign/FFI (`REQ-OPT-314`), zero-copy/DMA pin (`REQ-OPT-347`), `Drop`, `zeroize`, panic/unwind
+//   - `memmove -> memcpy` (`ptr_copy -> ptr_copy_nonoverlapping`) & `memset` zero-init legality
+module compiler.opt.memopt
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HirItem
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_BUILTIN_ADDRESS_OF
+use compiler.types.types.TY_BUILTIN_ADDRESS_OF_MUT
+use compiler.types.types.TY_BUILTIN_DROP_IN_PLACE
+use compiler.types.types.TY_BUILTIN_PTR_COPY
+use compiler.types.types.TY_BUILTIN_PTR_COPY_NONOVERLAPPING
+use compiler.types.types.TY_BUILTIN_PTR_WRITE_BYTES
+use compiler.types.types.TY_CHAR
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_I128
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_U128
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_USIZE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.Thir
+use compiler.types.types.type_get
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirConst
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.mir_copy_const
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_rvalue_reset
+use compiler.verify.verifier.verify_mir
+use compiler.opt.optir.ALIAS_MUST_ALIAS
+use compiler.opt.optir.ALIAS_NO_ALIAS
+use compiler.opt.optir.ANALYSIS_ALIAS_INFO
+use compiler.opt.optir.ANALYSIS_CFG
+use compiler.opt.optir.ANALYSIS_DOMINATORS
+use compiler.opt.optir.ANALYSIS_MEMORY_SSA
+use compiler.opt.optir.ANALYSIS_SSA
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_FFI
+use compiler.opt.optir.EFFECT_IO
+use compiler.opt.optir.EFFECT_MAY_PANIC
+use compiler.opt.optir.EFFECT_READS_MEM
+use compiler.opt.optir.EFFECT_UNKNOWN
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.EFFECT_WRITES_MEM
+use compiler.opt.optir.MEM_SSA_NONE
+use compiler.opt.optir.MemSsaId
+use compiler.opt.optir.OPT_BB_NONE
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_FLAG_MAY_TRAP
+use compiler.opt.optir.OPT_FLAG_MOVE
+use compiler.opt.optir.OPT_FLAG_STORAGE_DEAD
+use compiler.opt.optir.OPT_FLAG_STORAGE_LIVE
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_CONST
+use compiler.opt.optir.OPT_INST_COPY
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_NOP
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_LOCAL_SCALAR
+use compiler.opt.optir.OPT_PROJ_NONE
+use compiler.opt.optir.OPT_TERM_ASSERT
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_DROP
+use compiler.opt.optir.OPT_TERM_RETURN
+use compiler.opt.optir.OPT_TERM_UNREACHABLE
+use compiler.opt.optir.OPT_VAL_CONST
+use compiler.opt.optir.OPT_VAL_INST
+use compiler.opt.optir.OPT_VALUE_NONE
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBlock
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInst
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptRange
+use compiler.opt.optir.OptTerminator
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_DEAD_STORE
+use compiler.opt.optir.PROP_NO_ALIAS
+use compiler.opt.optir.opt_bbid_at
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_bool_at
+use compiler.opt.optir.opt_dominates
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_typeid_at
+use compiler.opt.optir.opt_u32_at
+use compiler.opt.optir.opt_u8_at
+use compiler.opt.optir.opt_val_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_compute_dom_frontier
+use compiler.opt.optir.optir_construct_memssa
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.effect_infer_term_with_table
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.PASS_GVN_CSE
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_ALL
+use compiler.opt.passmgr.PROP_MASK_DEAD_STORE
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.analysis_bit
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_is_analysis_valid
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.passmgr.passmgr_verify_postconditions
+use compiler.opt.alias.AliasFact
+use compiler.opt.alias.AliasInfo
+use compiler.opt.alias.CAP_MODE_MUT_VIEW_WRITE
+use compiler.opt.alias.CAP_MODE_OWNER
+use compiler.opt.alias.CAP_MODE_RAW_PTR
+use compiler.opt.alias.DOMAIN_DEVICE_DMA
+use compiler.opt.alias.DOMAIN_FIXED_MMIO
+use compiler.opt.alias.DOMAIN_STACK_LOCAL
+use compiler.opt.alias.alias_build_info
+use compiler.opt.alias.alias_is_must_alias_proven
+use compiler.opt.alias.alias_is_no_alias_proven
+use compiler.opt.alias.alias_local_is_zero_copy_pinned_at
+use compiler.opt.alias.alias_local_prov_at
+use compiler.opt.alias.alias_make_prog_pt
+use compiler.opt.alias.alias_may_overlap
+use compiler.opt.alias.alias_place_access_ty
+use compiler.opt.alias.alias_query_places
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifier & TransformationContract (SPEC-71 AXS-ESC-016) ---
+
+pub const PASS_ALIAS_MEM: u16 = 9u16;
+
+pub fn memopt_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_ALIAS_MEM,
+        required_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                           ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_EFFECT_INFO |
+                           ANALYSIS_MASK_ALIAS_INFO | ANALYSIS_MASK_RANGE_INFO,
+        required_proofs: PROP_MASK_NO_ALIAS | PROP_MASK_DEAD_STORE,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA,
+        invalidated_analyses: ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_ALL,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- Memory Access Kind Classification (SPEC-71 AXS-ALIAS-006.1, REQ-OPT-365) ---
+
+pub const MEM_ACCESS_NONE: u8 = 0u8;
+pub const MEM_ACCESS_LOAD: u8 = 1u8;
+pub const MEM_ACCESS_STORE: u8 = 2u8;
+pub const MEM_ACCESS_ATOMIC_LOAD: u8 = 3u8;
+pub const MEM_ACCESS_ATOMIC_STORE: u8 = 4u8;
+pub const MEM_ACCESS_ATOMIC_RMW: u8 = 5u8;
+pub const MEM_ACCESS_VOLATILE_LOAD: u8 = 6u8;
+pub const MEM_ACCESS_VOLATILE_STORE: u8 = 7u8;
+pub const MEM_ACCESS_COPY: u8 = 8u8;
+pub const MEM_ACCESS_MOVE: u8 = 9u8;
+pub const MEM_ACCESS_MEMCPY: u8 = 10u8;
+pub const MEM_ACCESS_MEMMOVE: u8 = 11u8;
+pub const MEM_ACCESS_MEMSET: u8 = 12u8;
+pub const MEM_ACCESS_INIT: u8 = 13u8;
+pub const MEM_ACCESS_DROP: u8 = 14u8;
+pub const MEM_ACCESS_ALLOC: u8 = 15u8;
+pub const MEM_ACCESS_DEALLOC: u8 = 16u8;
+pub const MEM_ACCESS_BARRIER: u8 = 17u8;
+
+// --- Memory Dependence Lattice (SPEC-71 AXS-ALIAS-006.1) ---
+
+pub const MEM_DEP_NO_DEPEND: u8 = 0u8;
+pub const MEM_DEP_MUST_DEPEND: u8 = 1u8;
+pub const MEM_DEP_MAY_DEPEND: u8 = 2u8;
+pub const MEM_DEP_UNKNOWN_DEPEND: u8 = 3u8;
+
+// --- Optimization Action & Barrier Telemetry Codes (SPEC-71 AXS-ESC-017) ---
+
+pub const ACTION_NONE: u8 = 0u8;
+pub const ACTION_STORE_TO_LOAD_FORWARD: u8 = 1u8;
+pub const ACTION_REDUNDANT_LOAD_ELIM: u8 = 2u8;
+pub const ACTION_DEAD_STORE_ELIM: u8 = 3u8;
+pub const ACTION_MEMMOVE_TO_MEMCPY: u8 = 4u8;
+pub const ACTION_MEMSET_ZERO_INIT: u8 = 5u8;
+
+pub const BARRIER_NONE: u8 = 0u8;
+pub const BARRIER_VOLATILE: u8 = 1u8;
+pub const BARRIER_ATOMIC: u8 = 2u8;
+pub const BARRIER_MAY_ALIAS: u8 = 3u8;
+pub const BARRIER_FFI: u8 = 4u8;
+pub const BARRIER_PANIC_UNWIND: u8 = 5u8;
+pub const BARRIER_DROP: u8 = 6u8;
+pub const BARRIER_ZERO_COPY: u8 = 7u8;
+
+@derive(Copy)
+pub struct MemOptRecord {
+    pub is_barrier: bool,
+    pub code: u8,
+    pub bb_idx: u32,
+    pub inst_idx: u32,
+    pub src_bb_idx: u32,
+    pub src_inst_idx: u32,
+    pub local_id: u32,
+    pub reason: u8,
+}
+
+@derive(Copy)
+pub struct MemOptStats {
+    pub forwarded_loads: u32,
+    pub eliminated_redundant_loads: u32,
+    pub eliminated_dead_stores: u32,
+    pub memmove_to_memcpy_rewrites: u32,
+    pub memset_zero_inits: u32,
+    pub volatile_barriers: u32,
+    pub atomic_barriers: u32,
+    pub ffi_barriers: u32,
+    pub may_alias_barriers: u32,
+    pub panic_unwind_barriers: u32,
+    pub drop_barriers: u32,
+    pub zero_copy_barriers: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+pub struct MemOptLog {
+    pub records: *mut MemOptRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+fn mo_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn memopt_record_at(base: *mut MemOptRecord, idx: usize) -> *mut MemOptRecord {
+    (base as usize + mo_mul_usize(idx, size_of<MemOptRecord>())) as *mut MemOptRecord
+}
+
+pub fn memopt_stats_zero(stats: mut_view<MemOptStats>) {
+    stats.forwarded_loads = 0u32;
+    stats.eliminated_redundant_loads = 0u32;
+    stats.eliminated_dead_stores = 0u32;
+    stats.memmove_to_memcpy_rewrites = 0u32;
+    stats.memset_zero_inits = 0u32;
+    stats.volatile_barriers = 0u32;
+    stats.atomic_barriers = 0u32;
+    stats.ffi_barriers = 0u32;
+    stats.may_alias_barriers = 0u32;
+    stats.panic_unwind_barriers = 0u32;
+    stats.drop_barriers = 0u32;
+    stats.zero_copy_barriers = 0u32;
+    stats.pass_runs = 0u32;
+    stats.pass_changes = 0u32;
+    stats.pass_rollbacks = 0u32;
+}
+
+pub fn memopt_log_init(log: mut_view<MemOptLog>, arena: mut_view<Arena>) {
+    let cap: usize = 32;
+    let bytes = mo_mul_usize(cap, size_of<MemOptRecord>());
+    log.records = arena_alloc_raw(mut_view(*arena), bytes, align_of<MemOptRecord>()) as *mut MemOptRecord;
+    log.count = 0;
+    log.cap = cap;
+}
+
+pub fn memopt_log_push(
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>,
+    rec: MemOptRecord
+) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 32 } else { cap * 2 };
+        let new_arr = arena_alloc_raw(
+            mut_view(*arena),
+            mo_mul_usize(new_cap, size_of<MemOptRecord>()),
+            align_of<MemOptRecord>()
+        ) as *mut MemOptRecord;
+        if cnt > 0 && ((unsafe { (*log).records }) as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    (*log).records as *const u8,
+                    new_arr as *mut u8,
+                    mo_mul_usize(cnt, size_of<MemOptRecord>())
+                );
+            }
+        }
+        unsafe {
+            (*log).records = new_arr;
+            (*log).cap = new_cap;
+        }
+    }
+    let slot = unsafe { memopt_record_at((*log).records, cnt) };
+    unsafe {
+        *slot = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+// --- Type, Builtin, and MemAccessKind Classifiers (REQ-OPT-365) ---
+
+fn mo_type_kind(thir: *const Thir, ty: TypeId) -> u8 {
+    if (thir as usize) == 0 || ty.v == 0u32 {
+        return 0u8;
+    }
+    let ax = unsafe { type_get(view((*thir).interner), ty) };
+    if (ax as usize) == 0 {
+        return 0u8;
+    }
+    unsafe { (*ax).kind }
+}
+
+fn mo_type_is_copy_scalar(thir: *const Thir, ty: TypeId) -> bool {
+    let tk = mo_type_kind(thir, TypeId { v: ty.v });
+    tk == TY_BOOL || tk == TY_CHAR || tk == TY_UNIT ||
+    tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_I128 || tk == TY_ISIZE ||
+    tk == TY_U8 || tk == TY_U16 || tk == TY_U32 || tk == TY_U64 || tk == TY_U128 || tk == TY_USIZE ||
+    tk == TY_PTR || tk == TY_VIEW
+}
+
+pub fn memopt_type_is_zero_valid(thir: *const Thir, ty: TypeId, depth: u32) -> bool {
+    if depth > 8u32 {
+        return false;
+    }
+    let tk = mo_type_kind(thir, TypeId { v: ty.v });
+    if tk == TY_BOOL || tk == TY_CHAR || tk == TY_UNIT ||
+       tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_I128 || tk == TY_ISIZE ||
+       tk == TY_U8 || tk == TY_U16 || tk == TY_U32 || tk == TY_U64 || tk == TY_U128 || tk == TY_USIZE ||
+       tk == TY_PTR {
+        return true;
+    }
+    if (thir as usize) == 0 {
+        return false;
+    }
+    let ax = unsafe { type_get(view((*thir).interner), ty) };
+    if (ax as usize) == 0 {
+        return false;
+    }
+    if tk == TY_ARRAY {
+        let elem = TypeId { v: unsafe { (*ax).elem.v } };
+        return memopt_type_is_zero_valid(thir, elem, depth + 1u32);
+    }
+    if tk == TY_STRUCT || tk == TY_TUPLE {
+        let fcnt = unsafe { (*ax).field_count };
+        let flds = unsafe { (*ax).fields };
+        if fcnt > 0 && (flds as usize) == 0 {
+            return false;
+        }
+        let mut i: usize = 0;
+        while i < fcnt {
+            let fty = TypeId { v: unsafe { (*opt_typeid_at(flds, i)).v } };
+            if !memopt_type_is_zero_valid(thir, fty, depth + 1u32) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    false
+}
+
+fn mo_callee_builtin_kind(body: view<OptBody>, func_op: view<MirOperand>) -> u8 {
+    if (body.thir as usize) == 0 {
+        return 0u8;
+    }
+    let mut fn_ty = TypeId { v: 0u32 };
+    if func_op.kind == MIR_OP_CONST {
+        fn_ty = TypeId { v: func_op.constant.ty.v };
+    } else if func_op.place.proj_count == 0 && (func_op.place.local.v as usize) < body.local_count {
+        fn_ty = TypeId { v: unsafe { (*opt_typeid_at(body.local_tys, func_op.place.local.v as usize)).v } };
+    }
+    mo_type_kind(body.thir, fn_ty)
+}
+
+fn mo_is_deleted_nop(inst: view<OptInst>) -> bool {
+    inst.opcode == OPT_INST_NOP && (inst.flags & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16
+}
+
+fn mo_place_is_memory_backed(info: view<AliasInfo>, body: view<OptBody>, place: view<MirPlace>) -> bool {
+    if place.proj_count > 0 {
+        return true;
+    }
+    let lv = place.local.v as usize;
+    if lv < body.local_count && (body.local_tys as usize) != 0 {
+        let lty = TypeId { v: unsafe { (*opt_typeid_at(body.local_tys, lv)).v } };
+        let tk = mo_type_kind(body.thir, lty);
+        if tk == TY_ARRAY || tk == TY_STRUCT || tk == TY_TUPLE || tk == TY_ENUM || tk == TY_SLICE {
+            return true;
+        }
+    }
+    if lv < body.local_count && (body.local_modes as usize) != 0 {
+        let mode = unsafe { *opt_u8_at(body.local_modes, lv) };
+        if mode != OPT_LOCAL_SCALAR {
+            return true;
+        }
+    }
+    if lv < info.local_count && (info.locals as usize) != 0 {
+        let lp = unsafe { alias_local_prov_at(info.locals, lv) };
+        if (unsafe { (*lp).borrow_taken }) || (unsafe { (*lp).raw_addr_exposed }) || (unsafe { (*lp).is_fixed_mmio }) {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn memopt_classify_inst(info: view<AliasInfo>, body: view<OptBody>, inst: view<OptInst>) -> u8 {
+    if mo_is_deleted_nop(inst) {
+        return MEM_ACCESS_NONE;
+    }
+    let opc = inst.opcode;
+    if opc == OPT_INST_VOLATILE_LOAD {
+        return MEM_ACCESS_VOLATILE_LOAD;
+    }
+    if opc == OPT_INST_VOLATILE_STORE {
+        return MEM_ACCESS_VOLATILE_STORE;
+    }
+    if opc == OPT_INST_ATOMIC {
+        let sub = inst.sub_op;
+        if sub == 0u8 {
+            return MEM_ACCESS_ATOMIC_LOAD;
+        }
+        if sub == 1u8 {
+            return MEM_ACCESS_ATOMIC_STORE;
+        }
+        return MEM_ACCESS_ATOMIC_RMW;
+    }
+    if opc == OPT_INST_ZEROIZE {
+        return MEM_ACCESS_MEMSET;
+    }
+    if opc == OPT_INST_BLACK_BOX || (inst.flags & OPT_FLAG_BARRIER) != 0u16 {
+        return MEM_ACCESS_BARRIER;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_STORAGE_LIVE {
+        return MEM_ACCESS_ALLOC;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_STORAGE_DEAD {
+        return MEM_ACCESS_DEALLOC;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_DROP {
+        return MEM_ACCESS_DROP;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_ASSIGN {
+        let dst_mem = mo_place_is_memory_backed(info, body, view(inst.orig_stmt.place));
+        if inst.orig_stmt.rvalue.kind == MIR_RVALUE_USE {
+            let uop = view(inst.orig_stmt.rvalue.use_op);
+            if uop.kind == MIR_OP_COPY || uop.kind == MIR_OP_MOVE {
+                let src_mem = mo_place_is_memory_backed(info, body, view(uop.place));
+                if dst_mem && src_mem {
+                    return if uop.kind == MIR_OP_MOVE { MEM_ACCESS_MOVE } else { MEM_ACCESS_COPY };
+                }
+                if src_mem {
+                    return MEM_ACCESS_LOAD;
+                }
+            } else if uop.kind == MIR_OP_CONST && dst_mem && inst.orig_stmt.place.proj_count == 0 {
+                return MEM_ACCESS_INIT;
+            }
+        }
+        if dst_mem {
+            return MEM_ACCESS_STORE;
+        }
+    }
+    if opc == OPT_INST_LOAD {
+        return MEM_ACCESS_LOAD;
+    }
+    if opc == OPT_INST_STORE {
+        return MEM_ACCESS_STORE;
+    }
+    MEM_ACCESS_NONE
+}
+
+pub fn memopt_classify_term(
+    body: view<OptBody>,
+    term: view<OptTerminator>,
+    call_table: *const EffectCallTable
+) -> u8 {
+    if term.kind == OPT_TERM_DROP {
+        return MEM_ACCESS_DROP;
+    }
+    if term.kind == OPT_TERM_CALL {
+        let bkind = mo_callee_builtin_kind(body, view(term.orig_term.func));
+        if bkind == TY_BUILTIN_PTR_COPY {
+            return MEM_ACCESS_MEMMOVE;
+        }
+        if bkind == TY_BUILTIN_PTR_COPY_NONOVERLAPPING {
+            return MEM_ACCESS_MEMCPY;
+        }
+        if bkind == TY_BUILTIN_PTR_WRITE_BYTES {
+            return MEM_ACCESS_MEMSET;
+        }
+        if bkind == TY_BUILTIN_DROP_IN_PLACE {
+            return MEM_ACCESS_DROP;
+        }
+        let eff_sum = effect_infer_term_with_table(body, term, call_table);
+        let eff = eff_sum.flags;
+        if (eff & EFFECT_VOLATILE) != 0u16 {
+            return if (eff & EFFECT_WRITES_MEM) != 0u16 { MEM_ACCESS_VOLATILE_STORE } else { MEM_ACCESS_VOLATILE_LOAD };
+        }
+        if (eff & EFFECT_ATOMIC) != 0u16 {
+            return MEM_ACCESS_ATOMIC_RMW;
+        }
+        if (eff & (EFFECT_FFI | EFFECT_UNKNOWN | EFFECT_WRITES_MEM)) != 0u16 {
+            return MEM_ACCESS_BARRIER;
+        }
+        if (eff & EFFECT_READS_MEM) != 0u16 {
+            return MEM_ACCESS_LOAD;
+        }
+    }
+    MEM_ACCESS_NONE
+}
+
+pub fn memopt_query_dependence(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    lhs_place: view<MirPlace>,
+    lhs_kind: u8,
+    rhs_place: view<MirPlace>,
+    rhs_kind: u8,
+    prog_pt: u32
+) -> u8 {
+    if lhs_kind == MEM_ACCESS_NONE || rhs_kind == MEM_ACCESS_NONE {
+        return MEM_DEP_NO_DEPEND;
+    }
+    // Any volatile, atomic, or explicit barrier has strict ordering dependence (REQ-OPT-312, REQ-OPT-313)
+    if lhs_kind == MEM_ACCESS_VOLATILE_LOAD || lhs_kind == MEM_ACCESS_VOLATILE_STORE ||
+       rhs_kind == MEM_ACCESS_VOLATILE_LOAD || rhs_kind == MEM_ACCESS_VOLATILE_STORE ||
+       lhs_kind == MEM_ACCESS_ATOMIC_LOAD || lhs_kind == MEM_ACCESS_ATOMIC_STORE || lhs_kind == MEM_ACCESS_ATOMIC_RMW ||
+       rhs_kind == MEM_ACCESS_ATOMIC_LOAD || rhs_kind == MEM_ACCESS_ATOMIC_STORE || rhs_kind == MEM_ACCESS_ATOMIC_RMW ||
+       lhs_kind == MEM_ACCESS_BARRIER || rhs_kind == MEM_ACCESS_BARRIER {
+        return MEM_DEP_UNKNOWN_DEPEND;
+    }
+    // Read-After-Read has no memory-carried dependence
+    if lhs_kind == MEM_ACCESS_LOAD && rhs_kind == MEM_ACCESS_LOAD {
+        return MEM_DEP_NO_DEPEND;
+    }
+    let fact = alias_query_places(info, body, mut_view(*arena), lhs_place, rhs_place, prog_pt);
+    if alias_is_no_alias_proven(view(fact)) {
+        return MEM_DEP_NO_DEPEND;
+    }
+    if alias_is_must_alias_proven(view(fact)) {
+        return MEM_DEP_MUST_DEPEND;
+    }
+    if fact.result == ALIAS_NO_ALIAS {
+        return MEM_DEP_MAY_DEPEND;
+    }
+    if fact.certainty == CERTAINTY_PROVEN || fact.result == ALIAS_MUST_ALIAS {
+        return MEM_DEP_MAY_DEPEND;
+    }
+    if fact.result == 4u8 {
+        return MEM_DEP_UNKNOWN_DEPEND;
+    }
+    MEM_DEP_MAY_DEPEND
+}
+
+// --- Path Clobber, Local Modification, and Call Escape Helpers ---
+
+fn mo_record_barrier(stats: mut_view<MemOptStats>, log: *mut MemOptLog, arena: mut_view<Arena>, code: u8, bb: u32, inst_idx: u32, loc: u32) {
+    if code == BARRIER_VOLATILE {
+        stats.volatile_barriers = stats.volatile_barriers + 1u32;
+    } else if code == BARRIER_ATOMIC {
+        stats.atomic_barriers = stats.atomic_barriers + 1u32;
+    } else if code == BARRIER_MAY_ALIAS {
+        stats.may_alias_barriers = stats.may_alias_barriers + 1u32;
+    } else if code == BARRIER_FFI {
+        stats.ffi_barriers = stats.ffi_barriers + 1u32;
+    } else if code == BARRIER_PANIC_UNWIND {
+        stats.panic_unwind_barriers = stats.panic_unwind_barriers + 1u32;
+    } else if code == BARRIER_DROP {
+        stats.drop_barriers = stats.drop_barriers + 1u32;
+    } else if code == BARRIER_ZERO_COPY {
+        stats.zero_copy_barriers = stats.zero_copy_barriers + 1u32;
+    } else {
+        return;
+    }
+    memopt_log_push(log, mut_view(*arena), MemOptRecord {
+        is_barrier: true,
+        code: code,
+        bb_idx: bb,
+        inst_idx: inst_idx,
+        src_bb_idx: 0u32,
+        src_inst_idx: 0u32,
+        local_id: loc,
+        reason: 0u8,
+    });
+}
+
+fn mo_place_uses_local_in_base_or_proj(place: view<MirPlace>, loc_v: u32, check_unprojected_base: bool) -> bool {
+    if (place.proj_count > 0 || check_unprojected_base) && place.local.v == loc_v {
+        return true;
+    }
+    let mut i: usize = 0;
+    while i < place.proj_count && (place.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX && (unsafe { (*pr).index_local.v }) == loc_v {
+            return true;
+        }
+        if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) && (unsafe { (*pr).from_local.v }) == loc_v {
+                return true;
+            }
+            if (unsafe { (*pr).has_to }) && (unsafe { (*pr).to_local.v }) == loc_v {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_stmt_modifies_local(st: view<MirStmt>, loc_v: u32) -> bool {
+    if st.kind == MIR_STMT_ASSIGN {
+        if st.place.proj_count == 0 && st.place.local.v == loc_v {
+            return true;
+        }
+        return false;
+    }
+    if st.kind == MIR_STMT_STORAGE_LIVE || st.kind == MIR_STMT_STORAGE_DEAD {
+        return st.storage_local.v == loc_v;
+    }
+    if st.kind == MIR_STMT_DROP {
+        return st.place.local.v == loc_v;
+    }
+    false
+}
+
+fn mo_term_modifies_local(tm: view<MirTerminator>, loc_v: u32) -> bool {
+    if tm.kind == MIR_TERM_CALL && tm.has_destination {
+        if tm.destination.proj_count == 0 && tm.destination.local.v == loc_v {
+            return true;
+        }
+    }
+    if tm.kind == MIR_TERM_DROP && tm.drop_place.local.v == loc_v {
+        return true;
+    }
+    false
+}
+
+fn mo_place_any_dep_local_modified_by_stmt(target_place: view<MirPlace>, st: view<MirStmt>) -> bool {
+    // If target_place has projections (`(*p).f`, `a[idx]`), modifying `p` or `idx` changes what `target_place` refers to!
+    if target_place.proj_count > 0 && mo_stmt_modifies_local(st, target_place.local.v) {
+        return true;
+    }
+    if st.kind == MIR_STMT_STORAGE_LIVE || st.kind == MIR_STMT_STORAGE_DEAD {
+        if target_place.local.v == st.storage_local.v {
+            return true;
+        }
+    }
+    let mut i: usize = 0;
+    while i < target_place.proj_count && (target_place.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(target_place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX && mo_stmt_modifies_local(st, unsafe { (*pr).index_local.v }) {
+            return true;
+        }
+        if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) && mo_stmt_modifies_local(st, unsafe { (*pr).from_local.v }) {
+                return true;
+            }
+            if (unsafe { (*pr).has_to }) && mo_stmt_modifies_local(st, unsafe { (*pr).to_local.v }) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_place_any_dep_local_modified_by_term(target_place: view<MirPlace>, tm: view<MirTerminator>) -> bool {
+    if target_place.proj_count > 0 && mo_term_modifies_local(tm, target_place.local.v) {
+        return true;
+    }
+    let mut i: usize = 0;
+    while i < target_place.proj_count && (target_place.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(target_place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX && mo_term_modifies_local(tm, unsafe { (*pr).index_local.v }) {
+            return true;
+        }
+        if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) && mo_term_modifies_local(tm, unsafe { (*pr).from_local.v }) {
+                return true;
+            }
+            if (unsafe { (*pr).has_to }) && mo_term_modifies_local(tm, unsafe { (*pr).to_local.v }) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_place_has_deref(place: view<MirPlace>) -> bool {
+    let mut i: usize = 0;
+    while i < place.proj_count && (place.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        if (unsafe { (*pr).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_place_has_deref_from(place: view<MirPlace>, start_idx: usize) -> bool {
+    let mut i: usize = start_idx;
+    while i < place.proj_count && (place.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(place.projs, i) };
+        if (unsafe { (*pr).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_make_prefix_place(place: view<MirPlace>, prefix_projs: usize, arena: mut_view<Arena>) -> MirPlace {
+    let mut pl = mir_local_place(place.local.v);
+    pl.region = place.region;
+    if prefix_projs == 0 || (place.projs as usize) == 0 {
+        pl.proj_count = 0;
+        pl.projs = 0 as *mut MirProjection;
+        return pl;
+    }
+    let cnt: usize = if prefix_projs < place.proj_count { prefix_projs } else { place.proj_count };
+    let arr = arena_alloc_raw(
+        mut_view(*arena),
+        mo_mul_usize(cnt, size_of<MirProjection>()),
+        align_of<MirProjection>()
+    ) as *mut MirProjection;
+    let mut k: usize = 0;
+    while k < cnt {
+        let src_p = unsafe { mir_proj_at(place.projs, k) };
+        let dst_p = unsafe { mir_proj_at(arr, k) };
+        unsafe { *dst_p = *src_p; }
+        k = k + 1;
+    }
+    pl.projs = arr;
+    pl.proj_count = cnt;
+    pl
+}
+
+fn mo_place_is_strict_noescape_local(info: view<AliasInfo>, body: view<OptBody>, place: view<MirPlace>) -> bool {
+    let lv = place.local.v as usize;
+    if lv == 0 || lv >= info.local_count || lv >= body.local_count || (info.locals as usize) == 0 {
+        return false;
+    }
+    // Reject ANY `MIR_PROJ_DEREF` anywhere in `place` (`*p`, `*(s.mv)`, `*(w.p)` access pointee memory, not the local itself!)
+    if mo_place_has_deref(place) {
+        return false;
+    }
+    let lp = unsafe { alias_local_prov_at(info.locals, lv) };
+    (unsafe { (*lp).domain }) == DOMAIN_STACK_LOCAL &&
+    !(unsafe { (*lp).borrow_taken }) &&
+    !(unsafe { (*lp).raw_addr_exposed }) &&
+    !(unsafe { (*lp).escaped_external }) &&
+    !(unsafe { (*lp).is_fixed_mmio }) &&
+    !(unsafe { (*lp).is_zero_copy_pinned })
+}
+
+fn mo_term_clobbers_any_dep_of_place(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    term: view<OptTerminator>,
+    target_place: view<MirPlace>,
+    call_table: *const EffectCallTable,
+    prog_pt: u32,
+    out_barrier: mut_view<u8>
+) -> bool {
+    if target_place.proj_count == 0 || (target_place.projs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < target_place.proj_count {
+        let pr = unsafe { mir_proj_at(target_place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            let pref = mo_make_prefix_place(target_place, i, mut_view(*arena));
+            if memopt_call_clobbers_place(info, body, mut_view(*arena), term, view(pref), call_table, prog_pt, mut_view(*out_barrier)) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            let ip = mir_local_place(unsafe { (*pr).index_local.v });
+            if memopt_call_clobbers_place(info, body, mut_view(*arena), term, view(ip), call_table, prog_pt, mut_view(*out_barrier)) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                let fp = mir_local_place(unsafe { (*pr).from_local.v });
+                if memopt_call_clobbers_place(info, body, mut_view(*arena), term, view(fp), call_table, prog_pt, mut_view(*out_barrier)) {
+                    return true;
+                }
+            }
+            if unsafe { (*pr).has_to } {
+                let tp = mir_local_place(unsafe { (*pr).to_local.v });
+                if memopt_call_clobbers_place(info, body, mut_view(*arena), term, view(tp), call_table, prog_pt, mut_view(*out_barrier)) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_inst_clobbers_any_dep_of_place(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    inst: view<OptInst>,
+    target_place: view<MirPlace>,
+    prog_pt: u32,
+    out_barrier: mut_view<u8>
+) -> bool {
+    if target_place.proj_count == 0 || (target_place.projs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < target_place.proj_count {
+        let pr = unsafe { mir_proj_at(target_place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            let pref = mo_make_prefix_place(target_place, i, mut_view(*arena));
+            if memopt_inst_clobbers_place(info, body, mut_view(*arena), inst, view(pref), prog_pt, mut_view(*out_barrier)) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            let ip = mir_local_place(unsafe { (*pr).index_local.v });
+            if memopt_inst_clobbers_place(info, body, mut_view(*arena), inst, view(ip), prog_pt, mut_view(*out_barrier)) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                let fp = mir_local_place(unsafe { (*pr).from_local.v });
+                if memopt_inst_clobbers_place(info, body, mut_view(*arena), inst, view(fp), prog_pt, mut_view(*out_barrier)) {
+                    return true;
+                }
+            }
+            if unsafe { (*pr).has_to } {
+                let tp = mir_local_place(unsafe { (*pr).to_local.v });
+                if memopt_inst_clobbers_place(info, body, mut_view(*arena), inst, view(tp), prog_pt, mut_view(*out_barrier)) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn memopt_call_clobbers_place(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    term: view<OptTerminator>,
+    target_place: view<MirPlace>,
+    call_table: *const EffectCallTable,
+    prog_pt: u32,
+    out_barrier: mut_view<u8>
+) -> bool {
+    *out_barrier = BARRIER_NONE;
+    if mo_place_any_dep_local_modified_by_term(target_place, view(term.orig_term)) {
+        return true;
+    }
+    if mo_term_clobbers_any_dep_of_place(info, body, mut_view(*arena), term, target_place, call_table, prog_pt, mut_view(*out_barrier)) {
+        return true;
+    }
+    if term.orig_term.has_destination {
+        let fact = alias_query_places(info, body, mut_view(*arena), view(term.orig_term.destination), target_place, prog_pt);
+        if alias_may_overlap(view(fact)) {
+            return true;
+        }
+    }
+    let bkind = mo_callee_builtin_kind(body, view(term.orig_term.func));
+    if bkind == TY_BUILTIN_ADDRESS_OF || bkind == TY_BUILTIN_ADDRESS_OF_MUT {
+        return false;
+    }
+    let eff_sum = effect_infer_term_with_table(body, term, call_table);
+    let eff = eff_sum.flags;
+    if (eff & EFFECT_VOLATILE) != 0u16 {
+        *out_barrier = BARRIER_VOLATILE;
+        return true;
+    }
+    if (eff & EFFECT_ATOMIC) != 0u16 {
+        *out_barrier = BARRIER_ATOMIC;
+        return true;
+    }
+    if (eff & (EFFECT_WRITES_MEM | EFFECT_FFI | EFFECT_UNKNOWN)) == 0u16 {
+        return false;
+    }
+    // Non-escaped, unborrowed stack local cannot be mutated by a callee (ALIAS_REASON_NOESCAPE_EXTERNAL)
+    if mo_place_is_strict_noescape_local(info, body, target_place) {
+        return false;
+    }
+    // Only when target_place is an immutable single-def parameter `view<T>` (`local <= arg_count`)
+    // without interior derefs and no raw pointer is exposed on its root, an internal non-FFI call
+    // cannot mutate its referent during the function body (`AXS-ALIAS-003.2`).
+    let tlv = target_place.local.v as usize;
+    if tlv >= 1 && tlv <= body.arg_count && tlv < info.local_count &&
+       target_place.proj_count >= 1 && (target_place.projs as usize) != 0 &&
+       !mo_place_has_deref_from(target_place, 1) {
+        let pr0 = unsafe { mir_proj_at(target_place.projs, 0) };
+        if (unsafe { (*pr0).kind }) == MIR_PROJ_DEREF {
+            let tlp = unsafe { alias_local_prov_at(info.locals, tlv) };
+            if (unsafe { (*tlp).cap_mode }) == 1u8 && (unsafe { (*tlp).def_count }) == 1u32 &&
+               !(unsafe { (*tlp).raw_addr_exposed }) &&
+               (eff & (EFFECT_FFI | EFFECT_UNKNOWN)) == 0u16 {
+                return false;
+            }
+        }
+    }
+    if (eff & (EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16 {
+        *out_barrier = BARRIER_FFI;
+    }
+    true
+}
+
+fn memopt_inst_clobbers_place(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    inst: view<OptInst>,
+    target_place: view<MirPlace>,
+    prog_pt: u32,
+    out_barrier: mut_view<u8>
+) -> bool {
+    *out_barrier = BARRIER_NONE;
+    if mo_is_deleted_nop(inst) {
+        return false;
+    }
+    let opc = inst.opcode;
+    if opc == OPT_INST_VOLATILE_LOAD || opc == OPT_INST_VOLATILE_STORE {
+        *out_barrier = BARRIER_VOLATILE;
+        return true;
+    }
+    if opc == OPT_INST_ATOMIC {
+        *out_barrier = BARRIER_ATOMIC;
+        return true;
+    }
+    if opc == OPT_INST_ZEROIZE || opc == OPT_INST_BLACK_BOX || (inst.flags & OPT_FLAG_BARRIER) != 0u16 {
+        return true;
+    }
+    if mo_place_any_dep_local_modified_by_stmt(target_place, view(inst.orig_stmt)) {
+        return true;
+    }
+    if mo_inst_clobbers_any_dep_of_place(info, body, mut_view(*arena), inst, target_place, prog_pt, mut_view(*out_barrier)) {
+        return true;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_DROP {
+        let dfact = alias_query_places(info, body, mut_view(*arena), view(inst.orig_stmt.place), target_place, prog_pt);
+        if alias_may_overlap(view(dfact)) {
+            *out_barrier = BARRIER_DROP;
+            return true;
+        }
+        return false;
+    }
+    if inst.orig_stmt.kind == MIR_STMT_ASSIGN {
+        let wplace = view(inst.orig_stmt.place);
+        let wlv = wplace.local.v as usize;
+        if wlv < info.local_count && (info.locals as usize) != 0 {
+            let wlp = unsafe { alias_local_prov_at(info.locals, wlv) };
+            if unsafe { (*wlp).is_fixed_mmio } {
+                *out_barrier = BARRIER_VOLATILE;
+                return true;
+            }
+        }
+        // Only check alias overlap if wplace can overlap target_place (note: even scalar assign to x if target_place is x)
+        if wplace.proj_count == 0 && target_place.proj_count == 0 {
+            return wplace.local.v == target_place.local.v;
+        }
+        if mo_place_is_memory_backed(info, body, wplace) {
+            let fact = alias_query_places(info, body, mut_view(*arena), wplace, target_place, prog_pt);
+            if alias_may_overlap(view(fact)) {
+                if !alias_is_must_alias_proven(view(fact)) {
+                    *out_barrier = BARRIER_MAY_ALIAS;
+                }
+                return true;
+            }
+        }
+    }
+    false
+}
+
+// Backward BFS across ALL CFG paths (including loop backedges!) from `(cur_b, cur_i)` back to `(dom_b, dom_i)`.
+// Precondition: `opt_dominates(body, dom_b, cur_b)` and if `dom_b == cur_b`, `dom_i < cur_i`.
+pub fn memopt_place_clobbered_on_path(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    dom_b: usize,
+    dom_i: usize,
+    cur_b: usize,
+    cur_i: usize,
+    target_place: view<MirPlace>,
+    call_table: *const EffectCallTable,
+    out_barrier: mut_view<u8>
+) -> bool {
+    *out_barrier = BARRIER_NONE;
+    let bcnt = body.bb_count;
+    if dom_b >= bcnt || cur_b >= bcnt {
+        return true;
+    }
+
+    // Same-block case without visiting predecessors:
+    if dom_b == cur_b {
+        let bb = unsafe { opt_block_at(body.blocks, cur_b) };
+        let mut idx: usize = dom_i + 1;
+        while idx < cur_i && idx < (unsafe { (*bb).inst_count }) {
+            let inst = unsafe { opt_inst_at((*bb).insts, idx) };
+            let pt = alias_make_prog_pt(cur_b as u32, idx as u32);
+            if memopt_inst_clobbers_place(info, body, mut_view(*arena), unsafe { view(*inst) }, target_place, pt, mut_view(*out_barrier)) {
+                return true;
+            }
+            idx = idx + 1;
+        }
+        return false;
+    }
+
+    // Cross-block case:
+    // 1. Check `cur_b` instructions `0 .. cur_i`.
+    let cbb = unsafe { opt_block_at(body.blocks, cur_b) };
+    let mut ci: usize = 0;
+    while ci < cur_i && ci < (unsafe { (*cbb).inst_count }) {
+        let inst = unsafe { opt_inst_at((*cbb).insts, ci) };
+        let pt = alias_make_prog_pt(cur_b as u32, ci as u32);
+        if memopt_inst_clobbers_place(info, body, mut_view(*arena), unsafe { view(*inst) }, target_place, pt, mut_view(*out_barrier)) {
+            return true;
+        }
+        ci = ci + 1;
+    }
+
+    // 2. Enqueue all reachable predecessors of `cur_b` for full-exit inspection.
+    // Note: if `cur_b` is inside a loop that does not pass through `dom_b`, a predecessor chain may reach `cur_b`
+    // at its terminator! `visited_exit[b]` tracks blocks whose exit (and full body if `b != dom_b`, or `dom_i+1..end` if `b == dom_b`)
+    // has been queued.
+    let visited_exit = arena_alloc_raw(mut_view(*arena), bcnt, 1) as *mut bool;
+    let queue = arena_alloc_raw(mut_view(*arena), mo_mul_usize(bcnt + 1, 4), 4) as *mut u32;
+    let mut z: usize = 0;
+    while z < bcnt {
+        unsafe { *opt_bool_at(visited_exit, z) = false; }
+        z = z + 1;
+    }
+
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+    let c_pcnt = unsafe { (*cbb).pred_count };
+    let mut p: usize = 0;
+    while p < c_pcnt {
+        let pb = (unsafe { (*opt_bbid_at((*cbb).preds, p)).v }) as usize;
+        if pb < bcnt {
+            let pbb = unsafe { opt_block_at(body.blocks, pb) };
+            if (unsafe { (*pbb).is_reachable }) && !(unsafe { *opt_bool_at(visited_exit, pb) }) {
+                unsafe {
+                    *opt_bool_at(visited_exit, pb) = true;
+                    *opt_u32_at(queue, q_tail) = pb as u32;
+                }
+                q_tail = q_tail + 1;
+            }
+        }
+        p = p + 1;
+    }
+
+    while q_head < q_tail {
+        let qb = (unsafe { *opt_u32_at(queue, q_head) }) as usize;
+        q_head = q_head + 1;
+        let qbb = unsafe { opt_block_at(body.blocks, qb) };
+        let q_icnt = unsafe { (*qbb).inst_count };
+
+        // Check terminator of `qb`
+        let term_pt = alias_make_prog_pt(qb as u32, q_icnt as u32);
+        let tk = unsafe { (*qbb).term.kind };
+        if tk == OPT_TERM_CALL {
+            if memopt_call_clobbers_place(
+                info,
+                body,
+                mut_view(*arena),
+                unsafe { view((*qbb).term) },
+                target_place,
+                call_table,
+                term_pt,
+                mut_view(*out_barrier)
+            ) {
+                return true;
+            }
+        } else if tk == OPT_TERM_DROP {
+            if mo_place_any_dep_local_modified_by_term(target_place, unsafe { view((*qbb).term.orig_term) }) {
+                *out_barrier = BARRIER_DROP;
+                return true;
+            }
+            let dfact = alias_query_places(
+                info,
+                body,
+                mut_view(*arena),
+                unsafe { view((*qbb).term.orig_term.drop_place) },
+                target_place,
+                term_pt
+            );
+            if alias_may_overlap(view(dfact)) {
+                *out_barrier = BARRIER_DROP;
+                return true;
+            }
+        }
+
+        if qb == dom_b {
+            // Check only instructions strictly after `dom_i` in `dom_b`; do NOT walk past `dom_b` entry!
+            let mut di: usize = dom_i + 1;
+            while di < q_icnt {
+                let dinst = unsafe { opt_inst_at((*qbb).insts, di) };
+                let dpt = alias_make_prog_pt(qb as u32, di as u32);
+                if memopt_inst_clobbers_place(info, body, mut_view(*arena), unsafe { view(*dinst) }, target_place, dpt, mut_view(*out_barrier)) {
+                    return true;
+                }
+                di = di + 1;
+            }
+        } else {
+            // Check ALL instructions in `qb`, then enqueue predecessors of `qb`
+            let mut qi: usize = 0;
+            while qi < q_icnt {
+                let qinst = unsafe { opt_inst_at((*qbb).insts, qi) };
+                let qpt = alias_make_prog_pt(qb as u32, qi as u32);
+                if memopt_inst_clobbers_place(info, body, mut_view(*arena), unsafe { view(*qinst) }, target_place, qpt, mut_view(*out_barrier)) {
+                    return true;
+                }
+                qi = qi + 1;
+            }
+            let q_pcnt = unsafe { (*qbb).pred_count };
+            let mut qp: usize = 0;
+            while qp < q_pcnt {
+                let npb = (unsafe { (*opt_bbid_at((*qbb).preds, qp)).v }) as usize;
+                if npb < bcnt {
+                    let npbb = unsafe { opt_block_at(body.blocks, npb) };
+                    if (unsafe { (*npbb).is_reachable }) && !(unsafe { *opt_bool_at(visited_exit, npb) }) {
+                        unsafe {
+                            *opt_bool_at(visited_exit, npb) = true;
+                            *opt_u32_at(queue, q_tail) = npb as u32;
+                        }
+                        q_tail = q_tail + 1;
+                    }
+                }
+                qp = qp + 1;
+            }
+        }
+    }
+    false
+}
+
+fn mo_operand_unclobbered_on_path(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    dom_b: usize,
+    dom_i: usize,
+    cur_b: usize,
+    cur_i: usize,
+    src_op: view<MirOperand>,
+    expected_ty: TypeId,
+    call_table: *const EffectCallTable
+) -> bool {
+    if !mo_type_is_copy_scalar(body.thir, expected_ty) {
+        return false;
+    }
+    if src_op.kind == MIR_OP_CONST {
+        return src_op.constant.kind == MIR_CONST_INT || src_op.constant.kind == MIR_CONST_BOOL;
+    }
+    if src_op.kind != MIR_OP_COPY && src_op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    if src_op.place.proj_count != 0 {
+        return false;
+    }
+    let slv = src_op.place.local.v;
+    if (slv as usize) >= body.local_count {
+        return false;
+    }
+    let sl_place = mir_local_place(slv);
+    let mut dummy_bar: u8 = BARRIER_NONE;
+    if memopt_place_clobbered_on_path(
+        info,
+        body,
+        mut_view(*arena),
+        dom_b,
+        dom_i,
+        cur_b,
+        cur_i,
+        view(sl_place),
+        call_table,
+        mut_view(dummy_bar)
+    ) {
+        return false;
+    }
+    true
+}
+
+// --- Load Rewrite & MemorySSA Forwarding / RLE Engine (SPEC-71 AXS-ALIAS-006 Rules 1-3, REQ-OPT-366) ---
+
+fn mo_find_local_ssa_val_at_inst(body: view<OptBody>, loc_v: u32, dom_inst: view<OptInst>, use_lhs: bool) -> OptValueId {
+    if use_lhs && dom_inst.lhs.v != OPT_VALUE_NONE {
+        return OptValueId { v: dom_inst.lhs.v };
+    }
+    if !use_lhs && dom_inst.result.v != OPT_VALUE_NONE {
+        return OptValueId { v: dom_inst.result.v };
+    }
+    // Fallback: search OptValues for single-def parameter or inst on `loc_v`
+    let mut v: usize = 1;
+    let mut found = OptValueId { v: OPT_VALUE_NONE };
+    let mut count: u32 = 0u32;
+    while v <= body.value_count && (body.values as usize) != 0 {
+        let vp = unsafe { opt_val_at(body.values, v) };
+        if (unsafe { (*vp).src_local.v }) == loc_v && (unsafe { (*vp).proj_field }) == OPT_PROJ_NONE {
+            found = OptValueId { v: v as u32 };
+            count = count + 1u32;
+        }
+        v = v + 1;
+    }
+    if count == 1u32 { found } else { OptValueId { v: OPT_VALUE_NONE } }
+}
+
+fn mo_rewrite_load_with_operand(
+    info: view<AliasInfo>,
+    body: mut_view<OptBody>,
+    bb_idx: usize,
+    inst_idx: usize,
+    src_op: view<MirOperand>,
+    ssa_src_val: OptValueId
+) -> bool {
+    let bb = unsafe { opt_block_at(body.blocks, bb_idx) };
+    let inst = unsafe { opt_inst_at((*bb).insts, inst_idx) };
+    let dst_mem = mo_place_is_memory_backed(info, view(*body), unsafe { view((*inst).orig_stmt.place) });
+
+    if !dst_mem && src_op.kind != MIR_OP_CONST && ssa_src_val.v == OPT_VALUE_NONE {
+        // Scalar SSA load destination requires a valid SSA OptValueId when rewriting to OPT_INST_COPY
+        return false;
+    }
+
+    // Rewrite underlying MIR statement rvalue cleanly (`dst_place = const C` or `dst_place = copy _src`)
+    unsafe {
+        mir_rvalue_reset(mut_view((*inst).orig_stmt.rvalue), MIR_RVALUE_USE);
+        mir_copy_operand(mut_view((*inst).orig_stmt.rvalue.use_op), src_op);
+        if (*inst).orig_stmt.rvalue.use_op.kind == MIR_OP_MOVE {
+            (*inst).orig_stmt.rvalue.use_op.kind = MIR_OP_COPY;
+        }
+        (*inst).rhs_place = mir_local_place(0u32);
+        (*inst).flags = (*inst).flags & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD);
+    }
+
+    if dst_mem {
+        unsafe {
+            (*inst).opcode = OPT_INST_STORE;
+            (*inst).lhs = if src_op.kind == MIR_OP_CONST { OptValueId { v: OPT_VALUE_NONE } } else { ssa_src_val };
+            (*inst).rhs = OptValueId { v: OPT_VALUE_NONE };
+        }
+    } else if src_op.kind == MIR_OP_CONST {
+        unsafe {
+            (*inst).opcode = OPT_INST_CONST;
+            (*inst).lhs = OptValueId { v: OPT_VALUE_NONE };
+            (*inst).rhs = OptValueId { v: OPT_VALUE_NONE };
+            let res_v = (*inst).result.v as usize;
+            if res_v != 0 && res_v <= body.value_count && (body.values as usize) != 0 {
+                let vp = opt_val_at(body.values, res_v);
+                (*vp).kind = OPT_VAL_CONST;
+                mir_copy_const(mut_view((*vp).const_val), view(src_op.constant));
+            }
+        }
+    } else {
+        unsafe {
+            (*inst).opcode = OPT_INST_COPY;
+            (*inst).lhs = ssa_src_val;
+            (*inst).rhs = OptValueId { v: OPT_VALUE_NONE };
+            let res_v = (*inst).result.v as usize;
+            if res_v != 0 && res_v <= body.value_count && (body.values as usize) != 0 {
+                let vp = opt_val_at(body.values, res_v);
+                (*vp).kind = OPT_VAL_INST;
+            }
+        }
+    }
+    true
+}
+
+fn mo_try_dominating_candidate_for_load(
+    info: view<AliasInfo>,
+    body: mut_view<OptBody>,
+    arena: mut_view<Arena>,
+    dom_b: usize,
+    dom_i: usize,
+    cur_b: usize,
+    cur_i: usize,
+    load_place: view<MirPlace>,
+    load_ty: TypeId,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    saw_barrier: mut_view<u8>
+) -> u8 {
+    // Returns: 0 = keep searching, 1 = rewritten, 2 = stop searching (clobbered/barrier)
+    let dbb = unsafe { opt_block_at(body.blocks, dom_b) };
+    let dinst = unsafe { opt_inst_at((*dbb).insts, dom_i) };
+    if mo_is_deleted_nop(unsafe { view(*dinst) }) {
+        return 0u8;
+    }
+    let dopc = unsafe { (*dinst).opcode };
+    if dopc == OPT_INST_VOLATILE_LOAD || dopc == OPT_INST_VOLATILE_STORE {
+        *saw_barrier = BARRIER_VOLATILE;
+        return 2u8;
+    }
+    if dopc == OPT_INST_ATOMIC {
+        *saw_barrier = BARRIER_ATOMIC;
+        return 2u8;
+    }
+    if dopc == OPT_INST_ZEROIZE || dopc == OPT_INST_BLACK_BOX || ((unsafe { (*dinst).flags }) & OPT_FLAG_BARRIER) != 0u16 {
+        return 2u8;
+    }
+
+    let dst_st = unsafe { view((*dinst).orig_stmt) };
+    let pt = alias_make_prog_pt(cur_b as u32, cur_i as u32);
+
+    if dst_st.kind == MIR_STMT_ASSIGN {
+        // Case A: Store-to-Load Forwarding (`*p = v; ... x = *q` with `MustAlias(p, q)` Proven)
+        let wplace = view(dst_st.place);
+        if mo_place_is_memory_backed(info, view(*body), wplace) {
+            let sfact = alias_query_places(info, view(*body), mut_view(*arena), wplace, load_place, pt);
+            if alias_is_must_alias_proven(view(sfact)) {
+                let wty = alias_place_access_ty(view(*body), wplace);
+                if wty.v == load_ty.v && dst_st.rvalue.kind == MIR_RVALUE_USE {
+                    let src_op = view(dst_st.rvalue.use_op);
+                    if mo_operand_unclobbered_on_path(info, view(*body), mut_view(*arena), dom_b, dom_i, cur_b, cur_i, src_op, (TypeId { v: load_ty.v }), call_table) {
+                        let mut path_bar: u8 = BARRIER_NONE;
+                        if !memopt_place_clobbered_on_path(info, view(*body), mut_view(*arena), dom_b, dom_i, cur_b, cur_i, load_place, call_table, mut_view(path_bar)) {
+                            let ssa_v = if src_op.kind == MIR_OP_CONST {
+                                OptValueId { v: OPT_VALUE_NONE }
+                            } else {
+                                mo_find_local_ssa_val_at_inst(view(*body), src_op.place.local.v, unsafe { view(*dinst) }, true)
+                            };
+                            let copied_op_ptr = arena_alloc_raw(mut_view(*arena), size_of<MirOperand>(), align_of<MirOperand>()) as *mut MirOperand;
+                            mir_copy_operand(unsafe { mut_view(*copied_op_ptr) }, src_op);
+                            if mo_rewrite_load_with_operand(info, mut_view(*body), cur_b, cur_i, unsafe { view(*copied_op_ptr) }, (OptValueId { v: ssa_v.v })) {
+                                optir_record_provenance(
+                                    mut_view(*body),
+                                    mut_view(*arena),
+                                    PROP_NO_ALIAS,
+                                    CERTAINTY_PROVEN,
+                                    ANALYSIS_ALIAS_INFO,
+                                    ssa_v,
+                                    OptValueId { v: OPT_VALUE_NONE },
+                                    OptBbId { v: cur_b as u32 },
+                                    OptInstId { v: cur_i as u32 },
+                                    PASS_ALIAS_MEM
+                                );
+                                stats.forwarded_loads = stats.forwarded_loads + 1u32;
+                                memopt_log_push(log, mut_view(*arena), MemOptRecord {
+                                    is_barrier: false,
+                                    code: ACTION_STORE_TO_LOAD_FORWARD,
+                                    bb_idx: cur_b as u32,
+                                    inst_idx: cur_i as u32,
+                                    src_bb_idx: dom_b as u32,
+                                    src_inst_idx: dom_i as u32,
+                                    local_id: load_place.local.v,
+                                    reason: sfact.reason,
+                                });
+                                return 1u8;
+                            }
+                        } else if path_bar != BARRIER_NONE {
+                            *saw_barrier = path_bar;
+                        }
+                    }
+                }
+                return 2u8;
+            }
+            if alias_may_overlap(view(sfact)) {
+                *saw_barrier = BARRIER_MAY_ALIAS;
+                return 2u8;
+            }
+        }
+
+        // Case B: Redundant Load Elimination (`r1 = *p; ... r2 = *q` with `MustAlias(p, q)` Proven)
+        if dst_st.place.proj_count == 0 && dst_st.rvalue.kind == MIR_RVALUE_USE {
+            let prev_uop = view(dst_st.rvalue.use_op);
+            if (prev_uop.kind == MIR_OP_COPY || prev_uop.kind == MIR_OP_MOVE) &&
+               mo_place_is_memory_backed(info, view(*body), view(prev_uop.place)) {
+                let lfact = alias_query_places(info, view(*body), mut_view(*arena), view(prev_uop.place), load_place, pt);
+                if alias_is_must_alias_proven(view(lfact)) {
+                    let pty = alias_place_access_ty(view(*body), view(prev_uop.place));
+                    let holder_loc = dst_st.place.local.v;
+                    if pty.v == load_ty.v && holder_loc != 0u32 {
+                        let holder_op = mir_op_copy_local(holder_loc);
+                        if mo_operand_unclobbered_on_path(info, view(*body), mut_view(*arena), dom_b, dom_i, cur_b, cur_i, view(holder_op), (TypeId { v: load_ty.v }), call_table) {
+                            let mut path_bar2: u8 = BARRIER_NONE;
+                            if !memopt_place_clobbered_on_path(info, view(*body), mut_view(*arena), dom_b, dom_i, cur_b, cur_i, load_place, call_table, mut_view(path_bar2)) {
+                                let ssa_v2 = mo_find_local_ssa_val_at_inst(view(*body), holder_loc, unsafe { view(*dinst) }, false);
+                                if mo_rewrite_load_with_operand(info, mut_view(*body), cur_b, cur_i, view(holder_op), (OptValueId { v: ssa_v2.v })) {
+                                    optir_record_provenance(
+                                        mut_view(*body),
+                                        mut_view(*arena),
+                                        PROP_NO_ALIAS,
+                                        CERTAINTY_PROVEN,
+                                        ANALYSIS_ALIAS_INFO,
+                                        ssa_v2,
+                                        OptValueId { v: OPT_VALUE_NONE },
+                                        OptBbId { v: cur_b as u32 },
+                                        OptInstId { v: cur_i as u32 },
+                                        PASS_ALIAS_MEM
+                                    );
+                                    stats.eliminated_redundant_loads = stats.eliminated_redundant_loads + 1u32;
+                                    memopt_log_push(log, mut_view(*arena), MemOptRecord {
+                                        is_barrier: false,
+                                        code: ACTION_REDUNDANT_LOAD_ELIM,
+                                        bb_idx: cur_b as u32,
+                                        inst_idx: cur_i as u32,
+                                        src_bb_idx: dom_b as u32,
+                                        src_inst_idx: dom_i as u32,
+                                        local_id: load_place.local.v,
+                                        reason: lfact.reason,
+                                    });
+                                    return 1u8;
+                                }
+                            } else if path_bar2 != BARRIER_NONE {
+                                *saw_barrier = path_bar2;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If `dinst` modifies or clobbers any base/index local or pointer prefix of `load_place`, we cannot walk earlier past `dinst`!
+    if mo_place_any_dep_local_modified_by_stmt(load_place, dst_st) {
+        return 2u8;
+    }
+    let cand_pt = alias_make_prog_pt(dom_b as u32, dom_i as u32);
+    let mut dep_bar: u8 = BARRIER_NONE;
+    if mo_inst_clobbers_any_dep_of_place(info, view(*body), mut_view(*arena), unsafe { view(*dinst) }, load_place, cand_pt, mut_view(dep_bar)) {
+        if dep_bar != BARRIER_NONE {
+            *saw_barrier = dep_bar;
+        }
+        return 2u8;
+    }
+    0u8
+}
+
+pub fn memopt_run_forwarding_and_rle(
+    info: view<AliasInfo>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut changed = false;
+    let rcnt = body.rpo_count;
+    let mut ri: usize = 0;
+    while ri < rcnt {
+        let b = (unsafe { (*opt_bbid_at(body.rpo_order, ri)).v }) as usize;
+        if b < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, b) };
+            if unsafe { (*bb).is_reachable } {
+                let icnt = unsafe { (*bb).inst_count };
+                let mut i: usize = 0;
+                while i < icnt {
+                    let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                    if !mo_is_deleted_nop(unsafe { view(*inst) }) {
+                        let opc = unsafe { (*inst).opcode };
+                        if opc == OPT_INST_VOLATILE_LOAD {
+                            let vloc = unsafe { (*inst).orig_stmt.rvalue.use_op.place.local.v };
+                            mo_record_barrier(mut_view(*stats), log, mut_view(*arena), BARRIER_VOLATILE, b as u32, i as u32, vloc);
+                        } else if opc == OPT_INST_ATOMIC {
+                            let aloc = unsafe { (*inst).place.local.v };
+                            mo_record_barrier(mut_view(*stats), log, mut_view(*arena), BARRIER_ATOMIC, b as u32, i as u32, aloc);
+                        } else if (unsafe { (*inst).orig_stmt.kind }) == MIR_STMT_ASSIGN &&
+                                  (unsafe { (*inst).orig_stmt.rvalue.kind }) == MIR_RVALUE_USE {
+                            let uop_kind = unsafe { (*inst).orig_stmt.rvalue.use_op.kind };
+                            if (uop_kind == MIR_OP_COPY || uop_kind == MIR_OP_MOVE) &&
+                               mo_place_is_memory_backed(info, view(*body), unsafe { view((*inst).orig_stmt.rvalue.use_op.place) }) {
+                                let lpl_copy = arena_alloc_raw(mut_view(*arena), size_of<MirPlace>(), align_of<MirPlace>()) as *mut MirPlace;
+                                mir_copy_place(unsafe { mut_view(*lpl_copy) }, unsafe { view((*inst).orig_stmt.rvalue.use_op.place) });
+                                let lloc = unsafe { (*lpl_copy).local.v };
+                                let mut is_mmio = false;
+                                if (lloc as usize) < info.local_count && (info.locals as usize) != 0 {
+                                    let llp = unsafe { alias_local_prov_at(info.locals, lloc as usize) };
+                                    if (unsafe { (*llp).is_fixed_mmio }) || (unsafe { (*llp).domain }) == DOMAIN_FIXED_MMIO {
+                                        is_mmio = true;
+                                    }
+                                }
+                                if is_mmio {
+                                    mo_record_barrier(mut_view(*stats), log, mut_view(*arena), BARRIER_VOLATILE, b as u32, i as u32, lloc);
+                                } else {
+                                    let lty = alias_place_access_ty(view(*body), unsafe { view(*lpl_copy) });
+                                    if mo_type_is_copy_scalar(body.thir, (TypeId { v: lty.v })) {
+                                        let mut saw_bar: u8 = BARRIER_NONE;
+                                        let mut this_rewritten = false;
+                                        let mut done = false;
+                                        let mut walk_b: usize = b;
+                                        let mut depth: u32 = 0u32;
+                                        while !done && depth < 64u32 {
+                                            let wbb = unsafe { opt_block_at(body.blocks, walk_b) };
+                                            let start_k: usize = if walk_b == b { i } else { unsafe { (*wbb).inst_count } };
+                                            // If walking into a strict dominator block, check its terminator first!
+                                            if walk_b != b {
+                                                let wt_pt = alias_make_prog_pt(walk_b as u32, start_k as u32);
+                                                if (unsafe { (*wbb).term.kind }) == OPT_TERM_CALL {
+                                                    let mut cbar: u8 = BARRIER_NONE;
+                                                    if memopt_call_clobbers_place(
+                                                        info,
+                                                        view(*body),
+                                                        mut_view(*arena),
+                                                        unsafe { view((*wbb).term) },
+                                                        unsafe { view(*lpl_copy) },
+                                                        call_table,
+                                                        wt_pt,
+                                                        mut_view(cbar)
+                                                    ) {
+                                                        if cbar != BARRIER_NONE {
+                                                            saw_bar = cbar;
+                                                        }
+                                                        done = true;
+                                                    }
+                                                } else if (unsafe { (*wbb).term.kind }) == OPT_TERM_DROP {
+                                                    done = true;
+                                                }
+                                            }
+                                            let mut k: usize = start_k;
+                                            while !done && k > 0 {
+                                                k = k - 1;
+                                                let st = mo_try_dominating_candidate_for_load(
+                                                    info,
+                                                    mut_view(*body),
+                                                    mut_view(*arena),
+                                                    walk_b,
+                                                    k,
+                                                    b,
+                                                    i,
+                                                    unsafe { view(*lpl_copy) },
+                                                    TypeId { v: lty.v },
+                                                    call_table,
+                                                    mut_view(*stats),
+                                                    log,
+                                                    mut_view(saw_bar)
+                                                );
+                                                if st == 1u8 {
+                                                    this_rewritten = true;
+                                                    changed = true;
+                                                    done = true;
+                                                } else if st == 2u8 {
+                                                    done = true;
+                                                }
+                                            }
+                                            if !done {
+                                                if walk_b == 0 {
+                                                    done = true;
+                                                } else {
+                                                    let idom_v = unsafe { (*wbb).idom.v };
+                                                    if idom_v == OPT_BB_NONE || (idom_v as usize) == walk_b || (idom_v as usize) >= body.bb_count {
+                                                        done = true;
+                                                    } else {
+                                                        walk_b = idom_v as usize;
+                                                    }
+                                                }
+                                            }
+                                            depth = depth + 1u32;
+                                        }
+                                        if !this_rewritten && saw_bar != BARRIER_NONE {
+                                            mo_record_barrier(mut_view(*stats), log, mut_view(*arena), saw_bar, b as u32, i as u32, lloc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        ri = ri + 1;
+    }
+    changed
+}
+
+// --- Read-Aliasing Scanners & Dead Store Elimination (SPEC-71 AXS-ALIAS-006 Rule 4, REQ-OPT-366) ---
+
+fn mo_place_reads_aliasing(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    read_place: view<MirPlace>,
+    prog_pt: u32
+) -> bool {
+    // Also check if reading `read_place` reads its base pointer/index locals when `store_place` is that scalar local!
+    if store_place.proj_count == 0 {
+        if mo_place_uses_local_in_base_or_proj(read_place, store_place.local.v, true) {
+            return true;
+        }
+    }
+    // Reading `read_place` also reads any pointer prefix before a `MIR_PROJ_DEREF` (e.g. `_2.0` in `*(_2.0)`)
+    // and any `index_local` / `from_local` / `to_local` in `MIR_PROJ_INDEX` / `MIR_PROJ_SUB_SLICE`.
+    if read_place.proj_count > 0 {
+        if mo_lhs_place_deref_or_index_reads_aliasing(info, body, mut_view(*arena), store_place, read_place, prog_pt) {
+            return true;
+        }
+    }
+    if read_place.proj_count == 0 && store_place.proj_count == 0 {
+        return read_place.local.v == store_place.local.v;
+    }
+    let fact = alias_query_places(info, body, mut_view(*arena), store_place, read_place, prog_pt);
+    alias_may_overlap(view(fact))
+}
+
+fn mo_op_reads_aliasing(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    op: view<MirOperand>,
+    prog_pt: u32
+) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(op.place), prog_pt);
+    }
+    false
+}
+
+fn mo_lhs_place_deref_or_index_reads_aliasing(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    lhs_place: view<MirPlace>,
+    prog_pt: u32
+) -> bool {
+    // Accessing or writing through `(*p).f`, `*(s.p)`, or `arr[idx]` reads every dereferenced pointer prefix
+    // (`p`, `s.p`, ...) and every index/slice bound local (`idx`, `from`, `to`), though NOT the final LHS pointee itself.
+    if lhs_place.proj_count == 0 || (lhs_place.projs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < lhs_place.proj_count {
+        let pr = unsafe { mir_proj_at(lhs_place.projs, i) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_DEREF {
+            let pref = mo_make_prefix_place(lhs_place, i, mut_view(*arena));
+            if mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(pref), prog_pt) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_INDEX {
+            let ip = mir_local_place(unsafe { (*pr).index_local.v });
+            if mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(ip), prog_pt) {
+                return true;
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                let fp = mir_local_place(unsafe { (*pr).from_local.v });
+                if mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(fp), prog_pt) {
+                    return true;
+                }
+            }
+            if unsafe { (*pr).has_to } {
+                let tp = mir_local_place(unsafe { (*pr).to_local.v });
+                if mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(tp), prog_pt) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn mo_stmt_reads_aliasing(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    st: view<MirStmt>,
+    prog_pt: u32
+) -> bool {
+    if st.kind == MIR_STMT_DROP {
+        return mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.place), prog_pt);
+    }
+    if st.kind != MIR_STMT_ASSIGN {
+        return false;
+    }
+    if mo_lhs_place_deref_or_index_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.place), prog_pt) {
+        return true;
+    }
+    let rk = st.rvalue.kind;
+    if rk == MIR_RVALUE_USE || rk == MIR_RVALUE_UNARY_OP || rk == MIR_RVALUE_CAST {
+        return mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.rvalue.use_op), prog_pt);
+    }
+    if rk == MIR_RVALUE_REPEAT {
+        if mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.rvalue.use_op), prog_pt) {
+            return true;
+        }
+        let rcop = st.rvalue.repeat_count_op;
+        if (rcop as usize) != 0 && mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, unsafe { view(*rcop) }, prog_pt) {
+            return true;
+        }
+        return false;
+    }
+    if rk == MIR_RVALUE_REF || rk == MIR_RVALUE_LEN || rk == MIR_RVALUE_DISCRIMINANT {
+        // Taking `&place` / `mut_view(place)` exposes the stored value to subsequent reads through the reference!
+        return mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.rvalue.place), prog_pt);
+    }
+    if rk == MIR_RVALUE_BINARY_OP || rk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        return mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.rvalue.lhs), prog_pt) ||
+               mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(st.rvalue.rhs), prog_pt);
+    }
+    if rk == MIR_RVALUE_AGGREGATE {
+        let mut idx: usize = 0;
+        while idx < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+            let op = unsafe { mir_op_at(st.rvalue.operands, idx) };
+            if mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, unsafe { view(*op) }, prog_pt) {
+                return true;
+            }
+            idx = idx + 1;
+        }
+    }
+    false
+}
+
+fn mo_term_reads_aliasing(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    tm: view<MirTerminator>,
+    prog_pt: u32
+) -> bool {
+    if tm.kind == MIR_TERM_SWITCH_INT {
+        return mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(tm.discr), prog_pt);
+    }
+    if tm.kind == MIR_TERM_ASSERT {
+        return mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(tm.cond), prog_pt);
+    }
+    if tm.kind == MIR_TERM_DROP {
+        return mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(tm.drop_place), prog_pt);
+    }
+    if tm.kind == MIR_TERM_RETURN {
+        let ret_pl = mir_local_place(0u32);
+        return mo_place_reads_aliasing(info, body, mut_view(*arena), store_place, view(ret_pl), prog_pt);
+    }
+    if tm.kind == MIR_TERM_CALL {
+        if mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, view(tm.func), prog_pt) {
+            return true;
+        }
+        if tm.has_destination && mo_lhs_place_deref_or_index_reads_aliasing(info, body, mut_view(*arena), store_place, view(tm.destination), prog_pt) {
+            return true;
+        }
+        let mut ai: usize = 0;
+        while ai < tm.arg_count && (tm.args as usize) != 0 {
+            let aop = unsafe { mir_op_at(tm.args, ai) };
+            if mo_op_reads_aliasing(info, body, mut_view(*arena), store_place, unsafe { view(*aop) }, prog_pt) {
+                return true;
+            }
+            ai = ai + 1;
+        }
+    }
+    false
+}
+
+fn mo_op_is_non_trivial_move(body: view<OptBody>, op: view<MirOperand>) -> bool {
+    if op.kind != MIR_OP_MOVE {
+        return false;
+    }
+    let lv = op.place.local.v as usize;
+    if lv < body.local_count && (body.local_dropped as usize) != 0 {
+        if unsafe { *opt_bool_at(body.local_dropped, lv) } {
+            return true;
+        }
+    }
+    !mo_type_is_copy_scalar(body.thir, TypeId { v: if lv < body.local_count && (body.local_tys as usize) != 0 { unsafe { (*opt_typeid_at(body.local_tys, lv)).v } } else { 0u32 } })
+}
+
+fn mo_inst_rhs_blocks_dse(body: view<OptBody>, inst: view<OptInst>) -> bool {
+    if inst.opcode == OPT_INST_CHECKED_BINOP || (inst.flags & OPT_FLAG_MAY_TRAP) != 0u16 {
+        return true;
+    }
+    let st = view(inst.orig_stmt);
+    if st.kind != MIR_STMT_ASSIGN {
+        return true;
+    }
+    let rk = st.rvalue.kind;
+    if rk == MIR_RVALUE_BINARY_OP || rk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        let bop = st.rvalue.bin_op;
+        if bop == MIR_BINOP_DIV || bop == MIR_BINOP_REM || bop == MIR_BINOP_SHL || bop == MIR_BINOP_SHR {
+            return true;
+        }
+        if mo_op_is_non_trivial_move(body, view(st.rvalue.lhs)) || mo_op_is_non_trivial_move(body, view(st.rvalue.rhs)) {
+            return true;
+        }
+    } else if rk == MIR_RVALUE_USE || rk == MIR_RVALUE_UNARY_OP || rk == MIR_RVALUE_CAST {
+        if mo_op_is_non_trivial_move(body, view(st.rvalue.use_op)) {
+            return true;
+        }
+    } else if rk == MIR_RVALUE_AGGREGATE {
+        let mut idx: usize = 0;
+        while idx < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+            let op = unsafe { mir_op_at(st.rvalue.operands, idx) };
+            if mo_op_is_non_trivial_move(body, unsafe { view(*op) }) {
+                return true;
+            }
+            idx = idx + 1;
+        }
+    }
+    false
+}
+
+// Inspects a single instruction `(cb, ci)` along a forward path from store `(store_b, store_i)`.
+// Returns: 0 = continue scan, 1 = path discharged (dead along this path), 2 = store is LIVE (abort DSE).
+fn mo_dse_step_inst(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_place: view<MirPlace>,
+    store_ty: TypeId,
+    store_is_local_noescape: bool,
+    store_is_unwind_visible: bool,
+    cb: usize,
+    ci: usize,
+    out_barrier: mut_view<u8>,
+    out_reason: mut_view<u8>
+) -> u8 {
+    let bb = unsafe { opt_block_at(body.blocks, cb) };
+    let inst = unsafe { opt_inst_at((*bb).insts, ci) };
+    if mo_is_deleted_nop(unsafe { view(*inst) }) {
+        return 0u8;
+    }
+    let opc = unsafe { (*inst).opcode };
+    if opc == OPT_INST_VOLATILE_LOAD || opc == OPT_INST_VOLATILE_STORE {
+        *out_barrier = BARRIER_VOLATILE;
+        return 2u8;
+    }
+    if opc == OPT_INST_ATOMIC {
+        *out_barrier = BARRIER_ATOMIC;
+        return 2u8;
+    }
+    if opc == OPT_INST_ZEROIZE || opc == OPT_INST_BLACK_BOX || ((unsafe { (*inst).flags }) & OPT_FLAG_BARRIER) != 0u16 {
+        return 2u8;
+    }
+
+    let st = unsafe { view((*inst).orig_stmt) };
+    let pt = alias_make_prog_pt(cb as u32, ci as u32);
+
+    // 1. Any read or borrow of an overlapping region makes the store LIVE!
+    if mo_stmt_reads_aliasing(info, body, mut_view(*arena), store_place, st, pt) {
+        let rfact = alias_query_places(info, body, mut_view(*arena), store_place, store_place, pt);
+        let _ = rfact;
+        return 2u8;
+    }
+
+    // 2. Potential trap/panic before overwrite on a caller-visible / unwind-visible region blocks DSE!
+    if store_is_unwind_visible && ((unsafe { (*inst).flags }) & OPT_FLAG_MAY_TRAP) != 0u16 {
+        *out_barrier = BARRIER_PANIC_UNWIND;
+        return 2u8;
+    }
+
+    // 3. `StorageDead(loc)` kills an unescaped, unborrowed non-return stack local!
+    if st.kind == MIR_STMT_STORAGE_DEAD {
+        if store_is_local_noescape && st.storage_local.v == store_place.local.v {
+            *out_reason = 6u8; // ALIAS_REASON_NOESCAPE_EXTERNAL
+            return 1u8;
+        }
+    }
+
+    // 4. Non-volatile, non-atomic `MustAlias` (`CERTAINTY_PROVEN`) full-type overwrite kills the earlier store!
+    if st.kind == MIR_STMT_ASSIGN {
+        let wplace = view(st.place);
+        let wlv = wplace.local.v as usize;
+        if wlv < info.local_count && (info.locals as usize) != 0 {
+            let wlp = unsafe { alias_local_prov_at(info.locals, wlv) };
+            if unsafe { (*wlp).is_fixed_mmio } {
+                *out_barrier = BARRIER_VOLATILE;
+                return 2u8;
+            }
+        }
+        let ofact = alias_query_places(info, body, mut_view(*arena), store_place, wplace, pt);
+        if alias_is_must_alias_proven(view(ofact)) {
+            let wty = alias_place_access_ty(body, wplace);
+            if wty.v == store_ty.v {
+                *out_reason = ofact.reason;
+                return 1u8;
+            }
+        }
+    }
+
+    // 5. If `st` modifies or clobbers any base pointer or index local of `store_place` without discharging,
+    // subsequent statements can no longer be compared soundly by `store_place`'s local names!
+    if mo_place_any_dep_local_modified_by_stmt(store_place, st) {
+        return 2u8;
+    }
+    let mut dep_bar: u8 = BARRIER_NONE;
+    if mo_inst_clobbers_any_dep_of_place(info, body, mut_view(*arena), unsafe { view(*inst) }, store_place, pt, mut_view(dep_bar)) {
+        if dep_bar != BARRIER_NONE {
+            *out_barrier = dep_bar;
+        }
+        return 2u8;
+    }
+
+    0u8
+}
+
+pub fn memopt_prove_dead_store(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    store_b: usize,
+    store_i: usize,
+    call_table: *const EffectCallTable,
+    out_barrier: mut_view<u8>,
+    out_reason: mut_view<u8>
+) -> bool {
+    *out_barrier = BARRIER_NONE;
+    *out_reason = 0u8;
+    if store_b >= body.bb_count {
+        return false;
+    }
+    let sbb = unsafe { opt_block_at(body.blocks, store_b) };
+    if !(unsafe { (*sbb).is_reachable }) || store_i >= (unsafe { (*sbb).inst_count }) {
+        return false;
+    }
+    let sinst = unsafe { opt_inst_at((*sbb).insts, store_i) };
+    if mo_is_deleted_nop(unsafe { view(*sinst) }) {
+        return false;
+    }
+    let sopc = unsafe { (*sinst).opcode };
+    if sopc == OPT_INST_VOLATILE_STORE || sopc == OPT_INST_VOLATILE_LOAD {
+        *out_barrier = BARRIER_VOLATILE;
+        return false;
+    }
+    if sopc == OPT_INST_ATOMIC {
+        *out_barrier = BARRIER_ATOMIC;
+        return false;
+    }
+    if sopc == OPT_INST_ZEROIZE || sopc == OPT_INST_BLACK_BOX || ((unsafe { (*sinst).flags }) & OPT_FLAG_BARRIER) != 0u16 {
+        return false;
+    }
+    if (unsafe { (*sinst).orig_stmt.kind }) != MIR_STMT_ASSIGN {
+        return false;
+    }
+    if (unsafe { (*sinst).orig_stmt.place.drop_flag }) != MIR_DROP_FLAG_NONE {
+        *out_barrier = BARRIER_DROP;
+        return false;
+    }
+    if mo_inst_rhs_blocks_dse(body, unsafe { view(*sinst) }) {
+        return false;
+    }
+
+    let store_place = unsafe { view((*sinst).orig_stmt.place) };
+    // Only eliminate memory-backed stores here; pure scalar SSA temps are handled by scalar DCE
+    if !mo_place_is_memory_backed(info, body, store_place) {
+        return false;
+    }
+
+    let base_l = store_place.local.v as usize;
+    let store_pt = alias_make_prog_pt(store_b as u32, store_i as u32);
+    if base_l < body.local_count && (body.local_dropped as usize) != 0 {
+        if unsafe { *opt_bool_at(body.local_dropped, base_l) } {
+            *out_barrier = BARRIER_DROP;
+            return false;
+        }
+    }
+    if base_l < info.local_count && (info.locals as usize) != 0 {
+        let lp = unsafe { alias_local_prov_at(info.locals, base_l) };
+        if (unsafe { (*lp).is_fixed_mmio }) || (unsafe { (*lp).domain }) == DOMAIN_FIXED_MMIO {
+            *out_barrier = BARRIER_VOLATILE;
+            return false;
+        }
+        if (unsafe { (*lp).domain }) == DOMAIN_DEVICE_DMA ||
+           alias_local_is_zero_copy_pinned_at(info, base_l as u32, store_pt) {
+            *out_barrier = BARRIER_ZERO_COPY;
+            return false;
+        }
+    }
+
+    let store_ty = alias_place_access_ty(body, store_place);
+    if store_ty.v == 0u32 {
+        return false;
+    }
+    let store_is_local_noescape = mo_place_is_strict_noescape_local(info, body, store_place);
+    let mut store_is_unwind_visible = !store_is_local_noescape;
+    if base_l == 0 {
+        store_is_unwind_visible = true;
+    } else if base_l < info.local_count && (info.locals as usize) != 0 {
+        let lp2 = unsafe { alias_local_prov_at(info.locals, base_l) };
+        let cm = unsafe { (*lp2).cap_mode };
+        if cm == CAP_MODE_MUT_VIEW_WRITE || cm == CAP_MODE_RAW_PTR || (unsafe { (*lp2).escaped_external }) {
+            store_is_unwind_visible = true;
+        }
+    }
+
+    // Step A: Scan remainder of `store_b` (`store_i + 1 .. sbb.inst_count`).
+    let s_icnt = unsafe { (*sbb).inst_count };
+    let mut idx: usize = store_i + 1;
+    while idx < s_icnt {
+        let stp = mo_dse_step_inst(
+            info,
+            body,
+            mut_view(*arena),
+            store_place,
+            TypeId { v: store_ty.v },
+            store_is_local_noescape,
+            store_is_unwind_visible,
+            store_b,
+            idx,
+            mut_view(*out_barrier),
+            mut_view(*out_reason)
+        );
+        if stp == 1u8 {
+            return true;
+        }
+        if stp == 2u8 {
+            return false;
+        }
+        idx = idx + 1;
+    }
+
+    // Step B: All-forward-paths BFS starting from `store_b`'s terminator.
+    let bcnt = body.bb_count;
+    let visited_entry = arena_alloc_raw(mut_view(*arena), bcnt, 1) as *mut bool;
+    let queue = arena_alloc_raw(mut_view(*arena), mo_mul_usize(bcnt + 1, 4), 4) as *mut u32;
+    let mut z: usize = 0;
+    while z < bcnt {
+        unsafe { *opt_bool_at(visited_entry, z) = false; }
+        z = z + 1;
+    }
+
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+    let mut real_discharge_count: u32 = 0u32;
+
+    // Helper-inline: evaluate terminator of `store_b` first, enqueueing successors if needed.
+    // We encode `cur_term_b` via loop over `[store_b]` followed by `queue`.
+    let mut first_term = true;
+    while first_term || q_head < q_tail {
+        let mut cb: usize = store_b;
+        let mut check_term = true;
+        if first_term {
+            first_term = false;
+            cb = store_b;
+        } else {
+            cb = (unsafe { *opt_u32_at(queue, q_head) }) as usize;
+            q_head = q_head + 1;
+            let cbb_in = unsafe { opt_block_at(body.blocks, cb) };
+            let c_icnt = unsafe { (*cbb_in).inst_count };
+            if cb == store_b {
+                // Loop backedge revisited `store_b`! Scan `0 .. store_i`: if clean, `(store_b, store_i)` overwrites itself!
+                let mut bi: usize = 0;
+                while bi < store_i && bi < c_icnt {
+                    let bst = mo_dse_step_inst(
+                        info,
+                        body,
+                        mut_view(*arena),
+                        store_place,
+                        TypeId { v: store_ty.v },
+                        store_is_local_noescape,
+                        store_is_unwind_visible,
+                        cb,
+                        bi,
+                        mut_view(*out_barrier),
+                        mut_view(*out_reason)
+                    );
+                    if bst == 2u8 {
+                        return false;
+                    }
+                    if bst == 1u8 {
+                        real_discharge_count = real_discharge_count + 1u32;
+                        check_term = false;
+                        break;
+                    }
+                    bi = bi + 1;
+                }
+                check_term = false;
+            } else {
+                let mut ci: usize = 0;
+                while ci < c_icnt {
+                    let cst = mo_dse_step_inst(
+                        info,
+                        body,
+                        mut_view(*arena),
+                        store_place,
+                        TypeId { v: store_ty.v },
+                        store_is_local_noescape,
+                        store_is_unwind_visible,
+                        cb,
+                        ci,
+                        mut_view(*out_barrier),
+                        mut_view(*out_reason)
+                    );
+                    if cst == 2u8 {
+                        return false;
+                    }
+                    if cst == 1u8 {
+                        real_discharge_count = real_discharge_count + 1u32;
+                        check_term = false;
+                        break;
+                    }
+                    ci = ci + 1;
+                }
+            }
+        }
+
+        if check_term {
+            let tbb = unsafe { opt_block_at(body.blocks, cb) };
+            let t_pt = alias_make_prog_pt(cb as u32, (unsafe { (*tbb).inst_count }) as u32);
+            let tk = unsafe { (*tbb).term.kind };
+            let mt = unsafe { view((*tbb).term.orig_term) };
+
+            if mo_term_reads_aliasing(info, body, mut_view(*arena), store_place, mt, t_pt) {
+                return false;
+            }
+            if tk == OPT_TERM_RETURN {
+                if store_is_local_noescape {
+                    *out_reason = 6u8; // ALIAS_REASON_NOESCAPE_EXTERNAL
+                    real_discharge_count = real_discharge_count + 1u32;
+                } else {
+                    return false;
+                }
+            } else if tk == OPT_TERM_UNREACHABLE {
+                // Unreachable branch cannot observe store
+            } else if tk == OPT_TERM_DROP {
+                *out_barrier = BARRIER_DROP;
+                return false;
+            } else if tk == OPT_TERM_ASSERT {
+                if store_is_unwind_visible {
+                    *out_barrier = BARRIER_PANIC_UNWIND;
+                    return false;
+                }
+                let scnt = unsafe { (*tbb).succ_count };
+                let mut s: usize = 0;
+                while s < scnt {
+                    let sb = (unsafe { (*opt_bbid_at((*tbb).succs, s)).v }) as usize;
+                    if sb < bcnt && !(unsafe { *opt_bool_at(visited_entry, sb) }) {
+                        unsafe {
+                            *opt_bool_at(visited_entry, sb) = true;
+                            *opt_u32_at(queue, q_tail) = sb as u32;
+                        }
+                        q_tail = q_tail + 1;
+                    }
+                    s = s + 1;
+                }
+            } else if tk == OPT_TERM_CALL {
+                let eff_sum = effect_infer_term_with_table(body, unsafe { view((*tbb).term) }, call_table);
+                let eff = eff_sum.flags;
+                if (eff & EFFECT_VOLATILE) != 0u16 {
+                    *out_barrier = BARRIER_VOLATILE;
+                    return false;
+                }
+                if (eff & EFFECT_ATOMIC) != 0u16 {
+                    *out_barrier = BARRIER_ATOMIC;
+                    return false;
+                }
+                if !store_is_local_noescape && (eff & (EFFECT_READS_MEM | EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16 {
+                    if (eff & (EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16 {
+                        *out_barrier = BARRIER_FFI;
+                    }
+                    return false;
+                }
+                if store_is_unwind_visible && (eff & (EFFECT_MAY_PANIC | EFFECT_FFI | EFFECT_UNKNOWN)) != 0u16 {
+                    *out_barrier = BARRIER_PANIC_UNWIND;
+                    return false;
+                }
+                // If the call modifies or clobbers any base pointer or index local of `store_place`,
+                // `store_place` cannot be discharged or compared soundly across the call!
+                if mo_place_any_dep_local_modified_by_term(store_place, mt) {
+                    return false;
+                }
+                let mut dep_cbar: u8 = BARRIER_NONE;
+                if mo_term_clobbers_any_dep_of_place(
+                    info,
+                    body,
+                    mut_view(*arena),
+                    unsafe { view((*tbb).term) },
+                    store_place,
+                    call_table,
+                    t_pt,
+                    mut_view(dep_cbar)
+                ) {
+                    if dep_cbar != BARRIER_NONE {
+                        *out_barrier = dep_cbar;
+                    }
+                    return false;
+                }
+                // Check if call destination itself is a MustAlias full overwrite!
+                let mut call_discharged = false;
+                if mt.has_destination {
+                    let cfact = alias_query_places(info, body, mut_view(*arena), store_place, view(mt.destination), t_pt);
+                    if alias_is_must_alias_proven(view(cfact)) {
+                        let cty = alias_place_access_ty(body, view(mt.destination));
+                        if cty.v == store_ty.v {
+                            *out_reason = cfact.reason;
+                            real_discharge_count = real_discharge_count + 1u32;
+                            call_discharged = true;
+                        }
+                    }
+                }
+                if !call_discharged {
+                    let scnt2 = unsafe { (*tbb).succ_count };
+                    if scnt2 == 0 {
+                        return false;
+                    }
+                    let mut s2: usize = 0;
+                    while s2 < scnt2 {
+                        let sb2 = (unsafe { (*opt_bbid_at((*tbb).succs, s2)).v }) as usize;
+                        if sb2 < bcnt && !(unsafe { *opt_bool_at(visited_entry, sb2) }) {
+                            unsafe {
+                                *opt_bool_at(visited_entry, sb2) = true;
+                                *opt_u32_at(queue, q_tail) = sb2 as u32;
+                            }
+                            q_tail = q_tail + 1;
+                        }
+                        s2 = s2 + 1;
+                    }
+                }
+            } else {
+                // Goto / Branch / SwitchInt
+                let scnt3 = unsafe { (*tbb).succ_count };
+                if scnt3 == 0 {
+                    return false;
+                }
+                let mut s3: usize = 0;
+                while s3 < scnt3 {
+                    let sb3 = (unsafe { (*opt_bbid_at((*tbb).succs, s3)).v }) as usize;
+                    if sb3 < bcnt && !(unsafe { *opt_bool_at(visited_entry, sb3) }) {
+                        unsafe {
+                            *opt_bool_at(visited_entry, sb3) = true;
+                            *opt_u32_at(queue, q_tail) = sb3 as u32;
+                        }
+                        q_tail = q_tail + 1;
+                    }
+                    s3 = s3 + 1;
+                }
+            }
+        }
+    }
+
+    real_discharge_count > 0u32
+}
+
+pub fn memopt_run_dse(
+    info: view<AliasInfo>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut changed = false;
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { opt_block_at(body.blocks, b) };
+        if unsafe { (*bb).is_reachable } {
+            let icnt = unsafe { (*bb).inst_count };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                if !mo_is_deleted_nop(unsafe { view(*inst) }) {
+                    let mut bar: u8 = BARRIER_NONE;
+                    let mut rsn: u8 = 0u8;
+                    if memopt_prove_dead_store(
+                        info,
+                        view(*body),
+                        mut_view(*arena),
+                        b,
+                        i,
+                        call_table,
+                        mut_view(bar),
+                        mut_view(rsn)
+                    ) {
+                        let sloc = unsafe { (*inst).orig_stmt.place.local.v };
+                        let slhs = OptValueId { v: unsafe { (*inst).lhs.v } };
+                        unsafe {
+                            (*inst).opcode = OPT_INST_NOP;
+                            (*inst).flags = 0u16;
+                            (*inst).result = OptValueId { v: OPT_VALUE_NONE };
+                            (*inst).lhs = OptValueId { v: OPT_VALUE_NONE };
+                            (*inst).rhs = OptValueId { v: OPT_VALUE_NONE };
+                            (*inst).mem_use = MemSsaId { v: MEM_SSA_NONE };
+                            (*inst).mem_def = MemSsaId { v: MEM_SSA_NONE };
+                        }
+                        optir_record_provenance(
+                            mut_view(*body),
+                            mut_view(*arena),
+                            PROP_DEAD_STORE,
+                            CERTAINTY_PROVEN,
+                            ANALYSIS_ALIAS_INFO,
+                            slhs,
+                            OptValueId { v: OPT_VALUE_NONE },
+                            OptBbId { v: b as u32 },
+                            OptInstId { v: i as u32 },
+                            PASS_ALIAS_MEM
+                        );
+                        stats.eliminated_dead_stores = stats.eliminated_dead_stores + 1u32;
+                        memopt_log_push(log, mut_view(*arena), MemOptRecord {
+                            is_barrier: false,
+                            code: ACTION_DEAD_STORE_ELIM,
+                            bb_idx: b as u32,
+                            inst_idx: i as u32,
+                            src_bb_idx: b as u32,
+                            src_inst_idx: i as u32,
+                            local_id: sloc,
+                            reason: rsn,
+                        });
+                        changed = true;
+                    } else if bar != BARRIER_NONE {
+                        let bloc = unsafe { (*inst).orig_stmt.place.local.v };
+                        mo_record_barrier(mut_view(*stats), log, mut_view(*arena), bar, b as u32, i as u32, bloc);
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        b = b + 1;
+    }
+    changed
+}
+
+// --- Memory Intrinsics Optimization: `memmove -> memcpy` & `memset` Zero-Init (AXS-ALIAS-006 Rules 5-6) ---
+
+fn mo_make_deref_place_for_ptr_local(loc_v: u32, arena: mut_view<Arena>) -> MirPlace {
+    let pr = arena_alloc_raw(mut_view(*arena), size_of<MirProjection>(), align_of<MirProjection>()) as *mut MirProjection;
+    unsafe {
+        (*pr).kind = MIR_PROJ_DEREF;
+        (*pr).field_idx = 0u32;
+        (*pr).index_local = MirLocalId { v: 0u32 };
+        (*pr).from_local = MirLocalId { v: 0u32 };
+        (*pr).to_local = MirLocalId { v: 0u32 };
+        (*pr).has_from = false;
+        (*pr).has_to = false;
+        (*pr).variant_idx = 0u32;
+    }
+    let mut pl = mir_local_place(loc_v);
+    pl.projs = pr;
+    pl.proj_count = 1;
+    pl
+}
+
+fn mo_find_nonoverlapping_builtin_ty(thir: *const Thir, orig_fn_ty: TypeId) -> TypeId {
+    if (thir as usize) == 0 || orig_fn_ty.v == 0u32 {
+        return TypeId { v: 0u32 };
+    }
+    let orig_ax = unsafe { type_get(view((*thir).interner), orig_fn_ty) };
+    if (orig_ax as usize) == 0 {
+        return TypeId { v: 0u32 };
+    }
+    let orig_acnt = unsafe { (*orig_ax).arg_count };
+    let orig_arg0: u32 = if orig_acnt >= 1 && ((unsafe { (*orig_ax).args }) as usize) != 0 {
+        unsafe { (*opt_typeid_at((*orig_ax).args, 0)).v }
+    } else {
+        0u32
+    };
+    let tlen = unsafe { (*thir).interner.len };
+    let mut idx: usize = 1;
+    while idx <= tlen {
+        let ax = unsafe { type_get(view((*thir).interner), TypeId { v: idx as u32 }) };
+        if (ax as usize) != 0 && (unsafe { (*ax).kind }) == TY_BUILTIN_PTR_COPY_NONOVERLAPPING {
+            let cacnt = unsafe { (*ax).arg_count };
+            let carg0: u32 = if cacnt >= 1 && ((unsafe { (*ax).args }) as usize) != 0 {
+                unsafe { (*opt_typeid_at((*ax).args, 0)).v }
+            } else {
+                0u32
+            };
+            if cacnt == orig_acnt && carg0 == orig_arg0 {
+                return TypeId { v: idx as u32 };
+            }
+        }
+        idx = idx + 1;
+    }
+    TypeId { v: 0u32 }
+}
+
+pub fn memopt_can_promote_memmove_to_memcpy(
+    info: view<AliasInfo>,
+    body: view<OptBody>,
+    arena: mut_view<Arena>,
+    src_ptr_local: u32,
+    dst_ptr_local: u32,
+    prog_pt: u32,
+    out_reason: mut_view<u8>
+) -> bool {
+    *out_reason = 0u8;
+    if (src_ptr_local as usize) >= body.local_count || (dst_ptr_local as usize) >= body.local_count {
+        return false;
+    }
+    let src_pl = mo_make_deref_place_for_ptr_local(src_ptr_local, mut_view(*arena));
+    let dst_pl = mo_make_deref_place_for_ptr_local(dst_ptr_local, mut_view(*arena));
+    let fact = alias_query_places(info, body, mut_view(*arena), view(src_pl), view(dst_pl), prog_pt);
+    if alias_is_no_alias_proven(view(fact)) {
+        *out_reason = fact.reason;
+        return true;
+    }
+    false
+}
+
+pub fn memopt_run_mem_intrinsics(
+    info: view<AliasInfo>,
+    body: mut_view<OptBody>,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut changed = false;
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { opt_block_at(body.blocks, b) };
+        if (unsafe { (*bb).is_reachable }) && (unsafe { (*bb).term.kind }) == OPT_TERM_CALL {
+            let icnt = unsafe { (*bb).inst_count };
+            let t_pt = alias_make_prog_pt(b as u32, icnt as u32);
+            let bkind = mo_callee_builtin_kind(view(*body), unsafe { view((*bb).term.orig_term.func) });
+
+            if bkind == TY_BUILTIN_PTR_COPY {
+                let acnt = unsafe { (*bb).term.orig_term.arg_count };
+                let args = unsafe { (*bb).term.orig_term.args };
+                if acnt >= 2 && (args as usize) != 0 {
+                    let a0 = unsafe { mir_op_at(args, 0) };
+                    let a1 = unsafe { mir_op_at(args, 1) };
+                    if ((unsafe { (*a0).kind }) == MIR_OP_COPY || (unsafe { (*a0).kind }) == MIR_OP_MOVE) &&
+                       ((unsafe { (*a1).kind }) == MIR_OP_COPY || (unsafe { (*a1).kind }) == MIR_OP_MOVE) &&
+                       (unsafe { (*a0).place.proj_count }) == 0 &&
+                       (unsafe { (*a1).place.proj_count }) == 0 {
+                        let src_l = unsafe { (*a0).place.local.v };
+                        let dst_l = unsafe { (*a1).place.local.v };
+                        let mut rsn: u8 = 0u8;
+                        if memopt_can_promote_memmove_to_memcpy(info, view(*body), mut_view(*arena), src_l, dst_l, t_pt, mut_view(rsn)) {
+                            let fop_kind = unsafe { (*bb).term.orig_term.func.kind };
+                            let mut orig_fn_ty = TypeId { v: 0u32 };
+                            if fop_kind == MIR_OP_CONST {
+                                orig_fn_ty = TypeId { v: unsafe { (*bb).term.orig_term.func.constant.ty.v } };
+                            } else if (fop_kind == MIR_OP_COPY || fop_kind == MIR_OP_MOVE) &&
+                                      (unsafe { (*bb).term.orig_term.func.place.proj_count }) == 0 {
+                                let flv = (unsafe { (*bb).term.orig_term.func.place.local.v }) as usize;
+                                if flv < body.local_count && (body.local_tys as usize) != 0 {
+                                    orig_fn_ty = TypeId { v: unsafe { (*opt_typeid_at(body.local_tys, flv)).v } };
+                                }
+                            }
+                            let nonov_ty = mo_find_nonoverlapping_builtin_ty(body.thir, orig_fn_ty);
+                            if nonov_ty.v != 0u32 {
+                                unsafe {
+                                    if fop_kind != MIR_OP_CONST {
+                                        (*bb).term.orig_term.func.kind = MIR_OP_CONST;
+                                        (*bb).term.orig_term.func.constant.kind = MIR_CONST_INT;
+                                        (*bb).term.orig_term.func.constant.val = 0u64;
+                                    }
+                                    (*bb).term.orig_term.func.constant.ty.v = nonov_ty.v;
+                                    let cal_v = (*bb).term.callee.v as usize;
+                                    if cal_v != 0 && cal_v <= body.value_count && (body.values as usize) != 0 {
+                                        let cvp = opt_val_at(body.values, cal_v);
+                                        (*cvp).kind = OPT_VAL_CONST;
+                                        (*cvp).ty.v = nonov_ty.v;
+                                        (*cvp).const_val.ty.v = nonov_ty.v;
+                                    }
+                                }
+                                optir_record_provenance(
+                                    mut_view(*body),
+                                    mut_view(*arena),
+                                    PROP_NO_ALIAS,
+                                    CERTAINTY_PROVEN,
+                                    ANALYSIS_ALIAS_INFO,
+                                    OptValueId { v: 0u32 },
+                                    OptValueId { v: 0u32 },
+                                    OptBbId { v: b as u32 },
+                                    OptInstId { v: icnt as u32 },
+                                    PASS_ALIAS_MEM
+                                );
+                                stats.memmove_to_memcpy_rewrites = stats.memmove_to_memcpy_rewrites + 1u32;
+                                memopt_log_push(log, mut_view(*arena), MemOptRecord {
+                                    is_barrier: false,
+                                    code: ACTION_MEMMOVE_TO_MEMCPY,
+                                    bb_idx: b as u32,
+                                    inst_idx: icnt as u32,
+                                    src_bb_idx: b as u32,
+                                    src_inst_idx: icnt as u32,
+                                    local_id: dst_l,
+                                    reason: rsn,
+                                });
+                                changed = true;
+                            }
+                        } else {
+                            mo_record_barrier(mut_view(*stats), log, mut_view(*arena), BARRIER_MAY_ALIAS, b as u32, icnt as u32, dst_l);
+                        }
+                    }
+                }
+            } else if bkind == TY_BUILTIN_PTR_WRITE_BYTES {
+                let acnt = unsafe { (*bb).term.orig_term.arg_count };
+                let args = unsafe { (*bb).term.orig_term.args };
+                if acnt >= 2 && (args as usize) != 0 {
+                    let a0 = unsafe { mir_op_at(args, 0) };
+                    let a1 = unsafe { mir_op_at(args, 1) };
+                    if ((unsafe { (*a0).kind }) == MIR_OP_COPY || (unsafe { (*a0).kind }) == MIR_OP_MOVE) &&
+                       (unsafe { (*a0).place.proj_count }) == 0 &&
+                       (unsafe { (*a1).kind }) == MIR_OP_CONST &&
+                       (unsafe { (*a1).constant.kind }) == MIR_CONST_INT &&
+                       (unsafe { (*a1).constant.val }) == 0u64 {
+                        let dst_l = unsafe { (*a0).place.local.v };
+                        let mut is_mmio = false;
+                        if (dst_l as usize) < info.local_count && (info.locals as usize) != 0 {
+                            let dlp = unsafe { alias_local_prov_at(info.locals, dst_l as usize) };
+                            if (unsafe { (*dlp).is_fixed_mmio }) || (unsafe { (*dlp).domain }) == DOMAIN_FIXED_MMIO {
+                                is_mmio = true;
+                            }
+                        }
+                        if is_mmio {
+                            mo_record_barrier(mut_view(*stats), log, mut_view(*arena), BARRIER_VOLATILE, b as u32, icnt as u32, dst_l);
+                        } else if (dst_l as usize) < body.local_count && (body.thir as usize) != 0 {
+                            let ptr_ty = TypeId { v: unsafe { (*opt_typeid_at(body.local_tys, dst_l as usize)).v } };
+                            let pax = unsafe { type_get(view((*body.thir).interner), ptr_ty) };
+                            if (pax as usize) != 0 && (unsafe { (*pax).kind }) == TY_PTR {
+                                let pointee = TypeId { v: unsafe { (*pax).pointee.v } };
+                                if memopt_type_is_zero_valid(body.thir, pointee, 0u32) {
+                                    stats.memset_zero_inits = stats.memset_zero_inits + 1u32;
+                                    memopt_log_push(log, mut_view(*arena), MemOptRecord {
+                                        is_barrier: false,
+                                        code: ACTION_MEMSET_ZERO_INIT,
+                                        bb_idx: b as u32,
+                                        inst_idx: icnt as u32,
+                                        src_bb_idx: b as u32,
+                                        src_inst_idx: icnt as u32,
+                                        local_id: dst_l,
+                                        reason: 0u8,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+    changed
+}
+
+// --- PassManager Contract Orchestrator & Verified-MIR Pipeline (SPEC-71 AXS-ESC-016) ---
+
+pub fn memopt_rebuild_memssa(body: mut_view<OptBody>, arena: mut_view<Arena>) {
+    optir_compute_dom_frontier(mut_view(*body), mut_view(*arena));
+    optir_construct_memssa(mut_view(*body), mut_view(*arena));
+}
+
+pub fn memopt_run_pass_with_info(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    info: mut_view<AliasInfo>,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = memopt_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_base_flags = pm.baseline_effect_summary.flags;
+    let pre_has_base = pm.has_baseline_effects;
+    let pre_stats = *stats;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let mut changed = false;
+    if memopt_run_forwarding_and_rle(view(*info), mut_view(*body), call_table, mut_view(*stats), log, mut_view(*arena)) {
+        memopt_rebuild_memssa(mut_view(*body), mut_view(*arena));
+        changed = true;
+    }
+    if memopt_run_dse(view(*info), mut_view(*body), call_table, mut_view(*stats), log, mut_view(*arena)) {
+        memopt_rebuild_memssa(mut_view(*body), mut_view(*arena));
+        changed = true;
+    }
+    if memopt_run_mem_intrinsics(view(*info), mut_view(*body), mut_view(*stats), log, mut_view(*arena)) {
+        memopt_rebuild_memssa(mut_view(*body), mut_view(*arena));
+        changed = true;
+    }
+
+    if changed {
+        let new_rev = pm.ir_revision + 1u32;
+        pm.ir_revision = new_rev;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        if !passmgr_is_analysis_valid(view(*pm), 7u8) {
+            body.ranges = 0 as *mut OptRange;
+        }
+        // Re-ensure MemorySSA so postconditions and downstream passes see fresh MemorySSA
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), ANALYSIS_MASK_MEMORY_SSA);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = passmgr_verify_postconditions(mut_view(*pm), mut_view(*body), PASS_GVN_CSE, mut_view(*arena), mut_view(*sink));
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) {
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            pm.baseline_effect_summary.flags = pre_base_flags;
+            pm.has_baseline_effects = pre_has_base;
+            *stats = pre_stats;
+            stats.pass_runs = pre_stats.pass_runs + 1u32;
+            stats.pass_rollbacks = pre_stats.pass_rollbacks + 1u32;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn memopt_run_pass(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = memopt_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+    let info_ptr = alias_build_info(view(*body), call_table, mut_view(*arena));
+    memopt_run_pass_with_info(
+        mut_view(*pm),
+        mut_view(*body),
+        unsafe { mut_view(*info_ptr) },
+        call_table,
+        mut_view(*stats),
+        log,
+        mut_view(*arena),
+        mut_view(*sink)
+    )
+}
+
+pub fn memopt_run_pipeline(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    passmgr_mark_all_valid_from_lowering(mut_view(*pm), mut_view(*body), mut_view(*arena));
+
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 || pm.budget.max_fixedpoint_rounds == 0u32 {
+        if pm.budget.verify_each {
+            let vst = passmgr_verify_postconditions(mut_view(*pm), mut_view(*body), PASS_LOWER_MIR, mut_view(*arena), mut_view(*sink));
+            return vst == CONTRACT_OK;
+        }
+        return true;
+    }
+
+    let max_rounds: u32 = if (pm.budget.max_fixedpoint_rounds) < 3u32 {
+        pm.budget.max_fixedpoint_rounds
+    } else {
+        3u32
+    };
+    let mut round: u32 = 0u32;
+    while round < max_rounds {
+        round = round + 1u32;
+        pm.fixedpoint_rounds_executed = round;
+        if !memopt_run_pass(mut_view(*pm), mut_view(*body), call_table, mut_view(*stats), log, mut_view(*arena), mut_view(*sink)) {
+            break;
+        }
+    }
+
+    let exit_mask = analysis_bit(ANALYSIS_CFG) | analysis_bit(ANALYSIS_DOMINATORS) |
+                    analysis_bit(ANALYSIS_SSA) | analysis_bit(ANALYSIS_MEMORY_SSA);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), exit_mask);
+    pm.last_verify_status == CONTRACT_OK
+}
+
+pub fn memopt_optimize_mir_body(
+    mir_body: mut_view<MirBody>,
+    thir: *const Thir,
+    profile: u8,
+    verify_each: bool,
+    call_table: *const EffectCallTable,
+    stats: mut_view<MemOptStats>,
+    log: *mut MemOptLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    fn_item: *const HirItem
+) -> bool {
+    memopt_stats_zero(mut_view(*stats));
+    let prev_errs = sink.errors;
+
+    // AXS-OPT-001 Entry Gate: lower only Verified MIR
+    let obody = optir_build_from_mir(view(*mir_body), thir, mut_view(*arena), mut_view(*sink), fn_item);
+    if (obody as usize) == 0 || sink.errors != prev_errs {
+        return false;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget = opt_budget_for_profile(profile, verify_each);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget, mut_view(*arena));
+
+    if !memopt_run_pipeline(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        mut_view(*stats),
+        log,
+        mut_view(*arena),
+        mut_view(*sink)
+    ) {
+        return false;
+    }
+
+    let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(unsafe { view(*obody) }, unsafe { mut_view(*rec_mir) }, mut_view(*arena)) {
+        return false;
+    }
+
+    verify_mir(unsafe { view(*rec_mir) }, thir, mut_view(*sink), fn_item);
+    if sink.errors != prev_errs {
+        return false;
+    }
+
+    unsafe {
+        mir_body.sym.v = (*rec_mir).sym.v;
+        mir_body.fn_sym.v = (*rec_mir).fn_sym.v;
+        mir_body.fn_name.v = (*rec_mir).fn_name.v;
+        mir_body.span.file.v = (*rec_mir).span.file.v;
+        mir_body.span.start = (*rec_mir).span.start;
+        mir_body.span.end = (*rec_mir).span.end;
+        mir_body.locals = (*rec_mir).locals;
+        mir_body.local_count = (*rec_mir).local_count;
+        mir_body.local_cap = (*rec_mir).local_cap;
+        mir_body.arg_count = (*rec_mir).arg_count;
+        mir_body.bbs = (*rec_mir).bbs;
+        mir_body.bb_count = (*rec_mir).bb_count;
+        mir_body.bb_cap = (*rec_mir).bb_cap;
+        mir_body.drop_flag_count = (*rec_mir).drop_flag_count;
+    }
+    true
+}
+
+// --- Deterministic Inspection Printer: `memopt_print` (SPEC-71 AXS-ESC-017) ---
+
+const MEMOPT_STR_DATA: [219]u8 = [
+    109u8, 101u8, 109u8, 111u8, 112u8, 116u8, 95u8, 108u8, 111u8, 103u8, 32u8, 123u8, 10u8, 125u8, 10u8, 32u8,
+    32u8, 32u8, 32u8, 97u8, 99u8, 116u8, 105u8, 111u8, 110u8, 32u8, 32u8, 32u8, 32u8, 32u8, 98u8, 97u8,
+    114u8, 114u8, 105u8, 101u8, 114u8, 32u8, 32u8, 98u8, 98u8, 61u8, 98u8, 98u8, 32u8, 105u8, 110u8, 115u8,
+    116u8, 61u8, 32u8, 102u8, 114u8, 111u8, 109u8, 61u8, 98u8, 98u8, 58u8, 32u8, 108u8, 111u8, 99u8, 97u8,
+    108u8, 61u8, 95u8, 32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8, 10u8, 78u8, 79u8, 78u8, 69u8,
+    83u8, 84u8, 79u8, 82u8, 69u8, 95u8, 84u8, 79u8, 95u8, 76u8, 79u8, 65u8, 68u8, 95u8, 70u8, 79u8,
+    82u8, 87u8, 65u8, 82u8, 68u8, 82u8, 69u8, 68u8, 85u8, 78u8, 68u8, 65u8, 78u8, 84u8, 95u8, 76u8,
+    79u8, 65u8, 68u8, 95u8, 69u8, 76u8, 73u8, 77u8, 68u8, 69u8, 65u8, 68u8, 95u8, 83u8, 84u8, 79u8,
+    82u8, 69u8, 95u8, 69u8, 76u8, 73u8, 77u8, 77u8, 69u8, 77u8, 77u8, 79u8, 86u8, 69u8, 95u8, 84u8,
+    79u8, 95u8, 77u8, 69u8, 77u8, 67u8, 80u8, 89u8, 77u8, 69u8, 77u8, 83u8, 69u8, 84u8, 95u8, 90u8,
+    69u8, 82u8, 79u8, 95u8, 73u8, 78u8, 73u8, 84u8, 86u8, 79u8, 76u8, 65u8, 84u8, 73u8, 76u8, 69u8,
+    65u8, 84u8, 79u8, 77u8, 73u8, 67u8, 77u8, 65u8, 89u8, 95u8, 65u8, 76u8, 73u8, 65u8, 83u8, 70u8,
+    70u8, 73u8, 80u8, 65u8, 78u8, 73u8, 67u8, 95u8, 85u8, 78u8, 87u8, 73u8, 78u8, 68u8, 68u8, 82u8,
+    79u8, 80u8, 90u8, 69u8, 82u8, 79u8, 95u8, 67u8, 79u8, 80u8, 89u8,
+];
+
+const MEMOPT_STR_OFF: [25]u32 = [
+    0u32, 13u32, 15u32, 26u32, 38u32, 44u32, 50u32, 58u32, 59u32, 67u32,
+    75u32, 76u32, 80u32, 101u32, 120u32, 135u32, 152u32, 168u32, 176u32, 182u32,
+    191u32, 194u32, 206u32, 210u32, 219u32,
+];
+
+fn mo_push_tok(out: mut_view<DiagBuffer>, tok: usize) {
+    let start = MEMOPT_STR_OFF[tok] as usize;
+    let end = MEMOPT_STR_OFF[tok + 1] as usize;
+    let mut i: usize = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*out), MEMOPT_STR_DATA[i]);
+        i = i + 1;
+    }
+}
+
+pub fn memopt_print(out: mut_view<DiagBuffer>, log: view<MemOptLog>) {
+    mo_push_tok(mut_view(*out), 0); // "memopt_log {\n"
+    let mut i: usize = 0;
+    while i < log.count && (log.records as usize) != 0 {
+        let rec = unsafe { memopt_record_at(log.records, i) };
+        let is_bar = unsafe { (*rec).is_barrier };
+        let code = (unsafe { (*rec).code }) as usize;
+        if is_bar {
+            mo_push_tok(mut_view(*out), 3); // "    barrier "
+            let b_tok: usize = if code >= 1 && code <= 7 { 16 + code } else { 11 };
+            mo_push_tok(mut_view(*out), b_tok);
+        } else {
+            mo_push_tok(mut_view(*out), 2); // "    action "
+            let a_tok: usize = if code >= 1 && code <= 5 { 11 + code } else { 11 };
+            mo_push_tok(mut_view(*out), a_tok);
+        }
+        mo_push_tok(mut_view(*out), 4); // " bb=bb"
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rec).bb_idx });
+        mo_push_tok(mut_view(*out), 5); // " inst="
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rec).inst_idx });
+        if !is_bar {
+            mo_push_tok(mut_view(*out), 6); // " from=bb"
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rec).src_bb_idx });
+            mo_push_tok(mut_view(*out), 7); // ":"
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rec).src_inst_idx });
+        }
+        mo_push_tok(mut_view(*out), 8); // " local=_"
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rec).local_id });
+        mo_push_tok(mut_view(*out), 9); // " reason="
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*rec).reason }) as u32);
+        mo_push_tok(mut_view(*out), 10); // "\n"
+        i = i + 1;
+    }
+    mo_push_tok(mut_view(*out), 1); // "}\n"
+}

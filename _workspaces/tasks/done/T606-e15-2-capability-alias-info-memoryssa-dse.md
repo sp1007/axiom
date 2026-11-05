@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T601, T602, T605]
 priority: 99
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [compiler/opt/alias, compiler/opt/memopt, tests/run/opt_alias]
 locks: [compiler/opt/mod.ax, compiler/opt/optir/mod.ax, tests/selfhost/opt]
 spec: [spec/SPEC-71-alias-escape-promotion.md, 0226, tasks/0366, tasks/0395, tasks/0486, tasks/0548]
 covers: [REQ-OPT-312, REQ-OPT-313, REQ-OPT-314, REQ-OPT-347, REQ-OPT-358, REQ-OPT-365, REQ-OPT-366]
+started: 2026-11-05 07:14:56
+finished: 2026-11-05 18:03:39
 ---
 # T606 — E15.2 — Capability-aware AliasInfo, provenance disjointness & MemorySSA store-to-load/DSE optimization
 
@@ -41,3 +43,5 @@ Implement the `AliasInfo` query engine exporting verified capability disjointnes
 
 ## Log
 - 2026-11-03 02:39:00 created by T215 (P15 phase planning)
+- 2026-11-05 07:14:56 started (attempt 1) T606-impl
+- 2026-11-05 18:03:39 accepted by QA -> done
