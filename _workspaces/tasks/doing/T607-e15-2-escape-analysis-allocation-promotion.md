@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T606]
 priority: 100
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/opt/escape, tests/run/opt_escape]
 spec: [spec/SPEC-71-alias-escape-promotion.md, 0131, 0162, 0165, tasks/0366, tasks/0397, tasks/0480]
 covers: [REQ-OPT-042, REQ-OPT-043, REQ-OPT-044, REQ-OPT-045, REQ-OPT-046, REQ-OPT-335, REQ-OPT-336, REQ-OPT-345, REQ-OPT-346, REQ-OPT-357]
+started: 2026-11-05 18:04:26
+agent: T607-impl
 ---
 # T607 — E15.2 — Escape analysis (NoEscape/ArgEscape/ReturnEscape/GlobalEscape) & stack/register allocation promotion
 
@@ -40,3 +42,4 @@ Implement interprocedural-summary-aware escape analysis and automatic storage pr
 
 ## Log
 - 2026-11-03 02:39:00 created by T215 (P15 phase planning)
+- 2026-11-05 18:04:26 started (attempt 1) T607-impl

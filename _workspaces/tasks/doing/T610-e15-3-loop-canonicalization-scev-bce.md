@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T606, T609]
 priority: 103
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/opt/loops, compiler/opt/bce, tests/run/opt_bce]
 spec: [spec/SPEC-72-loops-scev-bce.md, 0113, 0165, tasks/0366, tasks/0402, tasks/0416, tasks/0549]
 covers: [REQ-OPT-143, REQ-OPT-144, REQ-OPT-145, REQ-OPT-146, REQ-OPT-147, REQ-OPT-155, REQ-OPT-156, REQ-OPT-157, REQ-OPT-158, REQ-OPT-159, REQ-OPT-160, REQ-OPT-161, REQ-OPT-162, REQ-OPT-189, REQ-OPT-190, REQ-OPT-342]
+started: 2026-11-05 18:05:07
+agent: T610-impl
 ---
 # T610 — E15.3 — Natural loop discovery, loop canonicalization, Scalar Evolution (SCEV) & range/bounds-check elimination (BCE)
 
@@ -41,3 +43,4 @@ Implement CFG natural loop discovery, preheader/latch/LCSSA canonicalization, ov
 
 ## Log
 - 2026-11-03 02:40:00 created by T215 (P15 phase planning)
+- 2026-11-05 18:05:07 started (attempt 1) T610-impl

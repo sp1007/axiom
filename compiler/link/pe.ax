@@ -50,10 +50,12 @@ pub const PE_DATA_DIRECTORY_SIZE: usize = 8;
 pub const PE_DATA_DIRECTORY_COUNT: usize = 16;
 pub const PE_OPTIONAL_HEADER64_TOTAL_SIZE: usize = 240;
 pub const PE_IMPORT_DESCRIPTOR_SIZE: usize = 20;
+pub const PE_EXPORT_DIRECTORY_SIZE: usize = 40;
 
 pub const PE_MAGIC_PE32_PLUS: u16 = 0x020Bu16;
 
 pub const PE_DEFAULT_IMAGE_BASE: u64 = 0x140000000u64;
+pub const PE_DEFAULT_DLL_IMAGE_BASE: u64 = 0x180000000u64;
 pub const PE_DEFAULT_SECTION_ALIGN: u32 = 0x1000u32;
 pub const PE_DEFAULT_FILE_ALIGN: u32 = 0x200u32;
 pub const PE_DEFAULT_STACK_RESERVE: u32 = 0x100000u32;
@@ -64,6 +66,7 @@ pub const PE_DEFAULT_HEAP_COMMIT: u64 = 0x1000u64;
 pub const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002u16;
 pub const IMAGE_FILE_LARGE_ADDRESS_AWARE: u16 = 0x0020u16;
 pub const IMAGE_FILE_DEBUG_STRIPPED: u16 = 0x0200u16;
+pub const IMAGE_FILE_DLL: u16 = 0x2000u16;
 
 pub const IMAGE_SUBSYSTEM_WINDOWS_CUI: u16 = 3u16;
 
@@ -71,6 +74,10 @@ pub const IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA: u16 = 0x0020u16;
 pub const IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE: u16 = 0x0040u16;
 pub const IMAGE_DLLCHARACTERISTICS_NX_COMPAT: u16 = 0x0100u16;
 pub const IMAGE_DLLCHARACTERISTICS_TERMINAL_SERVER_AWARE: u16 = 0x8000u16;
+pub const PE_DLL_DEFAULT_DLL_CHARS: u16 = 0x0160u16;
+
+pub const IMAGE_REL_BASED_ABSOLUTE: u16 = 0u16;
+pub const IMAGE_REL_BASED_DIR64: u16 = 10u16;
 
 pub const IMAGE_REL_AMD64_REL32_1: u16 = 5u16;
 pub const IMAGE_REL_AMD64_REL32_2: u16 = 6u16;
@@ -96,6 +103,7 @@ pub const PE_DIR_COM_DESCRIPTOR: usize = 14;
 
 pub const AX_LINK_BAD_ARCHIVE: u32 = 138u32;
 pub const AX_LINK_LIBRARY_NOT_FOUND: u32 = 139u32;
+pub const AX_LINK_DUPLICATE_EXPORT: u32 = 140u32;
 
 // --- Alignment & Layout Helpers ---
 
@@ -163,6 +171,31 @@ pub fn pe_bytes_ieq(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> b
 
 pub fn pe_cstr_ieq(a: *const u8, b: *const u8) -> bool {
     pe_bytes_ieq(a, cstr_len(a), b, cstr_len(b))
+}
+
+pub fn pe_cstr_cmp(a: *const u8, b: *const u8) -> i32 {
+    if a as usize == 0 && b as usize == 0 {
+        return 0i32;
+    }
+    if a as usize == 0 {
+        return -1i32;
+    }
+    if b as usize == 0 {
+        return 1i32;
+    }
+    let mut i: usize = 0;
+    loop {
+        let ca = unsafe { *(a + i) };
+        let cb = unsafe { *(b + i) };
+        if ca != cb {
+            return if ca < cb { -1i32 } else { 1i32 };
+        }
+        if ca == 0u8 {
+            return 0i32;
+        }
+        i = i + 1;
+    }
+    0i32
 }
 
 pub fn pe_cstr_starts_with(s: *const u8, prefix: *const u8) -> bool {
@@ -266,6 +299,10 @@ pub struct PeOptionalHeader64 {
 
 pub fn pe_default_image_base() -> u64 {
     (1u64 << 32) | 0x40000000u64
+}
+
+pub fn pe_default_dll_image_base() -> u64 {
+    (1u64 << 32) | 0x80000000u64
 }
 
 pub fn pe_optional_header64_init(ohdr: mut_view<PeOptionalHeader64>) {
@@ -1092,4 +1129,104 @@ pub fn linker_add_reloc_str(ctx: mut_view<LinkerContext>, sec: *mut MergedSectio
     unsafe {
         heap_free(buf_ptr, n + 1, 1);
     }
+}
+
+// --- DLL Export State (`.edata` & Companion Short-Import `.lib`) ---
+
+pub struct DllExportSpec {
+    pub ext_name: *const u8,
+    pub internal_name: *const u8,
+    pub is_data: bool,
+    pub rva: u32,
+}
+
+pub struct DllLinkState {
+    pub exports: *mut DllExportSpec,
+    pub num_exports: usize,
+    pub cap_exports: usize,
+}
+
+pub fn dll_state_new() -> DllLinkState {
+    DllLinkState {
+        exports: 0 as *mut DllExportSpec,
+        num_exports: 0,
+        cap_exports: 0,
+    }
+}
+
+pub unsafe fn dll_export_slot_ptr(base: *mut DllExportSpec, idx: usize) -> *mut DllExportSpec {
+    ((base as usize) + coff_mul_usize(idx, size_of<DllExportSpec>())) as *mut DllExportSpec
+}
+
+pub fn dll_export_at(st: view<DllLinkState>, idx: usize) -> *mut DllExportSpec {
+    if idx >= st.num_exports || (st.exports as usize) == 0 {
+        return 0 as *mut DllExportSpec;
+    }
+    unsafe { dll_export_slot_ptr(st.exports, idx) }
+}
+
+pub fn dll_state_free(st: mut_view<DllLinkState>) {
+    if st.cap_exports > 0 && (st.exports as usize) != 0 {
+        unsafe {
+            heap_free(
+                st.exports as *mut u8,
+                coff_mul_usize(st.cap_exports, size_of<DllExportSpec>()),
+                align_of<DllExportSpec>()
+            );
+        }
+    }
+    st.exports = 0 as *mut DllExportSpec;
+    st.num_exports = 0;
+    st.cap_exports = 0;
+}
+
+pub fn dll_state_add_export(
+    st: mut_view<DllLinkState>,
+    ctx: mut_view<LinkerContext>,
+    ext_ptr: *const u8,
+    ext_len: usize,
+    int_ptr: *const u8,
+    int_len: usize,
+    is_data: bool
+) {
+    if ext_len == 0 || (ext_ptr as usize) == 0 {
+        return;
+    }
+    let eff_int_ptr = if int_len > 0 && (int_ptr as usize) != 0 { int_ptr } else { ext_ptr };
+    let eff_int_len = if int_len > 0 && (int_ptr as usize) != 0 { int_len } else { ext_len };
+
+    if st.num_exports == st.cap_exports {
+        let new_cap = if st.cap_exports == 0 { 16 } else { st.cap_exports + st.cap_exports };
+        let new_bytes = coff_mul_usize(new_cap, size_of<DllExportSpec>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<DllExportSpec>()) as *mut DllExportSpec };
+        if st.num_exports > 0 && (st.exports as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    st.exports as *const u8,
+                    new_arr as *mut u8,
+                    coff_mul_usize(st.num_exports, size_of<DllExportSpec>())
+                );
+                heap_free(
+                    st.exports as *mut u8,
+                    coff_mul_usize(st.cap_exports, size_of<DllExportSpec>()),
+                    align_of<DllExportSpec>()
+                );
+            }
+        }
+        st.exports = new_arr;
+        st.cap_exports = new_cap;
+    }
+
+    let dup_ext = linker_dup_bytes(mut_view(*ctx), ext_ptr, ext_len);
+    let dup_int = linker_dup_bytes(mut_view(*ctx), eff_int_ptr, eff_int_len);
+    let slot = unsafe { dll_export_slot_ptr(st.exports, st.num_exports) };
+    unsafe {
+        *slot = DllExportSpec {
+            ext_name: dup_ext,
+            internal_name: dup_int,
+            is_data: is_data,
+            rva: 0u32,
+        };
+    }
+    st.num_exports = st.num_exports + 1;
 }

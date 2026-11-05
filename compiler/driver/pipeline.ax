@@ -21,10 +21,19 @@ use compiler.kernel.id.TypeId
 use compiler.kernel.interner.StrInterner
 use compiler.kernel.interner.StrView
 use compiler.kernel.interner.interner_get
+use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
 use compiler.diag.code.AX_IO_FILE_NOT_FOUND
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.DiagSeverity
 use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagLabel
 use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
 use compiler.diag.format.DiagBuffer
 use compiler.diag.format.diag_buf_new
 use compiler.diag.format.diag_buf_free
@@ -56,6 +65,7 @@ use compiler.resolve.symtab.NamingCtx
 use compiler.resolve.symtab.ResolveMap
 use compiler.resolve.symtab.resolve_map_free
 use compiler.hir.hir.HIR_EXPR_LITERAL
+use compiler.hir.hir.HIR_ITEM_CONST
 use compiler.hir.hir.HIR_ITEM_EXTERN_BLOCK
 use compiler.hir.hir.HIR_ITEM_FN
 use compiler.hir.hir.HIR_ITEM_IMPL
@@ -74,12 +84,23 @@ use compiler.resolve_hir.session.session_lower_hir
 use compiler.resolve_hir.session.session_render_resolved_into
 use compiler.resolve_hir.session.session_render_hir_into
 use compiler.types.types.AxType
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_STR
+use compiler.types.types.CONST_INT
+use compiler.types.types.CONST_STR
+use compiler.types.types.CONST_AGGREGATE
 use compiler.types.types.TypeInterner
 use compiler.types.types.Thir
 use compiler.types.types.thir_init
 use compiler.types.types.thir_free
 use compiler.types.types.type_get
 use compiler.types.types.thir_get_item_type
+use compiler.types.types.thir_get_sym_type
+use compiler.types.types.thir_get_orig_item_name
+use compiler.types.types.sym_constmap_get
+use compiler.types.layout.type_size
+use compiler.types.layout.type_align
 use compiler.types.typeck.patch_unknown_intrinsic_diag_buf
 use compiler.typeck.session.session_render_thir_into
 use compiler.traits.mono.MonoInstance
@@ -135,15 +156,20 @@ use compiler.obj.coff.CoffBuf
 use compiler.obj.coff.CoffArchiveMember
 use compiler.obj.coff.coff_buf_with_capacity
 use compiler.obj.coff.coff_buf_free
+use compiler.obj.coff.coff_buf_put_u8
 use compiler.obj.coff.coff_buf_put_bytes
 use compiler.obj.coff.SectionId
 use compiler.obj.coff.SEC_CODE
 use compiler.obj.coff.SEC_RODATA
+use compiler.obj.coff.SEC_DIRECTIVE
+use compiler.obj.coff.SEC_FLAG_NONE
 use compiler.obj.coff.SEC_FLAG_EXEC
 use compiler.obj.coff.SEC_FLAG_READ
 use compiler.obj.coff.SYM_GLOBAL
 use compiler.obj.coff.SYM_LOCAL
 use compiler.obj.coff.SYM_EXTERNAL
+use compiler.obj.coff.RELOC_X86_64_PC32
+use compiler.obj.coff.RELOC_X86_64_64
 use compiler.obj.coff.ObjSymbol
 use compiler.obj.coff.ObjModel
 use compiler.obj.coff.objmodel_new
@@ -151,8 +177,10 @@ use compiler.obj.coff.objmodel_free
 use compiler.obj.coff.objmodel_add_section_bytes
 use compiler.obj.coff.objmodel_get_section_mut
 use compiler.obj.coff.objmodel_add_symbol_bytes
+use compiler.obj.coff.objmodel_find_symbol_bytes
 use compiler.obj.coff.section_add_byte
 use compiler.obj.coff.section_add_bytes
+use compiler.obj.coff.section_add_reloc
 use compiler.obj.writer.coff_write_to_buf
 use compiler.obj.writer.coff_write_path_bytes
 use compiler.obj.writer.coff_write_archive_to_buf
@@ -178,8 +206,11 @@ use compiler.target.x64.frame.x64_frame_emit_prologue
 use compiler.target.x64.frame.x64_encode_mi_inst_obj
 use compiler.link.pe.AX_LINK_BAD_ARCHIVE
 use compiler.link.pe.AX_LINK_LIBRARY_NOT_FOUND
+use compiler.link.pe.AX_LINK_DUPLICATE_EXPORT
+use compiler.link.import.pe_build_runtime_coff_obj
 use compiler.link.linker.pe_link_objmodel_to_buf
 use compiler.link.linker.pe_link_obj_and_libs_to_buf
+use compiler.link.linker.pe_link_dll_obj_and_libs_to_buf
 use compiler.link.linker.pe_link_with_libs_to_buf
 use compiler.link.linker.pe_write_buf_to_path_bytes
 
@@ -221,6 +252,8 @@ use compiler.driver.opts.ARTIFACT_OBJ
 use compiler.driver.opts.ARTIFACT_LIB
 use compiler.driver.opts.ARTIFACT_DLL
 use compiler.driver.opts.AX_DRIVER_INVALID_ARTIFACT_KIND
+use compiler.driver.opts.AX_FFI_GENERIC_EXPORT
+use compiler.driver.opts.err_run_kind_not_supported
 use compiler.driver.opts.DriverOptions
 use compiler.driver.opts.Project
 use compiler.driver.opts.ProjectFile
@@ -813,6 +846,7 @@ pub fn pipeline_stage_typeck(ctx: mut_view<PipelineCtx>, dopts: view<DriverOptio
         mut_view(ctx.hir_arena),
         mut_view(ctx.mono)
     );
+    pipe_validate_exports(mut_view(*ctx));
     if session_has_errors(view(ctx.sess)) {
         return;
     }
@@ -930,6 +964,16 @@ pub fn pipeline_run_stages(
         let t0 = monotonic_ns();
         if s == STAGE_SOURCE {
             let _ = pipeline_stage_source(mut_view(*ctx), dopts);
+            if dopts.cmd == CMD_RUN && !dopts.has_explicit_kind && ctx.proj.has_manifest && ctx.proj.manifest.kind.len > 0 {
+                let mut mk: u32 = ARTIFACT_EXE;
+                if !driver_parse_artifact_kind(view(ctx.proj.manifest.kind), mut_view(mk)) {
+                    emit_driver_diag(mut_view(ctx.sess.diag_sink), AX_DRIVER_INVALID_ARTIFACT_KIND, 42, 48);
+                    return false;
+                }
+                if mk != ARTIFACT_EXE {
+                    return false;
+                }
+            }
         } else if s == STAGE_LEX {
             pipeline_stage_lex(mut_view(*ctx));
         } else if s == STAGE_PARSE {
@@ -978,6 +1022,18 @@ const WLIB_LIB_NOT_FOUND_CODE_NAME: [25]u8 = [
     78u8, 79u8, 84u8, 95u8, 70u8, 79u8, 85u8, 78u8, 68u8,
 ];
 
+// "AX_LINK_DUPLICATE_EXPORT" (24 bytes)
+const WLIB_DUP_EXPORT_CODE_NAME: [24]u8 = [
+    65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 68u8, 85u8, 80u8, 76u8, 73u8, 67u8, 65u8, 84u8,
+    69u8, 95u8, 69u8, 88u8, 80u8, 79u8, 82u8, 84u8,
+];
+
+// "AX_FFI_GENERIC_EXPORT" (21 bytes)
+const WLIB_GEN_EXPORT_CODE_NAME: [21]u8 = [
+    65u8, 88u8, 95u8, 70u8, 70u8, 73u8, 95u8, 71u8, 69u8, 78u8, 69u8, 82u8, 73u8, 67u8, 95u8, 69u8,
+    88u8, 80u8, 79u8, 82u8, 84u8,
+];
+
 fn patch_wlib_diag_buf(sink: view<DiagSink>, buf: mut_view<DiagBuffer>) {
     let blen = buf.len;
     if sink.len == 0 || (sink.diags as usize) == 0 || blen < 9 || (buf.ptr as usize) == 0 {
@@ -988,7 +1044,7 @@ fn patch_wlib_diag_buf(sink: view<DiagSink>, buf: mut_view<DiagBuffer>) {
     while di < sink.len {
         let dp = ((sink.diags as usize) + opts_mul_usize(di, size_of<Diagnostic>())) as *const Diagnostic;
         let cv = unsafe { (*dp).code.v };
-        if cv >= 137u32 && cv <= 139u32 {
+        if cv >= 137u32 && cv <= 141u32 {
             has_wlib_code = true;
             break;
         }
@@ -1010,7 +1066,7 @@ fn patch_wlib_diag_buf(sink: view<DiagSink>, buf: mut_view<DiagBuffer>) {
                 let dp = ((sink.diags as usize) + opts_mul_usize(next_di, size_of<Diagnostic>())) as *const Diagnostic;
                 let cv = unsafe { (*dp).code.v };
                 next_di = next_di + 1;
-                if cv >= 137u32 && cv <= 139u32 {
+                if cv >= 137u32 && cv <= 141u32 {
                     match_cv = cv;
                     break;
                 }
@@ -1025,6 +1081,18 @@ fn patch_wlib_diag_buf(sink: view<DiagSink>, buf: mut_view<DiagBuffer>) {
                 let mut k: usize = 0;
                 while k < 25 {
                     diag_buf_push_byte(mut_view(out), WLIB_LIB_NOT_FOUND_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else if match_cv == 140u32 {
+                let mut k: usize = 0;
+                while k < 24 {
+                    diag_buf_push_byte(mut_view(out), WLIB_DUP_EXPORT_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else if match_cv == 141u32 {
+                let mut k: usize = 0;
+                while k < 21 {
+                    diag_buf_push_byte(mut_view(out), WLIB_GEN_EXPORT_CODE_NAME[k]);
                     k = k + 1;
                 }
             } else {
@@ -1995,12 +2063,831 @@ fn pipe_strip_unlinked_extern_c_prefixes(ctx: view<PipelineCtx>, obj: mut_view<O
     }
 }
 
+fn pipe_sv_is_entry_attr(sv: view<StrView>) -> bool {
+    if sv.len != 5 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 101u8 && *(sv.ptr + 1) == 110u8 &&
+        *(sv.ptr + 2) == 116u8 && *(sv.ptr + 3) == 114u8 &&
+        *(sv.ptr + 4) == 121u8
+    }
+}
+
+fn pipe_item_has_entry_attr(it: *const HirItem, interner: view<StrInterner>) -> bool {
+    let mut attr: *mut HirAttr = unsafe { (*it).attrs };
+    while (attr as usize) != 0 {
+        let an = interner_get(interner, unsafe { (*attr).name });
+        if pipe_sv_is_entry_attr(view(an)) {
+            return true;
+        }
+        attr = unsafe { (*attr).next };
+    }
+    false
+}
+
+fn pipe_is_mono_clone(head: *mut MonoInstance, target: *const HirItem) -> bool {
+    let mut inst: *mut MonoInstance = head;
+    while (inst as usize) != 0 {
+        if ((unsafe { (*inst).new_item }) as usize) == (target as usize) &&
+           ((unsafe { (*inst).orig_item }) as usize) != (target as usize) {
+            return true;
+        }
+        inst = unsafe { (*inst).next };
+    }
+    false
+}
+
+fn pipe_report_generic_export(sink: mut_view<DiagSink>, sp: Span) {
+    // "generic function cannot be exported" (35 bytes)
+    let msg: [36]u8 = [
+        103u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 32u8, 102u8, 117u8, 110u8, 99u8,
+        116u8, 105u8, 111u8, 110u8, 32u8, 99u8, 97u8, 110u8, 110u8, 111u8, 116u8, 32u8,
+        98u8, 101u8, 32u8, 101u8, 120u8, 112u8, 111u8, 114u8, 116u8, 101u8, 100u8, 0u8,
+    ];
+    let pmsg = unsafe { address_of(msg[0]) };
+    let d = Diagnostic {
+        code: DiagCode { v: AX_FFI_GENERIC_EXPORT },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: pmsg, len: 35 },
+        primary: sp,
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
+fn pipe_report_duplicate_export(sink: mut_view<DiagSink>, sp: Span, sym_sv: view<StrView>) {
+    // "duplicate export: " (18 bytes)
+    let prefix: [18]u8 = [
+        100u8, 117u8, 112u8, 108u8, 105u8, 99u8, 97u8, 116u8, 101u8, 32u8,
+        101u8, 120u8, 112u8, 111u8, 114u8, 116u8, 58u8, 32u8,
+    ];
+    let key_bytes: [7]u8 = [115u8, 121u8, 109u8, 98u8, 111u8, 108u8, 0u8]; // "symbol"
+    let p_prefix = unsafe { address_of(prefix[0]) };
+    let p_key = unsafe { address_of(key_bytes[0]) };
+    let mut buf = coff_buf_with_capacity(18 + sym_sv.len + 1);
+    coff_buf_put_bytes(mut_view(buf), p_prefix, 18);
+    coff_buf_put_bytes(mut_view(buf), sym_sv.ptr, sym_sv.len);
+    let msg_len = buf.len;
+    coff_buf_put_u8(mut_view(buf), 0u8);
+    let mut entry: [1]DiagDataEntry = [DiagDataEntry {
+        key: StrView { ptr: p_key, len: 6 },
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: StrView { ptr: sym_sv.ptr, len: sym_sv.len },
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0,
+        },
+    }];
+    let p_entry = unsafe { address_of(entry[0]) as *mut DiagDataEntry };
+    let d = Diagnostic {
+        code: DiagCode { v: AX_LINK_DUPLICATE_EXPORT },
+        severity: DiagSeverity.Error,
+        message: StrView { ptr: buf.ptr as *const u8, len: msg_len },
+        primary: sp,
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: p_entry,
+        data_count: 1,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+    coff_buf_free(mut_view(buf));
+}
+
+fn pipe_is_impl_member_clone(items_head: *mut HirItem, target: *const HirItem) -> bool {
+    if (target as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*target).kind };
+    let tsym_v = unsafe { (*target).symbol.v };
+    let tsp = unsafe { (*target).span };
+    let mut it: *mut HirItem = items_head;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (m as usize) != (target as usize) && (unsafe { (*m).kind }) == tk {
+                    let msym_v = unsafe { (*m).symbol.v };
+                    if tsym_v != 0u32 && msym_v == tsym_v {
+                        return true;
+                    }
+                    if tsym_v == 0u32 && msym_v == 0u32 {
+                        let msp = unsafe { (*m).span };
+                        if msp.file.v == tsp.file.v && msp.start == tsp.start && msp.end == tsp.end {
+                            return true;
+                        }
+                    }
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    false
+}
+
+fn pipe_other_fn_uses_name(
+    items_buf: *const *mut HirItem,
+    fn_count: usize,
+    self_item: *const HirItem,
+    interner: view<StrInterner>,
+    target_sv: view<StrView>
+) -> bool {
+    let mut i: usize = 0;
+    while i < fn_count {
+        let other = unsafe { *pipe_hir_item_ptr_at(items_buf as *mut *mut HirItem, i) };
+        if (other as usize) != 0 && (other as usize) != (self_item as usize) {
+            let oname_v = unsafe { (*other).name.v };
+            if oname_v != 0u32 {
+                let osv = interner_get(interner, StrId { v: oname_v });
+                if sv_eq(view(osv), target_sv) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn pipe_validate_export_item(
+    ctx: mut_view<PipelineCtx>,
+    it: *const HirItem,
+    in_impl: bool,
+    parent_is_generic: bool,
+    seen_sv: *mut StrView,
+    seen_n: mut_view<usize>,
+    cap: usize
+) {
+    let mut has_export: bool = false;
+    let export_sv = pipe_item_get_export_info(
+        it,
+        view(ctx.sess.interner),
+        mut_view(has_export)
+    );
+    if !has_export {
+        return;
+    }
+    if pipe_is_mono_clone(ctx.mono.instances_head, it) {
+        return;
+    }
+    if !in_impl && pipe_is_impl_member_clone(ctx.hir.items, it) {
+        return;
+    }
+    let gparams = unsafe { (*it).generic_params };
+    let item_is_generic: bool = parent_is_generic ||
+        ((gparams as usize) != 0 && (unsafe { (*gparams).params as usize }) != 0);
+    if item_is_generic {
+        pipe_report_generic_export(mut_view(ctx.sess.diag_sink), unsafe { (*it).span });
+        return;
+    }
+    let ext_sv = if export_sv.len > 0 {
+        export_sv
+    } else {
+        interner_get(view(ctx.sess.interner), unsafe { (*it).name })
+    };
+    if ext_sv.len == 0 {
+        return;
+    }
+    let mut dup: bool = false;
+    let mut k: usize = 0;
+    while k < *seen_n {
+        let prev = sv_slot_get(seen_sv as *const StrView, k);
+        if sv_eq(view(prev), view(ext_sv)) {
+            dup = true;
+            break;
+        }
+        k = k + 1;
+    }
+    if dup {
+        pipe_report_duplicate_export(
+            mut_view(ctx.sess.diag_sink),
+            unsafe { (*it).span },
+            view(ext_sv)
+        );
+    } else if *seen_n < cap {
+        sv_slot_set(seen_sv, *seen_n, view(ext_sv));
+        *seen_n = *seen_n + 1;
+    }
+}
+
+fn pipe_validate_exports(ctx: mut_view<PipelineCtx>) {
+    let mut cap: usize = 0;
+    let mut it0: *mut HirItem = ctx.hir.items;
+    while (it0 as usize) != 0 {
+        cap = cap + 1;
+        if (unsafe { (*it0).kind }) == HIR_ITEM_IMPL {
+            let mut m0: *mut HirItem = unsafe { (*it0).members };
+            while (m0 as usize) != 0 {
+                cap = cap + 1;
+                m0 = unsafe { (*m0).next };
+            }
+        }
+        it0 = unsafe { (*it0).next };
+    }
+    if cap == 0 {
+        return;
+    }
+    let seen_sv = arena_alloc_raw(
+        mut_view(ctx.hir_arena),
+        opts_mul_usize(cap, size_of<StrView>()),
+        align_of<StrView>()
+    ) as *mut StrView;
+    let mut seen_n: usize = 0;
+
+    let mut it: *mut HirItem = ctx.hir.items;
+    while (it as usize) != 0 {
+        pipe_validate_export_item(mut_view(*ctx), it as *const HirItem, false, false, seen_sv, mut_view(seen_n), cap);
+        if (unsafe { (*it).kind }) == HIR_ITEM_IMPL {
+            let igp = unsafe { (*it).generic_params };
+            let impl_is_gen: bool = (igp as usize) != 0 && (unsafe { (*igp).params as usize }) != 0;
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                pipe_validate_export_item(mut_view(*ctx), m as *const HirItem, true, impl_is_gen, seen_sv, mut_view(seen_n), cap);
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+}
+
+fn pipe_append_drectve_export(
+    buf: mut_view<CoffBuf>,
+    ext_sv: view<StrView>,
+    int_sv: view<StrView>,
+    is_data: bool
+) {
+    if ext_sv.len == 0 || (ext_sv.ptr as usize) == 0 {
+        return;
+    }
+    // " -export:" (9 bytes)
+    let pfx: [9]u8 = [32u8, 45u8, 101u8, 120u8, 112u8, 111u8, 114u8, 116u8, 58u8];
+    let p_pfx = unsafe { address_of(pfx[0]) };
+    coff_buf_put_bytes(mut_view(*buf), p_pfx, 9);
+    coff_buf_put_bytes(mut_view(*buf), ext_sv.ptr, ext_sv.len);
+    if int_sv.len > 0 && (int_sv.ptr as usize) != 0 && !sv_eq(ext_sv, int_sv) {
+        coff_buf_put_u8(mut_view(*buf), 61u8); // '='
+        coff_buf_put_bytes(mut_view(*buf), int_sv.ptr, int_sv.len);
+    }
+    if is_data {
+        let sfx: [5]u8 = [44u8, 100u8, 97u8, 116u8, 97u8]; // ",data"
+        let p_sfx = unsafe { address_of(sfx[0]) };
+        coff_buf_put_bytes(mut_view(*buf), p_sfx, 5);
+    }
+}
+
+fn pipe_emit_dll_entry_alias(
+    arena: mut_view<Arena>,
+    fn_ty: *const AxType,
+    ti: view<TypeInterner>,
+    obj: mut_view<ObjModel>,
+    text_sec_id: SectionId,
+    func_start: u64,
+    func_size: u64
+) {
+    let is_3arg: bool = (fn_ty as usize) != 0 && (unsafe { (*fn_ty).param_count }) >= 3;
+    let mut ret_kind: u32 = 0u32; // 0 = unit, 1 = bool, 2 = i32
+    if (fn_ty as usize) != 0 {
+        let rt_v = unsafe { (*fn_ty).ret_type.v };
+        if rt_v != 0u32 {
+            let rty = type_get(ti, TypeId { v: rt_v });
+            if (rty as usize) != 0 {
+                let rk = unsafe { (*rty).kind };
+                if rk == TY_UNIT {
+                    ret_kind = 0u32;
+                } else if rk == TY_BOOL {
+                    ret_kind = 1u32;
+                } else {
+                    ret_kind = 2u32;
+                }
+            }
+        }
+    }
+    // "__ax_dll_entry_" (15 bytes)
+    let pfx: [15]u8 = [
+        95u8, 95u8, 97u8, 120u8, 95u8, 100u8, 108u8, 108u8,
+        95u8, 101u8, 110u8, 116u8, 114u8, 121u8, 95u8,
+    ];
+    let sfx_len: usize = if ret_kind == 2u32 { 3 } else { 4 };
+    let total: usize = 17 + sfx_len;
+    let dst = arena_alloc_raw(mut_view(*arena), total + 1, 1);
+    let mut i: usize = 0;
+    while i < 15 {
+        unsafe { *(dst + i) = pfx[i]; }
+        i = i + 1;
+    }
+    unsafe {
+        *(dst + 15) = if is_3arg { 51u8 } else { 48u8 }; // '3' or '0'
+        *(dst + 16) = 95u8; // '_'
+        if ret_kind == 0u32 {
+            // "unit"
+            *(dst + 17) = 117u8;
+            *(dst + 18) = 110u8;
+            *(dst + 19) = 105u8;
+            *(dst + 20) = 116u8;
+        } else if ret_kind == 1u32 {
+            // "bool"
+            *(dst + 17) = 98u8;
+            *(dst + 18) = 111u8;
+            *(dst + 19) = 111u8;
+            *(dst + 20) = 108u8;
+        } else {
+            // "i32"
+            *(dst + 17) = 105u8;
+            *(dst + 18) = 51u8;
+            *(dst + 19) = 50u8;
+        }
+        *(dst + total) = 0u8;
+    }
+    let _ = objmodel_add_symbol_bytes(
+        mut_view(*obj),
+        dst as *const u8,
+        total,
+        text_sec_id,
+        func_start,
+        func_size,
+        SYM_GLOBAL
+    );
+}
+
+fn pipe_alloc_exp_str_sym(arena: mut_view<Arena>, id: u32) -> StrView {
+    // ".Lexp_str." (10 bytes) + digits
+    let pfx: [10]u8 = [46u8, 76u8, 101u8, 120u8, 112u8, 95u8, 115u8, 116u8, 114u8, 46u8];
+    let mut digits: [12]u8 = [0u8; 12];
+    let mut dlen: usize = 0;
+    if id == 0u32 {
+        digits[0] = 48u8;
+        dlen = 1;
+    } else {
+        let mut v = id;
+        while v > 0u32 {
+            digits[dlen] = (48u32 + (v % 10u32)) as u8;
+            v = v / 10u32;
+            dlen = dlen + 1;
+        }
+    }
+    let total = 10 + dlen;
+    let dst = arena_alloc_raw(mut_view(*arena), total + 1, 1);
+    let mut i: usize = 0;
+    while i < 10 {
+        unsafe { *(dst + i) = pfx[i]; }
+        i = i + 1;
+    }
+    let mut j: usize = 0;
+    while j < dlen {
+        unsafe { *(dst + 10 + j) = digits[dlen - 1 - j]; }
+        j = j + 1;
+    }
+    unsafe { *(dst + total) = 0u8; }
+    StrView { ptr: dst as *const u8, len: total }
+}
+
+fn pipe_any_hir_fn_uses_name(
+    items_head: *mut HirItem,
+    interner: view<StrInterner>,
+    target_sv: view<StrView>
+) -> bool {
+    let mut it: *mut HirItem = items_head;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_FN {
+            let gparams = unsafe { (*it).generic_params };
+            let is_gen: bool = (gparams as usize) != 0 && (unsafe { (*gparams).params as usize }) != 0;
+            if !is_gen {
+                let fn_name_v = unsafe { (*it).name.v };
+                if fn_name_v != 0u32 {
+                    let fsv = interner_get(interner, StrId { v: fn_name_v });
+                    if sv_eq(view(fsv), target_sv) {
+                        return true;
+                    }
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    false
+}
+
+fn pipe_alloc_exp_const_sym(
+    arena: mut_view<Arena>,
+    obj: view<ObjModel>,
+    ext_sv: view<StrView>
+) -> StrView {
+    // "__ax_const$" (11 bytes) + ext_sv
+    let pfx: [11]u8 = [
+        95u8, 95u8, 97u8, 120u8, 95u8,
+        99u8, 111u8, 110u8, 115u8, 116u8, 36u8,
+    ];
+    let ext_len = ext_sv.len;
+    let ext_ptr = ext_sv.ptr;
+    let base_len: usize = 11 + ext_len;
+    let dst = arena_alloc_raw(mut_view(*arena), base_len + 1, 1);
+    let mut i: usize = 0;
+    while i < 11 {
+        unsafe { *(dst + i) = pfx[i]; }
+        i = i + 1;
+    }
+    let mut j: usize = 0;
+    while j < ext_len {
+        unsafe { *(dst + 11 + j) = *(ext_ptr + j); }
+        j = j + 1;
+    }
+    unsafe { *(dst + base_len) = 0u8; }
+    if objmodel_find_symbol_bytes(obj, dst as *const u8, base_len).v == 0u32 {
+        return StrView { ptr: dst as *const u8, len: base_len };
+    }
+    let mut salt: u32 = 1u32;
+    while salt < 1000000u32 {
+        let mut digits: [12]u8 = [0u8; 12];
+        let mut dlen: usize = 0;
+        let mut v = salt;
+        while v > 0u32 {
+            digits[dlen] = (48u32 + (v % 10u32)) as u8;
+            v = v / 10u32;
+            dlen = dlen + 1;
+        }
+        let s_total = base_len + 1 + dlen;
+        let s_dst = arena_alloc_raw(mut_view(*arena), s_total + 1, 1);
+        let mut k: usize = 0;
+        while k < base_len {
+            unsafe { *(s_dst + k) = *(dst + k); }
+            k = k + 1;
+        }
+        unsafe { *(s_dst + base_len) = 36u8; }
+        let mut d: usize = 0;
+        while d < dlen {
+            unsafe { *(s_dst + base_len + 1 + d) = digits[dlen - 1 - d]; }
+            d = d + 1;
+        }
+        unsafe { *(s_dst + s_total) = 0u8; }
+        if objmodel_find_symbol_bytes(obj, s_dst as *const u8, s_total).v == 0u32 {
+            return StrView { ptr: s_dst as *const u8, len: s_total };
+        }
+        salt = salt + 1u32;
+    }
+    StrView { ptr: dst as *const u8, len: base_len }
+}
+
+fn pipe_emit_exported_consts(
+    ctx: mut_view<PipelineCtx>,
+    for_lib: bool,
+    for_obj: bool,
+    filter_fid_v: u32,
+    rdata_sec_id: SectionId,
+    obj: mut_view<ObjModel>,
+    drectve_buf: mut_view<CoffBuf>
+) {
+    let rdata_id_v = rdata_sec_id.v;
+    let mut exp_str_id: u32 = 0u32;
+    let mut cit: *mut HirItem = ctx.hir.items;
+    while (cit as usize) != 0 {
+        if (unsafe { (*cit).kind }) == HIR_ITEM_CONST &&
+           (filter_fid_v == 0u32 || (unsafe { (*cit).span.file.v }) == filter_fid_v) {
+            let mut has_export: bool = false;
+            let export_sv = pipe_item_get_export_info(
+                cit as *const HirItem,
+                view(ctx.sess.interner),
+                mut_view(has_export)
+            );
+            if has_export {
+                let cname_sv = interner_get(view(ctx.sess.interner), unsafe { (*cit).name });
+                let sym_v = unsafe { (*cit).symbol.v };
+                let cval = sym_constmap_get(view(ctx.thir.symbol_consts), SymbolId { v: sym_v });
+                let mut ty_v: u32 = 0u32;
+                if (cval as usize) != 0 {
+                    ty_v = unsafe { (*cval).ty.v };
+                }
+                if ty_v == 0u32 {
+                    let p_ity = thir_get_item_type(view(ctx.thir), cit as *const HirItem);
+                    if (p_ity as usize) != 0 {
+                        ty_v = unsafe { (*p_ity).v };
+                    } else {
+                        let p_sty = thir_get_sym_type(view(ctx.thir), SymbolId { v: sym_v });
+                        if (p_sty as usize) != 0 {
+                            ty_v = unsafe { (*p_sty).v };
+                        }
+                    }
+                }
+                let rdata_sec = objmodel_get_section_mut(mut_view(*obj), SectionId { v: rdata_id_v });
+                let mut const_off: u64 = 0u64;
+                let mut const_sz: u64 = 8u64;
+                let ckind: u8 = if (cval as usize) != 0 { unsafe { (*cval).kind } } else { CONST_INT };
+
+                if ckind == CONST_STR && (cval as usize) != 0 {
+                    let s_ptr = unsafe { (*cval).str_bytes };
+                    let s_len = unsafe { (*cval).str_len };
+                    let s_off = unsafe { (*rdata_sec).bytes_len as u64 };
+                    if (s_ptr as usize) != 0 && s_len > 0 {
+                        unsafe {
+                            section_add_bytes(mut_view(*rdata_sec), s_ptr, s_len);
+                        }
+                    }
+                    unsafe {
+                        section_add_byte(mut_view(*rdata_sec), 0u8);
+                        while ((*rdata_sec).bytes_len % 8) != 0 {
+                            section_add_byte(mut_view(*rdata_sec), 0u8);
+                        }
+                    }
+                    let es_sv = pipe_alloc_exp_str_sym(mut_view(ctx.backend_arena), exp_str_id);
+                    exp_str_id = exp_str_id + 1u32;
+                    let str_sym = objmodel_add_symbol_bytes(
+                        mut_view(*obj),
+                        es_sv.ptr,
+                        es_sv.len,
+                        SectionId { v: rdata_id_v },
+                        s_off,
+                        (s_len + 1) as u64,
+                        SYM_LOCAL
+                    );
+                    let rdata_sec2 = objmodel_get_section_mut(mut_view(*obj), SectionId { v: rdata_id_v });
+                    const_off = unsafe { (*rdata_sec2).bytes_len as u64 };
+                    const_sz = 16u64;
+                    let mut z: usize = 0;
+                    while z < 8 {
+                        section_add_byte(unsafe { mut_view(*rdata_sec2) }, 0u8);
+                        z = z + 1;
+                    }
+                    let slen_u64 = s_len as u64;
+                    let mut b: usize = 0;
+                    while b < 8 {
+                        let shift = (b * 8) as u64;
+                        let byte = ((slen_u64 >> shift) & 0xFFu64) as u8;
+                        section_add_byte(unsafe { mut_view(*rdata_sec2) }, byte);
+                        b = b + 1;
+                    }
+                    section_add_reloc(
+                        unsafe { mut_view(*rdata_sec2) },
+                        const_off as u32,
+                        RELOC_X86_64_64,
+                        str_sym,
+                        0i64
+                    );
+                } else if ckind == CONST_AGGREGATE && (cval as usize) != 0 {
+                    let agg_al_raw = unsafe { (*cval).agg_align };
+                    let agg_al: usize = if agg_al_raw == 0 { 8 } else { agg_al_raw };
+                    let agg_sz = unsafe { (*cval).agg_size };
+                    let agg_ptr = unsafe { (*cval).agg_data as *const u8 };
+                    unsafe {
+                        while ((*rdata_sec).bytes_len % agg_al) != 0 {
+                            section_add_byte(mut_view(*rdata_sec), 0u8);
+                        }
+                        const_off = (*rdata_sec).bytes_len as u64;
+                        if agg_sz > 0 && (agg_ptr as usize) != 0 {
+                            section_add_bytes(mut_view(*rdata_sec), agg_ptr, agg_sz);
+                            const_sz = agg_sz as u64;
+                        } else {
+                            section_add_byte(mut_view(*rdata_sec), 0u8);
+                            const_sz = 1u64;
+                        }
+                    }
+                } else {
+                    let raw_sz: u32 = if ty_v != 0u32 {
+                        type_size(TypeId { v: ty_v }, view(ctx.thir.interner))
+                    } else {
+                        8u32
+                    };
+                    let raw_al: u32 = if ty_v != 0u32 {
+                        type_align(TypeId { v: ty_v }, view(ctx.thir.interner))
+                    } else {
+                        8u32
+                    };
+                    let sz: usize = if raw_sz == 0u32 { 8 } else { raw_sz as usize };
+                    let al: usize = if raw_al == 0u32 { 8 } else { raw_al as usize };
+                    let ival: u64 = if (cval as usize) != 0 { unsafe { (*cval).int_val } } else { 0u64 };
+                    unsafe {
+                        while ((*rdata_sec).bytes_len % al) != 0 {
+                            section_add_byte(mut_view(*rdata_sec), 0u8);
+                        }
+                        const_off = (*rdata_sec).bytes_len as u64;
+                    }
+                    const_sz = sz as u64;
+                    let mut b: usize = 0;
+                    while b < sz {
+                        let byte: u8 = if b < 8 {
+                            let shift = (b * 8) as u64;
+                            ((ival >> shift) & 0xFFu64) as u8
+                        } else {
+                            0u8
+                        };
+                        section_add_byte(unsafe { mut_view(*rdata_sec) }, byte);
+                        b = b + 1;
+                    }
+                }
+
+                let exp_name_sv = if export_sv.len > 0 { export_sv } else { cname_sv };
+                let sym_taken: bool =
+                    objmodel_find_symbol_bytes(view(*obj), exp_name_sv.ptr, exp_name_sv.len).v != 0u32 ||
+                    pipe_any_hir_fn_uses_name(ctx.hir.items, view(ctx.sess.interner), view(exp_name_sv));
+                let use_mangled: bool = if for_lib || for_obj {
+                    sym_taken
+                } else {
+                    sym_taken || export_sv.len > 0 || pipe_is_impl_member_clone(ctx.hir.items, cit as *const HirItem)
+                };
+                let primary_const_sv = if use_mangled {
+                    pipe_alloc_exp_const_sym(mut_view(ctx.backend_arena), view(*obj), view(exp_name_sv))
+                } else {
+                    exp_name_sv
+                };
+                let _ = objmodel_add_symbol_bytes(
+                    mut_view(*obj),
+                    primary_const_sv.ptr,
+                    primary_const_sv.len,
+                    SectionId { v: rdata_id_v },
+                    const_off,
+                    const_sz,
+                    SYM_GLOBAL
+                );
+                if !for_lib {
+                    pipe_append_drectve_export(mut_view(*drectve_buf), view(exp_name_sv), view(primary_const_sv), true);
+                }
+            }
+        }
+        cit = unsafe { (*cit).next };
+    }
+}
+
+fn pipe_prefix_ends_with_dll(ptr: *const u8, len: usize) -> bool {
+    if len < 5 || (ptr as usize) == 0 {
+        return false;
+    }
+    let b0 = unsafe { *(ptr + len - 4) };
+    let b1 = unsafe { *(ptr + len - 3) } | 32u8;
+    let b2 = unsafe { *(ptr + len - 2) } | 32u8;
+    let b3 = unsafe { *(ptr + len - 1) } | 32u8;
+    b0 == 46u8 && b1 == 100u8 && b2 == 108u8 && b3 == 108u8
+}
+
+fn pipe_is_dll_import_sym(
+    items_head: *mut HirItem,
+    interner: view<StrInterner>,
+    dll_ptr: *const u8,
+    dll_len: usize,
+    fn_ptr: *const u8,
+    fn_len: usize
+) -> bool {
+    if pipe_prefix_ends_with_dll(dll_ptr, dll_len) {
+        return true;
+    }
+    let dll_sv = StrView { ptr: dll_ptr, len: dll_len };
+    let fn_sv = StrView { ptr: fn_ptr, len: fn_len };
+    let mut it: *mut HirItem = items_head;
+    while (it as usize) != 0 {
+        if (unsafe { (*it).kind }) == HIR_ITEM_FN && (unsafe { (*it).abi.v }) != 0u32 {
+            let item_fn_sv = interner_get(interner, unsafe { (*it).name });
+            if sv_eq(view(item_fn_sv), view(fn_sv)) {
+                let link_sv = pipe_item_get_link_arg(it as *const HirItem, interner);
+                if link_sv.len > 0 && sv_eq(view(link_sv), view(dll_sv)) {
+                    return true;
+                }
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+    false
+}
+
+// ADR-0034 section 4 OI-07b / SPEC-26 AXS-WLIB-032:
+// For standalone COFF object emission (`--emit=obj` / `--kind obj`), lower `<dll>$<FuncName>`
+// external symbols into local 6-byte `jmp [rip + __imp_<FuncName>]` stubs in `.text` referencing
+// standard PE/COFF `__imp_<FuncName>` external IAT symbols so GNU `ld`, `lld-link`, `link.exe`,
+// and `axiomc` can all link the emitted `.obj` directly.
+fn pipe_lower_dll_imports_for_obj(
+    items_head: *mut HirItem,
+    interner: view<StrInterner>,
+    arena: mut_view<Arena>,
+    text_sec_id: SectionId,
+    obj: mut_view<ObjModel>
+) {
+    let text_id_v = text_sec_id.v;
+    let thunk_pfx: [8]u8 = [46u8, 76u8, 116u8, 104u8, 117u8, 110u8, 107u8, 95u8]; // ".Lthunk_"
+    let imp_pfx: [6]u8 = [95u8, 95u8, 105u8, 109u8, 112u8, 95u8]; // "__imp_"
+    let orig_len = obj.symbols_len;
+    let mut si: usize = 0;
+    while si < orig_len {
+        let sym0 = unsafe { pipe_obj_symbol_at(obj.symbols, si) };
+        let bind = unsafe { (*sym0).linkage };
+        let sec_v = unsafe { (*sym0).section_id.v };
+        let nlen = unsafe { (*sym0).name_len };
+        let nptr = unsafe { (*sym0).name };
+        if bind == SYM_EXTERNAL && sec_v == 0u32 && nlen > 2 && (nptr as usize) != 0 {
+            let mut dollar_pos: usize = nlen;
+            let mut k: usize = 0;
+            while k < nlen {
+                if (unsafe { *(nptr + k) }) == 36u8 { // '$'
+                    dollar_pos = k;
+                    break;
+                }
+                k = k + 1;
+            }
+            if dollar_pos > 0 && (dollar_pos + 1) < nlen {
+                let fn_ptr = unsafe { nptr + dollar_pos + 1 };
+                let fn_len = nlen - dollar_pos - 1;
+                if pipe_is_dll_import_sym(items_head, interner, nptr, dollar_pos, fn_ptr, fn_len) {
+
+                let tlen = 8 + fn_len;
+                let tbuf = arena_alloc_raw(mut_view(*arena), tlen + 1, 1);
+                let mut ti: usize = 0;
+                while ti < 8 {
+                    unsafe { *(tbuf + ti) = thunk_pfx[ti]; }
+                    ti = ti + 1;
+                }
+                let mut fi: usize = 0;
+                while fi < fn_len {
+                    unsafe { *(tbuf + 8 + fi) = *(fn_ptr + fi); }
+                    fi = fi + 1;
+                }
+                unsafe { *(tbuf + tlen) = 0u8; }
+
+                let existing_thunk = objmodel_find_symbol_bytes(view(*obj), tbuf as *const u8, tlen);
+                let mut stub_off: u64 = 0u64;
+                if existing_thunk.v != 0u32 {
+                    let esym = unsafe { pipe_obj_symbol_at(obj.symbols, (existing_thunk.v - 1u32) as usize) };
+                    stub_off = unsafe { (*esym).value };
+                } else {
+                    let ilen = 6 + fn_len;
+                    let ibuf = arena_alloc_raw(mut_view(*arena), ilen + 1, 1);
+                    let mut ii: usize = 0;
+                    while ii < 6 {
+                        unsafe { *(ibuf + ii) = imp_pfx[ii]; }
+                        ii = ii + 1;
+                    }
+                    let mut ij: usize = 0;
+                    while ij < fn_len {
+                        unsafe { *(ibuf + 6 + ij) = *(fn_ptr + ij); }
+                        ij = ij + 1;
+                    }
+                    unsafe { *(ibuf + ilen) = 0u8; }
+
+                    let mut imp_id = objmodel_find_symbol_bytes(view(*obj), ibuf as *const u8, ilen);
+                    if imp_id.v == 0u32 {
+                        imp_id = objmodel_add_symbol_bytes(
+                            mut_view(*obj),
+                            ibuf as *const u8,
+                            ilen,
+                            SectionId { v: 0u32 },
+                            0u64,
+                            0u64,
+                            SYM_EXTERNAL
+                        );
+                    }
+                    let tsec = objmodel_get_section_mut(mut_view(*obj), SectionId { v: text_id_v });
+                    stub_off = unsafe { (*tsec).bytes_len as u64 };
+                    unsafe {
+                        section_add_byte(mut_view(*tsec), 0xFFu8);
+                        section_add_byte(mut_view(*tsec), 0x25u8);
+                        section_add_byte(mut_view(*tsec), 0x00u8);
+                        section_add_byte(mut_view(*tsec), 0x00u8);
+                        section_add_byte(mut_view(*tsec), 0x00u8);
+                        section_add_byte(mut_view(*tsec), 0x00u8);
+                        section_add_reloc(
+                            mut_view(*tsec),
+                            (stub_off as u32) + 2u32,
+                            RELOC_X86_64_PC32,
+                            imp_id,
+                            -4i64
+                        );
+                    }
+                }
+
+                    let sym_after = unsafe { pipe_obj_symbol_at(obj.symbols, si) };
+                    unsafe {
+                        (*sym_after).name = tbuf as *const u8;
+                        (*sym_after).name_len = tlen;
+                        (*sym_after).section_id = SectionId { v: text_id_v };
+                        (*sym_after).value = stub_off;
+                        (*sym_after).size = 6u64;
+                        (*sym_after).linkage = SYM_LOCAL;
+                    }
+                }
+            }
+        }
+        si = si + 1;
+    }
+}
+
 fn driver_emit_objmodel_filtered(
     ctx: mut_view<PipelineCtx>,
     run_drop_elab: bool,
     run_opt: bool,
     is_build_mode: bool,
     for_lib: bool,
+    for_obj: bool,
     filter_fid_v: u32,
     obj: mut_view<ObjModel>
 ) -> bool {
@@ -2071,18 +2958,16 @@ fn driver_emit_objmodel_filtered(
         }
         it0 = unsafe { (*it0).next };
     }
-    if fn_cap == 0 {
-        return true;
-    }
+    let alloc_fn_cap: usize = if fn_cap == 0 { 1 } else { fn_cap };
 
     let items_buf = arena_alloc_raw(
         mut_view(ctx.backend_arena),
-        opts_mul_usize(fn_cap, size_of<*mut HirItem>()),
+        opts_mul_usize(alloc_fn_cap, size_of<*mut HirItem>()),
         align_of<*mut HirItem>()
     ) as *mut *mut HirItem;
     let bodies_buf = arena_alloc_raw(
         mut_view(ctx.backend_arena),
-        opts_mul_usize(fn_cap, size_of<*mut MirBody>()),
+        opts_mul_usize(alloc_fn_cap, size_of<*mut MirBody>()),
         align_of<*mut MirBody>()
     ) as *mut *mut MirBody;
     let mut fn_count: usize = 0;
@@ -2203,6 +3088,7 @@ fn driver_emit_objmodel_filtered(
         mut_view(cstr_counter)
     );
 
+    let mut drectve_buf = coff_buf_with_capacity(64);
     let mut fi: usize = 0;
     while fi < fn_count {
         let idx = (unsafe { *pipe_u32_at(order_buf, fi) }) as usize;
@@ -2238,6 +3124,7 @@ fn driver_emit_objmodel_filtered(
             run_opt
         );
         if v_err != X64_VERIFY_OK {
+            coff_buf_free(mut_view(drectve_buf));
             return false;
         }
 
@@ -2294,12 +3181,19 @@ fn driver_emit_objmodel_filtered(
         } else {
             interner_get(view(ctx.sess.interner), StrId { v: fname_id_v })
         };
+        let orig_name_ptr = thir_get_orig_item_name(view(ctx.thir), fn_item as *const HirItem);
+        let orig_fname_sv = if (orig_name_ptr as usize) != 0 && (unsafe { *orig_name_ptr }) != 0u32 {
+            interner_get(view(ctx.sess.interner), StrId { v: unsafe { *orig_name_ptr } })
+        } else {
+            fname_sv
+        };
         let mut has_export: bool = false;
         let export_sv = pipe_item_get_export_info(
             fn_item as *const HirItem,
             view(ctx.sess.interner),
             mut_view(has_export)
         );
+        let exp_fn_sv = if export_sv.len > 0 { export_sv } else { orig_fname_sv };
         let sym_bind: u32 = if !for_lib ||
                                (unsafe { (*fn_item).vis.kind }) != 0u8 ||
                                has_export ||
@@ -2317,15 +3211,41 @@ fn driver_emit_objmodel_filtered(
             func_size,
             sym_bind
         );
-        if has_export && export_sv.len > 0 && !sv_eq(view(export_sv), view(fname_sv)) {
-            let _ = objmodel_add_symbol_bytes(
+        let mut emitted_exp_sym: bool = sv_eq(view(exp_fn_sv), view(fname_sv));
+        if (for_lib || for_obj) && has_export && exp_fn_sv.len > 0 && !emitted_exp_sym {
+            if objmodel_find_symbol_bytes(view(*obj), exp_fn_sv.ptr, exp_fn_sv.len).v == 0u32 &&
+               !pipe_other_fn_uses_name(
+                   items_buf as *const *mut HirItem,
+                   fn_count,
+                   fn_item as *const HirItem,
+                   view(ctx.sess.interner),
+                   view(exp_fn_sv)
+               ) {
+                let _ = objmodel_add_symbol_bytes(
+                    mut_view(*obj),
+                    exp_fn_sv.ptr,
+                    exp_fn_sv.len,
+                    SectionId { v: text_id_v },
+                    func_start,
+                    func_size,
+                    SYM_GLOBAL
+                );
+                emitted_exp_sym = true;
+            }
+        }
+        if is_build_mode && !for_lib && has_export {
+            let int_fn_sv = if for_obj && emitted_exp_sym { exp_fn_sv } else { fname_sv };
+            pipe_append_drectve_export(mut_view(drectve_buf), view(exp_fn_sv), view(int_fn_sv), false);
+        }
+        if is_build_mode && !for_lib && pipe_item_has_entry_attr(fn_item as *const HirItem, view(ctx.sess.interner)) {
+            pipe_emit_dll_entry_alias(
+                mut_view(ctx.backend_arena),
+                fn_ty,
+                view(ctx.thir.interner),
                 mut_view(*obj),
-                export_sv.ptr,
-                export_sv.len,
                 SectionId { v: text_id_v },
                 func_start,
-                func_size,
-                SYM_GLOBAL
+                func_size
             );
         }
         if is_build_mode && !for_lib && pipe_sv_is_main(view(fname_sv)) {
@@ -2346,6 +3266,36 @@ fn driver_emit_objmodel_filtered(
 
     if is_build_mode {
         pipe_strip_unlinked_extern_c_prefixes(view(*ctx), mut_view(*obj));
+        pipe_emit_exported_consts(
+            mut_view(*ctx),
+            for_lib,
+            for_obj,
+            filter_fid_v,
+            SectionId { v: rdata_id_v },
+            mut_view(*obj),
+            mut_view(drectve_buf)
+        );
+        if !for_lib && drectve_buf.len > 0 {
+            // ".drectve"
+            let dname_arr: [8]u8 = [46u8, 100u8, 114u8, 101u8, 99u8, 116u8, 118u8, 101u8];
+            let dname_buf = arena_alloc_raw(mut_view(ctx.backend_arena), 9, 1);
+            let mut di: usize = 0;
+            while di < 8 {
+                unsafe { *(dname_buf + di) = dname_arr[di]; }
+                di = di + 1;
+            }
+            unsafe { *(dname_buf + 8) = 0u8; }
+            let dsec_id = objmodel_add_section_bytes(
+                mut_view(*obj),
+                dname_buf as *const u8,
+                8,
+                SEC_DIRECTIVE,
+                SEC_FLAG_NONE,
+                1u32
+            );
+            let dsec = objmodel_get_section_mut(mut_view(*obj), dsec_id);
+            section_add_bytes(unsafe { mut_view(*dsec) }, drectve_buf.ptr as *const u8, drectve_buf.len);
+        }
         if for_lib {
             let mut u: usize = 0;
             while u < obj.symbols_len {
@@ -2373,8 +3323,18 @@ fn driver_emit_objmodel_filtered(
                 u = u + 1;
             }
         }
+        if for_obj {
+            pipe_lower_dll_imports_for_obj(
+                ctx.hir.items,
+                view(ctx.sess.interner),
+                mut_view(ctx.backend_arena),
+                SectionId { v: text_id_v },
+                mut_view(*obj)
+            );
+        }
     }
 
+    coff_buf_free(mut_view(drectve_buf));
     true
 }
 
@@ -2390,6 +3350,7 @@ fn driver_emit_objmodel(
         run_drop_elab,
         run_opt,
         is_build_mode,
+        false,
         false,
         0u32,
         obj
@@ -2436,6 +3397,18 @@ fn driver_execute_run_ctx(
     err_buf: mut_view<DiagBuffer>
 ) -> i32 {
     let ok = pipeline_run_stages(mut_view(*ctx), dopts, STAGE_INTERP, mut_view(*out_buf));
+    if !dopts.has_explicit_kind && ctx.proj.has_manifest && ctx.proj.manifest.kind.len > 0 {
+        let mut mk: u32 = ARTIFACT_EXE;
+        if !driver_parse_artifact_kind(view(ctx.proj.manifest.kind), mut_view(mk)) {
+            emit_driver_diag(mut_view(ctx.sess.diag_sink), AX_DRIVER_INVALID_ARTIFACT_KIND, 42, 48);
+            driver_flush_diagnostics(mut_view(*ctx), dopts, mut_view(*out_buf), mut_view(*err_buf));
+            return AX_EXIT_USAGE;
+        }
+        if mk != ARTIFACT_EXE {
+            err_run_kind_not_supported(mut_view(*err_buf), view(ctx.proj.manifest.kind));
+            return AX_EXIT_USAGE;
+        }
+    }
     if ctx.panic_msg.len > 0 && (ctx.panic_msg.ptr as usize) != 0 {
         push_pipe_str(mut_view(*err_buf), 108, 7);
         diag_buf_push_bytes(mut_view(*err_buf), ctx.panic_msg.ptr, ctx.panic_msg.len);
@@ -2581,6 +3554,47 @@ fn pipe_collect_attr_libs(ctx: mut_view<PipelineCtx>, out_count: mut_view<usize>
     arr
 }
 
+fn pipe_derive_companion_implib_path(arena: mut_view<Arena>, out_path: view<StrView>) -> StrView {
+    if out_path.len == 0 || (out_path.ptr as usize) == 0 {
+        let empty_sv = sv_empty();
+        return derive_default_output_path(arena, view(empty_sv), ARTIFACT_LIB);
+    }
+    let mut base_start: usize = 0;
+    let mut i: usize = 0;
+    while i < out_path.len {
+        let ch = unsafe { *(out_path.ptr + i) };
+        if ch == 47u8 || ch == 92u8 {
+            base_start = i + 1;
+        }
+        i = i + 1;
+    }
+    let mut prefix_len: usize = out_path.len;
+    let mut j: usize = out_path.len;
+    while j > base_start {
+        j = j - 1;
+        if (unsafe { *(out_path.ptr + j) }) == 46u8 {
+            if j > base_start {
+                prefix_len = j;
+            }
+            break;
+        }
+    }
+    let dst = arena_alloc_raw(mut_view(*arena), prefix_len + 5, 1);
+    let mut k: usize = 0;
+    while k < prefix_len {
+        unsafe { *(dst + k) = *(out_path.ptr + k); }
+        k = k + 1;
+    }
+    unsafe {
+        *(dst + prefix_len + 0) = 46u8;  // '.'
+        *(dst + prefix_len + 1) = 108u8; // 'l'
+        *(dst + prefix_len + 2) = 105u8; // 'i'
+        *(dst + prefix_len + 3) = 98u8;  // 'b'
+        *(dst + prefix_len + 4) = 0u8;
+    }
+    StrView { ptr: dst as *const u8, len: prefix_len + 4 }
+}
+
 fn driver_execute_build_into_ctx(
     ctx: mut_view<PipelineCtx>,
     dopts: view<DriverOptions>,
@@ -2589,6 +3603,26 @@ fn driver_execute_build_into_ctx(
     out_artifact: *mut CoffBuf,
     write_to_disk: bool
 ) -> i32 {
+    if dopts.rt_obj.len > 0 {
+        let mut rt_buf = coff_buf_with_capacity(1024);
+        let ok_rt = pe_build_runtime_coff_obj(mut_view(rt_buf));
+        let mut ok_write: bool = ok_rt;
+        if ok_rt && write_to_disk {
+            ok_write = pe_write_buf_to_path_bytes(view(rt_buf), dopts.rt_obj.ptr, dopts.rt_obj.len);
+        }
+        if (dopts.pos_argc) < 2 {
+            if ok_write && (out_artifact as usize) != 0 {
+                coff_buf_put_bytes(unsafe { mut_view(*out_artifact) }, rt_buf.ptr as *const u8, rt_buf.len);
+            }
+            coff_buf_free(mut_view(rt_buf));
+            return if ok_write { AX_EXIT_OK } else { AX_EXIT_DIAG };
+        }
+        coff_buf_free(mut_view(rt_buf));
+        if !ok_write {
+            return AX_EXIT_DIAG;
+        }
+    }
+
     let mut has_ax_sources: bool = ctx.main_text.len > 0;
     if !has_ax_sources {
         if dopts.pos_argc == 0 && dopts.input_file.len > 0 && !sv_is_obj_or_archive(view(dopts.input_file)) {
@@ -2701,6 +3735,7 @@ fn driver_execute_build_into_ctx(
                     dopts.opt_O1,
                     true,
                     true,
+                    false,
                     ctx.main_fid.v,
                     mut_view(mod_obj)
                 );
@@ -2749,6 +3784,7 @@ fn driver_execute_build_into_ctx(
                             dopts.opt_O1,
                             true,
                             true,
+                            false,
                             filter_v,
                             mut_view(mod_obj)
                         );
@@ -2833,11 +3869,14 @@ fn driver_execute_build_into_ctx(
         let mut obj = objmodel_new();
         let mut ok_obj: bool = true;
         if has_ax_sources {
-            ok_obj = driver_emit_objmodel(
+            ok_obj = driver_emit_objmodel_filtered(
                 mut_view(*ctx),
                 true,
                 dopts.opt_O1,
                 true,
+                false,
+                eff_kind == ARTIFACT_OBJ,
+                0u32,
                 mut_view(obj)
             );
         }
@@ -2886,7 +3925,7 @@ fn driver_execute_build_into_ctx(
                     0 as *mut *const u8
                 };
 
-                if has_ax_sources && extra_input_count == 0 && dopts.lib_dir_count == 0 && dopts.lib_name_count == 0 && attr_lib_count == 0 {
+                if eff_kind == ARTIFACT_EXE && has_ax_sources && extra_input_count == 0 && dopts.lib_dir_count == 0 && dopts.lib_name_count == 0 && attr_lib_count == 0 {
                     if !pe_link_objmodel_to_buf(view(obj), stack_res, mut_view(pe_buf), sink_ptr) {
                         rc = AX_EXIT_DIAG;
                     } else {
@@ -2963,29 +4002,71 @@ fn driver_execute_build_into_ctx(
                             li = li + 1;
                         }
 
-                        if !pe_link_obj_and_libs_to_buf(
-                            mem_obj_buf.ptr as *const u8,
-                            mem_obj_buf.len,
-                            in_ptrs as *const *const u8,
-                            in_idx,
-                            dir_ptrs as *const *const u8,
-                            dopts.lib_dir_count,
-                            lib_ptrs as *const *const u8,
-                            dopts.lib_name_count,
-                            attr_ptrs as *const *const u8,
-                            attr_lib_count,
-                            stack_res,
-                            mut_view(pe_buf),
-                            sink_ptr
-                        ) {
-                            rc = AX_EXIT_DIAG;
-                        } else {
-                            if (out_artifact as usize) != 0 {
-                                coff_buf_put_bytes(unsafe { mut_view(*out_artifact) }, pe_buf.ptr as *const u8, pe_buf.len);
+                        if eff_kind == ARTIFACT_DLL {
+                            let dll_base_sv = pipe_basename_in_arena(mut_view(ctx.backend_arena), view(out_path));
+                            let dll_name_cstr = pipe_sv_to_cstr_in_arena(mut_view(ctx.backend_arena), view(dll_base_sv));
+                            let implib_sv = if dopts.implib.len > 0 {
+                                dopts.implib
+                            } else {
+                                pipe_derive_companion_implib_path(mut_view(ctx.backend_arena), view(out_path))
+                            };
+                            let mut implib_buf = coff_buf_with_capacity(2048);
+                            if !pe_link_dll_obj_and_libs_to_buf(
+                                mem_obj_buf.ptr as *const u8,
+                                mem_obj_buf.len,
+                                in_ptrs as *const *const u8,
+                                in_idx,
+                                dir_ptrs as *const *const u8,
+                                dopts.lib_dir_count,
+                                lib_ptrs as *const *const u8,
+                                dopts.lib_name_count,
+                                attr_ptrs as *const *const u8,
+                                attr_lib_count,
+                                dll_name_cstr,
+                                stack_res,
+                                mut_view(pe_buf),
+                                mut_view(implib_buf),
+                                sink_ptr
+                            ) {
+                                rc = AX_EXIT_DIAG;
+                            } else {
+                                if (out_artifact as usize) != 0 {
+                                    coff_buf_put_bytes(unsafe { mut_view(*out_artifact) }, pe_buf.ptr as *const u8, pe_buf.len);
+                                }
+                                if write_to_disk {
+                                    if !pe_write_buf_to_path_bytes(view(pe_buf), out_path.ptr, out_path.len) {
+                                        rc = AX_EXIT_DIAG;
+                                    } else if !pe_write_buf_to_path_bytes(view(implib_buf), implib_sv.ptr, implib_sv.len) {
+                                        rc = AX_EXIT_DIAG;
+                                    }
+                                }
                             }
-                            if write_to_disk {
-                                if !pe_write_buf_to_path_bytes(view(pe_buf), out_path.ptr, out_path.len) {
-                                    rc = AX_EXIT_DIAG;
+                            coff_buf_free(mut_view(implib_buf));
+                        } else {
+                            if !pe_link_obj_and_libs_to_buf(
+                                mem_obj_buf.ptr as *const u8,
+                                mem_obj_buf.len,
+                                in_ptrs as *const *const u8,
+                                in_idx,
+                                dir_ptrs as *const *const u8,
+                                dopts.lib_dir_count,
+                                lib_ptrs as *const *const u8,
+                                dopts.lib_name_count,
+                                attr_ptrs as *const *const u8,
+                                attr_lib_count,
+                                stack_res,
+                                mut_view(pe_buf),
+                                sink_ptr
+                            ) {
+                                rc = AX_EXIT_DIAG;
+                            } else {
+                                if (out_artifact as usize) != 0 {
+                                    coff_buf_put_bytes(unsafe { mut_view(*out_artifact) }, pe_buf.ptr as *const u8, pe_buf.len);
+                                }
+                                if write_to_disk {
+                                    if !pe_write_buf_to_path_bytes(view(pe_buf), out_path.ptr, out_path.len) {
+                                        rc = AX_EXIT_DIAG;
+                                    }
                                 }
                             }
                         }

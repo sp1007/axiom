@@ -11,7 +11,25 @@ use compiler.obj.coff.CoffBuf
 use compiler.obj.coff.coff_buf_with_capacity
 use compiler.obj.coff.coff_buf_free
 use compiler.obj.coff.coff_buf_put_u8
+use compiler.obj.coff.coff_buf_put_u32
 use compiler.obj.coff.coff_buf_put_bytes
+use compiler.obj.coff.SectionId
+use compiler.obj.coff.SymbolId
+use compiler.obj.coff.ObjModel
+use compiler.obj.coff.SEC_CODE
+use compiler.obj.coff.SEC_FLAG_EXEC
+use compiler.obj.coff.SEC_FLAG_READ
+use compiler.obj.coff.SYM_GLOBAL
+use compiler.obj.coff.SYM_EXTERNAL
+use compiler.obj.coff.AX_RELOC_X86_64_PC32
+use compiler.obj.coff.objmodel_new
+use compiler.obj.coff.objmodel_free
+use compiler.obj.coff.objmodel_add_section_str
+use compiler.obj.coff.objmodel_get_section_mut
+use compiler.obj.coff.objmodel_add_symbol_str
+use compiler.obj.coff.section_append_slice
+use compiler.obj.coff.section_append_zeroes
+use compiler.obj.coff.section_add_reloc
 use compiler.obj.coff.IMAGE_SCN_CNT_CODE
 use compiler.obj.coff.IMAGE_SCN_CNT_INITIALIZED_DATA
 use compiler.obj.coff.IMAGE_SCN_MEM_EXECUTE
@@ -25,6 +43,7 @@ use compiler.obj.coff.bytes_eq
 use compiler.obj.coff.cstr_eq
 use compiler.obj.coff.coff_mul_usize
 use compiler.obj.coff.coff_mul_u32
+use compiler.obj.writer.coff_write_to_buf
 
 use compiler.link.pe.PE_IMPORT_DESCRIPTOR_SIZE
 use compiler.link.pe.pe_align_up_u32
@@ -174,6 +193,401 @@ pub fn linker_emit_runtime_stubs(ctx: mut_view<LinkerContext>) -> u32 {
     }
 
     axiom_start_offset
+}
+
+fn cstr_eq_str(s: *const u8, lit: Str) -> bool {
+    if (s as usize) == 0 {
+        return false;
+    }
+    let bytes: view<[u8]> = unsafe { *(address_of(lit) as *const view<[u8]>) };
+    let n = len(bytes);
+    let slen = cstr_len(s);
+    if slen != n {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < n {
+        if (unsafe { *(s + i) }) != bytes[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn linker_has_defined_global_str(ctx: view<LinkerContext>, name: Str) -> bool {
+    let mut tmp = pe_str_to_cstr_buf(name);
+    let g = linker_find_global(ctx, tmp.ptr as *const u8);
+    coff_buf_free(mut_view(tmp));
+    if (g as usize) == 0 {
+        return false;
+    }
+    unsafe { (*g).defined }
+}
+
+// Emits DLL runtime support stubs (`axiom_panic`, `__ax_host_print`, `__ax_host_print_int`) and
+// synthesizes `_DllMainCRTStartup(hinstDLL, fdwReason, lpvReserved) -> BOOL` in `.text`
+// (SPEC-26 AXS-WLIB-022, ADR-0001 section 5-6, SPEC-56 AXS-MOD-012).
+// Returns the `.text` section offset of `_DllMainCRTStartup`.
+pub fn linker_emit_dll_runtime_stubs(ctx: mut_view<LinkerContext>) -> u32 {
+    let text_chars = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+    let text_sec = linker_get_or_create_section_str(mut_view(*ctx), { ".text" }, text_chars);
+
+    // 1. axiom_panic (if not already provided by an input object)
+    if !linker_has_defined_global_str(view(*ctx), { "axiom_panic" }) {
+        let panic_code = AXIOM_PANIC_CODE;
+        let panic_offset = linker_append_section_slice(text_sec, view(panic_code), 16u32);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 19u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 48u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, panic_offset + 59u32, IMAGE_REL_AMD64_REL32, { "__IAT_ExitProcess" }, 0i64);
+        let panic_sym = linker_add_global_str(mut_view(*ctx), { "axiom_panic" });
+        unsafe {
+            (*panic_sym).defined = true;
+            (*panic_sym).sec = text_sec;
+            (*panic_sym).offset = panic_offset;
+        }
+    }
+
+    // 2. __ax_host_print
+    if !linker_has_defined_global_str(view(*ctx), { "__ax_host_print" }) {
+        let print_code = AXIOM_PRINT_CODE;
+        let print_offset = linker_append_section_slice(text_sec, view(print_code), 16u32);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, print_offset + 17u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, print_offset + 49u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+        let print_sym = linker_add_global_str(mut_view(*ctx), { "__ax_host_print" });
+        unsafe {
+            (*print_sym).defined = true;
+            (*print_sym).sec = text_sec;
+            (*print_sym).offset = print_offset;
+        }
+    }
+
+    // 3. __ax_host_print_int
+    if !linker_has_defined_global_str(view(*ctx), { "__ax_host_print_int" }) {
+        let print_int_code = AXIOM_PRINT_INT_CODE;
+        let print_int_offset = linker_append_section_slice(text_sec, view(print_int_code), 16u32);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, print_int_offset + 75u32, IMAGE_REL_AMD64_REL32, { "__IAT_GetStdHandle" }, 0i64);
+        linker_add_reloc_str(mut_view(*ctx), text_sec, print_int_offset + 107u32, IMAGE_REL_AMD64_REL32, { "__IAT_WriteFile" }, 0i64);
+        let print_int_sym = linker_add_global_str(mut_view(*ctx), { "__ax_host_print_int" });
+        unsafe {
+            (*print_int_sym).defined = true;
+            (*print_int_sym).sec = text_sec;
+            (*print_int_sym).offset = print_int_offset;
+        }
+    }
+
+    // If an input object already defined `_DllMainCRTStartup`, honour it directly.
+    if linker_has_defined_global_str(view(*ctx), { "_DllMainCRTStartup" }) {
+        let mut tmp_dm = pe_str_to_cstr_buf({ "_DllMainCRTStartup" });
+        let g_dm = linker_find_global(view(*ctx), tmp_dm.ptr as *const u8);
+        coff_buf_free(mut_view(tmp_dm));
+        if (g_dm as usize) != 0 {
+            return unsafe { (*g_dm).offset };
+        }
+    }
+
+    // Inspect optional hooks defined in input objects:
+    // - `__ax_resolve_module_bindings() -> bool` (SPEC-56 AXS-MOD-012)
+    // - `__ax_dll_entry_{0,3}_{unit,bool,i32}` user `@entry` hook
+    let has_mod_bind = linker_has_defined_global_str(view(*ctx), { "__ax_resolve_module_bindings" });
+    let mut entry_kind: u32 = 0u32;
+    let mut entry_sym_str: Str = { "" };
+    if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_0_unit" }) {
+        entry_kind = 1u32;
+        entry_sym_str = { "__ax_dll_entry_0_unit" };
+    } else if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_0_bool" }) {
+        entry_kind = 2u32;
+        entry_sym_str = { "__ax_dll_entry_0_bool" };
+    } else if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_0_i32" }) {
+        entry_kind = 3u32;
+        entry_sym_str = { "__ax_dll_entry_0_i32" };
+    } else if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_3_unit" }) {
+        entry_kind = 4u32;
+        entry_sym_str = { "__ax_dll_entry_3_unit" };
+    } else if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_3_bool" }) {
+        entry_kind = 5u32;
+        entry_sym_str = { "__ax_dll_entry_3_bool" };
+    } else if linker_has_defined_global_str(view(*ctx), { "__ax_dll_entry_3_i32" }) {
+        entry_kind = 6u32;
+        entry_sym_str = { "__ax_dll_entry_3_i32" };
+    }
+
+    let mut code = coff_buf_with_capacity(128);
+    // Prologue: push rbx; push rsi; push rdi; sub rsp, 0x20 (aligns RSP to 16 bytes + 32B shadow)
+    coff_buf_put_u8(mut_view(code), 0x53u8);
+    coff_buf_put_u8(mut_view(code), 0x56u8);
+    coff_buf_put_u8(mut_view(code), 0x57u8);
+    coff_buf_put_u8(mut_view(code), 0x48u8);
+    coff_buf_put_u8(mut_view(code), 0x83u8);
+    coff_buf_put_u8(mut_view(code), 0xECu8);
+    coff_buf_put_u8(mut_view(code), 0x20u8);
+    // Save Win64 params: mov rbx, rcx; mov esi, edx; mov rdi, r8
+    coff_buf_put_u8(mut_view(code), 0x48u8);
+    coff_buf_put_u8(mut_view(code), 0x89u8);
+    coff_buf_put_u8(mut_view(code), 0xCBu8);
+    coff_buf_put_u8(mut_view(code), 0x89u8);
+    coff_buf_put_u8(mut_view(code), 0xD6u8);
+    coff_buf_put_u8(mut_view(code), 0x4Cu8);
+    coff_buf_put_u8(mut_view(code), 0x89u8);
+    coff_buf_put_u8(mut_view(code), 0xC7u8);
+
+    // cmp esi, 1 (DLL_PROCESS_ATTACH); jne non_attach
+    coff_buf_put_u8(mut_view(code), 0x83u8);
+    coff_buf_put_u8(mut_view(code), 0xFEu8);
+    coff_buf_put_u8(mut_view(code), 0x01u8);
+    coff_buf_put_u8(mut_view(code), 0x0Fu8);
+    coff_buf_put_u8(mut_view(code), 0x85u8);
+    let jne_non_attach_disp_off: usize = code.len;
+    coff_buf_put_u32(mut_view(code), 0u32);
+
+    let mut mod_bind_reloc_off: u32 = 0u32;
+    let mut has_mod_bind_jz: bool = false;
+    let mut jz_mod_bind_disp_off: usize = 0;
+    if has_mod_bind {
+        // call __ax_resolve_module_bindings
+        coff_buf_put_u8(mut_view(code), 0xE8u8);
+        mod_bind_reloc_off = code.len as u32;
+        coff_buf_put_u32(mut_view(code), 0u32);
+        // test al, al; jz ret_false
+        coff_buf_put_u8(mut_view(code), 0x84u8);
+        coff_buf_put_u8(mut_view(code), 0xC0u8);
+        coff_buf_put_u8(mut_view(code), 0x0Fu8);
+        coff_buf_put_u8(mut_view(code), 0x84u8);
+        jz_mod_bind_disp_off = code.len;
+        has_mod_bind_jz = true;
+        coff_buf_put_u32(mut_view(code), 0u32);
+    }
+
+    let mut attach_entry_reloc_off: u32 = 0u32;
+    let mut has_attach_entry_call: bool = false;
+    let mut has_attach_entry_jz: bool = false;
+    let mut jz_attach_entry_disp_off: usize = 0;
+    if entry_kind != 0u32 {
+        if entry_kind >= 4u32 {
+            // mov rcx, rbx; mov edx, esi; mov r8, rdi
+            coff_buf_put_u8(mut_view(code), 0x48u8);
+            coff_buf_put_u8(mut_view(code), 0x89u8);
+            coff_buf_put_u8(mut_view(code), 0xD9u8);
+            coff_buf_put_u8(mut_view(code), 0x89u8);
+            coff_buf_put_u8(mut_view(code), 0xF2u8);
+            coff_buf_put_u8(mut_view(code), 0x49u8);
+            coff_buf_put_u8(mut_view(code), 0x89u8);
+            coff_buf_put_u8(mut_view(code), 0xF8u8);
+        }
+        coff_buf_put_u8(mut_view(code), 0xE8u8);
+        attach_entry_reloc_off = code.len as u32;
+        has_attach_entry_call = true;
+        coff_buf_put_u32(mut_view(code), 0u32);
+        if entry_kind == 2u32 || entry_kind == 5u32 {
+            // test al, al; jz ret_false
+            coff_buf_put_u8(mut_view(code), 0x84u8);
+            coff_buf_put_u8(mut_view(code), 0xC0u8);
+            coff_buf_put_u8(mut_view(code), 0x0Fu8);
+            coff_buf_put_u8(mut_view(code), 0x84u8);
+            jz_attach_entry_disp_off = code.len;
+            has_attach_entry_jz = true;
+            coff_buf_put_u32(mut_view(code), 0u32);
+        } else if entry_kind == 3u32 || entry_kind == 6u32 {
+            // test eax, eax; jz ret_false
+            coff_buf_put_u8(mut_view(code), 0x85u8);
+            coff_buf_put_u8(mut_view(code), 0xC0u8);
+            coff_buf_put_u8(mut_view(code), 0x0Fu8);
+            coff_buf_put_u8(mut_view(code), 0x84u8);
+            jz_attach_entry_disp_off = code.len;
+            has_attach_entry_jz = true;
+            coff_buf_put_u32(mut_view(code), 0u32);
+        }
+    }
+
+    // jmp ret_true
+    coff_buf_put_u8(mut_view(code), 0xE9u8);
+    let jmp_attach_true_disp_off: usize = code.len;
+    coff_buf_put_u32(mut_view(code), 0u32);
+
+    // non_attach: (DLL_PROCESS_DETACH = 0, DLL_THREAD_ATTACH = 2, DLL_THREAD_DETACH = 3)
+    let non_attach_label: usize = code.len;
+    let mut detach_entry_reloc_off: u32 = 0u32;
+    let mut has_detach_entry_call: bool = false;
+    let mut has_detach_jmp_epilogue: bool = false;
+    let mut jmp_detach_epilogue_disp_off: usize = 0;
+    if entry_kind >= 4u32 {
+        // mov rcx, rbx; mov edx, esi; mov r8, rdi
+        coff_buf_put_u8(mut_view(code), 0x48u8);
+        coff_buf_put_u8(mut_view(code), 0x89u8);
+        coff_buf_put_u8(mut_view(code), 0xD9u8);
+        coff_buf_put_u8(mut_view(code), 0x89u8);
+        coff_buf_put_u8(mut_view(code), 0xF2u8);
+        coff_buf_put_u8(mut_view(code), 0x49u8);
+        coff_buf_put_u8(mut_view(code), 0x89u8);
+        coff_buf_put_u8(mut_view(code), 0xF8u8);
+        coff_buf_put_u8(mut_view(code), 0xE8u8);
+        detach_entry_reloc_off = code.len as u32;
+        has_detach_entry_call = true;
+        coff_buf_put_u32(mut_view(code), 0u32);
+        if entry_kind == 5u32 {
+            // movzx eax, al; jmp epilogue
+            coff_buf_put_u8(mut_view(code), 0x0Fu8);
+            coff_buf_put_u8(mut_view(code), 0xB6u8);
+            coff_buf_put_u8(mut_view(code), 0xC0u8);
+            coff_buf_put_u8(mut_view(code), 0xE9u8);
+            jmp_detach_epilogue_disp_off = code.len;
+            has_detach_jmp_epilogue = true;
+            coff_buf_put_u32(mut_view(code), 0u32);
+        } else if entry_kind == 6u32 {
+            // jmp epilogue (keep eax)
+            coff_buf_put_u8(mut_view(code), 0xE9u8);
+            jmp_detach_epilogue_disp_off = code.len;
+            has_detach_jmp_epilogue = true;
+            coff_buf_put_u32(mut_view(code), 0u32);
+        }
+    }
+
+    // ret_true: mov eax, 1; jmp +2 (over `xor eax, eax`)
+    let ret_true_label: usize = code.len;
+    coff_buf_put_u8(mut_view(code), 0xB8u8);
+    coff_buf_put_u32(mut_view(code), 1u32);
+    coff_buf_put_u8(mut_view(code), 0xEBu8);
+    coff_buf_put_u8(mut_view(code), 0x02u8);
+
+    // ret_false: xor eax, eax
+    let ret_false_label: usize = code.len;
+    coff_buf_put_u8(mut_view(code), 0x31u8);
+    coff_buf_put_u8(mut_view(code), 0xC0u8);
+
+    // epilogue: add rsp, 0x20; pop rdi; pop rsi; pop rbx; ret
+    let epilogue_label: usize = code.len;
+    coff_buf_put_u8(mut_view(code), 0x48u8);
+    coff_buf_put_u8(mut_view(code), 0x83u8);
+    coff_buf_put_u8(mut_view(code), 0xC4u8);
+    coff_buf_put_u8(mut_view(code), 0x20u8);
+    coff_buf_put_u8(mut_view(code), 0x5Fu8);
+    coff_buf_put_u8(mut_view(code), 0x5Eu8);
+    coff_buf_put_u8(mut_view(code), 0x5Bu8);
+    coff_buf_put_u8(mut_view(code), 0xC3u8);
+
+    // Patch intra-stub relative branches
+    coff_write_u32_le(code.ptr, jne_non_attach_disp_off, ((non_attach_label as i32) - ((jne_non_attach_disp_off + 4) as i32)) as u32);
+    coff_write_u32_le(code.ptr, jmp_attach_true_disp_off, ((ret_true_label as i32) - ((jmp_attach_true_disp_off + 4) as i32)) as u32);
+    if has_mod_bind_jz {
+        coff_write_u32_le(code.ptr, jz_mod_bind_disp_off, ((ret_false_label as i32) - ((jz_mod_bind_disp_off + 4) as i32)) as u32);
+    }
+    if has_attach_entry_jz {
+        coff_write_u32_le(code.ptr, jz_attach_entry_disp_off, ((ret_false_label as i32) - ((jz_attach_entry_disp_off + 4) as i32)) as u32);
+    }
+    if has_detach_jmp_epilogue {
+        coff_write_u32_le(code.ptr, jmp_detach_epilogue_disp_off, ((epilogue_label as i32) - ((jmp_detach_epilogue_disp_off + 4) as i32)) as u32);
+    }
+
+    let mut dllmain_off_out: [1]u32 = [0u32];
+    let pdllmain_off = unsafe { address_of(dllmain_off_out[0]) as *mut u32 };
+    linker_append_section_data(text_sec, code.ptr as *const u8, code.len as u32, 16u32, pdllmain_off);
+    let dllmain_offset = dllmain_off_out[0];
+    coff_buf_free(mut_view(code));
+
+    if has_mod_bind {
+        linker_add_reloc_str(mut_view(*ctx), text_sec, dllmain_offset + mod_bind_reloc_off, IMAGE_REL_AMD64_REL32, { "__ax_resolve_module_bindings" }, 0i64);
+    }
+    if has_attach_entry_call {
+        linker_add_reloc_str(mut_view(*ctx), text_sec, dllmain_offset + attach_entry_reloc_off, IMAGE_REL_AMD64_REL32, entry_sym_str, 0i64);
+    }
+    if has_detach_entry_call {
+        let detach_sym_str: Str = if entry_kind == 4u32 {
+            { "__ax_dll_entry_3_unit" }
+        } else if entry_kind == 5u32 {
+            { "__ax_dll_entry_3_bool" }
+        } else {
+            { "__ax_dll_entry_3_i32" }
+        };
+        linker_add_reloc_str(mut_view(*ctx), text_sec, dllmain_offset + detach_entry_reloc_off, IMAGE_REL_AMD64_REL32, detach_sym_str, 0i64);
+    }
+
+    let dm_sym = linker_add_global_str(mut_view(*ctx), { "_DllMainCRTStartup" });
+    unsafe {
+        (*dm_sym).defined = true;
+        (*dm_sym).sec = text_sec;
+        (*dm_sym).offset = dllmain_offset;
+    }
+
+    dllmain_offset
+}
+
+// Emits a standalone COFF relocatable object (`axiom_rt.obj`) containing `axiom_start`,
+// `axiom_panic`, `__ax_host_print`, and `__ax_host_print_int` with standard `__imp_*`
+// imports so `--emit=obj` outputs link cleanly under GNU `ld` / `gcc` (ADR-0034 section 4 OI-07b).
+pub fn pe_build_runtime_coff_obj(out: mut_view<CoffBuf>) -> bool {
+    let mut model = objmodel_new();
+    let text_id_v = objmodel_add_section_str(
+        mut_view(model),
+        { ".text" },
+        SEC_CODE,
+        SEC_FLAG_EXEC | SEC_FLAG_READ,
+        16u32
+    ).v;
+    let sym_main_v = objmodel_add_symbol_str(mut_view(model), { "main" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_get_std_handle_v = objmodel_add_symbol_str(mut_view(model), { "__imp_GetStdHandle" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_get_console_mode_v = objmodel_add_symbol_str(mut_view(model), { "__imp_GetConsoleMode" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_get_console_cp_v = objmodel_add_symbol_str(mut_view(model), { "__imp_GetConsoleOutputCP" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_set_console_cp_v = objmodel_add_symbol_str(mut_view(model), { "__imp_SetConsoleOutputCP" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_write_file_v = objmodel_add_symbol_str(mut_view(model), { "__imp_WriteFile" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+    let sym_exit_process_v = objmodel_add_symbol_str(mut_view(model), { "__imp_ExitProcess" }, SectionId.none(), 0u64, 0u64, SYM_EXTERNAL).v;
+
+    let sec = objmodel_get_section_mut(mut_view(model), SectionId { v: text_id_v });
+    if (sec as usize) == 0 {
+        objmodel_free(mut_view(model));
+        return false;
+    }
+
+    // 1. axiom_start (86 bytes at offset 0)
+    let start_off: u32 = 0u32;
+    let start_code = AXIOM_START_CODE;
+    section_append_slice(unsafe { mut_view(*sec) }, view(start_code));
+    let _ = objmodel_add_symbol_str(mut_view(model), { "axiom_start" }, SectionId { v: text_id_v }, start_off as u64, 86u64, SYM_GLOBAL);
+
+    let sec1 = objmodel_get_section_mut(mut_view(model), SectionId { v: text_id_v });
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 17u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_std_handle_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 31u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_console_mode_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 41u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_console_cp_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 54u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_set_console_cp_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 59u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_main_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 73u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_set_console_cp_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec1) }, start_off + 81u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_exit_process_v }, -4i64);
+    section_append_zeroes(unsafe { mut_view(*sec1) }, 10); // pad 86 -> 96
+
+    // 2. axiom_panic (64 bytes at offset 96)
+    let panic_off: u32 = 96u32;
+    let panic_code = AXIOM_PANIC_CODE;
+    section_append_slice(unsafe { mut_view(*sec1) }, view(panic_code));
+    let _ = objmodel_add_symbol_str(mut_view(model), { "axiom_panic" }, SectionId { v: text_id_v }, panic_off as u64, 64u64, SYM_GLOBAL);
+
+    let sec2 = objmodel_get_section_mut(mut_view(model), SectionId { v: text_id_v });
+    section_add_reloc(unsafe { mut_view(*sec2) }, panic_off + 19u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_std_handle_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec2) }, panic_off + 48u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_write_file_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec2) }, panic_off + 59u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_exit_process_v }, -4i64);
+
+    // 3. __ax_host_print (59 bytes at offset 160)
+    let print_off: u32 = 160u32;
+    let print_code = AXIOM_PRINT_CODE;
+    section_append_slice(unsafe { mut_view(*sec2) }, view(print_code));
+    let _ = objmodel_add_symbol_str(mut_view(model), { "__ax_host_print" }, SectionId { v: text_id_v }, print_off as u64, 59u64, SYM_GLOBAL);
+
+    let sec3 = objmodel_get_section_mut(mut_view(model), SectionId { v: text_id_v });
+    section_add_reloc(unsafe { mut_view(*sec3) }, print_off + 17u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_std_handle_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec3) }, print_off + 49u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_write_file_v }, -4i64);
+    section_append_zeroes(unsafe { mut_view(*sec3) }, 5); // pad 219 -> 224
+
+    // 4. __ax_host_print_int (119 bytes at offset 224)
+    let print_int_off: u32 = 224u32;
+    let print_int_code = AXIOM_PRINT_INT_CODE;
+    section_append_slice(unsafe { mut_view(*sec3) }, view(print_int_code));
+    let _ = objmodel_add_symbol_str(mut_view(model), { "__ax_host_print_int" }, SectionId { v: text_id_v }, print_int_off as u64, 119u64, SYM_GLOBAL);
+
+    let sec4 = objmodel_get_section_mut(mut_view(model), SectionId { v: text_id_v });
+    section_add_reloc(unsafe { mut_view(*sec4) }, print_int_off + 75u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_get_std_handle_v }, -4i64);
+    section_add_reloc(unsafe { mut_view(*sec4) }, print_int_off + 107u32, AX_RELOC_X86_64_PC32, SymbolId { v: sym_write_file_v }, -4i64);
+
+    let ok = coff_write_to_buf(view(model), out);
+    objmodel_free(mut_view(model));
+    ok
 }
 
 // --- Import Table Data Structures (ImportFunc, ImportDll, ImportTable) ---
@@ -550,6 +964,57 @@ pub fn has_imp_prefix_cstr(s: *const u8) -> bool {
     b0 == 95u8 && b1 == 95u8 && b2 == 105u8 && b3 == 109u8 && b4 == 112u8 && b5 == 95u8
 }
 
+fn is_known_kernel32_sym(s: *const u8) -> bool {
+    cstr_eq_str(s, { "CloseHandle" }) ||
+    cstr_eq_str(s, { "CreateDirectoryW" }) ||
+    cstr_eq_str(s, { "CreateFileW" }) ||
+    cstr_eq_str(s, { "DeleteFileA" }) ||
+    cstr_eq_str(s, { "DeleteFileW" }) ||
+    cstr_eq_str(s, { "ExitProcess" }) ||
+    cstr_eq_str(s, { "FindClose" }) ||
+    cstr_eq_str(s, { "FindFirstFileW" }) ||
+    cstr_eq_str(s, { "FindNextFileW" }) ||
+    cstr_eq_str(s, { "FlushFileBuffers" }) ||
+    cstr_eq_str(s, { "FreeLibrary" }) ||
+    cstr_eq_str(s, { "GetCommandLineW" }) ||
+    cstr_eq_str(s, { "GetConsoleMode" }) ||
+    cstr_eq_str(s, { "GetConsoleOutputCP" }) ||
+    cstr_eq_str(s, { "GetCurrentProcessId" }) ||
+    cstr_eq_str(s, { "GetEnvironmentVariableW" }) ||
+    cstr_eq_str(s, { "GetFileAttributesExW" }) ||
+    cstr_eq_str(s, { "GetFileSizeEx" }) ||
+    cstr_eq_str(s, { "GetLastError" }) ||
+    cstr_eq_str(s, { "GetModuleFileNameW" }) ||
+    cstr_eq_str(s, { "GetProcAddress" }) ||
+    cstr_eq_str(s, { "GetProcessHeap" }) ||
+    cstr_eq_str(s, { "GetStdHandle" }) ||
+    cstr_eq_str(s, { "GetSystemTime" }) ||
+    cstr_eq_str(s, { "GetTickCount64" }) ||
+    cstr_eq_str(s, { "HeapAlloc" }) ||
+    cstr_eq_str(s, { "HeapFree" }) ||
+    cstr_eq_str(s, { "HeapReAlloc" }) ||
+    cstr_eq_str(s, { "LoadLibraryA" }) ||
+    cstr_eq_str(s, { "LoadLibraryW" }) ||
+    cstr_eq_str(s, { "LocalFree" }) ||
+    cstr_eq_str(s, { "QueryPerformanceCounter" }) ||
+    cstr_eq_str(s, { "QueryPerformanceFrequency" }) ||
+    cstr_eq_str(s, { "ReadFile" }) ||
+    cstr_eq_str(s, { "RemoveDirectoryW" }) ||
+    cstr_eq_str(s, { "SetConsoleOutputCP" }) ||
+    cstr_eq_str(s, { "SetEnvironmentVariableW" }) ||
+    cstr_eq_str(s, { "SetFilePointer" }) ||
+    cstr_eq_str(s, { "SetFilePointerEx" }) ||
+    cstr_eq_str(s, { "Sleep" }) ||
+    cstr_eq_str(s, { "VirtualAlloc" }) ||
+    cstr_eq_str(s, { "VirtualFree" }) ||
+    cstr_eq_str(s, { "WriteConsoleW" }) ||
+    cstr_eq_str(s, { "WriteFile" })
+}
+
+fn is_known_shell32_sym(s: *const u8) -> bool {
+    cstr_eq_str(s, { "CommandLineToArgvW" })
+}
+
 // 2. Discovers DLL imports (`DLL$func`, `__IAT_func`, or `__imp_DLL$func`) from unresolved relocations.
 pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<LinkerContext>) {
     let num_relocs = ctx.num_relocs;
@@ -584,6 +1049,16 @@ pub fn import_discover_from_relocs(tbl: mut_view<ImportTable>, ctx: mut_view<Lin
                     if !import_has_func(view(*tbl), target) {
                         let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
                         let _ = import_add_func(mut_view(*ctx), dll, target, 0 as *const u8);
+                    }
+                } else if starts_imp {
+                    if !import_has_func(view(*tbl), target) {
+                        if is_known_kernel32_sym(target) {
+                            let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "KERNEL32.dll" });
+                            let _ = import_add_func_ex(mut_view(*ctx), dll, target, 0 as *const u8, 0u16, false);
+                        } else if is_known_shell32_sym(target) {
+                            let dll = import_find_or_add_dll_str(mut_view(*tbl), mut_view(*ctx), { "SHELL32.dll" });
+                            let _ = import_add_func_ex(mut_view(*ctx), dll, target, 0 as *const u8, 0u16, false);
+                        }
                     }
                 }
             }
