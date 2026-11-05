@@ -13,6 +13,7 @@ use compiler.kernel.interner.interner_get
 use compiler.kernel.interner.interner_intern_bytes
 use compiler.source.span.Span
 use compiler.diag.code.AX_NAME_NOT_YET_SUPPORTED
+use compiler.diag.code.AX_NAME_UNRESOLVED
 use compiler.diag.code.DiagCode
 use compiler.diag.code.diag_code_severity
 use compiler.diag.emitter.DiagDataEntry
@@ -254,6 +255,41 @@ const LOWER_NOT_SUPPORTED_MSG: [60]u8 = [
 
 struct LowerCtx {
     fake_sym_counter: u32,
+    interner: *const StrInterner,
+}
+
+fn suppress_unresolved_at_span(sink: mut_view<DiagSink>, sp: Span) {
+    if (sink.diags as usize) == 0 || sink.len == 0 {
+        return;
+    }
+    let dsize = size_of<Diagnostic>();
+    let mut i: usize = 0;
+    while i < sink.len {
+        let dp = ((sink.diags as usize) + ((((i as isize) * (dsize as isize))) as usize)) as *mut Diagnostic;
+        let code_v = unsafe { (*dp).code.v };
+        let pf = unsafe { (*dp).primary.file.v };
+        let ps = unsafe { (*dp).primary.start };
+        let pe = unsafe { (*dp).primary.end };
+        if code_v == AX_NAME_UNRESOLVED && pf == sp.file.v && ps == sp.start && pe == sp.end {
+            let mut j: usize = i;
+            while j + 1 < sink.len {
+                let dst_p = ((sink.diags as usize) + ((((j as isize) * (dsize as isize))) as usize)) as *mut u8;
+                let src_p = ((sink.diags as usize) + (((((j + 1) as isize) * (dsize as isize))) as usize)) as *const u8;
+                let mut b: usize = 0;
+                while b < dsize {
+                    unsafe { *(dst_p + b) = *(src_p + b); }
+                    b = b + 1;
+                }
+                j = j + 1;
+            }
+            sink.len = sink.len - 1;
+            if sink.errors > 0 {
+                sink.errors = sink.errors - 1;
+            }
+            return;
+        }
+        i = i + 1;
+    }
 }
 
 fn emit_not_supported(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>, sp: Span) {
@@ -314,6 +350,15 @@ fn lower_path_into(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<R
     let sym = get_symbol(view(*ctx), view(*rmap), last as usize);
     dst.symbol.v = sym.v;
     dst.name.v = unsafe { (*last).name.v };
+    if sym.v == 0u32 && (unsafe { (*seg).next as usize }) == 0 && (ctx.interner as usize) != 0 {
+        let sv = interner_get(unsafe { view(*ctx.interner) }, unsafe { (*seg).name });
+        let is_i128 = sv_eq_cstr4(sv, 105u8, 49u8, 50u8, 56u8);
+        let is_u128 = sv_eq_cstr4(sv, 117u8, 49u8, 50u8, 56u8);
+        if is_i128 || is_u128 {
+            dst.symbol.v = if is_i128 { 0x3FFF0128u32 } else { 0x3FFF0129u32 };
+            suppress_unresolved_at_span(mut_view(*sink), unsafe { (*seg).span });
+        }
+    }
     let _t1 = lower_generic_args(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), unsafe { (*last).generic_args });
     dst.generic_args = _t1;
 }
@@ -440,7 +485,7 @@ fn lower_type(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
         let ht = unsafe { hir_alloc_type(mut_view(*arena), HIR_TYPE_ERROR, (*cur).span) };
         if k == TYPE_ERROR {
             unsafe { (*ht).kind = HIR_TYPE_ERROR; }
-        } else if k == TYPE_PATH {
+        } else if k == TYPE_PATH || k == (TYPE_PATH | 128u8) {
             unsafe {
                 (*ht).kind = HIR_TYPE_PATH;
                 lower_path_into(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), mut_view((*ht).path), (*cur).segments);
@@ -752,7 +797,7 @@ fn lower_expr(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
                 (*he).kind = HIR_EXPR_LITERAL;
                 hir_copy_token(mut_view((*he).literal), view((*cur).literal));
             }
-        } else if k == EXPR_PATH {
+        } else if k == EXPR_PATH || k == (EXPR_PATH | 128u8) {
             unsafe {
                 (*he).kind = HIR_EXPR_PATH;
                 lower_path_into(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), mut_view((*he).path), (*cur).segments);
@@ -1287,11 +1332,13 @@ fn lower_item(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
                 (*hi).expr = _t103;
             }
         } else if k == ITEM_STATIC {
+            let sym_v = get_symbol(view(*ctx), view(*rmap), cur as usize).v;
             unsafe {
                 (*hi).kind = HIR_ITEM_STATIC;
                 (*hi).is_unsafe = (*cur).is_unsafe;
                 (*hi).is_mut = (*cur).is_mut;
                 (*hi).name.v = (*cur).name.v;
+                (*hi).symbol.v = sym_v;
                 let _t104 = lower_type(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), (*cur).ty);
                 (*hi).ty = _t104;
                 let _t105 = lower_expr(mut_view(*ctx), mut_view(*arena), view(*rmap), mut_view(*sink), (*cur).expr);
@@ -1336,9 +1383,10 @@ fn lower_item(ctx: mut_view<LowerCtx>, arena: mut_view<Arena>, rmap: view<Resolv
     head
 }
 
-pub fn lower_ast(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>) -> HirFile {
+fn lower_ast_with_interner(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>, interner_ptr: *const StrInterner) -> HirFile {
     let mut ctx = LowerCtx {
         fake_sym_counter: 2147483648u32,
+        interner: interner_ptr,
     };
     let items = lower_item(mut_view(ctx), mut_view(*arena), view(*rmap), mut_view(*sink), ast.items);
     if (items as usize) != 0 {
@@ -1347,7 +1395,12 @@ pub fn lower_ast(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>,
     HirFile { items: items }
 }
 
+pub fn lower_ast(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>) -> HirFile {
+    lower_ast_with_interner(arena, ast, rmap, sink, 0 as *const StrInterner)
+}
+
 @intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
 
 fn sv_eq_cstr4(sv: StrView, c0: u8, c1: u8, c2: u8, c3: u8) -> bool {
     if sv.len != 4 {
@@ -1573,7 +1626,8 @@ pub fn hir_postprocess_items(arena: mut_view<Arena>, hf: mut_view<HirFile>, inte
 }
 
 pub fn lower_file(arena: mut_view<Arena>, ast: view<Ast>, rmap: view<ResolveMap>, sink: mut_view<DiagSink>, interner: mut_view<StrInterner>) -> HirFile {
-    let mut hf = lower_ast(mut_view(*arena), ast, rmap, sink);
+    let int_ptr = unsafe { address_of(interner.bytes.head) as *const StrInterner };
+    let mut hf = lower_ast_with_interner(mut_view(*arena), ast, rmap, sink, int_ptr);
     hir_postprocess_items(arena, mut_view(hf), interner);
     HirFile { items: hf.items }
 }

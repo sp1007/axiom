@@ -11,6 +11,7 @@ priority: 187
 status: todo
 attempts: 0
 paths: [compiler/traits, compiler/mir, compiler/interp, tests/run/dyn, tests/ui/dyn]
+locks: [compiler/syntax, compiler/hir, compiler/types, compiler/verify, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-63-dyn-trait-vtables.md, tasks/0476, 0212]
 covers: [REQ-CORE-3036, REQ-CORE-3037, REQ-CORE-3038, REQ-CORE-3039, REQ-CORE-3040]
 ---

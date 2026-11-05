@@ -11,6 +11,7 @@ priority: 182
 status: todo
 attempts: 0
 paths: [compiler/syntax, compiler/hir, compiler/own, tests/ui/generators]
+locks: [compiler/lex, compiler/resolve, compiler/types, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-62-generators.md, tasks/0512, tasks/0539]
 covers: [REQ-CORE-2999, REQ-CORE-3000, REQ-CORE-3001, REQ-CORE-3002, REQ-CORE-3003, REQ-CORE-3004, REQ-CORE-3005, REQ-CORE-3006, REQ-CORE-3007]
 ---

@@ -1,0 +1,244 @@
+# T451 Report — E12.1: Typeck & MIR for i128/u128, Saturating Ops & Integer Promotion Lattice
+
+## Summary
+- Activated `i128` and `u128` (`TY_I128 = 9u8`, `TY_U128 = 15u8`, `size = 16`, `align = 16`, `t_i128 = 0x3FFF0128` / `t_u128 = 0x3FFF0129` in `TypeInterner`), `SUFFIX_I128` / `SUFFIX_U128` in `compiler/lex/{token,scanner}.ax` with 128-bit literal accumulation (`token_int_hi` / `token_set_int_hi`), and `CONST_INT128` (`const_val_int_hi` / `const_val_set_int_hi`) in `compiler/types/types.ax`.
+- Implemented the pure-integer multi-width expression promotion lattice (`REQ-OWNER-007` Pattern D / `SPEC-40 §6.1..§6.4`) in `compiler/types/typeck.ax` (`join_int`, `can_widen_int_to`, `peek_arith_tree_int_type`) and `compiler/mir/builder.ax` (`mb_join_int_ty`, `mb_cast_int_if_needed`, `mb_expr_as_usize_local` for any fixed-width integer array/slice index and range bounds).
+- Activated `MirBinOp.SatAdd` (`MIR_BINOP_SAT_ADD`), `MirBinOp.SatSub` (`MIR_BINOP_SAT_SUB`), and `MirBinOp.SatMul` (`MIR_BINOP_SAT_MUL`) across `compiler/mir/{mir,mod,builder}.ax` and `compiler/verify/verifier.ax`, along with built-in integer methods (`saturating_add`/`sub`/`mul`, `wrapping_add`/`sub`/`mul`, `count_ones`, `leading_zeros`, `trailing_zeros`, `rotate_left`/`right`, `swap_bytes`, `reverse_bits`) and associated constants (`T.MIN`, `T.MAX`, `T.BITS`) on all 10 integer widths.
+- Completed Round 2 hardening across `compiler/types/{exhaust,types,typeck}.ax`, `compiler/mir/{builder,mir}.ax`, and `compiler/verify/verifier.ax` to eliminate the `..0` exhaustiveness ICE, preserve 128-bit top-level and `impl` associated `const` values across the pre-`T452` `session_comptime_check_and_eval` seam, widen `i8` shift counts before `< const 128` MIR shift-range checks, enforce checked arithmetic and shift bounds (`AX_CONST_OVERFLOW` / `AX_CONST_DIV_ZERO`) in `eval_const_expr_u128`, and reject `.mir` decimal constants `>= 2^128` in both MIR parsers.
+
+## Files changed
+- compiler/diag/code.ax
+- compiler/hir/lower.ax
+- compiler/lex/scanner.ax
+- compiler/lex/token.ax
+- compiler/mir/builder.ax
+- compiler/mir/mir.ax
+- compiler/mir/mod.ax
+- compiler/syntax/ast.ax
+- compiler/syntax/parse.ax
+- compiler/types/exhaust.ax
+- compiler/types/layout.ax
+- compiler/types/mod.ax
+- compiler/types/typeck.ax
+- compiler/types/types.ax
+- compiler/verify/verifier.ax
+- tests/conformance/vs0/lit_u64_max_plus_one.ax
+- tests/mir/int128/int128_and_sat_mir.ax
+- tests/mir/int128/int128_and_sat_mir.test
+- tests/mir/int128/int128_const_overflow_10e40.mir
+- tests/mir/int128/int128_const_overflow_10e40_check.test
+- tests/mir/int128/int128_const_overflow_10e40_emit.test
+- tests/mir/int128/int128_const_overflow_pow128.mir
+- tests/mir/int128/int128_const_overflow_pow128_check.test
+- tests/mir/int128/int128_const_overflow_pow128_emit.test
+- tests/mir/int128/int128_const_roundtrip.mir
+- tests/mir/int128/int128_const_roundtrip.test
+- tests/mir/int128/int128_const_roundtrip_check.test
+- tests/mir/int128/qa_round1_mir.ax
+- tests/mir/int128/qa_round1_mir.test
+- tests/mir/int128/qa_round2_const_check.test
+- tests/mir/int128/saturating_const_bool_neg.mir
+- tests/mir/int128/saturating_const_bool_neg.test
+- tests/mir/int128/saturating_const_int_bool_rhs_neg.mir
+- tests/mir/int128/saturating_const_int_bool_rhs_neg.test
+- tests/mir/int128/saturating_non_int_neg.mir
+- tests/mir/int128/saturating_non_int_neg.test
+- tests/mir/int128/saturating_roundtrip.mir
+- tests/mir/int128/saturating_roundtrip.test
+- tests/mir/int128/shift_i8_rhs.ax
+- tests/mir/int128/shift_i8_rhs.test
+- tests/mir/int128/shift_i8_rhs_check.test
+- tests/selfhost/abi/qa_abi_boundary_seam.ax
+- tests/selfhost/abi/qa_abi_lir_lower.ax
+- tests/selfhost/abi/qa_abi_win64_classify.ax
+- tests/selfhost/ast/qa_ast_derives.ax
+- tests/selfhost/ast/qa_ast_exprs_a.ax
+- tests/selfhost/ast/qa_ast_exprs_b.ax
+- tests/selfhost/ast/qa_ast_items.ax
+- tests/selfhost/ast/qa_ast_types_pats.ax
+- tests/selfhost/backend/qa_backend_diff_lir_a.ax
+- tests/selfhost/backend/qa_backend_diff_lir_b.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_a.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_b.ax
+- tests/selfhost/backend/qa_backend_edge.ax
+- tests/selfhost/backend/qa_backend_unit.ax
+- tests/selfhost/cap/qa_own_cap.ax
+- tests/selfhost/diag/qa_diag_codes.ax
+- tests/selfhost/diag/qa_diag_emitter.ax
+- tests/selfhost/diag/qa_diag_format_json.ax
+- tests/selfhost/driver/qa_driver_boundary_edges.ax
+- tests/selfhost/driver/qa_driver_cli_and_project.ax
+- tests/selfhost/driver/qa_driver_commands_a.ax
+- tests/selfhost/driver/qa_driver_commands_b.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_a.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_b.ax
+- tests/selfhost/drop/qa_drop_d01.ax
+- tests/selfhost/drop/qa_drop_d02.ax
+- tests/selfhost/drop/qa_drop_d03.ax
+- tests/selfhost/drop/qa_drop_d04.ax
+- tests/selfhost/drop/qa_drop_d05.ax
+- tests/selfhost/drop/qa_drop_d06.ax
+- tests/selfhost/drop/qa_drop_d07.ax
+- tests/selfhost/drop/qa_drop_d09.ax
+- tests/selfhost/drop/qa_drop_d10.ax
+- tests/selfhost/drop/qa_drop_d11.ax
+- tests/selfhost/drop/qa_drop_d12.ax
+- tests/selfhost/hir/qa_hir_corpus.ax
+- tests/selfhost/hir/qa_hir_desugar_and_drop.ax
+- tests/selfhost/interp/qa_interp_exec_a.ax
+- tests/selfhost/interp/qa_interp_exec_b.ax
+- tests/selfhost/interp/qa_interp_unit.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_unit.ax
+- tests/selfhost/isel/qa_frame_layout_and_verify.ax
+- tests/selfhost/isel/qa_isel_diff_golden.ax
+- tests/selfhost/isel/qa_isel_frame_seam_and_edge_cases.ax
+- tests/selfhost/isel/qa_isel_instructions_and_abi.ax
+- tests/selfhost/kernel_source_diag/qa_corpus_differential.ax
+- tests/selfhost/kernel_source_diag/qa_session_integration.ax
+- tests/selfhost/lex/qa_lex_differential.ax
+- tests/selfhost/lex/qa_lex_tokens.ax
+- tests/selfhost/lex/qa_lex_tokens.ax.in
+- tests/selfhost/lex/u64_max_literal.ax
+- tests/selfhost/lex/u64_max_literal.ax.in
+- tests/selfhost/lexer/qa_lexer_corpus_neg_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_b.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_b.ax.in
+- tests/selfhost/lexer/qa_lexer_corpus_pos_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_pos_b.ax
+- tests/selfhost/lexer/qa_lexer_session_integration.ax
+- tests/selfhost/link/qa_pe_headers_and_imports.ax
+- tests/selfhost/link/qa_pe_linker_diff.ax
+- tests/selfhost/link/qa_pe_local_symbols.ax
+- tests/selfhost/lir/qa_lir_from_ax_a.ax
+- tests/selfhost/lir/qa_lir_from_ax_b.ax
+- tests/selfhost/lir/qa_lir_from_ax_c.ax
+- tests/selfhost/lir/qa_lir_from_ax_d.ax
+- tests/selfhost/lir/qa_lir_from_ax_e.ax
+- tests/selfhost/lir/qa_lir_from_mir.ax
+- tests/selfhost/lir/qa_lir_seam_edge.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_a.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_b.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_c.ax
+- tests/selfhost/mir/qa_mir_text_roundtrip.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_diff.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_smoke.ax
+- tests/selfhost/opt/qa_opt_pipeline.ax
+- tests/selfhost/opt/qa_opt_unit.ax
+- tests/selfhost/own/qa_own_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_cap_ptr.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_verify_mir.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_b.ax
+- tests/selfhost/parse/qa_parse_corpus_a.ax
+- tests/selfhost/parse/qa_parse_corpus_b.ax
+- tests/selfhost/parse/qa_parse_corpus_c.ax
+- tests/selfhost/parse/qa_parse_corpus_d.ax
+- tests/selfhost/parse/qa_parse_corpus_e.ax
+- tests/selfhost/parse/qa_parse_corpus_f.ax
+- tests/selfhost/parse/qa_parse_corpus_g.ax
+- tests/selfhost/parse/qa_parse_corpus_h.ax
+- tests/selfhost/parse/qa_parse_corpus_i.ax
+- tests/selfhost/parse/qa_parse_corpus_j.ax
+- tests/selfhost/parse/qa_parse_heavy_a.ax
+- tests/selfhost/parse/qa_parse_heavy_b.ax
+- tests/selfhost/parse/qa_parse_qa_edge.ax
+- tests/selfhost/parse/qa_parse_qa_tuple_struct.ax
+- tests/selfhost/parse/qa_parse_recovery_a.ax
+- tests/selfhost/parse/qa_parse_recovery_b.ax
+- tests/selfhost/parse/qa_parse_terminator_a.ax
+- tests/selfhost/parse/qa_parse_terminator_b.ax
+- tests/selfhost/parse/qa_parse_terminator_heavy.ax
+- tests/selfhost/parser/qa_parser_diff_corpus_wide.ax
+- tests/selfhost/parser/qa_parser_diff_neg_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_b.ax
+- tests/selfhost/parser/qa_parser_session_integration.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_a.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_b.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_c.ax
+- tests/selfhost/resolve/qa_resolve_corpus_pos.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_d.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_b.ax
+- tests/selfhost/traits/qa_traits_solver_mono.ax
+- tests/selfhost/typeck/qa_typeck_a.ax
+- tests/selfhost/typeck/qa_typeck_b.ax
+- tests/selfhost/typeck/qa_typeck_c.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_a.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_b.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_c.ax
+- tests/selfhost/types/qa_types_exhaust.ax
+- tests/selfhost/types/qa_types_layout.ax
+- tests/selfhost/verify/qa_verify_mir.ax
+- tests/selfhost/verify/qa_verify_pipeline.ax
+- tests/typeck/int128/int128_lex_overflow_neg.ax
+- tests/typeck/int128/int128_literals_and_methods.ax
+- tests/typeck/int128/int128_literals_and_methods.test
+- tests/typeck/int128/int_promotion_neg.ax
+- tests/typeck/int128/int_promotion_pos.ax
+- tests/typeck/int128/int_promotion_pos.test
+- tests/typeck/int128/qa_round1_pos.ax
+- tests/typeck/int128/qa_round1_pos.test
+- tests/ui/int128/const_overflow_neg.ax
+- tests/ui/int128/qa_round1_lex_neg.ax
+- tests/ui/int128/qa_round1_neg.ax
+- tests/ui/lex/E16_overflow.ax
+
+## Verification
+- **Stage-3 Bootstrap Fixed-Point (`build-snap-T451`)**:
+  - `python tools/build_axiomc.py --root build-snap-T451 --out build-snap-T451/build --stage 3` -> exit `0`:
+    - `STAGE1 OK`: `build-snap-T451/build/axiomc1.exe` (`19860480` bytes, `sha256=03a2ed6623553b59`)
+    - `STAGE2 (O1) OK`: `build-snap-T451/build/dir_stage2_O1/axiomc2.exe` (`6142976` bytes, `sha256=3d2e5f3db21faa8f70435d646a79a1dd02415b37ee57c41acc733a949620acb6`)
+    - `STAGE3 (O1) OK`: `build-snap-T451/build/dir_stage3_O1/axiomc3.exe` (`6142976` bytes, `sha256=3d2e5f3db21faa8f70435d646a79a1dd02415b37ee57c41acc733a949620acb6`)
+    - `FIXED-POINT (O1) OK`: `sha256(axiomc2_O1) == sha256(axiomc3_O1) == 3d2e5f3db21faa8f70435d646a79a1dd02415b37ee57c41acc733a949620acb6` (`build-snap-T451/build/axiomc2.exe` promoted).
+- **Targeted `T451`, Conformance, Comptime/Array/Pattern UI & All 34 Selfhost Bundle Checks (`-j 1` inside `build-snap-T451`)**:
+  - `python build-snap-T451/tools/axtest.py --root build-snap-T451 --compiler build-snap-T451/build/axiomc2.exe --exclude-requires axiom0-internal -j 1 typeck/int128 mir/int128 ui/int128 ui/lex conformance/vs0 ui/comptime ui/array ui/pattern bundles_current.test` -> `WEAK-NATIVE 0`, `TOTAL 312 PASS 312 FAIL 0 SKIP 0 XFAIL 0` (all `34/34` `bundles_current.test` PASS).
+- **Typeck, MIR, Verifier, Intrinsics & Selfhost Regression Suites (`-j 1` inside `build-snap-T451`)**:
+  - `python build-snap-T451/tools/axtest.py --root build-snap-T451 --compiler build-snap-T451/build/axiomc2.exe --exclude-requires axiom0-internal -j 1 typeck/ mir/ verify/ run/intrinsics/` -> `WEAK-NATIVE 0`, `TOTAL 161 PASS 160 FAIL 0 SKIP 1 XFAIL 0`.
+  - `python build-snap-T451/tools/axtest.py --root build-snap-T451 --compiler build-snap-T451/build/axiomc2.exe --exclude-requires axiom0-internal -j 1 selfhost/types/ selfhost/lex/` -> `WEAK-NATIVE 0`, `TOTAL 17 PASS 17 FAIL 0 SKIP 0 XFAIL 0`.
+  - Executed all 5 Round 1 QA reproducers directly against `build-snap-T451/build/axiomc2.exe` and inspected emitted MIR bodies for `const_recv_mir()` (`const 42`, `const 99`, `const 18446744073709551615`/`18446744073709551617`, `const 18446744073709552392`, and `Packet.HI = const 1208925819614629174706183`) and `shift_i8_rhs` (`copy _2 as type#8` before `< const 128`).
+- **Workspace Sync, Architecture, Requirement Coverage, Harness & Ownership Gates**:
+  - Synced all `195` task files from `build-snap-T451/` to workspace root with LF (`\n`) line endings only (`0` SHA256 mismatches, `0` CRLF files, `0` `axiom-syntax` violations across all `28` non-generated `.ax` files).
+  - `python tools/archcheck.py` & `python build-snap-T451/tools/archcheck.py` -> `archcheck: 193 files scanned, 0 violations` (exit `0`).
+  - `python .claude/skills/axiom-tasks/scripts/reqcov.py --strict` -> `requirements: 32308`, `gaps: 0`, `COVERAGE OK` (exit `0`).
+  - `python .claude/skills/axiom-tasks/scripts/harness_check.py` -> `HARNESS OK` (exit `0`).
+  - `python .claude/skills/axiom-tasks/scripts/taskctl.py changes T451` -> exit `0`, `0 REFUSED`, `0` ignored lines in `T451-report.md`.
+
+## Round 1 QA Fixes
+- **Finding 1 (128-bit & negated `match` literal/range patterns)**: Updated `compiler/mir/builder.ax` (`mb_parse_pat_u128` + `mir_const_set_int_hi` on `HIR_PAT_LITERAL` and `HIR_PAT_RANGE`), `compiler/types/typeck.ax` (propagated `(*pat).is_negated` into `LitCheck` in `check_pat` + 128-bit `tc_match_check_exhaustiveness`), and `compiler/types/exhaust.ax` (`PatInterval128`, `get_pat_interval_128`, `match_check_exhaustiveness`).
+- **Finding 2 (`2a` & `2b` — 128-bit `.mir` parser & `SatAdd`/`SatSub`/`SatMul` verifier checks)**: Added 128-bit unsigned decimal parsing (`vp_parse_u128` in `compiler/verify/verifier.ax` and `mp_parse_u128` in `compiler/mir/mir.ax` with `mir_const_set_int_hi`), and tightened `verify_mir_check_assign_rvalue` in `compiler/verify/verifier.ax` so `SatAdd`/`SatSub`/`SatMul` reject non-`MIR_CONST_INT` constants (`const true`/`const false`) and non-integer `lhs_ty`/`rhs_ty`/`dest_ty` with `AX_VERIFY_TYPE_MISMATCH`.
+- **Finding 3 (`REQ-OWNER-007` Pattern D tree context propagation & unary `-`)**: Expanded `peek_expr_type_nonmut` and `collect_arith_tree_join` in `compiler/types/typeck.ax` to cover `HIR_EXPR_FIELD`, `HIR_EXPR_TUPLE_INDEX`, `HIR_EXPR_INDEX`, `HIR_EXPR_CALL`, `HIR_EXPR_METHOD_CALL`, `HIR_EXPR_UNARY` (`*`, `-`, `~`), and `HIR_EXPR_BLOCK`/`UNSAFE`, propagating widening target types into `UNOP_NEG`/`UNOP_BITNOT` subtrees (`check_unary_in_arith`) and casting narrow signed operands before `UNOP_NEG` in `compiler/mir/builder.ax`.
+- **Finding 4 (`AXS-INT-004` unsuffixed 128-bit integer literals)**: Updated `compiler/lex/{scanner,token}.ax` and `compiler/diag/code.ax` so unsuffixed literals in `[2^64, 2^128 - 1]` lex cleanly with `token_int_hi` and only `>= 2^128` emits `AX_LEX_INT_OVERFLOW` (`"integer literal above 2^128 - 1"`); updated `tests/ui/lex/E16_overflow.ax`, `tests/conformance/vs0/lit_u64_max_plus_one.ax`, `tests/selfhost/lex/{qa_lex_tokens,u64_max_literal}.ax.in`, and `tests/selfhost/lexer/qa_lexer_corpus_neg_b.ax.in`.
+- **Finding 5 (Selfhost bundle regeneration)**: Regenerated all affected `tests/selfhost/*` bundles across all 34 selfhost directories (`34/34` `bundles_current.test` PASS).
+- **Finding 6 (128-bit array length validation & `typeck` constant folding)**: Implemented trap-free 128-bit `eval_const_expr_u128` + `tc_norm_u128_for_kind` in `compiler/types/typeck.ax`, stored 128-bit `norm_hi` in `evaluate_const_item`, and updated `eval_array_len_expr` to reject `token_int_hi != 0`, `>= 2^64`, and negative `i128` array lengths with `AX_TYPE_ARRAY_SIZE`.
+- **Finding 7 (Built-in integer methods on `const`/`static` value receivers)**: Updated `check_expr_method_call` in `compiler/types/typeck.ax` and `ITEM_STATIC` lowering in `compiler/hir/lower.ax` so `const` and `static` receivers set `is_type_name = false`.
+- **Stage-2 Bootstrap & Minimal-`Thir` Hardening on `HEAD`**: Guarded Pass 1b `psym` insertion into `thir.symbol_types` and added `tc_sym_in_active_scope` in `compiler/types/typeck.ax` so `>30,000` user `SymbolId`s in `axiomc_bundle.ax` never overwrite `extern "system"` function symbols (`30000+`); shifted `t_i128`/`t_u128` sentinel `TypeId`s from `65128`/`65129` to `0x3FFF0128`/`0x3FFF0129` in `compiler/{hir/lower,types/types,mir/mir,verify/verifier}.ax`; and added canonical built-in `TypeId 10..16` kind normalization in `type_get` / `verify_safe_type_get` so standalone minimal-`Thir` callers (`opt_init_minimal_thir`) observe exact `TY_ISIZE..TY_STR` kinds.
+
+## Round 2 QA Fixes
+- **Finding 1 (Compiler ICE `rc=101` on signed exclusive range patterns ending at `0`, `..0`)**: Added Stage-0-safe split-32-bit `exhaust_wrapping_add_u64` / `exhaust_wrapping_sub_u64` in `compiler/types/exhaust.ax`, updated `get_pat_interval` and `get_pat_interval_128` so signed exclusive endpoints at `0` (`e.start_lo == 0u64 && e.start_hi == 0u64`) wrap `end_hi` cleanly to `0xffffffffffffffffu64` (`-1`) instead of panicking on `0u64 - 1u64`, guarded `i64.MIN` / `i128.MIN` negation, and aligned `match_check_exhaustiveness` (`is_cov = !non_empty`). Added regression coverage in `tests/typeck/int128/qa_round1_pos.ax` (`-10..0`, `-1..=1`, `i128.MIN..0i128`, `-2^64-4..-2^64`) and `tests/ui/int128/qa_round1_neg.ax` (`0..0` empty range and `-5..-1` covered subrange warnings on `i32` and `i128`).
+- **Finding 2 (`const` `i128`/`u128` & `impl` associated constants lowering to `const 0` in MIR)**: Updated `sym_constmap_insert` (`compiler/types/types.ax`) to preserve non-zero 128-bit `CONST_INT` entries (`0x3FFF0128u32` / `0x3FFF0129u32`) when pre-`T452` `session_comptime_check_and_eval` writes zeroed `(0, 0)` return buffers; added `HIR_EXPR_FIELD` associated-const lookup (`thir_get_expr_method`) in `eval_const_expr_u128` and `evaluate_const_item_in_impl` in `compiler/types/typeck.ax` (invoked on `HIR_EXPR_FIELD` and `HIR_ITEM_IMPL` bodies with resolved `r_ty`); and added `mb_expr_uses_int128` + `mb_find_precomputed_const_int` in `mir_build_expr_body` (`compiler/mir/builder.ax`) so pre-evaluated 128-bit `HIR_ITEM_CONST` bodies emit `_0 = const <lo, hi> : ty; return;` directly instead of trapping in the pre-`T452` 64-bit interpreter on shifts `>= 32`. Strengthened `tests/mir/int128/qa_round1_mir.{ax,test}` and added `tests/mir/int128/qa_round2_const_check.test` with unique top-level and `impl` constants (`42`, `99`, `-18446744073709551617`, `18446744073709552392`, and `Packet.HI = (1u128 << 80) + 7u128` = `1208925819614629174706183`).
+- **Finding 3 (MIR shift-range check on `i128`/`u128` with `i8` shift count)**: Updated `mb_build_binary_expr` (`compiler/mir/builder.ax`) so when `rty` is `TY_I8` and `bits >= 128u64`, `rhs` is widened to `t_i32` (`type#8`) via `mb_cast_int_if_needed` before comparing `< const 128`, preventing `128` from wrapping to `-128i8`. Added `tests/mir/int128/shift_i8_rhs.{ax,test}` and `tests/mir/int128/shift_i8_rhs_check.test`.
+- **Finding 4 (`eval_const_expr_u128` unchecked wrapping arithmetic & masked shifts)**: Added `tc_u128_umul_checked`, `tc_kind_is_signed`, `tc_kind_bits`, `tc_is_signed_min`, and `tc_fits_narrow_kind` in `compiler/types/typeck.ax` and enforced checked `+`, `-`, `*`, `/`, `%`, unary `-`, and `<<`/`>>` bounds across all 12 integer kinds in `eval_const_expr_u128`, emitting `AX_CONST_OVERFLOW` / `AX_CONST_DIV_ZERO` on top-level `const`, `impl` associated `const`, and array-length expressions while preserving valid `-170141183460469231731687303715884105728` (`i128.MIN`) literals. Added `tests/ui/int128/const_overflow_neg.ax`.
+- **Finding 5 (`.mir` parsers silently wrapping decimal constants `>= 2^128` + stale `type#65128`/`65129` in `int128_const_roundtrip.mir`)**: Changed `mp_u128_mul10_add` (`compiler/mir/mir.ax`) and `vp_u128_mul10_add` (`compiler/verify/verifier.ax`) (plus `mp_parse_u64` / `vp_parse_u64`) to detect overflow (`(h1 >> 32u64) != 0u64`) and set `p.failed = true` / `p.err = true` (`AX_VERIFY_MIR_SYNTAX`). Updated `tests/mir/int128/int128_const_roundtrip.{mir,test}` to `type#1073676584`/`type#1073676585` (`0`, `2^64`, `i128.MAX`, `u128.MAX`), added `int128_const_roundtrip_check.test`, and added negative `.mir` overflow tests `int128_const_overflow_pow128.{mir,_check.test,_emit.test}` (`2^128`) and `int128_const_overflow_10e40.{mir,_check.test,_emit.test}` (`10^40`).
+
+## Status
+STATUS: COMPLETE round=2

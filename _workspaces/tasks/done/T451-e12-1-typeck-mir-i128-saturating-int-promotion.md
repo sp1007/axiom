@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T450]
 priority: 141
-status: doing
+status: done
 attempts: 1
 paths: [compiler/lex, compiler/syntax, compiler/hir, compiler/types, compiler/mir, tests/typeck/int128, tests/mir/int128, tests/ui/int128, tests/selfhost/lex, tests/selfhost/lexer, tests/selfhost/parse, tests/selfhost/parser, tests/selfhost/ast, tests/selfhost/hir, tests/selfhost/resolve, tests/selfhost/resolve_hir, tests/selfhost/types, tests/selfhost/typeck, tests/selfhost/typeck_traits, tests/selfhost/traits, tests/selfhost/mir, tests/selfhost/cap, tests/selfhost/own, tests/selfhost/own_mir_verify, tests/selfhost/verify, tests/selfhost/drop, tests/selfhost/intrinsics, tests/selfhost/abi, tests/selfhost/interp, tests/selfhost/interp_opt, tests/selfhost/stage1, tests/selfhost/diag]
 locks: [compiler/verify/verifier.ax, compiler/diag/code.ax, tests/ui/lex, tests/conformance/vs0/lit_u64_max_plus_one.ax, tests/selfhost/opt, tests/selfhost/link, tests/selfhost/obj, tests/selfhost/backend, tests/selfhost/isel, tests/selfhost/lir, tests/selfhost/encode, tests/selfhost/driver, tests/selfhost/obj_link_driver, tests/selfhost/kernel_source_diag]
 spec: [spec/SPEC-40-integers.md, spec/SPEC-04-core-extensibility.md, spec/requirements/OWNER.md, tasks/0327, tasks/0334, tasks/0431]
 covers: [REQ-OWNER-007, REQ-SIMD-247, REQ-SIMD-263, REQ-SIMD-268, REQ-SIMD-318]
 started: 2026-11-03 22:52:04
-agent: T451-impl
+finished: 2026-11-05 07:13:34
 ---
 # T451 — E12.1 — Frontend, typeck & MIR lowering for i128/u128, saturating ops & integer promotion lattice
 
@@ -48,3 +48,4 @@ Activate `TypeKind.Int128` (`i128`, `u128`), `ConstValue.Int128`, and `MirBinOp.
 - 2026-11-03 09:58:12 started (attempt 1) T451-impl
 - 2026-11-03 22:51:47 requeue: restart (not charged: attempt refunded)
 - 2026-11-03 22:52:04 started (attempt 1) T451-impl
+- 2026-11-05 07:13:34 accepted by QA -> done

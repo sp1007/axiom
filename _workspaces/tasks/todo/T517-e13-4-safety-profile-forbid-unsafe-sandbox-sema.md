@@ -11,6 +11,7 @@ priority: 166
 status: todo
 attempts: 0
 paths: [compiler/driver, compiler/types, tests/ui/security_profiles]
+locks: [compiler/hir, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0342, tasks/0449, tasks/0703]
 covers: [REQ-CAP-010, REQ-CAP-123, REQ-CAP-131]
 ---

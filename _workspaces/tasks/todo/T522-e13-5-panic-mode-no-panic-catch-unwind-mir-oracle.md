@@ -11,6 +11,7 @@ priority: 171
 status: todo
 attempts: 0
 paths: [compiler/driver, compiler/types, compiler/mir, compiler/interp, std/panic, tests/ui/panic, tests/run/panic_oracle]
+locks: [compiler/hir, compiler/verify, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-54-panic-unwinding.md, 0229, tasks/0351, tasks/0700]
 covers: [REQ-FFI-041, REQ-FFI-093, REQ-ABI-096, REQ-ABI-105]
 ---
