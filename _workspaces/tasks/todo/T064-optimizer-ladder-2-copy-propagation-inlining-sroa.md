@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T215, T603, T607, T613]
+depends: [T215, T603, T607, T610, T613]
 priority: 107
 status: todo
 attempts: 0
@@ -43,3 +43,4 @@ Implement ownership- and capability-aware copy/move propagation, Scalar Replacem
 ## Log
 - 2026-10-06 02:31:24 covers += REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006 (metadata only)
 - 2026-11-03 02:41:00 refined scope, covers, and dependencies in T215 (P15 phase planning)
+- 2026-11-06 23:15:00 added T610 to depends (ADR-0037: serialize compiler/opt path overlap with T610)

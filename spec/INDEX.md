@@ -120,6 +120,7 @@ to this table at the next INDEX update.
 | ADR-0009 | Lexical decisions v0.1 | ASCII identifiers (revisit), keywords, literals, operators |
 | ADR-0010 | Grammar forms v0.1 | types, precedence, statements, items, patterns |
 | ADR-0011 | Diagnostic code taxonomy | named codes, 18 fixed areas, `_UNSUPPORTED_IN_BOOTSTRAP`, severities, ordering, streams, `INV-*` namespace, invariant `since:` |
+| ADR-0037 | `OPT_INST_DISCRIMINANT` hoisting guards & whole-aggregate `MemoryDef` clobber checks (`T610` unblock) | `SPEC-72 AXS-BCE-004` & `AXS-LOOP-011` require `OPT_INST_DISCRIMINANT` in `loops_can_hoist_inst` and `OPT_INST_AGGREGATE` / `inst.mem_def != MEM_SSA_NONE` (`proj_count == 0`) clobber queries in `bce_inst_clobbers_len_state` and `loops_region_clobbered_in_loop`; `T064` depends on `T610` |
 
 ## 4. Identifier namespaces
 
