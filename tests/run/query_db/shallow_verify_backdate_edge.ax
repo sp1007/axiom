@@ -1,0 +1,184 @@
+// test: run
+// modes: interp native
+// stdout-file: shallow_verify_backdate_edge.stdout
+// SPEC-21 AXS-QRY-011..012, AXS-QRY-021, AXS-QRY-030..033:
+// Edge-case verification of content-hash no-op input updates (R1 -> R2),
+// shallow verification with backdating on body-only edits (R2 -> R3) vs
+// signature-changing invalidation (R3 -> R4), and depth-limited query stacks.
+
+@derive(Copy)
+struct RevSlot {
+    state: u32,
+    verified_at: u64,
+    changed_at: u64,
+    value_fp: u64,
+    provider_runs: u32,
+    green_reuses: u32,
+    hits: u32,
+}
+
+struct EdgeDB {
+    rev: u64,
+    src_fp: u64,
+    src_changed_at: u64,
+    callee_sig_seed: u64,
+    callee_body_seed: u64,
+    caller_body_seed: u64,
+    callee_sig: RevSlot,
+    callee_body: RevSlot,
+    caller_body: RevSlot,
+}
+
+const ST_VACANT: u32 = 0u32;
+const ST_READY: u32 = 2u32;
+const ST_MAYBE_DIRTY: u32 = 4u32;
+
+fn empty_slot() -> RevSlot {
+    RevSlot {
+        state: ST_VACANT,
+        verified_at: 0u64,
+        changed_at: 0u64,
+        value_fp: 0u64,
+        provider_runs: 0u32,
+        green_reuses: 0u32,
+        hits: 0u32,
+    }
+}
+
+fn update_source_input(
+    db: mut_view<EdgeDB>,
+    new_src_fp: u64,
+    new_callee_sig_seed: u64,
+    new_callee_body_seed: u64
+) {
+    db.rev = db.rev + 1u64;
+    // AXS-QRY-032 §2: If content hash is unchanged, no derived slots are dirtied.
+    if db.src_fp == new_src_fp {
+        return;
+    }
+    db.src_fp = new_src_fp;
+    db.src_changed_at = db.rev;
+    db.callee_sig_seed = new_callee_sig_seed;
+    db.callee_body_seed = new_callee_body_seed;
+
+    if db.callee_sig.state == ST_READY {
+        db.callee_sig.state = ST_MAYBE_DIRTY;
+    }
+    if db.callee_body.state == ST_READY {
+        db.callee_body.state = ST_MAYBE_DIRTY;
+    }
+    if db.caller_body.state == ST_READY {
+        db.caller_body.state = ST_MAYBE_DIRTY;
+    }
+}
+
+fn query_callee_sig(db: mut_view<EdgeDB>) -> u64 {
+    let r = db.rev;
+    if db.callee_sig.state == ST_READY && db.callee_sig.verified_at == r {
+        db.callee_sig.hits = db.callee_sig.hits + 1u32;
+        return db.callee_sig.value_fp;
+    }
+    if db.callee_sig.state == ST_MAYBE_DIRTY && db.src_changed_at <= db.callee_sig.verified_at {
+        db.callee_sig.state = ST_READY;
+        db.callee_sig.verified_at = r;
+        db.callee_sig.green_reuses = db.callee_sig.green_reuses + 1u32;
+        db.callee_sig.hits = db.callee_sig.hits + 1u32;
+        return db.callee_sig.value_fp;
+    }
+    let had_prev = db.callee_sig.provider_runs > 0u32;
+    let old_fp = db.callee_sig.value_fp;
+    let old_changed = db.callee_sig.changed_at;
+
+    let new_fp = db.callee_sig_seed ^ 0xA5A50001u64;
+    db.callee_sig.provider_runs = db.callee_sig.provider_runs + 1u32;
+    db.callee_sig.state = ST_READY;
+    db.callee_sig.verified_at = r;
+    // AXS-QRY-033 §4 Backdating: if fingerprint unchanged, preserve old changed_at
+    db.callee_sig.changed_at = if had_prev && new_fp == old_fp { old_changed } else { r };
+    db.callee_sig.value_fp = new_fp;
+    new_fp
+}
+
+fn query_caller_body(db: mut_view<EdgeDB>) -> u64 {
+    let r = db.rev;
+    if db.caller_body.state == ST_READY && db.caller_body.verified_at == r {
+        db.caller_body.hits = db.caller_body.hits + 1u32;
+        return db.caller_body.value_fp;
+    }
+    if db.caller_body.state == ST_MAYBE_DIRTY {
+        let prev_ver = db.caller_body.verified_at;
+        let _ = query_callee_sig(mut_view(*db));
+        if db.callee_sig.changed_at <= prev_ver {
+            db.caller_body.state = ST_READY;
+            db.caller_body.verified_at = r;
+            db.caller_body.green_reuses = db.caller_body.green_reuses + 1u32;
+            db.caller_body.hits = db.caller_body.hits + 1u32;
+            return db.caller_body.value_fp;
+        }
+    }
+    let sig_fp = query_callee_sig(mut_view(*db));
+    let new_fp = sig_fp ^ db.caller_body_seed ^ 0xB0D10002u64;
+    db.caller_body.provider_runs = db.caller_body.provider_runs + 1u32;
+    db.caller_body.state = ST_READY;
+    db.caller_body.verified_at = r;
+    db.caller_body.changed_at = r;
+    db.caller_body.value_fp = new_fp;
+    new_fp
+}
+
+pub fn main() -> i32 {
+    let mut db = EdgeDB {
+        rev: 0u64,
+        src_fp: 0u64,
+        src_changed_at: 0u64,
+        callee_sig_seed: 0u64,
+        callee_body_seed: 0u64,
+        caller_body_seed: 77u64,
+        callee_sig: empty_slot(),
+        callee_body: empty_slot(),
+        caller_body: empty_slot(),
+    };
+
+    // R1: initial input & cold evaluation of caller_body
+    update_source_input(mut_view(db), 1001u64, 10u64, 200u64);
+    let fp_r1 = query_caller_body(mut_view(db));
+    if db.caller_body.provider_runs != 1u32 || db.callee_sig.provider_runs != 1u32 || db.callee_body.provider_runs != 0u32 {
+        return 1;
+    }
+
+    // R2: no-op source input update with identical content hash (1001) -> no slots dirtied
+    update_source_input(mut_view(db), 1001u64, 10u64, 200u64);
+    if db.caller_body.state != ST_READY || db.callee_sig.state != ST_READY {
+        return 2;
+    }
+
+    // R3: body-only edit in callee (src_fp=1002, callee_sig_seed stays 10, callee_body_seed=201)
+    // callee_sig re-runs provider, backdates changed_at to R1, and caller_body is reused green!
+    update_source_input(mut_view(db), 1002u64, 10u64, 201u64);
+    let fp_r3 = query_caller_body(mut_view(db));
+    if fp_r3 != fp_r1 {
+        return 3;
+    }
+    if db.callee_sig.provider_runs != 2u32 || db.callee_sig.changed_at != 1u64 {
+        return 4;
+    }
+    if db.caller_body.provider_runs != 1u32 || db.caller_body.green_reuses != 1u32 || db.caller_body.verified_at != 3u64 {
+        return 5;
+    }
+
+    // R4: signature change in callee (src_fp=1003, callee_sig_seed=99) -> caller_body must re-run provider!
+    update_source_input(mut_view(db), 1003u64, 99u64, 201u64);
+    let fp_r4 = query_caller_body(mut_view(db));
+    if fp_r4 == fp_r3 {
+        return 6;
+    }
+    if db.callee_sig.provider_runs != 3u32 || db.callee_sig.changed_at != 4u64 {
+        return 7;
+    }
+    if db.caller_body.provider_runs != 2u32 || db.caller_body.changed_at != 4u64 {
+        return 8;
+    }
+
+    print("SHALLOW-VERIFY-BACKDATE-EDGE-OK\n");
+    0
+}

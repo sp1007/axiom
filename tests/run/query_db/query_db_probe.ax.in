@@ -1,0 +1,568 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.query.db.CompilerDB
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.DefId
+use compiler.query.db.TypeId
+use compiler.query.db.DURABILITY_HIGH
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.DURABILITY_MEDIUM
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_KIND_TRAIT
+use compiler.query.db.ITEM_KIND_TYPE_ALIAS
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_TRAIT
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.QUERY_ITEM_SIGNATURE
+use compiler.query.db.QUERY_MIR_BODY
+use compiler.query.db.QUERY_STATE_POISONED
+use compiler.query.db.QUERY_STATE_READY
+use compiler.query.db.QUERY_TYPECK_BODY
+use compiler.query.db.SourceFileId
+use compiler.query.db.TRAIT_RESULT_IMPLEMENTED
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.UnitKey
+use compiler.query.db.query_const_eval
+use compiler.query.db.query_db_add_body_call
+use compiler.query.db.query_db_add_body_const_dep
+use compiler.query.db.query_db_add_body_layout_dep
+use compiler.query.db.query_db_add_sig_dep
+use compiler.query.db.query_db_check_module_signatures
+use compiler.query.db.query_db_emit_diagnostics
+use compiler.query.db.query_db_emit_query_graph
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_find_slot
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_get_def
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_db_register_trait_goal
+use compiler.query.db.query_db_register_type_layout
+use compiler.query.db.query_db_reset_session_diags
+use compiler.query.db.query_db_set_def_flags
+use compiler.query.db.query_db_set_def_seeds
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_set_package_graph_input
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_db_slot_at
+use compiler.query.db.query_db_snapshot
+use compiler.query.db.query_db_was_def_query_evaluated
+use compiler.query.db.query_effect_summary
+use compiler.query.db.query_item_signature
+use compiler.query.db.query_key_for_def
+use compiler.query.db.query_layout_of
+use compiler.query.db.query_mir_body
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_resolve_module
+use compiler.query.db.query_trait_solve
+use compiler.query.db.query_typeck_body
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_new
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < (a.len) {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn print_diag_buf(b: view<DiagBuffer>) {
+    if (b.len) > 0 && (b.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), b.ptr as *const u8, b.len);
+        }
+    }
+}
+
+fn test_session_isolation_and_firewall(str_arena: mut_view<Arena>) -> bool {
+    let mut db1 = query_db_empty();
+    let mut db2 = query_db_empty();
+
+    query_db_init(mut_view(db1), 101u64);
+    query_db_init(mut_view(db2), 202u64);
+
+    if db1.current_revision.raw != 0u64 || db2.current_revision.raw != 0u64 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    let pkg_core = probe_sv(mut_view(*str_arena), "core");
+    let mod_math_sv = probe_sv(mut_view(*str_arena), "math");
+    let path_math_sv = probe_sv(mut_view(*str_arena), "src/math.ax");
+    let triple_sv = probe_sv(mut_view(*str_arena), "x86_64-windows");
+    let abi_sv = probe_sv(mut_view(*str_arena), "win64");
+    let src_v1 = probe_sv(
+        mut_view(*str_arena),
+        "module math\npub fn square(x: i32) -> i32 { x * x }\npub fn compute(a: i32) -> i32 { square(a) + 1 }\npub fn fact(n: i32) -> i32 { fact(n) }\npub fn unreferenced_heavy(z: i32) -> i32 { z * z }\n"
+    );
+
+    let r1 = query_db_set_package_graph_input(mut_view(db1), PackageId { v: 1u32 }, pkg_core, 2026u32, 0u32, 0u64);
+    let r2 = query_db_set_target_config_input(mut_view(db1), UnitKey { v: 1u32 }, triple_sv, abi_sv, 0u32, 2026u32, 2u8, 8u32);
+    let r3 = query_db_set_source_file_input(mut_view(db1), SourceFileId { v: 1u32 }, path_math_sv, src_v1, DURABILITY_LOW);
+    let r4 = query_db_set_module_tree_input(mut_view(db1), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_math_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    if r1.raw != 1u64 || r2.raw != 2u64 || r3.raw != 3u64 || r4.raw != 4u64 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    // Session isolation: db2 is completely untouched at R0
+    if db2.current_revision.raw != 0u64 || db2.source_file_count != 0u32 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    let name_square = probe_sv(mut_view(*str_arena), "square");
+    let name_compute = probe_sv(mut_view(*str_arena), "compute");
+    let name_fact = probe_sv(mut_view(*str_arena), "fact");
+    let name_unref = probe_sv(mut_view(*str_arena), "unreferenced_heavy");
+
+    let def_square = DefId { v: 10u32 };
+    let def_compute = DefId { v: 11u32 };
+    let def_fact = DefId { v: 12u32 };
+    let def_unref = DefId { v: 13u32 };
+
+    let sk_square = semantic_key_new(pkg_core, mod_math_sv, ITEM_NS_VALUE, 0u32, name_square, qry_sv_empty());
+    let sk_compute = semantic_key_new(pkg_core, mod_math_sv, ITEM_NS_VALUE, 0u32, name_compute, qry_sv_empty());
+    let sk_fact = semantic_key_new(pkg_core, mod_math_sv, ITEM_NS_VALUE, 0u32, name_fact, qry_sv_empty());
+    let sk_unref = semantic_key_new(pkg_core, mod_math_sv, ITEM_NS_VALUE, 0u32, name_unref, qry_sv_empty());
+
+    query_db_register_def(mut_view(db1), def_square, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_square);
+    query_db_register_def(mut_view(db1), def_compute, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_compute);
+    query_db_register_def(mut_view(db1), def_fact, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_fact);
+    query_db_register_def(mut_view(db1), def_unref, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_unref);
+
+    // compute(a) calls square(a); fact(n) calls fact(n - 1)
+    query_db_add_body_call(mut_view(db1), def_compute, def_square);
+    query_db_add_body_call(mut_view(db1), def_fact, def_fact);
+
+    // Demand-driven query: typeck_body(math.compute)
+    let tck_compute = query_typeck_body(mut_view(db1), def_compute);
+    if tck_compute.is_error || tck_compute.callee_sig_count != 1u32 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    // AXS-QRY-004 Header/body firewall verification:
+    // item_signature(square) WAS evaluated, but typeck_body(square) and mir_body(square) were NOT!
+    if !query_db_was_def_query_evaluated(view(db1), QUERY_ITEM_SIGNATURE, def_square) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if query_db_was_def_query_evaluated(view(db1), QUERY_TYPECK_BODY, def_square) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if query_db_was_def_query_evaluated(view(db1), QUERY_MIR_BODY, def_square) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    // Unreferenced item isolation: neither item_signature(unreferenced_heavy) nor typeck_body(unreferenced_heavy) ran!
+    if query_db_was_def_query_evaluated(view(db1), QUERY_ITEM_SIGNATURE, def_unref) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if query_db_was_def_query_evaluated(view(db1), QUERY_TYPECK_BODY, def_unref) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    // Warm memo hit in same revision (AXS-QRY-012):
+    let hits_before = db1.total_memo_hits;
+    let misses_before = db1.total_memo_misses;
+    let _ = query_typeck_body(mut_view(db1), def_compute);
+    if db1.total_memo_hits != hits_before + 1u32 || db1.total_memo_misses != misses_before {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    // Signature-only module check: checks item_signature for all items without evaluating unreferenced bodies!
+    let sig_checked = query_db_check_module_signatures(mut_view(db1), ModuleId { v: 1u32 });
+    if sig_checked != 4u32 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if !query_db_was_def_query_evaluated(view(db1), QUERY_ITEM_SIGNATURE, def_unref) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if query_db_was_def_query_evaluated(view(db1), QUERY_TYPECK_BODY, def_unref) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    if query_db_was_def_query_evaluated(view(db1), QUERY_TYPECK_BODY, def_square) {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    // Legal runtime recursion (AXS-QRY-020): typeck_body(fact) queries item_signature(fact), no cycle!
+    let tck_fact = query_typeck_body(mut_view(db1), def_fact);
+    if tck_fact.is_error || db1.total_cycles_detected != 0u32 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    // Emit deterministic query graph for db1 and print it for oracle verification
+    let mut graph_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(graph_buf));
+    query_db_emit_query_graph(view(db1), mut_view(graph_buf));
+    print_diag_buf(view(graph_buf));
+    diag_buf_free(mut_view(graph_buf));
+
+    // Shallow verification & backdating firewall (AXS-QRY-033):
+    // Mutate source_file_input(1) (simulating body edit in square while keeping square's signature seed unchanged).
+    let src_v2 = probe_sv(
+        mut_view(*str_arena),
+        "module math\npub fn square(x: i32) -> i32 { (x + 0) * x }\npub fn compute(a: i32) -> i32 { square(a) + 1 }\npub fn fact(n: i32) -> i32 { fact(n) }\npub fn unreferenced_heavy(z: i32) -> i32 { z * z }\n"
+    );
+    let orig_sq_sig_seed = query_db_get_def(view(db1), def_square).sig_hash_seed;
+    let orig_comp_sig_seed = query_db_get_def(view(db1), def_compute).sig_hash_seed;
+    let r5 = query_db_set_source_file_input(mut_view(db1), SourceFileId { v: 1u32 }, path_math_sv, src_v2, DURABILITY_LOW);
+    if r5.raw != 5u64 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+    // Keep signature seeds fixed while updating square's body seed
+    query_db_set_def_seeds(mut_view(db1), def_square, orig_sq_sig_seed, 999999u64, 1i64);
+    query_db_set_def_seeds(mut_view(db1), def_compute, orig_comp_sig_seed, 111111u64, 1i64);
+
+    let comp_qkey = query_key_for_def(view(db1), QUERY_TYPECK_BODY, def_compute);
+    let comp_slot_idx = query_db_find_slot(view(db1), view(comp_qkey));
+    let runs_before = query_db_slot_at(view(db1), comp_slot_idx).provider_runs;
+    let _ = query_typeck_body(mut_view(db1), def_compute);
+    let slot_after = query_db_slot_at(view(db1), comp_slot_idx);
+    // Because item_signature(square) and item_signature(compute) backdated their changed_at to R4,
+    // typeck_body(compute) is reused green without re-running its provider!
+    if slot_after.provider_runs != runs_before || slot_after.green_reuses == 0u32 || slot_after.verified_at.raw != 5u64 {
+        query_db_free(mut_view(db1));
+        query_db_free(mut_view(db2));
+        return false;
+    }
+
+    query_db_free(mut_view(db1));
+    query_db_free(mut_view(db2));
+    true
+}
+
+fn test_allocation_order_independence_and_cycles(str_arena: mut_view<Arena>) -> bool {
+    let mut db_fwd = query_db_empty();
+    let mut db_rev = query_db_empty();
+
+    query_db_init(mut_view(db_fwd), 1u64);
+    query_db_init(mut_view(db_rev), 2u64);
+
+    let pkg_sv = probe_sv(mut_view(*str_arena), "app");
+    let mod_sv = probe_sv(mut_view(*str_arena), "cycles");
+    let path_sv = probe_sv(mut_view(*str_arena), "src/cycles.ax");
+    let src_sv = probe_sv(mut_view(*str_arena), "// cycles");
+
+    let _ = query_db_set_package_graph_input(mut_view(db_fwd), PackageId { v: 1u32 }, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_source_file_input(mut_view(db_fwd), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(db_fwd), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    let _ = query_db_set_package_graph_input(mut_view(db_rev), PackageId { v: 1u32 }, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_source_file_input(mut_view(db_rev), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(db_rev), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    let alpha_sv = probe_sv(mut_view(*str_arena), "ALPHA");
+    let beta_sv = probe_sv(mut_view(*str_arena), "BETA");
+    let down_sv = probe_sv(mut_view(*str_arena), "downstream_uses_poisoned");
+    let unrel_sv = probe_sv(mut_view(*str_arena), "unrelated_function_still_checked");
+
+    let sk_alpha = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_CONST, 0u32, alpha_sv, qry_sv_empty());
+    let sk_beta = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_CONST, 0u32, beta_sv, qry_sv_empty());
+    let sk_down = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_VALUE, 0u32, down_sv, qry_sv_empty());
+    let sk_unrel = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_VALUE, 0u32, unrel_sv, qry_sv_empty());
+
+    if semantic_key_cmp(view(sk_alpha), view(sk_beta)) >= 0i32 {
+        query_db_free(mut_view(db_fwd));
+        query_db_free(mut_view(db_rev));
+        return false;
+    }
+
+    // Register in forward order with DefId 1, 2, 3, 4 in db_fwd
+    query_db_register_def(mut_view(db_fwd), DefId { v: 1u32 }, ModuleId { v: 1u32 }, ITEM_KIND_CONST, true, 0u32, 1u32, sk_alpha);
+    query_db_register_def(mut_view(db_fwd), DefId { v: 2u32 }, ModuleId { v: 1u32 }, ITEM_KIND_CONST, true, 0u32, 1u32, sk_beta);
+    query_db_register_def(mut_view(db_fwd), DefId { v: 3u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 0u32, 1u32, sk_down);
+    query_db_register_def(mut_view(db_fwd), DefId { v: 4u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 0u32, 1u32, sk_unrel);
+    query_db_add_body_const_dep(mut_view(db_fwd), DefId { v: 1u32 }, ConstEvalKey { v: 2u32 });
+    query_db_add_body_const_dep(mut_view(db_fwd), DefId { v: 2u32 }, ConstEvalKey { v: 1u32 });
+    query_db_add_body_const_dep(mut_view(db_fwd), DefId { v: 3u32 }, ConstEvalKey { v: 1u32 });
+    query_db_set_def_flags(mut_view(db_fwd), DefId { v: 3u32 }, false, false, true);
+    query_db_set_def_flags(mut_view(db_fwd), DefId { v: 4u32 }, false, false, true);
+
+    // Register in reverse order with different DefId numbers (40, 30, 20, 10) in db_rev
+    query_db_register_def(mut_view(db_rev), DefId { v: 40u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 0u32, 1u32, sk_unrel);
+    query_db_register_def(mut_view(db_rev), DefId { v: 30u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 0u32, 1u32, sk_down);
+    query_db_register_def(mut_view(db_rev), DefId { v: 20u32 }, ModuleId { v: 1u32 }, ITEM_KIND_CONST, true, 0u32, 1u32, sk_beta);
+    query_db_register_def(mut_view(db_rev), DefId { v: 10u32 }, ModuleId { v: 1u32 }, ITEM_KIND_CONST, true, 0u32, 1u32, sk_alpha);
+    query_db_add_body_const_dep(mut_view(db_rev), DefId { v: 10u32 }, ConstEvalKey { v: 20u32 });
+    query_db_add_body_const_dep(mut_view(db_rev), DefId { v: 20u32 }, ConstEvalKey { v: 10u32 });
+    query_db_add_body_const_dep(mut_view(db_rev), DefId { v: 30u32 }, ConstEvalKey { v: 10u32 });
+    query_db_set_def_flags(mut_view(db_rev), DefId { v: 30u32 }, false, false, true);
+    query_db_set_def_flags(mut_view(db_rev), DefId { v: 40u32 }, false, false, true);
+
+    // Enter cycle from ALPHA in db_fwd, and from BETA in db_rev!
+    let ce_alpha_fwd = query_const_eval(mut_view(db_fwd), ConstEvalKey { v: 1u32 });
+    let ce_beta_rev = query_const_eval(mut_view(db_rev), ConstEvalKey { v: 20u32 });
+    if !ce_alpha_fwd.is_poisoned || !ce_beta_rev.is_poisoned {
+        query_db_free(mut_view(db_fwd));
+        query_db_free(mut_view(db_rev));
+        return false;
+    }
+
+    // Check downstream_uses_poisoned (cascade error suppressed!) and unrelated_function_still_checked (genuine error emitted!)
+    let tck_down_fwd = query_typeck_body(mut_view(db_fwd), DefId { v: 3u32 });
+    let tck_unrel_fwd = query_typeck_body(mut_view(db_fwd), DefId { v: 4u32 });
+    let tck_down_rev = query_typeck_body(mut_view(db_rev), DefId { v: 30u32 });
+    let tck_unrel_rev = query_typeck_body(mut_view(db_rev), DefId { v: 40u32 });
+
+    if !tck_down_fwd.is_error || !tck_unrel_fwd.is_error || !tck_down_rev.is_error || !tck_unrel_rev.is_error {
+        query_db_free(mut_view(db_fwd));
+        query_db_free(mut_view(db_rev));
+        return false;
+    }
+
+    // Exactly 2 diagnostics in each DB: 1 AX_CTM_CYCLE (anchored at ALPHA) + 1 AX_TYP_MISMATCH (on unrelated_function_still_checked)
+    if db_fwd.emitted_diag_count != 2u32 || db_rev.emitted_diag_count != 2u32 {
+        query_db_free(mut_view(db_fwd));
+        query_db_free(mut_view(db_rev));
+        return false;
+    }
+
+    let mut diag_fwd = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut diag_rev = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(diag_fwd));
+    diag_buf_init(mut_view(diag_rev));
+    query_db_emit_diagnostics(view(db_fwd), mut_view(diag_fwd));
+    query_db_emit_diagnostics(view(db_rev), mut_view(diag_rev));
+
+    let same_diags = diag_buf_eq(view(diag_fwd), view(diag_rev));
+    print_diag_buf(view(diag_fwd));
+
+    diag_buf_free(mut_view(diag_fwd));
+    diag_buf_free(mut_view(diag_rev));
+    query_db_free(mut_view(db_fwd));
+    query_db_free(mut_view(db_rev));
+    same_diags
+}
+
+fn test_query_graph_allocation_order_independence(str_arena: mut_view<Arena>) -> bool {
+    let mut db_a = query_db_empty();
+    let mut db_b = query_db_empty();
+
+    query_db_init(mut_view(db_a), 500u64);
+    query_db_init(mut_view(db_b), 600u64);
+
+    let pkg_sv = probe_sv(mut_view(*str_arena), "pkg");
+    let mod_sv = probe_sv(mut_view(*str_arena), "util");
+    let path_sv = probe_sv(mut_view(*str_arena), "src/util.ax");
+    let triple_sv = probe_sv(mut_view(*str_arena), "x86_64-windows");
+    let abi_sv = probe_sv(mut_view(*str_arena), "win64");
+    let src_sv = probe_sv(mut_view(*str_arena), "// util");
+
+    let _ = query_db_set_package_graph_input(mut_view(db_a), PackageId { v: 1u32 }, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_target_config_input(mut_view(db_a), UnitKey { v: 1u32 }, triple_sv, abi_sv, 0u32, 2026u32, 2u8, 8u32);
+    let _ = query_db_set_source_file_input(mut_view(db_a), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(db_a), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    let _ = query_db_set_package_graph_input(mut_view(db_b), PackageId { v: 1u32 }, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_target_config_input(mut_view(db_b), UnitKey { v: 1u32 }, triple_sv, abi_sv, 0u32, 2026u32, 2u8, 8u32);
+    let _ = query_db_set_source_file_input(mut_view(db_b), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(db_b), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    let sk_f1 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "f1_leaf"), qry_sv_empty());
+    let sk_f2 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "f2_leaf"), qry_sv_empty());
+    let sk_entry = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "f3_caller"), qry_sv_empty());
+    let sk_vec_ty = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TYPE, 0u32, probe_sv(mut_view(*str_arena), "Pair64"), qry_sv_empty());
+
+    // db_a: register in order (f1_leaf=1, f2_leaf=2, f3_caller=3, Pair64=4), add calls f1 then f2
+    query_db_register_def(mut_view(db_a), DefId { v: 1u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_f1);
+    query_db_register_def(mut_view(db_a), DefId { v: 2u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_f2);
+    query_db_register_def(mut_view(db_a), DefId { v: 3u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_entry);
+    query_db_register_def(mut_view(db_a), DefId { v: 4u32 }, ModuleId { v: 1u32 }, ITEM_KIND_STRUCT, true, 0u32, 4u32, sk_vec_ty);
+    query_db_register_type_layout(mut_view(db_a), TypeId { v: 4u32 }, DefId { v: 4u32 }, UnitKey { v: 1u32 }, 16u32, 8u32, false, sk_vec_ty);
+    query_db_add_body_call(mut_view(db_a), DefId { v: 3u32 }, DefId { v: 1u32 });
+    query_db_add_body_call(mut_view(db_a), DefId { v: 3u32 }, DefId { v: 2u32 });
+    query_db_add_body_layout_dep(mut_view(db_a), DefId { v: 3u32 }, TypeId { v: 4u32 });
+
+    // db_b: register in reverse order with different DefIds (Pair64=94, f3_caller=93, f2_leaf=92, f1_leaf=91), add calls f2 then f1
+    query_db_register_def(mut_view(db_b), DefId { v: 94u32 }, ModuleId { v: 1u32 }, ITEM_KIND_STRUCT, true, 0u32, 4u32, sk_vec_ty);
+    query_db_register_def(mut_view(db_b), DefId { v: 93u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_entry);
+    query_db_register_def(mut_view(db_b), DefId { v: 92u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_f2);
+    query_db_register_def(mut_view(db_b), DefId { v: 91u32 }, ModuleId { v: 1u32 }, ITEM_KIND_FN, true, 1u32, 1u32, sk_f1);
+    query_db_register_type_layout(mut_view(db_b), TypeId { v: 4u32 }, DefId { v: 94u32 }, UnitKey { v: 1u32 }, 16u32, 8u32, false, sk_vec_ty);
+    query_db_add_body_call(mut_view(db_b), DefId { v: 93u32 }, DefId { v: 92u32 });
+    query_db_add_body_call(mut_view(db_b), DefId { v: 93u32 }, DefId { v: 91u32 });
+    query_db_add_body_layout_dep(mut_view(db_b), DefId { v: 93u32 }, TypeId { v: 4u32 });
+
+    let eff_a = query_effect_summary(mut_view(db_a), DefId { v: 3u32 });
+    let eff_b = query_effect_summary(mut_view(db_b), DefId { v: 93u32 });
+    if eff_a.is_error || eff_b.is_error || !eff_a.is_pure || !eff_b.is_pure {
+        query_db_free(mut_view(db_a));
+        query_db_free(mut_view(db_b));
+        return false;
+    }
+
+    let mut g_a = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut g_b = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(g_a));
+    diag_buf_init(mut_view(g_b));
+    query_db_emit_query_graph(view(db_a), mut_view(g_a));
+    query_db_emit_query_graph(view(db_b), mut_view(g_b));
+
+    let graphs_identical = diag_buf_eq(view(g_a), view(g_b));
+    diag_buf_free(mut_view(g_a));
+    diag_buf_free(mut_view(g_b));
+    query_db_free(mut_view(db_a));
+    query_db_free(mut_view(db_b));
+    graphs_identical
+}
+
+fn test_depth_limit_warm_diag_replay_and_noop_input(str_arena: mut_view<Arena>) -> bool {
+    let mut db = query_db_empty();
+    query_db_init(mut_view(db), 777u64);
+    db.max_query_depth = 3u32;
+
+    let pkg_sv = probe_sv(mut_view(*str_arena), "pkg");
+    let mod_sv = probe_sv(mut_view(*str_arena), "traits");
+    let path_sv = probe_sv(mut_view(*str_arena), "src/traits.ax");
+    let src_sv = probe_sv(mut_view(*str_arena), "module traits\npub fn f(x: i32) -> i32 { x }\n");
+
+    let _ = query_db_set_package_graph_input(mut_view(db), PackageId { v: 1u32 }, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_source_file_input(mut_view(db), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(db), ModuleId { v: 1u32 }, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, mod_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+
+    let sk_tr = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TRAIT, 0u32, probe_sv(mut_view(*str_arena), "Clone"), qry_sv_empty());
+    query_db_register_def(mut_view(db), DefId { v: 1u32 }, ModuleId { v: 1u32 }, ITEM_KIND_TRAIT, true, 0u32, 1u32, sk_tr);
+
+    // Register a 4-deep chain of trait goals: G1 -> G2 -> G3 -> G4 (exceeds max_query_depth=3)
+    let sk_g1 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TRAIT, 1u32, probe_sv(mut_view(*str_arena), "Goal1"), qry_sv_empty());
+    let sk_g2 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TRAIT, 2u32, probe_sv(mut_view(*str_arena), "Goal2"), qry_sv_empty());
+    let sk_g3 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TRAIT, 3u32, probe_sv(mut_view(*str_arena), "Goal3"), qry_sv_empty());
+    let sk_g4 = semantic_key_new(pkg_sv, mod_sv, ITEM_NS_TRAIT, 4u32, probe_sv(mut_view(*str_arena), "Goal4"), qry_sv_empty());
+
+    query_db_register_trait_goal(mut_view(db), TraitGoalKey { v: 1u32 }, DefId { v: 1u32 }, TypeId { v: 1u32 }, TraitGoalKey { v: 2u32 }, sk_g1);
+    query_db_register_trait_goal(mut_view(db), TraitGoalKey { v: 2u32 }, DefId { v: 1u32 }, TypeId { v: 2u32 }, TraitGoalKey { v: 3u32 }, sk_g2);
+    query_db_register_trait_goal(mut_view(db), TraitGoalKey { v: 3u32 }, DefId { v: 1u32 }, TypeId { v: 3u32 }, TraitGoalKey { v: 4u32 }, sk_g3);
+    query_db_register_trait_goal(mut_view(db), TraitGoalKey { v: 4u32 }, DefId { v: 1u32 }, TypeId { v: 4u32 }, TraitGoalKey { v: 0u32 }, sk_g4);
+
+    let tr_res = query_trait_solve(mut_view(db), TraitGoalKey { v: 1u32 });
+    if !tr_res.is_error || db.emitted_diag_count != 1u32 {
+        query_db_free(mut_view(db));
+        return false;
+    }
+
+    // AXS-QRY-030: Reset session diagnostic sink and verify warm memo hit replays the depth-limit diagnostic!
+    query_db_reset_session_diags(mut_view(db));
+    if db.emitted_diag_count != 0u32 {
+        query_db_free(mut_view(db));
+        return false;
+    }
+    let tr_warm = query_trait_solve(mut_view(db), TraitGoalKey { v: 1u32 });
+    if !tr_warm.is_error || db.emitted_diag_count != 1u32 {
+        query_db_free(mut_view(db));
+        return false;
+    }
+
+    // AXS-QRY-032 §2: No-op source input update with identical text does not dirty derived parse_module slot
+    let pm_cold = query_parse_module(mut_view(db), ModuleId { v: 1u32 });
+    if pm_cold.has_parse_error || pm_cold.item_count == 0u32 {
+        query_db_free(mut_view(db));
+        return false;
+    }
+    let _ = query_db_set_source_file_input(mut_view(db), SourceFileId { v: 1u32 }, path_sv, src_sv, DURABILITY_LOW);
+    let snap = query_db_snapshot(view(db));
+    if !snap.is_immutable || snap.executed_query_count == 0u32 {
+        query_db_free(mut_view(db));
+        return false;
+    }
+
+    query_db_free(mut_view(db));
+    true
+}
+
+pub fn main() -> i32 {
+    let mut str_arena = arena_new();
+    let ok1 = test_session_isolation_and_firewall(mut_view(str_arena));
+    if !ok1 {
+        arena_destroy(mut_view(str_arena));
+        return 1;
+    }
+    let ok2 = test_allocation_order_independence_and_cycles(mut_view(str_arena));
+    if !ok2 {
+        arena_destroy(mut_view(str_arena));
+        return 2;
+    }
+    let ok3 = test_query_graph_allocation_order_independence(mut_view(str_arena));
+    if !ok3 {
+        arena_destroy(mut_view(str_arena));
+        return 3;
+    }
+    let ok4 = test_depth_limit_warm_diag_replay_and_noop_input(mut_view(str_arena));
+    if !ok4 {
+        arena_destroy(mut_view(str_arena));
+        return 4;
+    }
+    arena_destroy(mut_view(str_arena));
+    print("QUERY-DB-PROBE-PASS\n");
+    0
+}
