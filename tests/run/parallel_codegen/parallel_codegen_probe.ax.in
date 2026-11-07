@@ -1,0 +1,676 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use host_intrinsics.arg
+use host_intrinsics.args_count
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+
+use compiler.query.db.DefId
+use compiler.query.db.DIAG_AX_TYP_MISMATCH
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.SourceFileId
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.semantic_key_new
+
+use compiler.incremental.fingerprint.inc_add_item_call_dep
+use compiler.incremental.fingerprint.inc_add_item_const_dep
+use compiler.incremental.fingerprint.inc_add_item_layout_dep
+use compiler.incremental.fingerprint.inc_add_module_import
+use compiler.incremental.fingerprint.inc_register_item
+use compiler.incremental.fingerprint.inc_set_item_error_flag
+
+use compiler.incremental.cache.ARTIFACT_KIND_EXE
+use compiler.incremental.cache.CACHED_DIAG_ERROR
+use compiler.incremental.cache.CACHED_DIAG_WARNING
+use compiler.incremental.cache.CACHE_EVICT_NONE
+use compiler.incremental.cache.PANIC_STRATEGY_UNWIND
+use compiler.incremental.cache.SAFETY_PROFILE_STANDARD
+use compiler.incremental.cache.inc_cache_load_from_disk
+use compiler.incremental.cache.inc_cache_register_module
+use compiler.incremental.cache.inc_cache_save_to_disk
+use compiler.incremental.cache.inc_cache_set_action_config
+use compiler.incremental.cache.inc_cache_update_module_source
+
+use compiler.parallel.scheduler.PRIORITY_CRITICAL
+use compiler.parallel.scheduler.PRIORITY_INTERACTIVE
+use compiler.parallel.scheduler.PRIORITY_NORMAL
+use compiler.parallel.scheduler.SCHEDULE_MODE_BALANCED
+use compiler.parallel.scheduler.SCHEDULE_MODE_DETERMINISTIC_DEBUG
+use compiler.parallel.scheduler.SCHEDULE_MODE_INTERACTIVE
+use compiler.parallel.scheduler.SCHEDULE_MODE_THROUGHPUT
+
+use compiler.parallel.codegen.ARTIFACT_STAGE_PUBLISHED
+use compiler.parallel.codegen.ARTIFACT_STAGE_QUARANTINED
+use compiler.parallel.codegen.BARRIER_BLOCKED_BY_ERROR
+use compiler.parallel.codegen.BARRIER_PASSED
+use compiler.parallel.codegen.BOTTLENECK_CACHE_BOUND
+use compiler.parallel.codegen.DIAG_AX_DRIVER_USAGE
+use compiler.parallel.codegen.DIAG_AX_ICE_PARALLEL_VERIFY
+use compiler.parallel.codegen.FAULT_ARTIFACT_FAILURE
+use compiler.parallel.codegen.FAULT_RESOURCE_FAILURE
+use compiler.parallel.codegen.FAULT_WORKER_FAILURE
+use compiler.parallel.codegen.MEM_PRESSURE_ELEVATED
+use compiler.parallel.codegen.MEM_PRESSURE_NORMAL
+use compiler.parallel.codegen.ParallelCodegenEngine
+use compiler.parallel.codegen.parallel_codegen_attach_diag
+use compiler.parallel.codegen.parallel_codegen_clear_diags
+use compiler.parallel.codegen.parallel_codegen_emit_diagnostics
+use compiler.parallel.codegen.parallel_codegen_emit_inspect_dump
+use compiler.parallel.codegen.parallel_codegen_empty
+use compiler.parallel.codegen.parallel_codegen_execute_workspace
+use compiler.parallel.codegen.parallel_codegen_free
+use compiler.parallel.codegen.parallel_codegen_get_cgu
+use compiler.parallel.codegen.parallel_codegen_init
+use compiler.parallel.codegen.parallel_codegen_inject_cgu_fault
+use compiler.parallel.codegen.parallel_codegen_partition_cgus
+use compiler.parallel.codegen.parallel_codegen_reconfigure_jobs
+use compiler.parallel.codegen.parallel_codegen_register_external_archive
+use compiler.parallel.codegen.parallel_codegen_set_cgu_schedule_hint
+use compiler.parallel.codegen.parallel_codegen_set_max_items_per_cgu
+use compiler.parallel.codegen.parallel_codegen_set_memory_pressure
+use compiler.parallel.codegen.parallel_codegen_validate_cli_jobs
+use compiler.parallel.codegen.parallel_codegen_verify_duplicate_cgu
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn bytes_eq(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    if a_len == 0 {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if unsafe { *(a + i) } != unsafe { *(b + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    bytes_eq(a.ptr as *const u8, a.len, b.ptr as *const u8, b.len)
+}
+
+fn print_diag_buf(b: view<DiagBuffer>) {
+    if b.len > 0 && (b.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), b.ptr as *const u8, b.len);
+        }
+    }
+}
+
+fn populate_parallel_workspace(
+    eng: mut_view<ParallelCodegenEngine>,
+    str_arena: mut_view<Arena>,
+    phys_src: StrView,
+    reverse_diag_order: bool
+) {
+    let comp_dig = fingerprint128_new(0x4158494F4D43325Fu64, 0x323032365F563130u64);
+    let man_dig = fingerprint128_new(0x4D414E4946455354u64, 0x0000000000000762u64);
+    let triple = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let abi_prof = probe_sv(mut_view(*str_arena), "win64");
+
+    inc_cache_set_action_config(
+        mut_view(eng.cache),
+        comp_dig,
+        triple,
+        abi_prof,
+        0u32,
+        2u8,
+        SAFETY_PROFILE_STANDARD,
+        PANIC_STRATEGY_UNWIND,
+        ARTIFACT_KIND_EXE,
+        man_dig
+    );
+
+    let pkg = probe_sv(mut_view(*str_arena), "app_pkg");
+    let m_geom = probe_sv(mut_view(*str_arena), "geom");
+    let m_phys = probe_sv(mut_view(*str_arena), "physics");
+    let m_app = probe_sv(mut_view(*str_arena), "app");
+    let m_util = probe_sv(mut_view(*str_arena), "util");
+
+    let p_geom = probe_sv(mut_view(*str_arena), "src/geom.ax");
+    let p_phys = probe_sv(mut_view(*str_arena), "src/physics.ax");
+    let p_app = probe_sv(mut_view(*str_arena), "src/app.ax");
+    let p_util = probe_sv(mut_view(*str_arena), "src/util.ax");
+
+    let src_geom = probe_sv(
+        mut_view(*str_arena),
+        "pub struct Vec2 { pub x: i32, pub y: i32 }\npub fn dot(a: view<Vec2>, b: view<Vec2>) -> i32 { a.x * b.x + a.y * b.y }\npub fn norm_sq(v: view<Vec2>) -> i32 { dot(v, v) }\n"
+    );
+    let src_app = probe_sv(
+        mut_view(*str_arena),
+        "pub fn main() -> i32 { kinetic_scale(2) + clamp_energy(50) }\n"
+    );
+    let src_util = probe_sv(
+        mut_view(*str_arena),
+        "pub const MAX_ENERGY: i64 = 1000\npub fn clamp_energy(e: i32) -> i32 { e }\n"
+    );
+
+    let mod_geom = ModuleId { v: 1u32 };
+    let mod_phys = ModuleId { v: 2u32 };
+    let mod_app = ModuleId { v: 3u32 };
+    let mod_util = ModuleId { v: 4u32 };
+
+    inc_cache_register_module(mut_view(eng.cache), mod_geom, PackageId { v: 1u32 }, pkg, m_geom, SourceFileId { v: 1u32 }, p_geom, src_geom, 1000u64);
+    inc_cache_register_module(mut_view(eng.cache), mod_phys, PackageId { v: 1u32 }, pkg, m_phys, SourceFileId { v: 2u32 }, p_phys, phys_src, 1000u64);
+    inc_cache_register_module(mut_view(eng.cache), mod_app, PackageId { v: 1u32 }, pkg, m_app, SourceFileId { v: 3u32 }, p_app, src_app, 1000u64);
+    inc_cache_register_module(mut_view(eng.cache), mod_util, PackageId { v: 1u32 }, pkg, m_util, SourceFileId { v: 4u32 }, p_util, src_util, 1000u64);
+
+    inc_add_module_import(mut_view(eng.cache.eng), mod_phys, mod_geom);
+    inc_add_module_import(mut_view(eng.cache.eng), mod_app, mod_geom);
+    inc_add_module_import(mut_view(eng.cache.eng), mod_app, mod_phys);
+    inc_add_module_import(mut_view(eng.cache.eng), mod_app, mod_util);
+
+    let empty = qry_sv_empty();
+    let n_vec2 = probe_sv(mut_view(*str_arena), "Vec2");
+    let n_dot = probe_sv(mut_view(*str_arena), "dot");
+    let n_norm = probe_sv(mut_view(*str_arena), "norm_sq");
+    let n_kin = probe_sv(mut_view(*str_arena), "kinetic_scale");
+    let n_step = probe_sv(mut_view(*str_arena), "step_velocity");
+    let n_main = probe_sv(mut_view(*str_arena), "main");
+    let n_maxe = probe_sv(mut_view(*str_arena), "MAX_ENERGY");
+    let n_clamp = probe_sv(mut_view(*str_arena), "clamp_energy");
+
+    let d_vec2 = inc_register_item(mut_view(eng.cache.eng), DefId { v: 10u32 }, mod_geom, ITEM_KIND_STRUCT, true, false, false, 0u32, 2u32, n_vec2, empty);
+    let d_dot = inc_register_item(mut_view(eng.cache.eng), DefId { v: 11u32 }, mod_geom, ITEM_KIND_FN, true, false, false, 2u32, 1u32, n_dot, empty);
+    let d_norm = inc_register_item(mut_view(eng.cache.eng), DefId { v: 12u32 }, mod_geom, ITEM_KIND_FN, true, true, false, 1u32, 1u32, n_norm, empty);
+    let d_kin = inc_register_item(mut_view(eng.cache.eng), DefId { v: 20u32 }, mod_phys, ITEM_KIND_FN, true, false, false, 2u32, 1u32, n_kin, empty);
+    let d_step = inc_register_item(mut_view(eng.cache.eng), DefId { v: 21u32 }, mod_phys, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_step, empty);
+    let d_main = inc_register_item(mut_view(eng.cache.eng), DefId { v: 30u32 }, mod_app, ITEM_KIND_FN, true, false, false, 0u32, 1u32, n_main, empty);
+    let d_maxe = inc_register_item(mut_view(eng.cache.eng), DefId { v: 40u32 }, mod_util, ITEM_KIND_CONST, true, false, false, 0u32, 1u32, n_maxe, empty);
+    let d_clamp = inc_register_item(mut_view(eng.cache.eng), DefId { v: 41u32 }, mod_util, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_clamp, empty);
+
+    inc_add_item_layout_dep(mut_view(eng.cache.eng), d_dot, d_vec2);
+    inc_add_item_call_dep(mut_view(eng.cache.eng), d_norm, d_dot);
+    inc_add_item_call_dep(mut_view(eng.cache.eng), d_kin, d_dot);
+    inc_add_item_call_dep(mut_view(eng.cache.eng), d_kin, d_step);
+    inc_add_item_layout_dep(mut_view(eng.cache.eng), d_kin, d_vec2);
+    inc_add_item_call_dep(mut_view(eng.cache.eng), d_main, d_kin);
+    inc_add_item_call_dep(mut_view(eng.cache.eng), d_main, d_clamp);
+    inc_add_item_const_dep(mut_view(eng.cache.eng), d_clamp, d_maxe);
+
+    // Attach warnings in either forward or reverse file order so post-join `AXD-060`
+    // sorting (`FileId`, `byte_offset`, `code`, `SemanticKey`) is verified!
+    let sk_dot = semantic_key_new(pkg, m_geom, ITEM_NS_VALUE, 0u32, n_dot, empty);
+    let sk_kin = semantic_key_new(pkg, m_phys, ITEM_NS_VALUE, 0u32, n_kin, empty);
+    let sk_clamp = semantic_key_new(pkg, m_util, ITEM_NS_VALUE, 0u32, n_clamp, empty);
+
+    let msg_geom = probe_sv(mut_view(*str_arena), "unnecessary copy of Vec2 view in dot");
+    let msg_phys = probe_sv(mut_view(*str_arena), "shadowed local scalar in kinetic_scale");
+    let msg_util = probe_sv(mut_view(*str_arena), "unused bound MAX_ENERGY in clamp_energy");
+
+    if !reverse_diag_order {
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 1u32 }, 48u32, 2u32, 12u32, 2101u32, CACHED_DIAG_WARNING, mod_geom, d_dot, sk_dot, msg_geom);
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 2u32 }, 64u32, 3u32, 9u32, 2102u32, CACHED_DIAG_WARNING, mod_phys, d_kin, sk_kin, msg_phys);
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 4u32 }, 32u32, 2u32, 5u32, 2103u32, CACHED_DIAG_WARNING, mod_util, d_clamp, sk_clamp, msg_util);
+    } else {
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 4u32 }, 32u32, 2u32, 5u32, 2103u32, CACHED_DIAG_WARNING, mod_util, d_clamp, sk_clamp, msg_util);
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 2u32 }, 64u32, 3u32, 9u32, 2102u32, CACHED_DIAG_WARNING, mod_phys, d_kin, sk_kin, msg_phys);
+        parallel_codegen_attach_diag(mut_view(*eng), true, SourceFileId { v: 1u32 }, 48u32, 2u32, 12u32, 2101u32, CACHED_DIAG_WARNING, mod_geom, d_dot, sk_dot, msg_geom);
+    }
+}
+
+fn verify_engines_byte_identical(
+    a: view<ParallelCodegenEngine>,
+    b: view<ParallelCodegenEngine>
+) -> bool {
+    if a.cgu_count != b.cgu_count || a.cgu_count != 4u32 {
+        return false;
+    }
+    if a.link_barrier != BARRIER_PASSED || b.link_barrier != BARRIER_PASSED {
+        return false;
+    }
+    if a.package_barrier != BARRIER_PASSED || a.signing_barrier != BARRIER_PASSED {
+        return false;
+    }
+    if a.final_artifact_stage != ARTIFACT_STAGE_PUBLISHED || b.final_artifact_stage != ARTIFACT_STAGE_PUBLISHED {
+        return false;
+    }
+    if !fingerprint128_eq(a.combined_obj_fp, b.combined_obj_fp) ||
+        !fingerprint128_eq(a.combined_lir_mir_fp, b.combined_lir_mir_fp) ||
+        !fingerprint128_eq(a.linked_exe_fp, b.linked_exe_fp) ||
+        !fingerprint128_eq(a.merged_diag_fp, b.merged_diag_fp) {
+        return false;
+    }
+    if !bytes_eq(
+        a.linked_exe_bytes as *const u8,
+        a.linked_exe_len as usize,
+        b.linked_exe_bytes as *const u8,
+        b.linked_exe_len as usize
+    ) {
+        return false;
+    }
+
+    let mut i: u32 = 0u32;
+    while i < a.cgu_count {
+        let ca = parallel_codegen_get_cgu(a, i);
+        let cb = parallel_codegen_get_cgu(b, i);
+        if !fingerprint128_eq(ca.cgu_fp, cb.cgu_fp) ||
+            !fingerprint128_eq(ca.obj_digest, cb.obj_digest) ||
+            !fingerprint128_eq(ca.lir_mir_dump_fp, cb.lir_mir_dump_fp) ||
+            ca.lir_inst_count != cb.lir_inst_count ||
+            ca.vreg_count != cb.vreg_count ||
+            ca.stack_frame_bytes != cb.stack_frame_bytes ||
+            ca.symbol_count != cb.symbol_count ||
+            ca.reloc_count != cb.reloc_count ||
+            !ca.x64_verified ||
+            !cb.x64_verified ||
+            !bytes_eq(
+                ca.obj_bytes as *const u8,
+                ca.obj_len as usize,
+                cb.obj_bytes as *const u8,
+                cb.obj_len as usize
+            ) {
+            return false;
+        }
+        i = i + 1u32;
+    }
+    true
+}
+
+fn configure_reverse_delays(eng: mut_view<ParallelCodegenEngine>) {
+    // Queue all tasks on worker 0 with reverse delays (`50 ms` on CGU 0/1, `0 ms` on CGU 2/3)
+    // so workers 1..N steal from worker 0's deque (`total_steals > 0`) and finish out-of-order!
+    parallel_codegen_set_cgu_schedule_hint(mut_view(*eng), 0u32, 0u32, PRIORITY_NORMAL, 50u32);
+    parallel_codegen_set_cgu_schedule_hint(mut_view(*eng), 1u32, 0u32, PRIORITY_NORMAL, 40u32);
+    parallel_codegen_set_cgu_schedule_hint(mut_view(*eng), 2u32, 0u32, PRIORITY_INTERACTIVE, 10u32);
+    parallel_codegen_set_cgu_schedule_hint(mut_view(*eng), 3u32, 0u32, PRIORITY_CRITICAL, 0u32);
+}
+
+fn run_parallel_codegen_suite(
+    str_arena: mut_view<Arena>,
+    disk_cache_dir: StrView,
+    out_dump: mut_view<DiagBuffer>
+) -> i32 {
+    // 1. Verify CLI `--jobs <N>` validation (`AXS-PAR-050 §1`)
+    if parallel_codegen_validate_cli_jobs(0u32) != DIAG_AX_DRIVER_USAGE ||
+        parallel_codegen_validate_cli_jobs(1u32) != 0u32 ||
+        parallel_codegen_validate_cli_jobs(2u32) != 0u32 ||
+        parallel_codegen_validate_cli_jobs(4u32) != 0u32 ||
+        parallel_codegen_validate_cli_jobs(8u32) != 0u32 {
+        return 11;
+    }
+
+    let src_phys_r1 = probe_sv(
+        mut_view(*str_arena),
+        "fn step_velocity(v: i32) -> i32 { v + 5 }\npub fn kinetic_scale(v: view<Vec2>, mass: i32) -> i32 { dot(v, v) * step_velocity(mass) }\n"
+    );
+
+    // 2. Initialize reference `--jobs 1` engine (`eng_j1`) and multi-worker engine (`eng_par`)
+    let mut eng_j1 = parallel_codegen_empty();
+    let mut eng_par = parallel_codegen_empty();
+
+    parallel_codegen_init(mut_view(eng_j1), 762u64, 1u32, SCHEDULE_MODE_DETERMINISTIC_DEBUG);
+    parallel_codegen_init(mut_view(eng_par), 762u64, 2u32, SCHEDULE_MODE_BALANCED);
+
+    populate_parallel_workspace(mut_view(eng_j1), mut_view(*str_arena), src_phys_r1, false);
+    populate_parallel_workspace(mut_view(eng_par), mut_view(*str_arena), src_phys_r1, true);
+
+    let _ = parallel_codegen_partition_cgus(mut_view(eng_j1));
+    let _ = parallel_codegen_partition_cgus(mut_view(eng_par));
+    configure_reverse_delays(mut_view(eng_par));
+
+    // 3. Execute `--jobs 1` reference build and compare against `--jobs 2`, `--jobs 4`, and `--jobs 8`!
+    if !parallel_codegen_execute_workspace(mut_view(eng_j1), false) ||
+        eng_j1.total_steals != 0u32 {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 12;
+    }
+
+    let mut dump_j1 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(dump_j1));
+    parallel_codegen_emit_inspect_dump(view(eng_j1), mut_view(dump_j1));
+
+    // 3a. `--jobs 2` (`SCHEDULE_MODE_BALANCED`)
+    parallel_codegen_reconfigure_jobs(mut_view(eng_par), 2u32, SCHEDULE_MODE_BALANCED);
+    configure_reverse_delays(mut_view(eng_par));
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), false) ||
+        eng_par.total_steals == 0u32 ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        diag_buf_free(mut_view(dump_j1));
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 13;
+    }
+
+    // 3b. `--jobs 4` (`SCHEDULE_MODE_INTERACTIVE`)
+    parallel_codegen_reconfigure_jobs(mut_view(eng_par), 4u32, SCHEDULE_MODE_INTERACTIVE);
+    configure_reverse_delays(mut_view(eng_par));
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), false) ||
+        eng_par.total_steals == 0u32 ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        diag_buf_free(mut_view(dump_j1));
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 14;
+    }
+
+    // 3c. `--jobs 8` (`SCHEDULE_MODE_THROUGHPUT`)
+    parallel_codegen_reconfigure_jobs(mut_view(eng_par), 8u32, SCHEDULE_MODE_THROUGHPUT);
+    configure_reverse_delays(mut_view(eng_par));
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), false) ||
+        eng_par.total_steals == 0u32 ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        diag_buf_free(mut_view(dump_j1));
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 15;
+    }
+
+    let mut dump_j8 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(dump_j8));
+    parallel_codegen_emit_inspect_dump(view(eng_par), mut_view(dump_j8));
+    let same_dumps = diag_buf_eq(view(dump_j1), view(dump_j8));
+    diag_buf_free(mut_view(dump_j8));
+    diag_buf_free(mut_view(dump_j1));
+    if !same_dumps {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 16;
+    }
+
+    // 4. Persist `.axiom-cache` to disk if `--cache-dir` was provided (`AXS-PAR-022`)
+    if disk_cache_dir.len > 0 {
+        if !inc_cache_save_to_disk(mut_view(eng_par.cache), disk_cache_dir) {
+            parallel_codegen_free(mut_view(eng_par));
+            parallel_codegen_free(mut_view(eng_j1));
+            return 17;
+        }
+        let load_st = inc_cache_load_from_disk(mut_view(eng_par.cache), disk_cache_dir);
+        if load_st != CACHE_EVICT_NONE {
+            parallel_codegen_free(mut_view(eng_par));
+            parallel_codegen_free(mut_view(eng_j1));
+            return 18;
+        }
+    }
+
+    // 5. Warm no-op build on `eng_par` (`--jobs 8`): all 4 CGUs hit `.axiom-cache` (`cached_actions == 4, executed_actions == 0`)
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), true) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 19;
+    }
+    if eng_par.cached_actions != 4u32 ||
+        eng_par.executed_actions != 0u32 ||
+        eng_par.bottleneck_kind != BOTTLENECK_CACHE_BOUND ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 20;
+    }
+
+    // 6. Hybrid Incremental + Parallel Codegen (`AXS-PAR-022`):
+    //    Edit private helper `step_velocity` inside `physics` (`ModuleId = 2`):
+    //    - Under `--jobs 8` with incremental cache enabled (`eng_par`), `app`, `geom`, and `util`
+    //      (3 clean CGUs) load their `.obj` buffers from `.axiom-cache` (`cached_actions == 3`)
+    //      while dirty `physics` (1 dirty CGU) compiles on a worker (`executed_actions == 1`).
+    //    - Under `--jobs 1` clean (`allow_incremental_cache = false` on `eng_j1`), all 4 CGUs
+    //      compile from scratch (`executed_actions == 4, cached_actions == 0`).
+    //    - Both must produce 100% byte-for-byte identical `.obj` and `.exe` binaries!
+    let src_phys_r2 = probe_sv(
+        mut_view(*str_arena),
+        "fn step_velocity(v: i32) -> i32 { v + 777 }\npub fn kinetic_scale(v: view<Vec2>, mass: i32) -> i32 { dot(v, v) * step_velocity(mass) }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(eng_par.cache), ModuleId { v: 2u32 }, src_phys_r2, 2000u64);
+    let _ = inc_cache_update_module_source(mut_view(eng_j1.cache), ModuleId { v: 2u32 }, src_phys_r2, 2000u64);
+
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), true) ||
+        !parallel_codegen_execute_workspace(mut_view(eng_j1), false) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 21;
+    }
+
+    if eng_par.cached_actions != 3u32 ||
+        eng_par.executed_actions != 1u32 ||
+        eng_j1.cached_actions != 0u32 ||
+        eng_j1.executed_actions != 4u32 ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 22;
+    }
+
+    if disk_cache_dir.len > 0 {
+        if !inc_cache_save_to_disk(mut_view(eng_par.cache), disk_cache_dir) {
+            parallel_codegen_free(mut_view(eng_par));
+            parallel_codegen_free(mut_view(eng_j1));
+            return 23;
+        }
+    }
+
+    // Emit the canonical hybrid R2 inspect dump from `eng_par` (`--jobs 8`) into `out_dump`
+    parallel_codegen_emit_inspect_dump(view(eng_par), mut_view(*out_dump));
+
+    // 7. Test transient `FAULT_WORKER_FAILURE` lease retry + `FAULT_RESOURCE_FAILURE` memory pressure retry (`AXS-PAR-015 §2`):
+    //    Retrying on lease expiration or elevated memory pressure must still produce the exact same `.obj` and `.exe` bytes!
+    parallel_codegen_set_memory_pressure(mut_view(eng_par), MEM_PRESSURE_ELEVATED);
+    parallel_codegen_inject_cgu_fault(mut_view(eng_par), 1u32, true, false, false);
+    parallel_codegen_inject_cgu_fault(mut_view(eng_par), 2u32, false, true, false);
+    if !parallel_codegen_execute_workspace(mut_view(eng_par), false) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 24;
+    }
+    let cgu1_r = parallel_codegen_get_cgu(view(eng_par), 1u32);
+    let cgu2_r = parallel_codegen_get_cgu(view(eng_par), 2u32);
+    if eng_par.retried_actions != 2u32 ||
+        cgu1_r.fault_kind != FAULT_WORKER_FAILURE ||
+        cgu2_r.fault_kind != FAULT_RESOURCE_FAILURE ||
+        !verify_engines_byte_identical(view(eng_j1), view(eng_par)) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 25;
+    }
+    parallel_codegen_set_memory_pressure(mut_view(eng_par), MEM_PRESSURE_NORMAL);
+
+    // 8. Test duplicate/speculative execution verification (`AXS-PAR-010 §3`, `AXS-PAR-050 §2`):
+    let cgu0_dig = parallel_codegen_get_cgu(view(eng_par), 0u32).obj_digest;
+    if !parallel_codegen_verify_duplicate_cgu(mut_view(eng_par), 0u32, cgu0_dig) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 26;
+    }
+    let bad_fp = fingerprint128_new(0xDEAD0000u64, 0xBEEF0000u64);
+    if parallel_codegen_verify_duplicate_cgu(mut_view(eng_par), 0u32, bad_fp) ||
+        eng_par.last_ice_code != DIAG_AX_ICE_PARALLEL_VERIFY {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 27;
+    }
+
+    // 9. Verify multi-partition per-module CGU splitting (`max_items_per_cgu = 1`, `AXS-PAR-020 §2`)
+    //    and external archive CLI ordering (`AXS-PAR-024 §1`):
+    //    8 items across 4 modules -> 8 canonical CGUs (`CGU_0 .. CGU_7`), byte-identical between `--jobs 1` and `--jobs 8`!
+    parallel_codegen_set_max_items_per_cgu(mut_view(eng_j1), 1u32);
+    parallel_codegen_set_max_items_per_cgu(mut_view(eng_par), 1u32);
+    let ar_bytes: [8]u8 = [33u8, 60u8, 97u8, 114u8, 99u8, 104u8, 62u8, 10u8];
+    let ar_name = probe_sv(mut_view(*str_arena), "ext_runtime.lib");
+    let _ = parallel_codegen_register_external_archive(mut_view(eng_j1), ar_name, unsafe { address_of(ar_bytes[0]) }, 8u32);
+    let _ = parallel_codegen_register_external_archive(mut_view(eng_par), ar_name, unsafe { address_of(ar_bytes[0]) }, 8u32);
+    if !parallel_codegen_execute_workspace(mut_view(eng_j1), false) ||
+        !parallel_codegen_execute_workspace(mut_view(eng_par), false) ||
+        eng_j1.cgu_count != 8u32 ||
+        eng_par.cgu_count != 8u32 ||
+        !fingerprint128_eq(eng_j1.combined_obj_fp, eng_par.combined_obj_fp) ||
+        !fingerprint128_eq(eng_j1.linked_exe_fp, eng_par.linked_exe_fp) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 28;
+    }
+    parallel_codegen_set_max_items_per_cgu(mut_view(eng_j1), 16u32);
+    parallel_codegen_set_max_items_per_cgu(mut_view(eng_par), 16u32);
+    let _ = parallel_codegen_partition_cgus(mut_view(eng_j1));
+    let _ = parallel_codegen_partition_cgus(mut_view(eng_par));
+
+    // 10. Test `FAULT_ARTIFACT_FAILURE` checksum corruption quarantine (`AXS-PAR-015 §2`):
+    parallel_codegen_inject_cgu_fault(mut_view(eng_par), 0u32, false, false, true);
+    if parallel_codegen_execute_workspace(mut_view(eng_par), false) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 29;
+    }
+    let cgu0_q = parallel_codegen_get_cgu(view(eng_par), 0u32);
+    if eng_par.quarantined_artifacts != 1u32 ||
+        cgu0_q.fault_kind != FAULT_ARTIFACT_FAILURE ||
+        cgu0_q.artifact_stage != ARTIFACT_STAGE_QUARANTINED ||
+        eng_par.link_barrier != BARRIER_BLOCKED_BY_ERROR {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 30;
+    }
+    parallel_codegen_inject_cgu_fault(mut_view(eng_par), 0u32, false, false, false);
+
+    // 11. Test SPEC-23 `AXS-PAR-052` Negative Canonical Example:
+    //     Even when Worker `W_2` finishes `physics.kinetic_scale` (`FileId = 2`) 50 ms before Worker `W_1`
+    //     finishes `geom.dot` (`FileId = 1`), Post-Join Diagnostic Merging (`AXS-PAR-023`)
+    //     stably sorts diagnostics by `(FileId, byte_offset, code)` so `FileId = 1` errors ALWAYS
+    //     appear before `FileId = 2` errors under `--jobs 1` and `--jobs 8`!
+    parallel_codegen_clear_diags(mut_view(eng_j1));
+    parallel_codegen_clear_diags(mut_view(eng_par));
+
+    let pkg = probe_sv(mut_view(*str_arena), "app_pkg");
+    let m_geom = probe_sv(mut_view(*str_arena), "geom");
+    let m_phys = probe_sv(mut_view(*str_arena), "physics");
+    let empty = qry_sv_empty();
+    let sk_err_a = semantic_key_new(pkg, m_geom, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "dot"), empty);
+    let sk_err_b = semantic_key_new(pkg, m_phys, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "kinetic_scale"), empty);
+    let msg_err_a = probe_sv(mut_view(*str_arena), "expected i32, found bool in geom.dot");
+    let msg_err_b = probe_sv(mut_view(*str_arena), "expected bool, found i32 in physics.kinetic_scale");
+
+    inc_set_item_error_flag(mut_view(eng_j1.cache.eng), DefId { v: 11u32 }, true);
+    inc_set_item_error_flag(mut_view(eng_j1.cache.eng), DefId { v: 20u32 }, true);
+    parallel_codegen_attach_diag(mut_view(eng_j1), true, SourceFileId { v: 1u32 }, 80u32, 3u32, 16u32, DIAG_AX_TYP_MISMATCH, CACHED_DIAG_ERROR, ModuleId { v: 1u32 }, DefId { v: 11u32 }, sk_err_a, msg_err_a);
+    parallel_codegen_attach_diag(mut_view(eng_j1), true, SourceFileId { v: 2u32 }, 96u32, 4u32, 12u32, DIAG_AX_TYP_MISMATCH, CACHED_DIAG_ERROR, ModuleId { v: 2u32 }, DefId { v: 20u32 }, sk_err_b, msg_err_b);
+
+    inc_set_item_error_flag(mut_view(eng_par.cache.eng), DefId { v: 11u32 }, true);
+    inc_set_item_error_flag(mut_view(eng_par.cache.eng), DefId { v: 20u32 }, true);
+    parallel_codegen_attach_diag(mut_view(eng_par), true, SourceFileId { v: 2u32 }, 96u32, 4u32, 12u32, DIAG_AX_TYP_MISMATCH, CACHED_DIAG_ERROR, ModuleId { v: 2u32 }, DefId { v: 20u32 }, sk_err_b, msg_err_b);
+    parallel_codegen_attach_diag(mut_view(eng_par), true, SourceFileId { v: 1u32 }, 80u32, 3u32, 16u32, DIAG_AX_TYP_MISMATCH, CACHED_DIAG_ERROR, ModuleId { v: 1u32 }, DefId { v: 11u32 }, sk_err_a, msg_err_a);
+
+    parallel_codegen_set_cgu_schedule_hint(mut_view(eng_par), 1u32, 0u32, PRIORITY_NORMAL, 50u32);
+    parallel_codegen_set_cgu_schedule_hint(mut_view(eng_par), 2u32, 0u32, PRIORITY_CRITICAL, 0u32);
+
+    let ok1 = parallel_codegen_execute_workspace(mut_view(eng_j1), false);
+    let ok8 = parallel_codegen_execute_workspace(mut_view(eng_par), false);
+    if ok1 || ok8 ||
+        eng_j1.link_barrier != BARRIER_BLOCKED_BY_ERROR ||
+        eng_par.link_barrier != BARRIER_BLOCKED_BY_ERROR ||
+        !fingerprint128_eq(eng_j1.merged_diag_fp, eng_par.merged_diag_fp) {
+        parallel_codegen_free(mut_view(eng_par));
+        parallel_codegen_free(mut_view(eng_j1));
+        return 31;
+    }
+
+    let mut d_out1 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut d_out8 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(d_out1));
+    diag_buf_init(mut_view(d_out8));
+    parallel_codegen_emit_diagnostics(view(eng_j1), mut_view(d_out1));
+    parallel_codegen_emit_diagnostics(view(eng_par), mut_view(d_out8));
+    let same_neg_diags = diag_buf_eq(view(d_out1), view(d_out8));
+
+    // Append negative diagnostic stream to `out_dump`
+    parallel_codegen_emit_diagnostics(view(eng_par), mut_view(*out_dump));
+
+    diag_buf_free(mut_view(d_out1));
+    diag_buf_free(mut_view(d_out8));
+    parallel_codegen_free(mut_view(eng_par));
+    parallel_codegen_free(mut_view(eng_j1));
+
+    if !same_neg_diags {
+        return 32;
+    }
+    0
+}
+
+fn read_optional_cache_dir_arg(str_arena: mut_view<Arena>) -> StrView {
+    let argc = args_count();
+    if argc < 2 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = arena_alloc_raw(mut_view(*str_arena), 512, 1);
+    let alen = unsafe { arg(1, buf, 511) };
+    if alen <= 12i64 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let is_prefix = unsafe {
+        (*buf) == 45u8 &&
+        (*(buf + 1)) == 45u8 &&
+        (*(buf + 2)) == 99u8 &&
+        (*(buf + 3)) == 97u8 &&
+        (*(buf + 4)) == 99u8 &&
+        (*(buf + 5)) == 104u8 &&
+        (*(buf + 6)) == 101u8 &&
+        (*(buf + 7)) == 45u8 &&
+        (*(buf + 8)) == 100u8 &&
+        (*(buf + 9)) == 105u8 &&
+        (*(buf + 10)) == 114u8 &&
+        (*(buf + 11)) == 61u8
+    };
+    if !is_prefix {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    unsafe { *(buf + (alen as usize)) = 0u8; }
+    StrView { ptr: unsafe { (buf + 12) as *const u8 }, len: (alen as usize) - 12 }
+}
+
+pub fn main() -> i32 {
+    let mut str_arena = arena_new();
+    let disk_dir = read_optional_cache_dir_arg(mut_view(str_arena));
+
+    let mut out = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out));
+
+    let rc = run_parallel_codegen_suite(mut_view(str_arena), disk_dir, mut_view(out));
+    if rc != 0 {
+        diag_buf_free(mut_view(out));
+        arena_destroy(mut_view(str_arena));
+        return rc;
+    }
+
+    print_diag_buf(view(out));
+    print("PARALLEL-CODEGEN-PROBE-PASS\n");
+
+    diag_buf_free(mut_view(out));
+    arena_destroy(mut_view(str_arena));
+    0
+}

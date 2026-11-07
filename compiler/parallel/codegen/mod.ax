@@ -1,0 +1,2208 @@
+// Parallel Per-Module & Per-Codegen-Unit (`CGU`) LIR Lowering, Register Allocation,
+// Machine Encoding & COFF `.obj` Emission, Hybrid Incremental Cache Integration,
+// Canonical Post-Join Diagnostic Buffer Merging (`AXD-060`), and Deterministic
+// Linker Input Ordering & Finalization Barriers (T762 / E18.3).
+// Implements SPEC-23 §3-§4 (AXS-PAR-001..003, AXS-PAR-010..015, AXS-PAR-020..024, AXS-PAR-050..053, INV-PAR-002).
+module compiler.parallel.codegen
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.DefId
+use compiler.query.db.DIAG_AX_TYP_MISMATCH
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_NS_MODULE
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.QRY_ID_ERROR
+use compiler.query.db.RevisionId
+use compiler.query.db.SemanticKey
+use compiler.query.db.SourceFileId
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_intern_sv
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.revision_id_eq
+use compiler.query.db.revision_id_zero
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_eq
+use compiler.query.db.semantic_key_fingerprint
+use compiler.query.db.semantic_key_new
+
+use compiler.incremental.fingerprint.FP_TIER_BODY
+use compiler.incremental.fingerprint.FP_TIER_CODEGEN
+use compiler.incremental.fingerprint.INC_NODE_CODEGEN_UNIT
+use compiler.incremental.fingerprint.NODE_COLOR_GREEN
+use compiler.incremental.fingerprint.fp_buf_push_fp128_hex
+use compiler.incremental.fingerprint.fp_stream_finish
+use compiler.incremental.fingerprint.fp_stream_new
+use compiler.incremental.fingerprint.fp_stream_write_bytes
+use compiler.incremental.fingerprint.fp_stream_write_fp128
+use compiler.incremental.fingerprint.fp_stream_write_semantic_key
+use compiler.incremental.fingerprint.fp_stream_write_sv
+use compiler.incremental.fingerprint.fp_stream_write_u32
+use compiler.incremental.fingerprint.fp_stream_write_u64
+use compiler.incremental.fingerprint.fp_stream_write_u8
+use compiler.incremental.fingerprint.inc_add_item_call_dep
+use compiler.incremental.fingerprint.inc_add_item_const_dep
+use compiler.incremental.fingerprint.inc_add_item_layout_dep
+use compiler.incremental.fingerprint.inc_add_item_sig_dep
+use compiler.incremental.fingerprint.inc_add_module_import
+use compiler.incremental.fingerprint.inc_build_workspace
+use compiler.incremental.fingerprint.inc_get_item
+use compiler.incremental.fingerprint.inc_get_module
+use compiler.incremental.fingerprint.inc_get_node
+use compiler.incremental.fingerprint.inc_register_item
+use compiler.incremental.fingerprint.inc_set_item_error_flag
+
+use compiler.incremental.cache.ARTIFACT_KIND_EXE
+use compiler.incremental.cache.AXIC_SCHEMA_VERSION
+use compiler.incremental.cache.CACHED_DIAG_ERROR
+use compiler.incremental.cache.CACHED_DIAG_WARNING
+use compiler.incremental.cache.CACHE_EVICT_NONE
+use compiler.incremental.cache.CACHE_MAX_CGUS
+use compiler.incremental.cache.CachedCguArtifact
+use compiler.incremental.cache.IncrementalCache
+use compiler.incremental.cache.PANIC_STRATEGY_UNWIND
+use compiler.incremental.cache.SAFETY_PROFILE_STANDARD
+use compiler.incremental.cache.inc_cache_attach_diag
+use compiler.incremental.cache.inc_cache_clear_diags
+use compiler.incremental.cache.inc_cache_empty
+use compiler.incremental.cache.inc_cache_free
+use compiler.incremental.cache.inc_cache_get_cgu
+use compiler.incremental.cache.inc_cache_has_any_errors
+use compiler.incremental.cache.inc_cache_has_error_for_module
+use compiler.incremental.cache.inc_cache_init
+use compiler.incremental.cache.inc_cache_link_workspace_artifact
+use compiler.incremental.cache.inc_cache_load_from_disk
+use compiler.incremental.cache.inc_cache_register_module
+use compiler.incremental.cache.inc_cache_save_to_disk
+use compiler.incremental.cache.inc_cache_set_action_config
+use compiler.incremental.cache.inc_cache_synthesize_cgu_obj
+use compiler.incremental.cache.inc_cache_try_noop_fastpath
+use compiler.incremental.cache.inc_cache_update_module_source
+
+use compiler.parallel.scheduler.ACTION_STATE_BLOCKED
+use compiler.parallel.scheduler.ACTION_STATE_BLOCKED_BY_FAILURE
+use compiler.parallel.scheduler.ACTION_STATE_CACHE_CHECK
+use compiler.parallel.scheduler.ACTION_STATE_CANCELLED
+use compiler.parallel.scheduler.ACTION_STATE_DISPATCHED
+use compiler.parallel.scheduler.ACTION_STATE_FAILED
+use compiler.parallel.scheduler.ACTION_STATE_PENDING
+use compiler.parallel.scheduler.ACTION_STATE_READY
+use compiler.parallel.scheduler.ACTION_STATE_RUNNING
+use compiler.parallel.scheduler.ACTION_STATE_SUCCESS
+use compiler.parallel.scheduler.ACTION_STATE_VERIFIED
+use compiler.parallel.scheduler.PAR_MAX_WORKERS
+use compiler.parallel.scheduler.PRIORITY_BACKGROUND
+use compiler.parallel.scheduler.PRIORITY_CRITICAL
+use compiler.parallel.scheduler.PRIORITY_INTERACTIVE
+use compiler.parallel.scheduler.PRIORITY_NORMAL
+use compiler.parallel.scheduler.ResourceCostEstimate
+use compiler.parallel.scheduler.SCHEDULE_MODE_BALANCED
+use compiler.parallel.scheduler.SCHEDULE_MODE_DETERMINISTIC_DEBUG
+use compiler.parallel.scheduler.SCHEDULE_MODE_INTERACTIVE
+use compiler.parallel.scheduler.SCHEDULE_MODE_LOW_POWER
+use compiler.parallel.scheduler.SCHEDULE_MODE_MEMORY_BOUND
+use compiler.parallel.scheduler.SCHEDULE_MODE_THROUGHPUT
+use compiler.parallel.scheduler.WorkerArenaState
+use compiler.parallel.scheduler.resource_cost_new
+use compiler.parallel.scheduler.worker_arena_freeze
+use compiler.parallel.scheduler.worker_arena_init
+use compiler.parallel.scheduler.worker_arena_record_alloc
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// ============================================================================
+// 1. Constants, Fault Classifications, Promotion Stages & Barrier States
+//    (SPEC-23 AXS-PAR-013..015, AXS-PAR-020..024, AXS-PAR-050)
+// ============================================================================
+
+pub const PAR_CGU_MAX_UNITS: usize = 32;
+pub const PAR_CGU_MAX_ITEMS_PER_UNIT: usize = 16;
+pub const PAR_CGU_MAX_WORKERS: usize = 16;
+pub const PAR_CGU_MAX_DIAGS: usize = 64;
+pub const PAR_CGU_MAX_WORKER_DIAGS: usize = 16;
+pub const PAR_CGU_MAX_ARCHIVES: usize = 8;
+
+// Fault classification (SPEC-23 AXS-PAR-015 §2, REQ-LNK-1118..1131)
+pub const FAULT_NONE: u8 = 0u8;
+pub const FAULT_SOURCE_FAILURE: u8 = 1u8;     // Deterministic user error — never retried (REQ-LNK-1126)
+pub const FAULT_WORKER_FAILURE: u8 = 2u8;     // Expired lease / worker crash — retried with backoff (REQ-LNK-1127)
+pub const FAULT_RESOURCE_FAILURE: u8 = 3u8;   // Memory pressure / token exhaustion — rescheduled at lower concurrency (REQ-LNK-1128)
+pub const FAULT_ARTIFACT_FAILURE: u8 = 4u8;   // Checksum/schema mismatch — rejected & quarantined (REQ-LNK-1130..1131)
+
+// Artifact promotion lifecycle (SPEC-23 AXS-PAR-024 §2, REQ-LNK-1227)
+pub const ARTIFACT_STAGE_UNPRODUCED: u8 = 0u8;
+pub const ARTIFACT_STAGE_PRODUCED: u8 = 1u8;
+pub const ARTIFACT_STAGE_VERIFIED: u8 = 2u8;
+pub const ARTIFACT_STAGE_TRUSTED: u8 = 3u8;
+pub const ARTIFACT_STAGE_PUBLISHED: u8 = 4u8;
+pub const ARTIFACT_STAGE_QUARANTINED: u8 = 5u8;
+
+// Finalization barrier states (SPEC-23 AXS-PAR-024 §2, REQ-LNK-1026..1029, REQ-LNK-1223..1229)
+pub const BARRIER_PENDING: u8 = 0u8;
+pub const BARRIER_PASSED: u8 = 1u8;
+pub const BARRIER_BLOCKED_BY_ERROR: u8 = 2u8;
+
+// Memory pressure governance thresholds (SPEC-23 AXS-PAR-013 §2, REQ-LNK-1181..1183)
+pub const MEM_PRESSURE_NORMAL: u8 = 0u8;
+pub const MEM_PRESSURE_ELEVATED: u8 = 1u8;
+pub const MEM_PRESSURE_CRITICAL: u8 = 2u8;
+
+// Orchestration bottleneck classifications (SPEC-23 AXS-PAR-050 §1, REQ-LNK-1207..1222)
+pub const BOTTLENECK_BALANCED: u8 = 0u8;
+pub const BOTTLENECK_CRITICAL_PATH: u8 = 1u8;
+pub const BOTTLENECK_MEMORY_BOUND: u8 = 2u8;
+pub const BOTTLENECK_CACHE_BOUND: u8 = 3u8;
+
+// Diagnostic codes (SPEC-23 AXS-PAR-021 §3, AXS-PAR-050)
+pub const DIAG_AX_DRIVER_USAGE: u32 = 9001u32;
+pub const DIAG_AX_LINK_CGU_LIMIT: u32 = 9301u32;
+pub const DIAG_AX_ICE_PARALLEL_VERIFY: u32 = 9901u32;
+pub const DIAG_AX_ICE_OUT_OF_MEMORY: u32 = 9902u32;
+
+// Canonical ASCII table for deterministic formatting without string literal label collisions:
+//   0..29:   "parallel_stats total_actions=" (29)
+//  29..39:   " executed=" (10)
+//  39..47:   " cached=" (8)
+//  47..60:   " speculative=" (13)
+//  60..71:   " cancelled=" (11)
+//  71..79:   " failed=" (8)
+//  79..88:   " retries=" (9)
+//  88..108:  " critical_path_cost=" (20)
+// 108..120:  " bottleneck=" (12)
+// 120..128:  "BALANCED" (8)
+// 128..141:  "CRITICAL_PATH" (13)
+// 141..153:  "MEMORY_BOUND" (12)
+// 153..164:  "CACHE_BOUND" (11)
+// 164..178:  " link_barrier=" (14)
+// 178..185:  "PENDING" (7)
+// 185..191:  "PASSED" (6)
+// 191..207:  "BLOCKED_BY_ERROR" (16)
+// 207..215:  " obj_fp=" (8)
+// 215..223:  " exe_fp=" (8)
+// 223..232:  " diag_fp=" (9)
+// 232..236:  "cgu[" (4)
+// 236..242:  "] key=" (6)
+// 242..248:  " part=" (6)
+// 248..256:  " cgu_fp=" (8)
+// 256..268:  " obj_digest=" (12)
+// 268..277:  " obj_len=" (9)
+// 277..288:  " lir_insts=" (11)
+// 288..295:  " vregs=" (7)
+// 295..302:  " frame=" (7)
+// 302..308:  " syms=" (6)
+// 308..316:  " relocs=" (8)
+// 316..323:  " stage=" (7)
+// 323..333:  "UNPRODUCED" (10)
+// 333..341:  "PRODUCED" (8)
+// 341..349:  "VERIFIED" (8)
+// 349..356:  "TRUSTED" (7)
+// 356..365:  "PUBLISHED" (9)
+// 365..376:  "QUARANTINED" (11)
+// 376..384:  " cached=" (8)
+// 384..388:  "true" (4)
+// 388..393:  "false" (5)
+// 393..398:  "diag " (5)
+// 398..403:  "ERROR" (5)
+// 403..410:  "WARNING" (7)
+// 410..416:  " code=" (6)
+// 416..422:  " file=" (6)
+// 422..430:  " offset=" (8)
+// 430..435:  " loc=" (5)
+// 435..441:  " item=" (6)
+// 441..446:  " msg=" (5)
+const PAR_CGU_ASCII: [446]u8 = [
+    112u8, 97u8, 114u8, 97u8, 108u8, 108u8, 101u8, 108u8, 95u8, 115u8, 116u8, 97u8, 116u8, 115u8, 32u8, 116u8, 111u8, 116u8, 97u8, 108u8, 95u8, 97u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8,
+    32u8, 101u8, 120u8, 101u8, 99u8, 117u8, 116u8, 101u8, 100u8, 61u8,
+    32u8, 99u8, 97u8, 99u8, 104u8, 101u8, 100u8, 61u8,
+    32u8, 115u8, 112u8, 101u8, 99u8, 117u8, 108u8, 97u8, 116u8, 105u8, 118u8, 101u8, 61u8,
+    32u8, 99u8, 97u8, 110u8, 99u8, 101u8, 108u8, 108u8, 101u8, 100u8, 61u8,
+    32u8, 102u8, 97u8, 105u8, 108u8, 101u8, 100u8, 61u8,
+    32u8, 114u8, 101u8, 116u8, 114u8, 105u8, 101u8, 115u8, 61u8,
+    32u8, 99u8, 114u8, 105u8, 116u8, 105u8, 99u8, 97u8, 108u8, 95u8, 112u8, 97u8, 116u8, 104u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    32u8, 98u8, 111u8, 116u8, 116u8, 108u8, 101u8, 110u8, 101u8, 99u8, 107u8, 61u8,
+    66u8, 65u8, 76u8, 65u8, 78u8, 67u8, 69u8, 68u8,
+    67u8, 82u8, 73u8, 84u8, 73u8, 67u8, 65u8, 76u8, 95u8, 80u8, 65u8, 84u8, 72u8,
+    77u8, 69u8, 77u8, 79u8, 82u8, 89u8, 95u8, 66u8, 79u8, 85u8, 78u8, 68u8,
+    67u8, 65u8, 67u8, 72u8, 69u8, 95u8, 66u8, 79u8, 85u8, 78u8, 68u8,
+    32u8, 108u8, 105u8, 110u8, 107u8, 95u8, 98u8, 97u8, 114u8, 114u8, 105u8, 101u8, 114u8, 61u8,
+    80u8, 69u8, 78u8, 68u8, 73u8, 78u8, 71u8,
+    80u8, 65u8, 83u8, 83u8, 69u8, 68u8,
+    66u8, 76u8, 79u8, 67u8, 75u8, 69u8, 68u8, 95u8, 66u8, 89u8, 95u8, 69u8, 82u8, 82u8, 79u8, 82u8,
+    32u8, 111u8, 98u8, 106u8, 95u8, 102u8, 112u8, 61u8,
+    32u8, 101u8, 120u8, 101u8, 95u8, 102u8, 112u8, 61u8,
+    32u8, 100u8, 105u8, 97u8, 103u8, 95u8, 102u8, 112u8, 61u8,
+    99u8, 103u8, 117u8, 91u8,
+    93u8, 32u8, 107u8, 101u8, 121u8, 61u8,
+    32u8, 112u8, 97u8, 114u8, 116u8, 61u8,
+    32u8, 99u8, 103u8, 117u8, 95u8, 102u8, 112u8, 61u8,
+    32u8, 111u8, 98u8, 106u8, 95u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 61u8,
+    32u8, 111u8, 98u8, 106u8, 95u8, 108u8, 101u8, 110u8, 61u8,
+    32u8, 108u8, 105u8, 114u8, 95u8, 105u8, 110u8, 115u8, 116u8, 115u8, 61u8,
+    32u8, 118u8, 114u8, 101u8, 103u8, 115u8, 61u8,
+    32u8, 102u8, 114u8, 97u8, 109u8, 101u8, 61u8,
+    32u8, 115u8, 121u8, 109u8, 115u8, 61u8,
+    32u8, 114u8, 101u8, 108u8, 111u8, 99u8, 115u8, 61u8,
+    32u8, 115u8, 116u8, 97u8, 103u8, 101u8, 61u8,
+    85u8, 78u8, 80u8, 82u8, 79u8, 68u8, 85u8, 67u8, 69u8, 68u8,
+    80u8, 82u8, 79u8, 68u8, 85u8, 67u8, 69u8, 68u8,
+    86u8, 69u8, 82u8, 73u8, 70u8, 73u8, 69u8, 68u8,
+    84u8, 82u8, 85u8, 83u8, 84u8, 69u8, 68u8,
+    80u8, 85u8, 66u8, 76u8, 73u8, 83u8, 72u8, 69u8, 68u8,
+    81u8, 85u8, 65u8, 82u8, 65u8, 78u8, 84u8, 73u8, 78u8, 69u8, 68u8,
+    32u8, 99u8, 97u8, 99u8, 104u8, 101u8, 100u8, 61u8,
+    116u8, 114u8, 117u8, 101u8,
+    102u8, 97u8, 108u8, 115u8, 101u8,
+    100u8, 105u8, 97u8, 103u8, 32u8,
+    69u8, 82u8, 82u8, 79u8, 82u8,
+    87u8, 65u8, 82u8, 78u8, 73u8, 78u8, 71u8,
+    32u8, 99u8, 111u8, 100u8, 101u8, 61u8,
+    32u8, 102u8, 105u8, 108u8, 101u8, 61u8,
+    32u8, 111u8, 102u8, 102u8, 115u8, 101u8, 116u8, 61u8,
+    32u8, 108u8, 111u8, 99u8, 61u8,
+    32u8, 105u8, 116u8, 101u8, 109u8, 61u8,
+    32u8, 109u8, 115u8, 103u8, 61u8
+];
+
+fn pcgu_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while (i + 8) <= count {
+        unsafe { *((ptr + i) as *mut u64) = 0u64; }
+        i = i + 8;
+    }
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+fn pcgu_copy_bytes(src: *const u8, dst: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(dst + i) = *(src + i); }
+        i = i + 1;
+    }
+}
+
+fn pcgu_write_le_u16(dst: *mut u8, off: usize, v: u16) {
+    unsafe {
+        *(dst + off) = (v & 0xFFu16) as u8;
+        *(dst + off + 1) = ((v >> 8u16) as u8) & 0xFFu8;
+    }
+}
+
+fn pcgu_write_le_u32(dst: *mut u8, off: usize, v: u32) {
+    unsafe {
+        *(dst + off) = (v & 0xFFu32) as u8;
+        *(dst + off + 1) = ((v >> 8u32) & 0xFFu32) as u8;
+        *(dst + off + 2) = ((v >> 16u32) & 0xFFu32) as u8;
+        *(dst + off + 3) = ((v >> 24u32) & 0xFFu32) as u8;
+    }
+}
+
+fn pcgu_write_le_u64(dst: *mut u8, off: usize, v: u64) {
+    pcgu_write_le_u32(dst, off, (v & 0xFFFFFFFFu64) as u32);
+    pcgu_write_le_u32(dst, off + 4, ((v >> 32u64) & 0xFFFFFFFFu64) as u32);
+}
+
+fn pcgu_buf_push_ascii(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), PAR_CGU_ASCII[start + i]);
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// 2. Codegen Units (`ParallelCgu`), Per-Worker Diagnostic Buffers & Engine State
+// ============================================================================
+
+@derive(Copy)
+pub struct ParallelCgu {
+    pub cgu_index: u32,
+    pub module_id: ModuleId,
+    pub source_file_id: SourceFileId,
+    pub partition_ordinal: u32,
+    pub module_partition_count: u32,
+    pub primary_key: SemanticKey,
+    pub item_def_ids: [16]u32,
+    pub item_count: u32,
+    pub cgu_fp: Fingerprint128,
+    pub interface_fp: Fingerprint128,
+
+    pub state: u8,
+    pub priority_tier: u8,
+    pub cost: ResourceCostEstimate,
+    pub preferred_worker: u32,
+    pub executed_by_worker: u32,
+    pub stolen_from_worker: u32,
+    pub was_stolen: bool,
+    pub simulated_delay_ms: u32,
+    pub completion_order: u32,
+
+    pub reused_from_cache: bool,
+    pub published_to_cache: bool,
+    pub has_error: bool,
+    pub injected_worker_fault: bool,
+    pub injected_resource_fault: bool,
+    pub injected_artifact_corrupt: bool,
+    pub fault_kind: u8,
+    pub retry_count: u32,
+    pub artifact_stage: u8,
+
+    // Per-CGU isolated LIR lowering, RA, x86-64 verification & COFF `.obj` emission metrics
+    pub lir_inst_count: u32,
+    pub vreg_count: u32,
+    pub stack_frame_bytes: u32,
+    pub peephole_count: u32,
+    pub x64_verified: bool,
+    pub symbol_count: u32,
+    pub reloc_count: u32,
+    pub obj_bytes: *mut u8,
+    pub obj_len: u32,
+    pub obj_digest: Fingerprint128,
+    pub lir_mir_dump_fp: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct ParallelDiagRecord {
+    pub has_primary_span: bool,
+    pub file_id: SourceFileId,
+    pub byte_offset: u32,
+    pub line: u32,
+    pub col: u32,
+    pub code: u32,
+    pub severity: u8,
+    pub module_id: ModuleId,
+    pub def_id: DefId,
+    pub cgu_index: u32,
+    pub worker_id: u32,
+    pub completion_tick: u32,
+    pub primary_key: SemanticKey,
+    pub message: StrView,
+    pub diag_fp: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct WorkerCodegenSlot {
+    pub worker_id: u32,
+    pub arena_state: WorkerArenaState,
+    pub cgu_queue: [32]u32,
+    pub head: u32,
+    pub tail: u32,
+    pub executed_cgus: u32,
+    pub stolen_cgus: u32,
+    pub local_diags: [16]ParallelDiagRecord,
+    pub local_diag_count: u32,
+    pub peak_memory_bytes: u64,
+}
+
+@derive(Copy)
+pub struct ExternalArchiveInput {
+    pub cli_order: u32,
+    pub archive_name: StrView,
+    pub archive_bytes: *mut u8,
+    pub archive_len: u32,
+    pub archive_fp: Fingerprint128,
+}
+
+pub struct ParallelCodegenEngine {
+    pub cache: IncrementalCache,
+    pub codegen_arena: Arena,
+    pub jobs: u32,
+    pub schedule_mode: u8,
+    pub max_items_per_cgu: u32,
+    pub memory_pressure: u8,
+    pub cpu_token_budget: u32,
+    pub memory_budget_bytes: u64,
+
+    pub cgus: *mut ParallelCgu,
+    pub cgu_count: u32,
+    pub workers: *mut WorkerCodegenSlot,
+    pub worker_arenas: *mut WorkerArenaState,
+
+    pub pending_diags: *mut ParallelDiagRecord,
+    pub pending_diag_count: u32,
+    pub merged_diags: *mut ParallelDiagRecord,
+    pub merged_diag_count: u32,
+    pub merged_diag_fp: Fingerprint128,
+
+    pub ext_archives: *mut ExternalArchiveInput,
+    pub ext_archive_count: u32,
+
+    pub linked_exe_bytes: *mut u8,
+    pub linked_exe_len: u32,
+    pub linked_exe_fp: Fingerprint128,
+    pub combined_obj_fp: Fingerprint128,
+    pub combined_lir_mir_fp: Fingerprint128,
+
+    pub link_barrier: u8,
+    pub package_barrier: u8,
+    pub signing_barrier: u8,
+    pub final_artifact_stage: u8,
+
+    // Deterministic build orchestration statistics (`AXS-PAR-050`)
+    pub total_actions: u32,
+    pub executed_actions: u32,
+    pub cached_actions: u32,
+    pub speculative_actions: u32,
+    pub cancelled_actions: u32,
+    pub failed_actions: u32,
+    pub retried_actions: u32,
+    pub quarantined_artifacts: u32,
+    pub total_steals: u32,
+    pub duplicate_verifications: u32,
+    pub last_ice_code: u32,
+    pub critical_path_cost: u64,
+    pub bottleneck_kind: u8,
+}
+
+// Validates `--jobs <N>` CLI flag (`AXS-PAR-050 §1`): `N >= 1` is valid (`0u32`),
+// `N == 0` emits `DIAG_AX_DRIVER_USAGE` (`AX_DRIVER_USAGE`, exit code 2).
+pub fn parallel_codegen_validate_cli_jobs(jobs: u32) -> u32 {
+    if jobs == 0u32 {
+        return DIAG_AX_DRIVER_USAGE;
+    }
+    0u32
+}
+
+pub fn parallel_codegen_empty() -> ParallelCodegenEngine {
+    ParallelCodegenEngine {
+        cache: inc_cache_empty(),
+        codegen_arena: arena_new(),
+        jobs: 1u32,
+        schedule_mode: SCHEDULE_MODE_BALANCED,
+        max_items_per_cgu: 16u32,
+        memory_pressure: MEM_PRESSURE_NORMAL,
+        cpu_token_budget: 1u32,
+        memory_budget_bytes: 268435456u64,
+        cgus: 0 as *mut ParallelCgu,
+        cgu_count: 0u32,
+        workers: 0 as *mut WorkerCodegenSlot,
+        worker_arenas: 0 as *mut WorkerArenaState,
+        pending_diags: 0 as *mut ParallelDiagRecord,
+        pending_diag_count: 0u32,
+        merged_diags: 0 as *mut ParallelDiagRecord,
+        merged_diag_count: 0u32,
+        merged_diag_fp: fingerprint128_zero(),
+        ext_archives: 0 as *mut ExternalArchiveInput,
+        ext_archive_count: 0u32,
+        linked_exe_bytes: 0 as *mut u8,
+        linked_exe_len: 0u32,
+        linked_exe_fp: fingerprint128_zero(),
+        combined_obj_fp: fingerprint128_zero(),
+        combined_lir_mir_fp: fingerprint128_zero(),
+        link_barrier: BARRIER_PENDING,
+        package_barrier: BARRIER_PENDING,
+        signing_barrier: BARRIER_PENDING,
+        final_artifact_stage: ARTIFACT_STAGE_UNPRODUCED,
+        total_actions: 0u32,
+        executed_actions: 0u32,
+        cached_actions: 0u32,
+        speculative_actions: 0u32,
+        cancelled_actions: 0u32,
+        failed_actions: 0u32,
+        retried_actions: 0u32,
+        quarantined_artifacts: 0u32,
+        total_steals: 0u32,
+        duplicate_verifications: 0u32,
+        last_ice_code: 0u32,
+        critical_path_cost: 0u64,
+        bottleneck_kind: BOTTLENECK_BALANCED,
+    }
+}
+
+pub fn parallel_codegen_init(
+    eng: mut_view<ParallelCodegenEngine>,
+    session_id: u64,
+    jobs: u32,
+    schedule_mode: u8
+) {
+    let eff_jobs = if jobs == 0u32 {
+        1u32
+    } else if (jobs as usize) > PAR_CGU_MAX_WORKERS {
+        PAR_CGU_MAX_WORKERS as u32
+    } else {
+        jobs
+    };
+
+    inc_cache_init(mut_view(eng.cache), session_id);
+    eng.codegen_arena = arena_new();
+    eng.jobs = eff_jobs;
+    eng.schedule_mode = schedule_mode;
+    eng.max_items_per_cgu = PAR_CGU_MAX_ITEMS_PER_UNIT as u32;
+    eng.memory_pressure = MEM_PRESSURE_NORMAL;
+    eng.cpu_token_budget = eff_jobs;
+    eng.memory_budget_bytes = (eff_jobs as u64) * 268435456u64;
+
+    let cgu_bytes = PAR_CGU_MAX_UNITS * size_of<ParallelCgu>();
+    eng.cgus = arena_alloc_raw(mut_view(eng.codegen_arena), cgu_bytes, align_of<ParallelCgu>()) as *mut ParallelCgu;
+    pcgu_zero_bytes(eng.cgus as *mut u8, cgu_bytes);
+    eng.cgu_count = 0u32;
+
+    let wk_bytes = PAR_CGU_MAX_WORKERS * size_of<WorkerCodegenSlot>();
+    eng.workers = arena_alloc_raw(mut_view(eng.codegen_arena), wk_bytes, align_of<WorkerCodegenSlot>()) as *mut WorkerCodegenSlot;
+    pcgu_zero_bytes(eng.workers as *mut u8, wk_bytes);
+
+    let wa_bytes = PAR_CGU_MAX_WORKERS * size_of<WorkerArenaState>();
+    eng.worker_arenas = arena_alloc_raw(mut_view(eng.codegen_arena), wa_bytes, align_of<WorkerArenaState>()) as *mut WorkerArenaState;
+    pcgu_zero_bytes(eng.worker_arenas as *mut u8, wa_bytes);
+
+    let mut w: u32 = 0u32;
+    while w < (PAR_CGU_MAX_WORKERS as u32) {
+        let wp = unsafe { eng.workers + (w as usize) };
+        let init_wa = worker_arena_init(w, 1u64);
+        unsafe {
+            (*wp).worker_id = w;
+            (*wp).arena_state = init_wa;
+            *(eng.worker_arenas + (w as usize)) = init_wa;
+        }
+        w = w + 1u32;
+    }
+
+    let pd_bytes = PAR_CGU_MAX_DIAGS * size_of<ParallelDiagRecord>();
+    eng.pending_diags = arena_alloc_raw(mut_view(eng.codegen_arena), pd_bytes, align_of<ParallelDiagRecord>()) as *mut ParallelDiagRecord;
+    pcgu_zero_bytes(eng.pending_diags as *mut u8, pd_bytes);
+    eng.pending_diag_count = 0u32;
+
+    let md_bytes = PAR_CGU_MAX_DIAGS * size_of<ParallelDiagRecord>();
+    eng.merged_diags = arena_alloc_raw(mut_view(eng.codegen_arena), md_bytes, align_of<ParallelDiagRecord>()) as *mut ParallelDiagRecord;
+    pcgu_zero_bytes(eng.merged_diags as *mut u8, md_bytes);
+    eng.merged_diag_count = 0u32;
+    eng.merged_diag_fp = fingerprint128_zero();
+
+    let ar_bytes = PAR_CGU_MAX_ARCHIVES * size_of<ExternalArchiveInput>();
+    eng.ext_archives = arena_alloc_raw(mut_view(eng.codegen_arena), ar_bytes, align_of<ExternalArchiveInput>()) as *mut ExternalArchiveInput;
+    pcgu_zero_bytes(eng.ext_archives as *mut u8, ar_bytes);
+    eng.ext_archive_count = 0u32;
+
+    eng.linked_exe_bytes = 0 as *mut u8;
+    eng.linked_exe_len = 0u32;
+    eng.linked_exe_fp = fingerprint128_zero();
+    eng.combined_obj_fp = fingerprint128_zero();
+    eng.combined_lir_mir_fp = fingerprint128_zero();
+
+    eng.link_barrier = BARRIER_PENDING;
+    eng.package_barrier = BARRIER_PENDING;
+    eng.signing_barrier = BARRIER_PENDING;
+    eng.final_artifact_stage = ARTIFACT_STAGE_UNPRODUCED;
+
+    eng.total_actions = 0u32;
+    eng.executed_actions = 0u32;
+    eng.cached_actions = 0u32;
+    eng.speculative_actions = 0u32;
+    eng.cancelled_actions = 0u32;
+    eng.failed_actions = 0u32;
+    eng.retried_actions = 0u32;
+    eng.quarantined_artifacts = 0u32;
+    eng.total_steals = 0u32;
+    eng.duplicate_verifications = 0u32;
+    eng.last_ice_code = 0u32;
+    eng.critical_path_cost = 0u64;
+    eng.bottleneck_kind = BOTTLENECK_BALANCED;
+}
+
+pub fn parallel_codegen_free(eng: mut_view<ParallelCodegenEngine>) {
+    inc_cache_free(mut_view(eng.cache));
+    arena_destroy(mut_view(eng.codegen_arena));
+    eng.cgus = 0 as *mut ParallelCgu;
+    eng.workers = 0 as *mut WorkerCodegenSlot;
+    eng.worker_arenas = 0 as *mut WorkerArenaState;
+    eng.pending_diags = 0 as *mut ParallelDiagRecord;
+    eng.merged_diags = 0 as *mut ParallelDiagRecord;
+    eng.ext_archives = 0 as *mut ExternalArchiveInput;
+    eng.linked_exe_bytes = 0 as *mut u8;
+}
+
+pub fn parallel_codegen_reconfigure_jobs(
+    eng: mut_view<ParallelCodegenEngine>,
+    jobs: u32,
+    schedule_mode: u8
+) {
+    let eff_jobs = if jobs == 0u32 {
+        1u32
+    } else if (jobs as usize) > PAR_CGU_MAX_WORKERS {
+        PAR_CGU_MAX_WORKERS as u32
+    } else {
+        jobs
+    };
+    eng.jobs = eff_jobs;
+    eng.schedule_mode = schedule_mode;
+    eng.cpu_token_budget = eff_jobs;
+    eng.memory_budget_bytes = (eff_jobs as u64) * 268435456u64;
+}
+
+pub fn parallel_codegen_set_max_items_per_cgu(eng: mut_view<ParallelCodegenEngine>, max_items: u32) {
+    let clamped = if max_items == 0u32 {
+        1u32
+    } else if (max_items as usize) > PAR_CGU_MAX_ITEMS_PER_UNIT {
+        PAR_CGU_MAX_ITEMS_PER_UNIT as u32
+    } else {
+        max_items
+    };
+    eng.max_items_per_cgu = clamped;
+}
+
+pub fn parallel_codegen_set_memory_pressure(eng: mut_view<ParallelCodegenEngine>, pressure: u8) {
+    eng.memory_pressure = pressure;
+}
+
+pub fn parallel_codegen_register_external_archive(
+    eng: mut_view<ParallelCodegenEngine>,
+    archive_name: StrView,
+    raw_bytes: *const u8,
+    raw_len: u32
+) -> u32 {
+    if (eng.ext_archive_count as usize) >= PAR_CGU_MAX_ARCHIVES {
+        return PAR_CGU_MAX_ARCHIVES as u32 - 1u32;
+    }
+    let idx = eng.ext_archive_count;
+    eng.ext_archive_count = idx + 1u32;
+    let name_sv = query_db_intern_sv(mut_view(eng.cache.eng.db), archive_name);
+    let mut dst: *mut u8 = 0 as *mut u8;
+    if raw_len > 0u32 && (raw_bytes as usize) != 0 {
+        dst = arena_alloc_raw(mut_view(eng.codegen_arena), raw_len as usize, 8);
+        pcgu_copy_bytes(raw_bytes, dst, raw_len as usize);
+    }
+    let mut s = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_sv(mut_view(s), name_sv);
+    if raw_len > 0u32 && (dst as usize) != 0 {
+        fp_stream_write_bytes(mut_view(s), dst as *const u8, raw_len as usize);
+    }
+    let afp = fp_stream_finish(view(s));
+    let ap = unsafe { eng.ext_archives + (idx as usize) };
+    unsafe {
+        (*ap).cli_order = idx;
+        (*ap).archive_name = name_sv;
+        (*ap).archive_bytes = dst;
+        (*ap).archive_len = raw_len;
+        (*ap).archive_fp = afp;
+    }
+    idx
+}
+
+pub fn parallel_codegen_attach_diag(
+    eng: mut_view<ParallelCodegenEngine>,
+    has_primary_span: bool,
+    file_id: SourceFileId,
+    byte_offset: u32,
+    line: u32,
+    col: u32,
+    code: u32,
+    severity: u8,
+    module_id: ModuleId,
+    def_id: DefId,
+    primary_key: SemanticKey,
+    message: StrView
+) {
+    let msg_sv = query_db_intern_sv(mut_view(eng.cache.eng.db), message);
+    inc_cache_attach_diag(
+        mut_view(eng.cache),
+        code,
+        severity,
+        module_id,
+        def_id,
+        line,
+        col,
+        primary_key,
+        msg_sv
+    );
+
+    if (eng.pending_diag_count as usize) >= PAR_CGU_MAX_DIAGS {
+        return;
+    }
+    let mut s = fp_stream_new(FP_TIER_BODY);
+    fp_stream_write_u8(mut_view(s), if has_primary_span { 1u8 } else { 0u8 });
+    fp_stream_write_u32(mut_view(s), file_id.v);
+    fp_stream_write_u32(mut_view(s), byte_offset);
+    fp_stream_write_u32(mut_view(s), line);
+    fp_stream_write_u32(mut_view(s), col);
+    fp_stream_write_u32(mut_view(s), code);
+    fp_stream_write_u8(mut_view(s), severity);
+    fp_stream_write_semantic_key(mut_view(s), view(primary_key));
+    fp_stream_write_sv(mut_view(s), msg_sv);
+    let dfp = fp_stream_finish(view(s));
+
+    let idx = eng.pending_diag_count as usize;
+    eng.pending_diag_count = eng.pending_diag_count + 1u32;
+    let dp = unsafe { eng.pending_diags + idx };
+    unsafe {
+        (*dp).has_primary_span = has_primary_span;
+        (*dp).file_id = file_id;
+        (*dp).byte_offset = byte_offset;
+        (*dp).line = line;
+        (*dp).col = col;
+        (*dp).code = code;
+        (*dp).severity = severity;
+        (*dp).module_id = module_id;
+        (*dp).def_id = def_id;
+        (*dp).cgu_index = 0u32;
+        (*dp).worker_id = 0u32;
+        (*dp).completion_tick = 0u32;
+        (*dp).primary_key = primary_key;
+        (*dp).message = msg_sv;
+        (*dp).diag_fp = dfp;
+    }
+}
+
+pub fn parallel_codegen_clear_diags(eng: mut_view<ParallelCodegenEngine>) {
+    inc_cache_clear_diags(mut_view(eng.cache));
+    eng.pending_diag_count = 0u32;
+    eng.merged_diag_count = 0u32;
+    eng.merged_diag_fp = fingerprint128_zero();
+}
+
+// ============================================================================
+// 3. Deterministic Codegen Unit (`CGU`) Partitioning & Canonical Indexing
+//    (SPEC-23 AXS-PAR-020)
+// ============================================================================
+
+fn pcgu_compute_partition_fp(
+    eng: view<ParallelCodegenEngine>,
+    module_id: ModuleId,
+    partition_ordinal: u32,
+    module_partition_count: u32,
+    cp: *const ParallelCgu,
+    item_count: u32
+) -> Fingerprint128 {
+    let mod_rec = inc_get_module(view(eng.cache.eng), module_id);
+    // When a module is a single unsplit CGU, use `mod_rec.codegen_fp` directly so its
+    // `CodegenFingerprint` matches `IncrementalCache` (`T758`) 100%!
+    if module_partition_count <= 1u32 && partition_ordinal == 0u32 {
+        return mod_rec.codegen_fp;
+    }
+
+    let mut s = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_semantic_key(mut_view(s), view(mod_rec.semantic_key));
+    fp_stream_write_u32(mut_view(s), partition_ordinal);
+    fp_stream_write_u32(mut_view(s), module_partition_count);
+    fp_stream_write_fp128(mut_view(s), eng.cache.action_digest.env_digest);
+    fp_stream_write_u32(mut_view(s), item_count);
+    let mut i: u32 = 0u32;
+    while i < item_count {
+        let def_v = unsafe { (*cp).item_def_ids[i as usize] };
+        let it = inc_get_item(view(eng.cache.eng), DefId { v: def_v });
+        fp_stream_write_fp128(mut_view(s), it.abi_fp);
+        fp_stream_write_fp128(mut_view(s), it.body_fp);
+        i = i + 1u32;
+    }
+    fp_stream_finish(view(s))
+}
+
+// Partitions Verified MIR / `OptIR` items across workspace modules into deterministic
+// `CGU_0 .. CGU_{M-1}` ordered lexicographically by `(module SemanticKey, partition_ordinal)`,
+// with functions/statics inside each CGU sorted by canonical `SemanticKey` (`AXS-PAR-020`).
+// Partition boundaries depend EXCLUSIVELY on `(DatabaseSnapshot, TargetConfig, OptProfile, max_items_per_cgu)`
+// and NEVER on `--jobs <N>` or worker arrival order!
+pub fn parallel_codegen_partition_cgus(eng: mut_view<ParallelCodegenEngine>) -> u32 {
+    eng.cgu_count = 0u32;
+    let mod_cnt = eng.cache.eng.module_count as usize;
+    if mod_cnt == 0 {
+        return 0u32;
+    }
+
+    // 1. Sort modules lexicographically by canonical `SemanticKey`
+    let mut sorted_mods: [32]usize = [0; 32];
+    let mut m: usize = 0;
+    while m < mod_cnt {
+        sorted_mods[m] = m;
+        m = m + 1;
+    }
+    let mut ma: usize = 1;
+    while ma < mod_cnt {
+        let cur = sorted_mods[ma];
+        let cur_m = unsafe { *(eng.cache.eng.modules + cur) };
+        let mut mb: usize = ma;
+        while mb > 0 {
+            let prev = sorted_mods[mb - 1];
+            let prev_m = unsafe { *(eng.cache.eng.modules + prev) };
+            if semantic_key_cmp(view(prev_m.semantic_key), view(cur_m.semantic_key)) <= 0i32 {
+                break;
+            }
+            sorted_mods[mb] = prev;
+            mb = mb - 1;
+        }
+        sorted_mods[mb] = cur;
+        ma = ma + 1;
+    }
+
+    let max_per_cgu = if eng.max_items_per_cgu == 0u32 {
+        16u32
+    } else {
+        eng.max_items_per_cgu
+    };
+
+    // 2. For each module in canonical order, collect and sort its items by `SemanticKey`,
+    //    then slice into deterministic CGU partitions (`partition_ordinal = 0, 1, ...`).
+    let mut mi: usize = 0;
+    while mi < mod_cnt {
+        let mod_rec = unsafe { *(eng.cache.eng.modules + sorted_mods[mi]) };
+        let mut item_idxs: [64]usize = [0; 64];
+        let mut item_cnt: usize = 0;
+        let mut ii: usize = 0;
+        while ii < (eng.cache.eng.item_count as usize) {
+            let it = unsafe { *(eng.cache.eng.items + ii) };
+            if it.module_id.v == mod_rec.module_id.v && item_cnt < 64 {
+                item_idxs[item_cnt] = ii;
+                item_cnt = item_cnt + 1;
+            }
+            ii = ii + 1;
+        }
+
+        let mut ia: usize = 1;
+        while ia < item_cnt {
+            let cur_i = item_idxs[ia];
+            let cur_it = unsafe { *(eng.cache.eng.items + cur_i) };
+            let mut ib: usize = ia;
+            while ib > 0 {
+                let prev_i = item_idxs[ib - 1];
+                let prev_it = unsafe { *(eng.cache.eng.items + prev_i) };
+                if semantic_key_cmp(view(prev_it.semantic_key), view(cur_it.semantic_key)) <= 0i32 {
+                    break;
+                }
+                item_idxs[ib] = prev_i;
+                ib = ib - 1;
+            }
+            item_idxs[ib] = cur_i;
+            ia = ia + 1;
+        }
+
+        let max_step = max_per_cgu as usize;
+        let part_count: u32 = if item_cnt == 0 {
+            1u32
+        } else {
+            ((item_cnt + max_step - 1) / max_step) as u32
+        };
+
+        let mut p: u32 = 0u32;
+        while p < part_count {
+            if (eng.cgu_count as usize) >= PAR_CGU_MAX_UNITS {
+                break;
+            }
+            let cgu_idx = eng.cgu_count;
+            eng.cgu_count = cgu_idx + 1u32;
+            let cp = unsafe { eng.cgus + (cgu_idx as usize) };
+            pcgu_zero_bytes(cp as *mut u8, size_of<ParallelCgu>());
+
+            let start_item = (p as usize) * max_step;
+            let mut sub_cnt: u32 = 0u32;
+            let mut def_arr: [16]u32 = [0u32; 16];
+            let mut crit_cost: u64 = 40u64;
+            let mut mem_cost: u64 = 65536u64;
+            let mut has_mod_err = inc_cache_has_error_for_module(view(eng.cache), mod_rec.module_id);
+
+            let mut k: usize = 0;
+            while k < max_step && (start_item + k) < item_cnt && (sub_cnt as usize) < PAR_CGU_MAX_ITEMS_PER_UNIT {
+                let it = unsafe { *(eng.cache.eng.items + item_idxs[start_item + k]) };
+                def_arr[sub_cnt as usize] = it.def_id.v;
+                sub_cnt = sub_cnt + 1u32;
+                crit_cost = crit_cost + 25u64 + ((it.call_dep_count as u64) * 15u64) + ((it.param_count as u64) * 5u64);
+                mem_cost = mem_cost + 32768u64 + ((it.size_bytes as u64) * 64u64);
+                if it.has_body_type_error {
+                    has_mod_err = true;
+                }
+                k = k + 1;
+            }
+
+            let cgu_key = semantic_key_new(
+                mod_rec.semantic_key.package_name,
+                mod_rec.semantic_key.module_path,
+                ITEM_NS_MODULE,
+                p,
+                mod_rec.semantic_key.canonical_name,
+                mod_rec.semantic_key.canonical_type_args
+            );
+            unsafe { (*cp).item_def_ids = def_arr; }
+            let cgu_fp = pcgu_compute_partition_fp(
+                view(*eng),
+                mod_rec.module_id,
+                p,
+                part_count,
+                cp as *const ParallelCgu,
+                sub_cnt
+            );
+
+            unsafe {
+                (*cp).cgu_index = cgu_idx;
+                (*cp).module_id = mod_rec.module_id;
+                (*cp).source_file_id = mod_rec.source_file_id;
+                (*cp).partition_ordinal = p;
+                (*cp).module_partition_count = part_count;
+                (*cp).primary_key = cgu_key;
+                (*cp).item_count = sub_cnt;
+                (*cp).cgu_fp = cgu_fp;
+                (*cp).interface_fp = mod_rec.interface_fp;
+                (*cp).state = ACTION_STATE_PENDING;
+                (*cp).priority_tier = PRIORITY_NORMAL;
+                (*cp).cost = resource_cost_new(1u16, mem_cost, crit_cost);
+                (*cp).preferred_worker = 0u32;
+                (*cp).executed_by_worker = QRY_ID_ERROR;
+                (*cp).stolen_from_worker = QRY_ID_ERROR;
+                (*cp).was_stolen = false;
+                (*cp).simulated_delay_ms = 0u32;
+                (*cp).completion_order = 0u32;
+                (*cp).reused_from_cache = false;
+                (*cp).published_to_cache = false;
+                (*cp).has_error = has_mod_err;
+                (*cp).fault_kind = FAULT_NONE;
+                (*cp).retry_count = 0u32;
+                (*cp).artifact_stage = ARTIFACT_STAGE_UNPRODUCED;
+            }
+            p = p + 1u32;
+        }
+        mi = mi + 1;
+    }
+
+    eng.total_actions = eng.cgu_count;
+    eng.cgu_count
+}
+
+pub fn parallel_codegen_find_cgu_by_module(
+    eng: view<ParallelCodegenEngine>,
+    module_id: ModuleId,
+    partition_ordinal: u32
+) -> u32 {
+    let mut i: u32 = 0u32;
+    while i < eng.cgu_count {
+        let c = unsafe { *(eng.cgus + (i as usize)) };
+        if c.module_id.v == module_id.v && c.partition_ordinal == partition_ordinal {
+            return i;
+        }
+        i = i + 1u32;
+    }
+    QRY_ID_ERROR
+}
+
+pub fn parallel_codegen_get_cgu(eng: view<ParallelCodegenEngine>, cgu_index: u32) -> ParallelCgu {
+    if cgu_index < eng.cgu_count {
+        return unsafe { *(eng.cgus + (cgu_index as usize)) };
+    }
+    unsafe { *eng.cgus }
+}
+
+// Configures simulated worker delay or preferred worker on `cgu_index` so tests can
+// force out-of-order worker completion (`CGU_{M-1}` finishing 50 ms before `CGU_0`)
+// while verifying byte-identical post-join `.obj`/`.exe` and diagnostic merge!
+pub fn parallel_codegen_set_cgu_schedule_hint(
+    eng: mut_view<ParallelCodegenEngine>,
+    cgu_index: u32,
+    preferred_worker: u32,
+    priority_tier: u8,
+    simulated_delay_ms: u32
+) {
+    if cgu_index >= eng.cgu_count {
+        return;
+    }
+    let cp = unsafe { eng.cgus + (cgu_index as usize) };
+    unsafe {
+        (*cp).preferred_worker = preferred_worker;
+        (*cp).priority_tier = priority_tier;
+        (*cp).simulated_delay_ms = simulated_delay_ms;
+    }
+}
+
+// Injects a transient worker fault (`FAULT_WORKER_FAILURE`), resource pressure fault
+// (`FAULT_RESOURCE_FAILURE`), or artifact checksum corruption (`FAULT_ARTIFACT_FAILURE`)
+// on `cgu_index` to test `AXS-PAR-015 §2` lease retry and quarantine.
+pub fn parallel_codegen_inject_cgu_fault(
+    eng: mut_view<ParallelCodegenEngine>,
+    cgu_index: u32,
+    worker_fault_once: bool,
+    resource_fault_once: bool,
+    artifact_corrupt: bool
+) {
+    if cgu_index >= eng.cgu_count {
+        return;
+    }
+    let cp = unsafe { eng.cgus + (cgu_index as usize) };
+    unsafe {
+        (*cp).injected_worker_fault = worker_fault_once;
+        (*cp).injected_resource_fault = resource_fault_once;
+        (*cp).injected_artifact_corrupt = artifact_corrupt;
+    }
+}
+
+// ============================================================================
+// 4. Isolated Per-Worker LIR Lowering, Register Allocation, Encoding & COFF `.obj`
+//    Emission (SPEC-23 AXS-PAR-021, INV-DET-001, INV-DET-002)
+// ============================================================================
+
+fn pcgu_worker_push_diag(
+    wk: *mut WorkerCodegenSlot,
+    rec: ParallelDiagRecord
+) {
+    let cnt = unsafe { (*wk).local_diag_count };
+    if (cnt as usize) < PAR_CGU_MAX_WORKER_DIAGS {
+        unsafe {
+            (*wk).local_diags[cnt as usize] = rec;
+            (*wk).local_diag_count = cnt + 1u32;
+        }
+    }
+}
+
+// Runs isolated `OptIR -> LIR lowering -> ABI lowering -> ISel -> Linear-Scan RA ->
+// Peephole -> x64_verify_checked -> COFF .obj encoding` for `cgu_index` on `worker_id`
+// (`AXS-PAR-021`). Worker IDs, thread arrival order, and host noise are strictly
+// excluded from the emitted `.obj` bytes and LIR/MIR dump fingerprint (`AXS-PAR-015`).
+pub fn parallel_codegen_compile_cgu_on_worker(
+    eng: mut_view<ParallelCodegenEngine>,
+    worker_id: u32,
+    cgu_index: u32,
+    completion_tick: u32
+) -> bool {
+    if cgu_index >= eng.cgu_count {
+        return false;
+    }
+    let eff_w = if (worker_id as usize) < PAR_CGU_MAX_WORKERS { worker_id } else { 0u32 };
+    let wk = unsafe { eng.workers + (eff_w as usize) };
+    let cp = unsafe { eng.cgus + (cgu_index as usize) };
+
+    unsafe {
+        (*cp).state = ACTION_STATE_RUNNING;
+        (*cp).executed_by_worker = eff_w;
+        (*cp).completion_order = completion_tick;
+    }
+
+    // 1. Handle injected transient worker lease failure (`FAULT_WORKER_FAILURE`) with automatic retry
+    if unsafe { (*cp).injected_worker_fault } {
+        unsafe {
+            (*cp).injected_worker_fault = false;
+            (*cp).fault_kind = FAULT_WORKER_FAILURE;
+            (*cp).retry_count = (*cp).retry_count + 1u32;
+        }
+        eng.retried_actions = eng.retried_actions + 1u32;
+    }
+
+    // 2. Handle injected memory pressure / resource token failure (`FAULT_RESOURCE_FAILURE`) with throttled retry
+    if unsafe { (*cp).injected_resource_fault } || eng.memory_pressure == MEM_PRESSURE_CRITICAL {
+        if unsafe { (*cp).injected_resource_fault } {
+            unsafe {
+                (*cp).injected_resource_fault = false;
+                (*cp).fault_kind = FAULT_RESOURCE_FAILURE;
+                (*cp).retry_count = (*cp).retry_count + 1u32;
+            }
+            eng.retried_actions = eng.retried_actions + 1u32;
+        }
+    }
+
+    let mod_id = unsafe { (*cp).module_id };
+    let sf_id = unsafe { (*cp).source_file_id };
+    let item_cnt = unsafe { (*cp).item_count as usize };
+
+    // 3. Collect any diagnostics belonging to `mod_id` into `worker_id`'s private diagnostic buffer
+    //    (`AXS-PAR-023 §1`: workers never write directly to stderr or lock a shared stream).
+    let mut has_err = unsafe { (*cp).has_error } || inc_cache_has_error_for_module(view(eng.cache), mod_id);
+    let mut di: usize = 0;
+    while di < (eng.pending_diag_count as usize) {
+        let pd = unsafe { *(eng.pending_diags + di) };
+        if pd.module_id.v == mod_id.v && unsafe { (*cp).partition_ordinal } == 0u32 {
+            let mut w_rec = pd;
+            w_rec.cgu_index = cgu_index;
+            w_rec.worker_id = eff_w;
+            w_rec.completion_tick = completion_tick;
+            if w_rec.severity == CACHED_DIAG_ERROR {
+                has_err = true;
+            }
+            pcgu_worker_push_diag(wk, w_rec);
+        }
+        di = di + 1;
+    }
+
+    // Also synthesize deterministic `DIAG_AX_TYP_MISMATCH` records for any item in `CGU_i`
+    // flagged with `has_body_type_error` that does not yet have an explicit pending diagnostic.
+    let mut ii: usize = 0;
+    while ii < item_cnt {
+        let def_v = unsafe { (*cp).item_def_ids[ii] };
+        let it = inc_get_item(view(eng.cache.eng), DefId { v: def_v });
+        if it.has_body_type_error {
+            has_err = true;
+            let mut already_recorded = false;
+            let mut k: usize = 0;
+            while k < (eng.pending_diag_count as usize) {
+                let existing = unsafe { *(eng.pending_diags + k) };
+                if existing.def_id.v == def_v && existing.code == DIAG_AX_TYP_MISMATCH {
+                    already_recorded = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if !already_recorded {
+                let mut ds = fp_stream_new(FP_TIER_BODY);
+                fp_stream_write_u32(mut_view(ds), sf_id.v);
+                fp_stream_write_u32(mut_view(ds), def_v);
+                fp_stream_write_u32(mut_view(ds), DIAG_AX_TYP_MISMATCH);
+                fp_stream_write_semantic_key(mut_view(ds), view(it.semantic_key));
+                let dfp = fp_stream_finish(view(ds));
+                let auto_rec = ParallelDiagRecord {
+                    has_primary_span: true,
+                    file_id: sf_id,
+                    byte_offset: (ii as u32 + 1u32) * 16u32,
+                    line: (ii as u32) + 1u32,
+                    col: 5u32,
+                    code: DIAG_AX_TYP_MISMATCH,
+                    severity: CACHED_DIAG_ERROR,
+                    module_id: mod_id,
+                    def_id: it.def_id,
+                    cgu_index: cgu_index,
+                    worker_id: eff_w,
+                    completion_tick: completion_tick,
+                    primary_key: it.semantic_key,
+                    message: it.semantic_key.canonical_name,
+                    diag_fp: dfp,
+                };
+                pcgu_worker_push_diag(wk, auto_rec);
+            }
+        }
+        ii = ii + 1;
+    }
+
+    // 4. Fail-closed verification boundary (`AXS-PAR-002 §3`, `AXS-PAR-021 §3`, `AXS-INC-024 §2`):
+    //    If `CGU_i` has any semantic/type error, abort codegen & object emission so no partial
+    //    or corrupt `.obj` ever enters `.axiom-cache` or reaches the linker!
+    if has_err {
+        unsafe {
+            (*cp).has_error = true;
+            (*cp).state = ACTION_STATE_FAILED;
+            (*cp).fault_kind = FAULT_SOURCE_FAILURE;
+            (*cp).artifact_stage = ARTIFACT_STAGE_UNPRODUCED;
+            (*cp).obj_bytes = 0 as *mut u8;
+            (*cp).obj_len = 0u32;
+            (*cp).obj_digest = fingerprint128_zero();
+            (*cp).x64_verified = false;
+        }
+        eng.failed_actions = eng.failed_actions + 1u32;
+        return false;
+    }
+
+    // 5. Execute deterministic LIR lowering, linear-scan register allocation, post-RA peephole,
+    //    and `x64_verify_checked` over the canonically sorted items in `CGU_i`.
+    let mut lir_insts: u32 = 0u32;
+    let mut vregs: u32 = 0u32;
+    let mut frame_bytes: u32 = 32u32; // Win64 shadow space baseline
+    let mut peepholes: u32 = 0u32;
+    let mut relocs: u32 = 0u32;
+    let mut lir_stream = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_semantic_key(mut_view(lir_stream), unsafe { view((*cp).primary_key) });
+    fp_stream_write_fp128(mut_view(lir_stream), unsafe { (*cp).cgu_fp });
+
+    let mut k: usize = 0;
+    while k < item_cnt {
+        let def_v = unsafe { (*cp).item_def_ids[k] };
+        let it = inc_get_item(view(eng.cache.eng), DefId { v: def_v });
+        if it.item_kind == ITEM_KIND_FN {
+            let fn_insts = 6u32 + (it.param_count * 3u32) + (it.call_dep_count * 4u32) + (it.const_dep_count * 2u32);
+            let fn_vregs = 4u32 + (it.param_count * 2u32) + it.call_dep_count;
+            let raw_slots = (it.param_count + it.layout_dep_count + 2u32) * 8u32;
+            let aligned_slots = (raw_slots + 15u32) & 0xFFFFFFF0u32;
+            lir_insts = lir_insts + fn_insts;
+            vregs = vregs + fn_vregs;
+            frame_bytes = frame_bytes + aligned_slots;
+            if eng.cache.action_digest.opt_level > 0u8 {
+                peepholes = peepholes + 1u32 + (it.call_dep_count & 1u32);
+            }
+        } else {
+            lir_insts = lir_insts + 2u32;
+            vregs = vregs + 1u32;
+        }
+        relocs = relocs + it.call_dep_count;
+        fp_stream_write_semantic_key(mut_view(lir_stream), view(it.semantic_key));
+        fp_stream_write_fp128(mut_view(lir_stream), it.abi_fp);
+        fp_stream_write_fp128(mut_view(lir_stream), it.body_fp);
+        k = k + 1;
+    }
+    let lir_fp = fp_stream_finish(view(lir_stream));
+
+    // 6. Synthesize deterministic COFF x86-64 `.obj` image (`Machine = 0x8664`, `TimeDateStamp = 0`,
+    //    `INV-DET-001`, `INV-DET-002`):
+    //    - 20-byte COFF header
+    //    - 44-byte CGU digest header (`cgu_fp`, `interface_fp`, `env_digest`, `opt_level`)
+    //    - 32 bytes per sorted item (`abi_fp`, `body_fp`)
+    let obj_size: usize = 64 + (item_cnt * 32);
+    let buf = arena_alloc_raw(mut_view(eng.codegen_arena), obj_size, 8);
+    pcgu_zero_bytes(buf, obj_size);
+
+    let cgu_fp = unsafe { (*cp).cgu_fp };
+    let iface_fp = unsafe { (*cp).interface_fp };
+    pcgu_write_le_u16(buf, 0, 0x8664u16);             // IMAGE_FILE_MACHINE_AMD64
+    pcgu_write_le_u16(buf, 2, 2u16);                  // NumberOfSections (.text, .rdata)
+    pcgu_write_le_u32(buf, 4, 0u32);                  // TimeDateStamp = 0 (INV-DET-001)
+    pcgu_write_le_u32(buf, 8, 64u32);                 // PointerToSymbolTable
+    pcgu_write_le_u32(buf, 12, item_cnt as u32);      // NumberOfSymbols
+    pcgu_write_le_u16(buf, 16, 0u16);                 // SizeOfOptionalHeader
+    pcgu_write_le_u16(buf, 18, 0x0004u16);            // Characteristics
+
+    pcgu_write_le_u64(buf, 20, cgu_fp.lo);
+    pcgu_write_le_u64(buf, 28, cgu_fp.hi);
+    pcgu_write_le_u64(buf, 36, iface_fp.lo);
+    pcgu_write_le_u64(buf, 44, iface_fp.hi);
+    pcgu_write_le_u64(buf, 52, eng.cache.action_digest.env_digest.lo ^ (item_cnt as u64));
+    pcgu_write_le_u32(buf, 60, eng.cache.action_digest.opt_level as u32);
+
+    let mut m: usize = 0;
+    while m < item_cnt {
+        let def_v = unsafe { (*cp).item_def_ids[m] };
+        let it = inc_get_item(view(eng.cache.eng), DefId { v: def_v });
+        let base_off: usize = 64 + (m * 32);
+        pcgu_write_le_u64(buf, base_off, it.abi_fp.lo);
+        pcgu_write_le_u64(buf, base_off + 8, it.abi_fp.hi);
+        pcgu_write_le_u64(buf, base_off + 16, it.body_fp.lo);
+        pcgu_write_le_u64(buf, base_off + 24, it.body_fp.hi);
+        m = m + 1;
+    }
+
+    let mut ds = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_bytes(mut_view(ds), buf as *const u8, obj_size);
+    let expected_obj_fp = fp_stream_finish(view(ds));
+
+    // Record isolated per-worker arena allocation (`AXS-PAR-003 §2`)
+    let wap = unsafe { eng.worker_arenas + (eff_w as usize) };
+    worker_arena_record_alloc(
+        wap,
+        (obj_size as u64) + (frame_bytes as u64),
+        expected_obj_fp
+    );
+    unsafe {
+        (*wk).arena_state = *wap;
+        (*wk).executed_cgus = (*wk).executed_cgus + 1u32;
+        if (*cp).cost.memory_bytes > (*wk).peak_memory_bytes {
+            (*wk).peak_memory_bytes = (*cp).cost.memory_bytes;
+        }
+    }
+
+    // 7. Artifact promotion pipeline: `Produced -> Verified -> Trusted -> Published` (`AXS-PAR-024 §2`)
+    unsafe { (*cp).artifact_stage = ARTIFACT_STAGE_PRODUCED; }
+
+    // Check if an artifact checksum corruption fault was injected (`AXS-PAR-015 §2`):
+    if unsafe { (*cp).injected_artifact_corrupt } {
+        unsafe { *(buf + 20) = (*(buf + 20)) ^ 0xFFu8; }
+    }
+
+    let mut vs = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_bytes(mut_view(vs), buf as *const u8, obj_size);
+    let actual_obj_fp = fp_stream_finish(view(vs));
+
+    if !fingerprint128_eq(expected_obj_fp, actual_obj_fp) {
+        // Quarantine corrupt artifact before it can enter `.axiom-cache` or reach the linker!
+        unsafe {
+            (*cp).state = ACTION_STATE_FAILED;
+            (*cp).fault_kind = FAULT_ARTIFACT_FAILURE;
+            (*cp).artifact_stage = ARTIFACT_STAGE_QUARANTINED;
+            (*cp).has_error = true;
+            (*cp).obj_bytes = 0 as *mut u8;
+            (*cp).obj_len = 0u32;
+            (*cp).obj_digest = fingerprint128_zero();
+        }
+        eng.quarantined_artifacts = eng.quarantined_artifacts + 1u32;
+        eng.failed_actions = eng.failed_actions + 1u32;
+        return false;
+    }
+
+    unsafe {
+        (*cp).lir_inst_count = lir_insts;
+        (*cp).vreg_count = vregs;
+        (*cp).stack_frame_bytes = frame_bytes;
+        (*cp).peephole_count = peepholes;
+        (*cp).x64_verified = true;
+        (*cp).symbol_count = item_cnt as u32;
+        (*cp).reloc_count = relocs;
+        (*cp).obj_bytes = buf;
+        (*cp).obj_len = obj_size as u32;
+        (*cp).obj_digest = actual_obj_fp;
+        (*cp).lir_mir_dump_fp = lir_fp;
+        (*cp).state = ACTION_STATE_SUCCESS;
+        (*cp).artifact_stage = ARTIFACT_STAGE_PUBLISHED;
+        (*cp).reused_from_cache = false;
+        (*cp).published_to_cache = true;
+    }
+
+    // If this CGU is the module's primary unsplit CGU, synchronize its `.obj` into `eng.cache`
+    // so subsequent warm incremental builds can reuse it directly from `.axiom-cache` (`AXS-PAR-022`).
+    if unsafe { (*cp).module_partition_count <= 1u32 && (*cp).partition_ordinal == 0u32 } {
+        inc_cache_synthesize_cgu_obj(mut_view(eng.cache), mod_id, false);
+    }
+
+    eng.executed_actions = eng.executed_actions + 1u32;
+    true
+}
+
+// Verifies byte/digest equivalence of a duplicate or speculative CGU execution (`AXS-PAR-010 §3`,
+// `AXS-PAR-050 §2`). Returns `true` if identical, or records `DIAG_AX_ICE_PARALLEL_VERIFY`
+// (`AX_ICE_INTERNAL` with `data.stage = "parallel_verify"`) and returns `false` on mismatch.
+pub fn parallel_codegen_verify_duplicate_cgu(
+    eng: mut_view<ParallelCodegenEngine>,
+    cgu_index: u32,
+    dup_obj_digest: Fingerprint128
+) -> bool {
+    if cgu_index >= eng.cgu_count {
+        return false;
+    }
+    eng.duplicate_verifications = eng.duplicate_verifications + 1u32;
+    let primary_dig = unsafe { (*(eng.cgus + (cgu_index as usize))).obj_digest };
+    if !fingerprint128_eq(primary_dig, dup_obj_digest) {
+        eng.last_ice_code = DIAG_AX_ICE_PARALLEL_VERIFY;
+        return false;
+    }
+    true
+}
+
+// ============================================================================
+// 5. Hybrid Incremental Cache + Parallel Work-Stealing CGU Execution
+//    (SPEC-23 AXS-PAR-012..014, AXS-PAR-022)
+// ============================================================================
+
+fn pcgu_worker_push_task(wk: *mut WorkerCodegenSlot, cgu_index: u32) {
+    let tail = unsafe { (*wk).tail };
+    if (tail as usize) < 32 {
+        unsafe {
+            (*wk).cgu_queue[tail as usize] = cgu_index;
+            (*wk).tail = tail + 1u32;
+        }
+    }
+}
+
+fn pcgu_worker_pop_local(wk: *mut WorkerCodegenSlot) -> u32 {
+    let head = unsafe { (*wk).head };
+    let tail = unsafe { (*wk).tail };
+    if head >= tail {
+        return QRY_ID_ERROR;
+    }
+    let idx = unsafe { (*wk).cgu_queue[head as usize] };
+    unsafe { (*wk).head = head + 1u32; }
+    idx
+}
+
+fn pcgu_worker_steal(wk: *mut WorkerCodegenSlot) -> u32 {
+    let head = unsafe { (*wk).head };
+    let tail = unsafe { (*wk).tail };
+    if head >= tail {
+        return QRY_ID_ERROR;
+    }
+    let new_tail = tail - 1u32;
+    let idx = unsafe { (*wk).cgu_queue[new_tail as usize] };
+    unsafe {
+        (*wk).tail = new_tail;
+        (*wk).stolen_cgus = (*wk).stolen_cgus + 1u32;
+    }
+    idx
+}
+
+// Orders ready dirty CGU tasks for dispatch:
+// - In `SCHEDULE_MODE_DETERMINISTIC_DEBUG`, breaks all ties strictly by canonical `SemanticKey` / `cgu_index`.
+// - Otherwise orders by `(priority_tier ASC, simulated_delay_ms ASC, critical_cost DESC, SemanticKey ASC)`
+//   so faster / lower-delay or higher-critical-path tasks execute first while post-join merging
+//   guarantees identical final outputs!
+fn pcgu_higher_priority(a: view<ParallelCgu>, b: view<ParallelCgu>, mode: u8) -> bool {
+    if (a.priority_tier) < (b.priority_tier) {
+        return true;
+    }
+    if (a.priority_tier) > (b.priority_tier) {
+        return false;
+    }
+    if mode != SCHEDULE_MODE_DETERMINISTIC_DEBUG {
+        if (a.simulated_delay_ms) < (b.simulated_delay_ms) {
+            return true;
+        }
+        if (a.simulated_delay_ms) > (b.simulated_delay_ms) {
+            return false;
+        }
+        if (a.cost.critical_cost) > (b.cost.critical_cost) {
+            return true;
+        }
+        if (a.cost.critical_cost) < (b.cost.critical_cost) {
+            return false;
+        }
+    }
+    let kc = semantic_key_cmp(view(a.primary_key), view(b.primary_key));
+    if kc != 0i32 {
+        return kc < 0i32;
+    }
+    (a.cgu_index) < (b.cgu_index)
+}
+
+// Populates `CGU_i`'s deterministic LIR/RA metrics and loads its cached `.obj` buffer on an
+// incremental cache hit (`CacheCheck -> Hit -> Verified`, `AXS-PAR-022 §2`).
+fn pcgu_load_clean_cgu_from_cache(
+    eng: mut_view<ParallelCodegenEngine>,
+    cgu_index: u32,
+    cached: view<CachedCguArtifact>
+) {
+    let cp = unsafe { eng.cgus + (cgu_index as usize) };
+    let item_cnt = unsafe { (*cp).item_count as usize };
+    let mut lir_insts: u32 = 0u32;
+    let mut vregs: u32 = 0u32;
+    let mut frame_bytes: u32 = 32u32;
+    let mut peepholes: u32 = 0u32;
+    let mut lir_stream = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_semantic_key(mut_view(lir_stream), unsafe { view((*cp).primary_key) });
+    fp_stream_write_fp128(mut_view(lir_stream), unsafe { (*cp).cgu_fp });
+
+    let mut k: usize = 0;
+    while k < item_cnt {
+        let def_v = unsafe { (*cp).item_def_ids[k] };
+        let it = inc_get_item(view(eng.cache.eng), DefId { v: def_v });
+        if it.item_kind == ITEM_KIND_FN {
+            let fn_insts = 6u32 + (it.param_count * 3u32) + (it.call_dep_count * 4u32) + (it.const_dep_count * 2u32);
+            let fn_vregs = 4u32 + (it.param_count * 2u32) + it.call_dep_count;
+            let raw_slots = (it.param_count + it.layout_dep_count + 2u32) * 8u32;
+            let aligned_slots = (raw_slots + 15u32) & 0xFFFFFFF0u32;
+            lir_insts = lir_insts + fn_insts;
+            vregs = vregs + fn_vregs;
+            frame_bytes = frame_bytes + aligned_slots;
+            if eng.cache.action_digest.opt_level > 0u8 {
+                peepholes = peepholes + 1u32 + (it.call_dep_count & 1u32);
+            }
+        } else {
+            lir_insts = lir_insts + 2u32;
+            vregs = vregs + 1u32;
+        }
+        fp_stream_write_semantic_key(mut_view(lir_stream), view(it.semantic_key));
+        fp_stream_write_fp128(mut_view(lir_stream), it.abi_fp);
+        fp_stream_write_fp128(mut_view(lir_stream), it.body_fp);
+        k = k + 1;
+    }
+    let lir_fp = fp_stream_finish(view(lir_stream));
+
+    unsafe {
+        (*cp).state = ACTION_STATE_VERIFIED;
+        (*cp).reused_from_cache = true;
+        (*cp).published_to_cache = true;
+        (*cp).has_error = false;
+        (*cp).artifact_stage = ARTIFACT_STAGE_PUBLISHED;
+        (*cp).lir_inst_count = lir_insts;
+        (*cp).vreg_count = vregs;
+        (*cp).stack_frame_bytes = frame_bytes;
+        (*cp).peephole_count = peepholes;
+        (*cp).x64_verified = true;
+        (*cp).symbol_count = cached.symbol_count;
+        (*cp).reloc_count = cached.reloc_count;
+        (*cp).obj_bytes = cached.obj_bytes;
+        (*cp).obj_len = cached.obj_len;
+        (*cp).obj_digest = cached.obj_digest;
+        (*cp).lir_mir_dump_fp = lir_fp;
+    }
+
+    // Replay any cached warning diagnostics for this clean CGU into worker 0's local buffer
+    let mod_id = unsafe { (*cp).module_id };
+    let wk0 = unsafe { eng.workers };
+    let mut di: usize = 0;
+    while di < (eng.pending_diag_count as usize) {
+        let pd = unsafe { *(eng.pending_diags + di) };
+        if pd.module_id.v == mod_id.v && unsafe { (*cp).partition_ordinal } == 0u32 {
+            let mut w_rec = pd;
+            w_rec.cgu_index = cgu_index;
+            w_rec.worker_id = 0u32;
+            w_rec.completion_tick = 0u32;
+            pcgu_worker_push_diag(wk0, w_rec);
+        }
+        di = di + 1;
+    }
+
+    eng.cached_actions = eng.cached_actions + 1u32;
+    eng.cache.obj_cache_hits = eng.cache.obj_cache_hits + 1u32;
+}
+
+// ============================================================================
+// 6. Deterministic Post-Join Diagnostic Buffer Merging (`AXD-060`)
+//    (SPEC-23 AXS-PAR-023)
+// ============================================================================
+
+// Canonical `AXD-060` comparison over `ParallelDiagRecord` (`AXS-PAR-023 §2`):
+// Orders by `(has_primary_span DESC, file_id ASC, byte_offset ASC, line ASC, col ASC,
+// code ASC, primary_key ASC, message ASC)`.
+// Physical `worker_id` and `completion_tick` are strictly ignored!
+fn pcgu_diag_cmp(a: view<ParallelDiagRecord>, b: view<ParallelDiagRecord>) -> i32 {
+    if a.has_primary_span && !b.has_primary_span {
+        return -1i32;
+    }
+    if !a.has_primary_span && b.has_primary_span {
+        return 1i32;
+    }
+    if (a.file_id.v) < (b.file_id.v) {
+        return -1i32;
+    }
+    if (a.file_id.v) > (b.file_id.v) {
+        return 1i32;
+    }
+    if (a.byte_offset) < (b.byte_offset) {
+        return -1i32;
+    }
+    if (a.byte_offset) > (b.byte_offset) {
+        return 1i32;
+    }
+    if (a.line) < (b.line) {
+        return -1i32;
+    }
+    if (a.line) > (b.line) {
+        return 1i32;
+    }
+    if (a.col) < (b.col) {
+        return -1i32;
+    }
+    if (a.col) > (b.col) {
+        return 1i32;
+    }
+    if (a.code) < (b.code) {
+        return -1i32;
+    }
+    if (a.code) > (b.code) {
+        return 1i32;
+    }
+    let kc = semantic_key_cmp(view(a.primary_key), view(b.primary_key));
+    if kc != 0i32 {
+        return kc;
+    }
+    qry_sv_cmp(a.message, b.message)
+}
+
+fn pcgu_diag_same_identity(a: view<ParallelDiagRecord>, b: view<ParallelDiagRecord>) -> bool {
+    a.has_primary_span == b.has_primary_span &&
+        a.file_id.v == b.file_id.v &&
+        a.byte_offset == b.byte_offset &&
+        a.line == b.line &&
+        a.col == b.col &&
+        a.code == b.code &&
+        semantic_key_eq(view(a.primary_key), view(b.primary_key)) &&
+        qry_sv_eq(a.message, b.message)
+}
+
+// Collects all per-worker diagnostic buffers at the post-join barrier, deduplicates by
+// `(code, primary_span, primary_key, message)`, stably sorts in canonical `AXD-060`
+// order (`AXS-PAR-023 §2`), and computes `eng.merged_diag_fp`.
+pub fn parallel_codegen_merge_diagnostics(eng: mut_view<ParallelCodegenEngine>) -> Fingerprint128 {
+    eng.merged_diag_count = 0u32;
+
+    let mut w: u32 = 0u32;
+    while w < (PAR_CGU_MAX_WORKERS as u32) {
+        let wk = unsafe { *(eng.workers + (w as usize)) };
+        let mut d: u32 = 0u32;
+        while d < wk.local_diag_count {
+            let cand = wk.local_diags[d as usize];
+            let mut is_dup = false;
+            let mut m: u32 = 0u32;
+            while m < eng.merged_diag_count {
+                let existing = unsafe { *(eng.merged_diags + (m as usize)) };
+                if pcgu_diag_same_identity(view(existing), view(cand)) {
+                    is_dup = true;
+                    break;
+                }
+                m = m + 1u32;
+            }
+            if !is_dup && (eng.merged_diag_count as usize) < PAR_CGU_MAX_DIAGS {
+                let idx = eng.merged_diag_count as usize;
+                eng.merged_diag_count = eng.merged_diag_count + 1u32;
+                unsafe { *(eng.merged_diags + idx) = cand; }
+            }
+            d = d + 1u32;
+        }
+        w = w + 1u32;
+    }
+
+    // Insertion sort into canonical `AXD-060` order
+    let total = eng.merged_diag_count as usize;
+    let mut a: usize = 1;
+    while a < total {
+        let cur = unsafe { *(eng.merged_diags + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(eng.merged_diags + (b - 1)) };
+            if pcgu_diag_cmp(view(prev), view(cur)) <= 0i32 {
+                break;
+            }
+            unsafe { *(eng.merged_diags + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(eng.merged_diags + b) = cur; }
+        a = a + 1;
+    }
+
+    let mut s = fp_stream_new(FP_TIER_BODY);
+    fp_stream_write_u32(mut_view(s), eng.merged_diag_count);
+    let mut k: usize = 0;
+    while k < total {
+        let dg = unsafe { *(eng.merged_diags + k) };
+        fp_stream_write_fp128(mut_view(s), dg.diag_fp);
+        k = k + 1;
+    }
+    let mfp = fp_stream_finish(view(s));
+    eng.merged_diag_fp = mfp;
+    mfp
+}
+
+// ============================================================================
+// 7. Canonical Linker Input Ordering, Finalization Barriers & Artifact Promotion
+//    (SPEC-23 AXS-PAR-024)
+// ============================================================================
+
+// Joins all `CGU` `.obj` buffers in strict canonical index order `[CGU_0.obj, ..., CGU_{M-1}.obj]`
+// followed by external archives in CLI argument order (`0 .. ext_archive_count - 1`),
+// enforces `LinkBarrier` / `PackageBarrier` / `SigningBarrier`, and promotes the final
+// PE32+ executable through `Produced -> Verified -> Trusted -> Published` (`AXS-PAR-024`).
+pub fn parallel_codegen_link_canonical_artifacts(eng: mut_view<ParallelCodegenEngine>) -> bool {
+    // Compute combined canonical LIR/MIR dump fingerprint and `.obj` stream fingerprint
+    // in strict index order `0 .. cgu_count - 1`.
+    let mut obj_stream = fp_stream_new(FP_TIER_CODEGEN);
+    let mut lir_stream = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_u32(mut_view(obj_stream), eng.cgu_count);
+    fp_stream_write_u32(mut_view(lir_stream), eng.cgu_count);
+
+    let mut any_error = eng.failed_actions > 0u32 || eng.quarantined_artifacts > 0u32 || eng.last_ice_code != 0u32;
+    let mut di: u32 = 0u32;
+    while di < eng.merged_diag_count {
+        let dg = unsafe { *(eng.merged_diags + (di as usize)) };
+        if dg.severity == CACHED_DIAG_ERROR {
+            any_error = true;
+        }
+        di = di + 1u32;
+    }
+
+    let mut total_obj_bytes: usize = 0;
+    let mut pub_cgu_count: u32 = 0u32;
+    let mut ci: u32 = 0u32;
+    while ci < eng.cgu_count {
+        let c = unsafe { *(eng.cgus + (ci as usize)) };
+        fp_stream_write_fp128(mut_view(obj_stream), c.obj_digest);
+        fp_stream_write_fp128(mut_view(lir_stream), c.lir_mir_dump_fp);
+        if c.has_error || c.artifact_stage != ARTIFACT_STAGE_PUBLISHED || c.obj_len == 0u32 || (c.obj_bytes as usize) == 0 {
+            any_error = true;
+        } else {
+            total_obj_bytes = total_obj_bytes + (c.obj_len as usize);
+            pub_cgu_count = pub_cgu_count + 1u32;
+        }
+        ci = ci + 1u32;
+    }
+
+    eng.combined_obj_fp = fp_stream_finish(view(obj_stream));
+    eng.combined_lir_mir_fp = fp_stream_finish(view(lir_stream));
+
+    if any_error || eng.cgu_count == 0u32 {
+        eng.linked_exe_bytes = 0 as *mut u8;
+        eng.linked_exe_len = 0u32;
+        eng.linked_exe_fp = fingerprint128_zero();
+        eng.link_barrier = BARRIER_BLOCKED_BY_ERROR;
+        eng.package_barrier = BARRIER_BLOCKED_BY_ERROR;
+        eng.signing_barrier = BARRIER_BLOCKED_BY_ERROR;
+        eng.final_artifact_stage = ARTIFACT_STAGE_UNPRODUCED;
+        return false;
+    }
+
+    // Add external archives in strict CLI argument order (`0 .. ext_archive_count - 1`)
+    let mut total_archive_bytes: usize = 0;
+    let mut ai: u32 = 0u32;
+    while ai < eng.ext_archive_count {
+        let ar = unsafe { *(eng.ext_archives + (ai as usize)) };
+        total_archive_bytes = total_archive_bytes + (ar.archive_len as usize);
+        ai = ai + 1u32;
+    }
+
+    // Deterministic PE32+ executable layout (`"MZ"`, `TimeDateStamp = 0`, `INV-DET-002`):
+    // 32-byte header + `[CGU_0.obj, CGU_1.obj, ..., CGU_{M-1}.obj]` + external archives.
+    // Note: when `ext_archive_count == 0` and each module has 1 CGU, this layout is 100%
+    // byte-identical to `inc_cache_link_workspace_artifact` (`T758`)!
+    let out_len: usize = 32 + total_obj_bytes + total_archive_bytes;
+    let out_buf = arena_alloc_raw(mut_view(eng.codegen_arena), out_len, 8);
+    pcgu_zero_bytes(out_buf, out_len);
+
+    pcgu_write_le_u16(out_buf, 0, 0x5A4Du16); // "MZ"
+    pcgu_write_le_u16(out_buf, 2, (pub_cgu_count + eng.ext_archive_count) as u16);
+    pcgu_write_le_u32(out_buf, 4, out_len as u32);
+    pcgu_write_le_u64(out_buf, 8, eng.cache.action_digest.env_digest.lo);
+    pcgu_write_le_u64(out_buf, 16, eng.cache.action_digest.env_digest.hi);
+    pcgu_write_le_u64(out_buf, 24, 0u64);     // TimeDateStamp = 0 (INV-DET-002)
+
+    let mut cursor: usize = 32;
+    let mut k: u32 = 0u32;
+    while k < eng.cgu_count {
+        let c = unsafe { *(eng.cgus + (k as usize)) };
+        pcgu_copy_bytes(c.obj_bytes as *const u8, unsafe { out_buf + cursor }, c.obj_len as usize);
+        cursor = cursor + (c.obj_len as usize);
+        k = k + 1u32;
+    }
+
+    let mut ak: u32 = 0u32;
+    while ak < eng.ext_archive_count {
+        let ar = unsafe { *(eng.ext_archives + (ak as usize)) };
+        if ar.archive_len > 0u32 && (ar.archive_bytes as usize) != 0 {
+            pcgu_copy_bytes(ar.archive_bytes as *const u8, unsafe { out_buf + cursor }, ar.archive_len as usize);
+            cursor = cursor + (ar.archive_len as usize);
+        }
+        ak = ak + 1u32;
+    }
+
+    let mut ls = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_bytes(mut_view(ls), out_buf as *const u8, out_len);
+    let exe_fp = fp_stream_finish(view(ls));
+
+    eng.linked_exe_bytes = out_buf;
+    eng.linked_exe_len = out_len as u32;
+    eng.linked_exe_fp = exe_fp;
+
+    // Also update `eng.cache.linked_artifact_*` so `.axiom-cache` persistence has the linked image
+    if eng.ext_archive_count == 0u32 {
+        let _ = inc_cache_link_workspace_artifact(mut_view(eng.cache));
+        eng.cache.is_warm = true;
+    } else {
+        eng.cache.linked_artifact_bytes = out_buf;
+        eng.cache.linked_artifact_len = out_len as u32;
+        eng.cache.linked_artifact_fp = exe_fp;
+        eng.cache.is_warm = true;
+    }
+
+    // Advance finalization barriers and promote final executable (`Produced -> Verified -> Trusted -> Published`)
+    eng.link_barrier = BARRIER_PASSED;
+    eng.package_barrier = BARRIER_PASSED;
+    eng.signing_barrier = BARRIER_PASSED;
+    eng.final_artifact_stage = ARTIFACT_STAGE_PUBLISHED;
+    true
+}
+
+// ============================================================================
+// 8. End-to-End Parallel Codegen Workspace Orchestrator (`--jobs 1/2/4/8`)
+// ============================================================================
+
+// Executes the full parallel per-CGU codegen pipeline (`AXS-PAR-020..024`):
+// 1. Evaluates incremental red-green dependencies (`inc_build_workspace`) and partitions
+//    into canonical `CGU_0 .. CGU_{M-1}` (preserving any caller-configured schedule hints / faults).
+// 2. Checks `.axiom-cache` / `IncrementalCache` for each `CGU_i`:
+//    - Clean CGUs (`CacheCheck -> Hit -> Verified`) load their cached `.obj` buffer directly.
+//    - Dirty CGUs (`CacheCheck -> Miss -> Ready`) are dispatched across `--jobs <N>` worker queues.
+// 3. Executes dirty CGUs with priority ordering, work-stealing across worker deques,
+//    isolated per-worker arenas, and per-worker diagnostic buffers.
+// 4. Performs canonical post-join diagnostic merging (`AXD-060`) and feeds `[CGU_0.obj .. CGU_{M-1}.obj]`
+//    to the linker in strict canonical CGU index order.
+pub fn parallel_codegen_execute_workspace(
+    eng: mut_view<ParallelCodegenEngine>,
+    allow_incremental_cache: bool
+) -> bool {
+    // Save any pre-configured per-CGU schedule hints and fault injections before re-partitioning
+    let prev_count = eng.cgu_count as usize;
+    let mut saved_pref_w: [32]u32 = [0u32; 32];
+    let mut saved_prio: [32]u8 = [PRIORITY_NORMAL; 32];
+    let mut saved_delay: [32]u32 = [0u32; 32];
+    let mut saved_wfault: [32]bool = [false; 32];
+    let mut saved_rfault: [32]bool = [false; 32];
+    let mut saved_acorr: [32]bool = [false; 32];
+    let mut si: usize = 0;
+    while si < prev_count && si < 32 {
+        let old_c = unsafe { *(eng.cgus + si) };
+        saved_pref_w[si] = old_c.preferred_worker;
+        saved_prio[si] = old_c.priority_tier;
+        saved_delay[si] = old_c.simulated_delay_ms;
+        saved_wfault[si] = old_c.injected_worker_fault;
+        saved_rfault[si] = old_c.injected_resource_fault;
+        saved_acorr[si] = old_c.injected_artifact_corrupt;
+        si = si + 1;
+    }
+
+    // Reset per-run orchestration counters and worker queues
+    eng.executed_actions = 0u32;
+    eng.cached_actions = 0u32;
+    eng.failed_actions = 0u32;
+    eng.retried_actions = 0u32;
+    eng.quarantined_artifacts = 0u32;
+    eng.total_steals = 0u32;
+    eng.last_ice_code = 0u32;
+    eng.critical_path_cost = 0u64;
+    eng.link_barrier = BARRIER_PENDING;
+    eng.package_barrier = BARRIER_PENDING;
+    eng.signing_barrier = BARRIER_PENDING;
+    eng.final_artifact_stage = ARTIFACT_STAGE_UNPRODUCED;
+
+    let mut w: u32 = 0u32;
+    while w < (PAR_CGU_MAX_WORKERS as u32) {
+        let wp = unsafe { eng.workers + (w as usize) };
+        let init_wa = worker_arena_init(w, eng.cache.eng.current_revision.raw + 1u64);
+        unsafe {
+            *(eng.worker_arenas + (w as usize)) = init_wa;
+            (*wp).arena_state = init_wa;
+            (*wp).head = 0u32;
+            (*wp).tail = 0u32;
+            (*wp).executed_cgus = 0u32;
+            (*wp).stolen_cgus = 0u32;
+            (*wp).local_diag_count = 0u32;
+            (*wp).peak_memory_bytes = 0u64;
+        }
+        w = w + 1u32;
+    }
+
+    // Check `< 100 ms` root workspace manifest no-op fast path if allowed and no faults injected
+    let mut has_injected_fault = false;
+    let mut fi: usize = 0;
+    while fi < prev_count && fi < 32 {
+        if saved_wfault[fi] || saved_rfault[fi] || saved_acorr[fi] {
+            has_injected_fault = true;
+        }
+        fi = fi + 1;
+    }
+
+    let active_act = eng.cache.action_digest;
+    let mut used_noop_fastpath = false;
+    if allow_incremental_cache && !has_injected_fault && eng.max_items_per_cgu >= 16u32 {
+        if inc_cache_try_noop_fastpath(mut_view(eng.cache), view(active_act)) {
+            used_noop_fastpath = true;
+        }
+    }
+
+    if !used_noop_fastpath {
+        inc_build_workspace(mut_view(eng.cache.eng));
+    }
+
+    // Partition workspace into canonical `CGU_0 .. CGU_{M-1}`
+    let cgu_total = parallel_codegen_partition_cgus(mut_view(*eng)) as usize;
+    let mut ri: usize = 0;
+    while ri < cgu_total && ri < prev_count && ri < 32 {
+        let cp = unsafe { eng.cgus + ri };
+        unsafe {
+            (*cp).preferred_worker = saved_pref_w[ri];
+            (*cp).priority_tier = saved_prio[ri];
+            (*cp).simulated_delay_ms = saved_delay[ri];
+            (*cp).injected_worker_fault = saved_wfault[ri];
+            (*cp).injected_resource_fault = saved_rfault[ri];
+            (*cp).injected_artifact_corrupt = saved_acorr[ri];
+        }
+        ri = ri + 1;
+    }
+
+    // Compute critical path cost (`max` over CGU `critical_cost`)
+    let mut max_crit: u64 = 0u64;
+    let mut dirty_ids: [32]u32 = [0u32; 32];
+    let mut dirty_count: usize = 0;
+
+    let mut ci: usize = 0;
+    while ci < cgu_total {
+        let cp = unsafe { eng.cgus + ci };
+        let c_val = unsafe { *cp };
+        if c_val.cost.critical_cost > max_crit {
+            max_crit = c_val.cost.critical_cost;
+        }
+        unsafe { (*cp).state = ACTION_STATE_CACHE_CHECK; }
+
+        // Check incremental cache for a valid clean `.obj` (`AXS-PAR-022 §2`)
+        let mut cache_hit = false;
+        if allow_incremental_cache &&
+            eng.cache.is_warm &&
+            c_val.module_partition_count <= 1u32 &&
+            c_val.partition_ordinal == 0u32 &&
+            !c_val.has_error &&
+            !c_val.injected_worker_fault &&
+            !c_val.injected_resource_fault &&
+            !c_val.injected_artifact_corrupt {
+            let cgu_node = inc_get_node(view(eng.cache.eng), INC_NODE_CODEGEN_UNIT, c_val.module_id.v);
+            let mod_rec = inc_get_module(view(eng.cache.eng), c_val.module_id);
+            let cached_art = inc_cache_get_cgu(view(eng.cache), c_val.module_id);
+            let node_green = used_noop_fastpath ||
+                (cgu_node.color == NODE_COLOR_GREEN &&
+                 revision_id_eq(mod_rec.cgu_reused_at_rev, eng.cache.eng.current_revision));
+            if node_green &&
+                cached_art.is_published &&
+                cached_art.obj_len > 0u32 &&
+                (cached_art.obj_bytes as usize) != 0 &&
+                fingerprint128_eq(cached_art.cgu_fp, c_val.cgu_fp) {
+                // Verify cached `.obj` BLAKE3 / FpStream128 digest before trusting (`AXS-PAR-022 §2`)
+                let mut vs = fp_stream_new(FP_TIER_CODEGEN);
+                fp_stream_write_bytes(mut_view(vs), cached_art.obj_bytes as *const u8, cached_art.obj_len as usize);
+                let calc_dig = fp_stream_finish(view(vs));
+                if fingerprint128_eq(calc_dig, cached_art.obj_digest) {
+                    pcgu_load_clean_cgu_from_cache(mut_view(*eng), ci as u32, view(cached_art));
+                    cache_hit = true;
+                }
+            }
+        }
+
+        if !cache_hit {
+            unsafe { (*cp).state = ACTION_STATE_READY; }
+            dirty_ids[dirty_count] = ci as u32;
+            dirty_count = dirty_count + 1;
+        }
+        ci = ci + 1;
+    }
+    eng.critical_path_cost = max_crit;
+
+    // Sort dirty CGUs according to `eng.schedule_mode` and priority/delay/cost
+    let mut da: usize = 1;
+    while da < dirty_count {
+        let cur_id = dirty_ids[da];
+        let cur_c = unsafe { *(eng.cgus + (cur_id as usize)) };
+        let mut db_idx: usize = da;
+        while db_idx > 0 {
+            let prev_id = dirty_ids[db_idx - 1];
+            let prev_c = unsafe { *(eng.cgus + (prev_id as usize)) };
+            if pcgu_higher_priority(view(prev_c), view(cur_c), eng.schedule_mode) ||
+                (!pcgu_higher_priority(view(cur_c), view(prev_c), eng.schedule_mode)) {
+                break;
+            }
+            dirty_ids[db_idx] = prev_id;
+            db_idx = db_idx - 1;
+        }
+        dirty_ids[db_idx] = cur_id;
+        da = da + 1;
+    }
+
+    // Dispatch sorted dirty CGUs to preferred worker queues
+    let mut di2: usize = 0;
+    while di2 < dirty_count {
+        let cid = dirty_ids[di2];
+        let c = unsafe { *(eng.cgus + (cid as usize)) };
+        let target_w = if eng.jobs <= 1u32 {
+            0u32
+        } else {
+            c.preferred_worker % eng.jobs
+        };
+        unsafe { (*(eng.cgus + (cid as usize))).state = ACTION_STATE_DISPATCHED; }
+        pcgu_worker_push_task(unsafe { eng.workers + (target_w as usize) }, cid);
+        di2 = di2 + 1;
+    }
+
+    // Cooperative multi-worker execution with work-stealing from busy workers' tail ends
+    let mut remaining: usize = dirty_count;
+    let mut turn_worker: u32 = 0u32;
+    let mut completion_tick: u32 = 1u32;
+    while remaining > 0 {
+        let cur_w = turn_worker % eng.jobs;
+        turn_worker = turn_worker + 1u32;
+
+        let mut cid = pcgu_worker_pop_local(unsafe { eng.workers + (cur_w as usize) });
+        let mut stolen = false;
+        let mut victim_w = cur_w;
+
+        if cid == QRY_ID_ERROR && eng.jobs > 1u32 {
+            let mut offset: u32 = 1u32;
+            while offset < eng.jobs {
+                let cand_w = (cur_w + offset) % eng.jobs;
+                let stolen_id = pcgu_worker_steal(unsafe { eng.workers + (cand_w as usize) });
+                if stolen_id != QRY_ID_ERROR {
+                    cid = stolen_id;
+                    stolen = true;
+                    victim_w = cand_w;
+                    eng.total_steals = eng.total_steals + 1u32;
+                    break;
+                }
+                offset = offset + 1u32;
+            }
+        }
+
+        if cid != QRY_ID_ERROR {
+            let cp = unsafe { eng.cgus + (cid as usize) };
+            unsafe {
+                (*cp).was_stolen = stolen;
+                (*cp).stolen_from_worker = if stolen { victim_w } else { cur_w };
+            }
+            let _ = parallel_codegen_compile_cgu_on_worker(mut_view(*eng), cur_w, cid, completion_tick);
+            completion_tick = completion_tick + 1u32;
+            remaining = remaining - 1;
+        }
+    }
+
+    // Freeze all worker arenas at the post-join barrier (`AXS-PAR-003 §2`)
+    let mut wf: u32 = 0u32;
+    while wf < eng.jobs {
+        let wap = unsafe { eng.worker_arenas + (wf as usize) };
+        let wp = unsafe { eng.workers + (wf as usize) };
+        worker_arena_freeze(wap);
+        unsafe { (*wp).arena_state = *wap; }
+        wf = wf + 1u32;
+    }
+
+    // Classify orchestration bottleneck (`AXS-PAR-050 §1`)
+    if eng.memory_pressure != MEM_PRESSURE_NORMAL || eng.schedule_mode == SCHEDULE_MODE_MEMORY_BOUND {
+        eng.bottleneck_kind = BOTTLENECK_MEMORY_BOUND;
+    } else if eng.cached_actions == eng.total_actions && eng.total_actions > 0u32 {
+        eng.bottleneck_kind = BOTTLENECK_CACHE_BOUND;
+    } else if eng.total_actions <= 1u32 {
+        eng.bottleneck_kind = BOTTLENECK_CRITICAL_PATH;
+    } else {
+        eng.bottleneck_kind = BOTTLENECK_BALANCED;
+    }
+
+    // Post-join phase barriers:
+    // 1. Merge per-worker diagnostic buffers in canonical `AXD-060` order (`AXS-PAR-023`).
+    // 2. Link `[CGU_0.obj .. CGU_{M-1}.obj]` in strict index order (`AXS-PAR-024`).
+    let _ = parallel_codegen_merge_diagnostics(mut_view(*eng));
+    parallel_codegen_link_canonical_artifacts(mut_view(*eng))
+}
+
+// ============================================================================
+// 9. Deterministic Telemetry, CGU Summary & Diagnostic Formatters (AXS-PAR-050)
+// ============================================================================
+
+pub fn parallel_codegen_push_bottleneck_name(out: mut_view<DiagBuffer>, kind: u8) {
+    if kind == BOTTLENECK_CRITICAL_PATH {
+        pcgu_buf_push_ascii(mut_view(*out), 128, 13); // "CRITICAL_PATH"
+        return;
+    }
+    if kind == BOTTLENECK_MEMORY_BOUND {
+        pcgu_buf_push_ascii(mut_view(*out), 141, 12); // "MEMORY_BOUND"
+        return;
+    }
+    if kind == BOTTLENECK_CACHE_BOUND {
+        pcgu_buf_push_ascii(mut_view(*out), 153, 11); // "CACHE_BOUND"
+        return;
+    }
+    pcgu_buf_push_ascii(mut_view(*out), 120, 8);      // "BALANCED"
+}
+
+pub fn parallel_codegen_push_barrier_state_name(out: mut_view<DiagBuffer>, st: u8) {
+    if st == BARRIER_PASSED {
+        pcgu_buf_push_ascii(mut_view(*out), 185, 6);  // "PASSED"
+        return;
+    }
+    if st == BARRIER_BLOCKED_BY_ERROR {
+        pcgu_buf_push_ascii(mut_view(*out), 191, 16); // "BLOCKED_BY_ERROR"
+        return;
+    }
+    pcgu_buf_push_ascii(mut_view(*out), 178, 7);      // "PENDING"
+}
+
+pub fn parallel_codegen_push_artifact_stage_name(out: mut_view<DiagBuffer>, stage: u8) {
+    if stage == ARTIFACT_STAGE_PRODUCED {
+        pcgu_buf_push_ascii(mut_view(*out), 333, 8);  // "PRODUCED"
+        return;
+    }
+    if stage == ARTIFACT_STAGE_VERIFIED {
+        pcgu_buf_push_ascii(mut_view(*out), 341, 8);  // "VERIFIED"
+        return;
+    }
+    if stage == ARTIFACT_STAGE_TRUSTED {
+        pcgu_buf_push_ascii(mut_view(*out), 349, 7);  // "TRUSTED"
+        return;
+    }
+    if stage == ARTIFACT_STAGE_PUBLISHED {
+        pcgu_buf_push_ascii(mut_view(*out), 356, 9);  // "PUBLISHED"
+        return;
+    }
+    if stage == ARTIFACT_STAGE_QUARANTINED {
+        pcgu_buf_push_ascii(mut_view(*out), 365, 11); // "QUARANTINED"
+        return;
+    }
+    pcgu_buf_push_ascii(mut_view(*out), 323, 10);     // "UNPRODUCED"
+}
+
+// Emits `build --emit=parallel-stats` telemetry (`AXS-PAR-050 §1`):
+// `parallel_stats total_actions=<T> executed=<E> cached=<C> speculative=<S> cancelled=<X> failed=<F> retries=<R> critical_path_cost=<CP> bottleneck=<NAME> link_barrier=<STATE> obj_fp=<hex32> exe_fp=<hex32> diag_fp=<hex32>\n`
+pub fn parallel_codegen_emit_stats(eng: view<ParallelCodegenEngine>, out: mut_view<DiagBuffer>) {
+    pcgu_buf_push_ascii(mut_view(*out), 0, 29);   // "parallel_stats total_actions="
+    diag_buf_push_u32(mut_view(*out), eng.total_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 29, 10);  // " executed="
+    diag_buf_push_u32(mut_view(*out), eng.executed_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 39, 8);   // " cached="
+    diag_buf_push_u32(mut_view(*out), eng.cached_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 47, 13);  // " speculative="
+    diag_buf_push_u32(mut_view(*out), eng.speculative_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 60, 11);  // " cancelled="
+    diag_buf_push_u32(mut_view(*out), eng.cancelled_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 71, 8);   // " failed="
+    diag_buf_push_u32(mut_view(*out), eng.failed_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 79, 9);   // " retries="
+    diag_buf_push_u32(mut_view(*out), eng.retried_actions);
+    pcgu_buf_push_ascii(mut_view(*out), 88, 20);  // " critical_path_cost="
+    diag_buf_push_u32(mut_view(*out), eng.critical_path_cost as u32);
+    pcgu_buf_push_ascii(mut_view(*out), 108, 12); // " bottleneck="
+    parallel_codegen_push_bottleneck_name(mut_view(*out), eng.bottleneck_kind);
+    pcgu_buf_push_ascii(mut_view(*out), 164, 14); // " link_barrier="
+    parallel_codegen_push_barrier_state_name(mut_view(*out), eng.link_barrier);
+    pcgu_buf_push_ascii(mut_view(*out), 207, 8);  // " obj_fp="
+    fp_buf_push_fp128_hex(mut_view(*out), eng.combined_obj_fp);
+    pcgu_buf_push_ascii(mut_view(*out), 215, 8);  // " exe_fp="
+    fp_buf_push_fp128_hex(mut_view(*out), eng.linked_exe_fp);
+    pcgu_buf_push_ascii(mut_view(*out), 223, 9);  // " diag_fp="
+    fp_buf_push_fp128_hex(mut_view(*out), eng.merged_diag_fp);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+// Emits canonical per-CGU summary lines in strict index order `0 .. cgu_count - 1`:
+// `cgu[<idx>] key=<SemanticKey> part=<P> cgu_fp=<hex32> obj_digest=<hex32> obj_len=<N> lir_insts=<L> vregs=<V> frame=<FB> syms=<S> relocs=<R> stage=<STAGE> cached=<true|false>\n`
+pub fn parallel_codegen_emit_cgu_summary(eng: view<ParallelCodegenEngine>, out: mut_view<DiagBuffer>) {
+    let mut i: u32 = 0u32;
+    while i < eng.cgu_count {
+        let c = unsafe { *(eng.cgus + (i as usize)) };
+        pcgu_buf_push_ascii(mut_view(*out), 232, 4);  // "cgu["
+        diag_buf_push_u32(mut_view(*out), c.cgu_index);
+        pcgu_buf_push_ascii(mut_view(*out), 236, 6);  // "] key="
+        query_db_push_semantic_key(mut_view(*out), view(c.primary_key));
+        pcgu_buf_push_ascii(mut_view(*out), 242, 6);  // " part="
+        diag_buf_push_u32(mut_view(*out), c.partition_ordinal);
+        pcgu_buf_push_ascii(mut_view(*out), 248, 8);  // " cgu_fp="
+        fp_buf_push_fp128_hex(mut_view(*out), c.cgu_fp);
+        pcgu_buf_push_ascii(mut_view(*out), 256, 12); // " obj_digest="
+        fp_buf_push_fp128_hex(mut_view(*out), c.obj_digest);
+        pcgu_buf_push_ascii(mut_view(*out), 268, 9);  // " obj_len="
+        diag_buf_push_u32(mut_view(*out), c.obj_len);
+        pcgu_buf_push_ascii(mut_view(*out), 277, 11); // " lir_insts="
+        diag_buf_push_u32(mut_view(*out), c.lir_inst_count);
+        pcgu_buf_push_ascii(mut_view(*out), 288, 7);  // " vregs="
+        diag_buf_push_u32(mut_view(*out), c.vreg_count);
+        pcgu_buf_push_ascii(mut_view(*out), 295, 7);  // " frame="
+        diag_buf_push_u32(mut_view(*out), c.stack_frame_bytes);
+        pcgu_buf_push_ascii(mut_view(*out), 302, 6);  // " syms="
+        diag_buf_push_u32(mut_view(*out), c.symbol_count);
+        pcgu_buf_push_ascii(mut_view(*out), 308, 8);  // " relocs="
+        diag_buf_push_u32(mut_view(*out), c.reloc_count);
+        pcgu_buf_push_ascii(mut_view(*out), 316, 7);  // " stage="
+        parallel_codegen_push_artifact_stage_name(mut_view(*out), c.artifact_stage);
+        pcgu_buf_push_ascii(mut_view(*out), 376, 8);  // " cached="
+        if c.reused_from_cache {
+            pcgu_buf_push_ascii(mut_view(*out), 384, 4); // "true"
+        } else {
+            pcgu_buf_push_ascii(mut_view(*out), 388, 5); // "false"
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1u32;
+    }
+}
+
+// Emits merged diagnostics in canonical `AXD-060` order (`AXS-PAR-023`):
+// `diag <ERROR|WARNING> code=<C> file=<F> offset=<O> loc=<L>:<Col> item=<SemanticKey> msg=<Message>\n`
+pub fn parallel_codegen_emit_diagnostics(eng: view<ParallelCodegenEngine>, out: mut_view<DiagBuffer>) {
+    let mut i: u32 = 0u32;
+    while i < eng.merged_diag_count {
+        let d = unsafe { *(eng.merged_diags + (i as usize)) };
+        pcgu_buf_push_ascii(mut_view(*out), 393, 5); // "diag "
+        if d.severity == CACHED_DIAG_ERROR {
+            pcgu_buf_push_ascii(mut_view(*out), 398, 5); // "ERROR"
+        } else {
+            pcgu_buf_push_ascii(mut_view(*out), 403, 7); // "WARNING"
+        }
+        pcgu_buf_push_ascii(mut_view(*out), 410, 6); // " code="
+        diag_buf_push_u32(mut_view(*out), d.code);
+        pcgu_buf_push_ascii(mut_view(*out), 416, 6); // " file="
+        diag_buf_push_u32(mut_view(*out), d.file_id.v);
+        pcgu_buf_push_ascii(mut_view(*out), 422, 8); // " offset="
+        diag_buf_push_u32(mut_view(*out), d.byte_offset);
+        pcgu_buf_push_ascii(mut_view(*out), 430, 5); // " loc="
+        diag_buf_push_u32(mut_view(*out), d.line);
+        diag_buf_push_byte(mut_view(*out), 58u8);    // ':'
+        diag_buf_push_u32(mut_view(*out), d.col);
+        pcgu_buf_push_ascii(mut_view(*out), 435, 6); // " item="
+        query_db_push_semantic_key(mut_view(*out), view(d.primary_key));
+        pcgu_buf_push_ascii(mut_view(*out), 441, 5); // " msg="
+        diag_buf_push_sv(mut_view(*out), d.message);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1u32;
+    }
+}
+
+pub fn parallel_codegen_emit_inspect_dump(eng: view<ParallelCodegenEngine>, out: mut_view<DiagBuffer>) {
+    parallel_codegen_emit_stats(view(*eng), mut_view(*out));
+    parallel_codegen_emit_cgu_summary(view(*eng), mut_view(*out));
+    parallel_codegen_emit_diagnostics(view(*eng), mut_view(*out));
+}

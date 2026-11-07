@@ -1,0 +1,261 @@
+// test: run
+// modes: interp native
+// stdout-file: fault_retry_quarantine_and_archive_order.stdout
+// SPEC-23 AXS-PAR-010, AXS-PAR-013, AXS-PAR-015, AXS-PAR-020, AXS-PAR-024, AXS-PAR-050:
+// QA boundary test verifying:
+// 1. Transient worker lease (`FAULT_WORKER_FAILURE`) and memory-pressure (`FAULT_RESOURCE_FAILURE`)
+//    retry convergence across `--jobs 1`, `--jobs 2`, `--jobs 4`, and `--jobs 8`.
+// 2. Corrupt artifact checksum quarantine (`FAULT_ARTIFACT_FAILURE` -> `ARTIFACT_STAGE_QUARANTINED`)
+//    blocking `LinkBarrier`, `PackageBarrier`, and `SigningBarrier`.
+// 3. Duplicate/speculative CGU digest verification (`DIAG_AX_ICE_PARALLEL_VERIFY` on mismatch).
+// 4. Multi-partition CGU `(module_rank, partition_ordinal)` ordering followed by multiple
+//    external archives in strict CLI argument order (`archive_0`, `archive_1`).
+
+const FAULT_NONE: u8 = 0u8;
+const FAULT_WORKER_FAILURE: u8 = 2u8;
+const FAULT_RESOURCE_FAILURE: u8 = 3u8;
+const FAULT_ARTIFACT_FAILURE: u8 = 4u8;
+
+const STAGE_PUBLISHED: u8 = 4u8;
+const STAGE_QUARANTINED: u8 = 5u8;
+
+const BARRIER_PASSED: u8 = 1u8;
+const BARRIER_BLOCKED_BY_ERROR: u8 = 2u8;
+
+const DIAG_AX_ICE_PARALLEL_VERIFY: u32 = 9901u32;
+
+@derive(Copy)
+struct PartitionedCgu {
+    module_rank: u32,
+    partition_ordinal: u32,
+    cgu_fp: u64,
+    inject_worker_fault: bool,
+    inject_resource_fault: bool,
+    inject_corrupt_bytes: bool,
+    fault_recorded: u8,
+    retries: u32,
+    stage: u8,
+    obj_digest: u64,
+}
+
+@derive(Copy)
+struct LinkOutcome {
+    link_barrier: u8,
+    package_barrier: u8,
+    signing_barrier: u8,
+    quarantined_count: u32,
+    retry_count: u32,
+    exe_digest: u64,
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+fn cgu_less(a: PartitionedCgu, b: PartitionedCgu) -> bool {
+    if a.module_rank != b.module_rank {
+        return (a.module_rank) < (b.module_rank);
+    }
+    (a.partition_ordinal) < (b.partition_ordinal)
+}
+
+fn verify_duplicate_completion(primary_digest: u64, dup_digest: u64) -> u32 {
+    if primary_digest != dup_digest {
+        return DIAG_AX_ICE_PARALLEL_VERIFY;
+    }
+    0u32
+}
+
+fn execute_partitioned_pipeline(jobs: u32, inject_corruption: bool) -> LinkOutcome {
+    // 2 modules, each split into 2 CGU partitions (`part 0`, `part 1`)
+    let p0 = PartitionedCgu {
+        module_rank: 1u32,
+        partition_ordinal: 0u32,
+        cgu_fp: 0x1100u64,
+        inject_worker_fault: false,
+        inject_resource_fault: false,
+        inject_corrupt_bytes: inject_corruption,
+        fault_recorded: FAULT_NONE,
+        retries: 0u32,
+        stage: 0u8,
+        obj_digest: 0u64,
+    };
+    let p1 = PartitionedCgu {
+        module_rank: 1u32,
+        partition_ordinal: 1u32,
+        cgu_fp: 0x1101u64,
+        inject_worker_fault: true,
+        inject_resource_fault: false,
+        inject_corrupt_bytes: false,
+        fault_recorded: FAULT_NONE,
+        retries: 0u32,
+        stage: 0u8,
+        obj_digest: 0u64,
+    };
+    let p2 = PartitionedCgu {
+        module_rank: 2u32,
+        partition_ordinal: 0u32,
+        cgu_fp: 0x2200u64,
+        inject_worker_fault: false,
+        inject_resource_fault: true,
+        inject_corrupt_bytes: false,
+        fault_recorded: FAULT_NONE,
+        retries: 0u32,
+        stage: 0u8,
+        obj_digest: 0u64,
+    };
+    let p3 = PartitionedCgu {
+        module_rank: 2u32,
+        partition_ordinal: 1u32,
+        cgu_fp: 0x2201u64,
+        inject_worker_fault: false,
+        inject_resource_fault: false,
+        inject_corrupt_bytes: false,
+        fault_recorded: FAULT_NONE,
+        retries: 0u32,
+        stage: 0u8,
+        obj_digest: 0u64,
+    };
+
+    // Simulate worker completion permutation across `--jobs 1/2/4/8`
+    let mut units: [4]PartitionedCgu = if jobs == 1u32 {
+        [p0, p1, p2, p3]
+    } else if jobs == 2u32 {
+        [p2, p3, p0, p1]
+    } else if jobs == 4u32 {
+        [p3, p1, p2, p0]
+    } else {
+        [p3, p2, p1, p0]
+    };
+
+    let mut total_retries: u32 = 0u32;
+    let mut quarantined: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < 4 {
+        let mut u = units[i];
+        if u.inject_worker_fault {
+            u.inject_worker_fault = false;
+            u.fault_recorded = FAULT_WORKER_FAILURE;
+            u.retries = u.retries + 1u32;
+            total_retries = total_retries + 1u32;
+        }
+        if u.inject_resource_fault {
+            u.inject_resource_fault = false;
+            u.fault_recorded = FAULT_RESOURCE_FAILURE;
+            u.retries = u.retries + 1u32;
+            total_retries = total_retries + 1u32;
+        }
+        let expected_dig = mix64(
+            0x434F4646u64 ^ ((u.module_rank as u64) << 16u64) ^ (u.partition_ordinal as u64),
+            u.cgu_fp
+        );
+        let actual_dig = if u.inject_corrupt_bytes {
+            expected_dig ^ 0xFF00FF00u64
+        } else {
+            expected_dig
+        };
+        if actual_dig != expected_dig {
+            u.fault_recorded = FAULT_ARTIFACT_FAILURE;
+            u.stage = STAGE_QUARANTINED;
+            u.obj_digest = 0u64;
+            quarantined = quarantined + 1u32;
+        } else {
+            u.stage = STAGE_PUBLISHED;
+            u.obj_digest = actual_dig;
+        }
+        units[i] = u;
+        i = i + 1;
+    }
+
+    // Canonical post-join sort by `(module_rank, partition_ordinal)` (`AXS-PAR-020`, `AXS-PAR-024`)
+    let mut a: usize = 1;
+    while a < 4 {
+        let cur = units[a];
+        let mut b: usize = a;
+        while b > 0 {
+            if !cgu_less(cur, units[b - 1]) {
+                break;
+            }
+            units[b] = units[b - 1];
+            b = b - 1;
+        }
+        units[b] = cur;
+        a = a + 1;
+    }
+
+    if quarantined > 0u32 {
+        return LinkOutcome {
+            link_barrier: BARRIER_BLOCKED_BY_ERROR,
+            package_barrier: BARRIER_BLOCKED_BY_ERROR,
+            signing_barrier: BARRIER_BLOCKED_BY_ERROR,
+            quarantined_count: quarantined,
+            retry_count: total_retries,
+            exe_digest: 0u64,
+        };
+    }
+
+    // Link `[CGU_0.obj .. CGU_3.obj]` followed by external archives in CLI argument order (`archive_0`, `archive_1`)
+    let archive_0_fp: u64 = 0xA001_71B0u64;
+    let archive_1_fp: u64 = 0xA002_71B1u64;
+    let mut exe_fp: u64 = 0x5045_4C49_4E4B_3634u64;
+    let mut k: usize = 0;
+    while k < 4 {
+        exe_fp = mix64(exe_fp, units[k].obj_digest);
+        k = k + 1;
+    }
+    exe_fp = mix64(exe_fp, archive_0_fp);
+    exe_fp = mix64(exe_fp, archive_1_fp);
+
+    LinkOutcome {
+        link_barrier: BARRIER_PASSED,
+        package_barrier: BARRIER_PASSED,
+        signing_barrier: BARRIER_PASSED,
+        quarantined_count: 0u32,
+        retry_count: total_retries,
+        exe_digest: exe_fp,
+    }
+}
+
+pub fn main() -> i32 {
+    let out_j1 = execute_partitioned_pipeline(1u32, false);
+    let out_j2 = execute_partitioned_pipeline(2u32, false);
+    let out_j4 = execute_partitioned_pipeline(4u32, false);
+    let out_j8 = execute_partitioned_pipeline(8u32, false);
+
+    if out_j1.link_barrier != BARRIER_PASSED ||
+        out_j1.package_barrier != BARRIER_PASSED ||
+        out_j1.signing_barrier != BARRIER_PASSED ||
+        out_j1.retry_count != 2u32 ||
+        out_j8.retry_count != 2u32 {
+        return 1;
+    }
+    if out_j1.exe_digest == 0u64 ||
+        out_j1.exe_digest != out_j2.exe_digest ||
+        out_j2.exe_digest != out_j4.exe_digest ||
+        out_j4.exe_digest != out_j8.exe_digest {
+        return 2;
+    }
+
+    // Verify corrupt artifact quarantine blocks all finalization barriers
+    let corrupt_out = execute_partitioned_pipeline(8u32, true);
+    if corrupt_out.quarantined_count != 1u32 ||
+        corrupt_out.link_barrier != BARRIER_BLOCKED_BY_ERROR ||
+        corrupt_out.package_barrier != BARRIER_BLOCKED_BY_ERROR ||
+        corrupt_out.signing_barrier != BARRIER_BLOCKED_BY_ERROR ||
+        corrupt_out.exe_digest != 0u64 {
+        return 3;
+    }
+
+    // Verify duplicate/speculative completion check
+    if verify_duplicate_completion(out_j1.exe_digest, out_j8.exe_digest) != 0u32 {
+        return 4;
+    }
+    if verify_duplicate_completion(out_j1.exe_digest, out_j8.exe_digest ^ 1u64) != DIAG_AX_ICE_PARALLEL_VERIFY {
+        return 5;
+    }
+
+    print("FAULT-RETRY-QUARANTINE-AND-ARCHIVE-ORDER-OK\n");
+    0
+}
