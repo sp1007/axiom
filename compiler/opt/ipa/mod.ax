@@ -1,0 +1,2655 @@
+// Interprocedural Call-Site Constant/Closure Specialization & Tail-Call Optimization (T614 / E15.4).
+// Implements SPEC-73 §§5, 7, 8, 9 (AXS-INL-027..031, AXS-INL-033, AXS-INL-034, AXS-INL-035;
+// REQ-OPT-002..003, REQ-OPT-087..102):
+//   - Canonical `SpecializationKey` & deterministic clone symbol mangling (`AXS-INL-028`, `AXS-INL-030`)
+//   - Representation-equivalent code sharing with strict function-pointer identity preservation (`AXS-INL-029`, `REQ-OPT-098..099`)
+//   - Partial call-site constant, enum-tag, and closure specialization with `SpecializationBudget`
+//     (`max_clones_per_fn`, `max_module_growth_pct`, `min_benefit_score`) and post-specialization
+//     `ConstFold` + `SROA` + `SimplifyCFG` + `DCE` cleanup + summary refinement (`AXS-INL-030..031`)
+//   - Tail-call & self-tail-recursion optimization (`TCO_LEGAL` preconditions: zero post-call `Drop`
+//     glue, zero stack-borrowed `view<T>`/`mut_view<T>`/pointers escaping to callee, no post-call
+//     volatile/atomic barrier; `O(1)` stack self-tail-recursion loop lowering, sibling tail-call
+//     qualification, and explicit `@tailcall` legality verification) (`AXS-INL-033`, `REQ-OPT-002..003`)
+//   - `PassManager` `TransformationContract`s (`PASS_IPA_SPECIALIZE = 15u16`, `PASS_TAILCALL = 17u16`) (`AXS-INL-034`)
+//   - Deterministic `--emit=specialize` (`ipa_specialize_print`) and `--emit=inline` TCO (`ipa_tailcall_print`) (`AXS-INL-035`)
+module compiler.opt.ipa
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_VIEW
+use compiler.types.types.type_get
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_CONST_UNIT
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_TEMP
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.mir_add_bb
+use compiler.mir.mir.mir_add_local
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_bb_push_stmt
+use compiler.mir.mir.mir_clone_place
+use compiler.mir.mir.mir_copy_const
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_op_move_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_rvalue_reset
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.mir.mir.mir_u64_at
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_PURE
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_NO_ESCAPE
+use compiler.opt.optir.PROP_PURE_CALL
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.EffectSummary
+use compiler.opt.escape.EscapeSummaryTable
+use compiler.opt.escape.FunctionEscapeSummary
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_ESCAPE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_NONE
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_BALANCED_O1
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SIZE_OS
+use compiler.opt.passmgr.OPT_PROFILE_SPEED_O2
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_PURE_CALL
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.const_fold.opt_const_fold
+use compiler.opt.cfg_simp.opt_cfg_simplify_with_merge
+use compiler.opt.dce.opt_dce_in_arena
+use compiler.opt.sroa.SroaDecisionLog
+use compiler.opt.sroa.SroaStats
+use compiler.opt.sroa.sroa_optimize_mir_in_place
+use compiler.opt.sroa.sroa_stats_zero
+use compiler.opt.sroa.sroa_type_is_copy
+use compiler.opt.sroa.sroa_verify_mir_body_complete
+use compiler.opt.sroa.sroa_verify_postconditions_arg_aware
+use compiler.opt.inline.ANALYSIS_CALL_GRAPH
+use compiler.opt.inline.ANALYSIS_MASK_CALL_GRAPH
+use compiler.opt.inline.CallEdge
+use compiler.opt.inline.CallGraph
+use compiler.opt.inline.CallGraphNode
+use compiler.opt.inline.DISPATCH_CLOSURE
+use compiler.opt.inline.DISPATCH_DIRECT
+use compiler.opt.inline.DISPATCH_FN_PTR
+use compiler.opt.inline.INLINE_ATTR_NEVER
+use compiler.opt.inline.INLINE_NONE_IDX
+use compiler.opt.inline.OPT_PROFILE_MAX_O3
+use compiler.opt.inline.OPT_PROFILE_MINSIZE_OZ
+use compiler.opt.inline.callgraph_add_node
+use compiler.opt.inline.callgraph_analyze_edges
+use compiler.opt.inline.callgraph_compute_reachability
+use compiler.opt.inline.callgraph_compute_sccs
+use compiler.opt.inline.callgraph_finalize
+use compiler.opt.inline.callgraph_find_node_idx
+use compiler.opt.inline.callgraph_propagate_summaries
+use compiler.opt.inline.cg_edge_at
+use compiler.opt.inline.cg_node_at
+use compiler.opt.inline.inl_u32_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifiers & TransformationContracts (`SPEC-73 §8, AXS-INL-034`) ---
+
+pub const PASS_IPA_SPECIALIZE: u16 = 15u16;
+pub const PASS_TAILCALL: u16 = 17u16;
+
+pub fn ipa_specialize_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_IPA_SPECIALIZE,
+        required_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_SSA | ANALYSIS_MASK_EFFECT_INFO |
+                           ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_ALIAS_INFO,
+        required_proofs: PROP_MASK_REACHABLE | PROP_MASK_PURE_CALL | PROP_MASK_NO_ESCAPE | PROP_MASK_NO_ALIAS,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA,
+        invalidated_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_EFFECT_INFO |
+                              ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_NO_ESCAPE | PROP_MASK_PURE_CALL,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+pub fn tailcall_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_TAILCALL,
+        required_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS |
+                           ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ESCAPE_INFO,
+        required_proofs: PROP_MASK_REACHABLE | PROP_MASK_NO_ESCAPE,
+        preserved_analyses: ANALYSIS_MASK_NONE,
+        invalidated_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                              ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_LOOP_INFO,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ESCAPE,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- Section 1: Canonical `SpecializationKey`, Deterministic Clone Mangling, & `SpecializationBudget` (`SPEC-73 §5`) ---
+
+pub const SPEC_ARG_NONE: u8 = 0u8;
+pub const SPEC_ARG_CONST_INT: u8 = 1u8;
+pub const SPEC_ARG_CONST_BOOL: u8 = 2u8;
+pub const SPEC_ARG_ENUM_TAG: u8 = 3u8;
+pub const SPEC_ARG_CLOSURE_SYM: u8 = 4u8;
+pub const SPEC_ARG_FN_PTR_SYM: u8 = 5u8;
+pub const SPEC_ARG_TYPE_ID: u8 = 6u8;
+
+pub const MAX_SPEC_BINDINGS: usize = 8;
+
+pub const SPEC_DECISION_REJECTED: u8 = 0u8;
+pub const SPEC_DECISION_CLONED: u8 = 1u8;
+pub const SPEC_DECISION_REUSED_CACHE: u8 = 2u8;
+pub const SPEC_DECISION_SHARED_REP: u8 = 3u8;
+
+pub const SPEC_REASON_NONE: u8 = 0u8;
+pub const SPEC_REASON_PROFILE_DISABLED: u8 = 1u8;
+pub const SPEC_REASON_NO_SPEC_ARGS: u8 = 2u8;
+pub const SPEC_REASON_EXTERN_OR_NO_BODY: u8 = 3u8;
+pub const SPEC_REASON_CLONE_CAP_EXCEEDED: u8 = 4u8;
+pub const SPEC_REASON_MODULE_GROWTH_EXCEEDED: u8 = 5u8;
+pub const SPEC_REASON_LOW_BENEFIT: u8 = 6u8;
+pub const SPEC_REASON_ADDRESS_TAKEN_NO_MERGE: u8 = 7u8;
+pub const SPEC_REASON_ROLLBACK_VERIFY: u8 = 8u8;
+
+@derive(Copy)
+pub struct SpecArgBinding {
+    pub param_idx: u16,
+    pub kind: u8,
+    pub int_val: u64,
+    pub fn_sym: SymbolId,
+    pub ty: TypeId,
+}
+
+@derive(Copy)
+pub struct SpecializationKey {
+    pub base_fn: SymbolId,
+    pub type_arg_hash: u64,
+    pub const_generic_hash: u64,
+    pub trait_impl_hash: u64,
+    pub bindings: [8]SpecArgBinding,
+    pub binding_count: u32,
+    pub target_feature_mask: u64,
+}
+
+@derive(Copy)
+pub struct SpecializationBudget {
+    pub profile: u8,
+    pub max_clones_per_fn: u32,
+    pub max_module_growth_pct: u32,
+    pub min_benefit_score: i32,
+}
+
+@derive(Copy)
+pub struct RepEquivDesc {
+    pub fn_sym: SymbolId,
+    pub type_size: u32,
+    pub type_align: u32,
+    pub abi_class: u8,
+    pub has_custom_drop: bool,
+    pub body_fingerprint: u64,
+    pub address_taken_fn: bool,
+}
+
+@derive(Copy)
+pub struct SpecCacheEntry {
+    pub key: SpecializationKey,
+    pub fingerprint: u64,
+    pub clone_sym: SymbolId,
+    pub clone_node_idx: u32,
+    pub inst_before: u32,
+    pub inst_after: u32,
+    pub effect_flags_after: u16,
+}
+
+pub struct SpecTable {
+    pub entries: *mut SpecCacheEntry,
+    pub count: usize,
+    pub cap: usize,
+    pub initial_module_insts: u32,
+    pub added_spec_insts: u32,
+}
+
+@derive(Copy)
+pub struct SpecDecisionRecord {
+    pub caller_sym: u32,
+    pub base_callee_sym: u32,
+    pub spec_callee_sym: u32,
+    pub callsite_bb: u32,
+    pub binding_count: u32,
+    pub benefit_score: i32,
+    pub reason: u8,
+    pub decision: u8,
+}
+
+pub struct SpecDecisionLog {
+    pub records: *mut SpecDecisionRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+@derive(Copy)
+pub struct IpaSpecStats {
+    pub callsites_examined: u32,
+    pub clones_created: u32,
+    pub clones_reused: u32,
+    pub rep_equiv_shared: u32,
+    pub rejected_clone_cap: u32,
+    pub rejected_module_growth: u32,
+    pub rejected_low_benefit: u32,
+    pub post_spec_cleanups: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// --- Section 4 Structures: Tail-Call & Tail-Recursion Optimization (`SPEC-73 §7, AXS-INL-033`) ---
+
+pub const TCO_ILLEGAL: u8 = 0u8;
+pub const TCO_LEGAL: u8 = 1u8;
+
+pub const TCO_REASON_NONE: u8 = 0u8;
+pub const TCO_REASON_NOT_TAIL_POS: u8 = 1u8;
+pub const TCO_REASON_LIVE_DROP_AFTER_CALL: u8 = 2u8;
+pub const TCO_REASON_STACK_VIEW_ESCAPE: u8 = 3u8;
+pub const TCO_REASON_VOLATILE_OR_ATOMIC_AFTER: u8 = 4u8;
+pub const TCO_REASON_ABI_MISMATCH: u8 = 5u8;
+pub const TCO_REASON_INDIRECT_UNRESOLVED: u8 = 6u8;
+pub const TCO_REASON_PROFILE_O0: u8 = 7u8;
+pub const TCO_REASON_ROLLBACK_VERIFY: u8 = 8u8;
+
+pub const TCO_DECISION_NONE: u8 = 0u8;
+pub const TCO_DECISION_SELF_LOOP_LOWERED: u8 = 1u8;
+pub const TCO_DECISION_SIBLING_TAILCALL: u8 = 2u8;
+pub const TCO_DECISION_REJECTED_DIAG: u8 = 3u8;
+
+@derive(Copy)
+pub struct TcoCheckResult {
+    pub legality: u8,
+    pub reason: u8,
+    pub is_self_recursion: bool,
+    pub is_sibling_compatible: bool,
+}
+
+@derive(Copy)
+pub struct TcoDecisionRecord {
+    pub caller_sym: u32,
+    pub callee_sym: u32,
+    pub callsite_bb: u32,
+    pub is_tailcall_attr: bool,
+    pub legality: u8,
+    pub reason: u8,
+    pub decision: u8,
+}
+
+pub struct TcoDecisionLog {
+    pub records: *mut TcoDecisionRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+@derive(Copy)
+pub struct TcoStats {
+    pub callsites_checked: u32,
+    pub self_loops_lowered: u32,
+    pub sibling_tailcalls_marked: u32,
+    pub rejected_live_drop: u32,
+    pub rejected_stack_view: u32,
+    pub rejected_not_tail: u32,
+    pub tailcall_diag_errors: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// --- Pointer Indexing & Utility Helpers ---
+
+fn ipa_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn ipa_cache_at(base: *mut SpecCacheEntry, idx: usize) -> *mut SpecCacheEntry {
+    let off = ipa_mul_usize(idx, size_of<SpecCacheEntry>());
+    ((base as usize) + off) as *mut SpecCacheEntry
+}
+
+pub unsafe fn ipa_spec_rec_at(base: *mut SpecDecisionRecord, idx: usize) -> *mut SpecDecisionRecord {
+    let off = ipa_mul_usize(idx, size_of<SpecDecisionRecord>());
+    ((base as usize) + off) as *mut SpecDecisionRecord
+}
+
+pub unsafe fn ipa_tco_rec_at(base: *mut TcoDecisionRecord, idx: usize) -> *mut TcoDecisionRecord {
+    let off = ipa_mul_usize(idx, size_of<TcoDecisionRecord>());
+    ((base as usize) + off) as *mut TcoDecisionRecord
+}
+
+pub fn ipa_spec_stats_zero() -> IpaSpecStats {
+    IpaSpecStats {
+        callsites_examined: 0u32,
+        clones_created: 0u32,
+        clones_reused: 0u32,
+        rep_equiv_shared: 0u32,
+        rejected_clone_cap: 0u32,
+        rejected_module_growth: 0u32,
+        rejected_low_benefit: 0u32,
+        post_spec_cleanups: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+pub fn ipa_tco_stats_zero() -> TcoStats {
+    TcoStats {
+        callsites_checked: 0u32,
+        self_loops_lowered: 0u32,
+        sibling_tailcalls_marked: 0u32,
+        rejected_live_drop: 0u32,
+        rejected_stack_view: 0u32,
+        rejected_not_tail: 0u32,
+        tailcall_diag_errors: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+pub fn ipa_spec_log_new(arena: mut_view<Arena>, cap: usize) -> *mut SpecDecisionLog {
+    let actual_cap: usize = if cap < 16 { 16 } else { cap };
+    let log = arena_alloc_raw(mut_view(*arena), size_of<SpecDecisionLog>(), align_of<SpecDecisionLog>()) as *mut SpecDecisionLog;
+    let recs = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(actual_cap, size_of<SpecDecisionRecord>()), align_of<SpecDecisionRecord>()) as *mut SpecDecisionRecord;
+    unsafe {
+        (*log).records = recs;
+        (*log).count = 0;
+        (*log).cap = actual_cap;
+    }
+    log
+}
+
+pub fn ipa_spec_log_push(log: *mut SpecDecisionLog, arena: mut_view<Arena>, rec: SpecDecisionRecord) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 16 } else { cap + cap };
+        let new_recs = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(new_cap, size_of<SpecDecisionRecord>()), align_of<SpecDecisionRecord>()) as *mut SpecDecisionRecord;
+        let mut i: usize = 0;
+        while i < cnt {
+            unsafe { *ipa_spec_rec_at(new_recs, i) = *ipa_spec_rec_at((*log).records, i); }
+            i = i + 1;
+        }
+        unsafe {
+            (*log).records = new_recs;
+            (*log).cap = new_cap;
+        }
+    }
+    unsafe {
+        *ipa_spec_rec_at((*log).records, cnt) = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+pub fn ipa_tco_log_new(arena: mut_view<Arena>, cap: usize) -> *mut TcoDecisionLog {
+    let actual_cap: usize = if cap < 16 { 16 } else { cap };
+    let log = arena_alloc_raw(mut_view(*arena), size_of<TcoDecisionLog>(), align_of<TcoDecisionLog>()) as *mut TcoDecisionLog;
+    let recs = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(actual_cap, size_of<TcoDecisionRecord>()), align_of<TcoDecisionRecord>()) as *mut TcoDecisionRecord;
+    unsafe {
+        (*log).records = recs;
+        (*log).count = 0;
+        (*log).cap = actual_cap;
+    }
+    log
+}
+
+pub fn ipa_tco_log_push(log: *mut TcoDecisionLog, arena: mut_view<Arena>, rec: TcoDecisionRecord) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 16 } else { cap + cap };
+        let new_recs = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(new_cap, size_of<TcoDecisionRecord>()), align_of<TcoDecisionRecord>()) as *mut TcoDecisionRecord;
+        let mut i: usize = 0;
+        while i < cnt {
+            unsafe { *ipa_tco_rec_at(new_recs, i) = *ipa_tco_rec_at((*log).records, i); }
+            i = i + 1;
+        }
+        unsafe {
+            (*log).records = new_recs;
+            (*log).cap = new_cap;
+        }
+    }
+    unsafe {
+        *ipa_tco_rec_at((*log).records, cnt) = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+// --- Section 1 Implementation: `SpecializationKey`, Mangling, & `SpecializationBudget` (`AXS-INL-028, AXS-INL-030, AXS-INL-031`) ---
+
+pub fn ipa_empty_binding() -> SpecArgBinding {
+    SpecArgBinding {
+        param_idx: 0u16,
+        kind: SPEC_ARG_NONE,
+        int_val: 0u64,
+        fn_sym: SymbolId { v: 0u32 },
+        ty: TypeId { v: 0u32 },
+    }
+}
+
+pub fn ipa_spec_key_new(base_fn: SymbolId) -> SpecializationKey {
+    SpecializationKey {
+        base_fn: base_fn,
+        type_arg_hash: 0u64,
+        const_generic_hash: 0u64,
+        trait_impl_hash: 0u64,
+        bindings: [
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding(),
+            ipa_empty_binding()
+        ],
+        binding_count: 0u32,
+        target_feature_mask: 0u64,
+    }
+}
+
+pub fn ipa_spec_key_add_binding(key: mut_view<SpecializationKey>, b: SpecArgBinding) {
+    // Keep bindings canonically sorted by `param_idx` (`AXS-INL-028`)
+    let mut i: usize = 0;
+    let cnt = key.binding_count as usize;
+    while i < cnt && i < MAX_SPEC_BINDINGS {
+        if key.bindings[i].param_idx == b.param_idx {
+            key.bindings[i] = b;
+            return;
+        }
+        if key.bindings[i].param_idx > b.param_idx {
+            break;
+        }
+        i = i + 1;
+    }
+    if cnt >= MAX_SPEC_BINDINGS {
+        return;
+    }
+    let mut j: usize = cnt;
+    while j > i {
+        key.bindings[j] = key.bindings[j - 1];
+        j = j - 1;
+    }
+    key.bindings[i] = b;
+    key.binding_count = (cnt + 1) as u32;
+}
+
+pub fn ipa_spec_key_add_const_int(key: mut_view<SpecializationKey>, param_idx: u16, val: u64, ty: TypeId) {
+    ipa_spec_key_add_binding(mut_view(*key), SpecArgBinding {
+        param_idx: param_idx,
+        kind: SPEC_ARG_CONST_INT,
+        int_val: val,
+        fn_sym: SymbolId { v: 0u32 },
+        ty: ty,
+    });
+}
+
+pub fn ipa_spec_key_add_const_bool(key: mut_view<SpecializationKey>, param_idx: u16, val: bool, ty: TypeId) {
+    ipa_spec_key_add_binding(mut_view(*key), SpecArgBinding {
+        param_idx: param_idx,
+        kind: SPEC_ARG_CONST_BOOL,
+        int_val: if val { 1u64 } else { 0u64 },
+        fn_sym: SymbolId { v: 0u32 },
+        ty: ty,
+    });
+}
+
+pub fn ipa_spec_key_add_enum_tag(key: mut_view<SpecializationKey>, param_idx: u16, tag: u64, ty: TypeId) {
+    ipa_spec_key_add_binding(mut_view(*key), SpecArgBinding {
+        param_idx: param_idx,
+        kind: SPEC_ARG_ENUM_TAG,
+        int_val: tag,
+        fn_sym: SymbolId { v: 0u32 },
+        ty: ty,
+    });
+}
+
+pub fn ipa_spec_key_add_closure_or_fn(key: mut_view<SpecializationKey>, param_idx: u16, kind: u8, fn_sym: SymbolId, ty: TypeId) {
+    ipa_spec_key_add_binding(mut_view(*key), SpecArgBinding {
+        param_idx: param_idx,
+        kind: kind,
+        int_val: 0u64,
+        fn_sym: fn_sym,
+        ty: ty,
+    });
+}
+
+pub fn ipa_spec_key_equals(a: view<SpecializationKey>, b: view<SpecializationKey>) -> bool {
+    if a.base_fn.v != b.base_fn.v ||
+       a.type_arg_hash != b.type_arg_hash ||
+       a.const_generic_hash != b.const_generic_hash ||
+       a.trait_impl_hash != b.trait_impl_hash ||
+       a.target_feature_mask != b.target_feature_mask ||
+       a.binding_count != b.binding_count {
+        return false;
+    }
+    let cnt = a.binding_count as usize;
+    let mut i: usize = 0;
+    while i < cnt && i < MAX_SPEC_BINDINGS {
+        let ba = a.bindings[i];
+        let bb = b.bindings[i];
+        if ba.param_idx != bb.param_idx ||
+           ba.kind != bb.kind ||
+           ba.int_val != bb.int_val ||
+           ba.fn_sym.v != bb.fn_sym.v ||
+           ba.ty.v != bb.ty.v {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn ipa_fnv_mix(h: u64, v: u64) -> u64 {
+    wrapping_mul_u64(h ^ v, 1099511628211u64)
+}
+
+pub fn ipa_spec_key_fingerprint(key: view<SpecializationKey>) -> u64 {
+    let mut h: u64 = 14695981039346656037u64;
+    h = ipa_fnv_mix(h, key.base_fn.v as u64);
+    h = ipa_fnv_mix(h, key.type_arg_hash);
+    h = ipa_fnv_mix(h, key.const_generic_hash);
+    h = ipa_fnv_mix(h, key.trait_impl_hash);
+    h = ipa_fnv_mix(h, key.target_feature_mask);
+    h = ipa_fnv_mix(h, key.binding_count as u64);
+    let cnt = key.binding_count as usize;
+    let mut i: usize = 0;
+    while i < cnt && i < MAX_SPEC_BINDINGS {
+        let b = key.bindings[i];
+        h = ipa_fnv_mix(h, b.param_idx as u64);
+        h = ipa_fnv_mix(h, b.kind as u64);
+        h = ipa_fnv_mix(h, b.int_val);
+        h = ipa_fnv_mix(h, b.fn_sym.v as u64);
+        h = ipa_fnv_mix(h, b.ty.v as u64);
+        i = i + 1;
+    }
+    h
+}
+
+pub fn ipa_spec_clone_sym(key: view<SpecializationKey>) -> SymbolId {
+    let fp = ipa_spec_key_fingerprint(key);
+    let folded: u32 = ((fp ^ (fp >> 32u64) ^ (fp >> 16u64)) as u32) & 0x007FFFFFu32;
+    let base_tag: u32 = (key.base_fn.v & 0x03FFu32) << 12u32;
+    let raw: u32 = 0x00800000u32 | ((base_tag ^ folded) & 0x007FFFFFu32);
+    SymbolId { v: if raw == key.base_fn.v { raw ^ 1u32 } else { raw } }
+}
+
+pub fn ipa_budget_for_profile(profile: u8) -> SpecializationBudget {
+    if profile == OPT_PROFILE_DEBUG_O0 || profile == OPT_PROFILE_SIZE_OS || profile == OPT_PROFILE_MINSIZE_OZ {
+        return SpecializationBudget {
+            profile: profile,
+            max_clones_per_fn: 0u32,
+            max_module_growth_pct: 0u32,
+            min_benefit_score: 100000,
+        };
+    }
+    if profile == OPT_PROFILE_BALANCED_O1 {
+        return SpecializationBudget {
+            profile: profile,
+            max_clones_per_fn: 2u32,
+            max_module_growth_pct: 10u32,
+            min_benefit_score: 40,
+        };
+    }
+    if profile == OPT_PROFILE_MAX_O3 {
+        return SpecializationBudget {
+            profile: profile,
+            max_clones_per_fn: 16u32,
+            max_module_growth_pct: 40u32,
+            min_benefit_score: 15,
+        };
+    }
+    // Default `-O2` (`OPT_PROFILE_SPEED_O2`, `AXS-INL-031`)
+    SpecializationBudget {
+        profile: profile,
+        max_clones_per_fn: 8u32,
+        max_module_growth_pct: 25u32,
+        min_benefit_score: 25,
+    }
+}
+
+// --- Section 2: Representation-Equivalent Code Sharing vs. Function Pointer Identity (`AXS-INL-029, REQ-OPT-098..099`) ---
+
+pub fn ipa_can_share_representation(a: view<RepEquivDesc>, b: view<RepEquivDesc>) -> bool {
+    // REQ-OPT-099: Never merge two distinct functions into the same address when `address_taken_fn == true`!
+    if a.address_taken_fn || b.address_taken_fn {
+        return false;
+    }
+    if a.has_custom_drop || b.has_custom_drop {
+        return false;
+    }
+    a.type_size == b.type_size &&
+    a.type_align == b.type_align &&
+    a.abi_class == b.abi_class &&
+    a.body_fingerprint == b.body_fingerprint
+}
+
+// --- Section 3: Interprocedural Call-Site Constant & Closure Specialization Engine (`SPEC-73 §§5.2–5.5`) ---
+
+pub fn ipa_spec_table_new(arena: mut_view<Arena>, initial_module_insts: u32) -> *mut SpecTable {
+    let tbl = arena_alloc_raw(mut_view(*arena), size_of<SpecTable>(), align_of<SpecTable>()) as *mut SpecTable;
+    let init_cap: usize = 16;
+    let entries = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(init_cap, size_of<SpecCacheEntry>()), align_of<SpecCacheEntry>()) as *mut SpecCacheEntry;
+    unsafe {
+        (*tbl).entries = entries;
+        (*tbl).count = 0;
+        (*tbl).cap = init_cap;
+        (*tbl).initial_module_insts = if initial_module_insts < 256u32 { 256u32 } else { initial_module_insts };
+        (*tbl).added_spec_insts = 0u32;
+    }
+    tbl
+}
+
+pub fn ipa_spec_table_find(tbl: view<SpecTable>, key: view<SpecializationKey>) -> *mut SpecCacheEntry {
+    let fp = ipa_spec_key_fingerprint(key);
+    let mut i: usize = 0;
+    while i < tbl.count && (tbl.entries as usize) != 0 {
+        let ep = unsafe { ipa_cache_at(tbl.entries, i) };
+        if (unsafe { (*ep).fingerprint }) == fp && ipa_spec_key_equals(unsafe { view((*ep).key) }, key) {
+            return ep;
+        }
+        i = i + 1;
+    }
+    0 as *mut SpecCacheEntry
+}
+
+pub fn ipa_spec_table_count_for_base(tbl: view<SpecTable>, base_fn: SymbolId) -> u32 {
+    let mut c: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < tbl.count && (tbl.entries as usize) != 0 {
+        let ep = unsafe { ipa_cache_at(tbl.entries, i) };
+        if (unsafe { (*ep).key.base_fn.v }) == base_fn.v {
+            c = c + 1u32;
+        }
+        i = i + 1;
+    }
+    c
+}
+
+pub fn ipa_spec_table_insert(
+    tbl: mut_view<SpecTable>,
+    arena: mut_view<Arena>,
+    entry: SpecCacheEntry
+) -> *mut SpecCacheEntry {
+    if tbl.count >= tbl.cap {
+        let new_cap: usize = if tbl.cap == 0 { 16 } else { tbl.cap + tbl.cap };
+        let new_entries = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(new_cap, size_of<SpecCacheEntry>()), align_of<SpecCacheEntry>()) as *mut SpecCacheEntry;
+        let mut i: usize = 0;
+        while i < tbl.count {
+            unsafe { *ipa_cache_at(new_entries, i) = *ipa_cache_at(tbl.entries, i); }
+            i = i + 1;
+        }
+        tbl.entries = new_entries;
+        tbl.cap = new_cap;
+    }
+    let idx = tbl.count;
+    tbl.count = idx + 1;
+    let dst = unsafe { ipa_cache_at(tbl.entries, idx) };
+    unsafe { *dst = entry; }
+    dst
+}
+
+fn ipa_clone_mir_body(src: view<MirBody>, dst: mut_view<MirBody>, arena: mut_view<Arena>) {
+    dst.sym.v = src.sym.v;
+    dst.fn_sym.v = src.fn_sym.v;
+    dst.fn_name.v = src.fn_name.v;
+    dst.span = src.span;
+    dst.arg_count = src.arg_count;
+    dst.local_count = src.local_count;
+    dst.local_cap = src.local_count;
+    dst.bb_count = src.bb_count;
+    dst.bb_cap = src.bb_count;
+    dst.drop_flag_count = src.drop_flag_count;
+
+    if src.local_count > 0 && (src.locals as usize) != 0 {
+        let lbytes = ipa_mul_usize(src.local_count, size_of<MirLocalDecl>());
+        let new_locals = arena_alloc_raw(mut_view(*arena), lbytes, align_of<MirLocalDecl>()) as *mut MirLocalDecl;
+        unsafe { ptr_copy_nonoverlapping<u8>(src.locals as *const u8, new_locals as *mut u8, lbytes); }
+        dst.locals = new_locals;
+    } else {
+        dst.locals = 0 as *mut MirLocalDecl;
+    }
+
+    if src.bb_count > 0 && (src.bbs as usize) != 0 {
+        let bbytes = ipa_mul_usize(src.bb_count, size_of<MirBb>());
+        let new_bbs = arena_alloc_raw(mut_view(*arena), bbytes, align_of<MirBb>()) as *mut MirBb;
+        let mut b: usize = 0;
+        while b < src.bb_count {
+            let sbb = unsafe { mir_bb_at(src.bbs, b) };
+            let dbb = unsafe { mir_bb_at(new_bbs, b) };
+            unsafe {
+                (*dbb).id.v = (*sbb).id.v;
+                (*dbb).stmt_count = (*sbb).stmt_count;
+                (*dbb).stmt_cap = (*sbb).stmt_count;
+                (*dbb).has_terminator = (*sbb).has_terminator;
+                (*dbb).is_cleanup = (*sbb).is_cleanup;
+                mir_copy_terminator(mut_view((*dbb).terminator), view((*sbb).terminator));
+                if (*sbb).stmt_count > 0 && ((*sbb).stmts as usize) != 0 {
+                    let sbytes = ipa_mul_usize((*sbb).stmt_count, size_of<MirStmt>());
+                    let nstmts = arena_alloc_raw(mut_view(*arena), sbytes, align_of<MirStmt>()) as *mut MirStmt;
+                    ptr_copy_nonoverlapping<u8>((*sbb).stmts as *const u8, nstmts as *mut u8, sbytes);
+                    (*dbb).stmts = nstmts;
+                } else {
+                    (*dbb).stmts = 0 as *mut MirStmt;
+                }
+            }
+            b = b + 1;
+        }
+        dst.bbs = new_bbs;
+    } else {
+        dst.bbs = 0 as *mut MirBb;
+    }
+}
+
+fn ipa_count_mir_insts(mir: view<MirBody>) -> u32 {
+    let mut cnt: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk != MIR_STMT_STORAGE_LIVE && sk != MIR_STMT_STORAGE_DEAD {
+                cnt = cnt + 1u32;
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            cnt = cnt + 1u32;
+        }
+        b = b + 1;
+    }
+    if cnt == 0u32 { 1u32 } else { cnt }
+}
+
+fn ipa_resolve_arg_binding(
+    caller_mir: view<MirBody>,
+    arg_op: view<MirOperand>,
+    param_idx: u16,
+    out_binding: mut_view<SpecArgBinding>
+) -> bool {
+    *out_binding = ipa_empty_binding();
+    if arg_op.kind == MIR_OP_CONST {
+        let ck = arg_op.constant.kind;
+        if ck == MIR_CONST_INT {
+            *out_binding = SpecArgBinding {
+                param_idx: param_idx,
+                kind: SPEC_ARG_CONST_INT,
+                int_val: arg_op.constant.val,
+                fn_sym: SymbolId { v: 0u32 },
+                ty: arg_op.constant.ty,
+            };
+            return true;
+        }
+        if ck == MIR_CONST_BOOL {
+            *out_binding = SpecArgBinding {
+                param_idx: param_idx,
+                kind: SPEC_ARG_CONST_BOOL,
+                int_val: arg_op.constant.val,
+                fn_sym: SymbolId { v: 0u32 },
+                ty: arg_op.constant.ty,
+            };
+            return true;
+        }
+        if ck == MIR_CONST_FN && arg_op.constant.sym.v != 0u32 {
+            *out_binding = SpecArgBinding {
+                param_idx: param_idx,
+                kind: SPEC_ARG_FN_PTR_SYM,
+                int_val: 0u64,
+                fn_sym: arg_op.constant.sym,
+                ty: arg_op.constant.ty,
+            };
+            return true;
+        }
+        return false;
+    }
+
+    if (arg_op.kind != MIR_OP_COPY && arg_op.kind != MIR_OP_MOVE) || arg_op.place.proj_count != 0 {
+        return false;
+    }
+    let loc_v = arg_op.place.local.v;
+    if (loc_v as usize) >= caller_mir.local_count || (caller_mir.locals as usize) == 0 {
+        return false;
+    }
+    let ldecl = unsafe { mir_local_at(caller_mir.locals, loc_v as usize) };
+    let lty = unsafe { (*ldecl).ty };
+    if (unsafe { (*ldecl).kind }) == MIR_LOCAL_CONST && (unsafe { (*ldecl).const_sym.v }) != 0u32 {
+        *out_binding = SpecArgBinding {
+            param_idx: param_idx,
+            kind: SPEC_ARG_FN_PTR_SYM,
+            int_val: 0u64,
+            fn_sym: SymbolId { v: unsafe { (*ldecl).const_sym.v } },
+            ty: lty,
+        };
+        return true;
+    }
+
+    // Scan for unique assignment to `loc_v` in `caller_mir`
+    let mut def_cnt: u32 = 0u32;
+    let mut found = false;
+    let mut cand_kind: u8 = SPEC_ARG_NONE;
+    let mut cand_int_val: u64 = 0u64;
+    let mut cand_fn_sym_v: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < caller_mir.bb_count && (caller_mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(caller_mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).place.local.v }) == loc_v {
+                def_cnt = def_cnt + 1u32;
+                if (unsafe { (*st).place.proj_count }) == 0 {
+                    let rvk = unsafe { (*st).rvalue.kind };
+                    if rvk == MIR_RVALUE_USE && (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST {
+                        let c = unsafe { (*st).rvalue.use_op.constant };
+                        if c.kind == MIR_CONST_INT {
+                            cand_kind = SPEC_ARG_CONST_INT;
+                            cand_int_val = c.val;
+                            cand_fn_sym_v = 0u32;
+                            found = true;
+                        } else if c.kind == MIR_CONST_BOOL {
+                            cand_kind = SPEC_ARG_CONST_BOOL;
+                            cand_int_val = c.val;
+                            cand_fn_sym_v = 0u32;
+                            found = true;
+                        } else if c.kind == MIR_CONST_FN && c.sym.v != 0u32 {
+                            cand_kind = SPEC_ARG_FN_PTR_SYM;
+                            cand_int_val = 0u64;
+                            cand_fn_sym_v = c.sym.v;
+                            found = true;
+                        }
+                    } else if rvk == MIR_RVALUE_AGGREGATE {
+                        let oc = unsafe { (*st).rvalue.operand_count };
+                        let ops = unsafe { (*st).rvalue.operands };
+                        if oc > 0 && (ops as usize) != 0 {
+                            let op0 = unsafe { mir_op_at(ops, 0) };
+                            if (unsafe { (*op0).kind }) == MIR_OP_CONST &&
+                               (unsafe { (*op0).constant.kind }) == MIR_CONST_FN &&
+                               (unsafe { (*op0).constant.sym.v }) != 0u32 {
+                                cand_kind = SPEC_ARG_CLOSURE_SYM;
+                                cand_int_val = 0u64;
+                                cand_fn_sym_v = unsafe { (*op0).constant.sym.v };
+                                found = true;
+                            }
+                        }
+                        if !found {
+                            cand_kind = SPEC_ARG_ENUM_TAG;
+                            cand_int_val = (unsafe { (*st).rvalue.variant_idx }) as u64;
+                            cand_fn_sym_v = 0u32;
+                            found = true;
+                        }
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    if def_cnt == 1u32 && found {
+        *out_binding = SpecArgBinding {
+            param_idx: param_idx,
+            kind: cand_kind,
+            int_val: cand_int_val,
+            fn_sym: SymbolId { v: cand_fn_sym_v },
+            ty: lty,
+        };
+        return true;
+    }
+    false
+}
+
+pub fn ipa_extract_callsite_spec_key(
+    caller_mir: view<MirBody>,
+    call_bb_idx: usize,
+    base_callee: SymbolId
+) -> SpecializationKey {
+    let mut key = ipa_spec_key_new(base_callee);
+    if call_bb_idx >= caller_mir.bb_count || (caller_mir.bbs as usize) == 0 {
+        return key;
+    }
+    let cbb = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return key;
+    }
+    let argc = unsafe { (*cbb).terminator.arg_count };
+    let args = unsafe { (*cbb).terminator.args };
+    let mut ai: usize = 0;
+    while ai < argc && (args as usize) != 0 {
+        let ap = unsafe { mir_op_at(args, ai) };
+        let mut b = ipa_empty_binding();
+        if ipa_resolve_arg_binding(caller_mir, unsafe { view(*ap) }, (ai + 1) as u16, mut_view(b)) {
+            ipa_spec_key_add_binding(mut_view(key), b);
+        }
+        ai = ai + 1;
+    }
+    key
+}
+
+fn ipa_param_used_in_switch_or_call(callee_mir: view<MirBody>, param_loc: u32, out_in_switch: mut_view<bool>, out_in_call: mut_view<bool>) {
+    *out_in_switch = false;
+    *out_in_call = false;
+    // Also track any temporary assigned directly from `param_loc` (e.g. discriminant or copy)
+    let mut derived_loc: u32 = param_loc;
+    let mut b: usize = 0;
+    while b < callee_mir.bb_count && (callee_mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(callee_mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                let rvk = unsafe { (*st).rvalue.kind };
+                if (rvk == MIR_RVALUE_DISCRIMINANT && (unsafe { (*st).rvalue.place.local.v }) == param_loc) ||
+                   (rvk == MIR_RVALUE_USE &&
+                    ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY || (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE) &&
+                    (unsafe { (*st).rvalue.use_op.place.local.v }) == param_loc) ||
+                   (rvk == MIR_RVALUE_BINARY_OP &&
+                    ((((unsafe { (*st).rvalue.lhs.kind }) == MIR_OP_COPY || (unsafe { (*st).rvalue.lhs.kind }) == MIR_OP_MOVE) &&
+                      (unsafe { (*st).rvalue.lhs.place.local.v }) == param_loc) ||
+                     (((unsafe { (*st).rvalue.rhs.kind }) == MIR_OP_COPY || (unsafe { (*st).rvalue.rhs.kind }) == MIR_OP_MOVE) &&
+                      (unsafe { (*st).rvalue.rhs.place.local.v }) == param_loc))) {
+                    derived_loc = unsafe { (*st).place.local.v };
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                let dop = unsafe { (*bb).terminator.discr };
+                if (dop.kind == MIR_OP_COPY || dop.kind == MIR_OP_MOVE) &&
+                   (dop.place.local.v == param_loc || dop.place.local.v == derived_loc) {
+                    *out_in_switch = true;
+                }
+            } else if tk == MIR_TERM_CALL {
+                let fop = unsafe { (*bb).terminator.func };
+                if (fop.kind == MIR_OP_COPY || fop.kind == MIR_OP_MOVE) &&
+                   (fop.place.local.v == param_loc || fop.place.local.v == derived_loc) {
+                    *out_in_call = true;
+                }
+            }
+        }
+        b = b + 1;
+    }
+}
+
+pub fn ipa_evaluate_spec_benefit(callee_mir: view<MirBody>, key: view<SpecializationKey>) -> i32 {
+    if key.binding_count == 0u32 {
+        return 0;
+    }
+    let mut score: i32 = 0;
+    let cnt = key.binding_count as usize;
+    let mut i: usize = 0;
+    while i < cnt && i < MAX_SPEC_BINDINGS {
+        let b = key.bindings[i];
+        let mut in_sw = false;
+        let mut in_call = false;
+        ipa_param_used_in_switch_or_call(callee_mir, b.param_idx as u32, mut_view(in_sw), mut_view(in_call));
+        if b.kind == SPEC_ARG_CLOSURE_SYM || b.kind == SPEC_ARG_FN_PTR_SYM {
+            score = score + (if in_call { 60 } else { 30 });
+        } else if b.kind == SPEC_ARG_ENUM_TAG {
+            score = score + (if in_sw { 45 } else { 15 });
+        } else if b.kind == SPEC_ARG_CONST_BOOL || b.kind == SPEC_ARG_CONST_INT {
+            score = score + (if in_sw { 40 } else { 25 });
+        } else {
+            score = score + 20;
+        }
+        i = i + 1;
+    }
+    score
+}
+
+fn ipa_apply_bindings_to_clone_mir(
+    clone_mir: mut_view<MirBody>,
+    key: view<SpecializationKey>,
+    arena: mut_view<Arena>
+) {
+    if clone_mir.bb_count == 0 || (clone_mir.bbs as usize) == 0 || key.binding_count == 0u32 {
+        return;
+    }
+    let cnt = key.binding_count as usize;
+
+    // 1. Prepend constant/closure assignments at the beginning of `bb0` for bound parameters
+    let bb0 = unsafe { mir_bb_at(clone_mir.bbs, 0) };
+    let old_scnt = unsafe { (*bb0).stmt_count };
+    let old_stmts = unsafe { (*bb0).stmts };
+
+    let mut inject_cnt: usize = 0;
+    let mut bi: usize = 0;
+    while bi < cnt && bi < MAX_SPEC_BINDINGS {
+        let b = key.bindings[bi];
+        let ploc = b.param_idx as usize;
+        if ploc >= 1 && ploc < clone_mir.local_count {
+            if b.kind == SPEC_ARG_CONST_INT || b.kind == SPEC_ARG_CONST_BOOL ||
+               b.kind == SPEC_ARG_CLOSURE_SYM || b.kind == SPEC_ARG_FN_PTR_SYM {
+                inject_cnt = inject_cnt + 1;
+            }
+        }
+        bi = bi + 1;
+    }
+
+    if inject_cnt > 0 {
+        let new_total = inject_cnt + old_scnt;
+        let new_stmts = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(new_total, size_of<MirStmt>()), align_of<MirStmt>()) as *mut MirStmt;
+        let mut wi: usize = 0;
+        bi = 0;
+        while bi < cnt && bi < MAX_SPEC_BINDINGS {
+            let b = key.bindings[bi];
+            let ploc = b.param_idx as usize;
+            if ploc >= 1 && ploc < clone_mir.local_count {
+                let ldecl = unsafe { mir_local_at(clone_mir.locals, ploc) };
+                let pty = unsafe { (*ldecl).ty };
+                unsafe { (*ldecl).mut_flag = true; }
+                if b.kind == SPEC_ARG_CONST_INT || b.kind == SPEC_ARG_CONST_BOOL ||
+                   b.kind == SPEC_ARG_CLOSURE_SYM || b.kind == SPEC_ARG_FN_PTR_SYM {
+                    let dst_st = unsafe { mir_stmt_at(new_stmts, wi) };
+                    mir_stmt_reset(unsafe { mut_view(*dst_st) }, MIR_STMT_ASSIGN, view(clone_mir.span));
+                    unsafe { (*dst_st).place = mir_local_place(ploc as u32); }
+                    mir_rvalue_reset(unsafe { mut_view((*dst_st).rvalue) }, MIR_RVALUE_USE);
+                    unsafe {
+                        (*dst_st).rvalue.use_op.kind = MIR_OP_CONST;
+                        (*dst_st).rvalue.use_op.constant.ty = pty;
+                        if b.kind == SPEC_ARG_CONST_INT {
+                            (*dst_st).rvalue.use_op.constant.kind = MIR_CONST_INT;
+                            (*dst_st).rvalue.use_op.constant.val = b.int_val;
+                        } else if b.kind == SPEC_ARG_CONST_BOOL {
+                            (*dst_st).rvalue.use_op.constant.kind = MIR_CONST_BOOL;
+                            (*dst_st).rvalue.use_op.constant.val = b.int_val;
+                        } else {
+                            (*dst_st).rvalue.use_op.constant.kind = MIR_CONST_FN;
+                            (*dst_st).rvalue.use_op.constant.sym = b.fn_sym;
+                        }
+                    }
+                    wi = wi + 1;
+                }
+            }
+            bi = bi + 1;
+        }
+        let mut si: usize = 0;
+        while si < old_scnt && (old_stmts as usize) != 0 {
+            unsafe {
+                let src_s = mir_stmt_at(old_stmts, si);
+                let dst_s = mir_stmt_at(new_stmts, wi + si);
+                mir_copy_stmt(mut_view(*dst_s), view(*src_s));
+            }
+            si = si + 1;
+        }
+        unsafe {
+            (*bb0).stmts = new_stmts;
+            (*bb0).stmt_count = new_total;
+            (*bb0).stmt_cap = new_total;
+        }
+    }
+
+    // 2. Rewrite enum-tag discriminant reads and indirect closure/fn-ptr calls on bound parameters
+    let mut b_idx: usize = 0;
+    while b_idx < clone_mir.bb_count {
+        let bb = unsafe { mir_bb_at(clone_mir.bbs, b_idx) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_DISCRIMINANT &&
+               (unsafe { (*st).rvalue.place.proj_count }) == 0 {
+                let rloc = unsafe { (*st).rvalue.place.local.v };
+                let mut k: usize = 0;
+                while k < cnt && k < MAX_SPEC_BINDINGS {
+                    let kb = key.bindings[k];
+                    if kb.kind == SPEC_ARG_ENUM_TAG && (kb.param_idx as u32) == rloc {
+                        let dty_v = unsafe { (*mir_local_at(clone_mir.locals, (*st).place.local.v as usize)).ty.v };
+                        mir_rvalue_reset(unsafe { mut_view((*st).rvalue) }, MIR_RVALUE_USE);
+                        unsafe {
+                            (*st).rvalue.use_op.kind = MIR_OP_CONST;
+                            (*st).rvalue.use_op.constant.ty = TypeId { v: dty_v };
+                            (*st).rvalue.use_op.constant.kind = MIR_CONST_INT;
+                            (*st).rvalue.use_op.constant.val = kb.int_val;
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+            s = s + 1;
+        }
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+            let fop = unsafe { (*bb).terminator.func };
+            if (fop.kind == MIR_OP_COPY || fop.kind == MIR_OP_MOVE) && fop.place.proj_count == 0 {
+                let floc = fop.place.local.v;
+                let mut k: usize = 0;
+                while k < cnt && k < MAX_SPEC_BINDINGS {
+                    let kb = key.bindings[k];
+                    if (kb.kind == SPEC_ARG_CLOSURE_SYM || kb.kind == SPEC_ARG_FN_PTR_SYM) &&
+                       (kb.param_idx as u32) == floc && kb.fn_sym.v != 0u32 {
+                        unsafe {
+                            (*bb).terminator.func.kind = MIR_OP_CONST;
+                            (*bb).terminator.func.constant.kind = MIR_CONST_FN;
+                            (*bb).terminator.func.constant.sym = kb.fn_sym;
+                            (*bb).terminator.func.place = mir_local_place(0u32);
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        b_idx = b_idx + 1;
+    }
+}
+
+pub fn ipa_specialize_callsite(
+    cg: mut_view<CallGraph>,
+    edge_idx: usize,
+    budget: view<SpecializationBudget>,
+    tbl: mut_view<SpecTable>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<IpaSpecStats>,
+    log: *mut SpecDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if edge_idx >= cg.edge_count || (cg.edges as usize) == 0 || (cg.nodes as usize) == 0 {
+        return false;
+    }
+    let ep = unsafe { cg_edge_at(cg.edges, edge_idx) };
+    let caller_idx = unsafe { (*ep).caller_node_idx };
+    let callee_idx = unsafe { (*ep).callee_node_idx };
+    let caller_sym_v = unsafe { (*ep).caller_sym.v };
+    let base_callee_v = unsafe { (*ep).known_callee.v };
+    let cbb_v = unsafe { (*ep).callsite_bb.v };
+
+    stats.callsites_examined = stats.callsites_examined + 1u32;
+
+    if budget.max_clones_per_fn == 0u32 {
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: 0u32,
+            benefit_score: 0,
+            reason: SPEC_REASON_PROFILE_DISABLED,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    if (unsafe { (*ep).dispatch_kind }) != DISPATCH_DIRECT ||
+       base_callee_v == 0u32 ||
+       callee_idx == INLINE_NONE_IDX || (callee_idx as usize) >= cg.node_count ||
+       caller_idx == INLINE_NONE_IDX || (caller_idx as usize) >= cg.node_count {
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: 0u32,
+            benefit_score: 0,
+            reason: SPEC_REASON_EXTERN_OR_NO_BODY,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let callee_np = unsafe { cg_node_at(cg.nodes, callee_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let callee_mir_p = unsafe { (*callee_np).mir };
+
+    if (unsafe { (*callee_np).is_extern_ffi }) || !(unsafe { (*callee_np).has_verified_body }) ||
+       (caller_mir_p as usize) == 0 || (callee_mir_p as usize) == 0 ||
+       (unsafe { (*callee_np).inline_attr }) == INLINE_ATTR_NEVER {
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: 0u32,
+            benefit_score: 0,
+            reason: SPEC_REASON_EXTERN_OR_NO_BODY,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    let key = ipa_extract_callsite_spec_key(unsafe { view(*caller_mir_p) }, cbb_v as usize, SymbolId { v: base_callee_v });
+    let key_bcnt = key.binding_count;
+    if key_bcnt == 0u32 {
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: 0u32,
+            benefit_score: 0,
+            reason: SPEC_REASON_NO_SPEC_ARGS,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    let benefit = ipa_evaluate_spec_benefit(unsafe { view(*callee_mir_p) }, view(key));
+
+    // Check if an identical `SpecializationKey` is already cached (`AXS-INL-028`)
+    let cached = ipa_spec_table_find(view(*tbl), view(key));
+    if (cached as usize) != 0 {
+        let c_sym_v = unsafe { (*cached).clone_sym.v };
+        let c_nidx = unsafe { (*cached).clone_node_idx };
+        let cbb = unsafe { mir_bb_at((*caller_mir_p).bbs, cbb_v as usize) };
+        unsafe {
+            (*cbb).terminator.func.kind = MIR_OP_CONST;
+            (*cbb).terminator.func.constant.kind = MIR_CONST_FN;
+            (*cbb).terminator.func.constant.sym = SymbolId { v: c_sym_v };
+            (*ep).known_callee = SymbolId { v: c_sym_v };
+            (*ep).callee_node_idx = c_nidx;
+        }
+        stats.clones_reused = stats.clones_reused + 1u32;
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: c_sym_v,
+            callsite_bb: cbb_v,
+            binding_count: key_bcnt,
+            benefit_score: benefit,
+            reason: SPEC_REASON_NONE,
+            decision: SPEC_DECISION_REUSED_CACHE,
+        });
+        return true;
+    }
+
+    // Check per-function clone cap (`AXS-INL-031.1`, `REQ-OPT-093`)
+    let existing_clones = ipa_spec_table_count_for_base(view(*tbl), SymbolId { v: base_callee_v });
+    if existing_clones >= budget.max_clones_per_fn {
+        stats.rejected_clone_cap = stats.rejected_clone_cap + 1u32;
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: key_bcnt,
+            benefit_score: benefit,
+            reason: SPEC_REASON_CLONE_CAP_EXCEEDED,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    // Check profitability threshold (`AXS-INL-030.2`)
+    if benefit < budget.min_benefit_score {
+        stats.rejected_low_benefit = stats.rejected_low_benefit + 1u32;
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: key_bcnt,
+            benefit_score: benefit,
+            reason: SPEC_REASON_LOW_BENEFIT,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    // Check module specialization growth cap (`AXS-INL-031.1`)
+    let inst_before = unsafe { (*callee_np).inst_count };
+    let projected_added = tbl.added_spec_insts + inst_before;
+    if (projected_added * 100u32) > (tbl.initial_module_insts * budget.max_module_growth_pct) {
+        stats.rejected_module_growth = stats.rejected_module_growth + 1u32;
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: key_bcnt,
+            benefit_score: benefit,
+            reason: SPEC_REASON_MODULE_GROWTH_EXCEEDED,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    // Clone callee `MirBody`, apply specialization bindings, and run cleanup (`AXS-INL-030.3`, `AXS-INL-031.2`)
+    let clone_sym_v = ipa_spec_clone_sym(view(key)).v;
+    let clone_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    ipa_clone_mir_body(unsafe { view(*callee_mir_p) }, unsafe { mut_view(*clone_mir) }, mut_view(*arena));
+    unsafe {
+        (*clone_mir).sym = SymbolId { v: clone_sym_v };
+        (*clone_mir).fn_sym = SymbolId { v: clone_sym_v };
+    }
+
+    ipa_apply_bindings_to_clone_mir(unsafe { mut_view(*clone_mir) }, view(key), mut_view(*arena));
+
+    // Post-specialization cleanup cascade (`ConstFold` + `SROA` + `SimplifyCFG` + `DCE`, `AXS-INL-031.2`)
+    let _ = opt_const_fold(unsafe { mut_view(*clone_mir) }, cg.thir);
+    let mut local_ss = sroa_stats_zero();
+    let _ = sroa_optimize_mir_in_place(
+        unsafe { mut_view(*clone_mir) },
+        cg.thir,
+        unsafe { address_of(*eff_table) },
+        unsafe { address_of(*esc_table) },
+        mut_view(local_ss),
+        0 as *mut SroaDecisionLog,
+        mut_view(*arena),
+        mut_view(*sink),
+        unsafe { (*callee_np).fn_item }
+    );
+    let _ = opt_cfg_simplify_with_merge(unsafe { mut_view(*clone_mir) }, mut_view(*arena));
+    let _ = opt_dce_in_arena(unsafe { mut_view(*clone_mir) }, mut_view(*arena));
+    stats.post_spec_cleanups = stats.post_spec_cleanups + 1u32;
+
+    // Verify specialized clone body (`AXS-INL-034.1`)
+    let prev_errs = sink.errors;
+    let verify_ok = !force_verify_fail &&
+                    sroa_verify_mir_body_complete(
+                        unsafe { view(*clone_mir) },
+                        cg.thir,
+                        mut_view(*arena),
+                        mut_view(*sink)
+                    ) &&
+                    sink.errors == prev_errs;
+    sink.errors = prev_errs;
+
+    if !verify_ok {
+        stats.pass_rollbacks = stats.pass_rollbacks + 1u32;
+        ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+            caller_sym: caller_sym_v,
+            base_callee_sym: base_callee_v,
+            spec_callee_sym: 0u32,
+            callsite_bb: cbb_v,
+            binding_count: key_bcnt,
+            benefit_score: benefit,
+            reason: SPEC_REASON_ROLLBACK_VERIFY,
+            decision: SPEC_DECISION_REJECTED,
+        });
+        return false;
+    }
+
+    let inst_after = ipa_count_mir_insts(unsafe { view(*clone_mir) });
+    let clone_ob = optir_build_from_verified_mir(unsafe { view(*clone_mir) }, cg.thir, mut_view(*arena));
+    if (clone_ob as usize) != 0 {
+        unsafe { (*clone_ob).fn_sym = SymbolId { v: clone_sym_v }; }
+    }
+
+    let base_np_now = unsafe { cg_node_at(cg.nodes, callee_idx as usize) };
+    let clone_nidx = callgraph_add_node(
+        mut_view(*cg),
+        mut_view(*arena),
+        SymbolId { v: clone_sym_v },
+        unsafe { (*base_np_now).fn_name },
+        clone_mir,
+        clone_ob,
+        unsafe { (*base_np_now).fn_item },
+        unsafe { (*base_np_now).inline_attr },
+        false,
+        false,
+        false,
+        unsafe { (*base_np_now).is_cold_fn },
+        unsafe { (*base_np_now).exec_domain },
+        unsafe { (*base_np_now).has_await_suspension }
+    );
+
+    // Rewrite caller's callsite to invoke `clone_sym` (`AXS-INL-030.3`)
+    let caller_np_now = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let caller_mir_now = unsafe { (*caller_np_now).mir };
+    let cbb_now = unsafe { mir_bb_at((*caller_mir_now).bbs, cbb_v as usize) };
+    unsafe {
+        (*cbb_now).terminator.func.kind = MIR_OP_CONST;
+        (*cbb_now).terminator.func.constant.kind = MIR_CONST_FN;
+        (*cbb_now).terminator.func.constant.sym = SymbolId { v: clone_sym_v };
+        (*cbb_now).terminator.func.place = mir_local_place(0u32);
+    }
+
+    // Re-analyze callgraph edges & summaries so specialized clone's tighter `EffectSummary` / `EscapeSummary` propagate!
+    callgraph_finalize(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+
+    let clone_np_after = unsafe { cg_node_at(cg.nodes, clone_nidx as usize) };
+    let eff_after = unsafe { (*clone_np_after).effect_summary.flags };
+
+    tbl.added_spec_insts = tbl.added_spec_insts + inst_after;
+    let key_fp = ipa_spec_key_fingerprint(view(key));
+    let _ = ipa_spec_table_insert(mut_view(*tbl), mut_view(*arena), SpecCacheEntry {
+        key: key,
+        fingerprint: key_fp,
+        clone_sym: SymbolId { v: clone_sym_v },
+        clone_node_idx: clone_nidx,
+        inst_before: inst_before,
+        inst_after: inst_after,
+        effect_flags_after: eff_after,
+    });
+
+    stats.clones_created = stats.clones_created + 1u32;
+    ipa_spec_log_push(log, mut_view(*arena), SpecDecisionRecord {
+        caller_sym: caller_sym_v,
+        base_callee_sym: base_callee_v,
+        spec_callee_sym: clone_sym_v,
+        callsite_bb: cbb_v,
+        binding_count: key_bcnt,
+        benefit_score: benefit,
+        reason: SPEC_REASON_NONE,
+        decision: SPEC_DECISION_CLONED,
+    });
+    true
+}
+
+pub fn ipa_specialize_callgraph(
+    cg: mut_view<CallGraph>,
+    profile: u8,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<IpaSpecStats>,
+    log: *mut SpecDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> *mut SpecTable {
+    callgraph_finalize(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    let mut total_insts: u32 = 0u32;
+    let mut ni: usize = 0;
+    while ni < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, ni) };
+        total_insts = total_insts + (unsafe { (*np).inst_count });
+        ni = ni + 1;
+    }
+    let tbl = ipa_spec_table_new(mut_view(*arena), total_insts);
+    let budget = ipa_budget_for_profile(profile);
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let initial_edge_count = cg.edge_count;
+    let mut ei: usize = 0;
+    while ei < initial_edge_count && ei < cg.edge_count {
+        if ipa_specialize_callsite(
+            mut_view(*cg),
+            ei,
+            view(budget),
+             unsafe { mut_view(*tbl) },
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(*stats),
+            log,
+            false,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            stats.pass_changes = stats.pass_changes + 1u32;
+        }
+        ei = ei + 1;
+    }
+    tbl
+}
+
+// --- Section 4 Implementation: Tail-Call & Tail-Recursion Optimization (`SPEC-73 §7, AXS-INL-033`) ---
+
+fn ipa_mir_has_live_drop_for_tailcall(mir: view<MirBody>, call_bb_idx: usize) -> bool {
+    if call_bb_idx >= mir.bb_count || (mir.bbs as usize) == 0 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let tgt_v = (unsafe { (*cbb).terminator.call_target.v }) as usize;
+    if tgt_v < mir.bb_count {
+        let tbb = unsafe { mir_bb_at(mir.bbs, tgt_v) };
+        if (unsafe { (*tbb).has_terminator }) && (unsafe { (*tbb).terminator.kind }) == MIR_TERM_DROP {
+            return true;
+        }
+        let mut s: usize = 0;
+        while s < (unsafe { (*tbb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*tbb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_DROP {
+                return true;
+            }
+            s = s + 1;
+        }
+    }
+    // Also check if any block in `mir` has a `MIR_STMT_DROP` or `MIR_TERM_DROP` on a local that is live across `call_bb_idx`
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        if !(unsafe { (*bb).is_cleanup }) {
+            if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_DROP {
+                return true;
+            }
+            let mut s: usize = 0;
+            while s < (unsafe { (*bb).stmt_count }) {
+                let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                if (unsafe { (*st).kind }) == MIR_STMT_DROP {
+                    return true;
+                }
+                s = s + 1;
+            }
+        }
+        b = b + 1;
+    }
+    false
+}
+
+fn ipa_mir_has_stack_borrow_to_call(mir: view<MirBody>, call_bb_idx: usize) -> bool {
+    if call_bb_idx >= mir.bb_count || (mir.bbs as usize) == 0 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let argc = unsafe { (*cbb).terminator.arg_count };
+    let args = unsafe { (*cbb).terminator.args };
+    if argc == 0 || (args as usize) == 0 {
+        return false;
+    }
+
+    // Check if any call argument is a local assigned via `MIR_RVALUE_REF` of a caller stack slot (without deref)
+    let mut ai: usize = 0;
+    while ai < argc {
+        let ap = unsafe { mir_op_at(args, ai) };
+        if (unsafe { (*ap).kind }) == MIR_OP_COPY || (unsafe { (*ap).kind }) == MIR_OP_MOVE {
+            let arg_loc = unsafe { (*ap).place.local.v };
+            let mut b: usize = 0;
+            while b < mir.bb_count {
+                let bb = unsafe { mir_bb_at(mir.bbs, b) };
+                let mut s: usize = 0;
+                while s < (unsafe { (*bb).stmt_count }) {
+                    let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                    if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+                       (unsafe { (*st).place.local.v }) == arg_loc &&
+                       (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_REF {
+                        let ref_pl = unsafe { view((*st).rvalue.place) };
+                        let has_deref: bool = ref_pl.proj_count > 0 &&
+                                              (ref_pl.projs as usize) != 0 &&
+                                              (unsafe { (*mir_proj_at(ref_pl.projs, 0)).kind }) == MIR_PROJ_DEREF;
+                        if !has_deref {
+                            return true;
+                        }
+                    }
+                    s = s + 1;
+                }
+                b = b + 1;
+            }
+        }
+        ai = ai + 1;
+    }
+    false
+}
+
+fn ipa_mir_is_strict_tail_call(mir: view<MirBody>, call_bb_idx: usize, out_has_drop_after: mut_view<bool>) -> bool {
+    *out_has_drop_after = false;
+    if call_bb_idx >= mir.bb_count || (mir.bbs as usize) == 0 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let tgt_v = (unsafe { (*cbb).terminator.call_target.v }) as usize;
+    if tgt_v >= mir.bb_count {
+        return false;
+    }
+    let tbb = unsafe { mir_bb_at(mir.bbs, tgt_v) };
+    if unsafe { (*tbb).has_terminator } {
+        let tk = unsafe { (*tbb).terminator.kind };
+        if tk == MIR_TERM_DROP {
+            *out_has_drop_after = true;
+            return false;
+        }
+        if tk != MIR_TERM_RETURN {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    let dest_v: u32 = if unsafe { (*cbb).terminator.has_destination } {
+        unsafe { (*cbb).terminator.destination.local.v }
+    } else {
+        0u32
+    };
+
+    let mut s: usize = 0;
+    while s < (unsafe { (*tbb).stmt_count }) {
+        let st = unsafe { mir_stmt_at((*tbb).stmts, s) };
+        let sk = unsafe { (*st).kind };
+        if sk == MIR_STMT_DROP {
+            *out_has_drop_after = true;
+            return false;
+        }
+        if sk == MIR_STMT_STORAGE_DEAD {
+            s = s + 1;
+            continue;
+        }
+        if sk == MIR_STMT_ASSIGN &&
+           (unsafe { (*st).place.local.v }) == 0u32 &&
+           (unsafe { (*st).place.proj_count }) == 0 &&
+           (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+           ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY ||
+            (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE) &&
+           (unsafe { (*st).rvalue.use_op.place.local.v }) == dest_v &&
+           (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+            s = s + 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+pub fn ipa_check_tco_legality(
+    cg: view<CallGraph>,
+    edge: view<CallEdge>,
+    profile: u8
+) -> TcoCheckResult {
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_PROFILE_O0,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+    if (edge.caller_node_idx as usize) >= cg.node_count || (cg.nodes as usize) == 0 {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_INDIRECT_UNRESOLVED,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, edge.caller_node_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    if (caller_mir_p as usize) == 0 {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_INDIRECT_UNRESOLVED,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+    let caller_mir = unsafe { view(*caller_mir_p) };
+    let call_bb_idx = edge.callsite_bb.v as usize;
+
+    // 1. Check tail position and post-call `Drop` cleanup obligations (`AXS-INL-033` Precondition 1)
+    let mut has_drop_after = false;
+    let is_tail = ipa_mir_is_strict_tail_call(caller_mir, call_bb_idx, mut_view(has_drop_after));
+    if has_drop_after || ipa_mir_has_live_drop_for_tailcall(caller_mir, call_bb_idx) {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_LIVE_DROP_AFTER_CALL,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+    if !is_tail {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_NOT_TAIL_POS,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+
+    // 2. Check zero stack-borrowed capabilities (`view<T>`, `mut_view<T>`, raw pointer to caller stack slot) (`AXS-INL-033` Precondition 2)
+    if ipa_mir_has_stack_borrow_to_call(caller_mir, call_bb_idx) {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_STACK_VIEW_ESCAPE,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+
+    // 3. Check callee resolution & self-recursion vs ABI-compatible sibling call (`AXS-INL-033.1`, `AXS-INL-033.2`)
+    if edge.known_callee.v == 0u32 || edge.callee_node_idx == INLINE_NONE_IDX ||
+       (edge.callee_node_idx as usize) >= cg.node_count {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_INDIRECT_UNRESOLVED,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+
+    let is_self = edge.known_callee.v == edge.caller_sym.v;
+    if is_self {
+        return TcoCheckResult {
+            legality: TCO_LEGAL,
+            reason: TCO_REASON_NONE,
+            is_self_recursion: true,
+            is_sibling_compatible: true,
+        };
+    }
+
+    let callee_np = unsafe { cg_node_at(cg.nodes, edge.callee_node_idx as usize) };
+    let callee_mir_p = unsafe { (*callee_np).mir };
+    if (unsafe { (*callee_np).exec_domain }) != (unsafe { (*caller_np).exec_domain }) ||
+       (callee_mir_p as usize) == 0 {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_ABI_MISMATCH,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+    let callee_mir = unsafe { view(*callee_mir_p) };
+    if caller_mir.arg_count != callee_mir.arg_count ||
+       caller_mir.local_count == 0 || callee_mir.local_count == 0 {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_ABI_MISMATCH,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+    let caller_ret_ty = unsafe { (*mir_local_at(caller_mir.locals, 0)).ty.v };
+    let callee_ret_ty = unsafe { (*mir_local_at(callee_mir.locals, 0)).ty.v };
+    if caller_ret_ty != callee_ret_ty {
+        return TcoCheckResult {
+            legality: TCO_ILLEGAL,
+            reason: TCO_REASON_ABI_MISMATCH,
+            is_self_recursion: false,
+            is_sibling_compatible: false,
+        };
+    }
+
+    TcoCheckResult {
+        legality: TCO_LEGAL,
+        reason: TCO_REASON_NONE,
+        is_self_recursion: false,
+        is_sibling_compatible: true,
+    }
+}
+
+fn ipa_redirect_bb_target(target_v: mut_view<u32>, old_v: u32, new_v: u32) {
+    if *target_v == old_v {
+        *target_v = new_v;
+    }
+}
+
+// Lowers direct self-tail-recursive calls in `mir` into a canonical loop (`bb0 -> bb_header <- call_bb`)
+// executing in `O(1)` stack space (`AXS-INL-033.1`).
+pub fn ipa_lower_self_tail_recursion_in_mir(
+    mir: mut_view<MirBody>,
+    fn_sym: SymbolId,
+    thir: *const Thir,
+    arena: mut_view<Arena>
+) -> u32 {
+    if mir.bb_count == 0 || (mir.bbs as usize) == 0 || (mir.locals as usize) == 0 {
+        return 0u32;
+    }
+
+    // First check if there is at least one legal self-tail-recursive callsite in `mir`
+    let orig_bb_count = mir.bb_count;
+    let mut candidate_count: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < orig_bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+            let fop = unsafe { (*bb).terminator.func };
+            if fop.kind == MIR_OP_CONST && fop.constant.kind == MIR_CONST_FN && fop.constant.sym.v == fn_sym.v {
+                let mut drop_after = false;
+                if ipa_mir_is_strict_tail_call(view(*mir), b, mut_view(drop_after)) &&
+                   !drop_after &&
+                   !ipa_mir_has_live_drop_for_tailcall(view(*mir), b) &&
+                   !ipa_mir_has_stack_borrow_to_call(view(*mir), b) &&
+                   (unsafe { (*bb).terminator.arg_count }) == mir.arg_count {
+                    candidate_count = candidate_count + 1u32;
+                }
+            }
+        }
+        b = b + 1;
+    }
+    if candidate_count == 0u32 {
+        return 0u32;
+    }
+
+    // Mark parameter locals `_1 .. _arg_count` as `mut_flag = true` so loop back-edge updates verify cleanly
+    let argc = mir.arg_count;
+    let mut p: usize = 1;
+    while p <= argc && p < mir.local_count {
+        let pdecl = unsafe { mir_local_at(mir.locals, p) };
+        unsafe { (*pdecl).mut_flag = true; }
+        p = p + 1;
+    }
+
+    // Split `bb0` into preheader `bb0 -> bb_header` so `bb0` keeps `pred_count == 0` while `bb_header` receives back-edges!
+    let header_bb_id = mir_add_bb(mut_view(*mir), mut_view(*arena), false);
+    let header_idx = header_bb_id.v as usize;
+    let bb0_ptr = unsafe { mir_bb_at(mir.bbs, 0) };
+    let hdr_ptr = unsafe { mir_bb_at(mir.bbs, header_idx) };
+    let sp0 = unsafe { (*bb0_ptr).terminator.span };
+    unsafe {
+        (*hdr_ptr).stmts = (*bb0_ptr).stmts;
+        (*hdr_ptr).stmt_count = (*bb0_ptr).stmt_count;
+        (*hdr_ptr).stmt_cap = (*bb0_ptr).stmt_cap;
+        (*hdr_ptr).has_terminator = (*bb0_ptr).has_terminator;
+        mir_copy_terminator(mut_view((*hdr_ptr).terminator), view((*bb0_ptr).terminator));
+
+        (*bb0_ptr).stmts = 0 as *mut MirStmt;
+        (*bb0_ptr).stmt_count = 0;
+        (*bb0_ptr).stmt_cap = 0;
+        (*bb0_ptr).has_terminator = true;
+        mir_term_reset(mut_view((*bb0_ptr).terminator), MIR_TERM_GOTO, view(sp0));
+        (*bb0_ptr).terminator.goto_target = MirBbId { v: header_bb_id.v };
+    }
+
+    // Redirect any existing CFG edges in `1 .. header_idx` that targeted `0` to `header_bb_id.v`
+    let mut rb: usize = 1;
+    while rb <= header_idx {
+        let rbb = unsafe { mir_bb_at(mir.bbs, rb) };
+        if unsafe { (*rbb).has_terminator } {
+            let tk = unsafe { (*rbb).terminator.kind };
+            if tk == MIR_TERM_GOTO {
+                ipa_redirect_bb_target(unsafe { mut_view((*rbb).terminator.goto_target.v) }, 0u32, header_bb_id.v);
+            } else if tk == MIR_TERM_SWITCH_INT {
+                ipa_redirect_bb_target(unsafe { mut_view((*rbb).terminator.otherwise.v) }, 0u32, header_bb_id.v);
+                let sc = unsafe { (*rbb).terminator.switch_count };
+                let tgts = unsafe { (*rbb).terminator.targets };
+                let mut k: usize = 0;
+                while k < sc && (tgts as usize) != 0 {
+                    let tgt_p = unsafe { mir_bb_id_at(tgts, k) };
+                    if (unsafe { (*tgt_p).v }) == 0u32 {
+                        unsafe { (*tgt_p).v = header_bb_id.v; }
+                    }
+                    k = k + 1;
+                }
+            } else if tk == MIR_TERM_CALL {
+                ipa_redirect_bb_target(unsafe { mut_view((*rbb).terminator.call_target.v) }, 0u32, header_bb_id.v);
+            } else if tk == MIR_TERM_ASSERT {
+                ipa_redirect_bb_target(unsafe { mut_view((*rbb).terminator.assert_target.v) }, 0u32, header_bb_id.v);
+            } else if tk == MIR_TERM_DROP {
+                ipa_redirect_bb_target(unsafe { mut_view((*rbb).terminator.drop_target.v) }, 0u32, header_bb_id.v);
+            }
+        }
+        rb = rb + 1;
+    }
+
+    // Allocate temporary locals `tmp_0 .. tmp_{argc-1}` for parallel argument evaluation before updating `_1.._argc`
+    let tmp_locals = arena_alloc_raw(mut_view(*arena), ipa_mul_usize(if argc == 0 { 1 } else { argc }, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut ti: usize = 0;
+    while ti < argc {
+        let pdecl = unsafe { mir_local_at(mir.locals, ti + 1) };
+        let pty = unsafe { (*pdecl).ty };
+        let psp = unsafe { (*pdecl).span };
+        let tlid = mir_add_local(
+            mut_view(*mir),
+            mut_view(*arena),
+            pty,
+            MIR_LOCAL_TEMP,
+            true,
+            StrId { v: 0u32 },
+            view(psp)
+        );
+        unsafe { *inl_u32_at(tmp_locals, ti) = tlid.v; }
+        // Initialize `tmp_locals[ti]` in `bb0` from `_param` so definite-init holds across all blocks
+        let bb0_now = unsafe { mir_bb_at(mir.bbs, 0) };
+        let mut init_st = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+        mir_stmt_reset(mut_view(init_st), MIR_STMT_ASSIGN, view(psp));
+        init_st.place = mir_local_place(tlid.v);
+        mir_rvalue_reset(mut_view(init_st.rvalue), MIR_RVALUE_USE);
+        init_st.rvalue.use_op = mir_op_copy_local((ti + 1) as u32);
+        mir_bb_push_stmt(unsafe { mut_view(*bb0_now) }, mut_view(*arena), view(init_st));
+        ti = ti + 1;
+    }
+
+    // Rewrite each self-tail-recursive callsite in `1 .. header_idx`
+    let mut lowered: u32 = 0u32;
+    let mut cb: usize = 1;
+    while cb <= header_idx {
+        let cbb = unsafe { mir_bb_at(mir.bbs, cb) };
+        if (unsafe { (*cbb).has_terminator }) && (unsafe { (*cbb).terminator.kind }) == MIR_TERM_CALL {
+            let fop = unsafe { (*cbb).terminator.func };
+            if fop.kind == MIR_OP_CONST && fop.constant.kind == MIR_CONST_FN && fop.constant.sym.v == fn_sym.v {
+                let mut drop_after = false;
+                let is_tail: bool = if cb == header_idx {
+                    // `bb0` was moved to `header_idx`; check tail call on `header_idx`
+                    ipa_mir_is_strict_tail_call(view(*mir), cb, mut_view(drop_after))
+                } else {
+                    ipa_mir_is_strict_tail_call(view(*mir), cb, mut_view(drop_after))
+                };
+                if is_tail && !drop_after && (unsafe { (*cbb).terminator.arg_count }) == argc {
+                    let call_sp = unsafe { (*cbb).terminator.span };
+                    let call_args = unsafe { (*cbb).terminator.args };
+                    // Step A: `tmp_i = arg_i` left-to-right
+                    let mut ai: usize = 0;
+                    while ai < argc && (call_args as usize) != 0 {
+                        let aop = unsafe { mir_op_at(call_args, ai) };
+                        let tloc = unsafe { *inl_u32_at(tmp_locals, ai) };
+                        let mut tst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                        mir_stmt_reset(mut_view(tst), MIR_STMT_ASSIGN, view(call_sp));
+                        tst.place = mir_local_place(tloc);
+                        mir_rvalue_reset(mut_view(tst.rvalue), MIR_RVALUE_USE);
+                        mir_copy_operand(mut_view(tst.rvalue.use_op), unsafe { view(*aop) });
+                        let cbb_a = unsafe { mir_bb_at(mir.bbs, cb) };
+                        mir_bb_push_stmt(unsafe { mut_view(*cbb_a) }, mut_view(*arena), view(tst));
+                        ai = ai + 1;
+                    }
+                    // Step B: `_param_i = copy/move tmp_i`
+                    let mut pi: usize = 0;
+                    while pi < argc {
+                        let tloc = unsafe { *inl_u32_at(tmp_locals, pi) };
+                        let ploc = (pi + 1) as u32;
+                        let pty = unsafe { (*mir_local_at(mir.locals, pi + 1)).ty };
+                        let is_cp = sroa_type_is_copy(thir, pty);
+                        let mut pst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                        mir_stmt_reset(mut_view(pst), MIR_STMT_ASSIGN, view(call_sp));
+                        pst.place = mir_local_place(ploc);
+                        mir_rvalue_reset(mut_view(pst.rvalue), MIR_RVALUE_USE);
+                        pst.rvalue.use_op = if is_cp { mir_op_copy_local(tloc) } else { mir_op_move_local(tloc) };
+                        let cbb_b = unsafe { mir_bb_at(mir.bbs, cb) };
+                        mir_bb_push_stmt(unsafe { mut_view(*cbb_b) }, mut_view(*arena), view(pst));
+                        pi = pi + 1;
+                    }
+                    // Step C: Replace `MIR_TERM_CALL` with `MIR_TERM_GOTO -> header_bb_id`
+                    let cbb_c = unsafe { mir_bb_at(mir.bbs, cb) };
+                    mir_term_reset(unsafe { mut_view((*cbb_c).terminator) }, MIR_TERM_GOTO, view(call_sp));
+                    unsafe {
+                        (*cbb_c).terminator.goto_target = MirBbId { v: header_bb_id.v };
+                        (*cbb_c).has_terminator = true;
+                    }
+                    lowered = lowered + 1u32;
+                }
+            }
+        }
+        cb = cb + 1;
+    }
+
+    lowered
+}
+
+pub fn ipa_verify_tailcall_attr(
+    cg: view<CallGraph>,
+    edge: view<CallEdge>,
+    profile: u8,
+    stats: mut_view<TcoStats>,
+    log: *mut TcoDecisionLog,
+    arena: mut_view<Arena>
+) -> TcoCheckResult {
+    stats.callsites_checked = stats.callsites_checked + 1u32;
+    let res = ipa_check_tco_legality(cg, edge, profile);
+    if res.legality != TCO_LEGAL {
+        if res.reason == TCO_REASON_LIVE_DROP_AFTER_CALL {
+            stats.rejected_live_drop = stats.rejected_live_drop + 1u32;
+        } else if res.reason == TCO_REASON_STACK_VIEW_ESCAPE {
+            stats.rejected_stack_view = stats.rejected_stack_view + 1u32;
+        } else if res.reason == TCO_REASON_NOT_TAIL_POS {
+            stats.rejected_not_tail = stats.rejected_not_tail + 1u32;
+        }
+        // REQ-OPT-003: An explicit `@tailcall` annotation on an illegal tail call MUST be rejected with a deterministic diagnostic!
+        stats.tailcall_diag_errors = stats.tailcall_diag_errors + 1u32;
+        ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+            caller_sym: edge.caller_sym.v,
+            callee_sym: edge.known_callee.v,
+            callsite_bb: edge.callsite_bb.v,
+            is_tailcall_attr: true,
+            legality: TCO_ILLEGAL,
+            reason: res.reason,
+            decision: TCO_DECISION_REJECTED_DIAG,
+        });
+    } else {
+        let dec: u8 = if res.is_self_recursion {
+            TCO_DECISION_SELF_LOOP_LOWERED
+        } else {
+            TCO_DECISION_SIBLING_TAILCALL
+        };
+        ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+            caller_sym: edge.caller_sym.v,
+            callee_sym: edge.known_callee.v,
+            callsite_bb: edge.callsite_bb.v,
+            is_tailcall_attr: true,
+            legality: TCO_LEGAL,
+            reason: TCO_REASON_NONE,
+            decision: dec,
+        });
+    }
+    res
+}
+
+pub fn ipa_optimize_tailcalls_in_node(
+    cg: mut_view<CallGraph>,
+    node_idx: usize,
+    profile: u8,
+    stats: mut_view<TcoStats>,
+    log: *mut TcoDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if profile == OPT_PROFILE_DEBUG_O0 || node_idx >= cg.node_count || (cg.nodes as usize) == 0 {
+        return false;
+    }
+    let np = unsafe { cg_node_at(cg.nodes, node_idx) };
+    let mir_p = unsafe { (*np).mir };
+    if (unsafe { (*np).is_extern_ffi }) || !(unsafe { (*np).has_verified_body }) || (mir_p as usize) == 0 {
+        return false;
+    }
+    let fn_sym_v = unsafe { (*np).fn_sym.v };
+    let estart = (unsafe { (*np).out_edge_start }) as usize;
+    let ecnt = (unsafe { (*np).out_edge_count }) as usize;
+
+    let mut has_self_tail = false;
+    let mut any_sibling = false;
+    let mut ei: usize = 0;
+    while ei < ecnt && (estart + ei) < cg.edge_count {
+        let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+        if !(unsafe { (*ep).is_inlined }) {
+            stats.callsites_checked = stats.callsites_checked + 1u32;
+            let chk = ipa_check_tco_legality(view(*cg), unsafe { view(*ep) }, profile);
+            let cbb_v = unsafe { (*ep).callsite_bb.v };
+            let cal_v = unsafe { (*ep).known_callee.v };
+            if chk.legality != TCO_LEGAL {
+                if chk.reason == TCO_REASON_LIVE_DROP_AFTER_CALL {
+                    stats.rejected_live_drop = stats.rejected_live_drop + 1u32;
+                } else if chk.reason == TCO_REASON_STACK_VIEW_ESCAPE {
+                    stats.rejected_stack_view = stats.rejected_stack_view + 1u32;
+                } else if chk.reason == TCO_REASON_NOT_TAIL_POS {
+                    stats.rejected_not_tail = stats.rejected_not_tail + 1u32;
+                }
+                ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+                    caller_sym: fn_sym_v,
+                    callee_sym: cal_v,
+                    callsite_bb: cbb_v,
+                    is_tailcall_attr: false,
+                    legality: TCO_ILLEGAL,
+                    reason: chk.reason,
+                    decision: TCO_DECISION_NONE,
+                });
+            } else if chk.is_self_recursion {
+                has_self_tail = true;
+            } else if chk.is_sibling_compatible {
+                any_sibling = true;
+                stats.sibling_tailcalls_marked = stats.sibling_tailcalls_marked + 1u32;
+                unsafe { (*ep).is_tail_position = true; }
+                ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+                    caller_sym: fn_sym_v,
+                    callee_sym: cal_v,
+                    callsite_bb: cbb_v,
+                    is_tailcall_attr: false,
+                    legality: TCO_LEGAL,
+                    reason: TCO_REASON_NONE,
+                    decision: TCO_DECISION_SIBLING_TAILCALL,
+                });
+            }
+        }
+        ei = ei + 1;
+    }
+
+    if !has_self_tail {
+        return any_sibling;
+    }
+
+    // Snapshot `mir_p` before lowering self-tail-recursion into a loop
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    ipa_clone_mir_body(unsafe { view(*mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+
+    let lowered_cnt = ipa_lower_self_tail_recursion_in_mir(
+        unsafe { mut_view(*mir_p) },
+        SymbolId { v: fn_sym_v },
+        cg.thir,
+        mut_view(*arena)
+    );
+    if lowered_cnt == 0u32 {
+        return any_sibling;
+    }
+
+    let prev_errs = sink.errors;
+    let verify_ok = !force_verify_fail &&
+                    sroa_verify_mir_body_complete(
+                        unsafe { view(*mir_p) },
+                        cg.thir,
+                        mut_view(*arena),
+                        mut_view(*sink)
+                    ) &&
+                    sink.errors == prev_errs;
+    sink.errors = prev_errs;
+
+    if !verify_ok {
+        ipa_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*mir_p) }, mut_view(*arena));
+        stats.pass_rollbacks = stats.pass_rollbacks + 1u32;
+        ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+            caller_sym: fn_sym_v,
+            callee_sym: fn_sym_v,
+            callsite_bb: 0u32,
+            is_tailcall_attr: false,
+            legality: TCO_LEGAL,
+            reason: TCO_REASON_ROLLBACK_VERIFY,
+            decision: TCO_DECISION_NONE,
+        });
+        return any_sibling;
+    }
+
+    stats.self_loops_lowered = stats.self_loops_lowered + lowered_cnt;
+    ipa_tco_log_push(log, mut_view(*arena), TcoDecisionRecord {
+        caller_sym: fn_sym_v,
+        callee_sym: fn_sym_v,
+        callsite_bb: 0u32,
+        is_tailcall_attr: false,
+        legality: TCO_LEGAL,
+        reason: TCO_REASON_NONE,
+        decision: TCO_DECISION_SELF_LOOP_LOWERED,
+    });
+
+    // Rebuild `opt_body` and refresh callgraph edges after eliminating the recursive edge
+    let new_ob = optir_build_from_verified_mir(unsafe { view(*mir_p) }, cg.thir, mut_view(*arena));
+    let np_upd = unsafe { cg_node_at(cg.nodes, node_idx) };
+    unsafe {
+        (*np_upd).inst_count = ipa_count_mir_insts(view(*mir_p));
+        if (new_ob as usize) != 0 {
+            (*new_ob).fn_sym = SymbolId { v: fn_sym_v };
+            (*np_upd).opt_body = new_ob;
+        }
+    }
+    callgraph_analyze_edges(mut_view(*cg), mut_view(*arena));
+    callgraph_compute_sccs(mut_view(*cg), mut_view(*arena));
+    true
+}
+
+pub fn ipa_optimize_tailcalls_in_callgraph(
+    cg: mut_view<CallGraph>,
+    profile: u8,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<TcoStats>,
+    log: *mut TcoDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    stats.pass_runs = stats.pass_runs + 1u32;
+    let mut any_changed = false;
+    let mut ni: usize = 0;
+    while ni < cg.node_count {
+        if ipa_optimize_tailcalls_in_node(
+            mut_view(*cg),
+            ni,
+            profile,
+            mut_view(*stats),
+            log,
+            false,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            any_changed = true;
+            stats.pass_changes = stats.pass_changes + 1u32;
+        }
+        ni = ni + 1;
+    }
+    if any_changed {
+        callgraph_finalize(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    }
+    any_changed
+}
+
+// --- Section 5: `PassManager` Runners for `PASS_IPA_SPECIALIZE` & `PASS_TAILCALL` (`AXS-INL-034`) ---
+
+pub fn ipa_run_specialize_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    cg: mut_view<CallGraph>,
+    tbl: mut_view<SpecTable>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<IpaSpecStats>,
+    log: *mut SpecDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = ipa_specialize_contract();
+    let base_req = contract.required_analyses & (0xFFFFFFFFu32 ^ ANALYSIS_MASK_CALL_GRAPH);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), base_req);
+    pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+
+    let caller_idx = callgraph_find_node_idx(view(*cg), body.fn_sym);
+    if caller_idx == INLINE_NONE_IDX {
+        return false;
+    }
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<IpaSpecStats>(), align_of<IpaSpecStats>()) as *mut IpaSpecStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+    let budget = ipa_budget_for_profile(pm.budget.profile);
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if (caller_mir_p as usize) != 0 {
+        ipa_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+    }
+
+    let estart = (unsafe { (*caller_np).out_edge_start }) as usize;
+    let ecnt = (unsafe { (*caller_np).out_edge_count }) as usize;
+    let mut changed = false;
+    let mut ei: usize = 0;
+    while ei < ecnt && (estart + ei) < cg.edge_count {
+        if ipa_specialize_callsite(
+            mut_view(*cg),
+            estart + ei,
+            view(budget),
+            mut_view(*tbl),
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(*stats),
+            log,
+            force_verify_fail,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            changed = true;
+        }
+        ei = ei + 1;
+    }
+
+    if changed && (caller_mir_p as usize) != 0 {
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 || force_verify_fail {
+            ipa_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_PURE_CALL,
+            CERTAINTY_PROVEN,
+            ANALYSIS_CALL_GRAPH,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_IPA_SPECIALIZE
+        );
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) || force_verify_fail {
+            sink.errors = pre_sink_errs;
+            if (caller_mir_p as usize) != 0 {
+                ipa_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            }
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn ipa_run_tailcall_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    cg: mut_view<CallGraph>,
+    stats: mut_view<TcoStats>,
+    log: *mut TcoDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = tailcall_contract();
+    let base_req = contract.required_analyses & (0xFFFFFFFFu32 ^ ANALYSIS_MASK_CALL_GRAPH);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), base_req);
+    pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+
+    let caller_idx = callgraph_find_node_idx(view(*cg), body.fn_sym);
+    if caller_idx == INLINE_NONE_IDX {
+        return false;
+    }
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<TcoStats>(), align_of<TcoStats>()) as *mut TcoStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if (caller_mir_p as usize) != 0 {
+        ipa_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+    }
+
+    let changed = ipa_optimize_tailcalls_in_node(
+        mut_view(*cg),
+        caller_idx as usize,
+        pm.budget.profile,
+        mut_view(*stats),
+        log,
+        force_verify_fail,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    if changed && (caller_mir_p as usize) != 0 {
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 || force_verify_fail {
+            ipa_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_NO_ESCAPE,
+            CERTAINTY_PROVEN,
+            ANALYSIS_CALL_GRAPH,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_TAILCALL
+        );
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) || force_verify_fail {
+            sink.errors = pre_sink_errs;
+            if (caller_mir_p as usize) != 0 {
+                ipa_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            }
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+// --- Section 6: Deterministic `--emit=specialize` & `--emit=inline` TCO Printers (`SPEC-73 §9, AXS-INL-035`) ---
+
+const SPEC_PRINT_DATA: [224]u8 = [
+    //   0..17  "specializations {\n" (18 bytes)
+    115u8, 112u8, 101u8, 99u8, 105u8, 97u8, 108u8, 105u8, 122u8, 97u8, 116u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8,
+    //  18..31  "  clone base=" (13 bytes)
+    32u8, 32u8, 99u8, 108u8, 111u8, 110u8, 101u8, 32u8, 98u8, 97u8, 115u8, 101u8, 61u8,
+    //  31..37  " spec=" (6 bytes)
+    32u8, 115u8, 112u8, 101u8, 99u8, 61u8,
+    //  37..47  " bindings=" (10 bytes)
+    32u8, 98u8, 105u8, 110u8, 100u8, 105u8, 110u8, 103u8, 115u8, 61u8,
+    //  47..60  " inst_before=" (13 bytes)
+    32u8, 105u8, 110u8, 115u8, 116u8, 95u8, 98u8, 101u8, 102u8, 111u8, 114u8, 101u8, 61u8,
+    //  60..72  " inst_after=" (12 bytes)
+    32u8, 105u8, 110u8, 115u8, 116u8, 95u8, 97u8, 102u8, 116u8, 101u8, 114u8, 61u8,
+    //  72..81  " effects=" (9 bytes)
+    32u8, 101u8, 102u8, 102u8, 101u8, 99u8, 116u8, 115u8, 61u8,
+    //  81..98  "  summary clones=" (17 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 99u8, 108u8, 111u8, 110u8, 101u8, 115u8, 61u8,
+    //  98..106 " reused=" (8 bytes)
+    32u8, 114u8, 101u8, 117u8, 115u8, 101u8, 100u8, 61u8,
+    // 106..117 " cap_drops=" (11 bytes)
+    32u8, 99u8, 97u8, 112u8, 95u8, 100u8, 114u8, 111u8, 112u8, 115u8, 61u8,
+    // 117..128 " rollbacks=" (11 bytes)
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 128..144 "tco_decisions {\n" (16 bytes)
+    116u8, 99u8, 111u8, 95u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8,
+    // 144..165 "  summary self_loops=" (21 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 115u8, 101u8, 108u8, 102u8, 95u8, 108u8, 111u8, 111u8, 112u8, 115u8, 61u8,
+    // 165..175 " siblings=" (10 bytes)
+    32u8, 115u8, 105u8, 98u8, 108u8, 105u8, 110u8, 103u8, 115u8, 61u8,
+    // 175..187 " drop_blks=" (11 bytes)
+    32u8, 100u8, 114u8, 111u8, 112u8, 95u8, 98u8, 108u8, 107u8, 115u8, 61u8,
+    // 186..197 " view_blks=" (11 bytes)
+    32u8, 118u8, 105u8, 101u8, 119u8, 95u8, 98u8, 108u8, 107u8, 115u8, 61u8,
+    // 197..210 " diag_errors=" (13 bytes)
+    32u8, 100u8, 105u8, 97u8, 103u8, 95u8, 101u8, 114u8, 114u8, 111u8, 114u8, 115u8, 61u8,
+    // 210..224 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn spec_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), SPEC_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn ipa_specialize_print(
+    tbl: view<SpecTable>,
+    stats: view<IpaSpecStats>,
+    out: mut_view<DiagBuffer>
+) {
+    spec_push_tbl(mut_view(*out), 0, 18);
+    let mut i: usize = 0;
+    while i < tbl.count && (tbl.entries as usize) != 0 {
+        let ep = unsafe { ipa_cache_at(tbl.entries, i) };
+        spec_push_tbl(mut_view(*out), 18, 13);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).key.base_fn.v });
+        spec_push_tbl(mut_view(*out), 31, 6);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).clone_sym.v });
+        spec_push_tbl(mut_view(*out), 37, 10);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).key.binding_count });
+        spec_push_tbl(mut_view(*out), 47, 13);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).inst_before });
+        spec_push_tbl(mut_view(*out), 60, 12);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).inst_after });
+        spec_push_tbl(mut_view(*out), 72, 9);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*ep).effect_flags_after }) as u32);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+    spec_push_tbl(mut_view(*out), 81, 17);
+    diag_buf_push_u32(mut_view(*out), stats.clones_created);
+    spec_push_tbl(mut_view(*out), 98, 8);
+    diag_buf_push_u32(mut_view(*out), stats.clones_reused);
+    spec_push_tbl(mut_view(*out), 106, 11);
+    diag_buf_push_u32(mut_view(*out), stats.rejected_clone_cap);
+    spec_push_tbl(mut_view(*out), 117, 11);
+    diag_buf_push_u32(mut_view(*out), stats.pass_rollbacks);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    spec_push_tbl(mut_view(*out), 210, 2);
+}
+
+pub fn ipa_tailcall_print(
+    stats: view<TcoStats>,
+    out: mut_view<DiagBuffer>
+) {
+    spec_push_tbl(mut_view(*out), 128, 16);
+    spec_push_tbl(mut_view(*out), 144, 21);
+    diag_buf_push_u32(mut_view(*out), stats.self_loops_lowered);
+    spec_push_tbl(mut_view(*out), 165, 10);
+    diag_buf_push_u32(mut_view(*out), stats.sibling_tailcalls_marked);
+    spec_push_tbl(mut_view(*out), 175, 11);
+    diag_buf_push_u32(mut_view(*out), stats.rejected_live_drop);
+    spec_push_tbl(mut_view(*out), 186, 11);
+    diag_buf_push_u32(mut_view(*out), stats.rejected_stack_view);
+    spec_push_tbl(mut_view(*out), 197, 13);
+    diag_buf_push_u32(mut_view(*out), stats.tailcall_diag_errors);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    spec_push_tbl(mut_view(*out), 210, 2);
+}

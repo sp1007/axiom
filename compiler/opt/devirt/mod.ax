@@ -1,0 +1,1304 @@
+// Concrete-Receiver Devirtualization of `dyn Trait` Vtable Calls, Indirect Function Pointers,
+// and Closure Dispatch (T614 / E15.4).
+// Implements SPEC-73 §§6, 8, 9 (AXS-INL-032, AXS-INL-034, AXS-INL-035;
+// REQ-OPT-103..107, REQ-OPT-112..113, REQ-OPT-315):
+//   - Tier 1 (`DEVIRT_TIER_EXACT`): `Certainty.Proven` single concrete target devirtualization
+//     (local SSA/constructor provenance, interprocedural parameter provenance, or closed-world
+//     single-implementor proof) -> direct `MIR_CONST_FN` call + immediate inliner & SROA cascade (`AXS-INL-032.1`)
+//   - Tier 2 (`DEVIRT_TIER_GUARDED`): bounded multi-target speculative devirtualization (2..4 targets)
+//     emitting `MIR_TERM_SWITCH_INT` guarded direct calls with exhaustive closed-world branch or
+//     mandatory open-world dynamic fallback (`AXS-INL-032.2`, `REQ-OPT-106`)
+//   - Tier 3 (`DEVIRT_TIER_RETAINED_DYNAMIC`): fail-closed retention of dynamic dispatch when
+//     target set is unknown, open-world, `@export` boundary, or `dynamic_loading_active` (`AXS-INL-032.3`, `REQ-OPT-107`, `REQ-OPT-113`)
+//   - `PassManager` `TransformationContract` (`PASS_DEVIRT = 16u16`) (`AXS-INL-034`)
+//   - Deterministic `--emit=devirt` inspection printer (`devirt_print`) (`AXS-INL-035`)
+module compiler.opt.devirt
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.types.types.Thir
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.mir_add_bb
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_clone_place
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_term_reset
+use compiler.mir.mir.mir_u64_at
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_NO_ALIAS
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.escape.EscapeSummaryTable
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_ESCAPE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.sroa.SroaDecisionLog
+use compiler.opt.sroa.SroaStats
+use compiler.opt.sroa.sroa_verify_mir_body_complete
+use compiler.opt.sroa.sroa_verify_postconditions_arg_aware
+use compiler.opt.inline.ANALYSIS_CALL_GRAPH
+use compiler.opt.inline.ANALYSIS_MASK_CALL_GRAPH
+use compiler.opt.inline.CallEdge
+use compiler.opt.inline.CallGraph
+use compiler.opt.inline.CallGraphNode
+use compiler.opt.inline.DISPATCH_CLOSURE
+use compiler.opt.inline.DISPATCH_DIRECT
+use compiler.opt.inline.DISPATCH_DYN_TRAIT
+use compiler.opt.inline.DISPATCH_FN_PTR
+use compiler.opt.inline.INLINE_NONE_IDX
+use compiler.opt.inline.InlineDecisionLog
+use compiler.opt.inline.InlineStats
+use compiler.opt.inline.callgraph_analyze_edges
+use compiler.opt.inline.callgraph_finalize
+use compiler.opt.inline.callgraph_find_node_idx
+use compiler.opt.inline.cg_edge_at
+use compiler.opt.inline.cg_node_at
+use compiler.opt.inline.inl_sym_at
+use compiler.opt.inline.inline_budget_for_profile
+use compiler.opt.inline.inline_optimize_node
+use compiler.opt.inline.inline_stats_zero
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifier & TransformationContract (`SPEC-73 §8, AXS-INL-034`) ---
+
+pub const PASS_DEVIRT: u16 = 16u16;
+
+pub fn devirt_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_DEVIRT,
+        required_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS |
+                           ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO,
+        required_proofs: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS,
+        preserved_analyses: ANALYSIS_MASK_DOMINATORS,
+        invalidated_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_CFG | ANALYSIS_MASK_EFFECT_INFO |
+                              ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_NO_ESCAPE,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- Three-Tier Devirtualization Constants & Structures (`SPEC-73 §6, AXS-INL-032`) ---
+
+pub const DEVIRT_TIER_NONE: u8 = 0u8;
+pub const DEVIRT_TIER_EXACT: u8 = 1u8;
+pub const DEVIRT_TIER_GUARDED: u8 = 2u8;
+pub const DEVIRT_TIER_RETAINED_DYNAMIC: u8 = 3u8;
+
+pub const DEVIRT_REASON_NONE: u8 = 0u8;
+pub const DEVIRT_REASON_ALREADY_DIRECT: u8 = 1u8;
+pub const DEVIRT_REASON_UNKNOWN_TARGET: u8 = 2u8;
+pub const DEVIRT_REASON_OPEN_WORLD: u8 = 3u8;
+pub const DEVIRT_REASON_DYNAMIC_LOADING: u8 = 4u8;
+pub const DEVIRT_REASON_EXPORT_BOUNDARY: u8 = 5u8;
+pub const DEVIRT_REASON_TOO_MANY_TARGETS: u8 = 6u8;
+pub const DEVIRT_REASON_PROFILE_O0: u8 = 7u8;
+pub const DEVIRT_REASON_ROLLBACK_VERIFY: u8 = 8u8;
+
+pub const DEVIRT_DECISION_RETAINED_DYNAMIC: u8 = 0u8;
+pub const DEVIRT_DECISION_DEVIRT_EXACT: u8 = 1u8;
+pub const DEVIRT_DECISION_DEVIRT_GUARDED: u8 = 2u8;
+
+pub const MAX_GUARDED_TARGETS: usize = 4;
+
+@derive(Copy)
+pub struct DevirtCandidate {
+    pub tier: u8,
+    pub reason: u8,
+    pub dispatch_kind: u8,
+    pub exact_callee: SymbolId,
+    pub targets: [4]SymbolId,
+    pub target_count: u32,
+    pub targets_complete: bool,
+    pub locally_proven: bool,
+}
+
+@derive(Copy)
+pub struct DevirtDecisionRecord {
+    pub caller_sym: u32,
+    pub callsite_bb: u32,
+    pub orig_dispatch: u8,
+    pub tier: u8,
+    pub reason: u8,
+    pub decision: u8,
+    pub primary_target: u32,
+    pub target_count: u32,
+    pub targets_complete: bool,
+    pub inlined_after: bool,
+}
+
+pub struct DevirtDecisionLog {
+    pub records: *mut DevirtDecisionRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+@derive(Copy)
+pub struct DevirtStats {
+    pub callsites_analyzed: u32,
+    pub exact_devirt_count: u32,
+    pub guarded_devirt_count: u32,
+    pub retained_dynamic_count: u32,
+    pub inlined_after_devirt: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// --- Pointer Indexing & Utility Helpers ---
+
+fn dv_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn devirt_rec_at(base: *mut DevirtDecisionRecord, idx: usize) -> *mut DevirtDecisionRecord {
+    let off = dv_mul_usize(idx, size_of<DevirtDecisionRecord>());
+    ((base as usize) + off) as *mut DevirtDecisionRecord
+}
+
+pub fn devirt_stats_zero() -> DevirtStats {
+    DevirtStats {
+        callsites_analyzed: 0u32,
+        exact_devirt_count: 0u32,
+        guarded_devirt_count: 0u32,
+        retained_dynamic_count: 0u32,
+        inlined_after_devirt: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+pub fn devirt_log_new(arena: mut_view<Arena>, cap: usize) -> *mut DevirtDecisionLog {
+    let actual_cap: usize = if cap < 16 { 16 } else { cap };
+    let log = arena_alloc_raw(mut_view(*arena), size_of<DevirtDecisionLog>(), align_of<DevirtDecisionLog>()) as *mut DevirtDecisionLog;
+    let recs = arena_alloc_raw(mut_view(*arena), dv_mul_usize(actual_cap, size_of<DevirtDecisionRecord>()), align_of<DevirtDecisionRecord>()) as *mut DevirtDecisionRecord;
+    unsafe {
+        (*log).records = recs;
+        (*log).count = 0;
+        (*log).cap = actual_cap;
+    }
+    log
+}
+
+pub fn devirt_log_push(log: *mut DevirtDecisionLog, arena: mut_view<Arena>, rec: DevirtDecisionRecord) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 16 } else { cap + cap };
+        let new_recs = arena_alloc_raw(mut_view(*arena), dv_mul_usize(new_cap, size_of<DevirtDecisionRecord>()), align_of<DevirtDecisionRecord>()) as *mut DevirtDecisionRecord;
+        let mut i: usize = 0;
+        while i < cnt {
+            unsafe { *devirt_rec_at(new_recs, i) = *devirt_rec_at((*log).records, i); }
+            i = i + 1;
+        }
+        unsafe {
+            (*log).records = new_recs;
+            (*log).cap = new_cap;
+        }
+    }
+    unsafe {
+        *devirt_rec_at((*log).records, cnt) = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+fn devirt_clone_mir_body(src: view<MirBody>, dst: mut_view<MirBody>, arena: mut_view<Arena>) {
+    dst.sym.v = src.sym.v;
+    dst.fn_sym.v = src.fn_sym.v;
+    dst.fn_name.v = src.fn_name.v;
+    dst.span = src.span;
+    dst.arg_count = src.arg_count;
+    dst.local_count = src.local_count;
+    dst.local_cap = src.local_count;
+    dst.bb_count = src.bb_count;
+    dst.bb_cap = src.bb_count;
+    dst.drop_flag_count = src.drop_flag_count;
+
+    if src.local_count > 0 && (src.locals as usize) != 0 {
+        let lbytes = dv_mul_usize(src.local_count, size_of<MirLocalDecl>());
+        let new_locals = arena_alloc_raw(mut_view(*arena), lbytes, align_of<MirLocalDecl>()) as *mut MirLocalDecl;
+        unsafe { ptr_copy_nonoverlapping<u8>(src.locals as *const u8, new_locals as *mut u8, lbytes); }
+        dst.locals = new_locals;
+    } else {
+        dst.locals = 0 as *mut MirLocalDecl;
+    }
+
+    if src.bb_count > 0 && (src.bbs as usize) != 0 {
+        let bbytes = dv_mul_usize(src.bb_count, size_of<MirBb>());
+        let new_bbs = arena_alloc_raw(mut_view(*arena), bbytes, align_of<MirBb>()) as *mut MirBb;
+        let mut b: usize = 0;
+        while b < src.bb_count {
+            let sbb = unsafe { mir_bb_at(src.bbs, b) };
+            let dbb = unsafe { mir_bb_at(new_bbs, b) };
+            unsafe {
+                (*dbb).id.v = (*sbb).id.v;
+                (*dbb).stmt_count = (*sbb).stmt_count;
+                (*dbb).stmt_cap = (*sbb).stmt_count;
+                (*dbb).has_terminator = (*sbb).has_terminator;
+                (*dbb).is_cleanup = (*sbb).is_cleanup;
+                mir_copy_terminator(mut_view((*dbb).terminator), view((*sbb).terminator));
+                if (*sbb).stmt_count > 0 && ((*sbb).stmts as usize) != 0 {
+                    let sbytes = dv_mul_usize((*sbb).stmt_count, size_of<MirStmt>());
+                    let nstmts = arena_alloc_raw(mut_view(*arena), sbytes, align_of<MirStmt>()) as *mut MirStmt;
+                    ptr_copy_nonoverlapping<u8>((*sbb).stmts as *const u8, nstmts as *mut u8, sbytes);
+                    (*dbb).stmts = nstmts;
+                } else {
+                    (*dbb).stmts = 0 as *mut MirStmt;
+                }
+            }
+            b = b + 1;
+        }
+        dst.bbs = new_bbs;
+    } else {
+        dst.bbs = 0 as *mut MirBb;
+    }
+}
+
+// --- Section 1: Concrete-Receiver & Target-Set Provenance Analysis (`SPEC-73 §6.1, AXS-INL-032`) ---
+
+fn devirt_add_unique_sym(arr: mut_view<[4]SymbolId>, count: mut_view<u32>, sym: SymbolId) -> bool {
+    if sym.v == 0u32 {
+        return true;
+    }
+    let c = *count as usize;
+    let mut i: usize = 0;
+    while i < c && i < MAX_GUARDED_TARGETS {
+        if (*arr)[i].v == sym.v {
+            return true;
+        }
+        i = i + 1;
+    }
+    if c >= MAX_GUARDED_TARGETS {
+        *count = (c + 1) as u32;
+        return false;
+    }
+    (*arr)[c] = sym;
+    *count = (c + 1) as u32;
+    true
+}
+
+// Resolves a `MirOperand` to a direct function symbol, following up to 4 hops of
+// single-assignment temporary `MIR_OP_COPY` / `MIR_OP_MOVE` locals produced by `HIR_STMT_LET`.
+fn devirt_resolve_op_fn_sym(caller_mir: view<MirBody>, op: view<MirOperand>) -> SymbolId {
+    if op.kind == MIR_OP_CONST {
+        if op.constant.kind == MIR_CONST_FN && op.constant.sym.v != 0u32 {
+            return SymbolId { v: op.constant.sym.v };
+        }
+        return SymbolId { v: 0u32 };
+    }
+    if (op.kind != MIR_OP_COPY && op.kind != MIR_OP_MOVE) || op.place.proj_count != 0 {
+        return SymbolId { v: 0u32 };
+    }
+    let mut cur_local: u32 = op.place.local.v;
+    let mut hop: u32 = 0u32;
+    while hop < 4u32 {
+        if (cur_local as usize) >= caller_mir.local_count ||
+           (cur_local as usize) <= caller_mir.arg_count ||
+           (caller_mir.bbs as usize) == 0 {
+            return SymbolId { v: 0u32 };
+        }
+        let mut def_cnt: u32 = 0u32;
+        let mut found_sym: u32 = 0u32;
+        let mut next_local: u32 = 0u32;
+        let mut b: usize = 0;
+        while b < caller_mir.bb_count {
+            let bb = unsafe { mir_bb_at(caller_mir.bbs, b) };
+            let mut s: usize = 0;
+            while s < (unsafe { (*bb).stmt_count }) {
+                let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+                   (unsafe { (*st).place.local.v }) == cur_local &&
+                   (unsafe { (*st).place.proj_count }) == 0 {
+                    def_cnt = def_cnt + 1u32;
+                    let rvk = unsafe { (*st).rvalue.kind };
+                    if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST {
+                        let uok = unsafe { (*st).rvalue.use_op.kind };
+                        if uok == MIR_OP_CONST &&
+                           (unsafe { (*st).rvalue.use_op.constant.kind }) == MIR_CONST_FN &&
+                           (unsafe { (*st).rvalue.use_op.constant.sym.v }) != 0u32 {
+                            found_sym = unsafe { (*st).rvalue.use_op.constant.sym.v };
+                        } else if (uok == MIR_OP_COPY || uok == MIR_OP_MOVE) &&
+                                  (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+                            next_local = unsafe { (*st).rvalue.use_op.place.local.v };
+                        }
+                    } else if rvk == MIR_RVALUE_AGGREGATE {
+                        let oc = unsafe { (*st).rvalue.operand_count };
+                        let ops = unsafe { (*st).rvalue.operands };
+                        if oc > 0 && (ops as usize) != 0 {
+                            let op0 = unsafe { mir_op_at(ops, 0) };
+                            let ok0 = unsafe { (*op0).kind };
+                            if ok0 == MIR_OP_CONST &&
+                               (unsafe { (*op0).constant.kind }) == MIR_CONST_FN &&
+                               (unsafe { (*op0).constant.sym.v }) != 0u32 {
+                                found_sym = unsafe { (*op0).constant.sym.v };
+                            } else if (ok0 == MIR_OP_COPY || ok0 == MIR_OP_MOVE) &&
+                                      (unsafe { (*op0).place.proj_count }) == 0 {
+                                next_local = unsafe { (*op0).place.local.v };
+                            }
+                        }
+                    }
+                }
+                s = s + 1;
+            }
+            b = b + 1;
+        }
+        if def_cnt != 1u32 {
+            return SymbolId { v: 0u32 };
+        }
+        if found_sym != 0u32 {
+            return SymbolId { v: found_sym };
+        }
+        if next_local == 0u32 || next_local == cur_local {
+            return SymbolId { v: 0u32 };
+        }
+        cur_local = next_local;
+        hop = hop + 1u32;
+    }
+    SymbolId { v: 0u32 }
+}
+
+// Scans `caller_mir` for all assignments to `func_local` (direct `MIR_CONST_FN`, single-assignment
+// temp copies from `HIR_STMT_LET`, `MIR_RVALUE_CAST`, or `MIR_RVALUE_AGGREGATE` constructing a closure or `(data, vtable_fn)` pair).
+fn devirt_collect_local_provenance_targets(
+    caller_mir: view<MirBody>,
+    func_local: u32,
+    out_targets: mut_view<[4]SymbolId>,
+    out_count: mut_view<u32>,
+    out_all_defs_known: mut_view<bool>
+) {
+    *out_count = 0u32;
+    *out_all_defs_known = false;
+    if (func_local as usize) >= caller_mir.local_count || (caller_mir.bbs as usize) == 0 {
+        return;
+    }
+    // If `func_local` is an incoming function parameter (`1 .. arg_count`) with 0 assignments in `caller_mir`,
+    // its provenance is not locally defined unless reassigned.
+    let mut total_defs: u32 = 0u32;
+    let mut known_defs: u32 = 0u32;
+
+    let mut b: usize = 0;
+    while b < caller_mir.bb_count {
+        let bb = unsafe { mir_bb_at(caller_mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).place.local.v }) == func_local &&
+               (unsafe { (*st).place.proj_count }) == 0 {
+                total_defs = total_defs + 1u32;
+                let rvk = unsafe { (*st).rvalue.kind };
+                if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST {
+                    let sym = devirt_resolve_op_fn_sym(caller_mir, unsafe { view((*st).rvalue.use_op) });
+                    if sym.v != 0u32 {
+                        let _ = devirt_add_unique_sym(mut_view(*out_targets), mut_view(*out_count), sym);
+                        known_defs = known_defs + 1u32;
+                    }
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let oc = unsafe { (*st).rvalue.operand_count };
+                    let ops = unsafe { (*st).rvalue.operands };
+                    if oc > 0 && (ops as usize) != 0 {
+                        let op0 = unsafe { mir_op_at(ops, 0) };
+                        let sym = devirt_resolve_op_fn_sym(caller_mir, unsafe { view(*op0) });
+                        if sym.v != 0u32 {
+                            let _ = devirt_add_unique_sym(mut_view(*out_targets), mut_view(*out_count), sym);
+                            known_defs = known_defs + 1u32;
+                        }
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+
+    if total_defs > 0u32 && total_defs == known_defs && (func_local as usize) > caller_mir.arg_count {
+        *out_all_defs_known = true;
+    }
+}
+
+pub fn devirt_mir_call_is_indirect(caller_mir_p: *const MirBody, call_bb_idx: usize) -> bool {
+    if (caller_mir_p as usize) == 0 {
+        return false;
+    }
+    let caller_mir = unsafe { view(*caller_mir_p) };
+    if call_bb_idx >= caller_mir.bb_count || (caller_mir.bbs as usize) == 0 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let fop = unsafe { (*cbb).terminator.func };
+    return fop.kind != MIR_OP_CONST;
+}
+
+pub fn devirt_classify_callsite(
+    cg: view<CallGraph>,
+    edge: view<CallEdge>,
+    profile: u8
+) -> DevirtCandidate {
+    let mut cand = DevirtCandidate {
+        tier: DEVIRT_TIER_NONE,
+        reason: DEVIRT_REASON_NONE,
+        dispatch_kind: edge.dispatch_kind,
+        exact_callee: SymbolId { v: 0u32 },
+        targets: [SymbolId { v: 0u32 }, SymbolId { v: 0u32 }, SymbolId { v: 0u32 }, SymbolId { v: 0u32 }],
+        target_count: 0u32,
+        targets_complete: false,
+        locally_proven: false,
+    };
+
+    let mut caller_mir_p: *mut MirBody = 0 as *mut MirBody;
+    if (edge.caller_node_idx as usize) < cg.node_count && (cg.nodes as usize) != 0 {
+        let caller_np = unsafe { cg_node_at(cg.nodes, edge.caller_node_idx as usize) };
+        caller_mir_p = unsafe { (*caller_np).mir };
+    }
+    let mir_is_indirect = devirt_mir_call_is_indirect(caller_mir_p as *const MirBody, edge.callsite_bb.v as usize);
+
+    if edge.dispatch_kind == DISPATCH_DIRECT && !mir_is_indirect {
+        cand.tier = DEVIRT_TIER_NONE;
+        cand.reason = DEVIRT_REASON_ALREADY_DIRECT;
+        return cand;
+    }
+
+    let eff_dk = if edge.dispatch_kind == DISPATCH_DIRECT { DISPATCH_FN_PTR } else { edge.dispatch_kind };
+    cand.dispatch_kind = eff_dk;
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        cand.reason = DEVIRT_REASON_PROFILE_O0;
+        return cand;
+    }
+
+    if eff_dk != DISPATCH_DYN_TRAIT &&
+       eff_dk != DISPATCH_FN_PTR &&
+       eff_dk != DISPATCH_CLOSURE {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        cand.reason = DEVIRT_REASON_UNKNOWN_TARGET;
+        return cand;
+    }
+
+    if (edge.caller_node_idx as usize) >= cg.node_count || (cg.nodes as usize) == 0 {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        cand.reason = DEVIRT_REASON_UNKNOWN_TARGET;
+        return cand;
+    }
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, edge.caller_node_idx as usize) };
+
+    // 1. Check local SSA / constructor provenance inside `caller_mir` (`AXS-INL-032.1` Source 1 & 2)
+    if (caller_mir_p as usize) != 0 {
+        let caller_mir = unsafe { view(*caller_mir_p) };
+        let cbb_idx = edge.callsite_bb.v as usize;
+        if cbb_idx < caller_mir.bb_count && (caller_mir.bbs as usize) != 0 {
+            let cbb = unsafe { mir_bb_at(caller_mir.bbs, cbb_idx) };
+            if (unsafe { (*cbb).has_terminator }) && (unsafe { (*cbb).terminator.kind }) == MIR_TERM_CALL {
+                let fop = unsafe { (*cbb).terminator.func };
+                if (fop.kind == MIR_OP_COPY || fop.kind == MIR_OP_MOVE) && fop.place.proj_count == 0 {
+                    let mut loc_targets = [SymbolId { v: 0u32 }, SymbolId { v: 0u32 }, SymbolId { v: 0u32 }, SymbolId { v: 0u32 }];
+                    let mut loc_cnt: u32 = 0u32;
+                    let mut all_known = false;
+                    devirt_collect_local_provenance_targets(
+                        caller_mir,
+                        fop.place.local.v,
+                        mut_view(loc_targets),
+                        mut_view(loc_cnt),
+                        mut_view(all_known)
+                    );
+                    if all_known && loc_cnt == 1u32 {
+                        let t0_v = loc_targets[0].v;
+                        cand.tier = DEVIRT_TIER_EXACT;
+                        cand.reason = DEVIRT_REASON_NONE;
+                        cand.exact_callee = SymbolId { v: t0_v };
+                        cand.targets[0] = SymbolId { v: t0_v };
+                        cand.target_count = 1u32;
+                        cand.targets_complete = true;
+                        cand.locally_proven = true;
+                        return cand;
+                    }
+                    if all_known && loc_cnt >= 2u32 && (loc_cnt as usize) <= MAX_GUARDED_TARGETS {
+                        cand.tier = DEVIRT_TIER_GUARDED;
+                        cand.reason = DEVIRT_REASON_NONE;
+                        cand.targets = loc_targets;
+                        cand.target_count = loc_cnt;
+                        cand.targets_complete = true;
+                        cand.locally_proven = true;
+                        return cand;
+                    }
+                    if loc_cnt > (MAX_GUARDED_TARGETS as u32) {
+                        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+                        cand.reason = DEVIRT_REASON_TOO_MANY_TARGETS;
+                        return cand;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. If `edge.known_callee` is already resolved with `edge.targets_complete == true` (e.g. closure or local fn-ptr)
+    if edge.known_callee.v != 0u32 && edge.targets_complete {
+        let kc_v = edge.known_callee.v;
+        cand.tier = DEVIRT_TIER_EXACT;
+        cand.reason = DEVIRT_REASON_NONE;
+        cand.exact_callee = SymbolId { v: kc_v };
+        cand.targets[0] = SymbolId { v: kc_v };
+        cand.target_count = 1u32;
+        cand.targets_complete = true;
+        cand.locally_proven = true;
+        return cand;
+    }
+
+    // 3. Check whole-program / closed-world target set on `edge.possible_targets` (`AXS-INL-032.1` Source 3 & `AXS-INL-032.2`)
+    // Enforce open-world, dynamic-loading, and `@export` boundary guards (`REQ-OPT-107`, `REQ-OPT-113`):
+    if cg.dynamic_loading_active && !edge.targets_complete {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        cand.reason = DEVIRT_REASON_DYNAMIC_LOADING;
+        return cand;
+    }
+
+    let pt_cnt = edge.possible_target_count;
+    let pts = edge.possible_targets;
+    if pt_cnt == 0 || (pts as usize) == 0 {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        if cg.dynamic_loading_active {
+            cand.reason = DEVIRT_REASON_DYNAMIC_LOADING;
+        } else if !cg.closed_world {
+            cand.reason = DEVIRT_REASON_OPEN_WORLD;
+        } else if unsafe { (*caller_np).is_export_root } {
+            cand.reason = DEVIRT_REASON_EXPORT_BOUNDARY;
+        } else {
+            cand.reason = DEVIRT_REASON_UNKNOWN_TARGET;
+        }
+        return cand;
+    }
+
+    if pt_cnt > MAX_GUARDED_TARGETS {
+        cand.tier = DEVIRT_TIER_RETAINED_DYNAMIC;
+        cand.reason = DEVIRT_REASON_TOO_MANY_TARGETS;
+        return cand;
+    }
+
+    let is_complete = edge.targets_complete && cg.closed_world && !cg.dynamic_loading_active;
+    if pt_cnt == 1 {
+        let t0_v = unsafe { (*inl_sym_at(pts, 0)).v };
+        if is_complete && t0_v != 0u32 {
+            cand.tier = DEVIRT_TIER_EXACT;
+            cand.reason = DEVIRT_REASON_NONE;
+            cand.exact_callee = SymbolId { v: t0_v };
+            cand.targets[0] = SymbolId { v: t0_v };
+            cand.target_count = 1u32;
+            cand.targets_complete = true;
+            return cand;
+        }
+        // Single likely target in open-world -> guarded dispatch with mandatory dynamic fallback (`REQ-OPT-106`)
+        if t0_v != 0u32 {
+            cand.tier = DEVIRT_TIER_GUARDED;
+            cand.reason = DEVIRT_REASON_NONE;
+            cand.targets[0] = SymbolId { v: t0_v };
+            cand.target_count = 1u32;
+            cand.targets_complete = false;
+            return cand;
+        }
+    }
+
+    // `2 <= pt_cnt <= MAX_GUARDED_TARGETS`: Tier 2 Guarded Multi-Target Devirtualization (`AXS-INL-032.2`)
+    let mut k: usize = 0;
+    while k < pt_cnt && k < MAX_GUARDED_TARGETS {
+        cand.targets[k] = unsafe { *inl_sym_at(pts, k) };
+        k = k + 1;
+    }
+    cand.tier = DEVIRT_TIER_GUARDED;
+    cand.reason = DEVIRT_REASON_NONE;
+    cand.target_count = pt_cnt as u32;
+    cand.targets_complete = is_complete;
+    cand
+}
+
+// --- Section 2: Tier 1 Exact Devirtualization & Tier 2 Guarded Speculative Dispatch Rewrites (`AXS-INL-032.1..2`) ---
+
+pub fn devirt_rewrite_exact_in_mir(
+    caller_mir: mut_view<MirBody>,
+    call_bb_idx: usize,
+    exact_callee: SymbolId
+) -> bool {
+    if call_bb_idx >= caller_mir.bb_count || (caller_mir.bbs as usize) == 0 || exact_callee.v == 0u32 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    unsafe {
+        (*cbb).terminator.func.kind = MIR_OP_CONST;
+        (*cbb).terminator.func.constant.ty.v = 0u32;
+        (*cbb).terminator.func.constant.kind = MIR_CONST_FN;
+        (*cbb).terminator.func.constant.val = exact_callee.v as u64;
+        (*cbb).terminator.func.constant.sym = exact_callee;
+        (*cbb).terminator.func.place = mir_local_place(0u32);
+    }
+    true
+}
+
+fn devirt_clone_call_term_with_callee(
+    orig_term: view< compiler.mir.mir.MirTerminator >,
+    dst_term: mut_view< compiler.mir.mir.MirTerminator >,
+    direct_callee: SymbolId,
+    arena: mut_view<Arena>
+) {
+    mir_copy_terminator(mut_view(*dst_term), orig_term);
+    if direct_callee.v != 0u32 {
+        dst_term.func.kind = MIR_OP_CONST;
+        dst_term.func.constant.ty.v = 0u32;
+        dst_term.func.constant.kind = MIR_CONST_FN;
+        dst_term.func.constant.val = direct_callee.v as u64;
+        dst_term.func.constant.sym = direct_callee;
+        dst_term.func.place = mir_local_place(0u32);
+    }
+    if orig_term.arg_count > 0 && (orig_term.args as usize) != 0 {
+        let abytes = dv_mul_usize(orig_term.arg_count, size_of<MirOperand>());
+        let nargs = arena_alloc_raw(mut_view(*arena), abytes, align_of<MirOperand>()) as *mut MirOperand;
+        let mut i: usize = 0;
+        while i < orig_term.arg_count {
+            unsafe {
+                let src_op = mir_op_at(orig_term.args, i);
+                let dst_op = mir_op_at(nargs, i);
+                mir_copy_operand(mut_view(*dst_op), view(*src_op));
+            }
+            i = i + 1;
+        }
+        dst_term.args = nargs;
+    }
+    if orig_term.has_destination {
+        mir_clone_place(mut_view(*arena), view(orig_term.destination), mut_view(dst_term.destination));
+    }
+}
+
+pub fn devirt_rewrite_guarded_in_mir(
+    caller_mir: mut_view<MirBody>,
+    call_bb_idx: usize,
+    cand: view<DevirtCandidate>,
+    arena: mut_view<Arena>
+) -> bool {
+    let tcnt = cand.target_count as usize;
+    if call_bb_idx >= caller_mir.bb_count || (caller_mir.bbs as usize) == 0 ||
+       tcnt == 0 || tcnt > MAX_GUARDED_TARGETS {
+        return false;
+    }
+    let cbb_init = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb_init).has_terminator }) || (unsafe { (*cbb_init).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let orig_term = unsafe { (*cbb_init).terminator };
+    let fop_kind = orig_term.func.kind;
+    if fop_kind != MIR_OP_COPY && fop_kind != MIR_OP_MOVE {
+        return false;
+    }
+    let fop_local_v = orig_term.func.place.local.v;
+
+    // Number of explicit `switch_int` arms vs `otherwise` fallback block:
+    // - If `cand.targets_complete && tcnt >= 2`: `switch_count = tcnt - 1` (arms `0..tcnt-2`), and `otherwise` is direct call to `targets[tcnt - 1]`.
+    // - If `!cand.targets_complete`: `switch_count = tcnt` (arms `0..tcnt-1`), and `otherwise` is the original dynamic call fallback (`REQ-OPT-106`).
+    let switch_cnt: usize = if cand.targets_complete && tcnt >= 2 { tcnt - 1 } else { tcnt };
+    let sw_targets = arena_alloc_raw(mut_view(*arena), dv_mul_usize(switch_cnt, size_of<MirBbId>()), align_of<MirBbId>()) as *mut MirBbId;
+    let sw_values = arena_alloc_raw(mut_view(*arena), dv_mul_usize(switch_cnt, size_of<u64>()), align_of<u64>()) as *mut u64;
+
+    let mut k: usize = 0;
+    while k < switch_cnt {
+        let arm_bb_id = mir_add_bb(mut_view(*caller_mir), mut_view(*arena), false);
+        let arm_bb = unsafe { mir_bb_at(caller_mir.bbs, arm_bb_id.v as usize) };
+        let tsym_v = cand.targets[k].v;
+        devirt_clone_call_term_with_callee(
+            view(orig_term),
+            unsafe { mut_view((*arm_bb).terminator) },
+            SymbolId { v: tsym_v },
+            mut_view(*arena)
+        );
+        unsafe {
+            (*arm_bb).has_terminator = true;
+            *mir_bb_id_at(sw_targets, k) = arm_bb_id;
+            *mir_u64_at(sw_values, k) = tsym_v as u64;
+        }
+        k = k + 1;
+    }
+
+    let fb_bb_id = mir_add_bb(mut_view(*caller_mir), mut_view(*arena), false);
+    let fb_bb = unsafe { mir_bb_at(caller_mir.bbs, fb_bb_id.v as usize) };
+    let fb_callee: SymbolId = if cand.targets_complete && tcnt >= 2 {
+        SymbolId { v: cand.targets[tcnt - 1].v }
+    } else {
+        SymbolId { v: 0u32 }
+    };
+    devirt_clone_call_term_with_callee(
+        view(orig_term),
+        unsafe { mut_view((*fb_bb).terminator) },
+        fb_callee,
+        mut_view(*arena)
+    );
+    unsafe { (*fb_bb).has_terminator = true; }
+
+    // Replace `call_bb_idx` terminator with `MIR_TERM_SWITCH_INT`
+    let cbb_after = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    mir_term_reset(unsafe { mut_view((*cbb_after).terminator) }, MIR_TERM_SWITCH_INT, view(orig_term.span));
+    unsafe {
+        (*cbb_after).terminator.discr = mir_op_copy_local(fop_local_v);
+        (*cbb_after).terminator.switch_count = switch_cnt;
+        (*cbb_after).terminator.targets = sw_targets;
+        (*cbb_after).terminator.values = sw_values;
+        (*cbb_after).terminator.otherwise = fb_bb_id;
+        (*cbb_after).has_terminator = true;
+    }
+    true
+}
+
+// --- Section 3: CallGraph Devirtualization Driver + Inliner/SROA Feedback (`REQ-OPT-105, REQ-OPT-112`) ---
+
+pub fn devirt_optimize_node(
+    cg: mut_view<CallGraph>,
+    caller_idx: usize,
+    profile: u8,
+    run_inline_after: bool,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<DevirtStats>,
+    log: *mut DevirtDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if caller_idx >= cg.node_count || (cg.nodes as usize) == 0 {
+        return false;
+    }
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    if (unsafe { (*caller_np).is_extern_ffi }) || !(unsafe { (*caller_np).has_verified_body }) ||
+       (caller_mir_p as usize) == 0 {
+        return false;
+    }
+
+    let caller_sym = unsafe { (*caller_np).fn_sym };
+    let estart = (unsafe { (*caller_np).out_edge_start }) as usize;
+    let ecnt = (unsafe { (*caller_np).out_edge_count }) as usize;
+
+    let mut any_changed = false;
+    let mut has_new_direct_call = false;
+    let mut ei: usize = 0;
+    while ei < ecnt && (estart + ei) < cg.edge_count {
+        let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+        let cbb_v = unsafe { (*ep).callsite_bb.v };
+        let mir_is_indirect = devirt_mir_call_is_indirect(caller_mir_p as *const MirBody, cbb_v as usize);
+        let raw_dk = unsafe { (*ep).dispatch_kind };
+        let orig_dk = if raw_dk == DISPATCH_DIRECT && mir_is_indirect { DISPATCH_FN_PTR } else { raw_dk };
+        if orig_dk != DISPATCH_DIRECT {
+            stats.callsites_analyzed = stats.callsites_analyzed + 1u32;
+            let cand = devirt_classify_callsite(view(*cg), unsafe { view(*ep) }, profile);
+
+            if cand.tier == DEVIRT_TIER_EXACT {
+                let exact_v = cand.exact_callee.v;
+                let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+                devirt_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+
+                let rewrote = devirt_rewrite_exact_in_mir(
+                    unsafe { mut_view(*caller_mir_p) },
+                    cbb_v as usize,
+                    SymbolId { v: exact_v }
+                );
+                let prev_errs = sink.errors;
+                let verify_ok = rewrote && !force_verify_fail &&
+                                sroa_verify_mir_body_complete(
+                                    unsafe { view(*caller_mir_p) },
+                                    cg.thir,
+                                    mut_view(*arena),
+                                    mut_view(*sink)
+                                ) &&
+                                sink.errors == prev_errs;
+                sink.errors = prev_errs;
+
+                if !verify_ok {
+                    devirt_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+                    stats.pass_rollbacks = stats.pass_rollbacks + 1u32;
+                    devirt_log_push(log, mut_view(*arena), DevirtDecisionRecord {
+                        caller_sym: caller_sym.v,
+                        callsite_bb: cbb_v,
+                        orig_dispatch: orig_dk,
+                        tier: DEVIRT_TIER_EXACT,
+                        reason: DEVIRT_REASON_ROLLBACK_VERIFY,
+                        decision: DEVIRT_DECISION_RETAINED_DYNAMIC,
+                        primary_target: exact_v,
+                        target_count: 1u32,
+                        targets_complete: true,
+                        inlined_after: false,
+                    });
+                } else {
+                    let target_nidx = callgraph_find_node_idx(view(*cg), SymbolId { v: exact_v });
+                    unsafe {
+                        (*ep).dispatch_kind = DISPATCH_DIRECT;
+                        (*ep).known_callee = SymbolId { v: exact_v };
+                        (*ep).callee_node_idx = target_nidx;
+                        (*ep).targets_complete = true;
+                    }
+                    stats.exact_devirt_count = stats.exact_devirt_count + 1u32;
+                    any_changed = true;
+                    has_new_direct_call = true;
+                    devirt_log_push(log, mut_view(*arena), DevirtDecisionRecord {
+                        caller_sym: caller_sym.v,
+                        callsite_bb: cbb_v,
+                        orig_dispatch: orig_dk,
+                        tier: DEVIRT_TIER_EXACT,
+                        reason: DEVIRT_REASON_NONE,
+                        decision: DEVIRT_DECISION_DEVIRT_EXACT,
+                        primary_target: exact_v,
+                        target_count: 1u32,
+                        targets_complete: true,
+                        inlined_after: false,
+                    });
+                }
+            } else if cand.tier == DEVIRT_TIER_GUARDED {
+                let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+                devirt_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+
+                let rewrote = devirt_rewrite_guarded_in_mir(
+                    unsafe { mut_view(*caller_mir_p) },
+                    cbb_v as usize,
+                    view(cand),
+                    mut_view(*arena)
+                );
+                let prev_errs = sink.errors;
+                let verify_ok = rewrote && !force_verify_fail &&
+                                sroa_verify_mir_body_complete(
+                                    unsafe { view(*caller_mir_p) },
+                                    cg.thir,
+                                    mut_view(*arena),
+                                    mut_view(*sink)
+                                ) &&
+                                sink.errors == prev_errs;
+                sink.errors = prev_errs;
+
+                if !verify_ok {
+                    devirt_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+                    stats.pass_rollbacks = stats.pass_rollbacks + 1u32;
+                    devirt_log_push(log, mut_view(*arena), DevirtDecisionRecord {
+                        caller_sym: caller_sym.v,
+                        callsite_bb: cbb_v,
+                        orig_dispatch: orig_dk,
+                        tier: DEVIRT_TIER_GUARDED,
+                        reason: DEVIRT_REASON_ROLLBACK_VERIFY,
+                        decision: DEVIRT_DECISION_RETAINED_DYNAMIC,
+                        primary_target: cand.targets[0].v,
+                        target_count: cand.target_count,
+                        targets_complete: cand.targets_complete,
+                        inlined_after: false,
+                    });
+                } else {
+                    stats.guarded_devirt_count = stats.guarded_devirt_count + 1u32;
+                    any_changed = true;
+                    has_new_direct_call = true;
+                    devirt_log_push(log, mut_view(*arena), DevirtDecisionRecord {
+                        caller_sym: caller_sym.v,
+                        callsite_bb: cbb_v,
+                        orig_dispatch: orig_dk,
+                        tier: DEVIRT_TIER_GUARDED,
+                        reason: DEVIRT_REASON_NONE,
+                        decision: DEVIRT_DECISION_DEVIRT_GUARDED,
+                        primary_target: cand.targets[0].v,
+                        target_count: cand.target_count,
+                        targets_complete: cand.targets_complete,
+                        inlined_after: false,
+                    });
+                }
+            } else {
+                stats.retained_dynamic_count = stats.retained_dynamic_count + 1u32;
+                devirt_log_push(log, mut_view(*arena), DevirtDecisionRecord {
+                    caller_sym: caller_sym.v,
+                    callsite_bb: cbb_v,
+                    orig_dispatch: orig_dk,
+                    tier: DEVIRT_TIER_RETAINED_DYNAMIC,
+                    reason: cand.reason,
+                    decision: DEVIRT_DECISION_RETAINED_DYNAMIC,
+                    primary_target: 0u32,
+                    target_count: cand.target_count,
+                    targets_complete: false,
+                    inlined_after: false,
+                });
+            }
+        }
+        ei = ei + 1;
+    }
+
+    if any_changed {
+        callgraph_analyze_edges(mut_view(*cg), mut_view(*arena));
+        // Feed newly direct calls back into the inliner + SROA cascade (`REQ-OPT-105`, `REQ-OPT-112`)
+        if run_inline_after && has_new_direct_call {
+            let inl_budget = inline_budget_for_profile(profile);
+            let mut inl_stats = inline_stats_zero();
+            if inline_optimize_node(
+                mut_view(*cg),
+                caller_idx,
+                view(inl_budget),
+                unsafe { address_of(*eff_table) },
+                unsafe { address_of(*esc_table) },
+                mut_view(inl_stats),
+                0 as *mut InlineDecisionLog,
+                sroa_stats,
+                sroa_log,
+                false,
+                mut_view(*arena),
+                mut_view(*sink)
+            ) {
+                stats.inlined_after_devirt = stats.inlined_after_devirt + inl_stats.callsites_inlined;
+                if (log as usize) != 0 && (unsafe { (*log).count }) > 0 {
+                    let last_rec = unsafe { devirt_rec_at((*log).records, (*log).count - 1) };
+                    unsafe { (*last_rec).inlined_after = true; }
+                }
+            }
+        }
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, cg.thir, mut_view(*arena));
+        if (new_ob as usize) != 0 {
+            let np_upd = unsafe { cg_node_at(cg.nodes, caller_idx) };
+            unsafe {
+                (*new_ob).fn_sym = caller_sym;
+                (*np_upd).opt_body = new_ob;
+            }
+        }
+    }
+
+    any_changed
+}
+
+pub fn devirt_optimize_callgraph(
+    cg: mut_view<CallGraph>,
+    profile: u8,
+    run_inline_after: bool,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<DevirtStats>,
+    log: *mut DevirtDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    stats.pass_runs = stats.pass_runs + 1u32;
+    let mut any_changed = false;
+    let mut ni: usize = 0;
+    while ni < cg.node_count {
+        if devirt_optimize_node(
+            mut_view(*cg),
+            ni,
+            profile,
+            run_inline_after,
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(*stats),
+            log,
+            sroa_stats,
+            sroa_log,
+            false,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            any_changed = true;
+            stats.pass_changes = stats.pass_changes + 1u32;
+        }
+        ni = ni + 1;
+    }
+    if any_changed {
+        callgraph_finalize(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    }
+    any_changed
+}
+
+// --- Section 4: `PassManager` Runner for `PASS_DEVIRT` (`AXS-INL-034`) ---
+
+pub fn devirt_run_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    cg: mut_view<CallGraph>,
+    run_inline_after: bool,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<DevirtStats>,
+    log: *mut DevirtDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = devirt_contract();
+    let base_req = contract.required_analyses & (0xFFFFFFFFu32 ^ ANALYSIS_MASK_CALL_GRAPH);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), base_req);
+    pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+
+    let caller_idx = callgraph_find_node_idx(view(*cg), body.fn_sym);
+    if caller_idx == INLINE_NONE_IDX {
+        return false;
+    }
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<DevirtStats>(), align_of<DevirtStats>()) as *mut DevirtStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if (caller_mir_p as usize) != 0 {
+        devirt_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+    }
+
+    let changed = devirt_optimize_node(
+        mut_view(*cg),
+        caller_idx as usize,
+        pm.budget.profile,
+        run_inline_after,
+        mut_view(*eff_table),
+        mut_view(*esc_table),
+        mut_view(*stats),
+        log,
+        sroa_stats,
+        sroa_log,
+        force_verify_fail,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    if changed && (caller_mir_p as usize) != 0 {
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 || force_verify_fail {
+            devirt_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_NO_ALIAS,
+            CERTAINTY_PROVEN,
+            ANALYSIS_CALL_GRAPH,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_DEVIRT
+        );
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) || force_verify_fail {
+            sink.errors = pre_sink_errs;
+            if (caller_mir_p as usize) != 0 {
+                devirt_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            }
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+// --- Section 5: Deterministic `--emit=devirt` Printer (`SPEC-73 §9, AXS-INL-035`) ---
+
+const DEVIRT_PRINT_DATA: [192]u8 = [
+    //   0..19  "devirt_decisions {\n" (19 bytes)
+    100u8, 101u8, 118u8, 105u8, 114u8, 116u8, 95u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8,
+    //  19..36  "  callsite caller=" (18 bytes)
+    32u8, 32u8, 99u8, 97u8, 108u8, 108u8, 115u8, 105u8, 116u8, 101u8, 32u8, 99u8, 97u8, 108u8, 108u8, 101u8, 114u8, 61u8,
+    //  37..43  " bb=b" (5 bytes)
+    32u8, 98u8, 98u8, 61u8, 98u8,
+    //  42..48  " tier=" (6 bytes)
+    32u8, 116u8, 105u8, 101u8, 114u8, 61u8,
+    //  48..53  "EXACT" (5 bytes)
+    69u8, 88u8, 65u8, 67u8, 84u8,
+    //  53..60  "GUARDED" (7 bytes)
+    71u8, 85u8, 65u8, 82u8, 68u8, 69u8, 68u8,
+    //  60..68  "RETAINED" (8 bytes)
+    82u8, 69u8, 84u8, 65u8, 73u8, 78u8, 69u8, 68u8,
+    //  68..76  " target=" (8 bytes)
+    32u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 61u8,
+    //  76..84  " reason=" (8 bytes)
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    //  84..93  " inlined=" (9 bytes)
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 61u8,
+    //  93..109 "  summary exact=" (16 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 101u8, 120u8, 97u8, 99u8, 116u8, 61u8,
+    // 109..118 " guarded=" (9 bytes)
+    32u8, 103u8, 117u8, 97u8, 114u8, 100u8, 101u8, 100u8, 61u8,
+    // 118..128 " retained=" (10 bytes)
+    32u8, 114u8, 101u8, 116u8, 97u8, 105u8, 110u8, 101u8, 100u8, 61u8,
+    // 128..143 " inlined_after=" (15 bytes)
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 95u8, 97u8, 102u8, 116u8, 101u8, 114u8, 61u8,
+    // 143..154 " rollbacks=" (11 bytes)
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 154..192 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn dv_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), DEVIRT_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn devirt_print(
+    stats: view<DevirtStats>,
+    log: *const DevirtDecisionLog,
+    out: mut_view<DiagBuffer>
+) {
+    dv_push_tbl(mut_view(*out), 0, 19);
+    if (log as usize) != 0 {
+        let cnt = unsafe { (*log).count };
+        let recs = unsafe { (*log).records };
+        let mut i: usize = 0;
+        while i < cnt && (recs as usize) != 0 {
+            let rp = unsafe { devirt_rec_at(recs, i) };
+            dv_push_tbl(mut_view(*out), 19, 18);
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rp).caller_sym });
+            dv_push_tbl(mut_view(*out), 37, 5);
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rp).callsite_bb });
+            dv_push_tbl(mut_view(*out), 42, 6);
+            let tier = unsafe { (*rp).tier };
+            if tier == DEVIRT_TIER_EXACT {
+                dv_push_tbl(mut_view(*out), 48, 5);
+            } else if tier == DEVIRT_TIER_GUARDED {
+                dv_push_tbl(mut_view(*out), 53, 7);
+            } else {
+                dv_push_tbl(mut_view(*out), 60, 8);
+            }
+            dv_push_tbl(mut_view(*out), 68, 8);
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rp).primary_target });
+            dv_push_tbl(mut_view(*out), 76, 8);
+            diag_buf_push_u32(mut_view(*out), (unsafe { (*rp).reason }) as u32);
+            dv_push_tbl(mut_view(*out), 84, 9);
+            diag_buf_push_u32(mut_view(*out), if unsafe { (*rp).inlined_after } { 1u32 } else { 0u32 });
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            i = i + 1;
+        }
+    }
+    dv_push_tbl(mut_view(*out), 93, 16);
+    diag_buf_push_u32(mut_view(*out), stats.exact_devirt_count);
+    dv_push_tbl(mut_view(*out), 109, 9);
+    diag_buf_push_u32(mut_view(*out), stats.guarded_devirt_count);
+    dv_push_tbl(mut_view(*out), 118, 10);
+    diag_buf_push_u32(mut_view(*out), stats.retained_dynamic_count);
+    dv_push_tbl(mut_view(*out), 128, 15);
+    diag_buf_push_u32(mut_view(*out), stats.inlined_after_devirt);
+    dv_push_tbl(mut_view(*out), 143, 11);
+    diag_buf_push_u32(mut_view(*out), stats.pass_rollbacks);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    dv_push_tbl(mut_view(*out), 154, 2);
+}
