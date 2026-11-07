@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T766]
 priority: 717
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p18/e18_4_artifacts]
 spec: [spec/SPEC-24-artifact-format-module-interfaces.md, tasks/0739, tasks/0787, tasks/0803]
 covers: [REQ-LNK-614, REQ-LNK-615, REQ-LNK-616, REQ-LNK-617, REQ-LNK-618, REQ-LNK-619, REQ-LNK-620, REQ-LNK-621, REQ-LNK-622, REQ-LNK-623, REQ-LNK-624, REQ-LNK-625, REQ-LNK-626, REQ-LNK-627, REQ-LNK-628, REQ-LNK-629, REQ-LNK-630, REQ-LNK-631, REQ-LNK-632, REQ-LNK-633, REQ-LNK-3744, REQ-LNK-3745, REQ-LNK-3746, REQ-LNK-3747, REQ-LNK-3748, REQ-LNK-3749, REQ-LNK-3750, REQ-LNK-3751, REQ-LNK-3752, REQ-LNK-3753, REQ-LNK-3754, REQ-LNK-3755, REQ-LNK-3756, REQ-LNK-3757, REQ-LNK-3758, REQ-LNK-3759, REQ-LNK-3760, REQ-LNK-3761, REQ-LNK-3762, REQ-LNK-3763, REQ-LNK-3764, REQ-LNK-3765, REQ-LNK-3766, REQ-LNK-3767, REQ-LNK-3768, REQ-LNK-3769, REQ-LNK-3770, REQ-LNK-3771, REQ-LNK-3772, REQ-LNK-3773, REQ-LNK-3774, REQ-LNK-3775, REQ-LNK-3776, REQ-LNK-3777, REQ-LNK-3778, REQ-LNK-3779, REQ-LNK-3780, REQ-LNK-3781, REQ-LNK-3782, REQ-LNK-3783, REQ-LNK-3784]
+started: 2026-11-08 04:53:42
+finished: 2026-11-08 05:35:42
 ---
 # T767 — E18.4 — Artifact format, module interface (.axmi) & LTO section round-trip conformance suite
 
@@ -41,3 +43,5 @@ Certify E18.4 exit criteria with an end-to-end conformance suite covering `.axmi
 
 ## Log
 - 2026-11-03 02:58:55 created by T218 (P18 phase planning)
+- 2026-11-08 04:53:42 started (attempt 1) T767-impl
+- 2026-11-08 05:35:42 accepted by QA -> done
