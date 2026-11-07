@@ -1,0 +1,2508 @@
+// Axiom Compiler — Pass Contracts, Proof-Carrying IR & Fail-Closed Gate (compiler/verify/pass_contracts/mod.ax)
+// Implements SPEC-25 (AXS-PCT-001..015, AXS-PCT-050..053, INV-PCT-001):
+//   - PassContract descriptors (IrLevel, AnalysisKind, SemanticProperty, ValidationStrategy,
+//     PassFailurePolicy) and canonical PassContractRegistry (AXS-PCT-001..002).
+//   - Three-valued static Certainty lattice (Proven, Possible, Unknown) with fail-closed
+//     degradation on budget exhaustion, FFI/indirect boundaries, volatile/NaN hazards (AXS-PCT-010).
+//   - ProofCertificate & ProofProvenance with canonical 128-bit Fingerprint128 caching and
+//     automatic transitive invalidation on IR mutation or root fact invalidation (AXS-PCT-011).
+//   - Shared monotone dataflow fixed-point engine & multi-category EffectSummary lattices
+//     (Memory, Resource, Control, Concurrency, External) with Drop/callback/SCC rules (AXS-PCT-012..013).
+//   - Bounded in-process SymbolicValueDomain (Constant, Range, Nullability, Bitmask, Congruence)
+//     proving NonZero, ShiftInRange, InBounds, and NoOverflow with zero external SMT (AXS-PCT-014).
+//   - Auditable FactOrigin.TrustedBoundary tracking (AXS-PCT-015).
+//   - Transactional pass execution gate (semantic firewall separating profitability from semantic
+//     proofs, clean IR rollback on Possible/Unknown obligations, and --verify-pass-contracts
+//     post-pass verification emitting AX_ICE_INTERNAL / AX_ICE_MIR_VERIFY with
+//     data.stage = "pass_contract", AXS-PCT-003..005, AXS-PCT-050..053).
+module compiler.verify.pass_contracts
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.hash.AxHasher
+use compiler.kernel.hash.ax_hasher_new
+use compiler.kernel.hash.ax_hasher_write_u32
+use compiler.kernel.hash.ax_hasher_write_u64
+use compiler.kernel.hash.ax_hasher_finish
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.AX_ICE_INTERNAL
+use compiler.diag.code.AX_ICE_MIR_VERIFY
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.mir.mir.MIR_VIEW_READ
+use compiler.mir.mir.MIR_VIEW_MUT
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_BORROW_MUT
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_UNREACHABLE
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_u64_at
+use compiler.mir.mir.mir_mul_usize
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+fn ax_hasher_write_u8(h: mut_view<AxHasher>, v: u8) {
+    ax_hasher_write_u32(h, v as u32);
+}
+
+// =================================================================================================
+// 1. IR Levels, Analysis Kinds, Semantic Properties & Pass Contracts (AXS-PCT-001..005)
+// =================================================================================================
+
+@derive(Copy)
+pub enum IrLevel {
+    Hir,
+    Thir,
+    Mir,
+    OptIr,
+    Lir,
+    MachIr,
+}
+
+pub const IR_LEVEL_HIR: u8 = 0u8;
+pub const IR_LEVEL_THIR: u8 = 1u8;
+pub const IR_LEVEL_MIR: u8 = 2u8;
+pub const IR_LEVEL_OPT_IR: u8 = 3u8;
+pub const IR_LEVEL_LIR: u8 = 4u8;
+pub const IR_LEVEL_MACH_IR: u8 = 5u8;
+
+pub fn ir_level_to_u8(lvl: IrLevel) -> u8 {
+    match lvl {
+        IrLevel.Hir => IR_LEVEL_HIR,
+        IrLevel.Thir => IR_LEVEL_THIR,
+        IrLevel.Mir => IR_LEVEL_MIR,
+        IrLevel.OptIr => IR_LEVEL_OPT_IR,
+        IrLevel.Lir => IR_LEVEL_LIR,
+        IrLevel.MachIr => IR_LEVEL_MACH_IR,
+    }
+}
+
+@derive(Copy)
+pub enum AnalysisKind {
+    Cfg,
+    DominatorTree,
+    PostDominatorTree,
+    LoopForest,
+    SsaDefUse,
+    MemorySsa,
+    Liveness,
+    DefiniteInit,
+    MoveState,
+    CapabilityLoans,
+    RegionOutlives,
+    AliasSummary,
+    EscapeSummary,
+    EffectSummary,
+    ValueRange,
+    KnownBits,
+    Nullability,
+    CallGraphScc,
+    CostProfile,
+}
+
+pub const PCT_ANALYSIS_CFG: u8 = 0u8;
+pub const PCT_ANALYSIS_DOM_TREE: u8 = 1u8;
+pub const PCT_ANALYSIS_POST_DOM_TREE: u8 = 2u8;
+pub const PCT_ANALYSIS_LOOP_FOREST: u8 = 3u8;
+pub const PCT_ANALYSIS_SSA_DEF_USE: u8 = 4u8;
+pub const PCT_ANALYSIS_MEMORY_SSA: u8 = 5u8;
+pub const PCT_ANALYSIS_LIVENESS: u8 = 6u8;
+pub const PCT_ANALYSIS_DEFINITE_INIT: u8 = 7u8;
+pub const PCT_ANALYSIS_MOVE_STATE: u8 = 8u8;
+pub const PCT_ANALYSIS_CAPABILITY_LOANS: u8 = 9u8;
+pub const PCT_ANALYSIS_REGION_OUTLIVES: u8 = 10u8;
+pub const PCT_ANALYSIS_ALIAS_SUMMARY: u8 = 11u8;
+pub const PCT_ANALYSIS_ESCAPE_SUMMARY: u8 = 12u8;
+pub const PCT_ANALYSIS_EFFECT_SUMMARY: u8 = 13u8;
+pub const PCT_ANALYSIS_VALUE_RANGE: u8 = 14u8;
+pub const PCT_ANALYSIS_KNOWN_BITS: u8 = 15u8;
+pub const PCT_ANALYSIS_NULLABILITY: u8 = 16u8;
+pub const PCT_ANALYSIS_CALL_GRAPH_SCC: u8 = 17u8;
+pub const PCT_ANALYSIS_COST_PROFILE: u8 = 18u8;
+pub const PCT_ANALYSIS_COUNT: usize = 19;
+
+pub const PCT_MASK_CFG: u32 = 1u32;
+pub const PCT_MASK_DOM_TREE: u32 = 2u32;
+pub const PCT_MASK_POST_DOM_TREE: u32 = 4u32;
+pub const PCT_MASK_LOOP_FOREST: u32 = 8u32;
+pub const PCT_MASK_SSA_DEF_USE: u32 = 16u32;
+pub const PCT_MASK_MEMORY_SSA: u32 = 32u32;
+pub const PCT_MASK_LIVENESS: u32 = 64u32;
+pub const PCT_MASK_DEFINITE_INIT: u32 = 128u32;
+pub const PCT_MASK_MOVE_STATE: u32 = 256u32;
+pub const PCT_MASK_CAPABILITY_LOANS: u32 = 512u32;
+pub const PCT_MASK_REGION_OUTLIVES: u32 = 1024u32;
+pub const PCT_MASK_ALIAS_SUMMARY: u32 = 2048u32;
+pub const PCT_MASK_ESCAPE_SUMMARY: u32 = 4096u32;
+pub const PCT_MASK_EFFECT_SUMMARY: u32 = 8192u32;
+pub const PCT_MASK_VALUE_RANGE: u32 = 16384u32;
+pub const PCT_MASK_KNOWN_BITS: u32 = 32768u32;
+pub const PCT_MASK_NULLABILITY: u32 = 65536u32;
+pub const PCT_MASK_CALL_GRAPH_SCC: u32 = 131072u32;
+pub const PCT_MASK_COST_PROFILE: u32 = 262144u32;
+pub const PCT_MASK_ALL_ANALYSES: u32 = 524287u32;
+
+pub fn pct_analysis_bit(kind_id: u8) -> u32 {
+    if (kind_id as usize) >= PCT_ANALYSIS_COUNT {
+        return 0u32;
+    }
+    1u32 << (kind_id as u32)
+}
+
+pub fn pct_analysis_kind_bit(kind: AnalysisKind) -> u32 {
+    match kind {
+        AnalysisKind.Cfg => PCT_MASK_CFG,
+        AnalysisKind.DominatorTree => PCT_MASK_DOM_TREE,
+        AnalysisKind.PostDominatorTree => PCT_MASK_POST_DOM_TREE,
+        AnalysisKind.LoopForest => PCT_MASK_LOOP_FOREST,
+        AnalysisKind.SsaDefUse => PCT_MASK_SSA_DEF_USE,
+        AnalysisKind.MemorySsa => PCT_MASK_MEMORY_SSA,
+        AnalysisKind.Liveness => PCT_MASK_LIVENESS,
+        AnalysisKind.DefiniteInit => PCT_MASK_DEFINITE_INIT,
+        AnalysisKind.MoveState => PCT_MASK_MOVE_STATE,
+        AnalysisKind.CapabilityLoans => PCT_MASK_CAPABILITY_LOANS,
+        AnalysisKind.RegionOutlives => PCT_MASK_REGION_OUTLIVES,
+        AnalysisKind.AliasSummary => PCT_MASK_ALIAS_SUMMARY,
+        AnalysisKind.EscapeSummary => PCT_MASK_ESCAPE_SUMMARY,
+        AnalysisKind.EffectSummary => PCT_MASK_EFFECT_SUMMARY,
+        AnalysisKind.ValueRange => PCT_MASK_VALUE_RANGE,
+        AnalysisKind.KnownBits => PCT_MASK_KNOWN_BITS,
+        AnalysisKind.Nullability => PCT_MASK_NULLABILITY,
+        AnalysisKind.CallGraphScc => PCT_MASK_CALL_GRAPH_SCC,
+        AnalysisKind.CostProfile => PCT_MASK_COST_PROFILE,
+    }
+}
+
+// Topological dependency DAG between analyses:
+// CFG -> DomTree/PostDomTree/Liveness/DefiniteInit/MoveState
+// DomTree -> LoopForest, SsaDefUse -> MemorySsa -> AliasSummary/EscapeSummary/EffectSummary
+// SsaDefUse + DomTree -> ValueRange/KnownBits/Nullability
+pub fn pct_analysis_direct_deps(kind_id: u8) -> u32 {
+    if kind_id == PCT_ANALYSIS_CFG {
+        return 0u32;
+    }
+    if kind_id == PCT_ANALYSIS_DOM_TREE || kind_id == PCT_ANALYSIS_POST_DOM_TREE ||
+       kind_id == PCT_ANALYSIS_LIVENESS || kind_id == PCT_ANALYSIS_DEFINITE_INIT ||
+       kind_id == PCT_ANALYSIS_MOVE_STATE {
+        return PCT_MASK_CFG;
+    }
+    if kind_id == PCT_ANALYSIS_LOOP_FOREST {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE;
+    }
+    if kind_id == PCT_ANALYSIS_SSA_DEF_USE {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE;
+    }
+    if kind_id == PCT_ANALYSIS_MEMORY_SSA {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE;
+    }
+    if kind_id == PCT_ANALYSIS_CAPABILITY_LOANS || kind_id == PCT_ANALYSIS_REGION_OUTLIVES {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE;
+    }
+    if kind_id == PCT_ANALYSIS_ALIAS_SUMMARY || kind_id == PCT_ANALYSIS_ESCAPE_SUMMARY {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_CAPABILITY_LOANS;
+    }
+    if kind_id == PCT_ANALYSIS_EFFECT_SUMMARY {
+        return PCT_MASK_CFG | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_ALIAS_SUMMARY;
+    }
+    if kind_id == PCT_ANALYSIS_VALUE_RANGE || kind_id == PCT_ANALYSIS_KNOWN_BITS || kind_id == PCT_ANALYSIS_NULLABILITY {
+        return PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE;
+    }
+    if kind_id == PCT_ANALYSIS_COST_PROFILE {
+        return PCT_MASK_CFG | PCT_MASK_LOOP_FOREST;
+    }
+    0u32
+}
+
+pub fn pct_analysis_expand_required(mask: u32) -> u32 {
+    let mut cur = mask & PCT_MASK_ALL_ANALYSES;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut a: u8 = 0u8;
+        while (a as usize) < PCT_ANALYSIS_COUNT {
+            let bit = pct_analysis_bit(a);
+            if (cur & bit) != 0u32 {
+                let deps = pct_analysis_direct_deps(a);
+                if (cur & deps) != deps {
+                    cur = cur | deps;
+                    changed = true;
+                }
+            }
+            a = a + 1u8;
+        }
+    }
+    cur
+}
+
+pub fn pct_analysis_expand_invalidated(directly_invalidated: u32) -> u32 {
+    let mut inv = directly_invalidated & PCT_MASK_ALL_ANALYSES;
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut a: u8 = 0u8;
+        while (a as usize) < PCT_ANALYSIS_COUNT {
+            let bit = pct_analysis_bit(a);
+            if (inv & bit) == 0u32 {
+                let deps = pct_analysis_direct_deps(a);
+                if (inv & deps) != 0u32 {
+                    inv = inv | bit;
+                    changed = true;
+                }
+            }
+            a = a + 1u8;
+        }
+    }
+    inv
+}
+
+@derive(Copy)
+pub enum SemanticProperty {
+    CfgWellFormed,
+    DominatorsValid,
+    SsaForm,
+    MemorySsaValid,
+    StrictTypeCorrectness,
+    NoUninitializedReads,
+    NoUseAfterMove,
+    CapabilitySoundness,
+    RegionSoundness,
+    DropElaborationComplete,
+    DropOrderPreserved,
+    PanicUnwindSafety,
+    ObservableEffectsPreserved,
+    TerminationBehaviorPreserved,
+    AbiLayoutConformant,
+}
+
+pub const SEM_PROP_CFG_WELL_FORMED: u32 = 1u32;
+pub const SEM_PROP_DOMINATORS_VALID: u32 = 2u32;
+pub const SEM_PROP_SSA_FORM: u32 = 4u32;
+pub const SEM_PROP_MEMORY_SSA_VALID: u32 = 8u32;
+pub const SEM_PROP_STRICT_TYPE_CORRECTNESS: u32 = 16u32;
+pub const SEM_PROP_NO_UNINIT_READS: u32 = 32u32;
+pub const SEM_PROP_NO_USE_AFTER_MOVE: u32 = 64u32;
+pub const SEM_PROP_CAPABILITY_SOUNDNESS: u32 = 128u32;
+pub const SEM_PROP_REGION_SOUNDNESS: u32 = 256u32;
+pub const SEM_PROP_DROP_ELAB_COMPLETE: u32 = 512u32;
+pub const SEM_PROP_DROP_ORDER_PRESERVED: u32 = 1024u32;
+pub const SEM_PROP_PANIC_UNWIND_SAFETY: u32 = 2048u32;
+pub const SEM_PROP_OBSERVABLE_EFFECTS_PRESERVED: u32 = 4096u32;
+pub const SEM_PROP_TERMINATION_PRESERVED: u32 = 8192u32;
+pub const SEM_PROP_ABI_LAYOUT_CONFORMANT: u32 = 16384u32;
+
+// AXS-PCT-002: Every intra-level optimization pass MUST preserve at minimum these properties:
+pub const SEM_PROP_MANDATORY_INTRA_LEVEL: u32 =
+    SEM_PROP_CFG_WELL_FORMED |
+    SEM_PROP_STRICT_TYPE_CORRECTNESS |
+    SEM_PROP_CAPABILITY_SOUNDNESS |
+    SEM_PROP_DROP_ORDER_PRESERVED |
+    SEM_PROP_PANIC_UNWIND_SAFETY |
+    SEM_PROP_OBSERVABLE_EFFECTS_PRESERVED;
+
+@derive(Copy)
+pub enum ValidationStrategy {
+    StructuralVerifier,
+    ProofCertificateCheck,
+    TranslationValidation,
+    DifferentialOracle,
+}
+
+pub const VALIDATION_STRUCTURAL_VERIFIER: u8 = 0u8;
+pub const VALIDATION_PROOF_CERT_CHECK: u8 = 1u8;
+pub const VALIDATION_TRANSLATION_VALIDATION: u8 = 2u8;
+pub const VALIDATION_DIFFERENTIAL_ORACLE: u8 = 3u8;
+
+@derive(Copy)
+pub enum PassFailurePolicy {
+    RollbackIr,
+    AbortCompiler,
+}
+
+pub const FAILURE_POLICY_ROLLBACK_IR: u8 = 0u8;
+pub const FAILURE_POLICY_ABORT_COMPILER: u8 = 1u8;
+
+// Canonical Pass IDs across MIR, OptIR, LIR, ABI, and Target/x64 (SPEC-25 Section 2.1..2.3)
+pub const PCT_PASS_MIR_LOWER: u16 = 0u16;
+pub const PCT_PASS_MIR_DROP_ELAB: u16 = 1u16;
+pub const PCT_PASS_MIR_VERIFY: u16 = 2u16;
+pub const PCT_PASS_OPT_LOWER_MIR: u16 = 3u16;
+pub const PCT_PASS_OPT_MEMSSA: u16 = 4u16;
+pub const PCT_PASS_OPT_SROA: u16 = 5u16;
+pub const PCT_PASS_OPT_SCCP: u16 = 6u16;
+pub const PCT_PASS_OPT_INSTCOMBINE: u16 = 7u16;
+pub const PCT_PASS_OPT_GVN_CSE: u16 = 8u16;
+pub const PCT_PASS_OPT_LICM: u16 = 9u16;
+pub const PCT_PASS_OPT_BCE: u16 = 10u16;
+pub const PCT_PASS_OPT_DSE: u16 = 11u16;
+pub const PCT_PASS_OPT_DCE: u16 = 12u16;
+pub const PCT_PASS_OPT_CFG_SIMPLIFY: u16 = 13u16;
+pub const PCT_PASS_OPT_INLINE: u16 = 14u16;
+pub const PCT_PASS_ABI_LOWER: u16 = 15u16;
+pub const PCT_PASS_LIR_LOWER: u16 = 16u16;
+pub const PCT_PASS_X64_ISEL: u16 = 17u16;
+pub const PCT_PASS_X64_REGALLOC: u16 = 18u16;
+pub const PCT_PASS_X64_FINALIZE: u16 = 19u16;
+pub const PCT_CANONICAL_PASS_COUNT: usize = 20;
+
+pub struct PassContract {
+    pub pass_id: u16,
+    pub input_level: u8,
+    pub output_level: u8,
+    pub is_mutating_pass: bool,
+    pub required_analyses: u32,
+    pub required_propositions: u32,
+    pub produced_analyses: u32,
+    pub preserved_analyses: u32,
+    pub invalidated_analyses: u32,
+    pub preserved_properties: u32,
+    pub postconditions: u32,
+    pub validation: u8,
+    pub failure_policy: u8,
+}
+
+// =================================================================================================
+// 2. Three-Valued Static Certainty Lattice & Propositions (AXS-PCT-010, AXS-PCT-011)
+// =================================================================================================
+
+@derive(Copy)
+pub enum Certainty {
+    Proven,
+    Possible,
+    Unknown,
+}
+
+pub const CERTAINTY_PROVEN: u8 = 0u8;
+pub const CERTAINTY_POSSIBLE: u8 = 1u8;
+pub const CERTAINTY_UNKNOWN: u8 = 2u8;
+
+pub fn certainty_to_u8(c: Certainty) -> u8 {
+    match c {
+        Certainty.Proven => CERTAINTY_PROVEN,
+        Certainty.Possible => CERTAINTY_POSSIBLE,
+        Certainty.Unknown => CERTAINTY_UNKNOWN,
+    }
+}
+
+pub fn certainty_from_u8(v: u8) -> Certainty {
+    if v == CERTAINTY_PROVEN {
+        return Certainty.Proven;
+    }
+    if v == CERTAINTY_POSSIBLE {
+        return Certainty.Possible;
+    }
+    Certainty.Unknown
+}
+
+// Conjunction of two proof obligations: Proven only when BOTH are Proven (AXS-PCT-010).
+pub fn certainty_and(a: u8, b: u8) -> u8 {
+    if a == CERTAINTY_PROVEN && b == CERTAINTY_PROVEN {
+        return CERTAINTY_PROVEN;
+    }
+    if a == CERTAINTY_UNKNOWN || b == CERTAINTY_UNKNOWN {
+        return CERTAINTY_UNKNOWN;
+    }
+    CERTAINTY_POSSIBLE
+}
+
+// Meet / join across control-flow paths: if Proven on one path and Unknown/Possible on another,
+// merges to Possible (plausible on some path, not universally guaranteed).
+pub fn certainty_join_paths(a: u8, b: u8) -> u8 {
+    if a == CERTAINTY_PROVEN && b == CERTAINTY_PROVEN {
+        return CERTAINTY_PROVEN;
+    }
+    if a == CERTAINTY_UNKNOWN && b == CERTAINTY_UNKNOWN {
+        return CERTAINTY_UNKNOWN;
+    }
+    CERTAINTY_POSSIBLE
+}
+
+// AXS-PCT-010: Budget exhaustion, indirect/FFI boundaries, volatile/atomic, or FP NaN/-0.0 hazards
+// MUST degrade certainty to Unknown or Possible and NEVER fabricate Proven.
+pub fn certainty_degrade_on_boundary(
+    base_cert: u8,
+    budget_exhausted: bool,
+    crosses_ffi_or_indirect: bool,
+    has_volatile_or_atomic: bool,
+    has_fp_nan_or_signed_zero_hazard: bool
+) -> u8 {
+    if budget_exhausted || crosses_ffi_or_indirect || has_volatile_or_atomic {
+        return CERTAINTY_UNKNOWN;
+    }
+    if has_fp_nan_or_signed_zero_hazard {
+        if base_cert == CERTAINTY_PROVEN {
+            return CERTAINTY_POSSIBLE;
+        }
+        return base_cert;
+    }
+    base_cert
+}
+
+// AXS-PCT-010: Only Certainty.Proven authorizes semantic IR transformations.
+pub fn certainty_allows_transform(cert: u8) -> bool {
+    cert == CERTAINTY_PROVEN
+}
+
+@derive(Copy)
+pub enum PropositionKind {
+    NoAlias,
+    MustAlias,
+    NonNull,
+    NonZero,
+    InBounds,
+    NoSignedOverflow,
+    NoUnsignedOverflow,
+    ShiftInRange,
+    PureCall,
+    ReadOnlyMemory,
+    NoReadMemory,
+    NoEscape,
+    WillReturn,
+    NoPanic,
+    LoopInvariant,
+    DeadStore,
+}
+
+pub const PROP_NO_ALIAS: u8 = 0u8;
+pub const PROP_MUST_ALIAS: u8 = 1u8;
+pub const PROP_NON_NULL: u8 = 2u8;
+pub const PROP_NON_ZERO: u8 = 3u8;
+pub const PROP_IN_BOUNDS: u8 = 4u8;
+pub const PROP_NO_SIGNED_OVERFLOW: u8 = 5u8;
+pub const PROP_NO_UNSIGNED_OVERFLOW: u8 = 6u8;
+pub const PROP_SHIFT_IN_RANGE: u8 = 7u8;
+pub const PROP_PURE_CALL: u8 = 8u8;
+pub const PROP_READ_ONLY_MEMORY: u8 = 9u8;
+pub const PROP_NO_READ_MEMORY: u8 = 10u8;
+pub const PROP_NO_ESCAPE: u8 = 11u8;
+pub const PROP_WILL_RETURN: u8 = 12u8;
+pub const PROP_NO_PANIC: u8 = 13u8;
+pub const PROP_LOOP_INVARIANT: u8 = 14u8;
+pub const PROP_DEAD_STORE: u8 = 15u8;
+pub const PROP_KIND_COUNT: usize = 16;
+
+pub fn prop_bit(kind_id: u8) -> u32 {
+    if (kind_id as usize) >= PROP_KIND_COUNT {
+        return 0u32;
+    }
+    1u32 << (kind_id as u32)
+}
+
+@derive(Copy)
+pub enum FactOrigin {
+    SemanticVerifier,
+    DataflowEngine,
+    EffectEngine,
+    SymbolicEngine,
+    TrustedBoundary,
+}
+
+pub const FACT_ORIGIN_SEMANTIC_VERIFIER: u8 = 0u8;
+pub const FACT_ORIGIN_DATAFLOW_ENGINE: u8 = 1u8;
+pub const FACT_ORIGIN_EFFECT_ENGINE: u8 = 2u8;
+pub const FACT_ORIGIN_SYMBOLIC_ENGINE: u8 = 3u8;
+pub const FACT_ORIGIN_TRUSTED_BOUNDARY: u8 = 4u8;
+
+pub struct Fingerprint128 {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn fingerprint128_eq(a: view<Fingerprint128>, b: view<Fingerprint128>) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+// Canonical proof digest computation (AXS-PCT-011):
+// Symmetric propositions (NoAlias, MustAlias) canonicalize (subject_a, subject_b) order
+// so commuting operands produces the exact same 128-bit digest.
+pub fn pct_compute_proof_digest(
+    prop_kind: u8,
+    subject_a: u32,
+    subject_b: u32,
+    context_inst_or_bb: u32,
+    origin: u8,
+    source_analysis: u8,
+    ir_revision: u32,
+    snapshot_revision: u32
+) -> Fingerprint128 {
+    let mut sa = subject_a;
+    let mut sb = subject_b;
+    if (prop_kind == PROP_NO_ALIAS || prop_kind == PROP_MUST_ALIAS) && sa > sb {
+        sa = subject_b;
+        sb = subject_a;
+    }
+    let mut h1 = ax_hasher_new();
+    ax_hasher_write_u8(mut_view(h1), prop_kind);
+    ax_hasher_write_u32(mut_view(h1), sa);
+    ax_hasher_write_u32(mut_view(h1), sb);
+    ax_hasher_write_u32(mut_view(h1), context_inst_or_bb);
+    ax_hasher_write_u8(mut_view(h1), origin);
+    ax_hasher_write_u8(mut_view(h1), source_analysis);
+    ax_hasher_write_u32(mut_view(h1), ir_revision);
+    ax_hasher_write_u32(mut_view(h1), snapshot_revision);
+    let lo = ax_hasher_finish(view(h1));
+
+    let mut h2 = ax_hasher_new();
+    ax_hasher_write_u64(mut_view(h2), 0xA5A5_5A5A_F00D_CAFEu64);
+    ax_hasher_write_u32(mut_view(h2), sb);
+    ax_hasher_write_u32(mut_view(h2), sa);
+    ax_hasher_write_u8(mut_view(h2), source_analysis);
+    ax_hasher_write_u8(mut_view(h2), prop_kind);
+    ax_hasher_write_u32(mut_view(h2), context_inst_or_bb ^ ir_revision);
+    ax_hasher_write_u32(mut_view(h2), snapshot_revision);
+    let hi = ax_hash_combine(lo, ax_hasher_finish(view(h2)));
+
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+pub struct ProofProvenance {
+    pub origin: u8,
+    pub source_analysis: u8,
+    pub ir_revision: u32,
+    pub snapshot_revision: u32,
+    pub parent_proof_mask: u64,
+    pub trusted_attr_id: u32,
+    pub digest: Fingerprint128,
+}
+
+pub struct ProofCertificate {
+    pub id: u32,
+    pub kind: u8,
+    pub certainty: u8,
+    pub subject_a: u32,
+    pub subject_b: u32,
+    pub context_inst_or_bb: u32,
+    pub provenance: ProofProvenance,
+    pub valid: bool,
+}
+
+pub struct AuditTrailEntry {
+    pub cert_id: u32,
+    pub prop_kind: u8,
+    pub trusted_attr_id: u32,
+    pub fn_sym: SymbolId,
+    pub ir_revision: u32,
+}
+
+pub const PCT_MAX_PROOFS: usize = 64;
+pub const PCT_MAX_AUDIT_ENTRIES: usize = 32;
+pub const PCT_PROOF_ID_INVALID: u32 = 0xFFFFFFFFu32;
+
+pub struct ProofStore {
+    pub certs: *mut ProofCertificate,
+    pub cert_count: usize,
+    pub cert_cap: usize,
+    pub audits: *mut AuditTrailEntry,
+    pub audit_count: usize,
+    pub audit_cap: usize,
+    pub current_ir_revision: u32,
+    pub current_snapshot_revision: u32,
+    pub allow_trusted_boundaries: bool,
+    pub cache_hits: u32,
+    pub cache_misses: u32,
+    pub invalidation_events: u32,
+}
+
+unsafe fn pct_cert_at(base: *mut ProofCertificate, idx: usize) -> *mut ProofCertificate {
+    let off = ((idx as isize) * (size_of<ProofCertificate>() as isize)) as usize;
+    ((base as usize) + off) as *mut ProofCertificate
+}
+
+unsafe fn pct_audit_at(base: *mut AuditTrailEntry, idx: usize) -> *mut AuditTrailEntry {
+    let off = ((idx as isize) * (size_of<AuditTrailEntry>() as isize)) as usize;
+    ((base as usize) + off) as *mut AuditTrailEntry
+}
+
+pub fn proof_store_init(
+    store: mut_view<ProofStore>,
+    arena: mut_view<Arena>,
+    initial_ir_rev: u32,
+    allow_trusted_boundaries: bool
+) {
+    let certs_mem = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(PCT_MAX_PROOFS, size_of<ProofCertificate>()),
+        align_of<ProofCertificate>()
+    ) as *mut ProofCertificate;
+    let audits_mem = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(PCT_MAX_AUDIT_ENTRIES, size_of<AuditTrailEntry>()),
+        align_of<AuditTrailEntry>()
+    ) as *mut AuditTrailEntry;
+    store.certs = certs_mem;
+    store.cert_count = 0;
+    store.cert_cap = PCT_MAX_PROOFS;
+    store.audits = audits_mem;
+    store.audit_count = 0;
+    store.audit_cap = PCT_MAX_AUDIT_ENTRIES;
+    store.current_ir_revision = if initial_ir_rev == 0u32 { 1u32 } else { initial_ir_rev };
+    store.current_snapshot_revision = 1u32;
+    store.allow_trusted_boundaries = allow_trusted_boundaries;
+    store.cache_hits = 0u32;
+    store.cache_misses = 0u32;
+    store.invalidation_events = 0u32;
+}
+
+// Check if all parent proofs in `parent_proof_mask` are currently valid at `current_ir_revision`.
+pub fn proof_store_parents_valid(store: view<ProofStore>, parent_proof_mask: u64) -> bool {
+    if parent_proof_mask == 0u64 {
+        return true;
+    }
+    let mut i: usize = 0;
+    while i < store.cert_count {
+        let bit = 1u64 << (i as u64);
+        if (parent_proof_mask & bit) != 0u64 {
+            let cp = unsafe { pct_cert_at(store.certs, i) };
+            let is_val = unsafe { (*cp).valid };
+            let rev = unsafe { (*cp).provenance.ir_revision };
+            let srev = unsafe { (*cp).provenance.snapshot_revision };
+            let cert = unsafe { (*cp).certainty };
+            if !is_val || rev != store.current_ir_revision || srev != store.current_snapshot_revision || cert != CERTAINTY_PROVEN {
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Issue or retrieve a canonical ProofCertificate from the ProofStore (AXS-PCT-011, AXS-PCT-015).
+// Enforces:
+//   - TrustedBoundary facts require `allow_trusted_boundaries == true` AND `trusted_attr_id != 0`,
+//     otherwise certainty is degraded to CERTAINTY_UNKNOWN (fail-closed, AXS-PCT-015).
+//   - If any parent proof in `parent_proof_mask` is invalid or non-Proven, certainty is degraded
+//     to CERTAINTY_UNKNOWN.
+//   - Canonical 128-bit digest lookup deduplicates identical proofs at the same IR/snapshot revision.
+pub fn proof_store_issue(
+    store: mut_view<ProofStore>,
+    kind: u8,
+    requested_certainty: u8,
+    subject_a: u32,
+    subject_b: u32,
+    context_inst_or_bb: u32,
+    origin: u8,
+    source_analysis: u8,
+    parent_proof_mask: u64,
+    trusted_attr_id: u32,
+    fn_sym: SymbolId
+) -> u32 {
+    let mut effective_cert = requested_certainty;
+
+    // AXS-PCT-015: Unaudited or disallowed TrustedBoundary facts cannot produce Proven certificates.
+    if origin == FACT_ORIGIN_TRUSTED_BOUNDARY {
+        if !store.allow_trusted_boundaries || trusted_attr_id == 0u32 {
+            effective_cert = CERTAINTY_UNKNOWN;
+        }
+    }
+
+    // Parent proof validity check
+    if !proof_store_parents_valid(view(*store), parent_proof_mask) {
+        effective_cert = CERTAINTY_UNKNOWN;
+    }
+
+    let digest = pct_compute_proof_digest(
+        kind,
+        subject_a,
+        subject_b,
+        context_inst_or_bb,
+        origin,
+        source_analysis,
+        store.current_ir_revision,
+        store.current_snapshot_revision
+    );
+
+    // Check canonical proof cache for an existing valid certificate with identical 128-bit digest
+    let mut i: usize = 0;
+    while i < store.cert_count {
+        let cp = unsafe { pct_cert_at(store.certs, i) };
+        let cp_valid = unsafe { (*cp).valid };
+        let cp_rev = unsafe { (*cp).provenance.ir_revision };
+        let cp_srev = unsafe { (*cp).provenance.snapshot_revision };
+        let cp_d_lo = unsafe { (*cp).provenance.digest.lo };
+        let cp_d_hi = unsafe { (*cp).provenance.digest.hi };
+        let cp_parents = unsafe { (*cp).provenance.parent_proof_mask };
+        if cp_valid && cp_rev == store.current_ir_revision && cp_srev == store.current_snapshot_revision &&
+           cp_d_lo == digest.lo && cp_d_hi == digest.hi && cp_parents == parent_proof_mask {
+            store.cache_hits = store.cache_hits + 1u32;
+            return i as u32;
+        }
+        i = i + 1;
+    }
+
+    if store.cert_count >= store.cert_cap {
+        return PCT_PROOF_ID_INVALID;
+    }
+
+    store.cache_misses = store.cache_misses + 1u32;
+    let new_id = store.cert_count as u32;
+    let dst = unsafe { pct_cert_at(store.certs, store.cert_count) };
+    store.cert_count = store.cert_count + 1;
+
+    unsafe {
+        (*dst).id = new_id;
+        (*dst).kind = kind;
+        (*dst).certainty = effective_cert;
+        (*dst).subject_a = subject_a;
+        (*dst).subject_b = subject_b;
+        (*dst).context_inst_or_bb = context_inst_or_bb;
+        (*dst).provenance = ProofProvenance {
+            origin: origin,
+            source_analysis: source_analysis,
+            ir_revision: store.current_ir_revision,
+            snapshot_revision: store.current_snapshot_revision,
+            parent_proof_mask: parent_proof_mask,
+            trusted_attr_id: trusted_attr_id,
+            digest: digest,
+        };
+        (*dst).valid = true;
+    }
+
+    // Record audit trail for TrustedBoundary facts (AXS-PCT-015)
+    if origin == FACT_ORIGIN_TRUSTED_BOUNDARY && trusted_attr_id != 0u32 && store.allow_trusted_boundaries {
+        if (store.audit_count) < (store.audit_cap) {
+            let ad = unsafe { pct_audit_at(store.audits, store.audit_count) };
+            store.audit_count = store.audit_count + 1;
+            unsafe {
+                (*ad).cert_id = new_id;
+                (*ad).prop_kind = kind;
+                (*ad).trusted_attr_id = trusted_attr_id;
+                (*ad).fn_sym = SymbolId { v: fn_sym.v };
+                (*ad).ir_revision = store.current_ir_revision;
+            }
+        }
+    }
+
+    new_id
+}
+
+// Transitively invalidate all children of any invalidated proof certificate in the DAG (AXS-PCT-011).
+pub fn proof_store_propagate_invalidation(store: mut_view<ProofStore>) {
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut i: usize = 0;
+        while i < store.cert_count {
+            let cp = unsafe { pct_cert_at(store.certs, i) };
+            if unsafe { (*cp).valid } {
+                let pmask = unsafe { (*cp).provenance.parent_proof_mask };
+                if pmask != 0u64 {
+                    let mut p: usize = 0;
+                    while p < store.cert_count {
+                        let bit = 1u64 << (p as u64);
+                        if (pmask & bit) != 0u64 {
+                            let pp = unsafe { pct_cert_at(store.certs, p) };
+                            if !(unsafe { (*pp).valid }) {
+                                unsafe { (*cp).valid = false; }
+                                store.invalidation_events = store.invalidation_events + 1u32;
+                                changed = true;
+                                break;
+                            }
+                        }
+                        p = p + 1;
+                    }
+                }
+            }
+            i = i + 1;
+        }
+    }
+}
+
+// Explicitly invalidate a single ProofCertificate and transitively invalidate all derived certificates.
+pub fn proof_store_invalidate_cert(store: mut_view<ProofStore>, cert_id: u32) {
+    if (cert_id as usize) >= store.cert_count {
+        return;
+    }
+    let cp = unsafe { pct_cert_at(store.certs, cert_id as usize) };
+    if unsafe { (*cp).valid } {
+        unsafe { (*cp).valid = false; }
+        store.invalidation_events = store.invalidation_events + 1u32;
+        proof_store_propagate_invalidation(store);
+    }
+}
+
+// Invalidate all ProofCertificates produced by any analysis in `invalidated_analysis_mask`
+// and transitively invalidate all derived certificates in the DAG (AXS-PCT-011).
+pub fn proof_store_invalidate_by_analyses(store: mut_view<ProofStore>, invalidated_analysis_mask: u32) {
+    let expanded = pct_analysis_expand_invalidated(invalidated_analysis_mask);
+    let mut i: usize = 0;
+    while i < store.cert_count {
+        let cp = unsafe { pct_cert_at(store.certs, i) };
+        if unsafe { (*cp).valid } {
+            let src_a = unsafe { (*cp).provenance.source_analysis };
+            let bit = pct_analysis_bit(src_a);
+            if (expanded & bit) != 0u32 {
+                unsafe { (*cp).valid = false; }
+                store.invalidation_events = store.invalidation_events + 1u32;
+            }
+        }
+        i = i + 1;
+    }
+    proof_store_propagate_invalidation(store);
+}
+
+// Advance IR revision on instruction/CFG mutation and transitively invalidate stale proofs (AXS-PCT-011).
+pub fn proof_store_notify_ir_mutation(
+    store: mut_view<ProofStore>,
+    mutated_subject: u32,
+    invalidated_analysis_mask: u32
+) {
+    store.current_ir_revision = store.current_ir_revision + 1u32;
+    let expanded = pct_analysis_expand_invalidated(invalidated_analysis_mask);
+    let mut i: usize = 0;
+    while i < store.cert_count {
+        let cp = unsafe { pct_cert_at(store.certs, i) };
+        if unsafe { (*cp).valid } {
+            let sa = unsafe { (*cp).subject_a };
+            let sb = unsafe { (*cp).subject_b };
+            let src_a = unsafe { (*cp).provenance.source_analysis };
+            let bit = pct_analysis_bit(src_a);
+            if (mutated_subject != 0xFFFFFFFFu32 && (sa == mutated_subject || sb == mutated_subject)) ||
+               (expanded & bit) != 0u32 ||
+               (unsafe { (*cp).provenance.ir_revision }) != store.current_ir_revision {
+                unsafe { (*cp).valid = false; }
+                store.invalidation_events = store.invalidation_events + 1u32;
+            }
+        }
+        i = i + 1;
+    }
+    proof_store_propagate_invalidation(store);
+}
+
+pub fn proof_store_is_cert_usable(store: view<ProofStore>, cert_id: u32) -> bool {
+    if (cert_id as usize) >= store.cert_count {
+        return false;
+    }
+    let cp = unsafe { pct_cert_at(store.certs, cert_id as usize) };
+    let is_val = unsafe { (*cp).valid };
+    let rev = unsafe { (*cp).provenance.ir_revision };
+    let srev = unsafe { (*cp).provenance.snapshot_revision };
+    let cert = unsafe { (*cp).certainty };
+    if !is_val || rev != store.current_ir_revision || srev != store.current_snapshot_revision || cert != CERTAINTY_PROVEN {
+        return false;
+    }
+    let pmask = unsafe { (*cp).provenance.parent_proof_mask };
+    proof_store_parents_valid(store, pmask)
+}
+
+pub fn proof_store_get_cert_certainty(store: view<ProofStore>, cert_id: u32) -> u8 {
+    if (cert_id as usize) >= store.cert_count {
+        return CERTAINTY_UNKNOWN;
+    }
+    let cp = unsafe { pct_cert_at(store.certs, cert_id as usize) };
+    if !proof_store_is_cert_usable(store, cert_id) {
+        return unsafe {
+            let c = (*cp).certainty;
+            if c == CERTAINTY_PROVEN { CERTAINTY_UNKNOWN } else { c }
+        };
+    }
+    CERTAINTY_PROVEN
+}
+
+// =================================================================================================
+// 3. Monotone Dataflow Fixed-Point Engine & Multi-Category Effect Lattices (AXS-PCT-012..013)
+// =================================================================================================
+
+pub const PCT_DATAFLOW_FORWARD: u8 = 0u8;
+pub const PCT_DATAFLOW_BACKWARD: u8 = 1u8;
+
+pub struct DataflowFixpointResult {
+    pub converged: bool,
+    pub iterations: u32,
+    pub final_state: u64,
+    pub certainty: u8,
+}
+
+// Generic monotone lattice fixed-point solver over a block/transfer array with strict iteration budget.
+// If `max_iterations` is exceeded before convergence, fails closed to `CERTAINTY_UNKNOWN` (AXS-PCT-010, AXS-PCT-012).
+pub fn pct_solve_monotone_fixpoint(
+    direction: u8,
+    block_masks: *const u64,
+    block_kill_masks: *const u64,
+    block_count: usize,
+    initial_state: u64,
+    max_iterations: u32
+) -> DataflowFixpointResult {
+    if block_count == 0 || (block_masks as usize) == 0 {
+        return DataflowFixpointResult {
+            converged: true,
+            iterations: 0u32,
+            final_state: initial_state,
+            certainty: CERTAINTY_PROVEN,
+        };
+    }
+    let mut state = initial_state;
+    let mut iter: u32 = 0u32;
+    while iter < max_iterations {
+        iter = iter + 1u32;
+        let prev = state;
+        let mut idx: usize = 0;
+        while idx < block_count {
+            let b_idx = if direction == PCT_DATAFLOW_BACKWARD {
+                block_count - 1 - idx
+            } else {
+                idx
+            };
+            let gen_m = unsafe { *(((block_masks as usize) + (b_idx * 8)) as *const u64) };
+            let kill_m: u64 = if (block_kill_masks as usize) != 0 {
+                unsafe { *(((block_kill_masks as usize) + (b_idx * 8)) as *const u64) }
+            } else {
+                0u64
+            };
+            // Monotone join: state accumulates reachable facts along lattice order
+            state = state | ((state & (0xFFFFFFFF_FFFFFFFFu64 ^ kill_m)) | gen_m);
+            idx = idx + 1;
+        }
+        if state == prev {
+            return DataflowFixpointResult {
+                converged: true,
+                iterations: iter,
+                final_state: state,
+                certainty: CERTAINTY_PROVEN,
+            };
+        }
+    }
+    DataflowFixpointResult {
+        converged: false,
+        iterations: iter,
+        final_state: state,
+        certainty: CERTAINTY_UNKNOWN,
+    }
+}
+
+// Multi-category Effect Lattices (AXS-PCT-013):
+// Memory:      Pure(0) < ReadsOnly(1) < WritesLocalOnly(2) < WritesViewParam(3) < WritesGlobalOrHeap(4) < Unknown(5)
+// Resource:    None(0) < AllocatesBounded(1) < AllocatesUnbounded(2) < ReleasesOrDrops(3) < Unknown(4)
+// Control:     TotalWillReturn(0) < MayDiverge(1) < MayPanicOrTrap(2) < MayUnwind(3) < Unknown(4)
+// Concurrency: ThreadLocalPure(0) < AtomicSync(1) < SpawnsTaskOrChannel(2) < SharedMutableSync(3) < Unknown(4)
+// External:    None(0) < HostSyscall(1) < VolatileAccess(2) < FfiBoundary(3) < Unknown(4)
+
+pub const MEM_EFF_PURE: u8 = 0u8;
+pub const MEM_EFF_READS_ONLY: u8 = 1u8;
+pub const MEM_EFF_WRITES_LOCAL_ONLY: u8 = 2u8;
+pub const MEM_EFF_WRITES_VIEW_PARAM: u8 = 3u8;
+pub const MEM_EFF_WRITES_GLOBAL_OR_HEAP: u8 = 4u8;
+pub const MEM_EFF_UNKNOWN: u8 = 5u8;
+
+pub const RES_EFF_NONE: u8 = 0u8;
+pub const RES_EFF_ALLOCATES_BOUNDED: u8 = 1u8;
+pub const RES_EFF_ALLOCATES_UNBOUNDED: u8 = 2u8;
+pub const RES_EFF_RELEASES_OR_DROPS: u8 = 3u8;
+pub const RES_EFF_UNKNOWN: u8 = 4u8;
+
+pub const CTRL_EFF_TOTAL_WILL_RETURN: u8 = 0u8;
+pub const CTRL_EFF_MAY_DIVERGE: u8 = 1u8;
+pub const CTRL_EFF_MAY_PANIC_OR_TRAP: u8 = 2u8;
+pub const CTRL_EFF_MAY_UNWIND: u8 = 3u8;
+pub const CTRL_EFF_UNKNOWN: u8 = 4u8;
+
+pub const CONC_EFF_THREAD_LOCAL_PURE: u8 = 0u8;
+pub const CONC_EFF_ATOMIC_SYNC: u8 = 1u8;
+pub const CONC_EFF_SPAWNS_TASK_OR_CHANNEL: u8 = 2u8;
+pub const CONC_EFF_SHARED_MUTABLE_SYNC: u8 = 3u8;
+pub const CONC_EFF_UNKNOWN: u8 = 4u8;
+
+pub const EXT_EFF_NONE: u8 = 0u8;
+pub const EXT_EFF_HOST_SYSCALL: u8 = 1u8;
+pub const EXT_EFF_VOLATILE_ACCESS: u8 = 2u8;
+pub const EXT_EFF_FFI_BOUNDARY: u8 = 3u8;
+pub const EXT_EFF_UNKNOWN: u8 = 4u8;
+
+pub const PCT_EFFECT_SUMMARY_SCHEMA_VERSION: u32 = 1u32;
+
+pub struct PctEffectSummary {
+    pub schema_version: u32,
+    pub memory: u8,
+    pub resource: u8,
+    pub control: u8,
+    pub concurrency: u8,
+    pub external: u8,
+    pub reads_entropy_or_clock: bool,
+    pub has_debug_profile_trace: bool,
+    pub param_escape_mask: u32,
+    pub param_mutate_mask: u32,
+}
+
+fn max_u8(a: u8, b: u8) -> u8 {
+    if a >= b { a } else { b }
+}
+
+pub fn pct_effect_summary_pure() -> PctEffectSummary {
+    PctEffectSummary {
+        schema_version: PCT_EFFECT_SUMMARY_SCHEMA_VERSION,
+        memory: MEM_EFF_PURE,
+        resource: RES_EFF_NONE,
+        control: CTRL_EFF_TOTAL_WILL_RETURN,
+        concurrency: CONC_EFF_THREAD_LOCAL_PURE,
+        external: EXT_EFF_NONE,
+        reads_entropy_or_clock: false,
+        has_debug_profile_trace: false,
+        param_escape_mask: 0u32,
+        param_mutate_mask: 0u32,
+    }
+}
+
+pub fn pct_effect_summary_unknown() -> PctEffectSummary {
+    PctEffectSummary {
+        schema_version: PCT_EFFECT_SUMMARY_SCHEMA_VERSION,
+        memory: MEM_EFF_UNKNOWN,
+        resource: RES_EFF_UNKNOWN,
+        control: CTRL_EFF_UNKNOWN,
+        concurrency: CONC_EFF_UNKNOWN,
+        external: EXT_EFF_UNKNOWN,
+        reads_entropy_or_clock: true,
+        has_debug_profile_trace: false,
+        param_escape_mask: 0xFFFFFFFFu32,
+        param_mutate_mask: 0xFFFFFFFFu32,
+    }
+}
+
+// Monotone join across all 5 effect categories: Unknown is top and NEVER downgrades to Pure (AXS-PCT-013).
+pub fn pct_effect_summary_join(a: view<PctEffectSummary>, b: view<PctEffectSummary>) -> PctEffectSummary {
+    if a.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION ||
+       b.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION {
+        return pct_effect_summary_unknown();
+    }
+    PctEffectSummary {
+        schema_version: PCT_EFFECT_SUMMARY_SCHEMA_VERSION,
+        memory: max_u8(a.memory, b.memory),
+        resource: max_u8(a.resource, b.resource),
+        control: max_u8(a.control, b.control),
+        concurrency: max_u8(a.concurrency, b.concurrency),
+        external: max_u8(a.external, b.external),
+        reads_entropy_or_clock: a.reads_entropy_or_clock || b.reads_entropy_or_clock,
+        has_debug_profile_trace: a.has_debug_profile_trace || b.has_debug_profile_trace,
+        param_escape_mask: a.param_escape_mask | b.param_escape_mask,
+        param_mutate_mask: a.param_mutate_mask | b.param_mutate_mask,
+    }
+}
+
+// AXS-PCT-013: Scope exit of any value implementing Drop unions the Drop::drop summary into the
+// enclosing scope's effect summary (at minimum ReleasesOrDrops).
+pub fn pct_effect_summary_with_implicit_drop(
+    enclosing: view<PctEffectSummary>,
+    drop_impl_summary: view<PctEffectSummary>
+) -> PctEffectSummary {
+    let mut joined = pct_effect_summary_join(enclosing, drop_impl_summary);
+    if (joined.resource) < RES_EFF_RELEASES_OR_DROPS {
+        joined.resource = RES_EFF_RELEASES_OR_DROPS;
+    }
+    joined
+}
+
+// AXS-PCT-013: Higher-order calls check whether the callback summary is <= declared bound,
+// and union the callback's effects into the caller's effect summary.
+pub fn pct_effect_callback_within_bound(
+    callback: view<PctEffectSummary>,
+    declared_bound: view<PctEffectSummary>
+) -> bool {
+    if callback.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION ||
+       declared_bound.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION {
+        return false;
+    }
+    callback.memory <= declared_bound.memory &&
+    callback.resource <= declared_bound.resource &&
+    callback.control <= declared_bound.control &&
+    callback.concurrency <= declared_bound.concurrency &&
+    callback.external <= declared_bound.external &&
+    (!callback.reads_entropy_or_clock || declared_bound.reads_entropy_or_clock)
+}
+
+// AXS-PCT-013: DCE / CSE / Hoisting safety query on multi-category EffectSummary.
+// Debug/profiling trace instrumentation does not elevate Pure to Impure, preventing
+// Heisenbug optimization divergence between debug-traced and normal builds.
+pub fn pct_effect_can_dce_or_hoist(eff: view<PctEffectSummary>) -> bool {
+    if eff.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION {
+        return false;
+    }
+    (eff.memory == MEM_EFF_PURE || eff.memory == MEM_EFF_READS_ONLY) &&
+    (eff.resource == RES_EFF_NONE || eff.resource == RES_EFF_ALLOCATES_BOUNDED) &&
+    eff.control == CTRL_EFF_TOTAL_WILL_RETURN &&
+    eff.concurrency == CONC_EFF_THREAD_LOCAL_PURE &&
+    eff.external == EXT_EFF_NONE &&
+    !eff.reads_entropy_or_clock &&
+    eff.param_mutate_mask == 0u32
+}
+
+// AXS-PCT-013: Comptime memoization requires pure deterministic execution (no entropy/clock,
+// no external/volatile/FFI, no concurrency, no global/view mutation).
+pub fn pct_effect_can_memoize_comptime(eff: view<PctEffectSummary>) -> bool {
+    if eff.schema_version != PCT_EFFECT_SUMMARY_SCHEMA_VERSION {
+        return false;
+    }
+    eff.memory <= MEM_EFF_WRITES_LOCAL_ONLY &&
+    eff.resource <= RES_EFF_ALLOCATES_BOUNDED &&
+    eff.control == CTRL_EFF_TOTAL_WILL_RETURN &&
+    eff.concurrency == CONC_EFF_THREAD_LOCAL_PURE &&
+    eff.external == EXT_EFF_NONE &&
+    !eff.reads_entropy_or_clock &&
+    eff.param_mutate_mask == 0u32
+}
+
+// AXS-PCT-013: Mutual recursion SCC fixed-point propagation.
+pub fn pct_effect_propagate_scc(
+    member_A: view<PctEffectSummary>,
+    member_B: view<PctEffectSummary>,
+    has_unbounded_recursion: bool
+) -> PctEffectSummary {
+    let mut joined = pct_effect_summary_join(member_A, member_B);
+    if has_unbounded_recursion && (joined.control) < CTRL_EFF_MAY_DIVERGE {
+        joined.control = CTRL_EFF_MAY_DIVERGE;
+    }
+    joined
+}
+
+// =================================================================================================
+// 4. Bounded In-Process Symbolic Domain Proofs (AXS-PCT-014)
+// =================================================================================================
+
+pub const NULLABILITY_UNKNOWN: u8 = 0u8;
+pub const NULLABILITY_NON_NULL: u8 = 1u8;
+pub const NULLABILITY_NULL: u8 = 2u8;
+
+pub struct SymbolicValueDomain {
+    pub bit_width: u8,
+    pub is_signed: bool,
+    pub is_constant: bool,
+    pub const_val: u64,
+    pub has_range: bool,
+    pub range_lo: u64,
+    pub range_hi: u64,
+    pub nullability: u8,
+    pub known_zeros: u64,
+    pub known_ones: u64,
+    pub stride: u64,
+    pub offset: u64,
+    pub is_utf8_byte_len: bool,
+    pub is_contradiction: bool,
+}
+
+pub fn sym_domain_top(bit_width: u8, is_signed: bool) -> SymbolicValueDomain {
+    let max_u: u64 = if bit_width >= 64u8 {
+        0xFFFFFFFF_FFFFFFFFu64
+    } else if bit_width == 0u8 {
+        0u64
+    } else {
+        (1u64 << (bit_width as u64)) - 1u64
+    };
+    SymbolicValueDomain {
+        bit_width: bit_width,
+        is_signed: is_signed,
+        is_constant: false,
+        const_val: 0u64,
+        has_range: true,
+        range_lo: 0u64,
+        range_hi: max_u,
+        nullability: NULLABILITY_UNKNOWN,
+        known_zeros: 0u64,
+        known_ones: 0u64,
+        stride: 1u64,
+        offset: 0u64,
+        is_utf8_byte_len: false,
+        is_contradiction: false,
+    }
+}
+
+pub fn sym_domain_const(bit_width: u8, is_signed: bool, val: u64) -> SymbolicValueDomain {
+    SymbolicValueDomain {
+        bit_width: bit_width,
+        is_signed: is_signed,
+        is_constant: true,
+        const_val: val,
+        has_range: true,
+        range_lo: val,
+        range_hi: val,
+        nullability: if val != 0u64 { NULLABILITY_NON_NULL } else { NULLABILITY_NULL },
+        known_zeros: 0xFFFFFFFF_FFFFFFFFu64 ^ val,
+        known_ones: val,
+        stride: 0u64,
+        offset: val,
+        is_utf8_byte_len: false,
+        is_contradiction: false,
+    }
+}
+
+pub fn sym_domain_range(bit_width: u8, is_signed: bool, lo: u64, hi: u64) -> SymbolicValueDomain {
+    if lo > hi {
+        let mut bot = sym_domain_top(bit_width, is_signed);
+        bot.is_contradiction = true;
+        return bot;
+    }
+    let is_c = lo == hi;
+    SymbolicValueDomain {
+        bit_width: bit_width,
+        is_signed: is_signed,
+        is_constant: is_c,
+        const_val: if is_c { lo } else { 0u64 },
+        has_range: true,
+        range_lo: lo,
+        range_hi: hi,
+        nullability: if lo > 0u64 { NULLABILITY_NON_NULL } else if hi == 0u64 { NULLABILITY_NULL } else { NULLABILITY_UNKNOWN },
+        known_zeros: if is_c { 0xFFFFFFFF_FFFFFFFFu64 ^ lo } else { 0u64 },
+        known_ones: if is_c { lo } else { 0u64 },
+        stride: if is_c { 0u64 } else { 1u64 },
+        offset: if is_c { lo } else { 0u64 },
+        is_utf8_byte_len: false,
+        is_contradiction: false,
+    }
+}
+
+// Refine a symbolic domain under a dominating branch condition (`x >= cond_lo && x <= cond_hi`).
+// Detects unsatisfiable path constraints (`range_lo > range_hi` or conflicting known bits).
+pub fn sym_domain_refine_range(
+    dom: view<SymbolicValueDomain>,
+    cond_lo: u64,
+    cond_hi: u64
+) -> SymbolicValueDomain {
+    let mut out = SymbolicValueDomain {
+        bit_width: dom.bit_width,
+        is_signed: dom.is_signed,
+        is_constant: dom.is_constant,
+        const_val: dom.const_val,
+        has_range: true,
+        range_lo: if dom.has_range && dom.range_lo > cond_lo { dom.range_lo } else { cond_lo },
+        range_hi: if dom.has_range && (dom.range_hi) < cond_hi { dom.range_hi } else { cond_hi },
+        nullability: dom.nullability,
+        known_zeros: dom.known_zeros,
+        known_ones: dom.known_ones,
+        stride: dom.stride,
+        offset: dom.offset,
+        is_utf8_byte_len: dom.is_utf8_byte_len,
+        is_contradiction: dom.is_contradiction,
+    };
+    if out.range_lo > out.range_hi || (out.known_zeros & out.known_ones) != 0u64 {
+        out.is_contradiction = true;
+        return out;
+    }
+    if out.range_lo == out.range_hi {
+        out.is_constant = true;
+        out.const_val = out.range_lo;
+        out.known_ones = out.known_ones | out.range_lo;
+        out.known_zeros = out.known_zeros | (0xFFFFFFFF_FFFFFFFFu64 ^ out.range_lo);
+        if (out.known_zeros & out.known_ones) != 0u64 {
+            out.is_contradiction = true;
+            return out;
+        }
+    }
+    if out.range_lo > 0u64 || out.known_ones != 0u64 {
+        out.nullability = NULLABILITY_NON_NULL;
+    }
+    out
+}
+
+// Prove `d != 0` (`PropositionKind.NonZero`) using Constant, Range, Bitmask, or Congruence (AXS-PCT-014).
+pub fn sym_prove_non_zero(dom: view<SymbolicValueDomain>, remaining_budget: u32) -> u8 {
+    if remaining_budget == 0u32 {
+        return CERTAINTY_UNKNOWN;
+    }
+    if dom.is_contradiction {
+        return CERTAINTY_PROVEN;
+    }
+    if dom.is_constant {
+        return if dom.const_val != 0u64 { CERTAINTY_PROVEN } else { CERTAINTY_UNKNOWN };
+    }
+    if dom.has_range && dom.range_lo > 0u64 {
+        return CERTAINTY_PROVEN;
+    }
+    if dom.known_ones != 0u64 || dom.nullability == NULLABILITY_NON_NULL {
+        return CERTAINTY_PROVEN;
+    }
+    // Congruence: x = k * stride + offset with 0 < offset < stride cannot be 0
+    if dom.stride > 1u64 && dom.offset > 0u64 && (dom.offset) < (dom.stride) {
+        return CERTAINTY_PROVEN;
+    }
+    if dom.has_range && dom.range_lo == 0u64 && dom.range_hi > 0u64 {
+        return CERTAINTY_POSSIBLE;
+    }
+    CERTAINTY_UNKNOWN
+}
+
+// Prove `0 <= shift < bit_width` (`PropositionKind.ShiftInRange`, AXS-PCT-014).
+pub fn sym_prove_shift_in_range(
+    shift_dom: view<SymbolicValueDomain>,
+    target_bit_width: u8,
+    remaining_budget: u32
+) -> u8 {
+    if remaining_budget == 0u32 || target_bit_width == 0u8 {
+        return CERTAINTY_UNKNOWN;
+    }
+    let bw = target_bit_width as u64;
+    if shift_dom.is_constant {
+        return if (shift_dom.const_val) < bw { CERTAINTY_PROVEN } else { CERTAINTY_UNKNOWN };
+    }
+    if shift_dom.has_range && (shift_dom.range_hi) < bw {
+        return CERTAINTY_PROVEN;
+    }
+    // Bitmask: if target_bit_width is a power of two (e.g. 64) and all bits >= target_bit_width are known zero
+    if (bw & (bw - 1u64)) == 0u64 {
+        let high_mask = 0xFFFFFFFF_FFFFFFFFu64 ^ (bw - 1u64);
+        if (shift_dom.known_zeros & high_mask) == high_mask {
+            return CERTAINTY_PROVEN;
+        }
+    }
+    if shift_dom.has_range && (shift_dom.range_lo) < bw {
+        return CERTAINTY_POSSIBLE;
+    }
+    CERTAINTY_UNKNOWN
+}
+
+// Prove `idx < len` (`PropositionKind.InBounds`, AXS-PCT-014).
+// Distinguishes UTF-8 byte length (`len(s)`) from Unicode scalar count (`char_count(s)`):
+// a proof on scalar count NEVER authorizes byte-index bounds check elimination unless domains match!
+pub fn sym_prove_in_bounds(
+    idx_dom: view<SymbolicValueDomain>,
+    len_dom: view<SymbolicValueDomain>,
+    index_is_utf8_byte_offset: bool,
+    remaining_budget: u32
+) -> u8 {
+    if remaining_budget == 0u32 {
+        return CERTAINTY_UNKNOWN;
+    }
+    // UTF-8 byte vs Unicode scalar mismatch guard (SPEC-25 Section 7.2)
+    if index_is_utf8_byte_offset != len_dom.is_utf8_byte_len {
+        return CERTAINTY_UNKNOWN;
+    }
+    if idx_dom.has_range && len_dom.has_range {
+        if (idx_dom.range_hi) < (len_dom.range_lo) {
+            return CERTAINTY_PROVEN;
+        }
+        if (idx_dom.range_lo) < (len_dom.range_hi) {
+            return CERTAINTY_POSSIBLE;
+        }
+    }
+    CERTAINTY_UNKNOWN
+}
+
+// Prove unsigned addition `a + b` does not overflow `bit_width` (`PropositionKind.NoUnsignedOverflow`, AXS-PCT-014).
+pub fn sym_prove_no_unsigned_add_overflow(
+    lhs_dom: view<SymbolicValueDomain>,
+    rhs_dom: view<SymbolicValueDomain>,
+    bit_width: u8,
+    remaining_budget: u32
+) -> u8 {
+    if remaining_budget == 0u32 || bit_width == 0u8 || bit_width > 64u8 {
+        return CERTAINTY_UNKNOWN;
+    }
+    if !lhs_dom.has_range || !rhs_dom.has_range {
+        return CERTAINTY_UNKNOWN;
+    }
+    let max_val: u64 = if bit_width == 64u8 {
+        0xFFFFFFFF_FFFFFFFFu64
+    } else {
+        (1u64 << (bit_width as u64)) - 1u64
+    };
+    if lhs_dom.range_hi <= max_val - rhs_dom.range_hi {
+        return CERTAINTY_PROVEN;
+    }
+    if lhs_dom.range_lo <= max_val - rhs_dom.range_lo {
+        return CERTAINTY_POSSIBLE;
+    }
+    CERTAINTY_UNKNOWN
+}
+
+// =================================================================================================
+// 5. Canonical PassContract Registry & Contract Well-Formedness Verifier (AXS-PCT-001..002)
+// =================================================================================================
+
+pub fn pct_canonical_contract(pass_id: u16) -> PassContract {
+    let mandatory = SEM_PROP_MANDATORY_INTRA_LEVEL;
+    if pass_id == PCT_PASS_MIR_LOWER {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_THIR,
+            output_level: IR_LEVEL_MIR,
+            is_mutating_pass: true,
+            required_analyses: 0u32,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_CFG,
+            preserved_analyses: 0u32,
+            invalidated_analyses: 0u32,
+            preserved_properties: SEM_PROP_STRICT_TYPE_CORRECTNESS,
+            postconditions: SEM_PROP_CFG_WELL_FORMED | SEM_PROP_STRICT_TYPE_CORRECTNESS,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+        };
+    }
+    if pass_id == PCT_PASS_MIR_DROP_ELAB {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_MIR,
+            output_level: IR_LEVEL_MIR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DEFINITE_INIT | PCT_MASK_MOVE_STATE,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_CFG,
+            preserved_analyses: PCT_MASK_CFG,
+            invalidated_analyses: PCT_MASK_DOM_TREE | PCT_MASK_LIVENESS,
+            preserved_properties: mandatory | SEM_PROP_NO_UNINIT_READS | SEM_PROP_NO_USE_AFTER_MOVE,
+            postconditions: mandatory | SEM_PROP_DROP_ELAB_COMPLETE,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+        };
+    }
+    if pass_id == PCT_PASS_MIR_VERIFY {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_MIR,
+            output_level: IR_LEVEL_MIR,
+            is_mutating_pass: false,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_DEFINITE_INIT | PCT_MASK_MOVE_STATE | PCT_MASK_CAPABILITY_LOANS,
+            required_propositions: 0u32,
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_ALL_ANALYSES,
+            invalidated_analyses: 0u32,
+            preserved_properties: mandatory | SEM_PROP_NO_UNINIT_READS | SEM_PROP_NO_USE_AFTER_MOVE | SEM_PROP_REGION_SOUNDNESS | SEM_PROP_DROP_ELAB_COMPLETE,
+            postconditions: mandatory | SEM_PROP_NO_UNINIT_READS | SEM_PROP_NO_USE_AFTER_MOVE | SEM_PROP_REGION_SOUNDNESS | SEM_PROP_DROP_ELAB_COMPLETE,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_LOWER_MIR {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_MIR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE,
+            preserved_analyses: 0u32,
+            invalidated_analyses: 0u32,
+            preserved_properties: mandatory,
+            postconditions: mandatory | SEM_PROP_DOMINATORS_VALID | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_MEMSSA {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_MEMORY_SSA,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE,
+            invalidated_analyses: 0u32,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM | SEM_PROP_MEMORY_SSA_VALID,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_SROA {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_ALIAS_SUMMARY | PCT_MASK_ESCAPE_SUMMARY,
+            required_propositions: prop_bit(PROP_NO_ESCAPE) | prop_bit(PROP_NO_ALIAS),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_VALUE_RANGE,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_SCCP {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_VALUE_RANGE,
+            required_propositions: prop_bit(PROP_NO_SIGNED_OVERFLOW) | prop_bit(PROP_SHIFT_IN_RANGE) | prop_bit(PROP_NON_ZERO),
+            produced_analyses: PCT_MASK_VALUE_RANGE,
+            preserved_analyses: 0u32,
+            invalidated_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_INSTCOMBINE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_VALUE_RANGE | PCT_MASK_KNOWN_BITS | PCT_MASK_EFFECT_SUMMARY,
+            required_propositions: prop_bit(PROP_NO_SIGNED_OVERFLOW) | prop_bit(PROP_NO_UNSIGNED_OVERFLOW) | prop_bit(PROP_SHIFT_IN_RANGE) | prop_bit(PROP_NON_ZERO),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE | PCT_MASK_VALUE_RANGE | PCT_MASK_KNOWN_BITS,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_GVN_CSE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_ALIAS_SUMMARY | PCT_MASK_EFFECT_SUMMARY,
+            required_propositions: prop_bit(PROP_NO_ALIAS) | prop_bit(PROP_PURE_CALL) | prop_bit(PROP_READ_ONLY_MEMORY),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE | PCT_MASK_VALUE_RANGE,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM | SEM_PROP_MEMORY_SSA_VALID,
+            postconditions: mandatory | SEM_PROP_SSA_FORM | SEM_PROP_MEMORY_SSA_VALID,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_LICM {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_LOOP_FOREST | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_ALIAS_SUMMARY | PCT_MASK_EFFECT_SUMMARY,
+            required_propositions: prop_bit(PROP_LOOP_INVARIANT) | prop_bit(PROP_NO_ALIAS) | prop_bit(PROP_NO_PANIC) | prop_bit(PROP_WILL_RETURN),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_LOOP_FOREST,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_VALUE_RANGE,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_BCE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_VALUE_RANGE,
+            required_propositions: prop_bit(PROP_IN_BOUNDS),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_MEMORY_SSA,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_DSE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_POST_DOM_TREE | PCT_MASK_MEMORY_SSA | PCT_MASK_ALIAS_SUMMARY | PCT_MASK_EFFECT_SUMMARY,
+            required_propositions: prop_bit(PROP_DEAD_STORE) | prop_bit(PROP_NO_ALIAS),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            invalidated_analyses: PCT_MASK_MEMORY_SSA | PCT_MASK_SSA_DEF_USE,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_DCE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_SSA_DEF_USE | PCT_MASK_EFFECT_SUMMARY,
+            required_propositions: prop_bit(PROP_PURE_CALL) | prop_bit(PROP_NO_PANIC) | prop_bit(PROP_WILL_RETURN),
+            produced_analyses: 0u32,
+            preserved_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            invalidated_analyses: PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA,
+            preserved_properties: mandatory | SEM_PROP_SSA_FORM,
+            postconditions: mandatory | SEM_PROP_SSA_FORM,
+            validation: VALIDATION_PROOF_CERT_CHECK,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_CFG_SIMPLIFY {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_CFG,
+            preserved_analyses: 0u32,
+            invalidated_analyses: PCT_MASK_DOM_TREE | PCT_MASK_POST_DOM_TREE | PCT_MASK_LOOP_FOREST | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA,
+            preserved_properties: mandatory,
+            postconditions: mandatory,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_OPT_INLINE {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_OPT_IR,
+            output_level: IR_LEVEL_OPT_IR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_SSA_DEF_USE | PCT_MASK_CALL_GRAPH_SCC | PCT_MASK_EFFECT_SUMMARY | PCT_MASK_CAPABILITY_LOANS,
+            required_propositions: 0u32,
+            produced_analyses: 0u32,
+            preserved_analyses: 0u32,
+            invalidated_analyses: PCT_MASK_CFG | PCT_MASK_DOM_TREE | PCT_MASK_LOOP_FOREST | PCT_MASK_SSA_DEF_USE | PCT_MASK_MEMORY_SSA | PCT_MASK_VALUE_RANGE,
+            preserved_properties: mandatory | SEM_PROP_REGION_SOUNDNESS,
+            postconditions: mandatory | SEM_PROP_SSA_FORM | SEM_PROP_REGION_SOUNDNESS,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ROLLBACK_IR,
+        };
+    }
+    if pass_id == PCT_PASS_ABI_LOWER {
+        return PassContract {
+            pass_id: pass_id,
+            input_level: IR_LEVEL_MIR,
+            output_level: IR_LEVEL_LIR,
+            is_mutating_pass: true,
+            required_analyses: PCT_MASK_CFG,
+            required_propositions: 0u32,
+            produced_analyses: PCT_MASK_CFG,
+            preserved_analyses: 0u32,
+            invalidated_analyses: 0u32,
+            preserved_properties: mandatory | SEM_PROP_ABI_LAYOUT_CONFORMANT,
+            postconditions: mandatory | SEM_PROP_ABI_LAYOUT_CONFORMANT,
+            validation: VALIDATION_STRUCTURAL_VERIFIER,
+            failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+        };
+    }
+    // Default / backend lowering passes (LIR_LOWER, X64_ISEL, X64_REGALLOC, X64_FINALIZE)
+    PassContract {
+        pass_id: pass_id,
+        input_level: IR_LEVEL_LIR,
+        output_level: IR_LEVEL_MACH_IR,
+        is_mutating_pass: true,
+        required_analyses: PCT_MASK_CFG | PCT_MASK_LIVENESS,
+        required_propositions: 0u32,
+        produced_analyses: PCT_MASK_CFG,
+        preserved_analyses: PCT_MASK_CFG,
+        invalidated_analyses: PCT_MASK_LIVENESS,
+        preserved_properties: mandatory | SEM_PROP_ABI_LAYOUT_CONFORMANT,
+        postconditions: mandatory | SEM_PROP_ABI_LAYOUT_CONFORMANT,
+        validation: VALIDATION_STRUCTURAL_VERIFIER,
+        failure_policy: FAILURE_POLICY_ABORT_COMPILER,
+    }
+}
+
+// Verify well-formedness of a PassContract declaration (AXS-PCT-001, AXS-PCT-002):
+//   1. An intra-level mutating optimization pass MUST preserve at least `SEM_PROP_MANDATORY_INTRA_LEVEL`.
+//   2. A pass MUST NOT claim to both preserve and invalidate the same analysis (`(preserved & invalidated) == 0`).
+//   3. A mutating pass MUST declare at least one postcondition (`postconditions != 0`).
+pub fn pct_validate_contract_declaration(contract: view<PassContract>) -> bool {
+    if (contract.preserved_analyses & contract.invalidated_analyses) != 0u32 {
+        return false;
+    }
+    if contract.is_mutating_pass && contract.postconditions == 0u32 {
+        return false;
+    }
+    if contract.input_level == contract.output_level && contract.is_mutating_pass && contract.input_level >= IR_LEVEL_MIR {
+        if (contract.preserved_properties & SEM_PROP_MANDATORY_INTRA_LEVEL) != SEM_PROP_MANDATORY_INTRA_LEVEL {
+            return false;
+        }
+    }
+    true
+}
+
+// =================================================================================================
+// 6. Semantic Firewall, Transactional Pass Engine & --verify-pass-contracts Gate
+//    (AXS-PCT-003..005, AXS-PCT-050..053, INV-PCT-001)
+// =================================================================================================
+
+pub const PCT_EXEC_COMMITTED: u8 = 0u8;
+pub const PCT_EXEC_ROLLED_BACK_OBLIGATION: u8 = 1u8;
+pub const PCT_EXEC_ROLLED_BACK_POSTCOND: u8 = 2u8;
+pub const PCT_EXEC_ABORTED_VERIFY_TRAP: u8 = 3u8;
+
+pub const PCT_TRAP_NONE: u8 = 0u8;
+pub const PCT_TRAP_INVALID_CONTRACT: u8 = 1u8;
+pub const PCT_TRAP_IR_LEVEL_MISMATCH: u8 = 2u8;
+pub const PCT_TRAP_STALE_PROOF_CONSUMED: u8 = 3u8;
+pub const PCT_TRAP_UNPRESERVED_ANALYSIS: u8 = 4u8;
+pub const PCT_TRAP_POSTCONDITION_VIOLATED: u8 = 5u8;
+pub const PCT_TRAP_CAPABILITY_PROMOTION: u8 = 6u8;
+pub const PCT_TRAP_OBSERVABLE_EFFECT_LOSS: u8 = 7u8;
+
+// Profitability facts from `CostProfile` (e.g. loop trip count estimate, inline weight).
+// AXS-PCT-004 (Semantic Firewall): Profitability facts can veto an expensive rewrite when
+// unprofitable, but can NEVER elevate a Possible/Unknown semantic obligation to Proven!
+pub struct ProfitabilityFact {
+    pub estimated_benefit: i32,
+    pub threshold: i32,
+    pub hotness_weight: u32,
+}
+
+pub fn pct_semantic_firewall_gate(
+    semantic_certainty: u8,
+    profitability: view<ProfitabilityFact>
+) -> bool {
+    // Stage 1: Hard Semantic Gate (Strictly independent of profitability!)
+    if !certainty_allows_transform(semantic_certainty) {
+        return false;
+    }
+    // Stage 2: Profitability Gate (Consulted ONLY after Proven semantic proof succeeds)
+    profitability.estimated_benefit >= profitability.threshold
+}
+
+pub struct MirBodyCheckpoint {
+    pub bb_count: usize,
+    pub local_count: usize,
+    pub drop_flag_count: usize,
+    pub locals_copy: *mut MirLocalDecl,
+    pub bbs_copy: *mut MirBb,
+    pub bb_stmts_copy: *mut *mut MirStmt,
+    pub ir_revision: u32,
+    pub valid_analyses: u32,
+    pub active_properties: u32,
+    pub observable_effect_count: u32,
+}
+
+unsafe fn pct_ptr_stmt_at(base: *mut *mut MirStmt, idx: usize) -> *mut *mut MirStmt {
+    let off = ((idx as isize) * (size_of<*mut MirStmt>() as isize)) as usize;
+    ((base as usize) + off) as *mut *mut MirStmt
+}
+
+unsafe fn pct_u64_at(base: *mut u64, idx: usize) -> *mut u64 {
+    let off = ((idx as isize) * (size_of<u64>() as isize)) as usize;
+    ((base as usize) + off) as *mut u64
+}
+
+pub struct PassContractEngine {
+    pub current_level: u8,
+    pub ir_revision: u32,
+    pub valid_analyses: u32,
+    pub analysis_digests: *mut u64,
+    pub active_properties: u32,
+    pub verify_pass_contracts: bool,
+    pub verify_each: bool,
+    pub observable_effect_count: u32,
+    pub baseline_observable_effects: u32,
+    pub pass_run_count: u32,
+    pub pass_commit_count: u32,
+    pub pass_rollback_count: u32,
+    pub verify_trap_count: u32,
+    pub last_trap_kind: u8,
+    pub last_trap_pass_id: u16,
+}
+
+pub fn pct_engine_init(
+    eng: mut_view<PassContractEngine>,
+    arena: mut_view<Arena>,
+    initial_level: u8,
+    verify_pass_contracts: bool
+) {
+    let digests_mem = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(PCT_ANALYSIS_COUNT, size_of<u64>()),
+        align_of<u64>()
+    ) as *mut u64;
+    let mut i: usize = 0;
+    while i < PCT_ANALYSIS_COUNT {
+        unsafe { *pct_u64_at(digests_mem, i) = 0u64; }
+        i = i + 1;
+    }
+    eng.current_level = initial_level;
+    eng.ir_revision = 1u32;
+    eng.valid_analyses = 0u32;
+    eng.analysis_digests = digests_mem;
+    eng.active_properties = SEM_PROP_MANDATORY_INTRA_LEVEL | SEM_PROP_DOMINATORS_VALID | SEM_PROP_SSA_FORM | SEM_PROP_MEMORY_SSA_VALID | SEM_PROP_NO_UNINIT_READS | SEM_PROP_NO_USE_AFTER_MOVE | SEM_PROP_REGION_SOUNDNESS | SEM_PROP_DROP_ELAB_COMPLETE;
+    eng.verify_pass_contracts = verify_pass_contracts;
+    eng.verify_each = verify_pass_contracts;
+    eng.observable_effect_count = 0u32;
+    eng.baseline_observable_effects = 0u32;
+    eng.pass_run_count = 0u32;
+    eng.pass_commit_count = 0u32;
+    eng.pass_rollback_count = 0u32;
+    eng.verify_trap_count = 0u32;
+    eng.last_trap_kind = PCT_TRAP_NONE;
+    eng.last_trap_pass_id = 0u16;
+}
+
+// Compute a deterministic structural digest of an analysis over `MirBody` so `--verify-pass-contracts`
+// can detect when a pass claims an analysis in `preserved_analyses` but silently mutates the underlying IR!
+pub fn pct_compute_mir_analysis_digest(body: view<MirBody>, analysis_id: u8) -> u64 {
+    let mut h = ax_hasher_new();
+    ax_hasher_write_u8(mut_view(h), analysis_id);
+    ax_hasher_write_u32(mut_view(h), body.bb_count as u32);
+    if analysis_id != PCT_ANALYSIS_CFG && analysis_id != PCT_ANALYSIS_DOM_TREE &&
+       analysis_id != PCT_ANALYSIS_POST_DOM_TREE && analysis_id != PCT_ANALYSIS_LOOP_FOREST {
+        ax_hasher_write_u32(mut_view(h), body.local_count as u32);
+    }
+
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let has_term = unsafe { (*bb).has_terminator };
+        ax_hasher_write_u8(mut_view(h), if has_term { 1u8 } else { 0u8 });
+        if has_term {
+            let tk = unsafe { (*bb).terminator.kind };
+            ax_hasher_write_u8(mut_view(h), tk);
+            if tk == MIR_TERM_GOTO {
+                ax_hasher_write_u32(mut_view(h), unsafe { (*bb).terminator.goto_target.v });
+            } else if tk == MIR_TERM_SWITCH_INT {
+                ax_hasher_write_u32(mut_view(h), unsafe { (*bb).terminator.otherwise.v });
+                ax_hasher_write_u32(mut_view(h), (unsafe { (*bb).terminator.switch_count }) as u32);
+            } else if tk == MIR_TERM_CALL {
+                ax_hasher_write_u32(mut_view(h), unsafe { (*bb).terminator.call_target.v });
+            } else if tk == MIR_TERM_DROP {
+                ax_hasher_write_u32(mut_view(h), unsafe { (*bb).terminator.drop_target.v });
+            } else if tk == MIR_TERM_ASSERT {
+                ax_hasher_write_u32(mut_view(h), unsafe { (*bb).terminator.assert_target.v });
+            }
+        }
+        // Statement-sensitive analyses hash the statements in each block as well
+        if analysis_id >= PCT_ANALYSIS_SSA_DEF_USE {
+            let sc = unsafe { (*bb).stmt_count };
+            ax_hasher_write_u32(mut_view(h), sc as u32);
+            let stmts = unsafe { (*bb).stmts };
+            let mut s: usize = 0;
+            while s < sc {
+                let st = unsafe { mir_stmt_at(stmts, s) };
+                ax_hasher_write_u8(mut_view(h), unsafe { (*st).kind });
+                ax_hasher_write_u32(mut_view(h), unsafe { (*st).place.local.v });
+                ax_hasher_write_u8(mut_view(h), unsafe { (*st).place.view_kind });
+                ax_hasher_write_u8(mut_view(h), unsafe { (*st).rvalue.kind });
+                s = s + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ax_hasher_finish(view(h))
+}
+
+pub fn pct_count_mir_observable_effects(body: view<MirBody>) -> u32 {
+    let mut count: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        let stmts = unsafe { (*bb).stmts };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at(stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_DROP {
+                count = count + 1u32;
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_DROP || tk == MIR_TERM_CALL || tk == MIR_TERM_ASSERT {
+                count = count + 1u32;
+            }
+        }
+        b = b + 1;
+    }
+    count
+}
+
+// Verify MIR structural & capability postconditions (CFG well-formedness, valid branch targets,
+// local bounds, and no `MIR_VIEW_READ -> MIR_VIEW_MUT` capability promotion).
+pub fn pct_verify_mir_body_invariants(
+    body: view<MirBody>,
+    out_capability_violation: mut_view<bool>
+) -> bool {
+    *out_capability_violation = false;
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        if !(unsafe { (*bb).has_terminator }) {
+            return false;
+        }
+        let tk = unsafe { (*bb).terminator.kind };
+        if tk == MIR_TERM_GOTO {
+            if (unsafe { (*bb).terminator.goto_target.v } as usize) >= body.bb_count {
+                return false;
+            }
+        } else if tk == MIR_TERM_SWITCH_INT {
+            if (unsafe { (*bb).terminator.otherwise.v } as usize) >= body.bb_count {
+                return false;
+            }
+            let sw_cnt = unsafe { (*bb).terminator.switch_count };
+            let targets = unsafe { (*bb).terminator.targets };
+            let mut ti: usize = 0;
+            while ti < sw_cnt {
+                let tgt = unsafe { (*mir_bb_id_at(targets, ti)).v } as usize;
+                if tgt >= body.bb_count {
+                    return false;
+                }
+                ti = ti + 1;
+            }
+        } else if tk == MIR_TERM_DROP {
+            if (unsafe { (*bb).terminator.drop_target.v } as usize) >= body.bb_count {
+                return false;
+            }
+        } else if tk == MIR_TERM_CALL {
+            if (unsafe { (*bb).terminator.call_target.v } as usize) >= body.bb_count {
+                return false;
+            }
+        } else if tk == MIR_TERM_ASSERT {
+            if (unsafe { (*bb).terminator.assert_target.v } as usize) >= body.bb_count {
+                return false;
+            }
+        }
+
+        let sc = unsafe { (*bb).stmt_count };
+        let stmts = unsafe { (*bb).stmts };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at(stmts, s) };
+            let lv = (unsafe { (*st).place.local.v }) as usize;
+            if lv >= body.local_count {
+                return false;
+            }
+            // Check capability soundness: immutable local or shared read view promoted to mutable view
+            let decl = unsafe { mir_local_at(body.locals, lv) };
+            let is_mut_local = unsafe { (*decl).mut_flag };
+            if !is_mut_local && (unsafe { (*st).place.view_kind }) == MIR_VIEW_MUT {
+                *out_capability_violation = true;
+                return false;
+            }
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_REF &&
+               (unsafe { (*st).rvalue.borrow_kind }) == MIR_BORROW_MUT {
+                let ref_lv = (unsafe { (*st).rvalue.place.local.v }) as usize;
+                if ref_lv >= body.local_count {
+                    return false;
+                }
+                let ref_decl = unsafe { mir_local_at(body.locals, ref_lv) };
+                if !(unsafe { (*ref_decl).mut_flag }) || (unsafe { (*st).rvalue.place.view_kind }) == MIR_VIEW_READ {
+                    *out_capability_violation = true;
+                    return false;
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    true
+}
+
+// Compute all required analyses in topological order before a pass executes (AXS-PCT-003).
+pub fn pct_engine_ensure_analyses(
+    eng: mut_view<PassContractEngine>,
+    body: view<MirBody>,
+    required_mask: u32
+) {
+    let needed = pct_analysis_expand_required(required_mask);
+    let mut a: u8 = 0u8;
+    while (a as usize) < PCT_ANALYSIS_COUNT {
+        let bit = pct_analysis_bit(a);
+        if (needed & bit) != 0u32 && (eng.valid_analyses & bit) == 0u32 {
+            let dig = pct_compute_mir_analysis_digest(view(*body), a);
+            unsafe { *pct_u64_at(eng.analysis_digests, a as usize) = dig; }
+            eng.valid_analyses = eng.valid_analyses | bit;
+        }
+        a = a + 1u8;
+    }
+}
+
+// Take a transactional checkpoint of `MirBody` + `PassContractEngine` + `ProofStore` before a mutating pass.
+pub fn pct_engine_checkpoint_mir(
+    eng: view<PassContractEngine>,
+    body: view<MirBody>,
+    arena: mut_view<Arena>
+) -> MirBodyCheckpoint {
+    let lcnt = body.local_count;
+    let alloc_l: usize = if lcnt == 0 { 1 } else { lcnt };
+    let locals_cp = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(alloc_l, size_of<MirLocalDecl>()),
+        align_of<MirLocalDecl>()
+    ) as *mut MirLocalDecl;
+    if lcnt > 0 && (body.locals as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(
+                body.locals as *const u8,
+                locals_cp as *mut u8,
+                mir_mul_usize(lcnt, size_of<MirLocalDecl>())
+            );
+        }
+    }
+
+    let bcnt = body.bb_count;
+    let alloc_b: usize = if bcnt == 0 { 1 } else { bcnt };
+    let bbs_cp = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(alloc_b, size_of<MirBb>()),
+        align_of<MirBb>()
+    ) as *mut MirBb;
+    let stmts_cp = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(alloc_b, size_of<*mut MirStmt>()),
+        align_of<*mut MirStmt>()
+    ) as *mut *mut MirStmt;
+
+    let mut b: usize = 0;
+    while b < bcnt {
+        let src_bb = unsafe { mir_bb_at(body.bbs, b) };
+        let dst_bb = unsafe { mir_bb_at(bbs_cp, b) };
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(src_bb as *const u8, dst_bb as *mut u8, size_of<MirBb>());
+        }
+        let sc = unsafe { (*src_bb).stmt_count };
+        if sc > 0 && ((unsafe { (*src_bb).stmts }) as usize) != 0 {
+            let s_arr = arena_alloc_raw(
+                mut_view(*arena),
+                mir_mul_usize(sc, size_of<MirStmt>()),
+                align_of<MirStmt>()
+            ) as *mut MirStmt;
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    (*src_bb).stmts as *const u8,
+                    s_arr as *mut u8,
+                    mir_mul_usize(sc, size_of<MirStmt>())
+                );
+                *pct_ptr_stmt_at(stmts_cp, b) = s_arr;
+            }
+        } else {
+            unsafe { *pct_ptr_stmt_at(stmts_cp, b) = 0 as *mut MirStmt; }
+        }
+        b = b + 1;
+    }
+
+    MirBodyCheckpoint {
+        bb_count: bcnt,
+        local_count: lcnt,
+        drop_flag_count: body.drop_flag_count,
+        locals_copy: locals_cp,
+        bbs_copy: bbs_cp,
+        bb_stmts_copy: stmts_cp,
+        ir_revision: eng.ir_revision,
+        valid_analyses: eng.valid_analyses,
+        active_properties: eng.active_properties,
+        observable_effect_count: eng.observable_effect_count,
+    }
+}
+
+// Roll back `MirBody` and `PassContractEngine` to a prior transactional checkpoint (AXS-PCT-003, AXS-PCT-005).
+// Emits zero user-facing diagnostics.
+pub fn pct_engine_rollback_mir(
+    eng: mut_view<PassContractEngine>,
+    body: mut_view<MirBody>,
+    store: mut_view<ProofStore>,
+    ckpt: view<MirBodyCheckpoint>
+) {
+    body.local_count = ckpt.local_count;
+    body.drop_flag_count = ckpt.drop_flag_count;
+    if ckpt.local_count > 0 && (ckpt.locals_copy as usize) != 0 && (body.locals as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(
+                ckpt.locals_copy as *const u8,
+                body.locals as *mut u8,
+                mir_mul_usize(ckpt.local_count, size_of<MirLocalDecl>())
+            );
+        }
+    }
+    body.bb_count = ckpt.bb_count;
+    let mut b: usize = 0;
+    while b < ckpt.bb_count {
+        let src_bb = unsafe { mir_bb_at(ckpt.bbs_copy, b) };
+        let dst_bb = unsafe { mir_bb_at(body.bbs, b) };
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(src_bb as *const u8, dst_bb as *mut u8, size_of<MirBb>());
+            let s_arr = *pct_ptr_stmt_at(ckpt.bb_stmts_copy, b);
+            if (s_arr as usize) != 0 && (*dst_bb).stmt_count > 0 && ((*dst_bb).stmts as usize) != 0 {
+                ptr_copy_nonoverlapping<u8>(
+                    s_arr as *const u8,
+                    (*dst_bb).stmts as *mut u8,
+                    mir_mul_usize((*dst_bb).stmt_count, size_of<MirStmt>())
+                );
+            }
+        }
+        b = b + 1;
+    }
+
+    eng.ir_revision = ckpt.ir_revision;
+    eng.valid_analyses = ckpt.valid_analyses;
+    eng.active_properties = ckpt.active_properties;
+    eng.observable_effect_count = ckpt.observable_effect_count;
+    store.current_ir_revision = ckpt.ir_revision;
+    eng.pass_rollback_count = eng.pass_rollback_count + 1u32;
+}
+
+// =================================================================================================
+// 7. Diagnostic Reporting & Deterministic Witness Formatting (AXS-PCT-005, AXS-PCT-050..052)
+// =================================================================================================
+
+// Static ASCII table for pass contract diagnostic keys/values (works in both --interp and native)
+const PCT_STR_TABLE: [232]u8 = [
+    // 0..13: "pass_contract" (13)
+    112u8, 97u8, 115u8, 115u8, 95u8, 99u8, 111u8, 110u8, 116u8, 114u8, 97u8, 99u8, 116u8,
+    // 13..18: "stage" (5)
+    115u8, 116u8, 97u8, 103u8, 101u8,
+    // 18..25: "pass_id" (7)
+    112u8, 97u8, 115u8, 115u8, 95u8, 105u8, 100u8,
+    // 25..31: "detail" (6)
+    100u8, 101u8, 116u8, 97u8, 105u8, 108u8,
+    // 31..60: "stale_proof_certificate_used" (28) + pad
+    115u8, 116u8, 97u8, 108u8, 101u8, 95u8, 112u8, 114u8, 111u8, 111u8, 102u8, 95u8, 99u8, 101u8,
+    114u8, 116u8, 105u8, 102u8, 105u8, 99u8, 97u8, 116u8, 101u8, 95u8, 117u8, 115u8, 101u8, 100u8,
+    // 59..86: "unpreserved_analysis_mutated" (28)
+    117u8, 110u8, 112u8, 114u8, 101u8, 115u8, 101u8, 114u8, 118u8, 101u8, 100u8, 95u8, 97u8, 110u8,
+    97u8, 108u8, 121u8, 115u8, 105u8, 115u8, 95u8, 109u8, 117u8, 116u8, 97u8, 116u8, 101u8, 100u8,
+    // 87..110: "postcondition_violated" (22)
+    112u8, 111u8, 115u8, 116u8, 99u8, 111u8, 110u8, 100u8, 105u8, 116u8, 105u8, 111u8, 110u8, 95u8,
+    118u8, 105u8, 111u8, 108u8, 97u8, 116u8, 101u8, 100u8,
+    // 109..138: "capability_promotion_detected" (29)
+    99u8, 97u8, 112u8, 97u8, 98u8, 105u8, 108u8, 105u8, 116u8, 121u8, 95u8, 112u8, 114u8, 111u8,
+    109u8, 111u8, 116u8, 105u8, 111u8, 110u8, 95u8, 100u8, 101u8, 116u8, 101u8, 99u8, 116u8, 101u8, 100u8,
+    // 138..160: "observable_effect_lost" (22)
+    111u8, 98u8, 115u8, 101u8, 114u8, 118u8, 97u8, 98u8, 108u8, 101u8, 95u8, 101u8, 102u8, 102u8,
+    101u8, 99u8, 116u8, 95u8, 108u8, 111u8, 115u8, 116u8,
+    // 160..185: "invalid_contract_or_level" (25)
+    105u8, 110u8, 118u8, 97u8, 108u8, 105u8, 100u8, 95u8, 99u8, 111u8, 110u8, 116u8, 114u8, 97u8,
+    99u8, 116u8, 95u8, 111u8, 114u8, 95u8, 108u8, 101u8, 118u8, 101u8, 108u8,
+    // 185..232: "pass contract verification failed (AXS-PCT-005)" (47)
+    112u8, 97u8, 115u8, 115u8, 32u8, 99u8, 111u8, 110u8, 116u8, 114u8, 97u8, 99u8, 116u8, 32u8,
+    118u8, 101u8, 114u8, 105u8, 102u8, 105u8, 99u8, 97u8, 116u8, 105u8, 111u8, 110u8, 32u8, 102u8,
+    97u8, 105u8, 108u8, 101u8, 100u8, 32u8, 40u8, 65u8, 88u8, 83u8, 45u8, 80u8, 67u8, 84u8,
+    45u8, 48u8, 48u8, 53u8, 41u8,
+];
+
+fn pct_slice_in_arena(arena: mut_view<Arena>, start: usize, count: usize) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), count + 1, 1);
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(dst + i) = PCT_STR_TABLE[start + i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + count) = 0u8; }
+    StrView { ptr: dst as *const u8, len: count }
+}
+
+fn pct_trap_detail_str(arena: mut_view<Arena>, trap_kind: u8) -> StrView {
+    if trap_kind == PCT_TRAP_STALE_PROOF_CONSUMED {
+        return pct_slice_in_arena(arena, 31, 28);
+    }
+    if trap_kind == PCT_TRAP_UNPRESERVED_ANALYSIS {
+        return pct_slice_in_arena(arena, 59, 28);
+    }
+    if trap_kind == PCT_TRAP_POSTCONDITION_VIOLATED {
+        return pct_slice_in_arena(arena, 87, 22);
+    }
+    if trap_kind == PCT_TRAP_CAPABILITY_PROMOTION {
+        return pct_slice_in_arena(arena, 109, 29);
+    }
+    if trap_kind == PCT_TRAP_OBSERVABLE_EFFECT_LOSS {
+        return pct_slice_in_arena(arena, 138, 22);
+    }
+    pct_slice_in_arena(arena, 160, 25)
+}
+
+unsafe fn pct_data_entry_at(base: *mut DiagDataEntry, idx: usize) -> *mut DiagDataEntry {
+    let off = ((idx as isize) * (size_of<DiagDataEntry>() as isize)) as usize;
+    ((base as usize) + off) as *mut DiagDataEntry
+}
+
+// Emit structured internal compiler diagnostic (`AX_ICE_INTERNAL` or `AX_ICE_MIR_VERIFY`)
+// with `data.stage = "pass_contract"`, `data.pass_id`, and `data.detail` (AXS-PCT-005, AXS-PCT-050).
+pub fn pct_emit_contract_trap_diagnostic(
+    sink: mut_view<DiagSink>,
+    pass_id: u16,
+    trap_kind: u8,
+    use_mir_verify_code: bool
+) {
+    let code_v: u32 = if use_mir_verify_code { AX_ICE_MIR_VERIFY } else { AX_ICE_INTERNAL };
+    let msg_sv = pct_slice_in_arena(mut_view(sink.arena), 185, 47);
+    let key_stage = pct_slice_in_arena(mut_view(sink.arena), 13, 5);
+    let val_stage = pct_slice_in_arena(mut_view(sink.arena), 0, 13);
+    let key_pass = pct_slice_in_arena(mut_view(sink.arena), 18, 7);
+    let key_detail = pct_slice_in_arena(mut_view(sink.arena), 25, 6);
+    let val_detail = pct_trap_detail_str(mut_view(sink.arena), trap_kind);
+
+    let entries = arena_alloc_raw(
+        mut_view(sink.arena),
+        mir_mul_usize(3, size_of<DiagDataEntry>()),
+        align_of<DiagDataEntry>()
+    ) as *mut DiagDataEntry;
+
+    unsafe {
+        *pct_data_entry_at(entries, 0) = DiagDataEntry {
+            key: key_stage,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: val_stage,
+                int_val: 0i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *pct_data_entry_at(entries, 1) = DiagDataEntry {
+            key: key_pass,
+            value: DiagDataValue {
+                kind: DiagDataKind.Integer,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: pass_id as i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *pct_data_entry_at(entries, 2) = DiagDataEntry {
+            key: key_detail,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: val_detail,
+                int_val: 0i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+    }
+
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: msg_sv,
+        primary: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: entries,
+        data_count: 3,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
+// Execute post-pass contract verification and transactional commit/rollback/trap decision
+// (AXS-PCT-003..005, AXS-PCT-050):
+//   - Checks contract declaration well-formedness and IR level match.
+//   - If `consumed_cert_id != PCT_PROOF_ID_INVALID`:
+//       * If the certificate was already invalidated (`valid == false` or stale `ir_revision` before the pass),
+//         under `--verify-pass-contracts` traps with `PCT_TRAP_STALE_PROOF_CONSUMED` (`AX_ICE_INTERNAL`).
+//       * If the obligation certainty is `Possible` or `Unknown` (`!certainty_allows_transform`),
+//         rolls back `MirBody` cleanly to `ckpt` and returns `PCT_EXEC_ROLLED_BACK_OBLIGATION` (0 diagnostics!).
+//   - Verifies postconditions (`CfgWellFormed`, `CapabilitySoundness`, `ObservableEffectsPreserved`).
+//   - Under `--verify-pass-contracts`, recomputes every analysis in `contract.preserved_analyses` and
+//     traps with `PCT_TRAP_UNPRESERVED_ANALYSIS` if its digest changed without invalidation.
+pub fn pct_engine_finish_pass(
+    eng: mut_view<PassContractEngine>,
+    contract: view<PassContract>,
+    body: mut_view<MirBody>,
+    store: mut_view<ProofStore>,
+    ckpt: view<MirBodyCheckpoint>,
+    pass_mutated_ir: bool,
+    consumed_cert_id: u32,
+    obligation_certainty: u8,
+    sink: mut_view<DiagSink>
+) -> u8 {
+    eng.pass_run_count = eng.pass_run_count + 1u32;
+
+    // 1. Validate contract declaration and input IR level
+    if !pct_validate_contract_declaration(view(*contract)) {
+        eng.verify_trap_count = eng.verify_trap_count + 1u32;
+        eng.last_trap_kind = PCT_TRAP_INVALID_CONTRACT;
+        eng.last_trap_pass_id = contract.pass_id;
+        pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_INVALID_CONTRACT, false);
+        return PCT_EXEC_ABORTED_VERIFY_TRAP;
+    }
+    if contract.input_level != eng.current_level {
+        eng.verify_trap_count = eng.verify_trap_count + 1u32;
+        eng.last_trap_kind = PCT_TRAP_IR_LEVEL_MISMATCH;
+        eng.last_trap_pass_id = contract.pass_id;
+        pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_IR_LEVEL_MISMATCH, false);
+        return PCT_EXEC_ABORTED_VERIFY_TRAP;
+    }
+
+    // 2. Check consumed ProofCertificate validity (stale / invalidated certificate trap under --verify-pass-contracts)
+    if consumed_cert_id != PCT_PROOF_ID_INVALID {
+        if (consumed_cert_id as usize) >= store.cert_count {
+            eng.verify_trap_count = eng.verify_trap_count + 1u32;
+            eng.last_trap_kind = PCT_TRAP_STALE_PROOF_CONSUMED;
+            eng.last_trap_pass_id = contract.pass_id;
+            pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_STALE_PROOF_CONSUMED, false);
+            return PCT_EXEC_ABORTED_VERIFY_TRAP;
+        }
+        let cp = unsafe { pct_cert_at(store.certs, consumed_cert_id as usize) };
+        let cp_valid = unsafe { (*cp).valid };
+        let cp_rev = unsafe { (*cp).provenance.ir_revision };
+        let cp_srev = unsafe { (*cp).provenance.snapshot_revision };
+        let cp_pmask = unsafe { (*cp).provenance.parent_proof_mask };
+        if !cp_valid || cp_rev != ckpt.ir_revision || cp_srev != store.current_snapshot_revision ||
+           !proof_store_parents_valid(view(*store), cp_pmask) {
+            // Consuming an invalidated/stale ProofCertificate is a contract violation!
+            pct_engine_rollback_mir(mut_view(*eng), mut_view(*body), mut_view(*store), view(*ckpt));
+            if eng.verify_pass_contracts {
+                eng.verify_trap_count = eng.verify_trap_count + 1u32;
+                eng.last_trap_kind = PCT_TRAP_STALE_PROOF_CONSUMED;
+                eng.last_trap_pass_id = contract.pass_id;
+                pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_STALE_PROOF_CONSUMED, false);
+                return PCT_EXEC_ABORTED_VERIFY_TRAP;
+            }
+            return PCT_EXEC_ROLLED_BACK_OBLIGATION;
+        }
+    }
+
+    // 3. Three-valued Certainty fail-closed gate (AXS-PCT-010):
+    // If a required proof obligation evaluates to Possible or Unknown, roll back IR cleanly with 0 diagnostics!
+    if contract.required_propositions != 0u32 && !certainty_allows_transform(obligation_certainty) {
+        pct_engine_rollback_mir(mut_view(*eng), mut_view(*body), mut_view(*store), view(*ckpt));
+        return PCT_EXEC_ROLLED_BACK_OBLIGATION;
+    }
+
+    // 4. Verify preserved_analyses before invalidating non-preserved analyses (AXS-PCT-003, AXS-PCT-050)
+    if eng.verify_pass_contracts && pass_mutated_ir {
+        let mut a: u8 = 0u8;
+        while (a as usize) < PCT_ANALYSIS_COUNT {
+            let bit = pct_analysis_bit(a);
+            if (contract.preserved_analyses & bit) != 0u32 && (ckpt.valid_analyses & bit) != 0u32 {
+                let old_dig = unsafe { *pct_u64_at(eng.analysis_digests, a as usize) };
+                let new_dig = pct_compute_mir_analysis_digest(view(*body), a);
+                if old_dig != new_dig {
+                    pct_engine_rollback_mir(mut_view(*eng), mut_view(*body), mut_view(*store), view(*ckpt));
+                    eng.verify_trap_count = eng.verify_trap_count + 1u32;
+                    eng.last_trap_kind = PCT_TRAP_UNPRESERVED_ANALYSIS;
+                    eng.last_trap_pass_id = contract.pass_id;
+                    pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_UNPRESERVED_ANALYSIS, false);
+                    return PCT_EXEC_ABORTED_VERIFY_TRAP;
+                }
+            }
+            a = a + 1u8;
+        }
+    }
+
+    // 5. Verify structural & semantic postconditions (CFG well-formed, CapabilitySoundness, ObservableEffectsPreserved)
+    let mut cap_violation = false;
+    let mir_ok = pct_verify_mir_body_invariants(view(*body), mut_view(cap_violation));
+    if !mir_ok {
+        let trap_k: u8 = if cap_violation { PCT_TRAP_CAPABILITY_PROMOTION } else { PCT_TRAP_POSTCONDITION_VIOLATED };
+        pct_engine_rollback_mir(mut_view(*eng), mut_view(*body), mut_view(*store), view(*ckpt));
+        if eng.verify_pass_contracts || contract.failure_policy == FAILURE_POLICY_ABORT_COMPILER {
+            eng.verify_trap_count = eng.verify_trap_count + 1u32;
+            eng.last_trap_kind = trap_k;
+            eng.last_trap_pass_id = contract.pass_id;
+            pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, trap_k, true);
+            return PCT_EXEC_ABORTED_VERIFY_TRAP;
+        }
+        return PCT_EXEC_ROLLED_BACK_POSTCOND;
+    }
+
+    if (contract.postconditions & SEM_PROP_OBSERVABLE_EFFECTS_PRESERVED) != 0u32 {
+        let cur_eff = pct_count_mir_observable_effects(view(*body));
+        if cur_eff < ckpt.observable_effect_count {
+            pct_engine_rollback_mir(mut_view(*eng), mut_view(*body), mut_view(*store), view(*ckpt));
+            if eng.verify_pass_contracts || contract.failure_policy == FAILURE_POLICY_ABORT_COMPILER {
+                eng.verify_trap_count = eng.verify_trap_count + 1u32;
+                eng.last_trap_kind = PCT_TRAP_OBSERVABLE_EFFECT_LOSS;
+                eng.last_trap_pass_id = contract.pass_id;
+                pct_emit_contract_trap_diagnostic(mut_view(*sink), contract.pass_id, PCT_TRAP_OBSERVABLE_EFFECT_LOSS, true);
+                return PCT_EXEC_ABORTED_VERIFY_TRAP;
+            }
+            return PCT_EXEC_ROLLED_BACK_POSTCOND;
+        }
+        eng.observable_effect_count = cur_eff;
+    }
+
+    // 6. Commit pass: advance IR revision if mutated, invalidate non-preserved analyses & derived proofs
+    eng.current_level = contract.output_level;
+    if pass_mutated_ir {
+        let inv_mask = pct_analysis_expand_invalidated(contract.invalidated_analyses);
+        eng.valid_analyses = (eng.valid_analyses & contract.preserved_analyses) & (PCT_MASK_ALL_ANALYSES ^ inv_mask);
+        proof_store_notify_ir_mutation(mut_view(*store), 0xFFFFFFFFu32, inv_mask);
+        eng.ir_revision = store.current_ir_revision;
+    }
+    if contract.produced_analyses != 0u32 {
+        pct_engine_ensure_analyses(mut_view(*eng), view(*body), contract.produced_analyses);
+    }
+    eng.active_properties = (eng.active_properties & contract.preserved_properties) | contract.postconditions;
+    eng.pass_commit_count = eng.pass_commit_count + 1u32;
+    PCT_EXEC_COMMITTED
+}
+
+// Format a deterministic machine-readable witness summary into `DiagBuffer`
+// (`axiom inspect --emit=pass-witness`, SPEC-25 Section 8.2 / AXS-PCT-051).
+pub fn pct_format_witness_summary(
+    eng: view<PassContractEngine>,
+    store: view<ProofStore>,
+    buf: mut_view<DiagBuffer>
+) {
+    // "pct_witness: rev="
+    diag_buf_push_byte(mut_view(*buf), 114u8); // 'r'
+    diag_buf_push_byte(mut_view(*buf), 101u8); // 'e'
+    diag_buf_push_byte(mut_view(*buf), 118u8); // 'v'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), eng.ir_revision);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    // "commits="
+    diag_buf_push_byte(mut_view(*buf), 99u8);  // 'c'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), eng.pass_commit_count);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    // "rollbacks="
+    diag_buf_push_byte(mut_view(*buf), 114u8); // 'r'
+    diag_buf_push_byte(mut_view(*buf), 98u8);  // 'b'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), eng.pass_rollback_count);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    // "traps="
+    diag_buf_push_byte(mut_view(*buf), 116u8); // 't'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), eng.verify_trap_count);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    // "proofs="
+    diag_buf_push_byte(mut_view(*buf), 112u8); // 'p'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), store.cert_count as u32);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    // "audits="
+    diag_buf_push_byte(mut_view(*buf), 97u8);  // 'a'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), store.audit_count as u32);
+}
