@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T622]
 priority: 117
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p15/e15_6_lto_pgo_gc]
 spec: [spec/SPEC-75-lto-wpo-section-gc-pgo.md, tasks/0355, tasks/0408, tasks/0409, tasks/0410]
 covers: [REQ-OPT-246, REQ-OPT-247, REQ-OPT-248, REQ-OPT-249, REQ-OPT-250]
 started: 2026-11-08 03:24:43
-agent: T623-impl
+finished: 2026-11-08 04:31:54
 ---
 # T623 — E15.6 — LTO, whole-program optimization, section GC & PGO conformance suite
 
@@ -43,3 +43,4 @@ Certify E15.6 exit criteria with an end-to-end differential conformance suite co
 ## Log
 - 2026-11-03 02:43:00 created by T215 (P15 phase planning)
 - 2026-11-08 03:24:43 started (attempt 1) T623-impl
+- 2026-11-08 04:31:54 accepted by QA -> done
