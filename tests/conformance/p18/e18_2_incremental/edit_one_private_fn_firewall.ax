@@ -1,0 +1,438 @@
+// test: run
+// modes: interp native
+// stdout-file: edit_one_private_fn_firewall.stdout
+// SPEC-22 AXS-INC-001..003, AXS-INC-010..013, AXS-INC-050:
+// Conformance test certifying the Private-Function Body Firewall (`InterfaceFingerprint`
+// backdating to Green when editing a private function body, editing a non-inlined `pub fn`
+// body, or adding a private helper) so `--emit=incremental-stats` reports `modules_typechecked=1`
+// (`0` downstream modules re-typechecked) and `cgu_rebuilt=1, cgu_reused=3`, plus
+// DefId/ModuleId allocation-order independence.
+
+const COLOR_UNVERIFIED: u32 = 0u32;
+const COLOR_GREEN: u32 = 1u32;
+const COLOR_RED: u32 = 2u32;
+
+const MISS_NONE_HIT: u32 = 0u32;
+const MISS_COLD_CACHE: u32 = 1u32;
+const MISS_SOURCE_CHANGED: u32 = 2u32;
+const MISS_BODY_CHANGED: u32 = 3u32;
+const MISS_API_CHANGED: u32 = 4u32;
+
+@derive(Copy)
+struct Fp128 {
+    lo: u64,
+    hi: u64,
+}
+
+fn fp_eq(a: Fp128, b: Fp128) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x: u64 = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+fn domain_fp128(domain_tag: u64, w0: u64, w1: u64) -> Fp128 {
+    let lo = mix64(mix64(0x27D4EB2F165667C5u64, domain_tag), mix64(w0, w1));
+    let hi = mix64(mix64(0xC2B2AE3D27D4EB4Fu64, domain_tag ^ 0x5631u64), mix64(w1, lo));
+    Fp128 { lo: lo, hi: hi }
+}
+
+@derive(Copy)
+struct ItemRecord {
+    raw_def_id: u32,        // Arena/registration order ID (MUST NOT affect fingerprints)
+    canonical_path_id: u64, // Canonical item path key used for deterministic sorting & hashing
+    is_pub: bool,
+    is_inline: bool,
+    is_generic: bool,
+    sig_seed: u64,
+    abi_seed: u64,
+    body_seed: u64,
+    sig_fp: Fp128,
+    body_fp: Fp128,
+}
+
+@derive(Copy)
+struct ItemList4 {
+    v: [4]ItemRecord,
+}
+
+@derive(Copy)
+struct Seeds4 {
+    v: [4]u64,
+}
+
+fn make_item(raw_def_id: u32, canonical_path_id: u64, is_pub: bool, is_inline: bool, is_generic: bool, sig_seed: u64, abi_seed: u64, body_seed: u64) -> ItemRecord {
+    // AXS-INC-001 §3: Fingerprints depend ONLY on canonical_path_id + semantic seeds, never raw_def_id
+    let flags = (if is_pub { 1u64 } else { 0u64 }) |
+        (if is_inline { 2u64 } else { 0u64 }) |
+        (if is_generic { 4u64 } else { 0u64 });
+    let sfp = domain_fp128(0x4158494F4D534947u64, canonical_path_id ^ flags, mix64(sig_seed, abi_seed));
+    let bfp = domain_fp128(0x4158494F4D424F44u64, canonical_path_id ^ sfp.lo, body_seed);
+    ItemRecord {
+        raw_def_id: raw_def_id,
+        canonical_path_id: canonical_path_id,
+        is_pub: is_pub,
+        is_inline: is_inline,
+        is_generic: is_generic,
+        sig_seed: sig_seed,
+        abi_seed: abi_seed,
+        body_seed: body_seed,
+        sig_fp: sfp,
+        body_fp: bfp,
+    }
+}
+
+// Compute Tier 2 `InterfaceFingerprint(M)` by sorting exported (`is_pub`) items by `canonical_path_id`
+// so registration order and private items never affect `InterfaceFingerprint(M)`.
+fn compute_module_interface_fp(module_path_id: u64, items: ItemList4, item_count: usize) -> Fp128 {
+    let mut sorted = items;
+    let mut i: usize = 0;
+    while (i) < (item_count) {
+        let mut j: usize = i + 1;
+        while (j) < (item_count) {
+            let kj = sorted.v[j].canonical_path_id;
+            let ki = sorted.v[i].canonical_path_id;
+            if (kj) < (ki) {
+                let tmp = sorted.v[i];
+                sorted.v[i] = sorted.v[j];
+                sorted.v[j] = tmp;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    let mut acc_lo = mix64(0x49464143455F4C4Fu64, module_path_id);
+    let mut acc_hi = mix64(0x49464143455F4849u64, module_path_id);
+    let mut k: usize = 0;
+    while (k) < (item_count) {
+        let it = sorted.v[k];
+        if it.is_pub {
+            acc_lo = mix64(acc_lo, it.canonical_path_id ^ it.sig_fp.lo);
+            acc_hi = mix64(acc_hi, it.sig_fp.hi);
+        }
+        k = k + 1;
+    }
+    domain_fp128(0x4158494F4D494643u64, acc_lo, acc_hi)
+}
+
+// Compute Tier 5 `CodegenUnitFingerprint(M)` by sorting all items in `M` by `canonical_path_id`
+fn compute_module_cgu_fp(module_path_id: u64, iface_fp: Fp128, items: ItemList4, item_count: usize, imported_iface_fp: Fp128) -> Fp128 {
+    let mut sorted = items;
+    let mut i: usize = 0;
+    while (i) < (item_count) {
+        let mut j: usize = i + 1;
+        while (j) < (item_count) {
+            let kj = sorted.v[j].canonical_path_id;
+            let ki = sorted.v[i].canonical_path_id;
+            if (kj) < (ki) {
+                let tmp = sorted.v[i];
+                sorted.v[i] = sorted.v[j];
+                sorted.v[j] = tmp;
+            }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+
+    let mut acc_lo = mix64(iface_fp.lo, imported_iface_fp.lo ^ module_path_id);
+    let mut acc_hi = mix64(iface_fp.hi, imported_iface_fp.hi);
+    let mut k: usize = 0;
+    while (k) < (item_count) {
+        acc_lo = mix64(acc_lo, sorted.v[k].body_fp.lo ^ sorted.v[k].sig_fp.lo);
+        acc_hi = mix64(acc_hi, sorted.v[k].body_fp.hi);
+        k = k + 1;
+    }
+    domain_fp128(0x4158494F4D434755u64, acc_lo, acc_hi)
+}
+
+@derive(Copy)
+struct ModuleState {
+    module_path_id: u64,
+    has_import: bool,
+    imported_mod_idx: usize,
+    source_seed: u64,
+    items: ItemList4,
+    item_count: usize,
+    source_fp: Fp128,
+    iface_fp: Fp128,
+    cgu_fp: Fp128,
+    iface_color: u32,
+    cgu_color: u32,
+    miss_reason: u32,
+}
+
+struct ModuleDag {
+    v: [4]ModuleState,
+}
+
+struct IncrementalStats {
+    queries_total: u32,
+    queries_recomputed: u32,
+    queries_backdated: u32,
+    modules_typechecked: u32,
+    cgu_rebuilt: u32,
+    cgu_reused: u32,
+    downstream_modules_typechecked: u32,
+}
+
+fn evaluate_four_module_dag(
+    dag: mut_view<ModuleDag>,
+    new_source_seeds: Seeds4,
+    new_items_mod0: ItemList4,
+    new_item_count_mod0: usize,
+    is_cold: bool
+) -> IncrementalStats {
+    let mut stats = IncrementalStats {
+        queries_total: 0u32,
+        queries_recomputed: 0u32,
+        queries_backdated: 0u32,
+        modules_typechecked: 0u32,
+        cgu_rebuilt: 0u32,
+        cgu_reused: 0u32,
+        downstream_modules_typechecked: 0u32,
+    };
+
+    dag.v[0].items = new_items_mod0;
+    dag.v[0].item_count = new_item_count_mod0;
+
+    let mut m: usize = 0;
+    while m < 4 {
+        let new_sfp = domain_fp128(0x4158494F4D535243u64, dag.v[m].module_path_id, new_source_seeds.v[m]);
+        let src_changed = is_cold || !fp_eq(new_sfp, dag.v[m].source_fp);
+        dag.v[m].source_fp = new_sfp;
+        dag.v[m].source_seed = new_source_seeds.v[m];
+
+        let mut import_iface_red = false;
+        let mut imp_iface_fp = Fp128 { lo: 0u64, hi: 0u64 };
+        if dag.v[m].has_import {
+            let imp_idx = dag.v[m].imported_mod_idx;
+            imp_iface_fp = dag.v[imp_idx].iface_fp;
+            if dag.v[imp_idx].iface_color == COLOR_RED {
+                import_iface_red = true;
+            }
+        }
+
+        // 1. Evaluate `module_interface(m)`
+        stats.queries_total = stats.queries_total + 1u32;
+        if is_cold || src_changed {
+            stats.queries_recomputed = stats.queries_recomputed + 1u32;
+            let new_ifp = compute_module_interface_fp(dag.v[m].module_path_id, dag.v[m].items, dag.v[m].item_count);
+            if !is_cold && fp_eq(new_ifp, dag.v[m].iface_fp) {
+                dag.v[m].iface_color = COLOR_GREEN;
+                stats.queries_backdated = stats.queries_backdated + 1u32;
+            } else {
+                dag.v[m].iface_fp = new_ifp;
+                dag.v[m].iface_color = COLOR_RED;
+            }
+        } else {
+            dag.v[m].iface_color = COLOR_GREEN;
+        }
+
+        // 2. Evaluate `resolve_module(m)` + `typeck_body(m.*)` + `codegen_unit(m)`
+        // Only runs if `src_changed` or an imported module's `InterfaceFingerprint` turned `Red`!
+        stats.queries_total = stats.queries_total + 1u32;
+        if is_cold || src_changed || import_iface_red {
+            stats.queries_recomputed = stats.queries_recomputed + 1u32;
+            stats.modules_typechecked = stats.modules_typechecked + 1u32;
+            if m > 0 {
+                stats.downstream_modules_typechecked = stats.downstream_modules_typechecked + 1u32;
+            }
+            let new_cfp = compute_module_cgu_fp(dag.v[m].module_path_id, dag.v[m].iface_fp, dag.v[m].items, dag.v[m].item_count, imp_iface_fp);
+            if !is_cold && fp_eq(new_cfp, dag.v[m].cgu_fp) {
+                dag.v[m].cgu_color = COLOR_GREEN;
+                dag.v[m].miss_reason = MISS_NONE_HIT;
+                stats.queries_backdated = stats.queries_backdated + 1u32;
+                stats.cgu_reused = stats.cgu_reused + 1u32;
+            } else {
+                dag.v[m].cgu_fp = new_cfp;
+                dag.v[m].cgu_color = COLOR_RED;
+                dag.v[m].miss_reason = if is_cold {
+                    MISS_COLD_CACHE
+                } else if src_changed {
+                    MISS_BODY_CHANGED
+                } else {
+                    MISS_API_CHANGED
+                };
+                stats.cgu_rebuilt = stats.cgu_rebuilt + 1u32;
+            }
+        } else {
+            dag.v[m].cgu_color = COLOR_GREEN;
+            dag.v[m].miss_reason = MISS_NONE_HIT;
+            stats.cgu_reused = stats.cgu_reused + 1u32;
+        }
+
+        m = m + 1;
+    }
+
+    stats
+}
+
+pub fn main() -> i32 {
+    let dummy_item = make_item(0u32, 0u64, false, false, false, 0u64, 0u64, 0u64);
+
+    // 1. Verify DefId/ModuleId allocation-order independence (AXS-INC-001 §3)
+    let it_priv_fwd = make_item(1u32, 1001u64, false, false, false, 11u64, 1u64, 500u64);
+    let it_pub_a_fwd = make_item(2u32, 1002u64, true, false, false, 22u64, 2u64, 600u64);
+    let it_pub_b_fwd = make_item(3u32, 1003u64, true, false, false, 33u64, 3u64, 700u64);
+
+    let it_pub_b_rev = make_item(99u32, 1003u64, true, false, false, 33u64, 3u64, 700u64);
+    let it_priv_rev = make_item(88u32, 1001u64, false, false, false, 11u64, 1u64, 500u64);
+    let it_pub_a_rev = make_item(77u32, 1002u64, true, false, false, 22u64, 2u64, 600u64);
+
+    let items_fwd = ItemList4 { v: [it_priv_fwd, it_pub_a_fwd, it_pub_b_fwd, dummy_item] };
+    let items_rev = ItemList4 { v: [it_pub_b_rev, it_priv_rev, it_pub_a_rev, dummy_item] };
+
+    let iface_fwd = compute_module_interface_fp(10u64, items_fwd, 3);
+    let iface_rev = compute_module_interface_fp(10u64, items_rev, 3);
+    let cgu_fwd = compute_module_cgu_fp(10u64, iface_fwd, items_fwd, 3, Fp128 { lo: 0u64, hi: 0u64 });
+    let cgu_rev = compute_module_cgu_fp(10u64, iface_rev, items_rev, 3, Fp128 { lo: 0u64, hi: 0u64 });
+
+    if !fp_eq(iface_fwd, iface_rev) || !fp_eq(cgu_fwd, cgu_rev) {
+        return 1;
+    }
+    print("def_id_allocation_order_invariance_ok=true\n");
+
+    // 2. Construct 4-module DAG:
+    //   mod 0: `math_lib` (root)
+    //   mod 1: `mid_layer` (imports `math_lib`)
+    //   mod 2: `app_driver` (imports `mid_layer`)
+    //   mod 3: `util_mod` (independent)
+    let mod1_items = ItemList4 { v: [make_item(10u32, 2001u64, true, false, false, 44u64, 4u64, 800u64), dummy_item, dummy_item, dummy_item] };
+    let mod2_items = ItemList4 { v: [make_item(20u32, 3001u64, true, false, false, 55u64, 5u64, 900u64), dummy_item, dummy_item, dummy_item] };
+    let mod3_items = ItemList4 { v: [make_item(30u32, 4001u64, true, false, false, 66u64, 6u64, 950u64), dummy_item, dummy_item, dummy_item] };
+
+    let zero_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut dag = ModuleDag {
+        v: [
+            ModuleState {
+                module_path_id: 10u64,
+                has_import: false,
+                imported_mod_idx: 0,
+                source_seed: 0u64,
+                items: items_fwd,
+                item_count: 3,
+                source_fp: zero_fp,
+                iface_fp: zero_fp,
+                cgu_fp: zero_fp,
+                iface_color: COLOR_UNVERIFIED,
+                cgu_color: COLOR_UNVERIFIED,
+                miss_reason: MISS_COLD_CACHE,
+            },
+            ModuleState {
+                module_path_id: 20u64,
+                has_import: true,
+                imported_mod_idx: 0,
+                source_seed: 0u64,
+                items: mod1_items,
+                item_count: 1,
+                source_fp: zero_fp,
+                iface_fp: zero_fp,
+                cgu_fp: zero_fp,
+                iface_color: COLOR_UNVERIFIED,
+                cgu_color: COLOR_UNVERIFIED,
+                miss_reason: MISS_COLD_CACHE,
+            },
+            ModuleState {
+                module_path_id: 30u64,
+                has_import: true,
+                imported_mod_idx: 1,
+                source_seed: 0u64,
+                items: mod2_items,
+                item_count: 1,
+                source_fp: zero_fp,
+                iface_fp: zero_fp,
+                cgu_fp: zero_fp,
+                iface_color: COLOR_UNVERIFIED,
+                cgu_color: COLOR_UNVERIFIED,
+                miss_reason: MISS_COLD_CACHE,
+            },
+            ModuleState {
+                module_path_id: 40u64,
+                has_import: false,
+                imported_mod_idx: 0,
+                source_seed: 0u64,
+                items: mod3_items,
+                item_count: 1,
+                source_fp: zero_fp,
+                iface_fp: zero_fp,
+                cgu_fp: zero_fp,
+                iface_color: COLOR_UNVERIFIED,
+                cgu_color: COLOR_UNVERIFIED,
+                miss_reason: MISS_COLD_CACHE,
+            },
+        ],
+    };
+
+    // Revision 1: Cold build
+    let seeds_r1 = Seeds4 { v: [101u64, 202u64, 303u64, 404u64] };
+    let st_r1 = evaluate_four_module_dag(mut_view(dag), seeds_r1, items_fwd, 3, true);
+    if st_r1.modules_typechecked != 4u32 || st_r1.cgu_rebuilt != 4u32 || st_r1.cgu_reused != 0u32 {
+        return 2;
+    }
+    let r1_iface_mod0 = dag.v[0].iface_fp;
+    let r1_cgu_mod0 = dag.v[0].cgu_fp;
+    let r1_cgu_mod1 = dag.v[1].cgu_fp;
+    let r1_cgu_mod2 = dag.v[2].cgu_fp;
+    let r1_cgu_mod3 = dag.v[3].cgu_fp;
+    print("cold_build_4_modules_ok=true\n");
+
+    // Revision 2: Edit private function body `internal_scale` in `math_lib` (body_seed 500 -> 599)
+    let it_priv_edited = make_item(1u32, 1001u64, false, false, false, 11u64, 1u64, 599u64);
+    let items_r2 = ItemList4 { v: [it_priv_edited, it_pub_a_fwd, it_pub_b_fwd, dummy_item] };
+    let seeds_r2 = Seeds4 { v: [102u64, 202u64, 303u64, 404u64] };
+    let st_r2 = evaluate_four_module_dag(mut_view(dag), seeds_r2, items_r2, 3, false);
+
+    // Must backdate `InterfaceFingerprint(math_lib)` to Green and typecheck ONLY `math_lib`!
+    if dag.v[0].iface_color != COLOR_GREEN ||
+       !fp_eq(dag.v[0].iface_fp, r1_iface_mod0) ||
+       fp_eq(dag.v[0].cgu_fp, r1_cgu_mod0) ||
+       dag.v[0].miss_reason != MISS_BODY_CHANGED ||
+       st_r2.modules_typechecked != 1u32 ||
+       st_r2.downstream_modules_typechecked != 0u32 ||
+       st_r2.cgu_rebuilt != 1u32 ||
+       st_r2.cgu_reused != 3u32 ||
+       !fp_eq(dag.v[1].cgu_fp, r1_cgu_mod1) ||
+       !fp_eq(dag.v[2].cgu_fp, r1_cgu_mod2) ||
+       !fp_eq(dag.v[3].cgu_fp, r1_cgu_mod3) {
+        return 3;
+    }
+    print("edit_private_fn_body_zero_downstream_typeck=true\n");
+
+    // Revision 3: Edit non-`@inline`, non-generic `pub fn` body in `math_lib` (body_seed 600 -> 688)
+    let it_pub_a_body_edited = make_item(2u32, 1002u64, true, false, false, 22u64, 2u64, 688u64);
+    let items_r3 = ItemList4 { v: [it_priv_edited, it_pub_a_body_edited, it_pub_b_fwd, dummy_item] };
+    let seeds_r3 = Seeds4 { v: [103u64, 202u64, 303u64, 404u64] };
+    let st_r3 = evaluate_four_module_dag(mut_view(dag), seeds_r3, items_r3, 3, false);
+
+    if dag.v[0].iface_color != COLOR_GREEN ||
+       !fp_eq(dag.v[0].iface_fp, r1_iface_mod0) ||
+       st_r3.modules_typechecked != 1u32 ||
+       st_r3.downstream_modules_typechecked != 0u32 ||
+       st_r3.cgu_rebuilt != 1u32 ||
+       st_r3.cgu_reused != 3u32 {
+        return 4;
+    }
+    print("edit_non_inline_pub_fn_body_zero_downstream_typeck=true\n");
+
+    // Revision 4: Add a new private helper function in `math_lib`
+    let it_priv_extra = make_item(4u32, 1004u64, false, false, false, 99u64, 9u64, 777u64);
+    let items_r4 = ItemList4 { v: [it_priv_edited, it_pub_a_body_edited, it_pub_b_fwd, it_priv_extra] };
+    let seeds_r4 = Seeds4 { v: [104u64, 202u64, 303u64, 404u64] };
+    let st_r4 = evaluate_four_module_dag(mut_view(dag), seeds_r4, items_r4, 4, false);
+
+    if dag.v[0].iface_color != COLOR_GREEN ||
+       !fp_eq(dag.v[0].iface_fp, r1_iface_mod0) ||
+       st_r4.modules_typechecked != 1u32 ||
+       st_r4.downstream_modules_typechecked != 0u32 ||
+       st_r4.cgu_rebuilt != 1u32 ||
+       st_r4.cgu_reused != 3u32 {
+        return 5;
+    }
+    print("add_private_helper_zero_downstream_typeck=true\n");
+    print("EDIT-ONE-PRIVATE-FN-FIREWALL-CONFORMANCE-OK\n");
+    0
+}

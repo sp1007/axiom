@@ -1,0 +1,630 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use host_intrinsics.arg
+use host_intrinsics.args_count
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.query.db.DefId
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.SourceFileId
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.semantic_key_new
+use compiler.incremental.fingerprint.inc_add_item_call_dep
+use compiler.incremental.fingerprint.inc_add_item_const_dep
+use compiler.incremental.fingerprint.inc_add_item_layout_dep
+use compiler.incremental.fingerprint.inc_add_module_import
+use compiler.incremental.fingerprint.inc_register_item
+use compiler.incremental.fingerprint.inc_set_item_error_flag
+use compiler.incremental.cache.ARTIFACT_KIND_EXE
+use compiler.incremental.cache.AXIC_HEADER_BYTES
+use compiler.incremental.cache.AXIC_SCHEMA_VERSION
+use compiler.incremental.cache.AX_INC_CACHE_CORRUPT
+use compiler.incremental.cache.CACHED_DIAG_WARNING
+use compiler.incremental.cache.CACHE_EVICT_CORRUPT_CHECKSUM
+use compiler.incremental.cache.CACHE_EVICT_NONE
+use compiler.incremental.cache.CACHE_EVICT_SCHEMA_MISMATCH
+use compiler.incremental.cache.CACHE_EVICT_TRUNCATED
+use compiler.incremental.cache.IncrementalCache
+use compiler.incremental.cache.NOOP_FASTPATH_BUDGET_NS
+use compiler.incremental.cache.PANIC_STRATEGY_UNWIND
+use compiler.incremental.cache.SAFETY_PROFILE_STANDARD
+use compiler.incremental.cache.inc_cache_attach_diag
+use compiler.incremental.cache.inc_cache_build_clean_no_incremental
+use compiler.incremental.cache.inc_cache_build_workspace
+use compiler.incremental.cache.inc_cache_deserialize
+use compiler.incremental.cache.inc_cache_empty
+use compiler.incremental.cache.inc_cache_free
+use compiler.incremental.cache.inc_cache_get_cgu
+use compiler.incremental.cache.inc_cache_init
+use compiler.incremental.cache.inc_cache_inspect_dump
+use compiler.incremental.cache.inc_cache_load_from_disk
+use compiler.incremental.cache.inc_cache_register_module
+use compiler.incremental.cache.inc_cache_save_to_disk
+use compiler.incremental.cache.inc_cache_serialize
+use compiler.incremental.cache.inc_cache_set_action_config
+use compiler.incremental.cache.inc_cache_touch_source_mtime
+use compiler.incremental.cache.inc_cache_update_module_source
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn bytes_eq(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    if a_len == 0 {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if unsafe { *(a + i) } != unsafe { *(b + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn populate_four_module_workspace(
+    cache: mut_view<IncrementalCache>,
+    str_arena: mut_view<Arena>,
+    math_src: StrView
+) {
+    let comp_dig = fingerprint128_new(0x4158494F4D43325Fu64, 0x323032365F453138u64);
+    let man_dig = fingerprint128_new(0x4D414E4946455354u64, 0x0000000000000001u64);
+    let triple = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let abi_prof = probe_sv(mut_view(*str_arena), "win64");
+
+    inc_cache_set_action_config(
+        mut_view(*cache),
+        comp_dig,
+        triple,
+        abi_prof,
+        0u32,
+        2u8,
+        SAFETY_PROFILE_STANDARD,
+        PANIC_STRATEGY_UNWIND,
+        ARTIFACT_KIND_EXE,
+        man_dig
+    );
+
+    let pkg = probe_sv(mut_view(*str_arena), "axiomc");
+    let m_math = probe_sv(mut_view(*str_arena), "math_lib");
+    let m_mid = probe_sv(mut_view(*str_arena), "mid_layer");
+    let m_app = probe_sv(mut_view(*str_arena), "app_driver");
+    let m_util = probe_sv(mut_view(*str_arena), "util_mod");
+
+    let p_math = probe_sv(mut_view(*str_arena), "compiler/math_lib/mod.ax");
+    let p_mid = probe_sv(mut_view(*str_arena), "compiler/mid_layer/mod.ax");
+    let p_app = probe_sv(mut_view(*str_arena), "compiler/app_driver/mod.ax");
+    let p_util = probe_sv(mut_view(*str_arena), "compiler/util_mod/mod.ax");
+
+    let src_mid = probe_sv(
+        mut_view(*str_arena),
+        "fn pack_header(x: i32) -> i32 { x + 1 }\npub fn run_mid(x: i32) -> i32 { pack_header(x) + compute_metric(x) + fast_step(x) + transform(x) }\n"
+    );
+    let src_app = probe_sv(
+        mut_view(*str_arena),
+        "pub fn run_app(x: i32) -> i32 { run_mid(x) + 10 }\n"
+    );
+    let src_util = probe_sv(
+        mut_view(*str_arena),
+        "pub fn util_id(x: i32) -> i32 { x * 2 }\n"
+    );
+
+    let mod_math = ModuleId { v: 1u32 };
+    let mod_mid = ModuleId { v: 2u32 };
+    let mod_app = ModuleId { v: 3u32 };
+    let mod_util = ModuleId { v: 4u32 };
+
+    inc_cache_register_module(mut_view(*cache), mod_math, PackageId { v: 1u32 }, pkg, m_math, SourceFileId { v: 1u32 }, p_math, math_src, 1000u64);
+    inc_cache_register_module(mut_view(*cache), mod_mid, PackageId { v: 1u32 }, pkg, m_mid, SourceFileId { v: 2u32 }, p_mid, src_mid, 1000u64);
+    inc_cache_register_module(mut_view(*cache), mod_app, PackageId { v: 1u32 }, pkg, m_app, SourceFileId { v: 3u32 }, p_app, src_app, 1000u64);
+    inc_cache_register_module(mut_view(*cache), mod_util, PackageId { v: 1u32 }, pkg, m_util, SourceFileId { v: 4u32 }, p_util, src_util, 1000u64);
+
+    inc_add_module_import(mut_view(cache.eng), mod_mid, mod_math);
+    inc_add_module_import(mut_view(cache.eng), mod_app, mod_mid);
+
+    let empty = probe_sv(mut_view(*str_arena), "");
+    let n_limit = probe_sv(mut_view(*str_arena), "LIMIT");
+    let n_hdr = probe_sv(mut_view(*str_arena), "MetricHeader");
+    let n_scale = probe_sv(mut_view(*str_arena), "internal_scale");
+    let n_fast = probe_sv(mut_view(*str_arena), "fast_step");
+    let n_trans = probe_sv(mut_view(*str_arena), "transform");
+    let n_metric = probe_sv(mut_view(*str_arena), "compute_metric");
+    let n_pack = probe_sv(mut_view(*str_arena), "pack_header");
+    let n_mid = probe_sv(mut_view(*str_arena), "run_mid");
+    let n_app = probe_sv(mut_view(*str_arena), "run_app");
+    let n_util = probe_sv(mut_view(*str_arena), "util_id");
+
+    // Items in `math_lib`:
+    let d_limit = inc_register_item(mut_view(cache.eng), DefId { v: 10u32 }, mod_math, ITEM_KIND_CONST, true, false, false, 0u32, 1u32, n_limit, empty);
+    let d_hdr = inc_register_item(mut_view(cache.eng), DefId { v: 11u32 }, mod_math, ITEM_KIND_STRUCT, true, false, false, 0u32, 2u32, n_hdr, empty);
+    let d_scale = inc_register_item(mut_view(cache.eng), DefId { v: 12u32 }, mod_math, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_scale, empty);
+    let d_fast = inc_register_item(mut_view(cache.eng), DefId { v: 13u32 }, mod_math, ITEM_KIND_FN, true, true, false, 1u32, 1u32, n_fast, empty);
+    let d_trans = inc_register_item(mut_view(cache.eng), DefId { v: 14u32 }, mod_math, ITEM_KIND_FN, true, false, true, 1u32, 1u32, n_trans, empty);
+    let d_metric = inc_register_item(mut_view(cache.eng), DefId { v: 15u32 }, mod_math, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_metric, empty);
+    inc_add_item_call_dep(mut_view(cache.eng), d_metric, d_scale);
+    inc_add_item_const_dep(mut_view(cache.eng), d_metric, d_limit);
+
+    // Items in `mid_layer` (imports `math_lib`):
+    let d_pack = inc_register_item(mut_view(cache.eng), DefId { v: 19u32 }, mod_mid, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_pack, empty);
+    inc_add_item_layout_dep(mut_view(cache.eng), d_pack, d_hdr);
+    let d_mid = inc_register_item(mut_view(cache.eng), DefId { v: 20u32 }, mod_mid, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_mid, empty);
+    inc_add_item_call_dep(mut_view(cache.eng), d_mid, d_pack);
+    inc_add_item_const_dep(mut_view(cache.eng), d_mid, d_limit);
+    inc_add_item_call_dep(mut_view(cache.eng), d_mid, d_fast);
+    inc_add_item_call_dep(mut_view(cache.eng), d_mid, d_trans);
+    inc_add_item_call_dep(mut_view(cache.eng), d_mid, d_metric);
+
+    // Items in `app_driver` (imports `mid_layer` ONLY):
+    let d_app = inc_register_item(mut_view(cache.eng), DefId { v: 30u32 }, mod_app, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_app, empty);
+    inc_add_item_call_dep(mut_view(cache.eng), d_app, d_mid);
+
+    // Items in `util_mod` (independent):
+    let _ = inc_register_item(mut_view(cache.eng), DefId { v: 40u32 }, mod_util, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_util, empty);
+
+    // Attach warnings in reverse module order to verify canonical AXD-060 diagnostic sorting
+    let sk_util = semantic_key_new(pkg, m_util, ITEM_NS_VALUE, 0u32, n_util, empty);
+    let sk_app = semantic_key_new(pkg, m_app, ITEM_NS_VALUE, 0u32, n_app, empty);
+    let msg_w_util = probe_sv(mut_view(*str_arena), "unused parameter in util_id");
+    let msg_w_app = probe_sv(mut_view(*str_arena), "redundant parentheses in run_app");
+    inc_cache_attach_diag(mut_view(*cache), 2101u32, CACHED_DIAG_WARNING, mod_util, DefId { v: 40u32 }, 4u32, 5u32, sk_util, msg_w_util);
+    inc_cache_attach_diag(mut_view(*cache), 2100u32, CACHED_DIAG_WARNING, mod_app, DefId { v: 30u32 }, 2u32, 9u32, sk_app, msg_w_app);
+}
+
+fn verify_clean_equivalence_4_modules(
+    inc_sess: view<IncrementalCache>,
+    str_arena: mut_view<Arena>,
+    math_src: StrView
+) -> bool {
+    let mut sess_clean = inc_cache_empty();
+    inc_cache_init(mut_view(sess_clean), 900u64);
+    populate_four_module_workspace(mut_view(sess_clean), mut_view(*str_arena), math_src);
+    if !inc_cache_build_clean_no_incremental(mut_view(sess_clean)) {
+        inc_cache_free(mut_view(sess_clean));
+        return false;
+    }
+
+    if !fingerprint128_eq(inc_sess.linked_artifact_fp, sess_clean.linked_artifact_fp) ||
+       !bytes_eq(
+           inc_sess.linked_artifact_bytes as *const u8,
+           inc_sess.linked_artifact_len as usize,
+           sess_clean.linked_artifact_bytes as *const u8,
+           sess_clean.linked_artifact_len as usize
+       ) {
+        inc_cache_free(mut_view(sess_clean));
+        return false;
+    }
+
+    let mut mid: u32 = 1u32;
+    while mid <= 4u32 {
+        let cgu_inc = inc_cache_get_cgu(view(*inc_sess), ModuleId { v: mid });
+        let cgu_cln = inc_cache_get_cgu(view(sess_clean), ModuleId { v: mid });
+        if !fingerprint128_eq(cgu_inc.cgu_fp, cgu_cln.cgu_fp) ||
+           !fingerprint128_eq(cgu_inc.obj_digest, cgu_cln.obj_digest) ||
+           !bytes_eq(
+               cgu_inc.obj_bytes as *const u8,
+               cgu_inc.obj_len as usize,
+               cgu_cln.obj_bytes as *const u8,
+               cgu_cln.obj_len as usize
+           ) {
+            inc_cache_free(mut_view(sess_clean));
+            return false;
+        }
+        mid = mid + 1u32;
+    }
+
+    inc_cache_free(mut_view(sess_clean));
+    true
+}
+
+fn read_optional_cache_dir_arg(str_arena: mut_view<Arena>) -> StrView {
+    let argc = args_count();
+    if argc < 2 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = arena_alloc_raw(mut_view(*str_arena), 512, 1);
+    let alen = unsafe { arg(1, buf, 511) };
+    if alen <= 12i64 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let is_prefix = unsafe {
+        (*buf) == 45u8 &&
+        (*(buf + 1)) == 45u8 &&
+        (*(buf + 2)) == 99u8 &&
+        (*(buf + 3)) == 97u8 &&
+        (*(buf + 4)) == 99u8 &&
+        (*(buf + 5)) == 104u8 &&
+        (*(buf + 6)) == 101u8 &&
+        (*(buf + 7)) == 45u8 &&
+        (*(buf + 8)) == 100u8 &&
+        (*(buf + 9)) == 105u8 &&
+        (*(buf + 10)) == 114u8 &&
+        (*(buf + 11)) == 61u8
+    };
+    if !is_prefix {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    unsafe { *(buf + (alen as usize)) = 0u8; }
+    StrView { ptr: unsafe { (buf + 12) as *const u8 }, len: (alen as usize) - 12 }
+}
+
+fn main() -> i32 {
+    let mut str_arena = arena_new();
+    let disk_cache_dir = read_optional_cache_dir_arg(mut_view(str_arena));
+
+    let src_math_r1 = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 100\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { x * 2 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 5 }\n"
+    );
+
+    // 1. Cold build of 4-module `axiomc` workspace + serialization & optional on-disk `.axiom-cache` save
+    let mut sess_a = inc_cache_empty();
+    inc_cache_init(mut_view(sess_a), 100u64);
+    populate_four_module_workspace(mut_view(sess_a), mut_view(str_arena), src_math_r1);
+
+    if !inc_cache_build_workspace(mut_view(sess_a)) {
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 1;
+    }
+    if !sess_a.is_warm ||
+       sess_a.last_noop_fastpath ||
+       sess_a.eng.rev_modules_typechecked != 4u32 ||
+       sess_a.eng.rev_cgu_rebuilt != 4u32 ||
+       sess_a.eng.rev_cgu_reused != 0u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_a), mut_view(str_arena), src_math_r1) {
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 2;
+    }
+
+    let mut wire_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(wire_buf));
+    inc_cache_serialize(mut_view(sess_a), mut_view(wire_buf));
+    if wire_buf.len <= AXIC_HEADER_BYTES {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 3;
+    }
+
+    if disk_cache_dir.len > 0 {
+        if !inc_cache_save_to_disk(mut_view(sess_a), disk_cache_dir) {
+            diag_buf_free(mut_view(wire_buf));
+            inc_cache_free(mut_view(sess_a));
+            arena_destroy(mut_view(str_arena));
+            return 4;
+        }
+        // 4 `.obj` files + 1 `dep-graph.axcache` = 5 atomic temp writes and 5 atomic renames
+        if sess_a.atomic_temp_writes != 5u32 || sess_a.atomic_renames != 5u32 {
+            diag_buf_free(mut_view(wire_buf));
+            inc_cache_free(mut_view(sess_a));
+            arena_destroy(mut_view(str_arena));
+            return 5;
+        }
+    }
+
+    // Load warm cache into `sess_b` (checking corruption/schema eviction first)
+    let mut sess_b = inc_cache_empty();
+    inc_cache_init(mut_view(sess_b), 200u64);
+    populate_four_module_workspace(mut_view(sess_b), mut_view(str_arena), src_math_r1);
+
+    let st_trunc = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, 24);
+    unsafe { *(wire_buf.ptr + 40) = (*(wire_buf.ptr + 40)) ^ 0x55u8; }
+    let st_csum = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len);
+    unsafe { *(wire_buf.ptr + 40) = (*(wire_buf.ptr + 40)) ^ 0x55u8; }
+    unsafe { *(wire_buf.ptr + 8) = 99u8; }
+    let st_schema = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len);
+    unsafe { *(wire_buf.ptr + 8) = 1u8; }
+    if st_trunc != CACHE_EVICT_TRUNCATED ||
+       st_csum != CACHE_EVICT_CORRUPT_CHECKSUM ||
+       st_schema != CACHE_EVICT_SCHEMA_MISMATCH ||
+       sess_b.last_eviction_diag_code != AX_INC_CACHE_CORRUPT {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 6;
+    }
+
+    sess_b.eviction_count = 0u32;
+    sess_b.last_eviction_reason = CACHE_EVICT_NONE;
+    sess_b.last_eviction_diag_code = 0u32;
+
+    let load_st = if disk_cache_dir.len > 0 {
+        inc_cache_load_from_disk(mut_view(sess_b), disk_cache_dir)
+    } else {
+        inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len)
+    };
+    if load_st != CACHE_EVICT_NONE || !sess_b.is_warm {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 7;
+    }
+    print("cold_build_and_warm_reload_ok=true\n");
+
+    // 2. Warm `< 100 ms` No-Op Rebuild #1 (stat pre-check fast path, `AXS-INC-023` & `INV-INC-003`)
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 8;
+    }
+    if !sess_b.last_noop_fastpath ||
+       sess_b.last_noop_elapsed_ns >= NOOP_FASTPATH_BUDGET_NS ||
+       sess_b.eng.rev_queries_total != 0u32 ||
+       sess_b.eng.rev_queries_recomputed != 0u32 ||
+       sess_b.eng.rev_modules_typechecked != 0u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 0u32 ||
+       sess_b.eng.rev_cgu_reused != 4u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 9;
+    }
+    print("noop_fastpath_stat_under_100ms_ok=true\n");
+
+    // 3. Warm `< 100 ms` No-Op Rebuild #2 after `touch` on `compiler/math_lib/mod.ax` (`mtime_ns` changed, content unchanged)
+    inc_cache_touch_source_mtime(mut_view(sess_b), SourceFileId { v: 1u32 }, 999999u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 10;
+    }
+    if !sess_b.last_noop_fastpath ||
+       sess_b.last_noop_elapsed_ns >= NOOP_FASTPATH_BUDGET_NS ||
+       sess_b.noop_fastpath_hits != 2u32 ||
+       sess_b.content_digest_hits == 0u32 ||
+       sess_b.eng.rev_queries_recomputed != 0u32 ||
+       sess_b.eng.rev_modules_typechecked != 0u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 0u32 ||
+       sess_b.eng.rev_cgu_reused != 4u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 11;
+    }
+    print("noop_fastpath_touch_content_digest_ok=true\n");
+
+    // 4. Comment/whitespace-only edit in `math_lib` (`AXS-INC-002` Tier 1 `AstFingerprint` backdating)
+    let src_math_comment = probe_sv(
+        mut_view(str_arena),
+        "// non-doc comment edit\n   pub const LIMIT: i64 = 100\n   @repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { x * 2 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 5 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_comment, 2000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 12;
+    }
+    if sess_b.last_noop_fastpath ||
+       sess_b.eng.rev_modules_typechecked != 0u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 0u32 ||
+       sess_b.eng.rev_cgu_reused != 4u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 13;
+    }
+    print("comment_whitespace_ast_backdate_ok=true\n");
+
+    // 5. Edit private function body `internal_scale` in `math_lib` (`AXS-INC-012` / `AXS-INC-013`):
+    // `InterfaceFingerprint(math_lib)` backdates to Green -> `modules_typechecked == 1` (`0` downstream modules re-typechecked!)
+    let src_math_priv_edit = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 100\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 5 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_priv_edit, 3000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 14;
+    }
+    if sess_b.eng.rev_modules_typechecked != 1u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 1u32 ||
+       sess_b.eng.rev_cgu_reused != 3u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_priv_edit) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 15;
+    }
+    print("edit_private_fn_body_firewall_ok=true\n");
+
+    // 6. Edit non-inlined `pub fn compute_metric` body in `math_lib` without changing signature:
+    // `InterfaceFingerprint(math_lib)` backdates to Green -> `modules_typechecked == 1` (`0` downstream modules re-typechecked!)
+    let src_math_pub_body_edit = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 100\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 42 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_pub_body_edit, 4000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 16;
+    }
+    if sess_b.eng.rev_modules_typechecked != 1u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 1u32 ||
+       sess_b.eng.rev_cgu_reused != 3u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_pub_body_edit) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 17;
+    }
+    print("edit_non_inline_pub_fn_body_firewall_ok=true\n");
+
+    // 7. Edit `pub const LIMIT` expression (`100` -> `60 + 40`) with UNCHANGED evaluated value (`100`):
+    // `const_eval` backdates to Green -> `0` CGUs rebuilt!
+    let src_math_const_same = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 60 + 40\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 42 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_const_same, 5000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 18;
+    }
+    if sess_b.eng.rev_cgu_rebuilt != 0u32 ||
+       sess_b.eng.rev_cgu_reused != 4u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_const_same) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 19;
+    }
+    print("const_unchanged_value_backdated_ok=true\n");
+
+    // 8. Edit `pub const LIMIT` to a NEW value (`250`):
+    // Invalidates `mid_layer` via `DEP_KIND_CONST_BODY`, while `app_driver` & `util_mod` remain Green!
+    let src_math_const_diff = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 250\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 1 }\npub fn transform<T>(x: T) -> T { x }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 42 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_const_diff, 6000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 20;
+    }
+    if sess_b.eng.rev_modules_typechecked != 2u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 2u32 ||
+       sess_b.eng.rev_cgu_reused != 2u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_const_diff) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 21;
+    }
+    print("const_changed_value_selective_invalidation_ok=true\n");
+
+    // 9. Edit `@inline pub fn fast_step` body and generic `pub fn transform<T>` body without changing signatures:
+    // `InterfaceFingerprint(math_lib)` backdates to Green -> `modules_typechecked == 1` (`0` downstream `typeck_body`!),
+    // while `mid_layer`'s `CodegenUnit` rebuilds via `DEP_KIND_INLINED_BODY` / `DEP_KIND_GENERIC_BODY` (`cgu_rebuilt == 2`)!
+    let src_math_inline_gen_edit = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 250\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 77 }\npub fn transform<T>(x: T) -> T { let y = x; y }\npub fn compute_metric(x: i32) -> i32 { internal_scale(x) + 42 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_inline_gen_edit, 7000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 22;
+    }
+    if sess_b.eng.rev_modules_typechecked != 1u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 2u32 ||
+       sess_b.eng.rev_cgu_reused != 2u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_inline_gen_edit) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 23;
+    }
+    print("inline_and_generic_body_selective_cgu_rebuild_ok=true\n");
+
+    // 10. Edit `pub fn compute_metric` signature and `@repr(C) pub struct MetricHeader` layout in `math_lib`:
+    // Invalidates `math_lib` and `mid_layer`, while `app_driver` (`mid_layer` API unchanged) and `util_mod` stay Green!
+    let src_math_sig_abi_edit = probe_sv(
+        mut_view(str_arena),
+        "pub const LIMIT: i64 = 250\n@repr(C) pub struct MetricHeader { pub tag: i32, pub flags: i32, pub extra: i64 }\nfn internal_scale(x: i32) -> i32 { (x * 16) + 99 }\n@inline pub fn fast_step(x: i32) -> i32 { x + 77 }\npub fn transform<T>(x: T) -> T { let y = x; y }\npub fn compute_metric(x: i32, scale_bias: i32) -> i32 { internal_scale(x) + scale_bias }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_sig_abi_edit, 8000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 24;
+    }
+    if sess_b.eng.rev_modules_typechecked != 2u32 ||
+       sess_b.eng.rev_cgu_rebuilt != 2u32 ||
+       sess_b.eng.rev_cgu_reused != 2u32 ||
+       !verify_clean_equivalence_4_modules(view(sess_b), mut_view(str_arena), src_math_sig_abi_edit) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 25;
+    }
+    print("sig_and_repr_c_layout_invalidation_and_clean_equiv_ok=true\n");
+
+    // 11. Error Non-Pollution (`AXS-INC-024 §2`): module with error diagnostic never publishes a Ready `.obj`
+    inc_set_item_error_flag(mut_view(sess_a.eng), DefId { v: 15u32 }, true);
+    let _ = inc_cache_update_module_source(mut_view(sess_a), ModuleId { v: 1u32 }, src_math_r1, 9000u64);
+    let build_err_ok = inc_cache_build_workspace(mut_view(sess_a));
+    let math_err_cgu = inc_cache_get_cgu(view(sess_a), ModuleId { v: 1u32 });
+    if build_err_ok || math_err_cgu.is_published || math_err_cgu.obj_len != 0u32 || sess_a.linked_artifact_len != 0u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        arena_destroy(mut_view(str_arena));
+        return 26;
+    }
+    print("error_non_pollution_and_clean_equivalence_ok=true\n");
+    print("E18-2-INCREMENTAL-COMPILATION-CONFORMANCE-PASS\n");
+
+    diag_buf_free(mut_view(wire_buf));
+    inc_cache_free(mut_view(sess_b));
+    inc_cache_free(mut_view(sess_a));
+    arena_destroy(mut_view(str_arena));
+    0
+}

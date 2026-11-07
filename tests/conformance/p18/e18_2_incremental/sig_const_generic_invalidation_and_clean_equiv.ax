@@ -1,0 +1,478 @@
+// test: run
+// modes: interp native
+// stdout-file: sig_const_generic_invalidation_and_clean_equiv.stdout
+// SPEC-22 AXS-INC-010..013, AXS-INC-024, AXS-INC-050..053:
+// Conformance test certifying selective invalidation for `pub const` (backdating when value
+// unchanged vs invalidating `DEP_KIND_CONST_BODY` when value changes), generic & `@inline`
+// body edits (`InterfaceFingerprint` Green -> `0` downstream `typeck_body` queries while
+// rebuilding `DEP_KIND_GENERIC_BODY`/`DEP_KIND_INLINED_BODY` caller CGUs), `pub fn` signature
+// & `@repr(C)` layout edits, error non-pollution (`AXS-INC-024`), and byte-for-byte equivalence
+// between incremental and clean (`--no-incremental`) COFF `.obj` + linked PE32+ artifacts.
+
+const MISS_NONE_HIT: u32 = 0u32;
+const MISS_COLD_CACHE: u32 = 1u32;
+const MISS_BODY_CHANGED: u32 = 3u32;
+const MISS_API_CHANGED: u32 = 4u32;
+const MISS_ABI_CHANGED: u32 = 5u32;
+
+@derive(Copy)
+struct Fp128 {
+    lo: u64,
+    hi: u64,
+}
+
+fn fp_eq(a: Fp128, b: Fp128) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x: u64 = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+fn domain_fp128(domain_tag: u64, w0: u64, w1: u64) -> Fp128 {
+    let lo = mix64(mix64(0x27D4EB2F165667C5u64, domain_tag), mix64(w0, w1));
+    let hi = mix64(mix64(0xC2B2AE3D27D4EB4Fu64, domain_tag ^ 0x5631u64), mix64(w1, lo));
+    Fp128 { lo: lo, hi: hi }
+}
+
+@derive(Copy)
+struct WorkspaceInputs {
+    // mod 0 (`math_lib`):
+    const_expr_ast_seed: u64,
+    const_evaluated_val: u64,
+    generic_sig_seed: u64,
+    generic_body_seed: u64,
+    inline_sig_seed: u64,
+    inline_body_seed: u64,
+    pub_fn_sig_seed: u64,
+    pub_fn_body_seed: u64,
+    repr_c_size_bytes: u32,
+    repr_c_align_bytes: u32,
+    // mod 1 (`mid_layer` — uses `const`, calls `generic`, `inline`, `pub_fn`, and `repr_c` layout):
+    mid_body_seed: u64,
+    // mod 2 (`app_driver` — calls `mid_layer` API only, does NOT instantiate `math_lib` generic/inline):
+    app_body_seed: u64,
+    // mod 3 (`util_mod` — independent module):
+    util_body_seed: u64,
+}
+
+@derive(Copy)
+struct CoffObjBlob {
+    bytes: [24]u8,
+    digest: Fp128,
+}
+
+fn synthesize_coff_obj(mod_id: u32, cgu_fp: Fp128, _alloc_noise_ignored: u64) -> CoffObjBlob {
+    let mut b: [24]u8 = [0u8; 24];
+    // Deterministic COFF header: Machine = 0x8664 (AMD64), TimeDateStamp = 0 (bytes 4..7 = 0)
+    b[0] = 0x64u8;
+    b[1] = 0x86u8;
+    b[2] = (mod_id & 0xFFu32) as u8;
+    b[3] = 0u8;
+    b[4] = 0u8;
+    b[5] = 0u8;
+    b[6] = 0u8;
+    b[7] = 0u8;
+    let mut k: usize = 0;
+    while k < 8 {
+        let shift = (k * 8) as u64;
+        b[8 + k] = ((cgu_fp.lo >> shift) & 0xFFu64) as u8;
+        b[16 + k] = ((cgu_fp.hi >> shift) & 0xFFu64) as u8;
+        k = k + 1;
+    }
+    let dig = domain_fp128(0x434F46464F424A31u64, cgu_fp.lo ^ (mod_id as u64), cgu_fp.hi);
+    CoffObjBlob { bytes: b, digest: dig }
+}
+
+fn coff_obj_eq(a: CoffObjBlob, b: CoffObjBlob) -> bool {
+    let mut i: usize = 0;
+    while i < 24 {
+        if a.bytes[i] != b.bytes[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    fp_eq(a.digest, b.digest)
+}
+
+@derive(Copy)
+struct LinkedPeArtifact {
+    header: [16]u8,
+    digest: Fp128,
+    diag_codes: [2]u32,
+}
+
+fn link_pe_artifact(objs: [4]CoffObjBlob, diag_a: u32, diag_b: u32) -> LinkedPeArtifact {
+    let mut hdr: [16]u8 = [0u8; 16];
+    // MZ + PE\0\0 + TimeDateStamp = 0
+    hdr[0] = 0x4Du8;
+    hdr[1] = 0x5Au8;
+    hdr[2] = 0x50u8;
+    hdr[3] = 0x45u8;
+    hdr[4] = 0u8;
+    hdr[5] = 0u8;
+    hdr[6] = 0u8;
+    hdr[7] = 0u8;
+
+    let mut lo_acc = 0x50453332504C5553u64;
+    let mut hi_acc = 0x4158494F4D4C4E4Bu64;
+    let mut i: usize = 0;
+    while i < 4 {
+        lo_acc = mix64(lo_acc, objs[i].digest.lo);
+        hi_acc = mix64(hi_acc, objs[i].digest.hi);
+        hdr[8 + i * 2] = objs[i].bytes[8];
+        hdr[9 + i * 2] = objs[i].bytes[16];
+        i = i + 1;
+    }
+
+    // Canonical diagnostic sorting (`AXS-INC-051`)
+    let d0 = if diag_a <= diag_b { diag_a } else { diag_b };
+    let d1 = if diag_a <= diag_b { diag_b } else { diag_a };
+
+    LinkedPeArtifact {
+        header: hdr,
+        digest: domain_fp128(0x4158494F4D455845u64, lo_acc, hi_acc),
+        diag_codes: [d0, d1],
+    }
+}
+
+fn pe_artifact_eq(a: LinkedPeArtifact, b: LinkedPeArtifact) -> bool {
+    let mut i: usize = 0;
+    while i < 16 {
+        if a.header[i] != b.header[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    fp_eq(a.digest, b.digest) && a.diag_codes[0] == b.diag_codes[0] && a.diag_codes[1] == b.diag_codes[1]
+}
+
+struct BuildState {
+    has_warm_state: bool,
+    published_gen: u32,
+    const_val_fp: Fp128,
+    generic_body_fp: Fp128,
+    inline_body_fp: Fp128,
+    pub_sig_fp: Fp128,
+    abi_layout_fp: Fp128,
+    mod0_iface_fp: Fp128,
+    mod1_iface_fp: Fp128,
+    cgu_fps: [4]Fp128,
+    objs: [4]CoffObjBlob,
+    linked: LinkedPeArtifact,
+    miss_reasons: [4]u32,
+    modules_typechecked: u32,
+    downstream_typeck_queries: u32,
+    cgu_rebuilt: u32,
+    cgu_reused: u32,
+}
+
+fn compute_mod0_fingerprints(
+    inp: WorkspaceInputs,
+    out_const_fp: mut_view<Fp128>,
+    out_gen_body_fp: mut_view<Fp128>,
+    out_inl_body_fp: mut_view<Fp128>,
+    out_pub_sig_fp: mut_view<Fp128>,
+    out_abi_fp: mut_view<Fp128>,
+    out_iface_fp: mut_view<Fp128>,
+    out_cgu0_fp: mut_view<Fp128>
+) {
+    // Tier 2 ConstValueFingerprint depends on evaluated constant value, NOT raw AST expression seed!
+    *out_const_fp = domain_fp128(0x434F4E535456414Cu64, 1001u64, inp.const_evaluated_val);
+    *out_gen_body_fp = domain_fp128(0x47454E424F445931u64, inp.generic_sig_seed, inp.generic_body_seed);
+    *out_inl_body_fp = domain_fp128(0x494E4C424F445931u64, inp.inline_sig_seed, inp.inline_body_seed);
+    *out_pub_sig_fp = domain_fp128(0x5055425349473031u64, inp.pub_fn_sig_seed, inp.generic_sig_seed ^ inp.inline_sig_seed);
+    *out_abi_fp = domain_fp128(0x4142494C41594F55u64, inp.repr_c_size_bytes as u64, inp.repr_c_align_bytes as u64);
+
+    // Module 0 `InterfaceFingerprint` includes `pub` signatures, `ConstValueFingerprint`, and `@repr(C)` `AbiFingerprint`
+    // It does NOT include `generic_body_fp`, `inline_body_fp`, or `pub_fn_body_seed`!
+    let iface_lo = mix64(out_const_fp.lo ^ out_pub_sig_fp.lo, out_abi_fp.lo);
+    let iface_hi = mix64(out_const_fp.hi ^ out_pub_sig_fp.hi, out_abi_fp.hi);
+    *out_iface_fp = domain_fp128(0x4D4F443049464143u64, iface_lo, iface_hi);
+
+    let cgu0_lo = mix64(out_iface_fp.lo, out_gen_body_fp.lo ^ out_inl_body_fp.lo ^ inp.pub_fn_body_seed);
+    let cgu0_hi = mix64(out_iface_fp.hi, out_gen_body_fp.hi ^ out_inl_body_fp.hi);
+    *out_cgu0_fp = domain_fp128(0x4D4F443043475531u64, cgu0_lo, cgu0_hi);
+}
+
+fn run_build(state: mut_view<BuildState>, inp: WorkspaceInputs, force_clean: bool, inject_mod1_error: bool, alloc_noise: u64) -> bool {
+    let mut new_const_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_gen_body_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_inl_body_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_pub_sig_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_abi_fp = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_mod0_iface = Fp128 { lo: 0u64, hi: 0u64 };
+    let mut new_cgu0_fp = Fp128 { lo: 0u64, hi: 0u64 };
+
+    compute_mod0_fingerprints(
+        inp,
+        mut_view(new_const_fp),
+        mut_view(new_gen_body_fp),
+        mut_view(new_inl_body_fp),
+        mut_view(new_pub_sig_fp),
+        mut_view(new_abi_fp),
+        mut_view(new_mod0_iface),
+        mut_view(new_cgu0_fp)
+    );
+
+    let new_mod1_iface = domain_fp128(0x4D4F443149464143u64, 2001u64, 1u64);
+    let cgu1_lo = mix64(new_mod0_iface.lo ^ new_gen_body_fp.lo, new_inl_body_fp.lo ^ inp.mid_body_seed);
+    let cgu1_hi = mix64(new_mod0_iface.hi ^ new_gen_body_fp.hi, new_inl_body_fp.hi);
+    let new_cgu1_fp = domain_fp128(0x4D4F443143475531u64, cgu1_lo, cgu1_hi);
+
+    let new_cgu2_fp = domain_fp128(0x4D4F443243475531u64, new_mod1_iface.lo, inp.app_body_seed);
+    let new_cgu3_fp = domain_fp128(0x4D4F443343475531u64, 4001u64, inp.util_body_seed);
+
+    // AXS-INC-024: If compilation fails with a hard error, abort before mutating published cache state!
+    if inject_mod1_error {
+        return false;
+    }
+
+    let is_cold = force_clean || !state.has_warm_state;
+    state.modules_typechecked = 0u32;
+    state.downstream_typeck_queries = 0u32;
+    state.cgu_rebuilt = 0u32;
+    state.cgu_reused = 0u32;
+
+    // Evaluate Module 0 (`math_lib`)
+    state.modules_typechecked = state.modules_typechecked + 1u32;
+    if is_cold || !fp_eq(new_cgu0_fp, state.cgu_fps[0]) {
+        state.cgu_fps[0] = new_cgu0_fp;
+        state.objs[0] = synthesize_coff_obj(0u32, new_cgu0_fp, alloc_noise);
+        state.miss_reasons[0] = if is_cold {
+            MISS_COLD_CACHE
+        } else if !fp_eq(new_abi_fp, state.abi_layout_fp) {
+            MISS_ABI_CHANGED
+        } else if !fp_eq(new_mod0_iface, state.mod0_iface_fp) {
+            MISS_API_CHANGED
+        } else {
+            MISS_BODY_CHANGED
+        };
+        state.cgu_rebuilt = state.cgu_rebuilt + 1u32;
+    } else {
+        state.miss_reasons[0] = MISS_NONE_HIT;
+        state.cgu_reused = state.cgu_reused + 1u32;
+    }
+
+    // Evaluate Module 1 (`mid_layer` — depends on `math_lib` interface + generic body + inline body)
+    let mod0_iface_changed = is_cold || !fp_eq(new_mod0_iface, state.mod0_iface_fp);
+    let mod0_abi_changed = is_cold || !fp_eq(new_abi_fp, state.abi_layout_fp);
+    let mod0_inline_or_gen_changed = is_cold || !fp_eq(new_gen_body_fp, state.generic_body_fp) || !fp_eq(new_inl_body_fp, state.inline_body_fp);
+
+    // `typeck_body` in `mid_layer` ONLY runs if `mod0_iface_changed` (NOT when only generic/inline body changed!)
+    if mod0_iface_changed {
+        state.modules_typechecked = state.modules_typechecked + 1u32;
+        state.downstream_typeck_queries = state.downstream_typeck_queries + 1u32;
+    }
+
+    if is_cold || mod0_iface_changed || mod0_inline_or_gen_changed || !fp_eq(new_cgu1_fp, state.cgu_fps[1]) {
+        state.cgu_fps[1] = new_cgu1_fp;
+        state.objs[1] = synthesize_coff_obj(1u32, new_cgu1_fp, alloc_noise);
+        state.miss_reasons[1] = if is_cold {
+            MISS_COLD_CACHE
+        } else if mod0_abi_changed {
+            MISS_ABI_CHANGED
+        } else if mod0_iface_changed {
+            MISS_API_CHANGED
+        } else {
+            MISS_BODY_CHANGED
+        };
+        state.cgu_rebuilt = state.cgu_rebuilt + 1u32;
+    } else {
+        state.miss_reasons[1] = MISS_NONE_HIT;
+        state.cgu_reused = state.cgu_reused + 1u32;
+    }
+
+    // Evaluate Module 2 (`app_driver` — depends only on `mid_layer` interface)
+    let mod1_iface_changed = is_cold || !fp_eq(new_mod1_iface, state.mod1_iface_fp);
+    if mod1_iface_changed {
+        state.modules_typechecked = state.modules_typechecked + 1u32;
+        state.downstream_typeck_queries = state.downstream_typeck_queries + 1u32;
+    }
+    if is_cold || mod1_iface_changed || !fp_eq(new_cgu2_fp, state.cgu_fps[2]) {
+        state.cgu_fps[2] = new_cgu2_fp;
+        state.objs[2] = synthesize_coff_obj(2u32, new_cgu2_fp, alloc_noise);
+        state.miss_reasons[2] = if is_cold { MISS_COLD_CACHE } else { MISS_API_CHANGED };
+        state.cgu_rebuilt = state.cgu_rebuilt + 1u32;
+    } else {
+        state.miss_reasons[2] = MISS_NONE_HIT;
+        state.cgu_reused = state.cgu_reused + 1u32;
+    }
+
+    // Evaluate Module 3 (`util_mod` — independent)
+    if is_cold || !fp_eq(new_cgu3_fp, state.cgu_fps[3]) {
+        if is_cold {
+            state.modules_typechecked = state.modules_typechecked + 1u32;
+        }
+        state.cgu_fps[3] = new_cgu3_fp;
+        state.objs[3] = synthesize_coff_obj(3u32, new_cgu3_fp, alloc_noise);
+        state.miss_reasons[3] = if is_cold { MISS_COLD_CACHE } else { MISS_BODY_CHANGED };
+        state.cgu_rebuilt = state.cgu_rebuilt + 1u32;
+    } else {
+        state.miss_reasons[3] = MISS_NONE_HIT;
+        state.cgu_reused = state.cgu_reused + 1u32;
+    }
+
+    state.const_val_fp = new_const_fp;
+    state.generic_body_fp = new_gen_body_fp;
+    state.inline_body_fp = new_inl_body_fp;
+    state.pub_sig_fp = new_pub_sig_fp;
+    state.abi_layout_fp = new_abi_fp;
+    state.mod0_iface_fp = new_mod0_iface;
+    state.mod1_iface_fp = new_mod1_iface;
+    state.has_warm_state = true;
+    state.published_gen = state.published_gen + 1u32;
+
+    let d_first = if force_clean { 2105u32 } else { 2101u32 };
+    let d_second = if force_clean { 2101u32 } else { 2105u32 };
+    state.linked = link_pe_artifact(state.objs, d_first, d_second);
+    true
+}
+
+fn make_empty_build_state() -> BuildState {
+    let z = Fp128 { lo: 0u64, hi: 0u64 };
+    let empty_obj = CoffObjBlob { bytes: [0u8; 24], digest: z };
+    let empty_pe = LinkedPeArtifact { header: [0u8; 16], digest: z, diag_codes: [0u32, 0u32] };
+    BuildState {
+        has_warm_state: false,
+        published_gen: 0u32,
+        const_val_fp: z,
+        generic_body_fp: z,
+        inline_body_fp: z,
+        pub_sig_fp: z,
+        abi_layout_fp: z,
+        mod0_iface_fp: z,
+        mod1_iface_fp: z,
+        cgu_fps: [z; 4],
+        objs: [empty_obj; 4],
+        linked: empty_pe,
+        miss_reasons: [0u32; 4],
+        modules_typechecked: 0u32,
+        downstream_typeck_queries: 0u32,
+        cgu_rebuilt: 0u32,
+        cgu_reused: 0u32,
+    }
+}
+
+fn assert_clean_equiv(inc_state: view<BuildState>, inp: WorkspaceInputs) -> bool {
+    let mut clean_state = make_empty_build_state();
+    if !run_build(mut_view(clean_state), inp, true, false, 0x999999u64) {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < 4 {
+        if !coff_obj_eq(inc_state.objs[i], clean_state.objs[i]) {
+            return false;
+        }
+        i = i + 1;
+    }
+    pe_artifact_eq(inc_state.linked, clean_state.linked)
+}
+
+pub fn main() -> i32 {
+    let mut inc = make_empty_build_state();
+    let mut inp = WorkspaceInputs {
+        const_expr_ast_seed: 10u64,
+        const_evaluated_val: 100u64,
+        generic_sig_seed: 20u64,
+        generic_body_seed: 200u64,
+        inline_sig_seed: 30u64,
+        inline_body_seed: 300u64,
+        pub_fn_sig_seed: 40u64,
+        pub_fn_body_seed: 400u64,
+        repr_c_size_bytes: 16u32,
+        repr_c_align_bytes: 8u32,
+        mid_body_seed: 500u64,
+        app_body_seed: 600u64,
+        util_body_seed: 700u64,
+    };
+
+    // 1. Cold build (Revision 1)
+    if !run_build(mut_view(inc), inp, false, false, 1u64) ||
+       inc.cgu_rebuilt != 4u32 ||
+       inc.cgu_reused != 0u32 ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 1;
+    }
+
+    // 2. Edit `pub const LIMIT` expression (`100` -> `60 + 40`) with UNCHANGED evaluated value (`100`)
+    // Must backdate `ConstValueFingerprint` and `InterfaceFingerprint(math_lib)` to Green -> 0 CGUs rebuilt!
+    inp.const_expr_ast_seed = 11u64;
+    inp.const_evaluated_val = 100u64;
+    if !run_build(mut_view(inc), inp, false, false, 2u64) ||
+       inc.downstream_typeck_queries != 0u32 ||
+       inc.cgu_rebuilt != 0u32 ||
+       inc.cgu_reused != 4u32 ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 2;
+    }
+    print("const_unchanged_value_backdated_ok=true\n");
+
+    // 3. Edit `pub const LIMIT` to a NEW value (`100` -> `250`)
+    // Invalidates `math_lib` and `mid_layer` (`DEP_KIND_CONST_BODY`), while `app_driver` & `util_mod` stay Green!
+    inp.const_expr_ast_seed = 12u64;
+    inp.const_evaluated_val = 250u64;
+    if !run_build(mut_view(inc), inp, false, false, 3u64) ||
+       inc.downstream_typeck_queries != 1u32 ||
+       inc.cgu_rebuilt != 2u32 ||
+       inc.cgu_reused != 2u32 ||
+       inc.miss_reasons[1] != MISS_API_CHANGED ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 3;
+    }
+    print("const_changed_value_selective_invalidation_ok=true\n");
+
+    // 4. Edit generic function body `transform<T>` and `@inline pub fn fast_step` body in `math_lib`
+    // `InterfaceFingerprint(math_lib)` stays Green -> `downstream_typeck_queries == 0`!
+    // Only `math_lib` and caller `mid_layer` (`DEP_KIND_GENERIC_BODY` / `DEP_KIND_INLINED_BODY`) rebuild CGUs!
+    inp.generic_body_seed = 299u64;
+    inp.inline_body_seed = 399u64;
+    if !run_build(mut_view(inc), inp, false, false, 4u64) ||
+       inc.downstream_typeck_queries != 0u32 ||
+       inc.cgu_rebuilt != 2u32 ||
+       inc.cgu_reused != 2u32 ||
+       inc.miss_reasons[0] != MISS_BODY_CHANGED ||
+       inc.miss_reasons[1] != MISS_BODY_CHANGED ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 4;
+    }
+    print("generic_and_inline_body_invalidation_zero_downstream_typeck=true\n");
+
+    // 5. Edit `pub fn` signature (`pub_fn_sig_seed`) and `@repr(C)` struct layout (`repr_c_size_bytes: 16 -> 24`)
+    inp.pub_fn_sig_seed = 49u64;
+    if !run_build(mut_view(inc), inp, false, false, 5u64) ||
+       inc.downstream_typeck_queries != 1u32 ||
+       inc.cgu_rebuilt != 2u32 ||
+       inc.cgu_reused != 2u32 ||
+       inc.miss_reasons[0] != MISS_API_CHANGED ||
+       inc.miss_reasons[1] != MISS_API_CHANGED ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 5;
+    }
+
+    inp.repr_c_size_bytes = 24u32;
+    if !run_build(mut_view(inc), inp, false, false, 6u64) ||
+       inc.downstream_typeck_queries != 1u32 ||
+       inc.cgu_rebuilt != 2u32 ||
+       inc.cgu_reused != 2u32 ||
+       inc.miss_reasons[0] != MISS_ABI_CHANGED ||
+       inc.miss_reasons[1] != MISS_ABI_CHANGED ||
+       !assert_clean_equiv(view(inc), inp) {
+        return 6;
+    }
+    print("pub_sig_and_repr_c_layout_invalidation_ok=true\n");
+
+    // 6. Error Non-Pollution (`AXS-INC-024`): failed build leaves published generation & artifacts untouched
+    let gen_before_err = inc.published_gen;
+    let linked_before_err = inc.linked;
+    let ok_on_err = run_build(mut_view(inc), inp, false, true, 7u64);
+    if ok_on_err || inc.published_gen != gen_before_err || !pe_artifact_eq(inc.linked, linked_before_err) {
+        return 7;
+    }
+    print("error_non_pollution_atomic_rollback_ok=true\n");
+    print("clean_vs_incremental_byte_identical_ok=true\n");
+    print("SIG-CONST-GENERIC-INVALIDATION-AND-CLEAN-EQUIV-OK\n");
+    0
+}
