@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T406]
 priority: 128
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/lir, compiler/target/x64, tests/lir/atomics, tests/encode/atomics, tests/run/concurrency/atomics_native]
 locks: [compiler/backend/session.ax, tests/selfhost]
 spec: [spec/SPEC-31-atomics.md, 0092, 0162, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-075, REQ-CONC-134, REQ-CONC-135, REQ-CONC-179]
+started: 2026-11-08 01:21:57
+agent: T407-impl
 ---
 # T407 — E11.2 — LIR atomic operations & x86-64 instruction selection/encoding
 
@@ -43,3 +45,4 @@ Lower MIR `Atomic` statements to LIR atomic operations (`AXS-EXT-051`) and emit 
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-08 01:21:57 started (attempt 1) T407-impl

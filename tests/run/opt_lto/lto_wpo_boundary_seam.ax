@@ -1,0 +1,159 @@
+// test: run
+// modes: interp native
+// exit: 0
+// stdout: LTO_SEAM_BANNER=Lto_Wpo_Boundary_Seam\nLTO_SEAM_SPEC_DEVIRT=108\nLTO_SEAM_ALIAS_BARRIER=78\nSEAM_GUARD_DROP=20\nSEAM_GUARD_DROP=10\nLTO_SEAM_DEDUP_DROP=69\nLTO_SEAM_TOTAL=255\n
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+@derive(Copy)
+enum FilterOp {
+    ScaleBias(i32, i32),
+    ClampMax(i32),
+}
+
+struct FrameWindow {
+    lo: i32,
+    hi: i32,
+}
+
+struct SeamDropGuard {
+    tag: i32,
+}
+
+impl Drop for SeamDropGuard {
+    fn drop(self: mut_view<SeamDropGuard>) {
+        print("SEAM_GUARD_DROP=");
+        print_int(self.tag);
+        print("\n");
+    }
+}
+
+// 1. 3-target guarded function-pointer dispatch + enum-tag specialization + single-caller internalized helper (`AXS-LTO-010.2`, `AXS-LTO-011`, `AXS-LTO-013`)
+fn filter_stage_a(x: i32) -> i32 {
+    (x * 2) + 3
+}
+
+fn filter_stage_b(x: i32) -> i32 {
+    (x * 3) - 4
+}
+
+fn filter_stage_c(x: i32) -> i32 {
+    x + 15
+}
+
+pub fn single_caller_post_adj(v: i32) -> i32 {
+    v + 7
+}
+
+pub fn run_specialized_3way_dispatch(op: FilterOp, which: i32, input: i32) -> i32 {
+    let fp: fn(i32) -> i32 = if which == 0 {
+        filter_stage_a
+    } else if which == 1 {
+        filter_stage_b
+    } else {
+        filter_stage_c
+    };
+    let stage_val: i32 = fp(input);
+    match op {
+        FilterOp.ScaleBias(s, b) => single_caller_post_adj((stage_val * s) + b),
+        FilterOp.ClampMax(limit) => {
+            if stage_val > limit {
+                limit
+            } else {
+                stage_val
+            }
+        }
+    }
+}
+
+// 2. Cross-module `NoEscape`/`NoAlias` capability views vs. raw-pointer `UnknownAlias` fail-closed barrier (`AXS-LTO-012.2..3`, `ALTO-37..39`)
+pub fn cap_disjoint_step(src: view<FrameWindow>, dst: mut_view<FrameWindow>, k: i32) {
+    dst.lo = dst.lo + (src.lo * k);
+    dst.hi = dst.hi + (src.hi * k);
+}
+
+unsafe fn raw_ptr_alias_barrier(p_in: *const i32, p_out: *mut i32, delta: i32) -> i32 {
+    let before: i32 = *p_in;
+    *p_out = before + delta;
+    let after: i32 = *p_in;
+    before + after
+}
+
+fn test_alias_and_escape_seam() -> i32 {
+    let w_src = FrameWindow { lo: 4, hi: 6 };
+    let mut w_dst = FrameWindow { lo: 5, hi: 9 };
+    cap_disjoint_step(view(w_src), mut_view(w_dst), 3);
+    let cap_sum: i32 = w_dst.lo + w_dst.hi;
+
+    let mut shared_cell: i32 = 14;
+    let raw_sum: i32 = unsafe {
+        let p_const: *const i32 = address_of(shared_cell);
+        let p_mut: *mut i32 = address_of_mut(shared_cell);
+        raw_ptr_alias_barrier(p_const, p_mut, 6)
+    };
+    cap_sum + raw_sum
+}
+
+// 3. Generic deduplication + address-taken representation-equivalent twins + early-return LIFO `Drop` order (`AXS-LTO-014`, `AXS-LTO-015.3`)
+pub fn generic_mix<T>(a: T, b: T, pick_first: bool) -> T {
+    if pick_first {
+        a
+    } else {
+        b
+    }
+}
+
+fn rep_twin_one(x: i32) -> i32 {
+    (x * 4) + 1
+}
+
+fn rep_twin_two(x: i32) -> i32 {
+    (x * 4) + 1
+}
+
+fn test_dedup_fnptr_and_lifo_drop(early: bool) -> i32 {
+    let g1 = SeamDropGuard { tag: 10 };
+    let g2 = SeamDropGuard { tag: 20 };
+    let fp1: fn(i32) -> i32 = rep_twin_one;
+    let fp2: fn(i32) -> i32 = rep_twin_two;
+    let m1: i32 = generic_mix<i32>(fp1(5), fp2(6), true);
+    let m2: i32 = generic_mix<i64>(19i64, 99i64, true) as i32;
+    if early {
+        let m3: i32 = generic_mix<i32>(0, fp2(7), false);
+        return m1 + m2 + m3 + (g1.tag - g1.tag) + (g2.tag - g2.tag);
+    }
+    0
+}
+
+fn main() -> i32 {
+    print("LTO_SEAM_BANNER=Lto_Wpo_Boundary_Seam\n");
+
+    let r1: i32 = run_specialized_3way_dispatch(FilterOp.ScaleBias(2, 5), 0, 10);
+    let r2: i32 = run_specialized_3way_dispatch(FilterOp.ScaleBias(1, -3), 1, 10);
+    let r3: i32 = run_specialized_3way_dispatch(FilterOp.ClampMax(20), 2, 10);
+    let v_seam1: i32 = r1 + r2 + r3;
+    print("LTO_SEAM_SPEC_DEVIRT=");
+    print_int(v_seam1);
+    print("\n");
+
+    let v_seam2: i32 = test_alias_and_escape_seam();
+    print("LTO_SEAM_ALIAS_BARRIER=");
+    print_int(v_seam2);
+    print("\n");
+
+    let v_seam3: i32 = test_dedup_fnptr_and_lifo_drop(true);
+    print("LTO_SEAM_DEDUP_DROP=");
+    print_int(v_seam3);
+    print("\n");
+
+    let total: i32 = v_seam1 + v_seam2 + v_seam3;
+    print("LTO_SEAM_TOTAL=");
+    print_int(total);
+    print("\n");
+
+    if total != 255 {
+        return 1;
+    }
+    0
+}

@@ -1,0 +1,2525 @@
+// Whole-Program Closed-World Reachability, `.axmeta` Summary Serialization, Symbol Internalization,
+// Cross-Module LTO Inlining/Specialization/Escape/Alias/Devirtualization, and Generic Monomorphization Deduplication (T621 / E15.6).
+// Implements SPEC-75 §§1, 2, 5, 6 (AXS-LTO-001..005, AXS-LTO-010..015, AXS-LTO-024, AXS-LTO-025, AXS-LTO-030, AXS-PGO-015;
+// REQ-OPT-257..258, REQ-OPT-261..282, REQ-OPT-320, REQ-OPT-375..376, REQ-OPT-379..380; ALTO-20..41, ALTO-47..50):
+//   - Explicit LTO execution modes (`LTO_MODE_OFF`, `LTO_MODE_THIN`, `LTO_MODE_FAT` / `LTO_MODE_FULL`) & `WorldScope`
+//     (`WORLD_CLOSED`, `WORLD_PARTIAL`, `WORLD_OPEN`) (`AXS-LTO-001..004`)
+//   - Per-module `.axmeta` `LtoModuleSummary` binary serialization/deserialization & 64-bit/128-bit semantic digests
+//     with partition-level `ThinLTO` incremental invalidation (`lto_thin_partition_needs_rebuild`) (`AXS-LTO-002`, `ALTO-47`)
+//   - Whole-program closed-world reachability & non-exported `pub` symbol internalization (`lto_internalize_symbols`,
+//     `lto_compute_reachability`, `lto_prune_unreachable`) from formal root set $R_{root}$ (`Entry`, `Export`,
+//     `DynamicLookup`, `FfiCallback`, `Reflection`, `PinnedAt`, `ModuleInit`) + Rapid Type Analysis (`RTA`) (`AXS-LTO-005`, `AXS-LTO-010`)
+//   - Cross-module `OptIR` inlining, constant/closure specialization, `EffectSummary`/`FunctionEscapeSummary`/`AliasSummary`
+//     propagation (`UnknownAlias` fail-closed barrier, `atomic` & `volatile`/`@at` MMIO preservation), and closed-world
+//     `dyn Trait` / indirect function-pointer devirtualization (`lto_run_cross_module_opt`) (`AXS-LTO-011..013`, `AXS-LTO-015`)
+//   - Cross-module generic monomorphization deduplication (`lto_deduplicate_generics`) merging identical instances and
+//     representation-equivalent (`RepEquivDesc`) instances while preserving distinct observable function addresses whenever
+//     `address_taken_fn == true` or `has_custom_drop == true` (`AXS-LTO-014`, `ALTO-30..33`)
+//   - `PassManager` `TransformationContract` (`PASS_LTO = 18u16`) and deterministic `--emit=lto` (`lto_print`) (`AXS-LTO-030`, `AXS-PGO-015`)
+module compiler.opt.lto
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_FFI
+use compiler.opt.optir.EFFECT_PURE
+use compiler.opt.optir.EFFECT_READS_MEM
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.EFFECT_WRITES_MEM
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_REACHABLE
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.effect_call_table_register
+use compiler.opt.effects.effect_summary_empty
+use compiler.opt.escape.ESC_NONE
+use compiler.opt.escape.EscapeSummaryTable
+use compiler.opt.escape.escape_summary_table_register
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_ESCAPE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_PURE_CALL
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.sroa.SroaDecisionLog
+use compiler.opt.sroa.SroaStats
+use compiler.opt.sroa.sroa_stats_zero
+use compiler.opt.sroa.sroa_verify_postconditions_arg_aware
+use compiler.opt.inline.ANALYSIS_CALL_GRAPH
+use compiler.opt.inline.ANALYSIS_MASK_CALL_GRAPH
+use compiler.opt.inline.CallGraph
+use compiler.opt.inline.DISPATCH_CLOSURE
+use compiler.opt.inline.DISPATCH_DIRECT
+use compiler.opt.inline.DISPATCH_DYN_TRAIT
+use compiler.opt.inline.DISPATCH_FFI_EXTERN
+use compiler.opt.inline.DISPATCH_FN_PTR
+use compiler.opt.inline.INLINE_ATTR_ALWAYS
+use compiler.opt.inline.INLINE_ATTR_HINT
+use compiler.opt.inline.INLINE_ATTR_NEVER
+use compiler.opt.inline.INLINE_NONE_IDX
+use compiler.opt.inline.InlineDecisionLog
+use compiler.opt.inline.REACH_DEAD_ELIMINATED
+use compiler.opt.inline.REACH_INTERNAL
+use compiler.opt.inline.REACH_ROOT
+use compiler.opt.inline.callgraph_analyze_edges
+use compiler.opt.inline.callgraph_compute_sccs
+use compiler.opt.inline.callgraph_finalize
+use compiler.opt.inline.callgraph_find_node_idx
+use compiler.opt.inline.callgraph_propagate_summaries
+use compiler.opt.inline.cg_edge_at
+use compiler.opt.inline.cg_node_at
+use compiler.opt.inline.inl_sym_at
+use compiler.opt.inline.inline_optimize_callgraph
+use compiler.opt.inline.inline_stats_zero
+use compiler.opt.ipa.RepEquivDesc
+use compiler.opt.ipa.SpecDecisionLog
+use compiler.opt.ipa.ipa_can_share_representation
+use compiler.opt.ipa.ipa_spec_stats_zero
+use compiler.opt.ipa.ipa_specialize_callgraph
+use compiler.opt.devirt.DevirtDecisionLog
+use compiler.opt.devirt.MAX_GUARDED_TARGETS
+use compiler.opt.devirt.devirt_optimize_callgraph
+use compiler.opt.devirt.devirt_stats_zero
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifier & TransformationContract (`SPEC-75 §5, AXS-LTO-030`) ---
+
+pub const PASS_LTO: u16 = 18u16;
+
+pub fn lto_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_LTO,
+        required_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS |
+                           ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_EFFECT_INFO |
+                           ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_ALIAS_INFO,
+        required_proofs: PROP_MASK_REACHABLE | PROP_MASK_PURE_CALL | PROP_MASK_NO_ESCAPE | PROP_MASK_NO_ALIAS,
+        preserved_analyses: ANALYSIS_MASK_CALL_GRAPH,
+        invalidated_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                              ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_EFFECT_INFO | ANALYSIS_MASK_ESCAPE_INFO |
+                              ANALYSIS_MASK_ALIAS_INFO | ANALYSIS_MASK_LOOP_INFO | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_NO_ESCAPE | PROP_MASK_PURE_CALL,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- Section 1: LTO Modes, World Scopes, Visibility Lattice, Root Set, & Alias Codes (`AXS-LTO-001..005, AXS-LTO-010..014`) ---
+
+pub const LTO_MODE_OFF: u8 = 0u8;
+pub const LTO_MODE_THIN: u8 = 1u8;
+pub const LTO_MODE_FAT: u8 = 2u8;
+pub const LTO_MODE_FULL: u8 = 2u8;
+
+pub const WORLD_CLOSED: u8 = 0u8;
+pub const WORLD_PARTIAL: u8 = 1u8;
+pub const WORLD_OPEN: u8 = 2u8;
+
+pub const LTO_VIS_PRIVATE: u8 = 0u8;
+pub const LTO_VIS_PUB: u8 = 1u8;
+pub const LTO_VIS_EXPORTED: u8 = 2u8;
+pub const LTO_VIS_EXTERN_FFI: u8 = 3u8;
+
+pub const LTO_LINKAGE_LOCAL: u8 = 0u8;
+pub const LTO_LINKAGE_GLOBAL: u8 = 1u8;
+pub const LTO_LINKAGE_INTERNALIZED: u8 = 2u8;
+pub const LTO_LINKAGE_EXPORTED_ROOT: u8 = 3u8;
+pub const LTO_LINKAGE_DEAD_ELIMINATED: u8 = 4u8;
+
+pub const LTO_ROOT_NONE: u8 = 0u8;
+pub const LTO_ROOT_ENTRY: u8 = 1u8;
+pub const LTO_ROOT_EXPORT: u8 = 2u8;
+pub const LTO_ROOT_DYNAMIC_LOOKUP: u8 = 3u8;
+pub const LTO_ROOT_FFI_CALLBACK: u8 = 4u8;
+pub const LTO_ROOT_REFLECTION: u8 = 5u8;
+pub const LTO_ROOT_PINNED_AT: u8 = 6u8;
+pub const LTO_ROOT_MODULE_INIT: u8 = 7u8;
+
+pub const LTO_ALIAS_NO_ALIAS: u8 = 0u8;
+pub const LTO_ALIAS_MAY_ALIAS: u8 = 1u8;
+pub const LTO_ALIAS_UNKNOWN_ALIAS: u8 = 2u8;
+
+pub const LTO_DEDUP_NONE: u8 = 0u8;
+pub const LTO_DEDUP_EXACT_INSTANCE: u8 = 1u8;
+pub const LTO_DEDUP_REP_EQUIV_SHARED: u8 = 2u8;
+pub const LTO_DEDUP_KEPT_ADDRESS_TAKEN: u8 = 3u8;
+pub const LTO_DEDUP_KEPT_CUSTOM_DROP: u8 = 4u8;
+pub const LTO_DEDUP_KEPT_LAYOUT_MISMATCH: u8 = 5u8;
+
+pub const AXMETA_MAGIC_0: u8 = 65u8; // 'A'
+pub const AXMETA_MAGIC_1: u8 = 88u8; // 'X'
+pub const AXMETA_MAGIC_2: u8 = 76u8; // 'L'
+pub const AXMETA_MAGIC_3: u8 = 84u8; // 'T'
+pub const AXMETA_SCHEMA_VERSION: u32 = 1u32;
+
+@derive(Copy)
+pub struct LtoDigest128 {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+@derive(Copy)
+pub struct LtoFnSummary {
+    pub fn_sym: SymbolId,
+    pub fn_name: StrId,
+    pub module_id: u32,
+    pub visibility: u8,
+    pub linkage: u8,
+    pub root_kind: u8,
+    pub reachability: u8,
+    pub signature_hash: u64,
+    pub cfg_fingerprint: u64,
+    pub body_fingerprint: u64,
+    pub inst_count: u32,
+    pub effect_flags: u16,
+    pub escape_return_mask: u32,
+    pub param_no_escape_mask: u64,
+    pub param_no_alias_mask: u64,
+    pub alias_state: u8,
+    pub has_raw_ptr_or_ffi_alias: bool,
+    pub has_atomic_ops: bool,
+    pub has_volatile_ops: bool,
+    pub has_custom_drop: bool,
+    pub address_taken_fn: bool,
+    pub eligible_for_cross_inline: bool,
+    pub generic_def_id: u32,
+    pub canonical_type_arg_hash: u64,
+    pub rep_type_size: u32,
+    pub rep_type_align: u32,
+    pub rep_abi_class: u8,
+    pub canonical_leader_sym: SymbolId,
+}
+
+@derive(Copy)
+pub struct LtoStaticSummary {
+    pub static_sym: SymbolId,
+    pub module_id: u32,
+    pub visibility: u8,
+    pub linkage: u8,
+    pub root_kind: u8,
+    pub reachability: u8,
+    pub is_mutable: bool,
+    pub is_volatile_or_pinned_at: bool,
+    pub is_atomic: bool,
+    pub address_taken: bool,
+    pub has_const_init: bool,
+    pub init_const_val: u64,
+    pub referenced_fn_sym: SymbolId,
+}
+
+@derive(Copy)
+pub struct LtoTraitImplRecord {
+    pub trait_id: u32,
+    pub concrete_type_id: u32,
+    pub vtable_sym: SymbolId,
+    pub method_sym: SymbolId,
+    pub module_id: u32,
+    pub is_coerced_to_dyn: bool,
+    pub is_live_vtable: bool,
+}
+
+@derive(Copy)
+pub struct LtoGenericDedupRecord {
+    pub canonical_sym: SymbolId,
+    pub candidate_sym: SymbolId,
+    pub generic_def_id: u32,
+    pub decision: u8,
+}
+
+pub struct LtoModuleSummary {
+    pub module_id: u32,
+    pub target_triple: StrId,
+    pub digest_64: u64,
+    pub digest_128: LtoDigest128,
+    pub fns: *mut LtoFnSummary,
+    pub fn_count: usize,
+    pub fn_cap: usize,
+    pub statics: *mut LtoStaticSummary,
+    pub static_count: usize,
+    pub static_cap: usize,
+    pub trait_impls: *mut LtoTraitImplRecord,
+    pub trait_impl_count: usize,
+    pub trait_impl_cap: usize,
+}
+
+pub struct LtoWholeProgram {
+    pub lto_mode: u8,
+    pub world_scope: u8,
+    pub cg: *mut CallGraph,
+    pub modules: *mut *mut LtoModuleSummary,
+    pub module_count: usize,
+    pub module_cap: usize,
+    pub fns: *mut LtoFnSummary,
+    pub fn_count: usize,
+    pub fn_cap: usize,
+    pub statics: *mut LtoStaticSummary,
+    pub static_count: usize,
+    pub static_cap: usize,
+    pub trait_impls: *mut LtoTraitImplRecord,
+    pub trait_impl_count: usize,
+    pub trait_impl_cap: usize,
+    pub dedup_records: *mut LtoGenericDedupRecord,
+    pub dedup_count: usize,
+    pub dedup_cap: usize,
+}
+
+@derive(Copy)
+pub struct LtoStats {
+    pub modules_imported: u32,
+    pub roots_registered: u32,
+    pub symbols_internalized: u32,
+    pub single_caller_promoted: u32,
+    pub dead_fns_eliminated: u32,
+    pub dead_statics_eliminated: u32,
+    pub dead_vtables_eliminated: u32,
+    pub cross_module_inlined: u32,
+    pub cross_module_specialized: u32,
+    pub cross_module_devirt_exact: u32,
+    pub cross_module_devirt_guarded: u32,
+    pub cross_module_escape_noescape: u32,
+    pub cross_module_alias_noalias: u32,
+    pub unknown_alias_barriers: u32,
+    pub atomic_barriers_preserved: u32,
+    pub volatile_mmio_preserved: u32,
+    pub generics_dedup_exact: u32,
+    pub generics_rep_shared: u32,
+    pub generics_kept_addr_taken: u32,
+    pub generics_kept_custom_drop: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// --- Pointer Indexing & Byte Serialization Helpers ---
+
+fn lto_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn lto_fn_at(base: *mut LtoFnSummary, idx: usize) -> *mut LtoFnSummary {
+    let off = lto_mul_usize(idx, size_of<LtoFnSummary>());
+    ((base as usize) + off) as *mut LtoFnSummary
+}
+
+pub unsafe fn lto_static_at(base: *mut LtoStaticSummary, idx: usize) -> *mut LtoStaticSummary {
+    let off = lto_mul_usize(idx, size_of<LtoStaticSummary>());
+    ((base as usize) + off) as *mut LtoStaticSummary
+}
+
+pub unsafe fn lto_trait_at(base: *mut LtoTraitImplRecord, idx: usize) -> *mut LtoTraitImplRecord {
+    let off = lto_mul_usize(idx, size_of<LtoTraitImplRecord>());
+    ((base as usize) + off) as *mut LtoTraitImplRecord
+}
+
+pub unsafe fn lto_dedup_at(base: *mut LtoGenericDedupRecord, idx: usize) -> *mut LtoGenericDedupRecord {
+    let off = lto_mul_usize(idx, size_of<LtoGenericDedupRecord>());
+    ((base as usize) + off) as *mut LtoGenericDedupRecord
+}
+
+pub unsafe fn lto_mod_ptr_at(base: *mut *mut LtoModuleSummary, idx: usize) -> *mut *mut LtoModuleSummary {
+    let off = lto_mul_usize(idx, size_of<*mut LtoModuleSummary>());
+    ((base as usize) + off) as *mut *mut LtoModuleSummary
+}
+
+pub unsafe fn lto_u8_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+pub unsafe fn lto_const_u8_at(base: *const u8, idx: usize) -> *const u8 {
+    ((base as usize) + idx) as *const u8
+}
+
+pub fn lto_stats_zero() -> LtoStats {
+    LtoStats {
+        modules_imported: 0u32,
+        roots_registered: 0u32,
+        symbols_internalized: 0u32,
+        single_caller_promoted: 0u32,
+        dead_fns_eliminated: 0u32,
+        dead_statics_eliminated: 0u32,
+        dead_vtables_eliminated: 0u32,
+        cross_module_inlined: 0u32,
+        cross_module_specialized: 0u32,
+        cross_module_devirt_exact: 0u32,
+        cross_module_devirt_guarded: 0u32,
+        cross_module_escape_noescape: 0u32,
+        cross_module_alias_noalias: 0u32,
+        unknown_alias_barriers: 0u32,
+        atomic_barriers_preserved: 0u32,
+        volatile_mmio_preserved: 0u32,
+        generics_dedup_exact: 0u32,
+        generics_rep_shared: 0u32,
+        generics_kept_addr_taken: 0u32,
+        generics_kept_custom_drop: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+pub fn lto_fn_summary_default(fn_sym: SymbolId, fn_name: StrId, module_id: u32, visibility: u8) -> LtoFnSummary {
+    let is_exp = visibility == LTO_VIS_EXPORTED;
+    let is_ffi = visibility == LTO_VIS_EXTERN_FFI;
+    let sym_v = fn_sym.v;
+    let name_v = fn_name.v;
+    LtoFnSummary {
+        fn_sym: SymbolId { v: sym_v },
+        fn_name: StrId { v: name_v },
+        module_id: module_id,
+        visibility: visibility,
+        linkage: if is_exp {
+            LTO_LINKAGE_EXPORTED_ROOT
+        } else if visibility == LTO_VIS_PRIVATE {
+            LTO_LINKAGE_LOCAL
+        } else {
+            LTO_LINKAGE_GLOBAL
+        },
+        root_kind: if is_exp { LTO_ROOT_EXPORT } else { LTO_ROOT_NONE },
+        reachability: if is_exp { REACH_ROOT } else { REACH_DEAD_ELIMINATED },
+        signature_hash: wrapping_mul_u64(sym_v as u64, 2654435761u64),
+        cfg_fingerprint: wrapping_mul_u64(sym_v as u64, 1099511628211u64),
+        body_fingerprint: wrapping_mul_u64(sym_v as u64, 14695981039346656037u64),
+        inst_count: 4u32,
+        effect_flags: if is_ffi { EFFECT_FFI | EFFECT_READS_MEM | EFFECT_WRITES_MEM } else { EFFECT_PURE },
+        escape_return_mask: ESC_NONE as u32,
+        param_no_escape_mask: if is_ffi { 0u64 } else { 0xFFFFFFFFFFFFFFFFu64 },
+        param_no_alias_mask: if is_ffi { 0u64 } else { 0xFFFFFFFFFFFFFFFFu64 },
+        alias_state: if is_ffi { LTO_ALIAS_UNKNOWN_ALIAS } else { LTO_ALIAS_NO_ALIAS },
+        has_raw_ptr_or_ffi_alias: is_ffi,
+        has_atomic_ops: false,
+        has_volatile_ops: false,
+        has_custom_drop: false,
+        address_taken_fn: false,
+        eligible_for_cross_inline: !is_ffi,
+        generic_def_id: 0u32,
+        canonical_type_arg_hash: 0u64,
+        rep_type_size: 8u32,
+        rep_type_align: 8u32,
+        rep_abi_class: 1u8,
+        canonical_leader_sym: SymbolId { v: sym_v },
+    }
+}
+
+pub fn lto_static_summary_default(static_sym: SymbolId, module_id: u32, visibility: u8) -> LtoStaticSummary {
+    let is_exp = visibility == LTO_VIS_EXPORTED;
+    let sym_v = static_sym.v;
+    LtoStaticSummary {
+        static_sym: SymbolId { v: sym_v },
+        module_id: module_id,
+        visibility: visibility,
+        linkage: if is_exp {
+            LTO_LINKAGE_EXPORTED_ROOT
+        } else if visibility == LTO_VIS_PRIVATE {
+            LTO_LINKAGE_LOCAL
+        } else {
+            LTO_LINKAGE_GLOBAL
+        },
+        root_kind: if is_exp { LTO_ROOT_EXPORT } else { LTO_ROOT_NONE },
+        reachability: if is_exp { REACH_ROOT } else { REACH_DEAD_ELIMINATED },
+        is_mutable: false,
+        is_volatile_or_pinned_at: false,
+        is_atomic: false,
+        address_taken: false,
+        has_const_init: false,
+        init_const_val: 0u64,
+        referenced_fn_sym: SymbolId { v: 0u32 },
+    }
+}
+
+// --- Section 2: Per-Module `.axmeta` Summary Digests (64-bit & 128-bit), Serialization, & ThinLTO Invalidation (`AXS-LTO-002`) ---
+
+fn lto_fnv_mix_lo(h: u64, v: u64) -> u64 {
+    wrapping_mul_u64(h ^ v, 1099511628211u64)
+}
+
+fn lto_fnv_mix_hi(h: u64, v: u64) -> u64 {
+    let rotated = rotate_left_u64(v, 13u32);
+    wrapping_mul_u64(h ^ rotated ^ 0x9E3779B97F4A7C15u64, 0xBF58476D1CE4E5B9u64)
+}
+
+pub fn lto_digest128_eq(a: view<LtoDigest128>, b: view<LtoDigest128>) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+pub fn lto_module_summary_new(
+    arena: mut_view<Arena>,
+    module_id: u32,
+    target_triple: StrId
+) -> *mut LtoModuleSummary {
+    let ms = arena_alloc_raw(mut_view(*arena), size_of<LtoModuleSummary>(), align_of<LtoModuleSummary>()) as *mut LtoModuleSummary;
+    let init_cap: usize = 8;
+    let fns = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoFnSummary>()), align_of<LtoFnSummary>()) as *mut LtoFnSummary;
+    let sts = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoStaticSummary>()), align_of<LtoStaticSummary>()) as *mut LtoStaticSummary;
+    let trs = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoTraitImplRecord>()), align_of<LtoTraitImplRecord>()) as *mut LtoTraitImplRecord;
+    unsafe {
+        (*ms).module_id = module_id;
+        (*ms).target_triple = target_triple;
+        (*ms).digest_64 = 0u64;
+        (*ms).digest_128 = LtoDigest128 { lo: 0u64, hi: 0u64 };
+        (*ms).fns = fns;
+        (*ms).fn_count = 0;
+        (*ms).fn_cap = init_cap;
+        (*ms).statics = sts;
+        (*ms).static_count = 0;
+        (*ms).static_cap = init_cap;
+        (*ms).trait_impls = trs;
+        (*ms).trait_impl_count = 0;
+        (*ms).trait_impl_cap = init_cap;
+    }
+    ms
+}
+
+pub fn lto_module_summary_add_fn(
+    ms: mut_view<LtoModuleSummary>,
+    arena: mut_view<Arena>,
+    rec: LtoFnSummary
+) {
+    if ms.fn_count >= ms.fn_cap {
+        let new_cap: usize = if ms.fn_cap == 0 { 8 } else { ms.fn_cap + ms.fn_cap };
+        let new_fns = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoFnSummary>()), align_of<LtoFnSummary>()) as *mut LtoFnSummary;
+        let mut i: usize = 0;
+        while i < ms.fn_count {
+            unsafe { *lto_fn_at(new_fns, i) = *lto_fn_at(ms.fns, i); }
+            i = i + 1;
+        }
+        ms.fns = new_fns;
+        ms.fn_cap = new_cap;
+    }
+    // Insert sorted by `fn_sym.v` for deterministic `.axmeta` layout (`AXS-LTO-002.2`, `INV-DET-001`)
+    let mut pos: usize = ms.fn_count;
+    let rec_sym = rec.fn_sym.v;
+    let mut k: usize = 0;
+    while k < ms.fn_count {
+        let cur_sym = unsafe { (*lto_fn_at(ms.fns, k)).fn_sym.v };
+        if rec_sym < cur_sym {
+            pos = k;
+            break;
+        }
+        k = k + 1;
+    }
+    let mut j: usize = ms.fn_count;
+    while j > pos {
+        unsafe { *lto_fn_at(ms.fns, j) = *lto_fn_at(ms.fns, j - 1); }
+        j = j - 1;
+    }
+    unsafe { *lto_fn_at(ms.fns, pos) = rec; }
+    ms.fn_count = ms.fn_count + 1;
+    let _ = lto_compute_module_digest(mut_view(*ms));
+}
+
+pub fn lto_module_summary_add_static(
+    ms: mut_view<LtoModuleSummary>,
+    arena: mut_view<Arena>,
+    rec: LtoStaticSummary
+) {
+    if ms.static_count >= ms.static_cap {
+        let new_cap: usize = if ms.static_cap == 0 { 8 } else { ms.static_cap + ms.static_cap };
+        let new_sts = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoStaticSummary>()), align_of<LtoStaticSummary>()) as *mut LtoStaticSummary;
+        let mut i: usize = 0;
+        while i < ms.static_count {
+            unsafe { *lto_static_at(new_sts, i) = *lto_static_at(ms.statics, i); }
+            i = i + 1;
+        }
+        ms.statics = new_sts;
+        ms.static_cap = new_cap;
+    }
+    let idx = ms.static_count;
+    ms.static_count = idx + 1;
+    unsafe { *lto_static_at(ms.statics, idx) = rec; }
+    let _ = lto_compute_module_digest(mut_view(*ms));
+}
+
+pub fn lto_module_summary_add_trait_impl(
+    ms: mut_view<LtoModuleSummary>,
+    arena: mut_view<Arena>,
+    rec: LtoTraitImplRecord
+) {
+    if ms.trait_impl_count >= ms.trait_impl_cap {
+        let new_cap: usize = if ms.trait_impl_cap == 0 { 8 } else { ms.trait_impl_cap + ms.trait_impl_cap };
+        let new_trs = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoTraitImplRecord>()), align_of<LtoTraitImplRecord>()) as *mut LtoTraitImplRecord;
+        let mut i: usize = 0;
+        while i < ms.trait_impl_count {
+            unsafe { *lto_trait_at(new_trs, i) = *lto_trait_at(ms.trait_impls, i); }
+            i = i + 1;
+        }
+        ms.trait_impls = new_trs;
+        ms.trait_impl_cap = new_cap;
+    }
+    let idx = ms.trait_impl_count;
+    ms.trait_impl_count = idx + 1;
+    unsafe { *lto_trait_at(ms.trait_impls, idx) = rec; }
+    let _ = lto_compute_module_digest(mut_view(*ms));
+}
+
+pub fn lto_compute_module_digest(ms: mut_view<LtoModuleSummary>) -> LtoDigest128 {
+    let mut lo: u64 = 14695981039346656037u64;
+    let mut hi: u64 = 0x6A09E667F3BCC908u64;
+
+    lo = lto_fnv_mix_lo(lo, ms.module_id as u64);
+    hi = lto_fnv_mix_hi(hi, ms.module_id as u64);
+    lo = lto_fnv_mix_lo(lo, ms.target_triple.v as u64);
+    hi = lto_fnv_mix_hi(hi, ms.target_triple.v as u64);
+    lo = lto_fnv_mix_lo(lo, ms.fn_count as u64);
+    hi = lto_fnv_mix_hi(hi, ms.fn_count as u64);
+
+    let mut i: usize = 0;
+    while i < ms.fn_count && (ms.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(ms.fns, i) };
+        let sym_v = (unsafe { (*fp).fn_sym.v }) as u64;
+        let sig_h = unsafe { (*fp).signature_hash };
+        let cfg_h = unsafe { (*fp).cfg_fingerprint };
+        let bdy_h = unsafe { (*fp).body_fingerprint };
+        let eff_v = (unsafe { (*fp).effect_flags }) as u64;
+        let esc_v = unsafe { (*fp).param_no_escape_mask };
+        let ali_v = unsafe { (*fp).param_no_alias_mask };
+        let gen_v = (unsafe { (*fp).generic_def_id }) as u64;
+        let targ_h = unsafe { (*fp).canonical_type_arg_hash };
+
+        lo = lto_fnv_mix_lo(lo, sym_v);
+        lo = lto_fnv_mix_lo(lo, sig_h);
+        lo = lto_fnv_mix_lo(lo, cfg_h);
+        lo = lto_fnv_mix_lo(lo, bdy_h);
+        lo = lto_fnv_mix_lo(lo, eff_v);
+        lo = lto_fnv_mix_lo(lo, esc_v);
+        lo = lto_fnv_mix_lo(lo, ali_v);
+        lo = lto_fnv_mix_lo(lo, gen_v);
+        lo = lto_fnv_mix_lo(lo, targ_h);
+
+        hi = lto_fnv_mix_hi(hi, sym_v);
+        hi = lto_fnv_mix_hi(hi, sig_h);
+        hi = lto_fnv_mix_hi(hi, cfg_h);
+        hi = lto_fnv_mix_hi(hi, bdy_h);
+        hi = lto_fnv_mix_hi(hi, eff_v);
+        hi = lto_fnv_mix_hi(hi, esc_v);
+        hi = lto_fnv_mix_hi(hi, ali_v);
+        hi = lto_fnv_mix_hi(hi, gen_v);
+        hi = lto_fnv_mix_hi(hi, targ_h);
+        i = i + 1;
+    }
+
+    let mut s: usize = 0;
+    while s < ms.static_count && (ms.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(ms.statics, s) };
+        let ssym = (unsafe { (*sp).static_sym.v }) as u64;
+        let sval = unsafe { (*sp).init_const_val };
+        lo = lto_fnv_mix_lo(lo, ssym);
+        lo = lto_fnv_mix_lo(lo, sval);
+        hi = lto_fnv_mix_hi(hi, ssym);
+        hi = lto_fnv_mix_hi(hi, sval);
+        s = s + 1;
+    }
+
+    let mut t: usize = 0;
+    while t < ms.trait_impl_count && (ms.trait_impls as usize) != 0 {
+        let tp = unsafe { lto_trait_at(ms.trait_impls, t) };
+        let tv = ((unsafe { (*tp).trait_id }) as u64) ^ (((unsafe { (*tp).concrete_type_id }) as u64) << 32u64);
+        let mv = (unsafe { (*tp).method_sym.v }) as u64;
+        lo = lto_fnv_mix_lo(lo, tv);
+        lo = lto_fnv_mix_lo(lo, mv);
+        hi = lto_fnv_mix_hi(hi, tv);
+        hi = lto_fnv_mix_hi(hi, mv);
+        t = t + 1;
+    }
+
+    let d128 = LtoDigest128 { lo: lo, hi: hi };
+    ms.digest_64 = lo;
+    ms.digest_128 = d128;
+    d128
+}
+
+// Incremental `ThinLTO` partition invalidation (`AXS-LTO-002.4`, `REQ-OPT-376`, `ALTO-47`):
+// Partition $M$ needs re-optimization iff its own 128-bit `.axmeta` summary digest changed
+// OR the digest of cross-module summaries/bodies imported into $M$ changed.
+pub fn lto_thin_partition_needs_rebuild(
+    old_mod_digest: view<LtoDigest128>,
+    new_mod_digest: view<LtoDigest128>,
+    old_imported_digest: u64,
+    new_imported_digest: u64
+) -> bool {
+    if !lto_digest128_eq(old_mod_digest, new_mod_digest) {
+        return true;
+    }
+    old_imported_digest != new_imported_digest
+}
+
+fn lto_write_u32_le(buf: *mut u8, off: usize, val: u32) -> usize {
+    unsafe {
+        *lto_u8_at(buf, off) = (val & 0xFFu32) as u8;
+        *lto_u8_at(buf, off + 1) = ((val >> 8u32) & 0xFFu32) as u8;
+        *lto_u8_at(buf, off + 2) = ((val >> 16u32) & 0xFFu32) as u8;
+        *lto_u8_at(buf, off + 3) = ((val >> 24u32) & 0xFFu32) as u8;
+    }
+    off + 4
+}
+
+fn lto_read_u32_le(buf: *const u8, off: usize) -> u32 {
+    let b0 = (unsafe { *lto_const_u8_at(buf, off) }) as u32;
+    let b1 = (unsafe { *lto_const_u8_at(buf, off + 1) }) as u32;
+    let b2 = (unsafe { *lto_const_u8_at(buf, off + 2) }) as u32;
+    let b3 = (unsafe { *lto_const_u8_at(buf, off + 3) }) as u32;
+    b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+}
+
+fn lto_write_u64_le(buf: *mut u8, off: usize, val: u64) -> usize {
+    let lo = (val & 0xFFFFFFFFu64) as u32;
+    let hi = ((val >> 32u64) & 0xFFFFFFFFu64) as u32;
+    let off1 = lto_write_u32_le(buf, off, lo);
+    lto_write_u32_le(buf, off1, hi)
+}
+
+fn lto_read_u64_le(buf: *const u8, off: usize) -> u64 {
+    let lo = lto_read_u32_le(buf, off) as u64;
+    let hi = lto_read_u32_le(buf, off + 4) as u64;
+    lo | (hi << 32u64)
+}
+
+// Binary `.axmeta` summary serializer (`AXS-LTO-002.2`, `REQ-OPT-375`):
+// Header (44 bytes):
+//   [0..4]   magic `AXLT`
+//   [4..8]   schema_version (1)
+//   [8..12]  module_id
+//   [12..16] target_triple.v
+//   [16..24] digest_128.lo (digest_64)
+//   [24..32] digest_128.hi
+//   [32..36] fn_count
+//   [36..40] static_count
+//   [40..44] trait_impl_count
+// Followed by raw arrays of `LtoFnSummary`, `LtoStaticSummary`, and `LtoTraitImplRecord`.
+pub fn lto_serialize_module_summary(
+    ms: view<LtoModuleSummary>,
+    arena: mut_view<Arena>,
+    out_len: mut_view<usize>
+) -> *mut u8 {
+    let header_bytes: usize = 44;
+    let fn_bytes = lto_mul_usize(ms.fn_count, size_of<LtoFnSummary>());
+    let st_bytes = lto_mul_usize(ms.static_count, size_of<LtoStaticSummary>());
+    let tr_bytes = lto_mul_usize(ms.trait_impl_count, size_of<LtoTraitImplRecord>());
+    let total_bytes = header_bytes + fn_bytes + st_bytes + tr_bytes;
+
+    let buf = arena_alloc_raw(mut_view(*arena), total_bytes, 8);
+    unsafe {
+        *lto_u8_at(buf, 0) = AXMETA_MAGIC_0;
+        *lto_u8_at(buf, 1) = AXMETA_MAGIC_1;
+        *lto_u8_at(buf, 2) = AXMETA_MAGIC_2;
+        *lto_u8_at(buf, 3) = AXMETA_MAGIC_3;
+    }
+    let mut off: usize = 4;
+    off = lto_write_u32_le(buf, off, AXMETA_SCHEMA_VERSION);
+    off = lto_write_u32_le(buf, off, ms.module_id);
+    off = lto_write_u32_le(buf, off, ms.target_triple.v);
+    off = lto_write_u64_le(buf, off, ms.digest_128.lo);
+    off = lto_write_u64_le(buf, off, ms.digest_128.hi);
+    off = lto_write_u32_le(buf, off, ms.fn_count as u32);
+    off = lto_write_u32_le(buf, off, ms.static_count as u32);
+    off = lto_write_u32_le(buf, off, ms.trait_impl_count as u32);
+
+    if fn_bytes > 0 && (ms.fns as usize) != 0 {
+        unsafe { ptr_copy_nonoverlapping<u8>(ms.fns as *const u8, lto_u8_at(buf, off), fn_bytes); }
+        off = off + fn_bytes;
+    }
+    if st_bytes > 0 && (ms.statics as usize) != 0 {
+        unsafe { ptr_copy_nonoverlapping<u8>(ms.statics as *const u8, lto_u8_at(buf, off), st_bytes); }
+        off = off + st_bytes;
+    }
+    if tr_bytes > 0 && (ms.trait_impls as usize) != 0 {
+        unsafe { ptr_copy_nonoverlapping<u8>(ms.trait_impls as *const u8, lto_u8_at(buf, off), tr_bytes); }
+        off = off + tr_bytes;
+    }
+
+    *out_len = total_bytes;
+    buf
+}
+
+pub fn lto_deserialize_module_summary(
+    bytes: *const u8,
+    byte_len: usize,
+    arena: mut_view<Arena>
+) -> *mut LtoModuleSummary {
+    if (bytes as usize) == 0 || byte_len < 44 {
+        return 0 as *mut LtoModuleSummary;
+    }
+    let m0 = unsafe { *lto_const_u8_at(bytes, 0) };
+    let m1 = unsafe { *lto_const_u8_at(bytes, 1) };
+    let m2 = unsafe { *lto_const_u8_at(bytes, 2) };
+    let m3 = unsafe { *lto_const_u8_at(bytes, 3) };
+    if m0 != AXMETA_MAGIC_0 || m1 != AXMETA_MAGIC_1 || m2 != AXMETA_MAGIC_2 || m3 != AXMETA_MAGIC_3 {
+        return 0 as *mut LtoModuleSummary;
+    }
+    let ver = lto_read_u32_le(bytes, 4);
+    if ver != AXMETA_SCHEMA_VERSION {
+        return 0 as *mut LtoModuleSummary;
+    }
+    let mod_id = lto_read_u32_le(bytes, 8);
+    let target_v = lto_read_u32_le(bytes, 12);
+    let dig_lo = lto_read_u64_le(bytes, 16);
+    let dig_hi = lto_read_u64_le(bytes, 24);
+    let fn_cnt = lto_read_u32_le(bytes, 32) as usize;
+    let st_cnt = lto_read_u32_le(bytes, 36) as usize;
+    let tr_cnt = lto_read_u32_le(bytes, 40) as usize;
+
+    let fn_bytes = lto_mul_usize(fn_cnt, size_of<LtoFnSummary>());
+    let st_bytes = lto_mul_usize(st_cnt, size_of<LtoStaticSummary>());
+    let tr_bytes = lto_mul_usize(tr_cnt, size_of<LtoTraitImplRecord>());
+    if (44 + fn_bytes + st_bytes + tr_bytes) > byte_len {
+        return 0 as *mut LtoModuleSummary;
+    }
+
+    let ms = lto_module_summary_new(mut_view(*arena), mod_id, StrId { v: target_v });
+    let mut off: usize = 44;
+    if fn_cnt > 0 {
+        let fns_dst = arena_alloc_raw(mut_view(*arena), fn_bytes, align_of<LtoFnSummary>()) as *mut LtoFnSummary;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(lto_const_u8_at(bytes, off), fns_dst as *mut u8, fn_bytes);
+            (*ms).fns = fns_dst;
+            (*ms).fn_count = fn_cnt;
+            (*ms).fn_cap = fn_cnt;
+        }
+        off = off + fn_bytes;
+    }
+    if st_cnt > 0 {
+        let sts_dst = arena_alloc_raw(mut_view(*arena), st_bytes, align_of<LtoStaticSummary>()) as *mut LtoStaticSummary;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(lto_const_u8_at(bytes, off), sts_dst as *mut u8, st_bytes);
+            (*ms).statics = sts_dst;
+            (*ms).static_count = st_cnt;
+            (*ms).static_cap = st_cnt;
+        }
+        off = off + st_bytes;
+    }
+    if tr_cnt > 0 {
+        let trs_dst = arena_alloc_raw(mut_view(*arena), tr_bytes, align_of<LtoTraitImplRecord>()) as *mut LtoTraitImplRecord;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(lto_const_u8_at(bytes, off), trs_dst as *mut u8, tr_bytes);
+            (*ms).trait_impls = trs_dst;
+            (*ms).trait_impl_count = tr_cnt;
+            (*ms).trait_impl_cap = tr_cnt;
+        }
+    }
+
+    let computed = lto_compute_module_digest(unsafe { mut_view(*ms) });
+    if computed.lo != dig_lo || computed.hi != dig_hi {
+        return 0 as *mut LtoModuleSummary;
+    }
+    ms
+}
+
+// --- Section 3: Whole-Program Session, Closed-World Reachability, Internalization, & Dead Pruning (`AXS-LTO-004..005, AXS-LTO-010`) ---
+
+pub fn lto_wpo_new(
+    arena: mut_view<Arena>,
+    cg: *mut CallGraph,
+    lto_mode: u8,
+    world_scope: u8
+) -> *mut LtoWholeProgram {
+    let wpo = arena_alloc_raw(mut_view(*arena), size_of<LtoWholeProgram>(), align_of<LtoWholeProgram>()) as *mut LtoWholeProgram;
+    let init_cap: usize = 16;
+    let mods = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<*mut LtoModuleSummary>()), align_of<*mut LtoModuleSummary>()) as *mut *mut LtoModuleSummary;
+    let fns = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoFnSummary>()), align_of<LtoFnSummary>()) as *mut LtoFnSummary;
+    let sts = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoStaticSummary>()), align_of<LtoStaticSummary>()) as *mut LtoStaticSummary;
+    let trs = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoTraitImplRecord>()), align_of<LtoTraitImplRecord>()) as *mut LtoTraitImplRecord;
+    let dds = arena_alloc_raw(mut_view(*arena), lto_mul_usize(init_cap, size_of<LtoGenericDedupRecord>()), align_of<LtoGenericDedupRecord>()) as *mut LtoGenericDedupRecord;
+    unsafe {
+        (*wpo).lto_mode = lto_mode;
+        (*wpo).world_scope = world_scope;
+        (*wpo).cg = cg;
+        if (cg as usize) != 0 {
+            (*cg).closed_world = world_scope == WORLD_CLOSED;
+        }
+        (*wpo).modules = mods;
+        (*wpo).module_count = 0;
+        (*wpo).module_cap = init_cap;
+        (*wpo).fns = fns;
+        (*wpo).fn_count = 0;
+        (*wpo).fn_cap = init_cap;
+        (*wpo).statics = sts;
+        (*wpo).static_count = 0;
+        (*wpo).static_cap = init_cap;
+        (*wpo).trait_impls = trs;
+        (*wpo).trait_impl_count = 0;
+        (*wpo).trait_impl_cap = init_cap;
+        (*wpo).dedup_records = dds;
+        (*wpo).dedup_count = 0;
+        (*wpo).dedup_cap = init_cap;
+    }
+    wpo
+}
+
+pub fn lto_wpo_find_fn_idx(wpo: view<LtoWholeProgram>, fn_sym: SymbolId) -> u32 {
+    if fn_sym.v == 0u32 || (wpo.fns as usize) == 0 {
+        return INLINE_NONE_IDX;
+    }
+    let mut i: usize = 0;
+    while i < wpo.fn_count {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        if (unsafe { (*fp).fn_sym.v }) == fn_sym.v {
+            return i as u32;
+        }
+        i = i + 1;
+    }
+    INLINE_NONE_IDX
+}
+
+fn lto_wpo_push_fn(wpo: mut_view<LtoWholeProgram>, arena: mut_view<Arena>, rec: LtoFnSummary) {
+    let rec_sym_v = rec.fn_sym.v;
+    let existing = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: rec_sym_v });
+    if existing != INLINE_NONE_IDX {
+        unsafe { *lto_fn_at(wpo.fns, existing as usize) = rec; }
+        return;
+    }
+    if wpo.fn_count >= wpo.fn_cap {
+        let new_cap: usize = if wpo.fn_cap == 0 { 16 } else { wpo.fn_cap + wpo.fn_cap };
+        let new_fns = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoFnSummary>()), align_of<LtoFnSummary>()) as *mut LtoFnSummary;
+        let mut i: usize = 0;
+        while i < wpo.fn_count {
+            unsafe { *lto_fn_at(new_fns, i) = *lto_fn_at(wpo.fns, i); }
+            i = i + 1;
+        }
+        wpo.fns = new_fns;
+        wpo.fn_cap = new_cap;
+    }
+    let idx = wpo.fn_count;
+    wpo.fn_count = idx + 1;
+    unsafe { *lto_fn_at(wpo.fns, idx) = rec; }
+}
+
+fn lto_wpo_push_static(wpo: mut_view<LtoWholeProgram>, arena: mut_view<Arena>, rec: LtoStaticSummary) {
+    if wpo.static_count >= wpo.static_cap {
+        let new_cap: usize = if wpo.static_cap == 0 { 16 } else { wpo.static_cap + wpo.static_cap };
+        let new_sts = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoStaticSummary>()), align_of<LtoStaticSummary>()) as *mut LtoStaticSummary;
+        let mut i: usize = 0;
+        while i < wpo.static_count {
+            unsafe { *lto_static_at(new_sts, i) = *lto_static_at(wpo.statics, i); }
+            i = i + 1;
+        }
+        wpo.statics = new_sts;
+        wpo.static_cap = new_cap;
+    }
+    let idx = wpo.static_count;
+    wpo.static_count = idx + 1;
+    unsafe { *lto_static_at(wpo.statics, idx) = rec; }
+}
+
+fn lto_wpo_push_trait_impl(wpo: mut_view<LtoWholeProgram>, arena: mut_view<Arena>, rec: LtoTraitImplRecord) {
+    if wpo.trait_impl_count >= wpo.trait_impl_cap {
+        let new_cap: usize = if wpo.trait_impl_cap == 0 { 16 } else { wpo.trait_impl_cap + wpo.trait_impl_cap };
+        let new_trs = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoTraitImplRecord>()), align_of<LtoTraitImplRecord>()) as *mut LtoTraitImplRecord;
+        let mut i: usize = 0;
+        while i < wpo.trait_impl_count {
+            unsafe { *lto_trait_at(new_trs, i) = *lto_trait_at(wpo.trait_impls, i); }
+            i = i + 1;
+        }
+        wpo.trait_impls = new_trs;
+        wpo.trait_impl_cap = new_cap;
+    }
+    let idx = wpo.trait_impl_count;
+    wpo.trait_impl_count = idx + 1;
+    unsafe { *lto_trait_at(wpo.trait_impls, idx) = rec; }
+}
+
+fn lto_wpo_push_dedup(wpo: mut_view<LtoWholeProgram>, arena: mut_view<Arena>, rec: LtoGenericDedupRecord) {
+    if wpo.dedup_count >= wpo.dedup_cap {
+        let new_cap: usize = if wpo.dedup_cap == 0 { 16 } else { wpo.dedup_cap + wpo.dedup_cap };
+        let new_dds = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<LtoGenericDedupRecord>()), align_of<LtoGenericDedupRecord>()) as *mut LtoGenericDedupRecord;
+        let mut i: usize = 0;
+        while i < wpo.dedup_count {
+            unsafe { *lto_dedup_at(new_dds, i) = *lto_dedup_at(wpo.dedup_records, i); }
+            i = i + 1;
+        }
+        wpo.dedup_records = new_dds;
+        wpo.dedup_cap = new_cap;
+    }
+    let idx = wpo.dedup_count;
+    wpo.dedup_count = idx + 1;
+    unsafe { *lto_dedup_at(wpo.dedup_records, idx) = rec; }
+}
+
+pub fn lto_wpo_import_module(
+    wpo: mut_view<LtoWholeProgram>,
+    ms: *mut LtoModuleSummary,
+    arena: mut_view<Arena>,
+    stats: mut_view<LtoStats>
+) -> bool {
+    if (ms as usize) == 0 || wpo.lto_mode == LTO_MODE_OFF {
+        return false;
+    }
+    if wpo.module_count >= wpo.module_cap {
+        let new_cap: usize = if wpo.module_cap == 0 { 16 } else { wpo.module_cap + wpo.module_cap };
+        let new_mods = arena_alloc_raw(mut_view(*arena), lto_mul_usize(new_cap, size_of<*mut LtoModuleSummary>()), align_of<*mut LtoModuleSummary>()) as *mut *mut LtoModuleSummary;
+        let mut i: usize = 0;
+        while i < wpo.module_count {
+            unsafe { *lto_mod_ptr_at(new_mods, i) = *lto_mod_ptr_at(wpo.modules, i); }
+            i = i + 1;
+        }
+        wpo.modules = new_mods;
+        wpo.module_cap = new_cap;
+    }
+    unsafe { *lto_mod_ptr_at(wpo.modules, wpo.module_count) = ms; }
+    wpo.module_count = wpo.module_count + 1;
+    stats.modules_imported = stats.modules_imported + 1u32;
+
+    let fn_cnt = unsafe { (*ms).fn_count };
+    let mut i: usize = 0;
+    while i < fn_cnt {
+        let frec = unsafe { *lto_fn_at((*ms).fns, i) };
+        lto_wpo_push_fn(mut_view(*wpo), mut_view(*arena), frec);
+        i = i + 1;
+    }
+
+    let st_cnt = unsafe { (*ms).static_count };
+    let mut s: usize = 0;
+    while s < st_cnt {
+        let srec = unsafe { *lto_static_at((*ms).statics, s) };
+        lto_wpo_push_static(mut_view(*wpo), mut_view(*arena), srec);
+        s = s + 1;
+    }
+
+    let tr_cnt = unsafe { (*ms).trait_impl_count };
+    let mut t: usize = 0;
+    while t < tr_cnt {
+        let trec = unsafe { *lto_trait_at((*ms).trait_impls, t) };
+        lto_wpo_push_trait_impl(mut_view(*wpo), mut_view(*arena), trec);
+        t = t + 1;
+    }
+    true
+}
+
+pub fn lto_mark_root_symbol(
+    wpo: mut_view<LtoWholeProgram>,
+    sym: SymbolId,
+    root_kind: u8
+) -> bool {
+    let sym_v = sym.v;
+    if sym_v == 0u32 || root_kind == LTO_ROOT_NONE {
+        return false;
+    }
+    let mut found = false;
+    let fidx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: sym_v });
+    if fidx != INLINE_NONE_IDX {
+        let fp = unsafe { lto_fn_at(wpo.fns, fidx as usize) };
+        unsafe {
+            (*fp).root_kind = root_kind;
+            (*fp).reachability = REACH_ROOT;
+            if root_kind == LTO_ROOT_EXPORT || root_kind == LTO_ROOT_DYNAMIC_LOOKUP || root_kind == LTO_ROOT_FFI_CALLBACK {
+                (*fp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+            }
+            if root_kind == LTO_ROOT_FFI_CALLBACK {
+                (*fp).address_taken_fn = true;
+            }
+            if root_kind == LTO_ROOT_PINNED_AT {
+                (*fp).has_volatile_ops = true;
+                (*fp).effect_flags = (*fp).effect_flags | EFFECT_VOLATILE;
+            }
+        }
+        found = true;
+    }
+    let cg_p: *mut CallGraph = wpo.cg;
+    if (cg_p as usize) != 0 {
+        let nidx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: sym_v });
+        if nidx != INLINE_NONE_IDX {
+            let np = unsafe { cg_node_at((*cg_p).nodes, nidx as usize) };
+            unsafe {
+                (*np).reachability = REACH_ROOT;
+                if root_kind == LTO_ROOT_REFLECTION {
+                    (*np).is_reflection_root = true;
+                } else {
+                    (*np).is_export_root = true;
+                }
+                if root_kind == LTO_ROOT_FFI_CALLBACK {
+                    (*np).address_taken_fn = true;
+                }
+            }
+            found = true;
+        }
+    }
+    let mut s: usize = 0;
+    while s < wpo.static_count && (wpo.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(wpo.statics, s) };
+        if (unsafe { (*sp).static_sym.v }) == sym_v {
+            unsafe {
+                (*sp).root_kind = root_kind;
+                (*sp).reachability = REACH_ROOT;
+                (*sp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+                if root_kind == LTO_ROOT_PINNED_AT {
+                    (*sp).is_volatile_or_pinned_at = true;
+                }
+            }
+            found = true;
+        }
+        s = s + 1;
+    }
+    found
+}
+
+// Non-exported symbol internalization (`SPEC-75 §2, AXS-LTO-010`, `REQ-OPT-261`, `REQ-OPT-264`):
+// Under `WORLD_CLOSED` or internal partition of `WORLD_PARTIAL`, any `pub` function or static
+// that is NOT an external ABI root (`@export`, `DynamicLookup`, `FfiCallback`, `Reflection`, `PinnedAt`, `ModuleInit`)
+// has its linkage downgraded from `LTO_LINKAGE_GLOBAL` to `LTO_LINKAGE_INTERNALIZED`.
+pub fn lto_internalize_symbols(
+    wpo: mut_view<LtoWholeProgram>,
+    stats: mut_view<LtoStats>
+) -> u32 {
+    if wpo.lto_mode == LTO_MODE_OFF || wpo.world_scope == WORLD_OPEN {
+        return 0u32;
+    }
+    let cg_p: *mut CallGraph = wpo.cg;
+    let mut internalized: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        let vis = unsafe { (*fp).visibility };
+        let rk = unsafe { (*fp).root_kind };
+        let fn_sym_v = unsafe { (*fp).fn_sym.v };
+        if vis == LTO_VIS_EXPORTED && rk == LTO_ROOT_NONE {
+            unsafe {
+                (*fp).root_kind = LTO_ROOT_EXPORT;
+                (*fp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+                (*fp).reachability = REACH_ROOT;
+            }
+        } else if vis == LTO_VIS_PUB && rk == LTO_ROOT_NONE {
+            unsafe {
+                (*fp).linkage = LTO_LINKAGE_INTERNALIZED;
+            }
+            internalized = internalized + 1u32;
+            if (cg_p as usize) != 0 {
+                let nidx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: fn_sym_v });
+                if nidx != INLINE_NONE_IDX {
+                    let np = unsafe { cg_node_at((*cg_p).nodes, nidx as usize) };
+                    unsafe {
+                        (*np).is_export_root = false;
+                        (*np).is_reflection_root = false;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    let mut s: usize = 0;
+    while s < wpo.static_count && (wpo.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(wpo.statics, s) };
+        let vis = unsafe { (*sp).visibility };
+        let rk = unsafe { (*sp).root_kind };
+        let is_vol = unsafe { (*sp).is_volatile_or_pinned_at };
+        if is_vol && rk == LTO_ROOT_NONE {
+            unsafe {
+                (*sp).root_kind = LTO_ROOT_PINNED_AT;
+                (*sp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+                (*sp).reachability = REACH_ROOT;
+            }
+        } else if vis == LTO_VIS_EXPORTED && rk == LTO_ROOT_NONE {
+            unsafe {
+                (*sp).root_kind = LTO_ROOT_EXPORT;
+                (*sp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+                (*sp).reachability = REACH_ROOT;
+            }
+        } else if vis == LTO_VIS_PUB && rk == LTO_ROOT_NONE {
+            unsafe {
+                (*sp).linkage = LTO_LINKAGE_INTERNALIZED;
+            }
+            internalized = internalized + 1u32;
+        }
+        s = s + 1;
+    }
+
+    stats.symbols_internalized = stats.symbols_internalized + internalized;
+    internalized
+}
+
+// Whole-program reachability closure from $R_{root}$ + Rapid Type Analysis (`RTA`) (`AXS-LTO-005`, `AXS-LTO-013`):
+pub fn lto_compute_reachability(
+    wpo: mut_view<LtoWholeProgram>,
+    arena: mut_view<Arena>,
+    stats: mut_view<LtoStats>
+) -> u32 {
+    let mut roots_cnt: u32 = 0u32;
+    let cg_p: *mut CallGraph = wpo.cg;
+
+    // 1. Initialize function reachability from $R_{root}$ (and detect FFI callback roots where `address_taken_fn` escapes to FFI)
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        let vis = unsafe { (*fp).visibility };
+        let mut rk = unsafe { (*fp).root_kind };
+        if vis == LTO_VIS_EXPORTED && rk == LTO_ROOT_NONE {
+            rk = LTO_ROOT_EXPORT;
+            unsafe { (*fp).root_kind = rk; }
+        }
+        if (unsafe { (*fp).has_volatile_ops }) && rk == LTO_ROOT_NONE && vis != LTO_VIS_PRIVATE && vis != LTO_VIS_PUB {
+            rk = LTO_ROOT_PINNED_AT;
+            unsafe { (*fp).root_kind = rk; }
+        }
+        let is_open_pub = wpo.world_scope == WORLD_OPEN && (vis == LTO_VIS_PUB || vis == LTO_VIS_EXPORTED);
+        if rk != LTO_ROOT_NONE || is_open_pub {
+            unsafe {
+                (*fp).reachability = REACH_ROOT;
+                if (*fp).linkage == LTO_LINKAGE_DEAD_ELIMINATED {
+                    (*fp).linkage = LTO_LINKAGE_EXPORTED_ROOT;
+                }
+            }
+            roots_cnt = roots_cnt + 1u32;
+        } else {
+            unsafe {
+                (*fp).reachability = REACH_DEAD_ELIMINATED;
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Sync root flags into `wpo.cg` and propagate over `CallGraph` edges
+    if (cg_p as usize) != 0 {
+        let is_closed = wpo.world_scope != WORLD_OPEN;
+        unsafe { (*cg_p).closed_world = is_closed; }
+        let cg_node_cnt = unsafe { (*cg_p).node_count };
+        let cg_nodes = unsafe { (*cg_p).nodes };
+        let mut ni: usize = 0;
+        while ni < cg_node_cnt && (cg_nodes as usize) != 0 {
+            let np = unsafe { cg_node_at(cg_nodes, ni) };
+            let fn_sym_v = unsafe { (*np).fn_sym.v };
+            let fidx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: fn_sym_v });
+            if fidx != INLINE_NONE_IDX {
+                let fp = unsafe { lto_fn_at(wpo.fns, fidx as usize) };
+                let f_reach = unsafe { (*fp).reachability };
+                let f_rk = unsafe { (*fp).root_kind };
+                unsafe {
+                    if f_reach == REACH_ROOT {
+                        (*np).reachability = REACH_ROOT;
+                        if f_rk == LTO_ROOT_REFLECTION {
+                            (*np).is_reflection_root = true;
+                        } else {
+                            (*np).is_export_root = true;
+                        }
+                    } else if ((*np).is_export_root || (*np).is_reflection_root) &&
+                              ((*fp).linkage != LTO_LINKAGE_INTERNALIZED) {
+                        (*np).reachability = REACH_ROOT;
+                        (*fp).reachability = REACH_ROOT;
+                        if (*fp).root_kind == LTO_ROOT_NONE {
+                            (*fp).root_kind = if (*np).is_reflection_root { LTO_ROOT_REFLECTION } else { LTO_ROOT_EXPORT };
+                        }
+                        roots_cnt = roots_cnt + 1u32;
+                    } else {
+                        (*np).is_export_root = false;
+                        (*np).is_reflection_root = false;
+                        (*np).reachability = REACH_DEAD_ELIMINATED;
+                    }
+                }
+            } else {
+                let is_root = (unsafe { (*np).is_export_root }) || (unsafe { (*np).is_reflection_root }) || !is_closed;
+                unsafe {
+                    (*np).reachability = if is_root { REACH_ROOT } else { REACH_DEAD_ELIMINATED };
+                }
+            }
+            ni = ni + 1;
+        }
+    }
+
+    // 3. Initialize static reachability from roots (`@export`, `@at`/`volatile`, `atomic` roots)
+    let mut s: usize = 0;
+    while s < wpo.static_count && (wpo.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(wpo.statics, s) };
+        let rk = unsafe { (*sp).root_kind };
+        let is_vol = unsafe { (*sp).is_volatile_or_pinned_at };
+        let vis = unsafe { (*sp).visibility };
+        let is_open_pub = wpo.world_scope == WORLD_OPEN && (vis == LTO_VIS_PUB || vis == LTO_VIS_EXPORTED);
+        if rk != LTO_ROOT_NONE || is_vol || is_open_pub {
+            unsafe {
+                (*sp).reachability = REACH_ROOT;
+                if (*sp).root_kind == LTO_ROOT_NONE && is_vol {
+                    (*sp).root_kind = LTO_ROOT_PINNED_AT;
+                }
+            }
+            roots_cnt = roots_cnt + 1u32;
+            let ref_fn_v = unsafe { (*sp).referenced_fn_sym.v };
+            if ref_fn_v != 0u32 {
+                let rf_idx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: ref_fn_v });
+                if rf_idx != INLINE_NONE_IDX {
+                    let rfp = unsafe { lto_fn_at(wpo.fns, rf_idx as usize) };
+                    if (unsafe { (*rfp).reachability }) == REACH_DEAD_ELIMINATED {
+                        unsafe { (*rfp).reachability = REACH_INTERNAL; }
+                    }
+                }
+                if (cg_p as usize) != 0 {
+                    let rn_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: ref_fn_v });
+                    if rn_idx != INLINE_NONE_IDX {
+                        let rnp = unsafe { cg_node_at((*cg_p).nodes, rn_idx as usize) };
+                        if (unsafe { (*rnp).reachability }) == REACH_DEAD_ELIMINATED {
+                            unsafe { (*rnp).reachability = REACH_INTERNAL; }
+                        }
+                    }
+                }
+            }
+        } else {
+            unsafe { (*sp).reachability = REACH_DEAD_ELIMINATED; }
+        }
+        s = s + 1;
+    }
+
+    // 4. Fixed-point transitive reachability propagation across `CallGraph` edges, RTA trait impls, and leader redirects
+    let mut changed = true;
+    while changed {
+        changed = false;
+        if (cg_p as usize) != 0 {
+            let cg_edge_cnt = unsafe { (*cg_p).edge_count };
+            let cg_edges = unsafe { (*cg_p).edges };
+            let cg_node_cnt = unsafe { (*cg_p).node_count };
+            let cg_nodes = unsafe { (*cg_p).nodes };
+            let mut ei: usize = 0;
+            while ei < cg_edge_cnt && (cg_edges as usize) != 0 {
+                let ep = unsafe { cg_edge_at(cg_edges, ei) };
+                if !(unsafe { (*ep).is_inlined }) {
+                    let caller_idx = (unsafe { (*ep).caller_node_idx }) as usize;
+                    if caller_idx < cg_node_cnt {
+                        let cnp = unsafe { cg_node_at(cg_nodes, caller_idx) };
+                        if (unsafe { (*cnp).reachability }) != REACH_DEAD_ELIMINATED {
+                            let callee_idx = unsafe { (*ep).callee_node_idx };
+                            if callee_idx != INLINE_NONE_IDX && (callee_idx as usize) < cg_node_cnt {
+                                let tnp = unsafe { cg_node_at(cg_nodes, callee_idx as usize) };
+                                if (unsafe { (*tnp).reachability }) == REACH_DEAD_ELIMINATED {
+                                    unsafe { (*tnp).reachability = REACH_INTERNAL; }
+                                    changed = true;
+                                }
+                            }
+                            let known_sym_v = unsafe { (*ep).known_callee.v };
+                            if known_sym_v != 0u32 {
+                                let kf_idx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: known_sym_v });
+                                if kf_idx != INLINE_NONE_IDX {
+                                    let kfp = unsafe { lto_fn_at(wpo.fns, kf_idx as usize) };
+                                    if (unsafe { (*kfp).reachability }) == REACH_DEAD_ELIMINATED {
+                                        unsafe { (*kfp).reachability = REACH_INTERNAL; }
+                                        changed = true;
+                                    }
+                                }
+                            }
+                            let pt_cnt = unsafe { (*ep).possible_target_count };
+                            let pts = unsafe { (*ep).possible_targets };
+                            let mut pk: usize = 0;
+                            while pk < pt_cnt && (pts as usize) != 0 {
+                                let tsym_v = unsafe { (*inl_sym_at(pts, pk)).v };
+                                let tn_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: tsym_v });
+                                if tn_idx != INLINE_NONE_IDX {
+                                    let tnp2 = unsafe { cg_node_at(cg_nodes, tn_idx as usize) };
+                                    if (unsafe { (*tnp2).reachability }) == REACH_DEAD_ELIMINATED {
+                                        unsafe { (*tnp2).reachability = REACH_INTERNAL; }
+                                        changed = true;
+                                    }
+                                }
+                                let tf_idx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: tsym_v });
+                                if tf_idx != INLINE_NONE_IDX {
+                                    let tfp = unsafe { lto_fn_at(wpo.fns, tf_idx as usize) };
+                                    if (unsafe { (*tfp).reachability }) == REACH_DEAD_ELIMINATED {
+                                        unsafe { (*tfp).reachability = REACH_INTERNAL; }
+                                        changed = true;
+                                    }
+                                }
+                                pk = pk + 1;
+                            }
+                        }
+                    }
+                }
+                ei = ei + 1;
+            }
+
+            // Sync `CallGraphNode.reachability` <-> `LtoFnSummary.reachability`
+            let mut ni: usize = 0;
+            while ni < cg_node_cnt && (cg_nodes as usize) != 0 {
+                let np = unsafe { cg_node_at(cg_nodes, ni) };
+                let fn_sym_v = unsafe { (*np).fn_sym.v };
+                let fidx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: fn_sym_v });
+                if fidx != INLINE_NONE_IDX {
+                    let fp = unsafe { lto_fn_at(wpo.fns, fidx as usize) };
+                    let nr = unsafe { (*np).reachability };
+                    let fr = unsafe { (*fp).reachability };
+                    if nr != REACH_DEAD_ELIMINATED && fr == REACH_DEAD_ELIMINATED {
+                        unsafe { (*fp).reachability = nr; }
+                        changed = true;
+                    } else if fr != REACH_DEAD_ELIMINATED && nr == REACH_DEAD_ELIMINATED {
+                        unsafe { (*np).reachability = fr; }
+                        changed = true;
+                    }
+                }
+                ni = ni + 1;
+            }
+        }
+    }
+
+    // 5. Rapid Type Analysis (`RTA`, `AXS-LTO-005.2`, `AXS-LTO-013.1`):
+    // Check whether any reachable function has an un-devirtualized `DISPATCH_DYN_TRAIT` edge
+    let mut has_reachable_dyn_call = false;
+    if (cg_p as usize) != 0 {
+        let cg_edge_cnt = unsafe { (*cg_p).edge_count };
+        let cg_edges = unsafe { (*cg_p).edges };
+        let cg_node_cnt = unsafe { (*cg_p).node_count };
+        let cg_nodes = unsafe { (*cg_p).nodes };
+        let mut ei: usize = 0;
+        while ei < cg_edge_cnt && (cg_edges as usize) != 0 {
+            let ep = unsafe { cg_edge_at(cg_edges, ei) };
+            let caller_idx = (unsafe { (*ep).caller_node_idx }) as usize;
+            if caller_idx < cg_node_cnt {
+                let cnp = unsafe { cg_node_at(cg_nodes, caller_idx) };
+                if (unsafe { (*cnp).reachability }) != REACH_DEAD_ELIMINATED &&
+                   ((unsafe { (*ep).dispatch_kind }) == DISPATCH_DYN_TRAIT ||
+                    ((unsafe { (*ep).dispatch_kind }) == DISPATCH_FN_PTR && (unsafe { (*ep).possible_target_count }) == 0)) &&
+                   !(unsafe { (*ep).is_inlined }) {
+                    has_reachable_dyn_call = true;
+                }
+            }
+            ei = ei + 1;
+        }
+    }
+
+    let mut ti: usize = 0;
+    while ti < wpo.trait_impl_count && (wpo.trait_impls as usize) != 0 {
+        let tp = unsafe { lto_trait_at(wpo.trait_impls, ti) };
+        let coerced = unsafe { (*tp).is_coerced_to_dyn };
+        let msym_v = unsafe { (*tp).method_sym.v };
+        let mf_idx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: msym_v });
+        let vtable_live = (coerced && has_reachable_dyn_call) || wpo.world_scope == WORLD_OPEN;
+        unsafe { (*tp).is_live_vtable = vtable_live; }
+        if vtable_live && mf_idx != INLINE_NONE_IDX {
+            let mfp = unsafe { lto_fn_at(wpo.fns, mf_idx as usize) };
+            if (unsafe { (*mfp).reachability }) == REACH_DEAD_ELIMINATED {
+                unsafe { (*mfp).reachability = REACH_INTERNAL; }
+            }
+            if (cg_p as usize) != 0 {
+                let mn_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: msym_v });
+                if mn_idx != INLINE_NONE_IDX {
+                    let mnp = unsafe { cg_node_at((*cg_p).nodes, mn_idx as usize) };
+                    if (unsafe { (*mnp).reachability }) == REACH_DEAD_ELIMINATED {
+                        unsafe { (*mnp).reachability = REACH_INTERNAL; }
+                    }
+                }
+            }
+        }
+        ti = ti + 1;
+    }
+
+    // Count dead functions
+    let mut dead_fns: u32 = 0u32;
+    let mut fi: usize = 0;
+    while fi < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, fi) };
+        if (unsafe { (*fp).reachability }) == REACH_DEAD_ELIMINATED {
+            dead_fns = dead_fns + 1u32;
+        }
+        fi = fi + 1;
+    }
+
+    let _ = arena;
+    stats.roots_registered = roots_cnt;
+    dead_fns
+}
+
+// Dead symbol, static, and vtable pruning (`AXS-LTO-005.2`, `AXS-LTO-013.3`, `REQ-OPT-263`):
+pub fn lto_prune_unreachable(
+    wpo: mut_view<LtoWholeProgram>,
+    stats: mut_view<LtoStats>
+) -> u32 {
+    if wpo.lto_mode == LTO_MODE_OFF {
+        return 0u32;
+    }
+    let cg_p: *mut CallGraph = wpo.cg;
+    let mut pruned_fns: u32 = 0u32;
+    let mut pruned_statics: u32 = 0u32;
+    let mut pruned_vtables: u32 = 0u32;
+
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        let rk = unsafe { (*fp).root_kind };
+        if (unsafe { (*fp).reachability }) == REACH_DEAD_ELIMINATED && rk == LTO_ROOT_NONE {
+            unsafe { (*fp).linkage = LTO_LINKAGE_DEAD_ELIMINATED; }
+            pruned_fns = pruned_fns + 1u32;
+        }
+        i = i + 1;
+    }
+
+    if (cg_p as usize) != 0 {
+        let cg_node_cnt = unsafe { (*cg_p).node_count };
+        let cg_nodes = unsafe { (*cg_p).nodes };
+        let mut ni: usize = 0;
+        while ni < cg_node_cnt && (cg_nodes as usize) != 0 {
+            let np = unsafe { cg_node_at(cg_nodes, ni) };
+            let fn_sym_v = unsafe { (*np).fn_sym.v };
+            let fidx = lto_wpo_find_fn_idx(view(*wpo), SymbolId { v: fn_sym_v });
+            if fidx != INLINE_NONE_IDX {
+                let fp = unsafe { lto_fn_at(wpo.fns, fidx as usize) };
+                if (unsafe { (*fp).linkage }) == LTO_LINKAGE_DEAD_ELIMINATED {
+                    unsafe { (*np).reachability = REACH_DEAD_ELIMINATED; }
+                }
+            }
+            ni = ni + 1;
+        }
+    }
+
+    let mut s: usize = 0;
+    while s < wpo.static_count && (wpo.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(wpo.statics, s) };
+        let rk = unsafe { (*sp).root_kind };
+        let is_vol = unsafe { (*sp).is_volatile_or_pinned_at };
+        if (unsafe { (*sp).reachability }) == REACH_DEAD_ELIMINATED && rk == LTO_ROOT_NONE && !is_vol {
+            unsafe { (*sp).linkage = LTO_LINKAGE_DEAD_ELIMINATED; }
+            pruned_statics = pruned_statics + 1u32;
+        }
+        s = s + 1;
+    }
+
+    let mut t: usize = 0;
+    while t < wpo.trait_impl_count && (wpo.trait_impls as usize) != 0 {
+        let tp = unsafe { lto_trait_at(wpo.trait_impls, t) };
+        if !(unsafe { (*tp).is_live_vtable }) {
+            pruned_vtables = pruned_vtables + 1u32;
+        }
+        t = t + 1;
+    }
+
+    stats.dead_fns_eliminated = pruned_fns;
+    stats.dead_statics_eliminated = pruned_statics;
+    stats.dead_vtables_eliminated = pruned_vtables;
+    pruned_fns + pruned_statics + pruned_vtables
+}
+
+// --- Section 4: Cross-Module Effect/Escape/Alias Summary Propagation & Closed-World Devirtualization (`AXS-LTO-012..013, AXS-LTO-015`) ---
+
+pub fn lto_propagate_cross_module_summaries(
+    wpo: mut_view<LtoWholeProgram>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<LtoStats>,
+    arena: mut_view<Arena>
+) {
+    let cg_p: *mut CallGraph = wpo.cg;
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        let fn_sym_v = unsafe { (*fp).fn_sym.v };
+        let mut eff = unsafe { (*fp).effect_flags };
+
+        // Enforce `atomic` (`REQ-OPT-277`, `ALTO-40`) and `volatile`/`@at` (`REQ-OPT-278`, `ALTO-41`) preservation
+        if unsafe { (*fp).has_atomic_ops } {
+            eff = eff | EFFECT_ATOMIC | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+            stats.atomic_barriers_preserved = stats.atomic_barriers_preserved + 1u32;
+        }
+        if unsafe { (*fp).has_volatile_ops } {
+            eff = eff | EFFECT_VOLATILE | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+            stats.volatile_mmio_preserved = stats.volatile_mmio_preserved + 1u32;
+        }
+
+        // Enforce hard fail-closed `UnknownAlias` rule on raw pointer / FFI boundaries (`REQ-OPT-275..276`, `ALTO-38..39`)
+        if (unsafe { (*fp).has_raw_ptr_or_ffi_alias }) || (eff & EFFECT_FFI) != 0u16 {
+            unsafe {
+                (*fp).alias_state = LTO_ALIAS_UNKNOWN_ALIAS;
+                (*fp).param_no_alias_mask = 0u64;
+            }
+            stats.unknown_alias_barriers = stats.unknown_alias_barriers + 1u32;
+        } else if (unsafe { (*fp).param_no_alias_mask }) != 0u64 {
+            unsafe { (*fp).alias_state = LTO_ALIAS_NO_ALIAS; }
+            stats.cross_module_alias_noalias = stats.cross_module_alias_noalias + 1u32;
+        } else {
+            unsafe { (*fp).alias_state = LTO_ALIAS_MAY_ALIAS; }
+        }
+
+        if (unsafe { (*fp).param_no_escape_mask }) != 0u64 && !(unsafe { (*fp).has_raw_ptr_or_ffi_alias }) {
+            stats.cross_module_escape_noescape = stats.cross_module_escape_noescape + 1u32;
+        }
+
+        unsafe { (*fp).effect_flags = eff; }
+        let mut esum = effect_summary_empty(SymbolId { v: fn_sym_v });
+        esum.flags = eff;
+        effect_call_table_register(mut_view(*eff_table), mut_view(*arena), SymbolId { v: fn_sym_v }, OptValueId { v: 0u32 }, esum);
+
+        // Sync imported cross-module summaries into `CallGraphNode`
+        if (cg_p as usize) != 0 {
+            let nidx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: fn_sym_v });
+            if nidx != INLINE_NONE_IDX {
+                let np = unsafe { cg_node_at((*cg_p).nodes, nidx as usize) };
+                unsafe {
+                    (*np).effect_summary.flags = (*np).effect_summary.flags | eff;
+                    if (*fp).has_raw_ptr_or_ffi_alias {
+                        (*np).escape_summary.calls_ffi = true;
+                    }
+                    escape_summary_table_register(mut_view(*esc_table), mut_view(*arena), SymbolId { v: fn_sym_v }, (*np).escape_summary);
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    //Also check `LtoStaticSummary` for `volatile`/`@at` and `atomic` preservation
+    let mut s: usize = 0;
+    while s < wpo.static_count && (wpo.statics as usize) != 0 {
+        let sp = unsafe { lto_static_at(wpo.statics, s) };
+        if unsafe { (*sp).is_volatile_or_pinned_at } {
+            stats.volatile_mmio_preserved = stats.volatile_mmio_preserved + 1u32;
+        }
+        if unsafe { (*sp).is_atomic } {
+            stats.atomic_barriers_preserved = stats.atomic_barriers_preserved + 1u32;
+        }
+        s = s + 1;
+    }
+
+    if (cg_p as usize) != 0 {
+        callgraph_compute_sccs(unsafe { mut_view(*cg_p) }, mut_view(*arena));
+        callgraph_propagate_summaries(unsafe { mut_view(*cg_p) }, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    }
+}
+
+// Whole-program closed-world `dyn Trait` RTA target resolution (`AXS-LTO-013`, `REQ-OPT-273`, `ALTO-36`):
+pub fn lto_resolve_closed_world_trait_targets(
+    wpo: mut_view<LtoWholeProgram>,
+    arena: mut_view<Arena>
+) -> u32 {
+    let cg_p: *mut CallGraph = wpo.cg;
+    if (cg_p as usize) == 0 || wpo.lto_mode == LTO_MODE_OFF || wpo.world_scope == WORLD_OPEN {
+        return 0u32;
+    }
+    if unsafe { (*cg_p).dynamic_loading_active } {
+        return 0u32;
+    }
+
+    // Collect all live `is_coerced_to_dyn` method targets from `wpo.trait_impls`
+    let mut live_method_vs: [4]u32 = [0u32, 0u32, 0u32, 0u32];
+    let mut live_cnt: usize = 0;
+    let mut overflow = false;
+    let mut ti: usize = 0;
+    while ti < wpo.trait_impl_count && (wpo.trait_impls as usize) != 0 {
+        let tp = unsafe { lto_trait_at(wpo.trait_impls, ti) };
+        let msym_v = unsafe { (*tp).method_sym.v };
+        if (unsafe { (*tp).is_coerced_to_dyn }) && msym_v != 0u32 {
+            let mut dup = false;
+            let mut k: usize = 0;
+            while k < live_cnt {
+                if live_method_vs[k] == msym_v {
+                    dup = true;
+                    break;
+                }
+                k = k + 1;
+            }
+            if !dup {
+                if live_cnt < MAX_GUARDED_TARGETS {
+                    live_method_vs[live_cnt] = msym_v;
+                    live_cnt = live_cnt + 1;
+                } else {
+                    overflow = true;
+                }
+            }
+        }
+        ti = ti + 1;
+    }
+
+    if live_cnt == 0 || overflow {
+        return 0u32;
+    }
+
+    let mut resolved_edges: u32 = 0u32;
+    let cg_edge_cnt = unsafe { (*cg_p).edge_count };
+    let cg_edges = unsafe { (*cg_p).edges };
+    let mut ei: usize = 0;
+    while ei < cg_edge_cnt && (cg_edges as usize) != 0 {
+        let ep = unsafe { cg_edge_at(cg_edges, ei) };
+        if ((unsafe { (*ep).dispatch_kind }) == DISPATCH_DYN_TRAIT ||
+            (unsafe { (*ep).dispatch_kind }) == DISPATCH_FN_PTR) &&
+           (unsafe { (*ep).possible_target_count }) == 0 {
+            let pts = arena_alloc_raw(mut_view(*arena), lto_mul_usize(live_cnt, size_of<SymbolId>()), align_of<SymbolId>()) as *mut SymbolId;
+            let mut k: usize = 0;
+            while k < live_cnt {
+                unsafe { *inl_sym_at(pts, k) = SymbolId { v: live_method_vs[k] }; }
+                k = k + 1;
+            }
+            let first_sym_v = live_method_vs[0];
+            unsafe {
+                (*ep).dispatch_kind = DISPATCH_DYN_TRAIT;
+                (*ep).possible_targets = pts;
+                (*ep).possible_target_count = live_cnt;
+                (*ep).targets_complete = true;
+                if live_cnt == 1 {
+                    (*ep).known_callee = SymbolId { v: first_sym_v };
+                    (*ep).callee_node_idx = callgraph_find_node_idx(view(*cg_p), SymbolId { v: first_sym_v });
+                }
+            }
+            resolved_edges = resolved_edges + 1u32;
+        }
+        ei = ei + 1;
+    }
+    resolved_edges
+}
+
+// Promote internalized single-caller functions (`AXS-LTO-010.2`, `tasks/0355 §20`, `tasks/0594 §18`)
+fn lto_promote_single_caller_internalized(wpo: mut_view<LtoWholeProgram>, stats: mut_view<LtoStats>) -> u32 {
+    let cg_p: *mut CallGraph = wpo.cg;
+    if (cg_p as usize) == 0 || wpo.lto_mode == LTO_MODE_OFF || wpo.world_scope == WORLD_OPEN {
+        return 0u32;
+    }
+    let mut promoted: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        if (unsafe { (*fp).linkage }) == LTO_LINKAGE_INTERNALIZED &&
+           !(unsafe { (*fp).address_taken_fn }) &&
+           (unsafe { (*fp).eligible_for_cross_inline }) {
+            let fn_sym_v = unsafe { (*fp).fn_sym.v };
+            let nidx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: fn_sym_v });
+            if nidx != INLINE_NONE_IDX {
+                let np = unsafe { cg_node_at((*cg_p).nodes, nidx as usize) };
+                if (unsafe { (*np).direct_caller_count }) == 1u32 &&
+                   (unsafe { (*np).inline_attr }) != INLINE_ATTR_NEVER {
+                    unsafe { (*np).inline_attr = INLINE_ATTR_ALWAYS; }
+                    promoted = promoted + 1u32;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    stats.single_caller_promoted = stats.single_caller_promoted + promoted;
+    promoted
+}
+
+// --- Section 5: Cross-Module Generic Monomorphization Deduplication (`AXS-LTO-014, REQ-OPT-267..270, ALTO-30..33`) ---
+
+fn lto_redirect_symbol_in_mir(mir: mut_view<MirBody>, old_sym: SymbolId, new_sym: SymbolId) -> bool {
+    let old_sym_v = old_sym.v;
+    let new_sym_v = new_sym.v;
+    if old_sym_v == 0u32 || new_sym_v == 0u32 || old_sym_v == new_sym_v || (mir.bbs as usize) == 0 {
+        return false;
+    }
+    let mut changed = false;
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                let rvk = unsafe { (*st).rvalue.kind };
+                if (rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST) &&
+                   (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST &&
+                   (unsafe { (*st).rvalue.use_op.constant.kind }) == MIR_CONST_FN &&
+                   (unsafe { (*st).rvalue.use_op.constant.sym.v }) == old_sym_v {
+                    unsafe {
+                        (*st).rvalue.use_op.constant.sym = SymbolId { v: new_sym_v };
+                        (*st).rvalue.use_op.constant.val = new_sym_v as u64;
+                    }
+                    changed = true;
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let oc = unsafe { (*st).rvalue.operand_count };
+                    let ops = unsafe { (*st).rvalue.operands };
+                    let mut oi: usize = 0;
+                    while oi < oc && (ops as usize) != 0 {
+                        let op = unsafe { mir_op_at(ops, oi) };
+                        if (unsafe { (*op).kind }) == MIR_OP_CONST &&
+                           (unsafe { (*op).constant.kind }) == MIR_CONST_FN &&
+                           (unsafe { (*op).constant.sym.v }) == old_sym_v {
+                            unsafe {
+                                (*op).constant.sym = SymbolId { v: new_sym_v };
+                                (*op).constant.val = new_sym_v as u64;
+                            }
+                            changed = true;
+                        }
+                        oi = oi + 1;
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+            if (unsafe { (*bb).terminator.func.kind }) == MIR_OP_CONST &&
+               (unsafe { (*bb).terminator.func.constant.kind }) == MIR_CONST_FN &&
+               (unsafe { (*bb).terminator.func.constant.sym.v }) == old_sym_v {
+                unsafe {
+                    (*bb).terminator.func.constant.sym = SymbolId { v: new_sym_v };
+                    (*bb).terminator.func.constant.val = new_sym_v as u64;
+                }
+                changed = true;
+            }
+            let ac = unsafe { (*bb).terminator.arg_count };
+            let args = unsafe { (*bb).terminator.args };
+            let mut ai: usize = 0;
+            while ai < ac && (args as usize) != 0 {
+                let aop = unsafe { mir_op_at(args, ai) };
+                if (unsafe { (*aop).kind }) == MIR_OP_CONST &&
+                   (unsafe { (*aop).constant.kind }) == MIR_CONST_FN &&
+                   (unsafe { (*aop).constant.sym.v }) == old_sym_v {
+                    unsafe {
+                        (*aop).constant.sym = SymbolId { v: new_sym_v };
+                        (*aop).constant.val = new_sym_v as u64;
+                    }
+                    changed = true;
+                }
+                ai = ai + 1;
+            }
+        }
+        b = b + 1;
+    }
+    changed
+}
+
+fn lto_redirect_symbol_in_callgraph(cg: mut_view<CallGraph>, old_sym: SymbolId, new_sym: SymbolId, arena: mut_view<Arena>) {
+    let old_sym_v = old_sym.v;
+    let new_sym_v = new_sym.v;
+    let new_nidx = callgraph_find_node_idx(view(*cg), SymbolId { v: new_sym_v });
+    let mut ni: usize = 0;
+    while ni < cg.node_count && (cg.nodes as usize) != 0 {
+        let np = unsafe { cg_node_at(cg.nodes, ni) };
+        let mir_p = unsafe { (*np).mir };
+        if (mir_p as usize) != 0 && (unsafe { (*np).fn_sym.v }) != old_sym_v {
+            let redirected = lto_redirect_symbol_in_mir(unsafe { mut_view(*mir_p) }, SymbolId { v: old_sym_v }, SymbolId { v: new_sym_v });
+            if redirected {
+                let new_ob = optir_build_from_verified_mir(unsafe { view(*mir_p) }, cg.thir, mut_view(*arena));
+                if (new_ob as usize) != 0 {
+                    let node_sym_v = unsafe { (*np).fn_sym.v };
+                    unsafe {
+                        (*new_ob).fn_sym = SymbolId { v: node_sym_v };
+                        (*np).opt_body = new_ob;
+                    }
+                }
+            }
+        }
+        ni = ni + 1;
+    }
+
+    let mut ei: usize = 0;
+    while ei < cg.edge_count && (cg.edges as usize) != 0 {
+        let ep = unsafe { cg_edge_at(cg.edges, ei) };
+        if (unsafe { (*ep).known_callee.v }) == old_sym_v {
+            unsafe {
+                (*ep).known_callee = SymbolId { v: new_sym_v };
+                (*ep).callee_node_idx = new_nidx;
+            }
+        }
+        let pt_cnt = unsafe { (*ep).possible_target_count };
+        let pts = unsafe { (*ep).possible_targets };
+        let mut pk: usize = 0;
+        while pk < pt_cnt && (pts as usize) != 0 {
+            let p_sym = unsafe { inl_sym_at(pts, pk) };
+            if (unsafe { (*p_sym).v }) == old_sym_v {
+                unsafe { *p_sym = SymbolId { v: new_sym_v }; }
+            }
+            pk = pk + 1;
+        }
+        ei = ei + 1;
+    }
+}
+
+pub fn lto_fn_to_rep_equiv(f: view<LtoFnSummary>) -> RepEquivDesc {
+    RepEquivDesc {
+        fn_sym: SymbolId { v: f.fn_sym.v },
+        type_size: f.rep_type_size,
+        type_align: f.rep_type_align,
+        abi_class: f.rep_abi_class,
+        has_custom_drop: f.has_custom_drop,
+        body_fingerprint: f.body_fingerprint,
+        address_taken_fn: f.address_taken_fn,
+    }
+}
+
+// Cross-module generic monomorphization deduplication (`AXS-LTO-014`, `REQ-OPT-267..270`, `ALTO-30..33`):
+// 1. Exact duplicate generic instances (`generic_def_id` & `canonical_type_arg_hash` match across modules)
+//    are always merged into the first canonical instance (`LTO_DEDUP_EXACT_INSTANCE`, `ALTO-30`).
+// 2. Distinct generic instantiations (`f<A>` vs `f<B>`, `canonical_type_arg_hash` differs) share code
+//    (`LTO_DEDUP_REP_EQUIV_SHARED`, `ALTO-31, ALTO-33`) iff `ipa_can_share_representation` holds
+//    (`type_size`, `type_align`, `abi_class`, and `body_fingerprint` match, `has_custom_drop == false`,
+//    and `address_taken_fn == false` on both).
+// 3. If `address_taken_fn == true` on either distinct instantiation (`ALTO-32`, `REQ-OPT-269`),
+//    they are NEVER merged to the same symbol address (`LTO_DEDUP_KEPT_ADDRESS_TAKEN`).
+pub fn lto_deduplicate_generics(
+    wpo: mut_view<LtoWholeProgram>,
+    arena: mut_view<Arena>,
+    stats: mut_view<LtoStats>
+) -> u32 {
+    let fn_cnt_total = wpo.fn_count;
+    if wpo.lto_mode == LTO_MODE_OFF || fn_cnt_total < 2 || (wpo.fns as usize) == 0 {
+        return 0u32;
+    }
+
+    let cg_p: *mut CallGraph = wpo.cg;
+    let mut merged_total: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < wpo.fn_count {
+        let fi = unsafe { lto_fn_at(wpo.fns, i) };
+        let gdef_i = unsafe { (*fi).generic_def_id };
+        let link_i = unsafe { (*fi).linkage };
+        let sym_i_v = unsafe { (*fi).fn_sym.v };
+        let leader_i_v = unsafe { (*fi).canonical_leader_sym.v };
+
+        if gdef_i != 0u32 && link_i != LTO_LINKAGE_DEAD_ELIMINATED && leader_i_v == sym_i_v {
+            let mut is_first_for_gdef = true;
+            let mut k: usize = 0;
+            while k < i {
+                let fk = unsafe { lto_fn_at(wpo.fns, k) };
+                if (unsafe { (*fk).generic_def_id }) == gdef_i &&
+                   (unsafe { (*fk).linkage }) != LTO_LINKAGE_DEAD_ELIMINATED {
+                    is_first_for_gdef = false;
+                    break;
+                }
+                k = k + 1;
+            }
+            let mut j: usize = i + 1;
+            while j < wpo.fn_count {
+                let fj = unsafe { lto_fn_at(wpo.fns, j) };
+                let gdef_j = unsafe { (*fj).generic_def_id };
+                let link_j = unsafe { (*fj).linkage };
+                let sym_j_v = unsafe { (*fj).fn_sym.v };
+                let leader_j_v = unsafe { (*fj).canonical_leader_sym.v };
+
+                if gdef_j == gdef_i && link_j != LTO_LINKAGE_DEAD_ELIMINATED && leader_j_v == sym_j_v {
+                    let thash_i = unsafe { (*fi).canonical_type_arg_hash };
+                    let thash_j = unsafe { (*fj).canonical_type_arg_hash };
+
+                    if thash_i == thash_j && (unsafe { (*fi).body_fingerprint }) == (unsafe { (*fj).body_fingerprint }) {
+                        // Case 1: Identical generic instantiation `f<T>` across modules (`ALTO-30`, `REQ-OPT-267`)
+                        unsafe {
+                            (*fj).canonical_leader_sym = SymbolId { v: sym_i_v };
+                            (*fj).linkage = LTO_LINKAGE_DEAD_ELIMINATED;
+                            (*fj).reachability = REACH_DEAD_ELIMINATED;
+                            if (*fj).address_taken_fn {
+                                (*fi).address_taken_fn = true;
+                            }
+                        }
+                        if (cg_p as usize) != 0 {
+                            lto_redirect_symbol_in_callgraph(unsafe { mut_view(*cg_p) }, SymbolId { v: sym_j_v }, SymbolId { v: sym_i_v }, mut_view(*arena));
+                            let nj_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: sym_j_v });
+                            if nj_idx != INLINE_NONE_IDX {
+                                let njp = unsafe { cg_node_at((*cg_p).nodes, nj_idx as usize) };
+                                unsafe {
+                                    (*njp).is_export_root = false;
+                                    (*njp).is_reflection_root = false;
+                                    (*njp).reachability = REACH_DEAD_ELIMINATED;
+                                }
+                            }
+                        }
+                        lto_wpo_push_dedup(mut_view(*wpo), mut_view(*arena), LtoGenericDedupRecord {
+                            canonical_sym: SymbolId { v: sym_i_v },
+                            candidate_sym: SymbolId { v: sym_j_v },
+                            generic_def_id: gdef_i,
+                            decision: LTO_DEDUP_EXACT_INSTANCE,
+                        });
+                        stats.generics_dedup_exact = stats.generics_dedup_exact + 1u32;
+                        merged_total = merged_total + 1u32;
+                    } else if is_first_for_gdef {
+                        // Case 2: Distinct generic instantiations `f<A>` vs `f<B>` (`ALTO-31..33`, `REQ-OPT-268..270`)
+                        let rep_i = lto_fn_to_rep_equiv(unsafe { view(*fi) });
+                        let rep_j = lto_fn_to_rep_equiv(unsafe { view(*fj) });
+                        if rep_i.address_taken_fn || rep_j.address_taken_fn {
+                            // `REQ-OPT-269` / `ALTO-32`: preserve distinct observable function addresses!
+                            lto_wpo_push_dedup(mut_view(*wpo), mut_view(*arena), LtoGenericDedupRecord {
+                                canonical_sym: SymbolId { v: sym_i_v },
+                                candidate_sym: SymbolId { v: sym_j_v },
+                                generic_def_id: gdef_i,
+                                decision: LTO_DEDUP_KEPT_ADDRESS_TAKEN,
+                            });
+                            stats.generics_kept_addr_taken = stats.generics_kept_addr_taken + 1u32;
+                        } else if rep_i.has_custom_drop || rep_j.has_custom_drop {
+                            lto_wpo_push_dedup(mut_view(*wpo), mut_view(*arena), LtoGenericDedupRecord {
+                                canonical_sym: SymbolId { v: sym_i_v },
+                                candidate_sym: SymbolId { v: sym_j_v },
+                                generic_def_id: gdef_i,
+                                decision: LTO_DEDUP_KEPT_CUSTOM_DROP,
+                            });
+                            stats.generics_kept_custom_drop = stats.generics_kept_custom_drop + 1u32;
+                        } else if ipa_can_share_representation(view(rep_i), view(rep_j)) {
+                            unsafe {
+                                (*fj).canonical_leader_sym = SymbolId { v: sym_i_v };
+                                (*fj).linkage = LTO_LINKAGE_DEAD_ELIMINATED;
+                                (*fj).reachability = REACH_DEAD_ELIMINATED;
+                            }
+                            if (cg_p as usize) != 0 {
+                                lto_redirect_symbol_in_callgraph(unsafe { mut_view(*cg_p) }, SymbolId { v: sym_j_v }, SymbolId { v: sym_i_v }, mut_view(*arena));
+                                let nj_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: sym_j_v });
+                                if nj_idx != INLINE_NONE_IDX {
+                                    let njp = unsafe { cg_node_at((*cg_p).nodes, nj_idx as usize) };
+                                    unsafe {
+                                        (*njp).is_export_root = false;
+                                        (*njp).is_reflection_root = false;
+                                        (*njp).reachability = REACH_DEAD_ELIMINATED;
+                                    }
+                                }
+                            }
+                            lto_wpo_push_dedup(mut_view(*wpo), mut_view(*arena), LtoGenericDedupRecord {
+                                canonical_sym: SymbolId { v: sym_i_v },
+                                candidate_sym: SymbolId { v: sym_j_v },
+                                generic_def_id: gdef_i,
+                                decision: LTO_DEDUP_REP_EQUIV_SHARED,
+                            });
+                            stats.generics_rep_shared = stats.generics_rep_shared + 1u32;
+                            merged_total = merged_total + 1u32;
+                        } else {
+                            lto_wpo_push_dedup(mut_view(*wpo), mut_view(*arena), LtoGenericDedupRecord {
+                                canonical_sym: SymbolId { v: sym_i_v },
+                                candidate_sym: SymbolId { v: sym_j_v },
+                                generic_def_id: gdef_i,
+                                decision: LTO_DEDUP_KEPT_LAYOUT_MISMATCH,
+                            });
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+
+    if merged_total > 0u32 && (cg_p as usize) != 0 {
+        callgraph_analyze_edges(unsafe { mut_view(*cg_p) }, mut_view(*arena));
+    }
+    merged_total
+}
+
+// --- Section 6: Whole-Program Cross-Module Optimization Driver & `PassManager` Runner (`AXS-LTO-011..015, AXS-LTO-030`) ---
+
+pub fn lto_run_cross_module_opt(
+    wpo: mut_view<LtoWholeProgram>,
+    profile: u8,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<LtoStats>,
+    inl_log: *mut InlineDecisionLog,
+    spec_log: *mut SpecDecisionLog,
+    devirt_log: *mut DevirtDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    stats.pass_runs = stats.pass_runs + 1u32;
+    if wpo.lto_mode == LTO_MODE_OFF || profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+
+    let mut any_changed = false;
+    let cg_p: *mut CallGraph = wpo.cg;
+
+    // 1. Internalize non-exported `pub` symbols (`AXS-LTO-010`) and compute initial reachability from $R_{root}$ (`AXS-LTO-005`)
+    let int_cnt = lto_internalize_symbols(mut_view(*wpo), mut_view(*stats));
+    if int_cnt > 0u32 {
+        any_changed = true;
+    }
+    if (cg_p as usize) != 0 {
+        callgraph_finalize(unsafe { mut_view(*cg_p) }, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    }
+    let _ = lto_compute_reachability(mut_view(*wpo), mut_view(*arena), mut_view(*stats));
+
+    // 2. Propagate cross-module `EffectSummary`, `FunctionEscapeSummary`, and `AliasSummary` (`AXS-LTO-012`, `AXS-LTO-015`)
+    lto_propagate_cross_module_summaries(
+        mut_view(*wpo),
+        mut_view(*eff_table),
+        mut_view(*esc_table),
+        mut_view(*stats),
+        mut_view(*arena)
+    );
+
+    // 3. Resolve closed-world `dyn Trait` RTA targets (`AXS-LTO-013`) and run cross-module devirtualization
+    let rta_resolved = lto_resolve_closed_world_trait_targets(mut_view(*wpo), mut_view(*arena));
+    if rta_resolved > 0u32 {
+        any_changed = true;
+    }
+    if (cg_p as usize) != 0 {
+        let mut dv_stats = devirt_stats_zero();
+        if devirt_optimize_callgraph(
+            unsafe { mut_view(*cg_p) },
+            profile,
+            false,
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(dv_stats),
+            devirt_log,
+            sroa_stats,
+            sroa_log,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            any_changed = true;
+        }
+        stats.cross_module_devirt_exact = stats.cross_module_devirt_exact + dv_stats.exact_devirt_count;
+        stats.cross_module_devirt_guarded = stats.cross_module_devirt_guarded + dv_stats.guarded_devirt_count;
+        stats.cross_module_inlined = stats.cross_module_inlined + dv_stats.inlined_after_devirt;
+    }
+
+    // 4. Cross-module call-site constant/enum/closure specialization (`AXS-LTO-011.2..3`)
+    if (cg_p as usize) != 0 {
+        let mut sp_stats = ipa_spec_stats_zero();
+        let _ = ipa_specialize_callgraph(
+            unsafe { mut_view(*cg_p) },
+            profile,
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(sp_stats),
+            spec_log,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if sp_stats.clones_created > 0u32 || sp_stats.clones_reused > 0u32 {
+            stats.cross_module_specialized = stats.cross_module_specialized + sp_stats.clones_created + sp_stats.clones_reused;
+            any_changed = true;
+        }
+    }
+
+    // 5. Promote single-caller internalized functions (`AXS-LTO-010.2`) and run cross-module bottom-up SCC inliner (`AXS-LTO-011.1`)
+    if (cg_p as usize) != 0 {
+        callgraph_finalize(unsafe { mut_view(*cg_p) }, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+        let _ = lto_promote_single_caller_internalized(mut_view(*wpo), mut_view(*stats));
+        let mut inl_stats = inline_stats_zero();
+        if inline_optimize_callgraph(
+            unsafe { mut_view(*cg_p) },
+            profile,
+            mut_view(*eff_table),
+            mut_view(*esc_table),
+            mut_view(inl_stats),
+            inl_log,
+            sroa_stats,
+            sroa_log,
+            mut_view(*arena),
+            mut_view(*sink)
+        ) {
+            any_changed = true;
+        }
+        stats.cross_module_inlined = stats.cross_module_inlined + inl_stats.callsites_inlined;
+    }
+
+    // 6. Cross-module generic monomorphization deduplication & representation-equivalent sharing (`AXS-LTO-014`)
+    let dedup_cnt = lto_deduplicate_generics(mut_view(*wpo), mut_view(*arena), mut_view(*stats));
+    if dedup_cnt > 0u32 {
+        any_changed = true;
+    }
+
+    // 7. Re-evaluate whole-program reachability after dead-branch folding, inlining, and deduplication, and prune dead items (`AXS-LTO-005.2`, `AXS-LTO-013.3`)
+    if (cg_p as usize) != 0 {
+        callgraph_finalize(unsafe { mut_view(*cg_p) }, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    }
+    let _ = lto_compute_reachability(mut_view(*wpo), mut_view(*arena), mut_view(*stats));
+    let pruned = lto_prune_unreachable(mut_view(*wpo), mut_view(*stats));
+    if pruned > 0u32 {
+        any_changed = true;
+    }
+
+    if any_changed {
+        stats.pass_changes = stats.pass_changes + 1u32;
+    }
+    any_changed
+}
+
+fn lto_clone_mir_body(src: view<MirBody>, dst: mut_view<MirBody>, arena: mut_view<Arena>) {
+    dst.sym.v = src.sym.v;
+    dst.fn_sym.v = src.fn_sym.v;
+    dst.fn_name.v = src.fn_name.v;
+    dst.span = src.span;
+    dst.arg_count = src.arg_count;
+    dst.local_count = src.local_count;
+    dst.local_cap = src.local_count;
+    dst.bb_count = src.bb_count;
+    dst.bb_cap = src.bb_count;
+    dst.drop_flag_count = src.drop_flag_count;
+
+    if src.local_count > 0 && (src.locals as usize) != 0 {
+        let lbytes = lto_mul_usize(src.local_count, size_of<MirLocalDecl>());
+        let new_locals = arena_alloc_raw(mut_view(*arena), lbytes, align_of<MirLocalDecl>()) as *mut MirLocalDecl;
+        unsafe { ptr_copy_nonoverlapping<u8>(src.locals as *const u8, new_locals as *mut u8, lbytes); }
+        dst.locals = new_locals;
+    } else {
+        dst.locals = 0 as *mut MirLocalDecl;
+    }
+
+    if src.bb_count > 0 && (src.bbs as usize) != 0 {
+        let bbytes = lto_mul_usize(src.bb_count, size_of<MirBb>());
+        let new_bbs = arena_alloc_raw(mut_view(*arena), bbytes, align_of<MirBb>()) as *mut MirBb;
+        let mut b: usize = 0;
+        while b < src.bb_count {
+            let sbb = unsafe { mir_bb_at(src.bbs, b) };
+            let dbb = unsafe { mir_bb_at(new_bbs, b) };
+            unsafe {
+                (*dbb).id.v = (*sbb).id.v;
+                (*dbb).stmt_count = (*sbb).stmt_count;
+                (*dbb).stmt_cap = (*sbb).stmt_count;
+                (*dbb).has_terminator = (*sbb).has_terminator;
+                (*dbb).is_cleanup = (*sbb).is_cleanup;
+                mir_copy_terminator(mut_view((*dbb).terminator), view((*sbb).terminator));
+                if (*sbb).stmt_count > 0 && ((*sbb).stmts as usize) != 0 {
+                    let sbytes = lto_mul_usize((*sbb).stmt_count, size_of<MirStmt>());
+                    let nstmts = arena_alloc_raw(mut_view(*arena), sbytes, align_of<MirStmt>()) as *mut MirStmt;
+                    ptr_copy_nonoverlapping<u8>((*sbb).stmts as *const u8, nstmts as *mut u8, sbytes);
+                    (*dbb).stmts = nstmts;
+                } else {
+                    (*dbb).stmts = 0 as *mut MirStmt;
+                }
+            }
+            b = b + 1;
+        }
+        dst.bbs = new_bbs;
+    } else {
+        dst.bbs = 0 as *mut MirBb;
+    }
+}
+
+pub fn lto_run_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    wpo: mut_view<LtoWholeProgram>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<LtoStats>,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 || wpo.lto_mode == LTO_MODE_OFF || (wpo.cg as usize) == 0 {
+        return false;
+    }
+    let contract = lto_contract();
+    let base_req = contract.required_analyses & (0xFFFFFFFFu32 ^ ANALYSIS_MASK_CALL_GRAPH);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), base_req);
+    pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+
+    let cg_p: *mut CallGraph = wpo.cg;
+    let body_sym_v = body.fn_sym.v;
+    let caller_idx = callgraph_find_node_idx(unsafe { view(*cg_p) }, SymbolId { v: body_sym_v });
+    if caller_idx == INLINE_NONE_IDX {
+        return false;
+    }
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<LtoStats>(), align_of<LtoStats>()) as *mut LtoStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_sink_errs = sink.errors;
+
+    let caller_np = unsafe { cg_node_at((*cg_p).nodes, caller_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if (caller_mir_p as usize) != 0 {
+        lto_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+    }
+
+    if force_verify_fail {
+        if (caller_mir_p as usize) != 0 {
+            lto_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+        }
+        unsafe {
+            *body = *pre_body_ptr;
+            *stats = *pre_stats_ptr;
+            stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+            stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+        }
+        passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+        pm.ir_revision = pre_rev;
+        pm.valid_analyses = pre_valid;
+        return false;
+    }
+
+    let mut local_ss = sroa_stats_zero();
+    let changed = lto_run_cross_module_opt(
+        mut_view(*wpo),
+        pm.budget.profile,
+        mut_view(*eff_table),
+        mut_view(*esc_table),
+        mut_view(*stats),
+        0 as *mut InlineDecisionLog,
+        0 as *mut SpecDecisionLog,
+        0 as *mut DevirtDecisionLog,
+        unsafe { address_of_mut(local_ss) },
+        0 as *mut SroaDecisionLog,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    if (changed || force_verify_fail) && (caller_mir_p as usize) != 0 {
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 || force_verify_fail {
+            lto_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            return false;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_REACHABLE,
+            CERTAINTY_PROVEN,
+            ANALYSIS_CALL_GRAPH,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_LTO
+        );
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) || force_verify_fail {
+            sink.errors = pre_sink_errs;
+            if (caller_mir_p as usize) != 0 {
+                lto_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            }
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn lto_run_pass(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    wpo: mut_view<LtoWholeProgram>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<LtoStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    lto_run_pass_internal(
+        mut_view(*pm),
+        mut_view(*body),
+        mut_view(*wpo),
+        mut_view(*eff_table),
+        mut_view(*esc_table),
+        mut_view(*stats),
+        false,
+        mut_view(*arena),
+        mut_view(*sink)
+    )
+}
+
+// --- Section 7: Deterministic `--emit=lto` Inspection Printer (`SPEC-75 §5, AXS-PGO-015`) ---
+
+const LTO_PRINT_DATA: [320]u8 = [
+    //   0..11  "lto_wpo {\n" (10 bytes)
+    108u8, 116u8, 111u8, 95u8, 119u8, 112u8, 111u8, 32u8, 123u8, 10u8,
+    //  10..17  "  mode=" (7 bytes)
+    32u8, 32u8, 109u8, 111u8, 100u8, 101u8, 61u8,
+    //  17..20  "OFF" (3 bytes)
+    79u8, 70u8, 70u8,
+    //  20..24  "THIN" (4 bytes)
+    84u8, 72u8, 73u8, 78u8,
+    //  24..27  "FAT" (3 bytes)
+    70u8, 65u8, 84u8,
+    //  27..34  " world=" (7 bytes)
+    32u8, 119u8, 111u8, 114u8, 108u8, 100u8, 61u8,
+    //  34..40  "CLOSED" (6 bytes)
+    67u8, 76u8, 79u8, 83u8, 69u8, 68u8,
+    //  40..47  "PARTIAL" (7 bytes)
+    80u8, 65u8, 82u8, 84u8, 73u8, 65u8, 76u8,
+    //  47..51  "OPEN" (4 bytes)
+    79u8, 80u8, 69u8, 78u8,
+    //  51..60  " modules=" (9 bytes)
+    32u8, 109u8, 111u8, 100u8, 117u8, 108u8, 101u8, 115u8, 61u8,
+    //  60..68  "  fn fn#" (8 bytes)
+    32u8, 32u8, 102u8, 110u8, 32u8, 102u8, 110u8, 35u8,
+    //  68..73  " mod=" (5 bytes)
+    32u8, 109u8, 111u8, 100u8, 61u8,
+    //  73..78  " vis=" (5 bytes)
+    32u8, 118u8, 105u8, 115u8, 61u8,
+    //  78..87  " linkage=" (9 bytes)
+    32u8, 108u8, 105u8, 110u8, 107u8, 97u8, 103u8, 101u8, 61u8,
+    //  87..93  " root=" (6 bytes)
+    32u8, 114u8, 111u8, 111u8, 116u8, 61u8,
+    //  93..100 " reach=" (7 bytes)
+    32u8, 114u8, 101u8, 97u8, 99u8, 104u8, 61u8,
+    // 100..108 " leader=" (8 bytes)
+    32u8, 108u8, 101u8, 97u8, 100u8, 101u8, 114u8, 61u8,
+    // 108..126 "  dedup canonical=" (18 bytes)
+    32u8, 32u8, 100u8, 101u8, 100u8, 117u8, 112u8, 32u8, 99u8, 97u8, 110u8, 111u8, 110u8, 105u8, 99u8, 97u8, 108u8, 61u8,
+    // 126..137 " candidate=" (11 bytes)
+    32u8, 99u8, 97u8, 110u8, 100u8, 105u8, 100u8, 97u8, 116u8, 101u8, 61u8,
+    // 137..147 " decision=" (10 bytes)
+    32u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 61u8,
+    // 147..170 "  summary internalized=" (23 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 97u8, 108u8, 105u8, 122u8, 101u8, 100u8, 61u8,
+    // 170..180 " dead_fns=" (10 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 102u8, 110u8, 115u8, 61u8,
+    // 180..194 " dead_statics=" (14 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 115u8, 116u8, 97u8, 116u8, 105u8, 99u8, 115u8, 61u8,
+    // 194..208 " dead_vtables=" (14 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 118u8, 116u8, 97u8, 98u8, 108u8, 101u8, 115u8, 61u8,
+    // 208..217 " inlined=" (9 bytes)
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 61u8,
+    // 217..230 " specialized=" (13 bytes)
+    32u8, 115u8, 112u8, 101u8, 99u8, 105u8, 97u8, 108u8, 105u8, 122u8, 101u8, 100u8, 61u8,
+    // 230..238 " devirt=" (8 bytes)
+    32u8, 100u8, 101u8, 118u8, 105u8, 114u8, 116u8, 61u8,
+    // 238..251 " dedup_exact=" (13 bytes)
+    32u8, 100u8, 101u8, 100u8, 117u8, 112u8, 95u8, 101u8, 120u8, 97u8, 99u8, 116u8, 61u8,
+    // 251..263 " rep_shared=" (12 bytes)
+    32u8, 114u8, 101u8, 112u8, 95u8, 115u8, 104u8, 97u8, 114u8, 101u8, 100u8, 61u8,
+    // 263..274 " kept_addr=" (11 bytes)
+    32u8, 107u8, 101u8, 112u8, 116u8, 95u8, 97u8, 100u8, 100u8, 114u8, 61u8,
+    // 274..285 " rollbacks=" (11 bytes)
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 285..320 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn lto_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), LTO_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn lto_print(
+    wpo: view<LtoWholeProgram>,
+    stats: view<LtoStats>,
+    out: mut_view<DiagBuffer>
+) {
+    lto_push_tbl(mut_view(*out), 0, 10);
+    lto_push_tbl(mut_view(*out), 10, 7);
+    if wpo.lto_mode == LTO_MODE_OFF {
+        lto_push_tbl(mut_view(*out), 17, 3);
+    } else if wpo.lto_mode == LTO_MODE_THIN {
+        lto_push_tbl(mut_view(*out), 20, 4);
+    } else {
+        lto_push_tbl(mut_view(*out), 24, 3);
+    }
+    lto_push_tbl(mut_view(*out), 27, 7);
+    if wpo.world_scope == WORLD_CLOSED {
+        lto_push_tbl(mut_view(*out), 34, 6);
+    } else if wpo.world_scope == WORLD_PARTIAL {
+        lto_push_tbl(mut_view(*out), 40, 7);
+    } else {
+        lto_push_tbl(mut_view(*out), 47, 4);
+    }
+    lto_push_tbl(mut_view(*out), 51, 9);
+    diag_buf_push_u32(mut_view(*out), wpo.module_count as u32);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let mut i: usize = 0;
+    while i < wpo.fn_count && (wpo.fns as usize) != 0 {
+        let fp = unsafe { lto_fn_at(wpo.fns, i) };
+        lto_push_tbl(mut_view(*out), 60, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*fp).fn_sym.v });
+        lto_push_tbl(mut_view(*out), 68, 5);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*fp).module_id });
+        lto_push_tbl(mut_view(*out), 73, 5);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).visibility }) as u32);
+        lto_push_tbl(mut_view(*out), 78, 9);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).linkage }) as u32);
+        lto_push_tbl(mut_view(*out), 87, 6);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).root_kind }) as u32);
+        lto_push_tbl(mut_view(*out), 93, 7);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).reachability }) as u32);
+        lto_push_tbl(mut_view(*out), 100, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*fp).canonical_leader_sym.v });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    let mut d: usize = 0;
+    while d < wpo.dedup_count && (wpo.dedup_records as usize) != 0 {
+        let dp = unsafe { lto_dedup_at(wpo.dedup_records, d) };
+        lto_push_tbl(mut_view(*out), 108, 18);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*dp).canonical_sym.v });
+        lto_push_tbl(mut_view(*out), 126, 11);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*dp).candidate_sym.v });
+        lto_push_tbl(mut_view(*out), 137, 10);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*dp).decision }) as u32);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        d = d + 1;
+    }
+
+    lto_push_tbl(mut_view(*out), 147, 23);
+    diag_buf_push_u32(mut_view(*out), stats.symbols_internalized);
+    lto_push_tbl(mut_view(*out), 170, 10);
+    diag_buf_push_u32(mut_view(*out), stats.dead_fns_eliminated);
+    lto_push_tbl(mut_view(*out), 180, 14);
+    diag_buf_push_u32(mut_view(*out), stats.dead_statics_eliminated);
+    lto_push_tbl(mut_view(*out), 194, 14);
+    diag_buf_push_u32(mut_view(*out), stats.dead_vtables_eliminated);
+    lto_push_tbl(mut_view(*out), 208, 9);
+    diag_buf_push_u32(mut_view(*out), stats.cross_module_inlined);
+    lto_push_tbl(mut_view(*out), 217, 13);
+    diag_buf_push_u32(mut_view(*out), stats.cross_module_specialized);
+    lto_push_tbl(mut_view(*out), 230, 8);
+    diag_buf_push_u32(mut_view(*out), stats.cross_module_devirt_exact + stats.cross_module_devirt_guarded);
+    lto_push_tbl(mut_view(*out), 238, 13);
+    diag_buf_push_u32(mut_view(*out), stats.generics_dedup_exact);
+    lto_push_tbl(mut_view(*out), 251, 12);
+    diag_buf_push_u32(mut_view(*out), stats.generics_rep_shared);
+    lto_push_tbl(mut_view(*out), 263, 11);
+    diag_buf_push_u32(mut_view(*out), stats.generics_kept_addr_taken);
+    lto_push_tbl(mut_view(*out), 274, 11);
+    diag_buf_push_u32(mut_view(*out), stats.pass_rollbacks);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    lto_push_tbl(mut_view(*out), 285, 2);
+}
