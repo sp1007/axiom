@@ -1,0 +1,639 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use host_intrinsics.arg
+use host_intrinsics.args_count
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.query.db.DefId
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.SourceFileId
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.semantic_key_new
+use compiler.incremental.fingerprint.inc_add_item_call_dep
+use compiler.incremental.fingerprint.inc_add_item_const_dep
+use compiler.incremental.fingerprint.inc_add_item_layout_dep
+use compiler.incremental.fingerprint.inc_add_module_import
+use compiler.incremental.fingerprint.inc_register_item
+use compiler.incremental.fingerprint.inc_set_item_error_flag
+use compiler.incremental.cache.ARTIFACT_KIND_EXE
+use compiler.incremental.cache.ARTIFACT_KIND_LIB
+use compiler.incremental.cache.AXIC_HEADER_BYTES
+use compiler.incremental.cache.AXIC_SCHEMA_VERSION
+use compiler.incremental.cache.AX_INC_CACHE_CORRUPT
+use compiler.incremental.cache.CACHED_DIAG_ERROR
+use compiler.incremental.cache.CACHED_DIAG_WARNING
+use compiler.incremental.cache.CACHE_EVICT_COMPILER_CHANGED
+use compiler.incremental.cache.CACHE_EVICT_CORRUPT_CHECKSUM
+use compiler.incremental.cache.CACHE_EVICT_ENV_MISMATCH
+use compiler.incremental.cache.CACHE_EVICT_MISSING_OBJECT
+use compiler.incremental.cache.CACHE_EVICT_NONE
+use compiler.incremental.cache.CACHE_EVICT_SCHEMA_MISMATCH
+use compiler.incremental.cache.CACHE_EVICT_TRUNCATED
+use compiler.incremental.cache.IncrementalCache
+use compiler.incremental.cache.NOOP_FASTPATH_BUDGET_NS
+use compiler.incremental.cache.PANIC_STRATEGY_ABORT
+use compiler.incremental.cache.PANIC_STRATEGY_UNWIND
+use compiler.incremental.cache.SAFETY_PROFILE_HARDENED
+use compiler.incremental.cache.SAFETY_PROFILE_STANDARD
+use compiler.incremental.cache.inc_cache_attach_diag
+use compiler.incremental.cache.inc_cache_build_clean_no_incremental
+use compiler.incremental.cache.inc_cache_build_workspace
+use compiler.incremental.cache.inc_cache_compute_action_digest
+use compiler.incremental.cache.inc_cache_compute_action_digest_with_host_noise
+use compiler.incremental.cache.inc_cache_deserialize
+use compiler.incremental.cache.inc_cache_empty
+use compiler.incremental.cache.inc_cache_free
+use compiler.incremental.cache.inc_cache_get_cgu
+use compiler.incremental.cache.inc_cache_init
+use compiler.incremental.cache.inc_cache_inspect_dump
+use compiler.incremental.cache.inc_cache_load_from_disk
+use compiler.incremental.cache.inc_cache_register_module
+use compiler.incremental.cache.inc_cache_save_to_disk
+use compiler.incremental.cache.inc_cache_serialize
+use compiler.incremental.cache.inc_cache_set_action_config
+use compiler.incremental.cache.inc_cache_touch_source_mtime
+use compiler.incremental.cache.inc_cache_update_module_source
+use compiler.incremental.cache.inc_cache_validate_action_digest
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn bytes_eq(a: *const u8, a_len: usize, b: *const u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    if a_len == 0 {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        if unsafe { *(a + i) } != unsafe { *(b + i) } {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    bytes_eq(a.ptr as *const u8, a.len, b.ptr as *const u8, b.len)
+}
+
+fn print_diag_buf(b: view<DiagBuffer>) {
+    if b.len > 0 && (b.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), b.ptr as *const u8, b.len);
+        }
+    }
+}
+
+fn test_hermetic_action_digest(str_arena: mut_view<Arena>) -> bool {
+    let comp1 = fingerprint128_new(0x1111222233334444u64, 0x5555666677778888u64);
+    let comp2 = fingerprint128_new(0x9999222233334444u64, 0x5555666677778888u64);
+    let man1 = fingerprint128_new(0xAAAABBBBCCCCDDDDu64, 0x123456789ABCDEF0u64);
+    let man2 = fingerprint128_new(0xAAAABBBBCCCCEEEEu64, 0x123456789ABCDEF0u64);
+    let triple_win = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let triple_lnx = probe_sv(mut_view(*str_arena), "x86_64-unknown-linux-gnu");
+    let abi_w64 = probe_sv(mut_view(*str_arena), "win64");
+
+    let env_noise_1 = probe_sv(mut_view(*str_arena), "PATH=/usr/bin;USER=alice");
+    let env_noise_2 = probe_sv(mut_view(*str_arena), "PATH=D:/tools;USER=bob;RANDOM=42");
+    let cwd_1 = probe_sv(mut_view(*str_arena), "C:/dev/workspace_a");
+    let cwd_2 = probe_sv(mut_view(*str_arena), "D:/ci/workspace_b");
+
+    // 1. Invariant to undeclared host env vars, cwd, and wall-clock timestamps (AXS-INC-021)
+    let d_clean = inc_cache_compute_action_digest_with_host_noise(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1,
+        env_noise_1, cwd_1, 1000u64
+    );
+    let d_noisy = inc_cache_compute_action_digest_with_host_noise(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1,
+        env_noise_2, cwd_2, 999999999u64
+    );
+    if !fingerprint128_eq(d_clean.env_digest, d_noisy.env_digest) {
+        return false;
+    }
+    if inc_cache_validate_action_digest(view(d_clean), view(d_noisy)) != CACHE_EVICT_NONE {
+        return false;
+    }
+
+    // 2. Sensitive to compiler binary digest, schema version, target triple, opt level, safety profile, panic strategy, artifact kind, manifest digest
+    let d_comp = inc_cache_compute_action_digest(
+        comp2, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1
+    );
+    if inc_cache_validate_action_digest(view(d_clean), view(d_comp)) != CACHE_EVICT_COMPILER_CHANGED {
+        return false;
+    }
+
+    let d_schema = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION + 1u32, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1
+    );
+    if inc_cache_validate_action_digest(view(d_schema), view(d_clean)) != CACHE_EVICT_SCHEMA_MISMATCH {
+        return false;
+    }
+
+    let d_target = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_lnx, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1
+    );
+    let d_opt = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 0u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1
+    );
+    let d_safety = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_HARDENED, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man1
+    );
+    let d_panic = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_ABORT, ARTIFACT_KIND_EXE, man1
+    );
+    let d_kind = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_LIB, man1
+    );
+    let d_man = inc_cache_compute_action_digest(
+        comp1, AXIC_SCHEMA_VERSION, triple_win, abi_w64, 0u32, 2u8,
+        SAFETY_PROFILE_STANDARD, PANIC_STRATEGY_UNWIND, ARTIFACT_KIND_EXE, man2
+    );
+
+    if inc_cache_validate_action_digest(view(d_clean), view(d_target)) != CACHE_EVICT_ENV_MISMATCH ||
+        inc_cache_validate_action_digest(view(d_clean), view(d_opt)) != CACHE_EVICT_ENV_MISMATCH ||
+        inc_cache_validate_action_digest(view(d_clean), view(d_safety)) != CACHE_EVICT_ENV_MISMATCH ||
+        inc_cache_validate_action_digest(view(d_clean), view(d_panic)) != CACHE_EVICT_ENV_MISMATCH ||
+        inc_cache_validate_action_digest(view(d_clean), view(d_kind)) != CACHE_EVICT_ENV_MISMATCH ||
+        inc_cache_validate_action_digest(view(d_clean), view(d_man)) != CACHE_EVICT_ENV_MISMATCH {
+        return false;
+    }
+
+    true
+}
+
+fn populate_workspace(
+    cache: mut_view<IncrementalCache>,
+    str_arena: mut_view<Arena>,
+    math_src: StrView
+) {
+    let comp_dig = fingerprint128_new(0x4158494F4D43325Fu64, 0x323032365F563130u64);
+    let man_dig = fingerprint128_new(0x4D414E4946455354u64, 0x0000000000000001u64);
+    let triple = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let abi_prof = probe_sv(mut_view(*str_arena), "win64");
+
+    inc_cache_set_action_config(
+        mut_view(*cache),
+        comp_dig,
+        triple,
+        abi_prof,
+        0u32,
+        2u8,
+        SAFETY_PROFILE_STANDARD,
+        PANIC_STRATEGY_UNWIND,
+        ARTIFACT_KIND_EXE,
+        man_dig
+    );
+
+    let pkg = probe_sv(mut_view(*str_arena), "core_pkg");
+    let m_math = probe_sv(mut_view(*str_arena), "math_lib");
+    let m_app = probe_sv(mut_view(*str_arena), "app");
+    let m_util = probe_sv(mut_view(*str_arena), "util");
+
+    let p_math = probe_sv(mut_view(*str_arena), "src/math_lib.ax");
+    let p_app = probe_sv(mut_view(*str_arena), "src/app.ax");
+    let p_util = probe_sv(mut_view(*str_arena), "src/util.ax");
+
+    let src_app = probe_sv(
+        mut_view(*str_arena),
+        "pub fn run_app(x: i32) -> i32 { compute(x) + fast_add(x) }\n"
+    );
+    let src_util = probe_sv(
+        mut_view(*str_arena),
+        "pub fn helper_util(x: i32) -> i32 { x * 2 }\n"
+    );
+
+    let mod_math = ModuleId { v: 1u32 };
+    let mod_app = ModuleId { v: 2u32 };
+    let mod_util = ModuleId { v: 3u32 };
+
+    inc_cache_register_module(mut_view(*cache), mod_math, PackageId { v: 1u32 }, pkg, m_math, SourceFileId { v: 1u32 }, p_math, math_src, 1000u64);
+    inc_cache_register_module(mut_view(*cache), mod_app, PackageId { v: 1u32 }, pkg, m_app, SourceFileId { v: 2u32 }, p_app, src_app, 1000u64);
+    inc_cache_register_module(mut_view(*cache), mod_util, PackageId { v: 1u32 }, pkg, m_util, SourceFileId { v: 3u32 }, p_util, src_util, 1000u64);
+    inc_add_module_import(mut_view(cache.eng), mod_app, mod_math);
+
+    let empty = probe_sv(mut_view(*str_arena), "");
+    let n_scale = probe_sv(mut_view(*str_arena), "SCALE");
+    let n_pkt = probe_sv(mut_view(*str_arena), "Packet");
+    let n_sec = probe_sv(mut_view(*str_arena), "secret_helper");
+    let n_comp = probe_sv(mut_view(*str_arena), "compute");
+    let n_fast = probe_sv(mut_view(*str_arena), "fast_add");
+    let n_run = probe_sv(mut_view(*str_arena), "run_app");
+    let n_util = probe_sv(mut_view(*str_arena), "helper_util");
+
+    let d_scale = inc_register_item(mut_view(cache.eng), DefId { v: 10u32 }, mod_math, ITEM_KIND_CONST, true, false, false, 0u32, 1u32, n_scale, empty);
+    let d_pkt = inc_register_item(mut_view(cache.eng), DefId { v: 11u32 }, mod_math, ITEM_KIND_STRUCT, true, false, false, 0u32, 2u32, n_pkt, empty);
+    let d_sec = inc_register_item(mut_view(cache.eng), DefId { v: 12u32 }, mod_math, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_sec, empty);
+    let d_comp = inc_register_item(mut_view(cache.eng), DefId { v: 13u32 }, mod_math, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_comp, empty);
+    let d_fast = inc_register_item(mut_view(cache.eng), DefId { v: 14u32 }, mod_math, ITEM_KIND_FN, true, true, false, 1u32, 1u32, n_fast, empty);
+    let d_run = inc_register_item(mut_view(cache.eng), DefId { v: 20u32 }, mod_app, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_run, empty);
+    let _ = inc_register_item(mut_view(cache.eng), DefId { v: 30u32 }, mod_util, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_util, empty);
+
+    inc_add_item_call_dep(mut_view(cache.eng), d_comp, d_sec);
+    inc_add_item_call_dep(mut_view(cache.eng), d_run, d_comp);
+    inc_add_item_call_dep(mut_view(cache.eng), d_run, d_fast);
+    inc_add_item_const_dep(mut_view(cache.eng), d_run, d_scale);
+    inc_add_item_layout_dep(mut_view(cache.eng), d_run, d_pkt);
+
+    // Attach two warnings in reverse order to verify canonical AXD-060 diagnostic sorting & warm replay
+    let sk_util = semantic_key_new(pkg, m_util, ITEM_NS_VALUE, 0u32, n_util, empty);
+    let sk_app = semantic_key_new(pkg, m_app, ITEM_NS_VALUE, 0u32, n_run, empty);
+    let msg_w_util = probe_sv(mut_view(*str_arena), "unused parameter in helper_util");
+    let msg_w_app = probe_sv(mut_view(*str_arena), "redundant parentheses in run_app");
+    inc_cache_attach_diag(mut_view(*cache), 2101u32, CACHED_DIAG_WARNING, mod_util, DefId { v: 30u32 }, 4u32, 5u32, sk_util, msg_w_util);
+    inc_cache_attach_diag(mut_view(*cache), 2100u32, CACHED_DIAG_WARNING, mod_app, DefId { v: 20u32 }, 2u32, 9u32, sk_app, msg_w_app);
+}
+
+fn test_persistence_noop_fastpath_and_clean_equivalence(
+    str_arena: mut_view<Arena>,
+    disk_cache_dir: StrView,
+    out_dump: mut_view<DiagBuffer>
+) -> i32 {
+    let src_math_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 10 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 1 }\n"
+    );
+
+    // ========================================================================
+    // Phase 1: Cold build in Session A, serialize & save to disk (`.axiom-cache`)
+    // ========================================================================
+    let mut sess_a = inc_cache_empty();
+    inc_cache_init(mut_view(sess_a), 100u64);
+    populate_workspace(mut_view(sess_a), mut_view(*str_arena), src_math_r1);
+
+    if !inc_cache_build_workspace(mut_view(sess_a)) {
+        inc_cache_free(mut_view(sess_a));
+        return 31;
+    }
+    if !sess_a.is_warm || sess_a.last_noop_fastpath || sess_a.eng.rev_cgu_rebuilt != 3u32 {
+        inc_cache_free(mut_view(sess_a));
+        return 32;
+    }
+
+    let mut wire_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(wire_buf));
+    inc_cache_serialize(mut_view(sess_a), mut_view(wire_buf));
+    if wire_buf.len <= AXIC_HEADER_BYTES {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_a));
+        return 21;
+    }
+
+    if disk_cache_dir.len > 0 {
+        if !inc_cache_save_to_disk(mut_view(sess_a), disk_cache_dir) {
+            diag_buf_free(mut_view(wire_buf));
+            inc_cache_free(mut_view(sess_a));
+            return 33;
+        }
+        // 3 `.obj` files + 1 `dep-graph.axcache` = 4 atomic temp writes and 4 atomic renames
+        if sess_a.atomic_temp_writes != 4u32 || sess_a.atomic_renames != 4u32 {
+            diag_buf_free(mut_view(wire_buf));
+            inc_cache_free(mut_view(sess_a));
+            return 34;
+        }
+    }
+
+    // ========================================================================
+    // Phase 1b: Validate corruption, truncation, schema mismatch & compiler change eviction
+    // ========================================================================
+    let mut sess_b = inc_cache_empty();
+    inc_cache_init(mut_view(sess_b), 200u64);
+    populate_workspace(mut_view(sess_b), mut_view(*str_arena), src_math_r1);
+
+    // 1. Truncated header -> `CACHE_EVICT_TRUNCATED` + `AX_INC_CACHE_CORRUPT`
+    let st_trunc = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, 24);
+    if st_trunc != CACHE_EVICT_TRUNCATED || sess_b.last_eviction_diag_code != AX_INC_CACHE_CORRUPT {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 22;
+    }
+
+    // 2. Mid-section truncation -> `CACHE_EVICT_CORRUPT_CHECKSUM`
+    let st_mid = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len - 8);
+    if st_mid != CACHE_EVICT_CORRUPT_CHECKSUM {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 23;
+    }
+
+    // 3. Corrupted payload byte (bit-flip) -> `CACHE_EVICT_CORRUPT_CHECKSUM` + `AX_INC_CACHE_CORRUPT`
+    unsafe { *(wire_buf.ptr + 40) = (*(wire_buf.ptr + 40)) ^ 0x55u8; }
+    let st_csum = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len);
+    unsafe { *(wire_buf.ptr + 40) = (*(wire_buf.ptr + 40)) ^ 0x55u8; }
+    if st_csum != CACHE_EVICT_CORRUPT_CHECKSUM || sess_b.last_eviction_diag_code != AX_INC_CACHE_CORRUPT {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 24;
+    }
+
+    // 4. Schema version mismatch (byte 8 is low byte of `schema_version`) -> `CACHE_EVICT_SCHEMA_MISMATCH`
+    unsafe { *(wire_buf.ptr + 8) = 99u8; }
+    let st_schema = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len);
+    unsafe { *(wire_buf.ptr + 8) = 1u8; }
+    if st_schema != CACHE_EVICT_SCHEMA_MISMATCH || sess_b.last_eviction_diag_code != AX_INC_CACHE_CORRUPT {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 25;
+    }
+
+    // 5. Compiler binary digest upgrade on target session -> `CACHE_EVICT_COMPILER_CHANGED`
+    let saved_act = sess_b.action_digest;
+    let new_comp = fingerprint128_new(0x9999999999999999u64, 0x323032365F563230u64);
+    sess_b.action_digest = inc_cache_compute_action_digest(
+        new_comp,
+        saved_act.schema_version,
+        saved_act.target_triple,
+        saved_act.abi_profile,
+        saved_act.cpu_feature_mask,
+        saved_act.opt_level,
+        saved_act.safety_profile,
+        saved_act.panic_strategy,
+        saved_act.artifact_kind,
+        saved_act.manifest_digest
+    );
+    let st_comp = inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len);
+    sess_b.action_digest = saved_act;
+    if st_comp != CACHE_EVICT_COMPILER_CHANGED || sess_b.last_eviction_diag_code != AX_INC_CACHE_CORRUPT {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 26;
+    }
+
+    // Reset eviction counters on `sess_b` before clean Phase 2 load
+    sess_b.eviction_count = 0u32;
+    sess_b.last_eviction_reason = CACHE_EVICT_NONE;
+    sess_b.last_eviction_diag_code = 0u32;
+
+    // ========================================================================
+    // Phase 2: Load persistent cache into Session B & run `< 100 ms` No-Op Fast Path
+    // ========================================================================
+    let load_st = if disk_cache_dir.len > 0 {
+        inc_cache_load_from_disk(mut_view(sess_b), disk_cache_dir)
+    } else {
+        inc_cache_deserialize(mut_view(sess_b), wire_buf.ptr as *const u8, wire_buf.len)
+    };
+    if load_st != CACHE_EVICT_NONE || !sess_b.is_warm {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 100 + (load_st as i32);
+    }
+
+    // Preserve deterministic atomic write/rename counters across the loaded session for telemetry parity
+    sess_b.atomic_temp_writes = 4u32;
+    sess_b.atomic_renames = 4u32;
+
+    // 2a. No-op rebuild #1 (fast `(size, mtime_ns)` pre-check hit): `< 100 ms`, 0 queries, 0 CGUs rebuilt!
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 35;
+    }
+    if !sess_b.last_noop_fastpath ||
+        sess_b.last_noop_elapsed_ns >= NOOP_FASTPATH_BUDGET_NS ||
+        sess_b.eng.rev_queries_total != 0u32 ||
+        sess_b.eng.rev_queries_recomputed != 0u32 ||
+        sess_b.eng.rev_modules_typechecked != 0u32 ||
+        sess_b.eng.rev_cgu_rebuilt != 0u32 ||
+        sess_b.eng.rev_cgu_reused != 3u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 36;
+    }
+
+    // 2b. No-op rebuild #2 after `touch` (`mtime_ns` changed on `math_lib`, content-digest fallback):
+    //     Still takes the `< 100 ms` no-op fast path with 0 queries and 0 CGUs rebuilt!
+    inc_cache_touch_source_mtime(mut_view(sess_b), SourceFileId { v: 1u32 }, 999999u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 37;
+    }
+    if !sess_b.last_noop_fastpath ||
+        sess_b.last_noop_elapsed_ns >= NOOP_FASTPATH_BUDGET_NS ||
+        sess_b.noop_fastpath_hits != 2u32 ||
+        sess_b.content_digest_hits == 0u32 ||
+        sess_b.eng.rev_queries_recomputed != 0u32 ||
+        sess_b.eng.rev_cgu_rebuilt != 0u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 38;
+    }
+
+    // ========================================================================
+    // Phase 3: Incremental private-body edit in `math_lib` (R2) vs Clean `--no-incremental` build
+    // ========================================================================
+    let src_math_r2 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 999 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 1 }\n"
+    );
+    let _ = inc_cache_update_module_source(mut_view(sess_b), ModuleId { v: 1u32 }, src_math_r2, 2000u64);
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 39;
+    }
+
+    // Only `math_lib` (`ModuleId(1)`) rebuilt its `.obj`; `app` and `util` reused their cached `.obj` blobs!
+    if sess_b.last_noop_fastpath ||
+        sess_b.eng.rev_modules_typechecked != 1u32 ||
+        sess_b.eng.rev_cgu_rebuilt != 1u32 ||
+        sess_b.eng.rev_cgu_reused != 2u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 41;
+    }
+
+    // Build the exact same R2 workspace state from scratch using `--no-incremental` (`sess_clean`)
+    let mut sess_clean = inc_cache_empty();
+    inc_cache_init(mut_view(sess_clean), 300u64);
+    populate_workspace(mut_view(sess_clean), mut_view(*str_arena), src_math_r2);
+    if !inc_cache_build_clean_no_incremental(mut_view(sess_clean)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_clean));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 42;
+    }
+
+    // AXS-INC-024: Clean vs Incremental byte-for-byte equivalence across all `.obj` blobs and linked output!
+    if !fingerprint128_eq(sess_b.linked_artifact_fp, sess_clean.linked_artifact_fp) ||
+        !bytes_eq(
+            sess_b.linked_artifact_bytes as *const u8,
+            sess_b.linked_artifact_len as usize,
+            sess_clean.linked_artifact_bytes as *const u8,
+            sess_clean.linked_artifact_len as usize
+        ) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_clean));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 43;
+    }
+
+    let mut mid: u32 = 1u32;
+    while mid <= 3u32 {
+        let cgu_inc = inc_cache_get_cgu(view(sess_b), ModuleId { v: mid });
+        let cgu_cln = inc_cache_get_cgu(view(sess_clean), ModuleId { v: mid });
+        if !fingerprint128_eq(cgu_inc.cgu_fp, cgu_cln.cgu_fp) ||
+            !fingerprint128_eq(cgu_inc.obj_digest, cgu_cln.obj_digest) ||
+            !bytes_eq(
+                cgu_inc.obj_bytes as *const u8,
+                cgu_inc.obj_len as usize,
+                cgu_cln.obj_bytes as *const u8,
+                cgu_cln.obj_len as usize
+            ) {
+            diag_buf_free(mut_view(wire_buf));
+            inc_cache_free(mut_view(sess_clean));
+            inc_cache_free(mut_view(sess_b));
+            inc_cache_free(mut_view(sess_a));
+            return 44 + (mid as i32);
+        }
+        mid = mid + 1u32;
+    }
+
+    // After incremental R2 build, run one final no-op build on `sess_b` so the final dump shows
+    // `noop_fastpath=true under_100ms=true` with all 3 CGUs reused from cache!
+    if !inc_cache_build_workspace(mut_view(sess_b)) {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_clean));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 48;
+    }
+    if !sess_b.last_noop_fastpath || sess_b.last_noop_elapsed_ns >= NOOP_FASTPATH_BUDGET_NS {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_clean));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 49;
+    }
+
+    inc_cache_inspect_dump(view(sess_b), mut_view(*out_dump));
+
+    // Verify Error Non-Pollution (`AXS-INC-024 §2`): module with error diagnostic never publishes a Ready `.obj`
+    inc_set_item_error_flag(mut_view(sess_a.eng), DefId { v: 13u32 }, true);
+    let _ = inc_cache_update_module_source(mut_view(sess_a), ModuleId { v: 1u32 }, src_math_r1, 5000u64);
+    let build_err_ok = inc_cache_build_workspace(mut_view(sess_a));
+    let math_err_cgu = inc_cache_get_cgu(view(sess_a), ModuleId { v: 1u32 });
+    if build_err_ok || math_err_cgu.is_published || math_err_cgu.obj_len != 0u32 || sess_a.linked_artifact_len != 0u32 {
+        diag_buf_free(mut_view(wire_buf));
+        inc_cache_free(mut_view(sess_clean));
+        inc_cache_free(mut_view(sess_b));
+        inc_cache_free(mut_view(sess_a));
+        return 27;
+    }
+
+    diag_buf_free(mut_view(wire_buf));
+    inc_cache_free(mut_view(sess_clean));
+    inc_cache_free(mut_view(sess_b));
+    inc_cache_free(mut_view(sess_a));
+    0
+}
+
+fn read_optional_cache_dir_arg(str_arena: mut_view<Arena>) -> StrView {
+    let argc = args_count();
+    if argc < 2 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let buf = arena_alloc_raw(mut_view(*str_arena), 512, 1);
+    let alen = unsafe { arg(1, buf, 511) };
+    if alen <= 12i64 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    // Check "--cache-dir=" prefix so `axiomc run --interp ...` (where arg(1) is "run") is ignored
+    let is_prefix = unsafe {
+        (*buf) == 45u8 &&
+        (*(buf + 1)) == 45u8 &&
+        (*(buf + 2)) == 99u8 &&
+        (*(buf + 3)) == 97u8 &&
+        (*(buf + 4)) == 99u8 &&
+        (*(buf + 5)) == 104u8 &&
+        (*(buf + 6)) == 101u8 &&
+        (*(buf + 7)) == 45u8 &&
+        (*(buf + 8)) == 100u8 &&
+        (*(buf + 9)) == 105u8 &&
+        (*(buf + 10)) == 114u8 &&
+        (*(buf + 11)) == 61u8
+    };
+    if !is_prefix {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    unsafe { *(buf + (alen as usize)) = 0u8; }
+    StrView { ptr: unsafe { (buf + 12) as *const u8 }, len: (alen as usize) - 12 }
+}
+
+fn main() -> i32 {
+    let mut str_arena = arena_new();
+    let disk_dir = read_optional_cache_dir_arg(mut_view(str_arena));
+
+    let mut out1 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out1));
+
+    if !test_hermetic_action_digest(mut_view(str_arena)) {
+        return 10;
+    }
+    let rc1 = test_persistence_noop_fastpath_and_clean_equivalence(mut_view(str_arena), disk_dir, mut_view(out1));
+    if rc1 != 0 {
+        return rc1;
+    }
+
+    print_diag_buf(view(out1));
+
+    diag_buf_free(mut_view(out1));
+    arena_destroy(mut_view(str_arena));
+    0
+}

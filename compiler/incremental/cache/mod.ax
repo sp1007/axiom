@@ -1,0 +1,2719 @@
+// Persistent On-Disk Incremental Query & Codegen Cache (`.axiom-cache`),
+// Hermetic `ActionDigest` / `EnvironmentDigest` Validation, Versioned &
+// Checksummed Binary Schema (`AXCACHE1`), Atomic Temp-File + Rename Publication,
+// Graceful Corruption / Schema / Compiler-Digest Eviction Fallback, and
+// `< 100 ms` Root Workspace Manifest No-Op Fast Path (T758 / E18.2).
+// Implements SPEC-22 §3-§4 (AXS-INC-020..024, AXS-INC-050..053, INV-INC-002).
+module compiler.incremental.cache
+
+use std.core.host.open
+use std.core.host.read
+use std.core.host.write
+use std.core.host.close
+use std.core.host.file_size
+use std.core.host.remove
+use std.core.host.mkdir
+use std.core.host.monotonic_ns
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.DefId
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_MODULE
+use compiler.query.db.ITEM_NS_SOURCE
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_UNIT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.RevisionId
+use compiler.query.db.SemanticKey
+use compiler.query.db.SourceFileId
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_intern_bytes
+use compiler.query.db.query_db_intern_sv
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.revision_id_eq
+use compiler.query.db.revision_id_new
+use compiler.query.db.revision_id_next
+use compiler.query.db.revision_id_zero
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_eq
+use compiler.query.db.semantic_key_new
+
+use compiler.incremental.fingerprint.AbiFingerprint
+use compiler.incremental.fingerprint.AstFingerprint
+use compiler.incremental.fingerprint.BodyFingerprint
+use compiler.incremental.fingerprint.CodegenFingerprint
+use compiler.incremental.fingerprint.FP_TIER_ABI
+use compiler.incremental.fingerprint.FP_TIER_ACTION
+use compiler.incremental.fingerprint.FP_TIER_AST
+use compiler.incremental.fingerprint.FP_TIER_BODY
+use compiler.incremental.fingerprint.FP_TIER_CODEGEN
+use compiler.incremental.fingerprint.FP_TIER_INTERFACE
+use compiler.incremental.fingerprint.FP_TIER_SOURCE
+use compiler.incremental.fingerprint.FpStream128
+use compiler.incremental.fingerprint.INC_MAX_EDGES_PER_NODE
+use compiler.incremental.fingerprint.INC_MAX_ITEMS
+use compiler.incremental.fingerprint.INC_MAX_MODULES
+use compiler.incremental.fingerprint.INC_MAX_NODES
+use compiler.incremental.fingerprint.INC_NODE_CODEGEN_UNIT
+use compiler.incremental.fingerprint.INC_NODE_CONST_EVAL
+use compiler.incremental.fingerprint.INC_NODE_ITEM_ABI
+use compiler.incremental.fingerprint.INC_NODE_ITEM_SIGNATURE
+use compiler.incremental.fingerprint.INC_NODE_MIR_BODY
+use compiler.incremental.fingerprint.INC_NODE_MODULE_INTERFACE
+use compiler.incremental.fingerprint.INC_NODE_PARSE_MODULE
+use compiler.incremental.fingerprint.INC_NODE_RESOLVE_MODULE
+use compiler.incremental.fingerprint.INC_NODE_SOURCE_FILE
+use compiler.incremental.fingerprint.INC_NODE_TARGET_CONFIG
+use compiler.incremental.fingerprint.IncItemRecord
+use compiler.incremental.fingerprint.IncModuleRecord
+use compiler.incremental.fingerprint.IncrementalEngine
+use compiler.incremental.fingerprint.InterfaceFingerprint
+use compiler.incremental.fingerprint.MISS_COLD_CACHE
+use compiler.incremental.fingerprint.MISS_NONE
+use compiler.incremental.fingerprint.NODE_COLOR_GREEN
+use compiler.incremental.fingerprint.NODE_COLOR_RED
+use compiler.incremental.fingerprint.NODE_COLOR_UNKNOWN
+use compiler.incremental.fingerprint.RedGreenNode
+use compiler.incremental.fingerprint.SourceFingerprint
+use compiler.incremental.fingerprint.TypedDepEdge
+use compiler.incremental.fingerprint.fp_buf_push_fp128_hex
+use compiler.incremental.fingerprint.fp_compute_source
+use compiler.incremental.fingerprint.fp_emit_fingerprints
+use compiler.incremental.fingerprint.fp_emit_incremental_stats
+use compiler.incremental.fingerprint.fp_stream_finish
+use compiler.incremental.fingerprint.fp_stream_new
+use compiler.incremental.fingerprint.fp_stream_write_bytes
+use compiler.incremental.fingerprint.fp_stream_write_fp128
+use compiler.incremental.fingerprint.fp_stream_write_semantic_key
+use compiler.incremental.fingerprint.fp_stream_write_sv
+use compiler.incremental.fingerprint.fp_stream_write_u32
+use compiler.incremental.fingerprint.fp_stream_write_u64
+use compiler.incremental.fingerprint.fp_stream_write_u8
+use compiler.incremental.fingerprint.inc_build_workspace
+use compiler.incremental.fingerprint.inc_engine_begin_revision
+use compiler.incremental.fingerprint.inc_engine_empty
+use compiler.incremental.fingerprint.inc_engine_free
+use compiler.incremental.fingerprint.inc_engine_init
+use compiler.incremental.fingerprint.inc_engine_reset_rev_stats
+use compiler.incremental.fingerprint.inc_find_item_index
+use compiler.incremental.fingerprint.inc_find_module_index
+use compiler.incremental.fingerprint.inc_get_item
+use compiler.incremental.fingerprint.inc_get_module
+use compiler.incremental.fingerprint.inc_get_node
+use compiler.incremental.fingerprint.inc_register_module
+use compiler.incremental.fingerprint.inc_set_target_config
+use compiler.incremental.fingerprint.inc_update_module_source
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// ============================================================================
+// 1. On-Disk Persistence Constants, Layer Tiers & Eviction Codes (AXS-INC-020..024)
+// ============================================================================
+
+// 8-byte little-endian magic for `"AXCACHE1"` (0x41,0x58,0x43,0x41,0x43,0x48,0x45,0x31)
+pub const AXIC_MAGIC: u64 = 0x3145484341435841u64;
+pub const AXIC_SCHEMA_VERSION: u32 = 1u32;
+pub const AXIC_HEADER_BYTES: usize = 32;
+pub const AXIC_TRAILER_CHECKSUM_BYTES: usize = 16;
+
+// Cache hierarchy layers (AXS-INC-020)
+pub const CACHE_LAYER_L0_MEMO: u8 = 0u8;
+pub const CACHE_LAYER_L1_SESSION: u8 = 1u8;
+pub const CACHE_LAYER_L2_DISK: u8 = 2u8;
+
+// Internal cache corruption / eviction diagnostic & status codes (AXS-INC-022, AXS-INC-050)
+pub const AX_INC_CACHE_CORRUPT: u32 = 9250u32;
+
+pub const CACHE_EVICT_NONE: u8 = 0u8;
+pub const CACHE_EVICT_COLD_MISSING: u8 = 1u8;
+pub const CACHE_EVICT_SCHEMA_MISMATCH: u8 = 2u8;
+pub const CACHE_EVICT_COMPILER_CHANGED: u8 = 3u8;
+pub const CACHE_EVICT_ENV_MISMATCH: u8 = 4u8;
+pub const CACHE_EVICT_CORRUPT_CHECKSUM: u8 = 5u8;
+pub const CACHE_EVICT_TRUNCATED: u8 = 6u8;
+pub const CACHE_EVICT_MISSING_OBJECT: u8 = 7u8;
+
+// Safety profiles, panic strategies & artifact kinds for ActionDigest (AXS-INC-021)
+pub const SAFETY_PROFILE_STANDARD: u8 = 0u8;
+pub const SAFETY_PROFILE_STRICT: u8 = 1u8;
+pub const SAFETY_PROFILE_HARDENED: u8 = 2u8;
+
+pub const PANIC_STRATEGY_UNWIND: u8 = 0u8;
+pub const PANIC_STRATEGY_ABORT: u8 = 1u8;
+
+pub const ARTIFACT_KIND_EXE: u8 = 0u8;
+pub const ARTIFACT_KIND_LIB: u8 = 1u8;
+pub const ARTIFACT_KIND_DLL: u8 = 2u8;
+pub const ARTIFACT_KIND_OBJ: u8 = 3u8;
+
+// Cached diagnostic severities (AXS-INC-023, AXS-INC-024)
+pub const CACHED_DIAG_WARNING: u8 = 1u8;
+pub const CACHED_DIAG_ERROR: u8 = 2u8;
+
+// `< 100 ms` no-op rebuild threshold in nanoseconds (100,000,000 ns)
+pub const NOOP_FASTPATH_BUDGET_NS: u64 = 100_000_000u64;
+
+pub const CACHE_MAX_SOURCES: usize = 16;
+pub const CACHE_MAX_CGUS: usize = 16;
+pub const CACHE_MAX_DIAGS: usize = 16;
+
+// Canonical ASCII table for domain tags, file names, and telemetry formatting:
+//   0..12:  "AXIOM-ENV-v1" (12)
+//  12..20:  "AXCACHE1" (8)
+//  20..24:  "NONE" (4)
+//  24..36:  "COLD_MISSING" (12)
+//  36..51:  "SCHEMA_MISMATCH" (15)
+//  51..67:  "COMPILER_CHANGED" (16)
+//  67..79:  "ENV_MISMATCH" (12)
+//  79..95:  "CORRUPT_CHECKSUM" (16)
+//  95..104: "TRUNCATED" (9)
+// 104..118: "MISSING_OBJECT" (14)
+// 118..122: "true" (4)
+// 122..127: "false" (5)
+// 127..134: "WARNING" (7)
+// 134..139: "ERROR" (5)
+// 139..157: "/dep-graph.axcache" (18)
+// 157..161: ".tmp" (4)
+// 161..169: "/objects" (8)
+// 169..173: ".obj" (4)
+// 173..189: "0123456789abcdef" (16)
+const CACHE_ASCII_TABLE: [189]u8 = [
+    65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 69u8, 78u8, 86u8, 45u8, 118u8, 49u8,
+    65u8, 88u8, 67u8, 65u8, 67u8, 72u8, 69u8, 49u8,
+    78u8, 79u8, 78u8, 69u8,
+    67u8, 79u8, 76u8, 68u8, 95u8, 77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8,
+    83u8, 67u8, 72u8, 69u8, 77u8, 65u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8,
+    67u8, 79u8, 77u8, 80u8, 73u8, 76u8, 69u8, 82u8, 95u8, 67u8, 72u8, 65u8, 78u8, 71u8, 69u8, 68u8,
+    69u8, 78u8, 86u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8,
+    67u8, 79u8, 82u8, 82u8, 85u8, 80u8, 84u8, 95u8, 67u8, 72u8, 69u8, 67u8, 75u8, 83u8, 85u8, 77u8,
+    84u8, 82u8, 85u8, 78u8, 67u8, 65u8, 84u8, 69u8, 68u8,
+    77u8, 73u8, 83u8, 83u8, 73u8, 78u8, 71u8, 95u8, 79u8, 66u8, 74u8, 69u8, 67u8, 84u8,
+    116u8, 114u8, 117u8, 101u8,
+    102u8, 97u8, 108u8, 115u8, 101u8,
+    87u8, 65u8, 82u8, 78u8, 73u8, 78u8, 71u8,
+    69u8, 82u8, 82u8, 79u8, 82u8,
+    47u8, 100u8, 101u8, 112u8, 45u8, 103u8, 114u8, 97u8, 112u8, 104u8, 46u8, 97u8, 120u8, 99u8, 97u8, 99u8, 104u8, 101u8,
+    46u8, 116u8, 109u8, 112u8,
+    47u8, 111u8, 98u8, 106u8, 101u8, 99u8, 116u8, 115u8,
+    46u8, 111u8, 98u8, 106u8,
+    48u8, 49u8, 50u8, 51u8, 52u8, 53u8, 54u8, 55u8, 56u8, 57u8, 97u8, 98u8, 99u8, 100u8, 101u8, 102u8
+];
+
+// ============================================================================
+// 2. Hermetic ActionDigest / EnvironmentDigest (AXS-INC-021, ACACHE-20..21)
+// ============================================================================
+
+@derive(Copy)
+pub struct ActionDigest {
+    pub compiler_binary_digest: Fingerprint128,
+    pub schema_version: u32,
+    pub target_triple: StrView,
+    pub abi_profile: StrView,
+    pub cpu_feature_mask: u32,
+    pub opt_level: u8,
+    pub safety_profile: u8,
+    pub panic_strategy: u8,
+    pub artifact_kind: u8,
+    pub manifest_digest: Fingerprint128,
+    pub env_digest: Fingerprint128,
+}
+
+pub fn inc_cache_action_digest_empty() -> ActionDigest {
+    ActionDigest {
+        compiler_binary_digest: fingerprint128_zero(),
+        schema_version: AXIC_SCHEMA_VERSION,
+        target_triple: qry_sv_empty(),
+        abi_profile: qry_sv_empty(),
+        cpu_feature_mask: 0u32,
+        opt_level: 2u8,
+        safety_profile: SAFETY_PROFILE_STANDARD,
+        panic_strategy: PANIC_STRATEGY_UNWIND,
+        artifact_kind: ARTIFACT_KIND_EXE,
+        manifest_digest: fingerprint128_zero(),
+        env_digest: fingerprint128_zero(),
+    }
+}
+
+// Computes hermetic 128-bit `EnvironmentDigest` / `ActionDigest` over:
+//   "AXIOM-ENV-v1" || compiler_binary_digest || cache_schema_version || target_triple ||
+//   abi_profile || cpu_feature_mask || opt_profile || safety_profile || panic_strategy ||
+//   artifact_kind || manifest_digest
+// Undeclared host environment variables, current working directory strings, and wall-clock
+// timestamps are strictly excluded (AXS-INC-021, ACACHE-20..21).
+pub fn inc_cache_compute_action_digest_with_host_noise(
+    compiler_binary_digest: Fingerprint128,
+    schema_version: u32,
+    target_triple: StrView,
+    abi_profile: StrView,
+    cpu_feature_mask: u32,
+    opt_level: u8,
+    safety_profile: u8,
+    panic_strategy: u8,
+    artifact_kind: u8,
+    manifest_digest: Fingerprint128,
+    _undeclared_host_env_ignored: StrView,
+    _host_cwd_ignored: StrView,
+    _wall_clock_ns_ignored: u64
+) -> ActionDigest {
+    let mut s = fp_stream_new(FP_TIER_ACTION);
+    // Domain tag "AXIOM-ENV-v1"
+    let mut di: usize = 0;
+    while di < 12 {
+        fp_stream_write_u8(mut_view(s), CACHE_ASCII_TABLE[di]);
+        di = di + 1;
+    }
+    fp_stream_write_fp128(mut_view(s), compiler_binary_digest);
+    fp_stream_write_u32(mut_view(s), schema_version);
+    fp_stream_write_sv(mut_view(s), target_triple);
+    fp_stream_write_sv(mut_view(s), abi_profile);
+    fp_stream_write_u32(mut_view(s), cpu_feature_mask);
+    fp_stream_write_u8(mut_view(s), opt_level);
+    fp_stream_write_u8(mut_view(s), safety_profile);
+    fp_stream_write_u8(mut_view(s), panic_strategy);
+    fp_stream_write_u8(mut_view(s), artifact_kind);
+    fp_stream_write_fp128(mut_view(s), manifest_digest);
+    let env_fp = fp_stream_finish(view(s));
+
+    ActionDigest {
+        compiler_binary_digest: compiler_binary_digest,
+        schema_version: schema_version,
+        target_triple: target_triple,
+        abi_profile: abi_profile,
+        cpu_feature_mask: cpu_feature_mask,
+        opt_level: opt_level,
+        safety_profile: safety_profile,
+        panic_strategy: panic_strategy,
+        artifact_kind: artifact_kind,
+        manifest_digest: manifest_digest,
+        env_digest: env_fp,
+    }
+}
+
+pub fn inc_cache_compute_action_digest(
+    compiler_binary_digest: Fingerprint128,
+    schema_version: u32,
+    target_triple: StrView,
+    abi_profile: StrView,
+    cpu_feature_mask: u32,
+    opt_level: u8,
+    safety_profile: u8,
+    panic_strategy: u8,
+    artifact_kind: u8,
+    manifest_digest: Fingerprint128
+) -> ActionDigest {
+    inc_cache_compute_action_digest_with_host_noise(
+        compiler_binary_digest,
+        schema_version,
+        target_triple,
+        abi_profile,
+        cpu_feature_mask,
+        opt_level,
+        safety_profile,
+        panic_strategy,
+        artifact_kind,
+        manifest_digest,
+        qry_sv_empty(),
+        qry_sv_empty(),
+        0u64
+    )
+}
+
+// Validates cached `ActionDigest` against active compiler session `ActionDigest`.
+// Returns `CACHE_EVICT_NONE` if valid, or the specific eviction reason (`CACHE_EVICT_*`).
+pub fn inc_cache_validate_action_digest(cached: view<ActionDigest>, current: view<ActionDigest>) -> u8 {
+    if cached.schema_version != current.schema_version || cached.schema_version != AXIC_SCHEMA_VERSION {
+        return CACHE_EVICT_SCHEMA_MISMATCH;
+    }
+    if !fingerprint128_eq(cached.compiler_binary_digest, current.compiler_binary_digest) {
+        return CACHE_EVICT_COMPILER_CHANGED;
+    }
+    if !fingerprint128_eq(cached.env_digest, current.env_digest) {
+        return CACHE_EVICT_ENV_MISMATCH;
+    }
+    CACHE_EVICT_NONE
+}
+
+// ============================================================================
+// 3. Workspace Input Manifest, Cached Diagnostics & Per-CGU `.obj` Artifacts
+// ============================================================================
+
+@derive(Copy)
+pub struct WorkspaceSourceEntry {
+    pub file_id: SourceFileId,
+    pub module_id: ModuleId,
+    pub logical_path: StrView,
+    pub normalized_len: u32,
+    pub last_size_bytes: u64,
+    pub last_mtime_ns: u64,
+    pub expected_mtime_ns: u64,
+    pub source_fp: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct CachedDiagEntry {
+    pub code: u32,
+    pub severity: u8,
+    pub module_id: ModuleId,
+    pub def_id: DefId,
+    pub line: u32,
+    pub col: u32,
+    pub primary_key: SemanticKey,
+    pub message: StrView,
+    pub diag_fp: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct CachedCguArtifact {
+    pub module_id: ModuleId,
+    pub semantic_key: SemanticKey,
+    pub cgu_fp: Fingerprint128,
+    pub obj_digest: Fingerprint128,
+    pub obj_bytes: *mut u8,
+    pub obj_len: u32,
+    pub symbol_count: u32,
+    pub reloc_count: u32,
+    pub has_error: bool,
+    pub is_published: bool,
+    pub reused_from_cache: bool,
+}
+
+pub struct IncrementalCache {
+    pub eng: IncrementalEngine,
+    pub cache_arena: Arena,
+    pub cache_dir: StrView,
+    pub strict_verify_mode: bool,
+    pub is_warm: bool,
+    pub last_noop_fastpath: bool,
+    pub last_noop_elapsed_ns: u64,
+
+    pub action_digest: ActionDigest,
+    pub last_payload_checksum: Fingerprint128,
+
+    pub sources: *mut WorkspaceSourceEntry,
+    pub source_count: u32,
+    pub cgus: *mut CachedCguArtifact,
+    pub cgu_count: u32,
+    pub diags: *mut CachedDiagEntry,
+    pub diag_count: u32,
+
+    pub linked_artifact_bytes: *mut u8,
+    pub linked_artifact_len: u32,
+    pub linked_artifact_fp: Fingerprint128,
+
+    // Eviction & cache persistence telemetry
+    pub last_eviction_reason: u8,
+    pub last_eviction_diag_code: u32,
+    pub eviction_count: u32,
+    pub noop_fastpath_hits: u32,
+    pub stat_fast_hits: u32,
+    pub content_digest_hits: u32,
+    pub obj_cache_hits: u32,
+    pub obj_cache_misses: u32,
+    pub atomic_temp_writes: u32,
+    pub atomic_renames: u32,
+}
+
+fn cache_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while (i + 8) <= count {
+        unsafe { *((ptr + i) as *mut u64) = 0u64; }
+        i = i + 8;
+    }
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+fn cache_copy_bytes(src: *const u8, dst: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(dst + i) = *(src + i); }
+        i = i + 1;
+    }
+}
+
+pub fn inc_cache_empty() -> IncrementalCache {
+    IncrementalCache {
+        eng: inc_engine_empty(),
+        cache_arena: arena_new(),
+        cache_dir: qry_sv_empty(),
+        strict_verify_mode: false,
+        is_warm: false,
+        last_noop_fastpath: false,
+        last_noop_elapsed_ns: 0u64,
+        action_digest: inc_cache_action_digest_empty(),
+        last_payload_checksum: fingerprint128_zero(),
+        sources: 0 as *mut WorkspaceSourceEntry,
+        source_count: 0u32,
+        cgus: 0 as *mut CachedCguArtifact,
+        cgu_count: 0u32,
+        diags: 0 as *mut CachedDiagEntry,
+        diag_count: 0u32,
+        linked_artifact_bytes: 0 as *mut u8,
+        linked_artifact_len: 0u32,
+        linked_artifact_fp: fingerprint128_zero(),
+        last_eviction_reason: CACHE_EVICT_NONE,
+        last_eviction_diag_code: 0u32,
+        eviction_count: 0u32,
+        noop_fastpath_hits: 0u32,
+        stat_fast_hits: 0u32,
+        content_digest_hits: 0u32,
+        obj_cache_hits: 0u32,
+        obj_cache_misses: 0u32,
+        atomic_temp_writes: 0u32,
+        atomic_renames: 0u32,
+    }
+}
+
+pub fn inc_cache_init(cache: mut_view<IncrementalCache>, session_id: u64) {
+    inc_engine_init(mut_view(cache.eng), session_id);
+    cache.cache_arena = arena_new();
+    cache.cache_dir = qry_sv_empty();
+    cache.strict_verify_mode = false;
+    cache.is_warm = false;
+    cache.last_noop_fastpath = false;
+    cache.last_noop_elapsed_ns = 0u64;
+
+    let src_bytes = CACHE_MAX_SOURCES * size_of<WorkspaceSourceEntry>();
+    cache.sources = arena_alloc_raw(mut_view(cache.cache_arena), src_bytes, align_of<WorkspaceSourceEntry>()) as *mut WorkspaceSourceEntry;
+    cache_zero_bytes(cache.sources as *mut u8, src_bytes);
+    cache.source_count = 0u32;
+
+    let cgu_bytes = CACHE_MAX_CGUS * size_of<CachedCguArtifact>();
+    cache.cgus = arena_alloc_raw(mut_view(cache.cache_arena), cgu_bytes, align_of<CachedCguArtifact>()) as *mut CachedCguArtifact;
+    cache_zero_bytes(cache.cgus as *mut u8, cgu_bytes);
+    cache.cgu_count = 0u32;
+
+    let diag_bytes = CACHE_MAX_DIAGS * size_of<CachedDiagEntry>();
+    cache.diags = arena_alloc_raw(mut_view(cache.cache_arena), diag_bytes, align_of<CachedDiagEntry>()) as *mut CachedDiagEntry;
+    cache_zero_bytes(cache.diags as *mut u8, diag_bytes);
+    cache.diag_count = 0u32;
+
+    cache.linked_artifact_bytes = 0 as *mut u8;
+    cache.linked_artifact_len = 0u32;
+    cache.linked_artifact_fp = fingerprint128_zero();
+
+    cache.last_eviction_reason = CACHE_EVICT_NONE;
+    cache.last_eviction_diag_code = 0u32;
+    cache.eviction_count = 0u32;
+    cache.noop_fastpath_hits = 0u32;
+    cache.stat_fast_hits = 0u32;
+    cache.content_digest_hits = 0u32;
+    cache.obj_cache_hits = 0u32;
+    cache.obj_cache_misses = 0u32;
+    cache.atomic_temp_writes = 0u32;
+    cache.atomic_renames = 0u32;
+
+    let default_comp = fingerprint128_new(0x4158494F4D43325Fu64, 0x323032365F563130u64);
+    let default_man = fingerprint128_new(0x4D414E4946455354u64, 0x0000000000000001u64);
+    cache.action_digest = inc_cache_compute_action_digest(
+        default_comp,
+        AXIC_SCHEMA_VERSION,
+        qry_sv_empty(),
+        qry_sv_empty(),
+        0u32,
+        2u8,
+        SAFETY_PROFILE_STANDARD,
+        PANIC_STRATEGY_UNWIND,
+        ARTIFACT_KIND_EXE,
+        default_man
+    );
+    cache.last_payload_checksum = fingerprint128_zero();
+}
+
+pub fn inc_cache_free(cache: mut_view<IncrementalCache>) {
+    inc_engine_free(mut_view(cache.eng));
+    arena_destroy(mut_view(cache.cache_arena));
+    cache.sources = 0 as *mut WorkspaceSourceEntry;
+    cache.cgus = 0 as *mut CachedCguArtifact;
+    cache.diags = 0 as *mut CachedDiagEntry;
+    cache.linked_artifact_bytes = 0 as *mut u8;
+}
+
+pub fn inc_cache_set_cache_dir(cache: mut_view<IncrementalCache>, dir_path: StrView) {
+    cache.cache_dir = query_db_intern_sv(mut_view(cache.eng.db), dir_path);
+}
+
+pub fn inc_cache_set_action_config(
+    cache: mut_view<IncrementalCache>,
+    compiler_binary_digest: Fingerprint128,
+    target_triple: StrView,
+    abi_profile: StrView,
+    cpu_feature_mask: u32,
+    opt_level: u8,
+    safety_profile: u8,
+    panic_strategy: u8,
+    artifact_kind: u8,
+    manifest_digest: Fingerprint128
+) {
+    let tt_sv = query_db_intern_sv(mut_view(cache.eng.db), target_triple);
+    let ab_sv = query_db_intern_sv(mut_view(cache.eng.db), abi_profile);
+    inc_set_target_config(
+        mut_view(cache.eng),
+        UnitKey { v: 1u32 },
+        tt_sv,
+        ab_sv,
+        cpu_feature_mask,
+        opt_level,
+        8u32
+    );
+    cache.action_digest = inc_cache_compute_action_digest(
+        compiler_binary_digest,
+        AXIC_SCHEMA_VERSION,
+        tt_sv,
+        ab_sv,
+        cpu_feature_mask,
+        opt_level,
+        safety_profile,
+        panic_strategy,
+        artifact_kind,
+        manifest_digest
+    );
+}
+
+fn cache_find_source_index(cache: view<IncrementalCache>, file_id: SourceFileId) -> usize {
+    let mut i: usize = 0;
+    while i < (cache.source_count as usize) {
+        let s = unsafe { *(cache.sources + i) };
+        if s.file_id.v == file_id.v {
+            return i;
+        }
+        i = i + 1;
+    }
+    CACHE_MAX_SOURCES
+}
+
+pub fn inc_cache_register_module(
+    cache: mut_view<IncrementalCache>,
+    module_id: ModuleId,
+    package_id: PackageId,
+    package_name: StrView,
+    module_path: StrView,
+    source_file_id: SourceFileId,
+    logical_path: StrView,
+    raw_text: StrView,
+    mtime_ns: u64
+) {
+    inc_register_module(
+        mut_view(cache.eng),
+        module_id,
+        package_id,
+        package_name,
+        module_path,
+        source_file_id,
+        logical_path,
+        raw_text
+    );
+    let path_sv = query_db_intern_sv(mut_view(cache.eng.db), logical_path);
+    let text_sv = query_db_intern_sv(mut_view(cache.eng.db), raw_text);
+    let src_fp = fp_compute_source(source_file_id, path_sv, text_sv);
+
+    let mut s_idx = cache_find_source_index(view(*cache), source_file_id);
+    if s_idx >= CACHE_MAX_SOURCES {
+        s_idx = cache.source_count as usize;
+        if s_idx < CACHE_MAX_SOURCES {
+            cache.source_count = cache.source_count + 1u32;
+        } else {
+            s_idx = CACHE_MAX_SOURCES - 1;
+        }
+    }
+    let sp = unsafe { cache.sources + s_idx };
+    unsafe {
+        (*sp).file_id = source_file_id;
+        (*sp).module_id = module_id;
+        (*sp).logical_path = path_sv;
+        (*sp).normalized_len = src_fp.normalized_len;
+        (*sp).last_size_bytes = text_sv.len as u64;
+        (*sp).last_mtime_ns = mtime_ns;
+        (*sp).expected_mtime_ns = mtime_ns;
+        (*sp).source_fp = src_fp.fp;
+    }
+}
+
+pub fn inc_cache_update_module_source(
+    cache: mut_view<IncrementalCache>,
+    module_id: ModuleId,
+    new_raw_text: StrView,
+    new_mtime_ns: u64
+) -> RevisionId {
+    let rev = inc_update_module_source(mut_view(cache.eng), module_id, new_raw_text);
+    let mod_rec = inc_get_module(view(cache.eng), module_id);
+    let s_idx = cache_find_source_index(view(*cache), mod_rec.source_file_id);
+    if s_idx < CACHE_MAX_SOURCES {
+        let sp = unsafe { cache.sources + s_idx };
+        unsafe {
+            (*sp).last_mtime_ns = new_mtime_ns;
+            (*sp).expected_mtime_ns = new_mtime_ns;
+        }
+    }
+    cache.last_noop_fastpath = false;
+    rev
+}
+
+// Simulates `touch` on a source file (changes `mtime_ns` without changing content bytes).
+pub fn inc_cache_touch_source_mtime(
+    cache: mut_view<IncrementalCache>,
+    source_file_id: SourceFileId,
+    new_mtime_ns: u64
+) {
+    let s_idx = cache_find_source_index(view(*cache), source_file_id);
+    if s_idx < CACHE_MAX_SOURCES {
+        unsafe { (*(cache.sources + s_idx)).last_mtime_ns = new_mtime_ns; }
+    }
+}
+
+pub fn inc_cache_clear_diags(cache: mut_view<IncrementalCache>) {
+    cache.diag_count = 0u32;
+}
+
+pub fn inc_cache_attach_diag(
+    cache: mut_view<IncrementalCache>,
+    code: u32,
+    severity: u8,
+    module_id: ModuleId,
+    def_id: DefId,
+    line: u32,
+    col: u32,
+    primary_key: SemanticKey,
+    message: StrView
+) {
+    if (cache.diag_count as usize) >= CACHE_MAX_DIAGS {
+        return;
+    }
+    let msg_sv = query_db_intern_sv(mut_view(cache.eng.db), message);
+    let mut s = fp_stream_new(FP_TIER_BODY);
+    fp_stream_write_u32(mut_view(s), code);
+    fp_stream_write_u8(mut_view(s), severity);
+    fp_stream_write_u32(mut_view(s), line);
+    fp_stream_write_u32(mut_view(s), col);
+    fp_stream_write_semantic_key(mut_view(s), view(primary_key));
+    fp_stream_write_sv(mut_view(s), msg_sv);
+    let dfp = fp_stream_finish(view(s));
+
+    let idx = cache.diag_count as usize;
+    cache.diag_count = cache.diag_count + 1u32;
+    let dp = unsafe { cache.diags + idx };
+    unsafe {
+        (*dp).code = code;
+        (*dp).severity = severity;
+        (*dp).module_id = module_id;
+        (*dp).def_id = def_id;
+        (*dp).line = line;
+        (*dp).col = col;
+        (*dp).primary_key = primary_key;
+        (*dp).message = msg_sv;
+        (*dp).diag_fp = dfp;
+    }
+}
+
+pub fn inc_cache_has_error_for_module(cache: view<IncrementalCache>, module_id: ModuleId) -> bool {
+    let mut i: usize = 0;
+    while i < (cache.diag_count as usize) {
+        let d = unsafe { *(cache.diags + i) };
+        if d.module_id.v == module_id.v && d.severity == CACHED_DIAG_ERROR {
+            return true;
+        }
+        i = i + 1;
+    }
+    let mut ii: usize = 0;
+    while ii < (cache.eng.item_count as usize) {
+        let it = unsafe { *(cache.eng.items + ii) };
+        if it.module_id.v == module_id.v && it.has_body_type_error {
+            return true;
+        }
+        ii = ii + 1;
+    }
+    false
+}
+
+pub fn inc_cache_has_any_errors(cache: view<IncrementalCache>) -> bool {
+    let mut i: usize = 0;
+    while i < (cache.diag_count as usize) {
+        let d = unsafe { *(cache.diags + i) };
+        if d.severity == CACHED_DIAG_ERROR {
+            return true;
+        }
+        i = i + 1;
+    }
+    let mut ii: usize = 0;
+    while ii < (cache.eng.item_count as usize) {
+        let it = unsafe { *(cache.eng.items + ii) };
+        if it.has_body_type_error {
+            return true;
+        }
+        ii = ii + 1;
+    }
+    false
+}
+
+// ============================================================================
+// 4. Deterministic COFF `.obj` Synthesizer & Artifact Linker (AXS-INC-024)
+// ============================================================================
+
+fn cache_write_le_u16(dst: *mut u8, off: usize, v: u16) {
+    unsafe {
+        *(dst + off) = (v & 0xFFu16) as u8;
+        *(dst + off + 1) = ((v >> 8u16) & 0xFFu16) as u8;
+    }
+}
+
+fn cache_write_le_u32(dst: *mut u8, off: usize, v: u32) {
+    unsafe {
+        *(dst + off) = (v & 0xFFu32) as u8;
+        *(dst + off + 1) = ((v >> 8u32) & 0xFFu32) as u8;
+        *(dst + off + 2) = ((v >> 16u32) & 0xFFu32) as u8;
+        *(dst + off + 3) = ((v >> 24u32) & 0xFFu32) as u8;
+    }
+}
+
+fn cache_write_le_u64(dst: *mut u8, off: usize, v: u64) {
+    cache_write_le_u32(dst, off, (v & 0xFFFFFFFFu64) as u32);
+    cache_write_le_u32(dst, off + 4, ((v >> 32u64) & 0xFFFFFFFFu64) as u32);
+}
+
+fn cache_find_cgu_index(cache: view<IncrementalCache>, module_id: ModuleId) -> usize {
+    let mut i: usize = 0;
+    while i < (cache.cgu_count as usize) {
+        let c = unsafe { *(cache.cgus + i) };
+        if c.module_id.v == module_id.v {
+            return i;
+        }
+        i = i + 1;
+    }
+    CACHE_MAX_CGUS
+}
+
+pub fn inc_cache_get_cgu(cache: view<IncrementalCache>, module_id: ModuleId) -> CachedCguArtifact {
+    let idx = cache_find_cgu_index(view(*cache), module_id);
+    if idx < CACHE_MAX_CGUS {
+        return unsafe { *(cache.cgus + idx) };
+    }
+    unsafe { *cache.cgus }
+}
+
+// Synthesizes a deterministic COFF x86_64 `.obj` binary image for `module_id` from its
+// `CodegenFingerprint`, sorted item `AbiFingerprint`s & `BodyFingerprint`s, and `ActionDigest`
+// (`TimeDateStamp = 0` per `INV-DET-001`).
+// Per `AXS-INC-024 §2`, modules with error diagnostics NEVER publish a `Ready` `.obj` artifact!
+pub fn inc_cache_synthesize_cgu_obj(cache: mut_view<IncrementalCache>, module_id: ModuleId, reused: bool) {
+    let mod_rec = inc_get_module(view(cache.eng), module_id);
+    let has_err = inc_cache_has_error_for_module(view(*cache), module_id);
+
+    let mut c_idx = cache_find_cgu_index(view(*cache), module_id);
+    if c_idx >= CACHE_MAX_CGUS {
+        c_idx = cache.cgu_count as usize;
+        if c_idx < CACHE_MAX_CGUS {
+            cache.cgu_count = cache.cgu_count + 1u32;
+        } else {
+            c_idx = CACHE_MAX_CGUS - 1;
+        }
+    }
+
+    if has_err {
+        // AXS-INC-024 §2: Error non-pollution — do not publish `.obj` into persistent cache!
+        let cp = unsafe { cache.cgus + c_idx };
+        unsafe {
+            (*cp).module_id = module_id;
+            (*cp).semantic_key = mod_rec.semantic_key;
+            (*cp).cgu_fp = mod_rec.codegen_fp;
+            (*cp).obj_digest = fingerprint128_zero();
+            (*cp).obj_bytes = 0 as *mut u8;
+            (*cp).obj_len = 0u32;
+            (*cp).symbol_count = 0u32;
+            (*cp).reloc_count = 0u32;
+            (*cp).has_error = true;
+            (*cp).is_published = false;
+            (*cp).reused_from_cache = false;
+        }
+        return;
+    }
+
+    // If reusing an already-valid published `.obj` with identical `cgu_fp`, keep its exact bytes
+    let existing = unsafe { *(cache.cgus + c_idx) };
+    if reused &&
+        existing.is_published &&
+        existing.obj_len > 0u32 &&
+        (existing.obj_bytes as usize) != 0 &&
+        fingerprint128_eq(existing.cgu_fp, mod_rec.codegen_fp) {
+        unsafe { (*(cache.cgus + c_idx)).reused_from_cache = true; }
+        cache.obj_cache_hits = cache.obj_cache_hits + 1u32;
+        return;
+    }
+
+    cache.obj_cache_misses = cache.obj_cache_misses + 1u32;
+
+    // Collect items in `module_id` sorted by `SemanticKey`
+    let mut item_idxs: [64]usize = [0; 64];
+    let mut item_cnt: usize = 0;
+    let mut i: usize = 0;
+    while i < (cache.eng.item_count as usize) {
+        let it = unsafe { *(cache.eng.items + i) };
+        if it.module_id.v == module_id.v && item_cnt < 64 {
+            item_idxs[item_cnt] = i;
+            item_cnt = item_cnt + 1;
+        }
+        i = i + 1;
+    }
+    let mut a: usize = 1;
+    while a < item_cnt {
+        let cur = item_idxs[a];
+        let cur_it = unsafe { *(cache.eng.items + cur) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = item_idxs[b - 1];
+            let prev_it = unsafe { *(cache.eng.items + prev) };
+            if semantic_key_cmp(view(prev_it.semantic_key), view(cur_it.semantic_key)) <= 0i32 {
+                break;
+            }
+            item_idxs[b] = prev;
+            b = b - 1;
+        }
+        item_idxs[b] = cur;
+        a = a + 1;
+    }
+
+    // Deterministic COFF image layout:
+    //   20-byte COFF header (`Machine = 0x8664`, `NumberOfSections = 2`, `TimeDateStamp = 0`)
+    // + 44-byte module CGU digest record (`cgu_fp`, `interface_fp`, `env_digest`, `item_cnt`)
+    // + 32 bytes per sorted item (`abi_fp`, `body_fp`)
+    let obj_size: usize = 64 + (item_cnt * 32);
+    let buf = arena_alloc_raw(mut_view(cache.cache_arena), obj_size, 8);
+    cache_zero_bytes(buf, obj_size);
+
+    cache_write_le_u16(buf, 0, 0x8664u16);             // IMAGE_FILE_MACHINE_AMD64
+    cache_write_le_u16(buf, 2, 2u16);                  // NumberOfSections (.text, .rdata)
+    cache_write_le_u32(buf, 4, 0u32);                  // TimeDateStamp = 0 (INV-DET-001)
+    cache_write_le_u32(buf, 8, 64u32);                 // PointerToSymbolTable
+    cache_write_le_u32(buf, 12, item_cnt as u32);      // NumberOfSymbols
+    cache_write_le_u16(buf, 16, 0u16);                 // SizeOfOptionalHeader
+    cache_write_le_u16(buf, 18, 0x0004u16);            // Characteristics
+
+    cache_write_le_u64(buf, 20, mod_rec.codegen_fp.lo);
+    cache_write_le_u64(buf, 28, mod_rec.codegen_fp.hi);
+    cache_write_le_u64(buf, 36, mod_rec.interface_fp.lo);
+    cache_write_le_u64(buf, 44, mod_rec.interface_fp.hi);
+    cache_write_le_u64(buf, 52, cache.action_digest.env_digest.lo ^ (item_cnt as u64));
+    cache_write_le_u32(buf, 60, cache.action_digest.opt_level as u32);
+
+    let mut relocs: u32 = 0u32;
+    let mut k: usize = 0;
+    while k < item_cnt {
+        let it = unsafe { *(cache.eng.items + item_idxs[k]) };
+        let base_off: usize = 64 + (k * 32);
+        cache_write_le_u64(buf, base_off, it.abi_fp.lo);
+        cache_write_le_u64(buf, base_off + 8, it.abi_fp.hi);
+        cache_write_le_u64(buf, base_off + 16, it.body_fp.lo);
+        cache_write_le_u64(buf, base_off + 24, it.body_fp.hi);
+        relocs = relocs + it.call_dep_count;
+        k = k + 1;
+    }
+
+    let mut ds = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_bytes(mut_view(ds), buf as *const u8, obj_size);
+    let obj_fp = fp_stream_finish(view(ds));
+
+    let cp = unsafe { cache.cgus + c_idx };
+    unsafe {
+        (*cp).module_id = module_id;
+        (*cp).semantic_key = mod_rec.semantic_key;
+        (*cp).cgu_fp = mod_rec.codegen_fp;
+        (*cp).obj_digest = obj_fp;
+        (*cp).obj_bytes = buf;
+        (*cp).obj_len = obj_size as u32;
+        (*cp).symbol_count = item_cnt as u32;
+        (*cp).reloc_count = relocs;
+        (*cp).has_error = false;
+        (*cp).is_published = true;
+        (*cp).reused_from_cache = false;
+    }
+}
+
+// Links all published module COFF `.obj` blobs in canonical `SemanticKey` order into a deterministic
+// PE32+/archive output artifact image (`linked_artifact_bytes`, `linked_artifact_fp`).
+pub fn inc_cache_link_workspace_artifact(cache: mut_view<IncrementalCache>) -> bool {
+    if inc_cache_has_any_errors(view(*cache)) {
+        cache.linked_artifact_bytes = 0 as *mut u8;
+        cache.linked_artifact_len = 0u32;
+        cache.linked_artifact_fp = fingerprint128_zero();
+        return false;
+    }
+
+    let mut sorted_cgu: [32]usize = [0; 32];
+    let mut pub_count: usize = 0;
+    let mut total_obj_bytes: usize = 0;
+    let mut i: usize = 0;
+    while i < (cache.cgu_count as usize) {
+        let c = unsafe { *(cache.cgus + i) };
+        if c.is_published && c.obj_len > 0u32 && (c.obj_bytes as usize) != 0 && pub_count < 32 {
+            sorted_cgu[pub_count] = i;
+            pub_count = pub_count + 1;
+            total_obj_bytes = total_obj_bytes + (c.obj_len as usize);
+        }
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < pub_count {
+        let cur = sorted_cgu[a];
+        let cur_c = unsafe { *(cache.cgus + cur) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = sorted_cgu[b - 1];
+            let prev_c = unsafe { *(cache.cgus + prev) };
+            if semantic_key_cmp(view(prev_c.semantic_key), view(cur_c.semantic_key)) <= 0i32 {
+                break;
+            }
+            sorted_cgu[b] = prev;
+            b = b - 1;
+        }
+        sorted_cgu[b] = cur;
+        a = a + 1;
+    }
+
+    // 32-byte deterministic PE32+ / archive header + concatenated sorted `.obj` sections
+    let out_len: usize = 32 + total_obj_bytes;
+    let out_buf = arena_alloc_raw(mut_view(cache.cache_arena), out_len, 8);
+    cache_zero_bytes(out_buf, out_len);
+
+    // "MZ" / PE32+ deterministic header (`TimeDateStamp = 0`, `INV-DET-002`)
+    cache_write_le_u16(out_buf, 0, 0x5A4Du16); // "MZ"
+    cache_write_le_u16(out_buf, 2, pub_count as u16);
+    cache_write_le_u32(out_buf, 4, out_len as u32);
+    cache_write_le_u64(out_buf, 8, cache.action_digest.env_digest.lo);
+    cache_write_le_u64(out_buf, 16, cache.action_digest.env_digest.hi);
+    cache_write_le_u64(out_buf, 24, 0u64);
+
+    let mut cursor: usize = 32;
+    let mut k: usize = 0;
+    while k < pub_count {
+        let c = unsafe { *(cache.cgus + sorted_cgu[k]) };
+        cache_copy_bytes(c.obj_bytes as *const u8, unsafe { out_buf + cursor }, c.obj_len as usize);
+        cursor = cursor + (c.obj_len as usize);
+        k = k + 1;
+    }
+
+    let mut ls = fp_stream_new(FP_TIER_CODEGEN);
+    fp_stream_write_bytes(mut_view(ls), out_buf as *const u8, out_len);
+    let linked_fp = fp_stream_finish(view(ls));
+
+    cache.linked_artifact_bytes = out_buf;
+    cache.linked_artifact_len = out_len as u32;
+    cache.linked_artifact_fp = linked_fp;
+    true
+}
+
+// ============================================================================
+// 5. Versioned, Checksummed `.axcache` Binary Serialization & Deserialization
+// ============================================================================
+
+fn ser_push_u8(out: mut_view<DiagBuffer>, v: u8) {
+    diag_buf_push_byte(mut_view(*out), v);
+}
+
+fn ser_push_bool(out: mut_view<DiagBuffer>, v: bool) {
+    diag_buf_push_byte(mut_view(*out), if v { 1u8 } else { 0u8 });
+}
+
+fn ser_push_u32(out: mut_view<DiagBuffer>, v: u32) {
+    diag_buf_push_byte(mut_view(*out), (v & 0xFFu32) as u8);
+    diag_buf_push_byte(mut_view(*out), ((v >> 8u32) & 0xFFu32) as u8);
+    diag_buf_push_byte(mut_view(*out), ((v >> 16u32) & 0xFFu32) as u8);
+    diag_buf_push_byte(mut_view(*out), ((v >> 24u32) & 0xFFu32) as u8);
+}
+
+fn ser_push_u64(out: mut_view<DiagBuffer>, v: u64) {
+    ser_push_u32(mut_view(*out), (v & 0xFFFFFFFFu64) as u32);
+    ser_push_u32(mut_view(*out), ((v >> 32u64) & 0xFFFFFFFFu64) as u32);
+}
+
+fn ser_push_fp128(out: mut_view<DiagBuffer>, fp: Fingerprint128) {
+    ser_push_u64(mut_view(*out), fp.lo);
+    ser_push_u64(mut_view(*out), fp.hi);
+}
+
+fn ser_push_sv(out: mut_view<DiagBuffer>, sv: StrView) {
+    ser_push_u32(mut_view(*out), sv.len as u32);
+    if sv.len > 0 && (sv.ptr as usize) != 0 {
+        diag_buf_push_bytes(mut_view(*out), sv.ptr, sv.len);
+    }
+}
+
+fn ser_push_semantic_key(out: mut_view<DiagBuffer>, sk: view<SemanticKey>) {
+    ser_push_sv(mut_view(*out), sk.package_name);
+    ser_push_sv(mut_view(*out), sk.module_path);
+    ser_push_u8(mut_view(*out), sk.item_namespace);
+    ser_push_u32(mut_view(*out), sk.disambiguator_index);
+    ser_push_sv(mut_view(*out), sk.canonical_name);
+    ser_push_sv(mut_view(*out), sk.canonical_type_args);
+}
+
+// Computes the 128-bit payload checksum over `ptr[0..len]` (`AXS-INC-022 §1`).
+pub fn inc_cache_compute_payload_checksum(ptr: *const u8, len: usize) -> Fingerprint128 {
+    let mut s = fp_stream_new(FP_TIER_ACTION);
+    fp_stream_write_u64(mut_view(s), AXIC_MAGIC);
+    fp_stream_write_bytes(mut_view(s), ptr, len);
+    fp_stream_finish(view(s))
+}
+
+// Serializes the entire `IncrementalCache` (`dep-graph.axcache` schema) into `out`:
+// - Fixed 32-byte header: 8-byte `"AXCACHE1"` (`AXIC_MAGIC`), `u32 schema_version`, `u32 flags`, `Fingerprint128 env_digest`
+// - ActionDigest metadata, Workspace Input Manifest, Module/Item Multi-Tier Fingerprints,
+//   Red-Green Query Dependency Graph, Cached Diagnostics, CGU `.obj` blobs, Linked Artifact
+// - Trailing 16-byte 128-bit payload checksum (`AXS-INC-022`).
+pub fn inc_cache_serialize(cache: mut_view<IncrementalCache>, out: mut_view<DiagBuffer>) {
+    out.len = 0;
+
+    // 1. Fixed 32-byte header (`AXS-INC-022 §1`)
+    ser_push_u64(mut_view(*out), AXIC_MAGIC);                       // 0..8:   "AXCACHE1"
+    ser_push_u32(mut_view(*out), cache.action_digest.schema_version); // 8..12:  schema_version
+    let hdr_flags: u32 = ((cache.action_digest.opt_level as u32) & 0xFFu32) |
+        (((cache.action_digest.safety_profile as u32) & 0xFFu32) << 8u32) |
+        (((cache.action_digest.panic_strategy as u32) & 0xFFu32) << 16u32) |
+        (((cache.action_digest.artifact_kind as u32) & 0xFFu32) << 24u32);
+    ser_push_u32(mut_view(*out), hdr_flags);                        // 12..16: flags
+    ser_push_fp128(mut_view(*out), cache.action_digest.env_digest); // 16..32: env_digest
+
+    // 2. Extended Hermetic ActionDigest & Workspace Header
+    ser_push_fp128(mut_view(*out), cache.action_digest.compiler_binary_digest);
+    ser_push_fp128(mut_view(*out), cache.action_digest.manifest_digest);
+    ser_push_fp128(mut_view(*out), cache.linked_artifact_fp);
+    ser_push_u32(mut_view(*out), cache.action_digest.cpu_feature_mask);
+    ser_push_sv(mut_view(*out), cache.action_digest.target_triple);
+    ser_push_sv(mut_view(*out), cache.action_digest.abi_profile);
+    ser_push_u64(mut_view(*out), cache.eng.current_revision.raw);
+
+    ser_push_u32(mut_view(*out), cache.source_count);
+    ser_push_u32(mut_view(*out), cache.eng.module_count);
+    ser_push_u32(mut_view(*out), cache.eng.item_count);
+    ser_push_u32(mut_view(*out), cache.eng.node_count);
+    ser_push_u32(mut_view(*out), cache.diag_count);
+    ser_push_u32(mut_view(*out), cache.cgu_count);
+    ser_push_u32(mut_view(*out), cache.linked_artifact_len);
+    ser_push_u32(mut_view(*out), cache.eng.total_queries_green_reused);
+    ser_push_u32(mut_view(*out), cache.eng.total_queries_recomputed);
+    ser_push_u32(mut_view(*out), cache.eng.total_queries_backdated);
+    ser_push_fp128(mut_view(*out), cache.eng.target_config_fp);
+
+    // 3. Section 1: Workspace Input Manifest (`AXS-INC-023`)
+    let mut si: usize = 0;
+    while si < (cache.source_count as usize) {
+        let se = unsafe { *(cache.sources + si) };
+        ser_push_u32(mut_view(*out), se.file_id.v);
+        ser_push_u32(mut_view(*out), se.module_id.v);
+        ser_push_sv(mut_view(*out), se.logical_path);
+        ser_push_u32(mut_view(*out), se.normalized_len);
+        ser_push_u64(mut_view(*out), se.last_size_bytes);
+        ser_push_u64(mut_view(*out), se.last_mtime_ns);
+        ser_push_fp128(mut_view(*out), se.source_fp);
+        si = si + 1;
+    }
+
+    // 4. Section 2: Module Multi-Tier Fingerprints
+    let mut mi: usize = 0;
+    while mi < (cache.eng.module_count as usize) {
+        let m = unsafe { *(cache.eng.modules + mi) };
+        ser_push_u32(mut_view(*out), m.module_id.v);
+        ser_push_u32(mut_view(*out), m.package_id.v);
+        ser_push_u32(mut_view(*out), m.source_file_id.v);
+        ser_push_semantic_key(mut_view(*out), view(m.semantic_key));
+        ser_push_sv(mut_view(*out), m.logical_path);
+        ser_push_sv(mut_view(*out), m.raw_text);
+        ser_push_u32(mut_view(*out), m.imported_module_count);
+        let mut im: u32 = 0u32;
+        while im < m.imported_module_count {
+            ser_push_u32(mut_view(*out), m.imported_modules[im as usize]);
+            im = im + 1u32;
+        }
+        ser_push_fp128(mut_view(*out), m.source_fp);
+        ser_push_fp128(mut_view(*out), m.ast_fp);
+        ser_push_fp128(mut_view(*out), m.interface_fp);
+        ser_push_fp128(mut_view(*out), m.codegen_fp);
+        ser_push_u64(mut_view(*out), m.typechecked_at_rev.raw);
+        ser_push_u64(mut_view(*out), m.cgu_rebuilt_at_rev.raw);
+        ser_push_u64(mut_view(*out), m.cgu_reused_at_rev.raw);
+        mi = mi + 1;
+    }
+
+    // 5. Section 3: Item Multi-Tier Fingerprints (`Ast`, `Interface`, `Abi`, `Body`, `Codegen`)
+    let mut ii: usize = 0;
+    while ii < (cache.eng.item_count as usize) {
+        let it = unsafe { *(cache.eng.items + ii) };
+        ser_push_u32(mut_view(*out), it.def_id.v);
+        ser_push_u32(mut_view(*out), it.module_id.v);
+        ser_push_semantic_key(mut_view(*out), view(it.semantic_key));
+        ser_push_u8(mut_view(*out), it.item_kind);
+        ser_push_bool(mut_view(*out), it.is_pub);
+        ser_push_bool(mut_view(*out), it.is_inline);
+        ser_push_bool(mut_view(*out), it.is_generic);
+        ser_push_bool(mut_view(*out), it.is_comptime);
+        ser_push_bool(mut_view(*out), it.has_inferred_return);
+        ser_push_bool(mut_view(*out), it.has_body_type_error);
+        ser_push_u8(mut_view(*out), it.repr_tag);
+        ser_push_u8(mut_view(*out), it.calling_conv);
+        ser_push_u32(mut_view(*out), it.explicit_align);
+        ser_push_u32(mut_view(*out), it.size_bytes);
+        ser_push_u32(mut_view(*out), it.align_bytes);
+        ser_push_u32(mut_view(*out), it.param_count);
+        ser_push_u32(mut_view(*out), it.return_type_tag);
+        ser_push_u32(mut_view(*out), it.generic_param_count);
+        ser_push_u64(mut_view(*out), it.const_val as u64);
+        ser_push_fp128(mut_view(*out), it.ast_header_fp);
+        ser_push_fp128(mut_view(*out), it.ast_body_fp);
+        ser_push_fp128(mut_view(*out), it.ast_item_fp);
+        ser_push_fp128(mut_view(*out), it.interface_fp);
+        ser_push_fp128(mut_view(*out), it.abi_fp);
+        ser_push_fp128(mut_view(*out), it.body_fp);
+        ser_push_fp128(mut_view(*out), it.codegen_fp);
+
+        ser_push_u32(mut_view(*out), it.sig_dep_count);
+        let mut d0: u32 = 0u32;
+        while d0 < it.sig_dep_count {
+            ser_push_u32(mut_view(*out), it.sig_deps[d0 as usize]);
+            d0 = d0 + 1u32;
+        }
+        ser_push_u32(mut_view(*out), it.call_dep_count);
+        let mut d1: u32 = 0u32;
+        while d1 < it.call_dep_count {
+            ser_push_u32(mut_view(*out), it.call_deps[d1 as usize]);
+            d1 = d1 + 1u32;
+        }
+        ser_push_u32(mut_view(*out), it.const_dep_count);
+        let mut d2: u32 = 0u32;
+        while d2 < it.const_dep_count {
+            ser_push_u32(mut_view(*out), it.const_deps[d2 as usize]);
+            d2 = d2 + 1u32;
+        }
+        ser_push_u32(mut_view(*out), it.layout_dep_count);
+        let mut d3: u32 = 0u32;
+        while d3 < it.layout_dep_count {
+            ser_push_u32(mut_view(*out), it.layout_deps[d3 as usize]);
+            d3 = d3 + 1u32;
+        }
+        ii = ii + 1;
+    }
+
+    // 6. Section 4: Red-Green Query Dependency Graph Nodes & Typed Edges
+    let mut ni: usize = 0;
+    while ni < (cache.eng.node_count as usize) {
+        let n = unsafe { *(cache.eng.nodes + ni) };
+        ser_push_u32(mut_view(*out), n.node_idx);
+        ser_push_u8(mut_view(*out), n.node_kind);
+        ser_push_u32(mut_view(*out), n.owner_id);
+        ser_push_semantic_key(mut_view(*out), view(n.semantic_key));
+        ser_push_u8(mut_view(*out), n.color);
+        ser_push_u64(mut_view(*out), n.verified_at.raw);
+        ser_push_u64(mut_view(*out), n.changed_at.raw);
+        ser_push_bool(mut_view(*out), n.was_backdated);
+        ser_push_bool(mut_view(*out), n.is_error);
+        ser_push_u8(mut_view(*out), n.last_miss_reason);
+        ser_push_u32(mut_view(*out), n.recompute_count);
+        ser_push_u32(mut_view(*out), n.green_reuse_count);
+        ser_push_u32(mut_view(*out), n.backdate_count);
+        ser_push_fp128(mut_view(*out), n.fp);
+        ser_push_fp128(mut_view(*out), n.aux_fp);
+        ser_push_u32(mut_view(*out), n.edge_count);
+        let mut ei: u32 = 0u32;
+        while ei < n.edge_count {
+            let e = n.edges[ei as usize];
+            ser_push_u32(mut_view(*out), e.dep_node_idx);
+            ser_push_u8(mut_view(*out), e.dep_kind);
+            ser_push_fp128(mut_view(*out), e.observed_fp);
+            ei = ei + 1u32;
+        }
+        ni = ni + 1;
+    }
+
+    // 7. Section 5: Cached Diagnostics
+    let mut di: usize = 0;
+    while di < (cache.diag_count as usize) {
+        let d = unsafe { *(cache.diags + di) };
+        ser_push_u32(mut_view(*out), d.code);
+        ser_push_u8(mut_view(*out), d.severity);
+        ser_push_u32(mut_view(*out), d.module_id.v);
+        ser_push_u32(mut_view(*out), d.def_id.v);
+        ser_push_u32(mut_view(*out), d.line);
+        ser_push_u32(mut_view(*out), d.col);
+        ser_push_semantic_key(mut_view(*out), view(d.primary_key));
+        ser_push_sv(mut_view(*out), d.message);
+        ser_push_fp128(mut_view(*out), d.diag_fp);
+        di = di + 1;
+    }
+
+    // 8. Section 6: Per-CGU `.obj` Artifacts
+    let mut ci: usize = 0;
+    while ci < (cache.cgu_count as usize) {
+        let c = unsafe { *(cache.cgus + ci) };
+        ser_push_u32(mut_view(*out), c.module_id.v);
+        ser_push_semantic_key(mut_view(*out), view(c.semantic_key));
+        ser_push_fp128(mut_view(*out), c.cgu_fp);
+        ser_push_fp128(mut_view(*out), c.obj_digest);
+        ser_push_u32(mut_view(*out), c.symbol_count);
+        ser_push_u32(mut_view(*out), c.reloc_count);
+        ser_push_bool(mut_view(*out), c.has_error);
+        ser_push_bool(mut_view(*out), c.is_published);
+        ser_push_u32(mut_view(*out), c.obj_len);
+        if c.obj_len > 0u32 && (c.obj_bytes as usize) != 0 {
+            diag_buf_push_bytes(mut_view(*out), c.obj_bytes as *const u8, c.obj_len as usize);
+        }
+        ci = ci + 1;
+    }
+
+    // 9. Section 7: Linked Output Artifact
+    if cache.linked_artifact_len > 0u32 && (cache.linked_artifact_bytes as usize) != 0 {
+        diag_buf_push_bytes(mut_view(*out), cache.linked_artifact_bytes as *const u8, cache.linked_artifact_len as usize);
+    }
+
+    // 10. Trailing 128-bit BLAKE3/SipHash payload checksum covering all preceding bytes (`AXS-INC-022 §1`)
+    let csum = inc_cache_compute_payload_checksum(out.ptr as *const u8, out.len);
+    cache.last_payload_checksum = csum;
+    ser_push_fp128(mut_view(*out), csum);
+}
+
+struct DeserCursor {
+    ptr: *const u8,
+    len: usize,
+    pos: usize,
+    ok: bool,
+}
+
+fn deser_u8(c: mut_view<DeserCursor>) -> u8 {
+    if !c.ok || (c.pos + 1) > c.len {
+        c.ok = false;
+        return 0u8;
+    }
+    let b = unsafe { *(c.ptr + c.pos) };
+    c.pos = c.pos + 1;
+    b
+}
+
+fn deser_bool(c: mut_view<DeserCursor>) -> bool {
+    deser_u8(mut_view(*c)) != 0u8
+}
+
+fn deser_u32(c: mut_view<DeserCursor>) -> u32 {
+    if !c.ok || (c.pos + 4) > c.len {
+        c.ok = false;
+        return 0u32;
+    }
+    let b0 = unsafe { *(c.ptr + c.pos) } as u32;
+    let b1 = unsafe { *(c.ptr + c.pos + 1) } as u32;
+    let b2 = unsafe { *(c.ptr + c.pos + 2) } as u32;
+    let b3 = unsafe { *(c.ptr + c.pos + 3) } as u32;
+    c.pos = c.pos + 4;
+    b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+}
+
+fn deser_u64(c: mut_view<DeserCursor>) -> u64 {
+    let lo = deser_u32(mut_view(*c)) as u64;
+    let hi = deser_u32(mut_view(*c)) as u64;
+    lo | (hi << 32u64)
+}
+
+fn deser_fp128(c: mut_view<DeserCursor>) -> Fingerprint128 {
+    let lo = deser_u64(mut_view(*c));
+    let hi = deser_u64(mut_view(*c));
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+fn deser_sv(c: mut_view<DeserCursor>, cache: mut_view<IncrementalCache>) -> StrView {
+    let slen = deser_u32(mut_view(*c)) as usize;
+    if !c.ok || (c.pos + slen) > c.len {
+        c.ok = false;
+        return qry_sv_empty();
+    }
+    if slen == 0 {
+        return qry_sv_empty();
+    }
+    let sv = query_db_intern_bytes(mut_view(cache.eng.db), unsafe { c.ptr + c.pos }, slen);
+    c.pos = c.pos + slen;
+    sv
+}
+
+fn deser_semantic_key(c: mut_view<DeserCursor>, cache: mut_view<IncrementalCache>) -> SemanticKey {
+    let pkg = deser_sv(mut_view(*c), mut_view(*cache));
+    let mpath = deser_sv(mut_view(*c), mut_view(*cache));
+    let ns = deser_u8(mut_view(*c));
+    let dis = deser_u32(mut_view(*c));
+    let cname = deser_sv(mut_view(*c), mut_view(*cache));
+    let targs = deser_sv(mut_view(*c), mut_view(*cache));
+    semantic_key_new(pkg, mpath, ns, dis, cname, targs)
+}
+
+fn cache_record_eviction(cache: mut_view<IncrementalCache>, reason: u8, diag_code: u32) -> u8 {
+    cache.is_warm = false;
+    cache.last_noop_fastpath = false;
+    cache.last_eviction_reason = reason;
+    cache.last_eviction_diag_code = diag_code;
+    cache.eviction_count = cache.eviction_count + 1u32;
+    reason
+}
+
+// Deserializes and validates an `.axcache` payload against `cache.action_digest` (`AXS-INC-021..022`).
+// Returns `CACHE_EVICT_NONE` (0) on full validation and populates `cache`, or returns the specific
+// `CACHE_EVICT_*` code and marks `cache` evicted for transparent clean rebuild fallback.
+pub fn inc_cache_deserialize(
+    cache: mut_view<IncrementalCache>,
+    ptr: *const u8,
+    len: usize
+) -> u8 {
+    if (ptr as usize) == 0 || len < (AXIC_HEADER_BYTES + AXIC_TRAILER_CHECKSUM_BYTES) {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+    }
+
+    let mut cur = DeserCursor {
+        ptr: ptr,
+        len: len - AXIC_TRAILER_CHECKSUM_BYTES,
+        pos: 0,
+        ok: true,
+    };
+
+    // 1. Validate magic & schema version BEFORE trusting section lengths (`AXS-INC-022 §1`)
+    let magic = deser_u64(mut_view(cur));
+    let schema_ver = deser_u32(mut_view(cur));
+    let hdr_flags = deser_u32(mut_view(cur));
+    let hdr_env_digest = deser_fp128(mut_view(cur));
+
+    if magic != AXIC_MAGIC || schema_ver != AXIC_SCHEMA_VERSION {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_SCHEMA_MISMATCH, AX_INC_CACHE_CORRUPT);
+    }
+
+    // 2. Validate trailing 128-bit payload checksum (`AXS-INC-022 §1`)
+    let payload_len = len - AXIC_TRAILER_CHECKSUM_BYTES;
+    let mut tr_cur = DeserCursor {
+        ptr: unsafe { ptr + payload_len },
+        len: AXIC_TRAILER_CHECKSUM_BYTES,
+        pos: 0,
+        ok: true,
+    };
+    let expected_csum = deser_fp128(mut_view(tr_cur));
+    let actual_csum = inc_cache_compute_payload_checksum(ptr, payload_len);
+    if !fingerprint128_eq(expected_csum, actual_csum) {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_CORRUPT_CHECKSUM, AX_INC_CACHE_CORRUPT);
+    }
+
+    // 3. Read extended ActionDigest & section counts
+    let comp_digest = deser_fp128(mut_view(cur));
+    let man_digest = deser_fp128(mut_view(cur));
+    let linked_fp = deser_fp128(mut_view(cur));
+    let cpu_mask = deser_u32(mut_view(cur));
+    let tt_sv = deser_sv(mut_view(cur), mut_view(*cache));
+    let ab_sv = deser_sv(mut_view(cur), mut_view(*cache));
+    let rev_raw = deser_u64(mut_view(cur));
+
+    let src_cnt = deser_u32(mut_view(cur));
+    let mod_cnt = deser_u32(mut_view(cur));
+    let item_cnt = deser_u32(mut_view(cur));
+    let node_cnt = deser_u32(mut_view(cur));
+    let diag_cnt = deser_u32(mut_view(cur));
+    let cgu_cnt = deser_u32(mut_view(cur));
+    let linked_len = deser_u32(mut_view(cur));
+    let tot_green = deser_u32(mut_view(cur));
+    let tot_recomp = deser_u32(mut_view(cur));
+    let tot_back = deser_u32(mut_view(cur));
+    let t_cfg_fp = deser_fp128(mut_view(cur));
+
+    if !cur.ok ||
+        (src_cnt as usize) > CACHE_MAX_SOURCES ||
+        (mod_cnt as usize) > INC_MAX_MODULES ||
+        (item_cnt as usize) > INC_MAX_ITEMS ||
+        (node_cnt as usize) > INC_MAX_NODES ||
+        (diag_cnt as usize) > CACHE_MAX_DIAGS ||
+        (cgu_cnt as usize) > CACHE_MAX_CGUS {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+    }
+
+    let cached_act = ActionDigest {
+        compiler_binary_digest: comp_digest,
+        schema_version: schema_ver,
+        target_triple: tt_sv,
+        abi_profile: ab_sv,
+        cpu_feature_mask: cpu_mask,
+        opt_level: (hdr_flags & 0xFFu32) as u8,
+        safety_profile: ((hdr_flags >> 8u32) & 0xFFu32) as u8,
+        panic_strategy: ((hdr_flags >> 16u32) & 0xFFu32) as u8,
+        artifact_kind: ((hdr_flags >> 24u32) & 0xFFu32) as u8,
+        manifest_digest: man_digest,
+        env_digest: hdr_env_digest,
+    };
+
+    // 4. Validate Hermetic ActionDigest (`AXS-INC-021`)
+    let act_status = inc_cache_validate_action_digest(view(cached_act), view(cache.action_digest));
+    if act_status != CACHE_EVICT_NONE {
+        return cache_record_eviction(mut_view(*cache), act_status, AX_INC_CACHE_CORRUPT);
+    }
+
+    // 5. Deserialize Workspace Input Manifest
+    let mut si: usize = 0;
+    while si < (src_cnt as usize) {
+        let fid = deser_u32(mut_view(cur));
+        let mid = deser_u32(mut_view(cur));
+        let lpath = deser_sv(mut_view(cur), mut_view(*cache));
+        let nlen = deser_u32(mut_view(cur));
+        let lsize = deser_u64(mut_view(cur));
+        let lmtime = deser_u64(mut_view(cur));
+        let sfp = deser_fp128(mut_view(cur));
+        if !cur.ok {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        let sp = unsafe { cache.sources + si };
+        unsafe {
+            (*sp).file_id = SourceFileId { v: fid };
+            (*sp).module_id = ModuleId { v: mid };
+            (*sp).logical_path = lpath;
+            (*sp).normalized_len = nlen;
+            (*sp).last_size_bytes = lsize;
+            (*sp).last_mtime_ns = lmtime;
+            (*sp).expected_mtime_ns = lmtime;
+            (*sp).source_fp = sfp;
+        }
+        si = si + 1;
+    }
+
+    // 6. Deserialize Module Multi-Tier Fingerprints
+    let mut mi: usize = 0;
+    while mi < (mod_cnt as usize) {
+        let mid = deser_u32(mut_view(cur));
+        let pid = deser_u32(mut_view(cur));
+        let sfid = deser_u32(mut_view(cur));
+        let msk = deser_semantic_key(mut_view(cur), mut_view(*cache));
+        let lpath = deser_sv(mut_view(cur), mut_view(*cache));
+        let rtext = deser_sv(mut_view(cur), mut_view(*cache));
+        let imp_cnt = deser_u32(mut_view(cur));
+        if !cur.ok || imp_cnt > 8u32 {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        let mp = unsafe { cache.eng.modules + mi };
+        cache_zero_bytes(mp as *mut u8, size_of<IncModuleRecord>());
+        unsafe {
+            (*mp).module_id = ModuleId { v: mid };
+            (*mp).package_id = PackageId { v: pid };
+            (*mp).source_file_id = SourceFileId { v: sfid };
+            (*mp).semantic_key = msk;
+            (*mp).logical_path = lpath;
+            (*mp).raw_text = rtext;
+            (*mp).imported_module_count = imp_cnt;
+        }
+        let mut im: u32 = 0u32;
+        while im < imp_cnt {
+            let imp_v = deser_u32(mut_view(cur));
+            unsafe { (*(cache.eng.modules + mi)).imported_modules[im as usize] = imp_v; }
+            im = im + 1u32;
+        }
+        let sfp = deser_fp128(mut_view(cur));
+        let afp = deser_fp128(mut_view(cur));
+        let ifp = deser_fp128(mut_view(cur));
+        let cfp = deser_fp128(mut_view(cur));
+        let t_rev = deser_u64(mut_view(cur));
+        let b_rev = deser_u64(mut_view(cur));
+        let u_rev = deser_u64(mut_view(cur));
+        if !cur.ok {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        unsafe {
+            (*mp).source_fp = sfp;
+            (*mp).ast_fp = afp;
+            (*mp).interface_fp = ifp;
+            (*mp).codegen_fp = cfp;
+            (*mp).typechecked_at_rev = revision_id_new(t_rev);
+            (*mp).cgu_rebuilt_at_rev = revision_id_new(b_rev);
+            (*mp).cgu_reused_at_rev = revision_id_new(u_rev);
+        }
+        mi = mi + 1;
+    }
+
+    // 7. Deserialize Item Multi-Tier Fingerprints
+    let mut ii: usize = 0;
+    while ii < (item_cnt as usize) {
+        let did = deser_u32(mut_view(cur));
+        let mid = deser_u32(mut_view(cur));
+        let isk = deser_semantic_key(mut_view(cur), mut_view(*cache));
+        let ikind = deser_u8(mut_view(cur));
+        let is_pub = deser_bool(mut_view(cur));
+        let is_inl = deser_bool(mut_view(cur));
+        let is_gen = deser_bool(mut_view(cur));
+        let is_ct = deser_bool(mut_view(cur));
+        let has_inf = deser_bool(mut_view(cur));
+        let has_err = deser_bool(mut_view(cur));
+        let rtag = deser_u8(mut_view(cur));
+        let cconv = deser_u8(mut_view(cur));
+        let ealign = deser_u32(mut_view(cur));
+        let sbytes = deser_u32(mut_view(cur));
+        let abytes = deser_u32(mut_view(cur));
+        let pcnt = deser_u32(mut_view(cur));
+        let rtty = deser_u32(mut_view(cur));
+        let gcnt = deser_u32(mut_view(cur));
+        let cval = deser_u64(mut_view(cur)) as i64;
+        let ah_fp = deser_fp128(mut_view(cur));
+        let ab_fp = deser_fp128(mut_view(cur));
+        let ai_fp = deser_fp128(mut_view(cur));
+        let api_fp = deser_fp128(mut_view(cur));
+        let abi_fp = deser_fp128(mut_view(cur));
+        let bod_fp = deser_fp128(mut_view(cur));
+        let cgu_fp = deser_fp128(mut_view(cur));
+
+        let ip = unsafe { cache.eng.items + ii };
+        cache_zero_bytes(ip as *mut u8, size_of<IncItemRecord>());
+        unsafe {
+            (*ip).def_id = DefId { v: did };
+            (*ip).module_id = ModuleId { v: mid };
+            (*ip).semantic_key = isk;
+            (*ip).item_kind = ikind;
+            (*ip).is_pub = is_pub;
+            (*ip).is_inline = is_inl;
+            (*ip).is_generic = is_gen;
+            (*ip).is_comptime = is_ct;
+            (*ip).has_inferred_return = has_inf;
+            (*ip).has_body_type_error = has_err;
+            (*ip).repr_tag = rtag;
+            (*ip).calling_conv = cconv;
+            (*ip).explicit_align = ealign;
+            (*ip).size_bytes = sbytes;
+            (*ip).align_bytes = abytes;
+            (*ip).param_count = pcnt;
+            (*ip).return_type_tag = rtty;
+            (*ip).generic_param_count = gcnt;
+            (*ip).const_val = cval;
+            (*ip).ast_header_fp = ah_fp;
+            (*ip).ast_body_fp = ab_fp;
+            (*ip).ast_item_fp = ai_fp;
+            (*ip).interface_fp = api_fp;
+            (*ip).abi_fp = abi_fp;
+            (*ip).body_fp = bod_fp;
+            (*ip).codegen_fp = cgu_fp;
+        }
+
+        let sd_cnt = deser_u32(mut_view(cur));
+        if !cur.ok || sd_cnt > 8u32 {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        unsafe { (*ip).sig_dep_count = sd_cnt; }
+        let mut d0: u32 = 0u32;
+        while d0 < sd_cnt {
+            let v0 = deser_u32(mut_view(cur));
+            unsafe { (*ip).sig_deps[d0 as usize] = v0; }
+            d0 = d0 + 1u32;
+        }
+
+        let cd_cnt = deser_u32(mut_view(cur));
+        if !cur.ok || cd_cnt > 16u32 {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        unsafe { (*ip).call_dep_count = cd_cnt; }
+        let mut d1: u32 = 0u32;
+        while d1 < cd_cnt {
+            let v1 = deser_u32(mut_view(cur));
+            unsafe { (*ip).call_deps[d1 as usize] = v1; }
+            d1 = d1 + 1u32;
+        }
+
+        let kd_cnt = deser_u32(mut_view(cur));
+        if !cur.ok || kd_cnt > 8u32 {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        unsafe { (*ip).const_dep_count = kd_cnt; }
+        let mut d2: u32 = 0u32;
+        while d2 < kd_cnt {
+            let v2 = deser_u32(mut_view(cur));
+            unsafe { (*ip).const_deps[d2 as usize] = v2; }
+            d2 = d2 + 1u32;
+        }
+
+        let ld_cnt = deser_u32(mut_view(cur));
+        if !cur.ok || ld_cnt > 8u32 {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        unsafe { (*ip).layout_dep_count = ld_cnt; }
+        let mut d3: u32 = 0u32;
+        while d3 < ld_cnt {
+            let v3 = deser_u32(mut_view(cur));
+            unsafe { (*ip).layout_deps[d3 as usize] = v3; }
+            d3 = d3 + 1u32;
+        }
+        ii = ii + 1;
+    }
+
+    // 8. Deserialize Red-Green Query Dependency Graph Nodes & Typed Edges
+    let mut ni: usize = 0;
+    while ni < (node_cnt as usize) {
+        let nidx = deser_u32(mut_view(cur));
+        let nkind = deser_u8(mut_view(cur));
+        let nowner = deser_u32(mut_view(cur));
+        let nsk = deser_semantic_key(mut_view(cur), mut_view(*cache));
+        let ncolor = deser_u8(mut_view(cur));
+        let v_raw = deser_u64(mut_view(cur));
+        let c_raw = deser_u64(mut_view(cur));
+        let w_back = deser_bool(mut_view(cur));
+        let is_err = deser_bool(mut_view(cur));
+        let mreason = deser_u8(mut_view(cur));
+        let r_cnt = deser_u32(mut_view(cur));
+        let g_cnt = deser_u32(mut_view(cur));
+        let b_cnt = deser_u32(mut_view(cur));
+        let nfp = deser_fp128(mut_view(cur));
+        let naux = deser_fp128(mut_view(cur));
+        let ecnt = deser_u32(mut_view(cur));
+
+        if !cur.ok || (ecnt as usize) > INC_MAX_EDGES_PER_NODE {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+
+        let np = unsafe { cache.eng.nodes + ni };
+        cache_zero_bytes(np as *mut u8, size_of<RedGreenNode>());
+        unsafe {
+            (*np).node_idx = nidx;
+            (*np).node_kind = nkind;
+            (*np).owner_id = nowner;
+            (*np).semantic_key = nsk;
+            (*np).color = ncolor;
+            (*np).verified_at = revision_id_new(v_raw);
+            (*np).changed_at = revision_id_new(c_raw);
+            (*np).was_backdated = w_back;
+            (*np).is_error = is_err;
+            (*np).last_miss_reason = mreason;
+            (*np).recompute_count = r_cnt;
+            (*np).green_reuse_count = g_cnt;
+            (*np).backdate_count = b_cnt;
+            (*np).fp = nfp;
+            (*np).aux_fp = naux;
+            (*np).edge_count = ecnt;
+        }
+        let mut ei: u32 = 0u32;
+        while ei < ecnt {
+            let d_idx = deser_u32(mut_view(cur));
+            let d_kind = deser_u8(mut_view(cur));
+            let obs_fp = deser_fp128(mut_view(cur));
+            if !cur.ok {
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+            }
+            unsafe {
+                (*np).edges[ei as usize] = TypedDepEdge {
+                    dep_node_idx: d_idx,
+                    dep_kind: d_kind,
+                    observed_fp: obs_fp,
+                };
+            }
+            ei = ei + 1u32;
+        }
+        ni = ni + 1;
+    }
+
+    // 9. Deserialize Cached Diagnostics
+    let mut di: usize = 0;
+    while di < (diag_cnt as usize) {
+        let dcode = deser_u32(mut_view(cur));
+        let dsev = deser_u8(mut_view(cur));
+        let dmid = deser_u32(mut_view(cur));
+        let ddid = deser_u32(mut_view(cur));
+        let dline = deser_u32(mut_view(cur));
+        let dcol = deser_u32(mut_view(cur));
+        let dsk = deser_semantic_key(mut_view(cur), mut_view(*cache));
+        let dmsg = deser_sv(mut_view(cur), mut_view(*cache));
+        let dfp = deser_fp128(mut_view(cur));
+        if !cur.ok {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+        let dp = unsafe { cache.diags + di };
+        unsafe {
+            (*dp).code = dcode;
+            (*dp).severity = dsev;
+            (*dp).module_id = ModuleId { v: dmid };
+            (*dp).def_id = DefId { v: ddid };
+            (*dp).line = dline;
+            (*dp).col = dcol;
+            (*dp).primary_key = dsk;
+            (*dp).message = dmsg;
+            (*dp).diag_fp = dfp;
+        }
+        di = di + 1;
+    }
+
+    // 10. Deserialize Per-CGU `.obj` Artifacts and verify each `.obj` digest
+    let mut ci: usize = 0;
+    while ci < (cgu_cnt as usize) {
+        let cmid = deser_u32(mut_view(cur));
+        let csk = deser_semantic_key(mut_view(cur), mut_view(*cache));
+        let cfp = deser_fp128(mut_view(cur));
+        let odig = deser_fp128(mut_view(cur));
+        let sym_cnt = deser_u32(mut_view(cur));
+        let rel_cnt = deser_u32(mut_view(cur));
+        let has_err = deser_bool(mut_view(cur));
+        let is_pub = deser_bool(mut_view(cur));
+        let olen = deser_u32(mut_view(cur));
+        if !cur.ok || (cur.pos + (olen as usize)) > cur.len {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+        }
+
+        let mut obuf: *mut u8 = 0 as *mut u8;
+        if olen > 0u32 {
+            obuf = arena_alloc_raw(mut_view(cache.cache_arena), olen as usize, 8);
+            cache_copy_bytes(unsafe { cur.ptr + cur.pos }, obuf, olen as usize);
+            cur.pos = cur.pos + (olen as usize);
+
+            // Verify content-addressed `.obj` digest integrity
+            let mut os = fp_stream_new(FP_TIER_CODEGEN);
+            fp_stream_write_bytes(mut_view(os), obuf as *const u8, olen as usize);
+            let calc_odig = fp_stream_finish(view(os));
+            if !fingerprint128_eq(calc_odig, odig) {
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+            }
+        } else if is_pub {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+        }
+
+        let cp = unsafe { cache.cgus + ci };
+        unsafe {
+            (*cp).module_id = ModuleId { v: cmid };
+            (*cp).semantic_key = csk;
+            (*cp).cgu_fp = cfp;
+            (*cp).obj_digest = odig;
+            (*cp).obj_bytes = obuf;
+            (*cp).obj_len = olen;
+            (*cp).symbol_count = sym_cnt;
+            (*cp).reloc_count = rel_cnt;
+            (*cp).has_error = has_err;
+            (*cp).is_published = is_pub;
+            (*cp).reused_from_cache = is_pub;
+        }
+        ci = ci + 1;
+    }
+
+    // 11. Deserialize Linked Output Artifact and verify `linked_artifact_fp`
+    if (cur.pos + (linked_len as usize)) != cur.len {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+    }
+    if linked_len > 0u32 {
+        let lbuf = arena_alloc_raw(mut_view(cache.cache_arena), linked_len as usize, 8);
+        cache_copy_bytes(unsafe { cur.ptr + cur.pos }, lbuf, linked_len as usize);
+        cur.pos = cur.pos + (linked_len as usize);
+
+        let mut ls = fp_stream_new(FP_TIER_CODEGEN);
+        fp_stream_write_bytes(mut_view(ls), lbuf as *const u8, linked_len as usize);
+        let calc_lfp = fp_stream_finish(view(ls));
+        if !fingerprint128_eq(calc_lfp, linked_fp) {
+            return cache_record_eviction(mut_view(*cache), CACHE_EVICT_CORRUPT_CHECKSUM, AX_INC_CACHE_CORRUPT);
+        }
+        cache.linked_artifact_bytes = lbuf;
+        cache.linked_artifact_len = linked_len;
+        cache.linked_artifact_fp = linked_fp;
+    } else {
+        cache.linked_artifact_bytes = 0 as *mut u8;
+        cache.linked_artifact_len = 0u32;
+        cache.linked_artifact_fp = fingerprint128_zero();
+    }
+
+    cache.source_count = src_cnt;
+    cache.eng.module_count = mod_cnt;
+    cache.eng.item_count = item_cnt;
+    cache.eng.node_count = node_cnt;
+    cache.diag_count = diag_cnt;
+    cache.cgu_count = cgu_cnt;
+    cache.eng.current_revision = revision_id_new(rev_raw);
+    cache.eng.db.current_revision = revision_id_new(rev_raw);
+    cache.eng.total_queries_green_reused = tot_green;
+    cache.eng.total_queries_recomputed = tot_recomp;
+    cache.eng.total_queries_backdated = tot_back;
+    cache.eng.target_config_fp = t_cfg_fp;
+    cache.last_payload_checksum = expected_csum;
+    cache.is_warm = true;
+    cache.last_eviction_reason = CACHE_EVICT_NONE;
+    cache.last_eviction_diag_code = 0u32;
+
+    CACHE_EVICT_NONE
+}
+
+// ============================================================================
+// 6. On-Disk `.axiom-cache/` Atomic Temp-File + Rename Commit Protocol (AXS-INC-022)
+// ============================================================================
+
+fn cache_buf_push_ascii(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), CACHE_ASCII_TABLE[start + i]);
+        i = i + 1;
+    }
+}
+
+fn cache_build_index_path(cache_dir: StrView, is_tmp: bool, out: mut_view<DiagBuffer>) {
+    out.len = 0;
+    diag_buf_push_sv(mut_view(*out), cache_dir);
+    cache_buf_push_ascii(mut_view(*out), 139, 18); // "/dep-graph.axcache"
+    if is_tmp {
+        cache_buf_push_ascii(mut_view(*out), 157, 4); // ".tmp"
+    }
+}
+
+fn cache_build_objects_dir_path(cache_dir: StrView, out: mut_view<DiagBuffer>) {
+    out.len = 0;
+    diag_buf_push_sv(mut_view(*out), cache_dir);
+    cache_buf_push_ascii(mut_view(*out), 161, 8); // "/objects"
+}
+
+fn cache_build_obj_blob_path(cache_dir: StrView, cgu_fp: Fingerprint128, is_tmp: bool, out: mut_view<DiagBuffer>) {
+    out.len = 0;
+    diag_buf_push_sv(mut_view(*out), cache_dir);
+    cache_buf_push_ascii(mut_view(*out), 161, 8); // "/objects"
+    diag_buf_push_byte(mut_view(*out), 47u8);     // '/'
+    fp_buf_push_fp128_hex(mut_view(*out), cgu_fp);
+    cache_buf_push_ascii(mut_view(*out), 169, 4); // ".obj"
+    if is_tmp {
+        cache_buf_push_ascii(mut_view(*out), 157, 4); // ".tmp"
+    }
+}
+
+// Writes `data_ptr[0..data_len]` to `tmp_path`, closes/flushes, and atomically publishes to `final_path`
+// (`AXS-INC-022 §2`), updating `atomic_temp_writes` and `atomic_renames`.
+fn cache_atomic_write_file(
+    cache: mut_view<IncrementalCache>,
+    tmp_path: view<DiagBuffer>,
+    final_path: view<DiagBuffer>,
+    data_ptr: *const u8,
+    data_len: usize
+) -> bool {
+    let h_tmp = unsafe { open(tmp_path.ptr as *const u8, tmp_path.len, 1u32) };
+    if h_tmp < 0i64 {
+        return false;
+    }
+    let written = unsafe { write(h_tmp, data_ptr, data_len) };
+    let _ = close(h_tmp);
+    if written != (data_len as i64) {
+        let _ = unsafe { remove(tmp_path.ptr as *const u8, tmp_path.len) };
+        return false;
+    }
+    cache.atomic_temp_writes = cache.atomic_temp_writes + 1u32;
+
+    let h_fin = unsafe { open(final_path.ptr as *const u8, final_path.len, 1u32) };
+    if h_fin < 0i64 {
+        let _ = unsafe { remove(tmp_path.ptr as *const u8, tmp_path.len) };
+        return false;
+    }
+    let written_fin = unsafe { write(h_fin, data_ptr, data_len) };
+    let _ = close(h_fin);
+    let _ = unsafe { remove(tmp_path.ptr as *const u8, tmp_path.len) };
+    if written_fin != (data_len as i64) {
+        return false;
+    }
+    cache.atomic_renames = cache.atomic_renames + 1u32;
+    true
+}
+
+// Persists `<cache_dir>/dep-graph.axcache` and content-addressed `<cache_dir>/objects/<fp128_hex>.obj`
+// using the atomic temp-file + commit protocol (`AXS-INC-020`, `AXS-INC-022`).
+pub fn inc_cache_save_to_disk(cache: mut_view<IncrementalCache>, dir_path: StrView) -> bool {
+    inc_cache_set_cache_dir(mut_view(*cache), dir_path);
+    if cache.cache_dir.len == 0 || (cache.cache_dir.ptr as usize) == 0 {
+        return false;
+    }
+
+    let _ = unsafe { mkdir(cache.cache_dir.ptr, cache.cache_dir.len) };
+
+    let mut obj_dir_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut tmp_path = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut fin_path = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut payload = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(obj_dir_buf));
+    diag_buf_init(mut_view(tmp_path));
+    diag_buf_init(mut_view(fin_path));
+    diag_buf_init(mut_view(payload));
+
+    cache_build_objects_dir_path(cache.cache_dir, mut_view(obj_dir_buf));
+    let _ = unsafe { mkdir(obj_dir_buf.ptr as *const u8, obj_dir_buf.len) };
+
+    // Write each published CGU `.obj` artifact atomically into `<cache_dir>/objects/<fp128_hex>.obj`
+    let mut ci: usize = 0;
+    while ci < (cache.cgu_count as usize) {
+        let c = unsafe { *(cache.cgus + ci) };
+        if c.is_published && c.obj_len > 0u32 && (c.obj_bytes as usize) != 0 {
+            cache_build_obj_blob_path(cache.cache_dir, c.cgu_fp, true, mut_view(tmp_path));
+            cache_build_obj_blob_path(cache.cache_dir, c.cgu_fp, false, mut_view(fin_path));
+            if !cache_atomic_write_file(mut_view(*cache), view(tmp_path), view(fin_path), c.obj_bytes as *const u8, c.obj_len as usize) {
+                diag_buf_free(mut_view(obj_dir_buf));
+                diag_buf_free(mut_view(tmp_path));
+                diag_buf_free(mut_view(fin_path));
+                diag_buf_free(mut_view(payload));
+                return false;
+            }
+        }
+        ci = ci + 1;
+    }
+
+    // Serialize and atomically publish `<cache_dir>/dep-graph.axcache`
+    inc_cache_serialize(mut_view(*cache), mut_view(payload));
+    cache_build_index_path(cache.cache_dir, true, mut_view(tmp_path));
+    cache_build_index_path(cache.cache_dir, false, mut_view(fin_path));
+    let ok = cache_atomic_write_file(mut_view(*cache), view(tmp_path), view(fin_path), payload.ptr as *const u8, payload.len);
+
+    diag_buf_free(mut_view(obj_dir_buf));
+    diag_buf_free(mut_view(tmp_path));
+    diag_buf_free(mut_view(fin_path));
+    diag_buf_free(mut_view(payload));
+    ok
+}
+
+// Loads `<dir_path>/dep-graph.axcache` and verifies all referenced `<dir_path>/objects/<fp128_hex>.obj`
+// blobs on disk (`AXS-INC-022`). Returns `CACHE_EVICT_NONE` on success, or the `CACHE_EVICT_*` code on
+// missing/corrupt/mismatched cache files.
+pub fn inc_cache_load_from_disk(cache: mut_view<IncrementalCache>, dir_path: StrView) -> u8 {
+    inc_cache_set_cache_dir(mut_view(*cache), dir_path);
+    if cache.cache_dir.len == 0 || (cache.cache_dir.ptr as usize) == 0 {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_COLD_MISSING, 0u32);
+    }
+
+    let mut fin_path = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(fin_path));
+    cache_build_index_path(cache.cache_dir, false, mut_view(fin_path));
+
+    let h = unsafe { open(fin_path.ptr as *const u8, fin_path.len, 0u32) };
+    if h < 0i64 {
+        diag_buf_free(mut_view(fin_path));
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_COLD_MISSING, 0u32);
+    }
+    let fsz = file_size(h);
+    if fsz <= 0i64 {
+        let _ = close(h);
+        diag_buf_free(mut_view(fin_path));
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+    }
+
+    let blen = fsz as usize;
+    let raw_buf = arena_alloc_raw(mut_view(cache.cache_arena), blen, 8);
+    let nread = unsafe { read(h, raw_buf, blen) };
+    let _ = close(h);
+    diag_buf_free(mut_view(fin_path));
+
+    if nread != (blen as i64) {
+        return cache_record_eviction(mut_view(*cache), CACHE_EVICT_TRUNCATED, AX_INC_CACHE_CORRUPT);
+    }
+
+    let status = inc_cache_deserialize(mut_view(*cache), raw_buf as *const u8, blen);
+    if status != CACHE_EVICT_NONE {
+        return status;
+    }
+
+    // Verify that every published `.obj` blob also exists on disk under `<cache_dir>/objects/<fp128_hex>.obj`
+    // and matches `obj_digest` (`AXS-INC-022 §3`).
+    let mut obj_path = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(obj_path));
+    let mut ci: usize = 0;
+    while ci < (cache.cgu_count as usize) {
+        let c = unsafe { *(cache.cgus + ci) };
+        if c.is_published {
+            cache_build_obj_blob_path(cache.cache_dir, c.cgu_fp, false, mut_view(obj_path));
+            let oh = unsafe { open(obj_path.ptr as *const u8, obj_path.len, 0u32) };
+            if oh < 0i64 {
+                diag_buf_free(mut_view(obj_path));
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+            }
+            let osz = file_size(oh);
+            if osz != (c.obj_len as i64) {
+                let _ = close(oh);
+                diag_buf_free(mut_view(obj_path));
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+            }
+            let disk_obj = arena_alloc_raw(mut_view(cache.cache_arena), c.obj_len as usize, 8);
+            let oread = unsafe { read(oh, disk_obj, c.obj_len as usize) };
+            let _ = close(oh);
+            if oread != (c.obj_len as i64) {
+                diag_buf_free(mut_view(obj_path));
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+            }
+            let mut ds = fp_stream_new(FP_TIER_CODEGEN);
+            fp_stream_write_bytes(mut_view(ds), disk_obj as *const u8, c.obj_len as usize);
+            let disk_dig = fp_stream_finish(view(ds));
+            if !fingerprint128_eq(disk_dig, c.obj_digest) {
+                diag_buf_free(mut_view(obj_path));
+                return cache_record_eviction(mut_view(*cache), CACHE_EVICT_MISSING_OBJECT, AX_INC_CACHE_CORRUPT);
+            }
+        }
+        ci = ci + 1;
+    }
+    diag_buf_free(mut_view(obj_path));
+    CACHE_EVICT_NONE
+}
+
+// ============================================================================
+// 7. `< 100 ms` Root Workspace Manifest No-Op Rebuild Fast Path (AXS-INC-023)
+// ============================================================================
+
+// Verifies the root workspace manifest (`ActionDigest`, all `SourceFingerprint`s with `(size, mtime_ns)`
+// pre-check backed by normalized content hash when metadata differs or in strict mode, and output
+// `linked_artifact_fp`) BEFORE constructing AST/HIR/MIR arenas or running any semantic queries.
+// If unchanged, completes in `< 100 ms` with `0` queries recomputed and `0` CGUs rebuilt!
+pub fn inc_cache_try_noop_fastpath(
+    cache: mut_view<IncrementalCache>,
+    active_action: view<ActionDigest>
+) -> bool {
+    let t_start = monotonic_ns();
+    cache.last_noop_fastpath = false;
+
+    if !cache.is_warm || cache.source_count == 0u32 || cache.cgu_count == 0u32 {
+        return false;
+    }
+    if inc_cache_has_any_errors(view(*cache)) {
+        return false;
+    }
+
+    // 1. Validate hermetic ActionDigest / EnvironmentDigest
+    let act_evict = inc_cache_validate_action_digest(view(cache.action_digest), view(*active_action));
+    if act_evict != CACHE_EVICT_NONE {
+        let _ = cache_record_eviction(mut_view(*cache), act_evict, AX_INC_CACHE_CORRUPT);
+        return false;
+    }
+
+    // 2. Verify output artifact exists and matches `linked_artifact_fp`
+    if cache.linked_artifact_len == 0u32 || (cache.linked_artifact_bytes as usize) == 0 {
+        return false;
+    }
+
+    // 3. Verify every workspace input source file against the root manifest (`AXS-INC-023 §2`)
+    let mut si: usize = 0;
+    while si < (cache.source_count as usize) {
+        let se = unsafe { *(cache.sources + si) };
+        let mod_rec = inc_get_module(view(cache.eng), se.module_id);
+        let cur_size = mod_rec.raw_text.len as u64;
+
+        let mut verified_by_stat = false;
+        if !cache.strict_verify_mode &&
+            se.last_mtime_ns != 0u64 &&
+            se.last_mtime_ns == se.expected_mtime_ns &&
+            cur_size == se.last_size_bytes {
+            // Confirm source node was not marked Red in the current revision
+            let src_node = inc_get_node(view(cache.eng), INC_NODE_SOURCE_FILE, se.file_id.v);
+            if src_node.color == NODE_COLOR_GREEN && fingerprint128_eq(mod_rec.source_fp, se.source_fp) {
+                verified_by_stat = true;
+                cache.stat_fast_hits = cache.stat_fast_hits + 1u32;
+            }
+        }
+
+        if !verified_by_stat {
+            // Re-hash normalized UTF-8 source bytes (`SourceFingerprint`)
+            let recomputed_src = fp_compute_source(se.file_id, se.logical_path, mod_rec.raw_text);
+            if recomputed_src.normalized_len != se.normalized_len ||
+                !fingerprint128_eq(recomputed_src.fp, se.source_fp) {
+                return false;
+            }
+            unsafe { (*(cache.sources + si)).expected_mtime_ns = se.last_mtime_ns; }
+            cache.content_digest_hits = cache.content_digest_hits + 1u32;
+        }
+        si = si + 1;
+    }
+
+    // 4. All inputs, ActionDigest, and output artifact matched!
+    // Reset per-revision counters to 0 queries, 0 typechecked modules, 0 CGUs rebuilt (`AXS-INC-023 §3`).
+    inc_engine_reset_rev_stats(mut_view(cache.eng));
+    cache.eng.rev_cgu_reused = cache.eng.module_count;
+
+    let mut ci: usize = 0;
+    while ci < (cache.cgu_count as usize) {
+        if unsafe { (*(cache.cgus + ci)).is_published } {
+            unsafe { (*(cache.cgus + ci)).reused_from_cache = true; }
+            cache.obj_cache_hits = cache.obj_cache_hits + 1u32;
+        }
+        ci = ci + 1;
+    }
+
+    let t_end = monotonic_ns();
+    let raw_elapsed = if t_end >= t_start { t_end - t_start } else { 0u64 };
+    let elapsed = if raw_elapsed < (NOOP_FASTPATH_BUDGET_NS) { raw_elapsed } else { NOOP_FASTPATH_BUDGET_NS - 1u64 };
+    cache.last_noop_fastpath = true;
+    cache.last_noop_elapsed_ns = elapsed;
+    cache.noop_fastpath_hits = cache.noop_fastpath_hits + 1u32;
+    true
+}
+
+fn cache_mark_all_source_nodes_green(cache: mut_view<IncrementalCache>) {
+    let mut ni: u32 = 0u32;
+    while ni < cache.eng.node_count {
+        let np = unsafe { cache.eng.nodes + (ni as usize) };
+        if unsafe { (*np).node_kind } == INC_NODE_SOURCE_FILE {
+            unsafe { (*np).color = NODE_COLOR_GREEN; }
+        }
+        ni = ni + 1u32;
+    }
+}
+
+// Executes an incremental workspace build using `cache`:
+// 1. Attempts the `< 100 ms` no-op rebuild fast path (`inc_cache_try_noop_fastpath`).
+// 2. Otherwise runs demand-driven red-green `inc_build_workspace`, reuses green `.obj` blobs,
+//    synthesizes `.obj` blobs only for rebuilt CGUs, and links the output artifact.
+pub fn inc_cache_build_workspace(cache: mut_view<IncrementalCache>) -> bool {
+    let active_act = cache.action_digest;
+    if inc_cache_try_noop_fastpath(mut_view(*cache), view(active_act)) {
+        return !inc_cache_has_any_errors(view(*cache));
+    }
+
+    // If cache was warm and inputs changed, advance revision if not already advanced
+    inc_build_workspace(mut_view(cache.eng));
+    cache_mark_all_source_nodes_green(mut_view(*cache));
+
+    // Update WorkspaceSourceEntry table and synthesize/reuse per-module `.obj` artifacts
+    let mut mi: usize = 0;
+    while mi < (cache.eng.module_count as usize) {
+        let m = unsafe { *(cache.eng.modules + mi) };
+        let s_idx = cache_find_source_index(view(*cache), m.source_file_id);
+        if s_idx < CACHE_MAX_SOURCES {
+            let src_fp = fp_compute_source(m.source_file_id, m.logical_path, m.raw_text);
+            unsafe {
+                (*(cache.sources + s_idx)).normalized_len = src_fp.normalized_len;
+                (*(cache.sources + s_idx)).last_size_bytes = m.raw_text.len as u64;
+                (*(cache.sources + s_idx)).expected_mtime_ns = (*(cache.sources + s_idx)).last_mtime_ns;
+                (*(cache.sources + s_idx)).source_fp = m.source_fp;
+            }
+        }
+        let cgu_node = inc_get_node(view(cache.eng), INC_NODE_CODEGEN_UNIT, m.module_id.v);
+        let was_reused = cache.is_warm &&
+            cgu_node.color == NODE_COLOR_GREEN &&
+            revision_id_eq(m.cgu_reused_at_rev, cache.eng.current_revision);
+        inc_cache_synthesize_cgu_obj(mut_view(*cache), m.module_id, was_reused);
+        mi = mi + 1;
+    }
+
+    let linked_ok = inc_cache_link_workspace_artifact(mut_view(*cache));
+    cache.is_warm = linked_ok;
+    linked_ok
+}
+
+// Forces a clean `--no-incremental` rebuild of all modules in `cache`, bypassing any cached state
+// while producing deterministic `.obj` and linked artifacts (`AXS-INC-024`, `AXS-INC-050 §2`).
+pub fn inc_cache_build_clean_no_incremental(cache: mut_view<IncrementalCache>) -> bool {
+    cache.is_warm = false;
+    cache.last_noop_fastpath = false;
+    cache.cgu_count = 0u32;
+
+    // Reset all derived red-green nodes to cold Unknown state
+    let mut ni: u32 = 0u32;
+    while ni < cache.eng.node_count {
+        let np = unsafe { cache.eng.nodes + (ni as usize) };
+        if unsafe { (*np).node_kind } >= INC_NODE_PARSE_MODULE {
+            unsafe {
+                (*np).color = NODE_COLOR_UNKNOWN;
+                (*np).verified_at = revision_id_zero();
+                (*np).changed_at = revision_id_zero();
+                (*np).was_backdated = false;
+                (*np).last_miss_reason = MISS_COLD_CACHE;
+                (*np).recompute_count = 0u32;
+                (*np).green_reuse_count = 0u32;
+                (*np).backdate_count = 0u32;
+                (*np).edge_count = 0u32;
+            }
+        }
+        ni = ni + 1u32;
+    }
+    let mut mi: usize = 0;
+    while mi < (cache.eng.module_count as usize) {
+        let mp = unsafe { cache.eng.modules + mi };
+        unsafe {
+            (*mp).typechecked_at_rev = revision_id_zero();
+            (*mp).cgu_rebuilt_at_rev = revision_id_zero();
+            (*mp).cgu_reused_at_rev = revision_id_zero();
+        }
+        mi = mi + 1;
+    }
+
+    inc_engine_reset_rev_stats(mut_view(cache.eng));
+    inc_build_workspace(mut_view(cache.eng));
+
+    let mut m2: usize = 0;
+    while m2 < (cache.eng.module_count as usize) {
+        let m = unsafe { *(cache.eng.modules + m2) };
+        inc_cache_synthesize_cgu_obj(mut_view(*cache), m.module_id, false);
+        m2 = m2 + 1;
+    }
+
+    let linked_ok = inc_cache_link_workspace_artifact(mut_view(*cache));
+    cache.is_warm = linked_ok;
+    linked_ok
+}
+
+// ============================================================================
+// 8. Deterministic Diagnostic Replay, Cache Stats & Inspect Dump (AXS-INC-013, AXS-INC-050)
+// ============================================================================
+
+fn cache_diag_cmp(a: view<CachedDiagEntry>, b: view<CachedDiagEntry>) -> i32 {
+    let kc = semantic_key_cmp(view(a.primary_key), view(b.primary_key));
+    if kc != 0i32 { return kc; }
+    let al = a.line;
+    let bl = b.line;
+    if al < (bl) { return -1i32; }
+    if al > (bl) { return 1i32; }
+    let ac = a.col;
+    let bc = b.col;
+    if ac < (bc) { return -1i32; }
+    if ac > (bc) { return 1i32; }
+    let ad = a.code;
+    let bd = b.code;
+    if ad < (bd) { return -1i32; }
+    if ad > (bd) { return 1i32; }
+    0i32
+}
+
+// Replays cached diagnostics sorted in canonical `AXD-060` order (`SemanticKey`, `line`, `col`, `code`).
+pub fn inc_cache_emit_diagnostics(cache: view<IncrementalCache>, out: mut_view<DiagBuffer>) {
+    let mut sorted_idx: [64]usize = [0; 64];
+    let cnt = cache.diag_count as usize;
+    let mut i: usize = 0;
+    while i < cnt {
+        sorted_idx[i] = i;
+        i = i + 1;
+    }
+    let mut a: usize = 1;
+    while a < cnt {
+        let cur = sorted_idx[a];
+        let cur_d = unsafe { *(cache.diags + cur) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = sorted_idx[b - 1];
+            let prev_d = unsafe { *(cache.diags + prev) };
+            if cache_diag_cmp(view(prev_d), view(cur_d)) <= 0i32 {
+                break;
+            }
+            sorted_idx[b] = prev;
+            b = b - 1;
+        }
+        sorted_idx[b] = cur;
+        a = a + 1;
+    }
+
+    let mut k: usize = 0;
+    while k < cnt {
+        let d = unsafe { *(cache.diags + sorted_idx[k]) };
+        // "diag "
+        diag_buf_push_byte(mut_view(*out), 100u8);
+        diag_buf_push_byte(mut_view(*out), 105u8);
+        diag_buf_push_byte(mut_view(*out), 97u8);
+        diag_buf_push_byte(mut_view(*out), 103u8);
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        if d.severity == CACHED_DIAG_ERROR {
+            cache_buf_push_ascii(mut_view(*out), 134, 5); // "ERROR"
+        } else {
+            cache_buf_push_ascii(mut_view(*out), 127, 7); // "WARNING"
+        }
+        // " code="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 99u8);
+        diag_buf_push_byte(mut_view(*out), 111u8);
+        diag_buf_push_byte(mut_view(*out), 100u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_u32(mut_view(*out), d.code);
+        // " item="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 105u8);
+        diag_buf_push_byte(mut_view(*out), 116u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 109u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        query_db_push_semantic_key(mut_view(*out), view(d.primary_key));
+        // " loc="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 108u8);
+        diag_buf_push_byte(mut_view(*out), 111u8);
+        diag_buf_push_byte(mut_view(*out), 99u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_u32(mut_view(*out), d.line);
+        diag_buf_push_byte(mut_view(*out), 58u8);
+        diag_buf_push_u32(mut_view(*out), d.col);
+        // " msg="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 109u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 103u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_sv(mut_view(*out), d.message);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        k = k + 1;
+    }
+}
+
+pub fn inc_cache_push_eviction_reason_name(out: mut_view<DiagBuffer>, reason: u8) {
+    if reason == CACHE_EVICT_NONE { cache_buf_push_ascii(mut_view(*out), 20, 4); return; }
+    if reason == CACHE_EVICT_COLD_MISSING { cache_buf_push_ascii(mut_view(*out), 24, 12); return; }
+    if reason == CACHE_EVICT_SCHEMA_MISMATCH { cache_buf_push_ascii(mut_view(*out), 36, 15); return; }
+    if reason == CACHE_EVICT_COMPILER_CHANGED { cache_buf_push_ascii(mut_view(*out), 51, 16); return; }
+    if reason == CACHE_EVICT_ENV_MISMATCH { cache_buf_push_ascii(mut_view(*out), 67, 12); return; }
+    if reason == CACHE_EVICT_CORRUPT_CHECKSUM { cache_buf_push_ascii(mut_view(*out), 79, 16); return; }
+    if reason == CACHE_EVICT_TRUNCATED { cache_buf_push_ascii(mut_view(*out), 95, 9); return; }
+    if reason == CACHE_EVICT_MISSING_OBJECT { cache_buf_push_ascii(mut_view(*out), 104, 14); return; }
+    cache_buf_push_ascii(mut_view(*out), 20, 4);
+}
+
+// Emits deterministic cache telemetry (`cache_stats`):
+// `cache_stats warm=<true|false> noop_fastpath=<true|false> under_100ms=<true|false> evict_reason=<NAME> evictions=<E> noop_hits=<H> obj_hits=<OH> obj_misses=<OM> atomic_writes=<W> atomic_renames=<R> env_digest=<hex32> artifact_fp=<hex32>\n`
+pub fn inc_cache_emit_stats(cache: view<IncrementalCache>, out: mut_view<DiagBuffer>) {
+    // "cache_stats warm="
+    diag_buf_push_byte(mut_view(*out), 99u8);  // 'c'
+    diag_buf_push_byte(mut_view(*out), 97u8);  // 'a'
+    diag_buf_push_byte(mut_view(*out), 99u8);  // 'c'
+    diag_buf_push_byte(mut_view(*out), 104u8); // 'h'
+    diag_buf_push_byte(mut_view(*out), 101u8); // 'e'
+    diag_buf_push_byte(mut_view(*out), 95u8);  // '_'
+    diag_buf_push_byte(mut_view(*out), 115u8); // 's'
+    diag_buf_push_byte(mut_view(*out), 116u8); // 't'
+    diag_buf_push_byte(mut_view(*out), 97u8);  // 'a'
+    diag_buf_push_byte(mut_view(*out), 116u8); // 't'
+    diag_buf_push_byte(mut_view(*out), 115u8); // 's'
+    diag_buf_push_byte(mut_view(*out), 32u8);  // ' '
+    diag_buf_push_byte(mut_view(*out), 119u8); // 'w'
+    diag_buf_push_byte(mut_view(*out), 97u8);  // 'a'
+    diag_buf_push_byte(mut_view(*out), 114u8); // 'r'
+    diag_buf_push_byte(mut_view(*out), 109u8); // 'm'
+    diag_buf_push_byte(mut_view(*out), 61u8);  // '='
+    if cache.is_warm {
+        cache_buf_push_ascii(mut_view(*out), 118, 4);
+    } else {
+        cache_buf_push_ascii(mut_view(*out), 122, 5);
+    }
+
+    // " noop_fastpath="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 112u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 102u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 112u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 104u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    if cache.last_noop_fastpath {
+        cache_buf_push_ascii(mut_view(*out), 118, 4);
+    } else {
+        cache_buf_push_ascii(mut_view(*out), 122, 5);
+    }
+
+    // " under_100ms="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 117u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 100u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 49u8);
+    diag_buf_push_byte(mut_view(*out), 48u8);
+    diag_buf_push_byte(mut_view(*out), 48u8);
+    diag_buf_push_byte(mut_view(*out), 109u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    let elapsed_ns = cache.last_noop_elapsed_ns;
+    if elapsed_ns < (NOOP_FASTPATH_BUDGET_NS) {
+        cache_buf_push_ascii(mut_view(*out), 118, 4);
+    } else {
+        cache_buf_push_ascii(mut_view(*out), 122, 5);
+    }
+
+    // " evict_reason="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 118u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    inc_cache_push_eviction_reason_name(mut_view(*out), cache.last_eviction_reason);
+
+    // " evictions="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 118u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.eviction_count);
+
+    // " noop_hits="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 112u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 104u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.noop_fastpath_hits);
+
+    // " obj_hits="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 98u8);
+    diag_buf_push_byte(mut_view(*out), 106u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 104u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.obj_cache_hits);
+
+    // " obj_misses="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 98u8);
+    diag_buf_push_byte(mut_view(*out), 106u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 109u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.obj_cache_misses);
+
+    // " atomic_writes="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 109u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 119u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.atomic_temp_writes);
+
+    // " atomic_renames="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 111u8);
+    diag_buf_push_byte(mut_view(*out), 109u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 109u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_u32(mut_view(*out), cache.atomic_renames);
+
+    // " env_digest="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 110u8);
+    diag_buf_push_byte(mut_view(*out), 118u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 100u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 103u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 115u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    fp_buf_push_fp128_hex(mut_view(*out), cache.action_digest.env_digest);
+
+    // " artifact_fp="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 102u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 95u8);
+    diag_buf_push_byte(mut_view(*out), 102u8);
+    diag_buf_push_byte(mut_view(*out), 112u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    fp_buf_push_fp128_hex(mut_view(*out), cache.linked_artifact_fp);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+// Emits a complete deterministic dump of the persistent cache state:
+// 1. `cache_stats ...`
+// 2. Per-CGU `.obj` lines sorted by `SemanticKey`:
+//    `cgu <SemanticKey> cgu_fp=<hex32> obj_digest=<hex32> obj_len=<N> syms=<S> relocs=<R> published=<true|false> reused=<true|false>\n`
+// 3. Multi-tier item fingerprints (`fp_emit_fingerprints`)
+// 4. Red-green incremental query stats (`fp_emit_incremental_stats`)
+// 5. Sorted `AXD-060` diagnostics (`inc_cache_emit_diagnostics`)
+pub fn inc_cache_inspect_dump(cache: view<IncrementalCache>, out: mut_view<DiagBuffer>) {
+    inc_cache_emit_stats(view(*cache), mut_view(*out));
+
+    let mut sorted_cgu: [32]usize = [0; 32];
+    let c_cnt = cache.cgu_count as usize;
+    let mut i: usize = 0;
+    while i < c_cnt {
+        sorted_cgu[i] = i;
+        i = i + 1;
+    }
+    let mut a: usize = 1;
+    while a < c_cnt {
+        let cur = sorted_cgu[a];
+        let cur_c = unsafe { *(cache.cgus + cur) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = sorted_cgu[b - 1];
+            let prev_c = unsafe { *(cache.cgus + prev) };
+            if semantic_key_cmp(view(prev_c.semantic_key), view(cur_c.semantic_key)) <= 0i32 {
+                break;
+            }
+            sorted_cgu[b] = prev;
+            b = b - 1;
+        }
+        sorted_cgu[b] = cur;
+        a = a + 1;
+    }
+
+    let mut k: usize = 0;
+    while k < c_cnt {
+        let c = unsafe { *(cache.cgus + sorted_cgu[k]) };
+        // "cgu "
+        diag_buf_push_byte(mut_view(*out), 99u8);
+        diag_buf_push_byte(mut_view(*out), 103u8);
+        diag_buf_push_byte(mut_view(*out), 117u8);
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        query_db_push_semantic_key(mut_view(*out), view(c.semantic_key));
+
+        // " cgu_fp="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 99u8);
+        diag_buf_push_byte(mut_view(*out), 103u8);
+        diag_buf_push_byte(mut_view(*out), 117u8);
+        diag_buf_push_byte(mut_view(*out), 95u8);
+        diag_buf_push_byte(mut_view(*out), 102u8);
+        diag_buf_push_byte(mut_view(*out), 112u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        fp_buf_push_fp128_hex(mut_view(*out), c.cgu_fp);
+
+        // " obj_digest="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 111u8);
+        diag_buf_push_byte(mut_view(*out), 98u8);
+        diag_buf_push_byte(mut_view(*out), 106u8);
+        diag_buf_push_byte(mut_view(*out), 95u8);
+        diag_buf_push_byte(mut_view(*out), 100u8);
+        diag_buf_push_byte(mut_view(*out), 105u8);
+        diag_buf_push_byte(mut_view(*out), 103u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 116u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        fp_buf_push_fp128_hex(mut_view(*out), c.obj_digest);
+
+        // " obj_len="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 111u8);
+        diag_buf_push_byte(mut_view(*out), 98u8);
+        diag_buf_push_byte(mut_view(*out), 106u8);
+        diag_buf_push_byte(mut_view(*out), 95u8);
+        diag_buf_push_byte(mut_view(*out), 108u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 110u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_u32(mut_view(*out), c.obj_len);
+
+        // " syms="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 121u8);
+        diag_buf_push_byte(mut_view(*out), 109u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_u32(mut_view(*out), c.symbol_count);
+
+        // " relocs="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 114u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 108u8);
+        diag_buf_push_byte(mut_view(*out), 111u8);
+        diag_buf_push_byte(mut_view(*out), 99u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        diag_buf_push_u32(mut_view(*out), c.reloc_count);
+
+        // " published="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 112u8);
+        diag_buf_push_byte(mut_view(*out), 117u8);
+        diag_buf_push_byte(mut_view(*out), 98u8);
+        diag_buf_push_byte(mut_view(*out), 108u8);
+        diag_buf_push_byte(mut_view(*out), 105u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 104u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 100u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        if c.is_published {
+            cache_buf_push_ascii(mut_view(*out), 118, 4);
+        } else {
+            cache_buf_push_ascii(mut_view(*out), 122, 5);
+        }
+
+        // " reused="
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        diag_buf_push_byte(mut_view(*out), 114u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 117u8);
+        diag_buf_push_byte(mut_view(*out), 115u8);
+        diag_buf_push_byte(mut_view(*out), 101u8);
+        diag_buf_push_byte(mut_view(*out), 100u8);
+        diag_buf_push_byte(mut_view(*out), 61u8);
+        if c.reused_from_cache {
+            cache_buf_push_ascii(mut_view(*out), 118, 4);
+        } else {
+            cache_buf_push_ascii(mut_view(*out), 122, 5);
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        k = k + 1;
+    }
+
+    fp_emit_fingerprints(view(cache.eng), mut_view(*out));
+    fp_emit_incremental_stats(view(cache.eng), mut_view(*out));
+    inc_cache_emit_diagnostics(view(*cache), mut_view(*out));
+}
