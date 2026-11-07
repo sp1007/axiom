@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T770]
 priority: 721
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p18/e18_5_pass_contracts]
 spec: [spec/SPEC-25-pass-contracts-proof-carrying-ir.md, tasks/0545, tasks/0577, tasks/0578, tasks/0796, tasks/0797]
 covers: [REQ-LNK-3384, REQ-LNK-3385, REQ-LNK-3386, REQ-LNK-3387, REQ-LNK-3388, REQ-LNK-3389, REQ-LNK-3390, REQ-LNK-3391, REQ-LNK-3392, REQ-LNK-3393, REQ-LNK-3394, REQ-LNK-3395, REQ-LNK-3396, REQ-LNK-3397, REQ-LNK-3398, REQ-LNK-3399, REQ-LNK-3400, REQ-LNK-3401, REQ-LNK-3402, REQ-LNK-3403, REQ-LNK-3404, REQ-LNK-3405, REQ-LNK-3406, REQ-LNK-3407, REQ-LNK-3408, REQ-LNK-3409, REQ-LNK-3410, REQ-LNK-3411, REQ-LNK-3412, REQ-LNK-3413, REQ-LNK-3414, REQ-LNK-3415, REQ-LNK-3416, REQ-LNK-3417, REQ-LNK-3418, REQ-LNK-3419, REQ-LNK-3420, REQ-LNK-3421, REQ-LNK-3422, REQ-LNK-3423, REQ-LNK-3424, REQ-LNK-3425, REQ-LNK-3426, REQ-LNK-3427, REQ-LNK-3428, REQ-LNK-3429, REQ-LNK-3430, REQ-LNK-3431, REQ-LNK-3432, REQ-LNK-3433]
 started: 2026-11-07 17:49:55
-agent: T771-impl
+finished: 2026-11-07 18:51:13
 ---
 # T771 — E18.5 — Pass contracts, proof-carrying transformations & fail-closed verifier conformance suite
 
@@ -43,3 +43,4 @@ Certify E18.5 exit criteria with an end-to-end conformance suite covering compil
 ## Log
 - 2026-11-03 02:59:35 created by T218 (P18 phase planning)
 - 2026-11-07 17:49:55 started (attempt 1) T771-impl
+- 2026-11-07 18:51:13 accepted by QA -> done
