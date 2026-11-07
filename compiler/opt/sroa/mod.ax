@@ -1,0 +1,4195 @@
+// Ownership- and Capability-Aware Copy/Move Propagation, Deep Scalar Replacement of Aggregates (SROA),
+// and Caller-Allocated Return-Slot Construction (RVO / NRVO) Engine (T064 / E15.3).
+// Implements SPEC-73 §3, §8, §9 (AXS-INL-010..013, AXS-INL-034.1, AXS-INL-035):
+//   - Copy propagation for `Copy` types across dominated uses with modification & observability checks (`AXS-INL-010.1`)
+//   - Move propagation & move-chain coalescing with drop-flag folding & linear capability conservation (`AXS-INL-010.2`)
+//   - Deep recursive SROA for `Struct`, `Tuple`, `NoEscape` `Closure` environments, small `[N]T` arrays,
+//     and `Option<T>` / `Result<T, E>` / algebraic `Enum`s (`AXS-INL-011`, `AXS-INL-013`)
+//   - Field-order `Drop` decomposition `(0, 1, ..., k-1)` & partial-move drop elision (`AXS-INL-011` rule 3)
+//   - Direct `RVO`, named `NRVO` (`ReturnEscape` + `NoAlias`), & chained return-slot forwarding (`AXS-INL-012`)
+//   - `PassManager` contract verification, transactional rollback, & deterministic `--emit=inline` SROA printer
+module compiler.opt.sroa
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_TYPE_PATH
+use compiler.hir.hir.HirItem
+use compiler.hir.hir.HirParam
+use compiler.hir.hir.HirType
+use compiler.types.types.AxType
+use compiler.types.types.ClosureCapture
+use compiler.types.types.Thir
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_CHAR
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_ERROR
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_I128
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_NEVER
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_STR
+use compiler.types.types.TY_STRUCT
+use compiler.types.types.TY_TUPLE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_U128
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_USIZE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.capture_at
+use compiler.types.types.type_get
+use compiler.types.types.typeid_at
+use compiler.types.types.typeid_ptr_at
+use compiler.types.types.usize_at
+use compiler.mir.mir.MIR_BB_NONE
+use compiler.mir.mir.MIR_CONST_BOOL
+use compiler.mir.mir.MIR_CONST_INT
+use compiler.mir.mir.MIR_CONST_UNIT
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_RETURN
+use compiler.mir.mir.MIR_LOCAL_TEMP
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_DOWNCAST
+use compiler.mir.mir.MIR_PROJ_FIELD
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_VIEW_MUT
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirConst
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.mir_add_local
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_bb_push_stmt
+use compiler.mir.mir.mir_clone_place
+use compiler.mir.mir.mir_copy_const
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_copy_proj
+use compiler.mir.mir.mir_copy_rvalue
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_const_int
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_op_move_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_rvalue_reset
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.verify.verifier.verify_mir
+use compiler.verify.verifier.verify_safe_type_get
+use compiler.opt.optir.ANALYSIS_ALIAS_INFO
+use compiler.opt.optir.ANALYSIS_CFG
+use compiler.opt.optir.ANALYSIS_DOMINATORS
+use compiler.opt.optir.ANALYSIS_ESCAPE_INFO
+use compiler.opt.optir.ANALYSIS_MEMORY_SSA
+use compiler.opt.optir.ANALYSIS_SSA
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.OPT_INST_ADDR_OF
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_NO_ALIAS
+use compiler.opt.optir.PROP_NO_ESCAPE
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.opt_typeid_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.effect_infer_body
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_ESCAPE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_ERR_CAPABILITY_PROMOTION
+use compiler.opt.passmgr.CONTRACT_ERR_POSTCOND_CFG_DOM
+use compiler.opt.passmgr.CONTRACT_ERR_POSTCOND_EFFECTS
+use compiler.opt.passmgr.CONTRACT_ERR_POSTCOND_MIR_VERIFY
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.PASS_GVN_CSE
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.POSTCOND_CAPABILITY_PRESERVED
+use compiler.opt.passmgr.POSTCOND_CFG_VALID
+use compiler.opt.passmgr.POSTCOND_DOM_VALID
+use compiler.opt.passmgr.POSTCOND_EFFECTS_PRESERVED
+use compiler.opt.passmgr.POSTCOND_MEMSSA_VALID
+use compiler.opt.passmgr.POSTCOND_SSA_VALID
+use compiler.opt.passmgr.POSTCOND_VERIFIED_MIR
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_PURE_CALL
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.analysis_bit
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_contract_for_pass
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.passmgr.passmgr_verify_postconditions
+use compiler.opt.escape.ESCAPE_NO_ESCAPE
+use compiler.opt.escape.ESCAPE_RETURN_ESCAPE
+use compiler.opt.escape.EscapeInfo
+use compiler.opt.escape.EscapeSummaryTable
+use compiler.opt.escape.escape_build_info
+use compiler.opt.escape.escape_local_at
+use compiler.opt.escape.escape_type_byte_size
+use compiler.opt.const_fold.opt_const_fold
+use compiler.opt.dce.opt_dce_in_arena
+use compiler.opt.cfg_simp.opt_cfg_simplify_with_merge
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifier & TransformationContract (`SPEC-73 AXS-INL-034.1`) ---
+
+pub const PASS_COPY_MOVE_SROA: u16 = 13u16;
+
+pub fn sroa_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_COPY_MOVE_SROA,
+        required_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                           ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO |
+                           ANALYSIS_MASK_EFFECT_INFO | ANALYSIS_MASK_ESCAPE_INFO,
+        required_proofs: PROP_MASK_NO_ESCAPE | PROP_MASK_NO_ALIAS,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS,
+        invalidated_analyses: ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO |
+                              ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_PURE_CALL,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- SROA, Copy/Move Propagation, and RVO/NRVO Constants (`SPEC-73 §3, §9.2`) ---
+
+pub const MAX_SROA_LEAVES: u32 = 32u32;
+pub const MAX_SROA_ARRAY_LEN: u64 = 8u64;
+pub const SROA_NONE_IDX: u32 = 0xFFFFFFFFu32;
+
+pub const SROA_DECISION_NONE: u8 = 0u8;
+pub const SROA_DECISION_SCALARIZED: u8 = 1u8;
+pub const SROA_DECISION_BLOCKED: u8 = 2u8;
+pub const SROA_DECISION_RVO: u8 = 3u8;
+pub const SROA_DECISION_NRVO: u8 = 4u8;
+pub const SROA_DECISION_COPY_PROP: u8 = 5u8;
+pub const SROA_DECISION_MOVE_PROP: u8 = 6u8;
+
+pub const SROA_BLOCK_NONE: u8 = 0u8;
+pub const SROA_BLOCK_ESCAPE: u8 = 1u8;
+pub const SROA_BLOCK_ADDR_OBSERVABLE: u8 = 2u8;
+pub const SROA_BLOCK_VOLATILE_MMIO_PINNED: u8 = 3u8;
+pub const SROA_BLOCK_DYNAMIC_INDEX: u8 = 4u8;
+pub const SROA_BLOCK_LEAF_LIMIT: u8 = 5u8;
+pub const SROA_BLOCK_OPAQUE_WHOLE_USE: u8 = 6u8;
+pub const SROA_BLOCK_OPAQUE_DROP: u8 = 7u8;
+pub const SROA_BLOCK_ALIAS_CONFLICT: u8 = 8u8;
+pub const SROA_BLOCK_MULTI_RETURN_CONFLICT: u8 = 9u8;
+
+pub const SROA_AGG_NONE: u8 = 0u8;
+pub const SROA_AGG_STRUCT: u8 = 1u8;
+pub const SROA_AGG_TUPLE: u8 = 2u8;
+pub const SROA_AGG_CLOSURE: u8 = 3u8;
+pub const SROA_AGG_ARRAY: u8 = 4u8;
+pub const SROA_AGG_ENUM: u8 = 5u8;
+
+// --- SROA Data Structures ---
+
+@derive(Copy)
+pub struct SroaLeafDesc {
+    pub owner_local: u32,
+    pub slot_idx: u32,
+    pub variant_idx: u32,
+    pub field_idx: u32,
+    pub leaf_ty: TypeId,
+    pub leaf_local: u32,
+    pub is_enum_discr: bool,
+    pub needs_drop: bool,
+}
+
+@derive(Copy)
+pub struct SroaLocalPlan {
+    pub local_id: u32,
+    pub agg_kind: u8,
+    pub eligible: bool,
+    pub scalarized: bool,
+    pub block_reason: u8,
+    pub leaf_base: u32,
+    pub leaf_count: u32,
+    pub total_recursive_leaves: u32,
+    pub discr_leaf_local: u32,
+    pub size_bytes: u64,
+}
+
+pub struct SroaInfo {
+    pub fn_sym: SymbolId,
+    pub local_count: usize,
+    pub plans: *mut SroaLocalPlan,
+    pub leaves: *mut SroaLeafDesc,
+    pub leaf_count: usize,
+    pub leaf_cap: usize,
+    pub rvo_applied: bool,
+    pub nrvo_applied: bool,
+    pub nrvo_local: u32,
+}
+
+@derive(Copy)
+pub struct SroaDecisionRecord {
+    pub decision: u8,
+    pub block_reason: u8,
+    pub agg_kind: u8,
+    pub local_id: u32,
+    pub target_local: u32,
+    pub leaf_count: u32,
+    pub bb_idx: u32,
+}
+
+@derive(Copy)
+pub struct SroaStats {
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+    pub copy_propagations: u32,
+    pub move_propagations: u32,
+    pub move_chains_coalesced: u32,
+    pub drop_flags_folded: u32,
+    pub sroa_aggregates_scalarized: u32,
+    pub sroa_leaves_created: u32,
+    pub sroa_blocked_count: u32,
+    pub sroa_drops_decomposed: u32,
+    pub rvo_promotions: u32,
+    pub nrvo_promotions: u32,
+}
+
+pub struct SroaDecisionLog {
+    pub records: *mut SroaDecisionRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+// --- Pointer Indexing Helpers ---
+
+fn sroa_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn sroa_plan_at(base: *mut SroaLocalPlan, idx: usize) -> *mut SroaLocalPlan {
+    let off = sroa_mul_usize(idx, size_of<SroaLocalPlan>());
+    ((base as usize) + off) as *mut SroaLocalPlan
+}
+
+pub unsafe fn sroa_leaf_at(base: *mut SroaLeafDesc, idx: usize) -> *mut SroaLeafDesc {
+    let off = sroa_mul_usize(idx, size_of<SroaLeafDesc>());
+    ((base as usize) + off) as *mut SroaLeafDesc
+}
+
+pub unsafe fn sroa_record_at(base: *mut SroaDecisionRecord, idx: usize) -> *mut SroaDecisionRecord {
+    let off = sroa_mul_usize(idx, size_of<SroaDecisionRecord>());
+    ((base as usize) + off) as *mut SroaDecisionRecord
+}
+
+unsafe fn sroa_u8_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+unsafe fn sroa_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = sroa_mul_usize(idx, size_of<u32>());
+    ((base as usize) + off) as *mut u32
+}
+
+unsafe fn sroa_u64_at(base: *mut u64, idx: usize) -> *mut u64 {
+    let off = sroa_mul_usize(idx, size_of<u64>());
+    ((base as usize) + off) as *mut u64
+}
+
+unsafe fn sroa_bool_at(base: *mut bool, idx: usize) -> *mut bool {
+    let off = sroa_mul_usize(idx, size_of<bool>());
+    ((base as usize) + off) as *mut bool
+}
+
+fn sroa_zero_bytes(ptr: *mut u8, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        unsafe { *sroa_u8_at(ptr, i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+pub fn sroa_stats_zero() -> SroaStats {
+    SroaStats {
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+        copy_propagations: 0u32,
+        move_propagations: 0u32,
+        move_chains_coalesced: 0u32,
+        drop_flags_folded: 0u32,
+        sroa_aggregates_scalarized: 0u32,
+        sroa_leaves_created: 0u32,
+        sroa_blocked_count: 0u32,
+        sroa_drops_decomposed: 0u32,
+        rvo_promotions: 0u32,
+        nrvo_promotions: 0u32,
+    }
+}
+
+pub fn sroa_log_init(log: mut_view<SroaDecisionLog>, arena: mut_view<Arena>, initial_cap: usize) {
+    let cap: usize = if initial_cap == 0 { 16 } else { initial_cap };
+    log.records = arena_alloc_raw(
+        mut_view(*arena),
+        sroa_mul_usize(cap, size_of<SroaDecisionRecord>()),
+        align_of<SroaDecisionRecord>()
+    ) as *mut SroaDecisionRecord;
+    log.count = 0;
+    log.cap = cap;
+}
+
+pub fn sroa_log_new(arena: mut_view<Arena>, initial_cap: usize) -> *mut SroaDecisionLog {
+    let log_ptr = arena_alloc_raw(mut_view(*arena), size_of<SroaDecisionLog>(), align_of<SroaDecisionLog>()) as *mut SroaDecisionLog;
+    sroa_log_init(unsafe { mut_view(*log_ptr) }, mut_view(*arena), initial_cap);
+    log_ptr
+}
+
+pub fn sroa_log_push(log: *mut SroaDecisionLog, arena: mut_view<Arena>, rec: SroaDecisionRecord) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 16 } else { cap + cap };
+        let new_buf = arena_alloc_raw(
+            mut_view(*arena),
+            sroa_mul_usize(new_cap, size_of<SroaDecisionRecord>()),
+            align_of<SroaDecisionRecord>()
+        ) as *mut SroaDecisionRecord;
+        if cnt > 0 && (unsafe { (*log).records as usize }) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<SroaDecisionRecord>(
+                    (*log).records as *const SroaDecisionRecord,
+                    new_buf,
+                    cnt
+                );
+            }
+        }
+        unsafe {
+            (*log).records = new_buf;
+            (*log).cap = new_cap;
+        }
+    }
+    unsafe {
+        let dst = sroa_record_at((*log).records, cnt);
+        *dst = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+fn sroa_info_push_leaf(info: mut_view<SroaInfo>, arena: mut_view<Arena>, desc: SroaLeafDesc) -> u32 {
+    let cnt = info.leaf_count;
+    let cap = info.leaf_cap;
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 32 } else { cap + cap };
+        let new_buf = arena_alloc_raw(
+            mut_view(*arena),
+            sroa_mul_usize(new_cap, size_of<SroaLeafDesc>()),
+            align_of<SroaLeafDesc>()
+        ) as *mut SroaLeafDesc;
+        if cnt > 0 && (info.leaves as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<SroaLeafDesc>(
+                    info.leaves as *const SroaLeafDesc,
+                    new_buf,
+                    cnt
+                );
+            }
+        }
+        info.leaves = new_buf;
+        info.leaf_cap = new_cap;
+    }
+    unsafe {
+        *sroa_leaf_at(info.leaves, cnt) = desc;
+    }
+    info.leaf_count = cnt + 1;
+    cnt as u32
+}
+
+// --- Type Classification: `Copy`, `Drop`, Aggregate Kind, & Recursive Leaf Count ---
+
+fn sroa_type_is_copy_depth(thir: *const Thir, ty: TypeId, depth: u32) -> bool {
+    if (thir as usize) == 0 || ty.v == 0u32 || depth > 12u32 {
+        return false;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, ty);
+    if (tp as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*tp).kind };
+    if tk == TY_UNIT || tk == TY_NEVER || tk == TY_BOOL || tk == TY_CHAR ||
+       tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 || tk == TY_I128 || tk == TY_ISIZE ||
+       tk == TY_U8 || tk == TY_U16 || tk == TY_U32 || tk == TY_U64 || tk == TY_U128 || tk == TY_USIZE ||
+       tk == TY_PTR || tk == TY_FN || tk == TY_VIEW || tk == TY_STR || tk == TY_SLICE {
+        return true;
+    }
+    // `mut_view<T>` is a linear capability and is NEVER `Copy` (`AXS-INL-010.2`)
+    if tk == TY_MUT_VIEW {
+        return false;
+    }
+    if tk == TY_ARRAY {
+        return sroa_type_is_copy_depth(thir, TypeId { v: unsafe { (*tp).elem.v } }, depth + 1u32);
+    }
+    if tk == TY_TUPLE {
+        let fcnt = unsafe { (*tp).field_count };
+        let flds = unsafe { (*tp).fields };
+        let mut i: usize = 0;
+        while i < fcnt && (flds as usize) != 0 {
+            let fty = TypeId { v: unsafe { (*typeid_at(flds, i)).v } };
+            if !sroa_type_is_copy_depth(thir, fty, depth + 1u32) {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn sroa_type_is_copy(thir: *const Thir, ty: TypeId) -> bool {
+    sroa_type_is_copy_depth(thir, ty, 0u32)
+}
+
+fn sroa_type_is_linear_capability(thir: *const Thir, ty: TypeId, depth: u32) -> bool {
+    if (thir as usize) == 0 || ty.v == 0u32 || depth > 12u32 {
+        return false;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, ty);
+    if (tp as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*tp).kind };
+    if tk == TY_VIEW || tk == TY_MUT_VIEW {
+        return true;
+    }
+    if tk == TY_STRUCT || tk == TY_TUPLE {
+        let fcnt = unsafe { (*tp).field_count };
+        let flds = unsafe { (*tp).fields };
+        let mut i: usize = 0;
+        while i < fcnt && (flds as usize) != 0 {
+            let fty = TypeId { v: unsafe { (*typeid_at(flds, i)).v } };
+            if sroa_type_is_linear_capability(thir, fty, depth + 1u32) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    false
+}
+
+pub fn sroa_type_agg_kind(thir: *const Thir, ty: TypeId) -> u8 {
+    if (thir as usize) == 0 || ty.v == 0u32 {
+        return SROA_AGG_NONE;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, ty);
+    if (tp as usize) == 0 {
+        return SROA_AGG_NONE;
+    }
+    let tk = unsafe { (*tp).kind };
+    if tk == TY_STRUCT {
+        if (unsafe { (*tp).field_count }) > 0 && (unsafe { (*tp).fields as usize }) != 0 {
+            return SROA_AGG_STRUCT;
+        }
+        return SROA_AGG_NONE;
+    }
+    if tk == TY_TUPLE {
+        if (unsafe { (*tp).field_count }) > 0 && (unsafe { (*tp).fields as usize }) != 0 {
+            return SROA_AGG_TUPLE;
+        }
+        return SROA_AGG_NONE;
+    }
+    if tk == TY_CLOSURE {
+        return SROA_AGG_CLOSURE;
+    }
+    if tk == TY_ARRAY {
+        let alen = unsafe { (*tp).array_len };
+        if alen > 0u64 && (unsafe { (*tp).elem.v }) != 0u32 {
+            return SROA_AGG_ARRAY;
+        }
+        return SROA_AGG_NONE;
+    }
+    if tk == TY_ENUM {
+        if (unsafe { (*tp).variant_count }) > 0 {
+            return SROA_AGG_ENUM;
+        }
+        return SROA_AGG_NONE;
+    }
+    SROA_AGG_NONE
+}
+
+fn sroa_count_recursive_leaves_depth(thir: *const Thir, ty: TypeId, depth: u32) -> u32 {
+    if (thir as usize) == 0 || ty.v == 0u32 || depth > 8u32 {
+        return 1u32;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, ty);
+    if (tp as usize) == 0 {
+        return 1u32;
+    }
+    let tk = unsafe { (*tp).kind };
+    if tk == TY_STRUCT || tk == TY_TUPLE {
+        let fcnt = unsafe { (*tp).field_count };
+        let flds = unsafe { (*tp).fields };
+        if fcnt == 0 || (flds as usize) == 0 {
+            return 1u32;
+        }
+        let mut total: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < fcnt {
+            let fty = TypeId { v: unsafe { (*typeid_at(flds, i)).v } };
+            total = total + sroa_count_recursive_leaves_depth(thir, fty, depth + 1u32);
+            if total > 256u32 {
+                return total;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+    if tk == TY_CLOSURE {
+        let ccnt = unsafe { (*tp).capture_count };
+        let caps = unsafe { (*tp).captures };
+        let mut total: u32 = 1u32; // fn_ptr slot
+        let mut i: usize = 0;
+        while i < ccnt && (caps as usize) != 0 {
+            let cp = unsafe { capture_at(caps, i) };
+            let cty = TypeId { v: unsafe { (*cp).ty.v } };
+            total = total + sroa_count_recursive_leaves_depth(thir, cty, depth + 1u32);
+            if total > 256u32 {
+                return total;
+            }
+            i = i + 1;
+        }
+        return total;
+    }
+    if tk == TY_ARRAY {
+        let alen = unsafe { (*tp).array_len };
+        if alen == 0u64 || alen > MAX_SROA_ARRAY_LEN {
+            return (MAX_SROA_LEAVES + 1u32);
+        }
+        let elem_leaves = sroa_count_recursive_leaves_depth(thir, TypeId { v: unsafe { (*tp).elem.v } }, depth + 1u32);
+        return (alen as u32) * elem_leaves;
+    }
+    if tk == TY_ENUM {
+        let vcnt = unsafe { (*tp).variant_count };
+        let vflds = unsafe { (*tp).variant_fields };
+        let vcnts = unsafe { (*tp).variant_field_counts };
+        let mut total: u32 = 1u32; // discriminant leaf
+        let mut v: usize = 0;
+        while v < vcnt && (vflds as usize) != 0 && (vcnts as usize) != 0 {
+            let fc = unsafe { *usize_at(vcnts, v) };
+            let fp = unsafe { *typeid_ptr_at(vflds, v) };
+            let mut f: usize = 0;
+            while f < fc && (fp as usize) != 0 {
+                let fty = TypeId { v: unsafe { (*typeid_at(fp, f)).v } };
+                total = total + sroa_count_recursive_leaves_depth(thir, fty, depth + 1u32);
+                if total > 256u32 {
+                    return total;
+                }
+                f = f + 1;
+            }
+            v = v + 1;
+        }
+        return total;
+    }
+    1u32
+}
+
+pub fn sroa_count_recursive_leaves(thir: *const Thir, ty: TypeId) -> u32 {
+    sroa_count_recursive_leaves_depth(thir, ty, 0u32)
+}
+
+// --- MIR Place, Rvalue, Statement & Terminator Inspection Helpers ---
+
+fn sroa_rvalue_has_use_op(rvk: u8) -> bool {
+    rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_REPEAT || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP
+}
+
+fn sroa_rvalue_has_bin_ops(rvk: u8) -> bool {
+    rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP
+}
+
+fn sroa_place_proj_uses_local(pl: view<MirPlace>, loc_v: u32) -> bool {
+    let mut p: usize = 0;
+    while p < pl.proj_count && (pl.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(pl.projs, p) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX && (unsafe { (*pr).index_local.v }) == loc_v {
+            return true;
+        }
+        if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) && (unsafe { (*pr).from_local.v }) == loc_v {
+                return true;
+            }
+            if (unsafe { (*pr).has_to }) && (unsafe { (*pr).to_local.v }) == loc_v {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    false
+}
+
+fn sroa_place_uses_local(pl: view<MirPlace>, loc_v: u32) -> bool {
+    if pl.local.v == loc_v {
+        return true;
+    }
+    sroa_place_proj_uses_local(pl, loc_v)
+}
+
+fn sroa_operand_uses_local(op: view<MirOperand>, loc_v: u32) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return sroa_place_uses_local(view(op.place), loc_v);
+    }
+    false
+}
+
+fn sroa_rvalue_uses_local(rv: view<MirRvalue>, loc_v: u32) -> bool {
+    let rvk = rv.kind;
+    if rvk == MIR_RVALUE_REPEAT && (rv.repeat_count_op as usize) != 0 {
+        if sroa_operand_uses_local(unsafe { view(*rv.repeat_count_op) }, loc_v) {
+            return true;
+        }
+    }
+    if sroa_rvalue_has_use_op(rvk) {
+        return sroa_operand_uses_local(view(rv.use_op), loc_v);
+    }
+    if sroa_rvalue_has_bin_ops(rvk) {
+        return sroa_operand_uses_local(view(rv.lhs), loc_v) ||
+               sroa_operand_uses_local(view(rv.rhs), loc_v);
+    }
+    if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+        return sroa_place_uses_local(view(rv.place), loc_v);
+    }
+    if rvk == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < rv.operand_count && (rv.operands as usize) != 0 {
+            let op_p = unsafe { mir_op_at(rv.operands, i) };
+            if sroa_operand_uses_local(unsafe { view(*op_p) }, loc_v) {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    false
+}
+
+fn sroa_mir_remove_stmt_at(bb: mut_view<MirBb>, idx: usize) {
+    let cnt = bb.stmt_count;
+    if idx >= cnt || (bb.stmts as usize) == 0 {
+        return;
+    }
+    let mut k: usize = idx;
+    while k + 1 < cnt {
+        unsafe {
+            let dst = mir_stmt_at(bb.stmts, k);
+            let src = mir_stmt_at(bb.stmts, k + 1);
+            mir_copy_stmt(mut_view(*dst), view(*src));
+        }
+        k = k + 1;
+    }
+    bb.stmt_count = cnt - 1;
+}
+
+fn sroa_local_is_borrowed_in_mir(mir: view<MirBody>, loc_v: u32) -> bool {
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_REF &&
+               (unsafe { (*st).rvalue.place.local.v }) == loc_v {
+                return true;
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    false
+}
+
+fn sroa_local_has_drop_in_mir(mir: view<MirBody>, loc_v: u32) -> bool {
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_DROP && (unsafe { (*st).place.local.v }) == loc_v {
+                return true;
+            }
+            if sk == MIR_STMT_ASSIGN {
+                if (unsafe { (*st).place.local.v }) == loc_v &&
+                   (unsafe { (*st).place.drop_flag }) != MIR_DROP_FLAG_NONE {
+                    return true;
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_DROP && (unsafe { (*bb).terminator.drop_place.local.v }) == loc_v {
+                return true;
+            }
+        }
+        b = b + 1;
+    }
+    false
+}
+
+fn sroa_count_local_defs(mir: view<MirBody>, loc_v: u32) -> u32 {
+    let mut defs: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).place.local.v }) == loc_v {
+                defs = defs + 1u32;
+            }
+            s = s + 1;
+        }
+        if (unsafe { (*bb).has_terminator }) &&
+           (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL &&
+           (unsafe { (*bb).terminator.has_destination }) &&
+           (unsafe { (*bb).terminator.destination.local.v }) == loc_v {
+            defs = defs + 1u32;
+        }
+        b = b + 1;
+    }
+    defs
+}
+
+fn sroa_count_local_uses(mir: view<MirBody>, loc_v: u32) -> u32 {
+    let mut uses: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                if sroa_place_proj_uses_local(unsafe { view((*st).place) }, loc_v) {
+                    uses = uses + 1u32;
+                }
+                if (unsafe { (*st).place.local.v }) == loc_v &&
+                   (unsafe { (*st).place.proj_count }) > 0 &&
+                   (unsafe { (*st).place.projs as usize }) != 0 &&
+                   (unsafe { (*mir_proj_at((*st).place.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                    uses = uses + 1u32;
+                }
+                let rv = unsafe { view((*st).rvalue) };
+                let rvk = rv.kind;
+                if rvk == MIR_RVALUE_REPEAT && (rv.repeat_count_op as usize) != 0 {
+                    if sroa_operand_uses_local(unsafe { view(*rv.repeat_count_op) }, loc_v) {
+                        uses = uses + 1u32;
+                    }
+                }
+                if sroa_rvalue_has_use_op(rvk) {
+                    if sroa_operand_uses_local(view(rv.use_op), loc_v) {
+                        uses = uses + 1u32;
+                    }
+                } else if sroa_rvalue_has_bin_ops(rvk) {
+                    if sroa_operand_uses_local(view(rv.lhs), loc_v) {
+                        uses = uses + 1u32;
+                    }
+                    if sroa_operand_uses_local(view(rv.rhs), loc_v) {
+                        uses = uses + 1u32;
+                    }
+                } else if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+                    if sroa_place_uses_local(view(rv.place), loc_v) {
+                        uses = uses + 1u32;
+                    }
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let mut oi: usize = 0;
+                    while oi < rv.operand_count && (rv.operands as usize) != 0 {
+                        let op_p = unsafe { mir_op_at(rv.operands, oi) };
+                        if sroa_operand_uses_local(unsafe { view(*op_p) }, loc_v) {
+                            uses = uses + 1u32;
+                        }
+                        oi = oi + 1;
+                    }
+                }
+            } else if sk == MIR_STMT_DROP {
+                if sroa_place_uses_local(unsafe { view((*st).place) }, loc_v) {
+                    uses = uses + 1u32;
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tm = unsafe { view((*bb).terminator) };
+            let tk = tm.kind;
+            if tk == MIR_TERM_SWITCH_INT {
+                if sroa_operand_uses_local(view(tm.discr), loc_v) {
+                    uses = uses + 1u32;
+                }
+            } else if tk == MIR_TERM_ASSERT {
+                if sroa_operand_uses_local(view(tm.cond), loc_v) {
+                    uses = uses + 1u32;
+                }
+            } else if tk == MIR_TERM_DROP {
+                if sroa_place_uses_local(view(tm.drop_place), loc_v) {
+                    uses = uses + 1u32;
+                }
+            } else if tk == MIR_TERM_CALL {
+                if sroa_operand_uses_local(view(tm.func), loc_v) {
+                    uses = uses + 1u32;
+                }
+                let mut ai: usize = 0;
+                while ai < tm.arg_count && (tm.args as usize) != 0 {
+                    let ap = unsafe { mir_op_at(tm.args, ai) };
+                    if sroa_operand_uses_local(unsafe { view(*ap) }, loc_v) {
+                        uses = uses + 1u32;
+                    }
+                    ai = ai + 1;
+                }
+                if tm.has_destination {
+                    if sroa_place_proj_uses_local(view(tm.destination), loc_v) {
+                        uses = uses + 1u32;
+                    }
+                    if tm.destination.local.v == loc_v &&
+                       tm.destination.proj_count > 0 &&
+                       (tm.destination.projs as usize) != 0 &&
+                       (unsafe { (*mir_proj_at(tm.destination.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                        uses = uses + 1u32;
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+    uses
+}
+
+fn sroa_eval_const_index_local(mir: view<MirBody>, idx_loc: u32, out_ok: mut_view<bool>) -> u64 {
+    *out_ok = false;
+    if (idx_loc as usize) >= mir.local_count {
+        return 0u64;
+    }
+    if sroa_count_local_defs(mir, idx_loc) != 1u32 {
+        return 0u64;
+    }
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).place.local.v }) == idx_loc &&
+               (unsafe { (*st).place.proj_count }) == 0 &&
+               (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+               (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST &&
+               (unsafe { (*st).rvalue.use_op.constant.kind }) == MIR_CONST_INT {
+                *out_ok = true;
+                return unsafe { (*st).rvalue.use_op.constant.val };
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    0u64
+}
+
+// --- Section 1: Ownership- & Capability-Aware Copy and Move Propagation (`SPEC-73 §3.1, AXS-INL-010`) ---
+
+fn sroa_replace_local_in_operand(
+    op: mut_view<MirOperand>,
+    from_local: u32,
+    to_op: view<MirOperand>,
+    is_move_coalesce: bool
+) -> bool {
+    if (op.kind != MIR_OP_COPY && op.kind != MIR_OP_MOVE) || op.place.local.v != from_local {
+        return false;
+    }
+    if op.place.proj_count != 0 || op.place.drop_flag != MIR_DROP_FLAG_NONE {
+        return false;
+    }
+    if to_op.kind == MIR_OP_CONST {
+        op.kind = MIR_OP_CONST;
+        mir_copy_const(mut_view(op.constant), view(to_op.constant));
+        op.place = mir_local_place(0u32);
+        return true;
+    }
+    if (to_op.kind == MIR_OP_COPY || to_op.kind == MIR_OP_MOVE) &&
+       to_op.place.proj_count == 0 && to_op.place.drop_flag == MIR_DROP_FLAG_NONE {
+        op.place.local.v = to_op.place.local.v;
+        if is_move_coalesce {
+            op.kind = to_op.kind;
+        }
+        return true;
+    }
+    false
+}
+
+fn sroa_replace_local_in_stmt_reads(
+    st: mut_view<MirStmt>,
+    from_local: u32,
+    to_op: view<MirOperand>,
+    is_move_coalesce: bool
+) -> u32 {
+    if st.kind != MIR_STMT_ASSIGN {
+        return 0u32;
+    }
+    let mut cnt: u32 = 0u32;
+    let rvk = st.rvalue.kind;
+    if rvk == MIR_RVALUE_REPEAT && (st.rvalue.repeat_count_op as usize) != 0 {
+        if sroa_replace_local_in_operand(unsafe { mut_view(*st.rvalue.repeat_count_op) }, from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+    }
+    if sroa_rvalue_has_use_op(rvk) {
+        if sroa_replace_local_in_operand(mut_view(st.rvalue.use_op), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+    } else if sroa_rvalue_has_bin_ops(rvk) {
+        if sroa_replace_local_in_operand(mut_view(st.rvalue.lhs), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+        if sroa_replace_local_in_operand(mut_view(st.rvalue.rhs), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+    } else if (rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT) &&
+              (to_op.kind == MIR_OP_COPY || to_op.kind == MIR_OP_MOVE) &&
+              to_op.place.proj_count == 0 && to_op.place.drop_flag == MIR_DROP_FLAG_NONE {
+        if st.rvalue.place.local.v == from_local && st.rvalue.place.drop_flag == MIR_DROP_FLAG_NONE {
+            st.rvalue.place.local.v = to_op.place.local.v;
+            cnt = cnt + 1u32;
+        }
+    } else if rvk == MIR_RVALUE_AGGREGATE {
+        let mut i: usize = 0;
+        while i < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+            let op_p = unsafe { mir_op_at(st.rvalue.operands, i) };
+            if sroa_replace_local_in_operand(unsafe { mut_view(*op_p) }, from_local, to_op, is_move_coalesce) {
+                cnt = cnt + 1u32;
+            }
+            i = i + 1;
+        }
+    }
+    // Also rewrite index_local in projections if `to_op` is a local
+    if (to_op.kind == MIR_OP_COPY || to_op.kind == MIR_OP_MOVE) &&
+       to_op.place.proj_count == 0 && to_op.place.drop_flag == MIR_DROP_FLAG_NONE {
+        let mut p: usize = 0;
+        while p < st.place.proj_count && (st.place.projs as usize) != 0 {
+            let pr = unsafe { mir_proj_at(st.place.projs, p) };
+            if (unsafe { (*pr).kind }) == MIR_PROJ_INDEX && (unsafe { (*pr).index_local.v }) == from_local {
+                unsafe { (*pr).index_local.v = to_op.place.local.v; }
+                cnt = cnt + 1u32;
+            }
+            p = p + 1;
+        }
+    }
+    cnt
+}
+
+fn sroa_replace_local_in_term_reads(
+    bb: mut_view<MirBb>,
+    from_local: u32,
+    to_op: view<MirOperand>,
+    is_move_coalesce: bool
+) -> u32 {
+    if !bb.has_terminator {
+        return 0u32;
+    }
+    let mut cnt: u32 = 0u32;
+    let tk = bb.terminator.kind;
+    if tk == MIR_TERM_SWITCH_INT {
+        if sroa_replace_local_in_operand(mut_view(bb.terminator.discr), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+    } else if tk == MIR_TERM_ASSERT {
+        if sroa_replace_local_in_operand(mut_view(bb.terminator.cond), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+    } else if tk == MIR_TERM_CALL {
+        if sroa_replace_local_in_operand(mut_view(bb.terminator.func), from_local, to_op, is_move_coalesce) {
+            cnt = cnt + 1u32;
+        }
+        let mut ai: usize = 0;
+        while ai < bb.terminator.arg_count && (bb.terminator.args as usize) != 0 {
+            let ap = unsafe { mir_op_at(bb.terminator.args, ai) };
+            if sroa_replace_local_in_operand(unsafe { mut_view(*ap) }, from_local, to_op, is_move_coalesce) {
+                cnt = cnt + 1u32;
+            }
+            ai = ai + 1;
+        }
+    }
+    cnt
+}
+
+fn sroa_stmt_modifies_or_kills_local(st: view<MirStmt>, loc_v: u32, is_cap: bool) -> bool {
+    let sk = st.kind;
+    if sk == MIR_STMT_STORAGE_DEAD {
+        if st.storage_local.v == loc_v {
+            return true;
+        }
+        // Capability lifetime conservation (`AXS-INL-010.2` rule 4):
+        // Never propagate a `view<T>` / `mut_view<T>` across any `StorageDead` of a potential borrowed owner
+        if is_cap {
+            return true;
+        }
+    }
+    if sk == MIR_STMT_DROP {
+        if sroa_place_uses_local(view(st.place), loc_v) {
+            return true;
+        }
+    }
+    if sk == MIR_STMT_ASSIGN {
+        if st.place.local.v == loc_v {
+            return true;
+        }
+        if st.rvalue.kind == MIR_RVALUE_REF && st.rvalue.place.local.v == loc_v {
+            return true;
+        }
+        // Moving out of `loc_v` invalidates subsequent reads of `loc_v`
+        let rvk = st.rvalue.kind;
+        if sroa_rvalue_has_use_op(rvk) && st.rvalue.use_op.kind == MIR_OP_MOVE &&
+           st.rvalue.use_op.place.local.v == loc_v {
+            return true;
+        }
+        if sroa_rvalue_has_bin_ops(rvk) {
+            if (st.rvalue.lhs.kind == MIR_OP_MOVE && st.rvalue.lhs.place.local.v == loc_v) ||
+               (st.rvalue.rhs.kind == MIR_OP_MOVE && st.rvalue.rhs.place.local.v == loc_v) {
+                return true;
+            }
+        }
+        if rvk == MIR_RVALUE_AGGREGATE {
+            let mut i: usize = 0;
+            while i < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+                let op_p = unsafe { mir_op_at(st.rvalue.operands, i) };
+                if (unsafe { (*op_p).kind }) == MIR_OP_MOVE &&
+                   (unsafe { (*op_p).place.local.v }) == loc_v {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    false
+}
+
+pub fn sroa_copy_move_propagate_mir(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    esc_info: *const EscapeInfo,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    if mir.bb_count == 0 || mir.local_count == 0 || (mir.bbs as usize) == 0 || (mir.locals as usize) == 0 {
+        return false;
+    }
+    let mut changed = false;
+
+    // 1. Intra-block Copy Propagation & Single-Use Move / Temporary Coalescing
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).place.proj_count }) == 0 &&
+               (unsafe { (*st).place.drop_flag }) == MIR_DROP_FLAG_NONE {
+                let dst_loc = unsafe { (*st).place.local.v };
+                let dst_ty = TypeId { v: unsafe { (*mir_local_at(mir.locals, dst_loc as usize)).ty.v } };
+                let dst_obs: bool = if (esc_info as usize) != 0 && (dst_loc as usize) < (unsafe { (*esc_info).local_count }) {
+                    let dlp = unsafe { escape_local_at((*esc_info).locals, dst_loc as usize) };
+                    (unsafe { (*dlp).address_observable }) || (unsafe { (*dlp).stable_address }) ||
+                    (unsafe { (*dlp).is_fixed_mmio }) || (unsafe { (*dlp).is_volatile_atomic }) ||
+                    (unsafe { (*dlp).is_zero_copy_pinned }) || (unsafe { (*dlp).borrow_taken })
+                } else {
+                    sroa_local_is_borrowed_in_mir(view(*mir), dst_loc)
+                };
+
+                if !dst_obs && dst_loc != 0u32 {
+                    let rvk = unsafe { (*st).rvalue.kind };
+                    if rvk == MIR_RVALUE_USE {
+                        let uop_kind = unsafe { (*st).rvalue.use_op.kind };
+                        if uop_kind == MIR_OP_CONST {
+                            let is_cap = sroa_type_is_linear_capability(thir, TypeId { v: dst_ty.v }, 0u32);
+                            let mut c_op = mir_op_const_int(0u32, 0u64);
+                            mir_copy_operand(mut_view(c_op), unsafe { view((*st).rvalue.use_op) });
+                            let mut k: usize = s + 1;
+                            let mut killed = false;
+                            let mut prop_cnt: u32 = 0u32;
+                            while k < (unsafe { (*bb).stmt_count }) && !killed {
+                                let kst = unsafe { mir_stmt_at((*bb).stmts, k) };
+                                let nrep = sroa_replace_local_in_stmt_reads(unsafe { mut_view(*kst) }, dst_loc, view(c_op), false);
+                                prop_cnt = prop_cnt + nrep;
+                                if sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, dst_loc, is_cap) {
+                                    killed = true;
+                                }
+                                k = k + 1;
+                            }
+                            if !killed {
+                                prop_cnt = prop_cnt + sroa_replace_local_in_term_reads(unsafe { mut_view(*bb) }, dst_loc, view(c_op), false);
+                            }
+                            if prop_cnt > 0u32 {
+                                stats.copy_propagations = stats.copy_propagations + prop_cnt;
+                                sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                    decision: SROA_DECISION_COPY_PROP,
+                                    block_reason: SROA_BLOCK_NONE,
+                                    agg_kind: SROA_AGG_NONE,
+                                    local_id: dst_loc,
+                                    target_local: 0u32,
+                                    leaf_count: prop_cnt,
+                                    bb_idx: b as u32,
+                                });
+                                changed = true;
+                            }
+                        } else if (uop_kind == MIR_OP_COPY || uop_kind == MIR_OP_MOVE) &&
+                                  (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 &&
+                                  (unsafe { (*st).rvalue.use_op.place.drop_flag }) == MIR_DROP_FLAG_NONE {
+                            let src_loc = unsafe { (*st).rvalue.use_op.place.local.v };
+                            if src_loc != dst_loc && (src_loc as usize) < mir.local_count {
+                                let src_ty = TypeId { v: unsafe { (*mir_local_at(mir.locals, src_loc as usize)).ty.v } };
+                                let src_obs: bool = if (esc_info as usize) != 0 && (src_loc as usize) < (unsafe { (*esc_info).local_count }) {
+                                    let slp = unsafe { escape_local_at((*esc_info).locals, src_loc as usize) };
+                                    (unsafe { (*slp).address_observable }) || (unsafe { (*slp).stable_address }) ||
+                                    (unsafe { (*slp).is_fixed_mmio }) || (unsafe { (*slp).is_volatile_atomic }) ||
+                                    (unsafe { (*slp).is_zero_copy_pinned }) || (unsafe { (*slp).borrow_taken })
+                                } else {
+                                    sroa_local_is_borrowed_in_mir(view(*mir), src_loc)
+                                };
+                                let is_copy_ty = sroa_type_is_copy(thir, TypeId { v: dst_ty.v }) &&
+                                                 sroa_type_is_copy(thir, TypeId { v: src_ty.v });
+                                let is_cap = sroa_type_is_linear_capability(thir, TypeId { v: dst_ty.v }, 0u32) ||
+                                             sroa_type_is_linear_capability(thir, TypeId { v: src_ty.v }, 0u32);
+
+                                if !src_obs && is_copy_ty {
+                                    // Copy propagation (`AXS-INL-010.1`)
+                                    let mut rep_op = mir_op_copy_local(src_loc);
+                                    mir_copy_operand(mut_view(rep_op), unsafe { view((*st).rvalue.use_op) });
+                                    rep_op.kind = MIR_OP_COPY;
+                                    let mut k: usize = s + 1;
+                                    let mut killed = false;
+                                    let mut prop_cnt: u32 = 0u32;
+                                    while k < (unsafe { (*bb).stmt_count }) && !killed {
+                                        let kst = unsafe { mir_stmt_at((*bb).stmts, k) };
+                                        let nrep = sroa_replace_local_in_stmt_reads(unsafe { mut_view(*kst) }, dst_loc, view(rep_op), false);
+                                        prop_cnt = prop_cnt + nrep;
+                                        if sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, dst_loc, is_cap) ||
+                                           sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, src_loc, is_cap) {
+                                            killed = true;
+                                        }
+                                        k = k + 1;
+                                    }
+                                    if !killed {
+                                        prop_cnt = prop_cnt + sroa_replace_local_in_term_reads(unsafe { mut_view(*bb) }, dst_loc, view(rep_op), false);
+                                    }
+                                    if prop_cnt > 0u32 {
+                                        stats.copy_propagations = stats.copy_propagations + prop_cnt;
+                                        sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                            decision: SROA_DECISION_COPY_PROP,
+                                            block_reason: SROA_BLOCK_NONE,
+                                            agg_kind: SROA_AGG_NONE,
+                                            local_id: dst_loc,
+                                            target_local: src_loc,
+                                            leaf_count: prop_cnt,
+                                            bb_idx: b as u32,
+                                        });
+                                        changed = true;
+                                    }
+                                } else if !src_obs && uop_kind == MIR_OP_MOVE &&
+                                          (dst_loc as usize) > mir.arg_count &&
+                                          sroa_count_local_defs(view(*mir), dst_loc) == 1u32 &&
+                                          sroa_count_local_uses(view(*mir), dst_loc) == 1u32 {
+                                    // Single-move conservation & move-chain coalescing (`AXS-INL-010.2`)
+                                    let mut rep_op = mir_op_move_local(src_loc);
+                                    mir_copy_operand(mut_view(rep_op), unsafe { view((*st).rvalue.use_op) });
+                                    rep_op.kind = MIR_OP_MOVE;
+                                    let mut k: usize = s + 1;
+                                    let mut killed = false;
+                                    let mut did_move = false;
+                                    while k < (unsafe { (*bb).stmt_count }) && !killed && !did_move {
+                                        let kst = unsafe { mir_stmt_at((*bb).stmts, k) };
+                                        let sk_k = unsafe { (*kst).kind };
+                                        if sk_k == MIR_STMT_DROP && (unsafe { (*kst).place.local.v }) == dst_loc {
+                                            killed = true;
+                                        } else {
+                                            let nrep = sroa_replace_local_in_stmt_reads(unsafe { mut_view(*kst) }, dst_loc, view(rep_op), true);
+                                            if nrep == 1u32 {
+                                                did_move = true;
+                                            }
+                                            if sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, dst_loc, is_cap) ||
+                                               sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, src_loc, is_cap) {
+                                                killed = true;
+                                            }
+                                        }
+                                        k = k + 1;
+                                    }
+                                    if !killed && !did_move {
+                                        let trep = sroa_replace_local_in_term_reads(unsafe { mut_view(*bb) }, dst_loc, view(rep_op), true);
+                                        if trep == 1u32 {
+                                            did_move = true;
+                                        }
+                                    }
+                                    if did_move {
+                                        sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, s);
+                                        stats.move_propagations = stats.move_propagations + 1u32;
+                                        stats.move_chains_coalesced = stats.move_chains_coalesced + 1u32;
+                                        sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                            decision: SROA_DECISION_MOVE_PROP,
+                                            block_reason: SROA_BLOCK_NONE,
+                                            agg_kind: SROA_AGG_NONE,
+                                            local_id: dst_loc,
+                                            target_local: src_loc,
+                                            leaf_count: 1u32,
+                                            bb_idx: b as u32,
+                                        });
+                                        changed = true;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Move-destination forwarding: `tmp = <rvalue>; ... final_dst = Use(Move/Copy(tmp))`
+                    // where `tmp > arg_count` has 1 def and 1 use, and only StorageLive/StorageDead intervene
+                    if (dst_loc as usize) > mir.arg_count &&
+                       sroa_count_local_defs(view(*mir), dst_loc) == 1u32 &&
+                       sroa_count_local_uses(view(*mir), dst_loc) == 1u32 &&
+                       !sroa_local_has_drop_in_mir(view(*mir), dst_loc) {
+                        let mut m_idx: usize = s + 1;
+                        while m_idx < (unsafe { (*bb).stmt_count }) {
+                            let mst = unsafe { mir_stmt_at((*bb).stmts, m_idx) };
+                            let msk = unsafe { (*mst).kind };
+                            if msk == MIR_STMT_STORAGE_LIVE ||
+                               (msk == MIR_STMT_STORAGE_DEAD && (unsafe { (*mst).storage_local.v }) != dst_loc) {
+                                m_idx = m_idx + 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        if m_idx < (unsafe { (*bb).stmt_count }) {
+                            let next_st = unsafe { mir_stmt_at((*bb).stmts, m_idx) };
+                            if (unsafe { (*next_st).kind }) == MIR_STMT_ASSIGN &&
+                               (unsafe { (*next_st).place.proj_count }) == 0 &&
+                               (unsafe { (*next_st).place.drop_flag }) == MIR_DROP_FLAG_NONE &&
+                               (unsafe { (*next_st).rvalue.kind }) == MIR_RVALUE_USE &&
+                               ((unsafe { (*next_st).rvalue.use_op.kind }) == MIR_OP_MOVE ||
+                                (unsafe { (*next_st).rvalue.use_op.kind }) == MIR_OP_COPY) &&
+                               (unsafe { (*next_st).rvalue.use_op.place.local.v }) == dst_loc &&
+                               (unsafe { (*next_st).rvalue.use_op.place.proj_count }) == 0 &&
+                               (unsafe { (*next_st).rvalue.use_op.place.drop_flag }) == MIR_DROP_FLAG_NONE {
+                                let final_dst = unsafe { (*next_st).place.local.v };
+                                let final_ty = TypeId { v: unsafe { (*mir_local_at(mir.locals, final_dst as usize)).ty.v } };
+                                if final_dst != dst_loc && final_ty.v == dst_ty.v &&
+                                   !sroa_rvalue_uses_local(unsafe { view((*st).rvalue) }, final_dst) {
+                                    unsafe {
+                                        mir_copy_place(mut_view((*st).place), view((*next_st).place));
+                                    }
+                                    sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, m_idx);
+                                    stats.move_propagations = stats.move_propagations + 1u32;
+                                    stats.move_chains_coalesced = stats.move_chains_coalesced + 1u32;
+                                    sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                        decision: SROA_DECISION_MOVE_PROP,
+                                        block_reason: SROA_BLOCK_NONE,
+                                        agg_kind: SROA_AGG_NONE,
+                                        local_id: dst_loc,
+                                        target_local: final_dst,
+                                        leaf_count: 1u32,
+                                        bb_idx: b as u32,
+                                    });
+                                    changed = true;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+
+    // 2. Cross-block single-definition `Copy` / `Const` propagation for unmodified locals (`AXS-INL-010.1`)
+    let mut l: usize = 1;
+    while l < mir.local_count {
+        let loc_v = l as u32;
+        let lty = TypeId { v: unsafe { (*mir_local_at(mir.locals, l)).ty.v } };
+        let lty2 = TypeId { v: lty.v };
+        let lkind = unsafe { (*mir_local_at(mir.locals, l)).kind };
+        if lkind != MIR_LOCAL_ARG && sroa_type_is_copy(thir, lty) &&
+           !sroa_type_is_linear_capability(thir, lty2, 0u32) &&
+           !sroa_local_is_borrowed_in_mir(view(*mir), loc_v) &&
+           sroa_count_local_defs(view(*mir), loc_v) == 1u32 &&
+           sroa_count_local_uses(view(*mir), loc_v) > 0u32 {
+            // Find the unique definition in entry block bb0 (which dominates all reachable blocks)
+            let bb0 = unsafe { mir_bb_at(mir.bbs, 0) };
+            let mut def_idx: usize = unsafe { (*bb0).stmt_count };
+            let mut s0: usize = 0;
+            while s0 < (unsafe { (*bb0).stmt_count }) {
+                let st0 = unsafe { mir_stmt_at((*bb0).stmts, s0) };
+                if (unsafe { (*st0).kind }) == MIR_STMT_ASSIGN &&
+                   (unsafe { (*st0).place.local.v }) == loc_v &&
+                   (unsafe { (*st0).place.proj_count }) == 0 &&
+                   (unsafe { (*st0).place.drop_flag }) == MIR_DROP_FLAG_NONE &&
+                   (unsafe { (*st0).rvalue.kind }) == MIR_RVALUE_USE {
+                    def_idx = s0;
+                    break;
+                }
+                s0 = s0 + 1;
+            }
+            if def_idx < (unsafe { (*bb0).stmt_count }) {
+                let def_st = unsafe { mir_stmt_at((*bb0).stmts, def_idx) };
+                let uop = unsafe { view((*def_st).rvalue.use_op) };
+                let mut can_prop = false;
+                let mut rep_op = mir_op_const_int(0u32, 0u64);
+                let mut target_loc: u32 = 0u32;
+                if uop.kind == MIR_OP_CONST {
+                    mir_copy_operand(mut_view(rep_op), uop);
+                    can_prop = true;
+                } else if (uop.kind == MIR_OP_COPY || uop.kind == MIR_OP_MOVE) &&
+                          uop.place.proj_count == 0 && uop.place.drop_flag == MIR_DROP_FLAG_NONE {
+                    let src_v = uop.place.local.v;
+                    if src_v != loc_v && (src_v as usize) < mir.local_count &&
+                       !sroa_local_is_borrowed_in_mir(view(*mir), src_v) {
+                        let src_k = unsafe { (*mir_local_at(mir.locals, src_v as usize)).kind };
+                        let src_defs = sroa_count_local_defs(view(*mir), src_v);
+                        if (src_k == MIR_LOCAL_ARG && src_defs == 0u32) || src_defs == 1u32 {
+                            // Verify `src_v` is not modified after `def_idx` in bb0 or in any other block
+                            let mut src_mod = false;
+                            let mut kb: usize = 0;
+                            while kb < mir.bb_count && !src_mod {
+                                let kbb = unsafe { mir_bb_at(mir.bbs, kb) };
+                                let start_s: usize = if kb == 0 { def_idx + 1 } else { 0 };
+                                let mut ks: usize = start_s;
+                                while ks < (unsafe { (*kbb).stmt_count }) {
+                                    let kst = unsafe { mir_stmt_at((*kbb).stmts, ks) };
+                                    if sroa_stmt_modifies_or_kills_local(unsafe { view(*kst) }, src_v, false) {
+                                        src_mod = true;
+                                    }
+                                    ks = ks + 1;
+                                }
+                                if (unsafe { (*kbb).has_terminator }) &&
+                                   (unsafe { (*kbb).terminator.kind }) == MIR_TERM_CALL &&
+                                   (unsafe { (*kbb).terminator.has_destination }) &&
+                                   (unsafe { (*kbb).terminator.destination.local.v }) == src_v {
+                                    src_mod = true;
+                                }
+                                kb = kb + 1;
+                            }
+                            if !src_mod {
+                                mir_copy_operand(mut_view(rep_op), uop);
+                                rep_op.kind = MIR_OP_COPY;
+                                target_loc = src_v;
+                                can_prop = true;
+                            }
+                        }
+                    }
+                }
+                if can_prop {
+                    let mut prop_cnt: u32 = 0u32;
+                    let mut ob: usize = 1;
+                    while ob < mir.bb_count {
+                        let obb = unsafe { mir_bb_at(mir.bbs, ob) };
+                        let mut os: usize = 0;
+                        while os < (unsafe { (*obb).stmt_count }) {
+                            let ost = unsafe { mir_stmt_at((*obb).stmts, os) };
+                            prop_cnt = prop_cnt + sroa_replace_local_in_stmt_reads(unsafe { mut_view(*ost) }, loc_v, view(rep_op), false);
+                            os = os + 1;
+                        }
+                        prop_cnt = prop_cnt + sroa_replace_local_in_term_reads(unsafe { mut_view(*obb) }, loc_v, view(rep_op), false);
+                        ob = ob + 1;
+                    }
+                    if prop_cnt > 0u32 {
+                        stats.copy_propagations = stats.copy_propagations + prop_cnt;
+                        sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                            decision: SROA_DECISION_COPY_PROP,
+                            block_reason: SROA_BLOCK_NONE,
+                            agg_kind: SROA_AGG_NONE,
+                            local_id: loc_v,
+                            target_local: target_loc,
+                            leaf_count: prop_cnt,
+                            bb_idx: 0u32,
+                        });
+                        changed = true;
+                    }
+                }
+            }
+        }
+        l = l + 1;
+    }
+
+    // 3. Fold intermediate drop flags & eliminate dead assignments/drops/storage markers for 0-use temporaries (`AXS-INL-010.2` rule 2)
+    let mut cl: usize = mir.arg_count + 1;
+    while cl < mir.local_count {
+        let cl_v = cl as u32;
+        if sroa_count_local_uses(view(*mir), cl_v) == 0u32 && !sroa_local_is_borrowed_in_mir(view(*mir), cl_v) {
+            let mut cb: usize = 0;
+            while cb < mir.bb_count {
+                let cbb = unsafe { mir_bb_at(mir.bbs, cb) };
+                let mut cs: usize = 0;
+                while cs < (unsafe { (*cbb).stmt_count }) {
+                    let cst = unsafe { mir_stmt_at((*cbb).stmts, cs) };
+                    let csk = unsafe { (*cst).kind };
+                    if (csk == MIR_STMT_STORAGE_LIVE || csk == MIR_STMT_STORAGE_DEAD) &&
+                       (unsafe { (*cst).storage_local.v }) == cl_v {
+                        sroa_mir_remove_stmt_at(unsafe { mut_view(*cbb) }, cs);
+                        changed = true;
+                        continue;
+                    }
+                    if csk == MIR_STMT_DROP && (unsafe { (*cst).place.local.v }) == cl_v {
+                        sroa_mir_remove_stmt_at(unsafe { mut_view(*cbb) }, cs);
+                        stats.drop_flags_folded = stats.drop_flags_folded + 1u32;
+                        changed = true;
+                        continue;
+                    }
+                    if csk == MIR_STMT_ASSIGN &&
+                       (unsafe { (*cst).place.local.v }) == cl_v &&
+                       (unsafe { (*cst).place.proj_count }) == 0 &&
+                       (unsafe { (*cst).rvalue.kind }) == MIR_RVALUE_USE {
+                        if (unsafe { (*cst).place.drop_flag }) != MIR_DROP_FLAG_NONE {
+                            stats.drop_flags_folded = stats.drop_flags_folded + 1u32;
+                        }
+                        sroa_mir_remove_stmt_at(unsafe { mut_view(*cbb) }, cs);
+                        changed = true;
+                        continue;
+                    }
+                    cs = cs + 1;
+                }
+                if (unsafe { (*cbb).has_terminator }) &&
+                   (unsafe { (*cbb).terminator.kind }) == MIR_TERM_DROP &&
+                   (unsafe { (*cbb).terminator.drop_place.local.v }) == cl_v &&
+                   (unsafe { (*cbb).terminator.drop_place.proj_count }) == 0 {
+                    let dtgt = MirBbId { v: unsafe { (*cbb).terminator.drop_target.v } };
+                    let dsp = unsafe { (*cbb).terminator.span };
+                    mir_term_reset(unsafe { mut_view((*cbb).terminator) }, MIR_TERM_GOTO, view(dsp));
+                    unsafe { (*cbb).terminator.goto_target.v = dtgt.v; }
+                    stats.drop_flags_folded = stats.drop_flags_folded + 1u32;
+                    changed = true;
+                }
+                cb = cb + 1;
+            }
+        }
+        cl = cl + 1;
+    }
+
+    changed
+}
+
+// --- Section 2: Deep Scalar Replacement of Aggregates (`SROA`, `SPEC-73 §3.2, AXS-INL-011`) ---
+
+fn sroa_place_strip_prefix(
+    pl: mut_view<MirPlace>,
+    new_local: u32,
+    strip_count: usize,
+    arena: mut_view<Arena>
+) {
+    pl.local.v = new_local;
+    if pl.proj_count <= strip_count || (pl.projs as usize) == 0 {
+        pl.projs = 0 as *mut MirProjection;
+        pl.proj_count = 0;
+        return;
+    }
+    let rem = pl.proj_count - strip_count;
+    let bytes = sroa_mul_usize(rem, size_of<MirProjection>());
+    let new_projs = arena_alloc_raw(mut_view(*arena), bytes, align_of<MirProjection>()) as *mut MirProjection;
+    let mut i: usize = 0;
+    while i < rem {
+        unsafe {
+            let src = mir_proj_at(pl.projs, strip_count + i);
+            let dst = mir_proj_at(new_projs, i);
+            mir_copy_proj(mut_view(*dst), view(*src));
+        }
+        i = i + 1;
+    }
+    pl.projs = new_projs;
+    pl.proj_count = rem;
+}
+
+fn sroa_resolve_place_leaf(
+    mir: view<MirBody>,
+    plan: view<SroaLocalPlan>,
+    info: view<SroaInfo>,
+    pl: view<MirPlace>,
+    out_strip_count: mut_view<usize>
+) -> u32 {
+    *out_strip_count = 0;
+    if !plan.eligible || pl.proj_count == 0 || (pl.projs as usize) == 0 {
+        return SROA_NONE_IDX;
+    }
+    let p0 = unsafe { mir_proj_at(pl.projs, 0) };
+    let pk0 = unsafe { (*p0).kind };
+    let ak = plan.agg_kind;
+    let base = plan.leaf_base as usize;
+    let cnt = plan.leaf_count as usize;
+
+    if ak == SROA_AGG_STRUCT || ak == SROA_AGG_TUPLE || ak == SROA_AGG_CLOSURE {
+        if pk0 != MIR_PROJ_FIELD {
+            return SROA_NONE_IDX;
+        }
+        let fidx = unsafe { (*p0).field_idx };
+        if (fidx as usize) < cnt && (base + (fidx as usize)) < info.leaf_count {
+            *out_strip_count = 1;
+            let lf = unsafe { sroa_leaf_at(info.leaves, base + (fidx as usize)) };
+            return unsafe { (*lf).leaf_local };
+        }
+        return SROA_NONE_IDX;
+    }
+
+    if ak == SROA_AGG_ARRAY {
+        if pk0 != MIR_PROJ_INDEX {
+            return SROA_NONE_IDX;
+        }
+        let mut idx_ok = false;
+        let idx_val = sroa_eval_const_index_local(mir, unsafe { (*p0).index_local.v }, mut_view(idx_ok));
+        if idx_ok && (idx_val as usize) < cnt && (base + (idx_val as usize)) < info.leaf_count {
+            *out_strip_count = 1;
+            let lf = unsafe { sroa_leaf_at(info.leaves, base + (idx_val as usize)) };
+            return unsafe { (*lf).leaf_local };
+        }
+        return SROA_NONE_IDX;
+    }
+
+    if ak == SROA_AGG_ENUM {
+        if pk0 == MIR_PROJ_DOWNCAST && pl.proj_count >= 2 {
+            let p1 = unsafe { mir_proj_at(pl.projs, 1) };
+            if (unsafe { (*p1).kind }) == MIR_PROJ_FIELD {
+                let vidx = unsafe { (*p0).variant_idx };
+                let fidx = unsafe { (*p1).field_idx };
+                let mut k: usize = 0;
+                while k < cnt && (base + k) < info.leaf_count {
+                    let lf = unsafe { sroa_leaf_at(info.leaves, base + k) };
+                    if !(unsafe { (*lf).is_enum_discr }) &&
+                       (unsafe { (*lf).variant_idx }) == vidx &&
+                       (unsafe { (*lf).field_idx }) == fidx {
+                        *out_strip_count = 2;
+                        return unsafe { (*lf).leaf_local };
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        return SROA_NONE_IDX;
+    }
+
+    SROA_NONE_IDX
+}
+
+fn sroa_check_place_access_for_local(
+    mir: view<MirBody>,
+    loc_v: u32,
+    agg_kind: u8,
+    field_limit: u32,
+    pl: view<MirPlace>,
+    is_whole_lhs_init: bool,
+    out_has_proj: mut_view<bool>
+) -> u8 {
+    // Check if `loc_v` is used as a dynamic index inside another place's projection
+    if sroa_place_proj_uses_local(pl, loc_v) {
+        return SROA_BLOCK_OPAQUE_WHOLE_USE;
+    }
+    if pl.local.v != loc_v {
+        return SROA_BLOCK_NONE;
+    }
+    if pl.drop_flag != MIR_DROP_FLAG_NONE {
+        return SROA_BLOCK_OPAQUE_DROP;
+    }
+    if pl.proj_count == 0 {
+        if is_whole_lhs_init {
+            return SROA_BLOCK_NONE;
+        }
+        return SROA_BLOCK_OPAQUE_WHOLE_USE;
+    }
+    if (pl.projs as usize) == 0 {
+        return SROA_BLOCK_OPAQUE_WHOLE_USE;
+    }
+    let p0 = unsafe { mir_proj_at(pl.projs, 0) };
+    let pk0 = unsafe { (*p0).kind };
+    if agg_kind == SROA_AGG_STRUCT || agg_kind == SROA_AGG_TUPLE || agg_kind == SROA_AGG_CLOSURE {
+        if pk0 != MIR_PROJ_FIELD || (unsafe { (*p0).field_idx }) >= field_limit {
+            return SROA_BLOCK_OPAQUE_WHOLE_USE;
+        }
+        *out_has_proj = true;
+        return SROA_BLOCK_NONE;
+    }
+    if agg_kind == SROA_AGG_ARRAY {
+        if pk0 != MIR_PROJ_INDEX {
+            return SROA_BLOCK_DYNAMIC_INDEX;
+        }
+        let mut idx_ok = false;
+        let idx_val = sroa_eval_const_index_local(mir, unsafe { (*p0).index_local.v }, mut_view(idx_ok));
+        if !idx_ok || idx_val >= (field_limit as u64) {
+            return SROA_BLOCK_DYNAMIC_INDEX;
+        }
+        *out_has_proj = true;
+        return SROA_BLOCK_NONE;
+    }
+    if agg_kind == SROA_AGG_ENUM {
+        if pk0 != MIR_PROJ_DOWNCAST || (pl.proj_count) < 2 {
+            return SROA_BLOCK_OPAQUE_WHOLE_USE;
+        }
+        let p1 = unsafe { mir_proj_at(pl.projs, 1) };
+        if (unsafe { (*p1).kind }) != MIR_PROJ_FIELD {
+            return SROA_BLOCK_OPAQUE_WHOLE_USE;
+        }
+        *out_has_proj = true;
+        return SROA_BLOCK_NONE;
+    }
+    SROA_BLOCK_OPAQUE_WHOLE_USE
+}
+
+fn sroa_check_operand_access_for_local(
+    mir: view<MirBody>,
+    loc_v: u32,
+    agg_kind: u8,
+    field_limit: u32,
+    op: view<MirOperand>,
+    out_has_proj: mut_view<bool>
+) -> u8 {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return sroa_check_place_access_for_local(mir, loc_v, agg_kind, field_limit, view(op.place), false, out_has_proj);
+    }
+    SROA_BLOCK_NONE
+}
+
+pub fn sroa_build_info(
+    mir: view<MirBody>,
+    thir: *const Thir,
+    esc_info: *const EscapeInfo,
+    arena: mut_view<Arena>
+) -> *mut SroaInfo {
+    let info_ptr = arena_alloc_raw(mut_view(*arena), size_of<SroaInfo>(), align_of<SroaInfo>()) as *mut SroaInfo;
+    let lc = mir.local_count;
+    let alloc_l: usize = if lc == 0 { 1 } else { lc };
+    let plans = arena_alloc_raw(
+        mut_view(*arena),
+        sroa_mul_usize(alloc_l, size_of<SroaLocalPlan>()),
+        align_of<SroaLocalPlan>()
+    ) as *mut SroaLocalPlan;
+
+    unsafe {
+        (*info_ptr).fn_sym = SymbolId { v: mir.fn_sym.v };
+        (*info_ptr).local_count = lc;
+        (*info_ptr).plans = plans;
+        (*info_ptr).leaves = 0 as *mut SroaLeafDesc;
+        (*info_ptr).leaf_count = 0;
+        (*info_ptr).leaf_cap = 0;
+        (*info_ptr).rvo_applied = false;
+        (*info_ptr).nrvo_applied = false;
+        (*info_ptr).nrvo_local = SROA_NONE_IDX;
+    }
+
+    let mut l: usize = 0;
+    while l < lc {
+        let lp = unsafe { sroa_plan_at(plans, l) };
+        let lty_v: u32 = if (mir.locals as usize) != 0 {
+            unsafe { (*mir_local_at(mir.locals, l)).ty.v }
+        } else {
+            0u32
+        };
+        let mut sz_ok = false;
+        let mut sz_al: u64 = 1u64;
+        let sz_b = escape_type_byte_size(thir, TypeId { v: lty_v }, mut_view(sz_ok), mut_view(sz_al));
+        let ak = sroa_type_agg_kind(thir, TypeId { v: lty_v });
+        let rec_leaves = sroa_count_recursive_leaves(thir, TypeId { v: lty_v });
+
+        unsafe {
+            (*lp).local_id = l as u32;
+            (*lp).agg_kind = ak;
+            (*lp).eligible = false;
+            (*lp).scalarized = false;
+            (*lp).block_reason = SROA_BLOCK_NONE;
+            (*lp).leaf_base = 0u32;
+            (*lp).leaf_count = 0u32;
+            (*lp).total_recursive_leaves = rec_leaves;
+            (*lp).discr_leaf_local = SROA_NONE_IDX;
+            (*lp).size_bytes = sz_b;
+        }
+
+        // Only non-return, non-argument locals with aggregate types are SROA candidates
+        let lkind: u8 = if (mir.locals as usize) != 0 {
+            unsafe { (*mir_local_at(mir.locals, l)).kind }
+        } else {
+            MIR_LOCAL_RETURN
+        };
+        if l == 0 || l <= mir.arg_count || lkind == MIR_LOCAL_ARG || ak == SROA_AGG_NONE || (thir as usize) == 0 {
+            l = l + 1;
+            continue;
+        }
+
+        // 1. Check EscapeInfo & observability barriers (`SPEC-73 AXS-INL-011.1` rules 1-3)
+        let mut blk_reason = SROA_BLOCK_NONE;
+        if (esc_info as usize) != 0 && l < (unsafe { (*esc_info).local_count }) {
+            let elp = unsafe { escape_local_at((*esc_info).locals, l) };
+            if (unsafe { (*elp).is_fixed_mmio }) || (unsafe { (*elp).is_volatile_atomic }) ||
+               (unsafe { (*elp).is_zero_copy_pinned }) {
+                blk_reason = SROA_BLOCK_VOLATILE_MMIO_PINNED;
+            } else if (unsafe { (*elp).address_observable }) || (unsafe { (*elp).stable_address }) ||
+                      (unsafe { (*elp).borrow_taken }) {
+                blk_reason = SROA_BLOCK_ADDR_OBSERVABLE;
+            } else if (unsafe { (*elp).has_active_view_escape }) ||
+                      ((unsafe { (*elp).ind_escape }) != 0u16) ||
+                      ((unsafe { (*elp).alloc_site_idx }) != SROA_NONE_IDX &&
+                       (unsafe { (*elp).escape_class }) != ESCAPE_NO_ESCAPE) {
+                blk_reason = SROA_BLOCK_ESCAPE;
+            }
+        }
+        if blk_reason == SROA_BLOCK_NONE && sroa_local_is_borrowed_in_mir(mir, l as u32) {
+            blk_reason = SROA_BLOCK_ADDR_OBSERVABLE;
+        }
+
+        // 2. Check leaf count cap (`MAX_SROA_LEAVES = 32`, `MAX_SROA_ARRAY_LEN = 8`)
+        let tp = type_get(unsafe { view((*thir).interner) }, TypeId { v: lty_v });
+        let mut imm_limit: u32 = 0u32;
+        if (tp as usize) != 0 {
+            if ak == SROA_AGG_STRUCT || ak == SROA_AGG_TUPLE {
+                imm_limit = (unsafe { (*tp).field_count }) as u32;
+            } else if ak == SROA_AGG_CLOSURE {
+                imm_limit = 1u32 + ((unsafe { (*tp).capture_count }) as u32);
+            } else if ak == SROA_AGG_ARRAY {
+                let alen = unsafe { (*tp).array_len };
+                if alen > MAX_SROA_ARRAY_LEN {
+                    blk_reason = SROA_BLOCK_LEAF_LIMIT;
+                }
+                imm_limit = alen as u32;
+            } else if ak == SROA_AGG_ENUM {
+                imm_limit = (unsafe { (*tp).variant_count }) as u32;
+            }
+        }
+        if blk_reason == SROA_BLOCK_NONE {
+            if rec_leaves == 0u32 || rec_leaves > MAX_SROA_LEAVES || imm_limit == 0u32 {
+                blk_reason = SROA_BLOCK_LEAF_LIMIT;
+            }
+        }
+
+        // 3. Scan all MIR statements & terminators for access legality (`AXS-INL-011.1` rules 4-5)
+        let mut has_any_use_or_def = false;
+        let mut has_proj_or_agg = false;
+        let loc_v = l as u32;
+        let mut b: usize = 0;
+        while b < mir.bb_count && blk_reason == SROA_BLOCK_NONE && (mir.bbs as usize) != 0 {
+            let bb = unsafe { mir_bb_at(mir.bbs, b) };
+            let mut s: usize = 0;
+            while s < (unsafe { (*bb).stmt_count }) && blk_reason == SROA_BLOCK_NONE {
+                let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                let sk = unsafe { (*st).kind };
+                if sk == MIR_STMT_ASSIGN {
+                    let dst = unsafe { view((*st).place) };
+                    let rv = unsafe { view((*st).rvalue) };
+                    let rvk = rv.kind;
+
+                    // Check if LHS is whole-aggregate assignment `L = Aggregate(...)` or `L = Repeat(...)`
+                    let is_whole_agg_init = dst.local.v == loc_v && dst.proj_count == 0 &&
+                                            dst.drop_flag == MIR_DROP_FLAG_NONE &&
+                                            (rvk == MIR_RVALUE_AGGREGATE ||
+                                             (rvk == MIR_RVALUE_REPEAT && ak == SROA_AGG_ARRAY));
+                    if is_whole_agg_init {
+                        has_any_use_or_def = true;
+                        has_proj_or_agg = true;
+                    } else {
+                        let lhs_r = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, dst, false, mut_view(has_proj_or_agg));
+                        if dst.local.v == loc_v {
+                            has_any_use_or_def = true;
+                        }
+                        if lhs_r != SROA_BLOCK_NONE {
+                            blk_reason = lhs_r;
+                        }
+                    }
+
+                    // Check RHS operands & places
+                    if blk_reason == SROA_BLOCK_NONE {
+                        if rvk == MIR_RVALUE_REF {
+                            if sroa_place_uses_local(view(rv.place), loc_v) {
+                                blk_reason = SROA_BLOCK_ADDR_OBSERVABLE;
+                            }
+                        } else if rvk == MIR_RVALUE_DISCRIMINANT {
+                            if rv.place.local.v == loc_v {
+                                has_any_use_or_def = true;
+                                if rv.place.proj_count == 0 && ak == SROA_AGG_ENUM && rv.place.drop_flag == MIR_DROP_FLAG_NONE {
+                                    has_proj_or_agg = true;
+                                } else {
+                                    blk_reason = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, view(rv.place), false, mut_view(has_proj_or_agg));
+                                }
+                            } else if sroa_place_proj_uses_local(view(rv.place), loc_v) {
+                                blk_reason = SROA_BLOCK_OPAQUE_WHOLE_USE;
+                            }
+                        } else if rvk == MIR_RVALUE_LEN {
+                            if rv.place.local.v == loc_v {
+                                has_any_use_or_def = true;
+                                if rv.place.proj_count == 0 && ak == SROA_AGG_ARRAY && rv.place.drop_flag == MIR_DROP_FLAG_NONE {
+                                    has_proj_or_agg = true;
+                                } else {
+                                    blk_reason = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, view(rv.place), false, mut_view(has_proj_or_agg));
+                                }
+                            } else if sroa_place_proj_uses_local(view(rv.place), loc_v) {
+                                blk_reason = SROA_BLOCK_OPAQUE_WHOLE_USE;
+                            }
+                        } else if sroa_rvalue_has_use_op(rvk) {
+                            if sroa_operand_uses_local(view(rv.use_op), loc_v) {
+                                has_any_use_or_def = true;
+                            }
+                            blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(rv.use_op), mut_view(has_proj_or_agg));
+                        } else if sroa_rvalue_has_bin_ops(rvk) {
+                            if sroa_operand_uses_local(view(rv.lhs), loc_v) || sroa_operand_uses_local(view(rv.rhs), loc_v) {
+                                has_any_use_or_def = true;
+                            }
+                            let r1 = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(rv.lhs), mut_view(has_proj_or_agg));
+                            let r2 = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(rv.rhs), mut_view(has_proj_or_agg));
+                            blk_reason = if r1 != SROA_BLOCK_NONE { r1 } else { r2 };
+                        } else if rvk == MIR_RVALUE_AGGREGATE {
+                            let mut oi: usize = 0;
+                            while oi < rv.operand_count && (rv.operands as usize) != 0 && blk_reason == SROA_BLOCK_NONE {
+                                let op_p = unsafe { mir_op_at(rv.operands, oi) };
+                                if sroa_operand_uses_local(unsafe { view(*op_p) }, loc_v) {
+                                    has_any_use_or_def = true;
+                                }
+                                blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, unsafe { view(*op_p) }, mut_view(has_proj_or_agg));
+                                oi = oi + 1;
+                            }
+                        }
+                    }
+                } else if sk == MIR_STMT_DROP {
+                    let dpl = unsafe { view((*st).place) };
+                    if dpl.local.v == loc_v {
+                        has_any_use_or_def = true;
+                        if dpl.proj_count == 0 {
+                            // Whole-aggregate drop: decomposable if tuple/array/closure or struct without custom Drop
+                            if dpl.drop_flag != MIR_DROP_FLAG_NONE || ak == SROA_AGG_ENUM {
+                                blk_reason = SROA_BLOCK_OPAQUE_DROP;
+                            }
+                        } else {
+                            blk_reason = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, dpl, false, mut_view(has_proj_or_agg));
+                        }
+                    } else if sroa_place_proj_uses_local(dpl, loc_v) {
+                        blk_reason = SROA_BLOCK_OPAQUE_WHOLE_USE;
+                    }
+                }
+                s = s + 1;
+            }
+
+            if blk_reason == SROA_BLOCK_NONE && (unsafe { (*bb).has_terminator }) {
+                let tm = unsafe { view((*bb).terminator) };
+                let tk = tm.kind;
+                if tk == MIR_TERM_SWITCH_INT {
+                    if sroa_operand_uses_local(view(tm.discr), loc_v) {
+                        has_any_use_or_def = true;
+                    }
+                    blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(tm.discr), mut_view(has_proj_or_agg));
+                } else if tk == MIR_TERM_ASSERT {
+                    if sroa_operand_uses_local(view(tm.cond), loc_v) {
+                        has_any_use_or_def = true;
+                    }
+                    blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(tm.cond), mut_view(has_proj_or_agg));
+                } else if tk == MIR_TERM_DROP {
+                    if tm.drop_place.local.v == loc_v {
+                        has_any_use_or_def = true;
+                        if tm.drop_place.proj_count == 0 {
+                            if tm.drop_flag != MIR_DROP_FLAG_NONE || ak == SROA_AGG_ENUM || (tm.drop_unwind.v != 0u32 && tm.drop_unwind.v != MIR_BB_NONE) {
+                                blk_reason = SROA_BLOCK_OPAQUE_DROP;
+                            }
+                        } else {
+                            blk_reason = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, view(tm.drop_place), false, mut_view(has_proj_or_agg));
+                        }
+                    } else if sroa_place_proj_uses_local(view(tm.drop_place), loc_v) {
+                        blk_reason = SROA_BLOCK_OPAQUE_WHOLE_USE;
+                    }
+                } else if tk == MIR_TERM_CALL {
+                    if sroa_operand_uses_local(view(tm.func), loc_v) {
+                        has_any_use_or_def = true;
+                    }
+                    blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, view(tm.func), mut_view(has_proj_or_agg));
+                    let mut ai: usize = 0;
+                    while ai < tm.arg_count && (tm.args as usize) != 0 && blk_reason == SROA_BLOCK_NONE {
+                        let ap = unsafe { mir_op_at(tm.args, ai) };
+                        if sroa_operand_uses_local(unsafe { view(*ap) }, loc_v) {
+                            has_any_use_or_def = true;
+                        }
+                        blk_reason = sroa_check_operand_access_for_local(mir, loc_v, ak, imm_limit, unsafe { view(*ap) }, mut_view(has_proj_or_agg));
+                        ai = ai + 1;
+                    }
+                    if blk_reason == SROA_BLOCK_NONE && tm.has_destination {
+                        if tm.destination.local.v == loc_v {
+                            has_any_use_or_def = true;
+                        }
+                        blk_reason = sroa_check_place_access_for_local(mir, loc_v, ak, imm_limit, view(tm.destination), false, mut_view(has_proj_or_agg));
+                    }
+                }
+            }
+            b = b + 1;
+        }
+
+        if !has_any_use_or_def || !has_proj_or_agg {
+            if blk_reason == SROA_BLOCK_NONE {
+                l = l + 1;
+                continue;
+            }
+        }
+
+        if blk_reason != SROA_BLOCK_NONE {
+            unsafe {
+                (*lp).eligible = false;
+                (*lp).block_reason = blk_reason;
+            }
+            l = l + 1;
+            continue;
+        }
+
+        // Populate immediate leaf descriptors for eligible local `l`
+        let leaf_base = (unsafe { (*info_ptr).leaf_count }) as u32;
+        let mut lcnt: u32 = 0u32;
+        if ak == SROA_AGG_STRUCT || ak == SROA_AGG_TUPLE {
+            let fcnt = unsafe { (*tp).field_count };
+            let flds = unsafe { (*tp).fields };
+            let mut fi: usize = 0;
+            while fi < fcnt && (flds as usize) != 0 {
+                let fty_v = unsafe { (*typeid_at(flds, fi)).v };
+                let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                    owner_local: loc_v,
+                    slot_idx: lcnt,
+                    variant_idx: 0u32,
+                    field_idx: fi as u32,
+                    leaf_ty: TypeId { v: fty_v },
+                    leaf_local: SROA_NONE_IDX,
+                    is_enum_discr: false,
+                    needs_drop: !sroa_type_is_copy(thir, TypeId { v: fty_v }),
+                });
+                lcnt = lcnt + 1u32;
+                fi = fi + 1;
+            }
+        } else if ak == SROA_AGG_CLOSURE {
+            let fn_ty = TypeId { v: unsafe { (*tp).fn_type.v } };
+            let eff_fn_ty: TypeId = if fn_ty.v != 0u32 {
+                fn_ty
+            } else {
+                TypeId { v: unsafe { (*thir).interner.t_usize.v } }
+            };
+            let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                owner_local: loc_v,
+                slot_idx: 0u32,
+                variant_idx: 0u32,
+                field_idx: 0u32,
+                leaf_ty: eff_fn_ty,
+                leaf_local: SROA_NONE_IDX,
+                is_enum_discr: false,
+                needs_drop: false,
+            });
+            lcnt = 1u32;
+            let ccnt = unsafe { (*tp).capture_count };
+            let caps = unsafe { (*tp).captures };
+            let mut ci: usize = 0;
+            while ci < ccnt && (caps as usize) != 0 {
+                let cp = unsafe { capture_at(caps, ci) };
+                let cty_v = unsafe { (*cp).ty.v };
+                let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                    owner_local: loc_v,
+                    slot_idx: lcnt,
+                    variant_idx: 0u32,
+                    field_idx: (ci + 1) as u32,
+                    leaf_ty: TypeId { v: cty_v },
+                    leaf_local: SROA_NONE_IDX,
+                    is_enum_discr: false,
+                    needs_drop: !sroa_type_is_copy(thir, TypeId { v: cty_v }),
+                });
+                lcnt = lcnt + 1u32;
+                ci = ci + 1;
+            }
+        } else if ak == SROA_AGG_ARRAY {
+            let alen = unsafe { (*tp).array_len } as usize;
+            let ety_v = unsafe { (*tp).elem.v };
+            let mut ei: usize = 0;
+            while ei < alen {
+                let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                    owner_local: loc_v,
+                    slot_idx: lcnt,
+                    variant_idx: 0u32,
+                    field_idx: ei as u32,
+                    leaf_ty: TypeId { v: ety_v },
+                    leaf_local: SROA_NONE_IDX,
+                    is_enum_discr: false,
+                    needs_drop: !sroa_type_is_copy(thir, TypeId { v: ety_v }),
+                });
+                lcnt = lcnt + 1u32;
+                ei = ei + 1;
+            }
+        } else if ak == SROA_AGG_ENUM {
+            let discr_ty = TypeId { v: unsafe { (*thir).interner.t_isize.v } };
+            let eff_discr_ty: TypeId = if discr_ty.v != 0u32 { discr_ty } else { TypeId { v: 10u32 } };
+            let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                owner_local: loc_v,
+                slot_idx: 0u32,
+                variant_idx: 0u32,
+                field_idx: 0u32,
+                leaf_ty: eff_discr_ty,
+                leaf_local: SROA_NONE_IDX,
+                is_enum_discr: true,
+                needs_drop: false,
+            });
+            lcnt = 1u32;
+            let vcnt = unsafe { (*tp).variant_count };
+            let vflds = unsafe { (*tp).variant_fields };
+            let vcnts = unsafe { (*tp).variant_field_counts };
+            let mut vi: usize = 0;
+            while vi < vcnt && (vflds as usize) != 0 && (vcnts as usize) != 0 {
+                let fc = unsafe { *usize_at(vcnts, vi) };
+                let fp = unsafe { *typeid_ptr_at(vflds, vi) };
+                let mut fj: usize = 0;
+                while fj < fc && (fp as usize) != 0 {
+                    let fty_v = unsafe { (*typeid_at(fp, fj)).v };
+                    let _ = sroa_info_push_leaf(unsafe { mut_view(*info_ptr) }, mut_view(*arena), SroaLeafDesc {
+                        owner_local: loc_v,
+                        slot_idx: lcnt,
+                        variant_idx: vi as u32,
+                        field_idx: fj as u32,
+                        leaf_ty: TypeId { v: fty_v },
+                        leaf_local: SROA_NONE_IDX,
+                        is_enum_discr: false,
+                        needs_drop: !sroa_type_is_copy(thir, TypeId { v: fty_v }),
+                    });
+                    lcnt = lcnt + 1u32;
+                    fj = fj + 1;
+                }
+                vi = vi + 1;
+            }
+        }
+
+        unsafe {
+            (*lp).eligible = lcnt > 0u32;
+            (*lp).leaf_base = leaf_base;
+            (*lp).leaf_count = lcnt;
+        }
+        l = l + 1;
+    }
+
+    info_ptr
+}
+
+fn sroa_make_default_init_stmt(
+    thir: *const Thir,
+    leaf_local: u32,
+    leaf_ty: TypeId,
+    span: view<Span>,
+    out_stmt: mut_view<MirStmt>
+) -> bool {
+    let leaf_ty_v = leaf_ty.v;
+    if (thir as usize) == 0 || leaf_ty_v == 0u32 {
+        return false;
+    }
+    let tp = type_get(unsafe { view((*thir).interner) }, TypeId { v: leaf_ty_v });
+    if (tp as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*tp).kind };
+    mir_stmt_reset(mut_view(*out_stmt), MIR_STMT_ASSIGN, span);
+    out_stmt.place = mir_local_place(leaf_local);
+    mir_rvalue_reset(mut_view(out_stmt.rvalue), MIR_RVALUE_USE);
+    if tk == TY_BOOL {
+        out_stmt.rvalue.use_op.kind = MIR_OP_CONST;
+        out_stmt.rvalue.use_op.constant.ty = TypeId { v: leaf_ty_v };
+        out_stmt.rvalue.use_op.constant.kind = MIR_CONST_BOOL;
+        out_stmt.rvalue.use_op.constant.val = 0u64;
+        return true;
+    }
+    if tk == TY_UNIT {
+        out_stmt.rvalue.use_op.kind = MIR_OP_CONST;
+        out_stmt.rvalue.use_op.constant.ty = TypeId { v: leaf_ty_v };
+        out_stmt.rvalue.use_op.constant.kind = MIR_CONST_UNIT;
+        out_stmt.rvalue.use_op.constant.val = 0u64;
+        return true;
+    }
+    if tk == TY_CHAR || tk == TY_I8 || tk == TY_I16 || tk == TY_I32 || tk == TY_I64 ||
+       tk == TY_I128 || tk == TY_ISIZE || tk == TY_U8 || tk == TY_U16 || tk == TY_U32 ||
+       tk == TY_U64 || tk == TY_U128 || tk == TY_USIZE {
+        out_stmt.rvalue.use_op = mir_op_const_int(leaf_ty_v, 0u64);
+        return true;
+    }
+    false
+}
+
+fn sroa_rewrite_operand_place(
+    mir: view<MirBody>,
+    plan: view<SroaLocalPlan>,
+    info: view<SroaInfo>,
+    op: mut_view<MirOperand>,
+    arena: mut_view<Arena>
+) -> bool {
+    if (op.kind != MIR_OP_COPY && op.kind != MIR_OP_MOVE) || op.place.local.v != plan.local_id {
+        return false;
+    }
+    let mut strip_cnt: usize = 0;
+    let leaf_loc = sroa_resolve_place_leaf(mir, plan, info, view(op.place), mut_view(strip_cnt));
+    if leaf_loc == SROA_NONE_IDX || strip_cnt == 0 {
+        return false;
+    }
+    sroa_place_strip_prefix(mut_view(op.place), leaf_loc, strip_cnt, mut_view(*arena));
+    true
+}
+
+fn sroa_scalarize_single_local(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    plan: mut_view<SroaLocalPlan>,
+    info: mut_view<SroaInfo>,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let loc_v = plan.local_id;
+    let base = plan.leaf_base as usize;
+    let cnt = plan.leaf_count as usize;
+    if !plan.eligible || cnt == 0 || (loc_v as usize) >= mir.local_count {
+        return false;
+    }
+
+    // For Enum SROA, ensure all payload leaves can be default-initialized if any variant doesn't write them
+    if plan.agg_kind == SROA_AGG_ENUM {
+        let mut chk_k: usize = 0;
+        while chk_k < cnt && (base + chk_k) < info.leaf_count {
+            let lf = unsafe { sroa_leaf_at(info.leaves, base + chk_k) };
+            let mut dummy_st = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+            if !sroa_make_default_init_stmt(thir, 0u32, unsafe { (*lf).leaf_ty }, view(mir.span), mut_view(dummy_st)) {
+                plan.eligible = false;
+                plan.block_reason = SROA_BLOCK_OPAQUE_WHOLE_USE;
+                return false;
+            }
+            chk_k = chk_k + 1;
+        }
+    }
+
+    let orig_decl = unsafe { mir_local_at(mir.locals, loc_v as usize) };
+    let loc_span = unsafe { (*orig_decl).span };
+
+    // 1. Allocate fresh leaf locals in `mir`
+    let mut k: usize = 0;
+    while k < cnt && (base + k) < info.leaf_count {
+        let lf = unsafe { sroa_leaf_at(info.leaves, base + k) };
+        let new_lid = mir_add_local(
+            mut_view(*mir),
+            mut_view(*arena),
+            TypeId { v: unsafe { (*lf).leaf_ty.v } },
+            MIR_LOCAL_TEMP,
+            true,
+            StrId { v: 0u32 },
+            view(loc_span)
+        );
+        unsafe {
+            (*lf).leaf_local = new_lid.v;
+            if (*lf).is_enum_discr {
+                plan.discr_leaf_local = new_lid.v;
+            }
+        }
+        k = k + 1;
+    }
+
+    // 2. Rewrite all statements and terminators in `mir`
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let old_scnt = unsafe { (*bb).stmt_count };
+        let old_stmts = unsafe { (*bb).stmts };
+        unsafe {
+            (*bb).stmts = 0 as *mut MirStmt;
+            (*bb).stmt_count = 0;
+            (*bb).stmt_cap = 0;
+        }
+
+        // If Enum SROA and block 0, emit default initializers for enum leaves so unselected variant leaves are definitely initialized
+        if b == 0 && plan.agg_kind == SROA_AGG_ENUM {
+            let mut ek: usize = 0;
+            while ek < cnt && (base + ek) < info.leaf_count {
+                let lf = unsafe { sroa_leaf_at(info.leaves, base + ek) };
+                let mut init_st = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                if sroa_make_default_init_stmt(
+                    thir,
+                    unsafe { (*lf).leaf_local },
+                    unsafe { (*lf).leaf_ty },
+                    view(loc_span),
+                    mut_view(init_st)
+                ) {
+                    mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(init_st));
+                }
+                ek = ek + 1;
+            }
+        }
+
+        // Track per-leaf move-out within basic block for partial-move drop elision (`AXS-INL-011` rule 3)
+        let moved_leaves = arena_alloc_raw(mut_view(*arena), sroa_mul_usize(cnt, size_of<bool>()), align_of<bool>()) as *mut bool;
+        let mut mk: usize = 0;
+        while mk < cnt {
+            unsafe { *sroa_bool_at(moved_leaves, mk) = false; }
+            mk = mk + 1;
+        }
+
+        let mut s: usize = 0;
+        while s < old_scnt {
+            let st_in = unsafe { mir_stmt_at(old_stmts, s) };
+            let mut st = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+            mir_copy_stmt(mut_view(st), unsafe { view(*st_in) });
+            let sk = st.kind;
+
+            if (sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD) && st.storage_local.v == loc_v {
+                // Elide StorageLive/StorageDead of scalarized aggregate
+                s = s + 1;
+                continue;
+            }
+
+            if sk == MIR_STMT_DROP && st.place.local.v == loc_v {
+                if st.place.proj_count == 0 {
+                    // Decompose whole-aggregate Drop(L) into field-order drops `(0, 1, ..., k-1)` (`AXS-INL-011` rule 3)
+                    let mut dk: usize = 0;
+                    while dk < cnt && (base + dk) < info.leaf_count {
+                        let lf = unsafe { sroa_leaf_at(info.leaves, base + dk) };
+                        let was_moved = unsafe { *sroa_bool_at(moved_leaves, dk) };
+                        if (unsafe { (*lf).needs_drop }) && !was_moved {
+                            let mut dst_drop = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                            mir_stmt_reset(mut_view(dst_drop), MIR_STMT_DROP, view(st.span));
+                            dst_drop.place = mir_local_place(unsafe { (*lf).leaf_local });
+                            mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(dst_drop));
+                        }
+                        dk = dk + 1;
+                    }
+                    stats.sroa_drops_decomposed = stats.sroa_drops_decomposed + 1u32;
+                    s = s + 1;
+                    continue;
+                } else {
+                    let mut strip_d: usize = 0;
+                    let dlf = sroa_resolve_place_leaf(view(*mir), view(*plan), view(*info), view(st.place), mut_view(strip_d));
+                    if dlf != SROA_NONE_IDX && strip_d > 0 {
+                        sroa_place_strip_prefix(mut_view(st.place), dlf, strip_d, mut_view(*arena));
+                    }
+                }
+            }
+
+            if sk == MIR_STMT_ASSIGN {
+                // Rewrite RHS uses of `loc_v` projections first
+                let rvk = st.rvalue.kind;
+                if rvk == MIR_RVALUE_DISCRIMINANT && st.rvalue.place.local.v == loc_v &&
+                   st.rvalue.place.proj_count == 0 && plan.agg_kind == SROA_AGG_ENUM &&
+                   plan.discr_leaf_local != SROA_NONE_IDX {
+                    mir_rvalue_reset(mut_view(st.rvalue), MIR_RVALUE_USE);
+                    st.rvalue.use_op = mir_op_copy_local(plan.discr_leaf_local);
+                } else if rvk == MIR_RVALUE_LEN && st.rvalue.place.local.v == loc_v &&
+                          st.rvalue.place.proj_count == 0 && plan.agg_kind == SROA_AGG_ARRAY {
+                    let usz_ty_v: u32 = if (thir as usize) != 0 {
+                        unsafe { (*thir).interner.t_usize.v }
+                    } else {
+                        15u32
+                    };
+                    mir_rvalue_reset(mut_view(st.rvalue), MIR_RVALUE_USE);
+                    st.rvalue.use_op = mir_op_const_int(usz_ty_v, cnt as u64);
+                } else if rvk == MIR_RVALUE_DISCRIMINANT || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_REF {
+                    if st.rvalue.place.local.v == loc_v {
+                        let mut strip_r: usize = 0;
+                        let rlf = sroa_resolve_place_leaf(view(*mir), view(*plan), view(*info), view(st.rvalue.place), mut_view(strip_r));
+                        if rlf != SROA_NONE_IDX && strip_r > 0 {
+                            sroa_place_strip_prefix(mut_view(st.rvalue.place), rlf, strip_r, mut_view(*arena));
+                        }
+                    }
+                } else if sroa_rvalue_has_use_op(rvk) {
+                    if st.rvalue.use_op.kind == MIR_OP_MOVE && st.rvalue.use_op.place.local.v == loc_v &&
+                       st.rvalue.use_op.place.proj_count == 1 && (st.rvalue.use_op.place.projs as usize) != 0 {
+                        let pr0 = unsafe { mir_proj_at(st.rvalue.use_op.place.projs, 0) };
+                        if (unsafe { (*pr0).kind }) == MIR_PROJ_FIELD && ((unsafe { (*pr0).field_idx }) as usize) < cnt {
+                            unsafe { *sroa_bool_at(moved_leaves, (*pr0).field_idx as usize) = true; }
+                        }
+                    }
+                    let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), mut_view(st.rvalue.use_op), mut_view(*arena));
+                } else if sroa_rvalue_has_bin_ops(rvk) {
+                    let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), mut_view(st.rvalue.lhs), mut_view(*arena));
+                    let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), mut_view(st.rvalue.rhs), mut_view(*arena));
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let mut oi: usize = 0;
+                    while oi < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+                        let op_p = unsafe { mir_op_at(st.rvalue.operands, oi) };
+                        let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), unsafe { mut_view(*op_p) }, mut_view(*arena));
+                        oi = oi + 1;
+                    }
+                }
+
+                // Now check LHS writes to `loc_v`
+                if st.place.local.v == loc_v {
+                    if st.place.proj_count == 0 {
+                        if st.rvalue.kind == MIR_RVALUE_AGGREGATE {
+                            if plan.agg_kind == SROA_AGG_ENUM {
+                                // Emit `_discr = Const(variant_idx)` + payload leaf writes
+                                let vidx = st.rvalue.variant_idx;
+                                let discr_lf = unsafe { sroa_leaf_at(info.leaves, base) };
+                                let mut dst_d = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                                mir_stmt_reset(mut_view(dst_d), MIR_STMT_ASSIGN, view(st.span));
+                                dst_d.place = mir_local_place(unsafe { (*discr_lf).leaf_local });
+                                mir_rvalue_reset(mut_view(dst_d.rvalue), MIR_RVALUE_USE);
+                                dst_d.rvalue.use_op = mir_op_const_int(unsafe { (*discr_lf).leaf_ty.v }, vidx as u64);
+                                mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(dst_d));
+
+                                let mut oi: usize = 0;
+                                while oi < st.rvalue.operand_count && (st.rvalue.operands as usize) != 0 {
+                                    let op_p = unsafe { mir_op_at(st.rvalue.operands, oi) };
+                                    // Find payload leaf for `(vidx, oi)`
+                                    let mut pk: usize = 1;
+                                    while pk < cnt && (base + pk) < info.leaf_count {
+                                        let plf = unsafe { sroa_leaf_at(info.leaves, base + pk) };
+                                        if (unsafe { (*plf).variant_idx }) == vidx && (unsafe { (*plf).field_idx }) == (oi as u32) {
+                                            let mut fst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                                            mir_stmt_reset(mut_view(fst), MIR_STMT_ASSIGN, view(st.span));
+                                            fst.place = mir_local_place(unsafe { (*plf).leaf_local });
+                                            mir_rvalue_reset(mut_view(fst.rvalue), MIR_RVALUE_USE);
+                                            mir_copy_operand(mut_view(fst.rvalue.use_op), unsafe { view(*op_p) });
+                                            mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(fst));
+                                            break;
+                                        }
+                                        pk = pk + 1;
+                                    }
+                                    oi = oi + 1;
+                                }
+                                s = s + 1;
+                                continue;
+                            } else {
+                                // Struct, Tuple, Closure, or Array aggregate literal
+                                let mut oi: usize = 0;
+                                while oi < st.rvalue.operand_count && oi < cnt && (st.rvalue.operands as usize) != 0 {
+                                    let op_p = unsafe { mir_op_at(st.rvalue.operands, oi) };
+                                    let lf = unsafe { sroa_leaf_at(info.leaves, base + oi) };
+                                    let mut fst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                                    mir_stmt_reset(mut_view(fst), MIR_STMT_ASSIGN, view(st.span));
+                                    fst.place = mir_local_place(unsafe { (*lf).leaf_local });
+                                    mir_rvalue_reset(mut_view(fst.rvalue), MIR_RVALUE_USE);
+                                    mir_copy_operand(mut_view(fst.rvalue.use_op), unsafe { view(*op_p) });
+                                    mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(fst));
+                                    unsafe { *sroa_bool_at(moved_leaves, oi) = false; }
+                                    oi = oi + 1;
+                                }
+                                s = s + 1;
+                                continue;
+                            }
+                        } else if st.rvalue.kind == MIR_RVALUE_REPEAT && plan.agg_kind == SROA_AGG_ARRAY {
+                            let mut ri: usize = 0;
+                            while ri < cnt {
+                                let lf = unsafe { sroa_leaf_at(info.leaves, base + ri) };
+                                let mut fst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                                mir_stmt_reset(mut_view(fst), MIR_STMT_ASSIGN, view(st.span));
+                                fst.place = mir_local_place(unsafe { (*lf).leaf_local });
+                                mir_rvalue_reset(mut_view(fst.rvalue), MIR_RVALUE_USE);
+                                mir_copy_operand(mut_view(fst.rvalue.use_op), view(st.rvalue.use_op));
+                                mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(fst));
+                                ri = ri + 1;
+                            }
+                            s = s + 1;
+                            continue;
+                        }
+                    } else {
+                        let mut strip_l: usize = 0;
+                        let llf = sroa_resolve_place_leaf(view(*mir), view(*plan), view(*info), view(st.place), mut_view(strip_l));
+                        if llf != SROA_NONE_IDX && strip_l > 0 {
+                            if st.place.proj_count == 1 && (st.place.projs as usize) != 0 {
+                                let pr0 = unsafe { mir_proj_at(st.place.projs, 0) };
+                                if (unsafe { (*pr0).kind }) == MIR_PROJ_FIELD && ((unsafe { (*pr0).field_idx }) as usize) < cnt {
+                                    unsafe { *sroa_bool_at(moved_leaves, (*pr0).field_idx as usize) = false; }
+                                }
+                            }
+                            sroa_place_strip_prefix(mut_view(st.place), llf, strip_l, mut_view(*arena));
+                        }
+                    }
+                }
+            }
+
+            mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(st));
+            s = s + 1;
+        }
+
+        // Rewrite terminator uses or Drop(L)
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            if tk == MIR_TERM_SWITCH_INT {
+                let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), unsafe { mut_view((*bb).terminator.discr) }, mut_view(*arena));
+            } else if tk == MIR_TERM_ASSERT {
+                let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), unsafe { mut_view((*bb).terminator.cond) }, mut_view(*arena));
+            } else if tk == MIR_TERM_DROP {
+                if (unsafe { (*bb).terminator.drop_place.local.v }) == loc_v {
+                    if (unsafe { (*bb).terminator.drop_place.proj_count }) == 0 {
+                        // Decompose terminator Drop(L) into statement drops in declaration order + Goto(drop_target)
+                        let dtgt = MirBbId { v: unsafe { (*bb).terminator.drop_target.v } };
+                        let dsp = unsafe { (*bb).terminator.span };
+                        let mut dk: usize = 0;
+                        while dk < cnt && (base + dk) < info.leaf_count {
+                            let lf = unsafe { sroa_leaf_at(info.leaves, base + dk) };
+                            let was_moved = unsafe { *sroa_bool_at(moved_leaves, dk) };
+                            if (unsafe { (*lf).needs_drop }) && !was_moved {
+                                let mut dst_drop = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                                mir_stmt_reset(mut_view(dst_drop), MIR_STMT_DROP, view(dsp));
+                                dst_drop.place = mir_local_place(unsafe { (*lf).leaf_local });
+                                mir_bb_push_stmt(unsafe { mut_view(*bb) }, mut_view(*arena), view(dst_drop));
+                            }
+                            dk = dk + 1;
+                        }
+                        mir_term_reset(unsafe { mut_view((*bb).terminator) }, MIR_TERM_GOTO, view(dsp));
+                        unsafe { (*bb).terminator.goto_target.v = dtgt.v; }
+                        stats.sroa_drops_decomposed = stats.sroa_drops_decomposed + 1u32;
+                    } else {
+                        let mut strip_td: usize = 0;
+                        let tdlf = sroa_resolve_place_leaf(view(*mir), view(*plan), view(*info), unsafe { view((*bb).terminator.drop_place) }, mut_view(strip_td));
+                        if tdlf != SROA_NONE_IDX && strip_td > 0 {
+                            sroa_place_strip_prefix(unsafe { mut_view((*bb).terminator.drop_place) }, tdlf, strip_td, mut_view(*arena));
+                        }
+                    }
+                }
+            } else if tk == MIR_TERM_CALL {
+                let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), unsafe { mut_view((*bb).terminator.func) }, mut_view(*arena));
+                let mut ai: usize = 0;
+                while ai < (unsafe { (*bb).terminator.arg_count }) && (unsafe { (*bb).terminator.args as usize }) != 0 {
+                    let ap = unsafe { mir_op_at((*bb).terminator.args, ai) };
+                    let _ = sroa_rewrite_operand_place(view(*mir), view(*plan), view(*info), unsafe { mut_view(*ap) }, mut_view(*arena));
+                    ai = ai + 1;
+                }
+                if (unsafe { (*bb).terminator.has_destination }) &&
+                   (unsafe { (*bb).terminator.destination.local.v }) == loc_v {
+                    let mut strip_cd: usize = 0;
+                    let cdlf = sroa_resolve_place_leaf(view(*mir), view(*plan), view(*info), unsafe { view((*bb).terminator.destination) }, mut_view(strip_cd));
+                    if cdlf != SROA_NONE_IDX && strip_cd > 0 {
+                        sroa_place_strip_prefix(unsafe { mut_view((*bb).terminator.destination) }, cdlf, strip_cd, mut_view(*arena));
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+
+    plan.scalarized = true;
+    stats.sroa_aggregates_scalarized = stats.sroa_aggregates_scalarized + 1u32;
+    stats.sroa_leaves_created = stats.sroa_leaves_created + (cnt as u32);
+    let first_leaf_loc: u32 = if (base < info.leaf_count) {
+        unsafe { (*sroa_leaf_at(info.leaves, base)).leaf_local }
+    } else {
+        0u32
+    };
+    sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+        decision: SROA_DECISION_SCALARIZED,
+        block_reason: SROA_BLOCK_NONE,
+        agg_kind: plan.agg_kind,
+        local_id: loc_v,
+        target_local: first_leaf_loc,
+        leaf_count: cnt as u32,
+        bb_idx: 0u32,
+    });
+    true
+}
+
+pub fn sroa_scalarize_aggregates_mir(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    esc_info: *const EscapeInfo,
+    out_first_info: mut_view<*mut SroaInfo>,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut any_changed = false;
+    let mut level: u32 = 0u32;
+    while level < 4u32 {
+        // Run copy/move propagation before each SROA level so intermediate aggregate moves (`inner -> outer.f0`) coalesce
+        if sroa_copy_move_propagate_mir(mut_view(*mir), thir, if level == 0u32 { esc_info } else { 0 as *const EscapeInfo }, mut_view(*stats), log, mut_view(*arena)) {
+            any_changed = true;
+        }
+
+        let cur_info = sroa_build_info(
+            view(*mir),
+            thir,
+            if level == 0u32 { esc_info } else { 0 as *const EscapeInfo },
+            mut_view(*arena)
+        );
+        if level == 0u32 {
+            *out_first_info = cur_info;
+        }
+
+        let mut level_changed = false;
+        let orig_lc = unsafe { (*cur_info).local_count };
+        let mut l: usize = mir.arg_count + 1;
+        while l < orig_lc {
+            let lp = unsafe { sroa_plan_at((*cur_info).plans, l) };
+            if unsafe { (*lp).eligible } {
+                if sroa_scalarize_single_local(
+                    mut_view(*mir),
+                    thir,
+                    unsafe { mut_view(*lp) },
+                    unsafe { mut_view(*cur_info) },
+                    mut_view(*stats),
+                    log,
+                    mut_view(*arena)
+                ) {
+                    level_changed = true;
+                    any_changed = true;
+                }
+            } else if level == 0u32 && (unsafe { (*lp).block_reason }) != SROA_BLOCK_NONE {
+                stats.sroa_blocked_count = stats.sroa_blocked_count + 1u32;
+                sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                    decision: SROA_DECISION_BLOCKED,
+                    block_reason: unsafe { (*lp).block_reason },
+                    agg_kind: unsafe { (*lp).agg_kind },
+                    local_id: l as u32,
+                    target_local: SROA_NONE_IDX,
+                    leaf_count: unsafe { (*lp).total_recursive_leaves },
+                    bb_idx: 0u32,
+                });
+            }
+            l = l + 1;
+        }
+
+        if !level_changed {
+            break;
+        }
+        level = level + 1u32;
+    }
+
+    if any_changed {
+        let _ = sroa_copy_move_propagate_mir(mut_view(*mir), thir, 0 as *const EscapeInfo, mut_view(*stats), log, mut_view(*arena));
+    }
+    any_changed
+}
+
+// --- Section 3: Caller-Allocated Return-Slot Construction (`RVO` & `NRVO`, `SPEC-73 §3.3, AXS-INL-012`) ---
+
+fn sroa_has_aliasing_view_or_ptr_param(mir: view<MirBody>, thir: *const Thir) -> bool {
+    if (thir as usize) == 0 || (mir.locals as usize) == 0 {
+        return false;
+    }
+    let mut p: usize = 1;
+    while p <= mir.arg_count && p < mir.local_count {
+        let pty = TypeId { v: unsafe { (*mir_local_at(mir.locals, p)).ty.v } };
+        let tp = type_get(unsafe { view((*thir).interner) }, pty);
+        if (tp as usize) != 0 {
+            let tk = unsafe { (*tp).kind };
+            if tk == TY_MUT_VIEW || tk == TY_PTR {
+                return true;
+            }
+        }
+        p = p + 1;
+    }
+    false
+}
+
+fn sroa_try_direct_rvo(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    info: *mut SroaInfo,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    if mir.bb_count == 0 || mir.local_count == 0 || (mir.bbs as usize) == 0 || (mir.locals as usize) == 0 {
+        return false;
+    }
+    let ret_ty = TypeId { v: unsafe { (*mir_local_at(mir.locals, 0)).ty.v } };
+    let ret_ak = sroa_type_agg_kind(thir, ret_ty);
+    let mut changed = false;
+
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_RETURN {
+            // Find the last assignment in `bb` (ignoring trailing StorageDead)
+            let scnt = unsafe { (*bb).stmt_count };
+            let mut ret_s: usize = scnt;
+            let mut k: usize = scnt;
+            while k > 0 {
+                let idx = k - 1;
+                let st = unsafe { mir_stmt_at((*bb).stmts, idx) };
+                let sk = unsafe { (*st).kind };
+                if sk == MIR_STMT_STORAGE_DEAD {
+                    k = k - 1;
+                    continue;
+                }
+                if sk == MIR_STMT_ASSIGN &&
+                   (unsafe { (*st).place.local.v }) == 0u32 &&
+                   (unsafe { (*st).place.proj_count }) == 0 &&
+                   (unsafe { (*st).place.drop_flag }) == MIR_DROP_FLAG_NONE &&
+                   (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+                   ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE ||
+                    (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY) &&
+                   (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 &&
+                   (unsafe { (*st).rvalue.use_op.place.drop_flag }) == MIR_DROP_FLAG_NONE {
+                    ret_s = idx;
+                }
+                break;
+            }
+
+            if ret_s < scnt {
+                let ret_st = unsafe { mir_stmt_at((*bb).stmts, ret_s) };
+                let tmp_loc = unsafe { (*ret_st).rvalue.use_op.place.local.v };
+                if (tmp_loc as usize) > mir.arg_count &&
+                   sroa_count_local_defs(view(*mir), tmp_loc) == 1u32 &&
+                   sroa_count_local_uses(view(*mir), tmp_loc) == 1u32 &&
+                   !sroa_local_is_borrowed_in_mir(view(*mir), tmp_loc) &&
+                   !sroa_local_has_drop_in_mir(view(*mir), tmp_loc) {
+                    // Case A: `tmp = Aggregate(...)` in the same block `bb`
+                    let mut def_s: usize = ret_s;
+                    let mut ds: usize = 0;
+                    while ds < ret_s {
+                        let dst = unsafe { mir_stmt_at((*bb).stmts, ds) };
+                        if (unsafe { (*dst).kind }) == MIR_STMT_ASSIGN &&
+                           (unsafe { (*dst).place.local.v }) == tmp_loc &&
+                           (unsafe { (*dst).place.proj_count }) == 0 &&
+                           (unsafe { (*dst).rvalue.kind }) == MIR_RVALUE_AGGREGATE {
+                            def_s = ds;
+                            break;
+                        }
+                        ds = ds + 1;
+                    }
+                    if def_s < ret_s {
+                        // Ensure `_0` is not touched between `def_s` and `ret_s`
+                        let mut ok_between = true;
+                        let mut ms: usize = def_s;
+                        while ms < ret_s {
+                            let mst = unsafe { mir_stmt_at((*bb).stmts, ms) };
+                            if (unsafe { (*mst).kind }) == MIR_STMT_ASSIGN {
+                                if (unsafe { (*mst).place.local.v }) == 0u32 ||
+                                   sroa_rvalue_uses_local(unsafe { view((*mst).rvalue) }, 0u32) {
+                                    ok_between = false;
+                                }
+                            }
+                            ms = ms + 1;
+                        }
+                        if ok_between {
+                            let def_st = unsafe { mir_stmt_at((*bb).stmts, def_s) };
+                            unsafe { (*def_st).place.local.v = 0u32; }
+                            sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, ret_s);
+                            let mut rs: usize = 0;
+                            while rs < (unsafe { (*bb).stmt_count }) {
+                                let rst = unsafe { mir_stmt_at((*bb).stmts, rs) };
+                                let rsk = unsafe { (*rst).kind };
+                                if (rsk == MIR_STMT_STORAGE_LIVE || rsk == MIR_STMT_STORAGE_DEAD) &&
+                                   (unsafe { (*rst).storage_local.v }) == tmp_loc {
+                                    sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, rs);
+                                    continue;
+                                }
+                                rs = rs + 1;
+                            }
+                            if (info as usize) != 0 {
+                                unsafe { (*info).rvo_applied = true; }
+                            }
+                            stats.rvo_promotions = stats.rvo_promotions + 1u32;
+                            sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                decision: SROA_DECISION_RVO,
+                                block_reason: SROA_BLOCK_NONE,
+                                agg_kind: ret_ak,
+                                local_id: tmp_loc,
+                                target_local: 0u32,
+                                leaf_count: 1u32,
+                                bb_idx: b as u32,
+                            });
+                            changed = true;
+                        }
+                    } else {
+                        // Case B: Chained return-slot forwarding (`AXS-INL-012.3`):
+                        // `pred_bb` ends with `tmp = Call(f, args...) -> bb` and `bb` immediately does `_0 = Move(tmp); return`
+                        let mut only_storage_before = true;
+                        let mut ls: usize = 0;
+                        while ls < ret_s {
+                            let lst = unsafe { mir_stmt_at((*bb).stmts, ls) };
+                            let lsk = unsafe { (*lst).kind };
+                            if lsk != MIR_STMT_STORAGE_LIVE && lsk != MIR_STMT_STORAGE_DEAD {
+                                only_storage_before = false;
+                            }
+                            ls = ls + 1;
+                        }
+                        let mut pred_cnt: u32 = 0u32;
+                        let mut call_pred_b: usize = mir.bb_count;
+                        let mut pb: usize = 0;
+                        while only_storage_before && pb < mir.bb_count {
+                            let pbb = unsafe { mir_bb_at(mir.bbs, pb) };
+                            if unsafe { (*pbb).has_terminator } {
+                                let ptk = unsafe { (*pbb).terminator.kind };
+                                if ptk == MIR_TERM_CALL && (unsafe { (*pbb).terminator.call_target.v }) == (b as u32) {
+                                    pred_cnt = pred_cnt + 1u32;
+                                    call_pred_b = pb;
+                                } else if ptk == MIR_TERM_GOTO && (unsafe { (*pbb).terminator.goto_target.v }) == (b as u32) {
+                                    pred_cnt = pred_cnt + 2u32;
+                                } else if ptk == MIR_TERM_DROP && (unsafe { (*pbb).terminator.drop_target.v }) == (b as u32) {
+                                    pred_cnt = pred_cnt + 2u32;
+                                } else if ptk == MIR_TERM_ASSERT && (unsafe { (*pbb).terminator.assert_target.v }) == (b as u32) {
+                                    pred_cnt = pred_cnt + 2u32;
+                                } else if ptk == MIR_TERM_SWITCH_INT {
+                                    if (unsafe { (*pbb).terminator.otherwise.v }) == (b as u32) {
+                                        pred_cnt = pred_cnt + 2u32;
+                                    }
+                                    let mut sk_i: usize = 0;
+                                    while sk_i < (unsafe { (*pbb).terminator.switch_count }) && (unsafe { (*pbb).terminator.targets as usize }) != 0 {
+                                        if (unsafe { (*mir_bb_id_at((*pbb).terminator.targets, sk_i)).v }) == (b as u32) {
+                                            pred_cnt = pred_cnt + 2u32;
+                                        }
+                                        sk_i = sk_i + 1;
+                                    }
+                                }
+                            }
+                            pb = pb + 1;
+                        }
+                        if pred_cnt == 1u32 && call_pred_b < mir.bb_count &&
+                           sroa_count_local_defs(view(*mir), 0u32) == 1u32 {
+                            let cbb = unsafe { mir_bb_at(mir.bbs, call_pred_b) };
+                            if (unsafe { (*cbb).terminator.has_destination }) &&
+                               (unsafe { (*cbb).terminator.destination.local.v }) == tmp_loc &&
+                               (unsafe { (*cbb).terminator.destination.proj_count }) == 0 &&
+                               (unsafe { (*cbb).terminator.destination.drop_flag }) == MIR_DROP_FLAG_NONE {
+                                unsafe { (*cbb).terminator.destination.local.v = 0u32; }
+                                sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, ret_s);
+                                if (info as usize) != 0 {
+                                    unsafe { (*info).rvo_applied = true; }
+                                }
+                                stats.rvo_promotions = stats.rvo_promotions + 1u32;
+                                sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+                                    decision: SROA_DECISION_RVO,
+                                    block_reason: SROA_BLOCK_NONE,
+                                    agg_kind: ret_ak,
+                                    local_id: tmp_loc,
+                                    target_local: 0u32,
+                                    leaf_count: 1u32,
+                                    bb_idx: call_pred_b as u32,
+                                });
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        b = b + 1;
+    }
+    changed
+}
+
+fn sroa_try_nrvo_for_local(
+    mir: mut_view<MirBody>,
+    cand: u32,
+    agg_kind: u8,
+    info: *mut SroaInfo,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut ret_term_count: u32 = 0u32;
+    let mut ret_assign_count: u32 = 0u32;
+    let mut cand_defs: u32 = 0u32;
+    let mut first_ret_bb: u32 = 0u32;
+
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        if !(unsafe { (*bb).has_terminator }) {
+            return false;
+        }
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                let dst = unsafe { view((*st).place) };
+                let rv = unsafe { view((*st).rvalue) };
+                if sroa_place_proj_uses_local(dst, 0u32) || sroa_place_proj_uses_local(dst, cand) {
+                    return false;
+                }
+                if (dst.local.v == 0u32 || dst.local.v == cand) && dst.drop_flag != MIR_DROP_FLAG_NONE {
+                    return false;
+                }
+                if dst.local.v == 0u32 {
+                    ret_assign_count = ret_assign_count + 1u32;
+                    let mut trailing_ok = true;
+                    let mut ts: usize = s + 1;
+                    while ts < (unsafe { (*bb).stmt_count }) {
+                        let tst = unsafe { mir_stmt_at((*bb).stmts, ts) };
+                        if (unsafe { (*tst).kind }) != MIR_STMT_STORAGE_DEAD ||
+                           (unsafe { (*tst).storage_local.v }) == 0u32 {
+                            trailing_ok = false;
+                        }
+                        ts = ts + 1;
+                    }
+                    if dst.proj_count == 0 && rv.kind == MIR_RVALUE_USE &&
+                       (rv.use_op.kind == MIR_OP_COPY || rv.use_op.kind == MIR_OP_MOVE) &&
+                       rv.use_op.place.local.v == cand && rv.use_op.place.proj_count == 0 &&
+                       rv.use_op.place.drop_flag == MIR_DROP_FLAG_NONE &&
+                       (unsafe { (*bb).terminator.kind }) == MIR_TERM_RETURN &&
+                       trailing_ok {
+                        first_ret_bb = b as u32;
+                    } else {
+                        return false;
+                    }
+                } else {
+                    if dst.local.v == cand {
+                        if dst.proj_count > 0 && (dst.projs as usize) != 0 &&
+                           (unsafe { (*mir_proj_at(dst.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                            return false;
+                        }
+                        cand_defs = cand_defs + 1u32;
+                    }
+                    if sroa_rvalue_uses_local(rv, 0u32) {
+                        return false;
+                    }
+                    if rv.kind == MIR_RVALUE_REF && (rv.place.local.v == 0u32 || rv.place.local.v == cand) {
+                        return false;
+                    }
+                }
+            } else if sk == MIR_STMT_DROP {
+                if sroa_place_uses_local(unsafe { view((*st).place) }, 0u32) ||
+                   sroa_place_uses_local(unsafe { view((*st).place) }, cand) {
+                    return false;
+                }
+            } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+                if (unsafe { (*st).storage_local.v }) == 0u32 {
+                    return false;
+                }
+            }
+            s = s + 1;
+        }
+
+        let tm = unsafe { view((*bb).terminator) };
+        if tm.kind == MIR_TERM_RETURN {
+            ret_term_count = ret_term_count + 1u32;
+        } else if tm.kind == MIR_TERM_DROP {
+            if sroa_place_uses_local(view(tm.drop_place), 0u32) ||
+               sroa_place_uses_local(view(tm.drop_place), cand) {
+                return false;
+            }
+        } else if tm.kind == MIR_TERM_CALL {
+            if tm.has_destination {
+                if sroa_place_proj_uses_local(view(tm.destination), cand) ||
+                   sroa_place_proj_uses_local(view(tm.destination), 0u32) ||
+                   tm.destination.local.v == 0u32 {
+                    return false;
+                }
+                if tm.destination.local.v == cand {
+                    if tm.destination.drop_flag != MIR_DROP_FLAG_NONE {
+                        return false;
+                    }
+                    if tm.destination.proj_count > 0 && (tm.destination.projs as usize) != 0 &&
+                       (unsafe { (*mir_proj_at(tm.destination.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                        return false;
+                    }
+                    cand_defs = cand_defs + 1u32;
+                }
+            }
+            if sroa_operand_uses_local(view(tm.func), cand) || sroa_operand_uses_local(view(tm.func), 0u32) {
+                return false;
+            }
+            let mut ai: usize = 0;
+            while ai < tm.arg_count && (tm.args as usize) != 0 {
+                let ap = unsafe { mir_op_at(tm.args, ai) };
+                if sroa_operand_uses_local(unsafe { view(*ap) }, cand) ||
+                   sroa_operand_uses_local(unsafe { view(*ap) }, 0u32) {
+                    return false;
+                }
+                ai = ai + 1;
+            }
+        }
+        b = b + 1;
+    }
+
+    if ret_term_count == 0u32 || ret_assign_count != ret_term_count || cand_defs == 0u32 {
+        return false;
+    }
+
+    // Rewrite all occurrences of `cand` into caller return slot `_0` and remove `_0 = Copy/Move(cand)`
+    let mut wb: usize = 0;
+    while wb < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, wb) };
+        let mut ws: usize = 0;
+        while ws < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, ws) };
+            let sk = unsafe { (*st).kind };
+            if (sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD) &&
+               (unsafe { (*st).storage_local.v }) == cand {
+                sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, ws);
+                continue;
+            }
+            if sk == MIR_STMT_ASSIGN {
+                if (unsafe { (*st).place.local.v }) == 0u32 &&
+                   (unsafe { (*st).place.proj_count }) == 0 &&
+                   (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+                   ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY ||
+                    (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE) &&
+                   (unsafe { (*st).rvalue.use_op.place.local.v }) == cand &&
+                   (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+                    sroa_mir_remove_stmt_at(unsafe { mut_view(*bb) }, ws);
+                    continue;
+                }
+                if (unsafe { (*st).place.local.v }) == cand {
+                    unsafe { (*st).place.local.v = 0u32; }
+                }
+                let rvk = unsafe { (*st).rvalue.kind };
+                if sroa_rvalue_has_use_op(rvk) &&
+                   ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY ||
+                    (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE) &&
+                   (unsafe { (*st).rvalue.use_op.place.local.v }) == cand {
+                    unsafe { (*st).rvalue.use_op.place.local.v = 0u32; }
+                } else if sroa_rvalue_has_bin_ops(rvk) {
+                    if ((unsafe { (*st).rvalue.lhs.kind }) == MIR_OP_COPY ||
+                        (unsafe { (*st).rvalue.lhs.kind }) == MIR_OP_MOVE) &&
+                       (unsafe { (*st).rvalue.lhs.place.local.v }) == cand {
+                        unsafe { (*st).rvalue.lhs.place.local.v = 0u32; }
+                    }
+                    if ((unsafe { (*st).rvalue.rhs.kind }) == MIR_OP_COPY ||
+                        (unsafe { (*st).rvalue.rhs.kind }) == MIR_OP_MOVE) &&
+                       (unsafe { (*st).rvalue.rhs.place.local.v }) == cand {
+                        unsafe { (*st).rvalue.rhs.place.local.v = 0u32; }
+                    }
+                } else if (rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT) &&
+                          (unsafe { (*st).rvalue.place.local.v }) == cand {
+                    unsafe { (*st).rvalue.place.local.v = 0u32; }
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let mut ao: usize = 0;
+                    while ao < (unsafe { (*st).rvalue.operand_count }) && (unsafe { (*st).rvalue.operands as usize }) != 0 {
+                        let op_p = unsafe { mir_op_at((*st).rvalue.operands, ao) };
+                        if ((unsafe { (*op_p).kind }) == MIR_OP_COPY || (unsafe { (*op_p).kind }) == MIR_OP_MOVE) &&
+                           (unsafe { (*op_p).place.local.v }) == cand {
+                            unsafe { (*op_p).place.local.v = 0u32; }
+                        }
+                        ao = ao + 1;
+                    }
+                }
+            }
+            ws = ws + 1;
+        }
+        let wtk = unsafe { (*bb).terminator.kind };
+        if wtk == MIR_TERM_SWITCH_INT {
+            if ((unsafe { (*bb).terminator.discr.kind }) == MIR_OP_COPY ||
+                (unsafe { (*bb).terminator.discr.kind }) == MIR_OP_MOVE) &&
+               (unsafe { (*bb).terminator.discr.place.local.v }) == cand {
+                unsafe { (*bb).terminator.discr.place.local.v = 0u32; }
+            }
+        } else if wtk == MIR_TERM_ASSERT {
+            if ((unsafe { (*bb).terminator.cond.kind }) == MIR_OP_COPY ||
+                (unsafe { (*bb).terminator.cond.kind }) == MIR_OP_MOVE) &&
+               (unsafe { (*bb).terminator.cond.place.local.v }) == cand {
+                unsafe { (*bb).terminator.cond.place.local.v = 0u32; }
+            }
+        } else if wtk == MIR_TERM_CALL {
+            if (unsafe { (*bb).terminator.has_destination }) &&
+               (unsafe { (*bb).terminator.destination.local.v }) == cand {
+                unsafe { (*bb).terminator.destination.local.v = 0u32; }
+            }
+        }
+        wb = wb + 1;
+    }
+
+    if (info as usize) != 0 {
+        unsafe {
+            (*info).nrvo_applied = true;
+            (*info).nrvo_local = cand;
+        }
+    }
+    stats.nrvo_promotions = stats.nrvo_promotions + 1u32;
+    sroa_log_push(log, mut_view(*arena), SroaDecisionRecord {
+        decision: SROA_DECISION_NRVO,
+        block_reason: SROA_BLOCK_NONE,
+        agg_kind: agg_kind,
+        local_id: cand,
+        target_local: 0u32,
+        leaf_count: 1u32,
+        bb_idx: first_ret_bb,
+    });
+    true
+}
+
+pub fn sroa_apply_rvo_nrvo_mir(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    esc_info: *const EscapeInfo,
+    info: *mut SroaInfo,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    if mir.bb_count == 0 || mir.local_count == 0 || (mir.bbs as usize) == 0 || (mir.locals as usize) == 0 {
+        return false;
+    }
+    let mut changed = false;
+
+    // 1. Direct RVO & Chained Call Return-Slot Forwarding (`AXS-INL-012.1`, `AXS-INL-012.3`)
+    if sroa_try_direct_rvo(mut_view(*mir), thir, info, mut_view(*stats), log, mut_view(*arena)) {
+        changed = true;
+    }
+
+    // 2. Named Return Value Optimization (`NRVO`, `AXS-INL-012.2`)
+    let ret_ty_v = unsafe { (*mir_local_at(mir.locals, 0)).ty.v };
+    let ret_ak = sroa_type_agg_kind(thir, TypeId { v: ret_ty_v });
+    if ret_ak != SROA_AGG_NONE && !sroa_has_aliasing_view_or_ptr_param(view(*mir), thir) {
+        let mut l: usize = mir.arg_count + 1;
+        while l < mir.local_count {
+            let lty_v = unsafe { (*mir_local_at(mir.locals, l)).ty.v };
+            let lkind = unsafe { (*mir_local_at(mir.locals, l)).kind };
+            if lkind != MIR_LOCAL_ARG && lty_v == ret_ty_v {
+                let mut esc_ok = true;
+                if (esc_info as usize) != 0 && l < (unsafe { (*esc_info).local_count }) {
+                    let elp = unsafe { escape_local_at((*esc_info).locals, l) };
+                    let ecls = unsafe { (*elp).escape_class };
+                    if (ecls != ESCAPE_RETURN_ESCAPE && ecls != ESCAPE_NO_ESCAPE) ||
+                       (unsafe { (*elp).address_observable }) || (unsafe { (*elp).stable_address }) ||
+                       (unsafe { (*elp).borrow_taken }) || (unsafe { (*elp).is_fixed_mmio }) ||
+                       (unsafe { (*elp).is_volatile_atomic }) || (unsafe { (*elp).is_zero_copy_pinned }) {
+                        esc_ok = false;
+                    }
+                } else if sroa_local_is_borrowed_in_mir(view(*mir), l as u32) {
+                    esc_ok = false;
+                }
+                if esc_ok {
+                    if sroa_try_nrvo_for_local(mut_view(*mir), l as u32, ret_ak, info, mut_view(*stats), log, mut_view(*arena)) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            l = l + 1;
+        }
+    }
+
+    changed
+}
+
+// --- Section 4: `PassManager` Verification, Rollback, & Orchestration (`SPEC-73 AXS-INL-034.1`) ---
+
+fn sroa_mir_effective_arg_count(mir: view<MirBody>) -> usize {
+    let mut argc = mir.arg_count;
+    if argc + 1 > mir.local_count {
+        argc = if mir.local_count > 0 { mir.local_count - 1 } else { 0 };
+    }
+    if (mir.locals as usize) != 0 {
+        let mut scan: usize = 0;
+        let mut l: usize = 1;
+        while l < mir.local_count {
+            if (unsafe { (*mir_local_at(mir.locals, l)).kind }) == MIR_LOCAL_ARG {
+                scan = l;
+                l = l + 1;
+            } else {
+                break;
+            }
+        }
+        if scan > argc {
+            argc = scan;
+        }
+    }
+    argc
+}
+
+fn sroa_opt_body_has_args(body: view<OptBody>) -> bool {
+    if body.arg_count > 0 {
+        return true;
+    }
+    if (body.orig_mir as usize) != 0 {
+        return sroa_mir_effective_arg_count(unsafe { view(*body.orig_mir) }) > 0;
+    }
+    false
+}
+
+pub fn sroa_ensure_fn_item_for_mir(
+    mir: view<MirBody>,
+    fn_item: *const HirItem,
+    arena: mut_view<Arena>
+) -> *const HirItem {
+    if (fn_item as usize) != 0 {
+        return fn_item;
+    }
+    let argc = sroa_mir_effective_arg_count(mir);
+    if argc == 0 {
+        return 0 as *const HirItem;
+    }
+    let item_ptr = arena_alloc_raw(mut_view(*arena), size_of<HirItem>(), align_of<HirItem>()) as *mut HirItem;
+    sroa_zero_bytes(item_ptr as *mut u8, size_of<HirItem>());
+    let dummy_ty = arena_alloc_raw(mut_view(*arena), size_of<HirType>(), align_of<HirType>()) as *mut HirType;
+    sroa_zero_bytes(dummy_ty as *mut u8, size_of<HirType>());
+    unsafe {
+        (*dummy_ty).kind = HIR_TYPE_PATH;
+        (*item_ptr).kind = HIR_ITEM_FN;
+        (*item_ptr).symbol = SymbolId { v: mir.fn_sym.v };
+        (*item_ptr).name = StrId { v: mir.fn_name.v };
+        (*item_ptr).span = mir.span;
+        (*item_ptr).ret_type = dummy_ty;
+    }
+    let mut head: *mut HirParam = 0 as *mut HirParam;
+    let mut tail: *mut HirParam = 0 as *mut HirParam;
+    let mut p: usize = 0;
+    while p < argc {
+        let param_ptr = arena_alloc_raw(mut_view(*arena), size_of<HirParam>(), align_of<HirParam>()) as *mut HirParam;
+        sroa_zero_bytes(param_ptr as *mut u8, size_of<HirParam>());
+        unsafe {
+            (*param_ptr).ty = dummy_ty;
+            if (head as usize) == 0 {
+                head = param_ptr;
+                tail = param_ptr;
+            } else {
+                (*tail).next = param_ptr;
+                tail = param_ptr;
+            }
+        }
+        p = p + 1;
+    }
+    unsafe { (*item_ptr).params = head; }
+    item_ptr as *const HirItem
+}
+
+fn sroa_bitset_get(bits: *const u64, bit_idx: usize, local_count: usize) -> bool {
+    if (bits as usize) == 0 || bit_idx >= local_count {
+        return false;
+    }
+    let w = bit_idx / 64;
+    let sh = (bit_idx % 64) as u64;
+    let word = unsafe { *sroa_u64_at(bits as *mut u64, w) };
+    ((word >> sh) & 1u64) != 0u64
+}
+
+fn sroa_bitset_set(bits: *mut u64, bit_idx: usize, local_count: usize) {
+    if (bits as usize) == 0 || bit_idx >= local_count {
+        return;
+    }
+    let w = bit_idx / 64;
+    let sh = (bit_idx % 64) as u64;
+    unsafe {
+        let wp = sroa_u64_at(bits, w);
+        *wp = (*wp) | (1u64 << sh);
+    }
+}
+
+fn sroa_prop_bb_bits(
+    bb_in: *mut u64,
+    cur: *const u64,
+    target_v: u32,
+    bb_count: usize,
+    words: usize
+) -> bool {
+    if (target_v as usize) >= bb_count || words == 0 {
+        return false;
+    }
+    let mut changed = false;
+    let base = sroa_mul_usize(target_v as usize, words);
+    let mut w: usize = 0;
+    while w < words {
+        let dp = unsafe { sroa_u64_at(bb_in, base + w) };
+        let old_v = unsafe { *dp };
+        let cur_v = unsafe { *sroa_u64_at(cur as *mut u64, w) };
+        let new_v = old_v & cur_v;
+        if new_v != old_v {
+            unsafe { *dp = new_v; }
+            changed = true;
+        }
+        w = w + 1;
+    }
+    changed
+}
+
+fn sroa_mir_return_is_unit_or_error(mir: view<MirBody>, thir: *const Thir) -> bool {
+    if mir.local_count == 0 || (mir.locals as usize) == 0 || (thir as usize) == 0 {
+        return false;
+    }
+    let loc0_ty = TypeId { v: unsafe { (*mir_local_at(mir.locals, 0)).ty.v } };
+    let ret_t = verify_safe_type_get(unsafe { view((*thir).interner) }, loc0_ty);
+    if (ret_t as usize) == 0 {
+        return true;
+    }
+    let rk = unsafe { (*ret_t).kind };
+    rk == TY_UNIT || rk == TY_ERROR
+}
+
+fn sroa_check_proj_indices_init(pl: view<MirPlace>, cur: *const u64, local_count: usize) -> bool {
+    let mut p: usize = 0;
+    while p < pl.proj_count && (pl.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(pl.projs, p) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX {
+            if !sroa_bitset_get(cur, (unsafe { (*pr).index_local.v }) as usize, local_count) {
+                return false;
+            }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if (unsafe { (*pr).has_from }) &&
+               !sroa_bitset_get(cur, (unsafe { (*pr).from_local.v }) as usize, local_count) {
+                return false;
+            }
+            if (unsafe { (*pr).has_to }) &&
+               !sroa_bitset_get(cur, (unsafe { (*pr).to_local.v }) as usize, local_count) {
+                return false;
+            }
+        }
+        p = p + 1;
+    }
+    true
+}
+
+fn sroa_check_op_init(op: view<MirOperand>, cur: *const u64, local_count: usize) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        if !sroa_bitset_get(cur, op.place.local.v as usize, local_count) {
+            return false;
+        }
+        if !sroa_check_proj_indices_init(view(op.place), cur, local_count) {
+            return false;
+        }
+    }
+    true
+}
+
+pub fn sroa_verify_mir_definite_init(mir: view<MirBody>, thir: *const Thir, arena: mut_view<Arena>) -> bool {
+    if mir.bb_count == 0 || mir.local_count == 0 || (mir.bbs as usize) == 0 || (mir.locals as usize) == 0 {
+        return true;
+    }
+    let local_count = mir.local_count;
+    let words = (local_count + 63) / 64;
+    if words == 0 {
+        return true;
+    }
+    let total_words = sroa_mul_usize(mir.bb_count, words);
+    let bb_in = arena_alloc_raw(mut_view(*arena), sroa_mul_usize(total_words, size_of<u64>()), align_of<u64>()) as *mut u64;
+    let bb_out = arena_alloc_raw(mut_view(*arena), sroa_mul_usize(total_words, size_of<u64>()), align_of<u64>()) as *mut u64;
+    let cur = arena_alloc_raw(mut_view(*arena), sroa_mul_usize(words, size_of<u64>()), align_of<u64>()) as *mut u64;
+
+    let mut wi: usize = 0;
+    while wi < total_words {
+        unsafe {
+            *sroa_u64_at(bb_in, wi) = 0xFFFFFFFFFFFFFFFFu64;
+            *sroa_u64_at(bb_out, wi) = 0xFFFFFFFFFFFFFFFFu64;
+        }
+        wi = wi + 1;
+    }
+    let mut w0: usize = 0;
+    while w0 < words {
+        unsafe {
+            *sroa_u64_at(bb_in, w0) = 0u64;
+            *sroa_u64_at(cur, w0) = 0u64;
+        }
+        w0 = w0 + 1;
+    }
+
+    let argc = sroa_mir_effective_arg_count(mir);
+    let mut p: usize = 1;
+    while p <= argc && p < local_count {
+        sroa_bitset_set(bb_in, p, local_count);
+        p = p + 1;
+    }
+    let mut cl: usize = 0;
+    while cl < local_count {
+        let lk = unsafe { (*mir_local_at(mir.locals, cl)).kind };
+        if lk == MIR_LOCAL_CONST || lk == MIR_LOCAL_ARG {
+            sroa_bitset_set(bb_in, cl, local_count);
+        }
+        cl = cl + 1;
+    }
+    if sroa_mir_return_is_unit_or_error(mir, thir) {
+        sroa_bitset_set(bb_in, 0, local_count);
+    }
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        let mut bi: usize = 0;
+        while bi < mir.bb_count {
+            let bb = unsafe { mir_bb_at(mir.bbs, bi) };
+            let off = sroa_mul_usize(bi, words);
+            let mut cw: usize = 0;
+            while cw < words {
+                unsafe { *sroa_u64_at(cur, cw) = *sroa_u64_at(bb_in, off + cw); }
+                cw = cw + 1;
+            }
+            let scnt = unsafe { (*bb).stmt_count };
+            let mut si: usize = 0;
+            while si < scnt {
+                let st = unsafe { mir_stmt_at((*bb).stmts, si) };
+                if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                    sroa_bitset_set(cur, (unsafe { (*st).place.local.v }) as usize, local_count);
+                }
+                si = si + 1;
+            }
+            if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+                if (unsafe { (*bb).terminator.has_destination }) || (unsafe { (*bb).terminator.destination.local.v }) != 0u32 {
+                    sroa_bitset_set(cur, (unsafe { (*bb).terminator.destination.local.v }) as usize, local_count);
+                }
+            }
+            let mut eq = true;
+            let mut ew: usize = 0;
+            while ew < words {
+                if (unsafe { *sroa_u64_at(cur, ew) }) != (unsafe { *sroa_u64_at(bb_out, off + ew) }) {
+                    eq = false;
+                }
+                ew = ew + 1;
+            }
+            if !eq {
+                let mut sw: usize = 0;
+                while sw < words {
+                    unsafe { *sroa_u64_at(bb_out, off + sw) = *sroa_u64_at(cur, sw); }
+                    sw = sw + 1;
+                }
+                changed = true;
+            }
+            if unsafe { (*bb).has_terminator } {
+                let tk = unsafe { (*bb).terminator.kind };
+                if tk == MIR_TERM_GOTO {
+                    if sroa_prop_bb_bits(bb_in, cur as *const u64, unsafe { (*bb).terminator.goto_target.v }, mir.bb_count, words) {
+                        changed = true;
+                    }
+                } else if tk == MIR_TERM_SWITCH_INT {
+                    let sc = unsafe { (*bb).terminator.switch_count };
+                    let tgts = unsafe { (*bb).terminator.targets };
+                    let mut k: usize = 0;
+                    while k < sc && (tgts as usize) != 0 {
+                        let tid = unsafe { (*mir_bb_id_at(tgts, k)).v };
+                        if sroa_prop_bb_bits(bb_in, cur as *const u64, tid, mir.bb_count, words) {
+                            changed = true;
+                        }
+                        k = k + 1;
+                    }
+                    if sroa_prop_bb_bits(bb_in, cur as *const u64, unsafe { (*bb).terminator.otherwise.v }, mir.bb_count, words) {
+                        changed = true;
+                    }
+                } else if tk == MIR_TERM_DROP {
+                    if sroa_prop_bb_bits(bb_in, cur as *const u64, unsafe { (*bb).terminator.drop_target.v }, mir.bb_count, words) {
+                        changed = true;
+                    }
+                    let du = unsafe { (*bb).terminator.drop_unwind.v };
+                    if du > 0u32 && sroa_prop_bb_bits(bb_in, cur as *const u64, du, mir.bb_count, words) {
+                        changed = true;
+                    }
+                } else if tk == MIR_TERM_CALL {
+                    if sroa_prop_bb_bits(bb_in, cur as *const u64, unsafe { (*bb).terminator.call_target.v }, mir.bb_count, words) {
+                        changed = true;
+                    }
+                    let cu = unsafe { (*bb).terminator.call_unwind.v };
+                    if cu > 0u32 && sroa_prop_bb_bits(bb_in, cur as *const u64, cu, mir.bb_count, words) {
+                        changed = true;
+                    }
+                } else if tk == MIR_TERM_ASSERT {
+                    if sroa_prop_bb_bits(bb_in, cur as *const u64, unsafe { (*bb).terminator.assert_target.v }, mir.bb_count, words) {
+                        changed = true;
+                    }
+                    let au = unsafe { (*bb).terminator.assert_unwind.v };
+                    if au > 0u32 && sroa_prop_bb_bits(bb_in, cur as *const u64, au, mir.bb_count, words) {
+                        changed = true;
+                    }
+                }
+            }
+            bi = bi + 1;
+        }
+    }
+
+    let mut cb: usize = 0;
+    while cb < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, cb) };
+        let off = sroa_mul_usize(cb, words);
+        let mut cw: usize = 0;
+        while cw < words {
+            unsafe { *sroa_u64_at(cur, cw) = *sroa_u64_at(bb_in, off + cw); }
+            cw = cw + 1;
+        }
+        let scnt = unsafe { (*bb).stmt_count };
+        let mut si: usize = 0;
+        while si < scnt {
+            let st = unsafe { mir_stmt_at((*bb).stmts, si) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                let dst = unsafe { view((*st).place) };
+                if !sroa_check_proj_indices_init(dst, cur as *const u64, local_count) {
+                    return false;
+                }
+                if dst.proj_count > 0 && (dst.projs as usize) != 0 &&
+                   (unsafe { (*mir_proj_at(dst.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                    if !sroa_bitset_get(cur as *const u64, dst.local.v as usize, local_count) {
+                        return false;
+                    }
+                }
+                let rv = unsafe { view((*st).rvalue) };
+                let rvk = rv.kind;
+                if rvk == MIR_RVALUE_REPEAT && (rv.repeat_count_op as usize) != 0 {
+                    if !sroa_check_op_init(unsafe { view(*rv.repeat_count_op) }, cur as *const u64, local_count) {
+                        return false;
+                    }
+                }
+                if sroa_rvalue_has_use_op(rvk) {
+                    if !sroa_check_op_init(view(rv.use_op), cur as *const u64, local_count) {
+                        return false;
+                    }
+                } else if sroa_rvalue_has_bin_ops(rvk) {
+                    if !sroa_check_op_init(view(rv.lhs), cur as *const u64, local_count) ||
+                       !sroa_check_op_init(view(rv.rhs), cur as *const u64, local_count) {
+                        return false;
+                    }
+                } else if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+                    if !sroa_check_proj_indices_init(view(rv.place), cur as *const u64, local_count) {
+                        return false;
+                    }
+                    if rvk == MIR_RVALUE_DISCRIMINANT {
+                        if !sroa_bitset_get(cur as *const u64, rv.place.local.v as usize, local_count) {
+                            return false;
+                        }
+                    } else if rv.place.proj_count > 0 && (rv.place.projs as usize) != 0 &&
+                              (unsafe { (*mir_proj_at(rv.place.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                        if !sroa_bitset_get(cur as *const u64, rv.place.local.v as usize, local_count) {
+                            return false;
+                        }
+                    }
+                } else if rvk == MIR_RVALUE_AGGREGATE {
+                    let mut ao: usize = 0;
+                    while ao < rv.operand_count && (rv.operands as usize) != 0 {
+                        let op_p = unsafe { mir_op_at(rv.operands, ao) };
+                        if !sroa_check_op_init(unsafe { view(*op_p) }, cur as *const u64, local_count) {
+                            return false;
+                        }
+                        ao = ao + 1;
+                    }
+                }
+                sroa_bitset_set(cur, dst.local.v as usize, local_count);
+            } else if sk == MIR_STMT_DROP {
+                let dpl = unsafe { view((*st).place) };
+                if !sroa_check_proj_indices_init(dpl, cur as *const u64, local_count) {
+                    return false;
+                }
+                if dpl.drop_flag == MIR_DROP_FLAG_NONE && mir.drop_flag_count == 0 {
+                    if !sroa_bitset_get(cur as *const u64, dpl.local.v as usize, local_count) {
+                        return false;
+                    }
+                }
+            }
+            si = si + 1;
+        }
+
+        if !(unsafe { (*bb).has_terminator }) {
+            return false;
+        }
+        let tm = unsafe { view((*bb).terminator) };
+        if tm.kind == MIR_TERM_SWITCH_INT {
+            if !sroa_check_op_init(view(tm.discr), cur as *const u64, local_count) {
+                return false;
+            }
+        } else if tm.kind == MIR_TERM_ASSERT {
+            if !sroa_check_op_init(view(tm.cond), cur as *const u64, local_count) {
+                return false;
+            }
+        } else if tm.kind == MIR_TERM_DROP {
+            if !sroa_check_proj_indices_init(view(tm.drop_place), cur as *const u64, local_count) {
+                return false;
+            }
+            if tm.drop_flag == MIR_DROP_FLAG_NONE && mir.drop_flag_count == 0 {
+                if !sroa_bitset_get(cur as *const u64, tm.drop_place.local.v as usize, local_count) {
+                    return false;
+                }
+            }
+        } else if tm.kind == MIR_TERM_CALL {
+            if !sroa_check_op_init(view(tm.func), cur as *const u64, local_count) {
+                return false;
+            }
+            let mut ai: usize = 0;
+            while ai < tm.arg_count && (tm.args as usize) != 0 {
+                let ap = unsafe { mir_op_at(tm.args, ai) };
+                if !sroa_check_op_init(unsafe { view(*ap) }, cur as *const u64, local_count) {
+                    return false;
+                }
+                ai = ai + 1;
+            }
+            if tm.has_destination {
+                if !sroa_check_proj_indices_init(view(tm.destination), cur as *const u64, local_count) {
+                    return false;
+                }
+                if tm.destination.proj_count > 0 && (tm.destination.projs as usize) != 0 &&
+                   (unsafe { (*mir_proj_at(tm.destination.projs, 0)).kind }) == MIR_PROJ_DEREF {
+                    if !sroa_bitset_get(cur as *const u64, tm.destination.local.v as usize, local_count) {
+                        return false;
+                    }
+                }
+            }
+        } else if tm.kind == MIR_TERM_RETURN && local_count > 0 {
+            if !sroa_bitset_get(cur as *const u64, 0, local_count) {
+                return false;
+            }
+        }
+        cb = cb + 1;
+    }
+    true
+}
+
+pub fn sroa_verify_mir_body_complete(
+    mir: view<MirBody>,
+    thir: *const Thir,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let prev_errs = sink.errors;
+    let eff_fn = sroa_ensure_fn_item_for_mir(mir, 0 as *const HirItem, mut_view(*arena));
+    verify_mir(mir, thir, mut_view(*sink), eff_fn);
+    if sink.errors != prev_errs {
+        return false;
+    }
+    if (eff_fn as usize) != 0 {
+        if !sroa_verify_mir_definite_init(mir, thir, mut_view(*arena)) {
+            return false;
+        }
+    }
+    true
+}
+
+fn sroa_verify_body_capabilities(body: view<OptBody>) -> bool {
+    let mut b: usize = 0;
+    while b < body.bb_count && (body.blocks as usize) != 0 {
+        let bb = unsafe { opt_block_at(body.blocks, b) };
+        if unsafe { (*bb).is_reachable } {
+            let icnt = unsafe { (*bb).inst_count };
+            let insts = unsafe { (*bb).insts };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at(insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                let dlv = (unsafe { (*inst).place.local.v }) as usize;
+                if dlv < body.local_count && (body.local_tys as usize) != 0 && (body.thir as usize) != 0 {
+                    let lty = unsafe { *opt_typeid_at(body.local_tys, dlv) };
+                    let lt = verify_safe_type_get(unsafe { view((*body.thir).interner) }, lty);
+                    if (lt as usize) != 0 && (unsafe { (*lt).kind }) == TY_VIEW {
+                        if (unsafe { (*inst).place.view_kind }) == MIR_VIEW_MUT {
+                            return false;
+                        }
+                        if opc == OPT_INST_STORE && (unsafe { (*inst).place.proj_count }) > 0 {
+                            return false;
+                        }
+                    }
+                }
+                let rlv = (unsafe { (*inst).rhs_place.local.v }) as usize;
+                if rlv < body.local_count && (body.local_tys as usize) != 0 && (body.thir as usize) != 0 {
+                    let rty = unsafe { *opt_typeid_at(body.local_tys, rlv) };
+                    let rt = verify_safe_type_get(unsafe { view((*body.thir).interner) }, rty);
+                    if (rt as usize) != 0 && (unsafe { (*rt).kind }) == TY_VIEW {
+                        if (unsafe { (*inst).rhs_place.view_kind }) == MIR_VIEW_MUT {
+                            return false;
+                        }
+                        if opc == OPT_INST_ADDR_OF && (unsafe { (*inst).sub_op }) == MIR_VIEW_MUT {
+                            return false;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        b = b + 1;
+    }
+    true
+}
+
+pub fn sroa_verify_postconditions_arg_aware(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    pass_id: u16,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> u8 {
+    if !sroa_opt_body_has_args(view(*body)) {
+        let pm_pass: u16 = if pass_id == PASS_COPY_MOVE_SROA { PASS_GVN_CSE } else { pass_id };
+        return passmgr_verify_postconditions(mut_view(*pm), mut_view(*body), pm_pass, mut_view(*arena), mut_view(*sink));
+    }
+    let contract = if pass_id == PASS_COPY_MOVE_SROA {
+        sroa_contract()
+    } else {
+        passmgr_contract_for_pass(pass_id)
+    };
+    pm.verify_run_count = pm.verify_run_count + 1u32;
+
+    if (contract.postconditions & (POSTCOND_CFG_VALID | POSTCOND_DOM_VALID | POSTCOND_SSA_VALID | POSTCOND_MEMSSA_VALID)) != 0u32 {
+        let inv_mask = contract.invalidated_analyses & (ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA);
+        if inv_mask != 0u32 {
+            passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), inv_mask);
+        }
+        if !optir_verify_contract(view(*body)) {
+            pm.verify_fail_count = pm.verify_fail_count + 1u32;
+            pm.last_verify_status = CONTRACT_ERR_POSTCOND_CFG_DOM;
+            return CONTRACT_ERR_POSTCOND_CFG_DOM;
+        }
+    }
+
+    if (contract.postconditions & POSTCOND_CAPABILITY_PRESERVED) != 0u32 {
+        if !sroa_verify_body_capabilities(view(*body)) {
+            pm.verify_fail_count = pm.verify_fail_count + 1u32;
+            pm.last_verify_status = CONTRACT_ERR_CAPABILITY_PROMOTION;
+            return CONTRACT_ERR_CAPABILITY_PROMOTION;
+        }
+    }
+
+    if (contract.postconditions & POSTCOND_EFFECTS_PRESERVED) != 0u32 {
+        let cur_eff = effect_infer_body(mut_view(*body), mut_view(*arena), pm.budget.max_symbolic_steps);
+        let cur_vol = cur_eff.volatile_count;
+        let cur_ato = cur_eff.atomic_count;
+        let cur_io = cur_eff.io_count;
+        let cur_drp = cur_eff.drop_count;
+        pm.last_effect_summary = cur_eff;
+        if pm.has_baseline_effects {
+            let base_vol = pm.baseline_effect_summary.volatile_count;
+            let base_ato = pm.baseline_effect_summary.atomic_count;
+            let base_io = pm.baseline_effect_summary.io_count;
+            let base_drp = pm.baseline_effect_summary.drop_count;
+            if cur_vol < base_vol || cur_ato < base_ato || cur_io < base_io || cur_drp < base_drp {
+                pm.verify_fail_count = pm.verify_fail_count + 1u32;
+                pm.last_verify_status = CONTRACT_ERR_POSTCOND_EFFECTS;
+                return CONTRACT_ERR_POSTCOND_EFFECTS;
+            }
+        }
+    }
+
+    if (contract.postconditions & POSTCOND_VERIFIED_MIR) != 0u32 {
+        let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+        if !optir_reconstruct_mir(view(*body), unsafe { mut_view(*rec_mir) }, mut_view(*arena)) {
+            pm.verify_fail_count = pm.verify_fail_count + 1u32;
+            pm.last_verify_status = CONTRACT_ERR_POSTCOND_MIR_VERIFY;
+            return CONTRACT_ERR_POSTCOND_MIR_VERIFY;
+        }
+        let prev_errs = sink.errors;
+        let ok = sroa_verify_mir_body_complete(unsafe { view(*rec_mir) }, body.thir, mut_view(*arena), mut_view(*sink));
+        if !ok || sink.errors != prev_errs {
+            pm.verify_fail_count = pm.verify_fail_count + 1u32;
+            pm.last_verify_status = CONTRACT_ERR_POSTCOND_MIR_VERIFY;
+            return CONTRACT_ERR_POSTCOND_MIR_VERIFY;
+        }
+    }
+
+    pm.last_verify_status = CONTRACT_OK;
+    CONTRACT_OK
+}
+
+pub fn sroa_transform_mir(
+    mir: mut_view<MirBody>,
+    thir: *const Thir,
+    esc_info: *const EscapeInfo,
+    out_info: mut_view<*mut SroaInfo>,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>
+) -> bool {
+    let mut changed = false;
+    let mut first_info: *mut SroaInfo = 0 as *mut SroaInfo;
+
+    // 1. Apply RVO / NRVO first so return-slot aggregates construct directly in `_0` (`AXS-INL-012`)
+    if sroa_apply_rvo_nrvo_mir(mut_view(*mir), thir, esc_info, first_info, mut_view(*stats), log, mut_view(*arena)) {
+        changed = true;
+    }
+
+    // 2. Run deep SROA + Copy/Move propagation cascade (`AXS-INL-010`, `AXS-INL-011`, `AXS-INL-013`)
+    if sroa_scalarize_aggregates_mir(mut_view(*mir), thir, esc_info, mut_view(first_info), mut_view(*stats), log, mut_view(*arena)) {
+        changed = true;
+    }
+
+    // 3. Re-check RVO / NRVO after SROA and copy/move propagation
+    if sroa_apply_rvo_nrvo_mir(mut_view(*mir), thir, 0 as *const EscapeInfo, first_info, mut_view(*stats), log, mut_view(*arena)) {
+        changed = true;
+    }
+
+    if (first_info as usize) == 0 {
+        first_info = sroa_build_info(view(*mir), thir, esc_info, mut_view(*arena));
+    }
+    *out_info = first_info;
+    changed
+}
+
+pub fn sroa_run_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    summary_table: *const EscapeSummaryTable,
+    out_info: mut_view<*mut SroaInfo>,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    *out_info = 0 as *mut SroaInfo;
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = sroa_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<SroaStats>(), align_of<SroaStats>()) as *mut SroaStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_base_flags = pm.baseline_effect_summary.flags;
+    let pre_has_base = pm.has_baseline_effects;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let esc_info = escape_build_info(view(*body), call_table, summary_table, mut_view(*arena));
+    let work_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(view(*body), unsafe { mut_view(*work_mir) }, mut_view(*arena)) {
+        return false;
+    }
+
+    let mut s_info: *mut SroaInfo = 0 as *mut SroaInfo;
+    let changed = sroa_transform_mir(
+        unsafe { mut_view(*work_mir) },
+        body.thir,
+        esc_info as *const EscapeInfo,
+        mut_view(s_info),
+        mut_view(*stats),
+        log,
+        mut_view(*arena)
+    );
+    *out_info = s_info;
+
+    if changed {
+        let mir_ok = sroa_verify_mir_body_complete(
+            unsafe { view(*work_mir) },
+            body.thir,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if !mir_ok || sink.errors != pre_sink_errs {
+            sink.errors = pre_sink_errs;
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            pm.baseline_effect_summary.flags = pre_base_flags;
+            pm.has_baseline_effects = pre_has_base;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*work_mir) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 {
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+
+        let mut pi: usize = 0;
+        let pre_prov_cnt = unsafe { (*pre_body_ptr).provenance_count };
+        let pre_provs = unsafe { (*pre_body_ptr).provenance };
+        while pi < pre_prov_cnt && (pre_provs as usize) != 0 {
+            let pp = unsafe { opt_prov_at(pre_provs, pi) };
+            optir_record_provenance(
+                unsafe { mut_view(*new_ob) },
+                mut_view(*arena),
+                unsafe { (*pp).prop_kind },
+                unsafe { (*pp).certainty },
+                unsafe { (*pp).source_analysis },
+                unsafe { (*pp).subject_val },
+                unsafe { (*pp).aux_val },
+                unsafe { (*pp).at_bb },
+                unsafe { (*pp).at_inst },
+                unsafe { (*pp).pass_id }
+            );
+            pi = pi + 1;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_NO_ESCAPE,
+            CERTAINTY_PROVEN,
+            ANALYSIS_ESCAPE_INFO,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_COPY_MOVE_SROA
+        );
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_NO_ALIAS,
+            CERTAINTY_PROVEN,
+            ANALYSIS_ALIAS_INFO,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_COPY_MOVE_SROA
+        );
+
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+
+        if force_verify_fail && body.bb_count > 0 && (body.blocks as usize) != 0 {
+            let bb0 = unsafe { opt_block_at(body.blocks, 0) };
+            unsafe { (*bb0).pred_count = 999999; }
+        }
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_COPY_MOVE_SROA,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) {
+            sink.errors = pre_sink_errs;
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            pm.baseline_effect_summary.flags = pre_base_flags;
+            pm.has_baseline_effects = pre_has_base;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn sroa_run_pass(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    summary_table: *const EscapeSummaryTable,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut unused_info: *mut SroaInfo = 0 as *mut SroaInfo;
+    sroa_run_pass_internal(
+        mut_view(*pm),
+        mut_view(*body),
+        call_table,
+        summary_table,
+        mut_view(unused_info),
+        mut_view(*stats),
+        log,
+        false,
+        mut_view(*arena),
+        mut_view(*sink)
+    )
+}
+
+pub fn sroa_optimize_mir_in_place(
+    mir_body: mut_view<MirBody>,
+    thir: *const Thir,
+    call_table: *const EffectCallTable,
+    summary_table: *const EscapeSummaryTable,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    fn_item: *const HirItem
+) -> bool {
+    let prev_errs = sink.errors;
+    let eff_fn = sroa_ensure_fn_item_for_mir(view(*mir_body), fn_item, mut_view(*arena));
+    let obody = optir_build_from_mir(view(*mir_body), thir, mut_view(*arena), mut_view(*sink), eff_fn);
+    let mut esc_info: *mut EscapeInfo = 0 as *mut EscapeInfo;
+    if (obody as usize) != 0 && sink.errors == prev_errs {
+        esc_info = escape_build_info(unsafe { view(*obody) }, call_table, summary_table, mut_view(*arena));
+    } else {
+        sink.errors = prev_errs;
+    }
+
+    let mut unused_info: *mut SroaInfo = 0 as *mut SroaInfo;
+    let changed = sroa_transform_mir(
+        mut_view(*mir_body),
+        thir,
+        esc_info as *const EscapeInfo,
+        mut_view(unused_info),
+        mut_view(*stats),
+        log,
+        mut_view(*arena)
+    );
+    if changed {
+        let _ = opt_const_fold(mut_view(*mir_body), thir);
+        let _ = opt_cfg_simplify_with_merge(mut_view(*mir_body), mut_view(*arena));
+        let _ = opt_dce_in_arena(mut_view(*mir_body), mut_view(*arena));
+    }
+    changed
+}
+
+pub fn sroa_optimize_mir_body(
+    mir_body: mut_view<MirBody>,
+    thir: *const Thir,
+    profile: u8,
+    verify_each: bool,
+    call_table: *const EffectCallTable,
+    summary_table: *const EscapeSummaryTable,
+    stats: mut_view<SroaStats>,
+    log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    fn_item: *const HirItem
+) -> bool {
+    *stats = sroa_stats_zero();
+    let prev_errs = sink.errors;
+    let eff_fn = sroa_ensure_fn_item_for_mir(view(*mir_body), fn_item, mut_view(*arena));
+    if (fn_item as usize) == 0 && (eff_fn as usize) != 0 {
+        if !sroa_verify_mir_definite_init(view(*mir_body), thir, mut_view(*arena)) {
+            return false;
+        }
+    }
+
+    let obody = optir_build_from_mir(view(*mir_body), thir, mut_view(*arena), mut_view(*sink), eff_fn);
+    if (obody as usize) == 0 || sink.errors != prev_errs {
+        return false;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget = opt_budget_for_profile(profile, verify_each);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, mut_view(*arena));
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        if verify_each {
+            let vst = sroa_verify_postconditions_arg_aware(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, PASS_LOWER_MIR, mut_view(*arena), mut_view(*sink));
+            return vst == CONTRACT_OK;
+        }
+        return true;
+    }
+
+    let _did_change = sroa_run_pass(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        summary_table,
+        mut_view(*stats),
+        log,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+    if (unsafe { (*pm_ptr).last_verify_status }) != CONTRACT_OK {
+        return false;
+    }
+
+    let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(unsafe { view(*obody) }, unsafe { mut_view(*rec_mir) }, mut_view(*arena)) {
+        return false;
+    }
+
+    // Run post-SROA constant fold + CFG simplify + DCE cleanup on reconstructed MIR if modified
+    if stats.pass_changes > 0u32 {
+        let _ = opt_const_fold(unsafe { mut_view(*rec_mir) }, thir);
+        let _ = opt_cfg_simplify_with_merge(unsafe { mut_view(*rec_mir) }, mut_view(*arena));
+        let _ = opt_dce_in_arena(unsafe { mut_view(*rec_mir) }, mut_view(*arena));
+    }
+
+    let exit_fn = sroa_ensure_fn_item_for_mir(unsafe { view(*rec_mir) }, fn_item, mut_view(*arena));
+    verify_mir(unsafe { view(*rec_mir) }, thir, mut_view(*sink), exit_fn);
+    if sink.errors != prev_errs {
+        return false;
+    }
+    if (fn_item as usize) == 0 && (exit_fn as usize) != 0 {
+        if !sroa_verify_mir_definite_init(unsafe { view(*rec_mir) }, thir, mut_view(*arena)) {
+            return false;
+        }
+    }
+
+    unsafe {
+        mir_body.sym.v = (*rec_mir).sym.v;
+        mir_body.fn_sym.v = (*rec_mir).fn_sym.v;
+        mir_body.fn_name.v = (*rec_mir).fn_name.v;
+        mir_body.span.file.v = (*rec_mir).span.file.v;
+        mir_body.span.start = (*rec_mir).span.start;
+        mir_body.span.end = (*rec_mir).span.end;
+        mir_body.locals = (*rec_mir).locals;
+        mir_body.local_count = (*rec_mir).local_count;
+        mir_body.local_cap = (*rec_mir).local_cap;
+        mir_body.arg_count = (*rec_mir).arg_count;
+        mir_body.bbs = (*rec_mir).bbs;
+        mir_body.bb_count = (*rec_mir).bb_count;
+        mir_body.bb_cap = (*rec_mir).bb_cap;
+        mir_body.drop_flag_count = (*rec_mir).drop_flag_count;
+    }
+    true
+}
+
+// --- Deterministic `--emit=inline` SROA / RVO / NRVO Decision Formatter (`SPEC-73 §9.2, AXS-INL-035`) ---
+
+const SROA_PRINT_DATA: [164]u8 = [
+    //   0..17  "sroa_decisions {\n"
+    115u8, 114u8, 111u8, 97u8, 95u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8,
+    //  17..26  "  record "
+    32u8, 32u8, 114u8, 101u8, 99u8, 111u8, 114u8, 100u8, 32u8,
+    //  26..41  "SROA_SCALARIZED"
+    83u8, 82u8, 79u8, 65u8, 95u8, 83u8, 67u8, 65u8, 76u8, 65u8, 82u8, 73u8, 90u8, 69u8, 68u8,
+    //  41..53  "SROA_BLOCKED"
+    83u8, 82u8, 79u8, 65u8, 95u8, 66u8, 76u8, 79u8, 67u8, 75u8, 69u8, 68u8,
+    //  53..64  "RVO_APPLIED"
+    82u8, 86u8, 79u8, 95u8, 65u8, 80u8, 80u8, 76u8, 73u8, 69u8, 68u8,
+    //  64..76  "NRVO_APPLIED"
+    78u8, 82u8, 86u8, 79u8, 95u8, 65u8, 80u8, 80u8, 76u8, 73u8, 69u8, 68u8,
+    //  76..85  "COPY_PROP"
+    67u8, 79u8, 80u8, 89u8, 95u8, 80u8, 82u8, 79u8, 80u8,
+    //  85..94  "MOVE_PROP"
+    77u8, 79u8, 86u8, 69u8, 95u8, 80u8, 82u8, 79u8, 80u8,
+    //  94..102 " local=_"
+    32u8, 108u8, 111u8, 99u8, 97u8, 108u8, 61u8, 95u8,
+    // 102..111 " target=_"
+    32u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 61u8, 95u8,
+    // 111..119 " leaves="
+    32u8, 108u8, 101u8, 97u8, 118u8, 101u8, 115u8, 61u8,
+    // 119..127 " reason="
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    // 127..132 " agg="
+    32u8, 97u8, 103u8, 103u8, 61u8,
+    // 132..137 " bb=b"
+    32u8, 98u8, 98u8, 61u8, 98u8,
+    // 137..147 "  summary "
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8,
+    // 147..154 "sroa="
+    115u8, 114u8, 111u8, 97u8, 61u8, 0u8, 0u8,
+    // 154..160 " rvo="
+    32u8, 114u8, 118u8, 111u8, 61u8, 0u8,
+    // 160..164 "}\n"
+    125u8, 10u8, 0u8, 0u8,
+];
+
+fn sroa_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), SROA_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+fn sroa_push_decision_name(out: mut_view<DiagBuffer>, dec: u8) {
+    if dec == SROA_DECISION_SCALARIZED {
+        sroa_push_tbl(mut_view(*out), 26, 15);
+    } else if dec == SROA_DECISION_BLOCKED {
+        sroa_push_tbl(mut_view(*out), 41, 12);
+    } else if dec == SROA_DECISION_RVO {
+        sroa_push_tbl(mut_view(*out), 53, 11);
+    } else if dec == SROA_DECISION_NRVO {
+        sroa_push_tbl(mut_view(*out), 64, 12);
+    } else if dec == SROA_DECISION_COPY_PROP {
+        sroa_push_tbl(mut_view(*out), 76, 9);
+    } else {
+        sroa_push_tbl(mut_view(*out), 85, 9);
+    }
+}
+
+pub fn sroa_print(stats: view<SroaStats>, log: view<SroaDecisionLog>, out: mut_view<DiagBuffer>) {
+    sroa_push_tbl(mut_view(*out), 0, 17);
+    let mut i: usize = 0;
+    while i < log.count && (log.records as usize) != 0 {
+        let rp = unsafe { sroa_record_at(log.records, i) };
+        sroa_push_tbl(mut_view(*out), 17, 9);
+        sroa_push_decision_name(mut_view(*out), unsafe { (*rp).decision });
+        sroa_push_tbl(mut_view(*out), 94, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).local_id });
+        if (unsafe { (*rp).target_local }) != SROA_NONE_IDX {
+            sroa_push_tbl(mut_view(*out), 102, 9);
+            diag_buf_push_u32(mut_view(*out), unsafe { (*rp).target_local });
+        }
+        sroa_push_tbl(mut_view(*out), 111, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).leaf_count });
+        sroa_push_tbl(mut_view(*out), 119, 8);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*rp).block_reason }) as u32);
+        sroa_push_tbl(mut_view(*out), 127, 5);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*rp).agg_kind }) as u32);
+        sroa_push_tbl(mut_view(*out), 132, 5);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).bb_idx });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+    sroa_push_tbl(mut_view(*out), 137, 10);
+    sroa_push_tbl(mut_view(*out), 147, 5);
+    diag_buf_push_u32(mut_view(*out), stats.sroa_aggregates_scalarized);
+    sroa_push_tbl(mut_view(*out), 154, 5);
+    diag_buf_push_u32(mut_view(*out), stats.rvo_promotions + stats.nrvo_promotions);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    sroa_push_tbl(mut_view(*out), 160, 2);
+}

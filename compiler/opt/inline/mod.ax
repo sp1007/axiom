@@ -1,0 +1,3151 @@
+// Semantic Call-Graph Builder, Tarjan SCC Fixed-Point Summary Propagation,
+// Legality vs. Cost-Model Inliner, Transactional Callsite Cloning, and Post-Inline SROA Cascade (T064 / E15.3).
+// Implements SPEC-73 §§1, 4, 8, 9 (AXS-INL-001..005, AXS-INL-013, AXS-INL-020..026, AXS-INL-034, AXS-INL-035):
+//   - Multi-kind semantic `CallGraph` (`DISPATCH_DIRECT`, `DISPATCH_CLOSURE`, `DISPATCH_FN_PTR`,
+//     `DISPATCH_DYN_TRAIT`, `DISPATCH_FFI_EXTERN`, `DISPATCH_ASYNC_SPAWN`, `DISPATCH_GPU_LAUNCH`) (`AXS-INL-002`)
+//   - Deterministic Tarjan `SCC` decomposition & bottom-up reverse topological traversal (`AXS-INL-003`)
+//   - Compiler-derived `EffectSummary` (`Pure` vs `Result<T, E>` normal return vs `MayPanic`) & `FunctionEscapeSummary` (`AXS-INL-004`)
+//   - Closed-world vs open-world reachability (`REACH_ROOT`, `REACH_INTERNAL`, `REACH_DEAD_ELIMINATED`) & `address_taken_fn` (`AXS-INL-005`)
+//   - Two-stage inlining decision engine (`InlineLegality` strictly orthogonal to `CostModel` / `InlineBudget`,
+//     `@inline`, `@inline(always)`, `@inline(never)`, bounded recursive `SCC` unrolling) (`AXS-INL-020..023`)
+//   - Transactional callsite cloning, left-to-right arg binding, local/drop-flag/capability remapping,
+//     and post-inlining `SROA` + `ConstFold` + `SimplifyCFG` + `DCE` cleanup cascade (`AXS-INL-024..026`)
+//   - Deterministic `--emit=callgraph` (`callgraph_print`) and `--emit=inline` (`inline_print`) inspection (`AXS-INL-035`)
+module compiler.opt.inline
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HirItem
+use compiler.types.types.Thir
+use compiler.types.types.TY_CLOSURE
+use compiler.types.types.TY_ENUM
+use compiler.types.types.TY_FN
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PARAM
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_UNIT
+use compiler.types.types.TY_VIEW
+use compiler.types.types.type_get
+use compiler.mir.mir.MIR_CONST_FN
+use compiler.mir.mir.MIR_CONST_UNIT
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_LOCAL_CONST
+use compiler.mir.mir.MIR_LOCAL_TEMP
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_AGGREGATE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_CAST
+use compiler.mir.mir.MIR_RVALUE_DISCRIMINANT
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_REF
+use compiler.mir.mir.MIR_RVALUE_REPEAT
+use compiler.mir.mir.MIR_RVALUE_UNARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_STMT_STORAGE_DEAD
+use compiler.mir.mir.MIR_STMT_STORAGE_LIVE
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MirBb
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalDecl
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.mir_add_bb
+use compiler.mir.mir.mir_add_local
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_bb_push_stmt
+use compiler.mir.mir.mir_clone_place
+use compiler.mir.mir.mir_copy_const
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_copy_proj
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_op_move_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_rvalue_reset
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.mir.mir.mir_u64_at
+use compiler.opt.optir.ANALYSIS_ALIAS_INFO
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ALLOCATES
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_FFI
+use compiler.opt.optir.EFFECT_IO
+use compiler.opt.optir.EFFECT_MAY_PANIC
+use compiler.opt.optir.EFFECT_PURE
+use compiler.opt.optir.EFFECT_READS_MEM
+use compiler.opt.optir.EFFECT_UNKNOWN
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.EFFECT_WRITES_MEM
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_PURE_CALL
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.EffectSummary
+use compiler.opt.effects.effect_call_table_register
+use compiler.opt.effects.effect_infer_body
+use compiler.opt.effects.effect_summary_empty
+use compiler.opt.escape.ESC_EXTERNAL
+use compiler.opt.escape.ESC_GLOBAL_MASK
+use compiler.opt.escape.ESC_NONE
+use compiler.opt.escape.ESC_UNKNOWN
+use compiler.opt.escape.EscapeInfo
+use compiler.opt.escape.EscapeSummaryTable
+use compiler.opt.escape.FunctionEscapeSummary
+use compiler.opt.escape.escape_build_info
+use compiler.opt.escape.escape_summary_init
+use compiler.opt.escape.escape_summary_table_register
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_ESCAPE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_BALANCED_O1
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SIZE_OS
+use compiler.opt.passmgr.OPT_PROFILE_SPEED_O2
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_PURE_CALL
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.const_fold.opt_const_fold
+use compiler.opt.cfg_simp.opt_cfg_simplify_with_merge
+use compiler.opt.dce.opt_dce_in_arena
+use compiler.opt.sroa.SroaDecisionLog
+use compiler.opt.sroa.SroaStats
+use compiler.opt.sroa.sroa_ensure_fn_item_for_mir
+use compiler.opt.sroa.sroa_optimize_mir_in_place
+use compiler.opt.sroa.sroa_print
+use compiler.opt.sroa.sroa_stats_zero
+use compiler.opt.sroa.sroa_type_is_copy
+use compiler.opt.sroa.sroa_verify_mir_body_complete
+use compiler.opt.sroa.sroa_verify_postconditions_arg_aware
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identifier, Extended Profiles, & TransformationContract (`SPEC-73 §8, AXS-INL-034`) ---
+
+pub const PASS_INLINE: u16 = 14u16;
+pub const ANALYSIS_CALL_GRAPH: u8 = 9u8;
+pub const ANALYSIS_MASK_CALL_GRAPH: u32 = 512u32;
+
+pub const OPT_PROFILE_MAX_O3: u8 = 4u8;
+pub const OPT_PROFILE_MINSIZE_OZ: u8 = 5u8;
+
+pub const INLINE_NONE_IDX: u32 = 0xFFFFFFFFu32;
+pub const MAX_SCC_ITERATIONS: u32 = 8u32;
+pub const MAX_INLINE_HISTORY: usize = 32;
+
+pub fn inline_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_INLINE,
+        required_analyses: ANALYSIS_MASK_CALL_GRAPH | ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS |
+                           ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO |
+                           ANALYSIS_MASK_EFFECT_INFO | ANALYSIS_MASK_ESCAPE_INFO,
+        required_proofs: PROP_MASK_REACHABLE | PROP_MASK_PURE_CALL | PROP_MASK_NO_ESCAPE | PROP_MASK_NO_ALIAS,
+        preserved_analyses: ANALYSIS_MASK_CALL_GRAPH,
+        invalidated_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                              ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_ALIAS_INFO | ANALYSIS_MASK_EFFECT_INFO |
+                              ANALYSIS_MASK_ESCAPE_INFO | ANALYSIS_MASK_LOOP_INFO | ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_NO_ESCAPE | PROP_MASK_PURE_CALL,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+// --- Call-Graph Dispatch, Reachability, Attributes, & Legality Codes (`SPEC-73 §§1, 4`) ---
+
+pub const DISPATCH_DIRECT: u8 = 0u8;
+pub const DISPATCH_CLOSURE: u8 = 1u8;
+pub const DISPATCH_FN_PTR: u8 = 2u8;
+pub const DISPATCH_DYN_TRAIT: u8 = 3u8;
+pub const DISPATCH_FFI_EXTERN: u8 = 4u8;
+pub const DISPATCH_ASYNC_SPAWN: u8 = 5u8;
+pub const DISPATCH_GPU_LAUNCH: u8 = 6u8;
+
+pub const REACH_DEAD_ELIMINATED: u8 = 0u8;
+pub const REACH_INTERNAL: u8 = 1u8;
+pub const REACH_ROOT: u8 = 2u8;
+
+pub const INLINE_ATTR_NONE: u8 = 0u8;
+pub const INLINE_ATTR_HINT: u8 = 1u8;
+pub const INLINE_ATTR_ALWAYS: u8 = 2u8;
+pub const INLINE_ATTR_NEVER: u8 = 3u8;
+
+pub const DOMAIN_CPU_HOST: u8 = 0u8;
+pub const DOMAIN_GPU_KERNEL: u8 = 1u8;
+pub const DOMAIN_ASYNC_STATE: u8 = 2u8;
+
+pub const INLINE_ILLEGAL: u8 = 0u8;
+pub const INLINE_LEGAL: u8 = 1u8;
+
+pub const INLINE_REASON_NONE: u8 = 0u8;
+pub const INLINE_REASON_ATTR_INLINE_NEVER: u8 = 1u8;
+pub const INLINE_REASON_EXTERN_NO_BODY: u8 = 2u8;
+pub const INLINE_REASON_INDIRECT_UNPROVEN: u8 = 3u8;
+pub const INLINE_REASON_RECURSIVE_SCC_LIMIT: u8 = 4u8;
+pub const INLINE_REASON_DOMAIN_MISMATCH: u8 = 5u8;
+pub const INLINE_REASON_ASYNC_AWAIT_BOUNDARY: u8 = 6u8;
+pub const INLINE_REASON_UNVERIFIED_BODY: u8 = 7u8;
+pub const INLINE_REASON_PROFILE_O0: u8 = 8u8;
+pub const INLINE_REASON_BUDGET_EXCEEDED: u8 = 9u8;
+pub const INLINE_REASON_ROLLBACK_VERIFY: u8 = 10u8;
+
+pub const INLINE_DECISION_REJECTED: u8 = 0u8;
+pub const INLINE_DECISION_INLINED: u8 = 1u8;
+
+// --- Core CallGraph, SCC, Budget, & Inlining Decision Structures ---
+
+pub struct CallEdge {
+    pub edge_id: u32,
+    pub caller_sym: SymbolId,
+    pub caller_node_idx: u32,
+    pub callsite_bb: OptBbId,
+    pub callsite_inst: OptInstId,
+    pub dispatch_kind: u8,
+    pub known_callee: SymbolId,
+    pub callee_node_idx: u32,
+    pub possible_targets: *mut SymbolId,
+    pub possible_target_count: usize,
+    pub targets_complete: bool,
+    pub is_inlined: bool,
+    pub is_tail_position: bool,
+    pub in_loop_depth: u32,
+    pub is_cold_callsite: bool,
+    pub const_arg_mask: u64,
+    pub view_arg_mask: u64,
+    pub closure_arg_mask: u64,
+    pub span: Span,
+}
+
+pub struct CallGraphNode {
+    pub fn_sym: SymbolId,
+    pub fn_name: StrId,
+    pub node_idx: u32,
+    pub scc_id: u32,
+    pub mir: *mut MirBody,
+    pub opt_body: *mut OptBody,
+    pub fn_item: *const HirItem,
+    pub has_verified_body: bool,
+    pub is_extern_ffi: bool,
+    pub is_export_root: bool,
+    pub is_reflection_root: bool,
+    pub is_cold_fn: bool,
+    pub address_taken_fn: bool,
+    pub inline_attr: u8,
+    pub exec_domain: u8,
+    pub has_await_suspension: bool,
+    pub reachability: u8,
+    pub inst_count: u32,
+    pub direct_caller_count: u32,
+    pub out_edge_start: u32,
+    pub out_edge_count: u32,
+    pub effect_summary: EffectSummary,
+    pub escape_summary: FunctionEscapeSummary,
+    pub returns_result_or_option: bool,
+    pub summary_fingerprint: u64,
+}
+
+@derive(Copy)
+pub struct CallScc {
+    pub scc_id: u32,
+    pub is_recursive: bool,
+    pub member_start: u32,
+    pub member_count: u32,
+    pub fixed_point_iters: u32,
+    pub widened_to_top: bool,
+}
+
+pub struct CallGraph {
+    pub nodes: *mut CallGraphNode,
+    pub node_count: usize,
+    pub node_cap: usize,
+    pub edges: *mut CallEdge,
+    pub edge_count: usize,
+    pub edge_cap: usize,
+    pub sccs: *mut CallScc,
+    pub scc_count: usize,
+    pub scc_members: *mut u32,
+    pub scc_member_count: usize,
+    pub closed_world: bool,
+    pub dynamic_loading_active: bool,
+    pub thir: *const Thir,
+}
+
+@derive(Copy)
+pub struct InlineBudget {
+    pub profile: u8,
+    pub base_threshold_insts: i32,
+    pub max_callee_insts: u32,
+    pub max_caller_growth_pct: u32,
+    pub max_caller_total_insts: u32,
+    pub max_inline_depth: u32,
+    pub max_scc_cycle_depth: u32,
+    pub inline_hint_bonus: i32,
+    pub single_callsite_bonus: i32,
+    pub constant_arg_bonus: i32,
+    pub loop_depth_bonus: i32,
+    pub vectorization_enabler_bonus: i32,
+    pub escape_elim_bonus: i32,
+    pub closure_bonus: i32,
+    pub cold_callsite_penalty: i32,
+}
+
+@derive(Copy)
+pub struct InlineCostDecision {
+    pub legality: u8,
+    pub block_reason: u8,
+    pub profitable: bool,
+    pub forced_by_always: bool,
+    pub base_callee_cost: i32,
+    pub dead_branch_discount: i32,
+    pub call_overhead_saved: i32,
+    pub total_bonus: i32,
+    pub net_cost: i32,
+    pub threshold: i32,
+}
+
+pub struct InlineHistoryChain {
+    pub syms: [32]u32,
+    pub depth: usize,
+}
+
+@derive(Copy)
+pub struct InlineDecisionRecord {
+    pub caller_sym: u32,
+    pub callee_sym: u32,
+    pub callsite_bb: u32,
+    pub attr: u8,
+    pub legality: u8,
+    pub block_reason: u8,
+    pub profitable: bool,
+    pub net_cost: i32,
+    pub threshold: i32,
+    pub decision: u8,
+}
+
+pub struct InlineDecisionLog {
+    pub records: *mut InlineDecisionRecord,
+    pub count: usize,
+    pub cap: usize,
+}
+
+@derive(Copy)
+pub struct InlineStats {
+    pub callsites_analyzed: u32,
+    pub callsites_inlined: u32,
+    pub callsites_rejected_illegal: u32,
+    pub callsites_rejected_cost: u32,
+    pub closures_inlined: u32,
+    pub recursive_scc_bounded: u32,
+    pub post_inline_sroa_cascades: u32,
+    pub dead_fns_marked: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// --- Pointer Indexing & Utility Helpers ---
+
+fn inl_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+fn inl_zero_bytes(dst: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe {
+            let p = ((dst as usize) + i) as *mut u8;
+            *p = 0u8;
+        }
+        i = i + 1;
+    }
+}
+
+pub unsafe fn cg_node_at(base: *mut CallGraphNode, idx: usize) -> *mut CallGraphNode {
+    let off = ((idx as isize) * (size_of<CallGraphNode>() as isize)) as usize;
+    ((base as usize) + off) as *mut CallGraphNode
+}
+
+pub unsafe fn cg_edge_at(base: *mut CallEdge, idx: usize) -> *mut CallEdge {
+    let off = ((idx as isize) * (size_of<CallEdge>() as isize)) as usize;
+    ((base as usize) + off) as *mut CallEdge
+}
+
+pub unsafe fn cg_scc_at(base: *mut CallScc, idx: usize) -> *mut CallScc {
+    let off = ((idx as isize) * (size_of<CallScc>() as isize)) as usize;
+    ((base as usize) + off) as *mut CallScc
+}
+
+pub unsafe fn inl_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = ((idx as isize) * (size_of<u32>() as isize)) as usize;
+    ((base as usize) + off) as *mut u32
+}
+
+pub unsafe fn inl_bool_at(base: *mut bool, idx: usize) -> *mut bool {
+    let off = ((idx as isize) * (size_of<bool>() as isize)) as usize;
+    ((base as usize) + off) as *mut bool
+}
+
+pub unsafe fn inl_sym_at(base: *mut SymbolId, idx: usize) -> *mut SymbolId {
+    let off = ((idx as isize) * (size_of<SymbolId>() as isize)) as usize;
+    ((base as usize) + off) as *mut SymbolId
+}
+
+pub unsafe fn inl_record_at(base: *mut InlineDecisionRecord, idx: usize) -> *mut InlineDecisionRecord {
+    let off = ((idx as isize) * (size_of<InlineDecisionRecord>() as isize)) as usize;
+    ((base as usize) + off) as *mut InlineDecisionRecord
+}
+
+pub fn inline_stats_zero() -> InlineStats {
+    InlineStats {
+        callsites_analyzed: 0u32,
+        callsites_inlined: 0u32,
+        callsites_rejected_illegal: 0u32,
+        callsites_rejected_cost: 0u32,
+        closures_inlined: 0u32,
+        recursive_scc_bounded: 0u32,
+        post_inline_sroa_cascades: 0u32,
+        dead_fns_marked: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+pub fn inline_log_new(arena: mut_view<Arena>, cap: usize) -> *mut InlineDecisionLog {
+    let actual_cap: usize = if cap < 16 { 16 } else { cap };
+    let log = arena_alloc_raw(mut_view(*arena), size_of<InlineDecisionLog>(), align_of<InlineDecisionLog>()) as *mut InlineDecisionLog;
+    let bytes = inl_mul_usize(actual_cap, size_of<InlineDecisionRecord>());
+    let recs = arena_alloc_raw(mut_view(*arena), bytes, align_of<InlineDecisionRecord>()) as *mut InlineDecisionRecord;
+    unsafe {
+        (*log).records = recs;
+        (*log).count = 0;
+        (*log).cap = actual_cap;
+    }
+    log
+}
+
+pub fn inline_log_push(log: *mut InlineDecisionLog, arena: mut_view<Arena>, rec: InlineDecisionRecord) {
+    if (log as usize) == 0 {
+        return;
+    }
+    let cnt = unsafe { (*log).count };
+    let cap = unsafe { (*log).cap };
+    if cnt >= cap {
+        let new_cap: usize = if cap == 0 { 16 } else { cap + cap };
+        let new_bytes = inl_mul_usize(new_cap, size_of<InlineDecisionRecord>());
+        let new_recs = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<InlineDecisionRecord>()) as *mut InlineDecisionRecord;
+        let mut i: usize = 0;
+        while i < cnt {
+            unsafe {
+                let src = inl_record_at((*log).records, i);
+                let dst = inl_record_at(new_recs, i);
+                *dst = *src;
+            }
+            i = i + 1;
+        }
+        unsafe {
+            (*log).records = new_recs;
+            (*log).cap = new_cap;
+        }
+    }
+    unsafe {
+        let dst = inl_record_at((*log).records, cnt);
+        *dst = rec;
+        (*log).count = cnt + 1;
+    }
+}
+
+pub fn inline_history_empty() -> InlineHistoryChain {
+    InlineHistoryChain {
+        syms: [0u32; 32],
+        depth: 0,
+    }
+}
+
+pub fn inline_history_with_root(root_sym: SymbolId) -> InlineHistoryChain {
+    let mut h = inline_history_empty();
+    h.syms[0] = root_sym.v;
+    h.depth = 1;
+    h
+}
+
+pub fn inline_history_count_sym(h: view<InlineHistoryChain>, sym: SymbolId) -> u32 {
+    let mut cnt: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < h.depth && i < MAX_INLINE_HISTORY {
+        if h.syms[i] == sym.v {
+            cnt = cnt + 1u32;
+        }
+        i = i + 1;
+    }
+    cnt
+}
+
+pub fn inline_history_push(h: view<InlineHistoryChain>, sym: SymbolId) -> InlineHistoryChain {
+    let mut out = *h;
+    if (out.depth) < MAX_INLINE_HISTORY {
+        out.syms[out.depth] = sym.v;
+        out.depth = out.depth + 1;
+    }
+    out
+}
+
+// --- Section 1: Semantic CallGraph Construction & Edge Classification (`SPEC-73 §1.2, AXS-INL-002`) ---
+
+pub fn callgraph_new(
+    arena: mut_view<Arena>,
+    thir: *const Thir,
+    closed_world: bool,
+    dynamic_loading_active: bool
+) -> *mut CallGraph {
+    let cg = arena_alloc_raw(mut_view(*arena), size_of<CallGraph>(), align_of<CallGraph>()) as *mut CallGraph;
+    let init_nodes: usize = 16;
+    let init_edges: usize = 32;
+    let nodes = arena_alloc_raw(mut_view(*arena), inl_mul_usize(init_nodes, size_of<CallGraphNode>()), align_of<CallGraphNode>()) as *mut CallGraphNode;
+    let edges = arena_alloc_raw(mut_view(*arena), inl_mul_usize(init_edges, size_of<CallEdge>()), align_of<CallEdge>()) as *mut CallEdge;
+    unsafe {
+        (*cg).nodes = nodes;
+        (*cg).node_count = 0;
+        (*cg).node_cap = init_nodes;
+        (*cg).edges = edges;
+        (*cg).edge_count = 0;
+        (*cg).edge_cap = init_edges;
+        (*cg).sccs = 0 as *mut CallScc;
+        (*cg).scc_count = 0;
+        (*cg).scc_members = 0 as *mut u32;
+        (*cg).scc_member_count = 0;
+        (*cg).closed_world = closed_world;
+        (*cg).dynamic_loading_active = dynamic_loading_active;
+        (*cg).thir = thir;
+    }
+    cg
+}
+
+pub fn callgraph_find_node_idx(cg: view<CallGraph>, fn_sym: SymbolId) -> u32 {
+    if fn_sym.v == 0u32 || (cg.nodes as usize) == 0 {
+        return INLINE_NONE_IDX;
+    }
+    let mut i: usize = 0;
+    while i < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, i) };
+        if (unsafe { (*np).fn_sym.v }) == fn_sym.v {
+            return i as u32;
+        }
+        i = i + 1;
+    }
+    INLINE_NONE_IDX
+}
+
+fn callgraph_count_mir_insts(mir: *const MirBody) -> u32 {
+    if (mir as usize) == 0 {
+        return 0u32;
+    }
+    let m = unsafe { view(*mir) };
+    let mut cnt: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < m.bb_count && (m.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(m.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk != MIR_STMT_STORAGE_LIVE && sk != MIR_STMT_STORAGE_DEAD {
+                cnt = cnt + 1u32;
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            cnt = cnt + 1u32;
+        }
+        b = b + 1;
+    }
+    if cnt == 0u32 { 1u32 } else { cnt }
+}
+
+fn callgraph_fn_returns_result_or_option(mir: *const MirBody, thir: *const Thir) -> bool {
+    if (mir as usize) == 0 || (thir as usize) == 0 {
+        return false;
+    }
+    let m = unsafe { view(*mir) };
+    if m.local_count == 0 || (m.locals as usize) == 0 {
+        return false;
+    }
+    let ret_ty = TypeId { v: unsafe { (*mir_local_at(m.locals, 0)).ty.v } };
+    let tp = type_get(unsafe { view((*thir).interner) }, ret_ty);
+    if (tp as usize) == 0 {
+        return false;
+    }
+    (unsafe { (*tp).kind }) == TY_ENUM
+}
+
+pub fn callgraph_add_node(
+    cg: mut_view<CallGraph>,
+    arena: mut_view<Arena>,
+    fn_sym: SymbolId,
+    fn_name: StrId,
+    mir: *mut MirBody,
+    opt_body: *mut OptBody,
+    fn_item: *const HirItem,
+    inline_attr: u8,
+    is_extern_ffi: bool,
+    is_export_root: bool,
+    is_reflection_root: bool,
+    is_cold_fn: bool,
+    exec_domain: u8,
+    has_await_suspension: bool
+) -> u32 {
+    let fn_sym_v = fn_sym.v;
+    let existing = callgraph_find_node_idx(view(*cg), SymbolId { v: fn_sym_v });
+    if existing != INLINE_NONE_IDX {
+        return existing;
+    }
+    if cg.node_count >= cg.node_cap {
+        let new_cap: usize = if cg.node_cap == 0 { 16 } else { cg.node_cap + cg.node_cap };
+        let new_bytes = inl_mul_usize(new_cap, size_of<CallGraphNode>());
+        let new_nodes = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<CallGraphNode>()) as *mut CallGraphNode;
+        let mut i: usize = 0;
+        while i < cg.node_count {
+            unsafe {
+                *cg_node_at(new_nodes, i) = *cg_node_at(cg.nodes, i);
+            }
+            i = i + 1;
+        }
+        cg.nodes = new_nodes;
+        cg.node_cap = new_cap;
+    }
+
+    let idx = cg.node_count;
+    cg.node_count = idx + 1;
+    let np = unsafe { cg_node_at(cg.nodes, idx) };
+    inl_zero_bytes(np as *mut u8, size_of<CallGraphNode>());
+    let has_body = !is_extern_ffi && ((mir as usize) != 0 || (opt_body as usize) != 0);
+    let mut eff_mir = mir;
+    if (eff_mir as usize) == 0 && (opt_body as usize) != 0 {
+        eff_mir = unsafe { (*opt_body).orig_mir as *mut MirBody };
+    }
+    let argc: usize = if (eff_mir as usize) != 0 {
+        unsafe { (*eff_mir).arg_count }
+    } else if (opt_body as usize) != 0 {
+        unsafe { (*opt_body).arg_count }
+    } else {
+        0
+    };
+    unsafe {
+        (*np).fn_sym = SymbolId { v: fn_sym_v };
+        (*np).fn_name = fn_name;
+        (*np).node_idx = idx as u32;
+        (*np).scc_id = INLINE_NONE_IDX;
+        (*np).mir = eff_mir;
+        (*np).opt_body = opt_body;
+        if (opt_body as usize) != 0 && ((*opt_body).fn_sym.v == 0u32) {
+            (*opt_body).fn_sym = SymbolId { v: fn_sym_v };
+        }
+        (*np).fn_item = fn_item;
+        (*np).has_verified_body = has_body;
+        (*np).is_extern_ffi = is_extern_ffi;
+        (*np).is_export_root = is_export_root;
+        (*np).is_reflection_root = is_reflection_root;
+        (*np).is_cold_fn = is_cold_fn;
+        (*np).address_taken_fn = false;
+        (*np).inline_attr = inline_attr;
+        (*np).exec_domain = exec_domain;
+        (*np).has_await_suspension = has_await_suspension;
+        (*np).reachability = if is_export_root || is_reflection_root || !cg.closed_world {
+            REACH_ROOT
+        } else {
+            REACH_DEAD_ELIMINATED
+        };
+        (*np).inst_count = callgraph_count_mir_insts(eff_mir as *const MirBody);
+        (*np).direct_caller_count = 0u32;
+        (*np).out_edge_start = 0u32;
+        (*np).out_edge_count = 0u32;
+        (*np).effect_summary = effect_summary_empty(SymbolId { v: fn_sym_v });
+        if is_extern_ffi {
+            (*np).effect_summary.flags = EFFECT_FFI | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+        }
+        escape_summary_init(mut_view((*np).escape_summary), SymbolId { v: fn_sym_v }, argc);
+        if is_extern_ffi {
+            (*np).escape_summary.calls_ffi = true;
+        }
+        (*np).returns_result_or_option = callgraph_fn_returns_result_or_option(eff_mir as *const MirBody, cg.thir);
+        (*np).summary_fingerprint = (fn_sym_v as u64) * 1099511628211u64;
+    }
+    idx as u32
+}
+
+pub fn callgraph_push_edge(
+    cg: mut_view<CallGraph>,
+    arena: mut_view<Arena>,
+    edge: CallEdge
+) -> u32 {
+    if cg.edge_count >= cg.edge_cap {
+        let new_cap: usize = if cg.edge_cap == 0 { 32 } else { cg.edge_cap + cg.edge_cap };
+        let new_bytes = inl_mul_usize(new_cap, size_of<CallEdge>());
+        let new_edges = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<CallEdge>()) as *mut CallEdge;
+        let mut i: usize = 0;
+        while i < cg.edge_count {
+            unsafe {
+                *cg_edge_at(new_edges, i) = *cg_edge_at(cg.edges, i);
+            }
+            i = i + 1;
+        }
+        cg.edges = new_edges;
+        cg.edge_cap = new_cap;
+    }
+    let idx = cg.edge_count;
+    cg.edge_count = idx + 1;
+    let ep = unsafe { cg_edge_at(cg.edges, idx) };
+    unsafe {
+        *ep = edge;
+        (*ep).edge_id = idx as u32;
+    }
+    idx as u32
+}
+
+fn callgraph_mark_fn_address_taken(cg: mut_view<CallGraph>, sym: SymbolId) {
+    let nidx = callgraph_find_node_idx(view(*cg), sym);
+    if nidx != INLINE_NONE_IDX {
+        let np = unsafe { cg_node_at(cg.nodes, nidx as usize) };
+        unsafe { (*np).address_taken_fn = true; }
+    }
+}
+
+fn callgraph_check_op_fn_addr_taken(cg: mut_view<CallGraph>, op: view<MirOperand>) {
+    if op.kind == MIR_OP_CONST && op.constant.kind == MIR_CONST_FN && op.constant.sym.v != 0u32 {
+        callgraph_mark_fn_address_taken(mut_view(*cg), op.constant.sym);
+    }
+}
+
+fn callgraph_resolve_local_fn_sym(mir: view<MirBody>, loc_v: u32, out_is_closure: mut_view<bool>) -> SymbolId {
+    *out_is_closure = false;
+    if (loc_v as usize) >= mir.local_count || (mir.locals as usize) == 0 || (mir.bbs as usize) == 0 {
+        return SymbolId { v: 0u32 };
+    }
+    let ldecl = unsafe { mir_local_at(mir.locals, loc_v as usize) };
+    if (unsafe { (*ldecl).kind }) == MIR_LOCAL_CONST && (unsafe { (*ldecl).const_sym.v }) != 0u32 {
+        return SymbolId { v: unsafe { (*ldecl).const_sym.v } };
+    }
+    let mut found_sym: u32 = 0u32;
+    let mut def_cnt: u32 = 0u32;
+    let mut b: usize = 0;
+    while b < mir.bb_count {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN &&
+               (unsafe { (*st).place.local.v }) == loc_v &&
+               (unsafe { (*st).place.proj_count }) == 0 {
+                def_cnt = def_cnt + 1u32;
+                let rvk = unsafe { (*st).rvalue.kind };
+                if rvk == MIR_RVALUE_USE &&
+                   (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST &&
+                   (unsafe { (*st).rvalue.use_op.constant.kind }) == MIR_CONST_FN {
+                    found_sym = unsafe { (*st).rvalue.use_op.constant.sym.v };
+                } else if rvk == MIR_RVALUE_AGGREGATE &&
+                          (unsafe { (*st).rvalue.operand_count }) > 0 &&
+                          (unsafe { (*st).rvalue.operands as usize }) != 0 {
+                    let op0 = unsafe { mir_op_at((*st).rvalue.operands, 0) };
+                    if (unsafe { (*op0).kind }) == MIR_OP_CONST &&
+                       (unsafe { (*op0).constant.kind }) == MIR_CONST_FN {
+                        found_sym = unsafe { (*op0).constant.sym.v };
+                        *out_is_closure = true;
+                    }
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    if def_cnt == 1u32 && found_sym != 0u32 {
+        return SymbolId { v: found_sym };
+    }
+    SymbolId { v: 0u32 }
+}
+
+fn callgraph_is_call_in_tail_position(mir: view<MirBody>, call_bb_idx: usize) -> bool {
+    if call_bb_idx >= mir.bb_count || (mir.bbs as usize) == 0 {
+        return false;
+    }
+    let cbb = unsafe { mir_bb_at(mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb).has_terminator }) || (unsafe { (*cbb).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    let tgt_v = unsafe { (*cbb).terminator.call_target.v };
+    if (tgt_v as usize) >= mir.bb_count {
+        return false;
+    }
+    let tbb = unsafe { mir_bb_at(mir.bbs, tgt_v as usize) };
+    if !(unsafe { (*tbb).has_terminator }) || (unsafe { (*tbb).terminator.kind }) != MIR_TERM_RETURN {
+        return false;
+    }
+    let dest_v: u32 = if unsafe { (*cbb).terminator.has_destination } {
+        unsafe { (*cbb).terminator.destination.local.v }
+    } else {
+        0u32
+    };
+    let mut s: usize = 0;
+    while s < (unsafe { (*tbb).stmt_count }) {
+        let st = unsafe { mir_stmt_at((*tbb).stmts, s) };
+        let sk = unsafe { (*st).kind };
+        if sk == MIR_STMT_STORAGE_DEAD {
+            s = s + 1;
+            continue;
+        }
+        if sk == MIR_STMT_ASSIGN &&
+           (unsafe { (*st).place.local.v }) == 0u32 &&
+           (unsafe { (*st).place.proj_count }) == 0 &&
+           (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+           ((unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_COPY ||
+            (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_MOVE) &&
+           (unsafe { (*st).rvalue.use_op.place.local.v }) == dest_v &&
+           (unsafe { (*st).rvalue.use_op.place.proj_count }) == 0 {
+            s = s + 1;
+            continue;
+        }
+        return false;
+    }
+    true
+}
+
+fn callgraph_local_is_const_assigned(mir: view<MirBody>, loc_v: u32) -> bool {
+    let mut defs: u32 = 0u32;
+    let mut is_const = false;
+    let mut b: usize = 0;
+    while b < mir.bb_count && (mir.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(mir.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN && (unsafe { (*st).place.local.v }) == loc_v {
+                defs = defs + 1u32;
+                if (unsafe { (*st).place.proj_count }) == 0 &&
+                   (unsafe { (*st).rvalue.kind }) == MIR_RVALUE_USE &&
+                   (unsafe { (*st).rvalue.use_op.kind }) == MIR_OP_CONST {
+                    is_const = true;
+                }
+            }
+            s = s + 1;
+        }
+        b = b + 1;
+    }
+    defs == 1u32 && is_const
+}
+
+pub fn callgraph_analyze_edges(cg: mut_view<CallGraph>, arena: mut_view<Arena>) {
+    cg.edge_count = 0;
+    let mut ni: usize = 0;
+    while ni < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, ni) };
+        unsafe {
+            (*np).direct_caller_count = 0u32;
+            (*np).out_edge_start = cg.edge_count as u32;
+            (*np).out_edge_count = 0u32;
+        }
+        ni = ni + 1;
+    }
+
+    // Pass 1: Scan all statements and call arguments for function-pointer address taking (`AXS-INL-002.3`)
+    let mut n1: usize = 0;
+    while n1 < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, n1) };
+        let mir_p = unsafe { (*np).mir };
+        if (mir_p as usize) != 0 {
+            let mir = unsafe { view(*mir_p) };
+            let mut b: usize = 0;
+            while b < mir.bb_count && (mir.bbs as usize) != 0 {
+                let bb = unsafe { mir_bb_at(mir.bbs, b) };
+                let mut s: usize = 0;
+                while s < (unsafe { (*bb).stmt_count }) {
+                    let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+                    if (unsafe { (*st).kind }) == MIR_STMT_ASSIGN {
+                        let rvk = unsafe { (*st).rvalue.kind };
+                        if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP || rvk == MIR_RVALUE_REPEAT {
+                            callgraph_check_op_fn_addr_taken(mut_view(*cg), unsafe { view((*st).rvalue.use_op) });
+                        } else if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                            callgraph_check_op_fn_addr_taken(mut_view(*cg), unsafe { view((*st).rvalue.lhs) });
+                            callgraph_check_op_fn_addr_taken(mut_view(*cg), unsafe { view((*st).rvalue.rhs) });
+                        } else if rvk == MIR_RVALUE_AGGREGATE {
+                            let mut oi: usize = 0;
+                            while oi < (unsafe { (*st).rvalue.operand_count }) && (unsafe { (*st).rvalue.operands as usize }) != 0 {
+                                let op_p = unsafe { mir_op_at((*st).rvalue.operands, oi) };
+                                callgraph_check_op_fn_addr_taken(mut_view(*cg), unsafe { view(*op_p) });
+                                oi = oi + 1;
+                            }
+                        }
+                    }
+                    s = s + 1;
+                }
+                if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+                    let mut ai: usize = 0;
+                    while ai < (unsafe { (*bb).terminator.arg_count }) && (unsafe { (*bb).terminator.args as usize }) != 0 {
+                        let ap = unsafe { mir_op_at((*bb).terminator.args, ai) };
+                        callgraph_check_op_fn_addr_taken(mut_view(*cg), unsafe { view(*ap) });
+                        ai = ai + 1;
+                    }
+                }
+                b = b + 1;
+            }
+        }
+        n1 = n1 + 1;
+    }
+
+    // Pass 2: Extract `CallEdge`s in deterministic `(caller_node_idx, bb_idx)` order
+    let mut n2: usize = 0;
+    while n2 < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, n2) };
+        let caller_sym_v = unsafe { (*np).fn_sym.v };
+        let caller_dom = unsafe { (*np).exec_domain };
+        let mir_p = unsafe { (*np).mir };
+        unsafe { (*np).out_edge_start = cg.edge_count as u32; }
+        let mut node_edges: u32 = 0u32;
+
+        if (mir_p as usize) != 0 {
+            let mir = unsafe { view(*mir_p) };
+            let mut b: usize = 0;
+            while b < mir.bb_count && (mir.bbs as usize) != 0 {
+                let bb = unsafe { mir_bb_at(mir.bbs, b) };
+                if (unsafe { (*bb).has_terminator }) && (unsafe { (*bb).terminator.kind }) == MIR_TERM_CALL {
+                    let tm = unsafe { view((*bb).terminator) };
+                    let mut dkind: u8 = DISPATCH_FN_PTR;
+                    let mut kcallee_v: u32 = 0u32;
+                    let mut cnode_idx: u32 = INLINE_NONE_IDX;
+                    let mut complete = false;
+
+                    if tm.func.kind == MIR_OP_CONST && tm.func.constant.kind == MIR_CONST_FN {
+                        kcallee_v = tm.func.constant.sym.v;
+                        cnode_idx = callgraph_find_node_idx(view(*cg), SymbolId { v: kcallee_v });
+                        complete = true;
+                        if cnode_idx != INLINE_NONE_IDX {
+                            let cnp = unsafe { cg_node_at(cg.nodes, cnode_idx as usize) };
+                            if unsafe { (*cnp).is_extern_ffi } {
+                                dkind = DISPATCH_FFI_EXTERN;
+                            } else if (unsafe { (*cnp).exec_domain }) == DOMAIN_GPU_KERNEL && caller_dom == DOMAIN_CPU_HOST {
+                                dkind = DISPATCH_GPU_LAUNCH;
+                            } else if (unsafe { (*cnp).exec_domain }) == DOMAIN_ASYNC_STATE || (unsafe { (*cnp).has_await_suspension }) {
+                                dkind = DISPATCH_ASYNC_SPAWN;
+                            } else {
+                                dkind = DISPATCH_DIRECT;
+                            }
+                        } else {
+                            dkind = DISPATCH_FFI_EXTERN;
+                        }
+                    } else if tm.func.kind == MIR_OP_COPY || tm.func.kind == MIR_OP_MOVE {
+                        let floc = tm.func.place.local.v;
+                        let mut is_clos = false;
+                        let rsym = callgraph_resolve_local_fn_sym(mir, floc, mut_view(is_clos));
+                        if (floc as usize) < mir.local_count && (cg.thir as usize) != 0 {
+                            let fty = TypeId { v: unsafe { (*mir_local_at(mir.locals, floc as usize)).ty.v } };
+                            let ftp = type_get(unsafe { view((*cg.thir).interner) }, fty);
+                            if (ftp as usize) != 0 {
+                                let ftk = unsafe { (*ftp).kind };
+                                if ftk == TY_CLOSURE {
+                                    is_clos = true;
+                                    if rsym.v == 0u32 && (unsafe { (*ftp).fn_sym }) != 0u32 {
+                                        kcallee_v = unsafe { (*ftp).fn_sym };
+                                    }
+                                } else if ftk == TY_PARAM {
+                                    dkind = DISPATCH_DYN_TRAIT;
+                                }
+                            }
+                        }
+                        if rsym.v != 0u32 {
+                            kcallee_v = rsym.v;
+                        }
+                        if kcallee_v != 0u32 {
+                            cnode_idx = callgraph_find_node_idx(view(*cg), SymbolId { v: kcallee_v });
+                            complete = !cg.dynamic_loading_active;
+                            dkind = if is_clos { DISPATCH_CLOSURE } else { DISPATCH_DIRECT };
+                        } else if is_clos {
+                            dkind = DISPATCH_CLOSURE;
+                        }
+                    }
+
+                    // Compute argument context masks (`const_arg_mask`, `view_arg_mask`, `closure_arg_mask`)
+                    let mut cmask: u64 = 0u64;
+                    let mut vmask: u64 = 0u64;
+                    let mut clmask: u64 = 0u64;
+                    let mut ai: usize = 0;
+                    while ai < tm.arg_count && ai < 64 && (tm.args as usize) != 0 {
+                        let ap = unsafe { mir_op_at(tm.args, ai) };
+                        let ak = unsafe { (*ap).kind };
+                        if ak == MIR_OP_CONST {
+                            cmask = cmask | (1u64 << (ai as u64));
+                        } else if ak == MIR_OP_COPY || ak == MIR_OP_MOVE {
+                            let aloc = unsafe { (*ap).place.local.v };
+                            if callgraph_local_is_const_assigned(mir, aloc) {
+                                cmask = cmask | (1u64 << (ai as u64));
+                            }
+                            if (aloc as usize) < mir.local_count && (cg.thir as usize) != 0 {
+                                let aty = TypeId { v: unsafe { (*mir_local_at(mir.locals, aloc as usize)).ty.v } };
+                                let atp = type_get(unsafe { view((*cg.thir).interner) }, aty);
+                                if (atp as usize) != 0 {
+                                    let atk = unsafe { (*atp).kind };
+                                    if atk == TY_VIEW || atk == TY_MUT_VIEW {
+                                        vmask = vmask | (1u64 << (ai as u64));
+                                    } else if atk == TY_CLOSURE || atk == TY_FN {
+                                        clmask = clmask | (1u64 << (ai as u64));
+                                    }
+                                }
+                            }
+                        }
+                        ai = ai + 1;
+                    }
+
+                    // Check if block `b` has a loop backedge targeting `<= b`
+                    let mut loop_d: u32 = 0u32;
+                    let mut lb: usize = b;
+                    while lb < mir.bb_count {
+                        let lbb = unsafe { mir_bb_at(mir.bbs, lb) };
+                        if (unsafe { (*lbb).has_terminator }) &&
+                           (unsafe { (*lbb).terminator.kind }) == MIR_TERM_GOTO &&
+                           ((unsafe { (*lbb).terminator.goto_target.v }) as usize) <= b {
+                            loop_d = 1u32;
+                            break;
+                        }
+                        lb = lb + 1;
+                    }
+
+                    let mut pt_ptr: *mut SymbolId = 0 as *mut SymbolId;
+                    let mut pt_cnt: usize = 0;
+                    if kcallee_v != 0u32 {
+                        pt_ptr = arena_alloc_raw(mut_view(*arena), size_of<SymbolId>(), align_of<SymbolId>()) as *mut SymbolId;
+                        unsafe { (*pt_ptr).v = kcallee_v; }
+                        pt_cnt = 1;
+                    }
+                    if cnode_idx != INLINE_NONE_IDX {
+                        let cnp = unsafe { cg_node_at(cg.nodes, cnode_idx as usize) };
+                        unsafe { (*cnp).direct_caller_count = (*cnp).direct_caller_count + 1u32; }
+                    }
+
+                    let edge = CallEdge {
+                        edge_id: 0u32,
+                        caller_sym: SymbolId { v: caller_sym_v },
+                        caller_node_idx: n2 as u32,
+                        callsite_bb: OptBbId { v: b as u32 },
+                        callsite_inst: OptInstId { v: (unsafe { (*bb).stmt_count }) as u32 },
+                        dispatch_kind: dkind,
+                        known_callee: SymbolId { v: kcallee_v },
+                        callee_node_idx: cnode_idx,
+                        possible_targets: pt_ptr,
+                        possible_target_count: pt_cnt,
+                        targets_complete: complete,
+                        is_inlined: false,
+                        is_tail_position: callgraph_is_call_in_tail_position(mir, b),
+                        in_loop_depth: loop_d,
+                        is_cold_callsite: unsafe { (*np).is_cold_fn },
+                        const_arg_mask: cmask,
+                        view_arg_mask: vmask,
+                        closure_arg_mask: clmask,
+                        span: tm.span,
+                    };
+                    let _ = callgraph_push_edge(mut_view(*cg), mut_view(*arena), edge);
+                    node_edges = node_edges + 1u32;
+                }
+                b = b + 1;
+            }
+        }
+
+        let np_after = unsafe { cg_node_at(cg.nodes, n2) };
+        unsafe { (*np_after).out_edge_count = node_edges; }
+        n2 = n2 + 1;
+    }
+}
+
+// --- Section 2: Tarjan `SCC` Decomposition, Summaries, & Reachability (`SPEC-73 §§1.3–1.5, AXS-INL-003..005`) ---
+
+struct TarjanState {
+    pub index_counter: u32,
+    pub indices: *mut u32,
+    pub lowlink: *mut u32,
+    pub on_stack: *mut bool,
+    pub stack: *mut u32,
+    pub stack_top: usize,
+}
+
+fn callgraph_tarjan_dfs(
+    cg: mut_view<CallGraph>,
+    u: usize,
+    st: mut_view<TarjanState>
+) {
+    let cur_idx = st.index_counter;
+    st.index_counter = cur_idx + 1u32;
+    unsafe {
+        *inl_u32_at(st.indices, u) = cur_idx;
+        *inl_u32_at(st.lowlink, u) = cur_idx;
+        *inl_bool_at(st.on_stack, u) = true;
+        *inl_u32_at(st.stack, st.stack_top) = u as u32;
+    }
+    st.stack_top = st.stack_top + 1;
+
+    let np = unsafe { cg_node_at(cg.nodes, u) };
+    let estart = (unsafe { (*np).out_edge_start }) as usize;
+    let ecnt = (unsafe { (*np).out_edge_count }) as usize;
+    let mut ei: usize = 0;
+    while ei < ecnt && (estart + ei) < cg.edge_count {
+        let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+        let v_u32 = unsafe { (*ep).callee_node_idx };
+        if v_u32 != INLINE_NONE_IDX && (v_u32 as usize) < cg.node_count {
+            let v = v_u32 as usize;
+            let v_idx = unsafe { *inl_u32_at(st.indices, v) };
+            if v_idx == INLINE_NONE_IDX {
+                callgraph_tarjan_dfs(mut_view(*cg), v, mut_view(*st));
+                let u_low = unsafe { *inl_u32_at(st.lowlink, u) };
+                let v_low = unsafe { *inl_u32_at(st.lowlink, v) };
+                if v_low < u_low {
+                    unsafe { *inl_u32_at(st.lowlink, u) = v_low; }
+                }
+            } else if unsafe { *inl_bool_at(st.on_stack, v) } {
+                let u_low = unsafe { *inl_u32_at(st.lowlink, u) };
+                if v_idx < u_low {
+                    unsafe { *inl_u32_at(st.lowlink, u) = v_idx; }
+                }
+            }
+        }
+        // Also visit any finite `possible_targets` on indirect/dyn edges
+        let pt_cnt = unsafe { (*ep).possible_target_count };
+        let pt_ptr = unsafe { (*ep).possible_targets };
+        let mut pi: usize = 0;
+        while pi < pt_cnt && (pt_ptr as usize) != 0 {
+            let psym = unsafe { *inl_sym_at(pt_ptr, pi) };
+            let pv_u32 = callgraph_find_node_idx(view(*cg), psym);
+            if pv_u32 != INLINE_NONE_IDX && pv_u32 != v_u32 && (pv_u32 as usize) < cg.node_count {
+                let pv = pv_u32 as usize;
+                let pv_idx = unsafe { *inl_u32_at(st.indices, pv) };
+                if pv_idx == INLINE_NONE_IDX {
+                    callgraph_tarjan_dfs(mut_view(*cg), pv, mut_view(*st));
+                    let u_low = unsafe { *inl_u32_at(st.lowlink, u) };
+                    let pv_low = unsafe { *inl_u32_at(st.lowlink, pv) };
+                    if pv_low < u_low {
+                        unsafe { *inl_u32_at(st.lowlink, u) = pv_low; }
+                    }
+                } else if unsafe { *inl_bool_at(st.on_stack, pv) } {
+                    let u_low = unsafe { *inl_u32_at(st.lowlink, u) };
+                    if pv_idx < u_low {
+                        unsafe { *inl_u32_at(st.lowlink, u) = pv_idx; }
+                    }
+                }
+            }
+            pi = pi + 1;
+        }
+        ei = ei + 1;
+    }
+
+    if (unsafe { *inl_u32_at(st.lowlink, u) }) == (unsafe { *inl_u32_at(st.indices, u) }) {
+        let scc_id = cg.scc_count as u32;
+        let mstart = cg.scc_member_count as u32;
+        let mut mcnt: u32 = 0u32;
+        while st.stack_top > 0 {
+            st.stack_top = st.stack_top - 1;
+            let w = (unsafe { *inl_u32_at(st.stack, st.stack_top) }) as usize;
+            unsafe {
+                *inl_bool_at(st.on_stack, w) = false;
+                *inl_u32_at(cg.scc_members, cg.scc_member_count) = w as u32;
+                (*cg_node_at(cg.nodes, w)).scc_id = scc_id;
+            }
+            cg.scc_member_count = cg.scc_member_count + 1;
+            mcnt = mcnt + 1u32;
+            if w == u {
+                break;
+            }
+        }
+
+        // Check if this SCC is recursive (`member_count > 1` or self-edge `u -> u`, `AXS-INL-003.1`)
+        let mut is_rec = mcnt > 1u32;
+        if !is_rec && mcnt == 1u32 {
+            let member_u = (unsafe { *inl_u32_at(cg.scc_members, mstart as usize) }) as usize;
+            let mnp = unsafe { cg_node_at(cg.nodes, member_u) };
+            let ms = (unsafe { (*mnp).out_edge_start }) as usize;
+            let mc = (unsafe { (*mnp).out_edge_count }) as usize;
+            let mut k: usize = 0;
+            while k < mc && (ms + k) < cg.edge_count {
+                let mep = unsafe { cg_edge_at(cg.edges, ms + k) };
+                if (unsafe { (*mep).callee_node_idx }) == (member_u as u32) {
+                    is_rec = true;
+                    break;
+                }
+                k = k + 1;
+            }
+        }
+
+        let scc_p = unsafe { cg_scc_at(cg.sccs, cg.scc_count) };
+        unsafe {
+            (*scc_p).scc_id = scc_id;
+            (*scc_p).is_recursive = is_rec;
+            (*scc_p).member_start = mstart;
+            (*scc_p).member_count = mcnt;
+            (*scc_p).fixed_point_iters = 1u32;
+            (*scc_p).widened_to_top = false;
+        }
+        cg.scc_count = cg.scc_count + 1;
+    }
+}
+
+pub fn callgraph_compute_sccs(cg: mut_view<CallGraph>, arena: mut_view<Arena>) {
+    let n = cg.node_count;
+    if n == 0 {
+        cg.scc_count = 0;
+        cg.scc_member_count = 0;
+        return;
+    }
+    cg.sccs = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<CallScc>()), align_of<CallScc>()) as *mut CallScc;
+    cg.scc_members = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<u32>()), align_of<u32>()) as *mut u32;
+    cg.scc_count = 0;
+    cg.scc_member_count = 0;
+
+    let indices = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let lowlink = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let on_stack = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<bool>()), align_of<bool>()) as *mut bool;
+    let stack = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<u32>()), align_of<u32>()) as *mut u32;
+
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *inl_u32_at(indices, i) = INLINE_NONE_IDX;
+            *inl_u32_at(lowlink, i) = INLINE_NONE_IDX;
+            *inl_bool_at(on_stack, i) = false;
+            *inl_u32_at(stack, i) = 0u32;
+        }
+        i = i + 1;
+    }
+
+    let mut st = TarjanState {
+        index_counter: 0u32,
+        indices: indices,
+        lowlink: lowlink,
+        on_stack: on_stack,
+        stack: stack,
+        stack_top: 0,
+    };
+
+    let mut u: usize = 0;
+    while u < n {
+        if (unsafe { *inl_u32_at(st.indices, u) }) == INLINE_NONE_IDX {
+            callgraph_tarjan_dfs(mut_view(*cg), u, mut_view(st));
+        }
+        u = u + 1;
+    }
+}
+
+fn cg_place_has_deref(pl: view<MirPlace>) -> bool {
+    let mut i: usize = 0;
+    while i < pl.proj_count && (pl.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(pl.projs, i) };
+        if (unsafe { (*pr).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn cg_op_has_deref(op: view<MirOperand>) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return cg_place_has_deref(view(op.place));
+    }
+    false
+}
+
+fn cg_body_external_mem_flags(mir_p: *const MirBody) -> u16 {
+    if (mir_p as usize) == 0 {
+        return 0u16;
+    }
+    let m = unsafe { view(*mir_p) };
+    let mut flags: u16 = 0u16;
+    let mut b: usize = 0;
+    while b < m.bb_count && (m.bbs as usize) != 0 {
+        let bb = unsafe { mir_bb_at(m.bbs, b) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*bb).stmt_count }) && (unsafe { (*bb).stmts as usize }) != 0 {
+            let st = unsafe { mir_stmt_at((*bb).stmts, s) };
+            let sk = unsafe { (*st).kind };
+            if sk == MIR_STMT_ASSIGN {
+                if cg_place_has_deref(unsafe { view((*st).place) }) {
+                    flags = flags | EFFECT_WRITES_MEM;
+                }
+                let rv = unsafe { view((*st).rvalue) };
+                if rv.kind == MIR_RVALUE_USE || rv.kind == MIR_RVALUE_REPEAT ||
+                   rv.kind == MIR_RVALUE_CAST || rv.kind == MIR_RVALUE_UNARY_OP {
+                    if cg_op_has_deref(view(rv.use_op)) {
+                        flags = flags | EFFECT_READS_MEM;
+                    }
+                } else if rv.kind == MIR_RVALUE_REF || rv.kind == MIR_RVALUE_LEN || rv.kind == MIR_RVALUE_DISCRIMINANT {
+                    if cg_place_has_deref(view(rv.place)) {
+                        flags = flags | EFFECT_READS_MEM;
+                    }
+                } else if rv.kind == MIR_RVALUE_BINARY_OP || rv.kind == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                    if cg_op_has_deref(view(rv.lhs)) || cg_op_has_deref(view(rv.rhs)) {
+                        flags = flags | EFFECT_READS_MEM;
+                    }
+                } else if rv.kind == MIR_RVALUE_AGGREGATE {
+                    let mut oi: usize = 0;
+                    while oi < rv.operand_count && (rv.operands as usize) != 0 {
+                        let op = unsafe { mir_op_at(rv.operands, oi) };
+                        if cg_op_has_deref(unsafe { view(*op) }) {
+                            flags = flags | EFFECT_READS_MEM;
+                        }
+                        oi = oi + 1;
+                    }
+                }
+            } else if sk == MIR_STMT_DROP {
+                if cg_place_has_deref(unsafe { view((*st).place) }) {
+                    flags = flags | EFFECT_READS_MEM | EFFECT_WRITES_MEM;
+                }
+            }
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let mt = unsafe { view((*bb).terminator) };
+            if mt.kind == MIR_TERM_CALL {
+                if mt.has_destination && cg_place_has_deref(view(mt.destination)) {
+                    flags = flags | EFFECT_WRITES_MEM;
+                }
+                if cg_op_has_deref(view(mt.func)) {
+                    flags = flags | EFFECT_READS_MEM;
+                }
+                let mut ai: usize = 0;
+                while ai < mt.arg_count && (mt.args as usize) != 0 {
+                    let aop = unsafe { mir_op_at(mt.args, ai) };
+                    if cg_op_has_deref(unsafe { view(*aop) }) {
+                        flags = flags | EFFECT_READS_MEM;
+                    }
+                    ai = ai + 1;
+                }
+            } else if mt.kind == MIR_TERM_SWITCH_INT {
+                if cg_op_has_deref(view(mt.discr)) {
+                    flags = flags | EFFECT_READS_MEM;
+                }
+            } else if mt.kind == MIR_TERM_ASSERT {
+                if cg_op_has_deref(view(mt.cond)) {
+                    flags = flags | EFFECT_READS_MEM;
+                }
+            } else if mt.kind == MIR_TERM_DROP {
+                flags = flags | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC;
+            }
+        }
+        b = b + 1;
+    }
+    flags
+}
+
+fn callgraph_update_node_summary(
+    cg: mut_view<CallGraph>,
+    node_idx: usize,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    arena: mut_view<Arena>
+) -> bool {
+    let np = unsafe { cg_node_at(cg.nodes, node_idx) };
+    if unsafe { (*np).is_extern_ffi } {
+        return false;
+    }
+    let old_flags = unsafe { (*np).effect_summary.flags };
+    let old_fp = unsafe { (*np).summary_fingerprint };
+    let fn_sym_v = unsafe { (*np).fn_sym.v };
+
+    let mut ob_p = unsafe { (*np).opt_body };
+    let mir_p = unsafe { (*np).mir };
+    if (ob_p as usize) == 0 && (mir_p as usize) != 0 {
+        ob_p = optir_build_from_verified_mir(unsafe { view(*mir_p) }, cg.thir, mut_view(*arena));
+        if (ob_p as usize) != 0 {
+            unsafe { (*ob_p).fn_sym = SymbolId { v: fn_sym_v }; }
+        }
+        unsafe { (*np).opt_body = ob_p; }
+    }
+
+    let mut new_eff = effect_summary_empty(SymbolId { v: fn_sym_v });
+    let mut new_esc: FunctionEscapeSummary = unsafe { (*np).escape_summary };
+    if (ob_p as usize) != 0 {
+        new_eff = effect_infer_body(unsafe { mut_view(*ob_p) }, mut_view(*arena), 256u32);
+        let einfo = escape_build_info(
+            unsafe { view(*ob_p) },
+            unsafe { address_of(*eff_table) },
+            unsafe { address_of(*esc_table) },
+            mut_view(*arena)
+        );
+        if (einfo as usize) != 0 {
+            new_esc = unsafe { (*einfo).summary };
+        }
+    }
+
+    // Propagate callee effects across outgoing edges (`AXS-INL-004`)
+    // Note: `Result<T, E>` / `Option<T>` return is ordinary value dataflow (`REQ-OPT-068`), never `EFFECT_MAY_PANIC`!
+    // Intra-procedural stack-slot reads/writes (without `MIR_PROJ_DEREF`) do not escape the activation frame (`AXS-INL-004.2`).
+    let estart = (unsafe { (*np).out_edge_start }) as usize;
+    let ecnt = (unsafe { (*np).out_edge_count }) as usize;
+    let ext_mem_flags = cg_body_external_mem_flags(mir_p as *const MirBody);
+    let non_mem_flags = new_eff.flags & (0xFFFFu16 ^ (EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_UNKNOWN));
+    let mut prop_flags = non_mem_flags | ext_mem_flags;
+    if (non_mem_flags & (EFFECT_VOLATILE | EFFECT_ATOMIC | EFFECT_IO | EFFECT_FFI | EFFECT_ALLOCATES)) != 0u16 {
+        prop_flags = prop_flags | (new_eff.flags & (EFFECT_READS_MEM | EFFECT_WRITES_MEM));
+    }
+    if new_eff.call_count > 0u32 {
+        // Clear conservative call panic/read/write bits if all callees are resolved in CallGraph
+        let mut all_resolved = true;
+        let mut ei0: usize = 0;
+        while ei0 < ecnt && (estart + ei0) < cg.edge_count {
+            let ep0 = unsafe { cg_edge_at(cg.edges, estart + ei0) };
+            if (unsafe { (*ep0).callee_node_idx }) == INLINE_NONE_IDX || !(unsafe { (*ep0).targets_complete }) {
+                all_resolved = false;
+            }
+            ei0 = ei0 + 1;
+        }
+        if all_resolved {
+            prop_flags = (prop_flags & (0xFFFFu16 ^ EFFECT_MAY_PANIC)) | ext_mem_flags;
+            if new_eff.panic_count > new_eff.call_count {
+                prop_flags = prop_flags | EFFECT_MAY_PANIC;
+            }
+            if (mir_p as usize) != 0 {
+                let m = unsafe { view(*mir_p) };
+                let mut mb: usize = 0;
+                while mb < m.bb_count && (m.bbs as usize) != 0 {
+                    let mbb = unsafe { mir_bb_at(m.bbs, mb) };
+                    if (unsafe { (*mbb).has_terminator }) && (unsafe { (*mbb).terminator.kind }) == MIR_TERM_ASSERT {
+                        prop_flags = prop_flags | EFFECT_MAY_PANIC;
+                    }
+                    mb = mb + 1;
+                }
+            }
+        }
+    }
+
+    let mut ei: usize = 0;
+    while ei < ecnt && (estart + ei) < cg.edge_count {
+        let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+        let cidx = unsafe { (*ep).callee_node_idx };
+        if cidx != INLINE_NONE_IDX && (cidx as usize) < cg.node_count && (unsafe { (*ep).targets_complete }) {
+            let cnp = unsafe { cg_node_at(cg.nodes, cidx as usize) };
+            prop_flags = prop_flags | (unsafe { (*cnp).effect_summary.flags });
+        } else {
+            prop_flags = prop_flags | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC | EFFECT_UNKNOWN;
+        }
+        ei = ei + 1;
+    }
+
+    new_eff.flags = prop_flags;
+    new_eff.pure_certainty = if prop_flags == EFFECT_PURE { CERTAINTY_PROVEN } else { 0u8 };
+    new_eff.no_panic_certainty = if (prop_flags & EFFECT_MAY_PANIC) == 0u16 && (prop_flags & EFFECT_UNKNOWN) == 0u16 {
+        CERTAINTY_PROVEN
+    } else {
+        0u8
+    };
+    new_eff.read_only_certainty = if (prop_flags & (0xFFFFu16 ^ EFFECT_READS_MEM)) == 0u16 {
+        CERTAINTY_PROVEN
+    } else {
+        0u8
+    };
+
+    let new_fp: u64 = ((fn_sym_v as u64) * 1099511628211u64) ^
+                      ((prop_flags as u64) * 16777619u64) ^
+                      ((new_esc.param_addr_observed_mask as u64) << 16) ^
+                      ((new_esc.ret_aliases_params_mask as u64) << 32);
+
+    unsafe {
+        (*np).effect_summary = new_eff;
+        (*np).escape_summary = new_esc;
+        (*np).summary_fingerprint = new_fp;
+    }
+    effect_call_table_register(mut_view(*eff_table), mut_view(*arena), SymbolId { v: fn_sym_v }, OptValueId { v: 0u32 }, unsafe { (*np).effect_summary });
+    escape_summary_table_register(mut_view(*esc_table), mut_view(*arena), SymbolId { v: fn_sym_v }, unsafe { (*np).escape_summary });
+
+    old_flags != prop_flags || old_fp != new_fp
+}
+
+pub fn callgraph_propagate_summaries(
+    cg: mut_view<CallGraph>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    arena: mut_view<Arena>
+) {
+    // Initialize optimistic baseline summaries for all nodes before fixed-point iteration (`AXS-INL-003.3`)
+    let mut ni: usize = 0;
+    while ni < cg.node_count {
+        let np = unsafe { cg_node_at(cg.nodes, ni) };
+        let fn_sym_v = unsafe { (*np).fn_sym.v };
+        if !(unsafe { (*np).is_extern_ffi }) {
+            unsafe { (*np).effect_summary = effect_summary_empty(SymbolId { v: fn_sym_v }); }
+        }
+        effect_call_table_register(mut_view(*eff_table), mut_view(*arena), SymbolId { v: fn_sym_v }, OptValueId { v: 0u32 }, unsafe { (*np).effect_summary });
+        escape_summary_table_register(mut_view(*esc_table), mut_view(*arena), SymbolId { v: fn_sym_v }, unsafe { (*np).escape_summary });
+        ni = ni + 1;
+    }
+
+    // Bottom-up reverse topological traversal over SCCs (`0 .. scc_count - 1`, callees before callers)
+    let mut si: usize = 0;
+    while si < cg.scc_count {
+        let scc_p = unsafe { cg_scc_at(cg.sccs, si) };
+        let mstart = (unsafe { (*scc_p).member_start }) as usize;
+        let mcnt = (unsafe { (*scc_p).member_count }) as usize;
+        let is_rec = unsafe { (*scc_p).is_recursive };
+
+        if !is_rec {
+            let mut k: usize = 0;
+            while k < mcnt {
+                let u = (unsafe { *inl_u32_at(cg.scc_members, mstart + k) }) as usize;
+                let _ = callgraph_update_node_summary(mut_view(*cg), u, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+                k = k + 1;
+            }
+            unsafe { (*scc_p).fixed_point_iters = 1u32; }
+        } else {
+            let mut iter: u32 = 0u32;
+            let mut converged = false;
+            while iter < MAX_SCC_ITERATIONS && !converged {
+                let mut any_changed = false;
+                let mut k: usize = 0;
+                while k < mcnt {
+                    let u = (unsafe { *inl_u32_at(cg.scc_members, mstart + k) }) as usize;
+                    if callgraph_update_node_summary(mut_view(*cg), u, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena)) {
+                        any_changed = true;
+                    }
+                    k = k + 1;
+                }
+                iter = iter + 1u32;
+                if !any_changed {
+                    converged = true;
+                }
+            }
+            unsafe { (*scc_p).fixed_point_iters = iter; }
+            if !converged {
+                // Monotone widening to conservative top (`AXS-INL-003.3`)
+                unsafe { (*scc_p).widened_to_top = true; }
+                let mut k: usize = 0;
+                while k < mcnt {
+                    let u = (unsafe { *inl_u32_at(cg.scc_members, mstart + k) }) as usize;
+                    let np = unsafe { cg_node_at(cg.nodes, u) };
+                    unsafe {
+                        (*np).effect_summary.flags = (*np).effect_summary.flags | EFFECT_READS_MEM | EFFECT_WRITES_MEM | EFFECT_MAY_PANIC | EFFECT_UNKNOWN;
+                        (*np).escape_summary.has_unknown_call = true;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        si = si + 1;
+    }
+}
+
+pub fn callgraph_compute_reachability(cg: mut_view<CallGraph>, arena: mut_view<Arena>) -> u32 {
+    if cg.node_count == 0 {
+        return 0u32;
+    }
+    let n = cg.node_count;
+    let queue = arena_alloc_raw(mut_view(*arena), inl_mul_usize(n, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+
+    let mut i: usize = 0;
+    while i < n {
+        let np = unsafe { cg_node_at(cg.nodes, i) };
+        let is_root = !cg.closed_world ||
+                      (unsafe { (*np).is_export_root }) ||
+                      (unsafe { (*np).is_reflection_root }) ||
+                      (unsafe { (*np).address_taken_fn });
+        if is_root {
+            unsafe {
+                (*np).reachability = REACH_ROOT;
+                *inl_u32_at(queue, q_tail) = i as u32;
+            }
+            q_tail = q_tail + 1;
+        } else {
+            unsafe { (*np).reachability = REACH_DEAD_ELIMINATED; }
+        }
+        i = i + 1;
+    }
+
+    while q_head < q_tail {
+        let u = (unsafe { *inl_u32_at(queue, q_head) }) as usize;
+        q_head = q_head + 1;
+        let np = unsafe { cg_node_at(cg.nodes, u) };
+        let estart = (unsafe { (*np).out_edge_start }) as usize;
+        let ecnt = (unsafe { (*np).out_edge_count }) as usize;
+        let mut ei: usize = 0;
+        while ei < ecnt && (estart + ei) < cg.edge_count {
+            let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+            if !(unsafe { (*ep).is_inlined }) {
+                let v_u32 = unsafe { (*ep).callee_node_idx };
+                if v_u32 != INLINE_NONE_IDX && (v_u32 as usize) < n {
+                    let vnp = unsafe { cg_node_at(cg.nodes, v_u32 as usize) };
+                    if (unsafe { (*vnp).reachability }) == REACH_DEAD_ELIMINATED {
+                        unsafe {
+                            (*vnp).reachability = REACH_INTERNAL;
+                            *inl_u32_at(queue, q_tail) = v_u32;
+                        }
+                        q_tail = q_tail + 1;
+                    }
+                }
+            }
+            ei = ei + 1;
+        }
+    }
+
+    let mut dead_cnt: u32 = 0u32;
+    let mut j: usize = 0;
+    while j < n {
+        let np = unsafe { cg_node_at(cg.nodes, j) };
+        if (unsafe { (*np).reachability }) == REACH_DEAD_ELIMINATED && !(unsafe { (*np).is_extern_ffi }) {
+            dead_cnt = dead_cnt + 1u32;
+        }
+        j = j + 1;
+    }
+    dead_cnt
+}
+
+pub fn callgraph_finalize(
+    cg: mut_view<CallGraph>,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    arena: mut_view<Arena>
+) {
+    callgraph_analyze_edges(mut_view(*cg), mut_view(*arena));
+    callgraph_compute_sccs(mut_view(*cg), mut_view(*arena));
+    callgraph_propagate_summaries(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    let _ = callgraph_compute_reachability(mut_view(*cg), mut_view(*arena));
+}
+
+// --- Section 3: Two-Stage Inlining Decision Engine (`Legality` vs. `CostModel`, `SPEC-73 §4, AXS-INL-020..023`) ---
+
+pub fn inline_budget_for_profile(profile: u8) -> InlineBudget {
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        return InlineBudget {
+            profile: profile,
+            base_threshold_insts: 0,
+            max_callee_insts: 0u32,
+            max_caller_growth_pct: 100u32,
+            max_caller_total_insts: 0u32,
+            max_inline_depth: 0u32,
+            max_scc_cycle_depth: 0u32,
+            inline_hint_bonus: 0,
+            single_callsite_bonus: 0,
+            constant_arg_bonus: 0,
+            loop_depth_bonus: 0,
+            vectorization_enabler_bonus: 0,
+            escape_elim_bonus: 0,
+            closure_bonus: 0,
+            cold_callsite_penalty: 0,
+        };
+    }
+    if profile == OPT_PROFILE_BALANCED_O1 {
+        return InlineBudget {
+            profile: profile,
+            base_threshold_insts: 25,
+            max_callee_insts: 40u32,
+            max_caller_growth_pct: 150u32,
+            max_caller_total_insts: 250u32,
+            max_inline_depth: 3u32,
+            max_scc_cycle_depth: 1u32,
+            inline_hint_bonus: 150,
+            single_callsite_bonus: 120,
+            constant_arg_bonus: 60,
+            loop_depth_bonus: 80,
+            vectorization_enabler_bonus: 60,
+            escape_elim_bonus: 80,
+            closure_bonus: 150,
+            cold_callsite_penalty: 200,
+        };
+    }
+    if profile == OPT_PROFILE_SIZE_OS {
+        return InlineBudget {
+            profile: profile,
+            base_threshold_insts: 15,
+            max_callee_insts: 25u32,
+            max_caller_growth_pct: 115u32,
+            max_caller_total_insts: 160u32,
+            max_inline_depth: 2u32,
+            max_scc_cycle_depth: 1u32,
+            inline_hint_bonus: 60,
+            single_callsite_bonus: 100,
+            constant_arg_bonus: 40,
+            loop_depth_bonus: 30,
+            vectorization_enabler_bonus: 20,
+            escape_elim_bonus: 50,
+            closure_bonus: 100,
+            cold_callsite_penalty: 300,
+        };
+    }
+    if profile == OPT_PROFILE_MINSIZE_OZ {
+        return InlineBudget {
+            profile: profile,
+            base_threshold_insts: 8,
+            max_callee_insts: 12u32,
+            max_caller_growth_pct: 105u32,
+            max_caller_total_insts: 100u32,
+            max_inline_depth: 1u32,
+            max_scc_cycle_depth: 1u32,
+            inline_hint_bonus: 20,
+            single_callsite_bonus: 80,
+            constant_arg_bonus: 30,
+            loop_depth_bonus: 10,
+            vectorization_enabler_bonus: 0,
+            escape_elim_bonus: 40,
+            closure_bonus: 60,
+            cold_callsite_penalty: 400,
+        };
+    }
+    if profile == OPT_PROFILE_MAX_O3 {
+        return InlineBudget {
+            profile: profile,
+            base_threshold_insts: 180,
+            max_callee_insts: 300u32,
+            max_caller_growth_pct: 400u32,
+            max_caller_total_insts: 1200u32,
+            max_inline_depth: 8u32,
+            max_scc_cycle_depth: 1u32,
+            inline_hint_bonus: 400,
+            single_callsite_bonus: 350,
+            constant_arg_bonus: 120,
+            loop_depth_bonus: 200,
+            vectorization_enabler_bonus: 150,
+            escape_elim_bonus: 200,
+            closure_bonus: 300,
+            cold_callsite_penalty: 150,
+        };
+    }
+    // Default: OPT_PROFILE_SPEED_O2 (`-O2`)
+    InlineBudget {
+        profile: profile,
+        base_threshold_insts: 75,
+        max_callee_insts: 120u32,
+        max_caller_growth_pct: 250u32,
+        max_caller_total_insts: 600u32,
+        max_inline_depth: 6u32,
+        max_scc_cycle_depth: 1u32,
+        inline_hint_bonus: 250,
+        single_callsite_bonus: 200,
+        constant_arg_bonus: 90,
+        loop_depth_bonus: 120,
+        vectorization_enabler_bonus: 100,
+        escape_elim_bonus: 140,
+        closure_bonus: 220,
+        cold_callsite_penalty: 200,
+    }
+}
+
+// Stage 1: `check_inline_legality` (`AXS-INL-020.2`, `AXS-INL-021`, `AXS-INL-022`, `AXS-INL-025`).
+// Strictly independent of `CostModel`! `@inline(always)` NEVER overrides `INLINE_ILLEGAL`.
+pub fn inline_check_legality(
+    cg: view<CallGraph>,
+    edge: view<CallEdge>,
+    history: view<InlineHistoryChain>,
+    budget: view<InlineBudget>,
+    out_reason: mut_view<u8>
+) -> u8 {
+    *out_reason = INLINE_REASON_NONE;
+    if budget.profile == OPT_PROFILE_DEBUG_O0 {
+        *out_reason = INLINE_REASON_PROFILE_O0;
+        return INLINE_ILLEGAL;
+    }
+
+    if edge.dispatch_kind == DISPATCH_FFI_EXTERN {
+        *out_reason = INLINE_REASON_EXTERN_NO_BODY;
+        return INLINE_ILLEGAL;
+    }
+    if edge.dispatch_kind == DISPATCH_GPU_LAUNCH {
+        *out_reason = INLINE_REASON_DOMAIN_MISMATCH;
+        return INLINE_ILLEGAL;
+    }
+    if edge.dispatch_kind == DISPATCH_ASYNC_SPAWN {
+        *out_reason = INLINE_REASON_ASYNC_AWAIT_BOUNDARY;
+        return INLINE_ILLEGAL;
+    }
+
+    if edge.known_callee.v == 0u32 || edge.callee_node_idx == INLINE_NONE_IDX ||
+       (edge.callee_node_idx as usize) >= cg.node_count || !edge.targets_complete {
+        if edge.dispatch_kind == DISPATCH_FN_PTR || edge.dispatch_kind == DISPATCH_DYN_TRAIT ||
+           edge.dispatch_kind == DISPATCH_CLOSURE {
+            *out_reason = INLINE_REASON_INDIRECT_UNPROVEN;
+        } else {
+            *out_reason = INLINE_REASON_EXTERN_NO_BODY;
+        }
+        return INLINE_ILLEGAL;
+    }
+
+    if (edge.caller_node_idx as usize) >= cg.node_count {
+        *out_reason = INLINE_REASON_UNVERIFIED_BODY;
+        return INLINE_ILLEGAL;
+    }
+    let caller_np = unsafe { cg_node_at(cg.nodes, edge.caller_node_idx as usize) };
+    let callee_np = unsafe { cg_node_at(cg.nodes, edge.callee_node_idx as usize) };
+
+    if unsafe { (*callee_np).is_extern_ffi } {
+        *out_reason = INLINE_REASON_EXTERN_NO_BODY;
+        return INLINE_ILLEGAL;
+    }
+    if !(unsafe { (*callee_np).has_verified_body }) || ((unsafe { (*callee_np).mir }) as usize) == 0 ||
+       !(unsafe { (*caller_np).has_verified_body }) || ((unsafe { (*caller_np).mir }) as usize) == 0 {
+        *out_reason = INLINE_REASON_UNVERIFIED_BODY;
+        return INLINE_ILLEGAL;
+    }
+    if (unsafe { (*callee_np).inline_attr }) == INLINE_ATTR_NEVER {
+        *out_reason = INLINE_REASON_ATTR_INLINE_NEVER;
+        return INLINE_ILLEGAL;
+    }
+    if (unsafe { (*caller_np).exec_domain }) != (unsafe { (*callee_np).exec_domain }) {
+        *out_reason = INLINE_REASON_DOMAIN_MISMATCH;
+        return INLINE_ILLEGAL;
+    }
+    if unsafe { (*callee_np).has_await_suspension } {
+        *out_reason = INLINE_REASON_ASYNC_AWAIT_BOUNDARY;
+        return INLINE_ILLEGAL;
+    }
+
+    // Bounded recursive and mutually-recursive SCC cycle check (`AXS-INL-022`, `REQ-OPT-074`, `REQ-OPT-075`):
+    // Even if `callee` has `@inline(always)`, if `callee_sym` is already on the active `InlineHistoryChain`
+    // at depth >= `max_scc_cycle_depth` (default 1), inlining is ILLEGAL (`INLINE_REASON_RECURSIVE_SCC_LIMIT`).
+    let cycle_limit: u32 = if budget.max_scc_cycle_depth == 0u32 { 1u32 } else { budget.max_scc_cycle_depth };
+    let seen_cnt = inline_history_count_sym(history, unsafe { (*callee_np).fn_sym });
+    if seen_cnt >= cycle_limit {
+        *out_reason = INLINE_REASON_RECURSIVE_SCC_LIMIT;
+        return INLINE_ILLEGAL;
+    }
+
+    INLINE_LEGAL
+}
+
+fn inline_popcount_u64(v: u64) -> i32 {
+    let mut x = v;
+    let mut c: i32 = 0;
+    while x != 0u64 {
+        c = c + ((x & 1u64) as i32);
+        x = x >> 1u64;
+    }
+    c
+}
+
+// Stage 2: `evaluate_inline_cost` (`AXS-INL-020.2`, `AXS-INL-021`, `AXS-INL-023`).
+pub fn inline_evaluate_cost(
+    cg: view<CallGraph>,
+    edge: view<CallEdge>,
+    history: view<InlineHistoryChain>,
+    budget: view<InlineBudget>
+) -> InlineCostDecision {
+    let mut reason: u8 = INLINE_REASON_NONE;
+    let leg = inline_check_legality(cg, edge, history, budget, mut_view(reason));
+    if leg != INLINE_LEGAL {
+        return InlineCostDecision {
+            legality: INLINE_ILLEGAL,
+            block_reason: reason,
+            profitable: false,
+            forced_by_always: false,
+            base_callee_cost: 0,
+            dead_branch_discount: 0,
+            call_overhead_saved: 0,
+            total_bonus: 0,
+            net_cost: 0,
+            threshold: 0,
+        };
+    }
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, edge.caller_node_idx as usize) };
+    let callee_np = unsafe { cg_node_at(cg.nodes, edge.callee_node_idx as usize) };
+    let attr = unsafe { (*callee_np).inline_attr };
+    let callee_insts = unsafe { (*callee_np).inst_count };
+    let caller_insts = unsafe { (*caller_np).inst_count };
+    let base_cost = (callee_insts as i32) * 10;
+
+    let callee_mir_p = unsafe { (*callee_np).mir };
+    let argc: i32 = if (callee_mir_p as usize) != 0 {
+        (unsafe { (*callee_mir_p).arg_count }) as i32
+    } else {
+        0
+    };
+    let call_saved: i32 = 15 + (argc * 3);
+
+    // `@inline(always)` (`AXS-INL-021.3`): bypasses heuristic size threshold when `legality == INLINE_LEGAL`
+    if attr == INLINE_ATTR_ALWAYS {
+        return InlineCostDecision {
+            legality: INLINE_LEGAL,
+            block_reason: INLINE_REASON_NONE,
+            profitable: true,
+            forced_by_always: true,
+            base_callee_cost: base_cost,
+            dead_branch_discount: 0,
+            call_overhead_saved: call_saved,
+            total_bonus: 10000,
+            net_cost: base_cost - call_saved,
+            threshold: 10000,
+        };
+    }
+
+    let cur_depth: u32 = if history.depth > 0 { (history.depth - 1) as u32 } else { 0u32 };
+    if callee_insts > budget.max_callee_insts ||
+       cur_depth >= budget.max_inline_depth ||
+       (caller_insts + callee_insts) > budget.max_caller_total_insts {
+        return InlineCostDecision {
+            legality: INLINE_LEGAL,
+            block_reason: INLINE_REASON_BUDGET_EXCEEDED,
+            profitable: false,
+            forced_by_always: false,
+            base_callee_cost: base_cost,
+            dead_branch_discount: 0,
+            call_overhead_saved: call_saved,
+            total_bonus: 0,
+            net_cost: base_cost - call_saved,
+            threshold: budget.base_threshold_insts * 10,
+        };
+    }
+
+    // Context-sensitive branch discount (`AXS-INL-023.2`):
+    let const_cnt = inline_popcount_u64(edge.const_arg_mask);
+    let mut branch_discount: i32 = 0;
+    if const_cnt > 0 && (callee_mir_p as usize) != 0 && (unsafe { (*callee_mir_p).bb_count }) > 1 {
+        branch_discount = base_cost / 3;
+    }
+
+    let mut bonus: i32 = 0;
+    if attr == INLINE_ATTR_HINT {
+        bonus = bonus + budget.inline_hint_bonus;
+    }
+    if (unsafe { (*callee_np).direct_caller_count }) == 1u32 &&
+       !(unsafe { (*callee_np).is_export_root }) &&
+       !(unsafe { (*callee_np).address_taken_fn }) {
+        bonus = bonus + budget.single_callsite_bonus;
+    }
+    if const_cnt > 0 {
+        bonus = bonus + (const_cnt * budget.constant_arg_bonus);
+    }
+    if edge.in_loop_depth > 0u32 {
+        bonus = bonus + ((edge.in_loop_depth as i32) * budget.loop_depth_bonus) + budget.vectorization_enabler_bonus;
+    }
+    if edge.dispatch_kind == DISPATCH_CLOSURE || edge.closure_arg_mask != 0u64 {
+        bonus = bonus + budget.closure_bonus + budget.escape_elim_bonus;
+    }
+    if edge.view_arg_mask != 0u64 || (unsafe { (*callee_np).escape_summary.returns_fresh_alloc }) {
+        bonus = bonus + budget.escape_elim_bonus;
+    }
+    if edge.is_cold_callsite || (unsafe { (*callee_np).is_cold_fn }) {
+        bonus = bonus - budget.cold_callsite_penalty;
+    }
+
+    let net_cost = base_cost - branch_discount - call_saved;
+    let threshold = (budget.base_threshold_insts * 10) + bonus;
+    let is_prof = net_cost <= threshold;
+    InlineCostDecision {
+        legality: INLINE_LEGAL,
+        block_reason: if is_prof { INLINE_REASON_NONE } else { INLINE_REASON_BUDGET_EXCEEDED },
+        profitable: is_prof,
+        forced_by_always: false,
+        base_callee_cost: base_cost,
+        dead_branch_discount: branch_discount,
+        call_overhead_saved: call_saved,
+        total_bonus: bonus,
+        net_cost: net_cost,
+        threshold: threshold,
+    }
+}
+
+// --- Section 4: Transactional Callee Cloning & Remapping (`SPEC-73 §4.5, AXS-INL-024`) ---
+
+fn inline_clone_mir_body(src: view<MirBody>, dst: mut_view<MirBody>, arena: mut_view<Arena>) {
+    dst.sym.v = src.sym.v;
+    dst.fn_sym.v = src.fn_sym.v;
+    dst.fn_name.v = src.fn_name.v;
+    dst.span = src.span;
+    dst.arg_count = src.arg_count;
+    dst.local_count = src.local_count;
+    dst.local_cap = src.local_count;
+    dst.bb_count = src.bb_count;
+    dst.bb_cap = src.bb_count;
+    dst.drop_flag_count = src.drop_flag_count;
+
+    if src.local_count > 0 && (src.locals as usize) != 0 {
+        let lbytes = inl_mul_usize(src.local_count, size_of<MirLocalDecl>());
+        let new_locals = arena_alloc_raw(mut_view(*arena), lbytes, align_of<MirLocalDecl>()) as *mut MirLocalDecl;
+        unsafe { ptr_copy_nonoverlapping<u8>(src.locals as *const u8, new_locals as *mut u8, lbytes); }
+        dst.locals = new_locals;
+    } else {
+        dst.locals = 0 as *mut MirLocalDecl;
+    }
+
+    if src.bb_count > 0 && (src.bbs as usize) != 0 {
+        let bbytes = inl_mul_usize(src.bb_count, size_of<MirBb>());
+        let new_bbs = arena_alloc_raw(mut_view(*arena), bbytes, align_of<MirBb>()) as *mut MirBb;
+        let mut b: usize = 0;
+        while b < src.bb_count {
+            let sbb = unsafe { mir_bb_at(src.bbs, b) };
+            let dbb = unsafe { mir_bb_at(new_bbs, b) };
+            unsafe {
+                (*dbb).id.v = (*sbb).id.v;
+                (*dbb).stmt_count = (*sbb).stmt_count;
+                (*dbb).stmt_cap = (*sbb).stmt_count;
+                (*dbb).has_terminator = (*sbb).has_terminator;
+                (*dbb).is_cleanup = (*sbb).is_cleanup;
+                mir_copy_terminator(mut_view((*dbb).terminator), view((*sbb).terminator));
+                if (*sbb).stmt_count > 0 && ((*sbb).stmts as usize) != 0 {
+                    let sbytes = inl_mul_usize((*sbb).stmt_count, size_of<MirStmt>());
+                    let nstmts = arena_alloc_raw(mut_view(*arena), sbytes, align_of<MirStmt>()) as *mut MirStmt;
+                    ptr_copy_nonoverlapping<u8>((*sbb).stmts as *const u8, nstmts as *mut u8, sbytes);
+                    (*dbb).stmts = nstmts;
+                } else {
+                    (*dbb).stmts = 0 as *mut MirStmt;
+                }
+            }
+            b = b + 1;
+        }
+        dst.bbs = new_bbs;
+    } else {
+        dst.bbs = 0 as *mut MirBb;
+    }
+}
+
+fn inline_map_local(loc_v: u32, local_map: *const u32, callee_local_count: usize) -> u32 {
+    if (loc_v as usize) < callee_local_count && (local_map as usize) != 0 {
+        return unsafe { *inl_u32_at(local_map as *mut u32, loc_v as usize) };
+    }
+    loc_v
+}
+
+fn inline_remap_place(
+    src: view<MirPlace>,
+    dst: mut_view<MirPlace>,
+    local_map: *const u32,
+    callee_local_count: usize,
+    df_offset: u32,
+    arena: mut_view<Arena>
+) {
+    mir_clone_place(mut_view(*arena), src, mut_view(*dst));
+    dst.local.v = inline_map_local(src.local.v, local_map, callee_local_count);
+    if src.drop_flag != MIR_DROP_FLAG_NONE {
+        dst.drop_flag = src.drop_flag + df_offset;
+    }
+    let mut p: usize = 0;
+    while p < dst.proj_count && (dst.projs as usize) != 0 {
+        let pr = unsafe { mir_proj_at(dst.projs, p) };
+        let pk = unsafe { (*pr).kind };
+        if pk == MIR_PROJ_INDEX {
+            let old_idx = unsafe { (*pr).index_local.v };
+            unsafe { (*pr).index_local.v = inline_map_local(old_idx, local_map, callee_local_count); }
+        } else if pk == MIR_PROJ_SUB_SLICE {
+            if unsafe { (*pr).has_from } {
+                let fl = unsafe { (*pr).from_local.v };
+                unsafe { (*pr).from_local.v = inline_map_local(fl, local_map, callee_local_count); }
+            }
+            if unsafe { (*pr).has_to } {
+                let tl = unsafe { (*pr).to_local.v };
+                unsafe { (*pr).to_local.v = inline_map_local(tl, local_map, callee_local_count); }
+            }
+        }
+        p = p + 1;
+    }
+}
+
+fn inline_remap_operand(
+    src: view<MirOperand>,
+    dst: mut_view<MirOperand>,
+    local_map: *const u32,
+    callee_local_count: usize,
+    df_offset: u32,
+    arena: mut_view<Arena>
+) {
+    mir_copy_operand(mut_view(*dst), src);
+    if src.kind == MIR_OP_COPY || src.kind == MIR_OP_MOVE {
+        inline_remap_place(view(src.place), mut_view(dst.place), local_map, callee_local_count, df_offset, mut_view(*arena));
+    }
+}
+
+fn inline_remap_stmt(
+    src: view<MirStmt>,
+    dst: mut_view<MirStmt>,
+    local_map: *const u32,
+    callee_local_count: usize,
+    df_offset: u32,
+    arena: mut_view<Arena>
+) {
+    mir_copy_stmt(mut_view(*dst), src);
+    let sk = src.kind;
+    if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+        dst.storage_local.v = inline_map_local(src.storage_local.v, local_map, callee_local_count);
+        return;
+    }
+    if sk == MIR_STMT_DROP {
+        inline_remap_place(view(src.place), mut_view(dst.place), local_map, callee_local_count, df_offset, mut_view(*arena));
+        return;
+    }
+    if sk == MIR_STMT_ASSIGN {
+        inline_remap_place(view(src.place), mut_view(dst.place), local_map, callee_local_count, df_offset, mut_view(*arena));
+        let rvk = src.rvalue.kind;
+        if rvk == MIR_RVALUE_REPEAT && (src.rvalue.repeat_count_op as usize) != 0 {
+            let new_rc = arena_alloc_raw(mut_view(*arena), size_of<MirOperand>(), align_of<MirOperand>()) as *mut MirOperand;
+            inline_remap_operand(unsafe { view(*src.rvalue.repeat_count_op) }, unsafe { mut_view(*new_rc) }, local_map, callee_local_count, df_offset, mut_view(*arena));
+            dst.rvalue.repeat_count_op = new_rc;
+        }
+        if rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_REPEAT || rvk == MIR_RVALUE_CAST || rvk == MIR_RVALUE_UNARY_OP {
+            inline_remap_operand(view(src.rvalue.use_op), mut_view(dst.rvalue.use_op), local_map, callee_local_count, df_offset, mut_view(*arena));
+        } else if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+            inline_remap_operand(view(src.rvalue.lhs), mut_view(dst.rvalue.lhs), local_map, callee_local_count, df_offset, mut_view(*arena));
+            inline_remap_operand(view(src.rvalue.rhs), mut_view(dst.rvalue.rhs), local_map, callee_local_count, df_offset, mut_view(*arena));
+        } else if rvk == MIR_RVALUE_REF || rvk == MIR_RVALUE_LEN || rvk == MIR_RVALUE_DISCRIMINANT {
+            inline_remap_place(view(src.rvalue.place), mut_view(dst.rvalue.place), local_map, callee_local_count, df_offset, mut_view(*arena));
+        } else if rvk == MIR_RVALUE_AGGREGATE {
+            let ocnt = src.rvalue.operand_count;
+            if ocnt > 0 && (src.rvalue.operands as usize) != 0 {
+                let new_ops = arena_alloc_raw(mut_view(*arena), inl_mul_usize(ocnt, size_of<MirOperand>()), align_of<MirOperand>()) as *mut MirOperand;
+                let mut i: usize = 0;
+                while i < ocnt {
+                    let sop = unsafe { mir_op_at(src.rvalue.operands, i) };
+                    let dop = unsafe { mir_op_at(new_ops, i) };
+                    inline_remap_operand(unsafe { view(*sop) }, unsafe { mut_view(*dop) }, local_map, callee_local_count, df_offset, mut_view(*arena));
+                    i = i + 1;
+                }
+                dst.rvalue.operands = new_ops;
+            }
+        }
+    }
+}
+
+fn inl_bb_push_stmt_ptr(bb_p: *mut MirBb, arena: mut_view<Arena>, st_p: *const MirStmt) {
+    mir_bb_push_stmt(unsafe { mut_view(*bb_p) }, mut_view(*arena), unsafe { view(*st_p) });
+}
+
+fn inl_term_reset_ptr(tm_p: *mut MirTerminator, kind: u8, span: view<Span>) {
+    mir_term_reset(unsafe { mut_view(*tm_p) }, kind, span);
+}
+
+fn inl_copy_term_ptr(dst_p: *mut MirTerminator, src_p: *const MirTerminator) {
+    mir_copy_terminator(unsafe { mut_view(*dst_p) }, unsafe { view(*src_p) });
+}
+
+fn inl_remap_term_ptr(
+    stm_p: *const MirTerminator,
+    dtm_p: *mut MirTerminator,
+    local_map: *const u32,
+    local_map_len: usize,
+    bb_offset: u32,
+    df_offset: u32,
+    call_unwind_v: u32,
+    arena: mut_view<Arena>
+) {
+    let stm = unsafe { view(*stm_p) };
+    let dtm = unsafe { mut_view(*dtm_p) };
+    let stk = stm.kind;
+    if stk == MIR_TERM_GOTO {
+        dtm.goto_target.v = stm.goto_target.v + bb_offset;
+    } else if stk == MIR_TERM_SWITCH_INT {
+        inline_remap_operand(view(stm.discr), mut_view(dtm.discr), local_map, local_map_len, df_offset, mut_view(*arena));
+        dtm.otherwise.v = stm.otherwise.v + bb_offset;
+        if stm.switch_count > 0 && (stm.targets as usize) != 0 {
+            let tbytes = inl_mul_usize(stm.switch_count, size_of<MirBbId>());
+            let ntgts = arena_alloc_raw(mut_view(*arena), tbytes, align_of<MirBbId>()) as *mut MirBbId;
+            let vbytes = inl_mul_usize(stm.switch_count, size_of<u64>());
+            let nvals = arena_alloc_raw(mut_view(*arena), vbytes, align_of<u64>()) as *mut u64;
+            let mut k: usize = 0;
+            while k < stm.switch_count {
+                unsafe {
+                    (*mir_bb_id_at(ntgts, k)).v = (*mir_bb_id_at(stm.targets, k)).v + bb_offset;
+                    *mir_u64_at(nvals, k) = *mir_u64_at(stm.values, k);
+                }
+                k = k + 1;
+            }
+            dtm.targets = ntgts;
+            dtm.values = nvals;
+        }
+    } else if stk == MIR_TERM_DROP {
+        inline_remap_place(view(stm.drop_place), mut_view(dtm.drop_place), local_map, local_map_len, df_offset, mut_view(*arena));
+        if stm.drop_flag != MIR_DROP_FLAG_NONE {
+            dtm.drop_flag = stm.drop_flag + df_offset;
+        }
+        dtm.drop_target.v = stm.drop_target.v + bb_offset;
+        if stm.drop_unwind.v > 0u32 {
+            dtm.drop_unwind.v = stm.drop_unwind.v + bb_offset;
+        } else {
+            dtm.drop_unwind.v = call_unwind_v;
+        }
+    } else if stk == MIR_TERM_ASSERT {
+        inline_remap_operand(view(stm.cond), mut_view(dtm.cond), local_map, local_map_len, df_offset, mut_view(*arena));
+        dtm.assert_target.v = stm.assert_target.v + bb_offset;
+        if stm.assert_unwind.v > 0u32 {
+            dtm.assert_unwind.v = stm.assert_unwind.v + bb_offset;
+        } else {
+            dtm.assert_unwind.v = call_unwind_v;
+        }
+    } else if stk == MIR_TERM_CALL {
+        inline_remap_operand(view(stm.func), mut_view(dtm.func), local_map, local_map_len, df_offset, mut_view(*arena));
+        if stm.arg_count > 0 && (stm.args as usize) != 0 {
+            let abytes = inl_mul_usize(stm.arg_count, size_of<MirOperand>());
+            let nargs = arena_alloc_raw(mut_view(*arena), abytes, align_of<MirOperand>()) as *mut MirOperand;
+            let mut kai: usize = 0;
+            while kai < stm.arg_count {
+                let sap = unsafe { mir_op_at(stm.args, kai) };
+                let dap = unsafe { mir_op_at(nargs, kai) };
+                inline_remap_operand(unsafe { view(*sap) }, unsafe { mut_view(*dap) }, local_map, local_map_len, df_offset, mut_view(*arena));
+                kai = kai + 1;
+            }
+            dtm.args = nargs;
+        }
+        if stm.has_destination {
+            inline_remap_place(view(stm.destination), mut_view(dtm.destination), local_map, local_map_len, df_offset, mut_view(*arena));
+        }
+        dtm.call_target.v = stm.call_target.v + bb_offset;
+        if stm.call_unwind.v > 0u32 {
+            dtm.call_unwind.v = stm.call_unwind.v + bb_offset;
+        } else {
+            dtm.call_unwind.v = call_unwind_v;
+        }
+    }
+}
+
+pub fn inline_clone_callsite_in_mir(
+    caller_mir: mut_view<MirBody>,
+    callee_mir: view<MirBody>,
+    call_bb_idx: usize,
+    thir: *const Thir,
+    arena: mut_view<Arena>
+) -> bool {
+    if call_bb_idx >= caller_mir.bb_count || (caller_mir.bbs as usize) == 0 ||
+       callee_mir.bb_count == 0 || (callee_mir.bbs as usize) == 0 ||
+       (callee_mir.local_count) < (callee_mir.arg_count + 1) || (callee_mir.locals as usize) == 0 {
+        return false;
+    }
+
+    let cbb_init = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    if !(unsafe { (*cbb_init).has_terminator }) || (unsafe { (*cbb_init).terminator.kind }) != MIR_TERM_CALL {
+        return false;
+    }
+
+    let orig_term = unsafe { (*cbb_init).terminator };
+    let call_argc = orig_term.arg_count;
+    let callee_argc = callee_mir.arg_count;
+    let mut pass_closure_env_first = false;
+    if call_argc != callee_argc {
+        if (call_argc + 1) == callee_argc && (orig_term.func.kind == MIR_OP_COPY || orig_term.func.kind == MIR_OP_MOVE) {
+            pass_closure_env_first = true;
+        } else {
+            return false;
+        }
+    }
+
+    // 1. Allocate fresh locals in `caller_mir` for every local `0 .. callee_mir.local_count - 1` of `callee_mir`
+    let local_map = arena_alloc_raw(mut_view(*arena), inl_mul_usize(callee_mir.local_count, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut cl: usize = 0;
+    while cl < callee_mir.local_count {
+        let cdecl = unsafe { mir_local_at(callee_mir.locals, cl) };
+        let lkind: u8 = if (unsafe { (*cdecl).kind }) == MIR_LOCAL_CONST {
+            MIR_LOCAL_CONST
+        } else {
+            MIR_LOCAL_TEMP
+        };
+        let is_mut: bool = if cl <= callee_argc { true } else { unsafe { (*cdecl).mut_flag } };
+        let new_lid = mir_add_local(
+            mut_view(*caller_mir),
+            mut_view(*arena),
+            unsafe { (*cdecl).ty },
+            lkind,
+            is_mut,
+            unsafe { (*cdecl).name },
+            unsafe { view((*cdecl).span) }
+        );
+        let nd = unsafe { mir_local_at(caller_mir.locals, new_lid.v as usize) };
+        unsafe {
+            (*nd).const_sym.v = (*cdecl).const_sym.v;
+            *inl_u32_at(local_map, cl) = new_lid.v;
+        }
+        cl = cl + 1;
+    }
+
+    let ret_mapped_local = unsafe { *inl_u32_at(local_map, 0) };
+    let ret_ty_v = unsafe { (*mir_local_at(callee_mir.locals, 0)).ty.v };
+    let ret_is_copy = sroa_type_is_copy(thir, TypeId { v: ret_ty_v });
+    let df_offset: u32 = caller_mir.drop_flag_count as u32;
+    caller_mir.drop_flag_count = caller_mir.drop_flag_count + callee_mir.drop_flag_count;
+
+    // 2. Evaluate and bind arguments left-to-right in `call_bb` (`AXS-INL-024.1`)
+    let call_bb_before = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    let mut param_base: usize = 1;
+    if pass_closure_env_first {
+        let env_local = unsafe { *inl_u32_at(local_map, 1) };
+        let mut env_st = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+        mir_stmt_reset(mut_view(env_st), MIR_STMT_ASSIGN, view(orig_term.span));
+        env_st.place = mir_local_place(env_local);
+        mir_rvalue_reset(mut_view(env_st.rvalue), MIR_RVALUE_USE);
+        mir_copy_operand(mut_view(env_st.rvalue.use_op), view(orig_term.func));
+        mir_bb_push_stmt(unsafe { mut_view(*call_bb_before) }, mut_view(*arena), view(env_st));
+        param_base = 2;
+    }
+
+    let mut ai: usize = 0;
+    while ai < call_argc && (orig_term.args as usize) != 0 {
+        let arg_op = unsafe { mir_op_at(orig_term.args, ai) };
+        let param_loc = unsafe { *inl_u32_at(local_map, param_base + ai) };
+        let mut ast = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+        mir_stmt_reset(mut_view(ast), MIR_STMT_ASSIGN, view(orig_term.span));
+        ast.place = mir_local_place(param_loc);
+        mir_rvalue_reset(mut_view(ast.rvalue), MIR_RVALUE_USE);
+        mir_copy_operand(mut_view(ast.rvalue.use_op), unsafe { view(*arg_op) });
+        mir_bb_push_stmt(unsafe { mut_view(*call_bb_before) }, mut_view(*arena), view(ast));
+        ai = ai + 1;
+    }
+
+    // If return type is `TY_UNIT`, initialize `ret_mapped_local` to `()` so definite-init holds on implicit unit return
+    if (thir as usize) != 0 {
+        let rtp = type_get(unsafe { view((*thir).interner) }, TypeId { v: ret_ty_v });
+        if (rtp as usize) != 0 && (unsafe { (*rtp).kind }) == TY_UNIT {
+            let mut ust = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+            mir_stmt_reset(mut_view(ust), MIR_STMT_ASSIGN, view(orig_term.span));
+            ust.place = mir_local_place(ret_mapped_local);
+            mir_rvalue_reset(mut_view(ust.rvalue), MIR_RVALUE_USE);
+            ust.rvalue.use_op.kind = MIR_OP_CONST;
+            ust.rvalue.use_op.constant.ty.v = ret_ty_v;
+            ust.rvalue.use_op.constant.kind = MIR_CONST_UNIT;
+            mir_bb_push_stmt(unsafe { mut_view(*call_bb_before) }, mut_view(*arena), view(ust));
+        }
+    }
+
+    // 3. Allocate cloned callee basic blocks `bb_offset .. bb_offset + callee_mir.bb_count - 1`
+    let bb_offset = caller_mir.bb_count as u32;
+    let mut cb_alloc: usize = 0;
+    while cb_alloc < callee_mir.bb_count {
+        let src_bb = unsafe { mir_bb_at(callee_mir.bbs, cb_alloc) };
+        let _ = mir_add_bb(mut_view(*caller_mir), mut_view(*arena), unsafe { (*src_bb).is_cleanup });
+        cb_alloc = cb_alloc + 1;
+    }
+
+    // Redirect `call_bb` terminator to jump to `B_callee_entry` (`bb_offset`)
+    let call_bb_after = unsafe { mir_bb_at(caller_mir.bbs, call_bb_idx) };
+    mir_term_reset(unsafe { mut_view((*call_bb_after).terminator) }, MIR_TERM_GOTO, view(orig_term.span));
+    unsafe { (*call_bb_after).terminator.goto_target.v = bb_offset; }
+
+    // 4. Clone & remap statements and terminators of each callee basic block
+    let mut cb: usize = 0;
+    while cb < callee_mir.bb_count {
+        let sbb = unsafe { mir_bb_at(callee_mir.bbs, cb) };
+        let dbb = unsafe { mir_bb_at(caller_mir.bbs, (bb_offset as usize) + cb) };
+        let mut s: usize = 0;
+        while s < (unsafe { (*sbb).stmt_count }) {
+            let sst = unsafe { mir_stmt_at((*sbb).stmts, s) };
+            let mut dst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+            inline_remap_stmt(unsafe { view(*sst) }, mut_view(dst), local_map as *const u32, callee_mir.local_count, df_offset, mut_view(*arena));
+            inl_bb_push_stmt_ptr(dbb, mut_view(*arena), unsafe { address_of(dst) });
+            s = s + 1;
+        }
+
+        if unsafe { (*sbb).has_terminator } {
+            let stm_p = unsafe { address_of((*sbb).terminator) };
+            let dtm_p = unsafe { address_of_mut((*dbb).terminator) };
+            let stk = unsafe { (*stm_p).kind };
+            if stk == MIR_TERM_RETURN {
+                if orig_term.has_destination {
+                    let mut rst = unsafe { *(arena_alloc_raw(mut_view(*arena), size_of<MirStmt>(), align_of<MirStmt>()) as *mut MirStmt) };
+                    mir_stmt_reset(mut_view(rst), MIR_STMT_ASSIGN, view(orig_term.span));
+                    mir_clone_place(mut_view(*arena), view(orig_term.destination), mut_view(rst.place));
+                    mir_rvalue_reset(mut_view(rst.rvalue), MIR_RVALUE_USE);
+                    rst.rvalue.use_op = if ret_is_copy {
+                        mir_op_copy_local(ret_mapped_local)
+                    } else {
+                        mir_op_move_local(ret_mapped_local)
+                    };
+                    inl_bb_push_stmt_ptr(dbb, mut_view(*arena), unsafe { address_of(rst) });
+                }
+                let sp_ret = unsafe { (*stm_p).span };
+                inl_term_reset_ptr(dtm_p, MIR_TERM_GOTO, view(sp_ret));
+                unsafe {
+                    (*dbb).terminator.goto_target.v = orig_term.call_target.v;
+                    (*dbb).has_terminator = true;
+                }
+            } else {
+                inl_copy_term_ptr(dtm_p, stm_p);
+                unsafe { (*dbb).has_terminator = true; }
+                inl_remap_term_ptr(
+                    stm_p,
+                    dtm_p,
+                    local_map as *const u32,
+                    callee_mir.local_count,
+                    bb_offset,
+                    df_offset,
+                    orig_term.call_unwind.v,
+                    mut_view(*arena)
+                );
+            }
+        }
+        cb = cb + 1;
+    }
+
+    true
+}
+
+// --- Section 5: Bottom-Up `SCC` CallGraph Inliner & `PassManager` Runner (`SPEC-73 §§4.7, 8`) ---
+
+pub fn inline_optimize_node(
+    cg: mut_view<CallGraph>,
+    caller_idx: usize,
+    budget: view<InlineBudget>,
+    eff_table: *const EffectCallTable,
+    esc_table: *const EscapeSummaryTable,
+    stats: mut_view<InlineStats>,
+    log: *mut InlineDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if caller_idx >= cg.node_count || (cg.nodes as usize) == 0 {
+        return false;
+    }
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx) };
+    if (unsafe { (*caller_np).is_extern_ffi }) || !(unsafe { (*caller_np).has_verified_body }) ||
+       ((unsafe { (*caller_np).mir }) as usize) == 0 {
+        return false;
+    }
+
+    let caller_sym_v = unsafe { (*caller_np).fn_sym.v };
+    let mut history = inline_history_with_root(SymbolId { v: caller_sym_v });
+    let mut any_inlined = false;
+    let mut round: u32 = 0u32;
+    let max_rounds: u32 = if budget.max_inline_depth == 0u32 { 1u32 } else { budget.max_inline_depth };
+
+    while round < max_rounds {
+        let mut round_inlined = false;
+        let cur_caller = unsafe { cg_node_at(cg.nodes, caller_idx) };
+        let estart = (unsafe { (*cur_caller).out_edge_start }) as usize;
+        let ecnt = (unsafe { (*cur_caller).out_edge_count }) as usize;
+
+        let mut ei: usize = 0;
+        while ei < ecnt && (estart + ei) < cg.edge_count {
+            let ep = unsafe { cg_edge_at(cg.edges, estart + ei) };
+            if !(unsafe { (*ep).is_inlined }) {
+                stats.callsites_analyzed = stats.callsites_analyzed + 1u32;
+                let cost_dec = inline_evaluate_cost(view(*cg), unsafe { view(*ep) }, view(history), budget);
+                let callee_idx = unsafe { (*ep).callee_node_idx };
+                let callee_sym_v = unsafe { (*ep).known_callee.v };
+                let callee_attr: u8 = if callee_idx != INLINE_NONE_IDX && (callee_idx as usize) < cg.node_count {
+                    unsafe { (*cg_node_at(cg.nodes, callee_idx as usize)).inline_attr }
+                } else {
+                    INLINE_ATTR_NONE
+                };
+                let cbb_v = unsafe { (*ep).callsite_bb.v };
+
+                if cost_dec.legality != INLINE_LEGAL {
+                    stats.callsites_rejected_illegal = stats.callsites_rejected_illegal + 1u32;
+                    if cost_dec.block_reason == INLINE_REASON_RECURSIVE_SCC_LIMIT {
+                        stats.recursive_scc_bounded = stats.recursive_scc_bounded + 1u32;
+                    }
+                    inline_log_push(log, mut_view(*arena), InlineDecisionRecord {
+                        caller_sym: caller_sym_v,
+                        callee_sym: callee_sym_v,
+                        callsite_bb: cbb_v,
+                        attr: callee_attr,
+                        legality: INLINE_ILLEGAL,
+                        block_reason: cost_dec.block_reason,
+                        profitable: false,
+                        net_cost: cost_dec.net_cost,
+                        threshold: cost_dec.threshold,
+                        decision: INLINE_DECISION_REJECTED,
+                    });
+                } else if !cost_dec.profitable {
+                    stats.callsites_rejected_cost = stats.callsites_rejected_cost + 1u32;
+                    inline_log_push(log, mut_view(*arena), InlineDecisionRecord {
+                        caller_sym: caller_sym_v,
+                        callee_sym: callee_sym_v,
+                        callsite_bb: cbb_v,
+                        attr: callee_attr,
+                        legality: INLINE_LEGAL,
+                        block_reason: cost_dec.block_reason,
+                        profitable: false,
+                        net_cost: cost_dec.net_cost,
+                        threshold: cost_dec.threshold,
+                        decision: INLINE_DECISION_REJECTED,
+                    });
+                } else {
+                    // Legal & profitable: execute transactional callsite clone + remapping (`AXS-INL-024`)
+                    let caller_mir_p = unsafe { (*cg_node_at(cg.nodes, caller_idx)).mir };
+                    let callee_np = unsafe { cg_node_at(cg.nodes, callee_idx as usize) };
+                    let callee_mir_p = unsafe { (*callee_np).mir };
+                    let callee_sym = unsafe { (*callee_np).fn_sym };
+                    let is_clos_edge = (unsafe { (*ep).dispatch_kind }) == DISPATCH_CLOSURE;
+
+                    // Snapshot `caller_mir` before inlining
+                    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+                    inline_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+                    let callee_clone = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+                    inline_clone_mir_body(unsafe { view(*callee_mir_p) }, unsafe { mut_view(*callee_clone) }, mut_view(*arena));
+
+                    let cloned_ok = inline_clone_callsite_in_mir(
+                        unsafe { mut_view(*caller_mir_p) },
+                        unsafe { view(*callee_clone) },
+                        cbb_v as usize,
+                        cg.thir,
+                        mut_view(*arena)
+                    );
+
+                    let mut verify_ok = false;
+                    if cloned_ok && !force_verify_fail {
+                        let prev_errs = sink.errors;
+                        verify_ok = sroa_verify_mir_body_complete(
+                            unsafe { view(*caller_mir_p) },
+                            cg.thir,
+                            mut_view(*arena),
+                            mut_view(*sink)
+                        ) && sink.errors == prev_errs;
+                        sink.errors = prev_errs;
+                    }
+
+                    if !verify_ok {
+                        // Rollback `caller_mir` to pre-inline snapshot (`AXS-INL-024.7`)
+                        inline_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+                        stats.pass_rollbacks = stats.pass_rollbacks + 1u32;
+                        inline_log_push(log, mut_view(*arena), InlineDecisionRecord {
+                            caller_sym: caller_sym_v,
+                            callee_sym: callee_sym_v,
+                            callsite_bb: cbb_v,
+                            attr: callee_attr,
+                            legality: INLINE_LEGAL,
+                            block_reason: INLINE_REASON_ROLLBACK_VERIFY,
+                            profitable: true,
+                            net_cost: cost_dec.net_cost,
+                            threshold: cost_dec.threshold,
+                            decision: INLINE_DECISION_REJECTED,
+                        });
+                    } else {
+                        unsafe { (*ep).is_inlined = true; }
+                        stats.callsites_inlined = stats.callsites_inlined + 1u32;
+                        if is_clos_edge {
+                            stats.closures_inlined = stats.closures_inlined + 1u32;
+                        }
+                        inline_log_push(log, mut_view(*arena), InlineDecisionRecord {
+                            caller_sym: caller_sym_v,
+                            callee_sym: callee_sym_v,
+                            callsite_bb: cbb_v,
+                            attr: callee_attr,
+                            legality: INLINE_LEGAL,
+                            block_reason: INLINE_REASON_NONE,
+                            profitable: true,
+                            net_cost: cost_dec.net_cost,
+                            threshold: cost_dec.threshold,
+                            decision: INLINE_DECISION_INLINED,
+                        });
+
+                        // Run post-inlining cleanup cascade (`SROA` + `ConstFold` + `SimplifyCFG` + `DCE`, `AXS-INL-026`)
+                        let mut local_sroa_stats = sroa_stats_zero();
+                        let s_stats_p: *mut SroaStats = if (sroa_stats as usize) != 0 {
+                            sroa_stats
+                        } else {
+                            unsafe { address_of_mut(local_sroa_stats) }
+                        };
+                        let _ = sroa_optimize_mir_in_place(
+                            unsafe { mut_view(*caller_mir_p) },
+                            cg.thir,
+                            eff_table,
+                            esc_table,
+                            unsafe { mut_view(*s_stats_p) },
+                            sroa_log,
+                            mut_view(*arena),
+                            mut_view(*sink),
+                            unsafe { (*cg_node_at(cg.nodes, caller_idx)).fn_item }
+                        );
+                        let _ = opt_const_fold(unsafe { mut_view(*caller_mir_p) }, cg.thir);
+                        let _ = opt_cfg_simplify_with_merge(unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+                        let _ = opt_dce_in_arena(unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+                        stats.post_inline_sroa_cascades = stats.post_inline_sroa_cascades + 1u32;
+
+                        // Update caller's `inst_count`, `opt_body`, and outgoing edges after inlining + cleanup
+                        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, cg.thir, mut_view(*arena));
+                        let cnp_upd = unsafe { cg_node_at(cg.nodes, caller_idx) };
+                        unsafe {
+                            (*cnp_upd).inst_count = callgraph_count_mir_insts(caller_mir_p as *const MirBody);
+                            if (new_ob as usize) != 0 {
+                                (*new_ob).fn_sym = SymbolId { v: caller_sym_v };
+                                (*cnp_upd).opt_body = new_ob;
+                            }
+                        }
+                        history = inline_history_push(view(history), callee_sym);
+                        callgraph_analyze_edges(mut_view(*cg), mut_view(*arena));
+                        any_inlined = true;
+                        round_inlined = true;
+                        break;
+                    }
+                }
+            }
+            ei = ei + 1;
+        }
+
+        if !round_inlined {
+            break;
+        }
+        round = round + 1u32;
+    }
+
+    any_inlined
+}
+
+pub fn inline_optimize_callgraph(
+    cg: mut_view<CallGraph>,
+    profile: u8,
+    eff_table: mut_view<EffectCallTable>,
+    esc_table: mut_view<EscapeSummaryTable>,
+    stats: mut_view<InlineStats>,
+    log: *mut InlineDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    callgraph_finalize(mut_view(*cg), mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+    let budget = inline_budget_for_profile(profile);
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let mut any_changed = false;
+    // Traverse SCCs in bottom-up reverse topological order (`0 .. scc_count - 1`)
+    let mut si: usize = 0;
+    while si < cg.scc_count {
+        let scc_p = unsafe { cg_scc_at(cg.sccs, si) };
+        let mstart = (unsafe { (*scc_p).member_start }) as usize;
+        let mcnt = (unsafe { (*scc_p).member_count }) as usize;
+        let mut k: usize = 0;
+        while k < mcnt {
+            let u = (unsafe { *inl_u32_at(cg.scc_members, mstart + k) }) as usize;
+            // First run intraprocedural SROA/RVO/NRVO on `u` so callees are simplified before being inlined into callers
+            let unp = unsafe { cg_node_at(cg.nodes, u) };
+            let umir = unsafe { (*unp).mir };
+            if (umir as usize) != 0 && !(unsafe { (*unp).is_extern_ffi }) && budget.profile != OPT_PROFILE_DEBUG_O0 {
+                let mut local_ss = sroa_stats_zero();
+                let ss_p: *mut SroaStats = if (sroa_stats as usize) != 0 { sroa_stats } else { unsafe { address_of_mut(local_ss) } };
+                if sroa_optimize_mir_in_place(
+                    unsafe { mut_view(*umir) },
+                    cg.thir,
+                    unsafe { address_of(*eff_table) },
+                    unsafe { address_of(*esc_table) },
+                    unsafe { mut_view(*ss_p) },
+                    sroa_log,
+                    mut_view(*arena),
+                    mut_view(*sink),
+                    unsafe { (*unp).fn_item }
+                ) {
+                    any_changed = true;
+                    unsafe { (*unp).inst_count = callgraph_count_mir_insts(umir as *const MirBody); }
+                }
+            }
+
+            if inline_optimize_node(
+                mut_view(*cg),
+                u,
+                view(budget),
+                unsafe { address_of(*eff_table) },
+                unsafe { address_of(*esc_table) },
+                mut_view(*stats),
+                log,
+                sroa_stats,
+                sroa_log,
+                false,
+                mut_view(*arena),
+                mut_view(*sink)
+            ) {
+                any_changed = true;
+                stats.pass_changes = stats.pass_changes + 1u32;
+            }
+            let _ = callgraph_update_node_summary(mut_view(*cg), u, mut_view(*eff_table), mut_view(*esc_table), mut_view(*arena));
+            k = k + 1;
+        }
+        si = si + 1;
+    }
+
+    stats.dead_fns_marked = callgraph_compute_reachability(mut_view(*cg), mut_view(*arena));
+    any_changed
+}
+
+pub fn inline_run_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    cg: mut_view<CallGraph>,
+    eff_table: *const EffectCallTable,
+    esc_table: *const EscapeSummaryTable,
+    stats: mut_view<InlineStats>,
+    log: *mut InlineDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = inline_contract();
+    let base_req = contract.required_analyses & (0xFFFFFFFFu32 ^ ANALYSIS_MASK_CALL_GRAPH);
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), base_req);
+    pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+
+    let mut caller_idx = callgraph_find_node_idx(view(*cg), body.fn_sym);
+    if caller_idx == INLINE_NONE_IDX {
+        let mut ni: usize = 0;
+        while ni < cg.node_count && (cg.nodes as usize) != 0 {
+            let np0 = unsafe { cg_node_at(cg.nodes, ni) };
+            if ((unsafe { (*np0).opt_body as usize }) == (unsafe { address_of(*body) as usize })) ||
+               ((body.orig_mir as usize) != 0 && (unsafe { (*np0).mir as usize }) == (body.orig_mir as usize)) {
+                caller_idx = ni as u32;
+                break;
+            }
+            ni = ni + 1;
+        }
+    }
+    if caller_idx == INLINE_NONE_IDX {
+        return false;
+    }
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<InlineStats>(), align_of<InlineStats>()) as *mut InlineStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_log_cnt: usize = if (log as usize) != 0 { unsafe { (*log).count } } else { 0 };
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+    let budget = inline_budget_for_profile(pm.budget.profile);
+
+    let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+    let caller_mir_p = unsafe { (*caller_np).mir };
+    let snap_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if (caller_mir_p as usize) != 0 {
+        inline_clone_mir_body(unsafe { view(*caller_mir_p) }, unsafe { mut_view(*snap_mir) }, mut_view(*arena));
+    }
+
+    let changed = inline_optimize_node(
+        mut_view(*cg),
+        caller_idx as usize,
+        view(budget),
+        eff_table,
+        esc_table,
+        mut_view(*stats),
+        log,
+        sroa_stats,
+        sroa_log,
+        force_verify_fail,
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    if changed && (caller_mir_p as usize) != 0 {
+        let new_ob = optir_build_from_verified_mir(unsafe { view(*caller_mir_p) }, body.thir, mut_view(*arena));
+        if (new_ob as usize) == 0 {
+            inline_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+
+        let mut pi: usize = 0;
+        let pre_prov_cnt = unsafe { (*pre_body_ptr).provenance_count };
+        let pre_provs = unsafe { (*pre_body_ptr).provenance };
+        while pi < pre_prov_cnt && (pre_provs as usize) != 0 {
+            let pp = unsafe { opt_prov_at(pre_provs, pi) };
+            optir_record_provenance(
+                unsafe { mut_view(*new_ob) },
+                mut_view(*arena),
+                unsafe { (*pp).prop_kind },
+                unsafe { (*pp).certainty },
+                unsafe { (*pp).source_analysis },
+                unsafe { (*pp).subject_val },
+                unsafe { (*pp).aux_val },
+                unsafe { (*pp).at_bb },
+                unsafe { (*pp).at_inst },
+                unsafe { (*pp).pass_id }
+            );
+            pi = pi + 1;
+        }
+        optir_record_provenance(
+            unsafe { mut_view(*new_ob) },
+            mut_view(*arena),
+            PROP_PURE_CALL,
+            CERTAINTY_PROVEN,
+            ANALYSIS_CALL_GRAPH,
+            OptValueId { v: 0u32 },
+            OptValueId { v: 0u32 },
+            OptBbId { v: 0u32 },
+            OptInstId { v: 0u32 },
+            PASS_INLINE
+        );
+
+        *body = unsafe { *new_ob };
+        pm.ir_revision = pre_rev + 1u32;
+        stats.pass_changes = stats.pass_changes + 1u32;
+        passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+        pm.valid_analyses = pm.valid_analyses | ANALYSIS_MASK_CALL_GRAPH;
+        let re_mask = ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA;
+        passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), re_mask);
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) {
+            sink.errors = pre_sink_errs;
+            if (caller_mir_p as usize) != 0 {
+                inline_clone_mir_body(unsafe { view(*snap_mir) }, unsafe { mut_view(*caller_mir_p) }, mut_view(*arena));
+            }
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            if (log as usize) != 0 {
+                unsafe { (*log).count = pre_log_cnt; }
+            }
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn inline_run_pass(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    cg: mut_view<CallGraph>,
+    eff_table: *const EffectCallTable,
+    esc_table: *const EscapeSummaryTable,
+    stats: mut_view<InlineStats>,
+    log: *mut InlineDecisionLog,
+    sroa_stats: *mut SroaStats,
+    sroa_log: *mut SroaDecisionLog,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    inline_run_pass_internal(
+        mut_view(*pm),
+        mut_view(*body),
+        mut_view(*cg),
+        eff_table,
+        esc_table,
+        mut_view(*stats),
+        log,
+        sroa_stats,
+        sroa_log,
+        false,
+        mut_view(*arena),
+        mut_view(*sink)
+    )
+}
+
+// --- Section 6: Deterministic `--emit=callgraph` & `--emit=inline` Printers (`SPEC-73 §9, AXS-INL-035`) ---
+
+const CG_PRINT_DATA: [256]u8 = [
+    //   0..12  "callgraph {\n"
+    99u8, 97u8, 108u8, 108u8, 103u8, 114u8, 97u8, 112u8, 104u8, 32u8, 123u8, 10u8,
+    //  12..19  "  scc #"
+    32u8, 32u8, 115u8, 99u8, 99u8, 32u8, 35u8,
+    //  19..30  " recursive="
+    32u8, 114u8, 101u8, 99u8, 117u8, 114u8, 115u8, 105u8, 118u8, 101u8, 61u8,
+    //  30..39  " members="
+    32u8, 109u8, 101u8, 109u8, 98u8, 101u8, 114u8, 115u8, 61u8,
+    //  39..46  " iters="
+    32u8, 105u8, 116u8, 101u8, 114u8, 115u8, 61u8,
+    //  46..56  "  node fn#"
+    32u8, 32u8, 110u8, 111u8, 100u8, 101u8, 32u8, 102u8, 110u8, 35u8,
+    //  56..62  " scc=#"
+    32u8, 115u8, 99u8, 99u8, 61u8, 35u8,
+    //  62..69  " reach="
+    32u8, 114u8, 101u8, 97u8, 99u8, 104u8, 61u8,
+    //  69..75  " attr="
+    32u8, 97u8, 116u8, 116u8, 114u8, 61u8,
+    //  75..87  " addr_taken="
+    32u8, 97u8, 100u8, 100u8, 114u8, 95u8, 116u8, 97u8, 107u8, 101u8, 110u8, 61u8,
+    //  87..96  " effects="
+    32u8, 101u8, 102u8, 102u8, 101u8, 99u8, 116u8, 115u8, 61u8,
+    //  96..108 " result_ret="
+    32u8, 114u8, 101u8, 115u8, 117u8, 108u8, 116u8, 95u8, 114u8, 101u8, 116u8, 61u8,
+    // 108..116 "  edge #"
+    32u8, 32u8, 101u8, 100u8, 103u8, 101u8, 32u8, 35u8,
+    // 116..127 " caller=fn#"
+    32u8, 99u8, 97u8, 108u8, 108u8, 101u8, 114u8, 61u8, 102u8, 110u8, 35u8,
+    // 127..138 " callee=fn#"
+    32u8, 99u8, 97u8, 108u8, 108u8, 101u8, 101u8, 61u8, 102u8, 110u8, 35u8,
+    // 138..143 " bb=b"
+    32u8, 98u8, 98u8, 61u8, 98u8,
+    // 143..153 " dispatch="
+    32u8, 100u8, 105u8, 115u8, 112u8, 97u8, 116u8, 99u8, 104u8, 61u8,
+    // 153..163 " complete="
+    32u8, 99u8, 111u8, 109u8, 112u8, 108u8, 101u8, 116u8, 101u8, 61u8,
+    // 163..172 " inlined="
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 61u8,
+    // 172..178 " tail="
+    32u8, 116u8, 97u8, 105u8, 108u8, 61u8,
+    // 178..184 "DIRECT"
+    68u8, 73u8, 82u8, 69u8, 67u8, 84u8,
+    // 184..191 "CLOSURE"
+    67u8, 76u8, 79u8, 83u8, 85u8, 82u8, 69u8,
+    // 191..197 "FN_PTR"
+    70u8, 78u8, 95u8, 80u8, 84u8, 82u8,
+    // 197..206 "DYN_TRAIT"
+    68u8, 89u8, 78u8, 95u8, 84u8, 82u8, 65u8, 73u8, 84u8,
+    // 206..216 "FFI_EXTERN"
+    70u8, 70u8, 73u8, 95u8, 69u8, 88u8, 84u8, 69u8, 82u8, 78u8,
+    // 216..227 "ASYNC_SPAWN"
+    65u8, 83u8, 89u8, 78u8, 67u8, 95u8, 83u8, 80u8, 65u8, 87u8, 78u8,
+    // 227..237 "GPU_LAUNCH"
+    71u8, 80u8, 85u8, 95u8, 76u8, 65u8, 85u8, 78u8, 67u8, 72u8,
+    // 237..256 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+const INL_PRINT_DATA: [160]u8 = [
+    //   0..19  "inline_decisions {\n"
+    105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 95u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8,
+    //  19..29  "  callsite"
+    32u8, 32u8, 99u8, 97u8, 108u8, 108u8, 115u8, 105u8, 116u8, 101u8,
+    //  29..39  " legality="
+    32u8, 108u8, 101u8, 103u8, 97u8, 108u8, 105u8, 116u8, 121u8, 61u8,
+    //  39..44  "LEGAL"
+    76u8, 69u8, 71u8, 65u8, 76u8,
+    //  44..51  "ILLEGAL"
+    73u8, 76u8, 76u8, 69u8, 71u8, 65u8, 76u8,
+    //  51..59  " reason="
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    //  59..71  " profitable="
+    32u8, 112u8, 114u8, 111u8, 102u8, 105u8, 116u8, 97u8, 98u8, 108u8, 101u8, 61u8,
+    //  71..81  " decision="
+    32u8, 100u8, 101u8, 99u8, 105u8, 115u8, 105u8, 111u8, 110u8, 61u8,
+    //  81..88  "INLINED"
+    73u8, 78u8, 76u8, 73u8, 78u8, 69u8, 68u8,
+    //  88..96  "REJECTED"
+    82u8, 69u8, 74u8, 69u8, 67u8, 84u8, 69u8, 68u8,
+    //  96..114 "  summary inlined="
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 61u8,
+    // 114..124 " rejected="
+    32u8, 114u8, 101u8, 106u8, 101u8, 99u8, 116u8, 101u8, 100u8, 61u8,
+    // 124..139 " sroa_cascades="
+    32u8, 115u8, 114u8, 111u8, 97u8, 95u8, 99u8, 97u8, 115u8, 99u8, 97u8, 100u8, 101u8, 115u8, 61u8,
+    // 139..150 " rollbacks="
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 150..160 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn cg_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), CG_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+fn inl_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), INL_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+fn cg_push_dispatch_name(out: mut_view<DiagBuffer>, dk: u8) {
+    if dk == DISPATCH_DIRECT {
+        cg_push_tbl(mut_view(*out), 178, 6);
+    } else if dk == DISPATCH_CLOSURE {
+        cg_push_tbl(mut_view(*out), 184, 7);
+    } else if dk == DISPATCH_FN_PTR {
+        cg_push_tbl(mut_view(*out), 191, 6);
+    } else if dk == DISPATCH_DYN_TRAIT {
+        cg_push_tbl(mut_view(*out), 197, 9);
+    } else if dk == DISPATCH_FFI_EXTERN {
+        cg_push_tbl(mut_view(*out), 206, 10);
+    } else if dk == DISPATCH_ASYNC_SPAWN {
+        cg_push_tbl(mut_view(*out), 216, 11);
+    } else {
+        cg_push_tbl(mut_view(*out), 227, 10);
+    }
+}
+
+pub fn callgraph_print(cg: view<CallGraph>, out: mut_view<DiagBuffer>) {
+    cg_push_tbl(mut_view(*out), 0, 12);
+    let mut si: usize = 0;
+    while si < cg.scc_count && (cg.sccs as usize) != 0 {
+        let sp = unsafe { cg_scc_at(cg.sccs, si) };
+        cg_push_tbl(mut_view(*out), 12, 7);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*sp).scc_id });
+        cg_push_tbl(mut_view(*out), 19, 11);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*sp).is_recursive } { 1u32 } else { 0u32 });
+        cg_push_tbl(mut_view(*out), 30, 9);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*sp).member_count });
+        cg_push_tbl(mut_view(*out), 39, 7);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*sp).fixed_point_iters });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        si = si + 1;
+    }
+
+    let mut ni: usize = 0;
+    while ni < cg.node_count && (cg.nodes as usize) != 0 {
+        let np = unsafe { cg_node_at(cg.nodes, ni) };
+        cg_push_tbl(mut_view(*out), 46, 10);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*np).fn_sym.v });
+        cg_push_tbl(mut_view(*out), 56, 6);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*np).scc_id });
+        cg_push_tbl(mut_view(*out), 62, 7);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*np).reachability }) as u32);
+        cg_push_tbl(mut_view(*out), 69, 6);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*np).inline_attr }) as u32);
+        cg_push_tbl(mut_view(*out), 75, 12);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*np).address_taken_fn } { 1u32 } else { 0u32 });
+        cg_push_tbl(mut_view(*out), 87, 9);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*np).effect_summary.flags }) as u32);
+        cg_push_tbl(mut_view(*out), 96, 12);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*np).returns_result_or_option } { 1u32 } else { 0u32 });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        ni = ni + 1;
+    }
+
+    let mut ei: usize = 0;
+    while ei < cg.edge_count && (cg.edges as usize) != 0 {
+        let ep = unsafe { cg_edge_at(cg.edges, ei) };
+        cg_push_tbl(mut_view(*out), 108, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).edge_id });
+        cg_push_tbl(mut_view(*out), 116, 11);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).caller_sym.v });
+        cg_push_tbl(mut_view(*out), 138, 5);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).callsite_bb.v });
+        cg_push_tbl(mut_view(*out), 143, 10);
+        cg_push_dispatch_name(mut_view(*out), unsafe { (*ep).dispatch_kind });
+        cg_push_tbl(mut_view(*out), 127, 11);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*ep).known_callee.v });
+        cg_push_tbl(mut_view(*out), 153, 10);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*ep).targets_complete } { 1u32 } else { 0u32 });
+        cg_push_tbl(mut_view(*out), 163, 9);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*ep).is_inlined } { 1u32 } else { 0u32 });
+        cg_push_tbl(mut_view(*out), 172, 6);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*ep).is_tail_position } { 1u32 } else { 0u32 });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        ei = ei + 1;
+    }
+    cg_push_tbl(mut_view(*out), 237, 2);
+}
+
+pub fn inline_print(
+    stats: view<InlineStats>,
+    log: view<InlineDecisionLog>,
+    sroa_stats: *const SroaStats,
+    sroa_log: *const SroaDecisionLog,
+    out: mut_view<DiagBuffer>
+) {
+    inl_push_tbl(mut_view(*out), 0, 19);
+    let mut i: usize = 0;
+    while i < log.count && (log.records as usize) != 0 {
+        let rp = unsafe { inl_record_at(log.records, i) };
+        inl_push_tbl(mut_view(*out), 19, 10);
+        cg_push_tbl(mut_view(*out), 116, 11);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).caller_sym });
+        cg_push_tbl(mut_view(*out), 127, 11);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).callee_sym });
+        cg_push_tbl(mut_view(*out), 138, 5);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*rp).callsite_bb });
+        cg_push_tbl(mut_view(*out), 69, 6);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*rp).attr }) as u32);
+        inl_push_tbl(mut_view(*out), 29, 10);
+        if (unsafe { (*rp).legality }) == INLINE_LEGAL {
+            inl_push_tbl(mut_view(*out), 39, 5);
+        } else {
+            inl_push_tbl(mut_view(*out), 44, 7);
+        }
+        inl_push_tbl(mut_view(*out), 51, 8);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*rp).block_reason }) as u32);
+        inl_push_tbl(mut_view(*out), 59, 12);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*rp).profitable } { 1u32 } else { 0u32 });
+        inl_push_tbl(mut_view(*out), 71, 10);
+        if (unsafe { (*rp).decision }) == INLINE_DECISION_INLINED {
+            inl_push_tbl(mut_view(*out), 81, 7);
+        } else {
+            inl_push_tbl(mut_view(*out), 88, 8);
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+    inl_push_tbl(mut_view(*out), 96, 18);
+    diag_buf_push_u32(mut_view(*out), stats.callsites_inlined);
+    inl_push_tbl(mut_view(*out), 114, 10);
+    diag_buf_push_u32(mut_view(*out), stats.callsites_rejected_illegal + stats.callsites_rejected_cost);
+    inl_push_tbl(mut_view(*out), 124, 15);
+    diag_buf_push_u32(mut_view(*out), stats.post_inline_sroa_cascades);
+    inl_push_tbl(mut_view(*out), 139, 11);
+    diag_buf_push_u32(mut_view(*out), stats.pass_rollbacks);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    inl_push_tbl(mut_view(*out), 150, 2);
+
+    if (sroa_stats as usize) != 0 && (sroa_log as usize) != 0 {
+        sroa_print(unsafe { view(*sroa_stats) }, unsafe { view(*sroa_log) }, mut_view(*out));
+    }
+}

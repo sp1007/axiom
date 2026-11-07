@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T215, T603, T607, T613]
 priority: 107
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/sroa, compiler/opt/inline, tests/opt2]
 spec: [spec/SPEC-73-inlining-specialization-devirt.md, 0165, 0226, tasks/0366, tasks/0399, tasks/0401, tasks/0551]
 covers: [REQ-TYP-001, REQ-TYP-002, REQ-TYP-003, REQ-TYP-004, REQ-TYP-005, REQ-TYP-006, REQ-OPT-114, REQ-OPT-115, REQ-OPT-116, REQ-OPT-117, REQ-OPT-118, REQ-OPT-119, REQ-OPT-120, REQ-OPT-121, REQ-OPT-122, REQ-OPT-123, REQ-OPT-124, REQ-OPT-315, REQ-OPT-316, REQ-OPT-317, REQ-OPT-318]
 started: 2026-11-07 15:08:47
-agent: T064-impl
+finished: 2026-11-07 19:43:46
 ---
 # T064 — E15.4 — Optimizer ladder 2: copy/move propagation, SROA, return-slot construction & call-graph inlining
 
@@ -47,3 +47,4 @@ Implement ownership- and capability-aware copy/move propagation, Scalar Replacem
 - 2026-11-03 02:41:00 refined scope, covers, and dependencies in T215 (P15 phase planning)
 - 2026-11-06 23:15:00 added T610 to depends (ADR-0037: serialize compiler/opt path overlap with T610)
 - 2026-11-07 15:08:47 started (attempt 1) T064-impl
+- 2026-11-07 19:43:46 accepted by QA -> done
