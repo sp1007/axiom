@@ -1,0 +1,3782 @@
+// Module Interface Metadata (`.axmi`) Binary Serializer, Fail-Closed Loader,
+// Exported Symbol/Type/Trait/Capability/Const/Generic MIR Summaries,
+// Source-Free `CompilerDB` Ingestion, and `inspect --axmi` / `--emit=axmi` (T765 / E18.4).
+// Implements SPEC-24 sec.1-sec.2 & sec.4 (AXS-ART-001..005, AXS-ART-010..014, AXS-ART-050..053, INV-ART-001).
+module compiler.artifact.axmi
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.hash.AxHasher
+use compiler.kernel.hash.ax_hasher_new
+use compiler.kernel.hash.ax_hasher_init
+use compiler.kernel.hash.ax_hasher_write
+use compiler.kernel.hash.ax_hasher_write_u32
+use compiler.kernel.hash.ax_hasher_write_u64
+use compiler.kernel.hash.ax_hasher_finish
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.CompilerDB
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.ConstEvalResult
+use compiler.query.db.DefId
+use compiler.query.db.DURABILITY_HIGH
+use compiler.query.db.EffectSummaryResult
+use compiler.query.db.Fingerprint128
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_IMPL
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_KIND_TRAIT
+use compiler.query.db.ITEM_KIND_TYPE_ALIAS
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_MODULE
+use compiler.query.db.ITEM_NS_PACKAGE
+use compiler.query.db.ITEM_NS_TRAIT
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_UNIT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ItemSignatureResult
+use compiler.query.db.LayoutOfResult
+use compiler.query.db.MirBodyId
+use compiler.query.db.MirBodyResult
+use compiler.query.db.ModuleDefMapResult
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.ParseModuleResult
+use compiler.query.db.QRY_ID_ERROR
+use compiler.query.db.QRY_ID_NONE
+use compiler.query.db.QRY_MAX_DEFS
+use compiler.query.db.QRY_MAX_MODULES
+use compiler.query.db.QRY_MAX_TRAIT_GOALS
+use compiler.query.db.QRY_MAX_TYPE_LAYOUTS
+use compiler.query.db.QUERY_CONST_EVAL
+use compiler.query.db.QUERY_EFFECT_SUMMARY
+use compiler.query.db.QUERY_ITEM_SIGNATURE
+use compiler.query.db.QUERY_LAYOUT_OF
+use compiler.query.db.QUERY_MIR_BODY
+use compiler.query.db.QUERY_MODULE_DEF_MAP
+use compiler.query.db.QUERY_PARSE_MODULE
+use compiler.query.db.QUERY_RESOLVE_MODULE
+use compiler.query.db.QUERY_STATE_READY
+use compiler.query.db.QUERY_TRAIT_SOLVE
+use compiler.query.db.QueryKey
+use compiler.query.db.ResolveModuleResult
+use compiler.query.db.RevisionId
+use compiler.query.db.SemanticKey
+use compiler.query.db.SourceFileId
+use compiler.query.db.TRAIT_RESULT_IMPLEMENTED
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.TraitSolveResult
+use compiler.query.db.TypeId
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_add_type_layout_field
+use compiler.query.db.query_db_get_or_create_slot
+use compiler.query.db.query_db_intern_bytes
+use compiler.query.db.query_db_intern_sv
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_db_register_trait_goal
+use compiler.query.db.query_db_register_type_layout
+use compiler.query.db.query_db_set_def_seeds
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_set_package_graph_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_key_for_const_eval
+use compiler.query.db.query_key_for_def
+use compiler.query.db.query_key_for_layout_of
+use compiler.query.db.query_key_for_module
+use compiler.query.db.query_key_for_trait_goal
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_eq
+use compiler.query.db.semantic_key_fingerprint
+use compiler.query.db.semantic_key_new
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// ============================================================================
+// 1. Canonical `.axmi` Header, Magic, Version, Section & Diagnostic Constants
+// ============================================================================
+
+// Magic bytes: "AXMI0001" (little-endian u64 = 0x31303030494D5841)
+pub const AXMI_MAGIC: [8]u8 = [65u8, 88u8, 77u8, 73u8, 48u8, 48u8, 48u8, 49u8];
+pub const AXMI_MAGIC_U64: u64 = 0x31303030494D5841u64;
+
+pub const AXMI_FORMAT_FAMILY: u16 = 1u16;
+pub const AXMI_FORMAT_VERSION: u16 = 1u16;
+pub const AXMI_ARTIFACT_KIND: u16 = 1u16;
+pub const AXMI_PRODUCER_VERSION: u32 = 0x00010001u32;
+pub const AXMI_MIR_SCHEMA_VERSION: u16 = 1u16;
+
+pub const AXMI_HEADER_SIZE: usize = 64;
+pub const AXMI_SECTION_DESC_SIZE: usize = 48;
+
+// Header flags (AXS-ART-002)
+pub const AXMI_FLAG_LITTLE_ENDIAN: u16 = 0x0001u16;
+pub const AXMI_FLAG_DETERMINISTIC: u16 = 0x0002u16;
+pub const AXMI_FLAG_HAS_LTO: u16 = 0x0004u16;
+pub const AXMI_FLAG_COMPRESSED: u16 = 0x0008u16;
+pub const AXMI_DEFAULT_FLAGS: u16 = 0x0003u16;
+
+// Section types (AXS-ART-004 sec.1)
+pub const AXMI_SEC_STRINGS: u16 = 1u16;
+pub const AXMI_SEC_SYMBOLS: u16 = 2u16;
+pub const AXMI_SEC_TYPES: u16 = 3u16;
+pub const AXMI_SEC_TRAITS: u16 = 4u16;
+pub const AXMI_SEC_FUNCTIONS: u16 = 5u16;
+pub const AXMI_SEC_TYPES_LAYOUT: u16 = 6u16;
+pub const AXMI_SEC_CONST_VALUES: u16 = 7u16;
+pub const AXMI_SEC_GENERIC_MIR: u16 = 8u16;
+pub const AXMI_SEC_EFFECTS_CAPS: u16 = 9u16;
+pub const AXMI_SEC_LTO_SUMMARY: u16 = 10u16;
+pub const AXMI_SEC_DEPENDENCIES: u16 = 11u16;
+pub const AXMI_SEC_PROVENANCE: u16 = 12u16;
+pub const AXMI_SEC_AI_INDEX: u16 = 13u16;
+pub const AXMI_SEC_DEBUG_MAP: u16 = 14u16;
+
+// Section descriptor flags (AXS-ART-004 sec.1)
+pub const AXMI_SEC_FLAG_READ_ONLY: u16 = 0x0001u16;
+pub const AXMI_SEC_FLAG_MMAPABLE: u16 = 0x0002u16;
+pub const AXMI_SEC_FLAG_COMPRESSED: u16 = 0x0004u16;
+pub const AXMI_SEC_FLAG_DEDUPLICABLE: u16 = 0x0008u16;
+pub const AXMI_SEC_FLAG_OPTIONAL: u16 = 0x0010u16;
+pub const AXMI_SEC_FLAG_TARGET_SPECIFIC: u16 = 0x0020u16;
+pub const AXMI_SEC_FLAG_PUBLIC: u16 = 0x0040u16;
+pub const AXMI_SEC_DEFAULT_FLAGS: u16 = 0x0043u16;
+
+// Scoped ID domains (AXS-ART-003 sec.2)
+pub const AXMI_SCOPE_ARTIFACT_LOCAL: u8 = 1u8;
+pub const AXMI_SCOPE_PACKAGE_LOCAL: u8 = 2u8;
+pub const AXMI_SCOPE_WORKSPACE_LOCAL: u8 = 3u8;
+pub const AXMI_SCOPE_GLOBAL_CONTENT: u8 = 4u8;
+
+// ADT & Representation tags (AXS-ART-011)
+pub const AXMI_ADT_STRUCT: u8 = 1u8;
+pub const AXMI_ADT_ENUM: u8 = 2u8;
+pub const AXMI_ADT_UNION: u8 = 3u8;
+pub const AXMI_ADT_PRIMITIVE: u8 = 4u8;
+pub const AXMI_ADT_ALIAS: u8 = 5u8;
+
+pub const AXMI_REPR_DEFAULT: u8 = 0u8;
+pub const AXMI_REPR_C: u8 = 1u8;
+pub const AXMI_REPR_TRANSPARENT: u8 = 2u8;
+pub const AXMI_REPR_INT: u8 = 3u8;
+
+// Parameter passing modes & capability flow (AXS-ART-012)
+pub const AXMI_PASS_MOVE: u8 = 0u8;
+pub const AXMI_PASS_COPY: u8 = 1u8;
+pub const AXMI_PASS_VIEW: u8 = 2u8;
+pub const AXMI_PASS_MUT_VIEW: u8 = 3u8;
+
+// Proven effect mask bits (AXS-ART-012 sec.2)
+pub const AXMI_EFF_PURE: u32 = 0x0000u32;
+pub const AXMI_EFF_READS_MEM: u32 = 0x0001u32;
+pub const AXMI_EFF_WRITES_MEM: u32 = 0x0002u32;
+pub const AXMI_EFF_ALLOCATES: u32 = 0x0004u32;
+pub const AXMI_EFF_BLOCKING: u32 = 0x0008u32;
+pub const AXMI_EFF_OS_IO: u32 = 0x0010u32;
+pub const AXMI_EFF_FFI: u32 = 0x0020u32;
+pub const AXMI_EFF_UNSAFE: u32 = 0x0040u32;
+
+// Authority capability token mask bits (SPEC-53 / AXS-ART-012 sec.2)
+pub const AXMI_CAP_NONE: u32 = 0x0000u32;
+pub const AXMI_CAP_FS: u32 = 0x0001u32;
+pub const AXMI_CAP_NET: u32 = 0x0002u32;
+pub const AXMI_CAP_ENV: u32 = 0x0004u32;
+pub const AXMI_CAP_PROCESS: u32 = 0x0008u32;
+pub const AXMI_CAP_CLOCK: u32 = 0x0010u32;
+
+// Panic contract tags (SPEC-54 / AXS-ART-012 sec.2)
+pub const AXMI_PANIC_NO_PANIC: u8 = 0u8;
+pub const AXMI_PANIC_MAY_PANIC: u8 = 1u8;
+
+// Const value kind tags (AXS-ART-013 sec.1)
+pub const AXMI_CONST_INT: u8 = 1u8;
+pub const AXMI_CONST_BOOL: u8 = 2u8;
+pub const AXMI_CONST_STR: u8 = 3u8;
+pub const AXMI_CONST_AGGREGATE: u8 = 4u8;
+
+// Dependency edge kinds (AXS-ART-014 sec.1)
+pub const AXMI_DEP_SEMANTIC_INPUT: u8 = 1u8;
+pub const AXMI_DEP_IR_INPUT: u8 = 2u8;
+pub const AXMI_DEP_LTO_INPUT: u8 = 3u8;
+pub const AXMI_DEP_NATIVE_OBJECT: u8 = 4u8;
+
+// Freshness classifications (AXS-ART-014 sec.1)
+pub const AXMI_FRESHNESS_FRESH: u8 = 1u8;
+pub const AXMI_FRESHNESS_STALE: u8 = 2u8;
+pub const AXMI_FRESHNESS_UNKNOWN: u8 = 3u8;
+pub const AXMI_FRESHNESS_INVALID: u8 = 4u8;
+
+// Fail-closed validation & diagnostic status codes (T765 / AXS-ART-050)
+pub const AXMI_STATUS_OK: u32 = 0u32;
+pub const AX_ART_CORRUPT_HEADER: u32 = 9501u32;
+pub const AX_ART_VERSION_MISMATCH: u32 = 9502u32;
+pub const AX_ART_TARGET_MISMATCH: u32 = 9503u32;
+pub const AX_ART_CHECKSUM_MISMATCH: u32 = 9504u32;
+
+// Canonical SPEC-24 sec.4 diagnostic code aliases
+pub const AX_LINK_BAD_ARTIFACT: u32 = 9501u32;
+pub const AX_LINK_ARTIFACT_SCHEMA_MISMATCH: u32 = 9502u32;
+pub const AX_LINK_ARTIFACT_TARGET_MISMATCH: u32 = 9503u32;
+
+// Table capacity constants
+pub const AXMI_MAX_SECTIONS: usize = 16;
+pub const AXMI_MAX_STRINGS: usize = 128;
+pub const AXMI_MAX_SYMBOLS: usize = 64;
+pub const AXMI_MAX_TYPES: usize = 64;
+pub const AXMI_MAX_TRAITS: usize = 32;
+pub const AXMI_MAX_CONTRACTS: usize = 64;
+pub const AXMI_MAX_CONSTS: usize = 32;
+pub const AXMI_MAX_MIR_TEMPLATES: usize = 32;
+pub const AXMI_MAX_DEPS: usize = 32;
+pub const AXMI_MAX_CUSTOM_SECTIONS: usize = 8;
+
+// Canonical ASCII table for domain separation and deterministic `inspect --axmi` output:
+//   0:    0..  12 (12): "AXIOM-ART-v1"
+//   1:   12..  28 (16): "AXIOM-ART-SEC-v1"
+//   2:   28..  44 (16): "AXIOM-ART-API-v1"
+//   3:   44..  60 (16): "AXIOM-ART-ABI-v1"
+//   4:   60..  76 (16): "AXIOM-ART-TGT-v1"
+//   5:   76..  92 (16): "AXIOM-ART-MIR-v1"
+//   6:   92.. 108 (16): "0123456789abcdef"
+//   7:  108.. 115 ( 7): "Strings"
+//   8:  115.. 122 ( 7): "Symbols"
+//   9:  122.. 127 ( 5): "Types"
+//  10:  127.. 133 ( 6): "Traits"
+//  11:  133.. 142 ( 9): "Functions"
+//  12:  142.. 153 (11): "TypesLayout"
+//  13:  153.. 164 (11): "ConstValues"
+//  14:  164.. 174 (10): "GenericMir"
+//  15:  174.. 193 (19): "EffectsCapabilities"
+//  16:  193.. 203 (10): "LtoSummary"
+//  17:  203.. 215 (12): "Dependencies"
+//  18:  215.. 225 (10): "Provenance"
+//  19:  225.. 232 ( 7): "AIIndex"
+//  20:  232.. 240 ( 8): "DebugMap"
+//  21:  240.. 242 ( 2): "fn"
+//  22:  242.. 248 ( 6): "struct"
+//  23:  248.. 252 ( 4): "type"
+//  24:  252.. 257 ( 5): "const"
+//  25:  257.. 262 ( 5): "trait"
+//  26:  262.. 266 ( 4): "impl"
+//  27:  266.. 270 ( 4): "enum"
+//  28:  270.. 275 ( 5): "union"
+//  29:  275.. 279 ( 4): "prim"
+//  30:  279.. 284 ( 5): "alias"
+//  31:  284.. 291 ( 7): "default"
+//  32:  291.. 292 ( 1): "C"
+//  33:  292.. 303 (11): "transparent"
+//  34:  303.. 306 ( 3): "int"
+//  35:  306.. 310 ( 4): "true"
+//  36:  310.. 315 ( 5): "false"
+//  37:  315.. 322 ( 7): "NoPanic"
+//  38:  322.. 330 ( 8): "MayPanic"
+//  39:  330.. 351 (21): "AX_ART_CORRUPT_HEADER"
+//  40:  351.. 374 (23): "AX_ART_VERSION_MISMATCH"
+//  41:  374.. 396 (22): "AX_ART_TARGET_MISMATCH"
+//  42:  396.. 420 (24): "AX_ART_CHECKSUM_MISMATCH"
+//  43:  420.. 440 (20): "AX_LINK_BAD_ARTIFACT"
+//  44:  440.. 472 (32): "AX_LINK_ARTIFACT_SCHEMA_MISMATCH"
+//  45:  472.. 504 (32): "AX_LINK_ARTIFACT_TARGET_MISMATCH"
+//  46:  504.. 509 ( 5): "Fresh"
+//  47:  509.. 514 ( 5): "Stale"
+//  48:  514.. 521 ( 7): "Unknown"
+//  49:  521.. 528 ( 7): "Invalid"
+//  50:  528.. 563 (35): "axmi_header magic=AXMI0001 version="
+//  51:  563.. 573 (10): " sections="
+//  52:  573.. 587 (14): " interface_fp="
+//  53:  587.. 595 ( 8): " abi_fp="
+//  54:  595.. 606 (11): " target_fp="
+//  55:  606.. 620 (14): " content_hash="
+//  56:  620.. 636 (16): "axmi_module pkg="
+//  57:  636.. 644 ( 8): " module="
+//  58:  644.. 652 ( 8): " target="
+//  59:  652.. 657 ( 5): " abi="
+//  60:  657.. 675 (18): " stripped_private="
+//  61:  675.. 683 ( 8): "section["
+//  62:  683.. 690 ( 7): "] type="
+//  63:  690.. 698 ( 8): " offset="
+//  64:  698.. 704 ( 6): " size="
+//  65:  704.. 711 ( 7): " align="
+//  66:  711.. 721 (10): " checksum="
+//  67:  721.. 728 ( 7): "symbol "
+//  68:  728.. 734 ( 6): " kind="
+//  69:  734.. 742 ( 8): " params="
+//  70:  742.. 747 ( 5): " ret="
+//  71:  747.. 756 ( 9): " generic="
+//  72:  756.. 764 ( 8): " inline="
+//  73:  764.. 772 ( 8): " sig_fp="
+//  74:  772.. 784 (12): "type_layout "
+//  75:  784.. 789 ( 5): " adt="
+//  76:  789.. 795 ( 6): " repr="
+//  77:  795.. 803 ( 8): " fields="
+//  78:  803.. 809 ( 6): " copy="
+//  79:  809.. 815 ( 6): " send="
+//  80:  815.. 822 ( 7): " share="
+//  81:  822.. 833 (11): "trait_impl "
+//  82:  833.. 844 (11): " trait_def="
+//  83:  844.. 855 (11): " self_type="
+//  84:  855.. 862 ( 7): " assoc="
+//  85:  862.. 875 (13): " object_safe="
+//  86:  875.. 887 (12): "fn_contract "
+//  87:  887.. 900 (13): " ret_borrows="
+//  88:  900.. 911 (11): " no_escape="
+//  89:  911.. 920 ( 9): " effects="
+//  90:  920.. 926 ( 6): " caps="
+//  91:  926.. 933 ( 7): " panic="
+//  92:  933.. 939 ( 6): " pure="
+//  93:  939.. 949 (10): "const_val "
+//  94:  949.. 954 ( 5): " val="
+//  95:  954.. 958 ( 4): " fp="
+//  96:  958.. 971 (13): "mir_template "
+//  97:  971.. 979 ( 8): " schema="
+//  98:  979.. 989 (10): " comptime="
+//  99:  989.. 997 ( 8): " blocks="
+// 100:  997..1005 ( 8): " locals="
+// 101: 1005..1012 ( 7): " insts="
+// 102: 1012..1022 (10): " verified="
+// 103: 1022..1030 ( 8): " digest="
+// 104: 1030..1035 ( 5): "diag["
+// 105: 1035..1046 (11): "] artifact="
+// 106: 1046..1054 ( 8): " detail="
+const AXMI_ASCII_TABLE: [1054]u8 = [
+    65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 118u8, 49u8, 65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 83u8, 69u8, 67u8, 45u8, 118u8, 49u8, 65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 65u8, 80u8, 73u8, 45u8, 118u8, 49u8, 65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 65u8, 66u8, 73u8, 45u8, 118u8, 49u8, 65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 84u8, 71u8, 84u8, 45u8, 118u8, 49u8, 65u8, 88u8, 73u8, 79u8, 77u8, 45u8, 65u8, 82u8, 84u8, 45u8, 77u8, 73u8, 82u8, 45u8, 118u8, 49u8, 48u8, 49u8, 50u8, 51u8, 52u8, 53u8, 54u8, 55u8, 56u8, 57u8, 97u8, 98u8, 99u8, 100u8, 101u8, 102u8,
+    83u8, 116u8, 114u8, 105u8, 110u8, 103u8, 115u8, 83u8, 121u8, 109u8, 98u8, 111u8, 108u8, 115u8, 84u8, 121u8, 112u8, 101u8, 115u8, 84u8, 114u8, 97u8, 105u8, 116u8, 115u8, 70u8, 117u8, 110u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 84u8, 121u8, 112u8, 101u8, 115u8, 76u8, 97u8, 121u8, 111u8, 117u8, 116u8, 67u8, 111u8, 110u8, 115u8, 116u8, 86u8, 97u8, 108u8, 117u8, 101u8, 115u8, 71u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 77u8, 105u8, 114u8, 69u8, 102u8, 102u8, 101u8, 99u8, 116u8, 115u8, 67u8, 97u8, 112u8, 97u8, 98u8, 105u8, 108u8, 105u8, 116u8, 105u8, 101u8, 115u8, 76u8, 116u8, 111u8, 83u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 68u8, 101u8, 112u8, 101u8, 110u8, 100u8, 101u8, 110u8, 99u8, 105u8, 101u8, 115u8, 80u8, 114u8, 111u8, 118u8, 101u8, 110u8, 97u8, 110u8, 99u8, 101u8, 65u8, 73u8, 73u8, 110u8, 100u8, 101u8, 120u8, 68u8, 101u8, 98u8, 117u8, 103u8, 77u8, 97u8, 112u8,
+    102u8, 110u8, 115u8, 116u8, 114u8, 117u8, 99u8, 116u8, 116u8, 121u8, 112u8, 101u8, 99u8, 111u8, 110u8, 115u8, 116u8, 116u8, 114u8, 97u8, 105u8, 116u8, 105u8, 109u8, 112u8, 108u8, 101u8, 110u8, 117u8, 109u8, 117u8, 110u8, 105u8, 111u8, 110u8, 112u8, 114u8, 105u8, 109u8, 97u8, 108u8, 105u8, 97u8, 115u8, 100u8, 101u8, 102u8, 97u8, 117u8, 108u8, 116u8, 67u8, 116u8, 114u8, 97u8, 110u8, 115u8, 112u8, 97u8, 114u8, 101u8, 110u8, 116u8, 105u8, 110u8, 116u8, 116u8, 114u8, 117u8, 101u8, 102u8, 97u8, 108u8, 115u8, 101u8, 78u8, 111u8, 80u8, 97u8, 110u8, 105u8, 99u8, 77u8, 97u8, 121u8, 80u8, 97u8, 110u8, 105u8, 99u8,
+    65u8, 88u8, 95u8, 65u8, 82u8, 84u8, 95u8, 67u8, 79u8, 82u8, 82u8, 85u8, 80u8, 84u8, 95u8, 72u8, 69u8, 65u8, 68u8, 69u8, 82u8, 65u8, 88u8, 95u8, 65u8, 82u8, 84u8, 95u8, 86u8, 69u8, 82u8, 83u8, 73u8, 79u8, 78u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 65u8, 82u8, 84u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 65u8, 82u8, 84u8, 95u8, 67u8, 72u8, 69u8, 67u8, 75u8, 83u8, 85u8, 77u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 66u8, 65u8, 68u8, 95u8, 65u8, 82u8, 84u8, 73u8, 70u8, 65u8, 67u8, 84u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 65u8, 82u8, 84u8, 73u8, 70u8, 65u8, 67u8, 84u8, 95u8, 83u8, 67u8, 72u8, 69u8, 77u8, 65u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 65u8, 88u8, 95u8, 76u8, 73u8, 78u8, 75u8, 95u8, 65u8, 82u8, 84u8, 73u8, 70u8, 65u8, 67u8, 84u8, 95u8, 84u8, 65u8, 82u8, 71u8, 69u8, 84u8, 95u8, 77u8, 73u8, 83u8, 77u8, 65u8, 84u8, 67u8, 72u8, 70u8, 114u8, 101u8, 115u8, 104u8, 83u8, 116u8, 97u8, 108u8, 101u8, 85u8, 110u8, 107u8, 110u8, 111u8, 119u8, 110u8, 73u8, 110u8, 118u8, 97u8, 108u8, 105u8, 100u8,
+    97u8, 120u8, 109u8, 105u8, 95u8, 104u8, 101u8, 97u8, 100u8, 101u8, 114u8, 32u8, 109u8, 97u8, 103u8, 105u8, 99u8, 61u8, 65u8, 88u8, 77u8, 73u8, 48u8, 48u8, 48u8, 49u8, 32u8, 118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 61u8, 32u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8, 32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 102u8, 97u8, 99u8, 101u8, 95u8, 102u8, 112u8, 61u8, 32u8, 97u8, 98u8, 105u8, 95u8, 102u8, 112u8, 61u8, 32u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 95u8, 102u8, 112u8, 61u8, 32u8, 99u8, 111u8, 110u8, 116u8, 101u8, 110u8, 116u8, 95u8, 104u8, 97u8, 115u8, 104u8, 61u8, 97u8, 120u8, 109u8, 105u8, 95u8, 109u8, 111u8, 100u8, 117u8, 108u8, 101u8, 32u8, 112u8, 107u8, 103u8, 61u8, 32u8, 109u8, 111u8, 100u8, 117u8, 108u8, 101u8, 61u8, 32u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 61u8, 32u8, 97u8, 98u8, 105u8, 61u8, 32u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 112u8, 114u8, 105u8, 118u8, 97u8, 116u8, 101u8, 61u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 91u8, 93u8, 32u8, 116u8, 121u8, 112u8, 101u8, 61u8, 32u8, 111u8, 102u8, 102u8, 115u8, 101u8, 116u8, 61u8, 32u8, 115u8, 105u8, 122u8, 101u8, 61u8, 32u8, 97u8, 108u8, 105u8, 103u8, 110u8, 61u8, 32u8, 99u8, 104u8, 101u8, 99u8, 107u8, 115u8, 117u8, 109u8, 61u8, 115u8, 121u8, 109u8, 98u8, 111u8, 108u8, 32u8, 32u8, 107u8, 105u8, 110u8, 100u8, 61u8, 32u8, 112u8, 97u8, 114u8, 97u8, 109u8, 115u8, 61u8, 32u8, 114u8, 101u8, 116u8, 61u8, 32u8, 103u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 61u8, 32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 61u8, 32u8, 115u8, 105u8, 103u8, 95u8, 102u8, 112u8, 61u8, 116u8, 121u8, 112u8, 101u8, 95u8, 108u8, 97u8, 121u8, 111u8, 117u8, 116u8, 32u8, 32u8, 97u8, 100u8, 116u8, 61u8, 32u8, 114u8, 101u8, 112u8, 114u8, 61u8, 32u8, 102u8, 105u8, 101u8, 108u8, 100u8, 115u8, 61u8, 32u8, 99u8, 111u8, 112u8, 121u8, 61u8, 32u8, 115u8, 101u8, 110u8, 100u8, 61u8, 32u8, 115u8, 104u8, 97u8, 114u8, 101u8, 61u8, 116u8, 114u8, 97u8, 105u8, 116u8, 95u8, 105u8, 109u8, 112u8, 108u8, 32u8, 32u8, 116u8, 114u8, 97u8, 105u8, 116u8, 95u8, 100u8, 101u8, 102u8, 61u8, 32u8, 115u8, 101u8, 108u8, 102u8, 95u8, 116u8, 121u8, 112u8, 101u8, 61u8, 32u8, 97u8, 115u8, 115u8, 111u8, 99u8, 61u8, 32u8, 111u8, 98u8, 106u8, 101u8, 99u8, 116u8, 95u8, 115u8, 97u8, 102u8, 101u8, 61u8, 102u8, 110u8, 95u8, 99u8, 111u8, 110u8, 116u8, 114u8, 97u8, 99u8, 116u8, 32u8, 32u8, 114u8, 101u8, 116u8, 95u8, 98u8, 111u8, 114u8, 114u8, 111u8, 119u8, 115u8, 61u8, 32u8, 110u8, 111u8, 95u8, 101u8, 115u8, 99u8, 97u8, 112u8, 101u8, 61u8, 32u8, 101u8, 102u8, 102u8, 101u8, 99u8, 116u8, 115u8, 61u8, 32u8, 99u8, 97u8, 112u8, 115u8, 61u8, 32u8, 112u8, 97u8, 110u8, 105u8, 99u8, 61u8, 32u8, 112u8, 117u8, 114u8, 101u8, 61u8, 99u8, 111u8, 110u8, 115u8, 116u8, 95u8, 118u8, 97u8, 108u8, 32u8, 32u8, 118u8, 97u8, 108u8, 61u8, 32u8, 102u8, 112u8, 61u8, 109u8, 105u8, 114u8, 95u8, 116u8, 101u8, 109u8, 112u8, 108u8, 97u8, 116u8, 101u8, 32u8, 32u8, 115u8, 99u8, 104u8, 101u8, 109u8, 97u8, 61u8, 32u8, 99u8, 111u8, 109u8, 112u8, 116u8, 105u8, 109u8, 101u8, 61u8, 32u8, 98u8, 108u8, 111u8, 99u8, 107u8, 115u8, 61u8, 32u8, 108u8, 111u8, 99u8, 97u8, 108u8, 115u8, 61u8, 32u8, 105u8, 110u8, 115u8, 116u8, 115u8, 61u8, 32u8, 118u8, 101u8, 114u8, 105u8, 102u8, 105u8, 101u8, 100u8, 61u8, 32u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 61u8, 100u8, 105u8, 97u8, 103u8, 91u8, 93u8, 32u8, 97u8, 114u8, 116u8, 105u8, 102u8, 97u8, 99u8, 116u8, 61u8, 32u8, 100u8, 101u8, 116u8, 97u8, 105u8, 108u8, 61u8
+];
+
+// ============================================================================
+// 2. Domain-Prefixed 128-Bit Artifact Hasher & Checked Binary Buffer
+// ============================================================================
+
+pub struct AxmiHasher128 {
+    pub lo_hasher: AxHasher,
+    pub hi_hasher: AxHasher,
+    pub domain_id: u8,
+}
+
+fn axmi_domain_slice_start(domain_id: u8) -> usize {
+    if domain_id == 0u8 { return 0; }
+    if domain_id == 1u8 { return 12; }
+    if domain_id == 2u8 { return 28; }
+    if domain_id == 3u8 { return 44; }
+    if domain_id == 4u8 { return 60; }
+    76
+}
+
+fn axmi_domain_slice_len(domain_id: u8) -> usize {
+    if domain_id == 0u8 { return 12; }
+    16
+}
+
+pub fn axmi_hasher_new(domain_id: u8) -> AxmiHasher128 {
+    let mut h = AxmiHasher128 {
+        lo_hasher: ax_hasher_new(),
+        hi_hasher: ax_hasher_new(),
+        domain_id: domain_id,
+    };
+    ax_hasher_init(mut_view(h.lo_hasher));
+    ax_hasher_init(mut_view(h.hi_hasher));
+    ax_hasher_write_u64(mut_view(h.lo_hasher), 0x41584D495F4C4F31u64 ^ (domain_id as u64));
+    ax_hasher_write_u64(mut_view(h.hi_hasher), 0x41584D495F484931u64 ^ ax_hash_u64((domain_id as u64) + 77u64));
+    let start = axmi_domain_slice_start(domain_id);
+    let dlen = axmi_domain_slice_len(domain_id);
+    let mut i: usize = 0;
+    while i < dlen {
+        let b = AXMI_ASCII_TABLE[start + i];
+        axmi_hasher_write_u8(mut_view(h), b);
+        i = i + 1;
+    }
+    h
+}
+
+pub fn axmi_hasher_write_u8(h: mut_view<AxmiHasher128>, b: u8) {
+    ax_hasher_write_u32(mut_view(h.lo_hasher), (b as u32) | 0x01000000u32);
+    ax_hasher_write_u32(mut_view(h.hi_hasher), ((b ^ 0xA5u8) as u32) | 0x02000000u32);
+}
+
+pub fn axmi_hasher_write_u32(h: mut_view<AxmiHasher128>, v: u32) {
+    ax_hasher_write_u32(mut_view(h.lo_hasher), v);
+    ax_hasher_write_u32(mut_view(h.hi_hasher), v ^ 0x5A5AA5A5u32);
+}
+
+pub fn axmi_hasher_write_u64(h: mut_view<AxmiHasher128>, v: u64) {
+    ax_hasher_write_u64(mut_view(h.lo_hasher), v);
+    ax_hasher_write_u64(mut_view(h.hi_hasher), v ^ 0x9E3779B97F4A7C15u64);
+}
+
+pub fn axmi_hasher_write_bytes(h: mut_view<AxmiHasher128>, ptr: *const u8, len: usize) {
+    axmi_hasher_write_u64(mut_view(*h), len as u64);
+    if len == 0 || (ptr as usize) == 0 {
+        return;
+    }
+    ax_hasher_write(mut_view(h.lo_hasher), ptr, len);
+    ax_hasher_write_u64(mut_view(h.hi_hasher), (len as u64) ^ 0xC2B2AE3D27D4EB4Fu64);
+    ax_hasher_write(mut_view(h.hi_hasher), ptr, len);
+}
+
+pub fn axmi_hasher_write_sv(h: mut_view<AxmiHasher128>, sv: StrView) {
+    axmi_hasher_write_bytes(h, sv.ptr, sv.len);
+}
+
+pub fn axmi_hasher_write_fp128(h: mut_view<AxmiHasher128>, fp: Fingerprint128) {
+    axmi_hasher_write_u64(mut_view(*h), fp.lo);
+    axmi_hasher_write_u64(mut_view(*h), fp.hi);
+}
+
+pub fn axmi_hasher_write_semantic_key(h: mut_view<AxmiHasher128>, sk: view<SemanticKey>) {
+    axmi_hasher_write_sv(mut_view(*h), sk.package_name);
+    axmi_hasher_write_sv(mut_view(*h), sk.module_path);
+    axmi_hasher_write_u8(mut_view(*h), sk.item_namespace);
+    axmi_hasher_write_u32(mut_view(*h), sk.disambiguator_index);
+    axmi_hasher_write_sv(mut_view(*h), sk.canonical_name);
+    axmi_hasher_write_sv(mut_view(*h), sk.canonical_type_args);
+}
+
+pub fn axmi_hasher_finish(h: view<AxmiHasher128>) -> Fingerprint128 {
+    let lo = ax_hasher_finish(view(h.lo_hasher));
+    let hi_raw = ax_hasher_finish(view(h.hi_hasher));
+    let hi = ax_hash_combine(hi_raw, lo ^ ax_hash_u64((h.domain_id as u64) + 333u64));
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+pub fn axmi_compute_target_fingerprint(
+    target_triple: StrView,
+    abi_profile: StrView,
+    pointer_width_bytes: u32,
+    little_endian: bool,
+    cpu_feature_mask: u32,
+    panic_strategy: u8
+) -> Fingerprint128 {
+    let mut h = axmi_hasher_new(4u8);
+    axmi_hasher_write_sv(mut_view(h), target_triple);
+    axmi_hasher_write_sv(mut_view(h), abi_profile);
+    axmi_hasher_write_u32(mut_view(h), pointer_width_bytes);
+    axmi_hasher_write_u8(mut_view(h), if little_endian { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h), cpu_feature_mask);
+    axmi_hasher_write_u8(mut_view(h), panic_strategy);
+    axmi_hasher_finish(view(h))
+}
+
+pub struct AxmiBuffer {
+    pub ptr: *mut u8,
+    pub len: usize,
+    pub cap: usize,
+}
+
+fn axmi_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+pub fn axmi_buf_empty() -> AxmiBuffer {
+    AxmiBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+}
+
+pub fn axmi_buf_init(buf: mut_view<AxmiBuffer>, init_cap: usize) {
+    let c = if init_cap < 256 { 256 } else { init_cap };
+    let raw = unsafe { heap_alloc(c, 8) };
+    axmi_zero_bytes(raw, c);
+    buf.ptr = raw;
+    buf.len = 0;
+    buf.cap = c;
+}
+
+pub fn axmi_buf_free(buf: mut_view<AxmiBuffer>) {
+    if (buf.ptr as usize) != 0 && buf.cap > 0 {
+        unsafe { heap_free(buf.ptr, buf.cap, 8); }
+    }
+    buf.ptr = 0 as *mut u8;
+    buf.len = 0;
+    buf.cap = 0;
+}
+
+fn axmi_buf_ensure(buf: mut_view<AxmiBuffer>, extra: usize) {
+    let need = buf.len + extra;
+    if need <= buf.cap {
+        return;
+    }
+    let mut new_cap = if buf.cap == 0 { 512 } else { buf.cap * 2 };
+    while new_cap < need {
+        new_cap = new_cap * 2;
+    }
+    let next_ptr = unsafe { heap_alloc(new_cap, 8) };
+    axmi_zero_bytes(next_ptr, new_cap);
+    let mut i: usize = 0;
+    while i < buf.len {
+        unsafe { *(next_ptr + i) = *(buf.ptr + i); }
+        i = i + 1;
+    }
+    if (buf.ptr as usize) != 0 && buf.cap > 0 {
+        unsafe { heap_free(buf.ptr, buf.cap, 8); }
+    }
+    buf.ptr = next_ptr;
+    buf.cap = new_cap;
+}
+
+pub fn axmi_buf_push_u8(buf: mut_view<AxmiBuffer>, v: u8) {
+    axmi_buf_ensure(mut_view(*buf), 1);
+    unsafe { *(buf.ptr + buf.len) = v; }
+    buf.len = buf.len + 1;
+}
+
+pub fn axmi_buf_push_u16_le(buf: mut_view<AxmiBuffer>, v: u16) {
+    axmi_buf_ensure(mut_view(*buf), 2);
+    let p = buf.len;
+    unsafe {
+        *(buf.ptr + p) = (v & 0xFFu16) as u8;
+        *(buf.ptr + p + 1) = ((v >> 8u16) & 0xFFu16) as u8;
+    }
+    buf.len = p + 2;
+}
+
+pub fn axmi_buf_push_u32_le(buf: mut_view<AxmiBuffer>, v: u32) {
+    axmi_buf_ensure(mut_view(*buf), 4);
+    let p = buf.len;
+    unsafe {
+        *(buf.ptr + p) = (v & 0xFFu32) as u8;
+        *(buf.ptr + p + 1) = ((v >> 8u32) & 0xFFu32) as u8;
+        *(buf.ptr + p + 2) = ((v >> 16u32) & 0xFFu32) as u8;
+        *(buf.ptr + p + 3) = ((v >> 24u32) & 0xFFu32) as u8;
+    }
+    buf.len = p + 4;
+}
+
+pub fn axmi_buf_push_u64_le(buf: mut_view<AxmiBuffer>, v: u64) {
+    axmi_buf_push_u32_le(mut_view(*buf), (v & 0xFFFFFFFFu64) as u32);
+    axmi_buf_push_u32_le(mut_view(*buf), ((v >> 32u64) & 0xFFFFFFFFu64) as u32);
+}
+
+pub fn axmi_buf_push_fp128_le(buf: mut_view<AxmiBuffer>, fp: Fingerprint128) {
+    axmi_buf_push_u64_le(mut_view(*buf), fp.lo);
+    axmi_buf_push_u64_le(mut_view(*buf), fp.hi);
+}
+
+pub fn axmi_buf_push_bytes(buf: mut_view<AxmiBuffer>, ptr: *const u8, len: usize) {
+    if len == 0 || (ptr as usize) == 0 {
+        return;
+    }
+    axmi_buf_ensure(mut_view(*buf), len);
+    let mut i: usize = 0;
+    while i < len {
+        unsafe { *(buf.ptr + buf.len + i) = *(ptr + i); }
+        i = i + 1;
+    }
+    buf.len = buf.len + len;
+}
+
+pub fn axmi_buf_align_to(buf: mut_view<AxmiBuffer>, align: usize) {
+    if align <= 1 {
+        return;
+    }
+    while (buf.len % align) != 0 {
+        axmi_buf_push_u8(mut_view(*buf), 0u8);
+    }
+}
+
+pub fn axmi_buf_patch_u32_le(buf: mut_view<AxmiBuffer>, offset: usize, v: u32) {
+    if offset + 4 <= buf.len {
+        unsafe {
+            *(buf.ptr + offset) = (v & 0xFFu32) as u8;
+            *(buf.ptr + offset + 1) = ((v >> 8u32) & 0xFFu32) as u8;
+            *(buf.ptr + offset + 2) = ((v >> 16u32) & 0xFFu32) as u8;
+            *(buf.ptr + offset + 3) = ((v >> 24u32) & 0xFFu32) as u8;
+        }
+    }
+}
+
+pub fn axmi_buf_patch_u64_le(buf: mut_view<AxmiBuffer>, offset: usize, v: u64) {
+    axmi_buf_patch_u32_le(mut_view(*buf), offset, (v & 0xFFFFFFFFu64) as u32);
+    axmi_buf_patch_u32_le(mut_view(*buf), offset + 4, ((v >> 32u64) & 0xFFFFFFFFu64) as u32);
+}
+
+pub fn axmi_buf_patch_fp128_le(buf: mut_view<AxmiBuffer>, offset: usize, fp: Fingerprint128) {
+    axmi_buf_patch_u64_le(mut_view(*buf), offset, fp.lo);
+    axmi_buf_patch_u64_le(mut_view(*buf), offset + 8, fp.hi);
+}
+
+pub fn axmi_buf_eq(a: view<AxmiBuffer>, b: view<AxmiBuffer>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+// Checked bounds & little-endian reader helpers (AXS-ART-003 sec.3)
+pub fn axmi_check_bounds(offset: u64, size: u64, total_size: u64) -> bool {
+    if offset > total_size || size > total_size {
+        return false;
+    }
+    let sum = offset + size;
+    if sum < offset || sum > total_size {
+        return false;
+    }
+    true
+}
+
+pub fn axmi_is_power_of_two_align(align: u32) -> bool {
+    align == 1u32 || align == 2u32 || align == 4u32 || align == 8u32 || align == 16u32
+}
+
+pub fn axmi_read_u8(ptr: *const u8, offset: usize) -> u8 {
+    unsafe { *(ptr + offset) }
+}
+
+pub fn axmi_read_u16_le(ptr: *const u8, offset: usize) -> u16 {
+    let b0 = (unsafe { *(ptr + offset) }) as u16;
+    let b1 = (unsafe { *(ptr + offset + 1) }) as u16;
+    b0 | (b1 << 8u16)
+}
+
+pub fn axmi_read_u32_le(ptr: *const u8, offset: usize) -> u32 {
+    let b0 = (unsafe { *(ptr + offset) }) as u32;
+    let b1 = (unsafe { *(ptr + offset + 1) }) as u32;
+    let b2 = (unsafe { *(ptr + offset + 2) }) as u32;
+    let b3 = (unsafe { *(ptr + offset + 3) }) as u32;
+    b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+}
+
+pub fn axmi_read_u64_le(ptr: *const u8, offset: usize) -> u64 {
+    let lo = axmi_read_u32_le(ptr, offset) as u64;
+    let hi = axmi_read_u32_le(ptr, offset + 4) as u64;
+    lo | (hi << 32u64)
+}
+
+pub fn axmi_read_fp128_le(ptr: *const u8, offset: usize) -> Fingerprint128 {
+    let lo = axmi_read_u64_le(ptr, offset);
+    let hi = axmi_read_u64_le(ptr, offset + 8);
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+// ============================================================================
+// 3. `ArtifactHeader`, `SectionDescriptor` & `.axmi` Semantic Table Records
+// ============================================================================
+
+@derive(Copy)
+pub struct ArtifactId {
+    pub content_hash: Fingerprint128,
+    pub schema_id: u16,
+    pub schema_version: u16,
+}
+
+@derive(Copy)
+pub struct ArtifactHeader {
+    pub magic: [8]u8,
+    pub format_family: u16,
+    pub schema_version: u16,
+    pub artifact_kind: u16,
+    pub flags: u16,
+    pub target_fingerprint: Fingerprint128,
+    pub interface_fingerprint: Fingerprint128,
+    pub section_count: u32,
+    pub producer_version: u32,
+    pub payload_offset: u64,
+    pub payload_size: u64,
+    pub content_hash: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct SectionDescriptor {
+    pub id: u32,
+    pub section_type: u16,
+    pub flags: u16,
+    pub alignment: u32,
+    pub offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    pub checksum: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct AxmiExportedSymbol {
+    pub def_id: DefId,
+    pub item_kind: u8,
+    pub is_pub: bool,
+    pub is_generic: bool,
+    pub is_inline: bool,
+    pub is_comptime: bool,
+    pub param_count: u32,
+    pub return_type_id: TypeId,
+    pub generic_param_count: u32,
+    pub calling_conv: u8,
+    pub sig_fingerprint: Fingerprint128,
+    pub abi_fingerprint: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiTypeDef {
+    pub type_id: TypeId,
+    pub owner_def_id: DefId,
+    pub adt_kind: u8,
+    pub repr_tag: u8,
+    pub size_bytes: u32,
+    pub align_bytes: u32,
+    pub field_count: u32,
+    pub field_type_ids: [8]u32,
+    pub is_copy: bool,
+    pub is_send: bool,
+    pub is_share: bool,
+    pub layout_fingerprint: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiTraitImplEntry {
+    pub goal_key: TraitGoalKey,
+    pub trait_def_id: DefId,
+    pub self_type_id: TypeId,
+    pub impl_def_id: DefId,
+    pub assoc_item_count: u32,
+    pub is_object_safe: bool,
+    pub where_pred_count: u32,
+    pub impl_fingerprint: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiFnContractSummary {
+    pub def_id: DefId,
+    pub param_count: u32,
+    pub param_modes: [8]u8,
+    pub return_borrows_from_mask: u32,
+    pub no_escape_mask: u32,
+    pub effect_mask: u32,
+    pub authority_cap_mask: u32,
+    pub panic_contract: u8,
+    pub is_pure: bool,
+    pub contract_fingerprint: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiConstEntry {
+    pub const_key: ConstEvalKey,
+    pub def_id: DefId,
+    pub type_id: TypeId,
+    pub const_kind: u8,
+    pub int_val: i64,
+    pub aux_u64: u64,
+    pub str_val: StrView,
+    pub const_fingerprint: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiMirTemplate {
+    pub def_id: DefId,
+    pub mir_body_id: MirBodyId,
+    pub mir_schema_version: u16,
+    pub is_generic: bool,
+    pub is_inline: bool,
+    pub is_comptime: bool,
+    pub type_param_count: u32,
+    pub param_count: u32,
+    pub block_count: u32,
+    pub local_count: u32,
+    pub inst_count: u32,
+    pub ownership_verified: bool,
+    pub scale_const_dep: ConstEvalKey,
+    pub trait_bound_def_id: DefId,
+    pub body_digest: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxmiDependencyEdge {
+    pub dep_kind: u8,
+    pub module_path: StrView,
+    pub interface_fingerprint: Fingerprint128,
+    pub abi_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct AxmiCustomSection {
+    pub id: u32,
+    pub section_type: u16,
+    pub flags: u16,
+    pub payload_tag: u64,
+}
+
+@derive(Copy)
+pub struct AxmiTargetExpectation {
+    pub enforce_target: bool,
+    pub target_triple: StrView,
+    pub abi_profile: StrView,
+    pub pointer_width_bytes: u32,
+    pub little_endian: bool,
+    pub required_cpu_features: u32,
+    pub panic_strategy: u8,
+    pub target_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct AxmiDeserializeResult {
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub expected_version: u16,
+    pub bad_section_type: u16,
+    pub artifact_id: ArtifactId,
+}
+
+@derive(Copy)
+pub struct AxmiInterfaceDiff {
+    pub api_changed: bool,
+    pub abi_changed: bool,
+    pub layout_changed: bool,
+    pub trait_changed: bool,
+    pub effect_changed: bool,
+    pub const_changed: bool,
+    pub mir_template_changed: bool,
+    pub dependency_changed: bool,
+    pub freshness: u8,
+}
+
+pub struct AxmiModuleInterface {
+    pub arena: Arena,
+    pub header: ArtifactHeader,
+    pub sections: *mut SectionDescriptor,
+    pub section_count: u32,
+
+    pub package_name: StrView,
+    pub module_path: StrView,
+    pub target_triple: StrView,
+    pub abi_profile: StrView,
+    pub pointer_width_bytes: u32,
+    pub little_endian: bool,
+    pub cpu_feature_mask: u32,
+    pub panic_strategy: u8,
+    pub stripped_private_count: u32,
+
+    pub target_fingerprint: Fingerprint128,
+    pub interface_fingerprint: Fingerprint128,
+    pub abi_fingerprint: Fingerprint128,
+    pub body_fingerprint: Fingerprint128,
+
+    pub string_table: *mut StrView,
+    pub string_count: u32,
+
+    pub symbols: *mut AxmiExportedSymbol,
+    pub symbol_count: u32,
+
+    pub types: *mut AxmiTypeDef,
+    pub type_count: u32,
+
+    pub traits: *mut AxmiTraitImplEntry,
+    pub trait_count: u32,
+
+    pub contracts: *mut AxmiFnContractSummary,
+    pub contract_count: u32,
+
+    pub consts: *mut AxmiConstEntry,
+    pub const_count: u32,
+
+    pub mir_templates: *mut AxmiMirTemplate,
+    pub mir_template_count: u32,
+
+    pub deps: *mut AxmiDependencyEdge,
+    pub dep_count: u32,
+
+    pub custom_sections: *mut AxmiCustomSection,
+    pub custom_section_count: u32,
+}
+
+// ============================================================================
+// 4. `AxmiModuleInterface` Lifecycle, String Deduplication & Builder API
+// ============================================================================
+
+pub fn axmi_interface_empty() -> AxmiModuleInterface {
+    AxmiModuleInterface {
+        arena: arena_new(),
+        header: ArtifactHeader {
+            magic: AXMI_MAGIC,
+            format_family: AXMI_FORMAT_FAMILY,
+            schema_version: AXMI_FORMAT_VERSION,
+            artifact_kind: AXMI_ARTIFACT_KIND,
+            flags: AXMI_DEFAULT_FLAGS,
+            target_fingerprint: fingerprint128_zero(),
+            interface_fingerprint: fingerprint128_zero(),
+            section_count: 0u32,
+            producer_version: AXMI_PRODUCER_VERSION,
+            payload_offset: 0u64,
+            payload_size: 0u64,
+            content_hash: fingerprint128_zero(),
+        },
+        sections: 0 as *mut SectionDescriptor,
+        section_count: 0u32,
+        package_name: qry_sv_empty(),
+        module_path: qry_sv_empty(),
+        target_triple: qry_sv_empty(),
+        abi_profile: qry_sv_empty(),
+        pointer_width_bytes: 8u32,
+        little_endian: true,
+        cpu_feature_mask: 0u32,
+        panic_strategy: AXMI_PANIC_NO_PANIC,
+        stripped_private_count: 0u32,
+        target_fingerprint: fingerprint128_zero(),
+        interface_fingerprint: fingerprint128_zero(),
+        abi_fingerprint: fingerprint128_zero(),
+        body_fingerprint: fingerprint128_zero(),
+        string_table: 0 as *mut StrView,
+        string_count: 0u32,
+        symbols: 0 as *mut AxmiExportedSymbol,
+        symbol_count: 0u32,
+        types: 0 as *mut AxmiTypeDef,
+        type_count: 0u32,
+        traits: 0 as *mut AxmiTraitImplEntry,
+        trait_count: 0u32,
+        contracts: 0 as *mut AxmiFnContractSummary,
+        contract_count: 0u32,
+        consts: 0 as *mut AxmiConstEntry,
+        const_count: 0u32,
+        mir_templates: 0 as *mut AxmiMirTemplate,
+        mir_template_count: 0u32,
+        deps: 0 as *mut AxmiDependencyEdge,
+        dep_count: 0u32,
+        custom_sections: 0 as *mut AxmiCustomSection,
+        custom_section_count: 0u32,
+    }
+}
+
+pub fn axmi_interface_init(iface: mut_view<AxmiModuleInterface>) {
+    iface.arena = arena_new();
+    iface.header = ArtifactHeader {
+        magic: AXMI_MAGIC,
+        format_family: AXMI_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+        artifact_kind: AXMI_ARTIFACT_KIND,
+        flags: AXMI_DEFAULT_FLAGS,
+        target_fingerprint: fingerprint128_zero(),
+        interface_fingerprint: fingerprint128_zero(),
+        section_count: 0u32,
+        producer_version: AXMI_PRODUCER_VERSION,
+        payload_offset: 0u64,
+        payload_size: 0u64,
+        content_hash: fingerprint128_zero(),
+    };
+
+    let sec_bytes = AXMI_MAX_SECTIONS * size_of<SectionDescriptor>();
+    iface.sections = arena_alloc_raw(mut_view(iface.arena), sec_bytes, align_of<SectionDescriptor>()) as *mut SectionDescriptor;
+    axmi_zero_bytes(iface.sections as *mut u8, sec_bytes);
+    iface.section_count = 0u32;
+
+    let str_bytes = AXMI_MAX_STRINGS * size_of<StrView>();
+    iface.string_table = arena_alloc_raw(mut_view(iface.arena), str_bytes, align_of<StrView>()) as *mut StrView;
+    axmi_zero_bytes(iface.string_table as *mut u8, str_bytes);
+    iface.string_count = 0u32;
+
+    let sym_bytes = AXMI_MAX_SYMBOLS * size_of<AxmiExportedSymbol>();
+    iface.symbols = arena_alloc_raw(mut_view(iface.arena), sym_bytes, align_of<AxmiExportedSymbol>()) as *mut AxmiExportedSymbol;
+    axmi_zero_bytes(iface.symbols as *mut u8, sym_bytes);
+    iface.symbol_count = 0u32;
+
+    let typ_bytes = AXMI_MAX_TYPES * size_of<AxmiTypeDef>();
+    iface.types = arena_alloc_raw(mut_view(iface.arena), typ_bytes, align_of<AxmiTypeDef>()) as *mut AxmiTypeDef;
+    axmi_zero_bytes(iface.types as *mut u8, typ_bytes);
+    iface.type_count = 0u32;
+
+    let tr_bytes = AXMI_MAX_TRAITS * size_of<AxmiTraitImplEntry>();
+    iface.traits = arena_alloc_raw(mut_view(iface.arena), tr_bytes, align_of<AxmiTraitImplEntry>()) as *mut AxmiTraitImplEntry;
+    axmi_zero_bytes(iface.traits as *mut u8, tr_bytes);
+    iface.trait_count = 0u32;
+
+    let con_bytes = AXMI_MAX_CONTRACTS * size_of<AxmiFnContractSummary>();
+    iface.contracts = arena_alloc_raw(mut_view(iface.arena), con_bytes, align_of<AxmiFnContractSummary>()) as *mut AxmiFnContractSummary;
+    axmi_zero_bytes(iface.contracts as *mut u8, con_bytes);
+    iface.contract_count = 0u32;
+
+    let cst_bytes = AXMI_MAX_CONSTS * size_of<AxmiConstEntry>();
+    iface.consts = arena_alloc_raw(mut_view(iface.arena), cst_bytes, align_of<AxmiConstEntry>()) as *mut AxmiConstEntry;
+    axmi_zero_bytes(iface.consts as *mut u8, cst_bytes);
+    iface.const_count = 0u32;
+
+    let mir_bytes = AXMI_MAX_MIR_TEMPLATES * size_of<AxmiMirTemplate>();
+    iface.mir_templates = arena_alloc_raw(mut_view(iface.arena), mir_bytes, align_of<AxmiMirTemplate>()) as *mut AxmiMirTemplate;
+    axmi_zero_bytes(iface.mir_templates as *mut u8, mir_bytes);
+    iface.mir_template_count = 0u32;
+
+    let dep_bytes = AXMI_MAX_DEPS * size_of<AxmiDependencyEdge>();
+    iface.deps = arena_alloc_raw(mut_view(iface.arena), dep_bytes, align_of<AxmiDependencyEdge>()) as *mut AxmiDependencyEdge;
+    axmi_zero_bytes(iface.deps as *mut u8, dep_bytes);
+    iface.dep_count = 0u32;
+
+    let csec_bytes = AXMI_MAX_CUSTOM_SECTIONS * size_of<AxmiCustomSection>();
+    iface.custom_sections = arena_alloc_raw(mut_view(iface.arena), csec_bytes, align_of<AxmiCustomSection>()) as *mut AxmiCustomSection;
+    axmi_zero_bytes(iface.custom_sections as *mut u8, csec_bytes);
+    iface.custom_section_count = 0u32;
+
+    iface.package_name = qry_sv_empty();
+    iface.module_path = qry_sv_empty();
+    iface.target_triple = qry_sv_empty();
+    iface.abi_profile = qry_sv_empty();
+    iface.pointer_width_bytes = 8u32;
+    iface.little_endian = true;
+    iface.cpu_feature_mask = 0u32;
+    iface.panic_strategy = AXMI_PANIC_NO_PANIC;
+    iface.stripped_private_count = 0u32;
+
+    iface.target_fingerprint = fingerprint128_zero();
+    iface.interface_fingerprint = fingerprint128_zero();
+    iface.abi_fingerprint = fingerprint128_zero();
+    iface.body_fingerprint = fingerprint128_zero();
+}
+
+pub fn axmi_interface_free(iface: mut_view<AxmiModuleInterface>) {
+    arena_destroy(mut_view(iface.arena));
+    iface.sections = 0 as *mut SectionDescriptor;
+    iface.string_table = 0 as *mut StrView;
+    iface.symbols = 0 as *mut AxmiExportedSymbol;
+    iface.types = 0 as *mut AxmiTypeDef;
+    iface.traits = 0 as *mut AxmiTraitImplEntry;
+    iface.contracts = 0 as *mut AxmiFnContractSummary;
+    iface.consts = 0 as *mut AxmiConstEntry;
+    iface.mir_templates = 0 as *mut AxmiMirTemplate;
+    iface.deps = 0 as *mut AxmiDependencyEdge;
+    iface.custom_sections = 0 as *mut AxmiCustomSection;
+}
+
+pub fn axmi_intern_bytes(iface: mut_view<AxmiModuleInterface>, ptr: *const u8, len: usize) -> StrView {
+    if len == 0 || (ptr as usize) == 0 {
+        return qry_sv_empty();
+    }
+    let dst = arena_alloc_raw(mut_view(iface.arena), len + 1, 1);
+    let mut i: usize = 0;
+    while i < len {
+        unsafe { *(dst + i) = *(ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(dst + len) = 0u8; }
+    StrView { ptr: dst as *const u8, len: len }
+}
+
+pub fn axmi_intern_sv(iface: mut_view<AxmiModuleInterface>, sv: StrView) -> StrView {
+    axmi_intern_bytes(iface, sv.ptr, sv.len)
+}
+
+pub fn axmi_intern_semantic_key(iface: mut_view<AxmiModuleInterface>, sk: SemanticKey) -> SemanticKey {
+    SemanticKey {
+        package_name: axmi_intern_sv(mut_view(*iface), sk.package_name),
+        module_path: axmi_intern_sv(mut_view(*iface), sk.module_path),
+        item_namespace: sk.item_namespace,
+        disambiguator_index: sk.disambiguator_index,
+        canonical_name: axmi_intern_sv(mut_view(*iface), sk.canonical_name),
+        canonical_type_args: axmi_intern_sv(mut_view(*iface), sk.canonical_type_args),
+    }
+}
+
+pub fn axmi_get_or_add_string_id(iface: mut_view<AxmiModuleInterface>, sv: StrView) -> u32 {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return 0u32;
+    }
+    let mut i: u32 = 0u32;
+    while i < iface.string_count {
+        let cur = unsafe { *(iface.string_table + (i as usize)) };
+        if qry_sv_eq(cur, sv) {
+            return i + 1u32;
+        }
+        i = i + 1u32;
+    }
+    let idx = iface.string_count as usize;
+    if idx >= AXMI_MAX_STRINGS {
+        return AXMI_MAX_STRINGS as u32;
+    }
+    let interned = axmi_intern_sv(mut_view(*iface), sv);
+    unsafe { *(iface.string_table + idx) = interned; }
+    iface.string_count = (idx as u32) + 1u32;
+    (idx as u32) + 1u32
+}
+
+pub fn axmi_string_by_id(iface: view<AxmiModuleInterface>, str_id: u32) -> StrView {
+    if str_id == 0u32 || str_id > iface.string_count {
+        return qry_sv_empty();
+    }
+    unsafe { *(iface.string_table + ((str_id - 1u32) as usize)) }
+}
+
+pub fn axmi_set_module_identity(
+    iface: mut_view<AxmiModuleInterface>,
+    package_name: StrView,
+    module_path: StrView,
+    target_triple: StrView,
+    abi_profile: StrView,
+    pointer_width_bytes: u32,
+    little_endian: bool,
+    cpu_feature_mask: u32,
+    panic_strategy: u8
+) {
+    iface.package_name = axmi_intern_sv(mut_view(*iface), package_name);
+    iface.module_path = axmi_intern_sv(mut_view(*iface), module_path);
+    iface.target_triple = axmi_intern_sv(mut_view(*iface), target_triple);
+    iface.abi_profile = axmi_intern_sv(mut_view(*iface), abi_profile);
+    iface.pointer_width_bytes = pointer_width_bytes;
+    iface.little_endian = little_endian;
+    iface.cpu_feature_mask = cpu_feature_mask;
+    iface.panic_strategy = panic_strategy;
+    iface.target_fingerprint = axmi_compute_target_fingerprint(
+        iface.target_triple,
+        iface.abi_profile,
+        pointer_width_bytes,
+        little_endian,
+        cpu_feature_mask,
+        panic_strategy
+    );
+}
+
+// Adds an item to the `.axmi` builder. Per AXS-ART-010 sec.1 (`REQ-LNK-540`), private non-inlined,
+// non-generic, non-comptime items are stripped from `.axmi` and counted in `stripped_private_count`.
+pub fn axmi_add_symbol(
+    iface: mut_view<AxmiModuleInterface>,
+    def_id: DefId,
+    item_kind: u8,
+    is_pub: bool,
+    is_generic: bool,
+    is_inline: bool,
+    is_comptime: bool,
+    param_count: u32,
+    return_type_id: TypeId,
+    generic_param_count: u32,
+    calling_conv: u8,
+    semantic_key: SemanticKey
+) -> bool {
+    if !is_pub && !is_generic && !is_inline && !is_comptime {
+        iface.stripped_private_count = iface.stripped_private_count + 1u32;
+        return false;
+    }
+    let idx = iface.symbol_count as usize;
+    if idx >= AXMI_MAX_SYMBOLS {
+        return false;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+
+    let mut h_sig = axmi_hasher_new(2u8);
+    axmi_hasher_write_semantic_key(mut_view(h_sig), view(sk));
+    axmi_hasher_write_u8(mut_view(h_sig), item_kind);
+    axmi_hasher_write_u8(mut_view(h_sig), if is_pub { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_sig), if is_generic { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_sig), if is_inline { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_sig), if is_comptime { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h_sig), param_count);
+    axmi_hasher_write_u32(mut_view(h_sig), return_type_id.v);
+    axmi_hasher_write_u32(mut_view(h_sig), generic_param_count);
+    let sig_fp = axmi_hasher_finish(view(h_sig));
+
+    let mut h_abi = axmi_hasher_new(3u8);
+    axmi_hasher_write_fp128(mut_view(h_abi), sig_fp);
+    axmi_hasher_write_u8(mut_view(h_abi), calling_conv);
+    axmi_hasher_write_u32(mut_view(h_abi), iface.pointer_width_bytes);
+    let abi_fp = axmi_hasher_finish(view(h_abi));
+
+    unsafe {
+        *(iface.symbols + idx) = AxmiExportedSymbol {
+            def_id: def_id,
+            item_kind: item_kind,
+            is_pub: is_pub,
+            is_generic: is_generic,
+            is_inline: is_inline,
+            is_comptime: is_comptime,
+            param_count: param_count,
+            return_type_id: return_type_id,
+            generic_param_count: generic_param_count,
+            calling_conv: calling_conv,
+            sig_fingerprint: sig_fp,
+            abi_fingerprint: abi_fp,
+            semantic_key: sk,
+        };
+    }
+    iface.symbol_count = (idx as u32) + 1u32;
+    true
+}
+
+pub fn axmi_add_type_def(
+    iface: mut_view<AxmiModuleInterface>,
+    type_id: TypeId,
+    owner_def_id: DefId,
+    adt_kind: u8,
+    repr_tag: u8,
+    size_bytes: u32,
+    align_bytes: u32,
+    is_copy: bool,
+    is_send: bool,
+    is_share: bool,
+    semantic_key: SemanticKey
+) {
+    let idx = iface.type_count as usize;
+    if idx >= AXMI_MAX_TYPES {
+        return;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+    let mut h_lay = axmi_hasher_new(3u8);
+    axmi_hasher_write_semantic_key(mut_view(h_lay), view(sk));
+    axmi_hasher_write_u8(mut_view(h_lay), adt_kind);
+    axmi_hasher_write_u8(mut_view(h_lay), repr_tag);
+    axmi_hasher_write_u32(mut_view(h_lay), size_bytes);
+    axmi_hasher_write_u32(mut_view(h_lay), align_bytes);
+    axmi_hasher_write_u8(mut_view(h_lay), if is_copy { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_lay), if is_send { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_lay), if is_share { 1u8 } else { 0u8 });
+    let lay_fp = axmi_hasher_finish(view(h_lay));
+
+    let ptr = unsafe { iface.types + idx };
+    axmi_zero_bytes(ptr as *mut u8, size_of<AxmiTypeDef>());
+    unsafe {
+        (*ptr).type_id = type_id;
+        (*ptr).owner_def_id = owner_def_id;
+        (*ptr).adt_kind = adt_kind;
+        (*ptr).repr_tag = repr_tag;
+        (*ptr).size_bytes = size_bytes;
+        (*ptr).align_bytes = align_bytes;
+        (*ptr).field_count = 0u32;
+        (*ptr).is_copy = is_copy;
+        (*ptr).is_send = is_send;
+        (*ptr).is_share = is_share;
+        (*ptr).layout_fingerprint = lay_fp;
+        (*ptr).semantic_key = sk;
+    }
+    iface.type_count = (idx as u32) + 1u32;
+}
+
+pub fn axmi_add_type_field(iface: mut_view<AxmiModuleInterface>, type_id: TypeId, field_type_id: TypeId) {
+    let mut i: usize = 0;
+    while i < (iface.type_count as usize) {
+        let p = unsafe { iface.types + i };
+        if (unsafe { (*p).type_id.v }) == type_id.v {
+            let fc = unsafe { (*p).field_count };
+            if fc < 8u32 {
+                unsafe {
+                    (*p).field_type_ids[fc as usize] = field_type_id.v;
+                    (*p).field_count = fc + 1u32;
+                }
+                let mut h_lay = axmi_hasher_new(3u8);
+                let cur = unsafe { *p };
+                axmi_hasher_write_fp128(mut_view(h_lay), cur.layout_fingerprint);
+                axmi_hasher_write_u32(mut_view(h_lay), field_type_id.v);
+                unsafe { (*p).layout_fingerprint = axmi_hasher_finish(view(h_lay)); }
+            }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn axmi_add_trait_impl(
+    iface: mut_view<AxmiModuleInterface>,
+    goal_key: TraitGoalKey,
+    trait_def_id: DefId,
+    self_type_id: TypeId,
+    impl_def_id: DefId,
+    assoc_item_count: u32,
+    is_object_safe: bool,
+    where_pred_count: u32,
+    semantic_key: SemanticKey
+) {
+    let idx = iface.trait_count as usize;
+    if idx >= AXMI_MAX_TRAITS {
+        return;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+    let mut h_tr = axmi_hasher_new(2u8);
+    axmi_hasher_write_semantic_key(mut_view(h_tr), view(sk));
+    axmi_hasher_write_u32(mut_view(h_tr), trait_def_id.v);
+    axmi_hasher_write_u32(mut_view(h_tr), self_type_id.v);
+    axmi_hasher_write_u32(mut_view(h_tr), assoc_item_count);
+    axmi_hasher_write_u8(mut_view(h_tr), if is_object_safe { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h_tr), where_pred_count);
+    let tr_fp = axmi_hasher_finish(view(h_tr));
+
+    unsafe {
+        *(iface.traits + idx) = AxmiTraitImplEntry {
+            goal_key: goal_key,
+            trait_def_id: trait_def_id,
+            self_type_id: self_type_id,
+            impl_def_id: impl_def_id,
+            assoc_item_count: assoc_item_count,
+            is_object_safe: is_object_safe,
+            where_pred_count: where_pred_count,
+            impl_fingerprint: tr_fp,
+            semantic_key: sk,
+        };
+    }
+    iface.trait_count = (idx as u32) + 1u32;
+}
+
+pub fn axmi_add_fn_contract(
+    iface: mut_view<AxmiModuleInterface>,
+    def_id: DefId,
+    param_count: u32,
+    return_borrows_from_mask: u32,
+    no_escape_mask: u32,
+    effect_mask: u32,
+    authority_cap_mask: u32,
+    panic_contract: u8,
+    semantic_key: SemanticKey
+) {
+    let idx = iface.contract_count as usize;
+    if idx >= AXMI_MAX_CONTRACTS {
+        return;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+    let is_pure = effect_mask == AXMI_EFF_PURE && authority_cap_mask == AXMI_CAP_NONE;
+
+    let mut h_c = axmi_hasher_new(2u8);
+    axmi_hasher_write_semantic_key(mut_view(h_c), view(sk));
+    axmi_hasher_write_u32(mut_view(h_c), param_count);
+    axmi_hasher_write_u32(mut_view(h_c), return_borrows_from_mask);
+    axmi_hasher_write_u32(mut_view(h_c), no_escape_mask);
+    axmi_hasher_write_u32(mut_view(h_c), effect_mask);
+    axmi_hasher_write_u32(mut_view(h_c), authority_cap_mask);
+    axmi_hasher_write_u8(mut_view(h_c), panic_contract);
+    let c_fp = axmi_hasher_finish(view(h_c));
+
+    let ptr = unsafe { iface.contracts + idx };
+    axmi_zero_bytes(ptr as *mut u8, size_of<AxmiFnContractSummary>());
+    unsafe {
+        (*ptr).def_id = def_id;
+        (*ptr).param_count = param_count;
+        (*ptr).return_borrows_from_mask = return_borrows_from_mask;
+        (*ptr).no_escape_mask = no_escape_mask;
+        (*ptr).effect_mask = effect_mask;
+        (*ptr).authority_cap_mask = authority_cap_mask;
+        (*ptr).panic_contract = panic_contract;
+        (*ptr).is_pure = is_pure;
+        (*ptr).contract_fingerprint = c_fp;
+        (*ptr).semantic_key = sk;
+    }
+    iface.contract_count = (idx as u32) + 1u32;
+}
+
+pub fn axmi_set_fn_param_mode(iface: mut_view<AxmiModuleInterface>, def_id: DefId, param_idx: u32, mode: u8) {
+    if param_idx >= 8u32 {
+        return;
+    }
+    let mut i: usize = 0;
+    while i < (iface.contract_count as usize) {
+        let p = unsafe { iface.contracts + i };
+        if (unsafe { (*p).def_id.v }) == def_id.v {
+            unsafe { (*p).param_modes[param_idx as usize] = mode; }
+            let cur = unsafe { *p };
+            let mut h_c = axmi_hasher_new(2u8);
+            axmi_hasher_write_fp128(mut_view(h_c), cur.contract_fingerprint);
+            axmi_hasher_write_u32(mut_view(h_c), param_idx);
+            axmi_hasher_write_u8(mut_view(h_c), mode);
+            unsafe { (*p).contract_fingerprint = axmi_hasher_finish(view(h_c)); }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn axmi_add_const_val(
+    iface: mut_view<AxmiModuleInterface>,
+    const_key: ConstEvalKey,
+    def_id: DefId,
+    type_id: TypeId,
+    const_kind: u8,
+    int_val: i64,
+    aux_u64: u64,
+    str_val: StrView,
+    semantic_key: SemanticKey
+) {
+    let idx = iface.const_count as usize;
+    if idx >= AXMI_MAX_CONSTS {
+        return;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+    let sv = axmi_intern_sv(mut_view(*iface), str_val);
+
+    let mut h_cst = axmi_hasher_new(2u8);
+    axmi_hasher_write_semantic_key(mut_view(h_cst), view(sk));
+    axmi_hasher_write_u8(mut_view(h_cst), const_kind);
+    axmi_hasher_write_u64(mut_view(h_cst), int_val as u64);
+    axmi_hasher_write_u64(mut_view(h_cst), aux_u64);
+    axmi_hasher_write_sv(mut_view(h_cst), sv);
+    let cst_fp = axmi_hasher_finish(view(h_cst));
+
+    unsafe {
+        *(iface.consts + idx) = AxmiConstEntry {
+            const_key: const_key,
+            def_id: def_id,
+            type_id: type_id,
+            const_kind: const_kind,
+            int_val: int_val,
+            aux_u64: aux_u64,
+            str_val: sv,
+            const_fingerprint: cst_fp,
+            semantic_key: sk,
+        };
+    }
+    iface.const_count = (idx as u32) + 1u32;
+}
+
+pub fn axmi_add_mir_template(
+    iface: mut_view<AxmiModuleInterface>,
+    def_id: DefId,
+    mir_body_id: MirBodyId,
+    mir_schema_version: u16,
+    is_generic: bool,
+    is_inline: bool,
+    is_comptime: bool,
+    type_param_count: u32,
+    param_count: u32,
+    block_count: u32,
+    local_count: u32,
+    inst_count: u32,
+    ownership_verified: bool,
+    scale_const_dep: ConstEvalKey,
+    trait_bound_def_id: DefId,
+    body_seed: u64,
+    semantic_key: SemanticKey
+) -> bool {
+    // INV-PIPE-002 / AXS-ART-013 sec.2: Only ownership-verified MIR bodies may be added to `.axmi`.
+    if !ownership_verified || block_count == 0u32 || local_count == 0u32 {
+        return false;
+    }
+    let idx = iface.mir_template_count as usize;
+    if idx >= AXMI_MAX_MIR_TEMPLATES {
+        return false;
+    }
+    let sk = axmi_intern_semantic_key(mut_view(*iface), semantic_key);
+    let mut h_mir = axmi_hasher_new(5u8);
+    axmi_hasher_write_semantic_key(mut_view(h_mir), view(sk));
+    axmi_hasher_write_u32(mut_view(h_mir), mir_schema_version as u32);
+    axmi_hasher_write_u8(mut_view(h_mir), if is_generic { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_mir), if is_inline { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_mir), if is_comptime { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h_mir), type_param_count);
+    axmi_hasher_write_u32(mut_view(h_mir), param_count);
+    axmi_hasher_write_u32(mut_view(h_mir), block_count);
+    axmi_hasher_write_u32(mut_view(h_mir), local_count);
+    axmi_hasher_write_u32(mut_view(h_mir), inst_count);
+    axmi_hasher_write_u32(mut_view(h_mir), scale_const_dep.v);
+    axmi_hasher_write_u32(mut_view(h_mir), trait_bound_def_id.v);
+    axmi_hasher_write_u64(mut_view(h_mir), body_seed);
+    let mir_digest = axmi_hasher_finish(view(h_mir));
+
+    unsafe {
+        *(iface.mir_templates + idx) = AxmiMirTemplate {
+            def_id: def_id,
+            mir_body_id: mir_body_id,
+            mir_schema_version: mir_schema_version,
+            is_generic: is_generic,
+            is_inline: is_inline,
+            is_comptime: is_comptime,
+            type_param_count: type_param_count,
+            param_count: param_count,
+            block_count: block_count,
+            local_count: local_count,
+            inst_count: inst_count,
+            ownership_verified: ownership_verified,
+            scale_const_dep: scale_const_dep,
+            trait_bound_def_id: trait_bound_def_id,
+            body_digest: mir_digest,
+            semantic_key: sk,
+        };
+    }
+    iface.mir_template_count = (idx as u32) + 1u32;
+    true
+}
+
+pub fn axmi_add_dependency(
+    iface: mut_view<AxmiModuleInterface>,
+    dep_kind: u8,
+    module_path: StrView,
+    interface_fingerprint: Fingerprint128,
+    abi_fingerprint: Fingerprint128
+) {
+    let idx = iface.dep_count as usize;
+    if idx >= AXMI_MAX_DEPS {
+        return;
+    }
+    let mp = axmi_intern_sv(mut_view(*iface), module_path);
+    unsafe {
+        *(iface.deps + idx) = AxmiDependencyEdge {
+            dep_kind: dep_kind,
+            module_path: mp,
+            interface_fingerprint: interface_fingerprint,
+            abi_fingerprint: abi_fingerprint,
+        };
+    }
+    iface.dep_count = (idx as u32) + 1u32;
+}
+
+pub fn axmi_add_custom_section(
+    iface: mut_view<AxmiModuleInterface>,
+    id: u32,
+    section_type: u16,
+    flags: u16,
+    payload_tag: u64
+) {
+    let idx = iface.custom_section_count as usize;
+    if idx >= AXMI_MAX_CUSTOM_SECTIONS {
+        return;
+    }
+    unsafe {
+        *(iface.custom_sections + idx) = AxmiCustomSection {
+            id: id,
+            section_type: section_type,
+            flags: flags,
+            payload_tag: payload_tag,
+        };
+    }
+    iface.custom_section_count = (idx as u32) + 1u32;
+}
+
+// ============================================================================
+// 5. Canonical Table Sorting (`SemanticKey`) & Fingerprint Computation
+// ============================================================================
+
+pub fn axmi_sort_tables(iface: mut_view<AxmiModuleInterface>) {
+    // 1. Sort symbols by SemanticKey
+    let sym_n = iface.symbol_count as usize;
+    let mut a: usize = 1;
+    while a < sym_n {
+        let cur = unsafe { *(iface.symbols + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.symbols + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.symbols + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.symbols + b) = cur; }
+        a = a + 1;
+    }
+
+    // 2. Sort types by SemanticKey
+    let typ_n = iface.type_count as usize;
+    a = 1;
+    while a < typ_n {
+        let cur = unsafe { *(iface.types + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.types + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.types + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.types + b) = cur; }
+        a = a + 1;
+    }
+
+    // 3. Sort traits by SemanticKey
+    let tr_n = iface.trait_count as usize;
+    a = 1;
+    while a < tr_n {
+        let cur = unsafe { *(iface.traits + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.traits + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.traits + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.traits + b) = cur; }
+        a = a + 1;
+    }
+
+    // 4. Sort contracts by SemanticKey
+    let con_n = iface.contract_count as usize;
+    a = 1;
+    while a < con_n {
+        let cur = unsafe { *(iface.contracts + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.contracts + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.contracts + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.contracts + b) = cur; }
+        a = a + 1;
+    }
+
+    // 5. Sort consts by SemanticKey
+    let cst_n = iface.const_count as usize;
+    a = 1;
+    while a < cst_n {
+        let cur = unsafe { *(iface.consts + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.consts + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.consts + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.consts + b) = cur; }
+        a = a + 1;
+    }
+
+    // 6. Sort MIR templates by SemanticKey
+    let mir_n = iface.mir_template_count as usize;
+    a = 1;
+    while a < mir_n {
+        let cur = unsafe { *(iface.mir_templates + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.mir_templates + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.mir_templates + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.mir_templates + b) = cur; }
+        a = a + 1;
+    }
+
+    // 7. Sort dependencies by (dep_kind, module_path)
+    let dep_n = iface.dep_count as usize;
+    a = 1;
+    while a < dep_n {
+        let cur = unsafe { *(iface.deps + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(iface.deps + (b - 1)) };
+            let pk = prev.dep_kind;
+            let ck = cur.dep_kind;
+            let cmp_k = if pk < ck {
+                -1i32
+            } else if pk > ck {
+                1i32
+            } else {
+                qry_sv_cmp(prev.module_path, cur.module_path)
+            };
+            if cmp_k <= 0i32 {
+                break;
+            }
+            unsafe { *(iface.deps + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(iface.deps + b) = cur; }
+        a = a + 1;
+    }
+}
+
+pub fn axmi_recompute_fingerprints(iface: mut_view<AxmiModuleInterface>) {
+    axmi_sort_tables(mut_view(*iface));
+
+    iface.target_fingerprint = axmi_compute_target_fingerprint(
+        iface.target_triple,
+        iface.abi_profile,
+        iface.pointer_width_bytes,
+        iface.little_endian,
+        iface.cpu_feature_mask,
+        iface.panic_strategy
+    );
+
+    let mut h_api = axmi_hasher_new(2u8);
+    let mut h_abi = axmi_hasher_new(3u8);
+    let mut h_bod = axmi_hasher_new(5u8);
+
+    axmi_hasher_write_sv(mut_view(h_api), iface.package_name);
+    axmi_hasher_write_sv(mut_view(h_api), iface.module_path);
+
+    axmi_hasher_write_fp128(mut_view(h_abi), iface.target_fingerprint);
+
+    let mut i: usize = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        axmi_hasher_write_fp128(mut_view(h_api), s.sig_fingerprint);
+        axmi_hasher_write_fp128(mut_view(h_abi), s.abi_fingerprint);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.type_count as usize) {
+        let t = unsafe { *(iface.types + i) };
+        axmi_hasher_write_fp128(mut_view(h_api), t.layout_fingerprint);
+        axmi_hasher_write_fp128(mut_view(h_abi), t.layout_fingerprint);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.trait_count as usize) {
+        let tr = unsafe { *(iface.traits + i) };
+        axmi_hasher_write_fp128(mut_view(h_api), tr.impl_fingerprint);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.contract_count as usize) {
+        let c = unsafe { *(iface.contracts + i) };
+        axmi_hasher_write_fp128(mut_view(h_api), c.contract_fingerprint);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.const_count as usize) {
+        let cst = unsafe { *(iface.consts + i) };
+        axmi_hasher_write_fp128(mut_view(h_api), cst.const_fingerprint);
+        axmi_hasher_write_fp128(mut_view(h_bod), cst.const_fingerprint);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.mir_template_count as usize) {
+        let m = unsafe { *(iface.mir_templates + i) };
+        axmi_hasher_write_fp128(mut_view(h_bod), m.body_digest);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.dep_count as usize) {
+        let d = unsafe { *(iface.deps + i) };
+        axmi_hasher_write_u8(mut_view(h_api), d.dep_kind);
+        axmi_hasher_write_sv(mut_view(h_api), d.module_path);
+        axmi_hasher_write_fp128(mut_view(h_api), d.interface_fingerprint);
+        axmi_hasher_write_fp128(mut_view(h_abi), d.abi_fingerprint);
+        i = i + 1;
+    }
+
+    iface.interface_fingerprint = axmi_hasher_finish(view(h_api));
+    iface.abi_fingerprint = axmi_hasher_finish(view(h_abi));
+    iface.body_fingerprint = axmi_hasher_finish(view(h_bod));
+}
+
+// ============================================================================
+// 6. Deterministic `.axmi` Binary Serializer (`axmi_serialize`)
+// ============================================================================
+
+fn axmi_write_semantic_key_ids(iface: mut_view<AxmiModuleInterface>, out: mut_view<AxmiBuffer>, sk: view<SemanticKey>) {
+    let pkg_id = axmi_get_or_add_string_id(mut_view(*iface), sk.package_name);
+    let mod_id = axmi_get_or_add_string_id(mut_view(*iface), sk.module_path);
+    let name_id = axmi_get_or_add_string_id(mut_view(*iface), sk.canonical_name);
+    let targs_id = axmi_get_or_add_string_id(mut_view(*iface), sk.canonical_type_args);
+    axmi_buf_push_u32_le(mut_view(*out), pkg_id);
+    axmi_buf_push_u32_le(mut_view(*out), mod_id);
+    axmi_buf_push_u8(mut_view(*out), sk.item_namespace);
+    axmi_buf_push_u8(mut_view(*out), AXMI_SCOPE_PACKAGE_LOCAL);
+    axmi_buf_push_u16_le(mut_view(*out), 0u16);
+    axmi_buf_push_u32_le(mut_view(*out), sk.disambiguator_index);
+    axmi_buf_push_u32_le(mut_view(*out), name_id);
+    axmi_buf_push_u32_le(mut_view(*out), targs_id);
+}
+
+fn axmi_read_semantic_key_ids(
+    iface: mut_view<AxmiModuleInterface>,
+    ptr: *const u8,
+    offset: usize
+) -> SemanticKey {
+    let pkg_id = axmi_read_u32_le(ptr, offset);
+    let mod_id = axmi_read_u32_le(ptr, offset + 4);
+    let item_ns = axmi_read_u8(ptr, offset + 8);
+    let disamb = axmi_read_u32_le(ptr, offset + 12);
+    let name_id = axmi_read_u32_le(ptr, offset + 16);
+    let targs_id = axmi_read_u32_le(ptr, offset + 20);
+    SemanticKey {
+        package_name: axmi_string_by_id(view(*iface), pkg_id),
+        module_path: axmi_string_by_id(view(*iface), mod_id),
+        item_namespace: item_ns,
+        disambiguator_index: disamb,
+        canonical_name: axmi_string_by_id(view(*iface), name_id),
+        canonical_type_args: axmi_string_by_id(view(*iface), targs_id),
+    }
+}
+
+fn axmi_compute_section_checksum(ptr: *const u8, offset: usize, size: usize) -> Fingerprint128 {
+    let mut h = axmi_hasher_new(1u8);
+    axmi_hasher_write_bytes(mut_view(h), unsafe { ptr + offset }, size);
+    axmi_hasher_finish(view(h))
+}
+
+fn axmi_compute_artifact_content_hash(ptr: *const u8, total_len: usize) -> Fingerprint128 {
+    let mut h = axmi_hasher_new(0u8);
+    // Hash header[0..48] + section table & payload [64..total_len]
+    axmi_hasher_write_bytes(mut_view(h), ptr, 48);
+    if total_len > AXMI_HEADER_SIZE {
+        axmi_hasher_write_bytes(mut_view(h), unsafe { ptr + AXMI_HEADER_SIZE }, total_len - AXMI_HEADER_SIZE);
+    }
+    axmi_hasher_finish(view(h))
+}
+
+// Pre-registers all strings in canonical order so `AXMI_SEC_STRINGS` (section_type = 1)
+// can be emitted first in ascending `section_type` order.
+fn axmi_collect_canonical_strings(iface: mut_view<AxmiModuleInterface>) {
+    iface.string_count = 0u32;
+    let _ = axmi_get_or_add_string_id(mut_view(*iface), iface.package_name);
+    let _ = axmi_get_or_add_string_id(mut_view(*iface), iface.module_path);
+    let _ = axmi_get_or_add_string_id(mut_view(*iface), iface.target_triple);
+    let _ = axmi_get_or_add_string_id(mut_view(*iface), iface.abi_profile);
+
+    let mut i: usize = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), s.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), s.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), s.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), s.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.type_count as usize) {
+        let t = unsafe { *(iface.types + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), t.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), t.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), t.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), t.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.trait_count as usize) {
+        let tr = unsafe { *(iface.traits + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), tr.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), tr.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), tr.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), tr.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.contract_count as usize) {
+        let c = unsafe { *(iface.contracts + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), c.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), c.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), c.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), c.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.const_count as usize) {
+        let cst = unsafe { *(iface.consts + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), cst.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), cst.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), cst.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), cst.semantic_key.canonical_type_args);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), cst.str_val);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.mir_template_count as usize) {
+        let m = unsafe { *(iface.mir_templates + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), m.semantic_key.package_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), m.semantic_key.module_path);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), m.semantic_key.canonical_name);
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), m.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (iface.dep_count as usize) {
+        let d = unsafe { *(iface.deps + i) };
+        let _ = axmi_get_or_add_string_id(mut_view(*iface), d.module_path);
+        i = i + 1;
+    }
+}
+
+pub fn axmi_serialize(iface: mut_view<AxmiModuleInterface>, out: mut_view<AxmiBuffer>) -> ArtifactId {
+    out.len = 0;
+    axmi_recompute_fingerprints(mut_view(*iface));
+    axmi_collect_canonical_strings(mut_view(*iface));
+
+    // Standard 8 sections + any custom sections, sorted by ascending (section_type, id)
+    let base_sec_count: u32 = 8u32;
+    let total_sec_count: u32 = base_sec_count + iface.custom_section_count;
+    iface.section_count = total_sec_count;
+
+    // Build section type/flags list and sort by (section_type, id)
+    let mut sec_ids: [16]u32 = [0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32];
+    let mut sec_types: [16]u16 = [0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16];
+    let mut sec_flags: [16]u16 = [0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16];
+    let mut sec_custom_idx: [16]usize = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    sec_ids[0] = 0u32; sec_types[0] = AXMI_SEC_STRINGS; sec_flags[0] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[1] = 1u32; sec_types[1] = AXMI_SEC_SYMBOLS; sec_flags[1] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[2] = 2u32; sec_types[2] = AXMI_SEC_TYPES; sec_flags[2] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[3] = 3u32; sec_types[3] = AXMI_SEC_TRAITS; sec_flags[3] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[4] = 4u32; sec_types[4] = AXMI_SEC_TYPES_LAYOUT; sec_flags[4] = AXMI_SEC_DEFAULT_FLAGS | AXMI_SEC_FLAG_TARGET_SPECIFIC;
+    sec_ids[5] = 5u32; sec_types[5] = AXMI_SEC_CONST_VALUES; sec_flags[5] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[6] = 6u32; sec_types[6] = AXMI_SEC_GENERIC_MIR; sec_flags[6] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[7] = 7u32; sec_types[7] = AXMI_SEC_EFFECTS_CAPS; sec_flags[7] = AXMI_SEC_DEFAULT_FLAGS;
+
+    let mut ci: usize = 0;
+    while ci < (iface.custom_section_count as usize) {
+        let cs = unsafe { *(iface.custom_sections + ci) };
+        let pos = 8 + ci;
+        sec_ids[pos] = cs.id;
+        sec_types[pos] = cs.section_type;
+        sec_flags[pos] = cs.flags;
+        sec_custom_idx[pos] = ci;
+        ci = ci + 1;
+    }
+
+    // Sort section list by ascending (section_type, id)
+    let mut sa: usize = 1;
+    while sa < (total_sec_count as usize) {
+        let cur_id = sec_ids[sa];
+        let cur_ty = sec_types[sa];
+        let cur_fl = sec_flags[sa];
+        let cur_ci = sec_custom_idx[sa];
+        let mut sb: usize = sa;
+        while sb > 0 {
+            let prev_ty = sec_types[sb - 1];
+            let prev_id = sec_ids[sb - 1];
+            if prev_ty < cur_ty || (prev_ty == cur_ty && prev_id <= cur_id) {
+                break;
+            }
+            sec_ids[sb] = prev_id;
+            sec_types[sb] = prev_ty;
+            sec_flags[sb] = sec_flags[sb - 1];
+            sec_custom_idx[sb] = sec_custom_idx[sb - 1];
+            sb = sb - 1;
+        }
+        sec_ids[sb] = cur_id;
+        sec_types[sb] = cur_ty;
+        sec_flags[sb] = cur_fl;
+        sec_custom_idx[sb] = cur_ci;
+        sa = sa + 1;
+    }
+
+    let payload_offset = AXMI_HEADER_SIZE + ((total_sec_count as usize) * AXMI_SECTION_DESC_SIZE);
+
+    // 1. Write 64-byte ArtifactHeader
+    let mut mi: usize = 0;
+    while mi < 8 {
+        axmi_buf_push_u8(mut_view(*out), AXMI_MAGIC[mi]);
+        mi = mi + 1;
+    }
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_FORMAT_FAMILY);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_FORMAT_VERSION);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_ARTIFACT_KIND);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_DEFAULT_FLAGS);
+    axmi_buf_push_u64_le(mut_view(*out), iface.target_fingerprint.lo);
+    axmi_buf_push_u64_le(mut_view(*out), iface.interface_fingerprint.lo);
+    axmi_buf_push_u32_le(mut_view(*out), total_sec_count);
+    axmi_buf_push_u32_le(mut_view(*out), AXMI_PRODUCER_VERSION);
+    axmi_buf_push_u32_le(mut_view(*out), payload_offset as u32);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32); // payload_size patched after sections
+    axmi_buf_push_fp128_le(mut_view(*out), fingerprint128_zero()); // content_hash patched at end
+
+    // 2. Reserve SectionTable (total_sec_count * 48 bytes)
+    let mut si: usize = 0;
+    while si < ((total_sec_count as usize) * AXMI_SECTION_DESC_SIZE) {
+        axmi_buf_push_u8(mut_view(*out), 0u8);
+        si = si + 1;
+    }
+
+    // 3. Emit each section payload aligned to 8 bytes and record its SectionDescriptor
+    let mut s_idx: usize = 0;
+    while s_idx < (total_sec_count as usize) {
+        axmi_buf_align_to(mut_view(*out), 8);
+        let sec_start = out.len;
+        let sty = sec_types[s_idx];
+
+        if sty == AXMI_SEC_STRINGS {
+            axmi_buf_push_u32_le(mut_view(*out), iface.string_count);
+            let mut k: usize = 0;
+            while k < (iface.string_count as usize) {
+                let sv = unsafe { *(iface.string_table + k) };
+                axmi_buf_push_u32_le(mut_view(*out), sv.len as u32);
+                axmi_buf_push_bytes(mut_view(*out), sv.ptr, sv.len);
+                k = k + 1;
+            }
+            // Module & target metadata block
+            let pkg_id = axmi_get_or_add_string_id(mut_view(*iface), iface.package_name);
+            let mod_id = axmi_get_or_add_string_id(mut_view(*iface), iface.module_path);
+            let trp_id = axmi_get_or_add_string_id(mut_view(*iface), iface.target_triple);
+            let abi_id = axmi_get_or_add_string_id(mut_view(*iface), iface.abi_profile);
+            axmi_buf_push_u32_le(mut_view(*out), pkg_id);
+            axmi_buf_push_u32_le(mut_view(*out), mod_id);
+            axmi_buf_push_u32_le(mut_view(*out), trp_id);
+            axmi_buf_push_u32_le(mut_view(*out), abi_id);
+            axmi_buf_push_u32_le(mut_view(*out), iface.pointer_width_bytes);
+            axmi_buf_push_u8(mut_view(*out), if iface.little_endian { 1u8 } else { 0u8 });
+            axmi_buf_push_u8(mut_view(*out), iface.panic_strategy);
+            axmi_buf_push_u16_le(mut_view(*out), 0u16);
+            axmi_buf_push_u32_le(mut_view(*out), iface.cpu_feature_mask);
+            axmi_buf_push_u32_le(mut_view(*out), iface.stripped_private_count);
+            axmi_buf_push_fp128_le(mut_view(*out), iface.target_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), iface.interface_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), iface.abi_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), iface.body_fingerprint);
+            axmi_buf_push_u32_le(mut_view(*out), iface.dep_count);
+            let mut di: usize = 0;
+            while di < (iface.dep_count as usize) {
+                let d = unsafe { *(iface.deps + di) };
+                let mp_id = axmi_get_or_add_string_id(mut_view(*iface), d.module_path);
+                axmi_buf_push_u8(mut_view(*out), d.dep_kind);
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axmi_buf_push_u32_le(mut_view(*out), mp_id);
+                axmi_buf_push_fp128_le(mut_view(*out), d.interface_fingerprint);
+                axmi_buf_push_fp128_le(mut_view(*out), d.abi_fingerprint);
+                di = di + 1;
+            }
+        } else if sty == AXMI_SEC_SYMBOLS {
+            axmi_buf_push_u32_le(mut_view(*out), iface.symbol_count);
+            let mut k: usize = 0;
+            while k < (iface.symbol_count as usize) {
+                let s = unsafe { *(iface.symbols + k) };
+                axmi_buf_push_u32_le(mut_view(*out), s.def_id.v);
+                axmi_buf_push_u8(mut_view(*out), s.item_kind);
+                let mut bflags: u8 = 0u8;
+                if s.is_pub { bflags = bflags | 1u8; }
+                if s.is_generic { bflags = bflags | 2u8; }
+                if s.is_inline { bflags = bflags | 4u8; }
+                if s.is_comptime { bflags = bflags | 8u8; }
+                axmi_buf_push_u8(mut_view(*out), bflags);
+                axmi_buf_push_u8(mut_view(*out), s.calling_conv);
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u32_le(mut_view(*out), s.param_count);
+                axmi_buf_push_u32_le(mut_view(*out), s.return_type_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), s.generic_param_count);
+                axmi_buf_push_fp128_le(mut_view(*out), s.sig_fingerprint);
+                axmi_buf_push_fp128_le(mut_view(*out), s.abi_fingerprint);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(s.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_TYPES {
+            axmi_buf_push_u32_le(mut_view(*out), iface.type_count);
+            let mut k: usize = 0;
+            while k < (iface.type_count as usize) {
+                let t = unsafe { *(iface.types + k) };
+                axmi_buf_push_u32_le(mut_view(*out), t.type_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), t.owner_def_id.v);
+                axmi_buf_push_u8(mut_view(*out), t.adt_kind);
+                axmi_buf_push_u8(mut_view(*out), t.repr_tag);
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(t.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_TRAITS {
+            axmi_buf_push_u32_le(mut_view(*out), iface.trait_count);
+            let mut k: usize = 0;
+            while k < (iface.trait_count as usize) {
+                let tr = unsafe { *(iface.traits + k) };
+                axmi_buf_push_u32_le(mut_view(*out), tr.goal_key.v);
+                axmi_buf_push_u32_le(mut_view(*out), tr.trait_def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), tr.self_type_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), tr.impl_def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), tr.assoc_item_count);
+                axmi_buf_push_u8(mut_view(*out), if tr.is_object_safe { 1u8 } else { 0u8 });
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axmi_buf_push_u32_le(mut_view(*out), tr.where_pred_count);
+                axmi_buf_push_fp128_le(mut_view(*out), tr.impl_fingerprint);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(tr.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_TYPES_LAYOUT {
+            axmi_buf_push_u32_le(mut_view(*out), iface.type_count);
+            let mut k: usize = 0;
+            while k < (iface.type_count as usize) {
+                let t = unsafe { *(iface.types + k) };
+                axmi_buf_push_u32_le(mut_view(*out), t.type_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), t.size_bytes);
+                axmi_buf_push_u32_le(mut_view(*out), t.align_bytes);
+                axmi_buf_push_u32_le(mut_view(*out), t.field_count);
+                let mut mflags: u8 = 0u8;
+                if t.is_copy { mflags = mflags | 1u8; }
+                if t.is_send { mflags = mflags | 2u8; }
+                if t.is_share { mflags = mflags | 4u8; }
+                axmi_buf_push_u8(mut_view(*out), mflags);
+                axmi_buf_push_u8(mut_view(*out), t.repr_tag);
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                let mut fi: usize = 0;
+                while fi < 8 {
+                    axmi_buf_push_u32_le(mut_view(*out), t.field_type_ids[fi]);
+                    fi = fi + 1;
+                }
+                axmi_buf_push_fp128_le(mut_view(*out), t.layout_fingerprint);
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_CONST_VALUES {
+            axmi_buf_push_u32_le(mut_view(*out), iface.const_count);
+            let mut k: usize = 0;
+            while k < (iface.const_count as usize) {
+                let cst = unsafe { *(iface.consts + k) };
+                let sv_id = axmi_get_or_add_string_id(mut_view(*iface), cst.str_val);
+                axmi_buf_push_u32_le(mut_view(*out), cst.const_key.v);
+                axmi_buf_push_u32_le(mut_view(*out), cst.def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), cst.type_id.v);
+                axmi_buf_push_u8(mut_view(*out), cst.const_kind);
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axmi_buf_push_u64_le(mut_view(*out), cst.int_val as u64);
+                axmi_buf_push_u64_le(mut_view(*out), cst.aux_u64);
+                axmi_buf_push_u32_le(mut_view(*out), sv_id);
+                axmi_buf_push_fp128_le(mut_view(*out), cst.const_fingerprint);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(cst.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_GENERIC_MIR {
+            axmi_buf_push_u32_le(mut_view(*out), iface.mir_template_count);
+            let mut k: usize = 0;
+            while k < (iface.mir_template_count as usize) {
+                let m = unsafe { *(iface.mir_templates + k) };
+                axmi_buf_push_u32_le(mut_view(*out), m.def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), m.mir_body_id.v);
+                axmi_buf_push_u16_le(mut_view(*out), m.mir_schema_version);
+                let mut mflags: u8 = 0u8;
+                if m.is_generic { mflags = mflags | 1u8; }
+                if m.is_inline { mflags = mflags | 2u8; }
+                if m.is_comptime { mflags = mflags | 4u8; }
+                if m.ownership_verified { mflags = mflags | 8u8; }
+                axmi_buf_push_u8(mut_view(*out), mflags);
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u32_le(mut_view(*out), m.type_param_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.param_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.block_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.local_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.inst_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.scale_const_dep.v);
+                axmi_buf_push_u32_le(mut_view(*out), m.trait_bound_def_id.v);
+                axmi_buf_push_fp128_le(mut_view(*out), m.body_digest);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(m.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_EFFECTS_CAPS {
+            axmi_buf_push_u32_le(mut_view(*out), iface.contract_count);
+            let mut k: usize = 0;
+            while k < (iface.contract_count as usize) {
+                let c = unsafe { *(iface.contracts + k) };
+                axmi_buf_push_u32_le(mut_view(*out), c.def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), c.param_count);
+                let mut pi: usize = 0;
+                while pi < 8 {
+                    axmi_buf_push_u8(mut_view(*out), c.param_modes[pi]);
+                    pi = pi + 1;
+                }
+                axmi_buf_push_u32_le(mut_view(*out), c.return_borrows_from_mask);
+                axmi_buf_push_u32_le(mut_view(*out), c.no_escape_mask);
+                axmi_buf_push_u32_le(mut_view(*out), c.effect_mask);
+                axmi_buf_push_u32_le(mut_view(*out), c.authority_cap_mask);
+                axmi_buf_push_u8(mut_view(*out), c.panic_contract);
+                axmi_buf_push_u8(mut_view(*out), if c.is_pure { 1u8 } else { 0u8 });
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axmi_buf_push_fp128_le(mut_view(*out), c.contract_fingerprint);
+                axmi_write_semantic_key_ids(mut_view(*iface), mut_view(*out), view(c.semantic_key));
+                k = k + 1;
+            }
+        } else {
+            let cs = unsafe { *(iface.custom_sections + sec_custom_idx[s_idx]) };
+            axmi_buf_push_u64_le(mut_view(*out), cs.payload_tag);
+        }
+
+        let sec_end = out.len;
+        let sec_size = sec_end - sec_start;
+        let sec_cksum = axmi_compute_section_checksum(out.ptr as *const u8, sec_start, sec_size);
+
+        let desc = SectionDescriptor {
+            id: sec_ids[s_idx],
+            section_type: sty,
+            flags: sec_flags[s_idx],
+            alignment: 8u32,
+            offset: sec_start as u64,
+            compressed_size: sec_size as u64,
+            uncompressed_size: sec_size as u64,
+            checksum: sec_cksum,
+        };
+        unsafe { *(iface.sections + s_idx) = desc; }
+
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off, desc.id);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 4, (desc.section_type as u32) | ((desc.flags as u32) << 16u32));
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 8, desc.alignment);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 12, sec_start as u32);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 16, desc.compressed_size);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 24, desc.uncompressed_size);
+        axmi_buf_patch_fp128_le(mut_view(*out), desc_off + 32, desc.checksum);
+
+        s_idx = s_idx + 1;
+    }
+
+    let total_payload_size = out.len - AXMI_HEADER_SIZE;
+    axmi_buf_patch_u32_le(mut_view(*out), 44, total_payload_size as u32);
+
+    let content_hash = axmi_compute_artifact_content_hash(out.ptr as *const u8, out.len);
+    axmi_buf_patch_fp128_le(mut_view(*out), 48, content_hash);
+
+    iface.header = ArtifactHeader {
+        magic: AXMI_MAGIC,
+        format_family: AXMI_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+        artifact_kind: AXMI_ARTIFACT_KIND,
+        flags: AXMI_DEFAULT_FLAGS,
+        target_fingerprint: iface.target_fingerprint,
+        interface_fingerprint: iface.interface_fingerprint,
+        section_count: total_sec_count,
+        producer_version: AXMI_PRODUCER_VERSION,
+        payload_offset: payload_offset as u64,
+        payload_size: total_payload_size as u64,
+        content_hash: content_hash,
+    };
+
+    ArtifactId {
+        content_hash: content_hash,
+        schema_id: AXMI_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+    }
+}
+
+// ============================================================================
+// 7. Fail-Closed `.axmi` Deserializer & Validator (`axmi_deserialize`)
+// ============================================================================
+
+pub fn axmi_target_expectation_any() -> AxmiTargetExpectation {
+    AxmiTargetExpectation {
+        enforce_target: false,
+        target_triple: qry_sv_empty(),
+        abi_profile: qry_sv_empty(),
+        pointer_width_bytes: 8u32,
+        little_endian: true,
+        required_cpu_features: 0u32,
+        panic_strategy: AXMI_PANIC_NO_PANIC,
+        target_fingerprint: fingerprint128_zero(),
+    }
+}
+
+pub fn axmi_target_expectation_new(
+    target_triple: StrView,
+    abi_profile: StrView,
+    pointer_width_bytes: u32,
+    little_endian: bool,
+    required_cpu_features: u32,
+    panic_strategy: u8
+) -> AxmiTargetExpectation {
+    let tfp = axmi_compute_target_fingerprint(
+        target_triple,
+        abi_profile,
+        pointer_width_bytes,
+        little_endian,
+        required_cpu_features,
+        panic_strategy
+    );
+    AxmiTargetExpectation {
+        enforce_target: true,
+        target_triple: target_triple,
+        abi_profile: abi_profile,
+        pointer_width_bytes: pointer_width_bytes,
+        little_endian: little_endian,
+        required_cpu_features: required_cpu_features,
+        panic_strategy: panic_strategy,
+        target_fingerprint: tfp,
+    }
+}
+
+fn axmi_fail_result(status: u32, canonical_code: u32, found_ver: u16, bad_sec: u16) -> AxmiDeserializeResult {
+    AxmiDeserializeResult {
+        status: status,
+        canonical_diag_code: canonical_code,
+        found_version: found_ver,
+        expected_version: AXMI_FORMAT_VERSION,
+        bad_section_type: bad_sec,
+        artifact_id: ArtifactId {
+            content_hash: fingerprint128_zero(),
+            schema_id: AXMI_FORMAT_FAMILY,
+            schema_version: found_ver,
+        },
+    }
+}
+
+fn axmi_is_known_section_type(sty: u16) -> bool {
+    sty == AXMI_SEC_STRINGS ||
+        sty == AXMI_SEC_SYMBOLS ||
+        sty == AXMI_SEC_TYPES ||
+        sty == AXMI_SEC_TRAITS ||
+        sty == AXMI_SEC_FUNCTIONS ||
+        sty == AXMI_SEC_TYPES_LAYOUT ||
+        sty == AXMI_SEC_CONST_VALUES ||
+        sty == AXMI_SEC_GENERIC_MIR ||
+        sty == AXMI_SEC_EFFECTS_CAPS ||
+        sty == AXMI_SEC_LTO_SUMMARY ||
+        sty == AXMI_SEC_DEPENDENCIES ||
+        sty == AXMI_SEC_PROVENANCE ||
+        sty == AXMI_SEC_AI_INDEX ||
+        sty == AXMI_SEC_DEBUG_MAP
+}
+
+pub fn axmi_deserialize(
+    bytes: *const u8,
+    total_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_iface: mut_view<AxmiModuleInterface>
+) -> AxmiDeserializeResult {
+    // 1. Validate minimum 64-byte header and non-null buffer
+    if (bytes as usize) == 0 || total_len < AXMI_HEADER_SIZE {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    // 2. Validate magic bytes ("AXMI0001")
+    let magic_u64 = axmi_read_u64_le(bytes, 0);
+    if magic_u64 != AXMI_MAGIC_U64 {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    let format_family = axmi_read_u16_le(bytes, 8);
+    let schema_version = axmi_read_u16_le(bytes, 10);
+    let artifact_kind = axmi_read_u16_le(bytes, 12);
+    let flags = axmi_read_u16_le(bytes, 14);
+
+    if format_family != AXMI_FORMAT_FAMILY || artifact_kind != AXMI_ARTIFACT_KIND {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+    if (flags & AXMI_FLAG_LITTLE_ENDIAN) == 0u16 {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+
+    // 3. Validate schema_version (AXS-ART-005)
+    if schema_version != AXMI_FORMAT_VERSION {
+        return axmi_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, schema_version, 0u16);
+    }
+
+    let hdr_target_lo = axmi_read_u64_le(bytes, 16);
+    let hdr_iface_lo = axmi_read_u64_le(bytes, 24);
+    let section_count = axmi_read_u32_le(bytes, 32);
+    let producer_version = axmi_read_u32_le(bytes, 36);
+    let payload_offset = axmi_read_u32_le(bytes, 40) as u64;
+    let payload_size = axmi_read_u32_le(bytes, 44) as u64;
+    let stored_content_hash = axmi_read_fp128_le(bytes, 48);
+
+    if section_count == 0u32 || (section_count as usize) > AXMI_MAX_SECTIONS {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+
+    let expected_payload_off = (AXMI_HEADER_SIZE as u64) + ((section_count as u64) * (AXMI_SECTION_DESC_SIZE as u64));
+    if payload_offset != expected_payload_off {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+    if !axmi_check_bounds(AXMI_HEADER_SIZE as u64, payload_size, total_len as u64) {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+    if ((AXMI_HEADER_SIZE as u64) + payload_size) != (total_len as u64) {
+        return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+
+    // 4. Verify top-level BLAKE3-128 content_hash BEFORE parsing any section (AXS-ART-002 sec.2)
+    let computed_content_hash = axmi_compute_artifact_content_hash(bytes, total_len);
+    if !fingerprint128_eq(stored_content_hash, computed_content_hash) {
+        return axmi_fail_result(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, schema_version, 0u16);
+    }
+
+    // Reset output tables
+    out_iface.section_count = section_count;
+    out_iface.string_count = 0u32;
+    out_iface.symbol_count = 0u32;
+    out_iface.type_count = 0u32;
+    out_iface.trait_count = 0u32;
+    out_iface.contract_count = 0u32;
+    out_iface.const_count = 0u32;
+    out_iface.mir_template_count = 0u32;
+    out_iface.dep_count = 0u32;
+    out_iface.custom_section_count = 0u32;
+
+    // 5. Validate all SectionDescriptor entries upfront (AXS-ART-004 sec.2)
+    let mut prev_sec_type: u16 = 0u16;
+    let mut prev_sec_id: u32 = 0u32;
+    let mut prev_end: u64 = payload_offset;
+    let mut s_idx: usize = 0;
+    while s_idx < (section_count as usize) {
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        let sid = axmi_read_u32_le(bytes, desc_off);
+        let sty = axmi_read_u16_le(bytes, desc_off + 4);
+        let sflags = axmi_read_u16_le(bytes, desc_off + 6);
+        let salign = axmi_read_u32_le(bytes, desc_off + 8);
+        let soff = axmi_read_u32_le(bytes, desc_off + 12) as u64;
+        let scomp = axmi_read_u64_le(bytes, desc_off + 16);
+        let suncomp = axmi_read_u64_le(bytes, desc_off + 24);
+        let scksum = axmi_read_fp128_le(bytes, desc_off + 32);
+
+        if !axmi_is_power_of_two_align(salign) {
+            return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+        }
+        if (soff % (salign as u64)) != 0u64 {
+            return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+        }
+        if scomp != suncomp || soff < prev_end {
+            return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+        }
+        if !axmi_check_bounds(soff, suncomp, total_len as u64) {
+            return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+        }
+        if s_idx > 0 {
+            if sty < prev_sec_type || (sty == prev_sec_type && sid < prev_sec_id) {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+        }
+        prev_sec_type = sty;
+        prev_sec_id = sid;
+        prev_end = soff + suncomp;
+
+        // Verify per-section checksum (AXS-ART-004)
+        let calc_sec_cksum = axmi_compute_section_checksum(bytes, soff as usize, suncomp as usize);
+        if !fingerprint128_eq(scksum, calc_sec_cksum) {
+            return axmi_fail_result(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+        }
+
+        // Unknown section policy (AXS-ART-005 sec.1): reject if not marked OPTIONAL
+        if !axmi_is_known_section_type(sty) {
+            if (sflags & AXMI_SEC_FLAG_OPTIONAL) == 0u16 {
+                return axmi_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, schema_version, sty);
+            }
+        }
+
+        unsafe {
+            *(out_iface.sections + s_idx) = SectionDescriptor {
+                id: sid,
+                section_type: sty,
+                flags: sflags,
+                alignment: salign,
+                offset: soff,
+                compressed_size: scomp,
+                uncompressed_size: suncomp,
+                checksum: scksum,
+            };
+        }
+        s_idx = s_idx + 1;
+    }
+
+    // 6. Parse sections in canonical ascending order (Strings first, then Symbols, Types, Traits, Layout, Consts, MIR, Contracts)
+    s_idx = 0;
+    while s_idx < (section_count as usize) {
+        let desc = unsafe { *(out_iface.sections + s_idx) };
+        let sty = desc.section_type;
+        let mut cur_off = desc.offset as usize;
+        let sec_limit = (desc.offset + desc.uncompressed_size) as usize;
+
+        if sty == AXMI_SEC_STRINGS {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let scount = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (scount as usize) > AXMI_MAX_STRINGS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < scount {
+                if cur_off + 4 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let slen = axmi_read_u32_le(bytes, cur_off) as usize;
+                cur_off = cur_off + 4;
+                if cur_off + slen > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let interned = axmi_intern_bytes(mut_view(*out_iface), unsafe { bytes + cur_off }, slen);
+                unsafe { *(out_iface.string_table + (k as usize)) = interned; }
+                out_iface.string_count = k + 1u32;
+                cur_off = cur_off + slen;
+                k = k + 1u32;
+            }
+
+            if cur_off + 96 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let pkg_id = axmi_read_u32_le(bytes, cur_off);
+            let mod_id = axmi_read_u32_le(bytes, cur_off + 4);
+            let trp_id = axmi_read_u32_le(bytes, cur_off + 8);
+            let abi_id = axmi_read_u32_le(bytes, cur_off + 12);
+            out_iface.package_name = axmi_string_by_id(view(*out_iface), pkg_id);
+            out_iface.module_path = axmi_string_by_id(view(*out_iface), mod_id);
+            out_iface.target_triple = axmi_string_by_id(view(*out_iface), trp_id);
+            out_iface.abi_profile = axmi_string_by_id(view(*out_iface), abi_id);
+            out_iface.pointer_width_bytes = axmi_read_u32_le(bytes, cur_off + 16);
+            out_iface.little_endian = axmi_read_u8(bytes, cur_off + 20) != 0u8;
+            out_iface.panic_strategy = axmi_read_u8(bytes, cur_off + 21);
+            out_iface.cpu_feature_mask = axmi_read_u32_le(bytes, cur_off + 24);
+            out_iface.stripped_private_count = axmi_read_u32_le(bytes, cur_off + 28);
+            out_iface.target_fingerprint = axmi_read_fp128_le(bytes, cur_off + 32);
+            out_iface.interface_fingerprint = axmi_read_fp128_le(bytes, cur_off + 48);
+            out_iface.abi_fingerprint = axmi_read_fp128_le(bytes, cur_off + 64);
+            out_iface.body_fingerprint = axmi_read_fp128_le(bytes, cur_off + 80);
+            cur_off = cur_off + 96;
+
+            if out_iface.target_fingerprint.lo != hdr_target_lo || out_iface.interface_fingerprint.lo != hdr_iface_lo {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+
+            // Target & ABI expectation check (AXS-ART-023 / AX_ART_TARGET_MISMATCH)
+            if expected_target.enforce_target {
+                let mut tgt_mismatch = false;
+                if !fingerprint128_eq(out_iface.target_fingerprint, expected_target.target_fingerprint) {
+                    tgt_mismatch = true;
+                }
+                if out_iface.pointer_width_bytes != expected_target.pointer_width_bytes ||
+                    out_iface.little_endian != expected_target.little_endian ||
+                    out_iface.panic_strategy != expected_target.panic_strategy {
+                    tgt_mismatch = true;
+                }
+                if (out_iface.cpu_feature_mask & (~expected_target.required_cpu_features)) != 0u32 {
+                    tgt_mismatch = true;
+                }
+                if tgt_mismatch {
+                    return axmi_fail_result(AX_ART_TARGET_MISMATCH, AX_LINK_ARTIFACT_TARGET_MISMATCH, schema_version, sty);
+                }
+            }
+
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let dcount = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (dcount as usize) > AXMI_MAX_DEPS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut di: u32 = 0u32;
+            while di < dcount {
+                if cur_off + 40 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let dkind = axmi_read_u8(bytes, cur_off);
+                let mp_id = axmi_read_u32_le(bytes, cur_off + 4);
+                let dfp_api = axmi_read_fp128_le(bytes, cur_off + 8);
+                let dfp_abi = axmi_read_fp128_le(bytes, cur_off + 24);
+                unsafe {
+                    *(out_iface.deps + (di as usize)) = AxmiDependencyEdge {
+                        dep_kind: dkind,
+                        module_path: axmi_string_by_id(view(*out_iface), mp_id),
+                        interface_fingerprint: dfp_api,
+                        abi_fingerprint: dfp_abi,
+                    };
+                }
+                out_iface.dep_count = di + 1u32;
+                cur_off = cur_off + 40;
+                di = di + 1u32;
+            }
+        } else if sty == AXMI_SEC_SYMBOLS {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let sym_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (sym_cnt as usize) > AXMI_MAX_SYMBOLS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < sym_cnt {
+                if cur_off + 76 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let def_v = axmi_read_u32_le(bytes, cur_off);
+                let ikind = axmi_read_u8(bytes, cur_off + 4);
+                let bflags = axmi_read_u8(bytes, cur_off + 5);
+                let cconv = axmi_read_u8(bytes, cur_off + 6);
+                let pcount = axmi_read_u32_le(bytes, cur_off + 8);
+                let ret_v = axmi_read_u32_le(bytes, cur_off + 12);
+                let gcount = axmi_read_u32_le(bytes, cur_off + 16);
+                let s_fp = axmi_read_fp128_le(bytes, cur_off + 20);
+                let a_fp = axmi_read_fp128_le(bytes, cur_off + 36);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 52);
+                unsafe {
+                    *(out_iface.symbols + (k as usize)) = AxmiExportedSymbol {
+                        def_id: DefId { v: def_v },
+                        item_kind: ikind,
+                        is_pub: (bflags & 1u8) != 0u8,
+                        is_generic: (bflags & 2u8) != 0u8,
+                        is_inline: (bflags & 4u8) != 0u8,
+                        is_comptime: (bflags & 8u8) != 0u8,
+                        param_count: pcount,
+                        return_type_id: TypeId { v: ret_v },
+                        generic_param_count: gcount,
+                        calling_conv: cconv,
+                        sig_fingerprint: s_fp,
+                        abi_fingerprint: a_fp,
+                        semantic_key: sk,
+                    };
+                }
+                out_iface.symbol_count = k + 1u32;
+                cur_off = cur_off + 76;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_TYPES {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let typ_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (typ_cnt as usize) > AXMI_MAX_TYPES {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < typ_cnt {
+                if cur_off + 36 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let tid_v = axmi_read_u32_le(bytes, cur_off);
+                let own_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let akind = axmi_read_u8(bytes, cur_off + 8);
+                let rtag = axmi_read_u8(bytes, cur_off + 9);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 12);
+                let tp = unsafe { out_iface.types + (k as usize) };
+                axmi_zero_bytes(tp as *mut u8, size_of<AxmiTypeDef>());
+                unsafe {
+                    (*tp).type_id = TypeId { v: tid_v };
+                    (*tp).owner_def_id = DefId { v: own_v };
+                    (*tp).adt_kind = akind;
+                    (*tp).repr_tag = rtag;
+                    (*tp).semantic_key = sk;
+                }
+                out_iface.type_count = k + 1u32;
+                cur_off = cur_off + 36;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_TRAITS {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let tr_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (tr_cnt as usize) > AXMI_MAX_TRAITS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < tr_cnt {
+                if cur_off + 68 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let g_v = axmi_read_u32_le(bytes, cur_off);
+                let tr_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let st_v = axmi_read_u32_le(bytes, cur_off + 8);
+                let im_v = axmi_read_u32_le(bytes, cur_off + 12);
+                let assoc_c = axmi_read_u32_le(bytes, cur_off + 16);
+                let obj_safe = axmi_read_u8(bytes, cur_off + 20) != 0u8;
+                let w_cnt = axmi_read_u32_le(bytes, cur_off + 24);
+                let im_fp = axmi_read_fp128_le(bytes, cur_off + 28);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 44);
+                unsafe {
+                    *(out_iface.traits + (k as usize)) = AxmiTraitImplEntry {
+                        goal_key: TraitGoalKey { v: g_v },
+                        trait_def_id: DefId { v: tr_v },
+                        self_type_id: TypeId { v: st_v },
+                        impl_def_id: DefId { v: im_v },
+                        assoc_item_count: assoc_c,
+                        is_object_safe: obj_safe,
+                        where_pred_count: w_cnt,
+                        impl_fingerprint: im_fp,
+                        semantic_key: sk,
+                    };
+                }
+                out_iface.trait_count = k + 1u32;
+                cur_off = cur_off + 68;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_TYPES_LAYOUT {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let lay_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if lay_cnt != out_iface.type_count {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < lay_cnt {
+                if cur_off + 68 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let tid_v = axmi_read_u32_le(bytes, cur_off);
+                let sz = axmi_read_u32_le(bytes, cur_off + 4);
+                let al = axmi_read_u32_le(bytes, cur_off + 8);
+                let fc = axmi_read_u32_le(bytes, cur_off + 12);
+                let mflags = axmi_read_u8(bytes, cur_off + 16);
+                let rtag = axmi_read_u8(bytes, cur_off + 17);
+                let tp = unsafe { out_iface.types + (k as usize) };
+                if (unsafe { (*tp).type_id.v }) != tid_v || fc > 8u32 || !axmi_is_power_of_two_align(al) {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                unsafe {
+                    (*tp).size_bytes = sz;
+                    (*tp).align_bytes = al;
+                    (*tp).field_count = fc;
+                    (*tp).repr_tag = rtag;
+                    (*tp).is_copy = (mflags & 1u8) != 0u8;
+                    (*tp).is_send = (mflags & 2u8) != 0u8;
+                    (*tp).is_share = (mflags & 4u8) != 0u8;
+                }
+                let mut fi: usize = 0;
+                while fi < 8 {
+                    let ftv = axmi_read_u32_le(bytes, cur_off + 20 + (fi * 4));
+                    unsafe { (*tp).field_type_ids[fi] = ftv; }
+                    fi = fi + 1;
+                }
+                let l_fp = axmi_read_fp128_le(bytes, cur_off + 52);
+                unsafe { (*tp).layout_fingerprint = l_fp; }
+                cur_off = cur_off + 68;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_CONST_VALUES {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let cst_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (cst_cnt as usize) > AXMI_MAX_CONSTS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < cst_cnt {
+                if cur_off + 76 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let ck_v = axmi_read_u32_le(bytes, cur_off);
+                let df_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let ty_v = axmi_read_u32_le(bytes, cur_off + 8);
+                let ckind = axmi_read_u8(bytes, cur_off + 12);
+                let ival = axmi_read_u64_le(bytes, cur_off + 16) as i64;
+                let aux = axmi_read_u64_le(bytes, cur_off + 24);
+                let sv_id = axmi_read_u32_le(bytes, cur_off + 32);
+                let c_fp = axmi_read_fp128_le(bytes, cur_off + 36);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 52);
+                unsafe {
+                    *(out_iface.consts + (k as usize)) = AxmiConstEntry {
+                        const_key: ConstEvalKey { v: ck_v },
+                        def_id: DefId { v: df_v },
+                        type_id: TypeId { v: ty_v },
+                        const_kind: ckind,
+                        int_val: ival,
+                        aux_u64: aux,
+                        str_val: axmi_string_by_id(view(*out_iface), sv_id),
+                        const_fingerprint: c_fp,
+                        semantic_key: sk,
+                    };
+                }
+                out_iface.const_count = k + 1u32;
+                cur_off = cur_off + 76;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_GENERIC_MIR {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mir_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (mir_cnt as usize) > AXMI_MAX_MIR_TEMPLATES {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < mir_cnt {
+                if cur_off + 80 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let df_v = axmi_read_u32_le(bytes, cur_off);
+                let mb_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let m_ver = axmi_read_u16_le(bytes, cur_off + 8);
+                let mflags = axmi_read_u8(bytes, cur_off + 10);
+                let tp_cnt = axmi_read_u32_le(bytes, cur_off + 12);
+                let p_cnt = axmi_read_u32_le(bytes, cur_off + 16);
+                let b_cnt = axmi_read_u32_le(bytes, cur_off + 20);
+                let l_cnt = axmi_read_u32_le(bytes, cur_off + 24);
+                let i_cnt = axmi_read_u32_le(bytes, cur_off + 28);
+                let sc_dep = axmi_read_u32_le(bytes, cur_off + 32);
+                let tb_def = axmi_read_u32_le(bytes, cur_off + 36);
+                let b_dig = axmi_read_fp128_le(bytes, cur_off + 40);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 56);
+
+                // AXS-ART-013 sec.2 (`REQ-LNK-469`): strict MIR schema version check
+                if m_ver != AXMI_MIR_SCHEMA_VERSION {
+                    return axmi_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, m_ver, sty);
+                }
+                let is_ver = (mflags & 8u8) != 0u8;
+                // INV-PIPE-002: deserialized MIR template must pass structural & ownership verification
+                if !is_ver || b_cnt == 0u32 || l_cnt == 0u32 {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                unsafe {
+                    *(out_iface.mir_templates + (k as usize)) = AxmiMirTemplate {
+                        def_id: DefId { v: df_v },
+                        mir_body_id: MirBodyId { v: mb_v },
+                        mir_schema_version: m_ver,
+                        is_generic: (mflags & 1u8) != 0u8,
+                        is_inline: (mflags & 2u8) != 0u8,
+                        is_comptime: (mflags & 4u8) != 0u8,
+                        type_param_count: tp_cnt,
+                        param_count: p_cnt,
+                        block_count: b_cnt,
+                        local_count: l_cnt,
+                        inst_count: i_cnt,
+                        ownership_verified: is_ver,
+                        scale_const_dep: ConstEvalKey { v: sc_dep },
+                        trait_bound_def_id: DefId { v: tb_def },
+                        body_digest: b_dig,
+                        semantic_key: sk,
+                    };
+                }
+                out_iface.mir_template_count = k + 1u32;
+                cur_off = cur_off + 80;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_EFFECTS_CAPS {
+            if cur_off + 4 > sec_limit {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let con_cnt = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (con_cnt as usize) > AXMI_MAX_CONTRACTS {
+                return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < con_cnt {
+                if cur_off + 76 > sec_limit {
+                    return axmi_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, schema_version, sty);
+                }
+                let df_v = axmi_read_u32_le(bytes, cur_off);
+                let p_cnt = axmi_read_u32_le(bytes, cur_off + 4);
+                let cp = unsafe { out_iface.contracts + (k as usize) };
+                axmi_zero_bytes(cp as *mut u8, size_of<AxmiFnContractSummary>());
+                let mut pi: usize = 0;
+                while pi < 8 {
+                    let pm = axmi_read_u8(bytes, cur_off + 8 + pi);
+                    unsafe { (*cp).param_modes[pi] = pm; }
+                    pi = pi + 1;
+                }
+                let ret_b = axmi_read_u32_le(bytes, cur_off + 16);
+                let no_esc = axmi_read_u32_le(bytes, cur_off + 20);
+                let eff_m = axmi_read_u32_le(bytes, cur_off + 24);
+                let cap_m = axmi_read_u32_le(bytes, cur_off + 28);
+                let p_con = axmi_read_u8(bytes, cur_off + 32);
+                let pure_b = axmi_read_u8(bytes, cur_off + 33) != 0u8;
+                let c_fp = axmi_read_fp128_le(bytes, cur_off + 36);
+                let sk = axmi_read_semantic_key_ids(mut_view(*out_iface), bytes, cur_off + 52);
+                unsafe {
+                    (*cp).def_id = DefId { v: df_v };
+                    (*cp).param_count = p_cnt;
+                    (*cp).return_borrows_from_mask = ret_b;
+                    (*cp).no_escape_mask = no_esc;
+                    (*cp).effect_mask = eff_m;
+                    (*cp).authority_cap_mask = cap_m;
+                    (*cp).panic_contract = p_con;
+                    (*cp).is_pure = pure_b;
+                    (*cp).contract_fingerprint = c_fp;
+                    (*cp).semantic_key = sk;
+                }
+                out_iface.contract_count = k + 1u32;
+                cur_off = cur_off + 76;
+                k = k + 1u32;
+            }
+        }
+        s_idx = s_idx + 1;
+    }
+
+    out_iface.header = ArtifactHeader {
+        magic: AXMI_MAGIC,
+        format_family: format_family,
+        schema_version: schema_version,
+        artifact_kind: artifact_kind,
+        flags: flags,
+        target_fingerprint: out_iface.target_fingerprint,
+        interface_fingerprint: out_iface.interface_fingerprint,
+        section_count: section_count,
+        producer_version: producer_version,
+        payload_offset: payload_offset,
+        payload_size: payload_size,
+        content_hash: stored_content_hash,
+    };
+
+    AxmiDeserializeResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: schema_version,
+        expected_version: AXMI_FORMAT_VERSION,
+        bad_section_type: 0u16,
+        artifact_id: ArtifactId {
+            content_hash: stored_content_hash,
+            schema_id: format_family,
+            schema_version: schema_version,
+        },
+    }
+}
+
+// ============================================================================
+// 8. Source-Free `CompilerDB` Ingestion (`axmi_populate_compiler_db`) & Lookup
+// ============================================================================
+
+fn axmi_mark_slot_ready(db: mut_view<CompilerDB>, qk: QueryKey, value_tag: u32, fp: Fingerprint128) {
+    let slot_idx = query_db_get_or_create_slot(mut_view(*db), qk);
+    let slot_ptr = unsafe { db.memo_slots + (slot_idx as usize) };
+    let rev = db.current_revision;
+    unsafe {
+        (*slot_ptr).state = QUERY_STATE_READY;
+        (*slot_ptr).was_poisoned = false;
+        (*slot_ptr).verified_at = rev;
+        (*slot_ptr).changed_at = rev;
+        (*slot_ptr).value_tag = value_tag;
+        (*slot_ptr).value_is_error = false;
+        (*slot_ptr).value_fingerprint = fp;
+    }
+}
+
+// Populates `CompilerDB` directly from a deserialized `.axmi` module interface
+// WITHOUT requiring or reading any upstream `.ax` source file (SPEC-24 AXS-ART-010 sec.2).
+pub fn axmi_populate_compiler_db(
+    db: mut_view<CompilerDB>,
+    iface: view<AxmiModuleInterface>,
+    module_id: ModuleId,
+    package_id: PackageId,
+    unit_key: UnitKey
+) -> bool {
+    if (module_id.v as usize) >= QRY_MAX_MODULES {
+        return false;
+    }
+
+    let _ = query_db_set_package_graph_input(mut_view(*db), package_id, iface.package_name, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_target_config_input(
+        mut_view(*db),
+        unit_key,
+        iface.target_triple,
+        iface.abi_profile,
+        iface.cpu_feature_mask,
+        2026u32,
+        2u8,
+        iface.pointer_width_bytes
+    );
+    // Register module tree input with `SourceFileId { v: 0 }` (source-free `.axmi` import)
+    let _ = query_db_set_module_tree_input(
+        mut_view(*db),
+        module_id,
+        package_id,
+        ModuleId { v: 0u32 },
+        iface.module_path,
+        SourceFileId { v: 0u32 },
+        DURABILITY_HIGH
+    );
+
+    // 1. Register exported symbols & pre-populate `item_signature(def)`
+    let mut i: usize = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        let _ = query_db_register_def(
+            mut_view(*db),
+            s.def_id,
+            module_id,
+            s.item_kind,
+            s.is_pub,
+            s.param_count,
+            s.return_type_id.v,
+            s.semantic_key
+        );
+        query_db_set_def_seeds(mut_view(*db), s.def_id, s.sig_fingerprint.lo, s.abi_fingerprint.lo, 0i64);
+
+        if (s.def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(db.sig_results + (s.def_id.v as usize)) = ItemSignatureResult {
+                    def_id: s.def_id,
+                    param_count: s.param_count,
+                    return_type: s.return_type_id,
+                    is_error: false,
+                    interface_fingerprint: s.sig_fingerprint,
+                };
+            }
+            let sig_qk = query_key_for_def(view(*db), QUERY_ITEM_SIGNATURE, s.def_id);
+            axmi_mark_slot_ready(mut_view(*db), sig_qk, s.return_type_id.v, s.sig_fingerprint);
+        }
+        i = i + 1;
+    }
+
+    // 2. Register type definitions & pre-populate `layout_of(type_id)`
+    i = 0;
+    while i < (iface.type_count as usize) {
+        let t = unsafe { *(iface.types + i) };
+        query_db_register_type_layout(
+            mut_view(*db),
+            t.type_id,
+            t.owner_def_id,
+            unit_key,
+            t.size_bytes,
+            t.align_bytes,
+            false,
+            t.semantic_key
+        );
+        let mut fi: u32 = 0u32;
+        while fi < t.field_count {
+            query_db_add_type_layout_field(mut_view(*db), t.type_id, TypeId { v: t.field_type_ids[fi as usize] });
+            fi = fi + 1u32;
+        }
+        if (t.type_id.v as usize) < QRY_MAX_TYPE_LAYOUTS {
+            unsafe {
+                *(db.layout_results + (t.type_id.v as usize)) = LayoutOfResult {
+                    type_id: t.type_id,
+                    size_bytes: t.size_bytes,
+                    align_bytes: t.align_bytes,
+                    field_count: t.field_count,
+                    is_poisoned: false,
+                    layout_fingerprint: t.layout_fingerprint,
+                };
+            }
+            let lay_qk = query_key_for_layout_of(view(*db), t.type_id);
+            axmi_mark_slot_ready(mut_view(*db), lay_qk, t.size_bytes, t.layout_fingerprint);
+        }
+        i = i + 1;
+    }
+
+    // 3. Register trait impls & pre-populate `trait_solve(goal_key)`
+    i = 0;
+    while i < (iface.trait_count as usize) {
+        let tr = unsafe { *(iface.traits + i) };
+        query_db_register_trait_goal(
+            mut_view(*db),
+            tr.goal_key,
+            tr.trait_def_id,
+            tr.self_type_id,
+            TraitGoalKey { v: 0u32 },
+            tr.semantic_key
+        );
+        if (tr.goal_key.v as usize) < QRY_MAX_TRAIT_GOALS {
+            unsafe {
+                *(db.trait_results + (tr.goal_key.v as usize)) = TraitSolveResult {
+                    goal_key: tr.goal_key,
+                    status: TRAIT_RESULT_IMPLEMENTED,
+                    impl_def_id: tr.impl_def_id,
+                    is_error: false,
+                    goal_fingerprint: tr.impl_fingerprint,
+                };
+            }
+            let tr_qk = query_key_for_trait_goal(view(*db), tr.goal_key);
+            axmi_mark_slot_ready(mut_view(*db), tr_qk, TRAIT_RESULT_IMPLEMENTED as u32, tr.impl_fingerprint);
+        }
+        i = i + 1;
+    }
+
+    // 4. Pre-populate function capability/effect summaries (`effect_summary(def_id)`)
+    i = 0;
+    while i < (iface.contract_count as usize) {
+        let c = unsafe { *(iface.contracts + i) };
+        if (c.def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(db.effect_results + (c.def_id.v as usize)) = EffectSummaryResult {
+                    def_id: c.def_id,
+                    effect_mask: c.effect_mask,
+                    is_pure: c.is_pure,
+                    is_error: false,
+                    effect_fingerprint: c.contract_fingerprint,
+                };
+            }
+            let eff_qk = query_key_for_def(view(*db), QUERY_EFFECT_SUMMARY, c.def_id);
+            axmi_mark_slot_ready(mut_view(*db), eff_qk, if c.is_pure { 1u32 } else { 0u32 }, c.contract_fingerprint);
+        }
+        i = i + 1;
+    }
+
+    // 5. Pre-populate evaluated `const` values (`const_eval(const_key)`)
+    i = 0;
+    while i < (iface.const_count as usize) {
+        let cst = unsafe { *(iface.consts + i) };
+        query_db_set_def_seeds(mut_view(*db), cst.def_id, cst.const_fingerprint.lo, cst.const_fingerprint.hi, cst.int_val);
+        if (cst.const_key.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(db.const_results + (cst.const_key.v as usize)) = ConstEvalResult {
+                    const_key: cst.const_key,
+                    int_val: cst.int_val,
+                    is_poisoned: false,
+                    const_fingerprint: cst.const_fingerprint,
+                };
+            }
+            let ce_qk = query_key_for_const_eval(view(*db), cst.const_key);
+            axmi_mark_slot_ready(mut_view(*db), ce_qk, cst.int_val as u32, cst.const_fingerprint);
+        }
+        i = i + 1;
+    }
+
+    // 6. Pre-populate verified generic / `@inline` / `comptime` MIR templates (`mir_body(def_id)`)
+    i = 0;
+    while i < (iface.mir_template_count as usize) {
+        let m = unsafe { *(iface.mir_templates + i) };
+        if (m.def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(db.mir_results + (m.def_id.v as usize)) = MirBodyResult {
+                    def_id: m.def_id,
+                    mir_body_id: m.mir_body_id,
+                    block_count: m.block_count,
+                    local_count: m.local_count,
+                    ownership_verified: m.ownership_verified,
+                    is_error: false,
+                    mir_fingerprint: m.body_digest,
+                };
+            }
+            let mir_qk = query_key_for_def(view(*db), QUERY_MIR_BODY, m.def_id);
+            axmi_mark_slot_ready(mut_view(*db), mir_qk, m.block_count, m.body_digest);
+        }
+        i = i + 1;
+    }
+
+    // 7. Pre-populate `parse_module`, `module_def_map`, and `resolve_module` as Ready
+    unsafe {
+        *(db.parse_results + (module_id.v as usize)) = ParseModuleResult {
+            module_id: module_id,
+            item_count: iface.symbol_count,
+            token_count: 0u32,
+            has_parse_error: false,
+            ast_fingerprint: iface.interface_fingerprint,
+        };
+        *(db.def_map_results + (module_id.v as usize)) = ModuleDefMapResult {
+            module_id: module_id,
+            exported_count: iface.symbol_count,
+            total_defs: iface.symbol_count,
+            is_error: false,
+            def_map_fingerprint: iface.interface_fingerprint,
+        };
+        *(db.resolve_results + (module_id.v as usize)) = ResolveModuleResult {
+            module_id: module_id,
+            resolved_bindings: iface.symbol_count,
+            has_resolve_error: false,
+            resolve_fingerprint: iface.interface_fingerprint,
+        };
+    }
+
+    let pm_qk = query_key_for_module(view(*db), QUERY_PARSE_MODULE, module_id);
+    let dm_qk = query_key_for_module(view(*db), QUERY_MODULE_DEF_MAP, module_id);
+    let rm_qk = query_key_for_module(view(*db), QUERY_RESOLVE_MODULE, module_id);
+    axmi_mark_slot_ready(mut_view(*db), pm_qk, iface.symbol_count, iface.interface_fingerprint);
+    axmi_mark_slot_ready(mut_view(*db), dm_qk, iface.symbol_count, iface.interface_fingerprint);
+    axmi_mark_slot_ready(mut_view(*db), rm_qk, iface.symbol_count, iface.interface_fingerprint);
+
+    true
+}
+
+pub fn axmi_find_symbol_by_name(iface: view<AxmiModuleInterface>, name: StrView) -> AxmiExportedSymbol {
+    let mut i: usize = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        if qry_sv_eq(s.semantic_key.canonical_name, name) {
+            return s;
+        }
+        i = i + 1;
+    }
+    unsafe { *iface.symbols }
+}
+
+pub fn axmi_has_symbol_named(iface: view<AxmiModuleInterface>, name: StrView) -> bool {
+    let mut i: usize = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        if qry_sv_eq(s.semantic_key.canonical_name, name) {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn axmi_find_type_by_name(iface: view<AxmiModuleInterface>, name: StrView) -> AxmiTypeDef {
+    let mut i: usize = 0;
+    while i < (iface.type_count as usize) {
+        let t = unsafe { *(iface.types + i) };
+        if qry_sv_eq(t.semantic_key.canonical_name, name) {
+            return t;
+        }
+        i = i + 1;
+    }
+    unsafe { *iface.types }
+}
+
+pub fn axmi_find_const_by_name(iface: view<AxmiModuleInterface>, name: StrView) -> AxmiConstEntry {
+    let mut i: usize = 0;
+    while i < (iface.const_count as usize) {
+        let c = unsafe { *(iface.consts + i) };
+        if qry_sv_eq(c.semantic_key.canonical_name, name) {
+            return c;
+        }
+        i = i + 1;
+    }
+    unsafe { *iface.consts }
+}
+
+pub fn axmi_find_contract_by_def(iface: view<AxmiModuleInterface>, def_id: DefId) -> AxmiFnContractSummary {
+    let mut i: usize = 0;
+    while i < (iface.contract_count as usize) {
+        let c = unsafe { *(iface.contracts + i) };
+        if c.def_id.v == def_id.v {
+            return c;
+        }
+        i = i + 1;
+    }
+    unsafe { *iface.contracts }
+}
+
+pub fn axmi_find_mir_template_by_name(iface: view<AxmiModuleInterface>, name: StrView) -> AxmiMirTemplate {
+    let mut i: usize = 0;
+    while i < (iface.mir_template_count as usize) {
+        let m = unsafe { *(iface.mir_templates + i) };
+        if qry_sv_eq(m.semantic_key.canonical_name, name) {
+            return m;
+        }
+        i = i + 1;
+    }
+    unsafe { *iface.mir_templates }
+}
+
+// Monomorphizes a verified generic MIR template from `.axmi` for a concrete argument type
+// in the downstream `CompilerDB`, checking trait coherence and cross-module `const` dependencies.
+pub fn axmi_instantiate_generic_mir(
+    db: mut_view<CompilerDB>,
+    iface: view<AxmiModuleInterface>,
+    template_name: StrView,
+    concrete_type_id: TypeId,
+    concrete_type_arg_name: StrView,
+    target_module_id: ModuleId,
+    inst_def_id: DefId
+) -> MirBodyResult {
+    let tmpl = axmi_find_mir_template_by_name(iface, template_name);
+    if !tmpl.ownership_verified || tmpl.mir_schema_version != AXMI_MIR_SCHEMA_VERSION {
+        return MirBodyResult {
+            def_id: inst_def_id,
+            mir_body_id: MirBodyId { v: QRY_ID_ERROR },
+            block_count: 0u32,
+            local_count: 0u32,
+            ownership_verified: false,
+            is_error: true,
+            mir_fingerprint: fingerprint128_zero(),
+        };
+    }
+
+    // Verify required trait bound (`impl Trait for ConcreteType`) exists in `.axmi`
+    if tmpl.trait_bound_def_id.v != 0u32 {
+        let mut bound_satisfied = false;
+        let mut ti: usize = 0;
+        while ti < (iface.trait_count as usize) {
+            let tr = unsafe { *(iface.traits + ti) };
+            if tr.trait_def_id.v == tmpl.trait_bound_def_id.v && tr.self_type_id.v == concrete_type_id.v {
+                bound_satisfied = true;
+            }
+            ti = ti + 1;
+        }
+        if !bound_satisfied {
+            return MirBodyResult {
+                def_id: inst_def_id,
+                mir_body_id: MirBodyId { v: QRY_ID_ERROR },
+                block_count: 0u32,
+                local_count: 0u32,
+                ownership_verified: false,
+                is_error: true,
+                mir_fingerprint: fingerprint128_zero(),
+            };
+        }
+    }
+
+    let inst_sk = semantic_key_new(
+        tmpl.semantic_key.package_name,
+        tmpl.semantic_key.module_path,
+        ITEM_NS_VALUE,
+        0u32,
+        tmpl.semantic_key.canonical_name,
+        concrete_type_arg_name
+    );
+    let _ = query_db_register_def(
+        mut_view(*db),
+        inst_def_id,
+        target_module_id,
+        ITEM_KIND_FN,
+        true,
+        tmpl.param_count,
+        concrete_type_id.v,
+        inst_sk
+    );
+
+    let mut h_inst = axmi_hasher_new(5u8);
+    axmi_hasher_write_fp128(mut_view(h_inst), tmpl.body_digest);
+    axmi_hasher_write_u32(mut_view(h_inst), concrete_type_id.v);
+    axmi_hasher_write_sv(mut_view(h_inst), concrete_type_arg_name);
+    let inst_fp = axmi_hasher_finish(view(h_inst));
+
+    let res = MirBodyResult {
+        def_id: inst_def_id,
+        mir_body_id: MirBodyId { v: inst_def_id.v },
+        block_count: tmpl.block_count,
+        local_count: tmpl.local_count,
+        ownership_verified: true,
+        is_error: false,
+        mir_fingerprint: inst_fp,
+    };
+    if (inst_def_id.v as usize) < QRY_MAX_DEFS {
+        unsafe { *(db.mir_results + (inst_def_id.v as usize)) = res; }
+        let mir_qk = query_key_for_def(view(*db), QUERY_MIR_BODY, inst_def_id);
+        axmi_mark_slot_ready(mut_view(*db), mir_qk, tmpl.block_count, inst_fp);
+    }
+    res
+}
+
+// ============================================================================
+// 9. Freshness Classification & Structured Interface Diff (AXS-ART-014)
+// ============================================================================
+
+pub fn axmi_check_freshness(
+    loaded: view<AxmiModuleInterface>,
+    expected_target: view<AxmiTargetExpectation>,
+    current_upstream_interface_fp: Fingerprint128,
+    current_upstream_abi_fp: Fingerprint128
+) -> u8 {
+    if loaded.header.schema_version != AXMI_FORMAT_VERSION {
+        return AXMI_FRESHNESS_INVALID;
+    }
+    if expected_target.enforce_target && !fingerprint128_eq(loaded.target_fingerprint, expected_target.target_fingerprint) {
+        return AXMI_FRESHNESS_INVALID;
+    }
+    if current_upstream_interface_fp.lo == 0u64 && current_upstream_interface_fp.hi == 0u64 {
+        return AXMI_FRESHNESS_UNKNOWN;
+    }
+    if fingerprint128_eq(loaded.interface_fingerprint, current_upstream_interface_fp) &&
+        fingerprint128_eq(loaded.abi_fingerprint, current_upstream_abi_fp) {
+        return AXMI_FRESHNESS_FRESH;
+    }
+    AXMI_FRESHNESS_STALE
+}
+
+pub fn axmi_diff_interfaces(old_iface: view<AxmiModuleInterface>, new_iface: view<AxmiModuleInterface>) -> AxmiInterfaceDiff {
+    let api_changed = !fingerprint128_eq(old_iface.interface_fingerprint, new_iface.interface_fingerprint);
+    let abi_changed = !fingerprint128_eq(old_iface.abi_fingerprint, new_iface.abi_fingerprint);
+
+    let mut layout_changed = old_iface.type_count != new_iface.type_count;
+    let mut i: usize = 0;
+    while !layout_changed && i < (old_iface.type_count as usize) {
+        let ta = unsafe { *(old_iface.types + i) };
+        let tb = unsafe { *(new_iface.types + i) };
+        if !fingerprint128_eq(ta.layout_fingerprint, tb.layout_fingerprint) {
+            layout_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let mut trait_changed = old_iface.trait_count != new_iface.trait_count;
+    i = 0;
+    while !trait_changed && i < (old_iface.trait_count as usize) {
+        let tra = unsafe { *(old_iface.traits + i) };
+        let trb = unsafe { *(new_iface.traits + i) };
+        if !fingerprint128_eq(tra.impl_fingerprint, trb.impl_fingerprint) {
+            trait_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let mut effect_changed = old_iface.contract_count != new_iface.contract_count;
+    i = 0;
+    while !effect_changed && i < (old_iface.contract_count as usize) {
+        let ca = unsafe { *(old_iface.contracts + i) };
+        let cb = unsafe { *(new_iface.contracts + i) };
+        if !fingerprint128_eq(ca.contract_fingerprint, cb.contract_fingerprint) {
+            effect_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let mut const_changed = old_iface.const_count != new_iface.const_count;
+    i = 0;
+    while !const_changed && i < (old_iface.const_count as usize) {
+        let ka = unsafe { *(old_iface.consts + i) };
+        let kb = unsafe { *(new_iface.consts + i) };
+        if !fingerprint128_eq(ka.const_fingerprint, kb.const_fingerprint) {
+            const_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let mut mir_changed = old_iface.mir_template_count != new_iface.mir_template_count;
+    i = 0;
+    while !mir_changed && i < (old_iface.mir_template_count as usize) {
+        let ma = unsafe { *(old_iface.mir_templates + i) };
+        let mb = unsafe { *(new_iface.mir_templates + i) };
+        if !fingerprint128_eq(ma.body_digest, mb.body_digest) {
+            mir_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let mut dep_changed = old_iface.dep_count != new_iface.dep_count;
+    i = 0;
+    while !dep_changed && i < (old_iface.dep_count as usize) {
+        let da = unsafe { *(old_iface.deps + i) };
+        let db_e = unsafe { *(new_iface.deps + i) };
+        if !fingerprint128_eq(da.interface_fingerprint, db_e.interface_fingerprint) ||
+            !fingerprint128_eq(da.abi_fingerprint, db_e.abi_fingerprint) {
+            dep_changed = true;
+        }
+        i = i + 1;
+    }
+
+    let freshness = if !api_changed && !abi_changed && !layout_changed && !trait_changed && !effect_changed && !const_changed && !mir_changed {
+        AXMI_FRESHNESS_FRESH
+    } else {
+        AXMI_FRESHNESS_STALE
+    };
+
+    AxmiInterfaceDiff {
+        api_changed: api_changed,
+        abi_changed: abi_changed,
+        layout_changed: layout_changed,
+        trait_changed: trait_changed,
+        effect_changed: effect_changed,
+        const_changed: const_changed,
+        mir_template_changed: mir_changed,
+        dependency_changed: dep_changed,
+        freshness: freshness,
+    }
+}
+
+// ============================================================================
+// 10. Deterministic `inspect --axmi` / `--emit=axmi` Formatter (AXS-ART-050)
+// ============================================================================
+
+fn axmi_push_ascii_slice(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), AXMI_ASCII_TABLE[start + i]);
+        i = i + 1;
+    }
+}
+
+pub fn axmi_push_hex_u64(out: mut_view<DiagBuffer>, v: u64) {
+    let mut shift: u32 = 60u32;
+    let mut i: usize = 0;
+    while i < 16 {
+        let nib = ((v >> shift) & 0xFu64) as usize;
+        diag_buf_push_byte(mut_view(*out), AXMI_ASCII_TABLE[92 + nib]);
+        if shift >= 4u32 {
+            shift = shift - 4u32;
+        }
+        i = i + 1;
+    }
+}
+
+pub fn axmi_push_fp128_hex(out: mut_view<DiagBuffer>, fp: Fingerprint128) {
+    axmi_push_hex_u64(mut_view(*out), fp.hi);
+    axmi_push_hex_u64(mut_view(*out), fp.lo);
+}
+
+pub fn axmi_push_bool(out: mut_view<DiagBuffer>, b: bool) {
+    if b {
+        axmi_push_ascii_slice(out, 306, 4); // "true"
+    } else {
+        axmi_push_ascii_slice(out, 310, 5); // "false"
+    }
+}
+
+pub fn axmi_push_i64(out: mut_view<DiagBuffer>, v: i64) {
+    if v < 0i64 {
+        diag_buf_push_byte(mut_view(*out), 45u8); // '-'
+        let mag = (0i64 - v) as u32;
+        diag_buf_push_u32(mut_view(*out), mag);
+    } else {
+        diag_buf_push_u32(mut_view(*out), v as u32);
+    }
+}
+
+pub fn axmi_push_section_type_name(out: mut_view<DiagBuffer>, sty: u16) {
+    if sty == AXMI_SEC_STRINGS { axmi_push_ascii_slice(out, 108, 7); return; }
+    if sty == AXMI_SEC_SYMBOLS { axmi_push_ascii_slice(out, 115, 7); return; }
+    if sty == AXMI_SEC_TYPES { axmi_push_ascii_slice(out, 122, 5); return; }
+    if sty == AXMI_SEC_TRAITS { axmi_push_ascii_slice(out, 127, 6); return; }
+    if sty == AXMI_SEC_FUNCTIONS { axmi_push_ascii_slice(out, 133, 9); return; }
+    if sty == AXMI_SEC_TYPES_LAYOUT { axmi_push_ascii_slice(out, 142, 11); return; }
+    if sty == AXMI_SEC_CONST_VALUES { axmi_push_ascii_slice(out, 153, 11); return; }
+    if sty == AXMI_SEC_GENERIC_MIR { axmi_push_ascii_slice(out, 164, 10); return; }
+    if sty == AXMI_SEC_EFFECTS_CAPS { axmi_push_ascii_slice(out, 174, 19); return; }
+    if sty == AXMI_SEC_LTO_SUMMARY { axmi_push_ascii_slice(out, 193, 10); return; }
+    if sty == AXMI_SEC_DEPENDENCIES { axmi_push_ascii_slice(out, 203, 12); return; }
+    if sty == AXMI_SEC_PROVENANCE { axmi_push_ascii_slice(out, 215, 10); return; }
+    if sty == AXMI_SEC_AI_INDEX { axmi_push_ascii_slice(out, 225, 7); return; }
+    if sty == AXMI_SEC_DEBUG_MAP { axmi_push_ascii_slice(out, 232, 8); return; }
+    axmi_push_ascii_slice(out, 514, 7); // "Unknown"
+}
+
+pub fn axmi_push_item_kind_name(out: mut_view<DiagBuffer>, ik: u8) {
+    if ik == ITEM_KIND_FN { axmi_push_ascii_slice(out, 240, 2); return; }
+    if ik == ITEM_KIND_STRUCT { axmi_push_ascii_slice(out, 242, 6); return; }
+    if ik == ITEM_KIND_TYPE_ALIAS { axmi_push_ascii_slice(out, 248, 4); return; }
+    if ik == ITEM_KIND_CONST { axmi_push_ascii_slice(out, 252, 5); return; }
+    if ik == ITEM_KIND_TRAIT { axmi_push_ascii_slice(out, 257, 5); return; }
+    if ik == ITEM_KIND_IMPL { axmi_push_ascii_slice(out, 262, 4); return; }
+    axmi_push_ascii_slice(out, 240, 2);
+}
+
+pub fn axmi_push_adt_kind_name(out: mut_view<DiagBuffer>, ak: u8) {
+    if ak == AXMI_ADT_STRUCT { axmi_push_ascii_slice(out, 242, 6); return; }
+    if ak == AXMI_ADT_ENUM { axmi_push_ascii_slice(out, 266, 4); return; }
+    if ak == AXMI_ADT_UNION { axmi_push_ascii_slice(out, 270, 5); return; }
+    if ak == AXMI_ADT_PRIMITIVE { axmi_push_ascii_slice(out, 275, 4); return; }
+    axmi_push_ascii_slice(out, 279, 5); // "alias"
+}
+
+pub fn axmi_push_repr_name(out: mut_view<DiagBuffer>, repr_tag: u8) {
+    if repr_tag == AXMI_REPR_C { axmi_push_ascii_slice(out, 291, 1); return; }
+    if repr_tag == AXMI_REPR_TRANSPARENT { axmi_push_ascii_slice(out, 292, 11); return; }
+    if repr_tag == AXMI_REPR_INT { axmi_push_ascii_slice(out, 303, 3); return; }
+    axmi_push_ascii_slice(out, 284, 7); // "default"
+}
+
+pub fn axmi_push_panic_name(out: mut_view<DiagBuffer>, p: u8) {
+    if p == AXMI_PANIC_NO_PANIC {
+        axmi_push_ascii_slice(out, 315, 7); // "NoPanic"
+    } else {
+        axmi_push_ascii_slice(out, 322, 8); // "MayPanic"
+    }
+}
+
+pub fn axmi_push_diag_status_name(out: mut_view<DiagBuffer>, status: u32) {
+    if status == AX_ART_CORRUPT_HEADER { axmi_push_ascii_slice(out, 330, 21); return; }
+    if status == AX_ART_VERSION_MISMATCH { axmi_push_ascii_slice(out, 351, 23); return; }
+    if status == AX_ART_TARGET_MISMATCH { axmi_push_ascii_slice(out, 374, 22); return; }
+    if status == AX_ART_CHECKSUM_MISMATCH { axmi_push_ascii_slice(out, 396, 24); return; }
+    axmi_push_ascii_slice(out, 330, 21);
+}
+
+pub fn axmi_push_canonical_link_diag_name(out: mut_view<DiagBuffer>, status: u32) {
+    if status == AX_ART_VERSION_MISMATCH { axmi_push_ascii_slice(out, 440, 32); return; }
+    if status == AX_ART_TARGET_MISMATCH { axmi_push_ascii_slice(out, 472, 32); return; }
+    axmi_push_ascii_slice(out, 420, 20); // "AX_LINK_BAD_ARTIFACT"
+}
+
+pub fn axmi_push_freshness_name(out: mut_view<DiagBuffer>, freshness: u8) {
+    if freshness == AXMI_FRESHNESS_FRESH { axmi_push_ascii_slice(out, 504, 5); return; }
+    if freshness == AXMI_FRESHNESS_STALE { axmi_push_ascii_slice(out, 509, 5); return; }
+    if freshness == AXMI_FRESHNESS_UNKNOWN { axmi_push_ascii_slice(out, 514, 7); return; }
+    axmi_push_ascii_slice(out, 521, 7); // "Invalid"
+}
+
+pub fn axmi_emit_diag(res: view<AxmiDeserializeResult>, artifact_name: StrView, out: mut_view<DiagBuffer>) {
+    // "diag["
+    axmi_push_ascii_slice(mut_view(*out), 1030, 5);
+    axmi_push_diag_status_name(mut_view(*out), res.status);
+    diag_buf_push_byte(mut_view(*out), 47u8); // '/'
+    axmi_push_canonical_link_diag_name(mut_view(*out), res.status);
+    // "] artifact="
+    axmi_push_ascii_slice(mut_view(*out), 1035, 11);
+    diag_buf_push_sv(mut_view(*out), artifact_name);
+    // " detail="
+    axmi_push_ascii_slice(mut_view(*out), 1046, 8);
+    if res.status == AX_ART_VERSION_MISMATCH {
+        diag_buf_push_u32(mut_view(*out), res.found_version as u32);
+    } else {
+        diag_buf_push_u32(mut_view(*out), res.bad_section_type as u32);
+    }
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+// Deterministic `inspect --axmi <file>` / `--emit=axmi` dump (SPEC-24 AXS-ART-050)
+pub fn axmi_inspect_dump(iface: view<AxmiModuleInterface>, out: mut_view<DiagBuffer>) {
+    // 1. Header line:
+    // "axmi_header magic=AXMI0001 version=<V> sections=<S> interface_fp=<hex> abi_fp=<hex> target_fp=<hex> content_hash=<hex>\n"
+    axmi_push_ascii_slice(mut_view(*out), 528, 35);
+    diag_buf_push_u32(mut_view(*out), iface.header.schema_version as u32);
+    axmi_push_ascii_slice(mut_view(*out), 563, 10);
+    diag_buf_push_u32(mut_view(*out), iface.section_count);
+    axmi_push_ascii_slice(mut_view(*out), 573, 14);
+    axmi_push_fp128_hex(mut_view(*out), iface.interface_fingerprint);
+    axmi_push_ascii_slice(mut_view(*out), 587, 8);
+    axmi_push_fp128_hex(mut_view(*out), iface.abi_fingerprint);
+    axmi_push_ascii_slice(mut_view(*out), 595, 11);
+    axmi_push_fp128_hex(mut_view(*out), iface.target_fingerprint);
+    axmi_push_ascii_slice(mut_view(*out), 606, 14);
+    axmi_push_fp128_hex(mut_view(*out), iface.header.content_hash);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // 2. Module line:
+    // "axmi_module pkg=<pkg> module=<mod> target=<triple> abi=<abi> stripped_private=<count>\n"
+    axmi_push_ascii_slice(mut_view(*out), 620, 16);
+    diag_buf_push_sv(mut_view(*out), iface.package_name);
+    axmi_push_ascii_slice(mut_view(*out), 636, 8);
+    diag_buf_push_sv(mut_view(*out), iface.module_path);
+    axmi_push_ascii_slice(mut_view(*out), 644, 8);
+    diag_buf_push_sv(mut_view(*out), iface.target_triple);
+    axmi_push_ascii_slice(mut_view(*out), 652, 5);
+    diag_buf_push_sv(mut_view(*out), iface.abi_profile);
+    axmi_push_ascii_slice(mut_view(*out), 657, 18);
+    diag_buf_push_u32(mut_view(*out), iface.stripped_private_count);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // 3. Section directory table:
+    // "section[<id>] type=<Name> offset=<off> size=<sz> align=<al> checksum=<hex>\n"
+    let mut i: usize = 0;
+    while i < (iface.section_count as usize) {
+        let sec = unsafe { *(iface.sections + i) };
+        axmi_push_ascii_slice(mut_view(*out), 675, 8);
+        diag_buf_push_u32(mut_view(*out), sec.id);
+        axmi_push_ascii_slice(mut_view(*out), 683, 7);
+        axmi_push_section_type_name(mut_view(*out), sec.section_type);
+        axmi_push_ascii_slice(mut_view(*out), 690, 8);
+        diag_buf_push_u32(mut_view(*out), sec.offset as u32);
+        axmi_push_ascii_slice(mut_view(*out), 698, 6);
+        diag_buf_push_u32(mut_view(*out), sec.uncompressed_size as u32);
+        axmi_push_ascii_slice(mut_view(*out), 704, 7);
+        diag_buf_push_u32(mut_view(*out), sec.alignment);
+        axmi_push_ascii_slice(mut_view(*out), 711, 10);
+        axmi_push_fp128_hex(mut_view(*out), sec.checksum);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 4. Exported symbols:
+    // "symbol <SemanticKey> kind=<K> params=<P> ret=<R> generic=<G> inline=<I> sig_fp=<hex>\n"
+    i = 0;
+    while i < (iface.symbol_count as usize) {
+        let s = unsafe { *(iface.symbols + i) };
+        axmi_push_ascii_slice(mut_view(*out), 721, 7);
+        query_db_push_semantic_key(mut_view(*out), view(s.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 728, 6);
+        axmi_push_item_kind_name(mut_view(*out), s.item_kind);
+        axmi_push_ascii_slice(mut_view(*out), 734, 8);
+        diag_buf_push_u32(mut_view(*out), s.param_count);
+        axmi_push_ascii_slice(mut_view(*out), 742, 5);
+        diag_buf_push_u32(mut_view(*out), s.return_type_id.v);
+        axmi_push_ascii_slice(mut_view(*out), 747, 9);
+        axmi_push_bool(mut_view(*out), s.is_generic);
+        axmi_push_ascii_slice(mut_view(*out), 756, 8);
+        axmi_push_bool(mut_view(*out), s.is_inline);
+        axmi_push_ascii_slice(mut_view(*out), 764, 8);
+        axmi_push_fp128_hex(mut_view(*out), s.sig_fingerprint);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 5. Exported type layouts:
+    // "type_layout <SemanticKey> adt=<A> repr=<R> size=<S> align=<AL> fields=<F> copy=<C> send=<SN> share=<SH>\n"
+    i = 0;
+    while i < (iface.type_count as usize) {
+        let t = unsafe { *(iface.types + i) };
+        axmi_push_ascii_slice(mut_view(*out), 772, 12);
+        query_db_push_semantic_key(mut_view(*out), view(t.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 784, 5);
+        axmi_push_adt_kind_name(mut_view(*out), t.adt_kind);
+        axmi_push_ascii_slice(mut_view(*out), 789, 6);
+        axmi_push_repr_name(mut_view(*out), t.repr_tag);
+        axmi_push_ascii_slice(mut_view(*out), 698, 6); // " size="
+        diag_buf_push_u32(mut_view(*out), t.size_bytes);
+        axmi_push_ascii_slice(mut_view(*out), 704, 7); // " align="
+        diag_buf_push_u32(mut_view(*out), t.align_bytes);
+        axmi_push_ascii_slice(mut_view(*out), 795, 8); // " fields="
+        diag_buf_push_u32(mut_view(*out), t.field_count);
+        axmi_push_ascii_slice(mut_view(*out), 803, 6); // " copy="
+        axmi_push_bool(mut_view(*out), t.is_copy);
+        axmi_push_ascii_slice(mut_view(*out), 809, 6); // " send="
+        axmi_push_bool(mut_view(*out), t.is_send);
+        axmi_push_ascii_slice(mut_view(*out), 815, 7); // " share="
+        axmi_push_bool(mut_view(*out), t.is_share);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 6. Exported trait impls:
+    // "trait_impl <SemanticKey> trait_def=<T> self_type=<S> assoc=<A> object_safe=<O>\n"
+    i = 0;
+    while i < (iface.trait_count as usize) {
+        let tr = unsafe { *(iface.traits + i) };
+        axmi_push_ascii_slice(mut_view(*out), 822, 11);
+        query_db_push_semantic_key(mut_view(*out), view(tr.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 833, 11);
+        diag_buf_push_u32(mut_view(*out), tr.trait_def_id.v);
+        axmi_push_ascii_slice(mut_view(*out), 844, 11);
+        diag_buf_push_u32(mut_view(*out), tr.self_type_id.v);
+        axmi_push_ascii_slice(mut_view(*out), 855, 7);
+        diag_buf_push_u32(mut_view(*out), tr.assoc_item_count);
+        axmi_push_ascii_slice(mut_view(*out), 862, 13);
+        axmi_push_bool(mut_view(*out), tr.is_object_safe);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 7. Exported function ownership/capability/effect contracts:
+    // "fn_contract <SemanticKey> params=<P> ret_borrows=<RB> no_escape=<NE> effects=<E> caps=<C> panic=<PN> pure=<PR>\n"
+    i = 0;
+    while i < (iface.contract_count as usize) {
+        let c = unsafe { *(iface.contracts + i) };
+        axmi_push_ascii_slice(mut_view(*out), 875, 12);
+        query_db_push_semantic_key(mut_view(*out), view(c.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 734, 8); // " params="
+        diag_buf_push_u32(mut_view(*out), c.param_count);
+        axmi_push_ascii_slice(mut_view(*out), 887, 13); // " ret_borrows="
+        diag_buf_push_u32(mut_view(*out), c.return_borrows_from_mask);
+        axmi_push_ascii_slice(mut_view(*out), 900, 11); // " no_escape="
+        diag_buf_push_u32(mut_view(*out), c.no_escape_mask);
+        axmi_push_ascii_slice(mut_view(*out), 911, 9); // " effects="
+        diag_buf_push_u32(mut_view(*out), c.effect_mask);
+        axmi_push_ascii_slice(mut_view(*out), 920, 6); // " caps="
+        diag_buf_push_u32(mut_view(*out), c.authority_cap_mask);
+        axmi_push_ascii_slice(mut_view(*out), 926, 7); // " panic="
+        axmi_push_panic_name(mut_view(*out), c.panic_contract);
+        axmi_push_ascii_slice(mut_view(*out), 933, 6); // " pure="
+        axmi_push_bool(mut_view(*out), c.is_pure);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 8. Exported const values:
+    // "const_val <SemanticKey> val=<V> fp=<hex>\n"
+    i = 0;
+    while i < (iface.const_count as usize) {
+        let cst = unsafe { *(iface.consts + i) };
+        axmi_push_ascii_slice(mut_view(*out), 939, 10);
+        query_db_push_semantic_key(mut_view(*out), view(cst.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 949, 5);
+        axmi_push_i64(mut_view(*out), cst.int_val);
+        axmi_push_ascii_slice(mut_view(*out), 954, 4);
+        axmi_push_fp128_hex(mut_view(*out), cst.const_fingerprint);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    // 9. Exported generic / inlineable / comptime Verified MIR templates:
+    // "mir_template <SemanticKey> schema=<S> generic=<G> inline=<IN> comptime=<CT> blocks=<B> locals=<L> insts=<I> verified=<V> digest=<hex>\n"
+    i = 0;
+    while i < (iface.mir_template_count as usize) {
+        let m = unsafe { *(iface.mir_templates + i) };
+        axmi_push_ascii_slice(mut_view(*out), 958, 13);
+        query_db_push_semantic_key(mut_view(*out), view(m.semantic_key));
+        axmi_push_ascii_slice(mut_view(*out), 971, 8); // " schema="
+        diag_buf_push_u32(mut_view(*out), m.mir_schema_version as u32);
+        axmi_push_ascii_slice(mut_view(*out), 747, 9); // " generic="
+        axmi_push_bool(mut_view(*out), m.is_generic);
+        axmi_push_ascii_slice(mut_view(*out), 756, 8); // " inline="
+        axmi_push_bool(mut_view(*out), m.is_inline);
+        axmi_push_ascii_slice(mut_view(*out), 979, 10); // " comptime="
+        axmi_push_bool(mut_view(*out), m.is_comptime);
+        axmi_push_ascii_slice(mut_view(*out), 989, 8); // " blocks="
+        diag_buf_push_u32(mut_view(*out), m.block_count);
+        axmi_push_ascii_slice(mut_view(*out), 997, 8); // " locals="
+        diag_buf_push_u32(mut_view(*out), m.local_count);
+        axmi_push_ascii_slice(mut_view(*out), 1005, 7); // " insts="
+        diag_buf_push_u32(mut_view(*out), m.inst_count);
+        axmi_push_ascii_slice(mut_view(*out), 1012, 10); // " verified="
+        axmi_push_bool(mut_view(*out), m.ownership_verified);
+        axmi_push_ascii_slice(mut_view(*out), 1022, 8); // " digest="
+        axmi_push_fp128_hex(mut_view(*out), m.body_digest);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+}
