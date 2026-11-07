@@ -2839,6 +2839,9 @@ pub const AX_DIAG_CODE_COUNT: u32 = 133u32;
 pub const AX_CONC_NOT_SEND: u32 = 134u32;
 pub const AX_CONC_NOT_SHARE: u32 = 135u32;
 pub const AX_CONC_SAFE_SEND_SHARE_IMPL: u32 = 136u32;
+pub const AX_CONC_CAPTURE_NOT_SEND: u32 = 142u32;
+pub const AX_CONC_ESCAPING_VIEW: u32 = 143u32;
+pub const AX_CONC_SPAWN_REQUIRES_MOVE: u32 = 144u32;
 
 pub fn diag_code_name(c: DiagCode) -> Str {
     match c.v {
@@ -2877,6 +2880,7 @@ pub fn diag_code_name(c: DiagCode) -> Str {
         128u32 => "AX_DRIVER_NO_STD", 129u32 => "AX_DRIVER_BAD_MANIFEST", 130u32 => "AX_ICE_INTERNAL", 131u32 => "AX_ICE_MIR_VERIFY",
         132u32 => "AX_ICE_OUT_OF_MEMORY",
         134u32 => "AX_CONC_NOT_SEND", 135u32 => "AX_CONC_NOT_SHARE", 136u32 => "AX_CONC_SAFE_SEND_SHARE_IMPL",
+        142u32 => "AX_CONC_CAPTURE_NOT_SEND", 143u32 => "AX_CONC_ESCAPING_VIEW", 144u32 => "AX_CONC_SPAWN_REQUIRES_MOVE",
         _ => "<unknown>",
     }
 }
@@ -2953,6 +2957,9 @@ pub fn diag_code_default_message(c: DiagCode) -> Str {
         134u32 => "type does not implement Send and cannot cross a concurrency boundary",
         135u32 => "type does not implement Share and cannot be shared across threads",
         136u32 => "manual implementation of Send or Share must be marked unsafe impl",
+        142u32 => "captured variable in closure does not implement Send and cannot cross a spawn boundary",
+        143u32 => "view capability cannot escape its owner scope across a closure or spawn boundary",
+        144u32 => "closure passed to spawn must take ownership of captured stack variables by move",
         _ => "",
     }
 }
@@ -26386,9 +26393,14 @@ use compiler.source.span.Span
 use compiler.source.manager.SourceDatabase
 use compiler.source.manager.source_db_span_text
 use compiler.source.manager.source_db_text
+use compiler.diag.code.AX_CONC_CAPTURE_NOT_SEND
+use compiler.diag.code.AX_CONC_ESCAPING_VIEW
+use compiler.diag.code.AX_CONC_NOT_SEND
+use compiler.diag.code.AX_CONC_SPAWN_REQUIRES_MOVE
 use compiler.diag.code.AX_CONST_CYCLE
 use compiler.diag.code.AX_CONST_DIV_ZERO
 use compiler.diag.code.AX_CONST_OVERFLOW
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
 use compiler.diag.code.AX_NAME_PRIVATE
 use compiler.diag.code.AX_NAME_UNRESOLVED
 use compiler.diag.code.AX_PAT_NON_EXHAUSTIVE
@@ -26750,12 +26762,14 @@ use compiler.traits.solver.TRAIT_PROVEN
 use compiler.traits.solver.check_impl_supertraits
 use compiler.traits.solver.check_item_bounds
 use compiler.traits.solver.check_send_share_impl_safety
+use compiler.traits.solver.emit_conc_bound_diag
 use compiler.traits.solver.find_method
 use compiler.traits.solver.find_trait_by_type_path
 use compiler.traits.mono.subst_ty_self
 use compiler.traits.solver.satisfies_bound
 use compiler.traits.solver.sv_eq
 use compiler.traits.solver.traits_check_overlap
+use compiler.traits.solver.type_satisfies_auto_trait
 
 pub const AX_TYPE_UNKNOWN_INTRINSIC: u32 = 133u32;
 
@@ -26801,6 +26815,7 @@ pub struct LoopEnv {
 
 pub struct RawCapture {
     pub sym: SymbolId,
+    pub name: StrId,
     pub is_mutated: bool,
     pub is_moved: bool,
     pub is_read: bool,
@@ -27333,17 +27348,37 @@ const TC_CONC_SAFE_IMPL_CODE_NAME: [28]u8 = [
     73u8, 77u8, 80u8, 76u8,
 ];
 
+const TC_CONC_CAPTURE_NOT_SEND_CODE_NAME: [24]u8 = [
+    65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 67u8, 95u8,
+    67u8, 65u8, 80u8, 84u8, 85u8, 82u8, 69u8, 95u8,
+    78u8, 79u8, 84u8, 95u8, 83u8, 69u8, 78u8, 68u8,
+];
+
+const TC_CONC_ESCAPING_VIEW_CODE_NAME: [21]u8 = [
+    65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 67u8, 95u8,
+    69u8, 83u8, 67u8, 65u8, 80u8, 73u8, 78u8, 71u8,
+    95u8, 86u8, 73u8, 69u8, 87u8,
+];
+
+const TC_CONC_SPAWN_MOVE_CODE_NAME: [27]u8 = [
+    65u8, 88u8, 95u8, 67u8, 79u8, 78u8, 67u8, 95u8,
+    83u8, 80u8, 65u8, 87u8, 78u8, 95u8, 82u8, 69u8,
+    81u8, 85u8, 73u8, 82u8, 69u8, 83u8, 95u8, 77u8,
+    79u8, 86u8, 69u8,
+];
+
 pub fn patch_unknown_intrinsic_diag_buf(sink: view<DiagSink>, buf: mut_view<DiagBuffer>) {
     let blen = buf.len;
-    if sink.len == 0 || (sink.diags as usize) == 0 || blen < 9 || (buf.ptr as usize) == 0 {
+    let slen = sink.len;
+    if slen == 0 || (sink.diags as usize) == 0 || blen < 9 || (buf.ptr as usize) == 0 {
         return;
     }
     let mut has_ext_code = false;
     let mut di: usize = 0;
-    while di < sink.len {
+    while di < slen {
         let dp = ((sink.diags as usize) + mul_usize(di, size_of<Diagnostic>())) as *const Diagnostic;
         let cv = unsafe { (*dp).code.v };
-        if cv >= 133u32 && cv <= 136u32 {
+        if (cv >= 133u32 && cv <= 136u32) || (cv >= 142u32 && cv <= 144u32) {
             has_ext_code = true;
             break;
         }
@@ -27355,17 +27390,17 @@ pub fn patch_unknown_intrinsic_diag_buf(sink: view<DiagSink>, buf: mut_view<Diag
     let mut out = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
     let mut i: usize = 0;
     let mut next_di: usize = 0;
-    while i < buf.len {
-        if i + 9 <= buf.len &&
+    while i < blen {
+        if i + 9 <= blen &&
            unsafe { *(buf.ptr + i + 0) == 60u8 && *(buf.ptr + i + 1) == 117u8 && *(buf.ptr + i + 2) == 110u8 &&
                     *(buf.ptr + i + 3) == 107u8 && *(buf.ptr + i + 4) == 110u8 && *(buf.ptr + i + 5) == 111u8 &&
                     *(buf.ptr + i + 6) == 119u8 && *(buf.ptr + i + 7) == 110u8 && *(buf.ptr + i + 8) == 62u8 } {
-            let mut match_cv: u32 = 133u32;
-            while next_di < sink.len {
+            let mut match_cv: u32 = 0u32;
+            while next_di < slen {
                 let dp = ((sink.diags as usize) + mul_usize(next_di, size_of<Diagnostic>())) as *const Diagnostic;
                 let cv = unsafe { (*dp).code.v };
                 next_di = next_di + 1;
-                if cv >= 133u32 && cv <= 136u32 {
+                if cv >= 133u32 {
                     match_cv = cv;
                     break;
                 }
@@ -27388,10 +27423,34 @@ pub fn patch_unknown_intrinsic_diag_buf(sink: view<DiagSink>, buf: mut_view<Diag
                     diag_buf_push_byte(mut_view(out), TC_CONC_SAFE_IMPL_CODE_NAME[k]);
                     k = k + 1;
                 }
-            } else {
+            } else if match_cv == 142u32 {
+                let mut k: usize = 0;
+                while k < 24 {
+                    diag_buf_push_byte(mut_view(out), TC_CONC_CAPTURE_NOT_SEND_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else if match_cv == 143u32 {
+                let mut k: usize = 0;
+                while k < 21 {
+                    diag_buf_push_byte(mut_view(out), TC_CONC_ESCAPING_VIEW_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else if match_cv == 144u32 {
+                let mut k: usize = 0;
+                while k < 27 {
+                    diag_buf_push_byte(mut_view(out), TC_CONC_SPAWN_MOVE_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else if match_cv == 133u32 {
                 let mut k: usize = 0;
                 while k < 25 {
                     diag_buf_push_byte(mut_view(out), TC_UNKNOWN_INTR_CODE_NAME[k]);
+                    k = k + 1;
+                }
+            } else {
+                let mut k: usize = 0;
+                while k < 9 {
+                    diag_buf_push_byte(mut_view(out), unsafe { *(buf.ptr + i + k) });
                     k = k + 1;
                 }
             }
@@ -32607,12 +32666,15 @@ fn check_if(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expected: TypeId) -> 
     resolve_ty(mut_view(*cx), (TypeId { v: then_ty.v }))
 }
 
-fn record_cap(caps: *mut RawCapture, cap_count: mut_view<usize>, sym: SymbolId, is_mut: bool, is_move: bool) {
+fn record_cap(caps: *mut RawCapture, cap_count: mut_view<usize>, sym: SymbolId, name: StrId, is_mut: bool, is_move: bool) {
     let mut i: usize = 0;
     while (i < *cap_count) {
         let rc = unsafe { rawcap_at(caps, i) };
         if unsafe { (*rc).sym.v } == sym.v {
             unsafe {
+                if (*rc).name.v == 0u32 && name.v != 0u32 {
+                    (*rc).name.v = name.v;
+                }
                 if is_move { (*rc).is_moved = true; }
                 else if is_mut { (*rc).is_mutated = true; }
                 else { (*rc).is_read = true; }
@@ -32625,6 +32687,7 @@ fn record_cap(caps: *mut RawCapture, cap_count: mut_view<usize>, sym: SymbolId, 
         let rc = unsafe { rawcap_at(caps, *cap_count) };
         unsafe {
             (*rc).sym.v = sym.v;
+            (*rc).name.v = name.v;
             (*rc).is_mutated = is_mut;
             (*rc).is_moved = is_move;
             (*rc).is_read = !is_mut && !is_move;
@@ -32674,6 +32737,18 @@ fn add_pat_syms(pat: *const HirPat, inner: *mut SymbolId, inner_count: mut_view<
             let fpat: *mut HirPat = unsafe { (*f).pat };
             add_pat_syms(fpat, inner, mut_view(*inner_count));
             f = unsafe { (*f).next };
+        }
+    } else if pk == HIR_PAT_PATH {
+        let mut p: *mut HirPat = unsafe { (*pat).payload };
+        while ((p as usize) != 0) {
+            add_pat_syms(p, inner, mut_view(*inner_count));
+            p = unsafe { (*p).next };
+        }
+    } else if pk == HIR_PAT_OR {
+        let mut p: *mut HirPat = unsafe { (*pat).pats };
+        while ((p as usize) != 0) {
+            add_pat_syms(p, inner, mut_view(*inner_count));
+            p = unsafe { (*p).next };
         }
     }
 }
@@ -32733,7 +32808,8 @@ fn scan_expr_captures(
         if sym_v != 0u32 {
             let sym = (SymbolId { v: sym_v });
             if !is_inner_sym((SymbolId { v: sym.v }), inner, *inner_count) && is_outer_var(view(*cx), (SymbolId { v: sym.v })) {
-                record_cap(caps, mut_view(*cap_count), (SymbolId { v: sym.v }), in_mut, in_move);
+                let pname_v = unsafe { (*expr).path.name.v };
+                record_cap(caps, mut_view(*cap_count), (SymbolId { v: sym.v }), (StrId { v: pname_v }), in_mut, in_move);
             }
         }
     } else if ek == HIR_EXPR_BINARY {
@@ -32867,6 +32943,27 @@ fn scan_expr_captures(
         if (je as usize) != 0 {
             scan_expr_captures(mut_view(*cx), je, inner, mut_view(*inner_count), caps, mut_view(*cap_count), false, false);
         }
+    } else if ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT {
+        let ie: *mut HirExpr = unsafe { (*expr).inner };
+        if (ie as usize) != 0 {
+            scan_expr_captures(mut_view(*cx), ie, inner, mut_view(*inner_count), caps, mut_view(*cap_count), false, false);
+        }
+    } else if ek == HIR_EXPR_CLOSURE {
+        let save = *inner_count;
+        let mut cp: *mut HirParam = unsafe { (*expr).params };
+        while ((cp as usize) != 0) {
+            if *inner_count < 128 {
+                let dst = unsafe { symid_at(inner, *inner_count) };
+                unsafe { (*dst).v = (*cp).symbol.v; }
+                *inner_count = *inner_count + 1;
+            }
+            cp = unsafe { (*cp).next };
+        }
+        let cb: *mut HirExpr = unsafe { (*expr).body };
+        if (cb as usize) != 0 {
+            scan_expr_captures(mut_view(*cx), cb, inner, mut_view(*inner_count), caps, mut_view(*cap_count), false, false);
+        }
+        *inner_count = save;
     }
 }
 
@@ -33881,6 +33978,7 @@ fn check_expr_closure(cx: mut_view<TypeckCtx>, expr: *const HirExpr, expected: T
             mut_view(*cx),
             expr,
             cbody,
+            raw_caps,
             caps,
             raw_cap_count,
             closure_param_types,
@@ -33895,6 +33993,7 @@ fn finish_closure_item(
     cx: mut_view<TypeckCtx>,
     expr: *const HirExpr,
     cbody: *mut HirExpr,
+    raw_caps: *mut RawCapture,
     caps: *mut ClosureCapture,
     raw_cap_count: usize,
     closure_param_types: *mut TypeId,
@@ -33919,12 +34018,18 @@ fn finish_closure_item(
             (*fn_item).span.start = est;
             (*fn_item).span.end = een;
             (*fn_item).symbol.v = closure_sym;
+            ptr_itemmap_insert(
+                mut_view((*cx.thir).expr_methods),
+                ((closure_sym as usize) << 3) | 4usize,
+                fn_item as *const HirItem
+            );
         }
 
         let mut first_p: *mut HirParam = 0 as *mut HirParam;
         let mut tail_p: *mut HirParam = 0 as *mut HirParam;
         let mut i: usize = 0;
         while (i < raw_cap_count) {
+            let rc = unsafe { rawcap_at(raw_caps, i) };
             let cc = unsafe { capture_at(caps, i) };
             let hp_raw = unsafe { arena_alloc_raw(mut_view((*cx.thir).interner.arena), size_of<HirParam>(), align_of<HirParam>()) };
             tc_zero_bytes(hp_raw, size_of<HirParam>());
@@ -33932,10 +34037,12 @@ fn finish_closure_item(
             let c_mode = unsafe { (*cc).mode };
             let c_sym_v = unsafe { (*cc).sym.v };
             let c_ty_v = unsafe { (*cc).ty.v };
+            let c_name_v = unsafe { (*rc).name.v };
             unsafe {
                 (*hp).span.file.v = efv;
                 (*hp).span.start = est;
                 (*hp).span.end = een;
+                (*hp).name.v = c_name_v;
                 (*hp).is_mut = c_mode == CAP_MUT_VIEW;
                 (*hp).symbol.v = c_sym_v;
                 if (first_p as usize) == 0 { first_p = hp; } else { (*tail_p).next = hp; }
@@ -34676,6 +34783,21 @@ fn type_contains_view(cx: mut_view<TypeckCtx>, id: TypeId) -> bool {
         }
         return false;
     }
+    if k == TY_CLOSURE {
+        let ccnt = unsafe { (*t).capture_count };
+        let caps: *mut ClosureCapture = unsafe { (*t).captures };
+        let mut i: usize = 0;
+        while (i < ccnt) {
+            let cc = unsafe { capture_at(caps, i) };
+            let cm = unsafe { (*cc).mode };
+            let ct_v = unsafe { (*cc).ty.v };
+            if cm == CAP_MUT_VIEW || type_contains_view(mut_view(*cx), (TypeId { v: ct_v })) {
+                return true;
+            }
+            i = i + 1;
+        }
+        return false;
+    }
     false
 }
 
@@ -35034,6 +35156,1119 @@ fn finalize_types(cx: mut_view<TypeckCtx>) {
     }
 }
 
+const TC_SEND_TRAIT_NAME: [4]u8 = [83u8, 101u8, 110u8, 100u8];
+const TC_SHARE_TRAIT_NAME: [5]u8 = [83u8, 104u8, 97u8, 114u8, 101u8];
+
+const TC_MSG_CAPTURE_NOT_SEND: [65]u8 = [
+    99u8, 97u8, 112u8, 116u8, 117u8, 114u8, 101u8, 100u8, 32u8,
+    118u8, 97u8, 114u8, 105u8, 97u8, 98u8, 108u8, 101u8, 32u8,
+    105u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8,
+    96u8, 83u8, 101u8, 110u8, 100u8, 96u8, 32u8,
+    97u8, 110u8, 100u8, 32u8, 99u8, 97u8, 110u8, 110u8, 111u8, 116u8, 32u8,
+    99u8, 114u8, 111u8, 115u8, 115u8, 32u8,
+    96u8, 115u8, 112u8, 97u8, 119u8, 110u8, 96u8, 32u8,
+    98u8, 111u8, 117u8, 110u8, 100u8, 97u8, 114u8, 121u8,
+];
+
+const TC_MSG_ESCAPING_VIEW: [63]u8 = [
+    99u8, 97u8, 110u8, 110u8, 111u8, 116u8, 32u8,
+    99u8, 97u8, 112u8, 116u8, 117u8, 114u8, 101u8, 32u8,
+    110u8, 111u8, 110u8, 45u8, 101u8, 115u8, 99u8, 97u8, 112u8, 105u8, 110u8, 103u8, 32u8,
+    118u8, 105u8, 101u8, 119u8, 32u8, 105u8, 110u8, 32u8,
+    101u8, 115u8, 99u8, 97u8, 112u8, 105u8, 110u8, 103u8, 32u8,
+    99u8, 108u8, 111u8, 115u8, 117u8, 114u8, 101u8, 32u8,
+    111u8, 114u8, 32u8, 96u8, 115u8, 112u8, 97u8, 119u8, 110u8, 96u8,
+];
+
+const TC_NOTE_CAP_PREFIX: [19]u8 = [
+    99u8, 97u8, 112u8, 116u8, 117u8, 114u8, 101u8, 100u8, 32u8,
+    118u8, 97u8, 114u8, 105u8, 97u8, 98u8, 108u8, 101u8, 32u8, 96u8,
+];
+
+const TC_NOTE_HAS_TYPE: [12]u8 = [
+    96u8, 32u8, 104u8, 97u8, 115u8, 32u8, 116u8, 121u8, 112u8, 101u8, 32u8, 96u8,
+];
+
+const TC_LBL_MOVED_INTO_SPAWN: [37]u8 = [
+    118u8, 97u8, 108u8, 117u8, 101u8, 32u8, 109u8, 111u8, 118u8, 101u8, 100u8, 32u8,
+    105u8, 110u8, 116u8, 111u8, 32u8, 96u8, 115u8, 112u8, 97u8, 119u8, 110u8, 96u8, 32u8,
+    99u8, 108u8, 111u8, 115u8, 117u8, 114u8, 101u8, 32u8, 104u8, 101u8, 114u8, 101u8,
+];
+
+fn sv_is_spawn_name(sv: view<StrView>) -> u8 {
+    if sv.len == 5 && (sv.ptr as usize) != 0 {
+        let ok = unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 112u8 &&
+            *(sv.ptr + 2) == 97u8 && *(sv.ptr + 3) == 119u8 && *(sv.ptr + 4) == 110u8
+        };
+        if ok { return 1u8; }
+    } else if sv.len == 11 && (sv.ptr as usize) != 0 {
+        let ok = unsafe {
+            *(sv.ptr + 0) == 115u8 && *(sv.ptr + 1) == 112u8 &&
+            *(sv.ptr + 2) == 97u8 && *(sv.ptr + 3) == 119u8 && *(sv.ptr + 4) == 110u8 &&
+            *(sv.ptr + 5) == 95u8 && *(sv.ptr + 6) == 108u8 && *(sv.ptr + 7) == 111u8 &&
+            *(sv.ptr + 8) == 99u8 && *(sv.ptr + 9) == 97u8 && *(sv.ptr + 10) == 108u8
+        };
+        if ok { return 2u8; }
+    }
+    0u8
+}
+
+fn classify_spawn_call(cx: view<TypeckCtx>, expr: *const HirExpr) -> u8 {
+    if (expr as usize) == 0 || (cx.str_in as usize) == 0 {
+        return 0u8;
+    }
+    let ek = unsafe { (*expr).kind };
+    if ek == HIR_EXPR_CALL {
+        let callee: *mut HirExpr = unsafe { (*expr).callee };
+        if (callee as usize) != 0 && (unsafe { (*callee).kind }) == HIR_EXPR_PATH {
+            let p_sv = unsafe { tc_path_name_sv(cx, view((*callee).path)) };
+            let k = sv_is_spawn_name(view(p_sv));
+            if k != 0u8 { return k; }
+            let pn_v = unsafe { (*callee).path.name.v };
+            if pn_v != 0u32 {
+                let sv2 = unsafe { interner_get(view(*cx.str_in), (StrId { v: pn_v })) };
+                let k2 = sv_is_spawn_name(view(sv2));
+                if k2 != 0u8 { return k2; }
+            }
+        }
+    } else if ek == HIR_EXPR_METHOD_CALL {
+        let mn_v = unsafe { (*expr).method_name.v };
+        if mn_v != 0u32 {
+            let sv = unsafe { interner_get(view(*cx.str_in), (StrId { v: mn_v })) };
+            return sv_is_spawn_name(view(sv));
+        }
+    }
+    0u8
+}
+
+const TC_NOTE_NOT_SEND_PTR: [35]u8 = [
+    114u8, 97u8, 119u8, 32u8, 112u8, 111u8, 105u8, 110u8, 116u8, 101u8, 114u8, 115u8, 32u8,
+    100u8, 111u8, 32u8, 110u8, 111u8, 116u8, 32u8, 105u8, 109u8, 112u8, 108u8, 101u8, 109u8,
+    101u8, 110u8, 116u8, 32u8, 96u8, 83u8, 101u8, 110u8, 100u8,
+];
+
+const TC_NOTE_NOT_SEND_GEN: [52]u8 = [
+    99u8, 97u8, 112u8, 116u8, 117u8, 114u8, 101u8, 100u8, 32u8, 116u8, 121u8, 112u8, 101u8, 32u8,
+    100u8, 111u8, 101u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 115u8, 97u8, 116u8, 105u8, 115u8,
+    102u8, 121u8, 32u8, 96u8, 83u8, 101u8, 110u8, 100u8, 96u8, 32u8, 102u8, 111u8, 114u8, 32u8,
+    96u8, 115u8, 112u8, 97u8, 119u8, 110u8, 96u8, 32u8, 99u8, 97u8,
+];
+
+const TC_NOTE_VIEW_PROVENANCE: [67]u8 = [
+    110u8, 111u8, 110u8, 45u8, 101u8, 115u8, 99u8, 97u8, 112u8, 105u8, 110u8, 103u8, 32u8,
+    99u8, 97u8, 112u8, 97u8, 98u8, 105u8, 108u8, 105u8, 116u8, 121u8, 32u8, 118u8, 105u8, 101u8,
+    119u8, 32u8, 112u8, 114u8, 111u8, 118u8, 101u8, 110u8, 97u8, 110u8, 99u8, 101u8, 32u8,
+    100u8, 111u8, 101u8, 115u8, 32u8, 110u8, 111u8, 116u8, 32u8, 111u8, 117u8, 116u8, 108u8,
+    105u8, 118u8, 101u8, 32u8, 96u8, 115u8, 112u8, 97u8, 119u8, 110u8, 96u8, 32u8, 115u8, 99u8,
+];
+
+fn find_closure_expr_span(cx: view<TypeckCtx>, closure_sym: u32, fallback: Span) -> Span {
+    let key = ((closure_sym as usize) << 3) | 4usize;
+    let p = unsafe { ptr_itemmap_get(view((*cx.thir).expr_methods), key) };
+    if (p as usize) != 0 {
+        let fn_it = unsafe { *p };
+        if (fn_it as usize) != 0 {
+            return Span {
+                file: (FileId { v: unsafe { (*fn_it).span.file.v } }),
+                start: unsafe { (*fn_it).span.start },
+                end: unsafe { (*fn_it).span.end },
+            };
+        }
+    }
+    fallback
+}
+
+fn tc_capture_type_name_sv(cx: view<TypeckCtx>, cap_ty: TypeId) -> StrView {
+    if cap_ty.v == 0u32 || (cx.thir as usize) == 0 || (cx.str_in as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let t = unsafe { type_get(view((*cx.thir).interner), cap_ty) };
+    if (t as usize) == 0 {
+        return StrView { ptr: 0 as *const u8, len: 0 };
+    }
+    let tk = unsafe { (*t).kind };
+    if (tk == TY_STRUCT || tk == TY_ENUM) && (unsafe { (*t).def as usize }) != 0 {
+        let def_it = unsafe { (*t).def };
+        let dn = unsafe { (*def_it).name };
+        if dn.v != 0u32 {
+            return unsafe { interner_get(view(*cx.str_in), dn) };
+        }
+    }
+    StrView { ptr: 0 as *const u8, len: 0 }
+}
+
+fn emit_spawn_capture_diag(
+    cx: mut_view<TypeckCtx>,
+    code_v: u32,
+    primary_sp: Span,
+    cap_name: StrId,
+    cap_ty: TypeId
+) {
+    if (cx.sink as usize) == 0 {
+        return;
+    }
+    let sink = cx.sink;
+    let code = (DiagCode { v: code_v });
+    let sev = diag_code_severity(DiagCode { v: code_v });
+    let msg_sv = if code_v == AX_CONC_CAPTURE_NOT_SEND {
+        let p = unsafe { arena_alloc_raw(mut_view((*sink).arena), 65, 1) };
+        let mut k: usize = 0;
+        while k < 65 {
+            unsafe { *(p + k) = TC_MSG_CAPTURE_NOT_SEND[k]; }
+            k = k + 1;
+        }
+        StrView { ptr: p as *const u8, len: 65 }
+    } else {
+        let p = unsafe { arena_alloc_raw(mut_view((*sink).arena), 63, 1) };
+        let mut k: usize = 0;
+        while k < 63 {
+            unsafe { *(p + k) = TC_MSG_ESCAPING_VIEW[k]; }
+            k = k + 1;
+        }
+        StrView { ptr: p as *const u8, len: 63 }
+    };
+    let mut notes_ptr: *mut StrView = 0 as *mut StrView;
+    let mut note_cnt: usize = 0;
+    let tname_sv = tc_capture_type_name_sv(view(*cx), (TypeId { v: cap_ty.v }));
+    if cap_name.v != 0u32 && (cx.str_in as usize) != 0 {
+        let nsv = unsafe { interner_get(view(*cx.str_in), (StrId { v: cap_name.v })) };
+        let nsv_len = nsv.len;
+        let tn_len = tname_sv.len;
+        let extra_ty = if tn_len > 0 && (tname_sv.ptr as usize) != 0 { 12 + tn_len + 1 } else { 1 };
+        let nlen = 19 + nsv_len + extra_ty;
+        let np = unsafe { arena_alloc_raw(mut_view((*sink).arena), nlen, 1) };
+        let mut k: usize = 0;
+        while k < 19 {
+            unsafe { *(np + k) = TC_NOTE_CAP_PREFIX[k]; }
+            k = k + 1;
+        }
+        let mut j: usize = 0;
+        while j < nsv_len {
+            unsafe { *(np + 19 + j) = *(nsv.ptr + j); }
+            j = j + 1;
+        }
+        if tn_len > 0 && (tname_sv.ptr as usize) != 0 {
+            let mut m: usize = 0;
+            while m < 12 {
+                unsafe { *(np + 19 + nsv_len + m) = TC_NOTE_HAS_TYPE[m]; }
+                m = m + 1;
+            }
+            let mut r: usize = 0;
+            while r < tn_len {
+                unsafe { *(np + 19 + nsv_len + 12 + r) = *(tname_sv.ptr + r); }
+                r = r + 1;
+            }
+            unsafe { *(np + 19 + nsv_len + 12 + tn_len) = 96u8; }
+        } else {
+            unsafe { *(np + 19 + nsv_len) = 96u8; }
+        }
+        let sref = unsafe { arena_alloc_raw(mut_view((*sink).arena), mul_usize(2, size_of<StrView>()), align_of<StrView>()) as *mut StrView };
+        unsafe {
+            (*sref).ptr = np as *const u8;
+            (*sref).len = nlen;
+        }
+        let mut is_ptr_ty = false;
+        if cap_ty.v != 0u32 && (cx.thir as usize) != 0 {
+            let ct = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: cap_ty.v })) };
+            if (ct as usize) != 0 && (unsafe { (*ct).kind }) == TY_PTR {
+                is_ptr_ty = true;
+            }
+        }
+        let sref2 = unsafe { (sref as usize + size_of<StrView>()) as *mut StrView };
+        if code_v == AX_CONC_CAPTURE_NOT_SEND {
+            if is_ptr_ty {
+                let rp = unsafe { arena_alloc_raw(mut_view((*sink).arena), 36, 1) };
+                let mut q: usize = 0;
+                while q < 35 {
+                    unsafe { *(rp + q) = TC_NOTE_NOT_SEND_PTR[q]; }
+                    q = q + 1;
+                }
+                unsafe {
+                    *(rp + 35) = 96u8;
+                    (*sref2).ptr = rp as *const u8;
+                    (*sref2).len = 36;
+                }
+            } else {
+                let rp = unsafe { arena_alloc_raw(mut_view((*sink).arena), 50, 1) };
+                let mut q: usize = 0;
+                while q < 50 {
+                    unsafe { *(rp + q) = TC_NOTE_NOT_SEND_GEN[q]; }
+                    q = q + 1;
+                }
+                unsafe {
+                    (*sref2).ptr = rp as *const u8;
+                    (*sref2).len = 50;
+                }
+            }
+        } else {
+            let rp = unsafe { arena_alloc_raw(mut_view((*sink).arena), 65, 1) };
+            let mut q: usize = 0;
+            while q < 65 {
+                unsafe { *(rp + q) = TC_NOTE_VIEW_PROVENANCE[q]; }
+                q = q + 1;
+            }
+            unsafe {
+                (*sref2).ptr = rp as *const u8;
+                (*sref2).len = 65;
+            }
+        }
+        notes_ptr = sref;
+        note_cnt = 2;
+    }
+    let d = Diagnostic {
+        code: code,
+        severity: sev,
+        message: msg_sv,
+        primary: primary_sp,
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: notes_ptr,
+        note_count: note_cnt,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    unsafe { diag_sink_report(mut_view(*sink), view(d)); }
+}
+
+fn emit_spawn_use_after_move_diag(cx: mut_view<TypeckCtx>, use_sp: Span, move_sp: Span) {
+    if (cx.sink as usize) == 0 {
+        return;
+    }
+    let sink = cx.sink;
+    let code = (DiagCode { v: AX_MOVE_USE_AFTER_MOVE });
+    let sev = diag_code_severity(DiagCode { v: AX_MOVE_USE_AFTER_MOVE });
+    let msg_sv = unsafe { tc_alloc_diag_msg(mut_view((*sink).arena), (AX_MOVE_USE_AFTER_MOVE - 44u32) as usize) };
+    let lp = unsafe { arena_alloc_raw(mut_view((*sink).arena), 37, 1) };
+    let mut k: usize = 0;
+    while k < 37 {
+        unsafe { *(lp + k) = TC_LBL_MOVED_INTO_SPAWN[k]; }
+        k = k + 1;
+    }
+    let lbl = unsafe { arena_alloc_raw(mut_view((*sink).arena), size_of<DiagLabel>(), align_of<DiagLabel>()) as *mut DiagLabel };
+    unsafe {
+        (*lbl).span.file.v = move_sp.file.v;
+        (*lbl).span.start = move_sp.start;
+        (*lbl).span.end = move_sp.end;
+        (*lbl).message.ptr = lp as *const u8;
+        (*lbl).message.len = 37;
+    }
+    let d = Diagnostic {
+        code: code,
+        severity: sev,
+        message: msg_sv,
+        primary: use_sp,
+        labels: lbl,
+        label_count: 1,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: 0 as *mut DiagDataEntry,
+        data_count: 0,
+    };
+    unsafe { diag_sink_report(mut_view(*sink), view(d)); }
+}
+
+fn sync_closure_fn_item_types(cx: mut_view<TypeckCtx>, clos_t: *mut AxType) {
+    if (clos_t as usize) == 0 {
+        return;
+    }
+    let cap_count = unsafe { (*clos_t).capture_count };
+    let caps = unsafe { (*clos_t).captures };
+    let csym = unsafe { (*clos_t).fn_sym };
+    let fn_ptr = unsafe { ptr_itemmap_get(view((*cx.thir).expr_methods), ((csym as usize) << 3) | 4usize) };
+    let fn_item = if (fn_ptr as usize) != 0 { (unsafe { *fn_ptr }) as *mut HirItem } else { 0 as *mut HirItem };
+    if (fn_item as usize) != 0 {
+        let mut p: *mut HirParam = unsafe { (*fn_item).params };
+        let mut i: usize = 0;
+        while i < cap_count && (p as usize) != 0 {
+            let cc = unsafe { capture_at(caps, i) };
+            let cty_v = unsafe { (*cc).ty.v };
+            let psym_v = unsafe { (*p).symbol.v };
+            unsafe {
+                thir_set_param_type(mut_view(*cx.thir), p, (TypeId { v: cty_v }));
+                thir_set_sym_type(mut_view(*cx.thir), (SymbolId { v: psym_v }), (TypeId { v: cty_v }));
+            }
+            p = unsafe { (*p).next };
+            i = i + 1;
+        }
+    }
+    let fn_ty_v = unsafe { (*clos_t).fn_type.v };
+    if fn_ty_v != 0u32 {
+        let fn_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: fn_ty_v })) };
+        if (fn_t as usize) != 0 && (unsafe { (*fn_t).kind }) == TY_FN {
+            let pcount = unsafe { (*fn_t).param_count };
+            let ptypes = unsafe { (*fn_t).param_types };
+            let mut i: usize = 0;
+            while i < cap_count && i < pcount && (ptypes as usize) != 0 {
+                let cc = unsafe { capture_at(caps, i) };
+                unsafe { (*typeid_at(ptypes, i)).v = (*cc).ty.v; }
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fn tc_get_closure_cap_name(cx: view<TypeckCtx>, closure_sym: u32, cap_idx: usize) -> StrId {
+    let fn_ptr = unsafe { ptr_itemmap_get(view((*cx.thir).expr_methods), ((closure_sym as usize) << 3) | 4usize) };
+    if (fn_ptr as usize) == 0 {
+        return StrId { v: 0u32 };
+    }
+    let fn_item = (unsafe { *fn_ptr }) as *const HirItem;
+    if (fn_item as usize) == 0 {
+        return StrId { v: 0u32 };
+    }
+    let mut p: *mut HirParam = unsafe { (*fn_item).params };
+    let mut i: usize = 0;
+    while (p as usize) != 0 {
+        if i == cap_idx {
+            return StrId { v: unsafe { (*p).name.v } };
+        }
+        p = unsafe { (*p).next };
+        i = i + 1;
+    }
+    StrId { v: 0u32 }
+}
+
+fn verify_closure_at_boundary(
+    cx: mut_view<TypeckCtx>,
+    clos_t: *mut AxType,
+    boundary_kind: u8,
+    call_sp: Span
+) {
+    if (clos_t as usize) == 0 || (cx.hir as usize) == 0 || (cx.str_in as usize) == 0 {
+        return;
+    }
+    let csym = unsafe { (*clos_t).fn_sym };
+    if boundary_kind == 1u8 || boundary_kind == 2u8 {
+        unsafe {
+            (*clos_t).is_repr_c = true;
+        }
+    }
+    let clos_sp = find_closure_expr_span(
+        view(*cx),
+        csym,
+        Span { file: (FileId { v: call_sp.file.v }), start: call_sp.start, end: call_sp.end }
+    );
+    let diag_sp = if boundary_kind == 3u8 {
+        Span { file: (FileId { v: clos_sp.file.v }), start: clos_sp.start, end: clos_sp.end }
+    } else {
+        Span { file: (FileId { v: call_sp.file.v }), start: call_sp.start, end: call_sp.end }
+    };
+    let cap_count = unsafe { (*clos_t).capture_count };
+    let caps = unsafe { (*clos_t).captures };
+    let send_sv = StrView { ptr: unsafe { address_of(TC_SEND_TRAIT_NAME[0]) }, len: 4 };
+    let mut changed = false;
+    let mut i: usize = 0;
+    while i < cap_count {
+        let cc = unsafe { capture_at(caps, i) };
+        let sym_v = unsafe { (*cc).sym.v };
+        let mode = unsafe { (*cc).mode };
+        let cname = tc_get_closure_cap_name(view(*cx), csym, i);
+        let cty_v = unsafe { (*cc).ty.v };
+        let vty = unsafe { thir_get_symbol_type(view(*cx.thir), (SymbolId { v: sym_v })) };
+        let base_ty = if vty.v != 0u32 {
+            resolve_ty(mut_view(*cx), (TypeId { v: vty.v }))
+        } else {
+            resolve_ty(mut_view(*cx), (TypeId { v: cty_v }))
+        };
+        let has_view = type_contains_view(mut_view(*cx), (TypeId { v: base_ty.v }));
+        if has_view || mode == CAP_MUT_VIEW {
+            emit_spawn_capture_diag(
+                mut_view(*cx),
+                AX_CONC_ESCAPING_VIEW,
+                Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end },
+                (StrId { v: cname.v }),
+                (TypeId { v: cty_v })
+            );
+        } else {
+            if (boundary_kind == 1u8 || boundary_kind == 2u8) && mode != CAP_MOVE {
+                let is_c = unsafe { type_is_copy((TypeId { v: base_ty.v }), view(*cx.thir), view(*cx.str_in)) };
+                if !is_c {
+                    unsafe {
+                        (*cc).mode = CAP_MOVE;
+                        (*cc).ty.v = base_ty.v;
+                    }
+                    changed = true;
+                }
+            }
+            if boundary_kind == 1u8 && (cx.db as usize) != 0 {
+                let ok_send = unsafe {
+                    type_satisfies_auto_trait(
+                        view(*cx.hir),
+                        view(*cx.thir),
+                        (TypeId { v: base_ty.v }),
+                        1u8,
+                        10007u32,
+                        view(send_sv),
+                        view(*cx.str_in),
+                        view(*cx.db),
+                        0
+                    )
+                };
+                if !ok_send {
+                    emit_spawn_capture_diag(
+                        mut_view(*cx),
+                        AX_CONC_CAPTURE_NOT_SEND,
+                        Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end },
+                        (StrId { v: cname.v }),
+                        (TypeId { v: base_ty.v })
+                    );
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if changed {
+        sync_closure_fn_item_types(mut_view(*cx), clos_t);
+    }
+    let fn_ty_v = unsafe { (*clos_t).fn_type.v };
+    if fn_ty_v != 0u32 {
+        let fn_t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: fn_ty_v })) };
+        if (fn_t as usize) != 0 && (unsafe { (*fn_t).kind }) == TY_FN {
+            let ret_ty = resolve_ty(mut_view(*cx), TypeId { v: unsafe { (*fn_t).ret_type.v } });
+            if ret_ty.v != 0u32 {
+                let ret_view = type_contains_view(mut_view(*cx), (TypeId { v: ret_ty.v }));
+                if ret_view {
+                    emit_spawn_capture_diag(
+                        mut_view(*cx),
+                        AX_CONC_ESCAPING_VIEW,
+                        Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end },
+                        StrId { v: 0u32 },
+                        (TypeId { v: ret_ty.v })
+                    );
+                } else if boundary_kind == 1u8 && (cx.db as usize) != 0 && (cx.sink as usize) != 0 {
+                    let ok_ret = unsafe {
+                        type_satisfies_auto_trait(
+                            view(*cx.hir),
+                            view(*cx.thir),
+                            (TypeId { v: ret_ty.v }),
+                            1u8,
+                            10007u32,
+                            view(send_sv),
+                            view(*cx.str_in),
+                            view(*cx.db),
+                            0
+                        )
+                    };
+                    if !ok_ret {
+                        unsafe {
+                            emit_conc_bound_diag(
+                                view(*cx.hir),
+                                view(*cx.thir),
+                                (TypeId { v: ret_ty.v }),
+                                1u8,
+                                10007u32,
+                                view(send_sv),
+                                view(*cx.str_in),
+                                view(*cx.db),
+                                mut_view(*cx.sink),
+                                Span { file: (FileId { v: diag_sp.file.v }), start: diag_sp.start, end: diag_sp.end }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scan_spawn_boundaries_block(cx: mut_view<TypeckCtx>, blk: *const HirBlock, is_tail: bool) {
+    if (blk as usize) == 0 {
+        return;
+    }
+    let mut s: *mut HirStmt = unsafe { (*blk).stmts };
+    while (s as usize) != 0 {
+        let sk = unsafe { (*s).kind };
+        let next_s: *mut HirStmt = unsafe { (*s).next };
+        if sk == HIR_STMT_LET {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            let eb: *mut HirBlock = unsafe { (*s).else_block };
+            if (e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), e, false); }
+            if (eb as usize) != 0 { scan_spawn_boundaries_block(mut_view(*cx), eb, false); }
+        } else if sk == HIR_STMT_ASSIGN {
+            let l: *mut HirExpr = unsafe { (*s).left };
+            let r: *mut HirExpr = unsafe { (*s).right };
+            if (l as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), l, false); }
+            if (r as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), r, false); }
+        } else if sk == HIR_STMT_EXPR {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            let tail_here = is_tail && (next_s as usize) == 0 && !(unsafe { (*s).has_semi });
+            if (e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), e, tail_here); }
+        }
+        s = next_s;
+    }
+}
+
+fn scan_spawn_boundaries_expr(cx: mut_view<TypeckCtx>, expr: *const HirExpr, is_ret_pos: bool) {
+    if (expr as usize) == 0 {
+        return;
+    }
+    let ek = unsafe { (*expr).kind };
+    if is_ret_pos {
+        let et_v = unsafe { thir_get_expr_type(view(*cx.thir), expr).v };
+        if et_v != 0u32 {
+            let et = resolve_ty(mut_view(*cx), TypeId { v: et_v });
+            let t = unsafe { type_get(view((*cx.thir).interner), et) };
+            if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_CLOSURE {
+                let sp = Span {
+                    file: (FileId { v: unsafe { (*expr).span.file.v } }),
+                    start: unsafe { (*expr).span.start },
+                    end: unsafe { (*expr).span.end },
+                };
+                verify_closure_at_boundary(mut_view(*cx), t as *mut AxType, 3u8, sp);
+            }
+        }
+    }
+    if ek == HIR_EXPR_CALL || ek == HIR_EXPR_METHOD_CALL {
+        if ek == HIR_EXPR_CALL {
+            let callee: *mut HirExpr = unsafe { (*expr).callee };
+            if (callee as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), callee, false); }
+        } else {
+            let recv: *mut HirExpr = unsafe { (*expr).receiver };
+            if (recv as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), recv, false); }
+        }
+        let mut a: *mut HirExpr = unsafe { (*expr).args };
+        while (a as usize) != 0 {
+            scan_spawn_boundaries_expr(mut_view(*cx), a, false);
+            a = unsafe { (*a).next };
+        }
+        let sk = classify_spawn_call(view(*cx), expr);
+        if sk != 0u8 {
+            let call_sp = Span {
+                file: (FileId { v: unsafe { (*expr).span.file.v } }),
+                start: unsafe { (*expr).span.start },
+                end: unsafe { (*expr).span.end },
+            };
+            let send_sv = StrView { ptr: unsafe { address_of(TC_SEND_TRAIT_NAME[0]) }, len: 4 };
+            let mut arg: *mut HirExpr = unsafe { (*expr).args };
+            while (arg as usize) != 0 {
+                let at_v = unsafe { thir_get_expr_type(view(*cx.thir), arg).v };
+                if at_v != 0u32 {
+                    let arg_ty = resolve_ty(mut_view(*cx), TypeId { v: at_v });
+                    let at = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: arg_ty.v })) };
+                    if (at as usize) != 0 && (unsafe { (*at).kind }) == TY_CLOSURE {
+                        verify_closure_at_boundary(
+                            mut_view(*cx),
+                            at as *mut AxType,
+                            sk,
+                            Span { file: (FileId { v: call_sp.file.v }), start: call_sp.start, end: call_sp.end }
+                        );
+                    } else if arg_ty.v != 0u32 {
+                        let arg_sp = Span {
+                            file: (FileId { v: unsafe { (*arg).span.file.v } }),
+                            start: unsafe { (*arg).span.start },
+                            end: unsafe { (*arg).span.end },
+                        };
+                        let has_view = type_contains_view(mut_view(*cx), (TypeId { v: arg_ty.v }));
+                        if has_view {
+                            let mut aname = StrId { v: 0u32 };
+                            if (unsafe { (*arg).kind }) == HIR_EXPR_PATH {
+                                aname.v = unsafe { (*arg).path.name.v };
+                            }
+                            emit_spawn_capture_diag(
+                                mut_view(*cx),
+                                AX_CONC_ESCAPING_VIEW,
+                                Span { file: (FileId { v: arg_sp.file.v }), start: arg_sp.start, end: arg_sp.end },
+                                aname,
+                                (TypeId { v: arg_ty.v })
+                            );
+                        } else if sk == 1u8 && (cx.db as usize) != 0 {
+                            let ok_send = unsafe {
+                                type_satisfies_auto_trait(
+                                    view(*cx.hir),
+                                    view(*cx.thir),
+                                    (TypeId { v: arg_ty.v }),
+                                    1u8,
+                                    10007u32,
+                                    view(send_sv),
+                                    view(*cx.str_in),
+                                    view(*cx.db),
+                                    0
+                                )
+                            };
+                            if !ok_send {
+                                if (unsafe { (*arg).kind }) == HIR_EXPR_PATH && (unsafe { (*arg).path.name.v }) != 0u32 {
+                                    emit_spawn_capture_diag(
+                                        mut_view(*cx),
+                                        AX_CONC_CAPTURE_NOT_SEND,
+                                        Span { file: (FileId { v: arg_sp.file.v }), start: arg_sp.start, end: arg_sp.end },
+                                        StrId { v: unsafe { (*arg).path.name.v } },
+                                        (TypeId { v: arg_ty.v })
+                                    );
+                                } else if (cx.sink as usize) != 0 {
+                                    unsafe {
+                                        emit_conc_bound_diag(
+                                            view(*cx.hir),
+                                            view(*cx.thir),
+                                            (TypeId { v: arg_ty.v }),
+                                            1u8,
+                                            10007u32,
+                                            view(send_sv),
+                                            view(*cx.str_in),
+                                            view(*cx.db),
+                                            mut_view(*cx.sink),
+                                            Span { file: (FileId { v: arg_sp.file.v }), start: arg_sp.start, end: arg_sp.end }
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                arg = unsafe { (*arg).next };
+            }
+        }
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE {
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        scan_spawn_boundaries_block(mut_view(*cx), blk, is_ret_pos);
+    } else if ek == HIR_EXPR_IF {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        let else_e: *mut HirExpr = unsafe { (*expr).else_branch };
+        if (cond_e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), cond_e, false); }
+        if (blk as usize) != 0 { scan_spawn_boundaries_block(mut_view(*cx), blk, is_ret_pos); }
+        if (else_e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), else_e, is_ret_pos); }
+    } else if ek == HIR_EXPR_WHILE {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (cond_e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), cond_e, false); }
+        if (blk as usize) != 0 { scan_spawn_boundaries_block(mut_view(*cx), blk, false); }
+    } else if ek == HIR_EXPR_FOR {
+        let iter_e: *mut HirExpr = unsafe { (*expr).iter };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (iter_e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), iter_e, false); }
+        if (blk as usize) != 0 { scan_spawn_boundaries_block(mut_view(*cx), blk, false); }
+    } else if ek == HIR_EXPR_MATCH {
+        let m_e: *mut HirExpr = unsafe { (*expr).cond };
+        if (m_e as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), m_e, false); }
+        let mut arm: *mut HirMatchArm = unsafe { (*expr).arms };
+        while (arm as usize) != 0 {
+            let ag: *mut HirExpr = unsafe { (*arm).guard };
+            let ab: *mut HirExpr = unsafe { (*arm).body };
+            if (ag as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), ag, false); }
+            if (ab as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), ab, is_ret_pos); }
+            arm = unsafe { (*arm).next };
+        }
+    } else if ek == HIR_EXPR_BINARY {
+        let l: *mut HirExpr = unsafe { (*expr).left };
+        let r: *mut HirExpr = unsafe { (*expr).right };
+        if (l as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), l, false); }
+        if (r as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), r, false); }
+    } else if ek == HIR_EXPR_UNARY || ek == HIR_EXPR_CAST || ek == HIR_EXPR_VIEW || ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT {
+        let ie: *mut HirExpr = unsafe { (*expr).inner };
+        if (ie as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), ie, false); }
+    } else if ek == HIR_EXPR_FIELD || ek == HIR_EXPR_TUPLE_INDEX {
+        let b: *mut HirExpr = unsafe { (*expr).base };
+        if (b as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), b, false); }
+    } else if ek == HIR_EXPR_INDEX {
+        let b: *mut HirExpr = unsafe { (*expr).base };
+        let ia: *mut HirExpr = unsafe { (*expr).index_arg };
+        if (b as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), b, false); }
+        if (ia as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), ia, false); }
+    } else if ek == HIR_EXPR_TUPLE || ek == HIR_EXPR_ARRAY {
+        let mut e: *mut HirExpr = unsafe { (*expr).elems };
+        while (e as usize) != 0 {
+            scan_spawn_boundaries_expr(mut_view(*cx), e, false);
+            e = unsafe { (*e).next };
+        }
+        let ce: *mut HirExpr = unsafe { (*expr).count_expr };
+        if (ce as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), ce, false); }
+    } else if ek == HIR_EXPR_STRUCT {
+        let mut f: *mut HirFieldInit = unsafe { (*expr).fields };
+        while (f as usize) != 0 {
+            let fe: *mut HirExpr = unsafe { (*f).expr };
+            if (fe as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), fe, false); }
+            f = unsafe { (*f).next };
+        }
+    } else if ek == HIR_EXPR_JUMP {
+        let je: *mut HirExpr = unsafe { (*expr).inner };
+        let is_ret = (unsafe { (*expr).jump_kind }) == JUMP_RETURN;
+        if (je as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), je, is_ret); }
+    } else if ek == HIR_EXPR_CLOSURE {
+        let cb: *mut HirExpr = unsafe { (*expr).body };
+        if (cb as usize) != 0 { scan_spawn_boundaries_expr(mut_view(*cx), cb, true); }
+    }
+}
+
+struct SpawnMoveTracker {
+    syms: [64]u32,
+    files: [64]u32,
+    starts: [64]u32,
+    ends: [64]u32,
+    count: usize,
+}
+
+fn spawn_move_find(tr: view<SpawnMoveTracker>, sym_v: u32) -> isize {
+    let cnt = tr.count;
+    let mut i: usize = 0;
+    while i < cnt {
+        if tr.syms[i] == sym_v {
+            return i as isize;
+        }
+        i = i + 1;
+    }
+    -1isize
+}
+
+fn spawn_move_record(tr: mut_view<SpawnMoveTracker>, sym_v: u32, sp: Span) {
+    if sym_v == 0u32 {
+        return;
+    }
+    let idx = spawn_move_find(view(*tr), sym_v);
+    if idx >= 0isize {
+        return;
+    }
+    let c = tr.count;
+    if c < 64 {
+        tr.syms[c] = sym_v;
+        tr.files[c] = sp.file.v;
+        tr.starts[c] = sp.start;
+        tr.ends[c] = sp.end;
+        tr.count = c + 1;
+    }
+}
+
+fn spawn_move_get_span(tr: view<SpawnMoveTracker>, idx: usize) -> Span {
+    Span {
+        file: (FileId { v: tr.files[idx] }),
+        start: tr.starts[idx],
+        end: tr.ends[idx],
+    }
+}
+
+fn spawn_move_clear(tr: mut_view<SpawnMoveTracker>, sym_v: u32) {
+    let idx = spawn_move_find(view(*tr), sym_v);
+    if idx >= 0isize {
+        let u = idx as usize;
+        tr.syms[u] = 0u32;
+    }
+}
+
+fn check_spawn_moves_block(cx: mut_view<TypeckCtx>, blk: *const HirBlock, tr: mut_view<SpawnMoveTracker>) {
+    if (blk as usize) == 0 {
+        return;
+    }
+    let mut s: *mut HirStmt = unsafe { (*blk).stmts };
+    while (s as usize) != 0 {
+        let sk = unsafe { (*s).kind };
+        if sk == HIR_STMT_LET {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            let eb: *mut HirBlock = unsafe { (*s).else_block };
+            if (e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), e, mut_view(*tr)); }
+            if (eb as usize) != 0 { check_spawn_moves_block(mut_view(*cx), eb, mut_view(*tr)); }
+        } else if sk == HIR_STMT_ASSIGN {
+            let l: *mut HirExpr = unsafe { (*s).left };
+            let r: *mut HirExpr = unsafe { (*s).right };
+            if (r as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), r, mut_view(*tr)); }
+            if (l as usize) != 0 {
+                if (unsafe { (*l).kind }) == HIR_EXPR_PATH {
+                    spawn_move_clear(mut_view(*tr), unsafe { (*l).path.symbol.v });
+                } else {
+                    check_spawn_moves_expr(mut_view(*cx), l, mut_view(*tr));
+                }
+            }
+        } else if sk == HIR_STMT_EXPR {
+            let e: *mut HirExpr = unsafe { (*s).expr };
+            if (e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), e, mut_view(*tr)); }
+        }
+        s = unsafe { (*s).next };
+    }
+}
+
+fn check_spawn_moves_expr(cx: mut_view<TypeckCtx>, expr: *const HirExpr, tr: mut_view<SpawnMoveTracker>) {
+    if (expr as usize) == 0 {
+        return;
+    }
+    let ek = unsafe { (*expr).kind };
+    if ek == HIR_EXPR_PATH {
+        let sym_v = unsafe { (*expr).path.symbol.v };
+        if sym_v != 0u32 {
+            let idx = spawn_move_find(view(*tr), sym_v);
+            if idx >= 0isize {
+                let use_sp = Span {
+                    file: (FileId { v: unsafe { (*expr).span.file.v } }),
+                    start: unsafe { (*expr).span.start },
+                    end: unsafe { (*expr).span.end },
+                };
+                let mv_sp = spawn_move_get_span(view(*tr), idx as usize);
+                emit_spawn_use_after_move_diag(mut_view(*cx), use_sp, mv_sp);
+            }
+        }
+    } else if ek == HIR_EXPR_CLOSURE {
+        let et_v = unsafe { thir_get_expr_type(view(*cx.thir), expr).v };
+        if et_v != 0u32 {
+            let et = resolve_ty(mut_view(*cx), TypeId { v: et_v });
+            let t = unsafe { type_get(view((*cx.thir).interner), et) };
+            if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_CLOSURE {
+                let is_spawned = unsafe { (*t).is_repr_c };
+                let cap_count = unsafe { (*t).capture_count };
+                let caps = unsafe { (*t).captures };
+                let clos_sp = Span {
+                    file: (FileId { v: unsafe { (*expr).span.file.v } }),
+                    start: unsafe { (*expr).span.start },
+                    end: unsafe { (*expr).span.end },
+                };
+                let mut i: usize = 0;
+                while i < cap_count {
+                    let cc = unsafe { capture_at(caps, i) };
+                    let sym_v = unsafe { (*cc).sym.v };
+                    let mode = unsafe { (*cc).mode };
+                    if sym_v != 0u32 {
+                        let idx = spawn_move_find(view(*tr), sym_v);
+                        if idx >= 0isize {
+                            let mv_sp = spawn_move_get_span(view(*tr), idx as usize);
+                            emit_spawn_use_after_move_diag(
+                                mut_view(*cx),
+                                Span { file: (FileId { v: clos_sp.file.v }), start: clos_sp.start, end: clos_sp.end },
+                                mv_sp
+                            );
+                        } else if is_spawned && mode == CAP_MOVE {
+                            spawn_move_record(
+                                mut_view(*tr),
+                                sym_v,
+                                Span { file: (FileId { v: clos_sp.file.v }), start: clos_sp.start, end: clos_sp.end }
+                            );
+                        }
+                    }
+                    i = i + 1;
+                }
+            }
+        }
+        let cb: *mut HirExpr = unsafe { (*expr).body };
+        if (cb as usize) != 0 {
+            let mut inner_tr = SpawnMoveTracker {
+                syms: [0u32; 64],
+                files: [0u32; 64],
+                starts: [0u32; 64],
+                ends: [0u32; 64],
+                count: 0,
+            };
+            check_spawn_moves_expr(mut_view(*cx), cb, mut_view(inner_tr));
+        }
+    } else if ek == HIR_EXPR_CALL || ek == HIR_EXPR_METHOD_CALL {
+        if ek == HIR_EXPR_CALL {
+            let callee: *mut HirExpr = unsafe { (*expr).callee };
+            if (callee as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), callee, mut_view(*tr)); }
+        } else {
+            let recv: *mut HirExpr = unsafe { (*expr).receiver };
+            if (recv as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), recv, mut_view(*tr)); }
+        }
+        let sk = classify_spawn_call(view(*cx), expr);
+        let mut a: *mut HirExpr = unsafe { (*expr).args };
+        while (a as usize) != 0 {
+            check_spawn_moves_expr(mut_view(*cx), a, mut_view(*tr));
+            if sk != 0u8 && (unsafe { (*a).kind }) == HIR_EXPR_PATH {
+                let sym_v = unsafe { (*a).path.symbol.v };
+                if sym_v != 0u32 && (cx.str_in as usize) != 0 {
+                    let at_v = unsafe { thir_get_expr_type(view(*cx.thir), a).v };
+                    if at_v != 0u32 {
+                        let arg_ty = resolve_ty(mut_view(*cx), TypeId { v: at_v });
+                        let is_c = unsafe { type_is_copy(arg_ty, view(*cx.thir), view(*cx.str_in)) };
+                        if !is_c {
+                            let asp = Span {
+                                file: (FileId { v: unsafe { (*a).span.file.v } }),
+                                start: unsafe { (*a).span.start },
+                                end: unsafe { (*a).span.end },
+                            };
+                            spawn_move_record(mut_view(*tr), sym_v, asp);
+                        }
+                    }
+                }
+            }
+            a = unsafe { (*a).next };
+        }
+    } else if ek == HIR_EXPR_BLOCK || ek == HIR_EXPR_UNSAFE {
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        check_spawn_moves_block(mut_view(*cx), blk, mut_view(*tr));
+    } else if ek == HIR_EXPR_IF {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        let else_e: *mut HirExpr = unsafe { (*expr).else_branch };
+        if (cond_e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), cond_e, mut_view(*tr)); }
+        let save_cnt = tr.count;
+        if (blk as usize) != 0 { check_spawn_moves_block(mut_view(*cx), blk, mut_view(*tr)); }
+        let then_cnt = tr.count;
+        if (else_e as usize) != 0 {
+            tr.count = save_cnt;
+            check_spawn_moves_expr(mut_view(*cx), else_e, mut_view(*tr));
+            let else_cnt = tr.count;
+            if then_cnt > else_cnt {
+                tr.count = then_cnt;
+            }
+        }
+    } else if ek == HIR_EXPR_WHILE {
+        let cond_e: *mut HirExpr = unsafe { (*expr).cond };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (cond_e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), cond_e, mut_view(*tr)); }
+        if (blk as usize) != 0 { check_spawn_moves_block(mut_view(*cx), blk, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_FOR {
+        let iter_e: *mut HirExpr = unsafe { (*expr).iter };
+        let blk: *mut HirBlock = unsafe { (*expr).block };
+        if (iter_e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), iter_e, mut_view(*tr)); }
+        if (blk as usize) != 0 { check_spawn_moves_block(mut_view(*cx), blk, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_MATCH {
+        let m_e: *mut HirExpr = unsafe { (*expr).cond };
+        if (m_e as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), m_e, mut_view(*tr)); }
+        let mut arm: *mut HirMatchArm = unsafe { (*expr).arms };
+        while (arm as usize) != 0 {
+            let ag: *mut HirExpr = unsafe { (*arm).guard };
+            let ab: *mut HirExpr = unsafe { (*arm).body };
+            if (ag as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), ag, mut_view(*tr)); }
+            if (ab as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), ab, mut_view(*tr)); }
+            arm = unsafe { (*arm).next };
+        }
+    } else if ek == HIR_EXPR_BINARY {
+        let l: *mut HirExpr = unsafe { (*expr).left };
+        let r: *mut HirExpr = unsafe { (*expr).right };
+        if (l as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), l, mut_view(*tr)); }
+        if (r as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), r, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_UNARY || ek == HIR_EXPR_CAST || ek == HIR_EXPR_VIEW || ek == HIR_EXPR_TRY || ek == HIR_EXPR_AWAIT || ek == HIR_EXPR_JUMP {
+        let ie: *mut HirExpr = unsafe { (*expr).inner };
+        if (ie as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), ie, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_FIELD || ek == HIR_EXPR_TUPLE_INDEX {
+        let b: *mut HirExpr = unsafe { (*expr).base };
+        if (b as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), b, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_INDEX {
+        let b: *mut HirExpr = unsafe { (*expr).base };
+        let ia: *mut HirExpr = unsafe { (*expr).index_arg };
+        if (b as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), b, mut_view(*tr)); }
+        if (ia as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), ia, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_TUPLE || ek == HIR_EXPR_ARRAY {
+        let mut e: *mut HirExpr = unsafe { (*expr).elems };
+        while (e as usize) != 0 {
+            check_spawn_moves_expr(mut_view(*cx), e, mut_view(*tr));
+            e = unsafe { (*e).next };
+        }
+        let ce: *mut HirExpr = unsafe { (*expr).count_expr };
+        if (ce as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), ce, mut_view(*tr)); }
+    } else if ek == HIR_EXPR_STRUCT {
+        let mut f: *mut HirFieldInit = unsafe { (*expr).fields };
+        while (f as usize) != 0 {
+            let fe: *mut HirExpr = unsafe { (*f).expr };
+            if (fe as usize) != 0 { check_spawn_moves_expr(mut_view(*cx), fe, mut_view(*tr)); }
+            f = unsafe { (*f).next };
+        }
+    }
+}
+
+fn verify_closures_and_spawns(cx: mut_view<TypeckCtx>) {
+    if (cx.hir as usize) == 0 || (cx.thir as usize) == 0 {
+        return;
+    }
+    let mut it: *mut HirItem = unsafe { (*cx.hir).items };
+    while (it as usize) != 0 {
+        let ik = unsafe { (*it).kind };
+        if ik == HIR_ITEM_FN {
+            let sym_v = unsafe { (*it).symbol.v };
+            if sym_v < 0x40000000u32 || sym_v >= 0x50000000u32 {
+                let blk: *mut HirBlock = unsafe { (*it).body };
+                if (blk as usize) != 0 {
+                    scan_spawn_boundaries_block(mut_view(*cx), blk, true);
+                }
+            }
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    let mblk: *mut HirBlock = unsafe { (*m).body };
+                    if (mblk as usize) != 0 {
+                        scan_spawn_boundaries_block(mut_view(*cx), mblk, true);
+                    }
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it = unsafe { (*it).next };
+    }
+
+    let mut it2: *mut HirItem = unsafe { (*cx.hir).items };
+    while (it2 as usize) != 0 {
+        let ik = unsafe { (*it2).kind };
+        if ik == HIR_ITEM_FN {
+            let sym_v = unsafe { (*it2).symbol.v };
+            if sym_v < 0x40000000u32 || sym_v >= 0x50000000u32 {
+                let blk: *mut HirBlock = unsafe { (*it2).body };
+                if (blk as usize) != 0 {
+                    let mut tr = SpawnMoveTracker {
+                        syms: [0u32; 64],
+                        files: [0u32; 64],
+                        starts: [0u32; 64],
+                        ends: [0u32; 64],
+                        count: 0,
+                    };
+                    check_spawn_moves_block(mut_view(*cx), blk, mut_view(tr));
+                }
+            }
+        } else if ik == HIR_ITEM_IMPL {
+            let mut m: *mut HirItem = unsafe { (*it2).members };
+            while (m as usize) != 0 {
+                if (unsafe { (*m).kind }) == HIR_ITEM_FN {
+                    let mblk: *mut HirBlock = unsafe { (*m).body };
+                    if (mblk as usize) != 0 {
+                        let mut tr = SpawnMoveTracker {
+                            syms: [0u32; 64],
+                            files: [0u32; 64],
+                            starts: [0u32; 64],
+                            ends: [0u32; 64],
+                            count: 0,
+                        };
+                        check_spawn_moves_block(mut_view(*cx), mblk, mut_view(tr));
+                    }
+                }
+                m = unsafe { (*m).next };
+            }
+        }
+        it2 = unsafe { (*it2).next };
+    }
+
+    if (cx.str_in as usize) != 0 && (cx.db as usize) != 0 {
+        let send_sv = StrView { ptr: unsafe { address_of(TC_SEND_TRAIT_NAME[0]) }, len: 4 };
+        let share_sv = StrView { ptr: unsafe { address_of(TC_SHARE_TRAIT_NAME[0]) }, len: 5 };
+        let tlen = unsafe { (*cx.thir).interner.len };
+        let mut ti: u32 = 1u32;
+        while (ti as usize) <= tlen {
+            let t = unsafe { type_get(view((*cx.thir).interner), (TypeId { v: ti })) };
+            if (t as usize) != 0 && (unsafe { (*t).kind }) == TY_CLOSURE {
+                let _ = unsafe {
+                    type_satisfies_auto_trait(
+                        view(*cx.hir),
+                        view(*cx.thir),
+                        (TypeId { v: ti }),
+                        1u8,
+                        10007u32,
+                        view(send_sv),
+                        view(*cx.str_in),
+                        view(*cx.db),
+                        0
+                    )
+                };
+                let _ = unsafe {
+                    type_satisfies_auto_trait(
+                        view(*cx.hir),
+                        view(*cx.thir),
+                        (TypeId { v: ti }),
+                        2u8,
+                        10008u32,
+                        view(share_sv),
+                        view(*cx.str_in),
+                        view(*cx.db),
+                        0
+                    )
+                };
+            }
+            ti = ti + 1u32;
+        }
+    }
+}
+
 fn check_all_bounds(cx: mut_view<TypeckCtx>) {
     if (cx.hir as usize) == 0 || (cx.sink as usize) == 0 || (cx.str_in as usize) == 0 || (cx.db as usize) == 0 {
         return;
@@ -35067,7 +36302,15 @@ fn check_all_bounds(cx: mut_view<TypeckCtx>) {
                     let esym_v = unsafe { (*ex).path.symbol.v };
                     def = find_item_by_symbol(view(*cx), (SymbolId { v: esym_v }));
                 }
-                if (def as usize) != 0 {
+                let mut is_spawn_def = false;
+                if (def as usize) != 0 && (unsafe { (*def).kind }) == HIR_ITEM_FN {
+                    let dn_v = unsafe { (*def).name.v };
+                    if dn_v != 0u32 {
+                        let dsv = unsafe { interner_get(view(*cx.str_in), (StrId { v: dn_v })) };
+                        is_spawn_def = sv_is_spawn_name(view(dsv)) != 0u8;
+                    }
+                }
+                if (def as usize) != 0 && !is_spawn_def {
                     let sp_f = unsafe { (*ex).span.file.v };
                     let sp_s = unsafe { (*ex).span.start };
                     let sp_e = unsafe { (*ex).span.end };
@@ -36257,6 +37500,7 @@ fn typeck_pass1b_and_2(
     }
 
     finalize_types(mut_view(*cx));
+    verify_closures_and_spawns(mut_view(*cx));
     check_all_bounds(mut_view(*cx));
     if (thir_ptr as usize) != 0 && (sink_ptr as usize) != 0 && (str_ptr as usize) != 0 {
         unsafe {

@@ -1,0 +1,183 @@
+# T401 Report — E11.1 Closure & Spawn Capture Verification (Send Bounds, Escaping Views)
+
+## Summary
+
+Implemented closure environment `Send`/`Share` derivation and `spawn`/`spawn_local` capture ownership and capability escape verification (`0116 §84`, `0126 §11-12`, `0111 §47`, `0131 §88`, `0160 §26`, `SPEC-30` `AXS-CONC-020..024`, `AXS-CONC-050..052`):
+
+1. **Diagnostic Codes (`compiler/diag/code.ax`, `compiler/types/typeck.ax`)**:
+   - Added `AX_CONC_CAPTURE_NOT_SEND = 142u32`, `AX_CONC_ESCAPING_VIEW = 143u32`, and `AX_CONC_SPAWN_REQUIRES_MOVE = 144u32` along with their names and default messages in `compiler/diag/code.ax`.
+   - Extended `patch_unknown_intrinsic_diag_buf` in `compiler/types/typeck.ax` to patch formatted diagnostic codes `142..144` using `const` byte arrays (maintaining zero string literals in `compiler/types/typeck.ax`).
+2. **Closure Capture Discovery & `Send`/`Share` Derivation (`compiler/types/typeck.ax`)**:
+   - Extended `add_pat_syms` (`HIR_PAT_PATH`, `HIR_PAT_OR`) and `scan_expr_captures` (`HIR_EXPR_TRY`, `HIR_EXPR_AWAIT`, nested `HIR_EXPR_CLOSURE`) so only execution-relevant outer variables are captured (`0116 §84`, `AXS-CONC-020`).
+   - Recorded captured variable names on `RawCapture` and closure `fn_item` parameters so concurrency diagnostics identify the offending captured variable.
+   - Derived closure `Send` and `Share` in `verify_closures_and_spawns` strictly from captured fields via `type_satisfies_auto_trait`.
+3. **Spawn / Spawn-Local / Escaping Closure Verification (`compiler/types/typeck.ax`)**:
+   - Implemented `verify_closure_at_boundary` and `scan_spawn_boundaries_expr`:
+     - Rejects closures and arguments at `spawn`, `spawn_local`, or function return boundaries that capture or return non-escaping `view<T>` / `mut_view<T>` values or implicit `CAP_MUT_VIEW` stack borrows with `AX_CONC_ESCAPING_VIEW` (`AXS-CONC-023`, `AXS-CONC-051`).
+     - Upgrades `!Copy` non-view captures in closures crossing `spawn`/`spawn_local` boundaries to `CAP_MOVE` and synchronizes closure `fn_item` parameter types (`sync_closure_fn_item_types`), enforcing move ownership transfer (`0126 §11-12`, `AXS-CONC-022`).
+     - Requires `Send` on all captured values and return types crossing multi-threaded `spawn` (`AX_CONC_CAPTURE_NOT_SEND`, `AXS-CONC-024`, `AXS-CONC-050`), while permitting `!Send` captures in same-thread `spawn_local` subject to view-escape verification.
+   - Implemented `check_spawn_moves_block` / `check_spawn_moves_expr` to track `!Copy` variables moved into `spawn`/`spawn_local` closures and emit `AX_MOVE_USE_AFTER_MOVE` with a secondary label pointing to the `spawn` closure when used afterwards in the parent context.
+4. **Tests & Selfhost Bundles**:
+   - Added negative UI tests in `tests/ui/concurrency/spawn_capture/` (`non_send_capture_rejected.ax`, `escaping_view_rejected.ax`, `use_after_move_after_spawn.ax`).
+   - Added positive run tests (`modes: interp native`) in `tests/run/concurrency/spawn_capture/` (`send_and_copy_captures.ax`, `spawn_local_non_send.ax`).
+   - Regenerated all affected selfhost bundles under `tests/selfhost/`.
+
+## Verification
+
+- `python .claude/skills/axiom-tasks/scripts/taskctl.py snapshot T401`: exited 0.
+- `python build-snap-T401/tools/build_axiomc.py --root build-snap-T401 --out build-snap-T401/build`: stage1 and stage2 `axiomc2.exe` built cleanly.
+- `python build-snap-T401/tools/axtest.py --root build-snap-T401 --compiler build-snap-T401/build/axiomc2.exe --build-dir build-snap-T401/build --filter concurrency --filter bundles_current --filter qa_diag_codes --exclude-requires axiom0-internal`: `TOTAL 53 PASS 53 FAIL 0`.
+- `python build-snap-T401/tools/axtest.py --root build-snap-T401 --compiler build-snap-T401/build/axiomc2.exe --build-dir build-snap-T401/build --exclude-requires axiom0-internal -j 2 ui/concurrency/spawn_capture run/concurrency/spawn_capture selfhost/typeck selfhost/cap selfhost/own selfhost/diag run/intrinsics ui/intrinsics/unknown_intrinsic.ax` (plus `selfhost/diag` with `-j 1 --timeout-scale 4`): all 90 tests pass (`WEAK-NATIVE 0`, `FAIL 0`).
+- `python build-snap-T401/tools/archcheck.py --root build-snap-T401`: `193 files scanned, 0 violations`.
+- `python .claude/skills/axiom-tasks/scripts/harness_check.py --root build-snap-T401`: `HARNESS OK`.
+
+## Files changed
+
+- compiler/diag/code.ax
+- compiler/types/typeck.ax
+- tests/run/concurrency/spawn_capture/send_and_copy_captures.ax
+- tests/run/concurrency/spawn_capture/spawn_local_non_send.ax
+- tests/ui/concurrency/spawn_capture/escaping_view_rejected.ax
+- tests/ui/concurrency/spawn_capture/non_send_capture_rejected.ax
+- tests/ui/concurrency/spawn_capture/use_after_move_after_spawn.ax
+- tests/selfhost/abi/qa_abi_boundary_seam.ax
+- tests/selfhost/abi/qa_abi_lir_lower.ax
+- tests/selfhost/abi/qa_abi_win64_classify.ax
+- tests/selfhost/ast/qa_ast_derives.ax
+- tests/selfhost/ast/qa_ast_exprs_a.ax
+- tests/selfhost/ast/qa_ast_exprs_b.ax
+- tests/selfhost/ast/qa_ast_items.ax
+- tests/selfhost/ast/qa_ast_types_pats.ax
+- tests/selfhost/backend/qa_backend_diff_lir_a.ax
+- tests/selfhost/backend/qa_backend_diff_lir_b.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_a.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_b.ax
+- tests/selfhost/backend/qa_backend_edge.ax
+- tests/selfhost/backend/qa_backend_unit.ax
+- tests/selfhost/cap/qa_own_cap.ax
+- tests/selfhost/diag/qa_diag_codes.ax
+- tests/selfhost/diag/qa_diag_emitter.ax
+- tests/selfhost/diag/qa_diag_format_json.ax
+- tests/selfhost/driver/qa_driver_boundary_edges.ax
+- tests/selfhost/driver/qa_driver_cli_and_project.ax
+- tests/selfhost/driver/qa_driver_commands_a.ax
+- tests/selfhost/driver/qa_driver_commands_b.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_a.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_b.ax
+- tests/selfhost/drop/qa_drop_d01.ax
+- tests/selfhost/drop/qa_drop_d02.ax
+- tests/selfhost/drop/qa_drop_d03.ax
+- tests/selfhost/drop/qa_drop_d04.ax
+- tests/selfhost/drop/qa_drop_d05.ax
+- tests/selfhost/drop/qa_drop_d06.ax
+- tests/selfhost/drop/qa_drop_d07.ax
+- tests/selfhost/drop/qa_drop_d09.ax
+- tests/selfhost/drop/qa_drop_d10.ax
+- tests/selfhost/drop/qa_drop_d11.ax
+- tests/selfhost/drop/qa_drop_d12.ax
+- tests/selfhost/hir/qa_hir_corpus.ax
+- tests/selfhost/hir/qa_hir_desugar_and_drop.ax
+- tests/selfhost/interp/qa_interp_exec_a.ax
+- tests/selfhost/interp/qa_interp_exec_b.ax
+- tests/selfhost/interp/qa_interp_unit.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_unit.ax
+- tests/selfhost/isel/qa_frame_layout_and_verify.ax
+- tests/selfhost/isel/qa_isel_diff_golden.ax
+- tests/selfhost/isel/qa_isel_frame_seam_and_edge_cases.ax
+- tests/selfhost/isel/qa_isel_instructions_and_abi.ax
+- tests/selfhost/kernel_source_diag/qa_corpus_differential.ax
+- tests/selfhost/kernel_source_diag/qa_session_integration.ax
+- tests/selfhost/lex/qa_lex_differential.ax
+- tests/selfhost/lex/qa_lex_tokens.ax
+- tests/selfhost/lex/u64_max_literal.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_b.ax
+- tests/selfhost/lexer/qa_lexer_corpus_pos_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_pos_b.ax
+- tests/selfhost/lexer/qa_lexer_session_integration.ax
+- tests/selfhost/link/qa_pe_headers_and_imports.ax
+- tests/selfhost/link/qa_pe_linker_diff.ax
+- tests/selfhost/link/qa_pe_local_symbols.ax
+- tests/selfhost/lir/qa_lir_from_ax_a.ax
+- tests/selfhost/lir/qa_lir_from_ax_b.ax
+- tests/selfhost/lir/qa_lir_from_ax_c.ax
+- tests/selfhost/lir/qa_lir_from_ax_d.ax
+- tests/selfhost/lir/qa_lir_from_ax_e.ax
+- tests/selfhost/lir/qa_lir_from_mir.ax
+- tests/selfhost/lir/qa_lir_seam_edge.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_a.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_b.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_c.ax
+- tests/selfhost/mir/qa_mir_text_roundtrip.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_diff.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_smoke.ax
+- tests/selfhost/opt/qa_opt_pipeline.ax
+- tests/selfhost/opt/qa_opt_unit.ax
+- tests/selfhost/own/qa_own_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_cap_ptr.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_verify_mir.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_b.ax
+- tests/selfhost/parse/qa_parse_corpus_a.ax
+- tests/selfhost/parse/qa_parse_corpus_b.ax
+- tests/selfhost/parse/qa_parse_corpus_c.ax
+- tests/selfhost/parse/qa_parse_corpus_d.ax
+- tests/selfhost/parse/qa_parse_corpus_e.ax
+- tests/selfhost/parse/qa_parse_corpus_f.ax
+- tests/selfhost/parse/qa_parse_corpus_g.ax
+- tests/selfhost/parse/qa_parse_corpus_h.ax
+- tests/selfhost/parse/qa_parse_corpus_i.ax
+- tests/selfhost/parse/qa_parse_corpus_j.ax
+- tests/selfhost/parse/qa_parse_heavy_a.ax
+- tests/selfhost/parse/qa_parse_heavy_b.ax
+- tests/selfhost/parse/qa_parse_qa_edge.ax
+- tests/selfhost/parse/qa_parse_qa_tuple_struct.ax
+- tests/selfhost/parse/qa_parse_recovery_a.ax
+- tests/selfhost/parse/qa_parse_recovery_b.ax
+- tests/selfhost/parse/qa_parse_terminator_a.ax
+- tests/selfhost/parse/qa_parse_terminator_b.ax
+- tests/selfhost/parse/qa_parse_terminator_heavy.ax
+- tests/selfhost/parser/qa_parser_diff_corpus_wide.ax
+- tests/selfhost/parser/qa_parser_diff_neg_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_b.ax
+- tests/selfhost/parser/qa_parser_session_integration.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_a.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_b.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_c.ax
+- tests/selfhost/resolve/qa_resolve_corpus_pos.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_d.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_b.ax
+- tests/selfhost/traits/qa_traits_solver_mono.ax
+- tests/selfhost/typeck/qa_typeck_a.ax
+- tests/selfhost/typeck/qa_typeck_b.ax
+- tests/selfhost/typeck/qa_typeck_c.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_a.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_b.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_c.ax
+- tests/selfhost/types/qa_types_exhaust.ax
+- tests/selfhost/types/qa_types_layout.ax
+- tests/selfhost/verify/qa_verify_mir.ax
+- tests/selfhost/verify/qa_verify_pipeline.ax
+
+STATUS: COMPLETE round=0
