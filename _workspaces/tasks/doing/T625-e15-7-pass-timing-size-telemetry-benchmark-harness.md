@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T622, T624, T628]
 priority: 119
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/driver/perf_telemetry, tools/bench, tests/run/perf_contract]
 locks: [tools/perf.py]
 spec: [spec/SPEC-76-performance-contract.md, 0074, tasks/0408, tasks/0595, tasks/0706]
 covers: [REQ-OPT-242, REQ-OPT-243, REQ-OPT-244, REQ-OPT-245]
+started: 2026-11-08 03:25:19
+agent: T625-impl
 ---
 # T625 — E15.7 — Compiler pass-timing/code-size telemetry (--time-passes, --size-report) & benchmark harness enforcement
 
@@ -40,3 +42,4 @@ Implement structured `--time-passes` and `--size-report` telemetry in `compiler/
 
 ## Log
 - 2026-11-03 02:44:00 created by T215 (P15 phase planning)
+- 2026-11-08 03:25:19 started (attempt 1) T625-impl

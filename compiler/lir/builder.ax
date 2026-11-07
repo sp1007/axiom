@@ -121,6 +121,20 @@ use compiler.mir.mir.MIR_RVALUE_REPEAT
 use compiler.mir.mir.MIR_RVALUE_UNARY_OP
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_ATOMIC_LOAD
+use compiler.mir.mir.MIR_ATOMIC_STORE
+use compiler.mir.mir.MIR_ATOMIC_SWAP
+use compiler.mir.mir.MIR_ATOMIC_ADD
+use compiler.mir.mir.MIR_ATOMIC_SUB
+use compiler.mir.mir.MIR_ATOMIC_AND
+use compiler.mir.mir.MIR_ATOMIC_OR
+use compiler.mir.mir.MIR_ATOMIC_XOR
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG_WEAK
+use compiler.mir.mir.MIR_ATOMIC_FENCE
+use compiler.mir.mir.MIR_ATOMIC_COMPILER_FENCE
+use compiler.mir.mir.MIR_ATOMIC_SPIN_HINT
 use compiler.mir.mir.MIR_TERM_ASSERT
 use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MIR_TERM_GOTO
@@ -195,6 +209,12 @@ use compiler.lir.lir.LIR_INST_UDIV_OVERFLOW
 use compiler.lir.lir.LIR_INST_UMUL_OVERFLOW
 use compiler.lir.lir.LIR_INST_UREM_OVERFLOW
 use compiler.lir.lir.LIR_INST_USUB_OVERFLOW
+use compiler.lir.lir.LIR_INST_ATOMIC_LOAD
+use compiler.lir.lir.LIR_INST_ATOMIC_STORE
+use compiler.lir.lir.LIR_INST_ATOMIC_RMW
+use compiler.lir.lir.LIR_INST_ATOMIC_CAS
+use compiler.lir.lir.LIR_INST_FENCE
+use compiler.lir.lir.LIR_INST_PAUSE
 use compiler.lir.lir.LIR_TERM_ASSERT
 use compiler.lir.lir.LIR_TERM_JMP
 use compiler.lir.lir.LIR_TERM_RETURN
@@ -1453,6 +1473,165 @@ fn lower_assign_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
     emit_store(mut_view(*b), addr, val);
 }
 
+fn lower_atomic_stmt(b: mut_view<LirBuilder>, stmt: view<MirStmt>) {
+    let aop = stmt.rvalue.bin_op;
+    let ord = stmt.rvalue.cast_kind;
+    let fail_ord = stmt.rvalue.borrow_kind;
+
+    if aop == MIR_ATOMIC_FENCE || aop == MIR_ATOMIC_COMPILER_FENCE {
+        let inst = push_new_inst(mut_view(*b), LIR_INST_FENCE);
+        unsafe {
+            (*inst).dest.v = LIR_VREG_NONE;
+            (*inst).ordering = ord;
+            (*inst).is_compiler_only = aop == MIR_ATOMIC_COMPILER_FENCE;
+        }
+        return;
+    }
+    if aop == MIR_ATOMIC_SPIN_HINT {
+        let inst = push_new_inst(mut_view(*b), LIR_INST_PAUSE);
+        unsafe {
+            (*inst).dest.v = LIR_VREG_NONE;
+        }
+        return;
+    }
+
+    let mut elem_ty_v: u32 = 0u32;
+    if aop == MIR_ATOMIC_STORE || aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+        let _ = operand_is_signed(mut_view(*b), view(stmt.rvalue.lhs), unsafe { address_of_mut(elem_ty_v) });
+    } else {
+        elem_ty_v = get_place_type(mut_view(*b), view(stmt.place));
+    }
+    if elem_ty_v == 0u32 {
+        let mut ptr_ty_v: u32 = 0u32;
+        let _ = operand_is_signed(mut_view(*b), view(stmt.rvalue.use_op), unsafe { address_of_mut(ptr_ty_v) });
+        let pt = unsafe { type_get(view(*b.interner), TypeId { v: ptr_ty_v }) };
+        if (pt as usize) != 0 {
+            let ptk = unsafe { (*pt).kind };
+            let mut at = pt;
+            if ptk == TY_VIEW || ptk == TY_MUT_VIEW || ptk == TY_PTR {
+                at = unsafe { type_get(view(*b.interner), (*pt).pointee) };
+            }
+            if (at as usize) != 0 && (unsafe { (*at).kind }) == TY_STRUCT && (unsafe { (*at).field_count }) > 0 {
+                elem_ty_v = unsafe { (*typeid_at((*at).fields, 0)).v };
+            }
+        }
+    }
+
+    let mut sz = unsafe { type_size(TypeId { v: elem_ty_v }, view(*b.interner)) };
+    if sz != 1u32 && sz != 2u32 && sz != 4u32 && sz != 8u32 {
+        sz = 8u32;
+    }
+    let bw = sz * 8u32;
+    let ptr_v = lower_operand(mut_view(*b), view(stmt.rvalue.use_op));
+
+    if aop == MIR_ATOMIC_LOAD {
+        let res_v = make_vreg(mut_view(*b), elem_ty_v);
+        let inst = push_new_inst(mut_view(*b), LIR_INST_ATOMIC_LOAD);
+        unsafe {
+            (*inst).dest.v = res_v;
+            (*inst).ptr.v = ptr_v;
+            (*inst).ty.v = elem_ty_v;
+            (*inst).bit_width = bw;
+            (*inst).ordering = ord;
+        }
+        let dst_addr = lower_place_addr(mut_view(*b), view(stmt.place), 0 as *mut u32);
+        emit_store(mut_view(*b), dst_addr, res_v);
+        return;
+    }
+
+    if aop == MIR_ATOMIC_STORE {
+        let val_v = lower_operand(mut_view(*b), view(stmt.rvalue.lhs));
+        if elem_ty_v != 0u32 && (val_v as usize) < b.vreg_count {
+            let vp = unsafe { lir_vreg_at(b.vregs, val_v as usize) };
+            unsafe { (*vp).ty.v = elem_ty_v; }
+        }
+        let inst = push_new_inst(mut_view(*b), LIR_INST_ATOMIC_STORE);
+        unsafe {
+            (*inst).dest.v = LIR_VREG_NONE;
+            (*inst).ptr.v = ptr_v;
+            (*inst).val.v = val_v;
+            (*inst).ty.v = elem_ty_v;
+            (*inst).bit_width = bw;
+            (*inst).ordering = ord;
+        }
+        return;
+    }
+
+    if aop >= MIR_ATOMIC_SWAP && aop <= MIR_ATOMIC_XOR {
+        let val_v = lower_operand(mut_view(*b), view(stmt.rvalue.lhs));
+        if elem_ty_v != 0u32 && (val_v as usize) < b.vreg_count {
+            let vp = unsafe { lir_vreg_at(b.vregs, val_v as usize) };
+            unsafe { (*vp).ty.v = elem_ty_v; }
+        }
+        let res_v = make_vreg(mut_view(*b), elem_ty_v);
+        let rmw_op = aop - MIR_ATOMIC_SWAP;
+        let inst = push_new_inst(mut_view(*b), LIR_INST_ATOMIC_RMW);
+        unsafe {
+            (*inst).dest.v = res_v;
+            (*inst).ptr.v = ptr_v;
+            (*inst).val.v = val_v;
+            (*inst).ty.v = elem_ty_v;
+            (*inst).bit_width = bw;
+            (*inst).rmw_op = rmw_op;
+            (*inst).ordering = ord;
+        }
+        let dst_addr = lower_place_addr(mut_view(*b), view(stmt.place), 0 as *mut u32);
+        emit_store(mut_view(*b), dst_addr, res_v);
+        return;
+    }
+
+    if aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+        let exp_v = lower_operand(mut_view(*b), view(stmt.rvalue.lhs));
+        let des_v = lower_operand(mut_view(*b), view(stmt.rvalue.rhs));
+        if elem_ty_v != 0u32 {
+            if (exp_v as usize) < b.vreg_count {
+                let vp1 = unsafe { lir_vreg_at(b.vregs, exp_v as usize) };
+                unsafe { (*vp1).ty.v = elem_ty_v; }
+            }
+            if (des_v as usize) < b.vreg_count {
+                let vp2 = unsafe { lir_vreg_at(b.vregs, des_v as usize) };
+                unsafe { (*vp2).ty.v = elem_ty_v; }
+            }
+        }
+        let bool_ty_v = unsafe { (*b.interner).t_bool.v };
+        let usize_ty_v = unsafe { (*b.interner).t_usize.v };
+        let old_v = make_vreg(mut_view(*b), elem_ty_v);
+        let ok_v = make_vreg(mut_view(*b), bool_ty_v);
+        let inst = push_new_inst(mut_view(*b), LIR_INST_ATOMIC_CAS);
+        unsafe {
+            (*inst).dest.v = old_v;
+            (*inst).cas_ok.v = ok_v;
+            (*inst).ptr.v = ptr_v;
+            (*inst).lhs.v = exp_v;
+            (*inst).rhs.v = des_v;
+            (*inst).ty.v = elem_ty_v;
+            (*inst).bit_width = bw;
+            (*inst).ordering = ord;
+            (*inst).fail_ordering = fail_ord;
+            (*inst).is_weak = aop == MIR_ATOMIC_CMPXCHG_WEAK;
+        }
+        let mut cas_ty_v: u32 = 0u32;
+        let dst_addr = lower_place_addr(mut_view(*b), view(stmt.place), unsafe { address_of_mut(cas_ty_v) });
+        let ok_off = unsafe { type_field_offset(TypeId { v: cas_ty_v }, 0, view(*b.interner)) };
+        let val_off = unsafe { type_field_offset(TypeId { v: cas_ty_v }, 1, view(*b.interner)) };
+        let mut ok_addr = dst_addr;
+        if ok_off != 0u32 {
+            let ok_off_reg = emit_const(mut_view(*b), ok_off as u64, usize_ty_v);
+            ok_addr = emit_offset(mut_view(*b), dst_addr, ok_off_reg);
+        }
+        emit_store(mut_view(*b), ok_addr, ok_v);
+        let mut val_addr = dst_addr;
+        if val_off != 0u32 {
+            let val_off_reg = emit_const(mut_view(*b), val_off as u64, usize_ty_v);
+            val_addr = emit_offset(mut_view(*b), dst_addr, val_off_reg);
+        } else if cas_ty_v == 0u32 && ok_off == 0u32 {
+            let val_off_reg = emit_const(mut_view(*b), sz as u64, usize_ty_v);
+            val_addr = emit_offset(mut_view(*b), dst_addr, val_off_reg);
+        }
+        emit_store(mut_view(*b), val_addr, old_v);
+    }
+}
+
 // --- Call Terminator Lowering ---
 
 fn finish_jmp_bb(b: mut_view<LirBuilder>, bb_idx: usize, target_v: u32) {
@@ -2027,9 +2206,26 @@ pub fn lir_lower_ext_opt(
         let mut j: usize = 0;
         while j < stmt_cnt {
             let stmt = unsafe { mir_stmt_at(stmts, j) };
-            if (unsafe { (*stmt).kind }) == MIR_STMT_ASSIGN {
+            let sk = unsafe { (*stmt).kind };
+            if sk == MIR_STMT_ASSIGN {
+                let mut skip_dummy_init = false;
+                if j + 1 < stmt_cnt {
+                    let next_stmt = unsafe { mir_stmt_at(stmts, j + 1) };
+                    if (unsafe { (*next_stmt).kind }) == MIR_STMT_ATOMIC &&
+                       (unsafe { (*stmt).rvalue.kind }) == MIR_RVALUE_USE &&
+                       (unsafe { (*stmt).rvalue.use_op.kind }) == MIR_OP_CONST &&
+                       (unsafe { (*stmt).place.local.v }) == (unsafe { (*next_stmt).place.local.v }) {
+                        skip_dummy_init = true;
+                    }
+                }
+                if !skip_dummy_init {
+                    unsafe {
+                        lower_assign_stmt(mut_view(b), view(*stmt));
+                    }
+                }
+            } else if sk == MIR_STMT_ATOMIC {
                 unsafe {
-                    lower_assign_stmt(mut_view(b), view(*stmt));
+                    lower_atomic_stmt(mut_view(b), view(*stmt));
                 }
             }
             j = j + 1;
