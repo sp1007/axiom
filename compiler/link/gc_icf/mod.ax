@@ -1,0 +1,1630 @@
+// Linker Section Garbage Collection (COMDAT/Dead-Stripping), Safe Identical Code Folding (ICF),
+// Read-Only Constant/String Pooling, `.bss` Zero-Data Placement, and 3D Binary Size Accounting (T622 / E15.6).
+// Implements SPEC-04 AXS-EXT-071 and SPEC-75 §§3, 5, 6, 7 (AXS-LTO-020..025, AXS-LTO-030, AXS-PGO-015;
+// REQ-OPT-259..260, REQ-OPT-262..264, REQ-OPT-267, REQ-OPT-269, REQ-OPT-283..291, REQ-OPT-381..382):
+//   - Per-symbol function/data sections (`.text$sym`, `.rdata$sym`, `.data$sym`, `.bss$sym`, `.pdata$sym`, `.xdata$sym`)
+//     with COMDAT selection (`NODUPLICATES`, `ANY`, `EXACT_MATCH`, `ASSOC`) (`SPEC-04 AXS-EXT-071`, `AXS-LTO-020`)
+//   - Deterministic COMDAT group resolution independent of input/thread order (`link_resolve_comdats`) (`AXS-LTO-020.2..3`)
+//   - Deterministic FIFO worklist mark-sweep section GC from formal linker roots (`Entry`, `Export`, `DynamicLookup`,
+//     `FfiCallback`, `Reflection`, `PinnedAt`, `ModuleInit`) with `COMDAT_ASSOC` reverse-dependency retention
+//     and dead code/data/unwind/import/runtime component stripping (`link_mark_sweep_gc`) (`AXS-LTO-021`, `AXS-LTO-024`)
+//   - Safe Identical Code Folding (`link_run_safe_icf`) via coinductive partition-refinement equivalence with
+//     function-pointer identity preservation (`fp1 != fp2`) and optional 5-byte `jmp rel32` thunks (`AXS-LTO-022`)
+//   - Read-only `.rdata` constant/string merging and `.bss` zero-initialized data promotion (`link_optimize_readonly_and_bss`)
+//     while never merging mutable `static mut`, `@at(addr)` MMIO, or `volatile`/`atomic` globals (`AXS-LTO-023`)
+//   - Deterministic section layout ordering, 3D binary size model (`file_size_bytes`, `mapped_size_bytes`,
+//     `working_set_bytes`), 128-bit optimization cache identity, and `--emit=section-gc` (`section_gc_print`) (`AXS-LTO-025`, `AXS-PGO-015`)
+module compiler.link.gc_icf
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.obj.coff.SectionId
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+// =============================================================================
+// 1. Section Kinds, COMDAT Selection, Root Kinds, and ICF Decisions
+// =============================================================================
+
+pub const SEC_KIND_TEXT: u8 = 0u8;
+pub const SEC_KIND_RDATA: u8 = 1u8;
+pub const SEC_KIND_DATA: u8 = 2u8;
+pub const SEC_KIND_BSS: u8 = 3u8;
+pub const SEC_KIND_PDATA: u8 = 4u8;
+pub const SEC_KIND_XDATA: u8 = 5u8;
+pub const SEC_KIND_CUSTOM_AXMETA: u8 = 6u8;
+pub const SEC_KIND_IMPORT_THUNK: u8 = 7u8;
+
+pub const COMDAT_NODUPLICATES: u8 = 0u8;
+pub const COMDAT_ANY: u8 = 1u8;
+pub const COMDAT_EXACT_MATCH: u8 = 2u8;
+pub const COMDAT_ASSOC: u8 = 3u8;
+
+pub const GC_ROOT_NONE: u8 = 0u8;
+pub const GC_ROOT_ENTRY: u8 = 1u8;
+pub const GC_ROOT_EXPORT: u8 = 2u8;
+pub const GC_ROOT_DYNAMIC_LOOKUP: u8 = 3u8;
+pub const GC_ROOT_FFI_CALLBACK: u8 = 4u8;
+pub const GC_ROOT_REFLECTION: u8 = 5u8;
+pub const GC_ROOT_PINNED_AT: u8 = 6u8;
+pub const GC_ROOT_MODULE_INIT: u8 = 7u8;
+
+pub const RETENTION_DEAD_STRIPPED: u8 = 0u8;
+pub const RETENTION_ROOT: u8 = 1u8;
+pub const RETENTION_REFERENCED: u8 = 2u8;
+pub const RETENTION_ASSOC_LEADER: u8 = 3u8;
+pub const RETENTION_DISCARDED_COMDAT: u8 = 4u8;
+
+pub const ICF_DECISION_NONE: u8 = 0u8;
+pub const ICF_DECISION_FOLDED: u8 = 1u8;
+pub const ICF_DECISION_THUNKED_ADDR_TAKEN: u8 = 2u8;
+pub const ICF_DECISION_KEPT_DISTINCT_ADDR: u8 = 3u8;
+pub const ICF_DECISION_KEPT_MUTABLE_OR_PINNED: u8 = 4u8;
+pub const ICF_DECISION_RDATA_MERGED: u8 = 5u8;
+pub const ICF_DECISION_STRING_POOLED: u8 = 6u8;
+pub const ICF_DECISION_BSS_PROMOTED: u8 = 7u8;
+
+pub const HOTNESS_BUCKET_HOT: u8 = 0u8;
+pub const HOTNESS_BUCKET_WARM: u8 = 1u8;
+pub const HOTNESS_BUCKET_COLD: u8 = 2u8;
+
+pub const LINK_PROFILE_SPEED: u8 = 0u8;
+pub const LINK_PROFILE_BALANCED: u8 = 1u8;
+pub const LINK_PROFILE_SIZE: u8 = 2u8;
+pub const LINK_PROFILE_TINY: u8 = 3u8;
+
+pub const RUNTIME_COMP_NONE: u8 = 0u8;
+pub const RUNTIME_COMP_HEAP: u8 = 1u8;
+pub const RUNTIME_COMP_PANIC: u8 = 2u8;
+pub const RUNTIME_COMP_IO: u8 = 3u8;
+pub const RUNTIME_COMP_THREAD: u8 = 4u8;
+pub const RUNTIME_COMP_PGO_COUNTER: u8 = 5u8;
+
+pub const SEC_NONE_ID: u32 = 0xFFFFFFFFu32;
+pub const ICF_THUNK_SIZE: usize = 5;
+pub const AX_LINK_DUPLICATE_SYMBOL_CODE: u32 = 136u32;
+
+// =============================================================================
+// 2. Section Relocation Edges, Section Nodes, ICF Records & Binary Size Model
+// =============================================================================
+
+@derive(Copy)
+pub struct SectionRelocEdge {
+    pub offset: u32,
+    pub kind: u32,
+    pub target_sym: SymbolId,
+    pub target_sec: SectionId,
+    pub addend: i64,
+    pub is_direct_call: bool,
+}
+
+@derive(Copy)
+pub struct SectionNode {
+    pub sec_id: SectionId,
+    pub object_index: u32,
+    pub name: StrId,
+    pub kind: u8,
+    pub flags: u32,
+    pub align: u32,
+    pub bytes: *mut u8,
+    pub bytes_len: usize,
+    pub relocs: *mut SectionRelocEdge,
+    pub reloc_count: usize,
+    pub reloc_cap: usize,
+    pub defined_sym: SymbolId,
+    pub comdat_leader: SymbolId,
+    pub comdat_selection: u8,
+    pub assoc_leader_sec: SectionId,
+    pub has_pinned_vma: bool,
+    pub pinned_vma: u64,
+    pub address_taken: bool,
+    pub is_exported: bool,
+    pub is_mutable: bool,
+    pub is_volatile_or_atomic: bool,
+    pub is_string_literal: bool,
+    pub runtime_comp: u8,
+    pub import_dll_id: u32,
+    pub hotness_bucket: u8,
+    pub root_kind: u8,
+    pub is_live: bool,
+    pub is_discarded_comdat: bool,
+    pub retention_reason: u8,
+    pub retained_by_sec: SectionId,
+    pub retained_by_sym: SymbolId,
+    pub icf_leader_sec: SectionId,
+    pub icf_decision: u8,
+    pub layout_order: u32,
+    pub payload_hash: u64,
+}
+
+@derive(Copy)
+pub struct IcfRecord {
+    pub leader_sec: SectionId,
+    pub follower_sec: SectionId,
+    pub decision: u8,
+    pub bytes_saved: u32,
+}
+
+@derive(Copy)
+pub struct BinarySizeModel {
+    pub file_size_bytes: u64,
+    pub mapped_size_bytes: u64,
+    pub working_set_bytes: u64,
+    pub text_bytes: u64,
+    pub cold_text_bytes: u64,
+    pub rdata_bytes: u64,
+    pub data_bytes: u64,
+    pub bss_bytes: u64,
+    pub stripped_code_bytes: u64,
+    pub stripped_data_bytes: u64,
+    pub icf_saved_bytes: u64,
+    pub rdata_merged_bytes: u64,
+}
+
+@derive(Copy)
+pub struct OptimizationCacheIdentity {
+    pub compiler_version: u32,
+    pub target_triple: StrId,
+    pub opt_profile: u8,
+    pub lto_mode: u8,
+    pub section_graph_digest: u64,
+    pub pgo_profile_digest: u64,
+    pub cache_key_lo: u64,
+    pub cache_key_hi: u64,
+}
+
+pub struct SectionGraph {
+    pub nodes: *mut SectionNode,
+    pub node_count: usize,
+    pub node_cap: usize,
+    pub icf_records: *mut IcfRecord,
+    pub icf_count: usize,
+    pub icf_cap: usize,
+    pub link_profile: u8,
+    pub allow_icf_thunks: bool,
+    pub duplicate_symbol_errors: u32,
+    pub conflict_sym: SymbolId,
+    pub size_model: BinarySizeModel,
+}
+
+@derive(Copy)
+pub struct GcIcfStats {
+    pub total_sections: u32,
+    pub comdat_groups_resolved: u32,
+    pub comdat_duplicates_discarded: u32,
+    pub comdat_exact_mismatch_errors: u32,
+    pub duplicate_symbol_errors: u32,
+    pub roots_marked: u32,
+    pub live_sections_kept: u32,
+    pub dead_code_sections_stripped: u32,
+    pub dead_data_sections_stripped: u32,
+    pub dead_assoc_sections_stripped: u32,
+    pub unused_imports_stripped: u32,
+    pub unused_runtime_stripped: u32,
+    pub icf_classes_found: u32,
+    pub icf_sections_folded: u32,
+    pub icf_thunks_emitted: u32,
+    pub icf_kept_distinct_addr: u32,
+    pub rdata_constants_merged: u32,
+    pub strings_pooled: u32,
+    pub bss_zero_promoted: u32,
+}
+
+// =============================================================================
+// 3. Array Accessors, Hashing, and SectionGraph Construction Helpers
+// =============================================================================
+
+fn gc_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn gc_byte_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+pub unsafe fn sg_node_at(base: *mut SectionNode, idx: usize) -> *mut SectionNode {
+    let off = gc_mul_usize(idx, size_of<SectionNode>());
+    ((base as usize) + off) as *mut SectionNode
+}
+
+pub unsafe fn sg_reloc_at(base: *mut SectionRelocEdge, idx: usize) -> *mut SectionRelocEdge {
+    let off = gc_mul_usize(idx, size_of<SectionRelocEdge>());
+    ((base as usize) + off) as *mut SectionRelocEdge
+}
+
+pub unsafe fn sg_icf_at(base: *mut IcfRecord, idx: usize) -> *mut IcfRecord {
+    let off = gc_mul_usize(idx, size_of<IcfRecord>());
+    ((base as usize) + off) as *mut IcfRecord
+}
+
+pub unsafe fn gc_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    let off = gc_mul_usize(idx, size_of<u32>());
+    ((base as usize) + off) as *mut u32
+}
+
+fn gc_fnv1a_init() -> u64 {
+    14695981039346656037u64
+}
+
+fn gc_fnv1a_u8(h: u64, b: u8) -> u64 {
+    wrapping_mul_u64(h ^ (b as u64), 1099511628211u64)
+}
+
+fn gc_fnv1a_u32(h: u64, v: u32) -> u64 {
+    let mut cur: u64 = gc_fnv1a_u8(h, (v & 255u32) as u8);
+    cur = gc_fnv1a_u8(cur, ((v >> 8u32) & 255u32) as u8);
+    cur = gc_fnv1a_u8(cur, ((v >> 16u32) & 255u32) as u8);
+    cur = gc_fnv1a_u8(cur, ((v >> 24u32) & 255u32) as u8);
+    cur
+}
+
+fn gc_fnv1a_u64(h: u64, v: u64) -> u64 {
+    let lo: u32 = (v & 0xFFFFFFFFu64) as u32;
+    let hi: u32 = ((v >> 32u64) & 0xFFFFFFFFu64) as u32;
+    gc_fnv1a_u32(gc_fnv1a_u32(h, lo), hi)
+}
+
+pub fn gc_compute_bytes_hash(bytes: *mut u8, byte_len: usize) -> u64 {
+    let mut h: u64 = gc_fnv1a_init();
+    h = gc_fnv1a_u32(h, byte_len as u32);
+    if (bytes as usize) == 0 {
+        return h;
+    }
+    let mut i: usize = 0;
+    while i < byte_len {
+        let b = unsafe { *gc_byte_at(bytes, i) };
+        h = gc_fnv1a_u8(h, b);
+        i = i + 1;
+    }
+    h
+}
+
+pub fn gc_bytes_equal(a: *mut u8, a_len: usize, b: *mut u8, b_len: usize) -> bool {
+    if a_len != b_len {
+        return false;
+    }
+    if a_len == 0 {
+        return true;
+    }
+    if (a as usize) == 0 || (b as usize) == 0 {
+        return (a as usize) == (b as usize);
+    }
+    let mut i: usize = 0;
+    while i < a_len {
+        let ba = unsafe { *gc_byte_at(a, i) };
+        let bb = unsafe { *gc_byte_at(b, i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn gc_bytes_all_zero(bytes: *mut u8, byte_len: usize) -> bool {
+    if byte_len == 0 || (bytes as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < byte_len {
+        let b = unsafe { *gc_byte_at(bytes, i) };
+        if b != 0u8 {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn binary_size_model_zero() -> BinarySizeModel {
+    BinarySizeModel {
+        file_size_bytes: 0u64,
+        mapped_size_bytes: 0u64,
+        working_set_bytes: 0u64,
+        text_bytes: 0u64,
+        cold_text_bytes: 0u64,
+        rdata_bytes: 0u64,
+        data_bytes: 0u64,
+        bss_bytes: 0u64,
+        stripped_code_bytes: 0u64,
+        stripped_data_bytes: 0u64,
+        icf_saved_bytes: 0u64,
+        rdata_merged_bytes: 0u64,
+    }
+}
+
+pub fn gc_icf_stats_zero() -> GcIcfStats {
+    GcIcfStats {
+        total_sections: 0u32,
+        comdat_groups_resolved: 0u32,
+        comdat_duplicates_discarded: 0u32,
+        comdat_exact_mismatch_errors: 0u32,
+        duplicate_symbol_errors: 0u32,
+        roots_marked: 0u32,
+        live_sections_kept: 0u32,
+        dead_code_sections_stripped: 0u32,
+        dead_data_sections_stripped: 0u32,
+        dead_assoc_sections_stripped: 0u32,
+        unused_imports_stripped: 0u32,
+        unused_runtime_stripped: 0u32,
+        icf_classes_found: 0u32,
+        icf_sections_folded: 0u32,
+        icf_thunks_emitted: 0u32,
+        icf_kept_distinct_addr: 0u32,
+        rdata_constants_merged: 0u32,
+        strings_pooled: 0u32,
+        bss_zero_promoted: 0u32,
+    }
+}
+
+pub fn section_node_default(
+    sec_id: SectionId,
+    object_index: u32,
+    name: StrId,
+    kind: u8,
+    defined_sym: SymbolId
+) -> SectionNode {
+    let sec_v = sec_id.v;
+    let sym_v = defined_sym.v;
+    SectionNode {
+        sec_id: SectionId { v: sec_v },
+        object_index: object_index,
+        name: name,
+        kind: kind,
+        flags: 0u32,
+        align: 16u32,
+        bytes: 0 as *mut u8,
+        bytes_len: 0,
+        relocs: 0 as *mut SectionRelocEdge,
+        reloc_count: 0,
+        reloc_cap: 0,
+        defined_sym: SymbolId { v: sym_v },
+        comdat_leader: SymbolId { v: sym_v },
+        comdat_selection: COMDAT_NODUPLICATES,
+        assoc_leader_sec: SectionId { v: SEC_NONE_ID },
+        has_pinned_vma: false,
+        pinned_vma: 0u64,
+        address_taken: false,
+        is_exported: false,
+        is_mutable: kind == SEC_KIND_DATA || kind == SEC_KIND_BSS,
+        is_volatile_or_atomic: false,
+        is_string_literal: false,
+        runtime_comp: RUNTIME_COMP_NONE,
+        import_dll_id: 0u32,
+        hotness_bucket: HOTNESS_BUCKET_WARM,
+        root_kind: GC_ROOT_NONE,
+        is_live: false,
+        is_discarded_comdat: false,
+        retention_reason: RETENTION_DEAD_STRIPPED,
+        retained_by_sec: SectionId { v: SEC_NONE_ID },
+        retained_by_sym: SymbolId { v: SEC_NONE_ID },
+        icf_leader_sec: SectionId { v: sec_v },
+        icf_decision: ICF_DECISION_NONE,
+        layout_order: 0u32,
+        payload_hash: 0u64,
+    }
+}
+
+pub fn section_graph_new(
+    arena: mut_view<Arena>,
+    link_profile: u8,
+    allow_icf_thunks: bool
+) -> *mut SectionGraph {
+    let sg = arena_alloc_raw(mut_view(*arena), size_of<SectionGraph>(), align_of<SectionGraph>()) as *mut SectionGraph;
+    let init_cap: usize = 32;
+    let nodes = arena_alloc_raw(mut_view(*arena), gc_mul_usize(init_cap, size_of<SectionNode>()), align_of<SectionNode>()) as *mut SectionNode;
+    let icf_recs = arena_alloc_raw(mut_view(*arena), gc_mul_usize(init_cap, size_of<IcfRecord>()), align_of<IcfRecord>()) as *mut IcfRecord;
+    unsafe {
+        (*sg).nodes = nodes;
+        (*sg).node_count = 0;
+        (*sg).node_cap = init_cap;
+        (*sg).icf_records = icf_recs;
+        (*sg).icf_count = 0;
+        (*sg).icf_cap = init_cap;
+        (*sg).link_profile = link_profile;
+        (*sg).allow_icf_thunks = allow_icf_thunks;
+        (*sg).duplicate_symbol_errors = 0u32;
+        (*sg).conflict_sym = SymbolId { v: SEC_NONE_ID };
+        (*sg).size_model = binary_size_model_zero();
+    }
+    sg
+}
+
+pub fn section_graph_add_node(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    node: SectionNode
+) -> SectionId {
+    if sg.node_count >= sg.node_cap {
+        let new_cap: usize = if sg.node_cap == 0 { 32 } else { sg.node_cap + sg.node_cap };
+        let new_nodes = arena_alloc_raw(mut_view(*arena), gc_mul_usize(new_cap, size_of<SectionNode>()), align_of<SectionNode>()) as *mut SectionNode;
+        let mut i: usize = 0;
+        while i < sg.node_count {
+            unsafe { *sg_node_at(new_nodes, i) = *sg_node_at(sg.nodes, i); }
+            i = i + 1;
+        }
+        sg.nodes = new_nodes;
+        sg.node_cap = new_cap;
+    }
+    let idx: usize = sg.node_count;
+    let assigned_v: u32 = idx as u32;
+    unsafe {
+        let dst = sg_node_at(sg.nodes, idx);
+        *dst = node;
+        (*dst).sec_id = SectionId { v: assigned_v };
+        (*dst).icf_leader_sec = SectionId { v: assigned_v };
+        (*dst).payload_hash = gc_compute_bytes_hash((*dst).bytes, (*dst).bytes_len);
+    }
+    sg.node_count = idx + 1;
+    SectionId { v: assigned_v }
+}
+
+pub fn section_graph_set_bytes(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    sec_id: SectionId,
+    src_bytes: *mut u8,
+    byte_len: usize
+) {
+    if (sec_id.v as usize) >= sg.node_count {
+        return;
+    }
+    let node = unsafe { sg_node_at(sg.nodes, sec_id.v as usize) };
+    if byte_len == 0 || (src_bytes as usize) == 0 {
+        unsafe {
+            (*node).bytes = 0 as *mut u8;
+            (*node).bytes_len = 0;
+            (*node).payload_hash = gc_compute_bytes_hash(0 as *mut u8, 0);
+        }
+        return;
+    }
+    let buf = arena_alloc_raw(mut_view(*arena), byte_len, 1);
+    let mut i: usize = 0;
+    while i < byte_len {
+        unsafe { *gc_byte_at(buf, i) = *gc_byte_at(src_bytes, i); }
+        i = i + 1;
+    }
+    unsafe {
+        (*node).bytes = buf;
+        (*node).bytes_len = byte_len;
+        (*node).payload_hash = gc_compute_bytes_hash(buf, byte_len);
+    }
+}
+
+pub fn section_graph_add_reloc(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    from_sec: SectionId,
+    offset: u32,
+    kind: u32,
+    target_sym: SymbolId,
+    target_sec: SectionId,
+    addend: i64,
+    is_direct_call: bool
+) {
+    if (from_sec.v as usize) >= sg.node_count {
+        return;
+    }
+    let node = unsafe { sg_node_at(sg.nodes, from_sec.v as usize) };
+    let r_cnt = unsafe { (*node).reloc_count };
+    let r_cap = unsafe { (*node).reloc_cap };
+    if r_cnt >= r_cap {
+        let new_cap: usize = if r_cap == 0 { 8 } else { r_cap + r_cap };
+        let new_relocs = arena_alloc_raw(mut_view(*arena), gc_mul_usize(new_cap, size_of<SectionRelocEdge>()), align_of<SectionRelocEdge>()) as *mut SectionRelocEdge;
+        let mut i: usize = 0;
+        while i < r_cnt {
+            unsafe { *sg_reloc_at(new_relocs, i) = *sg_reloc_at((*node).relocs, i); }
+            i = i + 1;
+        }
+        unsafe {
+            (*node).relocs = new_relocs;
+            (*node).reloc_cap = new_cap;
+        }
+    }
+    unsafe {
+        let r = sg_reloc_at((*node).relocs, r_cnt);
+        (*r).offset = offset;
+        (*r).kind = kind;
+        (*r).target_sym = target_sym;
+        (*r).target_sec = target_sec;
+        (*r).addend = addend;
+        (*r).is_direct_call = is_direct_call;
+        (*node).reloc_count = r_cnt + 1;
+    }
+}
+
+pub fn section_graph_mark_root(sg: mut_view<SectionGraph>, sec_id: SectionId, root_kind: u8) -> bool {
+    if (sec_id.v as usize) >= sg.node_count {
+        return false;
+    }
+    unsafe {
+        let node = sg_node_at(sg.nodes, sec_id.v as usize);
+        (*node).root_kind = root_kind;
+        if root_kind == GC_ROOT_EXPORT {
+            (*node).is_exported = true;
+        }
+    }
+    true
+}
+
+fn section_graph_record_icf(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    leader_sec: SectionId,
+    follower_sec: SectionId,
+    decision: u8,
+    bytes_saved: u32
+) {
+    if sg.icf_count >= sg.icf_cap {
+        let new_cap: usize = if sg.icf_cap == 0 { 32 } else { sg.icf_cap + sg.icf_cap };
+        let new_recs = arena_alloc_raw(mut_view(*arena), gc_mul_usize(new_cap, size_of<IcfRecord>()), align_of<IcfRecord>()) as *mut IcfRecord;
+        let mut i: usize = 0;
+        while i < sg.icf_count {
+            unsafe { *sg_icf_at(new_recs, i) = *sg_icf_at(sg.icf_records, i); }
+            i = i + 1;
+        }
+        sg.icf_records = new_recs;
+        sg.icf_cap = new_cap;
+    }
+    unsafe {
+        let rec = sg_icf_at(sg.icf_records, sg.icf_count);
+        (*rec).leader_sec = leader_sec;
+        (*rec).follower_sec = follower_sec;
+        (*rec).decision = decision;
+        (*rec).bytes_saved = bytes_saved;
+    }
+    sg.icf_count = sg.icf_count + 1;
+}
+
+fn sg_redirect_relocs(sg: mut_view<SectionGraph>, from_target: SectionId, to_target: SectionId, direct_calls_only: bool) {
+    let from_v: u32 = from_target.v;
+    let to_v: u32 = to_target.v;
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let n = unsafe { sg_node_at(sg.nodes, i) };
+        let r_cnt = unsafe { (*n).reloc_count };
+        let mut r_idx: usize = 0;
+        while r_idx < r_cnt {
+            unsafe {
+                let r = sg_reloc_at((*n).relocs, r_idx);
+                if (*r).target_sec.v == from_v {
+                    if !direct_calls_only || (*r).is_direct_call {
+                        (*r).target_sec = SectionId { v: to_v };
+                    }
+                }
+            }
+            r_idx = r_idx + 1;
+        }
+        i = i + 1;
+    }
+}
+
+// =============================================================================
+// 4. Deterministic COMDAT Group Resolution (`AXS-EXT-071`, `AXS-LTO-020`)
+// =============================================================================
+
+fn comdat_precedes(a: *mut SectionNode, b: *mut SectionNode) -> bool {
+    let oa = unsafe { (*a).object_index };
+    let ob = unsafe { (*b).object_index };
+    if oa != ob {
+        return oa < ob;
+    }
+    let sa = unsafe { (*a).sec_id.v };
+    let sb = unsafe { (*b).sec_id.v };
+    sa < sb
+}
+
+pub fn link_resolve_comdats(sg: mut_view<SectionGraph>, stats: mut_view<GcIcfStats>) -> bool {
+    stats.total_sections = sg.node_count as u32;
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let ni = unsafe { sg_node_at(sg.nodes, i) };
+        let ni_disc = unsafe { (*ni).is_discarded_comdat };
+        let ni_sym_v = unsafe { (*ni).defined_sym.v };
+        let ni_sel = unsafe { (*ni).comdat_selection };
+        if !ni_disc && ni_sym_v != SEC_NONE_ID && ni_sel != COMDAT_ASSOC {
+            let mut has_dup_group: bool = false;
+            let mut leader_idx: usize = i;
+            let mut j: usize = i + 1;
+            while j < sg.node_count {
+                let nj = unsafe { sg_node_at(sg.nodes, j) };
+                let nj_disc = unsafe { (*nj).is_discarded_comdat };
+                let nj_sym_v = unsafe { (*nj).defined_sym.v };
+                let nj_sel = unsafe { (*nj).comdat_selection };
+                if !nj_disc && nj_sym_v == ni_sym_v && nj_sel != COMDAT_ASSOC {
+                    let cur_leader = unsafe { sg_node_at(sg.nodes, leader_idx) };
+                    let cur_sel = unsafe { (*cur_leader).comdat_selection };
+                    if cur_sel == COMDAT_NODUPLICATES || nj_sel == COMDAT_NODUPLICATES {
+                        sg.duplicate_symbol_errors = sg.duplicate_symbol_errors + 1u32;
+                        sg.conflict_sym = SymbolId { v: ni_sym_v };
+                        stats.duplicate_symbol_errors = stats.duplicate_symbol_errors + 1u32;
+                    } else {
+                        has_dup_group = true;
+                        if comdat_precedes(nj, cur_leader) {
+                            leader_idx = j;
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+
+            if has_dup_group {
+                stats.comdat_groups_resolved = stats.comdat_groups_resolved + 1u32;
+                let leader = unsafe { sg_node_at(sg.nodes, leader_idx) };
+                let leader_sec_v = unsafe { (*leader).sec_id.v };
+                let leader_sym_v = unsafe { (*leader).defined_sym.v };
+                let leader_sel = unsafe { (*leader).comdat_selection };
+                let leader_bytes = unsafe { (*leader).bytes };
+                let leader_len = unsafe { (*leader).bytes_len };
+
+                let mut k: usize = i;
+                while k < sg.node_count {
+                    if k != leader_idx {
+                        let nk = unsafe { sg_node_at(sg.nodes, k) };
+                        let nk_disc = unsafe { (*nk).is_discarded_comdat };
+                        let nk_sym_v = unsafe { (*nk).defined_sym.v };
+                        let nk_sel = unsafe { (*nk).comdat_selection };
+                        if !nk_disc && nk_sym_v == leader_sym_v && nk_sel != COMDAT_ASSOC {
+                            let nk_bytes = unsafe { (*nk).bytes };
+                            let nk_len = unsafe { (*nk).bytes_len };
+                            let nk_sec_v = unsafe { (*nk).sec_id.v };
+                            if leader_sel == COMDAT_EXACT_MATCH || nk_sel == COMDAT_EXACT_MATCH {
+                                if !gc_bytes_equal(leader_bytes, leader_len, nk_bytes, nk_len) {
+                                    stats.comdat_exact_mismatch_errors = stats.comdat_exact_mismatch_errors + 1u32;
+                                    sg.duplicate_symbol_errors = sg.duplicate_symbol_errors + 1u32;
+                                    sg.conflict_sym = SymbolId { v: leader_sym_v };
+                                }
+                            }
+                            unsafe {
+                                if (*nk).address_taken {
+                                    (*leader).address_taken = true;
+                                }
+                                if (*nk).is_exported {
+                                    (*leader).is_exported = true;
+                                }
+                                if (*nk).root_kind != GC_ROOT_NONE && (*leader).root_kind == GC_ROOT_NONE {
+                                    (*leader).root_kind = (*nk).root_kind;
+                                }
+                                (*nk).is_discarded_comdat = true;
+                                (*nk).is_live = false;
+                                (*nk).retention_reason = RETENTION_DISCARDED_COMDAT;
+                                (*nk).icf_leader_sec = SectionId { v: leader_sec_v };
+                            }
+                            stats.comdat_duplicates_discarded = stats.comdat_duplicates_discarded + 1u32;
+                            sg_redirect_relocs(mut_view(*sg), SectionId { v: nk_sec_v }, SectionId { v: leader_sec_v }, false);
+
+                            // Discard any COMDAT_ASSOC sections tied to the discarded duplicate section.
+                            let mut a_idx: usize = 0;
+                            while a_idx < sg.node_count {
+                                let na = unsafe { sg_node_at(sg.nodes, a_idx) };
+                                let na_sel = unsafe { (*na).comdat_selection };
+                                let na_assoc = unsafe { (*na).assoc_leader_sec.v };
+                                if na_sel == COMDAT_ASSOC && na_assoc == nk_sec_v {
+                                    unsafe {
+                                        (*na).is_discarded_comdat = true;
+                                        (*na).is_live = false;
+                                        (*na).retention_reason = RETENTION_DISCARDED_COMDAT;
+                                    }
+                                    stats.comdat_duplicates_discarded = stats.comdat_duplicates_discarded + 1u32;
+                                }
+                                a_idx = a_idx + 1;
+                            }
+                        }
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    sg.duplicate_symbol_errors == 0u32 && stats.comdat_exact_mismatch_errors == 0u32
+}
+
+// =============================================================================
+// 5. Deterministic Mark-Sweep Section GC (`AXS-LTO-021`, `AXS-LTO-024`)
+// =============================================================================
+
+pub fn link_mark_sweep_gc(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    stats: mut_view<GcIcfStats>
+) -> u32 {
+    if sg.node_count == 0 {
+        return 0u32;
+    }
+    let queue = arena_alloc_raw(mut_view(*arena), gc_mul_usize(sg.node_count, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+
+    // 1. Seed root sections (`Entry`, `Export`, `DynamicLookup`, `FfiCallback`, `Reflection`, `PinnedAt`, `ModuleInit`).
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let n = unsafe { sg_node_at(sg.nodes, i) };
+        let is_disc = unsafe { (*n).is_discarded_comdat };
+        if !is_disc {
+            unsafe {
+                if (*n).has_pinned_vma && (*n).root_kind == GC_ROOT_NONE {
+                    (*n).root_kind = GC_ROOT_PINNED_AT;
+                } else if (*n).is_exported && (*n).root_kind == GC_ROOT_NONE {
+                    (*n).root_kind = GC_ROOT_EXPORT;
+                }
+                if (*n).root_kind != GC_ROOT_NONE {
+                    (*n).is_live = true;
+                    (*n).retention_reason = RETENTION_ROOT;
+                    (*n).retained_by_sec = (*n).sec_id;
+                    (*n).retained_by_sym = (*n).defined_sym;
+                    *gc_u32_at(queue, q_tail) = i as u32;
+                    q_tail = q_tail + 1;
+                    stats.roots_marked = stats.roots_marked + 1u32;
+                } else {
+                    (*n).is_live = false;
+                    (*n).retention_reason = RETENTION_DEAD_STRIPPED;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Deterministic FIFO worklist mark phase over relocations + COMDAT_ASSOC reverse-dependency edges.
+    while q_head < q_tail {
+        let cur_idx = (unsafe { *gc_u32_at(queue, q_head) }) as usize;
+        q_head = q_head + 1;
+        let cur = unsafe { sg_node_at(sg.nodes, cur_idx) };
+        let cur_sec_v = unsafe { (*cur).sec_id.v };
+        let cur_sym_v = unsafe { (*cur).defined_sym.v };
+        let r_cnt = unsafe { (*cur).reloc_count };
+
+        // 2a. Outgoing relocation edges (`cur -> target_sec`).
+        let mut r_idx: usize = 0;
+        while r_idx < r_cnt {
+            let r = unsafe { sg_reloc_at((*cur).relocs, r_idx) };
+            let tgt_id = unsafe { (*r).target_sec.v };
+            if (tgt_id as usize) < sg.node_count {
+                let tgt = unsafe { sg_node_at(sg.nodes, tgt_id as usize) };
+                let tgt_disc = unsafe { (*tgt).is_discarded_comdat };
+                let tgt_live = unsafe { (*tgt).is_live };
+                if !tgt_disc && !tgt_live {
+                    unsafe {
+                        (*tgt).is_live = true;
+                        (*tgt).retention_reason = RETENTION_REFERENCED;
+                        (*tgt).retained_by_sec = SectionId { v: cur_sec_v };
+                        (*tgt).retained_by_sym = SymbolId { v: cur_sym_v };
+                        *gc_u32_at(queue, q_tail) = tgt_id;
+                    }
+                    q_tail = q_tail + 1;
+                }
+            }
+            r_idx = r_idx + 1;
+        }
+
+        // 2b. Associated sections (`COMDAT_ASSOC`, e.g., `.pdata$sym` / `.xdata$sym` tied to live `.text$sym`).
+        let mut a_idx: usize = 0;
+        while a_idx < sg.node_count {
+            let assoc = unsafe { sg_node_at(sg.nodes, a_idx) };
+            let a_disc = unsafe { (*assoc).is_discarded_comdat };
+            let a_live = unsafe { (*assoc).is_live };
+            if !a_disc && !a_live {
+                let a_sel = unsafe { (*assoc).comdat_selection };
+                let a_leader = unsafe { (*assoc).assoc_leader_sec.v };
+                if a_sel == COMDAT_ASSOC && a_leader == cur_sec_v {
+                    unsafe {
+                        (*assoc).is_live = true;
+                        (*assoc).retention_reason = RETENTION_ASSOC_LEADER;
+                        (*assoc).retained_by_sec = SectionId { v: cur_sec_v };
+                        (*assoc).retained_by_sym = SymbolId { v: cur_sym_v };
+                        *gc_u32_at(queue, q_tail) = a_idx as u32;
+                    }
+                    q_tail = q_tail + 1;
+                }
+            }
+            a_idx = a_idx + 1;
+        }
+    }
+
+    // 3. Sweep dead sections and tally granular dead-stripping counters.
+    let mut stripped_total: u32 = 0u32;
+    let mut s_idx: usize = 0;
+    while s_idx < sg.node_count {
+        let n = unsafe { sg_node_at(sg.nodes, s_idx) };
+        let is_disc = unsafe { (*n).is_discarded_comdat };
+        if !is_disc {
+            let is_live = unsafe { (*n).is_live };
+            if is_live {
+                stats.live_sections_kept = stats.live_sections_kept + 1u32;
+            } else {
+                let kind = unsafe { (*n).kind };
+                let rt_comp = unsafe { (*n).runtime_comp };
+                unsafe { (*n).retention_reason = RETENTION_DEAD_STRIPPED; }
+                stripped_total = stripped_total + 1u32;
+                if kind == SEC_KIND_TEXT {
+                    stats.dead_code_sections_stripped = stats.dead_code_sections_stripped + 1u32;
+                } else if kind == SEC_KIND_RDATA || kind == SEC_KIND_DATA || kind == SEC_KIND_BSS {
+                    stats.dead_data_sections_stripped = stats.dead_data_sections_stripped + 1u32;
+                } else if kind == SEC_KIND_PDATA || kind == SEC_KIND_XDATA {
+                    stats.dead_assoc_sections_stripped = stats.dead_assoc_sections_stripped + 1u32;
+                } else if kind == SEC_KIND_IMPORT_THUNK {
+                    stats.unused_imports_stripped = stats.unused_imports_stripped + 1u32;
+                }
+                if rt_comp != RUNTIME_COMP_NONE {
+                    stats.unused_runtime_stripped = stats.unused_runtime_stripped + 1u32;
+                }
+            }
+        }
+        s_idx = s_idx + 1;
+    }
+    stripped_total
+}
+
+// =============================================================================
+// 6. Safe Identical Code Folding (`ICF`) (`AXS-LTO-022`, `REQ-OPT-269`, `REQ-OPT-286`)
+// =============================================================================
+
+fn icf_can_participate_text(n: *mut SectionNode) -> bool {
+    let is_live = unsafe { (*n).is_live };
+    let is_disc = unsafe { (*n).is_discarded_comdat };
+    if !is_live || is_disc {
+        return false;
+    }
+    let kind = unsafe { (*n).kind };
+    let b_len = unsafe { (*n).bytes_len };
+    if kind != SEC_KIND_TEXT || b_len == 0 {
+        return false;
+    }
+    let pinned = unsafe { (*n).has_pinned_vma };
+    let mut_sec = unsafe { (*n).is_mutable };
+    let vol_at = unsafe { (*n).is_volatile_or_atomic };
+    if pinned || mut_sec || vol_at {
+        return false;
+    }
+    true
+}
+
+fn icf_sections_equivalent_in_partition(
+    a: *mut SectionNode,
+    b: *mut SectionNode,
+    class_ids: *mut u32,
+    node_count: usize
+) -> bool {
+    let a_align = unsafe { (*a).align };
+    let b_align = unsafe { (*b).align };
+    let a_flags = unsafe { (*a).flags };
+    let b_flags = unsafe { (*b).flags };
+    if a_align != b_align || a_flags != b_flags {
+        return false;
+    }
+    let a_hash = unsafe { (*a).payload_hash };
+    let b_hash = unsafe { (*b).payload_hash };
+    let a_len = unsafe { (*a).bytes_len };
+    let b_len = unsafe { (*b).bytes_len };
+    if a_hash != b_hash || a_len != b_len {
+        return false;
+    }
+    let a_rcnt = unsafe { (*a).reloc_count };
+    let b_rcnt = unsafe { (*b).reloc_count };
+    if a_rcnt != b_rcnt {
+        return false;
+    }
+    let a_bytes = unsafe { (*a).bytes };
+    let b_bytes = unsafe { (*b).bytes };
+    if !gc_bytes_equal(a_bytes, a_len, b_bytes, b_len) {
+        return false;
+    }
+    let mut r_idx: usize = 0;
+    while r_idx < a_rcnt {
+        let ra = unsafe { sg_reloc_at((*a).relocs, r_idx) };
+        let rb = unsafe { sg_reloc_at((*b).relocs, r_idx) };
+        let ra_off = unsafe { (*ra).offset };
+        let rb_off = unsafe { (*rb).offset };
+        let ra_kind = unsafe { (*ra).kind };
+        let rb_kind = unsafe { (*rb).kind };
+        let ra_add = unsafe { (*ra).addend };
+        let rb_add = unsafe { (*rb).addend };
+        if ra_off != rb_off || ra_kind != rb_kind || ra_add != rb_add {
+            return false;
+        }
+        let ta = unsafe { (*ra).target_sec.v };
+        let tb = unsafe { (*rb).target_sec.v };
+        if (ta as usize) < node_count && (tb as usize) < node_count {
+            let ca = unsafe { *gc_u32_at(class_ids, ta as usize) };
+            let cb = unsafe { *gc_u32_at(class_ids, tb as usize) };
+            if ca != cb {
+                return false;
+            }
+        } else {
+            let sa = unsafe { (*ra).target_sym.v };
+            let sb = unsafe { (*rb).target_sym.v };
+            if ta != tb || sa != sb {
+                return false;
+            }
+        }
+        r_idx = r_idx + 1;
+    }
+    true
+}
+
+fn icf_emit_jmp_thunk(node: *mut SectionNode, arena: mut_view<Arena>, leader_sec: SectionId, leader_sym: SymbolId) {
+    let thunk_bytes = arena_alloc_raw(mut_view(*arena), ICF_THUNK_SIZE, 1);
+    unsafe {
+        *gc_byte_at(thunk_bytes, 0) = 233u8; // 0xE9: x86-64 near `jmp rel32`
+        *gc_byte_at(thunk_bytes, 1) = 0u8;
+        *gc_byte_at(thunk_bytes, 2) = 0u8;
+        *gc_byte_at(thunk_bytes, 3) = 0u8;
+        *gc_byte_at(thunk_bytes, 4) = 0u8;
+        (*node).bytes = thunk_bytes;
+        (*node).bytes_len = ICF_THUNK_SIZE;
+        (*node).payload_hash = gc_compute_bytes_hash(thunk_bytes, ICF_THUNK_SIZE);
+    }
+    let rel = arena_alloc_raw(mut_view(*arena), size_of<SectionRelocEdge>(), align_of<SectionRelocEdge>()) as *mut SectionRelocEdge;
+    unsafe {
+        (*rel).offset = 1u32;
+        (*rel).kind = 4u32; // IMAGE_REL_AMD64_REL32
+        (*rel).target_sym = leader_sym;
+        (*rel).target_sec = leader_sec;
+        (*rel).addend = 0i64;
+        (*rel).is_direct_call = true;
+        (*node).relocs = rel;
+        (*node).reloc_count = 1;
+        (*node).reloc_cap = 1;
+    }
+}
+
+pub fn link_run_safe_icf(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    stats: mut_view<GcIcfStats>
+) -> u32 {
+    if sg.node_count == 0 {
+        return 0u32;
+    }
+    let class_ids = arena_alloc_raw(mut_view(*arena), gc_mul_usize(sg.node_count, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let next_ids = arena_alloc_raw(mut_view(*arena), gc_mul_usize(sg.node_count, size_of<u32>()), align_of<u32>()) as *mut u32;
+
+    // 1. Initial partition: group candidate `.text` sections with identical static byte hash + length + reloc count.
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let ni = unsafe { sg_node_at(sg.nodes, i) };
+        if !icf_can_participate_text(ni) {
+            unsafe {
+                *gc_u32_at(class_ids, i) = i as u32;
+                if (*ni).is_live && ((*ni).has_pinned_vma || (*ni).is_mutable || (*ni).is_volatile_or_atomic) {
+                    (*ni).icf_decision = ICF_DECISION_KEPT_MUTABLE_OR_PINNED;
+                }
+            }
+        } else {
+            let mut matched_leader: u32 = i as u32;
+            let ni_align = unsafe { (*ni).align };
+            let ni_flags = unsafe { (*ni).flags };
+            let ni_hash = unsafe { (*ni).payload_hash };
+            let ni_len = unsafe { (*ni).bytes_len };
+            let ni_rcnt = unsafe { (*ni).reloc_count };
+            let ni_bytes = unsafe { (*ni).bytes };
+            let mut j: usize = 0;
+            while j < i {
+                let nj = unsafe { sg_node_at(sg.nodes, j) };
+                if icf_can_participate_text(nj) {
+                    let nj_align = unsafe { (*nj).align };
+                    let nj_flags = unsafe { (*nj).flags };
+                    let nj_hash = unsafe { (*nj).payload_hash };
+                    let nj_len = unsafe { (*nj).bytes_len };
+                    let nj_rcnt = unsafe { (*nj).reloc_count };
+                    let nj_bytes = unsafe { (*nj).bytes };
+                    if ni_align == nj_align && ni_flags == nj_flags &&
+                       ni_hash == nj_hash && ni_len == nj_len &&
+                       ni_rcnt == nj_rcnt &&
+                       gc_bytes_equal(ni_bytes, ni_len, nj_bytes, nj_len) {
+                        matched_leader = j as u32;
+                        j = i;
+                    }
+                }
+                j = j + 1;
+            }
+            unsafe { *gc_u32_at(class_ids, i) = matched_leader; }
+        }
+        i = i + 1;
+    }
+
+    // 2. Coinductive partition refinement until fixed point (handles mutually recursive isomorphic functions).
+    let mut changed: bool = true;
+    let mut iter_guard: u32 = 0u32;
+    while changed && iter_guard < 32u32 {
+        changed = false;
+        iter_guard = iter_guard + 1u32;
+        let mut a_idx: usize = 0;
+        while a_idx < sg.node_count {
+            let na = unsafe { sg_node_at(sg.nodes, a_idx) };
+            let ca = unsafe { *gc_u32_at(class_ids, a_idx) };
+            if !icf_can_participate_text(na) {
+                unsafe { *gc_u32_at(next_ids, a_idx) = a_idx as u32; }
+            } else {
+                let mut new_rep: u32 = a_idx as u32;
+                let mut b_idx: usize = 0;
+                while b_idx < a_idx {
+                    let cb = unsafe { *gc_u32_at(class_ids, b_idx) };
+                    if cb == ca {
+                        let nb = unsafe { sg_node_at(sg.nodes, b_idx) };
+                        if icf_sections_equivalent_in_partition(na, nb, class_ids, sg.node_count) {
+                            new_rep = unsafe { *gc_u32_at(next_ids, b_idx) };
+                            b_idx = a_idx;
+                        }
+                    }
+                    b_idx = b_idx + 1;
+                }
+                unsafe { *gc_u32_at(next_ids, a_idx) = new_rep; }
+                if new_rep != ca {
+                    changed = true;
+                }
+            }
+            a_idx = a_idx + 1;
+        }
+        let mut k: usize = 0;
+        while k < sg.node_count {
+            unsafe { *gc_u32_at(class_ids, k) = *gc_u32_at(next_ids, k); }
+            k = k + 1;
+        }
+    }
+
+    // 3. Apply Safe ICF decisions per equivalence class with >1 member.
+    let mut folded_or_thunked: u32 = 0u32;
+    let mut c_idx: usize = 0;
+    while c_idx < sg.node_count {
+        let leader_id = unsafe { *gc_u32_at(class_ids, c_idx) };
+        if leader_id == (c_idx as u32) {
+            let leader = unsafe { sg_node_at(sg.nodes, c_idx) };
+            if icf_can_participate_text(leader) {
+                let leader_sec_v = unsafe { (*leader).sec_id.v };
+                let leader_sym_v = unsafe { (*leader).defined_sym.v };
+                let mut member_count: u32 = 0u32;
+                let mut f_idx: usize = c_idx + 1;
+                while f_idx < sg.node_count {
+                    let f_class = unsafe { *gc_u32_at(class_ids, f_idx) };
+                    if f_class == (c_idx as u32) {
+                        member_count = member_count + 1u32;
+                        let follower = unsafe { sg_node_at(sg.nodes, f_idx) };
+                        let orig_len = unsafe { (*follower).bytes_len };
+                        let f_sec_v = unsafe { (*follower).sec_id.v };
+                        let f_addr_taken = unsafe { (*follower).address_taken };
+                        let f_exported = unsafe { (*follower).is_exported };
+                        if !f_addr_taken && !f_exported {
+                            // Safe ICF Case 1 (`AXS-LTO-022.2.1`): Non-address-taken follower folds directly into leader.
+                            unsafe {
+                                (*follower).icf_leader_sec = SectionId { v: leader_sec_v };
+                                (*follower).icf_decision = ICF_DECISION_FOLDED;
+                            }
+                            let saved: u32 = orig_len as u32;
+                            sg.size_model.icf_saved_bytes = sg.size_model.icf_saved_bytes + (orig_len as u64);
+                            stats.icf_sections_folded = stats.icf_sections_folded + 1u32;
+                            folded_or_thunked = folded_or_thunked + 1u32;
+                            sg_redirect_relocs(mut_view(*sg), SectionId { v: f_sec_v }, SectionId { v: leader_sec_v }, false);
+                            section_graph_record_icf(mut_view(*sg), mut_view(*arena), SectionId { v: leader_sec_v }, SectionId { v: f_sec_v }, ICF_DECISION_FOLDED, saved);
+
+                            // Associated `.pdata`/`.xdata` for a completely folded follower become redundant.
+                            let mut a_idx: usize = 0;
+                            while a_idx < sg.node_count {
+                                let assoc = unsafe { sg_node_at(sg.nodes, a_idx) };
+                                let a_live = unsafe { (*assoc).is_live };
+                                let a_sel = unsafe { (*assoc).comdat_selection };
+                                let a_leader = unsafe { (*assoc).assoc_leader_sec.v };
+                                if a_live && a_sel == COMDAT_ASSOC && a_leader == f_sec_v {
+                                    unsafe {
+                                        (*assoc).icf_leader_sec = SectionId { v: leader_sec_v };
+                                        (*assoc).icf_decision = ICF_DECISION_FOLDED;
+                                    }
+                                }
+                                a_idx = a_idx + 1;
+                            }
+                        } else if sg.allow_icf_thunks && orig_len > ICF_THUNK_SIZE {
+                            // Safe ICF Case 2a (`AXS-LTO-022.2.2`): Address-taken follower gets a 5-byte `jmp rel32` thunk
+                            // at its own distinct address (`fp1 != fp2` preserved), while direct calls redirect to leader.
+                            let saved: u32 = (orig_len - ICF_THUNK_SIZE) as u32;
+                            icf_emit_jmp_thunk(follower, mut_view(*arena), SectionId { v: leader_sec_v }, SymbolId { v: leader_sym_v });
+                            unsafe {
+                                (*follower).icf_leader_sec = SectionId { v: f_sec_v };
+                                (*follower).icf_decision = ICF_DECISION_THUNKED_ADDR_TAKEN;
+                            }
+                            sg.size_model.icf_saved_bytes = sg.size_model.icf_saved_bytes + (saved as u64);
+                            stats.icf_thunks_emitted = stats.icf_thunks_emitted + 1u32;
+                            folded_or_thunked = folded_or_thunked + 1u32;
+                            sg_redirect_relocs(mut_view(*sg), SectionId { v: f_sec_v }, SectionId { v: leader_sec_v }, true);
+                            section_graph_record_icf(mut_view(*sg), mut_view(*arena), SectionId { v: leader_sec_v }, SectionId { v: f_sec_v }, ICF_DECISION_THUNKED_ADDR_TAKEN, saved);
+                        } else {
+                            // Safe ICF Case 2b (`AXS-LTO-022.2.2`): Retain distinct body unmerged.
+                            unsafe {
+                                (*follower).icf_leader_sec = SectionId { v: f_sec_v };
+                                (*follower).icf_decision = ICF_DECISION_KEPT_DISTINCT_ADDR;
+                            }
+                            stats.icf_kept_distinct_addr = stats.icf_kept_distinct_addr + 1u32;
+                            section_graph_record_icf(mut_view(*sg), mut_view(*arena), SectionId { v: leader_sec_v }, SectionId { v: f_sec_v }, ICF_DECISION_KEPT_DISTINCT_ADDR, 0u32);
+                        }
+                    }
+                    f_idx = f_idx + 1;
+                }
+                if member_count > 0u32 {
+                    stats.icf_classes_found = stats.icf_classes_found + 1u32;
+                }
+            }
+        }
+        c_idx = c_idx + 1;
+    }
+    folded_or_thunked
+}
+
+// =============================================================================
+// 7. Read-Only `.rdata` Constant/String Merging & `.bss` Placement (`AXS-LTO-023`)
+// =============================================================================
+
+fn rdata_can_merge(n: *mut SectionNode) -> bool {
+    let is_live = unsafe { (*n).is_live };
+    let is_disc = unsafe { (*n).is_discarded_comdat };
+    if !is_live || is_disc {
+        return false;
+    }
+    let kind = unsafe { (*n).kind };
+    let b_len = unsafe { (*n).bytes_len };
+    let r_cnt = unsafe { (*n).reloc_count };
+    if kind != SEC_KIND_RDATA || b_len == 0 || r_cnt != 0 {
+        return false;
+    }
+    let pinned = unsafe { (*n).has_pinned_vma };
+    let mut_sec = unsafe { (*n).is_mutable };
+    let vol_at = unsafe { (*n).is_volatile_or_atomic };
+    let addr_taken = unsafe { (*n).address_taken };
+    let exported = unsafe { (*n).is_exported };
+    if pinned || mut_sec || vol_at || addr_taken || exported {
+        return false;
+    }
+    true
+}
+
+pub fn link_optimize_readonly_and_bss(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    stats: mut_view<GcIcfStats>
+) -> u32 {
+    let mut opt_count: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let ni = unsafe { sg_node_at(sg.nodes, i) };
+        let ni_live = unsafe { (*ni).is_live };
+        let ni_disc = unsafe { (*ni).is_discarded_comdat };
+        if ni_live && !ni_disc {
+            let ni_kind = unsafe { (*ni).kind };
+            let ni_pinned = unsafe { (*ni).has_pinned_vma };
+            let ni_vol = unsafe { (*ni).is_volatile_or_atomic };
+            let ni_dec = unsafe { (*ni).icf_decision };
+            let ni_rcnt = unsafe { (*ni).reloc_count };
+            let ni_bytes = unsafe { (*ni).bytes };
+            let ni_len = unsafe { (*ni).bytes_len };
+
+            // 1. Mark mutable, pinned `@at`, or `volatile`/`atomic` globals as non-mergeable (`AXS-LTO-023.2`).
+            if ni_kind == SEC_KIND_DATA || ni_kind == SEC_KIND_BSS || ni_pinned || ni_vol {
+                if ni_dec == ICF_DECISION_NONE {
+                    unsafe { (*ni).icf_decision = ICF_DECISION_KEPT_MUTABLE_OR_PINNED; }
+                }
+            }
+
+            // 2. Promote zero-initialized `.data` sections without relocations or `@at` pinning to `.bss` (`AXS-LTO-023.3`).
+            if ni_kind == SEC_KIND_DATA && !ni_pinned && ni_rcnt == 0 && gc_bytes_all_zero(ni_bytes, ni_len) {
+                unsafe {
+                    (*ni).kind = SEC_KIND_BSS;
+                    (*ni).icf_decision = ICF_DECISION_BSS_PROMOTED;
+                }
+                stats.bss_zero_promoted = stats.bss_zero_promoted + 1u32;
+                opt_count = opt_count + 1u32;
+            }
+
+            // 3. Merge byte-identical read-only `.rdata` constants and UTF-8 string literals (`AXS-LTO-023.1`).
+            let ni_leader = unsafe { (*ni).icf_leader_sec.v };
+            let ni_sec_v = unsafe { (*ni).sec_id.v };
+            if rdata_can_merge(ni) && ni_leader == ni_sec_v {
+                let ni_align = unsafe { (*ni).align };
+                let ni_hash = unsafe { (*ni).payload_hash };
+                let mut j: usize = i + 1;
+                while j < sg.node_count {
+                    let nj = unsafe { sg_node_at(sg.nodes, j) };
+                    let nj_leader = unsafe { (*nj).icf_leader_sec.v };
+                    let nj_sec_v = unsafe { (*nj).sec_id.v };
+                    if rdata_can_merge(nj) && nj_leader == nj_sec_v {
+                        let nj_align = unsafe { (*nj).align };
+                        let nj_hash = unsafe { (*nj).payload_hash };
+                        let nj_bytes = unsafe { (*nj).bytes };
+                        let nj_len = unsafe { (*nj).bytes_len };
+                        if nj_align <= ni_align && nj_hash == ni_hash &&
+                           gc_bytes_equal(ni_bytes, ni_len, nj_bytes, nj_len) {
+                            let is_str = unsafe { (*nj).is_string_literal };
+                            let dec: u8 = if is_str { ICF_DECISION_STRING_POOLED } else { ICF_DECISION_RDATA_MERGED };
+                            unsafe {
+                                (*nj).icf_leader_sec = SectionId { v: ni_sec_v };
+                                (*nj).icf_decision = dec;
+                            }
+                            let saved: u32 = nj_len as u32;
+                            sg.size_model.rdata_merged_bytes = sg.size_model.rdata_merged_bytes + (nj_len as u64);
+                            if is_str {
+                                stats.strings_pooled = stats.strings_pooled + 1u32;
+                            } else {
+                                stats.rdata_constants_merged = stats.rdata_constants_merged + 1u32;
+                            }
+                            opt_count = opt_count + 1u32;
+                            sg_redirect_relocs(mut_view(*sg), SectionId { v: nj_sec_v }, SectionId { v: ni_sec_v }, false);
+                            section_graph_record_icf(mut_view(*sg), mut_view(*arena), SectionId { v: ni_sec_v }, SectionId { v: nj_sec_v }, dec, saved);
+                        }
+                    }
+                    j = j + 1;
+                }
+            } else {
+                let addr_or_exp = unsafe { (*ni).address_taken || (*ni).is_exported };
+                let cur_dec = unsafe { (*ni).icf_decision };
+                if ni_kind == SEC_KIND_RDATA && addr_or_exp && cur_dec == ICF_DECISION_NONE {
+                    unsafe { (*ni).icf_decision = ICF_DECISION_KEPT_DISTINCT_ADDR; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    opt_count
+}
+
+// =============================================================================
+// 8. Deterministic Section Layout, 3D Binary Size Model & Cache Identity (`AXS-LTO-025`)
+// =============================================================================
+
+fn section_is_emitted_in_image(n: *mut SectionNode) -> bool {
+    let is_live = unsafe { (*n).is_live };
+    let is_disc = unsafe { (*n).is_discarded_comdat };
+    if !is_live || is_disc {
+        return false;
+    }
+    let leader_v = unsafe { (*n).icf_leader_sec.v };
+    let sec_v = unsafe { (*n).sec_id.v };
+    leader_v == sec_v
+}
+
+fn section_layout_precedes(a: *mut SectionNode, b: *mut SectionNode) -> bool {
+    let ak = unsafe { (*a).kind };
+    let bk = unsafe { (*b).kind };
+    if ak != bk {
+        return ak < bk;
+    }
+    let ah = unsafe { (*a).hotness_bucket };
+    let bh = unsafe { (*b).hotness_bucket };
+    if ah != bh {
+        return ah < bh;
+    }
+    let an = unsafe { (*a).name.v };
+    let bn = unsafe { (*b).name.v };
+    if an != bn {
+        return an < bn;
+    }
+    let ao = unsafe { (*a).object_index };
+    let bo = unsafe { (*b).object_index };
+    if ao != bo {
+        return ao < bo;
+    }
+    let as_v = unsafe { (*a).sec_id.v };
+    let bs_v = unsafe { (*b).sec_id.v };
+    as_v < bs_v
+}
+
+fn align_up_u64(val: u64, align: u64) -> u64 {
+    if align <= 1u64 {
+        return val;
+    }
+    let mask: u64 = align - 1u64;
+    (val + mask) & (0xFFFFFFFFFFFFFFFFu64 ^ mask)
+}
+
+pub fn link_compute_deterministic_layout_and_sizes(sg: mut_view<SectionGraph>) -> BinarySizeModel {
+    // 1. Assign canonical deterministic layout order across all emitted sections (`AXS-LTO-025.3`).
+    let mut order_rank: u32 = 1u32;
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let ni = unsafe { sg_node_at(sg.nodes, i) };
+        unsafe { (*ni).layout_order = 0u32; }
+        i = i + 1;
+    }
+
+    let mut assigned: usize = 0;
+    while assigned < sg.node_count {
+        let mut best_idx: usize = sg.node_count;
+        let mut k: usize = 0;
+        while k < sg.node_count {
+            let nk = unsafe { sg_node_at(sg.nodes, k) };
+            let nk_ord = unsafe { (*nk).layout_order };
+            if section_is_emitted_in_image(nk) && nk_ord == 0u32 {
+                if best_idx == sg.node_count {
+                    best_idx = k;
+                } else {
+                    let best_node = unsafe { sg_node_at(sg.nodes, best_idx) };
+                    if section_layout_precedes(nk, best_node) {
+                        best_idx = k;
+                    }
+                }
+            }
+            k = k + 1;
+        }
+        if best_idx == sg.node_count {
+            assigned = sg.node_count;
+        } else {
+            let winner = unsafe { sg_node_at(sg.nodes, best_idx) };
+            unsafe { (*winner).layout_order = order_rank; }
+            order_rank = order_rank + 1u32;
+            assigned = assigned + 1;
+        }
+    }
+
+    // 2. Compute 3-dimensional binary size model (`file_size_bytes`, `mapped_size_bytes`, `working_set_bytes`).
+    let mut text_hot_warm: u64 = 0u64;
+    let mut text_cold: u64 = 0u64;
+    let mut rdata_total: u64 = 0u64;
+    let mut data_total: u64 = 0u64;
+    let mut bss_total: u64 = 0u64;
+    let mut pdata_xdata_total: u64 = 0u64;
+    let mut stripped_code: u64 = 0u64;
+    let mut stripped_data: u64 = 0u64;
+
+    let mut s_idx: usize = 0;
+    while s_idx < sg.node_count {
+        let n = unsafe { sg_node_at(sg.nodes, s_idx) };
+        let sz = (unsafe { (*n).bytes_len }) as u64;
+        let kind = unsafe { (*n).kind };
+        let hotness = unsafe { (*n).hotness_bucket };
+        let is_live = unsafe { (*n).is_live };
+        let is_disc = unsafe { (*n).is_discarded_comdat };
+        if section_is_emitted_in_image(n) {
+            if kind == SEC_KIND_TEXT || kind == SEC_KIND_IMPORT_THUNK {
+                if hotness == HOTNESS_BUCKET_COLD {
+                    text_cold = text_cold + sz;
+                } else {
+                    text_hot_warm = text_hot_warm + sz;
+                }
+            } else if kind == SEC_KIND_RDATA {
+                rdata_total = rdata_total + sz;
+            } else if kind == SEC_KIND_DATA {
+                data_total = data_total + sz;
+            } else if kind == SEC_KIND_BSS {
+                bss_total = bss_total + sz;
+            } else if kind == SEC_KIND_PDATA || kind == SEC_KIND_XDATA {
+                pdata_xdata_total = pdata_xdata_total + sz;
+            }
+        } else if !is_live && !is_disc {
+            if kind == SEC_KIND_TEXT || kind == SEC_KIND_IMPORT_THUNK {
+                stripped_code = stripped_code + sz;
+            } else {
+                stripped_data = stripped_data + sz;
+            }
+        }
+        s_idx = s_idx + 1;
+    }
+
+    let text_all: u64 = text_hot_warm + text_cold;
+    let pe_headers_file: u64 = 512u64;
+    let pe_headers_vma: u64 = 4096u64;
+
+    // File size (`FileAlignment = 512`) excludes `.bss` (`SEC_KIND_BSS` has `SizeOfRawData = 0`).
+    let file_sz: u64 = pe_headers_file +
+        align_up_u64(text_all, 512u64) +
+        align_up_u64(rdata_total + pdata_xdata_total, 512u64) +
+        align_up_u64(data_total, 512u64);
+
+    // Mapped virtual size (`SectionAlignment = 4096`) includes `.bss`.
+    let mapped_sz: u64 = pe_headers_vma +
+        align_up_u64(text_all, 4096u64) +
+        align_up_u64(rdata_total + pdata_xdata_total, 4096u64) +
+        align_up_u64(data_total + bss_total, 4096u64);
+
+    // Steady-state hot working set excludes `.text.cold` and cold unwind tables (`AXS-LTO-025.1`).
+    let working_set_sz: u64 = align_up_u64(text_hot_warm, 4096u64) +
+        align_up_u64(rdata_total, 4096u64) +
+        align_up_u64(data_total, 4096u64);
+
+    sg.size_model.file_size_bytes = file_sz;
+    sg.size_model.mapped_size_bytes = mapped_sz;
+    sg.size_model.working_set_bytes = working_set_sz;
+    sg.size_model.text_bytes = text_all;
+    sg.size_model.cold_text_bytes = text_cold;
+    sg.size_model.rdata_bytes = rdata_total;
+    sg.size_model.data_bytes = data_total;
+    sg.size_model.bss_bytes = bss_total;
+    sg.size_model.stripped_code_bytes = stripped_code;
+    sg.size_model.stripped_data_bytes = stripped_data;
+    sg.size_model
+}
+
+pub fn link_compute_section_graph_digest(sg: view<SectionGraph>) -> u64 {
+    let mut h: u64 = gc_fnv1a_init();
+    h = gc_fnv1a_u32(h, sg.node_count as u32);
+    h = gc_fnv1a_u8(h, sg.link_profile);
+    h = gc_fnv1a_u8(h, if sg.allow_icf_thunks { 1u8 } else { 0u8 });
+    let mut i: usize = 0;
+    while i < sg.node_count {
+        let n = unsafe { sg_node_at(sg.nodes, i) };
+        unsafe {
+            h = gc_fnv1a_u32(h, (*n).sec_id.v);
+            h = gc_fnv1a_u32(h, (*n).name.v);
+            h = gc_fnv1a_u8(h, (*n).kind);
+            h = gc_fnv1a_u8(h, if (*n).is_live { 1u8 } else { 0u8 });
+            h = gc_fnv1a_u8(h, (*n).retention_reason);
+            h = gc_fnv1a_u32(h, (*n).icf_leader_sec.v);
+            h = gc_fnv1a_u8(h, (*n).icf_decision);
+            h = gc_fnv1a_u32(h, (*n).layout_order);
+            h = gc_fnv1a_u64(h, (*n).payload_hash);
+        }
+        i = i + 1;
+    }
+    h
+}
+
+pub fn link_compute_cache_identity(
+    sg: view<SectionGraph>,
+    compiler_version: u32,
+    target_triple: StrId,
+    opt_profile: u8,
+    lto_mode: u8,
+    pgo_profile_digest: u64
+) -> OptimizationCacheIdentity {
+    let sg_digest: u64 = link_compute_section_graph_digest(view(*sg));
+    let target_v: u32 = target_triple.v;
+    let mut lo: u64 = gc_fnv1a_init();
+    lo = gc_fnv1a_u32(lo, compiler_version);
+    lo = gc_fnv1a_u32(lo, target_v);
+    lo = gc_fnv1a_u8(lo, opt_profile);
+    lo = gc_fnv1a_u8(lo, lto_mode);
+    lo = gc_fnv1a_u64(lo, sg_digest);
+    lo = gc_fnv1a_u64(lo, pgo_profile_digest);
+
+    let mut hi: u64 = 1099511628211u64 ^ lo;
+    hi = gc_fnv1a_u64(hi, sg.size_model.file_size_bytes);
+    hi = gc_fnv1a_u64(hi, sg.size_model.mapped_size_bytes);
+    hi = gc_fnv1a_u64(hi, sg.size_model.working_set_bytes);
+    hi = gc_fnv1a_u64(hi, pgo_profile_digest ^ sg_digest);
+
+    OptimizationCacheIdentity {
+        compiler_version: compiler_version,
+        target_triple: StrId { v: target_v },
+        opt_profile: opt_profile,
+        lto_mode: lto_mode,
+        section_graph_digest: sg_digest,
+        pgo_profile_digest: pgo_profile_digest,
+        cache_key_lo: lo,
+        cache_key_hi: hi,
+    }
+}
+
+pub fn link_run_gc_icf_pipeline(
+    sg: mut_view<SectionGraph>,
+    arena: mut_view<Arena>,
+    stats: mut_view<GcIcfStats>
+) -> bool {
+    let comdat_ok: bool = link_resolve_comdats(mut_view(*sg), mut_view(*stats));
+    if !comdat_ok {
+        return false;
+    }
+    let _stripped: u32 = link_mark_sweep_gc(mut_view(*sg), mut_view(*arena), mut_view(*stats));
+    let _icf: u32 = link_run_safe_icf(mut_view(*sg), mut_view(*arena), mut_view(*stats));
+    let _ro_bss: u32 = link_optimize_readonly_and_bss(mut_view(*sg), mut_view(*arena), mut_view(*stats));
+    let _sizes: BinarySizeModel = link_compute_deterministic_layout_and_sizes(mut_view(*sg));
+    true
+}
+
+// =============================================================================
+// 9. Deterministic `--emit=section-gc` Printer (`AXS-PGO-015.2`)
+// =============================================================================
+
+const GC_PRINT_DATA: [256]u8 = [
+    //   0..13  "section_gc {\n" (13 bytes)
+    115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 95u8, 103u8, 99u8, 32u8, 123u8, 10u8,
+    //  13..22  "  sec sec#" (10 bytes)
+    32u8, 32u8, 115u8, 101u8, 99u8, 32u8, 115u8, 101u8, 99u8, 35u8,
+    //  23..29  " kind=" (6 bytes)
+    32u8, 107u8, 105u8, 110u8, 100u8, 61u8,
+    //  29..35  " live=" (6 bytes)
+    32u8, 108u8, 105u8, 118u8, 101u8, 61u8,
+    //  35..43  " reason=" (8 bytes)
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    //  43..56  " retained_by=" (13 bytes)
+    32u8, 114u8, 101u8, 116u8, 97u8, 105u8, 110u8, 101u8, 100u8, 95u8, 98u8, 121u8, 61u8,
+    //  56..68  " icf_leader=" (12 bytes)
+    32u8, 105u8, 99u8, 102u8, 95u8, 108u8, 101u8, 97u8, 100u8, 101u8, 114u8, 61u8,
+    //  68..77  " icf_dec=" (9 bytes)
+    32u8, 105u8, 99u8, 102u8, 95u8, 100u8, 101u8, 99u8, 61u8,
+    //  77..84  " order=" (7 bytes)
+    32u8, 111u8, 114u8, 100u8, 101u8, 114u8, 61u8,
+    //  84..100 "  summary total=" (16 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 116u8, 111u8, 116u8, 97u8, 108u8, 61u8,
+    // 100..106 " live=" (6 bytes)
+    32u8, 108u8, 105u8, 118u8, 101u8, 61u8,
+    // 106..117 " dead_code=" (11 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 99u8, 111u8, 100u8, 101u8, 61u8,
+    // 117..128 " dead_data=" (11 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 100u8, 97u8, 116u8, 97u8, 61u8,
+    // 128..140 " dead_assoc=" (12 bytes)
+    32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 97u8, 115u8, 115u8, 111u8, 99u8, 61u8,
+    // 140..152 " icf_folded=" (12 bytes)
+    32u8, 105u8, 99u8, 102u8, 95u8, 102u8, 111u8, 108u8, 100u8, 101u8, 100u8, 61u8,
+    // 152..164 " icf_thunks=" (12 bytes)
+    32u8, 105u8, 99u8, 102u8, 95u8, 116u8, 104u8, 117u8, 110u8, 107u8, 115u8, 61u8,
+    // 164..178 " rdata_merged=" (14 bytes)
+    32u8, 114u8, 100u8, 97u8, 116u8, 97u8, 95u8, 109u8, 101u8, 114u8, 103u8, 101u8, 100u8, 61u8,
+    // 178..192 " bss_promoted=" (14 bytes)
+    32u8, 98u8, 115u8, 115u8, 95u8, 112u8, 114u8, 111u8, 109u8, 111u8, 116u8, 101u8, 100u8, 61u8,
+    // 192..198 " file=" (6 bytes)
+    32u8, 102u8, 105u8, 108u8, 101u8, 61u8,
+    // 198..206 " mapped=" (8 bytes)
+    32u8, 109u8, 97u8, 112u8, 112u8, 101u8, 100u8, 61u8,
+    // 206..219 " working_set=" (13 bytes)
+    32u8, 119u8, 111u8, 114u8, 107u8, 105u8, 110u8, 103u8, 95u8, 115u8, 101u8, 116u8, 61u8,
+    // 219..256 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn gc_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), GC_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn section_gc_print(
+    sg: view<SectionGraph>,
+    stats: view<GcIcfStats>,
+    out: mut_view<DiagBuffer>
+) {
+    gc_push_tbl(mut_view(*out), 0, 13);
+    let mut i: usize = 0;
+    while i < sg.node_count && (sg.nodes as usize) != 0 {
+        let n = unsafe { sg_node_at(sg.nodes, i) };
+        gc_push_tbl(mut_view(*out), 13, 10);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*n).sec_id.v });
+        gc_push_tbl(mut_view(*out), 23, 6);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*n).kind }) as u32);
+        gc_push_tbl(mut_view(*out), 29, 6);
+        diag_buf_push_u32(mut_view(*out), if unsafe { (*n).is_live } { 1u32 } else { 0u32 });
+        gc_push_tbl(mut_view(*out), 35, 8);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*n).retention_reason }) as u32);
+        gc_push_tbl(mut_view(*out), 43, 13);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*n).retained_by_sec.v });
+        gc_push_tbl(mut_view(*out), 56, 12);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*n).icf_leader_sec.v });
+        gc_push_tbl(mut_view(*out), 68, 9);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*n).icf_decision }) as u32);
+        gc_push_tbl(mut_view(*out), 77, 7);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*n).layout_order });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+    gc_push_tbl(mut_view(*out), 84, 16);
+    diag_buf_push_u32(mut_view(*out), stats.total_sections);
+    gc_push_tbl(mut_view(*out), 100, 6);
+    diag_buf_push_u32(mut_view(*out), stats.live_sections_kept);
+    gc_push_tbl(mut_view(*out), 106, 11);
+    diag_buf_push_u32(mut_view(*out), stats.dead_code_sections_stripped);
+    gc_push_tbl(mut_view(*out), 117, 11);
+    diag_buf_push_u32(mut_view(*out), stats.dead_data_sections_stripped);
+    gc_push_tbl(mut_view(*out), 128, 12);
+    diag_buf_push_u32(mut_view(*out), stats.dead_assoc_sections_stripped);
+    gc_push_tbl(mut_view(*out), 140, 12);
+    diag_buf_push_u32(mut_view(*out), stats.icf_sections_folded);
+    gc_push_tbl(mut_view(*out), 152, 12);
+    diag_buf_push_u32(mut_view(*out), stats.icf_thunks_emitted);
+    gc_push_tbl(mut_view(*out), 164, 14);
+    diag_buf_push_u32(mut_view(*out), stats.rdata_constants_merged + stats.strings_pooled);
+    gc_push_tbl(mut_view(*out), 178, 14);
+    diag_buf_push_u32(mut_view(*out), stats.bss_zero_promoted);
+    gc_push_tbl(mut_view(*out), 192, 6);
+    diag_buf_push_u32(mut_view(*out), sg.size_model.file_size_bytes as u32);
+    gc_push_tbl(mut_view(*out), 198, 8);
+    diag_buf_push_u32(mut_view(*out), sg.size_model.mapped_size_bytes as u32);
+    gc_push_tbl(mut_view(*out), 206, 13);
+    diag_buf_push_u32(mut_view(*out), sg.size_model.working_set_bytes as u32);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    gc_push_tbl(mut_view(*out), 219, 2);
+}

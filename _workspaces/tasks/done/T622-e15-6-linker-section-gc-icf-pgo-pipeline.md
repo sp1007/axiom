@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T621]
 priority: 116
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/pgo, compiler/link/gc_icf, tests/run/opt_pgo_gc]
 spec: [spec/SPEC-04-core-extensibility.md, spec/SPEC-75-lto-wpo-section-gc-pgo.md, tasks/0355, tasks/0408, tasks/0410, tasks/0581, tasks/0594, tasks/0595, tasks/0597]
 covers: [REQ-OPT-236, REQ-OPT-237, REQ-OPT-238, REQ-OPT-239, REQ-OPT-240, REQ-OPT-241, REQ-OPT-283, REQ-OPT-284, REQ-OPT-285, REQ-OPT-286, REQ-OPT-287, REQ-OPT-288, REQ-OPT-289, REQ-OPT-290, REQ-OPT-291, REQ-OPT-377, REQ-OPT-378, REQ-OPT-383, REQ-OPT-384]
 started: 2026-11-08 01:36:53
-agent: T622-impl
+finished: 2026-11-08 03:23:03
 ---
 # T622 — E15.6 — Linker section GC (COMDAT/dead stripping), Identical Code Folding (ICF) & deterministic PGO instrumentation/use pipeline
 
@@ -43,3 +43,4 @@ Implement linker section garbage collection (`COMDAT` / dead function and data s
 ## Log
 - 2026-11-03 02:43:00 created by T215 (P15 phase planning)
 - 2026-11-08 01:36:53 started (attempt 1) T622-impl
+- 2026-11-08 03:23:03 accepted by QA -> done

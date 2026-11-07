@@ -1,0 +1,1870 @@
+// Deterministic Profile-Guided Optimization (`--pgo-gen` / `--pgo-use`), `.axprof` Binary Schema,
+// Weighted Profile Merging, Stale-Profile Graceful Fallback, and Epistemic Cost-Model Guidance (T622 / E15.6).
+// Implements SPEC-75 §§4, 5, 8..11 (AXS-PGO-001..008, AXS-LTO-030, AXS-PGO-015;
+// REQ-OPT-223..241, REQ-OPT-246..256, REQ-OPT-279..282, REQ-OPT-291, REQ-OPT-319, REQ-OPT-377..378, REQ-OPT-383..384):
+//   - Three-tier epistemic separation (`EPISTEMIC_PROVEN`, `EPISTEMIC_OBSERVED`, `EPISTEMIC_HEURISTIC`):
+//     PGO guides profitability/cost-models only and NEVER upgrades `CERTAINTY_UNKNOWN`/`CERTAINTY_POSSIBLE` to `CERTAINTY_PROVEN` (`AXS-PGO-002`)
+//   - Canonical `.axprof` binary profile schema (`AXPF` magic, schema v1, target triple, 64-bit integrity digest)
+//     with deterministic serialization (`pgo_serialize_profile`) and fail-closed deserialization (`pgo_deserialize_profile`) (`AXS-PGO-003`)
+//   - Deterministic `--pgo-gen` counter instrumentation (`pgo_instrument_body`, `pgo_compute_cfg_fingerprint`)
+//     and commutative/associative saturating 64-bit profile merging (`pgo_merge_profiles`) (`AXS-PGO-004`)
+//   - Four-level profile compatibility classification (`EXACT`, `COMPATIBLE`, `STALE`, `INCOMPATIBLE`) with
+//     graceful stale-profile confidence decay + warning fallback without aborting compilation (`pgo_classify_and_bind_function`) (`AXS-PGO-005`)
+//   - PGO-guided cost models for inlining, value-guarded specialization, guarded speculative devirtualization,
+//     loop unrolling/peeling, SIMD width selection, hot/cold block splitting, branch fall-through layout,
+//     CPU `jcc` vs `cmovcc`, and security/constant-time/atomic/volatile barriers (`pgo_compute_cost_guidance`) (`AXS-PGO-006..008`)
+//   - `PassManager` `TransformationContract` (`PASS_PGO = 19u16`) and deterministic `--emit=pgo` (`pgo_print`) (`AXS-LTO-030`, `AXS-PGO-015`)
+module compiler.opt.pgo
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.opt.optir.ANALYSIS_CFG
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.EFFECT_ATOMIC
+use compiler.opt.optir.EFFECT_VOLATILE
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_TERM_BRANCH
+use compiler.opt.optir.OPT_TERM_SWITCH_INT
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_REACHABLE
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.CONTRACT_OK
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SIZE_OS
+use compiler.opt.passmgr.PASS_LOWER_MIR
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_IN_BOUNDS
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_ESCAPE
+use compiler.opt.passmgr.PROP_MASK_NO_OVERFLOW
+use compiler.opt.passmgr.PROP_MASK_NON_ZERO
+use compiler.opt.passmgr.PROP_MASK_PURE_CALL
+use compiler.opt.passmgr.PROP_MASK_REACHABLE
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.sroa.sroa_verify_postconditions_arg_aware
+use compiler.opt.inline.CallGraph
+use compiler.opt.inline.INLINE_NONE_IDX
+use compiler.opt.inline.callgraph_find_node_idx
+use compiler.opt.inline.cg_edge_at
+use compiler.opt.inline.cg_node_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+// =============================================================================
+// 1. Pass Contract (`PASS_PGO = 19u16`), Epistemic Tiers, and Schema Constants
+// =============================================================================
+
+pub const PASS_PGO: u16 = 19u16;
+
+pub fn pgo_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_PGO,
+        required_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_LOOP_INFO |
+                           ANALYSIS_MASK_SSA | ANALYSIS_MASK_MEMORY_SSA,
+        required_proofs: PROP_MASK_REACHABLE,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                            ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_LOOP_INFO,
+        invalidated_analyses: 0u32,
+        preserved_properties: PROP_MASK_REACHABLE | PROP_MASK_NO_ALIAS | PROP_MASK_IN_BOUNDS |
+                              PROP_MASK_NON_ZERO | PROP_MASK_NO_OVERFLOW | PROP_MASK_PURE_CALL |
+                              PROP_MASK_NO_ESCAPE,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+pub const EPISTEMIC_PROVEN: u8 = 0u8;
+pub const EPISTEMIC_OBSERVED: u8 = 1u8;
+pub const EPISTEMIC_HEURISTIC: u8 = 2u8;
+
+pub const PGO_PROV_INSTRUMENTED_AOT: u8 = 0u8;
+pub const PGO_PROV_HARDWARE_SAMPLED: u8 = 1u8;
+pub const PGO_PROV_MERGED: u8 = 2u8;
+
+pub const PGO_HOTNESS_NEVER: u8 = 0u8;
+pub const PGO_HOTNESS_COLD: u8 = 1u8;
+pub const PGO_HOTNESS_WARM: u8 = 2u8;
+pub const PGO_HOTNESS_HOT: u8 = 3u8;
+
+pub const PGO_COMPAT_EXACT: u8 = 0u8;
+pub const PGO_COMPAT_COMPATIBLE: u8 = 1u8;
+pub const PGO_COMPAT_STALE: u8 = 2u8;
+pub const PGO_COMPAT_INCOMPATIBLE: u8 = 3u8;
+
+pub const PGO_BRANCH_JCC_LIKELY_TAKEN: u8 = 0u8;
+pub const PGO_BRANCH_JCC_LIKELY_NOT_TAKEN: u8 = 1u8;
+pub const PGO_BRANCH_CMOV_UNPREDICTABLE: u8 = 2u8;
+pub const PGO_BRANCH_SECRET_CONSTANT_TIME: u8 = 3u8;
+
+pub const PGO_VEC_SCALAR_ONLY: u8 = 0u8;
+pub const PGO_VEC_128: u8 = 1u8;
+pub const PGO_VEC_256_UNROLLED: u8 = 2u8;
+
+pub const AXPROF_MAGIC_0: u8 = 65u8; // 'A'
+pub const AXPROF_MAGIC_1: u8 = 88u8; // 'X'
+pub const AXPROF_MAGIC_2: u8 = 80u8; // 'P'
+pub const AXPROF_MAGIC_3: u8 = 70u8; // 'F'
+pub const AXPROF_SCHEMA_VERSION: u32 = 1u32;
+
+pub const PGO_MAX_CONFIDENCE: u32 = 1000u32;
+pub const PGO_MAX_PROB_BP: u32 = 10000u32;
+
+// =============================================================================
+// 2. Profile Data Structures (`AXS-PGO-003`, `AXS-PGO-006..007`)
+// =============================================================================
+
+@derive(Copy)
+pub struct PgoBranchProfile {
+    pub bb_id: OptBbId,
+    pub taken_count: u64,
+    pub not_taken_count: u64,
+    pub taken_prob_bp: u32,
+}
+
+@derive(Copy)
+pub struct PgoCallTargetEntry {
+    pub target_sym: SymbolId,
+    pub call_count: u64,
+}
+
+@derive(Copy)
+pub struct PgoCallProfile {
+    pub callsite_id: u32,
+    pub callsite_bb: OptBbId,
+    pub total_calls: u64,
+    pub target_0: PgoCallTargetEntry,
+    pub target_1: PgoCallTargetEntry,
+    pub target_count: u32,
+    pub dominant_sym: SymbolId,
+    pub dominant_prob_bp: u32,
+}
+
+@derive(Copy)
+pub struct PgoLoopProfile {
+    pub header_bb: OptBbId,
+    pub header_entries: u64,
+    pub total_backedge_taken: u64,
+    pub avg_trip_count_x100: u64,
+}
+
+@derive(Copy)
+pub struct PgoValueEntry {
+    pub value: i64,
+    pub count: u64,
+}
+
+@derive(Copy)
+pub struct PgoValueProfile {
+    pub site_id: u32,
+    pub total_observations: u64,
+    pub top_0: PgoValueEntry,
+    pub top_1: PgoValueEntry,
+    pub value_count: u32,
+    pub dominant_val: i64,
+    pub dominant_prob_bp: u32,
+}
+
+@derive(Copy)
+pub struct PgoFunctionProfile {
+    pub fn_sym: SymbolId,
+    pub fn_name: StrId,
+    pub signature_hash: u64,
+    pub cfg_fingerprint: u64,
+    pub block_count_expected: u32,
+    pub entry_count: u64,
+    pub hotness_class: u8,
+    pub compatibility: u8,
+    pub confidence: u32,
+    pub is_constant_time_secret: bool,
+    pub has_atomic_or_volatile: bool,
+    pub block_counts: *mut u64,
+    pub block_count_len: usize,
+    pub branches: *mut PgoBranchProfile,
+    pub branch_count: usize,
+    pub branch_cap: usize,
+    pub calls: *mut PgoCallProfile,
+    pub call_count: usize,
+    pub call_cap: usize,
+    pub loops: *mut PgoLoopProfile,
+    pub loop_count: usize,
+    pub loop_cap: usize,
+    pub values: *mut PgoValueProfile,
+    pub value_count: usize,
+    pub value_cap: usize,
+}
+
+pub struct PgoProfileData {
+    pub target_triple: StrId,
+    pub program_identity_hash: u64,
+    pub provenance_kind: u8,
+    pub total_runs_merged: u32,
+    pub profile_digest: u64,
+    pub fns: *mut PgoFunctionProfile,
+    pub fn_count: usize,
+    pub fn_cap: usize,
+}
+
+@derive(Copy)
+pub struct PgoInstrumentationPlan {
+    pub fn_sym: SymbolId,
+    pub cfg_fingerprint: u64,
+    pub num_counters: u32,
+    pub counter_section_name: StrId,
+    pub atomic_counters: bool,
+    pub has_secret_barrier: bool,
+    pub has_atomic_or_volatile: bool,
+}
+
+@derive(Copy)
+pub struct PgoCostGuidance {
+    pub fn_sym: SymbolId,
+    pub epistemic_kind: u8,
+    pub compatibility: u8,
+    pub confidence: u32,
+    pub hotness_class: u8,
+    pub inline_threshold_insts: i32,
+    pub allow_specialization: bool,
+    pub has_value_guard_spec: bool,
+    pub guarded_spec_val: i64,
+    pub has_guarded_devirt: bool,
+    pub guarded_devirt_target: SymbolId,
+    pub requires_runtime_devirt_guard: bool,
+    pub unroll_factor: u32,
+    pub peel_first_iter: bool,
+    pub simd_width_plan: u8,
+    pub hot_block_count: u32,
+    pub cold_split_block_count: u32,
+    pub fallthrough_swaps: u32,
+    pub cmov_candidates: u32,
+    pub code_align_bytes: u32,
+    pub allow_data_layout_opt: bool,
+}
+
+@derive(Copy)
+pub struct PgoStats {
+    pub instrumented_fns: u32,
+    pub instrumented_counters: u32,
+    pub profiles_merged: u32,
+    pub exact_fn_matches: u32,
+    pub compatible_fn_matches: u32,
+    pub stale_fn_fallbacks: u32,
+    pub incompatible_profiles_rejected: u32,
+    pub hot_inline_boosts: u32,
+    pub cold_inline_suppressions: u32,
+    pub value_guarded_specs: u32,
+    pub guarded_devirt_sites: u32,
+    pub loop_unroll_boosts: u32,
+    pub cold_loops_suppressed: u32,
+    pub simd_width_decisions: u32,
+    pub hot_cold_blocks_split: u32,
+    pub branch_fallthrough_orders: u32,
+    pub cmov_decisions: u32,
+    pub secret_constant_time_barriers: u32,
+    pub atomic_volatile_barriers: u32,
+    pub forbidden_proof_upgrades_blocked: u32,
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+}
+
+// =============================================================================
+// 3. Pointer Helpers, Saturating Arithmetic, and Fixed-Point Probabilities
+// =============================================================================
+
+fn pgo_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn pgo_u8_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+pub unsafe fn pgo_const_u8_at(base: *const u8, idx: usize) -> *const u8 {
+    ((base as usize) + idx) as *const u8
+}
+
+pub unsafe fn pgo_u64_at(base: *mut u64, idx: usize) -> *mut u64 {
+    let off = pgo_mul_usize(idx, size_of<u64>());
+    ((base as usize) + off) as *mut u64
+}
+
+pub unsafe fn pgo_fn_at(base: *mut PgoFunctionProfile, idx: usize) -> *mut PgoFunctionProfile {
+    let off = pgo_mul_usize(idx, size_of<PgoFunctionProfile>());
+    ((base as usize) + off) as *mut PgoFunctionProfile
+}
+
+pub unsafe fn pgo_branch_at(base: *mut PgoBranchProfile, idx: usize) -> *mut PgoBranchProfile {
+    let off = pgo_mul_usize(idx, size_of<PgoBranchProfile>());
+    ((base as usize) + off) as *mut PgoBranchProfile
+}
+
+pub unsafe fn pgo_call_at(base: *mut PgoCallProfile, idx: usize) -> *mut PgoCallProfile {
+    let off = pgo_mul_usize(idx, size_of<PgoCallProfile>());
+    ((base as usize) + off) as *mut PgoCallProfile
+}
+
+pub unsafe fn pgo_loop_at(base: *mut PgoLoopProfile, idx: usize) -> *mut PgoLoopProfile {
+    let off = pgo_mul_usize(idx, size_of<PgoLoopProfile>());
+    ((base as usize) + off) as *mut PgoLoopProfile
+}
+
+pub unsafe fn pgo_val_at(base: *mut PgoValueProfile, idx: usize) -> *mut PgoValueProfile {
+    let off = pgo_mul_usize(idx, size_of<PgoValueProfile>());
+    ((base as usize) + off) as *mut PgoValueProfile
+}
+
+pub fn pgo_sat_add_u64(a: u64, b: u64) -> u64 {
+    let max_u64: u64 = 0xFFFFFFFFFFFFFFFFu64;
+    if a > max_u64 - b {
+        return max_u64;
+    }
+    a + b
+}
+
+pub fn pgo_sat_mul_u64(a: u64, w: u32) -> u64 {
+    if w == 0u32 || a == 0u64 {
+        return 0u64;
+    }
+    let w64: u64 = w as u64;
+    let max_u64: u64 = 0xFFFFFFFFFFFFFFFFu64;
+    if a > max_u64 / w64 {
+        return max_u64;
+    }
+    a * w64
+}
+
+pub fn pgo_compute_prob_bp(num: u64, den: u64) -> u32 {
+    if den == 0u64 || num == 0u64 {
+        return 0u32;
+    }
+    if num >= den {
+        return PGO_MAX_PROB_BP;
+    }
+    let scaled: u64 = pgo_sat_mul_u64(num, PGO_MAX_PROB_BP);
+    (scaled / den) as u32
+}
+
+pub fn pgo_classify_hotness_from_counts(entry_count: u64, max_block_count: u64) -> u8 {
+    if entry_count == 0u64 && max_block_count == 0u64 {
+        return PGO_HOTNESS_NEVER;
+    }
+    if entry_count >= 1000u64 || max_block_count >= 10000u64 {
+        return PGO_HOTNESS_HOT;
+    }
+    if entry_count >= 10u64 || max_block_count >= 100u64 {
+        return PGO_HOTNESS_WARM;
+    }
+    PGO_HOTNESS_COLD
+}
+
+pub fn pgo_stats_zero() -> PgoStats {
+    PgoStats {
+        instrumented_fns: 0u32,
+        instrumented_counters: 0u32,
+        profiles_merged: 0u32,
+        exact_fn_matches: 0u32,
+        compatible_fn_matches: 0u32,
+        stale_fn_fallbacks: 0u32,
+        incompatible_profiles_rejected: 0u32,
+        hot_inline_boosts: 0u32,
+        cold_inline_suppressions: 0u32,
+        value_guarded_specs: 0u32,
+        guarded_devirt_sites: 0u32,
+        loop_unroll_boosts: 0u32,
+        cold_loops_suppressed: 0u32,
+        simd_width_decisions: 0u32,
+        hot_cold_blocks_split: 0u32,
+        branch_fallthrough_orders: 0u32,
+        cmov_decisions: 0u32,
+        secret_constant_time_barriers: 0u32,
+        atomic_volatile_barriers: 0u32,
+        forbidden_proof_upgrades_blocked: 0u32,
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+    }
+}
+
+// =============================================================================
+// 4. Three-Tier Epistemic Separation Law (`AXS-PGO-002`, `REQ-OPT-224..225`, `REQ-OPT-248..250`)
+// =============================================================================
+
+pub fn pgo_verify_epistemic_law(
+    static_certainty: u8,
+    profile_prob_bp: u32,
+    profile_confidence: u32,
+    stats: mut_view<PgoStats>
+) -> u8 {
+    // `AXS-PGO-002`: Even if an observed runtime profile shows 100% probability (`10000` bp)
+    // and maximum confidence (`1000`), PGO MUST NEVER upgrade `CERTAINTY_UNKNOWN` or
+    // `CERTAINTY_POSSIBLE` to `CERTAINTY_PROVEN`.
+    if static_certainty != CERTAINTY_PROVEN && profile_prob_bp >= PGO_MAX_PROB_BP && profile_confidence > 0u32 {
+        stats.forbidden_proof_upgrades_blocked = stats.forbidden_proof_upgrades_blocked + 1u32;
+    }
+    static_certainty
+}
+
+// =============================================================================
+// 5. CFG Fingerprinting & `--pgo-gen` Counter Instrumentation (`AXS-PGO-004.1`)
+// =============================================================================
+
+fn pgo_fnv_init() -> u64 {
+    14695981039346656037u64
+}
+
+fn pgo_fnv_u32(h: u64, v: u32) -> u64 {
+    wrapping_mul_u64(h ^ (v as u64), 1099511628211u64)
+}
+
+fn pgo_fnv_u64(h: u64, v: u64) -> u64 {
+    let lo: u32 = (v & 0xFFFFFFFFu64) as u32;
+    let hi: u32 = ((v >> 32u64) & 0xFFFFFFFFu64) as u32;
+    pgo_fnv_u32(pgo_fnv_u32(h, lo), hi)
+}
+
+pub fn pgo_compute_cfg_fingerprint(body: view<OptBody>) -> u64 {
+    let mut h: u64 = pgo_fnv_init();
+    h = pgo_fnv_u32(h, body.bb_count as u32);
+    h = pgo_fnv_u32(h, body.arg_count as u32);
+    if (body.blocks as usize) == 0 {
+        return h;
+    }
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let blk = unsafe { opt_block_at(body.blocks, b) };
+        let pred_cnt = unsafe { (*blk).pred_count as u32 };
+        let succ_cnt = unsafe { (*blk).succ_count as u32 };
+        let term_kind = unsafe { (*blk).term.kind as u32 };
+        h = pgo_fnv_u32(h, b as u32);
+        h = pgo_fnv_u32(h, pred_cnt);
+        h = pgo_fnv_u32(h, succ_cnt);
+        h = pgo_fnv_u32(h, term_kind);
+        b = b + 1;
+    }
+    h
+}
+
+pub fn pgo_body_has_secret(body: view<OptBody>) -> bool {
+    if (body.blocks as usize) != 0 {
+        let mut b: usize = 0;
+        while b < body.bb_count {
+            let blk = unsafe { opt_block_at(body.blocks, b) };
+            let inst_cnt = unsafe { (*blk).inst_count };
+            let insts = unsafe { (*blk).insts };
+            let mut i: usize = 0;
+            while i < inst_cnt && (insts as usize) != 0 {
+                let inst = unsafe { opt_inst_at(insts, i) };
+                let op = unsafe { (*inst).opcode };
+                if op == OPT_INST_ZEROIZE || op == OPT_INST_BLACK_BOX {
+                    return true;
+                }
+                i = i + 1;
+            }
+            b = b + 1;
+        }
+    }
+    false
+}
+
+pub fn pgo_body_has_atomic_or_volatile(body: view<OptBody>) -> bool {
+    if (body.blocks as usize) != 0 {
+        let mut b: usize = 0;
+        while b < body.bb_count {
+            let blk = unsafe { opt_block_at(body.blocks, b) };
+            let inst_cnt = unsafe { (*blk).inst_count };
+            let insts = unsafe { (*blk).insts };
+            let mut i: usize = 0;
+            while i < inst_cnt && (insts as usize) != 0 {
+                let inst = unsafe { opt_inst_at(insts, i) };
+                let op = unsafe { (*inst).opcode };
+                let flags = unsafe { (*inst).flags };
+                if op == OPT_INST_ATOMIC || op == OPT_INST_VOLATILE_LOAD || op == OPT_INST_VOLATILE_STORE ||
+                   (flags & OPT_FLAG_BARRIER) != 0u16 {
+                    return true;
+                }
+                i = i + 1;
+            }
+            b = b + 1;
+        }
+    }
+    false
+}
+
+pub fn pgo_instrument_body(
+    body: view<OptBody>,
+    counter_section_name: StrId,
+    atomic_mode: bool,
+    stats: mut_view<PgoStats>
+) -> PgoInstrumentationPlan {
+    let cfg_fp: u64 = pgo_compute_cfg_fingerprint(view(*body));
+    let mut counters: u32 = 1u32; // Entry counter
+    if (body.blocks as usize) != 0 {
+        let mut b: usize = 0;
+        while b < body.bb_count {
+            let blk = unsafe { opt_block_at(body.blocks, b) };
+            let tk = unsafe { (*blk).term.kind };
+            if tk == OPT_TERM_BRANCH {
+                counters = counters + 2u32;
+            } else if tk == OPT_TERM_SWITCH_INT {
+                let sw_cnt = unsafe { (*blk).term.switch_count as u32 };
+                counters = counters + sw_cnt + 1u32;
+            }
+            b = b + 1;
+        }
+    }
+    let has_secret: bool = pgo_body_has_secret(view(*body));
+    let has_at_vol: bool = pgo_body_has_atomic_or_volatile(view(*body));
+    stats.instrumented_fns = stats.instrumented_fns + 1u32;
+    stats.instrumented_counters = stats.instrumented_counters + counters;
+    PgoInstrumentationPlan {
+        fn_sym: body.fn_sym,
+        cfg_fingerprint: cfg_fp,
+        num_counters: counters,
+        counter_section_name: counter_section_name,
+        atomic_counters: atomic_mode,
+        has_secret_barrier: has_secret,
+        has_atomic_or_volatile: has_at_vol,
+    }
+}
+
+// =============================================================================
+// 6. Profile Construction, Digest, `.axprof` Serialization & Deserialization (`AXS-PGO-003`)
+// =============================================================================
+
+pub fn pgo_profile_new(
+    arena: mut_view<Arena>,
+    target_triple: StrId,
+    program_identity_hash: u64,
+    provenance_kind: u8
+) -> *mut PgoProfileData {
+    let prof = arena_alloc_raw(mut_view(*arena), size_of<PgoProfileData>(), align_of<PgoProfileData>()) as *mut PgoProfileData;
+    let init_cap: usize = 16;
+    let fns = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(init_cap, size_of<PgoFunctionProfile>()), align_of<PgoFunctionProfile>()) as *mut PgoFunctionProfile;
+    unsafe {
+        (*prof).target_triple = target_triple;
+        (*prof).program_identity_hash = program_identity_hash;
+        (*prof).provenance_kind = provenance_kind;
+        (*prof).total_runs_merged = 1u32;
+        (*prof).profile_digest = 0u64;
+        (*prof).fns = fns;
+        (*prof).fn_count = 0;
+        (*prof).fn_cap = init_cap;
+    }
+    prof
+}
+
+pub fn pgo_fn_profile_new(
+    arena: mut_view<Arena>,
+    fn_sym: SymbolId,
+    fn_name: StrId,
+    signature_hash: u64,
+    cfg_fingerprint: u64,
+    block_count_expected: u32,
+    entry_count: u64
+) -> PgoFunctionProfile {
+    let b_len: usize = if block_count_expected == 0u32 { 1 } else { block_count_expected as usize };
+    let b_counts = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(b_len, size_of<u64>()), align_of<u64>()) as *mut u64;
+    let mut i: usize = 0;
+    while i < b_len {
+        unsafe { *pgo_u64_at(b_counts, i) = if i == 0 { entry_count } else { 0u64 }; }
+        i = i + 1;
+    }
+    let init_cap: usize = 4;
+    let brs = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(init_cap, size_of<PgoBranchProfile>()), align_of<PgoBranchProfile>()) as *mut PgoBranchProfile;
+    let cls = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(init_cap, size_of<PgoCallProfile>()), align_of<PgoCallProfile>()) as *mut PgoCallProfile;
+    let lps = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(init_cap, size_of<PgoLoopProfile>()), align_of<PgoLoopProfile>()) as *mut PgoLoopProfile;
+    let vls = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(init_cap, size_of<PgoValueProfile>()), align_of<PgoValueProfile>()) as *mut PgoValueProfile;
+    let hot_cls: u8 = pgo_classify_hotness_from_counts(entry_count, entry_count);
+    PgoFunctionProfile {
+        fn_sym: fn_sym,
+        fn_name: fn_name,
+        signature_hash: signature_hash,
+        cfg_fingerprint: cfg_fingerprint,
+        block_count_expected: block_count_expected,
+        entry_count: entry_count,
+        hotness_class: hot_cls,
+        compatibility: PGO_COMPAT_EXACT,
+        confidence: PGO_MAX_CONFIDENCE,
+        is_constant_time_secret: false,
+        has_atomic_or_volatile: false,
+        block_counts: b_counts,
+        block_count_len: b_len,
+        branches: brs,
+        branch_count: 0,
+        branch_cap: init_cap,
+        calls: cls,
+        call_count: 0,
+        call_cap: init_cap,
+        loops: lps,
+        loop_count: 0,
+        loop_cap: init_cap,
+        values: vls,
+        value_count: 0,
+        value_cap: init_cap,
+    }
+}
+
+pub fn pgo_fn_set_block_count(f_prof: mut_view<PgoFunctionProfile>, bb_idx: usize, count: u64) {
+    if bb_idx >= f_prof.block_count_len || (f_prof.block_counts as usize) == 0 {
+        return;
+    }
+    unsafe { *pgo_u64_at(f_prof.block_counts, bb_idx) = count; }
+    let mut max_c: u64 = f_prof.entry_count;
+    let mut i: usize = 0;
+    while i < f_prof.block_count_len {
+        let c = unsafe { *pgo_u64_at(f_prof.block_counts, i) };
+        if c > max_c {
+            max_c = c;
+        }
+        i = i + 1;
+    }
+    f_prof.hotness_class = pgo_classify_hotness_from_counts(f_prof.entry_count, max_c);
+}
+
+pub fn pgo_fn_add_branch(
+    f_prof: mut_view<PgoFunctionProfile>,
+    arena: mut_view<Arena>,
+    bb_id: OptBbId,
+    taken_count: u64,
+    not_taken_count: u64
+) {
+    if f_prof.branch_count >= f_prof.branch_cap {
+        let new_cap: usize = if f_prof.branch_cap == 0 { 4 } else { f_prof.branch_cap + f_prof.branch_cap };
+        let new_brs = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(new_cap, size_of<PgoBranchProfile>()), align_of<PgoBranchProfile>()) as *mut PgoBranchProfile;
+        let mut i: usize = 0;
+        while i < f_prof.branch_count {
+            unsafe { *pgo_branch_at(new_brs, i) = *pgo_branch_at(f_prof.branches, i); }
+            i = i + 1;
+        }
+        f_prof.branches = new_brs;
+        f_prof.branch_cap = new_cap;
+    }
+    let total: u64 = pgo_sat_add_u64(taken_count, not_taken_count);
+    let prob: u32 = pgo_compute_prob_bp(taken_count, total);
+    unsafe {
+        let dst = pgo_branch_at(f_prof.branches, f_prof.branch_count);
+        (*dst).bb_id = bb_id;
+        (*dst).taken_count = taken_count;
+        (*dst).not_taken_count = not_taken_count;
+        (*dst).taken_prob_bp = prob;
+    }
+    f_prof.branch_count = f_prof.branch_count + 1;
+}
+
+pub fn pgo_fn_add_call(
+    f_prof: mut_view<PgoFunctionProfile>,
+    arena: mut_view<Arena>,
+    callsite_id: u32,
+    callsite_bb: OptBbId,
+    target_0_sym: SymbolId,
+    target_0_count: u64,
+    target_1_sym: SymbolId,
+    target_1_count: u64,
+    other_calls: u64
+) {
+    if f_prof.call_count >= f_prof.call_cap {
+        let new_cap: usize = if f_prof.call_cap == 0 { 4 } else { f_prof.call_cap + f_prof.call_cap };
+        let new_cls = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(new_cap, size_of<PgoCallProfile>()), align_of<PgoCallProfile>()) as *mut PgoCallProfile;
+        let mut i: usize = 0;
+        while i < f_prof.call_count {
+            unsafe { *pgo_call_at(new_cls, i) = *pgo_call_at(f_prof.calls, i); }
+            i = i + 1;
+        }
+        f_prof.calls = new_cls;
+        f_prof.call_cap = new_cap;
+    }
+    let t0_v: u32 = target_0_sym.v;
+    let t1_v: u32 = target_1_sym.v;
+    let total: u64 = pgo_sat_add_u64(pgo_sat_add_u64(target_0_count, target_1_count), other_calls);
+    let dom_v: u32 = if target_0_count >= target_1_count { t0_v } else { t1_v };
+    let dom_cnt: u64 = if target_0_count >= target_1_count { target_0_count } else { target_1_count };
+    let prob: u32 = pgo_compute_prob_bp(dom_cnt, total);
+    let t_cnt: u32 = if target_1_count > 0u64 { 2u32 } else if target_0_count > 0u64 { 1u32 } else { 0u32 };
+    unsafe {
+        let dst = pgo_call_at(f_prof.calls, f_prof.call_count);
+        (*dst).callsite_id = callsite_id;
+        (*dst).callsite_bb = callsite_bb;
+        (*dst).total_calls = total;
+        (*dst).target_0 = PgoCallTargetEntry { target_sym: SymbolId { v: t0_v }, call_count: target_0_count };
+        (*dst).target_1 = PgoCallTargetEntry { target_sym: SymbolId { v: t1_v }, call_count: target_1_count };
+        (*dst).target_count = t_cnt;
+        (*dst).dominant_sym = SymbolId { v: dom_v };
+        (*dst).dominant_prob_bp = prob;
+    }
+    f_prof.call_count = f_prof.call_count + 1;
+}
+
+pub fn pgo_fn_add_loop(
+    f_prof: mut_view<PgoFunctionProfile>,
+    arena: mut_view<Arena>,
+    header_bb: OptBbId,
+    header_entries: u64,
+    total_backedge_taken: u64
+) {
+    if f_prof.loop_count >= f_prof.loop_cap {
+        let new_cap: usize = if f_prof.loop_cap == 0 { 4 } else { f_prof.loop_cap + f_prof.loop_cap };
+        let new_lps = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(new_cap, size_of<PgoLoopProfile>()), align_of<PgoLoopProfile>()) as *mut PgoLoopProfile;
+        let mut i: usize = 0;
+        while i < f_prof.loop_count {
+            unsafe { *pgo_loop_at(new_lps, i) = *pgo_loop_at(f_prof.loops, i); }
+            i = i + 1;
+        }
+        f_prof.loops = new_lps;
+        f_prof.loop_cap = new_cap;
+    }
+    let avg_x100: u64 = if header_entries == 0u64 {
+        0u64
+    } else {
+        pgo_sat_mul_u64(total_backedge_taken, 100u32) / header_entries
+    };
+    unsafe {
+        let dst = pgo_loop_at(f_prof.loops, f_prof.loop_count);
+        (*dst).header_bb = header_bb;
+        (*dst).header_entries = header_entries;
+        (*dst).total_backedge_taken = total_backedge_taken;
+        (*dst).avg_trip_count_x100 = avg_x100;
+    }
+    f_prof.loop_count = f_prof.loop_count + 1;
+}
+
+pub fn pgo_fn_add_value(
+    f_prof: mut_view<PgoFunctionProfile>,
+    arena: mut_view<Arena>,
+    site_id: u32,
+    val_0: i64,
+    cnt_0: u64,
+    val_1: i64,
+    cnt_1: u64,
+    other_obs: u64
+) {
+    if f_prof.value_count >= f_prof.value_cap {
+        let new_cap: usize = if f_prof.value_cap == 0 { 4 } else { f_prof.value_cap + f_prof.value_cap };
+        let new_vls = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(new_cap, size_of<PgoValueProfile>()), align_of<PgoValueProfile>()) as *mut PgoValueProfile;
+        let mut i: usize = 0;
+        while i < f_prof.value_count {
+            unsafe { *pgo_val_at(new_vls, i) = *pgo_val_at(f_prof.values, i); }
+            i = i + 1;
+        }
+        f_prof.values = new_vls;
+        f_prof.value_cap = new_cap;
+    }
+    let total: u64 = pgo_sat_add_u64(pgo_sat_add_u64(cnt_0, cnt_1), other_obs);
+    let dom_val: i64 = if cnt_0 >= cnt_1 { val_0 } else { val_1 };
+    let dom_cnt: u64 = if cnt_0 >= cnt_1 { cnt_0 } else { cnt_1 };
+    let prob: u32 = pgo_compute_prob_bp(dom_cnt, total);
+    let v_cnt: u32 = if cnt_1 > 0u64 { 2u32 } else if cnt_0 > 0u64 { 1u32 } else { 0u32 };
+    unsafe {
+        let dst = pgo_val_at(f_prof.values, f_prof.value_count);
+        (*dst).site_id = site_id;
+        (*dst).total_observations = total;
+        (*dst).top_0 = PgoValueEntry { value: val_0, count: cnt_0 };
+        (*dst).top_1 = PgoValueEntry { value: val_1, count: cnt_1 };
+        (*dst).value_count = v_cnt;
+        (*dst).dominant_val = dom_val;
+        (*dst).dominant_prob_bp = prob;
+    }
+    f_prof.value_count = f_prof.value_count + 1;
+}
+
+pub fn pgo_compute_profile_digest(prof: view<PgoProfileData>) -> u64 {
+    let mut h: u64 = pgo_fnv_init();
+    h = pgo_fnv_u32(h, prof.target_triple.v);
+    h = pgo_fnv_u64(h, prof.program_identity_hash);
+    h = pgo_fnv_u32(h, prof.provenance_kind as u32);
+    h = pgo_fnv_u32(h, prof.total_runs_merged);
+    h = pgo_fnv_u32(h, prof.fn_count as u32);
+    let mut i: usize = 0;
+    while i < prof.fn_count && (prof.fns as usize) != 0 {
+        let fp = unsafe { pgo_fn_at(prof.fns, i) };
+        unsafe {
+            h = pgo_fnv_u32(h, (*fp).fn_sym.v);
+            h = pgo_fnv_u64(h, (*fp).signature_hash);
+            h = pgo_fnv_u64(h, (*fp).cfg_fingerprint);
+            h = pgo_fnv_u32(h, (*fp).block_count_expected);
+            h = pgo_fnv_u64(h, (*fp).entry_count);
+            h = pgo_fnv_u32(h, (*fp).hotness_class as u32);
+            let fp_brcnt: usize = (*fp).branch_count;
+            h = pgo_fnv_u32(h, fp_brcnt as u32);
+            let mut b: usize = 0;
+            while b < fp_brcnt {
+                let br = pgo_branch_at((*fp).branches, b);
+                h = pgo_fnv_u32(h, (*br).bb_id.v);
+                h = pgo_fnv_u64(h, (*br).taken_count);
+                h = pgo_fnv_u64(h, (*br).not_taken_count);
+                b = b + 1;
+            }
+            let fp_clcnt: usize = (*fp).call_count;
+            h = pgo_fnv_u32(h, fp_clcnt as u32);
+            let mut c: usize = 0;
+            while c < fp_clcnt {
+                let cl = pgo_call_at((*fp).calls, c);
+                h = pgo_fnv_u32(h, (*cl).callsite_id);
+                h = pgo_fnv_u64(h, (*cl).total_calls);
+                h = pgo_fnv_u32(h, (*cl).dominant_sym.v);
+                c = c + 1;
+            }
+            let fp_lpcnt: usize = (*fp).loop_count;
+            h = pgo_fnv_u32(h, fp_lpcnt as u32);
+            let mut l: usize = 0;
+            while l < fp_lpcnt {
+                let lp = pgo_loop_at((*fp).loops, l);
+                h = pgo_fnv_u32(h, (*lp).header_bb.v);
+                h = pgo_fnv_u64(h, (*lp).header_entries);
+                h = pgo_fnv_u64(h, (*lp).total_backedge_taken);
+                l = l + 1;
+            }
+            let fp_vlcnt: usize = (*fp).value_count;
+            h = pgo_fnv_u32(h, fp_vlcnt as u32);
+            let mut v: usize = 0;
+            while v < fp_vlcnt {
+                let vl = pgo_val_at((*fp).values, v);
+                h = pgo_fnv_u32(h, (*vl).site_id);
+                h = pgo_fnv_u64(h, (*vl).total_observations);
+                h = pgo_fnv_u64(h, (*vl).dominant_val as u64);
+                v = v + 1;
+            }
+        }
+        i = i + 1;
+    }
+    h
+}
+
+pub fn pgo_profile_add_fn(
+    prof: mut_view<PgoProfileData>,
+    arena: mut_view<Arena>,
+    f_prof: PgoFunctionProfile
+) {
+    if prof.fn_count >= prof.fn_cap {
+        let new_cap: usize = if prof.fn_cap == 0 { 16 } else { prof.fn_cap + prof.fn_cap };
+        let new_fns = arena_alloc_raw(mut_view(*arena), pgo_mul_usize(new_cap, size_of<PgoFunctionProfile>()), align_of<PgoFunctionProfile>()) as *mut PgoFunctionProfile;
+        let mut i: usize = 0;
+        while i < prof.fn_count {
+            unsafe { *pgo_fn_at(new_fns, i) = *pgo_fn_at(prof.fns, i); }
+            i = i + 1;
+        }
+        prof.fns = new_fns;
+        prof.fn_cap = new_cap;
+    }
+    // Insert sorted by `fn_sym.v` for deterministic `.axprof` layout (`AXS-PGO-003.2`)
+    let mut pos: usize = prof.fn_count;
+    let sym_v: u32 = f_prof.fn_sym.v;
+    let mut k: usize = 0;
+    while k < prof.fn_count {
+        let cur_v = unsafe { (*pgo_fn_at(prof.fns, k)).fn_sym.v };
+        if sym_v < cur_v {
+            pos = k;
+            k = prof.fn_count;
+        } else {
+            k = k + 1;
+        }
+    }
+    let mut j: usize = prof.fn_count;
+    while j > pos {
+        unsafe { *pgo_fn_at(prof.fns, j) = *pgo_fn_at(prof.fns, j - 1); }
+        j = j - 1;
+    }
+    unsafe { *pgo_fn_at(prof.fns, pos) = f_prof; }
+    prof.fn_count = prof.fn_count + 1;
+    prof.profile_digest = pgo_compute_profile_digest(view(*prof));
+}
+
+pub fn pgo_profile_find_fn(prof: view<PgoProfileData>, fn_sym: SymbolId) -> *mut PgoFunctionProfile {
+    let mut i: usize = 0;
+    while i < prof.fn_count && (prof.fns as usize) != 0 {
+        let fp = unsafe { pgo_fn_at(prof.fns, i) };
+        let cur_v = unsafe { (*fp).fn_sym.v };
+        if cur_v == fn_sym.v {
+            return fp;
+        }
+        i = i + 1;
+    }
+    0 as *mut PgoFunctionProfile
+}
+
+// --- `.axprof` Binary Serialization & Deserialization Helpers ---
+
+fn axprof_write_u8(buf: *mut u8, off: usize, v: u8) -> usize {
+    unsafe {
+        *pgo_u8_at(buf, off) = v;
+    }
+    off + 1
+}
+
+fn axprof_write_u32(buf: *mut u8, off: usize, v: u32) -> usize {
+    let o1 = axprof_write_u8(buf, off, (v & 255u32) as u8);
+    let o2 = axprof_write_u8(buf, o1, ((v >> 8u32) & 255u32) as u8);
+    let o3 = axprof_write_u8(buf, o2, ((v >> 16u32) & 255u32) as u8);
+    axprof_write_u8(buf, o3, ((v >> 24u32) & 255u32) as u8)
+}
+
+fn axprof_write_u64(buf: *mut u8, off: usize, v: u64) -> usize {
+    let o1 = axprof_write_u32(buf, off, (v & 0xFFFFFFFFu64) as u32);
+    axprof_write_u32(buf, o1, ((v >> 32u64) & 0xFFFFFFFFu64) as u32)
+}
+
+fn axprof_read_u8(buf: *const u8, off: usize) -> u8 {
+    unsafe {
+        *pgo_const_u8_at(buf, off)
+    }
+}
+
+fn axprof_read_u32(buf: *const u8, off: usize) -> u32 {
+    let b0 = axprof_read_u8(buf, off) as u32;
+    let b1 = axprof_read_u8(buf, off + 1) as u32;
+    let b2 = axprof_read_u8(buf, off + 2) as u32;
+    let b3 = axprof_read_u8(buf, off + 3) as u32;
+    b0 | (b1 << 8u32) | (b2 << 16u32) | (b3 << 24u32)
+}
+
+fn axprof_read_u64(buf: *const u8, off: usize) -> u64 {
+    let lo = axprof_read_u32(buf, off) as u64;
+    let hi = axprof_read_u32(buf, off + 4) as u64;
+    lo | (hi << 32u64)
+}
+
+pub fn pgo_serialize_profile(
+    prof: mut_view<PgoProfileData>,
+    arena: mut_view<Arena>,
+    out_len: mut_view<usize>
+) -> *mut u8 {
+    prof.profile_digest = pgo_compute_profile_digest(view(*prof));
+    let mut cap: usize = 64;
+    let mut i: usize = 0;
+    while i < prof.fn_count {
+        let fp = unsafe { pgo_fn_at(prof.fns, i) };
+        unsafe {
+            cap = cap + 64 + (*fp).block_count_len * 8 + (*fp).branch_count * 24 +
+                  (*fp).call_count * 48 + (*fp).loop_count * 32 + (*fp).value_count * 48;
+        }
+        i = i + 1;
+    }
+    let buf = arena_alloc_raw(mut_view(*arena), cap, 1);
+    let mut off: usize = 0;
+
+    off = axprof_write_u8(buf, off, AXPROF_MAGIC_0);
+    off = axprof_write_u8(buf, off, AXPROF_MAGIC_1);
+    off = axprof_write_u8(buf, off, AXPROF_MAGIC_2);
+    off = axprof_write_u8(buf, off, AXPROF_MAGIC_3);
+    off = axprof_write_u32(buf, off, AXPROF_SCHEMA_VERSION);
+    off = axprof_write_u32(buf, off, prof.target_triple.v);
+    off = axprof_write_u64(buf, off, prof.program_identity_hash);
+    off = axprof_write_u8(buf, off, prof.provenance_kind);
+    off = axprof_write_u32(buf, off, prof.total_runs_merged);
+    off = axprof_write_u64(buf, off, prof.profile_digest);
+    off = axprof_write_u32(buf, off, prof.fn_count as u32);
+
+    let mut f_idx: usize = 0;
+    while f_idx < prof.fn_count {
+        let fp = unsafe { pgo_fn_at(prof.fns, f_idx) };
+        unsafe {
+            off = axprof_write_u32(buf, off, (*fp).fn_sym.v);
+            off = axprof_write_u32(buf, off, (*fp).fn_name.v);
+            off = axprof_write_u64(buf, off, (*fp).signature_hash);
+            off = axprof_write_u64(buf, off, (*fp).cfg_fingerprint);
+            off = axprof_write_u32(buf, off, (*fp).block_count_expected);
+            off = axprof_write_u64(buf, off, (*fp).entry_count);
+            off = axprof_write_u8(buf, off, if (*fp).is_constant_time_secret { 1u8 } else { 0u8 });
+            off = axprof_write_u8(buf, off, if (*fp).has_atomic_or_volatile { 1u8 } else { 0u8 });
+            let fp_blen: usize = (*fp).block_count_len;
+            off = axprof_write_u32(buf, off, fp_blen as u32);
+            let mut b: usize = 0;
+            while b < fp_blen {
+                off = axprof_write_u64(buf, off, *pgo_u64_at((*fp).block_counts, b));
+                b = b + 1;
+            }
+            let fp_brcnt: usize = (*fp).branch_count;
+            off = axprof_write_u32(buf, off, fp_brcnt as u32);
+            let mut br_i: usize = 0;
+            while br_i < fp_brcnt {
+                let br = pgo_branch_at((*fp).branches, br_i);
+                off = axprof_write_u32(buf, off, (*br).bb_id.v);
+                off = axprof_write_u64(buf, off, (*br).taken_count);
+                off = axprof_write_u64(buf, off, (*br).not_taken_count);
+                br_i = br_i + 1;
+            }
+            let fp_clcnt: usize = (*fp).call_count;
+            off = axprof_write_u32(buf, off, fp_clcnt as u32);
+            let mut cl_i: usize = 0;
+            while cl_i < fp_clcnt {
+                let cl = pgo_call_at((*fp).calls, cl_i);
+                off = axprof_write_u32(buf, off, (*cl).callsite_id);
+                off = axprof_write_u32(buf, off, (*cl).callsite_bb.v);
+                off = axprof_write_u64(buf, off, (*cl).total_calls);
+                off = axprof_write_u32(buf, off, (*cl).target_0.target_sym.v);
+                off = axprof_write_u64(buf, off, (*cl).target_0.call_count);
+                off = axprof_write_u32(buf, off, (*cl).target_1.target_sym.v);
+                off = axprof_write_u64(buf, off, (*cl).target_1.call_count);
+                cl_i = cl_i + 1;
+            }
+            let fp_lpcnt: usize = (*fp).loop_count;
+            off = axprof_write_u32(buf, off, fp_lpcnt as u32);
+            let mut lp_i: usize = 0;
+            while lp_i < fp_lpcnt {
+                let lp = pgo_loop_at((*fp).loops, lp_i);
+                off = axprof_write_u32(buf, off, (*lp).header_bb.v);
+                off = axprof_write_u64(buf, off, (*lp).header_entries);
+                off = axprof_write_u64(buf, off, (*lp).total_backedge_taken);
+                lp_i = lp_i + 1;
+            }
+            let fp_vlcnt: usize = (*fp).value_count;
+            off = axprof_write_u32(buf, off, fp_vlcnt as u32);
+            let mut vl_i: usize = 0;
+            while vl_i < fp_vlcnt {
+                let vl = pgo_val_at((*fp).values, vl_i);
+                off = axprof_write_u32(buf, off, (*vl).site_id);
+                off = axprof_write_u64(buf, off, (*vl).total_observations);
+                off = axprof_write_u64(buf, off, (*vl).top_0.value as u64);
+                off = axprof_write_u64(buf, off, (*vl).top_0.count);
+                off = axprof_write_u64(buf, off, (*vl).top_1.value as u64);
+                off = axprof_write_u64(buf, off, (*vl).top_1.count);
+                vl_i = vl_i + 1;
+            }
+        }
+        f_idx = f_idx + 1;
+    }
+
+    *out_len = off;
+    buf
+}
+
+pub fn pgo_deserialize_profile(
+    bytes: *const u8,
+    byte_len: usize,
+    expected_target: StrId,
+    arena: mut_view<Arena>,
+    stats: mut_view<PgoStats>
+) -> *mut PgoProfileData {
+    if (bytes as usize) == 0 || byte_len < 37 {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return 0 as *mut PgoProfileData;
+    }
+    let m0 = axprof_read_u8(bytes, 0);
+    let m1 = axprof_read_u8(bytes, 1);
+    let m2 = axprof_read_u8(bytes, 2);
+    let m3 = axprof_read_u8(bytes, 3);
+    if m0 != AXPROF_MAGIC_0 || m1 != AXPROF_MAGIC_1 || m2 != AXPROF_MAGIC_2 || m3 != AXPROF_MAGIC_3 {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return 0 as *mut PgoProfileData;
+    }
+    let ver = axprof_read_u32(bytes, 4);
+    let target_v = axprof_read_u32(bytes, 8);
+    if ver != AXPROF_SCHEMA_VERSION || target_v != expected_target.v {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return 0 as *mut PgoProfileData;
+    }
+    let prog_id = axprof_read_u64(bytes, 12);
+    let prov = axprof_read_u8(bytes, 20);
+    let runs_merged = axprof_read_u32(bytes, 21);
+    let expected_digest = axprof_read_u64(bytes, 25);
+    let fn_cnt = axprof_read_u32(bytes, 33);
+    if fn_cnt > 65536u32 {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return 0 as *mut PgoProfileData;
+    }
+
+    let prof = pgo_profile_new(mut_view(*arena), StrId { v: target_v }, prog_id, prov);
+    unsafe { (*prof).total_runs_merged = runs_merged; }
+
+    let mut off: usize = 37;
+    let mut f_idx: u32 = 0u32;
+    while f_idx < fn_cnt {
+        if off + 42 > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let sym_v = axprof_read_u32(bytes, off);
+        let name_v = axprof_read_u32(bytes, off + 4);
+        let sig_h = axprof_read_u64(bytes, off + 8);
+        let cfg_fp = axprof_read_u64(bytes, off + 16);
+        let bb_exp = axprof_read_u32(bytes, off + 24);
+        let entry_c = axprof_read_u64(bytes, off + 28);
+        let is_sec = axprof_read_u8(bytes, off + 36);
+        let has_av = axprof_read_u8(bytes, off + 37);
+        let b_len = axprof_read_u32(bytes, off + 38) as usize;
+        off = off + 42;
+        if b_len > 65536 || off + pgo_mul_usize(b_len, 8) > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let mut f_prof = pgo_fn_profile_new(
+            mut_view(*arena),
+            SymbolId { v: sym_v },
+            StrId { v: name_v },
+            sig_h,
+            cfg_fp,
+            bb_exp,
+            entry_c
+        );
+        f_prof.is_constant_time_secret = is_sec != 0u8;
+        f_prof.has_atomic_or_volatile = has_av != 0u8;
+
+        let mut b: usize = 0;
+        while b < b_len {
+            let bc = axprof_read_u64(bytes, off);
+            off = off + 8;
+            pgo_fn_set_block_count(mut_view(f_prof), b, bc);
+            b = b + 1;
+        }
+        if off + 4 > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let br_cnt = axprof_read_u32(bytes, off);
+        off = off + 4;
+        if (br_cnt as usize) > 65536 || off + pgo_mul_usize(br_cnt as usize, 20) > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let mut br_i: u32 = 0u32;
+        while br_i < br_cnt {
+            let bb_v = axprof_read_u32(bytes, off);
+            let tk_c = axprof_read_u64(bytes, off + 4);
+            let ntk_c = axprof_read_u64(bytes, off + 12);
+            off = off + 20;
+            pgo_fn_add_branch(mut_view(f_prof), mut_view(*arena), OptBbId { v: bb_v }, tk_c, ntk_c);
+            br_i = br_i + 1u32;
+        }
+        if off + 4 > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let cl_cnt = axprof_read_u32(bytes, off);
+        off = off + 4;
+        if (cl_cnt as usize) > 65536 || off + pgo_mul_usize(cl_cnt as usize, 40) > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let mut cl_i: u32 = 0u32;
+        while cl_i < cl_cnt {
+            let cs_id = axprof_read_u32(bytes, off);
+            let cs_bb = axprof_read_u32(bytes, off + 4);
+            let tot_c = axprof_read_u64(bytes, off + 8);
+            let t0_sym = axprof_read_u32(bytes, off + 16);
+            let t0_cnt = axprof_read_u64(bytes, off + 20);
+            let t1_sym = axprof_read_u32(bytes, off + 28);
+            let t1_cnt = axprof_read_u64(bytes, off + 32);
+            off = off + 40;
+            let sum_01 = pgo_sat_add_u64(t0_cnt, t1_cnt);
+            let rem_c: u64 = if tot_c > sum_01 { tot_c - sum_01 } else { 0u64 };
+            pgo_fn_add_call(
+                mut_view(f_prof),
+                mut_view(*arena),
+                cs_id,
+                OptBbId { v: cs_bb },
+                SymbolId { v: t0_sym },
+                t0_cnt,
+                SymbolId { v: t1_sym },
+                t1_cnt,
+                rem_c
+            );
+            cl_i = cl_i + 1u32;
+        }
+        if off + 4 > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let lp_cnt = axprof_read_u32(bytes, off);
+        off = off + 4;
+        if (lp_cnt as usize) > 65536 || off + pgo_mul_usize(lp_cnt as usize, 20) > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let mut lp_i: u32 = 0u32;
+        while lp_i < lp_cnt {
+            let hdr_v = axprof_read_u32(bytes, off);
+            let hdr_e = axprof_read_u64(bytes, off + 4);
+            let back_t = axprof_read_u64(bytes, off + 12);
+            off = off + 20;
+            pgo_fn_add_loop(mut_view(f_prof), mut_view(*arena), OptBbId { v: hdr_v }, hdr_e, back_t);
+            lp_i = lp_i + 1u32;
+        }
+        if off + 4 > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let vl_cnt = axprof_read_u32(bytes, off);
+        off = off + 4;
+        if (vl_cnt as usize) > 65536 || off + pgo_mul_usize(vl_cnt as usize, 44) > byte_len {
+            stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+            return 0 as *mut PgoProfileData;
+        }
+        let mut vl_i: u32 = 0u32;
+        while vl_i < vl_cnt {
+            let s_id = axprof_read_u32(bytes, off);
+            let tot_o = axprof_read_u64(bytes, off + 4);
+            let v0 = axprof_read_u64(bytes, off + 12) as i64;
+            let c0 = axprof_read_u64(bytes, off + 20);
+            let v1 = axprof_read_u64(bytes, off + 28) as i64;
+            let c1 = axprof_read_u64(bytes, off + 36);
+            off = off + 44;
+            let sum_v = pgo_sat_add_u64(c0, c1);
+            let rem_v: u64 = if tot_o > sum_v { tot_o - sum_v } else { 0u64 };
+            pgo_fn_add_value(mut_view(f_prof), mut_view(*arena), s_id, v0, c0, v1, c1, rem_v);
+            vl_i = vl_i + 1u32;
+        }
+        pgo_profile_add_fn(unsafe { mut_view(*prof) }, mut_view(*arena), f_prof);
+        f_idx = f_idx + 1u32;
+    }
+
+    let computed_digest = pgo_compute_profile_digest(unsafe { view(*prof) });
+    if computed_digest != expected_digest {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return 0 as *mut PgoProfileData;
+    }
+    unsafe { (*prof).profile_digest = computed_digest; }
+    prof
+}
+
+// =============================================================================
+// 7. Deterministic Weighted Profile Merging (`AXS-PGO-004.2`, `REQ-OPT-280..282`)
+// =============================================================================
+
+pub fn pgo_merge_profiles(
+    dst: mut_view<PgoProfileData>,
+    src: view<PgoProfileData>,
+    weight: u32,
+    arena: mut_view<Arena>,
+    stats: mut_view<PgoStats>
+) -> bool {
+    if dst.target_triple.v != src.target_triple.v || weight == 0u32 {
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < src.fn_count && (src.fns as usize) != 0 {
+        let s_fn = unsafe { pgo_fn_at(src.fns, i) };
+        let s_sym = unsafe { (*s_fn).fn_sym };
+        let s_cfg = unsafe { (*s_fn).cfg_fingerprint };
+        let s_sig = unsafe { (*s_fn).signature_hash };
+        let d_fn = pgo_profile_find_fn(view(*dst), s_sym);
+        if (d_fn as usize) == 0 {
+            let mut copy_fn = unsafe { *s_fn };
+            copy_fn.entry_count = pgo_sat_mul_u64(copy_fn.entry_count, weight);
+            pgo_profile_add_fn(mut_view(*dst), mut_view(*arena), copy_fn);
+        } else {
+            let d_cfg = unsafe { (*d_fn).cfg_fingerprint };
+            let d_sig = unsafe { (*d_fn).signature_hash };
+            if d_cfg == s_cfg && d_sig == s_sig {
+                unsafe {
+                    (*d_fn).entry_count = pgo_sat_add_u64((*d_fn).entry_count, pgo_sat_mul_u64((*s_fn).entry_count, weight));
+                    let d_blen: usize = (*d_fn).block_count_len;
+                    let s_blen: usize = (*s_fn).block_count_len;
+                    let min_b: usize = if d_blen < s_blen { d_blen } else { s_blen };
+                    let mut b: usize = 0;
+                    while b < min_b {
+                        let dc = *pgo_u64_at((*d_fn).block_counts, b);
+                        let sc = pgo_sat_mul_u64(*pgo_u64_at((*s_fn).block_counts, b), weight);
+                        pgo_fn_set_block_count(mut_view(*d_fn), b, pgo_sat_add_u64(dc, sc));
+                        b = b + 1;
+                    }
+                    let d_brcnt: usize = (*d_fn).branch_count;
+                    let s_brcnt: usize = (*s_fn).branch_count;
+                    let min_br: usize = if d_brcnt < s_brcnt { d_brcnt } else { s_brcnt };
+                    let mut br_i: usize = 0;
+                    while br_i < min_br {
+                        let d_br = pgo_branch_at((*d_fn).branches, br_i);
+                        let s_br = pgo_branch_at((*s_fn).branches, br_i);
+                        (*d_br).taken_count = pgo_sat_add_u64((*d_br).taken_count, pgo_sat_mul_u64((*s_br).taken_count, weight));
+                        (*d_br).not_taken_count = pgo_sat_add_u64((*d_br).not_taken_count, pgo_sat_mul_u64((*s_br).not_taken_count, weight));
+                        let tot = pgo_sat_add_u64((*d_br).taken_count, (*d_br).not_taken_count);
+                        (*d_br).taken_prob_bp = pgo_compute_prob_bp((*d_br).taken_count, tot);
+                        br_i = br_i + 1;
+                    }
+                    let d_lpcnt: usize = (*d_fn).loop_count;
+                    let s_lpcnt: usize = (*s_fn).loop_count;
+                    let min_lp: usize = if d_lpcnt < s_lpcnt { d_lpcnt } else { s_lpcnt };
+                    let mut lp_i: usize = 0;
+                    while lp_i < min_lp {
+                        let d_lp = pgo_loop_at((*d_fn).loops, lp_i);
+                        let s_lp = pgo_loop_at((*s_fn).loops, lp_i);
+                        (*d_lp).header_entries = pgo_sat_add_u64((*d_lp).header_entries, pgo_sat_mul_u64((*s_lp).header_entries, weight));
+                        (*d_lp).total_backedge_taken = pgo_sat_add_u64((*d_lp).total_backedge_taken, pgo_sat_mul_u64((*s_lp).total_backedge_taken, weight));
+                        (*d_lp).avg_trip_count_x100 = if (*d_lp).header_entries == 0u64 {
+                            0u64
+                        } else {
+                            pgo_sat_mul_u64((*d_lp).total_backedge_taken, 100u32) / (*d_lp).header_entries
+                        };
+                        lp_i = lp_i + 1;
+                    }
+                    (*d_fn).hotness_class = pgo_classify_hotness_from_counts((*d_fn).entry_count, (*d_fn).entry_count);
+                }
+            } else {
+                stats.stale_fn_fallbacks = stats.stale_fn_fallbacks + 1u32;
+            }
+        }
+        i = i + 1;
+    }
+    dst.provenance_kind = PGO_PROV_MERGED;
+    dst.total_runs_merged = dst.total_runs_merged + src.total_runs_merged;
+    dst.profile_digest = pgo_compute_profile_digest(view(*dst));
+    stats.profiles_merged = stats.profiles_merged + 1u32;
+    true
+}
+
+// =============================================================================
+// 8. Compatibility Classification & Stale-Profile Fallback (`AXS-PGO-005`)
+// =============================================================================
+
+pub fn pgo_classify_and_bind_function(
+    prof: view<PgoProfileData>,
+    f_prof: mut_view<PgoFunctionProfile>,
+    expected_target: StrId,
+    current_sig_hash: u64,
+    current_cfg_fp: u64,
+    current_bb_count: u32,
+    allow_minor_drift: bool,
+    stats: mut_view<PgoStats>
+) -> u8 {
+    if prof.target_triple.v != expected_target.v {
+        f_prof.compatibility = PGO_COMPAT_INCOMPATIBLE;
+        f_prof.confidence = 0u32;
+        stats.incompatible_profiles_rejected = stats.incompatible_profiles_rejected + 1u32;
+        return PGO_COMPAT_INCOMPATIBLE;
+    }
+    if f_prof.signature_hash == current_sig_hash &&
+       f_prof.cfg_fingerprint == current_cfg_fp &&
+       f_prof.block_count_expected == current_bb_count {
+        f_prof.compatibility = PGO_COMPAT_EXACT;
+        f_prof.confidence = PGO_MAX_CONFIDENCE;
+        stats.exact_fn_matches = stats.exact_fn_matches + 1u32;
+        return PGO_COMPAT_EXACT;
+    }
+    if f_prof.signature_hash == current_sig_hash &&
+       f_prof.cfg_fingerprint == current_cfg_fp &&
+       allow_minor_drift {
+        f_prof.compatibility = PGO_COMPAT_COMPATIBLE;
+        f_prof.confidence = (f_prof.confidence * 750u32) / 1000u32;
+        stats.compatible_fn_matches = stats.compatible_fn_matches + 1u32;
+        return PGO_COMPAT_COMPATIBLE;
+    }
+
+    // `AXS-PGO-005.2`: Stale profile fallback — reject fine-grained block/branch/value counters
+    // for the modified function, decay confidence, emit warning count, and NEVER abort compilation.
+    f_prof.compatibility = PGO_COMPAT_STALE;
+    let decayed: u32 = f_prof.confidence / 4u32;
+    f_prof.confidence = if decayed < 250u32 { decayed } else { 250u32 };
+    f_prof.branch_count = 0;
+    f_prof.call_count = 0;
+    f_prof.loop_count = 0;
+    f_prof.value_count = 0;
+    stats.stale_fn_fallbacks = stats.stale_fn_fallbacks + 1u32;
+    PGO_COMPAT_STALE
+}
+
+// =============================================================================
+// 9. PGO Cost-Model Guidance & Safety Barriers (`AXS-PGO-006..008`, `REQ-OPT-231..241`)
+// =============================================================================
+
+pub fn pgo_compute_cost_guidance(
+    f_prof: view<PgoFunctionProfile>,
+    base_profile: u8,
+    is_repr_c_or_pinned: bool,
+    static_devirt_proven: bool,
+    stats: mut_view<PgoStats>
+) -> PgoCostGuidance {
+    let base_inl: i32 = if base_profile == OPT_PROFILE_SIZE_OS {
+        10i32
+    } else if base_profile == OPT_PROFILE_DEBUG_O0 {
+        0i32
+    } else {
+        45i32
+    };
+
+    let mut guide = PgoCostGuidance {
+        fn_sym: f_prof.fn_sym,
+        epistemic_kind: EPISTEMIC_HEURISTIC,
+        compatibility: f_prof.compatibility,
+        confidence: f_prof.confidence,
+        hotness_class: f_prof.hotness_class,
+        inline_threshold_insts: base_inl,
+        allow_specialization: false,
+        has_value_guard_spec: false,
+        guarded_spec_val: 0i64,
+        has_guarded_devirt: static_devirt_proven,
+        guarded_devirt_target: SymbolId { v: 0u32 },
+        requires_runtime_devirt_guard: !static_devirt_proven,
+        unroll_factor: 1u32,
+        peel_first_iter: false,
+        simd_width_plan: PGO_VEC_SCALAR_ONLY,
+        hot_block_count: 0u32,
+        cold_split_block_count: 0u32,
+        fallthrough_swaps: 0u32,
+        cmov_candidates: 0u32,
+        code_align_bytes: 16u32,
+        allow_data_layout_opt: false,
+    };
+
+    if static_devirt_proven {
+        guide.epistemic_kind = EPISTEMIC_PROVEN;
+    }
+
+    if f_prof.has_atomic_or_volatile {
+        stats.atomic_volatile_barriers = stats.atomic_volatile_barriers + 1u32;
+    }
+
+    // Constant-time secret protection (`AXS-PGO-008.1`, `REQ-OPT-246`):
+    // Never speculate branches, values, or indirect calls inside constant-time regions.
+    if f_prof.is_constant_time_secret {
+        stats.secret_constant_time_barriers = stats.secret_constant_time_barriers + 1u32;
+        guide.allow_specialization = false;
+        guide.has_value_guard_spec = false;
+        if !static_devirt_proven {
+            guide.has_guarded_devirt = false;
+        }
+        return guide;
+    }
+
+    // Stale or low-confidence profiles fall back cleanly to static heuristics (`AXS-PGO-005.2`).
+    let f_conf: u32 = f_prof.confidence;
+    if f_prof.compatibility >= PGO_COMPAT_STALE || f_conf < 500u32 {
+        return guide;
+    }
+
+    if !static_devirt_proven {
+        guide.epistemic_kind = EPISTEMIC_OBSERVED;
+    }
+
+    // 1. Inlining threshold & code alignment (`REQ-OPT-232`, `REQ-OPT-241`).
+    if f_prof.hotness_class == PGO_HOTNESS_HOT {
+        guide.inline_threshold_insts = (base_inl * 25i32) / 10i32;
+        guide.allow_specialization = true;
+        guide.code_align_bytes = 32u32;
+        stats.hot_inline_boosts = stats.hot_inline_boosts + 1u32;
+    } else if f_prof.hotness_class == PGO_HOTNESS_WARM {
+        guide.inline_threshold_insts = base_inl;
+        guide.allow_specialization = true;
+        guide.code_align_bytes = 16u32;
+    } else {
+        guide.inline_threshold_insts = 10i32;
+        guide.allow_specialization = false;
+        guide.code_align_bytes = 4u32;
+        stats.cold_inline_suppressions = stats.cold_inline_suppressions + 1u32;
+    }
+
+    // 2. Value-guarded specialization (`AXS-PGO-006.2`, `REQ-OPT-233`).
+    if f_prof.confidence >= 600u32 && f_prof.value_count > 0 && (f_prof.values as usize) != 0 {
+        let vp = unsafe { pgo_val_at(f_prof.values, 0) };
+        let dom_bp = unsafe { (*vp).dominant_prob_bp };
+        let dom_v = unsafe { (*vp).dominant_val };
+        if dom_bp >= 8000u32 {
+            guide.has_value_guard_spec = true;
+            guide.guarded_spec_val = dom_v;
+            stats.value_guarded_specs = stats.value_guarded_specs + 1u32;
+        }
+    }
+
+    // 3. Guarded speculative devirtualization (`AXS-PGO-006.3`, `REQ-OPT-234`).
+    if !static_devirt_proven && f_prof.confidence >= 600u32 && f_prof.call_count > 0 && (f_prof.calls as usize) != 0 {
+        let cp = unsafe { pgo_call_at(f_prof.calls, 0) };
+        let dom_bp = unsafe { (*cp).dominant_prob_bp };
+        let dom_sym = unsafe { (*cp).dominant_sym };
+        if dom_bp >= 7500u32 && dom_sym.v != 0u32 {
+            guide.has_guarded_devirt = true;
+            guide.guarded_devirt_target = dom_sym;
+            guide.requires_runtime_devirt_guard = true;
+            stats.guarded_devirt_sites = stats.guarded_devirt_sites + 1u32;
+        }
+    }
+
+    // 4. Loop trip-count unrolling/peeling & SIMD vector width (`AXS-PGO-006.4`, `AXS-PGO-007.1`, `REQ-OPT-235..236`).
+    if f_prof.loop_count > 0 && (f_prof.loops as usize) != 0 {
+        let lp = unsafe { pgo_loop_at(f_prof.loops, 0) };
+        let trip_x100 = unsafe { (*lp).avg_trip_count_x100 };
+        let hdr_entries = unsafe { (*lp).header_entries };
+        if f_prof.hotness_class <= PGO_HOTNESS_COLD || hdr_entries == 0u64 || trip_x100 <= 300u64 {
+            guide.unroll_factor = 1u32;
+            guide.peel_first_iter = false;
+            guide.simd_width_plan = PGO_VEC_SCALAR_ONLY;
+            stats.cold_loops_suppressed = stats.cold_loops_suppressed + 1u32;
+            stats.simd_width_decisions = stats.simd_width_decisions + 1u32;
+        } else if trip_x100 <= 1200u64 {
+            guide.unroll_factor = 2u32;
+            guide.peel_first_iter = true;
+            guide.simd_width_plan = PGO_VEC_128;
+            stats.loop_unroll_boosts = stats.loop_unroll_boosts + 1u32;
+            stats.simd_width_decisions = stats.simd_width_decisions + 1u32;
+        } else {
+            guide.unroll_factor = if f_prof.hotness_class == PGO_HOTNESS_HOT { 4u32 } else { 2u32 };
+            guide.peel_first_iter = true;
+            guide.simd_width_plan = if f_prof.hotness_class == PGO_HOTNESS_HOT { PGO_VEC_256_UNROLLED } else { PGO_VEC_128 };
+            stats.loop_unroll_boosts = stats.loop_unroll_boosts + 1u32;
+            stats.simd_width_decisions = stats.simd_width_decisions + 1u32;
+        }
+    }
+
+    // 5. Hot/cold block splitting (`AXS-PGO-007.2`, `REQ-OPT-238`).
+    if f_prof.compatibility == PGO_COMPAT_EXACT && f_prof.hotness_class == PGO_HOTNESS_HOT && (f_prof.block_counts as usize) != 0 {
+        let mut b: usize = 0;
+        while b < f_prof.block_count_len {
+            let bc = unsafe { *pgo_u64_at(f_prof.block_counts, b) };
+            if bc == 0u64 {
+                guide.cold_split_block_count = guide.cold_split_block_count + 1u32;
+                stats.hot_cold_blocks_split = stats.hot_cold_blocks_split + 1u32;
+            } else {
+                guide.hot_block_count = guide.hot_block_count + 1u32;
+            }
+            b = b + 1;
+        }
+    }
+
+    // 6. Branch fall-through ordering & `jcc` vs `cmovcc` (`AXS-PGO-007.2..3`, `REQ-OPT-239`, `REQ-OPT-241`).
+    let mut br_i: usize = 0;
+    while br_i < f_prof.branch_count && (f_prof.branches as usize) != 0 {
+        let br = unsafe { pgo_branch_at(f_prof.branches, br_i) };
+        let prob_bp = unsafe { (*br).taken_prob_bp };
+        if prob_bp > 5000u32 {
+            guide.fallthrough_swaps = guide.fallthrough_swaps + 1u32;
+            stats.branch_fallthrough_orders = stats.branch_fallthrough_orders + 1u32;
+        }
+        if prob_bp >= 4000u32 && prob_bp <= 6000u32 {
+            guide.cmov_candidates = guide.cmov_candidates + 1u32;
+            stats.cmov_decisions = stats.cmov_decisions + 1u32;
+        }
+        br_i = br_i + 1;
+    }
+
+    // 7. Data layout optimization eligibility (`AXS-PGO-007.4`, `REQ-OPT-237`, `REQ-OPT-240`).
+    guide.allow_data_layout_opt = f_prof.hotness_class == PGO_HOTNESS_HOT && !is_repr_c_or_pinned;
+    guide
+}
+
+// =============================================================================
+// 10. CallGraph Hot/Cold Annotation & PassManager Integration (`AXS-LTO-030`)
+// =============================================================================
+
+pub fn pgo_apply_to_callgraph(
+    cg: mut_view<CallGraph>,
+    prof: view<PgoProfileData>,
+    stats: mut_view<PgoStats>
+) -> u32 {
+    let mut updated: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < cg.node_count && (cg.nodes as usize) != 0 {
+        let np = unsafe { cg_node_at(cg.nodes, i) };
+        let fn_sym = unsafe { (*np).fn_sym };
+        let fp = pgo_profile_find_fn(view(*prof), fn_sym);
+        if (fp as usize) != 0 {
+            let compat = unsafe { (*fp).compatibility };
+            let conf = unsafe { (*fp).confidence };
+            let hot = unsafe { (*fp).hotness_class };
+            if compat <= PGO_COMPAT_COMPATIBLE && conf >= 500u32 {
+                let is_cold: bool = hot <= PGO_HOTNESS_COLD;
+                unsafe { (*np).is_cold_fn = is_cold; }
+                updated = updated + 1u32;
+            }
+        }
+        i = i + 1;
+    }
+
+    let mut e: usize = 0;
+    while e < cg.edge_count && (cg.edges as usize) != 0 {
+        let ep = unsafe { cg_edge_at(cg.edges, e) };
+        let caller_idx = unsafe { (*ep).caller_node_idx };
+        if (caller_idx as usize) < cg.node_count {
+            let caller_np = unsafe { cg_node_at(cg.nodes, caller_idx as usize) };
+            let caller_sym = unsafe { (*caller_np).fn_sym };
+            let fp = pgo_profile_find_fn(view(*prof), caller_sym);
+            if (fp as usize) != 0 {
+                let compat = unsafe { (*fp).compatibility };
+                let cs_bb = unsafe { (*ep).callsite_bb.v as usize };
+                let fp_blen = unsafe { (*fp).block_count_len };
+                if compat == PGO_COMPAT_EXACT && cs_bb < fp_blen {
+                    let bc = unsafe { *pgo_u64_at((*fp).block_counts, cs_bb) };
+                    unsafe { (*ep).is_cold_callsite = bc == 0u64; }
+                }
+            }
+        }
+        e = e + 1;
+    }
+    if updated > 0u32 {
+        stats.pass_changes = stats.pass_changes + updated;
+    }
+    updated
+}
+
+pub fn pgo_run_pass_internal(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    prof: view<PgoProfileData>,
+    stats: mut_view<PgoStats>,
+    force_verify_fail: bool,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if pm.budget.profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+    let contract = pgo_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+
+    let pre_body_ptr = arena_alloc_raw(mut_view(*arena), size_of<OptBody>(), align_of<OptBody>()) as *mut OptBody;
+    let pre_stats_ptr = arena_alloc_raw(mut_view(*arena), size_of<PgoStats>(), align_of<PgoStats>()) as *mut PgoStats;
+    unsafe {
+        *pre_body_ptr = *body;
+        *pre_stats_ptr = *stats;
+    }
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_sink_errs = sink.errors;
+
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    if force_verify_fail {
+        unsafe {
+            *body = *pre_body_ptr;
+            *stats = *pre_stats_ptr;
+            stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+            stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+        }
+        passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+        pm.ir_revision = pre_rev;
+        pm.valid_analyses = pre_valid;
+        return false;
+    }
+
+    let mut changed: bool = false;
+    let fp = pgo_profile_find_fn(view(*prof), body.fn_sym);
+    if (fp as usize) != 0 {
+        let cur_cfg_fp = pgo_compute_cfg_fingerprint(view(*body));
+        let cur_sig = unsafe { (*fp).signature_hash };
+        let compat = pgo_classify_and_bind_function(
+            view(*prof),
+            unsafe { mut_view(*fp) },
+            prof.target_triple,
+            cur_sig,
+            cur_cfg_fp,
+            body.bb_count as u32,
+            true,
+            mut_view(*stats)
+        );
+        if compat <= PGO_COMPAT_COMPATIBLE {
+            let _guide = pgo_compute_cost_guidance(
+                unsafe { view(*fp) },
+                pm.budget.profile,
+                false,
+                false,
+                mut_view(*stats)
+            );
+            optir_record_provenance(
+                mut_view(*body),
+                mut_view(*arena),
+                PROP_REACHABLE,
+                CERTAINTY_PROVEN,
+                ANALYSIS_CFG,
+                OptValueId { v: 0u32 },
+                OptValueId { v: 0u32 },
+                OptBbId { v: 0u32 },
+                OptInstId { v: 0u32 },
+                PASS_PGO
+            );
+            changed = true;
+            stats.pass_changes = stats.pass_changes + 1u32;
+            pm.ir_revision = pre_rev + 1u32;
+        }
+    }
+
+    if pm.budget.verify_each {
+        let vstatus = sroa_verify_postconditions_arg_aware(
+            mut_view(*pm),
+            mut_view(*body),
+            PASS_LOWER_MIR,
+            mut_view(*arena),
+            mut_view(*sink)
+        );
+        if vstatus != CONTRACT_OK || !optir_verify_contract(view(*body)) {
+            sink.errors = pre_sink_errs;
+            unsafe {
+                *body = *pre_body_ptr;
+                *stats = *pre_stats_ptr;
+                stats.pass_runs = (*pre_stats_ptr).pass_runs + 1u32;
+                stats.pass_rollbacks = (*pre_stats_ptr).pass_rollbacks + 1u32;
+            }
+            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+            pm.ir_revision = pre_rev;
+            pm.valid_analyses = pre_valid;
+            return false;
+        }
+    }
+
+    changed
+}
+
+pub fn pgo_run_pass(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    prof: view<PgoProfileData>,
+    stats: mut_view<PgoStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    pgo_run_pass_internal(
+        mut_view(*pm),
+        mut_view(*body),
+        view(*prof),
+        mut_view(*stats),
+        false,
+        mut_view(*arena),
+        mut_view(*sink)
+    )
+}
+
+// =============================================================================
+// 11. Deterministic `--emit=pgo` Inspection Printer (`AXS-PGO-015.3`)
+// =============================================================================
+
+const PGO_PRINT_DATA: [288]u8 = [
+    //   0..14  "pgo_profile {\n" (14 bytes)
+    112u8, 103u8, 111u8, 95u8, 112u8, 114u8, 111u8, 102u8, 105u8, 108u8, 101u8, 32u8, 123u8, 10u8,
+    //  14..24  "  prov=" (7 bytes)
+    32u8, 32u8, 112u8, 114u8, 111u8, 118u8, 61u8,
+    //  21..27  " runs=" (6 bytes)
+    32u8, 114u8, 117u8, 110u8, 115u8, 61u8,
+    //  27..33  " fns=" (5 bytes)
+    32u8, 102u8, 110u8, 115u8, 61u8,
+    //  32..40  "  fn fn#" (8 bytes)
+    32u8, 32u8, 102u8, 110u8, 32u8, 102u8, 110u8, 35u8,
+    //  40..47  " entry=" (7 bytes)
+    32u8, 101u8, 110u8, 116u8, 114u8, 121u8, 61u8,
+    //  47..56  " hotness=" (9 bytes)
+    32u8, 104u8, 111u8, 116u8, 110u8, 101u8, 115u8, 115u8, 61u8,
+    //  56..64  " compat=" (8 bytes)
+    32u8, 99u8, 111u8, 109u8, 112u8, 97u8, 116u8, 61u8,
+    //  64..70  " conf=" (6 bytes)
+    32u8, 99u8, 111u8, 110u8, 102u8, 61u8,
+    //  70..80  " branches=" (10 bytes)
+    32u8, 98u8, 114u8, 97u8, 110u8, 99u8, 104u8, 101u8, 115u8, 61u8,
+    //  80..87  " calls=" (7 bytes)
+    32u8, 99u8, 97u8, 108u8, 108u8, 115u8, 61u8,
+    //  87..94  " loops=" (7 bytes)
+    32u8, 108u8, 111u8, 111u8, 112u8, 115u8, 61u8,
+    //  94..102 " values=" (8 bytes)
+    32u8, 118u8, 97u8, 108u8, 117u8, 101u8, 115u8, 61u8,
+    // 102..118 "  summary exact=" (16 bytes)
+    32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 101u8, 120u8, 97u8, 99u8, 116u8, 61u8,
+    // 118..126 " compat=" (8 bytes)
+    32u8, 99u8, 111u8, 109u8, 112u8, 97u8, 116u8, 61u8,
+    // 126..133 " stale=" (7 bytes)
+    32u8, 115u8, 116u8, 97u8, 108u8, 101u8, 61u8,
+    // 133..146 " inline_hot=" (12 bytes)
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 95u8, 104u8, 111u8, 116u8, 61u8,
+    // 145..158 " inline_cold=" (13 bytes)
+    32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 95u8, 99u8, 111u8, 108u8, 100u8, 61u8,
+    // 158..169 " val_specs=" (11 bytes)
+    32u8, 118u8, 97u8, 108u8, 95u8, 115u8, 112u8, 101u8, 99u8, 115u8, 61u8,
+    // 169..184 " guarded_devirt=" (16 bytes)
+    32u8, 103u8, 117u8, 97u8, 114u8, 100u8, 101u8, 100u8, 95u8, 100u8, 101u8, 118u8, 105u8, 114u8, 116u8, 61u8,
+    // 185..198 " unroll_boost=" (14 bytes)
+    32u8, 117u8, 110u8, 114u8, 111u8, 108u8, 108u8, 95u8, 98u8, 111u8, 111u8, 115u8, 116u8, 61u8,
+    // 199..211 " split_cold=" (12 bytes)
+    32u8, 115u8, 112u8, 108u8, 105u8, 116u8, 95u8, 99u8, 111u8, 108u8, 100u8, 61u8,
+    // 211..227 " blocked_proofs=" (16 bytes)
+    32u8, 98u8, 108u8, 111u8, 99u8, 107u8, 101u8, 100u8, 95u8, 112u8, 114u8, 111u8, 111u8, 102u8, 115u8, 61u8,
+    // 227..238 " rollbacks=" (11 bytes)
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 238..288 "}\n" + padding
+    125u8, 10u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    0u8, 0u8, 0u8, 0u8, 0u8,
+];
+
+fn pgo_push_tbl(out: mut_view<DiagBuffer>, off: usize, byte_len: usize) {
+    let mut i: usize = 0;
+    while i < byte_len {
+        diag_buf_push_byte(mut_view(*out), PGO_PRINT_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn pgo_print(
+    prof: view<PgoProfileData>,
+    stats: view<PgoStats>,
+    out: mut_view<DiagBuffer>
+) {
+    pgo_push_tbl(mut_view(*out), 0, 14);
+    pgo_push_tbl(mut_view(*out), 14, 7);
+    diag_buf_push_u32(mut_view(*out), prof.provenance_kind as u32);
+    pgo_push_tbl(mut_view(*out), 21, 6);
+    diag_buf_push_u32(mut_view(*out), prof.total_runs_merged);
+    pgo_push_tbl(mut_view(*out), 27, 5);
+    diag_buf_push_u32(mut_view(*out), prof.fn_count as u32);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let mut i: usize = 0;
+    while i < prof.fn_count && (prof.fns as usize) != 0 {
+        let fp = unsafe { pgo_fn_at(prof.fns, i) };
+        pgo_push_tbl(mut_view(*out), 32, 8);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*fp).fn_sym.v });
+        pgo_push_tbl(mut_view(*out), 40, 7);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).entry_count }) as u32);
+        pgo_push_tbl(mut_view(*out), 47, 9);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).hotness_class }) as u32);
+        pgo_push_tbl(mut_view(*out), 56, 8);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).compatibility }) as u32);
+        pgo_push_tbl(mut_view(*out), 64, 6);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*fp).confidence });
+        pgo_push_tbl(mut_view(*out), 70, 10);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).branch_count }) as u32);
+        pgo_push_tbl(mut_view(*out), 80, 7);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).call_count }) as u32);
+        pgo_push_tbl(mut_view(*out), 87, 7);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).loop_count }) as u32);
+        pgo_push_tbl(mut_view(*out), 94, 8);
+        diag_buf_push_u32(mut_view(*out), (unsafe { (*fp).value_count }) as u32);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    pgo_push_tbl(mut_view(*out), 102, 16);
+    diag_buf_push_u32(mut_view(*out), stats.exact_fn_matches);
+    pgo_push_tbl(mut_view(*out), 118, 8);
+    diag_buf_push_u32(mut_view(*out), stats.compatible_fn_matches);
+    pgo_push_tbl(mut_view(*out), 126, 7);
+    diag_buf_push_u32(mut_view(*out), stats.stale_fn_fallbacks);
+    pgo_push_tbl(mut_view(*out), 133, 12);
+    diag_buf_push_u32(mut_view(*out), stats.hot_inline_boosts);
+    pgo_push_tbl(mut_view(*out), 145, 13);
+    diag_buf_push_u32(mut_view(*out), stats.cold_inline_suppressions);
+    pgo_push_tbl(mut_view(*out), 158, 11);
+    diag_buf_push_u32(mut_view(*out), stats.value_guarded_specs);
+    pgo_push_tbl(mut_view(*out), 169, 16);
+    diag_buf_push_u32(mut_view(*out), stats.guarded_devirt_sites);
+    pgo_push_tbl(mut_view(*out), 185, 14);
+    diag_buf_push_u32(mut_view(*out), stats.loop_unroll_boosts);
+    pgo_push_tbl(mut_view(*out), 199, 12);
+    diag_buf_push_u32(mut_view(*out), stats.hot_cold_blocks_split);
+    pgo_push_tbl(mut_view(*out), 211, 16);
+    diag_buf_push_u32(mut_view(*out), stats.forbidden_proof_upgrades_blocked);
+    pgo_push_tbl(mut_view(*out), 227, 11);
+    diag_buf_push_u32(mut_view(*out), stats.pass_rollbacks);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    pgo_push_tbl(mut_view(*out), 238, 2);
+}
