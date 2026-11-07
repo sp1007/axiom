@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T614]
 priority: 109
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p15/e15_4_inline_specialize_devirt]
 spec: [spec/SPEC-73-inlining-specialization-devirt.md, 0131, tasks/0401, tasks/0551]
 covers: [REQ-OPT-108, REQ-OPT-109, REQ-OPT-110, REQ-OPT-111, REQ-OPT-112, REQ-OPT-113]
 started: 2026-11-07 22:16:33
-agent: T615-impl
+finished: 2026-11-08 01:02:21
 ---
 # T615 — E15.4 — Inlining, specialization, devirtualization & SROA conformance suite
 
@@ -43,3 +43,4 @@ Certify E15.4 exit criteria with an end-to-end differential conformance suite co
 ## Log
 - 2026-11-03 02:41:00 created by T215 (P15 phase planning)
 - 2026-11-07 22:16:33 started (attempt 1) T615-impl
+- 2026-11-08 01:02:21 accepted by QA -> done
