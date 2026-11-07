@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T611]
 priority: 105
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p15/e15_3_loops_bce]
 spec: [spec/SPEC-72-loops-scev-bce.md, tasks/0402, tasks/0416, tasks/0426, tasks/0549]
 covers: [REQ-OPT-176, REQ-OPT-177, REQ-OPT-178, REQ-OPT-179, REQ-OPT-180, REQ-OPT-181, REQ-OPT-182, REQ-OPT-183, REQ-OPT-184, REQ-OPT-185, REQ-OPT-186, REQ-OPT-187, REQ-OPT-188, REQ-OPT-192, REQ-OPT-193, REQ-OPT-194, REQ-OPT-195, REQ-OPT-196]
+started: 2026-11-07 21:14:17
+agent: T612-impl
 ---
 # T612 — E15.3 — Loop optimizations, SCEV & bounds-check elimination conformance suite
 
@@ -40,3 +42,4 @@ Certify E15.3 exit criteria with an end-to-end differential conformance suite co
 
 ## Log
 - 2026-11-03 02:40:00 created by T215 (P15 phase planning)
+- 2026-11-07 21:14:17 started (attempt 1) T612-impl

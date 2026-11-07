@@ -1,0 +1,583 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.query.db.DefId
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.SourceFileId
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.revision_id_new
+use compiler.incremental.fingerprint.FP_TIER_ABI
+use compiler.incremental.fingerprint.FP_TIER_ACTION
+use compiler.incremental.fingerprint.FP_TIER_AST
+use compiler.incremental.fingerprint.FP_TIER_BODY
+use compiler.incremental.fingerprint.FP_TIER_CODEGEN
+use compiler.incremental.fingerprint.FP_TIER_INTERFACE
+use compiler.incremental.fingerprint.FP_TIER_SOURCE
+use compiler.incremental.fingerprint.INC_NODE_CODEGEN_UNIT
+use compiler.incremental.fingerprint.INC_NODE_CONST_EVAL
+use compiler.incremental.fingerprint.INC_NODE_ITEM_ABI
+use compiler.incremental.fingerprint.INC_NODE_ITEM_SIGNATURE
+use compiler.incremental.fingerprint.INC_NODE_MIR_BODY
+use compiler.incremental.fingerprint.INC_NODE_MODULE_INTERFACE
+use compiler.incremental.fingerprint.INC_NODE_PARSE_MODULE
+use compiler.incremental.fingerprint.INC_NODE_TYPECK_BODY
+use compiler.incremental.fingerprint.IncrementalEngine
+use compiler.incremental.fingerprint.MISS_API_CHANGED
+use compiler.incremental.fingerprint.MISS_BODY_CHANGED
+use compiler.incremental.fingerprint.MISS_NONE
+use compiler.incremental.fingerprint.NODE_COLOR_GREEN
+use compiler.incremental.fingerprint.NODE_COLOR_RED
+use compiler.incremental.fingerprint.fp_compute_ast_fingerprint
+use compiler.incremental.fingerprint.fp_compute_source_with_meta
+use compiler.incremental.fingerprint.fp_emit_fingerprints
+use compiler.incremental.fingerprint.fp_emit_incremental_stats
+use compiler.incremental.fingerprint.fp_stream_finish
+use compiler.incremental.fingerprint.fp_stream_new
+use compiler.incremental.fingerprint.fp_stream_write_u64
+use compiler.incremental.fingerprint.inc_add_item_call_dep
+use compiler.incremental.fingerprint.inc_add_item_const_dep
+use compiler.incremental.fingerprint.inc_add_item_layout_dep
+use compiler.incremental.fingerprint.inc_add_module_import
+use compiler.incremental.fingerprint.inc_build_workspace
+use compiler.incremental.fingerprint.inc_engine_empty
+use compiler.incremental.fingerprint.inc_engine_free
+use compiler.incremental.fingerprint.inc_engine_init
+use compiler.incremental.fingerprint.inc_get_item
+use compiler.incremental.fingerprint.inc_get_module
+use compiler.incremental.fingerprint.inc_get_node
+use compiler.incremental.fingerprint.inc_register_item
+use compiler.incremental.fingerprint.inc_register_module
+use compiler.incremental.fingerprint.inc_set_target_config
+use compiler.incremental.fingerprint.inc_update_module_source
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn print_diag_buf(b: view<DiagBuffer>) {
+    if b.len > 0 && (b.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), b.ptr as *const u8, b.len);
+        }
+    }
+}
+
+fn test_domain_tags_and_source_ast_invariance(str_arena: mut_view<Arena>) -> bool {
+    let mut s_src = fp_stream_new(FP_TIER_SOURCE);
+    let mut s_ast = fp_stream_new(FP_TIER_AST);
+    let mut s_api = fp_stream_new(FP_TIER_INTERFACE);
+    let mut s_abi = fp_stream_new(FP_TIER_ABI);
+    let mut s_bod = fp_stream_new(FP_TIER_BODY);
+    let mut s_cgu = fp_stream_new(FP_TIER_CODEGEN);
+    let mut s_act = fp_stream_new(FP_TIER_ACTION);
+
+    fp_stream_write_u64(mut_view(s_src), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_ast), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_api), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_abi), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_bod), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_cgu), 0x123456789ABCDEF0u64);
+    fp_stream_write_u64(mut_view(s_act), 0x123456789ABCDEF0u64);
+
+    let fp_src = fp_stream_finish(view(s_src));
+    let fp_ast = fp_stream_finish(view(s_ast));
+    let fp_api = fp_stream_finish(view(s_api));
+    let fp_abi = fp_stream_finish(view(s_abi));
+    let fp_bod = fp_stream_finish(view(s_bod));
+    let fp_cgu = fp_stream_finish(view(s_cgu));
+    let fp_act = fp_stream_finish(view(s_act));
+
+    if fingerprint128_eq(fp_src, fp_ast) ||
+        fingerprint128_eq(fp_ast, fp_api) ||
+        fingerprint128_eq(fp_api, fp_abi) ||
+        fingerprint128_eq(fp_abi, fp_bod) ||
+        fingerprint128_eq(fp_bod, fp_cgu) ||
+        fingerprint128_eq(fp_cgu, fp_act) {
+        return false;
+    }
+
+    // SourceFingerprint is invariant under CRLF->LF, mtime, and physical workspace root
+    let ws1 = probe_sv(mut_view(*str_arena), "C:/work/tree_one");
+    let ws2 = probe_sv(mut_view(*str_arena), "D:/ci/runner_two");
+    let rel_path = probe_sv(mut_view(*str_arena), "pkg/math_lib.ax");
+    let lf_code = probe_sv(mut_view(*str_arena), "pub fn add(x: i32) -> i32 {\n    x + 1\n}\n");
+    let crlf_code = probe_sv(mut_view(*str_arena), "pub fn add(x: i32) -> i32 {\r\n    x + 1\r\n}\r\n");
+
+    let sf1 = fp_compute_source_with_meta(SourceFileId { v: 1u32 }, ws1, rel_path, lf_code, 1000u64);
+    let sf2 = fp_compute_source_with_meta(SourceFileId { v: 1u32 }, ws2, rel_path, crlf_code, 9999999u64);
+    if !fingerprint128_eq(sf1.fp, sf2.fp) {
+        return false;
+    }
+
+    // AstFingerprint is invariant under non-doc comments (`//`, nested `/* /* */ */`) and whitespace
+    let commented_code = probe_sv(
+        mut_view(*str_arena),
+        "// header comment\n/* outer /* nested */ comment */\n  pub   fn   add ( x : i32 ) -> i32 {\n    // body comment\n    x + 1 ;\n  }\n"
+    );
+    let sf3 = fp_compute_source_with_meta(SourceFileId { v: 1u32 }, ws1, rel_path, commented_code, 2000u64);
+    if fingerprint128_eq(sf1.fp, sf3.fp) {
+        return false;
+    }
+
+    let mod_path = probe_sv(mut_view(*str_arena), "math_lib");
+    let af1 = fp_compute_ast_fingerprint(ModuleId { v: 1u32 }, mod_path, lf_code, 1u32);
+    let af2 = fp_compute_ast_fingerprint(ModuleId { v: 1u32 }, mod_path, commented_code, 1u32);
+    if !fingerprint128_eq(af1.fp, af2.fp) {
+        return false;
+    }
+    if af1.token_count != af2.token_count {
+        return false;
+    }
+
+    // 4-slash non-doc comment `////` is stripped like `//`, whereas 3-slash doc comment `///` is hashed into AstFingerprint
+    let four_slash_code = probe_sv(
+        mut_view(*str_arena),
+        "//// non-doc four-slash comment\npub fn add(x: i32) -> i32 {\n    x + 1\n}\n"
+    );
+    let doc_comment_code = probe_sv(
+        mut_view(*str_arena),
+        "/// doc comment on add\npub fn add(x: i32) -> i32 {\n    x + 1\n}\n"
+    );
+    let af_four = fp_compute_ast_fingerprint(ModuleId { v: 1u32 }, mod_path, four_slash_code, 1u32);
+    let af_doc = fp_compute_ast_fingerprint(ModuleId { v: 1u32 }, mod_path, doc_comment_code, 1u32);
+    if !fingerprint128_eq(af1.fp, af_four.fp) {
+        return false;
+    }
+    if fingerprint128_eq(af1.fp, af_doc.fp) {
+        return false;
+    }
+
+    true
+}
+
+fn setup_workspace_forward(eng: mut_view<IncrementalEngine>, str_arena: mut_view<Arena>) {
+    let triple = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let abi_prof = probe_sv(mut_view(*str_arena), "win64");
+    inc_set_target_config(mut_view(*eng), UnitKey { v: 1u32 }, triple, abi_prof, 0u32, 2u8, 8u32);
+
+    let pkg = probe_sv(mut_view(*str_arena), "core_pkg");
+    let m_math = probe_sv(mut_view(*str_arena), "math_lib");
+    let m_app = probe_sv(mut_view(*str_arena), "app");
+    let m_util = probe_sv(mut_view(*str_arena), "util");
+
+    let p_math = probe_sv(mut_view(*str_arena), "src/math_lib.ax");
+    let p_app = probe_sv(mut_view(*str_arena), "src/app.ax");
+    let p_util = probe_sv(mut_view(*str_arena), "src/util.ax");
+
+    let src_math_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 10 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 1 }\n"
+    );
+    let src_app_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub fn run_app(x: i32) -> i32 { compute(x) + fast_add(x) }\n"
+    );
+    let src_util_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub fn helper_util(x: i32) -> i32 { x * 2 }\n"
+    );
+
+    let mod_math = ModuleId { v: 1u32 };
+    let mod_app = ModuleId { v: 2u32 };
+    let mod_util = ModuleId { v: 3u32 };
+
+    inc_register_module(mut_view(*eng), mod_math, PackageId { v: 1u32 }, pkg, m_math, SourceFileId { v: 1u32 }, p_math, src_math_r1);
+    inc_register_module(mut_view(*eng), mod_app, PackageId { v: 1u32 }, pkg, m_app, SourceFileId { v: 2u32 }, p_app, src_app_r1);
+    inc_register_module(mut_view(*eng), mod_util, PackageId { v: 1u32 }, pkg, m_util, SourceFileId { v: 3u32 }, p_util, src_util_r1);
+    inc_add_module_import(mut_view(*eng), mod_app, mod_math);
+
+    let empty = probe_sv(mut_view(*str_arena), "");
+    let n_scale = probe_sv(mut_view(*str_arena), "SCALE");
+    let n_pkt = probe_sv(mut_view(*str_arena), "Packet");
+    let n_sec = probe_sv(mut_view(*str_arena), "secret_helper");
+    let n_comp = probe_sv(mut_view(*str_arena), "compute");
+    let n_fast = probe_sv(mut_view(*str_arena), "fast_add");
+    let n_run = probe_sv(mut_view(*str_arena), "run_app");
+    let n_util = probe_sv(mut_view(*str_arena), "helper_util");
+
+    let d_scale = inc_register_item(mut_view(*eng), DefId { v: 10u32 }, mod_math, ITEM_KIND_CONST, true, false, false, 0u32, 1u32, n_scale, empty);
+    let d_pkt = inc_register_item(mut_view(*eng), DefId { v: 11u32 }, mod_math, ITEM_KIND_STRUCT, true, false, false, 0u32, 2u32, n_pkt, empty);
+    let d_sec = inc_register_item(mut_view(*eng), DefId { v: 12u32 }, mod_math, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_sec, empty);
+    let d_comp = inc_register_item(mut_view(*eng), DefId { v: 13u32 }, mod_math, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_comp, empty);
+    let d_fast = inc_register_item(mut_view(*eng), DefId { v: 14u32 }, mod_math, ITEM_KIND_FN, true, true, false, 1u32, 1u32, n_fast, empty);
+    let d_run = inc_register_item(mut_view(*eng), DefId { v: 20u32 }, mod_app, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_run, empty);
+    let _ = inc_register_item(mut_view(*eng), DefId { v: 30u32 }, mod_util, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_util, empty);
+
+    inc_add_item_call_dep(mut_view(*eng), d_comp, d_sec);
+    inc_add_item_call_dep(mut_view(*eng), d_run, d_comp);
+    inc_add_item_call_dep(mut_view(*eng), d_run, d_fast);
+    inc_add_item_const_dep(mut_view(*eng), d_run, d_scale);
+    inc_add_item_layout_dep(mut_view(*eng), d_run, d_pkt);
+}
+
+fn setup_workspace_reverse(eng: mut_view<IncrementalEngine>, str_arena: mut_view<Arena>) {
+    let triple = probe_sv(mut_view(*str_arena), "x86_64-pc-windows-msvc");
+    let abi_prof = probe_sv(mut_view(*str_arena), "win64");
+    inc_set_target_config(mut_view(*eng), UnitKey { v: 1u32 }, triple, abi_prof, 0u32, 2u8, 8u32);
+
+    let pkg = probe_sv(mut_view(*str_arena), "core_pkg");
+    let m_math = probe_sv(mut_view(*str_arena), "math_lib");
+    let m_app = probe_sv(mut_view(*str_arena), "app");
+    let m_util = probe_sv(mut_view(*str_arena), "util");
+
+    let p_math = probe_sv(mut_view(*str_arena), "src/math_lib.ax");
+    let p_app = probe_sv(mut_view(*str_arena), "src/app.ax");
+    let p_util = probe_sv(mut_view(*str_arena), "src/util.ax");
+
+    let src_math_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 10 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 1 }\n"
+    );
+    let src_app_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub fn run_app(x: i32) -> i32 { compute(x) + fast_add(x) }\n"
+    );
+    let src_util_r1 = probe_sv(
+        mut_view(*str_arena),
+        "pub fn helper_util(x: i32) -> i32 { x * 2 }\n"
+    );
+
+    // Reverse module IDs and registration order
+    let mod_util = ModuleId { v: 30u32 };
+    let mod_app = ModuleId { v: 20u32 };
+    let mod_math = ModuleId { v: 10u32 };
+
+    inc_register_module(mut_view(*eng), mod_util, PackageId { v: 1u32 }, pkg, m_util, SourceFileId { v: 30u32 }, p_util, src_util_r1);
+    inc_register_module(mut_view(*eng), mod_app, PackageId { v: 1u32 }, pkg, m_app, SourceFileId { v: 20u32 }, p_app, src_app_r1);
+    inc_register_module(mut_view(*eng), mod_math, PackageId { v: 1u32 }, pkg, m_math, SourceFileId { v: 10u32 }, p_math, src_math_r1);
+    inc_add_module_import(mut_view(*eng), mod_app, mod_math);
+
+    let empty = probe_sv(mut_view(*str_arena), "");
+    let n_scale = probe_sv(mut_view(*str_arena), "SCALE");
+    let n_pkt = probe_sv(mut_view(*str_arena), "Packet");
+    let n_sec = probe_sv(mut_view(*str_arena), "secret_helper");
+    let n_comp = probe_sv(mut_view(*str_arena), "compute");
+    let n_fast = probe_sv(mut_view(*str_arena), "fast_add");
+    let n_run = probe_sv(mut_view(*str_arena), "run_app");
+    let n_util = probe_sv(mut_view(*str_arena), "helper_util");
+
+    // Reverse DefIds and item registration order
+    let _ = inc_register_item(mut_view(*eng), DefId { v: 97u32 }, mod_util, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_util, empty);
+    let d_run = inc_register_item(mut_view(*eng), DefId { v: 96u32 }, mod_app, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_run, empty);
+    let d_fast = inc_register_item(mut_view(*eng), DefId { v: 95u32 }, mod_math, ITEM_KIND_FN, true, true, false, 1u32, 1u32, n_fast, empty);
+    let d_comp = inc_register_item(mut_view(*eng), DefId { v: 94u32 }, mod_math, ITEM_KIND_FN, true, false, false, 1u32, 1u32, n_comp, empty);
+    let d_sec = inc_register_item(mut_view(*eng), DefId { v: 93u32 }, mod_math, ITEM_KIND_FN, false, false, false, 1u32, 1u32, n_sec, empty);
+    let d_pkt = inc_register_item(mut_view(*eng), DefId { v: 92u32 }, mod_math, ITEM_KIND_STRUCT, true, false, false, 0u32, 2u32, n_pkt, empty);
+    let d_scale = inc_register_item(mut_view(*eng), DefId { v: 91u32 }, mod_math, ITEM_KIND_CONST, true, false, false, 0u32, 1u32, n_scale, empty);
+
+    inc_add_item_call_dep(mut_view(*eng), d_comp, d_sec);
+    inc_add_item_call_dep(mut_view(*eng), d_run, d_comp);
+    inc_add_item_call_dep(mut_view(*eng), d_run, d_fast);
+    inc_add_item_const_dep(mut_view(*eng), d_run, d_scale);
+    inc_add_item_layout_dep(mut_view(*eng), d_run, d_pkt);
+}
+
+fn test_allocation_order_independence(str_arena: mut_view<Arena>) -> bool {
+    let mut eng_a: IncrementalEngine = inc_engine_empty();
+    let mut eng_b: IncrementalEngine = inc_engine_empty();
+    inc_engine_init(mut_view(eng_a), 101u64);
+    inc_engine_init(mut_view(eng_b), 202u64);
+
+    setup_workspace_forward(mut_view(eng_a), mut_view(*str_arena));
+    setup_workspace_reverse(mut_view(eng_b), mut_view(*str_arena));
+
+    inc_build_workspace(mut_view(eng_a));
+    inc_build_workspace(mut_view(eng_b));
+
+    let mut fp_a: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut fp_b: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut st_a: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut st_b: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(fp_a));
+    diag_buf_init(mut_view(fp_b));
+    diag_buf_init(mut_view(st_a));
+    diag_buf_init(mut_view(st_b));
+
+    fp_emit_fingerprints(view(eng_a), mut_view(fp_a));
+    fp_emit_fingerprints(view(eng_b), mut_view(fp_b));
+    fp_emit_incremental_stats(view(eng_a), mut_view(st_a));
+    fp_emit_incremental_stats(view(eng_b), mut_view(st_b));
+
+    let ok = diag_buf_eq(view(fp_a), view(fp_b)) && diag_buf_eq(view(st_a), view(st_b));
+
+    diag_buf_free(mut_view(fp_a));
+    diag_buf_free(mut_view(fp_b));
+    diag_buf_free(mut_view(st_a));
+    diag_buf_free(mut_view(st_b));
+    inc_engine_free(mut_view(eng_a));
+    inc_engine_free(mut_view(eng_b));
+    ok
+}
+
+fn test_multi_revision_red_green_pipeline(str_arena: mut_view<Arena>, out: mut_view<DiagBuffer>) -> bool {
+    let mut eng: IncrementalEngine = inc_engine_empty();
+    inc_engine_init(mut_view(eng), 1u64);
+    setup_workspace_forward(mut_view(eng), mut_view(*str_arena));
+
+    let mod_math = ModuleId { v: 1u32 };
+    let mod_app = ModuleId { v: 2u32 };
+    let mod_util = ModuleId { v: 3u32 };
+
+    // ========================================================================
+    // R1: Cold build
+    // ========================================================================
+    inc_build_workspace(mut_view(eng));
+    if eng.rev_modules_typechecked != 3u32 || eng.rev_cgu_rebuilt != 3u32 || eng.rev_cgu_reused != 0u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_queries_green_reused != 0u32 || eng.rev_queries_backdated != 0u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    let math_r1 = inc_get_module(view(eng), mod_math);
+    let app_r1 = inc_get_module(view(eng), mod_app);
+    let util_r1 = inc_get_module(view(eng), mod_util);
+
+    // ========================================================================
+    // R2: Comment & Whitespace edit in `math_lib` -> `parse_module` backdates, 0 downstream re-runs
+    // ========================================================================
+    let src_math_r2 = probe_sv(
+        mut_view(*str_arena),
+        "// Leading comment\r\n/* Nested /* comment */ block */\r\n  pub const SCALE: i64 = 100\r\n  @repr(C) pub struct Packet { pub a: i32, pub b: i32 }\r\n  fn secret_helper(x: i32) -> i32 { /* noop */ x + 10 }\r\n  pub fn compute(x: i32) -> i32 { secret_helper(x) }\r\n  @inline pub fn fast_add(x: i32) -> i32 { x + 1 }\r\n"
+    );
+    let _ = inc_update_module_source(mut_view(eng), mod_math, src_math_r2);
+    inc_build_workspace(mut_view(eng));
+
+    let math_r2 = inc_get_module(view(eng), mod_math);
+    if fingerprint128_eq(math_r2.source_fp, math_r1.source_fp) {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if !fingerprint128_eq(math_r2.ast_fp, math_r1.ast_fp) {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    let pm_r2 = inc_get_node(view(eng), INC_NODE_PARSE_MODULE, mod_math.v);
+    if pm_r2.color != NODE_COLOR_GREEN || !pm_r2.was_backdated || pm_r2.changed_at.raw != 1u64 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_queries_recomputed != 1u32 || eng.rev_queries_backdated != 1u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_modules_typechecked != 0u32 || eng.rev_cgu_rebuilt != 0u32 || eng.rev_cgu_reused != 3u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+
+    // ========================================================================
+    // R3: Private function body edit (`secret_helper`: `x + 10` -> `x + 999`)
+    // Firewall: `InterfaceFingerprint(math_lib)` stays Green; 0 downstream `typeck` re-runs in `app`!
+    // ========================================================================
+    let src_math_r3 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 999 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 1 }\n"
+    );
+    let _ = inc_update_module_source(mut_view(eng), mod_math, src_math_r3);
+    inc_build_workspace(mut_view(eng));
+
+    let math_r3 = inc_get_module(view(eng), mod_math);
+    let app_r3 = inc_get_module(view(eng), mod_app);
+    if !fingerprint128_eq(math_r3.interface_fp, math_r1.interface_fp) {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    let math_api_node_r3 = inc_get_node(view(eng), INC_NODE_MODULE_INTERFACE, mod_math.v);
+    let tck_sec_r3 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 12u32);
+    let tck_comp_r3 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 13u32);
+    let tck_app_r3 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 20u32);
+    let cgu_app_r3 = inc_get_node(view(eng), INC_NODE_CODEGEN_UNIT, mod_app.v);
+    if math_api_node_r3.color != NODE_COLOR_GREEN ||
+        tck_sec_r3.color != NODE_COLOR_RED ||
+        tck_comp_r3.color != NODE_COLOR_GREEN ||
+        tck_app_r3.color != NODE_COLOR_GREEN ||
+        cgu_app_r3.color != NODE_COLOR_GREEN {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_modules_typechecked != 1u32 || eng.rev_cgu_rebuilt != 1u32 || eng.rev_cgu_reused != 2u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if !fingerprint128_eq(app_r3.codegen_fp, app_r1.codegen_fp) {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+
+    // ========================================================================
+    // R4: `@inline` function body edit (`fast_add`: `x + 1` -> `x + 2`)
+    // `InterfaceFingerprint(math_lib)` stays Green (`0` downstream `typeck` re-runs in `app`),
+    // while `CodegenFingerprint(app)` rebuilds via `DEP_KIND_INLINED_BODY` (`MISS_BODY_CHANGED`)!
+    // ========================================================================
+    let src_math_r4 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 100\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 999 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 2 }\n"
+    );
+    let _ = inc_update_module_source(mut_view(eng), mod_math, src_math_r4);
+    inc_build_workspace(mut_view(eng));
+
+    let tck_app_r4 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 20u32);
+    let cgu_app_r4 = inc_get_node(view(eng), INC_NODE_CODEGEN_UNIT, mod_app.v);
+    let cgu_util_r4 = inc_get_node(view(eng), INC_NODE_CODEGEN_UNIT, mod_util.v);
+    if tck_app_r4.color != NODE_COLOR_GREEN {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if cgu_app_r4.color != NODE_COLOR_RED || cgu_app_r4.last_miss_reason != MISS_BODY_CHANGED {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if cgu_util_r4.color != NODE_COLOR_GREEN {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_modules_typechecked != 1u32 || eng.rev_cgu_rebuilt != 2u32 || eng.rev_cgu_reused != 1u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+
+    // ========================================================================
+    // R5: `pub const SCALE` expression edit (`100` -> `60 + 40`) with unchanged evaluated value `100`
+    // `const_eval(SCALE)` backdates to Green -> 0 `typeck` re-runs, 0 CGU rebuilds!
+    // ========================================================================
+    let src_math_r5 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 60 + 40\n@repr(C) pub struct Packet { pub a: i32, pub b: i32 }\nfn secret_helper(x: i32) -> i32 { x + 999 }\npub fn compute(x: i32) -> i32 { secret_helper(x) }\n@inline pub fn fast_add(x: i32) -> i32 { x + 2 }\n"
+    );
+    let _ = inc_update_module_source(mut_view(eng), mod_math, src_math_r5);
+    inc_build_workspace(mut_view(eng));
+
+    let ce_r5 = inc_get_node(view(eng), INC_NODE_CONST_EVAL, 10u32);
+    if ce_r5.color != NODE_COLOR_GREEN || !ce_r5.was_backdated || ce_r5.changed_at.raw != 1u64 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_modules_typechecked != 0u32 || eng.rev_cgu_rebuilt != 0u32 || eng.rev_cgu_reused != 3u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+
+    // ========================================================================
+    // R6: Public signature & `@repr(C)` struct ABI layout change in `math_lib`
+    // Invalidates `math_lib` and dependent `app`, while `util` remains Green!
+    // ========================================================================
+    let src_math_r6 = probe_sv(
+        mut_view(*str_arena),
+        "pub const SCALE: i64 = 60 + 40\n@repr(C) pub struct Packet { pub a: i64, pub b: i64, pub c: i64 }\nfn secret_helper(x: i32) -> i32 { x + 999 }\npub fn compute(x: i32, y: i32) -> i32 { secret_helper(x) + y }\n@inline pub fn fast_add(x: i32) -> i32 { x + 2 }\n"
+    );
+    let _ = inc_update_module_source(mut_view(eng), mod_math, src_math_r6);
+    inc_build_workspace(mut_view(eng));
+
+    let math_api_r6 = inc_get_node(view(eng), INC_NODE_MODULE_INTERFACE, mod_math.v);
+    let pkt_abi_r6 = inc_get_node(view(eng), INC_NODE_ITEM_ABI, 11u32);
+    let tck_app_r6 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 20u32);
+    let tck_util_r6 = inc_get_node(view(eng), INC_NODE_TYPECK_BODY, 30u32);
+    let cgu_util_r6 = inc_get_node(view(eng), INC_NODE_CODEGEN_UNIT, mod_util.v);
+    let util_r6 = inc_get_module(view(eng), mod_util);
+
+    if math_api_r6.color != NODE_COLOR_RED || math_api_r6.last_miss_reason != MISS_API_CHANGED {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if pkt_abi_r6.color != NODE_COLOR_RED {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if tck_app_r6.color != NODE_COLOR_RED || tck_app_r6.last_miss_reason != MISS_API_CHANGED {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if tck_util_r6.color != NODE_COLOR_GREEN || cgu_util_r6.color != NODE_COLOR_GREEN || cgu_util_r6.last_miss_reason != MISS_NONE {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if !fingerprint128_eq(util_r6.codegen_fp, util_r1.codegen_fp) {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+    if eng.rev_modules_typechecked != 2u32 || eng.rev_cgu_rebuilt != 2u32 || eng.rev_cgu_reused != 1u32 {
+        inc_engine_free(mut_view(eng));
+        return false;
+    }
+
+    fp_emit_fingerprints(view(eng), mut_view(*out));
+    fp_emit_incremental_stats(view(eng), mut_view(*out));
+
+    inc_engine_free(mut_view(eng));
+    true
+}
+
+fn main() -> i32 {
+    let mut str_arena = arena_new();
+    let mut out1 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut out2 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out1));
+    diag_buf_init(mut_view(out2));
+
+    if !test_domain_tags_and_source_ast_invariance(mut_view(str_arena)) {
+        return 10;
+    }
+    if !test_allocation_order_independence(mut_view(str_arena)) {
+        return 20;
+    }
+    if !test_multi_revision_red_green_pipeline(mut_view(str_arena), mut_view(out1)) {
+        return 30;
+    }
+    if !test_multi_revision_red_green_pipeline(mut_view(str_arena), mut_view(out2)) {
+        return 40;
+    }
+    if !diag_buf_eq(view(out1), view(out2)) {
+        return 50;
+    }
+
+    print_diag_buf(view(out1));
+
+    diag_buf_free(mut_view(out1));
+    diag_buf_free(mut_view(out2));
+    arena_destroy(mut_view(str_arena));
+    0
+}
