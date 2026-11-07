@@ -1,0 +1,2349 @@
+// Deterministic Query Cycle Detection (Tarjan SCC & Active-Stack), Canonical
+// `SemanticKey` Cycle Rotation, Recovery Fallback Values, Cascading-Error Suppression,
+// Snapshot-Bound Diagnostic Accumulation/Replay, and Revision Invalidation (T754 / E18.1).
+// Implements SPEC-21 §3-§5 (AXS-QRY-020..023, AXS-QRY-030..033, AXS-QRY-050..053, INV-QRY-002).
+module compiler.query.engine
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.CompilerDB
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.ConstEvalResult
+use compiler.query.db.CYCLE_POLICY_DEPTH_LIMITED
+use compiler.query.db.CYCLE_POLICY_REJECT
+use compiler.query.db.DatabaseSnapshot
+use compiler.query.db.DefEntry
+use compiler.query.db.DefId
+use compiler.query.db.DIAG_AX_CTM_CYCLE
+use compiler.query.db.DIAG_AX_QUERY_CYCLE
+use compiler.query.db.DIAG_AX_QUERY_DEPTH_LIMIT
+use compiler.query.db.DIAG_AX_TRAIT_CYCLE
+use compiler.query.db.DIAG_AX_TYPE_CYCLE
+use compiler.query.db.DIAG_AX_TYP_MISMATCH
+use compiler.query.db.DURABILITY_HIGH
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.DURABILITY_MEDIUM
+use compiler.query.db.EffectSummaryResult
+use compiler.query.db.Fingerprint128
+use compiler.query.db.HirId
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_IMPL
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_KIND_TRAIT
+use compiler.query.db.ITEM_KIND_TYPE_ALIAS
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_MODULE
+use compiler.query.db.ITEM_NS_PACKAGE
+use compiler.query.db.ITEM_NS_SOURCE
+use compiler.query.db.ITEM_NS_TRAIT
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_UNIT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ItemSignatureResult
+use compiler.query.db.LayoutOfResult
+use compiler.query.db.MemoEntry
+use compiler.query.db.MirBodyId
+use compiler.query.db.MirBodyResult
+use compiler.query.db.ModuleDefMapResult
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.ParseModuleResult
+use compiler.query.db.QRY_ID_ERROR
+use compiler.query.db.QRY_ID_NONE
+use compiler.query.db.QRY_MAX_DEFS
+use compiler.query.db.QRY_MAX_DIAGS
+use compiler.query.db.QRY_MAX_MEMO_SLOTS
+use compiler.query.db.QRY_MAX_MODULES
+use compiler.query.db.QRY_MAX_TRAIT_GOALS
+use compiler.query.db.QRY_MAX_TYPE_LAYOUTS
+use compiler.query.db.QUERY_CONST_EVAL
+use compiler.query.db.QUERY_EFFECT_SUMMARY
+use compiler.query.db.QUERY_INPUT_MODULE_TREE
+use compiler.query.db.QUERY_INPUT_PACKAGE_GRAPH
+use compiler.query.db.QUERY_INPUT_SOURCE_FILE
+use compiler.query.db.QUERY_INPUT_TARGET_CONFIG
+use compiler.query.db.QUERY_ITEM_SIGNATURE
+use compiler.query.db.QUERY_LAYOUT_OF
+use compiler.query.db.QUERY_MIR_BODY
+use compiler.query.db.QUERY_MODULE_DEF_MAP
+use compiler.query.db.QUERY_PARSE_MODULE
+use compiler.query.db.QUERY_RESOLVE_MODULE
+use compiler.query.db.QUERY_STATE_COMPUTING
+use compiler.query.db.QUERY_STATE_MAYBE_DIRTY
+use compiler.query.db.QUERY_STATE_POISONED
+use compiler.query.db.QUERY_STATE_READY
+use compiler.query.db.QUERY_STATE_VACANT
+use compiler.query.db.QUERY_TRAIT_SOLVE
+use compiler.query.db.QUERY_TYPECK_BODY
+use compiler.query.db.QueryDiag
+use compiler.query.db.QueryKey
+use compiler.query.db.QueryStackFrame
+use compiler.query.db.ResolveModuleResult
+use compiler.query.db.RevisionId
+use compiler.query.db.SemanticKey
+use compiler.query.db.SnapshotId
+use compiler.query.db.SourceFileId
+use compiler.query.db.SymbolId
+use compiler.query.db.TRAIT_RESULT_AMBIGUOUS
+use compiler.query.db.TRAIT_RESULT_ERROR
+use compiler.query.db.TRAIT_RESULT_IMPLEMENTED
+use compiler.query.db.TRAIT_RESULT_NO_SOLUTION
+use compiler.query.db.TraitGoalEntry
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.TraitSolveResult
+use compiler.query.db.TypeId
+use compiler.query.db.TypeLayoutEntry
+use compiler.query.db.TypeckBodyResult
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_add_body_call
+use compiler.query.db.query_db_add_body_const_dep
+use compiler.query.db.query_db_add_body_layout_dep
+use compiler.query.db.query_db_add_sig_dep
+use compiler.query.db.query_db_add_type_layout_field
+use compiler.query.db.query_db_attach_diag
+use compiler.query.db.query_db_emit_diagnostics
+use compiler.query.db.query_db_emit_query_graph
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_find_def_index
+use compiler.query.db.query_db_find_slot
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_get_def
+use compiler.query.db.query_db_get_or_create_slot
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_intern_sv
+use compiler.query.db.query_db_mark_transitive_dirty
+use compiler.query.db.query_db_module_package_name
+use compiler.query.db.query_db_module_path
+use compiler.query.db.query_db_push_diag_code_name
+use compiler.query.db.query_db_push_kind_name
+use compiler.query.db.query_db_push_query_key
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.query_db_push_state_name
+use compiler.query.db.query_db_read_module_tree_input
+use compiler.query.db.query_db_read_package_graph_input
+use compiler.query.db.query_db_read_source_file_input
+use compiler.query.db.query_db_read_target_config_input
+use compiler.query.db.query_db_record_caller_callee
+use compiler.query.db.query_db_record_reverse_dependent
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_db_register_trait_goal
+use compiler.query.db.query_db_register_type_layout
+use compiler.query.db.query_db_replay_slot_diags
+use compiler.query.db.query_db_reset_session_diags
+use compiler.query.db.query_db_scan_module_source
+use compiler.query.db.query_db_set_def_flags
+use compiler.query.db.query_db_set_def_seeds
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_set_package_graph_input
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_db_slot_at
+use compiler.query.db.query_db_snapshot
+use compiler.query.db.query_db_was_def_query_evaluated
+use compiler.query.db.query_key_cmp
+use compiler.query.db.query_key_eq
+use compiler.query.db.query_key_fingerprint
+use compiler.query.db.query_key_for_const_eval
+use compiler.query.db.query_key_for_def
+use compiler.query.db.query_key_for_layout_of
+use compiler.query.db.query_key_for_module
+use compiler.query.db.query_key_for_trait_goal
+use compiler.query.db.query_key_new
+use compiler.query.db.query_kind_cycle_diag_code
+use compiler.query.db.query_kind_cycle_policy
+use compiler.query.db.query_kind_is_derived
+use compiler.query.db.query_kind_is_input
+use compiler.query.db.query_kind_order_rank
+use compiler.query.db.revision_id_eq
+use compiler.query.db.revision_id_le
+use compiler.query.db.revision_id_lt
+use compiler.query.db.revision_id_new
+use compiler.query.db.revision_id_next
+use compiler.query.db.revision_id_zero
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_eq
+use compiler.query.db.semantic_key_fingerprint
+use compiler.query.db.semantic_key_new
+use compiler.query.db.snapshot_id_eq
+use compiler.query.db.snapshot_id_new
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// ============================================================================
+// 1. Cycle Recovery Fallback Kinds & Carrier Poison Predicates (AXS-QRY-023, 031)
+// ============================================================================
+
+pub const RECOVERY_KIND_NONE: u8 = 0u8;
+pub const RECOVERY_KIND_ERROR_TYPE: u8 = 1u8;
+pub const RECOVERY_KIND_CONST_POISONED: u8 = 2u8;
+pub const RECOVERY_KIND_TRAIT_ERROR: u8 = 3u8;
+pub const RECOVERY_KIND_LAYOUT_POISONED: u8 = 4u8;
+pub const RECOVERY_KIND_DEF_ERROR: u8 = 5u8;
+pub const RECOVERY_KIND_MIR_POISONED: u8 = 6u8;
+
+@derive(Copy)
+pub struct CycleRecoveryFallback {
+    pub recovery_kind: u8,
+    pub fallback_tag: u32,
+    pub is_error: bool,
+    pub diag_code: u32,
+    pub fingerprint: Fingerprint128,
+}
+
+pub fn engine_recovery_kind_for_query(kind: u8) -> u8 {
+    if kind == QUERY_CONST_EVAL {
+        return RECOVERY_KIND_CONST_POISONED;
+    }
+    if kind == QUERY_TRAIT_SOLVE {
+        return RECOVERY_KIND_TRAIT_ERROR;
+    }
+    if kind == QUERY_LAYOUT_OF {
+        return RECOVERY_KIND_LAYOUT_POISONED;
+    }
+    if kind == QUERY_ITEM_SIGNATURE || kind == QUERY_TYPECK_BODY {
+        return RECOVERY_KIND_ERROR_TYPE;
+    }
+    if kind == QUERY_MIR_BODY || kind == QUERY_EFFECT_SUMMARY {
+        return RECOVERY_KIND_MIR_POISONED;
+    }
+    RECOVERY_KIND_DEF_ERROR
+}
+
+pub fn engine_cycle_recovery_for_kind(kind: u8, diag_code: u32, cycle_fp: Fingerprint128) -> CycleRecoveryFallback {
+    let rkind = engine_recovery_kind_for_query(kind);
+    let fallback_tag = if kind == QUERY_TRAIT_SOLVE {
+        TRAIT_RESULT_ERROR as u32
+    } else {
+        QRY_ID_ERROR
+    };
+    CycleRecoveryFallback {
+        recovery_kind: rkind,
+        fallback_tag: fallback_tag,
+        is_error: true,
+        diag_code: diag_code,
+        fingerprint: cycle_fp,
+    }
+}
+
+pub fn engine_type_error() -> TypeId {
+    TypeId { v: QRY_ID_ERROR }
+}
+
+pub fn engine_def_error() -> DefId {
+    DefId { v: QRY_ID_ERROR }
+}
+
+pub fn engine_type_is_error(ty: TypeId) -> bool {
+    ty.v == QRY_ID_ERROR
+}
+
+pub fn engine_def_is_error(def_id: DefId) -> bool {
+    def_id.v == QRY_ID_ERROR
+}
+
+pub fn engine_sig_is_poisoned(res: view<ItemSignatureResult>) -> bool {
+    res.is_error || res.return_type.v == QRY_ID_ERROR
+}
+
+pub fn engine_typeck_is_poisoned(res: view<TypeckBodyResult>) -> bool {
+    res.is_error || res.inferred_return_type.v == QRY_ID_ERROR
+}
+
+pub fn engine_const_is_poisoned(res: view<ConstEvalResult>) -> bool {
+    res.is_poisoned
+}
+
+pub fn engine_trait_is_error(res: view<TraitSolveResult>) -> bool {
+    res.is_error || res.status == TRAIT_RESULT_ERROR
+}
+
+pub fn engine_layout_is_poisoned(res: view<LayoutOfResult>) -> bool {
+    res.is_poisoned
+}
+
+pub fn engine_mir_is_poisoned(res: view<MirBodyResult>) -> bool {
+    res.is_error || !res.ownership_verified
+}
+
+pub fn engine_def_map_is_error(res: view<ModuleDefMapResult>) -> bool {
+    res.is_error || res.total_defs == QRY_ID_ERROR
+}
+
+// ============================================================================
+// 2. Canonical Cycle Trace, Tarjan SCC & Snapshot-Bound Diagnostic Records
+// ============================================================================
+
+pub const ENG_MAX_CYCLES: usize = 64;
+pub const ENG_MAX_CYCLE_STEPS: usize = 16;
+pub const ENG_MAX_SCCS: usize = 64;
+pub const ENG_MAX_SNAPSHOT_LOGS: usize = 32;
+pub const ENG_MAX_REEXPORT_EDGES: usize = 32;
+pub const ENG_MAX_INDIRECTION_EDGES: usize = 32;
+
+@derive(Copy)
+pub struct CycleTraceRecord {
+    pub cycle_id: u32,
+    pub snapshot_id: SnapshotId,
+    pub revision: RevisionId,
+    pub origin_slot: u32,
+    pub diag_code: u32,
+    pub recovery_kind: u8,
+    pub canonical_head: QueryKey,
+    pub steps: [16]QueryKey,
+    pub step_count: u32,
+    pub fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct TarjanSccRecord {
+    pub scc_id: u32,
+    pub canonical_head: QueryKey,
+    pub member_slots: [16]u32,
+    pub member_keys: [16]QueryKey,
+    pub member_count: u32,
+    pub is_cycle: bool,
+    pub diag_code: u32,
+    pub scc_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct SnapshotDiagSummary {
+    pub snapshot_id: SnapshotId,
+    pub revision: RevisionId,
+    pub diag_count: u32,
+    pub cycle_count: u32,
+    pub suppressed_cascades: u32,
+    pub warm_replays: u32,
+    pub combined_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct ModuleReexportEdge {
+    pub from_module: ModuleId,
+    pub to_module: ModuleId,
+}
+
+@derive(Copy)
+pub struct TypeIndirectionEdge {
+    pub owner_type: TypeId,
+    pub target_type: TypeId,
+}
+
+pub struct QueryEngine {
+    pub db: CompilerDB,
+    pub eng_arena: Arena,
+
+    // Canonical cycle records & active session cycle indices (AXS-QRY-021..023)
+    pub cycles: *mut CycleTraceRecord,
+    pub cycle_count: u32,
+    pub emitted_cycle_indices: *mut u32,
+    pub emitted_cycle_count: u32,
+
+    // Tarjan Strongly Connected Components over the dependency graph (AXS-QRY-021)
+    pub tarjan_sccs: *mut TarjanSccRecord,
+    pub tarjan_scc_count: u32,
+
+    // Snapshot-bound diagnostic logs across revisions (AXS-QRY-030)
+    pub snapshot_logs: *mut SnapshotDiagSummary,
+    pub snapshot_log_count: u32,
+
+    // Module re-export edges (`use a.X -> use b.X`) & pointer-indirection layout edges (`AXS-QRY-020`)
+    pub reexport_edges: *mut ModuleReexportEdge,
+    pub reexport_edge_count: u32,
+    pub indirection_edges: *mut TypeIndirectionEdge,
+    pub indirection_edge_count: u32,
+
+    // Engine telemetry counters
+    pub suppressed_cascades: u32,
+    pub warm_diag_replays: u32,
+    pub invalidation_waves: u32,
+    pub total_slots_dirtied: u32,
+    pub backdated_verifications: u32,
+}
+
+fn eng_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+pub fn query_engine_empty() -> QueryEngine {
+    QueryEngine {
+        db: query_db_empty(),
+        eng_arena: arena_new(),
+        cycles: 0 as *mut CycleTraceRecord,
+        cycle_count: 0u32,
+        emitted_cycle_indices: 0 as *mut u32,
+        emitted_cycle_count: 0u32,
+        tarjan_sccs: 0 as *mut TarjanSccRecord,
+        tarjan_scc_count: 0u32,
+        snapshot_logs: 0 as *mut SnapshotDiagSummary,
+        snapshot_log_count: 0u32,
+        reexport_edges: 0 as *mut ModuleReexportEdge,
+        reexport_edge_count: 0u32,
+        indirection_edges: 0 as *mut TypeIndirectionEdge,
+        indirection_edge_count: 0u32,
+        suppressed_cascades: 0u32,
+        warm_diag_replays: 0u32,
+        invalidation_waves: 0u32,
+        total_slots_dirtied: 0u32,
+        backdated_verifications: 0u32,
+    }
+}
+
+pub fn query_engine_init(eng: mut_view<QueryEngine>, session_id: u64) {
+    query_db_init(mut_view(eng.db), session_id);
+    eng.eng_arena = arena_new();
+
+    let cyc_bytes = ENG_MAX_CYCLES * size_of<CycleTraceRecord>();
+    eng.cycles = arena_alloc_raw(mut_view(eng.eng_arena), cyc_bytes, align_of<CycleTraceRecord>()) as *mut CycleTraceRecord;
+    eng_zero_bytes(eng.cycles as *mut u8, cyc_bytes);
+    eng.cycle_count = 0u32;
+
+    let eci_bytes = ENG_MAX_CYCLES * size_of<u32>();
+    eng.emitted_cycle_indices = arena_alloc_raw(mut_view(eng.eng_arena), eci_bytes, align_of<u32>()) as *mut u32;
+    eng_zero_bytes(eng.emitted_cycle_indices as *mut u8, eci_bytes);
+    eng.emitted_cycle_count = 0u32;
+
+    let scc_bytes = ENG_MAX_SCCS * size_of<TarjanSccRecord>();
+    eng.tarjan_sccs = arena_alloc_raw(mut_view(eng.eng_arena), scc_bytes, align_of<TarjanSccRecord>()) as *mut TarjanSccRecord;
+    eng_zero_bytes(eng.tarjan_sccs as *mut u8, scc_bytes);
+    eng.tarjan_scc_count = 0u32;
+
+    let snap_bytes = ENG_MAX_SNAPSHOT_LOGS * size_of<SnapshotDiagSummary>();
+    eng.snapshot_logs = arena_alloc_raw(mut_view(eng.eng_arena), snap_bytes, align_of<SnapshotDiagSummary>()) as *mut SnapshotDiagSummary;
+    eng_zero_bytes(eng.snapshot_logs as *mut u8, snap_bytes);
+    eng.snapshot_log_count = 0u32;
+
+    let rx_bytes = ENG_MAX_REEXPORT_EDGES * size_of<ModuleReexportEdge>();
+    eng.reexport_edges = arena_alloc_raw(mut_view(eng.eng_arena), rx_bytes, align_of<ModuleReexportEdge>()) as *mut ModuleReexportEdge;
+    eng_zero_bytes(eng.reexport_edges as *mut u8, rx_bytes);
+    eng.reexport_edge_count = 0u32;
+
+    let ind_bytes = ENG_MAX_INDIRECTION_EDGES * size_of<TypeIndirectionEdge>();
+    eng.indirection_edges = arena_alloc_raw(mut_view(eng.eng_arena), ind_bytes, align_of<TypeIndirectionEdge>()) as *mut TypeIndirectionEdge;
+    eng_zero_bytes(eng.indirection_edges as *mut u8, ind_bytes);
+    eng.indirection_edge_count = 0u32;
+
+    eng.suppressed_cascades = 0u32;
+    eng.warm_diag_replays = 0u32;
+    eng.invalidation_waves = 0u32;
+    eng.total_slots_dirtied = 0u32;
+    eng.backdated_verifications = 0u32;
+}
+
+pub fn query_engine_free(eng: mut_view<QueryEngine>) {
+    query_db_free(mut_view(eng.db));
+    arena_destroy(mut_view(eng.eng_arena));
+    eng.cycles = 0 as *mut CycleTraceRecord;
+    eng.emitted_cycle_indices = 0 as *mut u32;
+    eng.tarjan_sccs = 0 as *mut TarjanSccRecord;
+    eng.snapshot_logs = 0 as *mut SnapshotDiagSummary;
+    eng.reexport_edges = 0 as *mut ModuleReexportEdge;
+    eng.indirection_edges = 0 as *mut TypeIndirectionEdge;
+}
+
+// ============================================================================
+// 3. Canonical Cycle Rotation & Deduplicated Cycle Trace Recording (AXS-QRY-022)
+// ============================================================================
+
+@derive(Copy)
+pub struct CycleStepBuf {
+    pub items: [16]QueryKey,
+}
+
+@derive(Copy)
+struct SccMemberBuf {
+    slots: [16]u32,
+    keys: [16]QueryKey,
+}
+
+// Given a raw cycle sequence `raw_keys.items[0..cycle_len]`, computes index `p` that
+// minimizes `(QueryKind.order_rank, SemanticKey)` under canonical lexicographical
+// order and writes the rotated sequence `[Q_p, ..., Q_{m-1}, Q_0, ..., Q_{p-1}, Q_p]`
+// of length `cycle_len + 1` into `out_steps`. Returns the canonical cycle fingerprint.
+pub fn engine_rotate_cycle_canonical(
+    raw_keys: view<CycleStepBuf>,
+    cycle_len: u32,
+    out_steps: mut_view<CycleStepBuf>,
+    out_head: mut_view<QueryKey>
+) -> Fingerprint128 {
+    if cycle_len == 0u32 {
+        return fingerprint128_zero();
+    }
+    let mut min_offset: u32 = 0u32;
+    let mut min_key: QueryKey = raw_keys.items[0];
+    let mut i: u32 = 1u32;
+    while i < cycle_len {
+        let cand = raw_keys.items[i as usize];
+        if query_key_cmp(view(cand), view(min_key)) < 0i32 {
+            min_key = cand;
+            min_offset = i;
+        }
+        i = i + 1u32;
+    }
+    *out_head = min_key;
+
+    let mut rot_fp = fingerprint128_u64(0x4359434C455F5254u64, cycle_len as u64, min_key.kind as u64);
+    let mut j: u32 = 0u32;
+    while j <= cycle_len {
+        let idx = if j == cycle_len {
+            min_offset
+        } else {
+            (min_offset + j) % cycle_len
+        };
+        let step_key = raw_keys.items[idx as usize];
+        if (j as usize) < ENG_MAX_CYCLE_STEPS {
+            out_steps.items[j as usize] = step_key;
+        }
+        rot_fp = fingerprint128_combine(rot_fp, query_key_fingerprint(view(step_key)));
+        j = j + 1u32;
+    }
+    rot_fp
+}
+
+fn engine_collect_session_cycle(eng: mut_view<QueryEngine>, cycle_idx: u32) {
+    let c_fp = unsafe { (*(eng.cycles + (cycle_idx as usize))).fingerprint };
+    let mut i: u32 = 0u32;
+    while i < (eng.emitted_cycle_count) {
+        let existing_idx = unsafe { *(eng.emitted_cycle_indices + (i as usize)) };
+        let existing_fp = unsafe { (*(eng.cycles + (existing_idx as usize))).fingerprint };
+        if fingerprint128_eq(c_fp, existing_fp) {
+            return;
+        }
+        i = i + 1u32;
+    }
+    if (eng.emitted_cycle_count as usize) < ENG_MAX_CYCLES {
+        unsafe {
+            *(eng.emitted_cycle_indices + (eng.emitted_cycle_count as usize)) = cycle_idx;
+        }
+        eng.emitted_cycle_count = eng.emitted_cycle_count + 1u32;
+    }
+}
+
+fn engine_record_cycle_trace(
+    eng: mut_view<QueryEngine>,
+    origin_slot: u32,
+    diag_code: u32,
+    recovery_kind: u8,
+    canonical_head: QueryKey,
+    steps: view<CycleStepBuf>,
+    step_count: u32,
+    fp: Fingerprint128
+) -> u32 {
+    let mut i: u32 = 0u32;
+    while i < (eng.cycle_count) {
+        let existing = unsafe { *(eng.cycles + (i as usize)) };
+        if fingerprint128_eq(existing.fingerprint, fp) &&
+            revision_id_eq(existing.revision, eng.db.current_revision) {
+            engine_collect_session_cycle(mut_view(*eng), i);
+            return i;
+        }
+        i = i + 1u32;
+    }
+    if (eng.cycle_count as usize) >= ENG_MAX_CYCLES {
+        return 0u32;
+    }
+    let cid = eng.cycle_count;
+    eng.cycle_count = cid + 1u32;
+    let rec_ptr = unsafe { eng.cycles + (cid as usize) };
+    eng_zero_bytes(rec_ptr as *mut u8, size_of<CycleTraceRecord>());
+    let capped_steps = if (step_count as usize) > ENG_MAX_CYCLE_STEPS {
+        ENG_MAX_CYCLE_STEPS as u32
+    } else {
+        step_count
+    };
+    unsafe {
+        (*rec_ptr).cycle_id = cid;
+        (*rec_ptr).snapshot_id = snapshot_id_new(eng.db.session_id, eng.db.current_revision);
+        (*rec_ptr).revision = eng.db.current_revision;
+        (*rec_ptr).origin_slot = origin_slot;
+        (*rec_ptr).diag_code = diag_code;
+        (*rec_ptr).recovery_kind = recovery_kind;
+        (*rec_ptr).canonical_head = canonical_head;
+        (*rec_ptr).step_count = capped_steps;
+        (*rec_ptr).fingerprint = fp;
+        let mut s: u32 = 0u32;
+        while s < capped_steps {
+            (*rec_ptr).steps[s as usize] = steps.items[s as usize];
+            s = s + 1u32;
+        }
+    }
+    engine_collect_session_cycle(mut_view(*eng), cid);
+    cid
+}
+
+pub fn engine_reset_active_diagnostics(eng: mut_view<QueryEngine>) {
+    query_db_reset_session_diags(mut_view(eng.db));
+    eng.emitted_cycle_count = 0u32;
+}
+
+// ============================================================================
+// 4. Tarjan Strongly Connected Components (SCC) Discovery (AXS-QRY-021)
+// ============================================================================
+
+fn eng_sort_query_keys_and_slots(mbuf: mut_view<SccMemberBuf>, count: u32) {
+    let n = count as usize;
+    let mut i: usize = 1;
+    while i < n {
+        let cur_k = mbuf.keys[i];
+        let cur_s = mbuf.slots[i];
+        let mut j: usize = i;
+        while j > 0 {
+            let prev_k = mbuf.keys[j - 1];
+            if query_key_cmp(view(prev_k), view(cur_k)) <= 0i32 {
+                break;
+            }
+            mbuf.keys[j] = prev_k;
+            mbuf.slots[j] = mbuf.slots[j - 1];
+            j = j - 1;
+        }
+        mbuf.keys[j] = cur_k;
+        mbuf.slots[j] = cur_s;
+        i = i + 1;
+    }
+}
+
+// Runs iterative Tarjan SCC discovery over all derived query slots in `eng.db`,
+// canonicalizing each SCC by sorting members in `(QueryKind, SemanticKey)` order
+// and sorting all discovered cyclic SCCs by their `canonical_head`.
+pub fn engine_compute_tarjan_sccs(eng: mut_view<QueryEngine>) -> u32 {
+    eng.tarjan_scc_count = 0u32;
+    let n_slots = eng.db.memo_slot_count as usize;
+    if n_slots == 0 {
+        return 0u32;
+    }
+
+    let mut disc: [512]u32 = [0u32; 512];
+    let mut low: [512]u32 = [0u32; 512];
+    let mut on_stack: [512]bool = [false; 512];
+    let mut tj_stack: [512]u32 = [0u32; 512];
+    let mut tj_sp: usize = 0;
+
+    let mut dfs_node: [512]u32 = [0u32; 512];
+    let mut dfs_edge_idx: [512]u32 = [0u32; 512];
+    let mut dfs_sp: usize = 0;
+    let mut timer: u32 = 1u32;
+
+    let mut root: usize = 0;
+    while root < n_slots {
+        let root_slot = unsafe { *(eng.db.memo_slots + root) };
+        if query_kind_is_derived(root_slot.key.kind) && root_slot.state != QUERY_STATE_VACANT && disc[root] == 0u32 {
+            disc[root] = timer;
+            low[root] = timer;
+            timer = timer + 1u32;
+            on_stack[root] = true;
+            tj_stack[tj_sp] = root as u32;
+            tj_sp = tj_sp + 1;
+
+            dfs_node[0] = root as u32;
+            dfs_edge_idx[0] = 0u32;
+            dfs_sp = 1;
+
+            while dfs_sp > 0 {
+                let top_idx = dfs_sp - 1;
+                let u = dfs_node[top_idx] as usize;
+                let e_idx = dfs_edge_idx[top_idx];
+                let u_slot = unsafe { *(eng.db.memo_slots + u) };
+
+                if e_idx < (u_slot.deps_len) {
+                    dfs_edge_idx[top_idx] = e_idx + 1u32;
+                    let v = u_slot.deps[e_idx as usize] as usize;
+                    if v < n_slots {
+                        let v_slot = unsafe { *(eng.db.memo_slots + v) };
+                        if query_kind_is_derived(v_slot.key.kind) && v_slot.state != QUERY_STATE_VACANT {
+                            if disc[v] == 0u32 {
+                                disc[v] = timer;
+                                low[v] = timer;
+                                timer = timer + 1u32;
+                                on_stack[v] = true;
+                                tj_stack[tj_sp] = v as u32;
+                                tj_sp = tj_sp + 1;
+
+                                dfs_node[dfs_sp] = v as u32;
+                                dfs_edge_idx[dfs_sp] = 0u32;
+                                dfs_sp = dfs_sp + 1;
+                            } else if on_stack[v] {
+                                if disc[v] < low[u] {
+                                    low[u] = disc[v];
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    dfs_sp = dfs_sp - 1;
+                    if dfs_sp > 0 {
+                        let parent = dfs_node[dfs_sp - 1] as usize;
+                        if low[u] < low[parent] {
+                            low[parent] = low[u];
+                        }
+                    }
+
+                    if low[u] == disc[u] {
+                        let mut mbuf = SccMemberBuf {
+                            slots: [0u32; 16],
+                            keys: [u_slot.key; 16],
+                        };
+                        let mut m_count: u32 = 0u32;
+                        let mut has_poisoned_member = false;
+
+                        while tj_sp > 0 {
+                            tj_sp = tj_sp - 1;
+                            let w = tj_stack[tj_sp];
+                            on_stack[w as usize] = false;
+                            let w_slot = unsafe { *(eng.db.memo_slots + (w as usize)) };
+                            if w_slot.state == QUERY_STATE_POISONED || w_slot.was_poisoned {
+                                has_poisoned_member = true;
+                            }
+                            if m_count < 16u32 {
+                                mbuf.slots[m_count as usize] = w;
+                                mbuf.keys[m_count as usize] = w_slot.key;
+                                m_count = m_count + 1u32;
+                            }
+                            if (w as usize) == u {
+                                break;
+                            }
+                        }
+
+                        eng_sort_query_keys_and_slots(mut_view(mbuf), m_count);
+                        let is_cyc = m_count > 1u32 || has_poisoned_member;
+                        if is_cyc && (eng.tarjan_scc_count as usize) < ENG_MAX_SCCS {
+                            let scc_idx = eng.tarjan_scc_count;
+                            eng.tarjan_scc_count = scc_idx + 1u32;
+                            let head_k = mbuf.keys[0];
+                            let d_code = query_kind_cycle_diag_code(head_k.kind);
+                            let mut s_fp = fingerprint128_u64(0x5441524A53434300u64, m_count as u64, head_k.kind as u64);
+                            let mut mi: u32 = 0u32;
+                            while mi < m_count {
+                                s_fp = fingerprint128_combine(s_fp, query_key_fingerprint(view(mbuf.keys[mi as usize])));
+                                mi = mi + 1u32;
+                            }
+                            unsafe {
+                                *(eng.tarjan_sccs + (scc_idx as usize)) = TarjanSccRecord {
+                                    scc_id: scc_idx,
+                                    canonical_head: head_k,
+                                    member_slots: mbuf.slots,
+                                    member_keys: mbuf.keys,
+                                    member_count: m_count,
+                                    is_cycle: true,
+                                    diag_code: d_code,
+                                    scc_fingerprint: s_fp,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        root = root + 1;
+    }
+
+    // Sort discovered cyclic SCCs lexicographically by `canonical_head`
+    let scc_n = eng.tarjan_scc_count as usize;
+    let mut a: usize = 1;
+    while a < scc_n {
+        let cur_scc = unsafe { *(eng.tarjan_sccs + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_scc = unsafe { *(eng.tarjan_sccs + (b - 1)) };
+            if query_key_cmp(view(prev_scc.canonical_head), view(cur_scc.canonical_head)) <= 0i32 {
+                break;
+            }
+            unsafe { *(eng.tarjan_sccs + b) = prev_scc; }
+            b = b - 1;
+        }
+        unsafe { *(eng.tarjan_sccs + b) = cur_scc; }
+        a = a + 1;
+    }
+
+    eng.tarjan_scc_count
+}
+
+// ============================================================================
+// 5. Module Re-Export & Type Indirection Registration (AXS-QRY-020..021)
+// ============================================================================
+
+pub fn engine_add_module_reexport_dep(eng: mut_view<QueryEngine>, from_module: ModuleId, to_module: ModuleId) {
+    if (eng.reexport_edge_count as usize) >= ENG_MAX_REEXPORT_EDGES {
+        return;
+    }
+    let idx = eng.reexport_edge_count as usize;
+    eng.reexport_edge_count = eng.reexport_edge_count + 1u32;
+    unsafe {
+        *(eng.reexport_edges + idx) = ModuleReexportEdge {
+            from_module: from_module,
+            to_module: to_module,
+        };
+    }
+}
+
+pub fn engine_clear_module_reexports(eng: mut_view<QueryEngine>, from_module: ModuleId) {
+    let mut write_idx: usize = 0;
+    let mut i: usize = 0;
+    while i < (eng.reexport_edge_count as usize) {
+        let edge = unsafe { *(eng.reexport_edges + i) };
+        if edge.from_module.v != from_module.v {
+            unsafe { *(eng.reexport_edges + write_idx) = edge; }
+            write_idx = write_idx + 1;
+        }
+        i = i + 1;
+    }
+    eng.reexport_edge_count = write_idx as u32;
+}
+
+// Registers a pointer/Box/view indirection field (`struct Node { next: Option<Box<Node>> }`)
+// per AXS-QRY-020 §1: nominal indirection does NOT recursively query `layout_of(target_type)`
+// by value, so self-referential types behind pointers/boxes are legal and not layout cycles.
+pub fn engine_add_type_indirection_field(eng: mut_view<QueryEngine>, owner_type: TypeId, target_type: TypeId) {
+    if (eng.indirection_edge_count as usize) >= ENG_MAX_INDIRECTION_EDGES {
+        return;
+    }
+    let idx = eng.indirection_edge_count as usize;
+    eng.indirection_edge_count = eng.indirection_edge_count + 1u32;
+    unsafe {
+        *(eng.indirection_edges + idx) = TypeIndirectionEdge {
+            owner_type: owner_type,
+            target_type: target_type,
+        };
+    }
+}
+
+pub fn engine_clear_def_deps(eng: mut_view<QueryEngine>, def_id: DefId) {
+    let idx = query_db_find_def_index(view(eng.db), def_id);
+    if idx < QRY_MAX_DEFS {
+        unsafe {
+            (*(eng.db.defs + idx)).sig_dep_count = 0u32;
+            (*(eng.db.defs + idx)).body_call_count = 0u32;
+            (*(eng.db.defs + idx)).body_const_count = 0u32;
+            (*(eng.db.defs + idx)).body_layout_count = 0u32;
+        }
+    }
+}
+
+pub fn engine_clear_type_layout_fields(eng: mut_view<QueryEngine>, type_id: TypeId) {
+    let mut i: usize = 0;
+    while i < (eng.db.type_layout_count as usize) {
+        let p = unsafe { eng.db.type_layouts + i };
+        if unsafe { (*p).type_id.v } == type_id.v {
+            unsafe { (*p).field_count = 0u32; }
+            return;
+        }
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// 6. Active-Stack Cycle Handling, Recovery & Warm Diagnostic Replay
+// ============================================================================
+
+fn engine_populate_poisoned_result_table(eng: mut_view<QueryEngine>, key: QueryKey, fp: Fingerprint128) {
+    let kind = key.kind;
+    let raw = key.key_raw as usize;
+
+    if kind == QUERY_PARSE_MODULE && raw < QRY_MAX_MODULES {
+        unsafe {
+            *(eng.db.parse_results + raw) = ParseModuleResult {
+                module_id: ModuleId { v: key.key_raw },
+                item_count: 0u32,
+                token_count: 0u32,
+                has_parse_error: true,
+                ast_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_MODULE_DEF_MAP && raw < QRY_MAX_MODULES {
+        unsafe {
+            *(eng.db.def_map_results + raw) = ModuleDefMapResult {
+                module_id: ModuleId { v: key.key_raw },
+                exported_count: 0u32,
+                total_defs: QRY_ID_ERROR,
+                is_error: true,
+                def_map_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_RESOLVE_MODULE && raw < QRY_MAX_MODULES {
+        unsafe {
+            *(eng.db.resolve_results + raw) = ResolveModuleResult {
+                module_id: ModuleId { v: key.key_raw },
+                resolved_bindings: 0u32,
+                has_resolve_error: true,
+                resolve_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_ITEM_SIGNATURE && raw < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.sig_results + raw) = ItemSignatureResult {
+                def_id: DefId { v: key.key_raw },
+                param_count: 0u32,
+                return_type: TypeId { v: QRY_ID_ERROR },
+                is_error: true,
+                interface_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_TYPECK_BODY && raw < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.typeck_results + raw) = TypeckBodyResult {
+                def_id: DefId { v: key.key_raw },
+                checked_expr_count: 0u32,
+                callee_sig_count: 0u32,
+                inferred_return_type: TypeId { v: QRY_ID_ERROR },
+                is_error: true,
+                body_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_TRAIT_SOLVE && raw < QRY_MAX_TRAIT_GOALS {
+        unsafe {
+            *(eng.db.trait_results + raw) = TraitSolveResult {
+                goal_key: TraitGoalKey { v: key.key_raw },
+                status: TRAIT_RESULT_ERROR,
+                impl_def_id: DefId { v: QRY_ID_ERROR },
+                is_error: true,
+                goal_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_CONST_EVAL && raw < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.const_results + raw) = ConstEvalResult {
+                const_key: ConstEvalKey { v: key.key_raw },
+                int_val: 0i64,
+                is_poisoned: true,
+                const_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_MIR_BODY && raw < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.mir_results + raw) = MirBodyResult {
+                def_id: DefId { v: key.key_raw },
+                mir_body_id: MirBodyId { v: QRY_ID_ERROR },
+                block_count: 0u32,
+                local_count: 0u32,
+                ownership_verified: false,
+                is_error: true,
+                mir_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_LAYOUT_OF && raw < QRY_MAX_TYPE_LAYOUTS {
+        unsafe {
+            *(eng.db.layout_results + raw) = LayoutOfResult {
+                type_id: TypeId { v: key.key_raw },
+                size_bytes: 0u32,
+                align_bytes: 1u32,
+                field_count: 0u32,
+                is_poisoned: true,
+                layout_fingerprint: fp,
+            };
+        }
+        return;
+    }
+    if kind == QUERY_EFFECT_SUMMARY && raw < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.effect_results + raw) = EffectSummaryResult {
+                def_id: DefId { v: key.key_raw },
+                effect_mask: 0u32,
+                is_pure: false,
+                is_error: true,
+                effect_fingerprint: fp,
+            };
+        }
+    }
+}
+
+pub fn engine_handle_active_cycle(
+    eng: mut_view<QueryEngine>,
+    target_slot: u32,
+    start_frame_idx: u32
+) -> MemoEntry {
+    let stack_len = eng.db.query_stack_len;
+    let cycle_len = stack_len - start_frame_idx;
+    let init_key = unsafe { (*(eng.db.query_stack + (start_frame_idx as usize))).key };
+    let mut raw_keys = CycleStepBuf { items: [init_key; 16] };
+    let mut rot_steps = CycleStepBuf { items: [init_key; 16] };
+    let capped_len = if cycle_len > 15u32 { 15u32 } else { cycle_len };
+
+    let mut i: u32 = 0u32;
+    while i < capped_len {
+        let fr = unsafe { *(eng.db.query_stack + ((start_frame_idx + i) as usize)) };
+        raw_keys.items[i as usize] = fr.key;
+        let f_slot_ptr = unsafe { eng.db.memo_slots + (fr.slot_idx as usize) };
+        unsafe {
+            (*f_slot_ptr).was_poisoned = true;
+            (*f_slot_ptr).value_is_error = true;
+        }
+        i = i + 1u32;
+    }
+
+    let mut min_key = raw_keys.items[0];
+    let rot_fp = engine_rotate_cycle_canonical(
+        view(raw_keys),
+        capped_len,
+        mut_view(rot_steps),
+        mut_view(min_key)
+    );
+
+    let diag_code = query_kind_cycle_diag_code(min_key.kind);
+    let rec_kind = engine_recovery_kind_for_query(min_key.kind);
+
+    eng.db.total_cycles_detected = eng.db.total_cycles_detected + 1u32;
+    query_db_attach_diag(
+        mut_view(eng.db),
+        target_slot,
+        diag_code,
+        min_key.semantic_key,
+        capped_len + 1u32,
+        rot_fp
+    );
+    let _ = engine_record_cycle_trace(
+        mut_view(*eng),
+        target_slot,
+        diag_code,
+        rec_kind,
+        min_key,
+        view(rot_steps),
+        capped_len + 1u32,
+        rot_fp
+    );
+
+    // Populate poisoned recovery fallback for every participant in the cycle
+    let mut k: u32 = 0u32;
+    while k < capped_len {
+        engine_populate_poisoned_result_table(mut_view(*eng), raw_keys.items[k as usize], rot_fp);
+        k = k + 1u32;
+    }
+
+    let mut recovery = unsafe { *(eng.db.memo_slots + (target_slot as usize)) };
+    recovery.state = QUERY_STATE_POISONED;
+    recovery.was_poisoned = true;
+    recovery.verified_at = eng.db.current_revision;
+    recovery.changed_at = eng.db.current_revision;
+    recovery.value_tag = QRY_ID_ERROR;
+    recovery.value_is_error = true;
+    recovery.value_fingerprint = rot_fp;
+    recovery
+}
+
+// Replays snapshot-bound diagnostics and cycle traces from a warm/green memoized
+// subgraph in canonical `(QueryKind, SemanticKey)` order (AXS-QRY-030).
+pub fn engine_replay_slot_diagnostics(eng: mut_view<QueryEngine>, root_slot: u32) {
+    let diag_before = eng.db.emitted_diag_count;
+    query_db_replay_slot_diags(mut_view(eng.db), root_slot);
+
+    // Also replay any CycleTraceRecord reachable in the subgraph
+    let mut stack: [128]u32 = [0u32; 128];
+    let mut visited: [512]bool = [false; 512];
+    let mut sp: usize = 0;
+    stack[0] = root_slot;
+    sp = 1;
+
+    while sp > 0 {
+        sp = sp - 1;
+        let cur = stack[sp];
+        if (cur as usize) < 512 && !visited[cur as usize] {
+            visited[cur as usize] = true;
+            let slot = unsafe { *(eng.db.memo_slots + (cur as usize)) };
+            let mut di: u32 = 0u32;
+            while di < (slot.diags_len) {
+                let d_idx = slot.diags[di as usize];
+                let d_fp = unsafe { (*(eng.db.all_diags + (d_idx as usize))).fingerprint };
+                let mut ci: u32 = 0u32;
+                while ci < (eng.cycle_count) {
+                    let cyc_fp = unsafe { (*(eng.cycles + (ci as usize))).fingerprint };
+                    if fingerprint128_eq(d_fp, cyc_fp) {
+                        engine_collect_session_cycle(mut_view(*eng), ci);
+                    }
+                    ci = ci + 1u32;
+                }
+                di = di + 1u32;
+            }
+            let mut k: u32 = slot.deps_len;
+            while k > 0u32 {
+                k = k - 1u32;
+                let dep_slot = slot.deps[k as usize];
+                if (dep_slot as usize) < 512 && !visited[dep_slot as usize] && sp < 128 {
+                    stack[sp] = dep_slot;
+                    sp = sp + 1;
+                }
+            }
+        }
+    }
+
+    if eng.db.emitted_diag_count > diag_before {
+        eng.warm_diag_replays = eng.warm_diag_replays + 1u32;
+    }
+}
+
+// ============================================================================
+// 7. Demand-Driven Query Providers with Recovery & Cascade Suppression
+// ============================================================================
+
+struct EngineProviderOutput {
+    value_tag: u32,
+    is_error: bool,
+    fingerprint: Fingerprint128,
+}
+
+fn engine_execute_provider(eng: mut_view<QueryEngine>, slot_idx: u32, key: QueryKey) -> EngineProviderOutput {
+    let kind = key.kind;
+    let raw = key.key_raw;
+
+    if kind == QUERY_PARSE_MODULE {
+        let mod_id = ModuleId { v: raw };
+        let mod_in = query_db_read_module_tree_input(mut_view(eng.db), mod_id);
+        let sf_in = query_db_read_source_file_input(mut_view(eng.db), mod_in.source_file_id);
+        let tok_count = query_db_scan_module_source(mut_view(eng.db), mod_id, sf_in.text);
+        let mut item_count: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < (eng.db.def_count as usize) {
+            let d = unsafe { *(eng.db.defs + i) };
+            if d.module_id.v == mod_id.v {
+                item_count = item_count + 1u32;
+            }
+            i = i + 1;
+        }
+        let fp = fingerprint128_combine(
+            sf_in.content_hash,
+            fingerprint128_u64(0x50415253455F4D44u64, mod_id.v as u64, item_count as u64)
+        );
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(eng.db.parse_results + (mod_id.v as usize)) = ParseModuleResult {
+                    module_id: mod_id,
+                    item_count: item_count,
+                    token_count: tok_count,
+                    has_parse_error: false,
+                    ast_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: item_count, is_error: false, fingerprint: fp };
+    }
+
+    if kind == QUERY_MODULE_DEF_MAP {
+        let mod_id = ModuleId { v: raw };
+        let pm_key = query_key_for_module(view(eng.db), QUERY_PARSE_MODULE, mod_id);
+        let pm_memo = engine_invoke_query(mut_view(*eng), pm_key);
+        let mut is_err = pm_memo.value_is_error;
+        let mut exported: u32 = 0u32;
+        let mut total: u32 = 0u32;
+        let mut acc_fp = fingerprint128_u64(0x4445465F4D415030u64, mod_id.v as u64, pm_memo.value_tag as u64);
+
+        // Evaluate module re-export dependencies (`use a.X -> use b.X`) (AXS-QRY-020 §2)
+        let mut rx: usize = 0;
+        while rx < (eng.reexport_edge_count as usize) {
+            let edge = unsafe { *(eng.reexport_edges + rx) };
+            if edge.from_module.v == mod_id.v {
+                let target_dm_key = query_key_for_module(view(eng.db), QUERY_MODULE_DEF_MAP, edge.to_module);
+                let target_dm_memo = engine_invoke_query(mut_view(*eng), target_dm_key);
+                if target_dm_memo.value_is_error {
+                    is_err = true;
+                } else {
+                    exported = exported + 1u32;
+                }
+                acc_fp = fingerprint128_combine(acc_fp, target_dm_memo.value_fingerprint);
+            }
+            rx = rx + 1;
+        }
+
+        let mut i: usize = 0;
+        while i < (eng.db.def_count as usize) {
+            let d = unsafe { *(eng.db.defs + i) };
+            if d.module_id.v == mod_id.v {
+                total = total + 1u32;
+                if d.is_pub {
+                    exported = exported + 1u32;
+                }
+                acc_fp = fingerprint128_combine(acc_fp, semantic_key_fingerprint(view(d.semantic_key)));
+            }
+            i = i + 1;
+        }
+        let out_tag = if is_err { QRY_ID_ERROR } else { total };
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(eng.db.def_map_results + (mod_id.v as usize)) = ModuleDefMapResult {
+                    module_id: mod_id,
+                    exported_count: if is_err { 0u32 } else { exported },
+                    total_defs: out_tag,
+                    is_error: is_err,
+                    def_map_fingerprint: acc_fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: out_tag, is_error: is_err, fingerprint: acc_fp };
+    }
+
+    if kind == QUERY_RESOLVE_MODULE {
+        let mod_id = ModuleId { v: raw };
+        let pm_key = query_key_for_module(view(eng.db), QUERY_PARSE_MODULE, mod_id);
+        let dm_key = query_key_for_module(view(eng.db), QUERY_MODULE_DEF_MAP, mod_id);
+        let pm_memo = engine_invoke_query(mut_view(*eng), pm_key);
+        let dm_memo = engine_invoke_query(mut_view(*eng), dm_key);
+        let is_err = pm_memo.value_is_error || dm_memo.value_is_error;
+        let fp = fingerprint128_combine(
+            dm_memo.value_fingerprint,
+            fingerprint128_u64(0x5245534F4C56454Du64, mod_id.v as u64, dm_memo.value_tag as u64)
+        );
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(eng.db.resolve_results + (mod_id.v as usize)) = ResolveModuleResult {
+                    module_id: mod_id,
+                    resolved_bindings: if is_err { 0u32 } else { dm_memo.value_tag },
+                    has_resolve_error: is_err,
+                    resolve_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: if is_err { QRY_ID_ERROR } else { dm_memo.value_tag }, is_error: is_err, fingerprint: fp };
+    }
+
+    if kind == QUERY_ITEM_SIGNATURE {
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(eng.db), def_id);
+        let dm_key = query_key_for_module(view(eng.db), QUERY_MODULE_DEF_MAP, d.module_id);
+        let dm_memo = engine_invoke_query(mut_view(*eng), dm_key);
+        let mut is_err = dm_memo.value_is_error;
+        let mut sig_fp = fingerprint128_combine(
+            semantic_key_fingerprint(view(d.semantic_key)),
+            fingerprint128_u64(0x4954454D5F534947u64, d.sig_hash_seed, ((d.param_count as u64) << 32) | (d.return_type_tag as u64))
+        );
+
+        let mut i: u32 = 0u32;
+        while i < (d.sig_dep_count) {
+            let dep_def = DefId { v: d.sig_dep_defs[i as usize] };
+            let dep_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, dep_def);
+            let dep_memo = engine_invoke_query(mut_view(*eng), dep_key);
+            if dep_memo.value_is_error {
+                is_err = true;
+            }
+            sig_fp = fingerprint128_combine(sig_fp, dep_memo.value_fingerprint);
+            i = i + 1u32;
+        }
+
+        if d.has_inferred_return {
+            let body_key = query_key_for_def(view(eng.db), QUERY_TYPECK_BODY, def_id);
+            let body_memo = engine_invoke_query(mut_view(*eng), body_key);
+            if body_memo.value_is_error {
+                is_err = true;
+            }
+            sig_fp = fingerprint128_combine(sig_fp, body_memo.value_fingerprint);
+        }
+
+        let slot_poisoned = unsafe { (*(eng.db.memo_slots + (slot_idx as usize))).was_poisoned };
+        if slot_poisoned {
+            is_err = true;
+        }
+
+        let ret_ty = if is_err { TypeId { v: QRY_ID_ERROR } } else { d.type_id };
+        if (def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(eng.db.sig_results + (def_id.v as usize)) = ItemSignatureResult {
+                    def_id: def_id,
+                    param_count: d.param_count,
+                    return_type: ret_ty,
+                    is_error: is_err,
+                    interface_fingerprint: sig_fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: ret_ty.v, is_error: is_err, fingerprint: sig_fp };
+    }
+
+    if kind == QUERY_TYPECK_BODY {
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(eng.db), def_id);
+        let rm_key = query_key_for_module(view(eng.db), QUERY_RESOLVE_MODULE, d.module_id);
+        let self_sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, def_id);
+        let rm_memo = engine_invoke_query(mut_view(*eng), rm_key);
+        let self_sig_memo = if d.has_inferred_return {
+            rm_memo
+        } else {
+            engine_invoke_query(mut_view(*eng), self_sig_key)
+        };
+
+        let mut upstream_poisoned = rm_memo.value_is_error || self_sig_memo.value_is_error;
+        let mut body_fp = fingerprint128_combine(
+            self_sig_memo.value_fingerprint,
+            fingerprint128_u64(0x54595045434B4244u64, d.body_hash_seed, d.def_id.v as u64)
+        );
+
+        let mut ci: u32 = 0u32;
+        while ci < (d.body_call_count) {
+            let callee_id = DefId { v: d.body_call_defs[ci as usize] };
+            let callee_def = query_db_get_def(view(eng.db), callee_id);
+            let callee_sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, callee_id);
+            let callee_sig_memo = engine_invoke_query(mut_view(*eng), callee_sig_key);
+            if callee_sig_memo.value_is_error {
+                upstream_poisoned = true;
+            }
+            body_fp = fingerprint128_combine(body_fp, callee_sig_memo.value_fingerprint);
+
+            if callee_def.requires_ctfe_body && callee_id.v != def_id.v {
+                let callee_body_key = query_key_for_def(view(eng.db), QUERY_TYPECK_BODY, callee_id);
+                let callee_body_memo = engine_invoke_query(mut_view(*eng), callee_body_key);
+                if callee_body_memo.value_is_error {
+                    upstream_poisoned = true;
+                }
+                body_fp = fingerprint128_combine(body_fp, callee_body_memo.value_fingerprint);
+            }
+            ci = ci + 1u32;
+        }
+
+        let mut ki: u32 = 0u32;
+        while ki < (d.body_const_count) {
+            let ckey = ConstEvalKey { v: d.body_const_deps[ki as usize] };
+            let ce_qkey = query_key_for_const_eval(view(eng.db), ckey);
+            let ce_memo = engine_invoke_query(mut_view(*eng), ce_qkey);
+            if ce_memo.value_is_error {
+                upstream_poisoned = true;
+            }
+            body_fp = fingerprint128_combine(body_fp, ce_memo.value_fingerprint);
+            ki = ki + 1u32;
+        }
+
+        let mut li: u32 = 0u32;
+        while li < (d.body_layout_count) {
+            let tid = TypeId { v: d.body_layout_types[li as usize] };
+            let lo_qkey = query_key_for_layout_of(view(eng.db), tid);
+            let lo_memo = engine_invoke_query(mut_view(*eng), lo_qkey);
+            if lo_memo.value_is_error {
+                upstream_poisoned = true;
+            }
+            body_fp = fingerprint128_combine(body_fp, lo_memo.value_fingerprint);
+            li = li + 1u32;
+        }
+
+        // AXS-QRY-031 Cascading Error Suppression:
+        // When any upstream dependency is poisoned (`upstream_poisoned == true`), propagate
+        // a poisoned result silently and increment `suppressed_cascades` without emitting
+        // secondary `AX_TYP_MISMATCH` noise!
+        let mut is_err = upstream_poisoned;
+        if upstream_poisoned {
+            eng.suppressed_cascades = eng.suppressed_cascades + 1u32;
+        } else if d.has_body_type_error {
+            is_err = true;
+            let err_fp = fingerprint128_combine(
+                semantic_key_fingerprint(view(d.semantic_key)),
+                fingerprint128_u64(0x5459505F4D49534Du64, DIAG_AX_TYP_MISMATCH as u64, def_id.v as u64)
+            );
+            query_db_attach_diag(mut_view(eng.db), slot_idx, DIAG_AX_TYP_MISMATCH, d.semantic_key, 1u32, err_fp);
+        }
+
+        let ret_ty = if is_err { TypeId { v: QRY_ID_ERROR } } else { d.type_id };
+        if (def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(eng.db.typeck_results + (def_id.v as usize)) = TypeckBodyResult {
+                    def_id: def_id,
+                    checked_expr_count: d.body_call_count + d.body_const_count + 1u32,
+                    callee_sig_count: d.body_call_count,
+                    inferred_return_type: ret_ty,
+                    is_error: is_err,
+                    body_fingerprint: body_fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: ret_ty.v, is_error: is_err, fingerprint: body_fp };
+    }
+
+    if kind == QUERY_TRAIT_SOLVE {
+        let gkey = TraitGoalKey { v: raw };
+        let mut found = false;
+        let mut tg: TraitGoalEntry = unsafe { *eng.db.trait_goals };
+        let mut i: usize = 0;
+        while i < (eng.db.trait_goal_count as usize) {
+            let cur = unsafe { *(eng.db.trait_goals + i) };
+            if cur.goal_key.v == gkey.v {
+                tg = cur;
+                found = true;
+            }
+            i = i + 1;
+        }
+        if !found {
+            let fp = fingerprint128_u64(0x54524149544E4F4Eu64, raw as u64, 0u64);
+            return EngineProviderOutput { value_tag: TRAIT_RESULT_NO_SOLUTION as u32, is_error: false, fingerprint: fp };
+        }
+        let tr_sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, tg.trait_def_id);
+        let tr_sig_memo = engine_invoke_query(mut_view(*eng), tr_sig_key);
+        let mut is_err = tr_sig_memo.value_is_error;
+        let mut fp = fingerprint128_combine(
+            tr_sig_memo.value_fingerprint,
+            fingerprint128_u64(0x5452414954474C00u64, tg.self_type_id.v as u64, gkey.v as u64)
+        );
+        if tg.sub_goal_key.v != 0u32 {
+            let sub_qkey = query_key_for_trait_goal(view(eng.db), tg.sub_goal_key);
+            let sub_memo = engine_invoke_query(mut_view(*eng), sub_qkey);
+            if sub_memo.value_is_error {
+                is_err = true;
+            }
+            fp = fingerprint128_combine(fp, sub_memo.value_fingerprint);
+        }
+        let slot_poisoned = unsafe { (*(eng.db.memo_slots + (slot_idx as usize))).was_poisoned };
+        if slot_poisoned {
+            is_err = true;
+        }
+        let status = if is_err { TRAIT_RESULT_ERROR } else { TRAIT_RESULT_IMPLEMENTED };
+        if (gkey.v as usize) < QRY_MAX_TRAIT_GOALS {
+            unsafe {
+                *(eng.db.trait_results + (gkey.v as usize)) = TraitSolveResult {
+                    goal_key: gkey,
+                    status: status,
+                    impl_def_id: if is_err { DefId { v: QRY_ID_ERROR } } else { tg.trait_def_id },
+                    is_error: is_err,
+                    goal_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: status as u32, is_error: is_err, fingerprint: fp };
+    }
+
+    if kind == QUERY_CONST_EVAL {
+        let ckey = ConstEvalKey { v: raw };
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(eng.db), def_id);
+        let sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, def_id);
+        let sig_memo = engine_invoke_query(mut_view(*eng), sig_key);
+        let mut is_poisoned = sig_memo.value_is_error;
+        let mut acc_val: i64 = d.const_base_val;
+        let mut fp = fingerprint128_combine(
+            sig_memo.value_fingerprint,
+            fingerprint128_u64(0x434F4E53545F4556u64, d.body_hash_seed, acc_val as u64)
+        );
+        let mut i: u32 = 0u32;
+        while i < (d.body_const_count) {
+            let dep_ckey = ConstEvalKey { v: d.body_const_deps[i as usize] };
+            let dep_qkey = query_key_for_const_eval(view(eng.db), dep_ckey);
+            let dep_memo = engine_invoke_query(mut_view(*eng), dep_qkey);
+            if dep_memo.value_is_error {
+                is_poisoned = true;
+            } else {
+                acc_val = acc_val + (dep_memo.value_tag as i64);
+            }
+            fp = fingerprint128_combine(fp, dep_memo.value_fingerprint);
+            i = i + 1u32;
+        }
+        let slot_poisoned = unsafe { (*(eng.db.memo_slots + (slot_idx as usize))).was_poisoned };
+        if slot_poisoned {
+            is_poisoned = true;
+        }
+        let out_tag = if is_poisoned { QRY_ID_ERROR } else { acc_val as u32 };
+        if (ckey.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(eng.db.const_results + (ckey.v as usize)) = ConstEvalResult {
+                    const_key: ckey,
+                    int_val: if is_poisoned { 0i64 } else { acc_val },
+                    is_poisoned: is_poisoned,
+                    const_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: out_tag, is_error: is_poisoned, fingerprint: fp };
+    }
+
+    if kind == QUERY_MIR_BODY {
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(eng.db), def_id);
+        let sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, def_id);
+        let tck_key = query_key_for_def(view(eng.db), QUERY_TYPECK_BODY, def_id);
+        let sig_memo = engine_invoke_query(mut_view(*eng), sig_key);
+        let tck_memo = engine_invoke_query(mut_view(*eng), tck_key);
+        let mut is_err = sig_memo.value_is_error || tck_memo.value_is_error;
+        let mut fp = fingerprint128_combine(
+            sig_memo.value_fingerprint,
+            fingerprint128_combine(
+                tck_memo.value_fingerprint,
+                fingerprint128_u64(0x4D49525F424F4459u64, def_id.v as u64, d.body_hash_seed)
+            )
+        );
+        let mut li: u32 = 0u32;
+        while li < (d.body_layout_count) {
+            let tid = TypeId { v: d.body_layout_types[li as usize] };
+            let lo_key = query_key_for_layout_of(view(eng.db), tid);
+            let lo_memo = engine_invoke_query(mut_view(*eng), lo_key);
+            if lo_memo.value_is_error {
+                is_err = true;
+            }
+            fp = fingerprint128_combine(fp, lo_memo.value_fingerprint);
+            li = li + 1u32;
+        }
+        let blocks = if is_err { 0u32 } else { d.body_call_count + 1u32 };
+        let locals = if is_err { 0u32 } else { d.param_count + 2u32 };
+        if (def_id.v as usize) < QRY_MAX_DEFS {
+            unsafe {
+                *(eng.db.mir_results + (def_id.v as usize)) = MirBodyResult {
+                    def_id: def_id,
+                    mir_body_id: if is_err { MirBodyId { v: QRY_ID_ERROR } } else { d.mir_body_id },
+                    block_count: blocks,
+                    local_count: locals,
+                    ownership_verified: !is_err,
+                    is_error: is_err,
+                    mir_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: if is_err { QRY_ID_ERROR } else { blocks }, is_error: is_err, fingerprint: fp };
+    }
+
+    if kind == QUERY_LAYOUT_OF {
+        let type_id = TypeId { v: raw };
+        let mut found = false;
+        let mut tl: TypeLayoutEntry = unsafe { *eng.db.type_layouts };
+        let mut i: usize = 0;
+        while i < (eng.db.type_layout_count as usize) {
+            let cur = unsafe { *(eng.db.type_layouts + i) };
+            if cur.type_id.v == type_id.v {
+                tl = cur;
+                found = true;
+            }
+            i = i + 1;
+        }
+        if !found {
+            let fp = fingerprint128_u64(0x4C41594F55544446u64, raw as u64, 4u64);
+            return EngineProviderOutput { value_tag: 4u32, is_error: false, fingerprint: fp };
+        }
+        let tgt = query_db_read_target_config_input(mut_view(eng.db), tl.unit_key);
+        let mut is_poisoned = false;
+        if tl.owner_def_id.v != 0u32 {
+            let sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, tl.owner_def_id);
+            let sig_memo = engine_invoke_query(mut_view(*eng), sig_key);
+            if sig_memo.value_is_error {
+                is_poisoned = true;
+            }
+        }
+        let mut total_size: u32 = if tl.is_pointer_sized { tgt.pointer_width_bytes } else { tl.base_size };
+        let mut max_align: u32 = if tl.is_pointer_sized { tgt.pointer_width_bytes } else { tl.base_align };
+        if max_align == 0u32 {
+            max_align = 1u32;
+        }
+        let mut fp = fingerprint128_combine(
+            tgt.content_hash,
+            fingerprint128_u64(0x4C41594F55545459u64, type_id.v as u64, ((total_size as u64) << 32) | (max_align as u64))
+        );
+
+        // Pointer/Box indirection fields (AXS-QRY-020 §1): add pointer width without querying layout_of by value
+        let mut ind_count: u32 = 0u32;
+        let mut ie: usize = 0;
+        while ie < (eng.indirection_edge_count as usize) {
+            let iedge = unsafe { *(eng.indirection_edges + ie) };
+            if iedge.owner_type.v == type_id.v {
+                total_size = total_size + tgt.pointer_width_bytes;
+                if tgt.pointer_width_bytes > max_align {
+                    max_align = tgt.pointer_width_bytes;
+                }
+                ind_count = ind_count + 1u32;
+                fp = fingerprint128_combine(
+                    fp,
+                    fingerprint128_u64(0x494E445F464C4400u64, iedge.target_type.v as u64, tgt.pointer_width_bytes as u64)
+                );
+            }
+            ie = ie + 1;
+        }
+
+        // Value-sized fields: query `layout_of(field_type)` on the active stack (AXS-QRY-020 §2)
+        let mut fi: u32 = 0u32;
+        while fi < (tl.field_count) {
+            let ftid = TypeId { v: tl.field_type_ids[fi as usize] };
+            let f_key = query_key_for_layout_of(view(eng.db), ftid);
+            let f_memo = engine_invoke_query(mut_view(*eng), f_key);
+            if f_memo.value_is_error {
+                is_poisoned = true;
+            } else {
+                total_size = total_size + f_memo.value_tag;
+            }
+            fp = fingerprint128_combine(fp, f_memo.value_fingerprint);
+            fi = fi + 1u32;
+        }
+
+        let slot_poisoned = unsafe { (*(eng.db.memo_slots + (slot_idx as usize))).was_poisoned };
+        if slot_poisoned {
+            is_poisoned = true;
+        }
+        let out_size = if is_poisoned { QRY_ID_ERROR } else { total_size };
+        if (type_id.v as usize) < QRY_MAX_TYPE_LAYOUTS {
+            unsafe {
+                *(eng.db.layout_results + (type_id.v as usize)) = LayoutOfResult {
+                    type_id: type_id,
+                    size_bytes: if is_poisoned { 0u32 } else { total_size },
+                    align_bytes: if is_poisoned { 1u32 } else { max_align },
+                    field_count: tl.field_count + ind_count,
+                    is_poisoned: is_poisoned,
+                    layout_fingerprint: fp,
+                };
+            }
+        }
+        return EngineProviderOutput { value_tag: out_size, is_error: is_poisoned, fingerprint: fp };
+    }
+
+    // QUERY_EFFECT_SUMMARY
+    let def_id = DefId { v: raw };
+    let sig_key = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, def_id);
+    let mir_key = query_key_for_def(view(eng.db), QUERY_MIR_BODY, def_id);
+    let sig_memo = engine_invoke_query(mut_view(*eng), sig_key);
+    let mir_memo = engine_invoke_query(mut_view(*eng), mir_key);
+    let is_err = sig_memo.value_is_error || mir_memo.value_is_error;
+    let fp = fingerprint128_combine(
+        sig_memo.value_fingerprint,
+        fingerprint128_combine(mir_memo.value_fingerprint, fingerprint128_u64(0x4546464543545F53u64, def_id.v as u64, 0u64))
+    );
+    if (def_id.v as usize) < QRY_MAX_DEFS {
+        unsafe {
+            *(eng.db.effect_results + (def_id.v as usize)) = EffectSummaryResult {
+                def_id: def_id,
+                effect_mask: 0u32,
+                is_pure: !is_err,
+                is_error: is_err,
+                effect_fingerprint: fp,
+            };
+        }
+    }
+    EngineProviderOutput { value_tag: if is_err { QRY_ID_ERROR } else { 1u32 }, is_error: is_err, fingerprint: fp }
+}
+
+// Shallow verification & firewall green-node reuse (AXS-QRY-033)
+fn engine_try_verify_green(eng: mut_view<QueryEngine>, slot_idx: u32) -> bool {
+    let saved_stack_len = eng.db.query_stack_len;
+    eng.db.query_stack_len = 0u32;
+
+    let slot = unsafe { *(eng.db.memo_slots + (slot_idx as usize)) };
+    let prev_verified = slot.verified_at;
+    let mut all_green = true;
+    let mut i: u32 = 0u32;
+    while i < (slot.deps_len) {
+        let dep_slot_idx = slot.deps[i as usize];
+        let dep_slot = unsafe { *(eng.db.memo_slots + (dep_slot_idx as usize)) };
+        if query_kind_is_input(dep_slot.key.kind) {
+            if revision_id_lt(prev_verified, dep_slot.changed_at) {
+                all_green = false;
+                break;
+            }
+        } else {
+            let verified_dep = engine_invoke_query(mut_view(*eng), dep_slot.key);
+            if revision_id_lt(prev_verified, verified_dep.changed_at) {
+                all_green = false;
+                break;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    eng.db.query_stack_len = saved_stack_len;
+    all_green
+}
+
+pub fn engine_invoke_query(eng: mut_view<QueryEngine>, key: QueryKey) -> MemoEntry {
+    let slot_idx = query_db_get_or_create_slot(mut_view(eng.db), key);
+    query_db_record_caller_callee(mut_view(eng.db), slot_idx);
+
+    let slot_ptr = unsafe { eng.db.memo_slots + (slot_idx as usize) };
+    let cur_state = unsafe { (*slot_ptr).state };
+    let r_curr = eng.db.current_revision;
+
+    // 1. Active-stack cycle detection (AXS-QRY-021..023)
+    if cur_state == QUERY_STATE_COMPUTING {
+        let frame_idx = unsafe { (*slot_ptr).computing_frame };
+        let recovery = engine_handle_active_cycle(mut_view(*eng), slot_idx, frame_idx);
+        query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+        return recovery;
+    }
+
+    // 2. Depth limit check for DepthLimited queries (AXS-QRY-021)
+    if query_kind_cycle_policy(key.kind) == CYCLE_POLICY_DEPTH_LIMITED && eng.db.query_stack_len >= eng.db.max_query_depth {
+        let dl_fp = fingerprint128_combine(
+            query_key_fingerprint(view(key)),
+            fingerprint128_u64(0x44455054484C494Du64, eng.db.max_query_depth as u64, key.kind as u64)
+        );
+        query_db_attach_diag(mut_view(eng.db), slot_idx, DIAG_AX_QUERY_DEPTH_LIMIT, key.semantic_key, eng.db.query_stack_len, dl_fp);
+        let one_step = CycleStepBuf { items: [key; 16] };
+        let _ = engine_record_cycle_trace(
+            mut_view(*eng),
+            slot_idx,
+            DIAG_AX_QUERY_DEPTH_LIMIT,
+            engine_recovery_kind_for_query(key.kind),
+            key,
+            view(one_step),
+            1u32,
+            dl_fp
+        );
+        engine_populate_poisoned_result_table(mut_view(*eng), key, dl_fp);
+        unsafe {
+            (*slot_ptr).state = QUERY_STATE_POISONED;
+            (*slot_ptr).was_poisoned = true;
+            (*slot_ptr).verified_at = r_curr;
+            (*slot_ptr).changed_at = r_curr;
+            (*slot_ptr).value_tag = QRY_ID_ERROR;
+            (*slot_ptr).value_is_error = true;
+            (*slot_ptr).value_fingerprint = dl_fp;
+        }
+        query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+        return unsafe { *slot_ptr };
+    }
+
+    // 3. Same-revision warm memo hit (AXS-QRY-012, AXS-QRY-030)
+    let cur_verified = unsafe { (*slot_ptr).verified_at };
+    if (cur_state == QUERY_STATE_READY || cur_state == QUERY_STATE_POISONED) && revision_id_eq(cur_verified, r_curr) {
+        unsafe {
+            (*slot_ptr).memo_hits = (*slot_ptr).memo_hits + 1u32;
+        }
+        eng.db.total_memo_hits = eng.db.total_memo_hits + 1u32;
+        query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+        engine_replay_slot_diagnostics(mut_view(*eng), slot_idx);
+        return unsafe { *slot_ptr };
+    }
+
+    // 4. Stale revision / MaybeDirty shallow verification (AXS-QRY-033)
+    let had_previous = cur_state == QUERY_STATE_MAYBE_DIRTY ||
+        ((cur_state == QUERY_STATE_READY || cur_state == QUERY_STATE_POISONED) && revision_id_lt(cur_verified, r_curr));
+    let old_fingerprint = unsafe { (*slot_ptr).value_fingerprint };
+    let old_changed_at = unsafe { (*slot_ptr).changed_at };
+    let old_was_poisoned = unsafe { (*slot_ptr).was_poisoned || cur_state == QUERY_STATE_POISONED };
+    let old_diag_count = unsafe { (*slot_ptr).diags_len };
+
+    // Untouched Poisoned slot outside the dirty cone of `r_curr` can be green-reused directly
+    if cur_state == QUERY_STATE_POISONED && revision_id_lt(cur_verified, r_curr) {
+        unsafe {
+            (*slot_ptr).verified_at = r_curr;
+            (*slot_ptr).memo_hits = (*slot_ptr).memo_hits + 1u32;
+            (*slot_ptr).green_reuses = (*slot_ptr).green_reuses + 1u32;
+        }
+        eng.db.total_memo_hits = eng.db.total_memo_hits + 1u32;
+        eng.db.total_green_reuses = eng.db.total_green_reuses + 1u32;
+        query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+        engine_replay_slot_diagnostics(mut_view(*eng), slot_idx);
+        return unsafe { *slot_ptr };
+    }
+
+    if had_previous && unsafe { (*slot_ptr).deps_len } > 0u32 && !old_was_poisoned {
+        if engine_try_verify_green(mut_view(*eng), slot_idx) {
+            unsafe {
+                (*slot_ptr).state = QUERY_STATE_READY;
+                (*slot_ptr).verified_at = r_curr;
+                (*slot_ptr).memo_hits = (*slot_ptr).memo_hits + 1u32;
+                (*slot_ptr).green_reuses = (*slot_ptr).green_reuses + 1u32;
+            }
+            eng.db.total_memo_hits = eng.db.total_memo_hits + 1u32;
+            eng.db.total_green_reuses = eng.db.total_green_reuses + 1u32;
+            query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+            engine_replay_slot_diagnostics(mut_view(*eng), slot_idx);
+            return unsafe { *slot_ptr };
+        }
+    }
+
+    // 5. Cold miss or dirty re-evaluation: push onto QueryStack and run pure provider (AXS-QRY-011..012)
+    let frame_idx = eng.db.query_stack_len;
+    unsafe {
+        (*slot_ptr).memo_misses = (*slot_ptr).memo_misses + 1u32;
+        (*slot_ptr).provider_runs = (*slot_ptr).provider_runs + 1u32;
+        (*slot_ptr).state = QUERY_STATE_COMPUTING;
+        (*slot_ptr).was_poisoned = false;
+        (*slot_ptr).computing_frame = frame_idx;
+        (*slot_ptr).owner_worker_id = 0u32;
+        (*slot_ptr).deps_len = 0u32;
+        (*slot_ptr).diags_len = 0u32;
+        *(eng.db.query_stack + (frame_idx as usize)) = QueryStackFrame {
+            slot_idx: slot_idx,
+            key: key,
+            depth: frame_idx,
+        };
+    }
+    eng.db.query_stack_len = frame_idx + 1u32;
+    eng.db.total_memo_misses = eng.db.total_memo_misses + 1u32;
+    eng.db.total_provider_runs = eng.db.total_provider_runs + 1u32;
+
+    let out = engine_execute_provider(mut_view(*eng), slot_idx, key);
+
+    eng.db.query_stack_len = frame_idx;
+    let cycle_poisoned = unsafe { (*slot_ptr).was_poisoned };
+    let final_is_error = out.is_error || cycle_poisoned;
+    let final_state = if cycle_poisoned { QUERY_STATE_POISONED } else { QUERY_STATE_READY };
+    let new_diag_count = unsafe { (*slot_ptr).diags_len };
+
+    // Backdating firewall check (AXS-QRY-033 §4)
+    let can_backdate = had_previous &&
+        fingerprint128_eq(out.fingerprint, old_fingerprint) &&
+        new_diag_count == old_diag_count &&
+        final_is_error == old_was_poisoned;
+    let final_changed_at = if can_backdate {
+        eng.backdated_verifications = eng.backdated_verifications + 1u32;
+        old_changed_at
+    } else {
+        r_curr
+    };
+
+    unsafe {
+        (*slot_ptr).state = final_state;
+        (*slot_ptr).was_poisoned = cycle_poisoned;
+        (*slot_ptr).verified_at = r_curr;
+        (*slot_ptr).changed_at = final_changed_at;
+        (*slot_ptr).value_tag = out.value_tag;
+        (*slot_ptr).value_is_error = final_is_error;
+        (*slot_ptr).value_fingerprint = out.fingerprint;
+    }
+
+    query_db_record_reverse_dependent(mut_view(eng.db), slot_idx);
+    unsafe { *slot_ptr }
+}
+
+// ============================================================================
+// 8. Typed Engine Query Invocations & Revision Invalidation APIs
+// ============================================================================
+
+pub fn engine_query_parse_module(eng: mut_view<QueryEngine>, module_id: ModuleId) -> ParseModuleResult {
+    let qk = query_key_for_module(view(eng.db), QUERY_PARSE_MODULE, module_id);
+    let _ = engine_invoke_query(mut_view(*eng), qk);
+    unsafe { *(eng.db.parse_results + (module_id.v as usize)) }
+}
+
+pub fn engine_query_module_def_map(eng: mut_view<QueryEngine>, module_id: ModuleId) -> ModuleDefMapResult {
+    let qk = query_key_for_module(view(eng.db), QUERY_MODULE_DEF_MAP, module_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return ModuleDefMapResult {
+            module_id: module_id,
+            exported_count: 0u32,
+            total_defs: QRY_ID_ERROR,
+            is_error: true,
+            def_map_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.def_map_results + (module_id.v as usize)) }
+}
+
+pub fn engine_query_resolve_module(eng: mut_view<QueryEngine>, module_id: ModuleId) -> ResolveModuleResult {
+    let qk = query_key_for_module(view(eng.db), QUERY_RESOLVE_MODULE, module_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return ResolveModuleResult {
+            module_id: module_id,
+            resolved_bindings: 0u32,
+            has_resolve_error: true,
+            resolve_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.resolve_results + (module_id.v as usize)) }
+}
+
+pub fn engine_query_item_signature(eng: mut_view<QueryEngine>, def_id: DefId) -> ItemSignatureResult {
+    let qk = query_key_for_def(view(eng.db), QUERY_ITEM_SIGNATURE, def_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return ItemSignatureResult {
+            def_id: def_id,
+            param_count: 0u32,
+            return_type: TypeId { v: QRY_ID_ERROR },
+            is_error: true,
+            interface_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.sig_results + (def_id.v as usize)) }
+}
+
+pub fn engine_query_typeck_body(eng: mut_view<QueryEngine>, def_id: DefId) -> TypeckBodyResult {
+    let qk = query_key_for_def(view(eng.db), QUERY_TYPECK_BODY, def_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return TypeckBodyResult {
+            def_id: def_id,
+            checked_expr_count: 0u32,
+            callee_sig_count: 0u32,
+            inferred_return_type: TypeId { v: QRY_ID_ERROR },
+            is_error: true,
+            body_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.typeck_results + (def_id.v as usize)) }
+}
+
+pub fn engine_query_trait_solve(eng: mut_view<QueryEngine>, goal_key: TraitGoalKey) -> TraitSolveResult {
+    let qk = query_key_for_trait_goal(view(eng.db), goal_key);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return TraitSolveResult {
+            goal_key: goal_key,
+            status: TRAIT_RESULT_ERROR,
+            impl_def_id: DefId { v: QRY_ID_ERROR },
+            is_error: true,
+            goal_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.trait_results + (goal_key.v as usize)) }
+}
+
+pub fn engine_query_const_eval(eng: mut_view<QueryEngine>, const_key: ConstEvalKey) -> ConstEvalResult {
+    let qk = query_key_for_const_eval(view(eng.db), const_key);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return ConstEvalResult {
+            const_key: const_key,
+            int_val: 0i64,
+            is_poisoned: true,
+            const_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.const_results + (const_key.v as usize)) }
+}
+
+pub fn engine_query_mir_body(eng: mut_view<QueryEngine>, def_id: DefId) -> MirBodyResult {
+    let qk = query_key_for_def(view(eng.db), QUERY_MIR_BODY, def_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return MirBodyResult {
+            def_id: def_id,
+            mir_body_id: MirBodyId { v: QRY_ID_ERROR },
+            block_count: 0u32,
+            local_count: 0u32,
+            ownership_verified: false,
+            is_error: true,
+            mir_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.mir_results + (def_id.v as usize)) }
+}
+
+pub fn engine_query_layout_of(eng: mut_view<QueryEngine>, type_id: TypeId) -> LayoutOfResult {
+    let qk = query_key_for_layout_of(view(eng.db), type_id);
+    let memo = engine_invoke_query(mut_view(*eng), qk);
+    if memo.state == QUERY_STATE_POISONED {
+        return LayoutOfResult {
+            type_id: type_id,
+            size_bytes: 0u32,
+            align_bytes: 1u32,
+            field_count: 0u32,
+            is_poisoned: true,
+            layout_fingerprint: memo.value_fingerprint,
+        };
+    }
+    unsafe { *(eng.db.layout_results + (type_id.v as usize)) }
+}
+
+pub fn engine_query_effect_summary(eng: mut_view<QueryEngine>, def_id: DefId) -> EffectSummaryResult {
+    let qk = query_key_for_def(view(eng.db), QUERY_EFFECT_SUMMARY, def_id);
+    let _ = engine_invoke_query(mut_view(*eng), qk);
+    unsafe { *(eng.db.effect_results + (def_id.v as usize)) }
+}
+
+fn engine_count_maybe_dirty_slots(db: view<CompilerDB>) -> u32 {
+    let mut dirty: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < (db.memo_slot_count) {
+        let slot = unsafe { *(db.memo_slots + (i as usize)) };
+        if slot.state == QUERY_STATE_MAYBE_DIRTY {
+            dirty = dirty + 1u32;
+        }
+        i = i + 1u32;
+    }
+    dirty
+}
+
+// Mutates `source_file_input` and records transitive dirty invalidation telemetry (AXS-QRY-032)
+pub fn engine_set_source_file_input(
+    eng: mut_view<QueryEngine>,
+    id: SourceFileId,
+    path: StrView,
+    text: StrView,
+    durability: u8
+) -> RevisionId {
+    let dirty_before = engine_count_maybe_dirty_slots(view(eng.db));
+    let rev = query_db_set_source_file_input(mut_view(eng.db), id, path, text, durability);
+    let dirty_after = engine_count_maybe_dirty_slots(view(eng.db));
+    if dirty_after > dirty_before {
+        eng.invalidation_waves = eng.invalidation_waves + 1u32;
+        eng.total_slots_dirtied = eng.total_slots_dirtied + (dirty_after - dirty_before);
+    }
+    engine_reset_active_diagnostics(mut_view(*eng));
+    rev
+}
+
+pub fn engine_set_module_tree_input(
+    eng: mut_view<QueryEngine>,
+    id: ModuleId,
+    package_id: PackageId,
+    parent_id: ModuleId,
+    module_path: StrView,
+    source_file_id: SourceFileId,
+    durability: u8
+) -> RevisionId {
+    let dirty_before = engine_count_maybe_dirty_slots(view(eng.db));
+    let rev = query_db_set_module_tree_input(mut_view(eng.db), id, package_id, parent_id, module_path, source_file_id, durability);
+    let dirty_after = engine_count_maybe_dirty_slots(view(eng.db));
+    if dirty_after > dirty_before {
+        eng.invalidation_waves = eng.invalidation_waves + 1u32;
+        eng.total_slots_dirtied = eng.total_slots_dirtied + (dirty_after - dirty_before);
+    }
+    engine_reset_active_diagnostics(mut_view(*eng));
+    rev
+}
+
+pub fn engine_set_target_config_input(
+    eng: mut_view<QueryEngine>,
+    key: UnitKey,
+    target_triple: StrView,
+    abi_profile: StrView,
+    feature_flags: u32,
+    edition: u32,
+    opt_level: u8,
+    pointer_width_bytes: u32
+) -> RevisionId {
+    let dirty_before = engine_count_maybe_dirty_slots(view(eng.db));
+    let rev = query_db_set_target_config_input(
+        mut_view(eng.db),
+        key,
+        target_triple,
+        abi_profile,
+        feature_flags,
+        edition,
+        opt_level,
+        pointer_width_bytes
+    );
+    let dirty_after = engine_count_maybe_dirty_slots(view(eng.db));
+    if dirty_after > dirty_before {
+        eng.invalidation_waves = eng.invalidation_waves + 1u32;
+        eng.total_slots_dirtied = eng.total_slots_dirtied + (dirty_after - dirty_before);
+    }
+    engine_reset_active_diagnostics(mut_view(*eng));
+    rev
+}
+
+pub fn engine_set_package_graph_input(
+    eng: mut_view<QueryEngine>,
+    id: PackageId,
+    package_name: StrView,
+    edition: u32,
+    capability_ceiling: u32,
+    direct_deps_mask: u64
+) -> RevisionId {
+    let dirty_before = engine_count_maybe_dirty_slots(view(eng.db));
+    let rev = query_db_set_package_graph_input(mut_view(eng.db), id, package_name, edition, capability_ceiling, direct_deps_mask);
+    let dirty_after = engine_count_maybe_dirty_slots(view(eng.db));
+    if dirty_after > dirty_before {
+        eng.invalidation_waves = eng.invalidation_waves + 1u32;
+        eng.total_slots_dirtied = eng.total_slots_dirtied + (dirty_after - dirty_before);
+    }
+    engine_reset_active_diagnostics(mut_view(*eng));
+    rev
+}
+
+// ============================================================================
+// 9. Snapshot-Bound Diagnostic Capture & Equivalence Comparison (AXS-QRY-030)
+// ============================================================================
+
+pub fn engine_capture_snapshot_diags(eng: mut_view<QueryEngine>) -> SnapshotDiagSummary {
+    let snap_id = snapshot_id_new(eng.db.session_id, eng.db.current_revision);
+    let mut fp = fingerprint128_u64(
+        0x534E41505F444947u64,
+        eng.db.emitted_diag_count as u64,
+        eng.emitted_cycle_count as u64
+    );
+
+    // Sort emitted diagnostic fingerprints in canonical order by `(code, primary_key)`
+    // so cold and warm diagnostic sets are compared deterministically.
+    let d_count = eng.db.emitted_diag_count as usize;
+    let mut sorted_diags: [128]u32 = [0u32; 128];
+    let mut i: usize = 0;
+    while i < d_count {
+        sorted_diags[i] = unsafe { *(eng.db.emitted_diag_indices + i) };
+        i = i + 1;
+    }
+    let mut a: usize = 1;
+    while a < d_count {
+        let cur_idx = sorted_diags[a];
+        let cur_dg = unsafe { *(eng.db.all_diags + (cur_idx as usize)) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted_diags[b - 1];
+            let prev_dg = unsafe { *(eng.db.all_diags + (prev_idx as usize)) };
+            let cmp_k = semantic_key_cmp(view(prev_dg.primary_key), view(cur_dg.primary_key));
+            let le = if cmp_k < 0i32 {
+                true
+            } else if cmp_k > 0i32 {
+                false
+            } else {
+                prev_dg.code <= cur_dg.code
+            };
+            if le {
+                break;
+            }
+            sorted_diags[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted_diags[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut j: usize = 0;
+    while j < d_count {
+        let dg = unsafe { *(eng.db.all_diags + (sorted_diags[j] as usize)) };
+        fp = fingerprint128_combine(fp, dg.fingerprint);
+        j = j + 1;
+    }
+
+    let summary = SnapshotDiagSummary {
+        snapshot_id: snap_id,
+        revision: eng.db.current_revision,
+        diag_count: eng.db.emitted_diag_count,
+        cycle_count: eng.emitted_cycle_count,
+        suppressed_cascades: eng.suppressed_cascades,
+        warm_replays: eng.warm_diag_replays,
+        combined_fingerprint: fp,
+    };
+    if (eng.snapshot_log_count as usize) < ENG_MAX_SNAPSHOT_LOGS {
+        let log_idx = eng.snapshot_log_count as usize;
+        eng.snapshot_log_count = eng.snapshot_log_count + 1u32;
+        unsafe { *(eng.snapshot_logs + log_idx) = summary; }
+    }
+    summary
+}
+
+pub fn engine_snapshot_diags_equivalent(a: view<SnapshotDiagSummary>, b: view<SnapshotDiagSummary>) -> bool {
+    a.diag_count == b.diag_count &&
+        a.cycle_count == b.cycle_count &&
+        fingerprint128_eq(a.combined_fingerprint, b.combined_fingerprint)
+}
+
+pub fn engine_get_tarjan_scc(eng: view<QueryEngine>, idx: u32) -> TarjanSccRecord {
+    unsafe { *(eng.tarjan_sccs + (idx as usize)) }
+}
+
+pub fn engine_count_emitted_diag_code(eng: view<QueryEngine>, code: u32) -> u32 {
+    let mut matches: u32 = 0u32;
+    let mut i: usize = 0;
+    while i < (eng.db.emitted_diag_count as usize) {
+        let d_idx = unsafe { *(eng.db.emitted_diag_indices + i) };
+        let dg = unsafe { *(eng.db.all_diags + (d_idx as usize)) };
+        if dg.code == code {
+            matches = matches + 1u32;
+        }
+        i = i + 1;
+    }
+    matches
+}
+
+// ============================================================================
+// 10. Deterministic Cycle Trace, Diagnostic & Summary Formatters
+// ============================================================================
+
+// Byte table for deterministic ASCII labels without assembly label collisions:
+//   0..6:   "cycle[" (6)
+//   6..12:  "] rev=R" (7 -> indices 6..13)
+//  13..20:  " steps=" (7)
+//  20..22:  ": " (2)
+//  22..26:  " -> " (4)
+//  26..31:  "diag[" (5)
+//  31..41:  "] primary=" (10)
+//  41..52:  " trace_len=" (11)
+//  52..56:  "scc[" (4)
+//  56..66:  "] members=" (10)
+//  66..72:  " head=" (6)
+//  72..92:  "engine_summary rev=R" (20)
+//  92..98:  " hits=" (6)
+//  98..106: " misses=" (8)
+// 106..113: " green=" (7)
+// 113..121: " cycles=" (8)
+// 121..133: " suppressed=" (12)
+// 133..142: " replays=" (9)
+// 142..151: " dirtied=" (9)
+const ENG_FMT_BYTES: [151]u8 = [
+    99u8, 121u8, 99u8, 108u8, 101u8, 91u8,
+    93u8, 32u8, 114u8, 101u8, 118u8, 61u8, 82u8,
+    32u8, 115u8, 116u8, 101u8, 112u8, 115u8, 61u8,
+    58u8, 32u8,
+    32u8, 45u8, 62u8, 32u8,
+    100u8, 105u8, 97u8, 103u8, 91u8,
+    93u8, 32u8, 112u8, 114u8, 105u8, 109u8, 97u8, 114u8, 121u8, 61u8,
+    32u8, 116u8, 114u8, 97u8, 99u8, 101u8, 95u8, 108u8, 101u8, 110u8, 61u8,
+    115u8, 99u8, 99u8, 91u8,
+    93u8, 32u8, 109u8, 101u8, 109u8, 98u8, 101u8, 114u8, 115u8, 61u8,
+    32u8, 104u8, 101u8, 97u8, 100u8, 61u8,
+    101u8, 110u8, 103u8, 105u8, 110u8, 101u8, 95u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 114u8, 101u8, 118u8, 61u8, 82u8,
+    32u8, 104u8, 105u8, 116u8, 115u8, 61u8,
+    32u8, 109u8, 105u8, 115u8, 115u8, 101u8, 115u8, 61u8,
+    32u8, 103u8, 114u8, 101u8, 101u8, 110u8, 61u8,
+    32u8, 99u8, 121u8, 99u8, 108u8, 101u8, 115u8, 61u8,
+    32u8, 115u8, 117u8, 112u8, 112u8, 114u8, 101u8, 115u8, 115u8, 101u8, 100u8, 61u8,
+    32u8, 114u8, 101u8, 112u8, 108u8, 97u8, 121u8, 115u8, 61u8,
+    32u8, 100u8, 105u8, 114u8, 116u8, 105u8, 101u8, 100u8, 61u8
+];
+
+fn eng_buf_push_slice(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), ENG_FMT_BYTES[start + i]);
+        i = i + 1;
+    }
+}
+
+// Emits active session cycle traces sorted lexicographically by `canonical_head`:
+// `cycle[<CODE>] rev=R<rev> steps=<m>: <Q_0> -> <Q_1> -> ... -> <Q_0>\n`
+pub fn engine_emit_cycle_traces(eng: view<QueryEngine>, out: mut_view<DiagBuffer>) {
+    let c_count = eng.emitted_cycle_count as usize;
+    let mut sorted: [64]u32 = [0u32; 64];
+    let mut i: usize = 0;
+    while i < c_count {
+        sorted[i] = unsafe { *(eng.emitted_cycle_indices + i) };
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < c_count {
+        let cur_idx = sorted[a];
+        let cur_rec = unsafe { *(eng.cycles + (cur_idx as usize)) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted[b - 1];
+            let prev_rec = unsafe { *(eng.cycles + (prev_idx as usize)) };
+            if query_key_cmp(view(prev_rec.canonical_head), view(cur_rec.canonical_head)) <= 0i32 {
+                break;
+            }
+            sorted[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut idx: usize = 0;
+    while idx < c_count {
+        let rec = unsafe { *(eng.cycles + (sorted[idx] as usize)) };
+        eng_buf_push_slice(mut_view(*out), 0, 6); // "cycle["
+        query_db_push_diag_code_name(mut_view(*out), rec.diag_code);
+        eng_buf_push_slice(mut_view(*out), 6, 7); // "] rev=R"
+        diag_buf_push_u32(mut_view(*out), rec.revision.raw as u32);
+        eng_buf_push_slice(mut_view(*out), 13, 7); // " steps="
+        diag_buf_push_u32(mut_view(*out), rec.step_count);
+        eng_buf_push_slice(mut_view(*out), 20, 2); // ": "
+
+        let mut s: u32 = 0u32;
+        while s < (rec.step_count) {
+            if s > 0u32 {
+                eng_buf_push_slice(mut_view(*out), 22, 4); // " -> "
+            }
+            query_db_push_query_key(mut_view(*out), view(rec.steps[s as usize]));
+            s = s + 1u32;
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        idx = idx + 1;
+    }
+}
+
+// Emits active session diagnostics sorted deterministically by `(primary_key, code)`:
+// `diag[<CODE>] primary=<SemanticKey> rev=R<rev> trace_len=<n>\n`
+pub fn engine_emit_diagnostics(eng: view<QueryEngine>, out: mut_view<DiagBuffer>) {
+    let d_count = eng.db.emitted_diag_count as usize;
+    let mut sorted: [128]u32 = [0u32; 128];
+    let mut i: usize = 0;
+    while i < d_count {
+        sorted[i] = unsafe { *(eng.db.emitted_diag_indices + i) };
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < d_count {
+        let cur_idx = sorted[a];
+        let cur_dg = unsafe { *(eng.db.all_diags + (cur_idx as usize)) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted[b - 1];
+            let prev_dg = unsafe { *(eng.db.all_diags + (prev_idx as usize)) };
+            let cmp_k = semantic_key_cmp(view(prev_dg.primary_key), view(cur_dg.primary_key));
+            let le = if cmp_k < 0i32 {
+                true
+            } else if cmp_k > 0i32 {
+                false
+            } else {
+                prev_dg.code <= cur_dg.code
+            };
+            if le {
+                break;
+            }
+            sorted[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut idx: usize = 0;
+    while idx < d_count {
+        let dg = unsafe { *(eng.db.all_diags + (sorted[idx] as usize)) };
+        eng_buf_push_slice(mut_view(*out), 26, 5); // "diag["
+        query_db_push_diag_code_name(mut_view(*out), dg.code);
+        eng_buf_push_slice(mut_view(*out), 31, 10); // "] primary="
+        query_db_push_semantic_key(mut_view(*out), view(dg.primary_key));
+        eng_buf_push_slice(mut_view(*out), 7, 6); // " rev=R"
+        diag_buf_push_u32(mut_view(*out), dg.snapshot_id.revision.raw as u32);
+        eng_buf_push_slice(mut_view(*out), 41, 11); // " trace_len="
+        diag_buf_push_u32(mut_view(*out), dg.trace_len);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        idx = idx + 1;
+    }
+}
+
+// Emits discovered Tarjan cyclic SCCs in canonical order:
+// `scc[<CODE>] members=<m> head=<QueryKey>\n`
+pub fn engine_emit_tarjan_sccs(eng: view<QueryEngine>, out: mut_view<DiagBuffer>) {
+    let mut i: u32 = 0u32;
+    while i < (eng.tarjan_scc_count) {
+        let scc = unsafe { *(eng.tarjan_sccs + (i as usize)) };
+        eng_buf_push_slice(mut_view(*out), 52, 4); // "scc["
+        query_db_push_diag_code_name(mut_view(*out), scc.diag_code);
+        eng_buf_push_slice(mut_view(*out), 56, 10); // "] members="
+        diag_buf_push_u32(mut_view(*out), scc.member_count);
+        eng_buf_push_slice(mut_view(*out), 66, 6); // " head="
+        query_db_push_query_key(mut_view(*out), view(scc.canonical_head));
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1u32;
+    }
+}
+
+// Emits deterministic single-line engine telemetry summary:
+// `engine_summary rev=R<rev> hits=<h> misses=<m> green=<g> cycles=<c> suppressed=<s> replays=<r> dirtied=<d>\n`
+pub fn engine_emit_summary(eng: view<QueryEngine>, out: mut_view<DiagBuffer>) {
+    eng_buf_push_slice(mut_view(*out), 72, 20); // "engine_summary rev=R"
+    diag_buf_push_u32(mut_view(*out), eng.db.current_revision.raw as u32);
+    eng_buf_push_slice(mut_view(*out), 92, 6); // " hits="
+    diag_buf_push_u32(mut_view(*out), eng.db.total_memo_hits);
+    eng_buf_push_slice(mut_view(*out), 98, 8); // " misses="
+    diag_buf_push_u32(mut_view(*out), eng.db.total_memo_misses);
+    eng_buf_push_slice(mut_view(*out), 106, 7); // " green="
+    diag_buf_push_u32(mut_view(*out), eng.db.total_green_reuses);
+    eng_buf_push_slice(mut_view(*out), 113, 8); // " cycles="
+    diag_buf_push_u32(mut_view(*out), eng.db.total_cycles_detected);
+    eng_buf_push_slice(mut_view(*out), 121, 12); // " suppressed="
+    diag_buf_push_u32(mut_view(*out), eng.suppressed_cascades);
+    eng_buf_push_slice(mut_view(*out), 133, 9); // " replays="
+    diag_buf_push_u32(mut_view(*out), eng.warm_diag_replays);
+    eng_buf_push_slice(mut_view(*out), 142, 9); // " dirtied="
+    diag_buf_push_u32(mut_view(*out), eng.total_slots_dirtied);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}

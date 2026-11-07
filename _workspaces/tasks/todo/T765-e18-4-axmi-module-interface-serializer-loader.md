@@ -6,7 +6,7 @@ owner: axiom-semantics
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T764, T754]
+depends: [T764, T753]
 priority: 715
 status: todo
 attempts: 0
