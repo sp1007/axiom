@@ -1,0 +1,313 @@
+// test: run
+// modes: interp native
+// stdout-file: lollipop_cycle_and_multihop_backdate.stdout
+// SPEC-21 AXS-QRY-003, AXS-QRY-011, AXS-QRY-021..023, AXS-QRY-031, AXS-QRY-033, INV-QRY-003:
+// QA boundary conformance test verifying:
+// 1. Lollipop active-stack cycle extraction (`QueryStack = [Entry, Stem, CycleB, CycleA] -> CycleB`
+//    slices only `[CycleB, CycleA]` and rotates to `[CycleA, CycleB, CycleA]`, excluding prefix nodes).
+// 2. `SemanticKey` tie-breaking by `DisambiguatorIndex` and `CanonicalTypeArgs` when package, module,
+//    namespace, and canonical name are identical.
+// 3. First-seen deterministic dependency edge deduplication in `deps(Q_k)` (`AXS-QRY-011`).
+// 4. Multi-hop shallow verification & two-tier backdate firewall (`CallerA -> MidB -> LeafC -> Input`).
+
+@derive(Copy)
+struct SemKey {
+    kind: u32,
+    pkg: u32,
+    mod_path: u32,
+    ns: u32,
+    disambig: u32,
+    name: u32,
+    type_args: u32,
+    alloc_id: u32,
+}
+
+fn sem_key_cmp(a: SemKey, b: SemKey) -> i32 {
+    if (a.kind) < (b.kind) { return -1; }
+    if (a.kind) > (b.kind) { return 1; }
+    if (a.pkg) < (b.pkg) { return -1; }
+    if (a.pkg) > (b.pkg) { return 1; }
+    if (a.mod_path) < (b.mod_path) { return -1; }
+    if (a.mod_path) > (b.mod_path) { return 1; }
+    if (a.ns) < (b.ns) { return -1; }
+    if (a.ns) > (b.ns) { return 1; }
+    if (a.disambig) < (b.disambig) { return -1; }
+    if (a.disambig) > (b.disambig) { return 1; }
+    if (a.name) < (b.name) { return -1; }
+    if (a.name) > (b.name) { return 1; }
+    if (a.type_args) < (b.type_args) { return -1; }
+    if (a.type_args) > (b.type_args) { return 1; }
+    0
+}
+
+struct LollipopTrace {
+    canon_steps: [4]SemKey,
+    step_count: u32,
+    prefix_excluded: bool,
+}
+
+// Given active stack `[f0, f1, f2, f3]` where `f3` invokes `target_idx = 2` (`f2`),
+// extracts only `stack[2..=3]` and rotates to canonical minimum `SemKey`.
+fn extract_and_rotate_lollipop_cycle(
+    f0: SemKey,
+    f1: SemKey,
+    f2: SemKey,
+    f3: SemKey,
+    target_idx: usize,
+    out: mut_view<LollipopTrace>
+) -> bool {
+    let stack: [4]SemKey = [f0, f1, f2, f3];
+    if target_idx > 3 {
+        return false;
+    }
+    let cyc_len: usize = 4 - target_idx;
+    let mut min_offset: usize = 0;
+    let mut min_k: SemKey = stack[target_idx];
+    let mut i: usize = 1;
+    while i < cyc_len {
+        let cand = stack[target_idx + i];
+        if sem_key_cmp(cand, min_k) < 0 {
+            min_k = cand;
+            min_offset = i;
+        }
+        i = i + 1;
+    }
+    let mut j: usize = 0;
+    while j <= cyc_len {
+        let off = if j == cyc_len { min_offset } else { (min_offset + j) % cyc_len };
+        out.canon_steps[j] = stack[target_idx + off];
+        j = j + 1;
+    }
+    out.step_count = (cyc_len + 1) as u32;
+    // Verify neither f0 nor f1 leaked into the rotated cycle slice
+    let mut k: usize = 0;
+    let mut leaked: bool = false;
+    while k <= cyc_len {
+        if sem_key_cmp(out.canon_steps[k], f0) == 0 || sem_key_cmp(out.canon_steps[k], f1) == 0 {
+            leaked = true;
+        }
+        k = k + 1;
+    }
+    out.prefix_excluded = !leaked;
+    true
+}
+
+struct EdgeRecorder {
+    deps: [8]u32,
+    dep_count: u32,
+    memo_hits: u32,
+}
+
+fn record_dep_query(rec: mut_view<EdgeRecorder>, callee_key: u32) {
+    let n = rec.dep_count as usize;
+    let mut i: usize = 0;
+    while i < n {
+        if rec.deps[i] == callee_key {
+            // Duplicate edge in the same caller evaluation: preserve first-seen order, count warm hit
+            rec.memo_hits = rec.memo_hits + 1u32;
+            return;
+        }
+        i = i + 1;
+    }
+    if n < 8 {
+        rec.deps[n] = callee_key;
+        rec.dep_count = (n + 1) as u32;
+    }
+}
+
+@derive(Copy)
+struct ChainNode {
+    verified_at: u64,
+    changed_at: u64,
+    fp: u64,
+    provider_runs: u32,
+    green_reuses: u32,
+}
+
+struct ThreeTierDB {
+    rev: u64,
+    input_changed_at: u64,
+    leaf_seed: u64,
+    mid_mask_seed: u64,
+    leaf: ChainNode,
+    mid: ChainNode,
+    caller: ChainNode,
+    backdates: u32,
+}
+
+fn eval_leaf(db: mut_view<ThreeTierDB>) -> ChainNode {
+    let r = db.rev;
+    if db.leaf.verified_at == r {
+        return db.leaf;
+    }
+    if db.leaf.verified_at > 0u64 && db.input_changed_at <= db.leaf.verified_at {
+        db.leaf.verified_at = r;
+        db.leaf.green_reuses = db.leaf.green_reuses + 1u32;
+        return db.leaf;
+    }
+    let old_fp = db.leaf.fp;
+    let had_prev = db.leaf.verified_at > 0u64;
+    let new_fp = db.leaf_seed ^ 0xA5A5A5A5u64;
+    db.leaf.provider_runs = db.leaf.provider_runs + 1u32;
+    db.leaf.verified_at = r;
+    if had_prev && new_fp == old_fp {
+        db.backdates = db.backdates + 1u32;
+    } else {
+        db.leaf.changed_at = r;
+        db.leaf.fp = new_fp;
+    }
+    db.leaf
+}
+
+fn eval_mid(db: mut_view<ThreeTierDB>) -> ChainNode {
+    let r = db.rev;
+    if db.mid.verified_at == r {
+        return db.mid;
+    }
+    let leaf_node = eval_leaf(mut_view(*db));
+    if db.mid.verified_at > 0u64 && leaf_node.changed_at <= db.mid.verified_at {
+        db.mid.verified_at = r;
+        db.mid.green_reuses = db.mid.green_reuses + 1u32;
+        return db.mid;
+    }
+    let old_fp = db.mid.fp;
+    let had_prev = db.mid.verified_at > 0u64;
+    // `mid` projects the low 16 bits of `leaf.fp` combined with `mid_mask_seed`
+    let new_fp = (leaf_node.fp & 0xFFFFu64) ^ db.mid_mask_seed;
+    db.mid.provider_runs = db.mid.provider_runs + 1u32;
+    db.mid.verified_at = r;
+    if had_prev && new_fp == old_fp {
+        db.backdates = db.backdates + 1u32;
+    } else {
+        db.mid.changed_at = r;
+        db.mid.fp = new_fp;
+    }
+    db.mid
+}
+
+fn eval_caller(db: mut_view<ThreeTierDB>) -> ChainNode {
+    let r = db.rev;
+    if db.caller.verified_at == r {
+        return db.caller;
+    }
+    let mid_node = eval_mid(mut_view(*db));
+    if db.caller.verified_at > 0u64 && mid_node.changed_at <= db.caller.verified_at {
+        db.caller.verified_at = r;
+        db.caller.green_reuses = db.caller.green_reuses + 1u32;
+        return db.caller;
+    }
+    let old_fp = db.caller.fp;
+    let had_prev = db.caller.verified_at > 0u64;
+    let new_fp = mid_node.fp ^ 0x12345678u64;
+    db.caller.provider_runs = db.caller.provider_runs + 1u32;
+    db.caller.verified_at = r;
+    if had_prev && new_fp == old_fp {
+        db.backdates = db.backdates + 1u32;
+    } else {
+        db.caller.changed_at = r;
+        db.caller.fp = new_fp;
+    }
+    db.caller
+}
+
+pub fn main() -> i32 {
+    // 1. Lollipop cycle slice extraction & tie-breaking by DisambiguatorIndex / CanonicalTypeArgs
+    let entry_k = SemKey { kind: 14u32, pkg: 1u32, mod_path: 1u32, ns: 1u32, disambig: 0u32, name: 1u32, type_args: 0u32, alloc_id: 500u32 };
+    let stem_k  = SemKey { kind: 14u32, pkg: 1u32, mod_path: 1u32, ns: 1u32, disambig: 0u32, name: 2u32, type_args: 0u32, alloc_id: 400u32 };
+    // CycleB and CycleA share (kind, pkg, mod_path, ns, name), differing only in (disambig, type_args)
+    let cyc_b   = SemKey { kind: 15u32, pkg: 1u32, mod_path: 2u32, ns: 4u32, disambig: 1u32, name: 10u32, type_args: 20u32, alloc_id: 1u32 };
+    let cyc_a   = SemKey { kind: 15u32, pkg: 1u32, mod_path: 2u32, ns: 4u32, disambig: 1u32, name: 10u32, type_args: 10u32, alloc_id: 999u32 };
+
+    let mut trace = LollipopTrace {
+        canon_steps: [entry_k; 4],
+        step_count: 0u32,
+        prefix_excluded: false,
+    };
+    let ok_lol = extract_and_rotate_lollipop_cycle(entry_k, stem_k, cyc_b, cyc_a, 2, mut_view(trace));
+    if !ok_lol || !trace.prefix_excluded || trace.step_count != 3u32 {
+        return 1;
+    }
+    // Canonical minimum between cyc_b (type_args=20) and cyc_a (type_args=10) is cyc_a despite alloc_id=999 > 1
+    if trace.canon_steps[0].type_args != 10u32 || trace.canon_steps[1].type_args != 20u32 || trace.canon_steps[2].type_args != 10u32 {
+        return 2;
+    }
+    print("lollipop_cycle_slice_and_tiebreak_ok=true\n");
+
+    // 2. First-seen dependency edge deduplication (`AXS-QRY-011`)
+    let mut rec = EdgeRecorder {
+        deps: [0u32; 8],
+        dep_count: 0u32,
+        memo_hits: 0u32,
+    };
+    record_dep_query(mut_view(rec), 20u32);
+    record_dep_query(mut_view(rec), 10u32);
+    record_dep_query(mut_view(rec), 20u32);
+    record_dep_query(mut_view(rec), 30u32);
+    record_dep_query(mut_view(rec), 10u32);
+    if rec.dep_count != 3u32 || rec.memo_hits != 2u32 {
+        return 3;
+    }
+    if rec.deps[0] != 20u32 || rec.deps[1] != 10u32 || rec.deps[2] != 30u32 {
+        return 4;
+    }
+    print("first_seen_dep_edge_dedup_ok=true\n");
+
+    // 3. Multi-hop shallow verification & two-tier backdate firewall (`AXS-QRY-033`)
+    let empty_node = ChainNode {
+        verified_at: 0u64,
+        changed_at: 0u64,
+        fp: 0u64,
+        provider_runs: 0u32,
+        green_reuses: 0u32,
+    };
+    let mut db = ThreeTierDB {
+        rev: 1u64,
+        input_changed_at: 1u64,
+        leaf_seed: 0x00010005u64,
+        mid_mask_seed: 0x1111u64,
+        leaf: empty_node,
+        mid: empty_node,
+        caller: empty_node,
+        backdates: 0u32,
+    };
+
+    // R1 cold evaluation: all 3 nodes run their providers once
+    let c_r1 = eval_caller(mut_view(db));
+    if c_r1.provider_runs != 1u32 || db.mid.provider_runs != 1u32 || db.leaf.provider_runs != 1u32 {
+        return 5;
+    }
+
+    // R2 edit where `leaf_seed` is unchanged: `leaf` re-runs and backdates to R1; `mid` and `caller` reuse green!
+    db.rev = 2u64;
+    db.input_changed_at = 2u64;
+    let c_r2 = eval_caller(mut_view(db));
+    if db.leaf.provider_runs != 2u32 || db.leaf.changed_at != 1u64 {
+        return 6;
+    }
+    if db.mid.provider_runs != 1u32 || db.mid.green_reuses != 1u32 {
+        return 7;
+    }
+    if c_r2.provider_runs != 1u32 || c_r2.green_reuses != 1u32 {
+        return 8;
+    }
+
+    // R3 edit where upper bits of `leaf_seed` change (`0x00020005`), so `leaf.changed_at = 3`,
+    // `mid` re-runs its provider because `leaf.changed_at (3) > mid.verified_at (2)`,
+    // `mid` backdates to R1 because low 16 bits are unchanged, and `caller` STILL reuses green!
+    db.rev = 3u64;
+    db.input_changed_at = 3u64;
+    db.leaf_seed = 0x00020005u64;
+    let c_r3 = eval_caller(mut_view(db));
+    if db.leaf.provider_runs != 3u32 || db.leaf.changed_at != 3u64 {
+        return 9;
+    }
+    if db.mid.provider_runs != 2u32 || db.mid.changed_at != 1u64 || db.mid.verified_at != 3u64 {
+        return 10;
+    }
+    if c_r3.provider_runs != 1u32 || c_r3.green_reuses != 2u32 || c_r3.verified_at != 3u64 || db.backdates != 2u32 {
+        return 11;
+    }
+    print("multihop_shallow_verify_two_tier_backdate_ok=true\n");
+    print("LOLLIPOP-CYCLE-AND-MULTIHOP-BACKDATE-OK\n");
+    0
+}

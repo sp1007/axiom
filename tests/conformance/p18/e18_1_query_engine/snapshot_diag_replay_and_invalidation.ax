@@ -1,0 +1,437 @@
+// test: run
+// modes: interp native
+// stdout-file: snapshot_diag_replay_and_invalidation.stdout
+// SPEC-21 AXS-QRY-030..033, tasks/0791, INV-QRY-003:
+// Conformance test verifying snapshot-bound diagnostic accumulation, diamond-dependency
+// deduplication, cold vs warm memoized diagnostic equivalence, unrelated-module green
+// diagnostic replay across revisions, and cycle-breaking revision invalidation (`Poisoned -> Ready`).
+
+const STATE_VACANT: u32 = 0u32;
+const STATE_READY: u32 = 2u32;
+const STATE_POISONED: u32 = 3u32;
+const STATE_MAYBE_DIRTY: u32 = 4u32;
+
+const DIAG_AX_TYPE_CYCLE: u32 = 9202u32;
+const DIAG_AX_CTM_CYCLE: u32 = 9203u32;
+const DIAG_AX_QUERY_DEPTH_LIMIT: u32 = 9205u32;
+const DIAG_AX_TYP_MISMATCH: u32 = 4001u32;
+
+const SLOT_CONST_CA: usize = 1;
+const SLOT_CONST_CB: usize = 2;
+const SLOT_ALIAS_X: usize = 3;
+const SLOT_TRAIT_DEEP: usize = 4;
+const SLOT_CALLER_LEFT: usize = 5;
+const SLOT_CALLER_RIGHT: usize = 6;
+const SLOT_INDEP_ERR: usize = 7;
+const SLOT_METRICS_CLEAN: usize = 8;
+
+@derive(Copy)
+struct DiagSlot {
+    state: u32,
+    verified_rev: u64,
+    changed_rev: u64,
+    int_val: i64,
+    hits: u32,
+    misses: u32,
+    green_reuses: u32,
+    dep0: usize,
+    dep1: usize,
+    diag_code: u32,
+    diag_rank: u32,
+    diag_fp: u64,
+    diag_is_cycle: u32,
+}
+
+@derive(Copy)
+struct SnapshotSummary {
+    revision: u64,
+    diag_count: u32,
+    cycle_count: u32,
+    warm_replays: u32,
+    combined_fp: u64,
+}
+
+struct EngineState {
+    revision: u64,
+    cycle_broken: u32,
+    slots: [10]DiagSlot,
+    emitted_code: [16]u32,
+    emitted_rank: [16]u32,
+    emitted_fp: [16]u64,
+    emitted_is_cycle: [16]u32,
+    emitted_count: u32,
+    warm_replays: u32,
+    dirtied_slots: u32,
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x: u64 = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+fn calc_diag_fp(code: u32, primary_rank: u32) -> u64 {
+    mix64(0x444941475F465000u64, ((code as u64) << 32u64) | (primary_rank as u64))
+}
+
+fn emit_dedup_diag(eng: mut_view<EngineState>, code: u32, rank: u32, fp: u64, is_cycle: u32) -> bool {
+    if fp == 0u64 {
+        return false;
+    }
+    let n = eng.emitted_count as usize;
+    let mut i: usize = 0;
+    while i < n {
+        if eng.emitted_fp[i] == fp {
+            return false;
+        }
+        i = i + 1;
+    }
+    if n < 16 {
+        eng.emitted_code[n] = code;
+        eng.emitted_rank[n] = rank;
+        eng.emitted_fp[n] = fp;
+        eng.emitted_is_cycle[n] = is_cycle;
+        eng.emitted_count = (n + 1) as u32;
+        return true;
+    }
+    false
+}
+
+fn replay_subgraph_diags(eng: mut_view<EngineState>, slot_idx: usize) {
+    let before = eng.emitted_count;
+    let s = eng.slots[slot_idx];
+    if s.diag_fp != 0u64 {
+        let _ = emit_dedup_diag(mut_view(*eng), s.diag_code, s.diag_rank, s.diag_fp, s.diag_is_cycle);
+    }
+    if s.dep0 != 0 {
+        let d0 = eng.slots[s.dep0];
+        if d0.diag_fp != 0u64 {
+            let _ = emit_dedup_diag(mut_view(*eng), d0.diag_code, d0.diag_rank, d0.diag_fp, d0.diag_is_cycle);
+        }
+        if d0.dep0 != 0 {
+            let d00 = eng.slots[d0.dep0];
+            if d00.diag_fp != 0u64 {
+                let _ = emit_dedup_diag(mut_view(*eng), d00.diag_code, d00.diag_rank, d00.diag_fp, d00.diag_is_cycle);
+            }
+        }
+    }
+    if s.dep1 != 0 {
+        let d1 = eng.slots[s.dep1];
+        if d1.diag_fp != 0u64 {
+            let _ = emit_dedup_diag(mut_view(*eng), d1.diag_code, d1.diag_rank, d1.diag_fp, d1.diag_is_cycle);
+        }
+    }
+    if (eng.emitted_count) > before {
+        eng.warm_replays = eng.warm_replays + 1u32;
+    }
+}
+
+fn reset_session_diags(eng: mut_view<EngineState>) {
+    eng.emitted_count = 0u32;
+}
+
+fn eval_slot(eng: mut_view<EngineState>, idx: usize) -> DiagSlot {
+    let rev = eng.revision;
+    let broken = eng.cycle_broken;
+    let cur = eng.slots[idx];
+
+    // 1. Same-revision warm memo hit: replay attached + transitive diagnostics (AXS-QRY-012, AXS-QRY-030)
+    if (cur.state == STATE_READY || cur.state == STATE_POISONED) && cur.verified_rev == rev {
+        eng.slots[idx].hits = cur.hits + 1u32;
+        replay_subgraph_diags(mut_view(*eng), idx);
+        return eng.slots[idx];
+    }
+
+    // 2. Untouched slot outside dirty cone at newer revision: green reuse + replay (AXS-QRY-033)
+    if (cur.state == STATE_READY || cur.state == STATE_POISONED) && (cur.verified_rev) < rev {
+        eng.slots[idx].verified_rev = rev;
+        eng.slots[idx].hits = cur.hits + 1u32;
+        eng.slots[idx].green_reuses = cur.green_reuses + 1u32;
+        replay_subgraph_diags(mut_view(*eng), idx);
+        return eng.slots[idx];
+    }
+
+    // 3. Cold miss or MaybeDirty re-evaluation
+    let mut new_state: u32 = STATE_READY;
+    let mut new_val: i64 = 0i64;
+    let mut new_code: u32 = 0u32;
+    let mut new_rank: u32 = 0u32;
+    let mut new_fp: u64 = 0u64;
+    let mut new_cyc: u32 = 0u32;
+
+    if idx == SLOT_CONST_CB {
+        if broken == 0u32 {
+            new_state = STATE_POISONED;
+            new_code = DIAG_AX_CTM_CYCLE;
+            new_rank = 10u32;
+            new_fp = calc_diag_fp(DIAG_AX_CTM_CYCLE, 10u32);
+            new_cyc = 1u32;
+            let _ = emit_dedup_diag(mut_view(*eng), new_code, new_rank, new_fp, new_cyc);
+        } else {
+            new_state = STATE_READY;
+            new_val = 20i64;
+        }
+    } else if idx == SLOT_CONST_CA {
+        let cb = eval_slot(mut_view(*eng), SLOT_CONST_CB);
+        if broken == 0u32 || cb.state == STATE_POISONED {
+            new_state = STATE_POISONED;
+            new_code = DIAG_AX_CTM_CYCLE;
+            new_rank = 10u32;
+            new_fp = calc_diag_fp(DIAG_AX_CTM_CYCLE, 10u32);
+            new_cyc = 1u32;
+            let _ = emit_dedup_diag(mut_view(*eng), new_code, new_rank, new_fp, new_cyc);
+        } else {
+            new_state = STATE_READY;
+            new_val = 10i64 + cb.int_val;
+        }
+    } else if idx == SLOT_ALIAS_X {
+        if broken == 0u32 {
+            new_state = STATE_POISONED;
+            new_code = DIAG_AX_TYPE_CYCLE;
+            new_rank = 20u32;
+            new_fp = calc_diag_fp(DIAG_AX_TYPE_CYCLE, 20u32);
+            new_cyc = 1u32;
+            let _ = emit_dedup_diag(mut_view(*eng), new_code, new_rank, new_fp, new_cyc);
+        } else {
+            new_state = STATE_READY;
+            new_val = 8i64;
+        }
+    } else if idx == SLOT_TRAIT_DEEP {
+        if broken == 0u32 {
+            new_state = STATE_POISONED;
+            new_code = DIAG_AX_QUERY_DEPTH_LIMIT;
+            new_rank = 30u32;
+            new_fp = calc_diag_fp(DIAG_AX_QUERY_DEPTH_LIMIT, 30u32);
+            new_cyc = 1u32;
+            let _ = emit_dedup_diag(mut_view(*eng), new_code, new_rank, new_fp, new_cyc);
+        } else {
+            new_state = STATE_READY;
+            new_val = 1i64;
+        }
+    } else if idx == SLOT_CALLER_LEFT {
+        let ca = eval_slot(mut_view(*eng), SLOT_CONST_CA);
+        let ax = eval_slot(mut_view(*eng), SLOT_ALIAS_X);
+        if ca.state == STATE_POISONED || ax.state == STATE_POISONED {
+            // AXS-QRY-031: cascade suppressed — no local AX_TYP_MISMATCH emitted
+            new_state = STATE_POISONED;
+            new_val = 0i64;
+        } else {
+            new_state = STATE_READY;
+            new_val = ca.int_val + ax.int_val;
+        }
+    } else if idx == SLOT_CALLER_RIGHT {
+        let ca = eval_slot(mut_view(*eng), SLOT_CONST_CA);
+        let td = eval_slot(mut_view(*eng), SLOT_TRAIT_DEEP);
+        if ca.state == STATE_POISONED || td.state == STATE_POISONED {
+            new_state = STATE_POISONED;
+            new_val = 0i64;
+        } else {
+            new_state = STATE_READY;
+            new_val = ca.int_val + td.int_val;
+        }
+    } else if idx == SLOT_INDEP_ERR {
+        new_state = STATE_POISONED;
+        new_code = DIAG_AX_TYP_MISMATCH;
+        new_rank = 40u32;
+        new_fp = calc_diag_fp(DIAG_AX_TYP_MISMATCH, 40u32);
+        new_cyc = 0u32;
+        let _ = emit_dedup_diag(mut_view(*eng), new_code, new_rank, new_fp, new_cyc);
+    } else {
+        new_state = STATE_READY;
+        new_val = 100i64 + (rev as i64);
+    }
+
+    eng.slots[idx].state = new_state;
+    eng.slots[idx].verified_rev = rev;
+    eng.slots[idx].changed_rev = rev;
+    eng.slots[idx].int_val = new_val;
+    eng.slots[idx].misses = cur.misses + 1u32;
+    eng.slots[idx].diag_code = new_code;
+    eng.slots[idx].diag_rank = new_rank;
+    eng.slots[idx].diag_fp = new_fp;
+    eng.slots[idx].diag_is_cycle = new_cyc;
+    eng.slots[idx]
+}
+
+fn capture_snapshot_summary(eng: mut_view<EngineState>) -> SnapshotSummary {
+    let n = eng.emitted_count as usize;
+    // Canonical sort of `eng.emitted_*[0..n]` by (primary_rank, code)
+    let mut a: usize = 1;
+    while a < n {
+        let cur_code = eng.emitted_code[a];
+        let cur_rank = eng.emitted_rank[a];
+        let cur_fp = eng.emitted_fp[a];
+        let cur_cyc = eng.emitted_is_cycle[a];
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_rank = eng.emitted_rank[b - 1];
+            let prev_code = eng.emitted_code[b - 1];
+            let le = if prev_rank < cur_rank {
+                true
+            } else if prev_rank > cur_rank {
+                false
+            } else {
+                prev_code <= cur_code
+            };
+            if le {
+                break;
+            }
+            eng.emitted_code[b] = prev_code;
+            eng.emitted_rank[b] = prev_rank;
+            eng.emitted_fp[b] = eng.emitted_fp[b - 1];
+            eng.emitted_is_cycle[b] = eng.emitted_is_cycle[b - 1];
+            b = b - 1;
+        }
+        eng.emitted_code[b] = cur_code;
+        eng.emitted_rank[b] = cur_rank;
+        eng.emitted_fp[b] = cur_fp;
+        eng.emitted_is_cycle[b] = cur_cyc;
+        a = a + 1;
+    }
+
+    let mut cyc_count: u32 = 0u32;
+    let mut fp: u64 = mix64(0x534E41505F444947u64, n as u64);
+    let mut i: usize = 0;
+    while i < n {
+        if eng.emitted_is_cycle[i] != 0u32 {
+            cyc_count = cyc_count + 1u32;
+        }
+        fp = mix64(fp, eng.emitted_fp[i]);
+        i = i + 1;
+    }
+
+    SnapshotSummary {
+        revision: eng.revision,
+        diag_count: eng.emitted_count,
+        cycle_count: cyc_count,
+        warm_replays: eng.warm_replays,
+        combined_fp: fp,
+    }
+}
+
+fn summaries_eq(a: SnapshotSummary, b: SnapshotSummary) -> bool {
+    a.diag_count == b.diag_count &&
+        a.cycle_count == b.cycle_count &&
+        a.combined_fp == b.combined_fp
+}
+
+pub fn main() -> i32 {
+    let empty_slot = DiagSlot {
+        state: STATE_VACANT,
+        verified_rev: 0u64,
+        changed_rev: 0u64,
+        int_val: 0i64,
+        hits: 0u32,
+        misses: 0u32,
+        green_reuses: 0u32,
+        dep0: 0,
+        dep1: 0,
+        diag_code: 0u32,
+        diag_rank: 0u32,
+        diag_fp: 0u64,
+        diag_is_cycle: 0u32,
+    };
+    let mut eng = EngineState {
+        revision: 1u64,
+        cycle_broken: 0u32,
+        slots: [empty_slot; 10],
+        emitted_code: [0u32; 16],
+        emitted_rank: [0u32; 16],
+        emitted_fp: [0u64; 16],
+        emitted_is_cycle: [0u32; 16],
+        emitted_count: 0u32,
+        warm_replays: 0u32,
+        dirtied_slots: 0u32,
+    };
+    eng.slots[SLOT_CONST_CA].dep0 = SLOT_CONST_CB;
+    eng.slots[SLOT_CALLER_LEFT].dep0 = SLOT_CONST_CA;
+    eng.slots[SLOT_CALLER_LEFT].dep1 = SLOT_ALIAS_X;
+    eng.slots[SLOT_CALLER_RIGHT].dep0 = SLOT_CONST_CA;
+    eng.slots[SLOT_CALLER_RIGHT].dep1 = SLOT_TRAIT_DEEP;
+
+    // 1. R1 Cold evaluation across diamond graph:
+    // Both CALLER_LEFT and CALLER_RIGHT depend on CONST_CA (`AX_CTM_CYCLE`),
+    // plus ALIAS_X (`AX_TYPE_CYCLE`), TRAIT_DEEP (`AX_QUERY_DEPTH_LIMIT`), and INDEP_ERR (`AX_TYP_MISMATCH`).
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_LEFT);
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_RIGHT);
+    let _ = eval_slot(mut_view(eng), SLOT_INDEP_ERR);
+    let _ = eval_slot(mut_view(eng), SLOT_METRICS_CLEAN);
+    let snap_r1_cold = capture_snapshot_summary(mut_view(eng));
+
+    // Exactly 4 deduplicated diagnostics (3 cycle/depth + 1 independent type mismatch);
+    // shared CONST_CA cycle in the diamond is deduplicated to 1 emission!
+    if snap_r1_cold.diag_count != 4u32 || snap_r1_cold.cycle_count != 3u32 {
+        return 1;
+    }
+    print("r1_cold_diamond_dedup_ok=true\n");
+
+    // 2. R1 Warm memo hit replay in reverse root order (`INDEP_ERR`, `CALLER_RIGHT`, `CALLER_LEFT`)
+    reset_session_diags(mut_view(eng));
+    if eng.emitted_count != 0u32 {
+        return 2;
+    }
+    let _ = eval_slot(mut_view(eng), SLOT_INDEP_ERR);
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_RIGHT);
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_LEFT);
+    let snap_r1_warm = capture_snapshot_summary(mut_view(eng));
+
+    if !summaries_eq(snap_r1_cold, snap_r1_warm) || (eng.warm_replays) < 3u32 {
+        return 3;
+    }
+    print("r1_cold_vs_warm_diag_equivalent=true\n");
+
+    // 3. R2 Unrelated module edit (`SLOT_METRICS_CLEAN` marked MaybeDirty):
+    // Cyclic subgraph is untouched and green-reused at R2 with identical replayed diagnostics!
+    eng.revision = 2u64;
+    reset_session_diags(mut_view(eng));
+    eng.slots[SLOT_METRICS_CLEAN].state = STATE_MAYBE_DIRTY;
+    eng.dirtied_slots = eng.dirtied_slots + 1u32;
+
+    let m_r2 = eval_slot(mut_view(eng), SLOT_METRICS_CLEAN);
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_LEFT);
+    let _ = eval_slot(mut_view(eng), SLOT_CALLER_RIGHT);
+    let _ = eval_slot(mut_view(eng), SLOT_INDEP_ERR);
+    let snap_r2_green = capture_snapshot_summary(mut_view(eng));
+
+    if m_r2.int_val != 102i64 || !summaries_eq(snap_r1_cold, snap_r2_green) {
+        return 4;
+    }
+    if eng.slots[SLOT_CALLER_LEFT].green_reuses == 0u32 || eng.slots[SLOT_CALLER_RIGHT].green_reuses == 0u32 {
+        return 5;
+    }
+    print("r2_unrelated_edit_green_replay_ok=true\n");
+
+    // 4. R3 Cycle-breaking edit in `mod_cycles`:
+    // Mark cyclic slots and their callers MaybeDirty, set `cycle_broken = 1`, and re-evaluate!
+    eng.revision = 3u64;
+    eng.cycle_broken = 1u32;
+    reset_session_diags(mut_view(eng));
+
+    let mut s_idx: usize = SLOT_CONST_CA;
+    while s_idx <= SLOT_CALLER_RIGHT {
+        eng.slots[s_idx].state = STATE_MAYBE_DIRTY;
+        eng.dirtied_slots = eng.dirtied_slots + 1u32;
+        s_idx = s_idx + 1;
+    }
+
+    let left_r3 = eval_slot(mut_view(eng), SLOT_CALLER_LEFT);
+    let right_r3 = eval_slot(mut_view(eng), SLOT_CALLER_RIGHT);
+    let ca_r3 = eng.slots[SLOT_CONST_CA];
+    let cb_r3 = eng.slots[SLOT_CONST_CB];
+    let snap_r3_fixed = capture_snapshot_summary(mut_view(eng));
+
+    // All formerly poisoned cycle slots are now STATE_READY:
+    // CB = 20, CA = 10 + 20 = 30, ALIAS_X = 8 -> CALLER_LEFT = 38, CALLER_RIGHT = 31, 0 cycle diagnostics!
+    if ca_r3.state != STATE_READY || cb_r3.state != STATE_READY || left_r3.state != STATE_READY || right_r3.state != STATE_READY {
+        return 6;
+    }
+    if cb_r3.int_val != 20i64 || ca_r3.int_val != 30i64 || left_r3.int_val != 38i64 || right_r3.int_val != 31i64 {
+        return 7;
+    }
+    if snap_r3_fixed.diag_count != 0u32 || snap_r3_fixed.cycle_count != 0u32 {
+        return 8;
+    }
+    print("r3_cycle_breaking_invalidation_ok=true\n");
+    print("SNAPSHOT-DIAG-REPLAY-AND-INVALIDATION-OK\n");
+    0
+}

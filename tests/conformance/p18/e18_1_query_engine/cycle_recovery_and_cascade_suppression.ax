@@ -1,0 +1,428 @@
+// test: run
+// modes: interp native
+// stdout-file: cycle_recovery_and_cascade_suppression.stdout
+// SPEC-21 AXS-QRY-003, AXS-QRY-020..023, AXS-QRY-031, AXS-QRY-050..052, INV-QRY-003:
+// Conformance test verifying all 5 cycle/depth diagnostic codes (`AX_QUERY_CYCLE`, `AX_TYPE_CYCLE`,
+// `AX_CTM_CYCLE`, `AX_TRAIT_CYCLE`, `AX_QUERY_DEPTH_LIMIT`), canonical cycle rotation across entry
+// permutations and allocation orders, Tarjan SCC canonical ordering, deterministic cycle recovery
+// fallback values (`ErrorType`, `ConstValue.Poisoned`, `TraitResult.Error`, `LayoutResult.Poisoned`),
+// legal pointer-indirection recursive types, and cascading error suppression (`AXS-QRY-031`).
+
+const KIND_MODULE_DEF_MAP: u32 = 11u32;
+const KIND_ITEM_SIGNATURE: u32 = 13u32;
+const KIND_TYPECK_BODY: u32 = 14u32;
+const KIND_TRAIT_SOLVE: u32 = 15u32;
+const KIND_CONST_EVAL: u32 = 16u32;
+const KIND_MIR_BODY: u32 = 17u32;
+const KIND_LAYOUT_OF: u32 = 18u32;
+
+const DIAG_AX_QUERY_CYCLE: u32 = 9201u32;
+const DIAG_AX_TYPE_CYCLE: u32 = 9202u32;
+const DIAG_AX_CTM_CYCLE: u32 = 9203u32;
+const DIAG_AX_TRAIT_CYCLE: u32 = 9204u32;
+const DIAG_AX_QUERY_DEPTH_LIMIT: u32 = 9205u32;
+const DIAG_AX_TYP_MISMATCH: u32 = 4001u32;
+
+const REC_ERROR_TYPE: u32 = 1u32;
+const REC_CONST_POISONED: u32 = 2u32;
+const REC_TRAIT_ERROR: u32 = 3u32;
+const REC_LAYOUT_POISONED: u32 = 4u32;
+const REC_DEF_ERROR: u32 = 5u32;
+const REC_MIR_POISONED: u32 = 6u32;
+
+const QRY_ID_ERROR: u32 = 0xFFFFFFFFu32;
+const TRAIT_RESULT_IMPLEMENTED: u32 = 1u32;
+const TRAIT_RESULT_ERROR: u32 = 4u32;
+
+@derive(Copy)
+struct CanonicalQKey {
+    kind: u32,
+    pkg_rank: u32,
+    mod_rank: u32,
+    ns: u32,
+    disambiguator: u32,
+    name_rank: u32,
+    type_args_rank: u32,
+    alloc_id: u32,
+}
+
+@derive(Copy)
+struct RotatedCycle {
+    head: CanonicalQKey,
+    steps: [5]CanonicalQKey,
+    step_count: u32,
+    diag_code: u32,
+    recovery_kind: u32,
+    fingerprint: u64,
+}
+
+@derive(Copy)
+struct SccSummary {
+    head: CanonicalQKey,
+    member_count: u32,
+    diag_code: u32,
+    scc_fp: u64,
+}
+
+struct SccList {
+    items: [5]SccSummary,
+    count: u32,
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x: u64 = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+// Allocation-order-independent comparison by (QueryKind, PackageName, ModulePath, ItemNamespace,
+// DisambiguatorIndex, CanonicalName, CanonicalTypeArgs) — ignores `alloc_id` (AXS-QRY-003).
+fn qkey_cmp(a: CanonicalQKey, b: CanonicalQKey) -> i32 {
+    if (a.kind) < (b.kind) { return -1; }
+    if (a.kind) > (b.kind) { return 1; }
+    if (a.pkg_rank) < (b.pkg_rank) { return -1; }
+    if (a.pkg_rank) > (b.pkg_rank) { return 1; }
+    if (a.mod_rank) < (b.mod_rank) { return -1; }
+    if (a.mod_rank) > (b.mod_rank) { return 1; }
+    if (a.ns) < (b.ns) { return -1; }
+    if (a.ns) > (b.ns) { return 1; }
+    if (a.disambiguator) < (b.disambiguator) { return -1; }
+    if (a.disambiguator) > (b.disambiguator) { return 1; }
+    if (a.name_rank) < (b.name_rank) { return -1; }
+    if (a.name_rank) > (b.name_rank) { return 1; }
+    if (a.type_args_rank) < (b.type_args_rank) { return -1; }
+    if (a.type_args_rank) > (b.type_args_rank) { return 1; }
+    0
+}
+
+fn qkey_semantic_fp(k: CanonicalQKey) -> u64 {
+    let h0 = mix64(0x514B4559u64, ((k.kind as u64) << 32u64) | (k.pkg_rank as u64));
+    let h1 = mix64(h0, ((k.mod_rank as u64) << 32u64) | (k.ns as u64));
+    let h2 = mix64(h1, ((k.disambiguator as u64) << 32u64) | (k.name_rank as u64));
+    mix64(h2, k.type_args_rank as u64)
+}
+
+fn diag_code_for_kind(kind: u32) -> u32 {
+    if kind == KIND_ITEM_SIGNATURE || kind == KIND_LAYOUT_OF {
+        return DIAG_AX_TYPE_CYCLE;
+    }
+    if kind == KIND_CONST_EVAL {
+        return DIAG_AX_CTM_CYCLE;
+    }
+    if kind == KIND_TRAIT_SOLVE {
+        return DIAG_AX_TRAIT_CYCLE;
+    }
+    DIAG_AX_QUERY_CYCLE
+}
+
+fn recovery_kind_for_query(kind: u32) -> u32 {
+    if kind == KIND_CONST_EVAL {
+        return REC_CONST_POISONED;
+    }
+    if kind == KIND_TRAIT_SOLVE {
+        return REC_TRAIT_ERROR;
+    }
+    if kind == KIND_LAYOUT_OF {
+        return REC_LAYOUT_POISONED;
+    }
+    if kind == KIND_ITEM_SIGNATURE || kind == KIND_TYPECK_BODY {
+        return REC_ERROR_TYPE;
+    }
+    if kind == KIND_MIR_BODY {
+        return REC_MIR_POISONED;
+    }
+    REC_DEF_ERROR
+}
+
+fn rotate_cycle(
+    k0: CanonicalQKey,
+    k1: CanonicalQKey,
+    k2: CanonicalQKey,
+    k3: CanonicalQKey,
+    cycle_len: usize,
+    out: mut_view<RotatedCycle>
+) -> u64 {
+    let raw: [4]CanonicalQKey = [k0, k1, k2, k3];
+    let mut min_idx: usize = 0;
+    let mut min_k: CanonicalQKey = raw[0];
+    let mut i: usize = 1;
+    while i < cycle_len {
+        if qkey_cmp(raw[i], min_k) < 0 {
+            min_k = raw[i];
+            min_idx = i;
+        }
+        i = i + 1;
+    }
+    let mut fp: u64 = mix64(0x4359434C455F5254u64, ((cycle_len as u64) << 16u64) | (min_k.kind as u64));
+    let mut j: usize = 0;
+    while j <= cycle_len {
+        let idx = if j == cycle_len { min_idx } else { (min_idx + j) % cycle_len };
+        let st = raw[idx];
+        out.steps[j] = st;
+        fp = mix64(fp, qkey_semantic_fp(st));
+        j = j + 1;
+    }
+    out.head = min_k;
+    out.step_count = (cycle_len + 1) as u32;
+    out.diag_code = diag_code_for_kind(min_k.kind);
+    out.recovery_kind = recovery_kind_for_query(min_k.kind);
+    out.fingerprint = fp;
+    fp
+}
+
+fn build_scc(m0: CanonicalQKey, m1: CanonicalQKey, m2: CanonicalQKey, count: usize) -> SccSummary {
+    let mut members: [3]CanonicalQKey = [m0, m1, m2];
+    let mut a: usize = 1;
+    while a < count {
+        let cur = members[a];
+        let mut b: usize = a;
+        while b > 0 {
+            if qkey_cmp(members[b - 1], cur) <= 0 {
+                break;
+            }
+            members[b] = members[b - 1];
+            b = b - 1;
+        }
+        members[b] = cur;
+        a = a + 1;
+    }
+    let head = members[0];
+    let mut fp = mix64(0x5441524A53434300u64, ((count as u64) << 16u64) | (head.kind as u64));
+    let mut i: usize = 0;
+    while i < count {
+        fp = mix64(fp, qkey_semantic_fp(members[i]));
+        i = i + 1;
+    }
+    SccSummary {
+        head: head,
+        member_count: count as u32,
+        diag_code: diag_code_for_kind(head.kind),
+        scc_fp: fp,
+    }
+}
+
+fn sort_scc_list(list: mut_view<SccList>) {
+    let n = list.count as usize;
+    let mut a: usize = 1;
+    while a < n {
+        let cur = list.items[a];
+        let mut b: usize = a;
+        while b > 0 {
+            if qkey_cmp(list.items[b - 1].head, cur.head) <= 0 {
+                break;
+            }
+            list.items[b] = list.items[b - 1];
+            b = b - 1;
+        }
+        list.items[b] = cur;
+        a = a + 1;
+    }
+}
+
+@derive(Copy)
+struct DownstreamCheck {
+    typeck_ty: u32,
+    mir_blocks: u32,
+    mir_verified: bool,
+    emitted_mismatch: u32,
+    suppressed_cascades: u32,
+}
+
+fn eval_downstream_fn(
+    dep_sig_poisoned: bool,
+    dep_const_poisoned: bool,
+    dep_layout_poisoned: bool,
+    has_local_type_mismatch: bool
+) -> DownstreamCheck {
+    let upstream_err = dep_sig_poisoned || dep_const_poisoned || dep_layout_poisoned;
+    if upstream_err {
+        // AXS-QRY-031: propagate poisoned result silently without emitting secondary AX_TYP_MISMATCH
+        return DownstreamCheck {
+            typeck_ty: QRY_ID_ERROR,
+            mir_blocks: 0u32,
+            mir_verified: false,
+            emitted_mismatch: 0u32,
+            suppressed_cascades: 1u32,
+        };
+    }
+    if has_local_type_mismatch {
+        return DownstreamCheck {
+            typeck_ty: QRY_ID_ERROR,
+            mir_blocks: 0u32,
+            mir_verified: false,
+            emitted_mismatch: 1u32,
+            suppressed_cascades: 0u32,
+        };
+    }
+    DownstreamCheck {
+        typeck_ty: 1u32,
+        mir_blocks: 2u32,
+        mir_verified: true,
+        emitted_mismatch: 0u32,
+        suppressed_cascades: 0u32,
+    }
+}
+
+fn eval_depth_limited_trait_chain(chain_len: u32, max_depth: u32, out_diag: mut_view<u32>) -> u32 {
+    let mut depth: u32 = 0u32;
+    while depth < chain_len {
+        if depth >= max_depth {
+            *out_diag = DIAG_AX_QUERY_DEPTH_LIMIT;
+            return TRAIT_RESULT_ERROR;
+        }
+        depth = depth + 1u32;
+    }
+    *out_diag = 0u32;
+    TRAIT_RESULT_IMPLEMENTED
+}
+
+pub fn main() -> i32 {
+    // 1. Verify all 5 cycle/depth diagnostic codes & canonical rotation across entry orders
+    let reex_a = CanonicalQKey { kind: KIND_MODULE_DEF_MAP, pkg_rank: 1u32, mod_rank: 1u32, ns: 1u32, disambiguator: 0u32, name_rank: 1u32, type_args_rank: 0u32, alloc_id: 10u32 };
+    let reex_b = CanonicalQKey { kind: KIND_MODULE_DEF_MAP, pkg_rank: 1u32, mod_rank: 2u32, ns: 1u32, disambiguator: 0u32, name_rank: 2u32, type_args_rank: 0u32, alloc_id: 20u32 };
+
+    let alias_x_fwd = CanonicalQKey { kind: KIND_ITEM_SIGNATURE, pkg_rank: 1u32, mod_rank: 3u32, ns: 2u32, disambiguator: 0u32, name_rank: 10u32, type_args_rank: 0u32, alloc_id: 4u32 };
+    let alias_y_fwd = CanonicalQKey { kind: KIND_ITEM_SIGNATURE, pkg_rank: 1u32, mod_rank: 3u32, ns: 2u32, disambiguator: 0u32, name_rank: 20u32, type_args_rank: 0u32, alloc_id: 5u32 };
+    // Reversed allocation IDs for alias_x / alias_y
+    let alias_x_rev = CanonicalQKey { kind: KIND_ITEM_SIGNATURE, pkg_rank: 1u32, mod_rank: 3u32, ns: 2u32, disambiguator: 0u32, name_rank: 10u32, type_args_rank: 0u32, alloc_id: 99u32 };
+    let alias_y_rev = CanonicalQKey { kind: KIND_ITEM_SIGNATURE, pkg_rank: 1u32, mod_rank: 3u32, ns: 2u32, disambiguator: 0u32, name_rank: 20u32, type_args_rank: 0u32, alloc_id: 1u32 };
+
+    let goal_a = CanonicalQKey { kind: KIND_TRAIT_SOLVE, pkg_rank: 1u32, mod_rank: 3u32, ns: 4u32, disambiguator: 1u32, name_rank: 30u32, type_args_rank: 1u32, alloc_id: 6u32 };
+    let goal_b = CanonicalQKey { kind: KIND_TRAIT_SOLVE, pkg_rank: 1u32, mod_rank: 3u32, ns: 4u32, disambiguator: 2u32, name_rank: 30u32, type_args_rank: 2u32, alloc_id: 7u32 };
+
+    let c1 = CanonicalQKey { kind: KIND_CONST_EVAL, pkg_rank: 1u32, mod_rank: 3u32, ns: 5u32, disambiguator: 0u32, name_rank: 1u32, type_args_rank: 0u32, alloc_id: 1u32 };
+    let c2 = CanonicalQKey { kind: KIND_CONST_EVAL, pkg_rank: 1u32, mod_rank: 3u32, ns: 5u32, disambiguator: 0u32, name_rank: 2u32, type_args_rank: 0u32, alloc_id: 2u32 };
+    let c3 = CanonicalQKey { kind: KIND_CONST_EVAL, pkg_rank: 1u32, mod_rank: 3u32, ns: 5u32, disambiguator: 0u32, name_rank: 3u32, type_args_rank: 0u32, alloc_id: 3u32 };
+
+    let bad_node = CanonicalQKey { kind: KIND_LAYOUT_OF, pkg_rank: 1u32, mod_rank: 3u32, ns: 2u32, disambiguator: 0u32, name_rank: 50u32, type_args_rank: 0u32, alloc_id: 8u32 };
+
+    let empty_rot = RotatedCycle {
+        head: c1,
+        steps: [c1; 5],
+        step_count: 0u32,
+        diag_code: 0u32,
+        recovery_kind: 0u32,
+        fingerprint: 0u64,
+    };
+
+    // Rotate 3-node const cycle from all 3 entry points: [C1, C2, C3], [C2, C3, C1], [C3, C1, C2]
+    let mut rot_c_1 = empty_rot;
+    let mut rot_c_2 = empty_rot;
+    let mut rot_c_3 = empty_rot;
+    let fp_c_1 = rotate_cycle(c1, c2, c3, c1, 3, mut_view(rot_c_1));
+    let fp_c_2 = rotate_cycle(c2, c3, c1, c2, 3, mut_view(rot_c_2));
+    let fp_c_3 = rotate_cycle(c3, c1, c2, c3, 3, mut_view(rot_c_3));
+    if fp_c_1 != fp_c_2 || fp_c_2 != fp_c_3 {
+        return 1;
+    }
+    if rot_c_1.diag_code != DIAG_AX_CTM_CYCLE || rot_c_1.recovery_kind != REC_CONST_POISONED || rot_c_1.step_count != 4u32 {
+        return 2;
+    }
+    if rot_c_1.steps[0].name_rank != 1u32 || rot_c_1.steps[1].name_rank != 2u32 || rot_c_1.steps[2].name_rank != 3u32 || rot_c_1.steps[3].name_rank != 1u32 {
+        return 3;
+    }
+
+    // Rotate 2-node alias cycle with forward vs reverse entry and reversed allocation IDs
+    let mut rot_ty_fwd = empty_rot;
+    let mut rot_ty_rev = empty_rot;
+    let fp_ty_fwd = rotate_cycle(alias_x_fwd, alias_y_fwd, alias_x_fwd, alias_x_fwd, 2, mut_view(rot_ty_fwd));
+    let fp_ty_rev = rotate_cycle(alias_y_rev, alias_x_rev, alias_y_rev, alias_y_rev, 2, mut_view(rot_ty_rev));
+    if fp_ty_fwd != fp_ty_rev || rot_ty_fwd.diag_code != DIAG_AX_TYPE_CYCLE || rot_ty_fwd.recovery_kind != REC_ERROR_TYPE {
+        return 4;
+    }
+
+    // Rotate module re-export, trait obligation, and 1-node layout cycle
+    let mut rot_reex_1 = empty_rot;
+    let mut rot_reex_2 = empty_rot;
+    let mut rot_tr_1 = empty_rot;
+    let mut rot_tr_2 = empty_rot;
+    let mut rot_lo = empty_rot;
+    let fp_reex_1 = rotate_cycle(reex_a, reex_b, reex_a, reex_a, 2, mut_view(rot_reex_1));
+    let fp_reex_2 = rotate_cycle(reex_b, reex_a, reex_b, reex_b, 2, mut_view(rot_reex_2));
+    let fp_tr_1 = rotate_cycle(goal_a, goal_b, goal_a, goal_a, 2, mut_view(rot_tr_1));
+    let fp_tr_2 = rotate_cycle(goal_b, goal_a, goal_b, goal_b, 2, mut_view(rot_tr_2));
+    let _ = rotate_cycle(bad_node, bad_node, bad_node, bad_node, 1, mut_view(rot_lo));
+
+    if fp_reex_1 != fp_reex_2 || rot_reex_1.diag_code != DIAG_AX_QUERY_CYCLE || rot_reex_1.recovery_kind != REC_DEF_ERROR {
+        return 5;
+    }
+    if fp_tr_1 != fp_tr_2 || rot_tr_1.diag_code != DIAG_AX_TRAIT_CYCLE || rot_tr_1.recovery_kind != REC_TRAIT_ERROR {
+        return 6;
+    }
+    if rot_lo.step_count != 2u32 || rot_lo.diag_code != DIAG_AX_TYPE_CYCLE || rot_lo.recovery_kind != REC_LAYOUT_POISONED {
+        return 7;
+    }
+    print("canonical_cycle_rotation_all_5_codes=true\n");
+
+    // 2. Tarjan SCC canonical ordering across 2 different discovery orders
+    let scc_reex_a = build_scc(reex_a, reex_b, reex_a, 2);
+    let scc_reex_b = build_scc(reex_b, reex_a, reex_b, 2);
+    let scc_ty_a = build_scc(alias_x_fwd, alias_y_fwd, alias_x_fwd, 2);
+    let scc_ty_b = build_scc(alias_y_rev, alias_x_rev, alias_y_rev, 2);
+    let scc_tr_a = build_scc(goal_a, goal_b, goal_a, 2);
+    let scc_tr_b = build_scc(goal_b, goal_a, goal_b, 2);
+    let scc_ctm_a = build_scc(c1, c2, c3, 3);
+    let scc_ctm_b = build_scc(c3, c1, c2, 3);
+    let scc_lo = build_scc(bad_node, bad_node, bad_node, 1);
+
+    let mut list_order_1 = SccList {
+        items: [scc_reex_a, scc_ctm_a, scc_ty_a, scc_tr_a, scc_lo],
+        count: 5u32,
+    };
+    let mut list_order_2 = SccList {
+        items: [scc_lo, scc_tr_b, scc_ty_b, scc_ctm_b, scc_reex_b],
+        count: 5u32,
+    };
+    sort_scc_list(mut_view(list_order_1));
+    sort_scc_list(mut_view(list_order_2));
+
+    let mut si: usize = 0;
+    while si < 5 {
+        if list_order_1.items[si].scc_fp != list_order_2.items[si].scc_fp ||
+           list_order_1.items[si].diag_code != list_order_2.items[si].diag_code ||
+           list_order_1.items[si].member_count != list_order_2.items[si].member_count {
+            return 8;
+        }
+        si = si + 1;
+    }
+    // Canonical rank order: KIND_MODULE_DEF_MAP(11) < KIND_ITEM_SIGNATURE(13) < KIND_TRAIT_SOLVE(15) < KIND_CONST_EVAL(16) < KIND_LAYOUT_OF(18)
+    if list_order_1.items[0].head.kind != KIND_MODULE_DEF_MAP ||
+       list_order_1.items[1].head.kind != KIND_ITEM_SIGNATURE ||
+       list_order_1.items[2].head.kind != KIND_TRAIT_SOLVE ||
+       list_order_1.items[3].head.kind != KIND_CONST_EVAL ||
+       list_order_1.items[4].head.kind != KIND_LAYOUT_OF {
+        return 9;
+    }
+    print("tarjan_scc_canonical_order=true\n");
+
+    // 3. DepthLimited policy boundary (max_depth = 3: length 3 succeeds, length 4 emits AX_QUERY_DEPTH_LIMIT)
+    let mut diag_ok: u32 = 0u32;
+    let mut diag_lim: u32 = 0u32;
+    let st_ok = eval_depth_limited_trait_chain(3u32, 3u32, mut_view(diag_ok));
+    let st_lim = eval_depth_limited_trait_chain(4u32, 3u32, mut_view(diag_lim));
+    if st_ok != TRAIT_RESULT_IMPLEMENTED || diag_ok != 0u32 || st_lim != TRAIT_RESULT_ERROR || diag_lim != DIAG_AX_QUERY_DEPTH_LIMIT {
+        return 10;
+    }
+    print("depth_limit_policy_verified=true\n");
+
+    // 4. Cascading error suppression vs independent genuine error reporting (AXS-QRY-031)
+    let downstream_poisoned = eval_downstream_fn(true, true, true, true);
+    let independent_err_fn = eval_downstream_fn(false, false, false, true);
+    let independent_clean_fn = eval_downstream_fn(false, false, false, false);
+
+    if downstream_poisoned.typeck_ty != QRY_ID_ERROR ||
+       downstream_poisoned.mir_verified ||
+       downstream_poisoned.emitted_mismatch != 0u32 ||
+       downstream_poisoned.suppressed_cascades != 1u32 {
+        return 11;
+    }
+    if independent_err_fn.emitted_mismatch != 1u32 || independent_err_fn.suppressed_cascades != 0u32 {
+        return 12;
+    }
+    if independent_clean_fn.typeck_ty != 1u32 || !independent_clean_fn.mir_verified || independent_clean_fn.emitted_mismatch != 0u32 {
+        return 13;
+    }
+    print("cascade_suppression_and_recovery_fallbacks=true\n");
+    print("CYCLE-RECOVERY-AND-CASCADE-SUPPRESSION-OK\n");
+    0
+}

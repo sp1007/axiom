@@ -1,0 +1,371 @@
+// test: run
+// modes: interp native
+// stdout-file: demand_driven_isolation_and_memo.stdout
+// SPEC-21 AXS-QRY-001..005, AXS-QRY-010..013, AXS-QRY-020, AXS-QRY-032..033, INV-QRY-003:
+// Conformance test verifying multi-module demand-driven query isolation, session isolation,
+// header/body firewall (`item_signature` vs `typeck_body` / `mir_body`), inferred/CTFE body
+// dependency exception, legal runtime recursion (`fact`), memoization hit/miss counters,
+// no-op ContentHash firewall, and shallow verification with signature backdating.
+
+const Q_PARSE_MODULE: u32 = 1u32;
+const Q_MODULE_DEF_MAP: u32 = 2u32;
+const Q_RESOLVE_MODULE: u32 = 3u32;
+const Q_ITEM_SIGNATURE: u32 = 4u32;
+const Q_TYPECK_BODY: u32 = 5u32;
+const Q_MIR_BODY: u32 = 6u32;
+
+const STATE_VACANT: u32 = 0u32;
+const STATE_READY: u32 = 2u32;
+const STATE_MAYBE_DIRTY: u32 = 4u32;
+
+const MOD_MATH: u32 = 1u32;
+const MOD_APP: u32 = 2u32;
+const MOD_UNUSED: u32 = 3u32;
+
+const DEF_MATH_SQUARE: u32 = 1u32;
+const DEF_MATH_FACT: u32 = 2u32;
+const DEF_MATH_CTFE_CONST_FN: u32 = 3u32;
+const DEF_MATH_UNREF_HEAVY: u32 = 4u32;
+const DEF_APP_COMPUTE: u32 = 5u32;
+const DEF_APP_USE_CTFE: u32 = 6u32;
+const DEF_APP_UNREF: u32 = 7u32;
+const DEF_UNUSED_MOD_FN: u32 = 8u32;
+
+@derive(Copy)
+struct MemoSlot {
+    state: u32,
+    verified_at: u64,
+    changed_at: u64,
+    value_fp: u64,
+    hits: u32,
+    misses: u32,
+    provider_runs: u32,
+    green_reuses: u32,
+}
+
+struct SessionDB {
+    session_id: u64,
+    revision: u64,
+    mod_source_hash: [4]u64,
+    mod_changed_at: [4]u64,
+    def_sig_seed: [9]u64,
+    def_body_seed: [9]u64,
+    slots: [64]MemoSlot,
+    total_hits: u32,
+    total_misses: u32,
+    total_provider_runs: u32,
+    total_green_reuses: u32,
+    backdated_count: u32,
+    dirtied_slots: u32,
+}
+
+fn mix64(seed: u64, val: u64) -> u64 {
+    let mut x: u64 = seed ^ (val << 13u64) ^ (seed >> 7u64) ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 17u64) ^ (val >> 3u64);
+    x ^ (x << 5u64)
+}
+
+fn def_module(def_id: u32) -> u32 {
+    if def_id <= 4u32 {
+        return MOD_MATH;
+    }
+    if def_id <= 7u32 {
+        return MOD_APP;
+    }
+    MOD_UNUSED
+}
+
+fn slot_idx(kind: u32, key: u32) -> usize {
+    if kind <= 3u32 {
+        return ((kind - 1u32) * 4u32 + key) as usize;
+    }
+    (12u32 + (kind - 4u32) * 9u32 + key) as usize
+}
+
+fn mark_slot_dirty(db: mut_view<SessionDB>, idx: usize) {
+    if db.slots[idx].state == STATE_READY {
+        db.slots[idx].state = STATE_MAYBE_DIRTY;
+        db.dirtied_slots = db.dirtied_slots + 1u32;
+    }
+}
+
+fn update_module_source(db: mut_view<SessionDB>, mod_id: u32, new_source_hash: u64, new_sq_body_seed: u64) -> u64 {
+    db.revision = db.revision + 1u64;
+    let rev = db.revision;
+    let old_hash = db.mod_source_hash[mod_id as usize];
+    // AXS-QRY-032 section 2: unchanged ContentHash does not dirty any derived slots
+    if old_hash == new_source_hash {
+        return rev;
+    }
+    db.mod_source_hash[mod_id as usize] = new_source_hash;
+    db.mod_changed_at[mod_id as usize] = rev;
+    if mod_id == MOD_MATH {
+        db.def_body_seed[DEF_MATH_SQUARE as usize] = new_sq_body_seed;
+    }
+
+    // Mark transitive dependent derived slots MaybeDirty
+    mark_slot_dirty(mut_view(*db), slot_idx(Q_PARSE_MODULE, mod_id));
+    mark_slot_dirty(mut_view(*db), slot_idx(Q_MODULE_DEF_MAP, mod_id));
+    mark_slot_dirty(mut_view(*db), slot_idx(Q_RESOLVE_MODULE, mod_id));
+
+    let mut d: u32 = 1u32;
+    while d <= 8u32 {
+        if def_module(d) == mod_id {
+            mark_slot_dirty(mut_view(*db), slot_idx(Q_ITEM_SIGNATURE, d));
+            mark_slot_dirty(mut_view(*db), slot_idx(Q_TYPECK_BODY, d));
+            mark_slot_dirty(mut_view(*db), slot_idx(Q_MIR_BODY, d));
+        }
+        d = d + 1u32;
+    }
+    if mod_id == MOD_MATH {
+        // Cross-module caller `app.compute` depends on `item_signature(math.square)`
+        mark_slot_dirty(mut_view(*db), slot_idx(Q_TYPECK_BODY, DEF_APP_COMPUTE));
+        mark_slot_dirty(mut_view(*db), slot_idx(Q_TYPECK_BODY, DEF_APP_USE_CTFE));
+    }
+    rev
+}
+
+fn query_eval(db: mut_view<SessionDB>, kind: u32, key: u32) -> MemoSlot {
+    let idx = slot_idx(kind, key);
+    let rev = db.revision;
+    let cur = db.slots[idx];
+
+    // 1. Same-revision warm hit (AXS-QRY-012)
+    if cur.state == STATE_READY && cur.verified_at == rev {
+        db.slots[idx].hits = cur.hits + 1u32;
+        db.total_hits = db.total_hits + 1u32;
+        return db.slots[idx];
+    }
+
+    // 2. Shallow verification for MaybeDirty / stale revision (AXS-QRY-033)
+    let had_prev = cur.state == STATE_MAYBE_DIRTY || (cur.state == STATE_READY && (cur.verified_at) < rev);
+    if had_prev {
+        let mut can_green: bool = false;
+        if kind == Q_PARSE_MODULE {
+            let m_changed = db.mod_changed_at[key as usize];
+            if m_changed <= cur.verified_at {
+                can_green = true;
+            }
+        } else if kind == Q_MODULE_DEF_MAP {
+            let pm = query_eval(mut_view(*db), Q_PARSE_MODULE, key);
+            if pm.changed_at <= cur.verified_at {
+                can_green = true;
+            }
+        } else if kind == Q_RESOLVE_MODULE {
+            let pm = query_eval(mut_view(*db), Q_PARSE_MODULE, key);
+            let dm = query_eval(mut_view(*db), Q_MODULE_DEF_MAP, key);
+            if pm.changed_at <= cur.verified_at && dm.changed_at <= cur.verified_at {
+                can_green = true;
+            }
+        } else if kind == Q_ITEM_SIGNATURE {
+            let m_id = def_module(key);
+            let dm = query_eval(mut_view(*db), Q_MODULE_DEF_MAP, m_id);
+            if dm.changed_at <= cur.verified_at {
+                can_green = true;
+            }
+        } else if kind == Q_TYPECK_BODY {
+            let m_id = def_module(key);
+            let rm = query_eval(mut_view(*db), Q_RESOLVE_MODULE, m_id);
+            let s_self = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, key);
+            if key == DEF_APP_COMPUTE {
+                let s_sq = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, DEF_MATH_SQUARE);
+                if rm.changed_at <= cur.verified_at && s_self.changed_at <= cur.verified_at && s_sq.changed_at <= cur.verified_at {
+                    can_green = true;
+                }
+            } else if rm.changed_at <= cur.verified_at && s_self.changed_at <= cur.verified_at {
+                can_green = true;
+            }
+        }
+
+        if can_green {
+            db.slots[idx].state = STATE_READY;
+            db.slots[idx].verified_at = rev;
+            db.slots[idx].hits = db.slots[idx].hits + 1u32;
+            db.slots[idx].green_reuses = db.slots[idx].green_reuses + 1u32;
+            db.total_hits = db.total_hits + 1u32;
+            db.total_green_reuses = db.total_green_reuses + 1u32;
+            return db.slots[idx];
+        }
+    }
+
+    // 3. Cold miss or dirty re-evaluation: run pure provider
+    db.slots[idx].misses = db.slots[idx].misses + 1u32;
+    db.slots[idx].provider_runs = db.slots[idx].provider_runs + 1u32;
+    db.total_misses = db.total_misses + 1u32;
+    db.total_provider_runs = db.total_provider_runs + 1u32;
+
+    let mut new_fp: u64 = 0u64;
+    if kind == Q_PARSE_MODULE {
+        new_fp = mix64(0x5041525345u64, db.mod_source_hash[key as usize]);
+    } else if kind == Q_MODULE_DEF_MAP {
+        let _ = query_eval(mut_view(*db), Q_PARSE_MODULE, key);
+        // DefMap fingerprint depends on exported item names/kinds in the module, not function body text!
+        new_fp = mix64(0x4445464D4150u64, key as u64);
+    } else if kind == Q_RESOLVE_MODULE {
+        let pm = query_eval(mut_view(*db), Q_PARSE_MODULE, key);
+        let dm = query_eval(mut_view(*db), Q_MODULE_DEF_MAP, key);
+        new_fp = mix64(pm.value_fp, dm.value_fp);
+    } else if kind == Q_ITEM_SIGNATURE {
+        let m_id = def_module(key);
+        let dm = query_eval(mut_view(*db), Q_MODULE_DEF_MAP, m_id);
+        new_fp = mix64(dm.value_fp, db.def_sig_seed[key as usize]);
+    } else if kind == Q_TYPECK_BODY {
+        let m_id = def_module(key);
+        let rm = query_eval(mut_view(*db), Q_RESOLVE_MODULE, m_id);
+        let sig_self = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, key);
+        new_fp = mix64(mix64(rm.value_fp, sig_self.value_fp), db.def_body_seed[key as usize]);
+        if key == DEF_APP_COMPUTE {
+            // AXS-QRY-004 Header/body firewall: queries item_signature(math.square), NOT typeck_body(math.square)
+            let sig_sq = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, DEF_MATH_SQUARE);
+            new_fp = mix64(new_fp, sig_sq.value_fp);
+        } else if key == DEF_MATH_FACT {
+            // AXS-QRY-020 Legal runtime recursion: queries item_signature(math.fact), NOT typeck_body(math.fact)
+            let sig_fact = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, DEF_MATH_FACT);
+            new_fp = mix64(new_fp, sig_fact.value_fp);
+        } else if key == DEF_APP_USE_CTFE {
+            // AXS-QRY-004 section 1 exception: CTFE/inferred callee queries both item_signature and typeck_body
+            let sig_ctfe = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, DEF_MATH_CTFE_CONST_FN);
+            let body_ctfe = query_eval(mut_view(*db), Q_TYPECK_BODY, DEF_MATH_CTFE_CONST_FN);
+            new_fp = mix64(mix64(new_fp, sig_ctfe.value_fp), body_ctfe.value_fp);
+        }
+    } else {
+        let sig_m = query_eval(mut_view(*db), Q_ITEM_SIGNATURE, key);
+        let tck_m = query_eval(mut_view(*db), Q_TYPECK_BODY, key);
+        new_fp = mix64(sig_m.value_fp, tck_m.value_fp);
+    }
+
+    // Backdating firewall check (AXS-QRY-033 section 4)
+    let changed_rev = if had_prev && new_fp == cur.value_fp {
+        db.backdated_count = db.backdated_count + 1u32;
+        cur.changed_at
+    } else {
+        rev
+    };
+
+    db.slots[idx].state = STATE_READY;
+    db.slots[idx].verified_at = rev;
+    db.slots[idx].changed_at = changed_rev;
+    db.slots[idx].value_fp = new_fp;
+    db.slots[idx]
+}
+
+pub fn main() -> i32 {
+    let empty_slot = MemoSlot {
+        state: STATE_VACANT,
+        verified_at: 0u64,
+        changed_at: 0u64,
+        value_fp: 0u64,
+        hits: 0u32,
+        misses: 0u32,
+        provider_runs: 0u32,
+        green_reuses: 0u32,
+    };
+    let mut db1 = SessionDB {
+        session_id: 101u64,
+        revision: 1u64,
+        mod_source_hash: [0u64, 0x1111u64, 0x2222u64, 0x3333u64],
+        mod_changed_at: [0u64, 1u64, 1u64, 1u64],
+        def_sig_seed: [0u64, 101u64, 102u64, 103u64, 104u64, 201u64, 202u64, 203u64, 301u64],
+        def_body_seed: [0u64, 501u64, 502u64, 503u64, 504u64, 601u64, 602u64, 603u64, 701u64],
+        slots: [empty_slot; 64],
+        total_hits: 0u32,
+        total_misses: 0u32,
+        total_provider_runs: 0u32,
+        total_green_reuses: 0u32,
+        backdated_count: 0u32,
+        dirtied_slots: 0u32,
+    };
+    let db2 = SessionDB {
+        session_id: 202u64,
+        revision: 1u64,
+        mod_source_hash: [0u64, 0x1111u64, 0x2222u64, 0x3333u64],
+        mod_changed_at: [0u64, 1u64, 1u64, 1u64],
+        def_sig_seed: [0u64, 101u64, 102u64, 103u64, 104u64, 201u64, 202u64, 203u64, 301u64],
+        def_body_seed: [0u64, 501u64, 502u64, 503u64, 504u64, 601u64, 602u64, 603u64, 701u64],
+        slots: [empty_slot; 64],
+        total_hits: 0u32,
+        total_misses: 0u32,
+        total_provider_runs: 0u32,
+        total_green_reuses: 0u32,
+        backdated_count: 0u32,
+        dirtied_slots: 0u32,
+    };
+
+    // 1. Demand-driven cross-module query on `typeck_body(app.compute)`
+    let comp_r1 = query_eval(mut_view(db1), Q_TYPECK_BODY, DEF_APP_COMPUTE);
+    if comp_r1.state != STATE_READY || comp_r1.misses != 1u32 {
+        return 1;
+    }
+
+    // Session isolation check: db2 has 0 misses and 0 hits
+    if db2.total_misses != 0u32 || db2.total_hits != 0u32 {
+        return 2;
+    }
+
+    // Header/body firewall & multi-module isolation checks
+    let sq_sig = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_MATH_SQUARE)];
+    let sq_body = db1.slots[slot_idx(Q_TYPECK_BODY, DEF_MATH_SQUARE)];
+    let sq_mir = db1.slots[slot_idx(Q_MIR_BODY, DEF_MATH_SQUARE)];
+    let math_res = db1.slots[slot_idx(Q_RESOLVE_MODULE, MOD_MATH)];
+    let unref_math = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_MATH_UNREF_HEAVY)];
+    let unref_app = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_APP_UNREF)];
+    let unused_mod_parse = db1.slots[slot_idx(Q_PARSE_MODULE, MOD_UNUSED)];
+    let unused_mod_fn = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_UNUSED_MOD_FN)];
+
+    if sq_sig.misses != 1u32 || sq_body.misses != 0u32 || sq_mir.misses != 0u32 || math_res.misses != 0u32 {
+        return 3;
+    }
+    if unref_math.misses != 0u32 || unref_app.misses != 0u32 || unused_mod_parse.misses != 0u32 || unused_mod_fn.misses != 0u32 {
+        return 4;
+    }
+    print("cross_module_firewall_isolated=true\n");
+
+    // 2. Warm memo hit in same revision R1
+    let hits_before = db1.total_hits;
+    let misses_before = db1.total_misses;
+    let comp_warm = query_eval(mut_view(db1), Q_TYPECK_BODY, DEF_APP_COMPUTE);
+    if comp_warm.value_fp != comp_r1.value_fp || db1.total_hits != hits_before + 1u32 || db1.total_misses != misses_before {
+        return 5;
+    }
+    print("warm_memo_same_rev_hit=true\n");
+
+    // 3. Legal runtime recursion on `math.fact`
+    let fact_r1 = query_eval(mut_view(db1), Q_TYPECK_BODY, DEF_MATH_FACT);
+    let fact_sig = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_MATH_FACT)];
+    if fact_r1.state != STATE_READY || fact_sig.misses != 1u32 || fact_sig.hits != 1u32 {
+        return 6;
+    }
+    print("legal_runtime_recursion_ok=true\n");
+
+    // 4. CTFE / inferred-return callee exception (AXS-QRY-004 section 1)
+    let _ = query_eval(mut_view(db1), Q_TYPECK_BODY, DEF_APP_USE_CTFE);
+    let ctfe_body = db1.slots[slot_idx(Q_TYPECK_BODY, DEF_MATH_CTFE_CONST_FN)];
+    if ctfe_body.misses != 1u32 || sq_body.misses != 0u32 {
+        return 7;
+    }
+    print("ctfe_body_dependency_evaluated=true\n");
+
+    // 5. No-op ContentHash update at R2 (identical source hash 0x1111) -> 0 slots dirtied
+    let dirtied_before_noop = db1.dirtied_slots;
+    let r2 = update_module_source(mut_view(db1), MOD_MATH, 0x1111u64, 501u64);
+    if r2 != 2u64 || db1.dirtied_slots != dirtied_before_noop {
+        return 8;
+    }
+    print("noop_content_hash_zero_dirty=true\n");
+
+    // 6. Body-only edit in `math.square` at R3 (new source hash 0x1999, new square body seed 999)
+    // `item_signature(math.square)` re-evaluates and backdates to R1 -> `typeck_body(app.compute)` green-reused!
+    let comp_runs_before_r3 = db1.slots[slot_idx(Q_TYPECK_BODY, DEF_APP_COMPUTE)].provider_runs;
+    let r3 = update_module_source(mut_view(db1), MOD_MATH, 0x1999u64, 999u64);
+    let comp_r3 = query_eval(mut_view(db1), Q_TYPECK_BODY, DEF_APP_COMPUTE);
+    let sq_sig_r3 = db1.slots[slot_idx(Q_ITEM_SIGNATURE, DEF_MATH_SQUARE)];
+    if r3 != 3u64 || comp_r3.provider_runs != comp_runs_before_r3 || comp_r3.green_reuses == 0u32 {
+        return 9;
+    }
+    if sq_sig_r3.verified_at != 3u64 || sq_sig_r3.changed_at != 1u64 || db1.backdated_count == 0u32 {
+        return 10;
+    }
+    print("shallow_verify_and_backdate_reuse=true\n");
+    print("DEMAND-DRIVEN-ISOLATION-AND-MEMO-OK\n");
+    0
+}

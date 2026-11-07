@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T064]
 priority: 108
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/opt/ipa, compiler/opt/devirt, tests/run/opt_ipa_devirt]
 spec: [spec/SPEC-73-inlining-specialization-devirt.md, 0131, tasks/0400, tasks/0401, tasks/0551]
 covers: [REQ-OPT-087, REQ-OPT-088, REQ-OPT-089, REQ-OPT-090, REQ-OPT-091, REQ-OPT-092, REQ-OPT-093, REQ-OPT-094, REQ-OPT-095, REQ-OPT-096, REQ-OPT-097, REQ-OPT-098, REQ-OPT-099, REQ-OPT-100, REQ-OPT-101, REQ-OPT-102, REQ-OPT-103, REQ-OPT-104, REQ-OPT-105, REQ-OPT-106, REQ-OPT-107]
+started: 2026-11-07 19:44:13
+agent: T614-impl
 ---
 # T614 — E15.4 — Interprocedural call-site/constant/closure specialization, devirtualization & tail-call optimization
 
@@ -40,3 +42,4 @@ Implement interprocedural constant/closure call-site specialization, proven conc
 
 ## Log
 - 2026-11-03 02:41:00 created by T215 (P15 phase planning)
+- 2026-11-07 19:44:13 started (attempt 1) T614-impl
