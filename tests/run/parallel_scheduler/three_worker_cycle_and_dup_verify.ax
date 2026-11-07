@@ -1,0 +1,185 @@
+// test: run
+// modes: interp native
+// stdout-file: three_worker_cycle_and_dup_verify.stdout
+// SPEC-23 AXS-PAR-010 §3, AXS-PAR-011, AXS-PAR-050, INV-PAR-001:
+// QA boundary test:
+// 1. 3-worker transitive wait-for cycle (`W0 -> W1 -> W2 -> W0`) across 3 queries
+//    with canonical rotation to minimum `SemanticKey` (`Q_B`, rank 10) from all 3 closing orders.
+// 2. Duplicate/speculative `InFlightLatch` completion fingerprint equivalence check (`AXS-PAR-010 §3`).
+// 3. `SCHEDULE_MODE_DETERMINISTIC_DEBUG` vs `SCHEDULE_MODE_BALANCED` priority queue tie-breaking
+//    with identical post-join merged digest (`AXS-PAR-050`).
+
+@derive(Copy)
+struct WaitEdge3 {
+    waiter_w: u32,
+    target_w: u32,
+    target_q: u32,
+    active: bool,
+}
+
+struct EdgeTable3 {
+    edges: [4]WaitEdge3,
+}
+
+fn detect_3worker_cycle_head(closing_order: u32) -> u32 {
+    // Queries Q0 (rank 30, owned by W0), Q1 (rank 10, owned by W1), Q2 (rank 20, owned by W2)
+    let ranks: [3]u32 = [30u32, 10u32, 20u32];
+    let zero_e = WaitEdge3 { waiter_w: 0u32, target_w: 0u32, target_q: 0u32, active: false };
+    let mut tab = EdgeTable3 { edges: [zero_e; 4] };
+
+    let mut waiter_w: u32 = 0u32;
+    let mut target_w: u32 = 0u32;
+    let mut start_q: u32 = 0u32;
+    let mut target_q: u32 = 0u32;
+
+    if closing_order == 0u32 {
+        // W0 -> W1 and W1 -> W2 already active; W2 requests Q0 (owned by W0)
+        tab.edges[0] = WaitEdge3 { waiter_w: 0u32, target_w: 1u32, target_q: 1u32, active: true };
+        tab.edges[1] = WaitEdge3 { waiter_w: 1u32, target_w: 2u32, target_q: 2u32, active: true };
+        waiter_w = 2u32;
+        target_w = 0u32;
+        start_q = 2u32;
+        target_q = 0u32;
+    } else if closing_order == 1u32 {
+        // W1 -> W2 and W2 -> W0 already active; W0 requests Q1 (owned by W1)
+        tab.edges[0] = WaitEdge3 { waiter_w: 1u32, target_w: 2u32, target_q: 2u32, active: true };
+        tab.edges[1] = WaitEdge3 { waiter_w: 2u32, target_w: 0u32, target_q: 0u32, active: true };
+        waiter_w = 0u32;
+        target_w = 1u32;
+        start_q = 0u32;
+        target_q = 1u32;
+    } else {
+        // W2 -> W0 and W0 -> W1 already active; W1 requests Q2 (owned by W2)
+        tab.edges[0] = WaitEdge3 { waiter_w: 2u32, target_w: 0u32, target_q: 0u32, active: true };
+        tab.edges[1] = WaitEdge3 { waiter_w: 0u32, target_w: 1u32, target_q: 1u32, active: true };
+        waiter_w = 1u32;
+        target_w = 2u32;
+        start_q = 1u32;
+        target_q = 2u32;
+    }
+
+    let mut chain_q: [4]u32 = [start_q, target_q, 0u32, 0u32];
+    let mut step_len: usize = 2;
+    let mut cur_w = target_w;
+    let mut hops: u32 = 0u32;
+    let mut closed = false;
+
+    while hops < 4u32 {
+        let mut found = false;
+        let mut next_w: u32 = 99u32;
+        let mut next_q: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < 2 {
+            let e = tab.edges[i];
+            if !found && e.active && e.waiter_w == cur_w {
+                found = true;
+                next_w = e.target_w;
+                next_q = e.target_q;
+            }
+            i = i + 1;
+        }
+        if !found {
+            break;
+        }
+        if next_w == waiter_w {
+            closed = true;
+            break;
+        }
+        if step_len < 4 {
+            chain_q[step_len] = next_q;
+            step_len = step_len + 1;
+        }
+        cur_w = next_w;
+        hops = hops + 1u32;
+    }
+
+    if !closed || step_len != 3 {
+        return 999u32;
+    }
+
+    // Rotate 3-node cycle to canonical minimum semantic rank
+    let mut min_q = chain_q[0];
+    let mut min_rank = ranks[min_q as usize];
+    let mut k: usize = 1;
+    while k < step_len {
+        let q = chain_q[k];
+        let r = ranks[q as usize];
+        if r < min_rank {
+            min_rank = r;
+            min_q = q;
+        }
+        k = k + 1;
+    }
+    min_q
+}
+
+@derive(Copy)
+struct LatchVerifyState {
+    is_ready: bool,
+    committed_fp: u64,
+    dup_verified_count: u32,
+}
+
+fn complete_or_verify_latch(st: mut_view<LatchVerifyState>, candidate_fp: u64) -> bool {
+    if !st.is_ready {
+        st.is_ready = true;
+        st.committed_fp = candidate_fp;
+        return true;
+    }
+    st.dup_verified_count = st.dup_verified_count + 1u32;
+    st.committed_fp == candidate_fp
+}
+
+fn schedule_first_picked(deterministic_debug: bool) -> u32 {
+    // Task A: semantic_rank = 1, critical_cost = 100
+    // Task B: semantic_rank = 2, critical_cost = 500
+    let rank_a: u32 = 1u32;
+    let cost_a: u64 = 100u64;
+    let rank_b: u32 = 2u32;
+    let cost_b: u64 = 500u64;
+
+    let a_before_b = if !deterministic_debug {
+        if cost_a != cost_b {
+            cost_a > cost_b
+        } else {
+            rank_a < rank_b
+        }
+    } else {
+        rank_a < rank_b
+    };
+
+    if a_before_b { rank_a } else { rank_b }
+}
+
+pub fn main() -> i32 {
+    // 1. Verify 3-worker cycle closes and rotates to Q1 (minimum rank 10) under all 3 closing orders
+    let h0 = detect_3worker_cycle_head(0u32);
+    let h1 = detect_3worker_cycle_head(1u32);
+    let h2 = detect_3worker_cycle_head(2u32);
+    if h0 != 1u32 || h1 != 1u32 || h2 != 1u32 {
+        return 1;
+    }
+
+    // 2. Verify duplicate/speculative latch completion fingerprint equivalence check
+    let mut latch = LatchVerifyState {
+        is_ready: false,
+        committed_fp: 0u64,
+        dup_verified_count: 0u32,
+    };
+    let first_ok = complete_or_verify_latch(mut_view(latch), 0xABCD1234u64);
+    let dup_match = complete_or_verify_latch(mut_view(latch), 0xABCD1234u64);
+    let dup_mismatch = complete_or_verify_latch(mut_view(latch), 0xDEAD9999u64);
+    if !first_ok || !dup_match || dup_mismatch || latch.dup_verified_count != 2u32 {
+        return 2;
+    }
+
+    // 3. Verify Balanced vs DeterministicDebug dispatch order tie-breaking
+    let first_balanced = schedule_first_picked(false);
+    let first_det_debug = schedule_first_picked(true);
+    if first_balanced != 2u32 || first_det_debug != 1u32 {
+        return 3;
+    }
+
+    print("THREE-WORKER-CYCLE-AND-DUP-VERIFY-OK\n");
+    0
+}

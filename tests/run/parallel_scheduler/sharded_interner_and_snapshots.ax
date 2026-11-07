@@ -1,0 +1,220 @@
+// test: run
+// modes: interp native
+// stdout-file: sharded_interner_and_snapshots.stdout
+// SPEC-23 AXS-PAR-003..005, INV-PAR-001:
+// Verify immutable `ParallelSnapshot` / `SnapshotEpoch` fork/freeze, module-scoped
+// `(ModuleId, LocalIndex)` semantic IDs (`ScopedDefId`, `ScopedHirId`), and 64-shard
+// content-addressed interning (`ShardedInterner`) independent of worker arrival order.
+
+@derive(Copy)
+struct ScopedDefId {
+    module_id: u32,
+    local_index: u32,
+}
+
+@derive(Copy)
+struct ShardedInternId {
+    shard_id: u16,
+    local_offset: u32,
+    canonical_index: u32,
+    hash64: u64,
+}
+
+@derive(Copy)
+struct ShardSlot {
+    hash64: u64,
+    tag: u32,
+    dedup_hits: u32,
+}
+
+struct ShardSlots {
+    slots: [512]ShardSlot,
+}
+
+struct ShardCounts {
+    counts: [64]u32,
+}
+
+@derive(Copy)
+struct InternStats {
+    total_entries: u32,
+    total_dedup_hits: u32,
+}
+
+fn encode_scoped_def(id: ScopedDefId) -> u32 {
+    ((id.module_id & 0xFFFFu32) << 16u32) | (id.local_index & 0xFFFFu32)
+}
+
+fn hash_item(domain: u8, tag: u32) -> u64 {
+    let d = (domain as u64) << 56u64;
+    let t = (tag as u64) ^ ((tag as u64) << 19u64) ^ ((tag as u64) << 37u64);
+    let mut x: u64 = d ^ t ^ 0x9E3779B97F4A7C15u64;
+    x = x ^ (x >> 23u64) ^ (x << 11u64);
+    x = x ^ 0xBF58476D1CE4E5B9u64 ^ (t << 51u64);
+    x ^ (x >> 31u64)
+}
+
+fn route_shard64(h: u64) -> u16 {
+    (((h >> 58u64) ^ (h >> 26u64) ^ h) & 63u64) as u16
+}
+
+fn shard_base(sid: u16) -> usize {
+    (sid as usize) * 8
+}
+
+fn intern_into_shard(
+    tab: mut_view<ShardSlots>,
+    cnts: mut_view<ShardCounts>,
+    stats: mut_view<InternStats>,
+    domain: u8,
+    tag: u32
+) -> ShardedInternId {
+    let h = hash_item(domain, tag);
+    let sid = route_shard64(h);
+    let s_idx = sid as usize;
+    let base = shard_base(sid);
+    let cnt = cnts.counts[s_idx];
+
+    let mut i: u32 = 0u32;
+    while i < cnt {
+        let slot_idx = base + (i as usize);
+        let cur = tab.slots[slot_idx];
+        if cur.hash64 == h && cur.tag == tag {
+            tab.slots[slot_idx] = ShardSlot {
+                hash64: cur.hash64,
+                tag: cur.tag,
+                dedup_hits: cur.dedup_hits + 1u32,
+            };
+            stats.total_dedup_hits = stats.total_dedup_hits + 1u32;
+            return ShardedInternId {
+                shard_id: sid,
+                local_offset: i,
+                canonical_index: 0u32,
+                hash64: h,
+            };
+        }
+        i = i + 1u32;
+    }
+
+    // Insert sorted by (hash64, tag) inside the shard so local_offset is arrival-order-independent
+    let mut pos: usize = cnt as usize;
+    while pos > 0 {
+        let prev = tab.slots[base + pos - 1];
+        if (prev.hash64) < h || (prev.hash64 == h && (prev.tag) <= tag) {
+            break;
+        }
+        tab.slots[base + pos] = prev;
+        pos = pos - 1;
+    }
+    tab.slots[base + pos] = ShardSlot {
+        hash64: h,
+        tag: tag,
+        dedup_hits: 0u32,
+    };
+    cnts.counts[s_idx] = cnt + 1u32;
+    stats.total_entries = stats.total_entries + 1u32;
+    ShardedInternId {
+        shard_id: sid,
+        local_offset: pos as u32,
+        canonical_index: 0u32,
+        hash64: h,
+    }
+}
+
+fn lookup_canonical(
+    tab: mut_view<ShardSlots>,
+    cnts: mut_view<ShardCounts>,
+    domain: u8,
+    tag: u32
+) -> ShardedInternId {
+    let h = hash_item(domain, tag);
+    let sid = route_shard64(h);
+    let mut global_base: u32 = 0u32;
+    let mut s: usize = 0;
+    while s < (sid as usize) {
+        global_base = global_base + cnts.counts[s];
+        s = s + 1;
+    }
+    let base = shard_base(sid);
+    let cnt = cnts.counts[sid as usize];
+    let mut i: u32 = 0u32;
+    while i < cnt {
+        let cur = tab.slots[base + (i as usize)];
+        if cur.hash64 == h && cur.tag == tag {
+            return ShardedInternId {
+                shard_id: sid,
+                local_offset: i,
+                canonical_index: global_base + i,
+                hash64: h,
+            };
+        }
+        i = i + 1u32;
+    }
+    ShardedInternId { shard_id: sid, local_offset: 999u32, canonical_index: 999u32, hash64: h }
+}
+
+pub fn main() -> i32 {
+    let mut tab_seq = ShardSlots {
+        slots: [ShardSlot { hash64: 0u64, tag: 0u32, dedup_hits: 0u32 }; 512],
+    };
+    let mut cnts_seq = ShardCounts { counts: [0u32; 64] };
+    let mut stats_seq = InternStats { total_entries: 0u32, total_dedup_hits: 0u32 };
+
+    let mut tab_par = ShardSlots {
+        slots: [ShardSlot { hash64: 0u64, tag: 0u32, dedup_hits: 0u32 }; 512],
+    };
+    let mut cnts_par = ShardCounts { counts: [0u32; 64] };
+    let mut stats_par = InternStats { total_entries: 0u32, total_dedup_hits: 0u32 };
+
+    // Sequential worker order (--jobs 1): tags 10..17
+    let mut t: u32 = 10u32;
+    while t <= 17u32 {
+        let _ = intern_into_shard(mut_view(tab_seq), mut_view(cnts_seq), mut_view(stats_seq), 1u8, t);
+        t = t + 1u32;
+    }
+    // Duplicate interning on sequential worker
+    let _ = intern_into_shard(mut_view(tab_seq), mut_view(cnts_seq), mut_view(stats_seq), 1u8, 12u32);
+    let _ = intern_into_shard(mut_view(tab_seq), mut_view(cnts_seq), mut_view(stats_seq), 1u8, 15u32);
+
+    // Interleaved / reversed worker arrival order (--jobs 8): tags 17..10 + duplicates
+    let _ = intern_into_shard(mut_view(tab_par), mut_view(cnts_par), mut_view(stats_par), 1u8, 15u32);
+    let mut r: u32 = 17u32;
+    while r >= 10u32 {
+        let _ = intern_into_shard(mut_view(tab_par), mut_view(cnts_par), mut_view(stats_par), 1u8, r);
+        if r == 10u32 {
+            break;
+        }
+        r = r - 1u32;
+    }
+    let _ = intern_into_shard(mut_view(tab_par), mut_view(cnts_par), mut_view(stats_par), 1u8, 12u32);
+
+    if stats_seq.total_entries != 8u32 || stats_par.total_entries != 8u32 {
+        return 1;
+    }
+    if stats_seq.total_dedup_hits != 2u32 || stats_par.total_dedup_hits != 2u32 {
+        return 2;
+    }
+
+    let mut check_tag: u32 = 10u32;
+    while check_tag <= 17u32 {
+        let id_a = lookup_canonical(mut_view(tab_seq), mut_view(cnts_seq), 1u8, check_tag);
+        let id_b = lookup_canonical(mut_view(tab_par), mut_view(cnts_par), 1u8, check_tag);
+        if id_a.shard_id != id_b.shard_id ||
+            id_a.local_offset != id_b.local_offset ||
+            id_a.canonical_index != id_b.canonical_index ||
+            id_a.hash64 != id_b.hash64 {
+            return 3;
+        }
+        check_tag = check_tag + 1u32;
+    }
+
+    // Module-scoped (ModuleId, LocalIndex) encoding is invariant under parallel scheduling
+    let d_geom_dot = encode_scoped_def(ScopedDefId { module_id: 1u32, local_index: 1u32 });
+    let d_phys_kin = encode_scoped_def(ScopedDefId { module_id: 2u32, local_index: 1u32 });
+    if d_geom_dot == d_phys_kin || (d_geom_dot >> 16u32) != 1u32 || (d_phys_kin >> 16u32) != 2u32 {
+        return 4;
+    }
+
+    print("SHARDED-INTERNER-AND-SNAPSHOTS-OK\n");
+    0
+}

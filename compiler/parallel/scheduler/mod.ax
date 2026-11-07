@@ -1,0 +1,2449 @@
+// Thread-Safe Immutable `CompilerDB` Snapshots (`ParallelSnapshot`, `SnapshotEpoch`),
+// Module-Scoped `(ModuleId, LocalIndex)` Semantic IDs, Sharded Content-Addressed
+// String & Type Interner (`ShardedInterner`), Single-Flight Query Deduplication
+// (`InFlightLatch`), Cross-Worker Cycle Detection (`WaitForGraph`), and Work-Stealing
+// Query Scheduler (`ParallelScheduler`, `--jobs <N>`) (T761 / E18.3).
+// Implements SPEC-23 §1-§2 & §4 (AXS-PAR-001..005, AXS-PAR-010..015, AXS-PAR-023, AXS-PAR-050..053, INV-PAR-001).
+module compiler.parallel.scheduler
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.CompilerDB
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.ConstEvalResult
+use compiler.query.db.CYCLE_POLICY_DEPTH_LIMITED
+use compiler.query.db.DatabaseSnapshot
+use compiler.query.db.DefEntry
+use compiler.query.db.DefId
+use compiler.query.db.DIAG_AX_CTM_CYCLE
+use compiler.query.db.DIAG_AX_QUERY_CYCLE
+use compiler.query.db.DIAG_AX_QUERY_DEPTH_LIMIT
+use compiler.query.db.DIAG_AX_TRAIT_CYCLE
+use compiler.query.db.DIAG_AX_TYPE_CYCLE
+use compiler.query.db.DIAG_AX_TYP_MISMATCH
+use compiler.query.db.DURABILITY_HIGH
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.DURABILITY_MEDIUM
+use compiler.query.db.EffectSummaryResult
+use compiler.query.db.Fingerprint128
+use compiler.query.db.HirId
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_IMPL
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_KIND_TRAIT
+use compiler.query.db.ITEM_KIND_TYPE_ALIAS
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_MODULE
+use compiler.query.db.ITEM_NS_PACKAGE
+use compiler.query.db.ITEM_NS_SOURCE
+use compiler.query.db.ITEM_NS_TRAIT
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_UNIT
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ItemSignatureResult
+use compiler.query.db.LayoutOfResult
+use compiler.query.db.MemoEntry
+use compiler.query.db.MirBodyId
+use compiler.query.db.MirBodyResult
+use compiler.query.db.ModuleDefMapResult
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.ParseModuleResult
+use compiler.query.db.QRY_ID_ERROR
+use compiler.query.db.QRY_ID_NONE
+use compiler.query.db.QRY_MAX_DEFS
+use compiler.query.db.QRY_MAX_DIAGS
+use compiler.query.db.QRY_MAX_MEMO_SLOTS
+use compiler.query.db.QRY_MAX_MODULES
+use compiler.query.db.QRY_MAX_TRAIT_GOALS
+use compiler.query.db.QRY_MAX_TYPE_LAYOUTS
+use compiler.query.db.QUERY_CONST_EVAL
+use compiler.query.db.QUERY_EFFECT_SUMMARY
+use compiler.query.db.QUERY_INPUT_MODULE_TREE
+use compiler.query.db.QUERY_INPUT_PACKAGE_GRAPH
+use compiler.query.db.QUERY_INPUT_SOURCE_FILE
+use compiler.query.db.QUERY_INPUT_TARGET_CONFIG
+use compiler.query.db.QUERY_ITEM_SIGNATURE
+use compiler.query.db.QUERY_LAYOUT_OF
+use compiler.query.db.QUERY_MIR_BODY
+use compiler.query.db.QUERY_MODULE_DEF_MAP
+use compiler.query.db.QUERY_PARSE_MODULE
+use compiler.query.db.QUERY_RESOLVE_MODULE
+use compiler.query.db.QUERY_STATE_COMPUTING
+use compiler.query.db.QUERY_STATE_MAYBE_DIRTY
+use compiler.query.db.QUERY_STATE_POISONED
+use compiler.query.db.QUERY_STATE_READY
+use compiler.query.db.QUERY_STATE_VACANT
+use compiler.query.db.QUERY_TRAIT_SOLVE
+use compiler.query.db.QUERY_TYPECK_BODY
+use compiler.query.db.QueryDiag
+use compiler.query.db.QueryKey
+use compiler.query.db.QueryStackFrame
+use compiler.query.db.ResolveModuleResult
+use compiler.query.db.RevisionId
+use compiler.query.db.SemanticKey
+use compiler.query.db.SnapshotId
+use compiler.query.db.SourceFileId
+use compiler.query.db.SymbolId
+use compiler.query.db.TRAIT_RESULT_ERROR
+use compiler.query.db.TRAIT_RESULT_IMPLEMENTED
+use compiler.query.db.TRAIT_RESULT_NO_SOLUTION
+use compiler.query.db.TraitGoalEntry
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.TraitSolveResult
+use compiler.query.db.TypeId
+use compiler.query.db.TypeLayoutEntry
+use compiler.query.db.TypeckBodyResult
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_add_body_call
+use compiler.query.db.query_db_add_body_const_dep
+use compiler.query.db.query_db_add_body_layout_dep
+use compiler.query.db.query_db_add_sig_dep
+use compiler.query.db.query_db_add_type_layout_field
+use compiler.query.db.query_db_attach_diag
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_find_def_index
+use compiler.query.db.query_db_find_slot
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_get_def
+use compiler.query.db.query_db_get_or_create_slot
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_intern_sv
+use compiler.query.db.query_db_module_package_name
+use compiler.query.db.query_db_module_path
+use compiler.query.db.query_db_push_diag_code_name
+use compiler.query.db.query_db_push_kind_name
+use compiler.query.db.query_db_push_query_key
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.query_db_read_module_tree_input
+use compiler.query.db.query_db_read_source_file_input
+use compiler.query.db.query_db_read_target_config_input
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_db_register_trait_goal
+use compiler.query.db.query_db_register_type_layout
+use compiler.query.db.query_db_replay_slot_diags
+use compiler.query.db.query_db_reset_session_diags
+use compiler.query.db.query_db_scan_module_source
+use compiler.query.db.query_db_set_def_flags
+use compiler.query.db.query_db_set_def_seeds
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_set_package_graph_input
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_db_snapshot
+use compiler.query.db.query_key_cmp
+use compiler.query.db.query_key_eq
+use compiler.query.db.query_key_fingerprint
+use compiler.query.db.query_key_for_const_eval
+use compiler.query.db.query_key_for_def
+use compiler.query.db.query_key_for_layout_of
+use compiler.query.db.query_key_for_module
+use compiler.query.db.query_key_for_trait_goal
+use compiler.query.db.query_key_new
+use compiler.query.db.query_kind_cycle_diag_code
+use compiler.query.db.query_kind_cycle_policy
+use compiler.query.db.query_kind_is_derived
+use compiler.query.db.query_kind_is_input
+use compiler.query.db.revision_id_eq
+use compiler.query.db.revision_id_lt
+use compiler.query.db.revision_id_zero
+use compiler.query.db.semantic_key_cmp
+use compiler.query.db.semantic_key_eq
+use compiler.query.db.semantic_key_fingerprint
+use compiler.query.db.semantic_key_new
+use compiler.query.db.snapshot_id_new
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+fn sched_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+// ============================================================================
+// 1. Thread-Safe Immutable CompilerDB Snapshots (`ParallelSnapshot`, `SnapshotEpoch`)
+//    (SPEC-23 AXS-PAR-003)
+// ============================================================================
+
+@derive(Copy)
+pub struct SnapshotEpoch {
+    pub epoch_id: u64,
+    pub revision: RevisionId,
+    pub parent_epoch_id: u64,
+    pub is_frozen: bool,
+}
+
+pub fn snapshot_epoch_zero() -> SnapshotEpoch {
+    SnapshotEpoch {
+        epoch_id: 0u64,
+        revision: revision_id_zero(),
+        parent_epoch_id: 0u64,
+        is_frozen: false,
+    }
+}
+
+pub fn snapshot_epoch_new(epoch_id: u64, revision: RevisionId, parent_epoch_id: u64, is_frozen: bool) -> SnapshotEpoch {
+    SnapshotEpoch {
+        epoch_id: epoch_id,
+        revision: revision,
+        parent_epoch_id: parent_epoch_id,
+        is_frozen: is_frozen,
+    }
+}
+
+pub fn snapshot_epoch_eq(a: SnapshotEpoch, b: SnapshotEpoch) -> bool {
+    a.epoch_id == b.epoch_id &&
+        revision_id_eq(a.revision, b.revision) &&
+        a.parent_epoch_id == b.parent_epoch_id &&
+        a.is_frozen == b.is_frozen
+}
+
+@derive(Copy)
+pub struct ParallelSnapshot {
+    pub db_snapshot: DatabaseSnapshot,
+    pub epoch: SnapshotEpoch,
+    pub worker_count: u32,
+    pub active_readers: u32,
+    pub frozen_def_count: u32,
+    pub frozen_memo_count: u32,
+    pub snapshot_fingerprint: Fingerprint128,
+    pub is_immutable: bool,
+    pub arena_sealed: bool,
+}
+
+@derive(Copy)
+pub struct WorkerArenaState {
+    pub worker_id: u32,
+    pub epoch_id: u64,
+    pub allocated_bytes: u64,
+    pub sealed_entries: u32,
+    pub is_isolated: bool,
+    pub is_frozen: bool,
+    pub arena_fingerprint: Fingerprint128,
+}
+
+pub fn worker_arena_init(worker_id: u32, epoch_id: u64) -> WorkerArenaState {
+    WorkerArenaState {
+        worker_id: worker_id,
+        epoch_id: epoch_id,
+        allocated_bytes: 0u64,
+        sealed_entries: 0u32,
+        is_isolated: true,
+        is_frozen: false,
+        arena_fingerprint: fingerprint128_u64(0x574B5F4152454E41u64, worker_id as u64, epoch_id),
+    }
+}
+
+pub fn worker_arena_record_alloc(wa: *mut WorkerArenaState, bytes: u64, entry_fp: Fingerprint128) {
+    if unsafe { (*wa).is_frozen } {
+        return;
+    }
+    unsafe {
+        (*wa).allocated_bytes = (*wa).allocated_bytes + bytes;
+        (*wa).sealed_entries = (*wa).sealed_entries + 1u32;
+        (*wa).arena_fingerprint = fingerprint128_combine((*wa).arena_fingerprint, entry_fp);
+    }
+}
+
+pub fn worker_arena_freeze(wa: *mut WorkerArenaState) {
+    unsafe { (*wa).is_frozen = true; }
+}
+
+pub fn parallel_snapshot_compute_fingerprint(db: view<CompilerDB>, epoch_id: u64) -> Fingerprint128 {
+    let mut fp = fingerprint128_u64(
+        0x5041525F534E4150u64,
+        epoch_id ^ db.session_id,
+        db.current_revision.raw
+    );
+    let mut i: usize = 0;
+    while i < (db.source_file_count as usize) {
+        let sf = unsafe { *(db.source_files + i) };
+        fp = fingerprint128_combine(fp, sf.content_hash);
+        i = i + 1;
+    }
+    let mut m: usize = 0;
+    while m < (db.module_count as usize) {
+        let md = unsafe { *(db.modules + m) };
+        fp = fingerprint128_combine(fp, md.content_hash);
+        m = m + 1;
+    }
+    let mut t: usize = 0;
+    while t < (db.target_config_count as usize) {
+        let tc = unsafe { *(db.target_configs + t) };
+        fp = fingerprint128_combine(fp, tc.content_hash);
+        t = t + 1;
+    }
+    let mut p: usize = 0;
+    while p < (db.package_count as usize) {
+        let pk = unsafe { *(db.packages + p) };
+        fp = fingerprint128_combine(fp, pk.content_hash);
+        p = p + 1;
+    }
+    let d_count = db.def_count as usize;
+    let mut sorted_defs: [128]usize = [0; 128];
+    let mut di: usize = 0;
+    while di < d_count {
+        sorted_defs[di] = di;
+        di = di + 1;
+    }
+    let mut a: usize = 1;
+    while a < d_count {
+        let cur_idx = sorted_defs[a];
+        let cur_d = unsafe { *(db.defs + cur_idx) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted_defs[b - 1];
+            let prev_d = unsafe { *(db.defs + prev_idx) };
+            if semantic_key_cmp(view(prev_d.semantic_key), view(cur_d.semantic_key)) <= 0i32 {
+                break;
+            }
+            sorted_defs[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted_defs[b] = cur_idx;
+        a = a + 1;
+    }
+    let mut d: usize = 0;
+    while d < d_count {
+        let df = unsafe { *(db.defs + sorted_defs[d]) };
+        fp = fingerprint128_combine(fp, semantic_key_fingerprint(view(df.semantic_key)));
+        d = d + 1;
+    }
+    fp
+}
+
+pub fn parallel_snapshot_freeze(
+    db: view<CompilerDB>,
+    epoch_id: u64,
+    parent_epoch_id: u64,
+    worker_count: u32
+) -> ParallelSnapshot {
+    let base_snap = query_db_snapshot(db);
+    let epoch = snapshot_epoch_new(epoch_id, db.current_revision, parent_epoch_id, true);
+    let snap_fp = parallel_snapshot_compute_fingerprint(db, epoch_id);
+    ParallelSnapshot {
+        db_snapshot: base_snap,
+        epoch: epoch,
+        worker_count: worker_count,
+        active_readers: 0u32,
+        frozen_def_count: db.def_count,
+        frozen_memo_count: db.memo_slot_count,
+        snapshot_fingerprint: snap_fp,
+        is_immutable: true,
+        arena_sealed: true,
+    }
+}
+
+pub fn parallel_snapshot_fork_worker(snap: mut_view<ParallelSnapshot>, _worker_id: u32) -> ParallelSnapshot {
+    snap.active_readers = snap.active_readers + 1u32;
+    *snap
+}
+
+pub fn parallel_snapshot_release_worker(snap: mut_view<ParallelSnapshot>) {
+    if snap.active_readers > 0u32 {
+        snap.active_readers = snap.active_readers - 1u32;
+    }
+}
+
+pub fn parallel_snapshot_eq(a: view<ParallelSnapshot>, b: view<ParallelSnapshot>) -> bool {
+    snapshot_epoch_eq(a.epoch, b.epoch) &&
+        a.is_immutable &&
+        b.is_immutable &&
+        a.frozen_def_count == b.frozen_def_count &&
+        fingerprint128_eq(a.snapshot_fingerprint, b.snapshot_fingerprint)
+}
+
+// ============================================================================
+// 2. Module-Scoped `(ModuleId, LocalIndex)` Semantic IDs & Sharded Content-Addressed
+//    String & Type Interner (`ScopedDefId`, `ScopedHirId`, `ShardedInterner`)
+//    (SPEC-23 AXS-PAR-004, AXS-PAR-005)
+// ============================================================================
+
+@derive(Copy)
+pub struct ScopedDefId {
+    pub module_id: u32,
+    pub local_index: u32,
+}
+
+@derive(Copy)
+pub struct ScopedHirId {
+    pub owner: ScopedDefId,
+    pub body_local_index: u32,
+}
+
+pub fn scoped_def_id_new(module_id: u32, local_index: u32) -> ScopedDefId {
+    ScopedDefId {
+        module_id: module_id,
+        local_index: local_index,
+    }
+}
+
+// Encodes `(ModuleId, LocalIndex)` into a deterministic 32-bit `DefId` without any
+// thread-arrival-dependent global counter (`AXS-PAR-004`).
+pub fn scoped_def_id_to_def_id(scoped: ScopedDefId) -> DefId {
+    DefId {
+        v: ((scoped.module_id & 0xFFFFu32) << 16u32) | (scoped.local_index & 0xFFFFu32),
+    }
+}
+
+pub fn scoped_def_id_from_def_id(def_id: DefId) -> ScopedDefId {
+    ScopedDefId {
+        module_id: (def_id.v >> 16u32) & 0xFFFFu32,
+        local_index: def_id.v & 0xFFFFu32,
+    }
+}
+
+pub fn scoped_def_id_eq(a: ScopedDefId, b: ScopedDefId) -> bool {
+    a.module_id == b.module_id && a.local_index == b.local_index
+}
+
+pub fn scoped_def_id_cmp(a: ScopedDefId, b: ScopedDefId) -> i32 {
+    if (a.module_id) < (b.module_id) {
+        return -1i32;
+    }
+    if (a.module_id) > (b.module_id) {
+        return 1i32;
+    }
+    if (a.local_index) < (b.local_index) {
+        return -1i32;
+    }
+    if (a.local_index) > (b.local_index) {
+        return 1i32;
+    }
+    0i32
+}
+
+pub fn scoped_hir_id_new(owner: ScopedDefId, body_local_index: u32) -> ScopedHirId {
+    ScopedHirId {
+        owner: owner,
+        body_local_index: body_local_index,
+    }
+}
+
+pub fn scoped_hir_id_to_hir_id(scoped: ScopedHirId) -> HirId {
+    let encoded_def = scoped_def_id_to_def_id(scoped.owner);
+    HirId {
+        v: (encoded_def.v ^ (scoped.body_local_index * 257u32)) & 0x7FFFFFFFu32,
+    }
+}
+
+pub fn scoped_hir_id_eq(a: ScopedHirId, b: ScopedHirId) -> bool {
+    scoped_def_id_eq(a.owner, b.owner) && a.body_local_index == b.body_local_index
+}
+
+pub const PAR_SHARD_COUNT: usize = 64;
+pub const PAR_MAX_SHARD_ENTRIES: usize = 16;
+
+pub const INTERN_DOMAIN_STR: u8 = 1u8;
+pub const INTERN_DOMAIN_TYPE: u8 = 2u8;
+
+@derive(Copy)
+pub struct ShardedInternId {
+    pub domain: u8,
+    pub shard_id: u16,
+    pub local_offset: u32,
+    pub canonical_index: u32,
+    pub content_hash64: u64,
+}
+
+@derive(Copy)
+pub struct ShardedInternEntry {
+    pub id: ShardedInternId,
+    pub content: StrView,
+    pub type_tag: u32,
+    pub first_worker_id: u32,
+    pub dedup_hits: u32,
+    pub fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct InternShard {
+    pub shard_id: u16,
+    pub count: u32,
+    pub entries: [16]ShardedInternEntry,
+    pub shard_fingerprint: Fingerprint128,
+}
+
+pub struct ShardedInterner {
+    pub arena: Arena,
+    pub shard_count: u32,
+    pub shards: *mut InternShard,
+    pub total_entries: u32,
+    pub total_dedup_hits: u32,
+    pub is_sealed: bool,
+    pub table_fingerprint: Fingerprint128,
+}
+
+pub fn sharded_intern_id_eq(a: view<ShardedInternId>, b: view<ShardedInternId>) -> bool {
+    a.domain == b.domain &&
+        a.shard_id == b.shard_id &&
+        a.local_offset == b.local_offset &&
+        a.canonical_index == b.canonical_index &&
+        a.content_hash64 == b.content_hash64
+}
+
+pub fn sharded_interner_empty() -> ShardedInterner {
+    ShardedInterner {
+        arena: arena_new(),
+        shard_count: PAR_SHARD_COUNT as u32,
+        shards: 0 as *mut InternShard,
+        total_entries: 0u32,
+        total_dedup_hits: 0u32,
+        is_sealed: false,
+        table_fingerprint: fingerprint128_zero(),
+    }
+}
+
+pub fn sharded_interner_init(interner: mut_view<ShardedInterner>, shard_count: u32) {
+    interner.arena = arena_new();
+    let eff_shards = if shard_count == 0u32 || (shard_count as usize) > PAR_SHARD_COUNT {
+        PAR_SHARD_COUNT as u32
+    } else {
+        shard_count
+    };
+    interner.shard_count = eff_shards;
+    let shard_bytes = (eff_shards as usize) * size_of<InternShard>();
+    interner.shards = arena_alloc_raw(mut_view(interner.arena), shard_bytes, align_of<InternShard>()) as *mut InternShard;
+    sched_zero_bytes(interner.shards as *mut u8, shard_bytes);
+    let mut s: u32 = 0u32;
+    while s < eff_shards {
+        let sp = unsafe { interner.shards + (s as usize) };
+        unsafe {
+            (*sp).shard_id = s as u16;
+            (*sp).count = 0u32;
+            (*sp).shard_fingerprint = fingerprint128_u64(0x53484152445F494Eu64, s as u64, 0u64);
+        }
+        s = s + 1u32;
+    }
+    interner.total_entries = 0u32;
+    interner.total_dedup_hits = 0u32;
+    interner.is_sealed = false;
+    interner.table_fingerprint = fingerprint128_zero();
+}
+
+pub fn sharded_interner_free(interner: mut_view<ShardedInterner>) {
+    arena_destroy(mut_view(interner.arena));
+    interner.shards = 0 as *mut InternShard;
+    interner.total_entries = 0u32;
+    interner.total_dedup_hits = 0u32;
+}
+
+fn sharded_copy_sv(arena: mut_view<Arena>, sv: StrView) -> StrView {
+    if sv.len == 0 || sv.ptr as usize == 0 {
+        return qry_sv_empty();
+    }
+    let dst = arena_alloc_raw(mut_view(*arena), sv.len + 1, 1);
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe { *(dst + i) = *(sv.ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(dst + sv.len) = 0u8; }
+    StrView { ptr: dst as *const u8, len: sv.len }
+}
+
+pub fn sharded_interner_compute_hash64(domain: u8, sv: StrView, type_tag: u32) -> u64 {
+    let raw_h = ax_hash_bytes(sv.ptr, sv.len);
+    let dom_seed = ax_hash_u64(((domain as u64) << 32u64) | (type_tag as u64));
+    ax_hash_combine(dom_seed, raw_h)
+}
+
+// Routes a 64-bit content hash to one of the N shards using the top 6 bits (`AXS-PAR-005`).
+pub fn sharded_interner_route_shard(hash64: u64, shard_count: u32) -> u16 {
+    if shard_count <= 1u32 {
+        return 0u16;
+    }
+    let top = (hash64 >> 58u64) ^ ((hash64 >> 26u64) & 63u64);
+    (top % (shard_count as u64)) as u16
+}
+
+fn sharded_entry_cmp(a: view<ShardedInternEntry>, b: view<ShardedInternEntry>) -> i32 {
+    if (a.id.domain) < (b.id.domain) {
+        return -1i32;
+    }
+    if (a.id.domain) > (b.id.domain) {
+        return 1i32;
+    }
+    if (a.id.content_hash64) < (b.id.content_hash64) {
+        return -1i32;
+    }
+    if (a.id.content_hash64) > (b.id.content_hash64) {
+        return 1i32;
+    }
+    if (a.type_tag) < (b.type_tag) {
+        return -1i32;
+    }
+    if (a.type_tag) > (b.type_tag) {
+        return 1i32;
+    }
+    qry_sv_cmp(a.content, b.content)
+}
+
+fn sharded_interner_insert(
+    interner: mut_view<ShardedInterner>,
+    worker_id: u32,
+    domain: u8,
+    sv: StrView,
+    type_tag: u32
+) -> ShardedInternId {
+    let hash64 = sharded_interner_compute_hash64(domain, sv, type_tag);
+    let shard_id = sharded_interner_route_shard(hash64, interner.shard_count);
+    let shard_ptr = unsafe { interner.shards + (shard_id as usize) };
+    let cur_count = unsafe { (*shard_ptr).count };
+
+    // Check if already present in this shard
+    let mut i: u32 = 0u32;
+    while i < cur_count {
+        let existing = unsafe { (*shard_ptr).entries[i as usize] };
+        if existing.id.domain == domain &&
+            existing.id.content_hash64 == hash64 &&
+            existing.type_tag == type_tag &&
+            qry_sv_eq(existing.content, sv) {
+            unsafe {
+                (*shard_ptr).entries[i as usize].dedup_hits = existing.dedup_hits + 1u32;
+            }
+            interner.total_dedup_hits = interner.total_dedup_hits + 1u32;
+            return unsafe { (*shard_ptr).entries[i as usize].id };
+        }
+        i = i + 1u32;
+    }
+
+    if (cur_count as usize) >= PAR_MAX_SHARD_ENTRIES {
+        return ShardedInternId {
+            domain: domain,
+            shard_id: shard_id,
+            local_offset: 0u32,
+            canonical_index: 0u32,
+            content_hash64: hash64,
+        };
+    }
+
+    let owned_sv = sharded_copy_sv(mut_view(interner.arena), sv);
+    let fp = fingerprint128_combine(
+        fingerprint128_bytes(0x494E5445524E5F53u64, owned_sv.ptr, owned_sv.len),
+        fingerprint128_u64(0x494E5445524E5F4Du64, hash64, ((domain as u64) << 32u64) | (type_tag as u64))
+    );
+    let new_entry = ShardedInternEntry {
+        id: ShardedInternId {
+            domain: domain,
+            shard_id: shard_id,
+            local_offset: cur_count,
+            canonical_index: 0u32,
+            content_hash64: hash64,
+        },
+        content: owned_sv,
+        type_tag: type_tag,
+        first_worker_id: worker_id,
+        dedup_hits: 0u32,
+        fingerprint: fp,
+    };
+
+    // Insert in canonical sorted order inside the shard so `(ShardId, LocalOffset)`
+    // converges deterministically regardless of worker arrival order (`AXS-PAR-005`).
+    let mut insert_pos: usize = cur_count as usize;
+    while insert_pos > 0 {
+        let prev = unsafe { (*shard_ptr).entries[insert_pos - 1] };
+        if sharded_entry_cmp(view(prev), view(new_entry)) <= 0i32 {
+            break;
+        }
+        unsafe {
+            (*shard_ptr).entries[insert_pos] = prev;
+            (*shard_ptr).entries[insert_pos].id.local_offset = insert_pos as u32;
+        }
+        insert_pos = insert_pos - 1;
+    }
+
+    unsafe {
+        (*shard_ptr).entries[insert_pos] = new_entry;
+        (*shard_ptr).entries[insert_pos].id.local_offset = insert_pos as u32;
+        (*shard_ptr).count = cur_count + 1u32;
+    }
+    interner.total_entries = interner.total_entries + 1u32;
+    interner.is_sealed = false;
+    unsafe { (*shard_ptr).entries[insert_pos].id }
+}
+
+pub fn sharded_interner_intern_str(
+    interner: mut_view<ShardedInterner>,
+    worker_id: u32,
+    sv: StrView
+) -> ShardedInternId {
+    sharded_interner_insert(interner, worker_id, INTERN_DOMAIN_STR, sv, 0u32)
+}
+
+pub fn sharded_interner_intern_type(
+    interner: mut_view<ShardedInterner>,
+    worker_id: u32,
+    canonical_type_sv: StrView,
+    type_tag: u32
+) -> ShardedInternId {
+    sharded_interner_insert(interner, worker_id, INTERN_DOMAIN_TYPE, canonical_type_sv, type_tag)
+}
+
+// Seals all shards and assigns global `canonical_index` (`0 .. total_entries - 1`)
+// across `(shard_id, local_offset)`, returning the deterministic table fingerprint.
+pub fn sharded_interner_seal(interner: mut_view<ShardedInterner>) -> Fingerprint128 {
+    let mut global_idx: u32 = 0u32;
+    let mut table_fp = fingerprint128_u64(
+        0x53484152445F5442u64,
+        interner.shard_count as u64,
+        interner.total_entries as u64
+    );
+
+    let mut s: u32 = 0u32;
+    while s < (interner.shard_count) {
+        let sp = unsafe { interner.shards + (s as usize) };
+        let c = unsafe { (*sp).count };
+        let mut s_fp = fingerprint128_u64(0x53484152445F494Eu64, s as u64, c as u64);
+        let mut e: u32 = 0u32;
+        while e < c {
+            unsafe {
+                (*sp).entries[e as usize].id.local_offset = e;
+                (*sp).entries[e as usize].id.canonical_index = global_idx;
+            }
+            let ent_fp = unsafe { (*sp).entries[e as usize].fingerprint };
+            s_fp = fingerprint128_combine(s_fp, ent_fp);
+            table_fp = fingerprint128_combine(table_fp, ent_fp);
+            global_idx = global_idx + 1u32;
+            e = e + 1u32;
+        }
+        unsafe { (*sp).shard_fingerprint = s_fp; }
+        s = s + 1u32;
+    }
+
+    interner.is_sealed = true;
+    interner.table_fingerprint = table_fp;
+    table_fp
+}
+
+pub fn sharded_interner_lookup(
+    interner: view<ShardedInterner>,
+    domain: u8,
+    sv: StrView,
+    type_tag: u32
+) -> ShardedInternId {
+    let hash64 = sharded_interner_compute_hash64(domain, sv, type_tag);
+    let shard_id = sharded_interner_route_shard(hash64, interner.shard_count);
+    let shard_ptr = unsafe { interner.shards + (shard_id as usize) };
+    let cur_count = unsafe { (*shard_ptr).count };
+    let mut i: u32 = 0u32;
+    while i < cur_count {
+        let existing = unsafe { (*shard_ptr).entries[i as usize] };
+        if existing.id.domain == domain &&
+            existing.id.content_hash64 == hash64 &&
+            existing.type_tag == type_tag &&
+            qry_sv_eq(existing.content, sv) {
+            return existing.id;
+        }
+        i = i + 1u32;
+    }
+    ShardedInternId {
+        domain: domain,
+        shard_id: shard_id,
+        local_offset: QRY_ID_ERROR,
+        canonical_index: QRY_ID_ERROR,
+        content_hash64: hash64,
+    }
+}
+
+// ============================================================================
+// 3. Single-Flight Query Deduplication (`InFlightLatch`) & Cross-Worker Cycle
+//    Detection (`WaitForGraph`) (SPEC-23 AXS-PAR-010, AXS-PAR-011)
+// ============================================================================
+
+pub const DIAG_AX_PARALLEL_QUERY_CYCLE: u32 = 9201u32;
+
+pub const LATCH_STATE_VACANT: u8 = 0u8;
+pub const LATCH_STATE_COMPUTING: u8 = 1u8;
+pub const LATCH_STATE_READY: u8 = 2u8;
+pub const LATCH_STATE_POISONED: u8 = 3u8;
+
+pub const CLAIM_ACQUIRED: u8 = 1u8;
+pub const CLAIM_WAIT_SINGLE_FLIGHT: u8 = 2u8;
+pub const CLAIM_MEMO_HIT: u8 = 3u8;
+pub const CLAIM_CYCLE_DETECTED: u8 = 4u8;
+
+pub const PAR_MAX_WORKERS: usize = 16;
+pub const PAR_MAX_LATCHES: usize = 256;
+pub const PAR_MAX_WAIT_EDGES: usize = 128;
+pub const PAR_MAX_CYCLES: usize = 64;
+
+@derive(Copy)
+pub struct InFlightLatch {
+    pub latch_id: u32,
+    pub slot_idx: u32,
+    pub key: QueryKey,
+    pub state: u8,
+    pub owner_worker_id: u32,
+    pub waiter_workers: [16]u32,
+    pub waiter_count: u32,
+    pub single_flight_waits: u32,
+    pub duplicate_verified_count: u32,
+    pub result_tag: u32,
+    pub result_is_error: bool,
+    pub result_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct WaitForEdge {
+    pub waiter_worker_id: u32,
+    pub waiter_slot: u32,
+    pub waiter_key: QueryKey,
+    pub target_worker_id: u32,
+    pub target_slot: u32,
+    pub target_key: QueryKey,
+    pub active: bool,
+}
+
+@derive(Copy)
+pub struct WorkerQueryStack {
+    pub worker_id: u32,
+    pub frames: [32]QueryStackFrame,
+    pub len: u32,
+}
+
+@derive(Copy)
+pub struct ParallelCycleStepBuf {
+    pub items: [16]QueryKey,
+}
+
+@derive(Copy)
+pub struct ParallelCycleRecord {
+    pub cycle_id: u32,
+    pub diag_code: u32,
+    pub detecting_worker_id: u32,
+    pub canonical_head: QueryKey,
+    pub steps: [16]QueryKey,
+    pub step_count: u32,
+    pub fingerprint: Fingerprint128,
+}
+
+pub struct WaitForGraph {
+    pub latches: *mut InFlightLatch,
+    pub latch_count: u32,
+    pub edges: *mut WaitForEdge,
+    pub edge_count: u32,
+    pub worker_stacks: *mut WorkerQueryStack,
+    pub worker_count: u32,
+    pub cycles: *mut ParallelCycleRecord,
+    pub cycle_count: u32,
+    pub single_flight_waits: u32,
+    pub duplicate_verifications: u32,
+    pub cross_worker_cycles: u32,
+}
+
+pub fn wait_for_graph_init(wg: mut_view<WaitForGraph>, arena: mut_view<Arena>, worker_count: u32) {
+    let eff_workers = if worker_count == 0u32 {
+        1u32
+    } else if (worker_count as usize) > PAR_MAX_WORKERS {
+        PAR_MAX_WORKERS as u32
+    } else {
+        worker_count
+    };
+    wg.worker_count = eff_workers;
+
+    let latch_bytes = PAR_MAX_LATCHES * size_of<InFlightLatch>();
+    wg.latches = arena_alloc_raw(mut_view(*arena), latch_bytes, align_of<InFlightLatch>()) as *mut InFlightLatch;
+    sched_zero_bytes(wg.latches as *mut u8, latch_bytes);
+    wg.latch_count = 0u32;
+
+    let edge_bytes = PAR_MAX_WAIT_EDGES * size_of<WaitForEdge>();
+    wg.edges = arena_alloc_raw(mut_view(*arena), edge_bytes, align_of<WaitForEdge>()) as *mut WaitForEdge;
+    sched_zero_bytes(wg.edges as *mut u8, edge_bytes);
+    wg.edge_count = 0u32;
+
+    let ws_bytes = PAR_MAX_WORKERS * size_of<WorkerQueryStack>();
+    wg.worker_stacks = arena_alloc_raw(mut_view(*arena), ws_bytes, align_of<WorkerQueryStack>()) as *mut WorkerQueryStack;
+    sched_zero_bytes(wg.worker_stacks as *mut u8, ws_bytes);
+    let mut w: u32 = 0u32;
+    while w < (PAR_MAX_WORKERS as u32) {
+        unsafe {
+            (*(wg.worker_stacks + (w as usize))).worker_id = w;
+            (*(wg.worker_stacks + (w as usize))).len = 0u32;
+        }
+        w = w + 1u32;
+    }
+
+    let cyc_bytes = PAR_MAX_CYCLES * size_of<ParallelCycleRecord>();
+    wg.cycles = arena_alloc_raw(mut_view(*arena), cyc_bytes, align_of<ParallelCycleRecord>()) as *mut ParallelCycleRecord;
+    sched_zero_bytes(wg.cycles as *mut u8, cyc_bytes);
+    wg.cycle_count = 0u32;
+
+    wg.single_flight_waits = 0u32;
+    wg.duplicate_verifications = 0u32;
+    wg.cross_worker_cycles = 0u32;
+}
+
+pub fn wait_for_graph_push_worker_frame(
+    wg: mut_view<WaitForGraph>,
+    worker_id: u32,
+    slot_idx: u32,
+    key: QueryKey
+) {
+    if (worker_id as usize) >= PAR_MAX_WORKERS {
+        return;
+    }
+    let ws = unsafe { wg.worker_stacks + (worker_id as usize) };
+    let cur_len = unsafe { (*ws).len };
+    if cur_len < 32u32 {
+        unsafe {
+            (*ws).frames[cur_len as usize] = QueryStackFrame {
+                slot_idx: slot_idx,
+                key: key,
+                depth: cur_len,
+            };
+            (*ws).len = cur_len + 1u32;
+        }
+    }
+}
+
+pub fn wait_for_graph_pop_worker_frame(wg: mut_view<WaitForGraph>, worker_id: u32) {
+    if (worker_id as usize) >= PAR_MAX_WORKERS {
+        return;
+    }
+    let ws = unsafe { wg.worker_stacks + (worker_id as usize) };
+    let cur_len = unsafe { (*ws).len };
+    if cur_len > 0u32 {
+        unsafe { (*ws).len = cur_len - 1u32; }
+    }
+}
+
+pub fn wait_for_graph_find_or_create_latch(
+    wg: mut_view<WaitForGraph>,
+    slot_idx: u32,
+    key: QueryKey
+) -> u32 {
+    let mut i: u32 = 0u32;
+    while i < (wg.latch_count) {
+        let lp = unsafe { wg.latches + (i as usize) };
+        if unsafe { (*lp).slot_idx } == slot_idx || query_key_eq(unsafe { view((*lp).key) }, view(key)) {
+            return i;
+        }
+        i = i + 1u32;
+    }
+    if (wg.latch_count as usize) >= PAR_MAX_LATCHES {
+        return PAR_MAX_LATCHES as u32 - 1u32;
+    }
+    let lid = wg.latch_count;
+    wg.latch_count = lid + 1u32;
+    let lp = unsafe { wg.latches + (lid as usize) };
+    sched_zero_bytes(lp as *mut u8, size_of<InFlightLatch>());
+    unsafe {
+        (*lp).latch_id = lid;
+        (*lp).slot_idx = slot_idx;
+        (*lp).key = key;
+        (*lp).state = LATCH_STATE_VACANT;
+        (*lp).owner_worker_id = QRY_ID_ERROR;
+    }
+    lid
+}
+
+// Rotates a raw cycle sequence `raw.items[0..cycle_len]` to start at the unique
+// lexicographical minimum `(QueryKind.order_rank, SemanticKey)` head (`AXS-PAR-011`,
+// `SPEC-21 AXS-QRY-022`), writing `cycle_len + 1` steps into `out_steps`.
+pub fn parallel_rotate_cycle_canonical(
+    raw: view<ParallelCycleStepBuf>,
+    cycle_len: u32,
+    out_steps: mut_view<ParallelCycleStepBuf>,
+    out_head: mut_view<QueryKey>
+) -> Fingerprint128 {
+    if cycle_len == 0u32 {
+        return fingerprint128_zero();
+    }
+    let mut min_offset: u32 = 0u32;
+    let mut min_key: QueryKey = raw.items[0];
+    let mut i: u32 = 1u32;
+    while i < cycle_len {
+        let cand = raw.items[i as usize];
+        if query_key_cmp(view(cand), view(min_key)) < 0i32 {
+            min_key = cand;
+            min_offset = i;
+        }
+        i = i + 1u32;
+    }
+    *out_head = min_key;
+
+    let mut rot_fp = fingerprint128_u64(0x4359434C455F5254u64, cycle_len as u64, min_key.kind as u64);
+    let mut j: u32 = 0u32;
+    while j <= cycle_len {
+        let idx = if j == cycle_len {
+            min_offset
+        } else {
+            (min_offset + j) % cycle_len
+        };
+        let step_key = raw.items[idx as usize];
+        if (j as usize) < 16 {
+            out_steps.items[j as usize] = step_key;
+        }
+        rot_fp = fingerprint128_combine(rot_fp, query_key_fingerprint(view(step_key)));
+        j = j + 1u32;
+    }
+    rot_fp
+}
+
+fn wait_for_graph_record_cycle(
+    wg: mut_view<WaitForGraph>,
+    db: mut_view<CompilerDB>,
+    detecting_worker_id: u32,
+    raw_steps: view<ParallelCycleStepBuf>,
+    raw_len: u32
+) -> Fingerprint128 {
+    let mut rot_steps = ParallelCycleStepBuf { items: [raw_steps.items[0]; 16] };
+    let mut head_key = raw_steps.items[0];
+    let rot_fp = parallel_rotate_cycle_canonical(
+        raw_steps,
+        raw_len,
+        mut_view(rot_steps),
+        mut_view(head_key)
+    );
+    let diag_code = query_kind_cycle_diag_code(head_key.kind);
+    let head_slot = query_db_get_or_create_slot(mut_view(*db), head_key);
+
+    // Poison all participating slots and latches in the cycle
+    let mut s: u32 = 0u32;
+    while s < raw_len {
+        let k = raw_steps.items[s as usize];
+        let sl = query_db_get_or_create_slot(mut_view(*db), k);
+        let sl_ptr = unsafe { db.memo_slots + (sl as usize) };
+        unsafe {
+            (*sl_ptr).state = QUERY_STATE_POISONED;
+            (*sl_ptr).was_poisoned = true;
+            (*sl_ptr).verified_at = db.current_revision;
+            (*sl_ptr).changed_at = db.current_revision;
+            (*sl_ptr).value_tag = QRY_ID_ERROR;
+            (*sl_ptr).value_is_error = true;
+            (*sl_ptr).value_fingerprint = rot_fp;
+        }
+        let lid = wait_for_graph_find_or_create_latch(mut_view(*wg), sl, k);
+        let lp = unsafe { wg.latches + (lid as usize) };
+        unsafe {
+            (*lp).state = LATCH_STATE_POISONED;
+            (*lp).result_tag = QRY_ID_ERROR;
+            (*lp).result_is_error = true;
+            (*lp).result_fingerprint = rot_fp;
+        }
+        s = s + 1u32;
+    }
+
+    // Deduplicate cycle record by canonical rotated fingerprint
+    let mut ci: u32 = 0u32;
+    while ci < (wg.cycle_count) {
+        let existing = unsafe { *(wg.cycles + (ci as usize)) };
+        if fingerprint128_eq(existing.fingerprint, rot_fp) {
+            return rot_fp;
+        }
+        ci = ci + 1u32;
+    }
+
+    if (wg.cycle_count as usize) < PAR_MAX_CYCLES {
+        let idx = wg.cycle_count;
+        wg.cycle_count = idx + 1u32;
+        wg.cross_worker_cycles = wg.cross_worker_cycles + 1u32;
+        db.total_cycles_detected = db.total_cycles_detected + 1u32;
+        query_db_attach_diag(
+            mut_view(*db),
+            head_slot,
+            diag_code,
+            head_key.semantic_key,
+            raw_len + 1u32,
+            rot_fp
+        );
+        unsafe {
+            *(wg.cycles + (idx as usize)) = ParallelCycleRecord {
+                cycle_id: idx,
+                diag_code: diag_code,
+                detecting_worker_id: detecting_worker_id,
+                canonical_head: head_key,
+                steps: rot_steps.items,
+                step_count: raw_len + 1u32,
+                fingerprint: rot_fp,
+            };
+        }
+    }
+    rot_fp
+}
+
+// Checks if `target_worker` transitively waits on `waiter_worker` in `WaitForGraph`
+// (or if `target_slot` is already on `waiter_worker`'s stack). If a cycle is found,
+// records the canonically rotated cycle and returns `true`.
+fn wait_for_graph_detect_cycle(
+    wg: mut_view<WaitForGraph>,
+    db: mut_view<CompilerDB>,
+    waiter_worker: u32,
+    target_worker: u32,
+    target_slot: u32,
+    target_key: QueryKey
+) -> bool {
+    if (waiter_worker as usize) >= PAR_MAX_WORKERS {
+        return false;
+    }
+    let waiter_ws = unsafe { *(wg.worker_stacks + (waiter_worker as usize)) };
+
+    // Case 1: Same-worker stack cycle (`target_slot` is already on `waiter_worker`'s stack)
+    if waiter_worker == target_worker {
+        let mut i: u32 = 0u32;
+        while i < (waiter_ws.len) {
+            if waiter_ws.frames[i as usize].slot_idx == target_slot ||
+                query_key_eq(view(waiter_ws.frames[i as usize].key), view(target_key)) {
+                let c_len = waiter_ws.len - i;
+                let capped = if c_len > 15u32 { 15u32 } else { c_len };
+                let mut raw = ParallelCycleStepBuf { items: [target_key; 16] };
+                let mut j: u32 = 0u32;
+                while j < capped {
+                    raw.items[j as usize] = waiter_ws.frames[(i + j) as usize].key;
+                    j = j + 1u32;
+                }
+                let _ = wait_for_graph_record_cycle(mut_view(*wg), mut_view(*db), waiter_worker, view(raw), capped);
+                return true;
+            }
+            i = i + 1u32;
+        }
+    }
+
+    // Case 2: Cross-worker wait-for cycle (`waiter_worker -> target_worker -> ... -> waiter_worker`)
+    let mut raw = ParallelCycleStepBuf { items: [target_key; 16] };
+    let mut step_len: u32 = 0u32;
+
+    if waiter_ws.len > 0u32 {
+        raw.items[0] = waiter_ws.frames[(waiter_ws.len - 1u32) as usize].key;
+        step_len = 1u32;
+    }
+    raw.items[step_len as usize] = target_key;
+    step_len = step_len + 1u32;
+
+    let mut cur_worker = target_worker;
+    let mut hops: u32 = 0u32;
+    while hops < (PAR_MAX_WORKERS as u32) {
+        let mut found_next = false;
+        let mut next_worker: u32 = QRY_ID_ERROR;
+        let mut next_key: QueryKey = target_key;
+
+        let mut e: u32 = 0u32;
+        while e < (wg.edge_count) {
+            let edge = unsafe { *(wg.edges + (e as usize)) };
+            if edge.active && edge.waiter_worker_id == cur_worker {
+                found_next = true;
+                next_worker = edge.target_worker_id;
+                next_key = edge.target_key;
+                break;
+            }
+            e = e + 1u32;
+        }
+
+        if !found_next {
+            return false;
+        }
+
+        if next_worker == waiter_worker {
+            // Cycle closed back to `waiter_worker`!
+            let _ = wait_for_graph_record_cycle(mut_view(*wg), mut_view(*db), waiter_worker, view(raw), step_len);
+            return true;
+        }
+
+        if step_len < 15u32 {
+            raw.items[step_len as usize] = next_key;
+            step_len = step_len + 1u32;
+        }
+        cur_worker = next_worker;
+        hops = hops + 1u32;
+    }
+
+    false
+}
+
+// Claims `key` for `worker_id` or registers `worker_id` on `InFlightLatch` if another
+// worker is already computing `key`, performing deadlock-free cross-worker cycle
+// detection via `WaitForGraph` (`AXS-PAR-010`, `AXS-PAR-011`).
+pub fn wait_for_graph_claim_or_wait(
+    wg: mut_view<WaitForGraph>,
+    db: mut_view<CompilerDB>,
+    worker_id: u32,
+    key: QueryKey
+) -> u8 {
+    let slot_idx = query_db_get_or_create_slot(mut_view(*db), key);
+    let lid = wait_for_graph_find_or_create_latch(mut_view(*wg), slot_idx, key);
+    let lp = unsafe { wg.latches + (lid as usize) };
+    let st = unsafe { (*lp).state };
+
+    if st == LATCH_STATE_READY || st == LATCH_STATE_POISONED {
+        return CLAIM_MEMO_HIT;
+    }
+
+    if st == LATCH_STATE_VACANT {
+        unsafe {
+            (*lp).state = LATCH_STATE_COMPUTING;
+            (*lp).owner_worker_id = worker_id;
+        }
+        return CLAIM_ACQUIRED;
+    }
+
+    // `st == LATCH_STATE_COMPUTING`: check for cross-worker or self wait-for cycle first!
+    let owner_worker = unsafe { (*lp).owner_worker_id };
+    if wait_for_graph_detect_cycle(mut_view(*wg), mut_view(*db), worker_id, owner_worker, slot_idx, key) {
+        return CLAIM_CYCLE_DETECTED;
+    }
+
+    // No cycle: register `worker_id` as a single-flight waiter on `lp` and add a `WaitForEdge`
+    let wc = unsafe { (*lp).waiter_count };
+    if wc < 16u32 {
+        unsafe {
+            (*lp).waiter_workers[wc as usize] = worker_id;
+            (*lp).waiter_count = wc + 1u32;
+        }
+    }
+    unsafe {
+        (*lp).single_flight_waits = (*lp).single_flight_waits + 1u32;
+    }
+    wg.single_flight_waits = wg.single_flight_waits + 1u32;
+
+    let mut caller_slot = slot_idx;
+    let mut caller_key = key;
+    if (worker_id as usize) < PAR_MAX_WORKERS {
+        let ws = unsafe { *(wg.worker_stacks + (worker_id as usize)) };
+        if ws.len > 0u32 {
+            let top = ws.frames[(ws.len - 1u32) as usize];
+            caller_slot = top.slot_idx;
+            caller_key = top.key;
+        }
+    }
+
+    if (wg.edge_count as usize) < PAR_MAX_WAIT_EDGES {
+        let eidx = wg.edge_count as usize;
+        wg.edge_count = wg.edge_count + 1u32;
+        unsafe {
+            *(wg.edges + eidx) = WaitForEdge {
+                waiter_worker_id: worker_id,
+                waiter_slot: caller_slot,
+                waiter_key: caller_key,
+                target_worker_id: owner_worker,
+                target_slot: slot_idx,
+                target_key: key,
+                active: true,
+            };
+        }
+    }
+
+    CLAIM_WAIT_SINGLE_FLIGHT
+}
+
+pub fn wait_for_graph_complete_latch(
+    wg: mut_view<WaitForGraph>,
+    slot_idx: u32,
+    key: QueryKey,
+    result_tag: u32,
+    is_error: bool,
+    fp: Fingerprint128
+) -> bool {
+    let lid = wait_for_graph_find_or_create_latch(mut_view(*wg), slot_idx, key);
+    let lp = unsafe { wg.latches + (lid as usize) };
+    let st = unsafe { (*lp).state };
+
+    // If already completed (e.g. duplicate speculative completion or cycle poison),
+    // verify fingerprint consistency (`AXS-PAR-010 §3`).
+    if st == LATCH_STATE_READY || st == LATCH_STATE_POISONED {
+        let prev_fp = unsafe { (*lp).result_fingerprint };
+        unsafe {
+            (*lp).duplicate_verified_count = (*lp).duplicate_verified_count + 1u32;
+        }
+        wg.duplicate_verifications = wg.duplicate_verifications + 1u32;
+        return fingerprint128_eq(prev_fp, fp);
+    }
+
+    unsafe {
+        (*lp).state = if is_error { LATCH_STATE_POISONED } else { LATCH_STATE_READY };
+        (*lp).result_tag = result_tag;
+        (*lp).result_is_error = is_error;
+        (*lp).result_fingerprint = fp;
+    }
+
+    // Clear active WaitForEdges waiting on this target slot
+    let mut e: u32 = 0u32;
+    while e < (wg.edge_count) {
+        let ep = unsafe { wg.edges + (e as usize) };
+        if unsafe { (*ep).active && (*ep).target_slot == slot_idx } {
+            unsafe { (*ep).active = false; }
+        }
+        e = e + 1u32;
+    }
+    true
+}
+
+// ============================================================================
+// 4. Work-Stealing Query Scheduler (`ParallelScheduler`, `--jobs <N>`, Priority
+//    Deques & Post-Join Deterministic Merging) (SPEC-23 AXS-PAR-012..014, 023, 050)
+// ============================================================================
+
+pub const SCHEDULE_MODE_BALANCED: u8 = 0u8;
+pub const SCHEDULE_MODE_INTERACTIVE: u8 = 1u8;
+pub const SCHEDULE_MODE_THROUGHPUT: u8 = 2u8;
+pub const SCHEDULE_MODE_MEMORY_BOUND: u8 = 3u8;
+pub const SCHEDULE_MODE_LOW_POWER: u8 = 4u8;
+pub const SCHEDULE_MODE_DETERMINISTIC_DEBUG: u8 = 5u8;
+
+pub const PRIORITY_CRITICAL: u8 = 0u8;
+pub const PRIORITY_INTERACTIVE: u8 = 1u8;
+pub const PRIORITY_NORMAL: u8 = 2u8;
+pub const PRIORITY_BACKGROUND: u8 = 3u8;
+
+pub const ACTION_STATE_PENDING: u8 = 0u8;
+pub const ACTION_STATE_BLOCKED: u8 = 1u8;
+pub const ACTION_STATE_CACHE_CHECK: u8 = 2u8;
+pub const ACTION_STATE_VERIFIED: u8 = 3u8;
+pub const ACTION_STATE_READY: u8 = 4u8;
+pub const ACTION_STATE_DISPATCHED: u8 = 5u8;
+pub const ACTION_STATE_RUNNING: u8 = 6u8;
+pub const ACTION_STATE_SUCCESS: u8 = 7u8;
+pub const ACTION_STATE_FAILED: u8 = 8u8;
+pub const ACTION_STATE_CANCELLED: u8 = 9u8;
+pub const ACTION_STATE_BLOCKED_BY_FAILURE: u8 = 10u8;
+
+pub const PAR_MAX_TASKS: usize = 256;
+
+@derive(Copy)
+pub struct ResourceCostEstimate {
+    pub cpu_tokens: u16,
+    pub memory_bytes: u64,
+    pub critical_cost: u64,
+}
+
+pub fn resource_cost_new(cpu_tokens: u16, memory_bytes: u64, critical_cost: u64) -> ResourceCostEstimate {
+    ResourceCostEstimate {
+        cpu_tokens: cpu_tokens,
+        memory_bytes: memory_bytes,
+        critical_cost: critical_cost,
+    }
+}
+
+@derive(Copy)
+pub struct ScheduledTask {
+    pub task_id: u32,
+    pub query_key: QueryKey,
+    pub priority_tier: u8,
+    pub state: u8,
+    pub preferred_worker: u32,
+    pub executed_by_worker: u32,
+    pub stolen_from_worker: u32,
+    pub was_stolen: bool,
+    pub is_speculative: bool,
+    pub cost: ResourceCostEstimate,
+    pub result_tag: u32,
+    pub result_is_error: bool,
+    pub result_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct WorkerDeque {
+    pub worker_id: u32,
+    pub task_ids: [64]u32,
+    pub head: u32,
+    pub tail: u32,
+    pub executed_count: u32,
+    pub stolen_count: u32,
+    pub single_flight_waits: u32,
+}
+
+pub struct ParallelScheduler {
+    pub db: CompilerDB,
+    pub sched_arena: Arena,
+    pub snapshot: ParallelSnapshot,
+    pub interner: ShardedInterner,
+    pub wait_graph: WaitForGraph,
+    pub jobs: u32,
+    pub schedule_mode: u8,
+    pub cpu_token_budget: u32,
+    pub memory_budget_bytes: u64,
+    pub worker_deques: *mut WorkerDeque,
+    pub worker_arenas: *mut WorkerArenaState,
+    pub tasks: *mut ScheduledTask,
+    pub task_count: u32,
+    pub total_steals: u32,
+    pub total_tasks_executed: u32,
+    pub speculative_promoted: u32,
+    pub speculative_cancelled: u32,
+    pub post_join_fingerprint: Fingerprint128,
+}
+
+pub fn parallel_scheduler_empty() -> ParallelScheduler {
+    let base_snap = DatabaseSnapshot {
+        id: snapshot_id_new(0u64, revision_id_zero()),
+        source_file_count: 0u32,
+        module_count: 0u32,
+        target_config_count: 0u32,
+        package_count: 0u32,
+        executed_query_count: 0u32,
+        is_immutable: true,
+    };
+    ParallelScheduler {
+        db: query_db_empty(),
+        sched_arena: arena_new(),
+        snapshot: ParallelSnapshot {
+            db_snapshot: base_snap,
+            epoch: snapshot_epoch_zero(),
+            worker_count: 1u32,
+            active_readers: 0u32,
+            frozen_def_count: 0u32,
+            frozen_memo_count: 0u32,
+            snapshot_fingerprint: fingerprint128_zero(),
+            is_immutable: true,
+            arena_sealed: false,
+        },
+        interner: sharded_interner_empty(),
+        wait_graph: WaitForGraph {
+            latches: 0 as *mut InFlightLatch,
+            latch_count: 0u32,
+            edges: 0 as *mut WaitForEdge,
+            edge_count: 0u32,
+            worker_stacks: 0 as *mut WorkerQueryStack,
+            worker_count: 1u32,
+            cycles: 0 as *mut ParallelCycleRecord,
+            cycle_count: 0u32,
+            single_flight_waits: 0u32,
+            duplicate_verifications: 0u32,
+            cross_worker_cycles: 0u32,
+        },
+        jobs: 1u32,
+        schedule_mode: SCHEDULE_MODE_BALANCED,
+        cpu_token_budget: 1u32,
+        memory_budget_bytes: 1073741824u64,
+        worker_deques: 0 as *mut WorkerDeque,
+        worker_arenas: 0 as *mut WorkerArenaState,
+        tasks: 0 as *mut ScheduledTask,
+        task_count: 0u32,
+        total_steals: 0u32,
+        total_tasks_executed: 0u32,
+        speculative_promoted: 0u32,
+        speculative_cancelled: 0u32,
+        post_join_fingerprint: fingerprint128_zero(),
+    }
+}
+
+pub fn parallel_scheduler_init(
+    sched: mut_view<ParallelScheduler>,
+    session_id: u64,
+    jobs: u32,
+    schedule_mode: u8
+) {
+    query_db_init(mut_view(sched.db), session_id);
+    sched.sched_arena = arena_new();
+    let eff_jobs = if jobs == 0u32 {
+        1u32
+    } else if (jobs as usize) > PAR_MAX_WORKERS {
+        PAR_MAX_WORKERS as u32
+    } else {
+        jobs
+    };
+    sched.jobs = eff_jobs;
+    sched.schedule_mode = schedule_mode;
+    sched.cpu_token_budget = eff_jobs;
+    sched.memory_budget_bytes = (eff_jobs as u64) * 268435456u64;
+
+    sharded_interner_init(mut_view(sched.interner), PAR_SHARD_COUNT as u32);
+    wait_for_graph_init(mut_view(sched.wait_graph), mut_view(sched.sched_arena), eff_jobs);
+
+    let dq_bytes = PAR_MAX_WORKERS * size_of<WorkerDeque>();
+    sched.worker_deques = arena_alloc_raw(mut_view(sched.sched_arena), dq_bytes, align_of<WorkerDeque>()) as *mut WorkerDeque;
+    sched_zero_bytes(sched.worker_deques as *mut u8, dq_bytes);
+
+    let wa_bytes = PAR_MAX_WORKERS * size_of<WorkerArenaState>();
+    sched.worker_arenas = arena_alloc_raw(mut_view(sched.sched_arena), wa_bytes, align_of<WorkerArenaState>()) as *mut WorkerArenaState;
+    sched_zero_bytes(sched.worker_arenas as *mut u8, wa_bytes);
+
+    let mut w: u32 = 0u32;
+    while w < eff_jobs {
+        unsafe {
+            (*(sched.worker_deques + (w as usize))).worker_id = w;
+            *(sched.worker_arenas + (w as usize)) = worker_arena_init(w, 1u64);
+        }
+        w = w + 1u32;
+    }
+
+    let t_bytes = PAR_MAX_TASKS * size_of<ScheduledTask>();
+    sched.tasks = arena_alloc_raw(mut_view(sched.sched_arena), t_bytes, align_of<ScheduledTask>()) as *mut ScheduledTask;
+    sched_zero_bytes(sched.tasks as *mut u8, t_bytes);
+    sched.task_count = 0u32;
+    sched.total_steals = 0u32;
+    sched.total_tasks_executed = 0u32;
+    sched.speculative_promoted = 0u32;
+    sched.speculative_cancelled = 0u32;
+    sched.post_join_fingerprint = fingerprint128_zero();
+    sched.snapshot = parallel_snapshot_freeze(view(sched.db), 1u64, 0u64, eff_jobs);
+}
+
+pub fn parallel_scheduler_free(sched: mut_view<ParallelScheduler>) {
+    sharded_interner_free(mut_view(sched.interner));
+    query_db_free(mut_view(sched.db));
+    arena_destroy(mut_view(sched.sched_arena));
+    sched.worker_deques = 0 as *mut WorkerDeque;
+    sched.worker_arenas = 0 as *mut WorkerArenaState;
+    sched.tasks = 0 as *mut ScheduledTask;
+}
+
+pub fn parallel_scheduler_freeze_snapshot(
+    sched: mut_view<ParallelScheduler>,
+    epoch_id: u64
+) -> ParallelSnapshot {
+    let parent_epoch = sched.snapshot.epoch.epoch_id;
+    let snap = parallel_snapshot_freeze(view(sched.db), epoch_id, parent_epoch, sched.jobs);
+    sched.snapshot = snap;
+    let mut w: u32 = 0u32;
+    while w < (sched.jobs) {
+        let _ = parallel_snapshot_fork_worker(mut_view(sched.snapshot), w);
+        unsafe {
+            (*(sched.worker_arenas + (w as usize))).epoch_id = epoch_id;
+            (*(sched.worker_arenas + (w as usize))).is_frozen = false;
+        }
+        w = w + 1u32;
+    }
+    sched.snapshot
+}
+
+// Registers a module-scoped item using deterministic `(ModuleId, LocalIndex)` identity
+// (`AXS-PAR-004`) and interns its module path, canonical name, and type signature in
+// `sched.interner` (`AXS-PAR-005`).
+pub fn parallel_scheduler_register_scoped_def(
+    sched: mut_view<ParallelScheduler>,
+    worker_id: u32,
+    module_id: ModuleId,
+    local_index: u32,
+    item_kind: u8,
+    is_pub: bool,
+    param_count: u32,
+    return_type_tag: u32,
+    type_name_sv: StrView,
+    semantic_key: SemanticKey
+) -> ScopedDefId {
+    let scoped = scoped_def_id_new(module_id.v, local_index);
+    let def_id = scoped_def_id_to_def_id(scoped);
+    let _ = sharded_interner_intern_str(mut_view(sched.interner), worker_id, semantic_key.module_path);
+    let _ = sharded_interner_intern_str(mut_view(sched.interner), worker_id, semantic_key.canonical_name);
+    if type_name_sv.len > 0 {
+        let _ = sharded_interner_intern_type(mut_view(sched.interner), worker_id, type_name_sv, return_type_tag);
+    }
+    let _ = query_db_register_def(
+        mut_view(sched.db),
+        def_id,
+        module_id,
+        item_kind,
+        is_pub,
+        param_count,
+        return_type_tag,
+        semantic_key
+    );
+    scoped
+}
+
+fn worker_deque_push(dq: *mut WorkerDeque, task_id: u32) {
+    let tail = unsafe { (*dq).tail };
+    if (tail as usize) < 64 {
+        unsafe {
+            (*dq).task_ids[tail as usize] = task_id;
+            (*dq).tail = tail + 1u32;
+        }
+    }
+}
+
+fn worker_deque_pop_local(dq: *mut WorkerDeque) -> u32 {
+    let head = unsafe { (*dq).head };
+    let tail = unsafe { (*dq).tail };
+    if head >= tail {
+        return QRY_ID_ERROR;
+    }
+    let id = unsafe { (*dq).task_ids[head as usize] };
+    unsafe { (*dq).head = head + 1u32; }
+    id
+}
+
+// Steals a ready task from the tail end of another worker's deque (`AXS-PAR-012 §3`).
+fn worker_deque_steal(dq: *mut WorkerDeque) -> u32 {
+    let head = unsafe { (*dq).head };
+    let tail = unsafe { (*dq).tail };
+    if head >= tail {
+        return QRY_ID_ERROR;
+    }
+    let new_tail = tail - 1u32;
+    let id = unsafe { (*dq).task_ids[new_tail as usize] };
+    unsafe {
+        (*dq).tail = new_tail;
+        (*dq).stolen_count = (*dq).stolen_count + 1u32;
+    }
+    id
+}
+
+pub fn parallel_scheduler_submit_query_task(
+    sched: mut_view<ParallelScheduler>,
+    query_key: QueryKey,
+    priority_tier: u8,
+    preferred_worker: u32,
+    cost: ResourceCostEstimate
+) -> u32 {
+    if (sched.task_count as usize) >= PAR_MAX_TASKS {
+        return PAR_MAX_TASKS as u32 - 1u32;
+    }
+    let tid = sched.task_count;
+    sched.task_count = tid + 1u32;
+    let target_w = if sched.jobs <= 1u32 {
+        0u32
+    } else {
+        preferred_worker % sched.jobs
+    };
+    unsafe {
+        *(sched.tasks + (tid as usize)) = ScheduledTask {
+            task_id: tid,
+            query_key: query_key,
+            priority_tier: priority_tier,
+            state: ACTION_STATE_READY,
+            preferred_worker: target_w,
+            executed_by_worker: QRY_ID_ERROR,
+            stolen_from_worker: QRY_ID_ERROR,
+            was_stolen: false,
+            is_speculative: false,
+            cost: cost,
+            result_tag: 0u32,
+            result_is_error: false,
+            result_fingerprint: fingerprint128_zero(),
+        };
+    }
+    tid
+}
+
+// Evaluates a single `QueryKey` on `worker_id` using `InFlightLatch` single-flight
+// deduplication and `WaitForGraph` cycle detection, populating derived tables in `sched.db`.
+pub fn parallel_scheduler_eval_query_on_worker(
+    sched: mut_view<ParallelScheduler>,
+    worker_id: u32,
+    key: QueryKey
+) -> MemoEntry {
+    let slot_idx = query_db_get_or_create_slot(mut_view(sched.db), key);
+    let slot_ptr = unsafe { sched.db.memo_slots + (slot_idx as usize) };
+    let r_curr = sched.db.current_revision;
+
+    // 1. Claim or wait on SingleFlightLatch with cross-worker cycle check
+    let claim = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), worker_id, key);
+    if claim == CLAIM_MEMO_HIT {
+        unsafe { (*slot_ptr).memo_hits = (*slot_ptr).memo_hits + 1u32; }
+        sched.db.total_memo_hits = sched.db.total_memo_hits + 1u32;
+        query_db_replay_slot_diags(mut_view(sched.db), slot_idx);
+        return unsafe { *slot_ptr };
+    }
+    if claim == CLAIM_CYCLE_DETECTED {
+        return unsafe { *slot_ptr };
+    }
+    if claim == CLAIM_WAIT_SINGLE_FLIGHT {
+        if (worker_id as usize) < (sched.jobs as usize) {
+            unsafe {
+                (*(sched.worker_deques + (worker_id as usize))).single_flight_waits =
+                    (*(sched.worker_deques + (worker_id as usize))).single_flight_waits + 1u32;
+            }
+        }
+        return unsafe { *slot_ptr };
+    }
+
+    // `claim == CLAIM_ACQUIRED`: push frame onto `worker_id`'s stack and execute provider
+    wait_for_graph_push_worker_frame(mut_view(sched.wait_graph), worker_id, slot_idx, key);
+    unsafe {
+        (*slot_ptr).memo_misses = (*slot_ptr).memo_misses + 1u32;
+        (*slot_ptr).provider_runs = (*slot_ptr).provider_runs + 1u32;
+        (*slot_ptr).state = QUERY_STATE_COMPUTING;
+        (*slot_ptr).owner_worker_id = worker_id;
+    }
+    sched.db.total_memo_misses = sched.db.total_memo_misses + 1u32;
+    sched.db.total_provider_runs = sched.db.total_provider_runs + 1u32;
+
+    let kind = key.kind;
+    let raw = key.key_raw;
+    let mut val_tag: u32 = 0u32;
+    let mut is_err: bool = false;
+    let mut fp: Fingerprint128 = fingerprint128_zero();
+
+    if kind == QUERY_PARSE_MODULE {
+        let mod_id = ModuleId { v: raw };
+        let mod_in = query_db_read_module_tree_input(mut_view(sched.db), mod_id);
+        let sf_in = query_db_read_source_file_input(mut_view(sched.db), mod_in.source_file_id);
+        let tok_count = query_db_scan_module_source(mut_view(sched.db), mod_id, sf_in.text);
+        let mut item_count: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < (sched.db.def_count as usize) {
+            let d = unsafe { *(sched.db.defs + i) };
+            if d.module_id.v == mod_id.v {
+                item_count = item_count + 1u32;
+            }
+            i = i + 1;
+        }
+        fp = fingerprint128_combine(
+            sf_in.content_hash,
+            fingerprint128_u64(0x50415253455F4D44u64, mod_id.v as u64, item_count as u64)
+        );
+        val_tag = item_count;
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(sched.db.parse_results + (mod_id.v as usize)) = ParseModuleResult {
+                    module_id: mod_id,
+                    item_count: item_count,
+                    token_count: tok_count,
+                    has_parse_error: false,
+                    ast_fingerprint: fp,
+                };
+            }
+        }
+    } else if kind == QUERY_MODULE_DEF_MAP {
+        let mod_id = ModuleId { v: raw };
+        let pm_key = query_key_for_module(view(sched.db), QUERY_PARSE_MODULE, mod_id);
+        let pm_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, pm_key);
+        is_err = pm_memo.value_is_error;
+        let mut exported: u32 = 0u32;
+        let mut total: u32 = 0u32;
+        let mut mod_def_indices: [128]usize = [0; 128];
+        let mut mcount: usize = 0;
+        let mut i: usize = 0;
+        while i < (sched.db.def_count as usize) {
+            let d = unsafe { *(sched.db.defs + i) };
+            if d.module_id.v == mod_id.v {
+                total = total + 1u32;
+                if d.is_pub {
+                    exported = exported + 1u32;
+                }
+                mod_def_indices[mcount] = i;
+                mcount = mcount + 1;
+            }
+            i = i + 1;
+        }
+        let mut ma: usize = 1;
+        while ma < mcount {
+            let cur_idx = mod_def_indices[ma];
+            let cur_d = unsafe { *(sched.db.defs + cur_idx) };
+            let mut mb: usize = ma;
+            while mb > 0 {
+                let prev_idx = mod_def_indices[mb - 1];
+                let prev_d = unsafe { *(sched.db.defs + prev_idx) };
+                if semantic_key_cmp(view(prev_d.semantic_key), view(cur_d.semantic_key)) <= 0i32 {
+                    break;
+                }
+                mod_def_indices[mb] = prev_idx;
+                mb = mb - 1;
+            }
+            mod_def_indices[mb] = cur_idx;
+            ma = ma + 1;
+        }
+        fp = fingerprint128_u64(0x4445465F4D415030u64, mod_id.v as u64, pm_memo.value_tag as u64);
+        let mut mi: usize = 0;
+        while mi < mcount {
+            let d = unsafe { *(sched.db.defs + mod_def_indices[mi]) };
+            fp = fingerprint128_combine(fp, semantic_key_fingerprint(view(d.semantic_key)));
+            mi = mi + 1;
+        }
+        val_tag = if is_err { QRY_ID_ERROR } else { total };
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(sched.db.def_map_results + (mod_id.v as usize)) = ModuleDefMapResult {
+                    module_id: mod_id,
+                    exported_count: exported,
+                    total_defs: val_tag,
+                    is_error: is_err,
+                    def_map_fingerprint: fp,
+                };
+            }
+        }
+    } else if kind == QUERY_RESOLVE_MODULE {
+        let mod_id = ModuleId { v: raw };
+        let pm_key = query_key_for_module(view(sched.db), QUERY_PARSE_MODULE, mod_id);
+        let dm_key = query_key_for_module(view(sched.db), QUERY_MODULE_DEF_MAP, mod_id);
+        let pm_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, pm_key);
+        let dm_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, dm_key);
+        is_err = pm_memo.value_is_error || dm_memo.value_is_error;
+        fp = fingerprint128_combine(
+            dm_memo.value_fingerprint,
+            fingerprint128_u64(0x5245534F4C56454Du64, mod_id.v as u64, dm_memo.value_tag as u64)
+        );
+        val_tag = if is_err { QRY_ID_ERROR } else { dm_memo.value_tag };
+        if (mod_id.v as usize) < QRY_MAX_MODULES {
+            unsafe {
+                *(sched.db.resolve_results + (mod_id.v as usize)) = ResolveModuleResult {
+                    module_id: mod_id,
+                    resolved_bindings: dm_memo.value_tag,
+                    has_resolve_error: is_err,
+                    resolve_fingerprint: fp,
+                };
+            }
+        }
+    } else if kind == QUERY_ITEM_SIGNATURE {
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(sched.db), def_id);
+        let dm_key = query_key_for_module(view(sched.db), QUERY_MODULE_DEF_MAP, d.module_id);
+        let dm_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, dm_key);
+        is_err = dm_memo.value_is_error;
+        fp = fingerprint128_combine(
+            semantic_key_fingerprint(view(d.semantic_key)),
+            fingerprint128_u64(0x4954454D5F534947u64, d.sig_hash_seed, ((d.param_count as u64) << 32u64) | (d.return_type_tag as u64))
+        );
+        let mut i: u32 = 0u32;
+        while i < (d.sig_dep_count) {
+            let dep_def = DefId { v: d.sig_dep_defs[i as usize] };
+            let dep_key = query_key_for_def(view(sched.db), QUERY_ITEM_SIGNATURE, dep_def);
+            let dep_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, dep_key);
+            if dep_memo.value_is_error {
+                is_err = true;
+            }
+            fp = fingerprint128_combine(fp, dep_memo.value_fingerprint);
+            i = i + 1u32;
+        }
+        if unsafe { (*slot_ptr).was_poisoned } {
+            is_err = true;
+        }
+        val_tag = if is_err { QRY_ID_ERROR } else { d.type_id.v };
+        let def_idx = query_db_find_def_index(view(sched.db), def_id);
+        if def_idx < QRY_MAX_DEFS {
+            unsafe {
+                *(sched.db.sig_results + def_idx) = ItemSignatureResult {
+                    def_id: def_id,
+                    param_count: d.param_count,
+                    return_type: TypeId { v: val_tag },
+                    is_error: is_err,
+                    interface_fingerprint: fp,
+                };
+            }
+        }
+    } else if kind == QUERY_CONST_EVAL {
+        let ckey = ConstEvalKey { v: raw };
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(sched.db), def_id);
+        let sig_key = query_key_for_def(view(sched.db), QUERY_ITEM_SIGNATURE, def_id);
+        let sig_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, sig_key);
+        is_err = sig_memo.value_is_error;
+        let mut acc_val: i64 = d.const_base_val;
+        fp = fingerprint128_combine(
+            sig_memo.value_fingerprint,
+            fingerprint128_u64(0x434F4E53545F4556u64, d.body_hash_seed, acc_val as u64)
+        );
+        let mut i: u32 = 0u32;
+        while i < (d.body_const_count) {
+            let dep_ckey = ConstEvalKey { v: d.body_const_deps[i as usize] };
+            let dep_qkey = query_key_for_const_eval(view(sched.db), dep_ckey);
+            let dep_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, dep_qkey);
+            if dep_memo.value_is_error {
+                is_err = true;
+            } else {
+                acc_val = acc_val + (dep_memo.value_tag as i64);
+            }
+            fp = fingerprint128_combine(fp, dep_memo.value_fingerprint);
+            i = i + 1u32;
+        }
+        if unsafe { (*slot_ptr).was_poisoned } {
+            is_err = true;
+        }
+        val_tag = if is_err { QRY_ID_ERROR } else { acc_val as u32 };
+        let def_idx = query_db_find_def_index(view(sched.db), def_id);
+        if def_idx < QRY_MAX_DEFS {
+            unsafe {
+                *(sched.db.const_results + def_idx) = ConstEvalResult {
+                    const_key: ckey,
+                    int_val: if is_err { 0i64 } else { acc_val },
+                    is_poisoned: is_err,
+                    const_fingerprint: fp,
+                };
+            }
+        }
+    } else if kind == QUERY_TYPECK_BODY {
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(sched.db), def_id);
+        let rm_key = query_key_for_module(view(sched.db), QUERY_RESOLVE_MODULE, d.module_id);
+        let sig_key = query_key_for_def(view(sched.db), QUERY_ITEM_SIGNATURE, def_id);
+        let rm_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, rm_key);
+        let sig_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, sig_key);
+        let mut upstream_poisoned = rm_memo.value_is_error || sig_memo.value_is_error;
+        fp = fingerprint128_combine(
+            sig_memo.value_fingerprint,
+            fingerprint128_u64(0x54595045434B4244u64, d.body_hash_seed, d.def_id.v as u64)
+        );
+        let mut ci: u32 = 0u32;
+        while ci < (d.body_call_count) {
+            let callee_id = DefId { v: d.body_call_defs[ci as usize] };
+            let callee_sig_key = query_key_for_def(view(sched.db), QUERY_ITEM_SIGNATURE, callee_id);
+            let callee_sig_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, callee_sig_key);
+            if callee_sig_memo.value_is_error {
+                upstream_poisoned = true;
+            }
+            fp = fingerprint128_combine(fp, callee_sig_memo.value_fingerprint);
+            ci = ci + 1u32;
+        }
+        let mut ki: u32 = 0u32;
+        while ki < (d.body_const_count) {
+            let ckey = ConstEvalKey { v: d.body_const_deps[ki as usize] };
+            let ce_qkey = query_key_for_const_eval(view(sched.db), ckey);
+            let ce_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, ce_qkey);
+            if ce_memo.value_is_error {
+                upstream_poisoned = true;
+            }
+            fp = fingerprint128_combine(fp, ce_memo.value_fingerprint);
+            ki = ki + 1u32;
+        }
+        is_err = upstream_poisoned;
+        if !upstream_poisoned && d.has_body_type_error {
+            is_err = true;
+            let err_fp = fingerprint128_combine(
+                semantic_key_fingerprint(view(d.semantic_key)),
+                fingerprint128_u64(0x5459505F4D49534Du64, DIAG_AX_TYP_MISMATCH as u64, def_id.v as u64)
+            );
+            query_db_attach_diag(mut_view(sched.db), slot_idx, DIAG_AX_TYP_MISMATCH, d.semantic_key, 1u32, err_fp);
+        }
+        val_tag = if is_err { QRY_ID_ERROR } else { d.type_id.v };
+        let def_idx = query_db_find_def_index(view(sched.db), def_id);
+        if def_idx < QRY_MAX_DEFS {
+            unsafe {
+                *(sched.db.typeck_results + def_idx) = TypeckBodyResult {
+                    def_id: def_id,
+                    checked_expr_count: d.body_call_count + d.body_const_count + 1u32,
+                    callee_sig_count: d.body_call_count,
+                    inferred_return_type: TypeId { v: val_tag },
+                    is_error: is_err,
+                    body_fingerprint: fp,
+                };
+            }
+        }
+    } else {
+        // QUERY_MIR_BODY or other derived query
+        let def_id = DefId { v: raw };
+        let d = query_db_get_def(view(sched.db), def_id);
+        let sig_key = query_key_for_def(view(sched.db), QUERY_ITEM_SIGNATURE, def_id);
+        let tck_key = query_key_for_def(view(sched.db), QUERY_TYPECK_BODY, def_id);
+        let sig_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, sig_key);
+        let tck_memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), worker_id, tck_key);
+        is_err = sig_memo.value_is_error || tck_memo.value_is_error;
+        fp = fingerprint128_combine(
+            sig_memo.value_fingerprint,
+            fingerprint128_combine(
+                tck_memo.value_fingerprint,
+                fingerprint128_u64(0x4D49525F424F4459u64, def_id.v as u64, d.body_hash_seed)
+            )
+        );
+        let blocks = if is_err { 0u32 } else { d.body_call_count + 1u32 };
+        let locals = if is_err { 0u32 } else { d.param_count + 2u32 };
+        val_tag = if is_err { QRY_ID_ERROR } else { blocks };
+        let def_idx = query_db_find_def_index(view(sched.db), def_id);
+        if def_idx < QRY_MAX_DEFS {
+            unsafe {
+                *(sched.db.mir_results + def_idx) = MirBodyResult {
+                    def_id: def_id,
+                    mir_body_id: if is_err { MirBodyId { v: QRY_ID_ERROR } } else { d.mir_body_id },
+                    block_count: blocks,
+                    local_count: locals,
+                    ownership_verified: !is_err,
+                    is_error: is_err,
+                    mir_fingerprint: fp,
+                };
+            }
+        }
+    }
+
+    wait_for_graph_pop_worker_frame(mut_view(sched.wait_graph), worker_id);
+
+    let was_poisoned = unsafe { (*slot_ptr).was_poisoned };
+    let final_err = is_err || was_poisoned;
+    let final_fp = if was_poisoned { unsafe { (*slot_ptr).value_fingerprint } } else { fp };
+    let final_state = if was_poisoned { QUERY_STATE_POISONED } else { QUERY_STATE_READY };
+
+    unsafe {
+        (*slot_ptr).state = final_state;
+        (*slot_ptr).verified_at = r_curr;
+        (*slot_ptr).changed_at = r_curr;
+        (*slot_ptr).value_tag = val_tag;
+        (*slot_ptr).value_is_error = final_err;
+        (*slot_ptr).value_fingerprint = final_fp;
+    }
+
+    let _ = wait_for_graph_complete_latch(mut_view(sched.wait_graph), slot_idx, key, val_tag, final_err, final_fp);
+    if (worker_id as usize) < (sched.jobs as usize) {
+        worker_arena_record_alloc(unsafe { sched.worker_arenas + (worker_id as usize) }, 128u64, final_fp);
+    }
+    unsafe { *slot_ptr }
+}
+
+// Orders ready tasks by `(priority_tier ASC, critical_cost DESC, query_key ASC)`
+// (`AXS-PAR-012 §2`, `AXS-PAR-050`).
+fn scheduled_task_higher_priority(a: view<ScheduledTask>, b: view<ScheduledTask>, mode: u8) -> bool {
+    if (a.priority_tier) < (b.priority_tier) {
+        return true;
+    }
+    if (a.priority_tier) > (b.priority_tier) {
+        return false;
+    }
+    if mode != SCHEDULE_MODE_DETERMINISTIC_DEBUG {
+        if (a.cost.critical_cost) > (b.cost.critical_cost) {
+            return true;
+        }
+        if (a.cost.critical_cost) < (b.cost.critical_cost) {
+            return false;
+        }
+    }
+    query_key_cmp(view(a.query_key), view(b.query_key)) < 0i32
+}
+
+// Executes all submitted tasks across `--jobs <N>` workers with priority ordering,
+// work-stealing deques, single-flight query latches, and post-join canonical sealing.
+pub fn parallel_scheduler_execute_all(sched: mut_view<ParallelScheduler>) -> Fingerprint128 {
+    let n_tasks = sched.task_count as usize;
+    let mut sorted_ids: [256]u32 = [0u32; 256];
+    let mut i: usize = 0;
+    while i < n_tasks {
+        sorted_ids[i] = i as u32;
+        i = i + 1;
+    }
+
+    // Sort ready queue by priority tier & critical-path cost (`AXS-PAR-012`)
+    let mut a: usize = 1;
+    while a < n_tasks {
+        let cur_id = sorted_ids[a];
+        let cur_t = unsafe { *(sched.tasks + (cur_id as usize)) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_id = sorted_ids[b - 1];
+            let prev_t = unsafe { *(sched.tasks + (prev_id as usize)) };
+            if scheduled_task_higher_priority(view(prev_t), view(cur_t), sched.schedule_mode) ||
+                (!scheduled_task_higher_priority(view(cur_t), view(prev_t), sched.schedule_mode)) {
+                break;
+            }
+            sorted_ids[b] = prev_id;
+            b = b - 1;
+        }
+        sorted_ids[b] = cur_id;
+        a = a + 1;
+    }
+
+    // Reset worker deques and push sorted tasks to their preferred workers
+    let mut w: u32 = 0u32;
+    while w < (sched.jobs) {
+        let dqp = unsafe { sched.worker_deques + (w as usize) };
+        unsafe {
+            (*dqp).head = 0u32;
+            (*dqp).tail = 0u32;
+        }
+        w = w + 1u32;
+    }
+
+    let mut ti: usize = 0;
+    while ti < n_tasks {
+        let tid = sorted_ids[ti];
+        let t = unsafe { *(sched.tasks + (tid as usize)) };
+        let target_w = if sched.jobs <= 1u32 { 0u32 } else { t.preferred_worker % sched.jobs };
+        worker_deque_push(unsafe { sched.worker_deques + (target_w as usize) }, tid);
+        ti = ti + 1;
+    }
+
+    // Round-robin cooperative worker execution with work-stealing when a worker's local deque is empty
+    let mut remaining: usize = n_tasks;
+    let mut turn_worker: u32 = 0u32;
+    while remaining > 0 {
+        let cur_w = turn_worker % sched.jobs;
+        turn_worker = turn_worker + 1u32;
+
+        let mut tid = worker_deque_pop_local(unsafe { sched.worker_deques + (cur_w as usize) });
+        let mut stolen = false;
+        let mut victim_w = cur_w;
+
+        if tid == QRY_ID_ERROR && sched.jobs > 1u32 {
+            // Attempt to steal from the busiest / next non-empty worker deque
+            let mut offset: u32 = 1u32;
+            while offset < (sched.jobs) {
+                let cand_w = (cur_w + offset) % sched.jobs;
+                let stolen_id = worker_deque_steal(unsafe { sched.worker_deques + (cand_w as usize) });
+                if stolen_id != QRY_ID_ERROR {
+                    tid = stolen_id;
+                    stolen = true;
+                    victim_w = cand_w;
+                    sched.total_steals = sched.total_steals + 1u32;
+                    break;
+                }
+                offset = offset + 1u32;
+            }
+        }
+
+        if tid != QRY_ID_ERROR {
+            let tp = unsafe { sched.tasks + (tid as usize) };
+            let qk = unsafe { (*tp).query_key };
+            unsafe {
+                (*tp).state = ACTION_STATE_RUNNING;
+                (*tp).executed_by_worker = cur_w;
+                (*tp).was_stolen = stolen;
+                (*tp).stolen_from_worker = if stolen { victim_w } else { cur_w };
+            }
+
+            let memo = parallel_scheduler_eval_query_on_worker(mut_view(*sched), cur_w, qk);
+            unsafe {
+                (*tp).state = if memo.value_is_error { ACTION_STATE_FAILED } else { ACTION_STATE_SUCCESS };
+                (*tp).result_tag = memo.value_tag;
+                (*tp).result_is_error = memo.value_is_error;
+                (*tp).result_fingerprint = memo.value_fingerprint;
+                (*(sched.worker_deques + (cur_w as usize))).executed_count =
+                    (*(sched.worker_deques + (cur_w as usize))).executed_count + 1u32;
+            }
+            sched.total_tasks_executed = sched.total_tasks_executed + 1u32;
+            remaining = remaining - 1;
+        }
+    }
+
+    // Post-join barrier: seal sharded interner, freeze per-worker arenas, release readers,
+    // and compute canonical order-independent post-join fingerprint (`AXS-PAR-001`, `AXS-PAR-023`).
+    let intern_fp = sharded_interner_seal(mut_view(sched.interner));
+    let mut wi: u32 = 0u32;
+    while wi < (sched.jobs) {
+        worker_arena_freeze(unsafe { sched.worker_arenas + (wi as usize) });
+        parallel_snapshot_release_worker(mut_view(sched.snapshot));
+        wi = wi + 1u32;
+    }
+
+    // Compute canonical post-join fingerprint sorted by `QueryKey` across all evaluated memo slots
+    let mut sorted_slots: [512]u32 = [0u32; 512];
+    let mut scount: usize = 0;
+    let mut si: u32 = 0u32;
+    while si < (sched.db.memo_slot_count) {
+        let sl = unsafe { *(sched.db.memo_slots + (si as usize)) };
+        if query_kind_is_derived(sl.key.kind) && sl.state != QUERY_STATE_VACANT {
+            sorted_slots[scount] = si;
+            scount = scount + 1;
+        }
+        si = si + 1u32;
+    }
+    let mut sa: usize = 1;
+    while sa < scount {
+        let cur_s = sorted_slots[sa];
+        let cur_e = unsafe { *(sched.db.memo_slots + (cur_s as usize)) };
+        let mut sb: usize = sa;
+        while sb > 0 {
+            let prev_s = sorted_slots[sb - 1];
+            let prev_e = unsafe { *(sched.db.memo_slots + (prev_s as usize)) };
+            if query_key_cmp(view(prev_e.key), view(cur_e.key)) <= 0i32 {
+                break;
+            }
+            sorted_slots[sb] = prev_s;
+            sb = sb - 1;
+        }
+        sorted_slots[sb] = cur_s;
+        sa = sa + 1;
+    }
+
+    let mut post_fp = fingerprint128_combine(sched.snapshot.snapshot_fingerprint, intern_fp);
+    let mut k: usize = 0;
+    while k < scount {
+        let sl = unsafe { *(sched.db.memo_slots + (sorted_slots[k] as usize)) };
+        post_fp = fingerprint128_combine(post_fp, sl.value_fingerprint);
+        k = k + 1;
+    }
+    sched.post_join_fingerprint = post_fp;
+    post_fp
+}
+
+// ============================================================================
+// 5. Deterministic Post-Join Formatters (Interner, HIR/MIR Dumps, Cycles, Diags)
+// ============================================================================
+
+// Byte table for deterministic ASCII labels without assembly label collisions:
+//   0..16:   "interner shards=" (16)
+//  16..25:   " entries=" (9)
+//  25..37:   " dedup_hits=" (12)
+//  37..45:   " sealed=" (8)
+//  45..49:   "true" (4)
+//  49..54:   "false" (5)
+//  54..61:   "intern[" (7)
+//  61..69:   "] shard=" (8)
+//  69..77:   " offset=" (8)
+//  77..85:   " domain=" (8)
+//  85..88:   "str" (3)
+//  88..92:   "type" (4)
+//  92..97:   " key=" (5)
+//  97..110:  "hir_mir item=" (13)
+// 110..123:  " scoped_def=(" (13)
+// 123..132:  ") blocks=" (9)
+// 132..140:  " locals=" (8)
+// 140..150:  " verified=" (10)
+// 150..165:  "parallel_cycle[" (15)
+// 165..173:  "] steps=" (8)
+// 173..175:  ": " (2)
+// 175..179:  " -> " (4)
+// 179..184:  "diag[" (5)
+// 184..194:  "] primary=" (10)
+// 194..205:  " trace_len=" (11)
+// 205..228:  "parallel_digest epoch=E" (23)
+// 228..234:  " rev=R" (6)
+// 234..240:  " defs=" (6)
+// 240..250:  " interned=" (10)
+// 250..258:  " cycles=" (8)
+// 258..265:  " diags=" (7)
+const PAR_FMT_BYTES: [265]u8 = [
+    105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 101u8, 114u8, 32u8, 115u8, 104u8, 97u8, 114u8, 100u8, 115u8, 61u8,
+    32u8, 101u8, 110u8, 116u8, 114u8, 105u8, 101u8, 115u8, 61u8,
+    32u8, 100u8, 101u8, 100u8, 117u8, 112u8, 95u8, 104u8, 105u8, 116u8, 115u8, 61u8,
+    32u8, 115u8, 101u8, 97u8, 108u8, 101u8, 100u8, 61u8,
+    116u8, 114u8, 117u8, 101u8,
+    102u8, 97u8, 108u8, 115u8, 101u8,
+    105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 91u8,
+    93u8, 32u8, 115u8, 104u8, 97u8, 114u8, 100u8, 61u8,
+    32u8, 111u8, 102u8, 102u8, 115u8, 101u8, 116u8, 61u8,
+    32u8, 100u8, 111u8, 109u8, 97u8, 105u8, 110u8, 61u8,
+    115u8, 116u8, 114u8,
+    116u8, 121u8, 112u8, 101u8,
+    32u8, 107u8, 101u8, 121u8, 61u8,
+    104u8, 105u8, 114u8, 95u8, 109u8, 105u8, 114u8, 32u8, 105u8, 116u8, 101u8, 109u8, 61u8,
+    32u8, 115u8, 99u8, 111u8, 112u8, 101u8, 100u8, 95u8, 100u8, 101u8, 102u8, 61u8, 40u8,
+    41u8, 32u8, 98u8, 108u8, 111u8, 99u8, 107u8, 115u8, 61u8,
+    32u8, 108u8, 111u8, 99u8, 97u8, 108u8, 115u8, 61u8,
+    32u8, 118u8, 101u8, 114u8, 105u8, 102u8, 105u8, 101u8, 100u8, 61u8,
+    112u8, 97u8, 114u8, 97u8, 108u8, 108u8, 101u8, 108u8, 95u8, 99u8, 121u8, 99u8, 108u8, 101u8, 91u8,
+    93u8, 32u8, 115u8, 116u8, 101u8, 112u8, 115u8, 61u8,
+    58u8, 32u8,
+    32u8, 45u8, 62u8, 32u8,
+    100u8, 105u8, 97u8, 103u8, 91u8,
+    93u8, 32u8, 112u8, 114u8, 105u8, 109u8, 97u8, 114u8, 121u8, 61u8,
+    32u8, 116u8, 114u8, 97u8, 99u8, 101u8, 95u8, 108u8, 101u8, 110u8, 61u8,
+    112u8, 97u8, 114u8, 97u8, 108u8, 108u8, 101u8, 108u8, 95u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 32u8, 101u8, 112u8, 111u8, 99u8, 104u8, 61u8, 69u8,
+    32u8, 114u8, 101u8, 118u8, 61u8, 82u8,
+    32u8, 100u8, 101u8, 102u8, 115u8, 61u8,
+    32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 101u8, 100u8, 61u8,
+    32u8, 99u8, 121u8, 99u8, 108u8, 101u8, 115u8, 61u8,
+    32u8, 100u8, 105u8, 97u8, 103u8, 115u8, 61u8
+];
+
+fn sched_buf_push_slice(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), PAR_FMT_BYTES[start + i]);
+        i = i + 1;
+    }
+}
+
+pub fn parallel_scheduler_emit_interner_summary(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    sched_buf_push_slice(mut_view(*out), 0, 16); // "interner shards="
+    diag_buf_push_u32(mut_view(*out), sched.interner.shard_count);
+    sched_buf_push_slice(mut_view(*out), 16, 9); // " entries="
+    diag_buf_push_u32(mut_view(*out), sched.interner.total_entries);
+    sched_buf_push_slice(mut_view(*out), 25, 12); // " dedup_hits="
+    diag_buf_push_u32(mut_view(*out), sched.interner.total_dedup_hits);
+    sched_buf_push_slice(mut_view(*out), 37, 8); // " sealed="
+    if sched.interner.is_sealed {
+        sched_buf_push_slice(mut_view(*out), 45, 4); // "true"
+    } else {
+        sched_buf_push_slice(mut_view(*out), 49, 5); // "false"
+    }
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let mut s: u32 = 0u32;
+    while s < (sched.interner.shard_count) {
+        let shard = unsafe { *(sched.interner.shards + (s as usize)) };
+        let mut e: u32 = 0u32;
+        while e < (shard.count) {
+            let ent = shard.entries[e as usize];
+            sched_buf_push_slice(mut_view(*out), 54, 7); // "intern["
+            diag_buf_push_u32(mut_view(*out), ent.id.canonical_index);
+            sched_buf_push_slice(mut_view(*out), 61, 8); // "] shard="
+            diag_buf_push_u32(mut_view(*out), ent.id.shard_id as u32);
+            sched_buf_push_slice(mut_view(*out), 69, 8); // " offset="
+            diag_buf_push_u32(mut_view(*out), ent.id.local_offset);
+            sched_buf_push_slice(mut_view(*out), 77, 8); // " domain="
+            if ent.id.domain == INTERN_DOMAIN_TYPE {
+                sched_buf_push_slice(mut_view(*out), 88, 4); // "type"
+            } else {
+                sched_buf_push_slice(mut_view(*out), 85, 3); // "str"
+            }
+            sched_buf_push_slice(mut_view(*out), 92, 5); // " key="
+            diag_buf_push_sv(mut_view(*out), ent.content);
+            diag_buf_push_byte(mut_view(*out), 10u8);
+            e = e + 1u32;
+        }
+        s = s + 1u32;
+    }
+}
+
+// Emits canonical post-join HIR/MIR dump sorted lexicographically by `SemanticKey`
+// so `--jobs 1`, `--jobs 2`, and `--jobs 8` produce byte-for-byte identical dumps (`AXS-PAR-001`).
+pub fn parallel_scheduler_emit_hir_mir_dump(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    let d_count = sched.db.def_count as usize;
+    let mut sorted_defs: [128]usize = [0; 128];
+    let mut i: usize = 0;
+    while i < d_count {
+        sorted_defs[i] = i;
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < d_count {
+        let cur_idx = sorted_defs[a];
+        let cur_d = unsafe { *(sched.db.defs + cur_idx) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted_defs[b - 1];
+            let prev_d = unsafe { *(sched.db.defs + prev_idx) };
+            if semantic_key_cmp(view(prev_d.semantic_key), view(cur_d.semantic_key)) <= 0i32 {
+                break;
+            }
+            sorted_defs[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted_defs[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut k: usize = 0;
+    while k < d_count {
+        let def_idx = sorted_defs[k];
+        let d = unsafe { *(sched.db.defs + def_idx) };
+        let scoped = scoped_def_id_from_def_id(d.def_id);
+        let mir = unsafe { *(sched.db.mir_results + def_idx) };
+
+        sched_buf_push_slice(mut_view(*out), 97, 13); // "hir_mir item="
+        query_db_push_semantic_key(mut_view(*out), view(d.semantic_key));
+        sched_buf_push_slice(mut_view(*out), 110, 13); // " scoped_def=("
+        diag_buf_push_u32(mut_view(*out), scoped.module_id);
+        diag_buf_push_byte(mut_view(*out), 44u8); // ','
+        diag_buf_push_u32(mut_view(*out), scoped.local_index);
+        sched_buf_push_slice(mut_view(*out), 123, 9); // ") blocks="
+        diag_buf_push_u32(mut_view(*out), mir.block_count);
+        sched_buf_push_slice(mut_view(*out), 132, 8); // " locals="
+        diag_buf_push_u32(mut_view(*out), mir.local_count);
+        sched_buf_push_slice(mut_view(*out), 140, 10); // " verified="
+        if mir.ownership_verified && !mir.is_error {
+            sched_buf_push_slice(mut_view(*out), 45, 4); // "true"
+        } else {
+            sched_buf_push_slice(mut_view(*out), 49, 5); // "false"
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        k = k + 1;
+    }
+}
+
+pub fn parallel_scheduler_emit_cycles(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    let c_count = sched.wait_graph.cycle_count as usize;
+    let mut sorted: [64]usize = [0; 64];
+    let mut i: usize = 0;
+    while i < c_count {
+        sorted[i] = i;
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < c_count {
+        let cur_idx = sorted[a];
+        let cur_c = unsafe { *(sched.wait_graph.cycles + cur_idx) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted[b - 1];
+            let prev_c = unsafe { *(sched.wait_graph.cycles + prev_idx) };
+            if query_key_cmp(view(prev_c.canonical_head), view(cur_c.canonical_head)) <= 0i32 {
+                break;
+            }
+            sorted[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut idx: usize = 0;
+    while idx < c_count {
+        let rec = unsafe { *(sched.wait_graph.cycles + sorted[idx]) };
+        sched_buf_push_slice(mut_view(*out), 150, 15); // "parallel_cycle["
+        query_db_push_diag_code_name(mut_view(*out), rec.diag_code);
+        sched_buf_push_slice(mut_view(*out), 165, 8); // "] steps="
+        diag_buf_push_u32(mut_view(*out), rec.step_count);
+        sched_buf_push_slice(mut_view(*out), 173, 2); // ": "
+        let mut s: u32 = 0u32;
+        while s < (rec.step_count) {
+            if s > 0u32 {
+                sched_buf_push_slice(mut_view(*out), 175, 4); // " -> "
+            }
+            query_db_push_query_key(mut_view(*out), view(rec.steps[s as usize]));
+            s = s + 1u32;
+        }
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        idx = idx + 1;
+    }
+}
+
+// Post-join diagnostic merge (`AXS-PAR-023` / `AXD-060`): stably sorts all accumulated
+// diagnostics by `(primary_key, code)` so worker completion order never alters output.
+pub fn parallel_scheduler_emit_diagnostics(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    let d_count = sched.db.emitted_diag_count as usize;
+    let mut sorted: [128]u32 = [0u32; 128];
+    let mut i: usize = 0;
+    while i < d_count {
+        sorted[i] = unsafe { *(sched.db.emitted_diag_indices + i) };
+        i = i + 1;
+    }
+
+    let mut a: usize = 1;
+    while a < d_count {
+        let cur_idx = sorted[a];
+        let cur_dg = unsafe { *(sched.db.all_diags + (cur_idx as usize)) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev_idx = sorted[b - 1];
+            let prev_dg = unsafe { *(sched.db.all_diags + (prev_idx as usize)) };
+            let cmp_k = semantic_key_cmp(view(prev_dg.primary_key), view(cur_dg.primary_key));
+            let le = if cmp_k < 0i32 {
+                true
+            } else if cmp_k > 0i32 {
+                false
+            } else {
+                prev_dg.code <= cur_dg.code
+            };
+            if le {
+                break;
+            }
+            sorted[b] = prev_idx;
+            b = b - 1;
+        }
+        sorted[b] = cur_idx;
+        a = a + 1;
+    }
+
+    let mut idx: usize = 0;
+    while idx < d_count {
+        let dg = unsafe { *(sched.db.all_diags + (sorted[idx] as usize)) };
+        sched_buf_push_slice(mut_view(*out), 179, 5); // "diag["
+        query_db_push_diag_code_name(mut_view(*out), dg.code);
+        sched_buf_push_slice(mut_view(*out), 184, 10); // "] primary="
+        query_db_push_semantic_key(mut_view(*out), view(dg.primary_key));
+        sched_buf_push_slice(mut_view(*out), 194, 11); // " trace_len="
+        diag_buf_push_u32(mut_view(*out), dg.trace_len);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        idx = idx + 1;
+    }
+}
+
+pub fn parallel_scheduler_emit_equivalence_digest(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    sched_buf_push_slice(mut_view(*out), 205, 23); // "parallel_digest epoch=E"
+    diag_buf_push_u32(mut_view(*out), sched.snapshot.epoch.epoch_id as u32);
+    sched_buf_push_slice(mut_view(*out), 228, 6); // " rev=R"
+    diag_buf_push_u32(mut_view(*out), sched.db.current_revision.raw as u32);
+    sched_buf_push_slice(mut_view(*out), 234, 6); // " defs="
+    diag_buf_push_u32(mut_view(*out), sched.db.def_count);
+    sched_buf_push_slice(mut_view(*out), 240, 10); // " interned="
+    diag_buf_push_u32(mut_view(*out), sched.interner.total_entries);
+    sched_buf_push_slice(mut_view(*out), 250, 8); // " cycles="
+    diag_buf_push_u32(mut_view(*out), sched.wait_graph.cycle_count);
+    sched_buf_push_slice(mut_view(*out), 258, 7); // " diags="
+    diag_buf_push_u32(mut_view(*out), sched.db.emitted_diag_count);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}

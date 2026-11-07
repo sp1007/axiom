@@ -1,0 +1,391 @@
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.DefId
+use compiler.query.db.DIAG_AX_CTM_CYCLE
+use compiler.query.db.DIAG_AX_QUERY_CYCLE
+use compiler.query.db.DIAG_AX_TYPE_CYCLE
+use compiler.query.db.DIAG_AX_TYP_MISMATCH
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.DURABILITY_MEDIUM
+use compiler.query.db.ITEM_KIND_CONST
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_TYPE_ALIAS
+use compiler.query.db.ITEM_NS_CONST
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.QUERY_CONST_EVAL
+use compiler.query.db.QUERY_ITEM_SIGNATURE
+use compiler.query.db.QUERY_MIR_BODY
+use compiler.query.db.QUERY_TYPECK_BODY
+use compiler.query.db.SourceFileId
+use compiler.query.db.UnitKey
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.query_db_add_body_call
+use compiler.query.db.query_db_add_body_const_dep
+use compiler.query.db.query_db_add_sig_dep
+use compiler.query.db.query_db_get_or_create_slot
+use compiler.query.db.query_db_reset_session_diags
+use compiler.query.db.query_db_set_def_flags
+use compiler.query.db.query_db_set_def_seeds
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_set_package_graph_input
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_key_for_const_eval
+use compiler.query.db.query_key_for_def
+use compiler.query.db.semantic_key_new
+
+use compiler.parallel.scheduler.CLAIM_ACQUIRED
+use compiler.parallel.scheduler.CLAIM_CYCLE_DETECTED
+use compiler.parallel.scheduler.CLAIM_MEMO_HIT
+use compiler.parallel.scheduler.CLAIM_WAIT_SINGLE_FLIGHT
+use compiler.parallel.scheduler.DIAG_AX_PARALLEL_QUERY_CYCLE
+use compiler.parallel.scheduler.INTERN_DOMAIN_STR
+use compiler.parallel.scheduler.INTERN_DOMAIN_TYPE
+use compiler.parallel.scheduler.PRIORITY_CRITICAL
+use compiler.parallel.scheduler.PRIORITY_INTERACTIVE
+use compiler.parallel.scheduler.PRIORITY_NORMAL
+use compiler.parallel.scheduler.ParallelScheduler
+use compiler.parallel.scheduler.SCHEDULE_MODE_BALANCED
+use compiler.parallel.scheduler.SCHEDULE_MODE_DETERMINISTIC_DEBUG
+use compiler.parallel.scheduler.SCHEDULE_MODE_THROUGHPUT
+use compiler.parallel.scheduler.parallel_scheduler_emit_cycles
+use compiler.parallel.scheduler.parallel_scheduler_emit_diagnostics
+use compiler.parallel.scheduler.parallel_scheduler_emit_equivalence_digest
+use compiler.parallel.scheduler.parallel_scheduler_emit_hir_mir_dump
+use compiler.parallel.scheduler.parallel_scheduler_empty
+use compiler.parallel.scheduler.parallel_scheduler_execute_all
+use compiler.parallel.scheduler.parallel_scheduler_free
+use compiler.parallel.scheduler.parallel_scheduler_freeze_snapshot
+use compiler.parallel.scheduler.parallel_scheduler_init
+use compiler.parallel.scheduler.parallel_scheduler_register_scoped_def
+use compiler.parallel.scheduler.parallel_scheduler_submit_query_task
+use compiler.parallel.scheduler.parallel_snapshot_eq
+use compiler.parallel.scheduler.resource_cost_new
+use compiler.parallel.scheduler.scoped_def_id_eq
+use compiler.parallel.scheduler.scoped_def_id_new
+use compiler.parallel.scheduler.scoped_def_id_to_def_id
+use compiler.parallel.scheduler.sharded_intern_id_eq
+use compiler.parallel.scheduler.sharded_interner_intern_str
+use compiler.parallel.scheduler.sharded_interner_intern_type
+use compiler.parallel.scheduler.sharded_interner_lookup
+use compiler.parallel.scheduler.sharded_interner_seal
+use compiler.parallel.scheduler.wait_for_graph_claim_or_wait
+use compiler.parallel.scheduler.wait_for_graph_complete_latch
+use compiler.parallel.scheduler.wait_for_graph_pop_worker_frame
+use compiler.parallel.scheduler.wait_for_graph_push_worker_frame
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn probe_sv(arena: mut_view<Arena>, s: str) -> StrView {
+    let raw_sv: StrView = unsafe { *(address_of(s) as *const StrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw_sv.len;
+    let dst = arena_alloc_raw(mut_view(*arena), n + 1, 1);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    StrView { ptr: dst as *const u8, len: n }
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < (a.len) {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn print_diag_buf(b: view<DiagBuffer>) {
+    if (b.len) > 0 && (b.ptr as usize) != 0 {
+        unsafe {
+            let _ = write(stdio(1u32), b.ptr as *const u8, b.len);
+        }
+    }
+}
+
+fn setup_workspace(str_arena: mut_view<Arena>, sched: mut_view<ParallelScheduler>, reverse_registration: bool) -> bool {
+    let pkg_sv = probe_sv(mut_view(*str_arena), "app");
+    let triple_sv = probe_sv(mut_view(*str_arena), "x86_64-windows");
+    let abi_sv = probe_sv(mut_view(*str_arena), "win64");
+    let ty_i32_sv = probe_sv(mut_view(*str_arena), "i32");
+    let ty_vec2_sv = probe_sv(mut_view(*str_arena), "geom.Vec2");
+
+    let mod_geom_sv = probe_sv(mut_view(*str_arena), "geom");
+    let mod_phys_sv = probe_sv(mut_view(*str_arena), "physics");
+    let mod_app_sv = probe_sv(mut_view(*str_arena), "entry");
+    let mod_a_sv = probe_sv(mut_view(*str_arena), "mod_a");
+    let mod_b_sv = probe_sv(mut_view(*str_arena), "mod_b");
+
+    let pkg = PackageId { v: 1u32 };
+    let unit = UnitKey { v: 1u32 };
+    let _ = query_db_set_package_graph_input(mut_view(sched.db), pkg, pkg_sv, 2026u32, 0u32, 0u64);
+    let _ = query_db_set_target_config_input(mut_view(sched.db), unit, triple_sv, abi_sv, 0u32, 2026u32, 2u8, 8u32);
+
+    let _ = query_db_set_source_file_input(mut_view(sched.db), SourceFileId { v: 1u32 }, probe_sv(mut_view(*str_arena), "src/geom.ax"), probe_sv(mut_view(*str_arena), "// geom\n"), DURABILITY_LOW);
+    let _ = query_db_set_source_file_input(mut_view(sched.db), SourceFileId { v: 2u32 }, probe_sv(mut_view(*str_arena), "src/physics.ax"), probe_sv(mut_view(*str_arena), "// physics\n"), DURABILITY_LOW);
+    let _ = query_db_set_source_file_input(mut_view(sched.db), SourceFileId { v: 3u32 }, probe_sv(mut_view(*str_arena), "src/entry.ax"), probe_sv(mut_view(*str_arena), "// entry\n"), DURABILITY_LOW);
+    let _ = query_db_set_source_file_input(mut_view(sched.db), SourceFileId { v: 4u32 }, probe_sv(mut_view(*str_arena), "src/mod_a.ax"), probe_sv(mut_view(*str_arena), "// mod_a\n"), DURABILITY_LOW);
+    let _ = query_db_set_source_file_input(mut_view(sched.db), SourceFileId { v: 5u32 }, probe_sv(mut_view(*str_arena), "src/mod_b.ax"), probe_sv(mut_view(*str_arena), "// mod_b\n"), DURABILITY_LOW);
+
+    let _ = query_db_set_module_tree_input(mut_view(sched.db), ModuleId { v: 1u32 }, pkg, ModuleId { v: 0u32 }, mod_geom_sv, SourceFileId { v: 1u32 }, DURABILITY_MEDIUM);
+    let _ = query_db_set_module_tree_input(mut_view(sched.db), ModuleId { v: 2u32 }, pkg, ModuleId { v: 0u32 }, mod_phys_sv, SourceFileId { v: 2u32 }, DURABILITY_MEDIUM);
+    let _ = query_db_set_module_tree_input(mut_view(sched.db), ModuleId { v: 3u32 }, pkg, ModuleId { v: 0u32 }, mod_app_sv, SourceFileId { v: 3u32 }, DURABILITY_MEDIUM);
+    let _ = query_db_set_module_tree_input(mut_view(sched.db), ModuleId { v: 4u32 }, pkg, ModuleId { v: 0u32 }, mod_a_sv, SourceFileId { v: 4u32 }, DURABILITY_MEDIUM);
+    let _ = query_db_set_module_tree_input(mut_view(sched.db), ModuleId { v: 5u32 }, pkg, ModuleId { v: 0u32 }, mod_b_sv, SourceFileId { v: 5u32 }, DURABILITY_MEDIUM);
+
+    let sk_dot = semantic_key_new(pkg_sv, mod_geom_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "dot"), qry_sv_empty());
+    let sk_kin = semantic_key_new(pkg_sv, mod_phys_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "kinetic_scale"), qry_sv_empty());
+    let sk_main = semantic_key_new(pkg_sv, mod_app_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "main"), qry_sv_empty());
+    let sk_first = semantic_key_new(pkg_sv, mod_a_sv, ITEM_NS_CONST, 0u32, probe_sv(mut_view(*str_arena), "FIRST"), qry_sv_empty());
+    let sk_second = semantic_key_new(pkg_sv, mod_b_sv, ITEM_NS_CONST, 0u32, probe_sv(mut_view(*str_arena), "SECOND"), qry_sv_empty());
+    let sk_err_a = semantic_key_new(pkg_sv, mod_a_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "err_in_a"), qry_sv_empty());
+    let sk_err_b = semantic_key_new(pkg_sv, mod_b_sv, ITEM_NS_VALUE, 0u32, probe_sv(mut_view(*str_arena), "err_in_b"), qry_sv_empty());
+
+    // Register items in either forward or reverse worker arrival order:
+    // Because IDs are `(ModuleId, LocalIndex)` (`ScopedDefId`), the resulting `DefId`s
+    // and `ShardedInterner` entries are 100% identical regardless of registration order!
+    if !reverse_registration {
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 1u32 }, 1u32, ITEM_KIND_FN, true, 2u32, 1u32, ty_vec2_sv, sk_dot);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 2u32 }, 1u32, ITEM_KIND_FN, true, 2u32, 1u32, ty_i32_sv, sk_kin);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 3u32 }, 1u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_main);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 4u32 }, 1u32, ITEM_KIND_CONST, true, 0u32, 1u32, ty_i32_sv, sk_first);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 5u32 }, 1u32, ITEM_KIND_CONST, true, 0u32, 1u32, ty_i32_sv, sk_second);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 4u32 }, 2u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_err_a);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 5u32 }, 2u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_err_b);
+    } else {
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 3u32, ModuleId { v: 5u32 }, 2u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_err_b);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 2u32, ModuleId { v: 4u32 }, 2u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_err_a);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 1u32, ModuleId { v: 5u32 }, 1u32, ITEM_KIND_CONST, true, 0u32, 1u32, ty_i32_sv, sk_second);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 1u32, ModuleId { v: 4u32 }, 1u32, ITEM_KIND_CONST, true, 0u32, 1u32, ty_i32_sv, sk_first);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 0u32, ModuleId { v: 3u32 }, 1u32, ITEM_KIND_FN, true, 0u32, 1u32, ty_i32_sv, sk_main);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 2u32, ModuleId { v: 2u32 }, 1u32, ITEM_KIND_FN, true, 2u32, 1u32, ty_i32_sv, sk_kin);
+        let _ = parallel_scheduler_register_scoped_def(mut_view(*sched), 1u32, ModuleId { v: 1u32 }, 1u32, ITEM_KIND_FN, true, 2u32, 1u32, ty_vec2_sv, sk_dot);
+    }
+
+    let def_dot = scoped_def_id_to_def_id(scoped_def_id_new(1u32, 1u32));
+    let def_kin = scoped_def_id_to_def_id(scoped_def_id_new(2u32, 1u32));
+    let def_main = scoped_def_id_to_def_id(scoped_def_id_new(3u32, 1u32));
+    let def_first = scoped_def_id_to_def_id(scoped_def_id_new(4u32, 1u32));
+    let def_second = scoped_def_id_to_def_id(scoped_def_id_new(5u32, 1u32));
+    let def_err_a = scoped_def_id_to_def_id(scoped_def_id_new(4u32, 2u32));
+    let def_err_b = scoped_def_id_to_def_id(scoped_def_id_new(5u32, 2u32));
+
+    // Wire call graph: `main -> kinetic_scale -> dot` and `main -> dot`
+    query_db_add_body_call(mut_view(sched.db), def_kin, def_dot);
+    query_db_add_body_call(mut_view(sched.db), def_main, def_kin);
+    query_db_add_body_call(mut_view(sched.db), def_main, def_dot);
+
+    // Wire cross-module const cycle: `mod_a.FIRST <-> mod_b.SECOND`
+    query_db_add_body_const_dep(mut_view(sched.db), def_first, ConstEvalKey { v: def_second.v });
+    query_db_add_body_const_dep(mut_view(sched.db), def_second, ConstEvalKey { v: def_first.v });
+
+    // Wire independent type errors in `mod_a.err_in_a` and `mod_b.err_in_b`
+    query_db_set_def_flags(mut_view(sched.db), def_err_a, false, false, true);
+    query_db_set_def_flags(mut_view(sched.db), def_err_b, false, false, true);
+
+    query_db_reset_session_diags(mut_view(sched.db));
+    let snap = parallel_scheduler_freeze_snapshot(mut_view(*sched), 1u64);
+    snap.is_immutable && snap.arena_sealed
+}
+
+fn simulate_cross_worker_const_cycle(sched: mut_view<ParallelScheduler>, worker_b_completes_first: bool) -> bool {
+    let def_first = scoped_def_id_to_def_id(scoped_def_id_new(4u32, 1u32));
+    let def_second = scoped_def_id_to_def_id(scoped_def_id_new(5u32, 1u32));
+    let qk_first = query_key_for_const_eval(view(sched.db), ConstEvalKey { v: def_first.v });
+    let qk_second = query_key_for_const_eval(view(sched.db), ConstEvalKey { v: def_second.v });
+    let sl_first = query_db_get_or_create_slot(mut_view(sched.db), qk_first);
+    let sl_second = query_db_get_or_create_slot(mut_view(sched.db), qk_second);
+
+    // Worker 0 claims `const_eval(mod_a.FIRST)`; Worker 1 claims `const_eval(mod_b.SECOND)`
+    let c0 = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 0u32, qk_first);
+    wait_for_graph_push_worker_frame(mut_view(sched.wait_graph), 0u32, sl_first, qk_first);
+
+    let c1 = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 1u32, qk_second);
+    wait_for_graph_push_worker_frame(mut_view(sched.wait_graph), 1u32, sl_second, qk_second);
+
+    let mut wait_res: u8 = 0u8;
+    let mut cyc_res: u8 = 0u8;
+    if !worker_b_completes_first {
+        // Worker 0 requests `SECOND` (waits on Worker 1), then Worker 1 requests `FIRST` (cycle!)
+        wait_res = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 0u32, qk_second);
+        cyc_res = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 1u32, qk_first);
+    } else {
+        // Worker 1 requests `FIRST` (waits on Worker 0), then Worker 0 requests `SECOND` (cycle!)
+        wait_res = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 1u32, qk_first);
+        cyc_res = wait_for_graph_claim_or_wait(mut_view(sched.wait_graph), mut_view(sched.db), 0u32, qk_second);
+    }
+
+    wait_for_graph_pop_worker_frame(mut_view(sched.wait_graph), 1u32);
+    wait_for_graph_pop_worker_frame(mut_view(sched.wait_graph), 0u32);
+
+    c0 == CLAIM_ACQUIRED &&
+        c1 == CLAIM_ACQUIRED &&
+        wait_res == CLAIM_WAIT_SINGLE_FLIGHT &&
+        cyc_res == CLAIM_CYCLE_DETECTED &&
+        DIAG_AX_PARALLEL_QUERY_CYCLE == DIAG_AX_QUERY_CYCLE
+}
+
+fn enqueue_workspace_tasks(sched: mut_view<ParallelScheduler>, reverse_order: bool) {
+    let def_dot = scoped_def_id_to_def_id(scoped_def_id_new(1u32, 1u32));
+    let def_kin = scoped_def_id_to_def_id(scoped_def_id_new(2u32, 1u32));
+    let def_main = scoped_def_id_to_def_id(scoped_def_id_new(3u32, 1u32));
+    let def_err_a = scoped_def_id_to_def_id(scoped_def_id_new(4u32, 2u32));
+    let def_err_b = scoped_def_id_to_def_id(scoped_def_id_new(5u32, 2u32));
+
+    let q_mir_dot = query_key_for_def(view(sched.db), QUERY_MIR_BODY, def_dot);
+    let q_mir_kin = query_key_for_def(view(sched.db), QUERY_MIR_BODY, def_kin);
+    let q_mir_main = query_key_for_def(view(sched.db), QUERY_MIR_BODY, def_main);
+    let q_tck_err_a = query_key_for_def(view(sched.db), QUERY_TYPECK_BODY, def_err_a);
+    let q_tck_err_b = query_key_for_def(view(sched.db), QUERY_TYPECK_BODY, def_err_b);
+
+    if !reverse_order {
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_dot, PRIORITY_CRITICAL, 0u32, resource_cost_new(1u16, 4096u64, 100u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_kin, PRIORITY_INTERACTIVE, 0u32, resource_cost_new(1u16, 4096u64, 80u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_main, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 60u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_tck_err_a, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 40u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_tck_err_b, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 20u64));
+    } else {
+        // Assign tasks to worker 0 so workers 1..N steal from worker 0's deque (`total_steals > 0`),
+        // and evaluate `err_in_b` before `err_in_a` to test post-join diagnostic sorting!
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_tck_err_b, PRIORITY_CRITICAL, 0u32, resource_cost_new(1u16, 4096u64, 100u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_tck_err_a, PRIORITY_INTERACTIVE, 0u32, resource_cost_new(1u16, 4096u64, 80u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_main, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 60u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_kin, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 40u64));
+        let _ = parallel_scheduler_submit_query_task(mut_view(*sched), q_mir_dot, PRIORITY_NORMAL, 0u32, resource_cost_new(1u16, 4096u64, 20u64));
+    }
+}
+
+fn format_full_output(sched: view<ParallelScheduler>, out: mut_view<DiagBuffer>) {
+    parallel_scheduler_emit_hir_mir_dump(sched, mut_view(*out));
+    parallel_scheduler_emit_cycles(sched, mut_view(*out));
+    parallel_scheduler_emit_diagnostics(sched, mut_view(*out));
+    parallel_scheduler_emit_equivalence_digest(sched, mut_view(*out));
+}
+
+pub fn main() -> i32 {
+    let mut str_arena = arena_new();
+
+    let mut sched_j1 = parallel_scheduler_empty();
+    let mut sched_j2 = parallel_scheduler_empty();
+    let mut sched_j8 = parallel_scheduler_empty();
+
+    parallel_scheduler_init(mut_view(sched_j1), 500u64, 1u32, SCHEDULE_MODE_DETERMINISTIC_DEBUG);
+    parallel_scheduler_init(mut_view(sched_j2), 500u64, 2u32, SCHEDULE_MODE_BALANCED);
+    parallel_scheduler_init(mut_view(sched_j8), 500u64, 8u32, SCHEDULE_MODE_THROUGHPUT);
+
+    let ws1 = setup_workspace(mut_view(str_arena), mut_view(sched_j1), false);
+    let ws2 = setup_workspace(mut_view(str_arena), mut_view(sched_j2), true);
+    let ws8 = setup_workspace(mut_view(str_arena), mut_view(sched_j8), true);
+    if !ws1 || !ws2 || !ws8 {
+        arena_destroy(mut_view(str_arena));
+        return 1;
+    }
+
+    // Verify immutable snapshot equivalence across --jobs 1, --jobs 2, --jobs 8
+    if !parallel_snapshot_eq(view(sched_j1.snapshot), view(sched_j2.snapshot)) ||
+        !parallel_snapshot_eq(view(sched_j2.snapshot), view(sched_j8.snapshot)) {
+        arena_destroy(mut_view(str_arena));
+        return 2;
+    }
+
+    // Verify cross-worker wait-for cycle detection & canonical rotation across both arrival orders
+    let cyc1 = simulate_cross_worker_const_cycle(mut_view(sched_j1), false);
+    let cyc2 = simulate_cross_worker_const_cycle(mut_view(sched_j2), true);
+    let cyc8 = simulate_cross_worker_const_cycle(mut_view(sched_j8), true);
+    if !cyc1 || !cyc2 || !cyc8 {
+        arena_destroy(mut_view(str_arena));
+        return 3;
+    }
+
+    enqueue_workspace_tasks(mut_view(sched_j1), false);
+    enqueue_workspace_tasks(mut_view(sched_j2), true);
+    enqueue_workspace_tasks(mut_view(sched_j8), true);
+
+    let fp1 = parallel_scheduler_execute_all(mut_view(sched_j1));
+    let fp2 = parallel_scheduler_execute_all(mut_view(sched_j2));
+    let fp8 = parallel_scheduler_execute_all(mut_view(sched_j8));
+
+    if !fingerprint128_eq(fp1, fp2) || !fingerprint128_eq(fp2, fp8) {
+        arena_destroy(mut_view(str_arena));
+        return 4;
+    }
+
+    // Verify work-stealing occurred under --jobs 2 and --jobs 8, and zero steals under --jobs 1
+    if sched_j1.total_steals != 0u32 || sched_j2.total_steals == 0u32 || sched_j8.total_steals == 0u32 {
+        arena_destroy(mut_view(str_arena));
+        return 5;
+    }
+
+    // Verify sharded interner canonical ID equivalence across --jobs 1, --jobs 2, and --jobs 8
+    let dot_sv = probe_sv(mut_view(str_arena), "dot");
+    let kin_sv = probe_sv(mut_view(str_arena), "kinetic_scale");
+    let id1_dot = sharded_interner_lookup(view(sched_j1.interner), INTERN_DOMAIN_STR, dot_sv, 0u32);
+    let id2_dot = sharded_interner_lookup(view(sched_j2.interner), INTERN_DOMAIN_STR, dot_sv, 0u32);
+    let id8_dot = sharded_interner_lookup(view(sched_j8.interner), INTERN_DOMAIN_STR, dot_sv, 0u32);
+    let id1_kin = sharded_interner_lookup(view(sched_j1.interner), INTERN_DOMAIN_STR, kin_sv, 0u32);
+    let id8_kin = sharded_interner_lookup(view(sched_j8.interner), INTERN_DOMAIN_STR, kin_sv, 0u32);
+    if !sharded_intern_id_eq(view(id1_dot), view(id2_dot)) ||
+        !sharded_intern_id_eq(view(id2_dot), view(id8_dot)) ||
+        !sharded_intern_id_eq(view(id1_kin), view(id8_kin)) {
+        arena_destroy(mut_view(str_arena));
+        return 6;
+    }
+
+    // Verify byte-for-byte identical HIR/MIR dump, cycle trace, and post-join diagnostic stream
+    let mut out1 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut out2 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut out8 = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(out1));
+    diag_buf_init(mut_view(out2));
+    diag_buf_init(mut_view(out8));
+
+    format_full_output(view(sched_j1), mut_view(out1));
+    format_full_output(view(sched_j2), mut_view(out2));
+    format_full_output(view(sched_j8), mut_view(out8));
+
+    let same_12 = diag_buf_eq(view(out1), view(out2));
+    let same_28 = diag_buf_eq(view(out2), view(out8));
+    print_diag_buf(view(out1));
+
+    diag_buf_free(mut_view(out1));
+    diag_buf_free(mut_view(out2));
+    diag_buf_free(mut_view(out8));
+    parallel_scheduler_free(mut_view(sched_j1));
+    parallel_scheduler_free(mut_view(sched_j2));
+    parallel_scheduler_free(mut_view(sched_j8));
+    arena_destroy(mut_view(str_arena));
+
+    if !same_12 || !same_28 {
+        return 7;
+    }
+
+    print("PARALLEL-SCHEDULER-PROBE-PASS\n");
+    0
+}

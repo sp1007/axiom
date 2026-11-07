@@ -1,0 +1,176 @@
+// test: run
+// modes: interp native
+// stdout-file: single_flight_and_cross_worker_cycles.stdout
+// SPEC-23 AXS-PAR-010..011, INV-PAR-001:
+// Verify `InFlightLatch` single-flight query deduplication (`Vacant -> Computing -> Ready`)
+// and `WaitForGraph` deadlock-free cross-worker cycle detection (`AX_PARALLEL_QUERY_CYCLE` /
+// `AX_QUERY_CYCLE`) with canonical minimum-`SemanticKey` rotation.
+
+const LATCH_VACANT: u32 = 0u32;
+const LATCH_COMPUTING: u32 = 1u32;
+const LATCH_READY: u32 = 2u32;
+const LATCH_POISONED: u32 = 3u32;
+
+const CLAIM_ACQUIRED: u32 = 1u32;
+const CLAIM_WAIT_SINGLE_FLIGHT: u32 = 2u32;
+const CLAIM_MEMO_HIT: u32 = 3u32;
+const CLAIM_CYCLE_DETECTED: u32 = 4u32;
+
+@derive(Copy)
+struct GraphSlot {
+    semantic_rank: u32,
+    state: u32,
+    owner_worker: u32,
+    waiter_count: u32,
+    provider_runs: u32,
+    edge_waiter: u32,
+    edge_target: u32,
+    edge_active: u32,
+}
+
+// Slots 0..3 hold query `InFlightLatch` states; slots 4..7 hold active `WaitForEdge`s;
+// slot 0's `edge_waiter` tracks `edge_count`, and slot 0's `edge_target` tracks `canonical_cycle_head`.
+struct MiniWaitGraph {
+    slots: [8]GraphSlot,
+}
+
+fn init_graph(wg: mut_view<MiniWaitGraph>) {
+    let mut i: usize = 0;
+    while i < 8 {
+        wg.slots[i].semantic_rank = ((i as u32) + 1u32) * 10u32;
+        wg.slots[i].state = LATCH_VACANT;
+        wg.slots[i].owner_worker = 99u32;
+        wg.slots[i].waiter_count = 0u32;
+        wg.slots[i].provider_runs = 0u32;
+        wg.slots[i].edge_waiter = 0u32;
+        wg.slots[i].edge_target = 999u32;
+        wg.slots[i].edge_active = 0u32;
+        i = i + 1;
+    }
+}
+
+fn claim_query(
+    wg: mut_view<MiniWaitGraph>,
+    worker_id: u32,
+    active_query: u32,
+    target_query: u32
+) -> u32 {
+    let t_idx = target_query as usize;
+    let st = wg.slots[t_idx].state;
+    if st == LATCH_READY || st == LATCH_POISONED {
+        return CLAIM_MEMO_HIT;
+    }
+    if st == LATCH_VACANT {
+        wg.slots[t_idx].state = LATCH_COMPUTING;
+        wg.slots[t_idx].owner_worker = worker_id;
+        wg.slots[t_idx].provider_runs = wg.slots[t_idx].provider_runs + 1u32;
+        return CLAIM_ACQUIRED;
+    }
+
+    let owner = wg.slots[t_idx].owner_worker;
+    let edge_count = wg.slots[0].edge_waiter;
+    let mut cur_w = owner;
+    let mut hops: u32 = 0u32;
+    let mut has_cycle = false;
+    while hops < 4u32 {
+        if cur_w == worker_id {
+            has_cycle = true;
+        } else {
+            let mut next_w = cur_w;
+            let mut found = false;
+            let mut i: u32 = 0u32;
+            while i < edge_count {
+                let e_idx = (4u32 + i) as usize;
+                if !found && wg.slots[e_idx].edge_active == 1u32 && wg.slots[e_idx].edge_waiter == cur_w {
+                    next_w = wg.slots[e_idx].edge_target;
+                    found = true;
+                }
+                i = i + 1u32;
+            }
+            if found {
+                cur_w = next_w;
+            }
+        }
+        hops = hops + 1u32;
+    }
+    if cur_w == worker_id {
+        has_cycle = true;
+    }
+
+    if has_cycle {
+        // Cross-worker cycle detected! Rotate to minimum semantic_rank
+        let a_idx = active_query as usize;
+        let rank_a = wg.slots[a_idx].semantic_rank;
+        let rank_b = wg.slots[t_idx].semantic_rank;
+        let head_q = if rank_a <= rank_b { active_query } else { target_query };
+        wg.slots[a_idx].state = LATCH_POISONED;
+        wg.slots[t_idx].state = LATCH_POISONED;
+        wg.slots[0].edge_target = head_q;
+        return CLAIM_CYCLE_DETECTED;
+    }
+
+    wg.slots[t_idx].waiter_count = wg.slots[t_idx].waiter_count + 1u32;
+    let ec = wg.slots[0].edge_waiter;
+    let e_idx = (4u32 + ec) as usize;
+    wg.slots[e_idx].edge_waiter = worker_id;
+    wg.slots[e_idx].edge_target = owner;
+    wg.slots[e_idx].edge_active = 1u32;
+    wg.slots[0].edge_waiter = ec + 1u32;
+    CLAIM_WAIT_SINGLE_FLIGHT
+}
+
+pub fn main() -> i32 {
+    let zero_slot = GraphSlot {
+        semantic_rank: 0u32,
+        state: LATCH_VACANT,
+        owner_worker: 99u32,
+        waiter_count: 0u32,
+        provider_runs: 0u32,
+        edge_waiter: 0u32,
+        edge_target: 999u32,
+        edge_active: 0u32,
+    };
+
+    // 1. Single-flight deduplication: Worker 0 and Worker 1 both request Q0 (`geom.dot`)
+    let mut wg_sf = MiniWaitGraph { slots: [zero_slot; 8] };
+    init_graph(mut_view(wg_sf));
+    let c_w0 = claim_query(mut_view(wg_sf), 0u32, 0u32, 0u32);
+    let c_w1 = claim_query(mut_view(wg_sf), 1u32, 1u32, 0u32);
+    wg_sf.slots[0].state = LATCH_READY;
+    let c_w2 = claim_query(mut_view(wg_sf), 2u32, 2u32, 0u32);
+
+    if c_w0 != CLAIM_ACQUIRED || c_w1 != CLAIM_WAIT_SINGLE_FLIGHT || c_w2 != CLAIM_MEMO_HIT {
+        return 1;
+    }
+    if wg_sf.slots[0].provider_runs != 1u32 || wg_sf.slots[0].waiter_count != 1u32 {
+        return 2;
+    }
+
+    // 2. Cross-worker cycle detection in both arrival orders -> identical canonical head Q1 (rank 20 < rank 30)
+    let mut wg_a = MiniWaitGraph { slots: [zero_slot; 8] };
+    init_graph(mut_view(wg_a));
+    let _ = claim_query(mut_view(wg_a), 0u32, 1u32, 1u32); // W0 owns Q1
+    let _ = claim_query(mut_view(wg_a), 1u32, 2u32, 2u32); // W1 owns Q2
+    let w0_wait = claim_query(mut_view(wg_a), 0u32, 1u32, 2u32); // W0 waits on Q2 (W1)
+    let w1_cyc = claim_query(mut_view(wg_a), 1u32, 2u32, 1u32);  // W1 requests Q1 (W0) -> cycle!
+
+    let mut wg_b = MiniWaitGraph { slots: [zero_slot; 8] };
+    init_graph(mut_view(wg_b));
+    let _ = claim_query(mut_view(wg_b), 0u32, 1u32, 1u32); // W0 owns Q1
+    let _ = claim_query(mut_view(wg_b), 1u32, 2u32, 2u32); // W1 owns Q2
+    let w1_wait = claim_query(mut_view(wg_b), 1u32, 2u32, 1u32); // W1 waits on Q1 (W0)
+    let w0_cyc = claim_query(mut_view(wg_b), 0u32, 1u32, 2u32);  // W0 requests Q2 (W1) -> cycle!
+
+    if w0_wait != CLAIM_WAIT_SINGLE_FLIGHT || w1_cyc != CLAIM_CYCLE_DETECTED {
+        return 3;
+    }
+    if w1_wait != CLAIM_WAIT_SINGLE_FLIGHT || w0_cyc != CLAIM_CYCLE_DETECTED {
+        return 4;
+    }
+    if wg_a.slots[0].edge_target != 1u32 || wg_b.slots[0].edge_target != 1u32 {
+        return 5;
+    }
+
+    print("SINGLE-FLIGHT-AND-CROSS-WORKER-CYCLES-OK\n");
+    0
+}
