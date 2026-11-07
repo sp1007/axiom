@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T754]
 priority: 705
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p18/e18_1_query_engine]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, tasks/0384, tasks/0530, tasks/0533, tasks/0781, tasks/0791]
 covers: [REQ-LNK-1384, REQ-LNK-1385, REQ-LNK-1386, REQ-LNK-1387, REQ-LNK-1388, REQ-LNK-1389, REQ-LNK-1390, REQ-LNK-1391, REQ-LNK-1392, REQ-LNK-1393, REQ-LNK-1394, REQ-LNK-1395, REQ-LNK-1396, REQ-LNK-1397, REQ-LNK-1398, REQ-LNK-1399, REQ-LNK-1400, REQ-LNK-1401, REQ-LNK-1402, REQ-LNK-1403, REQ-LNK-1404, REQ-LNK-1405, REQ-LNK-1406, REQ-LNK-1407, REQ-LNK-1408, REQ-LNK-1409, REQ-LNK-1410, REQ-LNK-1411, REQ-LNK-1412, REQ-LNK-1413, REQ-LNK-1414, REQ-LNK-1415, REQ-LNK-1416, REQ-LNK-1417, REQ-LNK-1418, REQ-LNK-1419, REQ-LNK-1420, REQ-LNK-1421, REQ-LNK-1422, REQ-LNK-1423, REQ-LNK-1424, REQ-LNK-1425, REQ-LNK-1426, REQ-LNK-1427, REQ-LNK-1428, REQ-LNK-1429, REQ-LNK-1430, REQ-LNK-1431, REQ-LNK-1432, REQ-LNK-1433]
+started: 2026-11-07 19:12:32
+agent: T755-impl
 ---
 # T755 — E18.1 — Query engine, cycle recovery & semantic database conformance suite
 
@@ -41,3 +43,4 @@ Certify E18.1 exit criteria with an end-to-end conformance suite covering demand
 
 ## Log
 - 2026-11-03 02:56:00 created by T218 (P18 phase planning)
+- 2026-11-07 19:12:32 started (attempt 1) T755-impl
