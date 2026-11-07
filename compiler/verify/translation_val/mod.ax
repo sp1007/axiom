@@ -1,0 +1,1609 @@
+// Axiom Compiler — Bounded Translation Validation & Witness Checker (compiler/verify/translation_val/mod.ax)
+// Implements SPEC-25 (AXS-PCT-020..024, AXS-PCT-050..053, INV-PCT-002):
+//   - Five-tier Observable Semantic Equivalence hierarchy (Level 0 Structural, Level 1 Value,
+//     Level 2 Memory & Resource, Level 3 Effect & Trap, Level 4 Observable Semantic Equivalence)
+//     and per-function TranslationWitness records (AXS-PCT-020).
+//   - Middle-end translation validation across MIR <-> OptIR scalar & algebraic rewrites
+//     (exact bit-width, signed/unsigned polarity, IEEE-754 NaN/-0.0 rules, and checked-arithmetic
+//     trap preservation NoOverflow/NonZero/ShiftInRange/InBounds), CFG canonicalization &
+//     unreachable block removal (ReachableEdge, phi/MemoryPhi/dominance completeness), and
+//     memory/loop transformations (DeadStore, MustAlias/NoAlias, SROA, LICM, BCE, preserving
+//     volatile, atomic, Drop, and capability barriers) (AXS-PCT-021).
+//   - Target legalization & register allocation witness validation (zero remaining vregs,
+//     physical register unit RAX/EAX/AX/AL and XMMi/YMMi overlap checking with move-coalescing
+//     provenance, dominating spill stores to dedicated stack slots without aliasing user/volatile
+//     memory, fixed-register ISA constraints RCX/RAX:RDX, and caller/callee-save contracts) (AXS-PCT-022).
+//   - Instruction scheduling dependency & barrier witness validation (topological preservation of
+//     RAW/WAR/WAW dependencies on GPR/XMM/vector/stack/EFLAGS and strict ordering barriers for
+//     aliasing memory, volatile/MMIO, atomic, fences, call, and trapping Assert/idiv/div) (AXS-PCT-023).
+//   - Machine code finalization gate (allocated -> scheduled -> framed -> unwindable ->
+//     security-valid -> encodable, 16-byte Win64 call-site RSP alignment, __chkstk on frames
+//     >= 4096 bytes, Secret<T> zeroization barriers, and canonical .pdata/.xdata unwind match) (AXS-PCT-024).
+//   - --validate-translations diagnostic reporting (AX_ICE_MIR_VERIFY / AX_ICE_INTERNAL with
+//     data.stage = "translation_val") and deterministic inspect --emit=pass-witness output (AXS-PCT-050).
+module compiler.verify.translation_val
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.hash.AxHasher
+use compiler.kernel.hash.ax_hasher_new
+use compiler.kernel.hash.ax_hasher_write_u32
+use compiler.kernel.hash.ax_hasher_write_u64
+use compiler.kernel.hash.ax_hasher_finish
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.diag.code.DiagCode
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.AX_ICE_INTERNAL
+use compiler.diag.code.AX_ICE_MIR_VERIFY
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagLabel
+use compiler.diag.emitter.DiagFix
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_stmt_at
+use compiler.mir.mir.mir_mul_usize
+use compiler.verify.pass_contracts.IR_LEVEL_MIR
+use compiler.verify.pass_contracts.IR_LEVEL_OPT_IR
+use compiler.verify.pass_contracts.IR_LEVEL_LIR
+use compiler.verify.pass_contracts.IR_LEVEL_MACH_IR
+use compiler.verify.pass_contracts.SEM_PROP_MANDATORY_INTRA_LEVEL
+use compiler.verify.pass_contracts.SEM_PROP_ABI_LAYOUT_CONFORMANT
+use compiler.verify.pass_contracts.CERTAINTY_PROVEN
+use compiler.verify.pass_contracts.PROP_NO_ALIAS
+use compiler.verify.pass_contracts.PROP_MUST_ALIAS
+use compiler.verify.pass_contracts.PROP_NON_ZERO
+use compiler.verify.pass_contracts.PROP_IN_BOUNDS
+use compiler.verify.pass_contracts.PROP_NO_SIGNED_OVERFLOW
+use compiler.verify.pass_contracts.PROP_NO_UNSIGNED_OVERFLOW
+use compiler.verify.pass_contracts.PROP_SHIFT_IN_RANGE
+use compiler.verify.pass_contracts.PROP_NO_ESCAPE
+use compiler.verify.pass_contracts.PROP_LOOP_INVARIANT
+use compiler.verify.pass_contracts.PROP_DEAD_STORE
+use compiler.verify.pass_contracts.PCT_PROOF_ID_INVALID
+use compiler.verify.pass_contracts.Fingerprint128
+use compiler.verify.pass_contracts.ProofCertificate
+use compiler.verify.pass_contracts.ProofStore
+use compiler.verify.pass_contracts.PassContractEngine
+use compiler.verify.pass_contracts.proof_store_is_cert_usable
+use compiler.verify.pass_contracts.pct_verify_mir_body_invariants
+use compiler.verify.pass_contracts.pct_count_mir_observable_effects
+use compiler.verify.pass_contracts.pct_format_witness_summary
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+fn tval_hasher_write_u8(h: mut_view<AxHasher>, v: u8) {
+    ax_hasher_write_u32(h, v as u32);
+}
+
+// =================================================================================================
+// 1. Five-Tier Observable Semantic Equivalence Hierarchy & TranslationWitness (AXS-PCT-020)
+// =================================================================================================
+
+@derive(Copy)
+pub enum EquivalenceLevel {
+    Level0Structural,
+    Level1Value,
+    Level2MemoryResource,
+    Level3EffectTrap,
+    Level4ObservableSemantic,
+}
+
+pub const EQ_LEVEL_0_STRUCTURAL: u8 = 0u8;
+pub const EQ_LEVEL_1_VALUE: u8 = 1u8;
+pub const EQ_LEVEL_2_MEMORY_RESOURCE: u8 = 2u8;
+pub const EQ_LEVEL_3_EFFECT_TRAP: u8 = 3u8;
+pub const EQ_LEVEL_4_OBSERVABLE_SEMANTIC: u8 = 4u8;
+pub const EQ_LEVEL_FAILED: u8 = 255u8;
+
+pub fn eq_level_to_u8(lvl: EquivalenceLevel) -> u8 {
+    match lvl {
+        EquivalenceLevel.Level0Structural => EQ_LEVEL_0_STRUCTURAL,
+        EquivalenceLevel.Level1Value => EQ_LEVEL_1_VALUE,
+        EquivalenceLevel.Level2MemoryResource => EQ_LEVEL_2_MEMORY_RESOURCE,
+        EquivalenceLevel.Level3EffectTrap => EQ_LEVEL_3_EFFECT_TRAP,
+        EquivalenceLevel.Level4ObservableSemantic => EQ_LEVEL_4_OBSERVABLE_SEMANTIC,
+    }
+}
+
+pub fn eq_level_from_u8(v: u8) -> EquivalenceLevel {
+    if v == EQ_LEVEL_0_STRUCTURAL {
+        return EquivalenceLevel.Level0Structural;
+    }
+    if v == EQ_LEVEL_1_VALUE {
+        return EquivalenceLevel.Level1Value;
+    }
+    if v == EQ_LEVEL_2_MEMORY_RESOURCE {
+        return EquivalenceLevel.Level2MemoryResource;
+    }
+    if v == EQ_LEVEL_3_EFFECT_TRAP {
+        return EquivalenceLevel.Level3EffectTrap;
+    }
+    EquivalenceLevel.Level4ObservableSemantic
+}
+
+// Evaluate the five-tier semantic equivalence hierarchy (AXS-PCT-020):
+//   Level 0 (Structural): Isomorphic IR graph structure (debug/canonicalization check).
+//   Level 1 (Value): Identical return values and SSA expression outcomes for all valid inputs.
+//   Level 2 (Memory & Resource): Identical observable memory stores, ownership, init, and Drop order.
+//   Level 3 (Effect & Trap): Identical ordered sequence of I/O, checked traps, volatile, atomic, FFI.
+//   Level 4 (Observable Semantic Equivalence): Conjunction of Levels 1-3 (mandatory across all passes).
+pub fn tval_evaluate_equivalence_tier(
+    level0_structural_iso: bool,
+    level1_value_eq: bool,
+    level2_memory_drop_eq: bool,
+    level3_effect_trap_eq: bool,
+    require_structural_iso: bool
+) -> u8 {
+    if require_structural_iso && !level0_structural_iso {
+        return EQ_LEVEL_FAILED;
+    }
+    if level1_value_eq && level2_memory_drop_eq && level3_effect_trap_eq {
+        return EQ_LEVEL_4_OBSERVABLE_SEMANTIC;
+    }
+    if !level1_value_eq {
+        if level0_structural_iso {
+            return EQ_LEVEL_0_STRUCTURAL;
+        }
+        return EQ_LEVEL_FAILED;
+    }
+    if !level2_memory_drop_eq {
+        return EQ_LEVEL_1_VALUE;
+    }
+    // Level 1 and Level 2 hold, but Level 3 (Effect & Trap) failed
+    EQ_LEVEL_2_MEMORY_RESOURCE
+}
+
+pub fn tval_meets_mandatory_criterion(verified_level: u8) -> bool {
+    verified_level == EQ_LEVEL_4_OBSERVABLE_SEMANTIC
+}
+
+// Canonical Translation Validation failure codes across MIR, OptIR, LIR, RegAlloc, Scheduling, Finalize
+pub const TVAL_FAIL_NONE: u8 = 0u8;
+pub const TVAL_FAIL_DROPPED_OVERFLOW_TRAP: u8 = 1u8;
+pub const TVAL_FAIL_DROPPED_DIV_ZERO_TRAP: u8 = 2u8;
+pub const TVAL_FAIL_DROPPED_SHIFT_TRAP: u8 = 3u8;
+pub const TVAL_FAIL_DROPPED_BOUNDS_TRAP: u8 = 4u8;
+pub const TVAL_FAIL_BITWIDTH_OR_SIGN_MISMATCH: u8 = 5u8;
+pub const TVAL_FAIL_IEEE754_NAN_OR_SIGNED_ZERO: u8 = 6u8;
+pub const TVAL_FAIL_SCALAR_VALUE_MISMATCH: u8 = 7u8;
+pub const TVAL_FAIL_UNPROVEN_UNREACHABLE_EDGE: u8 = 8u8;
+pub const TVAL_FAIL_INCOMPLETE_PHI_OR_DOM: u8 = 9u8;
+pub const TVAL_FAIL_VOLATILE_OR_ATOMIC_ELIMINATED: u8 = 10u8;
+pub const TVAL_FAIL_DROP_OR_CAP_BARRIER_VIOLATED: u8 = 11u8;
+pub const TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF: u8 = 12u8;
+pub const TVAL_FAIL_LEGALIZATION_MISMATCH: u8 = 13u8;
+pub const TVAL_FAIL_UNRESOLVED_VREG: u8 = 14u8;
+pub const TVAL_FAIL_CLOBBERED_LIVE_REGISTER: u8 = 15u8;
+pub const TVAL_FAIL_INVALID_SPILL_RELOAD: u8 = 16u8;
+pub const TVAL_FAIL_ISA_FIXED_REG_OR_ABI_CLOBBER: u8 = 17u8;
+pub const TVAL_FAIL_SCHEDULE_DATA_HAZARD: u8 = 18u8;
+pub const TVAL_FAIL_EFLAGS_HAZARD: u8 = 19u8;
+pub const TVAL_FAIL_VOLATILE_BARRIER_REORDERED: u8 = 20u8;
+pub const TVAL_FAIL_ATOMIC_BARRIER_REORDERED: u8 = 21u8;
+pub const TVAL_FAIL_TRAP_OR_CALL_BARRIER_REORDERED: u8 = 22u8;
+pub const TVAL_FAIL_ALIASING_MEMORY_REORDERED: u8 = 23u8;
+pub const TVAL_FAIL_FINALIZE_PIPELINE_STAGE: u8 = 24u8;
+pub const TVAL_FAIL_STACK_ALIGNMENT: u8 = 25u8;
+pub const TVAL_FAIL_MISSING_CHKSTK_PROBE: u8 = 26u8;
+pub const TVAL_FAIL_SECRET_ZEROIZE_DROPPED: u8 = 27u8;
+pub const TVAL_FAIL_UNWIND_METADATA_MISMATCH: u8 = 28u8;
+
+@derive(Copy)
+pub struct TranslationWitness {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub input_ir: u8,
+    pub output_ir: u8,
+    pub pre_fingerprint: Fingerprint128,
+    pub post_fingerprint: Fingerprint128,
+    pub consumed_proofs: u32,
+    pub preserved_props: u32,
+    pub verified_level: u8,
+    pub equivalence_verified: bool,
+    pub failure_kind: u8,
+    pub failure_subject: u32,
+}
+
+pub const TVAL_MAX_WITNESSES: usize = 64;
+
+pub struct TranslationValEngine {
+    pub validate_translations: bool,
+    pub witnesses: *mut TranslationWitness,
+    pub witness_count: usize,
+    pub witness_cap: usize,
+    pub verified_count: u32,
+    pub failed_count: u32,
+    pub last_failure_kind: u8,
+    pub last_failure_pass_id: u16,
+    pub last_failure_subject: u32,
+}
+
+unsafe fn tval_witness_at(base: *mut TranslationWitness, idx: usize) -> *mut TranslationWitness {
+    let off = ((idx as isize) * (size_of<TranslationWitness>() as isize)) as usize;
+    ((base as usize) + off) as *mut TranslationWitness
+}
+
+unsafe fn tval_cert_at_const(base: *mut ProofCertificate, idx: usize) -> *const ProofCertificate {
+    let off = ((idx as isize) * (size_of<ProofCertificate>() as isize)) as usize;
+    ((base as usize) + off) as *const ProofCertificate
+}
+
+pub fn tval_engine_init(
+    eng: mut_view<TranslationValEngine>,
+    arena: mut_view<Arena>,
+    validate_translations: bool
+) {
+    let mem = arena_alloc_raw(
+        mut_view(*arena),
+        mir_mul_usize(TVAL_MAX_WITNESSES, size_of<TranslationWitness>()),
+        align_of<TranslationWitness>()
+    ) as *mut TranslationWitness;
+    eng.validate_translations = validate_translations;
+    eng.witnesses = mem;
+    eng.witness_count = 0;
+    eng.witness_cap = TVAL_MAX_WITNESSES;
+    eng.verified_count = 0u32;
+    eng.failed_count = 0u32;
+    eng.last_failure_kind = TVAL_FAIL_NONE;
+    eng.last_failure_pass_id = 0u16;
+    eng.last_failure_subject = 0u32;
+}
+
+pub fn tval_compute_stage_fingerprint(
+    stage_tag: u32,
+    fn_id: u32,
+    item_count: u32,
+    state_lo: u64,
+    state_hi: u64
+) -> Fingerprint128 {
+    let mut h1 = ax_hasher_new();
+    ax_hasher_write_u32(mut_view(h1), stage_tag);
+    ax_hasher_write_u32(mut_view(h1), fn_id);
+    ax_hasher_write_u32(mut_view(h1), item_count);
+    ax_hasher_write_u64(mut_view(h1), state_lo);
+    ax_hasher_write_u64(mut_view(h1), state_hi);
+    let lo = ax_hasher_finish(view(h1));
+
+    let mut h2 = ax_hasher_new();
+    ax_hasher_write_u64(mut_view(h2), 0x7700_BEEF_CAFE_2525u64);
+    ax_hasher_write_u64(mut_view(h2), state_hi ^ (stage_tag as u64));
+    ax_hasher_write_u64(mut_view(h2), state_lo ^ (fn_id as u64));
+    ax_hasher_write_u32(mut_view(h2), item_count);
+    let hi = ax_hash_combine(lo, ax_hasher_finish(view(h2)));
+
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+pub fn tval_compute_mir_fingerprint(body: view<MirBody>, ir_revision: u32) -> Fingerprint128 {
+    let mut h1 = ax_hasher_new();
+    ax_hasher_write_u32(mut_view(h1), ir_revision);
+    ax_hasher_write_u32(mut_view(h1), body.local_count as u32);
+    ax_hasher_write_u32(mut_view(h1), body.bb_count as u32);
+
+    let mut h2 = ax_hasher_new();
+    ax_hasher_write_u64(mut_view(h2), 0x1805_7700_AAAA_5555u64);
+
+    let mut b: usize = 0;
+    while b < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, b) };
+        let sc = unsafe { (*bb).stmt_count };
+        ax_hasher_write_u32(mut_view(h1), sc as u32);
+        let stmts = unsafe { (*bb).stmts };
+        let mut s: usize = 0;
+        while s < sc {
+            let st = unsafe { mir_stmt_at(stmts, s) };
+            tval_hasher_write_u8(mut_view(h1), unsafe { (*st).kind });
+            ax_hasher_write_u32(mut_view(h1), unsafe { (*st).place.local.v });
+            tval_hasher_write_u8(mut_view(h1), unsafe { (*st).rvalue.kind });
+            ax_hasher_write_u32(mut_view(h2), (unsafe { (*st).place.local.v }) ^ (s as u32));
+            s = s + 1;
+        }
+        if unsafe { (*bb).has_terminator } {
+            let tk = unsafe { (*bb).terminator.kind };
+            tval_hasher_write_u8(mut_view(h1), tk);
+            if tk == MIR_TERM_GOTO {
+                ax_hasher_write_u32(mut_view(h2), unsafe { (*bb).terminator.goto_target.v });
+            } else if tk == MIR_TERM_SWITCH_INT {
+                ax_hasher_write_u32(mut_view(h2), unsafe { (*bb).terminator.otherwise.v });
+            } else if tk == MIR_TERM_CALL {
+                ax_hasher_write_u32(mut_view(h2), unsafe { (*bb).terminator.call_target.v });
+            } else if tk == MIR_TERM_DROP {
+                ax_hasher_write_u32(mut_view(h2), unsafe { (*bb).terminator.drop_target.v });
+            } else if tk == MIR_TERM_ASSERT {
+                ax_hasher_write_u32(mut_view(h2), unsafe { (*bb).terminator.assert_target.v });
+            }
+        }
+        b = b + 1;
+    }
+    let lo = ax_hasher_finish(view(h1));
+    let hi = ax_hash_combine(lo, ax_hasher_finish(view(h2)));
+    Fingerprint128 { lo: lo, hi: hi }
+}
+
+// Check if `cert_id` in `store` is usable (`Certainty.Proven`, valid at current IR revision)
+// AND matches `expected_prop_kind`.
+pub fn tval_check_proof_cert_kind(
+    store: view<ProofStore>,
+    cert_id: u32,
+    expected_prop_kind: u8
+) -> bool {
+    if !proof_store_is_cert_usable(store, cert_id) {
+        return false;
+    }
+    let cp = unsafe { tval_cert_at_const(store.certs, cert_id as usize) };
+    (unsafe { (*cp).kind }) == expected_prop_kind
+}
+
+// =================================================================================================
+// 2. Diagnostic Reporting & Witness Recording (AXS-PCT-020, AXS-PCT-050..052)
+// =================================================================================================
+
+const TVAL_STR_TABLE: [240]u8 = [
+    // 0..15: "translation_val" (15)
+    116u8, 114u8, 97u8, 110u8, 115u8, 108u8, 97u8, 116u8, 105u8, 111u8, 110u8, 95u8, 118u8, 97u8, 108u8,
+    // 15..20: "stage" (5)
+    115u8, 116u8, 97u8, 103u8, 101u8,
+    // 20..27: "pass_id" (7)
+    112u8, 97u8, 115u8, 115u8, 95u8, 105u8, 100u8,
+    // 27..33: "detail" (6)
+    100u8, 101u8, 116u8, 97u8, 105u8, 108u8,
+    // 33..54: "dropped_overflow_trap" (21)
+    100u8, 114u8, 111u8, 112u8, 112u8, 101u8, 100u8, 95u8, 111u8, 118u8, 101u8, 114u8, 102u8, 108u8,
+    111u8, 119u8, 95u8, 116u8, 114u8, 97u8, 112u8,
+    // 54..77: "clobbered_live_register" (23)
+    99u8, 108u8, 111u8, 98u8, 98u8, 101u8, 114u8, 101u8, 100u8, 95u8, 108u8, 105u8, 118u8, 101u8,
+    95u8, 114u8, 101u8, 103u8, 105u8, 115u8, 116u8, 101u8, 114u8,
+    // 77..103: "volatile_barrier_reordered" (26)
+    118u8, 111u8, 108u8, 97u8, 116u8, 105u8, 108u8, 101u8, 95u8, 98u8, 97u8, 114u8, 114u8, 105u8,
+    101u8, 114u8, 95u8, 114u8, 101u8, 111u8, 114u8, 100u8, 101u8, 114u8, 101u8, 100u8,
+    // 103..135: "scalar_or_cfg_equivalence_failed" (32)
+    115u8, 99u8, 97u8, 108u8, 97u8, 114u8, 95u8, 111u8, 114u8, 95u8, 99u8, 102u8, 103u8, 95u8,
+    101u8, 113u8, 117u8, 105u8, 118u8, 97u8, 108u8, 101u8, 110u8, 99u8, 101u8, 95u8, 102u8, 97u8,
+    105u8, 108u8, 101u8, 100u8,
+    // 135..164: "memory_or_loop_witness_failed" (29)
+    109u8, 101u8, 109u8, 111u8, 114u8, 121u8, 95u8, 111u8, 114u8, 95u8, 108u8, 111u8, 111u8, 112u8,
+    95u8, 119u8, 105u8, 116u8, 110u8, 101u8, 115u8, 115u8, 95u8, 102u8, 97u8, 105u8, 108u8, 101u8, 100u8,
+    // 164..197: "backend_witness_validation_failed" (33)
+    98u8, 97u8, 99u8, 107u8, 101u8, 110u8, 100u8, 95u8, 119u8, 105u8, 116u8, 110u8, 101u8, 115u8,
+    115u8, 95u8, 118u8, 97u8, 108u8, 105u8, 100u8, 97u8, 116u8, 105u8, 111u8, 110u8, 95u8, 102u8,
+    97u8, 105u8, 108u8, 101u8, 100u8,
+    // 197..240: "translation validation failed (AXS-PCT-020)" (43)
+    116u8, 114u8, 97u8, 110u8, 115u8, 108u8, 97u8, 116u8, 105u8, 111u8, 110u8, 32u8, 118u8, 97u8,
+    108u8, 105u8, 100u8, 97u8, 116u8, 105u8, 111u8, 110u8, 32u8, 102u8, 97u8, 105u8, 108u8, 101u8,
+    100u8, 32u8, 40u8, 65u8, 88u8, 83u8, 45u8, 80u8, 67u8, 84u8, 45u8, 48u8, 50u8, 48u8, 41u8,
+];
+
+fn tval_slice_in_arena(arena: mut_view<Arena>, start: usize, count: usize) -> StrView {
+    let dst = arena_alloc_raw(mut_view(*arena), count + 1, 1);
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(dst + i) = TVAL_STR_TABLE[start + i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + count) = 0u8; }
+    StrView { ptr: dst as *const u8, len: count }
+}
+
+fn tval_failure_detail_str(arena: mut_view<Arena>, failure_kind: u8) -> StrView {
+    if failure_kind == TVAL_FAIL_DROPPED_OVERFLOW_TRAP ||
+       failure_kind == TVAL_FAIL_DROPPED_DIV_ZERO_TRAP ||
+       failure_kind == TVAL_FAIL_DROPPED_SHIFT_TRAP ||
+       failure_kind == TVAL_FAIL_DROPPED_BOUNDS_TRAP {
+        return tval_slice_in_arena(arena, 33, 21);
+    }
+    if failure_kind == TVAL_FAIL_CLOBBERED_LIVE_REGISTER {
+        return tval_slice_in_arena(arena, 54, 23);
+    }
+    if failure_kind == TVAL_FAIL_VOLATILE_BARRIER_REORDERED {
+        return tval_slice_in_arena(arena, 77, 26);
+    }
+    if failure_kind <= TVAL_FAIL_INCOMPLETE_PHI_OR_DOM {
+        return tval_slice_in_arena(arena, 103, 32);
+    }
+    if failure_kind <= TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF {
+        return tval_slice_in_arena(arena, 135, 29);
+    }
+    tval_slice_in_arena(arena, 164, 33)
+}
+
+unsafe fn tval_data_entry_at(base: *mut DiagDataEntry, idx: usize) -> *mut DiagDataEntry {
+    let off = ((idx as isize) * (size_of<DiagDataEntry>() as isize)) as usize;
+    ((base as usize) + off) as *mut DiagDataEntry
+}
+
+// Emit structured internal compiler diagnostic (`AX_ICE_MIR_VERIFY` for middle-end MIR/OptIR
+// failures or `AX_ICE_INTERNAL` for backend LIR/RegAlloc/Schedule/Finalize failures) with
+// `data.stage = "translation_val"`, `data.pass_id`, and `data.detail` (AXS-PCT-050, AXS-PCT-052).
+pub fn tval_emit_validation_trap_diagnostic(
+    sink: mut_view<DiagSink>,
+    pass_id: u16,
+    failure_kind: u8
+) {
+    let is_mir_verify = failure_kind <= TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+    let code_v: u32 = if is_mir_verify { AX_ICE_MIR_VERIFY } else { AX_ICE_INTERNAL };
+    let msg_sv = tval_slice_in_arena(mut_view(sink.arena), 197, 43);
+    let key_stage = tval_slice_in_arena(mut_view(sink.arena), 15, 5);
+    let val_stage = tval_slice_in_arena(mut_view(sink.arena), 0, 15);
+    let key_pass = tval_slice_in_arena(mut_view(sink.arena), 20, 7);
+    let key_detail = tval_slice_in_arena(mut_view(sink.arena), 27, 6);
+    let val_detail = tval_failure_detail_str(mut_view(sink.arena), failure_kind);
+
+    let entries = arena_alloc_raw(
+        mut_view(sink.arena),
+        mir_mul_usize(3, size_of<DiagDataEntry>()),
+        align_of<DiagDataEntry>()
+    ) as *mut DiagDataEntry;
+
+    unsafe {
+        *tval_data_entry_at(entries, 0) = DiagDataEntry {
+            key: key_stage,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: val_stage,
+                int_val: 0i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *tval_data_entry_at(entries, 1) = DiagDataEntry {
+            key: key_pass,
+            value: DiagDataValue {
+                kind: DiagDataKind.Integer,
+                str_val: StrView { ptr: 0 as *const u8, len: 0 },
+                int_val: pass_id as i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+        *tval_data_entry_at(entries, 2) = DiagDataEntry {
+            key: key_detail,
+            value: DiagDataValue {
+                kind: DiagDataKind.String,
+                str_val: val_detail,
+                int_val: 0i64,
+                bool_val: false,
+                list_items: 0 as *mut StrView,
+                list_count: 0,
+            },
+        };
+    }
+
+    let d = Diagnostic {
+        code: DiagCode { v: code_v },
+        severity: DiagSeverity.Error,
+        message: msg_sv,
+        primary: Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 },
+        labels: 0 as *mut DiagLabel,
+        label_count: 0,
+        notes: 0 as *mut StrView,
+        note_count: 0,
+        helps: 0 as *mut StrView,
+        help_count: 0,
+        fixes: 0 as *mut DiagFix,
+        fix_count: 0,
+        data: entries,
+        data_count: 3,
+    };
+    diag_sink_report(mut_view(*sink), view(d));
+}
+
+pub fn tval_record_witness(
+    eng: mut_view<TranslationValEngine>,
+    w: view<TranslationWitness>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if (eng.witness_count) < (eng.witness_cap) && (eng.witnesses as usize) != 0 {
+        let dst = unsafe { tval_witness_at(eng.witnesses, eng.witness_count) };
+        eng.witness_count = eng.witness_count + 1;
+        unsafe {
+            (*dst).pass_id = w.pass_id;
+            (*dst).fn_id = w.fn_id;
+            (*dst).input_ir = w.input_ir;
+            (*dst).output_ir = w.output_ir;
+            (*dst).pre_fingerprint = Fingerprint128 { lo: w.pre_fingerprint.lo, hi: w.pre_fingerprint.hi };
+            (*dst).post_fingerprint = Fingerprint128 { lo: w.post_fingerprint.lo, hi: w.post_fingerprint.hi };
+            (*dst).consumed_proofs = w.consumed_proofs;
+            (*dst).preserved_props = w.preserved_props;
+            (*dst).verified_level = w.verified_level;
+            (*dst).equivalence_verified = w.equivalence_verified;
+            (*dst).failure_kind = w.failure_kind;
+            (*dst).failure_subject = w.failure_subject;
+        }
+    }
+    if w.equivalence_verified {
+        eng.verified_count = eng.verified_count + 1u32;
+        return true;
+    }
+    eng.failed_count = eng.failed_count + 1u32;
+    eng.last_failure_kind = w.failure_kind;
+    eng.last_failure_pass_id = w.pass_id;
+    eng.last_failure_subject = w.failure_subject;
+    if eng.validate_translations {
+        tval_emit_validation_trap_diagnostic(mut_view(*sink), w.pass_id, w.failure_kind);
+    }
+    false
+}
+
+// =================================================================================================
+// 3. Middle-End Translation Validation: Scalar, CFG & Memory/Loop Passes (AXS-PCT-021)
+// =================================================================================================
+
+@derive(Copy)
+pub struct ScalarRewriteWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub inst_id: u32,
+    pub pre_bit_width: u8,
+    pub post_bit_width: u8,
+    pub pre_is_signed: bool,
+    pub post_is_signed: bool,
+    pub is_comparison_or_div_or_shift: bool,
+    pub is_float: bool,
+    pub rewrote_fp_identity_or_reassoc: bool,
+    pub fp_nan_safe: bool,
+    pub fp_signed_zero_safe: bool,
+    pub pre_has_overflow_trap: bool,
+    pub post_has_overflow_trap: bool,
+    pub overflow_cert_id: u32,
+    pub pre_has_div_zero_trap: bool,
+    pub post_has_div_zero_trap: bool,
+    pub non_zero_cert_id: u32,
+    pub pre_has_shift_trap: bool,
+    pub post_has_shift_trap: bool,
+    pub shift_cert_id: u32,
+    pub pre_has_bounds_trap: bool,
+    pub post_has_bounds_trap: bool,
+    pub bounds_cert_id: u32,
+    pub pre_sample_out_0: u64,
+    pub post_sample_out_0: u64,
+    pub pre_sample_out_1: u64,
+    pub post_sample_out_1: u64,
+}
+
+// Validate a scalar / algebraic rewrite in OptIR (constant folding, instcombine, strength
+// reduction, SCCP, GVN) per AXS-PCT-021.1:
+//   - Preserves exact bit-width and signed/unsigned comparison/division/shift polarity.
+//   - Enforces IEEE-754 NaN and -0.0 preservation on floating-point rewrites.
+//   - Rejects dropping checked-overflow, div-by-zero, shift-range, or bounds traps unless backed
+//     by a valid Certainty.Proven ProofCertificate in ProofStore.
+pub fn tval_validate_scalar_rewrite(
+    eng: mut_view<TranslationValEngine>,
+    store: view<ProofStore>,
+    desc: view<ScalarRewriteWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut consumed: u32 = 0u32;
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+
+    // 1. Exact bit-width preservation
+    if desc.pre_bit_width == 0u8 || desc.pre_bit_width > 128u8 || desc.pre_bit_width != desc.post_bit_width {
+        fail_kind = TVAL_FAIL_BITWIDTH_OR_SIGN_MISMATCH;
+    }
+
+    // 2. Signed/unsigned comparison/division/shift polarity preservation (REQ-CORE-3268)
+    if fail_kind == TVAL_FAIL_NONE && desc.is_comparison_or_div_or_shift && (desc.pre_is_signed != desc.post_is_signed) {
+        if !tval_check_proof_cert_kind(store, desc.overflow_cert_id, PROP_NO_SIGNED_OVERFLOW) {
+            fail_kind = TVAL_FAIL_BITWIDTH_OR_SIGN_MISMATCH;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    // 3. IEEE-754 floating-point NaN & signed-zero (-0.0) rules
+    if fail_kind == TVAL_FAIL_NONE && desc.is_float && desc.rewrote_fp_identity_or_reassoc {
+        if !desc.fp_nan_safe || !desc.fp_signed_zero_safe {
+            fail_kind = TVAL_FAIL_IEEE754_NAN_OR_SIGNED_ZERO;
+        }
+    }
+
+    // 4. Checked-overflow trap preservation (NoSignedOverflow / NoUnsignedOverflow)
+    if fail_kind == TVAL_FAIL_NONE && desc.pre_has_overflow_trap && !desc.post_has_overflow_trap {
+        let req_prop: u8 = if desc.pre_is_signed { PROP_NO_SIGNED_OVERFLOW } else { PROP_NO_UNSIGNED_OVERFLOW };
+        if !tval_check_proof_cert_kind(store, desc.overflow_cert_id, req_prop) {
+            fail_kind = TVAL_FAIL_DROPPED_OVERFLOW_TRAP;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    // 5. Division/remainder-by-zero trap preservation (NonZero)
+    if fail_kind == TVAL_FAIL_NONE && desc.pre_has_div_zero_trap && !desc.post_has_div_zero_trap {
+        if !tval_check_proof_cert_kind(store, desc.non_zero_cert_id, PROP_NON_ZERO) {
+            fail_kind = TVAL_FAIL_DROPPED_DIV_ZERO_TRAP;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    // 6. Shift-in-range trap preservation (ShiftInRange)
+    if fail_kind == TVAL_FAIL_NONE && desc.pre_has_shift_trap && !desc.post_has_shift_trap {
+        if !tval_check_proof_cert_kind(store, desc.shift_cert_id, PROP_SHIFT_IN_RANGE) {
+            fail_kind = TVAL_FAIL_DROPPED_SHIFT_TRAP;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    // 7. Bounds-check trap preservation (InBounds)
+    if fail_kind == TVAL_FAIL_NONE && desc.pre_has_bounds_trap && !desc.post_has_bounds_trap {
+        if !tval_check_proof_cert_kind(store, desc.bounds_cert_id, PROP_IN_BOUNDS) {
+            fail_kind = TVAL_FAIL_DROPPED_BOUNDS_TRAP;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    // 8. Sampled boundary value evaluation check
+    let val_ok = (desc.pre_sample_out_0 == desc.post_sample_out_0) &&
+                 (desc.pre_sample_out_1 == desc.post_sample_out_1);
+    if fail_kind == TVAL_FAIL_NONE && !val_ok {
+        fail_kind = TVAL_FAIL_SCALAR_VALUE_MISMATCH;
+    }
+
+    let trap_ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(true, val_ok, true, trap_ok, false);
+    let ok = tval_meets_mandatory_criterion(tier) && fail_kind == TVAL_FAIL_NONE;
+
+    let pre_fp = tval_compute_stage_fingerprint(
+        1u32,
+        desc.fn_id,
+        desc.inst_id,
+        desc.pre_sample_out_0 ^ (desc.pre_bit_width as u64),
+        desc.pre_sample_out_1
+    );
+    let post_fp = tval_compute_stage_fingerprint(
+        2u32,
+        desc.fn_id,
+        desc.inst_id,
+        desc.post_sample_out_0 ^ (desc.post_bit_width as u64),
+        desc.post_sample_out_1
+    );
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_OPT_IR,
+        output_ir: IR_LEVEL_OPT_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: consumed,
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: desc.inst_id,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+@derive(Copy)
+pub struct CfgTransformWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub removed_edges_or_blocks: u32,
+    pub branch_cond_certainty: u8,
+    pub join_pred_count: u32,
+    pub phi_input_count: u32,
+    pub memory_phi_complete: bool,
+    pub dom_tree_valid: bool,
+}
+
+// Validate CFG canonicalization & unreachable block removal (AXS-PCT-021.2):
+//   - Removing a branch edge or basic block requires a verified ReachableEdge / constant-condition
+//     proof (`branch_cond_certainty == CERTAINTY_PROVEN`).
+//   - Join blocks must retain complete phi & MemoryPhi inputs matching remaining predecessors,
+//     valid dominance, well-formed MIR terminators, and preserved observable effects.
+pub fn tval_validate_cfg_transform(
+    eng: mut_view<TranslationValEngine>,
+    pre_body: view<MirBody>,
+    post_body: view<MirBody>,
+    desc: view<CfgTransformWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut consumed: u32 = 0u32;
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+
+    if desc.removed_edges_or_blocks > 0u32 {
+        if desc.branch_cond_certainty != CERTAINTY_PROVEN {
+            fail_kind = TVAL_FAIL_UNPROVEN_UNREACHABLE_EDGE;
+        } else {
+            consumed = consumed + 1u32;
+        }
+    }
+
+    if fail_kind == TVAL_FAIL_NONE {
+        if desc.join_pred_count != desc.phi_input_count || !desc.memory_phi_complete || !desc.dom_tree_valid {
+            fail_kind = TVAL_FAIL_INCOMPLETE_PHI_OR_DOM;
+        }
+    }
+
+    let mut cap_viol = false;
+    let post_mir_ok = pct_verify_mir_body_invariants(view(*post_body), mut_view(cap_viol));
+    if fail_kind == TVAL_FAIL_NONE && !post_mir_ok {
+        fail_kind = if cap_viol { TVAL_FAIL_DROP_OR_CAP_BARRIER_VIOLATED } else { TVAL_FAIL_INCOMPLETE_PHI_OR_DOM };
+    }
+
+    let pre_eff = pct_count_mir_observable_effects(view(*pre_body));
+    let post_eff = pct_count_mir_observable_effects(view(*post_body));
+    if fail_kind == TVAL_FAIL_NONE && (post_eff < pre_eff) {
+        fail_kind = TVAL_FAIL_DROP_OR_CAP_BARRIER_VIOLATED;
+    }
+
+    let ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(
+        pre_body.bb_count == post_body.bb_count,
+        ok,
+        ok,
+        post_eff >= pre_eff && ok,
+        false
+    );
+
+    let pre_fp = tval_compute_mir_fingerprint(view(*pre_body), 1u32);
+    let post_fp = tval_compute_mir_fingerprint(view(*post_body), 2u32);
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_OPT_IR,
+        output_ir: IR_LEVEL_OPT_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: consumed,
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: desc.removed_edges_or_blocks,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+pub const TVAL_MEM_XFORM_DSE: u8 = 0u8;
+pub const TVAL_MEM_XFORM_LOAD_FWD: u8 = 1u8;
+pub const TVAL_MEM_XFORM_SROA: u8 = 2u8;
+pub const TVAL_MEM_XFORM_LICM: u8 = 3u8;
+pub const TVAL_MEM_XFORM_BCE: u8 = 4u8;
+
+@derive(Copy)
+pub struct MemoryLoopTransformWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub xform_kind: u8,
+    pub subject_inst: u32,
+    pub primary_cert_id: u32,
+    pub secondary_cert_id: u32,
+    pub touches_volatile_or_mmio: bool,
+    pub touches_atomic_sync: bool,
+    pub alters_drop_order: bool,
+    pub violates_capability_exclusivity: bool,
+    pub hoisted_op_may_trap_on_empty_loop: bool,
+}
+
+// Validate memory & loop transformations (DSE, Load Forwarding, SROA, LICM, BCE) per AXS-PCT-021.3:
+//   - Requires valid ProofCertificate entries (DeadStore, MustAlias/NoAlias, NoEscape, LoopInvariant, InBounds).
+//   - Strictly preserves all volatile/MMIO, atomic synchronization, Drop order, and capability barriers.
+pub fn tval_validate_memory_loop_transform(
+    eng: mut_view<TranslationValEngine>,
+    store: view<ProofStore>,
+    desc: view<MemoryLoopTransformWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut consumed: u32 = 0u32;
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+
+    if desc.touches_volatile_or_mmio || desc.touches_atomic_sync {
+        fail_kind = TVAL_FAIL_VOLATILE_OR_ATOMIC_ELIMINATED;
+    } else if desc.alters_drop_order || desc.violates_capability_exclusivity {
+        fail_kind = TVAL_FAIL_DROP_OR_CAP_BARRIER_VIOLATED;
+    } else if desc.xform_kind == TVAL_MEM_XFORM_DSE {
+        if !tval_check_proof_cert_kind(store, desc.primary_cert_id, PROP_DEAD_STORE) ||
+           !tval_check_proof_cert_kind(store, desc.secondary_cert_id, PROP_NO_ALIAS) {
+            fail_kind = TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+        } else {
+            consumed = 2u32;
+        }
+    } else if desc.xform_kind == TVAL_MEM_XFORM_LOAD_FWD {
+        if !tval_check_proof_cert_kind(store, desc.primary_cert_id, PROP_MUST_ALIAS) ||
+           !tval_check_proof_cert_kind(store, desc.secondary_cert_id, PROP_NO_ALIAS) {
+            fail_kind = TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+        } else {
+            consumed = 2u32;
+        }
+    } else if desc.xform_kind == TVAL_MEM_XFORM_SROA {
+        if !tval_check_proof_cert_kind(store, desc.primary_cert_id, PROP_NO_ESCAPE) ||
+           !tval_check_proof_cert_kind(store, desc.secondary_cert_id, PROP_NO_ALIAS) {
+            fail_kind = TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+        } else {
+            consumed = 2u32;
+        }
+    } else if desc.xform_kind == TVAL_MEM_XFORM_LICM {
+        if desc.hoisted_op_may_trap_on_empty_loop {
+            fail_kind = TVAL_FAIL_DROPPED_DIV_ZERO_TRAP;
+        } else if !tval_check_proof_cert_kind(store, desc.primary_cert_id, PROP_LOOP_INVARIANT) ||
+                  !tval_check_proof_cert_kind(store, desc.secondary_cert_id, PROP_NO_ALIAS) {
+            fail_kind = TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+        } else {
+            consumed = 2u32;
+        }
+    } else if desc.xform_kind == TVAL_MEM_XFORM_BCE {
+        if !tval_check_proof_cert_kind(store, desc.primary_cert_id, PROP_IN_BOUNDS) {
+            fail_kind = TVAL_FAIL_DROPPED_BOUNDS_TRAP;
+        } else {
+            consumed = 1u32;
+        }
+    } else {
+        fail_kind = TVAL_FAIL_MISSING_MEMORY_ALIAS_PROOF;
+    }
+
+    let ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(
+        false,
+        ok,
+        !desc.alters_drop_order && !desc.violates_capability_exclusivity && ok,
+        !desc.touches_volatile_or_mmio && !desc.touches_atomic_sync && ok,
+        false
+    );
+
+    let pre_fp = tval_compute_stage_fingerprint(3u32, desc.fn_id, desc.subject_inst, desc.xform_kind as u64, 1u64);
+    let post_fp = tval_compute_stage_fingerprint(4u32, desc.fn_id, desc.subject_inst, desc.xform_kind as u64, 2u64);
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_OPT_IR,
+        output_ir: IR_LEVEL_OPT_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: consumed,
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: desc.subject_inst,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+// =================================================================================================
+// 4. Target Legalization & Register Allocation Witness Validation (AXS-PCT-022)
+// =================================================================================================
+
+pub const TVAL_LEGALIZE_NARROW_INT_PROMOTE: u8 = 0u8;
+pub const TVAL_LEGALIZE_I128_PAIR_SPLIT: u8 = 1u8;
+pub const TVAL_LEGALIZE_SIMD_VECTOR_SPLIT: u8 = 2u8;
+
+@derive(Copy)
+pub struct TargetLegalizationWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub legalize_kind: u8,
+    pub inst_id: u32,
+    pub pre_total_bits: u16,
+    pub post_lane_bits: u16,
+    pub post_lane_count: u16,
+    pub extension_matches_signedness: bool,
+    pub preserves_carry_borrow_chain: bool,
+    pub preserves_lane_order: bool,
+    pub preserves_trap_semantics: bool,
+}
+
+// Validate OptIR/MIR -> LIR -> MachineIR target legalization equivalence (AXS-PCT-022.1):
+//   - Narrow/wide integer promotion, 128-bit (lo, hi) register-pair splitting (SPEC-40), and
+//     SIMD vector legalization (SPEC-43) preserve exact bit width, carry/borrow chains, and traps.
+pub fn tval_validate_target_legalization(
+    eng: mut_view<TranslationValEngine>,
+    desc: view<TargetLegalizationWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut ok = true;
+    let post_total: u32 = (desc.post_lane_bits as u32) * (desc.post_lane_count as u32);
+    if desc.pre_total_bits == 0u16 || (desc.pre_total_bits as u32) != post_total || !desc.preserves_trap_semantics {
+        ok = false;
+    } else if desc.legalize_kind == TVAL_LEGALIZE_NARROW_INT_PROMOTE {
+        if !desc.extension_matches_signedness || desc.post_lane_count != 1u16 {
+            ok = false;
+        }
+    } else if desc.legalize_kind == TVAL_LEGALIZE_I128_PAIR_SPLIT {
+        if desc.pre_total_bits != 128u16 || desc.post_lane_bits != 64u16 ||
+           desc.post_lane_count != 2u16 || !desc.preserves_carry_borrow_chain {
+            ok = false;
+        }
+    } else if desc.legalize_kind == TVAL_LEGALIZE_SIMD_VECTOR_SPLIT {
+        if !desc.preserves_lane_order || desc.post_lane_count == 0u16 {
+            ok = false;
+        }
+    } else {
+        ok = false;
+    }
+
+    let fail_kind: u8 = if ok { TVAL_FAIL_NONE } else { TVAL_FAIL_LEGALIZATION_MISMATCH };
+    let tier = tval_evaluate_equivalence_tier(false, ok, ok, desc.preserves_trap_semantics && ok, false);
+    let pre_fp = tval_compute_stage_fingerprint(5u32, desc.fn_id, desc.inst_id, desc.pre_total_bits as u64, 0u64);
+    let post_fp = tval_compute_stage_fingerprint(6u32, desc.fn_id, desc.inst_id, post_total as u64, desc.post_lane_count as u64);
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_MIR,
+        output_ir: IR_LEVEL_LIR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: if ok { 1u32 } else { 0u32 },
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL | SEM_PROP_ABI_LAYOUT_CONFORMANT } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: desc.inst_id,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+// Physical register sub-register encoding constants for RegUnit aliasing checks (AXS-PCT-022.2):
+//   0..15:    64-bit GPRs (RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8=8..R15=15)
+//   32..47:   32-bit GPR sub-registers (EAX=32..R15D=47) -> map to unit 0..15
+//   64..79:   16-bit GPR sub-registers (AX=64..R15W=79)  -> map to unit 0..15
+//   96..111:  8-bit low sub-registers  (AL=96..R15B=111) -> map to unit 0..15
+//   112..115: 8-bit high sub-registers (AH=112..BH=115)  -> map to unit 0..3
+//   128..143: 128-bit XMM0..XMM15 (128..143)             -> map to unit 16..31
+//   160..175: 256-bit YMM0..YMM15 (160..175)             -> map to unit 16..31
+pub const REG_ENC_RAX: u8 = 0u8;
+pub const REG_ENC_RCX: u8 = 1u8;
+pub const REG_ENC_RDX: u8 = 2u8;
+pub const REG_ENC_RBX: u8 = 3u8;
+pub const REG_ENC_EAX: u8 = 32u8;
+pub const REG_ENC_AX: u8 = 64u8;
+pub const REG_ENC_AL: u8 = 96u8;
+pub const REG_ENC_AH: u8 = 112u8;
+pub const REG_ENC_XMM0: u8 = 128u8;
+pub const REG_ENC_YMM0: u8 = 160u8;
+
+pub const PHYS_UNIT_RAX: u8 = 0u8;
+pub const PHYS_UNIT_RCX: u8 = 1u8;
+pub const PHYS_UNIT_RDX: u8 = 2u8;
+pub const PHYS_UNIT_RBX: u8 = 3u8;
+pub const PHYS_UNIT_XMM0: u8 = 16u8;
+
+pub fn tval_phys_reg_unit(reg_enc: u8) -> u8 {
+    if reg_enc < 16u8 {
+        return reg_enc;
+    }
+    if reg_enc >= 32u8 && reg_enc < 48u8 {
+        return reg_enc - 32u8;
+    }
+    if reg_enc >= 64u8 && reg_enc < 80u8 {
+        return reg_enc - 64u8;
+    }
+    if reg_enc >= 96u8 && reg_enc < 112u8 {
+        return reg_enc - 96u8;
+    }
+    if reg_enc >= 112u8 && reg_enc < 116u8 {
+        return reg_enc - 112u8;
+    }
+    if reg_enc >= 128u8 && reg_enc < 144u8 {
+        return 16u8 + (reg_enc - 128u8);
+    }
+    if reg_enc >= 160u8 && reg_enc < 176u8 {
+        return 16u8 + (reg_enc - 160u8);
+    }
+    reg_enc
+}
+
+// Win64 volatile / caller-saved physical units: RAX(0), RCX(1), RDX(2), R8(8)..R11(11), XMM0(16)..XMM5(21)
+pub fn tval_is_win64_caller_saved_unit(unit: u8) -> bool {
+    if unit == 0u8 || unit == 1u8 || unit == 2u8 {
+        return true;
+    }
+    if unit >= 8u8 && unit <= 11u8 {
+        return true;
+    }
+    if unit >= 16u8 && unit <= 21u8 {
+        return true;
+    }
+    false
+}
+
+@derive(Copy)
+pub struct LiveRangeAllocEntry {
+    pub vreg_id: u32,
+    pub start_point: u32,
+    pub end_point: u32,
+    pub phys_reg_enc: u8,
+    pub is_spilled: bool,
+    pub spill_slot_id: u32,
+    pub value_provenance: u32,
+    pub is_move_coalesced: bool,
+    pub crosses_call: bool,
+    pub saved_across_call: bool,
+}
+
+@derive(Copy)
+pub struct SpillSlotEntry {
+    pub slot_id: u32,
+    pub vreg_id: u32,
+    pub spill_store_point: u32,
+    pub reload_use_point: u32,
+    pub store_dominates_reload: bool,
+    pub aliases_user_local: bool,
+    pub aliases_volatile_or_mmio: bool,
+}
+
+@derive(Copy)
+pub struct RegAllocWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub remaining_vregs: u32,
+    pub intervals: *const LiveRangeAllocEntry,
+    pub interval_count: usize,
+    pub spills: *const SpillSlotEntry,
+    pub spill_count: usize,
+    pub var_shift_uses_rcx: bool,
+    pub div_mul_uses_rax_rdx: bool,
+    pub callee_saved_modified_mask: u32,
+    pub callee_saved_saved_restored_mask: u32,
+}
+
+unsafe fn tval_interval_at(base: *const LiveRangeAllocEntry, idx: usize) -> *const LiveRangeAllocEntry {
+    let off = ((idx as isize) * (size_of<LiveRangeAllocEntry>() as isize)) as usize;
+    ((base as usize) + off) as *const LiveRangeAllocEntry
+}
+
+unsafe fn tval_spill_at(base: *const SpillSlotEntry, idx: usize) -> *const SpillSlotEntry {
+    let off = ((idx as isize) * (size_of<SpillSlotEntry>() as isize)) as usize;
+    ((base as usize) + off) as *const SpillSlotEntry
+}
+
+// Validate post-RA register allocation & spill/reload witness (AXS-PCT-022.2):
+//   - Zero virtual registers remain.
+//   - No two simultaneously live intervals share an overlapping physical register unit
+//     (RAX/EAX/AX/AL, XMMi/YMMi) unless move-coalesced with identical value provenance.
+//   - Every spilled reload is preceded by a dominating spill store to its dedicated frame slot,
+//     never aliasing user locals or volatile/MMIO memory, and no two simultaneously live spilled
+//     intervals clobber the same spill slot.
+//   - Fixed-register ISA constraints (RCX shifts, RAX:RDX div/mul), caller-saved call clobbers,
+//     and callee-saved register save/restore contracts hold.
+pub fn tval_validate_regalloc_witness(
+    eng: mut_view<TranslationValEngine>,
+    desc: view<RegAllocWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+    let mut fail_subj: u32 = 0u32;
+
+    // 1. Zero virtual registers remaining
+    if desc.remaining_vregs != 0u32 {
+        fail_kind = TVAL_FAIL_UNRESOLVED_VREG;
+        fail_subj = desc.remaining_vregs;
+    }
+
+    // 2. ISA fixed-register & callee-saved register contracts
+    if fail_kind == TVAL_FAIL_NONE {
+        if !desc.var_shift_uses_rcx || !desc.div_mul_uses_rax_rdx ||
+           (desc.callee_saved_modified_mask & desc.callee_saved_saved_restored_mask) != desc.callee_saved_modified_mask {
+            fail_kind = TVAL_FAIL_ISA_FIXED_REG_OR_ABI_CLOBBER;
+        }
+    }
+
+    // 3. Live-range physical register unit interference & caller-saved call clobber checks
+    if fail_kind == TVAL_FAIL_NONE && desc.interval_count > 0 && (desc.intervals as usize) != 0 {
+        let mut i: usize = 0;
+        while i < desc.interval_count && fail_kind == TVAL_FAIL_NONE {
+            let iv_i = unsafe { tval_interval_at(desc.intervals, i) };
+            let i_spilled = unsafe { (*iv_i).is_spilled };
+            let i_start = unsafe { (*iv_i).start_point };
+            let i_end = unsafe { (*iv_i).end_point };
+            let i_unit = tval_phys_reg_unit(unsafe { (*iv_i).phys_reg_enc });
+            let i_prov = unsafe { (*iv_i).value_provenance };
+            let i_coal = unsafe { (*iv_i).is_move_coalesced };
+            let i_slot = unsafe { (*iv_i).spill_slot_id };
+
+            if !i_spilled && (unsafe { (*iv_i).crosses_call }) &&
+               tval_is_win64_caller_saved_unit(i_unit) && !(unsafe { (*iv_i).saved_across_call }) {
+                fail_kind = TVAL_FAIL_ISA_FIXED_REG_OR_ABI_CLOBBER;
+                fail_subj = unsafe { (*iv_i).vreg_id };
+                break;
+            }
+
+            let mut j: usize = i + 1;
+            while j < desc.interval_count {
+                let iv_j = unsafe { tval_interval_at(desc.intervals, j) };
+                let j_spilled = unsafe { (*iv_j).is_spilled };
+                let j_start = unsafe { (*iv_j).start_point };
+                let j_end = unsafe { (*iv_j).end_point };
+                let overlaps = (i_start < j_end) && (j_start < i_end);
+
+                if overlaps {
+                    let j_prov = unsafe { (*iv_j).value_provenance };
+                    if !i_spilled && !j_spilled {
+                        let j_unit = tval_phys_reg_unit(unsafe { (*iv_j).phys_reg_enc });
+                        let j_coal = unsafe { (*iv_j).is_move_coalesced };
+                        if i_unit == j_unit {
+                            let legal_coalesce = (i_coal || j_coal) && (i_prov == j_prov);
+                            if !legal_coalesce {
+                                fail_kind = TVAL_FAIL_CLOBBERED_LIVE_REGISTER;
+                                fail_subj = unsafe { (*iv_j).vreg_id };
+                                break;
+                            }
+                        }
+                    } else if i_spilled && j_spilled {
+                        let j_slot = unsafe { (*iv_j).spill_slot_id };
+                        if i_slot == j_slot && i_prov != j_prov {
+                            fail_kind = TVAL_FAIL_INVALID_SPILL_RELOAD;
+                            fail_subj = unsafe { (*iv_j).vreg_id };
+                            break;
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    // 4. Spill store dominance & stack slot non-aliasing checks
+    if fail_kind == TVAL_FAIL_NONE && desc.spill_count > 0 && (desc.spills as usize) != 0 {
+        let mut s: usize = 0;
+        while s < desc.spill_count {
+            let sp = unsafe { tval_spill_at(desc.spills, s) };
+            let dom = unsafe { (*sp).store_dominates_reload };
+            let st_pt = unsafe { (*sp).spill_store_point };
+            let rl_pt = unsafe { (*sp).reload_use_point };
+            let alias_loc = unsafe { (*sp).aliases_user_local };
+            let alias_vol = unsafe { (*sp).aliases_volatile_or_mmio };
+            if !dom || st_pt >= rl_pt || alias_loc || alias_vol {
+                fail_kind = TVAL_FAIL_INVALID_SPILL_RELOAD;
+                fail_subj = unsafe { (*sp).vreg_id };
+                break;
+            }
+            s = s + 1;
+        }
+    }
+
+    let ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(false, ok, ok, ok, false);
+    let pre_fp = tval_compute_stage_fingerprint(7u32, desc.fn_id, desc.interval_count as u32, desc.spill_count as u64, 0u64);
+    let post_fp = tval_compute_stage_fingerprint(8u32, desc.fn_id, desc.interval_count as u32, desc.callee_saved_saved_restored_mask as u64, desc.remaining_vregs as u64);
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_LIR,
+        output_ir: IR_LEVEL_MACH_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: if ok { 1u32 } else { 0u32 },
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL | SEM_PROP_ABI_LAYOUT_CONFORMANT } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: fail_subj,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+// =================================================================================================
+// 5. Instruction Scheduling Dependency & Barrier Witness Validation (AXS-PCT-023)
+// =================================================================================================
+
+pub const SCHED_DEP_RAW: u8 = 0u8;
+pub const SCHED_DEP_WAR: u8 = 1u8;
+pub const SCHED_DEP_WAW: u8 = 2u8;
+
+pub const SCHED_RES_GPR: u8 = 0u8;
+pub const SCHED_RES_XMM_VEC: u8 = 1u8;
+pub const SCHED_RES_STACK_SLOT: u8 = 2u8;
+pub const SCHED_RES_EFLAGS: u8 = 3u8;
+pub const SCHED_RES_MEMORY: u8 = 4u8;
+
+@derive(Copy)
+pub struct ScheduleNodeEntry {
+    pub inst_id: u32,
+    pub pre_order_idx: u32,
+    pub scheduled_order_idx: u32,
+    pub is_memory_load: bool,
+    pub is_memory_store: bool,
+    pub is_volatile_or_mmio: bool,
+    pub is_atomic: bool,
+    pub is_fence: bool,
+    pub is_call: bool,
+    pub is_may_trap: bool,
+    pub alias_group: u32,
+}
+
+@derive(Copy)
+pub struct ScheduleDepEdge {
+    pub pred_node_idx: u32,
+    pub succ_node_idx: u32,
+    pub dep_kind: u8,
+    pub resource_kind: u8,
+}
+
+@derive(Copy)
+pub struct ScheduleWitnessDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub nodes: *const ScheduleNodeEntry,
+    pub node_count: usize,
+    pub edges: *const ScheduleDepEdge,
+    pub edge_count: usize,
+    pub no_alias_cert_id: u32,
+    pub has_unknown_latency_model: bool,
+}
+
+unsafe fn tval_sched_node_at(base: *const ScheduleNodeEntry, idx: usize) -> *const ScheduleNodeEntry {
+    let off = ((idx as isize) * (size_of<ScheduleNodeEntry>() as isize)) as usize;
+    ((base as usize) + off) as *const ScheduleNodeEntry
+}
+
+unsafe fn tval_sched_edge_at(base: *const ScheduleDepEdge, idx: usize) -> *const ScheduleDepEdge {
+    let off = ((idx as isize) * (size_of<ScheduleDepEdge>() as isize)) as usize;
+    ((base as usize) + off) as *const ScheduleDepEdge
+}
+
+// Validate pre-RA and post-RA instruction scheduling against ScheduleDepGraph & ordering barriers (AXS-PCT-023):
+//   - Confirms all RAW, WAR, and WAW dependencies on GPR, XMM/vector, stack slots, and EFLAGS are
+//     topological sub-orders of the emitted schedule.
+//   - Enforces strict ordering barriers for volatile/MMIO accesses, atomic instructions, fences,
+//     calls, trapping instructions (Assert, idiv, div), and non-NoAlias memory accesses.
+pub fn tval_validate_schedule_witness(
+    eng: mut_view<TranslationValEngine>,
+    store: view<ProofStore>,
+    desc: view<ScheduleWitnessDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+    let mut fail_subj: u32 = 0u32;
+    let mut consumed: u32 = 0u32;
+
+    // 1. Unknown hardware latency/port behavior requires falling back to conservative original order
+    if desc.has_unknown_latency_model && desc.node_count > 0 && (desc.nodes as usize) != 0 {
+        let mut k: usize = 0;
+        while k < desc.node_count {
+            let nk = unsafe { tval_sched_node_at(desc.nodes, k) };
+            if (unsafe { (*nk).pre_order_idx }) != (unsafe { (*nk).scheduled_order_idx }) {
+                fail_kind = TVAL_FAIL_SCHEDULE_DATA_HAZARD;
+                fail_subj = unsafe { (*nk).inst_id };
+                break;
+            }
+            k = k + 1;
+        }
+    }
+
+    // 2. Verify explicit RAW/WAR/WAW dependency edges in ScheduleDepGraph
+    if fail_kind == TVAL_FAIL_NONE && desc.edge_count > 0 && (desc.edges as usize) != 0 && (desc.nodes as usize) != 0 {
+        let mut e: usize = 0;
+        while e < desc.edge_count {
+            let ed = unsafe { tval_sched_edge_at(desc.edges, e) };
+            let p_idx = (unsafe { (*ed).pred_node_idx }) as usize;
+            let s_idx = (unsafe { (*ed).succ_node_idx }) as usize;
+            if p_idx >= desc.node_count || s_idx >= desc.node_count {
+                fail_kind = TVAL_FAIL_SCHEDULE_DATA_HAZARD;
+                break;
+            }
+            let pn = unsafe { tval_sched_node_at(desc.nodes, p_idx) };
+            let sn = unsafe { tval_sched_node_at(desc.nodes, s_idx) };
+            if (unsafe { (*pn).scheduled_order_idx }) >= (unsafe { (*sn).scheduled_order_idx }) {
+                let rk = unsafe { (*ed).resource_kind };
+                fail_kind = if rk == SCHED_RES_EFLAGS { TVAL_FAIL_EFLAGS_HAZARD } else { TVAL_FAIL_SCHEDULE_DATA_HAZARD };
+                fail_subj = unsafe { (*sn).inst_id };
+                break;
+            }
+            e = e + 1;
+        }
+    }
+
+    // 3. Verify volatile/MMIO, atomic, fence, call, trap, and aliasing memory barriers
+    if fail_kind == TVAL_FAIL_NONE && desc.node_count > 1 && (desc.nodes as usize) != 0 {
+        let mut i: usize = 0;
+        while i < desc.node_count && fail_kind == TVAL_FAIL_NONE {
+            let ni = unsafe { tval_sched_node_at(desc.nodes, i) };
+            let mut j: usize = i + 1;
+            while j < desc.node_count {
+                let nj = unsafe { tval_sched_node_at(desc.nodes, j) };
+                let i_before_j_pre = (unsafe { (*ni).pre_order_idx }) < (unsafe { (*nj).pre_order_idx });
+                let i_before_j_post = (unsafe { (*ni).scheduled_order_idx }) < (unsafe { (*nj).scheduled_order_idx });
+
+                if i_before_j_pre != i_before_j_post {
+                    let i_vol = unsafe { (*ni).is_volatile_or_mmio };
+                    let j_vol = unsafe { (*nj).is_volatile_or_mmio };
+                    let i_atm = unsafe { (*ni).is_atomic };
+                    let j_atm = unsafe { (*nj).is_atomic };
+                    let i_fnc = unsafe { (*ni).is_fence };
+                    let j_fnc = unsafe { (*nj).is_fence };
+                    let i_cal = unsafe { (*ni).is_call };
+                    let j_cal = unsafe { (*nj).is_call };
+                    let i_trp = unsafe { (*ni).is_may_trap };
+                    let j_trp = unsafe { (*nj).is_may_trap };
+                    let i_ld = unsafe { (*ni).is_memory_load };
+                    let j_ld = unsafe { (*nj).is_memory_load };
+                    let i_st = unsafe { (*ni).is_memory_store };
+                    let j_st = unsafe { (*nj).is_memory_store };
+
+                    // (a) Volatile / MMIO ordering barrier
+                    if (i_vol && (j_vol || j_atm || j_fnc || j_cal || j_trp || j_st)) ||
+                       (j_vol && (i_vol || i_atm || i_fnc || i_cal || i_trp || i_st)) {
+                        fail_kind = TVAL_FAIL_VOLATILE_BARRIER_REORDERED;
+                        fail_subj = unsafe { (*nj).inst_id };
+                        break;
+                    }
+
+                    // (b) Atomic & fence synchronization barrier
+                    if i_fnc || j_fnc ||
+                       (i_atm && (j_atm || j_ld || j_st || j_cal || j_trp)) ||
+                       (j_atm && (i_atm || i_ld || i_st || i_cal || i_trp)) {
+                        fail_kind = TVAL_FAIL_ATOMIC_BARRIER_REORDERED;
+                        fail_subj = unsafe { (*nj).inst_id };
+                        break;
+                    }
+
+                    // (c) Trapping (Assert, idiv, div) & Call ordering barrier
+                    if ((i_trp || i_cal) && (j_st || j_trp || j_cal)) ||
+                       ((j_trp || j_cal) && (i_st || i_trp || i_cal)) {
+                        fail_kind = TVAL_FAIL_TRAP_OR_CALL_BARRIER_REORDERED;
+                        fail_subj = unsafe { (*nj).inst_id };
+                        break;
+                    }
+
+                    // (d) Aliasing memory store/load or store/store reordering check
+                    if (i_st && (j_ld || j_st)) || (j_st && (i_ld || i_st)) {
+                        if (unsafe { (*ni).alias_group }) == (unsafe { (*nj).alias_group }) {
+                            if !tval_check_proof_cert_kind(store, desc.no_alias_cert_id, PROP_NO_ALIAS) {
+                                fail_kind = TVAL_FAIL_ALIASING_MEMORY_REORDERED;
+                                fail_subj = unsafe { (*nj).inst_id };
+                                break;
+                            } else {
+                                consumed = consumed + 1u32;
+                            }
+                        }
+                    }
+                }
+                j = j + 1;
+            }
+            i = i + 1;
+        }
+    }
+
+    let ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(
+        false,
+        ok,
+        fail_kind != TVAL_FAIL_ALIASING_MEMORY_REORDERED && ok,
+        fail_kind != TVAL_FAIL_VOLATILE_BARRIER_REORDERED &&
+        fail_kind != TVAL_FAIL_ATOMIC_BARRIER_REORDERED &&
+        fail_kind != TVAL_FAIL_TRAP_OR_CALL_BARRIER_REORDERED && ok,
+        false
+    );
+
+    let pre_fp = tval_compute_stage_fingerprint(9u32, desc.fn_id, desc.node_count as u32, desc.edge_count as u64, 1u64);
+    let post_fp = tval_compute_stage_fingerprint(10u32, desc.fn_id, desc.node_count as u32, desc.edge_count as u64, 2u64);
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_MACH_IR,
+        output_ir: IR_LEVEL_MACH_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: consumed + (if ok { 1u32 } else { 0u32 }),
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL | SEM_PROP_ABI_LAYOUT_CONFORMANT } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: fail_subj,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+// =================================================================================================
+// 6. Machine Code Finalization Gate (AXS-PCT-024)
+// =================================================================================================
+
+pub const FINAL_STAGE_ALLOCATED: u8 = 1u8;
+pub const FINAL_STAGE_SCHEDULED: u8 = 2u8;
+pub const FINAL_STAGE_FRAMED: u8 = 4u8;
+pub const FINAL_STAGE_UNWINDABLE: u8 = 8u8;
+pub const FINAL_STAGE_SECURITY_VALID: u8 = 16u8;
+pub const FINAL_STAGE_ENCODABLE: u8 = 32u8;
+pub const FINAL_STAGE_COMPLETE_MASK: u8 = 63u8;
+
+@derive(Copy)
+pub struct FinalMachineGateDesc {
+    pub pass_id: u16,
+    pub fn_id: u32,
+    pub completed_stages_mask: u8,
+    pub remaining_vregs: u32,
+    pub unresolved_abstract_slots: u32,
+    pub frame_size_bytes: u32,
+    pub pushed_callee_bytes: u32,
+    pub has_calls: bool,
+    pub has_chkstk_probe: bool,
+    pub secret_slot_count: u32,
+    pub secret_zeroize_barriers_intact: bool,
+    pub pdata_xdata_matches_frame: bool,
+    pub callee_saved_pushed_mask: u32,
+    pub callee_saved_popped_mask: u32,
+}
+
+// Validate the Final Machine IR gate before the machine encoder emits bytes (AXS-PCT-024):
+//   - Pipeline stage progression: allocated -> scheduled -> framed -> unwindable -> security-valid -> encodable.
+//   - Zero virtual registers and zero unresolved abstract stack slots.
+//   - 16-byte Win64 call-site RSP alignment (`(8 + pushed_callee_bytes + frame_size_bytes) % 16 == 0`).
+//   - Stack probe (`__chkstk`) present on frames >= 4096 bytes (ADR-0003).
+//   - Secret<T> zeroization barriers intact.
+//   - Canonical .pdata/.xdata unwind metadata matches prologue/epilogue and callee-save symmetry.
+pub fn tval_validate_machine_finalization_gate(
+    eng: mut_view<TranslationValEngine>,
+    desc: view<FinalMachineGateDesc>,
+    sink: mut_view<DiagSink>
+) -> TranslationWitness {
+    let mut fail_kind: u8 = TVAL_FAIL_NONE;
+    let mut fail_subj: u32 = 0u32;
+
+    if (desc.completed_stages_mask & FINAL_STAGE_COMPLETE_MASK) != FINAL_STAGE_COMPLETE_MASK {
+        fail_kind = TVAL_FAIL_FINALIZE_PIPELINE_STAGE;
+        fail_subj = desc.completed_stages_mask as u32;
+    } else if desc.remaining_vregs != 0u32 || desc.unresolved_abstract_slots != 0u32 {
+        fail_kind = TVAL_FAIL_UNRESOLVED_VREG;
+        fail_subj = desc.remaining_vregs + desc.unresolved_abstract_slots;
+    } else if desc.has_calls && ((8u32 + desc.pushed_callee_bytes + desc.frame_size_bytes) & 15u32) != 0u32 {
+        fail_kind = TVAL_FAIL_STACK_ALIGNMENT;
+        fail_subj = desc.frame_size_bytes;
+    } else if desc.frame_size_bytes >= 4096u32 && !desc.has_chkstk_probe {
+        fail_kind = TVAL_FAIL_MISSING_CHKSTK_PROBE;
+        fail_subj = desc.frame_size_bytes;
+    } else if desc.secret_slot_count > 0u32 && !desc.secret_zeroize_barriers_intact {
+        fail_kind = TVAL_FAIL_SECRET_ZEROIZE_DROPPED;
+        fail_subj = desc.secret_slot_count;
+    } else if !desc.pdata_xdata_matches_frame || (desc.callee_saved_pushed_mask != desc.callee_saved_popped_mask) {
+        fail_kind = TVAL_FAIL_UNWIND_METADATA_MISMATCH;
+        fail_subj = desc.callee_saved_pushed_mask ^ desc.callee_saved_popped_mask;
+    }
+
+    let ok = fail_kind == TVAL_FAIL_NONE;
+    let tier = tval_evaluate_equivalence_tier(true, ok, ok, ok, false);
+    let pre_fp = tval_compute_stage_fingerprint(
+        11u32,
+        desc.fn_id,
+        desc.frame_size_bytes,
+        desc.callee_saved_pushed_mask as u64,
+        desc.completed_stages_mask as u64
+    );
+    let post_fp = tval_compute_stage_fingerprint(
+        12u32,
+        desc.fn_id,
+        desc.frame_size_bytes,
+        desc.callee_saved_popped_mask as u64,
+        if ok { 1u64 } else { 0u64 }
+    );
+
+    let w = TranslationWitness {
+        pass_id: desc.pass_id,
+        fn_id: desc.fn_id,
+        input_ir: IR_LEVEL_MACH_IR,
+        output_ir: IR_LEVEL_MACH_IR,
+        pre_fingerprint: pre_fp,
+        post_fingerprint: post_fp,
+        consumed_proofs: if ok { 1u32 } else { 0u32 },
+        preserved_props: if ok { SEM_PROP_MANDATORY_INTRA_LEVEL | SEM_PROP_ABI_LAYOUT_CONFORMANT } else { 0u32 },
+        verified_level: tier,
+        equivalence_verified: ok,
+        failure_kind: fail_kind,
+        failure_subject: fail_subj,
+    };
+    tval_record_witness(mut_view(*eng), view(w), mut_view(*sink));
+    w
+}
+
+// =================================================================================================
+// 7. Deterministic `inspect --emit=pass-witness` Formatter (AXS-PCT-050)
+// =================================================================================================
+
+pub fn tval_format_pass_witness_report(
+    tval_eng: view<TranslationValEngine>,
+    pct_eng: view<PassContractEngine>,
+    store: view<ProofStore>,
+    buf: mut_view<DiagBuffer>
+) {
+    pct_format_witness_summary(view(*pct_eng), view(*store), mut_view(*buf));
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    diag_buf_push_byte(mut_view(*buf), 116u8); // 't'
+    diag_buf_push_byte(mut_view(*buf), 118u8); // 'v'
+    diag_buf_push_byte(mut_view(*buf), 95u8);  // '_'
+    diag_buf_push_byte(mut_view(*buf), 111u8); // 'o'
+    diag_buf_push_byte(mut_view(*buf), 107u8); // 'k'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), tval_eng.verified_count);
+    diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+    diag_buf_push_byte(mut_view(*buf), 116u8); // 't'
+    diag_buf_push_byte(mut_view(*buf), 118u8); // 'v'
+    diag_buf_push_byte(mut_view(*buf), 95u8);  // '_'
+    diag_buf_push_byte(mut_view(*buf), 102u8); // 'f'
+    diag_buf_push_byte(mut_view(*buf), 97u8);  // 'a'
+    diag_buf_push_byte(mut_view(*buf), 105u8); // 'i'
+    diag_buf_push_byte(mut_view(*buf), 108u8); // 'l'
+    diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+    diag_buf_push_u32(mut_view(*buf), tval_eng.failed_count);
+    diag_buf_push_byte(mut_view(*buf), 10u8);  // '\n'
+
+    let mut i: usize = 0;
+    while i < tval_eng.witness_count {
+        let wp = unsafe { tval_witness_at(tval_eng.witnesses, i) };
+        let pass_id = unsafe { (*wp).pass_id } as u32;
+        let fn_id = unsafe { (*wp).fn_id };
+        let in_ir = unsafe { (*wp).input_ir } as u32;
+        let out_ir = unsafe { (*wp).output_ir } as u32;
+        let proofs = unsafe { (*wp).consumed_proofs };
+        let lvl = unsafe { (*wp).verified_level } as u32;
+        let eq_ok: u32 = if unsafe { (*wp).equivalence_verified } { 1u32 } else { 0u32 };
+        let fk = unsafe { (*wp).failure_kind } as u32;
+
+        // "w[" + i + "]:p=" + pass_id + " f=" + fn_id + " ir=" + in_ir + "->" + out_ir
+        // + " pr=" + proofs + " lv=" + lvl + " ok=" + eq_ok + " fk=" + fk + "\n"
+        diag_buf_push_byte(mut_view(*buf), 119u8); // 'w'
+        diag_buf_push_byte(mut_view(*buf), 91u8);  // '['
+        diag_buf_push_u32(mut_view(*buf), i as u32);
+        diag_buf_push_byte(mut_view(*buf), 93u8);  // ']'
+        diag_buf_push_byte(mut_view(*buf), 58u8);  // ':'
+        diag_buf_push_byte(mut_view(*buf), 112u8); // 'p'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), pass_id);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 102u8); // 'f'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), fn_id);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 105u8); // 'i'
+        diag_buf_push_byte(mut_view(*buf), 114u8); // 'r'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), in_ir);
+        diag_buf_push_byte(mut_view(*buf), 45u8);  // '-'
+        diag_buf_push_byte(mut_view(*buf), 62u8);  // '>'
+        diag_buf_push_u32(mut_view(*buf), out_ir);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 112u8); // 'p'
+        diag_buf_push_byte(mut_view(*buf), 114u8); // 'r'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), proofs);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 108u8); // 'l'
+        diag_buf_push_byte(mut_view(*buf), 118u8); // 'v'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), lvl);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 111u8); // 'o'
+        diag_buf_push_byte(mut_view(*buf), 107u8); // 'k'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), eq_ok);
+        diag_buf_push_byte(mut_view(*buf), 32u8);  // ' '
+        diag_buf_push_byte(mut_view(*buf), 102u8); // 'f'
+        diag_buf_push_byte(mut_view(*buf), 107u8); // 'k'
+        diag_buf_push_byte(mut_view(*buf), 61u8);  // '='
+        diag_buf_push_u32(mut_view(*buf), fk);
+        diag_buf_push_byte(mut_view(*buf), 10u8);  // '\n'
+        i = i + 1;
+    }
+}
