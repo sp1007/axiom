@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T610]
 priority: 104
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/loop_xform, tests/run/opt_loops]
 spec: [spec/SPEC-72-loops-scev-bce.md, tasks/0402, tasks/0426, tasks/0470, tasks/0549]
 covers: [REQ-OPT-163, REQ-OPT-164, REQ-OPT-165, REQ-OPT-166, REQ-OPT-167, REQ-OPT-168, REQ-OPT-169, REQ-OPT-170, REQ-OPT-171, REQ-OPT-172, REQ-OPT-173, REQ-OPT-174, REQ-OPT-175, REQ-OPT-344, REQ-OPT-354]
 started: 2026-11-07 16:14:03
-agent: T611-impl
+finished: 2026-11-07 21:13:49
 ---
 # T611 — E15.3 — Loop-invariant code motion (LICM), induction strength reduction, loop unrolling/peeling & iterator fusion
 
@@ -43,3 +43,4 @@ Implement effect- and `MemorySSA`-verified Loop-Invariant Code Motion (`LICM`), 
 ## Log
 - 2026-11-03 02:40:00 created by T215 (P15 phase planning)
 - 2026-11-07 16:14:03 started (attempt 1) T611-impl
+- 2026-11-07 21:13:49 accepted by QA -> done
