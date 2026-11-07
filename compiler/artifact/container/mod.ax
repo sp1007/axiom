@@ -1,0 +1,3795 @@
+// Object, Static Archive, LTO & Semantic Package Container Sections (`.axmeta`, `.axlto`, `.axmir`, `.axpkg`),
+// Schema-Versioned Reader/Writer, COFF `.obj`/`.lib` Embedding, Link-Time Verification,
+// Cross-Module LTO Verified MIR Consumption, and PE32+ `.exe`/`.dll` Section Stripping (T766 / E18.4).
+// Implements SPEC-24 sec.1-sec.4 (AXS-ART-020..024, AXS-ART-050..053, INV-ART-002).
+module compiler.artifact.container
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_new
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use compiler.query.db.DefId
+use compiler.query.db.Fingerprint128
+use compiler.query.db.MirBodyId
+use compiler.query.db.SemanticKey
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.qry_sv_eq
+use compiler.query.db.query_db_push_semantic_key
+use compiler.query.db.semantic_key_cmp
+
+use compiler.artifact.axmi.AXMI_ARTIFACT_KIND
+use compiler.artifact.axmi.AXMI_DEFAULT_FLAGS
+use compiler.artifact.axmi.AXMI_FLAG_HAS_LTO
+use compiler.artifact.axmi.AXMI_FLAG_LITTLE_ENDIAN
+use compiler.artifact.axmi.AXMI_FORMAT_FAMILY
+use compiler.artifact.axmi.AXMI_FORMAT_VERSION
+use compiler.artifact.axmi.AXMI_HEADER_SIZE
+use compiler.artifact.axmi.AXMI_MAGIC
+use compiler.artifact.axmi.AXMI_MAX_CUSTOM_SECTIONS
+use compiler.artifact.axmi.AXMI_MAX_SECTIONS
+use compiler.artifact.axmi.AXMI_MAX_STRINGS
+use compiler.artifact.axmi.AXMI_MIR_SCHEMA_VERSION
+use compiler.artifact.axmi.AXMI_PANIC_NO_PANIC
+use compiler.artifact.axmi.AXMI_PRODUCER_VERSION
+use compiler.artifact.axmi.AXMI_SCOPE_PACKAGE_LOCAL
+use compiler.artifact.axmi.AXMI_SEC_DEFAULT_FLAGS
+use compiler.artifact.axmi.AXMI_SEC_FLAG_OPTIONAL
+use compiler.artifact.axmi.AXMI_SEC_GENERIC_MIR
+use compiler.artifact.axmi.AXMI_SEC_LTO_SUMMARY
+use compiler.artifact.axmi.AXMI_SEC_STRINGS
+use compiler.artifact.axmi.AXMI_SECTION_DESC_SIZE
+use compiler.artifact.axmi.AXMI_STATUS_OK
+use compiler.artifact.axmi.AX_ART_CHECKSUM_MISMATCH
+use compiler.artifact.axmi.AX_ART_CORRUPT_HEADER
+use compiler.artifact.axmi.AX_ART_TARGET_MISMATCH
+use compiler.artifact.axmi.AX_ART_VERSION_MISMATCH
+use compiler.artifact.axmi.AX_LINK_ARTIFACT_SCHEMA_MISMATCH
+use compiler.artifact.axmi.AX_LINK_ARTIFACT_TARGET_MISMATCH
+use compiler.artifact.axmi.AX_LINK_BAD_ARTIFACT
+use compiler.artifact.axmi.ArtifactHeader
+use compiler.artifact.axmi.ArtifactId
+use compiler.artifact.axmi.AxmiBuffer
+use compiler.artifact.axmi.AxmiCustomSection
+use compiler.artifact.axmi.AxmiDeserializeResult
+use compiler.artifact.axmi.AxmiModuleInterface
+use compiler.artifact.axmi.AxmiTargetExpectation
+use compiler.artifact.axmi.SectionDescriptor
+use compiler.artifact.axmi.axmi_buf_align_to
+use compiler.artifact.axmi.axmi_buf_empty
+use compiler.artifact.axmi.axmi_buf_free
+use compiler.artifact.axmi.axmi_buf_init
+use compiler.artifact.axmi.axmi_buf_patch_fp128_le
+use compiler.artifact.axmi.axmi_buf_patch_u32_le
+use compiler.artifact.axmi.axmi_buf_patch_u64_le
+use compiler.artifact.axmi.axmi_buf_push_bytes
+use compiler.artifact.axmi.axmi_buf_push_fp128_le
+use compiler.artifact.axmi.axmi_buf_push_u16_le
+use compiler.artifact.axmi.axmi_buf_push_u32_le
+use compiler.artifact.axmi.axmi_buf_push_u64_le
+use compiler.artifact.axmi.axmi_buf_push_u8
+use compiler.artifact.axmi.axmi_check_bounds
+use compiler.artifact.axmi.axmi_compute_target_fingerprint
+use compiler.artifact.axmi.axmi_deserialize
+use compiler.artifact.axmi.axmi_hasher_finish
+use compiler.artifact.axmi.axmi_hasher_new
+use compiler.artifact.axmi.axmi_hasher_write_bytes
+use compiler.artifact.axmi.axmi_hasher_write_fp128
+use compiler.artifact.axmi.axmi_hasher_write_semantic_key
+use compiler.artifact.axmi.axmi_hasher_write_sv
+use compiler.artifact.axmi.axmi_hasher_write_u32
+use compiler.artifact.axmi.axmi_hasher_write_u64
+use compiler.artifact.axmi.axmi_hasher_write_u8
+use compiler.artifact.axmi.axmi_interface_empty
+use compiler.artifact.axmi.axmi_interface_free
+use compiler.artifact.axmi.axmi_interface_init
+use compiler.artifact.axmi.axmi_is_power_of_two_align
+use compiler.artifact.axmi.axmi_push_bool
+use compiler.artifact.axmi.axmi_push_canonical_link_diag_name
+use compiler.artifact.axmi.axmi_push_diag_status_name
+use compiler.artifact.axmi.axmi_push_fp128_hex
+use compiler.artifact.axmi.axmi_push_hex_u64
+use compiler.artifact.axmi.axmi_read_fp128_le
+use compiler.artifact.axmi.axmi_read_u16_le
+use compiler.artifact.axmi.axmi_read_u32_le
+use compiler.artifact.axmi.axmi_read_u64_le
+use compiler.artifact.axmi.axmi_read_u8
+use compiler.artifact.axmi.axmi_serialize
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+
+// ============================================================================
+// 1. Canonical Container Magic Bytes, Format Families & COFF/PE Constants
+// ============================================================================
+
+// `.axmir`: "AXMIR001" (little-endian u64 = 0x31303052494D5841)
+pub const AXMIR_MAGIC: [8]u8 = [65u8, 88u8, 77u8, 73u8, 82u8, 48u8, 48u8, 49u8];
+pub const AXMIR_MAGIC_U64: u64 = 0x31303052494D5841u64;
+pub const AXMIR_FORMAT_FAMILY: u16 = 2u16;
+pub const AXMIR_ARTIFACT_KIND: u16 = 2u16;
+
+// `.axlto`: "AXLTO001" (little-endian u64 = 0x3130304F544C5841)
+pub const AXLTO_MAGIC: [8]u8 = [65u8, 88u8, 76u8, 84u8, 79u8, 48u8, 48u8, 49u8];
+pub const AXLTO_MAGIC_U64: u64 = 0x3130304F544C5841u64;
+pub const AXLTO_FORMAT_FAMILY: u16 = 3u16;
+pub const AXLTO_ARTIFACT_KIND: u16 = 3u16;
+
+// `.axmeta`: "AXMETA01" (little-endian u64 = 0x31304154454D5841)
+pub const AXMETA_MAGIC: [8]u8 = [65u8, 88u8, 77u8, 69u8, 84u8, 65u8, 48u8, 49u8];
+pub const AXMETA_MAGIC_U64: u64 = 0x31304154454D5841u64;
+pub const AXMETA_FORMAT_FAMILY: u16 = 4u16;
+pub const AXMETA_ARTIFACT_KIND: u16 = 4u16;
+
+// `.axdbg`: "AXDBG001" (little-endian u64 = 0x3130304742445841)
+pub const AXDBG_MAGIC: [8]u8 = [65u8, 88u8, 68u8, 66u8, 71u8, 48u8, 48u8, 49u8];
+pub const AXDBG_MAGIC_U64: u64 = 0x3130304742445841u64;
+pub const AXDBG_FORMAT_FAMILY: u16 = 5u16;
+pub const AXDBG_ARTIFACT_KIND: u16 = 5u16;
+
+// `.axpkg`: "AXPKG001" (little-endian u64 = 0x313030474B505841)
+pub const AXPKG_MAGIC: [8]u8 = [65u8, 88u8, 80u8, 75u8, 71u8, 48u8, 48u8, 49u8];
+pub const AXPKG_MAGIC_U64: u64 = 0x313030474B505841u64;
+pub const AXPKG_FORMAT_FAMILY: u16 = 6u16;
+pub const AXPKG_ARTIFACT_KIND: u16 = 6u16;
+
+// Package container section types
+pub const AXPKG_SEC_AXMI: u16 = 1u16;
+pub const AXPKG_SEC_AXMETA: u16 = 2u16;
+pub const AXPKG_SEC_AXLTO: u16 = 3u16;
+pub const AXPKG_SEC_COFF_OBJ: u16 = 4u16;
+
+// COFF & PE32+ constants (SPEC-24 sec.3 / AXS-ART-021..022)
+pub const COFF_MACHINE_AMD64: u16 = 0x8664u16;
+pub const COFF_FILE_HEADER_SIZE: usize = 20;
+pub const COFF_SECTION_HEADER_SIZE: usize = 40;
+pub const COFF_SYMBOL_SIZE: usize = 18;
+pub const COFF_ARCHIVE_MAGIC_SIZE: usize = 8;
+pub const COFF_ARCHIVE_MEMBER_HEADER_SIZE: usize = 60;
+
+pub const IMAGE_SCN_CNT_CODE: u32 = 0x00000020u32;
+pub const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040u32;
+pub const IMAGE_SCN_LNK_INFO: u32 = 0x00000200u32;
+pub const IMAGE_SCN_LNK_REMOVE: u32 = 0x00000800u32;
+pub const IMAGE_SCN_MEM_DISCARDABLE: u32 = 0x02000000u32;
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000u32;
+pub const IMAGE_SCN_MEM_READ: u32 = 0x40000000u32;
+pub const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000u32;
+
+pub const AX_COFF_TEXT_CHARS: u32 = 0x60000020u32;
+pub const AX_COFF_RDATA_CHARS: u32 = 0x40000040u32;
+pub const AX_COFF_DATA_CHARS: u32 = 0xC0000040u32;
+// Canonical SPEC-24 sec.3.2 non-alloc discardable COFF characteristics:
+// IMAGE_SCN_LNK_INFO | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_MEM_READ (0x42000200)
+pub const AX_COFF_CONTAINER_CHARS: u32 = 0x42000200u32;
+
+pub const PE_IMAGE_KIND_EXE: u8 = 1u8;
+pub const PE_IMAGE_KIND_DLL: u8 = 2u8;
+pub const PE_OPT_HDR64_MAGIC: u16 = 0x020Bu16;
+pub const PE_OPT_HDR64_SIZE: usize = 240;
+
+// LTO linkage & root kind constants (SPEC-24 sec.3.1 / SPEC-75)
+pub const AXLTO_LINK_PUBLIC: u8 = 0u8;
+pub const AXLTO_LINK_INTERNAL: u8 = 1u8;
+pub const AXLTO_LINK_WEAK_ODR: u8 = 2u8;
+
+pub const AXLTO_ROOT_NONE: u8 = 0u8;
+pub const AXLTO_ROOT_ENTRY: u8 = 1u8;
+pub const AXLTO_ROOT_EXPORTED: u8 = 2u8;
+pub const AXLTO_ROOT_PINNED: u8 = 3u8;
+
+pub const AXLTO_MAX_FNS: usize = 64;
+pub const AXLTO_MAX_EDGES: usize = 64;
+pub const AXLTO_MAX_MIR_BODIES: usize = 32;
+pub const CONTAINER_MAX_COFF_SECTIONS: usize = 16;
+pub const CONTAINER_MAX_COFF_SYMBOLS: usize = 32;
+pub const CONTAINER_MAX_ARCHIVE_MEMBERS: usize = 16;
+
+// Canonical 8-byte COFF section names
+pub const COFF_NAME_TEXT: [8]u8 = [46u8, 116u8, 101u8, 120u8, 116u8, 0u8, 0u8, 0u8];
+pub const COFF_NAME_RDATA: [8]u8 = [46u8, 114u8, 100u8, 97u8, 116u8, 97u8, 0u8, 0u8];
+pub const COFF_NAME_DATA: [8]u8 = [46u8, 100u8, 97u8, 116u8, 97u8, 0u8, 0u8, 0u8];
+pub const COFF_NAME_AXMETA: [8]u8 = [46u8, 97u8, 120u8, 109u8, 101u8, 116u8, 97u8, 0u8];
+pub const COFF_NAME_AXLTO: [8]u8 = [46u8, 97u8, 120u8, 108u8, 116u8, 111u8, 0u8, 0u8];
+pub const COFF_NAME_AXMIR: [8]u8 = [46u8, 97u8, 120u8, 109u8, 105u8, 114u8, 0u8, 0u8];
+
+pub const COFF_NAME_TEXT_U64: u64 = 0x000000747865742Eu64;
+pub const COFF_NAME_RDATA_U64: u64 = 0x000061746164722Eu64;
+pub const COFF_NAME_DATA_U64: u64 = 0x000000617461642Eu64;
+pub const COFF_NAME_AXMETA_U64: u64 = 0x006174656D78612Eu64;
+pub const COFF_NAME_AXLTO_U64: u64 = 0x00006F746C78612Eu64;
+pub const COFF_NAME_AXMIR_U64: u64 = 0x000072696D78612Eu64;
+
+const CONTAINER_ASCII_TABLE: [714]u8 = [
+    99u8, 111u8, 110u8, 116u8, 97u8, 105u8, 110u8, 101u8, 114u8, 95u8, 111u8, 98u8, 106u8, 32u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8, 32u8, 114u8, 117u8, 110u8, 116u8, 105u8, 109u8, 101u8, 61u8, 32u8, 99u8, 111u8, 110u8, 116u8, 97u8, 105u8, 110u8, 101u8, 114u8, 61u8, 32u8, 102u8, 111u8, 114u8, 101u8, 105u8, 103u8, 110u8, 61u8, 32u8, 104u8, 97u8, 115u8, 95u8, 97u8, 120u8, 109u8, 101u8, 116u8, 97u8, 61u8, 32u8, 104u8, 97u8, 115u8, 95u8, 97u8, 120u8, 108u8, 116u8, 111u8, 61u8, 32u8, 104u8, 97u8, 115u8, 95u8, 97u8, 120u8, 109u8, 105u8, 114u8, 61u8, 32u8, 99u8, 104u8, 97u8, 114u8, 115u8, 95u8, 109u8, 101u8, 116u8, 97u8, 61u8, 32u8, 99u8, 104u8, 97u8, 114u8, 115u8, 95u8, 108u8, 116u8, 111u8, 61u8, 97u8, 120u8, 109u8, 101u8, 116u8, 97u8, 95u8, 104u8, 101u8, 97u8, 100u8, 101u8, 114u8, 32u8, 109u8, 97u8, 103u8, 105u8, 99u8, 61u8, 65u8, 88u8, 77u8, 69u8, 84u8, 65u8, 48u8, 49u8, 32u8, 118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 61u8, 32u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8, 32u8, 105u8, 110u8, 116u8, 101u8, 114u8, 102u8, 97u8, 99u8, 101u8, 95u8, 102u8, 112u8, 61u8, 32u8, 97u8, 98u8, 105u8, 95u8, 102u8, 112u8, 61u8, 32u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8, 95u8, 102u8, 112u8, 61u8, 32u8, 99u8, 111u8, 110u8, 116u8, 101u8, 110u8, 116u8, 95u8, 104u8, 97u8, 115u8, 104u8, 61u8, 97u8, 120u8, 108u8, 116u8, 111u8, 95u8, 104u8, 101u8, 97u8, 100u8, 101u8, 114u8, 32u8, 109u8, 97u8, 103u8, 105u8, 99u8, 61u8, 65u8, 88u8, 76u8, 84u8, 79u8, 48u8, 48u8, 49u8, 32u8, 118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 61u8, 32u8, 102u8, 110u8, 115u8, 61u8, 32u8, 101u8, 100u8, 103u8, 101u8, 115u8, 61u8, 32u8, 109u8, 105u8, 114u8, 95u8, 98u8, 111u8, 100u8, 105u8, 101u8, 115u8, 61u8, 32u8, 108u8, 116u8, 111u8, 95u8, 102u8, 112u8, 61u8, 108u8, 116u8, 111u8, 95u8, 102u8, 110u8, 32u8, 32u8, 108u8, 105u8, 110u8, 107u8, 97u8, 103u8, 101u8, 61u8, 32u8, 114u8, 111u8, 111u8, 116u8, 61u8, 32u8, 105u8, 110u8, 115u8, 116u8, 115u8, 61u8, 32u8, 119u8, 101u8, 105u8, 103u8, 104u8, 116u8, 61u8, 32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 61u8, 32u8, 101u8, 102u8, 102u8, 101u8, 99u8, 116u8, 115u8, 61u8, 32u8, 101u8, 115u8, 99u8, 97u8, 112u8, 101u8, 61u8, 32u8, 97u8, 108u8, 105u8, 97u8, 115u8, 61u8, 32u8, 115u8, 112u8, 101u8, 99u8, 95u8, 107u8, 101u8, 121u8, 61u8, 32u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 61u8, 108u8, 116u8, 111u8, 95u8, 101u8, 100u8, 103u8, 101u8, 32u8, 99u8, 97u8, 108u8, 108u8, 101u8, 114u8, 61u8, 32u8, 99u8, 97u8, 108u8, 108u8, 101u8, 101u8, 61u8, 32u8, 115u8, 105u8, 116u8, 101u8, 115u8, 61u8, 32u8, 104u8, 111u8, 116u8, 110u8, 101u8, 115u8, 115u8, 61u8, 32u8, 100u8, 105u8, 114u8, 101u8, 99u8, 116u8, 61u8, 32u8, 99u8, 97u8, 110u8, 95u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 61u8, 108u8, 116u8, 111u8, 95u8, 109u8, 105u8, 114u8, 32u8, 32u8, 115u8, 99u8, 104u8, 101u8, 109u8, 97u8, 61u8, 32u8, 98u8, 108u8, 111u8, 99u8, 107u8, 115u8, 61u8, 32u8, 108u8, 111u8, 99u8, 97u8, 108u8, 115u8, 61u8, 32u8, 111u8, 112u8, 99u8, 111u8, 100u8, 101u8, 115u8, 61u8, 32u8, 118u8, 101u8, 114u8, 105u8, 102u8, 105u8, 101u8, 100u8, 61u8, 112u8, 101u8, 95u8, 108u8, 105u8, 110u8, 107u8, 32u8, 107u8, 105u8, 110u8, 100u8, 61u8, 101u8, 120u8, 101u8, 100u8, 108u8, 108u8, 32u8, 111u8, 98u8, 106u8, 115u8, 61u8, 32u8, 97u8, 120u8, 105u8, 111u8, 109u8, 95u8, 111u8, 98u8, 106u8, 115u8, 61u8, 32u8, 102u8, 111u8, 114u8, 101u8, 105u8, 103u8, 110u8, 95u8, 111u8, 98u8, 106u8, 115u8, 61u8, 32u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 115u8, 101u8, 99u8, 115u8, 61u8, 32u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8, 116u8, 101u8, 120u8, 116u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8, 114u8, 100u8, 97u8, 116u8, 97u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 61u8, 32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 61u8, 32u8, 112u8, 101u8, 95u8, 99u8, 108u8, 101u8, 97u8, 110u8, 61u8, 97u8, 114u8, 99u8, 104u8, 105u8, 118u8, 101u8, 32u8, 109u8, 101u8, 109u8, 98u8, 101u8, 114u8, 115u8, 61u8, 112u8, 117u8, 98u8, 105u8, 110u8, 116u8, 101u8, 114u8, 110u8, 97u8, 108u8, 119u8, 101u8, 97u8, 107u8, 95u8, 111u8, 100u8, 114u8, 110u8, 111u8, 110u8, 101u8, 101u8, 110u8, 116u8, 114u8, 121u8, 101u8, 120u8, 112u8, 111u8, 114u8, 116u8, 101u8, 100u8, 112u8, 105u8, 110u8, 110u8, 101u8, 100u8, 97u8, 120u8, 112u8, 107u8, 103u8, 95u8, 104u8, 101u8, 97u8, 100u8, 101u8, 114u8, 32u8, 109u8, 97u8, 103u8, 105u8, 99u8, 61u8, 65u8, 88u8, 80u8, 75u8, 71u8, 48u8, 48u8, 49u8, 32u8, 118u8, 101u8, 114u8, 115u8, 105u8, 111u8, 110u8, 61u8, 32u8, 111u8, 98u8, 106u8, 95u8, 115u8, 105u8, 122u8, 101u8, 61u8
+];
+
+fn container_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+fn container_push_ascii_slice(out: mut_view<DiagBuffer>, start: usize, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        diag_buf_push_byte(mut_view(*out), CONTAINER_ASCII_TABLE[start + i]);
+        i = i + 1;
+    }
+}
+
+pub fn container_compute_section_checksum(ptr: *const u8, offset: usize, size: usize) -> Fingerprint128 {
+    let mut h = axmi_hasher_new(1u8);
+    axmi_hasher_write_bytes(mut_view(h), unsafe { ptr + offset }, size);
+    axmi_hasher_finish(view(h))
+}
+
+pub fn container_compute_content_hash(ptr: *const u8, total_len: usize) -> Fingerprint128 {
+    let mut h = axmi_hasher_new(0u8);
+    axmi_hasher_write_bytes(mut_view(h), ptr, 48);
+    if total_len > AXMI_HEADER_SIZE {
+        axmi_hasher_write_bytes(mut_view(h), unsafe { ptr + AXMI_HEADER_SIZE }, total_len - AXMI_HEADER_SIZE);
+    }
+    axmi_hasher_finish(view(h))
+}
+
+fn container_fail_result(
+    status: u32,
+    canonical_code: u32,
+    schema_id: u16,
+    found_ver: u16,
+    bad_sec: u16
+) -> AxmiDeserializeResult {
+    AxmiDeserializeResult {
+        status: status,
+        canonical_diag_code: canonical_code,
+        found_version: found_ver,
+        expected_version: AXMI_FORMAT_VERSION,
+        bad_section_type: bad_sec,
+        artifact_id: ArtifactId {
+            content_hash: fingerprint128_zero(),
+            schema_id: schema_id,
+            schema_version: found_ver,
+        },
+    }
+}
+
+// ============================================================================
+// 2. `.axmeta` Section Serializer & Schema-Versioned Fail-Closed Reader
+// ============================================================================
+
+pub fn axmeta_serialize(iface: mut_view<AxmiModuleInterface>, out: mut_view<AxmiBuffer>) -> ArtifactId {
+    let _ = axmi_serialize(mut_view(*iface), mut_view(*out));
+    let mut mi: usize = 0;
+    while mi < 8 {
+        unsafe { *(out.ptr + mi) = AXMETA_MAGIC[mi]; }
+        mi = mi + 1;
+    }
+    unsafe {
+        *(out.ptr + 8) = (AXMETA_FORMAT_FAMILY & 0xFFu16) as u8;
+        *(out.ptr + 9) = ((AXMETA_FORMAT_FAMILY >> 8u16) & 0xFFu16) as u8;
+        *(out.ptr + 12) = (AXMETA_ARTIFACT_KIND & 0xFFu16) as u8;
+        *(out.ptr + 13) = ((AXMETA_ARTIFACT_KIND >> 8u16) & 0xFFu16) as u8;
+    }
+    let content_hash = container_compute_content_hash(out.ptr as *const u8, out.len);
+    axmi_buf_patch_fp128_le(mut_view(*out), 48, content_hash);
+
+    iface.header.magic = AXMETA_MAGIC;
+    iface.header.format_family = AXMETA_FORMAT_FAMILY;
+    iface.header.artifact_kind = AXMETA_ARTIFACT_KIND;
+    iface.header.content_hash = content_hash;
+
+    ArtifactId {
+        content_hash: content_hash,
+        schema_id: AXMETA_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+    }
+}
+
+pub fn axmeta_deserialize(
+    bytes: *const u8,
+    total_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_iface: mut_view<AxmiModuleInterface>
+) -> AxmiDeserializeResult {
+    if (bytes as usize) == 0 || total_len < AXMI_HEADER_SIZE {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, 0u16, 0u16);
+    }
+
+    let magic_u64 = axmi_read_u64_le(bytes, 0);
+    if magic_u64 != AXMETA_MAGIC_U64 {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, 0u16, 0u16);
+    }
+
+    let format_family = axmi_read_u16_le(bytes, 8);
+    let schema_version = axmi_read_u16_le(bytes, 10);
+    let artifact_kind = axmi_read_u16_le(bytes, 12);
+    let flags = axmi_read_u16_le(bytes, 14);
+
+    if format_family != AXMETA_FORMAT_FAMILY || artifact_kind != AXMETA_ARTIFACT_KIND {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+    if (flags & AXMI_FLAG_LITTLE_ENDIAN) == 0u16 {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+    if schema_version != AXMI_FORMAT_VERSION {
+        return container_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+
+    let section_count = axmi_read_u32_le(bytes, 32);
+    let payload_offset = axmi_read_u32_le(bytes, 40) as u64;
+    let payload_size = axmi_read_u32_le(bytes, 44) as u64;
+    let stored_content_hash = axmi_read_fp128_le(bytes, 48);
+
+    if section_count == 0u32 || (section_count as usize) > AXMI_MAX_SECTIONS {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+    let expected_payload_off = (AXMI_HEADER_SIZE as u64) + ((section_count as u64) * (AXMI_SECTION_DESC_SIZE as u64));
+    if payload_offset != expected_payload_off {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+    if !axmi_check_bounds(AXMI_HEADER_SIZE as u64, payload_size, total_len as u64) {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+    if ((AXMI_HEADER_SIZE as u64) + payload_size) != (total_len as u64) {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+
+    let computed_content_hash = container_compute_content_hash(bytes, total_len);
+    if !fingerprint128_eq(stored_content_hash, computed_content_hash) {
+        return container_fail_result(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, AXMETA_FORMAT_FAMILY, schema_version, 0u16);
+    }
+
+    let mut tmp = axmi_buf_empty();
+    axmi_buf_init(mut_view(tmp), total_len + 16);
+    axmi_buf_push_bytes(mut_view(tmp), bytes, total_len);
+    let mut mi: usize = 0;
+    while mi < 8 {
+        unsafe { *(tmp.ptr + mi) = AXMI_MAGIC[mi]; }
+        mi = mi + 1;
+    }
+    unsafe {
+        *(tmp.ptr + 8) = (AXMI_FORMAT_FAMILY & 0xFFu16) as u8;
+        *(tmp.ptr + 9) = ((AXMI_FORMAT_FAMILY >> 8u16) & 0xFFu16) as u8;
+        *(tmp.ptr + 12) = (AXMI_ARTIFACT_KIND & 0xFFu16) as u8;
+        *(tmp.ptr + 13) = ((AXMI_ARTIFACT_KIND >> 8u16) & 0xFFu16) as u8;
+    }
+    let tmp_hash = container_compute_content_hash(tmp.ptr as *const u8, tmp.len);
+    axmi_buf_patch_fp128_le(mut_view(tmp), 48, tmp_hash);
+
+    let mut res = axmi_deserialize(tmp.ptr as *const u8, tmp.len, expected_target, mut_view(*out_iface));
+    axmi_buf_free(mut_view(tmp));
+
+    if res.status == AXMI_STATUS_OK {
+        out_iface.header.magic = AXMETA_MAGIC;
+        out_iface.header.format_family = AXMETA_FORMAT_FAMILY;
+        out_iface.header.artifact_kind = AXMETA_ARTIFACT_KIND;
+        out_iface.header.content_hash = stored_content_hash;
+        res.artifact_id = ArtifactId {
+            content_hash: stored_content_hash,
+            schema_id: AXMETA_FORMAT_FAMILY,
+            schema_version: schema_version,
+        };
+    } else {
+        res.artifact_id.schema_id = AXMETA_FORMAT_FAMILY;
+    }
+    res
+}
+
+// ============================================================================
+// 3. `.axlto` & `.axmir` Data Model, Builder, Serializer & Fail-Closed Reader
+// ============================================================================
+
+@derive(Copy)
+pub struct AxLtoFnEntry {
+    pub def_id: DefId,
+    pub linkage_kind: u8,
+    pub root_kind: u8,
+    pub panic_contract: u8,
+    pub inline_hint: bool,
+    pub inst_count: u32,
+    pub inline_weight: u32,
+    pub effect_mask: u32,
+    pub authority_cap_mask: u32,
+    pub no_escape_mask: u32,
+    pub no_alias_mask: u32,
+    pub specialization_key: u64,
+    pub body_digest: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxLtoCallEdge {
+    pub caller_def_id: DefId,
+    pub callee_def_id: DefId,
+    pub call_site_count: u32,
+    pub hotness_weight: u32,
+    pub is_direct: bool,
+    pub can_inline: bool,
+    pub callee_key: SemanticKey,
+}
+
+@derive(Copy)
+pub struct AxLtoMirBody {
+    pub def_id: DefId,
+    pub mir_body_id: MirBodyId,
+    pub mir_schema_version: u16,
+    pub is_generic: bool,
+    pub is_inline: bool,
+    pub is_comptime: bool,
+    pub ownership_verified: bool,
+    pub param_count: u32,
+    pub block_count: u32,
+    pub local_count: u32,
+    pub inst_count: u32,
+    pub opcode_len: u32,
+    pub opcodes: [8]u8,
+    pub body_digest: Fingerprint128,
+    pub semantic_key: SemanticKey,
+}
+
+pub struct AxLtoContainer {
+    pub arena: Arena,
+    pub header: ArtifactHeader,
+    pub sections: *mut SectionDescriptor,
+    pub section_count: u32,
+
+    pub package_name: StrView,
+    pub module_path: StrView,
+    pub target_triple: StrView,
+    pub abi_profile: StrView,
+    pub pointer_width_bytes: u32,
+    pub little_endian: bool,
+    pub cpu_feature_mask: u32,
+    pub panic_strategy: u8,
+
+    pub target_fingerprint: Fingerprint128,
+    pub interface_fingerprint: Fingerprint128,
+    pub abi_fingerprint: Fingerprint128,
+    pub lto_summary_fingerprint: Fingerprint128,
+
+    pub string_table: *mut StrView,
+    pub string_count: u32,
+
+    pub functions: *mut AxLtoFnEntry,
+    pub function_count: u32,
+
+    pub call_edges: *mut AxLtoCallEdge,
+    pub call_edge_count: u32,
+
+    pub mir_bodies: *mut AxLtoMirBody,
+    pub mir_body_count: u32,
+
+    pub custom_sections: *mut AxmiCustomSection,
+    pub custom_section_count: u32,
+}
+
+pub fn axlto_container_empty() -> AxLtoContainer {
+    AxLtoContainer {
+        arena: arena_new(),
+        header: ArtifactHeader {
+            magic: AXLTO_MAGIC,
+            format_family: AXLTO_FORMAT_FAMILY,
+            schema_version: AXMI_FORMAT_VERSION,
+            artifact_kind: AXLTO_ARTIFACT_KIND,
+            flags: AXMI_DEFAULT_FLAGS | AXMI_FLAG_HAS_LTO,
+            target_fingerprint: fingerprint128_zero(),
+            interface_fingerprint: fingerprint128_zero(),
+            section_count: 0u32,
+            producer_version: AXMI_PRODUCER_VERSION,
+            payload_offset: 0u64,
+            payload_size: 0u64,
+            content_hash: fingerprint128_zero(),
+        },
+        sections: 0 as *mut SectionDescriptor,
+        section_count: 0u32,
+        package_name: qry_sv_empty(),
+        module_path: qry_sv_empty(),
+        target_triple: qry_sv_empty(),
+        abi_profile: qry_sv_empty(),
+        pointer_width_bytes: 8u32,
+        little_endian: true,
+        cpu_feature_mask: 0u32,
+        panic_strategy: AXMI_PANIC_NO_PANIC,
+        target_fingerprint: fingerprint128_zero(),
+        interface_fingerprint: fingerprint128_zero(),
+        abi_fingerprint: fingerprint128_zero(),
+        lto_summary_fingerprint: fingerprint128_zero(),
+        string_table: 0 as *mut StrView,
+        string_count: 0u32,
+        functions: 0 as *mut AxLtoFnEntry,
+        function_count: 0u32,
+        call_edges: 0 as *mut AxLtoCallEdge,
+        call_edge_count: 0u32,
+        mir_bodies: 0 as *mut AxLtoMirBody,
+        mir_body_count: 0u32,
+        custom_sections: 0 as *mut AxmiCustomSection,
+        custom_section_count: 0u32,
+    }
+}
+
+pub fn axlto_container_init(lto: mut_view<AxLtoContainer>) {
+    lto.arena = arena_new();
+    lto.header = ArtifactHeader {
+        magic: AXLTO_MAGIC,
+        format_family: AXLTO_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+        artifact_kind: AXLTO_ARTIFACT_KIND,
+        flags: AXMI_DEFAULT_FLAGS | AXMI_FLAG_HAS_LTO,
+        target_fingerprint: fingerprint128_zero(),
+        interface_fingerprint: fingerprint128_zero(),
+        section_count: 0u32,
+        producer_version: AXMI_PRODUCER_VERSION,
+        payload_offset: 0u64,
+        payload_size: 0u64,
+        content_hash: fingerprint128_zero(),
+    };
+
+    let sec_bytes = AXMI_MAX_SECTIONS * size_of<SectionDescriptor>();
+    lto.sections = arena_alloc_raw(mut_view(lto.arena), sec_bytes, align_of<SectionDescriptor>()) as *mut SectionDescriptor;
+    container_zero_bytes(lto.sections as *mut u8, sec_bytes);
+    lto.section_count = 0u32;
+
+    let str_bytes = AXMI_MAX_STRINGS * size_of<StrView>();
+    lto.string_table = arena_alloc_raw(mut_view(lto.arena), str_bytes, align_of<StrView>()) as *mut StrView;
+    container_zero_bytes(lto.string_table as *mut u8, str_bytes);
+    lto.string_count = 0u32;
+
+    let fn_bytes = AXLTO_MAX_FNS * size_of<AxLtoFnEntry>();
+    lto.functions = arena_alloc_raw(mut_view(lto.arena), fn_bytes, align_of<AxLtoFnEntry>()) as *mut AxLtoFnEntry;
+    container_zero_bytes(lto.functions as *mut u8, fn_bytes);
+    lto.function_count = 0u32;
+
+    let ed_bytes = AXLTO_MAX_EDGES * size_of<AxLtoCallEdge>();
+    lto.call_edges = arena_alloc_raw(mut_view(lto.arena), ed_bytes, align_of<AxLtoCallEdge>()) as *mut AxLtoCallEdge;
+    container_zero_bytes(lto.call_edges as *mut u8, ed_bytes);
+    lto.call_edge_count = 0u32;
+
+    let mir_bytes = AXLTO_MAX_MIR_BODIES * size_of<AxLtoMirBody>();
+    lto.mir_bodies = arena_alloc_raw(mut_view(lto.arena), mir_bytes, align_of<AxLtoMirBody>()) as *mut AxLtoMirBody;
+    container_zero_bytes(lto.mir_bodies as *mut u8, mir_bytes);
+    lto.mir_body_count = 0u32;
+
+    let csec_bytes = AXMI_MAX_CUSTOM_SECTIONS * size_of<AxmiCustomSection>();
+    lto.custom_sections = arena_alloc_raw(mut_view(lto.arena), csec_bytes, align_of<AxmiCustomSection>()) as *mut AxmiCustomSection;
+    container_zero_bytes(lto.custom_sections as *mut u8, csec_bytes);
+    lto.custom_section_count = 0u32;
+
+    lto.package_name = qry_sv_empty();
+    lto.module_path = qry_sv_empty();
+    lto.target_triple = qry_sv_empty();
+    lto.abi_profile = qry_sv_empty();
+    lto.pointer_width_bytes = 8u32;
+    lto.little_endian = true;
+    lto.cpu_feature_mask = 0u32;
+    lto.panic_strategy = AXMI_PANIC_NO_PANIC;
+
+    lto.target_fingerprint = fingerprint128_zero();
+    lto.interface_fingerprint = fingerprint128_zero();
+    lto.abi_fingerprint = fingerprint128_zero();
+    lto.lto_summary_fingerprint = fingerprint128_zero();
+}
+
+pub fn axlto_container_free(lto: mut_view<AxLtoContainer>) {
+    arena_destroy(mut_view(lto.arena));
+    lto.sections = 0 as *mut SectionDescriptor;
+    lto.string_table = 0 as *mut StrView;
+    lto.functions = 0 as *mut AxLtoFnEntry;
+    lto.call_edges = 0 as *mut AxLtoCallEdge;
+    lto.mir_bodies = 0 as *mut AxLtoMirBody;
+    lto.custom_sections = 0 as *mut AxmiCustomSection;
+}
+
+pub fn axlto_intern_bytes(lto: mut_view<AxLtoContainer>, ptr: *const u8, len: usize) -> StrView {
+    if len == 0 || (ptr as usize) == 0 {
+        return qry_sv_empty();
+    }
+    let dst = arena_alloc_raw(mut_view(lto.arena), len + 1, 1);
+    let mut i: usize = 0;
+    while i < len {
+        unsafe { *(dst + i) = *(ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(dst + len) = 0u8; }
+    StrView { ptr: dst as *const u8, len: len }
+}
+
+pub fn axlto_intern_sv(lto: mut_view<AxLtoContainer>, sv: StrView) -> StrView {
+    axlto_intern_bytes(lto, sv.ptr, sv.len)
+}
+
+pub fn axlto_intern_semantic_key(lto: mut_view<AxLtoContainer>, sk: SemanticKey) -> SemanticKey {
+    SemanticKey {
+        package_name: axlto_intern_sv(mut_view(*lto), sk.package_name),
+        module_path: axlto_intern_sv(mut_view(*lto), sk.module_path),
+        item_namespace: sk.item_namespace,
+        disambiguator_index: sk.disambiguator_index,
+        canonical_name: axlto_intern_sv(mut_view(*lto), sk.canonical_name),
+        canonical_type_args: axlto_intern_sv(mut_view(*lto), sk.canonical_type_args),
+    }
+}
+
+pub fn axlto_get_or_add_string_id(lto: mut_view<AxLtoContainer>, sv: StrView) -> u32 {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return 0u32;
+    }
+    let mut i: u32 = 0u32;
+    while i < lto.string_count {
+        let cur = unsafe { *(lto.string_table + (i as usize)) };
+        if qry_sv_eq(cur, sv) {
+            return i + 1u32;
+        }
+        i = i + 1u32;
+    }
+    let idx = lto.string_count as usize;
+    if idx >= AXMI_MAX_STRINGS {
+        return AXMI_MAX_STRINGS as u32;
+    }
+    let interned = axlto_intern_sv(mut_view(*lto), sv);
+    unsafe { *(lto.string_table + idx) = interned; }
+    lto.string_count = (idx as u32) + 1u32;
+    (idx as u32) + 1u32
+}
+
+pub fn axlto_string_by_id(lto: view<AxLtoContainer>, str_id: u32) -> StrView {
+    if str_id == 0u32 || str_id > lto.string_count {
+        return qry_sv_empty();
+    }
+    unsafe { *(lto.string_table + ((str_id - 1u32) as usize)) }
+}
+
+pub fn axlto_bind_to_interface(lto: mut_view<AxLtoContainer>, iface: view<AxmiModuleInterface>) {
+    lto.package_name = axlto_intern_sv(mut_view(*lto), iface.package_name);
+    lto.module_path = axlto_intern_sv(mut_view(*lto), iface.module_path);
+    lto.target_triple = axlto_intern_sv(mut_view(*lto), iface.target_triple);
+    lto.abi_profile = axlto_intern_sv(mut_view(*lto), iface.abi_profile);
+    lto.pointer_width_bytes = iface.pointer_width_bytes;
+    lto.little_endian = iface.little_endian;
+    lto.cpu_feature_mask = iface.cpu_feature_mask;
+    lto.panic_strategy = iface.panic_strategy;
+    lto.target_fingerprint = iface.target_fingerprint;
+    lto.interface_fingerprint = iface.interface_fingerprint;
+    lto.abi_fingerprint = iface.abi_fingerprint;
+}
+
+pub fn axlto_add_fn_summary(
+    lto: mut_view<AxLtoContainer>,
+    def_id: DefId,
+    linkage_kind: u8,
+    root_kind: u8,
+    panic_contract: u8,
+    inline_hint: bool,
+    inst_count: u32,
+    inline_weight: u32,
+    effect_mask: u32,
+    authority_cap_mask: u32,
+    no_escape_mask: u32,
+    no_alias_mask: u32,
+    specialization_key: u64,
+    body_seed: u64,
+    semantic_key: SemanticKey
+) -> bool {
+    let idx = lto.function_count as usize;
+    if idx >= AXLTO_MAX_FNS {
+        return false;
+    }
+    let sk = axlto_intern_semantic_key(mut_view(*lto), semantic_key);
+    let mut h_fn = axmi_hasher_new(5u8);
+    axmi_hasher_write_semantic_key(mut_view(h_fn), view(sk));
+    axmi_hasher_write_u8(mut_view(h_fn), linkage_kind);
+    axmi_hasher_write_u8(mut_view(h_fn), root_kind);
+    axmi_hasher_write_u8(mut_view(h_fn), panic_contract);
+    axmi_hasher_write_u8(mut_view(h_fn), if inline_hint { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h_fn), inst_count);
+    axmi_hasher_write_u32(mut_view(h_fn), inline_weight);
+    axmi_hasher_write_u32(mut_view(h_fn), effect_mask);
+    axmi_hasher_write_u32(mut_view(h_fn), authority_cap_mask);
+    axmi_hasher_write_u32(mut_view(h_fn), no_escape_mask);
+    axmi_hasher_write_u32(mut_view(h_fn), no_alias_mask);
+    axmi_hasher_write_u64(mut_view(h_fn), specialization_key);
+    axmi_hasher_write_u64(mut_view(h_fn), body_seed);
+    let digest = axmi_hasher_finish(view(h_fn));
+
+    unsafe {
+        *(lto.functions + idx) = AxLtoFnEntry {
+            def_id: def_id,
+            linkage_kind: linkage_kind,
+            root_kind: root_kind,
+            panic_contract: panic_contract,
+            inline_hint: inline_hint,
+            inst_count: inst_count,
+            inline_weight: inline_weight,
+            effect_mask: effect_mask,
+            authority_cap_mask: authority_cap_mask,
+            no_escape_mask: no_escape_mask,
+            no_alias_mask: no_alias_mask,
+            specialization_key: specialization_key,
+            body_digest: digest,
+            semantic_key: sk,
+        };
+    }
+    lto.function_count = (idx as u32) + 1u32;
+    true
+}
+
+pub fn axlto_add_call_edge(
+    lto: mut_view<AxLtoContainer>,
+    caller_def_id: DefId,
+    callee_def_id: DefId,
+    call_site_count: u32,
+    hotness_weight: u32,
+    is_direct: bool,
+    can_inline: bool,
+    callee_key: SemanticKey
+) -> bool {
+    let idx = lto.call_edge_count as usize;
+    if idx >= AXLTO_MAX_EDGES {
+        return false;
+    }
+    let ck = axlto_intern_semantic_key(mut_view(*lto), callee_key);
+    unsafe {
+        *(lto.call_edges + idx) = AxLtoCallEdge {
+            caller_def_id: caller_def_id,
+            callee_def_id: callee_def_id,
+            call_site_count: call_site_count,
+            hotness_weight: hotness_weight,
+            is_direct: is_direct,
+            can_inline: can_inline,
+            callee_key: ck,
+        };
+    }
+    lto.call_edge_count = (idx as u32) + 1u32;
+    true
+}
+
+pub fn axlto_add_mir_body(
+    lto: mut_view<AxLtoContainer>,
+    def_id: DefId,
+    mir_body_id: MirBodyId,
+    mir_schema_version: u16,
+    is_generic: bool,
+    is_inline: bool,
+    is_comptime: bool,
+    ownership_verified: bool,
+    param_count: u32,
+    block_count: u32,
+    local_count: u32,
+    inst_count: u32,
+    opcodes_ptr: *const u8,
+    opcode_len: u32,
+    semantic_key: SemanticKey
+) -> bool {
+    // INV-PIPE-002 / AXS-ART-024: Only ownership-verified MIR bodies may be added to `.axlto`.
+    if !ownership_verified || block_count == 0u32 || local_count == 0u32 {
+        return false;
+    }
+    let idx = lto.mir_body_count as usize;
+    if idx >= AXLTO_MAX_MIR_BODIES {
+        return false;
+    }
+    let sk = axlto_intern_semantic_key(mut_view(*lto), semantic_key);
+    let eff_len: u32 = if opcode_len > 8u32 { 8u32 } else { opcode_len };
+    let mut ops: [8]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+    let mut k: usize = 0;
+    while k < (eff_len as usize) {
+        if (opcodes_ptr as usize) != 0 {
+            ops[k] = unsafe { *(opcodes_ptr + k) };
+        }
+        k = k + 1;
+    }
+
+    let mut h_mir = axmi_hasher_new(5u8);
+    axmi_hasher_write_semantic_key(mut_view(h_mir), view(sk));
+    axmi_hasher_write_u32(mut_view(h_mir), mir_schema_version as u32);
+    axmi_hasher_write_u8(mut_view(h_mir), if is_generic { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_mir), if is_inline { 1u8 } else { 0u8 });
+    axmi_hasher_write_u8(mut_view(h_mir), if is_comptime { 1u8 } else { 0u8 });
+    axmi_hasher_write_u32(mut_view(h_mir), param_count);
+    axmi_hasher_write_u32(mut_view(h_mir), block_count);
+    axmi_hasher_write_u32(mut_view(h_mir), local_count);
+    axmi_hasher_write_u32(mut_view(h_mir), inst_count);
+    axmi_hasher_write_u32(mut_view(h_mir), eff_len);
+    let mut bi: usize = 0;
+    while bi < (eff_len as usize) {
+        axmi_hasher_write_u8(mut_view(h_mir), ops[bi]);
+        bi = bi + 1;
+    }
+    let digest = axmi_hasher_finish(view(h_mir));
+
+    unsafe {
+        *(lto.mir_bodies + idx) = AxLtoMirBody {
+            def_id: def_id,
+            mir_body_id: mir_body_id,
+            mir_schema_version: mir_schema_version,
+            is_generic: is_generic,
+            is_inline: is_inline,
+            is_comptime: is_comptime,
+            ownership_verified: ownership_verified,
+            param_count: param_count,
+            block_count: block_count,
+            local_count: local_count,
+            inst_count: inst_count,
+            opcode_len: eff_len,
+            opcodes: ops,
+            body_digest: digest,
+            semantic_key: sk,
+        };
+    }
+    lto.mir_body_count = (idx as u32) + 1u32;
+    true
+}
+
+pub fn axlto_add_custom_section(
+    lto: mut_view<AxLtoContainer>,
+    id: u32,
+    section_type: u16,
+    flags: u16,
+    payload_tag: u64
+) {
+    let idx = lto.custom_section_count as usize;
+    if idx >= AXMI_MAX_CUSTOM_SECTIONS {
+        return;
+    }
+    unsafe {
+        *(lto.custom_sections + idx) = AxmiCustomSection {
+            id: id,
+            section_type: section_type,
+            flags: flags,
+            payload_tag: payload_tag,
+        };
+    }
+    lto.custom_section_count = (idx as u32) + 1u32;
+}
+
+
+// ============================================================================
+// 4. `.axlto` & `.axmir` Canonical Sorting, Serializer & Fail-Closed Reader
+// ============================================================================
+
+pub fn axlto_sort_tables(lto: mut_view<AxLtoContainer>) {
+    // 1. Sort functions by SemanticKey
+    let fn_n = lto.function_count as usize;
+    let mut a: usize = 1;
+    while a < fn_n {
+        let cur = unsafe { *(lto.functions + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(lto.functions + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(lto.functions + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(lto.functions + b) = cur; }
+        a = a + 1;
+    }
+
+    // 2. Sort MIR bodies by SemanticKey
+    let mir_n = lto.mir_body_count as usize;
+    a = 1;
+    while a < mir_n {
+        let cur = unsafe { *(lto.mir_bodies + a) };
+        let mut b: usize = a;
+        while b > 0 {
+            let prev = unsafe { *(lto.mir_bodies + (b - 1)) };
+            if semantic_key_cmp(view(prev.semantic_key), view(cur.semantic_key)) <= 0i32 {
+                break;
+            }
+            unsafe { *(lto.mir_bodies + b) = prev; }
+            b = b - 1;
+        }
+        unsafe { *(lto.mir_bodies + b) = cur; }
+        a = a + 1;
+    }
+
+    // 3. Sort call edges by (caller_def_id.v, callee_key)
+    let ed_n = lto.call_edges as usize;
+    if ed_n != 0 {
+        let ecnt = lto.call_edge_count as usize;
+        a = 1;
+        while a < ecnt {
+            let cur = unsafe { *(lto.call_edges + a) };
+            let mut b: usize = a;
+            while b > 0 {
+                let prev = unsafe { *(lto.call_edges + (b - 1)) };
+                let cmp_c: i32 = if (prev.caller_def_id.v) < (cur.caller_def_id.v) {
+                    -1i32
+                } else if (prev.caller_def_id.v) > (cur.caller_def_id.v) {
+                    1i32
+                } else {
+                    semantic_key_cmp(view(prev.callee_key), view(cur.callee_key))
+                };
+                if cmp_c <= 0i32 {
+                    break;
+                }
+                unsafe { *(lto.call_edges + b) = prev; }
+                b = b - 1;
+            }
+            unsafe { *(lto.call_edges + b) = cur; }
+            a = a + 1;
+        }
+    }
+}
+
+pub fn axlto_recompute_fingerprints(lto: mut_view<AxLtoContainer>) {
+    axlto_sort_tables(mut_view(*lto));
+    lto.target_fingerprint = axmi_compute_target_fingerprint(
+        lto.target_triple,
+        lto.abi_profile,
+        lto.pointer_width_bytes,
+        lto.little_endian,
+        lto.cpu_feature_mask,
+        lto.panic_strategy
+    );
+
+    let mut h_lto = axmi_hasher_new(5u8);
+    axmi_hasher_write_sv(mut_view(h_lto), lto.package_name);
+    axmi_hasher_write_sv(mut_view(h_lto), lto.module_path);
+    axmi_hasher_write_fp128(mut_view(h_lto), lto.target_fingerprint);
+    axmi_hasher_write_fp128(mut_view(h_lto), lto.interface_fingerprint);
+    axmi_hasher_write_fp128(mut_view(h_lto), lto.abi_fingerprint);
+
+    let mut i: usize = 0;
+    while i < (lto.function_count as usize) {
+        let f = unsafe { *(lto.functions + i) };
+        axmi_hasher_write_fp128(mut_view(h_lto), f.body_digest);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.call_edge_count as usize) {
+        let e = unsafe { *(lto.call_edges + i) };
+        axmi_hasher_write_u32(mut_view(h_lto), e.caller_def_id.v);
+        axmi_hasher_write_u32(mut_view(h_lto), e.callee_def_id.v);
+        axmi_hasher_write_u32(mut_view(h_lto), e.call_site_count);
+        axmi_hasher_write_u32(mut_view(h_lto), e.hotness_weight);
+        axmi_hasher_write_u8(mut_view(h_lto), if e.is_direct { 1u8 } else { 0u8 });
+        axmi_hasher_write_u8(mut_view(h_lto), if e.can_inline { 1u8 } else { 0u8 });
+        axmi_hasher_write_semantic_key(mut_view(h_lto), view(e.callee_key));
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.mir_body_count as usize) {
+        let m = unsafe { *(lto.mir_bodies + i) };
+        axmi_hasher_write_fp128(mut_view(h_lto), m.body_digest);
+        i = i + 1;
+    }
+
+    lto.lto_summary_fingerprint = axmi_hasher_finish(view(h_lto));
+}
+
+fn axlto_write_semantic_key_ids(lto: mut_view<AxLtoContainer>, out: mut_view<AxmiBuffer>, sk: view<SemanticKey>) {
+    let pkg_id = axlto_get_or_add_string_id(mut_view(*lto), sk.package_name);
+    let mod_id = axlto_get_or_add_string_id(mut_view(*lto), sk.module_path);
+    let name_id = axlto_get_or_add_string_id(mut_view(*lto), sk.canonical_name);
+    let targs_id = axlto_get_or_add_string_id(mut_view(*lto), sk.canonical_type_args);
+    axmi_buf_push_u32_le(mut_view(*out), pkg_id);
+    axmi_buf_push_u32_le(mut_view(*out), mod_id);
+    axmi_buf_push_u8(mut_view(*out), sk.item_namespace);
+    axmi_buf_push_u8(mut_view(*out), AXMI_SCOPE_PACKAGE_LOCAL);
+    axmi_buf_push_u16_le(mut_view(*out), 0u16);
+    axmi_buf_push_u32_le(mut_view(*out), sk.disambiguator_index);
+    axmi_buf_push_u32_le(mut_view(*out), name_id);
+    axmi_buf_push_u32_le(mut_view(*out), targs_id);
+}
+
+fn axlto_read_semantic_key_ids(
+    lto: mut_view<AxLtoContainer>,
+    ptr: *const u8,
+    offset: usize
+) -> SemanticKey {
+    let pkg_id = axmi_read_u32_le(ptr, offset);
+    let mod_id = axmi_read_u32_le(ptr, offset + 4);
+    let item_ns = axmi_read_u8(ptr, offset + 8);
+    let disamb = axmi_read_u32_le(ptr, offset + 12);
+    let name_id = axmi_read_u32_le(ptr, offset + 16);
+    let targs_id = axmi_read_u32_le(ptr, offset + 20);
+    SemanticKey {
+        package_name: axlto_string_by_id(view(*lto), pkg_id),
+        module_path: axlto_string_by_id(view(*lto), mod_id),
+        item_namespace: item_ns,
+        disambiguator_index: disamb,
+        canonical_name: axlto_string_by_id(view(*lto), name_id),
+        canonical_type_args: axlto_string_by_id(view(*lto), targs_id),
+    }
+}
+
+fn axlto_collect_canonical_strings(lto: mut_view<AxLtoContainer>) {
+    lto.string_count = 0u32;
+    let _ = axlto_get_or_add_string_id(mut_view(*lto), lto.package_name);
+    let _ = axlto_get_or_add_string_id(mut_view(*lto), lto.module_path);
+    let _ = axlto_get_or_add_string_id(mut_view(*lto), lto.target_triple);
+    let _ = axlto_get_or_add_string_id(mut_view(*lto), lto.abi_profile);
+
+    let mut i: usize = 0;
+    while i < (lto.function_count as usize) {
+        let f = unsafe { *(lto.functions + i) };
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), f.semantic_key.package_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), f.semantic_key.module_path);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), f.semantic_key.canonical_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), f.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.call_edge_count as usize) {
+        let e = unsafe { *(lto.call_edges + i) };
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), e.callee_key.package_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), e.callee_key.module_path);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), e.callee_key.canonical_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), e.callee_key.canonical_type_args);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.mir_body_count as usize) {
+        let m = unsafe { *(lto.mir_bodies + i) };
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), m.semantic_key.package_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), m.semantic_key.module_path);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), m.semantic_key.canonical_name);
+        let _ = axlto_get_or_add_string_id(mut_view(*lto), m.semantic_key.canonical_type_args);
+        i = i + 1;
+    }
+}
+
+fn axlto_serialize_with_family(
+    lto: mut_view<AxLtoContainer>,
+    magic: [8]u8,
+    format_family: u16,
+    artifact_kind: u16,
+    out: mut_view<AxmiBuffer>
+) -> ArtifactId {
+    out.len = 0;
+    axlto_recompute_fingerprints(mut_view(*lto));
+    axlto_collect_canonical_strings(mut_view(*lto));
+
+    let base_sec_count: u32 = 3u32;
+    let total_sec_count: u32 = base_sec_count + lto.custom_section_count;
+    lto.section_count = total_sec_count;
+
+    let mut sec_ids: [16]u32 = [0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32, 0u32];
+    let mut sec_types: [16]u16 = [0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16];
+    let mut sec_flags: [16]u16 = [0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16, 0u16];
+    let mut sec_custom_idx: [16]usize = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+    sec_ids[0] = 0u32; sec_types[0] = AXMI_SEC_STRINGS; sec_flags[0] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[1] = 1u32; sec_types[1] = AXMI_SEC_GENERIC_MIR; sec_flags[1] = AXMI_SEC_DEFAULT_FLAGS;
+    sec_ids[2] = 2u32; sec_types[2] = AXMI_SEC_LTO_SUMMARY; sec_flags[2] = AXMI_SEC_DEFAULT_FLAGS;
+
+    let mut ci: usize = 0;
+    while ci < (lto.custom_section_count as usize) {
+        let cs = unsafe { *(lto.custom_sections + ci) };
+        let pos = 3 + ci;
+        sec_ids[pos] = cs.id;
+        sec_types[pos] = cs.section_type;
+        sec_flags[pos] = cs.flags;
+        sec_custom_idx[pos] = ci;
+        ci = ci + 1;
+    }
+
+    let mut sa: usize = 1;
+    while sa < (total_sec_count as usize) {
+        let cur_id = sec_ids[sa];
+        let cur_ty = sec_types[sa];
+        let cur_fl = sec_flags[sa];
+        let cur_ci = sec_custom_idx[sa];
+        let mut sb: usize = sa;
+        while sb > 0 {
+            let prev_ty = sec_types[sb - 1];
+            let prev_id = sec_ids[sb - 1];
+            if prev_ty < cur_ty || (prev_ty == cur_ty && prev_id <= cur_id) {
+                break;
+            }
+            sec_ids[sb] = prev_id;
+            sec_types[sb] = prev_ty;
+            sec_flags[sb] = sec_flags[sb - 1];
+            sec_custom_idx[sb] = sec_custom_idx[sb - 1];
+            sb = sb - 1;
+        }
+        sec_ids[sb] = cur_id;
+        sec_types[sb] = cur_ty;
+        sec_flags[sb] = cur_fl;
+        sec_custom_idx[sb] = cur_ci;
+        sa = sa + 1;
+    }
+
+    let payload_offset = AXMI_HEADER_SIZE + ((total_sec_count as usize) * AXMI_SECTION_DESC_SIZE);
+    let hdr_flags: u16 = AXMI_DEFAULT_FLAGS | AXMI_FLAG_HAS_LTO;
+
+    // 1. Write 64-byte ArtifactHeader
+    let mut mi: usize = 0;
+    while mi < 8 {
+        axmi_buf_push_u8(mut_view(*out), magic[mi]);
+        mi = mi + 1;
+    }
+    axmi_buf_push_u16_le(mut_view(*out), format_family);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_FORMAT_VERSION);
+    axmi_buf_push_u16_le(mut_view(*out), artifact_kind);
+    axmi_buf_push_u16_le(mut_view(*out), hdr_flags);
+    axmi_buf_push_u64_le(mut_view(*out), lto.target_fingerprint.lo);
+    axmi_buf_push_u64_le(mut_view(*out), lto.interface_fingerprint.lo);
+    axmi_buf_push_u32_le(mut_view(*out), total_sec_count);
+    axmi_buf_push_u32_le(mut_view(*out), AXMI_PRODUCER_VERSION);
+    axmi_buf_push_u32_le(mut_view(*out), payload_offset as u32);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32);
+    axmi_buf_push_fp128_le(mut_view(*out), fingerprint128_zero());
+
+    // 2. Reserve SectionTable
+    let mut si: usize = 0;
+    while si < ((total_sec_count as usize) * AXMI_SECTION_DESC_SIZE) {
+        axmi_buf_push_u8(mut_view(*out), 0u8);
+        si = si + 1;
+    }
+
+    // 3. Emit each section payload aligned to 8 bytes
+    let mut s_idx: usize = 0;
+    while s_idx < (total_sec_count as usize) {
+        axmi_buf_align_to(mut_view(*out), 8);
+        let sec_start = out.len;
+        let sty = sec_types[s_idx];
+
+        if sty == AXMI_SEC_STRINGS {
+            axmi_buf_push_u32_le(mut_view(*out), lto.string_count);
+            let mut k: usize = 0;
+            while k < (lto.string_count as usize) {
+                let sv = unsafe { *(lto.string_table + k) };
+                axmi_buf_push_u32_le(mut_view(*out), sv.len as u32);
+                axmi_buf_push_bytes(mut_view(*out), sv.ptr, sv.len);
+                k = k + 1;
+            }
+            let pkg_id = axlto_get_or_add_string_id(mut_view(*lto), lto.package_name);
+            let mod_id = axlto_get_or_add_string_id(mut_view(*lto), lto.module_path);
+            let trp_id = axlto_get_or_add_string_id(mut_view(*lto), lto.target_triple);
+            let abi_id = axlto_get_or_add_string_id(mut_view(*lto), lto.abi_profile);
+            axmi_buf_push_u32_le(mut_view(*out), pkg_id);
+            axmi_buf_push_u32_le(mut_view(*out), mod_id);
+            axmi_buf_push_u32_le(mut_view(*out), trp_id);
+            axmi_buf_push_u32_le(mut_view(*out), abi_id);
+            axmi_buf_push_u32_le(mut_view(*out), lto.pointer_width_bytes);
+            axmi_buf_push_u8(mut_view(*out), if lto.little_endian { 1u8 } else { 0u8 });
+            axmi_buf_push_u8(mut_view(*out), lto.panic_strategy);
+            axmi_buf_push_u16_le(mut_view(*out), 0u16);
+            axmi_buf_push_u32_le(mut_view(*out), lto.cpu_feature_mask);
+            axmi_buf_push_u32_le(mut_view(*out), 0u32);
+            axmi_buf_push_fp128_le(mut_view(*out), lto.target_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), lto.interface_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), lto.abi_fingerprint);
+            axmi_buf_push_fp128_le(mut_view(*out), lto.lto_summary_fingerprint);
+        } else if sty == AXMI_SEC_GENERIC_MIR {
+            axmi_buf_push_u32_le(mut_view(*out), lto.mir_body_count);
+            let mut k: usize = 0;
+            while k < (lto.mir_body_count as usize) {
+                let m = unsafe { *(lto.mir_bodies + k) };
+                axmi_buf_push_u32_le(mut_view(*out), m.def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), m.mir_body_id.v);
+                axmi_buf_push_u16_le(mut_view(*out), m.mir_schema_version);
+                let mut mflags: u8 = 0u8;
+                if m.is_generic { mflags = mflags | 1u8; }
+                if m.is_inline { mflags = mflags | 2u8; }
+                if m.is_comptime { mflags = mflags | 4u8; }
+                if m.ownership_verified { mflags = mflags | 8u8; }
+                axmi_buf_push_u8(mut_view(*out), mflags);
+                axmi_buf_push_u8(mut_view(*out), 0u8);
+                axmi_buf_push_u32_le(mut_view(*out), m.param_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.block_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.local_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.inst_count);
+                axmi_buf_push_u32_le(mut_view(*out), m.opcode_len);
+                let mut bi: usize = 0;
+                while bi < 8 {
+                    axmi_buf_push_u8(mut_view(*out), m.opcodes[bi]);
+                    bi = bi + 1;
+                }
+                axmi_buf_push_fp128_le(mut_view(*out), m.body_digest);
+                axlto_write_semantic_key_ids(mut_view(*lto), mut_view(*out), view(m.semantic_key));
+                k = k + 1;
+            }
+        } else if sty == AXMI_SEC_LTO_SUMMARY {
+            axmi_buf_push_u32_le(mut_view(*out), lto.function_count);
+            axmi_buf_push_u32_le(mut_view(*out), lto.call_edge_count);
+            let mut k: usize = 0;
+            while k < (lto.function_count as usize) {
+                let f = unsafe { *(lto.functions + k) };
+                axmi_buf_push_u32_le(mut_view(*out), f.def_id.v);
+                axmi_buf_push_u8(mut_view(*out), f.linkage_kind);
+                axmi_buf_push_u8(mut_view(*out), f.root_kind);
+                axmi_buf_push_u8(mut_view(*out), f.panic_contract);
+                axmi_buf_push_u8(mut_view(*out), if f.inline_hint { 1u8 } else { 0u8 });
+                axmi_buf_push_u32_le(mut_view(*out), f.inst_count);
+                axmi_buf_push_u32_le(mut_view(*out), f.inline_weight);
+                axmi_buf_push_u32_le(mut_view(*out), f.effect_mask);
+                axmi_buf_push_u32_le(mut_view(*out), f.authority_cap_mask);
+                axmi_buf_push_u32_le(mut_view(*out), f.no_escape_mask);
+                axmi_buf_push_u32_le(mut_view(*out), f.no_alias_mask);
+                axmi_buf_push_u64_le(mut_view(*out), f.specialization_key);
+                axmi_buf_push_fp128_le(mut_view(*out), f.body_digest);
+                axlto_write_semantic_key_ids(mut_view(*lto), mut_view(*out), view(f.semantic_key));
+                k = k + 1;
+            }
+            let mut e: usize = 0;
+            while e < (lto.call_edge_count as usize) {
+                let ed = unsafe { *(lto.call_edges + e) };
+                axmi_buf_push_u32_le(mut_view(*out), ed.caller_def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), ed.callee_def_id.v);
+                axmi_buf_push_u32_le(mut_view(*out), ed.call_site_count);
+                axmi_buf_push_u32_le(mut_view(*out), ed.hotness_weight);
+                axmi_buf_push_u8(mut_view(*out), if ed.is_direct { 1u8 } else { 0u8 });
+                axmi_buf_push_u8(mut_view(*out), if ed.can_inline { 1u8 } else { 0u8 });
+                axmi_buf_push_u16_le(mut_view(*out), 0u16);
+                axlto_write_semantic_key_ids(mut_view(*lto), mut_view(*out), view(ed.callee_key));
+                e = e + 1;
+            }
+        } else {
+            let cs = unsafe { *(lto.custom_sections + sec_custom_idx[s_idx]) };
+            axmi_buf_push_u64_le(mut_view(*out), cs.payload_tag);
+        }
+
+        let sec_end = out.len;
+        let sec_size = sec_end - sec_start;
+        let sec_cksum = container_compute_section_checksum(out.ptr as *const u8, sec_start, sec_size);
+
+        let desc = SectionDescriptor {
+            id: sec_ids[s_idx],
+            section_type: sty,
+            flags: sec_flags[s_idx],
+            alignment: 8u32,
+            offset: sec_start as u64,
+            compressed_size: sec_size as u64,
+            uncompressed_size: sec_size as u64,
+            checksum: sec_cksum,
+        };
+        unsafe { *(lto.sections + s_idx) = desc; }
+
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off, desc.id);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 4, (desc.section_type as u32) | ((desc.flags as u32) << 16u32));
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 8, desc.alignment);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 12, sec_start as u32);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 16, desc.compressed_size);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 24, desc.uncompressed_size);
+        axmi_buf_patch_fp128_le(mut_view(*out), desc_off + 32, desc.checksum);
+
+        s_idx = s_idx + 1;
+    }
+
+    let total_payload_size = out.len - AXMI_HEADER_SIZE;
+    axmi_buf_patch_u32_le(mut_view(*out), 44, total_payload_size as u32);
+
+    let content_hash = container_compute_content_hash(out.ptr as *const u8, out.len);
+    axmi_buf_patch_fp128_le(mut_view(*out), 48, content_hash);
+
+    lto.header = ArtifactHeader {
+        magic: magic,
+        format_family: format_family,
+        schema_version: AXMI_FORMAT_VERSION,
+        artifact_kind: artifact_kind,
+        flags: hdr_flags,
+        target_fingerprint: lto.target_fingerprint,
+        interface_fingerprint: lto.interface_fingerprint,
+        section_count: total_sec_count,
+        producer_version: AXMI_PRODUCER_VERSION,
+        payload_offset: payload_offset as u64,
+        payload_size: total_payload_size as u64,
+        content_hash: content_hash,
+    };
+
+    ArtifactId {
+        content_hash: content_hash,
+        schema_id: format_family,
+        schema_version: AXMI_FORMAT_VERSION,
+    }
+}
+
+pub fn axlto_serialize(lto: mut_view<AxLtoContainer>, out: mut_view<AxmiBuffer>) -> ArtifactId {
+    axlto_serialize_with_family(lto, AXLTO_MAGIC, AXLTO_FORMAT_FAMILY, AXLTO_ARTIFACT_KIND, out)
+}
+
+pub fn axmir_serialize(lto: mut_view<AxLtoContainer>, out: mut_view<AxmiBuffer>) -> ArtifactId {
+    axlto_serialize_with_family(lto, AXMIR_MAGIC, AXMIR_FORMAT_FAMILY, AXMIR_ARTIFACT_KIND, out)
+}
+
+fn axlto_is_known_section_type(sty: u16) -> bool {
+    sty == AXMI_SEC_STRINGS || sty == AXMI_SEC_GENERIC_MIR || sty == AXMI_SEC_LTO_SUMMARY
+}
+
+fn axlto_deserialize_with_family(
+    bytes: *const u8,
+    total_len: usize,
+    expected_magic_u64: u64,
+    expected_magic: [8]u8,
+    expected_family: u16,
+    expected_kind: u16,
+    expected_target: view<AxmiTargetExpectation>,
+    out_lto: mut_view<AxLtoContainer>
+) -> AxmiDeserializeResult {
+    if (bytes as usize) == 0 || total_len < AXMI_HEADER_SIZE {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, 0u16, 0u16);
+    }
+
+    let magic_u64 = axmi_read_u64_le(bytes, 0);
+    if magic_u64 != expected_magic_u64 {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, 0u16, 0u16);
+    }
+
+    let format_family = axmi_read_u16_le(bytes, 8);
+    let schema_version = axmi_read_u16_le(bytes, 10);
+    let artifact_kind = axmi_read_u16_le(bytes, 12);
+    let flags = axmi_read_u16_le(bytes, 14);
+
+    if format_family != expected_family || artifact_kind != expected_kind {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+    if (flags & AXMI_FLAG_LITTLE_ENDIAN) == 0u16 {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+    if schema_version != AXMI_FORMAT_VERSION {
+        return container_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, expected_family, schema_version, 0u16);
+    }
+
+    let hdr_target_lo = axmi_read_u64_le(bytes, 16);
+    let hdr_iface_lo = axmi_read_u64_le(bytes, 24);
+    let section_count = axmi_read_u32_le(bytes, 32);
+    let producer_version = axmi_read_u32_le(bytes, 36);
+    let payload_offset = axmi_read_u32_le(bytes, 40) as u64;
+    let payload_size = axmi_read_u32_le(bytes, 44) as u64;
+    let stored_content_hash = axmi_read_fp128_le(bytes, 48);
+
+    if section_count == 0u32 || (section_count as usize) > AXMI_MAX_SECTIONS {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+    let expected_payload_off = (AXMI_HEADER_SIZE as u64) + ((section_count as u64) * (AXMI_SECTION_DESC_SIZE as u64));
+    if payload_offset != expected_payload_off {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+    if !axmi_check_bounds(AXMI_HEADER_SIZE as u64, payload_size, total_len as u64) {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+    if ((AXMI_HEADER_SIZE as u64) + payload_size) != (total_len as u64) {
+        return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+
+    let computed_content_hash = container_compute_content_hash(bytes, total_len);
+    if !fingerprint128_eq(stored_content_hash, computed_content_hash) {
+        return container_fail_result(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, 0u16);
+    }
+
+    out_lto.section_count = section_count;
+    out_lto.string_count = 0u32;
+    out_lto.function_count = 0u32;
+    out_lto.call_edge_count = 0u32;
+    out_lto.mir_body_count = 0u32;
+    out_lto.custom_section_count = 0u32;
+
+    let mut prev_sec_type: u16 = 0u16;
+    let mut prev_sec_id: u32 = 0u32;
+    let mut prev_end: u64 = payload_offset;
+    let mut s_idx: usize = 0;
+    while s_idx < (section_count as usize) {
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        let sid = axmi_read_u32_le(bytes, desc_off);
+        let sty = axmi_read_u16_le(bytes, desc_off + 4);
+        let sflags = axmi_read_u16_le(bytes, desc_off + 6);
+        let salign = axmi_read_u32_le(bytes, desc_off + 8);
+        let soff = axmi_read_u32_le(bytes, desc_off + 12) as u64;
+        let scomp = axmi_read_u64_le(bytes, desc_off + 16);
+        let suncomp = axmi_read_u64_le(bytes, desc_off + 24);
+        let scksum = axmi_read_fp128_le(bytes, desc_off + 32);
+
+        if !axmi_is_power_of_two_align(salign) {
+            return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+        }
+        if (soff % (salign as u64)) != 0u64 {
+            return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+        }
+        if scomp != suncomp || soff < prev_end {
+            return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+        }
+        if !axmi_check_bounds(soff, suncomp, total_len as u64) {
+            return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+        }
+        if s_idx > 0 {
+            if sty < prev_sec_type || (sty == prev_sec_type && sid < prev_sec_id) {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+        }
+        prev_sec_type = sty;
+        prev_sec_id = sid;
+        prev_end = soff + suncomp;
+
+        let calc_sec_cksum = container_compute_section_checksum(bytes, soff as usize, suncomp as usize);
+        if !fingerprint128_eq(scksum, calc_sec_cksum) {
+            return container_fail_result(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+        }
+
+        if !axlto_is_known_section_type(sty) {
+            if (sflags & AXMI_SEC_FLAG_OPTIONAL) == 0u16 {
+                return container_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, expected_family, schema_version, sty);
+            }
+        }
+
+        unsafe {
+            *(out_lto.sections + s_idx) = SectionDescriptor {
+                id: sid,
+                section_type: sty,
+                flags: sflags,
+                alignment: salign,
+                offset: soff,
+                compressed_size: scomp,
+                uncompressed_size: suncomp,
+                checksum: scksum,
+            };
+        }
+        s_idx = s_idx + 1;
+    }
+
+    s_idx = 0;
+    while s_idx < (section_count as usize) {
+        let desc = unsafe { *(out_lto.sections + s_idx) };
+        let sty = desc.section_type;
+        let mut cur_off = desc.offset as usize;
+        let sec_limit = (desc.offset + desc.uncompressed_size) as usize;
+
+        if sty == AXMI_SEC_STRINGS {
+            if cur_off + 4 > sec_limit {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let scount = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (scount as usize) > AXMI_MAX_STRINGS {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < scount {
+                if cur_off + 4 > sec_limit {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+                let slen = axmi_read_u32_le(bytes, cur_off) as usize;
+                cur_off = cur_off + 4;
+                if cur_off + slen > sec_limit {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+                let interned = axlto_intern_bytes(mut_view(*out_lto), unsafe { bytes + cur_off }, slen);
+                unsafe { *(out_lto.string_table + (k as usize)) = interned; }
+                out_lto.string_count = k + 1u32;
+                cur_off = cur_off + slen;
+                k = k + 1u32;
+            }
+            if cur_off + 96 > sec_limit {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let pkg_id = axmi_read_u32_le(bytes, cur_off);
+            let mod_id = axmi_read_u32_le(bytes, cur_off + 4);
+            let trp_id = axmi_read_u32_le(bytes, cur_off + 8);
+            let abi_id = axmi_read_u32_le(bytes, cur_off + 12);
+            out_lto.package_name = axlto_string_by_id(view(*out_lto), pkg_id);
+            out_lto.module_path = axlto_string_by_id(view(*out_lto), mod_id);
+            out_lto.target_triple = axlto_string_by_id(view(*out_lto), trp_id);
+            out_lto.abi_profile = axlto_string_by_id(view(*out_lto), abi_id);
+            out_lto.pointer_width_bytes = axmi_read_u32_le(bytes, cur_off + 16);
+            out_lto.little_endian = axmi_read_u8(bytes, cur_off + 20) != 0u8;
+            out_lto.panic_strategy = axmi_read_u8(bytes, cur_off + 21);
+            out_lto.cpu_feature_mask = axmi_read_u32_le(bytes, cur_off + 24);
+            out_lto.target_fingerprint = axmi_read_fp128_le(bytes, cur_off + 32);
+            out_lto.interface_fingerprint = axmi_read_fp128_le(bytes, cur_off + 48);
+            out_lto.abi_fingerprint = axmi_read_fp128_le(bytes, cur_off + 64);
+            out_lto.lto_summary_fingerprint = axmi_read_fp128_le(bytes, cur_off + 80);
+
+            if out_lto.target_fingerprint.lo != hdr_target_lo || out_lto.interface_fingerprint.lo != hdr_iface_lo {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+
+            if expected_target.enforce_target {
+                let mut tgt_mismatch = false;
+                if !fingerprint128_eq(out_lto.target_fingerprint, expected_target.target_fingerprint) {
+                    tgt_mismatch = true;
+                }
+                if out_lto.pointer_width_bytes != expected_target.pointer_width_bytes ||
+                    out_lto.little_endian != expected_target.little_endian ||
+                    out_lto.panic_strategy != expected_target.panic_strategy {
+                    tgt_mismatch = true;
+                }
+                if (out_lto.cpu_feature_mask & (~expected_target.required_cpu_features)) != 0u32 {
+                    tgt_mismatch = true;
+                }
+                if expected_target.target_triple.len > 0 && !qry_sv_eq(out_lto.target_triple, expected_target.target_triple) {
+                    tgt_mismatch = true;
+                }
+                if expected_target.abi_profile.len > 0 && !qry_sv_eq(out_lto.abi_profile, expected_target.abi_profile) {
+                    tgt_mismatch = true;
+                }
+                if tgt_mismatch {
+                    return container_fail_result(AX_ART_TARGET_MISMATCH, AX_LINK_ARTIFACT_TARGET_MISMATCH, expected_family, schema_version, sty);
+                }
+            }
+        } else if sty == AXMI_SEC_GENERIC_MIR {
+            if cur_off + 4 > sec_limit {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let mcount = axmi_read_u32_le(bytes, cur_off);
+            cur_off = cur_off + 4;
+            if (mcount as usize) > AXLTO_MAX_MIR_BODIES {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < mcount {
+                if cur_off + 80 > sec_limit {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+                let def_id_v = axmi_read_u32_le(bytes, cur_off);
+                let body_id_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let mir_ver = axmi_read_u16_le(bytes, cur_off + 8);
+                let mflags = axmi_read_u8(bytes, cur_off + 10);
+                let param_cnt = axmi_read_u32_le(bytes, cur_off + 12);
+                let blk_cnt = axmi_read_u32_le(bytes, cur_off + 16);
+                let loc_cnt = axmi_read_u32_le(bytes, cur_off + 20);
+                let inst_cnt = axmi_read_u32_le(bytes, cur_off + 24);
+                let op_len = axmi_read_u32_le(bytes, cur_off + 28);
+                let mut ops: [8]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+                let mut bi: usize = 0;
+                while bi < 8 {
+                    ops[bi] = axmi_read_u8(bytes, cur_off + 32 + bi);
+                    bi = bi + 1;
+                }
+                let digest = axmi_read_fp128_le(bytes, cur_off + 40);
+                let sk = axlto_read_semantic_key_ids(mut_view(*out_lto), bytes, cur_off + 56);
+                cur_off = cur_off + 80;
+
+                if mir_ver != AXMI_MIR_SCHEMA_VERSION {
+                    return container_fail_result(AX_ART_VERSION_MISMATCH, AX_LINK_ARTIFACT_SCHEMA_MISMATCH, expected_family, mir_ver, sty);
+                }
+                let verified = (mflags & 8u8) != 0u8;
+                // AXS-ART-024: Unverified HIR or unverified MIR must never be accepted from any container section.
+                if !verified || blk_cnt == 0u32 || loc_cnt == 0u32 || op_len > 8u32 {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+
+                unsafe {
+                    *(out_lto.mir_bodies + (k as usize)) = AxLtoMirBody {
+                        def_id: DefId { v: def_id_v },
+                        mir_body_id: MirBodyId { v: body_id_v },
+                        mir_schema_version: mir_ver,
+                        is_generic: (mflags & 1u8) != 0u8,
+                        is_inline: (mflags & 2u8) != 0u8,
+                        is_comptime: (mflags & 4u8) != 0u8,
+                        ownership_verified: verified,
+                        param_count: param_cnt,
+                        block_count: blk_cnt,
+                        local_count: loc_cnt,
+                        inst_count: inst_cnt,
+                        opcode_len: op_len,
+                        opcodes: ops,
+                        body_digest: digest,
+                        semantic_key: sk,
+                    };
+                }
+                out_lto.mir_body_count = k + 1u32;
+                k = k + 1u32;
+            }
+        } else if sty == AXMI_SEC_LTO_SUMMARY {
+            if cur_off + 8 > sec_limit {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let fcount = axmi_read_u32_le(bytes, cur_off);
+            let ecount = axmi_read_u32_le(bytes, cur_off + 4);
+            cur_off = cur_off + 8;
+            if (fcount as usize) > AXLTO_MAX_FNS || (ecount as usize) > AXLTO_MAX_EDGES {
+                return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+            }
+            let mut k: u32 = 0u32;
+            while k < fcount {
+                if cur_off + 80 > sec_limit {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+                let def_id_v = axmi_read_u32_le(bytes, cur_off);
+                let lnk = axmi_read_u8(bytes, cur_off + 4);
+                let rtk = axmi_read_u8(bytes, cur_off + 5);
+                let pnc = axmi_read_u8(bytes, cur_off + 6);
+                let inl = axmi_read_u8(bytes, cur_off + 7) != 0u8;
+                let icnt = axmi_read_u32_le(bytes, cur_off + 8);
+                let iwgt = axmi_read_u32_le(bytes, cur_off + 12);
+                let eff = axmi_read_u32_le(bytes, cur_off + 16);
+                let cap = axmi_read_u32_le(bytes, cur_off + 20);
+                let nesc = axmi_read_u32_le(bytes, cur_off + 24);
+                let nali = axmi_read_u32_le(bytes, cur_off + 28);
+                let skey = axmi_read_u64_le(bytes, cur_off + 32);
+                let dig = axmi_read_fp128_le(bytes, cur_off + 40);
+                let sk = axlto_read_semantic_key_ids(mut_view(*out_lto), bytes, cur_off + 56);
+                cur_off = cur_off + 80;
+
+                unsafe {
+                    *(out_lto.functions + (k as usize)) = AxLtoFnEntry {
+                        def_id: DefId { v: def_id_v },
+                        linkage_kind: lnk,
+                        root_kind: rtk,
+                        panic_contract: pnc,
+                        inline_hint: inl,
+                        inst_count: icnt,
+                        inline_weight: iwgt,
+                        effect_mask: eff,
+                        authority_cap_mask: cap,
+                        no_escape_mask: nesc,
+                        no_alias_mask: nali,
+                        specialization_key: skey,
+                        body_digest: dig,
+                        semantic_key: sk,
+                    };
+                }
+                out_lto.function_count = k + 1u32;
+                k = k + 1u32;
+            }
+            let mut e: u32 = 0u32;
+            while e < ecount {
+                if cur_off + 44 > sec_limit {
+                    return container_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, expected_family, schema_version, sty);
+                }
+                let caller_v = axmi_read_u32_le(bytes, cur_off);
+                let callee_v = axmi_read_u32_le(bytes, cur_off + 4);
+                let sites = axmi_read_u32_le(bytes, cur_off + 8);
+                let hot = axmi_read_u32_le(bytes, cur_off + 12);
+                let dir = axmi_read_u8(bytes, cur_off + 16) != 0u8;
+                let cinl = axmi_read_u8(bytes, cur_off + 17) != 0u8;
+                let ck = axlto_read_semantic_key_ids(mut_view(*out_lto), bytes, cur_off + 20);
+                cur_off = cur_off + 44;
+
+                unsafe {
+                    *(out_lto.call_edges + (e as usize)) = AxLtoCallEdge {
+                        caller_def_id: DefId { v: caller_v },
+                        callee_def_id: DefId { v: callee_v },
+                        call_site_count: sites,
+                        hotness_weight: hot,
+                        is_direct: dir,
+                        can_inline: cinl,
+                        callee_key: ck,
+                    };
+                }
+                out_lto.call_edge_count = e + 1u32;
+                e = e + 1u32;
+            }
+        } else {
+            if (out_lto.custom_section_count as usize) < AXMI_MAX_CUSTOM_SECTIONS {
+                let tag: u64 = if cur_off + 8 <= sec_limit { axmi_read_u64_le(bytes, cur_off) } else { 0u64 };
+                let cidx = out_lto.custom_section_count as usize;
+                unsafe {
+                    *(out_lto.custom_sections + cidx) = AxmiCustomSection {
+                        id: desc.id,
+                        section_type: desc.section_type,
+                        flags: desc.flags,
+                        payload_tag: tag,
+                    };
+                }
+                out_lto.custom_section_count = (cidx as u32) + 1u32;
+            }
+        }
+
+        s_idx = s_idx + 1;
+    }
+
+    out_lto.header = ArtifactHeader {
+        magic: expected_magic,
+        format_family: format_family,
+        schema_version: schema_version,
+        artifact_kind: artifact_kind,
+        flags: flags,
+        target_fingerprint: out_lto.target_fingerprint,
+        interface_fingerprint: out_lto.interface_fingerprint,
+        section_count: section_count,
+        producer_version: producer_version,
+        payload_offset: payload_offset,
+        payload_size: payload_size,
+        content_hash: stored_content_hash,
+    };
+
+    AxmiDeserializeResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: schema_version,
+        expected_version: AXMI_FORMAT_VERSION,
+        bad_section_type: 0u16,
+        artifact_id: ArtifactId {
+            content_hash: stored_content_hash,
+            schema_id: format_family,
+            schema_version: schema_version,
+        },
+    }
+}
+
+pub fn axlto_deserialize(
+    bytes: *const u8,
+    total_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_lto: mut_view<AxLtoContainer>
+) -> AxmiDeserializeResult {
+    axlto_deserialize_with_family(
+        bytes,
+        total_len,
+        AXLTO_MAGIC_U64,
+        AXLTO_MAGIC,
+        AXLTO_FORMAT_FAMILY,
+        AXLTO_ARTIFACT_KIND,
+        expected_target,
+        out_lto
+    )
+}
+
+pub fn axmir_deserialize(
+    bytes: *const u8,
+    total_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_mir: mut_view<AxLtoContainer>
+) -> AxmiDeserializeResult {
+    axlto_deserialize_with_family(
+        bytes,
+        total_len,
+        AXMIR_MAGIC_U64,
+        AXMIR_MAGIC,
+        AXMIR_FORMAT_FAMILY,
+        AXMIR_ARTIFACT_KIND,
+        expected_target,
+        out_mir
+    )
+}
+
+// ============================================================================
+// 5. COFF `.obj` & `.lib` Container Section Writer and Fail-Closed Reader
+// ============================================================================
+
+@derive(Copy)
+pub struct CoffExtractResult {
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub bad_section_type: u16,
+    pub is_foreign_coff: bool,
+    pub has_axmeta: bool,
+    pub has_axlto: bool,
+    pub has_axmir: bool,
+    pub total_sections: u32,
+    pub runtime_section_count: u32,
+    pub container_section_count: u32,
+    pub axmeta_chars: u32,
+    pub axlto_chars: u32,
+    pub axmir_chars: u32,
+    pub axmeta_size: u32,
+    pub axlto_size: u32,
+    pub axmir_size: u32,
+    pub symbol_count: u32,
+    pub text_size: u32,
+    pub rdata_size: u32,
+    pub data_size: u32,
+    pub interface_fingerprint: Fingerprint128,
+    pub abi_fingerprint: Fingerprint128,
+    pub target_fingerprint: Fingerprint128,
+    pub lto_summary_fingerprint: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct CoffArchiveExtractResult {
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub bad_section_type: u16,
+    pub member_count: u32,
+    pub axiom_member_count: u32,
+    pub foreign_member_count: u32,
+    pub total_axmeta_sections: u32,
+    pub total_axlto_sections: u32,
+    pub total_runtime_sections: u32,
+    pub combined_interface_fp: Fingerprint128,
+    pub combined_lto_fp: Fingerprint128,
+}
+
+fn coff_name_eq8_at(ptr: *const u8, offset: usize, expected_u64: u64) -> bool {
+    axmi_read_u64_le(ptr, offset) == expected_u64
+}
+
+fn coff_push_section_header(
+    out: mut_view<AxmiBuffer>,
+    name: [8]u8,
+    virtual_size: u32,
+    virtual_address: u32,
+    raw_size: u32,
+    raw_ptr: u32,
+    characteristics: u32
+) {
+    let mut i: usize = 0;
+    while i < 8 {
+        axmi_buf_push_u8(mut_view(*out), name[i]);
+        i = i + 1;
+    }
+    axmi_buf_push_u32_le(mut_view(*out), virtual_size);
+    axmi_buf_push_u32_le(mut_view(*out), virtual_address);
+    axmi_buf_push_u32_le(mut_view(*out), raw_size);
+    axmi_buf_push_u32_le(mut_view(*out), raw_ptr);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32); // PointerToRelocations
+    axmi_buf_push_u32_le(mut_view(*out), 0u32); // PointerToLinenumbers
+    axmi_buf_push_u16_le(mut_view(*out), 0u16); // NumberOfRelocations
+    axmi_buf_push_u16_le(mut_view(*out), 0u16); // NumberOfLinenumbers
+    axmi_buf_push_u32_le(mut_view(*out), characteristics);
+}
+
+// Emits a deterministic AMD64 COFF `.obj` with runtime `.text`/`.rdata` sections
+// and non-alloc discardable (`IMAGE_SCN_LNK_INFO | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_MEM_READ` = 0x42000200)
+// `.axmeta`, `.axlto`, and optional `.axmir` container sections.
+pub fn container_write_coff_obj_ex(
+    text_ptr: *const u8,
+    text_len: usize,
+    rdata_ptr: *const u8,
+    rdata_len: usize,
+    axmeta_ptr: *const u8,
+    axmeta_len: usize,
+    axlto_ptr: *const u8,
+    axlto_len: usize,
+    axmir_ptr: *const u8,
+    axmir_len: usize,
+    container_chars_override: u32,
+    symbol_count: u32,
+    out: mut_view<AxmiBuffer>
+) {
+    out.len = 0;
+    let has_text = text_len > 0;
+    let has_rdata = rdata_len > 0;
+    let has_meta = axmeta_len > 0 && (axmeta_ptr as usize) != 0;
+    let has_lto = axlto_len > 0 && (axlto_ptr as usize) != 0;
+    let has_mir = axmir_len > 0 && (axmir_ptr as usize) != 0;
+
+    let mut num_secs: u16 = 0u16;
+    if has_text { num_secs = num_secs + 1u16; }
+    if has_rdata { num_secs = num_secs + 1u16; }
+    if has_meta { num_secs = num_secs + 1u16; }
+    if has_lto { num_secs = num_secs + 1u16; }
+    if has_mir { num_secs = num_secs + 1u16; }
+
+    let c_chars: u32 = if container_chars_override == 0u32 { AX_COFF_CONTAINER_CHARS } else { container_chars_override };
+
+    // Compute aligned raw offsets after file header + section headers
+    let hdrs_end = COFF_FILE_HEADER_SIZE + ((num_secs as usize) * COFF_SECTION_HEADER_SIZE);
+    let mut cur_off: usize = hdrs_end;
+    while (cur_off % 8) != 0 {
+        cur_off = cur_off + 1;
+    }
+
+    let mut text_off: usize = 0;
+    if has_text {
+        text_off = cur_off;
+        cur_off = cur_off + text_len;
+        while (cur_off % 8) != 0 { cur_off = cur_off + 1; }
+    }
+    let mut rdata_off: usize = 0;
+    if has_rdata {
+        rdata_off = cur_off;
+        cur_off = cur_off + rdata_len;
+        while (cur_off % 8) != 0 { cur_off = cur_off + 1; }
+    }
+    let mut meta_off: usize = 0;
+    if has_meta {
+        meta_off = cur_off;
+        cur_off = cur_off + axmeta_len;
+        while (cur_off % 8) != 0 { cur_off = cur_off + 1; }
+    }
+    let mut lto_off: usize = 0;
+    if has_lto {
+        lto_off = cur_off;
+        cur_off = cur_off + axlto_len;
+        while (cur_off % 8) != 0 { cur_off = cur_off + 1; }
+    }
+    let mut mir_off: usize = 0;
+    if has_mir {
+        mir_off = cur_off;
+        cur_off = cur_off + axmir_len;
+        while (cur_off % 8) != 0 { cur_off = cur_off + 1; }
+    }
+
+    let symtab_off: u32 = if symbol_count > 0u32 { cur_off as u32 } else { 0u32 };
+
+    // 1. 20-byte COFF File Header
+    axmi_buf_push_u16_le(mut_view(*out), COFF_MACHINE_AMD64);
+    axmi_buf_push_u16_le(mut_view(*out), num_secs);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32); // TimeDateStamp = 0 (deterministic)
+    axmi_buf_push_u32_le(mut_view(*out), symtab_off);
+    axmi_buf_push_u32_le(mut_view(*out), symbol_count);
+    axmi_buf_push_u16_le(mut_view(*out), 0u16); // SizeOfOptionalHeader = 0
+    axmi_buf_push_u16_le(mut_view(*out), 0u16); // Characteristics = 0
+
+    // 2. 40-byte COFF Section Headers
+    if has_text {
+        coff_push_section_header(mut_view(*out), COFF_NAME_TEXT, 0u32, 0u32, text_len as u32, text_off as u32, AX_COFF_TEXT_CHARS);
+    }
+    if has_rdata {
+        coff_push_section_header(mut_view(*out), COFF_NAME_RDATA, 0u32, 0u32, rdata_len as u32, rdata_off as u32, AX_COFF_RDATA_CHARS);
+    }
+    if has_meta {
+        coff_push_section_header(mut_view(*out), COFF_NAME_AXMETA, 0u32, 0u32, axmeta_len as u32, meta_off as u32, c_chars);
+    }
+    if has_lto {
+        coff_push_section_header(mut_view(*out), COFF_NAME_AXLTO, 0u32, 0u32, axlto_len as u32, lto_off as u32, c_chars);
+    }
+    if has_mir {
+        coff_push_section_header(mut_view(*out), COFF_NAME_AXMIR, 0u32, 0u32, axmir_len as u32, mir_off as u32, c_chars);
+    }
+
+    // 3. Section Raw Payloads (8-byte aligned)
+    axmi_buf_align_to(mut_view(*out), 8);
+    if has_text {
+        if (text_ptr as usize) != 0 {
+            axmi_buf_push_bytes(mut_view(*out), text_ptr, text_len);
+        } else {
+            let mut ti: usize = 0;
+            while ti < text_len {
+                axmi_buf_push_u8(mut_view(*out), 0x90u8); // NOP
+                ti = ti + 1;
+            }
+        }
+        axmi_buf_align_to(mut_view(*out), 8);
+    }
+    if has_rdata {
+        if (rdata_ptr as usize) != 0 {
+            axmi_buf_push_bytes(mut_view(*out), rdata_ptr, rdata_len);
+        } else {
+            let mut ri: usize = 0;
+            while ri < rdata_len {
+                axmi_buf_push_u8(mut_view(*out), 0x41u8);
+                ri = ri + 1;
+            }
+        }
+        axmi_buf_align_to(mut_view(*out), 8);
+    }
+    if has_meta {
+        axmi_buf_push_bytes(mut_view(*out), axmeta_ptr, axmeta_len);
+        axmi_buf_align_to(mut_view(*out), 8);
+    }
+    if has_lto {
+        axmi_buf_push_bytes(mut_view(*out), axlto_ptr, axlto_len);
+        axmi_buf_align_to(mut_view(*out), 8);
+    }
+    if has_mir {
+        axmi_buf_push_bytes(mut_view(*out), axmir_ptr, axmir_len);
+        axmi_buf_align_to(mut_view(*out), 8);
+    }
+
+    // 4. COFF Symbol Table + 4-byte String Table size
+    if symbol_count > 0u32 {
+        let mut sy: u32 = 0u32;
+        while sy < symbol_count {
+            // 8-byte short symbol name: "axsym0", etc.
+            axmi_buf_push_u8(mut_view(*out), 97u8); // 'a'
+            axmi_buf_push_u8(mut_view(*out), 120u8); // 'x'
+            axmi_buf_push_u8(mut_view(*out), 115u8); // 's'
+            axmi_buf_push_u8(mut_view(*out), 121u8); // 'y'
+            axmi_buf_push_u8(mut_view(*out), 109u8); // 'm'
+            axmi_buf_push_u8(mut_view(*out), (48u32 + (sy % 10u32)) as u8);
+            axmi_buf_push_u8(mut_view(*out), 0u8);
+            axmi_buf_push_u8(mut_view(*out), 0u8);
+            axmi_buf_push_u32_le(mut_view(*out), sy * 16u32); // Value
+            axmi_buf_push_u16_le(mut_view(*out), 1u16); // SectionNumber = 1 (.text)
+            axmi_buf_push_u16_le(mut_view(*out), 0x0020u16); // Type = function
+            axmi_buf_push_u8(mut_view(*out), 2u8); // StorageClass = IMAGE_SYM_CLASS_EXTERNAL
+            axmi_buf_push_u8(mut_view(*out), 0u8); // NumberOfAuxSymbols = 0
+            sy = sy + 1u32;
+        }
+        axmi_buf_push_u32_le(mut_view(*out), 4u32); // Empty COFF string table (4-byte size)
+    }
+}
+
+pub fn container_write_axiom_coff_obj(
+    iface: mut_view<AxmiModuleInterface>,
+    lto: mut_view<AxLtoContainer>,
+    emit_mir_sec: bool,
+    text_len: usize,
+    rdata_len: usize,
+    out: mut_view<AxmiBuffer>
+) {
+    let mut meta_buf = axmi_buf_empty();
+    let mut lto_buf = axmi_buf_empty();
+    let mut mir_buf = axmi_buf_empty();
+    axmi_buf_init(mut_view(meta_buf), 1024);
+    axmi_buf_init(mut_view(lto_buf), 1024);
+    axmi_buf_init(mut_view(mir_buf), 512);
+
+    let _ = axmeta_serialize(mut_view(*iface), mut_view(meta_buf));
+    axlto_bind_to_interface(mut_view(*lto), view(*iface));
+    let _ = axlto_serialize(mut_view(*lto), mut_view(lto_buf));
+    if emit_mir_sec {
+        let _ = axmir_serialize(mut_view(*lto), mut_view(mir_buf));
+    }
+
+    container_write_coff_obj_ex(
+        0 as *const u8,
+        text_len,
+        0 as *const u8,
+        rdata_len,
+        meta_buf.ptr as *const u8,
+        meta_buf.len,
+        lto_buf.ptr as *const u8,
+        lto_buf.len,
+        if emit_mir_sec { mir_buf.ptr as *const u8 } else { 0 as *const u8 },
+        if emit_mir_sec { mir_buf.len } else { 0 },
+        AX_COFF_CONTAINER_CHARS,
+        iface.symbol_count,
+        mut_view(*out)
+    );
+
+    axmi_buf_free(mut_view(meta_buf));
+    axmi_buf_free(mut_view(lto_buf));
+    axmi_buf_free(mut_view(mir_buf));
+}
+
+pub fn container_write_foreign_coff_obj(
+    text_len: usize,
+    rdata_len: usize,
+    symbol_count: u32,
+    out: mut_view<AxmiBuffer>
+) {
+    container_write_coff_obj_ex(
+        0 as *const u8,
+        text_len,
+        0 as *const u8,
+        rdata_len,
+        0 as *const u8,
+        0,
+        0 as *const u8,
+        0,
+        0 as *const u8,
+        0,
+        AX_COFF_CONTAINER_CHARS,
+        symbol_count,
+        mut_view(*out)
+    );
+}
+
+fn coff_fail_extract(status: u32, canonical_code: u32, found_ver: u16, bad_sec: u16) -> CoffExtractResult {
+    CoffExtractResult {
+        status: status,
+        canonical_diag_code: canonical_code,
+        found_version: found_ver,
+        bad_section_type: bad_sec,
+        is_foreign_coff: false,
+        has_axmeta: false,
+        has_axlto: false,
+        has_axmir: false,
+        total_sections: 0u32,
+        runtime_section_count: 0u32,
+        container_section_count: 0u32,
+        axmeta_chars: 0u32,
+        axlto_chars: 0u32,
+        axmir_chars: 0u32,
+        axmeta_size: 0u32,
+        axlto_size: 0u32,
+        axmir_size: 0u32,
+        symbol_count: 0u32,
+        text_size: 0u32,
+        rdata_size: 0u32,
+        data_size: 0u32,
+        interface_fingerprint: fingerprint128_zero(),
+        abi_fingerprint: fingerprint128_zero(),
+        target_fingerprint: fingerprint128_zero(),
+        lto_summary_fingerprint: fingerprint128_zero(),
+    }
+}
+
+fn coff_is_valid_container_chars(chars: u32) -> bool {
+    let required: u32 = IMAGE_SCN_LNK_INFO | IMAGE_SCN_MEM_DISCARDABLE | IMAGE_SCN_MEM_READ;
+    let forbidden: u32 = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE;
+    ((chars & required) == required) && ((chars & forbidden) == 0u32)
+}
+
+pub fn container_extract_coff_obj(
+    obj_bytes: *const u8,
+    obj_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_meta: mut_view<AxmiModuleInterface>,
+    out_lto: mut_view<AxLtoContainer>
+) -> CoffExtractResult {
+    if (obj_bytes as usize) == 0 || obj_len < COFF_FILE_HEADER_SIZE {
+        return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    let machine = axmi_read_u16_le(obj_bytes, 0);
+    let num_secs = axmi_read_u16_le(obj_bytes, 2) as usize;
+    let symtab_off = axmi_read_u32_le(obj_bytes, 8) as u64;
+    let num_syms = axmi_read_u32_le(obj_bytes, 12);
+    let opt_hdr_sz = axmi_read_u16_le(obj_bytes, 16) as usize;
+
+    if machine != COFF_MACHINE_AMD64 || num_secs == 0 || num_secs > CONTAINER_MAX_COFF_SECTIONS {
+        return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    let shdr_table_start = COFF_FILE_HEADER_SIZE + opt_hdr_sz;
+    let shdr_table_bytes = num_secs * COFF_SECTION_HEADER_SIZE;
+    if !axmi_check_bounds(shdr_table_start as u64, shdr_table_bytes as u64, obj_len as u64) {
+        return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    if num_syms > 0u32 {
+        let sym_bytes = (num_syms as u64) * (COFF_SYMBOL_SIZE as u64);
+        if !axmi_check_bounds(symtab_off, sym_bytes + 4u64, obj_len as u64) {
+            return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+        }
+    }
+
+    let mut has_meta = false;
+    let mut has_lto = false;
+    let mut has_mir = false;
+    let mut runtime_secs: u32 = 0u32;
+    let mut container_secs: u32 = 0u32;
+    let mut meta_chars: u32 = 0u32;
+    let mut lto_chars: u32 = 0u32;
+    let mut mir_chars: u32 = 0u32;
+    let mut meta_sz: u32 = 0u32;
+    let mut lto_sz: u32 = 0u32;
+    let mut mir_sz: u32 = 0u32;
+    let mut text_sz: u32 = 0u32;
+    let mut rdata_sz: u32 = 0u32;
+    let mut data_sz: u32 = 0u32;
+
+    let mut s: usize = 0;
+    while s < num_secs {
+        let sh_off = shdr_table_start + (s * COFF_SECTION_HEADER_SIZE);
+        let raw_sz = axmi_read_u32_le(obj_bytes, sh_off + 16);
+        let raw_ptr = axmi_read_u32_le(obj_bytes, sh_off + 20);
+        let chars = axmi_read_u32_le(obj_bytes, sh_off + 36);
+
+        if raw_sz > 0u32 {
+            if (raw_ptr as usize) < (shdr_table_start + shdr_table_bytes) {
+                return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, (s + 1) as u16);
+            }
+            if !axmi_check_bounds(raw_ptr as u64, raw_sz as u64, obj_len as u64) {
+                return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, (s + 1) as u16);
+            }
+        }
+
+        if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_AXMETA_U64) {
+            if has_meta || raw_sz == 0u32 || !coff_is_valid_container_chars(chars) {
+                return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 1u16);
+            }
+            has_meta = true;
+            container_secs = container_secs + 1u32;
+            meta_chars = chars;
+            meta_sz = raw_sz;
+
+            let mres = axmeta_deserialize(
+                unsafe { obj_bytes + (raw_ptr as usize) },
+                raw_sz as usize,
+                expected_target,
+                mut_view(*out_meta)
+            );
+            if mres.status != AXMI_STATUS_OK {
+                return coff_fail_extract(mres.status, mres.canonical_diag_code, mres.found_version, mres.bad_section_type);
+            }
+        } else if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_AXLTO_U64) {
+            if has_lto || raw_sz == 0u32 || !coff_is_valid_container_chars(chars) {
+                return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 2u16);
+            }
+            has_lto = true;
+            container_secs = container_secs + 1u32;
+            lto_chars = chars;
+            lto_sz = raw_sz;
+
+            let lres = axlto_deserialize(
+                unsafe { obj_bytes + (raw_ptr as usize) },
+                raw_sz as usize,
+                expected_target,
+                mut_view(*out_lto)
+            );
+            if lres.status != AXMI_STATUS_OK {
+                return coff_fail_extract(lres.status, lres.canonical_diag_code, lres.found_version, lres.bad_section_type);
+            }
+        } else if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_AXMIR_U64) {
+            if has_mir || raw_sz == 0u32 || !coff_is_valid_container_chars(chars) {
+                return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 3u16);
+            }
+            has_mir = true;
+            container_secs = container_secs + 1u32;
+            mir_chars = chars;
+            mir_sz = raw_sz;
+
+            let mut tmp_mir = axlto_container_empty();
+            axlto_container_init(mut_view(tmp_mir));
+            let r_mir = axmir_deserialize(
+                unsafe { obj_bytes + (raw_ptr as usize) },
+                raw_sz as usize,
+                expected_target,
+                mut_view(tmp_mir)
+            );
+            axlto_container_free(mut_view(tmp_mir));
+            if r_mir.status != AXMI_STATUS_OK {
+                return coff_fail_extract(r_mir.status, r_mir.canonical_diag_code, r_mir.found_version, r_mir.bad_section_type);
+            }
+        } else {
+            runtime_secs = runtime_secs + 1u32;
+            if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_TEXT_U64) {
+                text_sz = text_sz + raw_sz;
+            } else if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_RDATA_U64) {
+                rdata_sz = rdata_sz + raw_sz;
+            } else if coff_name_eq8_at(obj_bytes, sh_off, COFF_NAME_DATA_U64) {
+                data_sz = data_sz + raw_sz;
+            }
+        }
+
+        s = s + 1;
+    }
+
+    // AXS-ART-020: An Axiom object carrying `.axlto` or `.axmir` must also carry `.axmeta`.
+    if (has_lto || has_mir) && !has_meta {
+        return coff_fail_extract(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, AXMI_SEC_LTO_SUMMARY);
+    }
+
+    // Cross-section consistency within the same `.obj`
+    if has_meta && has_lto {
+        if !fingerprint128_eq(out_meta.target_fingerprint, out_lto.target_fingerprint) ||
+            !fingerprint128_eq(out_meta.abi_fingerprint, out_lto.abi_fingerprint) {
+            return coff_fail_extract(AX_ART_TARGET_MISMATCH, AX_LINK_ARTIFACT_TARGET_MISMATCH, AXMI_FORMAT_VERSION, AXMI_SEC_LTO_SUMMARY);
+        }
+        if !fingerprint128_eq(out_meta.interface_fingerprint, out_lto.interface_fingerprint) {
+            return coff_fail_extract(AX_ART_CHECKSUM_MISMATCH, AX_LINK_BAD_ARTIFACT, AXMI_FORMAT_VERSION, AXMI_SEC_LTO_SUMMARY);
+        }
+    }
+
+    let is_foreign = !has_meta && !has_lto && !has_mir;
+
+    CoffExtractResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: if has_meta { out_meta.header.schema_version } else { 0u16 },
+        bad_section_type: 0u16,
+        is_foreign_coff: is_foreign,
+        has_axmeta: has_meta,
+        has_axlto: has_lto,
+        has_axmir: has_mir,
+        total_sections: num_secs as u32,
+        runtime_section_count: runtime_secs,
+        container_section_count: container_secs,
+        axmeta_chars: meta_chars,
+        axlto_chars: lto_chars,
+        axmir_chars: mir_chars,
+        axmeta_size: meta_sz,
+        axlto_size: lto_sz,
+        axmir_size: mir_sz,
+        symbol_count: num_syms,
+        text_size: text_sz,
+        rdata_size: rdata_sz,
+        data_size: data_sz,
+        interface_fingerprint: if has_meta { out_meta.interface_fingerprint } else { fingerprint128_zero() },
+        abi_fingerprint: if has_meta { out_meta.abi_fingerprint } else { fingerprint128_zero() },
+        target_fingerprint: if has_meta { out_meta.target_fingerprint } else { fingerprint128_zero() },
+        lto_summary_fingerprint: if has_lto { out_lto.lto_summary_fingerprint } else { fingerprint128_zero() },
+    }
+}
+
+// --- COFF `.lib` Static Archive Writer & Reader (`!<arch>\n`) ---
+
+fn archive_push_magic(out: mut_view<AxmiBuffer>) {
+    // "!<arch>\n"
+    axmi_buf_push_u8(mut_view(*out), 0x21u8);
+    axmi_buf_push_u8(mut_view(*out), 0x3Cu8);
+    axmi_buf_push_u8(mut_view(*out), 0x61u8);
+    axmi_buf_push_u8(mut_view(*out), 0x72u8);
+    axmi_buf_push_u8(mut_view(*out), 0x63u8);
+    axmi_buf_push_u8(mut_view(*out), 0x68u8);
+    axmi_buf_push_u8(mut_view(*out), 0x3Eu8);
+    axmi_buf_push_u8(mut_view(*out), 0x0Au8);
+}
+
+fn archive_push_decimal_field(out: mut_view<AxmiBuffer>, val: usize, width: usize) {
+    let mut digits: [16]u8 = [32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8, 32u8];
+    let mut d_len: usize = 0;
+    if val == 0 {
+        digits[0] = 48u8;
+        d_len = 1;
+    } else {
+        let mut tmp: usize = val;
+        let mut rev: [16]u8 = [0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8];
+        while tmp > 0 && d_len < width {
+            rev[d_len] = (48 + (tmp % 10)) as u8;
+            tmp = tmp / 10;
+            d_len = d_len + 1;
+        }
+        let mut k: usize = 0;
+        while k < d_len {
+            digits[k] = rev[d_len - 1 - k];
+            k = k + 1;
+        }
+    }
+    let mut i: usize = 0;
+    while i < width {
+        axmi_buf_push_u8(mut_view(*out), digits[i]);
+        i = i + 1;
+    }
+}
+
+fn archive_push_member_header(out: mut_view<AxmiBuffer>, is_linker_dir: bool, member_idx: usize, payload_len: usize) {
+    // 16-byte Name field
+    if is_linker_dir {
+        axmi_buf_push_u8(mut_view(*out), 47u8); // '/'
+        let mut p: usize = 1;
+        while p < 16 {
+            axmi_buf_push_u8(mut_view(*out), 32u8);
+            p = p + 1;
+        }
+    } else {
+        // "unit0.obj/      "
+        axmi_buf_push_u8(mut_view(*out), 117u8); // 'u'
+        axmi_buf_push_u8(mut_view(*out), 110u8); // 'n'
+        axmi_buf_push_u8(mut_view(*out), 105u8); // 'i'
+        axmi_buf_push_u8(mut_view(*out), 116u8); // 't'
+        axmi_buf_push_u8(mut_view(*out), (48 + (member_idx % 10)) as u8);
+        axmi_buf_push_u8(mut_view(*out), 46u8); // '.'
+        axmi_buf_push_u8(mut_view(*out), 111u8); // 'o'
+        axmi_buf_push_u8(mut_view(*out), 98u8); // 'b'
+        axmi_buf_push_u8(mut_view(*out), 106u8); // 'j'
+        axmi_buf_push_u8(mut_view(*out), 47u8); // '/'
+        let mut p: usize = 10;
+        while p < 16 {
+            axmi_buf_push_u8(mut_view(*out), 32u8);
+            p = p + 1;
+        }
+    }
+    // 12-byte Date ("0           ")
+    archive_push_decimal_field(mut_view(*out), 0, 12);
+    // 6-byte UID + 6-byte GID
+    archive_push_decimal_field(mut_view(*out), 0, 6);
+    archive_push_decimal_field(mut_view(*out), 0, 6);
+    // 8-byte Mode ("100644  ")
+    archive_push_decimal_field(mut_view(*out), 100644, 8);
+    // 10-byte Size
+    archive_push_decimal_field(mut_view(*out), payload_len, 10);
+    // 2-byte End ("`\n")
+    axmi_buf_push_u8(mut_view(*out), 0x60u8);
+    axmi_buf_push_u8(mut_view(*out), 0x0Au8);
+}
+
+pub fn container_write_coff_archive_begin(out: mut_view<AxmiBuffer>) {
+    out.len = 0;
+    archive_push_magic(mut_view(*out));
+    // Emit deterministic `/` linker directory member with 0 symbols (4 zero bytes)
+    archive_push_member_header(mut_view(*out), true, 0, 4);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32);
+}
+
+pub fn container_write_coff_archive_add_member(
+    out: mut_view<AxmiBuffer>,
+    member_idx: usize,
+    obj_ptr: *const u8,
+    obj_len: usize
+) {
+    archive_push_member_header(mut_view(*out), false, member_idx, obj_len);
+    axmi_buf_push_bytes(mut_view(*out), obj_ptr, obj_len);
+    if (obj_len % 2) != 0 {
+        axmi_buf_push_u8(mut_view(*out), 0x0Au8);
+    }
+}
+
+pub fn container_is_coff_archive(buf: *const u8, len: usize) -> bool {
+    if (buf as usize) == 0 || len < COFF_ARCHIVE_MAGIC_SIZE {
+        return false;
+    }
+    axmi_read_u8(buf, 0) == 0x21u8 &&
+        axmi_read_u8(buf, 1) == 0x3Cu8 &&
+        axmi_read_u8(buf, 2) == 0x61u8 &&
+        axmi_read_u8(buf, 3) == 0x72u8 &&
+        axmi_read_u8(buf, 4) == 0x63u8 &&
+        axmi_read_u8(buf, 5) == 0x68u8 &&
+        axmi_read_u8(buf, 6) == 0x3Eu8 &&
+        axmi_read_u8(buf, 7) == 0x0Au8
+}
+
+fn archive_parse_member_size(hdr_ptr: *const u8, out_size: mut_view<usize>) -> bool {
+    let mut val: usize = 0;
+    let mut i: usize = 0;
+    let mut has_digit = false;
+    let mut seen_space = false;
+    while i < 10 {
+        let ch = axmi_read_u8(hdr_ptr, 48 + i);
+        if ch >= 48u8 && ch <= 57u8 {
+            if seen_space {
+                return false;
+            }
+            has_digit = true;
+            val = (val * 10) + ((ch - 48u8) as usize);
+        } else if ch == 32u8 {
+            seen_space = true;
+        } else {
+            return false;
+        }
+        i = i + 1;
+    }
+    if !has_digit {
+        return false;
+    }
+    *out_size = val;
+    true
+}
+
+fn archive_fail_result(status: u32, canonical_code: u32, found_ver: u16, bad_sec: u16) -> CoffArchiveExtractResult {
+    CoffArchiveExtractResult {
+        status: status,
+        canonical_diag_code: canonical_code,
+        found_version: found_ver,
+        bad_section_type: bad_sec,
+        member_count: 0u32,
+        axiom_member_count: 0u32,
+        foreign_member_count: 0u32,
+        total_axmeta_sections: 0u32,
+        total_axlto_sections: 0u32,
+        total_runtime_sections: 0u32,
+        combined_interface_fp: fingerprint128_zero(),
+        combined_lto_fp: fingerprint128_zero(),
+    }
+}
+
+pub fn container_extract_coff_archive(
+    ar_bytes: *const u8,
+    ar_len: usize,
+    expected_target: view<AxmiTargetExpectation>
+) -> CoffArchiveExtractResult {
+    if !container_is_coff_archive(ar_bytes, ar_len) {
+        return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    let mut off: usize = COFF_ARCHIVE_MAGIC_SIZE;
+    let mut member_cnt: u32 = 0u32;
+    let mut axiom_cnt: u32 = 0u32;
+    let mut foreign_cnt: u32 = 0u32;
+    let mut meta_secs: u32 = 0u32;
+    let mut lto_secs: u32 = 0u32;
+    let mut runtime_secs: u32 = 0u32;
+    let mut first_target_fp = fingerprint128_zero();
+    let mut has_first_target = false;
+
+    let mut h_api = axmi_hasher_new(2u8);
+    let mut h_lto = axmi_hasher_new(5u8);
+
+    while off < ar_len {
+        if !axmi_check_bounds(off as u64, COFF_ARCHIVE_MEMBER_HEADER_SIZE as u64, ar_len as u64) {
+            return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+        }
+        let hdr_ptr = unsafe { ar_bytes + off };
+        if axmi_read_u8(hdr_ptr, 58) != 0x60u8 || axmi_read_u8(hdr_ptr, 59) != 0x0Au8 {
+            return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+        }
+        let mut m_size: usize = 0;
+        if !archive_parse_member_size(hdr_ptr, mut_view(m_size)) {
+            return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+        }
+        let payload_off = off + COFF_ARCHIVE_MEMBER_HEADER_SIZE;
+        if !axmi_check_bounds(payload_off as u64, m_size as u64, ar_len as u64) {
+            return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+        }
+
+        let n0 = axmi_read_u8(hdr_ptr, 0);
+        let n1 = axmi_read_u8(hdr_ptr, 1);
+        let is_special = n0 == 47u8 && (n1 == 32u8 || n1 == 47u8);
+        if !is_special {
+            let mut m_meta = axmi_interface_empty();
+            let mut m_lto = axlto_container_empty();
+            axmi_interface_init(mut_view(m_meta));
+            axlto_container_init(mut_view(m_lto));
+
+            let eres = container_extract_coff_obj(
+                unsafe { ar_bytes + payload_off },
+                m_size,
+                expected_target,
+                mut_view(m_meta),
+                mut_view(m_lto)
+            );
+            axmi_interface_free(mut_view(m_meta));
+            axlto_container_free(mut_view(m_lto));
+
+            if eres.status != AXMI_STATUS_OK {
+                return archive_fail_result(eres.status, eres.canonical_diag_code, eres.found_version, eres.bad_section_type);
+            }
+
+            member_cnt = member_cnt + 1u32;
+            runtime_secs = runtime_secs + eres.runtime_section_count;
+            if eres.is_foreign_coff {
+                foreign_cnt = foreign_cnt + 1u32;
+            } else {
+                axiom_cnt = axiom_cnt + 1u32;
+                if eres.has_axmeta {
+                    meta_secs = meta_secs + 1u32;
+                    axmi_hasher_write_fp128(mut_view(h_api), eres.interface_fingerprint);
+                    if !has_first_target {
+                        first_target_fp = eres.target_fingerprint;
+                        has_first_target = true;
+                    } else if !fingerprint128_eq(first_target_fp, eres.target_fingerprint) {
+                        return archive_fail_result(AX_ART_TARGET_MISMATCH, AX_LINK_ARTIFACT_TARGET_MISMATCH, eres.found_version, 0u16);
+                    }
+                }
+                if eres.has_axlto {
+                    lto_secs = lto_secs + 1u32;
+                    axmi_hasher_write_fp128(mut_view(h_lto), eres.lto_summary_fingerprint);
+                }
+            }
+        }
+
+        let mut step = COFF_ARCHIVE_MEMBER_HEADER_SIZE + m_size;
+        if (step % 2) != 0 {
+            step = step + 1;
+        }
+        off = off + step;
+    }
+
+    if member_cnt == 0u32 {
+        return archive_fail_result(AX_ART_CORRUPT_HEADER, AX_LINK_BAD_ARTIFACT, 0u16, 0u16);
+    }
+
+    CoffArchiveExtractResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: AXMI_FORMAT_VERSION,
+        bad_section_type: 0u16,
+        member_count: member_cnt,
+        axiom_member_count: axiom_cnt,
+        foreign_member_count: foreign_cnt,
+        total_axmeta_sections: meta_secs,
+        total_axlto_sections: lto_secs,
+        total_runtime_sections: runtime_secs,
+        combined_interface_fp: axmi_hasher_finish(view(h_api)),
+        combined_lto_fp: axmi_hasher_finish(view(h_lto)),
+    }
+}
+
+// ============================================================================
+// 6. Link-Time Container Verifier, Cross-Module LTO & PE32+ Section Stripper
+// ============================================================================
+
+@derive(Copy)
+pub struct ContainerLinkResult {
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub bad_section_type: u16,
+    pub image_kind: u8,
+    pub total_input_objects: u32,
+    pub axiom_object_count: u32,
+    pub foreign_object_count: u32,
+    pub verified_axmeta_count: u32,
+    pub verified_axlto_count: u32,
+    pub stripped_container_sections: u32,
+    pub stripped_container_bytes: u32,
+    pub merged_runtime_sections: u32,
+    pub merged_text_bytes: u32,
+    pub merged_rdata_bytes: u32,
+    pub lto_total_functions: u32,
+    pub lto_inlined_calls: u32,
+    pub lto_dead_stripped_functions: u32,
+    pub lto_verified_mir_bodies: u32,
+    pub pe_clean_verified: bool,
+    pub linked_interface_fp: Fingerprint128,
+    pub linked_lto_fp: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct PeStripVerifyResult {
+    pub is_valid_pe: bool,
+    pub is_stripped_clean: bool,
+    pub section_count: u32,
+    pub has_axmeta_section: bool,
+    pub has_axlto_section: bool,
+    pub has_axmir_section: bool,
+    pub has_discardable_info_section: bool,
+    pub leaked_magic_count: u32,
+}
+
+pub struct ContainerLinkSession {
+    pub arena: Arena,
+    pub expected_target: AxmiTargetExpectation,
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub bad_section_type: u16,
+
+    pub total_input_objects: u32,
+    pub axiom_object_count: u32,
+    pub foreign_object_count: u32,
+    pub verified_axmeta_count: u32,
+    pub verified_axlto_count: u32,
+    pub stripped_container_sections: u32,
+    pub stripped_container_bytes: u32,
+    pub merged_text_bytes: u32,
+    pub merged_rdata_bytes: u32,
+
+    pub lto_total_functions: u32,
+    pub lto_inlined_calls: u32,
+    pub lto_dead_stripped_functions: u32,
+    pub lto_verified_mir_bodies: u32,
+
+    pub seen_target_fp: Fingerprint128,
+    pub has_seen_target: bool,
+
+    pub mod_paths: *mut StrView,
+    pub mod_iface_fps: *mut Fingerprint128,
+    pub mod_abi_fps: *mut Fingerprint128,
+    pub mod_count: u32,
+
+    pub dep_paths: *mut StrView,
+    pub dep_iface_fps: *mut Fingerprint128,
+    pub dep_abi_fps: *mut Fingerprint128,
+    pub dep_count: u32,
+
+    pub api_hasher: u64,
+    pub lto_hasher: u64,
+    pub linked_interface_fp: Fingerprint128,
+    pub linked_lto_fp: Fingerprint128,
+}
+
+pub fn container_link_session_new(expected_target: AxmiTargetExpectation) -> ContainerLinkSession {
+    let mut ar = arena_new();
+    let mp = arena_alloc_raw(mut_view(ar), 16 * size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    let mif = arena_alloc_raw(mut_view(ar), 16 * size_of<Fingerprint128>(), align_of<Fingerprint128>()) as *mut Fingerprint128;
+    let mab = arena_alloc_raw(mut_view(ar), 16 * size_of<Fingerprint128>(), align_of<Fingerprint128>()) as *mut Fingerprint128;
+    let dp = arena_alloc_raw(mut_view(ar), 16 * size_of<StrView>(), align_of<StrView>()) as *mut StrView;
+    let dif = arena_alloc_raw(mut_view(ar), 16 * size_of<Fingerprint128>(), align_of<Fingerprint128>()) as *mut Fingerprint128;
+    let dab = arena_alloc_raw(mut_view(ar), 16 * size_of<Fingerprint128>(), align_of<Fingerprint128>()) as *mut Fingerprint128;
+
+    ContainerLinkSession {
+        arena: ar,
+        expected_target: expected_target,
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: AXMI_FORMAT_VERSION,
+        bad_section_type: 0u16,
+        total_input_objects: 0u32,
+        axiom_object_count: 0u32,
+        foreign_object_count: 0u32,
+        verified_axmeta_count: 0u32,
+        verified_axlto_count: 0u32,
+        stripped_container_sections: 0u32,
+        stripped_container_bytes: 0u32,
+        merged_text_bytes: 0u32,
+        merged_rdata_bytes: 0u32,
+        lto_total_functions: 0u32,
+        lto_inlined_calls: 0u32,
+        lto_dead_stripped_functions: 0u32,
+        lto_verified_mir_bodies: 0u32,
+        seen_target_fp: fingerprint128_zero(),
+        has_seen_target: false,
+        mod_paths: mp,
+        mod_iface_fps: mif,
+        mod_abi_fps: mab,
+        mod_count: 0u32,
+        dep_paths: dp,
+        dep_iface_fps: dif,
+        dep_abi_fps: dab,
+        dep_count: 0u32,
+        api_hasher: 0u64,
+        lto_hasher: 0u64,
+        linked_interface_fp: fingerprint128_zero(),
+        linked_lto_fp: fingerprint128_zero(),
+    }
+}
+
+pub fn container_link_session_free(sess: mut_view<ContainerLinkSession>) {
+    arena_destroy(mut_view(sess.arena));
+    sess.mod_paths = 0 as *mut StrView;
+    sess.mod_iface_fps = 0 as *mut Fingerprint128;
+    sess.mod_abi_fps = 0 as *mut Fingerprint128;
+    sess.dep_paths = 0 as *mut StrView;
+    sess.dep_iface_fps = 0 as *mut Fingerprint128;
+    sess.dep_abi_fps = 0 as *mut Fingerprint128;
+}
+
+fn link_intern_sv(sess: mut_view<ContainerLinkSession>, sv: StrView) -> StrView {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return qry_sv_empty();
+    }
+    let dst = arena_alloc_raw(mut_view(sess.arena), sv.len + 1, 1);
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe { *(dst + i) = *(sv.ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(dst + sv.len) = 0u8; }
+    StrView { ptr: dst as *const u8, len: sv.len }
+}
+
+pub fn container_link_add_coff_obj(
+    sess: mut_view<ContainerLinkSession>,
+    obj_bytes: *const u8,
+    obj_len: usize
+) -> bool {
+    if sess.status != AXMI_STATUS_OK {
+        return false;
+    }
+
+    let mut meta = axmi_interface_empty();
+    let mut lto = axlto_container_empty();
+    axmi_interface_init(mut_view(meta));
+    axlto_container_init(mut_view(lto));
+
+    let eres = container_extract_coff_obj(
+        obj_bytes,
+        obj_len,
+        view(sess.expected_target),
+        mut_view(meta),
+        mut_view(lto)
+    );
+
+    if eres.status != AXMI_STATUS_OK {
+        sess.status = eres.status;
+        sess.canonical_diag_code = eres.canonical_diag_code;
+        sess.found_version = eres.found_version;
+        sess.bad_section_type = eres.bad_section_type;
+        axmi_interface_free(mut_view(meta));
+        axlto_container_free(mut_view(lto));
+        return false;
+    }
+
+    sess.total_input_objects = sess.total_input_objects + 1u32;
+    sess.merged_text_bytes = sess.merged_text_bytes + eres.text_size;
+    sess.merged_rdata_bytes = sess.merged_rdata_bytes + eres.rdata_size;
+
+    if eres.is_foreign_coff {
+        sess.foreign_object_count = sess.foreign_object_count + 1u32;
+        axmi_interface_free(mut_view(meta));
+        axlto_container_free(mut_view(lto));
+        return true;
+    }
+
+    sess.axiom_object_count = sess.axiom_object_count + 1u32;
+    sess.stripped_container_sections = sess.stripped_container_sections + eres.container_section_count;
+    sess.stripped_container_bytes = sess.stripped_container_bytes + eres.axmeta_size + eres.axlto_size + eres.axmir_size;
+
+    if eres.has_axmeta {
+        sess.verified_axmeta_count = sess.verified_axmeta_count + 1u32;
+        if !sess.has_seen_target {
+            sess.seen_target_fp = eres.target_fingerprint;
+            sess.has_seen_target = true;
+        } else if !fingerprint128_eq(sess.seen_target_fp, eres.target_fingerprint) {
+            sess.status = AX_ART_TARGET_MISMATCH;
+            sess.canonical_diag_code = AX_LINK_ARTIFACT_TARGET_MISMATCH;
+            sess.found_version = eres.found_version;
+            sess.bad_section_type = 0u16;
+            axmi_interface_free(mut_view(meta));
+            axlto_container_free(mut_view(lto));
+            return false;
+        }
+
+        if (sess.mod_count as usize) < 16 {
+            let idx = sess.mod_count as usize;
+            let mpath = link_intern_sv(mut_view(*sess), meta.module_path);
+            unsafe {
+                *(sess.mod_paths + idx) = mpath;
+                *(sess.mod_iface_fps + idx) = meta.interface_fingerprint;
+                *(sess.mod_abi_fps + idx) = meta.abi_fingerprint;
+            }
+            sess.mod_count = (idx as u32) + 1u32;
+        }
+
+        let mut di: usize = 0;
+        while di < (meta.dep_count as usize) {
+            if (sess.dep_count as usize) < 16 {
+                let d = unsafe { *(meta.deps + di) };
+                let didx = sess.dep_count as usize;
+                let dpath = link_intern_sv(mut_view(*sess), d.module_path);
+                unsafe {
+                    *(sess.dep_paths + didx) = dpath;
+                    *(sess.dep_iface_fps + didx) = d.interface_fingerprint;
+                    *(sess.dep_abi_fps + didx) = d.abi_fingerprint;
+                }
+                sess.dep_count = (didx as u32) + 1u32;
+            }
+            di = di + 1;
+        }
+
+        let mut h_api = axmi_hasher_new(2u8);
+        axmi_hasher_write_fp128(mut_view(h_api), sess.linked_interface_fp);
+        axmi_hasher_write_fp128(mut_view(h_api), eres.interface_fingerprint);
+        sess.linked_interface_fp = axmi_hasher_finish(view(h_api));
+    }
+
+    if eres.has_axlto {
+        sess.verified_axlto_count = sess.verified_axlto_count + 1u32;
+        sess.lto_total_functions = sess.lto_total_functions + lto.function_count;
+        sess.lto_verified_mir_bodies = sess.lto_verified_mir_bodies + lto.mir_body_count;
+
+        let mut ei: usize = 0;
+        while ei < (lto.call_edge_count as usize) {
+            let ed = unsafe { *(lto.call_edges + ei) };
+            if ed.is_direct && ed.can_inline {
+                sess.lto_inlined_calls = sess.lto_inlined_calls + ed.call_site_count;
+            }
+            ei = ei + 1;
+        }
+
+        let mut fi: usize = 0;
+        while fi < (lto.function_count as usize) {
+            let fn_ent = unsafe { *(lto.functions + fi) };
+            if fn_ent.linkage_kind == AXLTO_LINK_INTERNAL && fn_ent.root_kind == AXLTO_ROOT_NONE {
+                // Check if any call edge in this unit references fn_ent.def_id
+                let mut referenced = false;
+                let mut ce: usize = 0;
+                while ce < (lto.call_edge_count as usize) {
+                    let edge = unsafe { *(lto.call_edges + ce) };
+                    if edge.callee_def_id.v == fn_ent.def_id.v && !edge.can_inline {
+                        referenced = true;
+                    }
+                    ce = ce + 1;
+                }
+                if !referenced {
+                    sess.lto_dead_stripped_functions = sess.lto_dead_stripped_functions + 1u32;
+                }
+            }
+            fi = fi + 1;
+        }
+
+        let mut h_lto = axmi_hasher_new(5u8);
+        axmi_hasher_write_fp128(mut_view(h_lto), sess.linked_lto_fp);
+        axmi_hasher_write_fp128(mut_view(h_lto), eres.lto_summary_fingerprint);
+        sess.linked_lto_fp = axmi_hasher_finish(view(h_lto));
+    }
+
+    axmi_interface_free(mut_view(meta));
+    axlto_container_free(mut_view(lto));
+    true
+}
+
+pub fn container_link_add_coff_archive(
+    sess: mut_view<ContainerLinkSession>,
+    ar_bytes: *const u8,
+    ar_len: usize
+) -> bool {
+    if sess.status != AXMI_STATUS_OK {
+        return false;
+    }
+    if !container_is_coff_archive(ar_bytes, ar_len) {
+        sess.status = AX_ART_CORRUPT_HEADER;
+        sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+        return false;
+    }
+
+    let mut off: usize = COFF_ARCHIVE_MAGIC_SIZE;
+    let mut added_any = false;
+    while off < ar_len {
+        if !axmi_check_bounds(off as u64, COFF_ARCHIVE_MEMBER_HEADER_SIZE as u64, ar_len as u64) {
+            sess.status = AX_ART_CORRUPT_HEADER;
+            sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+            return false;
+        }
+        let hdr_ptr = unsafe { ar_bytes + off };
+        if axmi_read_u8(hdr_ptr, 58) != 0x60u8 || axmi_read_u8(hdr_ptr, 59) != 0x0Au8 {
+            sess.status = AX_ART_CORRUPT_HEADER;
+            sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+            return false;
+        }
+        let mut m_size: usize = 0;
+        if !archive_parse_member_size(hdr_ptr, mut_view(m_size)) {
+            sess.status = AX_ART_CORRUPT_HEADER;
+            sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+            return false;
+        }
+        let payload_off = off + COFF_ARCHIVE_MEMBER_HEADER_SIZE;
+        if !axmi_check_bounds(payload_off as u64, m_size as u64, ar_len as u64) {
+            sess.status = AX_ART_CORRUPT_HEADER;
+            sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+            return false;
+        }
+        let n0 = axmi_read_u8(hdr_ptr, 0);
+        let n1 = axmi_read_u8(hdr_ptr, 1);
+        let is_special = n0 == 47u8 && (n1 == 32u8 || n1 == 47u8);
+        if !is_special {
+            added_any = true;
+            if !container_link_add_coff_obj(mut_view(*sess), unsafe { ar_bytes + payload_off }, m_size) {
+                return false;
+            }
+        }
+        let mut step = COFF_ARCHIVE_MEMBER_HEADER_SIZE + m_size;
+        if (step % 2) != 0 {
+            step = step + 1;
+        }
+        off = off + step;
+    }
+
+    if !added_any {
+        sess.status = AX_ART_CORRUPT_HEADER;
+        sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+        return false;
+    }
+    true
+}
+
+fn pe_align_up(val: u32, align: u32) -> u32 {
+    if align <= 1u32 {
+        return val;
+    }
+    let rem = val % align;
+    if rem == 0u32 { val } else { val + (align - rem) }
+}
+
+// Finalizes cross-module dependency verification, consumes LTO summaries,
+// strips all non-alloc `.axmeta`, `.axlto`, and `.axmir` sections (AXS-ART-022),
+// and emits a clean PE32+ `.exe` or `.dll` binary into `out_pe`.
+pub fn container_link_finalize_pe_image(
+    sess: mut_view<ContainerLinkSession>,
+    image_kind: u8,
+    out_pe: mut_view<AxmiBuffer>
+) -> ContainerLinkResult {
+    out_pe.len = 0;
+
+    if sess.status == AXMI_STATUS_OK && sess.total_input_objects == 0u32 {
+        sess.status = AX_ART_CORRUPT_HEADER;
+        sess.canonical_diag_code = AX_LINK_BAD_ARTIFACT;
+    }
+
+    // Verify cross-module dependency edges (`AxmiDependencyEdge`) against linked modules (AXS-ART-023)
+    if sess.status == AXMI_STATUS_OK {
+        let mut di: usize = 0;
+        while di < (sess.dep_count as usize) {
+            let dpath = unsafe { *(sess.dep_paths + di) };
+            let difp = unsafe { *(sess.dep_iface_fps + di) };
+            let dabp = unsafe { *(sess.dep_abi_fps + di) };
+
+            let mut mi: usize = 0;
+            while mi < (sess.mod_count as usize) {
+                let mpath = unsafe { *(sess.mod_paths + mi) };
+                if qry_sv_eq(dpath, mpath) {
+                    let mifp = unsafe { *(sess.mod_iface_fps + mi) };
+                    let mabp = unsafe { *(sess.mod_abi_fps + mi) };
+                    if !fingerprint128_eq(difp, mifp) || !fingerprint128_eq(dabp, mabp) {
+                        sess.status = AX_ART_TARGET_MISMATCH;
+                        sess.canonical_diag_code = AX_LINK_ARTIFACT_TARGET_MISMATCH;
+                        sess.bad_section_type = 11u16; // AXMI_SEC_DEPENDENCIES
+                    }
+                }
+                mi = mi + 1;
+            }
+            di = di + 1;
+        }
+    }
+
+    if sess.status != AXMI_STATUS_OK {
+        return ContainerLinkResult {
+            status: sess.status,
+            canonical_diag_code: sess.canonical_diag_code,
+            found_version: sess.found_version,
+            bad_section_type: sess.bad_section_type,
+            image_kind: image_kind,
+            total_input_objects: sess.total_input_objects,
+            axiom_object_count: sess.axiom_object_count,
+            foreign_object_count: sess.foreign_object_count,
+            verified_axmeta_count: sess.verified_axmeta_count,
+            verified_axlto_count: sess.verified_axlto_count,
+            stripped_container_sections: 0u32,
+            stripped_container_bytes: 0u32,
+            merged_runtime_sections: 0u32,
+            merged_text_bytes: 0u32,
+            merged_rdata_bytes: 0u32,
+            lto_total_functions: 0u32,
+            lto_inlined_calls: 0u32,
+            lto_dead_stripped_functions: 0u32,
+            lto_verified_mir_bodies: 0u32,
+            pe_clean_verified: false,
+            linked_interface_fp: fingerprint128_zero(),
+            linked_lto_fp: fingerprint128_zero(),
+        };
+    }
+
+    // Emit PE32+ executable/DLL containing ONLY runtime sections (`.text` and `.rdata`),
+    // stripping `.axmeta`, `.axlto`, and `.axmir` (AXS-ART-022).
+    let eff_text_sz: u32 = if sess.merged_text_bytes == 0u32 { 16u32 } else { sess.merged_text_bytes };
+    let eff_rdata_sz: u32 = sess.merged_rdata_bytes;
+    let num_pe_secs: u16 = if eff_rdata_sz > 0u32 { 2u16 } else { 1u16 };
+
+    let file_align: u32 = 512u32;
+    let sec_align: u32 = 4096u32;
+    let headers_raw_end: u32 = (64 + 4 + COFF_FILE_HEADER_SIZE + PE_OPT_HDR64_SIZE + ((num_pe_secs as usize) * COFF_SECTION_HEADER_SIZE)) as u32;
+    let size_of_headers: u32 = pe_align_up(headers_raw_end, file_align);
+
+    let text_rva: u32 = sec_align;
+    let text_raw_ptr: u32 = size_of_headers;
+    let text_raw_sz: u32 = pe_align_up(eff_text_sz, file_align);
+
+    let rdata_rva: u32 = pe_align_up(text_rva + eff_text_sz, sec_align);
+    let rdata_raw_ptr: u32 = text_raw_ptr + text_raw_sz;
+    let rdata_raw_sz: u32 = pe_align_up(eff_rdata_sz, file_align);
+
+    let size_of_image: u32 = if eff_rdata_sz > 0u32 {
+        pe_align_up(rdata_rva + eff_rdata_sz, sec_align)
+    } else {
+        pe_align_up(text_rva + eff_text_sz, sec_align)
+    };
+
+    // 1. 64-byte DOS Header ("MZ" + e_lfanew = 64 at offset 60)
+    axmi_buf_push_u8(mut_view(*out_pe), 0x4Du8); // 'M'
+    axmi_buf_push_u8(mut_view(*out_pe), 0x5Au8); // 'Z'
+    let mut di: usize = 2;
+    while di < 60 {
+        axmi_buf_push_u8(mut_view(*out_pe), 0u8);
+        di = di + 1;
+    }
+    axmi_buf_push_u32_le(mut_view(*out_pe), 64u32); // e_lfanew = 64
+
+    // 2. 4-byte PE Signature ("PE\0\0")
+    axmi_buf_push_u8(mut_view(*out_pe), 0x50u8); // 'P'
+    axmi_buf_push_u8(mut_view(*out_pe), 0x45u8); // 'E'
+    axmi_buf_push_u8(mut_view(*out_pe), 0u8);
+    axmi_buf_push_u8(mut_view(*out_pe), 0u8);
+
+    // 3. 20-byte COFF File Header
+    let mut pe_chars: u16 = 0x0222u16; // EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE | DEBUG_STRIPPED
+    if image_kind == PE_IMAGE_KIND_DLL {
+        pe_chars = pe_chars | 0x2000u16; // IMAGE_FILE_DLL
+    }
+    axmi_buf_push_u16_le(mut_view(*out_pe), COFF_MACHINE_AMD64);
+    axmi_buf_push_u16_le(mut_view(*out_pe), num_pe_secs);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u16_le(mut_view(*out_pe), PE_OPT_HDR64_SIZE as u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), pe_chars);
+
+    // 4. 240-byte PE32+ Optional Header
+    axmi_buf_push_u16_le(mut_view(*out_pe), PE_OPT_HDR64_MAGIC);
+    axmi_buf_push_u8(mut_view(*out_pe), 14u8);
+    axmi_buf_push_u8(mut_view(*out_pe), 0u8);
+    axmi_buf_push_u32_le(mut_view(*out_pe), text_raw_sz);
+    axmi_buf_push_u32_le(mut_view(*out_pe), rdata_raw_sz);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u32_le(mut_view(*out_pe), text_rva);
+    axmi_buf_push_u32_le(mut_view(*out_pe), text_rva);
+    axmi_buf_push_u64_le(mut_view(*out_pe), 0x0000000140000000u64);
+    axmi_buf_push_u32_le(mut_view(*out_pe), sec_align);
+    axmi_buf_push_u32_le(mut_view(*out_pe), file_align);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 6u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 0u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 0u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 0u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 6u16);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 0u16);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u32_le(mut_view(*out_pe), size_of_image);
+    axmi_buf_push_u32_le(mut_view(*out_pe), size_of_headers);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u16_le(mut_view(*out_pe), 3u16); // IMAGE_SUBSYSTEM_WINDOWS_CUI
+    axmi_buf_push_u16_le(mut_view(*out_pe), 0x8160u16); // HIGH_ENTROPY_VA | DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER_AWARE
+    axmi_buf_push_u64_le(mut_view(*out_pe), 0x100000u64);
+    axmi_buf_push_u64_le(mut_view(*out_pe), 0x1000u64);
+    axmi_buf_push_u64_le(mut_view(*out_pe), 0x100000u64);
+    axmi_buf_push_u64_le(mut_view(*out_pe), 0x1000u64);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 0u32);
+    axmi_buf_push_u32_le(mut_view(*out_pe), 16u32); // NumberOfRvaAndSizes = 16
+    let mut dd: usize = 0;
+    while dd < 16 {
+        axmi_buf_push_u64_le(mut_view(*out_pe), 0u64);
+        dd = dd + 1;
+    }
+
+    // 5. PE Section Headers (ONLY runtime `.text` and `.rdata`)
+    coff_push_section_header(mut_view(*out_pe), COFF_NAME_TEXT, eff_text_sz, text_rva, text_raw_sz, text_raw_ptr, AX_COFF_TEXT_CHARS);
+    if eff_rdata_sz > 0u32 {
+        coff_push_section_header(mut_view(*out_pe), COFF_NAME_RDATA, eff_rdata_sz, rdata_rva, rdata_raw_sz, rdata_raw_ptr, AX_COFF_RDATA_CHARS);
+    }
+
+    // 6. Pad to `size_of_headers` and emit `.text` + `.rdata` raw payloads
+    while (out_pe.len as u32) < size_of_headers {
+        axmi_buf_push_u8(mut_view(*out_pe), 0u8);
+    }
+    let mut ti: u32 = 0u32;
+    while ti < text_raw_sz {
+        axmi_buf_push_u8(mut_view(*out_pe), if ti < eff_text_sz { 0xC3u8 } else { 0u8 });
+        ti = ti + 1u32;
+    }
+    if eff_rdata_sz > 0u32 {
+        let mut ri: u32 = 0u32;
+        while ri < rdata_raw_sz {
+            axmi_buf_push_u8(mut_view(*out_pe), if ri < eff_rdata_sz { 0x41u8 } else { 0u8 });
+            ri = ri + 1u32;
+        }
+    }
+
+    let strip_verify = container_verify_pe_image_stripped(out_pe.ptr as *const u8, out_pe.len);
+
+    ContainerLinkResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: AXMI_FORMAT_VERSION,
+        bad_section_type: 0u16,
+        image_kind: image_kind,
+        total_input_objects: sess.total_input_objects,
+        axiom_object_count: sess.axiom_object_count,
+        foreign_object_count: sess.foreign_object_count,
+        verified_axmeta_count: sess.verified_axmeta_count,
+        verified_axlto_count: sess.verified_axlto_count,
+        stripped_container_sections: sess.stripped_container_sections,
+        stripped_container_bytes: sess.stripped_container_bytes,
+        merged_runtime_sections: num_pe_secs as u32,
+        merged_text_bytes: eff_text_sz,
+        merged_rdata_bytes: eff_rdata_sz,
+        lto_total_functions: sess.lto_total_functions,
+        lto_inlined_calls: sess.lto_inlined_calls,
+        lto_dead_stripped_functions: sess.lto_dead_stripped_functions,
+        lto_verified_mir_bodies: sess.lto_verified_mir_bodies,
+        pe_clean_verified: strip_verify.is_valid_pe && strip_verify.is_stripped_clean,
+        linked_interface_fp: sess.linked_interface_fp,
+        linked_lto_fp: sess.linked_lto_fp,
+    }
+}
+
+// Verifies that a linked PE32+ `.exe` or `.dll` binary contains valid PE headers
+// and that all non-runtime `.axmeta`, `.axlto`, and `.axmir` sections (and their
+// `"AXMETA01"`, `"AXLTO001"`, `"AXMIR001"` payloads) were completely stripped (AXS-ART-022).
+pub fn container_verify_pe_image_stripped(pe_bytes: *const u8, pe_len: usize) -> PeStripVerifyResult {
+    let fail = PeStripVerifyResult {
+        is_valid_pe: false,
+        is_stripped_clean: false,
+        section_count: 0u32,
+        has_axmeta_section: false,
+        has_axlto_section: false,
+        has_axmir_section: false,
+        has_discardable_info_section: false,
+        leaked_magic_count: 0u32,
+    };
+
+    if (pe_bytes as usize) == 0 || pe_len < 128 {
+        return fail;
+    }
+    if axmi_read_u8(pe_bytes, 0) != 0x4Du8 || axmi_read_u8(pe_bytes, 1) != 0x5Au8 {
+        return fail;
+    }
+    let lfanew = axmi_read_u32_le(pe_bytes, 60) as usize;
+    if !axmi_check_bounds(lfanew as u64, (4 + COFF_FILE_HEADER_SIZE) as u64, pe_len as u64) {
+        return fail;
+    }
+    if axmi_read_u8(pe_bytes, lfanew) != 0x50u8 ||
+        axmi_read_u8(pe_bytes, lfanew + 1) != 0x45u8 ||
+        axmi_read_u8(pe_bytes, lfanew + 2) != 0u8 ||
+        axmi_read_u8(pe_bytes, lfanew + 3) != 0u8 {
+        return fail;
+    }
+
+    let fhdr_off = lfanew + 4;
+    let machine = axmi_read_u16_le(pe_bytes, fhdr_off);
+    let num_secs = axmi_read_u16_le(pe_bytes, fhdr_off + 2) as usize;
+    let opt_sz = axmi_read_u16_le(pe_bytes, fhdr_off + 16) as usize;
+    if machine != COFF_MACHINE_AMD64 || num_secs == 0 || opt_sz < 24 {
+        return fail;
+    }
+
+    let opt_off = fhdr_off + COFF_FILE_HEADER_SIZE;
+    let shdr_start = opt_off + opt_sz;
+    if !axmi_check_bounds(shdr_start as u64, (num_secs * COFF_SECTION_HEADER_SIZE) as u64, pe_len as u64) {
+        return fail;
+    }
+    if axmi_read_u16_le(pe_bytes, opt_off) != PE_OPT_HDR64_MAGIC {
+        return fail;
+    }
+
+    let mut has_meta = false;
+    let mut has_lto = false;
+    let mut has_mir = false;
+    let mut has_disc = false;
+
+    let mut s: usize = 0;
+    while s < num_secs {
+        let sh_off = shdr_start + (s * COFF_SECTION_HEADER_SIZE);
+        let raw_sz = axmi_read_u32_le(pe_bytes, sh_off + 16);
+        let raw_ptr = axmi_read_u32_le(pe_bytes, sh_off + 20);
+        let chars = axmi_read_u32_le(pe_bytes, sh_off + 36);
+
+        if raw_sz > 0u32 && !axmi_check_bounds(raw_ptr as u64, raw_sz as u64, pe_len as u64) {
+            return fail;
+        }
+        if coff_name_eq8_at(pe_bytes, sh_off, COFF_NAME_AXMETA_U64) { has_meta = true; }
+        if coff_name_eq8_at(pe_bytes, sh_off, COFF_NAME_AXLTO_U64) { has_lto = true; }
+        if coff_name_eq8_at(pe_bytes, sh_off, COFF_NAME_AXMIR_U64) { has_mir = true; }
+        if (chars & (IMAGE_SCN_LNK_INFO | IMAGE_SCN_MEM_DISCARDABLE)) != 0u32 {
+            has_disc = true;
+        }
+        s = s + 1;
+    }
+
+    let mut leaked: u32 = 0u32;
+    let mut pos: usize = 0;
+    while pos + 8 <= pe_len {
+        let w = axmi_read_u64_le(pe_bytes, pos);
+        if w == AXMETA_MAGIC_U64 || w == AXLTO_MAGIC_U64 || w == AXMIR_MAGIC_U64 {
+            leaked = leaked + 1u32;
+        }
+        pos = pos + 1;
+    }
+
+    let clean = !has_meta && !has_lto && !has_mir && !has_disc && leaked == 0u32;
+    PeStripVerifyResult {
+        is_valid_pe: true,
+        is_stripped_clean: clean,
+        section_count: num_secs as u32,
+        has_axmeta_section: has_meta,
+        has_axlto_section: has_lto,
+        has_axmir_section: has_mir,
+        has_discardable_info_section: has_disc,
+        leaked_magic_count: leaked,
+    }
+}
+
+// ============================================================================
+// 7. Standalone `.axpkg` Semantic Package Container Writer & Reader (SPEC-24)
+// ============================================================================
+
+@derive(Copy)
+pub struct AxPkgExtractResult {
+    pub status: u32,
+    pub canonical_diag_code: u32,
+    pub found_version: u16,
+    pub bad_section_type: u16,
+    pub section_count: u32,
+    pub coff_obj_size: u32,
+    pub interface_fingerprint: Fingerprint128,
+    pub lto_summary_fingerprint: Fingerprint128,
+    pub content_hash: Fingerprint128,
+}
+
+pub fn axpkg_serialize(
+    iface: mut_view<AxmiModuleInterface>,
+    lto: mut_view<AxLtoContainer>,
+    coff_obj_ptr: *const u8,
+    coff_obj_len: usize,
+    out: mut_view<AxmiBuffer>
+) -> ArtifactId {
+    out.len = 0;
+
+    let mut axmi_bytes = axmi_buf_empty();
+    let mut meta_bytes = axmi_buf_empty();
+    let mut lto_bytes = axmi_buf_empty();
+    axmi_buf_init(mut_view(axmi_bytes), 1024);
+    axmi_buf_init(mut_view(meta_bytes), 1024);
+    axmi_buf_init(mut_view(lto_bytes), 1024);
+
+    let _ = axmi_serialize(mut_view(*iface), mut_view(axmi_bytes));
+    let _ = axmeta_serialize(mut_view(*iface), mut_view(meta_bytes));
+    axlto_bind_to_interface(mut_view(*lto), view(*iface));
+    let _ = axlto_serialize(mut_view(*lto), mut_view(lto_bytes));
+
+    let sec_count: u32 = 4u32;
+    let payload_offset = AXMI_HEADER_SIZE + (4 * AXMI_SECTION_DESC_SIZE);
+
+    let mut mi: usize = 0;
+    while mi < 8 {
+        axmi_buf_push_u8(mut_view(*out), AXPKG_MAGIC[mi]);
+        mi = mi + 1;
+    }
+    axmi_buf_push_u16_le(mut_view(*out), AXPKG_FORMAT_FAMILY);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_FORMAT_VERSION);
+    axmi_buf_push_u16_le(mut_view(*out), AXPKG_ARTIFACT_KIND);
+    axmi_buf_push_u16_le(mut_view(*out), AXMI_DEFAULT_FLAGS | AXMI_FLAG_HAS_LTO);
+    axmi_buf_push_u64_le(mut_view(*out), iface.target_fingerprint.lo);
+    axmi_buf_push_u64_le(mut_view(*out), iface.interface_fingerprint.lo);
+    axmi_buf_push_u32_le(mut_view(*out), sec_count);
+    axmi_buf_push_u32_le(mut_view(*out), AXMI_PRODUCER_VERSION);
+    axmi_buf_push_u32_le(mut_view(*out), payload_offset as u32);
+    axmi_buf_push_u32_le(mut_view(*out), 0u32);
+    axmi_buf_push_fp128_le(mut_view(*out), fingerprint128_zero());
+
+    let mut si: usize = 0;
+    while si < (4 * AXMI_SECTION_DESC_SIZE) {
+        axmi_buf_push_u8(mut_view(*out), 0u8);
+        si = si + 1;
+    }
+
+    let mut s_idx: usize = 0;
+    while s_idx < 4 {
+        axmi_buf_align_to(mut_view(*out), 8);
+        let sec_start = out.len;
+        let sty: u16 = (s_idx + 1) as u16;
+        if sty == AXPKG_SEC_AXMI {
+            axmi_buf_push_bytes(mut_view(*out), axmi_bytes.ptr as *const u8, axmi_bytes.len);
+        } else if sty == AXPKG_SEC_AXMETA {
+            axmi_buf_push_bytes(mut_view(*out), meta_bytes.ptr as *const u8, meta_bytes.len);
+        } else if sty == AXPKG_SEC_AXLTO {
+            axmi_buf_push_bytes(mut_view(*out), lto_bytes.ptr as *const u8, lto_bytes.len);
+        } else {
+            axmi_buf_push_bytes(mut_view(*out), coff_obj_ptr, coff_obj_len);
+        }
+        let sec_size = out.len - sec_start;
+        let sec_cksum = container_compute_section_checksum(out.ptr as *const u8, sec_start, sec_size);
+
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off, s_idx as u32);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 4, (sty as u32) | ((AXMI_SEC_DEFAULT_FLAGS as u32) << 16u32));
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 8, 8u32);
+        axmi_buf_patch_u32_le(mut_view(*out), desc_off + 12, sec_start as u32);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 16, sec_size as u64);
+        axmi_buf_patch_u64_le(mut_view(*out), desc_off + 24, sec_size as u64);
+        axmi_buf_patch_fp128_le(mut_view(*out), desc_off + 32, sec_cksum);
+        s_idx = s_idx + 1;
+    }
+
+    axmi_buf_free(mut_view(axmi_bytes));
+    axmi_buf_free(mut_view(meta_bytes));
+    axmi_buf_free(mut_view(lto_bytes));
+
+    let total_payload_size = out.len - AXMI_HEADER_SIZE;
+    axmi_buf_patch_u32_le(mut_view(*out), 44, total_payload_size as u32);
+    let content_hash = container_compute_content_hash(out.ptr as *const u8, out.len);
+    axmi_buf_patch_fp128_le(mut_view(*out), 48, content_hash);
+
+    ArtifactId {
+        content_hash: content_hash,
+        schema_id: AXPKG_FORMAT_FAMILY,
+        schema_version: AXMI_FORMAT_VERSION,
+    }
+}
+
+pub fn axpkg_deserialize(
+    bytes: *const u8,
+    total_len: usize,
+    expected_target: view<AxmiTargetExpectation>,
+    out_iface: mut_view<AxmiModuleInterface>,
+    out_lto: mut_view<AxLtoContainer>
+) -> AxPkgExtractResult {
+    let fail = AxPkgExtractResult {
+        status: AX_ART_CORRUPT_HEADER,
+        canonical_diag_code: AX_LINK_BAD_ARTIFACT,
+        found_version: 0u16,
+        bad_section_type: 0u16,
+        section_count: 0u32,
+        coff_obj_size: 0u32,
+        interface_fingerprint: fingerprint128_zero(),
+        lto_summary_fingerprint: fingerprint128_zero(),
+        content_hash: fingerprint128_zero(),
+    };
+
+    if (bytes as usize) == 0 || total_len < AXMI_HEADER_SIZE {
+        return fail;
+    }
+    if axmi_read_u64_le(bytes, 0) != AXPKG_MAGIC_U64 {
+        return fail;
+    }
+    let family = axmi_read_u16_le(bytes, 8);
+    let ver = axmi_read_u16_le(bytes, 10);
+    let kind = axmi_read_u16_le(bytes, 12);
+    if family != AXPKG_FORMAT_FAMILY || kind != AXPKG_ARTIFACT_KIND {
+        return fail;
+    }
+    if ver != AXMI_FORMAT_VERSION {
+        return AxPkgExtractResult {
+            status: AX_ART_VERSION_MISMATCH,
+            canonical_diag_code: AX_LINK_ARTIFACT_SCHEMA_MISMATCH,
+            found_version: ver,
+            bad_section_type: 0u16,
+            section_count: 0u32,
+            coff_obj_size: 0u32,
+            interface_fingerprint: fingerprint128_zero(),
+            lto_summary_fingerprint: fingerprint128_zero(),
+            content_hash: fingerprint128_zero(),
+        };
+    }
+
+    let sec_count = axmi_read_u32_le(bytes, 32);
+    let payload_off = axmi_read_u32_le(bytes, 40) as u64;
+    let payload_sz = axmi_read_u32_le(bytes, 44) as u64;
+    let stored_hash = axmi_read_fp128_le(bytes, 48);
+
+    if sec_count != 4u32 || payload_off != ((AXMI_HEADER_SIZE + (4 * AXMI_SECTION_DESC_SIZE)) as u64) {
+        return fail;
+    }
+    if !axmi_check_bounds(AXMI_HEADER_SIZE as u64, payload_sz, total_len as u64) ||
+        ((AXMI_HEADER_SIZE as u64) + payload_sz) != (total_len as u64) {
+        return fail;
+    }
+    let calc_hash = container_compute_content_hash(bytes, total_len);
+    if !fingerprint128_eq(stored_hash, calc_hash) {
+        return AxPkgExtractResult {
+            status: AX_ART_CHECKSUM_MISMATCH,
+            canonical_diag_code: AX_LINK_BAD_ARTIFACT,
+            found_version: ver,
+            bad_section_type: 0u16,
+            section_count: 0u32,
+            coff_obj_size: 0u32,
+            interface_fingerprint: fingerprint128_zero(),
+            lto_summary_fingerprint: fingerprint128_zero(),
+            content_hash: fingerprint128_zero(),
+        };
+    }
+
+    let mut coff_sz: u32 = 0u32;
+    let mut s_idx: usize = 0;
+    while s_idx < 4 {
+        let desc_off = AXMI_HEADER_SIZE + (s_idx * AXMI_SECTION_DESC_SIZE);
+        let sty = axmi_read_u16_le(bytes, desc_off + 4);
+        let soff = axmi_read_u32_le(bytes, desc_off + 12) as u64;
+        let ssz = axmi_read_u64_le(bytes, desc_off + 24);
+        let scksum = axmi_read_fp128_le(bytes, desc_off + 32);
+
+        if !axmi_check_bounds(soff, ssz, total_len as u64) {
+            return fail;
+        }
+        let c_cksum = container_compute_section_checksum(bytes, soff as usize, ssz as usize);
+        if !fingerprint128_eq(scksum, c_cksum) {
+            return AxPkgExtractResult {
+                status: AX_ART_CHECKSUM_MISMATCH,
+                canonical_diag_code: AX_LINK_BAD_ARTIFACT,
+                found_version: ver,
+                bad_section_type: sty,
+                section_count: 0u32,
+                coff_obj_size: 0u32,
+                interface_fingerprint: fingerprint128_zero(),
+                lto_summary_fingerprint: fingerprint128_zero(),
+                content_hash: fingerprint128_zero(),
+            };
+        }
+
+        let sec_ptr = unsafe { bytes + (soff as usize) };
+        let sec_len = ssz as usize;
+        if sty == AXPKG_SEC_AXMI {
+            let r1 = axmi_deserialize(sec_ptr, sec_len, expected_target, mut_view(*out_iface));
+            if r1.status != AXMI_STATUS_OK {
+                return AxPkgExtractResult {
+                    status: r1.status,
+                    canonical_diag_code: r1.canonical_diag_code,
+                    found_version: r1.found_version,
+                    bad_section_type: sty,
+                    section_count: 0u32,
+                    coff_obj_size: 0u32,
+                    interface_fingerprint: fingerprint128_zero(),
+                    lto_summary_fingerprint: fingerprint128_zero(),
+                    content_hash: fingerprint128_zero(),
+                };
+            }
+        } else if sty == AXPKG_SEC_AXMETA {
+            let r2 = axmeta_deserialize(sec_ptr, sec_len, expected_target, mut_view(*out_iface));
+            if r2.status != AXMI_STATUS_OK {
+                return AxPkgExtractResult {
+                    status: r2.status,
+                    canonical_diag_code: r2.canonical_diag_code,
+                    found_version: r2.found_version,
+                    bad_section_type: sty,
+                    section_count: 0u32,
+                    coff_obj_size: 0u32,
+                    interface_fingerprint: fingerprint128_zero(),
+                    lto_summary_fingerprint: fingerprint128_zero(),
+                    content_hash: fingerprint128_zero(),
+                };
+            }
+        } else if sty == AXPKG_SEC_AXLTO {
+            let r3 = axlto_deserialize(sec_ptr, sec_len, expected_target, mut_view(*out_lto));
+            if r3.status != AXMI_STATUS_OK {
+                return AxPkgExtractResult {
+                    status: r3.status,
+                    canonical_diag_code: r3.canonical_diag_code,
+                    found_version: r3.found_version,
+                    bad_section_type: sty,
+                    section_count: 0u32,
+                    coff_obj_size: 0u32,
+                    interface_fingerprint: fingerprint128_zero(),
+                    lto_summary_fingerprint: fingerprint128_zero(),
+                    content_hash: fingerprint128_zero(),
+                };
+            }
+        } else if sty == AXPKG_SEC_COFF_OBJ {
+            coff_sz = sec_len as u32;
+            let mut tmp_m = axmi_interface_empty();
+            let mut tmp_l = axlto_container_empty();
+            axmi_interface_init(mut_view(tmp_m));
+            axlto_container_init(mut_view(tmp_l));
+            let r4 = container_extract_coff_obj(sec_ptr, sec_len, expected_target, mut_view(tmp_m), mut_view(tmp_l));
+            axmi_interface_free(mut_view(tmp_m));
+            axlto_container_free(mut_view(tmp_l));
+            if r4.status != AXMI_STATUS_OK {
+                return AxPkgExtractResult {
+                    status: r4.status,
+                    canonical_diag_code: r4.canonical_diag_code,
+                    found_version: r4.found_version,
+                    bad_section_type: sty,
+                    section_count: 0u32,
+                    coff_obj_size: 0u32,
+                    interface_fingerprint: fingerprint128_zero(),
+                    lto_summary_fingerprint: fingerprint128_zero(),
+                    content_hash: fingerprint128_zero(),
+                };
+            }
+        }
+        s_idx = s_idx + 1;
+    }
+
+    AxPkgExtractResult {
+        status: AXMI_STATUS_OK,
+        canonical_diag_code: AXMI_STATUS_OK,
+        found_version: ver,
+        bad_section_type: 0u16,
+        section_count: sec_count,
+        coff_obj_size: coff_sz,
+        interface_fingerprint: out_iface.interface_fingerprint,
+        lto_summary_fingerprint: out_lto.lto_summary_fingerprint,
+        content_hash: stored_hash,
+    }
+}
+
+// ============================================================================
+// 8. Deterministic `inspect --artifact-sections` Formatter (AXS-ART-050)
+// ============================================================================
+
+fn container_push_linkage_name(out: mut_view<DiagBuffer>, lnk: u8) {
+    if lnk == AXLTO_LINK_PUBLIC { container_push_ascii_slice(mut_view(*out), 626, 3); return; }
+    if lnk == AXLTO_LINK_INTERNAL { container_push_ascii_slice(mut_view(*out), 629, 8); return; }
+    container_push_ascii_slice(mut_view(*out), 637, 8); // "weak_odr"
+}
+
+fn container_push_root_name(out: mut_view<DiagBuffer>, rk: u8) {
+    if rk == AXLTO_ROOT_NONE { container_push_ascii_slice(mut_view(*out), 645, 4); return; }
+    if rk == AXLTO_ROOT_ENTRY { container_push_ascii_slice(mut_view(*out), 649, 5); return; }
+    if rk == AXLTO_ROOT_EXPORTED { container_push_ascii_slice(mut_view(*out), 654, 8); return; }
+    container_push_ascii_slice(mut_view(*out), 662, 6); // "pinned"
+}
+
+pub fn container_emit_diag(
+    status: u32,
+    found_ver: u16,
+    bad_sec: u16,
+    artifact_name: StrView,
+    out: mut_view<DiagBuffer>
+) {
+    // "diag["
+    diag_buf_push_byte(mut_view(*out), 100u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 103u8);
+    diag_buf_push_byte(mut_view(*out), 91u8);
+    axmi_push_diag_status_name(mut_view(*out), status);
+    diag_buf_push_byte(mut_view(*out), 47u8); // '/'
+    axmi_push_canonical_link_diag_name(mut_view(*out), status);
+    // "] artifact="
+    diag_buf_push_byte(mut_view(*out), 93u8);
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 114u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 102u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 99u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    diag_buf_push_sv(mut_view(*out), artifact_name);
+    // " detail="
+    diag_buf_push_byte(mut_view(*out), 32u8);
+    diag_buf_push_byte(mut_view(*out), 100u8);
+    diag_buf_push_byte(mut_view(*out), 101u8);
+    diag_buf_push_byte(mut_view(*out), 116u8);
+    diag_buf_push_byte(mut_view(*out), 97u8);
+    diag_buf_push_byte(mut_view(*out), 105u8);
+    diag_buf_push_byte(mut_view(*out), 108u8);
+    diag_buf_push_byte(mut_view(*out), 61u8);
+    if status == AX_ART_VERSION_MISMATCH {
+        diag_buf_push_u32(mut_view(*out), found_ver as u32);
+    } else {
+        diag_buf_push_u32(mut_view(*out), bad_sec as u32);
+    }
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+pub fn container_inspect_obj_dump(
+    eres: view<CoffExtractResult>,
+    meta: view<AxmiModuleInterface>,
+    lto: view<AxLtoContainer>,
+    out: mut_view<DiagBuffer>
+) {
+    // 1. "container_obj sections=<S> runtime=<R> container=<C> foreign=<F> has_axmeta=<M> has_axlto=<L> has_axmir=<IR> chars_meta=<CM> chars_lto=<CL>\n"
+    container_push_ascii_slice(mut_view(*out), 0, 23);
+    diag_buf_push_u32(mut_view(*out), eres.total_sections);
+    container_push_ascii_slice(mut_view(*out), 23, 9);
+    diag_buf_push_u32(mut_view(*out), eres.runtime_section_count);
+    container_push_ascii_slice(mut_view(*out), 32, 11);
+    diag_buf_push_u32(mut_view(*out), eres.container_section_count);
+    container_push_ascii_slice(mut_view(*out), 43, 9);
+    axmi_push_bool(mut_view(*out), eres.is_foreign_coff);
+    container_push_ascii_slice(mut_view(*out), 52, 12);
+    axmi_push_bool(mut_view(*out), eres.has_axmeta);
+    container_push_ascii_slice(mut_view(*out), 64, 11);
+    axmi_push_bool(mut_view(*out), eres.has_axlto);
+    container_push_ascii_slice(mut_view(*out), 75, 11);
+    axmi_push_bool(mut_view(*out), eres.has_axmir);
+    container_push_ascii_slice(mut_view(*out), 86, 12);
+    diag_buf_push_u32(mut_view(*out), eres.axmeta_chars);
+    container_push_ascii_slice(mut_view(*out), 98, 11);
+    diag_buf_push_u32(mut_view(*out), eres.axlto_chars);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    if eres.has_axmeta {
+        // "axmeta_header magic=AXMETA01 version=<V> sections=<S> interface_fp=<hex> abi_fp=<hex> target_fp=<hex> content_hash=<hex>\n"
+        container_push_ascii_slice(mut_view(*out), 109, 37);
+        diag_buf_push_u32(mut_view(*out), meta.header.schema_version as u32);
+        container_push_ascii_slice(mut_view(*out), 146, 10);
+        diag_buf_push_u32(mut_view(*out), meta.section_count);
+        container_push_ascii_slice(mut_view(*out), 156, 14);
+        axmi_push_fp128_hex(mut_view(*out), meta.interface_fingerprint);
+        container_push_ascii_slice(mut_view(*out), 170, 8);
+        axmi_push_fp128_hex(mut_view(*out), meta.abi_fingerprint);
+        container_push_ascii_slice(mut_view(*out), 178, 11);
+        axmi_push_fp128_hex(mut_view(*out), meta.target_fingerprint);
+        container_push_ascii_slice(mut_view(*out), 189, 14);
+        axmi_push_fp128_hex(mut_view(*out), meta.header.content_hash);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+    }
+
+    if eres.has_axlto {
+        container_inspect_lto_dump(lto, mut_view(*out));
+    }
+}
+
+pub fn container_inspect_lto_dump(lto: view<AxLtoContainer>, out: mut_view<DiagBuffer>) {
+    // "axlto_header magic=AXLTO001 version=<V> sections=<S> fns=<F> edges=<E> mir_bodies=<M> interface_fp=<hex> lto_fp=<hex> content_hash=<hex>\n"
+    container_push_ascii_slice(mut_view(*out), 203, 36);
+    diag_buf_push_u32(mut_view(*out), lto.header.schema_version as u32);
+    container_push_ascii_slice(mut_view(*out), 146, 10); // " sections="
+    diag_buf_push_u32(mut_view(*out), lto.section_count);
+    container_push_ascii_slice(mut_view(*out), 239, 5); // " fns="
+    diag_buf_push_u32(mut_view(*out), lto.function_count);
+    container_push_ascii_slice(mut_view(*out), 244, 7); // " edges="
+    diag_buf_push_u32(mut_view(*out), lto.call_edge_count);
+    container_push_ascii_slice(mut_view(*out), 251, 12); // " mir_bodies="
+    diag_buf_push_u32(mut_view(*out), lto.mir_body_count);
+    container_push_ascii_slice(mut_view(*out), 156, 14); // " interface_fp="
+    axmi_push_fp128_hex(mut_view(*out), lto.interface_fingerprint);
+    container_push_ascii_slice(mut_view(*out), 263, 8); // " lto_fp="
+    axmi_push_fp128_hex(mut_view(*out), lto.lto_summary_fingerprint);
+    container_push_ascii_slice(mut_view(*out), 189, 14); // " content_hash="
+    axmi_push_fp128_hex(mut_view(*out), lto.header.content_hash);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    let mut i: usize = 0;
+    while i < (lto.function_count as usize) {
+        let f = unsafe { *(lto.functions + i) };
+        // "lto_fn <SemanticKey> linkage=<L> root=<R> insts=<I> weight=<W> inline=<IN> effects=<E> escape=<ES> alias=<AL> spec_key=<SK> digest=<hex>\n"
+        container_push_ascii_slice(mut_view(*out), 271, 7);
+        query_db_push_semantic_key(mut_view(*out), view(f.semantic_key));
+        container_push_ascii_slice(mut_view(*out), 278, 9);
+        container_push_linkage_name(mut_view(*out), f.linkage_kind);
+        container_push_ascii_slice(mut_view(*out), 287, 6);
+        container_push_root_name(mut_view(*out), f.root_kind);
+        container_push_ascii_slice(mut_view(*out), 293, 7);
+        diag_buf_push_u32(mut_view(*out), f.inst_count);
+        container_push_ascii_slice(mut_view(*out), 300, 8);
+        diag_buf_push_u32(mut_view(*out), f.inline_weight);
+        container_push_ascii_slice(mut_view(*out), 308, 8);
+        axmi_push_bool(mut_view(*out), f.inline_hint);
+        container_push_ascii_slice(mut_view(*out), 316, 9);
+        diag_buf_push_u32(mut_view(*out), f.effect_mask);
+        container_push_ascii_slice(mut_view(*out), 325, 8);
+        diag_buf_push_u32(mut_view(*out), f.no_escape_mask);
+        container_push_ascii_slice(mut_view(*out), 333, 7);
+        diag_buf_push_u32(mut_view(*out), f.no_alias_mask);
+        container_push_ascii_slice(mut_view(*out), 340, 10);
+        axmi_push_hex_u64(mut_view(*out), f.specialization_key);
+        container_push_ascii_slice(mut_view(*out), 350, 8);
+        axmi_push_fp128_hex(mut_view(*out), f.body_digest);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.call_edge_count as usize) {
+        let e = unsafe { *(lto.call_edges + i) };
+        // "lto_edge caller=<C> callee=<SemanticKey> sites=<S> hotness=<H> direct=<D> can_inline=<CI>\n"
+        container_push_ascii_slice(mut_view(*out), 358, 16);
+        diag_buf_push_u32(mut_view(*out), e.caller_def_id.v);
+        container_push_ascii_slice(mut_view(*out), 374, 8);
+        query_db_push_semantic_key(mut_view(*out), view(e.callee_key));
+        container_push_ascii_slice(mut_view(*out), 382, 7);
+        diag_buf_push_u32(mut_view(*out), e.call_site_count);
+        container_push_ascii_slice(mut_view(*out), 389, 9);
+        diag_buf_push_u32(mut_view(*out), e.hotness_weight);
+        container_push_ascii_slice(mut_view(*out), 398, 8);
+        axmi_push_bool(mut_view(*out), e.is_direct);
+        container_push_ascii_slice(mut_view(*out), 406, 12);
+        axmi_push_bool(mut_view(*out), e.can_inline);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+
+    i = 0;
+    while i < (lto.mir_body_count as usize) {
+        let m = unsafe { *(lto.mir_bodies + i) };
+        // "lto_mir <SemanticKey> schema=<S> blocks=<B> locals=<L> insts=<I> opcodes=<O> verified=<V> digest=<hex>\n"
+        container_push_ascii_slice(mut_view(*out), 418, 8);
+        query_db_push_semantic_key(mut_view(*out), view(m.semantic_key));
+        container_push_ascii_slice(mut_view(*out), 426, 8);
+        diag_buf_push_u32(mut_view(*out), m.mir_schema_version as u32);
+        container_push_ascii_slice(mut_view(*out), 434, 8);
+        diag_buf_push_u32(mut_view(*out), m.block_count);
+        container_push_ascii_slice(mut_view(*out), 442, 8);
+        diag_buf_push_u32(mut_view(*out), m.local_count);
+        container_push_ascii_slice(mut_view(*out), 293, 7); // " insts="
+        diag_buf_push_u32(mut_view(*out), m.inst_count);
+        container_push_ascii_slice(mut_view(*out), 450, 9); // " opcodes="
+        diag_buf_push_u32(mut_view(*out), m.opcode_len);
+        container_push_ascii_slice(mut_view(*out), 459, 10); // " verified="
+        axmi_push_bool(mut_view(*out), m.ownership_verified);
+        container_push_ascii_slice(mut_view(*out), 350, 8); // " digest="
+        axmi_push_fp128_hex(mut_view(*out), m.body_digest);
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1;
+    }
+}
+
+pub fn container_inspect_pe_link_dump(res: view<ContainerLinkResult>, out: mut_view<DiagBuffer>) {
+    // "pe_link kind=<exe|dll> objs=<O> axiom_objs=<A> foreign_objs=<F> stripped_secs=<SS> stripped_bytes=<SB> runtime=<R> text_bytes=<TB> rdata_bytes=<RB> fns=<FN> inlined=<IN> dead_stripped=<DS> mir_bodies=<MB> pe_clean=<PC> interface_fp=<hex> lto_fp=<hex>\n"
+    container_push_ascii_slice(mut_view(*out), 469, 13);
+    if res.image_kind == PE_IMAGE_KIND_DLL {
+        container_push_ascii_slice(mut_view(*out), 485, 3);
+    } else {
+        container_push_ascii_slice(mut_view(*out), 482, 3);
+    }
+    container_push_ascii_slice(mut_view(*out), 488, 6);
+    diag_buf_push_u32(mut_view(*out), res.total_input_objects);
+    container_push_ascii_slice(mut_view(*out), 494, 12);
+    diag_buf_push_u32(mut_view(*out), res.axiom_object_count);
+    container_push_ascii_slice(mut_view(*out), 506, 14);
+    diag_buf_push_u32(mut_view(*out), res.foreign_object_count);
+    container_push_ascii_slice(mut_view(*out), 520, 15);
+    diag_buf_push_u32(mut_view(*out), res.stripped_container_sections);
+    container_push_ascii_slice(mut_view(*out), 535, 16);
+    diag_buf_push_u32(mut_view(*out), res.stripped_container_bytes);
+    container_push_ascii_slice(mut_view(*out), 23, 9); // " runtime="
+    diag_buf_push_u32(mut_view(*out), res.merged_runtime_sections);
+    container_push_ascii_slice(mut_view(*out), 551, 12);
+    diag_buf_push_u32(mut_view(*out), res.merged_text_bytes);
+    container_push_ascii_slice(mut_view(*out), 563, 13);
+    diag_buf_push_u32(mut_view(*out), res.merged_rdata_bytes);
+    container_push_ascii_slice(mut_view(*out), 239, 5); // " fns="
+    diag_buf_push_u32(mut_view(*out), res.lto_total_functions);
+    container_push_ascii_slice(mut_view(*out), 576, 9);
+    diag_buf_push_u32(mut_view(*out), res.lto_inlined_calls);
+    container_push_ascii_slice(mut_view(*out), 585, 15);
+    diag_buf_push_u32(mut_view(*out), res.lto_dead_stripped_functions);
+    container_push_ascii_slice(mut_view(*out), 251, 12); // " mir_bodies="
+    diag_buf_push_u32(mut_view(*out), res.lto_verified_mir_bodies);
+    container_push_ascii_slice(mut_view(*out), 600, 10);
+    axmi_push_bool(mut_view(*out), res.pe_clean_verified);
+    container_push_ascii_slice(mut_view(*out), 156, 14); // " interface_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.linked_interface_fp);
+    container_push_ascii_slice(mut_view(*out), 263, 8); // " lto_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.linked_lto_fp);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+pub fn container_inspect_archive_dump(res: view<CoffArchiveExtractResult>, out: mut_view<DiagBuffer>) {
+    // "archive members=<M> axiom_objs=<A> foreign_objs=<F> has_axmeta=<M> has_axlto=<L> runtime=<R> interface_fp=<hex> lto_fp=<hex>\n"
+    container_push_ascii_slice(mut_view(*out), 610, 16);
+    diag_buf_push_u32(mut_view(*out), res.member_count);
+    container_push_ascii_slice(mut_view(*out), 494, 12);
+    diag_buf_push_u32(mut_view(*out), res.axiom_member_count);
+    container_push_ascii_slice(mut_view(*out), 506, 14);
+    diag_buf_push_u32(mut_view(*out), res.foreign_member_count);
+    container_push_ascii_slice(mut_view(*out), 52, 12); // " has_axmeta="
+    diag_buf_push_u32(mut_view(*out), res.total_axmeta_sections);
+    container_push_ascii_slice(mut_view(*out), 64, 11); // " has_axlto="
+    diag_buf_push_u32(mut_view(*out), res.total_axlto_sections);
+    container_push_ascii_slice(mut_view(*out), 23, 9); // " runtime="
+    diag_buf_push_u32(mut_view(*out), res.total_runtime_sections);
+    container_push_ascii_slice(mut_view(*out), 156, 14); // " interface_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.combined_interface_fp);
+    container_push_ascii_slice(mut_view(*out), 263, 8); // " lto_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.combined_lto_fp);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
+
+pub fn container_inspect_pkg_dump(res: view<AxPkgExtractResult>, out: mut_view<DiagBuffer>) {
+    // "axpkg_header magic=AXPKG001 version=<V> sections=<S> obj_size=<O> interface_fp=<hex> lto_fp=<hex> content_hash=<hex>\n"
+    container_push_ascii_slice(mut_view(*out), 668, 36);
+    diag_buf_push_u32(mut_view(*out), res.found_version as u32);
+    container_push_ascii_slice(mut_view(*out), 146, 10); // " sections="
+    diag_buf_push_u32(mut_view(*out), res.section_count);
+    container_push_ascii_slice(mut_view(*out), 704, 10); // " obj_size="
+    diag_buf_push_u32(mut_view(*out), res.coff_obj_size);
+    container_push_ascii_slice(mut_view(*out), 156, 14); // " interface_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.interface_fingerprint);
+    container_push_ascii_slice(mut_view(*out), 263, 8); // " lto_fp="
+    axmi_push_fp128_hex(mut_view(*out), res.lto_summary_fingerprint);
+    container_push_ascii_slice(mut_view(*out), 189, 14); // " content_hash="
+    axmi_push_fp128_hex(mut_view(*out), res.content_hash);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+}
