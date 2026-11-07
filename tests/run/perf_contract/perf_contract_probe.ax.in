@@ -1,0 +1,526 @@
+// Live probe for `compiler.driver.perf_telemetry` (`--time-passes`, `--size-report`,
+// `ProfileCostPolicy`, `AutoTuneBudget`, and `ArtifactProvenanceHeader` — SPEC-76 / T625).
+
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_free
+use compiler.obj.coff.SectionId
+use compiler.link.gc_icf.SEC_KIND_TEXT
+use compiler.link.gc_icf.SEC_KIND_BSS
+use compiler.link.gc_icf.GC_ROOT_ENTRY
+use compiler.link.gc_icf.HOTNESS_BUCKET_HOT
+use compiler.link.gc_icf.HOTNESS_BUCKET_WARM
+use compiler.link.gc_icf.HOTNESS_BUCKET_COLD
+use compiler.link.gc_icf.LINK_PROFILE_SPEED
+use compiler.link.gc_icf.RUNTIME_COMP_PANIC
+use compiler.link.gc_icf.GcIcfStats
+use compiler.link.gc_icf.gc_byte_at
+use compiler.link.gc_icf.gc_icf_stats_zero
+use compiler.link.gc_icf.section_node_default
+use compiler.link.gc_icf.section_graph_new
+use compiler.link.gc_icf.section_graph_add_node
+use compiler.link.gc_icf.section_graph_set_bytes
+use compiler.link.gc_icf.section_graph_mark_root
+use compiler.link.gc_icf.section_graph_add_reloc
+use compiler.link.gc_icf.link_run_gc_icf_pipeline
+use compiler.driver.perf_telemetry.PERF_OPT_O0
+use compiler.driver.perf_telemetry.PERF_OPT_O1
+use compiler.driver.perf_telemetry.PERF_OPT_O2
+use compiler.driver.perf_telemetry.PERF_OPT_OS
+use compiler.driver.perf_telemetry.PERF_OPT_OZ
+use compiler.driver.perf_telemetry.TUNE_SCOPE_LOOP
+use compiler.driver.perf_telemetry.STAGE_TIMING_LEX
+use compiler.driver.perf_telemetry.PASS_TIMING_BCE_RANGE
+use compiler.driver.perf_telemetry.AutoTuneBudget
+use compiler.driver.perf_telemetry.AutoTuneCandidate
+use compiler.driver.perf_telemetry.PassTimingRecord
+use compiler.driver.perf_telemetry.perf_policy_for_profile
+use compiler.driver.perf_telemetry.perf_should_inline
+use compiler.driver.perf_telemetry.perf_can_share_monomorphized_body
+use compiler.driver.perf_telemetry.perf_autotune_default_budget
+use compiler.driver.perf_telemetry.perf_autotune_evaluate
+use compiler.driver.perf_telemetry.perf_compute_artifact_provenance
+use compiler.driver.perf_telemetry.perf_verify_telemetry_orthogonality
+use compiler.driver.perf_telemetry.time_passes_report_new
+use compiler.driver.perf_telemetry.time_passes_report_free
+use compiler.driver.perf_telemetry.time_passes_record_push
+use compiler.driver.perf_telemetry.time_passes_deterministic_digest
+use compiler.driver.perf_telemetry.time_passes_format_human
+use compiler.driver.perf_telemetry.time_passes_format_json
+use compiler.driver.perf_telemetry.size_report_free
+use compiler.driver.perf_telemetry.size_report_check_alignment_budget
+use compiler.driver.perf_telemetry.size_report_build_from_section_graph
+use compiler.driver.perf_telemetry.size_report_format_human
+use compiler.driver.perf_telemetry.size_report_format_json
+use compiler.driver.perf_telemetry.perf_sym_entry_at
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn alloc_fill_bytes(arena: mut_view<Arena>, byte_len: usize, b0: u8, b1: u8) -> *mut u8 {
+    let p = arena_alloc_raw(mut_view(*arena), byte_len, 1);
+    let mut i: usize = 0;
+    while i < byte_len {
+        let v: u8 = if i == 0 { b0 } else if i == 1 { b1 } else { 0x90u8 };
+        unsafe { *gc_byte_at(p, i) = v; }
+        i = i + 1;
+    }
+    p
+}
+
+// -----------------------------------------------------------------------------
+// Probe 1: Optimization Profiles, Inlining Cost Models & Monomorphization Sharing
+// -----------------------------------------------------------------------------
+fn probe_profile_policies() -> i32 {
+    let p_o0 = perf_policy_for_profile(PERF_OPT_O0);
+    let p_o1 = perf_policy_for_profile(PERF_OPT_O1);
+    let p_o2 = perf_policy_for_profile(PERF_OPT_O2);
+    let p_os = perf_policy_for_profile(PERF_OPT_OS);
+    let p_oz = perf_policy_for_profile(PERF_OPT_OZ);
+
+    // REQ-OPT-334: No optimization profile requires a monolithic runtime.
+    if p_o0.requires_monolithic_runtime || p_o1.requires_monolithic_runtime ||
+       p_o2.requires_monolithic_runtime || p_os.requires_monolithic_runtime ||
+       p_oz.requires_monolithic_runtime {
+        return 10;
+    }
+
+    // AXS-PERF-001 & AXS-PERF-003: Safety barriers preserved at every optimization level.
+    if !p_o0.preserve_safety_barriers || !p_o1.preserve_safety_barriers ||
+       !p_o2.preserve_safety_barriers || !p_os.preserve_safety_barriers ||
+       !p_oz.preserve_safety_barriers {
+        return 11;
+    }
+
+    // Verify monotonic inline cost thresholds: -O0 < -Oz < -Os < -O1 < -O2
+    let c_o0 = p_o0.inline_base_cost;
+    let c_oz = p_oz.inline_base_cost;
+    let c_os = p_os.inline_base_cost;
+    let c_o1 = p_o1.inline_base_cost;
+    let c_o2 = p_o2.inline_base_cost;
+    if !(c_o0 == 0u32 && c_oz < c_os && c_os < c_o1 && c_o1 < c_o2) {
+        return 12;
+    }
+
+    // At -O0, never inline; at -O1..-Oz, single-callsite small helper inlines.
+    if perf_should_inline(view(p_o0), 10u32, 1u32, true, false, 100u32, 0u32) {
+        return 13;
+    }
+    if !perf_should_inline(view(p_oz), 20u32, 1u32, false, false, 100u32, 0u32) {
+        return 14;
+    }
+    // Cold callsite with multiple callers is rejected in -Os/-Oz.
+    if perf_should_inline(view(p_os), 20u32, 3u32, false, true, 100u32, 0u32) {
+        return 15;
+    }
+    // Hot callsite up to 400 cost units is inlined in -O2.
+    if !perf_should_inline(view(p_o2), 400u32, 4u32, true, false, 2000u32, 0u32) {
+        return 16;
+    }
+
+    // REQ-OPT-295: Polymorphic/type-erased body sharing when layout size & align match.
+    if !perf_can_share_monomorphized_body(view(p_os), 8u32, 8u32, 8u32, 8u32, false, true) {
+        return 17;
+    }
+    if perf_can_share_monomorphized_body(view(p_os), 8u32, 8u32, 16u32, 8u32, false, false) {
+        return 18;
+    }
+    // At -O2, hot loop keeps specialized instantiation instead of type-erased sharing.
+    if perf_can_share_monomorphized_body(view(p_o2), 8u32, 8u32, 8u32, 8u32, false, true) {
+        return 19;
+    }
+
+    0
+}
+
+// -----------------------------------------------------------------------------
+// Probe 2: Bounded Auto-Tuning (`AutoTuneBudget`) & Provenance Orthogonality
+// -----------------------------------------------------------------------------
+fn probe_autotune_and_provenance() -> i32 {
+    let mut budget: AutoTuneBudget = perf_autotune_default_budget(TUNE_SCOPE_LOOP);
+    budget.max_candidates = 3u32;
+    budget.max_iterations_per_cand = 16u32;
+    budget.max_wall_time_ms = 60u64;
+    budget.max_memory_bytes = 67108864u64;
+
+    let cands: [5]AutoTuneCandidate = [
+        // Candidate 1: legal baseline (400us)
+        AutoTuneCandidate {
+            cand_id: 1u32,
+            unroll_factor: 1u32,
+            vec_width_bits: 0u32,
+            inline_threshold: 60u32,
+            is_legality_proven: true,
+            iterations_run: 8u32,
+            measured_median_us: 400u64,
+            wall_time_ms: 15u64,
+            code_size_bytes: 4096u64,
+            peak_rss_bytes: 1048576u64,
+        },
+        // Candidate 2: UNPROVEN legality (10us) -> MUST be rejected by REQ-OPT-242!
+        AutoTuneCandidate {
+            cand_id: 2u32,
+            unroll_factor: 8u32,
+            vec_width_bits: 256u32,
+            inline_threshold: 500u32,
+            is_legality_proven: false,
+            iterations_run: 8u32,
+            measured_median_us: 10u64,
+            wall_time_ms: 10u64,
+            code_size_bytes: 2048u64,
+            peak_rss_bytes: 1048576u64,
+        },
+        // Candidate 3: legal vectorization (220us, 3584 bytes)
+        AutoTuneCandidate {
+            cand_id: 3u32,
+            unroll_factor: 4u32,
+            vec_width_bits: 256u32,
+            inline_threshold: 225u32,
+            is_legality_proven: true,
+            iterations_run: 8u32,
+            measured_median_us: 220u64,
+            wall_time_ms: 20u64,
+            code_size_bytes: 3584u64,
+            peak_rss_bytes: 2097152u64,
+        },
+        // Candidate 4: legal compact (280us, 3072 bytes)
+        AutoTuneCandidate {
+            cand_id: 4u32,
+            unroll_factor: 2u32,
+            vec_width_bits: 128u32,
+            inline_threshold: 45u32,
+            is_legality_proven: true,
+            iterations_run: 8u32,
+            measured_median_us: 280u64,
+            wall_time_ms: 20u64,
+            code_size_bytes: 3072u64,
+            peak_rss_bytes: 2097152u64,
+        },
+        // Candidate 5: exceeds max_candidates=3 and max_wall_time_ms=60 -> rejected by REQ-OPT-243!
+        AutoTuneCandidate {
+            cand_id: 5u32,
+            unroll_factor: 8u32,
+            vec_width_bits: 256u32,
+            inline_threshold: 300u32,
+            is_legality_proven: true,
+            iterations_run: 8u32,
+            measured_median_us: 150u64,
+            wall_time_ms: 25u64,
+            code_size_bytes: 4096u64,
+            peak_rss_bytes: 2097152u64,
+        },
+    ];
+
+    let c_ptr = unsafe { address_of<AutoTuneCandidate>(cands[0]) };
+    let res_o2 = perf_autotune_evaluate(view(budget), c_ptr, 5u32, PERF_OPT_O2);
+    if res_o2.selected_cand_id != 3u32 {
+        return 20;
+    }
+    if res_o2.rejected_unproven_count != 1u32 {
+        return 21;
+    }
+    if !res_o2.terminated_by_budget || res_o2.rejected_budget_count != 1u32 {
+        return 22;
+    }
+
+    // Under -Oz, size is prioritized over speed -> selects Candidate 4 (3072 bytes)
+    let res_oz = perf_autotune_evaluate(view(budget), c_ptr, 5u32, PERF_OPT_OZ);
+    if res_oz.selected_cand_id != 4u32 {
+        return 23;
+    }
+
+    // REQ-OPT-244 & REQ-OPT-245: Provenance cache key is deterministic and invariant to telemetry.
+    let prov_normal = perf_compute_artifact_provenance(
+        0x1122334455667788u64,
+        PERF_OPT_O2,
+        true,
+        0xAABBCCDDEEFF0011u64,
+        true,
+        res_o2.feedback_digest
+    );
+    let prov_timed = perf_compute_artifact_provenance(
+        0x1122334455667788u64,
+        PERF_OPT_O2,
+        true,
+        0xAABBCCDDEEFF0011u64,
+        true,
+        res_o2.feedback_digest
+    );
+    if !perf_verify_telemetry_orthogonality(
+        view(prov_normal),
+        view(prov_timed),
+        0x9988776655443322u64,
+        0x9988776655443322u64
+    ) {
+        return 24;
+    }
+
+    let prov_diff = perf_compute_artifact_provenance(
+        0x1122334455667788u64,
+        PERF_OPT_OZ,
+        true,
+        0xAABBCCDDEEFF0011u64,
+        true,
+        res_oz.feedback_digest
+    );
+    if prov_diff.cache_key_lo == prov_normal.cache_key_lo {
+        return 25;
+    }
+
+    0
+}
+
+// -----------------------------------------------------------------------------
+// Probe 3: `--time-passes` Collector, Deterministic Digest & JSON/Human Output
+// -----------------------------------------------------------------------------
+fn probe_time_passes_telemetry() -> i32 {
+    let mut rep1 = time_passes_report_new(PERF_OPT_O2);
+    let mut rep2 = time_passes_report_new(PERF_OPT_O2);
+
+    // Push identical structural IR counts with DIFFERENT wall-clock elapsed_us.
+    time_passes_record_push(mut_view(rep1), PassTimingRecord {
+        pass_id: STAGE_TIMING_LEX,
+        is_opt_pass: false,
+        elapsed_us: 120u64,
+        peak_arena_bytes: 65536u64,
+        ir_blocks: 0u32,
+        insts_before: 0u32,
+        insts_after: 0u32,
+        transforms_applied: 0u32,
+        bce_eliminated: 0u32,
+        loops_vectorized: 0u32,
+        spills_inserted: 0u32,
+        sections_total: 0u32,
+        sections_gc_removed: 0u32,
+        icf_folded: 0u32,
+    });
+    time_passes_record_push(mut_view(rep2), PassTimingRecord {
+        pass_id: STAGE_TIMING_LEX,
+        is_opt_pass: false,
+        elapsed_us: 9400u64,
+        peak_arena_bytes: 65536u64,
+        ir_blocks: 0u32,
+        insts_before: 0u32,
+        insts_after: 0u32,
+        transforms_applied: 0u32,
+        bce_eliminated: 0u32,
+        loops_vectorized: 0u32,
+        spills_inserted: 0u32,
+        sections_total: 0u32,
+        sections_gc_removed: 0u32,
+        icf_folded: 0u32,
+    });
+
+    time_passes_record_push(mut_view(rep1), PassTimingRecord {
+        pass_id: PASS_TIMING_BCE_RANGE,
+        is_opt_pass: true,
+        elapsed_us: 450u64,
+        peak_arena_bytes: 131072u64,
+        ir_blocks: 14u32,
+        insts_before: 180u32,
+        insts_after: 132u32,
+        transforms_applied: 16u32,
+        bce_eliminated: 12u32,
+        loops_vectorized: 0u32,
+        spills_inserted: 0u32,
+        sections_total: 8u32,
+        sections_gc_removed: 2u32,
+        icf_folded: 1u32,
+    });
+    time_passes_record_push(mut_view(rep2), PassTimingRecord {
+        pass_id: PASS_TIMING_BCE_RANGE,
+        is_opt_pass: true,
+        elapsed_us: 88200u64,
+        peak_arena_bytes: 131072u64,
+        ir_blocks: 14u32,
+        insts_before: 180u32,
+        insts_after: 132u32,
+        transforms_applied: 16u32,
+        bce_eliminated: 12u32,
+        loops_vectorized: 0u32,
+        spills_inserted: 0u32,
+        sections_total: 8u32,
+        sections_gc_removed: 2u32,
+        icf_folded: 1u32,
+    });
+
+    // AXS-PERF-030 Rule 3: Deterministic digest must match despite different elapsed_us!
+    let d1 = time_passes_deterministic_digest(view(rep1));
+    let d2 = time_passes_deterministic_digest(view(rep2));
+    if d1 != d2 || d1 == 0u64 {
+        time_passes_report_free(mut_view(rep1));
+        time_passes_report_free(mut_view(rep2));
+        return 30;
+    }
+
+    let mut human_buf: DiagBuffer = diag_buf_new();
+    let mut json_buf: DiagBuffer = diag_buf_new();
+    time_passes_format_human(view(rep1), mut_view(human_buf));
+    time_passes_format_json(view(rep1), mut_view(json_buf));
+
+    let tp_h_len = human_buf.len;
+    let tp_j_len = json_buf.len;
+    if tp_h_len < 64 || tp_j_len < 128 {
+        diag_buf_free(mut_view(human_buf));
+        diag_buf_free(mut_view(json_buf));
+        time_passes_report_free(mut_view(rep1));
+        time_passes_report_free(mut_view(rep2));
+        return 31;
+    }
+
+    diag_buf_free(mut_view(human_buf));
+    diag_buf_free(mut_view(json_buf));
+    time_passes_report_free(mut_view(rep1));
+    time_passes_report_free(mut_view(rep2));
+    0
+}
+
+// -----------------------------------------------------------------------------
+// Probe 4: `--size-report` 3D Binary Footprint, Section Graph & Symbol Sorting
+// -----------------------------------------------------------------------------
+fn probe_size_report_telemetry() -> i32 {
+    let mut arena: Arena = arena_with_chunk_size(262144);
+    let sg = section_graph_new(mut_view(arena), LINK_PROFILE_SPEED, true);
+    let mut stats: GcIcfStats = gc_icf_stats_zero();
+
+    let p_startup = alloc_fill_bytes(mut_view(arena), 64, 0x48u8, 0x83u8);
+    let p_hot = alloc_fill_bytes(mut_view(arena), 128, 0x48u8, 0x01u8);
+    let p_cold = alloc_fill_bytes(mut_view(arena), 32, 0x0Fu8, 0x0Bu8);
+    let p_dead = alloc_fill_bytes(mut_view(arena), 96, 0x48u8, 0x31u8);
+    let p_bss = alloc_fill_bytes(mut_view(arena), 256, 0u8, 0u8);
+
+    let mut n_entry = section_node_default(SectionId { v: 0u32 }, 0u32, StrId { v: 1u32 }, SEC_KIND_TEXT, SymbolId { v: 1u32 });
+    n_entry.hotness_bucket = HOTNESS_BUCKET_HOT;
+    let sec_entry_v = section_graph_add_node(unsafe { mut_view(*sg) }, mut_view(arena), n_entry).v;
+    section_graph_set_bytes(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_entry_v }, p_startup, 64);
+    let _ = section_graph_mark_root(unsafe { mut_view(*sg) }, SectionId { v: sec_entry_v }, GC_ROOT_ENTRY);
+
+    let mut n_hot = section_node_default(SectionId { v: 1u32 }, 0u32, StrId { v: 2u32 }, SEC_KIND_TEXT, SymbolId { v: 2u32 });
+    n_hot.hotness_bucket = HOTNESS_BUCKET_HOT;
+    let sec_hot_v = section_graph_add_node(unsafe { mut_view(*sg) }, mut_view(arena), n_hot).v;
+    section_graph_set_bytes(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_hot_v }, p_hot, 128);
+
+    let mut n_cold = section_node_default(SectionId { v: 2u32 }, 0u32, StrId { v: 3u32 }, SEC_KIND_TEXT, SymbolId { v: 3u32 });
+    n_cold.hotness_bucket = HOTNESS_BUCKET_COLD;
+    n_cold.runtime_comp = RUNTIME_COMP_PANIC;
+    let sec_cold_v = section_graph_add_node(unsafe { mut_view(*sg) }, mut_view(arena), n_cold).v;
+    section_graph_set_bytes(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_cold_v }, p_cold, 32);
+
+    let mut n_dead = section_node_default(SectionId { v: 3u32 }, 0u32, StrId { v: 4u32 }, SEC_KIND_TEXT, SymbolId { v: 4u32 });
+    n_dead.hotness_bucket = HOTNESS_BUCKET_WARM;
+    let sec_dead_v = section_graph_add_node(unsafe { mut_view(*sg) }, mut_view(arena), n_dead).v;
+    section_graph_set_bytes(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_dead_v }, p_dead, 96);
+
+    let mut n_bss = section_node_default(SectionId { v: 4u32 }, 0u32, StrId { v: 5u32 }, SEC_KIND_BSS, SymbolId { v: 5u32 });
+    n_bss.is_mutable = true;
+    let sec_bss_v = section_graph_add_node(unsafe { mut_view(*sg) }, mut_view(arena), n_bss).v;
+    section_graph_set_bytes(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_bss_v }, p_bss, 256);
+
+    section_graph_add_reloc(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_entry_v }, 4u32, 1u32, SymbolId { v: 2u32 }, SectionId { v: sec_hot_v }, 0i64, true);
+    section_graph_add_reloc(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_hot_v }, 8u32, 1u32, SymbolId { v: 3u32 }, SectionId { v: sec_cold_v }, 0i64, true);
+    section_graph_add_reloc(unsafe { mut_view(*sg) }, mut_view(arena), SectionId { v: sec_hot_v }, 12u32, 1u32, SymbolId { v: 5u32 }, SectionId { v: sec_bss_v }, 0i64, false);
+
+    if !link_run_gc_icf_pipeline(unsafe { mut_view(*sg) }, mut_view(arena), mut_view(stats)) {
+        arena_destroy(mut_view(arena));
+        return 40;
+    }
+
+    let mut rep_o2 = size_report_build_from_section_graph(
+        unsafe { view(*sg) }, view(stats), PERF_OPT_O2, SectionId { v: sec_entry_v }, 1u32, 4u32
+    );
+    let mut rep_oz = size_report_build_from_section_graph(
+        unsafe { view(*sg) }, view(stats), PERF_OPT_OZ, SectionId { v: sec_entry_v }, 1u32, 4u32
+    );
+
+    if !size_report_check_alignment_budget(view(rep_o2)) ||
+       !size_report_check_alignment_budget(view(rep_oz)) {
+        size_report_free(mut_view(rep_o2));
+        size_report_free(mut_view(rep_oz));
+        arena_destroy(mut_view(arena));
+        return 41;
+    }
+
+    let f_oz = rep_oz.file_size_bytes;
+    let f_o2 = rep_o2.file_size_bytes;
+    let bss_f = rep_o2.bss_file_bytes;
+    let bss_v = rep_o2.bss_virtual_bytes;
+    let gc_el = rep_o2.gc_eliminated_bytes;
+    let st_al = rep_o2.startup_allocations;
+    if f_oz > f_o2 ||
+       bss_f != 0u64 ||
+       bss_v != 256u64 ||
+       gc_el < 96u64 ||
+       st_al != 0u32 {
+        size_report_free(mut_view(rep_o2));
+        size_report_free(mut_view(rep_oz));
+        arena_destroy(mut_view(arena));
+        return 42;
+    }
+
+    // Verify deterministic descending symbol sorting (`AXS-PERF-031` rule 1)
+    let sym_cnt = rep_o2.sym_count;
+    if sym_cnt < 3u32 {
+        size_report_free(mut_view(rep_o2));
+        size_report_free(mut_view(rep_oz));
+        arena_destroy(mut_view(arena));
+        return 43;
+    }
+    let s0 = unsafe { (*perf_sym_entry_at(rep_o2.symbols, 0)).size_bytes };
+    let s1 = unsafe { (*perf_sym_entry_at(rep_o2.symbols, 1)).size_bytes };
+    if s0 < s1 {
+        size_report_free(mut_view(rep_o2));
+        size_report_free(mut_view(rep_oz));
+        arena_destroy(mut_view(arena));
+        return 44;
+    }
+
+    let mut human_buf: DiagBuffer = diag_buf_new();
+    let mut json_buf: DiagBuffer = diag_buf_new();
+    size_report_format_human(view(rep_o2), mut_view(human_buf));
+    size_report_format_json(view(rep_o2), mut_view(json_buf));
+
+    let sr_h_len = human_buf.len;
+    let sr_j_len = json_buf.len;
+    if sr_h_len < 128 || sr_j_len < 256 {
+        diag_buf_free(mut_view(human_buf));
+        diag_buf_free(mut_view(json_buf));
+        size_report_free(mut_view(rep_o2));
+        size_report_free(mut_view(rep_oz));
+        arena_destroy(mut_view(arena));
+        return 45;
+    }
+
+    diag_buf_free(mut_view(human_buf));
+    diag_buf_free(mut_view(json_buf));
+    size_report_free(mut_view(rep_o2));
+    size_report_free(mut_view(rep_oz));
+    arena_destroy(mut_view(arena));
+    0
+}
+
+fn main() -> i32 {
+    let r1 = probe_profile_policies();
+    if r1 != 0 {
+        return r1;
+    }
+    let r2 = probe_autotune_and_provenance();
+    if r2 != 0 {
+        return r2;
+    }
+    let r3 = probe_time_passes_telemetry();
+    if r3 != 0 {
+        return r3;
+    }
+    let r4 = probe_size_report_telemetry();
+    if r4 != 0 {
+        return r4;
+    }
+    0
+}

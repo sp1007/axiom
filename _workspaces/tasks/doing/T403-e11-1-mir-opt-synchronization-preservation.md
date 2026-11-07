@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T402]
 priority: 124
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/opt, tests/mir/concurrency]
 locks: [compiler/mir/mir.ax, compiler/verify/verifier.ax, tests/selfhost]
 spec: [spec/SPEC-30-concurrency.md, 0033, 0126, 0136, tasks/0488, tasks/0685]
 covers: [REQ-CONC-074, REQ-CONC-090, REQ-CONC-112, REQ-CONC-113, REQ-CONC-114, REQ-CONC-122, REQ-CONC-124, REQ-CONC-144, REQ-CONC-166, REQ-CONC-208, REQ-CONC-209, REQ-CONC-210, REQ-CONC-211, REQ-CONC-212, REQ-CONC-213, REQ-CONC-214, REQ-CONC-215, REQ-CONC-216]
+started: 2026-11-08 03:26:56
+agent: T403-impl
 ---
 # T403 — E11.1 — Synchronization & happens-before contracts in MIR optimizer & verifier
 
@@ -41,3 +43,4 @@ Ensure MIR optimization passes (`const_fold`, `dce`, `cfg_simp`) and the MIR ver
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-08 03:26:56 started (attempt 1) T403-impl

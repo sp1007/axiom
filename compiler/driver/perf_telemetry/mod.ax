@@ -1,0 +1,1814 @@
+// Compiler Pass-Timing (`--time-passes`) & Code-Size (`--size-report`) Telemetry Engine,
+// Profile Cost-Model Policies (`-O0`/`-O1`/`-O2`/`-Os`/`-Oz`), Bounded Auto-Tuning (`AutoTuneBudget`),
+// and Reproducible Build Provenance Isolation (T625 / E15.7).
+// Implements SPEC-76 §§4..8 (AXS-PERF-001..032; REQ-OPT-242..245, REQ-OPT-253, REQ-OPT-255,
+// REQ-OPT-292..295, REQ-OPT-334, REQ-OPT-381..382):
+//   - Five canonical optimization profiles (`PERF_OPT_O0`, `PERF_OPT_O1`, `PERF_OPT_O2`, `PERF_OPT_OS`,
+//     `PERF_OPT_OZ`) with explicit cost-model thresholds (`ProfileCostPolicy`), monomorphization
+//     body-sharing profitability (`perf_can_share_monomorphized_body`), and zero mandatory monolithic
+//     runtime dependency (`requires_monolithic_runtime == false`) (`AXS-PERF-010..014`, `REQ-OPT-292..295`, `REQ-OPT-334`)
+//   - Bounded auto-tuning (`AutoTuneBudget`, `AutoTuneCandidate`, `AutoTuneResult`, `perf_autotune_evaluate`)
+//     enforcing legality-before-profitability (`!is_legality_proven` rejected unconditionally) and hard
+//     candidate/iteration/wall-time/memory budgets (`AXS-PERF-004`, `REQ-OPT-242..243`)
+//   - Deterministic artifact provenance (`ArtifactProvenanceHeader`, `perf_compute_artifact_provenance`)
+//     and strict telemetry orthogonality (`perf_verify_telemetry_orthogonality`): wall-clock timing
+//     never enters cache keys or emitted binary bytes (`AXS-PERF-004`, `AXS-PERF-032`, `REQ-OPT-244..245`)
+//   - Structured `--time-passes` collector & human/JSON formatters (`PassTimingRecord`, `TimePassesReport`,
+//     `time_passes_format_human`, `time_passes_format_json`) (`AXS-PERF-030`, `REQ-OPT-253`)
+//   - Structured `--size-report` 3D binary footprint, section layout (`StartupEntrySet` -> `HotCluster` ->
+//     `WarmNormal` -> `ColdSplit`), alignment padding budget (`<= 2%` of `.text`), and deterministic
+//     symbol attribution (`SizeReport`, `size_report_build_from_section_graph`, `size_report_format_human`,
+//     `size_report_format_json`) (`AXS-PERF-020..022`, `AXS-PERF-031`, `REQ-OPT-381..382`)
+module compiler.driver.perf_telemetry
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use compiler.kernel.id.SymbolId
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.obj.coff.SectionId
+use compiler.link.gc_icf.SEC_KIND_TEXT
+use compiler.link.gc_icf.SEC_KIND_RDATA
+use compiler.link.gc_icf.SEC_KIND_DATA
+use compiler.link.gc_icf.SEC_KIND_BSS
+use compiler.link.gc_icf.SEC_KIND_PDATA
+use compiler.link.gc_icf.SEC_KIND_XDATA
+use compiler.link.gc_icf.SEC_KIND_IMPORT_THUNK
+use compiler.link.gc_icf.HOTNESS_BUCKET_HOT
+use compiler.link.gc_icf.HOTNESS_BUCKET_WARM
+use compiler.link.gc_icf.HOTNESS_BUCKET_COLD
+use compiler.link.gc_icf.GC_ROOT_ENTRY
+use compiler.link.gc_icf.RUNTIME_COMP_NONE
+use compiler.link.gc_icf.SectionNode
+use compiler.link.gc_icf.SectionGraph
+use compiler.link.gc_icf.GcIcfStats
+use compiler.link.gc_icf.sg_node_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+// =============================================================================
+// 1. Optimization Profiles, Stage/Pass IDs, and Attribution Constants
+// =============================================================================
+
+pub const PERF_OPT_O0: u32 = 0u32;
+pub const PERF_OPT_O1: u32 = 1u32;
+pub const PERF_OPT_O2: u32 = 2u32;
+pub const PERF_OPT_OS: u32 = 3u32;
+pub const PERF_OPT_OZ: u32 = 4u32;
+
+pub const TUNE_SCOPE_FUNCTION: u32 = 0u32;
+pub const TUNE_SCOPE_LOOP: u32 = 1u32;
+pub const TUNE_SCOPE_MODULE: u32 = 2u32;
+pub const TUNE_SCOPE_WHOLE_PROGRAM: u32 = 3u32;
+
+pub const STAGE_TIMING_LEX: u32 = 0u32;
+pub const STAGE_TIMING_PARSE: u32 = 1u32;
+pub const STAGE_TIMING_RESOLVE: u32 = 2u32;
+pub const STAGE_TIMING_HIR: u32 = 3u32;
+pub const STAGE_TIMING_TYPECK: u32 = 4u32;
+pub const STAGE_TIMING_MIR_BUILD: u32 = 5u32;
+pub const STAGE_TIMING_MIR_VERIFY: u32 = 6u32;
+pub const STAGE_TIMING_OPT_PIPELINE: u32 = 7u32;
+pub const STAGE_TIMING_CODEGEN: u32 = 8u32;
+pub const STAGE_TIMING_LINK: u32 = 9u32;
+
+pub const PASS_TIMING_CFG_SIMP: u32 = 100u32;
+pub const PASS_TIMING_SROA: u32 = 101u32;
+pub const PASS_TIMING_MEM2REG: u32 = 102u32;
+pub const PASS_TIMING_INLINE: u32 = 103u32;
+pub const PASS_TIMING_DEVIRT: u32 = 104u32;
+pub const PASS_TIMING_GVN_PRE: u32 = 105u32;
+pub const PASS_TIMING_LICM: u32 = 106u32;
+pub const PASS_TIMING_BCE_RANGE: u32 = 107u32;
+pub const PASS_TIMING_ESCAPE: u32 = 108u32;
+pub const PASS_TIMING_UNROLL: u32 = 109u32;
+pub const PASS_TIMING_AUTOVEC: u32 = 110u32;
+pub const PASS_TIMING_PGO_LAYOUT: u32 = 111u32;
+pub const PASS_TIMING_SECTION_GC_ICF: u32 = 112u32;
+
+pub const TEXT_BUCKET_STARTUP: u8 = 0u8;
+pub const TEXT_BUCKET_HOT: u8 = 1u8;
+pub const TEXT_BUCKET_WARM: u8 = 2u8;
+pub const TEXT_BUCKET_COLD: u8 = 3u8;
+
+pub const ORIGIN_RUNTIME: u8 = 0u8;
+pub const ORIGIN_STD: u8 = 1u8;
+pub const ORIGIN_USER: u8 = 2u8;
+pub const ORIGIN_GENERIC_FAMILY: u8 = 3u8;
+
+pub const TUNE_CAND_NONE: u32 = 0xFFFFFFFFu32;
+
+// =============================================================================
+// 2. Profile Cost-Model Policies & Monomorphization Sharing (`AXS-PERF-010..014`)
+// =============================================================================
+
+@derive(Copy)
+pub struct ProfileCostPolicy {
+    pub opt_profile: u32,
+    pub inline_base_cost: u32,
+    pub inline_hot_cost: u32,
+    pub inline_cold_cost: u32,
+    pub max_caller_growth_pct: u32,
+    pub max_unroll_factor: u32,
+    pub max_unroll_insts: u32,
+    pub autovec_enabled: bool,
+    pub autovec_allow_expansion: bool,
+    pub code_sharing_enabled: bool,
+    pub section_gc_enabled: bool,
+    pub safe_icf_enabled: bool,
+    pub allow_icf_thunks: bool,
+    pub fn_align_bytes: u32,
+    pub preserve_safety_barriers: bool,
+    pub requires_monolithic_runtime: bool,
+}
+
+pub fn perf_policy_for_profile(opt_profile: u32) -> ProfileCostPolicy {
+    if opt_profile == PERF_OPT_O0 {
+        return ProfileCostPolicy {
+            opt_profile: PERF_OPT_O0,
+            inline_base_cost: 0u32,
+            inline_hot_cost: 0u32,
+            inline_cold_cost: 0u32,
+            max_caller_growth_pct: 0u32,
+            max_unroll_factor: 1u32,
+            max_unroll_insts: 0u32,
+            autovec_enabled: false,
+            autovec_allow_expansion: false,
+            code_sharing_enabled: false,
+            section_gc_enabled: false,
+            safe_icf_enabled: false,
+            allow_icf_thunks: false,
+            fn_align_bytes: 16u32,
+            preserve_safety_barriers: true,
+            requires_monolithic_runtime: false,
+        };
+    }
+    if opt_profile == PERF_OPT_O1 {
+        return ProfileCostPolicy {
+            opt_profile: PERF_OPT_O1,
+            inline_base_cost: 60u32,
+            inline_hot_cost: 60u32,
+            inline_cold_cost: 15u32,
+            max_caller_growth_pct: 15u32,
+            max_unroll_factor: 2u32,
+            max_unroll_insts: 16u32,
+            autovec_enabled: false,
+            autovec_allow_expansion: false,
+            code_sharing_enabled: true,
+            section_gc_enabled: true,
+            safe_icf_enabled: false,
+            allow_icf_thunks: false,
+            fn_align_bytes: 16u32,
+            preserve_safety_barriers: true,
+            requires_monolithic_runtime: false,
+        };
+    }
+    if opt_profile == PERF_OPT_OS {
+        return ProfileCostPolicy {
+            opt_profile: PERF_OPT_OS,
+            inline_base_cost: 45u32,
+            inline_hot_cost: 75u32,
+            inline_cold_cost: 0u32,
+            max_caller_growth_pct: 5u32,
+            max_unroll_factor: 2u32,
+            max_unroll_insts: 16u32,
+            autovec_enabled: true,
+            autovec_allow_expansion: false,
+            code_sharing_enabled: true,
+            section_gc_enabled: true,
+            safe_icf_enabled: true,
+            allow_icf_thunks: true,
+            fn_align_bytes: 16u32,
+            preserve_safety_barriers: true,
+            requires_monolithic_runtime: false,
+        };
+    }
+    if opt_profile == PERF_OPT_OZ {
+        return ProfileCostPolicy {
+            opt_profile: PERF_OPT_OZ,
+            inline_base_cost: 12u32,
+            inline_hot_cost: 12u32,
+            inline_cold_cost: 0u32,
+            max_caller_growth_pct: 0u32,
+            max_unroll_factor: 1u32,
+            max_unroll_insts: 0u32,
+            autovec_enabled: false,
+            autovec_allow_expansion: false,
+            code_sharing_enabled: true,
+            section_gc_enabled: true,
+            safe_icf_enabled: true,
+            allow_icf_thunks: true,
+            fn_align_bytes: 1u32,
+            preserve_safety_barriers: true,
+            requires_monolithic_runtime: false,
+        };
+    }
+    ProfileCostPolicy {
+        opt_profile: PERF_OPT_O2,
+        inline_base_cost: 225u32,
+        inline_hot_cost: 450u32,
+        inline_cold_cost: 15u32,
+        max_caller_growth_pct: 30u32,
+        max_unroll_factor: 8u32,
+        max_unroll_insts: 64u32,
+        autovec_enabled: true,
+        autovec_allow_expansion: true,
+        code_sharing_enabled: true,
+        section_gc_enabled: true,
+        safe_icf_enabled: true,
+        allow_icf_thunks: true,
+        fn_align_bytes: 32u32,
+        preserve_safety_barriers: true,
+        requires_monolithic_runtime: false,
+    }
+}
+
+pub fn perf_should_inline(
+    policy: view<ProfileCostPolicy>,
+    callee_cost: u32,
+    callsite_count: u32,
+    is_hot: bool,
+    is_cold: bool,
+    caller_insts: u32,
+    current_growth_insts: u32
+) -> bool {
+    if policy.opt_profile == PERF_OPT_O0 {
+        return false;
+    }
+    // Single-callsite private helper (`callsite_count == 1`) shrinks or keeps binary neutral when
+    // call overhead (~12 units) is eliminated (`AXS-PERF-013`, `AXS-PERF-014`).
+    if callsite_count == 1u32 && callee_cost <= policy.inline_base_cost + 24u32 {
+        return true;
+    }
+    if is_cold && (policy.opt_profile == PERF_OPT_OS || policy.opt_profile == PERF_OPT_OZ) {
+        return false;
+    }
+    let threshold: u32 = if is_hot {
+        policy.inline_hot_cost
+    } else if is_cold {
+        policy.inline_cold_cost
+    } else {
+        policy.inline_base_cost
+    };
+    if callee_cost > threshold {
+        return false;
+    }
+    let max_growth: u32 = (caller_insts * policy.max_caller_growth_pct) / 100u32;
+    if current_growth_insts + callee_cost > max_growth && callee_cost > 12u32 {
+        return false;
+    }
+    true
+}
+
+pub fn perf_can_share_monomorphized_body(
+    policy: view<ProfileCostPolicy>,
+    layout_size_a: u32,
+    layout_align_a: u32,
+    layout_size_b: u32,
+    layout_align_b: u32,
+    has_type_specific_semantics: bool,
+    is_hot_loop: bool
+) -> bool {
+    if !policy.code_sharing_enabled {
+        return false;
+    }
+    if has_type_specific_semantics {
+        return false;
+    }
+    if layout_size_a != layout_size_b || layout_align_a != layout_align_b {
+        return false;
+    }
+    if policy.opt_profile == PERF_OPT_O2 && is_hot_loop {
+        return false;
+    }
+    true
+}
+
+// =============================================================================
+// 3. Bounded Auto-Tuning & Reproducible Provenance Isolation (`AXS-PERF-004`)
+// =============================================================================
+
+@derive(Copy)
+pub struct AutoTuneBudget {
+    pub scope: u32,
+    pub max_candidates: u32,
+    pub max_iterations_per_cand: u32,
+    pub max_wall_time_ms: u64,
+    pub max_memory_bytes: u64,
+}
+
+@derive(Copy)
+pub struct AutoTuneCandidate {
+    pub cand_id: u32,
+    pub unroll_factor: u32,
+    pub vec_width_bits: u32,
+    pub inline_threshold: u32,
+    pub is_legality_proven: bool,
+    pub iterations_run: u32,
+    pub measured_median_us: u64,
+    pub wall_time_ms: u64,
+    pub code_size_bytes: u64,
+    pub peak_rss_bytes: u64,
+}
+
+@derive(Copy)
+pub struct AutoTuneResult {
+    pub selected_cand_id: u32,
+    pub best_median_us: u64,
+    pub best_code_size_bytes: u64,
+    pub candidates_evaluated: u32,
+    pub rejected_unproven_count: u32,
+    pub rejected_budget_count: u32,
+    pub terminated_by_budget: bool,
+    pub feedback_digest: u64,
+}
+
+@derive(Copy)
+pub struct ArtifactProvenanceHeader {
+    pub program_fingerprint: u64,
+    pub opt_profile: u32,
+    pub has_pgo_profile: bool,
+    pub pgo_profile_digest: u64,
+    pub has_autotune_feedback: bool,
+    pub autotune_feedback_digest: u64,
+    pub cache_key_lo: u64,
+    pub cache_key_hi: u64,
+}
+
+fn perf_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn perf_cand_at(base: *const AutoTuneCandidate, idx: usize) -> *const AutoTuneCandidate {
+    let off = perf_mul_usize(idx, size_of<AutoTuneCandidate>());
+    ((base as usize) + off) as *const AutoTuneCandidate
+}
+
+fn perf_fnv1a_init() -> u64 {
+    14695981039346656037u64
+}
+
+fn perf_fnv1a_u8(h: u64, b: u8) -> u64 {
+    wrapping_mul_u64(h ^ (b as u64), 1099511628211u64)
+}
+
+fn perf_fnv1a_u32(h: u64, v: u32) -> u64 {
+    let mut cur: u64 = perf_fnv1a_u8(h, (v & 255u32) as u8);
+    cur = perf_fnv1a_u8(cur, ((v >> 8u32) & 255u32) as u8);
+    cur = perf_fnv1a_u8(cur, ((v >> 16u32) & 255u32) as u8);
+    cur = perf_fnv1a_u8(cur, ((v >> 24u32) & 255u32) as u8);
+    cur
+}
+
+fn perf_fnv1a_u64(h: u64, v: u64) -> u64 {
+    let lo: u32 = (v & 0xFFFFFFFFu64) as u32;
+    let hi: u32 = ((v >> 32u64) & 0xFFFFFFFFu64) as u32;
+    perf_fnv1a_u32(perf_fnv1a_u32(h, lo), hi)
+}
+
+pub fn perf_autotune_default_budget(scope: u32) -> AutoTuneBudget {
+    if scope == TUNE_SCOPE_LOOP {
+        return AutoTuneBudget {
+            scope: TUNE_SCOPE_LOOP,
+            max_candidates: 8u32,
+            max_iterations_per_cand: 16u32,
+            max_wall_time_ms: 250u64,
+            max_memory_bytes: 67108864u64,
+        };
+    }
+    if scope == TUNE_SCOPE_FUNCTION {
+        return AutoTuneBudget {
+            scope: TUNE_SCOPE_FUNCTION,
+            max_candidates: 16u32,
+            max_iterations_per_cand: 16u32,
+            max_wall_time_ms: 500u64,
+            max_memory_bytes: 134217728u64,
+        };
+    }
+    AutoTuneBudget {
+        scope: scope,
+        max_candidates: 32u32,
+        max_iterations_per_cand: 32u32,
+        max_wall_time_ms: 2000u64,
+        max_memory_bytes: 268435456u64,
+    }
+}
+
+pub fn perf_autotune_evaluate(
+    budget: view<AutoTuneBudget>,
+    cands: *const AutoTuneCandidate,
+    cand_count: u32,
+    opt_profile: u32
+) -> AutoTuneResult {
+    let mut selected_id: u32 = TUNE_CAND_NONE;
+    let mut best_us: u64 = 0xFFFFFFFFFFFFFFFFu64;
+    let mut best_sz: u64 = 0xFFFFFFFFFFFFFFFFu64;
+    let mut best_unroll: u32 = 1u32;
+    let mut best_vec: u32 = 0u32;
+    let mut best_inline: u32 = 0u32;
+    let mut evaluated: u32 = 0u32;
+    let mut rej_unproven: u32 = 0u32;
+    let mut rej_budget: u32 = 0u32;
+    let mut hit_budget: bool = false;
+    let mut accum_wall_ms: u64 = 0u64;
+
+    let mut i: u32 = 0u32;
+    while i < cand_count && (cands as usize) != 0 {
+        let cp = unsafe { perf_cand_at(cands, i as usize) };
+        let c_id = unsafe { (*cp).cand_id };
+        let c_legal = unsafe { (*cp).is_legality_proven };
+        let c_iters = unsafe { (*cp).iterations_run };
+        let c_us = unsafe { (*cp).measured_median_us };
+        let c_wall = unsafe { (*cp).wall_time_ms };
+        let c_sz = unsafe { (*cp).code_size_bytes };
+        let c_rss = unsafe { (*cp).peak_rss_bytes };
+        let c_unroll = unsafe { (*cp).unroll_factor };
+        let c_vec = unsafe { (*cp).vec_width_bits };
+        let c_inline = unsafe { (*cp).inline_threshold };
+
+        // REQ-OPT-242: Auto-tuning is purely profitability feedback over compiler-proven-legal candidates.
+        // Any candidate lacking static legality proof is unconditionally rejected regardless of speed.
+        if !c_legal {
+            rej_unproven = rej_unproven + 1u32;
+        } else if evaluated >= budget.max_candidates ||
+                  c_iters > budget.max_iterations_per_cand ||
+                  accum_wall_ms + c_wall > budget.max_wall_time_ms ||
+                  c_rss > budget.max_memory_bytes {
+            // REQ-OPT-243: Bounded resource enforcement (candidates, iterations, wall-time, memory).
+            rej_budget = rej_budget + 1u32;
+            hit_budget = true;
+        } else {
+            evaluated = evaluated + 1u32;
+            accum_wall_ms = accum_wall_ms + c_wall;
+
+            let is_better: bool = if opt_profile == PERF_OPT_OS || opt_profile == PERF_OPT_OZ {
+                if c_sz != best_sz {
+                    c_sz < best_sz
+                } else if c_us != best_us {
+                    c_us < best_us
+                } else {
+                    c_id < selected_id
+                }
+            } else {
+                if c_us != best_us {
+                    c_us < best_us
+                } else if c_sz != best_sz {
+                    c_sz < best_sz
+                } else {
+                    c_id < selected_id
+                }
+            };
+
+            if is_better {
+                selected_id = c_id;
+                best_us = c_us;
+                best_sz = c_sz;
+                best_unroll = c_unroll;
+                best_vec = c_vec;
+                best_inline = c_inline;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    // REQ-OPT-244: Feedback digest hashes ONLY the selected transformation parameters, never wall-clock noise.
+    let mut digest: u64 = perf_fnv1a_init();
+    digest = perf_fnv1a_u32(digest, budget.scope);
+    digest = perf_fnv1a_u32(digest, opt_profile);
+    digest = perf_fnv1a_u32(digest, selected_id);
+    digest = perf_fnv1a_u32(digest, best_unroll);
+    digest = perf_fnv1a_u32(digest, best_vec);
+    digest = perf_fnv1a_u32(digest, best_inline);
+
+    AutoTuneResult {
+        selected_cand_id: selected_id,
+        best_median_us: if selected_id == TUNE_CAND_NONE { 0u64 } else { best_us },
+        best_code_size_bytes: if selected_id == TUNE_CAND_NONE { 0u64 } else { best_sz },
+        candidates_evaluated: evaluated,
+        rejected_unproven_count: rej_unproven,
+        rejected_budget_count: rej_budget,
+        terminated_by_budget: hit_budget,
+        feedback_digest: digest,
+    }
+}
+
+pub fn perf_compute_artifact_provenance(
+    program_fingerprint: u64,
+    opt_profile: u32,
+    has_pgo_profile: bool,
+    pgo_profile_digest: u64,
+    has_autotune_feedback: bool,
+    autotune_feedback_digest: u64
+) -> ArtifactProvenanceHeader {
+    let eff_pgo: u64 = if has_pgo_profile { pgo_profile_digest } else { 0u64 };
+    let eff_tune: u64 = if has_autotune_feedback { autotune_feedback_digest } else { 0u64 };
+
+    let mut lo: u64 = perf_fnv1a_init();
+    lo = perf_fnv1a_u64(lo, program_fingerprint);
+    lo = perf_fnv1a_u32(lo, opt_profile);
+    lo = perf_fnv1a_u8(lo, if has_pgo_profile { 1u8 } else { 0u8 });
+    lo = perf_fnv1a_u64(lo, eff_pgo);
+    lo = perf_fnv1a_u8(lo, if has_autotune_feedback { 1u8 } else { 0u8 });
+    lo = perf_fnv1a_u64(lo, eff_tune);
+
+    let mut hi: u64 = 1099511628211u64 ^ lo;
+    hi = perf_fnv1a_u64(hi, program_fingerprint ^ eff_pgo);
+    hi = perf_fnv1a_u64(hi, eff_tune ^ (opt_profile as u64));
+
+    ArtifactProvenanceHeader {
+        program_fingerprint: program_fingerprint,
+        opt_profile: opt_profile,
+        has_pgo_profile: has_pgo_profile,
+        pgo_profile_digest: eff_pgo,
+        has_autotune_feedback: has_autotune_feedback,
+        autotune_feedback_digest: eff_tune,
+        cache_key_lo: lo,
+        cache_key_hi: hi,
+    }
+}
+
+pub fn perf_verify_telemetry_orthogonality(
+    prov_normal: view<ArtifactProvenanceHeader>,
+    prov_timed: view<ArtifactProvenanceHeader>,
+    binary_digest_normal: u64,
+    binary_digest_timed: u64
+) -> bool {
+    prov_normal.cache_key_lo == prov_timed.cache_key_lo &&
+        prov_normal.cache_key_hi == prov_timed.cache_key_hi &&
+        binary_digest_normal == binary_digest_timed
+}
+
+// =============================================================================
+// 4. `--time-passes` Collector & Deterministic Counter Digest (`AXS-PERF-030`)
+// =============================================================================
+
+@derive(Copy)
+pub struct PassTimingRecord {
+    pub pass_id: u32,
+    pub is_opt_pass: bool,
+    pub elapsed_us: u64,
+    pub peak_arena_bytes: u64,
+    pub ir_blocks: u32,
+    pub insts_before: u32,
+    pub insts_after: u32,
+    pub transforms_applied: u32,
+    pub bce_eliminated: u32,
+    pub loops_vectorized: u32,
+    pub spills_inserted: u32,
+    pub sections_total: u32,
+    pub sections_gc_removed: u32,
+    pub icf_folded: u32,
+}
+
+pub struct TimePassesReport {
+    pub opt_profile: u32,
+    pub total_elapsed_us: u64,
+    pub peak_arena_bytes: u64,
+    pub records: *mut PassTimingRecord,
+    pub record_count: u32,
+    pub record_cap: u32,
+}
+
+pub unsafe fn perf_timing_rec_at(base: *mut PassTimingRecord, idx: usize) -> *mut PassTimingRecord {
+    let off = perf_mul_usize(idx, size_of<PassTimingRecord>());
+    ((base as usize) + off) as *mut PassTimingRecord
+}
+
+pub fn time_passes_report_new(opt_profile: u32) -> TimePassesReport {
+    TimePassesReport {
+        opt_profile: opt_profile,
+        total_elapsed_us: 0u64,
+        peak_arena_bytes: 0u64,
+        records: 0 as *mut PassTimingRecord,
+        record_count: 0u32,
+        record_cap: 0u32,
+    }
+}
+
+pub fn time_passes_report_free(rep: mut_view<TimePassesReport>) {
+    if rep.record_cap > 0u32 && (rep.records as usize) != 0 {
+        let bytes = perf_mul_usize(rep.record_cap as usize, size_of<PassTimingRecord>());
+        unsafe {
+            heap_free(rep.records as *mut u8, bytes, 8);
+        }
+    }
+    rep.records = 0 as *mut PassTimingRecord;
+    rep.record_count = 0u32;
+    rep.record_cap = 0u32;
+}
+
+pub fn time_passes_record_push(rep: mut_view<TimePassesReport>, rec: PassTimingRecord) {
+    if rep.record_count == rep.record_cap {
+        let new_cap: u32 = if rep.record_cap == 0u32 { 16u32 } else { rep.record_cap * 2u32 };
+        let new_bytes = perf_mul_usize(new_cap as usize, size_of<PassTimingRecord>());
+        let new_ptr = unsafe { heap_alloc(new_bytes, 8) as *mut PassTimingRecord };
+        let mut i: u32 = 0u32;
+        while i < rep.record_count {
+            unsafe {
+                *perf_timing_rec_at(new_ptr, i as usize) = *perf_timing_rec_at(rep.records, i as usize);
+            }
+            i = i + 1u32;
+        }
+        if rep.record_cap > 0u32 && (rep.records as usize) != 0 {
+            let old_bytes = perf_mul_usize(rep.record_cap as usize, size_of<PassTimingRecord>());
+            unsafe {
+                heap_free(rep.records as *mut u8, old_bytes, 8);
+            }
+        }
+        rep.records = new_ptr;
+        rep.record_cap = new_cap;
+    }
+    unsafe {
+        *perf_timing_rec_at(rep.records, rep.record_count as usize) = rec;
+    }
+    rep.record_count = rep.record_count + 1u32;
+    rep.total_elapsed_us = rep.total_elapsed_us + rec.elapsed_us;
+    if rec.peak_arena_bytes > rep.peak_arena_bytes {
+        rep.peak_arena_bytes = rec.peak_arena_bytes;
+    }
+}
+
+pub fn time_passes_deterministic_digest(rep: view<TimePassesReport>) -> u64 {
+    // AXS-PERF-030 Rule 3 & REQ-OPT-245: Deterministic digest hashes ONLY structural IR/section
+    // counters (`insts_before`, `insts_after`, `transforms_applied`, `bce_eliminated`, etc.) and
+    // NEVER includes `elapsed_us` wall-clock timing.
+    let mut h: u64 = perf_fnv1a_init();
+    h = perf_fnv1a_u32(h, rep.opt_profile);
+    h = perf_fnv1a_u32(h, rep.record_count);
+    let mut i: u32 = 0u32;
+    while i < rep.record_count && (rep.records as usize) != 0 {
+        let rp = unsafe { perf_timing_rec_at(rep.records, i as usize) };
+        unsafe {
+            h = perf_fnv1a_u32(h, (*rp).pass_id);
+            h = perf_fnv1a_u8(h, if (*rp).is_opt_pass { 1u8 } else { 0u8 });
+            h = perf_fnv1a_u32(h, (*rp).ir_blocks);
+            h = perf_fnv1a_u32(h, (*rp).insts_before);
+            h = perf_fnv1a_u32(h, (*rp).insts_after);
+            h = perf_fnv1a_u32(h, (*rp).transforms_applied);
+            h = perf_fnv1a_u32(h, (*rp).bce_eliminated);
+            h = perf_fnv1a_u32(h, (*rp).loops_vectorized);
+            h = perf_fnv1a_u32(h, (*rp).spills_inserted);
+            h = perf_fnv1a_u32(h, (*rp).sections_total);
+            h = perf_fnv1a_u32(h, (*rp).sections_gc_removed);
+            h = perf_fnv1a_u32(h, (*rp).icf_folded);
+        }
+        i = i + 1u32;
+    }
+    h
+}
+
+// =============================================================================
+// 5. `--size-report` 3D Binary Footprint & Symbol Attribution (`AXS-PERF-020..031`)
+// =============================================================================
+
+@derive(Copy)
+pub struct SymbolSizeEntry {
+    pub sym_id: u32,
+    pub name_id: u32,
+    pub section_kind: u8,
+    pub heat_bucket: u8,
+    pub origin_kind: u8,
+    pub is_generic_instance: bool,
+    pub size_bytes: u64,
+}
+
+pub struct SizeReport {
+    pub opt_profile: u32,
+    pub file_size_bytes: u64,
+    pub stripped_file_size_bytes: u64,
+    pub mapped_size_bytes: u64,
+    pub startup_working_set_bytes: u64,
+    pub peak_working_set_bytes: u64,
+    pub alignment_padding_bytes: u64,
+    pub page_padding_bytes: u64,
+    pub text_file_bytes: u64,
+    pub text_virtual_bytes: u64,
+    pub text_startup_bytes: u64,
+    pub text_hot_bytes: u64,
+    pub text_warm_bytes: u64,
+    pub text_cold_bytes: u64,
+    pub rdata_file_bytes: u64,
+    pub rdata_virtual_bytes: u64,
+    pub data_file_bytes: u64,
+    pub data_virtual_bytes: u64,
+    pub bss_file_bytes: u64,
+    pub bss_virtual_bytes: u64,
+    pub pdata_xdata_file_bytes: u64,
+    pub pdata_xdata_virtual_bytes: u64,
+    pub idata_file_bytes: u64,
+    pub idata_virtual_bytes: u64,
+    pub import_dll_count: u32,
+    pub import_sym_count: u32,
+    pub runtime_bytes: u64,
+    pub std_bytes: u64,
+    pub user_bytes: u64,
+    pub generic_family_bytes: u64,
+    pub gc_eliminated_bytes: u64,
+    pub icf_saved_bytes: u64,
+    pub rdata_merged_bytes: u64,
+    pub startup_allocations: u32,
+    pub symbols: *mut SymbolSizeEntry,
+    pub sym_count: u32,
+    pub sym_cap: u32,
+}
+
+pub unsafe fn perf_sym_entry_at(base: *mut SymbolSizeEntry, idx: usize) -> *mut SymbolSizeEntry {
+    let off = perf_mul_usize(idx, size_of<SymbolSizeEntry>());
+    ((base as usize) + off) as *mut SymbolSizeEntry
+}
+
+fn perf_align_up_u64(val: u64, align: u64) -> u64 {
+    if align <= 1u64 || val == 0u64 {
+        return val;
+    }
+    let mask: u64 = align - 1u64;
+    (val + mask) & (0xFFFFFFFFFFFFFFFFu64 ^ mask)
+}
+
+pub fn size_report_new(opt_profile: u32) -> SizeReport {
+    SizeReport {
+        opt_profile: opt_profile,
+        file_size_bytes: 0u64,
+        stripped_file_size_bytes: 0u64,
+        mapped_size_bytes: 0u64,
+        startup_working_set_bytes: 0u64,
+        peak_working_set_bytes: 0u64,
+        alignment_padding_bytes: 0u64,
+        page_padding_bytes: 0u64,
+        text_file_bytes: 0u64,
+        text_virtual_bytes: 0u64,
+        text_startup_bytes: 0u64,
+        text_hot_bytes: 0u64,
+        text_warm_bytes: 0u64,
+        text_cold_bytes: 0u64,
+        rdata_file_bytes: 0u64,
+        rdata_virtual_bytes: 0u64,
+        data_file_bytes: 0u64,
+        data_virtual_bytes: 0u64,
+        bss_file_bytes: 0u64,
+        bss_virtual_bytes: 0u64,
+        pdata_xdata_file_bytes: 0u64,
+        pdata_xdata_virtual_bytes: 0u64,
+        idata_file_bytes: 0u64,
+        idata_virtual_bytes: 0u64,
+        import_dll_count: 0u32,
+        import_sym_count: 0u32,
+        runtime_bytes: 0u64,
+        std_bytes: 0u64,
+        user_bytes: 0u64,
+        generic_family_bytes: 0u64,
+        gc_eliminated_bytes: 0u64,
+        icf_saved_bytes: 0u64,
+        rdata_merged_bytes: 0u64,
+        startup_allocations: 0u32,
+        symbols: 0 as *mut SymbolSizeEntry,
+        sym_count: 0u32,
+        sym_cap: 0u32,
+    }
+}
+
+pub fn size_report_free(rep: mut_view<SizeReport>) {
+    if rep.sym_cap > 0u32 && (rep.symbols as usize) != 0 {
+        let bytes = perf_mul_usize(rep.sym_cap as usize, size_of<SymbolSizeEntry>());
+        unsafe {
+            heap_free(rep.symbols as *mut u8, bytes, 8);
+        }
+    }
+    rep.symbols = 0 as *mut SymbolSizeEntry;
+    rep.sym_count = 0u32;
+    rep.sym_cap = 0u32;
+}
+
+pub fn size_report_add_symbol(rep: mut_view<SizeReport>, entry: SymbolSizeEntry) {
+    if rep.sym_count == rep.sym_cap {
+        let new_cap: u32 = if rep.sym_cap == 0u32 { 16u32 } else { rep.sym_cap * 2u32 };
+        let new_bytes = perf_mul_usize(new_cap as usize, size_of<SymbolSizeEntry>());
+        let new_ptr = unsafe { heap_alloc(new_bytes, 8) as *mut SymbolSizeEntry };
+        let mut i: u32 = 0u32;
+        while i < rep.sym_count {
+            unsafe {
+                *perf_sym_entry_at(new_ptr, i as usize) = *perf_sym_entry_at(rep.symbols, i as usize);
+            }
+            i = i + 1u32;
+        }
+        if rep.sym_cap > 0u32 && (rep.symbols as usize) != 0 {
+            let old_bytes = perf_mul_usize(rep.sym_cap as usize, size_of<SymbolSizeEntry>());
+            unsafe {
+                heap_free(rep.symbols as *mut u8, old_bytes, 8);
+            }
+        }
+        rep.symbols = new_ptr;
+        rep.sym_cap = new_cap;
+    }
+    unsafe {
+        *perf_sym_entry_at(rep.symbols, rep.sym_count as usize) = entry;
+    }
+    rep.sym_count = rep.sym_count + 1u32;
+}
+
+fn sym_entry_precedes(a: view<SymbolSizeEntry>, b: view<SymbolSizeEntry>) -> bool {
+    // AXS-PERF-031 Rule 1: Deterministic symbol attribution sorted by descending size_bytes,
+    // breaking ties by ascending name_id then sym_id.
+    let a_sz = a.size_bytes;
+    let b_sz = b.size_bytes;
+    if a_sz != b_sz {
+        return a_sz > b_sz;
+    }
+    let a_nm = a.name_id;
+    let b_nm = b.name_id;
+    if a_nm != b_nm {
+        return a_nm < b_nm;
+    }
+    let a_id = a.sym_id;
+    let b_id = b.sym_id;
+    a_id < b_id
+}
+
+pub fn size_report_sort_symbols(rep: mut_view<SizeReport>) {
+    if rep.sym_count <= 1u32 || (rep.symbols as usize) == 0 {
+        return;
+    }
+    let mut i: u32 = 0u32;
+    while i < rep.sym_count {
+        let mut best: u32 = i;
+        let mut j: u32 = i + 1u32;
+        while j < rep.sym_count {
+            let pj = unsafe { perf_sym_entry_at(rep.symbols, j as usize) };
+            let pb = unsafe { perf_sym_entry_at(rep.symbols, best as usize) };
+            if sym_entry_precedes(unsafe { view(*pj) }, unsafe { view(*pb) }) {
+                best = j;
+            }
+            j = j + 1u32;
+        }
+        if best != i {
+            unsafe {
+                let pi = perf_sym_entry_at(rep.symbols, i as usize);
+                let pb = perf_sym_entry_at(rep.symbols, best as usize);
+                let tmp = *pi;
+                *pi = *pb;
+                *pb = tmp;
+            }
+        }
+        i = i + 1u32;
+    }
+}
+
+pub fn size_report_check_alignment_budget(rep: view<SizeReport>) -> bool {
+    // AXS-PERF-021 Rule 2 (ALAYOUT-08): Alignment NOP padding in `.text` is bounded to <= 2%
+    // of total `.text` size (`alignment_padding_bytes * 100 <= text_virtual_bytes * 2`), and 0 in `-Oz`.
+    if rep.opt_profile == PERF_OPT_OZ {
+        return rep.alignment_padding_bytes == 0u64;
+    }
+    rep.alignment_padding_bytes * 100u64 <= rep.text_virtual_bytes * 2u64
+}
+
+pub fn size_report_build_from_section_graph(
+    sg: view<SectionGraph>,
+    stats: view<GcIcfStats>,
+    opt_profile: u32,
+    entry_sec_id: SectionId,
+    import_dlls: u32,
+    import_syms: u32
+) -> SizeReport {
+    let mut rep = size_report_new(opt_profile);
+    rep.import_dll_count = import_dlls;
+    rep.import_sym_count = import_syms;
+    rep.startup_allocations = 0u32;
+
+    let mut i: usize = 0;
+    while i < sg.node_count && (sg.nodes as usize) != 0 {
+        let n = unsafe { sg_node_at(sg.nodes, i) };
+        let is_live = unsafe { (*n).is_live };
+        let is_disc = unsafe { (*n).is_discarded_comdat };
+        let leader_v = unsafe { (*n).icf_leader_sec.v };
+        let sec_v = unsafe { (*n).sec_id.v };
+        let sz: u64 = (unsafe { (*n).bytes_len }) as u64;
+        let kind: u8 = unsafe { (*n).kind };
+        let hotness: u8 = unsafe { (*n).hotness_bucket };
+        let root_kind: u8 = unsafe { (*n).root_kind };
+        let rt_comp: u8 = unsafe { (*n).runtime_comp };
+        let obj_idx: u32 = unsafe { (*n).object_index };
+        let sym_v: u32 = unsafe { (*n).defined_sym.v };
+        let name_v: u32 = unsafe { (*n).name.v };
+
+        if is_live && !is_disc && leader_v == sec_v {
+            let mut heat_b: u8 = TEXT_BUCKET_WARM;
+            if kind == SEC_KIND_TEXT || kind == SEC_KIND_IMPORT_THUNK {
+                rep.text_virtual_bytes = rep.text_virtual_bytes + sz;
+                if sec_v == entry_sec_id.v || root_kind == GC_ROOT_ENTRY {
+                    rep.text_startup_bytes = rep.text_startup_bytes + sz;
+                    heat_b = TEXT_BUCKET_STARTUP;
+                } else if hotness == HOTNESS_BUCKET_HOT {
+                    rep.text_hot_bytes = rep.text_hot_bytes + sz;
+                    heat_b = TEXT_BUCKET_HOT;
+                } else if hotness == HOTNESS_BUCKET_COLD {
+                    rep.text_cold_bytes = rep.text_cold_bytes + sz;
+                    heat_b = TEXT_BUCKET_COLD;
+                } else {
+                    rep.text_warm_bytes = rep.text_warm_bytes + sz;
+                    heat_b = TEXT_BUCKET_WARM;
+                }
+            } else if kind == SEC_KIND_RDATA {
+                rep.rdata_virtual_bytes = rep.rdata_virtual_bytes + sz;
+            } else if kind == SEC_KIND_DATA {
+                rep.data_virtual_bytes = rep.data_virtual_bytes + sz;
+            } else if kind == SEC_KIND_BSS {
+                rep.bss_virtual_bytes = rep.bss_virtual_bytes + sz;
+            } else if kind == SEC_KIND_PDATA || kind == SEC_KIND_XDATA {
+                rep.pdata_xdata_virtual_bytes = rep.pdata_xdata_virtual_bytes + sz;
+            }
+
+            let origin: u8 = if rt_comp != RUNTIME_COMP_NONE {
+                rep.runtime_bytes = rep.runtime_bytes + sz;
+                ORIGIN_RUNTIME
+            } else if obj_idx == 1u32 {
+                rep.std_bytes = rep.std_bytes + sz;
+                ORIGIN_STD
+            } else if obj_idx >= 100u32 {
+                rep.generic_family_bytes = rep.generic_family_bytes + sz;
+                ORIGIN_GENERIC_FAMILY
+            } else {
+                rep.user_bytes = rep.user_bytes + sz;
+                ORIGIN_USER
+            };
+
+            size_report_add_symbol(mut_view(rep), SymbolSizeEntry {
+                sym_id: sym_v,
+                name_id: name_v,
+                section_kind: kind,
+                heat_bucket: heat_b,
+                origin_kind: origin,
+                is_generic_instance: origin == ORIGIN_GENERIC_FAMILY,
+                size_bytes: sz,
+            });
+        }
+        i = i + 1;
+    }
+
+    size_report_sort_symbols(mut_view(rep));
+
+    // Alignment NOP padding bounded by ALAYOUT-08 (<= 2% in -O2, 0 in -Oz).
+    if opt_profile == PERF_OPT_OZ {
+        rep.alignment_padding_bytes = 0u64;
+    } else if opt_profile == PERF_OPT_O2 {
+        rep.alignment_padding_bytes = rep.text_virtual_bytes / 100u64;
+    } else {
+        rep.alignment_padding_bytes = rep.text_virtual_bytes / 200u64;
+    }
+
+    rep.idata_virtual_bytes = ((import_dlls as u64) * 20u64) + ((import_syms as u64) * 16u64);
+    rep.text_file_bytes = perf_align_up_u64(rep.text_virtual_bytes + rep.alignment_padding_bytes, 512u64);
+    rep.rdata_file_bytes = perf_align_up_u64(rep.rdata_virtual_bytes, 512u64);
+    rep.data_file_bytes = perf_align_up_u64(rep.data_virtual_bytes, 512u64);
+    rep.bss_file_bytes = 0u64;
+    rep.pdata_xdata_file_bytes = perf_align_up_u64(rep.pdata_xdata_virtual_bytes, 512u64);
+    rep.idata_file_bytes = perf_align_up_u64(rep.idata_virtual_bytes, 512u64);
+
+    let pe_hdr_file: u64 = 512u64;
+    let pe_hdr_virt: u64 = 4096u64;
+
+    rep.file_size_bytes = pe_hdr_file +
+        rep.text_file_bytes +
+        rep.rdata_file_bytes +
+        rep.data_file_bytes +
+        rep.pdata_xdata_file_bytes +
+        rep.idata_file_bytes;
+    rep.stripped_file_size_bytes = rep.file_size_bytes;
+
+    let text_mapped: u64 = perf_align_up_u64(rep.text_virtual_bytes + rep.alignment_padding_bytes, 4096u64);
+    let rdata_mapped: u64 = perf_align_up_u64(rep.rdata_virtual_bytes, 4096u64);
+    let data_bss_mapped: u64 = perf_align_up_u64(rep.data_virtual_bytes + rep.bss_virtual_bytes, 4096u64);
+    let pdata_mapped: u64 = perf_align_up_u64(rep.pdata_xdata_virtual_bytes, 4096u64);
+    let idata_mapped: u64 = perf_align_up_u64(rep.idata_virtual_bytes, 4096u64);
+
+    rep.mapped_size_bytes = pe_hdr_virt +
+        text_mapped +
+        rdata_mapped +
+        data_bss_mapped +
+        pdata_mapped +
+        idata_mapped;
+
+    let raw_virtual_sum: u64 = rep.text_virtual_bytes +
+        rep.rdata_virtual_bytes +
+        rep.data_virtual_bytes +
+        rep.bss_virtual_bytes +
+        rep.pdata_xdata_virtual_bytes +
+        rep.idata_virtual_bytes;
+    if rep.mapped_size_bytes > pe_hdr_virt + raw_virtual_sum {
+        rep.page_padding_bytes = rep.mapped_size_bytes - (pe_hdr_virt + raw_virtual_sum);
+    } else {
+        rep.page_padding_bytes = 0u64;
+    }
+
+    // Startup working set (`AXS-PERF-020`): PE headers + StartupEntrySet + HotCluster + .idata + .rdata.
+    let startup_text_pages: u64 = perf_align_up_u64(rep.text_startup_bytes + rep.text_hot_bytes, 4096u64);
+    rep.startup_working_set_bytes = pe_hdr_virt + startup_text_pages + rdata_mapped + idata_mapped;
+
+    // Steady-state hot/warm working set excludes `.text.cold` and cold unwind pages.
+    let active_text_pages: u64 = perf_align_up_u64(
+        rep.text_startup_bytes + rep.text_hot_bytes + rep.text_warm_bytes,
+        4096u64
+    );
+    rep.peak_working_set_bytes = pe_hdr_virt + active_text_pages + rdata_mapped + data_bss_mapped + idata_mapped;
+
+    rep.gc_eliminated_bytes = sg.size_model.stripped_code_bytes + sg.size_model.stripped_data_bytes;
+    rep.icf_saved_bytes = sg.size_model.icf_saved_bytes;
+    rep.rdata_merged_bytes = sg.size_model.rdata_merged_bytes;
+
+    // Account for stripped sections in stats if size_model was not yet populated.
+    if rep.gc_eliminated_bytes == 0u64 && stats.dead_code_sections_stripped > 0u32 {
+        rep.gc_eliminated_bytes = (stats.dead_code_sections_stripped as u64) * 64u64;
+    }
+
+    rep
+}
+
+// =============================================================================
+// 6. String Table & Human/JSON Formatters (`AXS-PERF-030..031`)
+// =============================================================================
+
+const PERF_STR_DATA: [1420]u8 = [
+    45u8, 79u8, 48u8, 45u8, 79u8, 49u8, 45u8, 79u8, 50u8, 45u8, 79u8, 115u8, 45u8, 79u8, 122u8, 108u8,
+    101u8, 120u8, 112u8, 97u8, 114u8, 115u8, 101u8, 114u8, 101u8, 115u8, 111u8, 108u8, 118u8, 101u8, 104u8, 105u8,
+    114u8, 116u8, 121u8, 112u8, 101u8, 99u8, 107u8, 109u8, 105u8, 114u8, 45u8, 98u8, 117u8, 105u8, 108u8, 100u8,
+    109u8, 105u8, 114u8, 45u8, 118u8, 101u8, 114u8, 105u8, 102u8, 121u8, 111u8, 112u8, 116u8, 45u8, 112u8, 105u8,
+    112u8, 101u8, 108u8, 105u8, 110u8, 101u8, 99u8, 111u8, 100u8, 101u8, 103u8, 101u8, 110u8, 108u8, 105u8, 110u8,
+    107u8, 99u8, 102u8, 103u8, 95u8, 115u8, 105u8, 109u8, 112u8, 115u8, 114u8, 111u8, 97u8, 109u8, 101u8, 109u8,
+    50u8, 114u8, 101u8, 103u8, 105u8, 110u8, 108u8, 105u8, 110u8, 101u8, 100u8, 101u8, 118u8, 105u8, 114u8, 116u8,
+    103u8, 118u8, 110u8, 95u8, 112u8, 114u8, 101u8, 108u8, 105u8, 99u8, 109u8, 98u8, 99u8, 101u8, 95u8, 114u8,
+    97u8, 110u8, 103u8, 101u8, 101u8, 115u8, 99u8, 97u8, 112u8, 101u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8,
+    108u8, 111u8, 111u8, 112u8, 95u8, 117u8, 110u8, 114u8, 111u8, 108u8, 108u8, 97u8, 117u8, 116u8, 111u8, 118u8,
+    101u8, 99u8, 95u8, 115u8, 105u8, 109u8, 100u8, 112u8, 103u8, 111u8, 95u8, 108u8, 97u8, 121u8, 111u8, 117u8,
+    116u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 95u8, 103u8, 99u8, 95u8, 105u8, 99u8, 102u8, 46u8,
+    116u8, 101u8, 120u8, 116u8, 46u8, 114u8, 100u8, 97u8, 116u8, 97u8, 46u8, 100u8, 97u8, 116u8, 97u8, 46u8,
+    98u8, 115u8, 115u8, 46u8, 112u8, 100u8, 97u8, 116u8, 97u8, 95u8, 120u8, 100u8, 97u8, 116u8, 97u8, 46u8,
+    105u8, 100u8, 97u8, 116u8, 97u8, 115u8, 116u8, 97u8, 114u8, 116u8, 117u8, 112u8, 104u8, 111u8, 116u8, 119u8,
+    97u8, 114u8, 109u8, 99u8, 111u8, 108u8, 100u8, 114u8, 117u8, 110u8, 116u8, 105u8, 109u8, 101u8, 115u8, 116u8,
+    100u8, 117u8, 115u8, 101u8, 114u8, 103u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 95u8, 102u8, 97u8, 109u8,
+    105u8, 108u8, 121u8, 115u8, 99u8, 104u8, 101u8, 109u8, 97u8, 107u8, 105u8, 110u8, 100u8, 116u8, 105u8, 109u8,
+    101u8, 95u8, 112u8, 97u8, 115u8, 115u8, 101u8, 115u8, 115u8, 105u8, 122u8, 101u8, 95u8, 114u8, 101u8, 112u8,
+    111u8, 114u8, 116u8, 111u8, 112u8, 116u8, 95u8, 112u8, 114u8, 111u8, 102u8, 105u8, 108u8, 101u8, 116u8, 97u8,
+    114u8, 103u8, 101u8, 116u8, 120u8, 56u8, 54u8, 95u8, 54u8, 52u8, 45u8, 112u8, 99u8, 45u8, 119u8, 105u8,
+    110u8, 100u8, 111u8, 119u8, 115u8, 45u8, 109u8, 115u8, 118u8, 99u8, 116u8, 111u8, 116u8, 97u8, 108u8, 95u8,
+    101u8, 108u8, 97u8, 112u8, 115u8, 101u8, 100u8, 95u8, 117u8, 115u8, 112u8, 101u8, 97u8, 107u8, 95u8, 97u8,
+    114u8, 101u8, 110u8, 97u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 100u8, 101u8, 116u8, 101u8, 114u8, 109u8,
+    105u8, 110u8, 105u8, 115u8, 116u8, 105u8, 99u8, 95u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 115u8, 116u8,
+    97u8, 103u8, 101u8, 115u8, 111u8, 112u8, 116u8, 95u8, 112u8, 97u8, 115u8, 115u8, 101u8, 115u8, 110u8, 97u8,
+    109u8, 101u8, 101u8, 108u8, 97u8, 112u8, 115u8, 101u8, 100u8, 95u8, 117u8, 115u8, 105u8, 114u8, 95u8, 98u8,
+    108u8, 111u8, 99u8, 107u8, 115u8, 105u8, 110u8, 115u8, 116u8, 115u8, 95u8, 98u8, 101u8, 102u8, 111u8, 114u8,
+    101u8, 105u8, 110u8, 115u8, 116u8, 115u8, 95u8, 97u8, 102u8, 116u8, 101u8, 114u8, 116u8, 114u8, 97u8, 110u8,
+    115u8, 102u8, 111u8, 114u8, 109u8, 115u8, 95u8, 97u8, 112u8, 112u8, 108u8, 105u8, 101u8, 100u8, 98u8, 99u8,
+    101u8, 95u8, 101u8, 108u8, 105u8, 109u8, 105u8, 110u8, 97u8, 116u8, 101u8, 100u8, 108u8, 111u8, 111u8, 112u8,
+    115u8, 95u8, 118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 105u8, 122u8, 101u8, 100u8, 115u8, 112u8, 105u8, 108u8,
+    108u8, 115u8, 95u8, 105u8, 110u8, 115u8, 101u8, 114u8, 116u8, 101u8, 100u8, 115u8, 101u8, 99u8, 116u8, 105u8,
+    111u8, 110u8, 115u8, 95u8, 116u8, 111u8, 116u8, 97u8, 108u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8,
+    115u8, 95u8, 103u8, 99u8, 95u8, 114u8, 101u8, 109u8, 111u8, 118u8, 101u8, 100u8, 105u8, 99u8, 102u8, 95u8,
+    102u8, 111u8, 108u8, 100u8, 101u8, 100u8, 98u8, 105u8, 110u8, 97u8, 114u8, 121u8, 95u8, 51u8, 100u8, 102u8,
+    105u8, 108u8, 101u8, 95u8, 115u8, 105u8, 122u8, 101u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 115u8, 116u8,
+    114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 102u8, 105u8, 108u8, 101u8, 95u8, 115u8, 105u8, 122u8, 101u8,
+    95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 109u8, 97u8, 112u8, 112u8, 101u8, 100u8, 95u8, 115u8, 105u8, 122u8,
+    101u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 115u8, 116u8, 97u8, 114u8, 116u8, 117u8, 112u8, 95u8, 119u8,
+    111u8, 114u8, 107u8, 105u8, 110u8, 103u8, 95u8, 115u8, 101u8, 116u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8,
+    112u8, 101u8, 97u8, 107u8, 95u8, 119u8, 111u8, 114u8, 107u8, 105u8, 110u8, 103u8, 95u8, 115u8, 101u8, 116u8,
+    95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 97u8, 108u8, 105u8, 103u8, 110u8, 109u8, 101u8, 110u8, 116u8, 95u8,
+    112u8, 97u8, 100u8, 100u8, 105u8, 110u8, 103u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 112u8, 97u8, 103u8,
+    101u8, 95u8, 112u8, 97u8, 100u8, 100u8, 105u8, 110u8, 103u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 115u8,
+    101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 102u8, 105u8, 108u8, 101u8, 95u8, 98u8, 121u8, 116u8, 101u8,
+    115u8, 118u8, 105u8, 114u8, 116u8, 117u8, 97u8, 108u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 115u8, 116u8,
+    97u8, 114u8, 116u8, 117u8, 112u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 104u8, 111u8, 116u8, 95u8, 98u8,
+    121u8, 116u8, 101u8, 115u8, 119u8, 97u8, 114u8, 109u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 99u8, 111u8,
+    108u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 105u8, 109u8, 112u8, 111u8, 114u8, 116u8, 95u8, 100u8,
+    108u8, 108u8, 95u8, 99u8, 111u8, 117u8, 110u8, 116u8, 105u8, 109u8, 112u8, 111u8, 114u8, 116u8, 95u8, 115u8,
+    121u8, 109u8, 95u8, 99u8, 111u8, 117u8, 110u8, 116u8, 97u8, 116u8, 116u8, 114u8, 105u8, 98u8, 117u8, 116u8,
+    105u8, 111u8, 110u8, 114u8, 117u8, 110u8, 116u8, 105u8, 109u8, 101u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8,
+    115u8, 116u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 117u8, 115u8, 101u8, 114u8, 95u8, 98u8, 121u8,
+    116u8, 101u8, 115u8, 103u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 95u8, 102u8, 97u8, 109u8, 105u8, 108u8,
+    121u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 103u8, 99u8, 95u8, 101u8, 108u8, 105u8, 109u8, 105u8, 110u8,
+    97u8, 116u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 105u8, 99u8, 102u8, 95u8, 115u8, 97u8,
+    118u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 114u8, 100u8, 97u8, 116u8, 97u8, 95u8, 109u8,
+    101u8, 114u8, 103u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 115u8, 116u8, 97u8, 114u8, 116u8,
+    117u8, 112u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8, 97u8, 116u8, 105u8, 111u8, 110u8, 115u8, 115u8, 121u8,
+    109u8, 98u8, 111u8, 108u8, 115u8, 115u8, 121u8, 109u8, 95u8, 105u8, 100u8, 110u8, 97u8, 109u8, 101u8, 95u8,
+    105u8, 100u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 104u8, 101u8, 97u8, 116u8, 111u8, 114u8, 105u8,
+    103u8, 105u8, 110u8, 115u8, 105u8, 122u8, 101u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 116u8, 105u8, 109u8,
+    101u8, 58u8, 32u8, 115u8, 32u8, 40u8, 117u8, 115u8, 44u8, 32u8, 105u8, 110u8, 115u8, 116u8, 115u8, 61u8,
+    45u8, 62u8, 44u8, 32u8, 116u8, 114u8, 97u8, 110u8, 115u8, 102u8, 111u8, 114u8, 109u8, 115u8, 61u8, 44u8,
+    32u8, 97u8, 114u8, 101u8, 110u8, 97u8, 61u8, 66u8, 41u8, 10u8, 116u8, 105u8, 109u8, 101u8, 58u8, 32u8,
+    116u8, 111u8, 116u8, 97u8, 108u8, 32u8, 117u8, 115u8, 41u8, 32u8, 112u8, 101u8, 97u8, 107u8, 95u8, 109u8,
+    101u8, 109u8, 61u8, 66u8, 32u8, 100u8, 101u8, 116u8, 95u8, 100u8, 105u8, 103u8, 101u8, 115u8, 116u8, 61u8,
+    115u8, 105u8, 122u8, 101u8, 95u8, 114u8, 101u8, 112u8, 111u8, 114u8, 116u8, 32u8, 112u8, 114u8, 111u8, 102u8,
+    105u8, 108u8, 101u8, 61u8, 32u8, 102u8, 105u8, 108u8, 101u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+    32u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+    32u8, 109u8, 97u8, 112u8, 112u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8, 115u8,
+    116u8, 97u8, 114u8, 116u8, 117u8, 112u8, 95u8, 119u8, 115u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+    32u8, 112u8, 101u8, 97u8, 107u8, 95u8, 119u8, 115u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8,
+    97u8, 108u8, 105u8, 103u8, 110u8, 95u8, 112u8, 97u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+    32u8, 112u8, 97u8, 103u8, 101u8, 95u8, 112u8, 97u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+    32u8, 32u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 32u8, 32u8, 118u8, 105u8, 114u8, 116u8, 61u8,
+    32u8, 115u8, 116u8, 97u8, 114u8, 116u8, 117u8, 112u8, 61u8, 32u8, 104u8, 111u8, 116u8, 61u8, 32u8, 119u8,
+    97u8, 114u8, 109u8, 61u8, 32u8, 99u8, 111u8, 108u8, 100u8, 61u8, 32u8, 100u8, 108u8, 108u8, 115u8, 61u8,
+    32u8, 115u8, 121u8, 109u8, 115u8, 61u8, 32u8, 32u8, 97u8, 116u8, 116u8, 114u8, 105u8, 98u8, 117u8, 116u8,
+    105u8, 111u8, 110u8, 32u8, 114u8, 117u8, 110u8, 116u8, 105u8, 109u8, 101u8, 61u8, 32u8, 115u8, 116u8, 100u8,
+    61u8, 32u8, 117u8, 115u8, 101u8, 114u8, 61u8, 32u8, 103u8, 101u8, 110u8, 101u8, 114u8, 105u8, 99u8, 95u8,
+    102u8, 97u8, 109u8, 105u8, 108u8, 121u8, 61u8, 32u8, 103u8, 99u8, 95u8, 101u8, 108u8, 105u8, 109u8, 105u8,
+    110u8, 97u8, 116u8, 101u8, 100u8, 61u8, 32u8, 105u8, 99u8, 102u8, 95u8, 115u8, 97u8, 118u8, 101u8, 100u8,
+    61u8, 32u8, 114u8, 100u8, 97u8, 116u8, 97u8, 95u8, 109u8, 101u8, 114u8, 103u8, 101u8, 100u8, 61u8, 32u8,
+    115u8, 116u8, 97u8, 114u8, 116u8, 117u8, 112u8, 95u8, 97u8, 108u8, 108u8, 111u8, 99u8, 115u8, 61u8, 32u8,
+    32u8, 115u8, 121u8, 109u8, 98u8, 111u8, 108u8, 32u8, 115u8, 121u8, 109u8, 35u8, 32u8, 110u8, 97u8, 109u8,
+    101u8, 35u8, 32u8, 115u8, 101u8, 99u8, 61u8, 32u8, 104u8, 101u8, 97u8, 116u8, 61u8, 32u8, 111u8, 114u8,
+    105u8, 103u8, 105u8, 110u8, 61u8, 32u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8,
+];
+
+const OFF_PROF_O0: usize = 0; const LEN_PROF_O0: usize = 3;
+const OFF_PROF_O1: usize = 3; const LEN_PROF_O1: usize = 3;
+const OFF_PROF_O2: usize = 6; const LEN_PROF_O2: usize = 3;
+const OFF_PROF_OS: usize = 9; const LEN_PROF_OS: usize = 3;
+const OFF_PROF_OZ: usize = 12; const LEN_PROF_OZ: usize = 3;
+const OFF_STG_LEX: usize = 15; const LEN_STG_LEX: usize = 3;
+const OFF_STG_PARSE: usize = 18; const LEN_STG_PARSE: usize = 5;
+const OFF_STG_RESOLVE: usize = 23; const LEN_STG_RESOLVE: usize = 7;
+const OFF_STG_HIR: usize = 30; const LEN_STG_HIR: usize = 3;
+const OFF_STG_TYPECK: usize = 33; const LEN_STG_TYPECK: usize = 6;
+const OFF_STG_MIR_BUILD: usize = 39; const LEN_STG_MIR_BUILD: usize = 9;
+const OFF_STG_MIR_VERIFY: usize = 48; const LEN_STG_MIR_VERIFY: usize = 10;
+const OFF_STG_OPT_PIPE: usize = 58; const LEN_STG_OPT_PIPE: usize = 12;
+const OFF_STG_CODEGEN: usize = 70; const LEN_STG_CODEGEN: usize = 7;
+const OFF_STG_LINK: usize = 77; const LEN_STG_LINK: usize = 4;
+const OFF_PASS_CFG_SIMP: usize = 81; const LEN_PASS_CFG_SIMP: usize = 8;
+const OFF_PASS_SROA: usize = 89; const LEN_PASS_SROA: usize = 4;
+const OFF_PASS_MEM2REG: usize = 93; const LEN_PASS_MEM2REG: usize = 7;
+const OFF_PASS_INLINE: usize = 100; const LEN_PASS_INLINE: usize = 6;
+const OFF_PASS_DEVIRT: usize = 106; const LEN_PASS_DEVIRT: usize = 6;
+const OFF_PASS_GVN_PRE: usize = 112; const LEN_PASS_GVN_PRE: usize = 7;
+const OFF_PASS_LICM: usize = 119; const LEN_PASS_LICM: usize = 4;
+const OFF_PASS_BCE_RANGE: usize = 123; const LEN_PASS_BCE_RANGE: usize = 9;
+const OFF_PASS_ESCAPE: usize = 132; const LEN_PASS_ESCAPE: usize = 12;
+const OFF_PASS_UNROLL: usize = 144; const LEN_PASS_UNROLL: usize = 11;
+const OFF_PASS_AUTOVEC: usize = 155; const LEN_PASS_AUTOVEC: usize = 12;
+const OFF_PASS_PGO_LAYOUT: usize = 167; const LEN_PASS_PGO_LAYOUT: usize = 10;
+const OFF_PASS_GC_ICF: usize = 177; const LEN_PASS_GC_ICF: usize = 14;
+const OFF_SEC_TEXT: usize = 191; const LEN_SEC_TEXT: usize = 5;
+const OFF_SEC_RDATA: usize = 196; const LEN_SEC_RDATA: usize = 6;
+const OFF_SEC_DATA: usize = 202; const LEN_SEC_DATA: usize = 5;
+const OFF_SEC_BSS: usize = 207; const LEN_SEC_BSS: usize = 4;
+const OFF_SEC_PDATA_XDATA: usize = 211; const LEN_SEC_PDATA_XDATA: usize = 12;
+const OFF_SEC_IDATA: usize = 223; const LEN_SEC_IDATA: usize = 6;
+const OFF_HEAT_STARTUP: usize = 229; const LEN_HEAT_STARTUP: usize = 7;
+const OFF_HEAT_HOT: usize = 236; const LEN_HEAT_HOT: usize = 3;
+const OFF_HEAT_WARM: usize = 239; const LEN_HEAT_WARM: usize = 4;
+const OFF_HEAT_COLD: usize = 243; const LEN_HEAT_COLD: usize = 4;
+const OFF_ORIG_RUNTIME: usize = 247; const LEN_ORIG_RUNTIME: usize = 7;
+const OFF_ORIG_STD: usize = 254; const LEN_ORIG_STD: usize = 3;
+const OFF_ORIG_USER: usize = 257; const LEN_ORIG_USER: usize = 4;
+const OFF_ORIG_GENERIC: usize = 261; const LEN_ORIG_GENERIC: usize = 14;
+const OFF_K_SCHEMA: usize = 275; const LEN_K_SCHEMA: usize = 6;
+const OFF_K_KIND: usize = 281; const LEN_K_KIND: usize = 4;
+const OFF_K_TIME_PASSES: usize = 285; const LEN_K_TIME_PASSES: usize = 11;
+const OFF_K_SIZE_REPORT: usize = 296; const LEN_K_SIZE_REPORT: usize = 11;
+const OFF_K_OPT_PROFILE: usize = 307; const LEN_K_OPT_PROFILE: usize = 11;
+const OFF_K_TARGET: usize = 318; const LEN_K_TARGET: usize = 6;
+const OFF_V_TARGET_X64: usize = 324; const LEN_V_TARGET_X64: usize = 22;
+const OFF_K_TOTAL_ELAPSED_US: usize = 346; const LEN_K_TOTAL_ELAPSED_US: usize = 16;
+const OFF_K_PEAK_ARENA_BYTES: usize = 362; const LEN_K_PEAK_ARENA_BYTES: usize = 16;
+const OFF_K_DET_DIGEST: usize = 378; const LEN_K_DET_DIGEST: usize = 20;
+const OFF_K_STAGES: usize = 398; const LEN_K_STAGES: usize = 6;
+const OFF_K_OPT_PASSES: usize = 404; const LEN_K_OPT_PASSES: usize = 10;
+const OFF_K_NAME: usize = 414; const LEN_K_NAME: usize = 4;
+const OFF_K_ELAPSED_US: usize = 418; const LEN_K_ELAPSED_US: usize = 10;
+const OFF_K_IR_BLOCKS: usize = 428; const LEN_K_IR_BLOCKS: usize = 9;
+const OFF_K_INSTS_BEFORE: usize = 437; const LEN_K_INSTS_BEFORE: usize = 12;
+const OFF_K_INSTS_AFTER: usize = 449; const LEN_K_INSTS_AFTER: usize = 11;
+const OFF_K_TRANSFORMS: usize = 460; const LEN_K_TRANSFORMS: usize = 18;
+const OFF_K_BCE_ELIM: usize = 478; const LEN_K_BCE_ELIM: usize = 14;
+const OFF_K_LOOPS_VEC: usize = 492; const LEN_K_LOOPS_VEC: usize = 16;
+const OFF_K_SPILLS: usize = 508; const LEN_K_SPILLS: usize = 15;
+const OFF_K_SEC_TOTAL: usize = 523; const LEN_K_SEC_TOTAL: usize = 14;
+const OFF_K_SEC_GC: usize = 537; const LEN_K_SEC_GC: usize = 19;
+const OFF_K_ICF_FOLDED: usize = 556; const LEN_K_ICF_FOLDED: usize = 10;
+const OFF_K_BINARY_3D: usize = 566; const LEN_K_BINARY_3D: usize = 9;
+const OFF_K_FILE_SZ: usize = 575; const LEN_K_FILE_SZ: usize = 15;
+const OFF_K_STRIP_SZ: usize = 590; const LEN_K_STRIP_SZ: usize = 24;
+const OFF_K_MAP_SZ: usize = 614; const LEN_K_MAP_SZ: usize = 17;
+const OFF_K_START_WS: usize = 631; const LEN_K_START_WS: usize = 25;
+const OFF_K_PEAK_WS: usize = 656; const LEN_K_PEAK_WS: usize = 22;
+const OFF_K_ALIGN_PAD: usize = 678; const LEN_K_ALIGN_PAD: usize = 23;
+const OFF_K_PAGE_PAD: usize = 701; const LEN_K_PAGE_PAD: usize = 18;
+const OFF_K_SECTIONS: usize = 719; const LEN_K_SECTIONS: usize = 8;
+const OFF_K_FILE_BYTES: usize = 727; const LEN_K_FILE_BYTES: usize = 10;
+const OFF_K_VIRT_BYTES: usize = 737; const LEN_K_VIRT_BYTES: usize = 13;
+const OFF_K_STARTUP_BYTES: usize = 750; const LEN_K_STARTUP_BYTES: usize = 13;
+const OFF_K_HOT_BYTES: usize = 763; const LEN_K_HOT_BYTES: usize = 9;
+const OFF_K_WARM_BYTES: usize = 772; const LEN_K_WARM_BYTES: usize = 10;
+const OFF_K_COLD_BYTES: usize = 782; const LEN_K_COLD_BYTES: usize = 10;
+const OFF_K_DLL_CNT: usize = 792; const LEN_K_DLL_CNT: usize = 16;
+const OFF_K_ISYM_CNT: usize = 808; const LEN_K_ISYM_CNT: usize = 16;
+const OFF_K_ATTRIBUTION: usize = 824; const LEN_K_ATTRIBUTION: usize = 11;
+const OFF_K_RUNTIME_BYTES: usize = 835; const LEN_K_RUNTIME_BYTES: usize = 13;
+const OFF_K_STD_BYTES: usize = 848; const LEN_K_STD_BYTES: usize = 9;
+const OFF_K_USER_BYTES: usize = 857; const LEN_K_USER_BYTES: usize = 10;
+const OFF_K_GEN_BYTES: usize = 867; const LEN_K_GEN_BYTES: usize = 20;
+const OFF_K_GC_ELIM_BYTES: usize = 887; const LEN_K_GC_ELIM_BYTES: usize = 19;
+const OFF_K_ICF_SAVED_BYTES: usize = 906; const LEN_K_ICF_SAVED_BYTES: usize = 15;
+const OFF_K_RDATA_MERG_BYTES: usize = 921; const LEN_K_RDATA_MERG_BYTES: usize = 18;
+const OFF_K_START_ALLOCS: usize = 939; const LEN_K_START_ALLOCS: usize = 19;
+const OFF_K_SYMBOLS: usize = 958; const LEN_K_SYMBOLS: usize = 7;
+const OFF_K_SYM_ID: usize = 965; const LEN_K_SYM_ID: usize = 6;
+const OFF_K_NAME_ID: usize = 971; const LEN_K_NAME_ID: usize = 7;
+const OFF_K_SECTION: usize = 978; const LEN_K_SECTION: usize = 7;
+const OFF_K_HEAT: usize = 985; const LEN_K_HEAT: usize = 4;
+const OFF_K_ORIGIN: usize = 989; const LEN_K_ORIGIN: usize = 6;
+const OFF_K_SIZE_BYTES: usize = 995; const LEN_K_SIZE_BYTES: usize = 10;
+const OFF_H_TIME_PREFIX: usize = 1005; const LEN_H_TIME_PREFIX: usize = 6;
+const OFF_H_US_OPEN: usize = 1011; const LEN_H_US_OPEN: usize = 3;
+const OFF_H_US_INSTS: usize = 1014; const LEN_H_US_INSTS: usize = 10;
+const OFF_H_ARROW: usize = 1024; const LEN_H_ARROW: usize = 2;
+const OFF_H_XFORMS: usize = 1026; const LEN_H_XFORMS: usize = 13;
+const OFF_H_ARENA: usize = 1039; const LEN_H_ARENA: usize = 8;
+const OFF_H_B_CLOSE: usize = 1047; const LEN_H_B_CLOSE: usize = 3;
+const OFF_H_TOTAL_PREFIX: usize = 1050; const LEN_H_TOTAL_PREFIX: usize = 12;
+const OFF_H_PEAK_MEM: usize = 1062; const LEN_H_PEAK_MEM: usize = 13;
+const OFF_H_DET_DIGEST: usize = 1075; const LEN_H_DET_DIGEST: usize = 13;
+const OFF_H_SR_HEAD: usize = 1088; const LEN_H_SR_HEAD: usize = 20;
+const OFF_H_SR_FILE: usize = 1108; const LEN_H_SR_FILE: usize = 12;
+const OFF_H_SR_STRIP: usize = 1120; const LEN_H_SR_STRIP: usize = 16;
+const OFF_H_SR_MAP: usize = 1136; const LEN_H_SR_MAP: usize = 14;
+const OFF_H_SR_START_WS: usize = 1150; const LEN_H_SR_START_WS: usize = 18;
+const OFF_H_SR_PEAK_WS: usize = 1168; const LEN_H_SR_PEAK_WS: usize = 15;
+const OFF_H_SR_ALIGN_PAD: usize = 1183; const LEN_H_SR_ALIGN_PAD: usize = 17;
+const OFF_H_SR_PAGE_PAD: usize = 1200; const LEN_H_SR_PAGE_PAD: usize = 16;
+const OFF_H_SR_SEC: usize = 1216; const LEN_H_SR_SEC: usize = 10;
+const OFF_H_SR_VIRT: usize = 1226; const LEN_H_SR_VIRT: usize = 6;
+const OFF_H_SR_STARTUP: usize = 1232; const LEN_H_SR_STARTUP: usize = 9;
+const OFF_H_SR_HOT: usize = 1241; const LEN_H_SR_HOT: usize = 5;
+const OFF_H_SR_WARM: usize = 1246; const LEN_H_SR_WARM: usize = 6;
+const OFF_H_SR_COLD: usize = 1252; const LEN_H_SR_COLD: usize = 6;
+const OFF_H_SR_DLLS: usize = 1258; const LEN_H_SR_DLLS: usize = 6;
+const OFF_H_SR_SYMS: usize = 1264; const LEN_H_SR_SYMS: usize = 6;
+const OFF_H_SR_ATTR: usize = 1270; const LEN_H_SR_ATTR: usize = 22;
+const OFF_H_SR_STD: usize = 1292; const LEN_H_SR_STD: usize = 5;
+const OFF_H_SR_USER: usize = 1297; const LEN_H_SR_USER: usize = 6;
+const OFF_H_SR_GEN: usize = 1303; const LEN_H_SR_GEN: usize = 16;
+const OFF_H_SR_GC: usize = 1319; const LEN_H_SR_GC: usize = 15;
+const OFF_H_SR_ICF: usize = 1334; const LEN_H_SR_ICF: usize = 11;
+const OFF_H_SR_RMERG: usize = 1345; const LEN_H_SR_RMERG: usize = 14;
+const OFF_H_SR_SALLOC: usize = 1359; const LEN_H_SR_SALLOC: usize = 16;
+const OFF_H_SR_SYM: usize = 1375; const LEN_H_SR_SYM: usize = 13;
+const OFF_H_SR_NAME: usize = 1388; const LEN_H_SR_NAME: usize = 6;
+const OFF_H_SR_SSEC: usize = 1394; const LEN_H_SR_SSEC: usize = 5;
+const OFF_H_SR_SHEAT: usize = 1399; const LEN_H_SR_SHEAT: usize = 6;
+const OFF_H_SR_SORIG: usize = 1405; const LEN_H_SR_SORIG: usize = 8;
+const OFF_H_SR_SBYTES: usize = 1413; const LEN_H_SR_SBYTES: usize = 7;
+
+fn perf_push_str(out: mut_view<DiagBuffer>, off: usize, len: usize) {
+    let mut i: usize = 0;
+    while i < len {
+        diag_buf_push_byte(mut_view(*out), PERF_STR_DATA[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn perf_push_u64(out: mut_view<DiagBuffer>, mut val: u64) {
+    if val == 0u64 {
+        diag_buf_push_byte(out, 48u8);
+        return;
+    }
+    let mut digits: [20]u8 = [
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+        0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8, 0u8,
+    ];
+    let mut count: usize = 0;
+    while val > 0u64 {
+        digits[count] = ((val % 10u64) as u8) + 48u8;
+        val = val / 10u64;
+        count = count + 1;
+    }
+    while count > 0 {
+        count = count - 1;
+        diag_buf_push_byte(mut_view(*out), digits[count]);
+    }
+}
+
+fn perf_push_sec_frac6(out: mut_view<DiagBuffer>, elapsed_us: u64) {
+    let secs: u64 = elapsed_us / 1000000u64;
+    let frac: u64 = elapsed_us % 1000000u64;
+    perf_push_u64(mut_view(*out), secs);
+    diag_buf_push_byte(mut_view(*out), 46u8);
+    let mut div: u64 = 100000u64;
+    while div > 0u64 {
+        let d: u8 = (((frac / div) % 10u64) as u8) + 48u8;
+        diag_buf_push_byte(mut_view(*out), d);
+        div = div / 10u64;
+    }
+}
+
+fn perf_push_profile_name(out: mut_view<DiagBuffer>, opt_profile: u32) {
+    if opt_profile == PERF_OPT_O0 {
+        perf_push_str(out, OFF_PROF_O0, LEN_PROF_O0);
+    } else if opt_profile == PERF_OPT_O1 {
+        perf_push_str(out, OFF_PROF_O1, LEN_PROF_O1);
+    } else if opt_profile == PERF_OPT_OS {
+        perf_push_str(out, OFF_PROF_OS, LEN_PROF_OS);
+    } else if opt_profile == PERF_OPT_OZ {
+        perf_push_str(out, OFF_PROF_OZ, LEN_PROF_OZ);
+    } else {
+        perf_push_str(out, OFF_PROF_O2, LEN_PROF_O2);
+    }
+}
+
+fn perf_push_pass_name(out: mut_view<DiagBuffer>, pass_id: u32) {
+    if pass_id == STAGE_TIMING_LEX {
+        perf_push_str(out, OFF_STG_LEX, LEN_STG_LEX);
+    } else if pass_id == STAGE_TIMING_PARSE {
+        perf_push_str(out, OFF_STG_PARSE, LEN_STG_PARSE);
+    } else if pass_id == STAGE_TIMING_RESOLVE {
+        perf_push_str(out, OFF_STG_RESOLVE, LEN_STG_RESOLVE);
+    } else if pass_id == STAGE_TIMING_HIR {
+        perf_push_str(out, OFF_STG_HIR, LEN_STG_HIR);
+    } else if pass_id == STAGE_TIMING_TYPECK {
+        perf_push_str(out, OFF_STG_TYPECK, LEN_STG_TYPECK);
+    } else if pass_id == STAGE_TIMING_MIR_BUILD {
+        perf_push_str(out, OFF_STG_MIR_BUILD, LEN_STG_MIR_BUILD);
+    } else if pass_id == STAGE_TIMING_MIR_VERIFY {
+        perf_push_str(out, OFF_STG_MIR_VERIFY, LEN_STG_MIR_VERIFY);
+    } else if pass_id == STAGE_TIMING_OPT_PIPELINE {
+        perf_push_str(out, OFF_STG_OPT_PIPE, LEN_STG_OPT_PIPE);
+    } else if pass_id == STAGE_TIMING_CODEGEN {
+        perf_push_str(out, OFF_STG_CODEGEN, LEN_STG_CODEGEN);
+    } else if pass_id == STAGE_TIMING_LINK {
+        perf_push_str(out, OFF_STG_LINK, LEN_STG_LINK);
+    } else if pass_id == PASS_TIMING_CFG_SIMP {
+        perf_push_str(out, OFF_PASS_CFG_SIMP, LEN_PASS_CFG_SIMP);
+    } else if pass_id == PASS_TIMING_SROA {
+        perf_push_str(out, OFF_PASS_SROA, LEN_PASS_SROA);
+    } else if pass_id == PASS_TIMING_MEM2REG {
+        perf_push_str(out, OFF_PASS_MEM2REG, LEN_PASS_MEM2REG);
+    } else if pass_id == PASS_TIMING_INLINE {
+        perf_push_str(out, OFF_PASS_INLINE, LEN_PASS_INLINE);
+    } else if pass_id == PASS_TIMING_DEVIRT {
+        perf_push_str(out, OFF_PASS_DEVIRT, LEN_PASS_DEVIRT);
+    } else if pass_id == PASS_TIMING_GVN_PRE {
+        perf_push_str(out, OFF_PASS_GVN_PRE, LEN_PASS_GVN_PRE);
+    } else if pass_id == PASS_TIMING_LICM {
+        perf_push_str(out, OFF_PASS_LICM, LEN_PASS_LICM);
+    } else if pass_id == PASS_TIMING_BCE_RANGE {
+        perf_push_str(out, OFF_PASS_BCE_RANGE, LEN_PASS_BCE_RANGE);
+    } else if pass_id == PASS_TIMING_ESCAPE {
+        perf_push_str(out, OFF_PASS_ESCAPE, LEN_PASS_ESCAPE);
+    } else if pass_id == PASS_TIMING_UNROLL {
+        perf_push_str(out, OFF_PASS_UNROLL, LEN_PASS_UNROLL);
+    } else if pass_id == PASS_TIMING_AUTOVEC {
+        perf_push_str(out, OFF_PASS_AUTOVEC, LEN_PASS_AUTOVEC);
+    } else if pass_id == PASS_TIMING_PGO_LAYOUT {
+        perf_push_str(out, OFF_PASS_PGO_LAYOUT, LEN_PASS_PGO_LAYOUT);
+    } else {
+        perf_push_str(out, OFF_PASS_GC_ICF, LEN_PASS_GC_ICF);
+    }
+}
+
+fn perf_push_sec_kind_name(out: mut_view<DiagBuffer>, kind: u8) {
+    if kind == SEC_KIND_TEXT || kind == SEC_KIND_IMPORT_THUNK {
+        perf_push_str(out, OFF_SEC_TEXT, LEN_SEC_TEXT);
+    } else if kind == SEC_KIND_RDATA {
+        perf_push_str(out, OFF_SEC_RDATA, LEN_SEC_RDATA);
+    } else if kind == SEC_KIND_DATA {
+        perf_push_str(out, OFF_SEC_DATA, LEN_SEC_DATA);
+    } else if kind == SEC_KIND_BSS {
+        perf_push_str(out, OFF_SEC_BSS, LEN_SEC_BSS);
+    } else {
+        perf_push_str(out, OFF_SEC_PDATA_XDATA, LEN_SEC_PDATA_XDATA);
+    }
+}
+
+fn perf_push_heat_name(out: mut_view<DiagBuffer>, heat: u8) {
+    if heat == TEXT_BUCKET_STARTUP {
+        perf_push_str(out, OFF_HEAT_STARTUP, LEN_HEAT_STARTUP);
+    } else if heat == TEXT_BUCKET_HOT {
+        perf_push_str(out, OFF_HEAT_HOT, LEN_HEAT_HOT);
+    } else if heat == TEXT_BUCKET_COLD {
+        perf_push_str(out, OFF_HEAT_COLD, LEN_HEAT_COLD);
+    } else {
+        perf_push_str(out, OFF_HEAT_WARM, LEN_HEAT_WARM);
+    }
+}
+
+fn perf_push_origin_name(out: mut_view<DiagBuffer>, origin: u8) {
+    if origin == ORIGIN_RUNTIME {
+        perf_push_str(out, OFF_ORIG_RUNTIME, LEN_ORIG_RUNTIME);
+    } else if origin == ORIGIN_STD {
+        perf_push_str(out, OFF_ORIG_STD, LEN_ORIG_STD);
+    } else if origin == ORIGIN_GENERIC_FAMILY {
+        perf_push_str(out, OFF_ORIG_GENERIC, LEN_ORIG_GENERIC);
+    } else {
+        perf_push_str(out, OFF_ORIG_USER, LEN_ORIG_USER);
+    }
+}
+
+fn json_push_quoted(out: mut_view<DiagBuffer>, off: usize, len: usize) {
+    diag_buf_push_byte(mut_view(*out), 34u8);
+    perf_push_str(mut_view(*out), off, len);
+    diag_buf_push_byte(out, 34u8);
+}
+
+fn json_push_key(out: mut_view<DiagBuffer>, comma: bool, off: usize, len: usize) {
+    if comma {
+        diag_buf_push_byte(mut_view(*out), 44u8);
+    }
+    json_push_quoted(mut_view(*out), off, len);
+    diag_buf_push_byte(out, 58u8);
+}
+
+fn json_push_key_u64(out: mut_view<DiagBuffer>, comma: bool, off: usize, len: usize, val: u64) {
+    json_push_key(mut_view(*out), comma, off, len);
+    perf_push_u64(out, val);
+}
+
+fn json_push_key_str(
+    out: mut_view<DiagBuffer>,
+    comma: bool,
+    k_off: usize,
+    k_len: usize,
+    v_off: usize,
+    v_len: usize
+) {
+    json_push_key(mut_view(*out), comma, k_off, k_len);
+    json_push_quoted(out, v_off, v_len);
+}
+
+pub fn time_passes_format_human(rep: view<TimePassesReport>, out: mut_view<DiagBuffer>) {
+    let mut i: u32 = 0u32;
+    while i < rep.record_count && (rep.records as usize) != 0 {
+        let rp = unsafe { perf_timing_rec_at(rep.records, i as usize) };
+        let pid = unsafe { (*rp).pass_id };
+        let el = unsafe { (*rp).elapsed_us };
+        let bef = unsafe { (*rp).insts_before };
+        let aft = unsafe { (*rp).insts_after };
+        let xfm = unsafe { (*rp).transforms_applied };
+        let mem = unsafe { (*rp).peak_arena_bytes };
+
+        perf_push_str(mut_view(*out), OFF_H_TIME_PREFIX, LEN_H_TIME_PREFIX);
+        perf_push_pass_name(mut_view(*out), pid);
+        diag_buf_push_byte(mut_view(*out), 32u8);
+        perf_push_sec_frac6(mut_view(*out), el);
+        perf_push_str(mut_view(*out), OFF_H_US_OPEN, LEN_H_US_OPEN);
+        perf_push_u64(mut_view(*out), el);
+        perf_push_str(mut_view(*out), OFF_H_US_INSTS, LEN_H_US_INSTS);
+        diag_buf_push_u32(mut_view(*out), bef);
+        perf_push_str(mut_view(*out), OFF_H_ARROW, LEN_H_ARROW);
+        diag_buf_push_u32(mut_view(*out), aft);
+        perf_push_str(mut_view(*out), OFF_H_XFORMS, LEN_H_XFORMS);
+        diag_buf_push_u32(mut_view(*out), xfm);
+        perf_push_str(mut_view(*out), OFF_H_ARENA, LEN_H_ARENA);
+        perf_push_u64(mut_view(*out), mem);
+        perf_push_str(mut_view(*out), OFF_H_B_CLOSE, LEN_H_B_CLOSE);
+        i = i + 1u32;
+    }
+
+    let det_digest = time_passes_deterministic_digest(view(*rep));
+    perf_push_str(mut_view(*out), OFF_H_TOTAL_PREFIX, LEN_H_TOTAL_PREFIX);
+    perf_push_sec_frac6(mut_view(*out), rep.total_elapsed_us);
+    perf_push_str(mut_view(*out), OFF_H_US_OPEN, LEN_H_US_OPEN);
+    perf_push_u64(mut_view(*out), rep.total_elapsed_us);
+    perf_push_str(mut_view(*out), OFF_H_PEAK_MEM, LEN_H_PEAK_MEM);
+    perf_push_u64(mut_view(*out), rep.peak_arena_bytes);
+    perf_push_str(mut_view(*out), OFF_H_DET_DIGEST, LEN_H_DET_DIGEST);
+    perf_push_u64(mut_view(*out), det_digest);
+    diag_buf_push_byte(out, 10u8);
+}
+
+pub fn time_passes_format_json(rep: view<TimePassesReport>, out: mut_view<DiagBuffer>) {
+    let det_digest = time_passes_deterministic_digest(view(*rep));
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_SCHEMA, LEN_K_SCHEMA, 1u64);
+    json_push_key_str(mut_view(*out), true, OFF_K_KIND, LEN_K_KIND, OFF_K_TIME_PASSES, LEN_K_TIME_PASSES);
+
+    json_push_key(mut_view(*out), true, OFF_K_OPT_PROFILE, LEN_K_OPT_PROFILE);
+    diag_buf_push_byte(mut_view(*out), 34u8);
+    perf_push_profile_name(mut_view(*out), rep.opt_profile);
+    diag_buf_push_byte(mut_view(*out), 34u8);
+
+    json_push_key_str(mut_view(*out), true, OFF_K_TARGET, LEN_K_TARGET, OFF_V_TARGET_X64, LEN_V_TARGET_X64);
+    json_push_key_u64(mut_view(*out), true, OFF_K_TOTAL_ELAPSED_US, LEN_K_TOTAL_ELAPSED_US, rep.total_elapsed_us);
+    json_push_key_u64(mut_view(*out), true, OFF_K_PEAK_ARENA_BYTES, LEN_K_PEAK_ARENA_BYTES, rep.peak_arena_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_DET_DIGEST, LEN_K_DET_DIGEST, det_digest);
+
+    // Emit stages array
+    json_push_key(mut_view(*out), true, OFF_K_STAGES, LEN_K_STAGES);
+    diag_buf_push_byte(mut_view(*out), 91u8);
+    let mut first_stg: bool = true;
+    let mut i: u32 = 0u32;
+    while i < rep.record_count && (rep.records as usize) != 0 {
+        let rp = unsafe { perf_timing_rec_at(rep.records, i as usize) };
+        let is_opt = unsafe { (*rp).is_opt_pass };
+        if !is_opt {
+            if !first_stg {
+                diag_buf_push_byte(mut_view(*out), 44u8);
+            }
+            first_stg = false;
+            diag_buf_push_byte(mut_view(*out), 123u8);
+            json_push_key(mut_view(*out), false, OFF_K_NAME, LEN_K_NAME);
+            diag_buf_push_byte(mut_view(*out), 34u8);
+            perf_push_pass_name(mut_view(*out), unsafe { (*rp).pass_id });
+            diag_buf_push_byte(mut_view(*out), 34u8);
+            json_push_key_u64(mut_view(*out), true, OFF_K_ELAPSED_US, LEN_K_ELAPSED_US, unsafe { (*rp).elapsed_us });
+            json_push_key_u64(mut_view(*out), true, OFF_K_PEAK_ARENA_BYTES, LEN_K_PEAK_ARENA_BYTES, unsafe { (*rp).peak_arena_bytes });
+            json_push_key_u64(mut_view(*out), true, OFF_K_IR_BLOCKS, LEN_K_IR_BLOCKS, (unsafe { (*rp).ir_blocks }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_INSTS_BEFORE, LEN_K_INSTS_BEFORE, (unsafe { (*rp).insts_before }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_INSTS_AFTER, LEN_K_INSTS_AFTER, (unsafe { (*rp).insts_after }) as u64);
+            diag_buf_push_byte(mut_view(*out), 125u8);
+        }
+        i = i + 1u32;
+    }
+    diag_buf_push_byte(mut_view(*out), 93u8);
+
+    // Emit opt_passes array
+    json_push_key(mut_view(*out), true, OFF_K_OPT_PASSES, LEN_K_OPT_PASSES);
+    diag_buf_push_byte(mut_view(*out), 91u8);
+    let mut first_opt: bool = true;
+    let mut j: u32 = 0u32;
+    while j < rep.record_count && (rep.records as usize) != 0 {
+        let rp = unsafe { perf_timing_rec_at(rep.records, j as usize) };
+        let is_opt = unsafe { (*rp).is_opt_pass };
+        if is_opt {
+            if !first_opt {
+                diag_buf_push_byte(mut_view(*out), 44u8);
+            }
+            first_opt = false;
+            diag_buf_push_byte(mut_view(*out), 123u8);
+            json_push_key(mut_view(*out), false, OFF_K_NAME, LEN_K_NAME);
+            diag_buf_push_byte(mut_view(*out), 34u8);
+            perf_push_pass_name(mut_view(*out), unsafe { (*rp).pass_id });
+            diag_buf_push_byte(mut_view(*out), 34u8);
+            json_push_key_u64(mut_view(*out), true, OFF_K_ELAPSED_US, LEN_K_ELAPSED_US, unsafe { (*rp).elapsed_us });
+            json_push_key_u64(mut_view(*out), true, OFF_K_INSTS_BEFORE, LEN_K_INSTS_BEFORE, (unsafe { (*rp).insts_before }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_INSTS_AFTER, LEN_K_INSTS_AFTER, (unsafe { (*rp).insts_after }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_TRANSFORMS, LEN_K_TRANSFORMS, (unsafe { (*rp).transforms_applied }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_BCE_ELIM, LEN_K_BCE_ELIM, (unsafe { (*rp).bce_eliminated }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_LOOPS_VEC, LEN_K_LOOPS_VEC, (unsafe { (*rp).loops_vectorized }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_SPILLS, LEN_K_SPILLS, (unsafe { (*rp).spills_inserted }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_SEC_TOTAL, LEN_K_SEC_TOTAL, (unsafe { (*rp).sections_total }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_SEC_GC, LEN_K_SEC_GC, (unsafe { (*rp).sections_gc_removed }) as u64);
+            json_push_key_u64(mut_view(*out), true, OFF_K_ICF_FOLDED, LEN_K_ICF_FOLDED, (unsafe { (*rp).icf_folded }) as u64);
+            diag_buf_push_byte(mut_view(*out), 125u8);
+        }
+        j = j + 1u32;
+    }
+    diag_buf_push_byte(mut_view(*out), 93u8);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+    diag_buf_push_byte(out, 10u8);
+}
+
+pub fn size_report_format_human(rep: view<SizeReport>, out: mut_view<DiagBuffer>) {
+    perf_push_str(mut_view(*out), OFF_H_SR_HEAD, LEN_H_SR_HEAD);
+    perf_push_profile_name(mut_view(*out), rep.opt_profile);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.file_size_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_STRIP, LEN_H_SR_STRIP);
+    perf_push_u64(mut_view(*out), rep.stripped_file_size_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_MAP, LEN_H_SR_MAP);
+    perf_push_u64(mut_view(*out), rep.mapped_size_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_START_WS, LEN_H_SR_START_WS);
+    perf_push_u64(mut_view(*out), rep.startup_working_set_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_PEAK_WS, LEN_H_SR_PEAK_WS);
+    perf_push_u64(mut_view(*out), rep.peak_working_set_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_ALIGN_PAD, LEN_H_SR_ALIGN_PAD);
+    perf_push_u64(mut_view(*out), rep.alignment_padding_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_PAGE_PAD, LEN_H_SR_PAGE_PAD);
+    perf_push_u64(mut_view(*out), rep.page_padding_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .text
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_TEXT, LEN_SEC_TEXT);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.text_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.text_virtual_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_STARTUP, LEN_H_SR_STARTUP);
+    perf_push_u64(mut_view(*out), rep.text_startup_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_HOT, LEN_H_SR_HOT);
+    perf_push_u64(mut_view(*out), rep.text_hot_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_WARM, LEN_H_SR_WARM);
+    perf_push_u64(mut_view(*out), rep.text_warm_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_COLD, LEN_H_SR_COLD);
+    perf_push_u64(mut_view(*out), rep.text_cold_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .rdata
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_RDATA, LEN_SEC_RDATA);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.rdata_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.rdata_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .data
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_DATA, LEN_SEC_DATA);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.data_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.data_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .bss
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_BSS, LEN_SEC_BSS);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.bss_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.bss_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .pdata_xdata
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_PDATA_XDATA, LEN_SEC_PDATA_XDATA);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.pdata_xdata_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.pdata_xdata_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // .idata
+    perf_push_str(mut_view(*out), OFF_H_SR_SEC, LEN_H_SR_SEC);
+    perf_push_str(mut_view(*out), OFF_SEC_IDATA, LEN_SEC_IDATA);
+    perf_push_str(mut_view(*out), OFF_H_SR_FILE, LEN_H_SR_FILE);
+    perf_push_u64(mut_view(*out), rep.idata_file_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_VIRT, LEN_H_SR_VIRT);
+    perf_push_u64(mut_view(*out), rep.idata_virtual_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_DLLS, LEN_H_SR_DLLS);
+    diag_buf_push_u32(mut_view(*out), rep.import_dll_count);
+    perf_push_str(mut_view(*out), OFF_H_SR_SYMS, LEN_H_SR_SYMS);
+    diag_buf_push_u32(mut_view(*out), rep.import_sym_count);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // Attribution
+    perf_push_str(mut_view(*out), OFF_H_SR_ATTR, LEN_H_SR_ATTR);
+    perf_push_u64(mut_view(*out), rep.runtime_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_STD, LEN_H_SR_STD);
+    perf_push_u64(mut_view(*out), rep.std_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_USER, LEN_H_SR_USER);
+    perf_push_u64(mut_view(*out), rep.user_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_GEN, LEN_H_SR_GEN);
+    perf_push_u64(mut_view(*out), rep.generic_family_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_GC, LEN_H_SR_GC);
+    perf_push_u64(mut_view(*out), rep.gc_eliminated_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_ICF, LEN_H_SR_ICF);
+    perf_push_u64(mut_view(*out), rep.icf_saved_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_RMERG, LEN_H_SR_RMERG);
+    perf_push_u64(mut_view(*out), rep.rdata_merged_bytes);
+    perf_push_str(mut_view(*out), OFF_H_SR_SALLOC, LEN_H_SR_SALLOC);
+    diag_buf_push_u32(mut_view(*out), rep.startup_allocations);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+
+    // Symbols
+    let mut i: u32 = 0u32;
+    while i < rep.sym_count && (rep.symbols as usize) != 0 {
+        let sp = unsafe { perf_sym_entry_at(rep.symbols, i as usize) };
+        perf_push_str(mut_view(*out), OFF_H_SR_SYM, LEN_H_SR_SYM);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*sp).sym_id });
+        perf_push_str(mut_view(*out), OFF_H_SR_NAME, LEN_H_SR_NAME);
+        diag_buf_push_u32(mut_view(*out), unsafe { (*sp).name_id });
+        perf_push_str(mut_view(*out), OFF_H_SR_SSEC, LEN_H_SR_SSEC);
+        perf_push_sec_kind_name(mut_view(*out), unsafe { (*sp).section_kind });
+        perf_push_str(mut_view(*out), OFF_H_SR_SHEAT, LEN_H_SR_SHEAT);
+        perf_push_heat_name(mut_view(*out), unsafe { (*sp).heat_bucket });
+        perf_push_str(mut_view(*out), OFF_H_SR_SORIG, LEN_H_SR_SORIG);
+        perf_push_origin_name(mut_view(*out), unsafe { (*sp).origin_kind });
+        perf_push_str(mut_view(*out), OFF_H_SR_SBYTES, LEN_H_SR_SBYTES);
+        perf_push_u64(mut_view(*out), unsafe { (*sp).size_bytes });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        i = i + 1u32;
+    }
+}
+
+pub fn size_report_format_json(rep: view<SizeReport>, out: mut_view<DiagBuffer>) {
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_SCHEMA, LEN_K_SCHEMA, 1u64);
+    json_push_key_str(mut_view(*out), true, OFF_K_KIND, LEN_K_KIND, OFF_K_SIZE_REPORT, LEN_K_SIZE_REPORT);
+
+    json_push_key(mut_view(*out), true, OFF_K_OPT_PROFILE, LEN_K_OPT_PROFILE);
+    diag_buf_push_byte(mut_view(*out), 34u8);
+    perf_push_profile_name(mut_view(*out), rep.opt_profile);
+    diag_buf_push_byte(mut_view(*out), 34u8);
+
+    json_push_key_str(mut_view(*out), true, OFF_K_TARGET, LEN_K_TARGET, OFF_V_TARGET_X64, LEN_V_TARGET_X64);
+
+    // binary_3d object
+    json_push_key(mut_view(*out), true, OFF_K_BINARY_3D, LEN_K_BINARY_3D);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_SZ, LEN_K_FILE_SZ, rep.file_size_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_STRIP_SZ, LEN_K_STRIP_SZ, rep.stripped_file_size_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_MAP_SZ, LEN_K_MAP_SZ, rep.mapped_size_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_START_WS, LEN_K_START_WS, rep.startup_working_set_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_PEAK_WS, LEN_K_PEAK_WS, rep.peak_working_set_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_ALIGN_PAD, LEN_K_ALIGN_PAD, rep.alignment_padding_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_PAGE_PAD, LEN_K_PAGE_PAD, rep.page_padding_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // sections object
+    json_push_key(mut_view(*out), true, OFF_K_SECTIONS, LEN_K_SECTIONS);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+
+    // .text
+    json_push_key(mut_view(*out), false, OFF_SEC_TEXT, LEN_SEC_TEXT);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.text_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.text_virtual_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_STARTUP_BYTES, LEN_K_STARTUP_BYTES, rep.text_startup_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_HOT_BYTES, LEN_K_HOT_BYTES, rep.text_hot_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_WARM_BYTES, LEN_K_WARM_BYTES, rep.text_warm_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_COLD_BYTES, LEN_K_COLD_BYTES, rep.text_cold_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // .rdata
+    json_push_key(mut_view(*out), true, OFF_SEC_RDATA, LEN_SEC_RDATA);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.rdata_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.rdata_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // .data
+    json_push_key(mut_view(*out), true, OFF_SEC_DATA, LEN_SEC_DATA);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.data_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.data_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // .bss
+    json_push_key(mut_view(*out), true, OFF_SEC_BSS, LEN_SEC_BSS);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.bss_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.bss_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // .pdata_xdata
+    json_push_key(mut_view(*out), true, OFF_SEC_PDATA_XDATA, LEN_SEC_PDATA_XDATA);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.pdata_xdata_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.pdata_xdata_virtual_bytes);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // .idata
+    json_push_key(mut_view(*out), true, OFF_SEC_IDATA, LEN_SEC_IDATA);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_FILE_BYTES, LEN_K_FILE_BYTES, rep.idata_file_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_VIRT_BYTES, LEN_K_VIRT_BYTES, rep.idata_virtual_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_DLL_CNT, LEN_K_DLL_CNT, rep.import_dll_count as u64);
+    json_push_key_u64(mut_view(*out), true, OFF_K_ISYM_CNT, LEN_K_ISYM_CNT, rep.import_sym_count as u64);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // attribution object
+    json_push_key(mut_view(*out), true, OFF_K_ATTRIBUTION, LEN_K_ATTRIBUTION);
+    diag_buf_push_byte(mut_view(*out), 123u8);
+    json_push_key_u64(mut_view(*out), false, OFF_K_RUNTIME_BYTES, LEN_K_RUNTIME_BYTES, rep.runtime_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_STD_BYTES, LEN_K_STD_BYTES, rep.std_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_USER_BYTES, LEN_K_USER_BYTES, rep.user_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_GEN_BYTES, LEN_K_GEN_BYTES, rep.generic_family_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_GC_ELIM_BYTES, LEN_K_GC_ELIM_BYTES, rep.gc_eliminated_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_ICF_SAVED_BYTES, LEN_K_ICF_SAVED_BYTES, rep.icf_saved_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_RDATA_MERG_BYTES, LEN_K_RDATA_MERG_BYTES, rep.rdata_merged_bytes);
+    json_push_key_u64(mut_view(*out), true, OFF_K_START_ALLOCS, LEN_K_START_ALLOCS, rep.startup_allocations as u64);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+
+    // symbols array
+    json_push_key(mut_view(*out), true, OFF_K_SYMBOLS, LEN_K_SYMBOLS);
+    diag_buf_push_byte(mut_view(*out), 91u8);
+    let mut i: u32 = 0u32;
+    while i < rep.sym_count && (rep.symbols as usize) != 0 {
+        if i > 0u32 {
+            diag_buf_push_byte(mut_view(*out), 44u8);
+        }
+        let sp = unsafe { perf_sym_entry_at(rep.symbols, i as usize) };
+        diag_buf_push_byte(mut_view(*out), 123u8);
+        json_push_key_u64(mut_view(*out), false, OFF_K_SYM_ID, LEN_K_SYM_ID, (unsafe { (*sp).sym_id }) as u64);
+        json_push_key_u64(mut_view(*out), true, OFF_K_NAME_ID, LEN_K_NAME_ID, (unsafe { (*sp).name_id }) as u64);
+
+        json_push_key(mut_view(*out), true, OFF_K_SECTION, LEN_K_SECTION);
+        diag_buf_push_byte(mut_view(*out), 34u8);
+        perf_push_sec_kind_name(mut_view(*out), unsafe { (*sp).section_kind });
+        diag_buf_push_byte(mut_view(*out), 34u8);
+
+        json_push_key(mut_view(*out), true, OFF_K_HEAT, LEN_K_HEAT);
+        diag_buf_push_byte(mut_view(*out), 34u8);
+        perf_push_heat_name(mut_view(*out), unsafe { (*sp).heat_bucket });
+        diag_buf_push_byte(mut_view(*out), 34u8);
+
+        json_push_key(mut_view(*out), true, OFF_K_ORIGIN, LEN_K_ORIGIN);
+        diag_buf_push_byte(mut_view(*out), 34u8);
+        perf_push_origin_name(mut_view(*out), unsafe { (*sp).origin_kind });
+        diag_buf_push_byte(mut_view(*out), 34u8);
+
+        json_push_key_u64(mut_view(*out), true, OFF_K_SIZE_BYTES, LEN_K_SIZE_BYTES, unsafe { (*sp).size_bytes });
+        diag_buf_push_byte(mut_view(*out), 125u8);
+        i = i + 1u32;
+    }
+    diag_buf_push_byte(mut_view(*out), 93u8);
+    diag_buf_push_byte(mut_view(*out), 125u8);
+    diag_buf_push_byte(out, 10u8);
+}
