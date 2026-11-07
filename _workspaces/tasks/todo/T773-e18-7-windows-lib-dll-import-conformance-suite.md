@@ -8,13 +8,12 @@ model: sonnet
 gate_model: sonnet
 depends: [T751]
 priority: 702
-status: doing
-attempts: 1
+status: todo
+attempts: 0
 paths: [tests/conformance/p18/e18_7_windows_artifacts]
 spec: [spec/SPEC-26-windows-artifact-kinds.md, spec/decisions/ADR-0034-oracle-independence-audit.md, 0164, 0185, 0186, 0187, 0217, tasks/0369, tasks/0563]
 covers: [REQ-LNK-113, REQ-LNK-114, REQ-LNK-115, REQ-LNK-116, REQ-LNK-117, REQ-LNK-118, REQ-LNK-119, REQ-LNK-120, REQ-LNK-121]
 started: 2026-11-07 06:05:53
-agent: T773-impl
 ---
 # T773 — E18.7 — Windows x64 static .lib, PE DLL, import library & GNU ld cross-link conformance suite
 
@@ -44,3 +43,4 @@ Certify E18.7 (`REQ-OWNER-006` and `ADR-0034` §4 OI-07b) with an end-to-end con
 ## Log
 - 2026-11-03 03:00:20 created by T218 (P18 phase planning)
 - 2026-11-07 06:05:53 started (attempt 1) T773-impl
+- 2026-11-07 10:39:08 requeue: restart (not charged: attempt refunded)

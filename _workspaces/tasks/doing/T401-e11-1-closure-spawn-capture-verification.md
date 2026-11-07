@@ -14,7 +14,7 @@ paths: [compiler/types, tests/ui/concurrency/spawn_capture, tests/run/concurrenc
 locks: [compiler/own/cap.ax, compiler/own/move.ax, compiler/diag/code.ax, tests/selfhost]
 spec: [spec/SPEC-30-concurrency.md, 0091, 0105, 0111, 0116, 0126, 0160, tasks/0298, tasks/0488]
 covers: [REQ-CONC-005, REQ-CONC-006, REQ-CONC-008, REQ-CONC-009, REQ-CONC-029, REQ-CONC-031, REQ-CONC-032, REQ-CONC-033, REQ-CONC-072, REQ-CONC-088, REQ-RES-044, REQ-TYP-069, REQ-TYP-106, REQ-CONC-125, REQ-CONC-132]
-started: 2026-11-07 06:05:52
+started: 2026-11-07 10:39:53
 agent: T401-impl
 ---
 # T401 — E11.1 — Closure & spawn capture verification (Send bounds, escaping views)
@@ -47,3 +47,5 @@ Enforce `Send`/`Share` derivation on closure environments and verify capture own
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
 - 2026-11-07 06:05:52 started (attempt 1) T401-impl
+- 2026-11-07 10:39:07 requeue: restart (not charged: attempt refunded)
+- 2026-11-07 10:39:53 started (attempt 1) T401-impl

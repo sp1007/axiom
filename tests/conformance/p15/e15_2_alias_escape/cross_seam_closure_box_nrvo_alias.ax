@@ -1,0 +1,171 @@
+// test: diff
+// flags: --verify-each
+// stdout: Xin chào E15.2 cross_seam_closure_box_nrvo_alias\ncross_nrvo_sum=652\ndrop_and_pinned=1415\nchecksum=2067\n
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn emit_metric(label: str, val: i64) {
+    print(label);
+    print_int(val as i32);
+    print("\n");
+}
+
+struct Box<T> {
+    ptr: *mut T,
+}
+
+impl<T> Drop for Box<T> {
+    fn drop(self: mut_view<Box<T>>) {
+        if (self.ptr as usize) != 0 {
+            unsafe {
+                heap_free(self.ptr as *mut u8, size_of<T>(), align_of<T>());
+            }
+            self.ptr = 0 as *mut T;
+        }
+    }
+}
+
+fn box_new<T>(val: T) -> Box<T> {
+    let raw = unsafe { heap_alloc(size_of<T>(), align_of<T>()) as *mut T };
+    unsafe {
+        *raw = val;
+    }
+    Box<T> { ptr: raw }
+}
+
+struct DropStamp {
+    log_ptr: *mut i64,
+    code: i64,
+}
+
+impl Drop for DropStamp {
+    fn drop(self: mut_view<DropStamp>) {
+        if (self.log_ptr as usize) != 0 {
+            unsafe {
+                *self.log_ptr = (*self.log_ptr) * 10 + self.code;
+            }
+            self.log_ptr = 0 as *mut i64;
+        }
+    }
+}
+
+struct CrossSeamPacket {
+    lane0: i64,
+    lane1: i64,
+    lane2: i64,
+    lane3: i64,
+}
+
+struct CoeffPair {
+    scale: i64,
+    bias: i64,
+}
+
+fn disjoint_forward_dse(dst_a: mut_view<i64>, dst_b: mut_view<i64>, ro: view<i64>) -> i64 {
+    // Dead store to *dst_a overwritten before any read
+    *dst_a = 999;
+    let r_first: i64 = *ro;
+    *dst_b = r_first + 20;
+    *dst_a = r_first * 2;
+    // RLE on *ro across disjoint writes to *dst_a and *dst_b
+    let r_second: i64 = *ro;
+    (*dst_a) + (*dst_b) + r_first + r_second
+}
+
+// Crosses NRVO (REQ-OPT-310), Box SROA (REQ-OPT-307), Closure CAP_MUT_VIEW + CAP_VIEW
+// promotion (REQ-OPT-309, REQ-OPT-385, REQ-OPT-386), and capability alias forwarding
+fn build_cross_seam_packet(seed: i64, drop_log: *mut i64) -> CrossSeamPacket {
+    let mut pkt = CrossSeamPacket {
+        lane0: seed,
+        lane1: seed + 10,
+        lane2: seed + 20,
+        lane3: seed + 30,
+    };
+    let _stamp_outer = DropStamp { log_ptr: drop_log, code: 7 };
+    {
+        let _stamp_inner = DropStamp { log_ptr: drop_log, code: 3 };
+        let b_temp = box_new<i64>(seed + 5);
+        let cfg = CoeffPair { scale: 3, bias: 14 };
+        let mut clos_acc: i64 = unsafe { *b_temp.ptr };
+        {
+            let mut step_clos = |x: i64| -> i64 {
+                clos_acc = clos_acc + x * cfg.scale + cfg.bias;
+                clos_acc
+            };
+            let c1 = step_clos(4); // clos_acc = 25 + 26 = 51
+            let c2 = step_clos(6); // clos_acc = 51 + 32 = 83
+            pkt.lane0 = c1 + c2;   // 134
+        }
+        let fwd = disjoint_forward_dse(mut_view(pkt.lane1), mut_view(pkt.lane2), view(clos_acc));
+        pkt.lane3 = fwd + cfg.bias; // (166 + 103 + 83 + 83) + 14 = 449
+    }
+    pkt
+}
+
+// Exercises raw-pointer MayAlias & stable-address barrier alongside promoted Box
+fn kernel_pinned_raw_alias_and_drop(seed: i64, drop_trace: i64) -> i64 {
+    let mut pinned: i64 = seed;
+    let raw_p: *mut i64 = unsafe { address_of_mut(pinned) };
+    let b_fast = box_new<i64>(40);
+    let non_null_ok: i64 = if (b_fast.ptr as usize) != 0 && (raw_p as usize) != 0 {
+        15
+    } else {
+        -999
+    };
+    unsafe {
+        *raw_p = (*raw_p) + (*b_fast.ptr) + 5;
+    }
+    // `pinned` must reflect the write through `raw_p` (30 + 40 + 5 = 75)
+    drop_trace * 37 + pinned + non_null_ok
+}
+
+fn main() -> i32 {
+    print("Xin chào E15.2 cross_seam_closure_box_nrvo_alias\n");
+
+    let mut drop_log: i64 = 0;
+    let dl_ptr: *mut i64 = unsafe { address_of_mut(drop_log) };
+    let pkt = build_cross_seam_packet(20, dl_ptr);
+    // pkt.lane0 = 134, pkt.lane1 = 166, pkt.lane2 = 103, pkt.lane3 = 449 -> sum = 852
+    let m1 = pkt.lane0 + pkt.lane1 + pkt.lane2 + pkt.lane3 - 200;
+    emit_metric("cross_nrvo_sum=", m1);
+    if m1 != 652 { return 1; }
+
+    // Inner stamp (3) drops before outer stamp (7) -> drop_log == 37
+    if drop_log != 37 { return 2; }
+    let m2 = kernel_pinned_raw_alias_and_drop(30, drop_log) - 44;
+    emit_metric("drop_and_pinned=", m2);
+    if m2 != 1415 { return 3; }
+
+    let total = m1 + m2;
+    emit_metric("checksum=", total);
+    if total != 2067 { return 4; }
+    0
+}

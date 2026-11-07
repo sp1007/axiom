@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T607]
 priority: 101
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p15/e15_2_alias_escape]
 spec: [spec/SPEC-71-alias-escape-promotion.md, 0226, tasks/0366, tasks/0395, tasks/0397, tasks/0615]
 covers: [REQ-OPT-307, REQ-OPT-308, REQ-OPT-309, REQ-OPT-310, REQ-OPT-385, REQ-OPT-386]
 started: 2026-11-07 06:05:51
-agent: T608-impl
+finished: 2026-11-07 12:59:10
 ---
 # T608 — E15.2 — Alias analysis, escape analysis & allocation promotion conformance suite
 
@@ -43,3 +43,4 @@ Certify E15.2 exit criteria with an end-to-end differential conformance suite co
 ## Log
 - 2026-11-03 02:39:00 created by T215 (P15 phase planning)
 - 2026-11-07 06:05:51 started (attempt 1) T608-impl
+- 2026-11-07 12:59:10 accepted by QA -> done

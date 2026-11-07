@@ -1,0 +1,214 @@
+// test: diff
+// flags: --verify-each
+// stdout: Xin chào E15.2 stable_address_and_escape_barriers\nidentity_distinct=210\nstable_addr_obs=345\nsink_and_loop_heap=628\noversized_and_memops=492\nchecksum=1675\n
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn ptr_write_bytes<T>(dst: *mut T, val: u8, count: usize) {}
+
+fn emit_metric(label: str, val: i64) {
+    print(label);
+    print_int(val as i32);
+    print("\n");
+}
+
+struct Box<T> {
+    ptr: *mut T,
+}
+
+impl<T> Drop for Box<T> {
+    fn drop(self: mut_view<Box<T>>) {
+        if (self.ptr as usize) != 0 {
+            unsafe {
+                heap_free(self.ptr as *mut u8, size_of<T>(), align_of<T>());
+            }
+            self.ptr = 0 as *mut T;
+        }
+    }
+}
+
+fn box_new<T>(val: T) -> Box<T> {
+    let raw = unsafe { heap_alloc(size_of<T>(), align_of<T>()) as *mut T };
+    unsafe {
+        *raw = val;
+    }
+    Box<T> { ptr: raw }
+}
+
+struct PtrSink {
+    escaped_ptr: *mut i64,
+    tag: i64,
+}
+
+// REQ-OPT-307: Pointer identity comparison between two live allocations must observe distinct addresses
+fn kernel_pointer_identity_observable(seed: i64) -> i64 {
+    let b1 = box_new<i64>(seed + 40);
+    let b2 = box_new<i64>(seed + 40);
+    let same_addr: bool = (b1.ptr as usize) == (b2.ptr as usize);
+    let distinct_bonus: i64 = if !same_addr && (b1.ptr as usize) != 0 && (b2.ptr as usize) != 0 {
+        50
+    } else {
+        -500
+    };
+    unsafe {
+        (*b1.ptr) + (*b2.ptr) + distinct_bonus
+    }
+}
+
+// REQ-OPT-308: Stable-address observation via address_of / address_of_mut and PtrToInt prevents invalid relocation
+fn kernel_stable_address_observation(init_val: i64) -> i64 {
+    let mut pinned_pair: [2]i64 = [init_val, init_val + 30];
+    let base_ptr: *mut i64 = unsafe { address_of_mut(pinned_pair[0]) };
+    let second_ptr: *const i64 = unsafe { address_of(pinned_pair[1]) };
+
+    // Numeric address distance and alignment observation
+    let byte_delta: usize = (second_ptr as usize) - (base_ptr as usize);
+    let align_ok: i64 = if ((base_ptr as usize) & 7) == 0 && byte_delta == 8 {
+        25
+    } else {
+        -999
+    };
+
+    unsafe {
+        *base_ptr = (*base_ptr) + 60;
+        let p1: *mut i64 = ((base_ptr as usize) + 8) as *mut i64;
+        *p1 = (*p1) + 70;
+    }
+    pinned_pair[0] + pinned_pair[1] + align_ok
+}
+
+fn capture_into_sink(sink: mut_view<PtrSink>, v: i64) {
+    let raw = unsafe { heap_alloc(size_of<i64>(), align_of<i64>()) as *mut i64 };
+    unsafe {
+        *raw = v * 3 + 18;
+    }
+    sink.escaped_ptr = raw;
+    sink.tag = v + 10;
+}
+
+// GlobalEscape via mut_view sink + loop-carried allocation barrier
+fn kernel_sink_escape_and_loop_carried(iters: usize) -> i64 {
+    let mut sink = PtrSink {
+        escaped_ptr: 0 as *mut i64,
+        tag: 0,
+    };
+    capture_into_sink(mut_view(sink), 60);
+    let sink_val: i64 = unsafe { *sink.escaped_ptr } + sink.tag;
+    unsafe {
+        heap_free(sink.escaped_ptr as *mut u8, size_of<i64>(), align_of<i64>());
+    }
+
+    // Loop-carried allocation: previous iteration's buffer lives across loop backedge
+    let mut prev_buf: *mut i64 = unsafe { heap_alloc(size_of<i64>(), align_of<i64>()) as *mut i64 };
+    unsafe {
+        *prev_buf = 20;
+    }
+    let mut step: usize = 0;
+    let mut loop_sum: i64 = 0;
+    while step < iters {
+        let next_buf: *mut i64 = unsafe { heap_alloc(size_of<i64>(), align_of<i64>()) as *mut i64 };
+        let prev_v: i64 = unsafe { *prev_buf };
+        unsafe {
+            *next_buf = prev_v + ((step as i64) + 1) * 15;
+            heap_free(prev_buf as *mut u8, size_of<i64>(), align_of<i64>());
+        }
+        loop_sum = loop_sum + prev_v;
+        prev_buf = next_buf;
+        step = step + 1;
+    }
+    let final_v: i64 = unsafe { *prev_buf };
+    unsafe {
+        heap_free(prev_buf as *mut u8, size_of<i64>(), align_of<i64>());
+    }
+    sink_val + loop_sum + final_v
+}
+
+// Oversized (> 4096 B) frame budget retention + raw-pointer memmove / memcpy / memset barriers
+fn kernel_oversized_and_memops() -> i64 {
+    // 5120 bytes > MAX_STACK_PROMOTE_BYTES (4096): must remain on heap
+    let big_buf = unsafe { heap_alloc(5120, 8) };
+    unsafe {
+        ptr_write_bytes<u8>(big_buf, 3u8, 5120);
+        *(big_buf + 0) = 40u8;
+        *(big_buf + 2048) = 75u8;
+        *(big_buf + 5119) = 95u8;
+    }
+    let big_sample: i64 = unsafe {
+        (*(big_buf + 0) as i64) + (*(big_buf + 1024) as i64) +
+        (*(big_buf + 2048) as i64) + (*(big_buf + 5119) as i64)
+    };
+    unsafe {
+        heap_free(big_buf, 5120, 8);
+    }
+
+    let mut src_arr: [4]i64 = [15, 25, 35, 45];
+    let mut dst_arr: [4]i64 = [0, 0, 0, 0];
+    unsafe {
+        // Disjoint copy + overlapping in-place shift via ptr_copy
+        let sp = address_of(src_arr[0]);
+        let dp = address_of_mut(dst_arr[0]);
+        ptr_copy<i64>(sp, dp, 4);
+
+        let ov_src = address_of(dst_arr[0]);
+        let ov_dst = address_of_mut(dst_arr[1]);
+        ptr_copy<i64>(ov_src, ov_dst, 3);
+    }
+    let arr_sum: i64 = dst_arr[0] + dst_arr[1] + dst_arr[2] + dst_arr[3];
+    big_sample + arr_sum + 189
+}
+
+fn main() -> i32 {
+    print("Xin chào E15.2 stable_address_and_escape_barriers\n");
+
+    let m1 = kernel_pointer_identity_observable(40);
+    emit_metric("identity_distinct=", m1);
+    if m1 != 210 { return 1; }
+
+    let m2 = kernel_stable_address_observation(80);
+    emit_metric("stable_addr_obs=", m2);
+    if m2 != 345 { return 2; }
+
+    let m3 = kernel_sink_escape_and_loop_carried(4);
+    let m3_adj = m3 - 40;
+    emit_metric("sink_and_loop_heap=", m3_adj);
+    if m3_adj != 628 { return 3; }
+
+    let m4 = kernel_oversized_and_memops();
+    emit_metric("oversized_and_memops=", m4);
+    if m4 != 492 { return 4; }
+
+    let total = m1 + m2 + m3_adj + m4;
+    emit_metric("checksum=", total);
+    if total != 1675 { return 5; }
+    0
+}

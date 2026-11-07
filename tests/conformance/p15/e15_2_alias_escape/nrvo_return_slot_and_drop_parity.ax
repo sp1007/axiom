@@ -1,0 +1,221 @@
+// test: diff
+// flags: --verify-each
+// stdout: Xin chào E15.2 nrvo_return_slot_and_drop_parity\nnrvo_struct=460\nnrvo_branch_array=524\nnrvo_conflict_guard=395\ndrop_lifo_trace=1234\nchecksum=2613\n
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+fn emit_metric(label: str, val: i64) {
+    print(label);
+    print_int(val as i32);
+    print("\n");
+}
+
+struct Frame8 {
+    w0: i64,
+    w1: i64,
+    w2: i64,
+    w3: i64,
+    w4: i64,
+    w5: i64,
+    w6: i64,
+    w7: i64,
+}
+
+fn mix_frame_in_place(f: mut_view<Frame8>, delta: i64) {
+    f.w0 = f.w0 + delta;
+    f.w3 = f.w3 + f.w0;
+    f.w7 = f.w7 + delta * 2;
+}
+
+// Single-local aggregate return eligible for NRVO caller return slot (REQ-OPT-310)
+fn build_nrvo_frame(seed: i64) -> Frame8 {
+    let mut out = Frame8 {
+        w0: seed,
+        w1: seed + 5,
+        w2: seed + 10,
+        w3: seed + 15,
+        w4: seed + 20,
+        w5: seed + 25,
+        w6: seed + 30,
+        w7: seed + 35,
+    };
+    mix_frame_in_place(mut_view(out), 12);
+    out
+}
+
+// Single-local array return across multi-way branching paths eligible for NRVO (REQ-OPT-310)
+fn build_branching_nrvo_digest(mode: i64, base: i64) -> [6]i64 {
+    let mut digest: [6]i64 = [base, base + 2, base + 4, base + 6, base + 8, base + 10];
+    if mode == 1 {
+        digest[0] = digest[0] + 40;
+        digest[5] = digest[5] + 60;
+        return digest;
+    } else if mode == 2 {
+        digest[1] = digest[1] + 50;
+        digest[4] = digest[4] + 70;
+        return digest;
+    } else {
+        digest[2] = digest[2] + 30;
+        digest[3] = digest[3] + 90;
+        return digest;
+    }
+}
+
+// Conflicting two-local return: NRVO must not merge distinct live locals
+fn build_conflicting_two_locals(pick_first: bool, seed: i64) -> Frame8 {
+    let mut a = Frame8 {
+        w0: seed,
+        w1: seed + 1,
+        w2: seed + 2,
+        w3: seed + 3,
+        w4: seed + 4,
+        w5: seed + 5,
+        w6: seed + 6,
+        w7: seed + 7,
+    };
+    let mut b = Frame8 {
+        w0: seed * 2,
+        w1: seed * 2 + 1,
+        w2: seed * 2 + 2,
+        w3: seed * 2 + 3,
+        w4: seed * 2 + 4,
+        w5: seed * 2 + 5,
+        w6: seed * 2 + 6,
+        w7: seed * 2 + 7,
+    };
+    a.w0 = a.w0 + b.w7;
+    b.w0 = b.w0 + a.w7;
+    if pick_first {
+        return a;
+    } else {
+        return b;
+    }
+}
+
+fn sum_frame8(f: view<Frame8>) -> i64 {
+    f.w0 + f.w1 + f.w2 + f.w3 + f.w4 + f.w5 + f.w6 + f.w7
+}
+
+struct ScopedGuard {
+    log_ptr: *mut i64,
+    digit: i64,
+}
+
+impl Drop for ScopedGuard {
+    fn drop(self: mut_view<ScopedGuard>) {
+        if (self.log_ptr as usize) != 0 {
+            unsafe {
+                let prev: i64 = *self.log_ptr;
+                *self.log_ptr = prev * 10 + self.digit;
+            }
+            self.log_ptr = 0 as *mut i64;
+        }
+    }
+}
+
+struct BoxGuard {
+    ptr: *mut ScopedGuard,
+}
+
+impl Drop for BoxGuard {
+    fn drop(self: mut_view<BoxGuard>) {
+        if (self.ptr as usize) != 0 {
+            unsafe {
+                // Trigger payload drop action before freeing container memory (AXS-ESC-011.3, REQ-OPT-307)
+                let lp = (*self.ptr).log_ptr;
+                let dg = (*self.ptr).digit;
+                if (lp as usize) != 0 {
+                    *lp = (*lp) * 10 + dg;
+                }
+                heap_free(self.ptr as *mut u8, size_of<ScopedGuard>(), align_of<ScopedGuard>());
+            }
+            self.ptr = 0 as *mut ScopedGuard;
+        }
+    }
+}
+
+fn box_guard_new(log_ptr: *mut i64, digit: i64) -> BoxGuard {
+    let raw = unsafe { heap_alloc(size_of<ScopedGuard>(), align_of<ScopedGuard>()) as *mut ScopedGuard };
+    unsafe {
+        *raw = ScopedGuard { log_ptr: log_ptr, digit: digit };
+    }
+    BoxGuard { ptr: raw }
+}
+
+fn kernel_drop_order_parity() -> i64 {
+    let mut trace: i64 = 0;
+    let tp: *mut i64 = unsafe { address_of_mut(trace) };
+    {
+        // Outer guard _g4 declared first -> dropped last (digit 4)
+        let _g4 = ScopedGuard { log_ptr: tp, digit: 4 };
+        {
+            // Inner guard _g3 declared before _bg2 -> dropped after _bg2 (digit 3)
+            let _g3 = ScopedGuard { log_ptr: tp, digit: 3 };
+            {
+                // Deepest guards: _g2 then _bg1 -> _bg1 drops first (1), then _g2 (2)
+                let _g2 = ScopedGuard { log_ptr: tp, digit: 2 };
+                let _bg1 = box_guard_new(tp, 1);
+            }
+        }
+    }
+    trace
+}
+
+fn main() -> i32 {
+    print("Xin chào E15.2 nrvo_return_slot_and_drop_parity\n");
+
+    let f = build_nrvo_frame(30);
+    let m1 = sum_frame8(view(f)) + 2;
+    emit_metric("nrvo_struct=", m1);
+    if m1 != 460 { return 1; }
+
+    let d1 = build_branching_nrvo_digest(1, 20);
+    let d2 = build_branching_nrvo_digest(2, 10);
+    let m2 = (d1[0] + d1[1] + d1[2] + d1[3] + d1[4] + d1[5]) +
+             (d2[0] + d2[1] + d2[2] + d2[3] + d2[4] + d2[5]) + 64;
+    emit_metric("nrvo_branch_array=", m2);
+    if m2 != 524 { return 2; }
+
+    let cf_a = build_conflicting_two_locals(true, 10);
+    let cf_b = build_conflicting_two_locals(false, 10);
+    let m3 = sum_frame8(view(cf_a)) + sum_frame8(view(cf_b)) + 55;
+    emit_metric("nrvo_conflict_guard=", m3);
+    if m3 != 395 { return 3; }
+
+    let m4 = kernel_drop_order_parity();
+    emit_metric("drop_lifo_trace=", m4);
+    if m4 != 1234 { return 4; }
+
+    let total = m1 + m2 + m3 + m4;
+    emit_metric("checksum=", total);
+    if total != 2613 { return 5; }
+    0
+}

@@ -1,0 +1,268 @@
+// test: diff
+// flags: --verify-each
+// stdout: Xin chào E15.2 escape_box_buffer_slot_promotion\nbox_sroa=318\nbox_stack_scc=792\ninline_buf_vec=546\ndisjoint_slots=684\nchecksum=2340\n
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@link("kernel32")
+extern "system" {
+    fn GetProcessHeap() -> *mut u8;
+    fn HeapAlloc(hHeap: *mut u8, dwFlags: u32, dwBytes: usize) -> *mut u8;
+    fn HeapFree(hHeap: *mut u8, dwFlags: u32, lpMem: *mut u8) -> i32;
+}
+
+pub unsafe fn __ax_host_heap_alloc(size: usize, align: usize) -> *mut u8 {
+    let h = GetProcessHeap();
+    if h as usize == 0 { return 0 as *mut u8; }
+    let alloc_bytes: usize = if size < 16 { 16 } else { size };
+    HeapAlloc(h, 8u32, alloc_bytes)
+}
+
+pub unsafe fn __ax_host_heap_free(p: *mut u8, size: usize, align: usize) {
+    if p as usize != 0 {
+        let h = GetProcessHeap();
+        if h as usize != 0 {
+            HeapFree(h, 0u32, p);
+        }
+    }
+}
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+fn emit_metric(label: str, val: i64) {
+    print(label);
+    print_int(val as i32);
+    print("\n");
+}
+
+struct Box<T> {
+    ptr: *mut T,
+}
+
+impl<T> Drop for Box<T> {
+    fn drop(self: mut_view<Box<T>>) {
+        if (self.ptr as usize) != 0 {
+            unsafe {
+                heap_free(self.ptr as *mut u8, size_of<T>(), align_of<T>());
+            }
+            self.ptr = 0 as *mut T;
+        }
+    }
+}
+
+fn box_new<T>(val: T) -> Box<T> {
+    let raw = unsafe { heap_alloc(size_of<T>(), align_of<T>()) as *mut T };
+    unsafe {
+        *raw = val;
+    }
+    Box<T> { ptr: raw }
+}
+
+struct Vec<T> {
+    ptr: *mut T,
+    len: usize,
+    cap: usize,
+}
+
+fn vec_with_capacity<T>(cap: usize) -> Vec<T> {
+    if cap == 0 {
+        return Vec<T> { ptr: 0 as *mut T, len: 0, cap: 0 };
+    }
+    let bytes = cap * size_of<T>();
+    let raw = unsafe { heap_alloc(bytes, align_of<T>()) as *mut T };
+    Vec<T> { ptr: raw, len: 0, cap: cap }
+}
+
+fn vec_push<T>(v: mut_view<Vec<T>>, val: T) {
+    let idx = v.len;
+    unsafe {
+        let slot = ((v.ptr as usize) + idx * size_of<T>()) as *mut T;
+        *slot = val;
+    }
+    v.len = idx + 1;
+}
+
+fn vec_free<T>(v: mut_view<Vec<T>>) {
+    if (v.ptr as usize) != 0 {
+        let bytes = v.cap * size_of<T>();
+        unsafe {
+            heap_free(v.ptr as *mut u8, bytes, align_of<T>());
+        }
+        v.ptr = 0 as *mut T;
+        v.len = 0;
+        v.cap = 0;
+    }
+}
+
+struct Matrix2x2 {
+    m00: i64,
+    m01: i64,
+    m10: i64,
+    m11: i64,
+}
+
+struct TensorBlock {
+    lanes: [12]i64,
+    bias: i64,
+}
+
+fn kernel_box_sroa_scalar_and_matrix(seed: i64) -> i64 {
+    let mut b_scalar = box_new<i64>(seed + 15);
+    let mut b_mat = box_new<Matrix2x2>(Matrix2x2 {
+        m00: seed,
+        m01: seed + 4,
+        m10: seed + 8,
+        m11: seed + 12,
+    });
+    // Non-null check on Box pointer (REQ-OPT-307: preserved under allocation elimination)
+    let non_null_bonus: i64 = if (b_scalar.ptr as usize) != 0 && (b_mat.ptr as usize) != 0 {
+        10
+    } else {
+        -999
+    };
+    unsafe {
+        *b_scalar.ptr = (*b_scalar.ptr) * 2;
+        (*b_mat.ptr).m00 = (*b_mat.ptr).m00 + (*b_scalar.ptr);
+        (*b_mat.ptr).m11 = (*b_mat.ptr).m11 + (*b_mat.ptr).m01;
+        (*b_scalar.ptr) + (*b_mat.ptr).m00 + (*b_mat.ptr).m01 +
+            (*b_mat.ptr).m10 + (*b_mat.ptr).m11 + non_null_bonus
+    }
+}
+
+fn borrow_tensor_scale(tb: mut_view<TensorBlock>, delta: i64) {
+    tb.lanes[0] = tb.lanes[0] + delta;
+    tb.lanes[5] = tb.lanes[5] + delta * 2;
+    tb.lanes[11] = tb.lanes[11] + delta * 3;
+    tb.bias = tb.bias + delta;
+}
+
+fn scc_even_accumulate(tb: view<TensorBlock>, depth: i64) -> i64 {
+    if depth <= 0 {
+        return tb.bias;
+    }
+    tb.lanes[0] + tb.lanes[5] + scc_odd_accumulate(tb, depth - 1)
+}
+
+fn scc_odd_accumulate(tb: view<TensorBlock>, depth: i64) -> i64 {
+    if depth <= 0 {
+        return tb.lanes[11];
+    }
+    tb.lanes[11] + tb.bias + scc_even_accumulate(tb, depth - 1)
+}
+
+fn kernel_box_stack_argument_escape_scc(base: i64) -> i64 {
+    let mut b_tensor = box_new<TensorBlock>(TensorBlock {
+        lanes: [
+            base, base + 1, base + 2, base + 3,
+            base + 4, base + 5, base + 6, base + 7,
+            base + 8, base + 9, base + 10, base + 11,
+        ],
+        bias: 20,
+    });
+    unsafe {
+        borrow_tensor_scale(mut_view(*b_tensor.ptr), 15);
+        scc_even_accumulate(view(*b_tensor.ptr), 4)
+    }
+}
+
+fn kernel_inline_buffer_and_bounded_vec(seed: u8) -> i64 {
+    let raw_buf = unsafe { heap_alloc(64, 8) };
+    let mut i: usize = 0;
+    while i < 64 {
+        unsafe {
+            *(raw_buf + i) = seed + ((i as u8) & 7u8);
+        }
+        i = i + 1;
+    }
+    let mut buf_sum: i64 = 0;
+    let mut j: usize = 0;
+    while j < 64 {
+        let b = unsafe { *(raw_buf + j) };
+        buf_sum = buf_sum + (b as i64);
+        j = j + 8;
+    }
+    unsafe {
+        heap_free(raw_buf, 64, 8);
+    }
+
+    let mut v = vec_with_capacity<i64>(6);
+    vec_push<i64>(mut_view(v), 30);
+    vec_push<i64>(mut_view(v), 50);
+    vec_push<i64>(mut_view(v), 70);
+    vec_push<i64>(mut_view(v), 90);
+    vec_push<i64>(mut_view(v), 110);
+    vec_push<i64>(mut_view(v), 132);
+    let mut vec_sum: i64 = 0;
+    let mut k: usize = 0;
+    while k < v.len {
+        let elem = unsafe { *((v.ptr as usize + k * size_of<i64>()) as *const i64) };
+        vec_sum = vec_sum + elem;
+        k = k + 1;
+    }
+    vec_free<i64>(mut_view(v));
+    buf_sum + vec_sum
+}
+
+fn kernel_disjoint_lifetime_slots(seed: i64) -> i64 {
+    let mut acc: i64 = 0;
+    {
+        let mut slot_alpha: [16]i64 = [
+            seed, seed + 2, seed + 4, seed + 6,
+            seed + 8, seed + 10, seed + 12, seed + 14,
+            seed + 16, seed + 18, seed + 20, seed + 22,
+            seed + 24, seed + 26, seed + 28, seed + 30,
+        ];
+        slot_alpha[0] = slot_alpha[0] + slot_alpha[15];
+        acc = acc + slot_alpha[0] + slot_alpha[7] + slot_alpha[15];
+    }
+    {
+        let mut slot_beta: [16]i64 = [
+            seed * 2, seed * 2 + 1, seed * 2 + 2, seed * 2 + 3,
+            seed * 2 + 4, seed * 2 + 5, seed * 2 + 6, seed * 2 + 7,
+            seed * 2 + 8, seed * 2 + 9, seed * 2 + 10, seed * 2 + 11,
+            seed * 2 + 12, seed * 2 + 13, seed * 2 + 14, seed * 2 + 15,
+        ];
+        slot_beta[3] = slot_beta[3] + slot_beta[12];
+        acc = acc + slot_beta[0] + slot_beta[3] + slot_beta[15];
+    }
+    {
+        let mut slot_gamma: [16]i64 = [
+            10, 20, 30, 40, 50, 60, 70, 80,
+            90, 100, 110, 120, 130, 140, 150, 160,
+        ];
+        slot_gamma[4] = slot_gamma[4] + seed;
+        acc = acc + slot_gamma[4] + slot_gamma[9] + slot_gamma[15];
+    }
+    acc
+}
+
+fn main() -> i32 {
+    print("Xin chào E15.2 escape_box_buffer_slot_promotion\n");
+
+    let s1 = kernel_box_sroa_scalar_and_matrix(30);
+    let m1 = s1 - 50;
+    emit_metric("box_sroa=", m1);
+    if m1 != 318 { return 1; }
+
+    let s2 = kernel_box_stack_argument_escape_scc(10);
+    let m2 = s2 + 415;
+    emit_metric("box_stack_scc=", m2);
+    if m2 != 792 { return 2; }
+
+    let m3 = kernel_inline_buffer_and_bounded_vec(8u8);
+    emit_metric("inline_buf_vec=", m3);
+    if m3 != 546 { return 3; }
+
+    let s4 = kernel_disjoint_lifetime_slots(20);
+    let m4 = s4 + 10;
+    emit_metric("disjoint_slots=", m4);
+    if m4 != 684 { return 4; }
+
+    let total = m1 + m2 + m3 + m4;
+    emit_metric("checksum=", total);
+    if total != 2340 { return 5; }
+    0
+}
