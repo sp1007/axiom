@@ -173,7 +173,7 @@ def byte_table(name, data):
 
 
 def build_prelude_text():
-    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=256, include_std_sys=True, root=ROOT)
+    return bc.build_prelude_text(include_sym_pad=True, sym_pad_count=16, include_std_sys=True, root=ROOT)
 
 
 def assemble_modules(mod_list):
