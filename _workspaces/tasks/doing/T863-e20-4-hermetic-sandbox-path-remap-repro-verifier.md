@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T852, T862]
 priority: 213
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/build/sandbox, compiler/build/repro, tests/run/build_hermetic]
 spec: [spec/SPEC-113-hermetic-builds-supply-chain-trust.md, tasks/0590, tasks/0449, tasks/0772, tasks/0661]
 covers: [REQ-PKG-022, REQ-PKG-024]
+started: 2026-11-08 21:28:52
+agent: T863-impl
 ---
 # T863 — E20.4 Hermetic build sandbox, filesystem/env/network/clock isolation, --remap-path-prefix & bit-for-bit reproducibility verifier
 
@@ -40,3 +42,4 @@ Implement the hermetic build sandbox enforcing filesystem, environment, network,
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 21:28:52 started (attempt 1) T863-impl
