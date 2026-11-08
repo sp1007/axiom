@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 200
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-110-build-graph-driver.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, spec/SPEC-88-cross-compilation-platform-layer.md, 0168, tasks/0356, tasks/0372, tasks/0411, tasks/0661]
 covers: [REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
 started: 2026-11-08 18:07:10
-agent: T850-impl
+finished: 2026-11-08 18:21:36
 ---
 # T850 — E20.1 Canonical build graph, declarative axiom.toml workspace & driver orchestration specification (SPEC-110)
 
@@ -46,3 +46,4 @@ Consolidate the canonical specification for Axiom's declarative `axiom.toml` pac
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 18:07:10 started (attempt 1) T850-impl
+- 2026-11-08 18:21:36 accepted by QA -> done
