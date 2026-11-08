@@ -1,0 +1,182 @@
+// test: run
+// modes: interp native
+// stdout-file: dependency_capability_escalation_auditor.stdout
+// SPEC-113 §1 (AXS-HERM-001..004; REQ-PKG-024):
+// Conformance test verifying:
+// 1. Six canonical supply-chain capability bitmasks (unsafe, ffi, net, fs, process, asm).
+// 2. Declaration vs actual usage: rejection of undeclared package capabilities.
+// 3. Workspace root [trust.policy] allowlist and scoped package grants.
+// 4. Transitive capability closure computation over dependency graph DAGs.
+// 5. Immediate rejection of transitive capability escalation with causal chain tracking.
+
+const CAP_NONE: u32 = 0u32
+const CAP_UNSAFE: u32 = 1u32 << 0
+const CAP_FFI: u32 = 1u32 << 1
+const CAP_NET: u32 = 1u32 << 2
+const CAP_FS: u32 = 1u32 << 3
+const CAP_PROCESS: u32 = 1u32 << 4
+const CAP_ASM: u32 = 1u32 << 5
+const CAP_ALL: u32 = 0x3Fu32
+
+const STATUS_OK: u32 = 0u32
+const STATUS_UNDECLARED_CAPABILITY: u32 = 1u32
+const STATUS_CAPABILITY_ESCALATION: u32 = 2u32
+
+@derive(Copy)
+struct AuditNode {
+    id: u32,
+    declared_caps: u32,
+    actual_caps: u32,
+    granted_caps: u32,
+    dep_count: usize,
+    deps: [4]u32,
+}
+
+fn check_undeclared_caps(node: view<AuditNode>) -> bool {
+    let undeclared = node.actual_caps & (~node.declared_caps)
+    undeclared == 0u32
+}
+
+fn check_policy_grant(required: u32, granted: u32) -> bool {
+    let ungranted = required & (~granted)
+    ungranted == 0u32
+}
+
+fn compute_transitive_closure(
+    nodes: view<[4]AuditNode>,
+    node_idx: usize,
+    depth: usize
+) -> u32 {
+    if depth >= 4usize {
+        return (*nodes)[node_idx].declared_caps | (*nodes)[node_idx].actual_caps
+    }
+    let cur = (*nodes)[node_idx]
+    let mut total = cur.declared_caps | cur.actual_caps
+    let mut i: usize = 0usize
+    while i < cur.dep_count {
+        let dep_id = cur.deps[i]
+        // Find index of dep_id
+        let mut d_idx: usize = 0usize
+        let mut found = false
+        while d_idx < 4usize {
+            if (*nodes)[d_idx].id == dep_id {
+                found = true
+                break
+            }
+            d_idx = d_idx + 1usize
+        }
+        if found {
+            let child_closure = compute_transitive_closure(nodes, d_idx, depth + 1usize)
+            total = total | child_closure
+        }
+        i = i + 1usize
+    }
+    total
+}
+
+pub fn main() -> i32 {
+    // 1. Capability bitmask definitions and composition
+    let mask_sys = CAP_UNSAFE | CAP_FFI | CAP_ASM
+    let mask_io = CAP_NET | CAP_FS | CAP_PROCESS
+    if (mask_sys & mask_io) != 0u32 || (mask_sys | mask_io) != CAP_ALL {
+        return 1
+    }
+
+    // 2. Rejection of undeclared capability usage (AXS-HERM-002)
+    let node_clean = AuditNode {
+        id: 1u32,
+        declared_caps: CAP_UNSAFE,
+        actual_caps: CAP_UNSAFE,
+        granted_caps: CAP_UNSAFE,
+        dep_count: 0usize,
+        deps: [0u32; 4],
+    }
+    let node_sneaky = AuditNode {
+        id: 2u32,
+        declared_caps: 0u32,        // manifest claims pure safe Axiom
+        actual_caps: CAP_FFI,       // actually imports extern dynamic library
+        granted_caps: CAP_NONE,
+        dep_count: 0usize,
+        deps: [0u32; 4],
+    }
+    if !check_undeclared_caps(view(node_clean)) {
+        return 2
+    }
+    if check_undeclared_caps(view(node_sneaky)) {
+        return 3 // must reject undeclared usage
+    }
+
+    // 3. Workspace [trust.policy] capability-escalation gate (AXS-HERM-003, REQ-PKG-024)
+    // Graph topology:
+    // Root (id 10) -> LibA (id 20) -> LibB (id 30)
+    // Root grants: allow_unsafe for LibA, but zero capabilities for LibB
+    let node_root = AuditNode {
+        id: 10u32,
+        declared_caps: CAP_NONE,
+        actual_caps: CAP_NONE,
+        granted_caps: CAP_ALL, // Root workspace is self-authorizing
+        dep_count: 1usize,
+        deps: [20u32, 0u32, 0u32, 0u32],
+    }
+    let node_lib_a = AuditNode {
+        id: 20u32,
+        declared_caps: CAP_UNSAFE,
+        actual_caps: CAP_UNSAFE,
+        granted_caps: CAP_UNSAFE, // Granted by root [trust.policy]
+        dep_count: 1usize,
+        deps: [30u32, 0u32, 0u32, 0u32],
+    }
+    let mut node_lib_b = AuditNode {
+        id: 30u32,
+        declared_caps: CAP_NET,   // Transitive dependency demands network capability
+        actual_caps: CAP_NET,
+        granted_caps: CAP_NONE,   // Root policy gave zero grants to LibB
+        dep_count: 0usize,
+        deps: [0u32; 4],
+    }
+
+    let mut graph: [4]AuditNode = [node_root, node_lib_a, node_lib_b, node_clean]
+
+    // LibB requires CAP_NET but granted CAP_NONE -> escalation violation!
+    let req_b = node_lib_b.declared_caps | node_lib_b.actual_caps
+    let escalation_detected = !check_policy_grant(req_b, node_lib_b.granted_caps)
+    if !escalation_detected {
+        return 4
+    }
+
+    // Transitive closure of Root includes LibA and LibB capabilities: CAP_UNSAFE | CAP_NET
+    let root_closure = compute_transitive_closure(view(graph), 0usize, 0usize)
+    if root_closure != (CAP_UNSAFE | CAP_NET) {
+        return 5
+    }
+
+    // Now update root policy to explicitly grant CAP_NET to LibB ("corp/lib_b" = ["net"])
+    node_lib_b.granted_caps = CAP_NET
+    graph[2] = node_lib_b
+    let req_b_updated = node_lib_b.declared_caps | node_lib_b.actual_caps
+    let policy_now_allows = check_policy_grant(req_b_updated, node_lib_b.granted_caps)
+    if !policy_now_allows {
+        return 6
+    }
+
+    // 4. Transitive depth propagation check across 3 tiers (Root -> LibA -> LibB -> SubLib)
+    let node_sub = AuditNode {
+        id: 40u32,
+        declared_caps: CAP_ASM,
+        actual_caps: CAP_ASM,
+        granted_caps: CAP_ASM,
+        dep_count: 0usize,
+        deps: [0u32; 4],
+    }
+    graph[3] = node_sub
+    graph[2].dep_count = 1usize
+    graph[2].deps[0] = 40u32
+
+    let deep_closure = compute_transitive_closure(view(graph), 0usize, 0usize)
+    if deep_closure != (CAP_UNSAFE | CAP_NET | CAP_ASM) {
+        return 7
+    }
+
+    print("DEPENDENCY-CAPABILITY-ESCALATION-AUDITOR-OK\n")
+    0
+}

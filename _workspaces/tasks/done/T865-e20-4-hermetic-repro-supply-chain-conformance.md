@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T864]
 priority: 215
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p20/e20_4_hermetic_supply_chain]
 spec: [spec/SPEC-113-hermetic-builds-supply-chain-trust.md, tasks/0590, tasks/0449, tasks/0772, tasks/0661, tasks/1065]
 covers: [REQ-PKG-022, REQ-PKG-024]
+started: 2026-11-09 03:56:31
+finished: 2026-11-09 05:02:05
 ---
 # T865 — E20.4 Hermetic build sandbox, cross-directory/cross-machine bit-for-bit reproducibility & supply-chain trust conformance suite
 
@@ -42,3 +44,5 @@ Certify E20.4 exit criteria with an end-to-end conformance suite covering hermet
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-09 03:56:31 started (attempt 1) T865-impl
+- 2026-11-09 05:02:05 accepted by QA -> done
