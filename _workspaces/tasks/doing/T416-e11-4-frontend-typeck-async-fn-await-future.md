@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T415, T089]
 priority: 138
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/future, tests/parse/async, tests/typeck/async]
 locks: [compiler/syntax/ast.ax, compiler/syntax/parse.ax, compiler/hir/hir.ax, compiler/hir/lower.ax, compiler/types/types.ax, compiler/types/typeck.ax, compiler/traits/solver.ax, compiler/diag/code.ax, std/core/prelude.ax, tests/selfhost]
 spec: [spec/SPEC-33-async.md, 0093, 0127, 0135, 0159, 0202, 0248, tasks/0275, tasks/0297, tasks/0619]
 covers: [REQ-ASY-023, REQ-ASY-027, REQ-ASY-044, REQ-ASY-048, REQ-ASY-049, REQ-ASY-050, REQ-ASY-084, REQ-ASY-117, REQ-ASY-118, REQ-ASY-123, REQ-ASY-135, REQ-ASY-139, REQ-ASY-141, REQ-VER-025]
+started: 2026-11-08 11:00:40
+agent: T416-impl
 ---
 # T416 — E11.4 — Frontend & typeck for async fn, .await, Future/Poll/Waker lang items
 
@@ -42,3 +44,4 @@ Enable `async fn`, `async { }`, and `.await` in the `axiomc` parser, HIR lowerer
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-08 11:00:40 started (attempt 1) T416-impl

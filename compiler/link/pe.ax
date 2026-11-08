@@ -13,11 +13,14 @@ use compiler.kernel.arena.arena_destroy
 
 use compiler.obj.coff.CoffBuf
 use compiler.obj.coff.coff_buf_with_capacity
+use compiler.obj.coff.coff_buf_clear
+use compiler.obj.coff.coff_buf_free
 use compiler.obj.coff.coff_buf_reserve
 use compiler.obj.coff.coff_buf_put_u8
 use compiler.obj.coff.coff_buf_put_u16
 use compiler.obj.coff.coff_buf_put_u32
 use compiler.obj.coff.coff_buf_put_u64
+use compiler.obj.coff.coff_buf_put_bytes
 use compiler.obj.coff.CoffFileHeader
 use compiler.obj.coff.CoffSectionHeader
 use compiler.obj.coff.IMAGE_SCN_ALIGN_MASK
@@ -1230,3 +1233,772 @@ pub fn dll_state_add_export(
     }
     st.num_exports = st.num_exports + 1;
 }
+
+// --- Linker v2 Constants, Symbol Mangling/Demangling, and .axmeta Metadata (SPEC-27) ---
+
+pub const IMAGE_REL_AMD64_SECTION: u16 = 10u16;
+pub const IMAGE_REL_AMD64_SECREL: u16 = 11u16;
+pub const IMAGE_SYM_CLASS_WEAK_EXTERNAL: u8 = 105u8;
+pub const IMAGE_SCN_LNK_INFO: u32 = 0x00000200u32;
+pub const IMAGE_SCN_LNK_REMOVE: u32 = 0x00000800u32;
+
+// SPEC-27 §7 Diagnostic Code Constants
+pub const AX_LINK_ABI_MISMATCH: u32 = 153u32;
+pub const AX_LINK_ARTIFACT_TARGET_MISMATCH: u32 = 154u32;
+
+pub const SYM_BIND_STRONG: u8 = 0u8;
+pub const SYM_BIND_WEAK: u8 = 1u8;
+pub const SYM_BIND_LOCAL: u8 = 2u8;
+
+pub const SYM_ABI_KIND_UNKNOWN: u8 = 0u8;
+pub const SYM_ABI_KIND_FUNC: u8 = 1u8;
+pub const SYM_ABI_KIND_DATA: u8 = 2u8;
+pub const SYM_ABI_KIND_TLS: u8 = 3u8;
+
+pub const SYM_CC_WIN64: u8 = 0u8;
+pub const SYM_CC_FASTCALL: u8 = 1u8;
+pub const SYM_CC_VECTORCALL: u8 = 2u8;
+pub const SYM_CC_SYSV64: u8 = 3u8;
+
+pub const AXMETA_ENTRY_DEF: u8 = 0u8;
+pub const AXMETA_ENTRY_REF: u8 = 1u8;
+pub const AXMETA_VERSION: u32 = 1u32;
+
+pub fn linker_append_section_data_pad(
+    sec: *mut MergedSection,
+    data: *const u8,
+    size: u32,
+    align: u32,
+    pad_byte: u8,
+    out_offset: *mut u32
+) {
+    if (sec as usize) == 0 {
+        return;
+    }
+    let old_size = unsafe { (*sec).size };
+    let offset = pe_align_up_u32(old_size, align);
+    let new_size = offset + size;
+    let old_cap = unsafe { (*sec).cap };
+
+    if new_size > old_cap {
+        let mut new_cap: u32 = if old_cap == 0u32 { 1024u32 } else { old_cap };
+        while new_cap < new_size {
+            new_cap = new_cap + new_cap;
+        }
+        let new_data = unsafe { heap_alloc(new_cap as usize, 8) };
+        let old_data = unsafe { (*sec).data };
+        if old_size > 0u32 && (old_data as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(old_data as *const u8, new_data, old_size as usize);
+                heap_free(old_data, old_cap as usize, 8);
+            }
+        } else if old_cap > 0u32 && (old_data as usize) != 0 {
+            unsafe {
+                heap_free(old_data, old_cap as usize, 8);
+            }
+        }
+        unsafe {
+            (*sec).data = new_data;
+            (*sec).cap = new_cap;
+        }
+    }
+
+    let dst_base = unsafe { (*sec).data };
+    if offset > old_size {
+        unsafe {
+            ptr_write_bytes<u8>(dst_base + (old_size as usize), pad_byte, (offset - old_size) as usize);
+        }
+    }
+
+    if size > 0u32 {
+        if (data as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(data, dst_base + (offset as usize), size as usize);
+            }
+        } else {
+            unsafe {
+                ptr_write_bytes<u8>(dst_base + (offset as usize), 0u8, size as usize);
+            }
+        }
+    }
+
+    unsafe {
+        (*sec).size = new_size;
+        if (out_offset as usize) != 0 {
+            *out_offset = offset;
+        }
+    }
+}
+
+pub struct LinkV2SymMeta {
+    pub sym_name: *const u8,
+    pub demangled: *const u8,
+    pub obj_name: *const u8,
+    pub abi_sig: *const u8,
+    pub ref_fn: *const u8,
+    pub entry_kind: u8,
+    pub binding: u8,
+    pub abi_kind: u8,
+    pub calling_conv: u8,
+    pub param_count: u32,
+    pub ret_size: u32,
+    pub file_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+pub struct LinkV2RelocMeta {
+    pub reloc_idx: usize,
+    pub obj_name: *const u8,
+    pub sec_name: *const u8,
+    pub ref_fn: *const u8,
+    pub file_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+pub struct LinkV2Context {
+    pub syms: *mut LinkV2SymMeta,
+    pub num_syms: usize,
+    pub cap_syms: usize,
+    pub reloc_metas: *mut LinkV2RelocMeta,
+    pub num_reloc_metas: usize,
+    pub cap_reloc_metas: usize,
+    pub searched_libs: *const u8,
+    pub current_obj_name: *const u8,
+    pub active: bool,
+}
+
+pub fn link_v2_context_new() -> LinkV2Context {
+    LinkV2Context {
+        syms: 0 as *mut LinkV2SymMeta,
+        num_syms: 0,
+        cap_syms: 0,
+        reloc_metas: 0 as *mut LinkV2RelocMeta,
+        num_reloc_metas: 0,
+        cap_reloc_metas: 0,
+        searched_libs: 0 as *const u8,
+        current_obj_name: 0 as *const u8,
+        active: true,
+    }
+}
+
+pub fn link_v2_context_free(v2: mut_view<LinkV2Context>) {
+    if v2.cap_syms > 0 && (v2.syms as usize) != 0 {
+        unsafe {
+            heap_free(
+                v2.syms as *mut u8,
+                coff_mul_usize(v2.cap_syms, size_of<LinkV2SymMeta>()),
+                align_of<LinkV2SymMeta>()
+            );
+        }
+    }
+    if v2.cap_reloc_metas > 0 && (v2.reloc_metas as usize) != 0 {
+        unsafe {
+            heap_free(
+                v2.reloc_metas as *mut u8,
+                coff_mul_usize(v2.cap_reloc_metas, size_of<LinkV2RelocMeta>()),
+                align_of<LinkV2RelocMeta>()
+            );
+        }
+    }
+    v2.syms = 0 as *mut LinkV2SymMeta;
+    v2.num_syms = 0;
+    v2.cap_syms = 0;
+    v2.reloc_metas = 0 as *mut LinkV2RelocMeta;
+    v2.num_reloc_metas = 0;
+    v2.cap_reloc_metas = 0;
+}
+
+unsafe fn v2_sym_slot_ptr(base: *mut LinkV2SymMeta, idx: usize) -> *mut LinkV2SymMeta {
+    ((base as usize) + coff_mul_usize(idx, size_of<LinkV2SymMeta>())) as *mut LinkV2SymMeta
+}
+
+unsafe fn v2_reloc_slot_ptr(base: *mut LinkV2RelocMeta, idx: usize) -> *mut LinkV2RelocMeta {
+    ((base as usize) + coff_mul_usize(idx, size_of<LinkV2RelocMeta>())) as *mut LinkV2RelocMeta
+}
+
+pub fn link_v2_sym_at(v2: view<LinkV2Context>, idx: usize) -> *mut LinkV2SymMeta {
+    if idx >= v2.num_syms || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    unsafe { v2_sym_slot_ptr(v2.syms, idx) }
+}
+
+pub fn link_v2_add_sym_meta(
+    v2: mut_view<LinkV2Context>,
+    sym_name: *const u8,
+    demangled: *const u8,
+    obj_name: *const u8,
+    abi_sig: *const u8,
+    ref_fn: *const u8,
+    entry_kind: u8,
+    binding: u8,
+    abi_kind: u8,
+    calling_conv: u8,
+    param_count: u32,
+    ret_size: u32,
+    file_id: u32,
+    span_start: u32,
+    span_end: u32
+) -> *mut LinkV2SymMeta {
+    if v2.num_syms == v2.cap_syms {
+        let new_cap = if v2.cap_syms == 0 { 32 } else { v2.cap_syms + v2.cap_syms };
+        let new_bytes = coff_mul_usize(new_cap, size_of<LinkV2SymMeta>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<LinkV2SymMeta>()) as *mut LinkV2SymMeta };
+        if v2.num_syms > 0 && (v2.syms as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    v2.syms as *const u8,
+                    new_arr as *mut u8,
+                    coff_mul_usize(v2.num_syms, size_of<LinkV2SymMeta>())
+                );
+                heap_free(
+                    v2.syms as *mut u8,
+                    coff_mul_usize(v2.cap_syms, size_of<LinkV2SymMeta>()),
+                    align_of<LinkV2SymMeta>()
+                );
+            }
+        }
+        v2.syms = new_arr;
+        v2.cap_syms = new_cap;
+    }
+    let slot = unsafe { v2_sym_slot_ptr(v2.syms, v2.num_syms) };
+    unsafe {
+        *slot = LinkV2SymMeta {
+            sym_name: sym_name,
+            demangled: demangled,
+            obj_name: obj_name,
+            abi_sig: abi_sig,
+            ref_fn: ref_fn,
+            entry_kind: entry_kind,
+            binding: binding,
+            abi_kind: abi_kind,
+            calling_conv: calling_conv,
+            param_count: param_count,
+            ret_size: ret_size,
+            file_id: file_id,
+            span_start: span_start,
+            span_end: span_end,
+        };
+    }
+    v2.num_syms = v2.num_syms + 1;
+    slot
+}
+
+pub fn link_v2_find_def_meta(v2: view<LinkV2Context>, sym_name: *const u8) -> *mut LinkV2SymMeta {
+    if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    let mut i: usize = 0;
+    while i < v2.num_syms {
+        let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
+        if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF &&
+           (unsafe { (*m).sym_name as usize }) != 0 &&
+           cstr_eq(unsafe { (*m).sym_name }, sym_name) {
+            return m;
+        }
+        i = i + 1;
+    }
+    0 as *mut LinkV2SymMeta
+}
+
+pub fn link_v2_find_def_meta_in_obj(
+    v2: view<LinkV2Context>,
+    sym_name: *const u8,
+    obj_name: *const u8
+) -> *mut LinkV2SymMeta {
+    if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    let mut i: usize = 0;
+    while i < v2.num_syms {
+        let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
+        if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_DEF &&
+           (unsafe { (*m).sym_name as usize }) != 0 &&
+           cstr_eq(unsafe { (*m).sym_name }, sym_name) {
+            if (obj_name as usize) == 0 ||
+               ((unsafe { (*m).obj_name as usize }) != 0 && cstr_eq(unsafe { (*m).obj_name }, obj_name)) {
+                return m;
+            }
+        }
+        i = i + 1;
+    }
+    0 as *mut LinkV2SymMeta
+}
+
+pub fn link_v2_find_ref_meta(
+    v2: view<LinkV2Context>,
+    sym_name: *const u8,
+    obj_name: *const u8
+) -> *mut LinkV2SymMeta {
+    if (sym_name as usize) == 0 || (v2.syms as usize) == 0 {
+        return 0 as *mut LinkV2SymMeta;
+    }
+    let mut fallback: *mut LinkV2SymMeta = 0 as *mut LinkV2SymMeta;
+    let mut i: usize = 0;
+    while i < v2.num_syms {
+        let m = unsafe { v2_sym_slot_ptr(v2.syms, i) };
+        if (unsafe { (*m).entry_kind }) == AXMETA_ENTRY_REF &&
+           (unsafe { (*m).sym_name as usize }) != 0 &&
+           cstr_eq(unsafe { (*m).sym_name }, sym_name) {
+            if (obj_name as usize) != 0 &&
+               (unsafe { (*m).obj_name as usize }) != 0 &&
+               cstr_eq(unsafe { (*m).obj_name }, obj_name) {
+                return m;
+            }
+            if (fallback as usize) == 0 {
+                fallback = m;
+            }
+        }
+        i = i + 1;
+    }
+    fallback
+}
+
+pub fn link_v2_add_reloc_meta(
+    v2: mut_view<LinkV2Context>,
+    reloc_idx: usize,
+    obj_name: *const u8,
+    sec_name: *const u8,
+    ref_fn: *const u8,
+    file_id: u32,
+    span_start: u32,
+    span_end: u32
+) {
+    if v2.num_reloc_metas == v2.cap_reloc_metas {
+        let new_cap = if v2.cap_reloc_metas == 0 { 32 } else { v2.cap_reloc_metas + v2.cap_reloc_metas };
+        let new_bytes = coff_mul_usize(new_cap, size_of<LinkV2RelocMeta>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<LinkV2RelocMeta>()) as *mut LinkV2RelocMeta };
+        if v2.num_reloc_metas > 0 && (v2.reloc_metas as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(
+                    v2.reloc_metas as *const u8,
+                    new_arr as *mut u8,
+                    coff_mul_usize(v2.num_reloc_metas, size_of<LinkV2RelocMeta>())
+                );
+                heap_free(
+                    v2.reloc_metas as *mut u8,
+                    coff_mul_usize(v2.cap_reloc_metas, size_of<LinkV2RelocMeta>()),
+                    align_of<LinkV2RelocMeta>()
+                );
+            }
+        }
+        v2.reloc_metas = new_arr;
+        v2.cap_reloc_metas = new_cap;
+    }
+    let slot = unsafe { v2_reloc_slot_ptr(v2.reloc_metas, v2.num_reloc_metas) };
+    unsafe {
+        *slot = LinkV2RelocMeta {
+            reloc_idx: reloc_idx,
+            obj_name: obj_name,
+            sec_name: sec_name,
+            ref_fn: ref_fn,
+            file_id: file_id,
+            span_start: span_start,
+            span_end: span_end,
+        };
+    }
+    v2.num_reloc_metas = v2.num_reloc_metas + 1;
+}
+
+pub fn link_v2_find_reloc_meta(v2: view<LinkV2Context>, reloc_idx: usize) -> *mut LinkV2RelocMeta {
+    if (v2.reloc_metas as usize) == 0 {
+        return 0 as *mut LinkV2RelocMeta;
+    }
+    let mut i: usize = 0;
+    while i < v2.num_reloc_metas {
+        let m = unsafe { v2_reloc_slot_ptr(v2.reloc_metas, i) };
+        if (unsafe { (*m).reloc_idx }) == reloc_idx {
+            return m;
+        }
+        i = i + 1;
+    }
+    0 as *mut LinkV2RelocMeta
+}
+
+fn pe_put_u32_decimal_to_buf(out: mut_view<CoffBuf>, val: u32) {
+    if val == 0u32 {
+        coff_buf_put_u8(mut_view(*out), 48u8);
+        return;
+    }
+    let mut digits: [12]u8 = [0u8; 12];
+    let mut n: usize = 0;
+    let mut v: u32 = val;
+    while v > 0u32 {
+        digits[n] = (48u32 + (v % 10u32)) as u8;
+        v = v / 10u32;
+        n = n + 1;
+    }
+    while n > 0 {
+        n = n - 1;
+        coff_buf_put_u8(mut_view(*out), digits[n]);
+    }
+}
+
+fn pe_is_prim_type_code(ptr: *const u8, len: usize) -> bool {
+    if len == 2 {
+        let b0 = unsafe { *ptr };
+        let b1 = unsafe { *(ptr + 1) };
+        if (b0 == 105u8 || b0 == 117u8) && b1 == 56u8 { // "i8", "u8"
+            return true;
+        }
+    } else if len == 3 {
+        let b0 = unsafe { *ptr };
+        let b1 = unsafe { *(ptr + 1) };
+        let b2 = unsafe { *(ptr + 2) };
+        if (b0 == 105u8 || b0 == 117u8) &&
+           ((b1 == 49u8 && b2 == 54u8) || (b1 == 51u8 && b2 == 50u8) || (b1 == 54u8 && b2 == 52u8)) {
+            return true; // i16, u16, i32, u32, i64, u64
+        }
+        if b0 == 102u8 && ((b1 == 51u8 && b2 == 50u8) || (b1 == 54u8 && b2 == 52u8)) {
+            return true; // f32, f64
+        }
+        if b0 == 115u8 && b1 == 116u8 && b2 == 114u8 {
+            return true; // str
+        }
+    } else if len == 4 {
+        let b0 = unsafe { *ptr };
+        let b1 = unsafe { *(ptr + 1) };
+        let b2 = unsafe { *(ptr + 2) };
+        let b3 = unsafe { *(ptr + 3) };
+        if b0 == 98u8 && b1 == 111u8 && b2 == 111u8 && b3 == 108u8 {
+            return true; // bool
+        }
+        if b0 == 117u8 && b1 == 110u8 && b2 == 105u8 && b3 == 116u8 {
+            return true; // unit
+        }
+    } else if len == 5 {
+        let b0 = unsafe { *ptr };
+        let b1 = unsafe { *(ptr + 1) };
+        let b2 = unsafe { *(ptr + 2) };
+        let b3 = unsafe { *(ptr + 3) };
+        let b4 = unsafe { *(ptr + 4) };
+        if (b0 == 117u8 || b0 == 105u8) && b1 == 115u8 && b2 == 105u8 && b3 == 122u8 && b4 == 101u8 {
+            return true; // usize, isize
+        }
+    }
+    false
+}
+
+// SPEC-27 §5.2 (AXS-LNK-011): Deterministic `_AX1_` symbol mangler.
+// Converts canonical Axiom path `pkg.mod.item` or `pkg.mod.item<T1, T2>` into `_AX1_<len><seg>...[_G<n>_<t1>...]`.
+pub fn pe_mangle_ax1_symbol(path_ptr: *const u8, path_len: usize, out: mut_view<CoffBuf>) {
+    coff_buf_clear(mut_view(*out));
+    if (path_ptr as usize) == 0 || path_len == 0 {
+        return;
+    }
+    // "_AX1"
+    coff_buf_put_u8(mut_view(*out), 95u8);
+    coff_buf_put_u8(mut_view(*out), 65u8);
+    coff_buf_put_u8(mut_view(*out), 88u8);
+    coff_buf_put_u8(mut_view(*out), 49u8);
+
+    let mut lt_pos: usize = path_len;
+    let mut i: usize = 0;
+    while i < path_len {
+        if (unsafe { *(path_ptr + i) }) == 60u8 { // '<'
+            lt_pos = i;
+            break;
+        }
+        i = i + 1;
+    }
+
+    let mut seg_start: usize = 0;
+    let mut pos: usize = 0;
+    while pos <= lt_pos {
+        let is_end = pos == lt_pos;
+        let ch = if is_end { 46u8 } else { unsafe { *(path_ptr + pos) } };
+        if ch == 46u8 || ch == 36u8 { // '.' or '$'
+            let seg_len = pos - seg_start;
+            if seg_len > 0 {
+                coff_buf_put_u8(mut_view(*out), 95u8); // '_'
+                pe_put_u32_decimal_to_buf(mut_view(*out), seg_len as u32);
+                coff_buf_put_bytes(mut_view(*out), unsafe { path_ptr + seg_start }, seg_len);
+            }
+            seg_start = pos + 1;
+        }
+        pos = pos + 1;
+    }
+
+    if lt_pos < path_len && (unsafe { *(path_ptr + path_len - 1) }) == 62u8 { // '>'
+        let gen_start = lt_pos + 1;
+        let gen_end = path_len - 1;
+        if gen_end > gen_start {
+            let mut arg_count: u32 = 1u32;
+            let mut k: usize = gen_start;
+            while k < gen_end {
+                if (unsafe { *(path_ptr + k) }) == 44u8 { // ','
+                    arg_count = arg_count + 1u32;
+                }
+                k = k + 1;
+            }
+            coff_buf_put_u8(mut_view(*out), 95u8); // '_'
+            coff_buf_put_u8(mut_view(*out), 71u8); // 'G'
+            pe_put_u32_decimal_to_buf(mut_view(*out), arg_count);
+
+            let mut a_start: usize = gen_start;
+            let mut a_pos: usize = gen_start;
+            while a_pos <= gen_end {
+                let is_a_end = a_pos == gen_end;
+                let ach = if is_a_end { 44u8 } else { unsafe { *(path_ptr + a_pos) } };
+                if ach == 44u8 {
+                    let mut ts = a_start;
+                    let mut te = a_pos;
+                    while ts < te && (unsafe { *(path_ptr + ts) }) == 32u8 {
+                        ts = ts + 1;
+                    }
+                    while te > ts && (unsafe { *(path_ptr + te - 1) }) == 32u8 {
+                        te = te - 1;
+                    }
+                    let tlen = te - ts;
+                    if tlen > 0 {
+                        let tptr = unsafe { path_ptr + ts };
+                        coff_buf_put_u8(mut_view(*out), 95u8); // '_'
+                        if !pe_is_prim_type_code(tptr, tlen) {
+                            pe_put_u32_decimal_to_buf(mut_view(*out), tlen as u32);
+                        }
+                        coff_buf_put_bytes(mut_view(*out), tptr, tlen);
+                    }
+                    a_start = a_pos + 1;
+                }
+                a_pos = a_pos + 1;
+            }
+        }
+    }
+}
+
+// SPEC-27 §5.2 (AXS-LNK-011): Lossless `_AX1_` and internal `$` symbol demangler.
+// Always formats Axiom paths using canonical `.` and `<T>` syntax (never `::`).
+pub fn pe_demangle_symbol(mangled_ptr: *const u8, mangled_len: usize, out: mut_view<CoffBuf>) {
+    coff_buf_clear(mut_view(*out));
+    if (mangled_ptr as usize) == 0 || mangled_len == 0 {
+        return;
+    }
+
+    // Check `_AX1_` prefix
+    if mangled_len > 5 &&
+       (unsafe { *mangled_ptr }) == 95u8 &&
+       (unsafe { *(mangled_ptr + 1) }) == 65u8 &&
+       (unsafe { *(mangled_ptr + 2) }) == 88u8 &&
+       (unsafe { *(mangled_ptr + 3) }) == 49u8 &&
+       (unsafe { *(mangled_ptr + 4) }) == 95u8 {
+        let mut pos: usize = 5;
+        let mut first_seg: bool = true;
+        while pos < mangled_len {
+            let ch = unsafe { *(mangled_ptr + pos) };
+            if ch == 95u8 { // '_'
+                pos = pos + 1;
+                continue;
+            }
+            if ch == 71u8 && pos + 1 < mangled_len { // 'G' generic instantiation
+                let next_ch = unsafe { *(mangled_ptr + pos + 1) };
+                if next_ch >= 48u8 && next_ch <= 57u8 {
+                    pos = pos + 1;
+                    let mut gcount: usize = 0;
+                    while pos < mangled_len {
+                        let d = unsafe { *(mangled_ptr + pos) };
+                        if d < 48u8 || d > 57u8 {
+                            break;
+                        }
+                        gcount = coff_mul_usize(gcount, 10) + ((d - 48u8) as usize);
+                        pos = pos + 1;
+                    }
+                    coff_buf_put_u8(mut_view(*out), 60u8); // '<'
+                    let mut g: usize = 0;
+                    while g < gcount && pos < mangled_len {
+                        if (unsafe { *(mangled_ptr + pos) }) == 95u8 {
+                            pos = pos + 1;
+                        }
+                        if g > 0 {
+                            coff_buf_put_u8(mut_view(*out), 44u8); // ','
+                            coff_buf_put_u8(mut_view(*out), 32u8); // ' '
+                        }
+                        let c0 = unsafe { *(mangled_ptr + pos) };
+                        if c0 >= 49u8 && c0 <= 57u8 {
+                            let mut tlen: usize = 0;
+                            while pos < mangled_len {
+                                let d = unsafe { *(mangled_ptr + pos) };
+                                if d < 48u8 || d > 57u8 {
+                                    break;
+                                }
+                                tlen = coff_mul_usize(tlen, 10) + ((d - 48u8) as usize);
+                                pos = pos + 1;
+                            }
+                            if pos + tlen <= mangled_len {
+                                coff_buf_put_bytes(mut_view(*out), unsafe { mangled_ptr + pos }, tlen);
+                                pos = pos + tlen;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            let tstart = pos;
+                            while pos < mangled_len && (unsafe { *(mangled_ptr + pos) }) != 95u8 {
+                                pos = pos + 1;
+                            }
+                            if pos > tstart {
+                                coff_buf_put_bytes(mut_view(*out), unsafe { mangled_ptr + tstart }, pos - tstart);
+                            }
+                        }
+                        g = g + 1;
+                    }
+                    coff_buf_put_u8(mut_view(*out), 62u8); // '>'
+                    return;
+                }
+            }
+            if ch >= 49u8 && ch <= 57u8 {
+                let mut slen: usize = 0;
+                while pos < mangled_len {
+                    let d = unsafe { *(mangled_ptr + pos) };
+                    if d < 48u8 || d > 57u8 {
+                        break;
+                    }
+                    slen = coff_mul_usize(slen, 10) + ((d - 48u8) as usize);
+                    pos = pos + 1;
+                }
+                if slen > 0 && pos + slen <= mangled_len {
+                    if !first_seg {
+                        coff_buf_put_u8(mut_view(*out), 46u8); // '.'
+                    }
+                    coff_buf_put_bytes(mut_view(*out), unsafe { mangled_ptr + pos }, slen);
+                    pos = pos + slen;
+                    first_seg = false;
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        if out.len > 0 {
+            return;
+        }
+    }
+
+    // Internal compiler `$` separator (e.g. `math$add` -> `math.add`, excluding DLL import `KERNEL32.dll$...`)
+    let mut has_dollar: bool = false;
+    let mut has_dot_dll: bool = false;
+    let mut k: usize = 0;
+    while k < mangled_len {
+        let b = unsafe { *(mangled_ptr + k) };
+        if b == 36u8 { // '$'
+            has_dollar = true;
+            if k >= 4 {
+                let d0 = unsafe { *(mangled_ptr + k - 4) };
+                let d1 = (unsafe { *(mangled_ptr + k - 3) }) | 32u8;
+                let d2 = (unsafe { *(mangled_ptr + k - 2) }) | 32u8;
+                let d3 = (unsafe { *(mangled_ptr + k - 1) }) | 32u8;
+                if d0 == 46u8 && d1 == 100u8 && d2 == 108u8 && d3 == 108u8 {
+                    has_dot_dll = true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+
+    if has_dollar && !has_dot_dll {
+        let mut idx: usize = 0;
+        while idx < mangled_len {
+            let b = unsafe { *(mangled_ptr + idx) };
+            if b == 36u8 {
+                coff_buf_put_u8(mut_view(*out), 46u8); // '.'
+            } else {
+                coff_buf_put_u8(mut_view(*out), b);
+            }
+            idx = idx + 1;
+        }
+        return;
+    }
+
+    coff_buf_put_bytes(mut_view(*out), mangled_ptr, mangled_len);
+}
+
+pub fn pe_demangle_cstr_in_ctx(ctx: mut_view<LinkerContext>, sym_name: *const u8) -> *const u8 {
+    if (sym_name as usize) == 0 {
+        return sym_name;
+    }
+    let slen = cstr_len(sym_name);
+    let mut buf = coff_buf_with_capacity(slen + 16);
+    pe_demangle_symbol(sym_name, slen, mut_view(buf));
+    let res = linker_dup_bytes(mut_view(*ctx), buf.ptr as *const u8, buf.len);
+    coff_buf_free(mut_view(buf));
+    res
+}
+
+// `.axmeta` Binary Section Writer Helpers (SPEC-27 §4)
+pub fn axmeta_put_header(
+    buf: mut_view<CoffBuf>,
+    machine: u16,
+    abi_id: u16,
+    obj_name_ptr: *const u8,
+    obj_name_len: usize,
+    triple_ptr: *const u8,
+    triple_len: usize,
+    num_entries: u32
+) {
+    // Magic "AXM1"
+    coff_buf_put_u8(mut_view(*buf), 65u8);
+    coff_buf_put_u8(mut_view(*buf), 88u8);
+    coff_buf_put_u8(mut_view(*buf), 77u8);
+    coff_buf_put_u8(mut_view(*buf), 49u8);
+    coff_buf_put_u32(mut_view(*buf), AXMETA_VERSION);
+    coff_buf_put_u16(mut_view(*buf), machine);
+    coff_buf_put_u16(mut_view(*buf), abi_id);
+    coff_buf_put_u32(mut_view(*buf), obj_name_len as u32);
+    coff_buf_put_u32(mut_view(*buf), triple_len as u32);
+    coff_buf_put_u32(mut_view(*buf), num_entries);
+    if obj_name_len > 0 && (obj_name_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), obj_name_ptr, obj_name_len);
+    }
+    if triple_len > 0 && (triple_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), triple_ptr, triple_len);
+    }
+}
+
+pub fn axmeta_put_entry(
+    buf: mut_view<CoffBuf>,
+    sym_ptr: *const u8,
+    sym_len: usize,
+    dem_ptr: *const u8,
+    dem_len: usize,
+    sig_ptr: *const u8,
+    sig_len: usize,
+    ref_fn_ptr: *const u8,
+    ref_fn_len: usize,
+    entry_kind: u8,
+    binding: u8,
+    abi_kind: u8,
+    calling_conv: u8,
+    param_count: u32,
+    ret_size: u32,
+    file_id: u32,
+    span_start: u32,
+    span_end: u32
+) {
+    coff_buf_put_u32(mut_view(*buf), sym_len as u32);
+    coff_buf_put_u32(mut_view(*buf), dem_len as u32);
+    coff_buf_put_u32(mut_view(*buf), sig_len as u32);
+    coff_buf_put_u32(mut_view(*buf), ref_fn_len as u32);
+    coff_buf_put_u8(mut_view(*buf), entry_kind);
+    coff_buf_put_u8(mut_view(*buf), binding);
+    coff_buf_put_u8(mut_view(*buf), abi_kind);
+    coff_buf_put_u8(mut_view(*buf), calling_conv);
+    coff_buf_put_u32(mut_view(*buf), param_count);
+    coff_buf_put_u32(mut_view(*buf), ret_size);
+    coff_buf_put_u32(mut_view(*buf), file_id);
+    coff_buf_put_u32(mut_view(*buf), span_start);
+    coff_buf_put_u32(mut_view(*buf), span_end);
+    if sym_len > 0 && (sym_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), sym_ptr, sym_len);
+    }
+    if dem_len > 0 && (dem_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), dem_ptr, dem_len);
+    }
+    if sig_len > 0 && (sig_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), sig_ptr, sig_len);
+    }
+    if ref_fn_len > 0 && (ref_fn_ptr as usize) != 0 {
+        coff_buf_put_bytes(mut_view(*buf), ref_fn_ptr, ref_fn_len);
+    }
+}
+
