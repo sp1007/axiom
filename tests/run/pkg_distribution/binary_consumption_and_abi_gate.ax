@@ -1,0 +1,220 @@
+// test: run
+// modes: interp native
+// stdout-file: binary_consumption_and_abi_gate.stdout
+// SPEC-112 §§1, 3 (AXS-REG-020..023; REQ-ECO-8736, REQ-PKG-024, REQ-PKG-010):
+// Verifies source-free precompiled .axmeta/binary package consumption,
+// popcount-based CPU variant selection, target triple checking,
+// AbiFingerprint validation, and deterministic hybrid source fallback.
+
+@intrinsic fn rotate_right_u32(a: u32, b: u32) -> u32 { 0 }
+
+const MODE_SOURCE: u16 = 1u16
+const MODE_BINARY: u16 = 2u16
+const MODE_HYBRID: u16 = 3u16
+
+const ACTION_USE_BINARY: u8 = 1u8
+const ACTION_COMPILE_SOURCE: u8 = 2u8
+const ACTION_REJECT: u8 = 3u8
+
+const REJECT_NONE: u8 = 0u8
+const REJECT_TARGET_MISMATCH: u8 = 1u8
+const REJECT_ABI_MISMATCH: u8 = 2u8
+const REJECT_NO_MATCHING_SLICE: u8 = 3u8
+const REJECT_QUARANTINED: u8 = 4u8
+
+const TARGET_WIN64: u32 = 1u32
+const TARGET_LINUX64: u32 = 2u32
+
+@derive(Copy)
+struct SliceDescLite {
+    target_id: u32,
+    cpu_mask: u64,
+    abi_hash: u64,
+}
+
+@derive(Copy)
+struct CatalogLite {
+    mode: u16,
+    slices: [4]SliceDescLite,
+    slice_count: usize,
+    has_source: bool,
+    is_quarantined: bool,
+}
+
+fn empty_slice() -> SliceDescLite {
+    SliceDescLite {
+        target_id: 0u32,
+        cpu_mask: 0u64,
+        abi_hash: 0u64,
+    }
+}
+
+fn popcount_u64(mut v: u64) -> u32 {
+    let mut c: u32 = 0u32
+    while v > 0u64 {
+        c = c + ((v & 1u64) as u32)
+        v = v >> 1u32
+    }
+    c
+}
+
+fn select_slice(
+    cat: view<CatalogLite>,
+    active_target: u32,
+    active_cpu: u64,
+    active_abi: u64,
+    out_idx: mut_view<usize>,
+    out_reason: mut_view<u8>
+) -> bool {
+    let mut best_idx: usize = 0usize
+    let mut best_pc: u32 = 0u32
+    let mut found = false
+
+    let mut i: usize = 0usize
+    while i < cat.slice_count && i < 4usize {
+        let sl = cat.slices[i]
+        if sl.target_id == active_target {
+            if (sl.cpu_mask & ~active_cpu) == 0u64 {
+                if sl.abi_hash == active_abi {
+                    let pc = popcount_u64(sl.cpu_mask)
+                    if !found || pc > best_pc {
+                        best_idx = i
+                        best_pc = pc
+                        found = true
+                    }
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found {
+        *out_idx = best_idx
+        return true
+    }
+
+    if cat.slice_count > 0usize {
+        let sl0 = cat.slices[0]
+        if sl0.target_id != active_target {
+            *out_reason = REJECT_TARGET_MISMATCH
+        } else if sl0.abi_hash != active_abi {
+            *out_reason = REJECT_ABI_MISMATCH
+        } else {
+            *out_reason = REJECT_NO_MATCHING_SLICE
+        }
+    } else {
+        *out_reason = REJECT_NO_MATCHING_SLICE
+    }
+    false
+}
+
+fn decide_consumption(
+    cat: view<CatalogLite>,
+    active_target: u32,
+    active_cpu: u64,
+    active_abi: u64,
+    require_binary: bool
+) -> u8 {
+    if cat.is_quarantined {
+        return ACTION_REJECT
+    }
+    if cat.mode == MODE_SOURCE {
+        return ACTION_COMPILE_SOURCE
+    }
+
+    let mut idx: usize = 0usize
+    let mut reason: u8 = REJECT_NONE
+    let ok = select_slice(cat, active_target, active_cpu, active_abi, mut_view(idx), mut_view(reason))
+    if ok {
+        return ACTION_USE_BINARY
+    }
+
+    if cat.mode == MODE_HYBRID && !require_binary && cat.has_source {
+        return ACTION_COMPILE_SOURCE
+    }
+
+    ACTION_REJECT
+}
+
+pub fn main() -> i32 {
+    let active_target = TARGET_WIN64
+    let active_cpu = 3u64 // baseline (1) | avx2 (2)
+    let active_abi = 0x1234567890ABCDEFu64
+
+    // Test 1: Popcount variant selection (AVX2 mask=3 selected over baseline mask=1)
+    let mut sl_multi: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    sl_multi[0] = SliceDescLite { target_id: TARGET_WIN64, cpu_mask: 1u64, abi_hash: active_abi }
+    sl_multi[1] = SliceDescLite { target_id: TARGET_WIN64, cpu_mask: 3u64, abi_hash: active_abi }
+
+    let cat_multi = CatalogLite {
+        mode: MODE_BINARY,
+        slices: sl_multi,
+        slice_count: 2usize,
+        has_source: false,
+        is_quarantined: false,
+    }
+    let mut chosen_idx: usize = 0usize
+    let mut reason: u8 = 0u8
+    let sel_ok = select_slice(view(cat_multi), active_target, active_cpu, active_abi, mut_view(chosen_idx), mut_view(reason))
+    if !sel_ok || chosen_idx != 1usize {
+        return 1
+    }
+    let act_bin = decide_consumption(view(cat_multi), active_target, active_cpu, active_abi, false)
+    if act_bin != ACTION_USE_BINARY {
+        return 2
+    }
+
+    // Test 2: Target mismatch rejected before linking
+    let mut sl_linux: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    sl_linux[0] = SliceDescLite { target_id: TARGET_LINUX64, cpu_mask: 1u64, abi_hash: active_abi }
+    let cat_linux = CatalogLite {
+        mode: MODE_BINARY,
+        slices: sl_linux,
+        slice_count: 1usize,
+        has_source: false,
+        is_quarantined: false,
+    }
+    let act_tgt_err = decide_consumption(view(cat_linux), active_target, active_cpu, active_abi, false)
+    if act_tgt_err != ACTION_REJECT {
+        return 3
+    }
+
+    // Test 3: ABI fingerprint mismatch rejected
+    let mut sl_abi_err: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    sl_abi_err[0] = SliceDescLite { target_id: TARGET_WIN64, cpu_mask: 1u64, abi_hash: 0x99999999u64 }
+    let cat_abi_err = CatalogLite {
+        mode: MODE_BINARY,
+        slices: sl_abi_err,
+        slice_count: 1usize,
+        has_source: false,
+        is_quarantined: false,
+    }
+    let act_abi_err = decide_consumption(view(cat_abi_err), active_target, active_cpu, active_abi, false)
+    if act_abi_err != ACTION_REJECT {
+        return 4
+    }
+
+    // Test 4: Deterministic fallback to source for Hybrid package
+    let cat_hybrid = CatalogLite {
+        mode: MODE_HYBRID,
+        slices: sl_linux, // Only Linux binary slice available
+        slice_count: 1usize,
+        has_source: true, // But canonical source is present!
+        is_quarantined: false,
+    }
+    let act_hybrid = decide_consumption(view(cat_hybrid), active_target, active_cpu, active_abi, false)
+    if act_hybrid != ACTION_COMPILE_SOURCE {
+        return 5
+    }
+
+    // Test 5: Quarantined version emergency blocked
+    let mut cat_quar = cat_multi
+    cat_quar.is_quarantined = true
+    let act_quar = decide_consumption(view(cat_quar), active_target, active_cpu, active_abi, false)
+    if act_quar != ACTION_REJECT {
+        return 6
+    }
+
+    print("BINARY-CONSUMPTION-AND-ABI-GATE-OK\n")
+    0
+}

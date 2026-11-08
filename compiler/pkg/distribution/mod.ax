@@ -1,0 +1,778 @@
+// Axiom Compiler — Precompiled .axmeta/Binary Package Consumption Engine &
+// Multi-Repository Routing / Namespace Pinning Defender (`compiler/pkg/distribution/mod.ax`, T860 / E20.3).
+//
+// Implements SPEC-112 §§1..4 (`AXS-REG-020`..`023`, `AXS-REG-031`, `AXS-REG-050`;
+// `REQ-ECO-8736`, `REQ-PKG-024`, `REQ-PKG-010`, `INV-REG-002`, `INV-DET-001`).
+
+module compiler.pkg.distribution
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.code.AX_DRIVER_UNKNOWN_TARGET
+use compiler.diag.code.AX_LINK_BAD_OBJECT
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. String-View Helpers & Fingerprints (`AXS-REG-022`)
+// =============================================================================
+
+pub fn dist_sv(s: str) -> StrView {
+    let lsv = lsv_from_str(s)
+    StrView { ptr: lsv.ptr, len: lsv.len }
+}
+
+pub fn dist_sv_empty() -> StrView {
+    StrView { ptr: 0 as *const u8, len: 0usize }
+}
+
+pub fn dist_sv_eq(a: StrView, b: StrView) -> bool {
+    if a.len != b.len { return false }
+    let mut i: usize = 0usize
+    while i < a.len {
+        let ba = if (a.ptr as usize) != 0usize { unsafe { *(a.ptr + i) } } else { 0u8 }
+        let bb = if (b.ptr as usize) != 0usize { unsafe { *(b.ptr + i) } } else { 0u8 }
+        if ba != bb { return false }
+        i = i + 1usize
+    }
+    true
+}
+
+pub fn dist_sv_starts_with(s: StrView, prefix: StrView) -> bool {
+    if prefix.len > s.len { return false }
+    let mut i: usize = 0usize
+    while i < prefix.len {
+        if unsafe { *(s.ptr + i) != *(prefix.ptr + i) } {
+            return false
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+pub fn str_view_to_lsv(sv: StrView) -> LockStrView {
+    LockStrView { ptr: sv.ptr, len: sv.len }
+}
+
+pub fn lsv_to_str_view(lsv: LockStrView) -> StrView {
+    StrView { ptr: lsv.ptr, len: lsv.len }
+}
+
+@derive(Copy)
+pub struct ApiFingerprint {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn api_fingerprint_zero() -> ApiFingerprint {
+    ApiFingerprint { lo: 0u64, hi: 0u64 }
+}
+
+pub fn api_fingerprint_eq(a: ApiFingerprint, b: ApiFingerprint) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+@derive(Copy)
+pub struct SemanticFingerprint {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn semantic_fingerprint_zero() -> SemanticFingerprint {
+    SemanticFingerprint { lo: 0u64, hi: 0u64 }
+}
+
+pub fn semantic_fingerprint_eq(a: SemanticFingerprint, b: SemanticFingerprint) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+@derive(Copy)
+pub struct AbiFingerprint {
+    pub lo: u64,
+    pub hi: u64,
+}
+
+pub fn abi_fingerprint_zero() -> AbiFingerprint {
+    AbiFingerprint { lo: 0u64, hi: 0u64 }
+}
+
+pub fn abi_fingerprint_eq(a: AbiFingerprint, b: AbiFingerprint) -> bool {
+    a.lo == b.lo && a.hi == b.hi
+}
+
+// =============================================================================
+// 2. Constants & Enums (`AXS-REG-020`..`023`, `AXS-REG-031`)
+// =============================================================================
+
+// Distribution modes per SPEC-112 AXS-REG-020 & SPEC-24 AXS-ART-002
+pub const DIST_MODE_SOURCE: u16 = 1u16
+pub const DIST_MODE_BINARY: u16 = 2u16
+pub const DIST_MODE_HYBRID: u16 = 3u16
+
+// Consumption actions
+pub const ACTION_USE_BINARY: u8 = 1u8
+pub const ACTION_COMPILE_SOURCE: u8 = 2u8
+pub const ACTION_REJECT: u8 = 3u8
+
+// Binary rejection reasons
+pub const REJECT_NONE: u8 = 0u8
+pub const REJECT_TARGET_MISMATCH: u8 = 1u8
+pub const REJECT_ABI_MISMATCH: u8 = 2u8
+pub const REJECT_SIF_MISMATCH: u8 = 3u8
+pub const REJECT_SCHEMA_MISMATCH: u8 = 4u8
+pub const REJECT_DIAMOND_CONFLICT: u8 = 5u8
+pub const REJECT_NO_MATCHING_SLICE: u8 = 6u8
+pub const REJECT_QUARANTINED: u8 = 7u8
+pub const REJECT_DOWNGRADE_BLOCKED: u8 = 8u8
+
+// Trust policy levels (`AXS-REG-031 §2`)
+pub const TRUST_POLICY_UNTRUSTED: u8 = 0u8
+pub const TRUST_POLICY_PUBLIC_STANDARD: u8 = 1u8
+pub const TRUST_POLICY_ENTERPRISE_VERIFIED: u8 = 2u8
+
+// Multi-repo routing result status codes
+pub const ROUTING_OK: u32 = 0u32
+pub const ROUTING_PINNED: u32 = 1u32
+pub const ROUTING_SHADOW_BLOCKED: u32 = 2u32
+pub const ROUTING_NOT_FOUND: u32 = 3u32
+pub const ROUTING_CONFLICTING_PIN: u32 = 4u32
+pub const ROUTING_POLICY_BLOCKED: u32 = 5u32
+
+pub fn dist_mode_name(mode: u16) -> StrView {
+    if mode == DIST_MODE_SOURCE { return dist_sv("source") }
+    if mode == DIST_MODE_BINARY { return dist_sv("binary") }
+    if mode == DIST_MODE_HYBRID { return dist_sv("hybrid") }
+    dist_sv("unknown")
+}
+
+pub fn parse_dist_mode(s: StrView) -> u16 {
+    if dist_sv_eq(s, dist_sv("source")) { return DIST_MODE_SOURCE }
+    if dist_sv_eq(s, dist_sv("binary")) { return DIST_MODE_BINARY }
+    if dist_sv_eq(s, dist_sv("hybrid")) { return DIST_MODE_HYBRID }
+    DIST_MODE_SOURCE
+}
+
+pub fn binary_rejection_name(r: u8) -> StrView {
+    if r == REJECT_NONE { return dist_sv("none") }
+    if r == REJECT_TARGET_MISMATCH { return dist_sv("target_mismatch") }
+    if r == REJECT_ABI_MISMATCH { return dist_sv("abi_mismatch") }
+    if r == REJECT_SIF_MISMATCH { return dist_sv("sif_mismatch") }
+    if r == REJECT_SCHEMA_MISMATCH { return dist_sv("schema_mismatch") }
+    if r == REJECT_DIAMOND_CONFLICT { return dist_sv("diamond_conflict") }
+    if r == REJECT_NO_MATCHING_SLICE { return dist_sv("no_matching_slice") }
+    if r == REJECT_QUARANTINED { return dist_sv("quarantined_package") }
+    if r == REJECT_DOWNGRADE_BLOCKED { return dist_sv("policy_blocked_version") }
+    dist_sv("unknown_rejection")
+}
+
+pub fn trust_policy_name(p: u8) -> StrView {
+    if p == TRUST_POLICY_UNTRUSTED { return dist_sv("untrusted") }
+    if p == TRUST_POLICY_PUBLIC_STANDARD { return dist_sv("public_standard") }
+    if p == TRUST_POLICY_ENTERPRISE_VERIFIED { return dist_sv("enterprise_verified") }
+    dist_sv("unknown")
+}
+
+pub fn trust_policy_from_str(s: StrView) -> u8 {
+    if dist_sv_eq(s, dist_sv("enterprise_verified")) { return TRUST_POLICY_ENTERPRISE_VERIFIED }
+    if dist_sv_eq(s, dist_sv("public_standard")) { return TRUST_POLICY_PUBLIC_STANDARD }
+    TRUST_POLICY_UNTRUSTED
+}
+
+// =============================================================================
+// 3. Data Structures for Binary Packaging & Interface Summary (`AXS-REG-021`..`023`)
+// =============================================================================
+
+@derive(Copy)
+pub struct PrecompiledInterfaceSummary {
+    pub magic: [8]u8,
+    pub schema_version: u16,
+    pub compiler_semantic_version: StrView,
+    pub target_triple: StrView,
+    pub api_fingerprint: ApiFingerprint,
+    pub semantic_interface_fingerprint: SemanticFingerprint,
+    pub abi_fingerprint: AbiFingerprint,
+    pub cpu_feature_mask: u64,
+    pub is_valid: bool,
+}
+
+pub fn precompiled_interface_summary_empty() -> PrecompiledInterfaceSummary {
+    PrecompiledInterfaceSummary {
+        magic: [65u8, 88u8, 77u8, 69u8, 84u8, 65u8, 48u8, 49u8], // "AXMETA01"
+        schema_version: 1u16,
+        compiler_semantic_version: dist_sv("0.1.0"),
+        target_triple: dist_sv("x86_64-windows"),
+        api_fingerprint: ApiFingerprint { lo: 0u64, hi: 0u64 },
+        semantic_interface_fingerprint: SemanticFingerprint { lo: 0u64, hi: 0u64 },
+        abi_fingerprint: AbiFingerprint { lo: 0u64, hi: 0u64 },
+        cpu_feature_mask: 1u64,
+        is_valid: true,
+    }
+}
+
+@derive(Copy)
+pub struct BinarySliceDescriptor {
+    pub target_triple: StrView,
+    pub cpu_variant: StrView,
+    pub cpu_feature_mask: u64,
+    pub lib_rel_path: StrView,
+    pub abi_fingerprint: AbiFingerprint,
+    pub is_dynamic: bool,
+}
+
+pub fn binary_slice_descriptor_empty() -> BinarySliceDescriptor {
+    let e = dist_sv_empty()
+    BinarySliceDescriptor {
+        target_triple: e,
+        cpu_variant: e,
+        cpu_feature_mask: 0u64,
+        lib_rel_path: e,
+        abi_fingerprint: AbiFingerprint { lo: 0u64, hi: 0u64 },
+        is_dynamic: false,
+    }
+}
+
+@derive(Copy)
+pub struct BinaryPackageCatalog {
+    pub package_name: StrView,
+    pub package_version: StrView,
+    pub distribution_mode: u16,
+    pub interface_summary: PrecompiledInterfaceSummary,
+    pub slices: [4]BinarySliceDescriptor,
+    pub slice_count: usize,
+    pub has_source_tree: bool,
+    pub source_entry_path: StrView,
+    pub is_quarantined: bool,
+}
+
+pub fn binary_package_catalog_empty() -> BinaryPackageCatalog {
+    let e = dist_sv_empty()
+    let sl: [4]BinarySliceDescriptor = [
+        binary_slice_descriptor_empty(),
+        binary_slice_descriptor_empty(),
+        binary_slice_descriptor_empty(),
+        binary_slice_descriptor_empty()
+    ]
+    BinaryPackageCatalog {
+        package_name: e,
+        package_version: e,
+        distribution_mode: DIST_MODE_SOURCE,
+        interface_summary: precompiled_interface_summary_empty(),
+        slices: sl,
+        slice_count: 0usize,
+        has_source_tree: true,
+        source_entry_path: dist_sv("src/lib.ax"),
+        is_quarantined: false,
+    }
+}
+
+@derive(Copy)
+pub struct BinaryRejectionDetail {
+    pub reason: u8,
+    pub expected_val: StrView,
+    pub found_val: StrView,
+    pub package_spec: StrView,
+}
+
+pub fn binary_rejection_detail_empty() -> BinaryRejectionDetail {
+    let e = dist_sv_empty()
+    BinaryRejectionDetail {
+        reason: REJECT_NONE,
+        expected_val: e,
+        found_val: e,
+        package_spec: e,
+    }
+}
+
+@derive(Copy)
+pub struct ConsumptionDecision {
+    pub action: u8,
+    pub selected_slice_idx: usize,
+    pub rejection_reason: u8,
+    pub rejection_detail: BinaryRejectionDetail,
+    pub diag_code: u32,
+    pub diag_kind: StrView,
+}
+
+@derive(Copy)
+pub struct RegistryConfig {
+    pub id: StrView,
+    pub url: StrView,
+    pub priority: u32,
+    pub trust_policy: u8,
+    pub pinned_namespaces: [4]StrView,
+    pub pinned_count: usize,
+    pub allow_unsigned: bool,
+}
+
+pub fn registry_config_empty() -> RegistryConfig {
+    let e = dist_sv_empty()
+    let pn: [4]StrView = [e, e, e, e]
+    RegistryConfig {
+        id: e,
+        url: e,
+        priority: 0u32,
+        trust_policy: TRUST_POLICY_PUBLIC_STANDARD,
+        pinned_namespaces: pn,
+        pinned_count: 0usize,
+        allow_unsigned: true,
+    }
+}
+
+@derive(Copy)
+pub struct MultiRepoRoutingTable {
+    pub registries: [4]RegistryConfig,
+    pub registry_count: usize,
+    pub default_registry_id: StrView,
+}
+
+pub fn multi_repo_routing_table_empty() -> MultiRepoRoutingTable {
+    let e = dist_sv_empty()
+    let regs: [4]RegistryConfig = [
+        registry_config_empty(),
+        registry_config_empty(),
+        registry_config_empty(),
+        registry_config_empty()
+    ]
+    MultiRepoRoutingTable {
+        registries: regs,
+        registry_count: 0usize,
+        default_registry_id: dist_sv("default"),
+    }
+}
+
+@derive(Copy)
+pub struct PackageRouteDecision {
+    pub status: u32,
+    pub target_registry_idx: usize,
+    pub target_registry_id: StrView,
+    pub is_pinned: bool,
+    pub shadowing_registry_id: StrView,
+    pub expected_registry_id: StrView,
+}
+
+// =============================================================================
+// 4. Precompiled Binary Slice Verification & Selection (`AXS-REG-021`..`023`)
+// =============================================================================
+
+pub fn popcount_u64(mut v: u64) -> u32 {
+    let mut count: u32 = 0u32
+    while v > 0u64 {
+        count = count + ((v & 1u64) as u32)
+        v = v >> 1u32
+    }
+    count
+}
+
+pub fn verify_slice_compatibility(
+    slice: view<BinarySliceDescriptor>,
+    active_target_triple: StrView,
+    active_cpu_features: u64,
+    active_abi: view<AbiFingerprint>,
+    out_detail: mut_view<BinaryRejectionDetail>
+) -> bool {
+    // 1. Target triple must match exactly
+    if !dist_sv_eq(slice.target_triple, active_target_triple) {
+        out_detail.reason = REJECT_TARGET_MISMATCH
+        out_detail.expected_val = active_target_triple
+        out_detail.found_val = slice.target_triple
+        return false
+    }
+
+    // 2. CPU feature mask requirement: slice.cpu_feature_mask must be subset of active_cpu_features
+    if (slice.cpu_feature_mask & ~active_cpu_features) != 0u64 {
+        out_detail.reason = REJECT_TARGET_MISMATCH
+        out_detail.expected_val = dist_sv("cpu_feature_mask_subset")
+        out_detail.found_val = slice.cpu_variant
+        return false
+    }
+
+    // 3. AbiFingerprint must match exactly
+    if !abi_fingerprint_eq(slice.abi_fingerprint, *active_abi) {
+        out_detail.reason = REJECT_ABI_MISMATCH
+        out_detail.expected_val = dist_sv("abi_fingerprint_match")
+        out_detail.found_val = dist_sv("abi_fingerprint_mismatch")
+        return false
+    }
+
+    true
+}
+
+pub fn select_best_binary_slice(
+    catalog: view<BinaryPackageCatalog>,
+    active_target_triple: StrView,
+    active_cpu_features: u64,
+    active_abi: view<AbiFingerprint>,
+    out_slice_idx: mut_view<usize>,
+    out_detail: mut_view<BinaryRejectionDetail>
+) -> bool {
+    let mut best_idx: usize = 0usize
+    let mut best_popcount: u32 = 0u32
+    let mut found_any = false
+
+    let mut i: usize = 0usize
+    while i < catalog.slice_count && i < 4usize {
+        let sl = catalog.slices[i]
+        let mut detail = binary_rejection_detail_empty()
+        if verify_slice_compatibility(view(sl), active_target_triple, active_cpu_features, active_abi, mut_view(detail)) {
+            let pc = popcount_u64(sl.cpu_feature_mask)
+            if !found_any || pc > best_popcount {
+                best_idx = i
+                best_popcount = pc
+                found_any = true
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found_any {
+        *out_slice_idx = best_idx
+        return true
+    }
+
+    // Set rejection reason from first slice or fallback to no slices
+    if catalog.slice_count > 0usize {
+        let sl0 = catalog.slices[0]
+        let _ = verify_slice_compatibility(view(sl0), active_target_triple, active_cpu_features, active_abi, out_detail)
+    } else {
+        out_detail.reason = REJECT_NO_MATCHING_SLICE
+        out_detail.expected_val = active_target_triple
+        out_detail.found_val = dist_sv("no_slices_available")
+    }
+    false
+}
+
+pub fn decide_package_consumption(
+    catalog: view<BinaryPackageCatalog>,
+    active_target_triple: StrView,
+    active_cpu_features: u64,
+    active_abi: view<AbiFingerprint>,
+    active_sif: view<SemanticFingerprint>,
+    require_binary: bool
+) -> ConsumptionDecision {
+    // 0. Quarantined package check (`AXS-REG-003 §3`, `AXS-REG-050`)
+    if catalog.is_quarantined {
+        let mut det = binary_rejection_detail_empty()
+        det.reason = REJECT_QUARANTINED
+        det.package_spec = catalog.package_name
+        det.found_val = dist_sv("quarantined")
+        return ConsumptionDecision {
+            action: ACTION_REJECT,
+            selected_slice_idx: 0usize,
+            rejection_reason: REJECT_QUARANTINED,
+            rejection_detail: det,
+            diag_code: 129u32, // AX_DRIVER_BAD_MANIFEST
+            diag_kind: dist_sv("quarantined_package"),
+        }
+    }
+
+    // 1. Source-only packages
+    if catalog.distribution_mode == DIST_MODE_SOURCE {
+        return ConsumptionDecision {
+            action: ACTION_COMPILE_SOURCE,
+            selected_slice_idx: 0usize,
+            rejection_reason: REJECT_NONE,
+            rejection_detail: binary_rejection_detail_empty(),
+            diag_code: 0u32,
+            diag_kind: dist_sv_empty(),
+        }
+    }
+
+    // 2. Precompiled .axmeta interface summary validation
+    if !catalog.interface_summary.is_valid {
+        let mut det = binary_rejection_detail_empty()
+        det.reason = REJECT_SCHEMA_MISMATCH
+        det.found_val = dist_sv("invalid_axmeta_summary")
+        return ConsumptionDecision {
+            action: ACTION_REJECT,
+            selected_slice_idx: 0usize,
+            rejection_reason: REJECT_SCHEMA_MISMATCH,
+            rejection_detail: det,
+            diag_code: 115u32, // AX_LINK_BAD_OBJECT / AX_LINK_BAD_ARTIFACT
+            diag_kind: dist_sv("bad_interface_container"),
+        }
+    }
+
+    // SIF check: if SIF is recorded and non-zero, it must match active_sif
+    if active_sif.lo != 0u64 || active_sif.hi != 0u64 {
+        if !semantic_fingerprint_eq(catalog.interface_summary.semantic_interface_fingerprint, *active_sif) {
+            let mut det = binary_rejection_detail_empty()
+            det.reason = REJECT_SIF_MISMATCH
+            det.expected_val = dist_sv("sif_match")
+            det.found_val = dist_sv("sif_mismatch")
+            if catalog.distribution_mode == DIST_MODE_HYBRID && !require_binary && catalog.has_source_tree {
+                return ConsumptionDecision {
+                    action: ACTION_COMPILE_SOURCE,
+                    selected_slice_idx: 0usize,
+                    rejection_reason: REJECT_SIF_MISMATCH,
+                    rejection_detail: det,
+                    diag_code: 0u32,
+                    diag_kind: dist_sv("hybrid_sif_fallback_source"),
+                }
+            }
+            return ConsumptionDecision {
+                action: ACTION_REJECT,
+                selected_slice_idx: 0usize,
+                rejection_reason: REJECT_SIF_MISMATCH,
+                rejection_detail: det,
+                diag_code: 129u32,
+                diag_kind: dist_sv("sif_mismatch"),
+            }
+        }
+    }
+
+    // 3. Try to select compatible binary slice
+    let mut selected_idx: usize = 0usize
+    let mut rej_detail = binary_rejection_detail_empty()
+    let slice_ok = select_best_binary_slice(
+        catalog,
+        active_target_triple,
+        active_cpu_features,
+        active_abi,
+        mut_view(selected_idx),
+        mut_view(rej_detail)
+    )
+
+    if slice_ok {
+        // Source-free consumption of precompiled binary package!
+        return ConsumptionDecision {
+            action: ACTION_USE_BINARY,
+            selected_slice_idx: selected_idx,
+            rejection_reason: REJECT_NONE,
+            rejection_detail: binary_rejection_detail_empty(),
+            diag_code: 0u32,
+            diag_kind: dist_sv_empty(),
+        }
+    }
+
+    // 4. Binary slice failed: handle Hybrid vs Binary mode
+    if catalog.distribution_mode == DIST_MODE_HYBRID && !require_binary && catalog.has_source_tree {
+        // Deterministic fallback to compiling from bundled .ax source tree
+        return ConsumptionDecision {
+            action: ACTION_COMPILE_SOURCE,
+            selected_slice_idx: 0usize,
+            rejection_reason: rej_detail.reason,
+            rejection_detail: rej_detail,
+            diag_code: 0u32,
+            diag_kind: dist_sv("hybrid_fallback_to_source"),
+        }
+    }
+
+    // Binary-only package or --require-binary: MUST reject and fail before linking
+    let mut code: u32 = 129u32 // AX_DRIVER_BAD_MANIFEST
+    let mut kind = dist_sv("binary_rejection")
+    if rej_detail.reason == REJECT_TARGET_MISMATCH {
+        code = 124u32 // AX_DRIVER_UNKNOWN_TARGET / AX_LINK_ARTIFACT_TARGET_MISMATCH
+        kind = dist_sv("target_mismatch")
+    } else if rej_detail.reason == REJECT_ABI_MISMATCH {
+        code = 129u32
+        kind = dist_sv("abi_mismatch")
+    } else if rej_detail.reason == REJECT_NO_MATCHING_SLICE {
+        code = 124u32
+        kind = dist_sv("no_matching_slice")
+    }
+
+    ConsumptionDecision {
+        action: ACTION_REJECT,
+        selected_slice_idx: 0usize,
+        rejection_reason: rej_detail.reason,
+        rejection_detail: rej_detail,
+        diag_code: code,
+        diag_kind: kind,
+    }
+}
+
+// =============================================================================
+// 5. Multi-Repository Priority Routing & Namespace Pinning (`AXS-REG-031`)
+// =============================================================================
+
+pub fn routing_table_add_registry(
+    table: mut_view<MultiRepoRoutingTable>,
+    reg: view<RegistryConfig>,
+    out_diag_kind: mut_view<StrView>
+) -> bool {
+    if table.registry_count >= 4usize {
+        return false
+    }
+
+    // SPEC-112 §AXS-REG-031 §1:
+    // "Duplicate pinned_namespaces claims across two distinct non-mirror registries
+    // in the same configuration are rejected upfront with AX_DRIVER_BAD_MANIFEST
+    // (data.kind = 'conflicting_namespace_pin')."
+    let mut i: usize = 0usize
+    while i < table.registry_count {
+        let existing = table.registries[i]
+        if !dist_sv_eq(existing.id, reg.id) {
+            let mut j: usize = 0usize
+            while j < reg.pinned_count && j < 4usize {
+                let candidate_pin = reg.pinned_namespaces[j]
+                let mut k: usize = 0usize
+                while k < existing.pinned_count && k < 4usize {
+                    if dist_sv_eq(existing.pinned_namespaces[k], candidate_pin) {
+                        *out_diag_kind = dist_sv("conflicting_namespace_pin")
+                        return false
+                    }
+                    k = k + 1usize
+                }
+                j = j + 1usize
+            }
+        }
+        i = i + 1usize
+    }
+
+    table.registries[table.registry_count] = *reg
+    table.registry_count = table.registry_count + 1usize
+    true
+}
+
+pub fn check_shadow_defense(
+    table: view<MultiRepoRoutingTable>,
+    candidate_reg_id: StrView,
+    namespace: StrView,
+    pkg_name: StrView,
+    out_expected_reg: mut_view<StrView>
+) -> bool {
+    // If `namespace` is in `pinned_namespaces` of any registry R_pin,
+    // candidate_reg_id MUST match R_pin.id!
+    let mut i: usize = 0usize
+    while i < table.registry_count && i < 4usize {
+        let reg = table.registries[i]
+        let mut j: usize = 0usize
+        while j < reg.pinned_count && j < 4usize {
+            if dist_sv_eq(reg.pinned_namespaces[j], namespace) {
+                if !dist_sv_eq(reg.id, candidate_reg_id) {
+                    *out_expected_reg = reg.id
+                    return false // SHADOWING BLOCKED! Dependency-confusion defense.
+                }
+                return true // Candidate is the authorized pinned registry.
+            }
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+    // Namespace is unpinned
+    true
+}
+
+pub fn route_package_lookup(
+    table: view<MultiRepoRoutingTable>,
+    namespace: StrView,
+    pkg_name: StrView
+) -> PackageRouteDecision {
+    let e = dist_sv_empty()
+    // 1. Check if namespace is pinned to any registry
+    let mut i: usize = 0usize
+    while i < table.registry_count && i < 4usize {
+        let reg = table.registries[i]
+        let mut j: usize = 0usize
+        while j < reg.pinned_count && j < 4usize {
+            if dist_sv_eq(reg.pinned_namespaces[j], namespace) {
+                return PackageRouteDecision {
+                    status: ROUTING_PINNED,
+                    target_registry_idx: i,
+                    target_registry_id: reg.id,
+                    is_pinned: true,
+                    shadowing_registry_id: e,
+                    expected_registry_id: reg.id,
+                }
+            }
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+
+    // 2. Unpinned namespace: route by numeric priority (descending) among registries satisfying trust policy
+    let mut best_idx: usize = 0usize
+    let mut best_prio: u32 = 0u32
+    let mut found_any = false
+
+    i = 0usize
+    while i < table.registry_count && i < 4usize {
+        let reg = table.registries[i]
+        if reg.trust_policy >= TRUST_POLICY_PUBLIC_STANDARD {
+            if !found_any || reg.priority > best_prio {
+                best_idx = i
+                best_prio = reg.priority
+                found_any = true
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found_any {
+        return PackageRouteDecision {
+            status: ROUTING_OK,
+            target_registry_idx: best_idx,
+            target_registry_id: table.registries[best_idx].id,
+            is_pinned: false,
+            shadowing_registry_id: e,
+            expected_registry_id: e,
+        }
+    }
+
+    // No eligible registry found
+    PackageRouteDecision {
+        status: ROUTING_NOT_FOUND,
+        target_registry_idx: 0usize,
+        target_registry_id: e,
+        is_pinned: false,
+        shadowing_registry_id: e,
+        expected_registry_id: e,
+    }
+}
+
+// =============================================================================
+// 6. Diagnostics Reporting Helper (`AXS-REG-050`)
+// =============================================================================
+
+fn make_sv_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_distribution_diag(
+    sink: mut_view<DiagSink>,
+    code_val: u32,
+    msg: str,
+    kind_name: str,
+    key1: str,
+    val1: StrView,
+    key2: str,
+    val2: StrView
+) {
+    let mut d = diag_new(diag_code(code_val), span_none(), dist_sv(msg))
+    let mut entries: [3]DiagDataEntry = [
+        make_sv_entry(dist_sv("kind"), dist_sv(kind_name)),
+        make_sv_entry(dist_sv(key1), val1),
+        make_sv_entry(dist_sv(key2), val2),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 3usize
+    diag_sink_report(mut_view(*sink), view(d))
+}

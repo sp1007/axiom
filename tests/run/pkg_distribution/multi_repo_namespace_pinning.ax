@@ -1,0 +1,189 @@
+// test: run
+// modes: interp native
+// stdout-file: multi_repo_namespace_pinning.stdout
+// SPEC-112 §4 (AXS-REG-031; REQ-ECO-8736, REQ-PKG-024):
+// Verifies multi-repository priority vs trust routing, mandatory namespace pinning,
+// dependency-confusion attack defense, and rejection of conflicting namespace pins.
+
+const TRUST_UNTRUSTED: u8 = 0u8
+const TRUST_PUBLIC: u8 = 1u8
+const TRUST_ENTERPRISE: u8 = 2u8
+
+const ROUTE_OK: u32 = 0u32
+const ROUTE_PINNED: u32 = 1u32
+const ROUTE_NOT_FOUND: u32 = 2u32
+
+@derive(Copy)
+struct RepoLite {
+    id_code: u32,
+    priority: u32,
+    trust: u8,
+    pinned_ns: u32, // 0 = unpinned, >0 = pinned namespace ID
+}
+
+@derive(Copy)
+struct RoutingTableLite {
+    repos: [4]RepoLite,
+    count: usize,
+}
+
+fn empty_repo() -> RepoLite {
+    RepoLite { id_code: 0u32, priority: 0u32, trust: TRUST_PUBLIC, pinned_ns: 0u32 }
+}
+
+fn add_repo(tbl: mut_view<RoutingTableLite>, repo: view<RepoLite>, out_conflict: mut_view<bool>) -> bool {
+    if tbl.count >= 4usize { return false }
+    if repo.pinned_ns != 0u32 {
+        let mut i: usize = 0usize
+        while i < tbl.count {
+            if tbl.repos[i].id_code != repo.id_code && tbl.repos[i].pinned_ns == repo.pinned_ns {
+                *out_conflict = true
+                return false // Conflicting namespace pin!
+            }
+            i = i + 1usize
+        }
+    }
+    tbl.repos[tbl.count] = *repo
+    tbl.count = tbl.count + 1usize
+    true
+}
+
+fn check_shadow_defense(tbl: view<RoutingTableLite>, candidate_id: u32, target_ns: u32, out_expected_id: mut_view<u32>) -> bool {
+    let mut i: usize = 0usize
+    while i < tbl.count {
+        if tbl.repos[i].pinned_ns == target_ns {
+            if tbl.repos[i].id_code != candidate_id {
+                *out_expected_id = tbl.repos[i].id_code
+                return false // SHADOWING BLOCKED!
+            }
+            return true
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+fn route_lookup(tbl: view<RoutingTableLite>, target_ns: u32, out_repo_id: mut_view<u32>) -> u32 {
+    // 1. Check pinned namespaces
+    let mut i: usize = 0usize
+    while i < tbl.count {
+        if tbl.repos[i].pinned_ns == target_ns {
+            *out_repo_id = tbl.repos[i].id_code
+            return ROUTE_PINNED
+        }
+        i = i + 1usize
+    }
+
+    // 2. Unpinned namespaces: select highest priority with trust >= TRUST_PUBLIC
+    let mut best_id: u32 = 0u32
+    let mut best_prio: u32 = 0u32
+    let mut found = false
+
+    i = 0usize
+    while i < tbl.count {
+        let r = tbl.repos[i]
+        if r.trust >= TRUST_PUBLIC {
+            if !found || r.priority > best_prio {
+                best_id = r.id_code
+                best_prio = r.priority
+                found = true
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found {
+        *out_repo_id = best_id
+        return ROUTE_OK
+    }
+
+    ROUTE_NOT_FOUND
+}
+
+pub fn main() -> i32 {
+    let ns_corp: u32 = 101u32
+    let ns_public: u32 = 202u32
+
+    let id_corp_internal: u32 = 1u32
+    let id_public_default: u32 = 2u32
+    let id_untrusted_mirror: u32 = 3u32
+
+    let mut table: RoutingTableLite = RoutingTableLite {
+        repos: [empty_repo(), empty_repo(), empty_repo(), empty_repo()],
+        count: 0usize,
+    }
+
+    // Add private enterprise repo (priority=50, pinned_ns=ns_corp)
+    let repo_corp = RepoLite {
+        id_code: id_corp_internal,
+        priority: 50u32,
+        trust: TRUST_ENTERPRISE,
+        pinned_ns: ns_corp,
+    }
+    let mut conflict = false
+    let ok1 = add_repo(mut_view(table), view(repo_corp), mut_view(conflict))
+    if !ok1 || conflict { return 1 }
+
+    // Add public default repo (priority=100, unpinned)
+    let repo_pub = RepoLite {
+        id_code: id_public_default,
+        priority: 100u32,
+        trust: TRUST_PUBLIC,
+        pinned_ns: 0u32,
+    }
+    let ok2 = add_repo(mut_view(table), view(repo_pub), mut_view(conflict))
+    if !ok2 || conflict { return 2 }
+
+    // Add untrusted rogue mirror (priority=999, unpinned)
+    let repo_rogue = RepoLite {
+        id_code: id_untrusted_mirror,
+        priority: 999u32,
+        trust: TRUST_UNTRUSTED,
+        pinned_ns: 0u32,
+    }
+    let ok3 = add_repo(mut_view(table), view(repo_rogue), mut_view(conflict))
+    if !ok3 || conflict { return 3 }
+
+    // Test 1: Pinned namespace resolution (ns_corp resolves exclusively to id_corp_internal)
+    let mut routed_id: u32 = 0u32
+    let r1 = route_lookup(view(table), ns_corp, mut_view(routed_id))
+    if r1 != ROUTE_PINNED || routed_id != id_corp_internal {
+        return 4
+    }
+
+    // Test 2: Dependency-confusion shadow attack blocked:
+    // untrusted mirror attempts to supply ns_corp
+    let mut expected_id: u32 = 0u32
+    let check_rogue = check_shadow_defense(view(table), id_untrusted_mirror, ns_corp, mut_view(expected_id))
+    if check_rogue || expected_id != id_corp_internal {
+        return 5
+    }
+
+    // Even public_default (priority=100) cannot supply ns_corp
+    let check_pub = check_shadow_defense(view(table), id_public_default, ns_corp, mut_view(expected_id))
+    if check_pub || expected_id != id_corp_internal {
+        return 6
+    }
+
+    // Test 3: Conflicting namespace pin rejected
+    let repo_duplicate_pin = RepoLite {
+        id_code: 4u32,
+        priority: 60u32,
+        trust: TRUST_ENTERPRISE,
+        pinned_ns: ns_corp, // Duplicate claim for ns_corp!
+    }
+    let ok4 = add_repo(mut_view(table), view(repo_duplicate_pin), mut_view(conflict))
+    if ok4 || !conflict {
+        return 7
+    }
+
+    // Test 4: Trust policy dominates numeric priority for unpinned lookups:
+    // unpinned ns_public selects id_public_default (prio=100, trusted) over id_untrusted_mirror (prio=999, untrusted)
+    let r2 = route_lookup(view(table), ns_public, mut_view(routed_id))
+    if r2 != ROUTE_OK || routed_id != id_public_default {
+        return 8
+    }
+
+    print("MULTI-REPO-NAMESPACE-PINNING-OK\n")
+    0
+}

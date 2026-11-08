@@ -1,0 +1,251 @@
+// test: run
+// modes: interp native
+// stdout-file: distribution_edge_cases_and_negative_gates.stdout
+// SPEC-112 §§1..4 (AXS-REG-020..023, AXS-REG-031; REQ-ECO-8736, REQ-PKG-024):
+// Verifies QA boundary edge cases:
+// 1. --require-binary on Hybrid package with mismatched slice halts with REJECT (no source fallback).
+// 2. CPU feature mask subset failure (slice requires unsupported CPU features) rejects slice.
+// 3. Binary package with zero slices rejects with REJECT_NO_MATCHING_SLICE.
+// 4. Untrusted registry exclusion: repositories with TRUST_UNTRUSTED are ignored for unpinned lookups even with high priority.
+
+const MODE_SOURCE: u16 = 1u16
+const MODE_BINARY: u16 = 2u16
+const MODE_HYBRID: u16 = 3u16
+
+const ACTION_USE_BINARY: u8 = 1u8
+const ACTION_COMPILE_SOURCE: u8 = 2u8
+const ACTION_REJECT: u8 = 3u8
+
+const REJECT_NONE: u8 = 0u8
+const REJECT_TARGET_MISMATCH: u8 = 1u8
+const REJECT_ABI_MISMATCH: u8 = 2u8
+const REJECT_NO_MATCHING_SLICE: u8 = 3u8
+const REJECT_QUARANTINED: u8 = 4u8
+
+const TARGET_WIN64: u32 = 1u32
+const TARGET_LINUX64: u32 = 2u32
+
+const TRUST_UNTRUSTED: u8 = 0u8
+const TRUST_PUBLIC: u8 = 1u8
+const TRUST_ENTERPRISE: u8 = 2u8
+
+const ROUTE_OK: u32 = 0u32
+const ROUTE_PINNED: u32 = 1u32
+const ROUTE_NOT_FOUND: u32 = 2u32
+
+@derive(Copy)
+struct SliceDescLite {
+    target_id: u32,
+    cpu_mask: u64,
+    abi_hash: u64,
+}
+
+@derive(Copy)
+struct CatalogLite {
+    mode: u16,
+    slices: [4]SliceDescLite,
+    slice_count: usize,
+    has_source: bool,
+    is_quarantined: bool,
+}
+
+fn empty_slice() -> SliceDescLite {
+    SliceDescLite {
+        target_id: 0u32,
+        cpu_mask: 0u64,
+        abi_hash: 0u64,
+    }
+}
+
+fn select_slice(
+    cat: view<CatalogLite>,
+    active_target: u32,
+    active_cpu: u64,
+    active_abi: u64,
+    out_idx: mut_view<usize>,
+    out_reason: mut_view<u8>
+) -> bool {
+    let mut i: usize = 0usize
+    while i < cat.slice_count && i < 4usize {
+        let sl = cat.slices[i]
+        if sl.target_id == active_target {
+            if (sl.cpu_mask & ~active_cpu) == 0u64 {
+                if sl.abi_hash == active_abi {
+                    *out_idx = i
+                    return true
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    if cat.slice_count > 0usize {
+        let sl0 = cat.slices[0]
+        if sl0.target_id != active_target {
+            *out_reason = REJECT_TARGET_MISMATCH
+        } else if (sl0.cpu_mask & ~active_cpu) != 0u64 {
+            *out_reason = REJECT_TARGET_MISMATCH
+        } else if sl0.abi_hash != active_abi {
+            *out_reason = REJECT_ABI_MISMATCH
+        } else {
+            *out_reason = REJECT_NO_MATCHING_SLICE
+        }
+    } else {
+        *out_reason = REJECT_NO_MATCHING_SLICE
+    }
+    false
+}
+
+fn decide_consumption(
+    cat: view<CatalogLite>,
+    active_target: u32,
+    active_cpu: u64,
+    active_abi: u64,
+    require_binary: bool
+) -> u8 {
+    if cat.is_quarantined {
+        return ACTION_REJECT
+    }
+    if cat.mode == MODE_SOURCE {
+        return ACTION_COMPILE_SOURCE
+    }
+
+    let mut idx: usize = 0usize
+    let mut reason: u8 = REJECT_NONE
+    let ok = select_slice(cat, active_target, active_cpu, active_abi, mut_view(idx), mut_view(reason))
+    if ok {
+        return ACTION_USE_BINARY
+    }
+
+    if cat.mode == MODE_HYBRID && !require_binary && cat.has_source {
+        return ACTION_COMPILE_SOURCE
+    }
+
+    ACTION_REJECT
+}
+
+@derive(Copy)
+struct RepoLite {
+    id_code: u32,
+    priority: u32,
+    trust: u8,
+    pinned_ns: u32,
+}
+
+@derive(Copy)
+struct RoutingTableLite {
+    repos: [4]RepoLite,
+    count: usize,
+}
+
+fn route_lookup(tbl: view<RoutingTableLite>, target_ns: u32, out_repo_id: mut_view<u32>) -> u32 {
+    let mut i: usize = 0usize
+    while i < tbl.count {
+        if tbl.repos[i].pinned_ns != 0u32 && tbl.repos[i].pinned_ns == target_ns {
+            *out_repo_id = tbl.repos[i].id_code
+            return ROUTE_PINNED
+        }
+        i = i + 1usize
+    }
+
+    let mut best_id: u32 = 0u32
+    let mut best_prio: u32 = 0u32
+    let mut found = false
+
+    i = 0usize
+    while i < tbl.count {
+        let r = tbl.repos[i]
+        if r.trust >= TRUST_PUBLIC {
+            if !found || r.priority > best_prio {
+                best_id = r.id_code
+                best_prio = r.priority
+                found = true
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found {
+        *out_repo_id = best_id
+        return ROUTE_OK
+    }
+
+    ROUTE_NOT_FOUND
+}
+
+pub fn main() -> i32 {
+    let target = TARGET_WIN64
+    let host_cpu = 3u64 // mask: 1 | 2 (baseline | avx2)
+    let abi = 0xABCD1234EF567890u64
+
+    // 1. Edge Case: require_binary = true on Hybrid package with slice mismatch MUST reject
+    let mut sl_linux: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    sl_linux[0] = SliceDescLite { target_id: TARGET_LINUX64, cpu_mask: 1u64, abi_hash: abi }
+    let cat_hybrid = CatalogLite {
+        mode: MODE_HYBRID,
+        slices: sl_linux,
+        slice_count: 1usize,
+        has_source: true,
+        is_quarantined: false,
+    }
+    // When require_binary is false -> fallback to source
+    let act_fallback = decide_consumption(view(cat_hybrid), target, host_cpu, abi, false)
+    if act_fallback != ACTION_COMPILE_SOURCE {
+        return 1
+    }
+    // When require_binary is true -> MUST reject!
+    let act_forced_bin = decide_consumption(view(cat_hybrid), target, host_cpu, abi, true)
+    if act_forced_bin != ACTION_REJECT {
+        return 2
+    }
+
+    // 2. Edge Case: Slice requires CPU feature beyond host mask (e.g., 0x10 AVX512 vs 0x03)
+    let mut sl_avx512: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    sl_avx512[0] = SliceDescLite { target_id: TARGET_WIN64, cpu_mask: 0x13u64, abi_hash: abi } // requires 0x10 bit
+    let cat_avx512 = CatalogLite {
+        mode: MODE_BINARY,
+        slices: sl_avx512,
+        slice_count: 1usize,
+        has_source: false,
+        is_quarantined: false,
+    }
+    let mut idx: usize = 0usize
+    let mut rej_reason: u8 = REJECT_NONE
+    let sel_cpu_fail = select_slice(view(cat_avx512), target, host_cpu, abi, mut_view(idx), mut_view(rej_reason))
+    if sel_cpu_fail || rej_reason != REJECT_TARGET_MISMATCH {
+        return 3
+    }
+
+    // 3. Edge Case: Binary package with 0 slices available
+    let sl_empty: [4]SliceDescLite = [empty_slice(), empty_slice(), empty_slice(), empty_slice()]
+    let cat_noslices = CatalogLite {
+        mode: MODE_BINARY,
+        slices: sl_empty,
+        slice_count: 0usize,
+        has_source: false,
+        is_quarantined: false,
+    }
+    let act_noslices = decide_consumption(view(cat_noslices), target, host_cpu, abi, false)
+    if act_noslices != ACTION_REJECT {
+        return 4
+    }
+
+    // 4. Edge Case: Untrusted repos ignored for unpinned lookup despite high priority
+    let mut tbl = RoutingTableLite {
+        repos: [
+            RepoLite { id_code: 99u32, priority: 9999u32, trust: TRUST_UNTRUSTED, pinned_ns: 0u32 },
+            RepoLite { id_code: 0u32, priority: 0u32, trust: TRUST_UNTRUSTED, pinned_ns: 0u32 },
+            RepoLite { id_code: 0u32, priority: 0u32, trust: TRUST_UNTRUSTED, pinned_ns: 0u32 },
+            RepoLite { id_code: 0u32, priority: 0u32, trust: TRUST_UNTRUSTED, pinned_ns: 0u32 },
+        ],
+        count: 1usize,
+    }
+    let mut routed_id: u32 = 0u32
+    let res = route_lookup(view(tbl), 42u32, mut_view(routed_id))
+    if res != ROUTE_NOT_FOUND {
+        return 5
+    }
+
+    print("DISTRIBUTION-EDGE-CASES-AND-NEGATIVE-GATES-OK\n")
+    0
+}

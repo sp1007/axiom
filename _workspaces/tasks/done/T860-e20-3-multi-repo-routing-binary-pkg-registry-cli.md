@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T858, T859]
 priority: 210
-status: doing
+status: done
 attempts: 1
 paths: [compiler/pkg/distribution, compiler/driver/registry_cmd, tests/run/pkg_distribution]
 spec: [spec/SPEC-112-package-registry-distribution.md, spec/SPEC-24-artifact-format-module-interfaces.md, tasks/0665, tasks/0739, tasks/0858, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-024]
 started: 2026-11-09 02:29:55
-agent: T860-impl
+finished: 2026-11-09 03:28:49
 ---
 # T860 — E20.3 Multi-repository priority/trust routing, precompiled .axmeta/binary package consumption & axiomc pkg publish/fetch/mirror CLI
 
@@ -44,3 +44,4 @@ Implement multi-repository priority/trust routing, precompiled `.axmeta` interfa
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-09 02:29:55 started (attempt 1) T860-impl
+- 2026-11-09 03:28:49 accepted by QA -> done

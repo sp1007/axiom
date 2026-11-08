@@ -1,0 +1,509 @@
+// Direct multi-module verification probe for `compiler.pkg.distribution` and `compiler.driver.registry_cmd`
+// (T860 / E20.3: SPEC-112 §§1..5, REQ-ECO-8736, REQ-PKG-024, INV-REG-002).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.diag_sink_new
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+
+use compiler.pkg.distribution.dist_sv
+use compiler.pkg.distribution.dist_sv_empty
+use compiler.pkg.distribution.dist_sv_eq
+use compiler.pkg.distribution.dist_sv_starts_with
+use compiler.pkg.distribution.ApiFingerprint
+use compiler.pkg.distribution.SemanticFingerprint
+use compiler.pkg.distribution.AbiFingerprint
+
+use compiler.pkg.distribution.DIST_MODE_SOURCE
+use compiler.pkg.distribution.DIST_MODE_BINARY
+use compiler.pkg.distribution.DIST_MODE_HYBRID
+use compiler.pkg.distribution.ACTION_USE_BINARY
+use compiler.pkg.distribution.ACTION_COMPILE_SOURCE
+use compiler.pkg.distribution.ACTION_REJECT
+use compiler.pkg.distribution.REJECT_NONE
+use compiler.pkg.distribution.REJECT_TARGET_MISMATCH
+use compiler.pkg.distribution.REJECT_ABI_MISMATCH
+use compiler.pkg.distribution.REJECT_SIF_MISMATCH
+use compiler.pkg.distribution.REJECT_SCHEMA_MISMATCH
+use compiler.pkg.distribution.REJECT_NO_MATCHING_SLICE
+use compiler.pkg.distribution.REJECT_QUARANTINED
+use compiler.pkg.distribution.TRUST_POLICY_UNTRUSTED
+use compiler.pkg.distribution.TRUST_POLICY_PUBLIC_STANDARD
+use compiler.pkg.distribution.TRUST_POLICY_ENTERPRISE_VERIFIED
+use compiler.pkg.distribution.ROUTING_OK
+use compiler.pkg.distribution.ROUTING_PINNED
+use compiler.pkg.distribution.PrecompiledInterfaceSummary
+use compiler.pkg.distribution.precompiled_interface_summary_empty
+use compiler.pkg.distribution.BinarySliceDescriptor
+use compiler.pkg.distribution.binary_slice_descriptor_empty
+use compiler.pkg.distribution.BinaryPackageCatalog
+use compiler.pkg.distribution.binary_package_catalog_empty
+use compiler.pkg.distribution.BinaryRejectionDetail
+use compiler.pkg.distribution.binary_rejection_detail_empty
+use compiler.pkg.distribution.ConsumptionDecision
+use compiler.pkg.distribution.RegistryConfig
+use compiler.pkg.distribution.registry_config_empty
+use compiler.pkg.distribution.MultiRepoRoutingTable
+use compiler.pkg.distribution.multi_repo_routing_table_empty
+use compiler.pkg.distribution.PackageRouteDecision
+use compiler.pkg.distribution.popcount_u64
+use compiler.pkg.distribution.verify_slice_compatibility
+use compiler.pkg.distribution.select_best_binary_slice
+use compiler.pkg.distribution.decide_package_consumption
+use compiler.pkg.distribution.routing_table_add_registry
+use compiler.pkg.distribution.check_shadow_defense
+use compiler.pkg.distribution.route_package_lookup
+
+use compiler.driver.registry_cmd.REG_CMD_PUBLISH
+use compiler.driver.registry_cmd.REG_CMD_FETCH
+use compiler.driver.registry_cmd.REG_CMD_VERIFY
+use compiler.driver.registry_cmd.REG_CMD_SEARCH
+use compiler.driver.registry_cmd.REG_CMD_MIRROR
+use compiler.driver.registry_cmd.REG_CMD_ROLLBACK
+use compiler.driver.registry_cmd.REG_EXIT_OK
+use compiler.driver.registry_cmd.REG_EXIT_ERROR
+use compiler.driver.registry_cmd.RegistryCmdOptions
+use compiler.driver.registry_cmd.registry_cmd_options_empty
+use compiler.driver.registry_cmd.execute_pkg_publish
+use compiler.driver.registry_cmd.execute_pkg_fetch
+use compiler.driver.registry_cmd.execute_pkg_verify
+use compiler.driver.registry_cmd.execute_pkg_search
+use compiler.driver.registry_cmd.execute_pkg_mirror
+use compiler.driver.registry_cmd.execute_pkg_rollback
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lock_semver_zero
+use std.pkg.archive.Sha256Digest
+use std.pkg.archive.sha256_digest_zero
+use std.pkg.registry.RegistryStore
+use std.pkg.registry.registry_store_init
+
+fn out_str(s: str) {
+    let sv = dist_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+pub fn main() -> i32 {
+    let active_win64 = dist_sv("x86_64-windows")
+    let active_linux64 = dist_sv("x86_64-linux")
+    let active_cpu: u64 = 3u64 // Bits 0 and 1 set (e.g. baseline | avx2)
+    let abi_good = AbiFingerprint { lo: 0x1122334455667788u64, hi: 0x99AABBCCDDEEFF00u64 }
+    let abi_bad = AbiFingerprint { lo: 0xDEADBEEF00000000u64, hi: 0x00000000CAFEBABEu64 }
+    let sif_zero = SemanticFingerprint { lo: 0u64, hi: 0u64 }
+
+    // =========================================================================
+    // 1. Probe `compiler.pkg.distribution` (Binary Consumption Engine)
+    // =========================================================================
+
+    // Case 1.1: Multi-target variant selection: popcount specificity
+    // Slice 0: baseline (mask=1), Slice 1: avx2 (mask=3)
+    let mut cat_multi = binary_package_catalog_empty()
+    cat_multi.package_name = dist_sv("axiom/crypto")
+    cat_multi.package_version = dist_sv("1.4.2")
+    cat_multi.distribution_mode = DIST_MODE_BINARY
+    cat_multi.slices[0] = BinarySliceDescriptor {
+        target_triple: active_win64,
+        cpu_variant: dist_sv("baseline"),
+        cpu_feature_mask: 1u64,
+        lib_rel_path: dist_sv("targets/x86_64-windows/baseline/libcrypto.axlib"),
+        abi_fingerprint: abi_good,
+        is_dynamic: false,
+    }
+    cat_multi.slices[1] = BinarySliceDescriptor {
+        target_triple: active_win64,
+        cpu_variant: dist_sv("avx2"),
+        cpu_feature_mask: 3u64,
+        lib_rel_path: dist_sv("targets/x86_64-windows/avx2/libcrypto.axlib"),
+        abi_fingerprint: abi_good,
+        is_dynamic: false,
+    }
+    cat_multi.slice_count = 2usize
+
+    let mut sel_idx: usize = 0usize
+    let mut rej_det = binary_rejection_detail_empty()
+    let sel_ok = select_best_binary_slice(
+        view(cat_multi),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        mut_view(sel_idx),
+        mut_view(rej_det)
+    )
+    let dec_bin = decide_package_consumption(
+        view(cat_multi),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        view(sif_zero),
+        false
+    )
+    let binary_slice_selected = sel_ok && sel_idx == 1usize && dec_bin.action == ACTION_USE_BINARY
+
+    // Case 1.2: Target mismatch rejection (Linux slice requested on Windows)
+    let mut cat_linux = binary_package_catalog_empty()
+    cat_linux.package_name = dist_sv("axiom/net")
+    cat_linux.distribution_mode = DIST_MODE_BINARY
+    cat_linux.slices[0] = BinarySliceDescriptor {
+        target_triple: active_linux64,
+        cpu_variant: dist_sv("baseline"),
+        cpu_feature_mask: 1u64,
+        lib_rel_path: dist_sv("targets/x86_64-linux/baseline/libnet.axlib"),
+        abi_fingerprint: abi_good,
+        is_dynamic: false,
+    }
+    cat_linux.slice_count = 1usize
+
+    let dec_target_err = decide_package_consumption(
+        view(cat_linux),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        view(sif_zero),
+        false
+    )
+    let target_mismatch_rejected = dec_target_err.action == ACTION_REJECT &&
+        dec_target_err.rejection_reason == REJECT_TARGET_MISMATCH
+
+    // Case 1.3: ABI mismatch rejection
+    let mut cat_abi_err = binary_package_catalog_empty()
+    cat_abi_err.package_name = dist_sv("corp/codec")
+    cat_abi_err.distribution_mode = DIST_MODE_BINARY
+    cat_abi_err.slices[0] = BinarySliceDescriptor {
+        target_triple: active_win64,
+        cpu_variant: dist_sv("baseline"),
+        cpu_feature_mask: 1u64,
+        lib_rel_path: dist_sv("targets/x86_64-windows/baseline/libcodec.axlib"),
+        abi_fingerprint: abi_bad, // ABI mismatch!
+        is_dynamic: false,
+    }
+    cat_abi_err.slice_count = 1usize
+
+    let dec_abi_err = decide_package_consumption(
+        view(cat_abi_err),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        view(sif_zero),
+        false
+    )
+    let abi_mismatch_rejected = dec_abi_err.action == ACTION_REJECT &&
+        dec_abi_err.rejection_reason == REJECT_ABI_MISMATCH
+
+    // Case 1.4: Hybrid fallback to source when binary slice fails
+    let mut cat_hybrid = binary_package_catalog_empty()
+    cat_hybrid.package_name = dist_sv("axiom/math")
+    cat_hybrid.distribution_mode = DIST_MODE_HYBRID
+    cat_hybrid.has_source_tree = true
+    cat_hybrid.slices[0] = BinarySliceDescriptor {
+        target_triple: active_linux64, // Linux only, won't match Windows
+        cpu_variant: dist_sv("baseline"),
+        cpu_feature_mask: 1u64,
+        lib_rel_path: dist_sv("targets/x86_64-linux/baseline/libmath.axlib"),
+        abi_fingerprint: abi_good,
+        is_dynamic: false,
+    }
+    cat_hybrid.slice_count = 1usize
+
+    let dec_hybrid = decide_package_consumption(
+        view(cat_hybrid),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        view(sif_zero),
+        false
+    )
+    let hybrid_fallback_ok = dec_hybrid.action == ACTION_COMPILE_SOURCE
+
+    // Case 1.5: Quarantined package rejected immediately
+    let mut cat_quar = binary_package_catalog_empty()
+    cat_quar.package_name = dist_sv("untrusted/malware")
+    cat_quar.is_quarantined = true
+    let dec_quar = decide_package_consumption(
+        view(cat_quar),
+        active_win64,
+        active_cpu,
+        view(abi_good),
+        view(sif_zero),
+        false
+    )
+    let quarantined_rejected = dec_quar.action == ACTION_REJECT &&
+        dec_quar.rejection_reason == REJECT_QUARANTINED
+
+    out_str("probe[consumption] binary_slice_selected=")
+    out_bool(binary_slice_selected)
+    out_str(" target_mismatch_rejected=")
+    out_bool(target_mismatch_rejected)
+    out_str(" abi_mismatch_rejected=")
+    out_bool(abi_mismatch_rejected)
+    out_str(" hybrid_fallback_ok=")
+    out_bool(hybrid_fallback_ok)
+    out_str(" quarantined_rejected=")
+    out_bool(quarantined_rejected)
+    out_str("\n")
+
+    // =========================================================================
+    // 2. Probe Multi-Repository Priority Routing & Namespace Pinning Defense
+    // =========================================================================
+
+    let mut routing = multi_repo_routing_table_empty()
+
+    // Internal enterprise registry with pinned namespace "corp" (priority = 50)
+    let mut reg_corp = registry_config_empty()
+    reg_corp.id = dist_sv("corp_internal")
+    reg_corp.url = dist_sv("file://D:/mirrors/corp_registry")
+    reg_corp.priority = 50u32
+    reg_corp.trust_policy = TRUST_POLICY_ENTERPRISE_VERIFIED
+    reg_corp.pinned_namespaces[0] = dist_sv("corp")
+    reg_corp.pinned_namespaces[1] = dist_sv("sec_internal")
+    reg_corp.pinned_count = 2usize
+    reg_corp.allow_unsigned = false
+
+    let mut diag_k = dist_sv_empty()
+    let add_corp_ok = routing_table_add_registry(mut_view(routing), view(reg_corp), mut_view(diag_k))
+
+    // Public registry (priority = 100, unpinned)
+    let mut reg_pub = registry_config_empty()
+    reg_pub.id = dist_sv("public_default")
+    reg_pub.url = dist_sv("https://registry.axiom-lang.org")
+    reg_pub.priority = 100u32
+    reg_pub.trust_policy = TRUST_POLICY_PUBLIC_STANDARD
+    reg_pub.allow_unsigned = true
+    let add_pub_ok = routing_table_add_registry(mut_view(routing), view(reg_pub), mut_view(diag_k))
+
+    // Untrusted rogue mirror (priority = 999, unpinned)
+    let mut reg_rogue = registry_config_empty()
+    reg_rogue.id = dist_sv("rogue_mirror")
+    reg_rogue.url = dist_sv("http://untrusted-mirror.org")
+    reg_rogue.priority = 999u32
+    reg_rogue.trust_policy = TRUST_POLICY_UNTRUSTED
+    reg_rogue.allow_unsigned = true
+    let add_rogue_ok = routing_table_add_registry(mut_view(routing), view(reg_rogue), mut_view(diag_k))
+
+    // 2.1 Pinned namespace route: `@corp/auth` must route exclusively to `corp_internal`
+    let route_corp = route_package_lookup(view(routing), dist_sv("corp"), dist_sv("auth"))
+    let routing_pinned_ok = route_corp.status == ROUTING_PINNED &&
+        dist_sv_eq(route_corp.target_registry_id, dist_sv("corp_internal"))
+
+    // 2.2 Dependency-confusion defense: rogue_mirror attempts to supply `@corp/auth`
+    let mut expected_reg = dist_sv_empty()
+    let shadow_check = check_shadow_defense(
+        view(routing),
+        dist_sv("rogue_mirror"),
+        dist_sv("corp"),
+        dist_sv("auth"),
+        mut_view(expected_reg)
+    )
+    let shadow_defense_blocked = (!shadow_check) && dist_sv_eq(expected_reg, dist_sv("corp_internal"))
+
+    // 2.3 Conflicting namespace pin rejected: another registry claiming `@corp`
+    let mut reg_conflict = registry_config_empty()
+    reg_conflict.id = dist_sv("rogue_claim")
+    reg_conflict.pinned_namespaces[0] = dist_sv("corp")
+    reg_conflict.pinned_count = 1usize
+    let mut conflict_diag = dist_sv_empty()
+    let add_conflict_res = routing_table_add_registry(mut_view(routing), view(reg_conflict), mut_view(conflict_diag))
+    let conflicting_pin_rejected = (!add_conflict_res) && dist_sv_eq(conflict_diag, dist_sv("conflicting_namespace_pin"))
+
+    // 2.4 Trust policy respected: unpinned lookup for `axiom/crypto` chooses `public_default` (trusted)
+    // over `rogue_mirror` (priority 999 but untrusted)
+    let route_unpinned = route_package_lookup(view(routing), dist_sv("axiom"), dist_sv("crypto"))
+    let trust_policy_respected = route_unpinned.status == ROUTING_OK &&
+        dist_sv_eq(route_unpinned.target_registry_id, dist_sv("public_default"))
+
+    out_str("probe[multi_repo] routing_pinned_ok=")
+    out_bool(routing_pinned_ok)
+    out_str(" shadow_defense_blocked=")
+    out_bool(shadow_defense_blocked)
+    out_str(" conflicting_pin_rejected=")
+    out_bool(conflicting_pin_rejected)
+    out_str(" trust_policy_respected=")
+    out_bool(trust_policy_respected)
+    out_str("\n")
+
+    // =========================================================================
+    // 3. Probe CLI Subcommands Engine (`compiler.driver.registry_cmd`)
+    // =========================================================================
+
+    let mut sink = diag_sink_new()
+    let mut out_buf = diag_buf_new()
+
+    // 3.1 Publish: reject unpublishable path-only dependency
+    let mut pub_opts = registry_cmd_options_empty()
+    pub_opts.subcommand = REG_CMD_PUBLISH
+    let pub_err1 = execute_pkg_publish(
+        view(pub_opts),
+        lsv_empty(),
+        dist_sv("corp"),
+        dist_sv("app"),
+        dist_sv("1.0.0"),
+        dist_sv("sha_dummy"),
+        dist_sv("merkle_dummy"),
+        true, // has unpublishable path-only dep!
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let unpublishable_rejected = pub_err1 == REG_EXIT_ERROR
+
+    // 3.2 Publish: immutability enforcement
+    let existing_idx_line = lsv_from_str("{\"ns\":\"corp\",\"name\":\"app\",\"v\":\"1.0.0\",\"sha256\":\"original_sha\",\"merkle_root\":\"orig_merkle\"}\n")
+    let pub_err2 = execute_pkg_publish(
+        view(pub_opts),
+        existing_idx_line,
+        dist_sv("corp"),
+        dist_sv("app"),
+        dist_sv("1.0.0"),
+        dist_sv("different_sha"),
+        dist_sv("different_merkle"),
+        false,
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let immutable_enforced = pub_err2 == REG_EXIT_ERROR
+
+    // 3.3 Publish: dry run succeeds
+    pub_opts.dry_run = true
+    let pub_dry_rc = execute_pkg_publish(
+        view(pub_opts),
+        lsv_empty(),
+        dist_sv("corp"),
+        dist_sv("app"),
+        dist_sv("1.0.0"),
+        dist_sv("sha1"),
+        dist_sv("merkle1"),
+        false,
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let dry_run_ok = pub_dry_rc == REG_EXIT_OK
+
+    // 3.4 Fetch: shadowed candidate rejected
+    let mut fetch_opts = registry_cmd_options_empty()
+    fetch_opts.subcommand = REG_CMD_FETCH
+    let exp_zero = sha256_digest_zero()
+    let fetch_rc = execute_pkg_fetch(
+        view(fetch_opts),
+        view(routing),
+        dist_sv("rogue_mirror"), // Candidate attempting to shadow pinned "corp"
+        dist_sv("corp"),
+        dist_sv("auth"),
+        dist_sv("1.0.0"),
+        lsv_empty(),
+        view(exp_zero),
+        true,
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let fetch_shadow_blocked = fetch_rc == REG_EXIT_ERROR
+
+    // 3.5 Search: query matching
+    let mut search_opts = registry_cmd_options_empty()
+    search_opts.subcommand = REG_CMD_SEARCH
+    search_opts.query = dist_sv("crypto")
+    let pkgs: [4]StrView = [dist_sv("crypto"), dist_sv("fast_hash"), dist_sv("crypto_util"), dist_sv("net")]
+    let vers: [4]StrView = [dist_sv("1.4.2"), dist_sv("0.2.0"), dist_sv("1.0.0"), dist_sv("2.0.0")]
+    let chs: [4]StrView = [dist_sv("stable"), dist_sv("stable"), dist_sv("beta"), dist_sv("stable")]
+    let search_rc = execute_pkg_search(
+        view(search_opts),
+        view(pkgs),
+        view(vers),
+        view(chs),
+        4usize,
+        mut_view(out_buf)
+    )
+    let search_ok = search_rc == REG_EXIT_OK
+
+    // 3.6 Mirror: synchronization
+    let mut mirror_opts = registry_cmd_options_empty()
+    mirror_opts.subcommand = REG_CMD_MIRROR
+    mirror_opts.dest_dir = dist_sv("./local_mirror")
+    let mirror_rc = execute_pkg_mirror(
+        view(mirror_opts),
+        view(pkgs),
+        view(vers),
+        2usize,
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let mirror_ok = mirror_rc == REG_EXIT_OK
+
+    // 3.7 Rollback: generation rollback
+    let mut rb_opts = registry_cmd_options_empty()
+    rb_opts.subcommand = REG_CMD_ROLLBACK
+    let mut store: RegistryStore = RegistryStore {
+        root: lsv_from_str(".axiom/pkg"),
+        active_generation: 2u32,
+        prev_generation: 1u32,
+        min_allowed_version: lock_semver_zero(),
+        allow_downgrade: true,
+        journal_state: 0u32,
+        journal_tx_id: lsv_empty(),
+        installed_names: [lsv_empty(); 8],
+        installed_versions: [lock_semver_zero(); 8],
+        installed_roots: [lsv_empty(); 8],
+        installed_count: 0usize,
+    }
+    registry_store_init(mut_view(store), lsv_from_str(".axiom/pkg"))
+    store.active_generation = 2u32
+    store.prev_generation = 1u32
+    store.allow_downgrade = true
+    let rollback_rc = execute_pkg_rollback(
+        view(rb_opts),
+        mut_view(store),
+        1u32,
+        mut_view(sink),
+        mut_view(out_buf)
+    )
+    let rollback_ok = rollback_rc == REG_EXIT_OK
+
+    out_str("probe[registry_cli] unpublishable_rejected=")
+    out_bool(unpublishable_rejected)
+    out_str(" immutable_enforced=")
+    out_bool(immutable_enforced)
+    out_str(" dry_run_ok=")
+    out_bool(dry_run_ok)
+    out_str(" fetch_shadow_blocked=")
+    out_bool(fetch_shadow_blocked)
+    out_str(" search_ok=")
+    out_bool(search_ok)
+    out_str(" mirror_ok=")
+    out_bool(mirror_ok)
+    out_str(" rollback_ok=")
+    out_bool(rollback_ok)
+    out_str("\n")
+
+    diag_buf_free(mut_view(out_buf))
+    diag_sink_free(mut_view(sink))
+
+    let all_ok = binary_slice_selected && target_mismatch_rejected && abi_mismatch_rejected &&
+        hybrid_fallback_ok && quarantined_rejected && routing_pinned_ok && shadow_defense_blocked &&
+        conflicting_pin_rejected && trust_policy_respected && unpublishable_rejected &&
+        immutable_enforced && dry_run_ok && fetch_shadow_blocked && search_ok && mirror_ok && rollback_ok
+
+    if all_ok {
+        out_str("PKG-DISTRIBUTION-PROBE-PASS\n")
+        return 0
+    }
+
+    out_str("PKG-DISTRIBUTION-PROBE-FAIL\n")
+    1
+}
