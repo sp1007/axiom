@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T813]
 priority: 204
-status: doing
+status: done
 attempts: 1
 paths: [compiler/ai_query, compiler/driver/query_cmd, std/meta_effects, tests/run/ai_query]
 spec: [spec/SPEC-103-diagnostics-ux-ai-interface.md, spec/SPEC-24-artifact-format-module-interfaces.md, 0101, 0129, 0146, tasks/0374, tasks/0421, tasks/0425, tasks/0444, tasks/0448, tasks/0456]
 covers: [REQ-TOOL-004, REQ-TOOL-180, REQ-TOOL-181, REQ-TOOL-182, REQ-TOOL-185, REQ-TOOL-186, REQ-TOOL-187, REQ-TOOL-190]
 started: 2026-11-08 17:13:29
-agent: T814-impl
+finished: 2026-11-08 17:47:35
 ---
 # T814 — E19.4 AI-agent semantic fact graph exporter, layout/container/std effect metadata inspector & .axmeta separation
 
@@ -43,3 +43,4 @@ Implement the versioned machine-readable AI semantic fact graph exporter, CLI la
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 17:13:29 started (attempt 1) T814-impl
+- 2026-11-08 17:47:35 accepted by QA -> done

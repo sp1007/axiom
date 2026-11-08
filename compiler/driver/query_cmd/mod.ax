@@ -1,0 +1,342 @@
+// `axiomc query` & `axiomc inspect layout` / `inspect binary` / `inspect --axmeta`
+// CLI Command Driver & Router (T814 / E19.4).
+// Implements SPEC-103 §§4..7 (AXS-AI-001..021, AXS-DIAG-050;
+// REQ-TOOL-004, REQ-TOOL-180..182, REQ-TOOL-185..187, REQ-TOOL-190, INV-DIAG-010).
+module compiler.driver.query_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.query.db.CompilerDB
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.TypeId
+use compiler.query.db.TraitGoalKey
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use std.meta_effects.container_contract_empty
+use std.meta_effects.meta_lookup_container_contract
+use std.meta_effects.api_effect_summary_empty
+use std.meta_effects.meta_lookup_api_effect
+
+use compiler.ai_query.TypeLayoutFact
+use compiler.ai_query.ai_meta_from_sv
+use compiler.ai_query.type_layout_fact_empty
+use compiler.ai_query.ai_inspect_type_layout
+use compiler.ai_query.ai_render_layout_human
+use compiler.ai_query.ai_render_layout_json
+use compiler.ai_query.ai_render_ownership_lifeline_json
+use compiler.ai_query.ai_render_capabilities_json
+use compiler.ai_query.ai_render_trait_trace_json
+use compiler.ai_query.ai_render_symbol_query_json
+use compiler.ai_query.ai_render_type_query_json
+use compiler.ai_query.ai_render_unsafe_map_json
+use compiler.ai_query.ai_render_deps_json
+use compiler.ai_query.ai_render_context_bundle_json
+use compiler.ai_query.ai_render_facts_jsonl
+use compiler.ai_query.ai_render_opt_remarks_json
+use compiler.ai_query.ai_render_container_contract_json
+use compiler.ai_query.ai_render_api_effect_json
+use compiler.ai_query.ai_verify_patch_candidate
+use compiler.ai_query.ai_render_verify_patch_json
+use compiler.ai_query.ai_verify_production_binary
+use compiler.ai_query.ai_render_binary_separation_json
+
+// ============================================================================
+// 1. `axiomc inspect layout` CLI Configuration & Execution (`AXS-AI-010`, `REQ-TOOL-004`)
+// ============================================================================
+
+@derive(Copy)
+pub struct InspectLayoutCliConfig {
+    pub subcmd: StrView,
+    pub type_name: StrView,
+    pub file_path: StrView,
+    pub target_triple: StrView,
+    pub json_mode: bool,
+    pub invalid_option: bool,
+    pub expecting_target: bool,
+}
+
+pub fn inspect_layout_cli_default() -> InspectLayoutCliConfig {
+    let e = ux2_sv_empty()
+    InspectLayoutCliConfig {
+        subcmd: e,
+        type_name: e,
+        file_path: e,
+        target_triple: ux2_sv("x86_64-windows"),
+        json_mode: false,
+        invalid_option: false,
+        expecting_target: false,
+    }
+}
+
+pub fn inspect_layout_parse_arg(cfg: mut_view<InspectLayoutCliConfig>, arg: StrView) -> bool {
+    if cfg.expecting_target {
+        cfg.target_triple = arg
+        cfg.expecting_target = false
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+        cfg.json_mode = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--target")) {
+        cfg.expecting_target = true
+        return true
+    }
+    if arg.len > 0 && unsafe { *(arg.ptr) } == 45u8 {
+        cfg.invalid_option = true
+        return false
+    }
+    if cfg.subcmd.len == 0 {
+        cfg.subcmd = arg
+        return true
+    }
+    if cfg.type_name.len == 0 {
+        cfg.type_name = arg
+        return true
+    }
+    if cfg.file_path.len == 0 {
+        cfg.file_path = arg
+        return true
+    }
+    cfg.invalid_option = true
+    false
+}
+
+pub fn inspect_layout_execute(
+    db: mut_view<CompilerDB>,
+    type_id: TypeId,
+    cfg: view<InspectLayoutCliConfig>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    if cfg.invalid_option || cfg.expecting_target {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_UNKNOWN_OPTION]: invalid option for `axiomc inspect layout`\n"))
+        return 2i32
+    }
+    if !ux2_sv_eq(cfg.subcmd, ux2_sv("layout")) || cfg.type_name.len == 0 || cfg.file_path.len == 0 {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: usage: `axiomc inspect layout <TypeName> <file> [--target <triple>] [--json]`\n"))
+        return 2i32
+    }
+    let mut lf = type_layout_fact_empty()
+    if !ai_inspect_type_layout(mut_view(*db), type_id, cfg.type_name, cfg.target_triple, mut_view(lf)) {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown type `"))
+        diag_buf_push_sv(mut_view(*out_stderr), cfg.type_name)
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("` for `axiomc inspect layout`\n"))
+        return 2i32
+    }
+    if cfg.json_mode {
+        ai_render_layout_json(view(lf), mut_view(*out_stdout))
+    } else {
+        ai_render_layout_human(view(lf), mut_view(*out_stdout))
+    }
+    0i32
+}
+
+// ============================================================================
+// 2. `axiomc query <subcommand>` CLI Configuration & Router (`AXS-AI-001..005`, `AXS-AI-020..021`)
+// ============================================================================
+
+@derive(Copy)
+pub struct QueryCliConfig {
+    pub subcmd: StrView,
+    pub arg0: StrView,
+    pub arg1: StrView,
+    pub arg2: StrView,
+    pub target_triple: StrView,
+    pub format_jsonl: bool,
+    pub invalid_option: bool,
+    pub expecting_target: bool,
+}
+
+pub fn query_cli_default() -> QueryCliConfig {
+    let e = ux2_sv_empty()
+    QueryCliConfig {
+        subcmd: e,
+        arg0: e,
+        arg1: e,
+        arg2: e,
+        target_triple: ux2_sv("x86_64-windows"),
+        format_jsonl: false,
+        invalid_option: false,
+        expecting_target: false,
+    }
+}
+
+pub fn query_cmd_parse_arg(cfg: mut_view<QueryCliConfig>, arg: StrView) -> bool {
+    if cfg.expecting_target {
+        cfg.target_triple = arg
+        cfg.expecting_target = false
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+        cfg.format_jsonl = false
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--jsonl")) || ux2_sv_eq(arg, ux2_sv("--format=jsonl")) {
+        cfg.format_jsonl = true
+        return true
+    }
+    if ux2_sv_eq(arg, ux2_sv("--target")) {
+        cfg.expecting_target = true
+        return true
+    }
+    if arg.len > 0 && unsafe { *(arg.ptr) } == 45u8 {
+        cfg.invalid_option = true
+        return false
+    }
+    if cfg.subcmd.len == 0 {
+        cfg.subcmd = arg
+        return true
+    }
+    if cfg.arg0.len == 0 {
+        cfg.arg0 = arg
+        return true
+    }
+    if cfg.arg1.len == 0 {
+        cfg.arg1 = arg
+        return true
+    }
+    if cfg.arg2.len == 0 {
+        cfg.arg2 = arg
+        return true
+    }
+    cfg.invalid_option = true
+    false
+}
+
+pub fn query_cmd_execute(
+    db: mut_view<CompilerDB>,
+    mod_id: ModuleId,
+    def_id: DefId,
+    type_id: TypeId,
+    goal_key: TraitGoalKey,
+    cfg: view<QueryCliConfig>,
+    candidate_or_pe_bytes: *const u8,
+    candidate_or_pe_len: usize,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> i32 {
+    if cfg.invalid_option || cfg.expecting_target {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_UNKNOWN_OPTION]: unknown option for `axiomc query`\n"))
+        return 2i32
+    }
+    if cfg.subcmd.len == 0 {
+        diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc query` requires a subcommand\n"))
+        return 2i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("symbol")) {
+        if cfg.arg0.len == 0 {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc query symbol` requires `<path_or_span>`\n"))
+            return 2i32
+        }
+        ai_render_symbol_query_json(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("type")) {
+        if cfg.arg0.len == 0 {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc query type` requires `<TypePath>`\n"))
+            return 2i32
+        }
+        ai_render_type_query_json(mut_view(*db), type_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("layout")) {
+        let mut lf = type_layout_fact_empty()
+        if !ai_inspect_type_layout(mut_view(*db), type_id, cfg.arg0, cfg.target_triple, mut_view(lf)) {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown type for `axiomc query layout`\n"))
+            return 2i32
+        }
+        ai_render_layout_json(view(lf), mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("ownership")) {
+        ai_render_ownership_lifeline_json(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("capabilities")) {
+        ai_render_capabilities_json(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("trait")) {
+        if cfg.arg0.len == 0 || cfg.arg1.len == 0 {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: `axiomc query trait` requires `<Trait> <Type>`\n"))
+            return 2i32
+        }
+        ai_render_trait_trace_json(mut_view(*db), goal_key, cfg.arg0, cfg.arg1, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("container")) {
+        let mut cc = container_contract_empty()
+        if !meta_lookup_container_contract(ai_meta_from_sv(cfg.arg0), mut_view(cc)) {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown container type\n"))
+            return 2i32
+        }
+        ai_render_container_contract_json(view(cc), mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("effects")) {
+        let mut eff = api_effect_summary_empty()
+        if !meta_lookup_api_effect(ai_meta_from_sv(cfg.arg0), mut_view(eff)) {
+            diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown API path for `axiomc query effects`\n"))
+            return 2i32
+        }
+        ai_render_api_effect_json(mut_view(*db), def_id, view(eff), mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("unsafe-map")) {
+        ai_render_unsafe_map_json(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("deps")) {
+        ai_render_deps_json(mut_view(*db), mod_id, def_id, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("context")) {
+        ai_render_context_bundle_json(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("facts")) {
+        ai_render_facts_jsonl(mut_view(*db), mod_id, def_id, cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("opt-remarks")) {
+        ai_render_opt_remarks_json(cfg.arg0, mut_view(*out_stdout))
+        return 0i32
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("verify-patch")) {
+        let cand_sv = StrView { ptr: candidate_or_pe_bytes, len: candidate_or_pe_len }
+        let res = ai_verify_patch_candidate(mut_view(*db), mod_id, def_id, cand_sv)
+        ai_render_verify_patch_json(view(res), mut_view(*out_stdout))
+        return if res.accepted { 0i32 } else { 1i32 }
+    }
+
+    if ux2_sv_eq(cfg.subcmd, ux2_sv("verify-production-binary")) {
+        let rep = ai_verify_production_binary(candidate_or_pe_bytes, candidate_or_pe_len)
+        ai_render_binary_separation_json(view(rep), mut_view(*out_stdout))
+        return if rep.is_production_clean { 0i32 } else { 1i32 }
+    }
+
+    diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("error[AX_DRIVER_USAGE]: unknown `axiomc query` subcommand `"))
+    diag_buf_push_sv(mut_view(*out_stderr), cfg.subcmd)
+    diag_buf_push_sv(mut_view(*out_stderr), ux2_sv("`\n"))
+    2i32
+}
