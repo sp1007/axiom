@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T854, T855]
 priority: 206
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/pkg/lockfile, std/pkg/store, compiler/driver/pkg_cmd, tests/run/pkg_lockfile]
 spec: [spec/SPEC-111-package-manager-resolution-lockfiles.md, 0098, tasks/0412, tasks/0446, tasks/0661, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-08 23:43:33
+agent: T856-impl
 ---
 # T856 — E20.2 Canonical axiom.lock serializer/verifier, content-addressed package store, offline vendoring & axiomc pkg CLI
 
@@ -41,3 +43,4 @@ Implement the canonical `axiom.lock` v1 parser/serializer, SHA-256 content-addre
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 23:43:33 started (attempt 1) T856-impl

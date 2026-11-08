@@ -1,0 +1,584 @@
+// Canonical AXTOOLCHAIN Target, ABI & Object-Pipeline Registry
+// (`compiler/sdk/toolchain/mod.ax`, T875 / E20.6).
+//
+// Implements SPEC-116 §§3, 4 (`AXS-SDK-025`..`AXS-SDK-034`, `AXS-SDK-036`,
+// `AXS-SDK-038`..`AXS-SDK-042`, `INV-SDK-001`, `REQ-ECO-8736`, `REQ-PKG-022`).
+
+module compiler.sdk.toolchain
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+
+use compiler.diag.code.diag_code
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagDataKind
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_ends_with
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_trim
+use compiler.build.manifest.bld_sv_cmp
+
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_mix_u64
+use compiler.build.workspace.digest256_combine
+use compiler.build.workspace.digest256_push_hex
+
+// =============================================================================
+// 1. Toolchain Diagnostic Codes & Structured Helpers (`AXS-SDK-025`..`034`)
+// =============================================================================
+
+pub const AX_SDK_TOOLCHAIN_NOT_FOUND: u32 = 247u32
+pub const AX_SDK_TOOLCHAIN_INCOMPATIBLE: u32 = 248u32
+pub const AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH: u32 = 249u32
+
+pub fn toolchain_diag_code_name(code_raw: u32) -> StrView {
+    if code_raw == AX_SDK_TOOLCHAIN_NOT_FOUND {
+        return ux2_sv("AX_SDK_TOOLCHAIN_NOT_FOUND")
+    }
+    if code_raw == AX_SDK_TOOLCHAIN_INCOMPATIBLE {
+        return ux2_sv("AX_SDK_TOOLCHAIN_INCOMPATIBLE")
+    }
+    if code_raw == AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH {
+        return ux2_sv("AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH")
+    }
+    ux2_sv("AX_SDK_TOOLCHAIN_UNKNOWN")
+}
+
+fn make_str_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_toolchain_diag_1(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [1]DiagDataEntry = [make_str_entry(ux2_sv(k1), v1)]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 1usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_toolchain_diag_2(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_str_entry(ux2_sv(k1), v1),
+        make_str_entry(ux2_sv(k2), v2),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 2. `TargetDescriptor` Definition Across 8 Tier-1/Tier-2 Targets (`AXS-SDK-026`)
+// =============================================================================
+
+pub struct TargetDescriptor {
+    pub triple: StrView,
+    pub tier: u8,
+    pub architecture: StrView,
+    pub vendor: StrView,
+    pub os: StrView,
+    pub abi: StrView,
+    pub endianness: StrView,
+    pub pointer_width: u32,
+    pub data_model: StrView,
+    pub calling_convention: StrView,
+    pub simd_abi: StrView,
+    pub float_abi: StrView,
+    pub page_size: u32,
+    pub object_format: StrView,
+    pub executable_format: StrView,
+    pub linker_engine: StrView,
+    pub unwind_format: StrView,
+    pub stack_alignment: u32,
+    pub red_zone_bytes: u32,
+    pub shadow_space_bytes: u32,
+    pub default_sdk_name: StrView,
+    pub is_valid: bool,
+}
+
+pub fn target_descriptor_empty() -> TargetDescriptor {
+    let e = ux2_sv_empty()
+    TargetDescriptor {
+        triple: e,
+        tier: 0u8,
+        architecture: e,
+        vendor: e,
+        os: e,
+        abi: e,
+        endianness: e,
+        pointer_width: 0u32,
+        data_model: e,
+        calling_convention: e,
+        simd_abi: e,
+        float_abi: e,
+        page_size: 0u32,
+        object_format: e,
+        executable_format: e,
+        linker_engine: e,
+        unwind_format: e,
+        stack_alignment: 0u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: e,
+        is_valid: false,
+    }
+}
+
+// Tier-1 Target 1: x86_64-pc-windows-msvc (LLP64, COFF/PE64, win64)
+pub fn target_desc_x86_64_windows() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("x86_64-pc-windows-msvc"),
+        tier: 1u8,
+        architecture: ux2_sv("x86_64"),
+        vendor: ux2_sv("pc"),
+        os: ux2_sv("windows"),
+        abi: ux2_sv("msvc"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LLP64"),
+        calling_convention: ux2_sv("win64"),
+        simd_abi: ux2_sv("sse2"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("coff"),
+        executable_format: ux2_sv("pe64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("windows_seh"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 32u32,
+        default_sdk_name: ux2_sv("windows-x86_64-10.0.22621"),
+        is_valid: true,
+    }
+}
+
+// Tier-1 Target 2: x86_64-unknown-linux-gnu (LP64, ELF64, sysv64)
+pub fn target_desc_x86_64_linux() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("x86_64-unknown-linux-gnu"),
+        tier: 1u8,
+        architecture: ux2_sv("x86_64"),
+        vendor: ux2_sv("unknown"),
+        os: ux2_sv("linux"),
+        abi: ux2_sv("gnu"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LP64"),
+        calling_convention: ux2_sv("sysv64"),
+        simd_abi: ux2_sv("sse2"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("elf64"),
+        executable_format: ux2_sv("elf64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("dwarf5"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 128u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("linux-x86_64-6.6"),
+        is_valid: true,
+    }
+}
+
+// Tier-1 Target 3: aarch64-unknown-linux-gnu (LP64, ELF64, aapcs64)
+pub fn target_desc_aarch64_linux() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("aarch64-unknown-linux-gnu"),
+        tier: 1u8,
+        architecture: ux2_sv("aarch64"),
+        vendor: ux2_sv("unknown"),
+        os: ux2_sv("linux"),
+        abi: ux2_sv("gnu"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LP64"),
+        calling_convention: ux2_sv("aapcs64"),
+        simd_abi: ux2_sv("neon"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("elf64"),
+        executable_format: ux2_sv("elf64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("dwarf5"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("linux-aarch64-6.6"),
+        is_valid: true,
+    }
+}
+
+// Tier-1 Target 4: aarch64-apple-darwin (LP64, Mach-O, darwin_arm64)
+pub fn target_desc_aarch64_macos() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("aarch64-apple-darwin"),
+        tier: 1u8,
+        architecture: ux2_sv("aarch64"),
+        vendor: ux2_sv("apple"),
+        os: ux2_sv("macos"),
+        abi: ux2_sv("darwin"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LP64"),
+        calling_convention: ux2_sv("darwin_arm64"),
+        simd_abi: ux2_sv("neon"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 16384u32,
+        object_format: ux2_sv("mach_o"),
+        executable_format: ux2_sv("mach_o_64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("compact_unwind"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("macos-aarch64-14.0"),
+        is_valid: true,
+    }
+}
+
+// Tier-2 Target 5: aarch64-pc-windows-msvc (LLP64, COFF/PE-ARM64, win64_arm64)
+pub fn target_desc_aarch64_windows() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("aarch64-pc-windows-msvc"),
+        tier: 2u8,
+        architecture: ux2_sv("aarch64"),
+        vendor: ux2_sv("pc"),
+        os: ux2_sv("windows"),
+        abi: ux2_sv("msvc"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LLP64"),
+        calling_convention: ux2_sv("win64_arm64"),
+        simd_abi: ux2_sv("neon"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("coff"),
+        executable_format: ux2_sv("pe_arm64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("windows_seh"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("windows-aarch64-10.0.22621"),
+        is_valid: true,
+    }
+}
+
+// Tier-2 Target 6: aarch64-linux-android (LP64, ELF64, aapcs64)
+pub fn target_desc_aarch64_android() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("aarch64-linux-android"),
+        tier: 2u8,
+        architecture: ux2_sv("aarch64"),
+        vendor: ux2_sv("linux"),
+        os: ux2_sv("android"),
+        abi: ux2_sv("bionic"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LP64"),
+        calling_convention: ux2_sv("aapcs64"),
+        simd_abi: ux2_sv("neon"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("elf64"),
+        executable_format: ux2_sv("elf64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("dwarf5"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("android-aarch64-34"),
+        is_valid: true,
+    }
+}
+
+// Tier-2 Target 7: wasm32-unknown-wasi (ILP32, WASM, wasm32)
+pub fn target_desc_wasm32() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("wasm32-unknown-wasi"),
+        tier: 2u8,
+        architecture: ux2_sv("wasm32"),
+        vendor: ux2_sv("unknown"),
+        os: ux2_sv("wasi"),
+        abi: ux2_sv("wasi"),
+        endianness: ux2_sv("little"),
+        pointer_width: 32u32,
+        data_model: ux2_sv("ILP32"),
+        calling_convention: ux2_sv("wasm32"),
+        simd_abi: ux2_sv("simd128"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 65536u32,
+        object_format: ux2_sv("wasm"),
+        executable_format: ux2_sv("wasm32"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("wasm_eh"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("wasi-wasm32-preview1"),
+        is_valid: true,
+    }
+}
+
+// Tier-2 Target 8: riscv64-unknown-linux-gnu (LP64, ELF64, lp64d)
+pub fn target_desc_riscv64_linux() -> TargetDescriptor {
+    TargetDescriptor {
+        triple: ux2_sv("riscv64-unknown-linux-gnu"),
+        tier: 2u8,
+        architecture: ux2_sv("riscv64"),
+        vendor: ux2_sv("unknown"),
+        os: ux2_sv("linux"),
+        abi: ux2_sv("gnu"),
+        endianness: ux2_sv("little"),
+        pointer_width: 64u32,
+        data_model: ux2_sv("LP64"),
+        calling_convention: ux2_sv("lp64d"),
+        simd_abi: ux2_sv("rvv"),
+        float_abi: ux2_sv("hard_float"),
+        page_size: 4096u32,
+        object_format: ux2_sv("elf64"),
+        executable_format: ux2_sv("elf64"),
+        linker_engine: ux2_sv("axiom_native"),
+        unwind_format: ux2_sv("dwarf5"),
+        stack_alignment: 16u32,
+        red_zone_bytes: 0u32,
+        shadow_space_bytes: 0u32,
+        default_sdk_name: ux2_sv("linux-riscv64-6.6"),
+        is_valid: true,
+    }
+}
+
+// =============================================================================
+// 3. Triple Alias Normalization & Registry Lookup (`AXS-SDK-005`, `025`, `026`)
+// =============================================================================
+
+pub fn normalize_target_triple(input: StrView) -> StrView {
+    let t = bld_sv_trim(input)
+    if ux2_sv_eq(t, ux2_sv("x86_64-windows")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-pc-windows")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-windows-msvc")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-pc-windows-msvc")) {
+        return ux2_sv("x86_64-pc-windows-msvc")
+    }
+    if ux2_sv_eq(t, ux2_sv("x86_64-linux")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-unknown-linux")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-linux-gnu")) ||
+        ux2_sv_eq(t, ux2_sv("x86_64-unknown-linux-gnu")) {
+        return ux2_sv("x86_64-unknown-linux-gnu")
+    }
+    if ux2_sv_eq(t, ux2_sv("aarch64-linux")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-unknown-linux")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-linux-gnu")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-unknown-linux-gnu")) {
+        return ux2_sv("aarch64-unknown-linux-gnu")
+    }
+    if ux2_sv_eq(t, ux2_sv("aarch64-macos")) ||
+        ux2_sv_eq(t, ux2_sv("arm64-apple-darwin")) ||
+        ux2_sv_eq(t, ux2_sv("arm64-macos")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-darwin")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-apple-darwin")) {
+        return ux2_sv("aarch64-apple-darwin")
+    }
+    if ux2_sv_eq(t, ux2_sv("aarch64-windows")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-pc-windows")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-pc-windows-msvc")) {
+        return ux2_sv("aarch64-pc-windows-msvc")
+    }
+    if ux2_sv_eq(t, ux2_sv("aarch64-android")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-unknown-linux-android")) ||
+        ux2_sv_eq(t, ux2_sv("aarch64-linux-android")) {
+        return ux2_sv("aarch64-linux-android")
+    }
+    if ux2_sv_eq(t, ux2_sv("wasm32")) ||
+        ux2_sv_eq(t, ux2_sv("wasm32-wasi")) ||
+        ux2_sv_eq(t, ux2_sv("wasm32-unknown-unknown")) ||
+        ux2_sv_eq(t, ux2_sv("wasm32-unknown-wasi")) {
+        return ux2_sv("wasm32-unknown-wasi")
+    }
+    if ux2_sv_eq(t, ux2_sv("riscv64-linux")) ||
+        ux2_sv_eq(t, ux2_sv("riscv64-unknown-linux")) ||
+        ux2_sv_eq(t, ux2_sv("riscv64-linux-gnu")) ||
+        ux2_sv_eq(t, ux2_sv("riscv64-unknown-linux-gnu")) {
+        return ux2_sv("riscv64-unknown-linux-gnu")
+    }
+    t
+}
+
+pub fn toolchain_registry_lookup(
+    query: StrView,
+    out_desc: mut_view<TargetDescriptor>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let norm = normalize_target_triple(query)
+    if ux2_sv_eq(norm, ux2_sv("x86_64-pc-windows-msvc")) {
+        *out_desc = target_desc_x86_64_windows()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("x86_64-unknown-linux-gnu")) {
+        *out_desc = target_desc_x86_64_linux()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("aarch64-unknown-linux-gnu")) {
+        *out_desc = target_desc_aarch64_linux()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("aarch64-apple-darwin")) {
+        *out_desc = target_desc_aarch64_macos()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("aarch64-pc-windows-msvc")) {
+        *out_desc = target_desc_aarch64_windows()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("aarch64-linux-android")) {
+        *out_desc = target_desc_aarch64_android()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("wasm32-unknown-wasi")) {
+        *out_desc = target_desc_wasm32()
+        return true
+    }
+    if ux2_sv_eq(norm, ux2_sv("riscv64-unknown-linux-gnu")) {
+        *out_desc = target_desc_riscv64_linux()
+        return true
+    }
+
+    *out_desc = target_descriptor_empty()
+    report_toolchain_diag_1(
+        mut_view(*sink),
+        AX_SDK_TOOLCHAIN_NOT_FOUND,
+        "requested target triple or architecture was not found in AXTOOLCHAIN registry",
+        "target",
+        query
+    )
+    false
+}
+
+pub fn verify_target_compatibility(
+    desc: view<TargetDescriptor>,
+    expected_obj_fmt: StrView,
+    expected_ptr_width: u32,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if !desc.is_valid {
+        report_toolchain_diag_1(
+            mut_view(*sink),
+            AX_SDK_TOOLCHAIN_NOT_FOUND,
+            "cannot verify compatibility for invalid target descriptor",
+            "triple",
+            desc.triple
+        )
+        return false
+    }
+
+    let obj_ok = ux2_sv_eq(desc.object_format, expected_obj_fmt)
+    let ptr_ok = desc.pointer_width == expected_ptr_width
+
+    if !obj_ok || !ptr_ok {
+        report_toolchain_diag_2(
+            mut_view(*sink),
+            AX_SDK_TOOLCHAIN_INCOMPATIBLE,
+            "selected toolchain components disagree on pointer width, endianness, or ABI format",
+            "target",
+            desc.triple,
+            "expected_format",
+            expected_obj_fmt
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 4. Domain-Separated `ToolchainFingerprint` Calculation & Verification (`AXS-SDK-036`)
+// =============================================================================
+
+pub fn compute_toolchain_fingerprint(
+    toolchain_id: StrView,
+    version: StrView,
+    compiler_binary_hash: Digest256,
+    descriptor_bytes: StrView
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_TOOLCHAIN_FINGERPRINT_V1\0"))
+    d = digest256_mix_sv(d, toolchain_id)
+    d = digest256_mix_sv(d, version)
+    d = digest256_combine(d, compiler_binary_hash)
+    d = digest256_mix_sv(d, descriptor_bytes)
+    d
+}
+
+pub fn verify_toolchain_fingerprint(
+    computed: Digest256,
+    expected: Digest256,
+    toolchain_id: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if digest256_eq(computed, expected) {
+        return true
+    }
+    report_toolchain_diag_2(
+        mut_view(*sink),
+        AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH,
+        "computed ToolchainFingerprint does not match expected fingerprint or axiom.lock",
+        "toolchain_id",
+        toolchain_id,
+        "status",
+        ux2_sv("mismatch")
+    )
+    false
+}

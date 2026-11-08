@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T852, T874]
 priority: 225
-status: doing
+status: done
 attempts: 1
 paths: [compiler/sdk/sysroot, compiler/sdk/toolchain, tests/run/sdk_sysroot]
 spec: [spec/SPEC-116-sdk-sysroot-toolchain-distribution.md, spec/SPEC-88-cross-compilation-platform-layer.md, tasks/0605, tasks/1034]
 covers: [REQ-ECO-8736, REQ-PKG-022]
 started: 2026-11-08 22:52:39
-agent: T875-impl
+finished: 2026-11-09 00:11:57
 ---
 # T875 — E20.6 Declarative .axsdk sysroot loader, SdkFingerprint verifier, C-free platform import/CRT resolver & AXTOOLCHAIN target registry
 
@@ -43,3 +43,4 @@ Implement the declarative `.axsdk` sysroot loader, `SdkFingerprint` verifier, C-
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 22:52:39 started (attempt 1) T875-impl
+- 2026-11-09 00:11:57 accepted by QA -> done

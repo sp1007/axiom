@@ -1,0 +1,886 @@
+// Declarative `.axsdk` Sysroot Loader, SdkFingerprint Verifier,
+// C-Free Platform Import/CRT Resolver & OS API Availability Gating
+// (`compiler/sdk/sysroot/mod.ax`, T875 / E20.6).
+//
+// Implements SPEC-116 §§1, 2, 4 (`AXS-SDK-001`..`AXS-SDK-024`, `AXS-SDK-035`,
+// `AXS-SDK-037`, `AXS-SDK-039`..`AXS-SDK-042`, `INV-SDK-001`, `REQ-ECO-8736`, `REQ-PKG-022`).
+
+module compiler.sdk.sysroot
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+
+use compiler.diag.code.diag_code
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.DiagDataKind
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_ends_with
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_trim
+use compiler.build.manifest.bld_sv_cmp
+
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_mix_u64
+use compiler.build.workspace.digest256_combine
+use compiler.build.workspace.digest256_push_hex
+
+// =============================================================================
+// 1. Sysroot Diagnostic Codes & Structured Helpers (`AXS-SDK-001`..`024`)
+// =============================================================================
+
+pub const AX_SDK_MANIFEST_NOT_FOUND: u32 = 240u32
+pub const AX_SDK_CORRUPT_MANIFEST: u32 = 241u32
+pub const AX_SDK_FINGERPRINT_MISMATCH: u32 = 242u32
+pub const AX_SDK_HOST_FALLBACK_DENIED: u32 = 243u32
+pub const AX_SDK_API_UNAVAILABLE: u32 = 244u32
+pub const AX_SDK_IMPORT_STUB_NOT_FOUND: u32 = 245u32
+pub const AX_SDK_STARTUP_CONTRACT_MISMATCH: u32 = 246u32
+
+pub fn sdk_diag_code_name(code_raw: u32) -> StrView {
+    if code_raw == AX_SDK_MANIFEST_NOT_FOUND {
+        return ux2_sv("AX_SDK_MANIFEST_NOT_FOUND")
+    }
+    if code_raw == AX_SDK_CORRUPT_MANIFEST {
+        return ux2_sv("AX_SDK_CORRUPT_MANIFEST")
+    }
+    if code_raw == AX_SDK_FINGERPRINT_MISMATCH {
+        return ux2_sv("AX_SDK_FINGERPRINT_MISMATCH")
+    }
+    if code_raw == AX_SDK_HOST_FALLBACK_DENIED {
+        return ux2_sv("AX_SDK_HOST_FALLBACK_DENIED")
+    }
+    if code_raw == AX_SDK_API_UNAVAILABLE {
+        return ux2_sv("AX_SDK_API_UNAVAILABLE")
+    }
+    if code_raw == AX_SDK_IMPORT_STUB_NOT_FOUND {
+        return ux2_sv("AX_SDK_IMPORT_STUB_NOT_FOUND")
+    }
+    if code_raw == AX_SDK_STARTUP_CONTRACT_MISMATCH {
+        return ux2_sv("AX_SDK_STARTUP_CONTRACT_MISMATCH")
+    }
+    ux2_sv("AX_SDK_UNKNOWN")
+}
+
+fn make_str_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_sdk_diag_1(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [1]DiagDataEntry = [make_str_entry(ux2_sv(k1), v1)]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 1usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_sdk_diag_2(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_str_entry(ux2_sv(k1), v1),
+        make_str_entry(ux2_sv(k2), v2),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_sdk_diag_3(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView,
+    k3: str,
+    v3: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [3]DiagDataEntry = [
+        make_str_entry(ux2_sv(k1), v1),
+        make_str_entry(ux2_sv(k2), v2),
+        make_str_entry(ux2_sv(k3), v3),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 3usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 2. Ambient Host Path Fallback Prohibition (`AXS-SDK-002`, `004`)
+// =============================================================================
+
+pub fn is_ambient_host_path(path: StrView) -> bool {
+    let p = bld_sv_trim(path)
+    if bld_sv_starts_with(p, ux2_sv("C:\\Windows")) ||
+        bld_sv_starts_with(p, ux2_sv("C:/Windows")) ||
+        bld_sv_starts_with(p, ux2_sv("c:\\windows")) ||
+        bld_sv_starts_with(p, ux2_sv("c:/windows")) {
+        return true
+    }
+    if bld_sv_starts_with(p, ux2_sv("C:\\Program Files")) ||
+        bld_sv_starts_with(p, ux2_sv("C:/Program Files")) ||
+        bld_sv_starts_with(p, ux2_sv("c:\\program files")) ||
+        bld_sv_starts_with(p, ux2_sv("c:/program files")) {
+        return true
+    }
+    if bld_sv_starts_with(p, ux2_sv("/usr/include")) ||
+        bld_sv_starts_with(p, ux2_sv("/usr/lib")) ||
+        bld_sv_starts_with(p, ux2_sv("/usr/local/include")) ||
+        bld_sv_starts_with(p, ux2_sv("/lib64")) {
+        return true
+    }
+    if bld_sv_starts_with(p, ux2_sv("/Library/Developer")) ||
+        bld_sv_starts_with(p, ux2_sv("/Applications/Xcode")) ||
+        bld_sv_starts_with(p, ux2_sv("/System/Library")) {
+        return true
+    }
+    false
+}
+
+pub fn verify_sysroot_hermeticity(
+    sysroot_path: StrView,
+    is_hermetic: bool,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if is_hermetic && (sysroot_path.len == 0usize || is_ambient_host_path(sysroot_path)) {
+        report_sdk_diag_2(
+            mut_view(*sink),
+            AX_SDK_HOST_FALLBACK_DENIED,
+            "hermetic build attempted fallback to ambient host OS paths without an installed SDK",
+            "path",
+            sysroot_path,
+            "policy",
+            ux2_sv("hermetic")
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 3. Declarative `SdkManifest` Schema & TOML Parser (`AXS-SDK-010`, `011`)
+// =============================================================================
+
+pub struct SdkManifest {
+    pub name: StrView,
+    pub version: StrView,
+    pub target_triple: StrView,
+    pub vendor: StrView,
+    pub description: StrView,
+    pub architecture: StrView,
+    pub os_name: StrView,
+    pub abi: StrView,
+    pub endianness: StrView,
+    pub pointer_width: u32,
+    pub data_model: StrView,
+    pub family: StrView,
+    pub min_version: StrView,
+    pub default_deployment_target: StrView,
+    pub subsystem: StrView,
+    pub has_mmu: bool,
+    pub has_threads: bool,
+    pub has_tls: bool,
+    pub has_dynamic_loader: bool,
+    pub has_signals: bool,
+    pub has_fork: bool,
+    pub has_posix_spawn: bool,
+    pub crt_model: StrView,
+    pub entry_point: StrView,
+    pub is_valid: bool,
+}
+
+pub fn sdk_manifest_empty() -> SdkManifest {
+    let e = ux2_sv_empty()
+    SdkManifest {
+        name: e,
+        version: e,
+        target_triple: e,
+        vendor: e,
+        description: e,
+        architecture: e,
+        os_name: e,
+        abi: e,
+        endianness: e,
+        pointer_width: 0u32,
+        data_model: e,
+        family: e,
+        min_version: e,
+        default_deployment_target: e,
+        subsystem: e,
+        has_mmu: false,
+        has_threads: false,
+        has_tls: false,
+        has_dynamic_loader: false,
+        has_signals: false,
+        has_fork: false,
+        has_posix_spawn: false,
+        crt_model: e,
+        entry_point: e,
+        is_valid: false,
+    }
+}
+
+fn parse_toml_val_str(raw: StrView) -> StrView {
+    let t = bld_sv_trim(raw)
+    if t.len >= 2usize {
+        let q0 = bld_sv_byte(t, 0usize)
+        let q1 = bld_sv_byte(t, t.len - 1usize)
+        if (q0 == 34u8 || q0 == 39u8) && q0 == q1 {
+            return bld_sv_slice(t, 1usize, t.len - 1usize)
+        }
+    }
+    t
+}
+
+fn parse_toml_val_bool(raw: StrView) -> bool {
+    let t = bld_sv_trim(raw)
+    ux2_sv_eq(t, ux2_sv("true"))
+}
+
+fn parse_toml_val_u32(raw: StrView) -> u32 {
+    let t = bld_sv_trim(raw)
+    let mut acc: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < t.len {
+        let b = bld_sv_byte(t, i)
+        if b >= 48u8 && b <= 57u8 {
+            acc = acc * 10u32 + ((b - 48u8) as u32)
+        }
+        i = i + 1usize
+    }
+    acc
+}
+
+pub fn parse_sdk_manifest(
+    toml_text: StrView,
+    sink: mut_view<DiagSink>
+) -> SdkManifest {
+    let mut m = sdk_manifest_empty()
+    if toml_text.len == 0usize {
+        report_sdk_diag_1(
+            mut_view(*sink),
+            AX_SDK_MANIFEST_NOT_FOUND,
+            "the sdk.toml manifest was not found or is empty in sysroot",
+            "size",
+            ux2_sv("0")
+        )
+        return m
+    }
+
+    let mut current_sec: u8 = 0u8
+    let mut line_start: usize = 0usize
+    let mut i: usize = 0usize
+
+    while i <= toml_text.len {
+        let is_eol = i == toml_text.len || bld_sv_byte(toml_text, i) == 10u8
+        if is_eol {
+            let mut line_end = i
+            if line_end > line_start && bld_sv_byte(toml_text, line_end - 1usize) == 13u8 {
+                line_end = line_end - 1usize
+            }
+            if line_end > line_start {
+                let raw_line = bld_sv_slice(toml_text, line_start, line_end)
+                let line = bld_sv_trim(raw_line)
+                if line.len > 0usize && bld_sv_byte(line, 0usize) != 35u8 {
+                    // Check section header: [name]
+                    if bld_sv_starts_with(line, ux2_sv("[")) && bld_sv_ends_with(line, ux2_sv("]")) {
+                        let sec_name = bld_sv_trim(bld_sv_slice(line, 1usize, line.len - 1usize))
+                        if ux2_sv_eq(sec_name, ux2_sv("sdk")) {
+                            current_sec = 1u8
+                        } else if ux2_sv_eq(sec_name, ux2_sv("target")) {
+                            current_sec = 2u8
+                        } else if ux2_sv_eq(sec_name, ux2_sv("os")) {
+                            current_sec = 3u8
+                        } else if ux2_sv_eq(sec_name, ux2_sv("capabilities")) {
+                            current_sec = 4u8
+                        } else if ux2_sv_eq(sec_name, ux2_sv("crt")) {
+                            current_sec = 5u8
+                        } else if ux2_sv_eq(sec_name, ux2_sv("linker")) {
+                            current_sec = 6u8
+                        } else {
+                            current_sec = 0u8
+                        }
+                    } else {
+                        // Key = Value
+                        let mut eq_pos: usize = 0usize
+                        let mut found_eq = false
+                        let mut ki: usize = 0usize
+                        while ki < line.len {
+                            if bld_sv_byte(line, ki) == 61u8 {
+                                eq_pos = ki
+                                found_eq = true
+                                ki = line.len
+                            }
+                            ki = ki + 1usize
+                        }
+
+                        if found_eq {
+                            let k = bld_sv_trim(bld_sv_slice(line, 0usize, eq_pos))
+                            let v = bld_sv_trim(bld_sv_slice(line, eq_pos + 1usize, line.len))
+
+                            if current_sec == 1u8 {
+                                if ux2_sv_eq(k, ux2_sv("name")) {
+                                    m.name = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("version")) {
+                                    m.version = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("target")) {
+                                    m.target_triple = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("vendor")) {
+                                    m.vendor = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("description")) {
+                                    m.description = parse_toml_val_str(v)
+                                }
+                            } else if current_sec == 2u8 {
+                                if ux2_sv_eq(k, ux2_sv("architecture")) {
+                                    m.architecture = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("os")) {
+                                    m.os_name = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("abi")) {
+                                    m.abi = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("endianness")) {
+                                    m.endianness = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("pointer_width")) {
+                                    m.pointer_width = parse_toml_val_u32(v)
+                                } else if ux2_sv_eq(k, ux2_sv("data_model")) {
+                                    m.data_model = parse_toml_val_str(v)
+                                }
+                            } else if current_sec == 3u8 {
+                                if ux2_sv_eq(k, ux2_sv("family")) {
+                                    m.family = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("min_version")) {
+                                    m.min_version = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("default_deployment_target")) {
+                                    m.default_deployment_target = parse_toml_val_str(v)
+                                } else if ux2_sv_eq(k, ux2_sv("subsystem")) {
+                                    m.subsystem = parse_toml_val_str(v)
+                                }
+                            } else if current_sec == 4u8 {
+                                if ux2_sv_eq(k, ux2_sv("has_mmu")) {
+                                    m.has_mmu = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_threads")) {
+                                    m.has_threads = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_tls")) {
+                                    m.has_tls = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_dynamic_loader")) {
+                                    m.has_dynamic_loader = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_signals")) {
+                                    m.has_signals = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_fork")) {
+                                    m.has_fork = parse_toml_val_bool(v)
+                                } else if ux2_sv_eq(k, ux2_sv("has_posix_spawn")) {
+                                    m.has_posix_spawn = parse_toml_val_bool(v)
+                                }
+                            } else if current_sec == 5u8 {
+                                if ux2_sv_eq(k, ux2_sv("model")) {
+                                    m.crt_model = parse_toml_val_str(v)
+                                }
+                            } else if current_sec == 6u8 {
+                                if ux2_sv_eq(k, ux2_sv("entry_point")) {
+                                    m.entry_point = parse_toml_val_str(v)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1usize
+        }
+        i = i + 1usize
+    }
+
+    // Validate required fields per AXS-SDK-010
+    if m.name.len == 0usize || m.version.len == 0usize || m.target_triple.len == 0usize ||
+        m.architecture.len == 0usize || m.os_name.len == 0usize {
+        report_sdk_diag_2(
+            mut_view(*sink),
+            AX_SDK_CORRUPT_MANIFEST,
+            "sdk.toml manifest is corrupt: missing required fields",
+            "name",
+            m.name,
+            "target",
+            m.target_triple
+        )
+        m.is_valid = false
+        return m
+    }
+
+    m.is_valid = true
+    m
+}
+
+// =============================================================================
+// 4. Platform Import Stubs & Startup/CRT Contract Resolver (`AXS-SDK-012`..`022`)
+// =============================================================================
+
+pub const LINKAGE_REQUIRED: u8 = 0u8
+pub const LINKAGE_WEAK_LINKED: u8 = 1u8
+pub const LINKAGE_RUNTIME_RESOLVED: u8 = 2u8
+
+pub struct ImportSymbol {
+    pub name: StrView,
+    pub ordinal: u32,
+    pub calling_convention: StrView,
+    pub return_type: StrView,
+    pub introduced_version: StrView,
+    pub linkage: u8,
+    pub is_valid: bool,
+}
+
+pub fn import_symbol_empty() -> ImportSymbol {
+    let e = ux2_sv_empty()
+    ImportSymbol {
+        name: e,
+        ordinal: 0u32,
+        calling_convention: e,
+        return_type: e,
+        introduced_version: e,
+        linkage: LINKAGE_REQUIRED,
+        is_valid: false,
+    }
+}
+
+pub struct ImportLibrary {
+    pub name: StrView,
+    pub target_file: StrView,
+    pub format: StrView,
+    pub symbol_count: usize,
+    pub symbols: [4]ImportSymbol,
+    pub is_valid: bool,
+}
+
+pub fn import_library_empty() -> ImportLibrary {
+    let e = ux2_sv_empty()
+    ImportLibrary {
+        name: e,
+        target_file: e,
+        format: e,
+        symbol_count: 0usize,
+        symbols: [
+            import_symbol_empty(), import_symbol_empty(),
+            import_symbol_empty(), import_symbol_empty()
+        ],
+        is_valid: false,
+    }
+}
+
+pub fn import_library_add_symbol(
+    lib: mut_view<ImportLibrary>,
+    sym: ImportSymbol
+) -> bool {
+    if lib.symbol_count >= 4usize {
+        return false
+    }
+    lib.symbols[lib.symbol_count] = sym
+    lib.symbol_count = lib.symbol_count + 1usize
+    true
+}
+
+pub fn resolve_import_symbol(
+    lib: view<ImportLibrary>,
+    sym_name: StrView
+) -> i32 {
+    let mut i: usize = 0usize
+    while i < lib.symbol_count {
+        if ux2_sv_eq(lib.symbols[i].name, sym_name) {
+            return i as i32
+        }
+        i = i + 1usize
+    }
+    -1i32
+}
+
+pub fn verify_startup_contract(
+    subsystem: StrView,
+    entry_symbol: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let sub = bld_sv_trim(subsystem)
+    let entry = bld_sv_trim(entry_symbol)
+
+    if ux2_sv_eq(sub, ux2_sv("console")) {
+        if ux2_sv_eq(entry, ux2_sv("main")) {
+            return true
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("windows")) {
+        if ux2_sv_eq(entry, ux2_sv("WinMain")) || ux2_sv_eq(entry, ux2_sv("wWinMain")) {
+            return true
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("posix")) {
+        if ux2_sv_eq(entry, ux2_sv("_start")) || ux2_sv_eq(entry, ux2_sv("main")) {
+            return true
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("freestanding")) {
+        if ux2_sv_eq(entry, ux2_sv("_start")) {
+            return true
+        }
+    } else if ux2_sv_eq(sub, ux2_sv("reactor")) {
+        if ux2_sv_eq(entry, ux2_sv("_initialize")) {
+            return true
+        }
+    }
+
+    report_sdk_diag_2(
+        mut_view(*sink),
+        AX_SDK_STARTUP_CONTRACT_MISMATCH,
+        "startup contract mismatch: executable entry point is incompatible with subsystem contract",
+        "subsystem",
+        subsystem,
+        "entry_point",
+        entry_symbol
+    )
+    false
+}
+
+// =============================================================================
+// 5. Compile-Time OS API Availability Gating (`AXS-SDK-015`, `016`)
+// =============================================================================
+
+fn next_version_component(ver: StrView, offset: mut_view<usize>) -> u32 {
+    let mut i = *offset
+    if i >= ver.len {
+        return 0u32
+    }
+    let mut acc: u32 = 0u32
+    while i < ver.len {
+        let b = bld_sv_byte(ver, i)
+        if b == 46u8 {
+            *offset = i + 1usize
+            return acc
+        }
+        if b >= 48u8 && b <= 57u8 {
+            acc = acc * 10u32 + ((b - 48u8) as u32)
+        }
+        i = i + 1usize
+    }
+    *offset = i
+    acc
+}
+
+pub fn compare_os_versions(v1: StrView, v2: StrView) -> i32 {
+    let mut off1: usize = 0usize
+    let mut off2: usize = 0usize
+
+    while off1 < v1.len || off2 < v2.len {
+        let c1 = next_version_component(v1, mut_view(off1))
+        let c2 = next_version_component(v2, mut_view(off2))
+        if c1 > c2 {
+            return 1i32
+        }
+        if c1 < c2 {
+            return -1i32
+        }
+    }
+    0i32
+}
+
+pub fn check_api_availability(
+    api_introduced: StrView,
+    target_deployment_ver: StrView,
+    is_guarded_by_check: bool,
+    symbol_name: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let cmp = compare_os_versions(api_introduced, target_deployment_ver)
+    if cmp > 0i32 {
+        if is_guarded_by_check {
+            // Guarded weak check or runtime availability check -> accepted
+            return true
+        }
+        report_sdk_diag_3(
+            mut_view(*sink),
+            AX_SDK_API_UNAVAILABLE,
+            "target platform function requires an OS version newer than target deployment version",
+            "symbol",
+            symbol_name,
+            "introduced",
+            api_introduced,
+            "target_version",
+            target_deployment_ver
+        )
+        return false
+    }
+    true
+}
+
+// =============================================================================
+// 6. Domain-Separated Cryptographic `SdkFingerprint` (`AXS-SDK-035`)
+// =============================================================================
+
+pub struct SysrootMerkleEntry {
+    pub path: StrView,
+    pub file_size: u64,
+    pub content_hash: u64,
+}
+
+pub fn sysroot_merkle_entry_empty() -> SysrootMerkleEntry {
+    let e = ux2_sv_empty()
+    SysrootMerkleEntry {
+        path: e,
+        file_size: 0u64,
+        content_hash: 0u64,
+    }
+}
+
+pub fn compute_sysroot_merkle_root(
+    entries: view<[4]SysrootMerkleEntry>,
+    count: usize
+) -> Digest256 {
+    let mut root = digest256_domain_init(ux2_sv("AXIOM_SDK_MERKLE_ROOT_V1\0"))
+    let mut i: usize = 0usize
+    while i < count && i < 4usize {
+        let entry = (*entries)[i]
+        let mut h = digest256_domain_init(ux2_sv("AXIOM_SDK_ENTRY_V1\0"))
+        h = digest256_mix_sv(h, entry.path)
+        h = digest256_mix_u64(h, entry.file_size)
+        h = digest256_mix_u64(h, entry.content_hash)
+        root = digest256_combine(root, h)
+        i = i + 1usize
+    }
+    root
+}
+
+pub fn compute_sdk_fingerprint(
+    target_triple: StrView,
+    manifest_bytes: StrView,
+    merkle_root: Digest256
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_SDK_FINGERPRINT_V1\0"))
+    d = digest256_mix_sv(d, target_triple)
+    d = digest256_mix_sv(d, manifest_bytes)
+    d = digest256_combine(d, merkle_root)
+    d
+}
+
+pub fn verify_sdk_fingerprint(
+    computed: Digest256,
+    expected: Digest256,
+    target_triple: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if digest256_eq(computed, expected) {
+        return true
+    }
+    report_sdk_diag_2(
+        mut_view(*sink),
+        AX_SDK_FINGERPRINT_MISMATCH,
+        "computed SdkFingerprint does not match expected fingerprint or axiom.lock",
+        "target",
+        target_triple,
+        "status",
+        ux2_sv("mismatch")
+    )
+    false
+}
+
+// =============================================================================
+// 7. Sysroot Structure & High-Level Loader (`AXS-SDK-001`..`024`)
+// =============================================================================
+
+pub struct Sysroot {
+    pub root_path: StrView,
+    pub is_hermetic: bool,
+    pub manifest: SdkManifest,
+    pub library_count: usize,
+    pub libraries: [4]ImportLibrary,
+    pub merkle_entry_count: usize,
+    pub merkle_entries: [4]SysrootMerkleEntry,
+    pub fingerprint: Digest256,
+    pub is_loaded: bool,
+}
+
+pub fn sysroot_empty() -> Sysroot {
+    let e = ux2_sv_empty()
+    Sysroot {
+        root_path: e,
+        is_hermetic: false,
+        manifest: sdk_manifest_empty(),
+        library_count: 0usize,
+        libraries: [
+            import_library_empty(), import_library_empty(),
+            import_library_empty(), import_library_empty()
+        ],
+        merkle_entry_count: 0usize,
+        merkle_entries: [
+            sysroot_merkle_entry_empty(), sysroot_merkle_entry_empty(),
+            sysroot_merkle_entry_empty(), sysroot_merkle_entry_empty()
+        ],
+        fingerprint: digest256_zero(),
+        is_loaded: false,
+    }
+}
+
+pub fn sysroot_add_library(
+    sys: mut_view<Sysroot>,
+    lib: view<ImportLibrary>
+) -> bool {
+    if sys.library_count >= 4usize {
+        return false
+    }
+    let idx = sys.library_count
+    sys.libraries[idx].name = lib.name
+    sys.libraries[idx].target_file = lib.target_file
+    sys.libraries[idx].format = lib.format
+    sys.libraries[idx].symbol_count = lib.symbol_count
+    sys.libraries[idx].is_valid = lib.is_valid
+    let mut i: usize = 0usize
+    while i < lib.symbol_count && i < 4usize {
+        sys.libraries[idx].symbols[i] = lib.symbols[i]
+        i = i + 1usize
+    }
+    sys.library_count = sys.library_count + 1usize
+    true
+}
+
+pub fn sysroot_add_merkle_entry(
+    sys: mut_view<Sysroot>,
+    path: StrView,
+    file_size: u64,
+    content_hash: u64
+) -> bool {
+    if sys.merkle_entry_count >= 4usize {
+        return false
+    }
+    sys.merkle_entries[sys.merkle_entry_count] = SysrootMerkleEntry {
+        path: path,
+        file_size: file_size,
+        content_hash: content_hash,
+    }
+    sys.merkle_entry_count = sys.merkle_entry_count + 1usize
+    true
+}
+
+pub fn sysroot_resolve_symbol(
+    sys: view<Sysroot>,
+    lib_name: StrView,
+    sym_name: StrView,
+    out_sym: mut_view<ImportSymbol>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut li: usize = 0usize
+    while li < sys.library_count {
+        if ux2_sv_eq(sys.libraries[li].name, lib_name) {
+            let mut si: usize = 0usize
+            while si < sys.libraries[li].symbol_count {
+                if ux2_sv_eq(sys.libraries[li].symbols[si].name, sym_name) {
+                    *out_sym = sys.libraries[li].symbols[si]
+                    return true
+                }
+                si = si + 1usize
+            }
+        }
+        li = li + 1usize
+    }
+
+    *out_sym = import_symbol_empty()
+    report_sdk_diag_2(
+        mut_view(*sink),
+        AX_SDK_IMPORT_STUB_NOT_FOUND,
+        "required dynamic library or platform symbol stub was not found in platform SDK",
+        "library",
+        lib_name,
+        "symbol",
+        sym_name
+    )
+    false
+}
+
+pub fn sysroot_loader_load(
+    root_path: StrView,
+    manifest_toml: StrView,
+    is_hermetic: bool,
+    expected_fp: Digest256,
+    out_sysroot: mut_view<Sysroot>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    *out_sysroot = sysroot_empty()
+
+    if !verify_sysroot_hermeticity(root_path, is_hermetic, mut_view(*sink)) {
+        return false
+    }
+
+    let manifest = parse_sdk_manifest(manifest_toml, mut_view(*sink))
+    if !manifest.is_valid {
+        return false
+    }
+
+    let target_triple = manifest.target_triple
+    out_sysroot.root_path = root_path
+    out_sysroot.is_hermetic = is_hermetic
+    out_sysroot.manifest = manifest
+
+    let merkle_root = compute_sysroot_merkle_root(
+        view(out_sysroot.merkle_entries),
+        out_sysroot.merkle_entry_count
+    )
+    let computed_fp = compute_sdk_fingerprint(
+        target_triple,
+        manifest_toml,
+        merkle_root
+    )
+    out_sysroot.fingerprint = computed_fp
+
+    if !digest256_eq(expected_fp, digest256_zero()) {
+        if !verify_sdk_fingerprint(computed_fp, expected_fp, target_triple, mut_view(*sink)) {
+            return false
+        }
+    }
+
+    out_sysroot.is_loaded = true
+    true
+}
