@@ -1,0 +1,277 @@
+// `axiomc doc` CLI Subcommand Driver (`compiler/driver/doc_cmd/mod.ax`, T817 / E19.5).
+// Implements SPEC-104 §4.1, §6.1 (AXS-DOC-050, AXS-DOC-053; REQ-TOOL-002, REQ-TOOL-298).
+module compiler.driver.doc_cmd
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.code.AX_DRIVER_UNKNOWN_OPTION
+use compiler.diag.code.diag_code
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.docgen.DocPackageGraph
+use compiler.docgen.DocTestSuiteSummary
+use compiler.docgen.doc_buf_push_str
+use compiler.docgen.docgen_resolve_intra_doc_links
+use compiler.docgen.docgen_render_html_site
+use compiler.docgen.docgen_render_search_index_json
+use compiler.docgen.docgen_render_doc_graph_json
+use compiler.docgen.docgen_run_package_doctests
+
+pub const DOC_EXIT_OK: i32 = 0
+pub const DOC_EXIT_ERROR: i32 = 1
+pub const DOC_EXIT_USAGE: i32 = 2
+pub const DOC_EXIT_ICE: i32 = 3
+
+@derive(Copy)
+pub struct DocCliOptions {
+    pub out_dir: StrView,
+    pub emit_json: bool,
+    pub include_private: bool,
+    pub include_hidden: bool,
+    pub deny_broken_links: bool,
+    pub run_doctests: bool,
+    pub include_ignored: bool,
+    pub show_help: bool,
+    pub path_0: StrView,
+    pub path_1: StrView,
+    pub path_count: usize,
+    pub has_usage_error: bool,
+    pub exit_code: i32,
+}
+
+@derive(Copy)
+pub struct DocCmdResult {
+    pub exit_code: i32,
+    pub broken_link_count: u32,
+    pub doctest_total: u32,
+    pub doctest_passed: u32,
+    pub doctest_failed: u32,
+    pub doctest_ignored: u32,
+    pub emitted_html: bool,
+    pub emitted_search_index: bool,
+    pub emitted_doc_graph_json: bool,
+    pub out_dir: StrView,
+}
+
+pub fn doc_cli_options_default() -> DocCliOptions {
+    DocCliOptions {
+        out_dir: ux2_sv("target/doc"),
+        emit_json: false,
+        include_private: false,
+        include_hidden: false,
+        deny_broken_links: false,
+        run_doctests: false,
+        include_ignored: false,
+        show_help: false,
+        path_0: ux2_sv_empty(),
+        path_1: ux2_sv_empty(),
+        path_count: 0usize,
+        has_usage_error: false,
+        exit_code: DOC_EXIT_OK,
+    }
+}
+
+fn doc_arg_starts_with_dash(arg: StrView) -> bool {
+    if (arg.ptr as usize) == 0 || arg.len == 0 {
+        return false
+    }
+    (unsafe { *(arg.ptr + 0) }) == 45u8
+}
+
+// Parses `axiomc doc` CLI arguments (`AXS-DOC-050`, `AXS-DOC-053`).
+// Rejects unknown flags with `AX_DRIVER_UNKNOWN_OPTION` (exit code 2)
+// and missing `--out-dir <dir>` value with `AX_DRIVER_USAGE` (exit code 2).
+pub fn doc_parse_cli_args(
+    args: view<[8]StrView>,
+    arg_count: usize,
+    sink: mut_view<DiagSink>
+) -> DocCliOptions {
+    let mut opts = doc_cli_options_default()
+    let mut i: usize = 0
+    while i < arg_count && i < 8usize {
+        let arg = (*args)[i]
+        if arg.len == 0 || (arg.ptr as usize) == 0 {
+            i = i + 1
+            continue
+        }
+        if ux2_sv_eq(arg, ux2_sv("--json")) {
+            opts.emit_json = true
+        } else if ux2_sv_eq(arg, ux2_sv("--include-private")) {
+            opts.include_private = true
+        } else if ux2_sv_eq(arg, ux2_sv("--include-hidden")) {
+            opts.include_hidden = true
+        } else if ux2_sv_eq(arg, ux2_sv("--deny-broken-links")) {
+            opts.deny_broken_links = true
+        } else if ux2_sv_eq(arg, ux2_sv("--test")) {
+            opts.run_doctests = true
+        } else if ux2_sv_eq(arg, ux2_sv("--include-ignored")) {
+            opts.include_ignored = true
+        } else if ux2_sv_eq(arg, ux2_sv("--help")) || ux2_sv_eq(arg, ux2_sv("-h")) {
+            opts.show_help = true
+        } else if ux2_sv_eq(arg, ux2_sv("--out-dir")) {
+            if i + 1 >= arg_count || i + 1 >= 8usize {
+                let d = diag_new(
+                    diag_code(AX_DRIVER_USAGE),
+                    span_none(),
+                    ux2_sv("missing directory argument after `--out-dir`")
+                )
+                diag_sink_report(mut_view(*sink), view(d))
+                opts.has_usage_error = true
+                opts.exit_code = DOC_EXIT_USAGE
+                return opts
+            }
+            let next_arg = (*args)[i + 1]
+            if next_arg.len == 0 || doc_arg_starts_with_dash(next_arg) {
+                let d = diag_new(
+                    diag_code(AX_DRIVER_USAGE),
+                    span_none(),
+                    ux2_sv("expected directory path after `--out-dir`")
+                )
+                diag_sink_report(mut_view(*sink), view(d))
+                opts.has_usage_error = true
+                opts.exit_code = DOC_EXIT_USAGE
+                return opts
+            }
+            opts.out_dir = next_arg
+            i = i + 1
+        } else if doc_arg_starts_with_dash(arg) {
+            let d = diag_new(
+                diag_code(AX_DRIVER_UNKNOWN_OPTION),
+                span_none(),
+                ux2_sv("unknown option passed to `axiomc doc`")
+            )
+            diag_sink_report(mut_view(*sink), view(d))
+            opts.has_usage_error = true
+            opts.exit_code = DOC_EXIT_USAGE
+            return opts
+        } else {
+            if opts.path_count == 0usize {
+                opts.path_0 = arg
+                opts.path_count = 1usize
+            } else if opts.path_count == 1usize {
+                opts.path_1 = arg
+                opts.path_count = 2usize
+            }
+        }
+        i = i + 1
+    }
+    opts
+}
+
+pub fn doc_write_help_banner(out_buf: mut_view<DiagBuffer>) {
+    doc_buf_push_str(
+        mut_view(*out_buf),
+        "Usage: axiomc doc [<path>...] [--out-dir <dir>] [--json] [--include-private] [--include-hidden] [--deny-broken-links] [--test] [--include-ignored]\n"
+    )
+}
+
+// Executes `axiomc doc` on a `DocPackageGraph` according to `opts` (`AXS-DOC-050`, `AXS-DOC-053`).
+pub fn doc_cmd_execute(
+    opts: DocCliOptions,
+    graph: mut_view<DocPackageGraph>,
+    html_buf: mut_view<DiagBuffer>,
+    search_buf: mut_view<DiagBuffer>,
+    json_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> DocCmdResult {
+    if opts.has_usage_error {
+        return DocCmdResult {
+            exit_code: DOC_EXIT_USAGE,
+            broken_link_count: 0u32,
+            doctest_total: 0u32,
+            doctest_passed: 0u32,
+            doctest_failed: 0u32,
+            doctest_ignored: 0u32,
+            emitted_html: false,
+            emitted_search_index: false,
+            emitted_doc_graph_json: false,
+            out_dir: opts.out_dir,
+        }
+    }
+    if opts.show_help {
+        doc_write_help_banner(mut_view(*html_buf))
+        return DocCmdResult {
+            exit_code: DOC_EXIT_OK,
+            broken_link_count: 0u32,
+            doctest_total: 0u32,
+            doctest_passed: 0u32,
+            doctest_failed: 0u32,
+            doctest_ignored: 0u32,
+            emitted_html: false,
+            emitted_search_index: false,
+            emitted_doc_graph_json: false,
+            out_dir: opts.out_dir,
+        }
+    }
+
+    let broken = docgen_resolve_intra_doc_links(
+        mut_view(*graph),
+        opts.deny_broken_links,
+        mut_view(*sink)
+    )
+    docgen_render_html_site(
+        view(*graph),
+        opts.include_private,
+        opts.include_hidden,
+        mut_view(*html_buf)
+    )
+    docgen_render_search_index_json(
+        view(*graph),
+        opts.include_private,
+        opts.include_hidden,
+        mut_view(*search_buf)
+    )
+    if opts.emit_json {
+        docgen_render_doc_graph_json(
+            view(*graph),
+            opts.include_private,
+            opts.include_hidden,
+            mut_view(*json_buf)
+        )
+    }
+
+    let mut dt_total: u32 = 0u32
+    let mut dt_passed: u32 = 0u32
+    let mut dt_failed: u32 = 0u32
+    let mut dt_ignored: u32 = 0u32
+    if opts.run_doctests {
+        let suite: DocTestSuiteSummary = docgen_run_package_doctests(
+            view(*graph),
+            opts.include_ignored
+        )
+        dt_total = suite.total_blocks
+        dt_passed = suite.passed_count
+        dt_failed = suite.failed_count
+        dt_ignored = suite.ignored_count
+    }
+
+    let mut exit_code: i32 = DOC_EXIT_OK
+    if opts.deny_broken_links && broken > 0u32 {
+        exit_code = DOC_EXIT_ERROR
+    }
+    if opts.run_doctests && dt_failed > 0u32 {
+        exit_code = DOC_EXIT_ERROR
+    }
+
+    DocCmdResult {
+        exit_code: exit_code,
+        broken_link_count: broken,
+        doctest_total: dt_total,
+        doctest_passed: dt_passed,
+        doctest_failed: dt_failed,
+        doctest_ignored: dt_ignored,
+        emitted_html: true,
+        emitted_search_index: true,
+        emitted_doc_graph_json: opts.emit_json,
+        out_dir: opts.out_dir,
+    }
+}

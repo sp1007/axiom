@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T805, T816]
 priority: 207
-status: doing
+status: done
 attempts: 1
 paths: [compiler/docgen, compiler/driver/doc_cmd, tests/run/docgen]
 spec: [spec/SPEC-104-docgen-test-framework-ux.md, spec/SPEC-21-query-engine-semantic-db.md, tasks/0361, tasks/0374, tasks/0418, tasks/0693, tasks/0695, tasks/0696]
 covers: [REQ-TOOL-002, REQ-TOOL-187, REQ-TOOL-298]
 started: 2026-11-08 17:25:07
-agent: T817-impl
+finished: 2026-11-08 19:03:57
 ---
 # T817 — E19.5 CompilerDB documentation extractor, HTML/JSON site renderer, search index & executable doc-test runner (axiomc doc)
 
@@ -42,3 +42,4 @@ Implement the `CompilerDB`-backed documentation generator (`compiler/docgen`), d
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 17:25:07 started (attempt 1) T817-impl
+- 2026-11-08 19:03:57 accepted by QA -> done

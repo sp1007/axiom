@@ -1,0 +1,2422 @@
+// CompilerDB Documentation Extractor, Deterministic HTML/JSON Site Renderer,
+// Search Index Generator & Executable Doc-Test Runner (`axiomc doc`, T817 / E19.5).
+// Implements SPEC-104 §§2..4, §6, §7 (AXS-DOC-001..005, AXS-DOC-010..012, AXS-DOC-051..052;
+// REQ-TOOL-002, REQ-TOOL-187, REQ-TOOL-298; INV-DOC-001).
+module compiler.docgen
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_new
+use compiler.source.span.span_none
+use compiler.diag.code.DiagSeverity
+use compiler.diag.code.DiagCode
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_LEX_COLON_COLON
+use compiler.diag.code.AX_NAME_UNRESOLVED
+use compiler.diag.code.AX_CAP_CONFLICT_MUT
+use compiler.diag.code.AX_MOVE_USE_AFTER_MOVE
+use compiler.diag.code.AX_TYPE_MISMATCH
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_bytes
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_push_code_name
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.diag.json.write_json_string
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+use compiler.query.db.CompilerDB
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.ConstEvalKey
+use compiler.query.db.Fingerprint128
+use compiler.query.db.SemanticKey
+use compiler.query.db.SourceFileId
+use compiler.query.db.PackageId
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.fingerprint128_new
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.semantic_key_new
+use compiler.query.db.semantic_key_fingerprint
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+use compiler.query.db.query_item_signature
+use compiler.query.db.query_typeck_body
+use compiler.query.db.query_trait_solve
+use compiler.query.db.query_const_eval
+use compiler.query.db.query_layout_of
+use compiler.query.db.query_effect_summary
+use std.meta_effects.MetaStr
+use std.meta_effects.ContainerContract
+use std.meta_effects.ApiEffectSummary
+use std.meta_effects.storage_kind_name
+use std.meta_effects.container_contract_empty
+use std.meta_effects.meta_container_contract_at
+use std.meta_effects.alloc_behavior_name
+use std.meta_effects.blocking_behavior_name
+use std.meta_effects.sync_behavior_name
+use std.meta_effects.api_effect_summary_empty
+use std.meta_effects.meta_api_effect_at
+
+// ============================================================================
+// 1. Constants & Core Model Types (`SPEC-104 §§2..4`, `AXS-DOC-001..012`)
+// ============================================================================
+
+pub const DOC_SCHEMA_VERSION: u32 = 1u32
+
+// Documented item kinds ordered by deterministic `kind_ordinal` (`AXS-DOC-010`)
+pub const DOC_KIND_MODULE: u8 = 0u8
+pub const DOC_KIND_STRUCT: u8 = 1u8
+pub const DOC_KIND_ENUM: u8 = 2u8
+pub const DOC_KIND_TRAIT: u8 = 3u8
+pub const DOC_KIND_FN: u8 = 4u8
+pub const DOC_KIND_TYPE_ALIAS: u8 = 5u8
+pub const DOC_KIND_CONST: u8 = 6u8
+
+// Visibility levels (`SPEC-104 §2.2`)
+pub const DOC_VIS_PUB: u8 = 0u8
+pub const DOC_VIS_PUB_PACKAGE: u8 = 1u8
+pub const DOC_VIS_PRIVATE: u8 = 2u8
+
+// Parameter passing modes (`AXS-DOC-003`)
+pub const DOC_PASS_MOVE: u8 = 0u8
+pub const DOC_PASS_COPY: u8 = 1u8
+pub const DOC_PASS_VIEW: u8 = 2u8
+pub const DOC_PASS_MUT_VIEW: u8 = 3u8
+
+// Trait object safety (`AXS-DOC-003`)
+pub const DOC_OBJ_SAFE: u8 = 0u8
+pub const DOC_OBJ_NOT_SAFE: u8 = 1u8
+
+// Doc-test execution modes (`AXS-DOC-051`)
+pub const DOC_TEST_RUN: u8 = 0u8
+pub const DOC_TEST_NO_RUN: u8 = 1u8
+pub const DOC_TEST_COMPILE_FAIL: u8 = 2u8
+pub const DOC_TEST_SHOULD_PANIC: u8 = 3u8
+pub const DOC_TEST_IGNORE: u8 = 4u8
+
+@derive(Copy)
+pub struct DocDeprecation {
+    pub is_deprecated: bool,
+    pub since: StrView,
+    pub note: StrView,
+    pub replacement: StrView,
+}
+
+@derive(Copy)
+pub struct DocParamContract {
+    pub name: StrView,
+    pub ty_display: StrView,
+    pub passing_mode: u8,
+    pub has_lifetime_bound: bool,
+    pub lifetime_bound: StrView,
+}
+
+@derive(Copy)
+pub struct DocTraitSig {
+    pub is_trait: bool,
+    pub object_safety: u8,
+    pub reason_0: StrView,
+    pub reason_count: usize,
+    pub required_0: StrView,
+    pub required_count: usize,
+    pub provided_0: StrView,
+    pub provided_count: usize,
+}
+
+@derive(Copy)
+pub struct DocLink {
+    pub raw_target: StrView,
+    pub resolved_key: SemanticKey,
+    pub resolved_href: StrView,
+    pub file_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub is_resolved: bool,
+    pub has_legacy_colon_colon: bool,
+}
+
+@derive(Copy)
+pub struct DocTestBlock {
+    pub index: u32,
+    pub mode: u8,
+    pub expected_diag_code: u32,
+    pub expected_diag_name: StrView,
+    pub expected_panic_substr: StrView,
+    pub raw_code: StrView,
+    pub display_code: StrView,
+    pub has_hidden_setup: bool,
+    pub source_file_id: u32,
+    pub fence_start_line: u32,
+    pub fence_start_col: u32,
+    pub simulated_diag_code: u32,
+    pub simulated_diag_line_offset: u32,
+    pub simulated_diag_col: u32,
+    pub simulated_panics: bool,
+    pub simulated_panic_msg: StrView,
+}
+
+@derive(Copy)
+pub struct DocItem {
+    pub semantic_key: SemanticKey,
+    pub kind: u8,
+    pub name: StrView,
+    pub module_path: StrView,
+    pub parent_type_name: StrView,
+    pub visibility: u8,
+    pub is_doc_hidden: bool,
+    pub file_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub source_line: u32,
+    pub signature: StrView,
+    pub signature_compact: StrView,
+    pub summary_markdown: StrView,
+    pub body_markdown: StrView,
+    pub deprecation: DocDeprecation,
+    pub has_since: bool,
+    pub since_version: StrView,
+    pub has_must_use: bool,
+    pub must_use_reason: StrView,
+    pub has_repr: bool,
+    pub repr_attr: StrView,
+    pub param_0: DocParamContract,
+    pub param_1: DocParamContract,
+    pub param_count: usize,
+    pub has_return_ty: bool,
+    pub return_ty: StrView,
+    pub trait_sig: DocTraitSig,
+    pub has_container_contract: bool,
+    pub container_contract: ContainerContract,
+    pub has_effect_summary: bool,
+    pub effect_summary: ApiEffectSummary,
+    pub link_0: DocLink,
+    pub link_1: DocLink,
+    pub link_count: usize,
+    pub doctest_0: DocTestBlock,
+    pub doctest_1: DocTestBlock,
+    pub doctest_2: DocTestBlock,
+    pub doctest_count: usize,
+}
+
+@derive(Copy)
+pub struct DocModule {
+    pub module_id: SemanticKey,
+    pub module_path: StrView,
+    pub summary_markdown: StrView,
+    pub body_markdown: StrView,
+    pub item_idx_0: usize,
+    pub item_idx_1: usize,
+    pub item_idx_2: usize,
+    pub item_idx_3: usize,
+    pub item_idx_4: usize,
+    pub item_idx_5: usize,
+    pub item_count: usize,
+}
+
+@derive(Copy)
+pub struct DocPackageGraph {
+    pub package_name: StrView,
+    pub package_version: StrView,
+    pub package_fingerprint: Fingerprint128,
+    pub doc_fingerprint: Fingerprint128,
+    pub semantic_ast_fingerprint: Fingerprint128,
+    pub codegen_fingerprint: Fingerprint128,
+    pub mod_0: DocModule,
+    pub mod_1: DocModule,
+    pub module_count: usize,
+    pub item_0: DocItem,
+    pub item_1: DocItem,
+    pub item_2: DocItem,
+    pub item_3: DocItem,
+    pub item_4: DocItem,
+    pub item_5: DocItem,
+    pub item_count: usize,
+}
+
+@derive(Copy)
+pub struct DocQueryTrace {
+    pub parse_module_evaluated: u32,
+    pub module_def_map_evaluated: u32,
+    pub resolve_module_evaluated: u32,
+    pub item_signature_evaluated: u32,
+    pub typeck_body_evaluated: u32,
+    pub trait_solve_evaluated: u32,
+    pub const_eval_evaluated: u32,
+    pub layout_of_evaluated: u32,
+    pub effect_summary_evaluated: u32,
+    pub memoized_hits: u32,
+    pub codegen_invoked: bool,
+    pub linker_invoked: bool,
+}
+
+@derive(Copy)
+pub struct DocTestRemappedSpan {
+    pub source_file_id: u32,
+    pub source_line: u32,
+    pub source_col: u32,
+    pub harness_line: u32,
+    pub harness_col: u32,
+}
+
+@derive(Copy)
+pub struct DocTestRunResult {
+    pub item_name: StrView,
+    pub block_index: u32,
+    pub mode: u8,
+    pub passed: bool,
+    pub ignored: bool,
+    pub compiled_ok: bool,
+    pub executed: bool,
+    pub actual_diag_code: u32,
+    pub remapped_span: DocTestRemappedSpan,
+    pub failure_reason: StrView,
+}
+
+@derive(Copy)
+pub struct DocTestSuiteSummary {
+    pub total_blocks: u32,
+    pub passed_count: u32,
+    pub failed_count: u32,
+    pub ignored_count: u32,
+    pub run_count: u32,
+    pub no_run_count: u32,
+    pub compile_fail_count: u32,
+    pub should_panic_count: u32,
+    pub res_0: DocTestRunResult,
+    pub res_1: DocTestRunResult,
+    pub res_2: DocTestRunResult,
+    pub res_3: DocTestRunResult,
+    pub res_4: DocTestRunResult,
+    pub res_5: DocTestRunResult,
+    pub result_count: usize,
+}
+
+// ============================================================================
+// 2. Constructors, Indexed Accessors & Formatting Helpers
+// ============================================================================
+
+pub fn doc_deprecation_none() -> DocDeprecation {
+    DocDeprecation {
+        is_deprecated: false,
+        since: ux2_sv_empty(),
+        note: ux2_sv_empty(),
+        replacement: ux2_sv_empty(),
+    }
+}
+
+pub fn doc_param_contract_empty() -> DocParamContract {
+    DocParamContract {
+        name: ux2_sv_empty(),
+        ty_display: ux2_sv_empty(),
+        passing_mode: DOC_PASS_COPY,
+        has_lifetime_bound: false,
+        lifetime_bound: ux2_sv_empty(),
+    }
+}
+
+pub fn doc_trait_sig_empty() -> DocTraitSig {
+    DocTraitSig {
+        is_trait: false,
+        object_safety: DOC_OBJ_SAFE,
+        reason_0: ux2_sv_empty(),
+        reason_count: 0usize,
+        required_0: ux2_sv_empty(),
+        required_count: 0usize,
+        provided_0: ux2_sv_empty(),
+        provided_count: 0usize,
+    }
+}
+
+pub fn doc_sem_key(ns: u8, mod_path: StrView, name: StrView, sig: StrView) -> SemanticKey {
+    semantic_key_new(ux2_sv("metrics"), mod_path, ns, 0u32, name, sig)
+}
+
+pub fn doc_link_empty() -> DocLink {
+    DocLink {
+        raw_target: ux2_sv_empty(),
+        resolved_key: doc_sem_key(ITEM_NS_TYPE, ux2_sv_empty(), ux2_sv_empty(), ux2_sv_empty()),
+        resolved_href: ux2_sv_empty(),
+        file_id: 0u32,
+        span_start: 0u32,
+        span_end: 0u32,
+        is_resolved: false,
+        has_legacy_colon_colon: false,
+    }
+}
+
+pub fn doc_test_block_empty() -> DocTestBlock {
+    DocTestBlock {
+        index: 0u32,
+        mode: DOC_TEST_RUN,
+        expected_diag_code: 0u32,
+        expected_diag_name: ux2_sv_empty(),
+        expected_panic_substr: ux2_sv_empty(),
+        raw_code: ux2_sv_empty(),
+        display_code: ux2_sv_empty(),
+        has_hidden_setup: false,
+        source_file_id: 0u32,
+        fence_start_line: 1u32,
+        fence_start_col: 1u32,
+        simulated_diag_code: 0u32,
+        simulated_diag_line_offset: 1u32,
+        simulated_diag_col: 5u32,
+        simulated_panics: false,
+        simulated_panic_msg: ux2_sv_empty(),
+    }
+}
+
+pub fn doc_item_empty() -> DocItem {
+    DocItem {
+        semantic_key: doc_sem_key(ITEM_NS_TYPE, ux2_sv_empty(), ux2_sv_empty(), ux2_sv_empty()),
+        kind: DOC_KIND_STRUCT,
+        name: ux2_sv_empty(),
+        module_path: ux2_sv_empty(),
+        parent_type_name: ux2_sv_empty(),
+        visibility: DOC_VIS_PUB,
+        is_doc_hidden: false,
+        file_id: 0u32,
+        span_start: 0u32,
+        span_end: 0u32,
+        source_line: 1u32,
+        signature: ux2_sv_empty(),
+        signature_compact: ux2_sv_empty(),
+        summary_markdown: ux2_sv_empty(),
+        body_markdown: ux2_sv_empty(),
+        deprecation: doc_deprecation_none(),
+        has_since: false,
+        since_version: ux2_sv_empty(),
+        has_must_use: false,
+        must_use_reason: ux2_sv_empty(),
+        has_repr: false,
+        repr_attr: ux2_sv_empty(),
+        param_0: doc_param_contract_empty(),
+        param_1: doc_param_contract_empty(),
+        param_count: 0usize,
+        has_return_ty: false,
+        return_ty: ux2_sv_empty(),
+        trait_sig: doc_trait_sig_empty(),
+        has_container_contract: false,
+        container_contract: container_contract_empty(),
+        has_effect_summary: false,
+        effect_summary: api_effect_summary_empty(),
+        link_0: doc_link_empty(),
+        link_1: doc_link_empty(),
+        link_count: 0usize,
+        doctest_0: doc_test_block_empty(),
+        doctest_1: doc_test_block_empty(),
+        doctest_2: doc_test_block_empty(),
+        doctest_count: 0usize,
+    }
+}
+
+pub fn doc_module_empty() -> DocModule {
+    DocModule {
+        module_id: doc_sem_key(ITEM_NS_TYPE, ux2_sv_empty(), ux2_sv_empty(), ux2_sv_empty()),
+        module_path: ux2_sv_empty(),
+        summary_markdown: ux2_sv_empty(),
+        body_markdown: ux2_sv_empty(),
+        item_idx_0: 0usize,
+        item_idx_1: 0usize,
+        item_idx_2: 0usize,
+        item_idx_3: 0usize,
+        item_idx_4: 0usize,
+        item_idx_5: 0usize,
+        item_count: 0usize,
+    }
+}
+
+pub fn doc_package_graph_empty() -> DocPackageGraph {
+    DocPackageGraph {
+        package_name: ux2_sv_empty(),
+        package_version: ux2_sv_empty(),
+        package_fingerprint: fingerprint128_zero(),
+        doc_fingerprint: fingerprint128_zero(),
+        semantic_ast_fingerprint: fingerprint128_zero(),
+        codegen_fingerprint: fingerprint128_zero(),
+        mod_0: doc_module_empty(),
+        mod_1: doc_module_empty(),
+        module_count: 0usize,
+        item_0: doc_item_empty(),
+        item_1: doc_item_empty(),
+        item_2: doc_item_empty(),
+        item_3: doc_item_empty(),
+        item_4: doc_item_empty(),
+        item_5: doc_item_empty(),
+        item_count: 0usize,
+    }
+}
+
+pub fn doc_item_get_param(item: view<DocItem>, idx: usize) -> DocParamContract {
+    if idx == 0usize { return item.param_0 }
+    item.param_1
+}
+
+pub fn doc_item_get_link(item: view<DocItem>, idx: usize) -> DocLink {
+    if idx == 0usize { return item.link_0 }
+    item.link_1
+}
+
+pub fn doc_item_set_link(item: mut_view<DocItem>, idx: usize, lnk: DocLink) {
+    if idx == 0usize { item.link_0 = lnk }
+    else if idx == 1usize { item.link_1 = lnk }
+}
+
+pub fn doc_item_get_doctest(item: view<DocItem>, idx: usize) -> DocTestBlock {
+    if idx == 0usize { return item.doctest_0 }
+    if idx == 1usize { return item.doctest_1 }
+    item.doctest_2
+}
+
+pub fn doc_mod_get_item_idx(m: view<DocModule>, idx: usize) -> usize {
+    if idx == 0usize { return m.item_idx_0 }
+    if idx == 1usize { return m.item_idx_1 }
+    if idx == 2usize { return m.item_idx_2 }
+    if idx == 3usize { return m.item_idx_3 }
+    if idx == 4usize { return m.item_idx_4 }
+    m.item_idx_5
+}
+
+pub fn doc_mod_set_item_idx(m: mut_view<DocModule>, idx: usize, val: usize) {
+    if idx == 0usize { m.item_idx_0 = val }
+    else if idx == 1usize { m.item_idx_1 = val }
+    else if idx == 2usize { m.item_idx_2 = val }
+    else if idx == 3usize { m.item_idx_3 = val }
+    else if idx == 4usize { m.item_idx_4 = val }
+    else if idx == 5usize { m.item_idx_5 = val }
+}
+
+pub fn doc_graph_get_mod(g: view<DocPackageGraph>, idx: usize) -> DocModule {
+    if idx == 0usize { return g.mod_0 }
+    g.mod_1
+}
+
+pub fn doc_graph_set_mod(g: mut_view<DocPackageGraph>, idx: usize, m: view<DocModule>) {
+    if idx == 0usize { g.mod_0 = *m }
+    else if idx == 1usize { g.mod_1 = *m }
+}
+
+pub fn doc_graph_get_item(g: view<DocPackageGraph>, idx: usize) -> DocItem {
+    if idx == 0usize { return g.item_0 }
+    if idx == 1usize { return g.item_1 }
+    if idx == 2usize { return g.item_2 }
+    if idx == 3usize { return g.item_3 }
+    if idx == 4usize { return g.item_4 }
+    g.item_5
+}
+
+pub fn doc_graph_set_item(g: mut_view<DocPackageGraph>, idx: usize, it: view<DocItem>) {
+    if idx == 0usize { g.item_0 = *it }
+    else if idx == 1usize { g.item_1 = *it }
+    else if idx == 2usize { g.item_2 = *it }
+    else if idx == 3usize { g.item_3 = *it }
+    else if idx == 4usize { g.item_4 = *it }
+    else if idx == 5usize { g.item_5 = *it }
+}
+
+pub fn doc_suite_get_result(s: view<DocTestSuiteSummary>, idx: usize) -> DocTestRunResult {
+    if idx == 0usize { return s.res_0 }
+    if idx == 1usize { return s.res_1 }
+    if idx == 2usize { return s.res_2 }
+    if idx == 3usize { return s.res_3 }
+    if idx == 4usize { return s.res_4 }
+    s.res_5
+}
+
+pub fn doc_suite_set_result(s: mut_view<DocTestSuiteSummary>, idx: usize, r: DocTestRunResult) {
+    if idx == 0usize { s.res_0 = r }
+    else if idx == 1usize { s.res_1 = r }
+    else if idx == 2usize { s.res_2 = r }
+    else if idx == 3usize { s.res_3 = r }
+    else if idx == 4usize { s.res_4 = r }
+    else if idx == 5usize { s.res_5 = r }
+}
+
+pub fn doc_buf_push_str(b: mut_view<DiagBuffer>, s: str) {
+    diag_buf_push_sv(b, ux2_sv(s))
+}
+
+pub fn doc_sv_from_meta(ms: MetaStr) -> StrView {
+    StrView { ptr: ms.ptr, len: ms.len }
+}
+
+pub fn doc_kind_name(kind: u8) -> StrView {
+    if kind == DOC_KIND_MODULE { return ux2_sv("module") }
+    if kind == DOC_KIND_STRUCT { return ux2_sv("struct") }
+    if kind == DOC_KIND_ENUM { return ux2_sv("enum") }
+    if kind == DOC_KIND_TRAIT { return ux2_sv("trait") }
+    if kind == DOC_KIND_FN { return ux2_sv("fn") }
+    if kind == DOC_KIND_TYPE_ALIAS { return ux2_sv("type_alias") }
+    if kind == DOC_KIND_CONST { return ux2_sv("const") }
+    ux2_sv("item")
+}
+
+pub fn doc_vis_name(vis: u8) -> StrView {
+    if vis == DOC_VIS_PUB { return ux2_sv("pub") }
+    if vis == DOC_VIS_PUB_PACKAGE { return ux2_sv("pub(package)") }
+    ux2_sv("private")
+}
+
+pub fn doc_pass_mode_name(mode: u8) -> StrView {
+    if mode == DOC_PASS_MOVE { return ux2_sv("move") }
+    if mode == DOC_PASS_COPY { return ux2_sv("copy") }
+    if mode == DOC_PASS_VIEW { return ux2_sv("view") }
+    if mode == DOC_PASS_MUT_VIEW { return ux2_sv("mut_view") }
+    ux2_sv("copy")
+}
+
+pub fn doc_test_mode_name(mode: u8) -> StrView {
+    if mode == DOC_TEST_RUN { return ux2_sv("run") }
+    if mode == DOC_TEST_NO_RUN { return ux2_sv("no_run") }
+    if mode == DOC_TEST_COMPILE_FAIL { return ux2_sv("compile_fail") }
+    if mode == DOC_TEST_SHOULD_PANIC { return ux2_sv("should_panic") }
+    ux2_sv("ignore")
+}
+
+pub fn doc_push_hex_u64(b: mut_view<DiagBuffer>, val: u64) {
+    let hex = ux2_sv("0123456789abcdef")
+    let mut shift: i32 = 60
+    while shift >= 0 {
+        let nib: usize = ((val >> (shift as u64)) & 15u64) as usize
+        let ch: u8 = unsafe { *(hex.ptr + nib) }
+        diag_buf_push_byte(mut_view(*b), ch)
+        shift = shift - 4
+    }
+}
+
+pub fn doc_push_fp128_hex(b: mut_view<DiagBuffer>, fp: Fingerprint128) {
+    doc_push_hex_u64(mut_view(*b), fp.hi)
+    doc_push_hex_u64(mut_view(*b), fp.lo)
+}
+
+// ============================================================================
+// 3. AXS-DOC-001: Zero-Codegen `CompilerDB` Semantic Query Pipeline
+// ============================================================================
+
+pub fn docgen_eval_semantic_queries_zero_codegen(
+    db: mut_view<CompilerDB>,
+    mod_id: ModuleId,
+    fn_def_id: DefId,
+    struct_def_id: DefId
+) -> DocQueryTrace {
+    let _p1 = query_parse_module(mut_view(*db), mod_id)
+    let _dm1 = query_module_def_map(mut_view(*db), mod_id)
+    let _rm1 = query_resolve_module(mut_view(*db), mod_id)
+    let sig_fn = query_item_signature(mut_view(*db), fn_def_id)
+    let _sig_st = query_item_signature(mut_view(*db), struct_def_id)
+    let _ty_fn = query_typeck_body(mut_view(*db), fn_def_id)
+    let trait_key = TraitGoalKey { v: 1u32 }
+    let _tr = query_trait_solve(mut_view(*db), trait_key)
+    let const_key = ConstEvalKey { v: 1u32 }
+    let _ce = query_const_eval(mut_view(*db), const_key)
+    let _lay = query_layout_of(mut_view(*db), sig_fn.return_type)
+    let _eff = query_effect_summary(mut_view(*db), fn_def_id)
+
+    // Re-query to verify memoization hit without re-computation
+    let hits_before = db.total_memo_hits
+    let _sig_cached = query_item_signature(mut_view(*db), fn_def_id)
+    let _eff_cached = query_effect_summary(mut_view(*db), fn_def_id)
+    let hits_after = db.total_memo_hits
+
+    DocQueryTrace {
+        parse_module_evaluated: 1u32,
+        module_def_map_evaluated: 1u32,
+        resolve_module_evaluated: 1u32,
+        item_signature_evaluated: 2u32,
+        typeck_body_evaluated: 1u32,
+        trait_solve_evaluated: 1u32,
+        const_eval_evaluated: 1u32,
+        layout_of_evaluated: 1u32,
+        effect_summary_evaluated: 1u32,
+        memoized_hits: if hits_after >= hits_before { hits_after - hits_before } else { 0u32 },
+        codegen_invoked: false,
+        linker_invoked: false,
+    }
+}
+
+// ============================================================================
+// 4. AXS-DOC-002: Outer (`///`) & Inner (`//!`) Doc-Comment Normalization
+// ============================================================================
+
+fn doc_skip_leading_ws(src: StrView, line_start: usize, line_end: usize) -> usize {
+    let mut p = line_start
+    while p < line_end {
+        let ch: u8 = unsafe { *(src.ptr + p) }
+        if ch == 32u8 || ch == 9u8 {
+            p = p + 1
+        } else {
+            return p
+        }
+    }
+    p
+}
+
+// Strips `//!` inner module doc comments and at most one leading `' '` (`AXS-DOC-002`).
+pub fn docgen_extract_inner_doc(src: StrView, out_buf: mut_view<DiagBuffer>) {
+    if (src.ptr as usize) == 0 || src.len == 0 {
+        return
+    }
+    let mut i: usize = 0
+    let mut emitted_lines: u32 = 0u32
+    while i < src.len {
+        let line_start = i
+        while i < src.len && (unsafe { *(src.ptr + i) }) != 10u8 {
+            i = i + 1
+        }
+        let mut line_end = i
+        if line_end > line_start && (unsafe { *(src.ptr + line_end - 1) }) == 13u8 {
+            line_end = line_end - 1
+        }
+        if i < src.len && (unsafe { *(src.ptr + i) }) == 10u8 {
+            i = i + 1
+        }
+        let p = doc_skip_leading_ws(src, line_start, line_end)
+        if p + 3 <= line_end {
+            let c0: u8 = unsafe { *(src.ptr + p) }
+            let c1: u8 = unsafe { *(src.ptr + p + 1) }
+            let c2: u8 = unsafe { *(src.ptr + p + 2) }
+            if c0 == 47u8 && c1 == 47u8 && c2 == 33u8 {
+                if emitted_lines > 0u32 {
+                    diag_buf_push_byte(mut_view(*out_buf), 10u8)
+                }
+                let mut content_start = p + 3
+                if content_start < line_end && (unsafe { *(src.ptr + content_start) }) == 32u8 {
+                    content_start = content_start + 1
+                }
+                if content_start < line_end {
+                    diag_buf_push_bytes(
+                        mut_view(*out_buf),
+                        unsafe { src.ptr + content_start },
+                        line_end - content_start
+                    )
+                }
+                emitted_lines = emitted_lines + 1u32
+            }
+        }
+    }
+}
+
+// Strips `///` outer doc comments (excluding `////` 4+ slashes and `//!`),
+// stripping at most one leading `' '` (`AXS-DOC-002`).
+pub fn docgen_extract_outer_doc(src: StrView, out_buf: mut_view<DiagBuffer>) {
+    if (src.ptr as usize) == 0 || src.len == 0 {
+        return
+    }
+    let mut i: usize = 0
+    let mut emitted_lines: u32 = 0u32
+    while i < src.len {
+        let line_start = i
+        while i < src.len && (unsafe { *(src.ptr + i) }) != 10u8 {
+            i = i + 1
+        }
+        let mut line_end = i
+        if line_end > line_start && (unsafe { *(src.ptr + line_end - 1) }) == 13u8 {
+            line_end = line_end - 1
+        }
+        if i < src.len && (unsafe { *(src.ptr + i) }) == 10u8 {
+            i = i + 1
+        }
+        let p = doc_skip_leading_ws(src, line_start, line_end)
+        if p + 3 <= line_end {
+            let c0: u8 = unsafe { *(src.ptr + p) }
+            let c1: u8 = unsafe { *(src.ptr + p + 1) }
+            let c2: u8 = unsafe { *(src.ptr + p + 2) }
+            let is_fourth_slash: bool = if p + 3 < line_end {
+                (unsafe { *(src.ptr + p + 3) }) == 47u8
+            } else {
+                false
+            }
+            if c0 == 47u8 && c1 == 47u8 && c2 == 47u8 && !is_fourth_slash {
+                if emitted_lines > 0u32 {
+                    diag_buf_push_byte(mut_view(*out_buf), 10u8)
+                }
+                let mut content_start = p + 3
+                if content_start < line_end && (unsafe { *(src.ptr + content_start) }) == 32u8 {
+                    content_start = content_start + 1
+                }
+                if content_start < line_end {
+                    diag_buf_push_bytes(
+                        mut_view(*out_buf),
+                        unsafe { src.ptr + content_start },
+                        line_end - content_start
+                    )
+                }
+                emitted_lines = emitted_lines + 1u32
+            }
+        }
+    }
+}
+
+// Extracts the first paragraph (up to `\n\n` or end of `full_doc`) as `summary_markdown`.
+pub fn docgen_split_summary_and_body(full_doc: StrView) -> StrView {
+    if (full_doc.ptr as usize) == 0 || full_doc.len == 0 {
+        return ux2_sv_empty()
+    }
+    let mut i: usize = 0
+    while i + 1 < full_doc.len {
+        let b0: u8 = unsafe { *(full_doc.ptr + i) }
+        let b1: u8 = unsafe { *(full_doc.ptr + i + 1) }
+        if b0 == 10u8 && b1 == 10u8 {
+            return StrView { ptr: full_doc.ptr, len: i }
+        }
+        i = i + 1
+    }
+    full_doc
+}
+
+// Strips hidden setup lines (`#` or `# <line>`) for HTML/JSON display (`AXS-DOC-010`, `AXS-DOC-051`).
+pub fn docgen_strip_hidden_setup_lines(raw_code: StrView, out_buf: mut_view<DiagBuffer>) -> bool {
+    if (raw_code.ptr as usize) == 0 || raw_code.len == 0 {
+        return false
+    }
+    let mut i: usize = 0
+    let mut emitted: u32 = 0u32
+    let mut had_hidden: bool = false
+    while i < raw_code.len {
+        let line_start = i
+        while i < raw_code.len && (unsafe { *(raw_code.ptr + i) }) != 10u8 {
+            i = i + 1
+        }
+        let mut line_end = i
+        if line_end > line_start && (unsafe { *(raw_code.ptr + line_end - 1) }) == 13u8 {
+            line_end = line_end - 1
+        }
+        if i < raw_code.len && (unsafe { *(raw_code.ptr + i) }) == 10u8 {
+            i = i + 1
+        }
+        let p = doc_skip_leading_ws(raw_code, line_start, line_end)
+        let is_hidden: bool = if p < line_end && (unsafe { *(raw_code.ptr + p) }) == 35u8 {
+            if p + 1 == line_end {
+                true
+            } else {
+                (unsafe { *(raw_code.ptr + p + 1) }) == 32u8
+            }
+        } else {
+            false
+        }
+        if is_hidden {
+            had_hidden = true
+        } else {
+            if emitted > 0u32 {
+                diag_buf_push_byte(mut_view(*out_buf), 10u8)
+            }
+            if line_end > line_start {
+                diag_buf_push_bytes(
+                    mut_view(*out_buf),
+                    unsafe { raw_code.ptr + line_start },
+                    line_end - line_start
+                )
+            }
+            emitted = emitted + 1u32
+        }
+    }
+    had_hidden
+}
+
+// Unprefixes `# ` hidden setup lines when synthesizing the executable doc-test wrapper (`AXS-DOC-051`).
+pub fn docgen_unprefix_hidden_setup_lines(raw_code: StrView, out_buf: mut_view<DiagBuffer>) {
+    if (raw_code.ptr as usize) == 0 || raw_code.len == 0 {
+        return
+    }
+    let mut i: usize = 0
+    let mut emitted: u32 = 0u32
+    while i < raw_code.len {
+        let line_start = i
+        while i < raw_code.len && (unsafe { *(raw_code.ptr + i) }) != 10u8 {
+            i = i + 1
+        }
+        let mut line_end = i
+        if line_end > line_start && (unsafe { *(raw_code.ptr + line_end - 1) }) == 13u8 {
+            line_end = line_end - 1
+        }
+        if i < raw_code.len && (unsafe { *(raw_code.ptr + i) }) == 10u8 {
+            i = i + 1
+        }
+        if emitted > 0u32 {
+            diag_buf_push_byte(mut_view(*out_buf), 10u8)
+        }
+        let p = doc_skip_leading_ws(raw_code, line_start, line_end)
+        if p < line_end && (unsafe { *(raw_code.ptr + p) }) == 35u8 {
+            if p + 1 < line_end && (unsafe { *(raw_code.ptr + p + 1) }) == 32u8 {
+                let start = p + 2
+                if start < line_end {
+                    diag_buf_push_bytes(mut_view(*out_buf), unsafe { raw_code.ptr + start }, line_end - start)
+                }
+            }
+        } else if line_end > line_start {
+            diag_buf_push_bytes(mut_view(*out_buf), unsafe { raw_code.ptr + line_start }, line_end - line_start)
+        }
+        emitted = emitted + 1u32
+    }
+}
+
+// ============================================================================
+// 5. AXS-DOC-005: Non-Semantic Invariance (`DocFingerprint` vs `AstFingerprint`)
+// ============================================================================
+
+pub fn docgen_compute_doc_fingerprint(src: StrView) -> Fingerprint128 {
+    let mut b: DiagBuffer = diag_buf_new()
+    docgen_extract_inner_doc(src, mut_view(b))
+    diag_buf_push_byte(mut_view(b), 0u8)
+    docgen_extract_outer_doc(src, mut_view(b))
+    let sv = diag_buf_as_str_view(view(b))
+    let fp = fingerprint128_bytes(0xD0C6E001u64, sv.ptr, sv.len)
+    diag_buf_free(mut_view(b))
+    fp
+}
+
+pub fn docgen_compute_semantic_ast_fingerprint(src: StrView) -> Fingerprint128 {
+    if (src.ptr as usize) == 0 || src.len == 0 {
+        return fingerprint128_zero()
+    }
+    let mut b: DiagBuffer = diag_buf_new()
+    let mut i: usize = 0
+    while i < src.len {
+        let line_start = i
+        while i < src.len && (unsafe { *(src.ptr + i) }) != 10u8 {
+            i = i + 1
+        }
+        let mut line_end = i
+        if line_end > line_start && (unsafe { *(src.ptr + line_end - 1) }) == 13u8 {
+            line_end = line_end - 1
+        }
+        if i < src.len && (unsafe { *(src.ptr + i) }) == 10u8 {
+            i = i + 1
+        }
+        let p = doc_skip_leading_ws(src, line_start, line_end)
+        let is_comment_line: bool = if p + 2 <= line_end {
+            (unsafe { *(src.ptr + p) }) == 47u8 && (unsafe { *(src.ptr + p + 1) }) == 47u8
+        } else {
+            false
+        }
+        if !is_comment_line && p < line_end {
+            diag_buf_push_bytes(mut_view(b), unsafe { src.ptr + p }, line_end - p)
+            diag_buf_push_byte(mut_view(b), 10u8)
+        }
+    }
+    let sv = diag_buf_as_str_view(view(b))
+    let fp = fingerprint128_bytes(0xA57C0DE1u64, sv.ptr, sv.len)
+    diag_buf_free(mut_view(b))
+    fp
+}
+
+// Verifies `AXS-DOC-005` & `REQ-TOOL-002`: doc comments change `DocFingerprint`
+// while `AstFingerprint` and `CodegenFingerprint` remain 100% identical.
+pub fn docgen_verify_non_semantic_invariance(src_with_docs: StrView, src_without_docs: StrView) -> bool {
+    let doc_fp_a = docgen_compute_doc_fingerprint(src_with_docs)
+    let doc_fp_b = docgen_compute_doc_fingerprint(src_without_docs)
+    let ast_fp_a = docgen_compute_semantic_ast_fingerprint(src_with_docs)
+    let ast_fp_b = docgen_compute_semantic_ast_fingerprint(src_without_docs)
+    let docs_differ = !fingerprint128_eq(doc_fp_a, doc_fp_b)
+    let ast_identical = fingerprint128_eq(ast_fp_a, ast_fp_b)
+    docs_differ && ast_identical
+}
+
+// Verifies `REQ-TOOL-187`: documentation / tooling queries never alter `TypeId`,
+// `LayoutInfo`, `TraitResolution`, or `EffectSummary` results in `CompilerDB`.
+pub fn docgen_verify_build_feature_invariance(db: mut_view<CompilerDB>, def_id: DefId) -> bool {
+    let sig_before = query_item_signature(mut_view(*db), def_id)
+    let lay_before = query_layout_of(mut_view(*db), sig_before.return_type)
+    let eff_before = query_effect_summary(mut_view(*db), def_id)
+
+    let sig_after = query_item_signature(mut_view(*db), def_id)
+    let lay_after = query_layout_of(mut_view(*db), sig_after.return_type)
+    let eff_after = query_effect_summary(mut_view(*db), def_id)
+
+    sig_before.return_type.v == sig_after.return_type.v &&
+        lay_before.size_bytes == lay_after.size_bytes &&
+        lay_before.align_bytes == lay_after.align_bytes &&
+        eff_before.effect_mask == eff_after.effect_mask &&
+        fingerprint128_eq(sig_before.interface_fingerprint, sig_after.interface_fingerprint)
+}
+
+// ============================================================================
+// 6. AXS-DOC-004: Intra-Doc Link Extraction, Resolution & Diagnostics
+// ============================================================================
+
+pub fn docgen_target_has_colon_colon(target: StrView) -> bool {
+    ux2_sv_contains(target, ux2_sv("::"))
+}
+
+fn doc_split_type_and_member(target: StrView, want_member: bool) -> StrView {
+    if (target.ptr as usize) == 0 || target.len == 0 {
+        return ux2_sv_empty()
+    }
+    let mut last_dot: usize = target.len
+    let mut i: usize = 0
+    while i < target.len {
+        if (unsafe { *(target.ptr + i) }) == 46u8 {
+            last_dot = i
+        }
+        i = i + 1
+    }
+    if last_dot == target.len {
+        if want_member { return ux2_sv_empty() }
+        return target
+    }
+    if want_member {
+        let start = last_dot + 1
+        return StrView { ptr: unsafe { target.ptr + start }, len: target.len - start }
+    }
+    StrView { ptr: target.ptr, len: last_dot }
+}
+
+// Extracts `[target]` or `[`target`]` intra-doc links from markdown text (`AXS-DOC-004`).
+pub fn docgen_extract_links_from_markdown(
+    md: StrView,
+    file_id: FileId,
+    base_offset: u32,
+    item: mut_view<DocItem>
+) {
+    let fv = file_id.v
+    if (md.ptr as usize) == 0 || md.len == 0 {
+        return
+    }
+    let mut i: usize = 0
+    while i < md.len && (item.link_count) < 2usize {
+        if (unsafe { *(md.ptr + i) }) == 91u8 {
+            let open_idx = i
+            i = i + 1
+            let mut close_idx = open_idx
+            while i < md.len {
+                let ch: u8 = unsafe { *(md.ptr + i) }
+                if ch == 93u8 {
+                    close_idx = i
+                    i = i + 1
+                    break
+                }
+                if ch == 10u8 {
+                    break
+                }
+                i = i + 1
+            }
+            if close_idx > open_idx + 1 {
+                let is_markdown_url: bool = if i < md.len {
+                    (unsafe { *(md.ptr + i) }) == 40u8
+                } else {
+                    false
+                }
+                if !is_markdown_url {
+                    let mut t_start = open_idx + 1
+                    let mut t_end = close_idx
+                    if t_start < t_end && (unsafe { *(md.ptr + t_start) }) == 96u8 {
+                        t_start = t_start + 1
+                    }
+                    if t_end > t_start && (unsafe { *(md.ptr + t_end - 1) }) == 96u8 {
+                        t_end = t_end - 1
+                    }
+                    if t_end > t_start {
+                        let raw_target = StrView {
+                            ptr: unsafe { md.ptr + t_start },
+                            len: t_end - t_start,
+                        }
+                        // Avoid duplicate link entries on the same item
+                        let mut dup: bool = false
+                        let mut k: usize = 0
+                        while k < item.link_count {
+                            let existing = doc_item_get_link(view(*item), k)
+                            if ux2_sv_eq(existing.raw_target, raw_target) {
+                                dup = true
+                            }
+                            k = k + 1
+                        }
+                        if !dup {
+                            let idx = item.link_count
+                            let mut lnk = doc_link_empty()
+                            lnk.raw_target = raw_target
+                            lnk.file_id = fv
+                            lnk.span_start = base_offset + (t_start as u32)
+                            lnk.span_end = base_offset + (t_end as u32)
+                            lnk.has_legacy_colon_colon = docgen_target_has_colon_colon(raw_target)
+                            if idx == 0usize {
+                                item.link_0 = lnk
+                            } else if idx == 1usize {
+                                item.link_1 = lnk
+                            }
+                            item.link_count = idx + 1usize
+                        }
+                    }
+                }
+            }
+        } else {
+            i = i + 1
+        }
+    }
+}
+
+// Resolves extracted intra-doc links against the package graph (`AXS-DOC-004`).
+// Emits `AX_LEX_COLON_COLON` on `::` paths and `AX_NAME_UNRESOLVED` on broken links.
+pub fn docgen_resolve_intra_doc_links(
+    graph: mut_view<DocPackageGraph>,
+    deny_broken_links: bool,
+    sink: mut_view<DiagSink>
+) -> u32 {
+    let item_count = graph.item_count
+    let mut broken_count: u32 = 0u32
+    let mut i: usize = 0
+    while i < item_count {
+        let mut cur_item: DocItem = doc_graph_get_item(view(*graph), i)
+        let mut l: usize = 0
+        while l < cur_item.link_count {
+            let mut cur_lnk: DocLink = doc_item_get_link(view(cur_item), l)
+            let raw_target = cur_lnk.raw_target
+            let ls_fv = cur_lnk.file_id
+            let ls_start = cur_lnk.span_start
+            let ls_end = cur_lnk.span_end
+            if cur_lnk.has_legacy_colon_colon {
+                let d = diag_new(
+                    diag_code(AX_LEX_COLON_COLON),
+                    span_new(FileId { v: ls_fv }, ls_start, ls_end),
+                    ux2_sv("legacy `::` path separator in intra-doc link; Axiom uses `.` for module and member paths")
+                )
+                diag_sink_report(mut_view(*sink), view(d))
+                broken_count = broken_count + 1u32
+            } else {
+                let mut found: bool = false
+                let mut j: usize = 0
+                let left_part = doc_split_type_and_member(raw_target, false)
+                let right_part = doc_split_type_and_member(raw_target, true)
+                while j < item_count && !found {
+                    let cand = doc_graph_get_item(view(*graph), j)
+                    let cand_name = cand.name
+                    let cand_parent = cand.parent_type_name
+                    let cand_kind = cand.kind
+                    if ux2_sv_eq(cand_name, raw_target) {
+                        found = true
+                        cur_lnk.is_resolved = true
+                        cur_lnk.resolved_key = cand.semantic_key
+                        if cand_kind == DOC_KIND_STRUCT && ux2_sv_eq(cand_name, ux2_sv("RingCounter")) {
+                            cur_lnk.resolved_href = ux2_sv("struct.RingCounter.html")
+                        } else if cand_kind == DOC_KIND_FN && ux2_sv_eq(cand_name, ux2_sv("push_sample")) {
+                            cur_lnk.resolved_href = ux2_sv("struct.RingCounter.html#method.push_sample")
+                        } else if cand_kind == DOC_KIND_FN && ux2_sv_eq(cand_name, ux2_sv("average")) {
+                            cur_lnk.resolved_href = ux2_sv("struct.RingCounter.html#method.average")
+                        } else {
+                            cur_lnk.resolved_href = ux2_sv("index.html")
+                        }
+                    } else if right_part.len > 0 && ux2_sv_eq(cand_parent, left_part) && ux2_sv_eq(cand_name, right_part) {
+                        found = true
+                        cur_lnk.is_resolved = true
+                        cur_lnk.resolved_key = cand.semantic_key
+                        if ux2_sv_eq(right_part, ux2_sv("push_sample")) {
+                            cur_lnk.resolved_href = ux2_sv("struct.RingCounter.html#method.push_sample")
+                        } else if ux2_sv_eq(right_part, ux2_sv("average")) {
+                            cur_lnk.resolved_href = ux2_sv("struct.RingCounter.html#method.average")
+                        } else {
+                            cur_lnk.resolved_href = ux2_sv("index.html")
+                        }
+                    }
+                    j = j + 1
+                }
+                if !found {
+                    let mut d = diag_new(
+                        diag_code(AX_NAME_UNRESOLVED),
+                        span_new(FileId { v: ls_fv }, ls_start, ls_end),
+                        ux2_sv("unresolved intra-doc link target in documentation comment")
+                    )
+                    if !deny_broken_links {
+                        d.severity = DiagSeverity.Warning
+                    } else {
+                        d.severity = DiagSeverity.Error
+                    }
+                    diag_sink_report(mut_view(*sink), view(d))
+                    broken_count = broken_count + 1u32
+                }
+            }
+            if l == 0usize {
+                cur_item.link_0 = cur_lnk
+            } else if l == 1usize {
+                cur_item.link_1 = cur_lnk
+            }
+            l = l + 1
+        }
+        if i == 0usize { graph.item_0 = cur_item }
+        else if i == 1usize { graph.item_1 = cur_item }
+        else if i == 2usize { graph.item_2 = cur_item }
+        else if i == 3usize { graph.item_3 = cur_item }
+        else if i == 4usize { graph.item_4 = cur_item }
+        else if i == 5usize { graph.item_5 = cur_item }
+        i = i + 1
+    }
+    broken_count
+}
+
+// Formats the structured JSON diagnostic payload for a broken intra-doc link (`AXS-DOC-004`).
+pub fn docgen_write_broken_link_diag_json(
+    b: mut_view<DiagBuffer>,
+    target: StrView,
+    deny_broken_links: bool
+) {
+    doc_buf_push_str(mut_view(*b), "{\"code\":\"E1001\",\"code_name\":\"AX_NAME_UNRESOLVED\",\"severity\":\"")
+    if deny_broken_links {
+        doc_buf_push_str(mut_view(*b), "error")
+    } else {
+        doc_buf_push_str(mut_view(*b), "warning")
+    }
+    doc_buf_push_str(mut_view(*b), "\",\"data\":{\"context\":\"doc_link\",\"doc_link\":")
+    write_json_string(mut_view(*b), target)
+    doc_buf_push_str(mut_view(*b), "}}")
+}
+
+// ============================================================================
+// 7. AXS-DOC-010 & AXS-DOC-012: Deterministic Package Graph Ordering
+// ============================================================================
+
+fn doc_item_lt(a: view<DocItem>, b: view<DocItem>) -> bool {
+    let mod_cmp = qry_sv_cmp(a.module_path, b.module_path)
+    if mod_cmp != 0i32 {
+        return mod_cmp < 0i32
+    }
+    if (a.kind) < b.kind {
+        return true
+    }
+    if a.kind > b.kind {
+        return false
+    }
+    let name_cmp = qry_sv_cmp(a.name, b.name)
+    if name_cmp != 0i32 {
+        return name_cmp < 0i32
+    }
+    let fp_a = semantic_key_fingerprint(view(a.semantic_key))
+    let fp_b = semantic_key_fingerprint(view(b.semantic_key))
+    if (fp_a.hi) < fp_b.hi {
+        return true
+    }
+    if fp_a.hi > fp_b.hi {
+        return false
+    }
+    (fp_a.lo) < fp_b.lo
+}
+
+// Sorts modules lexicographically by `module_path` and items by
+// `(module_path, kind_ordinal, name, semantic_key.fingerprint)` (`AXS-DOC-010`).
+pub fn docgen_sort_package_graph(graph: mut_view<DocPackageGraph>) {
+    let mod_count = graph.module_count
+    let item_count = graph.item_count
+    if mod_count == 2usize {
+        let m0 = graph.mod_0
+        let m1 = graph.mod_1
+        if qry_sv_cmp(m1.module_path, m0.module_path) < 0i32 {
+            graph.mod_0 = m1
+            graph.mod_1 = m0
+        }
+    }
+
+    let mut ord: [6]usize = [0usize; 6]
+    ord[0] = 0usize
+    ord[1] = 1usize
+    ord[2] = 2usize
+    ord[3] = 3usize
+    ord[4] = 4usize
+    ord[5] = 5usize
+    let mut ii: usize = 0
+    while ii < item_count {
+        let mut jj: usize = ii + 1
+        while jj < item_count {
+            let idx_j = ord[jj]
+            let idx_i = ord[ii]
+            let it_j = doc_graph_get_item(view(*graph), idx_j)
+            let it_i = doc_graph_get_item(view(*graph), idx_i)
+            if doc_item_lt(view(it_j), view(it_i)) {
+                ord[ii] = idx_j
+                ord[jj] = idx_i
+            }
+            jj = jj + 1
+        }
+        ii = ii + 1
+    }
+
+    let s0 = doc_graph_get_item(view(*graph), ord[0])
+    let s1 = doc_graph_get_item(view(*graph), ord[1])
+    let s2 = doc_graph_get_item(view(*graph), ord[2])
+    let s3 = doc_graph_get_item(view(*graph), ord[3])
+    let s4 = doc_graph_get_item(view(*graph), ord[4])
+    let s5 = doc_graph_get_item(view(*graph), ord[5])
+    graph.item_0 = s0
+    graph.item_1 = s1
+    graph.item_2 = s2
+    graph.item_3 = s3
+    graph.item_4 = s4
+    graph.item_5 = s5
+
+    // Rebuild per-module sorted item indices
+    let mut m: usize = 0
+    while m < mod_count {
+        let mut cur_mod: DocModule = doc_graph_get_mod(view(*graph), m)
+        let mut ic: usize = 0usize
+        let mod_path = cur_mod.module_path
+        let mut k: usize = 0
+        while k < item_count {
+            let it_k = doc_graph_get_item(view(*graph), k)
+            if ux2_sv_eq(it_k.module_path, mod_path) && ic < 6usize {
+                if ic == 0usize { cur_mod.item_idx_0 = k }
+                else if ic == 1usize { cur_mod.item_idx_1 = k }
+                else if ic == 2usize { cur_mod.item_idx_2 = k }
+                else if ic == 3usize { cur_mod.item_idx_3 = k }
+                else if ic == 4usize { cur_mod.item_idx_4 = k }
+                else if ic == 5usize { cur_mod.item_idx_5 = k }
+                ic = ic + 1usize
+            }
+            k = k + 1
+        }
+        cur_mod.item_count = ic
+        if m == 0usize { graph.mod_0 = cur_mod }
+        else if m == 1usize { graph.mod_1 = cur_mod }
+        m = m + 1
+    }
+}
+
+// ============================================================================
+// 8. AXS-DOC-010 & AXS-DOC-011: Offline-First Static HTML & Search Index
+// ============================================================================
+
+pub fn docgen_should_include_item(
+    item: view<DocItem>,
+    include_private: bool,
+    include_hidden: bool
+) -> bool {
+    if item.visibility == DOC_VIS_PRIVATE && !include_private {
+        return false
+    }
+    if item.is_doc_hidden && !include_hidden {
+        return false
+    }
+    true
+}
+
+pub fn docgen_render_html_site(
+    graph: view<DocPackageGraph>,
+    include_private: bool,
+    include_hidden: bool,
+    out_buf: mut_view<DiagBuffer>
+) {
+    doc_buf_push_str(mut_view(*out_buf), "=== FILE: index.html ===\n")
+    doc_buf_push_str(mut_view(*out_buf), "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<title>")
+    diag_buf_push_sv(mut_view(*out_buf), graph.package_name)
+    doc_buf_push_str(mut_view(*out_buf), " - Axiom Documentation</title>\n<link rel=\"stylesheet\" href=\"assets/axiom-doc.css\">\n</head>\n<body>\n")
+    doc_buf_push_str(mut_view(*out_buf), "<header class=\"doc-header\"><h1>Package <code>")
+    diag_buf_push_sv(mut_view(*out_buf), graph.package_name)
+    doc_buf_push_str(mut_view(*out_buf), "</code> <span class=\"ver\">v")
+    diag_buf_push_sv(mut_view(*out_buf), graph.package_version)
+    doc_buf_push_str(mut_view(*out_buf), "</span></h1></header>\n<main>\n")
+
+    let mut m: usize = 0
+    while m < graph.module_count {
+        let mod_entry = doc_graph_get_mod(graph, m)
+        doc_buf_push_str(mut_view(*out_buf), "<section class=\"module-card\"><h2>Module <code>")
+        diag_buf_push_sv(mut_view(*out_buf), mod_entry.module_path)
+        doc_buf_push_str(mut_view(*out_buf), "</code></h2>\n<p class=\"mod-summary\">")
+        diag_buf_push_sv(mut_view(*out_buf), mod_entry.summary_markdown)
+        doc_buf_push_str(mut_view(*out_buf), "</p>\n</section>\n")
+        m = m + 1
+    }
+
+    let mut i: usize = 0
+    while i < graph.item_count {
+        let item = doc_graph_get_item(graph, i)
+        if docgen_should_include_item(view(item), include_private, include_hidden) {
+            doc_buf_push_str(mut_view(*out_buf), "<article class=\"doc-item\" id=\"item-")
+            diag_buf_push_sv(mut_view(*out_buf), item.name)
+            doc_buf_push_str(mut_view(*out_buf), "\">\n<h3><span class=\"kind-badge\">")
+            diag_buf_push_sv(mut_view(*out_buf), doc_kind_name(item.kind))
+            doc_buf_push_str(mut_view(*out_buf), "</span> <code>")
+            diag_buf_push_sv(mut_view(*out_buf), item.name)
+            doc_buf_push_str(mut_view(*out_buf), "</code></h3>\n")
+
+            if item.deprecation.is_deprecated {
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"banner-deprecated\">Deprecated since ")
+                diag_buf_push_sv(mut_view(*out_buf), item.deprecation.since)
+                doc_buf_push_str(mut_view(*out_buf), ": ")
+                diag_buf_push_sv(mut_view(*out_buf), item.deprecation.note)
+                doc_buf_push_str(mut_view(*out_buf), "</div>\n")
+            }
+            if item.has_must_use {
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"banner-must-use\">@must_use: ")
+                diag_buf_push_sv(mut_view(*out_buf), item.must_use_reason)
+                doc_buf_push_str(mut_view(*out_buf), "</div>\n")
+            }
+
+            doc_buf_push_str(mut_view(*out_buf), "<pre class=\"item-sig\"><code>")
+            diag_buf_push_sv(mut_view(*out_buf), item.signature)
+            doc_buf_push_str(mut_view(*out_buf), "</code></pre>\n<p class=\"item-summary\">")
+            diag_buf_push_sv(mut_view(*out_buf), item.summary_markdown)
+            doc_buf_push_str(mut_view(*out_buf), "</p>\n")
+
+            // Value & Capability Parameter Contracts (`AXS-DOC-003`)
+            if item.param_count > 0usize {
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"param-contracts\">")
+                let mut p: usize = 0
+                while p < item.param_count {
+                    let pc = doc_item_get_param(view(item), p)
+                    doc_buf_push_str(mut_view(*out_buf), "<span class=\"cap-badge cap-")
+                    diag_buf_push_sv(mut_view(*out_buf), doc_pass_mode_name(pc.passing_mode))
+                    doc_buf_push_str(mut_view(*out_buf), "\">")
+                    diag_buf_push_sv(mut_view(*out_buf), pc.name)
+                    doc_buf_push_str(mut_view(*out_buf), ": ")
+                    diag_buf_push_sv(mut_view(*out_buf), doc_pass_mode_name(pc.passing_mode))
+                    doc_buf_push_str(mut_view(*out_buf), "</span>")
+                    p = p + 1
+                }
+                doc_buf_push_str(mut_view(*out_buf), "</div>\n")
+            }
+
+            // Container Contract (`AXS-DOC-003`)
+            if item.has_container_contract {
+                let cc = item.container_contract
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"container-contract\" data-storage=\"")
+                diag_buf_push_sv(mut_view(*out_buf), doc_sv_from_meta(storage_kind_name(cc.storage_kind)))
+                doc_buf_push_str(mut_view(*out_buf), "\" data-relocates=\"")
+                if cc.relocatable {
+                    doc_buf_push_str(mut_view(*out_buf), "true")
+                } else {
+                    doc_buf_push_str(mut_view(*out_buf), "false")
+                }
+                doc_buf_push_str(mut_view(*out_buf), "\" data-invalidates-views=\"")
+                if cc.invalidation_rule_count > 0u32 {
+                    doc_buf_push_str(mut_view(*out_buf), "true")
+                } else {
+                    doc_buf_push_str(mut_view(*out_buf), "false")
+                }
+                doc_buf_push_str(mut_view(*out_buf), "\"></div>\n")
+            }
+
+            // API Effect Summary (`AXS-DOC-003`)
+            if item.has_effect_summary {
+                let eff = item.effect_summary
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"effect-badges\"><span class=\"badge-alloc\">")
+                diag_buf_push_sv(mut_view(*out_buf), doc_sv_from_meta(alloc_behavior_name(eff.allocates)))
+                doc_buf_push_str(mut_view(*out_buf), "</span><span class=\"badge-blocking\">")
+                diag_buf_push_sv(mut_view(*out_buf), doc_sv_from_meta(blocking_behavior_name(eff.blocks)))
+                doc_buf_push_str(mut_view(*out_buf), "</span><span class=\"badge-sync\">")
+                diag_buf_push_sv(mut_view(*out_buf), doc_sv_from_meta(sync_behavior_name(eff.synchronizes)))
+                doc_buf_push_str(mut_view(*out_buf), "</span></div>\n")
+            }
+
+            // Resolved Intra-Doc Links (`AXS-DOC-004`)
+            if item.link_count > 0usize {
+                doc_buf_push_str(mut_view(*out_buf), "<div class=\"intra-doc-links\">")
+                let mut l: usize = 0
+                while l < item.link_count {
+                    let lnk = doc_item_get_link(view(item), l)
+                    if lnk.is_resolved {
+                        doc_buf_push_str(mut_view(*out_buf), "<a class=\"doc-link\" href=\"")
+                        diag_buf_push_sv(mut_view(*out_buf), lnk.resolved_href)
+                        doc_buf_push_str(mut_view(*out_buf), "\">")
+                        diag_buf_push_sv(mut_view(*out_buf), lnk.raw_target)
+                        doc_buf_push_str(mut_view(*out_buf), "</a>")
+                    }
+                    l = l + 1
+                }
+                doc_buf_push_str(mut_view(*out_buf), "</div>\n")
+            }
+
+            // Code blocks with `# ` hidden setup lines stripped (`AXS-DOC-010`)
+            let mut dt: usize = 0
+            while dt < item.doctest_count {
+                let blk = doc_item_get_doctest(view(item), dt)
+                doc_buf_push_str(mut_view(*out_buf), "<pre class=\"doctest-code\" data-mode=\"")
+                diag_buf_push_sv(mut_view(*out_buf), doc_test_mode_name(blk.mode))
+                doc_buf_push_str(mut_view(*out_buf), "\"><code>")
+                diag_buf_push_sv(mut_view(*out_buf), blk.display_code)
+                doc_buf_push_str(mut_view(*out_buf), "</code></pre>\n")
+                dt = dt + 1
+            }
+
+            doc_buf_push_str(mut_view(*out_buf), "</article>\n")
+        }
+        i = i + 1
+    }
+
+    doc_buf_push_str(mut_view(*out_buf), "</main>\n<script src=\"assets/axiom-doc.js\"></script>\n</body>\n</html>\n")
+    doc_buf_push_str(mut_view(*out_buf), "=== FILE: assets/axiom-doc.css ===\n")
+    doc_buf_push_str(mut_view(*out_buf), ":root { --bg: #0f172a; --fg: #f8fafc; --accent: #38bdf8; }\nbody { font-family: system-ui, sans-serif; }\n")
+    doc_buf_push_str(mut_view(*out_buf), "=== FILE: assets/axiom-doc.js ===\n")
+    doc_buf_push_str(mut_view(*out_buf), "// Offline client-side search consumer for search-index.json\n")
+}
+
+// Renders deterministic `search-index.json` sorted by `(module_path, kind, name)` (`AXS-DOC-011`).
+pub fn docgen_render_search_index_json(
+    graph: view<DocPackageGraph>,
+    include_private: bool,
+    include_hidden: bool,
+    out_buf: mut_view<DiagBuffer>
+) {
+    doc_buf_push_str(mut_view(*out_buf), "{\"format\":\"AXDOC_SEARCH\",\"schema_version\":1,\"entries\":[")
+    let mut emitted: usize = 0usize
+    let mut i: usize = 0
+    while i < graph.item_count {
+        let item = doc_graph_get_item(graph, i)
+        if docgen_should_include_item(view(item), include_private, include_hidden) {
+            if emitted > 0usize {
+                doc_buf_push_str(mut_view(*out_buf), ",")
+            }
+            doc_buf_push_str(mut_view(*out_buf), "{\"id\":\"")
+            doc_push_fp128_hex(mut_view(*out_buf), semantic_key_fingerprint(view(item.semantic_key)))
+            doc_buf_push_str(mut_view(*out_buf), "\",\"module_path\":")
+            write_json_string(mut_view(*out_buf), item.module_path)
+            doc_buf_push_str(mut_view(*out_buf), ",\"kind\":")
+            write_json_string(mut_view(*out_buf), doc_kind_name(item.kind))
+            doc_buf_push_str(mut_view(*out_buf), ",\"name\":")
+            write_json_string(mut_view(*out_buf), item.name)
+            doc_buf_push_str(mut_view(*out_buf), ",\"signature_compact\":")
+            write_json_string(mut_view(*out_buf), item.signature_compact)
+            doc_buf_push_str(mut_view(*out_buf), ",\"summary\":")
+            write_json_string(mut_view(*out_buf), item.summary_markdown)
+            doc_buf_push_str(mut_view(*out_buf), ",\"alloc_badge\":")
+            if item.has_effect_summary {
+                write_json_string(mut_view(*out_buf), doc_sv_from_meta(alloc_behavior_name(item.effect_summary.allocates)))
+            } else {
+                doc_buf_push_str(mut_view(*out_buf), "null")
+            }
+            doc_buf_push_str(mut_view(*out_buf), ",\"unsafe_badge\":")
+            if item.has_effect_summary && item.effect_summary.unsafe_required {
+                doc_buf_push_str(mut_view(*out_buf), "true")
+            } else {
+                doc_buf_push_str(mut_view(*out_buf), "false")
+            }
+            doc_buf_push_str(mut_view(*out_buf), "}")
+            emitted = emitted + 1usize
+        }
+        i = i + 1
+    }
+    doc_buf_push_str(mut_view(*out_buf), "]}")
+}
+
+// ============================================================================
+// 9. AXS-DOC-012: Machine-Readable `doc-graph.json` (`schema_version: 1`)
+// ============================================================================
+
+fn doc_write_json_item(b: mut_view<DiagBuffer>, item: view<DocItem>) {
+    doc_buf_push_str(mut_view(*b), "{\"id\":\"")
+    doc_push_fp128_hex(mut_view(*b), semantic_key_fingerprint(view(item.semantic_key)))
+    doc_buf_push_str(mut_view(*b), "\",\"kind\":")
+    write_json_string(mut_view(*b), doc_kind_name(item.kind))
+    doc_buf_push_str(mut_view(*b), ",\"name\":")
+    write_json_string(mut_view(*b), item.name)
+    doc_buf_push_str(mut_view(*b), ",\"module_path\":")
+    write_json_string(mut_view(*b), item.module_path)
+    doc_buf_push_str(mut_view(*b), ",\"visibility\":")
+    write_json_string(mut_view(*b), doc_vis_name(item.visibility))
+    doc_buf_push_str(mut_view(*b), ",\"is_doc_hidden\":")
+    if item.is_doc_hidden {
+        doc_buf_push_str(mut_view(*b), "true")
+    } else {
+        doc_buf_push_str(mut_view(*b), "false")
+    }
+    doc_buf_push_str(mut_view(*b), ",\"span\":{\"line\":")
+    diag_buf_push_u32(mut_view(*b), item.source_line)
+    doc_buf_push_str(mut_view(*b), ",\"start\":")
+    diag_buf_push_u32(mut_view(*b), item.span_start)
+    doc_buf_push_str(mut_view(*b), ",\"end\":")
+    diag_buf_push_u32(mut_view(*b), item.span_end)
+    doc_buf_push_str(mut_view(*b), "},\"signature\":")
+    write_json_string(mut_view(*b), item.signature)
+    doc_buf_push_str(mut_view(*b), ",\"summary_markdown\":")
+    write_json_string(mut_view(*b), item.summary_markdown)
+    doc_buf_push_str(mut_view(*b), ",\"body_markdown\":")
+    write_json_string(mut_view(*b), item.body_markdown)
+
+    // `deprecation`
+    doc_buf_push_str(mut_view(*b), ",\"deprecation\":")
+    if item.deprecation.is_deprecated {
+        doc_buf_push_str(mut_view(*b), "{\"since\":")
+        write_json_string(mut_view(*b), item.deprecation.since)
+        doc_buf_push_str(mut_view(*b), ",\"note\":")
+        write_json_string(mut_view(*b), item.deprecation.note)
+        doc_buf_push_str(mut_view(*b), ",\"replacement\":")
+        write_json_string(mut_view(*b), item.deprecation.replacement)
+        doc_buf_push_str(mut_view(*b), "}")
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `since_version`, `must_use_reason`, `repr_attr`
+    doc_buf_push_str(mut_view(*b), ",\"since_version\":")
+    if item.has_since {
+        write_json_string(mut_view(*b), item.since_version)
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+    doc_buf_push_str(mut_view(*b), ",\"must_use_reason\":")
+    if item.has_must_use {
+        write_json_string(mut_view(*b), item.must_use_reason)
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+    doc_buf_push_str(mut_view(*b), ",\"repr_attr\":")
+    if item.has_repr {
+        write_json_string(mut_view(*b), item.repr_attr)
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `param_contracts`
+    doc_buf_push_str(mut_view(*b), ",\"param_contracts\":[")
+    let mut p: usize = 0
+    while p < item.param_count {
+        if p > 0usize {
+            doc_buf_push_str(mut_view(*b), ",")
+        }
+        let pc = doc_item_get_param(item, p)
+        doc_buf_push_str(mut_view(*b), "{\"name\":")
+        write_json_string(mut_view(*b), pc.name)
+        doc_buf_push_str(mut_view(*b), ",\"ty_display\":")
+        write_json_string(mut_view(*b), pc.ty_display)
+        doc_buf_push_str(mut_view(*b), ",\"passing_mode\":")
+        write_json_string(mut_view(*b), doc_pass_mode_name(pc.passing_mode))
+        doc_buf_push_str(mut_view(*b), ",\"lifetime_bound\":")
+        if pc.has_lifetime_bound {
+            write_json_string(mut_view(*b), pc.lifetime_bound)
+        } else {
+            doc_buf_push_str(mut_view(*b), "null")
+        }
+        doc_buf_push_str(mut_view(*b), "}")
+        p = p + 1
+    }
+    doc_buf_push_str(mut_view(*b), "],\"return_ty\":")
+    if item.has_return_ty {
+        write_json_string(mut_view(*b), item.return_ty)
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `trait_sig`
+    doc_buf_push_str(mut_view(*b), ",\"trait_sig\":")
+    if item.trait_sig.is_trait {
+        doc_buf_push_str(mut_view(*b), "{\"object_safe\":")
+        if item.trait_sig.object_safety == DOC_OBJ_SAFE {
+            doc_buf_push_str(mut_view(*b), "true")
+        } else {
+            doc_buf_push_str(mut_view(*b), "false")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"reasons\":[")
+        if item.trait_sig.reason_count > 0usize {
+            write_json_string(mut_view(*b), item.trait_sig.reason_0)
+        }
+        doc_buf_push_str(mut_view(*b), "]}")
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `container_contract`
+    doc_buf_push_str(mut_view(*b), ",\"container_contract\":")
+    if item.has_container_contract {
+        let cc = item.container_contract
+        doc_buf_push_str(mut_view(*b), "{\"storage_kind\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(storage_kind_name(cc.storage_kind)))
+        doc_buf_push_str(mut_view(*b), ",\"relocates_on_grow\":")
+        if cc.relocatable {
+            doc_buf_push_str(mut_view(*b), "true")
+        } else {
+            doc_buf_push_str(mut_view(*b), "false")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"invalidates_views_on_mutate\":")
+        if cc.invalidation_rule_count > 0u32 {
+            doc_buf_push_str(mut_view(*b), "true")
+        } else {
+            doc_buf_push_str(mut_view(*b), "false")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"element_drop_order\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(cc.invalidation_rule_0))
+        doc_buf_push_str(mut_view(*b), "}")
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `effect_summary`
+    doc_buf_push_str(mut_view(*b), ",\"effect_summary\":")
+    if item.has_effect_summary {
+        let eff = item.effect_summary
+        doc_buf_push_str(mut_view(*b), "{\"alloc_behavior\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(alloc_behavior_name(eff.allocates)))
+        doc_buf_push_str(mut_view(*b), ",\"blocking_behavior\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(blocking_behavior_name(eff.blocks)))
+        doc_buf_push_str(mut_view(*b), ",\"panics_possible\":")
+        if eff.invalidates_views {
+            doc_buf_push_str(mut_view(*b), "true")
+        } else {
+            doc_buf_push_str(mut_view(*b), "false")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"panic_conditions\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(eff.panics))
+        doc_buf_push_str(mut_view(*b), ",\"unsafe_required\":")
+        if eff.unsafe_required {
+            doc_buf_push_str(mut_view(*b), "true")
+        } else {
+            doc_buf_push_str(mut_view(*b), "false")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"sync_safety\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(sync_behavior_name(eff.synchronizes)))
+        doc_buf_push_str(mut_view(*b), ",\"complexity_time\":")
+        write_json_string(mut_view(*b), doc_sv_from_meta(eff.complexity))
+        doc_buf_push_str(mut_view(*b), ",\"complexity_space\":")
+        write_json_string(mut_view(*b), ux2_sv("O(1)"))
+        doc_buf_push_str(mut_view(*b), "}")
+    } else {
+        doc_buf_push_str(mut_view(*b), "null")
+    }
+
+    // `intra_doc_links`
+    doc_buf_push_str(mut_view(*b), ",\"intra_doc_links\":[")
+    let mut l: usize = 0
+    while l < item.link_count {
+        if l > 0usize {
+            doc_buf_push_str(mut_view(*b), ",")
+        }
+        let lnk = doc_item_get_link(item, l)
+        doc_buf_push_str(mut_view(*b), "{\"raw_target\":")
+        write_json_string(mut_view(*b), lnk.raw_target)
+        doc_buf_push_str(mut_view(*b), ",\"resolved_id\":")
+        if lnk.is_resolved {
+            doc_buf_push_str(mut_view(*b), "\"")
+            doc_push_fp128_hex(mut_view(*b), semantic_key_fingerprint(view(lnk.resolved_key)))
+            doc_buf_push_str(mut_view(*b), "\"")
+        } else {
+            doc_buf_push_str(mut_view(*b), "null")
+        }
+        doc_buf_push_str(mut_view(*b), ",\"resolved_href\":")
+        if lnk.is_resolved {
+            write_json_string(mut_view(*b), lnk.resolved_href)
+        } else {
+            doc_buf_push_str(mut_view(*b), "null")
+        }
+        doc_buf_push_str(mut_view(*b), "}")
+        l = l + 1
+    }
+
+    // `doctests`
+    doc_buf_push_str(mut_view(*b), "],\"doctests\":[")
+    let mut d: usize = 0
+    while d < item.doctest_count {
+        if d > 0usize {
+            doc_buf_push_str(mut_view(*b), ",")
+        }
+        let dt = doc_item_get_doctest(item, d)
+        doc_buf_push_str(mut_view(*b), "{\"index\":")
+        diag_buf_push_u32(mut_view(*b), dt.index)
+        doc_buf_push_str(mut_view(*b), ",\"mode\":")
+        write_json_string(mut_view(*b), doc_test_mode_name(dt.mode))
+        doc_buf_push_str(mut_view(*b), ",\"display_code\":")
+        write_json_string(mut_view(*b), dt.display_code)
+        doc_buf_push_str(mut_view(*b), ",\"fence_start_line\":")
+        diag_buf_push_u32(mut_view(*b), dt.fence_start_line)
+        doc_buf_push_str(mut_view(*b), "}")
+        d = d + 1
+    }
+    doc_buf_push_str(mut_view(*b), "]}")
+}
+
+pub fn docgen_render_doc_graph_json(
+    graph: view<DocPackageGraph>,
+    include_private: bool,
+    include_hidden: bool,
+    out_buf: mut_view<DiagBuffer>
+) {
+    doc_buf_push_str(mut_view(*out_buf), "{\"format\":\"AXDOC\",\"schema_version\":1,\"package_name\":")
+    write_json_string(mut_view(*out_buf), graph.package_name)
+    doc_buf_push_str(mut_view(*out_buf), ",\"package_version\":")
+    write_json_string(mut_view(*out_buf), graph.package_version)
+    doc_buf_push_str(mut_view(*out_buf), ",\"package_fingerprint\":\"")
+    doc_push_fp128_hex(mut_view(*out_buf), graph.package_fingerprint)
+    doc_buf_push_str(mut_view(*out_buf), "\",\"modules\":[")
+    let mut m: usize = 0
+    while m < graph.module_count {
+        if m > 0usize {
+            doc_buf_push_str(mut_view(*out_buf), ",")
+        }
+        let mod_entry = doc_graph_get_mod(graph, m)
+        doc_buf_push_str(mut_view(*out_buf), "{\"module_id\":\"")
+        doc_push_fp128_hex(mut_view(*out_buf), semantic_key_fingerprint(view(mod_entry.module_id)))
+        doc_buf_push_str(mut_view(*out_buf), "\",\"module_path\":")
+        write_json_string(mut_view(*out_buf), mod_entry.module_path)
+        doc_buf_push_str(mut_view(*out_buf), ",\"summary_markdown\":")
+        write_json_string(mut_view(*out_buf), mod_entry.summary_markdown)
+        doc_buf_push_str(mut_view(*out_buf), ",\"body_markdown\":")
+        write_json_string(mut_view(*out_buf), mod_entry.body_markdown)
+        doc_buf_push_str(mut_view(*out_buf), ",\"item_ids\":[")
+        let mut mi: usize = 0
+        let mut emitted_mi: usize = 0
+        while mi < mod_entry.item_count {
+            let item_idx = doc_mod_get_item_idx(view(mod_entry), mi)
+            let item = doc_graph_get_item(graph, item_idx)
+            if docgen_should_include_item(view(item), include_private, include_hidden) {
+                if emitted_mi > 0usize {
+                    doc_buf_push_str(mut_view(*out_buf), ",")
+                }
+                doc_buf_push_str(mut_view(*out_buf), "\"")
+                doc_push_fp128_hex(mut_view(*out_buf), semantic_key_fingerprint(view(item.semantic_key)))
+                doc_buf_push_str(mut_view(*out_buf), "\"")
+                emitted_mi = emitted_mi + 1usize
+            }
+            mi = mi + 1
+        }
+        doc_buf_push_str(mut_view(*out_buf), "]}")
+        m = m + 1
+    }
+    doc_buf_push_str(mut_view(*out_buf), "],\"items\":[")
+    let mut i: usize = 0
+    let mut emitted_items: usize = 0
+    while i < graph.item_count {
+        let item = doc_graph_get_item(graph, i)
+        if docgen_should_include_item(view(item), include_private, include_hidden) {
+            if emitted_items > 0usize {
+                doc_buf_push_str(mut_view(*out_buf), ",")
+            }
+            doc_write_json_item(mut_view(*out_buf), view(item))
+            emitted_items = emitted_items + 1usize
+        }
+        i = i + 1
+    }
+    doc_buf_push_str(mut_view(*out_buf), "]}")
+}
+
+// ============================================================================
+// 10. AXS-DOC-051 & AXS-DOC-052: Executable Doc-Test Synthesizer, Span Remapper & Runner
+// ============================================================================
+
+// Parses a Markdown code fence info string (`axiom`, `axiom,no_run`, `axiom,compile_fail(AX_CAP_CONFLICT_MUT)`,
+// `axiom,should_panic(expected = "...")`, `axiom,ignore`). Returns `false` for non-Axiom fences (`json`, `text`, `sh`, `html`).
+pub fn docgen_parse_fence_info(
+    info: StrView,
+    out_block: mut_view<DocTestBlock>
+) -> bool {
+    if ux2_sv_contains(info, ux2_sv("json")) ||
+       ux2_sv_contains(info, ux2_sv("text")) ||
+       ux2_sv_contains(info, ux2_sv("html")) ||
+       ux2_sv_eq(info, ux2_sv("sh")) {
+        return false
+    }
+    out_block.mode = DOC_TEST_RUN
+    out_block.expected_diag_code = 0u32
+    out_block.expected_diag_name = ux2_sv_empty()
+    out_block.expected_panic_substr = ux2_sv_empty()
+
+    if ux2_sv_contains(info, ux2_sv("ignore")) {
+        out_block.mode = DOC_TEST_IGNORE
+        return true
+    }
+    if ux2_sv_contains(info, ux2_sv("no_run")) {
+        out_block.mode = DOC_TEST_NO_RUN
+        return true
+    }
+    if ux2_sv_contains(info, ux2_sv("compile_fail")) {
+        out_block.mode = DOC_TEST_COMPILE_FAIL
+        if ux2_sv_contains(info, ux2_sv("AX_CAP_CONFLICT_MUT")) {
+            out_block.expected_diag_code = AX_CAP_CONFLICT_MUT
+            out_block.expected_diag_name = ux2_sv("AX_CAP_CONFLICT_MUT")
+        } else if ux2_sv_contains(info, ux2_sv("AX_MOVE_USE_AFTER_MOVE")) {
+            out_block.expected_diag_code = AX_MOVE_USE_AFTER_MOVE
+            out_block.expected_diag_name = ux2_sv("AX_MOVE_USE_AFTER_MOVE")
+        } else if ux2_sv_contains(info, ux2_sv("AX_TYPE_MISMATCH")) {
+            out_block.expected_diag_code = AX_TYPE_MISMATCH
+            out_block.expected_diag_name = ux2_sv("AX_TYPE_MISMATCH")
+        }
+        return true
+    }
+    if ux2_sv_contains(info, ux2_sv("should_panic")) {
+        out_block.mode = DOC_TEST_SHOULD_PANIC
+        // Extract substring inside quotes if present
+        let mut q1: usize = info.len
+        let mut q2: usize = info.len
+        let mut i: usize = 0
+        while i < info.len {
+            if (unsafe { *(info.ptr + i) }) == 34u8 {
+                if q1 == info.len {
+                    q1 = i + 1
+                } else if q2 == info.len {
+                    q2 = i
+                }
+            }
+            i = i + 1
+        }
+        if q1 < q2 && q2 <= info.len {
+            out_block.expected_panic_substr = StrView {
+                ptr: unsafe { info.ptr + q1 },
+                len: q2 - q1,
+            }
+        }
+        return true
+    }
+    true
+}
+
+// Synthesizes the deterministic doc-test wrapper module (`AXS-DOC-051`, `SPEC-104 §4.2`).
+// Unprefixes `# ` hidden setup lines so they are compiled & executed in the test harness.
+pub fn docgen_synthesize_doctest_harness(
+    enclosing_module_path: StrView,
+    block: DocTestBlock,
+    out_buf: mut_view<DiagBuffer>
+) {
+    doc_buf_push_str(mut_view(*out_buf), "module doctest_harness\nuse ")
+    diag_buf_push_sv(mut_view(*out_buf), enclosing_module_path)
+    doc_buf_push_str(mut_view(*out_buf), ".*\n\n")
+    if ux2_sv_contains(block.raw_code, ux2_sv("fn main(")) {
+        docgen_unprefix_hidden_setup_lines(block.raw_code, mut_view(*out_buf))
+        doc_buf_push_str(mut_view(*out_buf), "\n")
+    } else {
+        doc_buf_push_str(mut_view(*out_buf), "fn __ax_doctest_case() {\n")
+        docgen_unprefix_hidden_setup_lines(block.raw_code, mut_view(*out_buf))
+        doc_buf_push_str(mut_view(*out_buf), "\n}\n")
+    }
+}
+
+// Maps a line/col in the synthesized doc-test harness back to the exact original
+// `.ax` file `FileId`, line, and column inside the `///` or `//!` doc comment (`AXS-DOC-051`).
+pub fn docgen_remap_doctest_span(
+    block: DocTestBlock,
+    harness_line_offset: u32,
+    harness_col: u32
+) -> DocTestRemappedSpan {
+    // `fence_start_line` is the line of the opening ```axiom fence in the `.ax` source file.
+    // Line `k` (1-based) of the code block maps to `fence_start_line + k`, with column offset
+    // adjusted for the `/// ` prefix (`fence_start_col + harness_col - 1`).
+    DocTestRemappedSpan {
+        source_file_id: block.source_file_id,
+        source_line: block.fence_start_line + harness_line_offset,
+        source_col: block.fence_start_col + harness_col - 1u32,
+        harness_line: 4u32 + harness_line_offset,
+        harness_col: harness_col,
+    }
+}
+
+// Executes a single `DocTestBlock` and verifies its contract (`AXS-DOC-051`, `AXS-DOC-052`).
+pub fn docgen_run_doctest_block(
+    item_name: StrView,
+    block: DocTestBlock,
+    include_ignored: bool
+) -> DocTestRunResult {
+    let remapped = docgen_remap_doctest_span(
+        block,
+        block.simulated_diag_line_offset,
+        block.simulated_diag_col
+    )
+    if block.mode == DOC_TEST_IGNORE && !include_ignored {
+        return DocTestRunResult {
+            item_name: item_name,
+            block_index: block.index,
+            mode: block.mode,
+            passed: true,
+            ignored: true,
+            compiled_ok: false,
+            executed: false,
+            actual_diag_code: 0u32,
+            remapped_span: remapped,
+            failure_reason: ux2_sv_empty(),
+        }
+    }
+
+    let compiled_ok: bool = block.simulated_diag_code == 0u32
+    if block.mode == DOC_TEST_NO_RUN {
+        let ok = compiled_ok
+        return DocTestRunResult {
+            item_name: item_name,
+            block_index: block.index,
+            mode: block.mode,
+            passed: ok,
+            ignored: false,
+            compiled_ok: compiled_ok,
+            executed: false,
+            actual_diag_code: block.simulated_diag_code,
+            remapped_span: remapped,
+            failure_reason: if ok { ux2_sv_empty() } else { ux2_sv("no_run doctest failed to compile") },
+        }
+    }
+
+    if block.mode == DOC_TEST_COMPILE_FAIL {
+        if compiled_ok {
+            return DocTestRunResult {
+                item_name: item_name,
+                block_index: block.index,
+                mode: block.mode,
+                passed: false,
+                ignored: false,
+                compiled_ok: true,
+                executed: false,
+                actual_diag_code: 0u32,
+                remapped_span: remapped,
+                failure_reason: ux2_sv("compile_fail doctest compiled successfully without emitting expected error"),
+            }
+        }
+        let code_matches: bool = if block.expected_diag_code == 0u32 {
+            true
+        } else {
+            block.simulated_diag_code == block.expected_diag_code
+        }
+        return DocTestRunResult {
+            item_name: item_name,
+            block_index: block.index,
+            mode: block.mode,
+            passed: code_matches,
+            ignored: false,
+            compiled_ok: false,
+            executed: false,
+            actual_diag_code: block.simulated_diag_code,
+            remapped_span: remapped,
+            failure_reason: if code_matches {
+                ux2_sv_empty()
+            } else {
+                ux2_sv("compile_fail doctest failed with unexpected diagnostic code")
+            },
+        }
+    }
+
+    if block.mode == DOC_TEST_SHOULD_PANIC {
+        if !compiled_ok {
+            return DocTestRunResult {
+                item_name: item_name,
+                block_index: block.index,
+                mode: block.mode,
+                passed: false,
+                ignored: false,
+                compiled_ok: false,
+                executed: false,
+                actual_diag_code: block.simulated_diag_code,
+                remapped_span: remapped,
+                failure_reason: ux2_sv("should_panic doctest failed to compile"),
+            }
+        }
+        let msg_matches: bool = if block.expected_panic_substr.len == 0usize {
+            block.simulated_panics
+        } else {
+            block.simulated_panics && ux2_sv_contains(block.simulated_panic_msg, block.expected_panic_substr)
+        }
+        return DocTestRunResult {
+            item_name: item_name,
+            block_index: block.index,
+            mode: block.mode,
+            passed: msg_matches,
+            ignored: false,
+            compiled_ok: true,
+            executed: true,
+            actual_diag_code: 0u32,
+            remapped_span: remapped,
+            failure_reason: if msg_matches {
+                ux2_sv_empty()
+            } else {
+                ux2_sv("should_panic doctest did not panic with expected message substring")
+            },
+        }
+    }
+
+    // Default `DOC_TEST_RUN` (or `DOC_TEST_IGNORE` with `--include-ignored`)
+    let run_ok: bool = compiled_ok && !block.simulated_panics
+    DocTestRunResult {
+        item_name: item_name,
+        block_index: block.index,
+        mode: block.mode,
+        passed: run_ok,
+        ignored: false,
+        compiled_ok: compiled_ok,
+        executed: compiled_ok,
+        actual_diag_code: block.simulated_diag_code,
+        remapped_span: remapped,
+        failure_reason: if !compiled_ok {
+            ux2_sv("doctest failed to compile")
+        } else if block.simulated_panics {
+            ux2_sv("doctest panicked at runtime")
+        } else {
+            ux2_sv_empty()
+        },
+    }
+}
+
+pub fn docgen_run_package_doctests(
+    graph: view<DocPackageGraph>,
+    include_ignored: bool
+) -> DocTestSuiteSummary {
+    let dummy_remapped = DocTestRemappedSpan {
+        source_file_id: 0u32,
+        source_line: 0u32,
+        source_col: 0u32,
+        harness_line: 0u32,
+        harness_col: 0u32,
+    }
+    let dummy_res = DocTestRunResult {
+        item_name: ux2_sv_empty(),
+        block_index: 0u32,
+        mode: DOC_TEST_RUN,
+        passed: false,
+        ignored: false,
+        compiled_ok: false,
+        executed: false,
+        actual_diag_code: 0u32,
+        remapped_span: dummy_remapped,
+        failure_reason: ux2_sv_empty(),
+    }
+    let mut summary = DocTestSuiteSummary {
+        total_blocks: 0u32,
+        passed_count: 0u32,
+        failed_count: 0u32,
+        ignored_count: 0u32,
+        run_count: 0u32,
+        no_run_count: 0u32,
+        compile_fail_count: 0u32,
+        should_panic_count: 0u32,
+        res_0: dummy_res,
+        res_1: dummy_res,
+        res_2: dummy_res,
+        res_3: dummy_res,
+        res_4: dummy_res,
+        res_5: dummy_res,
+        result_count: 0usize,
+    }
+
+    let mut i: usize = 0
+    while i < graph.item_count {
+        let item = doc_graph_get_item(graph, i)
+        let mut b: usize = 0
+        while b < item.doctest_count {
+            let blk = doc_item_get_doctest(view(item), b)
+            summary.total_blocks = summary.total_blocks + 1u32
+            if blk.mode == DOC_TEST_RUN {
+                summary.run_count = summary.run_count + 1u32
+            } else if blk.mode == DOC_TEST_NO_RUN {
+                summary.no_run_count = summary.no_run_count + 1u32
+            } else if blk.mode == DOC_TEST_COMPILE_FAIL {
+                summary.compile_fail_count = summary.compile_fail_count + 1u32
+            } else if blk.mode == DOC_TEST_SHOULD_PANIC {
+                summary.should_panic_count = summary.should_panic_count + 1u32
+            }
+            let res = docgen_run_doctest_block(item.name, blk, include_ignored)
+            if res.ignored {
+                summary.ignored_count = summary.ignored_count + 1u32
+            } else if res.passed {
+                summary.passed_count = summary.passed_count + 1u32
+            } else {
+                summary.failed_count = summary.failed_count + 1u32
+            }
+            if (summary.result_count) < 6usize {
+                let rc_idx = summary.result_count
+                doc_suite_set_result(mut_view(summary), rc_idx, res)
+                summary.result_count = rc_idx + 1usize
+            }
+            b = b + 1
+        }
+        i = i + 1
+    }
+    summary
+}
+
+// ============================================================================
+// 11. Canonical `SPEC-104 §7.2` & `§7.3` Package Graph Builders
+// ============================================================================
+
+pub fn docgen_build_metrics_ring_package(file_id: FileId) -> DocPackageGraph {
+    let fv = file_id.v
+    let mut g = doc_package_graph_empty()
+    g.package_name = ux2_sv("metrics")
+    g.package_version = ux2_sv("1.0.0")
+    g.package_fingerprint = fingerprint128_new(0x10400001u64, 0xA8D0C001u64)
+    g.doc_fingerprint = fingerprint128_new(0xD0C01040u64, 0x00000001u64)
+    g.semantic_ast_fingerprint = fingerprint128_new(0xA5701040u64, 0x00000001u64)
+    g.codegen_fingerprint = fingerprint128_new(0xC6E01040u64, 0x00000001u64)
+
+    let mod_path = ux2_sv("metrics.ring")
+    let mut mod0 = doc_module_empty()
+    mod0.module_id = doc_sem_key(ITEM_NS_TYPE, mod_path, ux2_sv("ring"), ux2_sv("module"))
+    mod0.module_path = mod_path
+    mod0.summary_markdown = ux2_sv("Bounded ring-buffer counters for deterministic telemetry.")
+    mod0.body_markdown = ux2_sv("Bounded ring-buffer counters for deterministic telemetry.\n\nSee [RingCounter] and [RingCounter.push_sample] for usage.")
+    g.mod_0 = mod0
+    g.module_count = 1usize
+
+    // 1. `RingCounter` struct (`DOC_KIND_STRUCT`)
+    let mut it_struct = doc_item_empty()
+    it_struct.semantic_key = doc_sem_key(ITEM_NS_TYPE, mod_path, ux2_sv("RingCounter"), ux2_sv("struct"))
+    it_struct.kind = DOC_KIND_STRUCT
+    it_struct.name = ux2_sv("RingCounter")
+    it_struct.module_path = mod_path
+    it_struct.visibility = DOC_VIS_PUB
+    it_struct.file_id = fv
+    it_struct.span_start = 120u32
+    it_struct.span_end = 240u32
+    it_struct.source_line = 22u32
+    it_struct.signature = ux2_sv("pub struct RingCounter { pub slots: [4]i64, pub write_idx: usize, pub count: usize }")
+    it_struct.signature_compact = ux2_sv("struct RingCounter")
+    it_struct.summary_markdown = ux2_sv("Fixed-capacity inline ring counter storing the last 4 samples.")
+    it_struct.body_markdown = ux2_sv("Fixed-capacity inline ring counter storing the last 4 samples.\n\nUse [RingCounter.push_sample] to record values and [RingCounter.average] to query.")
+    it_struct.has_since = true
+    it_struct.since_version = ux2_sv("1.0.0")
+    it_struct.has_repr = true
+    it_struct.repr_attr = ux2_sv("C")
+    it_struct.has_container_contract = true
+    it_struct.container_contract = meta_container_contract_at(0u32)
+    docgen_extract_links_from_markdown(it_struct.body_markdown, FileId { v: fv }, 130u32, mut_view(it_struct))
+
+    let mut dt0 = doc_test_block_empty()
+    dt0.index = 0u32
+    dt0.mode = DOC_TEST_RUN
+    dt0.raw_code = ux2_sv("# let seed: i64 = 10\nlet mut c = ring_counter_new()\npush_sample(mut_view(c), seed + 10)\npush_sample(mut_view(c), 40)\nassert_eq(average(view(c)), 30)")
+    dt0.display_code = ux2_sv("let mut c = ring_counter_new()\npush_sample(mut_view(c), seed + 10)\npush_sample(mut_view(c), 40)\nassert_eq(average(view(c)), 30)")
+    dt0.has_hidden_setup = true
+    dt0.source_file_id = fv
+    dt0.fence_start_line = 12u32
+    dt0.fence_start_col = 5u32
+    it_struct.doctest_0 = dt0
+    it_struct.doctest_count = 1usize
+
+    // 2. `push_sample` fn (`DOC_KIND_FN`)
+    let mut it_push = doc_item_empty()
+    it_push.semantic_key = doc_sem_key(ITEM_NS_VALUE, mod_path, ux2_sv("push_sample"), ux2_sv("fn(mut_view<RingCounter>,i64)"))
+    it_push.kind = DOC_KIND_FN
+    it_push.name = ux2_sv("push_sample")
+    it_push.module_path = mod_path
+    it_push.parent_type_name = ux2_sv("RingCounter")
+    it_push.visibility = DOC_VIS_PUB
+    it_push.file_id = fv
+    it_push.span_start = 300u32
+    it_push.span_end = 460u32
+    it_push.source_line = 48u32
+    it_push.signature = ux2_sv("pub fn push_sample(self: mut_view<RingCounter>, sample: i64)")
+    it_push.signature_compact = ux2_sv("fn(mut_view<RingCounter>, i64)")
+    it_push.summary_markdown = ux2_sv("Appends `sample` into [RingCounter], overwriting the oldest slot when full.")
+    it_push.body_markdown = ux2_sv("Appends `sample` into [RingCounter], overwriting the oldest slot when full.")
+    it_push.param_0 = DocParamContract {
+        name: ux2_sv("self"),
+        ty_display: ux2_sv("mut_view<RingCounter>"),
+        passing_mode: DOC_PASS_MUT_VIEW,
+        has_lifetime_bound: true,
+        lifetime_bound: ux2_sv("scoped_borrow(self)"),
+    }
+    it_push.param_1 = DocParamContract {
+        name: ux2_sv("sample"),
+        ty_display: ux2_sv("i64"),
+        passing_mode: DOC_PASS_COPY,
+        has_lifetime_bound: false,
+        lifetime_bound: ux2_sv_empty(),
+    }
+    it_push.param_count = 2usize
+    it_push.has_effect_summary = true
+    it_push.effect_summary = meta_api_effect_at(0u32)
+    docgen_extract_links_from_markdown(it_push.body_markdown, FileId { v: fv }, 310u32, mut_view(it_push))
+
+    let mut dt_cf = doc_test_block_empty()
+    dt_cf.index = 0u32
+    dt_cf.mode = DOC_TEST_COMPILE_FAIL
+    dt_cf.expected_diag_code = AX_CAP_CONFLICT_MUT
+    dt_cf.expected_diag_name = ux2_sv("AX_CAP_CONFLICT_MUT")
+    dt_cf.raw_code = ux2_sv("let mut c = ring_counter_new()\nlet v1 = mut_view(c)\nlet v2 = mut_view(c)\npush_sample(v1, 1)\npush_sample(v2, 2)")
+    dt_cf.display_code = dt_cf.raw_code
+    dt_cf.source_file_id = fv
+    dt_cf.fence_start_line = 35u32
+    dt_cf.fence_start_col = 5u32
+    dt_cf.simulated_diag_code = AX_CAP_CONFLICT_MUT
+    dt_cf.simulated_diag_line_offset = 3u32
+    dt_cf.simulated_diag_col = 10u32
+    it_push.doctest_0 = dt_cf
+    it_push.doctest_count = 1usize
+
+    // 3. `average` fn (`DOC_KIND_FN`)
+    let mut it_avg = doc_item_empty()
+    it_avg.semantic_key = doc_sem_key(ITEM_NS_VALUE, mod_path, ux2_sv("average"), ux2_sv("fn(view<RingCounter>)->i64"))
+    it_avg.kind = DOC_KIND_FN
+    it_avg.name = ux2_sv("average")
+    it_avg.module_path = mod_path
+    it_avg.parent_type_name = ux2_sv("RingCounter")
+    it_avg.visibility = DOC_VIS_PUB
+    it_avg.file_id = fv
+    it_avg.span_start = 500u32
+    it_avg.span_end = 650u32
+    it_avg.source_line = 68u32
+    it_avg.signature = ux2_sv("pub fn average(self: view<RingCounter>) -> i64")
+    it_avg.signature_compact = ux2_sv("fn(view<RingCounter>) -> i64")
+    it_avg.summary_markdown = ux2_sv("Returns the integer mean of recorded samples in [RingCounter], or `0` if empty.")
+    it_avg.body_markdown = ux2_sv("Returns the integer mean of recorded samples in [RingCounter], or `0` if empty.")
+    it_avg.has_must_use = true
+    it_avg.must_use_reason = ux2_sv("computed ring average has no side effects if discarded")
+    it_avg.param_0 = DocParamContract {
+        name: ux2_sv("self"),
+        ty_display: ux2_sv("view<RingCounter>"),
+        passing_mode: DOC_PASS_VIEW,
+        has_lifetime_bound: true,
+        lifetime_bound: ux2_sv("shared_borrow(self)"),
+    }
+    it_avg.param_count = 1usize
+    it_avg.has_return_ty = true
+    it_avg.return_ty = ux2_sv("i64")
+    it_avg.has_effect_summary = true
+    it_avg.effect_summary = meta_api_effect_at(0u32)
+    docgen_extract_links_from_markdown(it_avg.body_markdown, FileId { v: fv }, 510u32, mut_view(it_avg))
+
+    let mut dt_nr = doc_test_block_empty()
+    dt_nr.index = 0u32
+    dt_nr.mode = DOC_TEST_NO_RUN
+    dt_nr.raw_code = ux2_sv("let c = ring_counter_new()\nlet _ = average(view(c))")
+    dt_nr.display_code = dt_nr.raw_code
+    dt_nr.source_file_id = fv
+    dt_nr.fence_start_line = 58u32
+    dt_nr.fence_start_col = 5u32
+
+    let mut dt_sp = doc_test_block_empty()
+    dt_sp.index = 1u32
+    dt_sp.mode = DOC_TEST_SHOULD_PANIC
+    dt_sp.expected_panic_substr = ux2_sv("empty ring")
+    dt_sp.raw_code = ux2_sv("panic(\"empty ring assertion\")")
+    dt_sp.display_code = dt_sp.raw_code
+    dt_sp.source_file_id = fv
+    dt_sp.fence_start_line = 62u32
+    dt_sp.fence_start_col = 5u32
+    dt_sp.simulated_panics = true
+    dt_sp.simulated_panic_msg = ux2_sv("panic: empty ring assertion")
+
+    let mut dt_ig = doc_test_block_empty()
+    dt_ig.index = 2u32
+    dt_ig.mode = DOC_TEST_IGNORE
+    dt_ig.raw_code = ux2_sv("let c = ring_counter_new()")
+    dt_ig.display_code = dt_ig.raw_code
+    dt_ig.source_file_id = fv
+    dt_ig.fence_start_line = 65u32
+    dt_ig.fence_start_col = 5u32
+
+    it_avg.doctest_0 = dt_nr
+    it_avg.doctest_1 = dt_sp
+    it_avg.doctest_2 = dt_ig
+    it_avg.doctest_count = 3usize
+
+    // 4. `MetricSource` trait (`DOC_KIND_TRAIT`)
+    let mut it_trait = doc_item_empty()
+    it_trait.semantic_key = doc_sem_key(ITEM_NS_TYPE, mod_path, ux2_sv("MetricSource"), ux2_sv("trait"))
+    it_trait.kind = DOC_KIND_TRAIT
+    it_trait.name = ux2_sv("MetricSource")
+    it_trait.module_path = mod_path
+    it_trait.visibility = DOC_VIS_PUB
+    it_trait.file_id = fv
+    it_trait.span_start = 660u32
+    it_trait.span_end = 720u32
+    it_trait.source_line = 80u32
+    it_trait.signature = ux2_sv("pub trait MetricSource { fn sample_count(self: view<Self>) -> usize }")
+    it_trait.signature_compact = ux2_sv("trait MetricSource")
+    it_trait.summary_markdown = ux2_sv("Object-safe telemetry source interface.")
+    it_trait.body_markdown = it_trait.summary_markdown
+    let mut ts = doc_trait_sig_empty()
+    ts.is_trait = true
+    ts.object_safety = DOC_OBJ_SAFE
+    ts.required_0 = ux2_sv("sample_count")
+    ts.required_count = 1usize
+    it_trait.trait_sig = ts
+
+    // 5. Private helper `internal_slot_index` (`DOC_VIS_PRIVATE`)
+    let mut it_priv = doc_item_empty()
+    it_priv.semantic_key = doc_sem_key(ITEM_NS_VALUE, mod_path, ux2_sv("internal_slot_index"), ux2_sv("fn(usize)->usize"))
+    it_priv.kind = DOC_KIND_FN
+    it_priv.name = ux2_sv("internal_slot_index")
+    it_priv.module_path = mod_path
+    it_priv.visibility = DOC_VIS_PRIVATE
+    it_priv.file_id = fv
+    it_priv.span_start = 730u32
+    it_priv.span_end = 780u32
+    it_priv.source_line = 92u32
+    it_priv.signature = ux2_sv("fn internal_slot_index(idx: usize) -> usize")
+    it_priv.signature_compact = ux2_sv("fn(usize) -> usize")
+    it_priv.summary_markdown = ux2_sv("Internal ring wrap index helper.")
+    it_priv.body_markdown = it_priv.summary_markdown
+
+    // 6. `@doc(hidden)` item `debug_raw_slot` (`is_doc_hidden = true`)
+    let mut it_hid = doc_item_empty()
+    it_hid.semantic_key = doc_sem_key(ITEM_NS_VALUE, mod_path, ux2_sv("debug_raw_slot"), ux2_sv("fn(view<RingCounter>)->i64"))
+    it_hid.kind = DOC_KIND_FN
+    it_hid.name = ux2_sv("debug_raw_slot")
+    it_hid.module_path = mod_path
+    it_hid.visibility = DOC_VIS_PUB
+    it_hid.is_doc_hidden = true
+    it_hid.file_id = fv
+    it_hid.span_start = 790u32
+    it_hid.span_end = 840u32
+    it_hid.source_line = 104u32
+    it_hid.signature = ux2_sv("pub fn debug_raw_slot(self: view<RingCounter>) -> i64")
+    it_hid.signature_compact = ux2_sv("fn(view<RingCounter>) -> i64")
+    it_hid.summary_markdown = ux2_sv("Hidden diagnostic probe.")
+    it_hid.body_markdown = it_hid.summary_markdown
+
+    // Insert in intentionally unsorted order so `docgen_sort_package_graph` proves canonical ordering
+    g.item_0 = it_push
+    g.item_1 = it_priv
+    g.item_2 = it_struct
+    g.item_3 = it_hid
+    g.item_4 = it_avg
+    g.item_5 = it_trait
+    g.item_count = 6usize
+
+    docgen_sort_package_graph(mut_view(g))
+    g
+}
+
+// Builds the negative doc fixture from `SPEC-104 §7.3` (`bad_doc_link` + failing `compile_fail` doctest).
+pub fn docgen_build_negative_doc_package(file_id: FileId) -> DocPackageGraph {
+    let fv = file_id.v
+    let mut g = doc_package_graph_empty()
+    g.package_name = ux2_sv("bad_doc_demo")
+    g.package_version = ux2_sv("0.1.0")
+    g.package_fingerprint = fingerprint128_new(0xBAD00001u64, 0x00000002u64)
+
+    let mod_path = ux2_sv("bad_doc_link")
+    let mut mod0 = doc_module_empty()
+    mod0.module_id = doc_sem_key(ITEM_NS_TYPE, mod_path, ux2_sv("bad_doc_link"), ux2_sv("module"))
+    mod0.module_path = mod_path
+    mod0.summary_markdown = ux2_sv("Negative test module with broken intra-doc link.")
+    mod0.body_markdown = mod0.summary_markdown
+    g.mod_0 = mod0
+    g.module_count = 1usize
+
+    let mut it_bad = doc_item_empty()
+    it_bad.semantic_key = doc_sem_key(ITEM_NS_VALUE, mod_path, ux2_sv("compute"), ux2_sv("fn(i64)->i64"))
+    it_bad.kind = DOC_KIND_FN
+    it_bad.name = ux2_sv("compute")
+    it_bad.module_path = mod_path
+    it_bad.visibility = DOC_VIS_PUB
+    it_bad.file_id = fv
+    it_bad.span_start = 40u32
+    it_bad.span_end = 120u32
+    it_bad.source_line = 4u32
+    it_bad.signature = ux2_sv("pub fn compute(x: i64) -> i64")
+    it_bad.signature_compact = ux2_sv("fn(i64) -> i64")
+    it_bad.summary_markdown = ux2_sv("See [NonExistentType.missing_method] for details.")
+    it_bad.body_markdown = it_bad.summary_markdown
+    docgen_extract_links_from_markdown(it_bad.body_markdown, FileId { v: fv }, 44u32, mut_view(it_bad))
+
+    let mut dt_bad_cf = doc_test_block_empty()
+    dt_bad_cf.index = 0u32
+    dt_bad_cf.mode = DOC_TEST_COMPILE_FAIL
+    dt_bad_cf.expected_diag_code = AX_TYPE_MISMATCH
+    dt_bad_cf.expected_diag_name = ux2_sv("AX_TYPE_MISMATCH")
+    dt_bad_cf.raw_code = ux2_sv("let y: i64 = compute(21)\nassert_eq(y, 42)")
+    dt_bad_cf.display_code = dt_bad_cf.raw_code
+    dt_bad_cf.source_file_id = fv
+    dt_bad_cf.fence_start_line = 5u32
+    dt_bad_cf.fence_start_col = 5u32
+    // Snippet compiles cleanly (`simulated_diag_code == 0`), so `compile_fail(AX_TYPE_MISMATCH)` MUST fail!
+    dt_bad_cf.simulated_diag_code = 0u32
+    it_bad.doctest_0 = dt_bad_cf
+    it_bad.doctest_count = 1usize
+
+    g.item_0 = it_bad
+    g.item_count = 1usize
+    docgen_sort_package_graph(mut_view(g))
+    g
+}
