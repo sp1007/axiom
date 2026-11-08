@@ -8,14 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T211, T089, T401, T407, T408, T410]
 priority: 132
-status: doing
+status: done
 attempts: 1
 paths: [std/thread, std/sys/windows/thread.ax, tests/std/thread]
 locks: [std/core/host.ax, compiler/interp/oracle.ax, compiler/interp/interp.ax, compiler/types/typeck.ax, compiler/lir/builder.ax, tests/selfhost]
 spec: [spec/SPEC-32-threads-sync.md, 0203, 0206, 0207, 0208, tasks/0329, tasks/0623]
 covers: [REQ-CONC-219]
 started: 2026-11-08 19:20:45
-agent: T090-impl
+finished: 2026-11-09 02:31:21
 ---
 # T090 — E11.3 — Host threading intrinsics & std.thread spawn/join/scope on Windows
 
@@ -45,3 +45,4 @@ Implement the host threading intrinsics (`std/core/host.ax`, `std/sys/windows/th
 - 2026-10-06 02:23:55 covers += REQ-CONC-219 (metadata only)
 - 2026-11-03 00:10:00 refined scope, paths, locks, and dependencies in T211 (P11 phase planning)
 - 2026-11-08 19:20:45 started (attempt 1) T090-impl
+- 2026-11-09 02:31:21 accepted by QA -> done

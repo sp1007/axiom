@@ -1,0 +1,819 @@
+module std.thread
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+use std.core.host.thread_spawn
+use std.core.host.thread_join
+use std.core.host.thread_detach
+use std.core.host.thread_current_id
+use std.core.host.thread_yield
+use std.core.host.thread_sleep_ns
+use std.sync.atomic.Atomic
+use std.sync.atomic.Ordering
+use std.sync.atomic.fence
+use std.text.string.String
+use std.text.string.string_new
+use std.text.string.string_with_capacity
+use std.text.string.string_clone
+use std.time.Duration
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn needs_drop<T>() -> bool { false }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic unsafe fn drop_in_place<T>(p: *mut T) {}
+@intrinsic fn forget<T>(val: T) {}
+@intrinsic fn panic(msg: str) {}
+
+const AX_THREAD_SLOT_MAGIC: u64 = 0x4158544852504B54u64;
+const FLAG_CHILD_DONE: u32 = 1u32;
+const FLAG_PARENT_DETACHED: u32 = 2u32;
+
+fn __ax_thread_self_entry(ctx: *mut u8) -> i64 {
+    let _ = ctx;
+    0i64
+}
+
+fn str_to_owned_string(s: str) -> String {
+    let n = len(s);
+    if n == 0 {
+        return string_new();
+    }
+    let bs: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let mut out = string_with_capacity(n);
+    let mut i: usize = 0;
+    while i < n {
+        unsafe {
+            *(out.ptr + i) = bs[i];
+        }
+        i = i + 1;
+    }
+    out.len = n;
+    out
+}
+
+fn string_as_str_slice(s: view<String>) -> str {
+    let mut raw_words: [2]usize = [s.ptr as usize, s.len];
+    unsafe { *(address_of(raw_words[0]) as *const str) }
+}
+
+@derive(Copy)
+pub struct ThreadId {
+    pub id: u64,
+}
+
+impl ThreadId {
+    pub fn as_u64(self: view<ThreadId>) -> u64 {
+        self.id
+    }
+
+    pub fn eq(self: view<ThreadId>, other: view<ThreadId>) -> bool {
+        self.id == other.id
+    }
+
+    pub fn clone(self: view<ThreadId>) -> ThreadId {
+        *self
+    }
+}
+
+pub struct Thread {
+    pub id: ThreadId,
+    pub has_name: bool,
+    pub name_buf: String,
+}
+
+unsafe impl Send for Thread {}
+unsafe impl Share for Thread {}
+
+impl Thread {
+    pub fn id(self: view<Thread>) -> ThreadId {
+        self.id
+    }
+
+    pub fn name(self: view<Thread>) -> Option<str> {
+        if self.has_name {
+            Option.Some(string_as_str_slice(view(self.name_buf)))
+        } else {
+            Option.None
+        }
+    }
+
+    pub fn clone(self: view<Thread>) -> Thread {
+        Thread {
+            id: self.id,
+            has_name: self.has_name,
+            name_buf: if self.has_name { string_clone(view(self.name_buf)) } else { string_new() },
+        }
+    }
+}
+
+@derive(Copy)
+pub enum ThreadError {
+    SpawnFailed,
+    InvalidConfig,
+}
+
+impl ThreadError {
+    pub fn eq(self: view<ThreadError>, other: view<ThreadError>) -> bool {
+        let a = match *self {
+            ThreadError.SpawnFailed => 0u8,
+            ThreadError.InvalidConfig => 1u8,
+        };
+        let b = match *other {
+            ThreadError.SpawnFailed => 0u8,
+            ThreadError.InvalidConfig => 1u8,
+        };
+        a == b
+    }
+
+    pub fn clone(self: view<ThreadError>) -> ThreadError {
+        *self
+    }
+}
+
+pub struct ThreadPanic {
+    pub message: String,
+    pub thread_id: ThreadId,
+}
+
+unsafe impl Send for ThreadPanic {}
+unsafe impl Share for ThreadPanic {}
+
+impl ThreadPanic {
+    pub fn message(self: view<ThreadPanic>) -> str {
+        string_as_str_slice(view(self.message))
+    }
+
+    pub fn thread_id(self: view<ThreadPanic>) -> ThreadId {
+        self.thread_id
+    }
+}
+
+fn make_thread_panic(tid: ThreadId) -> ThreadPanic {
+    ThreadPanic {
+        message: str_to_owned_string("child thread panicked"),
+        thread_id: tid,
+    }
+}
+
+// Shared heap control slot between parent handle and child trampoline.
+// Byte offsets 0 (magic: u64), 8 (lifecycle: Atomic<u32>), and 32 (assigned_tid: u64)
+// match the host runtime contract in std/sys/windows/thread.ax and compiler/interp/interp.ax.
+@repr(C)
+struct SpawnSlot {
+    pub magic: u64,
+    pub lifecycle: Atomic<u32>,
+    pub phase: u32,
+    pub stack_size: usize,
+    pub raw_handle: i64,
+    pub assigned_tid: u64,
+    pub closure_ptr: *mut u8,
+    pub val_ptr: *mut u8,
+    pub cleanup_fn: fn(*mut u8) -> i64,
+}
+
+fn box_size(sz: usize) -> usize {
+    if sz == 0 { 8 } else { sz }
+}
+
+fn box_align(al: usize) -> usize {
+    if al < 8 { 8 } else { al }
+}
+
+unsafe fn spawn_slot_new(stack_size: usize, closure_ptr: *mut u8) -> *mut SpawnSlot {
+    let raw = heap_alloc(size_of<SpawnSlot>(), align_of<SpawnSlot>());
+    if (raw as usize) == 0 {
+        return 0 as *mut SpawnSlot;
+    }
+    let s = raw as *mut SpawnSlot;
+    (*s).magic = AX_THREAD_SLOT_MAGIC;
+    (*s).lifecycle = Atomic.new(0u32);
+    (*s).phase = 0u32;
+    (*s).stack_size = stack_size;
+    (*s).raw_handle = 0i64;
+    (*s).assigned_tid = 0u64;
+    (*s).closure_ptr = closure_ptr;
+    (*s).val_ptr = 0 as *mut u8;
+    (*s).cleanup_fn = __ax_thread_self_entry;
+    s
+}
+
+unsafe fn ax_spawn_trampoline<F: FnOnce<T> + Send, T: Send>(raw_typed: *mut (F, T)) -> i64 {
+    let raw = raw_typed as *mut u8;
+    let slot = raw as *mut SpawnSlot;
+    let ph = (*slot).phase;
+    let res_sz = box_size(size_of<Result<T, ThreadPanic>>());
+    let res_al = box_align(align_of<Result<T, ThreadPanic>>());
+    if ph == 0u32 {
+        (*slot).cleanup_fn = __ax_thread_self_entry;
+        (*slot).phase = 1u32;
+        let h = thread_spawn(__ax_thread_self_entry, raw, (*slot).stack_size);
+        (*slot).raw_handle = h;
+        return h;
+    }
+    if ph == 2u32 {
+        let c_ptr = (*slot).closure_ptr;
+        (*slot).closure_ptr = 0 as *mut u8;
+        if (c_ptr as usize) != 0 {
+            if needs_drop<F>() {
+                drop_in_place<F>(c_ptr as *mut F);
+            }
+            heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+        }
+        let v_ptr = (*slot).val_ptr;
+        (*slot).val_ptr = 0 as *mut u8;
+        if (v_ptr as usize) != 0 {
+            if needs_drop<Result<T, ThreadPanic>>() {
+                drop_in_place<Result<T, ThreadPanic>>(v_ptr as *mut Result<T, ThreadPanic>);
+            }
+            heap_free(v_ptr, res_sz, res_al);
+        }
+        (*slot).magic = 0u64;
+        heap_free(raw, size_of<SpawnSlot>(), align_of<SpawnSlot>());
+        return 0i64;
+    }
+    if ph == 3u32 {
+        let c_ptr = (*slot).closure_ptr;
+        (*slot).closure_ptr = 0 as *mut u8;
+        if (c_ptr as usize) != 0 {
+            if needs_drop<F>() {
+                drop_in_place<F>(c_ptr as *mut F);
+            }
+            heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+        }
+        let old_v = (*slot).val_ptr;
+        (*slot).val_ptr = 0 as *mut u8;
+        if (old_v as usize) != 0 {
+            if needs_drop<Result<T, ThreadPanic>>() {
+                drop_in_place<Result<T, ThreadPanic>>(old_v as *mut Result<T, ThreadPanic>);
+            }
+            heap_free(old_v, res_sz, res_al);
+        }
+        let r_raw = heap_alloc(res_sz, res_al);
+        let r_box = r_raw as *mut Result<T, ThreadPanic>;
+        *r_box = Result.Err(make_thread_panic(ThreadId { id: (*slot).assigned_tid }));
+        (*slot).val_ptr = r_raw;
+        return 0i64;
+    }
+    if ph == 4u32 {
+        let v_ptr = (*slot).val_ptr;
+        (*slot).val_ptr = 0 as *mut u8;
+        if (v_ptr as usize) != 0 {
+            heap_free(v_ptr, res_sz, res_al);
+        }
+        (*slot).magic = 0u64;
+        heap_free(raw, size_of<SpawnSlot>(), align_of<SpawnSlot>());
+        return 0i64;
+    }
+
+    let c_ptr = (*slot).closure_ptr;
+    (*slot).closure_ptr = 0 as *mut u8;
+    let f_box = c_ptr as *mut F;
+    let f_val = *f_box;
+    heap_free(c_ptr, box_size(size_of<F>()), box_align(align_of<F>()));
+
+    let out_val: T = f_val();
+    let v_raw = heap_alloc(res_sz, res_al);
+    let v_box = v_raw as *mut Result<T, ThreadPanic>;
+    *v_box = Result.Ok(out_val);
+    (*slot).val_ptr = v_raw;
+
+    let prev = (*slot).lifecycle.fetch_or(FLAG_CHILD_DONE, Ordering.AcqRel);
+    if (prev & FLAG_PARENT_DETACHED) != 0u32 {
+        (*slot).val_ptr = 0 as *mut u8;
+        if needs_drop<Result<T, ThreadPanic>>() {
+            drop_in_place<Result<T, ThreadPanic>>(v_box);
+        }
+        heap_free(v_raw, res_sz, res_al);
+        (*slot).magic = 0u64;
+        heap_free(raw, size_of<SpawnSlot>(), align_of<SpawnSlot>());
+    }
+    0i64
+}
+
+unsafe fn spawn_raw_slot<F: FnOnce<T> + Send, T: Send>(f: F, stack_size: usize, _t_tag: *const T) -> *mut SpawnSlot {
+    let f_raw = heap_alloc(box_size(size_of<F>()), box_align(align_of<F>()));
+    if (f_raw as usize) == 0 {
+        return 0 as *mut SpawnSlot;
+    }
+    let f_box = f_raw as *mut F;
+    *f_box = f;
+    let slot = spawn_slot_new(stack_size, f_raw);
+    if (slot as usize) == 0 {
+        if needs_drop<F>() {
+            drop_in_place<F>(f_box);
+        }
+        heap_free(f_raw, box_size(size_of<F>()), box_align(align_of<F>()));
+        return 0 as *mut SpawnSlot;
+    }
+    let h = ax_spawn_trampoline<F, T>(slot as *mut (F, T));
+    if h <= 0i64 {
+        (*slot).phase = 2u32;
+        let cfn = (*slot).cleanup_fn;
+        let _ = cfn(slot as *mut u8);
+        return 0 as *mut SpawnSlot;
+    }
+    slot
+}
+
+pub struct JoinHandle<T> {
+    pub raw_handle: i64,
+    pub thread_info: Thread,
+    pub slot: *mut u8,
+    pub marker: *const T,
+}
+
+unsafe impl<T: Send> Send for JoinHandle<T> {}
+impl<T> !Share for JoinHandle<T> {}
+
+impl<T> Drop for JoinHandle<T> {
+    fn drop(self: mut_view<JoinHandle<T>>) {
+        let h = self.raw_handle;
+        let raw = self.slot;
+        self.raw_handle = 0i64;
+        self.slot = 0 as *mut u8;
+        if h > 0i64 && (raw as usize) != 0 {
+            unsafe {
+                let s = raw as *mut SpawnSlot;
+                let prev = (*s).lifecycle.fetch_or(FLAG_PARENT_DETACHED, Ordering.AcqRel);
+                let _ = thread_detach(h);
+                if (prev & FLAG_CHILD_DONE) != 0u32 {
+                    (*s).phase = 2u32;
+                    let cfn = (*s).cleanup_fn;
+                    let _ = cfn(raw);
+                }
+            }
+        }
+    }
+}
+
+impl<T> JoinHandle<T> {
+    pub fn thread(self: view<JoinHandle<T>>) -> Thread {
+        self.thread_info.clone()
+    }
+
+    pub fn is_finished(self: view<JoinHandle<T>>) -> bool {
+        if (self.slot as usize) == 0 {
+            return true;
+        }
+        let s = self.slot as *const SpawnSlot;
+        let st = unsafe { (*s).lifecycle.load(Ordering.Acquire) };
+        (st & FLAG_CHILD_DONE) != 0u32
+    }
+
+    pub fn join(mut self: JoinHandle<T>) -> Result<T, ThreadPanic> {
+        let h = self.raw_handle;
+        let raw = self.slot;
+        let tid = self.thread_info.id;
+        self.raw_handle = 0i64;
+        self.slot = 0 as *mut u8;
+        if h <= 0i64 || (raw as usize) == 0 {
+            return Result.Err(make_thread_panic(tid));
+        }
+        let mut ret_code: i64 = 0i64;
+        let rc = unsafe { thread_join(h, address_of_mut(ret_code)) };
+        let s = raw as *mut SpawnSlot;
+        let cfn = unsafe { (*s).cleanup_fn };
+        if rc != 0i64 || ret_code != 0i64 || (unsafe { (*s).val_ptr } as usize) == 0 {
+            unsafe {
+                (*s).phase = 3u32;
+                let _ = cfn(raw);
+            }
+        }
+        let r_raw = unsafe { (*s).val_ptr };
+        let out_res = unsafe { *(r_raw as *const Result<T, ThreadPanic>) };
+        unsafe {
+            (*s).phase = 4u32;
+            let _ = cfn(raw);
+        }
+        out_res
+    }
+
+    pub fn detach(mut self: JoinHandle<T>) {
+        let h = self.raw_handle;
+        let raw = self.slot;
+        self.raw_handle = 0i64;
+        self.slot = 0 as *mut u8;
+        if h > 0i64 && (raw as usize) != 0 {
+            unsafe {
+                let s = raw as *mut SpawnSlot;
+                let prev = (*s).lifecycle.fetch_or(FLAG_PARENT_DETACHED, Ordering.AcqRel);
+                let _ = thread_detach(h);
+                if (prev & FLAG_CHILD_DONE) != 0u32 {
+                    (*s).phase = 2u32;
+                    let cfn = (*s).cleanup_fn;
+                    let _ = cfn(raw);
+                }
+            }
+        }
+    }
+}
+
+pub struct Builder {
+    pub stack_size: usize,
+    pub has_name: bool,
+    pub name_buf: String,
+}
+
+unsafe impl Send for Builder {}
+unsafe impl Share for Builder {}
+
+impl Builder {
+    pub fn new() -> Builder {
+        Builder {
+            stack_size: 0,
+            has_name: false,
+            name_buf: string_new(),
+        }
+    }
+
+    pub fn stack_size(mut self: Builder, size: usize) -> Builder {
+        self.stack_size = size;
+        self
+    }
+
+    pub fn name(mut self: Builder, name: str) -> Builder {
+        self.has_name = true;
+        self.name_buf = str_to_owned_string(name);
+        self
+    }
+
+    pub fn spawn<F: FnOnce<T> + Send, T: Send>(self: Builder, f: F) -> Result<JoinHandle<T>, ThreadError> {
+        let slot = unsafe { spawn_raw_slot<F, T>(f, self.stack_size, 0 as *const T) };
+        if (slot as usize) == 0 {
+            return Result.Err(ThreadError.SpawnFailed);
+        }
+        let h = unsafe { (*slot).raw_handle };
+        let tid_num = unsafe { (*slot).assigned_tid };
+        let t_info = Thread {
+            id: ThreadId { id: tid_num },
+            has_name: self.has_name,
+            name_buf: self.name_buf,
+        };
+        Result.Ok(JoinHandle {
+            raw_handle: h,
+            thread_info: t_info,
+            slot: slot as *mut u8,
+            marker: 0 as *const T,
+        })
+    }
+}
+
+pub fn spawn<F: FnOnce<T> + Send, T: Send>(f: F) -> JoinHandle<T> {
+    let slot = unsafe { spawn_raw_slot<F, T>(f, 0, 0 as *const T) };
+    if (slot as usize) == 0 {
+        panic("failed to spawn OS thread");
+    }
+    let h = unsafe { (*slot).raw_handle };
+    let tid_num = unsafe { (*slot).assigned_tid };
+    JoinHandle {
+        raw_handle: h,
+        thread_info: Thread {
+            id: ThreadId { id: tid_num },
+            has_name: false,
+            name_buf: string_new(),
+        },
+        slot: slot as *mut u8,
+        marker: 0 as *const T,
+    }
+}
+
+struct ScopeNode {
+    pub next: *mut ScopeNode,
+    pub slot: *mut SpawnSlot,
+    pub raw_handle: i64,
+    pub thread_info: Thread,
+    pub joined_by_handle: bool,
+}
+
+struct ScopeState {
+    pub active_count: usize,
+    pub has_panic: bool,
+    pub first_panic_tid: u64,
+    pub handles_head: *mut u8,
+}
+
+pub struct Scope {
+    pub state_ptr: *mut ScopeState,
+}
+
+impl !Share for Scope {}
+
+pub struct ScopedJoinHandle<T> {
+    pub raw_handle: i64,
+    pub slot: *mut u8,
+    pub marker: *const T,
+}
+
+unsafe impl<T: Send> Send for ScopedJoinHandle<T> {}
+impl<T> !Share for ScopedJoinHandle<T> {}
+
+impl<T> ScopedJoinHandle<T> {
+    pub fn thread(self: view<ScopedJoinHandle<T>>) -> Thread {
+        let node = self.slot as *const ScopeNode;
+        unsafe { view((*node).thread_info).clone() }
+    }
+
+    pub fn is_finished(self: view<ScopedJoinHandle<T>>) -> bool {
+        if (self.slot as usize) == 0 {
+            return true;
+        }
+        let node = self.slot as *const ScopeNode;
+        let sp = unsafe { (*node).slot };
+        if (sp as usize) == 0 {
+            return true;
+        }
+        let st = unsafe { (*sp).lifecycle.load(Ordering.Acquire) };
+        (st & FLAG_CHILD_DONE) != 0u32
+    }
+
+    pub fn join(self: ScopedJoinHandle<T>) -> Result<T, ThreadPanic> {
+        let node = self.slot as *mut ScopeNode;
+        let h = self.raw_handle;
+        let tid = unsafe { (*node).thread_info.id };
+        unsafe {
+            (*node).joined_by_handle = true;
+        }
+        let sp = unsafe { (*node).slot };
+        unsafe {
+            (*node).slot = 0 as *mut SpawnSlot;
+        }
+        if h <= 0i64 || (sp as usize) == 0 {
+            return Result.Err(make_thread_panic(tid));
+        }
+        let mut ret_code: i64 = 0i64;
+        let rc = unsafe { thread_join(h, address_of_mut(ret_code)) };
+        let cfn = unsafe { (*sp).cleanup_fn };
+        if rc != 0i64 || ret_code != 0i64 || (unsafe { (*sp).val_ptr } as usize) == 0 {
+            unsafe {
+                (*sp).phase = 3u32;
+                let _ = cfn(sp as *mut u8);
+            }
+        }
+        let r_raw = unsafe { (*sp).val_ptr };
+        let out_res = unsafe { *(r_raw as *const Result<T, ThreadPanic>) };
+        unsafe {
+            (*sp).phase = 4u32;
+            let _ = cfn(sp as *mut u8);
+        }
+        out_res
+    }
+}
+
+fn scope_drain_all_nodes(s: mut_view<Scope>) -> bool {
+    let mut had_unjoined_panic = false;
+    let st = s.state_ptr;
+    if (st as usize) == 0 {
+        return false;
+    }
+    let mut cur = unsafe { (*st).handles_head as *mut ScopeNode };
+    unsafe {
+        (*st).handles_head = 0 as *mut u8;
+        (*st).active_count = 0;
+    }
+    while (cur as usize) != 0 {
+        let next_node = unsafe { (*cur).next };
+        let already_joined = unsafe { (*cur).joined_by_handle };
+        let sp = unsafe { (*cur).slot };
+        let h = unsafe { (*cur).raw_handle };
+        let tid = unsafe { (*cur).thread_info.id };
+        if !already_joined && h > 0i64 && (sp as usize) != 0 {
+            let mut ret_code: i64 = 0i64;
+            let rc = unsafe { thread_join(h, address_of_mut(ret_code)) };
+            unsafe {
+                (*sp).phase = 2u32;
+                let cfn = (*sp).cleanup_fn;
+                let _ = cfn(sp as *mut u8);
+                (*cur).slot = 0 as *mut SpawnSlot;
+            }
+            if rc != 0i64 || ret_code != 0i64 {
+                if !had_unjoined_panic {
+                    unsafe {
+                        (*st).has_panic = true;
+                        (*st).first_panic_tid = tid.id;
+                    }
+                }
+                had_unjoined_panic = true;
+            }
+        }
+        unsafe {
+            if needs_drop<ScopeNode>() {
+                drop_in_place<ScopeNode>(cur);
+            }
+            heap_free(cur as *mut u8, size_of<ScopeNode>(), align_of<ScopeNode>());
+        }
+        cur = next_node;
+    }
+    had_unjoined_panic
+}
+
+impl Drop for Scope {
+    fn drop(self: mut_view<Scope>) {
+        let _ = scope_drain_all_nodes(self);
+    }
+}
+
+impl Scope {
+    pub fn spawn<F: FnOnce<T> + Send, T: Send>(self: view<Scope>, f: F) -> ScopedJoinHandle<T> {
+        let sp = unsafe { spawn_raw_slot<F, T>(f, 0, 0 as *const T) };
+        if (sp as usize) == 0 {
+            panic("failed to spawn scoped OS thread");
+        }
+        let h = unsafe { (*sp).raw_handle };
+        let tid_num = unsafe { (*sp).assigned_tid };
+        let node_raw = unsafe { heap_alloc(size_of<ScopeNode>(), align_of<ScopeNode>()) };
+        if (node_raw as usize) == 0 {
+            panic("out of memory allocating ScopeNode");
+        }
+        let st = self.state_ptr;
+        let node = node_raw as *mut ScopeNode;
+        unsafe {
+            *node = ScopeNode {
+                next: (*st).handles_head as *mut ScopeNode,
+                slot: sp,
+                raw_handle: h,
+                thread_info: Thread {
+                    id: ThreadId { id: tid_num },
+                    has_name: false,
+                    name_buf: string_new(),
+                },
+                joined_by_handle: false,
+            };
+            (*st).handles_head = node_raw;
+            (*st).active_count = (*st).active_count + 1;
+        }
+        ScopedJoinHandle {
+            raw_handle: h,
+            slot: node_raw,
+            marker: 0 as *const T,
+        }
+    }
+}
+
+pub fn scope<F: FnOnce<view<Scope>, R>, R>(f: F) -> R {
+    let mut st = ScopeState {
+        active_count: 0,
+        has_panic: false,
+        first_panic_tid: 0u64,
+        handles_head: 0 as *mut u8,
+    };
+    let mut s = Scope {
+        state_ptr: unsafe { address_of_mut(st) },
+    };
+    let out: R = f(view(s));
+    let had_panic = scope_drain_all_nodes(mut_view(s));
+    if had_panic {
+        panic("unjoined scoped thread panicked");
+    }
+    out
+}
+
+pub fn current_id() -> ThreadId {
+    ThreadId { id: thread_current_id() }
+}
+
+pub fn current() -> Thread {
+    Thread {
+        id: current_id(),
+        has_name: false,
+        name_buf: string_new(),
+    }
+}
+
+pub fn yield_now() {
+    thread_yield();
+}
+
+pub fn sleep_ns(ns: u64) {
+    thread_sleep_ns(ns);
+}
+
+pub fn sleep_ms(ms: u64) {
+    let ns = if ms > 18446744073709u64 {
+        0xFFFFFFFFFFFFFFFFu64
+    } else {
+        ms * 1_000_000u64
+    };
+    thread_sleep_ns(ns);
+}
+
+pub fn sleep(d: Duration) {
+    thread_sleep_ns(d.nanos);
+}
+
+struct CancelInner {
+    pub refs: Atomic<usize>,
+    pub cancelled: Atomic<bool>,
+}
+
+unsafe fn cancel_inner_retain(raw: *mut u8) {
+    if (raw as usize) != 0 {
+        let p = raw as *const CancelInner;
+        let _ = (*p).refs.fetch_add(1usize, Ordering.Relaxed);
+    }
+}
+
+unsafe fn cancel_inner_release(raw: *mut u8) {
+    if (raw as usize) != 0 {
+        let p = raw as *const CancelInner;
+        let prev = (*p).refs.fetch_sub(1usize, Ordering.AcqRel);
+        if prev == 1usize {
+            fence(Ordering.Acquire);
+            heap_free(raw, size_of<CancelInner>(), align_of<CancelInner>());
+        }
+    }
+}
+
+pub struct CancelSource {
+    pub inner: *mut u8,
+}
+
+unsafe impl Send for CancelSource {}
+unsafe impl Share for CancelSource {}
+
+impl Drop for CancelSource {
+    fn drop(self: mut_view<CancelSource>) {
+        let p = self.inner;
+        self.inner = 0 as *mut u8;
+        unsafe {
+            cancel_inner_release(p);
+        }
+    }
+}
+
+impl CancelSource {
+    pub fn new() -> CancelSource {
+        let raw = unsafe { heap_alloc(size_of<CancelInner>(), align_of<CancelInner>()) };
+        if (raw as usize) == 0 {
+            panic("out of memory allocating CancelSource");
+        }
+        let p = raw as *mut CancelInner;
+        unsafe {
+            *p = CancelInner {
+                refs: Atomic.new(1usize),
+                cancelled: Atomic.new(false),
+            };
+        }
+        CancelSource { inner: raw }
+    }
+
+    pub fn token(self: view<CancelSource>) -> CancelToken {
+        unsafe {
+            cancel_inner_retain(self.inner);
+        }
+        CancelToken { inner: self.inner }
+    }
+
+    pub fn cancel(self: view<CancelSource>) {
+        if (self.inner as usize) != 0 {
+            let p = self.inner as *const CancelInner;
+            unsafe {
+                (*p).cancelled.store(true, Ordering.Release);
+            }
+        }
+    }
+
+    pub fn is_cancelled(self: view<CancelSource>) -> bool {
+        if (self.inner as usize) == 0 {
+            return false;
+        }
+        let p = self.inner as *const CancelInner;
+        unsafe { (*p).cancelled.load(Ordering.Acquire) }
+    }
+}
+
+pub struct CancelToken {
+    pub inner: *mut u8,
+}
+
+unsafe impl Send for CancelToken {}
+unsafe impl Share for CancelToken {}
+
+impl Drop for CancelToken {
+    fn drop(self: mut_view<CancelToken>) {
+        let p = self.inner;
+        self.inner = 0 as *mut u8;
+        unsafe {
+            cancel_inner_release(p);
+        }
+    }
+}
+
+impl CancelToken {
+    pub fn is_cancelled(self: view<CancelToken>) -> bool {
+        if (self.inner as usize) == 0 {
+            return false;
+        }
+        let p = self.inner as *const CancelInner;
+        unsafe { (*p).cancelled.load(Ordering.Acquire) }
+    }
+
+    pub fn clone(self: view<CancelToken>) -> CancelToken {
+        unsafe {
+            cancel_inner_retain(self.inner);
+        }
+        CancelToken { inner: self.inner }
+    }
+}

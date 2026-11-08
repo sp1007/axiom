@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T859, T862, T863]
 priority: 214
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [std/pkg/trust, compiler/driver/trust_cmd, tests/run/pkg_supply_chain]
 spec: [spec/SPEC-113-hermetic-builds-supply-chain-trust.md, tasks/0590, tasks/0449, tasks/0772, tasks/1065]
 covers: [REQ-PKG-022, REQ-PKG-024]
+started: 2026-11-09 02:30:33
+agent: T864-impl
 ---
 # T864 — E20.4 Dependency capability-escalation auditor, Ed25519 package/toolchain signature verifier, provenance attestation & axiomc trust CLI
 
@@ -40,3 +42,4 @@ Implement the transitive dependency capability-escalation auditor, Ed25519 packa
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-09 02:30:33 started (attempt 1) T864-impl
