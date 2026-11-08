@@ -8,12 +8,14 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T802, T805]
 priority: 196
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/fmt/verify, compiler/driver/fmt_cmd, tests/run/fmt_cli]
 locks: [compiler/lsp/handlers/mod.ax]
 spec: [spec/SPEC-101-canonical-formatter.md, spec/SPEC-100-lsp-server-ide-engine.md, tasks/0476, tasks/0374, tasks/0693, tasks/0695, tasks/0696]
 covers: [REQ-TOOL-183, REQ-TOOL-298]
+started: 2026-11-08 16:30:37
+agent: T806-impl
 ---
 # T806 — E19.2 axiomc fmt CLI (--check, --stdin), AST equivalence verifier & LSP textDocument/formatting integration
 
@@ -41,3 +43,4 @@ Implement the post-format AST equivalence verifier, the `axiomc fmt` CLI subcomm
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 16:30:37 started (attempt 1) T806-impl

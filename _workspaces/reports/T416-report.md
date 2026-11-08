@@ -1,0 +1,180 @@
+STATUS: COMPLETE round=0
+
+# T416 Implementation Report — E11.4 Frontend & typeck for `async fn`, `.await`, `Future`/`Poll`/`Waker` lang items
+
+## Summary
+- Added `std/future/mod.ax` defining `@lang("poll") pub enum Poll<T>`, `RawWaker`, `RawWakerVTable`, `Waker`, `Context`, and `@lang("future") pub trait Future { type Output; fn poll(self: mut_view<Self>, cx: mut_view<Context>) -> Poll<Self.Output>; }`, and exported `Poll` and `Future` in `std/core/prelude.ax`.
+- Updated `compiler/syntax/parse.ax` to accept `async fn` on free functions, inherent methods, and trait methods, and `.await` postfix expressions (`AST_EXPR_AWAIT`), removing the `AX_PARSE_UNSUPPORTED_IN_BOOTSTRAP` rejection on `async fn` and `.await`.
+- Updated `compiler/hir/lower.ax` to preserve `is_async` on `HirItem` (`AXS-EXT-031`) and lower `AST_EXPR_AWAIT` to `HIR_EXPR_AWAIT` (`AXS-EXT-033`).
+- Updated `compiler/diag/code.ax`, `compiler/types/types.ax`, `compiler/types/typeck.ax`, and `compiler/traits/solver.ax`:
+  - Added diagnostic codes `AX_ASYNC_AWAIT_OUTSIDE_ASYNC` (`E1101`) through `AX_ASYNC_DROP_ASYNC` (`E1110`) to `compiler/diag/code.ax`.
+  - Added `TY_COROUTINE` (`intern_coroutine_ty`) in `compiler/types/types.ax` (`AXS-EXT-020`) and `emit_thir` formatting (`Coroutine<Ret>`).
+  - Typechecked `async fn` signatures as returning `TY_COROUTINE` while checking the function body against the declared inner return type, supporting `?` (`HIR_EXPR_TRY`) on the inner return type (`REQ-ASY-050`).
+  - Typechecked `expr.await` (`HIR_EXPR_AWAIT`) by verifying `expr: Future` (concrete `Future` impl, `TY_COROUTINE`, or generic parameter bound `F: Future<Output = T>`) and yielding `Output` (`REQ-ASY-139`), emitting `AX_ASYNC_NOT_A_FUTURE` or `AX_ASYNC_AWAIT_OUTSIDE_ASYNC` as appropriate.
+  - Rejected `extern "C" async fn` (`AX_ASYNC_EXTERN_ABI`, `REQ-ASY-123`) and `async fn drop` (`AX_ASYNC_DROP_ASYNC`, `REQ-ASY-124`).
+  - Detected direct and mutual unboxed recursive `async fn` cycles (`AX_ASYNC_RECURSIVE_FUTURE`, `REQ-ASY-044, 117`).
+  - Updated `compiler/traits/solver.ax` so `TY_COROUTINE` satisfies `@lang("future") Future` and propagates `Send`/`Share` auto-traits from its captures/return type.
+- Added golden and negative UI tests under `tests/parse/async/` and `tests/typeck/async/` and regenerated affected `tests/selfhost/` bundles.
+
+## Verification
+- Rebuilt Stage-1 (`axiomc1.exe`) and Stage-2 (`axiomc2.exe`) in `build-snap-T416/build` (`BUILD-AXIOMC OK`).
+- `python build-snap-T416/tools/axtest.py -j 1 --root build-snap-T416 --build-dir build-snap-T416/build --compiler build-snap-T416/build/axiomc2.exe parse/async typeck/async selfhost/parse/bundles_current.test selfhost/hir/bundles_current.test selfhost/typeck/bundles_current.test run/intrinsics/assert_false.ax run/intrinsics/panic_abort.ax ui/intrinsics/unknown_intrinsic.ax` -> `WEAK-NATIVE 0`, `TOTAL 16 PASS 16 FAIL 0 SKIP 0 XFAIL 0`.
+- `python build-snap-T416/tools/axtest.py -j 1 --root build-snap-T416 --build-dir build-snap-T416/build --compiler build-snap-T416/build/axiomc2.exe bundles_current.test` -> `WEAK-NATIVE 0`, `TOTAL 34 PASS 34 FAIL 0 SKIP 0 XFAIL 0`.
+- `python tools/archcheck.py --root build-snap-T416` -> `archcheck: 196 files scanned, 0 violations`.
+
+## Files changed
+- compiler/diag/code.ax
+- compiler/hir/lower.ax
+- compiler/syntax/parse.ax
+- compiler/traits/solver.ax
+- compiler/types/typeck.ax
+- compiler/types/types.ax
+- std/core/prelude.ax
+- std/future/mod.ax
+- tests/parse/async/async_fn_and_await.ast
+- tests/parse/async/async_fn_and_await.ax
+- tests/selfhost/abi/qa_abi_boundary_seam.ax
+- tests/selfhost/abi/qa_abi_lir_lower.ax
+- tests/selfhost/abi/qa_abi_win64_classify.ax
+- tests/selfhost/ast/qa_ast_derives.ax
+- tests/selfhost/ast/qa_ast_exprs_a.ax
+- tests/selfhost/ast/qa_ast_exprs_b.ax
+- tests/selfhost/ast/qa_ast_items.ax
+- tests/selfhost/ast/qa_ast_types_pats.ax
+- tests/selfhost/backend/qa_backend_diff_lir_a.ax
+- tests/selfhost/backend/qa_backend_diff_lir_b.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_a.ax
+- tests/selfhost/backend/qa_backend_diff_mi_mc_b.ax
+- tests/selfhost/backend/qa_backend_edge.ax
+- tests/selfhost/backend/qa_backend_unit.ax
+- tests/selfhost/cap/qa_own_cap.ax
+- tests/selfhost/diag/qa_diag_codes.ax
+- tests/selfhost/diag/qa_diag_emitter.ax
+- tests/selfhost/diag/qa_diag_format_json.ax
+- tests/selfhost/driver/qa_driver_boundary_edges.ax
+- tests/selfhost/driver/qa_driver_cli_and_project.ax
+- tests/selfhost/driver/qa_driver_commands_a.ax
+- tests/selfhost/driver/qa_driver_commands_b.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_a.ax
+- tests/selfhost/driver/qa_driver_inspect_diff_b.ax
+- tests/selfhost/drop/qa_drop_d01.ax
+- tests/selfhost/drop/qa_drop_d02.ax
+- tests/selfhost/drop/qa_drop_d03.ax
+- tests/selfhost/drop/qa_drop_d04.ax
+- tests/selfhost/drop/qa_drop_d05.ax
+- tests/selfhost/drop/qa_drop_d06.ax
+- tests/selfhost/drop/qa_drop_d07.ax
+- tests/selfhost/drop/qa_drop_d09.ax
+- tests/selfhost/drop/qa_drop_d10.ax
+- tests/selfhost/drop/qa_drop_d11.ax
+- tests/selfhost/drop/qa_drop_d12.ax
+- tests/selfhost/hir/qa_hir_corpus.ax
+- tests/selfhost/hir/qa_hir_desugar_and_drop.ax
+- tests/selfhost/interp/qa_interp_exec_a.ax
+- tests/selfhost/interp/qa_interp_exec_b.ax
+- tests/selfhost/interp/qa_interp_unit.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_comptime_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_mir_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_a.ax
+- tests/selfhost/interp_opt/qa_interp_opt_diff_run_b.ax
+- tests/selfhost/interp_opt/qa_interp_opt_unit.ax
+- tests/selfhost/isel/qa_frame_layout_and_verify.ax
+- tests/selfhost/isel/qa_isel_diff_golden.ax
+- tests/selfhost/isel/qa_isel_frame_seam_and_edge_cases.ax
+- tests/selfhost/isel/qa_isel_instructions_and_abi.ax
+- tests/selfhost/kernel_source_diag/qa_corpus_differential.ax
+- tests/selfhost/kernel_source_diag/qa_session_integration.ax
+- tests/selfhost/lex/qa_lex_differential.ax
+- tests/selfhost/lex/qa_lex_tokens.ax
+- tests/selfhost/lex/u64_max_literal.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_neg_b.ax
+- tests/selfhost/lexer/qa_lexer_corpus_pos_a.ax
+- tests/selfhost/lexer/qa_lexer_corpus_pos_b.ax
+- tests/selfhost/lexer/qa_lexer_session_integration.ax
+- tests/selfhost/link/qa_pe_headers_and_imports.ax
+- tests/selfhost/link/qa_pe_linker_diff.ax
+- tests/selfhost/link/qa_pe_local_symbols.ax
+- tests/selfhost/lir/qa_lir_from_ax_a.ax
+- tests/selfhost/lir/qa_lir_from_ax_b.ax
+- tests/selfhost/lir/qa_lir_from_ax_c.ax
+- tests/selfhost/lir/qa_lir_from_ax_d.ax
+- tests/selfhost/lir/qa_lir_from_ax_e.ax
+- tests/selfhost/lir/qa_lir_from_mir.ax
+- tests/selfhost/lir/qa_lir_seam_edge.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_a.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_b.ax
+- tests/selfhost/mir/qa_mir_builder_and_drop_c.ax
+- tests/selfhost/mir/qa_mir_text_roundtrip.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_diff.ax
+- tests/selfhost/obj_link_driver/qa_obj_link_driver_smoke.ax
+- tests/selfhost/opt/qa_opt_pipeline.ax
+- tests/selfhost/opt/qa_opt_unit.ax
+- tests/selfhost/own/qa_own_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_build_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_cap_ptr.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_init.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_own_b.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_diag_verify_mir.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_a.ax
+- tests/selfhost/own_mir_verify/qa_own_mir_diff_drop_b.ax
+- tests/selfhost/parse/qa_parse_corpus_a.ax
+- tests/selfhost/parse/qa_parse_corpus_b.ax
+- tests/selfhost/parse/qa_parse_corpus_c.ax
+- tests/selfhost/parse/qa_parse_corpus_d.ax
+- tests/selfhost/parse/qa_parse_corpus_e.ax
+- tests/selfhost/parse/qa_parse_corpus_f.ax
+- tests/selfhost/parse/qa_parse_corpus_g.ax
+- tests/selfhost/parse/qa_parse_corpus_h.ax
+- tests/selfhost/parse/qa_parse_corpus_i.ax
+- tests/selfhost/parse/qa_parse_corpus_j.ax
+- tests/selfhost/parse/qa_parse_heavy_a.ax
+- tests/selfhost/parse/qa_parse_heavy_b.ax
+- tests/selfhost/parse/qa_parse_qa_edge.ax
+- tests/selfhost/parse/qa_parse_qa_tuple_struct.ax
+- tests/selfhost/parse/qa_parse_recovery_a.ax
+- tests/selfhost/parse/qa_parse_recovery_b.ax
+- tests/selfhost/parse/qa_parse_terminator_a.ax
+- tests/selfhost/parse/qa_parse_terminator_b.ax
+- tests/selfhost/parse/qa_parse_terminator_heavy.ax
+- tests/selfhost/parser/qa_parser_diff_corpus_wide.ax
+- tests/selfhost/parser/qa_parser_diff_neg_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_a.ax
+- tests/selfhost/parser/qa_parser_diff_pos_b.ax
+- tests/selfhost/parser/qa_parser_session_integration.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_a.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_b.ax
+- tests/selfhost/resolve/qa_resolve_corpus_neg_c.ax
+- tests/selfhost/resolve/qa_resolve_corpus_pos.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_neg_d.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_pos_c.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_corpus_wide_b.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_a.ax
+- tests/selfhost/resolve_hir/qa_resolve_hir_multifile_modules_b.ax
+- tests/selfhost/traits/qa_traits_solver_mono.ax
+- tests/selfhost/typeck/qa_typeck_a.ax
+- tests/selfhost/typeck/qa_typeck_b.ax
+- tests/selfhost/typeck/qa_typeck_c.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_a.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_b.ax
+- tests/selfhost/typeck_traits/qa_typeck_traits_c.ax
+- tests/selfhost/types/qa_types_exhaust.ax
+- tests/selfhost/types/qa_types_layout.ax
+- tests/selfhost/verify/qa_verify_mir.ax
+- tests/selfhost/verify/qa_verify_pipeline.ax
+- tests/typeck/async/async_basic_pos.ax
+- tests/typeck/async/async_basic_pos.thir
+- tests/typeck/async/await_outside_async_neg.ax
+- tests/typeck/async/extern_and_drop_async_neg.ax
+- tests/typeck/async/not_a_future_neg.ax
+- tests/typeck/async/recursive_async_neg.ax
