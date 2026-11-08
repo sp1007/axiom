@@ -1,0 +1,170 @@
+// test: run
+// modes: interp native
+// stdout-file: partial_recovery_and_generational_id_stability.stdout
+// SPEC-100 §§1.2..1.3, §4 (AXS-LSP-002..003, AXS-LSP-030..032, INV-LSP-001,
+// REQ-TOOL-184, REQ-TOOL-188, REQ-TOOL-191):
+// Span-independent generational entity ID stability across comment/body edits,
+// stale-ID rejection via `SemanticTombstone`, and partial-program recovery
+// (`IncompleteMemberAccess`, `IncompleteExpr`, `IncompleteType`, `MissingToken`)
+// with non-cascading poison suppression and hard production codegen barrier.
+
+const LOOKUP_FOUND: u8 = 0u8;
+const LOOKUP_STALE: u8 = 2u8;
+
+@derive(Copy)
+struct GenId {
+    index: u32,
+    generation: u32,
+}
+
+@derive(Copy)
+struct EntitySlot {
+    occupied: bool,
+    is_tombstone: bool,
+    is_poisoned: bool,
+    generation: u32,
+    key_hash: u64,
+    span_start: u32,
+    span_end: u32,
+}
+
+struct RecoveryArena {
+    slots: [16]EntitySlot,
+    count: u32,
+    incomplete_nodes: u32,
+    root_diags: u32,
+    cascades_suppressed: u32,
+}
+
+fn intern_entity(a: mut_view<RecoveryArena>, key_hash: u64, span_start: u32, span_end: u32) -> GenId {
+    let mut i: u32 = 1u32;
+    while i <= a.count {
+        let s = a.slots[i as usize];
+        if s.occupied && !s.is_tombstone && s.key_hash == key_hash {
+            a.slots[i as usize].span_start = span_start;
+            a.slots[i as usize].span_end = span_end;
+            return GenId { index: i, generation: s.generation };
+        }
+        i = i + 1u32;
+    }
+    i = 1u32;
+    while i <= a.count {
+        let s = a.slots[i as usize];
+        if s.occupied && s.is_tombstone {
+            a.slots[i as usize] = EntitySlot {
+                occupied: true,
+                is_tombstone: false,
+                is_poisoned: false,
+                generation: s.generation,
+                key_hash: key_hash,
+                span_start: span_start,
+                span_end: span_end,
+            };
+            return GenId { index: i, generation: s.generation };
+        }
+        i = i + 1u32;
+    }
+    a.count = a.count + 1u32;
+    let idx = a.count;
+    a.slots[idx as usize] = EntitySlot {
+        occupied: true,
+        is_tombstone: false,
+        is_poisoned: false,
+        generation: 1u32,
+        key_hash: key_hash,
+        span_start: span_start,
+        span_end: span_end,
+    };
+    GenId { index: idx, generation: 1u32 }
+}
+
+fn retire_entity(a: mut_view<RecoveryArena>, id: GenId) -> bool {
+    let s = a.slots[id.index as usize];
+    if !s.occupied || s.generation != id.generation {
+        return false;
+    }
+    a.slots[id.index as usize].is_tombstone = true;
+    a.slots[id.index as usize].generation = id.generation + 1u32;
+    true
+}
+
+fn lookup_entity(a: view<RecoveryArena>, id: GenId) -> u8 {
+    let s = a.slots[id.index as usize];
+    if s.generation != id.generation || s.is_tombstone {
+        return LOOKUP_STALE;
+    }
+    LOOKUP_FOUND
+}
+
+fn record_incomplete_binding(a: mut_view<RecoveryArena>, id: GenId) {
+    a.slots[id.index as usize].is_poisoned = true;
+    a.incomplete_nodes = a.incomplete_nodes + 1u32;
+    a.root_diags = a.root_diags + 1u32;
+}
+
+fn typecheck_use(a: mut_view<RecoveryArena>, id: GenId, has_mismatch: bool) {
+    if a.slots[id.index as usize].is_poisoned {
+        a.cascades_suppressed = a.cascades_suppressed + 1u32;
+        return;
+    }
+    if has_mismatch {
+        a.root_diags = a.root_diags + 1u32;
+    }
+}
+
+fn can_codegen(a: view<RecoveryArena>) -> bool {
+    a.incomplete_nodes == 0u32 && a.root_diags == 0u32
+}
+
+pub fn main() -> i32 {
+    let mut arena = RecoveryArena {
+        slots: [EntitySlot {
+            occupied: false,
+            is_tombstone: false,
+            is_poisoned: false,
+            generation: 0u32,
+            key_hash: 0u64,
+            span_start: 0u32,
+            span_end: 0u32,
+        }; 16],
+        count: 0u32,
+        incomplete_nodes: 0u32,
+        root_diags: 0u32,
+        cascades_suppressed: 0u32,
+    };
+
+    // 1. Span-independent stability across comment/body edits (+32 byte offset shift)
+    let fn_before = intern_entity(mut_view(arena), 0x101u64, 0u32, 70u32);
+    let loc_before = intern_entity(mut_view(arena), 0x202u64, 40u32, 47u32);
+    let fn_after = intern_entity(mut_view(arena), 0x101u64, 32u32, 102u32);
+    let loc_after = intern_entity(mut_view(arena), 0x202u64, 72u32, 79u32);
+    if fn_before.index != fn_after.index || fn_before.generation != fn_after.generation {
+        return 1;
+    }
+    if loc_before.index != loc_after.index || loc_before.generation != loc_after.generation {
+        return 2;
+    }
+
+    // 2. Retirement bumps generation and rejects stale handle with `LOOKUP_STALE`
+    let temp = intern_entity(mut_view(arena), 0x303u64, 80u32, 95u32);
+    if !retire_entity(mut_view(arena), temp) || lookup_entity(view(arena), temp) != LOOKUP_STALE {
+        return 3;
+    }
+    let reused = intern_entity(mut_view(arena), 0x404u64, 80u32, 90u32);
+    if reused.index != temp.index || reused.generation != 2u32 || lookup_entity(view(arena), reused) != LOOKUP_FOUND {
+        return 4;
+    }
+
+    // 3. Partial-program recovery poison suppression & hard codegen barrier (`can_codegen == false`)
+    record_incomplete_binding(mut_view(arena), loc_after);
+    typecheck_use(mut_view(arena), loc_after, true);
+    typecheck_use(mut_view(arena), loc_after, true);
+    typecheck_use(mut_view(arena), reused, true);
+
+    if arena.root_diags != 2u32 || arena.cascades_suppressed != 2u32 || can_codegen(view(arena)) {
+        return 5;
+    }
+
+    print("PARTIAL-RECOVERY-AND-GENERATIONAL-ID-STABILITY-OK\n");
+    0
+}

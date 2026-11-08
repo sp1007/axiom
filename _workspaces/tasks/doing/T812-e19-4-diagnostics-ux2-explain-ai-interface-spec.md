@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759]
 priority: 202
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [spec/SPEC-103-diagnostics-ux-ai-interface.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-24-artifact-format-module-interfaces.md, 0101, 0129, 0146, tasks/0360, tasks/0374, tasks/0421, tasks/0425, tasks/0444, tasks/0448, tasks/0456, tasks/0693]
 covers: [REQ-TOOL-004, REQ-TOOL-180, REQ-TOOL-181, REQ-TOOL-182, REQ-TOOL-185, REQ-TOOL-186, REQ-TOOL-187, REQ-TOOL-190, REQ-TOOL-298]
+started: 2026-11-08 15:28:53
+agent: T812-impl
 ---
 # T812 — E19.4 Canonical Diagnostics UX 2.0, explain registry, machine-applicable fixes & AI-agent fact protocol specification (SPEC-103)
 
@@ -42,3 +44,4 @@ Consolidate the canonical specification for Axiom's Diagnostics UX 2.0, `axiomc 
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 15:28:53 started (attempt 1) T812-impl
