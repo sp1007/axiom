@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T612, T615, T619, T623, T625, T629]
 priority: 120
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p15/e15_7_perf_contract]
 spec: [spec/SPEC-76-performance-contract.md, 0074, tasks/0408, tasks/0595, tasks/0706]
 covers: [REQ-OPT-251, REQ-OPT-252, REQ-OPT-253, REQ-OPT-254, REQ-OPT-255, REQ-OPT-256]
 started: 2026-11-08 16:29:16
-agent: T626-impl
+finished: 2026-11-08 17:05:34
 ---
 # T626 — E15.7 — Performance contract, -O2 differential equivalence & CI regression budget conformance suite
 
@@ -43,3 +43,4 @@ Certify E15.7 and the phase P15 exit criterion (`differential green at -O2; benc
 ## Log
 - 2026-11-03 02:44:00 created by T215 (P15 phase planning)
 - 2026-11-08 16:29:16 started (attempt 1) T626-impl
+- 2026-11-08 17:05:34 accepted by QA -> done

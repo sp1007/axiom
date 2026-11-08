@@ -8,12 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T406]
 priority: 129
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/interp, tests/run/concurrency/atomics_oracle]
 locks: [compiler/interp_opt/session.ax, compiler/driver/opts.ax, compiler/driver/pipeline.ax, tests/selfhost]
 spec: [spec/SPEC-31-atomics.md, 0033, 0092, 0128, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-054, REQ-ATM-006, REQ-ATM-007, REQ-ATM-008, REQ-ATM-010, REQ-ATM-012, REQ-ATM-013, REQ-ATM-018, REQ-ATM-019, REQ-ATM-021, REQ-ATM-026, REQ-ATM-032]
+started: 2026-11-08 16:40:05
+agent: T408-impl
 ---
 # T408 — E11.2 — Oracle atomic memory model & deterministic schedule explorer
 
@@ -41,3 +43,4 @@ Implement `Atomic` execution, per-location modification order, Acquire/Release v
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-08 16:40:05 started (attempt 1) T408-impl
