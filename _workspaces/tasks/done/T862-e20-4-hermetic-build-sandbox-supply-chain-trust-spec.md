@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318]
 priority: 212
-status: doing
+status: done
 attempts: 1
 paths: [spec/SPEC-113-hermetic-builds-supply-chain-trust.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-53-safety-profiles-capability-security.md, tasks/0590, tasks/0449, tasks/0772, tasks/0661, tasks/1065]
 covers: [REQ-PKG-022, REQ-PKG-024]
 started: 2026-11-08 18:59:35
-agent: T862-impl
+finished: 2026-11-08 19:20:08
 ---
 # T862 — E20.4 Canonical build sandbox, hermetic/reproducible compilation, Ed25519 signing & supply-chain trust specification (SPEC-113)
 
@@ -46,3 +46,4 @@ Consolidate the canonical specification for Axiom's hermetic build sandbox, bit-
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 18:59:35 started (attempt 1) T862-impl
+- 2026-11-08 19:20:08 accepted by QA -> done
