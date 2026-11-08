@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T850]
 priority: 201
-status: doing
+status: done
 attempts: 1
 paths: [compiler/build/manifest, compiler/build/workspace, tests/run/build_manifest]
 spec: [spec/SPEC-110-build-graph-driver.md, 0168, tasks/0356, tasks/0372, tasks/0661]
 covers: [REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
 started: 2026-11-08 18:22:14
-agent: T851-impl
+finished: 2026-11-08 19:09:12
 ---
 # T851 — E20.1 Declarative axiom.toml package/workspace manifest parser, feature/@cfg evaluator & acyclic package graph
 
@@ -44,3 +44,4 @@ Implement the declarative `axiom.toml` package and workspace manifest parser, de
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 18:22:14 started (attempt 1) T851-impl
+- 2026-11-08 19:09:12 accepted by QA -> done
