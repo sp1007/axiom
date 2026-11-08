@@ -17,8 +17,11 @@ use compiler.mir.mir.MirBody
 use compiler.mir.mir.MirOperand
 use compiler.mir.mir.MirPlace
 use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
 use compiler.mir.mir.MIR_OP_COPY
 use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_PROJ_INDEX
 use compiler.mir.mir.MIR_PROJ_SUB_SLICE
 use compiler.mir.mir.MIR_RVALUE_USE
@@ -50,6 +53,8 @@ use compiler.mir.mir.mir_stmt_at
 use compiler.mir.mir.mir_proj_at
 use compiler.mir.mir.mir_op_at
 use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_stmt_is_sync_barrier
+use compiler.mir.mir.mir_term_is_sync_barrier
 
 @intrinsic fn size_of<T>() -> usize { 0 }
 
@@ -141,12 +146,95 @@ pub fn opt_rvalue_is_pure(rv: view<MirRvalue>) -> bool {
     k == MIR_RVALUE_AGGREGATE
 }
 
+pub fn opt_place_has_deref(p: view<MirPlace>) -> bool {
+    if p.proj_count == 0 || (p.projs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < p.proj_count {
+        let proj = unsafe { mir_proj_at(p.projs, i) };
+        if (unsafe { (*proj).kind }) == MIR_PROJ_DEREF {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn opt_operand_reads_deref(op: view<MirOperand>) -> bool {
+    if op.kind == MIR_OP_COPY || op.kind == MIR_OP_MOVE {
+        return opt_place_has_deref(view(op.place));
+    }
+    false
+}
+
+pub fn opt_rvalue_reads_deref(rv: view<MirRvalue>) -> bool {
+    let k = rv.kind;
+    if k == MIR_RVALUE_USE || k == MIR_RVALUE_UNARY_OP || k == MIR_RVALUE_CAST {
+        return opt_operand_reads_deref(view(rv.use_op));
+    }
+    if k == MIR_RVALUE_REPEAT {
+        if opt_operand_reads_deref(view(rv.use_op)) {
+            return true;
+        }
+        if (rv.repeat_count_op as usize) != 0 {
+            return unsafe { opt_operand_reads_deref(view(*rv.repeat_count_op)) };
+        }
+        return false;
+    }
+    if k == MIR_RVALUE_LEN || k == MIR_RVALUE_DISCRIMINANT {
+        return opt_place_has_deref(view(rv.place));
+    }
+    if k == MIR_RVALUE_BINARY_OP || k == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+        return opt_operand_reads_deref(view(rv.lhs)) || opt_operand_reads_deref(view(rv.rhs));
+    }
+    if k == MIR_RVALUE_AGGREGATE {
+        if rv.operand_count > 0 && (rv.operands as usize) != 0 {
+            let mut i: usize = 0;
+            while i < rv.operand_count {
+                let op_ptr = unsafe { mir_op_at(rv.operands, i) };
+                if unsafe { opt_operand_reads_deref(view(*op_ptr)) } {
+                    return true;
+                }
+                i = i + 1;
+            }
+        }
+    }
+    false
+}
+
+pub fn opt_body_has_atomic_sync(body: view<MirBody>) -> bool {
+    if body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, i) };
+        let is_unreach = unsafe { (*bb).has_terminator && (*bb).terminator.kind == MIR_TERM_UNREACHABLE };
+        if !is_unreach {
+            let stmt_count = unsafe { (*bb).stmt_count };
+            let stmts = unsafe { (*bb).stmts };
+            let mut j: usize = 0;
+            while j < stmt_count {
+                let stmt = unsafe { mir_stmt_at(stmts, j) };
+                if unsafe { mir_stmt_is_sync_barrier(view(*stmt)) } {
+                    return true;
+                }
+                j = j + 1;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
 pub fn opt_dce_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bool {
     let max_locals = body.local_count;
     if max_locals == 0 || body.bb_count == 0 || (body.bbs as usize) == 0 {
         return false;
     }
 
+    let has_atomic_sync = opt_body_has_atomic_sync(view(*body));
     let uses_bytes = mir_mul_usize(max_locals, size_of<u32>());
     let uses = arena_alloc_raw(mut_view(*scratch), uses_bytes, 4) as *mut u32;
     let mut total_changed: bool = false;
@@ -251,9 +339,10 @@ pub fn opt_dce_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bo
                 let mut j: usize = 0;
                 while j < stmt_count {
                     let stmt = unsafe { mir_stmt_at(stmts, j) };
+                    let is_sync = unsafe { mir_stmt_is_sync_barrier(view(*stmt)) };
                     let sk = unsafe { (*stmt).kind };
                     let mut remove: bool = false;
-                    if sk == MIR_STMT_ASSIGN {
+                    if !is_sync && sk == MIR_STMT_ASSIGN {
                         let p_cnt = unsafe { (*stmt).place.proj_count };
                         if p_cnt == 0 {
                             let lv = unsafe { (*stmt).place.local.v as usize };
@@ -261,13 +350,14 @@ pub fn opt_dce_in_arena(body: mut_view<MirBody>, scratch: mut_view<Arena>) -> bo
                                 let u_cnt = unsafe { *opt_u32_at(uses, lv) };
                                 if u_cnt == 0u32 {
                                     let is_pure = unsafe { opt_rvalue_is_pure(view((*stmt).rvalue)) };
-                                    if is_pure {
+                                    let reads_deref_sync = has_atomic_sync && unsafe { opt_rvalue_reads_deref(view((*stmt).rvalue)) };
+                                    if is_pure && !reads_deref_sync {
                                         remove = true;
                                     }
                                 }
                             }
                         }
-                    } else if sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD {
+                    } else if !is_sync && (sk == MIR_STMT_STORAGE_LIVE || sk == MIR_STMT_STORAGE_DEAD) {
                         let lv = unsafe { (*stmt).storage_local.v as usize };
                         if lv < max_locals {
                             let u_cnt = unsafe { *opt_u32_at(uses, lv) };

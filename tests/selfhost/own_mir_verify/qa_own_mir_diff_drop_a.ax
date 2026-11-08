@@ -39519,6 +39519,84 @@ pub unsafe fn mir_u64_at(base: *mut u64, idx: usize) -> *mut u64 {
     ((base as usize) + off) as *mut u64
 }
 
+// --- Synchronization & Happens-Before Barrier Predicates (SPEC-30 §5–§8, ACONC-27, ACONCUR-195) ---
+
+pub fn mir_order_has_acquire(ord: u8) -> bool {
+    ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST
+}
+
+pub fn mir_order_has_release(ord: u8) -> bool {
+    ord == MIR_ORDER_RELEASE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST
+}
+
+pub fn mir_stmt_is_sync_barrier(stmt: view<MirStmt>) -> bool {
+    stmt.kind == MIR_STMT_ATOMIC
+}
+
+pub fn mir_stmt_is_acquire_barrier(stmt: view<MirStmt>) -> bool {
+    if stmt.kind != MIR_STMT_ATOMIC {
+        return false;
+    }
+    let aop = stmt.rvalue.bin_op;
+    let ord = stmt.rvalue.cast_kind;
+    let fail_ord = stmt.rvalue.borrow_kind;
+    if aop == MIR_ATOMIC_SPIN_HINT {
+        return false;
+    }
+    if aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+        return mir_order_has_acquire(ord) || mir_order_has_acquire(fail_ord);
+    }
+    mir_order_has_acquire(ord)
+}
+
+pub fn mir_stmt_is_release_barrier(stmt: view<MirStmt>) -> bool {
+    if stmt.kind != MIR_STMT_ATOMIC {
+        return false;
+    }
+    let aop = stmt.rvalue.bin_op;
+    let ord = stmt.rvalue.cast_kind;
+    if aop == MIR_ATOMIC_SPIN_HINT || aop == MIR_ATOMIC_LOAD {
+        return false;
+    }
+    mir_order_has_release(ord)
+}
+
+pub fn mir_term_is_sync_barrier(term: view<MirTerminator>) -> bool {
+    term.kind == MIR_TERM_CALL || term.kind == MIR_TERM_DROP
+}
+
+pub fn mir_bb_has_sync_barrier(bb: view<MirBb>) -> bool {
+    if bb.stmt_count > 0 && (bb.stmts as usize) != 0 {
+        let mut i: usize = 0;
+        while i < bb.stmt_count {
+            let st = unsafe { mir_stmt_at(bb.stmts, i) };
+            if unsafe { mir_stmt_is_sync_barrier(view(*st)) } {
+                return true;
+            }
+            i = i + 1;
+        }
+    }
+    if bb.has_terminator && mir_term_is_sync_barrier(view(bb.terminator)) {
+        return true;
+    }
+    false
+}
+
+pub fn mir_body_has_sync_barrier(body: view<MirBody>) -> bool {
+    if body.bb_count == 0 || (body.bbs as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < body.bb_count {
+        let bb = unsafe { mir_bb_at(body.bbs, i) };
+        if unsafe { mir_bb_has_sync_barrier(view(*bb)) } {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
 // --- Reset & Field-by-Field Copy Helpers ---
 
 pub fn mir_span_zero(dst: mut_view<Span>) {
@@ -61638,6 +61716,7 @@ use compiler.diag.emitter.DiagDataEntry
 use compiler.diag.emitter.DiagSink
 use compiler.diag.emitter.diag_sink_report
 use compiler.hir.hir.HIR_ITEM_FN
+use compiler.hir.hir.HIR_ITEM_TRAIT
 use compiler.hir.hir.HirFile
 use compiler.hir.hir.HirItem
 use compiler.hir.hir.HirParam
@@ -63093,6 +63172,8 @@ fn verify_mir_check_stmt(
                      !((ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL) && fail_ord == MIR_ORDER_SEQ_CST);
         } else if aop == MIR_ATOMIC_FENCE || aop == MIR_ATOMIC_COMPILER_FENCE {
             ord_ok = ord <= MIR_ORDER_SEQ_CST && ord != MIR_ORDER_RELAXED;
+        } else if aop > MIR_ATOMIC_SPIN_HINT {
+            ord_ok = false;
         }
         if !ord_ok {
             verify_emit_diag(mut_view(*sink), AX_CONC_INVALID_ATOMIC_ORDERING, view(s_span), 60);
@@ -63270,6 +63351,45 @@ fn verify_mir_check_terminator(
     }
 }
 
+// Verifies zero-cost compile-time erasure of `Send`/`Share` marker obligations (SPEC-30 AXS-CONC-019,
+// ACONCUR-190..191) and deterministic concurrency invariants in `MirBody` (ACONCUR-196):
+//   - No local in `body.locals` may have a marker-trait (`HIR_ITEM_TRAIT`) runtime representation.
+//   - Functions with `Send`/`Share` generic bounds must not inject hidden runtime witness arguments
+//     beyond the declared HIR parameter list.
+pub fn verify_mir_conc_erasure(
+    body: view<MirBody>,
+    thir: *const Thir,
+    sink: mut_view<DiagSink>,
+    func: *const HirItem
+) {
+    let local_count = body.local_count;
+    if local_count > 0 && (body.locals as usize) != 0 && (thir as usize) != 0 {
+        let mut l: usize = 0;
+        while l < local_count {
+            let decl = unsafe { mir_local_at(body.locals, l) };
+            let lty_v = unsafe { (*decl).ty.v };
+            if lty_v != 0u32 {
+                let t = verify_safe_type_get(unsafe { view((*thir).interner) }, TypeId { v: lty_v });
+                if (t as usize) != 0 {
+                    let def_ptr = unsafe { (*t).def };
+                    if (def_ptr as usize) != 0 && (unsafe { (*def_ptr).kind }) == HIR_ITEM_TRAIT {
+                        let sp = verify_copy_span(unsafe { view((*decl).span) });
+                        verify_emit_diag(mut_view(*sink), AX_VERIFY_TYPE_MISMATCH, view(sp), 25);
+                    }
+                }
+            }
+            l = l + 1;
+        }
+    }
+    if (func as usize) != 0 && (unsafe { (*func).kind }) == HIR_ITEM_FN && body.arg_count > 0 {
+        let declared_params = verify_fn_param_count(func);
+        if body.arg_count != declared_params {
+            let sp = verify_copy_span(view(body.span));
+            verify_emit_diag(mut_view(*sink), AX_VERIFY_CALL_SIGNATURE, view(sp), 36);
+        }
+    }
+}
+
 pub fn verify_mir(
     body: view<MirBody>,
     thir: *const Thir,
@@ -63279,6 +63399,8 @@ pub fn verify_mir(
     if body.bb_count == 0 {
         return;
     }
+
+    verify_mir_conc_erasure(body, thir, mut_view(*sink), func);
 
     let local_count = body.local_count;
     let words = (local_count + 63) / 64;

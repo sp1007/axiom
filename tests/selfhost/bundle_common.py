@@ -401,6 +401,9 @@ def assemble_compiler_modules(mod_list, root=ROOT):
     )
 
     parts = []
+    if "compiler.opt.optir" in name_set:
+        pad_variants = ", ".join("P%d" % i for i in range(50))
+        parts.append("module _opt_sym_pad\nenum _OptSymPad { %s }\n" % pad_variants)
     emitted_own_mir_shim = False
 
     for raw_name in names:
