@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T806]
 priority: 197
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p19/e19_2_formatter]
 spec: [spec/SPEC-101-canonical-formatter.md, tasks/0476, tasks/0693, tasks/0695, tasks/0696]
 covers: [REQ-TOOL-183, REQ-TOOL-298]
 started: 2026-11-08 17:55:58
-agent: T807-impl
+finished: 2026-11-08 18:48:50
 ---
 # T807 — E19.2 Canonical formatter idempotence, comment preservation & full-corpus conformance suite
 
@@ -44,3 +44,4 @@ Certify E19.2 and P19 formatter exit criteria (`formatter idempotence over the w
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 17:55:58 started (attempt 1) T807-impl
+- 2026-11-08 18:48:50 accepted by QA -> done
