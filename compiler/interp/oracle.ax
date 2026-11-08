@@ -27,18 +27,49 @@ use std.core.host.write
 
 use compiler.kernel.interner.StrView
 use compiler.diag.format.diag_buf_push_bytes
+use compiler.mir.mir.MIR_ATOMIC_ADD
+use compiler.mir.mir.MIR_ATOMIC_AND
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG_WEAK
+use compiler.mir.mir.MIR_ATOMIC_COMPILER_FENCE
+use compiler.mir.mir.MIR_ATOMIC_FENCE
+use compiler.mir.mir.MIR_ATOMIC_LOAD
+use compiler.mir.mir.MIR_ATOMIC_OR
+use compiler.mir.mir.MIR_ATOMIC_SPIN_HINT
+use compiler.mir.mir.MIR_ATOMIC_STORE
+use compiler.mir.mir.MIR_ATOMIC_SUB
+use compiler.mir.mir.MIR_ATOMIC_SWAP
+use compiler.mir.mir.MIR_ATOMIC_XOR
+use compiler.mir.mir.MIR_ORDER_ACQUIRE
+use compiler.mir.mir.MIR_ORDER_ACQ_REL
+use compiler.mir.mir.MIR_ORDER_RELAXED
+use compiler.mir.mir.MIR_ORDER_RELEASE
+use compiler.mir.mir.MIR_ORDER_SEQ_CST
+use compiler.interp.value.INTERP_MAX_THREADS
+use compiler.interp.value.INTERP_MSG_UB_ATOMIC_ORDER
+use compiler.interp.value.INTERP_MSG_UB_ATOMIC_OVERLAP
 use compiler.interp.value.INTERP_MSG_UB_DANGLING
+use compiler.interp.value.INTERP_MSG_UB_DATA_RACE
 use compiler.interp.value.INTERP_MSG_UB_FREE_NON_HEAP
+use compiler.interp.value.INTERP_MSG_UB_MISALIGNED
+use compiler.interp.value.INTERP_MSG_UB_MIXED_ATOMIC
 use compiler.interp.value.INTERP_MSG_UB_UNMAPPED
 use compiler.interp.value.InterpAlloc
+use compiler.interp.value.InterpAtomicLoc
+use compiler.interp.value.InterpAtomicWrite
 use compiler.interp.value.InterpCtx
 use compiler.interp.value.InterpHostArg
+use compiler.interp.value.InterpOrdAccess
 use compiler.interp.value.InterpValue
+use compiler.interp.value.InterpVecClock
 use compiler.interp.value.interp_alloc_at
+use compiler.interp.value.interp_atomic_loc_at
+use compiler.interp.value.interp_atomic_write_at
 use compiler.interp.value.interp_copy_bytes
 use compiler.interp.value.interp_host_arg_at
 use compiler.interp.value.interp_i64_at
 use compiler.interp.value.interp_mul_usize
+use compiler.interp.value.interp_ord_access_at
 use compiler.interp.value.interp_register_alloc
 use compiler.interp.value.interp_report_ub
 use compiler.interp.value.interp_validate_raw_ptr
@@ -468,6 +499,7 @@ fn eval_host_heap_realloc(
         }
     }
     if (found_ptr as usize) != 0 {
+        oracle_invalidate_range(mut_view(*ctx), found_ptr, found_sz as usize);
         let old_alloc_bytes: usize = if found_sz < 16u64 { 16 } else { found_sz as usize };
         unsafe {
             heap_free(found_ptr, old_alloc_bytes, 16);
@@ -512,6 +544,7 @@ fn eval_host_heap_free(ctx: mut_view<InterpCtx>, p: u64, out_ret: mut_view<Inter
     let found_ptr = unsafe { (*found).host_ptr };
     let found_sz = unsafe { (*found).size };
     if (found_ptr as usize) != 0 {
+        oracle_invalidate_range(mut_view(*ctx), found_ptr, found_sz as usize);
         let old_alloc_bytes: usize = if found_sz < 16u64 { 16 } else { found_sz as usize };
         unsafe {
             heap_free(found_ptr, old_alloc_bytes, 16);
@@ -878,4 +911,995 @@ pub fn interp_eval_host_intrinsic(
     }
 
     false
+}
+
+// =================================================================================================
+// Oracle Atomic Memory Model, Vector Clocks & Deterministic Schedule Explorer (SPEC-31 §6)
+// =================================================================================================
+
+pub fn oracle_w_add_u64(a: u64, b: u64) -> u64 {
+    let a_lo = a & 0xFFFFFFFFu64;
+    let a_hi = (a >> 32u64) & 0xFFFFFFFFu64;
+    let b_lo = b & 0xFFFFFFFFu64;
+    let b_hi = (b >> 32u64) & 0xFFFFFFFFu64;
+    let sum_lo = a_lo + b_lo;
+    let carry = sum_lo >> 32u64;
+    let sum_hi = (a_hi + b_hi + carry) & 0xFFFFFFFFu64;
+    (sum_hi << 32u64) | (sum_lo & 0xFFFFFFFFu64)
+}
+
+pub fn oracle_w_sub_u64(a: u64, b: u64) -> u64 {
+    let neg_b = oracle_w_add_u64(b ^ 0xFFFFFFFFFFFFFFFFu64, 1u64);
+    oracle_w_add_u64(a, neg_b)
+}
+
+pub fn oracle_bit_mask(size: u32) -> u64 {
+    if size == 1u32 {
+        return 0xFFu64;
+    }
+    if size == 2u32 {
+        return 0xFFFFu64;
+    }
+    if size == 4u32 {
+        return 0xFFFFFFFFu64;
+    }
+    0xFFFFFFFFFFFFFFFFu64
+}
+
+pub fn oracle_read_scalar(ptr: *const u8, size: u32) -> u64 {
+    if (ptr as usize) == 0 {
+        return 0u64;
+    }
+    if size == 1u32 {
+        return unsafe { *ptr as u64 };
+    }
+    if size == 2u32 {
+        return unsafe { *(ptr as *const u16) as u64 };
+    }
+    if size == 4u32 {
+        return unsafe { *(ptr as *const u32) as u64 };
+    }
+    unsafe { *(ptr as *const u64) }
+}
+
+pub fn oracle_write_scalar(ptr: *mut u8, size: u32, val: u64) {
+    if (ptr as usize) == 0 {
+        return;
+    }
+    if size == 1u32 {
+        unsafe {
+            *ptr = val as u8;
+        }
+    } else if size == 2u32 {
+        unsafe {
+            *(ptr as *mut u16) = val as u16;
+        }
+    } else if size == 4u32 {
+        unsafe {
+            *(ptr as *mut u32) = val as u32;
+        }
+    } else {
+        unsafe {
+            *(ptr as *mut u64) = val;
+        }
+    }
+}
+
+pub fn vec_clock_zero() -> InterpVecClock {
+    InterpVecClock {
+        v: [0u64; 16],
+    }
+}
+
+pub fn vec_clock_join(a: view<InterpVecClock>, b: view<InterpVecClock>) -> InterpVecClock {
+    let mut r = InterpVecClock {
+        v: [0u64; 16],
+    };
+    let mut i: usize = 0;
+    while i < INTERP_MAX_THREADS {
+        let va = a.v[i];
+        let vb = b.v[i];
+        r.v[i] = if va >= vb { va } else { vb };
+        i = i + 1;
+    }
+    r
+}
+
+pub fn oracle_seed_prng(ctx: mut_view<InterpCtx>, seed: u64) {
+    ctx.oracle.schedule_seed = seed;
+    let mut s = seed ^ 0x9E3779B97F4A7C15u64;
+    if s == 0u64 {
+        s = 0x9E3779B97F4A7C15u64;
+    }
+    ctx.oracle.prng_state = s;
+}
+
+pub fn oracle_next_prng(ctx: mut_view<InterpCtx>) -> u64 {
+    let mut s = ctx.oracle.prng_state;
+    if s == 0u64 {
+        s = 0x9E3779B97F4A7C15u64;
+    }
+    s = s ^ (s << 13u64);
+    s = s ^ (s >> 7u64);
+    s = s ^ (s << 17u64);
+    ctx.oracle.prng_state = s;
+    s
+}
+
+pub fn oracle_advance_tid_epoch(ctx: mut_view<InterpCtx>, tid: u32) -> u64 {
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    let next_e = ctx.oracle.clock[t].v[t] + 1u64;
+    ctx.oracle.clock[t].v[t] = next_e;
+    next_e
+}
+
+pub fn oracle_join_threads(ctx: mut_view<InterpCtx>) {
+    if ctx.oracle.active_thread_mask == 0u32 {
+        return;
+    }
+    let mut c0 = ctx.oracle.clock[0];
+    let mut t: usize = 1;
+    while t < INTERP_MAX_THREADS {
+        let bit = 1u32 << (t as u32);
+        if (ctx.oracle.active_thread_mask & bit) != 0u32 {
+            c0 = vec_clock_join(view(c0), view(ctx.oracle.clock[t]));
+        }
+        t = t + 1;
+    }
+    c0.v[0] = c0.v[0] + 1u64;
+    ctx.oracle.clock[0] = c0;
+    ctx.oracle.fork_clock = ctx.oracle.clock[0];
+    ctx.oracle.active_thread_mask = 0u32;
+    let mut k: usize = 0;
+    while k < INTERP_MAX_THREADS {
+        ctx.oracle.last_thread_callee[k] = 0;
+        k = k + 1;
+    }
+}
+
+pub fn oracle_begin_concurrent_batch(ctx: mut_view<InterpCtx>) {
+    if ctx.oracle.active_thread_mask != 0u32 {
+        oracle_join_threads(mut_view(*ctx));
+    } else {
+        let e0 = ctx.oracle.clock[0].v[0] + 1u64;
+        ctx.oracle.clock[0].v[0] = e0;
+        ctx.oracle.fork_clock = ctx.oracle.clock[0];
+    }
+    ctx.oracle.has_concurrent_threads = true;
+    let run_idx = ctx.oracle.schedule_run_counter;
+    ctx.oracle.schedule_run_counter = run_idx + 1u64;
+    let mix = oracle_w_add_u64(ctx.oracle.schedule_seed, run_idx * 0x517CC1B727220A95u64);
+    let mut s = ctx.oracle.prng_state ^ mix ^ 0x9E3779B97F4A7C15u64;
+    if s == 0u64 {
+        s = 0x9E3779B97F4A7C15u64;
+    }
+    ctx.oracle.prng_state = s;
+    let _ = oracle_next_prng(mut_view(*ctx));
+}
+
+pub fn oracle_fork_thread_for_batch(ctx: mut_view<InterpCtx>, tid: u32, callee_addr: usize) {
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    if t == 0 {
+        return;
+    }
+    let bit = 1u32 << (t as u32);
+    ctx.oracle.has_concurrent_threads = true;
+    if (ctx.oracle.active_thread_mask & bit) != 0u32 {
+        if ctx.oracle.last_thread_callee[t] == callee_addr {
+            oracle_begin_concurrent_batch(mut_view(*ctx));
+        } else {
+            ctx.oracle.last_thread_callee[t] = callee_addr;
+            let _ = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+            return;
+        }
+    }
+    ctx.oracle.active_thread_mask = ctx.oracle.active_thread_mask | bit;
+    ctx.oracle.last_thread_callee[t] = callee_addr;
+    let prev_own_epoch = ctx.oracle.clock[t].v[t];
+    let prev_fork_epoch = ctx.oracle.fork_clock.v[t];
+    let base_epoch = if prev_own_epoch >= prev_fork_epoch { prev_own_epoch } else { prev_fork_epoch };
+    ctx.oracle.clock[t] = ctx.oracle.fork_clock;
+    ctx.oracle.clock[t].v[t] = base_epoch + 1u64;
+    ctx.oracle.acq_fence_clock[t] = vec_clock_zero();
+    ctx.oracle.rel_fence_clock[t] = vec_clock_zero();
+}
+
+pub fn oracle_ranges_overlap(a_addr: usize, a_sz: u32, b_addr: usize, b_sz: u32) -> bool {
+    let a_end = a_addr + (a_sz as usize);
+    let b_end = b_addr + (b_sz as usize);
+    a_addr < b_end && b_addr < a_end
+}
+
+pub fn oracle_invalidate_range(ctx: mut_view<InterpCtx>, ptr: *const u8, size: usize) {
+    let base = ptr as usize;
+    if base == 0 || size == 0 {
+        return;
+    }
+    let end = base + size;
+    let mut i: usize = 0;
+    while i < ctx.oracle.atomic_loc_len {
+        let loc = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, i) };
+        let l_addr = unsafe { (*loc).host_addr };
+        let l_sz = unsafe { (*loc).size as usize };
+        if l_addr < end && base < l_addr + l_sz {
+            unsafe {
+                (*loc).is_active = false;
+                (*loc).write_len = 0;
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    while i < ctx.oracle.ord_access_len {
+        let oa = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, i) };
+        let o_addr = unsafe { (*oa).host_addr };
+        let o_sz = unsafe { (*oa).size as usize };
+        if o_addr < end && base < o_addr + o_sz {
+            unsafe {
+                (*oa).is_active = false;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+pub fn oracle_has_active_atomic_at(ctx: view<InterpCtx>, ptr: *const u8, size: u32) -> bool {
+    let addr = ptr as usize;
+    if addr == 0 || size == 0u32 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < ctx.oracle.atomic_loc_len {
+        let loc = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, i) };
+        if unsafe { (*loc).is_active } {
+            let l_addr = unsafe { (*loc).host_addr };
+            let l_sz = unsafe { (*loc).size };
+            if oracle_ranges_overlap(addr, size, l_addr, l_sz) {
+                return true;
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+pub fn oracle_reset_atomic_loc(ctx: mut_view<InterpCtx>, ptr: *const u8, size: u32) {
+    oracle_invalidate_range(mut_view(*ctx), ptr, size as usize);
+}
+
+fn oracle_append_atomic_write(
+    loc: *mut InterpAtomicLoc,
+    val: u64,
+    writer_tid: u32,
+    writer_epoch: u64,
+    order: u8,
+    is_rmw: bool,
+    seq_cst_index: u64,
+    rel_clock: view<InterpVecClock>
+) -> usize {
+    let wlen = unsafe { (*loc).write_len };
+    let wcap = unsafe { (*loc).write_cap };
+    if wlen >= wcap {
+        let new_cap: usize = if wcap == 0 { 8 } else { interp_mul_usize(wcap, 2) };
+        let new_bytes = interp_mul_usize(new_cap, size_of<InterpAtomicWrite>());
+        let new_arr = unsafe { heap_alloc(new_bytes, align_of<InterpAtomicWrite>()) as *mut InterpAtomicWrite };
+        unsafe {
+            interp_zero_bytes(new_arr as *mut u8, new_bytes);
+        }
+        let old_arr = unsafe { (*loc).writes };
+        if wlen > 0 && (old_arr as usize) != 0 {
+            let old_bytes = interp_mul_usize(wlen, size_of<InterpAtomicWrite>());
+            let old_cap_bytes = interp_mul_usize(wcap, size_of<InterpAtomicWrite>());
+            unsafe {
+                interp_copy_bytes(new_arr as *mut u8, old_arr as *const u8, old_bytes);
+                heap_free(old_arr as *mut u8, old_cap_bytes, align_of<InterpAtomicWrite>());
+            }
+        }
+        unsafe {
+            (*loc).writes = new_arr;
+            (*loc).write_cap = new_cap;
+        }
+    }
+    let slot = unsafe { interp_atomic_write_at((*loc).writes, wlen) };
+    unsafe {
+        (*slot).val = val;
+        (*slot).writer_tid = writer_tid;
+        (*slot).writer_epoch = writer_epoch;
+        (*slot).order = order;
+        (*slot).is_rmw = is_rmw;
+        (*slot).seq_cst_index = seq_cst_index;
+        (*slot).rel_clock = *rel_clock;
+        (*loc).write_len = wlen + 1;
+    }
+    wlen
+}
+
+pub fn oracle_find_or_create_atomic_loc(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u32
+) -> *mut InterpAtomicLoc {
+    let addr = host_ptr as usize;
+    if addr == 0 || size == 0u32 {
+        return 0 as *mut InterpAtomicLoc;
+    }
+    if size > 1u32 && (addr % (size as usize)) != 0 {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MISALIGNED);
+        return 0 as *mut InterpAtomicLoc;
+    }
+
+    let mut reuse_slot: *mut InterpAtomicLoc = 0 as *mut InterpAtomicLoc;
+    let mut i: usize = 0;
+    while i < ctx.oracle.atomic_loc_len {
+        let loc = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, i) };
+        let active = unsafe { (*loc).is_active };
+        let l_addr = unsafe { (*loc).host_addr };
+        let l_sz = unsafe { (*loc).size };
+        if active {
+            if l_addr == addr && l_sz == size {
+                return loc;
+            }
+            if oracle_ranges_overlap(addr, size, l_addr, l_sz) {
+                interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_OVERLAP);
+                return 0 as *mut InterpAtomicLoc;
+            }
+        } else if (reuse_slot as usize) == 0 {
+            reuse_slot = loc;
+        }
+        i = i + 1;
+    }
+
+    let mut target: *mut InterpAtomicLoc = reuse_slot;
+    if (target as usize) == 0 {
+        if ctx.oracle.atomic_loc_len >= ctx.oracle.atomic_loc_cap {
+            let new_cap: usize = if ctx.oracle.atomic_loc_cap == 0 { 32 } else { interp_mul_usize(ctx.oracle.atomic_loc_cap, 2) };
+            let new_bytes = interp_mul_usize(new_cap, size_of<InterpAtomicLoc>());
+            let new_arr = unsafe { heap_alloc(new_bytes, align_of<InterpAtomicLoc>()) as *mut InterpAtomicLoc };
+            unsafe {
+                interp_zero_bytes(new_arr as *mut u8, new_bytes);
+            }
+            if ctx.oracle.atomic_loc_len > 0 && (ctx.oracle.atomic_locs as usize) != 0 {
+                let old_bytes = interp_mul_usize(ctx.oracle.atomic_loc_len, size_of<InterpAtomicLoc>());
+                let old_cap_bytes = interp_mul_usize(ctx.oracle.atomic_loc_cap, size_of<InterpAtomicLoc>());
+                unsafe {
+                    interp_copy_bytes(new_arr as *mut u8, ctx.oracle.atomic_locs as *const u8, old_bytes);
+                    heap_free(ctx.oracle.atomic_locs as *mut u8, old_cap_bytes, align_of<InterpAtomicLoc>());
+                }
+            }
+            ctx.oracle.atomic_locs = new_arr;
+            ctx.oracle.atomic_loc_cap = new_cap;
+        }
+        target = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, ctx.oracle.atomic_loc_len) };
+        ctx.oracle.atomic_loc_len = ctx.oracle.atomic_loc_len + 1;
+    }
+
+    let init_val = oracle_read_scalar(host_ptr as *const u8, size) & oracle_bit_mask(size);
+    let init_clock = ctx.oracle.fork_clock;
+    unsafe {
+        (*target).host_addr = addr;
+        (*target).size = size;
+        (*target).is_active = true;
+        (*target).write_len = 0;
+        (*target).last_write_tid = 0u32;
+        (*target).last_write_epoch = init_clock.v[0];
+        (*target).last_spurious_mo_len = 0;
+        (*target).last_spurious_tid = 0xFFFFFFFFu32;
+        let mut ti: usize = 0;
+        while ti < INTERP_MAX_THREADS {
+            (*target).seen_mo[ti] = 0;
+            (*target).last_read_epoch[ti] = 0u64;
+            (*target).last_read_mo[ti] = 0;
+            (*target).last_weak_load_mo_len[ti] = 0;
+            ti = ti + 1;
+        }
+    }
+    let _ = oracle_append_atomic_write(
+        target,
+        init_val,
+        0u32,
+        init_clock.v[0],
+        MIR_ORDER_RELAXED,
+        false,
+        0u64,
+        view(init_clock)
+    );
+    target
+}
+
+fn oracle_check_atomic_vs_ordinary(
+    ctx: mut_view<InterpCtx>,
+    addr: usize,
+    size: u32,
+    tid: u32,
+    is_write: bool
+) -> bool {
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    let mut i: usize = 0;
+    while i < ctx.oracle.ord_access_len {
+        let oa = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, i) };
+        if unsafe { (*oa).is_active } {
+            let o_addr = unsafe { (*oa).host_addr };
+            let o_sz = unsafe { (*oa).size };
+            if oracle_ranges_overlap(addr, size, o_addr, o_sz) {
+                let w_tid = unsafe { (*oa).last_write_tid as usize };
+                let w_ep = unsafe { (*oa).last_write_epoch };
+                if w_ep > 0u64 && w_tid != t {
+                    if w_ep > ctx.oracle.clock[t].v[w_tid] {
+                        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MIXED_ATOMIC);
+                        return false;
+                    }
+                }
+                if is_write {
+                    let mut r: usize = 0;
+                    while r < INTERP_MAX_THREADS {
+                        if r != t {
+                            let r_ep = unsafe { (*oa).read_epochs[r] };
+                            if r_ep > 0u64 && r_ep > ctx.oracle.clock[t].v[r] {
+                                interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MIXED_ATOMIC);
+                                return false;
+                            }
+                        }
+                        r = r + 1;
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn oracle_find_or_create_ord_access(ctx: mut_view<InterpCtx>, addr: usize, size: u32) -> *mut InterpOrdAccess {
+    let mut reuse_slot: *mut InterpOrdAccess = 0 as *mut InterpOrdAccess;
+    let mut i: usize = 0;
+    while i < ctx.oracle.ord_access_len {
+        let oa = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, i) };
+        let active = unsafe { (*oa).is_active };
+        let o_addr = unsafe { (*oa).host_addr };
+        let o_sz = unsafe { (*oa).size };
+        if active && o_addr == addr && o_sz == size {
+            return oa;
+        }
+        if !active && (reuse_slot as usize) == 0 {
+            reuse_slot = oa;
+        }
+        i = i + 1;
+    }
+    let mut target = reuse_slot;
+    if (target as usize) == 0 {
+        if ctx.oracle.ord_access_len >= ctx.oracle.ord_access_cap {
+            let new_cap: usize = if ctx.oracle.ord_access_cap == 0 { 64 } else { interp_mul_usize(ctx.oracle.ord_access_cap, 2) };
+            let new_bytes = interp_mul_usize(new_cap, size_of<InterpOrdAccess>());
+            let new_arr = unsafe { heap_alloc(new_bytes, align_of<InterpOrdAccess>()) as *mut InterpOrdAccess };
+            unsafe {
+                interp_zero_bytes(new_arr as *mut u8, new_bytes);
+            }
+            if ctx.oracle.ord_access_len > 0 && (ctx.oracle.ord_accesses as usize) != 0 {
+                let old_bytes = interp_mul_usize(ctx.oracle.ord_access_len, size_of<InterpOrdAccess>());
+                let old_cap_bytes = interp_mul_usize(ctx.oracle.ord_access_cap, size_of<InterpOrdAccess>());
+                unsafe {
+                    interp_copy_bytes(new_arr as *mut u8, ctx.oracle.ord_accesses as *const u8, old_bytes);
+                    heap_free(ctx.oracle.ord_accesses as *mut u8, old_cap_bytes, align_of<InterpOrdAccess>());
+                }
+            }
+            ctx.oracle.ord_accesses = new_arr;
+            ctx.oracle.ord_access_cap = new_cap;
+        }
+        target = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, ctx.oracle.ord_access_len) };
+        ctx.oracle.ord_access_len = ctx.oracle.ord_access_len + 1;
+    }
+    unsafe {
+        (*target).host_addr = addr;
+        (*target).size = size;
+        (*target).is_active = true;
+        (*target).last_write_tid = 0u32;
+        (*target).last_write_epoch = 0u64;
+        let mut r: usize = 0;
+        while r < INTERP_MAX_THREADS {
+            (*target).read_epochs[r] = 0u64;
+            r = r + 1;
+        }
+    }
+    target
+}
+
+pub fn oracle_record_ordinary_read(
+    ctx: mut_view<InterpCtx>,
+    ptr: *const u8,
+    size: u32,
+    is_raw_deref: bool
+) {
+    let addr = ptr as usize;
+    if addr == 0 || size == 0u32 || ctx.failed {
+        return;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+
+    // 1. Check against active atomic locations (mixed atomic/ordinary race, AXS-ATM-052)
+    let mut i: usize = 0;
+    while i < ctx.oracle.atomic_loc_len {
+        let loc = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, i) };
+        if unsafe { (*loc).is_active } {
+            let l_addr = unsafe { (*loc).host_addr };
+            let l_sz = unsafe { (*loc).size };
+            if oracle_ranges_overlap(addr, size, l_addr, l_sz) {
+                let w_tid = unsafe { (*loc).last_write_tid as usize };
+                let w_ep = unsafe { (*loc).last_write_epoch };
+                if (w_ep > 0u64 && w_tid != t && w_ep > ctx.oracle.clock[t].v[w_tid]) || (is_raw_deref && tid != 0u32) {
+                    interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MIXED_ATOMIC);
+                    return;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    if !ctx.oracle.has_concurrent_threads || tid == 0u32 {
+        return;
+    }
+    let f_base = ctx.oracle.current_frame_storage as usize;
+    let f_sz = ctx.oracle.current_frame_storage_size;
+    if f_base != 0 && addr >= f_base && addr + (size as usize) <= f_base + f_sz {
+        return;
+    }
+
+    // 2. Check against ordinary memory writes from other threads
+    i = 0;
+    while i < ctx.oracle.ord_access_len {
+        let oa = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, i) };
+        if unsafe { (*oa).is_active } {
+            let o_addr = unsafe { (*oa).host_addr };
+            let o_sz = unsafe { (*oa).size };
+            if oracle_ranges_overlap(addr, size, o_addr, o_sz) {
+                let w_tid = unsafe { (*oa).last_write_tid as usize };
+                let w_ep = unsafe { (*oa).last_write_epoch };
+                if w_ep > 0u64 && w_tid != t && w_ep > ctx.oracle.clock[t].v[w_tid] {
+                    interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DATA_RACE);
+                    return;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    let oa_slot = oracle_find_or_create_ord_access(mut_view(*ctx), addr, size);
+    let cur_ep = ctx.oracle.clock[t].v[t];
+    unsafe {
+        if cur_ep > (*oa_slot).read_epochs[t] {
+            (*oa_slot).read_epochs[t] = cur_ep;
+        }
+    }
+}
+
+pub fn oracle_record_ordinary_write(
+    ctx: mut_view<InterpCtx>,
+    ptr: *const u8,
+    size: u32
+) {
+    let addr = ptr as usize;
+    if addr == 0 || size == 0u32 || ctx.failed {
+        return;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+
+    // 1. Any non-initialization ordinary write to an active atomic location is UB (AXS-ATM-052)
+    let mut i: usize = 0;
+    while i < ctx.oracle.atomic_loc_len {
+        let loc = unsafe { interp_atomic_loc_at(ctx.oracle.atomic_locs, i) };
+        if unsafe { (*loc).is_active } {
+            let l_addr = unsafe { (*loc).host_addr };
+            let l_sz = unsafe { (*loc).size };
+            if oracle_ranges_overlap(addr, size, l_addr, l_sz) {
+                interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MIXED_ATOMIC);
+                return;
+            }
+        }
+        i = i + 1;
+    }
+
+    if !ctx.oracle.has_concurrent_threads || tid == 0u32 {
+        return;
+    }
+    let f_base = ctx.oracle.current_frame_storage as usize;
+    let f_sz = ctx.oracle.current_frame_storage_size;
+    if f_base != 0 && addr >= f_base && addr + (size as usize) <= f_base + f_sz {
+        return;
+    }
+
+    // 2. Check against ordinary writes and reads from other threads
+    i = 0;
+    while i < ctx.oracle.ord_access_len {
+        let oa = unsafe { interp_ord_access_at(ctx.oracle.ord_accesses, i) };
+        if unsafe { (*oa).is_active } {
+            let o_addr = unsafe { (*oa).host_addr };
+            let o_sz = unsafe { (*oa).size };
+            if oracle_ranges_overlap(addr, size, o_addr, o_sz) {
+                let w_tid = unsafe { (*oa).last_write_tid as usize };
+                let w_ep = unsafe { (*oa).last_write_epoch };
+                if w_ep > 0u64 && w_tid != t && w_ep > ctx.oracle.clock[t].v[w_tid] {
+                    interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DATA_RACE);
+                    return;
+                }
+                let mut r: usize = 0;
+                while r < INTERP_MAX_THREADS {
+                    if r != t {
+                        let r_ep = unsafe { (*oa).read_epochs[r] };
+                        if r_ep > 0u64 && r_ep > ctx.oracle.clock[t].v[r] {
+                            interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_DATA_RACE);
+                            return;
+                        }
+                    }
+                    r = r + 1;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    let oa_slot = oracle_find_or_create_ord_access(mut_view(*ctx), addr, size);
+    let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+    unsafe {
+        (*oa_slot).last_write_tid = tid;
+        (*oa_slot).last_write_epoch = cur_ep;
+    }
+}
+
+pub fn oracle_atomic_load(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u32,
+    ord: u8
+) -> u64 {
+    if ord == MIR_ORDER_RELEASE || ord == MIR_ORDER_ACQ_REL || ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return 0u64;
+    }
+    let loc = oracle_find_or_create_atomic_loc(mut_view(*ctx), host_ptr, size);
+    if (loc as usize) == 0 || ctx.failed {
+        return 0u64;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    if !oracle_check_atomic_vs_ordinary(mut_view(*ctx), host_ptr as usize, size, tid, false) {
+        return 0u64;
+    }
+
+    let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+    if ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+    }
+
+    let wlen = unsafe { (*loc).write_len };
+    let writes = unsafe { (*loc).writes };
+    let mut min_mo: usize = unsafe { (*loc).seen_mo[t] };
+
+    // CoWR: any write happens-before this thread bounds min_mo
+    let mut m: usize = 0;
+    while m < wlen {
+        let w = unsafe { interp_atomic_write_at(writes, m) };
+        let w_tid = unsafe { (*w).writer_tid as usize };
+        let w_ep = unsafe { (*w).writer_epoch };
+        if ctx.oracle.clock[t].v[w_tid] >= w_ep && m > min_mo {
+            min_mo = m;
+        }
+        if ord == MIR_ORDER_SEQ_CST {
+            let sc_i = unsafe { (*w).seq_cst_index };
+            if sc_i > 0u64 && m > min_mo {
+                min_mo = m;
+            }
+        }
+        m = m + 1;
+    }
+
+    // CoRR: any read happens-before this thread bounds min_mo
+    let mut u: usize = 0;
+    while u < INTERP_MAX_THREADS {
+        let lr_ep = unsafe { (*loc).last_read_epoch[u] };
+        let lr_mo = unsafe { (*loc).last_read_mo[u] };
+        if lr_ep > 0u64 && ctx.oracle.clock[t].v[u] >= lr_ep && lr_mo > min_mo {
+            min_mo = lr_mo;
+        }
+        u = u + 1;
+    }
+
+    if min_mo >= wlen {
+        min_mo = wlen - 1;
+    }
+
+    let mut chosen_idx: usize = wlen - 1;
+    let last_weak_len = unsafe { (*loc).last_weak_load_mo_len[t] };
+    if min_mo < wlen - 1 && ctx.oracle.schedule_run_counter > 1u64 && last_weak_len != wlen {
+        unsafe {
+            (*loc).last_weak_load_mo_len[t] = wlen;
+        }
+        let span = wlen - min_mo;
+        let rnd = (oracle_next_prng(mut_view(*ctx)) as usize) % span;
+        chosen_idx = min_mo + rnd;
+    }
+
+    let chosen_w = unsafe { interp_atomic_write_at(writes, chosen_idx) };
+    let w_val = unsafe { (*chosen_w).val };
+    let w_rel = unsafe { (*chosen_w).rel_clock };
+
+    ctx.oracle.acq_fence_clock[t] = vec_clock_join(view(ctx.oracle.acq_fence_clock[t]), view(w_rel));
+    if ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(w_rel));
+    }
+
+    unsafe {
+        if chosen_idx > (*loc).seen_mo[t] {
+            (*loc).seen_mo[t] = chosen_idx;
+        }
+        (*loc).last_read_epoch[t] = cur_ep;
+        if chosen_idx > (*loc).last_read_mo[t] {
+            (*loc).last_read_mo[t] = chosen_idx;
+        }
+    }
+    w_val & oracle_bit_mask(size)
+}
+
+pub fn oracle_atomic_store(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u32,
+    val: u64,
+    ord: u8
+) {
+    if ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL || ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return;
+    }
+    let loc = oracle_find_or_create_atomic_loc(mut_view(*ctx), host_ptr, size);
+    if (loc as usize) == 0 || ctx.failed {
+        return;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    if !oracle_check_atomic_vs_ordinary(mut_view(*ctx), host_ptr as usize, size, tid, true) {
+        return;
+    }
+
+    let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+    let mut sc_idx: u64 = 0u64;
+    if ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+        sc_idx = ctx.oracle.seq_cst_tick;
+    }
+
+    let w_rel = if ord == MIR_ORDER_RELEASE || ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t]
+    } else {
+        ctx.oracle.rel_fence_clock[t]
+    };
+
+    let masked_val = val & oracle_bit_mask(size);
+    let new_idx = oracle_append_atomic_write(loc, masked_val, tid, cur_ep, ord, false, sc_idx, view(w_rel));
+    unsafe {
+        (*loc).seen_mo[t] = new_idx;
+        (*loc).last_write_tid = tid;
+        (*loc).last_write_epoch = cur_ep;
+    }
+    oracle_write_scalar(host_ptr, size, masked_val);
+}
+
+pub fn oracle_atomic_rmw(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u32,
+    aop: u8,
+    arg_val: u64,
+    ord: u8
+) -> u64 {
+    if ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return 0u64;
+    }
+    let loc = oracle_find_or_create_atomic_loc(mut_view(*ctx), host_ptr, size);
+    if (loc as usize) == 0 || ctx.failed {
+        return 0u64;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    if !oracle_check_atomic_vs_ordinary(mut_view(*ctx), host_ptr as usize, size, tid, true) {
+        return 0u64;
+    }
+
+    let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+    let mask = oracle_bit_mask(size);
+    let wlen = unsafe { (*loc).write_len };
+    let k = wlen - 1;
+    let wk = unsafe { interp_atomic_write_at((*loc).writes, k) };
+    let old_val = (unsafe { (*wk).val }) & mask;
+    let wk_rel = unsafe { (*wk).rel_clock };
+
+    // Acquire synchronization on read of W_k
+    ctx.oracle.acq_fence_clock[t] = vec_clock_join(view(ctx.oracle.acq_fence_clock[t]), view(wk_rel));
+    if ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(wk_rel));
+    }
+
+    // Wrapping two's-complement RMW computation (AXS-ATM-024)
+    let rhs = arg_val & mask;
+    let mut new_val: u64 = rhs;
+    if aop == MIR_ATOMIC_SWAP {
+        new_val = rhs;
+    } else if aop == MIR_ATOMIC_ADD {
+        new_val = oracle_w_add_u64(old_val, rhs) & mask;
+    } else if aop == MIR_ATOMIC_SUB {
+        new_val = oracle_w_sub_u64(old_val, rhs) & mask;
+    } else if aop == MIR_ATOMIC_AND {
+        new_val = (old_val & rhs) & mask;
+    } else if aop == MIR_ATOMIC_OR {
+        new_val = (old_val | rhs) & mask;
+    } else if aop == MIR_ATOMIC_XOR {
+        new_val = (old_val ^ rhs) & mask;
+    }
+
+    // Release sequence preservation (AXS-ATM-021, AXS-ATM-051(3))
+    let mut w_rel = wk_rel;
+    if ord == MIR_ORDER_RELEASE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST {
+        w_rel = vec_clock_join(view(w_rel), view(ctx.oracle.clock[t]));
+    } else {
+        w_rel = vec_clock_join(view(w_rel), view(ctx.oracle.rel_fence_clock[t]));
+    }
+
+    let mut sc_idx: u64 = 0u64;
+    if ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+        sc_idx = ctx.oracle.seq_cst_tick;
+    }
+
+    let new_idx = oracle_append_atomic_write(loc, new_val, tid, cur_ep, ord, true, sc_idx, view(w_rel));
+    unsafe {
+        (*loc).seen_mo[t] = new_idx;
+        (*loc).last_write_tid = tid;
+        (*loc).last_write_epoch = cur_ep;
+        (*loc).last_read_epoch[t] = cur_ep;
+        if k > (*loc).last_read_mo[t] {
+            (*loc).last_read_mo[t] = k;
+        }
+    }
+    oracle_write_scalar(host_ptr, size, new_val);
+    old_val
+}
+
+pub fn oracle_atomic_cmpxchg(
+    ctx: mut_view<InterpCtx>,
+    host_ptr: *mut u8,
+    size: u32,
+    expected_val: u64,
+    desired_val: u64,
+    succ_ord: u8,
+    fail_ord: u8,
+    is_weak: bool,
+    out_ok: mut_view<bool>
+) -> u64 {
+    *out_ok = false;
+    if succ_ord > MIR_ORDER_SEQ_CST || fail_ord == MIR_ORDER_RELEASE || fail_ord == MIR_ORDER_ACQ_REL || fail_ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return 0u64;
+    }
+    let loc = oracle_find_or_create_atomic_loc(mut_view(*ctx), host_ptr, size);
+    if (loc as usize) == 0 || ctx.failed {
+        return 0u64;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+
+    let mask = oracle_bit_mask(size);
+    let exp_masked = expected_val & mask;
+    let des_masked = desired_val & mask;
+    let wlen = unsafe { (*loc).write_len };
+    let k = wlen - 1;
+    let wk = unsafe { interp_atomic_write_at((*loc).writes, k) };
+    let old_val = (unsafe { (*wk).val }) & mask;
+    let wk_rel = unsafe { (*wk).rel_clock };
+
+    // Deterministic spurious failure for compare_exchange_weak (AXS-ATM-054)
+    let mut spurious_fail = false;
+    if is_weak && old_val == exp_masked {
+        let last_sp_len = unsafe { (*loc).last_spurious_mo_len };
+        let last_sp_tid = unsafe { (*loc).last_spurious_tid };
+        if last_sp_len != wlen || last_sp_tid != tid {
+            unsafe {
+                (*loc).last_spurious_mo_len = wlen;
+                (*loc).last_spurious_tid = tid;
+            }
+            spurious_fail = true;
+        }
+    }
+
+    if old_val != exp_masked || spurious_fail {
+        if !oracle_check_atomic_vs_ordinary(mut_view(*ctx), host_ptr as usize, size, tid, false) {
+            return old_val;
+        }
+        let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+        if fail_ord == MIR_ORDER_SEQ_CST {
+            ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+        }
+        ctx.oracle.acq_fence_clock[t] = vec_clock_join(view(ctx.oracle.acq_fence_clock[t]), view(wk_rel));
+        if fail_ord == MIR_ORDER_ACQUIRE || fail_ord == MIR_ORDER_SEQ_CST {
+            ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(wk_rel));
+        }
+        unsafe {
+            if k > (*loc).seen_mo[t] {
+                (*loc).seen_mo[t] = k;
+            }
+            (*loc).last_read_epoch[t] = cur_ep;
+            if k > (*loc).last_read_mo[t] {
+                (*loc).last_read_mo[t] = k;
+            }
+        }
+        *out_ok = false;
+        return old_val;
+    }
+
+    if !oracle_check_atomic_vs_ordinary(mut_view(*ctx), host_ptr as usize, size, tid, true) {
+        return old_val;
+    }
+    let cur_ep = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+
+    ctx.oracle.acq_fence_clock[t] = vec_clock_join(view(ctx.oracle.acq_fence_clock[t]), view(wk_rel));
+    if succ_ord == MIR_ORDER_ACQUIRE || succ_ord == MIR_ORDER_ACQ_REL || succ_ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(wk_rel));
+    }
+
+    let mut w_rel = wk_rel;
+    if succ_ord == MIR_ORDER_RELEASE || succ_ord == MIR_ORDER_ACQ_REL || succ_ord == MIR_ORDER_SEQ_CST {
+        w_rel = vec_clock_join(view(w_rel), view(ctx.oracle.clock[t]));
+    } else {
+        w_rel = vec_clock_join(view(w_rel), view(ctx.oracle.rel_fence_clock[t]));
+    }
+
+    let mut sc_idx: u64 = 0u64;
+    if succ_ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+        sc_idx = ctx.oracle.seq_cst_tick;
+    }
+
+    let new_idx = oracle_append_atomic_write(loc, des_masked, tid, cur_ep, succ_ord, true, sc_idx, view(w_rel));
+    unsafe {
+        (*loc).seen_mo[t] = new_idx;
+        (*loc).last_write_tid = tid;
+        (*loc).last_write_epoch = cur_ep;
+        (*loc).last_read_epoch[t] = cur_ep;
+        if k > (*loc).last_read_mo[t] {
+            (*loc).last_read_mo[t] = k;
+        }
+    }
+    oracle_write_scalar(host_ptr, size, des_masked);
+    *out_ok = true;
+    old_val
+}
+
+pub fn oracle_atomic_fence(ctx: mut_view<InterpCtx>, ord: u8) {
+    if ord == MIR_ORDER_RELAXED || ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return;
+    }
+    let tid = ctx.oracle.current_tid;
+    let t = (tid as usize) % INTERP_MAX_THREADS;
+    let _ = oracle_advance_tid_epoch(mut_view(*ctx), tid);
+
+    if ord == MIR_ORDER_RELEASE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.rel_fence_clock[t] = ctx.oracle.clock[t];
+    }
+    if ord == MIR_ORDER_ACQUIRE || ord == MIR_ORDER_ACQ_REL || ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(ctx.oracle.acq_fence_clock[t]));
+    }
+    if ord == MIR_ORDER_SEQ_CST {
+        ctx.oracle.clock[t] = vec_clock_join(view(ctx.oracle.clock[t]), view(ctx.oracle.seq_cst_fence_clock));
+        ctx.oracle.seq_cst_fence_clock = ctx.oracle.clock[t];
+        ctx.oracle.rel_fence_clock[t] = ctx.oracle.clock[t];
+        ctx.oracle.seq_cst_tick = ctx.oracle.seq_cst_tick + 1u64;
+    }
+}
+
+pub fn oracle_atomic_compiler_fence(ctx: mut_view<InterpCtx>, ord: u8) {
+    if ord == MIR_ORDER_RELAXED || ord > MIR_ORDER_SEQ_CST {
+        interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_ATOMIC_ORDER);
+        return;
+    }
 }

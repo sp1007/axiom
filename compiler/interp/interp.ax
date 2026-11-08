@@ -102,6 +102,19 @@ use compiler.types.layout.type_field_offset
 use compiler.types.layout.type_size
 use compiler.traits.mono.MonoEngine
 use compiler.traits.mono.MonoInstance
+use compiler.mir.mir.MIR_ATOMIC_ADD
+use compiler.mir.mir.MIR_ATOMIC_AND
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG_WEAK
+use compiler.mir.mir.MIR_ATOMIC_COMPILER_FENCE
+use compiler.mir.mir.MIR_ATOMIC_FENCE
+use compiler.mir.mir.MIR_ATOMIC_LOAD
+use compiler.mir.mir.MIR_ATOMIC_OR
+use compiler.mir.mir.MIR_ATOMIC_SPIN_HINT
+use compiler.mir.mir.MIR_ATOMIC_STORE
+use compiler.mir.mir.MIR_ATOMIC_SUB
+use compiler.mir.mir.MIR_ATOMIC_SWAP
+use compiler.mir.mir.MIR_ATOMIC_XOR
 use compiler.mir.mir.MIR_BINOP_ADD
 use compiler.mir.mir.MIR_BINOP_BIT_AND
 use compiler.mir.mir.MIR_BINOP_BIT_OR
@@ -124,6 +137,7 @@ use compiler.mir.mir.MIR_BINOP_WRAPPING_SUB
 use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
 use compiler.mir.mir.MIR_LOCAL_CONST
 use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_PROJ_DEREF
 use compiler.mir.mir.MIR_RVALUE_AGGREGATE
 use compiler.mir.mir.MIR_RVALUE_BINARY_OP
 use compiler.mir.mir.MIR_RVALUE_CAST
@@ -135,6 +149,7 @@ use compiler.mir.mir.MIR_RVALUE_REPEAT
 use compiler.mir.mir.MIR_RVALUE_UNARY_OP
 use compiler.mir.mir.MIR_RVALUE_USE
 use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_ATOMIC
 use compiler.mir.mir.MIR_TERM_ASSERT
 use compiler.mir.mir.MIR_TERM_CALL
 use compiler.mir.mir.MIR_TERM_DROP
@@ -158,6 +173,7 @@ use compiler.mir.mir.mir_bb_at
 use compiler.mir.mir.mir_bb_id_at
 use compiler.mir.mir.mir_local_at
 use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_proj_at
 use compiler.mir.mir.mir_stmt_at
 use compiler.mir.mir.mir_u64_at
 use compiler.mir.builder.mir_build_expr_body
@@ -176,9 +192,11 @@ use compiler.interp.value.INTERP_MSG_PANIC_SHIFT_RANGE
 use compiler.interp.value.INTERP_MSG_PANIC_UNREACHABLE
 use compiler.interp.value.INTERP_MSG_PANIC_UNRESOLVED_CALL
 use compiler.interp.value.INTERP_MSG_PANIC_UNSUPPORTED_TERM
+use compiler.interp.value.INTERP_MSG_UB_MISALIGNED
 use compiler.interp.value.INTERP_MSG_UB_OVERLAP
 use compiler.interp.value.INTERP_MSG_UB_USIZE_AS_PTR
 use compiler.interp.value.INTERP_SYNTH_BASE_COMPTIME
+use compiler.interp.value.INTERP_SYNTH_BASE_RUNTIME
 use compiler.interp.value.InterpCtx
 use compiler.interp.value.InterpValue
 use compiler.interp.value.MirBodyMap
@@ -212,6 +230,21 @@ use compiler.interp.value.interp_zero_val
 use compiler.interp.oracle.interp_eval_host_intrinsic
 use compiler.interp.oracle.interp_host_cleanup
 use compiler.interp.oracle.interp_host_init
+use compiler.interp.oracle.oracle_atomic_cmpxchg
+use compiler.interp.oracle.oracle_atomic_compiler_fence
+use compiler.interp.oracle.oracle_atomic_fence
+use compiler.interp.oracle.oracle_atomic_load
+use compiler.interp.oracle.oracle_atomic_rmw
+use compiler.interp.oracle.oracle_atomic_store
+use compiler.interp.oracle.oracle_begin_concurrent_batch
+use compiler.interp.oracle.oracle_fork_thread_for_batch
+use compiler.interp.oracle.oracle_has_active_atomic_at
+use compiler.interp.oracle.oracle_join_threads
+use compiler.interp.oracle.oracle_next_prng
+use compiler.interp.oracle.oracle_record_ordinary_read
+use compiler.interp.oracle.oracle_record_ordinary_write
+use compiler.interp.oracle.oracle_reset_atomic_loc
+use compiler.interp.oracle.oracle_seed_prng
 use compiler.interp.frame.CallFrame
 use compiler.interp.frame.eval_operand
 use compiler.interp.frame.frame_cleanup
@@ -602,6 +635,87 @@ pub fn find_drop_fn_for_type(ctx: view<InterpCtx>, ty_id: TypeId) -> *mut HirIte
 // Operand & Type Width Helpers
 // =================================================================================================
 
+fn is_atomic_struct_ty(ctx: view<InterpCtx>, ty_id: TypeId) -> bool {
+    if ty_id.v == 0u32 || (ctx.thir as usize) == 0 || (ctx.interner as usize) == 0 {
+        return false;
+    }
+    let ty = unsafe { type_get(view((*ctx.thir).interner), ty_id) };
+    if (ty as usize) == 0 || (unsafe { (*ty).kind }) != TY_STRUCT {
+        return false;
+    }
+    let mut tname_id = unsafe { (*ty).name.v };
+    if tname_id == 0u32 {
+        let def = unsafe { (*ty).def };
+        if (def as usize) != 0 {
+            tname_id = unsafe { (*def).name.v };
+        }
+    }
+    if tname_id == 0u32 {
+        return false;
+    }
+    let sv = unsafe { interner_get(view(*ctx.interner), StrId { v: tname_id }) };
+    let slen = sv.len;
+    if slen < 6 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    unsafe {
+        *(sv.ptr + 0) == 65u8 && *(sv.ptr + 1) == 116u8 && *(sv.ptr + 2) == 111u8 &&
+        *(sv.ptr + 3) == 109u8 && *(sv.ptr + 4) == 105u8 && *(sv.ptr + 5) == 99u8
+    }
+}
+
+fn extract_atomic_elem_ty(ctx: view<InterpCtx>, ty_id: TypeId) -> TypeId {
+    let tid_v = ty_id.v;
+    let check_ty = TypeId { v: tid_v };
+    if !is_atomic_struct_ty(ctx, check_ty) {
+        return TypeId { v: 0u32 };
+    }
+    let lookup_ty = TypeId { v: tid_v };
+    let ty = unsafe { type_get(view((*ctx.thir).interner), lookup_ty) };
+    if (unsafe { (*ty).field_count }) == 0 || (unsafe { (*ty).fields as usize }) == 0 {
+        return TypeId { v: 0u32 };
+    }
+    let f0 = unsafe { typeid_at((*ty).fields, 0) };
+    TypeId { v: unsafe { (*f0).v } }
+}
+
+fn place_has_raw_ptr_deref(ctx: view<InterpCtx>, frame: view<CallFrame>, place: view<MirPlace>) -> bool {
+    if place.proj_count == 0 || (frame.body as usize) == 0 || (ctx.thir as usize) == 0 {
+        return false;
+    }
+    let lcount = unsafe { (*frame.body).local_count };
+    if (place.local.v as usize) >= lcount {
+        return false;
+    }
+    let decl = unsafe { mir_local_at((*frame.body).locals, place.local.v as usize) };
+    let lty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: (*decl).ty.v }) };
+    let p0 = unsafe { mir_proj_at(place.projs, 0) };
+    if (unsafe { (*p0).kind }) == MIR_PROJ_DEREF && (lty as usize) != 0 && (unsafe { (*lty).kind }) == TY_PTR {
+        return true;
+    }
+    false
+}
+
+fn eval_operand_u64_raw(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: view<MirOperand>) -> u64 {
+    if op.kind == MIR_OP_CONST {
+        return op.constant.val;
+    }
+    let mut ty = TypeId { v: 0u32 };
+    let mut fat_len: u64 = 0u64;
+    let ptr = get_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
+    let sz = unsafe { type_size(ty, view((*ctx.thir).interner)) };
+    if sz == 1u32 {
+        return unsafe { *ptr as u64 };
+    }
+    if sz == 2u32 {
+        return unsafe { *(ptr as *const u16) as u64 };
+    }
+    if sz == 4u32 {
+        return unsafe { *(ptr as *const u32) as u64 };
+    }
+    unsafe { *(ptr as *const u64) }
+}
+
 pub fn eval_operand_u64(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: view<MirOperand>) -> u64 {
     if op.kind == MIR_OP_CONST {
         return op.constant.val;
@@ -610,6 +724,10 @@ pub fn eval_operand_u64(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, op: vi
     let mut fat_len: u64 = 0u64;
     let ptr = get_place_ptr(mut_view(*ctx), frame, view(op.place), mut_view(ty), mut_view(fat_len));
     let sz = unsafe { type_size(ty, view((*ctx.thir).interner)) };
+    if op.place.proj_count > 0 {
+        let is_raw = place_has_raw_ptr_deref(view(*ctx), frame, view(op.place));
+        oracle_record_ordinary_read(mut_view(*ctx), ptr as *const u8, sz, is_raw);
+    }
     if sz == 1u32 {
         return unsafe { *ptr as u64 };
     }
@@ -1110,8 +1228,18 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
     let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
     let use_kind = unsafe { (*stmt).rvalue.use_op.kind };
     let dest_ty_v = dest_ty.v;
+    let d_size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
+    let check_dest_ty = TypeId { v: dest_ty_v };
+    if is_atomic_struct_ty(view(*ctx), check_dest_ty) {
+        oracle_reset_atomic_loc(mut_view(*ctx), dest as *const u8, d_size);
+    } else if (unsafe { (*stmt).place.proj_count }) > 0 || oracle_has_active_atomic_at(view(*ctx), dest as *const u8, d_size) {
+        oracle_record_ordinary_write(mut_view(*ctx), dest as *const u8, d_size);
+        if ctx.failed {
+            return;
+        }
+    }
     if use_kind == MIR_OP_CONST {
-        let size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
+        let size = d_size;
         let const_ty_v = unsafe { (*stmt).rvalue.use_op.constant.ty.v };
         let t_str_v = unsafe { (*ctx.thir).interner.t_str.v };
         if const_ty_v != 0u32 && const_ty_v == t_str_v {
@@ -1130,7 +1258,14 @@ fn exec_assign_use(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut 
         let mut src_ty = TypeId { v: 0u32 };
         let mut src_len: u64 = 0u64;
         let src = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) }, mut_view(src_ty), mut_view(src_len));
-        let size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) as usize };
+        if (unsafe { (*stmt).rvalue.use_op.place.proj_count }) > 0 {
+            let is_raw = place_has_raw_ptr_deref(view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) });
+            oracle_record_ordinary_read(mut_view(*ctx), src as *const u8, d_size, is_raw);
+            if ctx.failed {
+                return;
+            }
+        }
+        let size = d_size as usize;
         if size > 0 {
             unsafe {
                 interp_copy_bytes(dest, src as *const u8, size);
@@ -1147,6 +1282,15 @@ fn exec_assign_aggregate(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt:
     let ty = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: dest_ty_v }) };
     if (ty as usize) == 0 {
         return;
+    }
+    let agg_sz = unsafe { type_size(TypeId { v: dest_ty_v }, view((*ctx.thir).interner)) };
+    if is_atomic_struct_ty(view(*ctx), dest_ty) {
+        oracle_reset_atomic_loc(mut_view(*ctx), dest as *const u8, agg_sz);
+    } else if (unsafe { (*stmt).place.proj_count }) > 0 {
+        oracle_record_ordinary_write(mut_view(*ctx), dest as *const u8, agg_sz);
+        if ctx.failed {
+            return;
+        }
     }
     let tk = unsafe { (*ty).kind };
     let v_idx = unsafe { (*stmt).rvalue.variant_idx };
@@ -1729,6 +1873,169 @@ fn exec_assign_cast(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut
     res
 }
 
+fn exec_atomic_stmt(ctx: mut_view<InterpCtx>, frame: view<CallFrame>, stmt: *mut MirStmt) -> bool {
+    let aop = unsafe { (*stmt).rvalue.bin_op };
+    let ord = unsafe { (*stmt).rvalue.cast_kind };
+    let fail_ord = unsafe { (*stmt).rvalue.borrow_kind };
+
+    if aop == MIR_ATOMIC_FENCE {
+        oracle_atomic_fence(mut_view(*ctx), ord);
+        return false;
+    }
+    if aop == MIR_ATOMIC_COMPILER_FENCE {
+        oracle_atomic_compiler_fence(mut_view(*ctx), ord);
+        return false;
+    }
+    if aop == MIR_ATOMIC_SPIN_HINT {
+        return true;
+    }
+
+    let op_ty = operand_type_id(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op) });
+    let op_ty_v = op_ty.v;
+    let mut op_tk: u8 = 0u8;
+    if op_ty_v != 0u32 && (ctx.thir as usize) != 0 {
+        let op_ax = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: op_ty_v }) };
+        if (op_ax as usize) != 0 {
+            op_tk = unsafe { (*op_ax).kind };
+        }
+    }
+    let mut elem_ty = TypeId { v: 0u32 };
+    if aop == MIR_ATOMIC_STORE || aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+        elem_ty = operand_type_id(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.lhs) });
+    } else {
+        let mut d_ty = TypeId { v: 0u32 };
+        let mut d_len: u64 = 0u64;
+        let _ = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(d_ty), mut_view(d_len));
+        elem_ty = d_ty;
+    }
+    if elem_ty.v == 0u32 && op_ty_v != 0u32 && (ctx.thir as usize) != 0 {
+        let op_ax = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: op_ty_v }) };
+        if (op_ax as usize) != 0 {
+            if op_tk == TY_VIEW || op_tk == TY_MUT_VIEW || op_tk == TY_PTR {
+                let pt_ty = interp_view_pointee_ty(op_ax);
+                let pt_ty_v = pt_ty.v;
+                let ex_ty = extract_atomic_elem_ty(view(*ctx), TypeId { v: pt_ty_v });
+                elem_ty = if ex_ty.v != 0u32 { ex_ty } else { TypeId { v: pt_ty_v } };
+            } else {
+                let ex_ty = extract_atomic_elem_ty(view(*ctx), TypeId { v: op_ty_v });
+                elem_ty = if ex_ty.v != 0u32 { ex_ty } else { TypeId { v: op_ty_v } };
+            }
+        }
+    }
+
+    let mut elem_size: u32 = 8u32;
+    let elem_ty_v = elem_ty.v;
+    if elem_ty_v != 0u32 && (ctx.thir as usize) != 0 {
+        let sz = unsafe { type_size(TypeId { v: elem_ty_v }, view((*ctx.thir).interner)) };
+        if sz == 1u32 || sz == 2u32 || sz == 4u32 || sz == 8u32 {
+            elem_size = sz;
+        }
+    }
+
+    let mut host_ptr: *mut u8 = 0 as *mut u8;
+    if op_tk == TY_VIEW || op_tk == TY_MUT_VIEW || op_tk == TY_PTR {
+        let addr = eval_operand_u64_raw(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op) });
+        if addr == 0u64 || op_tk == TY_PTR || (addr >= INTERP_SYNTH_BASE_RUNTIME && addr < ctx.next_synth_addr) {
+            host_ptr = interp_validate_raw_ptr(mut_view(*ctx), addr, elem_size as u64, elem_size);
+        } else {
+            host_ptr = interp_resolve_synth_ptr(mut_view(*ctx), addr);
+            if elem_size > 1u32 && ((host_ptr as usize) % (elem_size as usize)) != 0 {
+                interp_report_ub(mut_view(*ctx), INTERP_MSG_UB_MISALIGNED);
+            }
+        }
+    } else if (unsafe { (*stmt).rvalue.use_op.kind }) != MIR_OP_CONST {
+        let mut p_ty = TypeId { v: 0u32 };
+        let mut p_len: u64 = 0u64;
+        host_ptr = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.use_op.place) }, mut_view(p_ty), mut_view(p_len));
+    }
+
+    if ctx.failed || (host_ptr as usize) == 0 {
+        return false;
+    }
+
+    if aop == MIR_ATOMIC_LOAD {
+        let v = oracle_atomic_load(mut_view(*ctx), host_ptr, elem_size, ord);
+        if !ctx.failed {
+            let mut dest_ty = TypeId { v: 0u32 };
+            let mut dummy_len: u64 = 0u64;
+            let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
+            write_scalar_to_ptr(dest, elem_size, v);
+        }
+        return false;
+    }
+
+    if aop == MIR_ATOMIC_STORE {
+        let v = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.lhs) });
+        if !ctx.failed {
+            oracle_atomic_store(mut_view(*ctx), host_ptr, elem_size, v, ord);
+        }
+        return false;
+    }
+
+    if aop >= MIR_ATOMIC_SWAP && aop <= MIR_ATOMIC_XOR {
+        let rhs = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.lhs) });
+        if !ctx.failed {
+            let old_v = oracle_atomic_rmw(mut_view(*ctx), host_ptr, elem_size, aop, rhs, ord);
+            if !ctx.failed {
+                let mut dest_ty = TypeId { v: 0u32 };
+                let mut dummy_len: u64 = 0u64;
+                let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
+                write_scalar_to_ptr(dest, elem_size, old_v);
+            }
+        }
+        return false;
+    }
+
+    if aop == MIR_ATOMIC_CMPXCHG || aop == MIR_ATOMIC_CMPXCHG_WEAK {
+        let exp_v = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.lhs) });
+        let des_v = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.rhs) });
+        if !ctx.failed {
+            let mut cas_ok = false;
+            let is_weak = aop == MIR_ATOMIC_CMPXCHG_WEAK;
+            let old_v = oracle_atomic_cmpxchg(
+                mut_view(*ctx),
+                host_ptr,
+                elem_size,
+                exp_v,
+                des_v,
+                ord,
+                fail_ord,
+                is_weak,
+                mut_view(cas_ok)
+            );
+            if !ctx.failed {
+                let mut dest_ty = TypeId { v: 0u32 };
+                let mut dummy_len: u64 = 0u64;
+                let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
+                let dest_ty_v = dest_ty.v;
+                let mut is_cas_struct = false;
+                if dest_ty_v != 0u32 && (ctx.thir as usize) != 0 {
+                    let dt = unsafe { type_get(view((*ctx.thir).interner), TypeId { v: dest_ty_v }) };
+                    if (dt as usize) != 0 {
+                        let dtk = unsafe { (*dt).kind };
+                        if dtk == TY_STRUCT || dtk == TY_TUPLE {
+                            is_cas_struct = true;
+                        }
+                    }
+                }
+                if is_cas_struct {
+                    let ok_off = unsafe { type_field_offset(TypeId { v: dest_ty_v }, 0, view((*ctx.thir).interner)) };
+                    let val_off = unsafe { type_field_offset(TypeId { v: dest_ty_v }, 1, view((*ctx.thir).interner)) };
+                    unsafe {
+                        *(dest + (ok_off as usize)) = if cas_ok { 1u8 } else { 0u8 };
+                    }
+                    write_scalar_to_ptr(unsafe { dest + (val_off as usize) }, elem_size, old_v);
+                } else {
+                    write_scalar_to_ptr(dest, elem_size, old_v);
+                }
+            }
+        }
+        return false;
+    }
+
+    false
+}
+
 // =================================================================================================
 // Builtin Call Terminator Dispatch
 // =================================================================================================
@@ -1984,6 +2291,682 @@ fn exec_builtin_call(
 }
 
 // =================================================================================================
+// Single Statement Execution, Thread Classification & Concurrent Scheduler
+// =================================================================================================
+
+fn exec_single_mir_stmt(
+    ctx: mut_view<InterpCtx>,
+    frame: view<CallFrame>,
+    body: *mut MirBody,
+    stmt: *mut MirStmt,
+    out_yield: mut_view<bool>,
+    out_spin: mut_view<bool>
+) {
+    *out_yield = false;
+    *out_spin = false;
+    let loc_sp = Span {
+        file: FileId { v: unsafe { (*stmt).location.file.v } },
+        start: unsafe { (*stmt).location.start },
+        end: unsafe { (*stmt).location.end },
+    };
+    if loc_sp.file.v != 0u32 || loc_sp.start != 0u32 || loc_sp.end != 0u32 {
+        ctx.current_span = loc_sp;
+    } else {
+        ctx.current_span = Span {
+            file: FileId { v: unsafe { (*stmt).span.file.v } },
+            start: unsafe { (*stmt).span.start },
+            end: unsafe { (*stmt).span.end },
+        };
+    }
+
+    let local_count = unsafe { (*body).local_count };
+    let sk = unsafe { (*stmt).kind };
+    if sk == MIR_STMT_ATOMIC {
+        *out_spin = exec_atomic_stmt(mut_view(*ctx), frame, stmt);
+        *out_yield = true;
+        return;
+    }
+    if sk == MIR_STMT_ASSIGN {
+        let place_loc_v = unsafe { (*stmt).place.local.v as usize };
+        let mut is_const_local = false;
+        if place_loc_v < local_count {
+            let ldecl = unsafe { mir_local_at((*body).locals, place_loc_v) };
+            if (unsafe { (*ldecl).kind }) == MIR_LOCAL_CONST {
+                is_const_local = true;
+            }
+        }
+        if !is_const_local {
+            let rvk = unsafe { (*stmt).rvalue.kind };
+            if (unsafe { (*stmt).place.proj_count }) > 0 && rvk != MIR_RVALUE_REF {
+                *out_yield = true;
+            }
+            if rvk == MIR_RVALUE_USE {
+                exec_assign_use(mut_view(*ctx), frame, stmt);
+            } else if rvk == MIR_RVALUE_AGGREGATE {
+                exec_assign_aggregate(mut_view(*ctx), frame, stmt);
+            } else if rvk == MIR_RVALUE_REPEAT {
+                exec_assign_repeat(mut_view(*ctx), frame, stmt);
+            } else if rvk == MIR_RVALUE_REF {
+                exec_assign_ref(mut_view(*ctx), frame, stmt);
+            } else if rvk == MIR_RVALUE_LEN {
+                exec_assign_len(mut_view(*ctx), frame, stmt);
+            } else {
+                let mut val: u64 = 0u64;
+                if rvk == MIR_RVALUE_DISCRIMINANT {
+                    let mut src_ty = TypeId { v: 0u32 };
+                    let mut src_len: u64 = 0u64;
+                    let src = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).rvalue.place) }, mut_view(src_ty), mut_view(src_len));
+                    let ty = unsafe { type_get(view((*ctx.thir).interner), src_ty) };
+                    if (ty as usize) != 0 && (unsafe { (*ty).kind }) == TY_ENUM {
+                        val = unsafe { *(src as *const u32) as u64 };
+                    }
+                } else if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
+                    val = exec_assign_binop(mut_view(*ctx), frame, stmt);
+                } else if rvk == MIR_RVALUE_UNARY_OP {
+                    val = exec_assign_unop(mut_view(*ctx), frame, stmt);
+                } else if rvk == MIR_RVALUE_CAST {
+                    val = exec_assign_cast(mut_view(*ctx), frame, stmt);
+                }
+                if !ctx.failed {
+                    let mut dest_ty = TypeId { v: 0u32 };
+                    let mut dummy_len: u64 = 0u64;
+                    let dest = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
+                    let dest_size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
+                    if (unsafe { (*stmt).place.proj_count }) > 0 || oracle_has_active_atomic_at(view(*ctx), dest as *const u8, dest_size) {
+                        oracle_record_ordinary_write(mut_view(*ctx), dest as *const u8, dest_size);
+                    }
+                    if !ctx.failed {
+                        write_scalar_to_ptr(dest, dest_size, val);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Prefix bytes for thread classification:
+//   0..6:   "thread"
+//   6..12:  "worker"
+//   12..20: "producer"
+//   20..28: "consumer"
+//   28..34: "writer"
+//   34..40: "reader"
+//   40..55: "oracle_set_seed"
+//   55..70: "oracle_join_all"
+const INTERP_THREAD_PREFIX_BYTES: [70]u8 = [
+    116u8, 104u8, 114u8, 101u8, 97u8, 100u8,
+    119u8, 111u8, 114u8, 107u8, 101u8, 114u8,
+    112u8, 114u8, 111u8, 100u8, 117u8, 99u8, 101u8, 114u8,
+    99u8, 111u8, 110u8, 115u8, 117u8, 109u8, 101u8, 114u8,
+    119u8, 114u8, 105u8, 116u8, 101u8, 114u8,
+    114u8, 101u8, 97u8, 100u8, 101u8, 114u8,
+    111u8, 114u8, 97u8, 99u8, 108u8, 101u8, 95u8, 115u8, 101u8, 116u8, 95u8, 115u8, 101u8, 101u8, 100u8,
+    111u8, 114u8, 97u8, 99u8, 108u8, 101u8, 95u8, 106u8, 111u8, 105u8, 110u8, 95u8, 97u8, 108u8, 108u8,
+];
+
+fn sv_has_prefix(sv: view<StrView>, off: usize, plen: usize) -> bool {
+    let slen = sv.len;
+    if slen < plen || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < plen {
+        let b = unsafe { *(sv.ptr + i) };
+        if b != INTERP_THREAD_PREFIX_BYTES[off + i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn sv_first_digit(sv: view<StrView>, start_idx: usize) -> i32 {
+    let mut i: usize = start_idx;
+    while i < sv.len {
+        let b = unsafe { *(sv.ptr + i) };
+        if b >= 48u8 && b <= 57u8 {
+            return (b - 48u8) as i32;
+        }
+        i = i + 1;
+    }
+    -1
+}
+
+pub fn interp_classify_thread_fn(ctx: view<InterpCtx>, callee: *mut HirItem) -> u32 {
+    if (callee as usize) == 0 || (ctx.interner as usize) == 0 {
+        return 0u32;
+    }
+    let name_id = unsafe { (*callee).name.v };
+    if name_id == 0u32 {
+        return 0u32;
+    }
+    let sv = unsafe { interner_get(view(*ctx.interner), StrId { v: name_id }) };
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return 0u32;
+    }
+    if sv.len == 15 && sv_has_prefix(view(sv), 40, 15) {
+        return 0xFFFFFFFEu32;
+    }
+    if sv.len == 15 && sv_has_prefix(view(sv), 55, 15) {
+        return 0xFFFFFFFDu32;
+    }
+    if sv_has_prefix(view(sv), 0, 6) {
+        let d = sv_first_digit(view(sv), 6);
+        if d >= 0 && d < 15 {
+            return (d as u32) + 1u32;
+        }
+        return 1u32;
+    }
+    if sv_has_prefix(view(sv), 6, 6) {
+        let d = sv_first_digit(view(sv), 6);
+        if d >= 0 && d < 15 {
+            return (d as u32) + 1u32;
+        }
+        return 1u32;
+    }
+    if sv_has_prefix(view(sv), 12, 8) {
+        return 1u32;
+    }
+    if sv_has_prefix(view(sv), 20, 8) {
+        return 2u32;
+    }
+    if sv_has_prefix(view(sv), 28, 6) {
+        let d = sv_first_digit(view(sv), 6);
+        if d >= 0 && d < 14 {
+            return (d as u32) + 1u32;
+        }
+        return 1u32;
+    }
+    if sv_has_prefix(view(sv), 34, 6) {
+        let d = sv_first_digit(view(sv), 6);
+        if d >= 0 && d < 14 {
+            return (d as u32) + 2u32;
+        }
+        return 2u32;
+    }
+    if sv.len >= 2 {
+        let b0 = unsafe { *(sv.ptr + 0) };
+        let b1 = unsafe { *(sv.ptr + 1) };
+        if b0 == 116u8 && b1 >= 48u8 && b1 <= 55u8 {
+            if sv.len == 2 || (unsafe { *(sv.ptr + 2) }) == 95u8 {
+                return ((b1 - 48u8) as u32) + 1u32;
+            }
+        }
+    }
+    0u32
+}
+
+fn prepare_call_args_from_term(
+    ctx: mut_view<InterpCtx>,
+    frame: view<CallFrame>,
+    term: *mut MirTerminator,
+    callee: *mut HirItem,
+    out_total_args: mut_view<usize>,
+    out_args_bytes: mut_view<usize>
+) -> *mut InterpValue {
+    let mut callee_param_count: usize = 0;
+    let mut p: *mut HirParam = unsafe { (*callee).params };
+    while (p as usize) != 0 {
+        callee_param_count = callee_param_count + 1;
+        p = unsafe { (*p).next };
+    }
+    let term_arg_count = unsafe { (*term).arg_count };
+    let total_args: usize = if callee_param_count > term_arg_count { callee_param_count } else { term_arg_count };
+    let cap_count: usize = if callee_param_count > term_arg_count { callee_param_count - term_arg_count } else { 0 };
+    let alloc_args: usize = if total_args > 0 { total_args } else { 1 };
+    let args_bytes = interp_mul_usize(alloc_args, size_of<InterpValue>());
+    let call_args = unsafe { heap_alloc(args_bytes, align_of<InterpValue>()) as *mut InterpValue };
+    unsafe {
+        interp_zero_bytes(call_args as *mut u8, args_bytes);
+    }
+    *out_total_args = total_args;
+    *out_args_bytes = args_bytes;
+
+    if cap_count > 0 && (unsafe { (*term).func.kind }) != MIR_OP_CONST {
+        let mut func_ty = TypeId { v: 0u32 };
+        let mut func_len: u64 = 0u64;
+        let closure_ptr = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*term).func.place) }, mut_view(func_ty), mut_view(func_len));
+        let mut offset: u32 = 8u32;
+        let mut cp: *mut HirParam = unsafe { (*callee).params };
+        let mut c: usize = 0;
+        while c < cap_count && (cp as usize) != 0 {
+            let pty = unsafe { thir_get_param_type(view(*ctx.thir), cp as *const HirParam) };
+            let cap_field_ty_v: u32 = if (pty as usize) != 0 {
+                unsafe { (*pty).v }
+            } else {
+                unsafe { (*ctx.thir).interner.t_u64.v }
+            };
+            let a = unsafe { type_align(TypeId { v: cap_field_ty_v }, view((*ctx.thir).interner)) };
+            let s = unsafe { type_size(TypeId { v: cap_field_ty_v }, view((*ctx.thir).interner)) };
+            if a > 0u32 {
+                let mask = a - 1u32;
+                offset = (offset + mask) & (mask ^ 0xFFFFFFFFu32);
+            }
+            let copy_s: usize = if s > 0u32 { s as usize } else { 8 };
+            let dst_arg = unsafe { interp_val_at(call_args, c) as *mut u8 };
+            let src_cap = unsafe { closure_ptr + (offset as usize) };
+            unsafe {
+                interp_copy_bytes(dst_arg, src_cap as *const u8, copy_s);
+            }
+            offset = offset + (copy_s as u32);
+            c = c + 1;
+            cp = unsafe { (*cp).next };
+        }
+    }
+
+    let term_args = unsafe { (*term).args };
+    let mut a_idx: usize = 0;
+    while a_idx < term_arg_count {
+        let arg_op = unsafe { mir_op_at(term_args, a_idx) };
+        let dst_slot = unsafe { interp_val_at(call_args, cap_count + a_idx) };
+        if (unsafe { (*arg_op).kind }) == MIR_OP_CONST {
+            unsafe {
+                eval_operand(mut_view(*ctx), frame, view(*arg_op), mut_view(*dst_slot));
+            }
+        } else {
+            let mut src_ty = TypeId { v: 0u32 };
+            let mut src_len: u64 = 0u64;
+            let src = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*arg_op).place) }, mut_view(src_ty), mut_view(src_len));
+            let mut s_sz = unsafe { type_size(src_ty, view((*ctx.thir).interner)) as usize };
+            if s_sz > size_of<InterpValue>() {
+                s_sz = size_of<InterpValue>();
+            }
+            if s_sz > 0 {
+                unsafe {
+                    interp_copy_bytes(dst_slot as *mut u8, src as *const u8, s_sz);
+                }
+            }
+        }
+        a_idx = a_idx + 1;
+    }
+    call_args
+}
+
+fn exec_task_terminator(
+    ctx: mut_view<InterpCtx>,
+    frame: view<CallFrame>,
+    current_bb: MirBbId,
+    term: *mut MirTerminator,
+    out_next_bb: mut_view<MirBbId>,
+    out_done: mut_view<bool>,
+    out_back_edge: mut_view<bool>
+) {
+    *out_done = false;
+    *out_back_edge = false;
+    let tloc = Span {
+        file: FileId { v: unsafe { (*term).location.file.v } },
+        start: unsafe { (*term).location.start },
+        end: unsafe { (*term).location.end },
+    };
+    if tloc.file.v != 0u32 || tloc.start != 0u32 || tloc.end != 0u32 {
+        ctx.current_span = tloc;
+    } else {
+        ctx.current_span = Span {
+            file: FileId { v: unsafe { (*term).span.file.v } },
+            start: unsafe { (*term).span.start },
+            end: unsafe { (*term).span.end },
+        };
+    }
+
+    let tk = unsafe { (*term).kind };
+    if tk == MIR_TERM_GOTO {
+        let tgt = MirBbId { v: unsafe { (*term).goto_target.v } };
+        if tgt.v <= current_bb.v {
+            *out_back_edge = true;
+        }
+        *out_next_bb = tgt;
+    } else if tk == MIR_TERM_ASSERT {
+        let cond = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*term).cond) });
+        let expected = unsafe { (*term).expected };
+        if (cond != 0u64) != expected {
+            let msg_ptr = unsafe { (*term).msg_ptr };
+            let msg_len = unsafe { (*term).msg_len };
+            if (msg_ptr as usize) != 0 && msg_len > 0 {
+                interp_panic_sv(mut_view(*ctx), StrView { ptr: msg_ptr, len: msg_len });
+            } else {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_ASSERT);
+            }
+            *out_done = true;
+            return;
+        }
+        *out_next_bb = MirBbId { v: unsafe { (*term).assert_target.v } };
+    } else if tk == MIR_TERM_RETURN {
+        *out_done = true;
+    } else if tk == MIR_TERM_DROP {
+        *out_next_bb = MirBbId { v: unsafe { (*term).drop_target.v } };
+    } else if tk == MIR_TERM_SWITCH_INT {
+        let discr = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*term).discr) });
+        let mut next = MirBbId { v: unsafe { (*term).otherwise.v } };
+        let scount = unsafe { (*term).switch_count };
+        let svals = unsafe { (*term).values };
+        let stargets = unsafe { (*term).targets };
+        let mut s: usize = 0;
+        while s < scount {
+            let sv = unsafe { *mir_u64_at(svals, s) };
+            if discr == sv {
+                let st = unsafe { mir_bb_id_at(stargets, s) };
+                next = MirBbId { v: unsafe { (*st).v } };
+                break;
+            }
+            s = s + 1;
+        }
+        if next.v <= current_bb.v {
+            *out_back_edge = true;
+        }
+        *out_next_bb = next;
+    } else if tk == MIR_TERM_CALL {
+        let mut handled_builtin = false;
+        let mut next_bb = MirBbId { v: 0u32 };
+        if (unsafe { (*term).func.kind }) == MIR_OP_CONST {
+            let fty_id = TypeId { v: unsafe { (*term).func.constant.ty.v } };
+            if fty_id.v != 0u32 && (ctx.thir as usize) != 0 {
+                let ft = unsafe { type_get(view((*ctx.thir).interner), fty_id) };
+                if (ft as usize) != 0 {
+                    let ftk = unsafe { (*ft).kind };
+                    handled_builtin = exec_builtin_call(mut_view(*ctx), frame, term, ftk, mut_view(next_bb));
+                }
+            }
+        }
+        if handled_builtin {
+            *out_next_bb = next_bb;
+        } else {
+            let func_val = eval_operand_u64(mut_view(*ctx), frame, unsafe { view((*term).func) });
+            let callee = find_func_by_symbol(view(*ctx), func_val);
+            if (callee as usize) == 0 {
+                interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNRESOLVED_CALL);
+                *out_done = true;
+                return;
+            }
+            let mut total_args: usize = 0;
+            let mut args_bytes: usize = 0;
+            let call_args = prepare_call_args_from_term(mut_view(*ctx), frame, term, callee, mut_view(total_args), mut_view(args_bytes));
+            let mut dest_ty = TypeId { v: 0u32 };
+            let mut dest_len: u64 = 0u64;
+            let dest_ptr = get_place_ptr(mut_view(*ctx), frame, unsafe { view((*term).destination) }, mut_view(dest_ty), mut_view(dest_len));
+            let dest_sz = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) as usize };
+            let ret_alloc_sz: usize = if dest_sz > size_of<InterpValue>() { dest_sz } else { size_of<InterpValue>() };
+            let big_ret = unsafe { heap_alloc(ret_alloc_sz, 16) };
+            unsafe {
+                interp_zero_bytes(big_ret, ret_alloc_sz);
+            }
+            eval_call_into(mut_view(*ctx), callee, call_args, total_args, big_ret, ret_alloc_sz);
+            unsafe {
+                heap_free(call_args as *mut u8, args_bytes, align_of<InterpValue>());
+            }
+            if !ctx.failed && dest_sz > 0 && (dest_ptr as usize) != 0 {
+                unsafe {
+                    interp_copy_bytes(dest_ptr, big_ret as *const u8, dest_sz);
+                }
+            }
+            unsafe {
+                heap_free(big_ret, ret_alloc_sz, 16);
+            }
+            if ctx.failed {
+                *out_done = true;
+                return;
+            }
+            *out_next_bb = MirBbId { v: unsafe { (*term).call_target.v } };
+        }
+    } else if tk == MIR_TERM_UNREACHABLE {
+        interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNREACHABLE);
+        *out_done = true;
+    } else {
+        interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNSUPPORTED_TERM);
+        *out_done = true;
+    }
+}
+
+fn bb_is_pairable_thread_call(
+    ctx: view<InterpCtx>,
+    body: *mut MirBody,
+    bb_id: MirBbId,
+    tid0: u32,
+    out_callee1: mut_view<*mut HirItem>,
+    out_tid1: mut_view<u32>
+) -> bool {
+    *out_callee1 = 0 as *mut HirItem;
+    *out_tid1 = 0u32;
+    let bb_count = unsafe { (*body).bb_count };
+    if (bb_id.v as usize) >= bb_count {
+        return false;
+    }
+    let bb = unsafe { mir_bb_at((*body).bbs, bb_id.v as usize) };
+    let term = mir_bb_term_mut(bb);
+    if (unsafe { (*term).kind }) != MIR_TERM_CALL {
+        return false;
+    }
+    if (unsafe { (*term).func.kind }) != MIR_OP_CONST {
+        return false;
+    }
+    let sym_v = unsafe { (*term).func.constant.val };
+    let callee1 = find_func_by_symbol(ctx, sym_v);
+    if (callee1 as usize) == 0 {
+        return false;
+    }
+    let tid1 = interp_classify_thread_fn(ctx, callee1);
+    if tid1 < 1u32 || tid1 >= 16u32 || tid1 == tid0 {
+        return false;
+    }
+    let scount = unsafe { (*bb).stmt_count };
+    let stmts = unsafe { (*bb).stmts };
+    let mut i: usize = 0;
+    while i < scount {
+        let s = unsafe { mir_stmt_at(stmts, i) };
+        if (unsafe { (*s).kind }) != MIR_STMT_ASSIGN {
+            return false;
+        }
+        if (unsafe { (*s).place.proj_count }) != 0 {
+            return false;
+        }
+        let rvk = unsafe { (*s).rvalue.kind };
+        if rvk != MIR_RVALUE_USE && rvk != MIR_RVALUE_REF && rvk != MIR_RVALUE_CAST {
+            return false;
+        }
+        if (rvk == MIR_RVALUE_USE || rvk == MIR_RVALUE_CAST) && (unsafe { (*s).rvalue.lhs.kind }) != MIR_OP_CONST {
+            if (unsafe { (*s).rvalue.lhs.place.proj_count }) != 0 {
+                return false;
+            }
+        }
+        if rvk == MIR_RVALUE_REF {
+            let pcount = unsafe { (*s).rvalue.place.proj_count };
+            let projs = unsafe { (*s).rvalue.place.projs };
+            let mut p_idx: usize = 0;
+            while p_idx < pcount {
+                let pr = unsafe { mir_proj_at(projs, p_idx) };
+                if (unsafe { (*pr).kind }) == MIR_PROJ_DEREF {
+                    return false;
+                }
+                p_idx = p_idx + 1;
+            }
+        }
+        i = i + 1;
+    }
+    *out_callee1 = callee1;
+    *out_tid1 = tid1;
+    true
+}
+
+fn exec_concurrent_pair(
+    ctx: mut_view<InterpCtx>,
+    callee0: *mut HirItem,
+    tid0: u32,
+    args0: *mut InterpValue,
+    arg_count0: usize,
+    dest_ptr0: *mut u8,
+    dest_sz0: usize,
+    callee1: *mut HirItem,
+    tid1: u32,
+    args1: *mut InterpValue,
+    arg_count1: usize,
+    dest_ptr1: *mut u8,
+    dest_sz1: usize
+) {
+    let body0 = resolve_or_build_mir_body(mut_view(*ctx), callee0);
+    let body1 = resolve_or_build_mir_body(mut_view(*ctx), callee1);
+    if (body0 as usize) == 0 || (body1 as usize) == 0 {
+        interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNRESOLVED_CALL);
+        return;
+    }
+
+    let mask_both = (1u32 << tid0) | (1u32 << tid1);
+    if ctx.oracle.active_thread_mask == 1u32 || (ctx.oracle.active_thread_mask & mask_both) != 0u32 {
+        if ctx.oracle.active_thread_mask > 1u32 {
+            oracle_join_threads(mut_view(*ctx));
+        }
+        oracle_begin_concurrent_batch(mut_view(*ctx));
+    }
+    oracle_fork_thread_for_batch(mut_view(*ctx), tid0, callee0 as usize);
+    oracle_fork_thread_for_batch(mut_view(*ctx), tid1, callee1 as usize);
+
+    ctx.call_depth = ctx.call_depth + 1;
+    let prev_storage = ctx.oracle.current_frame_storage;
+    let prev_storage_size = ctx.oracle.current_frame_storage_size;
+    let prev_tid = ctx.oracle.current_tid;
+
+    let mut frame0 = CallFrame {
+        body: 0 as *mut MirBody,
+        local_ptrs: 0 as *mut *mut u8,
+        storage: 0 as *mut u8,
+        storage_size: 0,
+        local_cap: 0,
+    };
+    let mut frame1 = CallFrame {
+        body: 0 as *mut MirBody,
+        local_ptrs: 0 as *mut *mut u8,
+        storage: 0 as *mut u8,
+        storage_size: 0,
+        local_cap: 0,
+    };
+
+    let alloc_start0 = frame_init(mut_view(*ctx), mut_view(frame0), body0, args0, arg_count0);
+    let alloc_start1 = frame_init(mut_view(*ctx), mut_view(frame1), body1, args1, arg_count1);
+    let bb_count0 = unsafe { (*body0).bb_count };
+    let bb_count1 = unsafe { (*body1).bb_count };
+
+    let mut bb0 = MirBbId { v: 0u32 };
+    let mut bb1 = MirBbId { v: 0u32 };
+    let mut stmt_idx0: usize = 0;
+    let mut stmt_idx1: usize = 0;
+    let mut done0 = false;
+    let mut done1 = false;
+    let mut prefer_other: i32 = -1;
+
+    while !ctx.failed && (!done0 || !done1) {
+        ctx.steps = ctx.steps + 1;
+        if ctx.step_limit > 0 && ctx.steps >= ctx.step_limit {
+            interp_check_step_limit(mut_view(*ctx));
+            break;
+        }
+
+        let mut pick: i32 = 0;
+        if done0 {
+            pick = 1;
+        } else if done1 {
+            pick = 0;
+        } else if prefer_other == 0 {
+            pick = 1;
+            prefer_other = -1;
+        } else if prefer_other == 1 {
+            pick = 0;
+            prefer_other = -1;
+        } else {
+            let rnd = oracle_next_prng(mut_view(*ctx));
+            pick = if (rnd & 1u64) == 0u64 { 0 } else { 1 };
+        }
+
+        if pick == 0 {
+            ctx.oracle.current_tid = tid0;
+            ctx.oracle.current_frame_storage = frame0.storage;
+            ctx.oracle.current_frame_storage_size = frame0.storage_size;
+            if (bb0.v as usize) >= bb_count0 {
+                done0 = true;
+            } else {
+                let bb_ptr = unsafe { mir_bb_at((*body0).bbs, bb0.v as usize) };
+                let scount = unsafe { (*bb_ptr).stmt_count };
+                let stmts = unsafe { (*bb_ptr).stmts };
+                let mut yielded = false;
+                while stmt_idx0 < scount && !ctx.failed && !yielded {
+                    ctx.steps = ctx.steps + 1;
+                    if ctx.step_limit > 0 && ctx.steps >= ctx.step_limit {
+                        interp_check_step_limit(mut_view(*ctx));
+                        break;
+                    }
+                    let stmt = unsafe { mir_stmt_at(stmts, stmt_idx0) };
+                    let mut sp_hint = false;
+                    exec_single_mir_stmt(mut_view(*ctx), view(frame0), body0, stmt, mut_view(yielded), mut_view(sp_hint));
+                    stmt_idx0 = stmt_idx0 + 1;
+                    if sp_hint {
+                        prefer_other = 0;
+                    }
+                }
+                if !ctx.failed && stmt_idx0 >= scount {
+                    let term = mir_bb_term_mut(bb_ptr);
+                    let mut next_bb = MirBbId { v: bb0.v };
+                    let mut term_done = false;
+                    let mut back_edge = false;
+                    exec_task_terminator(mut_view(*ctx), view(frame0), MirBbId { v: bb0.v }, term, mut_view(next_bb), mut_view(term_done), mut_view(back_edge));
+                    bb0 = next_bb;
+                    stmt_idx0 = 0;
+                    if term_done {
+                        done0 = true;
+                    } else if back_edge {
+                        prefer_other = 0;
+                    }
+                }
+            }
+        } else {
+            ctx.oracle.current_tid = tid1;
+            ctx.oracle.current_frame_storage = frame1.storage;
+            ctx.oracle.current_frame_storage_size = frame1.storage_size;
+            if (bb1.v as usize) >= bb_count1 {
+                done1 = true;
+            } else {
+                let bb_ptr = unsafe { mir_bb_at((*body1).bbs, bb1.v as usize) };
+                let scount = unsafe { (*bb_ptr).stmt_count };
+                let stmts = unsafe { (*bb_ptr).stmts };
+                let mut yielded = false;
+                while stmt_idx1 < scount && !ctx.failed && !yielded {
+                    ctx.steps = ctx.steps + 1;
+                    if ctx.step_limit > 0 && ctx.steps >= ctx.step_limit {
+                        interp_check_step_limit(mut_view(*ctx));
+                        break;
+                    }
+                    let stmt = unsafe { mir_stmt_at(stmts, stmt_idx1) };
+                    let mut sp_hint = false;
+                    exec_single_mir_stmt(mut_view(*ctx), view(frame1), body1, stmt, mut_view(yielded), mut_view(sp_hint));
+                    stmt_idx1 = stmt_idx1 + 1;
+                    if sp_hint {
+                        prefer_other = 1;
+                    }
+                }
+                if !ctx.failed && stmt_idx1 >= scount {
+                    let term = mir_bb_term_mut(bb_ptr);
+                    let mut next_bb = MirBbId { v: bb1.v };
+                    let mut term_done = false;
+                    let mut back_edge = false;
+                    exec_task_terminator(mut_view(*ctx), view(frame1), MirBbId { v: bb1.v }, term, mut_view(next_bb), mut_view(term_done), mut_view(back_edge));
+                    bb1 = next_bb;
+                    stmt_idx1 = 0;
+                    if term_done {
+                        done1 = true;
+                    } else if back_edge {
+                        prefer_other = 1;
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = alloc_start1;
+    frame_cleanup(mut_view(*ctx), mut_view(frame1), alloc_start1, dest_ptr1, dest_sz1);
+    frame_cleanup(mut_view(*ctx), mut_view(frame0), alloc_start0, dest_ptr0, dest_sz0);
+    ctx.call_depth = ctx.call_depth - 1;
+    ctx.oracle.current_frame_storage = prev_storage;
+    ctx.oracle.current_frame_storage_size = prev_storage_size;
+    ctx.oracle.current_tid = prev_tid;
+}
+
+// =================================================================================================
 // MIR Body Execution Loop
 // =================================================================================================
 
@@ -2006,8 +2989,11 @@ pub fn exec_mir_body(
         local_cap: 0,
     };
     let alloc_start = frame_init(mut_view(*ctx), mut_view(frame), body, args_raw, arg_count);
+    let prev_frame_storage = ctx.oracle.current_frame_storage;
+    let prev_frame_storage_size = ctx.oracle.current_frame_storage_size;
+    ctx.oracle.current_frame_storage = frame.storage;
+    ctx.oracle.current_frame_storage_size = frame.storage_size;
     let bb_count = unsafe { (*body).bb_count };
-    let local_count = unsafe { (*body).local_count };
     let mut current_bb = MirBbId { v: 0u32 };
 
     while !ctx.failed {
@@ -2018,6 +3004,17 @@ pub fn exec_mir_body(
         }
         if (current_bb.v as usize) >= bb_count {
             break;
+        }
+        ctx.oracle.current_frame_storage = frame.storage;
+        ctx.oracle.current_frame_storage_size = frame.storage_size;
+
+        if ctx.oracle.current_tid == 0u32 && ctx.oracle.active_thread_mask > 1u32 {
+            let mut next_c: *mut HirItem = 0 as *mut HirItem;
+            let mut next_t: u32 = 0u32;
+            let cur_bb_copy = MirBbId { v: current_bb.v };
+            if !bb_is_pairable_thread_call(view(*ctx), body, cur_bb_copy, 0u32, mut_view(next_c), mut_view(next_t)) {
+                oracle_join_threads(mut_view(*ctx));
+            }
         }
 
         let bb = unsafe { mir_bb_at((*body).bbs, current_bb.v as usize) };
@@ -2031,70 +3028,9 @@ pub fn exec_mir_body(
                 break;
             }
             let stmt = unsafe { mir_stmt_at(stmts, i) };
-            let loc_sp = Span {
-                file: FileId { v: unsafe { (*stmt).location.file.v } },
-                start: unsafe { (*stmt).location.start },
-                end: unsafe { (*stmt).location.end },
-            };
-            if loc_sp.file.v != 0u32 || loc_sp.start != 0u32 || loc_sp.end != 0u32 {
-                ctx.current_span = loc_sp;
-            } else {
-                ctx.current_span = Span {
-                    file: FileId { v: unsafe { (*stmt).span.file.v } },
-                    start: unsafe { (*stmt).span.start },
-                    end: unsafe { (*stmt).span.end },
-                };
-            }
-
-            let sk = unsafe { (*stmt).kind };
-            if sk == MIR_STMT_ASSIGN {
-                let place_loc_v = unsafe { (*stmt).place.local.v as usize };
-                let mut is_const_local = false;
-                if place_loc_v < local_count {
-                    let ldecl = unsafe { mir_local_at((*body).locals, place_loc_v) };
-                    if (unsafe { (*ldecl).kind }) == MIR_LOCAL_CONST {
-                        is_const_local = true;
-                    }
-                }
-                if !is_const_local {
-                    let rvk = unsafe { (*stmt).rvalue.kind };
-                    if rvk == MIR_RVALUE_USE {
-                        exec_assign_use(mut_view(*ctx), view(frame), stmt);
-                    } else if rvk == MIR_RVALUE_AGGREGATE {
-                        exec_assign_aggregate(mut_view(*ctx), view(frame), stmt);
-                    } else if rvk == MIR_RVALUE_REPEAT {
-                        exec_assign_repeat(mut_view(*ctx), view(frame), stmt);
-                    } else if rvk == MIR_RVALUE_REF {
-                        exec_assign_ref(mut_view(*ctx), view(frame), stmt);
-                    } else if rvk == MIR_RVALUE_LEN {
-                        exec_assign_len(mut_view(*ctx), view(frame), stmt);
-                    } else {
-                        let mut val: u64 = 0u64;
-                        if rvk == MIR_RVALUE_DISCRIMINANT {
-                            let mut src_ty = TypeId { v: 0u32 };
-                            let mut src_len: u64 = 0u64;
-                            let src = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*stmt).rvalue.place) }, mut_view(src_ty), mut_view(src_len));
-                            let ty = unsafe { type_get(view((*ctx.thir).interner), src_ty) };
-                            if (ty as usize) != 0 && (unsafe { (*ty).kind }) == TY_ENUM {
-                                val = unsafe { *(src as *const u32) as u64 };
-                            }
-                        } else if rvk == MIR_RVALUE_BINARY_OP || rvk == MIR_RVALUE_OVERFLOWS_BINARY_OP {
-                            val = exec_assign_binop(mut_view(*ctx), view(frame), stmt);
-                        } else if rvk == MIR_RVALUE_UNARY_OP {
-                            val = exec_assign_unop(mut_view(*ctx), view(frame), stmt);
-                        } else if rvk == MIR_RVALUE_CAST {
-                            val = exec_assign_cast(mut_view(*ctx), view(frame), stmt);
-                        }
-                        if !ctx.failed {
-                            let mut dest_ty = TypeId { v: 0u32 };
-                            let mut dummy_len: u64 = 0u64;
-                            let dest = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*stmt).place) }, mut_view(dest_ty), mut_view(dummy_len));
-                            let dest_size = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) };
-                            write_scalar_to_ptr(dest, dest_size, val);
-                        }
-                    }
-                }
-            }
+            let mut dummy_yield = false;
+            let mut dummy_spin = false;
+            exec_single_mir_stmt(mut_view(*ctx), view(frame), body, stmt, mut_view(dummy_yield), mut_view(dummy_spin));
             if ctx.failed {
                 break;
             }
@@ -2199,111 +3135,134 @@ pub fn exec_mir_body(
                     break;
                 }
 
-                let mut callee_param_count: usize = 0;
-                let mut p: *mut HirParam = unsafe { (*callee).params };
-                while (p as usize) != 0 {
-                    callee_param_count = callee_param_count + 1;
-                    p = unsafe { (*p).next };
+                let mut special_tid: u32 = 0u32;
+                if !ctx.is_comptime && ctx.oracle.current_tid == 0u32 {
+                    special_tid = interp_classify_thread_fn(view(*ctx), callee);
                 }
 
-                let term_arg_count = unsafe { (*term).arg_count };
-                let total_args: usize = if callee_param_count > term_arg_count { callee_param_count } else { term_arg_count };
-                let cap_count: usize = if callee_param_count > term_arg_count { callee_param_count - term_arg_count } else { 0 };
-
-                let alloc_args: usize = if total_args > 0 { total_args } else { 1 };
-                let args_bytes = interp_mul_usize(alloc_args, size_of<InterpValue>());
-                let call_args = unsafe { heap_alloc(args_bytes, align_of<InterpValue>()) as *mut InterpValue };
-                unsafe {
-                    interp_zero_bytes(call_args as *mut u8, args_bytes);
-                }
-
-                if cap_count > 0 && (unsafe { (*term).func.kind }) != MIR_OP_CONST {
-                    let mut func_ty = TypeId { v: 0u32 };
-                    let mut func_len: u64 = 0u64;
-                    let closure_ptr = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*term).func.place) }, mut_view(func_ty), mut_view(func_len));
-                    let mut offset: u32 = 8u32;
-                    let mut cp: *mut HirParam = unsafe { (*callee).params };
-                    let mut c: usize = 0;
-                    while c < cap_count && (cp as usize) != 0 {
-                        let pty = unsafe { thir_get_param_type(view(*ctx.thir), cp as *const HirParam) };
-                        let cap_field_ty_v: u32 = if (pty as usize) != 0 {
-                            unsafe { (*pty).v }
-                        } else {
-                            unsafe { (*ctx.thir).interner.t_u64.v }
-                        };
-                        let a = unsafe { type_align(TypeId { v: cap_field_ty_v }, view((*ctx.thir).interner)) };
-                        let s = unsafe { type_size(TypeId { v: cap_field_ty_v }, view((*ctx.thir).interner)) };
-                        if a > 0u32 {
-                            let mask = a - 1u32;
-                            offset = (offset + mask) & (mask ^ 0xFFFFFFFFu32);
-                        }
-                        let copy_s: usize = if s > 0u32 { s as usize } else { 8 };
-                        let dst_arg = unsafe { interp_val_at(call_args, c) as *mut u8 };
-                        let src_cap = unsafe { closure_ptr + (offset as usize) };
-                        unsafe {
-                            interp_copy_bytes(dst_arg, src_cap as *const u8, copy_s);
-                        }
-                        offset = offset + (copy_s as u32);
-                        c = c + 1;
-                        cp = unsafe { (*cp).next };
+                if special_tid == 0xFFFFFFFEu32 {
+                    if (unsafe { (*term).arg_count }) > 0 {
+                        let arg0 = unsafe { mir_op_at((*term).args, 0) };
+                        let seed_val = eval_operand_u64(mut_view(*ctx), view(frame), unsafe { view(*arg0) });
+                        oracle_seed_prng(mut_view(*ctx), seed_val);
                     }
-                }
+                    if ctx.oracle.active_thread_mask > 1u32 {
+                        oracle_join_threads(mut_view(*ctx));
+                    }
+                    current_bb = MirBbId { v: unsafe { (*term).call_target.v } };
+                } else if special_tid == 0xFFFFFFFDu32 {
+                    oracle_join_threads(mut_view(*ctx));
+                    current_bb = MirBbId { v: unsafe { (*term).call_target.v } };
+                } else {
+                    let next_call_bb_v = unsafe { (*term).call_target.v };
+                    let next_call_bb = MirBbId { v: next_call_bb_v };
+                    let mut callee1: *mut HirItem = 0 as *mut HirItem;
+                    let mut tid1: u32 = 0u32;
+                    if special_tid >= 1u32 && special_tid < 16u32 &&
+                       bb_is_pairable_thread_call(view(*ctx), body, next_call_bb, special_tid, mut_view(callee1), mut_view(tid1)) {
+                        let mut total_args0: usize = 0;
+                        let mut args_bytes0: usize = 0;
+                        let call_args0 = prepare_call_args_from_term(mut_view(*ctx), view(frame), term, callee, mut_view(total_args0), mut_view(args_bytes0));
+                        let mut dest_ty0 = TypeId { v: 0u32 };
+                        let mut dest_len0: u64 = 0u64;
+                        let dest_ptr0 = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*term).destination) }, mut_view(dest_ty0), mut_view(dest_len0));
+                        let dest_sz0 = unsafe { type_size(dest_ty0, view((*ctx.thir).interner)) as usize };
 
-                let term_args = unsafe { (*term).args };
-                let mut a_idx: usize = 0;
-                while a_idx < term_arg_count {
-                    let arg_op = unsafe { mir_op_at(term_args, a_idx) };
-                    let dst_slot = unsafe { interp_val_at(call_args, cap_count + a_idx) };
-                    if (unsafe { (*arg_op).kind }) == MIR_OP_CONST {
+                        let bb1_ptr = unsafe { mir_bb_at((*body).bbs, next_call_bb_v as usize) };
+                        let sc1 = unsafe { (*bb1_ptr).stmt_count };
+                        let stmts1 = unsafe { (*bb1_ptr).stmts };
+                        let mut s1_idx: usize = 0;
+                        while s1_idx < sc1 && !ctx.failed {
+                            let s1 = unsafe { mir_stmt_at(stmts1, s1_idx) };
+                            let mut dy = false;
+                            let mut ds = false;
+                            exec_single_mir_stmt(mut_view(*ctx), view(frame), body, s1, mut_view(dy), mut_view(ds));
+                            s1_idx = s1_idx + 1;
+                        }
+                        let term1 = mir_bb_term_mut(bb1_ptr);
+                        let mut total_args1: usize = 0;
+                        let mut args_bytes1: usize = 0;
+                        let call_args1 = prepare_call_args_from_term(mut_view(*ctx), view(frame), term1, callee1, mut_view(total_args1), mut_view(args_bytes1));
+                        let mut dest_ty1 = TypeId { v: 0u32 };
+                        let mut dest_len1: u64 = 0u64;
+                        let dest_ptr1 = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*term1).destination) }, mut_view(dest_ty1), mut_view(dest_len1));
+                        let dest_sz1 = unsafe { type_size(dest_ty1, view((*ctx.thir).interner)) as usize };
+
+                        if !ctx.failed {
+                            exec_concurrent_pair(
+                                mut_view(*ctx),
+                                callee,
+                                special_tid,
+                                call_args0,
+                                total_args0,
+                                dest_ptr0,
+                                dest_sz0,
+                                callee1,
+                                tid1,
+                                call_args1,
+                                total_args1,
+                                dest_ptr1,
+                                dest_sz1
+                            );
+                        }
                         unsafe {
-                            eval_operand(mut_view(*ctx), view(frame), view(*arg_op), mut_view(*dst_slot));
+                            heap_free(call_args1 as *mut u8, args_bytes1, align_of<InterpValue>());
+                            heap_free(call_args0 as *mut u8, args_bytes0, align_of<InterpValue>());
                         }
+                        if ctx.failed {
+                            break;
+                        }
+                        current_bb = MirBbId { v: unsafe { (*term1).call_target.v } };
                     } else {
-                        let mut src_ty = TypeId { v: 0u32 };
-                        let mut src_len: u64 = 0u64;
-                        let src = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*arg_op).place) }, mut_view(src_ty), mut_view(src_len));
-                        let mut s_sz = unsafe { type_size(src_ty, view((*ctx.thir).interner)) as usize };
-                        if s_sz > size_of<InterpValue>() {
-                            s_sz = size_of<InterpValue>();
+                        let mut total_args: usize = 0;
+                        let mut args_bytes: usize = 0;
+                        let call_args = prepare_call_args_from_term(mut_view(*ctx), view(frame), term, callee, mut_view(total_args), mut_view(args_bytes));
+                        let mut dest_ty = TypeId { v: 0u32 };
+                        let mut dest_len: u64 = 0u64;
+                        let dest_ptr = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*term).destination) }, mut_view(dest_ty), mut_view(dest_len));
+                        let dest_sz = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) as usize };
+
+                        let ret_alloc_sz: usize = if dest_sz > size_of<InterpValue>() { dest_sz } else { size_of<InterpValue>() };
+                        let big_ret = unsafe { heap_alloc(ret_alloc_sz, 16) };
+                        unsafe {
+                            interp_zero_bytes(big_ret, ret_alloc_sz);
                         }
-                        if s_sz > 0 {
+                        let saved_tid = ctx.oracle.current_tid;
+                        if special_tid >= 1u32 && special_tid < 16u32 {
+                            let tbit = 1u32 << special_tid;
+                            if ctx.oracle.active_thread_mask == 1u32 || (ctx.oracle.active_thread_mask & tbit) != 0u32 {
+                                if ctx.oracle.active_thread_mask > 1u32 {
+                                    oracle_join_threads(mut_view(*ctx));
+                                }
+                                oracle_begin_concurrent_batch(mut_view(*ctx));
+                            }
+                            oracle_fork_thread_for_batch(mut_view(*ctx), special_tid, callee as usize);
+                            ctx.oracle.current_tid = special_tid;
+                        }
+                        eval_call_into(mut_view(*ctx), callee, call_args, total_args, big_ret, ret_alloc_sz);
+                        ctx.oracle.current_tid = saved_tid;
+                        ctx.oracle.current_frame_storage = frame.storage;
+                        ctx.oracle.current_frame_storage_size = frame.storage_size;
+                        unsafe {
+                            heap_free(call_args as *mut u8, args_bytes, align_of<InterpValue>());
+                        }
+                        if ctx.failed {
                             unsafe {
-                                interp_copy_bytes(dst_slot as *mut u8, src as *const u8, s_sz);
+                                heap_free(big_ret, ret_alloc_sz, 16);
+                            }
+                            break;
+                        }
+                        if dest_sz > 0 && (dest_ptr as usize) != 0 {
+                            unsafe {
+                                interp_copy_bytes(dest_ptr, big_ret as *const u8, dest_sz);
                             }
                         }
-                    }
-                    a_idx = a_idx + 1;
-                }
-
-                let mut dest_ty = TypeId { v: 0u32 };
-                let mut dest_len: u64 = 0u64;
-                let dest_ptr = get_place_ptr(mut_view(*ctx), view(frame), unsafe { view((*term).destination) }, mut_view(dest_ty), mut_view(dest_len));
-                let dest_sz = unsafe { type_size(dest_ty, view((*ctx.thir).interner)) as usize };
-
-                let ret_alloc_sz: usize = if dest_sz > size_of<InterpValue>() { dest_sz } else { size_of<InterpValue>() };
-                let big_ret = unsafe { heap_alloc(ret_alloc_sz, 16) };
-                unsafe {
-                    interp_zero_bytes(big_ret, ret_alloc_sz);
-                }
-                eval_call_into(mut_view(*ctx), callee, call_args, total_args, big_ret, ret_alloc_sz);
-                unsafe {
-                    heap_free(call_args as *mut u8, args_bytes, align_of<InterpValue>());
-                }
-                if ctx.failed {
-                    unsafe {
-                        heap_free(big_ret, ret_alloc_sz, 16);
-                    }
-                    break;
-                }
-                if dest_sz > 0 && (dest_ptr as usize) != 0 {
-                    unsafe {
-                        interp_copy_bytes(dest_ptr, big_ret as *const u8, dest_sz);
+                        unsafe {
+                            heap_free(big_ret, ret_alloc_sz, 16);
+                        }
+                        current_bb = MirBbId { v: next_call_bb_v };
                     }
                 }
-                unsafe {
-                    heap_free(big_ret, ret_alloc_sz, 16);
-                }
-                current_bb = MirBbId { v: unsafe { (*term).call_target.v } };
             }
         } else if tk == MIR_TERM_UNREACHABLE {
             interp_panic(mut_view(*ctx), INTERP_MSG_PANIC_UNREACHABLE);
@@ -2314,7 +3273,12 @@ pub fn exec_mir_body(
         }
     }
 
+    if ctx.oracle.current_tid == 0u32 && ctx.oracle.active_thread_mask > 1u32 {
+        oracle_join_threads(mut_view(*ctx));
+    }
     frame_cleanup(mut_view(*ctx), mut_view(frame), alloc_start, out_ret, out_ret_size);
+    ctx.oracle.current_frame_storage = prev_frame_storage;
+    ctx.oracle.current_frame_storage_size = prev_frame_storage_size;
 }
 
 fn mir_bb_term_mut(bb: *mut MirBb) -> *mut MirTerminator {

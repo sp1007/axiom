@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T850, T851]
 priority: 202
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/build/graph, compiler/build/cache, compiler/driver/workspace_cmd, tests/run/build_graph]
 spec: [spec/SPEC-110-build-graph-driver.md, spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, 0168, tasks/0356, tasks/0372, tasks/0411, tasks/0661]
 covers: [REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-08 19:10:03
+agent: T852-impl
 ---
 # T852 — E20.1 CompilerDB build graph planner, host/target cross-build split, content-addressed cache & workspace CLI
 
@@ -41,3 +43,4 @@ Implement the `CompilerDB`-backed deterministic Build Graph planner, host-vs-tar
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 19:10:03 started (attempt 1) T852-impl
