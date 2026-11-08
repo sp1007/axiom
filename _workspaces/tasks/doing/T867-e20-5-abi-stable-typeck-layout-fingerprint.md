@@ -8,11 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T866]
 priority: 217
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/abi/stability, compiler/abi/fingerprint, tests/run/abi_stability]
 spec: [spec/SPEC-114-abi-stability-versioning-binary-compat.md, 0104, tasks/0452, tasks/0583, tasks/0739]
 covers: [REQ-ECO-8734, REQ-PKG-022, REQ-PKG-024]
+started: 2026-11-08 20:33:52
+agent: T867-impl
 ---
 # T867 — E20.5 @abi(stable) boundary typechecker, StableStruct/handle layout verifier & AbiFingerprint/ApiFingerprint calculator
 
@@ -40,3 +42,4 @@ Implement the `@abi(stable, version = "...")` boundary typechecker, extensible s
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-08 20:33:52 started (attempt 1) T867-impl

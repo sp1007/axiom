@@ -1,0 +1,1390 @@
+// CompilerDB Build Graph Planner, Host/Target Split & Action DAG
+// (`compiler/build/graph/mod.ax`, T852 / E20.1).
+//
+// Implements SPEC-110 §3 & §6 (`AXS-BLD-020`..`AXS-BLD-025`, `AXS-BLD-050`..`AXS-BLD-053`,
+// `INV-BLD-001`..`INV-BLD-003`, `REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`).
+
+module compiler.build.graph
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.query.db.CompilerDB
+use compiler.query.db.SourceFileId
+use compiler.query.db.PackageId
+use compiler.query.db.UnitKey
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.DURABILITY_HIGH
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_target_config_input
+use compiler.query.db.query_db_set_package_graph_input
+
+use compiler.build.manifest.DEP_SCOPE_NORMAL
+use compiler.build.manifest.DEP_SCOPE_DEV
+use compiler.build.manifest.DEP_SCOPE_BUILD
+use compiler.build.manifest.DEP_SCOPE_COMPTIME
+use compiler.build.manifest.TARGET_UNIT_LIB
+use compiler.build.manifest.TARGET_UNIT_BIN
+use compiler.build.manifest.TARGET_UNIT_TEST
+use compiler.build.manifest.TARGET_UNIT_BENCH
+use compiler.build.manifest.TARGET_UNIT_BUILD_TOOL
+use compiler.build.manifest.BuildToolTargetDecl
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.target_unit_kind_name
+use compiler.build.manifest.report_manifest_diag_2
+
+use compiler.build.workspace.ENV_CLASS_TARGET
+use compiler.build.workspace.ENV_CLASS_HOST
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.PackageIdentity
+use compiler.build.workspace.WorkspaceMemberInput
+use compiler.build.workspace.ResolvedPackageNode
+use compiler.build.workspace.WorkspaceGraph
+use compiler.build.workspace.env_class_name
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_u64
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_combine
+use compiler.build.workspace.package_identity_empty
+
+use compiler.build.cache.ACTION_RUN_BUILD_TOOL
+use compiler.build.cache.ACTION_EMIT_INTERFACE
+use compiler.build.cache.ACTION_COMPILE_CGU
+use compiler.build.cache.ACTION_ASSEMBLE_ARCHIVE
+use compiler.build.cache.ACTION_LINK_ARTIFACT
+use compiler.build.cache.ACTION_RUN_TEST_UNIT
+use compiler.build.cache.CACHE_HIT
+use compiler.build.cache.FourTierFingerprints
+use compiler.build.cache.UnitFingerprintInputs
+use compiler.build.cache.CancellationToken
+use compiler.build.cache.BuildArtifactCache
+use compiler.build.cache.build_action_kind_name
+use compiler.build.cache.unit_fingerprint_inputs_default
+use compiler.build.cache.compute_four_tier_fingerprints
+use compiler.build.cache.cancellation_token_none
+use compiler.build.cache.build_artifact_cache_new
+use compiler.build.cache.cache_lookup_and_verify
+use compiler.build.cache.cache_stage_artifact_write
+use compiler.build.cache.cache_commit_staged_atomic
+use compiler.build.cache.push_cache_key_short_hex
+
+// =============================================================================
+// 1. Diagnostic Codes & Build Event Kinds (`AXS-BLD-021`, `AXS-BLD-042`, `AXS-BLD-050`)
+// =============================================================================
+
+pub const AX_LINK_ARTIFACT_TARGET_MISMATCH: u32 = 220u32
+
+pub const EVENT_WORKSPACE_RESOLVED: u8 = 0u8
+pub const EVENT_ACTION_STARTED: u8 = 1u8
+pub const EVENT_ACTION_CACHED: u8 = 2u8
+pub const EVENT_ACTION_COMPLETED: u8 = 3u8
+pub const EVENT_ARTIFACT_EMITTED: u8 = 4u8
+pub const EVENT_BUILD_FINISHED: u8 = 5u8
+
+pub fn build_event_kind_name(kind: u8) -> StrView {
+    if kind == EVENT_WORKSPACE_RESOLVED {
+        return ux2_sv("workspace_resolved")
+    }
+    if kind == EVENT_ACTION_STARTED {
+        return ux2_sv("action_started")
+    }
+    if kind == EVENT_ACTION_CACHED {
+        return ux2_sv("action_cached")
+    }
+    if kind == EVENT_ACTION_COMPLETED {
+        return ux2_sv("action_completed")
+    }
+    if kind == EVENT_ARTIFACT_EMITTED {
+        return ux2_sv("artifact_emitted")
+    }
+    ux2_sv("build_finished")
+}
+
+// =============================================================================
+// 2. Target-Specific Artifact Extensions & Layout (`AXS-BLD-023`, `AXS-BLD-024`)
+// =============================================================================
+
+pub fn triple_is_windows(triple: StrView) -> bool {
+    ux2_sv_contains(triple, ux2_sv("windows")) || ux2_sv_contains(triple, ux2_sv("msvc"))
+}
+
+pub fn triple_is_wasm(triple: StrView) -> bool {
+    ux2_sv_contains(triple, ux2_sv("wasm"))
+}
+
+pub fn triple_is_macos(triple: StrView) -> bool {
+    ux2_sv_contains(triple, ux2_sv("apple")) || ux2_sv_contains(triple, ux2_sv("darwin")) || ux2_sv_contains(triple, ux2_sv("macos"))
+}
+
+pub fn artifact_interface_ext() -> StrView {
+    ux2_sv(".axmi")
+}
+
+pub fn artifact_obj_ext(triple: StrView) -> StrView {
+    if triple_is_windows(triple) {
+        return ux2_sv(".obj")
+    }
+    ux2_sv(".o")
+}
+
+pub fn artifact_archive_ext(triple: StrView) -> StrView {
+    if triple_is_windows(triple) {
+        return ux2_sv(".lib")
+    }
+    ux2_sv(".a")
+}
+
+pub fn artifact_shared_lib_ext(triple: StrView) -> StrView {
+    if triple_is_windows(triple) {
+        return ux2_sv(".dll")
+    }
+    if triple_is_macos(triple) {
+        return ux2_sv(".dylib")
+    }
+    ux2_sv(".so")
+}
+
+pub fn artifact_exe_ext(triple: StrView) -> StrView {
+    if triple_is_windows(triple) {
+        return ux2_sv(".exe")
+    }
+    if triple_is_wasm(triple) {
+        return ux2_sv(".wasm")
+    }
+    ux2_sv_empty()
+}
+
+pub fn format_target_env_root(
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(".axiom/target/"))
+    if env_class == ENV_CLASS_HOST {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("host/"))
+    } else {
+        diag_buf_push_sv(mut_view(*buf), target_triple)
+        diag_buf_push_byte(mut_view(*buf), 47u8)
+    }
+    diag_buf_push_sv(mut_view(*buf), profile_name)
+}
+
+pub fn format_build_gen_output_path(
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    pkg_name: StrView,
+    out_rel: StrView,
+    buf: mut_view<DiagBuffer>
+) {
+    format_target_env_root(env_class, target_triple, profile_name, mut_view(*buf))
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("/gen/"))
+    diag_buf_push_sv(mut_view(*buf), pkg_name)
+    diag_buf_push_byte(mut_view(*buf), 47u8)
+    diag_buf_push_sv(mut_view(*buf), out_rel)
+}
+
+pub fn format_build_artifact_path(
+    action_kind: u8,
+    unit_kind: u8,
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    pkg_name: StrView,
+    target_name: StrView,
+    build_fingerprint: view<Digest256>,
+    buf: mut_view<DiagBuffer>
+) {
+    format_target_env_root(env_class, target_triple, profile_name, mut_view(*buf))
+    if action_kind == ACTION_RUN_BUILD_TOOL {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("/gen/"))
+        diag_buf_push_sv(mut_view(*buf), pkg_name)
+        diag_buf_push_byte(mut_view(*buf), 47u8)
+        diag_buf_push_sv(mut_view(*buf), target_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(".gen.ax"))
+        return
+    }
+    if action_kind == ACTION_EMIT_INTERFACE {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("/deps/"))
+        diag_buf_push_sv(mut_view(*buf), pkg_name)
+        diag_buf_push_byte(mut_view(*buf), 45u8)
+        push_cache_key_short_hex(build_fingerprint, mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), artifact_interface_ext())
+        return
+    }
+    if action_kind == ACTION_COMPILE_CGU {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("/deps/"))
+        diag_buf_push_sv(mut_view(*buf), pkg_name)
+        diag_buf_push_byte(mut_view(*buf), 45u8)
+        diag_buf_push_sv(mut_view(*buf), target_name)
+        diag_buf_push_byte(mut_view(*buf), 45u8)
+        push_cache_key_short_hex(build_fingerprint, mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), artifact_obj_ext(target_triple))
+        return
+    }
+    if action_kind == ACTION_ASSEMBLE_ARCHIVE {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("/deps/lib"))
+        diag_buf_push_sv(mut_view(*buf), pkg_name)
+        diag_buf_push_byte(mut_view(*buf), 45u8)
+        push_cache_key_short_hex(build_fingerprint, mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), artifact_archive_ext(target_triple))
+        return
+    }
+    if action_kind == ACTION_LINK_ARTIFACT {
+        if unit_kind == TARGET_UNIT_BUILD_TOOL {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("/tools/"))
+        } else {
+            diag_buf_push_byte(mut_view(*buf), 47u8)
+        }
+        diag_buf_push_sv(mut_view(*buf), target_name)
+        diag_buf_push_sv(mut_view(*buf), artifact_exe_ext(target_triple))
+        return
+    }
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("/test-logs/"))
+    diag_buf_push_sv(mut_view(*buf), pkg_name)
+    diag_buf_push_byte(mut_view(*buf), 45u8)
+    diag_buf_push_sv(mut_view(*buf), target_name)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(".log"))
+}
+
+// =============================================================================
+// 3. `[[build_tool]]` Hermetic Sandbox & Provenance (`AXS-BLD-022`)
+// =============================================================================
+
+@derive(Copy)
+pub struct BuildToolSandboxPolicy {
+    pub pkg_name: StrView,
+    pub tool_name: StrView,
+    pub entry_path: StrView,
+    pub declared_inputs: [4]StrView,
+    pub declared_input_count: usize,
+    pub declared_outputs: [4]StrView,
+    pub declared_output_count: usize,
+    pub net_cap_denied: bool,
+    pub process_cap_denied: bool,
+    pub clock_cap_denied: bool,
+    pub env_var_count: u32,
+    pub ambient_host_env_passed: bool,
+}
+
+pub fn build_tool_sandbox_policy_from_spec(
+    pkg_name: StrView,
+    spec: view<BuildToolTargetDecl>
+) -> BuildToolSandboxPolicy {
+    BuildToolSandboxPolicy {
+        pkg_name: pkg_name,
+        tool_name: spec.name,
+        entry_path: spec.path,
+        declared_inputs: spec.inputs,
+        declared_input_count: spec.input_count,
+        declared_outputs: spec.outputs,
+        declared_output_count: spec.output_count,
+        net_cap_denied: true,
+        process_cap_denied: true,
+        clock_cap_denied: true,
+        env_var_count: 5u32,
+        ambient_host_env_passed: false,
+    }
+}
+
+pub fn verify_build_tool_sandbox_access(
+    policy: view<BuildToolSandboxPolicy>,
+    is_write: bool,
+    candidate_path: StrView
+) -> bool {
+    if candidate_path.len == 0usize {
+        return false
+    }
+    if ux2_sv_contains(candidate_path, ux2_sv("..")) {
+        return false
+    }
+    if !is_write {
+        if ux2_sv_eq(candidate_path, policy.entry_path) {
+            return true
+        }
+        let mut i: usize = 0usize
+        while i < policy.declared_input_count {
+            if ux2_sv_eq(candidate_path, policy.declared_inputs[i]) {
+                return true
+            }
+            i = i + 1usize
+        }
+        return false
+    }
+
+    if bld_sv_starts_with(candidate_path, ux2_sv("src/")) ||
+        ux2_sv_eq(candidate_path, ux2_sv("axiom.toml")) ||
+        ux2_sv_eq(candidate_path, ux2_sv("Axiom.toml")) {
+        return false
+    }
+    if bld_sv_starts_with(candidate_path, ux2_sv(".axiom/target/")) &&
+        ux2_sv_contains(candidate_path, ux2_sv("/gen/")) {
+        return true
+    }
+    false
+}
+
+pub fn format_build_tool_env_var(
+    pkg_id: view<PackageIdentity>,
+    manifest_dir: StrView,
+    target_triple: StrView,
+    profile_name: StrView,
+    var_idx: u32,
+    buf: mut_view<DiagBuffer>
+) {
+    if var_idx == 0u32 {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("AXIOM_PACKAGE_NAME="))
+        diag_buf_push_sv(mut_view(*buf), pkg_id.name)
+        return
+    }
+    if var_idx == 1u32 {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("AXIOM_PACKAGE_VERSION="))
+        diag_buf_push_u32(mut_view(*buf), pkg_id.version.major)
+        diag_buf_push_byte(mut_view(*buf), 46u8)
+        diag_buf_push_u32(mut_view(*buf), pkg_id.version.minor)
+        diag_buf_push_byte(mut_view(*buf), 46u8)
+        diag_buf_push_u32(mut_view(*buf), pkg_id.version.patch)
+        return
+    }
+    if var_idx == 2u32 {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("AXIOM_MANIFEST_DIR="))
+        diag_buf_push_sv(mut_view(*buf), manifest_dir)
+        return
+    }
+    if var_idx == 3u32 {
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("AXIOM_OUT_DIR="))
+        format_target_env_root(ENV_CLASS_TARGET, target_triple, profile_name, mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("/gen/"))
+        diag_buf_push_sv(mut_view(*buf), pkg_id.name)
+        return
+    }
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("AXIOM_TARGET_TRIPLE="))
+    diag_buf_push_sv(mut_view(*buf), target_triple)
+}
+
+@derive(Copy)
+pub struct GeneratedSourceProvenance {
+    pub pkg_id: PackageIdentity,
+    pub tool_name: StrView,
+    pub entry_path: StrView,
+    pub output_rel_path: StrView,
+    pub source_file_id: SourceFileId,
+    pub input_digest: Digest256,
+}
+
+// =============================================================================
+// 4. `BuildAction`, `BuildEventRecord` & `BuildGraph` (`AXS-BLD-023..025`)
+// =============================================================================
+
+@derive(Copy)
+pub struct BuildAction {
+    pub action_id: u32,
+    pub action_kind: u8,
+    pub pkg_idx: usize,
+    pub pkg_id: PackageIdentity,
+    pub unit_kind: u8,
+    pub target_name: StrView,
+    pub entry_path: StrView,
+    pub env_class: u8,
+    pub target_triple: StrView,
+    pub profile_name: StrView,
+    pub dep_action_ids: [8]u32,
+    pub dep_action_count: usize,
+    pub feature_set_hash: Digest256,
+    pub compiler_version_digest: u64,
+    pub tiers: FourTierFingerprints,
+    pub expected_payload_len: u64,
+    pub executed: bool,
+    pub cache_hit: bool,
+    pub early_cutoff_reused: bool,
+    pub corrupt_evicted: bool,
+    pub last_miss_reason: u8,
+}
+
+@derive(Copy)
+pub struct BuildEventRecord {
+    pub event_kind: u8,
+    pub action_id: u32,
+    pub action_kind: u8,
+    pub unit_kind: u8,
+    pub env_class: u8,
+    pub pkg_name: StrView,
+    pub target_name: StrView,
+    pub target_triple: StrView,
+    pub profile_name: StrView,
+    pub build_fingerprint: Digest256,
+    pub miss_reason: u8,
+    pub success: bool,
+}
+
+@derive(Copy)
+pub struct BuildGraph {
+    pub host_triple: StrView,
+    pub target_triple: StrView,
+    pub profile_name: StrView,
+    pub package_count: u32,
+    pub actions: [48]BuildAction,
+    pub action_count: usize,
+    pub host_action_count: u32,
+    pub target_action_count: u32,
+    pub sandboxes: [8]BuildToolSandboxPolicy,
+    pub sandbox_count: usize,
+    pub provenances: [8]GeneratedSourceProvenance,
+    pub provenance_count: usize,
+    pub events: [64]BuildEventRecord,
+    pub event_count: usize,
+    pub executed_actions: u32,
+    pub cached_actions: u32,
+    pub early_cutoff_actions: u32,
+    pub aborted_by_cancel: bool,
+    pub build_succeeded: bool,
+}
+
+pub fn empty_build_action() -> BuildAction {
+    let e = ux2_sv_empty()
+    let z = digest256_zero()
+    let zt = FourTierFingerprints {
+        semantic_fingerprint: z,
+        abi_fingerprint: z,
+        codegen_fingerprint: z,
+        build_fingerprint: z,
+    }
+    BuildAction {
+        action_id: 0u32,
+        action_kind: ACTION_EMIT_INTERFACE,
+        pkg_idx: 0usize,
+        pkg_id: package_identity_empty(),
+        unit_kind: TARGET_UNIT_LIB,
+        target_name: e,
+        entry_path: e,
+        env_class: ENV_CLASS_TARGET,
+        target_triple: e,
+        profile_name: e,
+        dep_action_ids: [0u32; 8],
+        dep_action_count: 0usize,
+        feature_set_hash: z,
+        compiler_version_digest: 0u64,
+        tiers: zt,
+        expected_payload_len: 0u64,
+        executed: false,
+        cache_hit: false,
+        early_cutoff_reused: false,
+        corrupt_evicted: false,
+        last_miss_reason: CACHE_HIT,
+    }
+}
+
+pub fn empty_build_event() -> BuildEventRecord {
+    let e = ux2_sv_empty()
+    BuildEventRecord {
+        event_kind: EVENT_WORKSPACE_RESOLVED,
+        action_id: 0u32,
+        action_kind: ACTION_EMIT_INTERFACE,
+        unit_kind: TARGET_UNIT_LIB,
+        env_class: ENV_CLASS_TARGET,
+        pkg_name: e,
+        target_name: e,
+        target_triple: e,
+        profile_name: e,
+        build_fingerprint: digest256_zero(),
+        miss_reason: CACHE_HIT,
+        success: true,
+    }
+}
+
+pub fn build_graph_new() -> BuildGraph {
+    let e = ux2_sv_empty()
+    let act = empty_build_action()
+    let ev = empty_build_event()
+    let sb = BuildToolSandboxPolicy {
+        pkg_name: e,
+        tool_name: e,
+        entry_path: e,
+        declared_inputs: [e; 4],
+        declared_input_count: 0usize,
+        declared_outputs: [e; 4],
+        declared_output_count: 0usize,
+        net_cap_denied: true,
+        process_cap_denied: true,
+        clock_cap_denied: true,
+        env_var_count: 5u32,
+        ambient_host_env_passed: false,
+    }
+    let prov = GeneratedSourceProvenance {
+        pkg_id: package_identity_empty(),
+        tool_name: e,
+        entry_path: e,
+        output_rel_path: e,
+        source_file_id: SourceFileId { v: 0u32 },
+        input_digest: digest256_zero(),
+    }
+    BuildGraph {
+        host_triple: ux2_sv("x86_64-windows"),
+        target_triple: ux2_sv("x86_64-windows"),
+        profile_name: ux2_sv("dev"),
+        package_count: 0u32,
+        actions: [act; 48],
+        action_count: 0usize,
+        host_action_count: 0u32,
+        target_action_count: 0u32,
+        sandboxes: [sb; 8],
+        sandbox_count: 0usize,
+        provenances: [prov; 8],
+        provenance_count: 0usize,
+        events: [ev; 64],
+        event_count: 0usize,
+        executed_actions: 0u32,
+        cached_actions: 0u32,
+        early_cutoff_actions: 0u32,
+        aborted_by_cancel: false,
+        build_succeeded: false,
+    }
+}
+
+// =============================================================================
+// 5. Cross-Build Host/Target Link Isolation (`AXS-BLD-021 §2`, `AXS-BLD-050`)
+// =============================================================================
+
+pub fn verify_artifact_link_target_match(
+    consumer_pkg_name: StrView,
+    consumer_target_name: StrView,
+    consumer_env_class: u8,
+    consumer_triple: StrView,
+    provider_pkg_name: StrView,
+    provider_target_name: StrView,
+    provider_env_class: u8,
+    provider_triple: StrView,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let _ = consumer_pkg_name
+    let _ = consumer_target_name
+    let _ = provider_pkg_name
+    let _ = provider_target_name
+    if consumer_env_class == provider_env_class && ux2_sv_eq(consumer_triple, provider_triple) {
+        return true
+    }
+    report_manifest_diag_2(
+        mut_view(*sink),
+        AX_LINK_ARTIFACT_TARGET_MISMATCH,
+        "cannot link artifact compiled for incompatible target environment (`AXS-BLD-021 §2`)",
+        "expected_triple",
+        consumer_triple,
+        "found_triple",
+        provider_triple
+    )
+    false
+}
+
+pub fn verify_build_graph_target_isolation(
+    bg: view<BuildGraph>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let act = bg.actions[i]
+        let mut d: usize = 0usize
+        while d < act.dep_action_count {
+            let dep_id = act.dep_action_ids[d] as usize
+            if dep_id < bg.action_count {
+                let dep_act = bg.actions[dep_id]
+                if dep_act.action_kind != ACTION_RUN_BUILD_TOOL {
+                    if !verify_artifact_link_target_match(
+                        act.pkg_id.name,
+                        act.target_name,
+                        act.env_class,
+                        act.target_triple,
+                        dep_act.pkg_id.name,
+                        dep_act.target_name,
+                        dep_act.env_class,
+                        dep_act.target_triple,
+                        mut_view(*sink)
+                    ) {
+                        return false
+                    }
+                }
+            }
+            d = d + 1usize
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+// =============================================================================
+// 6. Lowering `WorkspaceGraph` -> `CompilerDB` & `BuildGraph` (`AXS-BLD-020..024`)
+// =============================================================================
+
+fn push_dep_action(act: mut_view<BuildAction>, dep_id: u32) {
+    let mut i: usize = 0usize
+    while i < act.dep_action_count {
+        if act.dep_action_ids[i] == dep_id {
+            return
+        }
+        i = i + 1usize
+    }
+    if (act.dep_action_count) < 8usize {
+        act.dep_action_ids[act.dep_action_count] = dep_id
+        act.dep_action_count = act.dep_action_count + 1usize
+    }
+}
+
+fn find_member_source_hashes(
+    member_inputs: view<[16]WorkspaceMemberInput>,
+    member_input_count: usize,
+    rel_path: StrView,
+    out_pub: mut_view<u64>,
+    out_priv: mut_view<u64>
+) {
+    *out_pub = 0x1122334455667788u64
+    *out_priv = 0x99AABBCCDDEEFF00u64
+    let mut i: usize = 0usize
+    while i < member_input_count && i < 16usize {
+        if ux2_sv_eq((*member_inputs)[i].rel_path, rel_path) {
+            *out_pub = (*member_inputs)[i].public_api_source_hash
+            *out_priv = (*member_inputs)[i].private_body_source_hash
+            return
+        }
+        i = i + 1usize
+    }
+}
+
+fn compute_pkg_upstream_interface_digest(
+    ws: view<WorkspaceGraph>,
+    pkg_idx: usize,
+    desired_to_env: u8
+) -> Digest256 {
+    let mut acc = digest256_domain_init(ux2_sv("AXIOM_UPSTREAM_IFACE_V1"))
+    acc = digest256_mix_u64(acc, desired_to_env as u64)
+    let mut e: usize = 0usize
+    while e < ws.edge_count {
+        let edge = ws.edges[e]
+        if edge.from_pkg_idx == pkg_idx && edge.to_env_class == desired_to_env {
+            let dep_pkg = ws.packages[edge.to_pkg_idx]
+            acc = digest256_combine(acc, dep_pkg.semantic_fingerprint)
+        }
+        e = e + 1usize
+    }
+    acc
+}
+
+fn compute_pkg_upstream_archive_digest(
+    ws: view<WorkspaceGraph>,
+    member_inputs: view<[16]WorkspaceMemberInput>,
+    member_input_count: usize,
+    pkg_idx: usize,
+    desired_to_env: u8
+) -> u64 {
+    let mut h: u64 = 0x55505F4152434856u64 ^ (desired_to_env as u64)
+    let mut e: usize = 0usize
+    while e < ws.edge_count {
+        let edge = ws.edges[e]
+        if edge.from_pkg_idx == pkg_idx && edge.to_env_class == desired_to_env {
+            let dep_pkg = ws.packages[edge.to_pkg_idx]
+            let mut dep_pub: u64 = 0u64
+            let mut dep_priv: u64 = 0u64
+            find_member_source_hashes(
+                member_inputs,
+                member_input_count,
+                dep_pkg.member_rel_path,
+                mut_view(dep_pub),
+                mut_view(dep_priv)
+            )
+            h = ax_hash_combine(h, dep_pkg.semantic_fingerprint.w0)
+            h = ax_hash_combine(h, dep_pub)
+            h = ax_hash_combine(h, dep_priv)
+        }
+        e = e + 1usize
+    }
+    h
+}
+
+fn find_lib_action_for_pkg(
+    bg: view<BuildGraph>,
+    pkg_idx: usize,
+    env_class: u8,
+    desired_action_kind: u8
+) -> u32 {
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let a = bg.actions[i]
+        if a.pkg_idx == pkg_idx &&
+            a.unit_kind == TARGET_UNIT_LIB &&
+            a.env_class == env_class &&
+            a.action_kind == desired_action_kind {
+            return a.action_id
+        }
+        i = i + 1usize
+    }
+    48u32
+}
+
+fn find_build_tool_run_action_for_pkg(
+    bg: view<BuildGraph>,
+    pkg_idx: usize
+) -> u32 {
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let a = bg.actions[i]
+        if a.pkg_idx == pkg_idx && a.action_kind == ACTION_RUN_BUILD_TOOL {
+            return a.action_id
+        }
+        i = i + 1usize
+    }
+    48u32
+}
+
+fn wire_upstream_pkg_deps(
+    ws: view<WorkspaceGraph>,
+    bg: mut_view<BuildGraph>,
+    act_idx: usize,
+    pkg_idx: usize,
+    desired_to_env: u8,
+    upstream_action_kind: u8
+) {
+    let mut e: usize = 0usize
+    while e < ws.edge_count {
+        let edge = ws.edges[e]
+        if edge.from_pkg_idx == pkg_idx && edge.to_env_class == desired_to_env {
+            let dep_act_id = find_lib_action_for_pkg(
+                view(*bg),
+                edge.to_pkg_idx,
+                desired_to_env,
+                upstream_action_kind
+            )
+            if dep_act_id < 48u32 {
+                push_dep_action(mut_view(bg.actions[act_idx]), dep_act_id)
+            }
+        }
+        e = e + 1usize
+    }
+}
+
+fn append_node_action(
+    ws: view<WorkspaceGraph>,
+    member_inputs: view<[16]WorkspaceMemberInput>,
+    member_input_count: usize,
+    pkg_idx: usize,
+    unit_kind: u8,
+    target_name: StrView,
+    entry_path: StrView,
+    env_class: u8,
+    target_triple: StrView,
+    action_kind: u8,
+    compiler_version_digest: u64,
+    sysroot_fingerprint: u64,
+    bg: mut_view<BuildGraph>
+) -> u32 {
+    if bg.action_count >= 48usize {
+        return 48u32
+    }
+    let pkg = ws.packages[pkg_idx]
+    let mut pub_hash: u64 = 0u64
+    let mut priv_hash: u64 = 0u64
+    find_member_source_hashes(
+        member_inputs,
+        member_input_count,
+        pkg.member_rel_path,
+        mut_view(pub_hash),
+        mut_view(priv_hash)
+    )
+    let up_iface = compute_pkg_upstream_interface_digest(ws, pkg_idx, env_class)
+    let up_arch_hash = compute_pkg_upstream_archive_digest(
+        ws,
+        member_inputs,
+        member_input_count,
+        pkg_idx,
+        env_class
+    )
+
+    let mut f_inputs = unit_fingerprint_inputs_default(pkg.identity)
+    f_inputs.unit_kind = unit_kind
+    f_inputs.env_class = env_class
+    f_inputs.target_name = target_name
+    f_inputs.target_triple = target_triple
+    f_inputs.profile_name = ws.active_profile.name
+    f_inputs.public_api_source_hash = pub_hash
+    if action_kind == ACTION_LINK_ARTIFACT || action_kind == ACTION_RUN_TEST_UNIT {
+        f_inputs.private_body_source_hash = ax_hash_combine(priv_hash, up_arch_hash)
+    } else {
+        f_inputs.private_body_source_hash = priv_hash
+    }
+    f_inputs.enabled_features_digest = pkg.identity.feature_set_hash
+    f_inputs.upstream_interfaces_digest = up_iface
+    f_inputs.upstream_abi_digest = up_iface
+    if env_class == ENV_CLASS_HOST {
+        f_inputs.comptime_eval_digest = digest256_mix_u64(
+            digest256_domain_init(ux2_sv("AXIOM_HOST_CTFE_V1")),
+            pub_hash
+        )
+    }
+    f_inputs.safety_profile = ws.active_profile.safety_profile
+    f_inputs.panic_strategy = ws.active_profile.panic_strategy
+    f_inputs.opt_level = ws.active_profile.opt_level
+    f_inputs.lto_mode = ws.active_profile.lto
+    f_inputs.debug_info = ws.active_profile.debug_info
+    f_inputs.codegen_units = ws.active_profile.codegen_units
+    f_inputs.compiler_version_digest = compiler_version_digest
+    f_inputs.sysroot_fingerprint = sysroot_fingerprint
+
+    let tiers = compute_four_tier_fingerprints(action_kind, view(f_inputs))
+    let action_id = bg.action_count as u32
+    let payload_len: u64 = 256u64 + ((action_kind as u64) * 64u64) + ((pkg_idx as u64) * 16u64)
+
+    let mut act = empty_build_action()
+    act.action_id = action_id
+    act.action_kind = action_kind
+    act.pkg_idx = pkg_idx
+    act.pkg_id = pkg.identity
+    act.unit_kind = unit_kind
+    act.target_name = target_name
+    act.entry_path = entry_path
+    act.env_class = env_class
+    act.target_triple = target_triple
+    act.profile_name = ws.active_profile.name
+    act.feature_set_hash = pkg.identity.feature_set_hash
+    act.compiler_version_digest = compiler_version_digest
+    act.tiers = tiers
+    act.expected_payload_len = payload_len
+
+    bg.actions[bg.action_count] = act
+    bg.action_count = bg.action_count + 1usize
+    if env_class == ENV_CLASS_HOST {
+        bg.host_action_count = bg.host_action_count + 1u32
+    } else {
+        bg.target_action_count = bg.target_action_count + 1u32
+    }
+    action_id
+}
+
+pub fn lower_workspace_to_build_graph(
+    ws: view<WorkspaceGraph>,
+    member_inputs: view<[16]WorkspaceMemberInput>,
+    member_input_count: usize,
+    db: mut_view<CompilerDB>,
+    compiler_version_digest: u64,
+    sysroot_fingerprint: u64,
+    include_test_units: bool,
+    out_bg: mut_view<BuildGraph>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    *out_bg = build_graph_new()
+    out_bg.host_triple = ws.host_triple
+    out_bg.target_triple = ws.target_triple
+    out_bg.profile_name = ws.active_profile.name
+    out_bg.package_count = ws.package_count as u32
+
+    // 1. Register workspace package graph, target configs, and source files in `CompilerDB` (`AXS-BLD-020`)
+    let _ = query_db_set_target_config_input(
+        mut_view(*db),
+        UnitKey { v: 1u32 },
+        ws.target_triple,
+        ws.active_profile.panic_strategy,
+        0u32,
+        2026u32,
+        ws.active_profile.opt_level,
+        8u32
+    )
+    let _ = query_db_set_target_config_input(
+        mut_view(*db),
+        UnitKey { v: 2u32 },
+        ws.host_triple,
+        ws.active_profile.panic_strategy,
+        0u32,
+        2026u32,
+        ws.active_profile.opt_level,
+        8u32
+    )
+
+    let mut p_idx: usize = 0usize
+    while p_idx < ws.package_count {
+        let pkg = ws.packages[p_idx]
+        let _ = query_db_set_package_graph_input(
+            mut_view(*db),
+            PackageId { v: (p_idx as u32) + 1u32 },
+            pkg.identity.name,
+            2026u32,
+            0u32,
+            pkg.identity.identity_digest.w0
+        )
+        let sf_id = SourceFileId { v: (p_idx as u32) + 1u32 }
+        let dur = if p_idx == 0usize { DURABILITY_LOW } else { DURABILITY_HIGH }
+        let _ = query_db_set_source_file_input(
+            mut_view(*db),
+            sf_id,
+            pkg.member_rel_path,
+            pkg.identity.name,
+            dur
+        )
+
+        if pkg.identity.target_env_class == ENV_CLASS_TARGET {
+            let mut bt: usize = 0usize
+            while bt < pkg.manifest.build_tool_count {
+                let spec = pkg.manifest.build_tools[bt]
+                if (out_bg.sandbox_count) < 8usize {
+                    out_bg.sandboxes[out_bg.sandbox_count] = build_tool_sandbox_policy_from_spec(
+                        pkg.identity.name,
+                        view(spec)
+                    )
+                    out_bg.sandbox_count = out_bg.sandbox_count + 1usize
+                }
+                let out_rel = if spec.output_count > 0usize {
+                    spec.outputs[0]
+                } else {
+                    ux2_sv("generated.ax")
+                }
+                if (out_bg.provenance_count) < 8usize {
+                    let gen_sf_id = SourceFileId { v: 100u32 + (out_bg.provenance_count as u32) }
+                    let _ = query_db_set_source_file_input(
+                        mut_view(*db),
+                        gen_sf_id,
+                        out_rel,
+                        spec.path,
+                        DURABILITY_LOW
+                    )
+                    let mut in_dig = digest256_domain_init(ux2_sv("AXIOM_BUILD_TOOL_PROV_V1"))
+                    in_dig = digest256_mix_sv(in_dig, spec.path)
+                    in_dig = digest256_mix_sv(in_dig, out_rel)
+                    out_bg.provenances[out_bg.provenance_count] = GeneratedSourceProvenance {
+                        pkg_id: pkg.identity,
+                        tool_name: spec.name,
+                        entry_path: spec.path,
+                        output_rel_path: out_rel,
+                        source_file_id: gen_sf_id,
+                        input_digest: in_dig,
+                    }
+                    out_bg.provenance_count = out_bg.provenance_count + 1usize
+                }
+                bt = bt + 1usize
+            }
+        }
+        p_idx = p_idx + 1usize
+    }
+
+    // 2. Lower units in topological package order (`AXS-BLD-021`, `AXS-BLD-023`)
+    let mut t: usize = 0usize
+    while t < ws.topo_count {
+        let pkg_idx = ws.topo_order[t]
+        let node = ws.packages[pkg_idx]
+        let env_c = node.identity.target_env_class
+        let triple = node.identity.target_triple
+
+        // 2a. `[[build_tool]]` units for target packages (`ENV_CLASS_HOST` on `ws.host_triple`)
+        if env_c == ENV_CLASS_TARGET {
+            let mut bti: usize = 0usize
+            while bti < node.manifest.build_tool_count {
+                let bt_spec = node.manifest.build_tools[bti]
+                let cgu_id = append_node_action(
+                    ws, member_inputs, member_input_count,
+                    pkg_idx, TARGET_UNIT_BUILD_TOOL, bt_spec.name, bt_spec.path,
+                    ENV_CLASS_HOST, ws.host_triple, ACTION_COMPILE_CGU,
+                    compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                )
+                if cgu_id < 48u32 {
+                    wire_upstream_pkg_deps(
+                        ws, mut_view(*out_bg), cgu_id as usize, pkg_idx,
+                        ENV_CLASS_HOST, ACTION_EMIT_INTERFACE
+                    )
+                }
+                let link_id = append_node_action(
+                    ws, member_inputs, member_input_count,
+                    pkg_idx, TARGET_UNIT_BUILD_TOOL, bt_spec.name, bt_spec.path,
+                    ENV_CLASS_HOST, ws.host_triple, ACTION_LINK_ARTIFACT,
+                    compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                )
+                if link_id < 48u32 {
+                    if cgu_id < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[link_id as usize]), cgu_id)
+                    }
+                    wire_upstream_pkg_deps(
+                        ws, mut_view(*out_bg), link_id as usize, pkg_idx,
+                        ENV_CLASS_HOST, ACTION_ASSEMBLE_ARCHIVE
+                    )
+                }
+                let run_id = append_node_action(
+                    ws, member_inputs, member_input_count,
+                    pkg_idx, TARGET_UNIT_BUILD_TOOL, bt_spec.name, bt_spec.path,
+                    ENV_CLASS_HOST, ws.host_triple, ACTION_RUN_BUILD_TOOL,
+                    compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                )
+                if run_id < 48u32 && link_id < 48u32 {
+                    push_dep_action(mut_view(out_bg.actions[run_id as usize]), link_id)
+                }
+                bti = bti + 1usize
+            }
+        }
+
+        // 2b. `[lib]` unit (`EmitInterface` -> `CompileCodegenUnit` -> `AssembleArchive`)
+        if node.manifest.lib_target.present {
+            let bt_run_id = find_build_tool_run_action_for_pkg(view(*out_bg), pkg_idx)
+            let lib_name = if node.manifest.lib_target.name.len > 0usize {
+                node.manifest.lib_target.name
+            } else {
+                node.identity.name
+            }
+            let lib_path = node.manifest.lib_target.path
+            let iface_id = append_node_action(
+                ws, member_inputs, member_input_count,
+                pkg_idx, TARGET_UNIT_LIB, lib_name, lib_path,
+                env_c, triple, ACTION_EMIT_INTERFACE,
+                compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+            )
+            if iface_id < 48u32 {
+                if bt_run_id < 48u32 {
+                    push_dep_action(mut_view(out_bg.actions[iface_id as usize]), bt_run_id)
+                }
+                wire_upstream_pkg_deps(
+                    ws, mut_view(*out_bg), iface_id as usize, pkg_idx,
+                    env_c, ACTION_EMIT_INTERFACE
+                )
+            }
+            let cgu_id = append_node_action(
+                ws, member_inputs, member_input_count,
+                pkg_idx, TARGET_UNIT_LIB, lib_name, lib_path,
+                env_c, triple, ACTION_COMPILE_CGU,
+                compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+            )
+            if cgu_id < 48u32 {
+                if iface_id < 48u32 {
+                    push_dep_action(mut_view(out_bg.actions[cgu_id as usize]), iface_id)
+                }
+                wire_upstream_pkg_deps(
+                    ws, mut_view(*out_bg), cgu_id as usize, pkg_idx,
+                    env_c, ACTION_EMIT_INTERFACE
+                )
+            }
+            let arch_id = append_node_action(
+                ws, member_inputs, member_input_count,
+                pkg_idx, TARGET_UNIT_LIB, lib_name, lib_path,
+                env_c, triple, ACTION_ASSEMBLE_ARCHIVE,
+                compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+            )
+            if arch_id < 48u32 && cgu_id < 48u32 {
+                push_dep_action(mut_view(out_bg.actions[arch_id as usize]), cgu_id)
+            }
+        }
+
+        // 2c. `[[bin]]` units (`CompileCodegenUnit` -> `LinkArtifact`, plus `RunTestUnit` if `include_test_units`)
+        if env_c == ENV_CLASS_TARGET {
+            let mut bi: usize = 0usize
+            while bi < node.manifest.bin_count {
+                let bin_decl = node.manifest.bin_targets[bi]
+                let bt_run_id = find_build_tool_run_action_for_pkg(view(*out_bg), pkg_idx)
+                let same_pkg_iface = find_lib_action_for_pkg(
+                    view(*out_bg), pkg_idx, env_c, ACTION_EMIT_INTERFACE
+                )
+                let same_pkg_arch = find_lib_action_for_pkg(
+                    view(*out_bg), pkg_idx, env_c, ACTION_ASSEMBLE_ARCHIVE
+                )
+                let cgu_id = append_node_action(
+                    ws, member_inputs, member_input_count,
+                    pkg_idx, TARGET_UNIT_BIN, bin_decl.name, bin_decl.path,
+                    env_c, triple, ACTION_COMPILE_CGU,
+                    compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                )
+                if cgu_id < 48u32 {
+                    if bt_run_id < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[cgu_id as usize]), bt_run_id)
+                    }
+                    if same_pkg_iface < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[cgu_id as usize]), same_pkg_iface)
+                    }
+                    wire_upstream_pkg_deps(
+                        ws, mut_view(*out_bg), cgu_id as usize, pkg_idx,
+                        env_c, ACTION_EMIT_INTERFACE
+                    )
+                }
+                let link_id = append_node_action(
+                    ws, member_inputs, member_input_count,
+                    pkg_idx, TARGET_UNIT_BIN, bin_decl.name, bin_decl.path,
+                    env_c, triple, ACTION_LINK_ARTIFACT,
+                    compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                )
+                if link_id < 48u32 {
+                    if cgu_id < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[link_id as usize]), cgu_id)
+                    }
+                    if same_pkg_arch < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[link_id as usize]), same_pkg_arch)
+                    }
+                    wire_upstream_pkg_deps(
+                        ws, mut_view(*out_bg), link_id as usize, pkg_idx,
+                        env_c, ACTION_ASSEMBLE_ARCHIVE
+                    )
+                }
+                if include_test_units {
+                    let test_id = append_node_action(
+                        ws, member_inputs, member_input_count,
+                        pkg_idx, TARGET_UNIT_TEST, bin_decl.name, bin_decl.path,
+                        env_c, triple, ACTION_RUN_TEST_UNIT,
+                        compiler_version_digest, sysroot_fingerprint, mut_view(*out_bg)
+                    )
+                    if test_id < 48u32 && link_id < 48u32 {
+                        push_dep_action(mut_view(out_bg.actions[test_id as usize]), link_id)
+                    }
+                }
+                bi = bi + 1usize
+            }
+        }
+
+        t = t + 1usize
+    }
+
+    verify_build_graph_target_isolation(view(*out_bg), mut_view(*sink))
+}
+
+// =============================================================================
+// 7. Deterministic Build Execution & Worker-Count Invariance (`AXS-BLD-025`)
+// =============================================================================
+
+fn push_build_event(
+    bg: mut_view<BuildGraph>,
+    event_kind: u8,
+    act: view<BuildAction>,
+    miss_reason: u8,
+    success: bool
+) {
+    if bg.event_count >= 64usize {
+        return
+    }
+    bg.events[bg.event_count] = BuildEventRecord {
+        event_kind: event_kind,
+        action_id: act.action_id,
+        action_kind: act.action_kind,
+        unit_kind: act.unit_kind,
+        env_class: act.env_class,
+        pkg_name: act.pkg_id.name,
+        target_name: act.target_name,
+        target_triple: act.target_triple,
+        profile_name: act.profile_name,
+        build_fingerprint: act.tiers.build_fingerprint,
+        miss_reason: miss_reason,
+        success: success,
+    }
+    bg.event_count = bg.event_count + 1usize
+}
+
+fn action_is_scheduled_for_mode(
+    act: view<BuildAction>,
+    check_only: bool,
+    run_tests: bool
+) -> bool {
+    if check_only {
+        return act.action_kind == ACTION_RUN_BUILD_TOOL ||
+               act.action_kind == ACTION_EMIT_INTERFACE
+    }
+    if act.action_kind == ACTION_RUN_TEST_UNIT {
+        return run_tests
+    }
+    true
+}
+
+pub fn execute_build_graph(
+    bg: mut_view<BuildGraph>,
+    cache: mut_view<BuildArtifactCache>,
+    jobs: u32,
+    check_only: bool,
+    run_tests: bool,
+    upstream_private_body_edited: bool,
+    cancel_token: view<CancellationToken>
+) -> bool {
+    let effective_jobs = if jobs == 0u32 { 1u32 } else { jobs }
+    bg.event_count = 0usize
+    bg.executed_actions = 0u32
+    bg.cached_actions = 0u32
+    bg.early_cutoff_actions = 0u32
+    bg.aborted_by_cancel = false
+    bg.build_succeeded = false
+
+    let dummy_act = empty_build_action()
+    push_build_event(mut_view(*bg), EVENT_WORKSPACE_RESOLVED, view(dummy_act), CACHE_HIT, true)
+
+    let mut path_buf = diag_buf_new()
+    diag_buf_init(mut_view(path_buf))
+    let mut seq: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        bg.actions[i].executed = false
+        bg.actions[i].cache_hit = false
+        bg.actions[i].early_cutoff_reused = false
+        bg.actions[i].corrupt_evicted = false
+
+        let act_snap = bg.actions[i]
+        if action_is_scheduled_for_mode(view(act_snap), check_only, run_tests) {
+            let outcome = cache_lookup_and_verify(
+                mut_view(*cache),
+                act_snap.action_kind,
+                act_snap.unit_kind,
+                act_snap.env_class,
+                act_snap.target_triple,
+                act_snap.profile_name,
+                act_snap.pkg_id.name,
+                act_snap.target_name,
+                act_snap.feature_set_hash,
+                act_snap.compiler_version_digest,
+                view(act_snap.tiers),
+                upstream_private_body_edited
+            )
+            bg.actions[i].last_miss_reason = outcome.miss_reason
+            bg.actions[i].corrupt_evicted = outcome.corrupt_entry_evicted
+
+            if outcome.hit {
+                bg.actions[i].cache_hit = true
+                bg.actions[i].early_cutoff_reused = outcome.early_cutoff_reused
+                bg.cached_actions = bg.cached_actions + 1u32
+                if outcome.early_cutoff_reused {
+                    bg.early_cutoff_actions = bg.early_cutoff_actions + 1u32
+                }
+                let updated_act = bg.actions[i]
+                push_build_event(mut_view(*bg), EVENT_ACTION_CACHED, view(updated_act), CACHE_HIT, true)
+            } else {
+                push_build_event(mut_view(*bg), EVENT_ACTION_STARTED, view(act_snap), outcome.miss_reason, true)
+                path_buf.len = 0usize
+                format_build_artifact_path(
+                    act_snap.action_kind,
+                    act_snap.unit_kind,
+                    act_snap.env_class,
+                    act_snap.target_triple,
+                    act_snap.profile_name,
+                    act_snap.pkg_id.name,
+                    act_snap.target_name,
+                    view(act_snap.tiers.build_fingerprint),
+                    mut_view(path_buf)
+                )
+                let worker_id = (seq % effective_jobs) + 1u32
+                let staging_slot = cache_stage_artifact_write(
+                    mut_view(*cache),
+                    worker_id,
+                    4200u32,
+                    act_snap.action_kind,
+                    act_snap.unit_kind,
+                    act_snap.env_class,
+                    act_snap.target_triple,
+                    act_snap.profile_name,
+                    act_snap.pkg_id.name,
+                    act_snap.target_name,
+                    diag_buf_as_str_view(view(path_buf)),
+                    act_snap.feature_set_hash,
+                    act_snap.compiler_version_digest,
+                    view(act_snap.tiers),
+                    act_snap.expected_payload_len
+                )
+                seq = seq + 1u32
+                if !cache_commit_staged_atomic(mut_view(*cache), staging_slot, cancel_token, seq) {
+                    bg.aborted_by_cancel = true
+                    bg.build_succeeded = false
+                    push_build_event(mut_view(*bg), EVENT_BUILD_FINISHED, view(act_snap), outcome.miss_reason, false)
+                    diag_buf_free(mut_view(path_buf))
+                    return false
+                }
+                bg.actions[i].executed = true
+                bg.executed_actions = bg.executed_actions + 1u32
+                let done_act = bg.actions[i]
+                push_build_event(mut_view(*bg), EVENT_ARTIFACT_EMITTED, view(done_act), outcome.miss_reason, true)
+                push_build_event(mut_view(*bg), EVENT_ACTION_COMPLETED, view(done_act), outcome.miss_reason, true)
+            }
+        }
+        i = i + 1usize
+    }
+
+    diag_buf_free(mut_view(path_buf))
+    push_build_event(mut_view(*bg), EVENT_BUILD_FINISHED, view(dummy_act), CACHE_HIT, true)
+    bg.build_succeeded = true
+    true
+}
+
+pub fn compute_build_graph_execution_digest(
+    bg: view<BuildGraph>,
+    cache: view<BuildArtifactCache>
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_EXEC_DIGEST_V1"))
+    d = digest256_mix_u64(d, bg.action_count as u64)
+    d = digest256_mix_u64(d, bg.executed_actions as u64)
+    d = digest256_mix_u64(d, bg.cached_actions as u64)
+    d = digest256_mix_u64(d, bg.event_count as u64)
+
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let a = bg.actions[i]
+        d = digest256_combine(d, a.tiers.build_fingerprint)
+        d = digest256_mix_u64(d, if a.executed { 1u64 } else { 0u64 })
+        d = digest256_mix_u64(d, if a.cache_hit { 1u64 } else { 0u64 })
+        i = i + 1usize
+    }
+
+    let mut c: usize = 0usize
+    while c < 48usize {
+        if cache.entries[c].occupied {
+            d = digest256_combine(d, cache.entries[c].actual_payload_digest)
+            d = digest256_mix_u64(d, cache.entries[c].actual_payload_len)
+        }
+        c = c + 1usize
+    }
+
+    let mut ev: usize = 0usize
+    while ev < bg.event_count {
+        let e = bg.events[ev]
+        d = digest256_mix_u64(d, e.event_kind as u64)
+        d = digest256_mix_u64(d, e.action_id as u64)
+        d = digest256_combine(d, e.build_fingerprint)
+        ev = ev + 1usize
+    }
+    d
+}
+
+pub fn verify_worker_count_invariance(
+    bg_template: view<BuildGraph>,
+    jobs_a: u32,
+    jobs_b: u32
+) -> bool {
+    let mut bg_a = *bg_template
+    let mut bg_b = *bg_template
+    let mut cache_a = build_artifact_cache_new()
+    let mut cache_b = build_artifact_cache_new()
+    let no_cancel = cancellation_token_none()
+
+    if !execute_build_graph(
+        mut_view(bg_a),
+        mut_view(cache_a),
+        jobs_a,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    ) {
+        return false
+    }
+    if !execute_build_graph(
+        mut_view(bg_b),
+        mut_view(cache_b),
+        jobs_b,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    ) {
+        return false
+    }
+
+    let dig_a = compute_build_graph_execution_digest(view(bg_a), view(cache_a))
+    let dig_b = compute_build_graph_execution_digest(view(bg_b), view(cache_b))
+    digest256_eq(dig_a, dig_b)
+}

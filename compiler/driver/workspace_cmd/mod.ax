@@ -1,0 +1,920 @@
+// Workspace CLI Commands & Graph Introspection
+// (`compiler/driver/workspace_cmd/mod.ax`, T852 / E20.1).
+//
+// Implements SPEC-110 §5 (`AXS-BLD-040`..`AXS-BLD-042`, `REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`).
+
+module compiler.driver.workspace_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.code.AX_DRIVER_UNKNOWN_OPTION
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.build.manifest.TARGET_UNIT_LIB
+use compiler.build.manifest.TARGET_UNIT_BIN
+use compiler.build.manifest.TARGET_UNIT_TEST
+use compiler.build.manifest.TARGET_UNIT_BENCH
+use compiler.build.manifest.TARGET_UNIT_BUILD_TOOL
+use compiler.build.manifest.AX_DRIVER_INVALID_PROFILE
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.dep_scope_name
+use compiler.build.manifest.target_unit_kind_name
+use compiler.build.manifest.report_manifest_diag_1
+
+use compiler.build.workspace.ENV_CLASS_TARGET
+use compiler.build.workspace.ENV_CLASS_HOST
+use compiler.build.workspace.WorkspaceGraph
+use compiler.build.workspace.env_class_name
+
+use compiler.build.cache.ACTION_RUN_BUILD_TOOL
+use compiler.build.cache.ACTION_EMIT_INTERFACE
+use compiler.build.cache.ACTION_COMPILE_CGU
+use compiler.build.cache.ACTION_ASSEMBLE_ARCHIVE
+use compiler.build.cache.ACTION_LINK_ARTIFACT
+use compiler.build.cache.ACTION_RUN_TEST_UNIT
+use compiler.build.cache.CancellationToken
+use compiler.build.cache.BuildArtifactCache
+use compiler.build.cache.build_action_kind_name
+use compiler.build.cache.cache_miss_reason_name
+use compiler.build.cache.build_artifact_cache_clear
+use compiler.build.cache.push_cache_key_short_hex
+
+use compiler.build.graph.EVENT_WORKSPACE_RESOLVED
+use compiler.build.graph.EVENT_ACTION_STARTED
+use compiler.build.graph.EVENT_ACTION_CACHED
+use compiler.build.graph.EVENT_ACTION_COMPLETED
+use compiler.build.graph.EVENT_ARTIFACT_EMITTED
+use compiler.build.graph.EVENT_BUILD_FINISHED
+use compiler.build.graph.BuildGraph
+use compiler.build.graph.build_event_kind_name
+use compiler.build.graph.execute_build_graph
+
+// =============================================================================
+// 1. Subcommand, Format & Exit Code Constants (`AXS-BLD-040..042`)
+// =============================================================================
+
+pub const WS_CMD_BUILD: u8 = 0u8
+pub const WS_CMD_CHECK: u8 = 1u8
+pub const WS_CMD_RUN: u8 = 2u8
+pub const WS_CMD_TEST: u8 = 3u8
+pub const WS_CMD_BENCH: u8 = 4u8
+pub const WS_CMD_CLEAN: u8 = 5u8
+pub const WS_CMD_GRAPH: u8 = 6u8
+
+pub const GRAPH_FMT_JSON: u8 = 0u8
+pub const GRAPH_FMT_DOT: u8 = 1u8
+
+pub const WS_EXIT_OK: i32 = 0i32
+pub const WS_EXIT_BUILD_FAILED: i32 = 1i32
+pub const WS_EXIT_USAGE_ERROR: i32 = 2i32
+
+pub fn workspace_subcommand_name(cmd: u8) -> StrView {
+    if cmd == WS_CMD_BUILD {
+        return ux2_sv("build")
+    }
+    if cmd == WS_CMD_CHECK {
+        return ux2_sv("check")
+    }
+    if cmd == WS_CMD_RUN {
+        return ux2_sv("run")
+    }
+    if cmd == WS_CMD_TEST {
+        return ux2_sv("test")
+    }
+    if cmd == WS_CMD_BENCH {
+        return ux2_sv("bench")
+    }
+    if cmd == WS_CMD_CLEAN {
+        return ux2_sv("clean")
+    }
+    ux2_sv("graph")
+}
+
+// =============================================================================
+// 2. Workspace CLI Options & Parser (`AXS-BLD-041`)
+// =============================================================================
+
+@derive(Copy)
+pub struct WorkspaceCliOptions {
+    pub subcommand: u8,
+    pub manifest_path: StrView,
+    pub workspace_wide: bool,
+    pub package_filter: StrView,
+    pub filter_lib_only: bool,
+    pub bin_filter: StrView,
+    pub filter_all_bins: bool,
+    pub test_filter: StrView,
+    pub filter_all_tests: bool,
+    pub bench_filter: StrView,
+    pub filter_all_benches: bool,
+    pub profile_name: StrView,
+    pub target_triple: StrView,
+    pub cli_features: [8]StrView,
+    pub cli_feature_count: usize,
+    pub no_default_features: bool,
+    pub all_features: bool,
+    pub jobs: u32,
+    pub offline: bool,
+    pub locked: bool,
+    pub frozen: bool,
+    pub explain: bool,
+    pub message_format_json: bool,
+    pub universal_targets: bool,
+    pub clean_all: bool,
+    pub clean_cache: bool,
+    pub graph_format: u8,
+    pub run_passthrough_args: [8]StrView,
+    pub run_passthrough_count: usize,
+}
+
+pub fn workspace_cli_options_default() -> WorkspaceCliOptions {
+    let e = ux2_sv_empty()
+    WorkspaceCliOptions {
+        subcommand: WS_CMD_BUILD,
+        manifest_path: ux2_sv("axiom.toml"),
+        workspace_wide: false,
+        package_filter: e,
+        filter_lib_only: false,
+        bin_filter: e,
+        filter_all_bins: false,
+        test_filter: e,
+        filter_all_tests: false,
+        bench_filter: e,
+        filter_all_benches: false,
+        profile_name: ux2_sv("dev"),
+        target_triple: ux2_sv("x86_64-windows"),
+        cli_features: [e; 8],
+        cli_feature_count: 0usize,
+        no_default_features: false,
+        all_features: false,
+        jobs: 1u32,
+        offline: false,
+        locked: false,
+        frozen: false,
+        explain: false,
+        message_format_json: false,
+        universal_targets: false,
+        clean_all: false,
+        clean_cache: false,
+        graph_format: GRAPH_FMT_JSON,
+        run_passthrough_args: [e; 8],
+        run_passthrough_count: 0usize,
+    }
+}
+
+fn parse_u32_decimal(s: StrView, out_val: mut_view<u32>) -> bool {
+    if s.len == 0usize {
+        return false
+    }
+    let mut v: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < s.len {
+        let b = bld_sv_byte(s, i)
+        if b < 48u8 || b > 57u8 {
+            return false
+        }
+        v = (v * 10u32) + ((b - 48u8) as u32)
+        i = i + 1usize
+    }
+    if v == 0u32 {
+        return false
+    }
+    *out_val = v
+    true
+}
+
+fn split_comma_features(csv: StrView, opts: mut_view<WorkspaceCliOptions>) {
+    let mut start: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= csv.len {
+        if i == csv.len || bld_sv_byte(csv, i) == 44u8 {
+            let item = bld_sv_slice(csv, start, i)
+            if item.len > 0usize && (opts.cli_feature_count) < 8usize {
+                opts.cli_features[opts.cli_feature_count] = item
+                opts.cli_feature_count = opts.cli_feature_count + 1usize
+            }
+            start = i + 1usize
+        }
+        i = i + 1usize
+    }
+}
+
+fn validate_profile_name(name: StrView) -> bool {
+    ux2_sv_eq(name, ux2_sv("dev")) ||
+    ux2_sv_eq(name, ux2_sv("release")) ||
+    ux2_sv_eq(name, ux2_sv("test")) ||
+    ux2_sv_eq(name, ux2_sv("bench"))
+}
+
+fn apply_graph_format_str(
+    val: StrView,
+    opts: mut_view<WorkspaceCliOptions>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    if ux2_sv_eq(val, ux2_sv("json")) {
+        opts.graph_format = GRAPH_FMT_JSON
+        return true
+    }
+    if ux2_sv_eq(val, ux2_sv("dot")) {
+        opts.graph_format = GRAPH_FMT_DOT
+        return true
+    }
+    report_manifest_diag_1(
+        mut_view(*sink),
+        AX_DRIVER_USAGE,
+        "invalid `--format` value for `axiomc graph`; expected `json` or `dot`",
+        "format",
+        val
+    )
+    false
+}
+
+pub fn workspace_parse_cli_args(
+    args: view<[16]StrView>,
+    arg_count: usize,
+    out_opts: mut_view<WorkspaceCliOptions>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    *out_opts = workspace_cli_options_default()
+    if arg_count == 0usize {
+        report_manifest_diag_1(
+            mut_view(*sink),
+            AX_DRIVER_USAGE,
+            "missing workspace subcommand (`build`, `check`, `run`, `test`, `bench`, `clean`, or `graph`)",
+            "subcommand",
+            ux2_sv_empty()
+        )
+        return false
+    }
+
+    let sub = (*args)[0]
+    if ux2_sv_eq(sub, ux2_sv("build")) {
+        out_opts.subcommand = WS_CMD_BUILD
+    } else if ux2_sv_eq(sub, ux2_sv("check")) {
+        out_opts.subcommand = WS_CMD_CHECK
+    } else if ux2_sv_eq(sub, ux2_sv("run")) {
+        out_opts.subcommand = WS_CMD_RUN
+    } else if ux2_sv_eq(sub, ux2_sv("test")) {
+        out_opts.subcommand = WS_CMD_TEST
+        out_opts.profile_name = ux2_sv("test")
+    } else if ux2_sv_eq(sub, ux2_sv("bench")) {
+        out_opts.subcommand = WS_CMD_BENCH
+        out_opts.profile_name = ux2_sv("bench")
+    } else if ux2_sv_eq(sub, ux2_sv("clean")) {
+        out_opts.subcommand = WS_CMD_CLEAN
+    } else if ux2_sv_eq(sub, ux2_sv("graph")) {
+        out_opts.subcommand = WS_CMD_GRAPH
+    } else {
+        report_manifest_diag_1(
+            mut_view(*sink),
+            AX_DRIVER_USAGE,
+            "unknown workspace subcommand",
+            "subcommand",
+            sub
+        )
+        return false
+    }
+
+    let mut i: usize = 1usize
+    let mut in_passthrough = false
+    while i < arg_count {
+        let a = (*args)[i]
+        if in_passthrough {
+            if (out_opts.run_passthrough_count) < 8usize {
+                out_opts.run_passthrough_args[out_opts.run_passthrough_count] = a
+                out_opts.run_passthrough_count = out_opts.run_passthrough_count + 1usize
+            }
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--")) {
+            in_passthrough = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--workspace")) {
+            out_opts.workspace_wide = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--lib")) {
+            out_opts.filter_lib_only = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--bins")) {
+            out_opts.filter_all_bins = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--tests")) {
+            out_opts.filter_all_tests = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--benches")) {
+            out_opts.filter_all_benches = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--release")) {
+            out_opts.profile_name = ux2_sv("release")
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--no-default-features")) {
+            out_opts.no_default_features = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--all-features")) {
+            out_opts.all_features = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--offline")) {
+            out_opts.offline = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--locked")) {
+            out_opts.locked = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--frozen")) {
+            out_opts.frozen = true
+            out_opts.locked = true
+            out_opts.offline = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--explain")) {
+            out_opts.explain = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--universal-targets")) {
+            out_opts.universal_targets = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--all")) {
+            out_opts.clean_all = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--cache")) {
+            out_opts.clean_cache = true
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--message-format=json")) {
+            out_opts.message_format_json = true
+            i = i + 1usize
+            continue
+        }
+        if bld_sv_starts_with(a, ux2_sv("--format=")) {
+            let val = bld_sv_slice(a, 9usize, a.len)
+            if !apply_graph_format_str(val, mut_view(*out_opts), mut_view(*sink)) {
+                return false
+            }
+            i = i + 1usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--format")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(
+                    mut_view(*sink),
+                    AX_DRIVER_USAGE,
+                    "`--format` requires a value (`json` or `dot`)",
+                    "option",
+                    a
+                )
+                return false
+            }
+            if !apply_graph_format_str((*args)[i + 1usize], mut_view(*out_opts), mut_view(*sink)) {
+                return false
+            }
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--manifest-path")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--manifest-path`", "option", a)
+                return false
+            }
+            out_opts.manifest_path = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("-p")) || ux2_sv_eq(a, ux2_sv("--package")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--package`", "option", a)
+                return false
+            }
+            out_opts.package_filter = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--bin")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--bin`", "option", a)
+                return false
+            }
+            out_opts.bin_filter = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--test")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--test`", "option", a)
+                return false
+            }
+            out_opts.test_filter = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--bench")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--bench`", "option", a)
+                return false
+            }
+            out_opts.bench_filter = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--profile")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--profile`", "option", a)
+                return false
+            }
+            let prof = (*args)[i + 1usize]
+            if !validate_profile_name(prof) {
+                report_manifest_diag_1(
+                    mut_view(*sink),
+                    AX_DRIVER_INVALID_PROFILE,
+                    "unknown build profile; expected `dev`, `release`, `test`, or `bench`",
+                    "profile",
+                    prof
+                )
+                return false
+            }
+            out_opts.profile_name = prof
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--target")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--target`", "option", a)
+                return false
+            }
+            out_opts.target_triple = (*args)[i + 1usize]
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("--features")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--features`", "option", a)
+                return false
+            }
+            split_comma_features((*args)[i + 1usize], mut_view(*out_opts))
+            i = i + 2usize
+            continue
+        }
+        if ux2_sv_eq(a, ux2_sv("-j")) || ux2_sv_eq(a, ux2_sv("--jobs")) {
+            if (i + 1usize) >= arg_count {
+                report_manifest_diag_1(mut_view(*sink), AX_DRIVER_USAGE, "missing value for `--jobs`", "option", a)
+                return false
+            }
+            let mut parsed_jobs: u32 = 1u32
+            if !parse_u32_decimal((*args)[i + 1usize], mut_view(parsed_jobs)) {
+                report_manifest_diag_1(
+                    mut_view(*sink),
+                    AX_DRIVER_USAGE,
+                    "`--jobs` requires a positive integer",
+                    "jobs",
+                    (*args)[i + 1usize]
+                )
+                return false
+            }
+            out_opts.jobs = parsed_jobs
+            i = i + 2usize
+            continue
+        }
+
+        report_manifest_diag_1(
+            mut_view(*sink),
+            AX_DRIVER_UNKNOWN_OPTION,
+            "unknown workspace CLI option",
+            "option",
+            a
+        )
+        return false
+    }
+
+    true
+}
+
+// =============================================================================
+// 3. `axiomc graph --format=json|dot` Renderers (`AXS-BLD-042 §1`, `REQ-PKG-025`)
+// =============================================================================
+
+pub fn render_build_graph_json(
+    ws: view<WorkspaceGraph>,
+    bg: view<BuildGraph>,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("{\"schema_version\":1,\"host_triple\":\""))
+    diag_buf_push_sv(mut_view(*buf), bg.host_triple)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"target_triple\":\""))
+    diag_buf_push_sv(mut_view(*buf), bg.target_triple)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"profile\":\""))
+    diag_buf_push_sv(mut_view(*buf), bg.profile_name)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"packages\":["))
+
+    let mut p: usize = 0usize
+    while p < ws.package_count {
+        if p > 0usize {
+            diag_buf_push_byte(mut_view(*buf), 44u8)
+        }
+        let pkg = ws.packages[p]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("{\"name\":\""))
+        diag_buf_push_sv(mut_view(*buf), pkg.identity.name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"version\":\""))
+        diag_buf_push_u32(mut_view(*buf), pkg.identity.version.major)
+        diag_buf_push_byte(mut_view(*buf), 46u8)
+        diag_buf_push_u32(mut_view(*buf), pkg.identity.version.minor)
+        diag_buf_push_byte(mut_view(*buf), 46u8)
+        diag_buf_push_u32(mut_view(*buf), pkg.identity.version.patch)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"env\":\""))
+        diag_buf_push_sv(mut_view(*buf), env_class_name(pkg.identity.target_env_class))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"features\":["))
+        let mut f: usize = 0usize
+        while f < pkg.active_feature_count {
+            if f > 0usize {
+                diag_buf_push_byte(mut_view(*buf), 44u8)
+            }
+            diag_buf_push_byte(mut_view(*buf), 34u8)
+            diag_buf_push_sv(mut_view(*buf), pkg.active_features[f])
+            diag_buf_push_byte(mut_view(*buf), 34u8)
+            f = f + 1usize
+        }
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("]}"))
+        p = p + 1usize
+    }
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("],\"edges\":["))
+    let mut e: usize = 0usize
+    while e < ws.edge_count {
+        if e > 0usize {
+            diag_buf_push_byte(mut_view(*buf), 44u8)
+        }
+        let edge = ws.edges[e]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("{\"from\":\""))
+        diag_buf_push_sv(mut_view(*buf), edge.from_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"to\":\""))
+        diag_buf_push_sv(mut_view(*buf), edge.to_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"scope\":\""))
+        diag_buf_push_sv(mut_view(*buf), dep_scope_name(edge.scope))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"to_env\":\""))
+        diag_buf_push_sv(mut_view(*buf), env_class_name(edge.to_env_class))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\"}"))
+        e = e + 1usize
+    }
+
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("],\"actions\":["))
+    let mut a: usize = 0usize
+    while a < bg.action_count {
+        if a > 0usize {
+            diag_buf_push_byte(mut_view(*buf), 44u8)
+        }
+        let act = bg.actions[a]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("{\"id\":"))
+        diag_buf_push_u32(mut_view(*buf), act.action_id)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(",\"kind\":\""))
+        diag_buf_push_sv(mut_view(*buf), build_action_kind_name(act.action_kind))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"pkg\":\""))
+        diag_buf_push_sv(mut_view(*buf), act.pkg_id.name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"unit_kind\":\""))
+        diag_buf_push_sv(mut_view(*buf), target_unit_kind_name(act.unit_kind))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"target\":\""))
+        diag_buf_push_sv(mut_view(*buf), act.target_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"env\":\""))
+        diag_buf_push_sv(mut_view(*buf), env_class_name(act.env_class))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"triple\":\""))
+        diag_buf_push_sv(mut_view(*buf), act.target_triple)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"semantic_fingerprint\":\""))
+        push_cache_key_short_hex(view(act.tiers.semantic_fingerprint), mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"abi_fingerprint\":\""))
+        push_cache_key_short_hex(view(act.tiers.abi_fingerprint), mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"codegen_fingerprint\":\""))
+        push_cache_key_short_hex(view(act.tiers.codegen_fingerprint), mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"build_fingerprint\":\""))
+        push_cache_key_short_hex(view(act.tiers.build_fingerprint), mut_view(*buf))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"deps\":["))
+        let mut d: usize = 0usize
+        while d < act.dep_action_count {
+            if d > 0usize {
+                diag_buf_push_byte(mut_view(*buf), 44u8)
+            }
+            diag_buf_push_u32(mut_view(*buf), act.dep_action_ids[d])
+            d = d + 1usize
+        }
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("]}"))
+        a = a + 1usize
+    }
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("]}\n"))
+}
+
+pub fn render_build_graph_dot(
+    ws: view<WorkspaceGraph>,
+    bg: view<BuildGraph>,
+    buf: mut_view<DiagBuffer>
+) {
+    let _ = ws
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("digraph axiom_build_graph {\n  rankdir=LR;\n"))
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let act = bg.actions[i]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("  a"))
+        diag_buf_push_u32(mut_view(*buf), act.action_id)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(" [label=\""))
+        diag_buf_push_sv(mut_view(*buf), build_action_kind_name(act.action_kind))
+        diag_buf_push_byte(mut_view(*buf), 58u8)
+        diag_buf_push_sv(mut_view(*buf), act.pkg_id.name)
+        diag_buf_push_byte(mut_view(*buf), 58u8)
+        diag_buf_push_sv(mut_view(*buf), act.target_name)
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(" ("))
+        diag_buf_push_sv(mut_view(*buf), env_class_name(act.env_class))
+        diag_buf_push_sv(mut_view(*buf), ux2_sv(")\"];\n"))
+
+        let mut d: usize = 0usize
+        while d < act.dep_action_count {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("  a"))
+            diag_buf_push_u32(mut_view(*buf), act.dep_action_ids[d])
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" -> a"))
+            diag_buf_push_u32(mut_view(*buf), act.action_id)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(";\n"))
+            d = d + 1usize
+        }
+        i = i + 1usize
+    }
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("}\n"))
+}
+
+// =============================================================================
+// 4. `--explain` & `--message-format=json` Renderers (`AXS-BLD-031 §3`, `AXS-BLD-042 §2`)
+// =============================================================================
+
+pub fn render_build_explain_report(
+    bg: view<BuildGraph>,
+    buf: mut_view<DiagBuffer>
+) {
+    let mut i: usize = 0usize
+    while i < bg.action_count {
+        let act = bg.actions[i]
+        if act.executed || act.cache_hit {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("explain action="))
+            diag_buf_push_sv(mut_view(*buf), build_action_kind_name(act.action_kind))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" pkg="))
+            diag_buf_push_sv(mut_view(*buf), act.pkg_id.name)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" target="))
+            diag_buf_push_sv(mut_view(*buf), act.target_name)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" env="))
+            diag_buf_push_sv(mut_view(*buf), env_class_name(act.env_class))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" status="))
+            if act.cache_hit {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("hit"))
+            } else {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("miss"))
+            }
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" reason="))
+            diag_buf_push_sv(mut_view(*buf), cache_miss_reason_name(act.last_miss_reason))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" early_cutoff="))
+            if act.early_cutoff_reused {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("true"))
+            } else {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("false"))
+            }
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(" key="))
+            push_cache_key_short_hex(view(act.tiers.build_fingerprint), mut_view(*buf))
+            diag_buf_push_byte(mut_view(*buf), 10u8)
+        }
+        i = i + 1usize
+    }
+}
+
+pub fn render_build_events_jsonl(
+    bg: view<BuildGraph>,
+    buf: mut_view<DiagBuffer>
+) {
+    let mut i: usize = 0usize
+    while i < bg.event_count {
+        let ev = bg.events[i]
+        diag_buf_push_sv(mut_view(*buf), ux2_sv("{\"event\":\""))
+        diag_buf_push_sv(mut_view(*buf), build_event_kind_name(ev.event_kind))
+        if ev.event_kind == EVENT_WORKSPACE_RESOLVED {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"packages\":"))
+            diag_buf_push_u32(mut_view(*buf), bg.package_count)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(",\"actions\":"))
+            diag_buf_push_u32(mut_view(*buf), bg.action_count as u32)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("}\n"))
+        } else if ev.event_kind == EVENT_BUILD_FINISHED {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"success\":"))
+            if ev.success {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("true"))
+            } else {
+                diag_buf_push_sv(mut_view(*buf), ux2_sv("false"))
+            }
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(",\"executed\":"))
+            diag_buf_push_u32(mut_view(*buf), bg.executed_actions)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(",\"cached\":"))
+            diag_buf_push_u32(mut_view(*buf), bg.cached_actions)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("}\n"))
+        } else {
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"action_id\":"))
+            diag_buf_push_u32(mut_view(*buf), ev.action_id)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv(",\"kind\":\""))
+            diag_buf_push_sv(mut_view(*buf), build_action_kind_name(ev.action_kind))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"pkg\":\""))
+            diag_buf_push_sv(mut_view(*buf), ev.pkg_name)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"target\":\""))
+            diag_buf_push_sv(mut_view(*buf), ev.target_name)
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"env\":\""))
+            diag_buf_push_sv(mut_view(*buf), env_class_name(ev.env_class))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\",\"reason\":\""))
+            diag_buf_push_sv(mut_view(*buf), cache_miss_reason_name(ev.miss_reason))
+            diag_buf_push_sv(mut_view(*buf), ux2_sv("\"}\n"))
+        }
+        i = i + 1usize
+    }
+}
+
+// =============================================================================
+// 5. Workspace Subcommand Execution (`AXS-BLD-040`, `REQ-PKG-022`, `REQ-PKG-024`, `REQ-PKG-025`)
+// =============================================================================
+
+fn package_exists_in_workspace(ws: view<WorkspaceGraph>, pkg_name: StrView) -> bool {
+    let mut i: usize = 0usize
+    while i < ws.package_count {
+        if ux2_sv_eq(ws.packages[i].identity.name, pkg_name) {
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+fn select_run_binary_target(
+    ws: view<WorkspaceGraph>,
+    opts: view<WorkspaceCliOptions>,
+    out_bin_name: mut_view<StrView>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let mut match_count: u32 = 0u32
+    let mut matched_name = ux2_sv_empty()
+    let mut u: usize = 0usize
+    while u < ws.unit_count {
+        let unit = ws.units[u]
+        if unit.unit_kind == TARGET_UNIT_BIN {
+            let pkg_ok = opts.package_filter.len == 0usize ||
+                         ux2_sv_eq(unit.pkg_name, opts.package_filter)
+            let bin_ok = opts.bin_filter.len == 0usize ||
+                         ux2_sv_eq(unit.target_name, opts.bin_filter)
+            if pkg_ok && bin_ok {
+                match_count = match_count + 1u32
+                matched_name = unit.target_name
+            }
+        }
+        u = u + 1usize
+    }
+
+    if match_count == 0u32 {
+        report_manifest_diag_1(
+            mut_view(*sink),
+            AX_DRIVER_USAGE,
+            "no matching `[[bin]]` target found for `axiomc run`",
+            "bin",
+            opts.bin_filter
+        )
+        return false
+    }
+    if match_count > 1u32 && opts.bin_filter.len == 0usize {
+        report_manifest_diag_1(
+            mut_view(*sink),
+            AX_DRIVER_USAGE,
+            "`axiomc run` requires `--bin <name>` when multiple binary targets exist",
+            "subcommand",
+            ux2_sv("run")
+        )
+        return false
+    }
+    *out_bin_name = matched_name
+    true
+}
+
+pub fn workspace_cmd_execute(
+    opts: view<WorkspaceCliOptions>,
+    ws: view<WorkspaceGraph>,
+    bg: mut_view<BuildGraph>,
+    cache: mut_view<BuildArtifactCache>,
+    upstream_private_body_edited: bool,
+    cancel_token: view<CancellationToken>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.package_filter.len > 0usize {
+        if !package_exists_in_workspace(ws, opts.package_filter) {
+            report_manifest_diag_1(
+                mut_view(*sink),
+                AX_DRIVER_USAGE,
+                "package specified with `-p`/`--package` was not found in workspace",
+                "package",
+                opts.package_filter
+            )
+            return WS_EXIT_USAGE_ERROR
+        }
+    }
+
+    if opts.subcommand == WS_CMD_CLEAN {
+        let removed = build_artifact_cache_clear(
+            mut_view(*cache),
+            opts.clean_all,
+            opts.clean_cache,
+            opts.target_triple,
+            opts.profile_name
+        )
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("clean removed="))
+        diag_buf_push_u32(mut_view(*out_buf), removed)
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv(" all="))
+        if opts.clean_all {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("true"))
+        } else {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("false"))
+        }
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv(" cache="))
+        if opts.clean_cache {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("true\n"))
+        } else {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("false\n"))
+        }
+        return WS_EXIT_OK
+    }
+
+    if opts.subcommand == WS_CMD_GRAPH {
+        if opts.graph_format == GRAPH_FMT_DOT {
+            render_build_graph_dot(ws, view(*bg), mut_view(*out_buf))
+        } else {
+            render_build_graph_json(ws, view(*bg), mut_view(*out_buf))
+        }
+        return WS_EXIT_OK
+    }
+
+    let mut selected_bin = ux2_sv_empty()
+    if opts.subcommand == WS_CMD_RUN {
+        if !select_run_binary_target(ws, opts, mut_view(selected_bin), mut_view(*sink)) {
+            return WS_EXIT_USAGE_ERROR
+        }
+    }
+
+    let check_only = opts.subcommand == WS_CMD_CHECK
+    let run_tests = opts.subcommand == WS_CMD_TEST || opts.subcommand == WS_CMD_BENCH
+    let ok = execute_build_graph(
+        mut_view(*bg),
+        mut_view(*cache),
+        opts.jobs,
+        check_only,
+        run_tests,
+        upstream_private_body_edited,
+        cancel_token
+    )
+    if opts.message_format_json {
+        render_build_events_jsonl(view(*bg), mut_view(*out_buf))
+    }
+    if opts.explain {
+        render_build_explain_report(view(*bg), mut_view(*out_buf))
+    }
+    if !ok {
+        return WS_EXIT_BUILD_FAILED
+    }
+
+    if opts.subcommand == WS_CMD_RUN {
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("run bin="))
+        diag_buf_push_sv(mut_view(*out_buf), selected_bin)
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv(" args="))
+        diag_buf_push_u32(mut_view(*out_buf), opts.run_passthrough_count as u32)
+        diag_buf_push_byte(mut_view(*out_buf), 10u8)
+    }
+
+    WS_EXIT_OK
+}

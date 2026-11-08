@@ -1,0 +1,783 @@
+// Content-Addressed Build Cache, 4-Tier Fingerprint Hierarchy, Interface Early Cutoff,
+// Poisoning/Corruption Defense, Atomic Staging & Reproducible Packaging
+// (`compiler/build/cache/mod.ax`, T852 / E20.1).
+//
+// Implements SPEC-110 §4 (`AXS-BLD-030`..`AXS-BLD-034`, `INV-BLD-001`..`INV-BLD-003`).
+
+module compiler.build.cache
+
+use compiler.kernel.hash.ax_hash_bytes
+use compiler.kernel.hash.ax_hash_u64
+use compiler.kernel.hash.ax_hash_combine
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.build.manifest.TARGET_UNIT_LIB
+use compiler.build.manifest.TARGET_UNIT_BIN
+use compiler.build.manifest.TARGET_UNIT_TEST
+use compiler.build.manifest.TARGET_UNIT_BENCH
+use compiler.build.manifest.TARGET_UNIT_BUILD_TOOL
+use compiler.build.workspace.ENV_CLASS_TARGET
+use compiler.build.workspace.ENV_CLASS_HOST
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.PackageIdentity
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_u64
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_combine
+use compiler.build.workspace.push_u64_hex16
+
+// =============================================================================
+// 1. Build Action Kinds & Cache Miss Reason Taxonomy (`AXS-BLD-023`, `AXS-BLD-031`, `AXS-BLD-041`)
+// =============================================================================
+
+pub const ACTION_RUN_BUILD_TOOL: u8 = 0u8
+pub const ACTION_EMIT_INTERFACE: u8 = 1u8
+pub const ACTION_COMPILE_CGU: u8 = 2u8
+pub const ACTION_ASSEMBLE_ARCHIVE: u8 = 3u8
+pub const ACTION_LINK_ARTIFACT: u8 = 4u8
+pub const ACTION_RUN_TEST_UNIT: u8 = 5u8
+
+pub const CACHE_HIT: u8 = 0u8
+pub const CACHE_MISS_MISSING_OUTPUT: u8 = 1u8
+pub const CACHE_MISS_SOURCE_MODIFIED: u8 = 2u8
+pub const CACHE_MISS_INTERFACE_CHANGED: u8 = 3u8
+pub const CACHE_MISS_PROFILE_CHANGED: u8 = 4u8
+pub const CACHE_MISS_FEATURES_CHANGED: u8 = 5u8
+pub const CACHE_MISS_TARGET_CHANGED: u8 = 6u8
+pub const CACHE_MISS_COMPILER_CHANGED: u8 = 7u8
+pub const CACHE_MISS_CORRUPT_ENTRY_EVICTED: u8 = 8u8
+
+pub const CACHE_HEADER_MAGIC: u32 = 0x41584348u32
+pub const CACHE_SCHEMA_VERSION: u32 = 1u32
+
+pub fn build_action_kind_name(kind: u8) -> StrView {
+    if kind == ACTION_RUN_BUILD_TOOL {
+        return ux2_sv("RunBuildTool")
+    }
+    if kind == ACTION_EMIT_INTERFACE {
+        return ux2_sv("EmitInterface")
+    }
+    if kind == ACTION_COMPILE_CGU {
+        return ux2_sv("CompileCodegenUnit")
+    }
+    if kind == ACTION_ASSEMBLE_ARCHIVE {
+        return ux2_sv("AssembleArchive")
+    }
+    if kind == ACTION_LINK_ARTIFACT {
+        return ux2_sv("LinkArtifact")
+    }
+    ux2_sv("RunTestUnit")
+}
+
+pub fn cache_miss_reason_name(reason: u8) -> StrView {
+    if reason == CACHE_HIT {
+        return ux2_sv("CacheHit")
+    }
+    if reason == CACHE_MISS_MISSING_OUTPUT {
+        return ux2_sv("MissingOutput")
+    }
+    if reason == CACHE_MISS_SOURCE_MODIFIED {
+        return ux2_sv("SourceModified")
+    }
+    if reason == CACHE_MISS_INTERFACE_CHANGED {
+        return ux2_sv("InterfaceChanged")
+    }
+    if reason == CACHE_MISS_PROFILE_CHANGED {
+        return ux2_sv("ProfileChanged")
+    }
+    if reason == CACHE_MISS_FEATURES_CHANGED {
+        return ux2_sv("FeaturesChanged")
+    }
+    if reason == CACHE_MISS_TARGET_CHANGED {
+        return ux2_sv("TargetChanged")
+    }
+    if reason == CACHE_MISS_COMPILER_CHANGED {
+        return ux2_sv("CompilerChanged")
+    }
+    ux2_sv("CorruptEntryEvicted")
+}
+
+// =============================================================================
+// 2. Four-Tier Fingerprint Hierarchy (`AXS-BLD-030`, `AXS-BLD-031`, `INV-BLD-002`)
+// =============================================================================
+
+@derive(Copy)
+pub struct FourTierFingerprints {
+    pub semantic_fingerprint: Digest256,
+    pub abi_fingerprint: Digest256,
+    pub codegen_fingerprint: Digest256,
+    pub build_fingerprint: Digest256,
+}
+
+@derive(Copy)
+pub struct UnitFingerprintInputs {
+    pub pkg_id: PackageIdentity,
+    pub unit_kind: u8,
+    pub env_class: u8,
+    pub target_name: StrView,
+    pub target_triple: StrView,
+    pub profile_name: StrView,
+    pub public_api_source_hash: u64,
+    pub private_body_source_hash: u64,
+    pub enabled_features_digest: Digest256,
+    pub upstream_interfaces_digest: Digest256,
+    pub upstream_abi_digest: Digest256,
+    pub comptime_eval_digest: Digest256,
+    pub safety_profile: StrView,
+    pub panic_strategy: StrView,
+    pub opt_level: u8,
+    pub lto_mode: StrView,
+    pub debug_info: StrView,
+    pub codegen_units: u32,
+    pub compiler_version_digest: u64,
+    pub sysroot_fingerprint: u64,
+}
+
+pub fn unit_fingerprint_inputs_default(pkg_id: PackageIdentity) -> UnitFingerprintInputs {
+    let z = digest256_zero()
+    UnitFingerprintInputs {
+        pkg_id: pkg_id,
+        unit_kind: TARGET_UNIT_LIB,
+        env_class: ENV_CLASS_TARGET,
+        target_name: pkg_id.name,
+        target_triple: ux2_sv("x86_64-windows"),
+        profile_name: ux2_sv("dev"),
+        public_api_source_hash: 0u64,
+        private_body_source_hash: 0u64,
+        enabled_features_digest: z,
+        upstream_interfaces_digest: z,
+        upstream_abi_digest: z,
+        comptime_eval_digest: z,
+        safety_profile: ux2_sv("safe"),
+        panic_strategy: ux2_sv("unwind"),
+        opt_level: 0u8,
+        lto_mode: ux2_sv("off"),
+        debug_info: ux2_sv("full"),
+        codegen_units: 16u32,
+        compiler_version_digest: 0x4158494F4D5F3236u64,
+        sysroot_fingerprint: 0x535953524F4F5431u64,
+    }
+}
+
+pub fn compute_semantic_fingerprint(inp: view<UnitFingerprintInputs>) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_SEMANTIC_FP_V1"))
+    d = digest256_combine(d, inp.pkg_id.identity_digest)
+    d = digest256_mix_u64(d, inp.unit_kind as u64)
+    d = digest256_mix_sv(d, inp.target_name)
+    d = digest256_mix_u64(d, inp.public_api_source_hash)
+    d = digest256_combine(d, inp.enabled_features_digest)
+    d = digest256_combine(d, inp.upstream_interfaces_digest)
+    d = digest256_combine(d, inp.comptime_eval_digest)
+    d
+}
+
+pub fn compute_abi_fingerprint(
+    sem_fp: Digest256,
+    inp: view<UnitFingerprintInputs>
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_ABI_FP_V1"))
+    d = digest256_combine(d, sem_fp)
+    d = digest256_mix_sv(d, inp.target_triple)
+    d = digest256_mix_sv(d, inp.safety_profile)
+    d = digest256_mix_sv(d, inp.panic_strategy)
+    d = digest256_combine(d, inp.upstream_abi_digest)
+    d
+}
+
+pub fn compute_codegen_fingerprint(
+    sem_fp: Digest256,
+    abi_fp: Digest256,
+    inp: view<UnitFingerprintInputs>
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_CODEGEN_FP_V1"))
+    d = digest256_combine(d, sem_fp)
+    d = digest256_combine(d, abi_fp)
+    d = digest256_mix_u64(d, inp.private_body_source_hash)
+    d = digest256_mix_u64(d, inp.opt_level as u64)
+    d = digest256_mix_sv(d, inp.lto_mode)
+    d = digest256_mix_sv(d, inp.debug_info)
+    d = digest256_mix_u64(d, inp.codegen_units as u64)
+    d = digest256_mix_u64(d, inp.compiler_version_digest)
+    d = digest256_mix_u64(d, inp.sysroot_fingerprint)
+    d
+}
+
+// Computes the action-specific `BuildFingerprint` (`AXS-BLD-031`):
+// - `EmitInterface` (`.axmi`) depends ONLY on `SemanticFingerprint` + `AbiFingerprint`
+//   (private function body edits inside a package do NOT alter its `.axmi` cache key!).
+// - `CompileCodegenUnit`, `AssembleArchive`, `LinkArtifact`, `RunBuildTool`, `RunTestUnit`
+//   include `CodegenFingerprint`.
+pub fn compute_action_build_fingerprint(
+    action_kind: u8,
+    unit_kind: u8,
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    tiers: view<FourTierFingerprints>
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_BUILD_FP_V1"))
+    d = digest256_mix_u64(d, action_kind as u64)
+    d = digest256_mix_u64(d, unit_kind as u64)
+    d = digest256_mix_u64(d, env_class as u64)
+    d = digest256_mix_sv(d, target_triple)
+    d = digest256_mix_sv(d, profile_name)
+    d = digest256_combine(d, tiers.semantic_fingerprint)
+    d = digest256_combine(d, tiers.abi_fingerprint)
+    if action_kind != ACTION_EMIT_INTERFACE {
+        d = digest256_combine(d, tiers.codegen_fingerprint)
+    }
+    d
+}
+
+pub fn compute_four_tier_fingerprints(
+    action_kind: u8,
+    inp: view<UnitFingerprintInputs>
+) -> FourTierFingerprints {
+    let sem = compute_semantic_fingerprint(inp)
+    let abi = compute_abi_fingerprint(sem, inp)
+    let cg = compute_codegen_fingerprint(sem, abi, inp)
+    let mut tiers = FourTierFingerprints {
+        semantic_fingerprint: sem,
+        abi_fingerprint: abi,
+        codegen_fingerprint: cg,
+        build_fingerprint: digest256_zero(),
+    }
+    tiers.build_fingerprint = compute_action_build_fingerprint(
+        action_kind,
+        inp.unit_kind,
+        inp.env_class,
+        inp.target_triple,
+        inp.profile_name,
+        view(tiers)
+    )
+    tiers
+}
+
+pub fn compute_artifact_payload_digest(
+    build_fp: Digest256,
+    target_triple: StrView,
+    payload_len: u64
+) -> Digest256 {
+    let mut d = digest256_domain_init(ux2_sv("AXIOM_ARTIFACT_PAYLOAD_V1"))
+    d = digest256_combine(d, build_fp)
+    d = digest256_mix_sv(d, target_triple)
+    d = digest256_mix_u64(d, payload_len)
+    d
+}
+
+// =============================================================================
+// 3. Content-Addressed Cache Store, Poison Defense & Atomic Commits (`AXS-BLD-032..034`)
+// =============================================================================
+
+@derive(Copy)
+pub struct CacheEntryRecord {
+    pub occupied: bool,
+    pub header_magic: u32,
+    pub schema_version: u32,
+    pub action_kind: u8,
+    pub unit_kind: u8,
+    pub env_class: u8,
+    pub target_triple: StrView,
+    pub profile_name: StrView,
+    pub pkg_name: StrView,
+    pub target_name: StrView,
+    pub artifact_path: StrView,
+    pub tiers: FourTierFingerprints,
+    pub feature_set_hash: Digest256,
+    pub compiler_version_digest: u64,
+    pub expected_payload_len: u64,
+    pub actual_payload_len: u64,
+    pub expected_payload_digest: Digest256,
+    pub actual_payload_digest: Digest256,
+    pub mtime_zeroed: bool,
+    pub uid_gid_zeroed: bool,
+    pub logical_path_remapped: bool,
+}
+
+@derive(Copy)
+pub struct AtomicStagingSlot {
+    pub active: bool,
+    pub pid: u32,
+    pub worker_id: u32,
+    pub temp_path_hash: u64,
+    pub candidate: CacheEntryRecord,
+}
+
+@derive(Copy)
+pub struct CancellationToken {
+    pub cancelled: bool,
+    pub cancel_after_seq: u32,
+}
+
+pub fn cancellation_token_none() -> CancellationToken {
+    CancellationToken {
+        cancelled: false,
+        cancel_after_seq: 0xFFFFFFFFu32,
+    }
+}
+
+pub fn cancellation_token_after_seq(seq: u32) -> CancellationToken {
+    CancellationToken {
+        cancelled: true,
+        cancel_after_seq: seq,
+    }
+}
+
+pub fn cancellation_token_is_active(tok: view<CancellationToken>, current_seq: u32) -> bool {
+    tok.cancelled && current_seq >= tok.cancel_after_seq
+}
+
+@derive(Copy)
+pub struct CacheLookupOutcome {
+    pub hit: bool,
+    pub miss_reason: u8,
+    pub early_cutoff_reused: bool,
+    pub corrupt_entry_evicted: bool,
+    pub matched_slot: usize,
+}
+
+@derive(Copy)
+pub struct BuildArtifactCache {
+    pub entries: [48]CacheEntryRecord,
+    pub entry_count: usize,
+    pub staging_slots: [8]AtomicStagingSlot,
+    pub total_hits: u32,
+    pub total_misses: u32,
+    pub early_cutoff_hits: u32,
+    pub corrupt_evictions: u32,
+    pub atomic_commits: u32,
+    pub aborted_temp_files: u32,
+}
+
+pub fn cache_entry_record_empty() -> CacheEntryRecord {
+    let e = ux2_sv_empty()
+    let z = digest256_zero()
+    let zt = FourTierFingerprints {
+        semantic_fingerprint: z,
+        abi_fingerprint: z,
+        codegen_fingerprint: z,
+        build_fingerprint: z,
+    }
+    CacheEntryRecord {
+        occupied: false,
+        header_magic: CACHE_HEADER_MAGIC,
+        schema_version: CACHE_SCHEMA_VERSION,
+        action_kind: ACTION_EMIT_INTERFACE,
+        unit_kind: TARGET_UNIT_LIB,
+        env_class: ENV_CLASS_TARGET,
+        target_triple: e,
+        profile_name: e,
+        pkg_name: e,
+        target_name: e,
+        artifact_path: e,
+        tiers: zt,
+        feature_set_hash: z,
+        compiler_version_digest: 0u64,
+        expected_payload_len: 0u64,
+        actual_payload_len: 0u64,
+        expected_payload_digest: z,
+        actual_payload_digest: z,
+        mtime_zeroed: true,
+        uid_gid_zeroed: true,
+        logical_path_remapped: true,
+    }
+}
+
+fn atomic_staging_slot_empty() -> AtomicStagingSlot {
+    AtomicStagingSlot {
+        active: false,
+        pid: 0u32,
+        worker_id: 0u32,
+        temp_path_hash: 0u64,
+        candidate: cache_entry_record_empty(),
+    }
+}
+
+pub fn build_artifact_cache_new() -> BuildArtifactCache {
+    let rec = cache_entry_record_empty()
+    let stg = atomic_staging_slot_empty()
+    BuildArtifactCache {
+        entries: [rec; 48],
+        entry_count: 0usize,
+        staging_slots: [stg; 8],
+        total_hits: 0u32,
+        total_misses: 0u32,
+        early_cutoff_hits: 0u32,
+        corrupt_evictions: 0u32,
+        atomic_commits: 0u32,
+        aborted_temp_files: 0u32,
+    }
+}
+
+pub fn build_artifact_cache_clear(
+    cache: mut_view<BuildArtifactCache>,
+    clear_all_targets: bool,
+    clear_cache_store: bool,
+    target_triple: StrView,
+    profile_name: StrView
+) -> u32 {
+    let mut removed: u32 = 0u32
+    let mut i: usize = 0usize
+    while i < 48usize {
+        if cache.entries[i].occupied {
+            let match_filter = clear_all_targets || clear_cache_store ||
+                (ux2_sv_eq(cache.entries[i].target_triple, target_triple) &&
+                 ux2_sv_eq(cache.entries[i].profile_name, profile_name))
+            if match_filter {
+                cache.entries[i] = cache_entry_record_empty()
+                removed = removed + 1u32
+                if cache.entry_count > 0usize {
+                    cache.entry_count = cache.entry_count - 1usize
+                }
+            }
+        }
+        i = i + 1usize
+    }
+    let mut s: usize = 0usize
+    while s < 8usize {
+        cache.staging_slots[s] = atomic_staging_slot_empty()
+        s = s + 1usize
+    }
+    removed
+}
+
+pub fn format_atomic_temp_path(
+    target_path: StrView,
+    pid: u32,
+    worker_id: u32,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), target_path)
+    diag_buf_push_sv(mut_view(*buf), ux2_sv(".tmp."))
+    diag_buf_push_u32(mut_view(*buf), pid)
+    diag_buf_push_byte(mut_view(*buf), 46u8)
+    diag_buf_push_u32(mut_view(*buf), worker_id)
+}
+
+pub fn format_reproducible_logical_src_path(
+    pkg_id: view<PackageIdentity>,
+    rel_src_path: StrView,
+    buf: mut_view<DiagBuffer>
+) {
+    diag_buf_push_sv(mut_view(*buf), ux2_sv("pkg://"))
+    diag_buf_push_sv(mut_view(*buf), pkg_id.name)
+    diag_buf_push_byte(mut_view(*buf), 64u8)
+    diag_buf_push_u32(mut_view(*buf), pkg_id.version.major)
+    diag_buf_push_byte(mut_view(*buf), 46u8)
+    diag_buf_push_u32(mut_view(*buf), pkg_id.version.minor)
+    diag_buf_push_byte(mut_view(*buf), 46u8)
+    diag_buf_push_u32(mut_view(*buf), pkg_id.version.patch)
+    diag_buf_push_byte(mut_view(*buf), 47u8)
+    diag_buf_push_sv(mut_view(*buf), rel_src_path)
+}
+
+pub fn verify_cache_entry_integrity(
+    rec: view<CacheEntryRecord>,
+    expected_env_class: u8,
+    expected_triple: StrView
+) -> bool {
+    if !rec.occupied {
+        return false
+    }
+    if rec.header_magic != CACHE_HEADER_MAGIC || rec.schema_version != CACHE_SCHEMA_VERSION {
+        return false
+    }
+    if rec.env_class != expected_env_class || !ux2_sv_eq(rec.target_triple, expected_triple) {
+        return false
+    }
+    if rec.expected_payload_len == 0u64 || rec.actual_payload_len != rec.expected_payload_len {
+        return false
+    }
+    if !digest256_eq(rec.actual_payload_digest, rec.expected_payload_digest) {
+        return false
+    }
+    let recomputed = compute_artifact_payload_digest(
+        rec.tiers.build_fingerprint,
+        rec.target_triple,
+        rec.actual_payload_len
+    )
+    if !digest256_eq(rec.actual_payload_digest, recomputed) {
+        return false
+    }
+    if !rec.mtime_zeroed || !rec.uid_gid_zeroed || !rec.logical_path_remapped {
+        return false
+    }
+    true
+}
+
+pub fn cache_lookup_and_verify(
+    cache: mut_view<BuildArtifactCache>,
+    action_kind: u8,
+    unit_kind: u8,
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    pkg_name: StrView,
+    target_name: StrView,
+    feature_set_hash: Digest256,
+    compiler_version_digest: u64,
+    tiers: view<FourTierFingerprints>,
+    upstream_private_body_edited: bool
+) -> CacheLookupOutcome {
+    let mut same_unit_slot: usize = 48usize
+    let mut exact_key_slot: usize = 48usize
+
+    let mut i: usize = 0usize
+    while i < 48usize {
+        if cache.entries[i].occupied {
+            let e = cache.entries[i]
+            if e.action_kind == action_kind &&
+                e.unit_kind == unit_kind &&
+                ux2_sv_eq(e.pkg_name, pkg_name) &&
+                ux2_sv_eq(e.target_name, target_name) {
+                same_unit_slot = i
+                if e.env_class == env_class &&
+                    digest256_eq(e.tiers.build_fingerprint, tiers.build_fingerprint) {
+                    exact_key_slot = i
+                    break
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    if exact_key_slot < 48usize {
+        if verify_cache_entry_integrity(view(cache.entries[exact_key_slot]), env_class, target_triple) {
+            cache.total_hits = cache.total_hits + 1u32
+            let is_early_cutoff = upstream_private_body_edited &&
+                (action_kind == ACTION_EMIT_INTERFACE ||
+                 action_kind == ACTION_COMPILE_CGU ||
+                 action_kind == ACTION_ASSEMBLE_ARCHIVE)
+            if is_early_cutoff {
+                cache.early_cutoff_hits = cache.early_cutoff_hits + 1u32
+            }
+            return CacheLookupOutcome {
+                hit: true,
+                miss_reason: CACHE_HIT,
+                early_cutoff_reused: is_early_cutoff,
+                corrupt_entry_evicted: false,
+                matched_slot: exact_key_slot,
+            }
+        }
+        cache.entries[exact_key_slot].occupied = false
+        if cache.entry_count > 0usize {
+            cache.entry_count = cache.entry_count - 1usize
+        }
+        cache.corrupt_evictions = cache.corrupt_evictions + 1u32
+        cache.total_misses = cache.total_misses + 1u32
+        return CacheLookupOutcome {
+            hit: false,
+            miss_reason: CACHE_MISS_CORRUPT_ENTRY_EVICTED,
+            early_cutoff_reused: false,
+            corrupt_entry_evicted: true,
+            matched_slot: exact_key_slot,
+        }
+    }
+
+    cache.total_misses = cache.total_misses + 1u32
+    if same_unit_slot >= 48usize {
+        return CacheLookupOutcome {
+            hit: false,
+            miss_reason: CACHE_MISS_MISSING_OUTPUT,
+            early_cutoff_reused: false,
+            corrupt_entry_evicted: false,
+            matched_slot: 48usize,
+        }
+    }
+
+    let prev = cache.entries[same_unit_slot]
+    let mut reason: u8 = CACHE_MISS_SOURCE_MODIFIED
+    if prev.compiler_version_digest != compiler_version_digest {
+        reason = CACHE_MISS_COMPILER_CHANGED
+    } else if prev.env_class != env_class || !ux2_sv_eq(prev.target_triple, target_triple) {
+        reason = CACHE_MISS_TARGET_CHANGED
+    } else if !ux2_sv_eq(prev.profile_name, profile_name) {
+        reason = CACHE_MISS_PROFILE_CHANGED
+    } else if !digest256_eq(prev.feature_set_hash, feature_set_hash) {
+        reason = CACHE_MISS_FEATURES_CHANGED
+    } else if !digest256_eq(prev.tiers.semantic_fingerprint, tiers.semantic_fingerprint) ||
+        !digest256_eq(prev.tiers.abi_fingerprint, tiers.abi_fingerprint) {
+        reason = CACHE_MISS_INTERFACE_CHANGED
+    } else {
+        reason = CACHE_MISS_SOURCE_MODIFIED
+    }
+
+    CacheLookupOutcome {
+        hit: false,
+        miss_reason: reason,
+        early_cutoff_reused: false,
+        corrupt_entry_evicted: false,
+        matched_slot: same_unit_slot,
+    }
+}
+
+pub fn cache_stage_artifact_write(
+    cache: mut_view<BuildArtifactCache>,
+    worker_id: u32,
+    pid: u32,
+    action_kind: u8,
+    unit_kind: u8,
+    env_class: u8,
+    target_triple: StrView,
+    profile_name: StrView,
+    pkg_name: StrView,
+    target_name: StrView,
+    artifact_path: StrView,
+    feature_set_hash: Digest256,
+    compiler_version_digest: u64,
+    tiers: view<FourTierFingerprints>,
+    payload_len: u64
+) -> usize {
+    let slot = (worker_id as usize) % 8usize
+    let payload_digest = compute_artifact_payload_digest(tiers.build_fingerprint, target_triple, payload_len)
+    let rec = CacheEntryRecord {
+        occupied: true,
+        header_magic: CACHE_HEADER_MAGIC,
+        schema_version: CACHE_SCHEMA_VERSION,
+        action_kind: action_kind,
+        unit_kind: unit_kind,
+        env_class: env_class,
+        target_triple: target_triple,
+        profile_name: profile_name,
+        pkg_name: pkg_name,
+        target_name: target_name,
+        artifact_path: artifact_path,
+        tiers: *tiers,
+        feature_set_hash: feature_set_hash,
+        compiler_version_digest: compiler_version_digest,
+        expected_payload_len: payload_len,
+        actual_payload_len: payload_len,
+        expected_payload_digest: payload_digest,
+        actual_payload_digest: payload_digest,
+        mtime_zeroed: true,
+        uid_gid_zeroed: true,
+        logical_path_remapped: true,
+    }
+    let th = ax_hash_combine(ax_hash_u64(pid as u64), ax_hash_u64(worker_id as u64))
+    cache.staging_slots[slot] = AtomicStagingSlot {
+        active: true,
+        pid: pid,
+        worker_id: worker_id,
+        temp_path_hash: th,
+        candidate: rec,
+    }
+    slot
+}
+
+pub fn cache_abort_staged_writes(cache: mut_view<BuildArtifactCache>) -> u32 {
+    let mut cleaned: u32 = 0u32
+    let mut s: usize = 0usize
+    while s < 8usize {
+        if cache.staging_slots[s].active {
+            cache.staging_slots[s] = atomic_staging_slot_empty()
+            cache.aborted_temp_files = cache.aborted_temp_files + 1u32
+            cleaned = cleaned + 1u32
+        }
+        s = s + 1usize
+    }
+    cleaned
+}
+
+pub fn cache_commit_staged_atomic(
+    cache: mut_view<BuildArtifactCache>,
+    staging_slot: usize,
+    cancel_token: view<CancellationToken>,
+    current_seq: u32
+) -> bool {
+    if staging_slot >= 8usize || !cache.staging_slots[staging_slot].active {
+        return false
+    }
+    if cancellation_token_is_active(cancel_token, current_seq) {
+        let _ = cache_abort_staged_writes(mut_view(*cache))
+        return false
+    }
+
+    let cand = cache.staging_slots[staging_slot].candidate
+    cache.staging_slots[staging_slot] = atomic_staging_slot_empty()
+
+    let mut dst_slot: usize = 48usize
+    let mut first_free: usize = 48usize
+    let mut i: usize = 0usize
+    while i < 48usize {
+        if cache.entries[i].occupied {
+            let e = cache.entries[i]
+            if e.action_kind == cand.action_kind &&
+                e.unit_kind == cand.unit_kind &&
+                e.env_class == cand.env_class &&
+                ux2_sv_eq(e.pkg_name, cand.pkg_name) &&
+                ux2_sv_eq(e.target_name, cand.target_name) {
+                dst_slot = i
+                break
+            }
+        } else if first_free == 48usize {
+            first_free = i
+        }
+        i = i + 1usize
+    }
+
+    if dst_slot == 48usize {
+        if first_free == 48usize {
+            dst_slot = 0usize
+        } else {
+            dst_slot = first_free
+            cache.entry_count = cache.entry_count + 1usize
+        }
+    }
+
+    cache.entries[dst_slot] = cand
+    cache.atomic_commits = cache.atomic_commits + 1u32
+    true
+}
+
+pub fn cache_poison_entry_digest(
+    cache: mut_view<BuildArtifactCache>,
+    pkg_name: StrView,
+    action_kind: u8
+) -> bool {
+    let mut i: usize = 0usize
+    while i < 48usize {
+        if cache.entries[i].occupied &&
+            ux2_sv_eq(cache.entries[i].pkg_name, pkg_name) &&
+            cache.entries[i].action_kind == action_kind {
+            cache.entries[i].actual_payload_digest.w0 = cache.entries[i].actual_payload_digest.w0 ^ 0xDEADCAFEBEEF1234u64
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn cache_truncate_entry_payload(
+    cache: mut_view<BuildArtifactCache>,
+    pkg_name: StrView,
+    action_kind: u8
+) -> bool {
+    let mut i: usize = 0usize
+    while i < 48usize {
+        if cache.entries[i].occupied &&
+            ux2_sv_eq(cache.entries[i].pkg_name, pkg_name) &&
+            cache.entries[i].action_kind == action_kind {
+            if cache.entries[i].actual_payload_len > 4u64 {
+                cache.entries[i].actual_payload_len = cache.entries[i].actual_payload_len - 4u64
+            } else {
+                cache.entries[i].actual_payload_len = 0u64
+            }
+            return true
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn push_cache_key_short_hex(d: view<Digest256>, buf: mut_view<DiagBuffer>) {
+    push_u64_hex16(mut_view(*buf), d.w0)
+}

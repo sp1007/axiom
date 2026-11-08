@@ -1,0 +1,567 @@
+// Direct verification probe for `compiler.build.cache`, `compiler.build.graph`, and
+// `compiler.driver.workspace_cmd` (T852 / E20.1: SPEC-110 §§3..6, REQ-PKG-022,
+// REQ-PKG-024, REQ-PKG-025, INV-BLD-001..003).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.emitter.diag_sink_get
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.query.db.CompilerDB
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_free
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.manifest_diag_get_data
+
+use compiler.build.workspace.ENV_CLASS_TARGET
+use compiler.build.workspace.ENV_CLASS_HOST
+use compiler.build.workspace.WorkspaceMemberInput
+use compiler.build.workspace.WorkspaceResolveOptions
+use compiler.build.workspace.WorkspaceGraph
+use compiler.build.workspace.workspace_member_input_new
+use compiler.build.workspace.workspace_resolve_options_default
+use compiler.build.workspace.workspace_graph_empty
+use compiler.build.workspace.resolve_workspace_graph
+
+use compiler.build.cache.ACTION_EMIT_INTERFACE
+use compiler.build.cache.ACTION_LINK_ARTIFACT
+use compiler.build.cache.BuildArtifactCache
+use compiler.build.cache.cancellation_token_none
+use compiler.build.cache.cancellation_token_after_seq
+use compiler.build.cache.build_artifact_cache_new
+use compiler.build.cache.cache_poison_entry_digest
+use compiler.build.cache.cache_truncate_entry_payload
+
+use compiler.build.graph.AX_LINK_ARTIFACT_TARGET_MISMATCH
+use compiler.build.graph.BuildGraph
+use compiler.build.graph.build_graph_new
+use compiler.build.graph.verify_build_tool_sandbox_access
+use compiler.build.graph.format_build_tool_env_var
+use compiler.build.graph.verify_artifact_link_target_match
+use compiler.build.graph.verify_build_graph_target_isolation
+use compiler.build.graph.lower_workspace_to_build_graph
+use compiler.build.graph.execute_build_graph
+use compiler.build.graph.verify_worker_count_invariance
+
+use compiler.driver.workspace_cmd.WS_EXIT_OK
+use compiler.driver.workspace_cmd.WS_EXIT_USAGE_ERROR
+use compiler.driver.workspace_cmd.WorkspaceCliOptions
+use compiler.driver.workspace_cmd.workspace_cli_options_default
+use compiler.driver.workspace_cmd.workspace_parse_cli_args
+use compiler.driver.workspace_cmd.workspace_cmd_execute
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_sv(sv: StrView) {
+    if sv.len > 0usize && (sv.ptr as usize) != 0usize {
+        let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+    }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn out_u32(n: u32) {
+    let mut b = diag_buf_new()
+    diag_buf_init(mut_view(b))
+    diag_buf_push_u32(mut_view(b), n)
+    out_sv(diag_buf_as_str_view(view(b)))
+    diag_buf_free(mut_view(b))
+}
+
+fn new_diag_sink() -> DiagSink {
+    let mut sink = DiagSink {
+        arena: (query_db_empty()).arena,
+        diags: 0 as *mut compiler.diag.emitter.Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+    diag_sink_init(mut_view(sink))
+    sink
+}
+
+fn build_workspace_members(
+    core_priv_hash: u64,
+    multi_bin: bool
+) -> [16]WorkspaceMemberInput {
+    let e = workspace_member_input_new(ux2_sv_empty(), ux2_sv_empty())
+    let mut members: [16]WorkspaceMemberInput = [e; 16]
+
+    let mut m_core = workspace_member_input_new(
+        ux2_sv("crates/core_util"),
+        ux2_sv("[package]\nname = \"core_util\"\nversion = \"0.1.0\"\nedition = \"2026\"\n[lib]\nname = \"core_util\"\npath = \"src/lib.ax\"\n")
+    )
+    m_core.public_api_source_hash = 0xAAAABBBBCCCCDDDDu64
+    m_core.private_body_source_hash = core_priv_hash
+
+    let mut m_host = workspace_member_input_new(
+        ux2_sv("crates/host_codegen"),
+        ux2_sv("[package]\nname = \"host_codegen\"\nversion = \"0.1.0\"\nedition = \"2026\"\n[lib]\nname = \"host_codegen\"\npath = \"src/lib.ax\"\n")
+    )
+    m_host.public_api_source_hash = 0x9999000011112222u64
+    m_host.private_body_source_hash = 0x3333444455556666u64
+
+    let app_toml = if multi_bin {
+        ux2_sv("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n[lib]\nname = \"app\"\npath = \"src/lib.ax\"\n[[bin]]\nname = \"app\"\npath = \"src/main.ax\"\n[[bin]]\nname = \"app_admin\"\npath = \"src/admin.ax\"\n[[build_tool]]\nname = \"gen_schema\"\npath = \"build/gen_schema.ax\"\ninputs = [\"schema/api.txt\"]\noutputs = [\"api_gen.ax\"]\n[dependencies]\ncore_util = { path = \"../core_util\", version = \"^0.1.0\" }\n[build-dependencies]\nhost_codegen = { path = \"../host_codegen\", version = \"^0.1.0\" }\n")
+    } else {
+        ux2_sv("[package]\nname = \"app\"\nversion = \"0.1.0\"\nedition = \"2026\"\n[lib]\nname = \"app\"\npath = \"src/lib.ax\"\n[[bin]]\nname = \"app\"\npath = \"src/main.ax\"\n[[build_tool]]\nname = \"gen_schema\"\npath = \"build/gen_schema.ax\"\ninputs = [\"schema/api.txt\"]\noutputs = [\"api_gen.ax\"]\n[dependencies]\ncore_util = { path = \"../core_util\", version = \"^0.1.0\" }\n[build-dependencies]\nhost_codegen = { path = \"../host_codegen\", version = \"^0.1.0\" }\n")
+    }
+    let mut m_app = workspace_member_input_new(ux2_sv("crates/app"), app_toml)
+    m_app.public_api_source_hash = 0x1111222233334444u64
+    m_app.private_body_source_hash = 0x5555666677778888u64
+
+    members[0] = m_core
+    members[1] = m_host
+    members[2] = m_app
+    members
+}
+
+fn demo_workspace_root_toml() -> StrView {
+    ux2_sv("[workspace]\nmembers = [\n    \"crates/core_util\",\n    \"crates/host_codegen\",\n    \"crates/app\"\n]\ndefault_members = [\"crates/app\"]\nresolver = \"1\"\n")
+}
+
+fn resolve_and_lower(
+    core_priv_hash: u64,
+    multi_bin: bool,
+    db: mut_view<CompilerDB>,
+    out_ws: mut_view<WorkspaceGraph>,
+    out_bg: mut_view<BuildGraph>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let ws_toml = demo_workspace_root_toml()
+    let members = build_workspace_members(core_priv_hash, multi_bin)
+    let mut opts = workspace_resolve_options_default()
+    opts.host_triple = ux2_sv("x86_64-windows")
+    opts.target_triple = ux2_sv("aarch64-linux")
+    opts.profile_name = ux2_sv("dev")
+    if !resolve_workspace_graph(
+        ws_toml,
+        view(members),
+        3usize,
+        view(opts),
+        mut_view(*out_ws),
+        mut_view(*sink)
+    ) {
+        return false
+    }
+    lower_workspace_to_build_graph(
+        view(*out_ws),
+        view(members),
+        3usize,
+        mut_view(*db),
+        0xC0DEC0DE2026u64,
+        0x5952007F2026u64,
+        false,
+        mut_view(*out_bg),
+        mut_view(*sink)
+    )
+}
+
+pub fn main() -> i32 {
+    let mut sink = new_diag_sink()
+    let mut qdb = query_db_empty()
+    query_db_init(mut_view(qdb), 1u64)
+
+    let mut ws = workspace_graph_empty()
+    let mut bg = build_graph_new()
+
+    // 1. Host/Target Split & Action DAG Lowering (`AXS-BLD-020..024`)
+    let lower_ok = resolve_and_lower(
+        0xEEEEEEEEFFFFFFFFu64,
+        false,
+        mut_view(qdb),
+        mut_view(ws),
+        mut_view(bg),
+        mut_view(sink)
+    )
+    let iso_ok = verify_build_graph_target_isolation(view(bg), mut_view(sink))
+
+    let mut mismatch_sink = new_diag_sink()
+    let mismatch_ok = verify_artifact_link_target_match(
+        ux2_sv("app"),
+        ux2_sv("app"),
+        ENV_CLASS_TARGET,
+        ux2_sv("aarch64-linux"),
+        ux2_sv("host_codegen"),
+        ux2_sv("host_codegen"),
+        ENV_CLASS_HOST,
+        ux2_sv("x86_64-windows"),
+        mut_view(mismatch_sink)
+    )
+    let d_mm = diag_sink_get(view(mismatch_sink), 0usize)
+    let mm_code = d_mm.code.v
+
+    out_str("probe[graph_split] lower_ok=")
+    out_bool(lower_ok)
+    out_str(" actions=")
+    out_u32(bg.action_count as u32)
+    out_str(" host=")
+    out_u32(bg.host_action_count)
+    out_str(" target=")
+    out_u32(bg.target_action_count)
+    out_str(" isolation_ok=")
+    out_bool(iso_ok)
+    out_str(" mismatch_rejected=")
+    out_bool(!mismatch_ok)
+    out_str(" code=")
+    out_u32(mm_code)
+    out_str("\n")
+
+    if !lower_ok || bg.action_count != 14usize || bg.host_action_count != 6u32 ||
+        bg.target_action_count != 8u32 || !iso_ok || mismatch_ok ||
+        mm_code != AX_LINK_ARTIFACT_TARGET_MISMATCH {
+        diag_sink_free(mut_view(mismatch_sink))
+        diag_sink_free(mut_view(sink))
+        query_db_free(mut_view(qdb))
+        return 1
+    }
+
+    // 2. `[[build_tool]]` Hermetic Sandbox & Provenance (`AXS-BLD-022`)
+    let sb = bg.sandboxes[0]
+    let caps_denied = sb.net_cap_denied && sb.process_cap_denied && sb.clock_cap_denied
+    let read_decl_ok = verify_build_tool_sandbox_access(view(sb), false, ux2_sv("schema/api.txt"))
+    let read_undecl_ok = verify_build_tool_sandbox_access(view(sb), false, ux2_sv("src/main.ax"))
+    let write_gen_ok = verify_build_tool_sandbox_access(
+        view(sb),
+        true,
+        ux2_sv(".axiom/target/aarch64-linux/dev/gen/app/api_gen.ax")
+    )
+    let write_src_ok = verify_build_tool_sandbox_access(view(sb), true, ux2_sv("src/lib.ax"))
+    let access_ok = read_decl_ok && !read_undecl_ok && write_gen_ok && !write_src_ok
+
+    let mut env_buf = diag_buf_new()
+    diag_buf_init(mut_view(env_buf))
+    format_build_tool_env_var(
+        view(bg.provenances[0].pkg_id),
+        ux2_sv("crates/app"),
+        ux2_sv("aarch64-linux"),
+        ux2_sv("dev"),
+        0u32,
+        mut_view(env_buf)
+    )
+    let env0_ok = ux2_sv_eq(diag_buf_as_str_view(view(env_buf)), ux2_sv("AXIOM_PACKAGE_NAME=app"))
+    env_buf.len = 0usize
+    format_build_tool_env_var(
+        view(bg.provenances[0].pkg_id),
+        ux2_sv("crates/app"),
+        ux2_sv("aarch64-linux"),
+        ux2_sv("dev"),
+        4u32,
+        mut_view(env_buf)
+    )
+    let env4_ok = ux2_sv_eq(diag_buf_as_str_view(view(env_buf)), ux2_sv("AXIOM_TARGET_TRIPLE=aarch64-linux"))
+    diag_buf_free(mut_view(env_buf))
+    let env_ok = env0_ok && env4_ok
+
+    out_str("probe[sandbox_prov] sandboxes=")
+    out_u32(bg.sandbox_count as u32)
+    out_str(" provenances=")
+    out_u32(bg.provenance_count as u32)
+    out_str(" caps_denied=")
+    out_bool(caps_denied)
+    out_str(" ambient_env=")
+    out_bool(sb.ambient_host_env_passed)
+    out_str(" access_ok=")
+    out_bool(access_ok)
+    out_str(" env_ok=")
+    out_bool(env_ok)
+    out_str("\n")
+
+    if !caps_denied || sb.ambient_host_env_passed || !access_ok || !env_ok {
+        diag_sink_free(mut_view(mismatch_sink))
+        diag_sink_free(mut_view(sink))
+        query_db_free(mut_view(qdb))
+        return 2
+    }
+
+    // 3. 4-Tier Cache, Early Cutoff & Poison/Cancel Defense (`AXS-BLD-030..034`)
+    let mut cache = build_artifact_cache_new()
+    let no_cancel = cancellation_token_none()
+
+    let _ = execute_build_graph(
+        mut_view(bg),
+        mut_view(cache),
+        1u32,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    )
+    let cold_exec = bg.executed_actions
+
+    let _ = execute_build_graph(
+        mut_view(bg),
+        mut_view(cache),
+        1u32,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    )
+    let warm_cached = bg.cached_actions
+
+    let mut ws_edited = workspace_graph_empty()
+    let mut bg_edited = build_graph_new()
+    let _ = resolve_and_lower(
+        0x123456789ABCDEF0u64,
+        false,
+        mut_view(qdb),
+        mut_view(ws_edited),
+        mut_view(bg_edited),
+        mut_view(sink)
+    )
+    let _ = execute_build_graph(
+        mut_view(bg_edited),
+        mut_view(cache),
+        4u32,
+        false,
+        false,
+        true,
+        view(no_cancel)
+    )
+    let cutoff_exec = bg_edited.executed_actions
+    let cutoff_cached = bg_edited.cached_actions
+    let cutoff_reused = bg_edited.early_cutoff_actions
+
+    let _ = cache_poison_entry_digest(mut_view(cache), ux2_sv("core_util"), ACTION_EMIT_INTERFACE)
+    let _ = execute_build_graph(
+        mut_view(bg_edited),
+        mut_view(cache),
+        1u32,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    )
+    let poison_ok = cache.corrupt_evictions == 1u32 && bg_edited.executed_actions == 1u32
+
+    let _ = cache_truncate_entry_payload(mut_view(cache), ux2_sv("app"), ACTION_LINK_ARTIFACT)
+    let _ = execute_build_graph(
+        mut_view(bg_edited),
+        mut_view(cache),
+        1u32,
+        false,
+        false,
+        false,
+        view(no_cancel)
+    )
+    let truncate_ok = cache.corrupt_evictions == 2u32 && bg_edited.executed_actions == 1u32
+
+    let mut cancel_cache = build_artifact_cache_new()
+    let mut bg_cancel = bg_edited
+    let cancel_tok = cancellation_token_after_seq(2u32)
+    let cancel_run_ok = execute_build_graph(
+        mut_view(bg_cancel),
+        mut_view(cancel_cache),
+        2u32,
+        false,
+        false,
+        false,
+        view(cancel_tok)
+    )
+    let cancel_safe = !cancel_run_ok && bg_cancel.aborted_by_cancel && cancel_cache.aborted_temp_files == 1u32
+    let inv_ok = verify_worker_count_invariance(view(bg), 1u32, 8u32)
+
+    out_str("probe[cache_cutoff] cold_exec=")
+    out_u32(cold_exec)
+    out_str(" warm_cached=")
+    out_u32(warm_cached)
+    out_str(" cutoff_exec=")
+    out_u32(cutoff_exec)
+    out_str(" cutoff_cached=")
+    out_u32(cutoff_cached)
+    out_str(" cutoff_reused=")
+    out_u32(cutoff_reused)
+    out_str(" poison_evicted=")
+    out_bool(poison_ok && truncate_ok)
+    out_str(" cancel_safe=")
+    out_bool(cancel_safe)
+    out_str(" invariance_ok=")
+    out_bool(inv_ok)
+    out_str("\n")
+
+    if cold_exec != 14u32 || warm_cached != 14u32 || cutoff_exec != 3u32 ||
+        cutoff_cached != 11u32 || cutoff_reused != 9u32 || !poison_ok || !truncate_ok ||
+        !cancel_safe || !inv_ok {
+        diag_sink_free(mut_view(mismatch_sink))
+        diag_sink_free(mut_view(sink))
+        query_db_free(mut_view(qdb))
+        return 3
+    }
+
+    // 4. Workspace CLI & Graph Introspection (`AXS-BLD-040..042`)
+    let e = ux2_sv_empty()
+    let mut out_buf = diag_buf_new()
+    diag_buf_init(mut_view(out_buf))
+    let mut cli_opts = workspace_cli_options_default()
+
+    let mut check_cache = build_artifact_cache_new()
+    let mut bg_check = bg
+    let check_args: [16]StrView = [ux2_sv("check"), ux2_sv("--explain"), e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(check_args), 2usize, mut_view(cli_opts), mut_view(sink))
+    let check_exit = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws),
+        mut_view(bg_check),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(sink)
+    )
+    let check_ok = check_exit == WS_EXIT_OK && bg_check.executed_actions == 4u32
+
+    let mut ws_multi = workspace_graph_empty()
+    let mut bg_multi = build_graph_new()
+    let _ = resolve_and_lower(
+        0xEEEEEEEEFFFFFFFFu64,
+        true,
+        mut_view(qdb),
+        mut_view(ws_multi),
+        mut_view(bg_multi),
+        mut_view(sink)
+    )
+    let run_ambig_args: [16]StrView = [ux2_sv("run"), e, e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(run_ambig_args), 1usize, mut_view(cli_opts), mut_view(sink))
+    let mut run_sink = new_diag_sink()
+    let run_ambig_exit = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws_multi),
+        mut_view(bg_multi),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(run_sink)
+    )
+
+    let run_sel_args: [16]StrView = [ux2_sv("run"), ux2_sv("--bin"), ux2_sv("app"), ux2_sv("--"), ux2_sv("--port=8080"), e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(run_sel_args), 5usize, mut_view(cli_opts), mut_view(sink))
+    let run_sel_exit = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws_multi),
+        mut_view(bg_multi),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(sink)
+    )
+
+    out_buf.len = 0usize
+    let graph_json_args: [16]StrView = [ux2_sv("graph"), ux2_sv("--format=json"), e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(graph_json_args), 2usize, mut_view(cli_opts), mut_view(sink))
+    let _ = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws),
+        mut_view(bg),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(sink)
+    )
+    let json_sv = diag_buf_as_str_view(view(out_buf))
+    let graph_json_ok = bld_sv_starts_with(json_sv, ux2_sv("{\"schema_version\":1")) &&
+        ux2_sv_contains(json_sv, ux2_sv("\"semantic_fingerprint\":"))
+
+    out_buf.len = 0usize
+    let graph_dot_args: [16]StrView = [ux2_sv("graph"), ux2_sv("--format=dot"), e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(graph_dot_args), 2usize, mut_view(cli_opts), mut_view(sink))
+    let _ = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws),
+        mut_view(bg),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(sink)
+    )
+    let dot_sv = diag_buf_as_str_view(view(out_buf))
+    let graph_dot_ok = bld_sv_starts_with(dot_sv, ux2_sv("digraph axiom_build_graph"))
+
+    let mut err_sink = new_diag_sink()
+    let bad_fmt_args: [16]StrView = [ux2_sv("graph"), ux2_sv("--format=xml"), e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let bad_fmt_ok = workspace_parse_cli_args(view(bad_fmt_args), 2usize, mut_view(cli_opts), mut_view(err_sink))
+    let bad_fmt_exit = if bad_fmt_ok { WS_EXIT_OK } else { WS_EXIT_USAGE_ERROR }
+
+    let unk_args: [16]StrView = [ux2_sv("build"), ux2_sv("--bogus-flag"), e, e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let unk_ok = workspace_parse_cli_args(view(unk_args), 2usize, mut_view(cli_opts), mut_view(err_sink))
+    let unk_opt_exit = if unk_ok { WS_EXIT_OK } else { WS_EXIT_USAGE_ERROR }
+
+    let clean_args: [16]StrView = [ux2_sv("clean"), ux2_sv("--all"), ux2_sv("--cache"), e, e, e, e, e, e, e, e, e, e, e, e, e]
+    let _ = workspace_parse_cli_args(view(clean_args), 3usize, mut_view(cli_opts), mut_view(sink))
+    let clean_exit = workspace_cmd_execute(
+        view(cli_opts),
+        view(ws),
+        mut_view(bg),
+        mut_view(check_cache),
+        false,
+        view(no_cancel),
+        mut_view(out_buf),
+        mut_view(sink)
+    )
+    let clean_ok = clean_exit == WS_EXIT_OK
+
+    out_str("probe[workspace_cli] check_ok=")
+    out_bool(check_ok)
+    out_str(" run_ambig_exit=")
+    out_u32(run_ambig_exit as u32)
+    out_str(" run_sel_exit=")
+    out_u32(run_sel_exit as u32)
+    out_str(" graph_json_ok=")
+    out_bool(graph_json_ok)
+    out_str(" graph_dot_ok=")
+    out_bool(graph_dot_ok)
+    out_str(" bad_fmt_exit=")
+    out_u32(bad_fmt_exit as u32)
+    out_str(" unk_opt_exit=")
+    out_u32(unk_opt_exit as u32)
+    out_str(" clean_ok=")
+    out_bool(clean_ok)
+    out_str("\n")
+
+    diag_buf_free(mut_view(out_buf))
+    diag_sink_free(mut_view(err_sink))
+    diag_sink_free(mut_view(run_sink))
+    diag_sink_free(mut_view(mismatch_sink))
+    diag_sink_free(mut_view(sink))
+    query_db_free(mut_view(qdb))
+
+    if !check_ok || run_ambig_exit != 2i32 || run_sel_exit != 0i32 ||
+        !graph_json_ok || !graph_dot_ok || bad_fmt_exit != 2i32 ||
+        unk_opt_exit != 2i32 || !clean_ok {
+        return 4
+    }
+
+    out_str("BUILD-GRAPH-PROBE-PASS\n")
+    0
+}
