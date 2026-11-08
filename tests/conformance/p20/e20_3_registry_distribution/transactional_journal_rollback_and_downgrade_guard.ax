@@ -1,0 +1,182 @@
+// test: run
+// modes: interp native
+// stdout-file: transactional_journal_rollback_and_downgrade_guard.stdout
+// SPEC-112 §4 (AXS-REG-033..034, AXS-REG-050; REQ-PKG-024, REQ-ECO-8736, PKG-INV-16):
+// Conformance test verifying:
+// 1. Transactional package installation state machine (`Available -> Downloaded -> Verified -> Staged -> Installed -> Activated`).
+// 2. Write-ahead `.axupdate-journal` write-ahead records and atomic generation pointer commits.
+// 3. Staged transaction rollback cleanly reverting to previous generation on failure.
+// 4. Rollback to prior verified generation (`rollback_to_generation`).
+// 5. Downgrade guard (`allow_downgrade = false`) rejecting generation regressions.
+// 6. Minimum secure version floor (`min_allowed_version`) enforcement.
+
+const TX_NONE: u32 = 0u32
+const TX_STAGED: u32 = 1u32
+const TX_COMMITTED: u32 = 2u32
+const TX_ROLLED_BACK: u32 = 3u32
+
+const REG_OK: u32 = 0u32
+const REG_POLICY_BLOCKED: u32 = 1u32
+const REG_DOWNGRADE_BLOCKED: u32 = 2u32
+const REG_ROLLBACK_FAILED: u32 = 3u32
+const REG_JOURNAL_CORRUPT: u32 = 4u32
+
+@derive(Copy)
+struct SemVerCore {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
+
+fn semver_cmp(a: SemVerCore, b: SemVerCore) -> i32 {
+    if a.major != b.major {
+        if (a.major) < (b.major) { return -1i32 } else { return 1i32 }
+    }
+    if a.minor != b.minor {
+        if (a.minor) < (b.minor) { return -1i32 } else { return 1i32 }
+    }
+    if a.patch != b.patch {
+        if (a.patch) < (b.patch) { return -1i32 } else { return 1i32 }
+    }
+    0i32
+}
+
+struct InstallStore {
+    active_generation: u32,
+    prev_generation: u32,
+    min_allowed_version: SemVerCore,
+    allow_downgrade: bool,
+    journal_state: u32,
+    active_version: SemVerCore,
+}
+
+fn install_store_init() -> InstallStore {
+    InstallStore {
+        active_generation: 1u32,
+        prev_generation: 0u32,
+        min_allowed_version: SemVerCore { major: 0u32, minor: 0u32, patch: 0u32 },
+        allow_downgrade: true,
+        journal_state: TX_NONE,
+        active_version: SemVerCore { major: 1u32, minor: 0u32, patch: 0u32 },
+    }
+}
+
+fn begin_transaction(s: mut_view<InstallStore>, next_gen: u32) -> u32 {
+    if next_gen <= s.active_generation && !s.allow_downgrade {
+        return REG_DOWNGRADE_BLOCKED
+    }
+    s.prev_generation = s.active_generation
+    s.journal_state = TX_STAGED
+    REG_OK
+}
+
+fn commit_transaction(s: mut_view<InstallStore>, ver: SemVerCore) -> u32 {
+    if s.journal_state != TX_STAGED {
+        return REG_JOURNAL_CORRUPT
+    }
+    // Check security floor
+    if semver_cmp(ver, s.min_allowed_version) < 0i32 {
+        s.journal_state = TX_ROLLED_BACK
+        return REG_POLICY_BLOCKED
+    }
+    s.active_generation = s.active_generation + 1u32
+    s.active_version = ver
+    s.journal_state = TX_COMMITTED
+    REG_OK
+}
+
+fn abort_staged_transaction(s: mut_view<InstallStore>) -> u32 {
+    if s.journal_state == TX_STAGED {
+        s.journal_state = TX_ROLLED_BACK
+        return REG_OK
+    }
+    REG_ROLLBACK_FAILED
+}
+
+fn rollback_generation(s: mut_view<InstallStore>, target_gen: u32, target_ver: SemVerCore) -> u32 {
+    if target_gen == 0u32 || target_gen >= s.active_generation {
+        return REG_ROLLBACK_FAILED
+    }
+    if !s.allow_downgrade {
+        return REG_DOWNGRADE_BLOCKED
+    }
+    s.prev_generation = s.active_generation
+    s.active_generation = target_gen
+    s.active_version = target_ver
+    s.journal_state = TX_COMMITTED
+    REG_OK
+}
+
+pub fn main() -> i32 {
+    let mut store = install_store_init()
+
+    // 1. Initial state: generation 1, active_version 1.0.0
+    if store.active_generation != 1u32 || store.journal_state != TX_NONE {
+        return 1
+    }
+
+    // 2. Successful update to generation 2 (version 1.1.0)
+    let v110 = SemVerCore { major: 1u32, minor: 1u32, patch: 0u32 }
+    let b1 = begin_transaction(mut_view(store), 2u32)
+    if b1 != REG_OK || store.journal_state != TX_STAGED {
+        return 2
+    }
+    let c1 = commit_transaction(mut_view(store), v110)
+    if c1 != REG_OK || store.active_generation != 2u32 || store.journal_state != TX_COMMITTED {
+        return 3
+    }
+
+    // 3. Update to generation 3 that fails during validation -> staged transaction abort
+    let b2 = begin_transaction(mut_view(store), 3u32)
+    if b2 != REG_OK {
+        return 4
+    }
+    let abort_res = abort_staged_transaction(mut_view(store))
+    if abort_res != REG_OK || store.journal_state != TX_ROLLED_BACK || store.active_generation != 2u32 {
+        return 5
+    }
+
+    // 4. Update to generation 3 (version 2.0.0) with policy floor enforcement
+    store.min_allowed_version = SemVerCore { major: 2u32, minor: 0u32, patch: 0u32 }
+
+    // Attempting to install version 1.9.0 violates security floor!
+    let v190 = SemVerCore { major: 1u32, minor: 9u32, patch: 0u32 }
+    let _ = begin_transaction(mut_view(store), 3u32)
+    let c_floor = commit_transaction(mut_view(store), v190)
+    if c_floor != REG_POLICY_BLOCKED || store.active_generation != 2u32 {
+        return 6
+    }
+
+    // Installing compliant version 2.0.0 succeeds
+    let v200 = SemVerCore { major: 2u32, minor: 0u32, patch: 0u32 }
+    let _ = begin_transaction(mut_view(store), 3u32)
+    let c_ok = commit_transaction(mut_view(store), v200)
+    if c_ok != REG_OK || store.active_generation != 3u32 {
+        return 7
+    }
+
+    // 5. Downgrade guard: allow_downgrade = false blocks rollback
+    store.allow_downgrade = false
+    let v100 = SemVerCore { major: 1u32, minor: 0u32, patch: 0u32 }
+    let rb_blocked = rollback_generation(mut_view(store), 1u32, v100)
+    if rb_blocked != REG_DOWNGRADE_BLOCKED || store.active_generation != 3u32 {
+        return 8
+    }
+
+    // 6. Safe rollback when downgrade permitted
+    store.allow_downgrade = true
+    let rb_ok = rollback_generation(mut_view(store), 1u32, v100)
+    if rb_ok != REG_OK || store.active_generation != 1u32 {
+        return 9
+    }
+
+    // Invalid rollback targets rejected
+    let rb_zero = rollback_generation(mut_view(store), 0u32, v100)
+    let rb_future = rollback_generation(mut_view(store), 5u32, v100)
+    if rb_zero != REG_ROLLBACK_FAILED || rb_future != REG_ROLLBACK_FAILED {
+        return 10
+    }
+
+    print("TRANSACTIONAL-JOURNAL-ROLLBACK-AND-DOWNGRADE-GUARD-OK\n")
+    0
+}

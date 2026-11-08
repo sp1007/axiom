@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T860]
 priority: 211
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p20/e20_3_registry_distribution]
 spec: [spec/SPEC-112-package-registry-distribution.md, tasks/0412, tasks/0665, tasks/0739, tasks/0858, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-024]
 started: 2026-11-09 03:29:17
-agent: T861-impl
+finished: 2026-11-09 05:07:05
 ---
 # T861 — E20.3 Package registry protocol, .axpkg deterministic archive, offline mirror & binary/interface distribution conformance suite
 
@@ -45,3 +45,4 @@ Certify E20.3 exit criteria with an end-to-end conformance suite covering `.axpk
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-09 03:29:17 started (attempt 1) T861-impl
+- 2026-11-09 05:07:05 accepted by QA -> done
