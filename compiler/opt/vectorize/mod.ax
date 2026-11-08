@@ -1,0 +1,3680 @@
+// Loop auto-vectorization legality, capability-disjoint dependence proving, reduction recognition,
+// target SIMD width/cost model, and vectorized main loop + scalar remainder epilogue generation (T617 / E15.5).
+// Implements SPEC-74 (REQ-OPT-206, REQ-OPT-209, REQ-OPT-210, REQ-OPT-211, REQ-OPT-212..217, REQ-OPT-338..341).
+module compiler.opt.vectorize
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.id.FileId
+use compiler.kernel.id.StrId
+use compiler.kernel.id.SymbolId
+use compiler.kernel.id.TypeId
+use compiler.source.span.Span
+use compiler.diag.emitter.DiagSink
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_u32
+use compiler.hir.hir.HirItem
+use compiler.types.types.TY_ARRAY
+use compiler.types.types.TY_BOOL
+use compiler.types.types.TY_I8
+use compiler.types.types.TY_I16
+use compiler.types.types.TY_I32
+use compiler.types.types.TY_I64
+use compiler.types.types.TY_ISIZE
+use compiler.types.types.TY_MUT_VIEW
+use compiler.types.types.TY_PTR
+use compiler.types.types.TY_SLICE
+use compiler.types.types.TY_U8
+use compiler.types.types.TY_U16
+use compiler.types.types.TY_U32
+use compiler.types.types.TY_U64
+use compiler.types.types.TY_USIZE
+use compiler.types.types.TY_VIEW
+use compiler.types.types.Thir
+use compiler.types.types.type_get
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG
+use compiler.mir.mir.MIR_ATOMIC_CMPXCHG_WEAK
+use compiler.mir.mir.MIR_ATOMIC_LOAD
+use compiler.mir.mir.MIR_ATOMIC_STORE
+use compiler.mir.mir.MIR_BINOP_ADD
+use compiler.mir.mir.MIR_BINOP_BIT_AND
+use compiler.mir.mir.MIR_BINOP_BIT_OR
+use compiler.mir.mir.MIR_BINOP_BIT_XOR
+use compiler.mir.mir.MIR_BINOP_DIV
+use compiler.mir.mir.MIR_BINOP_EQ
+use compiler.mir.mir.MIR_BINOP_GE
+use compiler.mir.mir.MIR_BINOP_GT
+use compiler.mir.mir.MIR_BINOP_LE
+use compiler.mir.mir.MIR_BINOP_LT
+use compiler.mir.mir.MIR_BINOP_MUL
+use compiler.mir.mir.MIR_BINOP_NE
+use compiler.mir.mir.MIR_BINOP_REM
+use compiler.mir.mir.MIR_BINOP_SHL
+use compiler.mir.mir.MIR_BINOP_SHR
+use compiler.mir.mir.MIR_BINOP_SUB
+use compiler.mir.mir.MIR_BINOP_WRAPPING_ADD
+use compiler.mir.mir.MIR_BINOP_WRAPPING_MUL
+use compiler.mir.mir.MIR_BINOP_WRAPPING_SUB
+use compiler.mir.mir.MIR_DROP_FLAG_NONE
+use compiler.mir.mir.MIR_LOCAL_ARG
+use compiler.mir.mir.MIR_OP_CONST
+use compiler.mir.mir.MIR_OP_COPY
+use compiler.mir.mir.MIR_OP_MOVE
+use compiler.mir.mir.MIR_PROJ_DEREF
+use compiler.mir.mir.MIR_PROJ_INDEX
+use compiler.mir.mir.MIR_PROJ_SUB_SLICE
+use compiler.mir.mir.MIR_RVALUE_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_LEN
+use compiler.mir.mir.MIR_RVALUE_OVERFLOWS_BINARY_OP
+use compiler.mir.mir.MIR_RVALUE_USE
+use compiler.mir.mir.MIR_STMT_ASSIGN
+use compiler.mir.mir.MIR_STMT_ATOMIC
+use compiler.mir.mir.MIR_STMT_DROP
+use compiler.mir.mir.MIR_TERM_ASSERT
+use compiler.mir.mir.MIR_TERM_CALL
+use compiler.mir.mir.MIR_TERM_DROP
+use compiler.mir.mir.MIR_TERM_GOTO
+use compiler.mir.mir.MIR_TERM_RETURN
+use compiler.mir.mir.MIR_TERM_SWITCH_INT
+use compiler.mir.mir.MIR_TERM_UNREACHABLE
+use compiler.mir.mir.MIR_UNOP_NEG
+use compiler.mir.mir.MIR_UNOP_NOT
+use compiler.mir.mir.MirBbId
+use compiler.mir.mir.MirBody
+use compiler.mir.mir.MirLocalId
+use compiler.mir.mir.MirOperand
+use compiler.mir.mir.MirPlace
+use compiler.mir.mir.MirProjection
+use compiler.mir.mir.MirRvalue
+use compiler.mir.mir.MirStmt
+use compiler.mir.mir.MirTerminator
+use compiler.mir.mir.mir_add_bb
+use compiler.mir.mir.mir_add_local
+use compiler.mir.mir.mir_bb_at
+use compiler.mir.mir.mir_bb_id_at
+use compiler.mir.mir.mir_bb_push_stmt
+use compiler.mir.mir.mir_bb_set_terminator
+use compiler.mir.mir.mir_body_reset
+use compiler.mir.mir.mir_copy_operand
+use compiler.mir.mir.mir_copy_place
+use compiler.mir.mir.mir_copy_stmt
+use compiler.mir.mir.mir_copy_terminator
+use compiler.mir.mir.mir_local_at
+use compiler.mir.mir.mir_local_place
+use compiler.mir.mir.mir_op_at
+use compiler.mir.mir.mir_op_const_int
+use compiler.mir.mir.mir_op_copy_local
+use compiler.mir.mir.mir_proj_at
+use compiler.mir.mir.mir_rvalue_reset
+use compiler.mir.mir.mir_span_copy
+use compiler.mir.mir.mir_stmt_reset
+use compiler.mir.mir.mir_term_reset
+use compiler.verify.verifier.verify_mir
+use compiler.opt.optir.ANALYSIS_ALIAS_INFO
+use compiler.opt.optir.ANALYSIS_CFG
+use compiler.opt.optir.ANALYSIS_DOMINATORS
+use compiler.opt.optir.ANALYSIS_LOOP_INFO
+use compiler.opt.optir.ANALYSIS_MEMORY_SSA
+use compiler.opt.optir.ANALYSIS_RANGE_INFO
+use compiler.opt.optir.ANALYSIS_SSA
+use compiler.opt.optir.CERTAINTY_POSSIBLE
+use compiler.opt.optir.CERTAINTY_PROVEN
+use compiler.opt.optir.CERTAINTY_UNKNOWN
+use compiler.opt.optir.MEM_SSA_LIVE_ON_ENTRY
+use compiler.opt.optir.MEM_SSA_NONE
+use compiler.opt.optir.MemSsaDefNode
+use compiler.opt.optir.MemSsaId
+use compiler.opt.optir.OPT_BB_NONE
+use compiler.opt.optir.OPT_FLAG_BARRIER
+use compiler.opt.optir.OPT_FLAG_MAY_TRAP
+use compiler.opt.optir.OPT_FLAG_NONE
+use compiler.opt.optir.OPT_FLAG_STORAGE_DEAD
+use compiler.opt.optir.OPT_FLAG_STORAGE_LIVE
+use compiler.opt.optir.OPT_INST_ATOMIC
+use compiler.opt.optir.OPT_INST_BINOP
+use compiler.opt.optir.OPT_INST_BLACK_BOX
+use compiler.opt.optir.OPT_INST_CAST
+use compiler.opt.optir.OPT_INST_CHECKED_BINOP
+use compiler.opt.optir.OPT_INST_CONST
+use compiler.opt.optir.OPT_INST_COPY
+use compiler.opt.optir.OPT_INST_DROP_FLAG
+use compiler.opt.optir.OPT_INST_LEN
+use compiler.opt.optir.OPT_INST_LOAD
+use compiler.opt.optir.OPT_INST_NONE
+use compiler.opt.optir.OPT_INST_NOP
+use compiler.opt.optir.OPT_INST_STORE
+use compiler.opt.optir.OPT_INST_UNOP
+use compiler.opt.optir.OPT_INST_VOLATILE_LOAD
+use compiler.opt.optir.OPT_INST_VOLATILE_STORE
+use compiler.opt.optir.OPT_INST_WRAPPING_BINOP
+use compiler.opt.optir.OPT_INST_ZEROIZE
+use compiler.opt.optir.OPT_LOCAL_SCALAR
+use compiler.opt.optir.OPT_PROJ_NONE
+use compiler.opt.optir.OPT_TERM_ASSERT
+use compiler.opt.optir.OPT_TERM_BRANCH
+use compiler.opt.optir.OPT_TERM_CALL
+use compiler.opt.optir.OPT_TERM_DROP
+use compiler.opt.optir.OPT_TERM_GOTO
+use compiler.opt.optir.OPT_TERM_RETURN
+use compiler.opt.optir.OPT_TERM_SWITCH_INT
+use compiler.opt.optir.OPT_TERM_UNREACHABLE
+use compiler.opt.optir.OPT_VALUE_NONE
+use compiler.opt.optir.OPT_VAL_CONST
+use compiler.opt.optir.OPT_VAL_INST
+use compiler.opt.optir.OPT_VAL_PARAM
+use compiler.opt.optir.OPT_VAL_PHI
+use compiler.opt.optir.OptBbId
+use compiler.opt.optir.OptBlock
+use compiler.opt.optir.OptBody
+use compiler.opt.optir.OptInst
+use compiler.opt.optir.OptInstId
+use compiler.opt.optir.OptOrigin
+use compiler.opt.optir.OptPhi
+use compiler.opt.optir.OptValue
+use compiler.opt.optir.OptValueId
+use compiler.opt.optir.PROP_IN_BOUNDS
+use compiler.opt.optir.PROP_NO_ALIAS
+use compiler.opt.optir.PROP_NO_OVERFLOW
+use compiler.opt.optir.ProofProvenance
+use compiler.opt.optir.opt_bbid_at
+use compiler.opt.optir.opt_block_at
+use compiler.opt.optir.opt_bool_at
+use compiler.opt.optir.opt_dominates
+use compiler.opt.optir.opt_inst_at
+use compiler.opt.optir.opt_phi_at
+use compiler.opt.optir.opt_prov_at
+use compiler.opt.optir.opt_typeid_at
+use compiler.opt.optir.opt_u32_at
+use compiler.opt.optir.opt_u8_at
+use compiler.opt.optir.opt_val_at
+use compiler.opt.optir.opt_valid_at
+use compiler.opt.optir.optir_build_from_mir
+use compiler.opt.optir.optir_build_from_verified_mir
+use compiler.opt.optir.optir_reconstruct_mir
+use compiler.opt.optir.optir_record_provenance
+use compiler.opt.optir.optir_verify_contract
+use compiler.opt.effects.EffectCallTable
+use compiler.opt.effects.effect_infer_body
+use compiler.opt.alias.ALIAS_REASON_CAP_MUT_DISJOINT
+use compiler.opt.alias.ALIAS_REASON_CAP_VIEW_READONLY
+use compiler.opt.alias.AliasInfo
+use compiler.opt.alias.CAP_MODE_MUT_VIEW_WRITE
+use compiler.opt.alias.CAP_MODE_RAW_PTR
+use compiler.opt.alias.CAP_MODE_VIEW_READ
+use compiler.opt.alias.DOMAIN_FIXED_MMIO
+use compiler.opt.alias.alias_build_info
+use compiler.opt.alias.alias_extract_region
+use compiler.opt.alias.alias_is_no_alias_proven
+use compiler.opt.alias.alias_make_prog_pt
+use compiler.opt.alias.alias_query_regions
+use compiler.opt.passmgr.ANALYSIS_MASK_ALIAS_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_CFG
+use compiler.opt.passmgr.ANALYSIS_MASK_DOMINATORS
+use compiler.opt.passmgr.ANALYSIS_MASK_EFFECT_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_LOOP_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_MEMORY_SSA
+use compiler.opt.passmgr.ANALYSIS_MASK_RANGE_INFO
+use compiler.opt.passmgr.ANALYSIS_MASK_SSA
+use compiler.opt.passmgr.OPT_PROFILE_BALANCED_O1
+use compiler.opt.passmgr.OPT_PROFILE_DEBUG_O0
+use compiler.opt.passmgr.OPT_PROFILE_SIZE_OS
+use compiler.opt.passmgr.OPT_PROFILE_SPEED_O2
+use compiler.opt.passmgr.POSTCOND_ALL
+use compiler.opt.passmgr.PROP_MASK_IN_BOUNDS
+use compiler.opt.passmgr.PROP_MASK_NO_ALIAS
+use compiler.opt.passmgr.PROP_MASK_NO_OVERFLOW
+use compiler.opt.passmgr.PassManager
+use compiler.opt.passmgr.TransformationContract
+use compiler.opt.passmgr.analysis_bit
+use compiler.opt.passmgr.opt_budget_for_profile
+use compiler.opt.passmgr.passmgr_ensure_analyses
+use compiler.opt.passmgr.passmgr_init
+use compiler.opt.passmgr.passmgr_invalidate_analyses
+use compiler.opt.passmgr.passmgr_mark_all_valid_from_lowering
+use compiler.opt.passmgr.passmgr_rollback_body
+use compiler.opt.passmgr.passmgr_snapshot_body
+use compiler.opt.bce.BceSiteRecord
+use compiler.opt.bce.BceStats
+use compiler.opt.bce.RangeInfo
+use compiler.opt.bce.bce_range_at
+use compiler.opt.bce.bce_stats_zero
+use compiler.opt.bce.opt_bce
+use compiler.opt.bce.range_build_info
+use compiler.opt.loops.ARITH_CHECKED
+use compiler.opt.loops.ARITH_PROVEN_NSW_NUW
+use compiler.opt.loops.ARITH_SATURATING
+use compiler.opt.loops.ARITH_WRAPPING
+use compiler.opt.loops.BARRIER_ATOMIC
+use compiler.opt.loops.BARRIER_AWAIT
+use compiler.opt.loops.BARRIER_DROP
+use compiler.opt.loops.BARRIER_FFI
+use compiler.opt.loops.BARRIER_GPU_DOMAIN
+use compiler.opt.loops.BARRIER_IO
+use compiler.opt.loops.BARRIER_STABLE_ADDR
+use compiler.opt.loops.BARRIER_VOLATILE
+use compiler.opt.loops.DEP_LOOP_INDEPENDENT
+use compiler.opt.loops.DEP_NONE
+use compiler.opt.loops.DEP_RAW_FLOW
+use compiler.opt.loops.DEP_UNKNOWN
+use compiler.opt.loops.DEP_WAR_ANTI
+use compiler.opt.loops.DEP_WAW_OUTPUT
+use compiler.opt.loops.InductionVar
+use compiler.opt.loops.LOOP_NONE
+use compiler.opt.loops.LoopDesc
+use compiler.opt.loops.LoopId
+use compiler.opt.loops.LoopSimplifyStats
+use compiler.opt.loops.LoopTree
+use compiler.opt.loops.SCEV_CONST
+use compiler.opt.loops.SCEV_IDX_NONE
+use compiler.opt.loops.TRIP_CONST
+use compiler.opt.loops.TRIP_SYMBOLIC
+use compiler.opt.loops.loop_desc_at
+use compiler.opt.loops.loop_iv_at
+use compiler.opt.loops.loops_discover
+use compiler.opt.loops.loops_extract_bool_branch
+use compiler.opt.loops.loops_is_val_invariant
+use compiler.opt.loops.loops_local_has_indirect_mutation
+use compiler.opt.loops.loops_local_written_in_loop
+use compiler.opt.loops.loops_query_dependence
+use compiler.opt.loops.loops_stamp_valid_analysis_revs
+use compiler.opt.loops.loops_stats_zero
+use compiler.opt.loops.loops_verify_pass_postconditions
+use compiler.opt.loops.lp_block_in_set
+use compiler.opt.loops.lp_find_def_inst
+use compiler.opt.loops.lp_peel_copy
+use compiler.opt.loops.lp_peel_copy_and_lcssa
+use compiler.opt.loops.lp_val_const_int
+use compiler.opt.loops.opt_loop_simplify
+use compiler.opt.loops.scev_analyze_tree
+use compiler.opt.loops.scev_expr_at
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// --- Pass Identity & Typed Vector Opcode Taxonomy (SPEC-74 §3, §9, AXS-VEC-001..006, AXS-VEC-049) ---
+
+pub const PASS_LOOP_VEC: u16 = 18u16;
+
+pub const VEC_TY_F32: u8 = 50u8;
+pub const VEC_TY_F64: u8 = 51u8;
+
+pub const OPT_INST_VLOAD: u8 = 32u8;
+pub const OPT_INST_VSTORE: u8 = 33u8;
+pub const OPT_INST_VLOAD_MASKED: u8 = 34u8;
+pub const OPT_INST_VSTORE_MASKED: u8 = 35u8;
+pub const OPT_INST_VSPLAT: u8 = 36u8;
+pub const OPT_INST_VSTEP: u8 = 37u8;
+pub const OPT_INST_VEXTRACT: u8 = 38u8;
+pub const OPT_INST_VINSERT: u8 = 39u8;
+pub const OPT_INST_VSHUFFLE: u8 = 40u8;
+pub const OPT_INST_VBINOP: u8 = 41u8;
+pub const OPT_INST_VFMA: u8 = 42u8;
+pub const OPT_INST_VCMP: u8 = 43u8;
+pub const OPT_INST_VSELECT: u8 = 44u8;
+pub const OPT_INST_VCAST: u8 = 45u8;
+pub const OPT_INST_VREDUCE: u8 = 46u8;
+
+pub const VEC_ELEM_NONE: u8 = 0u8;
+pub const VEC_ELEM_I8: u8 = 1u8;
+pub const VEC_ELEM_U8: u8 = 2u8;
+pub const VEC_ELEM_I16: u8 = 3u8;
+pub const VEC_ELEM_U16: u8 = 4u8;
+pub const VEC_ELEM_I32: u8 = 5u8;
+pub const VEC_ELEM_U32: u8 = 6u8;
+pub const VEC_ELEM_I64: u8 = 7u8;
+pub const VEC_ELEM_U64: u8 = 8u8;
+pub const VEC_ELEM_F32: u8 = 9u8;
+pub const VEC_ELEM_F64: u8 = 10u8;
+
+pub const VREDUCE_NONE: u8 = 0u8;
+pub const VREDUCE_ADD: u8 = 1u8;
+pub const VREDUCE_MUL: u8 = 2u8;
+pub const VREDUCE_BIT_AND: u8 = 3u8;
+pub const VREDUCE_BIT_OR: u8 = 4u8;
+pub const VREDUCE_BIT_XOR: u8 = 5u8;
+pub const VREDUCE_MIN: u8 = 6u8;
+pub const VREDUCE_MAX: u8 = 7u8;
+
+pub const TARGET_ISA_SCALAR_ONLY: u8 = 0u8;
+pub const TARGET_ISA_SSE2: u8 = 1u8;
+pub const TARGET_ISA_SSE42: u8 = 2u8;
+pub const TARGET_ISA_AVX: u8 = 3u8;
+pub const TARGET_ISA_AVX2: u8 = 4u8;
+pub const TARGET_ISA_NEON: u8 = 5u8;
+
+pub const FP_MODE_STRICT: u8 = 0u8;
+pub const FP_MODE_RELAXED: u8 = 1u8;
+
+pub const REASON_NONE: u8 = 0u8;
+pub const REASON_NON_COUNTED_LOOP: u8 = 1u8;
+pub const REASON_ATOMIC_BARRIER: u8 = 2u8;
+pub const REASON_VOLATILE_BARRIER: u8 = 3u8;
+pub const REASON_UNKNOWN_ALIAS: u8 = 4u8;
+pub const REASON_LOOP_CARRIED_DEP: u8 = 5u8;
+pub const REASON_STRICT_FP_REDUCTION: u8 = 6u8;
+pub const REASON_CHECKED_OVERFLOW_TRAP: u8 = 7u8;
+pub const REASON_UNPROVEN_BOUNDS: u8 = 8u8;
+pub const REASON_COST_NOT_PROFITABLE: u8 = 9u8;
+pub const REASON_SIZE_PROFILE_GROWTH: u8 = 10u8;
+pub const REASON_INTERIOR_CALL_OR_DROP: u8 = 11u8;
+pub const REASON_NON_ASSOC_REDUCTION: u8 = 12u8;
+
+pub const VEC_ALIAS_NONE: u8 = 0u8;
+pub const VEC_ALIAS_CAP_DISJOINT: u8 = 1u8;
+pub const VEC_ALIAS_SCEV_DISJOINT: u8 = 2u8;
+pub const VEC_ALIAS_RUNTIME_GUARD: u8 = 3u8;
+pub const VEC_ALIAS_REJECTED_MAY_ALIAS: u8 = 4u8;
+
+pub const EPILOGUE_NONE: u8 = 0u8;
+pub const EPILOGUE_SCALAR_REMAINDER: u8 = 1u8;
+pub const EPILOGUE_NONE_EXACT_MULTIPLE: u8 = 2u8;
+
+pub const COST_CONF_HIGH: u8 = 0u8;
+pub const COST_CONF_MEDIUM: u8 = 1u8;
+pub const COST_CONF_LOW: u8 = 2u8;
+
+const VEC_BARRIER_ALL_MASK: u16 =
+    BARRIER_VOLATILE | BARRIER_ATOMIC | BARRIER_IO | BARRIER_AWAIT |
+    BARRIER_FFI | BARRIER_DROP | BARRIER_STABLE_ADDR | BARRIER_GPU_DOMAIN;
+
+// --- Core Descriptors & Records (SPEC-74 §4..§10) ---
+
+@derive(Copy)
+pub struct TargetSimdCaps {
+    pub isa_level: u8,
+    pub max_int_vec_bits: u16,
+    pub max_fp_vec_bits: u16,
+    pub arch_vec_regs: u8,
+    pub reg_pressure_budget: u8,
+    pub has_fma: bool,
+    pub has_masked_mem: bool,
+    pub has_blendv: bool,
+    pub fp_mode: u8,
+}
+
+@derive(Copy)
+pub struct VecMemDepResult {
+    pub dep_kind: u8,
+    pub is_constant_dist: bool,
+    pub distance: i64,
+    pub certainty: u8,
+    pub alias_proof: u8,
+    pub is_legal_for_vf: bool,
+    pub reject_reason: u8,
+}
+
+@derive(Copy)
+pub struct LoopVecReduction {
+    pub is_valid: bool,
+    pub acc_local: MirLocalId,
+    pub header_phi_val: OptValueId,
+    pub init_val: OptValueId,
+    pub step_val: OptValueId,
+    pub step_bb: OptBbId,
+    pub step_inst_idx: u32,
+    pub bin_op: u8,
+    pub vreduce_op: u8,
+    pub elem_kind: u8,
+    pub arith_class: u8,
+    pub certainty: u8,
+    pub reject_reason: u8,
+}
+
+@derive(Copy)
+pub struct VectorLegalityResult {
+    pub is_legal: bool,
+    pub reject_reason: u8,
+    pub certainty: u8,
+    pub elem_kind: u8,
+    pub elem_bits: u16,
+    pub candidate_vf: u8,
+    pub max_safe_vf: u8,
+    pub alias_proof: u8,
+    pub has_reduction: bool,
+    pub reduction_op: u8,
+    pub reduction_arith: u8,
+    pub vload_count: u8,
+    pub vstore_count: u8,
+    pub vsplat_count: u8,
+    pub vstep_count: u8,
+    pub vbinop_count: u8,
+    pub vcmp_count: u8,
+    pub vselect_count: u8,
+    pub est_live_vec_regs: u8,
+}
+
+@derive(Copy)
+pub struct VectorCostEstimate {
+    pub loop_id: LoopId,
+    pub vf: u8,
+    pub uf: u8,
+    pub elem_kind: u8,
+    pub scalar_iter_cost: u32,
+    pub vector_iter_cost: u32,
+    pub setup_cost: u32,
+    pub reduction_cost: u32,
+    pub epilogue_cost: u32,
+    pub spill_penalty: u32,
+    pub total_scalar_cost: u32,
+    pub total_vec_cost: u32,
+    pub est_vec_regs: u8,
+    pub confidence: u8,
+    pub profitable: bool,
+    pub reject_reason: u8,
+}
+
+@derive(Copy)
+pub struct LoopVecRecord {
+    pub pass_id: u16,
+    pub loop_id: LoopId,
+    pub header_bb: OptBbId,
+    pub vector_loop_bb: OptBbId,
+    pub epilogue_loop_bb: OptBbId,
+    pub applied: bool,
+    pub vf: u8,
+    pub uf: u8,
+    pub elem_kind: u8,
+    pub isa_level: u8,
+    pub alias_proof: u8,
+    pub reduction_op: u8,
+    pub epilogue_kind: u8,
+    pub reason: u8,
+    pub certainty: u8,
+    pub vload_count: u8,
+    pub vstore_count: u8,
+    pub vsplat_count: u8,
+    pub vstep_count: u8,
+    pub vbinop_count: u8,
+    pub vselect_count: u8,
+    pub vreduce_count: u8,
+    pub scalar_cost: u32,
+    pub vec_cost: u32,
+    pub confidence: u8,
+}
+
+@derive(Copy)
+pub struct LoopVecStats {
+    pub pass_runs: u32,
+    pub pass_changes: u32,
+    pub pass_rollbacks: u32,
+    pub loops_analyzed: u32,
+    pub loops_vectorized: u32,
+    pub loops_rejected: u32,
+    pub cap_disjoint_proven: u32,
+    pub scev_disjoint_proven: u32,
+    pub runtime_alias_guards: u32,
+    pub reductions_vectorized: u32,
+    pub broadcasts_widened: u32,
+    pub step_vectors_widened: u32,
+    pub selects_if_converted: u32,
+    pub epilogues_emitted: u32,
+    pub epilogues_omitted_exact: u32,
+    pub rejected_non_counted: u32,
+    pub rejected_atomic: u32,
+    pub rejected_volatile: u32,
+    pub rejected_unknown_alias: u32,
+    pub rejected_loop_carried_dep: u32,
+    pub rejected_strict_fp: u32,
+    pub rejected_checked_overflow: u32,
+    pub rejected_unproven_bounds: u32,
+    pub rejected_cost: u32,
+    pub rejected_size_profile: u32,
+    pub records: *mut LoopVecRecord,
+    pub record_count: usize,
+    pub record_cap: usize,
+}
+
+// --- Contract, Target Capability Constructors & Element Type Queries (SPEC-74 §3, §7, §9) ---
+
+pub fn loop_vec_contract() -> TransformationContract {
+    TransformationContract {
+        pass_id: PASS_LOOP_VEC,
+        required_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                           ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_LOOP_INFO |
+                           ANALYSIS_MASK_RANGE_INFO | ANALYSIS_MASK_ALIAS_INFO |
+                           ANALYSIS_MASK_EFFECT_INFO,
+        required_proofs: PROP_MASK_IN_BOUNDS | PROP_MASK_NO_ALIAS | PROP_MASK_NO_OVERFLOW,
+        preserved_analyses: ANALYSIS_MASK_CFG | ANALYSIS_MASK_DOMINATORS | ANALYSIS_MASK_SSA |
+                            ANALYSIS_MASK_MEMORY_SSA | ANALYSIS_MASK_LOOP_INFO,
+        invalidated_analyses: ANALYSIS_MASK_RANGE_INFO,
+        preserved_properties: PROP_MASK_IN_BOUNDS | PROP_MASK_NO_ALIAS | PROP_MASK_NO_OVERFLOW,
+        postconditions: POSTCOND_ALL,
+    }
+}
+
+pub fn vec_default_target_caps() -> TargetSimdCaps {
+    TargetSimdCaps {
+        isa_level: TARGET_ISA_SSE2,
+        max_int_vec_bits: 128u16,
+        max_fp_vec_bits: 128u16,
+        arch_vec_regs: 16u8,
+        reg_pressure_budget: 14u8,
+        has_fma: false,
+        has_masked_mem: false,
+        has_blendv: false,
+        fp_mode: FP_MODE_STRICT,
+    }
+}
+
+pub fn vec_avx_target_caps() -> TargetSimdCaps {
+    TargetSimdCaps {
+        isa_level: TARGET_ISA_AVX,
+        max_int_vec_bits: 128u16,
+        max_fp_vec_bits: 256u16,
+        arch_vec_regs: 16u8,
+        reg_pressure_budget: 14u8,
+        has_fma: false,
+        has_masked_mem: true,
+        has_blendv: true,
+        fp_mode: FP_MODE_STRICT,
+    }
+}
+
+pub fn vec_avx2_target_caps() -> TargetSimdCaps {
+    TargetSimdCaps {
+        isa_level: TARGET_ISA_AVX2,
+        max_int_vec_bits: 256u16,
+        max_fp_vec_bits: 256u16,
+        arch_vec_regs: 16u8,
+        reg_pressure_budget: 14u8,
+        has_fma: true,
+        has_masked_mem: true,
+        has_blendv: true,
+        fp_mode: FP_MODE_STRICT,
+    }
+}
+
+pub fn vec_neon_target_caps() -> TargetSimdCaps {
+    TargetSimdCaps {
+        isa_level: TARGET_ISA_NEON,
+        max_int_vec_bits: 128u16,
+        max_fp_vec_bits: 128u16,
+        arch_vec_regs: 32u8,
+        reg_pressure_budget: 24u8,
+        has_fma: true,
+        has_masked_mem: false,
+        has_blendv: true,
+        fp_mode: FP_MODE_STRICT,
+    }
+}
+
+pub fn vec_elem_bit_width(elem_kind: u8) -> u16 {
+    if elem_kind == VEC_ELEM_I8 || elem_kind == VEC_ELEM_U8 {
+        return 8u16;
+    }
+    if elem_kind == VEC_ELEM_I16 || elem_kind == VEC_ELEM_U16 {
+        return 16u16;
+    }
+    if elem_kind == VEC_ELEM_I32 || elem_kind == VEC_ELEM_U32 || elem_kind == VEC_ELEM_F32 {
+        return 32u16;
+    }
+    if elem_kind == VEC_ELEM_I64 || elem_kind == VEC_ELEM_U64 || elem_kind == VEC_ELEM_F64 {
+        return 64u16;
+    }
+    0u16
+}
+
+pub fn vec_elem_is_float(elem_kind: u8) -> bool {
+    elem_kind == VEC_ELEM_F32 || elem_kind == VEC_ELEM_F64
+}
+
+pub fn vec_elem_is_signed_int(elem_kind: u8) -> bool {
+    elem_kind == VEC_ELEM_I8 || elem_kind == VEC_ELEM_I16 ||
+    elem_kind == VEC_ELEM_I32 || elem_kind == VEC_ELEM_I64
+}
+
+pub fn vec_classify_type_elem(thir: *const Thir, ty: TypeId) -> u8 {
+    let ty_v = ty.v;
+    if (thir as usize) == 0 || ty_v == 0u32 {
+        return VEC_ELEM_NONE;
+    }
+    let ax = type_get(unsafe { view((*thir).interner) }, TypeId { v: ty_v });
+    if (ax as usize) == 0 {
+        return VEC_ELEM_NONE;
+    }
+    let tk = unsafe { (*ax).kind };
+    if tk == TY_I8 { return VEC_ELEM_I8; }
+    if tk == TY_U8 { return VEC_ELEM_U8; }
+    if tk == TY_I16 { return VEC_ELEM_I16; }
+    if tk == TY_U16 { return VEC_ELEM_U16; }
+    if tk == TY_I32 { return VEC_ELEM_I32; }
+    if tk == TY_U32 { return VEC_ELEM_U32; }
+    if tk == TY_I64 || tk == TY_ISIZE { return VEC_ELEM_I64; }
+    if tk == TY_U64 || tk == TY_USIZE { return VEC_ELEM_U64; }
+    if tk == VEC_TY_F32 { return VEC_ELEM_F32; }
+    if tk == VEC_TY_F64 { return VEC_ELEM_F64; }
+    if tk == TY_ARRAY {
+        return vec_classify_type_elem(thir, unsafe { (*ax).elem });
+    }
+    if tk == TY_SLICE {
+        return vec_classify_type_elem(thir, unsafe { (*ax).elem });
+    }
+    if tk == TY_VIEW || tk == TY_MUT_VIEW || tk == TY_PTR {
+        let pt = unsafe { (*ax).pointee };
+        if pt.v != 0u32 && pt.v != ty_v {
+            return vec_classify_type_elem(thir, pt);
+        }
+    }
+    VEC_ELEM_NONE
+}
+
+// Selects the legal and profitable SIMD lane count `VF` for `elem_kind` under `caps` (`AXS-VEC-044..045`).
+pub fn vec_select_lane_width(
+    caps: view<TargetSimdCaps>,
+    elem_kind: u8,
+    trip_count_known: bool,
+    trip_count: u64,
+    est_regs_128: u8,
+    est_regs_256: u8
+) -> u8 {
+    let ebits = vec_elem_bit_width(elem_kind);
+    if ebits == 0u16 || caps.isa_level == TARGET_ISA_SCALAR_ONLY {
+        return 1u8;
+    }
+    let is_fp = vec_elem_is_float(elem_kind);
+    let max_bits: u16 = if is_fp { caps.max_fp_vec_bits } else { caps.max_int_vec_bits };
+    if max_bits < 128u16 {
+        return 1u8;
+    }
+    let vf_128: u8 = (128u16 / ebits) as u8;
+    if max_bits >= 256u16 {
+        let vf_256: u8 = (256u16 / ebits) as u8;
+        // Register pressure fallback: if 256-bit exceeds budget while 128-bit fits (`AXS-VEC-045`)
+        if est_regs_256 > caps.reg_pressure_budget && est_regs_128 <= caps.reg_pressure_budget {
+            return vf_128;
+        }
+        // Known trip-count ceiling: if constant trip count < VF_256 (`AXS-VEC-044` rule 2)
+        if trip_count_known && trip_count < (vf_256 as u64) {
+            if trip_count >= (vf_128 as u64) {
+                return vf_128;
+            }
+            return vf_128;
+        }
+        return vf_256;
+    }
+    vf_128
+}
+
+pub fn loop_vec_stats_zero(stats: mut_view<LoopVecStats>) {
+    stats.pass_runs = 0u32;
+    stats.pass_changes = 0u32;
+    stats.pass_rollbacks = 0u32;
+    stats.loops_analyzed = 0u32;
+    stats.loops_vectorized = 0u32;
+    stats.loops_rejected = 0u32;
+    stats.cap_disjoint_proven = 0u32;
+    stats.scev_disjoint_proven = 0u32;
+    stats.runtime_alias_guards = 0u32;
+    stats.reductions_vectorized = 0u32;
+    stats.broadcasts_widened = 0u32;
+    stats.step_vectors_widened = 0u32;
+    stats.selects_if_converted = 0u32;
+    stats.epilogues_emitted = 0u32;
+    stats.epilogues_omitted_exact = 0u32;
+    stats.rejected_non_counted = 0u32;
+    stats.rejected_atomic = 0u32;
+    stats.rejected_volatile = 0u32;
+    stats.rejected_unknown_alias = 0u32;
+    stats.rejected_loop_carried_dep = 0u32;
+    stats.rejected_strict_fp = 0u32;
+    stats.rejected_checked_overflow = 0u32;
+    stats.rejected_unproven_bounds = 0u32;
+    stats.rejected_cost = 0u32;
+    stats.rejected_size_profile = 0u32;
+    stats.records = 0 as *mut LoopVecRecord;
+    stats.record_count = 0;
+    stats.record_cap = 0;
+}
+
+pub unsafe fn loop_vec_record_at(base: *mut LoopVecRecord, idx: usize) -> *mut LoopVecRecord {
+    let off = idx * size_of<LoopVecRecord>();
+    ((base as usize) + off) as *mut LoopVecRecord
+}
+
+fn vec_mul_usize(a: usize, b: usize) -> usize {
+    let mut res: usize = 0;
+    let mut i: usize = 0;
+    while i < b {
+        res = res + a;
+        i = i + 1;
+    }
+    res
+}
+
+fn vec_push_record(stats: mut_view<LoopVecStats>, arena: mut_view<Arena>, rec: view<LoopVecRecord>) {
+    if stats.record_count >= stats.record_cap {
+        let new_cap: usize = if stats.record_cap == 0 { 16 } else { stats.record_cap + stats.record_cap };
+        let new_bytes = vec_mul_usize(new_cap, size_of<LoopVecRecord>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<LoopVecRecord>()) as *mut LoopVecRecord;
+        if stats.record_count > 0 && (stats.records as usize) != 0 {
+            let old_bytes = vec_mul_usize(stats.record_count, size_of<LoopVecRecord>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(stats.records as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        stats.records = new_arr;
+        stats.record_cap = new_cap;
+    }
+    let idx = stats.record_count;
+    stats.record_count = idx + 1;
+    unsafe {
+        *loop_vec_record_at(stats.records, idx) = *rec;
+    }
+}
+
+fn vec_bump_reject_stat(stats: mut_view<LoopVecStats>, reason: u8) {
+    stats.loops_rejected = stats.loops_rejected + 1u32;
+    if reason == REASON_NON_COUNTED_LOOP || reason == REASON_INTERIOR_CALL_OR_DROP {
+        stats.rejected_non_counted = stats.rejected_non_counted + 1u32;
+    } else if reason == REASON_ATOMIC_BARRIER {
+        stats.rejected_atomic = stats.rejected_atomic + 1u32;
+    } else if reason == REASON_VOLATILE_BARRIER {
+        stats.rejected_volatile = stats.rejected_volatile + 1u32;
+    } else if reason == REASON_UNKNOWN_ALIAS {
+        stats.rejected_unknown_alias = stats.rejected_unknown_alias + 1u32;
+    } else if reason == REASON_LOOP_CARRIED_DEP {
+        stats.rejected_loop_carried_dep = stats.rejected_loop_carried_dep + 1u32;
+    } else if reason == REASON_STRICT_FP_REDUCTION || reason == REASON_NON_ASSOC_REDUCTION {
+        stats.rejected_strict_fp = stats.rejected_strict_fp + 1u32;
+    } else if reason == REASON_CHECKED_OVERFLOW_TRAP {
+        stats.rejected_checked_overflow = stats.rejected_checked_overflow + 1u32;
+    } else if reason == REASON_UNPROVEN_BOUNDS {
+        stats.rejected_unproven_bounds = stats.rejected_unproven_bounds + 1u32;
+    } else if reason == REASON_COST_NOT_PROFITABLE {
+        stats.rejected_cost = stats.rejected_cost + 1u32;
+    } else if reason == REASON_SIZE_PROFILE_GROWTH {
+        stats.rejected_size_profile = stats.rejected_size_profile + 1u32;
+    }
+}
+
+// --- 1. Capability-Disjoint & SCEV Loop-Carried Memory Dependence Prover (SPEC-74 §4.2, AXS-VEC-010..017) ---
+
+fn vec_extract_place_idx_local(pl: view<MirPlace>, out_idx_loc: mut_view<u32>) -> bool {
+    if pl.proj_count == 1 && (pl.projs as usize) != 0 {
+        let p0 = unsafe { mir_proj_at(pl.projs, 0) };
+        if (unsafe { (*p0).kind }) == MIR_PROJ_INDEX {
+            *out_idx_loc = unsafe { (*p0).index_local.v };
+            return true;
+        }
+    } else if pl.proj_count == 2 && (pl.projs as usize) != 0 {
+        let p0 = unsafe { mir_proj_at(pl.projs, 0) };
+        let p1 = unsafe { mir_proj_at(pl.projs, 1) };
+        if (unsafe { (*p0).kind }) == MIR_PROJ_DEREF && (unsafe { (*p1).kind }) == MIR_PROJ_INDEX {
+            *out_idx_loc = unsafe { (*p1).index_local.v };
+            return true;
+        }
+    }
+    false
+}
+
+fn vec_resolve_place_iv_offset(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    place: view<MirPlace>,
+    piv_loc: u32,
+    out_off: mut_view<i64>
+) -> bool {
+    *out_off = 0i64;
+    if piv_loc == 0u32 {
+        return false;
+    }
+    let mut idx_loc: u32 = 0u32;
+    if !vec_extract_place_idx_local(place, mut_view(idx_loc)) || idx_loc == 0u32 {
+        return false;
+    }
+    if idx_loc == piv_loc {
+        *out_off = 0i64;
+        return true;
+    }
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            let icnt = unsafe { (*bb).inst_count };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                let flg = unsafe { (*inst).flags };
+                if opc != OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16 &&
+                   (unsafe { (*inst).place.local.v }) == idx_loc && (unsafe { (*inst).place.proj_count }) == 0 {
+                    if opc == OPT_INST_COPY {
+                        let lv = lp_peel_copy(body, unsafe { (*inst).lhs });
+                        if lv.v != OPT_VALUE_NONE && (lv.v as usize) <= body.value_count &&
+                           (unsafe { (*opt_val_at(body.values, lv.v as usize)).src_local.v }) == piv_loc {
+                            *out_off = 0i64;
+                            return true;
+                        }
+                    } else if opc == OPT_INST_BINOP || opc == OPT_INST_WRAPPING_BINOP {
+                        let bop = unsafe { (*inst).sub_op };
+                        let lv = lp_peel_copy(body, unsafe { (*inst).lhs });
+                        let rv = lp_peel_copy(body, unsafe { (*inst).rhs });
+                        let mut cu: u64 = 0u64;
+                        let mut ci: i64 = 0i64;
+                        if lv.v != OPT_VALUE_NONE && (lv.v as usize) <= body.value_count &&
+                           (unsafe { (*opt_val_at(body.values, lv.v as usize)).src_local.v }) == piv_loc &&
+                           lp_val_const_int(body, rv, mut_view(cu), mut_view(ci)) {
+                            if bop == MIR_BINOP_ADD || bop == MIR_BINOP_WRAPPING_ADD {
+                                *out_off = cu as i64;
+                                return true;
+                            }
+                            if bop == MIR_BINOP_SUB || bop == MIR_BINOP_WRAPPING_SUB {
+                                *out_off = 0i64 - (cu as i64);
+                                return true;
+                            }
+                        } else if rv.v != OPT_VALUE_NONE && (rv.v as usize) <= body.value_count &&
+                                  (unsafe { (*opt_val_at(body.values, rv.v as usize)).src_local.v }) == piv_loc &&
+                                  lp_val_const_int(body, lv, mut_view(cu), mut_view(ci)) {
+                            if bop == MIR_BINOP_ADD || bop == MIR_BINOP_WRAPPING_ADD {
+                                *out_off = cu as i64;
+                                return true;
+                            }
+                        }
+                    }
+                    return false;
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    false
+}
+
+fn vec_base_local_reassigned_in_loop(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    info: *const AliasInfo,
+    loc_v: u32
+) -> bool {
+    if loc_v == 0u32 {
+        return true;
+    }
+    if loops_local_has_indirect_mutation(body, info, loc_v) {
+        return true;
+    }
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            let mut p: usize = 0;
+            while p < (unsafe { (*bb).phi_count }) {
+                let phi = unsafe { opt_phi_at((*bb).phis, p) };
+                if (unsafe { (*phi).src_local.v }) == loc_v {
+                    return true;
+                }
+                p = p + 1;
+            }
+            let mut i: usize = 0;
+            while i < (unsafe { (*bb).inst_count }) {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                let flg = unsafe { (*inst).flags };
+                if opc != OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16 {
+                    if (unsafe { (*inst).place.local.v }) == loc_v {
+                        let pcnt = unsafe { (*inst).place.proj_count };
+                        if pcnt == 0 || (unsafe { (*inst).place.projs } as usize) == 0 {
+                            return true;
+                        }
+                        let p0 = unsafe { mir_proj_at((*inst).place.projs, 0) };
+                        if (unsafe { (*p0).kind }) != MIR_PROJ_DEREF {
+                            return true;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+            if (unsafe { (*bb).term.kind }) == OPT_TERM_CALL &&
+               (unsafe { (*bb).term.call_dest.local.v }) == loc_v {
+                let cpcnt = unsafe { (*bb).term.call_dest.proj_count };
+                if cpcnt == 0 || (unsafe { (*bb).term.call_dest.projs } as usize) == 0 {
+                    return true;
+                }
+                let cp0 = unsafe { mir_proj_at((*bb).term.call_dest.projs, 0) };
+                if (unsafe { (*cp0).kind }) != MIR_PROJ_DEREF {
+                    return true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    false
+}
+
+pub fn vec_prove_memory_dep_pair(
+    tree: view<LoopTree>,
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    info: *const AliasInfo,
+    place_a: view<MirPlace>,
+    pt_a: u32,
+    is_write_a: bool,
+    place_b: view<MirPlace>,
+    pt_b: u32,
+    is_write_b: bool,
+    candidate_vf: u8,
+    allow_runtime_guard: bool,
+    arena: mut_view<Arena>
+) -> VecMemDepResult {
+    let vf_use: i64 = if candidate_vf == 0u8 { 4i64 } else { candidate_vf as i64 };
+    if !is_write_a && !is_write_b {
+        return VecMemDepResult {
+            dep_kind: DEP_NONE,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_PROVEN,
+            alias_proof: VEC_ALIAS_NONE,
+            is_legal_for_vf: true,
+            reject_reason: REASON_NONE,
+        };
+    }
+    if lp.is_irreducible || (info as usize) == 0 {
+        return VecMemDepResult {
+            dep_kind: DEP_UNKNOWN,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_UNKNOWN,
+            alias_proof: VEC_ALIAS_REJECTED_MAY_ALIAS,
+            is_legal_for_vf: false,
+            reject_reason: REASON_UNKNOWN_ALIAS,
+        };
+    }
+
+    let ainfo = unsafe { view(*info) };
+    let reg_a = alias_extract_region(ainfo, body, place_a, OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+    let reg_b = alias_extract_region(ainfo, body, place_b, OptValueId { v: OPT_VALUE_NONE }, mut_view(*arena));
+    if reg_a.domain == DOMAIN_FIXED_MMIO || reg_b.domain == DOMAIN_FIXED_MMIO {
+        return VecMemDepResult {
+            dep_kind: DEP_UNKNOWN,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_UNKNOWN,
+            alias_proof: VEC_ALIAS_REJECTED_MAY_ALIAS,
+            is_legal_for_vf: false,
+            reject_reason: REASON_VOLATILE_BARRIER,
+        };
+    }
+
+    let qpt: u32 = if pt_a >= pt_b { pt_a } else { pt_b };
+    let afact = alias_query_regions(ainfo, body, mut_view(*arena), view(reg_a), view(reg_b), qpt);
+    if alias_is_no_alias_proven(view(afact)) {
+        let proof_kind: u8 = if afact.reason == ALIAS_REASON_CAP_MUT_DISJOINT ||
+                                afact.reason == ALIAS_REASON_CAP_VIEW_READONLY ||
+                                (reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE && reg_b.cap_mode == CAP_MODE_VIEW_READ) ||
+                                (reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE && reg_a.cap_mode == CAP_MODE_VIEW_READ) ||
+                                (reg_a.cap_mode == CAP_MODE_MUT_VIEW_WRITE && reg_b.cap_mode == CAP_MODE_MUT_VIEW_WRITE &&
+                                 place_a.local.v != place_b.local.v) {
+            VEC_ALIAS_CAP_DISJOINT
+        } else {
+            VEC_ALIAS_SCEV_DISJOINT
+        };
+        return VecMemDepResult {
+            dep_kind: DEP_NONE,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_PROVEN,
+            alias_proof: proof_kind,
+            is_legal_for_vf: true,
+            reject_reason: REASON_NONE,
+        };
+    }
+
+    let dep = loops_query_dependence(
+        tree, lp, body, info,
+        place_a, pt_a, is_write_a,
+        place_b, pt_b, is_write_b,
+        mut_view(*arena)
+    );
+    if dep.kind == DEP_NONE && dep.certainty == CERTAINTY_PROVEN {
+        return VecMemDepResult {
+            dep_kind: DEP_NONE,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_PROVEN,
+            alias_proof: VEC_ALIAS_SCEV_DISJOINT,
+            is_legal_for_vf: true,
+            reject_reason: REASON_NONE,
+        };
+    }
+    if dep.kind == DEP_LOOP_INDEPENDENT && dep.certainty == CERTAINTY_PROVEN {
+        return VecMemDepResult {
+            dep_kind: DEP_LOOP_INDEPENDENT,
+            is_constant_dist: true,
+            distance: 0i64,
+            certainty: CERTAINTY_PROVEN,
+            alias_proof: VEC_ALIAS_SCEV_DISJOINT,
+            is_legal_for_vf: true,
+            reject_reason: REASON_NONE,
+        };
+    }
+    if dep.is_constant_dist && dep.certainty == CERTAINTY_PROVEN {
+        let d = dep.distance;
+        if dep.kind == DEP_RAW_FLOW || dep.kind == DEP_WAW_OUTPUT {
+            // Forward loop-carried recurrence (`a[i] = a[i - d] + 1`): legal iff `d >= VF` (`AXS-VEC-014`).
+            let legal_flow = d >= vf_use;
+            return VecMemDepResult {
+                dep_kind: dep.kind,
+                is_constant_dist: true,
+                distance: d,
+                certainty: CERTAINTY_PROVEN,
+                alias_proof: if legal_flow { VEC_ALIAS_SCEV_DISJOINT } else { VEC_ALIAS_REJECTED_MAY_ALIAS },
+                is_legal_for_vf: legal_flow,
+                reject_reason: if legal_flow { REASON_NONE } else { REASON_LOOP_CARRIED_DEP },
+            };
+        }
+        if dep.kind == DEP_WAR_ANTI {
+            // Backward anti-dependence in iteration space (`a[i] = a[i + d] + 1`, signed distance `-d < 0`):
+            // Legal when the load precedes the store in the loop body (`pt_load < pt_store`) or `d >= VF`.
+            let pt_load: u32 = if is_write_a { pt_b } else { pt_a };
+            let pt_store: u32 = if is_write_a { pt_a } else { pt_b };
+            let legal_anti = pt_load < pt_store || d >= vf_use;
+            return VecMemDepResult {
+                dep_kind: DEP_WAR_ANTI,
+                is_constant_dist: true,
+                distance: 0i64 - d,
+                certainty: CERTAINTY_PROVEN,
+                alias_proof: if legal_anti { VEC_ALIAS_SCEV_DISJOINT } else { VEC_ALIAS_REJECTED_MAY_ALIAS },
+                is_legal_for_vf: legal_anti,
+                reject_reason: if legal_anti { REASON_NONE } else { REASON_LOOP_CARRIED_DEP },
+            };
+        }
+    }
+
+    // Same base container: try direct primary-IV affine offset difference `a[i + off_a]` vs `a[i + off_b]`
+    if place_a.local.v == place_b.local.v {
+        if lp.iv_count > 0 && (lp.ivs as usize) != 0 && place_a.proj_count == place_b.proj_count {
+            let piv = unsafe { loop_iv_at(lp.ivs, 0) };
+            if (unsafe { (*piv).is_primary }) && (unsafe { (*piv).step_const }) == 1i64 &&
+               (unsafe { (*piv).phi_val.v }) != OPT_VALUE_NONE &&
+               ((unsafe { (*piv).phi_val.v }) as usize) <= body.value_count {
+                let pvp = unsafe { opt_val_at(body.values, (*piv).phi_val.v as usize) };
+                let piv_loc = unsafe { (*pvp).src_local.v };
+                let mut off_a: i64 = 0i64;
+                let mut off_b: i64 = 0i64;
+                if vec_resolve_place_iv_offset(lp, body, place_a, piv_loc, mut_view(off_a)) &&
+                   vec_resolve_place_iv_offset(lp, body, place_b, piv_loc, mut_view(off_b)) {
+                    let w_off: i64 = if is_write_a { off_a } else { off_b };
+                    let r_off: i64 = if is_write_a { off_b } else { off_a };
+                    let flow_dist = w_off - r_off;
+                    if flow_dist == 0i64 {
+                        return VecMemDepResult {
+                            dep_kind: DEP_LOOP_INDEPENDENT,
+                            is_constant_dist: true,
+                            distance: 0i64,
+                            certainty: CERTAINTY_PROVEN,
+                            alias_proof: VEC_ALIAS_SCEV_DISJOINT,
+                            is_legal_for_vf: true,
+                            reject_reason: REASON_NONE,
+                        };
+                    }
+                    if flow_dist > 0i64 {
+                        let dk: u8 = if is_write_a && is_write_b { DEP_WAW_OUTPUT } else { DEP_RAW_FLOW };
+                        let legal_f = flow_dist >= vf_use;
+                        return VecMemDepResult {
+                            dep_kind: dk,
+                            is_constant_dist: true,
+                            distance: flow_dist,
+                            certainty: CERTAINTY_PROVEN,
+                            alias_proof: if legal_f { VEC_ALIAS_SCEV_DISJOINT } else { VEC_ALIAS_REJECTED_MAY_ALIAS },
+                            is_legal_for_vf: legal_f,
+                            reject_reason: if legal_f { REASON_NONE } else { REASON_LOOP_CARRIED_DEP },
+                        };
+                    }
+                    let anti_d = r_off - w_off;
+                    let pt_load2: u32 = if is_write_a { pt_b } else { pt_a };
+                    let pt_store2: u32 = if is_write_a { pt_a } else { pt_b };
+                    let legal_a = pt_load2 < pt_store2 || anti_d >= vf_use;
+                    return VecMemDepResult {
+                        dep_kind: DEP_WAR_ANTI,
+                        is_constant_dist: true,
+                        distance: flow_dist,
+                        certainty: CERTAINTY_PROVEN,
+                        alias_proof: if legal_a { VEC_ALIAS_SCEV_DISJOINT } else { VEC_ALIAS_REJECTED_MAY_ALIAS },
+                        is_legal_for_vf: legal_a,
+                        reject_reason: if legal_a { REASON_NONE } else { REASON_LOOP_CARRIED_DEP },
+                    };
+                }
+            }
+        }
+        return VecMemDepResult {
+            dep_kind: DEP_UNKNOWN,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_UNKNOWN,
+            alias_proof: VEC_ALIAS_REJECTED_MAY_ALIAS,
+            is_legal_for_vf: false,
+            reject_reason: REASON_LOOP_CARRIED_DEP,
+        };
+    }
+
+    // Distinct base pointers/containers with unproven static disjointness (e.g., raw pointers `*mut T` / `*const T`)
+    if allow_runtime_guard &&
+       place_a.local.v != 0u32 && place_b.local.v != 0u32 &&
+       !vec_base_local_reassigned_in_loop(lp, body, info, place_a.local.v) &&
+       !vec_base_local_reassigned_in_loop(lp, body, info, place_b.local.v) {
+        return VecMemDepResult {
+            dep_kind: DEP_NONE,
+            is_constant_dist: false,
+            distance: 0i64,
+            certainty: CERTAINTY_POSSIBLE,
+            alias_proof: VEC_ALIAS_RUNTIME_GUARD,
+            is_legal_for_vf: true,
+            reject_reason: REASON_NONE,
+        };
+    }
+
+    VecMemDepResult {
+        dep_kind: DEP_UNKNOWN,
+        is_constant_dist: false,
+        distance: 0i64,
+        certainty: CERTAINTY_UNKNOWN,
+        alias_proof: VEC_ALIAS_REJECTED_MAY_ALIAS,
+        is_legal_for_vf: false,
+        reject_reason: REASON_UNKNOWN_ALIAS,
+    }
+}
+
+// --- 2. Reduction Recognition, Strict FP Ordering & Checked Overflow Gates (SPEC-74 §4.4, REQ-OPT-206) ---
+
+fn vec_binop_to_vreduce_op(bin_op: u8) -> u8 {
+    if bin_op == MIR_BINOP_ADD || bin_op == MIR_BINOP_WRAPPING_ADD {
+        return VREDUCE_ADD;
+    }
+    if bin_op == MIR_BINOP_MUL || bin_op == MIR_BINOP_WRAPPING_MUL {
+        return VREDUCE_MUL;
+    }
+    if bin_op == MIR_BINOP_BIT_AND {
+        return VREDUCE_BIT_AND;
+    }
+    if bin_op == MIR_BINOP_BIT_OR {
+        return VREDUCE_BIT_OR;
+    }
+    if bin_op == MIR_BINOP_BIT_XOR {
+        return VREDUCE_BIT_XOR;
+    }
+    VREDUCE_NONE
+}
+
+fn vec_loop_has_unproven_checked_overflow_for_local(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    iv_local: u32
+) -> bool {
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            let icnt = unsafe { (*bb).inst_count };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                if opc == OPT_INST_CHECKED_BINOP {
+                    let lhs_v = lp_peel_copy(body, unsafe { (*inst).lhs });
+                    let is_iv_step = lhs_v.v != OPT_VALUE_NONE && (lhs_v.v as usize) <= body.value_count &&
+                                     (unsafe { (*opt_val_at(body.values, lhs_v.v as usize)).src_local.v }) == iv_local &&
+                                     (unsafe { (*inst).sub_op }) == MIR_BINOP_ADD;
+                    if !is_iv_step {
+                        return true;
+                    }
+                }
+                if opc == OPT_INST_BINOP {
+                    let bop = unsafe { (*inst).sub_op };
+                    if bop == MIR_BINOP_DIV || bop == MIR_BINOP_REM || bop == MIR_BINOP_SHL || bop == MIR_BINOP_SHR {
+                        return true;
+                    }
+                }
+                if opc == OPT_INST_UNOP && (unsafe { (*inst).sub_op }) == MIR_UNOP_NEG {
+                    let ty_elem = vec_classify_type_elem(body.thir, unsafe { (*inst).ty });
+                    if vec_elem_is_signed_int(ty_elem) {
+                        return true;
+                    }
+                }
+                i = i + 1;
+            }
+        }
+        k = k + 1;
+    }
+    false
+}
+
+fn vec_prove_checked_int_reduction_nsw(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    range_info: *const RangeInfo,
+    acc_local: u32,
+    iv_local: u32,
+    step_inst: view<OptInst>,
+    elem_kind: u8
+) -> bool {
+    if step_inst.opcode == OPT_INST_CHECKED_BINOP {
+        return false;
+    }
+    if vec_loop_has_unproven_checked_overflow_for_local(lp, body, iv_local) {
+        return false;
+    }
+    if lp.trip_count.certainty != CERTAINTY_PROVEN {
+        return false;
+    }
+    // Check if `PROP_NO_OVERFLOW` was explicitly recorded in `body.provenance` for `step_inst.result`
+    let mut pi: usize = 0;
+    while pi < body.provenance_count && (body.provenance as usize) != 0 {
+        let pr = unsafe { opt_prov_at(body.provenance, pi) };
+        if (unsafe { (*pr).prop_kind }) == PROP_NO_OVERFLOW &&
+           (unsafe { (*pr).certainty }) == CERTAINTY_PROVEN &&
+           ((unsafe { (*pr).subject_val.v }) == step_inst.result.v ||
+            (unsafe { (*pr).at_bb.v }) == lp.header.v) {
+            return true;
+        }
+        pi = pi + 1;
+    }
+    // Check `RangeInfo` bounds on the added term and initial accumulator across known constant trip count
+    if lp.trip_count.kind == TRIP_CONST && lp.trip_count.const_iters <= 65536u64 {
+        let tc = lp.trip_count.const_iters;
+        let ebits = vec_elem_bit_width(elem_kind);
+        let lhs_v = lp_peel_copy(body, step_inst.lhs);
+        let rhs_v = lp_peel_copy(body, step_inst.rhs);
+        let other_v: OptValueId = if lhs_v.v != OPT_VALUE_NONE && (lhs_v.v as usize) <= body.value_count &&
+                                     (unsafe { (*opt_val_at(body.values, lhs_v.v as usize)).src_local.v }) == acc_local {
+            rhs_v
+        } else {
+            lhs_v
+        };
+        let mut cu: u64 = 0u64;
+        let mut ci: i64 = 0i64;
+        if lp_val_const_int(body, other_v, mut_view(cu), mut_view(ci)) {
+            if ebits >= 32u16 && ci >= -10000i64 && ci <= 10000i64 {
+                return true;
+            }
+        }
+        if (range_info as usize) != 0 && other_v.v != OPT_VALUE_NONE {
+            let rinfo = unsafe { view(*range_info) };
+            if (other_v.v as usize) < rinfo.value_cap && (rinfo.value_ranges as usize) != 0 {
+                let vr = unsafe { bce_range_at(rinfo.value_ranges, other_v.v as usize) };
+                if (unsafe { (*vr).has_range }) && ebits >= 32u16 {
+                    let lo = unsafe { (*vr).lo } as i64;
+                    let hi = unsafe { (*vr).hi } as i64;
+                    if lo >= -10000i64 && hi <= 10000i64 && tc <= 65536u64 {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+fn vec_is_phi_used_in_loop(lp: view<LoopDesc>, body: view<OptBody>, phi_res: OptValueId) -> bool {
+    if phi_res.v == OPT_VALUE_NONE {
+        return false;
+    }
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            let icnt = unsafe { (*bb).inst_count };
+            let mut i: usize = 0;
+            while i < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, i) };
+                let opc = unsafe { (*inst).opcode };
+                let flg = unsafe { (*inst).flags };
+                if opc != OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16 {
+                    let lv = lp_peel_copy(body, unsafe { (*inst).lhs });
+                    let rv = lp_peel_copy(body, unsafe { (*inst).rhs });
+                    if (unsafe { (*inst).lhs.v }) == phi_res.v || lv.v == phi_res.v ||
+                       (unsafe { (*inst).rhs.v }) == phi_res.v || rv.v == phi_res.v {
+                        return true;
+                    }
+                    let eac = unsafe { (*inst).extra_arg_count };
+                    let mut ei: usize = 0;
+                    while ei < eac && ((unsafe { (*inst).extra_args }) as usize) != 0 {
+                        let ev = unsafe { *opt_valid_at((*inst).extra_args, ei) };
+                        let ep = lp_peel_copy(body, ev);
+                        if ev.v == phi_res.v || ep.v == phi_res.v {
+                            return true;
+                        }
+                        ei = ei + 1;
+                    }
+                }
+                i = i + 1;
+            }
+            if unsafe { (*bb).has_term } {
+                let cv = lp_peel_copy(body, unsafe { (*bb).term.cond });
+                if (unsafe { (*bb).term.cond.v }) == phi_res.v || cv.v == phi_res.v {
+                    return true;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    false
+}
+
+pub fn vec_recognize_reduction(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    info: *const AliasInfo,
+    range_info: *const RangeInfo,
+    caps: view<TargetSimdCaps>,
+    elem_kind_override: u8
+) -> LoopVecReduction {
+    let invalid = LoopVecReduction {
+        is_valid: false,
+        acc_local: MirLocalId { v: 0u32 },
+        header_phi_val: OptValueId { v: OPT_VALUE_NONE },
+        init_val: OptValueId { v: OPT_VALUE_NONE },
+        step_val: OptValueId { v: OPT_VALUE_NONE },
+        step_bb: OptBbId { v: OPT_BB_NONE },
+        step_inst_idx: 0u32,
+        bin_op: 0u8,
+        vreduce_op: VREDUCE_NONE,
+        elem_kind: VEC_ELEM_NONE,
+        arith_class: ARITH_CHECKED,
+        certainty: CERTAINTY_UNKNOWN,
+        reject_reason: REASON_NONE,
+    };
+    if lp.is_irreducible || lp.preheader.v == OPT_BB_NONE || lp.latch_count != 1 ||
+       (lp.header.v as usize) >= body.bb_count {
+        return invalid;
+    }
+
+    let mut iv_loc: u32 = 0u32;
+    if lp.iv_count > 0 && (lp.ivs as usize) != 0 {
+        let piv = unsafe { loop_iv_at(lp.ivs, 0) };
+        if (unsafe { (*piv).phi_val.v }) != OPT_VALUE_NONE &&
+           ((unsafe { (*piv).phi_val.v }) as usize) <= body.value_count {
+            let pvp = unsafe { opt_val_at(body.values, (*piv).phi_val.v as usize) };
+            iv_loc = unsafe { (*pvp).src_local.v };
+        }
+    }
+
+    let ph_v = lp.preheader.v;
+    let latch_v = unsafe { (*opt_bbid_at(lp.latches, 0)).v };
+    let hbb = unsafe { opt_block_at(body.blocks, lp.header.v as usize) };
+    let pcnt = unsafe { (*hbb).phi_count };
+    let mut pi: usize = 0;
+    while pi < pcnt {
+        let phi = unsafe { opt_phi_at((*hbb).phis, pi) };
+        let phi_res = unsafe { (*phi).result };
+        let acc_loc = unsafe { (*phi).src_local.v };
+        if (unsafe { (*phi).arity }) == 2 &&
+           (unsafe { (*phi).proj_field }) == OPT_PROJ_NONE &&
+           acc_loc != 0u32 && acc_loc != iv_loc &&
+           vec_is_phi_used_in_loop(lp, body, phi_res) &&
+           !loops_local_has_indirect_mutation(body, info, acc_loc) {
+            let b0 = unsafe { (*opt_bbid_at((*phi).incoming_blocks, 0)).v };
+            let b1 = unsafe { (*opt_bbid_at((*phi).incoming_blocks, 1)).v };
+            let v0 = unsafe { *opt_valid_at((*phi).incoming_values, 0) };
+            let v1 = unsafe { *opt_valid_at((*phi).incoming_values, 1) };
+            let mut init_v = OptValueId { v: OPT_VALUE_NONE };
+            let mut step_v = OptValueId { v: OPT_VALUE_NONE };
+            if b0 == ph_v && b1 == latch_v {
+                init_v = v0;
+                step_v = v1;
+            } else if b1 == ph_v && b0 == latch_v {
+                init_v = v1;
+                step_v = v0;
+            }
+            if init_v.v != OPT_VALUE_NONE && step_v.v != OPT_VALUE_NONE {
+                let s_peel = lp_peel_copy(body, step_v);
+                let s_inst = lp_find_def_inst(body, s_peel);
+                if (s_inst as usize) != 0 {
+                    let opc = unsafe { (*s_inst).opcode };
+                    let bop = unsafe { (*s_inst).sub_op };
+                    let s_vp = unsafe { opt_val_at(body.values, s_peel.v as usize) };
+                    let s_bb = unsafe { (*s_vp).def_bb };
+                    let s_idx = unsafe { (*s_vp).def_inst.v };
+                    if opc == OPT_INST_WRAPPING_BINOP || opc == OPT_INST_BINOP || opc == OPT_INST_CHECKED_BINOP {
+                        let lhs_p = lp_peel_copy_and_lcssa(body, unsafe { (*s_inst).lhs });
+                        let rhs_p = lp_peel_copy_and_lcssa(body, unsafe { (*s_inst).rhs });
+                        let lhs_is_acc = lhs_p.v == phi_res.v ||
+                                         (lhs_p.v != OPT_VALUE_NONE && (lhs_p.v as usize) <= body.value_count &&
+                                          (unsafe { (*opt_val_at(body.values, lhs_p.v as usize)).src_local.v }) == acc_loc);
+                        let rhs_is_acc = rhs_p.v == phi_res.v ||
+                                         (rhs_p.v != OPT_VALUE_NONE && (rhs_p.v as usize) <= body.value_count &&
+                                          (unsafe { (*opt_val_at(body.values, rhs_p.v as usize)).src_local.v }) == acc_loc);
+                        if lhs_is_acc != rhs_is_acc {
+                            let inferred_elem = vec_classify_type_elem(body.thir, unsafe { (*phi).ty });
+                            let elem_k: u8 = if elem_kind_override != VEC_ELEM_NONE {
+                                elem_kind_override
+                            } else {
+                                inferred_elem
+                            };
+                            let vred = vec_binop_to_vreduce_op(bop);
+                            if vred == VREDUCE_NONE {
+                                return LoopVecReduction {
+                                    is_valid: false,
+                                    acc_local: MirLocalId { v: acc_loc },
+                                    header_phi_val: phi_res,
+                                    init_val: init_v,
+                                    step_val: s_peel,
+                                    step_bb: s_bb,
+                                    step_inst_idx: s_idx,
+                                    bin_op: bop,
+                                    vreduce_op: VREDUCE_NONE,
+                                    elem_kind: elem_k,
+                                    arith_class: ARITH_SATURATING,
+                                    certainty: CERTAINTY_UNKNOWN,
+                                    reject_reason: REASON_NON_ASSOC_REDUCTION,
+                                };
+                            }
+                            if vec_elem_is_float(elem_k) {
+                                // `REQ-OPT-206` / `AXS-VEC-021`: Reject FP `+` / `*` reductions under `FP_MODE_STRICT`.
+                                if caps.fp_mode == FP_MODE_STRICT && (vred == VREDUCE_ADD || vred == VREDUCE_MUL) {
+                                    return LoopVecReduction {
+                                        is_valid: false,
+                                        acc_local: MirLocalId { v: acc_loc },
+                                        header_phi_val: phi_res,
+                                        init_val: init_v,
+                                        step_val: s_peel,
+                                        step_bb: s_bb,
+                                        step_inst_idx: s_idx,
+                                        bin_op: bop,
+                                        vreduce_op: vred,
+                                        elem_kind: elem_k,
+                                        arith_class: ARITH_CHECKED,
+                                        certainty: CERTAINTY_UNKNOWN,
+                                        reject_reason: REASON_STRICT_FP_REDUCTION,
+                                    };
+                                }
+                                return LoopVecReduction {
+                                    is_valid: true,
+                                    acc_local: MirLocalId { v: acc_loc },
+                                    header_phi_val: phi_res,
+                                    init_val: init_v,
+                                    step_val: s_peel,
+                                    step_bb: s_bb,
+                                    step_inst_idx: s_idx,
+                                    bin_op: bop,
+                                    vreduce_op: vred,
+                                    elem_kind: elem_k,
+                                    arith_class: ARITH_WRAPPING,
+                                    certainty: CERTAINTY_PROVEN,
+                                    reject_reason: REASON_NONE,
+                                };
+                            }
+                            // Integer reduction: wrapping / bitwise is unconditionally legal (`AXS-VEC-023` rule 1)
+                            let is_wrap_or_bit = opc == OPT_INST_WRAPPING_BINOP ||
+                                                 bop == MIR_BINOP_WRAPPING_ADD ||
+                                                 bop == MIR_BINOP_WRAPPING_MUL ||
+                                                 bop == MIR_BINOP_BIT_AND ||
+                                                 bop == MIR_BINOP_BIT_OR ||
+                                                 bop == MIR_BINOP_BIT_XOR;
+                            if is_wrap_or_bit {
+                                return LoopVecReduction {
+                                    is_valid: true,
+                                    acc_local: MirLocalId { v: acc_loc },
+                                    header_phi_val: phi_res,
+                                    init_val: init_v,
+                                    step_val: s_peel,
+                                    step_bb: s_bb,
+                                    step_inst_idx: s_idx,
+                                    bin_op: bop,
+                                    vreduce_op: vred,
+                                    elem_kind: elem_k,
+                                    arith_class: ARITH_WRAPPING,
+                                    certainty: CERTAINTY_PROVEN,
+                                    reject_reason: REASON_NONE,
+                                };
+                            }
+                            // Checked integer `+` / `*` reduction: legal iff `NoOverflow` is proven (`AXS-VEC-023` rule 2)
+                            if vec_prove_checked_int_reduction_nsw(
+                                lp, body, range_info, acc_loc, iv_loc, unsafe { view(*s_inst) }, elem_k
+                            ) {
+                                return LoopVecReduction {
+                                    is_valid: true,
+                                    acc_local: MirLocalId { v: acc_loc },
+                                    header_phi_val: phi_res,
+                                    init_val: init_v,
+                                    step_val: s_peel,
+                                    step_bb: s_bb,
+                                    step_inst_idx: s_idx,
+                                    bin_op: bop,
+                                    vreduce_op: vred,
+                                    elem_kind: elem_k,
+                                    arith_class: ARITH_PROVEN_NSW_NUW,
+                                    certainty: CERTAINTY_PROVEN,
+                                    reject_reason: REASON_NONE,
+                                };
+                            }
+                            return LoopVecReduction {
+                                is_valid: false,
+                                acc_local: MirLocalId { v: acc_loc },
+                                header_phi_val: phi_res,
+                                init_val: init_v,
+                                step_val: s_peel,
+                                step_bb: s_bb,
+                                step_inst_idx: s_idx,
+                                bin_op: bop,
+                                vreduce_op: vred,
+                                elem_kind: elem_k,
+                                arith_class: ARITH_CHECKED,
+                                certainty: CERTAINTY_UNKNOWN,
+                                reject_reason: REASON_CHECKED_OVERFLOW_TRAP,
+                            };
+                        }
+                    }
+                }
+            }
+        }
+        pi = pi + 1;
+    }
+    invalid
+}
+
+// --- 3. Bounds Proof, If-Conversion (`VSelect`), Broadcast (`VSplat`) & Step (`VStep`) Analysis (SPEC-74 §4.3..§4.6) ---
+
+fn vec_container_has_static_len_at_least(body: view<OptBody>, base_local: u32, req_len: u64) -> bool {
+    if (base_local as usize) >= body.local_count || (body.local_tys as usize) == 0 || (body.thir as usize) == 0 {
+        return false;
+    }
+    let lty = unsafe { *opt_typeid_at(body.local_tys, base_local as usize) };
+    let ax = type_get(unsafe { view((*body.thir).interner) }, lty);
+    if (ax as usize) == 0 {
+        return false;
+    }
+    let tk = unsafe { (*ax).kind };
+    if tk == TY_ARRAY {
+        return (unsafe { (*ax).array_len }) >= req_len;
+    }
+    if tk == TY_VIEW || tk == TY_MUT_VIEW || tk == TY_PTR {
+        let pt = unsafe { (*ax).pointee };
+        let pax = type_get(unsafe { view((*body.thir).interner) }, pt);
+        if (pax as usize) != 0 && (unsafe { (*pax).kind }) == TY_ARRAY {
+            return (unsafe { (*pax).array_len }) >= req_len;
+        }
+    }
+    false
+}
+
+fn vec_check_interior_assert_is_proven_iv_step(
+    body: view<OptBody>,
+    bb: view<OptBlock>,
+    iv_local: u32,
+    out_is_bounds_assert: mut_view<bool>
+) -> bool {
+    *out_is_bounds_assert = false;
+    if !bb.has_term || bb.term.kind != OPT_TERM_ASSERT {
+        return true;
+    }
+    let cond_v = lp_peel_copy(body, bb.term.cond).v;
+    let mut ov_v = cond_v;
+    if bb.term.assert_expected {
+        let cinst = lp_find_def_inst(body, OptValueId { v: cond_v });
+        if (cinst as usize) != 0 && (unsafe { (*cinst).opcode }) == OPT_INST_BINOP {
+            let bop = unsafe { (*cinst).sub_op };
+            if bop == MIR_BINOP_LT || bop == MIR_BINOP_LE {
+                *out_is_bounds_assert = true;
+                return false;
+            }
+        }
+        if (cinst as usize) != 0 && (unsafe { (*cinst).opcode }) == OPT_INST_UNOP &&
+           (unsafe { (*cinst).sub_op }) == MIR_UNOP_NOT {
+            ov_v = lp_peel_copy(body, unsafe { (*cinst).lhs }).v;
+        } else {
+            return false;
+        }
+    }
+    let oinst = lp_find_def_inst(body, OptValueId { v: ov_v });
+    if (oinst as usize) == 0 || (unsafe { (*oinst).opcode }) != OPT_INST_CHECKED_BINOP ||
+       (unsafe { (*oinst).sub_op }) != MIR_BINOP_ADD {
+        return false;
+    }
+    let ol = lp_peel_copy(body, unsafe { (*oinst).lhs });
+    if ol.v == OPT_VALUE_NONE || (ol.v as usize) > body.value_count {
+        return false;
+    }
+    let ol_vp = unsafe { opt_val_at(body.values, ol.v as usize) };
+    (unsafe { (*ol_vp).src_local.v }) == iv_local
+}
+
+fn vec_is_pure_if_convertible_diamond(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    br_bb_v: u32,
+    t_bb_v: u32,
+    f_bb_v: u32
+) -> bool {
+    if t_bb_v == f_bb_v || (t_bb_v as usize) >= body.bb_count || (f_bb_v as usize) >= body.bb_count {
+        return false;
+    }
+    if !lp_block_in_set(lp.blocks, lp.block_count, t_bb_v) ||
+       !lp_block_in_set(lp.blocks, lp.block_count, f_bb_v) {
+        return false;
+    }
+    let tbb = unsafe { opt_block_at(body.blocks, t_bb_v as usize) };
+    let fbb = unsafe { opt_block_at(body.blocks, f_bb_v as usize) };
+    if !(unsafe { (*tbb).has_term }) || !(unsafe { (*fbb).has_term }) {
+        return false;
+    }
+    if (unsafe { (*tbb).term.kind }) != OPT_TERM_GOTO || (unsafe { (*fbb).term.kind }) != OPT_TERM_GOTO {
+        return false;
+    }
+    let join_t = unsafe { (*tbb).term.true_bb.v };
+    let join_f = unsafe { (*fbb).term.true_bb.v };
+    if join_t != join_f || join_t == br_bb_v {
+        return false;
+    }
+    // Both arms must be pure, non-trapping, and free of memory writes or barriers (`AXS-VEC-025`)
+    let mut arm: usize = 0;
+    while arm < 2 {
+        let abb = if arm == 0 { tbb } else { fbb };
+        let icnt = unsafe { (*abb).inst_count };
+        let mut i: usize = 0;
+        while i < icnt {
+            let inst = unsafe { opt_inst_at((*abb).insts, i) };
+            let opc = unsafe { (*inst).opcode };
+            let flg = unsafe { (*inst).flags };
+            if (flg & (OPT_FLAG_BARRIER | OPT_FLAG_MAY_TRAP)) != 0u16 {
+                return false;
+            }
+            if opc == OPT_INST_STORE || opc == OPT_INST_VOLATILE_STORE ||
+               opc == OPT_INST_LOAD || opc == OPT_INST_VOLATILE_LOAD ||
+               opc == OPT_INST_ATOMIC || opc == OPT_INST_CHECKED_BINOP ||
+               opc == OPT_INST_BLACK_BOX || opc == OPT_INST_ZEROIZE ||
+               opc == OPT_INST_DROP_FLAG {
+                return false;
+            }
+            i = i + 1;
+        }
+        arm = arm + 1;
+    }
+    true
+}
+
+pub fn vec_analyze_loop_legality(
+    tree: view<LoopTree>,
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    info: *const AliasInfo,
+    range_info: *const RangeInfo,
+    caps: view<TargetSimdCaps>,
+    allow_runtime_guard: bool,
+    arena: mut_view<Arena>
+) -> VectorLegalityResult {
+    let mut res = VectorLegalityResult {
+        is_legal: false,
+        reject_reason: REASON_NON_COUNTED_LOOP,
+        certainty: CERTAINTY_UNKNOWN,
+        elem_kind: VEC_ELEM_NONE,
+        elem_bits: 0u16,
+        candidate_vf: 1u8,
+        max_safe_vf: 1u8,
+        alias_proof: VEC_ALIAS_NONE,
+        has_reduction: false,
+        reduction_op: VREDUCE_NONE,
+        reduction_arith: ARITH_CHECKED,
+        vload_count: 0u8,
+        vstore_count: 0u8,
+        vsplat_count: 0u8,
+        vstep_count: 0u8,
+        vbinop_count: 0u8,
+        vcmp_count: 0u8,
+        vselect_count: 0u8,
+        est_live_vec_regs: 1u8,
+    };
+
+    // 1. Check hard semantic barriers first (`AXS-VEC-008..009`, `AXS-VEC-018..020`)
+    if (lp.has_observable_barriers & BARRIER_ATOMIC) != 0u16 {
+        res.reject_reason = REASON_ATOMIC_BARRIER;
+        return res;
+    }
+    if (lp.has_observable_barriers & BARRIER_VOLATILE) != 0u16 {
+        res.reject_reason = REASON_VOLATILE_BARRIER;
+        return res;
+    }
+    if (lp.has_observable_barriers & VEC_BARRIER_ALL_MASK) != 0u16 {
+        res.reject_reason = REASON_INTERIOR_CALL_OR_DROP;
+        return res;
+    }
+
+    // Also scan instructions for explicit atomic/volatile opcodes even if barrier mask was not pre-populated
+    let mut kb: usize = 0;
+    while kb < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, kb)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            let icnt = unsafe { (*bb).inst_count };
+            let mut ii: usize = 0;
+            while ii < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, ii) };
+                let opc = unsafe { (*inst).opcode };
+                if opc == OPT_INST_ATOMIC || (unsafe { (*inst).orig_stmt.kind }) == MIR_STMT_ATOMIC {
+                    res.reject_reason = REASON_ATOMIC_BARRIER;
+                    return res;
+                }
+                if opc == OPT_INST_VOLATILE_LOAD || opc == OPT_INST_VOLATILE_STORE {
+                    res.reject_reason = REASON_VOLATILE_BARRIER;
+                    return res;
+                }
+                if opc == OPT_INST_DROP_FLAG || opc == OPT_INST_BLACK_BOX || opc == OPT_INST_ZEROIZE ||
+                   (unsafe { (*inst).orig_stmt.kind }) == MIR_STMT_DROP {
+                    res.reject_reason = REASON_INTERIOR_CALL_OR_DROP;
+                    return res;
+                }
+                ii = ii + 1;
+            }
+            if unsafe { (*bb).has_term } {
+                let tk = unsafe { (*bb).term.kind };
+                if tk == OPT_TERM_CALL || tk == OPT_TERM_DROP {
+                    res.reject_reason = REASON_INTERIOR_CALL_OR_DROP;
+                    return res;
+                }
+            }
+        }
+        kb = kb + 1;
+    }
+
+    // 2. Canonical single-latch, single-exit innermost counted loop preconditions (`AXS-VEC-028`)
+    if lp.is_irreducible || lp.child_count != 0 ||
+       lp.preheader.v == OPT_BB_NONE || lp.latch_count != 1 ||
+       lp.exit_count != 1 || lp.exiting_count != 1 || lp.iv_count == 0 || (lp.ivs as usize) == 0 {
+        res.reject_reason = REASON_NON_COUNTED_LOOP;
+        return res;
+    }
+    let exiting_v = unsafe { (*opt_bbid_at(lp.exiting_blocks, 0)).v };
+    if exiting_v != lp.header.v {
+        res.reject_reason = REASON_NON_COUNTED_LOOP;
+        return res;
+    }
+    if (lp.trip_count.kind != TRIP_CONST && lp.trip_count.kind != TRIP_SYMBOLIC) ||
+       lp.trip_count.certainty != CERTAINTY_PROVEN {
+        res.reject_reason = REASON_NON_COUNTED_LOOP;
+        return res;
+    }
+
+    let piv = unsafe { loop_iv_at(lp.ivs, 0) };
+    if !(unsafe { (*piv).is_primary }) || !(unsafe { (*piv).no_wrap_proven }) ||
+       (unsafe { (*piv).step_const }) != 1i64 || (unsafe { (*piv).start_expr }) == SCEV_IDX_NONE ||
+       ((unsafe { (*piv).start_expr }) as usize) >= tree.scev_count {
+        res.reject_reason = REASON_NON_COUNTED_LOOP;
+        return res;
+    }
+    let st_ex = unsafe { scev_expr_at(tree.scev_pool, (*piv).start_expr as usize) };
+    if (unsafe { (*st_ex).kind }) != SCEV_CONST || (unsafe { (*st_ex).const_val }) != 0i64 {
+        res.reject_reason = REASON_NON_COUNTED_LOOP;
+        return res;
+    }
+    let phi_vp = unsafe { opt_val_at(body.values, (*piv).phi_val.v as usize) };
+    let iv_loc = unsafe { (*phi_vp).src_local.v };
+
+    // 3. Inspect loop blocks for interior branches (`if-conversion`), bounds/overflow asserts, and element types
+    let mut elem_k: u8 = VEC_ELEM_NONE;
+    let mut vloads: u8 = 0u8;
+    let mut vstores: u8 = 0u8;
+    let mut vsplats: u8 = 0u8;
+    let mut vsteps: u8 = 0u8;
+    let mut vbinops: u8 = 0u8;
+    let mut vcmps: u8 = 0u8;
+    let mut vselects: u8 = 0u8;
+
+    kb = 0;
+    while kb < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, kb)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            if unsafe { (*bb).has_term } {
+                let tk = unsafe { (*bb).term.kind };
+                if tk == OPT_TERM_ASSERT {
+                    let mut is_bnds = false;
+                    if !vec_check_interior_assert_is_proven_iv_step(body, unsafe { view(*bb) }, iv_loc, mut_view(is_bnds)) {
+                        res.reject_reason = if is_bnds { REASON_UNPROVEN_BOUNDS } else { REASON_CHECKED_OVERFLOW_TRAP };
+                        return res;
+                    }
+                } else if (tk == OPT_TERM_BRANCH || tk == OPT_TERM_SWITCH_INT) && bv != lp.header.v {
+                    let mut cval = OptValueId { v: OPT_VALUE_NONE };
+                    let mut tbb = OptBbId { v: OPT_BB_NONE };
+                    let mut fbb = OptBbId { v: OPT_BB_NONE };
+                    if !loops_extract_bool_branch(unsafe { view(*bb) }, mut_view(cval), mut_view(tbb), mut_view(fbb)) ||
+                       !vec_is_pure_if_convertible_diamond(lp, body, bv, tbb.v, fbb.v) {
+                        res.reject_reason = REASON_CHECKED_OVERFLOW_TRAP;
+                        return res;
+                    }
+                    vselects = vselects + 1u8;
+                    vcmps = vcmps + 1u8;
+                } else if tk != OPT_TERM_GOTO && bv != lp.header.v {
+                    res.reject_reason = REASON_NON_COUNTED_LOOP;
+                    return res;
+                }
+            }
+
+            let icnt = unsafe { (*bb).inst_count };
+            let mut ii: usize = 0;
+            while ii < icnt {
+                let inst = unsafe { opt_inst_at((*bb).insts, ii) };
+                let opc = unsafe { (*inst).opcode };
+                let flg = unsafe { (*inst).flags };
+                if opc != OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16 {
+                    let dst_loc = unsafe { (*inst).place.local.v };
+                    let is_hdr_iv = bv == lp.header.v || dst_loc == iv_loc;
+                    if opc == OPT_INST_LOAD {
+                        vloads = vloads + 1u8;
+                        let ek = vec_classify_type_elem(body.thir, unsafe { (*inst).ty });
+                        if ek != VEC_ELEM_NONE && elem_k == VEC_ELEM_NONE {
+                            elem_k = ek;
+                        }
+                    } else if opc == OPT_INST_STORE {
+                        vstores = vstores + 1u8;
+                        let ek = vec_classify_type_elem(body.thir, unsafe { (*inst).ty });
+                        if ek != VEC_ELEM_NONE && elem_k == VEC_ELEM_NONE {
+                            elem_k = ek;
+                        }
+                    } else if !is_hdr_iv && (opc == OPT_INST_BINOP || opc == OPT_INST_WRAPPING_BINOP || opc == OPT_INST_CHECKED_BINOP) {
+                        let bop = unsafe { (*inst).sub_op };
+                        if bop == MIR_BINOP_DIV || bop == MIR_BINOP_REM {
+                            res.reject_reason = REASON_CHECKED_OVERFLOW_TRAP;
+                            return res;
+                        }
+                        if opc == OPT_INST_CHECKED_BINOP {
+                            res.reject_reason = REASON_CHECKED_OVERFLOW_TRAP;
+                            return res;
+                        }
+                        vbinops = vbinops + 1u8;
+                        let ek = vec_classify_type_elem(body.thir, unsafe { (*inst).ty });
+                        if ek != VEC_ELEM_NONE && elem_k == VEC_ELEM_NONE {
+                            elem_k = ek;
+                        }
+                        let lhs_v = lp_peel_copy(body, unsafe { (*inst).lhs });
+                        let rhs_v = lp_peel_copy(body, unsafe { (*inst).rhs });
+                        if lhs_v.v != OPT_VALUE_NONE && loops_is_val_invariant(lp, body, info, lhs_v) {
+                            vsplats = vsplats + 1u8;
+                        }
+                        if rhs_v.v != OPT_VALUE_NONE && loops_is_val_invariant(lp, body, info, rhs_v) {
+                            vsplats = vsplats + 1u8;
+                        }
+                        if lhs_v.v != OPT_VALUE_NONE && (lhs_v.v as usize) <= body.value_count &&
+                           (unsafe { (*opt_val_at(body.values, lhs_v.v as usize)).src_local.v }) == iv_loc {
+                            vsteps = vsteps + 1u8;
+                        } else if rhs_v.v != OPT_VALUE_NONE && (rhs_v.v as usize) <= body.value_count &&
+                                  (unsafe { (*opt_val_at(body.values, rhs_v.v as usize)).src_local.v }) == iv_loc {
+                            vsteps = vsteps + 1u8;
+                        }
+                    } else if !is_hdr_iv && opc == OPT_INST_CAST {
+                        let src_v = lp_peel_copy(body, unsafe { (*inst).lhs });
+                        if src_v.v != OPT_VALUE_NONE && (src_v.v as usize) <= body.value_count &&
+                           (unsafe { (*opt_val_at(body.values, src_v.v as usize)).src_local.v }) == iv_loc {
+                            vsteps = vsteps + 1u8;
+                        }
+                    }
+                }
+                ii = ii + 1;
+            }
+        }
+        kb = kb + 1;
+    }
+
+    // 4. Check loop-carried scalar phis (`InductionVar` vs `LoopVecReduction`)
+    let hbb = unsafe { opt_block_at(body.blocks, lp.header.v as usize) };
+    let phi_cnt = unsafe { (*hbb).phi_count };
+    let mut non_iv_phis: u32 = 0u32;
+    let mut pi: usize = 0;
+    while pi < phi_cnt {
+        let phi = unsafe { opt_phi_at((*hbb).phis, pi) };
+        let sloc = unsafe { (*phi).src_local.v };
+        let pres = unsafe { (*phi).result };
+        if sloc != 0u32 && sloc != iv_loc &&
+           (unsafe { (*phi).proj_field }) == OPT_PROJ_NONE &&
+           vec_is_phi_used_in_loop(lp, body, pres) {
+            non_iv_phis = non_iv_phis + 1u32;
+            let pek = vec_classify_type_elem(body.thir, unsafe { (*phi).ty });
+            if pek != VEC_ELEM_NONE && elem_k == VEC_ELEM_NONE {
+                elem_k = pek;
+            }
+        }
+        pi = pi + 1;
+    }
+    if elem_k == VEC_ELEM_NONE {
+        elem_k = VEC_ELEM_I32;
+    }
+
+    if non_iv_phis > 1u32 {
+        res.reject_reason = REASON_LOOP_CARRIED_DEP;
+        return res;
+    }
+    if non_iv_phis == 1u32 {
+        let red = vec_recognize_reduction(lp, body, info, range_info, caps, elem_k);
+        if !red.is_valid {
+            res.reject_reason = if red.reject_reason != REASON_NONE { red.reject_reason } else { REASON_LOOP_CARRIED_DEP };
+            return res;
+        }
+        res.has_reduction = true;
+        res.reduction_op = red.vreduce_op;
+        res.reduction_arith = red.arith_class;
+        if red.elem_kind != VEC_ELEM_NONE {
+            elem_k = red.elem_kind;
+        }
+    }
+
+    let ebits = vec_elem_bit_width(elem_k);
+    let est_regs_128: u8 = 2u8 + vloads + vstores + vsplats + vsteps + (if res.has_reduction { 2u8 } else { 0u8 });
+    let est_regs_256: u8 = est_regs_128 + (if vbinops > 4u8 { 3u8 } else { 1u8 });
+    let tc_known = lp.trip_count.kind == TRIP_CONST;
+    let tc_val = lp.trip_count.const_iters;
+    let mut cand_vf = vec_select_lane_width(caps, elem_k, tc_known, tc_val, est_regs_128, est_regs_256);
+    if cand_vf < 2u8 {
+        res.reject_reason = REASON_COST_NOT_PROFITABLE;
+        return res;
+    }
+
+    // 5. Prove pairwise memory dependence legality across all loads and stores in `lp` (`AXS-VEC-010..017`)
+    let mut alias_proof: u8 = VEC_ALIAS_NONE;
+    let mut max_safe_vf: u8 = 32u8;
+    let mut k1: usize = 0;
+    while k1 < lp.block_count {
+        let b1 = unsafe { (*opt_bbid_at(lp.blocks, k1)).v };
+        if (b1 as usize) < body.bb_count {
+            let bb1 = unsafe { opt_block_at(body.blocks, b1 as usize) };
+            let ic1 = unsafe { (*bb1).inst_count };
+            let mut i1: usize = 0;
+            while i1 < ic1 {
+                let inst1 = unsafe { opt_inst_at((*bb1).insts, i1) };
+                let opc1 = unsafe { (*inst1).opcode };
+                if opc1 == OPT_INST_STORE {
+                    let pl1 = unsafe { view((*inst1).place) };
+                    let pt1 = alias_make_prog_pt(b1, i1 as u32);
+                    let mut k2: usize = 0;
+                    while k2 < lp.block_count {
+                        let b2 = unsafe { (*opt_bbid_at(lp.blocks, k2)).v };
+                        if (b2 as usize) < body.bb_count {
+                            let bb2 = unsafe { opt_block_at(body.blocks, b2 as usize) };
+                            let ic2 = unsafe { (*bb2).inst_count };
+                            let mut i2: usize = 0;
+                            while i2 < ic2 {
+                                if !(b1 == b2 && i1 == i2) {
+                                    let inst2 = unsafe { opt_inst_at((*bb2).insts, i2) };
+                                    let opc2 = unsafe { (*inst2).opcode };
+                                    if opc2 == OPT_INST_LOAD || opc2 == OPT_INST_STORE {
+                                        let pl2: view<MirPlace> = if opc2 == OPT_INST_STORE {
+                                            unsafe { view((*inst2).place) }
+                                        } else {
+                                            unsafe { view((*inst2).rhs_place) }
+                                        };
+                                        let pt2 = alias_make_prog_pt(b2, i2 as u32);
+                                        let dpair = vec_prove_memory_dep_pair(
+                                            tree, lp, body, info,
+                                            pl1, pt1, true,
+                                            pl2, pt2, opc2 == OPT_INST_STORE,
+                                            cand_vf, allow_runtime_guard, mut_view(*arena)
+                                        );
+                                        if !dpair.is_legal_for_vf {
+                                            // Check if a smaller 128-bit VF satisfies `d >= VF_128` (`AXS-VEC-014`)
+                                            let vf_128: u8 = if ebits > 0u16 { (128u16 / ebits) as u8 } else { 1u8 };
+                                            if dpair.is_constant_dist && dpair.distance > 0i64 &&
+                                               vf_128 >= 2u8 && dpair.distance >= (vf_128 as i64) {
+                                                cand_vf = vf_128;
+                                                max_safe_vf = dpair.distance as u8;
+                                                alias_proof = VEC_ALIAS_SCEV_DISJOINT;
+                                            } else {
+                                                res.reject_reason = dpair.reject_reason;
+                                                res.alias_proof = VEC_ALIAS_REJECTED_MAY_ALIAS;
+                                                return res;
+                                            }
+                                        } else {
+                                            if dpair.alias_proof == VEC_ALIAS_RUNTIME_GUARD {
+                                                alias_proof = VEC_ALIAS_RUNTIME_GUARD;
+                                            } else if dpair.alias_proof == VEC_ALIAS_CAP_DISJOINT && alias_proof == VEC_ALIAS_NONE {
+                                                alias_proof = VEC_ALIAS_CAP_DISJOINT;
+                                            } else if dpair.alias_proof == VEC_ALIAS_SCEV_DISJOINT && alias_proof == VEC_ALIAS_NONE {
+                                                alias_proof = VEC_ALIAS_SCEV_DISJOINT;
+                                            }
+                                            if dpair.is_constant_dist && dpair.distance > 0i64 && (dpair.distance as u8) < max_safe_vf {
+                                                max_safe_vf = dpair.distance as u8;
+                                            }
+                                        }
+                                    }
+                                }
+                                i2 = i2 + 1;
+                            }
+                        }
+                        k2 = k2 + 1;
+                    }
+                }
+                i1 = i1 + 1;
+            }
+        }
+        k1 = k1 + 1;
+    }
+
+    if vstores == 0u8 && vloads > 0u8 && alias_proof == VEC_ALIAS_NONE {
+        alias_proof = VEC_ALIAS_CAP_DISJOINT;
+    }
+
+    res.is_legal = true;
+    res.reject_reason = REASON_NONE;
+    res.certainty = if alias_proof == VEC_ALIAS_RUNTIME_GUARD { CERTAINTY_POSSIBLE } else { CERTAINTY_PROVEN };
+    res.elem_kind = elem_k;
+    res.elem_bits = ebits;
+    res.candidate_vf = cand_vf;
+    res.max_safe_vf = max_safe_vf;
+    res.alias_proof = alias_proof;
+    res.vload_count = vloads;
+    res.vstore_count = vstores;
+    res.vsplat_count = vsplats;
+    res.vstep_count = vsteps;
+    res.vbinop_count = vbinops;
+    res.vcmp_count = vcmps;
+    res.vselect_count = vselects;
+    res.est_live_vec_regs = if cand_vf * (ebits as u8 / 8u8) >= 32u8 { est_regs_256 } else { est_regs_128 };
+    res
+}
+
+// --- 4. Quantitative Vector Cost Model & Profile Policy (SPEC-74 §7, AXS-VEC-044..047) ---
+
+pub fn vec_estimate_cost(
+    lp: view<LoopDesc>,
+    legality: view<VectorLegalityResult>,
+    caps: view<TargetSimdCaps>,
+    profile: u8
+) -> VectorCostEstimate {
+    let vf = legality.candidate_vf;
+    let mut uf: u8 = 1u8;
+    if profile == OPT_PROFILE_SPEED_O2 && legality.has_reduction &&
+       (legality.est_live_vec_regs * 2u8) <= caps.reg_pressure_budget &&
+       (lp.trip_count.kind != TRIP_CONST || lp.trip_count.const_iters >= ((vf as u64) * 2u64)) {
+        uf = 1u8;
+    }
+
+    let mut est = VectorCostEstimate {
+        loop_id: lp.id,
+        vf: vf,
+        uf: uf,
+        elem_kind: legality.elem_kind,
+        scalar_iter_cost: 0u32,
+        vector_iter_cost: 0u32,
+        setup_cost: 0u32,
+        reduction_cost: 0u32,
+        epilogue_cost: 0u32,
+        spill_penalty: 0u32,
+        total_scalar_cost: 0u32,
+        total_vec_cost: 0u32,
+        est_vec_regs: legality.est_live_vec_regs,
+        confidence: COST_CONF_HIGH,
+        profitable: false,
+        reject_reason: legality.reject_reason,
+    };
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        est.reject_reason = REASON_COST_NOT_PROFITABLE;
+        return est;
+    }
+    if !legality.is_legal || vf < 2u8 {
+        return est;
+    }
+
+    // `-O1` policy (`AXS-VEC-047`): no runtime alias versioning guards
+    if profile == OPT_PROFILE_BALANCED_O1 && legality.alias_proof == VEC_ALIAS_RUNTIME_GUARD {
+        est.reject_reason = REASON_UNKNOWN_ALIAS;
+        return est;
+    }
+
+    // `-Os`/`-Oz` policy (`AXS-VEC-047`): only when `code_growth == 0` (exact multiple constant trip count, no epilogue, no versioning)
+    let stride = (vf as u64) * (uf as u64);
+    let tc_kind = lp.trip_count.kind;
+    let tc_const = lp.trip_count.const_iters;
+    let tc_max = lp.trip_count.max_iters;
+    if profile == OPT_PROFILE_SIZE_OS {
+        if tc_kind != TRIP_CONST ||
+           tc_const < stride ||
+           (tc_const % stride) != 0u64 ||
+           legality.alias_proof == VEC_ALIAS_RUNTIME_GUARD {
+            est.reject_reason = REASON_SIZE_PROFILE_GROWTH;
+            return est;
+        }
+    }
+
+    let n_est: u64 = if tc_kind == TRIP_CONST {
+        tc_const
+    } else if tc_max > 0u64 && tc_max < 1024u64 {
+        tc_max
+    } else {
+        32u64
+    };
+    let conf: u8 = if tc_kind == TRIP_CONST {
+        COST_CONF_HIGH
+    } else if legality.alias_proof == VEC_ALIAS_RUNTIME_GUARD {
+        COST_CONF_LOW
+    } else {
+        COST_CONF_MEDIUM
+    };
+    est.confidence = conf;
+
+    // Known constant trip count smaller than a single vector width cannot execute any vector iteration
+    if lp.trip_count.kind == TRIP_CONST && n_est < stride {
+        est.reject_reason = REASON_COST_NOT_PROFITABLE;
+        return est;
+    }
+
+    let load_c = (legality.vload_count as u32) * 4u32;
+    let store_c = (legality.vstore_count as u32) * 4u32;
+    let bin_c = (if legality.vbinop_count > 0u8 { legality.vbinop_count as u32 } else { 1u32 }) * 2u32;
+    let sel_c = (legality.vselect_count as u32) * 3u32;
+    let scalar_iter = load_c + store_c + bin_c + sel_c + 2u32;
+    let vec_iter = (load_c + store_c + bin_c + sel_c + 2u32) * (uf as u32);
+    let setup_c = (legality.vsplat_count as u32) * 2u32 +
+                  (legality.vstep_count as u32) * 3u32 +
+                  (if legality.alias_proof == VEC_ALIAS_RUNTIME_GUARD { 6u32 } else { 1u32 });
+    let red_c: u32 = if legality.has_reduction {
+        if vf >= 8u8 { 8u32 } else if vf >= 4u8 { 5u32 } else { 3u32 }
+    } else {
+        0u32
+    };
+    let spill_pen: u32 = if legality.est_live_vec_regs > caps.reg_pressure_budget {
+        ((legality.est_live_vec_regs - caps.reg_pressure_budget) as u32) * 16u32
+    } else {
+        0u32
+    };
+
+    let vec_iters = (n_est / stride) as u32;
+    let rem_iters = (n_est % stride) as u32;
+    let epi_c = rem_iters * scalar_iter;
+    let total_scalar = (n_est as u32) * scalar_iter;
+    let total_vec = setup_c + vec_iters * (vec_iter + spill_pen) + red_c + epi_c;
+
+    est.scalar_iter_cost = scalar_iter;
+    est.vector_iter_cost = vec_iter;
+    est.setup_cost = setup_c;
+    est.reduction_cost = red_c;
+    est.epilogue_cost = epi_c;
+    est.spill_penalty = spill_pen;
+    est.total_scalar_cost = total_scalar;
+    est.total_vec_cost = total_vec;
+
+    let is_prof: bool = if conf == COST_CONF_LOW {
+        (total_vec * 5u32) <= (total_scalar * 4u32)
+    } else {
+        total_vec < total_scalar
+    };
+    est.profitable = is_prof;
+    est.reject_reason = if is_prof { REASON_NONE } else { REASON_COST_NOT_PROFITABLE };
+    est
+}
+
+// --- 5. Snapshot, Block Cloning, MIR Extraction & OptIR Resync Helpers ---
+
+struct VecExtraSnapshot {
+    blocks_ptr: *mut OptBlock,
+    bb_count: usize,
+    values_ptr: *mut OptValue,
+    value_cap: usize,
+    rpo_ptr: *mut OptBbId,
+    rpo_count: usize,
+    mem_defs_ptr: *mut u8,
+    mem_ssa_cap: usize,
+    prov_ptr: *mut ProofProvenance,
+    prov_cap: usize,
+    local_tys_ptr: *mut TypeId,
+    local_modes_ptr: *mut u8,
+    local_addr_ptr: *mut bool,
+    local_dropped_ptr: *mut bool,
+    local_sroa_base_ptr: *mut u32,
+    local_sroa_count_ptr: *mut u32,
+    slot_local_ptr: *mut u32,
+    slot_field_ptr: *mut u32,
+    slot_ty_ptr: *mut TypeId,
+    local_count: usize,
+    slot_count: usize,
+    orig_mir_ptr: *const MirBody,
+    orig_mir_local_count: usize,
+}
+
+fn vec_save_extra_snap(body: view<OptBody>) -> VecExtraSnapshot {
+    let orig_lc: usize = if (body.orig_mir as usize) != 0 {
+        unsafe { (*body.orig_mir).local_count }
+    } else {
+        0
+    };
+    VecExtraSnapshot {
+        blocks_ptr: body.blocks,
+        bb_count: body.bb_count,
+        values_ptr: body.values,
+        value_cap: body.value_cap,
+        rpo_ptr: body.rpo_order,
+        rpo_count: body.rpo_count,
+        mem_defs_ptr: body.mem_defs as *mut u8,
+        mem_ssa_cap: body.mem_ssa_cap,
+        prov_ptr: body.provenance,
+        prov_cap: body.provenance_cap,
+        local_tys_ptr: body.local_tys,
+        local_modes_ptr: body.local_modes,
+        local_addr_ptr: body.local_addr_taken,
+        local_dropped_ptr: body.local_dropped,
+        local_sroa_base_ptr: body.local_sroa_base,
+        local_sroa_count_ptr: body.local_sroa_count,
+        slot_local_ptr: body.slot_local,
+        slot_field_ptr: body.slot_field,
+        slot_ty_ptr: body.slot_ty,
+        local_count: body.local_count,
+        slot_count: body.slot_count,
+        orig_mir_ptr: body.orig_mir,
+        orig_mir_local_count: orig_lc,
+    }
+}
+
+fn vec_restore_extra_snap(body: mut_view<OptBody>, ex: view<VecExtraSnapshot>) {
+    body.blocks = ex.blocks_ptr;
+    body.bb_count = ex.bb_count;
+    body.values = ex.values_ptr;
+    body.value_cap = ex.value_cap;
+    body.rpo_order = ex.rpo_ptr;
+    body.rpo_count = ex.rpo_count;
+    body.mem_defs = ex.mem_defs_ptr as *mut MemSsaDefNode;
+    body.mem_ssa_cap = ex.mem_ssa_cap;
+    body.provenance = ex.prov_ptr;
+    body.provenance_cap = ex.prov_cap;
+    body.local_tys = ex.local_tys_ptr;
+    body.local_modes = ex.local_modes_ptr;
+    body.local_addr_taken = ex.local_addr_ptr;
+    body.local_dropped = ex.local_dropped_ptr;
+    body.local_sroa_base = ex.local_sroa_base_ptr;
+    body.local_sroa_count = ex.local_sroa_count_ptr;
+    body.slot_local = ex.slot_local_ptr;
+    body.slot_field = ex.slot_field_ptr;
+    body.slot_ty = ex.slot_ty_ptr;
+    body.local_count = ex.local_count;
+    body.slot_count = ex.slot_count;
+    body.orig_mir = ex.orig_mir_ptr;
+    if (body.orig_mir as usize) != 0 {
+        let mut_orig = body.orig_mir as *mut MirBody;
+        unsafe { (*mut_orig).local_count = ex.orig_mir_local_count; }
+    }
+}
+
+fn vec_copy_stats(dst: mut_view<LoopVecStats>, src: view<LoopVecStats>) {
+    *dst = *src;
+}
+
+fn vec_add_fresh_local(body: mut_view<OptBody>, arena: mut_view<Arena>, ty: TypeId) -> MirLocalId {
+    let old_cnt = body.local_count;
+    let new_cnt = old_cnt + 1;
+    let new_tys = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_cnt, size_of<TypeId>()), align_of<TypeId>()) as *mut TypeId;
+    let new_modes = arena_alloc_raw(mut_view(*arena), new_cnt, 1) as *mut u8;
+    let new_addr = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_cnt, size_of<bool>()), align_of<bool>()) as *mut bool;
+    let new_drop = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_cnt, size_of<bool>()), align_of<bool>()) as *mut bool;
+    let new_sbase = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_cnt, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let new_scnt = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_cnt, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut l: usize = 0;
+    while l < old_cnt {
+        unsafe {
+            *opt_typeid_at(new_tys, l) = if (body.local_tys as usize) != 0 { *opt_typeid_at(body.local_tys, l) } else { TypeId { v: 0u32 } };
+            *opt_u8_at(new_modes, l) = if (body.local_modes as usize) != 0 { *opt_u8_at(body.local_modes, l) } else { OPT_LOCAL_SCALAR };
+            *opt_bool_at(new_addr, l) = if (body.local_addr_taken as usize) != 0 { *opt_bool_at(body.local_addr_taken, l) } else { false };
+            *opt_bool_at(new_drop, l) = if (body.local_dropped as usize) != 0 { *opt_bool_at(body.local_dropped, l) } else { false };
+            *opt_u32_at(new_sbase, l) = if (body.local_sroa_base as usize) != 0 { *opt_u32_at(body.local_sroa_base, l) } else { OPT_PROJ_NONE };
+            *opt_u32_at(new_scnt, l) = if (body.local_sroa_count as usize) != 0 { *opt_u32_at(body.local_sroa_count, l) } else { 0u32 };
+        }
+        l = l + 1;
+    }
+    let ty_v = ty.v;
+    unsafe {
+        *opt_typeid_at(new_tys, old_cnt) = TypeId { v: ty_v };
+        *opt_u8_at(new_modes, old_cnt) = OPT_LOCAL_SCALAR;
+        *opt_bool_at(new_addr, old_cnt) = false;
+        *opt_bool_at(new_drop, old_cnt) = false;
+        *opt_u32_at(new_sbase, old_cnt) = OPT_PROJ_NONE;
+        *opt_u32_at(new_scnt, old_cnt) = 0u32;
+    }
+    body.local_tys = new_tys;
+    body.local_modes = new_modes;
+    body.local_addr_taken = new_addr;
+    body.local_dropped = new_drop;
+    body.local_sroa_base = new_sbase;
+    body.local_sroa_count = new_scnt;
+    body.local_count = new_cnt;
+
+    let old_sc = body.slot_count;
+    let new_sc = old_sc + 1;
+    let new_sloc = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_sc, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let new_sfld = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_sc, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let new_sty = arena_alloc_raw(mut_view(*arena), vec_mul_usize(new_sc, size_of<TypeId>()), align_of<TypeId>()) as *mut TypeId;
+    let mut s: usize = 0;
+    while s < old_sc {
+        unsafe {
+            *opt_u32_at(new_sloc, s) = if (body.slot_local as usize) != 0 { *opt_u32_at(body.slot_local, s) } else { s as u32 };
+            *opt_u32_at(new_sfld, s) = if (body.slot_field as usize) != 0 { *opt_u32_at(body.slot_field, s) } else { OPT_PROJ_NONE };
+            *opt_typeid_at(new_sty, s) = if (body.slot_ty as usize) != 0 { *opt_typeid_at(body.slot_ty, s) } else { TypeId { v: 0u32 } };
+        }
+        s = s + 1;
+    }
+    unsafe {
+        *opt_u32_at(new_sloc, old_sc) = old_cnt as u32;
+        *opt_u32_at(new_sfld, old_sc) = OPT_PROJ_NONE;
+        *opt_typeid_at(new_sty, old_sc) = TypeId { v: ty_v };
+    }
+    body.slot_local = new_sloc;
+    body.slot_field = new_sfld;
+    body.slot_ty = new_sty;
+    body.slot_count = new_sc;
+
+    if (body.orig_mir as usize) != 0 {
+        let mut_orig = body.orig_mir as *mut MirBody;
+        if (unsafe { (*mut_orig).local_count }) == old_cnt {
+            let _ = mir_add_local(
+                unsafe { mut_view(*mut_orig) },
+                mut_view(*arena),
+                TypeId { v: ty_v },
+                0u8,
+                true,
+                StrId { v: 0u32 },
+                view(body.span)
+            );
+        }
+    }
+    MirLocalId { v: old_cnt as u32 }
+}
+
+fn vec_append_goto_block(body: mut_view<OptBody>, arena: mut_view<Arena>, target: OptBbId, loc_span: view<Span>) -> OptBbId {
+    let target_v = target.v;
+    let old_cnt = body.bb_count;
+    let new_cnt = old_cnt + 1;
+    let new_blocks = arena_alloc_raw(
+        mut_view(*arena),
+        vec_mul_usize(new_cnt, size_of<OptBlock>()),
+        align_of<OptBlock>()
+    ) as *mut OptBlock;
+    if old_cnt > 0 && (body.blocks as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(
+                body.blocks as *const u8,
+                new_blocks as *mut u8,
+                vec_mul_usize(old_cnt, size_of<OptBlock>())
+            );
+        }
+    }
+    body.blocks = new_blocks;
+    body.bb_count = new_cnt;
+
+    let new_id_v = old_cnt as u32;
+    let nbb = unsafe { opt_block_at(body.blocks, old_cnt) };
+    let mut loc = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    mir_span_copy(mut_view(loc), loc_span);
+
+    unsafe {
+        (*nbb).id = OptBbId { v: new_id_v };
+        (*nbb).is_cleanup = false;
+        (*nbb).is_reachable = true;
+        (*nbb).preds = 0 as *mut OptBbId;
+        (*nbb).pred_count = 0;
+        (*nbb).succs = 0 as *mut OptBbId;
+        (*nbb).succ_count = 0;
+        (*nbb).phis = 0 as *mut OptPhi;
+        (*nbb).phi_count = 0;
+        (*nbb).phi_cap = 0;
+        (*nbb).has_mem_phi = false;
+        (*nbb).mem_phi_result = MemSsaId { v: MEM_SSA_NONE };
+        (*nbb).mem_phi_inputs = 0 as *mut MemSsaId;
+        (*nbb).mem_in = MemSsaId { v: MEM_SSA_LIVE_ON_ENTRY };
+        (*nbb).mem_out = MemSsaId { v: MEM_SSA_LIVE_ON_ENTRY };
+        (*nbb).insts = 0 as *mut OptInst;
+        (*nbb).inst_count = 0;
+        (*nbb).inst_cap = 0;
+        (*nbb).has_term = true;
+        (*nbb).idom = OptBbId { v: OPT_BB_NONE };
+        (*nbb).dom_depth = 0u32;
+        (*nbb).rpo_idx = new_id_v;
+        (*nbb).dom_frontier = 0 as *mut OptBbId;
+        (*nbb).dom_frontier_count = 0;
+
+        mir_term_reset(mut_view((*nbb).term.orig_term), MIR_TERM_GOTO, view(loc));
+        (*nbb).term.orig_term.goto_target = MirBbId { v: target_v };
+        (*nbb).term.kind = OPT_TERM_GOTO;
+        (*nbb).term.cond = OptValueId { v: OPT_VALUE_NONE };
+        (*nbb).term.true_bb = OptBbId { v: target_v };
+        (*nbb).term.false_bb = OptBbId { v: OPT_BB_NONE };
+        (*nbb).term.switch_ty = TypeId { v: 0u32 };
+        (*nbb).term.switch_vals = 0 as *mut u64;
+        (*nbb).term.switch_targets = 0 as *mut OptBbId;
+        (*nbb).term.switch_count = 0;
+        (*nbb).term.otherwise_bb = OptBbId { v: OPT_BB_NONE };
+        (*nbb).term.callee = OptValueId { v: OPT_VALUE_NONE };
+        (*nbb).term.call_args = 0 as *mut OptValueId;
+        (*nbb).term.call_arg_count = 0;
+        (*nbb).term.call_result = OptValueId { v: OPT_VALUE_NONE };
+        (*nbb).term.call_dest = mir_local_place(0u32);
+        (*nbb).term.has_call_dest = false;
+        (*nbb).term.unwind_bb = OptBbId { v: OPT_BB_NONE };
+        (*nbb).term.drop_place = mir_local_place(0u32);
+        (*nbb).term.drop_flag = MIR_DROP_FLAG_NONE;
+        (*nbb).term.drop_is_explicit = false;
+        (*nbb).term.assert_expected = true;
+        (*nbb).term.assert_msg_ptr = 0 as *const u8;
+        (*nbb).term.assert_msg_len = 0;
+        (*nbb).term.mem_use = MemSsaId { v: MEM_SSA_NONE };
+        (*nbb).term.mem_def = MemSsaId { v: MEM_SSA_NONE };
+        (*nbb).term.origin = OptOrigin {
+            span: loc,
+            mir_bb: MirBbId { v: new_id_v },
+            mir_stmt_idx: 0u32,
+            pass_id: PASS_LOOP_VEC,
+        };
+    }
+    OptBbId { v: new_id_v }
+}
+
+fn vec_push_inst_to_block(bb: mut_view<OptBlock>, arena: mut_view<Arena>, inst: OptInst) {
+    if bb.inst_count >= bb.inst_cap {
+        let new_cap: usize = if bb.inst_cap == 0 { 8 } else { bb.inst_cap + bb.inst_cap };
+        let new_bytes = vec_mul_usize(new_cap, size_of<OptInst>());
+        let new_arr = arena_alloc_raw(mut_view(*arena), new_bytes, align_of<OptInst>()) as *mut OptInst;
+        if bb.inst_count > 0 && (bb.insts as usize) != 0 {
+            let old_bytes = vec_mul_usize(bb.inst_count, size_of<OptInst>());
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(bb.insts as *const u8, new_arr as *mut u8, old_bytes);
+            }
+        }
+        bb.insts = new_arr;
+        bb.inst_cap = new_cap;
+    }
+    let idx = bb.inst_count;
+    bb.inst_count = idx + 1;
+    let dst = unsafe { opt_inst_at(bb.insts, idx) };
+    unsafe {
+        *dst = inst;
+        (*dst).id = OptInstId { v: idx as u32 };
+    }
+}
+
+fn vec_clone_inst(src: view<OptInst>, arena: mut_view<Arena>, pass_id: u16) -> OptInst {
+    let mut res = *src;
+    res.origin.pass_id = pass_id;
+    mir_copy_place(mut_view(res.place), view(src.place));
+    mir_copy_place(mut_view(res.rhs_place), view(src.rhs_place));
+    mir_copy_stmt(mut_view(res.orig_stmt), view(src.orig_stmt));
+    if src.extra_arg_count > 0 && (src.extra_args as usize) != 0 {
+        let ebytes = vec_mul_usize(src.extra_arg_count, size_of<OptValueId>());
+        let earr = arena_alloc_raw(mut_view(*arena), ebytes, align_of<OptValueId>()) as *mut OptValueId;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(src.extra_args as *const u8, earr as *mut u8, ebytes);
+        }
+        res.extra_args = earr;
+    }
+    res
+}
+
+fn vec_make_const_int_inst(dest_local: MirLocalId, ty: TypeId, val_u64: u64, span: view<Span>) -> OptInst {
+    let dest_v = dest_local.v;
+    let ty_v = ty.v;
+    let sp1 = Span { file: FileId { v: span.file.v }, start: span.start, end: span.end };
+    let sp2 = Span { file: FileId { v: span.file.v }, start: span.start, end: span.end };
+    let sp3 = Span { file: FileId { v: span.file.v }, start: span.start, end: span.end };
+    let mut stmt = MirStmt {
+        kind: MIR_STMT_ASSIGN,
+        span: sp1,
+        location: sp2,
+        place: mir_local_place(dest_v),
+        rvalue: MirRvalue {
+            kind: MIR_RVALUE_USE,
+            use_op: mir_op_const_int(ty_v, val_u64),
+            repeat_count: 0u64,
+            repeat_count_op: 0 as *mut MirOperand,
+            borrow_kind: 0u8,
+            place: mir_local_place(0u32),
+            cast_kind: 0u8,
+            target_ty: TypeId { v: ty_v },
+            bin_op: 0u8,
+            lhs: mir_op_const_int(ty_v, 0u64),
+            rhs: mir_op_const_int(ty_v, 0u64),
+            un_op: 0u8,
+            variant_idx: 0u32,
+            operands: 0 as *mut MirOperand,
+            operand_count: 0,
+        },
+        storage_local: MirLocalId { v: 0u32 },
+    };
+    mir_stmt_reset(mut_view(stmt), MIR_STMT_ASSIGN, span);
+    stmt.place = mir_local_place(dest_v);
+    mir_rvalue_reset(mut_view(stmt.rvalue), MIR_RVALUE_USE);
+    stmt.rvalue.use_op = mir_op_const_int(ty_v, val_u64);
+
+    OptInst {
+        id: OptInstId { v: 0u32 },
+        opcode: OPT_INST_CONST,
+        sub_op: 0u8,
+        flags: OPT_FLAG_NONE,
+        result: OptValueId { v: OPT_VALUE_NONE },
+        ty: TypeId { v: ty_v },
+        lhs: OptValueId { v: OPT_VALUE_NONE },
+        rhs: OptValueId { v: OPT_VALUE_NONE },
+        extra_args: 0 as *mut OptValueId,
+        extra_arg_count: 0,
+        place: mir_local_place(dest_v),
+        rhs_place: mir_local_place(0u32),
+        mem_use: MemSsaId { v: MEM_SSA_NONE },
+        mem_def: MemSsaId { v: MEM_SSA_NONE },
+        origin: OptOrigin {
+            span: sp3,
+            mir_bb: MirBbId { v: 0u32 },
+            mir_stmt_idx: 0u32,
+            pass_id: PASS_LOOP_VEC,
+        },
+        orig_stmt: stmt,
+    }
+}
+
+fn vec_make_binop_inst(
+    dest_local: MirLocalId,
+    ty: TypeId,
+    bin_op: u8,
+    is_wrapping: bool,
+    lhs_op: view<MirOperand>,
+    rhs_op: view<MirOperand>,
+    span: view<Span>
+) -> OptInst {
+    let mut inst = vec_make_const_int_inst(dest_local, ty, 0u64, span);
+    inst.opcode = if is_wrapping { OPT_INST_WRAPPING_BINOP } else { OPT_INST_BINOP };
+    inst.sub_op = bin_op;
+    mir_rvalue_reset(mut_view(inst.orig_stmt.rvalue), MIR_RVALUE_BINARY_OP);
+    inst.orig_stmt.rvalue.bin_op = bin_op;
+    mir_copy_operand(mut_view(inst.orig_stmt.rvalue.lhs), lhs_op);
+    mir_copy_operand(mut_view(inst.orig_stmt.rvalue.rhs), rhs_op);
+    inst
+}
+
+fn vec_set_block_goto_target(bb: mut_view<OptBlock>, target: OptBbId) {
+    let target_v = target.v;
+    let mut sp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    mir_span_copy(mut_view(sp), view(bb.term.orig_term.location));
+    bb.term.kind = OPT_TERM_GOTO;
+    bb.term.cond = OptValueId { v: OPT_VALUE_NONE };
+    bb.term.true_bb = OptBbId { v: target_v };
+    bb.term.false_bb = OptBbId { v: OPT_BB_NONE };
+    bb.term.otherwise_bb = OptBbId { v: OPT_BB_NONE };
+    bb.term.unwind_bb = OptBbId { v: OPT_BB_NONE };
+    bb.term.switch_count = 0;
+    bb.term.call_arg_count = 0;
+    mir_term_reset(mut_view(bb.term.orig_term), MIR_TERM_GOTO, view(sp));
+    bb.term.orig_term.goto_target = MirBbId { v: target_v };
+}
+
+fn vec_redirect_edge_in_block(
+    bb: mut_view<OptBlock>,
+    arena: mut_view<Arena>,
+    old_target: OptBbId,
+    new_target: OptBbId
+) -> bool {
+    if !bb.has_term {
+        return false;
+    }
+    let old_v = old_target.v;
+    let new_v = new_target.v;
+    let mut changed = false;
+    let tk = bb.term.kind;
+    if tk == OPT_TERM_GOTO {
+        if bb.term.true_bb.v == old_v {
+            bb.term.true_bb = OptBbId { v: new_v };
+            bb.term.orig_term.goto_target = MirBbId { v: new_v };
+            changed = true;
+        }
+    } else if tk == OPT_TERM_BRANCH || tk == OPT_TERM_SWITCH_INT {
+        if bb.term.true_bb.v == old_v {
+            bb.term.true_bb = OptBbId { v: new_v };
+            changed = true;
+        }
+        if bb.term.false_bb.v == old_v {
+            bb.term.false_bb = OptBbId { v: new_v };
+            changed = true;
+        }
+        if bb.term.otherwise_bb.v == old_v {
+            bb.term.otherwise_bb = OptBbId { v: new_v };
+            changed = true;
+        }
+        if bb.term.switch_count > 0 && (bb.term.switch_targets as usize) != 0 {
+            let swc = bb.term.switch_count;
+            let sw_bytes = vec_mul_usize(swc, size_of<OptBbId>());
+            let new_sw = arena_alloc_raw(mut_view(*arena), sw_bytes, align_of<OptBbId>()) as *mut OptBbId;
+            let mut k: usize = 0;
+            while k < swc {
+                let sv = unsafe { (*opt_bbid_at(bb.term.switch_targets, k)).v };
+                if sv == old_v {
+                    unsafe { *opt_bbid_at(new_sw, k) = OptBbId { v: new_v }; }
+                    changed = true;
+                } else {
+                    unsafe { *opt_bbid_at(new_sw, k) = OptBbId { v: sv }; }
+                }
+                k = k + 1;
+            }
+            bb.term.switch_targets = new_sw;
+        }
+        if bb.term.orig_term.kind == MIR_TERM_SWITCH_INT {
+            if bb.term.orig_term.otherwise.v == old_v {
+                bb.term.orig_term.otherwise = MirBbId { v: new_v };
+            }
+            if bb.term.orig_term.switch_count > 0 && (bb.term.orig_term.targets as usize) != 0 {
+                let n = bb.term.orig_term.switch_count;
+                let nbytes = vec_mul_usize(n, size_of<MirBbId>());
+                let narr = arena_alloc_raw(mut_view(*arena), nbytes, align_of<MirBbId>()) as *mut MirBbId;
+                let mut i: usize = 0;
+                while i < n {
+                    let cur_v = unsafe { (*mir_bb_id_at(bb.term.orig_term.targets, i)).v };
+                    unsafe {
+                        *mir_bb_id_at(narr, i) = MirBbId { v: if cur_v == old_v { new_v } else { cur_v } };
+                    }
+                    i = i + 1;
+                }
+                bb.term.orig_term.targets = narr;
+            }
+        }
+    } else if tk == OPT_TERM_ASSERT {
+        if bb.term.true_bb.v == old_v {
+            bb.term.true_bb = OptBbId { v: new_v };
+            bb.term.orig_term.assert_target = MirBbId { v: new_v };
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn vec_clone_loop_blocks(
+    lp: view<LoopDesc>,
+    body: mut_view<OptBody>,
+    arena: mut_view<Arena>
+) -> *mut OptBbId {
+    let orig_bb_cnt = body.bb_count;
+    let map_cap = orig_bb_cnt + lp.block_count + 4;
+    let clone_map = arena_alloc_raw(mut_view(*arena), vec_mul_usize(map_cap, size_of<OptBbId>()), align_of<OptBbId>()) as *mut OptBbId;
+    let mut b: usize = 0;
+    while b < map_cap {
+        unsafe { *opt_bbid_at(clone_map, b) = OptBbId { v: b as u32 }; }
+        b = b + 1;
+    }
+
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let orig_v = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        let orig_bb = unsafe { opt_block_at(body.blocks, orig_v as usize) };
+        let mut sp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+        mir_span_copy(mut_view(sp), unsafe { view((*orig_bb).term.orig_term.location) });
+        let new_id = vec_append_goto_block(mut_view(*body), mut_view(*arena), OptBbId { v: 0u32 }, view(sp));
+        unsafe { *opt_bbid_at(clone_map, orig_v as usize) = new_id; }
+        k = k + 1;
+    }
+
+    k = 0;
+    while k < lp.block_count {
+        let orig_v = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        let new_v = unsafe { (*opt_bbid_at(clone_map, orig_v as usize)).v };
+        let orig_bb = unsafe { opt_block_at(body.blocks, orig_v as usize) };
+        let icnt = unsafe { (*orig_bb).inst_count };
+        let mut i: usize = 0;
+        while i < icnt {
+            let orig_bb_cur = unsafe { opt_block_at(body.blocks, orig_v as usize) };
+            let inst = unsafe { opt_inst_at((*orig_bb_cur).insts, i) };
+            let opc = unsafe { (*inst).opcode };
+            let flg = unsafe { (*inst).flags };
+            let is_deleted = opc == OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16;
+            if !is_deleted {
+                let cinst = vec_clone_inst(unsafe { view(*inst) }, mut_view(*arena), PASS_LOOP_VEC);
+                let new_bb_cur = unsafe { opt_block_at(body.blocks, new_v as usize) };
+                vec_push_inst_to_block(unsafe { mut_view(*new_bb_cur) }, mut_view(*arena), cinst);
+            }
+            i = i + 1;
+        }
+
+        let orig_bb2 = unsafe { opt_block_at(body.blocks, orig_v as usize) };
+        let new_bb2 = unsafe { opt_block_at(body.blocks, new_v as usize) };
+        let mut cterm = unsafe { (*orig_bb2).term };
+        mir_copy_terminator(mut_view(cterm.orig_term), unsafe { view((*orig_bb2).term.orig_term) });
+        cterm.origin.pass_id = PASS_LOOP_VEC;
+        unsafe {
+            (*new_bb2).term = cterm;
+            (*new_bb2).has_term = (*orig_bb2).has_term;
+        }
+
+        let mut m: usize = 0;
+        while m < lp.block_count {
+            let from_v = unsafe { (*opt_bbid_at(lp.blocks, m)).v };
+            let to_v = unsafe { (*opt_bbid_at(clone_map, from_v as usize)).v };
+            let new_bb3 = unsafe { opt_block_at(body.blocks, new_v as usize) };
+            let _ = vec_redirect_edge_in_block(unsafe { mut_view(*new_bb3) }, mut_view(*arena), OptBbId { v: from_v }, OptBbId { v: to_v });
+            m = m + 1;
+        }
+        k = k + 1;
+    }
+
+    clone_map
+}
+
+fn vec_extract_mir_from_opt_body(
+    opt_body: view<OptBody>,
+    out_mir: mut_view<MirBody>,
+    arena: mut_view<Arena>
+) {
+    mir_body_reset(mut_view(*out_mir));
+    out_mir.fn_sym = SymbolId { v: opt_body.fn_sym.v };
+    out_mir.fn_name = StrId { v: opt_body.fn_name.v };
+    out_mir.span = Span {
+        file: FileId { v: opt_body.span.file.v },
+        start: opt_body.span.start,
+        end: opt_body.span.end,
+    };
+    if (opt_body.orig_mir as usize) != 0 {
+        let orig = unsafe { view(*opt_body.orig_mir) };
+        out_mir.sym = SymbolId { v: orig.sym.v };
+        out_mir.drop_flag_count = orig.drop_flag_count;
+        let mut l: usize = 0;
+        while l < orig.local_count {
+            let decl = unsafe { mir_local_at(orig.locals, l) };
+            let lid = mir_add_local(
+                mut_view(*out_mir),
+                mut_view(*arena),
+                TypeId { v: unsafe { (*decl).ty.v } },
+                unsafe { (*decl).kind },
+                unsafe { (*decl).mut_flag },
+                StrId { v: unsafe { (*decl).name.v } },
+                unsafe { view((*decl).span) }
+            );
+            let new_decl = unsafe { mir_local_at(out_mir.locals, lid.v as usize) };
+            unsafe { (*new_decl).const_sym = SymbolId { v: (*decl).const_sym.v }; }
+            l = l + 1;
+        }
+        while l < opt_body.local_count {
+            let lty_v = unsafe { (*opt_typeid_at(opt_body.local_tys, l)).v };
+            let _ = mir_add_local(
+                mut_view(*out_mir),
+                mut_view(*arena),
+                TypeId { v: lty_v },
+                0u8,
+                true,
+                StrId { v: 0u32 },
+                view(opt_body.span)
+            );
+            l = l + 1;
+        }
+    } else {
+        let mut l: usize = 0;
+        while l < opt_body.local_count {
+            let lty_v = unsafe { (*opt_typeid_at(opt_body.local_tys, l)).v };
+            let lkind: u8 = if l >= 1 && l <= opt_body.arg_count { MIR_LOCAL_ARG } else { 0u8 };
+            let _ = mir_add_local(
+                mut_view(*out_mir),
+                mut_view(*arena),
+                TypeId { v: lty_v },
+                lkind,
+                true,
+                StrId { v: 0u32 },
+                view(opt_body.span)
+            );
+            l = l + 1;
+        }
+    }
+    out_mir.arg_count = opt_body.arg_count;
+
+    let rterm_ptr = arena_alloc_raw(mut_view(*arena), size_of<MirTerminator>(), align_of<MirTerminator>()) as *mut MirTerminator;
+    let mut b: usize = 0;
+    while b < opt_body.bb_count {
+        let obb = unsafe { opt_block_at(opt_body.blocks, b) };
+        let mbb_id = mir_add_bb(mut_view(*out_mir), mut_view(*arena), unsafe { (*obb).is_cleanup });
+        let mbb = unsafe { mir_bb_at(out_mir.bbs, mbb_id.v as usize) };
+        let icnt = unsafe { (*obb).inst_count };
+        let insts = unsafe { (*obb).insts };
+        let mut i: usize = 0;
+        while i < icnt {
+            let inst = unsafe { opt_inst_at(insts, i) };
+            let opc = unsafe { (*inst).opcode };
+            let flg = unsafe { (*inst).flags };
+            let is_deleted_nop = opc == OPT_INST_NOP && (flg & (OPT_FLAG_STORAGE_LIVE | OPT_FLAG_STORAGE_DEAD)) == 0u16;
+            if !is_deleted_nop {
+                mir_bb_push_stmt(unsafe { mut_view(*mbb) }, mut_view(*arena), unsafe { view((*inst).orig_stmt) });
+            }
+            i = i + 1;
+        }
+        mir_copy_terminator(unsafe { mut_view(*rterm_ptr) }, unsafe { view((*obb).term.orig_term) });
+        let otk = unsafe { (*obb).term.kind };
+        if otk == OPT_TERM_GOTO {
+            unsafe {
+                (*rterm_ptr).kind = MIR_TERM_GOTO;
+                (*rterm_ptr).goto_target = MirBbId { v: (*obb).term.true_bb.v };
+            }
+        } else if otk == OPT_TERM_RETURN {
+            unsafe { (*rterm_ptr).kind = MIR_TERM_RETURN; }
+        } else if otk == OPT_TERM_UNREACHABLE {
+            unsafe { (*rterm_ptr).kind = MIR_TERM_UNREACHABLE; }
+        }
+        mir_bb_set_terminator(unsafe { mut_view(*mbb) }, unsafe { view(*rterm_ptr) });
+        b = b + 1;
+    }
+}
+
+fn vec_resync_opt_body(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    alias_info: *const AliasInfo,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let saved_prov_cnt = body.provenance_count;
+    let saved_provs: *mut ProofProvenance = if saved_prov_cnt > 0 && (body.provenance as usize) != 0 {
+        let pbytes = vec_mul_usize(saved_prov_cnt, size_of<ProofProvenance>());
+        let parr = arena_alloc_raw(mut_view(*arena), pbytes, align_of<ProofProvenance>()) as *mut ProofProvenance;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(body.provenance as *const u8, parr as *mut u8, pbytes);
+        }
+        parr
+    } else {
+        0 as *mut ProofProvenance
+    };
+
+    let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    vec_extract_mir_from_opt_body(view(*body), unsafe { mut_view(*rec_mir) }, mut_view(*arena));
+
+    let prev_errs = sink.errors;
+    let dummy_fn = arena_alloc_raw(mut_view(*arena), size_of<HirItem>(), align_of<HirItem>()) as *mut HirItem;
+    let dummy_bytes = dummy_fn as *mut u8;
+    let mut zi: usize = 0;
+    while zi < size_of<HirItem>() {
+        unsafe { *opt_u8_at(dummy_bytes, zi) = 0u8; }
+        zi = zi + 1;
+    }
+    verify_mir(unsafe { view(*rec_mir) }, body.thir, mut_view(*sink), dummy_fn as *const HirItem);
+    if sink.errors != prev_errs {
+        sink.errors = prev_errs;
+        return false;
+    }
+
+    let rebuilt = optir_build_from_verified_mir(unsafe { view(*rec_mir) }, body.thir, mut_view(*arena));
+    if (rebuilt as usize) == 0 {
+        return false;
+    }
+
+    let mut pi: usize = 0;
+    while pi < saved_prov_cnt {
+        let p = unsafe { opt_prov_at(saved_provs, pi) };
+        optir_record_provenance(
+            unsafe { mut_view(*rebuilt) },
+            mut_view(*arena),
+            unsafe { (*p).prop_kind },
+            unsafe { (*p).certainty },
+            unsafe { (*p).source_analysis },
+            unsafe { (*p).subject_val },
+            unsafe { (*p).aux_val },
+            unsafe { (*p).at_bb },
+            unsafe { (*p).at_inst },
+            unsafe { (*p).pass_id }
+        );
+        pi = pi + 1;
+    }
+
+    unsafe { *body = *rebuilt; }
+
+    let mut simp_stats = LoopSimplifyStats {
+        pass_runs: 0u32,
+        pass_changes: 0u32,
+        pass_rollbacks: 0u32,
+        loops_discovered: 0u32,
+        irreducible_cycles: 0u32,
+        preheaders_inserted: 0u32,
+        latches_merged: 0u32,
+        dedicated_exits_inserted: 0u32,
+        lcssa_phis_inserted: 0u32,
+    };
+    loops_stats_zero(mut_view(simp_stats));
+    let fresh_alias = alias_build_info(view(*body), call_table, mut_view(*arena));
+    let use_alias: *const AliasInfo = if (fresh_alias as usize) != 0 { fresh_alias as *const AliasInfo } else { alias_info };
+    let _ = opt_loop_simplify(
+        mut_view(*pm),
+        mut_view(*body),
+        call_table,
+        use_alias,
+        mut_view(simp_stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    if pm.has_baseline_effects {
+        let cur_eff = effect_infer_body(mut_view(*body), mut_view(*arena), pm.budget.max_symbolic_steps);
+        let cur_vol = cur_eff.volatile_count;
+        let cur_atm = cur_eff.atomic_count;
+        let cur_io = cur_eff.io_count;
+        let cur_drp = cur_eff.drop_count;
+        let base_vol = pm.baseline_effect_summary.volatile_count;
+        let base_atm = pm.baseline_effect_summary.atomic_count;
+        let base_io = pm.baseline_effect_summary.io_count;
+        let base_drp = pm.baseline_effect_summary.drop_count;
+        if cur_vol < base_vol || cur_atm < base_atm || cur_io < base_io || cur_drp < base_drp {
+            return false;
+        }
+    }
+
+    optir_verify_contract(view(*body))
+}
+
+// --- 6. Vectorized Main Loop & Scalar Remainder Epilogue Generation (SPEC-74 §6, AXS-VEC-028..035) ---
+
+fn vec_find_header_cmp_inst_and_bound(
+    lp: view<LoopDesc>,
+    body: view<OptBody>,
+    iv_loc: u32,
+    out_inst_idx: mut_view<usize>,
+    out_cnd_loc: mut_view<u32>,
+    out_bool_ty: mut_view<u32>,
+    out_bound_loc: mut_view<u32>
+) -> bool {
+    *out_inst_idx = 0;
+    *out_cnd_loc = 0u32;
+    *out_bool_ty = 0u32;
+    *out_bound_loc = 0u32;
+
+    let hbb = unsafe { opt_block_at(body.blocks, lp.header.v as usize) };
+    let mut cond_val = OptValueId { v: OPT_VALUE_NONE };
+    let mut t_bb = OptBbId { v: OPT_BB_NONE };
+    let mut f_bb = OptBbId { v: OPT_BB_NONE };
+    if !loops_extract_bool_branch(unsafe { view(*hbb) }, mut_view(cond_val), mut_view(t_bb), mut_view(f_bb)) {
+        return false;
+    }
+    let icnt = unsafe { (*hbb).inst_count };
+    let mut i: usize = 0;
+    while i < icnt {
+        let inst = unsafe { opt_inst_at((*hbb).insts, i) };
+        let opc = unsafe { (*inst).opcode };
+        if (unsafe { (*inst).result.v }) == cond_val.v && opc == OPT_INST_BINOP {
+            let bop = unsafe { (*inst).sub_op };
+            if bop == MIR_BINOP_LT || bop == MIR_BINOP_LE || bop == MIR_BINOP_NE {
+                let cnd_l = unsafe { (*inst).place.local.v };
+                let bty_v = unsafe { (*inst).ty.v };
+                let lhs_v = lp_peel_copy(body, unsafe { (*inst).lhs });
+                let rhs_v = lp_peel_copy(body, unsafe { (*inst).rhs });
+                if cnd_l != 0u32 && lhs_v.v != OPT_VALUE_NONE && (lhs_v.v as usize) <= body.value_count &&
+                   (unsafe { (*opt_val_at(body.values, lhs_v.v as usize)).src_local.v }) == iv_loc {
+                    *out_inst_idx = i;
+                    *out_cnd_loc = cnd_l;
+                    *out_bool_ty = bty_v;
+                    if rhs_v.v != OPT_VALUE_NONE && (rhs_v.v as usize) <= body.value_count {
+                        let rvp = unsafe { opt_val_at(body.values, rhs_v.v as usize) };
+                        *out_bound_loc = unsafe { (*rvp).src_local.v };
+                    }
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+fn vec_fold_proven_iv_step_asserts_in_loop(lp: view<LoopDesc>, body: mut_view<OptBody>) {
+    let mut k: usize = 0;
+    while k < lp.block_count {
+        let bv = unsafe { (*opt_bbid_at(lp.blocks, k)).v };
+        if (bv as usize) < body.bb_count {
+            let bb = unsafe { opt_block_at(body.blocks, bv as usize) };
+            if (unsafe { (*bb).has_term }) && (unsafe { (*bb).term.kind }) == OPT_TERM_ASSERT {
+                let ok_v = unsafe { (*bb).term.true_bb.v };
+                vec_set_block_goto_target(unsafe { mut_view(*bb) }, OptBbId { v: ok_v });
+            }
+        }
+        k = k + 1;
+    }
+}
+
+fn vec_transform_counted_loop(
+    lp: view<LoopDesc>,
+    body: mut_view<OptBody>,
+    legality: view<VectorLegalityResult>,
+    cost: view<VectorCostEstimate>,
+    arena: mut_view<Arena>,
+    out_epi_bb: mut_view<OptBbId>,
+    out_epi_kind: mut_view<u8>
+) -> bool {
+    *out_epi_bb = OptBbId { v: OPT_BB_NONE };
+    *out_epi_kind = EPILOGUE_NONE;
+
+    let vf = cost.vf;
+    let uf = cost.uf;
+    let stride = (vf as u64) * (uf as u64);
+    if stride < 2u64 || lp.iv_count == 0 || (lp.ivs as usize) == 0 {
+        return false;
+    }
+
+    let piv = unsafe { loop_iv_at(lp.ivs, 0) };
+    let phi_vp = unsafe { opt_val_at(body.values, (*piv).phi_val.v as usize) };
+    let iv_loc = unsafe { (*phi_vp).src_local.v };
+    let iv_ty_v = unsafe { (*phi_vp).ty.v };
+    if iv_loc == 0u32 || iv_ty_v == 0u32 {
+        return false;
+    }
+
+    let ph_v = lp.preheader.v;
+    let hdr_v = lp.header.v;
+    let latch_v = unsafe { (*opt_bbid_at(lp.latches, 0)).v };
+    let exit_v = unsafe { (*opt_bbid_at(lp.exit_blocks, 0)).v };
+    if hdr_v == latch_v || (ph_v as usize) >= body.bb_count {
+        return false;
+    }
+
+    let hbb_init = unsafe { opt_block_at(body.blocks, hdr_v as usize) };
+    let mut cond_val = OptValueId { v: OPT_VALUE_NONE };
+    let mut t_bb = OptBbId { v: OPT_BB_NONE };
+    let mut f_bb = OptBbId { v: OPT_BB_NONE };
+    if !loops_extract_bool_branch(unsafe { view(*hbb_init) }, mut_view(cond_val), mut_view(t_bb), mut_view(f_bb)) {
+        return false;
+    }
+    let t_in = lp_block_in_set(lp.blocks, lp.block_count, t_bb.v);
+    let f_in = lp_block_in_set(lp.blocks, lp.block_count, f_bb.v);
+    if !t_in || f_in {
+        return false;
+    }
+    let body_entry_v = t_bb.v;
+
+    let mut cmp_idx: usize = 0;
+    let mut cnd_loc: u32 = 0u32;
+    let mut bool_ty_v: u32 = 0u32;
+    let mut bound_loc: u32 = 0u32;
+    if !vec_find_header_cmp_inst_and_bound(
+        lp, view(*body), iv_loc,
+        mut_view(cmp_idx), mut_view(cnd_loc), mut_view(bool_ty_v), mut_view(bound_loc)
+    ) {
+        return false;
+    }
+
+    let tk = lp.trip_count.kind;
+    let tc = lp.trip_count.const_iters;
+    if tk == TRIP_SYMBOLIC && bound_loc == 0u32 {
+        return false;
+    }
+
+    let need_epilogue: bool = if tk == TRIP_CONST {
+        (tc % stride) != 0u64 || legality.alias_proof == VEC_ALIAS_RUNTIME_GUARD
+    } else {
+        true
+    };
+
+    // Fold any proven-safe IV step overflow asserts inside `lp` before cloning lanes and epilogue
+    vec_fold_proven_iv_step_asserts_in_loop(lp, mut_view(*body));
+
+    // 1. If scalar remainder epilogue is needed (`AXS-VEC-030`), clone `lp` BEFORE mutating `lp`
+    let mut epilogue_hdr_v: u32 = OPT_BB_NONE;
+    if need_epilogue {
+        let epi_map = vec_clone_loop_blocks(lp, mut_view(*body), mut_view(*arena));
+        epilogue_hdr_v = unsafe { (*opt_bbid_at(epi_map, hdr_v as usize)).v };
+        *out_epi_bb = OptBbId { v: epilogue_hdr_v };
+        *out_epi_kind = EPILOGUE_SCALAR_REMAINDER;
+    } else {
+        *out_epi_bb = OptBbId { v: OPT_BB_NONE };
+        *out_epi_kind = EPILOGUE_NONE_EXACT_MULTIPLE;
+    }
+
+    // 2. Clone `stride - 1` lane bodies for the vectorized main loop BEFORE mutating `hdr_v` / `latch_v`
+    let lane_hdrs = arena_alloc_raw(mut_view(*arena), vec_mul_usize(stride as usize, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let lane_bodies = arena_alloc_raw(mut_view(*arena), vec_mul_usize(stride as usize, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let lane_latches = arena_alloc_raw(mut_view(*arena), vec_mul_usize(stride as usize, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut lane: u64 = 1u64;
+    while lane < stride {
+        let lmap = vec_clone_loop_blocks(lp, mut_view(*body), mut_view(*arena));
+        let l_hdr = unsafe { (*opt_bbid_at(lmap, hdr_v as usize)).v };
+        let l_body = unsafe { (*opt_bbid_at(lmap, body_entry_v as usize)).v };
+        let l_latch = unsafe { (*opt_bbid_at(lmap, latch_v as usize)).v };
+        unsafe {
+            *opt_u32_at(lane_hdrs, lane as usize) = l_hdr;
+            *opt_u32_at(lane_bodies, lane as usize) = l_body;
+            *opt_u32_at(lane_latches, lane as usize) = l_latch;
+        }
+        lane = lane + 1u64;
+    }
+
+    // 3. Emit `n_vec = bound_loc & ~(stride - 1)` in `preheader` for symbolic trip counts (`AXS-VEC-030`)
+    let ph_bb0 = unsafe { opt_block_at(body.blocks, ph_v as usize) };
+    let mut sp = Span { file: FileId { v: 0u32 }, start: 0u32, end: 0u32 };
+    mir_span_copy(mut_view(sp), unsafe { view((*ph_bb0).term.orig_term.location) });
+
+    let mut n_vec_rhs_op = mir_op_const_int(iv_ty_v, 0u64);
+    if tk == TRIP_CONST {
+        let n_vec_const = (tc / stride) * stride;
+        n_vec_rhs_op = mir_op_const_int(iv_ty_v, n_vec_const);
+    } else {
+        let n_vec_loc = vec_add_fresh_local(mut_view(*body), mut_view(*arena), TypeId { v: iv_ty_v }).v;
+        let mask_u64 = 0xFFFFFFFFFFFFFFFFu64 - (stride - 1u64);
+        let lhs_bnd = mir_op_copy_local(bound_loc);
+        let rhs_msk = mir_op_const_int(iv_ty_v, mask_u64);
+        let mask_inst = vec_make_binop_inst(
+            MirLocalId { v: n_vec_loc },
+            TypeId { v: iv_ty_v },
+            MIR_BINOP_BIT_AND,
+            false,
+            view(lhs_bnd),
+            view(rhs_msk),
+            view(sp)
+        );
+        let ph_bb = unsafe { opt_block_at(body.blocks, ph_v as usize) };
+        vec_push_inst_to_block(unsafe { mut_view(*ph_bb) }, mut_view(*arena), mask_inst);
+        n_vec_rhs_op = mir_op_copy_local(n_vec_loc);
+    }
+
+    // 4. Update `vec_header` (`hdr_v`) condition to `iv_loc < n_vec` and exit edge to `epilogue_hdr_v` (if needed)
+    let lhs_iv = mir_op_copy_local(iv_loc);
+    let new_cmp_inst = vec_make_binop_inst(
+        MirLocalId { v: cnd_loc },
+        TypeId { v: bool_ty_v },
+        MIR_BINOP_LT,
+        false,
+        view(lhs_iv),
+        view(n_vec_rhs_op),
+        view(sp)
+    );
+    let hbb = unsafe { opt_block_at(body.blocks, hdr_v as usize) };
+    let dst_cmp = unsafe { opt_inst_at((*hbb).insts, cmp_idx) };
+    let saved_res = unsafe { (*dst_cmp).result };
+    let saved_id = unsafe { (*dst_cmp).id };
+    unsafe {
+        *dst_cmp = new_cmp_inst;
+        (*dst_cmp).id = saved_id;
+        (*dst_cmp).result = saved_res;
+    }
+    if need_epilogue && epilogue_hdr_v != OPT_BB_NONE {
+        let _ = vec_redirect_edge_in_block(
+            unsafe { mut_view(*hbb) },
+            mut_view(*arena),
+            OptBbId { v: exit_v },
+            OptBbId { v: epilogue_hdr_v }
+        );
+    }
+
+    // 5. Chain the `stride` lanes inside `vec_loop` so one vector iteration steps by `VF * UF` (`AXS-VEC-029`)
+    let mut prev_latch_v = latch_v;
+    let mut prev_hdr_v = hdr_v;
+    lane = 1u64;
+    while lane < stride {
+        let l_hdr = unsafe { *opt_u32_at(lane_hdrs, lane as usize) };
+        let l_body = unsafe { *opt_u32_at(lane_bodies, lane as usize) };
+        let l_latch = unsafe { *opt_u32_at(lane_latches, lane as usize) };
+
+        let lh_bb = unsafe { opt_block_at(body.blocks, l_hdr as usize) };
+        vec_set_block_goto_target(unsafe { mut_view(*lh_bb) }, OptBbId { v: l_body });
+
+        let pl_bb = unsafe { opt_block_at(body.blocks, prev_latch_v as usize) };
+        let _ = vec_redirect_edge_in_block(
+            unsafe { mut_view(*pl_bb) },
+            mut_view(*arena),
+            OptBbId { v: prev_hdr_v },
+            OptBbId { v: l_hdr }
+        );
+
+        prev_latch_v = l_latch;
+        prev_hdr_v = l_hdr;
+        lane = lane + 1u64;
+    }
+
+    let last_lbb = unsafe { opt_block_at(body.blocks, prev_latch_v as usize) };
+    let _ = vec_redirect_edge_in_block(
+        unsafe { mut_view(*last_lbb) },
+        mut_view(*arena),
+        OptBbId { v: prev_hdr_v },
+        OptBbId { v: hdr_v }
+    );
+
+    true
+}
+
+pub fn opt_loop_vec_with_caps(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    alias_info: *const AliasInfo,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<LoopVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let profile = pm.budget.profile;
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        return false;
+    }
+
+    let contract = loop_vec_contract();
+    passmgr_ensure_analyses(mut_view(*pm), mut_view(*body), mut_view(*arena), contract.required_analyses);
+
+    let snap = passmgr_snapshot_body(view(*body), mut_view(*arena));
+    let ex_snap = vec_save_extra_snap(view(*body));
+    let pre_rev = pm.ir_revision;
+    let pre_valid = pm.valid_analyses;
+    let pre_stats = *stats;
+    stats.pass_runs = stats.pass_runs + 1u32;
+
+    let use_alias: *const AliasInfo = if (alias_info as usize) != 0 {
+        alias_info
+    } else {
+        alias_build_info(view(*body), call_table, mut_view(*arena)) as *const AliasInfo
+    };
+    let tree = loops_discover(view(*body), call_table, use_alias, mut_view(*arena));
+    scev_analyze_tree(unsafe { mut_view(*tree) }, view(*body), use_alias, mut_view(*arena));
+    let range_ptr = range_build_info(view(*body), tree as *const LoopTree, use_alias, call_table, mut_view(*arena)) as *const RangeInfo;
+
+    let allow_rt_guard = profile == OPT_PROFILE_SPEED_O2;
+    let lcnt = unsafe { (*tree).loop_count };
+    let mut li: usize = 0;
+    while li < lcnt {
+        let lp = unsafe { loop_desc_at((*tree).loops, li) };
+        if (unsafe { (*lp).child_count }) == 0 {
+            stats.loops_analyzed = stats.loops_analyzed + 1u32;
+            let leg = vec_analyze_loop_legality(
+                unsafe { view(*tree) },
+                unsafe { view(*lp) },
+                view(*body),
+                use_alias,
+                range_ptr,
+                caps,
+                allow_rt_guard,
+                mut_view(*arena)
+            );
+            let cost = vec_estimate_cost(unsafe { view(*lp) }, view(leg), caps, profile);
+
+            if !leg.is_legal || !cost.profitable {
+                let rej_r: u8 = if !leg.is_legal { leg.reject_reason } else { cost.reject_reason };
+                vec_bump_reject_stat(mut_view(*stats), rej_r);
+                let rec_rej = LoopVecRecord {
+                    pass_id: PASS_LOOP_VEC,
+                    loop_id: unsafe { (*lp).id },
+                    header_bb: unsafe { (*lp).header },
+                    vector_loop_bb: OptBbId { v: OPT_BB_NONE },
+                    epilogue_loop_bb: OptBbId { v: OPT_BB_NONE },
+                    applied: false,
+                    vf: cost.vf,
+                    uf: cost.uf,
+                    elem_kind: leg.elem_kind,
+                    isa_level: caps.isa_level,
+                    alias_proof: leg.alias_proof,
+                    reduction_op: leg.reduction_op,
+                    epilogue_kind: EPILOGUE_NONE,
+                    reason: rej_r,
+                    certainty: leg.certainty,
+                    vload_count: leg.vload_count,
+                    vstore_count: leg.vstore_count,
+                    vsplat_count: leg.vsplat_count,
+                    vstep_count: leg.vstep_count,
+                    vbinop_count: leg.vbinop_count,
+                    vselect_count: leg.vselect_count,
+                    vreduce_count: if leg.has_reduction { 1u8 } else { 0u8 },
+                    scalar_cost: cost.total_scalar_cost,
+                    vec_cost: cost.total_vec_cost,
+                    confidence: cost.confidence,
+                };
+                vec_push_record(mut_view(*stats), mut_view(*arena), view(rec_rej));
+            } else {
+                let lp_id = unsafe { (*lp).id };
+                let hdr_bb = unsafe { (*lp).header };
+                let mut epi_bb = OptBbId { v: OPT_BB_NONE };
+                let mut epi_kind: u8 = EPILOGUE_NONE;
+                if vec_transform_counted_loop(
+                    unsafe { view(*lp) },
+                    mut_view(*body),
+                    view(leg),
+                    view(cost),
+                    mut_view(*arena),
+                    mut_view(epi_bb),
+                    mut_view(epi_kind)
+                ) {
+                    if !vec_resync_opt_body(mut_view(*pm), mut_view(*body), call_table, use_alias, mut_view(*arena), mut_view(*sink)) {
+                        vec_restore_extra_snap(mut_view(*body), view(ex_snap));
+                        passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+                        pm.ir_revision = pre_rev;
+                        pm.valid_analyses = pre_valid;
+                        vec_copy_stats(mut_view(*stats), view(pre_stats));
+                        stats.pass_runs = pre_stats.pass_runs + 1u32;
+                        stats.pass_rollbacks = pre_stats.pass_rollbacks + 1u32;
+                        return false;
+                    }
+
+                    stats.loops_vectorized = stats.loops_vectorized + 1u32;
+                    if leg.alias_proof == VEC_ALIAS_CAP_DISJOINT {
+                        stats.cap_disjoint_proven = stats.cap_disjoint_proven + 1u32;
+                    } else if leg.alias_proof == VEC_ALIAS_SCEV_DISJOINT {
+                        stats.scev_disjoint_proven = stats.scev_disjoint_proven + 1u32;
+                    } else if leg.alias_proof == VEC_ALIAS_RUNTIME_GUARD {
+                        stats.runtime_alias_guards = stats.runtime_alias_guards + 1u32;
+                    }
+                    if leg.has_reduction {
+                        stats.reductions_vectorized = stats.reductions_vectorized + 1u32;
+                    }
+                    stats.broadcasts_widened = stats.broadcasts_widened + (leg.vsplat_count as u32);
+                    stats.step_vectors_widened = stats.step_vectors_widened + (leg.vstep_count as u32);
+                    stats.selects_if_converted = stats.selects_if_converted + (leg.vselect_count as u32);
+                    if epi_kind == EPILOGUE_SCALAR_REMAINDER {
+                        stats.epilogues_emitted = stats.epilogues_emitted + 1u32;
+                    } else if epi_kind == EPILOGUE_NONE_EXACT_MULTIPLE {
+                        stats.epilogues_omitted_exact = stats.epilogues_omitted_exact + 1u32;
+                    }
+
+                    optir_record_provenance(
+                        mut_view(*body),
+                        mut_view(*arena),
+                        PROP_NO_ALIAS,
+                        leg.certainty,
+                        ANALYSIS_ALIAS_INFO,
+                        OptValueId { v: OPT_VALUE_NONE },
+                        OptValueId { v: OPT_VALUE_NONE },
+                        hdr_bb,
+                        OptInstId { v: OPT_INST_NONE },
+                        PASS_LOOP_VEC
+                    );
+
+                    let rec_ok = LoopVecRecord {
+                        pass_id: PASS_LOOP_VEC,
+                        loop_id: lp_id,
+                        header_bb: hdr_bb,
+                        vector_loop_bb: hdr_bb,
+                        epilogue_loop_bb: epi_bb,
+                        applied: true,
+                        vf: cost.vf,
+                        uf: cost.uf,
+                        elem_kind: leg.elem_kind,
+                        isa_level: caps.isa_level,
+                        alias_proof: leg.alias_proof,
+                        reduction_op: leg.reduction_op,
+                        epilogue_kind: epi_kind,
+                        reason: REASON_NONE,
+                        certainty: leg.certainty,
+                        vload_count: leg.vload_count,
+                        vstore_count: leg.vstore_count,
+                        vsplat_count: leg.vsplat_count,
+                        vstep_count: leg.vstep_count,
+                        vbinop_count: leg.vbinop_count,
+                        vselect_count: leg.vselect_count,
+                        vreduce_count: if leg.has_reduction { 1u8 } else { 0u8 },
+                        scalar_cost: cost.total_scalar_cost,
+                        vec_cost: cost.total_vec_cost,
+                        confidence: cost.confidence,
+                    };
+                    vec_push_record(mut_view(*stats), mut_view(*arena), view(rec_ok));
+
+                    pm.ir_revision = pm.ir_revision + 1u32;
+                    stats.pass_changes = stats.pass_changes + 1u32;
+                    passmgr_invalidate_analyses(mut_view(*pm), contract.invalidated_analyses);
+                    let keep_mask = analysis_bit(ANALYSIS_CFG) | analysis_bit(ANALYSIS_DOMINATORS) |
+                                    analysis_bit(ANALYSIS_SSA) | analysis_bit(ANALYSIS_MEMORY_SSA) |
+                                    analysis_bit(ANALYSIS_LOOP_INFO);
+                    pm.valid_analyses = pm.valid_analyses | keep_mask;
+                    loops_stamp_valid_analysis_revs(mut_view(*pm));
+
+                    if pm.budget.verify_each {
+                        if !loops_verify_pass_postconditions(mut_view(*pm), mut_view(*body), mut_view(*arena), mut_view(*sink)) {
+                            vec_restore_extra_snap(mut_view(*body), view(ex_snap));
+                            passmgr_rollback_body(mut_view(*body), view(snap), mut_view(*arena));
+                            pm.ir_revision = pre_rev;
+                            pm.valid_analyses = pre_valid;
+                            vec_copy_stats(mut_view(*stats), view(pre_stats));
+                            stats.pass_runs = pre_stats.pass_runs + 1u32;
+                            stats.pass_rollbacks = pre_stats.pass_rollbacks + 1u32;
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+        li = li + 1;
+    }
+
+    false
+}
+
+pub fn opt_loop_vec(
+    pm: mut_view<PassManager>,
+    body: mut_view<OptBody>,
+    call_table: *const EffectCallTable,
+    alias_info: *const AliasInfo,
+    stats: mut_view<LoopVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    let caps = vec_default_target_caps();
+    opt_loop_vec_with_caps(pm, body, call_table, alias_info, view(caps), stats, arena, sink)
+}
+
+pub fn loop_vec_optimize_mir_body(
+    mir_body: mut_view<MirBody>,
+    thir: *const Thir,
+    profile: u8,
+    verify_each: bool,
+    call_table: *const EffectCallTable,
+    caps: view<TargetSimdCaps>,
+    stats: mut_view<LoopVecStats>,
+    arena: mut_view<Arena>,
+    sink: mut_view<DiagSink>,
+    fn_item: *const HirItem
+) -> bool {
+    loop_vec_stats_zero(mut_view(*stats));
+    let prev_errs = sink.errors;
+
+    let obody = optir_build_from_mir(view(*mir_body), thir, mut_view(*arena), mut_view(*sink), fn_item);
+    if (obody as usize) == 0 || sink.errors != prev_errs {
+        return false;
+    }
+
+    let pm_ptr = arena_alloc_raw(mut_view(*arena), size_of<PassManager>(), align_of<PassManager>()) as *mut PassManager;
+    let budget = opt_budget_for_profile(profile, verify_each);
+    passmgr_init(unsafe { mut_view(*pm_ptr) }, budget, mut_view(*arena));
+    passmgr_mark_all_valid_from_lowering(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, mut_view(*arena));
+
+    if profile == OPT_PROFILE_DEBUG_O0 {
+        if verify_each {
+            return loops_verify_pass_postconditions(unsafe { mut_view(*pm_ptr) }, unsafe { mut_view(*obody) }, mut_view(*arena), mut_view(*sink));
+        }
+        return true;
+    }
+
+    let alias_ptr = alias_build_info(unsafe { view(*obody) }, call_table, mut_view(*arena)) as *const AliasInfo;
+    let mut simp_stats = LoopSimplifyStats {
+        pass_runs: 0u32, pass_changes: 0u32, pass_rollbacks: 0u32,
+        loops_discovered: 0u32, irreducible_cycles: 0u32, preheaders_inserted: 0u32,
+        latches_merged: 0u32, dedicated_exits_inserted: 0u32, lcssa_phis_inserted: 0u32,
+    };
+    loops_stats_zero(mut_view(simp_stats));
+    let _ = opt_loop_simplify(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        alias_ptr,
+        mut_view(simp_stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    let mut bce_stats = BceStats {
+        pass_runs: 0u32, pass_changes: 0u32, pass_rollbacks: 0u32,
+        sites_inspected: 0u32, checks_eliminated: 0u32, checks_retained_possible: 0u32,
+        checks_retained_unknown: 0u32, array_checks_eliminated: 0u32, slice_checks_eliminated: 0u32,
+        vec_checks_eliminated: 0u32, blocks_pruned: 0u32,
+    };
+    bce_stats_zero(mut_view(bce_stats));
+    let _ = opt_bce(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        mut_view(*arena),
+        mut_view(*sink),
+        mut_view(bce_stats),
+        0 as *mut *mut BceSiteRecord,
+        0 as *mut usize
+    );
+
+    let fresh_alias = alias_build_info(unsafe { view(*obody) }, call_table, mut_view(*arena)) as *const AliasInfo;
+    let _ = opt_loop_vec_with_caps(
+        unsafe { mut_view(*pm_ptr) },
+        unsafe { mut_view(*obody) },
+        call_table,
+        fresh_alias,
+        caps,
+        mut_view(*stats),
+        mut_view(*arena),
+        mut_view(*sink)
+    );
+
+    let rec_mir = arena_alloc_raw(mut_view(*arena), size_of<MirBody>(), align_of<MirBody>()) as *mut MirBody;
+    if !optir_reconstruct_mir(unsafe { view(*obody) }, unsafe { mut_view(*rec_mir) }, mut_view(*arena)) {
+        return false;
+    }
+    verify_mir(unsafe { view(*rec_mir) }, thir, mut_view(*sink), fn_item);
+    if sink.errors != prev_errs {
+        return false;
+    }
+
+    unsafe {
+        mir_body.sym.v = (*rec_mir).sym.v;
+        mir_body.fn_sym.v = (*rec_mir).fn_sym.v;
+        mir_body.fn_name.v = (*rec_mir).fn_name.v;
+        mir_body.span.file.v = (*rec_mir).span.file.v;
+        mir_body.span.start = (*rec_mir).span.start;
+        mir_body.span.end = (*rec_mir).span.end;
+        mir_body.locals = (*rec_mir).locals;
+        mir_body.local_count = (*rec_mir).local_count;
+        mir_body.local_cap = (*rec_mir).local_cap;
+        mir_body.arg_count = (*rec_mir).arg_count;
+        mir_body.bbs = (*rec_mir).bbs;
+        mir_body.bb_count = (*rec_mir).bb_count;
+        mir_body.bb_cap = (*rec_mir).bb_cap;
+        mir_body.drop_flag_count = (*rec_mir).drop_flag_count;
+    }
+    true
+}
+
+// --- 7. Deterministic `--emit=vectorize` & `--emit=vector-cost` Formatters (SPEC-74 §10, AXS-VEC-051) ---
+
+const VEC_STR_DATA: [276]u8 = [
+    // 0: "vectorize {\n" (12)
+    118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 105u8, 122u8, 101u8, 32u8, 123u8, 10u8,
+    // 1: "  pass_runs=" (12)
+    32u8, 32u8, 112u8, 97u8, 115u8, 115u8, 95u8, 114u8, 117u8, 110u8, 115u8, 61u8,
+    // 2: " vectorized=" (12)
+    32u8, 118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 105u8, 122u8, 101u8, 100u8, 61u8,
+    // 3: " rejected=" (10)
+    32u8, 114u8, 101u8, 106u8, 101u8, 99u8, 116u8, 101u8, 100u8, 61u8,
+    // 4: " rollbacks=" (11)
+    32u8, 114u8, 111u8, 108u8, 108u8, 98u8, 97u8, 99u8, 107u8, 115u8, 61u8,
+    // 5: "\n  alias: cap_disjoint=" (23)
+    10u8, 32u8, 32u8, 97u8, 108u8, 105u8, 97u8, 115u8, 58u8, 32u8, 99u8, 97u8, 112u8, 95u8, 100u8, 105u8, 115u8, 106u8, 111u8, 105u8, 110u8, 116u8, 61u8,
+    // 6: " scev_disjoint=" (15)
+    32u8, 115u8, 99u8, 101u8, 118u8, 95u8, 100u8, 105u8, 115u8, 106u8, 111u8, 105u8, 110u8, 116u8, 61u8,
+    // 7: " rt_guard=" (10)
+    32u8, 114u8, 116u8, 95u8, 103u8, 117u8, 97u8, 114u8, 100u8, 61u8,
+    // 8: "\n  widen: reductions=" (21)
+    10u8, 32u8, 32u8, 119u8, 105u8, 100u8, 101u8, 110u8, 58u8, 32u8, 114u8, 101u8, 100u8, 117u8, 99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 61u8,
+    // 9: " broadcasts=" (12)
+    32u8, 98u8, 114u8, 111u8, 97u8, 100u8, 99u8, 97u8, 115u8, 116u8, 115u8, 61u8,
+    // 10: " steps=" (7)
+    32u8, 115u8, 116u8, 101u8, 112u8, 115u8, 61u8,
+    // 11: " selects=" (9)
+    32u8, 115u8, 101u8, 108u8, 101u8, 99u8, 116u8, 115u8, 61u8,
+    // 12: " epilogues=" (11)
+    32u8, 101u8, 112u8, 105u8, 108u8, 111u8, 103u8, 117u8, 101u8, 115u8, 61u8,
+    // 13: "\n  loop[L" (9)
+    10u8, 32u8, 32u8, 108u8, 111u8, 111u8, 112u8, 91u8, 76u8,
+    // 14: "]: applied=" (11)
+    93u8, 58u8, 32u8, 97u8, 112u8, 112u8, 108u8, 105u8, 101u8, 100u8, 61u8,
+    // 15: " vf=" (4)
+    32u8, 118u8, 102u8, 61u8,
+    // 16: " uf=" (4)
+    32u8, 117u8, 102u8, 61u8,
+    // 17: " alias=" (7)
+    32u8, 97u8, 108u8, 105u8, 97u8, 115u8, 61u8,
+    // 18: " epilogue=" (10)
+    32u8, 101u8, 112u8, 105u8, 108u8, 111u8, 103u8, 117u8, 101u8, 61u8,
+    // 19: " reason=" (8)
+    32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8,
+    // 20: " scalar_cost=" (13)
+    32u8, 115u8, 99u8, 97u8, 108u8, 97u8, 114u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 21: " vec_cost=" (10)
+    32u8, 118u8, 101u8, 99u8, 95u8, 99u8, 111u8, 115u8, 116u8, 61u8,
+    // 22: " conf=" (6)
+    32u8, 99u8, 111u8, 110u8, 102u8, 61u8,
+    // 23: "\n}\n" (3)
+    10u8, 125u8, 10u8,
+    // 24: "vector_cost {\n" (14)
+    118u8, 101u8, 99u8, 116u8, 111u8, 114u8, 95u8, 99u8, 111u8, 115u8, 116u8, 32u8, 123u8, 10u8,
+    // 25: " profitable=" (12)
+    32u8, 112u8, 114u8, 111u8, 102u8, 105u8, 116u8, 97u8, 98u8, 108u8, 101u8, 61u8
+];
+
+const VEC_STR_OFF: [27]u32 = [
+    0u32, 12u32, 24u32, 36u32, 46u32, 57u32, 80u32, 95u32,
+    105u32, 126u32, 138u32, 145u32, 154u32, 165u32, 174u32, 185u32,
+    189u32, 193u32, 200u32, 210u32, 218u32, 231u32, 241u32, 247u32,
+    250u32, 264u32, 276u32
+];
+
+fn vec_push_str(buf: mut_view<DiagBuffer>, idx: usize) {
+    let start = VEC_STR_OFF[idx] as usize;
+    let end = VEC_STR_OFF[idx + 1] as usize;
+    let mut i = start;
+    while i < end {
+        diag_buf_push_byte(mut_view(*buf), VEC_STR_DATA[i]);
+        i = i + 1;
+    }
+}
+
+pub fn loop_vec_print(stats: view<LoopVecStats>, buf: mut_view<DiagBuffer>) {
+    vec_push_str(mut_view(*buf), 0);
+    vec_push_str(mut_view(*buf), 1);
+    diag_buf_push_u32(mut_view(*buf), stats.pass_runs);
+    vec_push_str(mut_view(*buf), 2);
+    diag_buf_push_u32(mut_view(*buf), stats.loops_vectorized);
+    vec_push_str(mut_view(*buf), 3);
+    diag_buf_push_u32(mut_view(*buf), stats.loops_rejected);
+    vec_push_str(mut_view(*buf), 4);
+    diag_buf_push_u32(mut_view(*buf), stats.pass_rollbacks);
+
+    vec_push_str(mut_view(*buf), 5);
+    diag_buf_push_u32(mut_view(*buf), stats.cap_disjoint_proven);
+    vec_push_str(mut_view(*buf), 6);
+    diag_buf_push_u32(mut_view(*buf), stats.scev_disjoint_proven);
+    vec_push_str(mut_view(*buf), 7);
+    diag_buf_push_u32(mut_view(*buf), stats.runtime_alias_guards);
+
+    vec_push_str(mut_view(*buf), 8);
+    diag_buf_push_u32(mut_view(*buf), stats.reductions_vectorized);
+    vec_push_str(mut_view(*buf), 9);
+    diag_buf_push_u32(mut_view(*buf), stats.broadcasts_widened);
+    vec_push_str(mut_view(*buf), 10);
+    diag_buf_push_u32(mut_view(*buf), stats.step_vectors_widened);
+    vec_push_str(mut_view(*buf), 11);
+    diag_buf_push_u32(mut_view(*buf), stats.selects_if_converted);
+    vec_push_str(mut_view(*buf), 12);
+    diag_buf_push_u32(mut_view(*buf), stats.epilogues_emitted);
+
+    let mut r: usize = 0;
+    while r < stats.record_count && (stats.records as usize) != 0 {
+        let rec = unsafe { loop_vec_record_at(stats.records, r) };
+        vec_push_str(mut_view(*buf), 13);
+        diag_buf_push_u32(mut_view(*buf), unsafe { (*rec).loop_id.v });
+        vec_push_str(mut_view(*buf), 14);
+        diag_buf_push_u32(mut_view(*buf), if unsafe { (*rec).applied } { 1u32 } else { 0u32 });
+        vec_push_str(mut_view(*buf), 15);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).vf }) as u32);
+        vec_push_str(mut_view(*buf), 16);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).uf }) as u32);
+        vec_push_str(mut_view(*buf), 17);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).alias_proof }) as u32);
+        vec_push_str(mut_view(*buf), 18);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).epilogue_kind }) as u32);
+        vec_push_str(mut_view(*buf), 19);
+        diag_buf_push_u32(mut_view(*buf), (unsafe { (*rec).reason }) as u32);
+        r = r + 1;
+    }
+
+    vec_push_str(mut_view(*buf), 23);
+}
+
+pub fn loop_vec_cost_print(est: view<VectorCostEstimate>, buf: mut_view<DiagBuffer>) {
+    vec_push_str(mut_view(*buf), 24);
+    vec_push_str(mut_view(*buf), 13);
+    diag_buf_push_u32(mut_view(*buf), est.loop_id.v);
+    vec_push_str(mut_view(*buf), 15);
+    diag_buf_push_u32(mut_view(*buf), est.vf as u32);
+    vec_push_str(mut_view(*buf), 16);
+    diag_buf_push_u32(mut_view(*buf), est.uf as u32);
+    vec_push_str(mut_view(*buf), 20);
+    diag_buf_push_u32(mut_view(*buf), est.total_scalar_cost);
+    vec_push_str(mut_view(*buf), 21);
+    diag_buf_push_u32(mut_view(*buf), est.total_vec_cost);
+    vec_push_str(mut_view(*buf), 22);
+    diag_buf_push_u32(mut_view(*buf), est.confidence as u32);
+    vec_push_str(mut_view(*buf), 25);
+    diag_buf_push_u32(mut_view(*buf), if est.profitable { 1u32 } else { 0u32 });
+    vec_push_str(mut_view(*buf), 19);
+    diag_buf_push_u32(mut_view(*buf), est.reject_reason as u32);
+    vec_push_str(mut_view(*buf), 23);
+}

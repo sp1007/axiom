@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T463, T611, T616]
 priority: 111
-status: doing
+status: done
 attempts: 1
 paths: [compiler/opt/vectorize, tests/run/opt_loop_vec]
 spec: [spec/SPEC-74-auto-vectorization.md, 0095, tasks/0402, tasks/0403, tasks/0406, tasks/0407]
 covers: [REQ-OPT-206, REQ-OPT-209, REQ-OPT-210, REQ-OPT-211]
 started: 2026-11-08 11:01:39
-agent: T617-impl
+finished: 2026-11-08 14:28:49
 ---
 # T617 — E15.5 — Loop auto-vectorization legality, capability-disjoint dependence proving, reduction recognition & scalar tail/epilogue generation
 
@@ -44,3 +44,4 @@ Implement the loop auto-vectorization engine in `compiler/opt/vectorize` consumi
 ## Log
 - 2026-11-03 02:42:00 created by T215 (P15 phase planning)
 - 2026-11-08 11:01:39 started (attempt 1) T617-impl
+- 2026-11-08 14:28:49 accepted by QA -> done
