@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T802]
 priority: 193
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p19/e19_1_lsp_server]
 spec: [spec/SPEC-100-lsp-server-ide-engine.md, 0101, 0146, tasks/0374, tasks/0448, tasks/0450, tasks/0479, tasks/0664, tasks/1053, tasks/1054]
 covers: [REQ-TOOL-183, REQ-TOOL-184, REQ-TOOL-185, REQ-TOOL-188, REQ-TOOL-189, REQ-TOOL-191, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-299, REQ-TOOL-300]
+started: 2026-11-08 14:54:08
+agent: T803-impl
 ---
 # T803 — E19.1 LSP server, AXEDITOR/AXCODEEDITOR & VS Code extension conformance suite
 
@@ -41,3 +43,4 @@ Certify E19.1 exit criteria with an end-to-end conformance suite covering `axiom
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 14:54:08 started (attempt 1) T803-impl
