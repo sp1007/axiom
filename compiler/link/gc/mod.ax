@@ -1,0 +1,1798 @@
+// Linker v2 Per-Item Section Subdivision, `IMAGE_SCN_LNK_COMDAT` Monomorphized Generic & Vtable
+// Deduplication, Root-Set Reachability Section Garbage Collection (`--gc-sections`), Forward
+// `.pdata`/`.xdata` Unwind Association, and Deterministic `inspect --emit=link-map` &
+// `--emit=gc-sections` Reporting (T775 / E18.6).
+// Implements `spec/SPEC-27-separate-compilation-linker-v2.md` §§2-4 (`AXS-LNK-010..025`,
+// `AXS-LNK-050..053`, `INV-LNK-002`; `0099`, `0164`, `0217`, `tasks/0369`, `tasks/0409`,
+// `tasks/0410`, `tasks/0526`, `tasks/0786`, `tasks/0802`, `tasks/0804`).
+module compiler.link.gc
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+// =============================================================================
+// 1. Per-Item Section Kinds, COFF Flags, COMDAT Selection, Roots & GC States
+// =============================================================================
+
+pub const LGC_SEC_TEXT: u8 = 0u8;
+pub const LGC_SEC_RDATA: u8 = 1u8;
+pub const LGC_SEC_DATA: u8 = 2u8;
+pub const LGC_SEC_BSS: u8 = 3u8;
+pub const LGC_SEC_PDATA: u8 = 4u8;
+pub const LGC_SEC_XDATA: u8 = 5u8;
+pub const LGC_SEC_TLS: u8 = 6u8;
+pub const LGC_SEC_CUSTOM: u8 = 7u8;
+
+pub const IMAGE_SCN_CNT_CODE: u32 = 0x00000020u32;
+pub const IMAGE_SCN_CNT_INITIALIZED_DATA: u32 = 0x00000040u32;
+pub const IMAGE_SCN_CNT_UNINITIALIZED_DATA: u32 = 0x00000080u32;
+pub const IMAGE_SCN_LNK_COMDAT: u32 = 0x00001000u32;
+pub const IMAGE_SCN_MEM_EXECUTE: u32 = 0x20000000u32;
+pub const IMAGE_SCN_MEM_READ: u32 = 0x40000000u32;
+pub const IMAGE_SCN_MEM_WRITE: u32 = 0x80000000u32;
+
+// SPEC-27 AXS-LNK-010 & AXS-LNK-013: COFF COMDAT Selection Modes
+pub const COMDAT_SELECT_NONE: u8 = 0u8;
+pub const COMDAT_SELECT_NODUPLICATES: u8 = 1u8;
+pub const COMDAT_SELECT_ANY: u8 = 2u8;
+pub const COMDAT_SELECT_SAME_SIZE: u8 = 3u8;
+pub const COMDAT_SELECT_EXACT_MATCH: u8 = 4u8;
+pub const COMDAT_SELECT_ASSOCIATIVE: u8 = 5u8;
+pub const COMDAT_SELECT_LARGEST: u8 = 6u8;
+
+// SPEC-27 AXS-LNK-010 & AXS-LNK-012: Symbol Bindings
+pub const LGC_BIND_LOCAL: u8 = 0u8;
+pub const LGC_BIND_GLOBAL: u8 = 1u8;
+pub const LGC_BIND_WEAK: u8 = 2u8;
+pub const LGC_BIND_COMDAT: u8 = 3u8;
+pub const LGC_BIND_COMMON: u8 = 4u8;
+pub const LGC_BIND_ABSOLUTE: u8 = 5u8;
+pub const LGC_BIND_IMPORT: u8 = 6u8;
+
+// SPEC-27 AXS-LNK-021: Reachability Root Kinds (`R_root`)
+pub const LGC_ROOT_NONE: u8 = 0u8;
+pub const LGC_ROOT_ENTRY: u8 = 1u8;
+pub const LGC_ROOT_EXPORT: u8 = 2u8;
+pub const LGC_ROOT_USED: u8 = 3u8;
+pub const LGC_ROOT_AT_PINNED: u8 = 4u8;
+pub const LGC_ROOT_MODULE_INIT: u8 = 5u8;
+pub const LGC_ROOT_REFLECTION: u8 = 6u8;
+
+// SPEC-27 AXS-LNK-022 & AXS-LNK-050: Section Retention States
+pub const LGC_STATE_DEAD_STRIPPED: u8 = 0u8;
+pub const LGC_STATE_RETAINED_ROOT: u8 = 1u8;
+pub const LGC_STATE_RETAINED_REF: u8 = 2u8;
+pub const LGC_STATE_RETAINED_UNWIND: u8 = 3u8;
+pub const LGC_STATE_FOLDED_COMDAT: u8 = 4u8;
+
+// Relocation Kinds (COFF AMD64)
+pub const LGC_RELOC_ADDR64: u16 = 1u16;
+pub const LGC_RELOC_ADDR32NB: u16 = 3u16;
+pub const LGC_RELOC_REL32: u16 = 4u16;
+pub const LGC_RELOC_SECTION: u16 = 10u16;
+pub const LGC_RELOC_SECREL: u16 = 11u16;
+
+// Linker v2 Diagnostic Codes (SPEC-27 AXS-LNK-014, AXS-LNK-050)
+pub const LGC_OK: u32 = 0u32;
+pub const AX_LINK_UNDEFINED_SYMBOL: u32 = 135u32;
+pub const AX_LINK_DUPLICATE_SYMBOL: u32 = 136u32;
+pub const AX_LINK_RELOC_OUT_OF_RANGE: u32 = 137u32;
+pub const AX_LINK_ABI_MISMATCH: u32 = 153u32;
+pub const AX_LINK_WX_VIOLATION: u32 = 155u32;
+pub const AX_LINK_DANGLING_RELOC: u32 = 156u32;
+
+pub const LGC_NONE_ID: u32 = 0xFFFFFFFFu32;
+pub const LGC_PE_HEADERS_RVA: u32 = 0x1000u32;
+pub const LGC_PE_HEADERS_FILE_OFF: u32 = 0x200u32;
+pub const LGC_SECTION_ALIGN: u32 = 0x1000u32;
+pub const LGC_FILE_ALIGN: u32 = 0x200u32;
+
+// =============================================================================
+// 2. LinkGcGraph Data Model (`AXS-LNK-010`, `AXS-LNK-013`, `AXS-LNK-020..024`)
+// =============================================================================
+
+@derive(Copy)
+pub struct LgcObjectInput {
+    pub obj_id: u32,
+    pub obj_name: StrView,
+    pub archive_name: StrView,
+    pub is_archive_member: bool,
+    pub extracted: bool,
+    pub content_hash: u64,
+}
+
+@derive(Copy)
+pub struct LgcRelocEdge {
+    pub from_sec_id: u32,
+    pub offset: u32,
+    pub reloc_kind: u16,
+    pub target_sym: StrView,
+    pub target_sym_hash: u64,
+    pub target_sec_id: u32,
+    pub addend: i64,
+}
+
+@derive(Copy)
+pub struct LgcSection {
+    pub sec_id: u32,
+    pub obj_id: u32,
+    pub sec_index_in_obj: u32,
+    pub sec_name: StrView,
+    pub sym_mangled: StrView,
+    pub sym_demangled: StrView,
+    pub sym_hash: u64,
+    pub kind: u8,
+    pub characteristics: u32,
+    pub align: u32,
+    pub binding: u8,
+    pub comdat_selection: u8,
+    pub assoc_leader_sec: u32,
+    pub bytes_hash: u64,
+    pub size_bytes: u32,
+    pub root_kind: u8,
+    pub is_export: bool,
+    pub is_used: bool,
+    pub has_pinned_vma: bool,
+    pub pinned_vma: u64,
+    pub state: u8,
+    pub is_live: bool,
+    pub is_folded_comdat: bool,
+    pub selected_rep_sec: u32,
+    pub retained_by_sec: u32,
+    pub retained_by_sym: StrView,
+    pub output_sec_idx: u32,
+    pub output_rva: u32,
+    pub output_file_off: u32,
+    pub output_order: u32,
+}
+
+@derive(Copy)
+pub struct LgcComdatGroup {
+    pub key_sym: StrView,
+    pub key_demangled: StrView,
+    pub key_hash: u64,
+    pub selection: u8,
+    pub winner_sec_id: u32,
+    pub winner_obj_id: u32,
+    pub folded_copies: u32,
+    pub folded_assoc_copies: u32,
+}
+
+@derive(Copy)
+pub struct LgcOutputSection {
+    pub kind: u8,
+    pub name: StrView,
+    pub characteristics: u32,
+    pub align: u32,
+    pub rva: u32,
+    pub virtual_size: u32,
+    pub file_offset: u32,
+    pub raw_size: u32,
+    pub input_sec_count: u32,
+    pub pad_byte: u8,
+}
+
+@derive(Copy)
+pub struct LgcStats {
+    pub total_objects: u32,
+    pub extracted_archive_members: u32,
+    pub skipped_archive_members: u32,
+    pub total_input_sections: u32,
+    pub comdat_groups_total: u32,
+    pub comdat_sections_folded: u32,
+    pub comdat_assoc_folded: u32,
+    pub roots_seeded: u32,
+    pub retained_sections: u32,
+    pub retained_code_sections: u32,
+    pub retained_data_sections: u32,
+    pub retained_unwind_sections: u32,
+    pub dead_stripped_sections: u32,
+    pub dead_code_stripped: u32,
+    pub dead_data_stripped: u32,
+    pub dead_unwind_stripped: u32,
+    pub retained_bytes: u64,
+    pub stripped_bytes: u64,
+    pub folded_comdat_bytes: u64,
+    pub output_section_count: u32,
+    pub image_size_bytes: u32,
+    pub file_size_bytes: u32,
+    pub diag_code: u32,
+    pub diag_sym: StrView,
+    pub diag_demangled: StrView,
+    pub diag_first_obj: StrView,
+    pub diag_second_obj: StrView,
+}
+
+pub struct LinkGcGraph {
+    pub objs: *mut LgcObjectInput,
+    pub obj_count: usize,
+    pub obj_cap: usize,
+    pub secs: *mut LgcSection,
+    pub sec_count: usize,
+    pub sec_cap: usize,
+    pub relocs: *mut LgcRelocEdge,
+    pub reloc_count: usize,
+    pub reloc_cap: usize,
+    pub comdat_groups: *mut LgcComdatGroup,
+    pub comdat_count: usize,
+    pub comdat_cap: usize,
+    pub out_secs: *mut LgcOutputSection,
+    pub out_sec_count: usize,
+    pub out_sec_cap: usize,
+    pub gc_enabled: bool,
+    pub is_dll: bool,
+    pub is_static_lib: bool,
+    pub stats: LgcStats,
+}
+
+// =============================================================================
+// 3. Pointer Arithmetic, Hashing, and String View Utilities
+// =============================================================================
+
+fn lgc_mul_usize(a: usize, b: usize) -> usize {
+    ((a as isize) * (b as isize)) as usize
+}
+
+pub unsafe fn lgc_byte_at(base: *mut u8, idx: usize) -> *mut u8 {
+    ((base as usize) + idx) as *mut u8
+}
+
+pub unsafe fn lgc_u32_at(base: *mut u32, idx: usize) -> *mut u32 {
+    ((base as usize) + lgc_mul_usize(idx, size_of<u32>())) as *mut u32
+}
+
+pub unsafe fn lgc_obj_at(base: *mut LgcObjectInput, idx: usize) -> *mut LgcObjectInput {
+    ((base as usize) + lgc_mul_usize(idx, size_of<LgcObjectInput>())) as *mut LgcObjectInput
+}
+
+pub unsafe fn lgc_sec_at(base: *mut LgcSection, idx: usize) -> *mut LgcSection {
+    ((base as usize) + lgc_mul_usize(idx, size_of<LgcSection>())) as *mut LgcSection
+}
+
+pub unsafe fn lgc_reloc_at(base: *mut LgcRelocEdge, idx: usize) -> *mut LgcRelocEdge {
+    ((base as usize) + lgc_mul_usize(idx, size_of<LgcRelocEdge>())) as *mut LgcRelocEdge
+}
+
+pub unsafe fn lgc_comdat_at(base: *mut LgcComdatGroup, idx: usize) -> *mut LgcComdatGroup {
+    ((base as usize) + lgc_mul_usize(idx, size_of<LgcComdatGroup>())) as *mut LgcComdatGroup
+}
+
+pub unsafe fn lgc_out_sec_at(base: *mut LgcOutputSection, idx: usize) -> *mut LgcOutputSection {
+    ((base as usize) + lgc_mul_usize(idx, size_of<LgcOutputSection>())) as *mut LgcOutputSection
+}
+
+pub fn lgc_sv_empty() -> StrView {
+    StrView { ptr: 0 as *const u8, len: 0 }
+}
+
+pub fn lgc_sv_eq(a: StrView, b: StrView) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    if a.len == 0 {
+        return true;
+    }
+    if (a.ptr as usize) == 0 || (b.ptr as usize) == 0 {
+        return (a.ptr as usize) == (b.ptr as usize);
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn lgc_hash_sv(sv: StrView) -> u64 {
+    let mut h: u64 = 14695981039346656037u64;
+    if (sv.ptr as usize) == 0 || sv.len == 0 {
+        return h;
+    }
+    let mut i: usize = 0;
+    while i < sv.len {
+        let b = unsafe { *(sv.ptr + i) };
+        h = wrapping_mul_u64(h ^ (b as u64), 1099511628211u64);
+        i = i + 1;
+    }
+    h
+}
+
+pub fn lgc_align_up_u32(val: u32, align: u32) -> u32 {
+    if align <= 1u32 {
+        return val;
+    }
+    let mask: u32 = align - 1u32;
+    (val + mask) & (0xFFFFFFFFu32 ^ mask)
+}
+
+// =============================================================================
+// 4. LinkGcGraph Lifecycle, Per-Item Section Subdivision & COMDAT Emission
+// =============================================================================
+
+pub fn lgc_stats_zero() -> LgcStats {
+    LgcStats {
+        total_objects: 0u32,
+        extracted_archive_members: 0u32,
+        skipped_archive_members: 0u32,
+        total_input_sections: 0u32,
+        comdat_groups_total: 0u32,
+        comdat_sections_folded: 0u32,
+        comdat_assoc_folded: 0u32,
+        roots_seeded: 0u32,
+        retained_sections: 0u32,
+        retained_code_sections: 0u32,
+        retained_data_sections: 0u32,
+        retained_unwind_sections: 0u32,
+        dead_stripped_sections: 0u32,
+        dead_code_stripped: 0u32,
+        dead_data_stripped: 0u32,
+        dead_unwind_stripped: 0u32,
+        retained_bytes: 0u64,
+        stripped_bytes: 0u64,
+        folded_comdat_bytes: 0u64,
+        output_section_count: 0u32,
+        image_size_bytes: 0u32,
+        file_size_bytes: 0u32,
+        diag_code: LGC_OK,
+        diag_sym: lgc_sv_empty(),
+        diag_demangled: lgc_sv_empty(),
+        diag_first_obj: lgc_sv_empty(),
+        diag_second_obj: lgc_sv_empty(),
+    }
+}
+
+pub fn lgc_graph_new(
+    arena: mut_view<Arena>,
+    gc_enabled: bool,
+    is_dll: bool,
+    is_static_lib: bool
+) -> *mut LinkGcGraph {
+    let g = arena_alloc_raw(mut_view(*arena), size_of<LinkGcGraph>(), align_of<LinkGcGraph>()) as *mut LinkGcGraph;
+    let obj_cap: usize = 16;
+    let sec_cap: usize = 64;
+    let rel_cap: usize = 64;
+    let cmd_cap: usize = 32;
+    let out_cap: usize = 8;
+    let objs = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(obj_cap, size_of<LgcObjectInput>()), align_of<LgcObjectInput>()) as *mut LgcObjectInput;
+    let secs = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(sec_cap, size_of<LgcSection>()), align_of<LgcSection>()) as *mut LgcSection;
+    let rels = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(rel_cap, size_of<LgcRelocEdge>()), align_of<LgcRelocEdge>()) as *mut LgcRelocEdge;
+    let cmds = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(cmd_cap, size_of<LgcComdatGroup>()), align_of<LgcComdatGroup>()) as *mut LgcComdatGroup;
+    let outs = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(out_cap, size_of<LgcOutputSection>()), align_of<LgcOutputSection>()) as *mut LgcOutputSection;
+    unsafe {
+        (*g).objs = objs;
+        (*g).obj_count = 0;
+        (*g).obj_cap = obj_cap;
+        (*g).secs = secs;
+        (*g).sec_count = 0;
+        (*g).sec_cap = sec_cap;
+        (*g).relocs = rels;
+        (*g).reloc_count = 0;
+        (*g).reloc_cap = rel_cap;
+        (*g).comdat_groups = cmds;
+        (*g).comdat_count = 0;
+        (*g).comdat_cap = cmd_cap;
+        (*g).out_secs = outs;
+        (*g).out_sec_count = 0;
+        (*g).out_sec_cap = out_cap;
+        // SPEC-27 AXS-LNK-021: `--gc-sections` enabled by default for `.exe`/`.dll`, disabled for `--kind lib`.
+        (*g).gc_enabled = if is_static_lib { false } else { gc_enabled };
+        (*g).is_dll = is_dll;
+        (*g).is_static_lib = is_static_lib;
+        (*g).stats = lgc_stats_zero();
+    }
+    g
+}
+
+fn lgc_push_object_raw(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    obj_name: StrView,
+    archive_name: StrView,
+    is_archive_member: bool,
+    extracted: bool,
+    content_hash: u64
+) -> u32 {
+    if g.obj_count >= g.obj_cap {
+        let new_cap: usize = if g.obj_cap == 0 { 16 } else { g.obj_cap + g.obj_cap };
+        let new_objs = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(new_cap, size_of<LgcObjectInput>()), align_of<LgcObjectInput>()) as *mut LgcObjectInput;
+        let mut i: usize = 0;
+        while i < g.obj_count {
+            unsafe { *lgc_obj_at(new_objs, i) = *lgc_obj_at(g.objs, i); }
+            i = i + 1;
+        }
+        g.objs = new_objs;
+        g.obj_cap = new_cap;
+    }
+    let idx: usize = g.obj_count;
+    let id: u32 = idx as u32;
+    unsafe {
+        let dst = lgc_obj_at(g.objs, idx);
+        (*dst).obj_id = id;
+        (*dst).obj_name = obj_name;
+        (*dst).archive_name = archive_name;
+        (*dst).is_archive_member = is_archive_member;
+        (*dst).extracted = extracted;
+        (*dst).content_hash = content_hash;
+    }
+    g.obj_count = idx + 1;
+    g.stats.total_objects = g.obj_count as u32;
+    id
+}
+
+pub fn lgc_add_object(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    obj_name: StrView,
+    content_hash: u64
+) -> u32 {
+    lgc_push_object_raw(mut_view(*g), mut_view(*arena), obj_name, lgc_sv_empty(), false, true, content_hash)
+}
+
+pub fn lgc_add_archive_member(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    archive_name: StrView,
+    member_name: StrView,
+    content_hash: u64
+) -> u32 {
+    lgc_push_object_raw(mut_view(*g), mut_view(*arena), member_name, archive_name, true, false, content_hash)
+}
+
+// SPEC-27 AXS-LNK-020: Default fine-grained COFF subsection characteristics.
+pub fn lgc_section_characteristics(kind: u8, is_comdat: bool) -> u32 {
+    let mut chars: u32 = if kind == LGC_SEC_TEXT {
+        IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ
+    } else if kind == LGC_SEC_RDATA || kind == LGC_SEC_PDATA || kind == LGC_SEC_XDATA {
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ
+    } else if kind == LGC_SEC_DATA || kind == LGC_SEC_TLS || kind == LGC_SEC_CUSTOM {
+        IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE
+    } else {
+        IMAGE_SCN_CNT_UNINITIALIZED_DATA | IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE
+    };
+    if is_comdat {
+        chars = chars | IMAGE_SCN_LNK_COMDAT;
+    }
+    chars
+}
+
+fn lgc_prefix_for_kind(kind: u8, out_buf: *mut u8) -> usize {
+    // Writes ".text$", ".rdata$", ".data$", ".bss$", ".pdata$", ".xdata$", ".tls$", or ".cust$"
+    unsafe { *lgc_byte_at(out_buf, 0) = 46u8; } // '.'
+    if kind == LGC_SEC_TEXT {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 2) = 101u8; // 'e'
+            *lgc_byte_at(out_buf, 3) = 120u8; // 'x'
+            *lgc_byte_at(out_buf, 4) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 5) = 36u8;  // '$'
+        }
+        return 6;
+    }
+    if kind == LGC_SEC_RDATA {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 114u8; // 'r'
+            *lgc_byte_at(out_buf, 2) = 100u8; // 'd'
+            *lgc_byte_at(out_buf, 3) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 4) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 5) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 6) = 36u8;  // '$'
+        }
+        return 7;
+    }
+    if kind == LGC_SEC_DATA {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 100u8; // 'd'
+            *lgc_byte_at(out_buf, 2) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 3) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 4) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 5) = 36u8;  // '$'
+        }
+        return 6;
+    }
+    if kind == LGC_SEC_BSS {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 98u8;  // 'b'
+            *lgc_byte_at(out_buf, 2) = 115u8; // 's'
+            *lgc_byte_at(out_buf, 3) = 115u8; // 's'
+            *lgc_byte_at(out_buf, 4) = 36u8;  // '$'
+        }
+        return 5;
+    }
+    if kind == LGC_SEC_PDATA {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 112u8; // 'p'
+            *lgc_byte_at(out_buf, 2) = 100u8; // 'd'
+            *lgc_byte_at(out_buf, 3) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 4) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 5) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 6) = 36u8;  // '$'
+        }
+        return 7;
+    }
+    if kind == LGC_SEC_XDATA {
+        unsafe {
+            *lgc_byte_at(out_buf, 1) = 120u8; // 'x'
+            *lgc_byte_at(out_buf, 2) = 100u8; // 'd'
+            *lgc_byte_at(out_buf, 3) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 4) = 116u8; // 't'
+            *lgc_byte_at(out_buf, 5) = 97u8;  // 'a'
+            *lgc_byte_at(out_buf, 6) = 36u8;  // '$'
+        }
+        return 7;
+    }
+    unsafe {
+        *lgc_byte_at(out_buf, 1) = 116u8; // 't'
+        *lgc_byte_at(out_buf, 2) = 108u8; // 'l'
+        *lgc_byte_at(out_buf, 3) = 115u8; // 's'
+        *lgc_byte_at(out_buf, 4) = 36u8;  // '$'
+    }
+    5
+}
+
+// SPEC-27 AXS-LNK-020: Formats `.text$<mangled_sym>`, `.rdata$<mangled_sym>`, etc.
+pub fn lgc_format_subsection_name(
+    arena: mut_view<Arena>,
+    kind: u8,
+    sym_mangled: StrView
+) -> StrView {
+    let total_cap: usize = 8 + sym_mangled.len;
+    let buf = arena_alloc_raw(mut_view(*arena), total_cap, 1);
+    let pref_len: usize = lgc_prefix_for_kind(kind, buf);
+    let mut i: usize = 0;
+    while i < sym_mangled.len {
+        unsafe {
+            *lgc_byte_at(buf, pref_len + i) = *(sym_mangled.ptr + i);
+        }
+        i = i + 1;
+    }
+    StrView { ptr: buf as *const u8, len: pref_len + sym_mangled.len }
+}
+
+pub fn lgc_add_section(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    obj_id: u32,
+    sec_name: StrView,
+    sym_mangled: StrView,
+    sym_demangled: StrView,
+    kind: u8,
+    align: u32,
+    binding: u8,
+    comdat_selection: u8,
+    assoc_leader_sec: u32,
+    size_bytes: u32,
+    bytes_hash: u64,
+    root_kind: u8
+) -> u32 {
+    if g.sec_count >= g.sec_cap {
+        let new_cap: usize = if g.sec_cap == 0 { 64 } else { g.sec_cap + g.sec_cap };
+        let new_secs = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(new_cap, size_of<LgcSection>()), align_of<LgcSection>()) as *mut LgcSection;
+        let mut i: usize = 0;
+        while i < g.sec_count {
+            unsafe { *lgc_sec_at(new_secs, i) = *lgc_sec_at(g.secs, i); }
+            i = i + 1;
+        }
+        g.secs = new_secs;
+        g.sec_cap = new_cap;
+    }
+    let mut sec_idx_in_obj: u32 = 0u32;
+    let mut k: usize = 0;
+    while k < g.sec_count {
+        let sk = unsafe { lgc_sec_at(g.secs, k) };
+        if (unsafe { (*sk).obj_id }) == obj_id {
+            sec_idx_in_obj = sec_idx_in_obj + 1u32;
+        }
+        k = k + 1;
+    }
+    let idx: usize = g.sec_count;
+    let id: u32 = idx as u32;
+    let is_comdat: bool = comdat_selection != COMDAT_SELECT_NONE || binding == LGC_BIND_COMDAT;
+    let chars: u32 = lgc_section_characteristics(kind, is_comdat);
+    let shash: u64 = lgc_hash_sv(sym_mangled);
+    unsafe {
+        let dst = lgc_sec_at(g.secs, idx);
+        (*dst).sec_id = id;
+        (*dst).obj_id = obj_id;
+        (*dst).sec_index_in_obj = sec_idx_in_obj;
+        (*dst).sec_name = sec_name;
+        (*dst).sym_mangled = sym_mangled;
+        (*dst).sym_demangled = if sym_demangled.len > 0 { sym_demangled } else { sym_mangled };
+        (*dst).sym_hash = shash;
+        (*dst).kind = kind;
+        (*dst).characteristics = chars;
+        (*dst).align = if align == 0u32 { 16u32 } else { align };
+        (*dst).binding = binding;
+        (*dst).comdat_selection = comdat_selection;
+        (*dst).assoc_leader_sec = assoc_leader_sec;
+        (*dst).bytes_hash = bytes_hash;
+        (*dst).size_bytes = size_bytes;
+        (*dst).root_kind = root_kind;
+        (*dst).is_export = root_kind == LGC_ROOT_EXPORT;
+        (*dst).is_used = root_kind == LGC_ROOT_USED;
+        (*dst).has_pinned_vma = root_kind == LGC_ROOT_AT_PINNED;
+        (*dst).pinned_vma = 0u64;
+        (*dst).state = LGC_STATE_DEAD_STRIPPED;
+        (*dst).is_live = false;
+        (*dst).is_folded_comdat = false;
+        (*dst).selected_rep_sec = id;
+        (*dst).retained_by_sec = LGC_NONE_ID;
+        (*dst).retained_by_sym = lgc_sv_empty();
+        (*dst).output_sec_idx = LGC_NONE_ID;
+        (*dst).output_rva = 0u32;
+        (*dst).output_file_off = 0u32;
+        (*dst).output_order = 0u32;
+    }
+    g.sec_count = idx + 1;
+    g.stats.total_input_sections = g.sec_count as u32;
+    id
+}
+
+// SPEC-27 AXS-LNK-013 & AXS-LNK-020: Emits a function into `.text$<sym>` along with
+// associated `.pdata$<sym>` (12 bytes) and `.xdata$<sym>` (`xdata_bytes` bytes) tied via
+// `IMAGE_COMDAT_SELECT_ASSOCIATIVE` (`COMDAT_SELECT_ASSOCIATIVE = 5`).
+pub fn lgc_emit_function_with_unwind(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    obj_id: u32,
+    sym_mangled: StrView,
+    sym_demangled: StrView,
+    binding: u8,
+    comdat_selection: u8,
+    code_size: u32,
+    code_hash: u64,
+    xdata_size: u32,
+    root_kind: u8
+) -> u32 {
+    let text_name = lgc_format_subsection_name(mut_view(*arena), LGC_SEC_TEXT, sym_mangled);
+    let text_sec = lgc_add_section(
+        mut_view(*g),
+        mut_view(*arena),
+        obj_id,
+        text_name,
+        sym_mangled,
+        sym_demangled,
+        LGC_SEC_TEXT,
+        16u32,
+        binding,
+        comdat_selection,
+        LGC_NONE_ID,
+        code_size,
+        code_hash,
+        root_kind
+    );
+    if xdata_size > 0u32 {
+        let pdata_name = lgc_format_subsection_name(mut_view(*arena), LGC_SEC_PDATA, sym_mangled);
+        let xdata_name = lgc_format_subsection_name(mut_view(*arena), LGC_SEC_XDATA, sym_mangled);
+        let xdata_sec = lgc_add_section(
+            mut_view(*g),
+            mut_view(*arena),
+            obj_id,
+            xdata_name,
+            lgc_sv_empty(),
+            sym_demangled,
+            LGC_SEC_XDATA,
+            4u32,
+            LGC_BIND_LOCAL,
+            COMDAT_SELECT_ASSOCIATIVE,
+            text_sec,
+            xdata_size,
+            code_hash ^ 0x5844415441u64,
+            LGC_ROOT_NONE
+        );
+        let pdata_sec = lgc_add_section(
+            mut_view(*g),
+            mut_view(*arena),
+            obj_id,
+            pdata_name,
+            lgc_sv_empty(),
+            sym_demangled,
+            LGC_SEC_PDATA,
+            4u32,
+            LGC_BIND_LOCAL,
+            COMDAT_SELECT_ASSOCIATIVE,
+            text_sec,
+            12u32,
+            code_hash ^ 0x5044415441u64,
+            LGC_ROOT_NONE
+        );
+        let _unused_x = xdata_sec;
+        let _unused_p = pdata_sec;
+    }
+    text_sec
+}
+
+// SPEC-27 AXS-LNK-020: Emits a constant/vtable/static datum into `.rdata$<sym>`, `.data$<sym>`, or `.bss$<sym>`.
+pub fn lgc_emit_static_datum(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    obj_id: u32,
+    sym_mangled: StrView,
+    sym_demangled: StrView,
+    kind: u8,
+    align: u32,
+    binding: u8,
+    comdat_selection: u8,
+    size_bytes: u32,
+    bytes_hash: u64,
+    root_kind: u8
+) -> u32 {
+    let sec_name = lgc_format_subsection_name(mut_view(*arena), kind, sym_mangled);
+    lgc_add_section(
+        mut_view(*g),
+        mut_view(*arena),
+        obj_id,
+        sec_name,
+        sym_mangled,
+        sym_demangled,
+        kind,
+        align,
+        binding,
+        comdat_selection,
+        LGC_NONE_ID,
+        size_bytes,
+        bytes_hash,
+        root_kind
+    )
+}
+
+pub fn lgc_set_pinned_vma(g: mut_view<LinkGcGraph>, sec_id: u32, vma: u64) {
+    if (sec_id as usize) >= g.sec_count {
+        return;
+    }
+    unsafe {
+        let s = lgc_sec_at(g.secs, sec_id as usize);
+        (*s).has_pinned_vma = true;
+        (*s).pinned_vma = vma;
+        if (*s).root_kind == LGC_ROOT_NONE {
+            (*s).root_kind = LGC_ROOT_AT_PINNED;
+        }
+    }
+}
+
+pub fn lgc_mark_root(g: mut_view<LinkGcGraph>, sec_id: u32, root_kind: u8) {
+    if (sec_id as usize) >= g.sec_count {
+        return;
+    }
+    unsafe {
+        let s = lgc_sec_at(g.secs, sec_id as usize);
+        (*s).root_kind = root_kind;
+        if root_kind == LGC_ROOT_EXPORT {
+            (*s).is_export = true;
+        } else if root_kind == LGC_ROOT_USED {
+            (*s).is_used = true;
+        } else if root_kind == LGC_ROOT_AT_PINNED {
+            (*s).has_pinned_vma = true;
+        }
+    }
+}
+
+pub fn lgc_add_reloc(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    from_sec_id: u32,
+    offset: u32,
+    reloc_kind: u16,
+    target_sym: StrView,
+    target_sec_id: u32,
+    addend: i64
+) {
+    if g.reloc_count >= g.reloc_cap {
+        let new_cap: usize = if g.reloc_cap == 0 { 64 } else { g.reloc_cap + g.reloc_cap };
+        let new_rels = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(new_cap, size_of<LgcRelocEdge>()), align_of<LgcRelocEdge>()) as *mut LgcRelocEdge;
+        let mut i: usize = 0;
+        while i < g.reloc_count {
+            unsafe { *lgc_reloc_at(new_rels, i) = *lgc_reloc_at(g.relocs, i); }
+            i = i + 1;
+        }
+        g.relocs = new_rels;
+        g.reloc_cap = new_cap;
+    }
+    let idx: usize = g.reloc_count;
+    unsafe {
+        let r = lgc_reloc_at(g.relocs, idx);
+        (*r).from_sec_id = from_sec_id;
+        (*r).offset = offset;
+        (*r).reloc_kind = reloc_kind;
+        (*r).target_sym = target_sym;
+        (*r).target_sym_hash = lgc_hash_sv(target_sym);
+        (*r).target_sec_id = target_sec_id;
+        (*r).addend = addend;
+    }
+    g.reloc_count = idx + 1;
+}
+
+// =============================================================================
+// 5. Demand-Driven Archive Extraction & COMDAT / Symbol Resolution (`AXS-LNK-012..013`)
+// =============================================================================
+
+pub fn lgc_is_obj_active(g: view<LinkGcGraph>, obj_id: u32) -> bool {
+    if (obj_id as usize) >= g.obj_count {
+        return false;
+    }
+    let obj = unsafe { lgc_obj_at(g.objs, obj_id as usize) };
+    let is_arch = unsafe { (*obj).is_archive_member };
+    let extr = unsafe { (*obj).extracted };
+    !is_arch || extr
+}
+
+fn lgc_obj_name_of(g: view<LinkGcGraph>, obj_id: u32) -> StrView {
+    if (obj_id as usize) >= g.obj_count {
+        return lgc_sv_empty();
+    }
+    let obj = unsafe { lgc_obj_at(g.objs, obj_id as usize) };
+    unsafe { (*obj).obj_name }
+}
+
+fn lgc_sym_defined_in_active_objs(g: view<LinkGcGraph>, sym_hash: u64, sym_name: StrView) -> bool {
+    let mut i: usize = 0;
+    while i < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, i) };
+        let oid = unsafe { (*s).obj_id };
+        if lgc_is_obj_active(g, oid) {
+            let bind = unsafe { (*s).binding };
+            let sel = unsafe { (*s).comdat_selection };
+            if bind != LGC_BIND_LOCAL && sel != COMDAT_SELECT_ASSOCIATIVE {
+                let sh = unsafe { (*s).sym_hash };
+                let sm = unsafe { (*s).sym_mangled };
+                if sh == sym_hash && sm.len > 0 && lgc_sv_eq(sm, sym_name) {
+                    return true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// SPEC-27 AXS-LNK-003.1: Fixed-point demand-driven `.lib` archive member extraction.
+pub fn lgc_extract_archives_fixed_point(g: mut_view<LinkGcGraph>) {
+    let mut changed: bool = true;
+    while changed {
+        changed = false;
+        let mut r_idx: usize = 0;
+        while r_idx < g.reloc_count {
+            let rel = unsafe { lgc_reloc_at(g.relocs, r_idx) };
+            let from_sec_id = unsafe { (*rel).from_sec_id };
+            if (from_sec_id as usize) < g.sec_count {
+                let from_sec = unsafe { lgc_sec_at(g.secs, from_sec_id as usize) };
+                let from_obj = unsafe { (*from_sec).obj_id };
+                if lgc_is_obj_active(view(*g), from_obj) {
+                    let tsym = unsafe { (*rel).target_sym };
+                    let thash = unsafe { (*rel).target_sym_hash };
+                    if tsym.len > 0 && !lgc_sym_defined_in_active_objs(view(*g), thash, tsym) {
+                        let mut k: usize = 0;
+                        while k < g.sec_count {
+                            let cand_sec = unsafe { lgc_sec_at(g.secs, k) };
+                            let cand_obj_id = unsafe { (*cand_sec).obj_id };
+                            if !lgc_is_obj_active(view(*g), cand_obj_id) {
+                                let c_bind = unsafe { (*cand_sec).binding };
+                                let c_sel = unsafe { (*cand_sec).comdat_selection };
+                                let c_hash = unsafe { (*cand_sec).sym_hash };
+                                let c_sym = unsafe { (*cand_sec).sym_mangled };
+                                if c_bind != LGC_BIND_LOCAL && c_sel != COMDAT_SELECT_ASSOCIATIVE &&
+                                   c_hash == thash && lgc_sv_eq(c_sym, tsym) {
+                                    let obj_ptr = unsafe { lgc_obj_at(g.objs, cand_obj_id as usize) };
+                                    unsafe { (*obj_ptr).extracted = true; }
+                                    changed = true;
+                                    k = g.sec_count;
+                                }
+                            }
+                            k = k + 1;
+                        }
+                    }
+                }
+            }
+            r_idx = r_idx + 1;
+        }
+    }
+
+    let mut extr_cnt: u32 = 0u32;
+    let mut skip_cnt: u32 = 0u32;
+    let mut o_idx: usize = 0;
+    while o_idx < g.obj_count {
+        let o = unsafe { lgc_obj_at(g.objs, o_idx) };
+        if unsafe { (*o).is_archive_member } {
+            if unsafe { (*o).extracted } {
+                extr_cnt = extr_cnt + 1u32;
+            } else {
+                skip_cnt = skip_cnt + 1u32;
+            }
+        }
+        o_idx = o_idx + 1;
+    }
+    g.stats.extracted_archive_members = extr_cnt;
+    g.stats.skipped_archive_members = skip_cnt;
+}
+
+fn lgc_record_comdat_group(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>,
+    key_sym: StrView,
+    key_demangled: StrView,
+    key_hash: u64,
+    selection: u8,
+    winner_sec_id: u32,
+    winner_obj_id: u32,
+    folded_copies: u32,
+    folded_assoc_copies: u32
+) {
+    if g.comdat_count >= g.comdat_cap {
+        let new_cap: usize = if g.comdat_cap == 0 { 32 } else { g.comdat_cap + g.comdat_cap };
+        let new_arr = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(new_cap, size_of<LgcComdatGroup>()), align_of<LgcComdatGroup>()) as *mut LgcComdatGroup;
+        let mut i: usize = 0;
+        while i < g.comdat_count {
+            unsafe { *lgc_comdat_at(new_arr, i) = *lgc_comdat_at(g.comdat_groups, i); }
+            i = i + 1;
+        }
+        g.comdat_groups = new_arr;
+        g.comdat_cap = new_cap;
+    }
+    let idx: usize = g.comdat_count;
+    unsafe {
+        let cg = lgc_comdat_at(g.comdat_groups, idx);
+        (*cg).key_sym = key_sym;
+        (*cg).key_demangled = key_demangled;
+        (*cg).key_hash = key_hash;
+        (*cg).selection = selection;
+        (*cg).winner_sec_id = winner_sec_id;
+        (*cg).winner_obj_id = winner_obj_id;
+        (*cg).folded_copies = folded_copies;
+        (*cg).folded_assoc_copies = folded_assoc_copies;
+    }
+    g.comdat_count = idx + 1;
+    g.stats.comdat_groups_total = g.comdat_count as u32;
+}
+
+fn lgc_sec_precedes(a: *mut LgcSection, b: *mut LgcSection) -> bool {
+    let oa = unsafe { (*a).obj_id };
+    let ob = unsafe { (*b).obj_id };
+    if oa != ob {
+        return oa < ob;
+    }
+    let sa = unsafe { (*a).sec_index_in_obj };
+    let sb = unsafe { (*b).sec_index_in_obj };
+    sa < sb
+}
+
+fn lgc_candidate_wins_over(cand: *mut LgcSection, cur: *mut LgcSection) -> bool {
+    let c_bind = unsafe { (*cand).binding };
+    let l_bind = unsafe { (*cur).binding };
+    // Strong overrides Weak regardless of object order (`SPEC-27 AXS-LNK-012.3`).
+    if c_bind == LGC_BIND_GLOBAL && l_bind == LGC_BIND_WEAK {
+        return true;
+    }
+    if c_bind == LGC_BIND_WEAK && l_bind == LGC_BIND_GLOBAL {
+        return false;
+    }
+    let c_sel = unsafe { (*cand).comdat_selection };
+    let l_sel = unsafe { (*cur).comdat_selection };
+    if c_sel == COMDAT_SELECT_LARGEST || l_sel == COMDAT_SELECT_LARGEST {
+        let c_sz = unsafe { (*cand).size_bytes };
+        let l_sz = unsafe { (*cur).size_bytes };
+        if c_sz != l_sz {
+            return c_sz > l_sz;
+        }
+    }
+    lgc_sec_precedes(cand, cur)
+}
+
+fn lgc_already_group_winner(g: view<LinkGcGraph>, sec_id: u32) -> bool {
+    let mut c: usize = 0;
+    while c < g.comdat_count {
+        let cg = unsafe { lgc_comdat_at(g.comdat_groups, c) };
+        if (unsafe { (*cg).winner_sec_id }) == sec_id {
+            return true;
+        }
+        c = c + 1;
+    }
+    false
+}
+
+// SPEC-27 AXS-LNK-012 & AXS-LNK-013: Global symbol & COMDAT group resolution.
+pub fn lgc_resolve_symbols_and_comdats(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>
+) -> bool {
+    lgc_extract_archives_fixed_point(mut_view(*g));
+
+    let mut i: usize = 0;
+    while i < g.sec_count {
+        let si = unsafe { lgc_sec_at(g.secs, i) };
+        let si_obj = unsafe { (*si).obj_id };
+        let si_folded = unsafe { (*si).is_folded_comdat };
+        let si_bind = unsafe { (*si).binding };
+        let si_sel = unsafe { (*si).comdat_selection };
+        let si_sym = unsafe { (*si).sym_mangled };
+        let si_hash = unsafe { (*si).sym_hash };
+
+        if lgc_is_obj_active(view(*g), si_obj) && !si_folded &&
+           !lgc_already_group_winner(view(*g), i as u32) &&
+           si_bind != LGC_BIND_LOCAL && si_sel != COMDAT_SELECT_ASSOCIATIVE && si_sym.len > 0 {
+            let mut winner_idx: usize = i;
+            let mut has_group: bool = si_sel != COMDAT_SELECT_NONE || si_bind == LGC_BIND_COMDAT;
+            let mut j: usize = i + 1;
+            while j < g.sec_count {
+                let sj = unsafe { lgc_sec_at(g.secs, j) };
+                let sj_obj = unsafe { (*sj).obj_id };
+                let sj_folded = unsafe { (*sj).is_folded_comdat };
+                let sj_bind = unsafe { (*sj).binding };
+                let sj_sel = unsafe { (*sj).comdat_selection };
+                let sj_sym = unsafe { (*sj).sym_mangled };
+                let sj_hash = unsafe { (*sj).sym_hash };
+
+                if lgc_is_obj_active(view(*g), sj_obj) && !sj_folded &&
+                   sj_bind != LGC_BIND_LOCAL && sj_sel != COMDAT_SELECT_ASSOCIATIVE &&
+                   sj_hash == si_hash && lgc_sv_eq(sj_sym, si_sym) {
+                    has_group = true;
+                    let cur_w = unsafe { lgc_sec_at(g.secs, winner_idx) };
+                    if lgc_candidate_wins_over(sj, cur_w) {
+                        winner_idx = j;
+                    }
+                }
+                j = j + 1;
+            }
+
+            if has_group {
+                let winner = unsafe { lgc_sec_at(g.secs, winner_idx) };
+                let w_sec_id = unsafe { (*winner).sec_id };
+                let w_obj_id = unsafe { (*winner).obj_id };
+                let w_bind = unsafe { (*winner).binding };
+                let w_sel = unsafe { (*winner).comdat_selection };
+                let w_sz = unsafe { (*winner).size_bytes };
+                let w_bhash = unsafe { (*winner).bytes_hash };
+                let w_dem = unsafe { (*winner).sym_demangled };
+
+                let mut folded_leaders: u32 = 0u32;
+                let mut folded_assocs: u32 = 0u32;
+
+                let mut k: usize = i;
+                while k < g.sec_count {
+                    if k != winner_idx {
+                        let sk = unsafe { lgc_sec_at(g.secs, k) };
+                        let sk_obj = unsafe { (*sk).obj_id };
+                        let sk_folded = unsafe { (*sk).is_folded_comdat };
+                        let sk_bind = unsafe { (*sk).binding };
+                        let sk_sel = unsafe { (*sk).comdat_selection };
+                        let sk_sym = unsafe { (*sk).sym_mangled };
+                        let sk_hash = unsafe { (*sk).sym_hash };
+
+                        if lgc_is_obj_active(view(*g), sk_obj) && !sk_folded &&
+                           sk_bind != LGC_BIND_LOCAL && sk_sel != COMDAT_SELECT_ASSOCIATIVE &&
+                           sk_hash == si_hash && lgc_sv_eq(sk_sym, si_sym) {
+                            let sk_sz = unsafe { (*sk).size_bytes };
+                            let sk_bhash = unsafe { (*sk).bytes_hash };
+                            let sk_sec_id = unsafe { (*sk).sec_id };
+
+                            // 1. Check for duplicate strong non-COMDAT or NODUPLICATES collision
+                            let both_strong: bool = w_bind == LGC_BIND_GLOBAL && sk_bind == LGC_BIND_GLOBAL;
+                            let no_dup_sel: bool = (w_sel == COMDAT_SELECT_NONE && sk_sel == COMDAT_SELECT_NONE) ||
+                                                   w_sel == COMDAT_SELECT_NODUPLICATES ||
+                                                   sk_sel == COMDAT_SELECT_NODUPLICATES;
+                            if both_strong && no_dup_sel {
+                                g.stats.diag_code = AX_LINK_DUPLICATE_SYMBOL;
+                                g.stats.diag_sym = si_sym;
+                                g.stats.diag_demangled = w_dem;
+                                g.stats.diag_first_obj = lgc_obj_name_of(view(*g), w_obj_id);
+                                g.stats.diag_second_obj = lgc_obj_name_of(view(*g), sk_obj);
+                                return false;
+                            }
+
+                            // 2. Check COMDAT_SELECT_SAME_SIZE and COMDAT_SELECT_EXACT_MATCH
+                            if w_sel == COMDAT_SELECT_SAME_SIZE || sk_sel == COMDAT_SELECT_SAME_SIZE {
+                                if w_sz != sk_sz {
+                                    g.stats.diag_code = AX_LINK_DUPLICATE_SYMBOL;
+                                    g.stats.diag_sym = si_sym;
+                                    g.stats.diag_demangled = w_dem;
+                                    g.stats.diag_first_obj = lgc_obj_name_of(view(*g), w_obj_id);
+                                    g.stats.diag_second_obj = lgc_obj_name_of(view(*g), sk_obj);
+                                    return false;
+                                }
+                            }
+                            if w_sel == COMDAT_SELECT_EXACT_MATCH || sk_sel == COMDAT_SELECT_EXACT_MATCH {
+                                if w_sz != sk_sz || w_bhash != sk_bhash {
+                                    g.stats.diag_code = AX_LINK_DUPLICATE_SYMBOL;
+                                    g.stats.diag_sym = si_sym;
+                                    g.stats.diag_demangled = w_dem;
+                                    g.stats.diag_first_obj = lgc_obj_name_of(view(*g), w_obj_id);
+                                    g.stats.diag_second_obj = lgc_obj_name_of(view(*g), sk_obj);
+                                    return false;
+                                }
+                            }
+
+                            // Propagate root attributes from folded duplicate to canonical representative
+                            unsafe {
+                                if (*sk).root_kind != LGC_ROOT_NONE && (*winner).root_kind == LGC_ROOT_NONE {
+                                    (*winner).root_kind = (*sk).root_kind;
+                                }
+                                if (*sk).is_export {
+                                    (*winner).is_export = true;
+                                }
+                                if (*sk).is_used {
+                                    (*winner).is_used = true;
+                                }
+                                (*sk).is_folded_comdat = true;
+                                (*sk).is_live = false;
+                                (*sk).state = LGC_STATE_FOLDED_COMDAT;
+                                (*sk).selected_rep_sec = w_sec_id;
+                            }
+                            folded_leaders = folded_leaders + 1u32;
+                            g.stats.comdat_sections_folded = g.stats.comdat_sections_folded + 1u32;
+                            g.stats.folded_comdat_bytes = g.stats.folded_comdat_bytes + (sk_sz as u64);
+
+                            // Fold any associative `.pdata`/`.xdata` children tied to `sk_sec_id`
+                            let mut a_idx: usize = 0;
+                            while a_idx < g.sec_count {
+                                let sa = unsafe { lgc_sec_at(g.secs, a_idx) };
+                                let sa_sel = unsafe { (*sa).comdat_selection };
+                                let sa_leader = unsafe { (*sa).assoc_leader_sec };
+                                if sa_sel == COMDAT_SELECT_ASSOCIATIVE && sa_leader == sk_sec_id {
+                                    let sa_sz = unsafe { (*sa).size_bytes };
+                                    unsafe {
+                                        (*sa).is_folded_comdat = true;
+                                        (*sa).is_live = false;
+                                        (*sa).state = LGC_STATE_FOLDED_COMDAT;
+                                        (*sa).selected_rep_sec = w_sec_id;
+                                    }
+                                    folded_assocs = folded_assocs + 1u32;
+                                    g.stats.comdat_assoc_folded = g.stats.comdat_assoc_folded + 1u32;
+                                    g.stats.folded_comdat_bytes = g.stats.folded_comdat_bytes + (sa_sz as u64);
+                                }
+                                a_idx = a_idx + 1;
+                            }
+                        }
+                    }
+                    k = k + 1;
+                }
+
+                if w_sel != COMDAT_SELECT_NONE || w_bind == LGC_BIND_COMDAT || folded_leaders > 0u32 {
+                    let eff_sel: u8 = if w_sel == COMDAT_SELECT_NONE { COMDAT_SELECT_ANY } else { w_sel };
+                    lgc_record_comdat_group(
+                        mut_view(*g),
+                        mut_view(*arena),
+                        si_sym,
+                        w_dem,
+                        si_hash,
+                        eff_sel,
+                        w_sec_id,
+                        w_obj_id,
+                        folded_leaders,
+                        folded_assocs
+                    );
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // Bind and redirect all relocations to the surviving canonical section (`AXS-LNK-013.2`).
+    let mut r_idx: usize = 0;
+    while r_idx < g.reloc_count {
+        let rel = unsafe { lgc_reloc_at(g.relocs, r_idx) };
+        let cur_tgt = unsafe { (*rel).target_sec_id };
+        if (cur_tgt as usize) < g.sec_count {
+            let tsec = unsafe { lgc_sec_at(g.secs, cur_tgt as usize) };
+            if unsafe { (*tsec).is_folded_comdat } {
+                unsafe { (*rel).target_sec_id = (*tsec).selected_rep_sec; }
+            }
+        } else {
+            let tsym = unsafe { (*rel).target_sym };
+            let thash = unsafe { (*rel).target_sym_hash };
+            if tsym.len > 0 {
+                let mut m: usize = 0;
+                while m < g.sec_count {
+                    let sm = unsafe { lgc_sec_at(g.secs, m) };
+                    let sm_obj = unsafe { (*sm).obj_id };
+                    let sm_folded = unsafe { (*sm).is_folded_comdat };
+                    let sm_bind = unsafe { (*sm).binding };
+                    let sm_sel = unsafe { (*sm).comdat_selection };
+                    if lgc_is_obj_active(view(*g), sm_obj) && !sm_folded &&
+                       sm_bind != LGC_BIND_LOCAL && sm_sel != COMDAT_SELECT_ASSOCIATIVE {
+                        let sh = unsafe { (*sm).sym_hash };
+                        let sname = unsafe { (*sm).sym_mangled };
+                        if sh == thash && lgc_sv_eq(sname, tsym) {
+                            unsafe { (*rel).target_sec_id = (*sm).sec_id; }
+                            m = g.sec_count;
+                        }
+                    }
+                    m = m + 1;
+                }
+            }
+        }
+        r_idx = r_idx + 1;
+    }
+    true
+}
+
+// =============================================================================
+// 6. Root-Set FIFO Mark-Sweep Section GC & Forward Unwind Association (`AXS-LNK-021..022`)
+// =============================================================================
+
+pub fn lgc_verify_post_gc_invariants(g: mut_view<LinkGcGraph>) -> bool {
+    let mut i: usize = 0;
+    while i < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, i) };
+        if unsafe { (*s).is_live } {
+            let chars = unsafe { (*s).characteristics };
+            let is_exec: bool = (chars & IMAGE_SCN_MEM_EXECUTE) != 0u32;
+            let is_write: bool = (chars & IMAGE_SCN_MEM_WRITE) != 0u32;
+            if is_exec && is_write {
+                g.stats.diag_code = AX_LINK_WX_VIOLATION;
+                g.stats.diag_sym = unsafe { (*s).sec_name };
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+
+    let mut r_idx: usize = 0;
+    while r_idx < g.reloc_count {
+        let rel = unsafe { lgc_reloc_at(g.relocs, r_idx) };
+        let from_id = unsafe { (*rel).from_sec_id };
+        if (from_id as usize) < g.sec_count {
+            let from_sec = unsafe { lgc_sec_at(g.secs, from_id as usize) };
+            if unsafe { (*from_sec).is_live } {
+                let tgt_id = unsafe { (*rel).target_sec_id };
+                if (tgt_id as usize) >= g.sec_count {
+                    g.stats.diag_code = AX_LINK_UNDEFINED_SYMBOL;
+                    g.stats.diag_sym = unsafe { (*rel).target_sym };
+                    g.stats.diag_first_obj = lgc_obj_name_of(view(*g), unsafe { (*from_sec).obj_id });
+                    return false;
+                }
+                let tgt_sec = unsafe { lgc_sec_at(g.secs, tgt_id as usize) };
+                if !(unsafe { (*tgt_sec).is_live }) {
+                    g.stats.diag_code = AX_LINK_DANGLING_RELOC;
+                    g.stats.diag_sym = unsafe { (*rel).target_sym };
+                    return false;
+                }
+            }
+        }
+        r_idx = r_idx + 1;
+    }
+    true
+}
+
+pub fn lgc_mark_sweep_sections(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>
+) -> bool {
+    if g.sec_count == 0 {
+        return true;
+    }
+    let queue = arena_alloc_raw(mut_view(*arena), lgc_mul_usize(g.sec_count, size_of<u32>()), align_of<u32>()) as *mut u32;
+    let mut q_head: usize = 0;
+    let mut q_tail: usize = 0;
+
+    // 1. Seed initial live worklist `R_root` (`@entry`, `@export`, `@used`, `@at`, `ModuleInit`, `Reflection`).
+    let mut i: usize = 0;
+    while i < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, i) };
+        let s_obj = unsafe { (*s).obj_id };
+        let s_folded = unsafe { (*s).is_folded_comdat };
+        if lgc_is_obj_active(view(*g), s_obj) && !s_folded {
+            unsafe {
+                if (*s).has_pinned_vma && (*s).root_kind == LGC_ROOT_NONE {
+                    (*s).root_kind = LGC_ROOT_AT_PINNED;
+                } else if (*s).is_export && (*s).root_kind == LGC_ROOT_NONE {
+                    (*s).root_kind = LGC_ROOT_EXPORT;
+                } else if (*s).is_used && (*s).root_kind == LGC_ROOT_NONE {
+                    (*s).root_kind = LGC_ROOT_USED;
+                }
+
+                let should_seed: bool = if g.gc_enabled {
+                    (*s).root_kind != LGC_ROOT_NONE
+                } else {
+                    (*s).comdat_selection != COMDAT_SELECT_ASSOCIATIVE
+                };
+
+                if should_seed {
+                    if (*s).root_kind == LGC_ROOT_NONE {
+                        (*s).root_kind = LGC_ROOT_ENTRY;
+                    }
+                    (*s).is_live = true;
+                    (*s).state = LGC_STATE_RETAINED_ROOT;
+                    (*s).retained_by_sec = (*s).sec_id;
+                    (*s).retained_by_sym = (*s).sym_demangled;
+                    *lgc_u32_at(queue, q_tail) = i as u32;
+                    q_tail = q_tail + 1;
+                    g.stats.roots_seeded = g.stats.roots_seeded + 1u32;
+                } else {
+                    (*s).is_live = false;
+                    (*s).state = LGC_STATE_DEAD_STRIPPED;
+                }
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Deterministic FIFO worklist mark traversal over relocations + forward `.pdata`/`.xdata` unwind edges.
+    while q_head < q_tail {
+        let cur_id = unsafe { *lgc_u32_at(queue, q_head) };
+        q_head = q_head + 1;
+        let cur_sec = unsafe { lgc_sec_at(g.secs, cur_id as usize) };
+        let cur_dem = unsafe { (*cur_sec).sym_demangled };
+
+        // 2a. Outgoing relocations from `cur_id`
+        let mut r_idx: usize = 0;
+        while r_idx < g.reloc_count {
+            let rel = unsafe { lgc_reloc_at(g.relocs, r_idx) };
+            if (unsafe { (*rel).from_sec_id }) == cur_id {
+                let tgt_id = unsafe { (*rel).target_sec_id };
+                if (tgt_id as usize) >= g.sec_count {
+                    g.stats.diag_code = AX_LINK_UNDEFINED_SYMBOL;
+                    g.stats.diag_sym = unsafe { (*rel).target_sym };
+                    g.stats.diag_demangled = unsafe { (*rel).target_sym };
+                    g.stats.diag_first_obj = lgc_obj_name_of(view(*g), unsafe { (*cur_sec).obj_id });
+                    return false;
+                }
+                let tgt_sec = unsafe { lgc_sec_at(g.secs, tgt_id as usize) };
+                let tgt_folded = unsafe { (*tgt_sec).is_folded_comdat };
+                let tgt_live = unsafe { (*tgt_sec).is_live };
+                if !tgt_folded && !tgt_live {
+                    unsafe {
+                        (*tgt_sec).is_live = true;
+                        (*tgt_sec).state = LGC_STATE_RETAINED_REF;
+                        (*tgt_sec).retained_by_sec = cur_id;
+                        (*tgt_sec).retained_by_sym = if (*rel).target_sym.len > 0 {
+                            (*rel).target_sym
+                        } else {
+                            cur_dem
+                        };
+                        *lgc_u32_at(queue, q_tail) = tgt_id;
+                        q_tail = q_tail + 1;
+                    }
+                }
+            }
+            r_idx = r_idx + 1;
+        }
+
+        // 2b. Forward unwind association (`AXS-LNK-022.1`): live `.text$sym` marks its
+        // `COMDAT_SELECT_ASSOCIATIVE` `.pdata$sym` and `.xdata$sym` sections live.
+        let mut a_idx: usize = 0;
+        while a_idx < g.sec_count {
+            let assoc = unsafe { lgc_sec_at(g.secs, a_idx) };
+            let a_folded = unsafe { (*assoc).is_folded_comdat };
+            let a_live = unsafe { (*assoc).is_live };
+            if !a_folded && !a_live {
+                let a_sel = unsafe { (*assoc).comdat_selection };
+                let a_leader = unsafe { (*assoc).assoc_leader_sec };
+                if a_sel == COMDAT_SELECT_ASSOCIATIVE && a_leader == cur_id {
+                    unsafe {
+                        (*assoc).is_live = true;
+                        (*assoc).state = LGC_STATE_RETAINED_UNWIND;
+                        (*assoc).retained_by_sec = cur_id;
+                        (*assoc).retained_by_sym = cur_dem;
+                        *lgc_u32_at(queue, q_tail) = a_idx as u32;
+                        q_tail = q_tail + 1;
+                    }
+                }
+            }
+            a_idx = a_idx + 1;
+        }
+    }
+
+    // 3. Sweep unreferenced sections and compute retention/strip counters.
+    let mut s_idx: usize = 0;
+    while s_idx < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, s_idx) };
+        let s_obj = unsafe { (*s).obj_id };
+        let s_folded = unsafe { (*s).is_folded_comdat };
+        if lgc_is_obj_active(view(*g), s_obj) && !s_folded {
+            let s_live = unsafe { (*s).is_live };
+            let s_kind = unsafe { (*s).kind };
+            let s_sz = (unsafe { (*s).size_bytes }) as u64;
+            if s_live {
+                g.stats.retained_sections = g.stats.retained_sections + 1u32;
+                g.stats.retained_bytes = g.stats.retained_bytes + s_sz;
+                if s_kind == LGC_SEC_TEXT {
+                    g.stats.retained_code_sections = g.stats.retained_code_sections + 1u32;
+                } else if s_kind == LGC_SEC_PDATA || s_kind == LGC_SEC_XDATA {
+                    g.stats.retained_unwind_sections = g.stats.retained_unwind_sections + 1u32;
+                } else {
+                    g.stats.retained_data_sections = g.stats.retained_data_sections + 1u32;
+                }
+            } else {
+                unsafe { (*s).state = LGC_STATE_DEAD_STRIPPED; }
+                g.stats.dead_stripped_sections = g.stats.dead_stripped_sections + 1u32;
+                g.stats.stripped_bytes = g.stats.stripped_bytes + s_sz;
+                if s_kind == LGC_SEC_TEXT {
+                    g.stats.dead_code_stripped = g.stats.dead_code_stripped + 1u32;
+                } else if s_kind == LGC_SEC_PDATA || s_kind == LGC_SEC_XDATA {
+                    g.stats.dead_unwind_stripped = g.stats.dead_unwind_stripped + 1u32;
+                } else {
+                    g.stats.dead_data_stripped = g.stats.dead_data_stripped + 1u32;
+                }
+            }
+        }
+        s_idx = s_idx + 1;
+    }
+
+    lgc_verify_post_gc_invariants(mut_view(*g))
+}
+
+
+// =============================================================================
+// 7. Output Section Merging, RVA / FileOffset Layout & Full Pipeline (`AXS-LNK-024`)
+// =============================================================================
+
+const LGC_STR_TABLE: [577]u8 = [
+    46u8, 116u8, 101u8, 120u8, 116u8, 46u8, 114u8, 100u8, 97u8, 116u8, 97u8, 46u8, 100u8, 97u8, 116u8, 97u8,
+    46u8, 98u8, 115u8, 115u8, 46u8, 112u8, 100u8, 97u8, 116u8, 97u8, 46u8, 120u8, 100u8, 97u8, 116u8, 97u8,
+    46u8, 116u8, 108u8, 115u8, 46u8, 99u8, 117u8, 115u8, 116u8, 111u8, 109u8, 103u8, 99u8, 95u8, 115u8, 101u8,
+    99u8, 116u8, 105u8, 111u8, 110u8, 115u8, 32u8, 123u8, 10u8, 32u8, 32u8, 114u8, 101u8, 116u8, 97u8, 105u8,
+    110u8, 101u8, 100u8, 32u8, 32u8, 32u8, 102u8, 111u8, 108u8, 100u8, 101u8, 100u8, 95u8, 99u8, 111u8, 109u8,
+    100u8, 97u8, 116u8, 32u8, 32u8, 32u8, 100u8, 101u8, 97u8, 100u8, 95u8, 115u8, 116u8, 114u8, 105u8, 112u8,
+    112u8, 101u8, 100u8, 32u8, 32u8, 111u8, 98u8, 106u8, 61u8, 32u8, 115u8, 121u8, 109u8, 61u8, 32u8, 115u8,
+    105u8, 122u8, 101u8, 61u8, 32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8, 82u8, 111u8, 111u8, 116u8,
+    40u8, 32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8, 82u8, 101u8, 102u8, 101u8, 114u8, 101u8, 110u8,
+    99u8, 101u8, 100u8, 66u8, 121u8, 40u8, 32u8, 114u8, 101u8, 97u8, 115u8, 111u8, 110u8, 61u8, 65u8, 115u8,
+    115u8, 111u8, 99u8, 105u8, 97u8, 116u8, 105u8, 118u8, 101u8, 85u8, 110u8, 119u8, 105u8, 110u8, 100u8, 40u8,
+    32u8, 114u8, 101u8, 112u8, 95u8, 115u8, 101u8, 99u8, 61u8, 32u8, 114u8, 101u8, 112u8, 95u8, 111u8, 98u8,
+    106u8, 61u8, 32u8, 115u8, 101u8, 108u8, 61u8, 101u8, 110u8, 116u8, 114u8, 121u8, 101u8, 120u8, 112u8, 111u8,
+    114u8, 116u8, 117u8, 115u8, 101u8, 100u8, 97u8, 116u8, 95u8, 112u8, 105u8, 110u8, 110u8, 101u8, 100u8, 109u8,
+    111u8, 100u8, 117u8, 108u8, 101u8, 95u8, 105u8, 110u8, 105u8, 116u8, 114u8, 101u8, 102u8, 108u8, 101u8, 99u8,
+    116u8, 105u8, 111u8, 110u8, 32u8, 32u8, 115u8, 117u8, 109u8, 109u8, 97u8, 114u8, 121u8, 32u8, 116u8, 111u8,
+    116u8, 97u8, 108u8, 61u8, 32u8, 114u8, 101u8, 116u8, 97u8, 105u8, 110u8, 101u8, 100u8, 61u8, 32u8, 102u8,
+    111u8, 108u8, 100u8, 101u8, 100u8, 95u8, 99u8, 111u8, 109u8, 100u8, 97u8, 116u8, 61u8, 32u8, 100u8, 101u8,
+    97u8, 100u8, 95u8, 115u8, 116u8, 114u8, 105u8, 112u8, 112u8, 101u8, 100u8, 61u8, 32u8, 114u8, 101u8, 116u8,
+    97u8, 105u8, 110u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 32u8, 115u8, 116u8, 114u8,
+    105u8, 112u8, 112u8, 101u8, 100u8, 95u8, 98u8, 121u8, 116u8, 101u8, 115u8, 61u8, 125u8, 10u8, 108u8, 105u8,
+    110u8, 107u8, 95u8, 109u8, 97u8, 112u8, 32u8, 123u8, 10u8, 32u8, 32u8, 97u8, 114u8, 99u8, 104u8, 105u8,
+    118u8, 101u8, 95u8, 109u8, 101u8, 109u8, 98u8, 101u8, 114u8, 32u8, 32u8, 97u8, 114u8, 99u8, 104u8, 105u8,
+    118u8, 101u8, 61u8, 32u8, 101u8, 120u8, 116u8, 114u8, 97u8, 99u8, 116u8, 101u8, 100u8, 61u8, 32u8, 32u8,
+    99u8, 111u8, 109u8, 100u8, 97u8, 116u8, 95u8, 103u8, 114u8, 111u8, 117u8, 112u8, 32u8, 107u8, 101u8, 121u8,
+    61u8, 32u8, 119u8, 105u8, 110u8, 110u8, 101u8, 114u8, 95u8, 111u8, 98u8, 106u8, 61u8, 32u8, 119u8, 105u8,
+    110u8, 110u8, 101u8, 114u8, 95u8, 115u8, 101u8, 99u8, 61u8, 32u8, 102u8, 111u8, 108u8, 100u8, 101u8, 100u8,
+    95u8, 99u8, 111u8, 112u8, 105u8, 101u8, 115u8, 61u8, 32u8, 32u8, 111u8, 117u8, 116u8, 112u8, 117u8, 116u8,
+    95u8, 115u8, 101u8, 99u8, 116u8, 105u8, 111u8, 110u8, 32u8, 32u8, 114u8, 118u8, 97u8, 61u8, 48u8, 120u8,
+    32u8, 118u8, 115u8, 105u8, 122u8, 101u8, 61u8, 32u8, 102u8, 105u8, 108u8, 101u8, 95u8, 111u8, 102u8, 102u8,
+    61u8, 48u8, 120u8, 32u8, 114u8, 97u8, 119u8, 95u8, 115u8, 105u8, 122u8, 101u8, 61u8, 32u8, 105u8, 110u8,
+    112u8, 117u8, 116u8, 115u8, 61u8, 32u8, 32u8, 115u8, 121u8, 109u8, 98u8, 111u8, 108u8, 32u8, 32u8, 115u8,
+    101u8, 99u8, 61u8, 116u8, 114u8, 117u8, 101u8, 102u8, 97u8, 108u8, 115u8, 101u8, 97u8, 110u8, 121u8, 101u8,
+    120u8, 97u8, 99u8, 116u8, 95u8, 109u8, 97u8, 116u8, 99u8, 104u8, 115u8, 97u8, 109u8, 101u8, 95u8, 115u8,
+    105u8, 122u8, 101u8, 108u8, 97u8, 114u8, 103u8, 101u8, 115u8, 116u8, 97u8, 115u8, 115u8, 111u8, 99u8, 105u8,
+    97u8, 116u8, 105u8, 118u8, 101u8, 110u8, 111u8, 100u8, 117u8, 112u8, 108u8, 105u8, 99u8, 97u8, 116u8, 101u8,
+    115u8
+];
+
+fn lgc_push_tbl(out: mut_view<DiagBuffer>, off: usize, len: usize) {
+    let mut i: usize = 0;
+    while i < len {
+        diag_buf_push_byte(mut_view(*out), LGC_STR_TABLE[off + i]);
+        i = i + 1;
+    }
+}
+
+pub fn lgc_push_output_sec_name(out: mut_view<DiagBuffer>, kind: u8) {
+    if kind == LGC_SEC_TEXT { lgc_push_tbl(mut_view(*out), 0, 5); return; }
+    if kind == LGC_SEC_RDATA { lgc_push_tbl(mut_view(*out), 5, 6); return; }
+    if kind == LGC_SEC_DATA { lgc_push_tbl(mut_view(*out), 11, 5); return; }
+    if kind == LGC_SEC_BSS { lgc_push_tbl(mut_view(*out), 16, 4); return; }
+    if kind == LGC_SEC_PDATA { lgc_push_tbl(mut_view(*out), 20, 6); return; }
+    if kind == LGC_SEC_XDATA { lgc_push_tbl(mut_view(*out), 26, 6); return; }
+    if kind == LGC_SEC_TLS { lgc_push_tbl(mut_view(*out), 32, 4); return; }
+    lgc_push_tbl(mut_view(*out), 36, 7);
+}
+
+pub fn lgc_push_root_kind(out: mut_view<DiagBuffer>, rk: u8) {
+    if rk == LGC_ROOT_ENTRY { lgc_push_tbl(mut_view(*out), 199, 5); return; }
+    if rk == LGC_ROOT_EXPORT { lgc_push_tbl(mut_view(*out), 204, 6); return; }
+    if rk == LGC_ROOT_USED { lgc_push_tbl(mut_view(*out), 210, 4); return; }
+    if rk == LGC_ROOT_AT_PINNED { lgc_push_tbl(mut_view(*out), 214, 9); return; }
+    if rk == LGC_ROOT_MODULE_INIT { lgc_push_tbl(mut_view(*out), 223, 11); return; }
+    if rk == LGC_ROOT_REFLECTION { lgc_push_tbl(mut_view(*out), 234, 10); return; }
+    lgc_push_tbl(mut_view(*out), 199, 5);
+}
+
+pub fn lgc_push_comdat_sel(out: mut_view<DiagBuffer>, sel: u8) {
+    if sel == COMDAT_SELECT_ANY { lgc_push_tbl(mut_view(*out), 524, 3); return; }
+    if sel == COMDAT_SELECT_EXACT_MATCH { lgc_push_tbl(mut_view(*out), 527, 11); return; }
+    if sel == COMDAT_SELECT_SAME_SIZE { lgc_push_tbl(mut_view(*out), 538, 9); return; }
+    if sel == COMDAT_SELECT_LARGEST { lgc_push_tbl(mut_view(*out), 547, 7); return; }
+    if sel == COMDAT_SELECT_ASSOCIATIVE { lgc_push_tbl(mut_view(*out), 554, 11); return; }
+    if sel == COMDAT_SELECT_NODUPLICATES { lgc_push_tbl(mut_view(*out), 565, 12); return; }
+    lgc_push_tbl(mut_view(*out), 524, 3);
+}
+
+// SPEC-27 AXS-LNK-024: Deterministic output section merging & RVA/FileOffset layout.
+// Canonical PE/COFF section order: `.text`, `.rdata`, `.data`, `.bss`, `.pdata`, `.xdata`, `.tls`, `.custom`.
+pub fn lgc_layout_output_sections(g: mut_view<LinkGcGraph>) -> bool {
+    g.out_sec_count = 0;
+    let mut cur_rva: u32 = LGC_PE_HEADERS_RVA;
+    let mut cur_foff: u32 = LGC_PE_HEADERS_FILE_OFF;
+
+    let mut kind: u8 = 0u8;
+    while kind <= LGC_SEC_CUSTOM {
+        let mut count_in_kind: u32 = 0u32;
+        let mut max_align: u32 = 4u32;
+        let mut cur_off_in_sec: u32 = 0u32;
+        let out_idx: u32 = g.out_sec_count as u32;
+
+        let mut i: usize = 0;
+        while i < g.sec_count {
+            let s = unsafe { lgc_sec_at(g.secs, i) };
+            let s_live = unsafe { (*s).is_live };
+            let s_kind = unsafe { (*s).kind };
+            if s_live && s_kind == kind {
+                let s_align = unsafe { (*s).align };
+                let s_sz = unsafe { (*s).size_bytes };
+                if s_align > max_align {
+                    max_align = s_align;
+                }
+                cur_off_in_sec = lgc_align_up_u32(cur_off_in_sec, s_align);
+                unsafe {
+                    (*s).output_sec_idx = out_idx;
+                    (*s).output_rva = cur_rva + cur_off_in_sec;
+                    (*s).output_file_off = if kind == LGC_SEC_BSS { 0u32 } else { cur_foff + cur_off_in_sec };
+                    (*s).output_order = count_in_kind;
+                }
+                cur_off_in_sec = cur_off_in_sec + s_sz;
+                count_in_kind = count_in_kind + 1u32;
+            }
+            i = i + 1;
+        }
+
+        if count_in_kind > 0u32 {
+            let vsize: u32 = cur_off_in_sec;
+            let rsize: u32 = if kind == LGC_SEC_BSS {
+                0u32
+            } else {
+                lgc_align_up_u32(vsize, LGC_FILE_ALIGN)
+            };
+            let osec_foff: u32 = if kind == LGC_SEC_BSS { 0u32 } else { cur_foff };
+            let pad_b: u8 = if kind == LGC_SEC_TEXT { 0xCCu8 } else { 0x00u8 };
+            let chars: u32 = lgc_section_characteristics(kind, false);
+            unsafe {
+                let os = lgc_out_sec_at(g.out_secs, g.out_sec_count);
+                (*os).kind = kind;
+                (*os).name = lgc_sv_empty();
+                (*os).characteristics = chars;
+                (*os).align = max_align;
+                (*os).rva = cur_rva;
+                (*os).virtual_size = vsize;
+                (*os).file_offset = osec_foff;
+                (*os).raw_size = rsize;
+                (*os).input_sec_count = count_in_kind;
+                (*os).pad_byte = pad_b;
+            }
+            g.out_sec_count = g.out_sec_count + 1;
+            cur_rva = cur_rva + lgc_align_up_u32(vsize, LGC_SECTION_ALIGN);
+            cur_foff = cur_foff + rsize;
+        }
+        kind = kind + 1u8;
+    }
+
+    g.stats.output_section_count = g.out_sec_count as u32;
+    g.stats.image_size_bytes = cur_rva;
+    g.stats.file_size_bytes = cur_foff;
+    true
+}
+
+// Runs the complete Linker v2 COMDAT folding + root-set mark-sweep GC + output layout pipeline.
+pub fn lgc_run_pipeline(
+    g: mut_view<LinkGcGraph>,
+    arena: mut_view<Arena>
+) -> bool {
+    if !lgc_resolve_symbols_and_comdats(mut_view(*g), mut_view(*arena)) {
+        return false;
+    }
+    if !lgc_mark_sweep_sections(mut_view(*g), mut_view(*arena)) {
+        return false;
+    }
+    lgc_layout_output_sections(mut_view(*g))
+}
+
+// =============================================================================
+// 8. Deterministic `inspect --emit=gc-sections` & `--emit=link-map` Formatting
+// =============================================================================
+
+fn lgc_push_hex_u32(out: mut_view<DiagBuffer>, val: u32) {
+    let mut shift: u32 = 16u32;
+    while shift > 0u32 {
+        shift = shift - 4u32;
+        let nib: u8 = ((val >> shift) & 0xFu32) as u8;
+        let ch: u8 = if nib < 10u8 { 48u8 + nib } else { 87u8 + nib };
+        diag_buf_push_byte(mut_view(*out), ch);
+    }
+}
+
+// SPEC-27 AXS-LNK-050.2: Deterministic `inspect --emit=gc-sections` report.
+pub fn lgc_emit_gc_sections_report(g: view<LinkGcGraph>, out: mut_view<DiagBuffer>) {
+    lgc_push_tbl(mut_view(*out), 43, 14); // "gc_sections {\n"
+
+    let mut i: usize = 0;
+    while i < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, i) };
+        let s_obj = unsafe { (*s).obj_id };
+        if lgc_is_obj_active(g, s_obj) {
+            let st = unsafe { (*s).state };
+            let s_name = unsafe { (*s).sec_name };
+            let s_dem = unsafe { (*s).sym_demangled };
+            let s_sz = unsafe { (*s).size_bytes };
+            let obj_name = lgc_obj_name_of(g, s_obj);
+
+            if st == LGC_STATE_RETAINED_ROOT || st == LGC_STATE_RETAINED_REF || st == LGC_STATE_RETAINED_UNWIND {
+                lgc_push_tbl(mut_view(*out), 57, 11); // "  retained "
+                diag_buf_push_sv(mut_view(*out), s_name);
+                lgc_push_tbl(mut_view(*out), 100, 5); // " obj="
+                diag_buf_push_sv(mut_view(*out), obj_name);
+                lgc_push_tbl(mut_view(*out), 105, 5); // " sym="
+                diag_buf_push_sv(mut_view(*out), s_dem);
+                lgc_push_tbl(mut_view(*out), 110, 6); // " size="
+                diag_buf_push_u32(mut_view(*out), s_sz);
+                if st == LGC_STATE_RETAINED_ROOT {
+                    lgc_push_tbl(mut_view(*out), 116, 13); // " reason=Root("
+                    let rk = unsafe { (*s).root_kind };
+                    lgc_push_root_kind(mut_view(*out), rk);
+                    diag_buf_push_byte(mut_view(*out), 41u8); // ')'
+                } else if st == LGC_STATE_RETAINED_REF {
+                    lgc_push_tbl(mut_view(*out), 129, 21); // " reason=ReferencedBy("
+                    let p_id = unsafe { (*s).retained_by_sec };
+                    if (p_id as usize) < g.sec_count {
+                        let p_sec = unsafe { lgc_sec_at(g.secs, p_id as usize) };
+                        diag_buf_push_sv(mut_view(*out), unsafe { (*p_sec).sec_name });
+                    }
+                    diag_buf_push_byte(mut_view(*out), 41u8); // ')'
+                } else {
+                    lgc_push_tbl(mut_view(*out), 150, 26); // " reason=AssociativeUnwind("
+                    let p_id = unsafe { (*s).retained_by_sec };
+                    if (p_id as usize) < g.sec_count {
+                        let p_sec = unsafe { lgc_sec_at(g.secs, p_id as usize) };
+                        diag_buf_push_sv(mut_view(*out), unsafe { (*p_sec).sec_name });
+                    }
+                    diag_buf_push_byte(mut_view(*out), 41u8); // ')'
+                }
+                diag_buf_push_byte(mut_view(*out), 10u8);
+            } else if st == LGC_STATE_FOLDED_COMDAT {
+                lgc_push_tbl(mut_view(*out), 68, 16); // "  folded_comdat "
+                diag_buf_push_sv(mut_view(*out), s_name);
+                lgc_push_tbl(mut_view(*out), 100, 5); // " obj="
+                diag_buf_push_sv(mut_view(*out), obj_name);
+                lgc_push_tbl(mut_view(*out), 110, 6); // " size="
+                diag_buf_push_u32(mut_view(*out), s_sz);
+                let rep_id = unsafe { (*s).selected_rep_sec };
+                if (rep_id as usize) < g.sec_count {
+                    let rep_sec = unsafe { lgc_sec_at(g.secs, rep_id as usize) };
+                    lgc_push_tbl(mut_view(*out), 176, 9); // " rep_sec="
+                    diag_buf_push_sv(mut_view(*out), unsafe { (*rep_sec).sec_name });
+                    lgc_push_tbl(mut_view(*out), 185, 9); // " rep_obj="
+                    diag_buf_push_sv(mut_view(*out), lgc_obj_name_of(g, unsafe { (*rep_sec).obj_id }));
+                }
+                lgc_push_tbl(mut_view(*out), 194, 5); // " sel="
+                lgc_push_comdat_sel(mut_view(*out), unsafe { (*s).comdat_selection });
+                diag_buf_push_byte(mut_view(*out), 10u8);
+            } else {
+                lgc_push_tbl(mut_view(*out), 84, 16); // "  dead_stripped "
+                diag_buf_push_sv(mut_view(*out), s_name);
+                lgc_push_tbl(mut_view(*out), 100, 5); // " obj="
+                diag_buf_push_sv(mut_view(*out), obj_name);
+                lgc_push_tbl(mut_view(*out), 105, 5); // " sym="
+                diag_buf_push_sv(mut_view(*out), s_dem);
+                lgc_push_tbl(mut_view(*out), 110, 6); // " size="
+                diag_buf_push_u32(mut_view(*out), s_sz);
+                diag_buf_push_byte(mut_view(*out), 10u8);
+            }
+        }
+        i = i + 1;
+    }
+
+    let total_folded: u32 = g.stats.comdat_sections_folded + g.stats.comdat_assoc_folded;
+    let total_active: u32 = g.stats.retained_sections + total_folded + g.stats.dead_stripped_sections;
+    lgc_push_tbl(mut_view(*out), 244, 16); // "  summary total="
+    diag_buf_push_u32(mut_view(*out), total_active);
+    lgc_push_tbl(mut_view(*out), 260, 10); // " retained="
+    diag_buf_push_u32(mut_view(*out), g.stats.retained_sections);
+    lgc_push_tbl(mut_view(*out), 270, 15); // " folded_comdat="
+    diag_buf_push_u32(mut_view(*out), total_folded);
+    lgc_push_tbl(mut_view(*out), 285, 15); // " dead_stripped="
+    diag_buf_push_u32(mut_view(*out), g.stats.dead_stripped_sections);
+    lgc_push_tbl(mut_view(*out), 300, 16); // " retained_bytes="
+    diag_buf_push_u32(mut_view(*out), g.stats.retained_bytes as u32);
+    lgc_push_tbl(mut_view(*out), 316, 16); // " stripped_bytes="
+    diag_buf_push_u32(mut_view(*out), g.stats.stripped_bytes as u32);
+    diag_buf_push_byte(mut_view(*out), 10u8);
+    lgc_push_tbl(mut_view(*out), 332, 2); // "}\n"
+}
+
+// SPEC-27 AXS-LNK-050.1: Deterministic `inspect --emit=link-map` report.
+pub fn lgc_emit_link_map_report(g: view<LinkGcGraph>, out: mut_view<DiagBuffer>) {
+    lgc_push_tbl(mut_view(*out), 334, 11); // "link_map {\n"
+
+    // 1. Archive members and their demand-driven extraction status
+    let mut o_idx: usize = 0;
+    while o_idx < g.obj_count {
+        let obj = unsafe { lgc_obj_at(g.objs, o_idx) };
+        if unsafe { (*obj).is_archive_member } {
+            lgc_push_tbl(mut_view(*out), 345, 17); // "  archive_member "
+            diag_buf_push_sv(mut_view(*out), unsafe { (*obj).obj_name });
+            lgc_push_tbl(mut_view(*out), 362, 9); // " archive="
+            diag_buf_push_sv(mut_view(*out), unsafe { (*obj).archive_name });
+            lgc_push_tbl(mut_view(*out), 371, 11); // " extracted="
+            if unsafe { (*obj).extracted } {
+                lgc_push_tbl(mut_view(*out), 515, 4); // "true"
+            } else {
+                lgc_push_tbl(mut_view(*out), 519, 5); // "false"
+            }
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+        o_idx = o_idx + 1;
+    }
+
+    // 2. COMDAT groups and selected winning representatives
+    let mut c_idx: usize = 0;
+    while c_idx < g.comdat_count {
+        let cg = unsafe { lgc_comdat_at(g.comdat_groups, c_idx) };
+        lgc_push_tbl(mut_view(*out), 382, 19); // "  comdat_group key="
+        diag_buf_push_sv(mut_view(*out), unsafe { (*cg).key_sym });
+        lgc_push_tbl(mut_view(*out), 194, 5); // " sel="
+        lgc_push_comdat_sel(mut_view(*out), unsafe { (*cg).selection });
+        lgc_push_tbl(mut_view(*out), 401, 12); // " winner_obj="
+        diag_buf_push_sv(mut_view(*out), lgc_obj_name_of(g, unsafe { (*cg).winner_obj_id }));
+        let w_sec_id = unsafe { (*cg).winner_sec_id };
+        if (w_sec_id as usize) < g.sec_count {
+            let w_sec = unsafe { lgc_sec_at(g.secs, w_sec_id as usize) };
+            lgc_push_tbl(mut_view(*out), 413, 12); // " winner_sec="
+            diag_buf_push_sv(mut_view(*out), unsafe { (*w_sec).sec_name });
+        }
+        lgc_push_tbl(mut_view(*out), 425, 15); // " folded_copies="
+        diag_buf_push_u32(mut_view(*out), unsafe { (*cg).folded_copies });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        c_idx = c_idx + 1;
+    }
+
+    // 3. Output sections with RVA, VirtualSize, FileOffset, RawSize, and input count
+    let mut os_idx: usize = 0;
+    while os_idx < g.out_sec_count {
+        let os = unsafe { lgc_out_sec_at(g.out_secs, os_idx) };
+        lgc_push_tbl(mut_view(*out), 440, 17); // "  output_section "
+        lgc_push_output_sec_name(mut_view(*out), unsafe { (*os).kind });
+        lgc_push_tbl(mut_view(*out), 457, 7); // " rva=0x"
+        lgc_push_hex_u32(mut_view(*out), unsafe { (*os).rva });
+        lgc_push_tbl(mut_view(*out), 464, 7); // " vsize="
+        diag_buf_push_u32(mut_view(*out), unsafe { (*os).virtual_size });
+        lgc_push_tbl(mut_view(*out), 471, 12); // " file_off=0x"
+        lgc_push_hex_u32(mut_view(*out), unsafe { (*os).file_offset });
+        lgc_push_tbl(mut_view(*out), 483, 10); // " raw_size="
+        diag_buf_push_u32(mut_view(*out), unsafe { (*os).raw_size });
+        lgc_push_tbl(mut_view(*out), 493, 8); // " inputs="
+        diag_buf_push_u32(mut_view(*out), unsafe { (*os).input_sec_count });
+        diag_buf_push_byte(mut_view(*out), 10u8);
+        os_idx = os_idx + 1;
+    }
+
+    // 4. Surviving global/COMDAT/entry symbols in output RVA order
+    let mut s_idx: usize = 0;
+    while s_idx < g.sec_count {
+        let s = unsafe { lgc_sec_at(g.secs, s_idx) };
+        let s_live = unsafe { (*s).is_live };
+        let s_sym = unsafe { (*s).sym_mangled };
+        if s_live && s_sym.len > 0 {
+            lgc_push_tbl(mut_view(*out), 501, 9); // "  symbol "
+            diag_buf_push_sv(mut_view(*out), unsafe { (*s).sym_demangled });
+            lgc_push_tbl(mut_view(*out), 457, 7); // " rva=0x"
+            lgc_push_hex_u32(mut_view(*out), unsafe { (*s).output_rva });
+            lgc_push_tbl(mut_view(*out), 110, 6); // " size="
+            diag_buf_push_u32(mut_view(*out), unsafe { (*s).size_bytes });
+            lgc_push_tbl(mut_view(*out), 510, 5); // " sec="
+            diag_buf_push_sv(mut_view(*out), unsafe { (*s).sec_name });
+            lgc_push_tbl(mut_view(*out), 100, 5); // " obj="
+            diag_buf_push_sv(mut_view(*out), lgc_obj_name_of(g, unsafe { (*s).obj_id }));
+            diag_buf_push_byte(mut_view(*out), 10u8);
+        }
+        s_idx = s_idx + 1;
+    }
+
+    lgc_push_tbl(mut_view(*out), 332, 2); // "}\n"
+}
