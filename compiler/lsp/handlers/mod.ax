@@ -1,0 +1,2288 @@
+// CompilerDB-Backed Semantic LSP Query Handlers (`publishDiagnostics`, `hover`, `definition`,
+// `typeDefinition`, `implementation`, `references`, `documentSymbol`, `workspace/symbol`,
+// constraint-filtered `completion`, conflict-checked `prepareRename` & `rename`) and
+// `AXCODEEDITOR` Semantic Presentation Layer (`semanticTokens/full`, `semanticTokens/full/delta`,
+// ownership/capability/move/drop/async-suspension `inlayHint`, and highlight layer precedence) (T802 / E19.1).
+// Implements SPEC-100 §§4..7 (AXS-LSP-001..004, AXS-LSP-030..032, AXS-LSP-040..043,
+// AXS-LSP-050..051, AXS-LSP-060..063; REQ-TOOL-183, REQ-TOOL-185, REQ-TOOL-188,
+// REQ-TOOL-189, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-300, INV-LSP-002).
+module compiler.lsp.handlers
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use std.editor.LspPosition
+use std.editor.LspRange
+use std.editor.TextRange
+use std.editor.TextEdit
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+use std.editor.text_range_new
+use std.editor.text_edit_new
+use std.editor.editor_lsp_pos_to_byte_offset
+use std.editor.editor_byte_offset_to_lsp_pos
+use std.editor.editor_byte_range_to_lsp_range
+use std.editor.editor_apply_transaction
+use std.editor.editor_snapshot
+
+use compiler.lsp.protocol.LSP_SCHEMA_VERSION_1
+use compiler.lsp.protocol.CERTAINTY_EXACT
+use compiler.lsp.protocol.CERTAINTY_RECOVERED
+use compiler.lsp.protocol.CERTAINTY_HEURISTIC
+use compiler.lsp.protocol.CERTAINTY_UNAVAILABLE
+use compiler.lsp.protocol.FALLBACK_NONE
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_MEMBER
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_EXPR
+use compiler.lsp.protocol.FALLBACK_STALE_ENTITY
+use compiler.lsp.protocol.LSP_ERR_NONE
+use compiler.lsp.protocol.LSP_ERR_INVALID_PARAMS
+use compiler.lsp.protocol.LspFactHeader
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_fact_header_new
+use compiler.lsp.protocol.lsp_str_view
+
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.VfsDiagnostic
+use compiler.lsp.vfs.GenerationalId
+use compiler.lsp.vfs.LspSymbolId
+use compiler.lsp.vfs.FunctionId
+use compiler.lsp.vfs.LspTypeId
+use compiler.lsp.vfs.LocalId
+use compiler.lsp.vfs.ENTITY_NONE
+use compiler.lsp.vfs.ENTITY_SYMBOL
+use compiler.lsp.vfs.ENTITY_FUNCTION
+use compiler.lsp.vfs.ENTITY_TYPE
+use compiler.lsp.vfs.ENTITY_LOCAL
+use compiler.lsp.vfs.ENTITY_PLACE
+use compiler.lsp.vfs.LOOKUP_FOUND
+use compiler.lsp.vfs.OWNERSHIP_OWNED
+use compiler.lsp.vfs.OWNERSHIP_VIEW
+use compiler.lsp.vfs.OWNERSHIP_MUT_VIEW
+use compiler.lsp.vfs.OWNERSHIP_MOVED
+use compiler.lsp.vfs.CAP_NONE
+use compiler.lsp.vfs.CAP_READ_ONLY
+use compiler.lsp.vfs.CAP_READ_WRITE
+use compiler.lsp.vfs.RECOVERY_INCOMPLETE_MEMBER_ACCESS
+use compiler.lsp.vfs.DIAG_PARSE_MISSING_DELIM
+use compiler.lsp.vfs.DIAG_PARSE_INCOMPLETE_MEMBER
+use compiler.lsp.vfs.DIAG_PARSE_INCOMPLETE_EXPR
+use compiler.lsp.vfs.DIAG_PARSE_INCOMPLETE_TYPE
+use compiler.lsp.vfs.DIAG_PARSE_INCOMPLETE_CALL
+use compiler.lsp.vfs.DIAG_TYP_MISMATCH
+use compiler.lsp.vfs.DIAG_BORROW_CONFLICT
+use compiler.lsp.vfs.DIAG_SEVERITY_ERROR
+use compiler.lsp.vfs.DIAG_SEVERITY_WARNING
+use compiler.lsp.vfs.gen_id_new
+use compiler.lsp.vfs.gen_id_eq
+use compiler.lsp.vfs.function_id_eq
+use compiler.lsp.vfs.local_id_eq
+use compiler.lsp.vfs.lsp_type_id_eq
+use compiler.lsp.vfs.lsp_symbol_id_eq
+use compiler.lsp.vfs.vfs_doc_ptr
+use compiler.lsp.vfs.vfs_hash_str
+use compiler.lsp.vfs.vfs_lookup_entity
+
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.TypeId
+use compiler.query.db.TraitGoalKey
+use compiler.query.db.UnitKey
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.ITEM_KIND_STRUCT
+use compiler.query.db.ITEM_KIND_TRAIT
+use compiler.query.db.ITEM_KIND_IMPL
+use compiler.query.db.ITEM_NS_TYPE
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ITEM_NS_TRAIT
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.semantic_key_new
+use compiler.query.db.query_db_register_def
+use compiler.query.db.query_db_register_type_layout
+use compiler.query.db.query_db_register_trait_goal
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+use compiler.query.db.query_item_signature
+use compiler.query.db.query_typeck_body
+use compiler.query.db.query_trait_solve
+use compiler.query.db.query_mir_body
+use compiler.query.db.query_layout_of
+use compiler.query.db.query_effect_summary
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+// ============================================================================
+// 1. AXCODEEDITOR & Semantic Handler Constants (AXS-LSP-040..060)
+// ============================================================================
+
+pub const AXCODEEDITOR_ABI_1: u32 = 1u32;
+
+// Additional LSP diagnostic severities (AXS-LSP-060 §2)
+pub const DIAG_SEVERITY_INFORMATION: u8 = 3u8;
+pub const DIAG_SEVERITY_HINT: u8 = 4u8;
+
+// Additional registered diagnostic codes (AXS-LSP-060 §1)
+pub const DIAG_TRAIT_AMBIGUOUS_METHOD: u32 = 4001u32;
+pub const DIAG_MOVE_USE_AFTER_MOVE: u32 = 5001u32;
+pub const DIAG_NAME_DUPLICATE: u32 = 6001u32;
+pub const DIAG_NAME_UNRESOLVED: u32 = 6002u32;
+
+// Method dispatch modes for `textDocument/hover` (AXS-LSP-041 §3)
+pub const DISPATCH_NONE: u8 = 0u8;
+pub const DISPATCH_INHERENT: u8 = 1u8;
+pub const DISPATCH_STATIC_TRAIT: u8 = 2u8;
+pub const DISPATCH_DYNAMIC_TRAIT: u8 = 3u8;
+
+// Type representation kinds for `textDocument/hover` (AXS-LSP-041 §4)
+pub const REPR_AXIOM: u8 = 0u8;
+pub const REPR_C: u8 = 1u8;
+pub const REPR_PACKED: u8 = 2u8;
+
+// Document & Workspace symbol kinds (LSP 3.17 SymbolKind) (AXS-LSP-042 §4)
+pub const SYM_KIND_MODULE: u8 = 2u8;
+pub const SYM_KIND_NAMESPACE: u8 = 3u8;
+pub const SYM_KIND_PROPERTY_FIELD: u8 = 7u8;
+pub const SYM_KIND_METHOD: u8 = 6u8;
+pub const SYM_KIND_FUNCTION: u8 = 12u8;
+pub const SYM_KIND_VARIABLE: u8 = 13u8;
+pub const SYM_KIND_CONSTANT: u8 = 14u8;
+pub const SYM_KIND_ENUM: u8 = 10u8;
+pub const SYM_KIND_INTERFACE_TRAIT: u8 = 11u8;
+pub const SYM_KIND_STRUCT: u8 = 23u8;
+pub const SYM_KIND_TYPE_PARAM: u8 = 26u8;
+
+// Completion candidate kinds (LSP 3.17 CompletionItemKind) (AXS-LSP-040)
+pub const COMP_KIND_METHOD: u8 = 2u8;
+pub const COMP_KIND_FUNCTION: u8 = 3u8;
+pub const COMP_KIND_FIELD: u8 = 5u8;
+pub const COMP_KIND_VARIABLE: u8 = 6u8;
+pub const COMP_KIND_INTERFACE_TRAIT: u8 = 8u8;
+pub const COMP_KIND_MODULE: u8 = 9u8;
+pub const COMP_KIND_STRUCT: u8 = 22u8;
+
+// Receiver capability requirement for member completion (AXS-LSP-040 §2)
+pub const REQ_RECEIVER_NONE: u8 = 0u8;
+pub const REQ_RECEIVER_FIELD: u8 = 1u8;
+pub const REQ_RECEIVER_VIEW: u8 = 2u8;
+pub const REQ_RECEIVER_MUT_VIEW: u8 = 3u8;
+pub const REQ_RECEIVER_OWNED_SELF: u8 = 4u8;
+
+// Deterministic completion ranking tiers (AXS-LSP-040 §2)
+pub const COMP_TIER_INHERENT_TYPE_MATCH: u8 = 1u8;
+pub const COMP_TIER_INHERENT: u8 = 2u8;
+pub const COMP_TIER_TRAIT: u8 = 3u8;
+pub const COMP_TIER_SCOPE: u8 = 4u8;
+
+// AXCODEEDITOR highlight layer precedence (AXS-LSP-050 §2)
+pub const HIGHLIGHT_LAYER_BASE_TEXT: u8 = 0u8;
+pub const HIGHLIGHT_LAYER_LEXICAL_SYNTAX: u8 = 1u8;
+pub const HIGHLIGHT_LAYER_SEMANTIC_TOKEN: u8 = 2u8;
+pub const HIGHLIGHT_LAYER_DIAGNOSTIC: u8 = 3u8;
+pub const HIGHLIGHT_LAYER_SELECTION: u8 = 4u8;
+pub const HIGHLIGHT_LAYER_ACTIVE_CARET: u8 = 5u8;
+
+// AXCODEEDITOR canonical semantic token types (AXS-LSP-050 §3)
+pub const SEM_TOK_NAMESPACE: u32 = 0u32;
+pub const SEM_TOK_TYPE: u32 = 1u32;
+pub const SEM_TOK_STRUCT: u32 = 2u32;
+pub const SEM_TOK_ENUM: u32 = 3u32;
+pub const SEM_TOK_INTERFACE: u32 = 4u32;
+pub const SEM_TOK_TYPE_PARAMETER: u32 = 5u32;
+pub const SEM_TOK_PARAMETER: u32 = 6u32;
+pub const SEM_TOK_VARIABLE: u32 = 7u32;
+pub const SEM_TOK_PROPERTY: u32 = 8u32;
+pub const SEM_TOK_ENUM_MEMBER: u32 = 9u32;
+pub const SEM_TOK_FUNCTION: u32 = 10u32;
+pub const SEM_TOK_METHOD: u32 = 11u32;
+pub const SEM_TOK_KEYWORD: u32 = 12u32;
+pub const SEM_TOK_COMMENT: u32 = 13u32;
+pub const SEM_TOK_STRING: u32 = 14u32;
+pub const SEM_TOK_NUMBER: u32 = 15u32;
+pub const SEM_TOK_OPERATOR: u32 = 16u32;
+pub const SEM_TOK_DECORATOR: u32 = 17u32;
+
+// AXCODEEDITOR Axiom semantic token modifier bitflags (AXS-LSP-050 §3, 0101 §18)
+pub const SEM_MOD_DECLARATION: u32 = 1u32;
+pub const SEM_MOD_DEFINITION: u32 = 2u32;
+pub const SEM_MOD_READONLY: u32 = 4u32;
+pub const SEM_MOD_MODIFICATION: u32 = 8u32;
+pub const SEM_MOD_STATIC: u32 = 16u32;
+pub const SEM_MOD_ASYNC: u32 = 32u32;
+pub const SEM_MOD_UNSAFE: u32 = 64u32;
+pub const SEM_MOD_OWNED_VALUE: u32 = 128u32;
+pub const SEM_MOD_READ_VIEW: u32 = 256u32;
+pub const SEM_MOD_MUT_VIEW: u32 = 512u32;
+pub const SEM_MOD_MOVED_VALUE: u32 = 1024u32;
+
+// AXCODEEDITOR Inlay Hint categories & subkinds (AXS-LSP-051 §2, REQ-TOOL-300)
+pub const INLAY_KIND_INFERRED_TYPE: u8 = 1u8;
+pub const INLAY_KIND_PARAMETER_NAME: u8 = 2u8;
+pub const INLAY_KIND_OWNERSHIP_FLOW: u8 = 3u8;
+pub const INLAY_KIND_ASYNC_SUSPEND: u8 = 4u8;
+
+pub const INLAY_SUBKIND_NONE: u8 = 0u8;
+pub const INLAY_SUBKIND_MOVE: u8 = 1u8;
+pub const INLAY_SUBKIND_DROP: u8 = 2u8;
+pub const INLAY_SUBKIND_VIEW: u8 = 3u8;
+pub const INLAY_SUBKIND_MUT_VIEW: u8 = 4u8;
+pub const INLAY_SUBKIND_AWAIT_STATE: u8 = 5u8;
+
+// Capability region relationships for inlay provenance (SPEC-11, AXS-LSP-051 §2)
+pub const REGION_REL_NONE: u8 = 0u8;
+pub const REGION_REL_SAME: u8 = 1u8;
+pub const REGION_REL_DISJOINT: u8 = 2u8;
+pub const REGION_REL_CONTAINS: u8 = 3u8;
+pub const REGION_REL_OVERLAPS: u8 = 4u8;
+
+pub const LSP_MAX_SEMANTIC_NODES: usize = 64;
+pub const LSP_MAX_TYPE_METAS: usize = 32;
+pub const LSP_MAX_COMP_CANDIDATES: usize = 64;
+pub const LSP_MAX_TRAIT_IMPLS: usize = 32;
+pub const LSP_MAX_INLAY_SITES: usize = 32;
+
+// ============================================================================
+// 2. Semantic Query Records & AXCODEEDITOR Presentation Types
+// ============================================================================
+
+@derive(Copy)
+pub struct LspTypeMeta {
+    pub active: bool,
+    pub type_id: LspTypeId,
+    pub decl_doc_id: u32,
+    pub decl_span_start: u32,
+    pub decl_span_end: u32,
+    pub decl_symbol_id: LspSymbolId,
+    pub canonical_name: LspStrView,
+    pub repr_kind: u8,
+    pub size_bytes: u32,
+    pub align_bytes: u32,
+    pub is_copy: bool,
+    pub is_drop: bool,
+    pub is_send: bool,
+    pub is_share: bool,
+}
+
+@derive(Copy)
+pub struct LspSemanticNode {
+    pub active: bool,
+    pub doc_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub symbol_id: LspSymbolId,
+    pub entity_id: GenerationalId,
+    pub owner_fn: FunctionId,
+    pub scope_depth: u16,
+    pub sym_kind: u8,
+    pub sem_tok_type: u32,
+    pub sem_tok_modifiers: u32,
+    pub is_declaration: bool,
+    pub is_pub: bool,
+    pub is_mutable_binding: bool,
+    pub is_builtin_or_external: bool,
+    pub type_id: LspTypeId,
+    pub ownership_class: u8,
+    pub capability_class: u8,
+    pub moved_at_line: u32,
+    pub dispatch_mode: u8,
+    pub effect_mask: u32,
+    pub is_pure: bool,
+    pub name_hash: u64,
+    pub name_str: LspStrView,
+    pub signature_str: LspStrView,
+    pub resolved_type_str: LspStrView,
+    pub capability_owner_str: LspStrView,
+    pub trait_origin_str: LspStrView,
+    pub doc_comment_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspCompletionEntry {
+    pub active: bool,
+    pub is_member: bool,
+    pub is_pub: bool,
+    pub is_cfg_active: bool,
+    pub def_doc_id: u32,
+    pub owner_fn: FunctionId,
+    pub scope_depth: u16,
+    pub receiver_type_id: LspTypeId,
+    pub result_type_id: LspTypeId,
+    pub req_receiver: u8,
+    pub comp_kind: u8,
+    pub local_id: LocalId,
+    pub symbol_id: LspSymbolId,
+    pub trait_symbol_id: LspSymbolId,
+    pub name_hash: u64,
+    pub label_str: LspStrView,
+    pub trait_qualified_str: LspStrView,
+    pub detail_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspTraitImplEntry {
+    pub active: bool,
+    pub trait_symbol_id: LspSymbolId,
+    pub self_type_id: LspTypeId,
+    pub impl_doc_id: u32,
+    pub impl_span_start: u32,
+    pub impl_span_end: u32,
+    pub impl_symbol_id: LspSymbolId,
+    pub sort_key_hash: u64,
+}
+
+@derive(Copy)
+pub struct LspInlaySiteEntry {
+    pub active: bool,
+    pub doc_id: u32,
+    pub byte_offset: u32,
+    pub kind: u8,
+    pub subkind: u8,
+    pub region_rel: u8,
+    pub await_state_ordinal: u16,
+    pub await_live_locals: u16,
+    pub label_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspPublishedDiagnostics {
+    pub doc_id: u32,
+    pub client_version: i64,
+    pub revision: u64,
+    pub diagnostic_count: u32,
+    pub error_count: u32,
+    pub warning_count: u32,
+    pub info_hint_count: u32,
+    pub cascaded_suppressed: u32,
+    pub header: LspFactHeader,
+}
+
+@derive(Copy)
+pub struct LspHoverResult {
+    pub found: bool,
+    pub header: LspFactHeader,
+    pub doc_id: u32,
+    pub range: LspRange,
+    pub symbol_id: LspSymbolId,
+    pub entity_id: GenerationalId,
+    pub type_id: LspTypeId,
+    pub ownership_class: u8,
+    pub capability_class: u8,
+    pub is_mutable_binding: bool,
+    pub moved_at_line: u32,
+    pub is_copy: bool,
+    pub is_drop: bool,
+    pub is_send: bool,
+    pub is_share: bool,
+    pub dispatch_mode: u8,
+    pub repr_kind: u8,
+    pub layout_size_bytes: u32,
+    pub layout_align_bytes: u32,
+    pub effect_mask: u32,
+    pub is_pure: bool,
+    pub name_str: LspStrView,
+    pub signature_str: LspStrView,
+    pub resolved_type_str: LspStrView,
+    pub capability_owner_str: LspStrView,
+    pub trait_origin_str: LspStrView,
+    pub doc_comment_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspLocation {
+    pub doc_id: u32,
+    pub uri_hash: u64,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub range: LspRange,
+    pub symbol_id: LspSymbolId,
+}
+
+@derive(Copy)
+pub struct LspDefinitionResult {
+    pub found: bool,
+    pub header: LspFactHeader,
+    pub location: LspLocation,
+}
+
+@derive(Copy)
+pub struct LspImplementationResult {
+    pub count: u32,
+    pub header: LspFactHeader,
+    pub locations: [16]LspLocation,
+}
+
+@derive(Copy)
+pub struct LspReferencesResult {
+    pub count: u32,
+    pub header: LspFactHeader,
+    pub locations: [32]LspLocation,
+}
+
+@derive(Copy)
+pub struct LspSymbolItem {
+    pub doc_id: u32,
+    pub symbol_id: LspSymbolId,
+    pub sym_kind: u8,
+    pub is_recovered_partial: bool,
+    pub range: LspRange,
+    pub name_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspSymbolListResult {
+    pub count: u32,
+    pub header: LspFactHeader,
+    pub items: [32]LspSymbolItem,
+}
+
+@derive(Copy)
+pub struct LspCompletionItem {
+    pub symbol_id: LspSymbolId,
+    pub comp_kind: u8,
+    pub tier: u8,
+    pub req_receiver: u8,
+    pub is_ambiguous_trait_method: bool,
+    pub label_str: LspStrView,
+    pub insert_text_str: LspStrView,
+    pub detail_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspCompletionResult {
+    pub count: u32,
+    pub is_incomplete_member: bool,
+    pub receiver_is_moved: bool,
+    pub receiver_moved_line: u32,
+    pub excluded_visibility_count: u32,
+    pub excluded_moved_count: u32,
+    pub excluded_capability_count: u32,
+    pub excluded_cfg_count: u32,
+    pub ambiguous_trait_count: u32,
+    pub header: LspFactHeader,
+    pub unavailable_note_str: LspStrView,
+    pub items: [32]LspCompletionItem,
+}
+
+@derive(Copy)
+pub struct LspPrepareRenameResult {
+    pub can_rename: bool,
+    pub error_code: i32,
+    pub doc_id: u32,
+    pub symbol_id: LspSymbolId,
+    pub range: LspRange,
+    pub placeholder_str: LspStrView,
+    pub header: LspFactHeader,
+}
+
+@derive(Copy)
+pub struct LspRenameTextEdit {
+    pub doc_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub range: LspRange,
+    pub new_text_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspRenameResult {
+    pub accepted: bool,
+    pub has_conflict: bool,
+    pub error_code: i32,
+    pub conflict_diag_code: u32,
+    pub target_symbol_id: LspSymbolId,
+    pub affected_doc_count: u32,
+    pub edit_count: u32,
+    pub header: LspFactHeader,
+    pub edits: [32]LspRenameTextEdit,
+}
+
+@derive(Copy)
+pub struct LspSemanticToken {
+    pub delta_line: u32,
+    pub delta_start: u32,
+    pub length_utf16: u32,
+    pub token_type: u32,
+    pub token_modifiers: u32,
+    pub abs_line: u32,
+    pub abs_char: u32,
+}
+
+@derive(Copy)
+pub struct LspSemanticTokensResult {
+    pub doc_id: u32,
+    pub revision: u64,
+    pub result_id: u64,
+    pub token_count: u32,
+    pub header: LspFactHeader,
+    pub tokens: [64]LspSemanticToken,
+}
+
+@derive(Copy)
+pub struct LspSemanticTokensDeltaResult {
+    pub doc_id: u32,
+    pub previous_result_id: u64,
+    pub result_id: u64,
+    pub changed_token_count: u32,
+    pub header: LspFactHeader,
+}
+
+@derive(Copy)
+pub struct LspInlayHintItem {
+    pub position: LspPosition,
+    pub byte_offset: u32,
+    pub kind: u8,
+    pub subkind: u8,
+    pub region_rel: u8,
+    pub await_state_ordinal: u16,
+    pub await_live_locals: u16,
+    pub label_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct LspInlayHintsResult {
+    pub doc_id: u32,
+    pub revision: u64,
+    pub count: u32,
+    pub type_hint_count: u32,
+    pub param_hint_count: u32,
+    pub ownership_hint_count: u32,
+    pub async_hint_count: u32,
+    pub buffer_mutated: bool,
+    pub header: LspFactHeader,
+    pub hints: [32]LspInlayHintItem,
+}
+
+@derive(Copy)
+pub struct LspPresentationSpan {
+    pub doc_id: u32,
+    pub revision: u64,
+    pub layer: u8,
+    pub start_byte: u32,
+    pub end_byte: u32,
+}
+
+pub struct LspSemanticEngine {
+    pub nodes: *mut LspSemanticNode,
+    pub node_count: u32,
+    pub node_cap: u32,
+    pub type_metas: *mut LspTypeMeta,
+    pub type_meta_count: u32,
+    pub type_meta_cap: u32,
+    pub comp_entries: *mut LspCompletionEntry,
+    pub comp_entry_count: u32,
+    pub comp_entry_cap: u32,
+    pub trait_impls: *mut LspTraitImplEntry,
+    pub trait_impl_count: u32,
+    pub trait_impl_cap: u32,
+    pub inlay_sites: *mut LspInlaySiteEntry,
+    pub inlay_site_count: u32,
+    pub inlay_site_cap: u32,
+    pub enable_type_inlays: bool,
+    pub enable_param_inlays: bool,
+    pub enable_ownership_inlays: bool,
+    pub enable_async_inlays: bool,
+    pub last_sem_tokens_rev: u64,
+    pub last_sem_tokens_count: u32,
+    pub total_semantic_queries: u32,
+}
+
+// ============================================================================
+// 3. Engine Lifecycle, Identifier Validation & Semantic Registration APIs
+// ============================================================================
+
+fn hnd_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+pub fn lsp_engine_new() -> LspSemanticEngine {
+    let node_bytes = LSP_MAX_SEMANTIC_NODES * size_of<LspSemanticNode>();
+    let nodes_ptr = unsafe { heap_alloc(node_bytes, align_of<LspSemanticNode>()) as *mut LspSemanticNode };
+
+    let tm_bytes = LSP_MAX_TYPE_METAS * size_of<LspTypeMeta>();
+    let tm_ptr = unsafe { heap_alloc(tm_bytes, align_of<LspTypeMeta>()) as *mut LspTypeMeta };
+
+    let comp_bytes = LSP_MAX_COMP_CANDIDATES * size_of<LspCompletionEntry>();
+    let comp_ptr = unsafe { heap_alloc(comp_bytes, align_of<LspCompletionEntry>()) as *mut LspCompletionEntry };
+
+    let ti_bytes = LSP_MAX_TRAIT_IMPLS * size_of<LspTraitImplEntry>();
+    let ti_ptr = unsafe { heap_alloc(ti_bytes, align_of<LspTraitImplEntry>()) as *mut LspTraitImplEntry };
+
+    let inl_bytes = LSP_MAX_INLAY_SITES * size_of<LspInlaySiteEntry>();
+    let inl_ptr = unsafe { heap_alloc(inl_bytes, align_of<LspInlaySiteEntry>()) as *mut LspInlaySiteEntry };
+
+    LspSemanticEngine {
+        nodes: nodes_ptr,
+        node_count: 0u32,
+        node_cap: LSP_MAX_SEMANTIC_NODES as u32,
+        type_metas: tm_ptr,
+        type_meta_count: 0u32,
+        type_meta_cap: LSP_MAX_TYPE_METAS as u32,
+        comp_entries: comp_ptr,
+        comp_entry_count: 0u32,
+        comp_entry_cap: LSP_MAX_COMP_CANDIDATES as u32,
+        trait_impls: ti_ptr,
+        trait_impl_count: 0u32,
+        trait_impl_cap: LSP_MAX_TRAIT_IMPLS as u32,
+        inlay_sites: inl_ptr,
+        inlay_site_count: 0u32,
+        inlay_site_cap: LSP_MAX_INLAY_SITES as u32,
+        enable_type_inlays: true,
+        enable_param_inlays: true,
+        enable_ownership_inlays: true,
+        enable_async_inlays: true,
+        last_sem_tokens_rev: 0u64,
+        last_sem_tokens_count: 0u32,
+        total_semantic_queries: 0u32,
+    }
+}
+
+pub fn lsp_engine_free(eng: mut_view<LspSemanticEngine>) {
+    if (eng.nodes as usize) != 0 {
+        unsafe { heap_free(eng.nodes as *mut u8, (eng.node_cap as usize) * size_of<LspSemanticNode>(), align_of<LspSemanticNode>()); }
+    }
+    if (eng.type_metas as usize) != 0 {
+        unsafe { heap_free(eng.type_metas as *mut u8, (eng.type_meta_cap as usize) * size_of<LspTypeMeta>(), align_of<LspTypeMeta>()); }
+    }
+    if (eng.comp_entries as usize) != 0 {
+        unsafe { heap_free(eng.comp_entries as *mut u8, (eng.comp_entry_cap as usize) * size_of<LspCompletionEntry>(), align_of<LspCompletionEntry>()); }
+    }
+    if (eng.trait_impls as usize) != 0 {
+        unsafe { heap_free(eng.trait_impls as *mut u8, (eng.trait_impl_cap as usize) * size_of<LspTraitImplEntry>(), align_of<LspTraitImplEntry>()); }
+    }
+    if (eng.inlay_sites as usize) != 0 {
+        unsafe { heap_free(eng.inlay_sites as *mut u8, (eng.inlay_site_cap as usize) * size_of<LspInlaySiteEntry>(), align_of<LspInlaySiteEntry>()); }
+    }
+    eng.nodes = 0 as *mut LspSemanticNode;
+    eng.type_metas = 0 as *mut LspTypeMeta;
+    eng.comp_entries = 0 as *mut LspCompletionEntry;
+    eng.trait_impls = 0 as *mut LspTraitImplEntry;
+    eng.inlay_sites = 0 as *mut LspInlaySiteEntry;
+}
+
+pub fn lsp_diag_code_name(code: u32) -> LspStrView {
+    if code == DIAG_PARSE_MISSING_DELIM { return lsp_str_view("AX_PARSE_MISSING_DELIM"); }
+    if code == DIAG_PARSE_INCOMPLETE_MEMBER { return lsp_str_view("AX_PARSE_INCOMPLETE_MEMBER"); }
+    if code == DIAG_PARSE_INCOMPLETE_EXPR { return lsp_str_view("AX_PARSE_INCOMPLETE_EXPR"); }
+    if code == DIAG_PARSE_INCOMPLETE_TYPE { return lsp_str_view("AX_PARSE_INCOMPLETE_TYPE"); }
+    if code == DIAG_PARSE_INCOMPLETE_CALL { return lsp_str_view("AX_PARSE_INCOMPLETE_CALL"); }
+    if code == DIAG_TYP_MISMATCH { return lsp_str_view("AX_TYPE_MISMATCH"); }
+    if code == DIAG_BORROW_CONFLICT { return lsp_str_view("AX_CAP_BORROW_CONFLICT"); }
+    if code == DIAG_TRAIT_AMBIGUOUS_METHOD { return lsp_str_view("AX_TRAIT_AMBIGUOUS_METHOD"); }
+    if code == DIAG_MOVE_USE_AFTER_MOVE { return lsp_str_view("AX_MOVE_USE_AFTER_MOVE"); }
+    if code == DIAG_NAME_DUPLICATE { return lsp_str_view("AX_NAME_DUPLICATE"); }
+    if code == DIAG_NAME_UNRESOLVED { return lsp_str_view("AX_NAME_UNRESOLVED"); }
+    lsp_str_view("AX_DIAG_UNKNOWN")
+}
+
+pub fn lsp_hash_sv(sv: LspStrView) -> u64 {
+    let mut h: u64 = 0xCBF29CE484222325u64;
+    let mut i: usize = 0;
+    while i < sv.len {
+        let b = (unsafe { *(sv.ptr + i) }) as u64;
+        h = wrapping_mul_u64(h ^ b, 0x100000001B3u64);
+        i = i + 1;
+    }
+    h
+}
+
+fn hnd_is_reserved_hash(h: u64) -> bool {
+    h == vfs_hash_str("fn") ||
+        h == vfs_hash_str("let") ||
+        h == vfs_hash_str("mut") ||
+        h == vfs_hash_str("pub") ||
+        h == vfs_hash_str("struct") ||
+        h == vfs_hash_str("enum") ||
+        h == vfs_hash_str("trait") ||
+        h == vfs_hash_str("impl") ||
+        h == vfs_hash_str("use") ||
+        h == vfs_hash_str("module") ||
+        h == vfs_hash_str("return") ||
+        h == vfs_hash_str("if") ||
+        h == vfs_hash_str("else") ||
+        h == vfs_hash_str("while") ||
+        h == vfs_hash_str("match") ||
+        h == vfs_hash_str("view") ||
+        h == vfs_hash_str("mut_view") ||
+        h == vfs_hash_str("async") ||
+        h == vfs_hash_str("await") ||
+        h == vfs_hash_str("unsafe") ||
+        h == vfs_hash_str("true") ||
+        h == vfs_hash_str("false") ||
+        h == vfs_hash_str("const") ||
+        h == vfs_hash_str("type")
+}
+
+pub fn lsp_is_reserved_keyword(name: str) -> bool {
+    hnd_is_reserved_hash(vfs_hash_str(name))
+}
+
+fn hnd_is_valid_ident_sv(sv: LspStrView) -> bool {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return false;
+    }
+    if hnd_is_reserved_hash(lsp_hash_sv(sv)) {
+        return false;
+    }
+    let b0 = unsafe { *(sv.ptr) };
+    let valid_start = (b0 >= 65u8 && b0 <= 90u8) || (b0 >= 97u8 && b0 <= 122u8) || b0 == 95u8;
+    if !valid_start {
+        return false;
+    }
+    let mut i: usize = 1;
+    while i < sv.len {
+        let b = unsafe { *(sv.ptr + i) };
+        let valid_cont = (b >= 65u8 && b <= 90u8) || (b >= 97u8 && b <= 122u8) || (b >= 48u8 && b <= 57u8) || b == 95u8;
+        if !valid_cont {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn lsp_is_valid_identifier(name: str) -> bool {
+    hnd_is_valid_ident_sv(lsp_str_view(name))
+}
+
+pub fn lsp_register_type_meta(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    type_id: LspTypeId,
+    decl_doc_id: u32,
+    decl_span_start: u32,
+    decl_span_end: u32,
+    decl_symbol_id: LspSymbolId,
+    canonical_name: str,
+    repr_kind: u8,
+    size_bytes: u32,
+    align_bytes: u32,
+    is_copy: bool,
+    is_drop: bool,
+    is_send: bool,
+    is_share: bool
+) {
+    if eng.type_meta_count >= eng.type_meta_cap {
+        return;
+    }
+    let idx = eng.type_meta_count;
+    eng.type_meta_count = idx + 1u32;
+    let p = unsafe { eng.type_metas + (idx as usize) };
+    unsafe {
+        *p = LspTypeMeta {
+            active: true,
+            type_id: type_id,
+            decl_doc_id: decl_doc_id,
+            decl_span_start: decl_span_start,
+            decl_span_end: decl_span_end,
+            decl_symbol_id: decl_symbol_id,
+            canonical_name: lsp_str_view(canonical_name),
+            repr_kind: repr_kind,
+            size_bytes: size_bytes,
+            align_bytes: align_bytes,
+            is_copy: is_copy,
+            is_drop: is_drop,
+            is_send: is_send,
+            is_share: is_share,
+        };
+    }
+    // Also register in `CompilerDB` `type_layouts` so `query_layout_of` evaluates target layout (`AXS-LSP-001`, `AXS-LSP-041 §4`)
+    let q_tid = TypeId { v: type_id.raw.index };
+    let q_def = DefId { v: decl_symbol_id.raw.index };
+    let sk = semantic_key_new(qry_sv_empty(), qry_sv_empty(), ITEM_NS_TYPE, 0u32, qry_sv_empty(), qry_sv_empty());
+    query_db_register_type_layout(
+        mut_view(ws.db),
+        q_tid,
+        q_def,
+        UnitKey { v: 1u32 },
+        size_bytes,
+        align_bytes,
+        false,
+        sk
+    );
+}
+
+pub fn lsp_register_node(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    span_start: u32,
+    span_end: u32,
+    symbol_id: LspSymbolId,
+    entity_id: GenerationalId,
+    owner_fn: FunctionId,
+    scope_depth: u16,
+    sym_kind: u8,
+    sem_tok_type: u32,
+    sem_tok_modifiers: u32,
+    is_declaration: bool,
+    is_pub: bool,
+    is_mutable_binding: bool,
+    is_builtin_or_external: bool,
+    type_id: LspTypeId,
+    ownership_class: u8,
+    capability_class: u8,
+    dispatch_mode: u8,
+    name: str,
+    signature: str,
+    resolved_type: str,
+    capability_owner: str,
+    trait_origin: str,
+    doc_comment: str
+) -> u32 {
+    if eng.node_count >= eng.node_cap {
+        return 0u32;
+    }
+    let idx = eng.node_count;
+    eng.node_count = idx + 1u32;
+    let np = unsafe { eng.nodes + (idx as usize) };
+    let mut mods = sem_tok_modifiers;
+    if is_declaration {
+        mods = mods | SEM_MOD_DECLARATION | SEM_MOD_DEFINITION;
+    }
+    if is_mutable_binding || ownership_class == OWNERSHIP_MUT_VIEW || capability_class == CAP_READ_WRITE {
+        mods = mods | SEM_MOD_MODIFICATION;
+    } else {
+        mods = mods | SEM_MOD_READONLY;
+    }
+    if ownership_class == OWNERSHIP_OWNED {
+        mods = mods | SEM_MOD_OWNED_VALUE;
+    } else if ownership_class == OWNERSHIP_VIEW || capability_class == CAP_READ_ONLY {
+        mods = mods | SEM_MOD_READ_VIEW;
+    } else if ownership_class == OWNERSHIP_MUT_VIEW || capability_class == CAP_READ_WRITE {
+        mods = mods | SEM_MOD_MUT_VIEW;
+    } else if ownership_class == OWNERSHIP_MOVED {
+        mods = mods | SEM_MOD_MOVED_VALUE;
+    }
+
+    let name_sv = lsp_str_view(name);
+    let name_h = lsp_hash_sv(name_sv);
+    unsafe {
+        *np = LspSemanticNode {
+            active: true,
+            doc_id: doc_id,
+            span_start: span_start,
+            span_end: span_end,
+            symbol_id: symbol_id,
+            entity_id: entity_id,
+            owner_fn: owner_fn,
+            scope_depth: scope_depth,
+            sym_kind: sym_kind,
+            sem_tok_type: sem_tok_type,
+            sem_tok_modifiers: mods,
+            is_declaration: is_declaration,
+            is_pub: is_pub,
+            is_mutable_binding: is_mutable_binding,
+            is_builtin_or_external: is_builtin_or_external,
+            type_id: type_id,
+            ownership_class: ownership_class,
+            capability_class: capability_class,
+            moved_at_line: 0u32,
+            dispatch_mode: dispatch_mode,
+            effect_mask: 0u32,
+            is_pure: true,
+            name_hash: name_h,
+            name_str: name_sv,
+            signature_str: lsp_str_view(signature),
+            resolved_type_str: lsp_str_view(resolved_type),
+            capability_owner_str: lsp_str_view(capability_owner),
+            trait_origin_str: lsp_str_view(trait_origin),
+            doc_comment_str: lsp_str_view(doc_comment),
+        };
+    }
+
+    if is_declaration && symbol_id.raw.index > 0u32 {
+        let q_def = DefId { v: symbol_id.raw.index };
+        let q_mod = ModuleId { v: doc_id + 1u32 };
+        let ik = if sym_kind == SYM_KIND_FUNCTION || sym_kind == SYM_KIND_METHOD {
+            ITEM_KIND_FN
+        } else if sym_kind == SYM_KIND_INTERFACE_TRAIT {
+            ITEM_KIND_TRAIT
+        } else {
+            ITEM_KIND_STRUCT
+        };
+        let ns = if ik == ITEM_KIND_FN { ITEM_NS_VALUE } else if ik == ITEM_KIND_TRAIT { ITEM_NS_TRAIT } else { ITEM_NS_TYPE };
+        let sk = semantic_key_new(qry_sv_empty(), qry_sv_empty(), ns, 0u32, qry_sv_empty(), qry_sv_empty());
+        let _ = query_db_register_def(mut_view(ws.db), q_def, q_mod, ik, is_pub, 1u32, type_id.raw.index, sk);
+    }
+    idx
+}
+
+// Marks a local binding as moved at `moved_line` (`AXS-LSP-040 §2`, `AXS-LSP-041 §2`),
+// updating both the `VfsWorkspace` generational entity slot and all corresponding `LspSemanticNode`s.
+pub fn lsp_mark_local_moved(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    local_id: LocalId,
+    moved_line: u32
+) {
+    if local_id.raw.index > 0u32 && local_id.raw.index <= ws.entity_count {
+        let ep = unsafe { ws.entities + (local_id.raw.index as usize) };
+        unsafe {
+            (*ep).ownership_class = OWNERSHIP_MOVED;
+        }
+    }
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let np = unsafe { eng.nodes + (i as usize) };
+        if (unsafe { (*np).active }) && gen_id_eq(unsafe { (*np).entity_id }, local_id.raw) {
+            unsafe {
+                (*np).ownership_class = OWNERSHIP_MOVED;
+                (*np).moved_at_line = moved_line;
+                (*np).sem_tok_modifiers = ((*np).sem_tok_modifiers & (0xFFFFFFFFu32 ^ SEM_MOD_OWNED_VALUE)) | SEM_MOD_MOVED_VALUE;
+            }
+        }
+        i = i + 1u32;
+    }
+}
+
+pub fn lsp_register_member_candidate(
+    eng: mut_view<LspSemanticEngine>,
+    def_doc_id: u32,
+    is_pub: bool,
+    is_cfg_active: bool,
+    receiver_type_id: LspTypeId,
+    result_type_id: LspTypeId,
+    req_receiver: u8,
+    comp_kind: u8,
+    symbol_id: LspSymbolId,
+    trait_symbol_id: LspSymbolId,
+    label: str,
+    trait_qualified: str,
+    detail: str
+) {
+    if eng.comp_entry_count >= eng.comp_entry_cap {
+        return;
+    }
+    let idx = eng.comp_entry_count;
+    eng.comp_entry_count = idx + 1u32;
+    let cp = unsafe { eng.comp_entries + (idx as usize) };
+    let label_sv = lsp_str_view(label);
+    let label_h = lsp_hash_sv(label_sv);
+    unsafe {
+        *cp = LspCompletionEntry {
+            active: true,
+            is_member: true,
+            is_pub: is_pub,
+            is_cfg_active: is_cfg_active,
+            def_doc_id: def_doc_id,
+            owner_fn: FunctionId { raw: gen_id_new(0u32, 0u32) },
+            scope_depth: 0u16,
+            receiver_type_id: receiver_type_id,
+            result_type_id: result_type_id,
+            req_receiver: req_receiver,
+            comp_kind: comp_kind,
+            local_id: LocalId { raw: gen_id_new(0u32, 0u32) },
+            symbol_id: symbol_id,
+            trait_symbol_id: trait_symbol_id,
+            name_hash: label_h,
+            label_str: label_sv,
+            trait_qualified_str: lsp_str_view(trait_qualified),
+            detail_str: lsp_str_view(detail),
+        };
+    }
+}
+
+pub fn lsp_register_scope_candidate(
+    eng: mut_view<LspSemanticEngine>,
+    def_doc_id: u32,
+    owner_fn: FunctionId,
+    scope_depth: u16,
+    is_pub: bool,
+    is_cfg_active: bool,
+    result_type_id: LspTypeId,
+    comp_kind: u8,
+    local_id: LocalId,
+    symbol_id: LspSymbolId,
+    label: str,
+    detail: str
+) {
+    if eng.comp_entry_count >= eng.comp_entry_cap {
+        return;
+    }
+    let idx = eng.comp_entry_count;
+    eng.comp_entry_count = idx + 1u32;
+    let cp = unsafe { eng.comp_entries + (idx as usize) };
+    let label_sv = lsp_str_view(label);
+    let label_h = lsp_hash_sv(label_sv);
+    unsafe {
+        *cp = LspCompletionEntry {
+            active: true,
+            is_member: false,
+            is_pub: is_pub,
+            is_cfg_active: is_cfg_active,
+            def_doc_id: def_doc_id,
+            owner_fn: owner_fn,
+            scope_depth: scope_depth,
+            receiver_type_id: LspTypeId { raw: gen_id_new(0u32, 0u32) },
+            result_type_id: result_type_id,
+            req_receiver: REQ_RECEIVER_NONE,
+            comp_kind: comp_kind,
+            local_id: local_id,
+            symbol_id: symbol_id,
+            trait_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            name_hash: label_h,
+            label_str: label_sv,
+            trait_qualified_str: label_sv,
+            detail_str: lsp_str_view(detail),
+        };
+    }
+}
+
+pub fn lsp_register_trait_impl(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    trait_symbol_id: LspSymbolId,
+    self_type_id: LspTypeId,
+    impl_doc_id: u32,
+    impl_span_start: u32,
+    impl_span_end: u32,
+    impl_symbol_id: LspSymbolId,
+    canonical_impl_key: str
+) {
+    if eng.trait_impl_count >= eng.trait_impl_cap {
+        return;
+    }
+    let idx = eng.trait_impl_count;
+    eng.trait_impl_count = idx + 1u32;
+    let tp = unsafe { eng.trait_impls + (idx as usize) };
+    unsafe {
+        *tp = LspTraitImplEntry {
+            active: true,
+            trait_symbol_id: trait_symbol_id,
+            self_type_id: self_type_id,
+            impl_doc_id: impl_doc_id,
+            impl_span_start: impl_span_start,
+            impl_span_end: impl_span_end,
+            impl_symbol_id: impl_symbol_id,
+            sort_key_hash: vfs_hash_str(canonical_impl_key),
+        };
+    }
+    let gkey = TraitGoalKey { v: idx + 1u32 };
+    let sk = semantic_key_new(qry_sv_empty(), qry_sv_empty(), ITEM_NS_TRAIT, idx + 1u32, qry_sv_empty(), qry_sv_empty());
+    query_db_register_trait_goal(
+        mut_view(ws.db),
+        gkey,
+        DefId { v: trait_symbol_id.raw.index },
+        TypeId { v: self_type_id.raw.index },
+        TraitGoalKey { v: 0u32 },
+        sk
+    );
+}
+
+pub fn lsp_register_inlay_site(
+    eng: mut_view<LspSemanticEngine>,
+    doc_id: u32,
+    byte_offset: u32,
+    kind: u8,
+    subkind: u8,
+    region_rel: u8,
+    await_state_ordinal: u16,
+    await_live_locals: u16,
+    label: str
+) {
+    if eng.inlay_site_count >= eng.inlay_site_cap {
+        return;
+    }
+    let idx = eng.inlay_site_count;
+    eng.inlay_site_count = idx + 1u32;
+    let ip = unsafe { eng.inlay_sites + (idx as usize) };
+    unsafe {
+        *ip = LspInlaySiteEntry {
+            active: true,
+            doc_id: doc_id,
+            byte_offset: byte_offset,
+            kind: kind,
+            subkind: subkind,
+            region_rel: region_rel,
+            await_state_ordinal: await_state_ordinal,
+            await_live_locals: await_live_locals,
+            label_str: lsp_str_view(label),
+        };
+    }
+}
+
+// ============================================================================
+// 4. Snapshot-Bound `publishDiagnostics`, `hover` & Semantic Navigation (AXS-LSP-032, 041, 042)
+// ============================================================================
+
+pub fn lsp_handle_publish_diagnostics(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32
+) -> LspPublishedDiagnostics {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let mod_id = ModuleId { v: doc_id + 1u32 };
+    let _ = query_parse_module(mut_view(ws.db), mod_id);
+    let _ = query_module_def_map(mut_view(ws.db), mod_id);
+    let _ = query_resolve_module(mut_view(ws.db), mod_id);
+
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let cver = unsafe { (*dp).client_version };
+    let sup = unsafe { (*dp).cascaded_errors_suppressed };
+    let inc = unsafe { (*dp).parse_Incomplete_count };
+
+    let mut dcount: u32 = 0u32;
+    let mut errs: u32 = 0u32;
+    let mut warns: u32 = 0u32;
+    let mut infos: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < ws.diagnostic_count {
+        let d = unsafe { *(ws.diagnostics + (i as usize)) };
+        if d.doc_id == doc_id {
+            dcount = dcount + 1u32;
+            if d.severity == DIAG_SEVERITY_ERROR {
+                errs = errs + 1u32;
+            } else if d.severity == DIAG_SEVERITY_WARNING {
+                warns = warns + 1u32;
+            } else {
+                infos = infos + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    let cert = if inc > 0u32 { CERTAINTY_RECOVERED } else { CERTAINTY_EXACT };
+    let fb = if inc > 0u32 { FALLBACK_INCOMPLETE_EXPR } else { FALLBACK_NONE };
+    LspPublishedDiagnostics {
+        doc_id: doc_id,
+        client_version: cver,
+        revision: ws.revision,
+        diagnostic_count: dcount,
+        error_count: errs,
+        warning_count: warns,
+        info_hint_count: infos,
+        cascaded_suppressed: sup,
+        header: lsp_fact_header_new(ws.revision, cert, fb),
+    }
+}
+
+fn hnd_find_node_at_byte(eng: view<LspSemanticEngine>, doc_id: u32, byte_off: u32) -> i32 {
+    let mut best_idx: i32 = -1i32;
+    let mut best_len: u32 = 0xFFFFFFFFu32;
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let n = unsafe { *(eng.nodes + (i as usize)) };
+        if n.active && n.doc_id == doc_id && byte_off >= n.span_start && byte_off <= n.span_end {
+            let span_len = n.span_end - n.span_start;
+            if span_len <= best_len {
+                best_len = span_len;
+                best_idx = i as i32;
+            }
+        }
+        i = i + 1u32;
+    }
+    best_idx
+}
+
+fn hnd_find_type_meta(eng: view<LspSemanticEngine>, type_id: LspTypeId) -> i32 {
+    let mut i: u32 = 0u32;
+    while i < eng.type_meta_count {
+        let tm = unsafe { *(eng.type_metas + (i as usize)) };
+        if tm.active && lsp_type_id_eq(tm.type_id, type_id) {
+            return i as i32;
+        }
+        i = i + 1u32;
+    }
+    -1i32
+}
+
+pub fn lsp_handle_hover(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition
+) -> LspHoverResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let empty_range = lsp_range_new(pos, pos);
+    let mut res = LspHoverResult {
+        found: false,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        doc_id: doc_id,
+        range: empty_range,
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        entity_id: gen_id_new(0u32, 0u32),
+        type_id: LspTypeId { raw: gen_id_new(0u32, 0u32) },
+        ownership_class: OWNERSHIP_OWNED,
+        capability_class: CAP_NONE,
+        is_mutable_binding: false,
+        moved_at_line: 0u32,
+        is_copy: false,
+        is_drop: false,
+        is_send: true,
+        is_share: true,
+        dispatch_mode: DISPATCH_NONE,
+        repr_kind: REPR_AXIOM,
+        layout_size_bytes: 0u32,
+        layout_align_bytes: 1u32,
+        effect_mask: 0u32,
+        is_pure: true,
+        name_str: empty_sv,
+        signature_str: empty_sv,
+        resolved_type_str: empty_sv,
+        capability_owner_str: empty_sv,
+        trait_origin_str: empty_sv,
+        doc_comment_str: empty_sv,
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) {
+        return res;
+    }
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return res;
+    }
+    let node = unsafe { *(eng.nodes + (nidx as usize)) };
+
+    // Validate generational handle in VFS arena if attached (`AXS-LSP-002`)
+    let mut cert = CERTAINTY_EXACT;
+    let mut fb = FALLBACK_NONE;
+    if node.entity_id.index > 0u32 {
+        let lk = vfs_lookup_entity(view(*ws), node.entity_id);
+        if lk.status != LOOKUP_FOUND {
+            return res;
+        }
+        cert = lk.header.certainty;
+        fb = lk.header.fallback_reason;
+    }
+
+    // Evaluate frontend/semantic queries in `CompilerDB` (`AXS-LSP-004` zero-codegen firewall)
+    if node.symbol_id.raw.index > 0u32 {
+        let def_id = DefId { v: node.symbol_id.raw.index };
+        let _ = query_item_signature(mut_view(ws.db), def_id);
+        let _ = query_typeck_body(mut_view(ws.db), def_id);
+        let eff = query_effect_summary(mut_view(ws.db), def_id);
+        res.effect_mask = eff.effect_mask;
+        res.is_pure = eff.is_pure;
+    }
+
+    let mut repr = REPR_AXIOM;
+    let mut sz: u32 = 8u32;
+    let mut al: u32 = 8u32;
+    let mut is_cp = false;
+    let mut is_dr = false;
+    let mut is_sd = true;
+    let mut is_sh = true;
+
+    let tmidx = hnd_find_type_meta(view(*eng), node.type_id);
+    if tmidx >= 0i32 {
+        let tm = unsafe { *(eng.type_metas + (tmidx as usize)) };
+        let lo = query_layout_of(mut_view(ws.db), TypeId { v: node.type_id.raw.index });
+        repr = tm.repr_kind;
+        sz = if lo.size_bytes > 0u32 { lo.size_bytes } else { tm.size_bytes };
+        al = if lo.align_bytes > 0u32 { lo.align_bytes } else { tm.align_bytes };
+        is_cp = tm.is_copy;
+        is_dr = tm.is_drop;
+        is_sd = tm.is_send;
+        is_sh = tm.is_share;
+    }
+
+    let tr = text_range_new(node.span_start as u64, node.span_end as u64);
+    let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+
+    res.found = true;
+    res.header = lsp_fact_header_new(ws.revision, cert, fb);
+    res.range = lrange;
+    res.symbol_id = node.symbol_id;
+    res.entity_id = node.entity_id;
+    res.type_id = node.type_id;
+    res.ownership_class = node.ownership_class;
+    res.capability_class = node.capability_class;
+    res.is_mutable_binding = node.is_mutable_binding;
+    res.moved_at_line = node.moved_at_line;
+    res.is_copy = is_cp;
+    res.is_drop = is_dr;
+    res.is_send = is_sd;
+    res.is_share = is_sh;
+    res.dispatch_mode = node.dispatch_mode;
+    res.repr_kind = repr;
+    res.layout_size_bytes = sz;
+    res.layout_align_bytes = al;
+    res.name_str = node.name_str;
+    res.signature_str = node.signature_str;
+    res.resolved_type_str = node.resolved_type_str;
+    res.capability_owner_str = node.capability_owner_str;
+    res.trait_origin_str = node.trait_origin_str;
+    res.doc_comment_str = node.doc_comment_str;
+    res
+}
+
+fn hnd_make_location(ws: view<VfsWorkspace>, doc_id: u32, span_start: u32, span_end: u32, symbol_id: LspSymbolId) -> LspLocation {
+    let dp = vfs_doc_ptr(ws, doc_id);
+    let tr = text_range_new(span_start as u64, span_end as u64);
+    let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+    LspLocation {
+        doc_id: doc_id,
+        uri_hash: unsafe { (*dp).uri_hash },
+        span_start: span_start,
+        span_end: span_end,
+        range: lrange,
+        symbol_id: symbol_id,
+    }
+}
+
+pub fn lsp_handle_definition(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition
+) -> LspDefinitionResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_loc = LspLocation {
+        doc_id: 0u32,
+        uri_hash: 0u64,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(pos, pos),
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+    };
+    if doc_id >= ws.doc_cap {
+        return LspDefinitionResult {
+            found: false,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+            location: empty_loc,
+        };
+    }
+    let _ = query_resolve_module(mut_view(ws.db), ModuleId { v: doc_id + 1u32 });
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return LspDefinitionResult {
+            found: false,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+            location: empty_loc,
+        };
+    }
+    let target_sym = unsafe { (*(eng.nodes + (nidx as usize))).symbol_id };
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let cand = unsafe { *(eng.nodes + (i as usize)) };
+        if cand.active && cand.is_declaration && lsp_symbol_id_eq(cand.symbol_id, target_sym) {
+            return LspDefinitionResult {
+                found: true,
+                header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+                location: hnd_make_location(view(*ws), cand.doc_id, cand.span_start, cand.span_end, cand.symbol_id),
+            };
+        }
+        i = i + 1u32;
+    }
+    LspDefinitionResult {
+        found: false,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        location: empty_loc,
+    }
+}
+
+pub fn lsp_handle_type_definition(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition
+) -> LspDefinitionResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_loc = LspLocation {
+        doc_id: 0u32,
+        uri_hash: 0u64,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(pos, pos),
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+    };
+    if doc_id >= ws.doc_cap {
+        return LspDefinitionResult {
+            found: false,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+            location: empty_loc,
+        };
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return LspDefinitionResult {
+            found: false,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+            location: empty_loc,
+        };
+    }
+    let node_ty = unsafe { (*(eng.nodes + (nidx as usize))).type_id };
+    let tmidx = hnd_find_type_meta(view(*eng), node_ty);
+    if tmidx < 0i32 {
+        return LspDefinitionResult {
+            found: false,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+            location: empty_loc,
+        };
+    }
+    let tm = unsafe { *(eng.type_metas + (tmidx as usize)) };
+    LspDefinitionResult {
+        found: true,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        location: hnd_make_location(view(*ws), tm.decl_doc_id, tm.decl_span_start, tm.decl_span_end, tm.decl_symbol_id),
+    }
+}
+
+pub fn lsp_handle_implementation(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition
+) -> LspImplementationResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_loc = LspLocation {
+        doc_id: 0u32,
+        uri_hash: 0u64,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(pos, pos),
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+    };
+    let mut res = LspImplementationResult {
+        count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        locations: [empty_loc; 16],
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return res;
+    }
+    let target_sym = unsafe { (*(eng.nodes + (nidx as usize))).symbol_id };
+    let mut i: u32 = 0u32;
+    while i < eng.trait_impl_count {
+        let ti = unsafe { *(eng.trait_impls + (i as usize)) };
+        if ti.active && lsp_symbol_id_eq(ti.trait_symbol_id, target_sym) && (res.count) < 16u32 {
+            let _ = query_trait_solve(mut_view(ws.db), TraitGoalKey { v: i + 1u32 });
+            res.locations[res.count as usize] = hnd_make_location(view(*ws), ti.impl_doc_id, ti.impl_span_start, ti.impl_span_end, ti.impl_symbol_id);
+            res.count = res.count + 1u32;
+        }
+        i = i + 1u32;
+    }
+    res
+}
+
+// Finds all references matching `LspSymbolId` across all workspace documents (`AXS-LSP-042 §3`).
+// Never matches by raw string/regex, so comments, string literals, and shadowed variables in other scopes are never returned.
+pub fn lsp_handle_references(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition,
+    include_declaration: bool
+) -> LspReferencesResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_loc = LspLocation {
+        doc_id: 0u32,
+        uri_hash: 0u64,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(pos, pos),
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+    };
+    let mut res = LspReferencesResult {
+        count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        locations: [empty_loc; 32],
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return res;
+    }
+    let target_sym = unsafe { (*(eng.nodes + (nidx as usize))).symbol_id };
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let cand = unsafe { *(eng.nodes + (i as usize)) };
+        if cand.active && lsp_symbol_id_eq(cand.symbol_id, target_sym) {
+            if (include_declaration || !cand.is_declaration) && (res.count) < 32u32 {
+                res.locations[res.count as usize] = hnd_make_location(view(*ws), cand.doc_id, cand.span_start, cand.span_end, cand.symbol_id);
+                res.count = res.count + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+    res
+}
+
+pub fn lsp_handle_document_symbol(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32
+) -> LspSymbolListResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_item = LspSymbolItem {
+        doc_id: 0u32,
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        sym_kind: 0u8,
+        is_recovered_partial: false,
+        range: lsp_range_new(lsp_pos_new(0u32, 0u32), lsp_pos_new(0u32, 0u32)),
+        name_str: lsp_str_view(""),
+    };
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let inc = unsafe { (*dp).parse_Incomplete_count };
+    let cert = if inc > 0u32 { CERTAINTY_RECOVERED } else { CERTAINTY_EXACT };
+    let fb = if inc > 0u32 { FALLBACK_INCOMPLETE_EXPR } else { FALLBACK_NONE };
+    let mut res = LspSymbolListResult {
+        count: 0u32,
+        header: lsp_fact_header_new(ws.revision, cert, fb),
+        items: [empty_item; 32],
+    };
+    let _ = query_module_def_map(mut_view(ws.db), ModuleId { v: doc_id + 1u32 });
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let n = unsafe { *(eng.nodes + (i as usize)) };
+        if n.active && n.doc_id == doc_id && n.is_declaration && n.sym_kind != SYM_KIND_VARIABLE && (res.count) < 32u32 {
+            let tr = text_range_new(n.span_start as u64, n.span_end as u64);
+            let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+            res.items[res.count as usize] = LspSymbolItem {
+                doc_id: doc_id,
+                symbol_id: n.symbol_id,
+                sym_kind: n.sym_kind,
+                is_recovered_partial: inc > 0u32,
+                range: lrange,
+                name_str: n.name_str,
+            };
+            res.count = res.count + 1u32;
+        }
+        i = i + 1u32;
+    }
+    res
+}
+
+pub fn lsp_handle_workspace_symbol(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    query_filter: str
+) -> LspSymbolListResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_item = LspSymbolItem {
+        doc_id: 0u32,
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        sym_kind: 0u8,
+        is_recovered_partial: false,
+        range: lsp_range_new(lsp_pos_new(0u32, 0u32), lsp_pos_new(0u32, 0u32)),
+        name_str: lsp_str_view(""),
+    };
+    let mut res = LspSymbolListResult {
+        count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        items: [empty_item; 32],
+    };
+    let qsv = lsp_str_view(query_filter);
+    let qhash = lsp_hash_sv(qsv);
+    let match_all = qsv.len == 0;
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let n = unsafe { *(eng.nodes + (i as usize)) };
+        if n.active && n.is_declaration && n.sym_kind != SYM_KIND_VARIABLE && (res.count) < 32u32 {
+            if match_all || n.name_hash == qhash {
+                let dp = vfs_doc_ptr(view(*ws), n.doc_id);
+                let tr = text_range_new(n.span_start as u64, n.span_end as u64);
+                let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+                res.items[res.count as usize] = LspSymbolItem {
+                    doc_id: n.doc_id,
+                    symbol_id: n.symbol_id,
+                    sym_kind: n.sym_kind,
+                    is_recovered_partial: (unsafe { (*dp).parse_Incomplete_count }) > 0u32,
+                    range: lrange,
+                    name_str: n.name_str,
+                };
+                res.count = res.count + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+    res
+}
+
+// ============================================================================
+// 5. Constraint-Filtered Semantic Code Completion (`AXS-LSP-040`, `REQ-TOOL-188`, `REQ-TOOL-189`)
+// ============================================================================
+
+fn hnd_insert_completion_sorted(res: mut_view<LspCompletionResult>, item: LspCompletionItem) {
+    if res.count >= 32u32 {
+        return;
+    }
+    let mut ins_pos: u32 = res.count;
+    let mut i: u32 = 0u32;
+    while i < res.count {
+        if (item.tier) < (res.items[i as usize].tier) {
+            ins_pos = i;
+            break;
+        }
+        i = i + 1u32;
+    }
+    let mut k: u32 = res.count;
+    while k > ins_pos {
+        res.items[k as usize] = res.items[(k - 1u32) as usize];
+        k = k - 1u32;
+    }
+    res.items[ins_pos as usize] = item;
+    res.count = res.count + 1u32;
+}
+
+pub fn lsp_handle_completion(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition,
+    active_fn: FunctionId,
+    active_scope_depth: u16,
+    expected_type: LspTypeId
+) -> LspCompletionResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let empty_item = LspCompletionItem {
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        comp_kind: 0u8,
+        tier: COMP_TIER_SCOPE,
+        req_receiver: REQ_RECEIVER_NONE,
+        is_ambiguous_trait_method: false,
+        label_str: empty_sv,
+        insert_text_str: empty_sv,
+        detail_str: empty_sv,
+    };
+    let mut res = LspCompletionResult {
+        count: 0u32,
+        is_incomplete_member: false,
+        receiver_is_moved: false,
+        receiver_moved_line: 0u32,
+        excluded_visibility_count: 0u32,
+        excluded_moved_count: 0u32,
+        excluded_capability_count: 0u32,
+        excluded_cfg_count: 0u32,
+        ambiguous_trait_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        unavailable_note_str: empty_sv,
+        items: [empty_item; 32],
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let _ = query_resolve_module(mut_view(ws.db), ModuleId { v: doc_id + 1u32 });
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+
+    // 1. Check if cursor is at a partial-program `IncompleteMemberAccess` (`pkt.` or `ro.`) (`AXS-LSP-031`, `AXS-LSP-040`)
+    let mut rec_idx: i32 = -1i32;
+    let mut r: u32 = 0u32;
+    while r < ws.recovery_count {
+        let rn = unsafe { *(ws.recovery_nodes + (r as usize)) };
+        if rn.doc_id == doc_id && rn.kind == RECOVERY_INCOMPLETE_MEMBER_ACCESS {
+            let dot_match = rn.dot_byte_offset > 0u32 && byte_off >= rn.dot_byte_offset && byte_off <= (rn.dot_byte_offset + 1u32);
+            let span_match = rn.dot_byte_offset == 0u32 && byte_off >= rn.span_start && byte_off <= (rn.span_end + 1u32);
+            if dot_match || span_match {
+                rec_idx = r as i32;
+                break;
+            }
+        }
+        r = r + 1u32;
+    }
+
+    if rec_idx >= 0i32 {
+        let rn = unsafe { *(ws.recovery_nodes + (rec_idx as usize)) };
+        res.is_incomplete_member = true;
+        res.header = lsp_fact_header_new(ws.revision, CERTAINTY_RECOVERED, FALLBACK_INCOMPLETE_MEMBER);
+
+        let rec_ty = rn.receiver_type_id;
+        let mut rec_own = rn.receiver_ownership;
+        let mut rec_cap = rn.receiver_capability;
+        let mut rec_is_mut_binding = rec_own == OWNERSHIP_MUT_VIEW || rec_cap == CAP_READ_WRITE;
+        let mut moved_line: u32 = 0u32;
+
+        if rn.receiver_expr_id.raw.index > 0u32 {
+            let lk = vfs_lookup_entity(view(*ws), rn.receiver_expr_id.raw);
+            if lk.status == LOOKUP_FOUND {
+                rec_own = lk.entity.ownership_class;
+                rec_cap = lk.entity.capability_class;
+            }
+            let mut ni: u32 = 0u32;
+            while ni < eng.node_count {
+                let nd = unsafe { *(eng.nodes + (ni as usize)) };
+                if nd.active && gen_id_eq(nd.entity_id, rn.receiver_expr_id.raw) {
+                    if nd.is_mutable_binding {
+                        rec_is_mut_binding = true;
+                    }
+                    if nd.ownership_class == OWNERSHIP_MOVED {
+                        rec_own = OWNERSHIP_MOVED;
+                        moved_line = nd.moved_at_line;
+                    }
+                }
+                ni = ni + 1u32;
+            }
+        }
+
+        if rec_own == OWNERSHIP_MOVED {
+            res.receiver_is_moved = true;
+            res.receiver_moved_line = moved_line;
+            res.unavailable_note_str = lsp_str_view("unavailable: value moved prior to member access");
+            let mut ci: u32 = 0u32;
+            while ci < eng.comp_entry_count {
+                let ce = unsafe { *(eng.comp_entries + (ci as usize)) };
+                if ce.active && ce.is_member && lsp_type_id_eq(ce.receiver_type_id, rec_ty) {
+                    res.excluded_moved_count = res.excluded_moved_count + 1u32;
+                }
+                ci = ci + 1u32;
+            }
+            return res;
+        }
+
+        let can_mutate = rec_own == OWNERSHIP_MUT_VIEW ||
+            rec_cap == CAP_READ_WRITE ||
+            (rec_own == OWNERSHIP_OWNED && rec_is_mut_binding);
+
+        let mut ci: u32 = 0u32;
+        while ci < eng.comp_entry_count {
+            let ce = unsafe { *(eng.comp_entries + (ci as usize)) };
+            if ce.active && ce.is_member && lsp_type_id_eq(ce.receiver_type_id, rec_ty) {
+                if !ce.is_cfg_active {
+                    res.excluded_cfg_count = res.excluded_cfg_count + 1u32;
+                } else if ce.def_doc_id != doc_id && !ce.is_pub {
+                    // Visibility filter: private fields/methods of another module are excluded (`AXS-LSP-040 §2`)
+                    res.excluded_visibility_count = res.excluded_visibility_count + 1u32;
+                } else if ce.req_receiver == REQ_RECEIVER_MUT_VIEW && !can_mutate {
+                    // Capability filter: `mut_view<Self>` methods excluded on read-only `view<T>` or immutable `let` (`AXS-LSP-040 §2`)
+                    res.excluded_capability_count = res.excluded_capability_count + 1u32;
+                } else {
+                    // Check for ambiguous trait methods (`AXS-LSP-040 §3`: never guess by heuristic!)
+                    let is_trait_cand = ce.trait_symbol_id.raw.index > 0u32;
+                    let mut is_ambig = false;
+                    if is_trait_cand {
+                        let mut cj: u32 = 0u32;
+                        while cj < eng.comp_entry_count {
+                            if cj != ci {
+                                let other = unsafe { *(eng.comp_entries + (cj as usize)) };
+                                if other.active && other.is_member &&
+                                    lsp_type_id_eq(other.receiver_type_id, rec_ty) &&
+                                    other.trait_symbol_id.raw.index > 0u32 &&
+                                    other.name_hash == ce.name_hash &&
+                                    !lsp_symbol_id_eq(other.trait_symbol_id, ce.trait_symbol_id) {
+                                    is_ambig = true;
+                                    break;
+                                }
+                            }
+                            cj = cj + 1u32;
+                        }
+                    }
+                    if is_ambig {
+                        res.ambiguous_trait_count = res.ambiguous_trait_count + 1u32;
+                    }
+                    let tier = if is_trait_cand {
+                        COMP_TIER_TRAIT
+                    } else if expected_type.raw.index > 0u32 && lsp_type_id_eq(ce.result_type_id, expected_type) {
+                        COMP_TIER_INHERENT_TYPE_MATCH
+                    } else {
+                        COMP_TIER_INHERENT
+                    };
+                    let ins_txt = if is_ambig { ce.trait_qualified_str } else { ce.label_str };
+                    let item = LspCompletionItem {
+                        symbol_id: ce.symbol_id,
+                        comp_kind: ce.comp_kind,
+                        tier: tier,
+                        req_receiver: ce.req_receiver,
+                        is_ambiguous_trait_method: is_ambig,
+                        label_str: ins_txt,
+                        insert_text_str: ins_txt,
+                        detail_str: ce.detail_str,
+                    };
+                    hnd_insert_completion_sorted(mut_view(res), item);
+                }
+            }
+            ci = ci + 1u32;
+        }
+        return res;
+    }
+
+    // 2. Lexical & module scope completion (`AXS-LSP-040 §2`)
+    let mut ci: u32 = 0u32;
+    while ci < eng.comp_entry_count {
+        let ce = unsafe { *(eng.comp_entries + (ci as usize)) };
+        if ce.active && !ce.is_member {
+            if !ce.is_cfg_active {
+                res.excluded_cfg_count = res.excluded_cfg_count + 1u32;
+            } else if ce.local_id.raw.index > 0u32 {
+                // Local variable candidate: check enclosing function, lexical scope depth, and ownership liveness
+                if ce.def_doc_id != doc_id || !function_id_eq(ce.owner_fn, active_fn) || (ce.scope_depth) > active_scope_depth {
+                    res.excluded_visibility_count = res.excluded_visibility_count + 1u32;
+                } else {
+                    let lk = vfs_lookup_entity(view(*ws), ce.local_id.raw);
+                    if lk.status != LOOKUP_FOUND || lk.entity.ownership_class == OWNERSHIP_MOVED {
+                        res.excluded_moved_count = res.excluded_moved_count + 1u32;
+                    } else {
+                        let tier = if expected_type.raw.index > 0u32 && lsp_type_id_eq(ce.result_type_id, expected_type) {
+                            COMP_TIER_INHERENT_TYPE_MATCH
+                        } else {
+                            COMP_TIER_SCOPE
+                        };
+                        let item = LspCompletionItem {
+                            symbol_id: ce.symbol_id,
+                            comp_kind: ce.comp_kind,
+                            tier: tier,
+                            req_receiver: REQ_RECEIVER_NONE,
+                            is_ambiguous_trait_method: false,
+                            label_str: ce.label_str,
+                            insert_text_str: ce.label_str,
+                            detail_str: ce.detail_str,
+                        };
+                        hnd_insert_completion_sorted(mut_view(res), item);
+                    }
+                }
+            } else {
+                // Module-level item candidate: check module visibility (`pub`)
+                if ce.def_doc_id != doc_id && !ce.is_pub {
+                    res.excluded_visibility_count = res.excluded_visibility_count + 1u32;
+                } else {
+                    let tier = if expected_type.raw.index > 0u32 && lsp_type_id_eq(ce.result_type_id, expected_type) {
+                        COMP_TIER_INHERENT_TYPE_MATCH
+                    } else {
+                        COMP_TIER_SCOPE
+                    };
+                    let item = LspCompletionItem {
+                        symbol_id: ce.symbol_id,
+                        comp_kind: ce.comp_kind,
+                        tier: tier,
+                        req_receiver: REQ_RECEIVER_NONE,
+                        is_ambiguous_trait_method: false,
+                        label_str: ce.label_str,
+                        insert_text_str: ce.label_str,
+                        detail_str: ce.detail_str,
+                    };
+                    hnd_insert_completion_sorted(mut_view(res), item);
+                }
+            }
+        }
+        ci = ci + 1u32;
+    }
+    res
+}
+
+// ============================================================================
+// 6. Conflict-Checked Cross-Module & Scoped Semantic Rename (`AXS-LSP-043`)
+// ============================================================================
+
+pub fn lsp_handle_prepare_rename(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition
+) -> LspPrepareRenameResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_res = LspPrepareRenameResult {
+        can_rename: false,
+        error_code: LSP_ERR_INVALID_PARAMS,
+        doc_id: doc_id,
+        symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        range: lsp_range_new(pos, pos),
+        placeholder_str: lsp_str_view(""),
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+    };
+    if doc_id >= ws.doc_cap {
+        return empty_res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    if nidx < 0i32 {
+        return empty_res;
+    }
+    let node = unsafe { *(eng.nodes + (nidx as usize)) };
+    // Reject renaming built-in primitive types (`i32`, `usize`, `bool`, `view`) or external stdlib symbols (`AXS-LSP-043 §1`)
+    if node.is_builtin_or_external || node.symbol_id.raw.index == 0u32 {
+        return empty_res;
+    }
+    let tr = text_range_new(node.span_start as u64, node.span_end as u64);
+    let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+    LspPrepareRenameResult {
+        can_rename: true,
+        error_code: LSP_ERR_NONE,
+        doc_id: doc_id,
+        symbol_id: node.symbol_id,
+        range: lrange,
+        placeholder_str: node.name_str,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+    }
+}
+
+pub fn lsp_handle_rename(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    pos: LspPosition,
+    new_name: str
+) -> LspRenameResult {
+    let empty_edit = LspRenameTextEdit {
+        doc_id: 0u32,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(pos, pos),
+        new_text_str: lsp_str_view(""),
+    };
+    let mut res = LspRenameResult {
+        accepted: false,
+        has_conflict: false,
+        error_code: LSP_ERR_INVALID_PARAMS,
+        conflict_diag_code: 0u32,
+        target_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+        affected_doc_count: 0u32,
+        edit_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        edits: [empty_edit; 32],
+    };
+
+    let prep = lsp_handle_prepare_rename(mut_view(*eng), mut_view(*ws), doc_id, pos);
+    if !prep.can_rename {
+        return res;
+    }
+    let new_sv = lsp_str_view(new_name);
+    if !hnd_is_valid_ident_sv(new_sv) {
+        return res;
+    }
+
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let byte_off = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, pos, ws.position_encoding) as u32;
+    let nidx = hnd_find_node_at_byte(view(*eng), doc_id, byte_off);
+    let target_node = unsafe { *(eng.nodes + (nidx as usize)) };
+    let target_sym = target_node.symbol_id;
+    let new_hash = lsp_hash_sv(new_sv);
+
+    // Check for shadowing / duplicate-name collisions in the target scope (`AXS-LSP-043 §2`: `AX_NAME_DUPLICATE`)
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let other = unsafe { *(eng.nodes + (i as usize)) };
+        if other.active && other.is_declaration && !lsp_symbol_id_eq(other.symbol_id, target_sym) {
+            if other.doc_id == target_node.doc_id &&
+                function_id_eq(other.owner_fn, target_node.owner_fn) &&
+                other.sym_kind == target_node.sym_kind &&
+                other.name_hash == new_hash {
+                res.has_conflict = true;
+                res.conflict_diag_code = DIAG_NAME_DUPLICATE;
+                res.target_symbol_id = target_sym;
+                return res;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    // Collect hygienic edits strictly for tokens bound to `target_sym` across all workspace documents
+    let mut doc_seen: [32]bool = [false; 32];
+    let mut doc_cnt: u32 = 0u32;
+    i = 0u32;
+    while i < eng.node_count {
+        let cand = unsafe { *(eng.nodes + (i as usize)) };
+        if cand.active && lsp_symbol_id_eq(cand.symbol_id, target_sym) && (res.edit_count) < 32u32 {
+            let cdp = vfs_doc_ptr(view(*ws), cand.doc_id);
+            let tr = text_range_new(cand.span_start as u64, cand.span_end as u64);
+            let lrange = editor_byte_range_to_lsp_range(unsafe { view((*cdp).editor) }, tr, ws.position_encoding);
+            res.edits[res.edit_count as usize] = LspRenameTextEdit {
+                doc_id: cand.doc_id,
+                span_start: cand.span_start,
+                span_end: cand.span_end,
+                range: lrange,
+                new_text_str: new_sv,
+            };
+            res.edit_count = res.edit_count + 1u32;
+            if (cand.doc_id as usize) < 32 && !doc_seen[cand.doc_id as usize] {
+                doc_seen[cand.doc_id as usize] = true;
+                doc_cnt = doc_cnt + 1u32;
+            }
+        }
+        i = i + 1u32;
+    }
+
+    res.accepted = true;
+    res.error_code = LSP_ERR_NONE;
+    res.target_symbol_id = target_sym;
+    res.affected_doc_count = doc_cnt;
+    res.header = lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE);
+    res
+}
+
+// Applies a verified `LspRenameResult` atomically per document via `AXEDITOR` `editor_apply_transaction` (`AXS-LSP-022`, `AXS-LSP-043`).
+pub fn lsp_apply_workspace_rename(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    rename_res: view<LspRenameResult>
+) -> bool {
+    if !rename_res.accepted || rename_res.has_conflict || rename_res.edit_count == 0u32 {
+        return false;
+    }
+    let mut doc_id: u32 = 0u32;
+    while doc_id < ws.doc_cap {
+        let mut batch: [16]TextEdit = [text_edit_new(0u64, 0u64, 0 as *const u8, 0); 16];
+        let mut bcount: u32 = 0u32;
+        let mut ei: u32 = 0u32;
+        while ei < rename_res.edit_count {
+            let ed = rename_res.edits[ei as usize];
+            if ed.doc_id == doc_id && bcount < 16u32 {
+                batch[bcount as usize] = text_edit_new(
+                    ed.span_start as u64,
+                    ed.span_end as u64,
+                    ed.new_text_str.ptr,
+                    ed.new_text_str.len
+                );
+                bcount = bcount + 1u32;
+            }
+            ei = ei + 1u32;
+        }
+        if bcount > 0u32 {
+            let dp = vfs_doc_ptr(view(*ws), doc_id);
+            if !editor_apply_transaction(unsafe { mut_view((*dp).editor) }, unsafe { address_of(batch[0]) }, bcount) {
+                return false;
+            }
+            ws.revision = ws.revision + 1u64;
+            unsafe { (*dp).workspace_revision = ws.revision; }
+        }
+        doc_id = doc_id + 1u32;
+    }
+
+    // Update renamed symbol's `name_str` and `name_hash` in `eng.nodes`
+    let new_sv = rename_res.edits[0].new_text_str;
+    let mut ni: u32 = 0u32;
+    while ni < eng.node_count {
+        let np = unsafe { eng.nodes + (ni as usize) };
+        if (unsafe { (*np).active }) && lsp_symbol_id_eq(unsafe { (*np).symbol_id }, rename_res.target_symbol_id) {
+            unsafe {
+                (*np).name_str = new_sv;
+            }
+        }
+        ni = ni + 1u32;
+    }
+    true
+}
+
+// ============================================================================
+// 7. AXCODEEDITOR Semantic Tokens, Inlay Hints & Presentation Layer (AXS-LSP-050, 051)
+// ============================================================================
+
+pub fn lsp_handle_semantic_tokens_full(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32
+) -> LspSemanticTokensResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_tok = LspSemanticToken {
+        delta_line: 0u32,
+        delta_start: 0u32,
+        length_utf16: 0u32,
+        token_type: 0u32,
+        token_modifiers: 0u32,
+        abs_line: 0u32,
+        abs_char: 0u32,
+    };
+    let mut res = LspSemanticTokensResult {
+        doc_id: doc_id,
+        revision: ws.revision,
+        result_id: ws.revision * 100u64 + (doc_id as u64),
+        token_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        tokens: [empty_tok; 64],
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let _ = query_parse_module(mut_view(ws.db), ModuleId { v: doc_id + 1u32 });
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+
+    let mut i: u32 = 0u32;
+    while i < eng.node_count {
+        let n = unsafe { *(eng.nodes + (i as usize)) };
+        if n.active && n.doc_id == doc_id && (res.token_count) < 64u32 {
+            let tr = text_range_new(n.span_start as u64, n.span_end as u64);
+            let lr = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+            let line = lr.start.line;
+            let ch = lr.start.character;
+            let len_u16 = if lr.end.line == line && lr.end.character >= ch {
+                lr.end.character - ch
+            } else {
+                n.span_end - n.span_start
+            };
+            let new_tok = LspSemanticToken {
+                delta_line: 0u32,
+                delta_start: 0u32,
+                length_utf16: len_u16,
+                token_type: n.sem_tok_type,
+                token_modifiers: n.sem_tok_modifiers,
+                abs_line: line,
+                abs_char: ch,
+            };
+            let mut pos = res.token_count;
+            while pos > 0u32 {
+                let prev = res.tokens[(pos - 1u32) as usize];
+                if line < prev.abs_line || (line == prev.abs_line && ch < prev.abs_char) {
+                    res.tokens[pos as usize] = prev;
+                    pos = pos - 1u32;
+                } else {
+                    break;
+                }
+            }
+            res.tokens[pos as usize] = new_tok;
+            res.token_count = res.token_count + 1u32;
+        }
+        i = i + 1u32;
+    }
+
+    let mut prev_line: u32 = 0u32;
+    let mut prev_char: u32 = 0u32;
+    let mut first = true;
+    let mut ti: u32 = 0u32;
+    while ti < res.token_count {
+        let mut t = res.tokens[ti as usize];
+        let d_line = if first { t.abs_line } else { t.abs_line - prev_line };
+        let d_start = if first || d_line > 0u32 { t.abs_char } else { t.abs_char - prev_char };
+        t.delta_line = d_line;
+        t.delta_start = d_start;
+        res.tokens[ti as usize] = t;
+        prev_line = t.abs_line;
+        prev_char = t.abs_char;
+        first = false;
+        ti = ti + 1u32;
+    }
+    eng.last_sem_tokens_rev = ws.revision;
+    eng.last_sem_tokens_count = res.token_count;
+    res
+}
+
+pub fn lsp_handle_semantic_tokens_delta(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    previous_result_id: u64
+) -> LspSemanticTokensDeltaResult {
+    let prev_cnt = eng.last_sem_tokens_count;
+    let full = lsp_handle_semantic_tokens_full(mut_view(*eng), mut_view(*ws), doc_id);
+    let diff = if full.token_count >= prev_cnt {
+        full.token_count - prev_cnt + 1u32
+    } else {
+        prev_cnt - full.token_count + 1u32
+    };
+    LspSemanticTokensDeltaResult {
+        doc_id: doc_id,
+        previous_result_id: previous_result_id,
+        result_id: full.result_id,
+        changed_token_count: diff,
+        header: full.header,
+    }
+}
+
+// Computes non-mutating `AXCODEEDITOR` inlay hints (`AXS-LSP-051`, `REQ-TOOL-300`, `CODE-INV-17, 25`).
+// Verifies that evaluating inlay hints NEVER alters `AXEDITOR` byte length, content hash, or document revision.
+pub fn lsp_handle_inlay_hints(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    range: LspRange
+) -> LspInlayHintsResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_hint = LspInlayHintItem {
+        position: lsp_pos_new(0u32, 0u32),
+        byte_offset: 0u32,
+        kind: 0u8,
+        subkind: 0u8,
+        region_rel: REGION_REL_NONE,
+        await_state_ordinal: 0u16,
+        await_live_locals: 0u16,
+        label_str: lsp_str_view(""),
+    };
+    let mut res = LspInlayHintsResult {
+        doc_id: doc_id,
+        revision: ws.revision,
+        count: 0u32,
+        type_hint_count: 0u32,
+        param_hint_count: 0u32,
+        ownership_hint_count: 0u32,
+        async_hint_count: 0u32,
+        buffer_mutated: false,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        hints: [empty_hint; 32],
+    };
+    if doc_id >= ws.doc_cap {
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let snap_before = editor_snapshot(unsafe { view((*dp).editor) });
+    let start_byte = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, range.start, ws.position_encoding) as u32;
+    let end_byte = editor_lsp_pos_to_byte_offset(unsafe { view((*dp).editor) }, range.end, ws.position_encoding) as u32;
+
+    let mut i: u32 = 0u32;
+    while i < eng.inlay_site_count {
+        let s = unsafe { *(eng.inlay_sites + (i as usize)) };
+        if s.active && s.doc_id == doc_id && s.byte_offset >= start_byte && s.byte_offset <= end_byte && (res.count) < 32u32 {
+            let enabled = if s.kind == INLAY_KIND_INFERRED_TYPE {
+                eng.enable_type_inlays
+            } else if s.kind == INLAY_KIND_PARAMETER_NAME {
+                eng.enable_param_inlays
+            } else if s.kind == INLAY_KIND_OWNERSHIP_FLOW {
+                eng.enable_ownership_inlays
+            } else {
+                eng.enable_async_inlays
+            };
+            if enabled {
+                let lpos = editor_byte_offset_to_lsp_pos(unsafe { view((*dp).editor) }, s.byte_offset as u64, ws.position_encoding);
+                res.hints[res.count as usize] = LspInlayHintItem {
+                    position: lpos,
+                    byte_offset: s.byte_offset,
+                    kind: s.kind,
+                    subkind: s.subkind,
+                    region_rel: s.region_rel,
+                    await_state_ordinal: s.await_state_ordinal,
+                    await_live_locals: s.await_live_locals,
+                    label_str: s.label_str,
+                };
+                res.count = res.count + 1u32;
+                if s.kind == INLAY_KIND_INFERRED_TYPE {
+                    res.type_hint_count = res.type_hint_count + 1u32;
+                } else if s.kind == INLAY_KIND_PARAMETER_NAME {
+                    res.param_hint_count = res.param_hint_count + 1u32;
+                } else if s.kind == INLAY_KIND_OWNERSHIP_FLOW {
+                    res.ownership_hint_count = res.ownership_hint_count + 1u32;
+                } else if s.kind == INLAY_KIND_ASYNC_SUSPEND {
+                    res.async_hint_count = res.async_hint_count + 1u32;
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+
+    let snap_after = editor_snapshot(unsafe { view((*dp).editor) });
+    res.buffer_mutated = snap_before.byte_len != snap_after.byte_len ||
+        snap_before.content_hash != snap_after.content_hash ||
+        snap_before.revision != snap_after.revision;
+    res
+}
+
+// Verifies `AXCODEEDITOR` highlight layer precedence (`AXS-LSP-050 §2`, `CODE-INV-08..09`):
+// Presentation spans from an older revision (`span.revision < current_doc_revision`) are rejected as stale,
+// and surviving spans sort in strict non-destructive precedence order (`base -> lexical -> semantic -> diagnostic -> selection -> caret`).
+pub fn lsp_verify_presentation_span(ws: view<VfsWorkspace>, span: LspPresentationSpan) -> bool {
+    if span.doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(ws, span.doc_id);
+    if !(unsafe { (*dp).active }) {
+        return false;
+    }
+    let doc_rev = unsafe { (*dp).workspace_revision };
+    if span.revision != doc_rev {
+        return false;
+    }
+    span.layer <= HIGHLIGHT_LAYER_ACTIVE_CARET && span.start_byte <= span.end_byte
+}

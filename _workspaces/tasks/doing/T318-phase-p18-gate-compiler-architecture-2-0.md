@@ -8,10 +8,12 @@ model: opus
 gate_model: opus
 depends: [T218, T067, T750, T751, T752, T753, T754, T755, T756, T757, T758, T759, T760, T761, T762, T763, T764, T765, T766, T767, T768, T769, T770, T771, T772, T773, T774, T775, T776]
 priority: 318
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p18, _workspaces/reports/phase-P18-review.md]
 spec: [spec/ROADMAP.md, spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, spec/SPEC-23-parallel-compilation.md, spec/SPEC-24-artifact-format-module-interfaces.md, spec/SPEC-25-pass-contracts-proof-carrying-ir.md, spec/SPEC-26-windows-artifact-kinds.md, spec/SPEC-27-separate-compilation-linker-v2.md]
+started: 2026-11-08 14:44:41
+agent: T318-impl
 ---
 # T318 — Phase P18 gate: Compiler architecture 2.0
 
@@ -37,3 +39,4 @@ Certify that phase P18 meets the exit criteria of every epic (`E18.1`–`E18.7`)
 
 ## Log
 - 2026-11-03 03:01:45 updated by T218 (wired all P18 tasks T067, T750–T776 into depends)
+- 2026-11-08 14:44:41 started (attempt 1) T318-impl

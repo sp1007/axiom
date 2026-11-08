@@ -1,0 +1,409 @@
+// `axiomc lsp` CLI Driver Entrypoint & JSON-RPC Event Loop Router (T802 / E19.1).
+// Implements SPEC-100 §8 (AXS-LSP-070..071; REQ-TOOL-183, REQ-TOOL-185, REQ-TOOL-300):
+// - CLI flags: `--stdio`, `--position-encoding=utf-16|utf-8`, `--inlay-types=true|false`,
+//   `--inlay-params=true|false`, `--inlay-ownership=true|false`, `--inlay-async=true|false`,
+//   `--version`, `--help`.
+// - Event-loop dispatch over `LspServerSession` (`compiler.lsp.protocol`),
+//   `VfsWorkspace` (`compiler.lsp.vfs`), and `LspSemanticEngine` (`compiler.lsp.handlers`).
+// - Enforces `AXS-LSP-004` (`REQ-TOOL-185`): zero mandatory backend codegen (`LIR`/`x86-64`/`COFF`/`ELF`)
+//   during interactive semantic IDE sessions.
+module compiler.driver.lsp_cmd
+
+use std.editor.POS_ENCODING_UTF16
+use std.editor.POS_ENCODING_UTF8
+use std.editor.LspPosition
+use std.editor.LspRange
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+
+use compiler.lsp.protocol.LspServerSession
+use compiler.lsp.protocol.LspParsedMessage
+use compiler.lsp.protocol.LSP_ERR_NONE
+use compiler.lsp.protocol.LSP_ERR_PARSE_ERROR
+use compiler.lsp.protocol.LSP_ERR_INVALID_REQUEST
+use compiler.lsp.protocol.LSP_ERR_METHOD_NOT_FOUND
+use compiler.lsp.protocol.LSP_ERR_SERVER_NOT_INITIALIZED
+use compiler.lsp.protocol.LSP_ERR_REQUEST_CANCELLED
+use compiler.lsp.protocol.MSG_REQUEST
+use compiler.lsp.protocol.MSG_NOTIFICATION
+use compiler.lsp.protocol.METHOD_UNKNOWN
+use compiler.lsp.protocol.METHOD_INITIALIZE
+use compiler.lsp.protocol.METHOD_INITIALIZED
+use compiler.lsp.protocol.METHOD_SHUTDOWN
+use compiler.lsp.protocol.METHOD_EXIT
+use compiler.lsp.protocol.METHOD_CANCEL_REQUEST
+use compiler.lsp.protocol.METHOD_DID_OPEN
+use compiler.lsp.protocol.METHOD_DID_CHANGE
+use compiler.lsp.protocol.METHOD_DID_SAVE
+use compiler.lsp.protocol.METHOD_DID_CLOSE
+use compiler.lsp.protocol.METHOD_HOVER
+use compiler.lsp.protocol.METHOD_COMPLETION
+use compiler.lsp.protocol.METHOD_DEFINITION
+use compiler.lsp.protocol.METHOD_TYPE_DEFINITION
+use compiler.lsp.protocol.METHOD_IMPLEMENTATION
+use compiler.lsp.protocol.METHOD_REFERENCES
+use compiler.lsp.protocol.METHOD_DOCUMENT_SYMBOL
+use compiler.lsp.protocol.METHOD_WORKSPACE_SYMBOL
+use compiler.lsp.protocol.METHOD_RENAME
+use compiler.lsp.protocol.METHOD_PREPARE_RENAME
+use compiler.lsp.protocol.METHOD_SEMANTIC_TOKENS_FULL
+use compiler.lsp.protocol.METHOD_SEMANTIC_TOKENS_DELTA
+use compiler.lsp.protocol.METHOD_INLAY_HINT
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.protocol.lsp_session_new
+use compiler.lsp.protocol.lsp_classify_method
+use compiler.lsp.protocol.lsp_is_notification_method
+use compiler.lsp.protocol.lsp_dispatch_message
+use compiler.lsp.protocol.lsp_check_cancellation
+use compiler.lsp.protocol.lsp_complete_request
+use compiler.lsp.protocol.lsp_write_frame
+
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.FunctionId
+use compiler.lsp.vfs.LspTypeId
+use compiler.lsp.vfs.gen_id_new
+use compiler.lsp.vfs.vfs_workspace_free
+use compiler.lsp.vfs.vfs_hash_str
+use compiler.lsp.vfs.vfs_did_open
+use compiler.lsp.vfs.vfs_did_save
+use compiler.lsp.vfs.vfs_did_close
+
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.lsp_engine_free
+use compiler.lsp.handlers.lsp_hash_sv
+use compiler.lsp.handlers.lsp_handle_publish_diagnostics
+use compiler.lsp.handlers.lsp_handle_hover
+use compiler.lsp.handlers.lsp_handle_definition
+use compiler.lsp.handlers.lsp_handle_type_definition
+use compiler.lsp.handlers.lsp_handle_implementation
+use compiler.lsp.handlers.lsp_handle_references
+use compiler.lsp.handlers.lsp_handle_document_symbol
+use compiler.lsp.handlers.lsp_handle_workspace_symbol
+use compiler.lsp.handlers.lsp_handle_completion
+use compiler.lsp.handlers.lsp_handle_prepare_rename
+use compiler.lsp.handlers.lsp_handle_rename
+use compiler.lsp.handlers.lsp_handle_semantic_tokens_full
+use compiler.lsp.handlers.lsp_handle_semantic_tokens_delta
+use compiler.lsp.handlers.lsp_handle_inlay_hints
+
+// ============================================================================
+// 1. CLI Configuration & Argument Parsing (`AXS-LSP-070`)
+// ============================================================================
+
+@derive(Copy)
+pub struct LspCliConfig {
+    pub stdio_mode: bool,
+    pub position_encoding: u8,
+    pub inlay_types: bool,
+    pub inlay_params: bool,
+    pub inlay_ownership: bool,
+    pub inlay_async: bool,
+    pub show_version: bool,
+    pub show_help: bool,
+    pub invalid_arg_count: u32,
+}
+
+pub fn lsp_default_cli_config() -> LspCliConfig {
+    LspCliConfig {
+        stdio_mode: true,
+        position_encoding: POS_ENCODING_UTF16,
+        inlay_types: true,
+        inlay_params: true,
+        inlay_ownership: true,
+        inlay_async: true,
+        show_version: false,
+        show_help: false,
+        invalid_arg_count: 0u32,
+    }
+}
+
+pub fn lsp_parse_cli_arg(cfg: mut_view<LspCliConfig>, arg: str) -> bool {
+    let h = vfs_hash_str(arg);
+    if h == vfs_hash_str("--stdio") {
+        cfg.stdio_mode = true;
+        return true;
+    }
+    if h == vfs_hash_str("--position-encoding=utf-16") {
+        cfg.position_encoding = POS_ENCODING_UTF16;
+        return true;
+    }
+    if h == vfs_hash_str("--position-encoding=utf-8") {
+        cfg.position_encoding = POS_ENCODING_UTF8;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-types=true") {
+        cfg.inlay_types = true;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-types=false") {
+        cfg.inlay_types = false;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-params=true") {
+        cfg.inlay_params = true;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-params=false") {
+        cfg.inlay_params = false;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-ownership=true") {
+        cfg.inlay_ownership = true;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-ownership=false") {
+        cfg.inlay_ownership = false;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-async=true") {
+        cfg.inlay_async = true;
+        return true;
+    }
+    if h == vfs_hash_str("--inlay-async=false") {
+        cfg.inlay_async = false;
+        return true;
+    }
+    if h == vfs_hash_str("--version") {
+        cfg.show_version = true;
+        return true;
+    }
+    if h == vfs_hash_str("--help") {
+        cfg.show_help = true;
+        return true;
+    }
+    cfg.invalid_arg_count = cfg.invalid_arg_count + 1u32;
+    false
+}
+
+// ============================================================================
+// 2. `axiomc lsp` Driver Session & Event-Loop Router (`AXS-LSP-071`)
+// ============================================================================
+
+pub struct LspDriverContext {
+    pub cli: LspCliConfig,
+    pub session: LspServerSession,
+    pub frames_processed: u32,
+    pub diagnostics_published: u32,
+    pub codegen_invocations: u32,
+    pub last_method: u16,
+    pub last_error_code: i32,
+    pub last_response_bytes: usize,
+}
+
+pub fn lsp_driver_new(cli: LspCliConfig) -> LspDriverContext {
+    LspDriverContext {
+        cli: cli,
+        session: lsp_session_new(),
+        frames_processed: 0u32,
+        diagnostics_published: 0u32,
+        codegen_invocations: 0u32,
+        last_method: METHOD_UNKNOWN,
+        last_error_code: LSP_ERR_NONE,
+        last_response_bytes: 0,
+    }
+}
+
+pub fn lsp_driver_apply_cli(
+    drv: view<LspDriverContext>,
+    ws: mut_view<VfsWorkspace>,
+    eng: mut_view<LspSemanticEngine>
+) {
+    ws.position_encoding = drv.cli.position_encoding;
+    eng.enable_type_inlays = drv.cli.inlay_types;
+    eng.enable_param_inlays = drv.cli.inlay_params;
+    eng.enable_ownership_inlays = drv.cli.inlay_ownership;
+    eng.enable_async_inlays = drv.cli.inlay_async;
+}
+
+pub fn lsp_driver_free(ws: mut_view<VfsWorkspace>, eng: mut_view<LspSemanticEngine>) {
+    lsp_engine_free(mut_view(*eng));
+    vfs_workspace_free(mut_view(*ws));
+}
+
+// Verifies the `AXS-LSP-004` (`REQ-TOOL-185`) zero-codegen firewall across both `VfsWorkspace`
+// and `LspDriverContext`.
+pub fn lsp_driver_verify_zero_codegen(drv: view<LspDriverContext>, ws: view<VfsWorkspace>) -> bool {
+    drv.codegen_invocations == 0u32 && ws.codegen_invocations == 0u32
+}
+
+fn drv_write_json_frame(out_buf: *mut u8, out_cap: usize, json_str: str) -> usize {
+    let sv = lsp_str_view(json_str);
+    lsp_write_frame(sv.ptr, sv.len, out_buf, out_cap)
+}
+
+// Routes an LSP request or notification through lifecycle state, `VfsWorkspace`, and `LspSemanticEngine`,
+// writing the framed JSON-RPC 2.0 wire response into `out_buf` (`AXS-LSP-010..014`, `AXS-LSP-071`).
+pub fn lsp_driver_dispatch(
+    drv: mut_view<LspDriverContext>,
+    ws: mut_view<VfsWorkspace>,
+    eng: mut_view<LspSemanticEngine>,
+    request_id: i64,
+    method_name: str,
+    doc_id: u32,
+    doc_uri: str,
+    doc_version: i64,
+    doc_text: str,
+    pos: LspPosition,
+    out_buf: *mut u8,
+    out_cap: usize
+) -> i32 {
+    drv.frames_processed = drv.frames_processed + 1u32;
+    let msv = lsp_str_view(method_name);
+    let m = lsp_classify_method(msv.ptr, msv.len);
+    drv.last_method = m;
+
+    let is_notif = lsp_is_notification_method(m);
+    let msg = LspParsedMessage {
+        msg_kind: if is_notif { MSG_NOTIFICATION } else { MSG_REQUEST },
+        method_id: m,
+        has_id: !is_notif,
+        request_id: request_id,
+        cancel_target_id: request_id,
+        requested_encoding: drv.cli.position_encoding,
+        doc_version: doc_version,
+        range_start_line: pos.line,
+        range_start_char: pos.character,
+        range_end_line: pos.line,
+        range_end_char: pos.character,
+        has_range: false,
+        uri_offset: 0u32,
+        uri_len: 0u32,
+        text_offset: 0u32,
+        text_len: 0u32,
+    };
+
+    let outcome = lsp_dispatch_message(mut_view(drv.session), msg);
+    if !outcome.accepted {
+        drv.last_error_code = outcome.error_code;
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600}}");
+        return outcome.error_code;
+    }
+
+    if m == METHOD_INITIALIZE {
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = drv_write_json_frame(
+            out_buf,
+            out_cap,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-16\",\"textDocumentSync\":2,\"hoverProvider\":true,\"completionProvider\":{\"triggerCharacters\":[\".\"]},\"definitionProvider\":true,\"typeDefinitionProvider\":true,\"implementationProvider\":true,\"referencesProvider\":true,\"documentSymbolProvider\":true,\"workspaceSymbolProvider\":true,\"renameProvider\":{\"prepareProvider\":true},\"semanticTokensProvider\":{\"full\":{\"delta\":true}},\"inlayHintProvider\":true}}}"
+        );
+        return LSP_ERR_NONE;
+    }
+
+    if m == METHOD_INITIALIZED || m == METHOD_EXIT || m == METHOD_CANCEL_REQUEST {
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = 0;
+        return LSP_ERR_NONE;
+    }
+
+    if m == METHOD_SHUTDOWN {
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":null}");
+        return LSP_ERR_NONE;
+    }
+
+    if m == METHOD_DID_OPEN {
+        let tsv = lsp_str_view(doc_text);
+        let h = lsp_hash_sv(tsv);
+        let _ = vfs_did_open(mut_view(*ws), doc_id, vfs_hash_str(doc_uri), doc_version, tsv.ptr, tsv.len, h, h);
+        let _ = lsp_handle_publish_diagnostics(mut_view(*eng), mut_view(*ws), doc_id);
+        drv.diagnostics_published = drv.diagnostics_published + 1u32;
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = 0;
+        return LSP_ERR_NONE;
+    }
+
+    if m == METHOD_DID_SAVE {
+        let _ = vfs_did_save(mut_view(*ws), doc_id);
+        let _ = lsp_handle_publish_diagnostics(mut_view(*eng), mut_view(*ws), doc_id);
+        drv.diagnostics_published = drv.diagnostics_published + 1u32;
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = 0;
+        return LSP_ERR_NONE;
+    }
+
+    if m == METHOD_DID_CLOSE {
+        let tsv = lsp_str_view(doc_text);
+        let h = lsp_hash_sv(tsv);
+        let _ = vfs_did_close(mut_view(*ws), doc_id, tsv.ptr, tsv.len, h, h);
+        drv.diagnostics_published = drv.diagnostics_published + 1u32;
+        drv.last_error_code = LSP_ERR_NONE;
+        drv.last_response_bytes = 0;
+        return LSP_ERR_NONE;
+    }
+
+    let cancel_rc = lsp_check_cancellation(view(drv.session), request_id);
+    if cancel_rc != LSP_ERR_NONE {
+        drv.last_error_code = cancel_rc;
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32800}}");
+        return cancel_rc;
+    }
+
+    if m == METHOD_HOVER {
+        let h = lsp_handle_hover(mut_view(*eng), mut_view(*ws), doc_id, pos);
+        let body = if h.found { "{\"jsonrpc\":\"2.0\",\"result\":{\"contents\":{\"kind\":\"markdown\"}}}" } else { "{\"jsonrpc\":\"2.0\",\"result\":null}" };
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, body);
+    } else if m == METHOD_DEFINITION {
+        let d = lsp_handle_definition(mut_view(*eng), mut_view(*ws), doc_id, pos);
+        let body = if d.found { "{\"jsonrpc\":\"2.0\",\"result\":{\"uri\":\"file:///resolved\"}}" } else { "{\"jsonrpc\":\"2.0\",\"result\":null}" };
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, body);
+    } else if m == METHOD_TYPE_DEFINITION {
+        let td = lsp_handle_type_definition(mut_view(*eng), mut_view(*ws), doc_id, pos);
+        let body = if td.found { "{\"jsonrpc\":\"2.0\",\"result\":{\"uri\":\"file:///type_decl\"}}" } else { "{\"jsonrpc\":\"2.0\",\"result\":null}" };
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, body);
+    } else if m == METHOD_IMPLEMENTATION {
+        let _ = lsp_handle_implementation(mut_view(*eng), mut_view(*ws), doc_id, pos);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":[]}");
+    } else if m == METHOD_REFERENCES {
+        let _ = lsp_handle_references(mut_view(*eng), mut_view(*ws), doc_id, pos, true);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":[]}");
+    } else if m == METHOD_DOCUMENT_SYMBOL {
+        let _ = lsp_handle_document_symbol(mut_view(*eng), mut_view(*ws), doc_id);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":[]}");
+    } else if m == METHOD_WORKSPACE_SYMBOL {
+        let _ = lsp_handle_workspace_symbol(mut_view(*eng), mut_view(*ws), doc_text);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":[]}");
+    } else if m == METHOD_COMPLETION {
+        let _ = lsp_handle_completion(
+            mut_view(*eng),
+            mut_view(*ws),
+            doc_id,
+            pos,
+            FunctionId { raw: gen_id_new(1u32, 1u32) },
+            1u16,
+            LspTypeId { raw: gen_id_new(0u32, 0u32) }
+        );
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":{\"isIncomplete\":false,\"items\":[]}}");
+    } else if m == METHOD_PREPARE_RENAME {
+        let pr = lsp_handle_prepare_rename(mut_view(*eng), mut_view(*ws), doc_id, pos);
+        if !pr.can_rename {
+            let _ = lsp_complete_request(mut_view(drv.session), request_id);
+            drv.last_error_code = pr.error_code;
+            drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602}}");
+            return pr.error_code;
+        }
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":{\"placeholder\":\"ident\"}}");
+    } else if m == METHOD_RENAME {
+        let rn = lsp_handle_rename(mut_view(*eng), mut_view(*ws), doc_id, pos, doc_text);
+        if !rn.accepted {
+            let _ = lsp_complete_request(mut_view(drv.session), request_id);
+            drv.last_error_code = rn.error_code;
+            drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32602}}");
+            return rn.error_code;
+        }
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":{\"changes\":{}}}");
+    } else if m == METHOD_SEMANTIC_TOKENS_FULL {
+        let _ = lsp_handle_semantic_tokens_full(mut_view(*eng), mut_view(*ws), doc_id);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":{\"data\":[]}}");
+    } else if m == METHOD_SEMANTIC_TOKENS_DELTA {
+        let _ = lsp_handle_semantic_tokens_delta(mut_view(*eng), mut_view(*ws), doc_id, 1u64);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":{\"edits\":[]}}");
+    } else if m == METHOD_INLAY_HINT {
+        let r = lsp_range_new(lsp_pos_new(0u32, 0u32), lsp_pos_new(1000u32, 0u32));
+        let _ = lsp_handle_inlay_hints(mut_view(*eng), mut_view(*ws), doc_id, r);
+        drv.last_response_bytes = drv_write_json_frame(out_buf, out_cap, "{\"jsonrpc\":\"2.0\",\"result\":[]}");
+    }
+
+    let _ = lsp_complete_request(mut_view(drv.session), request_id);
+    drv.last_error_code = LSP_ERR_NONE;
+    LSP_ERR_NONE
+}

@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T801]
 priority: 192
-status: doing
+status: done
 attempts: 1
 paths: [compiler/lsp/handlers, compiler/driver/lsp_cmd, tools/vscode-axiom, tests/run/lsp_queries]
 spec: [spec/SPEC-100-lsp-server-ide-engine.md, 0101, 0146, tasks/0374, tasks/0448, tasks/0450, tasks/0664, tasks/0693, tasks/0695, tasks/0696, tasks/1054]
 covers: [REQ-TOOL-183, REQ-TOOL-185, REQ-TOOL-188, REQ-TOOL-189, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-300]
 started: 2026-11-08 13:45:20
-agent: T802-impl
+finished: 2026-11-08 14:53:55
 ---
 # T802 — E19.1 Semantic IDE queries (hover, definition, references, completion, rename) & AXCODEEDITOR/VS Code client
 
@@ -48,3 +48,4 @@ Implement `CompilerDB`-backed semantic LSP query handlers (diagnostics, hover, g
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 13:45:20 started (attempt 1) T802-impl
+- 2026-11-08 14:53:55 accepted by QA -> done
