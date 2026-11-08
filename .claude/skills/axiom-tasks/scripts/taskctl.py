@@ -157,7 +157,7 @@ AUTOPILOT = os.path.join(ROOT, "_workspaces", "autopilot.json")
 UNBLOCK_LOCK = os.path.join(LOCKS, "unblock.json")
 UNBLOCK_LOCK_PATHS = ["spec", "_workspaces/tasks"]
 UNBLOCK_LOCK_STALE_MIN = 180
-DEFAULT_TRAILER = "Co-Authored-By: Gemini <noreply@google.com>"
+DEFAULT_TRAILER = ""
 MAX_ATTEMPTS = 3
 MAX_UNBLOCKS = 2          # architect unblock cycles per task, then parked for the owner
 MAX_UNBLOCK_FAILURES = 2  # crashed/overdue unblock agents per task, then parked
@@ -757,8 +757,10 @@ def stage(files):
 
 def do_commit(t, files, subject_extra=""):
     m = t["meta"]
+    tr = trailer().strip()
+    tail = f"\n\n{tr}\n" if tr else "\n"
     msg = (f"{m['id']}: {m.get('title', '')}\n\nTask {m['id']} ({m.get('owner', '')}) accepted by QA."
-           f"{subject_extra}\n\n{trailer()}\n")
+           f"{subject_extra}{tail}")
     return commit_files(files, msg, m["id"])
 
 
@@ -832,7 +834,9 @@ def cmd_commit_report(tasks, report, subject):
         print("REFUSED", p)
     if problems:
         die(f"commit-report refused ({len(problems)} problem(s)); nothing staged", 1)
-    r = commit_files(sorted(files), f"{subject}\n\nReport: {rel}\n\n{trailer()}\n", rel)
+    tr = trailer().strip()
+    tail = f"\n\n{tr}\n" if tr else "\n"
+    r = commit_files(sorted(files), f"{subject}\n\nReport: {rel}{tail}", rel)
     if r is False:
         die("git commit failed", 1)
 

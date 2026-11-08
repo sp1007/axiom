@@ -211,8 +211,8 @@ loops go to the architect). Infrastructure failures (rate limit, quota, API or t
 `unblock` resets attempts and counts a cycle; after 2 unblock cycles, or 2 failed unblock agents, the
 task is `parked` (exit 4) and listed in `_workspaces/STUCK.md` for the owner instead of looping.
 
-Commit message (produced by `accept`): `T034: Struct + layout engine` + body + `Co-Authored-By`
-trailer (override with `AXIOM_COMMIT_TRAILER`). Architect work outside a task (unblock, phase review,
+Commit message (produced by `accept`): `T034: Struct + layout engine` + body (optional trailer via
+`AXIOM_COMMIT_TRAILER`). Architect work outside a task (unblock, phase review,
 audit fixes) is committed with `taskctl.py commit-report <report.md> --subject "arch: ..."`, which
 stages exactly the report's `## Files changed` plus the board. The owner's files under `docs/` and
 git-ignored paths are never staged by these commands. `.claude/hooks/guard.py` is the PreToolUse
