@@ -6,7 +6,7 @@ owner: axiom-frontend
 reviewer: axiom-qa
 model: sonnet
 gate_model: sonnet
-depends: [T219, T318, T805, T816]
+depends: [T219, T752, T755, T756, T759, T805, T816]
 priority: 207
 status: todo
 attempts: 0

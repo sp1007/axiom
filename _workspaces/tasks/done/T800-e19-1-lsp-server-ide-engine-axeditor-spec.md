@@ -6,14 +6,16 @@ owner: axiom-architect
 reviewer: axiom-qa
 model: opus
 gate_model: sonnet
-depends: [T219, T318]
+depends: [T219, T752, T756]
 priority: 190
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [spec/SPEC-100-lsp-server-ide-engine.md]
 locks: [spec/INDEX.md, spec/diagnostics.md, spec/invariants.md]
 spec: [spec/SPEC-21-query-engine-semantic-db.md, spec/SPEC-22-incremental-compilation.md, 0101, 0146, tasks/0374, tasks/0448, tasks/0450, tasks/0479, tasks/0664, tasks/0693, tasks/0695, tasks/0696, tasks/1053, tasks/1054]
 covers: [REQ-TOOL-183, REQ-TOOL-184, REQ-TOOL-185, REQ-TOOL-188, REQ-TOOL-189, REQ-TOOL-191, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-299, REQ-TOOL-300]
+started: 2026-11-08 12:20:14
+finished: 2026-11-08 12:34:48
 ---
 # T800 — E19.1 Canonical LSP server, IDE semantic engine, AXEDITOR/AXCODEEDITOR & VS Code extension specification (SPEC-100)
 
@@ -42,3 +44,5 @@ Consolidate the canonical specification for Axiom's Language Server (`axiomc lsp
 
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
+- 2026-11-08 12:20:14 started (attempt 1) T800-impl
+- 2026-11-08 12:34:48 accepted by QA -> done
