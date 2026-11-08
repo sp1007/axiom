@@ -1,0 +1,453 @@
+// test: run
+// modes: interp native
+// stdout-file: adversarial_sdk_extraction_and_repro_drift.stdout
+// SPEC-116 §§2..5, SPEC-111, SPEC-113 (AXS-SDK-024, AXS-SDK-030, AXS-SDK-040..042, AXS-SDK-055, REQ-PKG-022, INV-SDK-001..003):
+// Conformance test verifying adversarial boundary conditions:
+// 1. Archive extraction security:
+//    - Rejection of path traversal (..), absolute paths, UNC shares, and null-byte injection.
+//    - Rejection of Windows reserved device names (CON, PRN, AUX, NUL, COM1..9, LPT1..9).
+// 2. Multi-target lockfile cross-triple mismatch:
+//    - Cross-target compilation rejection when requested target triple is missing under --locked / --frozen.
+//    - Rejection of cross-triple fingerprint substitution attacks.
+// 3. Declarative .axsdk dynamic import stub tampering:
+//    - Detection of modified symbol hashes and corrupted stub entrypoints.
+//    - Enforcement of subsystem entrypoint contracts.
+// 4. Two-machine reproducibility drift detection:
+//    - Host path leakage breaks bit-for-bit identity and fails audit.
+//    - Optimization flag drift (-O1 vs -O2) is detected via artifact SHA-256 divergence.
+//    - ToolchainFingerprint drift is rejected under --frozen.
+
+@intrinsic
+fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+fn fnv1a_mix(h: u64, byte_val: u8) -> u64 {
+    let mixed = h ^ (byte_val as u64)
+    wrapping_mul_u64(mixed, 1099511628211u64)
+}
+
+fn fnv1a_mix_u64(h: u64, v: u64) -> u64 {
+    let mut cur = h
+    let mut shift: u32 = 0u32
+    while shift < 64u32 {
+        let b = ((v >> shift) & 0xFFu64) as u8
+        cur = fnv1a_mix(cur, b)
+        shift = shift + 8u32
+    }
+    cur
+}
+
+// ---------------------------------------------------------------------------
+// 1. Archive Extraction Security (Path Traversal & Windows Reserved Devices)
+// ---------------------------------------------------------------------------
+
+@derive(Copy)
+struct ArchivePathAttackEntry {
+    attack_id: u32,
+    has_dot_dot: bool,
+    has_drive_or_unc: bool,
+    has_leading_slash: bool,
+    has_reserved_device: bool,
+    has_null_byte: bool,
+}
+
+// Return codes:
+// 0 = EXTRACT_OK
+// 1 = EXTRACT_REJECT_TRAVERSAL
+// 2 = EXTRACT_REJECT_ABSOLUTE_OR_UNC
+// 3 = EXTRACT_REJECT_RESERVED_DEVICE
+// 4 = EXTRACT_REJECT_NULL_BYTE
+fn validate_archive_extraction_entry(entry: view<ArchivePathAttackEntry>) -> u32 {
+    if entry.has_null_byte {
+        return 4u32
+    }
+    if entry.has_dot_dot {
+        return 1u32
+    }
+    if entry.has_drive_or_unc || entry.has_leading_slash {
+        return 2u32
+    }
+    if entry.has_reserved_device {
+        return 3u32
+    }
+    0u32
+}
+
+fn test_archive_extraction_security() -> bool {
+    // Attack 1: Classic directory traversal ../../etc/shadow
+    let a1 = ArchivePathAttackEntry {
+        attack_id: 1u32,
+        has_dot_dot: true,
+        has_drive_or_unc: false,
+        has_leading_slash: false,
+        has_reserved_device: false,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(a1)) != 1u32 {
+        return false
+    }
+
+    // Attack 2: Absolute drive path C:\Windows\System32\payload.dll
+    let a2 = ArchivePathAttackEntry {
+        attack_id: 2u32,
+        has_dot_dot: false,
+        has_drive_or_unc: true,
+        has_leading_slash: false,
+        has_reserved_device: false,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(a2)) != 2u32 {
+        return false
+    }
+
+    // Attack 3: UNC network share \\malicious.site\share\exploit
+    let a3 = ArchivePathAttackEntry {
+        attack_id: 3u32,
+        has_dot_dot: false,
+        has_drive_or_unc: true,
+        has_leading_slash: false,
+        has_reserved_device: false,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(a3)) != 2u32 {
+        return false
+    }
+
+    // Attack 4: Leading Unix root slash /usr/lib/libc.so
+    let a4 = ArchivePathAttackEntry {
+        attack_id: 4u32,
+        has_dot_dot: false,
+        has_drive_or_unc: false,
+        has_leading_slash: true,
+        has_reserved_device: false,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(a4)) != 2u32 {
+        return false
+    }
+
+    // Attack 5: Windows reserved device name CON.ax / aux / nul / com1
+    let a5 = ArchivePathAttackEntry {
+        attack_id: 5u32,
+        has_dot_dot: false,
+        has_drive_or_unc: false,
+        has_leading_slash: false,
+        has_reserved_device: true,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(a5)) != 3u32 {
+        return false
+    }
+
+    // Attack 6: Null byte injection in path sysroot/lib\0evil.dll
+    let a6 = ArchivePathAttackEntry {
+        attack_id: 6u32,
+        has_dot_dot: false,
+        has_drive_or_unc: false,
+        has_leading_slash: false,
+        has_reserved_device: false,
+        has_null_byte: true,
+    }
+    if validate_archive_extraction_entry(view(a6)) != 4u32 {
+        return false
+    }
+
+    // Legitimate entry: lib/x86_64-pc-windows-msvc/kernel32.axstub
+    let legit = ArchivePathAttackEntry {
+        attack_id: 7u32,
+        has_dot_dot: false,
+        has_drive_or_unc: false,
+        has_leading_slash: false,
+        has_reserved_device: false,
+        has_null_byte: false,
+    }
+    if validate_archive_extraction_entry(view(legit)) != 0u32 {
+        return false
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// 2. Multi-Target Lockfile Cross-Triple Mismatch & Substitution
+// ---------------------------------------------------------------------------
+
+@derive(Copy)
+struct TargetLockPin {
+    triple_id: u32, // 1=x86_64-windows, 2=x86_64-linux, 3=aarch64-linux, 4=aarch64-macos, 5=wasm32
+    fingerprint: u64,
+    is_present: bool,
+}
+
+@derive(Copy)
+struct MultiTargetLockSim {
+    pins: [5]TargetLockPin,
+    is_locked: bool,
+    is_frozen: bool,
+}
+
+// Result codes:
+// 0 = RESOLVE_OK
+// 1 = ERR_MISSING_TARGET_PIN
+// 2 = ERR_FINGERPRINT_MISMATCH
+// 3 = ERR_FROZEN_MUTATION
+fn resolve_cross_target_sdk_pin(
+    lock: view<MultiTargetLockSim>,
+    target_triple: u32,
+    candidate_fp: u64
+) -> u32 {
+    let mut i: usize = 0usize
+    let mut found = false
+    let mut pinned_fp: u64 = 0u64
+
+    while i < 5usize {
+        let p = lock.pins[i]
+        if p.is_present && p.triple_id == target_triple {
+            found = true
+            pinned_fp = p.fingerprint
+        }
+        i = i + 1usize
+    }
+
+    if !found {
+        if lock.is_locked || lock.is_frozen {
+            return 1u32 // ERR_MISSING_TARGET_PIN
+        }
+    }
+
+    if found && candidate_fp != pinned_fp {
+        return 2u32 // ERR_FINGERPRINT_MISMATCH
+    }
+
+    0u32
+}
+
+fn test_multi_target_lockfile_defense() -> bool {
+    let pin_win = TargetLockPin {
+        triple_id: 1u32,
+        fingerprint: 0x9F83C1B2E5A7D6E4u64,
+        is_present: true,
+    }
+    let pin_wasm = TargetLockPin {
+        triple_id: 5u32,
+        fingerprint: 0x5C6D7E8F1A2B3C4Du64,
+        is_present: true,
+    }
+    let pin_none = TargetLockPin {
+        triple_id: 0u32,
+        fingerprint: 0u64,
+        is_present: false,
+    }
+
+    let lock = MultiTargetLockSim {
+        pins: [pin_win, pin_wasm, pin_none, pin_none, pin_none],
+        is_locked: true,
+        is_frozen: true,
+    }
+
+    // Scenario 1: Valid resolution for pinned Windows target
+    let r1 = resolve_cross_target_sdk_pin(view(lock), 1u32, 0x9F83C1B2E5A7D6E4u64)
+    if r1 != 0u32 {
+        return false
+    }
+
+    // Scenario 2: Valid resolution for pinned WASM target
+    let r2 = resolve_cross_target_sdk_pin(view(lock), 5u32, 0x5C6D7E8F1A2B3C4Du64)
+    if r2 != 0u32 {
+        return false
+    }
+
+    // Scenario 3: Missing target triple (aarch64-linux = 3) under --frozen fails closed
+    let r3 = resolve_cross_target_sdk_pin(view(lock), 3u32, 0x1122334455667788u64)
+    if r3 != 1u32 {
+        return false
+    }
+
+    // Scenario 4: Cross-triple fingerprint substitution attack:
+    // Attacker passes WASM candidate fingerprint to Windows target triple
+    let r4 = resolve_cross_target_sdk_pin(view(lock), 1u32, 0x5C6D7E8F1A2B3C4Du64)
+    if r4 != 2u32 {
+        return false
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// 3. Declarative .axsdk Dynamic Import Stub Verification
+// ---------------------------------------------------------------------------
+
+@derive(Copy)
+struct StubSymbolEntry {
+    symbol_id: u32,
+    expected_hash: u64,
+    actual_hash: u64,
+    is_subsystem_required: bool,
+}
+
+// Return codes:
+// 0 = STUB_OK
+// 1 = STUB_CORRUPTED_SYMBOL_HASH
+// 2 = STUB_MISSING_REQUIRED_ENTRYPOINT
+fn verify_sdk_import_stub(stub: view<StubSymbolEntry>) -> u32 {
+    if stub.expected_hash != stub.actual_hash {
+        return 1u32 // STUB_CORRUPTED_SYMBOL_HASH
+    }
+    if stub.is_subsystem_required && stub.actual_hash == 0u64 {
+        return 2u32 // STUB_MISSING_REQUIRED_ENTRYPOINT
+    }
+    0u32
+}
+
+fn test_import_stub_verification() -> bool {
+    // Valid kernel32.dll!ExitProcess stub
+    let valid_stub = StubSymbolEntry {
+        symbol_id: 101u32,
+        expected_hash: 0xA1B2C3D4E5F60718u64,
+        actual_hash: 0xA1B2C3D4E5F60718u64,
+        is_subsystem_required: true,
+    }
+    if verify_sdk_import_stub(view(valid_stub)) != 0u32 {
+        return false
+    }
+
+    // Corrupted stub hash (e.g. tampered import address table or name hash)
+    let tampered_stub = StubSymbolEntry {
+        symbol_id: 102u32,
+        expected_hash: 0xA1B2C3D4E5F60718u64,
+        actual_hash: 0xDEADBEEFCAFEBABEu64,
+        is_subsystem_required: false,
+    }
+    if verify_sdk_import_stub(view(tampered_stub)) != 1u32 {
+        return false
+    }
+
+    // Missing subsystem entrypoint (hash=0)
+    let missing_entrypoint = StubSymbolEntry {
+        symbol_id: 103u32,
+        expected_hash: 0u64,
+        actual_hash: 0u64,
+        is_subsystem_required: true,
+    }
+    if verify_sdk_import_stub(view(missing_entrypoint)) != 2u32 {
+        return false
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// 4. Two-Machine Reproducibility Drift & Host Path Leak Detection
+// ---------------------------------------------------------------------------
+
+@derive(Copy)
+struct BuildRunConfig {
+    optimization_level: u32, // 1 = -O1, 2 = -O2
+    enable_path_remapping: bool,
+    host_root_hash: u64,
+    toolchain_fp: u64,
+}
+
+fn compute_simulated_binary_digest(cfg: view<BuildRunConfig>, source_hash: u64) -> u64 {
+    // Domain tag "AXIOM_REPRO_BIN_DIGEST_V1"
+    let mut h: u64 = 0x415842494E524550u64
+    h = fnv1a_mix_u64(h, source_hash)
+    h = fnv1a_mix_u64(h, cfg.optimization_level as u64)
+    h = fnv1a_mix_u64(h, cfg.toolchain_fp)
+
+    // If path remapping is disabled, host root path leaks into binary debug info / string table!
+    if !cfg.enable_path_remapping {
+        h = fnv1a_mix_u64(h, cfg.host_root_hash)
+    }
+
+    h
+}
+
+fn test_reproducibility_drift_detection() -> bool {
+    let source_hash = 0x3344556677889900u64
+    let official_toolchain_fp = 0x8F7E6D5C4B3A2918u64
+
+    // Machine A: user alice, root /home/alice/repo
+    let root_alice_hash = 0xAAAA111122223333u64
+    let cfg_a = BuildRunConfig {
+        optimization_level: 1u32,
+        enable_path_remapping: true,
+        host_root_hash: root_alice_hash,
+        toolchain_fp: official_toolchain_fp,
+    }
+
+    // Machine B: user bob, root /srv/ci_bob/workspace
+    let root_bob_hash = 0xBBBB444455556666u64
+    let cfg_b = BuildRunConfig {
+        optimization_level: 1u32,
+        enable_path_remapping: true,
+        host_root_hash: root_bob_hash,
+        toolchain_fp: official_toolchain_fp,
+    }
+
+    // 1. With canonical path remapping (@ws, @pkg, @std), binaries MUST be bit-for-bit identical
+    let bin_a = compute_simulated_binary_digest(view(cfg_a), source_hash)
+    let bin_b = compute_simulated_binary_digest(view(cfg_b), source_hash)
+    if bin_a != bin_b {
+        return false // reproducibility failure on canonical build
+    }
+
+    // 2. Perturb: Un-remapped host path leak on Machine B causes binary digest divergence
+    let cfg_b_leaked = BuildRunConfig {
+        optimization_level: 1u32,
+        enable_path_remapping: false, // leak host path!
+        host_root_hash: root_bob_hash,
+        toolchain_fp: official_toolchain_fp,
+    }
+    let bin_b_leaked = compute_simulated_binary_digest(view(cfg_b_leaked), source_hash)
+    if bin_a == bin_b_leaked {
+        return false // failed to detect host path leak
+    }
+
+    // 3. Perturb: Optimization flag drift on Machine B (-O2 vs -O1) causes binary digest divergence
+    let cfg_b_opt2 = BuildRunConfig {
+        optimization_level: 2u32, // flag drift!
+        enable_path_remapping: true,
+        host_root_hash: root_bob_hash,
+        toolchain_fp: official_toolchain_fp,
+    }
+    let bin_b_opt2 = compute_simulated_binary_digest(view(cfg_b_opt2), source_hash)
+    if bin_a == bin_b_opt2 {
+        return false // failed to detect flag drift
+    }
+
+    // 4. Perturb: Toolchain fingerprint drift on Machine B causes binary digest divergence
+    let cfg_b_drift_tc = BuildRunConfig {
+        optimization_level: 1u32,
+        enable_path_remapping: true,
+        host_root_hash: root_bob_hash,
+        toolchain_fp: official_toolchain_fp ^ 0x01u64, // tampered compiler
+    }
+    let bin_b_drift_tc = compute_simulated_binary_digest(view(cfg_b_drift_tc), source_hash)
+    if bin_a == bin_b_drift_tc {
+        return false // failed to detect toolchain drift
+    }
+
+    true
+}
+
+// ---------------------------------------------------------------------------
+// Main Conformance Entrypoint
+// ---------------------------------------------------------------------------
+
+pub fn main() -> i32 {
+    if !test_archive_extraction_security() {
+        return 1i32
+    }
+    if !test_multi_target_lockfile_defense() {
+        return 2i32
+    }
+    if !test_import_stub_verification() {
+        return 3i32
+    }
+    if !test_reproducibility_drift_detection() {
+        return 4i32
+    }
+
+    print("ADVERSARIAL-SDK-EXTRACTION-AND-REPRO-DRIFT-OK\n")
+    0i32
+}

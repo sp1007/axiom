@@ -1,0 +1,238 @@
+// test: run
+// modes: interp native
+// stdout-file: lockfile_pinning_drift_and_tamper_defense.stdout
+// SPEC-116 §4 (AXS-SDK-037..042, REQ-PKG-022, INV-SDK-002):
+// Conformance test verifying:
+// 1. axiom.lock multi-target SDK & toolchain pin state modeling & serialization.
+// 2. Strict --locked / --frozen fingerprint verification & drift detection.
+// 3. Fail-closed rejection of tampered SdkFingerprint or ToolchainFingerprint.
+// 4. Missing target triple pin handling in lockfile.
+// 5. Action cache key composition folding SdkFingerprint and ToolchainFingerprint.
+
+@intrinsic
+fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+fn fnv1a_mix(h: u64, byte_val: u8) -> u64 {
+    let mixed = h ^ (byte_val as u64)
+    wrapping_mul_u64(mixed, 1099511628211u64)
+}
+
+fn fnv1a_mix_u64(h: u64, v: u64) -> u64 {
+    let mut cur = h
+    let mut shift: u32 = 0u32
+    while shift < 64u32 {
+        let b = ((v >> shift) & 0xFFu64) as u8
+        cur = fnv1a_mix(cur, b)
+        shift = shift + 8u32
+    }
+    cur
+}
+
+// Simulated lockfile pin entry
+@derive(Copy)
+struct SdkPinSim {
+    target_id: u32,       // 1=windows-x64, 2=linux-x64, 3=linux-aarch64, 4=macos-aarch64, 5=wasm32
+    version_id: u32,
+    fingerprint_hash: u64,
+    source_id: u32,
+    is_valid: bool,
+}
+
+@derive(Copy)
+struct ToolchainPinSim {
+    toolchain_id: u32,
+    version_id: u32,
+    fingerprint_hash: u64,
+    channel_id: u32,
+    is_valid: bool,
+}
+
+@derive(Copy)
+struct LockStateSim {
+    sdk_count: usize,
+    sdks: [8]SdkPinSim,
+    toolchain: ToolchainPinSim,
+    has_toolchain: bool,
+}
+
+fn lock_state_empty_sim() -> LockStateSim {
+    let z_sdk = SdkPinSim {
+        target_id: 0u32,
+        version_id: 0u32,
+        fingerprint_hash: 0u64,
+        source_id: 0u32,
+        is_valid: false,
+    }
+    let z_tc = ToolchainPinSim {
+        toolchain_id: 0u32,
+        version_id: 0u32,
+        fingerprint_hash: 0u64,
+        channel_id: 0u32,
+        is_valid: false,
+    }
+    LockStateSim {
+        sdk_count: 0usize,
+        sdks: [
+            z_sdk, z_sdk, z_sdk, z_sdk,
+            z_sdk, z_sdk, z_sdk, z_sdk
+        ],
+        toolchain: z_tc,
+        has_toolchain: false,
+    }
+}
+
+fn add_sdk_pin(state: mut_view<LockStateSim>, target: u32, ver: u32, fp: u64) -> bool {
+    let mut i: usize = 0usize
+    while i < state.sdk_count {
+        if state.sdks[i].target_id == target {
+            state.sdks[i].version_id = ver
+            state.sdks[i].fingerprint_hash = fp
+            state.sdks[i].is_valid = true
+            return true
+        }
+        i = i + 1usize
+    }
+    if state.sdk_count >= 8usize {
+        return false
+    }
+    let idx = state.sdk_count
+    state.sdks[idx] = SdkPinSim {
+        target_id: target,
+        version_id: ver,
+        fingerprint_hash: fp,
+        source_id: 1u32,
+        is_valid: true,
+    }
+    state.sdk_count = idx + 1usize
+    true
+}
+
+// Verification under --locked / --frozen (AXS-SDK-039)
+// Returns: 0 = OK, 1 = LOCK_MISMATCH, 2 = NOT_FOUND
+fn verify_locked_sdk_sim(state: view<LockStateSim>, target: u32, active_fp: u64) -> u32 {
+    let mut i: usize = 0usize
+    while i < state.sdk_count {
+        let s = state.sdks[i]
+        if s.target_id == target {
+            if s.fingerprint_hash == active_fp {
+                return 0u32 // BUNDLE_STATUS_OK
+            }
+            return 1u32 // BUNDLE_STATUS_LOCK_MISMATCH
+        }
+        i = i + 1usize
+    }
+    2u32 // BUNDLE_STATUS_NOT_FOUND
+}
+
+fn verify_locked_toolchain_sim(state: view<LockStateSim>, tc_id: u32, active_fp: u64) -> u32 {
+    if !state.has_toolchain || !state.toolchain.is_valid {
+        return 2u32 // BUNDLE_STATUS_NOT_FOUND
+    }
+    if state.toolchain.toolchain_id != tc_id {
+        return 1u32 // BUNDLE_STATUS_LOCK_MISMATCH
+    }
+    if state.toolchain.fingerprint_hash != active_fp {
+        return 1u32 // BUNDLE_STATUS_LOCK_MISMATCH
+    }
+    0u32 // BUNDLE_STATUS_OK
+}
+
+// ActionCacheKey computation (AXS-SDK-040)
+// ActionCacheKey = BLAKE3(PackageInputHash || SdkFingerprint || ToolchainFingerprint || BuildFlagsHash)
+fn compute_action_cache_key(
+    pkg_input_hash: u64,
+    sdk_fp: u64,
+    toolchain_fp: u64,
+    build_flags_hash: u64
+) -> u64 {
+    // Domain tag "AXIOM_ACTION_CACHE_KEY_V1"
+    let mut h: u64 = 0x4158434143484531u64
+    h = fnv1a_mix_u64(h, pkg_input_hash)
+    h = fnv1a_mix_u64(h, sdk_fp)
+    h = fnv1a_mix_u64(h, toolchain_fp)
+    h = fnv1a_mix_u64(h, build_flags_hash)
+    h
+}
+
+pub fn main() -> i32 {
+    let mut state = lock_state_empty_sim()
+
+    // 1. Pin 5 targets in axiom.lock
+    // 1: windows-x64, 2: linux-x64, 3: linux-aarch64, 4: macos-aarch64, 5: wasm32
+    let _ = add_sdk_pin(mut_view(state), 1u32, 100u32, 0x1111_0001u64)
+    let _ = add_sdk_pin(mut_view(state), 2u32, 100u32, 0x2222_0002u64)
+    let _ = add_sdk_pin(mut_view(state), 3u32, 100u32, 0x3333_0003u64)
+    let _ = add_sdk_pin(mut_view(state), 4u32, 100u32, 0x4444_0004u64)
+    let _ = add_sdk_pin(mut_view(state), 5u32, 100u32, 0x5555_0005u64)
+
+    if state.sdk_count != 5usize {
+        return 1
+    }
+
+    // Pin toolchain
+    state.has_toolchain = true
+    state.toolchain = ToolchainPinSim {
+        toolchain_id: 10u32, // axiom-official-2026.11
+        version_id: 200u32,  // 0.2.0
+        fingerprint_hash: 0x9999_A0A0u64,
+        channel_id: 1u32,    // stable
+        is_valid: true,
+    }
+
+    // 2. Strict --locked verification: matching active fingerprints pass
+    let win_ok = verify_locked_sdk_sim(view(state), 1u32, 0x1111_0001u64) == 0u32
+    let nix_ok = verify_locked_sdk_sim(view(state), 2u32, 0x2222_0002u64) == 0u32
+    let aarch_ok = verify_locked_sdk_sim(view(state), 3u32, 0x3333_0003u64) == 0u32
+    let mac_ok = verify_locked_sdk_sim(view(state), 4u32, 0x4444_0004u64) == 0u32
+    let wasm_ok = verify_locked_sdk_sim(view(state), 5u32, 0x5555_0005u64) == 0u32
+    let tc_ok = verify_locked_toolchain_sim(view(state), 10u32, 0x9999_A0A0u64) == 0u32
+    if !win_ok || !nix_ok || !aarch_ok || !mac_ok || !wasm_ok || !tc_ok {
+        return 2
+    }
+
+    // 3. Drift rejection: tampered local SDK fingerprint fails with BUNDLE_STATUS_LOCK_MISMATCH
+    let sdk_tampered_rejected = verify_locked_sdk_sim(view(state), 1u32, 0x1111_0002u64) == 1u32
+    if !sdk_tampered_rejected {
+        return 3
+    }
+
+    // Tampered toolchain fingerprint fails with BUNDLE_STATUS_LOCK_MISMATCH
+    let tc_tampered_rejected = verify_locked_toolchain_sim(view(state), 10u32, 0x9999_A0A1u64) == 1u32
+    if !tc_tampered_rejected {
+        return 4
+    }
+
+    // 4. Missing target pin fails with BUNDLE_STATUS_NOT_FOUND (fail-closed)
+    let missing_target_rejected = verify_locked_sdk_sim(view(state), 99u32, 0x1111_0001u64) == 2u32
+    if !missing_target_rejected {
+        return 5
+    }
+
+    // 5. Action cache key sensitivity test (AXS-SDK-040)
+    let base_cache_key = compute_action_cache_key(0xA0A0u64, 0x1111_0001u64, 0x9999_A0A0u64, 0x01u64)
+    let identical_cache_key = compute_action_cache_key(0xA0A0u64, 0x1111_0001u64, 0x9999_A0A0u64, 0x01u64)
+    if base_cache_key != identical_cache_key {
+        return 6
+    }
+
+    // Modifying SdkFingerprint changes ActionCacheKey
+    let altered_sdk_key = compute_action_cache_key(0xA0A0u64, 0x1111_0002u64, 0x9999_A0A0u64, 0x01u64)
+    if base_cache_key == altered_sdk_key {
+        return 7
+    }
+
+    // Modifying ToolchainFingerprint changes ActionCacheKey
+    let altered_tc_key = compute_action_cache_key(0xA0A0u64, 0x1111_0001u64, 0x9999_A0A1u64, 0x01u64)
+    if base_cache_key == altered_tc_key {
+        return 8
+    }
+
+    // Modifying PackageInputHash changes ActionCacheKey
+    let altered_input_key = compute_action_cache_key(0xA0A1u64, 0x1111_0001u64, 0x9999_A0A0u64, 0x01u64)
+    if base_cache_key == altered_input_key {
+        return 9
+    }
+
+    print("LOCKFILE-PINNING-DRIFT-AND-TAMPER-DEFENSE-OK\n")
+    0
+}

@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T865, T876]
 priority: 227
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p20/e20_6_sdk_toolchain_workspace]
 spec: [spec/SPEC-116-sdk-sysroot-toolchain-distribution.md, spec/SPEC-110-build-graph-driver.md, spec/SPEC-111-package-manager-resolution-lockfiles.md, spec/SPEC-113-hermetic-builds-supply-chain-trust.md, tasks/0605, tasks/1034, tasks/0661, tasks/0858]
 covers: [REQ-ECO-8736, REQ-PKG-022]
 started: 2026-11-09 05:02:33
-agent: T877-impl
+finished: 2026-11-09 06:10:15
 ---
 # T877 — E20.6 Native SDK/sysroot, AXTOOLCHAIN distribution & two-machine lockfile reproducible multi-package workspace conformance suite
 
@@ -44,3 +44,4 @@ Certify E20.6 and the Phase P20 overall exit criterion (`multi-package workspace
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-09 05:02:33 started (attempt 1) T877-impl
+- 2026-11-09 06:10:15 accepted by QA -> done
