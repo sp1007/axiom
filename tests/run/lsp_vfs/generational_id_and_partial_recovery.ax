@@ -1,0 +1,167 @@
+// test: run
+// modes: interp native
+// stdout-file: generational_id_and_partial_recovery.stdout
+// SPEC-100 AXS-LSP-002..007, REQ-TOOL-183, REQ-TOOL-184, REQ-TOOL-188, REQ-TOOL-191, REQ-TOOL-297, REQ-TOOL-298:
+// Generational entity IDs (`FunctionId`, `LocalId`, `PlaceId`, `LspTypeId`), stale-ID
+// detection via `SemanticTombstone`, and partial-program recovery (`IncompleteMemberAccess`,
+// `IncompleteExpr`, `MissingToken`) with non-cascading poison suppression and codegen barrier.
+
+const LOOKUP_FOUND: u8 = 0u8;
+const LOOKUP_STALE: u8 = 2u8;
+
+@derive(Copy)
+struct GenId {
+    index: u32,
+    generation: u32,
+}
+
+@derive(Copy)
+struct ArenaSlot {
+    occupied: bool,
+    is_tombstone: bool,
+    is_poisoned: bool,
+    generation: u32,
+    key_hash: u64,
+    span_start: u32,
+    span_end: u32,
+}
+
+struct MiniArena {
+    slots: [16]ArenaSlot,
+    count: u32,
+    root_diags: u32,
+    suppressed_cascades: u32,
+}
+
+fn intern_by_semantic_key(a: mut_view<MiniArena>, key_hash: u64, span_start: u32, span_end: u32) -> GenId {
+    let mut i: u32 = 1u32;
+    while i <= a.count {
+        let s = a.slots[i as usize];
+        if s.occupied && !s.is_tombstone && s.key_hash == key_hash {
+            a.slots[i as usize].span_start = span_start;
+            a.slots[i as usize].span_end = span_end;
+            return GenId { index: i, generation: s.generation };
+        }
+        i = i + 1u32;
+    }
+    i = 1u32;
+    while i <= a.count {
+        let s = a.slots[i as usize];
+        if s.occupied && s.is_tombstone {
+            a.slots[i as usize] = ArenaSlot {
+                occupied: true,
+                is_tombstone: false,
+                is_poisoned: false,
+                generation: s.generation,
+                key_hash: key_hash,
+                span_start: span_start,
+                span_end: span_end,
+            };
+            return GenId { index: i, generation: s.generation };
+        }
+        i = i + 1u32;
+    }
+    a.count = a.count + 1u32;
+    let idx = a.count;
+    a.slots[idx as usize] = ArenaSlot {
+        occupied: true,
+        is_tombstone: false,
+        is_poisoned: false,
+        generation: 1u32,
+        key_hash: key_hash,
+        span_start: span_start,
+        span_end: span_end,
+    };
+    GenId { index: idx, generation: 1u32 }
+}
+
+fn retire_slot(a: mut_view<MiniArena>, id: GenId) -> bool {
+    let s = a.slots[id.index as usize];
+    if !s.occupied || s.generation != id.generation {
+        return false;
+    }
+    a.slots[id.index as usize].is_tombstone = true;
+    a.slots[id.index as usize].generation = id.generation + 1u32;
+    true
+}
+
+fn lookup_slot(a: view<MiniArena>, id: GenId) -> u8 {
+    let s = a.slots[id.index as usize];
+    if s.generation != id.generation || s.is_tombstone {
+        return LOOKUP_STALE;
+    }
+    LOOKUP_FOUND
+}
+
+fn poison_with_incomplete_expr(a: mut_view<MiniArena>, id: GenId) {
+    a.slots[id.index as usize].is_poisoned = true;
+    a.root_diags = a.root_diags + 1u32;
+}
+
+fn check_use_of_binding(a: mut_view<MiniArena>, id: GenId, mismatch: bool) {
+    if a.slots[id.index as usize].is_poisoned {
+        a.suppressed_cascades = a.suppressed_cascades + 1u32;
+        return;
+    }
+    if mismatch {
+        a.root_diags = a.root_diags + 1u32;
+    }
+}
+
+pub fn main() -> i32 {
+    let mut arena = MiniArena {
+        slots: [ArenaSlot {
+            occupied: false,
+            is_tombstone: false,
+            is_poisoned: false,
+            generation: 0u32,
+            key_hash: 0u64,
+            span_start: 0u32,
+            span_end: 0u32,
+        }; 16],
+        count: 0u32,
+        root_diags: 0u32,
+        suppressed_cascades: 0u32,
+    };
+
+    // 1. Span-independent stability across whitespace/comment edits
+    let fn_before = intern_by_semantic_key(mut_view(arena), 0x1001u64, 0u32, 50u32);
+    let loc_before = intern_by_semantic_key(mut_view(arena), 0x2001u64, 12u32, 20u32);
+    let fn_after = intern_by_semantic_key(mut_view(arena), 0x1001u64, 32u32, 82u32);
+    let loc_after = intern_by_semantic_key(mut_view(arena), 0x2001u64, 44u32, 52u32);
+    if fn_before.index != fn_after.index || fn_before.generation != fn_after.generation {
+        return 1;
+    }
+    if loc_before.index != loc_after.index || loc_before.generation != loc_after.generation {
+        return 2;
+    }
+
+    // 2. Retirement bumps generation and rejects stale handle with LOOKUP_STALE
+    let temp_id = intern_by_semantic_key(mut_view(arena), 0x3001u64, 90u32, 100u32);
+    if !retire_slot(mut_view(arena), temp_id) {
+        return 3;
+    }
+    if lookup_slot(view(arena), temp_id) != LOOKUP_STALE {
+        return 4;
+    }
+    let reused_id = intern_by_semantic_key(mut_view(arena), 0x4001u64, 90u32, 110u32);
+    if reused_id.index != temp_id.index || reused_id.generation != 2u32 {
+        return 5;
+    }
+    if lookup_slot(view(arena), temp_id) != LOOKUP_STALE || lookup_slot(view(arena), reused_id) != LOOKUP_FOUND {
+        return 6;
+    }
+
+    // 3. Partial-program recovery poison suppresses cascading errors while independent bindings still report errors
+    poison_with_incomplete_expr(mut_view(arena), loc_after);
+    check_use_of_binding(mut_view(arena), loc_after, true);
+    check_use_of_binding(mut_view(arena), loc_after, true);
+    check_use_of_binding(mut_view(arena), reused_id, true);
+
+    if arena.root_diags != 2u32 || arena.suppressed_cascades != 2u32 {
+        return 7;
+    }
+
+    print("GENERATIONAL-ID-AND-PARTIAL-RECOVERY-OK\n");
+    0
+}

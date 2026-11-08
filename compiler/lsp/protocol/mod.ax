@@ -1,0 +1,1127 @@
+// LSP 3.17 JSON-RPC 2.0 Framing (`Content-Length`), Message Parser & Method Router,
+// Server Lifecycle State Machine (`initialize`, `initialized`, `shutdown`, `exit`),
+// Cancellation Tokens (`$/cancelRequest` & revision superseding), and Versioned Fact Envelopes (T801 / E19.1).
+// Implements SPEC-100 §2.1, §2.2, §2.3 (AXS-LSP-008, AXS-LSP-009, AXS-LSP-010, AXS-LSP-012).
+module compiler.lsp.protocol
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+@derive(Copy)
+pub struct LspStrView {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+pub fn lsp_str_view(s: str) -> LspStrView {
+    let raw: LspStrView = unsafe { *(address_of(s) as *const LspStrView) };
+    let bytes: view<[u8]> = unsafe { *(address_of(s) as *const view<[u8]>) };
+    let n = raw.len;
+    let dst = unsafe { heap_alloc(n + 1, 1) };
+    let mut i: usize = 0;
+    while i < n {
+        unsafe { *(dst + i) = bytes[i]; }
+        i = i + 1;
+    }
+    unsafe { *(dst + n) = 0u8; }
+    LspStrView { ptr: dst as *const u8, len: n }
+}
+
+pub fn lsp_str_ptr(s: str) -> *const u8 {
+    let sv = lsp_str_view(s);
+    sv.ptr
+}
+
+pub fn lsp_str_len(s: str) -> usize {
+    let raw: LspStrView = unsafe { *(address_of(s) as *const LspStrView) };
+    raw.len
+}
+
+// ============================================================================
+// 1. JSON-RPC 2.0 & LSP 3.17 Constants, Error Codes & Lifecycle States
+// ============================================================================
+
+pub const LSP_SCHEMA_VERSION_1: u32 = 1u32;
+
+// Framing parse statuses
+pub const FRAME_OK: u8 = 0u8;
+pub const FRAME_INCOMPLETE: u8 = 1u8;
+pub const FRAME_ERR_MALFORMED_HEADER: u8 = 2u8;
+pub const FRAME_ERR_INVALID_UTF8: u8 = 3u8;
+
+// JSON-RPC 2.0 & LSP 3.17 standard error codes (AXS-LSP-010 §3)
+pub const LSP_ERR_NONE: i32 = 0i32;
+pub const LSP_ERR_PARSE_ERROR: i32 = -32700i32;
+pub const LSP_ERR_INVALID_REQUEST: i32 = -32600i32;
+pub const LSP_ERR_METHOD_NOT_FOUND: i32 = -32601i32;
+pub const LSP_ERR_INVALID_PARAMS: i32 = -32602i32;
+pub const LSP_ERR_INTERNAL_ERROR: i32 = -32603i32;
+pub const LSP_ERR_SERVER_NOT_INITIALIZED: i32 = -32002i32;
+pub const LSP_ERR_REQUEST_CANCELLED: i32 = -32800i32;
+pub const LSP_ERR_CONTENT_MODIFIED: i32 = -32801i32;
+
+// Server lifecycle state machine (AXS-LSP-010 §2)
+pub const LSP_STATE_UNINITIALIZED: u8 = 0u8;
+pub const LSP_STATE_INITIALIZING: u8 = 1u8;
+pub const LSP_STATE_RUNNING: u8 = 2u8;
+pub const LSP_STATE_SHUTTING_DOWN: u8 = 3u8;
+pub const LSP_STATE_EXITED: u8 = 4u8;
+
+// Position encoding negotiation (AXS-LSP-012 §1)
+pub const LSP_ENCODING_UTF16: u8 = 0u8;
+pub const LSP_ENCODING_UTF8: u8 = 1u8;
+
+// TextDocumentSyncKind
+pub const LSP_SYNC_NONE: u8 = 0u8;
+pub const LSP_SYNC_FULL: u8 = 1u8;
+pub const LSP_SYNC_INCREMENTAL: u8 = 2u8;
+
+// Message kinds
+pub const MSG_INVALID: u8 = 0u8;
+pub const MSG_REQUEST: u8 = 1u8;
+pub const MSG_NOTIFICATION: u8 = 2u8;
+pub const MSG_RESPONSE: u8 = 3u8;
+
+// Canonical LSP method identifiers
+pub const METHOD_UNKNOWN: u16 = 0u16;
+pub const METHOD_INITIALIZE: u16 = 1u16;
+pub const METHOD_INITIALIZED: u16 = 2u16;
+pub const METHOD_SHUTDOWN: u16 = 3u16;
+pub const METHOD_EXIT: u16 = 4u16;
+pub const METHOD_CANCEL_REQUEST: u16 = 5u16;
+
+pub const METHOD_DID_OPEN: u16 = 10u16;
+pub const METHOD_DID_CHANGE: u16 = 11u16;
+pub const METHOD_DID_SAVE: u16 = 12u16;
+pub const METHOD_DID_CLOSE: u16 = 13u16;
+
+pub const METHOD_HOVER: u16 = 20u16;
+pub const METHOD_COMPLETION: u16 = 21u16;
+pub const METHOD_DEFINITION: u16 = 22u16;
+pub const METHOD_TYPE_DEFINITION: u16 = 23u16;
+pub const METHOD_IMPLEMENTATION: u16 = 24u16;
+pub const METHOD_REFERENCES: u16 = 25u16;
+pub const METHOD_DOCUMENT_SYMBOL: u16 = 26u16;
+pub const METHOD_WORKSPACE_SYMBOL: u16 = 27u16;
+pub const METHOD_PREPARE_RENAME: u16 = 28u16;
+pub const METHOD_RENAME: u16 = 29u16;
+pub const METHOD_CODE_ACTION: u16 = 30u16;
+pub const METHOD_SEMANTIC_TOKENS_FULL: u16 = 31u16;
+pub const METHOD_SEMANTIC_TOKENS_DELTA: u16 = 32u16;
+pub const METHOD_INLAY_HINT: u16 = 33u16;
+pub const METHOD_SIGNATURE_HELP: u16 = 34u16;
+
+// Semantic fact certainty grades (AXS-LSP-009)
+pub const CERTAINTY_EXACT: u8 = 0u8;
+pub const CERTAINTY_RECOVERED: u8 = 1u8;
+pub const CERTAINTY_HEURISTIC: u8 = 2u8;
+pub const CERTAINTY_UNAVAILABLE: u8 = 3u8;
+
+pub const FALLBACK_NONE: u8 = 0u8;
+pub const FALLBACK_MISSING_TOKEN: u8 = 1u8;
+pub const FALLBACK_INCOMPLETE_MEMBER: u8 = 2u8;
+pub const FALLBACK_INCOMPLETE_EXPR: u8 = 3u8;
+pub const FALLBACK_INCOMPLETE_TYPE: u8 = 4u8;
+pub const FALLBACK_STALE_ENTITY: u8 = 5u8;
+
+pub const LSP_MAX_INFLIGHT_REQUESTS: usize = 64;
+
+@derive(Copy)
+pub struct LspFactHeader {
+    pub schema_version: u32,
+    pub revision: u64,
+    pub certainty: u8,
+    pub fallback_reason: u8,
+}
+
+pub fn lsp_fact_header_new(revision: u64, certainty: u8, fallback_reason: u8) -> LspFactHeader {
+    LspFactHeader {
+        schema_version: LSP_SCHEMA_VERSION_1,
+        revision: revision,
+        certainty: certainty,
+        fallback_reason: fallback_reason,
+    }
+}
+
+@derive(Copy)
+pub struct LspFrameParseResult {
+    pub status: u8,
+    pub header_bytes: usize,
+    pub body_offset: usize,
+    pub body_len: usize,
+    pub error_code: i32,
+}
+
+@derive(Copy)
+pub struct LspParsedMessage {
+    pub msg_kind: u8,
+    pub method_id: u16,
+    pub has_id: bool,
+    pub request_id: i64,
+    pub cancel_target_id: i64,
+    pub requested_encoding: u8,
+    pub doc_version: i64,
+    pub range_start_line: u32,
+    pub range_start_char: u32,
+    pub range_end_line: u32,
+    pub range_end_char: u32,
+    pub has_range: bool,
+    pub uri_offset: u32,
+    pub uri_len: u32,
+    pub text_offset: u32,
+    pub text_len: u32,
+}
+
+@derive(Copy)
+pub struct CancellationEntry {
+    pub active: bool,
+    pub cancelled: bool,
+    pub superseded: bool,
+    pub completed: bool,
+    pub method_id: u16,
+    pub request_id: i64,
+    pub snapshot_revision: u64,
+}
+
+@derive(Copy)
+pub struct LspServerCapabilities {
+    pub text_document_sync: u8,
+    pub position_encoding: u8,
+    pub hover_provider: bool,
+    pub completion_provider: bool,
+    pub definition_provider: bool,
+    pub type_definition_provider: bool,
+    pub implementation_provider: bool,
+    pub references_provider: bool,
+    pub document_symbol_provider: bool,
+    pub workspace_symbol_provider: bool,
+    pub rename_provider: bool,
+    pub prepare_rename_provider: bool,
+    pub code_action_provider: bool,
+    pub semantic_tokens_full: bool,
+    pub semantic_tokens_delta: bool,
+    pub inlay_hint_provider: bool,
+    pub signature_help_provider: bool,
+}
+
+@derive(Copy)
+pub struct LspDispatchOutcome {
+    pub accepted: bool,
+    pub produces_response: bool,
+    pub error_code: i32,
+    pub method_id: u16,
+    pub request_id: i64,
+    pub bound_revision: u64,
+    pub server_state: u8,
+}
+
+pub struct LspServerSession {
+    pub state: u8,
+    pub position_encoding: u8,
+    pub current_revision: u64,
+    pub exit_code: i32,
+    pub capabilities: LspServerCapabilities,
+    pub inflight: [64]CancellationEntry,
+    pub inflight_count: u32,
+    pub total_requests_handled: u32,
+    pub total_notifications_handled: u32,
+    pub total_cancelled_requests: u32,
+    pub total_protocol_errors: u32,
+}
+
+// ============================================================================
+// 2. Byte Slice Matching & Header / JSON Helpers
+// ============================================================================
+
+fn proto_bytes_eq_lit(ptr: *const u8, len: usize, lit: str) -> bool {
+    let sv = lsp_str_view(lit);
+    if len != sv.len || (ptr as usize) == 0 {
+        return false;
+    }
+    let lit_ptr = sv.ptr;
+    let mut i: usize = 0;
+    while i < len {
+        if (unsafe { *(ptr + i) }) != (unsafe { *(lit_ptr + i) }) {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn proto_ascii_lower(b: u8) -> u8 {
+    if b >= 65u8 && b <= 90u8 {
+        b + 32u8
+    } else {
+        b
+    }
+}
+
+fn proto_slice_starts_with_ci(ptr: *const u8, rem_len: usize, prefix: str) -> bool {
+    let sv = lsp_str_view(prefix);
+    let plen = sv.len;
+    if rem_len < plen || (ptr as usize) == 0 {
+        return false;
+    }
+    let pptr = sv.ptr;
+    let mut i: usize = 0;
+    while i < plen {
+        let a = proto_ascii_lower(unsafe { *(ptr + i) });
+        let b = proto_ascii_lower(unsafe { *(pptr + i) });
+        if a != b {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn proto_validate_utf8(ptr: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if (ptr as usize) == 0 {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < len {
+        let b0 = unsafe { *(ptr + i) };
+        if (b0 & 0x80u8) == 0u8 {
+            i = i + 1;
+        } else if b0 >= 0xC2u8 && b0 <= 0xDFu8 {
+            if (i + 1) >= len || ((unsafe { *(ptr + i + 1) }) & 0xC0u8) != 0x80u8 {
+                return false;
+            }
+            i = i + 2;
+        } else if b0 >= 0xE0u8 && b0 <= 0xEFu8 {
+            if (i + 2) >= len {
+                return false;
+            }
+            let b1 = unsafe { *(ptr + i + 1) };
+            let b2 = unsafe { *(ptr + i + 2) };
+            if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 {
+                return false;
+            }
+            let cp = (((b0 as u32) & 0x0Fu32) << 12u32) | (((b1 as u32) & 0x3Fu32) << 6u32) | ((b2 as u32) & 0x3Fu32);
+            if cp < 0x800u32 || (cp >= 0xD800u32 && cp <= 0xDFFFu32) {
+                return false;
+            }
+            i = i + 3;
+        } else if b0 >= 0xF0u8 && b0 <= 0xF4u8 {
+            if (i + 3) >= len {
+                return false;
+            }
+            let b1 = unsafe { *(ptr + i + 1) };
+            let b2 = unsafe { *(ptr + i + 2) };
+            let b3 = unsafe { *(ptr + i + 3) };
+            if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 || (b3 & 0xC0u8) != 0x80u8 {
+                return false;
+            }
+            let cp = (((b0 as u32) & 0x07u32) << 18u32) | (((b1 as u32) & 0x3Fu32) << 12u32) |
+                (((b2 as u32) & 0x3Fu32) << 6u32) | ((b3 as u32) & 0x3Fu32);
+            if cp < 0x10000u32 || cp > 0x10FFFFu32 {
+                return false;
+            }
+            i = i + 4;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+// ============================================================================
+// 3. Content-Length Frame Parser & Formatter (AXS-LSP-010 §1)
+// ============================================================================
+
+pub fn lsp_parse_frame(buf_ptr: *const u8, buf_len: usize) -> LspFrameParseResult {
+    if (buf_ptr as usize) == 0 || buf_len == 0 {
+        return LspFrameParseResult {
+            status: FRAME_INCOMPLETE,
+            header_bytes: 0,
+            body_offset: 0,
+            body_len: 0,
+            error_code: LSP_ERR_NONE,
+        };
+    }
+
+    // Locate `\r\n\r\n` header terminator while validating each header line
+    let mut line_start: usize = 0;
+    let mut i: usize = 0;
+    let mut found_end: bool = false;
+    let mut header_end: usize = 0;
+    let mut has_content_length: bool = false;
+    let mut content_length: usize = 0;
+
+    while (i + 1) < buf_len {
+        let b0 = unsafe { *(buf_ptr + i) };
+        let b1 = unsafe { *(buf_ptr + i + 1) };
+        if b0 == 13u8 && b1 == 10u8 {
+            let line_len = i - line_start;
+            if line_len == 0 {
+                // Empty line after `\r\n` -> `\r\n\r\n` header boundary!
+                header_end = i + 2;
+                found_end = true;
+                break;
+            }
+            // Validate header line `Name: Value`
+            let line_ptr = unsafe { buf_ptr + line_start };
+            let mut colon_pos: usize = line_len;
+            let mut k: usize = 0;
+            while k < line_len {
+                if (unsafe { *(line_ptr + k) }) == 58u8 {
+                    colon_pos = k;
+                    break;
+                }
+                k = k + 1;
+            }
+            if colon_pos == 0 || colon_pos >= line_len {
+                return LspFrameParseResult {
+                    status: FRAME_ERR_MALFORMED_HEADER,
+                    header_bytes: 0,
+                    body_offset: 0,
+                    body_len: 0,
+                    error_code: LSP_ERR_PARSE_ERROR,
+                };
+            }
+            if colon_pos == 14 && proto_slice_starts_with_ci(line_ptr, line_len, "Content-Length") {
+                let mut vpos = colon_pos + 1;
+                while vpos < line_len && ((unsafe { *(line_ptr + vpos) }) == 32u8 || (unsafe { *(line_ptr + vpos) }) == 9u8) {
+                    vpos = vpos + 1;
+                }
+                if vpos >= line_len {
+                    return LspFrameParseResult {
+                        status: FRAME_ERR_MALFORMED_HEADER,
+                        header_bytes: 0,
+                        body_offset: 0,
+                        body_len: 0,
+                        error_code: LSP_ERR_PARSE_ERROR,
+                    };
+                }
+                let mut parsed_len: usize = 0;
+                let mut digits: usize = 0;
+                while vpos < line_len {
+                    let ch = unsafe { *(line_ptr + vpos) };
+                    if ch >= 48u8 && ch <= 57u8 {
+                        parsed_len = (parsed_len * 10) + ((ch - 48u8) as usize);
+                        digits = digits + 1;
+                    } else if ch == 32u8 || ch == 9u8 {
+                        // trailing whitespace allowed
+                    } else {
+                        return LspFrameParseResult {
+                            status: FRAME_ERR_MALFORMED_HEADER,
+                            header_bytes: 0,
+                            body_offset: 0,
+                            body_len: 0,
+                            error_code: LSP_ERR_PARSE_ERROR,
+                        };
+                    }
+                    vpos = vpos + 1;
+                }
+                if digits == 0 {
+                    return LspFrameParseResult {
+                        status: FRAME_ERR_MALFORMED_HEADER,
+                        header_bytes: 0,
+                        body_offset: 0,
+                        body_len: 0,
+                        error_code: LSP_ERR_PARSE_ERROR,
+                    };
+                }
+                has_content_length = true;
+                content_length = parsed_len;
+            }
+            i = i + 2;
+            line_start = i;
+        } else {
+            i = i + 1;
+        }
+    }
+
+    if !found_end {
+        return LspFrameParseResult {
+            status: FRAME_INCOMPLETE,
+            header_bytes: 0,
+            body_offset: 0,
+            body_len: 0,
+            error_code: LSP_ERR_NONE,
+        };
+    }
+
+    if !has_content_length {
+        return LspFrameParseResult {
+            status: FRAME_ERR_MALFORMED_HEADER,
+            header_bytes: header_end,
+            body_offset: header_end,
+            body_len: 0,
+            error_code: LSP_ERR_PARSE_ERROR,
+        };
+    }
+
+    if (header_end + content_length) > buf_len {
+        return LspFrameParseResult {
+            status: FRAME_INCOMPLETE,
+            header_bytes: header_end,
+            body_offset: header_end,
+            body_len: content_length,
+            error_code: LSP_ERR_NONE,
+        };
+    }
+
+    let body_ptr = unsafe { buf_ptr + header_end };
+    if !proto_validate_utf8(body_ptr, content_length) {
+        return LspFrameParseResult {
+            status: FRAME_ERR_INVALID_UTF8,
+            header_bytes: header_end,
+            body_offset: header_end,
+            body_len: content_length,
+            error_code: LSP_ERR_PARSE_ERROR,
+        };
+    }
+
+    LspFrameParseResult {
+        status: FRAME_OK,
+        header_bytes: header_end,
+        body_offset: header_end,
+        body_len: content_length,
+        error_code: LSP_ERR_NONE,
+    }
+}
+pub fn lsp_write_frame(payload_ptr: *const u8, payload_len: usize, dst_ptr: *mut u8, dst_cap: usize) -> usize {
+    if (dst_ptr as usize) == 0 {
+        return 0;
+    }
+    let prefix_sv = lsp_str_view("Content-Length: ");
+    let plen = prefix_sv.len;
+    let mut digits_buf: [24]u8 = [0u8; 24];
+    let mut dcount: usize = 0;
+    if payload_len == 0 {
+        digits_buf[0] = 48u8;
+        dcount = 1;
+    } else {
+        let mut n = payload_len;
+        while n > 0 {
+            digits_buf[dcount] = (48 + (n % 10)) as u8;
+            dcount = dcount + 1;
+            n = n / 10;
+        }
+    }
+    let total_needed = plen + dcount + 4 + payload_len;
+    if total_needed > dst_cap {
+        return 0;
+    }
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(prefix_sv.ptr, dst_ptr, plen);
+    }
+    let mut pos = plen;
+    let mut k = dcount;
+    while k > 0 {
+        k = k - 1;
+        unsafe { *(dst_ptr + pos) = digits_buf[k]; }
+        pos = pos + 1;
+    }
+    unsafe {
+        *(dst_ptr + pos) = 13u8;
+        *(dst_ptr + pos + 1) = 10u8;
+        *(dst_ptr + pos + 2) = 13u8;
+        *(dst_ptr + pos + 3) = 10u8;
+    }
+    pos = pos + 4;
+    if payload_len > 0 && (payload_ptr as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(payload_ptr, dst_ptr + pos, payload_len);
+        }
+    }
+    total_needed
+}
+
+// ============================================================================
+// 4. Method Classifier & Lightweight JSON-RPC 2.0 Field Parser
+// ============================================================================
+
+pub fn lsp_classify_method(name_ptr: *const u8, name_len: usize) -> u16 {
+    if proto_bytes_eq_lit(name_ptr, name_len, "initialize") { return METHOD_INITIALIZE; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "initialized") { return METHOD_INITIALIZED; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "shutdown") { return METHOD_SHUTDOWN; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "exit") { return METHOD_EXIT; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "$/cancelRequest") { return METHOD_CANCEL_REQUEST; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/didOpen") { return METHOD_DID_OPEN; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/didChange") { return METHOD_DID_CHANGE; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/didSave") { return METHOD_DID_SAVE; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/didClose") { return METHOD_DID_CLOSE; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/hover") { return METHOD_HOVER; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/completion") { return METHOD_COMPLETION; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/definition") { return METHOD_DEFINITION; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/typeDefinition") { return METHOD_TYPE_DEFINITION; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/implementation") { return METHOD_IMPLEMENTATION; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/references") { return METHOD_REFERENCES; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/documentSymbol") { return METHOD_DOCUMENT_SYMBOL; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "workspace/symbol") { return METHOD_WORKSPACE_SYMBOL; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/prepareRename") { return METHOD_PREPARE_RENAME; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/rename") { return METHOD_RENAME; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/codeAction") { return METHOD_CODE_ACTION; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/semanticTokens/full") { return METHOD_SEMANTIC_TOKENS_FULL; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/semanticTokens/full/delta") { return METHOD_SEMANTIC_TOKENS_DELTA; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/inlayHint") { return METHOD_INLAY_HINT; }
+    if proto_bytes_eq_lit(name_ptr, name_len, "textDocument/signatureHelp") { return METHOD_SIGNATURE_HELP; }
+    METHOD_UNKNOWN
+}
+
+pub fn lsp_is_notification_method(method_id: u16) -> bool {
+    method_id == METHOD_INITIALIZED ||
+        method_id == METHOD_EXIT ||
+        method_id == METHOD_CANCEL_REQUEST ||
+        method_id == METHOD_DID_OPEN ||
+        method_id == METHOD_DID_CHANGE ||
+        method_id == METHOD_DID_SAVE ||
+        method_id == METHOD_DID_CLOSE
+}
+
+pub fn lsp_is_semantic_read_request(method_id: u16) -> bool {
+    method_id >= METHOD_HOVER && method_id <= METHOD_SIGNATURE_HELP
+}
+
+// Finds `"key"` in JSON `ptr[0..len]` and returns the index right after the `:` following `"key"`, or `len` if not found.
+fn proto_find_json_key(ptr: *const u8, len: usize, start_from: usize, key: str) -> usize {
+    let ksv = lsp_str_view(key);
+    let klen = ksv.len;
+    let kptr = ksv.ptr;
+    let mut i = start_from;
+    while (i + klen + 2) < len {
+        if (unsafe { *(ptr + i) }) == 34u8 && (unsafe { *(ptr + i + klen + 1) }) == 34u8 {
+            let mut matched = true;
+            let mut j: usize = 0;
+            while j < klen {
+                if (unsafe { *(ptr + i + 1 + j) }) != (unsafe { *(kptr + j) }) {
+                    matched = false;
+                    break;
+                }
+                j = j + 1;
+            }
+            if matched {
+                let mut c = i + klen + 2;
+                while c < len && ((unsafe { *(ptr + c) }) == 32u8 || (unsafe { *(ptr + c) }) == 9u8 || (unsafe { *(ptr + c) }) == 10u8 || (unsafe { *(ptr + c) }) == 13u8) {
+                    c = c + 1;
+                }
+                if c < len && (unsafe { *(ptr + c) }) == 58u8 {
+                    c = c + 1;
+                    while c < len && ((unsafe { *(ptr + c) }) == 32u8 || (unsafe { *(ptr + c) }) == 9u8 || (unsafe { *(ptr + c) }) == 10u8 || (unsafe { *(ptr + c) }) == 13u8) {
+                        c = c + 1;
+                    }
+                    return c;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    len
+}
+
+fn proto_parse_json_int(ptr: *const u8, len: usize, val_pos: usize, out_val: mut_view<i64>) -> bool {
+    if val_pos >= len {
+        return false;
+    }
+    let mut i = val_pos;
+    let mut neg = false;
+    if (unsafe { *(ptr + i) }) == 45u8 {
+        neg = true;
+        i = i + 1;
+    }
+    let mut v: i64 = 0i64;
+    let mut digits: usize = 0;
+    while i < len {
+        let b = unsafe { *(ptr + i) };
+        if b >= 48u8 && b <= 57u8 {
+            v = (v * 10i64) + ((b - 48u8) as i64);
+            digits = digits + 1;
+            i = i + 1;
+        } else {
+            break;
+        }
+    }
+    if digits == 0 {
+        return false;
+    }
+    *out_val = if neg { -v } else { v };
+    true
+}
+
+fn proto_parse_json_str_span(
+    ptr: *const u8,
+    len: usize,
+    val_pos: usize,
+    out_off: mut_view<u32>,
+    out_len: mut_view<u32>
+) -> bool {
+    if val_pos >= len || (unsafe { *(ptr + val_pos) }) != 34u8 {
+        return false;
+    }
+    let start = val_pos + 1;
+    let mut i = start;
+    while i < len {
+        let b = unsafe { *(ptr + i) };
+        if b == 92u8 {
+            i = i + 2;
+        } else if b == 34u8 {
+            *out_off = start as u32;
+            *out_len = (i - start) as u32;
+            return true;
+        } else {
+            i = i + 1;
+        }
+    }
+    false
+}
+
+pub fn lsp_parse_jsonrpc_message(body_ptr: *const u8, body_len: usize) -> LspParsedMessage {
+    let mut msg = LspParsedMessage {
+        msg_kind: MSG_INVALID,
+        method_id: METHOD_UNKNOWN,
+        has_id: false,
+        request_id: -1i64,
+        cancel_target_id: -1i64,
+        requested_encoding: LSP_ENCODING_UTF16,
+        doc_version: 0i64,
+        range_start_line: 0u32,
+        range_start_char: 0u32,
+        range_end_line: 0u32,
+        range_end_char: 0u32,
+        has_range: false,
+        uri_offset: 0u32,
+        uri_len: 0u32,
+        text_offset: 0u32,
+        text_len: 0u32,
+    };
+    if (body_ptr as usize) == 0 || body_len < 2 || !proto_validate_utf8(body_ptr, body_len) {
+        return msg;
+    }
+    // Check `"jsonrpc":"2.0"`
+    let jpos = proto_find_json_key(body_ptr, body_len, 0, "jsonrpc");
+    let mut j_off: u32 = 0u32;
+    let mut j_len: u32 = 0u32;
+    if jpos >= body_len || !proto_parse_json_str_span(body_ptr, body_len, jpos, mut_view(j_off), mut_view(j_len)) {
+        return msg;
+    }
+    if !proto_bytes_eq_lit(unsafe { body_ptr + (j_off as usize) }, j_len as usize, "2.0") {
+        return msg;
+    }
+
+    // Parse top-level `"method"`
+    let mpos = proto_find_json_key(body_ptr, body_len, 0, "method");
+    let mut m_off: u32 = 0u32;
+    let mut m_len: u32 = 0u32;
+    let has_method = mpos < body_len && proto_parse_json_str_span(body_ptr, body_len, mpos, mut_view(m_off), mut_view(m_len));
+    if has_method {
+        msg.method_id = lsp_classify_method(unsafe { body_ptr + (m_off as usize) }, m_len as usize);
+    }
+
+    // Parse `"params"` position so we can distinguish top-level `"id"` vs `"params":{"id":...}`
+    let ppos = proto_find_json_key(body_ptr, body_len, 0, "params");
+
+    // Parse `"id"`
+    let id_pos1 = proto_find_json_key(body_ptr, body_len, 0, "id");
+    if id_pos1 < body_len {
+        let mut parsed_id: i64 = -1i64;
+        if proto_parse_json_int(body_ptr, body_len, id_pos1, mut_view(parsed_id)) {
+            if msg.method_id == METHOD_CANCEL_REQUEST && id_pos1 > ppos {
+                msg.cancel_target_id = parsed_id;
+            } else {
+                msg.has_id = true;
+                msg.request_id = parsed_id;
+                let id_pos2 = proto_find_json_key(body_ptr, body_len, id_pos1 + 1, "id");
+                if id_pos2 < body_len {
+                    let mut target_id: i64 = -1i64;
+                    if proto_parse_json_int(body_ptr, body_len, id_pos2, mut_view(target_id)) {
+                        msg.cancel_target_id = target_id;
+                    }
+                }
+            }
+        }
+    }
+
+    if has_method {
+        msg.msg_kind = if msg.has_id { MSG_REQUEST } else { MSG_NOTIFICATION };
+    } else if msg.has_id {
+        msg.msg_kind = MSG_RESPONSE;
+    } else {
+        msg.msg_kind = MSG_INVALID;
+    }
+
+    // Check `"positionEncodings":["utf-8"]` in `initialize`
+    let enc_pos = proto_find_json_key(body_ptr, body_len, 0, "positionEncodings");
+    if enc_pos < body_len {
+        let mut scan = enc_pos;
+        while (scan + 7) <= body_len && (unsafe { *(body_ptr + scan) }) != 93u8 {
+            if proto_bytes_eq_lit(unsafe { body_ptr + scan }, 7, "\"utf-8\"") {
+                msg.requested_encoding = LSP_ENCODING_UTF8;
+                break;
+            }
+            scan = scan + 1;
+        }
+    }
+
+    // Extract `"uri"`, `"version"`, `"text"`
+    let upos = proto_find_json_key(body_ptr, body_len, 0, "uri");
+    if upos < body_len {
+        let _ = proto_parse_json_str_span(body_ptr, body_len, upos, mut_view(msg.uri_offset), mut_view(msg.uri_len));
+    }
+    let vpos = proto_find_json_key(body_ptr, body_len, 0, "version");
+    if vpos < body_len {
+        let _ = proto_parse_json_int(body_ptr, body_len, vpos, mut_view(msg.doc_version));
+    }
+    let tpos = proto_find_json_key(body_ptr, body_len, 0, "text");
+    if tpos < body_len {
+        let _ = proto_parse_json_str_span(body_ptr, body_len, tpos, mut_view(msg.text_offset), mut_view(msg.text_len));
+    }
+
+    // Extract `"line"` / `"character"` (both single position and range `start`/`end`)
+    let lpos1 = proto_find_json_key(body_ptr, body_len, 0, "line");
+    let cpos1 = proto_find_json_key(body_ptr, body_len, 0, "character");
+    if lpos1 < body_len && cpos1 < body_len {
+        let mut l1: i64 = 0i64;
+        let mut c1: i64 = 0i64;
+        if proto_parse_json_int(body_ptr, body_len, lpos1, mut_view(l1)) &&
+            proto_parse_json_int(body_ptr, body_len, cpos1, mut_view(c1)) {
+            msg.range_start_line = l1 as u32;
+            msg.range_start_char = c1 as u32;
+            let lpos2 = proto_find_json_key(body_ptr, body_len, lpos1 + 1, "line");
+            let cpos2 = proto_find_json_key(body_ptr, body_len, cpos1 + 1, "character");
+            if lpos2 < body_len && cpos2 < body_len {
+                let mut l2: i64 = 0i64;
+                let mut c2: i64 = 0i64;
+                if proto_parse_json_int(body_ptr, body_len, lpos2, mut_view(l2)) &&
+                    proto_parse_json_int(body_ptr, body_len, cpos2, mut_view(c2)) {
+                    msg.range_end_line = l2 as u32;
+                    msg.range_end_char = c2 as u32;
+                    msg.has_range = true;
+                }
+            }
+        }
+    }
+    msg
+}
+
+// ============================================================================
+// 5. Server Session Lifecycle & Cancellation Token Engine (AXS-LSP-008, AXS-LSP-010)
+// ============================================================================
+
+pub fn lsp_default_capabilities(encoding: u8) -> LspServerCapabilities {
+    LspServerCapabilities {
+        text_document_sync: LSP_SYNC_INCREMENTAL,
+        position_encoding: encoding,
+        hover_provider: true,
+        completion_provider: true,
+        definition_provider: true,
+        type_definition_provider: true,
+        implementation_provider: true,
+        references_provider: true,
+        document_symbol_provider: true,
+        workspace_symbol_provider: true,
+        rename_provider: true,
+        prepare_rename_provider: true,
+        code_action_provider: true,
+        semantic_tokens_full: true,
+        semantic_tokens_delta: true,
+        inlay_hint_provider: true,
+        signature_help_provider: true,
+    }
+}
+
+pub fn lsp_session_new() -> LspServerSession {
+    let empty_entry = CancellationEntry {
+        active: false,
+        cancelled: false,
+        superseded: false,
+        completed: false,
+        method_id: METHOD_UNKNOWN,
+        request_id: -1i64,
+        snapshot_revision: 0u64,
+    };
+    LspServerSession {
+        state: LSP_STATE_UNINITIALIZED,
+        position_encoding: LSP_ENCODING_UTF16,
+        current_revision: 1u64,
+        exit_code: -1i32,
+        capabilities: lsp_default_capabilities(LSP_ENCODING_UTF16),
+        inflight: [empty_entry; 64],
+        inflight_count: 0u32,
+        total_requests_handled: 0u32,
+        total_notifications_handled: 0u32,
+        total_cancelled_requests: 0u32,
+        total_protocol_errors: 0u32,
+    }
+}
+
+pub fn lsp_begin_request(session: mut_view<LspServerSession>, request_id: i64, method_id: u16) -> u64 {
+    let mut slot: usize = LSP_MAX_INFLIGHT_REQUESTS;
+    let mut i: usize = 0;
+    while i < LSP_MAX_INFLIGHT_REQUESTS {
+        if session.inflight[i].active && session.inflight[i].request_id == request_id {
+            slot = i;
+            break;
+        }
+        if (!session.inflight[i].active || session.inflight[i].completed) && slot == LSP_MAX_INFLIGHT_REQUESTS {
+            slot = i;
+        }
+        i = i + 1;
+    }
+    if slot == LSP_MAX_INFLIGHT_REQUESTS {
+        slot = 0;
+    }
+    session.inflight[slot] = CancellationEntry {
+        active: true,
+        cancelled: false,
+        superseded: false,
+        completed: false,
+        method_id: method_id,
+        request_id: request_id,
+        snapshot_revision: session.current_revision,
+    };
+    session.inflight_count = session.inflight_count + 1u32;
+    session.current_revision
+}
+
+pub fn lsp_cancel_request(session: mut_view<LspServerSession>, target_request_id: i64) -> bool {
+    let mut i: usize = 0;
+    while i < LSP_MAX_INFLIGHT_REQUESTS {
+        if session.inflight[i].active && !session.inflight[i].completed && session.inflight[i].request_id == target_request_id {
+            if !session.inflight[i].cancelled && !session.inflight[i].superseded {
+                session.total_cancelled_requests = session.total_cancelled_requests + 1u32;
+            }
+            session.inflight[i].cancelled = true;
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// Called when `didOpen`, `didChange`, `didSave`, or `didClose` advances the workspace revision.
+// Automatically marks any in-flight semantic read request bound to an older revision as superseded (`AXS-LSP-008 §4`).
+pub fn lsp_notify_revision_advance(session: mut_view<LspServerSession>, new_revision: u64) {
+    session.current_revision = new_revision;
+    let mut i: usize = 0;
+    while i < LSP_MAX_INFLIGHT_REQUESTS {
+        if session.inflight[i].active && !session.inflight[i].completed {
+            if (session.inflight[i].snapshot_revision) < new_revision &&
+                lsp_is_semantic_read_request(session.inflight[i].method_id) {
+                if !session.inflight[i].cancelled && !session.inflight[i].superseded {
+                    session.total_cancelled_requests = session.total_cancelled_requests + 1u32;
+                }
+                session.inflight[i].superseded = true;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+// Cooperative cancellation checkpoint: returns `LSP_ERR_REQUEST_CANCELLED` (`-32800`) if cancelled or superseded.
+pub fn lsp_check_cancellation(session: view<LspServerSession>, request_id: i64) -> i32 {
+    let mut i: usize = 0;
+    while i < LSP_MAX_INFLIGHT_REQUESTS {
+        if session.inflight[i].active && session.inflight[i].request_id == request_id {
+            if session.inflight[i].cancelled || session.inflight[i].superseded {
+                return LSP_ERR_REQUEST_CANCELLED;
+            }
+            return LSP_ERR_NONE;
+        }
+        i = i + 1;
+    }
+    LSP_ERR_NONE
+}
+
+pub fn lsp_complete_request(session: mut_view<LspServerSession>, request_id: i64) -> i32 {
+    let mut i: usize = 0;
+    while i < LSP_MAX_INFLIGHT_REQUESTS {
+        if session.inflight[i].active && session.inflight[i].request_id == request_id {
+            let err = if session.inflight[i].cancelled || session.inflight[i].superseded {
+                LSP_ERR_REQUEST_CANCELLED
+            } else {
+                LSP_ERR_NONE
+            };
+            session.inflight[i].completed = true;
+            session.inflight[i].active = false;
+            return err;
+        }
+        i = i + 1;
+    }
+    LSP_ERR_NONE
+}
+
+// Routes a parsed JSON-RPC message through the LSP 3.17 lifecycle state machine (`AXS-LSP-010 §2-3`).
+pub fn lsp_dispatch_message(session: mut_view<LspServerSession>, msg: LspParsedMessage) -> LspDispatchOutcome {
+    if msg.msg_kind == MSG_INVALID {
+        session.total_protocol_errors = session.total_protocol_errors + 1u32;
+        return LspDispatchOutcome {
+            accepted: false,
+            produces_response: true,
+            error_code: LSP_ERR_INVALID_REQUEST,
+            method_id: msg.method_id,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    // Handle `exit` notification in any state
+    if msg.method_id == METHOD_EXIT {
+        session.exit_code = if session.state == LSP_STATE_SHUTTING_DOWN { 0i32 } else { 1i32 };
+        session.state = LSP_STATE_EXITED;
+        session.total_notifications_handled = session.total_notifications_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: false,
+            error_code: LSP_ERR_NONE,
+            method_id: METHOD_EXIT,
+            request_id: -1i64,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    // Reject requests after `shutdown` with `-32600` (`InvalidRequest`)
+    if session.state == LSP_STATE_SHUTTING_DOWN || session.state == LSP_STATE_EXITED {
+        session.total_protocol_errors = session.total_protocol_errors + 1u32;
+        return LspDispatchOutcome {
+            accepted: false,
+            produces_response: msg.msg_kind == MSG_REQUEST,
+            error_code: LSP_ERR_INVALID_REQUEST,
+            method_id: msg.method_id,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    // Before `initialize`: only `initialize` (and `exit` handled above) are valid; others -> `-32002` (`ServerNotInitialized`)
+    if session.state == LSP_STATE_UNINITIALIZED {
+        if msg.method_id != METHOD_INITIALIZE {
+            session.total_protocol_errors = session.total_protocol_errors + 1u32;
+            return LspDispatchOutcome {
+                accepted: false,
+                produces_response: msg.msg_kind == MSG_REQUEST,
+                error_code: LSP_ERR_SERVER_NOT_INITIALIZED,
+                method_id: msg.method_id,
+                request_id: msg.request_id,
+                bound_revision: session.current_revision,
+                server_state: session.state,
+            };
+        }
+        session.position_encoding = msg.requested_encoding;
+        session.capabilities = lsp_default_capabilities(msg.requested_encoding);
+        session.state = LSP_STATE_INITIALIZING;
+        session.total_requests_handled = session.total_requests_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: true,
+            error_code: LSP_ERR_NONE,
+            method_id: METHOD_INITIALIZE,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    // Duplicate `initialize` after initialization -> `-32600` (`InvalidRequest`)
+    if msg.method_id == METHOD_INITIALIZE {
+        session.total_protocol_errors = session.total_protocol_errors + 1u32;
+        return LspDispatchOutcome {
+            accepted: false,
+            produces_response: true,
+            error_code: LSP_ERR_INVALID_REQUEST,
+            method_id: METHOD_INITIALIZE,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    if msg.method_id == METHOD_INITIALIZED {
+        session.state = LSP_STATE_RUNNING;
+        session.total_notifications_handled = session.total_notifications_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: false,
+            error_code: LSP_ERR_NONE,
+            method_id: METHOD_INITIALIZED,
+            request_id: -1i64,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    if msg.method_id == METHOD_SHUTDOWN {
+        session.state = LSP_STATE_SHUTTING_DOWN;
+        session.total_requests_handled = session.total_requests_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: true,
+            error_code: LSP_ERR_NONE,
+            method_id: METHOD_SHUTDOWN,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    if msg.method_id == METHOD_CANCEL_REQUEST {
+        let _ = lsp_cancel_request(mut_view(*session), msg.cancel_target_id);
+        session.total_notifications_handled = session.total_notifications_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: false,
+            error_code: LSP_ERR_NONE,
+            method_id: METHOD_CANCEL_REQUEST,
+            request_id: msg.cancel_target_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    if msg.method_id == METHOD_UNKNOWN {
+        session.total_protocol_errors = session.total_protocol_errors + 1u32;
+        return LspDispatchOutcome {
+            accepted: false,
+            produces_response: msg.msg_kind == MSG_REQUEST,
+            error_code: LSP_ERR_METHOD_NOT_FOUND,
+            method_id: METHOD_UNKNOWN,
+            request_id: msg.request_id,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    if msg.msg_kind == MSG_NOTIFICATION || lsp_is_notification_method(msg.method_id) {
+        if msg.method_id == METHOD_DID_OPEN || msg.method_id == METHOD_DID_CHANGE ||
+            msg.method_id == METHOD_DID_SAVE || msg.method_id == METHOD_DID_CLOSE {
+            let next_rev = session.current_revision + 1u64;
+            lsp_notify_revision_advance(mut_view(*session), next_rev);
+        }
+        session.total_notifications_handled = session.total_notifications_handled + 1u32;
+        return LspDispatchOutcome {
+            accepted: true,
+            produces_response: false,
+            error_code: LSP_ERR_NONE,
+            method_id: msg.method_id,
+            request_id: -1i64,
+            bound_revision: session.current_revision,
+            server_state: session.state,
+        };
+    }
+
+    let bound_rev = lsp_begin_request(mut_view(*session), msg.request_id, msg.method_id);
+    session.total_requests_handled = session.total_requests_handled + 1u32;
+    LspDispatchOutcome {
+        accepted: true,
+        produces_response: true,
+        error_code: LSP_ERR_NONE,
+        method_id: msg.method_id,
+        request_id: msg.request_id,
+        bound_revision: bound_rev,
+        server_state: session.state,
+    }
+}

@@ -1,0 +1,1999 @@
+// AXEDITOR Unicode-Aware Adaptive Text Buffer (`CompactBuffer` + Balanced `PieceTree`),
+// O(log N) Large-File Incremental Edits, Exact UTF-8 <-> UTF-16 Coordinate Mapping,
+// UAX #29 Grapheme Cluster Navigation, Atomic `EditTransaction`, Multi-Cursor `SelectionSet`,
+// Piece-Backed Undo/Redo, and O(1) Immutable `DocumentSnapshot` (T801 / E19.1).
+// Implements SPEC-100 §2.3 & §3 (AXS-LSP-012, AXS-LSP-020..022, REQ-TOOL-299, EDITOR-INV-01..40).
+module std.editor
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_add_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+@intrinsic fn rotate_left_u64(x: u64, n: u32) -> u64 { 0 }
+
+// ============================================================================
+// 1. AXEDITOR Constants, Coordinate Systems & Core Data Types (AXS-LSP-012, 020)
+// ============================================================================
+
+pub const AXEDITOR_ABI_1: u32 = 1u32;
+
+// Adaptive threshold: < 4 KiB uses contiguous CompactBuffer; >= 4 KiB uses balanced PieceTree
+pub const EDITOR_COMPACT_THRESHOLD: usize = 4096;
+pub const EDITOR_PIECE_CHUNK_SIZE: usize = 512;
+
+pub const REPR_COMPACT: u8 = 0u8;
+pub const REPR_PIECE_TREE: u8 = 1u8;
+
+pub const BUFFER_SOURCE_ORIGINAL: u8 = 0u8;
+pub const BUFFER_SOURCE_ADDED: u8 = 1u8;
+
+pub const POS_ENCODING_UTF16: u8 = 0u8;
+pub const POS_ENCODING_UTF8: u8 = 1u8;
+
+pub const NEWLINE_LF: u8 = 0u8;
+pub const NEWLINE_CRLF: u8 = 1u8;
+pub const NEWLINE_PRESERVE: u8 = 2u8;
+
+pub const AFFINITY_UPSTREAM: u8 = 0u8;
+pub const AFFINITY_DOWNSTREAM: u8 = 1u8;
+
+pub const EDITOR_MAX_SELECTIONS: usize = 16;
+pub const EDITOR_MAX_TX_EDITS: usize = 16;
+pub const EDITOR_DEFAULT_MAX_PIECES: u32 = 2048u32;
+pub const EDITOR_DEFAULT_MAX_UNDO: u32 = 128u32;
+
+@derive(Copy)
+pub struct TextPosition {
+    pub byte_offset: u64,
+}
+
+pub fn text_pos_new(byte_offset: u64) -> TextPosition {
+    TextPosition { byte_offset: byte_offset }
+}
+
+@derive(Copy)
+pub struct TextRange {
+    pub start: TextPosition,
+    pub end: TextPosition,
+}
+
+pub fn text_range_new(start_byte: u64, end_byte: u64) -> TextRange {
+    TextRange {
+        start: TextPosition { byte_offset: start_byte },
+        end: TextPosition { byte_offset: end_byte },
+    }
+}
+
+@derive(Copy)
+pub struct LspPosition {
+    pub line: u32,
+    pub character: u32,
+}
+
+pub fn lsp_pos_new(line: u32, character: u32) -> LspPosition {
+    LspPosition { line: line, character: character }
+}
+
+pub fn lsp_pos_eq(a: LspPosition, b: LspPosition) -> bool {
+    a.line == b.line && a.character == b.character
+}
+
+@derive(Copy)
+pub struct LspRange {
+    pub start: LspPosition,
+    pub end: LspPosition,
+}
+
+pub fn lsp_range_new(start: LspPosition, end: LspPosition) -> LspRange {
+    LspRange { start: start, end: end }
+}
+
+@derive(Copy)
+pub struct PieceNode {
+    pub source: u8,
+    pub active: bool,
+    pub height: u8,
+    pub pad: u8,
+    pub left: u32,
+    pub right: u32,
+    pub parent: u32,
+    pub offset: u64,
+    pub byte_len: u32,
+    pub line_breaks: u32,
+    pub utf16_units: u32,
+    pub subtree_bytes: u64,
+    pub subtree_lines: u64,
+    pub subtree_utf16: u64,
+}
+
+@derive(Copy)
+pub struct Selection {
+    pub anchor: TextPosition,
+    pub active: TextPosition,
+    pub affinity: u8,
+}
+
+pub fn selection_caret(byte_offset: u64) -> Selection {
+    Selection {
+        anchor: TextPosition { byte_offset: byte_offset },
+        active: TextPosition { byte_offset: byte_offset },
+        affinity: AFFINITY_DOWNSTREAM,
+    }
+}
+
+pub fn selection_range(anchor_byte: u64, active_byte: u64) -> Selection {
+    Selection {
+        anchor: TextPosition { byte_offset: anchor_byte },
+        active: TextPosition { byte_offset: active_byte },
+        affinity: AFFINITY_DOWNSTREAM,
+    }
+}
+
+pub fn selection_start(s: Selection) -> u64 {
+    if s.anchor.byte_offset <= s.active.byte_offset {
+        s.anchor.byte_offset
+    } else {
+        s.active.byte_offset
+    }
+}
+
+pub fn selection_end(s: Selection) -> u64 {
+    if s.anchor.byte_offset >= s.active.byte_offset {
+        s.anchor.byte_offset
+    } else {
+        s.active.byte_offset
+    }
+}
+
+@derive(Copy)
+pub struct TextEdit {
+    pub range: TextRange,
+    pub replacement_ptr: *const u8,
+    pub replacement_len: usize,
+}
+
+pub fn text_edit_new(start_byte: u64, end_byte: u64, replacement_ptr: *const u8, replacement_len: usize) -> TextEdit {
+    TextEdit {
+        range: text_range_new(start_byte, end_byte),
+        replacement_ptr: replacement_ptr,
+        replacement_len: replacement_len,
+    }
+}
+
+@derive(Copy)
+pub struct AppliedDelta {
+    pub old_start: u64,
+    pub old_end: u64,
+    pub new_start: u64,
+    pub new_end: u64,
+}
+
+@derive(Copy)
+pub struct ChangeSet {
+    pub from_rev: u64,
+    pub to_rev: u64,
+    pub edit_count: u32,
+    pub deltas: [16]AppliedDelta,
+}
+
+@derive(Copy)
+pub struct UndoEntry {
+    pub rev_before: u64,
+    pub rev_after: u64,
+    pub edit_start: u64,
+    pub inserted_len: u32,
+    pub deleted_add_offset: u64,
+    pub deleted_len: u32,
+}
+
+@derive(Copy)
+pub struct DocumentSnapshot {
+    pub doc_id: u32,
+    pub revision: u64,
+    pub repr_kind: u8,
+    pub piece_root: u32,
+    pub piece_count: u32,
+    pub byte_len: u64,
+    pub line_count: u32,
+    pub utf16_len: u64,
+    pub content_hash: u64,
+}
+
+pub struct EditorDocument {
+    pub doc_id: u32,
+    pub revision: u64,
+    pub repr_kind: u8,
+    pub newline_mode: u8,
+    pub compact_threshold: usize,
+
+    // CompactBuffer storage (for small files < compact_threshold)
+    pub compact_buf: *mut u8,
+    pub compact_len: usize,
+    pub compact_cap: usize,
+
+    // PieceTree storage (for medium/large files or promoted incremental buffers)
+    pub orig_buf: *mut u8,
+    pub orig_len: usize,
+    pub orig_cap: usize,
+    pub add_buf: *mut u8,
+    pub add_len: usize,
+    pub add_cap: usize,
+    pub pieces: *mut PieceNode,
+    pub piece_count: u32,
+    pub piece_cap: u32,
+    pub piece_root: u32,
+
+    // Document-wide O(1) summary metrics
+    pub total_bytes: u64,
+    pub total_line_breaks: u64,
+    pub total_utf16_units: u64,
+
+    // Canonical multi-cursor SelectionSet
+    pub selections: [16]Selection,
+    pub selection_count: u32,
+
+    // Bounded piece-backed Undo / Redo stacks
+    pub undo_stack: *mut UndoEntry,
+    pub undo_len: u32,
+    pub undo_cap: u32,
+    pub undo_max_steps: u32,
+    pub redo_stack: *mut UndoEntry,
+    pub redo_len: u32,
+    pub redo_cap: u32,
+
+    // Transaction telemetry & last committed ChangeSet
+    pub last_changeset: ChangeSet,
+    pub tx_commit_count: u32,
+    pub tx_rollback_count: u32,
+    pub promotion_count: u32,
+}
+
+// ============================================================================
+// 2. UTF-8 Scalar Validation, UTF-16 Code Unit Counting & Grapheme Boundaries
+// ============================================================================
+
+fn ed_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+fn ed_hash_mix(h: u64, w: u64) -> u64 {
+    let m = wrapping_mul_u64(rotate_left_u64(wrapping_mul_u64(w, 0xC2B2AE3D27D4EB4Fu64), 31u32), 0x9E3779B97F4A7C15u64);
+    wrapping_add_u64(wrapping_mul_u64(rotate_left_u64(h ^ m, 27u32), 0x9E3779B97F4A7C15u64), 0x165667B19E3779F9u64)
+}
+
+pub fn editor_utf8_seq_len(b0: u8) -> usize {
+    if (b0 & 0x80u8) == 0u8 {
+        return 1;
+    }
+    if b0 >= 0xC2u8 && b0 <= 0xDFu8 {
+        return 2;
+    }
+    if b0 >= 0xE0u8 && b0 <= 0xEFu8 {
+        return 3;
+    }
+    if b0 >= 0xF0u8 && b0 <= 0xF4u8 {
+        return 4;
+    }
+    0
+}
+
+// Decodes one valid UTF-8 Unicode scalar at `ptr[offset..len]`.
+// Returns the UTF-8 byte length (1..4) and writes the codepoint to `*out_cp`, or returns 0 on invalid UTF-8.
+pub fn editor_decode_codepoint(ptr: *const u8, len: usize, offset: usize, out_cp: mut_view<u32>) -> usize {
+    if (ptr as usize) == 0 || offset >= len {
+        *out_cp = 0u32;
+        return 0;
+    }
+    let b0 = unsafe { *(ptr + offset) };
+    if (b0 & 0x80u8) == 0u8 {
+        *out_cp = b0 as u32;
+        return 1;
+    }
+    if b0 < 0xC2u8 {
+        *out_cp = 0u32;
+        return 0;
+    }
+    if b0 <= 0xDFu8 {
+        if (offset + 1) >= len {
+            *out_cp = 0u32;
+            return 0;
+        }
+        let b1 = unsafe { *(ptr + offset + 1) };
+        if (b1 & 0xC0u8) != 0x80u8 {
+            *out_cp = 0u32;
+            return 0;
+        }
+        *out_cp = (((b0 as u32) & 0x1Fu32) << 6u32) | ((b1 as u32) & 0x3Fu32);
+        return 2;
+    }
+    if b0 <= 0xEFu8 {
+        if (offset + 2) >= len {
+            *out_cp = 0u32;
+            return 0;
+        }
+        let b1 = unsafe { *(ptr + offset + 1) };
+        let b2 = unsafe { *(ptr + offset + 2) };
+        if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 {
+            *out_cp = 0u32;
+            return 0;
+        }
+        let cp = (((b0 as u32) & 0x0Fu32) << 12u32) | (((b1 as u32) & 0x3Fu32) << 6u32) | ((b2 as u32) & 0x3Fu32);
+        if cp < 0x800u32 || (cp >= 0xD800u32 && cp <= 0xDFFFu32) {
+            *out_cp = 0u32;
+            return 0;
+        }
+        *out_cp = cp;
+        return 3;
+    }
+    if b0 <= 0xF4u8 {
+        if (offset + 3) >= len {
+            *out_cp = 0u32;
+            return 0;
+        }
+        let b1 = unsafe { *(ptr + offset + 1) };
+        let b2 = unsafe { *(ptr + offset + 2) };
+        let b3 = unsafe { *(ptr + offset + 3) };
+        if (b1 & 0xC0u8) != 0x80u8 || (b2 & 0xC0u8) != 0x80u8 || (b3 & 0xC0u8) != 0x80u8 {
+            *out_cp = 0u32;
+            return 0;
+        }
+        let cp = (((b0 as u32) & 0x07u32) << 18u32) | (((b1 as u32) & 0x3Fu32) << 12u32) |
+            (((b2 as u32) & 0x3Fu32) << 6u32) | ((b3 as u32) & 0x3Fu32);
+        if cp < 0x10000u32 || cp > 0x10FFFFu32 {
+            *out_cp = 0u32;
+            return 0;
+        }
+        *out_cp = cp;
+        return 4;
+    }
+    *out_cp = 0u32;
+    0
+}
+
+pub fn editor_codepoint_utf16_len(cp: u32) -> u32 {
+    if cp <= 0xFFFFu32 { 1u32 } else { 2u32 }
+}
+
+pub fn editor_validate_utf8_slice(ptr: *const u8, len: usize) -> bool {
+    if len == 0 {
+        return true;
+    }
+    if (ptr as usize) == 0 {
+        return false;
+    }
+    let mut off: usize = 0;
+    let mut cp: u32 = 0u32;
+    while off < len {
+        let step = editor_decode_codepoint(ptr, len, off, mut_view(cp));
+        if step == 0 {
+            return false;
+        }
+        off = off + step;
+    }
+    off == len
+}
+
+// Computes exact (line_breaks, utf16_units) for a valid UTF-8 byte slice.
+pub fn editor_scan_slice_metrics(ptr: *const u8, len: usize, out_lines: mut_view<u32>, out_utf16: mut_view<u32>) {
+    let mut lines: u32 = 0u32;
+    let mut utf16: u32 = 0u32;
+    let mut off: usize = 0;
+    let mut cp: u32 = 0u32;
+    while off < len {
+        let b = unsafe { *(ptr + off) };
+        if b == 10u8 {
+            lines = lines + 1u32;
+            utf16 = utf16 + 1u32;
+            off = off + 1;
+        } else if (b & 0x80u8) == 0u8 {
+            utf16 = utf16 + 1u32;
+            off = off + 1;
+        } else {
+            let step = editor_decode_codepoint(ptr, len, off, mut_view(cp));
+            if step == 0 {
+                utf16 = utf16 + 1u32;
+                off = off + 1;
+            } else {
+                utf16 = utf16 + editor_codepoint_utf16_len(cp);
+                off = off + step;
+            }
+        }
+    }
+    *out_lines = lines;
+    *out_utf16 = utf16;
+}
+
+// True for UAX #29 combining marks, variation selectors, skin-tone modifiers, and ZWJ (`U+200D`).
+pub fn editor_is_grapheme_extender(cp: u32) -> bool {
+    (cp >= 0x0300u32 && cp <= 0x036Fu32) ||
+        (cp >= 0x1AB0u32 && cp <= 0x1AFFu32) ||
+        (cp >= 0x1DC0u32 && cp <= 0x1DFFu32) ||
+        (cp >= 0x20D0u32 && cp <= 0x20FFu32) ||
+        (cp >= 0xFE00u32 && cp <= 0xFE2Fu32) ||
+        (cp >= 0x1F3FBu32 && cp <= 0x1F3FFu32) ||
+        cp == 0x200Du32
+}
+// ============================================================================
+// 3. Balanced PieceTree (AVL) Node Management & Subtree Summary Invariants (AXS-LSP-021)
+// ============================================================================
+
+fn ed_piece_ptr(doc: view<EditorDocument>, idx: u32) -> *mut PieceNode {
+    unsafe { doc.pieces + (idx as usize) }
+}
+
+fn ed_piece_source_ptr(doc: view<EditorDocument>, source: u8, offset: u64) -> *const u8 {
+    if source == BUFFER_SOURCE_ORIGINAL {
+        unsafe { (doc.orig_buf as *const u8) + (offset as usize) }
+    } else {
+        unsafe { (doc.add_buf as *const u8) + (offset as usize) }
+    }
+}
+
+fn ed_ensure_add_cap(doc: mut_view<EditorDocument>, extra: usize) {
+    let needed = doc.add_len + extra;
+    if needed <= doc.add_cap {
+        return;
+    }
+    let mut new_cap = if doc.add_cap == 0 { 1024 } else { doc.add_cap * 2 };
+    while new_cap < needed {
+        new_cap = new_cap * 2;
+    }
+    let new_buf = unsafe { heap_alloc(new_cap, 8) };
+    if doc.add_len > 0 && (doc.add_buf as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(doc.add_buf as *const u8, new_buf, doc.add_len);
+            heap_free(doc.add_buf, doc.add_cap, 8);
+        }
+    }
+    doc.add_buf = new_buf;
+    doc.add_cap = new_cap;
+}
+
+fn ed_append_add_bytes(doc: mut_view<EditorDocument>, ptr: *const u8, len: usize) -> u64 {
+    if len == 0 || (ptr as usize) == 0 {
+        return doc.add_len as u64;
+    }
+    ed_ensure_add_cap(mut_view(*doc), len);
+    let start_off = doc.add_len as u64;
+    unsafe {
+        ptr_copy_nonoverlapping<u8>(ptr, doc.add_buf + doc.add_len, len);
+    }
+    doc.add_len = doc.add_len + len;
+    start_off
+}
+
+fn ed_ensure_piece_cap(doc: mut_view<EditorDocument>, needed_nodes: u32) {
+    if needed_nodes < (doc.piece_cap) {
+        return;
+    }
+    let mut new_cap = if doc.piece_cap == 0u32 { EDITOR_DEFAULT_MAX_PIECES } else { doc.piece_cap * 2u32 };
+    while new_cap <= needed_nodes {
+        new_cap = new_cap * 2u32;
+    }
+    let bytes = (new_cap as usize) * size_of<PieceNode>();
+    let new_pieces = unsafe { heap_alloc(bytes, align_of<PieceNode>()) as *mut PieceNode };
+    ed_zero_bytes(new_pieces as *mut u8, bytes);
+    if doc.piece_count > 0u32 && (doc.pieces as usize) != 0 {
+        unsafe {
+            ptr_copy_nonoverlapping<PieceNode>(doc.pieces as *const PieceNode, new_pieces, (doc.piece_count + 1u32) as usize);
+            heap_free(doc.pieces as *mut u8, (doc.piece_cap as usize) * size_of<PieceNode>(), align_of<PieceNode>());
+        }
+    }
+    doc.pieces = new_pieces;
+    doc.piece_cap = new_cap;
+}
+
+fn ed_alloc_piece(doc: mut_view<EditorDocument>, source: u8, offset: u64, byte_len: u32) -> u32 {
+    ed_ensure_piece_cap(mut_view(*doc), doc.piece_count + 2u32);
+    doc.piece_count = doc.piece_count + 1u32;
+    let idx = doc.piece_count;
+    let slice_ptr = ed_piece_source_ptr(view(*doc), source, offset);
+    let mut lines: u32 = 0u32;
+    let mut utf16: u32 = 0u32;
+    editor_scan_slice_metrics(slice_ptr, byte_len as usize, mut_view(lines), mut_view(utf16));
+    let np = ed_piece_ptr(view(*doc), idx);
+    unsafe {
+        (*np).source = source;
+        (*np).active = true;
+        (*np).height = 1u8;
+        (*np).pad = 0u8;
+        (*np).left = 0u32;
+        (*np).right = 0u32;
+        (*np).parent = 0u32;
+        (*np).offset = offset;
+        (*np).byte_len = byte_len;
+        (*np).line_breaks = lines;
+        (*np).utf16_units = utf16;
+        (*np).subtree_bytes = byte_len as u64;
+        (*np).subtree_lines = lines as u64;
+        (*np).subtree_utf16 = utf16 as u64;
+    }
+    idx
+}
+
+fn ed_node_height(doc: view<EditorDocument>, idx: u32) -> i32 {
+    if idx == 0u32 {
+        return 0i32;
+    }
+    unsafe { (*ed_piece_ptr(doc, idx)).height as i32 }
+}
+
+fn ed_recompute_node(doc: mut_view<EditorDocument>, idx: u32) {
+    if idx == 0u32 {
+        return;
+    }
+    let np = ed_piece_ptr(view(*doc), idx);
+    let l = unsafe { (*np).left };
+    let r = unsafe { (*np).right };
+    let mut sb = unsafe { (*np).byte_len as u64 };
+    let mut sl = unsafe { (*np).line_breaks as u64 };
+    let mut su = unsafe { (*np).utf16_units as u64 };
+    let mut hl: u8 = 0u8;
+    let mut hr: u8 = 0u8;
+    if l != 0u32 {
+        let lp = ed_piece_ptr(view(*doc), l);
+        unsafe {
+            sb = sb + (*lp).subtree_bytes;
+            sl = sl + (*lp).subtree_lines;
+            su = su + (*lp).subtree_utf16;
+            hl = (*lp).height;
+            (*lp).parent = idx;
+        }
+    }
+    if r != 0u32 {
+        let rp = ed_piece_ptr(view(*doc), r);
+        unsafe {
+            sb = sb + (*rp).subtree_bytes;
+            sl = sl + (*rp).subtree_lines;
+            su = su + (*rp).subtree_utf16;
+            hr = (*rp).height;
+            (*rp).parent = idx;
+        }
+    }
+    let max_h = if hl >= hr { hl } else { hr };
+    unsafe {
+        (*np).subtree_bytes = sb;
+        (*np).subtree_lines = sl;
+        (*np).subtree_utf16 = su;
+        (*np).height = max_h + 1u8;
+    }
+}
+
+fn ed_rotate_right(doc: mut_view<EditorDocument>, y: u32) -> u32 {
+    let yp = ed_piece_ptr(view(*doc), y);
+    let x = unsafe { (*yp).left };
+    let xp = ed_piece_ptr(view(*doc), x);
+    let t2 = unsafe { (*xp).right };
+    unsafe {
+        (*xp).right = y;
+        (*yp).left = t2;
+    }
+    ed_recompute_node(mut_view(*doc), y);
+    ed_recompute_node(mut_view(*doc), x);
+    x
+}
+
+fn ed_rotate_left(doc: mut_view<EditorDocument>, x: u32) -> u32 {
+    let xp = ed_piece_ptr(view(*doc), x);
+    let y = unsafe { (*xp).right };
+    let yp = ed_piece_ptr(view(*doc), y);
+    let t2 = unsafe { (*yp).left };
+    unsafe {
+        (*yp).left = x;
+        (*xp).right = t2;
+    }
+    ed_recompute_node(mut_view(*doc), x);
+    ed_recompute_node(mut_view(*doc), y);
+    y
+}
+
+fn ed_balance_node(doc: mut_view<EditorDocument>, idx: u32) -> u32 {
+    if idx == 0u32 {
+        return 0u32;
+    }
+    ed_recompute_node(mut_view(*doc), idx);
+    let np = ed_piece_ptr(view(*doc), idx);
+    let l = unsafe { (*np).left };
+    let r = unsafe { (*np).right };
+    let bf = ed_node_height(view(*doc), l) - ed_node_height(view(*doc), r);
+    if bf > 1i32 {
+        let lp = ed_piece_ptr(view(*doc), l);
+        let ll = unsafe { (*lp).left };
+        let lr = unsafe { (*lp).right };
+        if ed_node_height(view(*doc), ll) < ed_node_height(view(*doc), lr) {
+            let nl = ed_rotate_left(mut_view(*doc), l);
+            unsafe { (*np).left = nl; }
+        }
+        return ed_rotate_right(mut_view(*doc), idx);
+    }
+    if bf < -1i32 {
+        let rp = ed_piece_ptr(view(*doc), r);
+        let rl = unsafe { (*rp).left };
+        let rr = unsafe { (*rp).right };
+        if ed_node_height(view(*doc), rr) < ed_node_height(view(*doc), rl) {
+            let nr = ed_rotate_right(mut_view(*doc), r);
+            unsafe { (*np).right = nr; }
+        }
+        return ed_rotate_left(mut_view(*doc), idx);
+    }
+    idx
+}
+
+// Joins two height-balanced subtrees `left_root` and `right_root` with pivot `mid_idx` in O(|h_L - h_R|) time.
+fn ed_join_with_root(doc: mut_view<EditorDocument>, left_root: u32, mid_idx: u32, right_root: u32) -> u32 {
+    let hl = ed_node_height(view(*doc), left_root);
+    let hr = ed_node_height(view(*doc), right_root);
+    if hl > (hr + 1i32) {
+        let lp = ed_piece_ptr(view(*doc), left_root);
+        let lr = unsafe { (*lp).right };
+        let new_r = ed_join_with_root(mut_view(*doc), lr, mid_idx, right_root);
+        unsafe { (*lp).right = new_r; }
+        return ed_balance_node(mut_view(*doc), left_root);
+    }
+    if hr > (hl + 1i32) {
+        let rp = ed_piece_ptr(view(*doc), right_root);
+        let rl = unsafe { (*rp).left };
+        let new_l = ed_join_with_root(mut_view(*doc), left_root, mid_idx, rl);
+        unsafe { (*rp).left = new_l; }
+        return ed_balance_node(mut_view(*doc), right_root);
+    }
+    let mp = ed_piece_ptr(view(*doc), mid_idx);
+    unsafe {
+        (*mp).left = left_root;
+        (*mp).right = right_root;
+    }
+    ed_balance_node(mut_view(*doc), mid_idx)
+}
+
+fn ed_split_rightmost(doc: mut_view<EditorDocument>, root: u32, out_rightmost: mut_view<u32>) -> u32 {
+    let np = ed_piece_ptr(view(*doc), root);
+    let r = unsafe { (*np).right };
+    if r == 0u32 {
+        let l = unsafe { (*np).left };
+        unsafe {
+            (*np).left = 0u32;
+            (*np).right = 0u32;
+            (*np).parent = 0u32;
+        }
+        ed_recompute_node(mut_view(*doc), root);
+        *out_rightmost = root;
+        return l;
+    }
+    let new_r = ed_split_rightmost(mut_view(*doc), r, out_rightmost);
+    unsafe { (*np).right = new_r; }
+    ed_balance_node(mut_view(*doc), root)
+}
+
+fn ed_concat_trees(doc: mut_view<EditorDocument>, left_root: u32, right_root: u32) -> u32 {
+    if left_root == 0u32 {
+        return right_root;
+    }
+    if right_root == 0u32 {
+        return left_root;
+    }
+    let mut mid: u32 = 0u32;
+    let rem_left = ed_split_rightmost(mut_view(*doc), left_root, mut_view(mid));
+    ed_join_with_root(mut_view(*doc), rem_left, mid, right_root)
+}
+
+// Splits `root` at byte offset `split_byte` (`0 <= split_byte <= root.subtree_bytes`) into `(out_left, out_right)`
+// in O(log N) time, splitting at most 1 piece if `split_byte` falls strictly inside a piece!
+fn ed_split_tree_at_byte(
+    doc: mut_view<EditorDocument>,
+    root: u32,
+    split_byte: u64,
+    out_left: mut_view<u32>,
+    out_right: mut_view<u32>
+) {
+    if root == 0u32 {
+        *out_left = 0u32;
+        *out_right = 0u32;
+        return;
+    }
+    let np = ed_piece_ptr(view(*doc), root);
+    let l = unsafe { (*np).left };
+    let r = unsafe { (*np).right };
+    let left_bytes = if l != 0u32 {
+        unsafe { (*ed_piece_ptr(view(*doc), l)).subtree_bytes }
+    } else {
+        0u64
+    };
+    let own_bytes = unsafe { (*np).byte_len as u64 };
+    unsafe {
+        (*np).left = 0u32;
+        (*np).right = 0u32;
+        (*np).parent = 0u32;
+    }
+    ed_recompute_node(mut_view(*doc), root);
+
+    if split_byte <= left_bytes {
+        let mut ll: u32 = 0u32;
+        let mut lr: u32 = 0u32;
+        ed_split_tree_at_byte(mut_view(*doc), l, split_byte, mut_view(ll), mut_view(lr));
+        *out_left = ll;
+        *out_right = ed_join_with_root(mut_view(*doc), lr, root, r);
+        return;
+    }
+    if split_byte >= (left_bytes + own_bytes) {
+        let mut rl: u32 = 0u32;
+        let mut rr: u32 = 0u32;
+        ed_split_tree_at_byte(mut_view(*doc), r, split_byte - left_bytes - own_bytes, mut_view(rl), mut_view(rr));
+        *out_left = ed_join_with_root(mut_view(*doc), l, root, rl);
+        *out_right = rr;
+        return;
+    }
+
+    // `split_byte` falls strictly inside `root`'s piece: split this piece into two pieces!
+    let rel = (split_byte - left_bytes) as u32;
+    let src = unsafe { (*np).source };
+    let off = unsafe { (*np).offset };
+    let rem_len = (own_bytes as u32) - rel;
+
+    // Update `root` to become the left half `[off .. off + rel]`
+    let left_slice = ed_piece_source_ptr(view(*doc), src, off);
+    let mut l_lines: u32 = 0u32;
+    let mut l_utf16: u32 = 0u32;
+    editor_scan_slice_metrics(left_slice, rel as usize, mut_view(l_lines), mut_view(l_utf16));
+    unsafe {
+        (*np).byte_len = rel;
+        (*np).line_breaks = l_lines;
+        (*np).utf16_units = l_utf16;
+    }
+    ed_recompute_node(mut_view(*doc), root);
+
+    // Allocate a new piece for the right half `[off + rel .. off + own_bytes]`
+    let right_half_idx = ed_alloc_piece(mut_view(*doc), src, off + (rel as u64), rem_len);
+    *out_left = ed_join_with_root(mut_view(*doc), l, root, 0u32);
+    *out_right = ed_join_with_root(mut_view(*doc), 0u32, right_half_idx, r);
+}
+
+fn ed_sync_root_totals(doc: mut_view<EditorDocument>) {
+    if doc.repr_kind == REPR_PIECE_TREE {
+        if doc.piece_root == 0u32 {
+            doc.total_bytes = 0u64;
+            doc.total_line_breaks = 0u64;
+            doc.total_utf16_units = 0u64;
+        } else {
+            let rp = ed_piece_ptr(view(*doc), doc.piece_root);
+            unsafe {
+                (*rp).parent = 0u32;
+                doc.total_bytes = (*rp).subtree_bytes;
+                doc.total_line_breaks = (*rp).subtree_lines;
+                doc.total_utf16_units = (*rp).subtree_utf16;
+            }
+        }
+    } else {
+        let mut lines: u32 = 0u32;
+        let mut utf16: u32 = 0u32;
+        editor_scan_slice_metrics(doc.compact_buf as *const u8, doc.compact_len, mut_view(lines), mut_view(utf16));
+        doc.total_bytes = doc.compact_len as u64;
+        doc.total_line_breaks = lines as u64;
+        doc.total_utf16_units = utf16 as u64;
+    }
+}
+
+// Appends `ptr[0..len]` into `add_buf` as chunked UTF-8-aligned pieces and returns a balanced subtree root.
+fn ed_build_added_pieces_tree(doc: mut_view<EditorDocument>, ptr: *const u8, len: usize) -> u32 {
+    if len == 0 || (ptr as usize) == 0 {
+        return 0u32;
+    }
+    let add_base = ed_append_add_bytes(mut_view(*doc), ptr, len);
+    let mut tree: u32 = 0u32;
+    let mut pos: usize = 0;
+    while pos < len {
+        let mut chunk_end = pos + EDITOR_PIECE_CHUNK_SIZE;
+        if chunk_end >= len {
+            chunk_end = len;
+        } else {
+            // Align chunk boundary to a valid UTF-8 scalar starter byte
+            while chunk_end > pos && ((unsafe { *(ptr + chunk_end) }) & 0xC0u8) == 0x80u8 {
+                chunk_end = chunk_end - 1;
+            }
+            if chunk_end == pos {
+                chunk_end = len;
+            }
+        }
+        let clen = (chunk_end - pos) as u32;
+        let p_idx = ed_alloc_piece(mut_view(*doc), BUFFER_SOURCE_ADDED, add_base + (pos as u64), clen);
+        tree = ed_join_with_root(mut_view(*doc), tree, p_idx, 0u32);
+        pos = chunk_end;
+    }
+    tree
+}
+
+// Builds initial PieceTree from `orig_buf[0..orig_len]` chunked into <= EDITOR_PIECE_CHUNK_SIZE leaves.
+fn ed_build_original_pieces_tree(doc: mut_view<EditorDocument>) -> u32 {
+    let len = doc.orig_len;
+    let ptr = doc.orig_buf as *const u8;
+    if len == 0 || (ptr as usize) == 0 {
+        return 0u32;
+    }
+    let mut tree: u32 = 0u32;
+    let mut pos: usize = 0;
+    while pos < len {
+        let mut chunk_end = pos + EDITOR_PIECE_CHUNK_SIZE;
+        if chunk_end >= len {
+            chunk_end = len;
+        } else {
+            while chunk_end > pos && ((unsafe { *(ptr + chunk_end) }) & 0xC0u8) == 0x80u8 {
+                chunk_end = chunk_end - 1;
+            }
+            if chunk_end == pos {
+                chunk_end = len;
+            }
+        }
+        let clen = (chunk_end - pos) as u32;
+        let p_idx = ed_alloc_piece(mut_view(*doc), BUFFER_SOURCE_ORIGINAL, pos as u64, clen);
+        tree = ed_join_with_root(mut_view(*doc), tree, p_idx, 0u32);
+        pos = chunk_end;
+    }
+    tree
+}
+
+// Seamless representation promotion from CompactBuffer to balanced PieceTree (`AXS-LSP-020 §3`).
+// Preserves `doc_id`, `revision`, `SelectionSet`, undo history, and all byte offsets identically.
+pub fn editor_promote_to_piece_tree(doc: mut_view<EditorDocument>) {
+    if doc.repr_kind == REPR_PIECE_TREE {
+        return;
+    }
+    let n = doc.compact_len;
+    if n > 0 && (doc.compact_buf as usize) != 0 {
+        let orig_raw = unsafe { heap_alloc(n, 8) };
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(doc.compact_buf as *const u8, orig_raw, n);
+        }
+        doc.orig_buf = orig_raw;
+        doc.orig_len = n;
+        doc.orig_cap = n;
+    } else {
+        doc.orig_buf = 0 as *mut u8;
+        doc.orig_len = 0;
+        doc.orig_cap = 0;
+    }
+    doc.piece_count = 0u32;
+    doc.piece_root = ed_build_original_pieces_tree(mut_view(*doc));
+    doc.repr_kind = REPR_PIECE_TREE;
+    doc.promotion_count = doc.promotion_count + 1u32;
+    ed_sync_root_totals(mut_view(*doc));
+}
+// ============================================================================
+// 4. Document Lifecycle, O(log N) Byte / Line Lookup & Subtree Verification
+// ============================================================================
+
+pub fn editor_doc_empty() -> EditorDocument {
+    EditorDocument {
+        doc_id: 0u32,
+        revision: 0u64,
+        repr_kind: REPR_COMPACT,
+        newline_mode: NEWLINE_LF,
+        compact_threshold: EDITOR_COMPACT_THRESHOLD,
+        compact_buf: 0 as *mut u8,
+        compact_len: 0,
+        compact_cap: 0,
+        orig_buf: 0 as *mut u8,
+        orig_len: 0,
+        orig_cap: 0,
+        add_buf: 0 as *mut u8,
+        add_len: 0,
+        add_cap: 0,
+        pieces: 0 as *mut PieceNode,
+        piece_count: 0u32,
+        piece_cap: 0u32,
+        piece_root: 0u32,
+        total_bytes: 0u64,
+        total_line_breaks: 0u64,
+        total_utf16_units: 0u64,
+        selections: [selection_caret(0u64); 16],
+        selection_count: 1u32,
+        undo_stack: 0 as *mut UndoEntry,
+        undo_len: 0u32,
+        undo_cap: 0u32,
+        undo_max_steps: EDITOR_DEFAULT_MAX_UNDO,
+        redo_stack: 0 as *mut UndoEntry,
+        redo_len: 0u32,
+        redo_cap: 0u32,
+        last_changeset: ChangeSet {
+            from_rev: 0u64,
+            to_rev: 0u64,
+            edit_count: 0u32,
+            deltas: [AppliedDelta { old_start: 0u64, old_end: 0u64, new_start: 0u64, new_end: 0u64 }; 16],
+        },
+        tx_commit_count: 0u32,
+        tx_rollback_count: 0u32,
+        promotion_count: 0u32,
+    }
+}
+
+fn ed_detect_newline_mode(ptr: *const u8, len: usize) -> u8 {
+    if (ptr as usize) == 0 || len == 0 {
+        return NEWLINE_LF;
+    }
+    let mut i: usize = 0;
+    while i < len {
+        let b = unsafe { *(ptr + i) };
+        if b == 13u8 && (i + 1) < len && (unsafe { *(ptr + i + 1) }) == 10u8 {
+            return NEWLINE_CRLF;
+        }
+        if b == 10u8 {
+            return NEWLINE_LF;
+        }
+        i = i + 1;
+    }
+    NEWLINE_LF
+}
+
+pub fn editor_doc_init_with_threshold(
+    doc: mut_view<EditorDocument>,
+    doc_id: u32,
+    initial_ptr: *const u8,
+    initial_len: usize,
+    threshold: usize
+) -> bool {
+    if !editor_validate_utf8_slice(initial_ptr, initial_len) {
+        return false;
+    }
+    doc.doc_id = doc_id;
+    doc.revision = 1u64;
+    doc.compact_threshold = if threshold == 0 { EDITOR_COMPACT_THRESHOLD } else { threshold };
+    doc.newline_mode = ed_detect_newline_mode(initial_ptr, initial_len);
+    doc.selection_count = 1u32;
+    doc.selections[0] = selection_caret(0u64);
+    doc.tx_commit_count = 0u32;
+    doc.tx_rollback_count = 0u32;
+    doc.promotion_count = 0u32;
+    doc.undo_max_steps = EDITOR_DEFAULT_MAX_UNDO;
+
+    let undo_bytes = (doc.undo_max_steps as usize) * size_of<UndoEntry>();
+    doc.undo_stack = unsafe { heap_alloc(undo_bytes, align_of<UndoEntry>()) as *mut UndoEntry };
+    ed_zero_bytes(doc.undo_stack as *mut u8, undo_bytes);
+    doc.undo_len = 0u32;
+    doc.undo_cap = doc.undo_max_steps;
+
+    doc.redo_stack = unsafe { heap_alloc(undo_bytes, align_of<UndoEntry>()) as *mut UndoEntry };
+    ed_zero_bytes(doc.redo_stack as *mut u8, undo_bytes);
+    doc.redo_len = 0u32;
+    doc.redo_cap = doc.undo_max_steps;
+
+    ed_ensure_piece_cap(mut_view(*doc), EDITOR_DEFAULT_MAX_PIECES);
+
+    if initial_len < (doc.compact_threshold) {
+        doc.repr_kind = REPR_COMPACT;
+        let cap = if initial_len < 256 { 256 } else { initial_len * 2 };
+        doc.compact_buf = unsafe { heap_alloc(cap, 8) };
+        doc.compact_cap = cap;
+        doc.compact_len = initial_len;
+        if initial_len > 0 && (initial_ptr as usize) != 0 {
+            unsafe {
+                ptr_copy_nonoverlapping<u8>(initial_ptr, doc.compact_buf, initial_len);
+            }
+        }
+        ed_sync_root_totals(mut_view(*doc));
+    } else {
+        doc.repr_kind = REPR_PIECE_TREE;
+        doc.orig_buf = unsafe { heap_alloc(initial_len, 8) };
+        doc.orig_cap = initial_len;
+        doc.orig_len = initial_len;
+        unsafe {
+            ptr_copy_nonoverlapping<u8>(initial_ptr, doc.orig_buf, initial_len);
+        }
+        doc.piece_count = 0u32;
+        doc.piece_root = ed_build_original_pieces_tree(mut_view(*doc));
+        ed_sync_root_totals(mut_view(*doc));
+    }
+    true
+}
+
+pub fn editor_doc_init(doc: mut_view<EditorDocument>, doc_id: u32, initial_ptr: *const u8, initial_len: usize) -> bool {
+    editor_doc_init_with_threshold(doc, doc_id, initial_ptr, initial_len, EDITOR_COMPACT_THRESHOLD)
+}
+
+pub fn editor_doc_free(doc: mut_view<EditorDocument>) {
+    if doc.compact_cap > 0 && (doc.compact_buf as usize) != 0 {
+        unsafe { heap_free(doc.compact_buf, doc.compact_cap, 8); }
+    }
+    if doc.orig_cap > 0 && (doc.orig_buf as usize) != 0 {
+        unsafe { heap_free(doc.orig_buf, doc.orig_cap, 8); }
+    }
+    if doc.add_cap > 0 && (doc.add_buf as usize) != 0 {
+        unsafe { heap_free(doc.add_buf, doc.add_cap, 8); }
+    }
+    if doc.piece_cap > 0u32 && (doc.pieces as usize) != 0 {
+        unsafe {
+            heap_free(doc.pieces as *mut u8, (doc.piece_cap as usize) * size_of<PieceNode>(), align_of<PieceNode>());
+        }
+    }
+    if doc.undo_cap > 0u32 && (doc.undo_stack as usize) != 0 {
+        unsafe {
+            heap_free(doc.undo_stack as *mut u8, (doc.undo_cap as usize) * size_of<UndoEntry>(), align_of<UndoEntry>());
+        }
+    }
+    if doc.redo_cap > 0u32 && (doc.redo_stack as usize) != 0 {
+        unsafe {
+            heap_free(doc.redo_stack as *mut u8, (doc.redo_cap as usize) * size_of<UndoEntry>(), align_of<UndoEntry>());
+        }
+    }
+    doc.compact_buf = 0 as *mut u8;
+    doc.compact_len = 0;
+    doc.compact_cap = 0;
+    doc.orig_buf = 0 as *mut u8;
+    doc.orig_len = 0;
+    doc.orig_cap = 0;
+    doc.add_buf = 0 as *mut u8;
+    doc.add_len = 0;
+    doc.add_cap = 0;
+    doc.pieces = 0 as *mut PieceNode;
+    doc.piece_count = 0u32;
+    doc.piece_cap = 0u32;
+    doc.piece_root = 0u32;
+    doc.undo_stack = 0 as *mut UndoEntry;
+    doc.undo_len = 0u32;
+    doc.undo_cap = 0u32;
+    doc.redo_stack = 0 as *mut UndoEntry;
+    doc.redo_len = 0u32;
+    doc.redo_cap = 0u32;
+}
+
+// O(log N) byte lookup at `byte_offset`.
+pub fn editor_byte_at(doc: view<EditorDocument>, byte_offset: u64) -> u8 {
+    if byte_offset >= doc.total_bytes {
+        return 0u8;
+    }
+    if doc.repr_kind == REPR_COMPACT {
+        return unsafe { *(doc.compact_buf + (byte_offset as usize)) };
+    }
+    let mut cur = doc.piece_root;
+    let mut rem = byte_offset;
+    while cur != 0u32 {
+        let np = ed_piece_ptr(doc, cur);
+        let l = unsafe { (*np).left };
+        let left_bytes = if l != 0u32 {
+            unsafe { (*ed_piece_ptr(doc, l)).subtree_bytes }
+        } else {
+            0u64
+        };
+        if rem < left_bytes {
+            cur = l;
+        } else {
+            let own_bytes = unsafe { (*np).byte_len as u64 };
+            if rem < (left_bytes + own_bytes) {
+                let rel = rem - left_bytes;
+                let src_ptr = ed_piece_source_ptr(doc, unsafe { (*np).source }, unsafe { (*np).offset + rel });
+                return unsafe { *src_ptr };
+            }
+            rem = rem - left_bytes - own_bytes;
+            cur = unsafe { (*np).right };
+        }
+    }
+    0u8
+}
+
+// Copies `[start_byte .. end_byte]` into `dst` (which must have capacity `end_byte - start_byte`).
+pub fn editor_copy_range(doc: view<EditorDocument>, start_byte: u64, end_byte: u64, dst: *mut u8) -> usize {
+    if start_byte >= end_byte || start_byte >= doc.total_bytes || (dst as usize) == 0 {
+        return 0;
+    }
+    let clamped_end = if end_byte > doc.total_bytes { doc.total_bytes } else { end_byte };
+    let count = (clamped_end - start_byte) as usize;
+    if doc.repr_kind == REPR_COMPACT {
+        unsafe {
+            ptr_copy_nonoverlapping<u8>((doc.compact_buf as *const u8) + (start_byte as usize), dst, count);
+        }
+        return count;
+    }
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(dst + i) = editor_byte_at(doc, start_byte + (i as u64)); }
+        i = i + 1;
+    }
+    count
+}
+
+fn ed_verify_node_invariants(doc: view<EditorDocument>, idx: u32, out_active_leaves: mut_view<u32>) -> bool {
+    if idx == 0u32 {
+        return true;
+    }
+    let np = ed_piece_ptr(doc, idx);
+    let l = unsafe { (*np).left };
+    let r = unsafe { (*np).right };
+    if !ed_verify_node_invariants(doc, l, mut_view(*out_active_leaves)) {
+        return false;
+    }
+    if !ed_verify_node_invariants(doc, r, mut_view(*out_active_leaves)) {
+        return false;
+    }
+    *out_active_leaves = *out_active_leaves + 1u32;
+    let mut exp_bytes = unsafe { (*np).byte_len as u64 };
+    let mut exp_lines = unsafe { (*np).line_breaks as u64 };
+    let mut exp_utf16 = unsafe { (*np).utf16_units as u64 };
+    let mut hl: i32 = 0i32;
+    let mut hr: i32 = 0i32;
+    if l != 0u32 {
+        let lp = ed_piece_ptr(doc, l);
+        unsafe {
+            exp_bytes = exp_bytes + (*lp).subtree_bytes;
+            exp_lines = exp_lines + (*lp).subtree_lines;
+            exp_utf16 = exp_utf16 + (*lp).subtree_utf16;
+            hl = (*lp).height as i32;
+        }
+    }
+    if r != 0u32 {
+        let rp = ed_piece_ptr(doc, r);
+        unsafe {
+            exp_bytes = exp_bytes + (*rp).subtree_bytes;
+            exp_lines = exp_lines + (*rp).subtree_lines;
+            exp_utf16 = exp_utf16 + (*rp).subtree_utf16;
+            hr = (*rp).height as i32;
+        }
+    }
+    let bf = hl - hr;
+    if bf < -1i32 || bf > 1i32 {
+        return false;
+    }
+    unsafe {
+        (*np).subtree_bytes == exp_bytes &&
+            (*np).subtree_lines == exp_lines &&
+            (*np).subtree_utf16 == exp_utf16
+    }
+}
+
+// Verifies AVL height balance and exact (`subtree_bytes`, `subtree_lines`, `subtree_utf16`) aggregates on every node.
+pub fn editor_verify_tree_invariants(doc: view<EditorDocument>) -> bool {
+    if doc.repr_kind == REPR_COMPACT {
+        return true;
+    }
+    let mut active_count: u32 = 0u32;
+    if !ed_verify_node_invariants(doc, doc.piece_root, mut_view(active_count)) {
+        return false;
+    }
+    if doc.piece_root == 0u32 {
+        return doc.total_bytes == 0u64 && doc.total_line_breaks == 0u64 && doc.total_utf16_units == 0u64;
+    }
+    let rp = ed_piece_ptr(doc, doc.piece_root);
+    unsafe {
+        (*rp).subtree_bytes == doc.total_bytes &&
+            (*rp).subtree_lines == doc.total_line_breaks &&
+            (*rp).subtree_utf16 == doc.total_utf16_units
+    }
+}
+
+// ============================================================================
+// 5. O(log N) UTF-8 Byte Offset <-> UTF-16 / UTF-8 LSP Position Mapping (AXS-LSP-012)
+// ============================================================================
+
+// Finds the byte offset immediately after the `target_line - 1`-th '\n' in O(log N) time using `subtree_lines`.
+pub fn editor_line_start_byte(doc: view<EditorDocument>, target_line: u32) -> u64 {
+    if target_line == 0u32 {
+        return 0u64;
+    }
+    if (target_line as u64) > doc.total_line_breaks {
+        return doc.total_bytes;
+    }
+    if doc.repr_kind == REPR_COMPACT {
+        let mut seen_nl: u32 = 0u32;
+        let mut i: usize = 0;
+        while i < (doc.compact_len) {
+            if (unsafe { *(doc.compact_buf + i) }) == 10u8 {
+                seen_nl = seen_nl + 1u32;
+                if seen_nl == target_line {
+                    return (i + 1) as u64;
+                }
+            }
+            i = i + 1;
+        }
+        return doc.total_bytes;
+    }
+    // Descend PieceTree using `subtree_lines`
+    let mut cur = doc.piece_root;
+    let mut rem_lines = target_line as u64;
+    let mut byte_acc: u64 = 0u64;
+    while cur != 0u32 {
+        let np = ed_piece_ptr(doc, cur);
+        let l = unsafe { (*np).left };
+        let left_lines = if l != 0u32 { unsafe { (*ed_piece_ptr(doc, l)).subtree_lines } } else { 0u64 };
+        let left_bytes = if l != 0u32 { unsafe { (*ed_piece_ptr(doc, l)).subtree_bytes } } else { 0u64 };
+        if rem_lines <= left_lines {
+            cur = l;
+        } else {
+            let own_lines = unsafe { (*np).line_breaks as u64 };
+            let own_bytes = unsafe { (*np).byte_len as u64 };
+            if rem_lines <= (left_lines + own_lines) {
+                let needed_in_piece = (rem_lines - left_lines) as u32;
+                let slice_ptr = ed_piece_source_ptr(doc, unsafe { (*np).source }, unsafe { (*np).offset });
+                let mut seen: u32 = 0u32;
+                let mut k: u32 = 0u32;
+                while k < (own_bytes as u32) {
+                    if (unsafe { *(slice_ptr + (k as usize)) }) == 10u8 {
+                        seen = seen + 1u32;
+                        if seen == needed_in_piece {
+                            return byte_acc + left_bytes + (k as u64) + 1u64;
+                        }
+                    }
+                    k = k + 1u32;
+                }
+                return byte_acc + left_bytes + own_bytes;
+            }
+            byte_acc = byte_acc + left_bytes + own_bytes;
+            rem_lines = rem_lines - left_lines - own_lines;
+            cur = unsafe { (*np).right };
+        }
+    }
+    doc.total_bytes
+}
+
+// Finds the terminal byte offset of `line` (before `\r\n` or `\n`, or `doc.total_bytes` on the last line).
+pub fn editor_line_end_byte(doc: view<EditorDocument>, line: u32) -> u64 {
+    if (line as u64) > doc.total_line_breaks {
+        return doc.total_bytes;
+    }
+    let start_b = editor_line_start_byte(doc, line);
+    let next_start = if (line as u64) < (doc.total_line_breaks) {
+        editor_line_start_byte(doc, line + 1u32)
+    } else {
+        doc.total_bytes
+    };
+    let mut end_b = next_start;
+    if end_b > start_b && editor_byte_at(doc, end_b - 1u64) == 10u8 {
+        end_b = end_b - 1u64;
+        if end_b > start_b && editor_byte_at(doc, end_b - 1u64) == 13u8 {
+            end_b = end_b - 1u64;
+        }
+    }
+    end_b
+}
+
+// Finds the 0-based line number containing `byte_offset` in O(log N) time using `subtree_bytes` and `subtree_lines`.
+pub fn editor_line_of_byte(doc: view<EditorDocument>, byte_offset: u64) -> u32 {
+    let clamped = if byte_offset > doc.total_bytes { doc.total_bytes } else { byte_offset };
+    if doc.repr_kind == REPR_COMPACT {
+        let mut line: u32 = 0u32;
+        let mut i: usize = 0;
+        let n = clamped as usize;
+        while i < n {
+            if (unsafe { *(doc.compact_buf + i) }) == 10u8 {
+                line = line + 1u32;
+            }
+            i = i + 1;
+        }
+        return line;
+    }
+    let mut cur = doc.piece_root;
+    let mut rem_bytes = clamped;
+    let mut lines_before: u64 = 0u64;
+    while cur != 0u32 {
+        let np = ed_piece_ptr(doc, cur);
+        let l = unsafe { (*np).left };
+        let left_bytes = if l != 0u32 { unsafe { (*ed_piece_ptr(doc, l)).subtree_bytes } } else { 0u64 };
+        let left_lines = if l != 0u32 { unsafe { (*ed_piece_ptr(doc, l)).subtree_lines } } else { 0u64 };
+        if rem_bytes < left_bytes {
+            cur = l;
+        } else {
+            let own_bytes = unsafe { (*np).byte_len as u64 };
+            let own_lines = unsafe { (*np).line_breaks as u64 };
+            if rem_bytes <= (left_bytes + own_bytes) {
+                let in_piece = (rem_bytes - left_bytes) as usize;
+                let slice_ptr = ed_piece_source_ptr(doc, unsafe { (*np).source }, unsafe { (*np).offset });
+                let mut k: usize = 0;
+                let mut p_lines: u64 = 0u64;
+                while k < in_piece {
+                    if (unsafe { *(slice_ptr + k) }) == 10u8 {
+                        p_lines = p_lines + 1u64;
+                    }
+                    k = k + 1;
+                }
+                return (lines_before + left_lines + p_lines) as u32;
+            }
+            lines_before = lines_before + left_lines + own_lines;
+            rem_bytes = rem_bytes - left_bytes - own_bytes;
+            cur = unsafe { (*np).right };
+        }
+    }
+    lines_before as u32
+}
+
+// Converts a UTF-8 byte offset to an LSP `(line, character)` position under `encoding` (`POS_ENCODING_UTF16` or `POS_ENCODING_UTF8`).
+pub fn editor_byte_offset_to_lsp_pos(doc: view<EditorDocument>, byte_offset: u64, encoding: u8) -> LspPosition {
+    let clamped = if byte_offset > doc.total_bytes { doc.total_bytes } else { byte_offset };
+    let line = editor_line_of_byte(doc, clamped);
+    let line_start = editor_line_start_byte(doc, line);
+    let line_end = editor_line_end_byte(doc, line);
+    let target = if clamped > line_end { line_end } else { clamped };
+    if encoding == POS_ENCODING_UTF8 {
+        return LspPosition { line: line, character: (target - line_start) as u32 };
+    }
+    // Count UTF-16 code units from `line_start` to `target` without splitting multi-byte scalars
+    let mut pos = line_start;
+    let mut utf16_col: u32 = 0u32;
+    let mut tmp: [4]u8 = [0u8; 4];
+    let mut cp: u32 = 0u32;
+    while pos < target {
+        let b0 = editor_byte_at(doc, pos);
+        if (b0 & 0x80u8) == 0u8 {
+            utf16_col = utf16_col + 1u32;
+            pos = pos + 1u64;
+        } else {
+            let seq_len = editor_utf8_seq_len(b0);
+            if seq_len == 0 || (pos + (seq_len as u64)) > target {
+                break;
+            }
+            let mut k: usize = 0;
+            while k < seq_len {
+                tmp[k] = editor_byte_at(doc, pos + (k as u64));
+                k = k + 1;
+            }
+            let dec_len = editor_decode_codepoint(unsafe { address_of(tmp[0]) }, seq_len, 0, mut_view(cp));
+            if dec_len == 0 {
+                break;
+            }
+            utf16_col = utf16_col + editor_codepoint_utf16_len(cp);
+            pos = pos + (dec_len as u64);
+        }
+    }
+    LspPosition { line: line, character: utf16_col }
+}
+
+// Converts an LSP `(line, character)` position to a canonical UTF-8 byte offset, clamping out-of-range
+// `character` values to the line's terminal byte offset and never clamping mid-codepoint (`AXS-LSP-012 §2`).
+pub fn editor_lsp_pos_to_byte_offset(doc: view<EditorDocument>, pos: LspPosition, encoding: u8) -> u64 {
+    if (pos.line as u64) > doc.total_line_breaks {
+        return doc.total_bytes;
+    }
+    let line_start = editor_line_start_byte(doc, pos.line);
+    let line_end = editor_line_end_byte(doc, pos.line);
+    if encoding == POS_ENCODING_UTF8 {
+        let mut cand = line_start + (pos.character as u64);
+        if cand >= line_end {
+            return line_end;
+        }
+        // Snap backward if `cand` lands on a UTF-8 continuation byte (`10xxxxxx`)
+        while cand > line_start && (editor_byte_at(doc, cand) & 0xC0u8) == 0x80u8 {
+            cand = cand - 1u64;
+        }
+        return cand;
+    }
+    let mut cur_byte = line_start;
+    let mut cur_utf16: u32 = 0u32;
+    let mut tmp: [4]u8 = [0u8; 4];
+    let mut cp: u32 = 0u32;
+    while cur_byte < line_end && cur_utf16 < (pos.character) {
+        let b0 = editor_byte_at(doc, cur_byte);
+        if (b0 & 0x80u8) == 0u8 {
+            cur_utf16 = cur_utf16 + 1u32;
+            cur_byte = cur_byte + 1u64;
+        } else {
+            let seq_len = editor_utf8_seq_len(b0);
+            if seq_len == 0 || (cur_byte + (seq_len as u64)) > line_end {
+                break;
+            }
+            let mut k: usize = 0;
+            while k < seq_len {
+                tmp[k] = editor_byte_at(doc, cur_byte + (k as u64));
+                k = k + 1;
+            }
+            let dec_len = editor_decode_codepoint(unsafe { address_of(tmp[0]) }, seq_len, 0, mut_view(cp));
+            if dec_len == 0 {
+                break;
+            }
+            let u16_w = editor_codepoint_utf16_len(cp);
+            // Never split a surrogate pair if `pos.character` falls inside a 2-unit astral scalar
+            if (cur_utf16 + u16_w) > pos.character {
+                break;
+            }
+            cur_utf16 = cur_utf16 + u16_w;
+            cur_byte = cur_byte + (dec_len as u64);
+        }
+    }
+    cur_byte
+}
+
+pub fn editor_byte_range_to_lsp_range(doc: view<EditorDocument>, range: TextRange, encoding: u8) -> LspRange {
+    LspRange {
+        start: editor_byte_offset_to_lsp_pos(doc, range.start.byte_offset, encoding),
+        end: editor_byte_offset_to_lsp_pos(doc, range.end.byte_offset, encoding),
+    }
+}
+
+pub fn editor_lsp_range_to_byte_range(doc: view<EditorDocument>, range: LspRange, encoding: u8) -> TextRange {
+    TextRange {
+        start: TextPosition { byte_offset: editor_lsp_pos_to_byte_offset(doc, range.start, encoding) },
+        end: TextPosition { byte_offset: editor_lsp_pos_to_byte_offset(doc, range.end, encoding) },
+    }
+}
+// ============================================================================
+// 6. UTF-8 Scalar Boundary Integrity & UAX #29 Grapheme Cluster Motion (AXS-LSP-021 §3)
+// ============================================================================
+
+pub fn editor_is_char_boundary(doc: view<EditorDocument>, byte_offset: u64) -> bool {
+    if byte_offset == 0u64 || byte_offset == doc.total_bytes {
+        return true;
+    }
+    if byte_offset > doc.total_bytes {
+        return false;
+    }
+    let b = editor_byte_at(doc, byte_offset);
+    (b & 0xC0u8) != 0x80u8
+}
+
+fn ed_decode_at_doc(doc: view<EditorDocument>, byte_offset: u64, out_cp: mut_view<u32>) -> u64 {
+    if byte_offset >= doc.total_bytes {
+        *out_cp = 0u32;
+        return 0u64;
+    }
+    let b0 = editor_byte_at(doc, byte_offset);
+    if (b0 & 0x80u8) == 0u8 {
+        *out_cp = b0 as u32;
+        return 1u64;
+    }
+    let seq_len = editor_utf8_seq_len(b0);
+    if seq_len == 0 || (byte_offset + (seq_len as u64)) > doc.total_bytes {
+        *out_cp = 0u32;
+        return 0u64;
+    }
+    let mut tmp: [4]u8 = [0u8; 4];
+    let mut i: usize = 0;
+    while i < seq_len {
+        tmp[i] = editor_byte_at(doc, byte_offset + (i as u64));
+        i = i + 1;
+    }
+    let dec = editor_decode_codepoint(unsafe { address_of(tmp[0]) }, seq_len, 0, mut_view(*out_cp));
+    dec as u64
+}
+
+// Advances across one complete UAX #29 extended grapheme cluster starting at `byte_offset`.
+// Keeps `\r\n`, base + combining marks, and ZWJ sequences intact (`EDITOR-INV-21..22`).
+pub fn editor_next_grapheme_offset(doc: view<EditorDocument>, byte_offset: u64) -> u64 {
+    if byte_offset >= doc.total_bytes {
+        return doc.total_bytes;
+    }
+    let b0 = editor_byte_at(doc, byte_offset);
+    if b0 == 13u8 && (byte_offset + 1u64) < (doc.total_bytes) && editor_byte_at(doc, byte_offset + 1u64) == 10u8 {
+        return byte_offset + 2u64;
+    }
+    if b0 == 10u8 || b0 == 13u8 {
+        return byte_offset + 1u64;
+    }
+    let mut cp: u32 = 0u32;
+    let first_step = ed_decode_at_doc(doc, byte_offset, mut_view(cp));
+    if first_step == 0u64 {
+        return byte_offset + 1u64;
+    }
+    let mut cur = byte_offset + first_step;
+    while cur < (doc.total_bytes) {
+        let mut next_cp: u32 = 0u32;
+        let next_step = ed_decode_at_doc(doc, cur, mut_view(next_cp));
+        if next_step == 0u64 {
+            break;
+        }
+        if editor_is_grapheme_extender(next_cp) {
+            cur = cur + next_step;
+            // If ZWJ (`U+200D`), also consume the joined base scalar immediately following it
+            if next_cp == 0x200Du32 && cur < (doc.total_bytes) {
+                let mut joined_cp: u32 = 0u32;
+                let joined_step = ed_decode_at_doc(doc, cur, mut_view(joined_cp));
+                if joined_step > 0u64 && joined_cp != 10u8 as u32 && joined_cp != 13u8 as u32 {
+                    cur = cur + joined_step;
+                }
+            }
+        } else {
+            break;
+        }
+    }
+    cur
+}
+
+// Steps backward across one complete UAX #29 extended grapheme cluster ending at `byte_offset`.
+pub fn editor_prev_grapheme_offset(doc: view<EditorDocument>, byte_offset: u64) -> u64 {
+    if byte_offset == 0u64 {
+        return 0u64;
+    }
+    let clamped = if byte_offset > doc.total_bytes { doc.total_bytes } else { byte_offset };
+    if clamped >= 2u64 && editor_byte_at(doc, clamped - 1u64) == 10u8 && editor_byte_at(doc, clamped - 2u64) == 13u8 {
+        return clamped - 2u64;
+    }
+    // Scan from the start of the current line (or up to 64 bytes back) to find the cluster boundary before `clamped`
+    let line = editor_line_of_byte(doc, clamped);
+    let line_start = editor_line_start_byte(doc, line);
+    if clamped == line_start {
+        if line_start >= 2u64 && editor_byte_at(doc, line_start - 1u64) == 10u8 && editor_byte_at(doc, line_start - 2u64) == 13u8 {
+            return line_start - 2u64;
+        }
+        return line_start - 1u64;
+    }
+    let mut scan = line_start;
+    let mut prev = line_start;
+    while scan < clamped {
+        prev = scan;
+        scan = editor_next_grapheme_offset(doc, scan);
+    }
+    prev
+}
+
+// ============================================================================
+// 7. Multi-Cursor SelectionSet Normalization & Caret Remapping (AXS-LSP-022 §2)
+// ============================================================================
+
+pub fn editor_normalize_selections(doc: mut_view<EditorDocument>) {
+    if doc.selection_count == 0u32 {
+        doc.selection_count = 1u32;
+        doc.selections[0] = selection_caret(0u64);
+        return;
+    }
+    let n = doc.selection_count as usize;
+    // Clamp all selections to valid UTF-8 boundaries within `0..=doc.total_bytes`
+    let mut i: usize = 0;
+    while i < n {
+        let mut a = doc.selections[i].anchor.byte_offset;
+        let mut b = doc.selections[i].active.byte_offset;
+        if a > doc.total_bytes { a = doc.total_bytes; }
+        if b > doc.total_bytes { b = doc.total_bytes; }
+        while a > 0u64 && !editor_is_char_boundary(view(*doc), a) { a = a - 1u64; }
+        while b > 0u64 && !editor_is_char_boundary(view(*doc), b) { b = b - 1u64; }
+        doc.selections[i].anchor.byte_offset = a;
+        doc.selections[i].active.byte_offset = b;
+        i = i + 1;
+    }
+    // Insertion sort by `(selection_start, selection_end)`
+    i = 1;
+    while i < n {
+        let cur = doc.selections[i];
+        let cur_s = selection_start(cur);
+        let cur_e = selection_end(cur);
+        let mut j = i;
+        while j > 0 {
+            let prev = doc.selections[j - 1];
+            let prev_s = selection_start(prev);
+            let prev_e = selection_end(prev);
+            if prev_s < cur_s || (prev_s == cur_s && prev_e <= cur_e) {
+                break;
+            }
+            doc.selections[j] = prev;
+            j = j - 1;
+        }
+        doc.selections[j] = cur;
+        i = i + 1;
+    }
+    // Merge overlapping selections (or identical carets)
+    let mut out_idx: usize = 0;
+    i = 1;
+    while i < n {
+        let cur = doc.selections[i];
+        let prev = doc.selections[out_idx];
+        let prev_s = selection_start(prev);
+        let prev_e = selection_end(prev);
+        let cur_s = selection_start(cur);
+        let cur_e = selection_end(cur);
+        let should_merge = if prev_s == prev_e && cur_s == cur_e {
+            prev_s == cur_s
+        } else {
+            cur_s <= prev_e
+        };
+        if should_merge {
+            let merged_start = if prev_s <= cur_s { prev_s } else { cur_s };
+            let merged_end = if prev_e >= cur_e { prev_e } else { cur_e };
+            doc.selections[out_idx] = selection_range(merged_start, merged_end);
+        } else {
+            out_idx = out_idx + 1;
+            doc.selections[out_idx] = cur;
+        }
+        i = i + 1;
+    }
+    doc.selection_count = (out_idx + 1) as u32;
+}
+
+pub fn editor_set_selections(doc: mut_view<EditorDocument>, sels: *const Selection, count: u32) {
+    if (sels as usize) == 0 || count == 0u32 {
+        doc.selection_count = 1u32;
+        doc.selections[0] = selection_caret(0u64);
+        return;
+    }
+    let capped = if (count as usize) > EDITOR_MAX_SELECTIONS { EDITOR_MAX_SELECTIONS } else { count as usize };
+    let mut i: usize = 0;
+    while i < capped {
+        doc.selections[i] = unsafe { *(sels + i) };
+        i = i + 1;
+    }
+    doc.selection_count = capped as u32;
+    editor_normalize_selections(mut_view(*doc));
+}
+
+pub fn editor_move_cursor_right(doc: mut_view<EditorDocument>) {
+    let mut i: usize = 0;
+    let n = doc.selection_count as usize;
+    while i < n {
+        let next_off = editor_next_grapheme_offset(view(*doc), doc.selections[i].active.byte_offset);
+        doc.selections[i] = selection_caret(next_off);
+        i = i + 1;
+    }
+    editor_normalize_selections(mut_view(*doc));
+}
+
+pub fn editor_move_cursor_left(doc: mut_view<EditorDocument>) {
+    let mut i: usize = 0;
+    let n = doc.selection_count as usize;
+    while i < n {
+        let prev_off = editor_prev_grapheme_offset(view(*doc), doc.selections[i].active.byte_offset);
+        doc.selections[i] = selection_caret(prev_off);
+        i = i + 1;
+    }
+    editor_normalize_selections(mut_view(*doc));
+}
+
+// ============================================================================
+// 8. Low-Level Single-Range Replace, Atomic EditTransaction & Undo/Redo (AXS-LSP-022)
+// ============================================================================
+
+fn ed_replace_range_raw(
+    doc: mut_view<EditorDocument>,
+    start_byte: u64,
+    end_byte: u64,
+    rep_ptr: *const u8,
+    rep_len: usize
+) {
+    let del_len = (end_byte - start_byte) as usize;
+    if doc.repr_kind == REPR_COMPACT {
+        let new_len = (doc.compact_len - del_len) + rep_len;
+        if new_len >= doc.compact_threshold {
+            editor_promote_to_piece_tree(mut_view(*doc));
+        } else {
+            if new_len > doc.compact_cap {
+                let mut new_cap = if doc.compact_cap == 0 { 256 } else { doc.compact_cap * 2 };
+                while new_cap < new_len {
+                    new_cap = new_cap * 2;
+                }
+                let new_buf = unsafe { heap_alloc(new_cap, 8) };
+                if doc.compact_len > 0 && (doc.compact_buf as usize) != 0 {
+                    unsafe {
+                        ptr_copy_nonoverlapping<u8>(doc.compact_buf as *const u8, new_buf, doc.compact_len);
+                        heap_free(doc.compact_buf, doc.compact_cap, 8);
+                    }
+                }
+                doc.compact_buf = new_buf;
+                doc.compact_cap = new_cap;
+            }
+            let s_idx = start_byte as usize;
+            let e_idx = end_byte as usize;
+            let tail_len = doc.compact_len - e_idx;
+            if tail_len > 0 && (s_idx + rep_len) != e_idx {
+                if (s_idx + rep_len) < e_idx {
+                    let mut k: usize = 0;
+                    while k < tail_len {
+                        unsafe { *(doc.compact_buf + s_idx + rep_len + k) = *(doc.compact_buf + e_idx + k); }
+                        k = k + 1;
+                    }
+                } else {
+                    let mut k: usize = tail_len;
+                    while k > 0 {
+                        k = k - 1;
+                        unsafe { *(doc.compact_buf + s_idx + rep_len + k) = *(doc.compact_buf + e_idx + k); }
+                    }
+                }
+            }
+            if rep_len > 0 && (rep_ptr as usize) != 0 {
+                unsafe {
+                    ptr_copy_nonoverlapping<u8>(rep_ptr, doc.compact_buf + s_idx, rep_len);
+                }
+            }
+            doc.compact_len = new_len;
+            ed_sync_root_totals(mut_view(*doc));
+            return;
+        }
+    }
+
+    // PieceTree O(log N) split + insert + join:
+    let mut left_tree: u32 = 0u32;
+    let mut mid_right_tree: u32 = 0u32;
+    ed_split_tree_at_byte(mut_view(*doc), doc.piece_root, start_byte, mut_view(left_tree), mut_view(mid_right_tree));
+
+    let mut deleted_tree: u32 = 0u32;
+    let mut right_tree: u32 = 0u32;
+    ed_split_tree_at_byte(mut_view(*doc), mid_right_tree, end_byte - start_byte, mut_view(deleted_tree), mut_view(right_tree));
+
+    let added_tree = ed_build_added_pieces_tree(mut_view(*doc), rep_ptr, rep_len);
+    let left_plus_added = ed_concat_trees(mut_view(*doc), left_tree, added_tree);
+    doc.piece_root = ed_concat_trees(mut_view(*doc), left_plus_added, right_tree);
+    ed_sync_root_totals(mut_view(*doc));
+}
+
+// Maps a byte offset from `cs.from_rev` to `cs.to_rev` across a committed `ChangeSet` (`CODE-INV-08..09`).
+pub fn editor_map_offset(cs: view<ChangeSet>, byte_offset: u64, affinity: u8) -> u64 {
+    let mut delta: i64 = 0i64;
+    let mut i: u32 = 0u32;
+    while i < (cs.edit_count) {
+        let d = cs.deltas[i as usize];
+        if byte_offset < (d.old_start) {
+            break;
+        }
+        if byte_offset == d.old_start && d.old_start == d.old_end && affinity == AFFINITY_UPSTREAM {
+            break;
+        }
+        if byte_offset <= d.old_end {
+            if affinity == AFFINITY_UPSTREAM {
+                return d.new_start;
+            }
+            return d.new_end;
+        }
+        let old_len = (d.old_end - d.old_start) as i64;
+        let new_len = (d.new_end - d.new_start) as i64;
+        delta = delta + (new_len - old_len);
+        i = i + 1u32;
+    }
+    ((byte_offset as i64) + delta) as u64
+}
+
+pub fn editor_map_range(cs: view<ChangeSet>, range: TextRange) -> TextRange {
+    let ns = editor_map_offset(cs, range.start.byte_offset, AFFINITY_UPSTREAM);
+    let ne = editor_map_offset(cs, range.end.byte_offset, AFFINITY_DOWNSTREAM);
+    text_range_new(ns, if ne < ns { ns } else { ne })
+}
+
+// Executes a batch of `edits[0..edit_count]` inside an atomic `EditTransaction` (`AXS-LSP-022 §1`, `EDITOR-INV-04..05`).
+// Validates sorted non-overlapping ranges (`e_i.end <= e_{i+1}.start`), UTF-8 scalar boundary alignment, and valid
+// UTF-8 replacement slices. Rolls back cleanly with zero partial mutation if any edit is invalid.
+pub fn editor_apply_transaction(
+    doc: mut_view<EditorDocument>,
+    edits: *const TextEdit,
+    edit_count: u32
+) -> bool {
+    if edit_count == 0u32 {
+        return true;
+    }
+    if (edits as usize) == 0 || (edit_count as usize) > EDITOR_MAX_TX_EDITS {
+        doc.tx_rollback_count = doc.tx_rollback_count + 1u32;
+        return false;
+    }
+
+    // 1. Validate every edit in the batch BEFORE mutating anything (`EDITOR-INV-05`)
+    let n = edit_count as usize;
+    let mut i: usize = 0;
+    while i < n {
+        let e = unsafe { *(edits + i) };
+        let s = e.range.start.byte_offset;
+        let end_b = e.range.end.byte_offset;
+        if s > end_b || end_b > doc.total_bytes {
+            doc.tx_rollback_count = doc.tx_rollback_count + 1u32;
+            return false;
+        }
+        if !editor_is_char_boundary(view(*doc), s) || !editor_is_char_boundary(view(*doc), end_b) {
+            doc.tx_rollback_count = doc.tx_rollback_count + 1u32;
+            return false;
+        }
+        if !editor_validate_utf8_slice(e.replacement_ptr, e.replacement_len) {
+            doc.tx_rollback_count = doc.tx_rollback_count + 1u32;
+            return false;
+        }
+        if i > 0 {
+            let prev = unsafe { *(edits + (i - 1)) };
+            if prev.range.end.byte_offset > s {
+                // Overlapping or unsorted edit ranges -> atomic rollback!
+                doc.tx_rollback_count = doc.tx_rollback_count + 1u32;
+                return false;
+            }
+        }
+        i = i + 1;
+    }
+
+    // 2. Record UndoEntry for single-range edits (piece-backed slice in `add_buf` without cloning document)
+    let old_rev = doc.revision;
+    let new_rev = old_rev + 1u64;
+    if n == 1 && (doc.undo_len) < (doc.undo_cap) {
+        let e0 = unsafe { *edits };
+        let s0 = e0.range.start.byte_offset;
+        let e0_end = e0.range.end.byte_offset;
+        let del_len = (e0_end - s0) as usize;
+        let mut del_add_off: u64 = 0u64;
+        if del_len > 0 {
+            ed_ensure_add_cap(mut_view(*doc), del_len);
+            del_add_off = doc.add_len as u64;
+            let _ = editor_copy_range(view(*doc), s0, e0_end, unsafe { doc.add_buf + doc.add_len });
+            doc.add_len = doc.add_len + del_len;
+        }
+        let u_ptr = unsafe { doc.undo_stack + (doc.undo_len as usize) };
+        unsafe {
+            *u_ptr = UndoEntry {
+                rev_before: old_rev,
+                rev_after: new_rev,
+                edit_start: s0,
+                inserted_len: e0.replacement_len as u32,
+                deleted_add_offset: del_add_off,
+                deleted_len: del_len as u32,
+            };
+        }
+        doc.undo_len = doc.undo_len + 1u32;
+        doc.redo_len = 0u32;
+    }
+
+    // 3. Compute cumulative ChangeSet deltas in forward order
+    doc.last_changeset.from_rev = old_rev;
+    doc.last_changeset.to_rev = new_rev;
+    doc.last_changeset.edit_count = edit_count;
+    let mut running_delta: i64 = 0i64;
+    i = 0;
+    while i < n {
+        let e = unsafe { *(edits + i) };
+        let os = e.range.start.byte_offset;
+        let oe = e.range.end.byte_offset;
+        let ns = ((os as i64) + running_delta) as u64;
+        let ne = ns + (e.replacement_len as u64);
+        doc.last_changeset.deltas[i] = AppliedDelta {
+            old_start: os,
+            old_end: oe,
+            new_start: ns,
+            new_end: ne,
+        };
+        running_delta = running_delta + (e.replacement_len as i64) - ((oe - os) as i64);
+        i = i + 1;
+    }
+
+    // 4. Apply edits from highest byte offset to lowest so earlier spans never shift
+    let mut k = n;
+    while k > 0 {
+        k = k - 1;
+        let e = unsafe { *(edits + k) };
+        ed_replace_range_raw(
+            mut_view(*doc),
+            e.range.start.byte_offset,
+            e.range.end.byte_offset,
+            e.replacement_ptr,
+            e.replacement_len
+        );
+    }
+
+    // 5. Remap and canonicalize multi-cursor selections across the transaction
+    let mut si: usize = 0;
+    let sc = doc.selection_count as usize;
+    while si < sc {
+        let old_sel = doc.selections[si];
+        let new_anchor = editor_map_offset(view(doc.last_changeset), old_sel.anchor.byte_offset, old_sel.affinity);
+        let new_active = editor_map_offset(view(doc.last_changeset), old_sel.active.byte_offset, old_sel.affinity);
+        doc.selections[si] = Selection {
+            anchor: TextPosition { byte_offset: new_anchor },
+            active: TextPosition { byte_offset: new_active },
+            affinity: old_sel.affinity,
+        };
+        si = si + 1;
+    }
+    editor_normalize_selections(mut_view(*doc));
+
+    doc.revision = new_rev;
+    doc.tx_commit_count = doc.tx_commit_count + 1u32;
+    true
+}
+
+pub fn editor_apply_edit(
+    doc: mut_view<EditorDocument>,
+    start_byte: u64,
+    end_byte: u64,
+    replacement_ptr: *const u8,
+    replacement_len: usize
+) -> bool {
+    let e = text_edit_new(start_byte, end_byte, replacement_ptr, replacement_len);
+    editor_apply_transaction(doc, unsafe { address_of(e) }, 1u32)
+}
+
+pub fn editor_undo(doc: mut_view<EditorDocument>) -> bool {
+    if doc.undo_len == 0u32 {
+        return false;
+    }
+    doc.undo_len = doc.undo_len - 1u32;
+    let u = unsafe { *(doc.undo_stack + (doc.undo_len as usize)) };
+
+    // Save current inserted slice into `add_buf` for redo
+    let mut ins_add_off: u64 = 0u64;
+    if u.inserted_len > 0u32 {
+        ed_ensure_add_cap(mut_view(*doc), u.inserted_len as usize);
+        ins_add_off = doc.add_len as u64;
+        let _ = editor_copy_range(view(*doc), u.edit_start, u.edit_start + (u.inserted_len as u64), unsafe { doc.add_buf + doc.add_len });
+        doc.add_len = doc.add_len + (u.inserted_len as usize);
+    }
+    if (doc.redo_len) < (doc.redo_cap) {
+        let r_ptr = unsafe { doc.redo_stack + (doc.redo_len as usize) };
+        unsafe {
+            *r_ptr = UndoEntry {
+                rev_before: doc.revision,
+                rev_after: doc.revision + 1u64,
+                edit_start: u.edit_start,
+                inserted_len: u.deleted_len,
+                deleted_add_offset: ins_add_off,
+                deleted_len: u.inserted_len,
+            };
+        }
+        doc.redo_len = doc.redo_len + 1u32;
+    }
+
+    let restore_ptr = if u.deleted_len > 0u32 {
+        unsafe { (doc.add_buf as *const u8) + (u.deleted_add_offset as usize) }
+    } else {
+        0 as *const u8
+    };
+    ed_replace_range_raw(
+        mut_view(*doc),
+        u.edit_start,
+        u.edit_start + (u.inserted_len as u64),
+        restore_ptr,
+        u.deleted_len as usize
+    );
+    doc.revision = doc.revision + 1u64;
+    editor_normalize_selections(mut_view(*doc));
+    true
+}
+
+pub fn editor_redo(doc: mut_view<EditorDocument>) -> bool {
+    if doc.redo_len == 0u32 {
+        return false;
+    }
+    doc.redo_len = doc.redo_len - 1u32;
+    let r = unsafe { *(doc.redo_stack + (doc.redo_len as usize)) };
+
+    let mut del_add_off: u64 = 0u64;
+    if r.inserted_len > 0u32 {
+        ed_ensure_add_cap(mut_view(*doc), r.inserted_len as usize);
+        del_add_off = doc.add_len as u64;
+        let _ = editor_copy_range(view(*doc), r.edit_start, r.edit_start + (r.inserted_len as u64), unsafe { doc.add_buf + doc.add_len });
+        doc.add_len = doc.add_len + (r.inserted_len as usize);
+    }
+    if (doc.undo_len) < (doc.undo_cap) {
+        let u_ptr = unsafe { doc.undo_stack + (doc.undo_len as usize) };
+        unsafe {
+            *u_ptr = UndoEntry {
+                rev_before: doc.revision,
+                rev_after: doc.revision + 1u64,
+                edit_start: r.edit_start,
+                inserted_len: r.deleted_len,
+                deleted_add_offset: del_add_off,
+                deleted_len: r.inserted_len,
+            };
+        }
+        doc.undo_len = doc.undo_len + 1u32;
+    }
+
+    let redo_ptr = if r.deleted_len > 0u32 {
+        unsafe { (doc.add_buf as *const u8) + (r.deleted_add_offset as usize) }
+    } else {
+        0 as *const u8
+    };
+    ed_replace_range_raw(
+        mut_view(*doc),
+        r.edit_start,
+        r.edit_start + (r.inserted_len as u64),
+        redo_ptr,
+        r.deleted_len as usize
+    );
+    doc.revision = doc.revision + 1u64;
+    editor_normalize_selections(mut_view(*doc));
+    true
+}
+
+// Computes an O(1) structural content hash from the root summary and returns an immutable `DocumentSnapshot` (`AXS-LSP-022 §3`).
+pub fn editor_snapshot(doc: view<EditorDocument>) -> DocumentSnapshot {
+    let mut h: u64 = 0x27D4EB2F165667C5u64;
+    h = ed_hash_mix(h, doc.doc_id as u64);
+    h = ed_hash_mix(h, doc.revision);
+    h = ed_hash_mix(h, doc.total_bytes);
+    h = ed_hash_mix(h, doc.total_line_breaks);
+    h = ed_hash_mix(h, doc.total_utf16_units);
+    if doc.total_bytes > 0u64 {
+        let b_first = editor_byte_at(doc, 0u64) as u64;
+        let b_mid = editor_byte_at(doc, doc.total_bytes >> 1u64) as u64;
+        let b_last = editor_byte_at(doc, doc.total_bytes - 1u64) as u64;
+        h = ed_hash_mix(h, (b_first << 16u64) | (b_mid << 8u64) | b_last);
+    }
+    DocumentSnapshot {
+        doc_id: doc.doc_id,
+        revision: doc.revision,
+        repr_kind: doc.repr_kind,
+        piece_root: doc.piece_root,
+        piece_count: doc.piece_count,
+        byte_len: doc.total_bytes,
+        line_count: (doc.total_line_breaks as u32) + 1u32,
+        utf16_len: doc.total_utf16_units,
+        content_hash: h,
+    }
+}

@@ -1,0 +1,1337 @@
+// Incremental Virtual File System (`VFS`), `CompilerDB` & `IncrementalEngine` Bridge,
+// Typed Generational Entity IDs (`LocalId`, `FunctionId`, `LspTypeId`, `PlaceId`, `LspSymbolId`),
+// Span-Independent Identity Anchoring, and Partial-Program Syntax/HIR Recovery (T801 / E19.1).
+// Implements SPEC-100 §1.2..1.7, §2.1..2.3 (AXS-LSP-001..007, AXS-LSP-011..012,
+// REQ-TOOL-183, REQ-TOOL-184, REQ-TOOL-188, REQ-TOOL-191, REQ-TOOL-297, REQ-TOOL-298, REQ-TOOL-299).
+module compiler.lsp.vfs
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use std.editor.EditorDocument
+use std.editor.LspPosition
+use std.editor.LspRange
+use std.editor.TextPosition
+use std.editor.TextRange
+use std.editor.TextEdit
+use std.editor.DocumentSnapshot
+use std.editor.POS_ENCODING_UTF16
+use std.editor.POS_ENCODING_UTF8
+use std.editor.REPR_COMPACT
+use std.editor.REPR_PIECE_TREE
+use std.editor.text_range_new
+use std.editor.editor_doc_empty
+use std.editor.editor_doc_init_with_threshold
+use std.editor.editor_doc_free
+use std.editor.editor_apply_edit
+use std.editor.editor_apply_transaction
+use std.editor.editor_lsp_pos_to_byte_offset
+use std.editor.editor_byte_offset_to_lsp_pos
+use std.editor.editor_lsp_range_to_byte_range
+use std.editor.editor_byte_range_to_lsp_range
+use std.editor.editor_snapshot
+
+use compiler.lsp.protocol.LSP_SCHEMA_VERSION_1
+use compiler.lsp.protocol.CERTAINTY_EXACT
+use compiler.lsp.protocol.CERTAINTY_RECOVERED
+use compiler.lsp.protocol.CERTAINTY_HEURISTIC
+use compiler.lsp.protocol.CERTAINTY_UNAVAILABLE
+use compiler.lsp.protocol.FALLBACK_NONE
+use compiler.lsp.protocol.FALLBACK_MISSING_TOKEN
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_MEMBER
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_EXPR
+use compiler.lsp.protocol.FALLBACK_INCOMPLETE_TYPE
+use compiler.lsp.protocol.FALLBACK_STALE_ENTITY
+use compiler.lsp.protocol.LspFactHeader
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_fact_header_new
+use compiler.lsp.protocol.lsp_str_view
+use compiler.lsp.protocol.lsp_str_ptr
+use compiler.lsp.protocol.lsp_str_len
+
+use compiler.query.db.CompilerDB
+use compiler.query.db.SourceFileId
+use compiler.query.db.ModuleId
+use compiler.query.db.PackageId
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.qry_sv_empty
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic fn wrapping_mul_u64(a: u64, b: u64) -> u64 { a }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+
+// ============================================================================
+// 1. Typed Generational Entity Identifiers (AXS-LSP-002, REQ-TOOL-184, REQ-TOOL-191)
+// ============================================================================
+
+pub const ENTITY_NONE: u8 = 0u8;
+pub const ENTITY_SYMBOL: u8 = 1u8;
+pub const ENTITY_FUNCTION: u8 = 2u8;
+pub const ENTITY_TYPE: u8 = 3u8;
+pub const ENTITY_LOCAL: u8 = 4u8;
+pub const ENTITY_PLACE: u8 = 5u8;
+pub const ENTITY_DECLARATION: u8 = 6u8;
+pub const ENTITY_EXPR: u8 = 7u8;
+
+pub const LOOKUP_FOUND: u8 = 0u8;
+pub const LOOKUP_NOT_FOUND: u8 = 1u8;
+pub const LOOKUP_STALE: u8 = 2u8;
+
+// Receiver Ownership & Capability Classifications (AXS-LSP-005 §2, AXS-LSP-013)
+pub const OWNERSHIP_OWNED: u8 = 0u8;
+pub const OWNERSHIP_VIEW: u8 = 1u8;
+pub const OWNERSHIP_MUT_VIEW: u8 = 2u8;
+pub const OWNERSHIP_MOVED: u8 = 3u8;
+
+pub const CAP_NONE: u8 = 0u8;
+pub const CAP_READ_ONLY: u8 = 1u8;
+pub const CAP_READ_WRITE: u8 = 2u8;
+
+// Partial-program recovery node kinds (AXS-LSP-004, AXS-LSP-005, REQ-TOOL-183, REQ-TOOL-188, REQ-TOOL-297, REQ-TOOL-298)
+pub const RECOVERY_NONE: u8 = 0u8;
+pub const RECOVERY_MISSING_TOKEN: u8 = 1u8;
+pub const RECOVERY_INCOMPLETE_EXPR: u8 = 2u8;
+pub const RECOVERY_INCOMPLETE_MEMBER_ACCESS: u8 = 3u8;
+pub const RECOVERY_INCOMPLETE_CALL_EXPR: u8 = 4u8;
+pub const RECOVERY_INCOMPLETE_TYPE: u8 = 5u8;
+pub const RECOVERY_INCOMPLETE_PATTERN: u8 = 6u8;
+pub const RECOVERY_SEMANTIC_TOMBSTONE: u8 = 7u8;
+
+// Expected token kinds for `MissingToken`
+pub const EXPECTED_TOK_SEMI: u16 = 1u16;
+pub const EXPECTED_TOK_RPAREN: u16 = 2u16;
+pub const EXPECTED_TOK_RBRACE: u16 = 3u16;
+pub const EXPECTED_TOK_IDENT: u16 = 4u16;
+pub const EXPECTED_TOK_TYPE: u16 = 5u16;
+pub const EXPECTED_TOK_EXPR: u16 = 6u16;
+
+// Structured diagnostic codes (`publishDiagnostics`)
+pub const DIAG_PARSE_MISSING_DELIM: u32 = 1001u32;
+pub const DIAG_PARSE_INCOMPLETE_MEMBER: u32 = 1002u32;
+pub const DIAG_PARSE_INCOMPLETE_EXPR: u32 = 1003u32;
+pub const DIAG_PARSE_INCOMPLETE_TYPE: u32 = 1004u32;
+pub const DIAG_PARSE_INCOMPLETE_CALL: u32 = 1005u32;
+pub const DIAG_TYP_MISMATCH: u32 = 2001u32;
+pub const DIAG_BORROW_CONFLICT: u32 = 3001u32;
+
+pub const DIAG_SEVERITY_ERROR: u8 = 1u8;
+pub const DIAG_SEVERITY_WARNING: u8 = 2u8;
+
+pub const VFS_MAX_DOCS: usize = 32;
+pub const VFS_MAX_ENTITIES: usize = 256;
+pub const VFS_MAX_RECOVERY_NODES: usize = 128;
+pub const VFS_MAX_DIAGNOSTICS: usize = 128;
+
+@derive(Copy)
+pub struct GenerationalId {
+    pub index: u32,
+    pub generation: u32,
+}
+
+pub fn gen_id_new(index: u32, generation: u32) -> GenerationalId {
+    GenerationalId { index: index, generation: generation }
+}
+
+pub fn gen_id_eq(a: GenerationalId, b: GenerationalId) -> bool {
+    a.index == b.index && a.generation == b.generation
+}
+
+pub fn gen_id_pack(id: GenerationalId) -> u64 {
+    ((id.generation as u64) << 32u64) | (id.index as u64)
+}
+
+pub fn gen_id_unpack(raw: u64) -> GenerationalId {
+    GenerationalId {
+        index: (raw & 0xFFFFFFFFu64) as u32,
+        generation: (raw >> 32u64) as u32,
+    }
+}
+
+// Distinct typed generational IDs (REQ-TOOL-184, REQ-TOOL-191)
+@derive(Copy)
+pub struct LspSymbolId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct FunctionId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct LspTypeId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct LocalId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct PlaceId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct DeclarationId {
+    pub raw: GenerationalId,
+}
+
+@derive(Copy)
+pub struct ExprId {
+    pub raw: GenerationalId,
+}
+
+pub fn function_id_eq(a: FunctionId, b: FunctionId) -> bool {
+    gen_id_eq(a.raw, b.raw)
+}
+
+pub fn local_id_eq(a: LocalId, b: LocalId) -> bool {
+    gen_id_eq(a.raw, b.raw)
+}
+
+pub fn place_id_eq(a: PlaceId, b: PlaceId) -> bool {
+    gen_id_eq(a.raw, b.raw)
+}
+
+pub fn lsp_type_id_eq(a: LspTypeId, b: LspTypeId) -> bool {
+    gen_id_eq(a.raw, b.raw)
+}
+
+pub fn lsp_symbol_id_eq(a: LspSymbolId, b: LspSymbolId) -> bool {
+    gen_id_eq(a.raw, b.raw)
+}
+
+// Span-independent identity anchor key (AXS-LSP-003 §1-2)
+@derive(Copy)
+pub struct SemanticKey {
+    pub doc_id: u32,
+    pub entity_domain: u8,
+    pub scope_depth: u16,
+    pub lexical_ordinal: u16,
+    pub owner_fn_index: u32,
+    pub name_hash: u64,
+    pub disambiguator: u32,
+}
+
+pub fn semantic_key_item(doc_id: u32, entity_domain: u8, name_hash: u64, disambiguator: u32) -> SemanticKey {
+    SemanticKey {
+        doc_id: doc_id,
+        entity_domain: entity_domain,
+        scope_depth: 0u16,
+        lexical_ordinal: 0u16,
+        owner_fn_index: 0u32,
+        name_hash: name_hash,
+        disambiguator: disambiguator,
+    }
+}
+
+pub fn semantic_key_local(
+    doc_id: u32,
+    entity_domain: u8,
+    owner_fn: FunctionId,
+    scope_depth: u16,
+    binding_name_hash: u64,
+    lexical_ordinal: u16
+) -> SemanticKey {
+    SemanticKey {
+        doc_id: doc_id,
+        entity_domain: entity_domain,
+        scope_depth: scope_depth,
+        lexical_ordinal: lexical_ordinal,
+        owner_fn_index: owner_fn.raw.index,
+        name_hash: binding_name_hash,
+        disambiguator: owner_fn.raw.generation,
+    }
+}
+
+pub fn semantic_key_eq(a: SemanticKey, b: SemanticKey) -> bool {
+    a.doc_id == b.doc_id &&
+        a.entity_domain == b.entity_domain &&
+        a.scope_depth == b.scope_depth &&
+        a.lexical_ordinal == b.lexical_ordinal &&
+        a.owner_fn_index == b.owner_fn_index &&
+        a.name_hash == b.name_hash &&
+        a.disambiguator == b.disambiguator
+}
+// ============================================================================
+// 2. Generational Entity Slot, Recovery Nodes & Structured Diagnostics
+// ============================================================================
+
+@derive(Copy)
+pub struct VfsEntitySlot {
+    pub occupied: bool,
+    pub is_tombstone: bool,
+    pub is_poisoned: bool,
+    pub entity_domain: u8,
+    pub generation: u32,
+    pub retired_at_revision: u64,
+    pub key: SemanticKey,
+    pub type_id: LspTypeId,
+    pub ownership_class: u8,
+    pub capability_class: u8,
+    pub span_start: u32,
+    pub span_end: u32,
+}
+
+@derive(Copy)
+pub struct VfsLookupResult {
+    pub status: u8,
+    pub expected_gen: u32,
+    pub actual_gen: u32,
+    pub entity: VfsEntitySlot,
+    pub header: LspFactHeader,
+}
+
+@derive(Copy)
+pub struct VfsRecoveryNode {
+    pub doc_id: u32,
+    pub owner_fn: FunctionId,
+    pub kind: u8,
+    pub expected_token: u16,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub dot_byte_offset: u32,
+    pub receiver_expr_id: ExprId,
+    pub receiver_type_id: LspTypeId,
+    pub receiver_ownership: u8,
+    pub receiver_capability: u8,
+    pub callee_symbol_id: LspSymbolId,
+    pub active_param_index: u16,
+    pub previous_symbol_id: LspSymbolId,
+    pub retired_at_revision: u64,
+}
+
+@derive(Copy)
+pub struct VfsDiagnostic {
+    pub doc_id: u32,
+    pub code: u32,
+    pub severity: u8,
+    pub is_primary_root: bool,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub lsp_range: LspRange,
+}
+
+pub struct VfsDocumentSlot {
+    pub active: bool,
+    pub has_editor_overlay: bool,
+    pub doc_id: u32,
+    pub uri_hash: u64,
+    pub client_version: i64,
+    pub workspace_revision: u64,
+    pub interface_hash: u64,
+    pub body_hash: u64,
+    pub disk_hash: u64,
+    pub verified_deps_hash: u64,
+    pub imports: [8]u32,
+    pub import_count: u32,
+    pub editor: EditorDocument,
+    pub parse_Incomplete_count: u32,
+    pub diagnostic_count: u32,
+    pub cascaded_errors_suppressed: u32,
+}
+
+pub struct VfsWorkspace {
+    pub db: CompilerDB,
+    pub revision: u64,
+    pub position_encoding: u8,
+    pub codegen_invocations: u32,
+    pub typeck_invocations: u32,
+    pub docs: *mut VfsDocumentSlot,
+    pub doc_cap: u32,
+    pub entities: *mut VfsEntitySlot,
+    pub entity_count: u32,
+    pub entity_cap: u32,
+    pub recovery_nodes: *mut VfsRecoveryNode,
+    pub recovery_count: u32,
+    pub recovery_cap: u32,
+    pub diagnostics: *mut VfsDiagnostic,
+    pub diagnostic_count: u32,
+    pub diagnostic_cap: u32,
+}
+
+fn vfs_zero_bytes(ptr: *mut u8, count: usize) {
+    let mut i: usize = 0;
+    while i < count {
+        unsafe { *(ptr + i) = 0u8; }
+        i = i + 1;
+    }
+}
+
+pub fn vfs_hash_str(s: str) -> u64 {
+    let sv = lsp_str_view(s);
+    let ptr = sv.ptr;
+    let slen = sv.len;
+    let mut h: u64 = 0xCBF29CE484222325u64;
+    let mut i: usize = 0;
+    while i < slen {
+        let b = (unsafe { *(ptr + i) }) as u64;
+        h = wrapping_mul_u64(h ^ b, 0x100000001B3u64);
+        i = i + 1;
+    }
+    h
+}
+
+pub fn vfs_workspace_new() -> VfsWorkspace {
+    let doc_bytes = VFS_MAX_DOCS * size_of<VfsDocumentSlot>();
+    let docs_ptr = unsafe { heap_alloc(doc_bytes, align_of<VfsDocumentSlot>()) as *mut VfsDocumentSlot };
+    vfs_zero_bytes(docs_ptr as *mut u8, doc_bytes);
+
+    let ent_bytes = VFS_MAX_ENTITIES * size_of<VfsEntitySlot>();
+    let ent_ptr = unsafe { heap_alloc(ent_bytes, align_of<VfsEntitySlot>()) as *mut VfsEntitySlot };
+    vfs_zero_bytes(ent_ptr as *mut u8, ent_bytes);
+
+    let rec_bytes = VFS_MAX_RECOVERY_NODES * size_of<VfsRecoveryNode>();
+    let rec_ptr = unsafe { heap_alloc(rec_bytes, align_of<VfsRecoveryNode>()) as *mut VfsRecoveryNode };
+    vfs_zero_bytes(rec_ptr as *mut u8, rec_bytes);
+
+    let diag_bytes = VFS_MAX_DIAGNOSTICS * size_of<VfsDiagnostic>();
+    let diag_ptr = unsafe { heap_alloc(diag_bytes, align_of<VfsDiagnostic>()) as *mut VfsDiagnostic };
+    vfs_zero_bytes(diag_ptr as *mut u8, diag_bytes);
+
+    let mut db = query_db_empty();
+    query_db_init(mut_view(db), 1u64);
+
+    VfsWorkspace {
+        db: db,
+        revision: 1u64,
+        position_encoding: POS_ENCODING_UTF16,
+        codegen_invocations: 0u32,
+        typeck_invocations: 0u32,
+        docs: docs_ptr,
+        doc_cap: VFS_MAX_DOCS as u32,
+        entities: ent_ptr,
+        entity_count: 0u32,
+        entity_cap: VFS_MAX_ENTITIES as u32,
+        recovery_nodes: rec_ptr,
+        recovery_count: 0u32,
+        recovery_cap: VFS_MAX_RECOVERY_NODES as u32,
+        diagnostics: diag_ptr,
+        diagnostic_count: 0u32,
+        diagnostic_cap: VFS_MAX_DIAGNOSTICS as u32,
+    }
+}
+
+pub fn vfs_workspace_free(ws: mut_view<VfsWorkspace>) {
+    let mut i: u32 = 0u32;
+    while i < (ws.doc_cap) {
+        let dp = unsafe { ws.docs + (i as usize) };
+        if unsafe { (*dp).active } {
+            editor_doc_free(unsafe { mut_view((*dp).editor) });
+            unsafe { (*dp).active = false; }
+        }
+        i = i + 1u32;
+    }
+    query_db_free(mut_view(ws.db));
+    if (ws.docs as usize) != 0 {
+        unsafe { heap_free(ws.docs as *mut u8, (ws.doc_cap as usize) * size_of<VfsDocumentSlot>(), align_of<VfsDocumentSlot>()); }
+    }
+    if (ws.entities as usize) != 0 {
+        unsafe { heap_free(ws.entities as *mut u8, (ws.entity_cap as usize) * size_of<VfsEntitySlot>(), align_of<VfsEntitySlot>()); }
+    }
+    if (ws.recovery_nodes as usize) != 0 {
+        unsafe { heap_free(ws.recovery_nodes as *mut u8, (ws.recovery_cap as usize) * size_of<VfsRecoveryNode>(), align_of<VfsRecoveryNode>()); }
+    }
+    if (ws.diagnostics as usize) != 0 {
+        unsafe { heap_free(ws.diagnostics as *mut u8, (ws.diagnostic_cap as usize) * size_of<VfsDiagnostic>(), align_of<VfsDiagnostic>()); }
+    }
+    ws.docs = 0 as *mut VfsDocumentSlot;
+    ws.entities = 0 as *mut VfsEntitySlot;
+    ws.recovery_nodes = 0 as *mut VfsRecoveryNode;
+    ws.diagnostics = 0 as *mut VfsDiagnostic;
+}
+
+pub fn vfs_doc_ptr(ws: view<VfsWorkspace>, doc_id: u32) -> *mut VfsDocumentSlot {
+    unsafe { ws.docs + (doc_id as usize) }
+}
+
+// ============================================================================
+// 3. Span-Independent Generational Entity Arena (AXS-LSP-002, AXS-LSP-003)
+// ============================================================================
+
+fn vfs_intern_entity(
+    ws: mut_view<VfsWorkspace>,
+    key: SemanticKey,
+    type_id: LspTypeId,
+    ownership_class: u8,
+    capability_class: u8,
+    span_start: u32,
+    span_end: u32
+) -> GenerationalId {
+    // 1. Check if an active (non-tombstone) entity with the exact `SemanticKey` already exists:
+    //    preserve its `(index, generation)` across edits even when `span_start..span_end` shifted!
+    let mut i: u32 = 1u32;
+    while i <= ws.entity_count {
+        let ep = unsafe { ws.entities + (i as usize) };
+        if (unsafe { (*ep).occupied }) && !(unsafe { (*ep).is_tombstone }) {
+            if semantic_key_eq(unsafe { (*ep).key }, key) {
+                unsafe {
+                    (*ep).type_id = type_id;
+                    (*ep).ownership_class = ownership_class;
+                    (*ep).capability_class = capability_class;
+                    (*ep).span_start = span_start;
+                    (*ep).span_end = span_end;
+                }
+                return GenerationalId { index: i, generation: unsafe { (*ep).generation } };
+            }
+        }
+        i = i + 1u32;
+    }
+
+    // 2. Check if a retired tombstone slot can be reused (keeping its already-incremented `generation`)
+    i = 1u32;
+    while i <= ws.entity_count {
+        let ep = unsafe { ws.entities + (i as usize) };
+        if (unsafe { (*ep).occupied }) && (unsafe { (*ep).is_tombstone }) && (unsafe { (*ep).entity_domain }) == key.entity_domain {
+            let gen = unsafe { (*ep).generation };
+            unsafe {
+                *ep = VfsEntitySlot {
+                    occupied: true,
+                    is_tombstone: false,
+                    is_poisoned: false,
+                    entity_domain: key.entity_domain,
+                    generation: gen,
+                    retired_at_revision: 0u64,
+                    key: key,
+                    type_id: type_id,
+                    ownership_class: ownership_class,
+                    capability_class: capability_class,
+                    span_start: span_start,
+                    span_end: span_end,
+                };
+            }
+            return GenerationalId { index: i, generation: gen };
+        }
+        i = i + 1u32;
+    }
+
+    // 3. Allocate a fresh slot with initial `generation = 1`
+    if (ws.entity_count + 1u32) < (ws.entity_cap) {
+        ws.entity_count = ws.entity_count + 1u32;
+    }
+    let idx = ws.entity_count;
+    let ep = unsafe { ws.entities + (idx as usize) };
+    unsafe {
+        *ep = VfsEntitySlot {
+            occupied: true,
+            is_tombstone: false,
+            is_poisoned: false,
+            entity_domain: key.entity_domain,
+            generation: 1u32,
+            retired_at_revision: 0u64,
+            key: key,
+            type_id: type_id,
+            ownership_class: ownership_class,
+            capability_class: capability_class,
+            span_start: span_start,
+            span_end: span_end,
+        };
+    }
+    GenerationalId { index: idx, generation: 1u32 }
+}
+
+pub fn vfs_intern_type(ws: mut_view<VfsWorkspace>, doc_id: u32, name: str, span_start: u32, span_end: u32) -> LspTypeId {
+    let key = semantic_key_item(doc_id, ENTITY_TYPE, vfs_hash_str(name), 0u32);
+    let no_ty = LspTypeId { raw: gen_id_new(0u32, 0u32) };
+    let gid = vfs_intern_entity(ws, key, no_ty, OWNERSHIP_OWNED, CAP_NONE, span_start, span_end);
+    LspTypeId { raw: gid }
+}
+
+pub fn vfs_intern_function(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    name: str,
+    ret_type: LspTypeId,
+    span_start: u32,
+    span_end: u32
+) -> FunctionId {
+    let key = semantic_key_item(doc_id, ENTITY_FUNCTION, vfs_hash_str(name), 0u32);
+    let gid = vfs_intern_entity(ws, key, ret_type, OWNERSHIP_OWNED, CAP_NONE, span_start, span_end);
+    FunctionId { raw: gid }
+}
+
+pub fn vfs_intern_symbol(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    name: str,
+    sym_type: LspTypeId,
+    span_start: u32,
+    span_end: u32
+) -> LspSymbolId {
+    let key = semantic_key_item(doc_id, ENTITY_SYMBOL, vfs_hash_str(name), 0u32);
+    let gid = vfs_intern_entity(ws, key, sym_type, OWNERSHIP_OWNED, CAP_NONE, span_start, span_end);
+    LspSymbolId { raw: gid }
+}
+
+pub fn vfs_intern_local(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    scope_depth: u16,
+    binding_name: str,
+    lexical_ordinal: u16,
+    ty: LspTypeId,
+    ownership_class: u8,
+    capability_class: u8,
+    span_start: u32,
+    span_end: u32
+) -> LocalId {
+    let key = semantic_key_local(doc_id, ENTITY_LOCAL, owner_fn, scope_depth, vfs_hash_str(binding_name), lexical_ordinal);
+    let gid = vfs_intern_entity(ws, key, ty, ownership_class, capability_class, span_start, span_end);
+    LocalId { raw: gid }
+}
+
+pub fn vfs_intern_place(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    scope_depth: u16,
+    binding_name: str,
+    lexical_ordinal: u16,
+    ty: LspTypeId,
+    ownership_class: u8,
+    capability_class: u8,
+    span_start: u32,
+    span_end: u32
+) -> PlaceId {
+    let key = semantic_key_local(doc_id, ENTITY_PLACE, owner_fn, scope_depth, vfs_hash_str(binding_name), lexical_ordinal);
+    let gid = vfs_intern_entity(ws, key, ty, ownership_class, capability_class, span_start, span_end);
+    PlaceId { raw: gid }
+}
+
+// Retires a deleted entity slot by incrementing `generation` and recording a `SemanticTombstone` (`AXS-LSP-002 §2`, `AXS-LSP-003 §3`).
+pub fn vfs_retire_entity(ws: mut_view<VfsWorkspace>, doc_id: u32, id: GenerationalId) -> bool {
+    if id.index == 0u32 || id.index > ws.entity_count {
+        return false;
+    }
+    let ep = unsafe { ws.entities + (id.index as usize) };
+    if !(unsafe { (*ep).occupied }) || (unsafe { (*ep).generation }) != id.generation {
+        return false;
+    }
+    let new_gen = id.generation + 1u32;
+    unsafe {
+        (*ep).is_tombstone = true;
+        (*ep).generation = new_gen;
+        (*ep).retired_at_revision = ws.revision;
+    }
+    if (ws.recovery_count) < (ws.recovery_cap) {
+        let rp = unsafe { ws.recovery_nodes + (ws.recovery_count as usize) };
+        let no_ty = LspTypeId { raw: gen_id_new(0u32, 0u32) };
+        unsafe {
+            *rp = VfsRecoveryNode {
+                doc_id: doc_id,
+                owner_fn: FunctionId { raw: gen_id_new(0u32, 0u32) },
+                kind: RECOVERY_SEMANTIC_TOMBSTONE,
+                expected_token: 0u16,
+                span_start: (*ep).span_start,
+                span_end: (*ep).span_end,
+                dot_byte_offset: 0u32,
+                receiver_expr_id: ExprId { raw: gen_id_new(0u32, 0u32) },
+                receiver_type_id: no_ty,
+                receiver_ownership: OWNERSHIP_OWNED,
+                receiver_capability: CAP_NONE,
+                callee_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+                active_param_index: 0u16,
+                previous_symbol_id: LspSymbolId { raw: id },
+                retired_at_revision: ws.revision,
+            };
+        }
+        ws.recovery_count = ws.recovery_count + 1u32;
+    }
+    true
+}
+
+// Validates `(index, generation)` against the generational arena (`AXS-LSP-002 §2`).
+// Never dereferences stale slots or aliases reused indices: returns `LOOKUP_STALE` with `(expected_gen, actual_gen)`.
+pub fn vfs_lookup_entity(ws: view<VfsWorkspace>, id: GenerationalId) -> VfsLookupResult {
+    let empty_slot = VfsEntitySlot {
+        occupied: false,
+        is_tombstone: false,
+        is_poisoned: false,
+        entity_domain: ENTITY_NONE,
+        generation: 0u32,
+        retired_at_revision: 0u64,
+        key: semantic_key_item(0u32, ENTITY_NONE, 0u64, 0u32),
+        type_id: LspTypeId { raw: gen_id_new(0u32, 0u32) },
+        ownership_class: OWNERSHIP_OWNED,
+        capability_class: CAP_NONE,
+        span_start: 0u32,
+        span_end: 0u32,
+    };
+    if id.index == 0u32 || id.index > ws.entity_count {
+        return VfsLookupResult {
+            status: LOOKUP_NOT_FOUND,
+            expected_gen: id.generation,
+            actual_gen: 0u32,
+            entity: empty_slot,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        };
+    }
+    let ep = unsafe { ws.entities + (id.index as usize) };
+    let actual_gen = unsafe { (*ep).generation };
+    if !(unsafe { (*ep).occupied }) {
+        return VfsLookupResult {
+            status: LOOKUP_NOT_FOUND,
+            expected_gen: id.generation,
+            actual_gen: actual_gen,
+            entity: empty_slot,
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        };
+    }
+    if actual_gen != id.generation || (unsafe { (*ep).is_tombstone }) {
+        return VfsLookupResult {
+            status: LOOKUP_STALE,
+            expected_gen: id.generation,
+            actual_gen: actual_gen,
+            entity: unsafe { *ep },
+            header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        };
+    }
+    let cert = if unsafe { (*ep).is_poisoned } { CERTAINTY_RECOVERED } else { CERTAINTY_EXACT };
+    let fb = if unsafe { (*ep).is_poisoned } { FALLBACK_INCOMPLETE_EXPR } else { FALLBACK_NONE };
+    VfsLookupResult {
+        status: LOOKUP_FOUND,
+        expected_gen: id.generation,
+        actual_gen: actual_gen,
+        entity: unsafe { *ep },
+        header: lsp_fact_header_new(ws.revision, cert, fb),
+    }
+}
+// ============================================================================
+// 4. Partial-Program Syntax/HIR Recovery & Non-Cascading Diagnostics (AXS-LSP-004..007)
+// ============================================================================
+
+pub fn vfs_clear_doc_recovery_and_diagnostics(ws: mut_view<VfsWorkspace>, doc_id: u32) {
+    // Retain recovery nodes and diagnostics from other documents; clear non-tombstone nodes for `doc_id`
+    let mut write_rec: u32 = 0u32;
+    let mut i: u32 = 0u32;
+    while i < (ws.recovery_count) {
+        let node = unsafe { *(ws.recovery_nodes + (i as usize)) };
+        if node.doc_id != doc_id || node.kind == RECOVERY_SEMANTIC_TOMBSTONE {
+            unsafe { *(ws.recovery_nodes + (write_rec as usize)) = node; }
+            write_rec = write_rec + 1u32;
+        }
+        i = i + 1u32;
+    }
+    ws.recovery_count = write_rec;
+
+    let mut write_diag: u32 = 0u32;
+    i = 0u32;
+    while i < (ws.diagnostic_count) {
+        let d = unsafe { *(ws.diagnostics + (i as usize)) };
+        if d.doc_id != doc_id {
+            unsafe { *(ws.diagnostics + (write_diag as usize)) = d; }
+            write_diag = write_diag + 1u32;
+        }
+        i = i + 1u32;
+    }
+    ws.diagnostic_count = write_diag;
+
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe {
+            (*dp).parse_Incomplete_count = 0u32;
+            (*dp).diagnostic_count = 0u32;
+            (*dp).cascaded_errors_suppressed = 0u32;
+        }
+    }
+}
+
+fn vfs_emit_primary_diagnostic(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    code: u32,
+    severity: u8,
+    span_start: u32,
+    span_end: u32
+) {
+    if ws.diagnostic_count >= ws.diagnostic_cap || doc_id >= ws.doc_cap {
+        return;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let tr = text_range_new(span_start as u64, span_end as u64);
+    let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+    let diag_ptr = unsafe { ws.diagnostics + (ws.diagnostic_count as usize) };
+    unsafe {
+        *diag_ptr = VfsDiagnostic {
+            doc_id: doc_id,
+            code: code,
+            severity: severity,
+            is_primary_root: true,
+            span_start: span_start,
+            span_end: span_end,
+            lsp_range: lrange,
+        };
+        (*dp).diagnostic_count = (*dp).diagnostic_count + 1u32;
+    }
+    ws.diagnostic_count = ws.diagnostic_count + 1u32;
+}
+
+pub fn vfs_record_missing_token(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    expected_token: u16,
+    insertion_byte: u32
+) -> u32 {
+    if ws.recovery_count >= ws.recovery_cap {
+        return 0u32;
+    }
+    let idx = ws.recovery_count;
+    let rp = unsafe { ws.recovery_nodes + (idx as usize) };
+    unsafe {
+        *rp = VfsRecoveryNode {
+            doc_id: doc_id,
+            owner_fn: owner_fn,
+            kind: RECOVERY_MISSING_TOKEN,
+            expected_token: expected_token,
+            span_start: insertion_byte,
+            span_end: insertion_byte,
+            dot_byte_offset: 0u32,
+            receiver_expr_id: ExprId { raw: gen_id_new(0u32, 0u32) },
+            receiver_type_id: LspTypeId { raw: gen_id_new(0u32, 0u32) },
+            receiver_ownership: OWNERSHIP_OWNED,
+            receiver_capability: CAP_NONE,
+            callee_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            active_param_index: 0u16,
+            previous_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            retired_at_revision: 0u64,
+        };
+    }
+    ws.recovery_count = ws.recovery_count + 1u32;
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe { (*dp).parse_Incomplete_count = (*dp).parse_Incomplete_count + 1u32; }
+    }
+    // Emit exactly 1 root parse diagnostic (`AXS-LSP-005 §3`)
+    vfs_emit_primary_diagnostic(ws, doc_id, DIAG_PARSE_MISSING_DELIM, DIAG_SEVERITY_ERROR, insertion_byte, insertion_byte);
+    idx
+}
+
+// Records an `IncompleteMemberAccess` (`pkt.` or `ro.`) preserving the resolved receiver type, ownership (`view<T>` / `mut_view<T>`),
+// and capability (`ReadOnly<T>` / `ReadWrite<T>`) across the incomplete member dot (`AXS-LSP-004 §2`, `AXS-LSP-005 §2`).
+pub fn vfs_record_incomplete_member_access(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    receiver_local: LocalId,
+    dot_byte_offset: u32
+) -> u32 {
+    if ws.recovery_count >= ws.recovery_cap {
+        return 0u32;
+    }
+    let lookup = vfs_lookup_entity(view(*ws), receiver_local.raw);
+    let rec_ty = lookup.entity.type_id;
+    let rec_own = lookup.entity.ownership_class;
+    let rec_cap = lookup.entity.capability_class;
+
+    let idx = ws.recovery_count;
+    let rp = unsafe { ws.recovery_nodes + (idx as usize) };
+    unsafe {
+        *rp = VfsRecoveryNode {
+            doc_id: doc_id,
+            owner_fn: owner_fn,
+            kind: RECOVERY_INCOMPLETE_MEMBER_ACCESS,
+            expected_token: EXPECTED_TOK_IDENT,
+            span_start: lookup.entity.span_start,
+            span_end: dot_byte_offset + 1u32,
+            dot_byte_offset: dot_byte_offset,
+            receiver_expr_id: ExprId { raw: receiver_local.raw },
+            receiver_type_id: rec_ty,
+            receiver_ownership: rec_own,
+            receiver_capability: rec_cap,
+            callee_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            active_param_index: 0u16,
+            previous_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            retired_at_revision: 0u64,
+        };
+    }
+    ws.recovery_count = ws.recovery_count + 1u32;
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe { (*dp).parse_Incomplete_count = (*dp).parse_Incomplete_count + 1u32; }
+    }
+    vfs_emit_primary_diagnostic(ws, doc_id, DIAG_PARSE_INCOMPLETE_MEMBER, DIAG_SEVERITY_ERROR, dot_byte_offset, dot_byte_offset + 1u32);
+    idx
+}
+
+pub fn vfs_record_incomplete_expr(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    target_local: LocalId,
+    expected_type: LspTypeId,
+    span_start: u32,
+    span_end: u32
+) -> u32 {
+    if ws.recovery_count >= ws.recovery_cap {
+        return 0u32;
+    }
+    // Poison `target_local` so downstream uses do not trigger cascading secondary type/borrow errors (`AXS-LSP-005 §3`)
+    if target_local.raw.index > 0u32 && target_local.raw.index <= ws.entity_count {
+        let ep = unsafe { ws.entities + (target_local.raw.index as usize) };
+        unsafe {
+            (*ep).is_poisoned = true;
+            if expected_type.raw.index != 0u32 {
+                (*ep).type_id = expected_type;
+            }
+        }
+    }
+    let idx = ws.recovery_count;
+    let rp = unsafe { ws.recovery_nodes + (idx as usize) };
+    unsafe {
+        *rp = VfsRecoveryNode {
+            doc_id: doc_id,
+            owner_fn: owner_fn,
+            kind: RECOVERY_INCOMPLETE_EXPR,
+            expected_token: EXPECTED_TOK_EXPR,
+            span_start: span_start,
+            span_end: span_end,
+            dot_byte_offset: 0u32,
+            receiver_expr_id: ExprId { raw: target_local.raw },
+            receiver_type_id: expected_type,
+            receiver_ownership: OWNERSHIP_OWNED,
+            receiver_capability: CAP_NONE,
+            callee_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            active_param_index: 0u16,
+            previous_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            retired_at_revision: 0u64,
+        };
+    }
+    ws.recovery_count = ws.recovery_count + 1u32;
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe { (*dp).parse_Incomplete_count = (*dp).parse_Incomplete_count + 1u32; }
+    }
+    vfs_emit_primary_diagnostic(ws, doc_id, DIAG_PARSE_INCOMPLETE_EXPR, DIAG_SEVERITY_ERROR, span_start, span_end);
+    idx
+}
+
+pub fn vfs_record_incomplete_type(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    target_local: LocalId,
+    inferred_rhs_type: LspTypeId,
+    span_start: u32,
+    span_end: u32
+) -> u32 {
+    if ws.recovery_count >= ws.recovery_cap {
+        return 0u32;
+    }
+    // Preserve RHS inferred type on `target_local` while marking it recovered (`AXS-LSP-005 §1`)
+    if target_local.raw.index > 0u32 && target_local.raw.index <= ws.entity_count {
+        let ep = unsafe { ws.entities + (target_local.raw.index as usize) };
+        unsafe {
+            (*ep).is_poisoned = true;
+            if inferred_rhs_type.raw.index != 0u32 {
+                (*ep).type_id = inferred_rhs_type;
+            }
+        }
+    }
+    let idx = ws.recovery_count;
+    let rp = unsafe { ws.recovery_nodes + (idx as usize) };
+    unsafe {
+        *rp = VfsRecoveryNode {
+            doc_id: doc_id,
+            owner_fn: owner_fn,
+            kind: RECOVERY_INCOMPLETE_TYPE,
+            expected_token: EXPECTED_TOK_TYPE,
+            span_start: span_start,
+            span_end: span_end,
+            dot_byte_offset: 0u32,
+            receiver_expr_id: ExprId { raw: target_local.raw },
+            receiver_type_id: inferred_rhs_type,
+            receiver_ownership: OWNERSHIP_OWNED,
+            receiver_capability: CAP_NONE,
+            callee_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            active_param_index: 0u16,
+            previous_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            retired_at_revision: 0u64,
+        };
+    }
+    ws.recovery_count = ws.recovery_count + 1u32;
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe { (*dp).parse_Incomplete_count = (*dp).parse_Incomplete_count + 1u32; }
+    }
+    vfs_emit_primary_diagnostic(ws, doc_id, DIAG_PARSE_INCOMPLETE_TYPE, DIAG_SEVERITY_ERROR, span_start, span_end);
+    idx
+}
+
+pub fn vfs_record_incomplete_call(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    owner_fn: FunctionId,
+    callee: LspSymbolId,
+    active_param_index: u16,
+    span_start: u32,
+    span_end: u32
+) -> u32 {
+    if ws.recovery_count >= ws.recovery_cap {
+        return 0u32;
+    }
+    let idx = ws.recovery_count;
+    let rp = unsafe { ws.recovery_nodes + (idx as usize) };
+    unsafe {
+        *rp = VfsRecoveryNode {
+            doc_id: doc_id,
+            owner_fn: owner_fn,
+            kind: RECOVERY_INCOMPLETE_CALL_EXPR,
+            expected_token: EXPECTED_TOK_RPAREN,
+            span_start: span_start,
+            span_end: span_end,
+            dot_byte_offset: 0u32,
+            receiver_expr_id: ExprId { raw: gen_id_new(0u32, 0u32) },
+            receiver_type_id: LspTypeId { raw: gen_id_new(0u32, 0u32) },
+            receiver_ownership: OWNERSHIP_OWNED,
+            receiver_capability: CAP_NONE,
+            callee_symbol_id: callee,
+            active_param_index: active_param_index,
+            previous_symbol_id: LspSymbolId { raw: gen_id_new(0u32, 0u32) },
+            retired_at_revision: 0u64,
+        };
+    }
+    ws.recovery_count = ws.recovery_count + 1u32;
+    if doc_id < (ws.doc_cap) {
+        let dp = vfs_doc_ptr(view(*ws), doc_id);
+        unsafe { (*dp).parse_Incomplete_count = (*dp).parse_Incomplete_count + 1u32; }
+    }
+    vfs_emit_primary_diagnostic(ws, doc_id, DIAG_PARSE_INCOMPLETE_CALL, DIAG_SEVERITY_ERROR, span_start, span_end);
+    idx
+}
+
+// Checks a downstream expression referencing `local_id` (`AXS-LSP-005 §3`).
+// If `local_id` is poisoned by an upstream recovery node, suppresses secondary type/borrow diagnostics
+// (`cascaded_errors_suppressed += 1`) and returns `false` (no secondary diagnostic emitted).
+// If `local_id` is healthy and `has_type_mismatch` is true, emits a genuine `DIAG_TYP_MISMATCH` diagnostic and returns `true`.
+pub fn vfs_typecheck_local_use(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    local_id: LocalId,
+    has_type_mismatch: bool,
+    span_start: u32,
+    span_end: u32
+) -> bool {
+    let lk = vfs_lookup_entity(view(*ws), local_id.raw);
+    if lk.status != LOOKUP_FOUND {
+        return false;
+    }
+    if lk.entity.is_poisoned {
+        if doc_id < (ws.doc_cap) {
+            let dp = vfs_doc_ptr(view(*ws), doc_id);
+            unsafe {
+                (*dp).cascaded_errors_suppressed = (*dp).cascaded_errors_suppressed + 1u32;
+            }
+        }
+        return false;
+    }
+    if has_type_mismatch {
+        vfs_emit_primary_diagnostic(ws, doc_id, DIAG_TYP_MISMATCH, DIAG_SEVERITY_ERROR, span_start, span_end);
+        return true;
+    }
+    false
+}
+
+// Typechecks an independent function in the same module (`AXS-LSP-006 §2`).
+// Even when a sibling function in `doc_id` has partial-program syntax/HIR recovery nodes,
+// healthy functions are still type-checked and report genuine `DIAG_TYP_MISMATCH` errors!
+pub fn vfs_typecheck_independent_fn(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    fn_id: FunctionId,
+    has_type_mismatch: bool,
+    err_span_start: u32,
+    err_span_end: u32
+) -> bool {
+    ws.typeck_invocations = ws.typeck_invocations + 1u32;
+    let lk = vfs_lookup_entity(view(*ws), fn_id.raw);
+    if lk.status != LOOKUP_FOUND {
+        return false;
+    }
+    if has_type_mismatch {
+        vfs_emit_primary_diagnostic(ws, doc_id, DIAG_TYP_MISMATCH, DIAG_SEVERITY_ERROR, err_span_start, err_span_end);
+        return true;
+    }
+    false
+}
+
+// Hard Production Codegen Barrier (`AXS-LSP-007`):
+// Any document containing a partial-program recovery node or error diagnostic is strictly barred from MIR/LLVM codegen.
+pub fn vfs_can_codegen(ws: view<VfsWorkspace>, doc_id: u32) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(ws, doc_id);
+    if !(unsafe { (*dp).active }) {
+        return false;
+    }
+    if (unsafe { (*dp).parse_Incomplete_count }) > 0u32 || (unsafe { (*dp).diagnostic_count }) > 0u32 {
+        return false;
+    }
+    true
+}
+
+// ============================================================================
+// 5. Incremental VFS Overlay Ownership & CompilerDB / IncrementalEngine Bridge (AXS-LSP-011)
+// ============================================================================
+
+fn vfs_compute_deps_interface_hash(ws: view<VfsWorkspace>, doc_id: u32) -> u64 {
+    let dp = vfs_doc_ptr(ws, doc_id);
+    let mut h: u64 = unsafe { (*dp).interface_hash ^ (*dp).body_hash };
+    let ic = unsafe { (*dp).import_count };
+    let mut i: u32 = 0u32;
+    while i < ic {
+        let dep_id = unsafe { (*dp).imports[i as usize] };
+        let dep_ptr = vfs_doc_ptr(ws, dep_id);
+        let dep_if_hash = unsafe { (*dep_ptr).interface_hash };
+        h = wrapping_mul_u64(h ^ dep_if_hash, 0x100000001B3u64);
+        i = i + 1u32;
+    }
+    h
+}
+
+fn vfs_sync_db_and_incremental(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    interface_hash: u64,
+    body_hash: u64
+) {
+    let sf_id = SourceFileId { v: doc_id + 1u32 };
+    let mod_id = ModuleId { v: doc_id + 1u32 };
+    let pkg_id = PackageId { v: 1u32 };
+    let empty_sv = qry_sv_empty();
+
+    // Update `CompilerDB` source file input and execute frontend queries ONLY (zero-codegen firewall: never Q_LOWER_MIR or Q_EMIT_CODEGEN!)
+    let _ = query_db_set_source_file_input(mut_view(ws.db), sf_id, empty_sv, empty_sv, DURABILITY_LOW);
+    let _ = query_db_set_module_tree_input(mut_view(ws.db), mod_id, pkg_id, ModuleId { v: 0u32 }, empty_sv, sf_id, DURABILITY_LOW);
+    let _ = query_parse_module(mut_view(ws.db), mod_id);
+    let _ = query_module_def_map(mut_view(ws.db), mod_id);
+    let _ = query_resolve_module(mut_view(ws.db), mod_id);
+
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    let deps_h = vfs_compute_deps_interface_hash(view(*ws), doc_id);
+    unsafe {
+        (*dp).verified_deps_hash = deps_h;
+    }
+}
+
+pub fn vfs_register_import_dep(ws: mut_view<VfsWorkspace>, from_doc_id: u32, to_doc_id: u32) {
+    if from_doc_id >= ws.doc_cap {
+        return;
+    }
+    let dp = vfs_doc_ptr(view(*ws), from_doc_id);
+    let ic = unsafe { (*dp).import_count };
+    if ic < 8u32 {
+        unsafe {
+            (*dp).imports[ic as usize] = to_doc_id;
+            (*dp).import_count = ic + 1u32;
+        }
+    }
+}
+
+// Recomputes a downstream dependent module `dep_doc_id` after `changed_doc_id` was edited.
+// If `changed_doc_id`'s `InterfaceFingerprint` did not change (body-only or comment/whitespace edit),
+// short-circuits via `InterfaceFingerprint` backdating (`0` downstream `typeck` runs!).
+pub fn vfs_recompute_dependent_module(ws: mut_view<VfsWorkspace>, dep_doc_id: u32) -> bool {
+    if dep_doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), dep_doc_id);
+    let new_deps_h = vfs_compute_deps_interface_hash(view(*ws), dep_doc_id);
+    let prev_deps_h = unsafe { (*dp).verified_deps_hash };
+    if prev_deps_h != 0u64 && prev_deps_h == new_deps_h {
+        return false;
+    }
+    unsafe {
+        (*dp).verified_deps_hash = new_deps_h;
+    }
+    ws.typeck_invocations = ws.typeck_invocations + 1u32;
+    true
+}
+
+pub fn vfs_did_open_with_threshold(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    uri_hash: u64,
+    client_version: i64,
+    text_ptr: *const u8,
+    text_len: usize,
+    interface_hash: u64,
+    body_hash: u64,
+    compact_threshold: usize
+) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if unsafe { (*dp).active } {
+        editor_doc_free(unsafe { mut_view((*dp).editor) });
+    }
+    unsafe {
+        (*dp).editor = editor_doc_empty();
+    }
+    if !editor_doc_init_with_threshold(unsafe { mut_view((*dp).editor) }, doc_id, text_ptr, text_len, compact_threshold) {
+        return false;
+    }
+    ws.revision = ws.revision + 1u64;
+    let snap = editor_snapshot(unsafe { view((*dp).editor) });
+    unsafe {
+        (*dp).active = true;
+        (*dp).has_editor_overlay = true;
+        (*dp).doc_id = doc_id;
+        (*dp).uri_hash = uri_hash;
+        (*dp).client_version = client_version;
+        (*dp).workspace_revision = ws.revision;
+        (*dp).interface_hash = interface_hash;
+        (*dp).body_hash = body_hash;
+        (*dp).disk_hash = snap.content_hash;
+        (*dp).parse_Incomplete_count = 0u32;
+        (*dp).diagnostic_count = 0u32;
+        (*dp).cascaded_errors_suppressed = 0u32;
+    }
+    vfs_clear_doc_recovery_and_diagnostics(mut_view(*ws), doc_id);
+    vfs_sync_db_and_incremental(ws, doc_id, interface_hash, body_hash);
+    true
+}
+
+pub fn vfs_did_open(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    uri_hash: u64,
+    client_version: i64,
+    text_ptr: *const u8,
+    text_len: usize,
+    interface_hash: u64,
+    body_hash: u64
+) -> bool {
+    vfs_did_open_with_threshold(ws, doc_id, uri_hash, client_version, text_ptr, text_len, interface_hash, body_hash, 4096)
+}
+
+pub fn vfs_did_change_bytes(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    new_client_version: i64,
+    start_byte: u64,
+    end_byte: u64,
+    rep_ptr: *const u8,
+    rep_len: usize,
+    new_interface_hash: u64,
+    new_body_hash: u64
+) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) || !(unsafe { (*dp).has_editor_overlay }) {
+        return false;
+    }
+    if !editor_apply_edit(unsafe { mut_view((*dp).editor) }, start_byte, end_byte, rep_ptr, rep_len) {
+        return false;
+    }
+    ws.revision = ws.revision + 1u64;
+    unsafe {
+        (*dp).client_version = new_client_version;
+        (*dp).workspace_revision = ws.revision;
+        (*dp).interface_hash = new_interface_hash;
+        (*dp).body_hash = new_body_hash;
+    }
+    vfs_clear_doc_recovery_and_diagnostics(mut_view(*ws), doc_id);
+    vfs_sync_db_and_incremental(ws, doc_id, new_interface_hash, new_body_hash);
+    true
+}
+
+pub fn vfs_did_change_range(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    new_client_version: i64,
+    range: LspRange,
+    rep_ptr: *const u8,
+    rep_len: usize,
+    new_interface_hash: u64,
+    new_body_hash: u64
+) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) || !(unsafe { (*dp).has_editor_overlay }) {
+        return false;
+    }
+    let byte_range = editor_lsp_range_to_byte_range(unsafe { view((*dp).editor) }, range, ws.position_encoding);
+    vfs_did_change_bytes(
+        ws,
+        doc_id,
+        new_client_version,
+        byte_range.start.byte_offset,
+        byte_range.end.byte_offset,
+        rep_ptr,
+        rep_len,
+        new_interface_hash,
+        new_body_hash
+    )
+}
+
+pub fn vfs_did_save(ws: mut_view<VfsWorkspace>, doc_id: u32) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) {
+        return false;
+    }
+    let snap = editor_snapshot(unsafe { view((*dp).editor) });
+    unsafe {
+        (*dp).disk_hash = snap.content_hash;
+    }
+    true
+}
+
+// Releases the in-memory `EditorDocument` overlay on `textDocument/didClose` and reverts the `CompilerDB`
+// input to the on-disk file content (`AXS-LSP-011 §1`).
+pub fn vfs_did_close(
+    ws: mut_view<VfsWorkspace>,
+    doc_id: u32,
+    disk_ptr: *const u8,
+    disk_len: usize,
+    disk_interface_hash: u64,
+    disk_body_hash: u64
+) -> bool {
+    if doc_id >= ws.doc_cap {
+        return false;
+    }
+    let dp = vfs_doc_ptr(view(*ws), doc_id);
+    if !(unsafe { (*dp).active }) {
+        return false;
+    }
+    editor_doc_free(unsafe { mut_view((*dp).editor) });
+    unsafe {
+        (*dp).editor = editor_doc_empty();
+    }
+    if !editor_doc_init_with_threshold(unsafe { mut_view((*dp).editor) }, doc_id, disk_ptr, disk_len, 4096) {
+        return false;
+    }
+    ws.revision = ws.revision + 1u64;
+    let snap = editor_snapshot(unsafe { view((*dp).editor) });
+    unsafe {
+        (*dp).has_editor_overlay = false;
+        (*dp).workspace_revision = ws.revision;
+        (*dp).interface_hash = disk_interface_hash;
+        (*dp).body_hash = disk_body_hash;
+        (*dp).disk_hash = snap.content_hash;
+    }
+    vfs_clear_doc_recovery_and_diagnostics(mut_view(*ws), doc_id);
+    vfs_sync_db_and_incremental(ws, doc_id, disk_interface_hash, disk_body_hash);
+    true
+}
