@@ -8,12 +8,12 @@ model: opus
 gate_model: opus
 depends: [T215, T063, T064, T600, T601, T602, T603, T604, T605, T606, T607, T608, T609, T610, T611, T612, T613, T614, T615, T616, T617, T618, T619, T620, T621, T622, T623, T624, T625, T626, T627, T628, T629]
 priority: 315
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p15, _workspaces/reports/phase-P15-review.md]
 spec: [spec/ROADMAP.md, spec/SPEC-70-optir-ssa-memoryssa.md, spec/SPEC-71-alias-escape-promotion.md, spec/SPEC-72-loops-scev-bce.md, spec/SPEC-73-inlining-specialization-devirt.md, spec/SPEC-74-auto-vectorization.md, spec/SPEC-75-lto-wpo-section-gc-pgo.md, spec/SPEC-76-performance-contract.md, spec/SPEC-77-regalloc-machine-opt.md]
 started: 2026-11-08 17:06:48
-agent: T315-impl
+finished: 2026-11-08 17:46:15
 ---
 # T315 — Phase P15 gate: Optimizer 2.0
 
@@ -40,3 +40,4 @@ Certify that phase P15 meets the exit criteria of every epic (`E15.1`–`E15.8`)
 ## Log
 - 2026-11-03 02:45:00 wired all P15 tasks (`T063`, `T064`, `T600`–`T629`) into `depends:` in T215
 - 2026-11-08 17:06:48 started (attempt 1) T315-impl
+- 2026-11-08 17:46:15 accepted by QA -> done
