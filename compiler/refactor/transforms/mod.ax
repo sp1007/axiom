@@ -1,0 +1,1870 @@
+// CompilerDB-Driven Semantic Refactoring Transformations & Mandatory Verification Gate (T809 / E19.3).
+// Implements SPEC-102 §§1..2 (AXS-REF-001..003, AXS-REF-010..014; REQ-TOOL-183, REQ-TOOL-186):
+// - Unified `CompilerDB` semantic authority & post-transformation verification gate (`AXS-REF-001..002`)
+// - `extract_function`: ownership (`ByCopy`, `ByMove`), capability (`view<T>`, `mut_view<T>`),
+//   return-value tuple, `async`/`.await`, and `! ErrorType` synthesis (`AXS-REF-010`)
+// - `extract_variable` & `inline_variable`: evaluation-order, purity, `Copy`, `Drop`,
+//   and operator-precedence parenthesization verification (`AXS-REF-011`)
+// - `populate_match_arms`: exhaustive pattern matrix expansion (`AXS-REF-012`)
+// - `organize_imports`: unused pruning, deduplication, alias preservation & dot-path brace merging (`AXS-REF-013`)
+// - `change_signature`, `move_item` & `convert_capability_view` (`AXS-REF-014`)
+module compiler.refactor.transforms
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use std.editor.LspPosition
+use std.editor.LspRange
+use std.editor.TextRange
+use std.editor.TextEdit
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+use std.editor.text_range_new
+use std.editor.text_edit_new
+use std.editor.editor_byte_range_to_lsp_range
+use std.editor.editor_apply_transaction
+use std.editor.editor_undo
+use std.editor.editor_snapshot
+
+use compiler.lsp.protocol.CERTAINTY_EXACT
+use compiler.lsp.protocol.CERTAINTY_UNAVAILABLE
+use compiler.lsp.protocol.FALLBACK_NONE
+use compiler.lsp.protocol.FALLBACK_STALE_ENTITY
+use compiler.lsp.protocol.LspFactHeader
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_fact_header_new
+use compiler.lsp.protocol.lsp_str_view
+
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.GenerationalId
+use compiler.lsp.vfs.LspSymbolId
+use compiler.lsp.vfs.FunctionId
+use compiler.lsp.vfs.LspTypeId
+use compiler.lsp.vfs.LocalId
+use compiler.lsp.vfs.LOOKUP_FOUND
+use compiler.lsp.vfs.OWNERSHIP_OWNED
+use compiler.lsp.vfs.OWNERSHIP_VIEW
+use compiler.lsp.vfs.OWNERSHIP_MUT_VIEW
+use compiler.lsp.vfs.OWNERSHIP_MOVED
+use compiler.lsp.vfs.DIAG_BORROW_CONFLICT
+use compiler.lsp.vfs.gen_id_new
+use compiler.lsp.vfs.function_id_eq
+use compiler.lsp.vfs.lsp_symbol_id_eq
+use compiler.lsp.vfs.vfs_doc_ptr
+use compiler.lsp.vfs.vfs_lookup_entity
+
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.DIAG_CAP_MUT_REQUIRED
+use compiler.lsp.handlers.DIAG_CAP_CONFLICT_READ
+use compiler.lsp.handlers.DIAG_CAP_OUTLIVES_OWNER
+use compiler.lsp.handlers.DIAG_MOVE_USE_AFTER_MOVE
+use compiler.lsp.handlers.DIAG_MOVE_ASSIGN_IMMUTABLE
+use compiler.lsp.handlers.DIAG_NAME_DUPLICATE
+use compiler.lsp.handlers.DIAG_NAME_UNRESOLVED
+use compiler.lsp.handlers.DIAG_PAT_NON_EXHAUSTIVE
+use compiler.lsp.handlers.DIAG_UNSAFE_REQUIRED
+use compiler.lsp.handlers.APPLICABILITY_MACHINE_APPLICABLE
+use compiler.lsp.handlers.APPLICABILITY_HAS_PLACEHOLDERS
+use compiler.lsp.handlers.APPLICABILITY_MAYBE_INCORRECT
+use compiler.lsp.handlers.SYM_KIND_FUNCTION
+use compiler.lsp.handlers.SYM_KIND_VARIABLE
+use compiler.lsp.handlers.lsp_hash_sv
+use compiler.lsp.handlers.lsp_is_valid_identifier
+
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+use compiler.query.db.query_item_signature
+use compiler.query.db.query_typeck_body
+use compiler.query.db.query_mir_body
+use compiler.query.db.query_effect_summary
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic fn align_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+// ============================================================================
+// 1. Refactoring Taxonomy, Statuses & Capture Modes (SPEC-102 §§1..2)
+// ============================================================================
+
+pub const REFACTOR_ABI_1: u32 = 1u32;
+pub const REFACTOR_SCHEMA_1: u32 = 1u32;
+
+// RefactorKind (AXS-REF-003)
+pub const REFACTOR_EXTRACT_FUNCTION: u8 = 1u8;
+pub const REFACTOR_EXTRACT_VARIABLE: u8 = 2u8;
+pub const REFACTOR_INLINE_VARIABLE: u8 = 3u8;
+pub const REFACTOR_POPULATE_MATCH_ARMS: u8 = 4u8;
+pub const REFACTOR_ORGANIZE_IMPORTS: u8 = 5u8;
+pub const REFACTOR_CHANGE_SIGNATURE: u8 = 6u8;
+pub const REFACTOR_MOVE_ITEM: u8 = 7u8;
+pub const REFACTOR_CONVERT_CAPABILITY_VIEW: u8 = 8u8;
+
+// RefactorStatus (AXS-REF-003)
+pub const REFACTOR_OK: u8 = 0u8;
+pub const REFACTOR_INVALID_SELECTION: u8 = 1u8;
+pub const REFACTOR_PRECONDITION_FAILED: u8 = 2u8;
+pub const REFACTOR_OWNERSHIP_CONFLICT: u8 = 3u8;
+pub const REFACTOR_CAPABILITY_CONFLICT: u8 = 4u8;
+pub const REFACTOR_CONTROL_FLOW_CONFLICT: u8 = 5u8;
+pub const REFACTOR_NAME_COLLISION: u8 = 6u8;
+pub const REFACTOR_VERIFICATION_FAILED: u8 = 7u8;
+pub const REFACTOR_UNSAFE_SYNTHESIS_FORBIDDEN: u8 = 8u8;
+
+// `extract_function` parameter capture modes (AXS-REF-010 §2)
+pub const PARAM_MODE_NONE: u8 = 0u8;
+pub const PARAM_MODE_BY_COPY: u8 = 1u8;
+pub const PARAM_MODE_READ_VIEW: u8 = 2u8;
+pub const PARAM_MODE_MUT_VIEW: u8 = 3u8;
+pub const PARAM_MODE_BY_MOVE: u8 = 4u8;
+
+// `populate_match_arms` scrutinee & variant kinds (AXS-REF-012)
+pub const SCRUTINEE_ENUM: u8 = 1u8;
+pub const SCRUTINEE_BOOL: u8 = 2u8;
+pub const SCRUTINEE_OPEN_SCALAR: u8 = 3u8;
+
+pub const VARIANT_UNIT: u8 = 0u8;
+pub const VARIANT_TUPLE: u8 = 1u8;
+pub const VARIANT_STRUCT: u8 = 2u8;
+
+// `convert_capability_view` modes (AXS-REF-014 §3)
+pub const CAP_CONV_OWNED_TO_VIEW: u8 = 1u8;
+pub const CAP_CONV_VIEW_TO_MUT_VIEW: u8 = 2u8;
+pub const CAP_CONV_LET_TO_LET_MUT: u8 = 3u8;
+
+// ============================================================================
+// 2. String Synthesis Buffer & Byte Helpers
+// ============================================================================
+
+struct RefBuf {
+    ptr: *mut u8,
+    len: usize,
+    cap: usize,
+}
+
+fn ref_buf_new(cap: usize) -> RefBuf {
+    let actual_cap = if cap < 64 { 64 } else { cap };
+    let p = unsafe { heap_alloc(actual_cap + 1, 1) };
+    unsafe { *(p) = 0u8; }
+    RefBuf { ptr: p, len: 0, cap: actual_cap }
+}
+
+fn ref_buf_ensure(b: mut_view<RefBuf>, add_len: usize) {
+    if (b.len + add_len + 1) <= b.cap {
+        return;
+    }
+    let mut new_cap = b.cap * 2;
+    while (b.len + add_len + 1) > new_cap {
+        new_cap = new_cap * 2;
+    }
+    let np = unsafe { heap_alloc(new_cap + 1, 1) };
+    let mut i: usize = 0;
+    while i < b.len {
+        unsafe { *(np + i) = *(b.ptr + i); }
+        i = i + 1;
+    }
+    unsafe { *(np + b.len) = 0u8; }
+    if (b.ptr as usize) != 0 {
+        unsafe { heap_free(b.ptr, b.cap + 1, 1); }
+    }
+    b.ptr = np;
+    b.cap = new_cap;
+}
+
+fn ref_buf_push_byte(b: mut_view<RefBuf>, ch: u8) {
+    ref_buf_ensure(mut_view(*b), 1);
+    unsafe {
+        *(b.ptr + b.len) = ch;
+        *(b.ptr + b.len + 1) = 0u8;
+    }
+    b.len = b.len + 1;
+}
+
+fn ref_buf_push_sv(b: mut_view<RefBuf>, sv: LspStrView) {
+    if sv.len == 0 || (sv.ptr as usize) == 0 {
+        return;
+    }
+    ref_buf_ensure(mut_view(*b), sv.len);
+    let mut i: usize = 0;
+    while i < sv.len {
+        unsafe { *(b.ptr + b.len + i) = *(sv.ptr + i); }
+        i = i + 1;
+    }
+    b.len = b.len + sv.len;
+    unsafe { *(b.ptr + b.len) = 0u8; }
+}
+
+fn ref_buf_push_str(b: mut_view<RefBuf>, s: str) {
+    ref_buf_push_sv(mut_view(*b), lsp_str_view(s));
+}
+
+fn ref_buf_push_spaces(b: mut_view<RefBuf>, count: u32) {
+    let mut i: u32 = 0u32;
+    while i < count {
+        ref_buf_push_byte(mut_view(*b), 32u8);
+        i = i + 1u32;
+    }
+}
+
+fn ref_buf_to_sv(b: RefBuf) -> LspStrView {
+    LspStrView { ptr: b.ptr as *const u8, len: b.len }
+}
+
+pub fn refactor_sv_eq(a: LspStrView, b: LspStrView) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let ba = if (a.ptr as usize) != 0 { unsafe { *(a.ptr + i) } } else { 0u8 };
+        let bb = if (b.ptr as usize) != 0 { unsafe { *(b.ptr + i) } } else { 0u8 };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+pub fn refactor_sv_eq_lit(a: LspStrView, lit: str) -> bool {
+    refactor_sv_eq(a, lsp_str_view(lit))
+}
+
+pub fn refactor_sv_cmp(a: LspStrView, b: LspStrView) -> i32 {
+    let min_len = if (a.len) < (b.len) { a.len } else { b.len };
+    let mut i: usize = 0;
+    while i < min_len {
+        let ba = if (a.ptr as usize) != 0 { unsafe { *(a.ptr + i) } } else { 0u8 };
+        let bb = if (b.ptr as usize) != 0 { unsafe { *(b.ptr + i) } } else { 0u8 };
+        if ba < bb {
+            return -1i32;
+        }
+        if ba > bb {
+            return 1i32;
+        }
+        i = i + 1;
+    }
+    if (a.len) < (b.len) {
+        return -1i32;
+    }
+    if (a.len) > (b.len) {
+        return 1i32;
+    }
+    0i32
+}
+
+pub fn refactor_sv_contains_lit(hay: LspStrView, needle: str) -> bool {
+    let nsv = lsp_str_view(needle);
+    if nsv.len == 0 {
+        return true;
+    }
+    if (hay.len) < (nsv.len) || (hay.ptr as usize) == 0 {
+        return false;
+    }
+    let limit = hay.len - nsv.len;
+    let mut i: usize = 0;
+    while i <= limit {
+        let mut matched = true;
+        let mut j: usize = 0;
+        while j < nsv.len {
+            if (unsafe { *(hay.ptr + i + j) }) != (unsafe { *(nsv.ptr + j) }) {
+                matched = false;
+                break;
+            }
+            j = j + 1;
+        }
+        if matched {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// ============================================================================
+// 3. Atomic WorkspaceEdit & Mandatory Post-Transformation Verification Gate (`AXS-REF-002..003`)
+// ============================================================================
+
+@derive(Copy)
+pub struct RefactorTextEdit {
+    pub doc_id: u32,
+    pub span_start: u32,
+    pub span_end: u32,
+    pub range: LspRange,
+    pub new_text_str: LspStrView,
+}
+
+@derive(Copy)
+pub struct RefactorWorkspaceEdit {
+    pub status: u8,
+    pub kind: u8,
+    pub applicability: u8,
+    pub diag_code: u32,
+    pub verified_by_compiler_db: bool,
+    pub rolled_back: bool,
+    pub affected_doc_count: u32,
+    pub edit_count: u32,
+    pub header: LspFactHeader,
+    pub edits: [16]RefactorTextEdit,
+}
+
+pub fn refactor_workspace_edit_empty(ws: view<VfsWorkspace>, kind: u8, applicability: u8) -> RefactorWorkspaceEdit {
+    let empty_pos = lsp_pos_new(0u32, 0u32);
+    let empty_edit = RefactorTextEdit {
+        doc_id: 0u32,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: lsp_range_new(empty_pos, empty_pos),
+        new_text_str: lsp_str_view(""),
+    };
+    RefactorWorkspaceEdit {
+        status: REFACTOR_OK,
+        kind: kind,
+        applicability: applicability,
+        diag_code: 0u32,
+        verified_by_compiler_db: false,
+        rolled_back: false,
+        affected_doc_count: 0u32,
+        edit_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        edits: [empty_edit; 16],
+    }
+}
+
+// Inserts a `RefactorTextEdit` into `we` in deterministic sorted order `(doc_id, span_start, span_end)`
+// while verifying the non-overlapping span invariant (`e_i.span_end <= e_{i+1}.span_start`) (`AXS-REF-003 §2`).
+pub fn refactor_workspace_edit_add(
+    ws: view<VfsWorkspace>,
+    we: mut_view<RefactorWorkspaceEdit>,
+    doc_id: u32,
+    span_start: u32,
+    span_end: u32,
+    new_text_str: LspStrView
+) -> bool {
+    if doc_id >= ws.doc_cap || span_start > span_end || we.edit_count >= 16u32 {
+        we.status = REFACTOR_PRECONDITION_FAILED;
+        return false;
+    }
+    let dp = vfs_doc_ptr(ws, doc_id);
+    if !(unsafe { (*dp).active }) {
+        we.status = REFACTOR_PRECONDITION_FAILED;
+        return false;
+    }
+
+    // Check against existing edits in the same document for illegal overlap (`e_i.end <= e_{i+1}.start`)
+    let mut ins_pos: u32 = we.edit_count;
+    let mut i: u32 = 0u32;
+    while i < we.edit_count {
+        let cur = we.edits[i as usize];
+        if cur.doc_id == doc_id {
+            let before_cur = span_end < cur.span_start || (span_end == cur.span_start && span_start <= cur.span_start);
+            let after_cur = span_start > cur.span_end || (span_start == cur.span_end && cur.span_end > cur.span_start);
+            if !before_cur && !after_cur {
+                we.status = REFACTOR_PRECONDITION_FAILED;
+                return false;
+            }
+            if before_cur && ins_pos == we.edit_count {
+                ins_pos = i;
+            }
+        } else if doc_id < cur.doc_id && ins_pos == we.edit_count {
+            ins_pos = i;
+        }
+        i = i + 1u32;
+    }
+
+    let tr = text_range_new(span_start as u64, span_end as u64);
+    let lrange = editor_byte_range_to_lsp_range(unsafe { view((*dp).editor) }, tr, ws.position_encoding);
+    let item = RefactorTextEdit {
+        doc_id: doc_id,
+        span_start: span_start,
+        span_end: span_end,
+        range: lrange,
+        new_text_str: new_text_str,
+    };
+
+    let mut k: u32 = we.edit_count;
+    while k > ins_pos {
+        we.edits[k as usize] = we.edits[(k - 1u32) as usize];
+        k = k - 1u32;
+    }
+    we.edits[ins_pos as usize] = item;
+    we.edit_count = we.edit_count + 1u32;
+
+    // Recompute `affected_doc_count`
+    let mut seen: [32]bool = [false; 32];
+    let mut dcnt: u32 = 0u32;
+    let mut j: u32 = 0u32;
+    while j < we.edit_count {
+        let did = we.edits[j as usize].doc_id as usize;
+        if did < 32 && !seen[did] {
+            seen[did] = true;
+            dcnt = dcnt + 1u32;
+        }
+        j = j + 1u32;
+    }
+    we.affected_doc_count = dcnt;
+    true
+}
+
+// Checks whether a synthesized text fragment attempts to inject `unsafe` or `@allow_unsafe`
+// without audited user authorization (`AXS-REF-002 §2`, `REQ-TOOL-186`).
+pub fn refactor_contains_unauthorized_unsafe(sv: LspStrView) -> bool {
+    refactor_sv_contains_lit(sv, "unsafe ") ||
+        refactor_sv_contains_lit(sv, "unsafe{") ||
+        refactor_sv_contains_lit(sv, "@allow_unsafe")
+}
+
+// Mandatory post-transformation `CompilerDB` verification & transactional commit gate
+// (`SPEC-102 §1.2 AXS-REF-002`, `REQ-TOOL-186`, `ATOOL-27..29`):
+// 1. Rejects any edit that synthesizes unauthorized `unsafe` or `@allow_unsafe`.
+// 2. Applies candidate `EditTransaction` batches to `AXEDITOR` buffers in `VfsWorkspace`.
+// 3. Evaluates `CompilerDB` frontend verification (`parse_module`, `module_def_map`, `resolve_module`,
+//    `item_signature`, `typeck_body`, `mir_body`) under the zero-codegen firewall (`ws.codegen_invocations == 0`).
+// 4. If any verification fails (or `simulate_verification_failure == true`), rolls back all modified documents
+//    via `editor_undo` and restores `ws.revision` cleanly.
+pub fn refactor_verify_and_commit_edit(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    we: mut_view<RefactorWorkspaceEdit>,
+    allow_audited_unsafe: bool,
+    simulate_verification_failure: bool
+) -> bool {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    if we.status != REFACTOR_OK || we.edit_count == 0u32 {
+        we.verified_by_compiler_db = false;
+        return false;
+    }
+
+    // 1. Check AI / refactoring safety boundary for unauthorized `unsafe` synthesis (`AXS-REF-002 §2`)
+    if !allow_audited_unsafe {
+        let mut ei: u32 = 0u32;
+        while ei < we.edit_count {
+            if refactor_contains_unauthorized_unsafe(we.edits[ei as usize].new_text_str) {
+                we.status = REFACTOR_UNSAFE_SYNTHESIS_FORBIDDEN;
+                we.diag_code = DIAG_UNSAFE_REQUIRED;
+                we.verified_by_compiler_db = false;
+                we.rolled_back = true;
+                we.header = lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY);
+                return false;
+            }
+            ei = ei + 1u32;
+        }
+    }
+
+    // 2. Apply per-document atomic transactions on the candidate overlay
+    let saved_ws_rev = ws.revision;
+    let mut applied_docs: [32]bool = [false; 32];
+    let mut doc_saved_rev: [32]u64 = [0u64; 32];
+    let mut doc_id: u32 = 0u32;
+    while doc_id < ws.doc_cap {
+        let mut batch: [16]TextEdit = [text_edit_new(0u64, 0u64, 0 as *const u8, 0); 16];
+        let mut bcount: u32 = 0u32;
+        let mut ei: u32 = 0u32;
+        while ei < we.edit_count {
+            let ed = we.edits[ei as usize];
+            if ed.doc_id == doc_id && bcount < 16u32 {
+                batch[bcount as usize] = text_edit_new(
+                    ed.span_start as u64,
+                    ed.span_end as u64,
+                    ed.new_text_str.ptr,
+                    ed.new_text_str.len
+                );
+                bcount = bcount + 1u32;
+            }
+            ei = ei + 1u32;
+        }
+        if bcount > 0u32 {
+            let dp = vfs_doc_ptr(view(*ws), doc_id);
+            doc_saved_rev[doc_id as usize] = unsafe { (*dp).workspace_revision };
+            if !editor_apply_transaction(unsafe { mut_view((*dp).editor) }, unsafe { address_of(batch[0]) }, bcount) {
+                // Roll back any previously applied documents in this transaction
+                let mut rdoc: u32 = 0u32;
+                while rdoc < doc_id {
+                    if applied_docs[rdoc as usize] {
+                        let rdp = vfs_doc_ptr(view(*ws), rdoc);
+                        let _ = editor_undo(unsafe { mut_view((*rdp).editor) });
+                        unsafe { (*rdp).workspace_revision = doc_saved_rev[rdoc as usize]; }
+                    }
+                    rdoc = rdoc + 1u32;
+                }
+                ws.revision = saved_ws_rev;
+                we.status = REFACTOR_VERIFICATION_FAILED;
+                we.verified_by_compiler_db = false;
+                we.rolled_back = true;
+                return false;
+            }
+            applied_docs[doc_id as usize] = true;
+            ws.revision = ws.revision + 1u64;
+            unsafe { (*dp).workspace_revision = ws.revision; }
+        }
+        doc_id = doc_id + 1u32;
+    }
+
+    // 3. Evaluate `CompilerDB` semantic verification queries on every modified module (`AXS-REF-002 §3`)
+    let mut verify_ok = !simulate_verification_failure && ws.codegen_invocations == 0u32;
+    doc_id = 0u32;
+    while doc_id < ws.doc_cap && verify_ok {
+        if applied_docs[doc_id as usize] {
+            let dp = vfs_doc_ptr(view(*ws), doc_id);
+            let mod_id = ModuleId { v: doc_id + 1u32 };
+            let pm = query_parse_module(mut_view(ws.db), mod_id);
+            let dm = query_module_def_map(mut_view(ws.db), mod_id);
+            let rm = query_resolve_module(mut_view(ws.db), mod_id);
+            ws.typeck_invocations = ws.typeck_invocations + 1u32;
+            if pm.has_parse_error || dm.is_error || rm.has_resolve_error || (unsafe { (*dp).parse_Incomplete_count }) > 0u32 {
+                verify_ok = false;
+            }
+            // Verify enclosing/declared functions in `doc_id` through `item_signature`, `typeck_body`, and `mir_body`
+            let mut ni: u32 = 0u32;
+            while ni < eng.node_count && verify_ok {
+                let n = unsafe { *(eng.nodes + (ni as usize)) };
+                if n.active && n.doc_id == doc_id && n.is_declaration && n.sym_kind == SYM_KIND_FUNCTION && n.symbol_id.raw.index > 0u32 {
+                    let def_id = DefId { v: n.symbol_id.raw.index };
+                    let sig = query_item_signature(mut_view(ws.db), def_id);
+                    let tck = query_typeck_body(mut_view(ws.db), def_id);
+                    let mir = query_mir_body(mut_view(ws.db), def_id);
+                    if sig.is_error || tck.is_error || mir.is_error || !mir.ownership_verified {
+                        verify_ok = false;
+                    }
+                }
+                ni = ni + 1u32;
+            }
+        }
+        doc_id = doc_id + 1u32;
+    }
+
+    if !verify_ok {
+        // Transactional rollback (`ATOOL-29`, `AXS-REF-002 §3`): restore all modified `AXEDITOR` buffers and revisions
+        doc_id = 0u32;
+        while doc_id < ws.doc_cap {
+            if applied_docs[doc_id as usize] {
+                let rdp = vfs_doc_ptr(view(*ws), doc_id);
+                let _ = editor_undo(unsafe { mut_view((*rdp).editor) });
+                unsafe { (*rdp).workspace_revision = doc_saved_rev[doc_id as usize]; }
+            }
+            doc_id = doc_id + 1u32;
+        }
+        ws.revision = saved_ws_rev;
+        we.status = REFACTOR_VERIFICATION_FAILED;
+        we.verified_by_compiler_db = false;
+        we.rolled_back = true;
+        we.header = lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY);
+        return false;
+    }
+
+    we.verified_by_compiler_db = true;
+    we.rolled_back = false;
+    we.header = lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE);
+    true
+}
+
+// ============================================================================
+// 4. `extract_function`: Ownership, Capability & Control-Flow Synthesis (`AXS-REF-010`)
+// ============================================================================
+
+@derive(Copy)
+pub struct ExtractCaptureVar {
+    pub local_id: LocalId,
+    pub name_str: LspStrView,
+    pub base_type_str: LspStrView,
+    pub is_copy: bool,
+    pub is_mutable_binding: bool,
+    pub already_view: bool,
+    pub already_mut_view: bool,
+    pub read_in_selection: bool,
+    pub mutated_in_selection: bool,
+    pub moved_in_selection: bool,
+    pub live_after_selection: bool,
+    pub conflicting_view_active: bool,
+    pub defined_in_selection: bool,
+    pub escapes_as_view_after_selection: bool,
+}
+
+@derive(Copy)
+pub struct ExtractParamSpec {
+    pub name_str: LspStrView,
+    pub param_decl_str: LspStrView,
+    pub call_arg_str: LspStrView,
+    pub param_mode: u8,
+}
+
+@derive(Copy)
+pub struct ExtractFunctionRequest {
+    pub doc_id: u32,
+    pub enclosing_fn: FunctionId,
+    pub selection_start: u32,
+    pub selection_end: u32,
+    pub helper_insert_offset: u32,
+    pub new_fn_name_str: LspStrView,
+    pub is_enclosing_async: bool,
+    pub has_await_in_selection: bool,
+    pub has_yield_in_selection: bool,
+    pub has_unstructured_loop_exit: bool,
+    pub has_non_tail_early_return: bool,
+    pub has_incomplete_syntax: bool,
+    pub error_effect_type_str: LspStrView,
+    pub generic_params_str: LspStrView,
+    pub body_text_str: LspStrView,
+    pub captures: [8]ExtractCaptureVar,
+    pub capture_count: u32,
+}
+
+@derive(Copy)
+pub struct ExtractFunctionResult {
+    pub status: u8,
+    pub diag_code: u32,
+    pub applicability: u8,
+    pub param_count: u32,
+    pub return_var_count: u32,
+    pub is_async_helper: bool,
+    pub has_error_effect: bool,
+    pub params: [8]ExtractParamSpec,
+    pub helper_signature_str: LspStrView,
+    pub helper_fn_text_str: LspStrView,
+    pub call_site_text_str: LspStrView,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn extract_capture_var_new(
+    local_id: LocalId,
+    name: str,
+    base_type: str,
+    is_copy: bool,
+    is_mutable_binding: bool,
+    already_view: bool,
+    already_mut_view: bool,
+    read_in_selection: bool,
+    mutated_in_selection: bool,
+    moved_in_selection: bool,
+    live_after_selection: bool,
+    conflicting_view_active: bool,
+    defined_in_selection: bool,
+    escapes_as_view_after_selection: bool
+) -> ExtractCaptureVar {
+    ExtractCaptureVar {
+        local_id: local_id,
+        name_str: lsp_str_view(name),
+        base_type_str: lsp_str_view(base_type),
+        is_copy: is_copy,
+        is_mutable_binding: is_mutable_binding,
+        already_view: already_view,
+        already_mut_view: already_mut_view,
+        read_in_selection: read_in_selection,
+        mutated_in_selection: mutated_in_selection,
+        moved_in_selection: moved_in_selection,
+        live_after_selection: live_after_selection,
+        conflicting_view_active: conflicting_view_active,
+        defined_in_selection: defined_in_selection,
+        escapes_as_view_after_selection: escapes_as_view_after_selection,
+    }
+}
+
+pub fn refactor_extract_function(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<ExtractFunctionRequest>
+) -> ExtractFunctionResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let empty_param = ExtractParamSpec {
+        name_str: empty_sv,
+        param_decl_str: empty_sv,
+        call_arg_str: empty_sv,
+        param_mode: PARAM_MODE_NONE,
+    };
+    let mut res = ExtractFunctionResult {
+        status: REFACTOR_OK,
+        diag_code: 0u32,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        param_count: 0u32,
+        return_var_count: 0u32,
+        is_async_helper: false,
+        has_error_effect: false,
+        params: [empty_param; 8],
+        helper_signature_str: empty_sv,
+        helper_fn_text_str: empty_sv,
+        call_site_text_str: empty_sv,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_EXTRACT_FUNCTION, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    // 1. Syntactic & control-flow preconditions (`AXS-REF-010 §1`)
+    if req.doc_id >= ws.doc_cap || req.selection_start >= req.selection_end || req.has_incomplete_syntax {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), req.doc_id);
+    if !(unsafe { (*dp).active }) || (unsafe { (*dp).parse_Incomplete_count }) > 0u32 {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+    if req.has_unstructured_loop_exit || req.has_non_tail_early_return || req.has_yield_in_selection {
+        res.status = REFACTOR_CONTROL_FLOW_CONFLICT;
+        res.workspace_edit.status = REFACTOR_CONTROL_FLOW_CONFLICT;
+        return res;
+    }
+    if req.new_fn_name_str.len == 0 {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+    let fn_hash = lsp_hash_sv(req.new_fn_name_str);
+    let mut ni: u32 = 0u32;
+    while ni < eng.node_count {
+        let nd = unsafe { *(eng.nodes + (ni as usize)) };
+        if nd.active && nd.doc_id == req.doc_id && nd.is_declaration && nd.sym_kind == SYM_KIND_FUNCTION && nd.name_hash == fn_hash {
+            res.status = REFACTOR_NAME_COLLISION;
+            res.diag_code = DIAG_NAME_DUPLICATE;
+            res.workspace_edit.status = REFACTOR_NAME_COLLISION;
+            res.workspace_edit.diag_code = DIAG_NAME_DUPLICATE;
+            return res;
+        }
+        ni = ni + 1u32;
+    }
+
+    // 2. Dataflow & ownership/capability capture classification (`AXS-REF-010 §2`)
+    let mut ret_indices: [8]u32 = [0u32; 8];
+    let mut ret_cnt: u32 = 0u32;
+    let mut ci: u32 = 0u32;
+    while ci < req.capture_count && ci < 8u32 {
+        let cap = req.captures[ci as usize];
+        // Validate generational handle in VFS arena if attached (`AXS-REF-001 §2`)
+        if cap.local_id.raw.index > 0u32 {
+            let lk = vfs_lookup_entity(view(*ws), cap.local_id.raw);
+            if lk.status != LOOKUP_FOUND {
+                res.status = REFACTOR_PRECONDITION_FAILED;
+                res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+                return res;
+            }
+        }
+
+        if cap.defined_in_selection {
+            // Check for escaping view rooted in a local allocated inside selection (`AXS-REF-010 §2`: `AX_CAP_OUTLIVES_OWNER`)
+            if cap.escapes_as_view_after_selection {
+                res.status = REFACTOR_CAPABILITY_CONFLICT;
+                res.diag_code = DIAG_CAP_OUTLIVES_OWNER;
+                res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+                res.workspace_edit.diag_code = DIAG_CAP_OUTLIVES_OWNER;
+                return res;
+            }
+            if cap.live_after_selection {
+                ret_indices[ret_cnt as usize] = ci;
+                ret_cnt = ret_cnt + 1u32;
+            }
+        } else {
+            // Variable declared outside selection and referenced inside selection
+            if !cap.is_copy && cap.moved_in_selection && cap.live_after_selection {
+                // Consumed by move inside selection AND used after selection (`AX_MOVE_USE_AFTER_MOVE`)
+                res.status = REFACTOR_OWNERSHIP_CONFLICT;
+                res.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+                res.workspace_edit.status = REFACTOR_OWNERSHIP_CONFLICT;
+                res.workspace_edit.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+                return res;
+            }
+            if cap.mutated_in_selection {
+                if !cap.is_mutable_binding && !cap.already_mut_view {
+                    res.status = REFACTOR_CAPABILITY_CONFLICT;
+                    res.diag_code = DIAG_MOVE_ASSIGN_IMMUTABLE;
+                    res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+                    res.workspace_edit.diag_code = DIAG_MOVE_ASSIGN_IMMUTABLE;
+                    return res;
+                }
+                if cap.conflicting_view_active {
+                    res.status = REFACTOR_CAPABILITY_CONFLICT;
+                    res.diag_code = DIAG_BORROW_CONFLICT;
+                    res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+                    res.workspace_edit.diag_code = DIAG_BORROW_CONFLICT;
+                    return res;
+                }
+            }
+
+            let mut mode = PARAM_MODE_BY_COPY;
+            let mut pdecl_buf = ref_buf_new(48);
+            let mut carg_buf = ref_buf_new(32);
+            ref_buf_push_sv(mut_view(pdecl_buf), cap.name_str);
+            ref_buf_push_str(mut_view(pdecl_buf), ": ");
+
+            if cap.mutated_in_selection && (cap.live_after_selection || cap.already_mut_view) {
+                mode = PARAM_MODE_MUT_VIEW;
+                ref_buf_push_str(mut_view(pdecl_buf), "mut_view<");
+                ref_buf_push_sv(mut_view(pdecl_buf), cap.base_type_str);
+                ref_buf_push_str(mut_view(pdecl_buf), ">");
+                if cap.already_mut_view {
+                    ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+                } else {
+                    ref_buf_push_str(mut_view(carg_buf), "mut_view(");
+                    ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+                    ref_buf_push_str(mut_view(carg_buf), ")");
+                }
+            } else if !cap.is_copy && cap.moved_in_selection && !cap.live_after_selection {
+                mode = PARAM_MODE_BY_MOVE;
+                ref_buf_push_sv(mut_view(pdecl_buf), cap.base_type_str);
+                ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+            } else if cap.is_copy && !cap.already_view && !cap.already_mut_view {
+                mode = PARAM_MODE_BY_COPY;
+                ref_buf_push_sv(mut_view(pdecl_buf), cap.base_type_str);
+                ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+            } else {
+                mode = PARAM_MODE_READ_VIEW;
+                ref_buf_push_str(mut_view(pdecl_buf), "view<");
+                ref_buf_push_sv(mut_view(pdecl_buf), cap.base_type_str);
+                ref_buf_push_str(mut_view(pdecl_buf), ">");
+                if cap.already_view {
+                    ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+                } else {
+                    ref_buf_push_str(mut_view(carg_buf), "view(");
+                    ref_buf_push_sv(mut_view(carg_buf), cap.name_str);
+                    ref_buf_push_str(mut_view(carg_buf), ")");
+                }
+            }
+
+            let pidx = res.param_count as usize;
+            res.params[pidx] = ExtractParamSpec {
+                name_str: cap.name_str,
+                param_decl_str: ref_buf_to_sv(pdecl_buf),
+                call_arg_str: ref_buf_to_sv(carg_buf),
+                param_mode: mode,
+            };
+            res.param_count = res.param_count + 1u32;
+        }
+        ci = ci + 1u32;
+    }
+
+    res.return_var_count = ret_cnt;
+    res.is_async_helper = req.is_enclosing_async && req.has_await_in_selection;
+    res.has_error_effect = req.error_effect_type_str.len > 0;
+
+    // 3. Synthesize canonical helper signature, helper body, and call site (`AXS-REF-001 §3`, `AXS-REF-010 §3`)
+    let mut sig_buf = ref_buf_new(128);
+    if res.is_async_helper {
+        ref_buf_push_str(mut_view(sig_buf), "async fn ");
+    } else {
+        ref_buf_push_str(mut_view(sig_buf), "fn ");
+    }
+    ref_buf_push_sv(mut_view(sig_buf), req.new_fn_name_str);
+    if req.generic_params_str.len > 0 {
+        ref_buf_push_sv(mut_view(sig_buf), req.generic_params_str);
+    }
+    ref_buf_push_str(mut_view(sig_buf), "(");
+    let mut pi: u32 = 0u32;
+    while pi < res.param_count {
+        if pi > 0u32 {
+            ref_buf_push_str(mut_view(sig_buf), ", ");
+        }
+        ref_buf_push_sv(mut_view(sig_buf), res.params[pi as usize].param_decl_str);
+        pi = pi + 1u32;
+    }
+    ref_buf_push_str(mut_view(sig_buf), ")");
+
+    if ret_cnt == 1u32 {
+        let rcap = req.captures[ret_indices[0] as usize];
+        ref_buf_push_str(mut_view(sig_buf), " -> ");
+        ref_buf_push_sv(mut_view(sig_buf), rcap.base_type_str);
+    } else if ret_cnt > 1u32 {
+        ref_buf_push_str(mut_view(sig_buf), " -> (");
+        let mut ri: u32 = 0u32;
+        while ri < ret_cnt {
+            if ri > 0u32 {
+                ref_buf_push_str(mut_view(sig_buf), ", ");
+            }
+            ref_buf_push_sv(mut_view(sig_buf), req.captures[ret_indices[ri as usize] as usize].base_type_str);
+            ri = ri + 1u32;
+        }
+        ref_buf_push_str(mut_view(sig_buf), ")");
+    } else if res.has_error_effect {
+        ref_buf_push_str(mut_view(sig_buf), " -> ()");
+    }
+    if res.has_error_effect {
+        ref_buf_push_str(mut_view(sig_buf), " ! ");
+        ref_buf_push_sv(mut_view(sig_buf), req.error_effect_type_str);
+    }
+    let sig_sv = ref_buf_to_sv(sig_buf);
+    res.helper_signature_str = sig_sv;
+
+    let mut fn_buf = ref_buf_new(256);
+    ref_buf_push_sv(mut_view(fn_buf), sig_sv);
+    ref_buf_push_str(mut_view(fn_buf), " {\n");
+    if req.body_text_str.len > 0 {
+        ref_buf_push_sv(mut_view(fn_buf), req.body_text_str);
+        ref_buf_push_str(mut_view(fn_buf), "\n");
+    }
+    if ret_cnt == 1u32 {
+        let rcap = req.captures[ret_indices[0] as usize];
+        ref_buf_push_str(mut_view(fn_buf), "    return ");
+        ref_buf_push_sv(mut_view(fn_buf), rcap.name_str);
+        ref_buf_push_str(mut_view(fn_buf), "\n");
+    } else if ret_cnt > 1u32 {
+        ref_buf_push_str(mut_view(fn_buf), "    return (");
+        let mut ri: u32 = 0u32;
+        while ri < ret_cnt {
+            if ri > 0u32 {
+                ref_buf_push_str(mut_view(fn_buf), ", ");
+            }
+            ref_buf_push_sv(mut_view(fn_buf), req.captures[ret_indices[ri as usize] as usize].name_str);
+            ri = ri + 1u32;
+        }
+        ref_buf_push_str(mut_view(fn_buf), ")\n");
+    }
+    ref_buf_push_str(mut_view(fn_buf), "}\n\n");
+    res.helper_fn_text_str = ref_buf_to_sv(fn_buf);
+
+    let mut call_buf = ref_buf_new(128);
+    if ret_cnt == 1u32 {
+        let rcap = req.captures[ret_indices[0] as usize];
+        if rcap.is_mutable_binding {
+            ref_buf_push_str(mut_view(call_buf), "let mut ");
+        } else {
+            ref_buf_push_str(mut_view(call_buf), "let ");
+        }
+        ref_buf_push_sv(mut_view(call_buf), rcap.name_str);
+        ref_buf_push_str(mut_view(call_buf), " = ");
+    } else if ret_cnt > 1u32 {
+        ref_buf_push_str(mut_view(call_buf), "let (");
+        let mut ri: u32 = 0u32;
+        while ri < ret_cnt {
+            if ri > 0u32 {
+                ref_buf_push_str(mut_view(call_buf), ", ");
+            }
+            ref_buf_push_sv(mut_view(call_buf), req.captures[ret_indices[ri as usize] as usize].name_str);
+            ri = ri + 1u32;
+        }
+        ref_buf_push_str(mut_view(call_buf), ") = ");
+    }
+    ref_buf_push_sv(mut_view(call_buf), req.new_fn_name_str);
+    ref_buf_push_str(mut_view(call_buf), "(");
+    pi = 0u32;
+    while pi < res.param_count {
+        if pi > 0u32 {
+            ref_buf_push_str(mut_view(call_buf), ", ");
+        }
+        ref_buf_push_sv(mut_view(call_buf), res.params[pi as usize].call_arg_str);
+        pi = pi + 1u32;
+    }
+    ref_buf_push_str(mut_view(call_buf), ")");
+    if res.is_async_helper {
+        ref_buf_push_str(mut_view(call_buf), ".await");
+    }
+    if res.has_error_effect {
+        ref_buf_push_str(mut_view(call_buf), "?");
+    }
+    res.call_site_text_str = ref_buf_to_sv(call_buf);
+
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.helper_insert_offset,
+        req.helper_insert_offset,
+        res.helper_fn_text_str
+    );
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.selection_start,
+        req.selection_end,
+        res.call_site_text_str
+    );
+    res
+}
+
+// ============================================================================
+// 5. `extract_variable` & `inline_variable` (`SPEC-102 §2.2 AXS-REF-011`)
+// ============================================================================
+
+@derive(Copy)
+pub struct ExtractVariableRequest {
+    pub doc_id: u32,
+    pub enclosing_fn: FunctionId,
+    pub stmt_insert_offset: u32,
+    pub expr_start: u32,
+    pub expr_end: u32,
+    pub var_name_str: LspStrView,
+    pub expr_text_str: LspStrView,
+    pub expr_type_str: LspStrView,
+    pub indent_spaces: u32,
+    pub is_unit_or_never: bool,
+    pub is_lhs_place: bool,
+    pub is_expr_pure: bool,
+    pub is_expr_copy: bool,
+    pub prior_stmt_aliases_expr: bool,
+    pub occurrence_count: u32,
+    pub second_expr_start: u32,
+    pub second_expr_end: u32,
+    pub mutated_between_occurrences: bool,
+}
+
+@derive(Copy)
+pub struct ExtractVariableResult {
+    pub status: u8,
+    pub diag_code: u32,
+    pub applicability: u8,
+    pub replaced_occurrences: u32,
+    pub let_stmt_str: LspStrView,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn refactor_extract_variable(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<ExtractVariableRequest>
+) -> ExtractVariableResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let mut res = ExtractVariableResult {
+        status: REFACTOR_OK,
+        diag_code: 0u32,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        replaced_occurrences: 0u32,
+        let_stmt_str: empty_sv,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_EXTRACT_VARIABLE, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    if req.doc_id >= ws.doc_cap || req.expr_start >= req.expr_end || req.is_unit_or_never || req.is_lhs_place {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+    if req.var_name_str.len == 0 || req.expr_text_str.len == 0 {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    // Check for identifier collision or shadowing in the enclosing function (`AXS-REF-011 §1`: `AX_NAME_DUPLICATE`)
+    let vhash = lsp_hash_sv(req.var_name_str);
+    let mut ni: u32 = 0u32;
+    while ni < eng.node_count {
+        let nd = unsafe { *(eng.nodes + (ni as usize)) };
+        if nd.active && nd.doc_id == req.doc_id && nd.is_declaration &&
+            function_id_eq(nd.owner_fn, req.enclosing_fn) && nd.name_hash == vhash {
+            res.status = REFACTOR_NAME_COLLISION;
+            res.diag_code = DIAG_NAME_DUPLICATE;
+            res.workspace_edit.status = REFACTOR_NAME_COLLISION;
+            res.workspace_edit.diag_code = DIAG_NAME_DUPLICATE;
+            return res;
+        }
+        ni = ni + 1u32;
+    }
+
+    // Verify evaluation-order preservation before hoisting (`AXS-REF-011 §1`)
+    if req.prior_stmt_aliases_expr {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    // Multi-occurrence extraction requires `is_expr_pure && is_expr_copy && !mutated_between_occurrences` (`AXS-REF-011 §1`)
+    if req.occurrence_count >= 2u32 {
+        if !req.is_expr_copy {
+            res.status = REFACTOR_OWNERSHIP_CONFLICT;
+            res.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+            res.workspace_edit.status = REFACTOR_OWNERSHIP_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+            return res;
+        }
+        if !req.is_expr_pure || req.mutated_between_occurrences || req.second_expr_start <= req.expr_end || req.second_expr_start >= req.second_expr_end {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+    }
+
+    let mut stmt_buf = ref_buf_new(64);
+    ref_buf_push_spaces(mut_view(stmt_buf), req.indent_spaces);
+    ref_buf_push_str(mut_view(stmt_buf), "let ");
+    ref_buf_push_sv(mut_view(stmt_buf), req.var_name_str);
+    if req.expr_type_str.len > 0 {
+        ref_buf_push_str(mut_view(stmt_buf), ": ");
+        ref_buf_push_sv(mut_view(stmt_buf), req.expr_type_str);
+    }
+    ref_buf_push_str(mut_view(stmt_buf), " = ");
+    ref_buf_push_sv(mut_view(stmt_buf), req.expr_text_str);
+    ref_buf_push_str(mut_view(stmt_buf), "\n");
+    res.let_stmt_str = ref_buf_to_sv(stmt_buf);
+
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.stmt_insert_offset,
+        req.stmt_insert_offset,
+        res.let_stmt_str
+    );
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.expr_start,
+        req.expr_end,
+        req.var_name_str
+    );
+    res.replaced_occurrences = 1u32;
+
+    if req.occurrence_count >= 2u32 {
+        let _ = refactor_workspace_edit_add(
+            view(*ws),
+            mut_view(res.workspace_edit),
+            req.doc_id,
+            req.second_expr_start,
+            req.second_expr_end,
+            req.var_name_str
+        );
+        res.replaced_occurrences = 2u32;
+    }
+    res
+}
+
+@derive(Copy)
+pub struct InlineVariableRequest {
+    pub doc_id: u32,
+    pub local_id: LocalId,
+    pub let_stmt_start: u32,
+    pub let_stmt_end: u32,
+    pub init_text_str: LspStrView,
+    pub is_mutable_binding: bool,
+    pub has_definite_init: bool,
+    pub is_init_pure: bool,
+    pub is_type_copy: bool,
+    pub has_observable_drop: bool,
+    pub interferes_before_use: bool,
+    pub init_precedence: u8,
+    pub use_count: u32,
+    pub use_starts: [4]u32,
+    pub use_ends: [4]u32,
+    pub use_context_precedences: [4]u8,
+}
+
+@derive(Copy)
+pub struct InlineVariableResult {
+    pub status: u8,
+    pub diag_code: u32,
+    pub applicability: u8,
+    pub inlined_use_count: u32,
+    pub parenthesized_count: u32,
+    pub replacement_texts: [4]LspStrView,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn refactor_inline_variable(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<InlineVariableRequest>
+) -> InlineVariableResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let mut res = InlineVariableResult {
+        status: REFACTOR_OK,
+        diag_code: 0u32,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        inlined_use_count: 0u32,
+        parenthesized_count: 0u32,
+        replacement_texts: [empty_sv; 4],
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_INLINE_VARIABLE, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    if req.doc_id >= ws.doc_cap || req.let_stmt_start >= req.let_stmt_end || req.use_count > 4u32 {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+
+    // Validate `local_id` in VFS generational arena (`AXS-REF-001 §2`)
+    if req.local_id.raw.index > 0u32 {
+        let lk = vfs_lookup_entity(view(*ws), req.local_id.raw);
+        if lk.status != LOOKUP_FOUND {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+        let _ = query_effect_summary(mut_view(ws.db), DefId { v: req.local_id.raw.index });
+    }
+
+    // Mandatory preconditions (`AXS-REF-011 §2`):
+    // - Must be an immutable `let` binding with a single definite initializer
+    if req.is_mutable_binding || !req.has_definite_init || req.init_text_str.len == 0 {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    if req.use_count == 0u32 {
+        // `k == 0` uses: permitted only if `init` is pure and type has no observable `Drop` side effect
+        if !req.is_init_pure || req.has_observable_drop {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+    } else if req.use_count == 1u32 {
+        // `k == 1` use: permitted if no statement between declaration and sole use mutates any place read by `init`
+        // or shifts deterministic `Drop` across an observable side effect
+        if req.interferes_before_use {
+            res.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.diag_code = DIAG_BORROW_CONFLICT;
+            res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_BORROW_CONFLICT;
+            return res;
+        }
+    } else {
+        // `k >= 2` uses: permitted iff `init` is pure, `type_of(init): Copy`, and no place read by `init` is mutated
+        if !req.is_type_copy {
+            res.status = REFACTOR_OWNERSHIP_CONFLICT;
+            res.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+            res.workspace_edit.status = REFACTOR_OWNERSHIP_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+            return res;
+        }
+        if !req.is_init_pure || req.interferes_before_use {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+    }
+
+    // Remove the `let x = init\n` declaration span
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.let_stmt_start,
+        req.let_stmt_end,
+        empty_sv
+    );
+
+    // Replace each use site, wrapping `init` in `(...)` iff `init_precedence < use_context_precedence` (`AXS-REF-011 §2`)
+    let mut ui: u32 = 0u32;
+    while ui < req.use_count {
+        let u_start = req.use_starts[ui as usize];
+        let u_end = req.use_ends[ui as usize];
+        let ctx_prec = req.use_context_precedences[ui as usize];
+        let needs_parens = (req.init_precedence) < ctx_prec;
+        let rep_sv = if needs_parens {
+            let mut pbuf = ref_buf_new(req.init_text_str.len + 4);
+            ref_buf_push_str(mut_view(pbuf), "(");
+            ref_buf_push_sv(mut_view(pbuf), req.init_text_str);
+            ref_buf_push_str(mut_view(pbuf), ")");
+            res.parenthesized_count = res.parenthesized_count + 1u32;
+            ref_buf_to_sv(pbuf)
+        } else {
+            req.init_text_str
+        };
+        res.replacement_texts[ui as usize] = rep_sv;
+        if !refactor_workspace_edit_add(view(*ws), mut_view(res.workspace_edit), req.doc_id, u_start, u_end, rep_sv) {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+        res.inlined_use_count = res.inlined_use_count + 1u32;
+        ui = ui + 1u32;
+    }
+    res
+}
+
+// ============================================================================
+// 6. `populate_match_arms` (`SPEC-102 §2.3 AXS-REF-012`)
+// ============================================================================
+
+@derive(Copy)
+pub struct MatchVariantSpec {
+    pub variant_name_str: LspStrView,
+    pub variant_kind: u8,
+    pub payload_pattern_str: LspStrView,
+    pub already_covered: bool,
+}
+
+@derive(Copy)
+pub struct PopulateMatchArmsRequest {
+    pub doc_id: u32,
+    pub scrutinee_type_id: LspTypeId,
+    pub scrutinee_kind: u8,
+    pub enum_path_prefix_str: LspStrView,
+    pub variants_imported_unqualified: bool,
+    pub insert_offset: u32,
+    pub indent_spaces: u32,
+    pub bool_true_covered: bool,
+    pub bool_false_covered: bool,
+    pub has_wildcard_arm: bool,
+    pub variants: [8]MatchVariantSpec,
+    pub variant_count: u32,
+}
+
+@derive(Copy)
+pub struct PopulateMatchArmsResult {
+    pub status: u8,
+    pub applicability: u8,
+    pub added_arm_count: u32,
+    pub arms_text_str: LspStrView,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn match_variant_spec_new(
+    variant_name: str,
+    variant_kind: u8,
+    payload_pattern: str,
+    already_covered: bool
+) -> MatchVariantSpec {
+    MatchVariantSpec {
+        variant_name_str: lsp_str_view(variant_name),
+        variant_kind: variant_kind,
+        payload_pattern_str: lsp_str_view(payload_pattern),
+        already_covered: already_covered,
+    }
+}
+
+pub fn refactor_populate_match_arms(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<PopulateMatchArmsRequest>
+) -> PopulateMatchArmsResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let mut res = PopulateMatchArmsResult {
+        status: REFACTOR_OK,
+        applicability: APPLICABILITY_HAS_PLACEHOLDERS,
+        added_arm_count: 0u32,
+        arms_text_str: empty_sv,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_POPULATE_MATCH_ARMS, APPLICABILITY_HAS_PLACEHOLDERS),
+    };
+
+    if req.doc_id >= ws.doc_cap {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+
+    let mut abuf = ref_buf_new(160);
+    if req.scrutinee_kind == SCRUTINEE_ENUM {
+        let mut vi: u32 = 0u32;
+        while vi < req.variant_count && vi < 8u32 {
+            let v = req.variants[vi as usize];
+            if !v.already_covered {
+                ref_buf_push_spaces(mut_view(abuf), req.indent_spaces);
+                if !req.variants_imported_unqualified && req.enum_path_prefix_str.len > 0 {
+                    ref_buf_push_sv(mut_view(abuf), req.enum_path_prefix_str);
+                    ref_buf_push_str(mut_view(abuf), ".");
+                }
+                ref_buf_push_sv(mut_view(abuf), v.variant_name_str);
+                if v.variant_kind == VARIANT_TUPLE {
+                    ref_buf_push_str(mut_view(abuf), "(");
+                    ref_buf_push_sv(mut_view(abuf), v.payload_pattern_str);
+                    ref_buf_push_str(mut_view(abuf), ")");
+                } else if v.variant_kind == VARIANT_STRUCT {
+                    ref_buf_push_str(mut_view(abuf), " { ");
+                    ref_buf_push_sv(mut_view(abuf), v.payload_pattern_str);
+                    ref_buf_push_str(mut_view(abuf), " }");
+                }
+                ref_buf_push_str(mut_view(abuf), " => todo(),\n");
+                res.added_arm_count = res.added_arm_count + 1u32;
+            }
+            vi = vi + 1u32;
+        }
+    } else if req.scrutinee_kind == SCRUTINEE_BOOL {
+        if !req.bool_true_covered {
+            ref_buf_push_spaces(mut_view(abuf), req.indent_spaces);
+            ref_buf_push_str(mut_view(abuf), "true => todo(),\n");
+            res.added_arm_count = res.added_arm_count + 1u32;
+        }
+        if !req.bool_false_covered {
+            ref_buf_push_spaces(mut_view(abuf), req.indent_spaces);
+            ref_buf_push_str(mut_view(abuf), "false => todo(),\n");
+            res.added_arm_count = res.added_arm_count + 1u32;
+        }
+    } else if req.scrutinee_kind == SCRUTINEE_OPEN_SCALAR {
+        if !req.has_wildcard_arm {
+            ref_buf_push_spaces(mut_view(abuf), req.indent_spaces);
+            ref_buf_push_str(mut_view(abuf), "_ => todo(),\n");
+            res.added_arm_count = res.added_arm_count + 1u32;
+        }
+    }
+
+    // If `match` is already exhaustive (`0` missing arms), the transformation is not offered (`AXS-REF-012 §2`)
+    if res.added_arm_count == 0u32 {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    res.arms_text_str = ref_buf_to_sv(abuf);
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.insert_offset,
+        req.insert_offset,
+        res.arms_text_str
+    );
+    res
+}
+
+// ============================================================================
+// 7. `organize_imports` (`SPEC-102 §2.4 AXS-REF-013`)
+// ============================================================================
+
+@derive(Copy)
+pub struct ImportEntrySpec {
+    pub symbol_id: LspSymbolId,
+    pub module_prefix_str: LspStrView,
+    pub item_name_str: LspStrView,
+    pub alias_str: LspStrView,
+    pub is_pub_reexport: bool,
+    pub is_cfg_gated: bool,
+    pub region_group: u8,
+    pub reference_count: u32,
+}
+
+@derive(Copy)
+pub struct OrganizeImportsRequest {
+    pub doc_id: u32,
+    pub import_block_start: u32,
+    pub import_block_end: u32,
+    pub entries: [12]ImportEntrySpec,
+    pub entry_count: u32,
+}
+
+@derive(Copy)
+pub struct OrganizeImportsResult {
+    pub status: u8,
+    pub applicability: u8,
+    pub kept_count: u32,
+    pub pruned_unused_count: u32,
+    pub deduplicated_count: u32,
+    pub merged_group_count: u32,
+    pub preserved_alias_count: u32,
+    pub formatted_imports_str: LspStrView,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn import_entry_spec_new(
+    symbol_id: LspSymbolId,
+    module_prefix: str,
+    item_name: str,
+    alias: str,
+    is_pub_reexport: bool,
+    is_cfg_gated: bool,
+    region_group: u8,
+    reference_count: u32
+) -> ImportEntrySpec {
+    ImportEntrySpec {
+        symbol_id: symbol_id,
+        module_prefix_str: lsp_str_view(module_prefix),
+        item_name_str: lsp_str_view(item_name),
+        alias_str: lsp_str_view(alias),
+        is_pub_reexport: is_pub_reexport,
+        is_cfg_gated: is_cfg_gated,
+        region_group: region_group,
+        reference_count: reference_count,
+    }
+}
+
+fn ref_import_comes_before(a: view<ImportEntrySpec>, b: view<ImportEntrySpec>) -> bool {
+    if (a.region_group) < (b.region_group) { return true; }
+    if (a.region_group) > (b.region_group) { return false; }
+    if a.is_pub_reexport && !b.is_pub_reexport { return true; }
+    if !a.is_pub_reexport && b.is_pub_reexport { return false; }
+    let c_pref = refactor_sv_cmp(a.module_prefix_str, b.module_prefix_str);
+    if c_pref < 0i32 { return true; }
+    if c_pref > 0i32 { return false; }
+    let c_item = refactor_sv_cmp(a.item_name_str, b.item_name_str);
+    if c_item < 0i32 { return true; }
+    if c_item > 0i32 { return false; }
+    refactor_sv_cmp(a.alias_str, b.alias_str) < 0i32
+}
+
+pub fn refactor_organize_imports(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<OrganizeImportsRequest>
+) -> OrganizeImportsResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let mut res = OrganizeImportsResult {
+        status: REFACTOR_OK,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        kept_count: 0u32,
+        pruned_unused_count: 0u32,
+        deduplicated_count: 0u32,
+        merged_group_count: 0u32,
+        preserved_alias_count: 0u32,
+        formatted_imports_str: empty_sv,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_ORGANIZE_IMPORTS, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    if req.doc_id >= ws.doc_cap || req.import_block_start > req.import_block_end {
+        res.status = REFACTOR_INVALID_SELECTION;
+        res.workspace_edit.status = REFACTOR_INVALID_SELECTION;
+        return res;
+    }
+
+    let _ = query_resolve_module(mut_view(ws.db), ModuleId { v: req.doc_id + 1u32 });
+
+    let empty_entry = import_entry_spec_new(LspSymbolId { raw: gen_id_new(0u32, 0u32) }, "", "", "", false, false, 0u8, 0u32);
+    let mut kept: [12]ImportEntrySpec = [empty_entry; 12];
+    let mut kcount: u32 = 0u32;
+
+    // 1. Prune unused private imports (`reference_count == 0 && !is_pub_reexport && !is_cfg_gated`) & deduplicate by `SymbolId` (`AXS-REF-013 §1..2`)
+    let mut i: u32 = 0u32;
+    while i < req.entry_count && i < 12u32 {
+        let ent = req.entries[i as usize];
+        if ent.reference_count == 0u32 && !ent.is_pub_reexport && !ent.is_cfg_gated {
+            res.pruned_unused_count = res.pruned_unused_count + 1u32;
+        } else {
+            let mut is_dup = false;
+            let mut j: u32 = 0u32;
+            while j < kcount {
+                let prev = kept[j as usize];
+                if prev.region_group == ent.region_group &&
+                    prev.is_pub_reexport == ent.is_pub_reexport &&
+                    lsp_symbol_id_eq(prev.symbol_id, ent.symbol_id) &&
+                    refactor_sv_eq(prev.alias_str, ent.alias_str) {
+                    is_dup = true;
+                    break;
+                }
+                j = j + 1u32;
+            }
+            if is_dup {
+                res.deduplicated_count = res.deduplicated_count + 1u32;
+            } else {
+                // Insertion sort into `kept`
+                let mut ins_pos = kcount;
+                let mut s: u32 = 0u32;
+                while s < kcount {
+                    let cur = kept[s as usize];
+                    if ref_import_comes_before(view(ent), view(cur)) {
+                        ins_pos = s;
+                        break;
+                    }
+                    s = s + 1u32;
+                }
+                let mut m = kcount;
+                while m > ins_pos {
+                    kept[m as usize] = kept[(m - 1u32) as usize];
+                    m = m - 1u32;
+                }
+                kept[ins_pos as usize] = ent;
+                kcount = kcount + 1u32;
+                if ent.alias_str.len > 0 {
+                    res.preserved_alias_count = res.preserved_alias_count + 1u32;
+                }
+            }
+        }
+        i = i + 1u32;
+    }
+
+    res.kept_count = kcount;
+
+    // 2. Emit canonical dot-path imports, merging contiguous sibling imports in the same region group (`SPEC-101 AXS-FMT-021`, `AXS-REF-013 §2..3`)
+    let mut ibuf = ref_buf_new(256);
+    let mut idx: u32 = 0u32;
+    while idx < kcount {
+        let cur = kept[idx as usize];
+        let can_group = cur.alias_str.len == 0 && !cur.is_cfg_gated && cur.module_prefix_str.len > 0;
+        let mut group_end = idx + 1u32;
+        if can_group {
+            while group_end < kcount {
+                let nxt = kept[group_end as usize];
+                if nxt.region_group == cur.region_group &&
+                    nxt.is_pub_reexport == cur.is_pub_reexport &&
+                    nxt.alias_str.len == 0 &&
+                    !nxt.is_cfg_gated &&
+                    refactor_sv_eq(nxt.module_prefix_str, cur.module_prefix_str) {
+                    group_end = group_end + 1u32;
+                } else {
+                    break;
+                }
+            }
+        }
+
+        if cur.is_pub_reexport {
+            ref_buf_push_str(mut_view(ibuf), "pub use ");
+        } else {
+            ref_buf_push_str(mut_view(ibuf), "use ");
+        }
+        if cur.module_prefix_str.len > 0 {
+            ref_buf_push_sv(mut_view(ibuf), cur.module_prefix_str);
+            ref_buf_push_str(mut_view(ibuf), ".");
+        }
+
+        if (group_end - idx) >= 2u32 {
+            // Merge sibling imports into `use prefix.{ItemA, ItemB}`
+            ref_buf_push_str(mut_view(ibuf), "{");
+            let mut gi = idx;
+            while gi < group_end {
+                if gi > idx {
+                    ref_buf_push_str(mut_view(ibuf), ", ");
+                }
+                ref_buf_push_sv(mut_view(ibuf), kept[gi as usize].item_name_str);
+                gi = gi + 1u32;
+            }
+            ref_buf_push_str(mut_view(ibuf), "}\n");
+            res.merged_group_count = res.merged_group_count + 1u32;
+            idx = group_end;
+        } else {
+            // Single-item import (unwrapped, no redundant `{Item}` braces per `AXS-FMT-021`)
+            ref_buf_push_sv(mut_view(ibuf), cur.item_name_str);
+            if cur.alias_str.len > 0 {
+                ref_buf_push_str(mut_view(ibuf), " as ");
+                ref_buf_push_sv(mut_view(ibuf), cur.alias_str);
+            }
+            ref_buf_push_str(mut_view(ibuf), "\n");
+            idx = idx + 1u32;
+        }
+    }
+
+    res.formatted_imports_str = ref_buf_to_sv(ibuf);
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.import_block_start,
+        req.import_block_end,
+        res.formatted_imports_str
+    );
+    res
+}
+
+// ============================================================================
+// 8. `change_signature`, `move_item` & `convert_capability_view` (`SPEC-102 §2.5 AXS-REF-014`)
+// ============================================================================
+
+@derive(Copy)
+pub struct ChangeSignatureRequest {
+    pub decl_doc_id: u32,
+    pub fn_symbol_id: LspSymbolId,
+    pub decl_span_start: u32,
+    pub decl_span_end: u32,
+    pub new_decl_sig_str: LspStrView,
+    pub removed_param_used_in_body: bool,
+    pub removed_arg_is_impure: bool,
+    pub added_param_has_placeholder: bool,
+    pub call_site_count: u32,
+    pub call_doc_ids: [4]u32,
+    pub call_starts: [4]u32,
+    pub call_ends: [4]u32,
+    pub call_new_texts: [4]LspStrView,
+}
+
+@derive(Copy)
+pub struct ChangeSignatureResult {
+    pub status: u8,
+    pub applicability: u8,
+    pub updated_call_sites: u32,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn refactor_change_signature(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<ChangeSignatureRequest>
+) -> ChangeSignatureResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let app = if req.added_param_has_placeholder { APPLICABILITY_HAS_PLACEHOLDERS } else { APPLICABILITY_MACHINE_APPLICABLE };
+    let mut res = ChangeSignatureResult {
+        status: REFACTOR_OK,
+        applicability: app,
+        updated_call_sites: 0u32,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_CHANGE_SIGNATURE, app),
+    };
+
+    // Parameter removal is permitted ONLY when the parameter has zero uses in the body AND call-site arguments are pure (`AXS-REF-014 §1`)
+    if req.removed_param_used_in_body || req.removed_arg_is_impure || req.call_site_count > 4u32 {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    if !refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.decl_doc_id,
+        req.decl_span_start,
+        req.decl_span_end,
+        req.new_decl_sig_str
+    ) {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    let mut ci: u32 = 0u32;
+    while ci < req.call_site_count {
+        if !refactor_workspace_edit_add(
+            view(*ws),
+            mut_view(res.workspace_edit),
+            req.call_doc_ids[ci as usize],
+            req.call_starts[ci as usize],
+            req.call_ends[ci as usize],
+            req.call_new_texts[ci as usize]
+        ) {
+            res.status = REFACTOR_PRECONDITION_FAILED;
+            return res;
+        }
+        res.updated_call_sites = res.updated_call_sites + 1u32;
+        ci = ci + 1u32;
+    }
+    res
+}
+
+@derive(Copy)
+pub struct MoveItemRequest {
+    pub item_symbol_id: LspSymbolId,
+    pub src_doc_id: u32,
+    pub src_item_start: u32,
+    pub src_item_end: u32,
+    pub src_import_insert_offset: u32,
+    pub dst_doc_id: u32,
+    pub dst_insert_offset: u32,
+    pub item_text_str: LspStrView,
+    pub reimport_use_str: LspStrView,
+    pub violates_orphan_coherence: bool,
+    pub accesses_private_src_field: bool,
+}
+
+@derive(Copy)
+pub struct MoveItemResult {
+    pub status: u8,
+    pub applicability: u8,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn refactor_move_item(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<MoveItemRequest>
+) -> MoveItemResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let mut res = MoveItemResult {
+        status: REFACTOR_OK,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_MOVE_ITEM, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    if req.violates_orphan_coherence || req.accesses_private_src_field || req.src_doc_id == req.dst_doc_id {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    if req.reimport_use_str.len > 0 {
+        let _ = refactor_workspace_edit_add(
+            view(*ws),
+            mut_view(res.workspace_edit),
+            req.src_doc_id,
+            req.src_import_insert_offset,
+            req.src_import_insert_offset,
+            req.reimport_use_str
+        );
+    }
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.src_doc_id,
+        req.src_item_start,
+        req.src_item_end,
+        lsp_str_view("")
+    );
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.dst_doc_id,
+        req.dst_insert_offset,
+        req.dst_insert_offset,
+        req.item_text_str
+    );
+    res
+}
+
+@derive(Copy)
+pub struct ConvertCapabilityViewRequest {
+    pub doc_id: u32,
+    pub target_symbol_id: LspSymbolId,
+    pub conversion_mode: u8,
+    pub decl_span_start: u32,
+    pub decl_span_end: u32,
+    pub new_decl_text_str: LspStrView,
+    pub is_only_read_in_scope: bool,
+    pub caller_has_conflicting_borrow: bool,
+    pub caller_arg_is_immutable: bool,
+    pub call_site_count: u32,
+    pub call_doc_ids: [4]u32,
+    pub call_arg_starts: [4]u32,
+    pub call_arg_ends: [4]u32,
+    pub call_arg_new_texts: [4]LspStrView,
+}
+
+@derive(Copy)
+pub struct ConvertCapabilityViewResult {
+    pub status: u8,
+    pub diag_code: u32,
+    pub applicability: u8,
+    pub updated_call_sites: u32,
+    pub workspace_edit: RefactorWorkspaceEdit,
+}
+
+pub fn refactor_convert_capability_view(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    req: view<ConvertCapabilityViewRequest>
+) -> ConvertCapabilityViewResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let mut res = ConvertCapabilityViewResult {
+        status: REFACTOR_OK,
+        diag_code: 0u32,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        updated_call_sites: 0u32,
+        workspace_edit: refactor_workspace_edit_empty(view(*ws), REFACTOR_CONVERT_CAPABILITY_VIEW, APPLICABILITY_MACHINE_APPLICABLE),
+    };
+
+    if req.conversion_mode == CAP_CONV_OWNED_TO_VIEW {
+        if !req.is_only_read_in_scope {
+            res.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.diag_code = DIAG_CAP_MUT_REQUIRED;
+            res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_CAP_MUT_REQUIRED;
+            return res;
+        }
+    } else if req.conversion_mode == CAP_CONV_VIEW_TO_MUT_VIEW || req.conversion_mode == CAP_CONV_LET_TO_LET_MUT {
+        if req.caller_has_conflicting_borrow {
+            res.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.diag_code = DIAG_BORROW_CONFLICT;
+            res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_BORROW_CONFLICT;
+            return res;
+        }
+        if req.caller_arg_is_immutable {
+            res.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.diag_code = DIAG_MOVE_ASSIGN_IMMUTABLE;
+            res.workspace_edit.status = REFACTOR_CAPABILITY_CONFLICT;
+            res.workspace_edit.diag_code = DIAG_MOVE_ASSIGN_IMMUTABLE;
+            return res;
+        }
+    } else {
+        res.status = REFACTOR_PRECONDITION_FAILED;
+        res.workspace_edit.status = REFACTOR_PRECONDITION_FAILED;
+        return res;
+    }
+
+    let _ = refactor_workspace_edit_add(
+        view(*ws),
+        mut_view(res.workspace_edit),
+        req.doc_id,
+        req.decl_span_start,
+        req.decl_span_end,
+        req.new_decl_text_str
+    );
+
+    let mut ci: u32 = 0u32;
+    while ci < req.call_site_count && ci < 4u32 {
+        let _ = refactor_workspace_edit_add(
+            view(*ws),
+            mut_view(res.workspace_edit),
+            req.call_doc_ids[ci as usize],
+            req.call_arg_starts[ci as usize],
+            req.call_arg_ends[ci as usize],
+            req.call_arg_new_texts[ci as usize]
+        );
+        res.updated_call_sites = res.updated_call_sites + 1u32;
+        ci = ci + 1u32;
+    }
+    res
+}

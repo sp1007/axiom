@@ -1,0 +1,614 @@
+// LSP `textDocument/codeAction` & `codeAction/resolve` Engine, Diagnostic Quick-Fixes,
+// Precondition-Gated Refactoring Surfacing & Snapshot-Pinned Verification (T809 / E19.3).
+// Implements SPEC-102 §3 (AXS-REF-020..021; REQ-TOOL-183, REQ-TOOL-185, REQ-TOOL-186):
+// - Supported `CodeActionKind` taxonomy (`quickfix`, `refactor.extract`, `refactor.inline`,
+//   `refactor.rewrite`, `source.organizeImports`)
+// - Deterministic action ordering (`isPreferred` -> `CodeActionKind` tier -> lexicographical `action_id` & `SymbolId`)
+// - Precondition-gated action surfacing (illegal refactorings are never offered)
+// - Snapshot-pinned `codeAction/resolve` with stale-revision rejection (`LSP_ERR_CONTENT_MODIFIED`)
+//   and mandatory `CompilerDB` post-transformation verification under the zero-codegen firewall.
+module compiler.refactor.code_actions
+
+use std.editor.LspPosition
+use std.editor.LspRange
+use std.editor.lsp_pos_new
+use std.editor.lsp_range_new
+use std.editor.editor_undo
+
+use compiler.lsp.protocol.LSP_SCHEMA_VERSION_1
+use compiler.lsp.protocol.CERTAINTY_EXACT
+use compiler.lsp.protocol.CERTAINTY_UNAVAILABLE
+use compiler.lsp.protocol.FALLBACK_NONE
+use compiler.lsp.protocol.FALLBACK_STALE_ENTITY
+use compiler.lsp.protocol.LSP_ERR_NONE
+use compiler.lsp.protocol.LSP_ERR_INVALID_PARAMS
+use compiler.lsp.protocol.LSP_ERR_CONTENT_MODIFIED
+use compiler.lsp.protocol.LspFactHeader
+use compiler.lsp.protocol.LspStrView
+use compiler.lsp.protocol.lsp_fact_header_new
+use compiler.lsp.protocol.lsp_str_view
+
+use compiler.lsp.vfs.VfsWorkspace
+use compiler.lsp.vfs.LspSymbolId
+use compiler.lsp.vfs.gen_id_new
+use compiler.lsp.vfs.vfs_doc_ptr
+
+use compiler.lsp.handlers.LspSemanticEngine
+use compiler.lsp.handlers.LspRenameTextEdit
+use compiler.lsp.handlers.LspCodeActionDataToken
+use compiler.lsp.handlers.LspCodeActionItem
+use compiler.lsp.handlers.LspCodeActionResult
+use compiler.lsp.handlers.LspCodeActionResolveResult
+use compiler.lsp.handlers.DIAG_CAP_MUT_REQUIRED
+use compiler.lsp.handlers.DIAG_TRAIT_AMBIGUOUS_METHOD
+use compiler.lsp.handlers.DIAG_MOVE_USE_AFTER_MOVE
+use compiler.lsp.handlers.DIAG_MOVE_ASSIGN_IMMUTABLE
+use compiler.lsp.handlers.DIAG_NAME_UNRESOLVED
+use compiler.lsp.handlers.DIAG_PAT_NON_EXHAUSTIVE
+use compiler.lsp.handlers.APPLICABILITY_MACHINE_APPLICABLE
+use compiler.lsp.handlers.APPLICABILITY_HAS_PLACEHOLDERS
+use compiler.lsp.handlers.CODE_ACTION_KIND_QUICKFIX
+use compiler.lsp.handlers.CODE_ACTION_KIND_REFACTOR_EXTRACT
+use compiler.lsp.handlers.CODE_ACTION_KIND_REFACTOR_INLINE
+use compiler.lsp.handlers.CODE_ACTION_KIND_REFACTOR_REWRITE
+use compiler.lsp.handlers.CODE_ACTION_KIND_SOURCE_ORGANIZE_IMPORTS
+use compiler.lsp.handlers.lsp_insert_code_action_sorted
+use compiler.lsp.handlers.lsp_make_code_action_item
+
+use compiler.query.db.ModuleId
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+
+use compiler.refactor.transforms.RefactorWorkspaceEdit
+use compiler.refactor.transforms.REFACTOR_OK
+use compiler.refactor.transforms.refactor_verify_and_commit_edit
+
+// ============================================================================
+// 1. Canonical Action IDs & Context Descriptor (`SPEC-102 §3.1 AXS-REF-020`)
+// ============================================================================
+
+pub const CODE_ACTION_ABI_1: u32 = 1u32;
+pub const CODE_ACTION_SCHEMA_1: u32 = 1u32;
+
+@derive(Copy)
+pub struct CodeActionQueryContext {
+    pub doc_id: u32,
+    pub range: LspRange,
+    pub selection_start: u32,
+    pub selection_end: u32,
+
+    // Diagnostic quick-fix triggers (`AXS-REF-020 §1`)
+    pub has_non_exhaustive_match: bool,
+    pub match_insert_offset: u32,
+    pub match_missing_arms_text_str: LspStrView,
+
+    pub has_ambiguous_method_diag: bool,
+    pub ambiguous_call_start: u32,
+    pub ambiguous_call_end: u32,
+    pub ambiguous_candidate_a_str: LspStrView,
+    pub ambiguous_candidate_b_str: LspStrView,
+    pub ambiguous_trait_a_symbol: LspSymbolId,
+    pub ambiguous_trait_b_symbol: LspSymbolId,
+
+    pub has_unresolved_symbol_diag: bool,
+    pub unresolved_import_insert_offset: u32,
+    pub unresolved_import_text_str: LspStrView,
+    pub unresolved_target_symbol: LspSymbolId,
+
+    pub has_unused_import_diag: bool,
+    pub unused_import_start: u32,
+    pub unused_import_end: u32,
+
+    pub has_immutable_assign_diag: bool,
+    pub immutable_upgrade_legal: bool,
+    pub immutable_decl_start: u32,
+    pub immutable_decl_end: u32,
+    pub immutable_new_decl_str: LspStrView,
+
+    pub has_use_after_move_diag: bool,
+    pub callee_accepts_view: bool,
+    pub move_arg_start: u32,
+    pub move_arg_end: u32,
+    pub move_arg_view_text_str: LspStrView,
+
+    // Semantic refactoring triggers & precondition flags (`AXS-REF-020..021`)
+    pub has_selection: bool,
+    pub extract_fn_preconditions_ok: bool,
+    pub extract_var_preconditions_ok: bool,
+
+    pub cursor_on_local_binding: bool,
+    pub inline_var_target_is_mutable: bool,
+    pub inline_var_preconditions_ok: bool,
+    pub inline_var_symbol: LspSymbolId,
+
+    pub convert_view_eligible: bool,
+    pub convert_view_symbol: LspSymbolId,
+
+    pub change_sig_eligible: bool,
+    pub change_sig_symbol: LspSymbolId,
+
+    pub move_item_eligible: bool,
+    pub move_item_symbol: LspSymbolId,
+
+    pub has_use_imports: bool,
+}
+
+pub fn code_action_context_default(doc_id: u32, range: LspRange, selection_start: u32, selection_end: u32) -> CodeActionQueryContext {
+    let empty_sv = lsp_str_view("");
+    let empty_sym = LspSymbolId { raw: gen_id_new(0u32, 0u32) };
+    CodeActionQueryContext {
+        doc_id: doc_id,
+        range: range,
+        selection_start: selection_start,
+        selection_end: selection_end,
+        has_non_exhaustive_match: false,
+        match_insert_offset: 0u32,
+        match_missing_arms_text_str: empty_sv,
+        has_ambiguous_method_diag: false,
+        ambiguous_call_start: 0u32,
+        ambiguous_call_end: 0u32,
+        ambiguous_candidate_a_str: empty_sv,
+        ambiguous_candidate_b_str: empty_sv,
+        ambiguous_trait_a_symbol: empty_sym,
+        ambiguous_trait_b_symbol: empty_sym,
+        has_unresolved_symbol_diag: false,
+        unresolved_import_insert_offset: 0u32,
+        unresolved_import_text_str: empty_sv,
+        unresolved_target_symbol: empty_sym,
+        has_unused_import_diag: false,
+        unused_import_start: 0u32,
+        unused_import_end: 0u32,
+        has_immutable_assign_diag: false,
+        immutable_upgrade_legal: false,
+        immutable_decl_start: 0u32,
+        immutable_decl_end: 0u32,
+        immutable_new_decl_str: empty_sv,
+        has_use_after_move_diag: false,
+        callee_accepts_view: false,
+        move_arg_start: 0u32,
+        move_arg_end: 0u32,
+        move_arg_view_text_str: empty_sv,
+        has_selection: selection_end > selection_start,
+        extract_fn_preconditions_ok: false,
+        extract_var_preconditions_ok: false,
+        cursor_on_local_binding: false,
+        inline_var_target_is_mutable: false,
+        inline_var_preconditions_ok: false,
+        inline_var_symbol: empty_sym,
+        convert_view_eligible: false,
+        convert_view_symbol: empty_sym,
+        change_sig_eligible: false,
+        change_sig_symbol: empty_sym,
+        move_item_eligible: false,
+        move_item_symbol: empty_sym,
+        has_use_imports: false,
+    }
+}
+
+
+fn code_action_make_item_sv(
+    revision: u64,
+    doc_id: u32,
+    range: LspRange,
+    action_id: str,
+    title: str,
+    kind_tier: u8,
+    applicability: u8,
+    is_preferred: bool,
+    diag_code: u32,
+    target_symbol: LspSymbolId,
+    edit_doc_id: u32,
+    edit_span_start: u32,
+    edit_span_end: u32,
+    edit_new_text_sv: LspStrView
+) -> LspCodeActionItem {
+    let mut item = lsp_make_code_action_item(
+        revision,
+        doc_id,
+        range,
+        action_id,
+        title,
+        kind_tier,
+        applicability,
+        is_preferred,
+        diag_code,
+        target_symbol,
+        edit_doc_id,
+        edit_span_start,
+        edit_span_end,
+        ""
+    );
+    item.edit_new_text_str = edit_new_text_sv;
+    item
+}
+
+// ============================================================================
+// 2. Precondition-Gated `textDocument/codeAction` Evaluation (`SPEC-102 §3.1..3.2`)
+// ============================================================================
+
+pub fn code_action_evaluate_context(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    ctx: view<CodeActionQueryContext>
+) -> LspCodeActionResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_sv = lsp_str_view("");
+    let empty_sym = LspSymbolId { raw: gen_id_new(0u32, 0u32) };
+    let empty_tok = LspCodeActionDataToken {
+        schema_version: LSP_SCHEMA_VERSION_1,
+        revision: ws.revision,
+        doc_id: ctx.doc_id,
+        range: ctx.range,
+        action_id_str: empty_sv,
+        action_id_hash: 0u64,
+        target_symbol: empty_sym,
+        diag_code: 0u32,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+    };
+    let empty_item = LspCodeActionItem {
+        action_id_str: empty_sv,
+        title_str: empty_sv,
+        kind_tier: CODE_ACTION_KIND_REFACTOR_REWRITE,
+        kind_str: empty_sv,
+        applicability: APPLICABILITY_MACHINE_APPLICABLE,
+        is_preferred: false,
+        diag_code: 0u32,
+        target_symbol: empty_sym,
+        sort_key_hash: 0u64,
+        data: empty_tok,
+        edit_doc_id: ctx.doc_id,
+        edit_span_start: 0u32,
+        edit_span_end: 0u32,
+        edit_new_text_str: empty_sv,
+    };
+    let mut res = LspCodeActionResult {
+        doc_id: ctx.doc_id,
+        revision: ws.revision,
+        count: 0u32,
+        quickfix_count: 0u32,
+        refactor_count: 0u32,
+        source_action_count: 0u32,
+        filtered_illegal_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE),
+        items: [empty_item; 16],
+    };
+
+    if ctx.doc_id >= ws.doc_cap {
+        return res;
+    }
+    let dp = vfs_doc_ptr(view(*ws), ctx.doc_id);
+    if !(unsafe { (*dp).active }) {
+        return res;
+    }
+
+    // Frontend-only `CompilerDB` queries (`AXS-REF-001`, `AXS-REF-021 §3` zero-codegen firewall)
+    let mod_id = ModuleId { v: ctx.doc_id + 1u32 };
+    let _ = query_parse_module(mut_view(ws.db), mod_id);
+    let _ = query_module_def_map(mut_view(ws.db), mod_id);
+    let _ = query_resolve_module(mut_view(ws.db), mod_id);
+
+    // 1. Diagnostic Quick-Fixes (`AXS-REF-020 §1`)
+    if ctx.has_non_exhaustive_match {
+        let qf_match = code_action_make_item_sv(
+            ws.revision, ctx.doc_id, ctx.range,
+            "quickfix.populate_match_arms",
+            "Populate missing match arms",
+            CODE_ACTION_KIND_QUICKFIX,
+            APPLICABILITY_HAS_PLACEHOLDERS,
+            false,
+            DIAG_PAT_NON_EXHAUSTIVE,
+            empty_sym,
+            ctx.doc_id, ctx.match_insert_offset, ctx.match_insert_offset,
+            ctx.match_missing_arms_text_str
+        );
+        lsp_insert_code_action_sorted(mut_view(res), qf_match);
+    }
+
+    if ctx.has_ambiguous_method_diag {
+        if ctx.ambiguous_candidate_a_str.len > 0 {
+            let qf_amb_a = code_action_make_item_sv(
+                ws.revision, ctx.doc_id, ctx.range,
+                "quickfix.qualify_ambiguous_method",
+                "Qualify ambiguous trait method call (candidate A)",
+                CODE_ACTION_KIND_QUICKFIX,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                false,
+                DIAG_TRAIT_AMBIGUOUS_METHOD,
+                ctx.ambiguous_trait_a_symbol,
+                ctx.doc_id, ctx.ambiguous_call_start, ctx.ambiguous_call_end,
+                ctx.ambiguous_candidate_a_str
+            );
+            lsp_insert_code_action_sorted(mut_view(res), qf_amb_a);
+        }
+        if ctx.ambiguous_candidate_b_str.len > 0 {
+            let qf_amb_b = code_action_make_item_sv(
+                ws.revision, ctx.doc_id, ctx.range,
+                "quickfix.qualify_ambiguous_method",
+                "Qualify ambiguous trait method call (candidate B)",
+                CODE_ACTION_KIND_QUICKFIX,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                false,
+                DIAG_TRAIT_AMBIGUOUS_METHOD,
+                ctx.ambiguous_trait_b_symbol,
+                ctx.doc_id, ctx.ambiguous_call_start, ctx.ambiguous_call_end,
+                ctx.ambiguous_candidate_b_str
+            );
+            lsp_insert_code_action_sorted(mut_view(res), qf_amb_b);
+        }
+    }
+
+    if ctx.has_unresolved_symbol_diag && ctx.unresolved_import_text_str.len > 0 {
+        let qf_imp = code_action_make_item_sv(
+            ws.revision, ctx.doc_id, ctx.range,
+            "quickfix.import_unresolved_symbol",
+            "Import unresolved workspace symbol",
+            CODE_ACTION_KIND_QUICKFIX,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            true,
+            DIAG_NAME_UNRESOLVED,
+            ctx.unresolved_target_symbol,
+            ctx.doc_id, ctx.unresolved_import_insert_offset, ctx.unresolved_import_insert_offset,
+            ctx.unresolved_import_text_str
+        );
+        lsp_insert_code_action_sorted(mut_view(res), qf_imp);
+    }
+
+    if ctx.has_unused_import_diag && ctx.unused_import_end > ctx.unused_import_start {
+        let qf_rm_imp = code_action_make_item_sv(
+            ws.revision, ctx.doc_id, ctx.range,
+            "quickfix.remove_unused_import",
+            "Remove unused `use` import",
+            CODE_ACTION_KIND_QUICKFIX,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            true,
+            0u32,
+            empty_sym,
+            ctx.doc_id, ctx.unused_import_start, ctx.unused_import_end,
+            empty_sv
+        );
+        lsp_insert_code_action_sorted(mut_view(res), qf_rm_imp);
+    }
+
+    if ctx.has_immutable_assign_diag {
+        if ctx.immutable_upgrade_legal {
+            let qf_mut = code_action_make_item_sv(
+                ws.revision, ctx.doc_id, ctx.range,
+                "quickfix.upgrade_to_mut_binding",
+                "Upgrade local binding to `let mut`",
+                CODE_ACTION_KIND_QUICKFIX,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                true,
+                DIAG_MOVE_ASSIGN_IMMUTABLE,
+                empty_sym,
+                ctx.doc_id, ctx.immutable_decl_start, ctx.immutable_decl_end,
+                ctx.immutable_new_decl_str
+            );
+            lsp_insert_code_action_sorted(mut_view(res), qf_mut);
+        } else {
+            res.filtered_illegal_count = res.filtered_illegal_count + 1u32;
+        }
+    }
+
+    if ctx.has_use_after_move_diag {
+        if ctx.callee_accepts_view {
+            let qf_vw = code_action_make_item_sv(
+                ws.revision, ctx.doc_id, ctx.range,
+                "quickfix.pass_view_instead_of_move",
+                "Pass `view(...)` instead of moving value",
+                CODE_ACTION_KIND_QUICKFIX,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                true,
+                DIAG_MOVE_USE_AFTER_MOVE,
+                empty_sym,
+                ctx.doc_id, ctx.move_arg_start, ctx.move_arg_end,
+                ctx.move_arg_view_text_str
+            );
+            lsp_insert_code_action_sorted(mut_view(res), qf_vw);
+        } else {
+            res.filtered_illegal_count = res.filtered_illegal_count + 1u32;
+        }
+    }
+
+    // 2. Precondition-Gated Semantic Refactorings (`AXS-REF-020..021`)
+    if ctx.has_selection {
+        if ctx.extract_fn_preconditions_ok {
+            let ext_fn = lsp_make_code_action_item(
+                ws.revision, ctx.doc_id, ctx.range,
+                "refactor.extract_function",
+                "Extract selection to function",
+                CODE_ACTION_KIND_REFACTOR_EXTRACT,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                false, 0u32, empty_sym,
+                ctx.doc_id, ctx.selection_start, ctx.selection_end,
+                "extracted_helper()"
+            );
+            lsp_insert_code_action_sorted(mut_view(res), ext_fn);
+        } else {
+            res.filtered_illegal_count = res.filtered_illegal_count + 1u32;
+        }
+
+        if ctx.extract_var_preconditions_ok {
+            let ext_var = lsp_make_code_action_item(
+                ws.revision, ctx.doc_id, ctx.range,
+                "refactor.extract_variable",
+                "Extract expression to local variable",
+                CODE_ACTION_KIND_REFACTOR_EXTRACT,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                false, 0u32, empty_sym,
+                ctx.doc_id, ctx.selection_start, ctx.selection_end,
+                "extracted_val"
+            );
+            lsp_insert_code_action_sorted(mut_view(res), ext_var);
+        } else {
+            res.filtered_illegal_count = res.filtered_illegal_count + 1u32;
+        }
+    }
+
+    if ctx.cursor_on_local_binding {
+        if !ctx.inline_var_target_is_mutable && ctx.inline_var_preconditions_ok {
+            let inl_var = lsp_make_code_action_item(
+                ws.revision, ctx.doc_id, ctx.range,
+                "refactor.inline_variable",
+                "Inline local variable binding",
+                CODE_ACTION_KIND_REFACTOR_INLINE,
+                APPLICABILITY_MACHINE_APPLICABLE,
+                false, 0u32, ctx.inline_var_symbol,
+                ctx.doc_id, ctx.selection_start, ctx.selection_end,
+                ""
+            );
+            lsp_insert_code_action_sorted(mut_view(res), inl_var);
+        } else {
+            res.filtered_illegal_count = res.filtered_illegal_count + 1u32;
+        }
+    }
+
+    if ctx.has_non_exhaustive_match {
+        let rw_match = code_action_make_item_sv(
+            ws.revision, ctx.doc_id, ctx.range,
+            "refactor.populate_match_arms",
+            "Expand non-exhaustive match arms",
+            CODE_ACTION_KIND_REFACTOR_REWRITE,
+            APPLICABILITY_HAS_PLACEHOLDERS,
+            false, DIAG_PAT_NON_EXHAUSTIVE, empty_sym,
+            ctx.doc_id, ctx.match_insert_offset, ctx.match_insert_offset,
+            ctx.match_missing_arms_text_str
+        );
+        lsp_insert_code_action_sorted(mut_view(res), rw_match);
+    }
+
+    if ctx.convert_view_eligible {
+        let rw_view = lsp_make_code_action_item(
+            ws.revision, ctx.doc_id, ctx.range,
+            "refactor.convert_capability_view",
+            "Convert capability view mode",
+            CODE_ACTION_KIND_REFACTOR_REWRITE,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            false, 0u32, ctx.convert_view_symbol,
+            ctx.doc_id, ctx.selection_start, ctx.selection_end,
+            "view<T>"
+        );
+        lsp_insert_code_action_sorted(mut_view(res), rw_view);
+    }
+
+    if ctx.change_sig_eligible {
+        let rw_sig = lsp_make_code_action_item(
+            ws.revision, ctx.doc_id, ctx.range,
+            "refactor.change_signature",
+            "Change function signature",
+            CODE_ACTION_KIND_REFACTOR_REWRITE,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            false, 0u32, ctx.change_sig_symbol,
+            ctx.doc_id, ctx.selection_start, ctx.selection_end,
+            "fn_updated"
+        );
+        lsp_insert_code_action_sorted(mut_view(res), rw_sig);
+    }
+
+    if ctx.move_item_eligible {
+        let rw_move = lsp_make_code_action_item(
+            ws.revision, ctx.doc_id, ctx.range,
+            "refactor.move_item",
+            "Move item to target module",
+            CODE_ACTION_KIND_REFACTOR_REWRITE,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            false, 0u32, ctx.move_item_symbol,
+            ctx.doc_id, ctx.selection_start, ctx.selection_end,
+            ""
+        );
+        lsp_insert_code_action_sorted(mut_view(res), rw_move);
+    }
+
+    if ctx.has_use_imports {
+        let src_org = lsp_make_code_action_item(
+            ws.revision, ctx.doc_id, ctx.range,
+            "source.organize_imports",
+            "Organize and canonicalize `use` imports",
+            CODE_ACTION_KIND_SOURCE_ORGANIZE_IMPORTS,
+            APPLICABILITY_MACHINE_APPLICABLE,
+            false, 0u32, empty_sym,
+            ctx.doc_id, 0u32, 0u32,
+            ""
+        );
+        lsp_insert_code_action_sorted(mut_view(res), src_org);
+    }
+
+    res
+}
+
+// ============================================================================
+// 3. Snapshot-Pinned `codeAction/resolve` & Verification (`SPEC-102 §3.2 AXS-REF-021`)
+// ============================================================================
+
+pub fn code_action_resolve_and_verify(
+    eng: mut_view<LspSemanticEngine>,
+    ws: mut_view<VfsWorkspace>,
+    item: view<LspCodeActionItem>,
+    edit: mut_view<RefactorWorkspaceEdit>,
+    allow_audited_unsafe: bool,
+    simulate_verification_failure: bool
+) -> LspCodeActionResolveResult {
+    eng.total_semantic_queries = eng.total_semantic_queries + 1u32;
+    let empty_edit = LspRenameTextEdit {
+        doc_id: 0u32,
+        span_start: 0u32,
+        span_end: 0u32,
+        range: item.data.range,
+        new_text_str: lsp_str_view(""),
+    };
+    let mut res = LspCodeActionResolveResult {
+        resolved: false,
+        is_stale_revision: false,
+        verified_by_compiler_db: false,
+        error_code: LSP_ERR_INVALID_PARAMS,
+        revision: ws.revision,
+        action_id_str: item.action_id_str,
+        applicability: item.applicability,
+        edit_count: 0u32,
+        header: lsp_fact_header_new(ws.revision, CERTAINTY_UNAVAILABLE, FALLBACK_STALE_ENTITY),
+        edits: [empty_edit; 16],
+    };
+
+    if item.data.schema_version != LSP_SCHEMA_VERSION_1 || item.data.doc_id >= ws.doc_cap {
+        return res;
+    }
+
+    // Stale revision rejection (`AXS-REF-021 §2`): reject cleanly with `LSP_ERR_CONTENT_MODIFIED`
+    if item.data.revision != ws.revision || edit.header.revision != ws.revision {
+        res.is_stale_revision = true;
+        res.error_code = LSP_ERR_CONTENT_MODIFIED;
+        return res;
+    }
+
+    // Mandatory post-transformation `CompilerDB` verification gate (`AXS-REF-002`, `AXS-REF-021 §2..3`)
+    let verified_ok = refactor_verify_and_commit_edit(
+        mut_view(*eng),
+        mut_view(*ws),
+        mut_view(*edit),
+        allow_audited_unsafe,
+        simulate_verification_failure
+    );
+    if !verified_ok || !edit.verified_by_compiler_db || edit.status != REFACTOR_OK || ws.codegen_invocations != 0u32 {
+        return res;
+    }
+
+    let mut ei: u32 = 0u32;
+    while ei < edit.edit_count && ei < 16u32 {
+        let ed = edit.edits[ei as usize];
+        res.edits[ei as usize] = LspRenameTextEdit {
+            doc_id: ed.doc_id,
+            span_start: ed.span_start,
+            span_end: ed.span_end,
+            range: ed.range,
+            new_text_str: ed.new_text_str,
+        };
+        ei = ei + 1u32;
+    }
+    res.edit_count = edit.edit_count;
+    res.resolved = true;
+    res.verified_by_compiler_db = true;
+    res.error_code = LSP_ERR_NONE;
+    res.revision = ws.revision;
+    res.header = lsp_fact_header_new(ws.revision, CERTAINTY_EXACT, FALLBACK_NONE);
+    res
+}

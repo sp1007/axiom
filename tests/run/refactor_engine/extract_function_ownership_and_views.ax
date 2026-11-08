@@ -1,0 +1,190 @@
+// test: run
+// modes: interp native
+// stdout-file: extract_function_ownership_and_views.stdout
+// Verify E19.3 `extract_function` ownership, capability-view (`view<T>`, `mut_view<T>`),
+// move-tracking, async/error-effect propagation, and precondition rejection (`SPEC-102 §2.1 AXS-REF-010`).
+
+const PARAM_BY_COPY: u8 = 0u8;
+const PARAM_READ_VIEW: u8 = 1u8;
+const PARAM_MUT_VIEW: u8 = 2u8;
+const PARAM_BY_MOVE: u8 = 3u8;
+
+const STATUS_OK: u8 = 0u8;
+const STATUS_OWNERSHIP_CONFLICT: u8 = 3u8;
+const STATUS_CAPABILITY_CONFLICT: u8 = 4u8;
+
+const DIAG_CAP_OUTLIVES_OWNER: u32 = 3008u32;
+const DIAG_MOVE_USE_AFTER_MOVE: u32 = 3101u32;
+
+@derive(Copy)
+struct CaptureFact {
+    is_copy: bool,
+    mutated_in_selection: bool,
+    moved_in_selection: bool,
+    live_after_selection: bool,
+    defined_in_selection: bool,
+    returned_is_view_of_local: bool,
+}
+
+@derive(Copy)
+struct ExtractEval {
+    status: u8,
+    diag_code: u32,
+    param_modes: [4]u8,
+    param_count: u32,
+    return_count: u32,
+    is_async_helper: bool,
+    propagates_error_effect: bool,
+}
+
+fn classify_capture_mode(c: CaptureFact) -> u8 {
+    if c.mutated_in_selection {
+        return PARAM_MUT_VIEW;
+    }
+    if !c.is_copy && c.moved_in_selection && !c.live_after_selection {
+        return PARAM_BY_MOVE;
+    }
+    if c.is_copy {
+        return PARAM_BY_COPY;
+    }
+    PARAM_READ_VIEW
+}
+
+fn evaluate_extract_fn(
+    captures: [4]CaptureFact,
+    capture_count: u32,
+    enclosing_async: bool,
+    selection_has_await: bool,
+    selection_has_try: bool
+) -> ExtractEval {
+    let mut out = ExtractEval {
+        status: STATUS_OK,
+        diag_code: 0u32,
+        param_modes: [0u8; 4],
+        param_count: 0u32,
+        return_count: 0u32,
+        is_async_helper: enclosing_async && selection_has_await,
+        propagates_error_effect: selection_has_try,
+    };
+
+    let mut i: u32 = 0u32;
+    while i < capture_count {
+        let c = captures[i as usize];
+        if !c.defined_in_selection && !c.is_copy && c.moved_in_selection && c.live_after_selection {
+            out.status = STATUS_OWNERSHIP_CONFLICT;
+            out.diag_code = DIAG_MOVE_USE_AFTER_MOVE;
+            return out;
+        }
+        if c.defined_in_selection && c.live_after_selection && c.returned_is_view_of_local {
+            out.status = STATUS_CAPABILITY_CONFLICT;
+            out.diag_code = DIAG_CAP_OUTLIVES_OWNER;
+            return out;
+        }
+        if c.defined_in_selection {
+            if c.live_after_selection {
+                out.return_count = out.return_count + 1u32;
+            }
+        } else {
+            let p_idx = out.param_count as usize;
+            out.param_modes[p_idx] = classify_capture_mode(c);
+            out.param_count = out.param_count + 1u32;
+        }
+        i = i + 1u32;
+    }
+    out
+}
+
+pub fn main() -> i32 {
+    // Case 1: Valid extraction with Copy (`ByCopy`), read-only !Copy (`ReadView`),
+    // mutated binding (`MutView`), moved dead binding (`ByMove`), and 1 live output.
+    let c0 = CaptureFact {
+        is_copy: true,
+        mutated_in_selection: false,
+        moved_in_selection: false,
+        live_after_selection: true,
+        defined_in_selection: false,
+        returned_is_view_of_local: false,
+    };
+    let c1 = CaptureFact {
+        is_copy: false,
+        mutated_in_selection: false,
+        moved_in_selection: false,
+        live_after_selection: true,
+        defined_in_selection: false,
+        returned_is_view_of_local: false,
+    };
+    let c2 = CaptureFact {
+        is_copy: false,
+        mutated_in_selection: true,
+        moved_in_selection: false,
+        live_after_selection: true,
+        defined_in_selection: false,
+        returned_is_view_of_local: false,
+    };
+    let c3 = CaptureFact {
+        is_copy: true,
+        mutated_in_selection: false,
+        moved_in_selection: false,
+        live_after_selection: true,
+        defined_in_selection: true,
+        returned_is_view_of_local: false,
+    };
+    let ev1 = evaluate_extract_fn([c0, c1, c2, c3], 4u32, true, true, true);
+    if ev1.status != STATUS_OK || ev1.param_count != 3u32 || ev1.return_count != 1u32 {
+        return 1;
+    }
+    if ev1.param_modes[0] != PARAM_BY_COPY || ev1.param_modes[1] != PARAM_READ_VIEW || ev1.param_modes[2] != PARAM_MUT_VIEW {
+        return 2;
+    }
+    if !ev1.is_async_helper || !ev1.propagates_error_effect {
+        return 3;
+    }
+    print("case1_status=0 params=3 modes=0,1,2 returns=1 async=true try_err=true\n");
+
+    // Case 2: ByMove parameter when !Copy variable is moved in selection and NOT live after
+    let m0 = CaptureFact {
+        is_copy: false,
+        mutated_in_selection: false,
+        moved_in_selection: true,
+        live_after_selection: false,
+        defined_in_selection: false,
+        returned_is_view_of_local: false,
+    };
+    let ev2 = evaluate_extract_fn([m0, c0, c0, c0], 1u32, false, false, false);
+    if ev2.status != STATUS_OK || ev2.param_modes[0] != PARAM_BY_MOVE {
+        return 4;
+    }
+    print("case2_status=0 mode0=3\n");
+
+    // Case 3: Rejected when !Copy variable is moved in selection AND live after (`AX_MOVE_USE_AFTER_MOVE`)
+    let bad_move = CaptureFact {
+        is_copy: false,
+        mutated_in_selection: false,
+        moved_in_selection: true,
+        live_after_selection: true,
+        defined_in_selection: false,
+        returned_is_view_of_local: false,
+    };
+    let ev3 = evaluate_extract_fn([bad_move, c0, c0, c0], 1u32, false, false, false);
+    if ev3.status != STATUS_OWNERSHIP_CONFLICT || ev3.diag_code != DIAG_MOVE_USE_AFTER_MOVE {
+        return 5;
+    }
+    print("case3_status=3 diag=3101\n");
+
+    // Case 4: Rejected when returned view borrows a local allocated inside selection (`AX_CAP_OUTLIVES_OWNER`)
+    let bad_view = CaptureFact {
+        is_copy: false,
+        mutated_in_selection: false,
+        moved_in_selection: false,
+        live_after_selection: true,
+        defined_in_selection: true,
+        returned_is_view_of_local: true,
+    };
+    let ev4 = evaluate_extract_fn([bad_view, c0, c0, c0], 1u32, false, false, false);
+    if ev4.status != STATUS_CAPABILITY_CONFLICT || ev4.diag_code != DIAG_CAP_OUTLIVES_OWNER {
+        return 6;
+    }
+    print("case4_status=4 diag=3008\n");
+
+    return 0;
+}

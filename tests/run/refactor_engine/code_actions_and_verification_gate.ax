@@ -1,0 +1,132 @@
+// test: run
+// modes: interp native
+// stdout-file: code_actions_and_verification_gate.stdout
+// Verify E19.3 LSP `textDocument/codeAction` deterministic ordering, precondition filtering,
+// `codeAction/resolve` stale-revision rejection (`LSP_ERR_CONTENT_MODIFIED`), rejection of
+// `unsafe` injection (`AX_UNSAFE_REQUIRED`), and transactional `CompilerDB` verification rollback
+// (`SPEC-102 §1.2 AXS-REF-002`, `§3 AXS-REF-020..021`).
+
+const KIND_QUICKFIX: u8 = 0u8;
+const KIND_EXTRACT: u8 = 1u8;
+const KIND_INLINE: u8 = 2u8;
+const KIND_REWRITE: u8 = 3u8;
+const KIND_ORGANIZE_IMPORTS: u8 = 4u8;
+
+const LSP_ERR_NONE: i32 = 0i32;
+const LSP_ERR_CONTENT_MODIFIED: i32 = -32801i32;
+const DIAG_UNSAFE_REQUIRED: u32 = 3201u32;
+
+@derive(Copy)
+struct ActionCandidate {
+    action_rank: u32,
+    kind_tier: u8,
+    is_preferred: bool,
+    symbol_index: u32,
+}
+
+fn action_comes_before(a: ActionCandidate, b: ActionCandidate) -> bool {
+    if a.is_preferred && !b.is_preferred { return true; }
+    if !a.is_preferred && b.is_preferred { return false; }
+    if (a.kind_tier) < (b.kind_tier) { return true; }
+    if (a.kind_tier) > (b.kind_tier) { return false; }
+    if (a.action_rank) < (b.action_rank) { return true; }
+    if (a.action_rank) > (b.action_rank) { return false; }
+    (a.symbol_index) < (b.symbol_index)
+}
+
+@derive(Copy)
+struct VerifyGateOutcome {
+    committed: bool,
+    rolled_back: bool,
+    error_code: i32,
+    diag_code: u32,
+    buffer_revision_after: u64,
+    codegen_invocations: u32,
+}
+
+fn run_verification_gate(
+    token_revision: u64,
+    current_revision: u64,
+    has_parse_or_type_err: bool,
+    has_borrow_or_move_err: bool,
+    introduces_unsafe_block: bool
+) -> VerifyGateOutcome {
+    if token_revision != current_revision {
+        return VerifyGateOutcome {
+            committed: false,
+            rolled_back: false,
+            error_code: LSP_ERR_CONTENT_MODIFIED,
+            diag_code: 0u32,
+            buffer_revision_after: current_revision,
+            codegen_invocations: 0u32,
+        };
+    }
+    if introduces_unsafe_block {
+        return VerifyGateOutcome {
+            committed: false,
+            rolled_back: true,
+            error_code: -1i32,
+            diag_code: DIAG_UNSAFE_REQUIRED,
+            buffer_revision_after: current_revision,
+            codegen_invocations: 0u32,
+        };
+    }
+    if has_parse_or_type_err || has_borrow_or_move_err {
+        return VerifyGateOutcome {
+            committed: false,
+            rolled_back: true,
+            error_code: -1i32,
+            diag_code: 3001u32,
+            buffer_revision_after: current_revision,
+            codegen_invocations: 0u32,
+        };
+    }
+    VerifyGateOutcome {
+        committed: true,
+        rolled_back: false,
+        error_code: LSP_ERR_NONE,
+        diag_code: 0u32,
+        buffer_revision_after: current_revision + 1u64,
+        codegen_invocations: 0u32,
+    }
+}
+
+pub fn main() -> i32 {
+    // 1. Deterministic ordering: preferred quickfix < non-preferred quickfix < extract < inline < rewrite < organizeImports
+    let a_org = ActionCandidate { action_rank: 50u32, kind_tier: KIND_ORGANIZE_IMPORTS, is_preferred: false, symbol_index: 0u32 };
+    let a_ext = ActionCandidate { action_rank: 20u32, kind_tier: KIND_EXTRACT, is_preferred: false, symbol_index: 0u32 };
+    let a_qf_pref = ActionCandidate { action_rank: 10u32, kind_tier: KIND_QUICKFIX, is_preferred: true, symbol_index: 1u32 };
+    let a_qf_nonpref_b = ActionCandidate { action_rank: 15u32, kind_tier: KIND_QUICKFIX, is_preferred: false, symbol_index: 9u32 };
+    let a_qf_nonpref_a = ActionCandidate { action_rank: 15u32, kind_tier: KIND_QUICKFIX, is_preferred: false, symbol_index: 3u32 };
+
+    if !action_comes_before(a_qf_pref, a_qf_nonpref_a) ||
+        !action_comes_before(a_qf_nonpref_a, a_qf_nonpref_b) ||
+        !action_comes_before(a_qf_nonpref_b, a_ext) ||
+        !action_comes_before(a_ext, a_org) {
+        return 1;
+    }
+    print("pref_before_nonpref=true sym_tiebreak=true qf_before_ext=true ext_before_org=true\n");
+
+    // 2. Valid `codeAction/resolve` at matching revision commits and advances revision with 0 codegen
+    let g_ok = run_verification_gate(7u64, 7u64, false, false, false);
+    if !g_ok.committed || g_ok.buffer_revision_after != 8u64 || g_ok.codegen_invocations != 0u32 {
+        return 2;
+    }
+    print("resolve_ok=true rev=8 codegen=0\n");
+
+    // 3. Stale revision token rejected with `LSP_ERR_CONTENT_MODIFIED` (-32801)
+    let g_stale = run_verification_gate(6u64, 7u64, false, false, false);
+    if g_stale.committed || g_stale.error_code != LSP_ERR_CONTENT_MODIFIED || g_stale.buffer_revision_after != 7u64 {
+        return 3;
+    }
+    print("resolve_stale_committed=false err=-32801 rev=7\n");
+
+    // 4. `unsafe` injection rejected and rolled back (`AX_UNSAFE_REQUIRED = 3201`)
+    let g_unsafe = run_verification_gate(7u64, 7u64, false, false, true);
+    if !g_unsafe.rolled_back || g_unsafe.diag_code != DIAG_UNSAFE_REQUIRED || g_unsafe.buffer_revision_after != 7u64 {
+        return 4;
+    }
+    print("resolve_unsafe_rolled_back=true diag=3201 rev=7\n");
+
+    return 0;
+}

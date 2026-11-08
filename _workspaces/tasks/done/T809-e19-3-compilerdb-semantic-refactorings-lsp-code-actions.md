@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T802, T808]
 priority: 199
-status: doing
+status: done
 attempts: 1
 paths: [compiler/refactor/transforms, compiler/refactor/code_actions, tests/run/refactor_engine]
 locks: [compiler/lsp/handlers/mod.ax]
 spec: [spec/SPEC-102-refactoring-engine-semantic-vcs.md, spec/SPEC-100-lsp-server-ide-engine.md, 0101, tasks/0448]
 covers: [REQ-TOOL-183, REQ-TOOL-186]
 started: 2026-11-08 15:30:55
-agent: T809-impl
+finished: 2026-11-08 16:29:55
 ---
 # T809 — E19.3 CompilerDB semantic refactorings (extract function/binding, exhaustive match, use imports) & LSP codeAction
 
@@ -47,3 +47,4 @@ Implement `CompilerDB`-verified semantic refactoring transformations and LSP `te
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 15:30:55 started (attempt 1) T809-impl
+- 2026-11-08 16:29:55 accepted by QA -> done
