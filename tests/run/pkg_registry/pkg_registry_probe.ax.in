@@ -1,0 +1,316 @@
+// Direct multi-module verification probe for `std.pkg.archive` and `std.pkg.registry`
+// (T859 / E20.3: SPEC-112 §§1..4, REQ-ECO-8736, REQ-PKG-024, INV-REG-001).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockSemVer
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.parse_lock_semver
+use std.pkg.lockfile.lock_semver_zero
+
+use std.pkg.archive.ARCHIVE_STATUS_OK
+use std.pkg.archive.ARCHIVE_STATUS_MERKLE_MISMATCH
+use std.pkg.archive.ARCHIVE_STATUS_PATH_TRAVERSAL
+use std.pkg.archive.ARCHIVE_STATUS_DUPLICATE_ENTRY
+use std.pkg.archive.Sha256Digest
+use std.pkg.archive.sha256_digest_zero
+use std.pkg.archive.sha256_digest_eq
+use std.pkg.archive.sha256_digest_format_hex
+use std.pkg.archive.parse_sha256_digest_hex
+use std.pkg.archive.sha256_hash_sv
+use std.pkg.archive.check_axpkg_path_safety
+use std.pkg.archive.check_path_case_collision
+use std.pkg.archive.AxpkgArchive
+use std.pkg.archive.axpkg_entry_empty
+use std.pkg.archive.axpkg_archive_init
+use std.pkg.archive.axpkg_archive_add_entry
+use std.pkg.archive.pack_axpkg
+use std.pkg.archive.unpack_axpkg
+use std.pkg.archive.verify_axpkg
+
+use std.pkg.registry.REG_STATUS_OK
+use std.pkg.registry.REG_STATUS_IMMUTABLE_VERSION_EXISTS
+use std.pkg.registry.REG_STATUS_ALREADY_PUBLISHED_IDENTICAL
+use std.pkg.registry.REG_STATUS_NOT_FOUND
+use std.pkg.registry.REG_STATUS_DOWNGRADE_BLOCKED
+use std.pkg.registry.RegistryPackageVersion
+use std.pkg.registry.registry_package_version_empty
+use std.pkg.registry.format_sparse_index_rel_path
+use std.pkg.registry.format_sparse_index_line
+use std.pkg.registry.parse_sparse_index_line
+use std.pkg.registry.parse_sparse_index_file
+use std.pkg.registry.query_sparse_index_best_version
+use std.pkg.registry.check_registry_publication_immutability
+use std.pkg.registry.format_registry_blob_rel_path
+use std.pkg.registry.format_offline_pkg_cache_path
+use std.pkg.registry.format_registry_config_json
+use std.pkg.registry.RegistryStore
+use std.pkg.registry.registry_store_init
+use std.pkg.registry.begin_install_transaction
+use std.pkg.registry.commit_install_transaction
+use std.pkg.registry.rollback_staged_transaction
+use std.pkg.registry.rollback_to_generation
+
+fn out_str(s: str) {
+    let sv = lsv_from_str(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+pub fn main() -> i32 {
+    // =========================================================================
+    // 1. Probe `std.pkg.archive`
+    // =========================================================================
+
+    // Test SHA-256 standard vector: "abc" -> ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    let s_abc = lsv_from_str("abc")
+    let d_abc = sha256_hash_sv(s_abc)
+    let mut exp_abc = sha256_digest_zero()
+    let _ = parse_sha256_digest_hex(lsv_from_str("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), mut_view(exp_abc))
+    let sha256_std_ok = sha256_digest_eq(view(d_abc), view(exp_abc))
+
+    // Test Path Traversal Defenses
+    let p_trav1 = check_axpkg_path_safety(lsv_from_str("../secret.txt")) == ARCHIVE_STATUS_PATH_TRAVERSAL
+    let p_trav2 = check_axpkg_path_safety(lsv_from_str("/etc/passwd")) == ARCHIVE_STATUS_PATH_TRAVERSAL
+    let p_trav3 = check_axpkg_path_safety(lsv_from_str("C:/windows/sys")) == ARCHIVE_STATUS_PATH_TRAVERSAL
+    let p_safe = check_axpkg_path_safety(lsv_from_str("src/lib.ax")) == ARCHIVE_STATUS_OK
+    let traversal_rejected = p_trav1 && p_trav2 && p_trav3 && p_safe
+
+    // Test Case Collision Rejection
+    let case_coll = check_path_case_collision(lsv_from_str("src/Vec.ax"), lsv_from_str("src/vec.ax"))
+
+    // Build and pack an archive with 2 files (added out-of-order to test sorting)
+    let mut arch = AxpkgArchive {
+        artifact_kind: 1u16,
+        manifest: lsv_from_str("[package]\nname = \"fast_hash\"\nversion = \"1.2.0\"\n"),
+        iface_summary: lsv_from_str("sif = \"blake3:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff\"\n"),
+        provenance: lsv_from_str("compiler = \"0.1.0\"\n"),
+        entries: [axpkg_entry_empty(); 32],
+        entry_count: 0usize,
+        merkle_root: sha256_digest_zero(),
+    }
+    // Added in reverse lexicographical order: "src/lib.ax", then "axiom.toml"
+    let _ = axpkg_archive_add_entry(mut_view(arch), lsv_from_str("src/lib.ax"), 0u8, lsv_from_str("pub fn hash() -> u64 { 42 }\n"))
+    let _ = axpkg_archive_add_entry(mut_view(arch), lsv_from_str("axiom.toml"), 0u8, lsv_from_str("[package]\nname = \"fast_hash\"\nversion = \"1.2.0\"\n"))
+
+    let mut pack_buf = lock_buf_new()
+    lock_buf_init(mut_view(pack_buf))
+    let pack_status = pack_axpkg(mut_view(arch), mut_view(pack_buf))
+    let packing_ok = pack_status == ARCHIVE_STATUS_OK && pack_buf.len > 0usize
+
+    // Unpack and verify Merkle root
+    let packed_bytes = lock_buf_as_lsv(view(pack_buf))
+    let mut unpack_arch = AxpkgArchive {
+        artifact_kind: 0u16,
+        manifest: lsv_empty(),
+        iface_summary: lsv_empty(),
+        provenance: lsv_empty(),
+        entries: [axpkg_entry_empty(); 32],
+        entry_count: 0usize,
+        merkle_root: sha256_digest_zero(),
+    }
+    let unpack_status = unpack_axpkg(packed_bytes, mut_view(unpack_arch))
+    let unpack_ok = unpack_status == ARCHIVE_STATUS_OK &&
+                    unpack_arch.entry_count == 2usize &&
+                    lsv_eq_str(unpack_arch.entries[0].path, "axiom.toml") &&
+                    lsv_eq_str(unpack_arch.entries[1].path, "src/lib.ax")
+
+    let verify_status = verify_axpkg(packed_bytes, view(arch.merkle_root))
+    let merkle_verify_ok = sha256_std_ok && unpack_ok && (verify_status == ARCHIVE_STATUS_OK)
+
+    // Tamper test: modify one byte of the payload section and verify rejection
+    let mut tampered_buf = lock_buf_new()
+    lock_buf_init(mut_view(tampered_buf))
+    let mut t_i: usize = 0usize
+    while t_i < pack_buf.len {
+        lock_buf_push_byte(mut_view(tampered_buf), lsv_byte(packed_bytes, t_i))
+        t_i = t_i + 1usize
+    }
+    // Flip a byte inside payload (not in 8-byte alignment padding at the very end)
+    let flip_pos = tampered_buf.len - 10usize
+    unsafe { *(tampered_buf.ptr + flip_pos) = (*(tampered_buf.ptr + flip_pos)) ^ 1u8 }
+    let tampered_status = verify_axpkg(lock_buf_as_lsv(view(tampered_buf)), view(arch.merkle_root))
+    let tamper_rejected = tampered_status == ARCHIVE_STATUS_MERKLE_MISMATCH
+
+    out_str("probe[archive] packing_ok=")
+    out_bool(packing_ok)
+    out_str(" merkle_verify_ok=")
+    out_bool(merkle_verify_ok && tamper_rejected)
+    out_str(" traversal_rejected=")
+    out_bool(traversal_rejected)
+    out_str(" case_collision_rejected=")
+    out_bool(case_coll)
+    out_str("\n")
+
+    lock_buf_free(mut_view(pack_buf))
+    lock_buf_free(mut_view(tampered_buf))
+
+    // =========================================================================
+    // 2. Probe `std.pkg.registry`
+    // =========================================================================
+
+    // Test Sparse Index Path Formatting
+    let mut p_buf = lock_buf_new()
+    lock_buf_init(mut_view(p_buf))
+    format_sparse_index_rel_path(lsv_from_str("axiom"), lsv_from_str("crypto"), mut_view(p_buf))
+    let index_path_ok = lsv_eq_str(lock_buf_as_lsv(view(p_buf)), "index/axiom/cr/crypto.jsonl")
+    lock_buf_free(mut_view(p_buf))
+
+    // Test Content-Addressed Blob Path Formatting
+    let mut b_buf = lock_buf_new()
+    lock_buf_init(mut_view(b_buf))
+    let b_ok = format_registry_blob_rel_path(lsv_from_str("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"), mut_view(b_buf))
+    let blob_path_ok = b_ok && lsv_eq_str(lock_buf_as_lsv(view(b_buf)), "blobs/sha256/2c/26/2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae.axpkg")
+    lock_buf_free(mut_view(b_buf))
+
+    // Test Sparse JSON Line Serialization & Parsing
+    let mut v1 = registry_package_version_empty()
+    v1.namespace = lsv_from_str("axiom")
+    v1.name = lsv_from_str("crypto")
+    v1.semver_raw = lsv_from_str("1.4.2")
+    let _ = parse_lock_semver(v1.semver_raw, mut_view(v1.semver))
+    v1.sha256_hex = lsv_from_str("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae")
+    v1.merkle_root_hex = lsv_from_str("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae")
+    v1.channel = lsv_from_str("stable")
+    v1.yanked = false
+    v1.quarantined = false
+
+    let mut line_buf = lock_buf_new()
+    lock_buf_init(mut_view(line_buf))
+    format_sparse_index_line(view(v1), mut_view(line_buf))
+
+    let mut parsed_v = registry_package_version_empty()
+    let parse_ok = parse_sparse_index_line(lock_buf_as_lsv(view(line_buf)), mut_view(parsed_v))
+    let roundtrip_ok = parse_ok &&
+                       lsv_eq(parsed_v.namespace, v1.namespace) &&
+                       lsv_eq(parsed_v.name, v1.name) &&
+                       lsv_eq(parsed_v.semver_raw, v1.semver_raw) &&
+                       lsv_eq(parsed_v.sha256_hex, v1.sha256_hex)
+    lock_buf_free(mut_view(line_buf))
+
+    // Test Multi-Version Query: stable vs beta, skipping yanked, blocking quarantined
+    let mut v_yanked = registry_package_version_empty()
+    v_yanked.namespace = lsv_from_str("axiom")
+    v_yanked.name = lsv_from_str("crypto")
+    v_yanked.semver_raw = lsv_from_str("1.4.3")
+    let _ = parse_lock_semver(v_yanked.semver_raw, mut_view(v_yanked.semver))
+    v_yanked.channel = lsv_from_str("stable")
+    v_yanked.yanked = true
+
+    let mut v_beta = registry_package_version_empty()
+    v_beta.namespace = lsv_from_str("axiom")
+    v_beta.name = lsv_from_str("crypto")
+    v_beta.semver_raw = lsv_from_str("2.0.0-beta.1")
+    let _ = parse_lock_semver(v_beta.semver_raw, mut_view(v_beta.semver))
+    v_beta.channel = lsv_from_str("beta")
+
+    let mut vers: [16]RegistryPackageVersion = [registry_package_version_empty(); 16]
+    vers[0] = v1
+    vers[1] = v_yanked
+    vers[2] = v_beta
+
+    let mut best_stable = registry_package_version_empty()
+    let q_stable_ok = query_sparse_index_best_version(view(vers), 3usize, lsv_from_str("stable"), false, mut_view(best_stable)) == REG_STATUS_OK
+    let stable_is_142 = lsv_eq_str(best_stable.semver_raw, "1.4.2")
+
+    let mut best_beta = registry_package_version_empty()
+    let q_beta_ok = query_sparse_index_best_version(view(vers), 3usize, lsv_from_str("beta"), false, mut_view(best_beta)) == REG_STATUS_OK
+    let beta_is_200 = lsv_eq_str(best_beta.semver_raw, "2.0.0-beta.1")
+    let query_ok = q_stable_ok && stable_is_142 && q_beta_ok && beta_is_200
+
+    // Test Immutable Version Publication
+    let mut candidate_tampered = v1
+    candidate_tampered.sha256_hex = lsv_from_str("0000000000000000000000000000000000000000000000000000000000000000")
+    let immut_rejected = check_registry_publication_immutability(view(vers), 3usize, view(candidate_tampered)) == REG_STATUS_IMMUTABLE_VERSION_EXISTS
+
+    let mut candidate_identical = v1
+    let ident_allowed = check_registry_publication_immutability(view(vers), 3usize, view(candidate_identical)) == REG_STATUS_ALREADY_PUBLISHED_IDENTICAL
+    let immutable_enforced = immut_rejected && ident_allowed
+
+    out_str("probe[registry] sparse_index_ok=")
+    out_bool(index_path_ok && roundtrip_ok)
+    out_str(" query_ok=")
+    out_bool(query_ok)
+    out_str(" immutable_enforced=")
+    out_bool(immutable_enforced)
+    out_str(" paths_ok=")
+    out_bool(blob_path_ok)
+    out_str("\n")
+
+    // =========================================================================
+    // 3. Probe Transactional Rollback & Generations (`AXS-REG-034`)
+    // =========================================================================
+
+    let mut store: RegistryStore = RegistryStore {
+        root: lsv_from_str(".axiom/pkg"),
+        active_generation: 1u32,
+        prev_generation: 0u32,
+        min_allowed_version: lock_semver_zero(),
+        allow_downgrade: true,
+        journal_state: 0u32,
+        journal_tx_id: lsv_empty(),
+        installed_names: [lsv_empty(); 8],
+        installed_versions: [lock_semver_zero(); 8],
+        installed_roots: [lsv_empty(); 8],
+        installed_count: 0usize,
+    }
+    registry_store_init(mut_view(store), lsv_from_str(".axiom/pkg"))
+
+    // Test 1: Stage a transaction and abort -> verifies rollback
+    let _ = begin_install_transaction(mut_view(store), lsv_from_str("tx_01"), 2u32)
+    let staged_ok = store.journal_state == 1u32 // TX_STATE_STAGED
+    let _ = rollback_staged_transaction(mut_view(store))
+    let abort_rollback_ok = store.journal_state == 3u32 && store.active_generation == 1u32
+
+    // Test 2: Commit generation 2
+    let _ = begin_install_transaction(mut_view(store), lsv_from_str("tx_02"), 2u32)
+    let _ = commit_install_transaction(mut_view(store), v1.name, view(v1.semver), v1.merkle_root_hex)
+    let gen2_ok = store.active_generation == 2u32 && store.installed_count == 1usize
+
+    // Test 3: Commit generation 3
+    let _ = begin_install_transaction(mut_view(store), lsv_from_str("tx_03"), 3u32)
+    let mut v2 = v1
+    v2.semver_raw = lsv_from_str("1.5.0")
+    let _ = parse_lock_semver(v2.semver_raw, mut_view(v2.semver))
+    let _ = commit_install_transaction(mut_view(store), v2.name, view(v2.semver), v2.merkle_root_hex)
+    let gen3_ok = store.active_generation == 3u32 && store.installed_count == 2usize
+
+    // Test 4: Rollback to generation 1
+    let rb_ok = rollback_to_generation(mut_view(store), 1u32) == REG_STATUS_OK
+    let gen1_restored = store.active_generation == 1u32
+
+    out_str("probe[rollback] journal_staged_ok=")
+    out_bool(staged_ok)
+    out_str(" abort_rollback_ok=")
+    out_bool(abort_rollback_ok)
+    out_str(" generation_commit_ok=")
+    out_bool(gen2_ok && gen3_ok)
+    out_str(" generation_rollback_ok=")
+    out_bool(rb_ok && gen1_restored)
+    out_str("\n")
+
+    out_str("PKG-REGISTRY-PROBE-PASS\n")
+    0
+}

@@ -1,0 +1,605 @@
+// Sparse JSON/Line-Delimited Registry Index Client, Immutable Version Verifier,
+// Offline-First Mirror Resolver, and Transactional Rollback Engine (`std/pkg/registry/mod.ax`, T859 / E20.3).
+//
+// Implements SPEC-112 §§1, 4 (`AXS-REG-001`..`004`, `AXS-REG-030`..`034`, `AXS-REG-050`;
+// `REQ-ECO-8736`, `REQ-PKG-024`, `REQ-PKG-013`, `INV-REG-001`).
+
+module std.pkg.registry
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockSemVer
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_cmp
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.parse_lock_semver
+use std.pkg.lockfile.cmp_lock_semver
+use std.pkg.lockfile.lock_semver_zero
+
+use std.pkg.archive.Sha256Digest
+use std.pkg.archive.sha256_digest_zero
+use std.pkg.archive.sha256_digest_eq
+use std.pkg.archive.sha256_digest_format_hex
+use std.pkg.archive.parse_sha256_digest_hex
+
+// =============================================================================
+// 1. Constants & Status Codes (`AXS-REG-001`..`004`, `AXS-REG-030`..`034`)
+// =============================================================================
+
+pub const REG_STATUS_OK: u32 = 0u32
+pub const REG_STATUS_IMMUTABLE_VERSION_EXISTS: u32 = 1u32
+pub const REG_STATUS_QUARANTINED: u32 = 2u32
+pub const REG_STATUS_POLICY_BLOCKED: u32 = 3u32
+pub const REG_STATUS_MERKLE_MISMATCH: u32 = 4u32
+pub const REG_STATUS_ROLLBACK_FAILED: u32 = 5u32
+pub const REG_STATUS_NOT_FOUND: u32 = 6u32
+pub const REG_STATUS_JOURNAL_CORRUPT: u32 = 7u32
+pub const REG_STATUS_ALREADY_PUBLISHED_IDENTICAL: u32 = 8u32
+pub const REG_STATUS_DOWNGRADE_BLOCKED: u32 = 9u32
+pub const REG_STATUS_PARSE_ERROR: u32 = 10u32
+
+pub const PROTOCOL_VERSION_1: u32 = 1u32
+
+pub const TX_STATE_NONE: u32 = 0u32
+pub const TX_STATE_STAGED: u32 = 1u32
+pub const TX_STATE_COMMITTED: u32 = 2u32
+pub const TX_STATE_ROLLED_BACK: u32 = 3u32
+
+// =============================================================================
+// 2. Sparse Index Path & Line Protocol (`AXS-REG-030`)
+// =============================================================================
+
+// Generates sparse index path: `index/<namespace>/<prefix2>/<name>.jsonl`
+pub fn format_sparse_index_rel_path(
+    namespace: LockStrView,
+    name: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_str(mut_view(*out_buf), "index/")
+    let ns = if namespace.len > 0usize { namespace } else { lsv_from_str("default") }
+    lock_buf_push_sv(mut_view(*out_buf), ns)
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    // prefix2: 1-char name -> "_1", otherwise first 2 characters
+    if name.len == 1usize {
+        lock_buf_push_str(mut_view(*out_buf), "_1")
+    } else if (name.len >= 2usize) {
+        lock_buf_push_byte(mut_view(*out_buf), lsv_byte(name, 0usize))
+        lock_buf_push_byte(mut_view(*out_buf), lsv_byte(name, 1usize))
+    } else {
+        lock_buf_push_str(mut_view(*out_buf), "_0")
+    }
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    lock_buf_push_sv(mut_view(*out_buf), name)
+    lock_buf_push_str(mut_view(*out_buf), ".jsonl")
+}
+
+@derive(Copy)
+pub struct RegistryPackageVersion {
+    pub semver_raw: LockStrView,
+    pub semver: LockSemVer,
+    pub namespace: LockStrView,
+    pub name: LockStrView,
+    pub sha256_hex: LockStrView,
+    pub merkle_root_hex: LockStrView,
+    pub sif: LockStrView,
+    pub api: LockStrView,
+    pub mode: LockStrView,
+    pub channel: LockStrView,
+    pub yanked: bool,
+    pub quarantined: bool,
+    pub security_fix: bool,
+}
+
+pub fn registry_package_version_empty() -> RegistryPackageVersion {
+    let e = lsv_empty()
+    RegistryPackageVersion {
+        semver_raw: e,
+        semver: lock_semver_zero(),
+        namespace: lsv_from_str("default"),
+        name: e,
+        sha256_hex: e,
+        merkle_root_hex: e,
+        sif: e,
+        api: e,
+        mode: lsv_from_str("source"),
+        channel: lsv_from_str("stable"),
+        yanked: false,
+        quarantined: false,
+        security_fix: false,
+    }
+}
+
+// Formats one UTF-8 newline-delimited JSON record per AXS-REG-030 §2
+pub fn format_sparse_index_line(v: view<RegistryPackageVersion>, out_buf: mut_view<LockBuffer>) {
+    lock_buf_push_str(mut_view(*out_buf), "{\"v\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.semver_raw)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"ns\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.namespace)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"name\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.name)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"sha256\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.sha256_hex)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"merkle_root\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.merkle_root_hex)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"sif\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.sif)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"api\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.api)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"mode\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.mode)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"channel\":\"")
+    lock_buf_push_sv(mut_view(*out_buf), v.channel)
+
+    lock_buf_push_str(mut_view(*out_buf), "\",\"yanked\":")
+    if v.yanked {
+        lock_buf_push_str(mut_view(*out_buf), "true")
+    } else {
+        lock_buf_push_str(mut_view(*out_buf), "false")
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), ",\"quarantined\":")
+    if v.quarantined {
+        lock_buf_push_str(mut_view(*out_buf), "true")
+    } else {
+        lock_buf_push_str(mut_view(*out_buf), "false")
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), ",\"security_fix\":")
+    if v.security_fix {
+        lock_buf_push_str(mut_view(*out_buf), "true")
+    } else {
+        lock_buf_push_str(mut_view(*out_buf), "false")
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), "}\n")
+}
+
+fn extract_json_string_field(line: LockStrView, key: str) -> LockStrView {
+    let raw_key = lsv_from_str(key)
+    let mut i: usize = 0usize
+    while i + raw_key.len + 3usize <= line.len {
+        if lsv_byte(line, i) == 34u8 { // '"'
+            let candidate_key = lsv_slice(line, i + 1usize, i + 1usize + raw_key.len)
+            if lsv_eq(candidate_key, raw_key) && lsv_byte(line, i + 1usize + raw_key.len) == 34u8 {
+                let mut pos = i + 1usize + raw_key.len + 1usize
+                while pos < line.len && (lsv_byte(line, pos) == 32u8 || lsv_byte(line, pos) == 58u8) {
+                    pos = pos + 1usize
+                }
+                if pos < line.len && lsv_byte(line, pos) == 34u8 {
+                    let start = pos + 1usize
+                    let mut end = start
+                    while end < line.len && lsv_byte(line, end) != 34u8 {
+                        end = end + 1usize
+                    }
+                    return lsv_slice(line, start, end)
+                }
+            }
+        }
+        i = i + 1usize
+    }
+    lsv_empty()
+}
+
+fn extract_json_bool_field(line: LockStrView, key: str) -> bool {
+    let raw_key = lsv_from_str(key)
+    let mut i: usize = 0usize
+    while i + raw_key.len + 3usize <= line.len {
+        if lsv_byte(line, i) == 34u8 {
+            let candidate_key = lsv_slice(line, i + 1usize, i + 1usize + raw_key.len)
+            if lsv_eq(candidate_key, raw_key) && lsv_byte(line, i + 1usize + raw_key.len) == 34u8 {
+                let mut pos = i + 1usize + raw_key.len + 1usize
+                while pos < line.len && (lsv_byte(line, pos) == 32u8 || lsv_byte(line, pos) == 58u8) {
+                    pos = pos + 1usize
+                }
+                if pos + 4usize <= line.len && lsv_eq_str(lsv_slice(line, pos, pos + 4usize), "true") {
+                    return true
+                }
+                return false
+            }
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+pub fn parse_sparse_index_line(line: LockStrView, out_v: mut_view<RegistryPackageVersion>) -> bool {
+    let t = lsv_trim(line)
+    if t.len == 0usize || lsv_byte(t, 0usize) != 123u8 { // '{'
+        return false
+    }
+
+    let v_str = extract_json_string_field(t, "v")
+    if v_str.len == 0usize {
+        return false
+    }
+    let mut sem: LockSemVer = lock_semver_zero()
+    if !parse_lock_semver(v_str, mut_view(sem)) {
+        return false
+    }
+
+    out_v.semver_raw = v_str
+    out_v.semver = sem
+    out_v.namespace = extract_json_string_field(t, "ns")
+    out_v.name = extract_json_string_field(t, "name")
+    out_v.sha256_hex = extract_json_string_field(t, "sha256")
+    out_v.merkle_root_hex = extract_json_string_field(t, "merkle_root")
+    out_v.sif = extract_json_string_field(t, "sif")
+    out_v.api = extract_json_string_field(t, "api")
+    out_v.mode = extract_json_string_field(t, "mode")
+    let ch = extract_json_string_field(t, "channel")
+    out_v.channel = if ch.len > 0usize { ch } else { lsv_from_str("stable") }
+    out_v.yanked = extract_json_bool_field(t, "yanked")
+    out_v.quarantined = extract_json_bool_field(t, "quarantined")
+    out_v.security_fix = extract_json_bool_field(t, "security_fix")
+
+    true
+}
+
+// Parses full multi-line index file and sorts versions in ascending SemVer order
+pub fn parse_sparse_index_file(
+    content: LockStrView,
+    out_versions: mut_view<[16]RegistryPackageVersion>,
+    out_count: mut_view<usize>
+) -> bool {
+    *out_count = 0usize
+    if content.len == 0usize {
+        return true
+    }
+    let mut line_start: usize = 0usize
+    let mut count: usize = 0usize
+    let mut i: usize = 0usize
+    while i <= content.len {
+        let is_eol = i == content.len || lsv_byte(content, i) == 10u8
+        if is_eol {
+            if i > line_start {
+                let line = lsv_slice(content, line_start, i)
+                let mut pv = registry_package_version_empty()
+                if parse_sparse_index_line(line, mut_view(pv)) {
+                    if count < 16usize {
+                        (*out_versions)[count] = pv
+                        count = count + 1usize
+                    }
+                }
+            }
+            line_start = i + 1usize
+        }
+        i = i + 1usize
+    }
+    *out_count = count
+
+    // Sort ascending by SemVer
+    if count > 1usize {
+        let mut a_idx: usize = 0usize
+        while a_idx < count {
+            let mut min_idx = a_idx
+            let mut b_idx = a_idx + 1usize
+            while b_idx < count {
+                if cmp_lock_semver(view((*out_versions)[b_idx].semver), view((*out_versions)[min_idx].semver)) < 0i32 {
+                    min_idx = b_idx
+                }
+                b_idx = b_idx + 1usize
+            }
+            if min_idx != a_idx {
+                let tmp = (*out_versions)[a_idx]
+                (*out_versions)[a_idx] = (*out_versions)[min_idx]
+                (*out_versions)[min_idx] = tmp
+            }
+            a_idx = a_idx + 1usize
+        }
+    }
+    true
+}
+
+// Queries best matching version: channel match, skipping quarantined & yanked
+pub fn query_sparse_index_best_version(
+    versions: view<[16]RegistryPackageVersion>,
+    count: usize,
+    req_channel: LockStrView,
+    allow_yanked: bool,
+    out_best: mut_view<RegistryPackageVersion>
+) -> u32 {
+    let target_channel = if req_channel.len > 0usize { req_channel } else { lsv_from_str("stable") }
+    let mut found = false
+    let mut best = registry_package_version_empty()
+
+    let mut i: usize = 0usize
+    while i < count {
+        let v = (*versions)[i]
+        // Strictly block quarantined versions from being newly selected
+        if !v.quarantined {
+            let channel_ok = lsv_eq(v.channel, target_channel)
+            let yank_ok = allow_yanked || (!v.yanked)
+            if channel_ok && yank_ok {
+                if !found || cmp_lock_semver(view(v.semver), view(best.semver)) > 0i32 {
+                    best = v
+                    found = true
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    if found {
+        *out_best = best
+        REG_STATUS_OK
+    } else {
+        REG_STATUS_NOT_FOUND
+    }
+}
+
+// =============================================================================
+// 3. Immutable Version Publication Checks (`AXS-REG-003`, `AXS-REG-050`)
+// =============================================================================
+
+// Forbids silent overwrite of published (namespace, name, version) coordinates
+pub fn check_registry_publication_immutability(
+    existing: view<[16]RegistryPackageVersion>,
+    count: usize,
+    new_pkg: view<RegistryPackageVersion>
+) -> u32 {
+    let mut i: usize = 0usize
+    while i < count {
+        let e = (*existing)[i]
+        let ns_match = lsv_eq(e.namespace, new_pkg.namespace)
+        let name_match = lsv_eq(e.name, new_pkg.name)
+        let ver_match = cmp_lock_semver(view(e.semver), view(new_pkg.semver)) == 0i32
+
+        if ns_match && name_match && ver_match {
+            // Coordinate matches: check if digests are identical (idempotent republish)
+            let sha_match = lsv_eq(e.sha256_hex, new_pkg.sha256_hex)
+            let mroot_match = lsv_eq(e.merkle_root_hex, new_pkg.merkle_root_hex)
+            let sif_match = lsv_eq(e.sif, new_pkg.sif)
+
+            if sha_match && mroot_match && sif_match {
+                return REG_STATUS_ALREADY_PUBLISHED_IDENTICAL
+            }
+            // Discrepancy -> immutable published version violation
+            return REG_STATUS_IMMUTABLE_VERSION_EXISTS
+        }
+        i = i + 1usize
+    }
+    REG_STATUS_OK
+}
+
+// =============================================================================
+// 4. Content-Addressed Blob & Offline Cache Paths (`AXS-REG-030`, `AXS-REG-032`)
+// =============================================================================
+
+// `blobs/sha256/<b0>/<b1>/<sha256_hex>.axpkg`
+pub fn format_registry_blob_rel_path(sha256_hex: LockStrView, out_buf: mut_view<LockBuffer>) -> bool {
+    let mut raw = lsv_trim(sha256_hex)
+    if lsv_starts_with_str(raw, "sha256:") {
+        raw = lsv_slice(raw, 7usize, raw.len)
+    }
+    if raw.len != 64usize {
+        return false
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), "blobs/sha256/")
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 0usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 1usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 2usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 3usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    lock_buf_push_sv(mut_view(*out_buf), raw)
+    lock_buf_push_str(mut_view(*out_buf), ".axpkg")
+    true
+}
+
+// `.axiom/cache/pkg/sha256/<b0>/<b1>/<sha256_hex>.axpkg`
+pub fn format_offline_pkg_cache_path(sha256_hex: LockStrView, out_buf: mut_view<LockBuffer>) -> bool {
+    let mut raw = lsv_trim(sha256_hex)
+    if lsv_starts_with_str(raw, "sha256:") {
+        raw = lsv_slice(raw, 7usize, raw.len)
+    }
+    if raw.len != 64usize {
+        return false
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), ".axiom/cache/pkg/sha256/")
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 0usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 1usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 2usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 3usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    lock_buf_push_sv(mut_view(*out_buf), raw)
+    lock_buf_push_str(mut_view(*out_buf), ".axpkg")
+    true
+}
+
+// Generates `config.json` per AXS-REG-030 §1
+pub fn format_registry_config_json(
+    registry_id: LockStrView,
+    snapshot_hash: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_str(mut_view(*out_buf), "{\n  \"protocol_version\": 1,\n  \"registry_id\": \"")
+    let rid = if registry_id.len > 0usize { registry_id } else { lsv_from_str("default") }
+    lock_buf_push_sv(mut_view(*out_buf), rid)
+    lock_buf_push_str(mut_view(*out_buf), "\",\n  \"dl_template\": \"{root}/blobs/sha256/{b0}/{b1}/{sha256}.axpkg\",\n  \"index_snapshot_hash\": \"")
+    lock_buf_push_sv(mut_view(*out_buf), snapshot_hash)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n}\n")
+}
+
+// =============================================================================
+// 5. Transactional Package Installation, .axupdate-journal & Safe Rollback (`AXS-REG-034`)
+// =============================================================================
+
+pub struct RegistryStore {
+    pub root: LockStrView,
+    pub active_generation: u32,
+    pub prev_generation: u32,
+    pub min_allowed_version: LockSemVer,
+    pub allow_downgrade: bool,
+    pub journal_state: u32,
+    pub journal_tx_id: LockStrView,
+    pub installed_names: [8]LockStrView,
+    pub installed_versions: [8]LockSemVer,
+    pub installed_roots: [8]LockStrView,
+    pub installed_count: usize,
+}
+
+pub fn registry_store_init(s: mut_view<RegistryStore>, root: LockStrView) {
+    let e = lsv_empty()
+    let zv = lock_semver_zero()
+    s.root = root
+    s.active_generation = 1u32
+    s.prev_generation = 0u32
+    s.min_allowed_version = zv
+    s.allow_downgrade = true
+    s.journal_state = TX_STATE_NONE
+    s.journal_tx_id = e
+    s.installed_count = 0usize
+    let mut i: usize = 0usize
+    while i < 8usize {
+        s.installed_names[i] = e
+        s.installed_versions[i] = zv
+        s.installed_roots[i] = e
+        i = i + 1usize
+    }
+}
+
+// Formats .axupdate-journal write-ahead record
+pub fn format_update_journal(
+    tx_id: LockStrView,
+    state_str: LockStrView,
+    prev_gen: u32,
+    next_gen: u32,
+    pkg_coord: LockStrView,
+    merkle_root_hex: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_str(mut_view(*out_buf), "# Axiom update journal (SPEC-112 AXS-REG-034)\n")
+    lock_buf_push_str(mut_view(*out_buf), "journal_version = 1\n")
+
+    lock_buf_push_str(mut_view(*out_buf), "tx_id = \"")
+    lock_buf_push_sv(mut_view(*out_buf), tx_id)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+    lock_buf_push_str(mut_view(*out_buf), "state = \"")
+    lock_buf_push_sv(mut_view(*out_buf), state_str)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+    lock_buf_push_str(mut_view(*out_buf), "prev_generation = ")
+    lock_buf_push_u32(mut_view(*out_buf), prev_gen)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+
+    lock_buf_push_str(mut_view(*out_buf), "next_generation = ")
+    lock_buf_push_u32(mut_view(*out_buf), next_gen)
+    lock_buf_push_byte(mut_view(*out_buf), 10u8)
+
+    lock_buf_push_str(mut_view(*out_buf), "package = \"")
+    lock_buf_push_sv(mut_view(*out_buf), pkg_coord)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+    lock_buf_push_str(mut_view(*out_buf), "merkle_root = \"")
+    lock_buf_push_sv(mut_view(*out_buf), merkle_root_hex)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n")
+}
+
+// Phase 1..3: Starts transactional update, staging isolated files and writing journal
+pub fn begin_install_transaction(
+    s: mut_view<RegistryStore>,
+    tx_id: LockStrView,
+    next_gen: u32
+) -> u32 {
+    if (next_gen <= s.active_generation) && (!s.allow_downgrade) {
+        return REG_STATUS_DOWNGRADE_BLOCKED
+    }
+    s.prev_generation = s.active_generation
+    s.journal_state = TX_STATE_STAGED
+    s.journal_tx_id = tx_id
+    REG_STATUS_OK
+}
+
+// Phase 4..5: Commits installation transaction, flips active_generation pointer
+pub fn commit_install_transaction(
+    s: mut_view<RegistryStore>,
+    pkg_name: LockStrView,
+    ver: view<LockSemVer>,
+    merkle_root: LockStrView
+) -> u32 {
+    if s.journal_state != TX_STATE_STAGED {
+        return REG_STATUS_JOURNAL_CORRUPT
+    }
+
+    // Policy check: min_allowed_version floor
+    if s.min_allowed_version.major > 0u64 || s.min_allowed_version.minor > 0u64 || s.min_allowed_version.patch > 0u64 {
+        if cmp_lock_semver(ver, view(s.min_allowed_version)) < 0i32 {
+            // Revert state on policy violation
+            s.journal_state = TX_STATE_ROLLED_BACK
+            return REG_STATUS_POLICY_BLOCKED
+        }
+    }
+
+    // Switch active generation pointer atomically
+    s.active_generation = s.active_generation + 1u32
+    s.journal_state = TX_STATE_COMMITTED
+
+    // Record installed package
+    if (s.installed_count) < 8usize {
+        s.installed_names[s.installed_count] = pkg_name
+        s.installed_versions[s.installed_count] = *ver
+        s.installed_roots[s.installed_count] = merkle_root
+        s.installed_count = s.installed_count + 1usize
+    }
+
+    REG_STATUS_OK
+}
+
+// Cleans up a failed transaction, cleanly reverting to prev_generation
+pub fn rollback_staged_transaction(s: mut_view<RegistryStore>) -> u32 {
+    if s.journal_state == TX_STATE_STAGED {
+        s.journal_state = TX_STATE_ROLLED_BACK
+        // Active generation stays intact at prev_generation
+        return REG_STATUS_OK
+    }
+    REG_STATUS_ROLLBACK_FAILED
+}
+
+// Rolls back to a previous generation manifest, preserving user data intact
+pub fn rollback_to_generation(s: mut_view<RegistryStore>, target_gen: u32) -> u32 {
+    if target_gen == 0u32 || (target_gen >= s.active_generation) {
+        return REG_STATUS_ROLLBACK_FAILED
+    }
+    if !s.allow_downgrade {
+        return REG_STATUS_DOWNGRADE_BLOCKED
+    }
+
+    // Flips active generation pointer
+    s.prev_generation = s.active_generation
+    s.active_generation = target_gen
+    s.journal_state = TX_STATE_COMMITTED
+
+    REG_STATUS_OK
+}

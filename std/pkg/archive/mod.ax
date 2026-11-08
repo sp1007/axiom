@@ -1,0 +1,1323 @@
+// Canonical Deterministic `.axpkg` Container Packer, Unpacker, Path Normalizer,
+// Quota Defender, and SHA-256 Merkle Tree Digest Verifier (`std/pkg/archive/mod.ax`, T859 / E20.3).
+//
+// Implements SPEC-112 §§1..2 (`AXS-REG-010`..`013`, `AXS-REG-050`;
+// `REQ-ECO-8736`, `REQ-PKG-024`, `REQ-PKG-010`..`012`, `INV-REG-001`, `INV-DET-001`).
+
+module std.pkg.archive
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_cmp
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_grow
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_push_u64
+use std.pkg.lockfile.lock_buf_as_lsv
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+@intrinsic unsafe fn ptr_copy_nonoverlapping<T>(src: *const T, dst: *mut T, count: usize) {}
+@intrinsic fn wrapping_add_u32(a: u32, b: u32) -> u32 { 0 }
+@intrinsic fn rotate_right_u32(a: u32, b: u32) -> u32 { 0 }
+
+// =============================================================================
+// 1. Constants & Status Codes (`AXS-REG-010`, `AXS-REG-050`)
+// =============================================================================
+
+pub const ARCHIVE_STATUS_OK: u32 = 0u32
+pub const ARCHIVE_STATUS_BAD_MAGIC: u32 = 1u32
+pub const ARCHIVE_STATUS_CORRUPT: u32 = 2u32
+pub const ARCHIVE_STATUS_MERKLE_MISMATCH: u32 = 3u32
+pub const ARCHIVE_STATUS_PATH_TRAVERSAL: u32 = 4u32
+pub const ARCHIVE_STATUS_DUPLICATE_ENTRY: u32 = 5u32
+pub const ARCHIVE_STATUS_QUOTA_EXCEEDED: u32 = 6u32
+pub const ARCHIVE_STATUS_UNSUPPORTED_VERSION: u32 = 7u32
+pub const ARCHIVE_STATUS_MISSING_SECTION: u32 = 8u32
+
+// Decompression quotas per SPEC-112 AXS-REG-013 §2 / tasks/1065 §115
+pub const ARCHIVE_MAX_ARCHIVE_SIZE: usize = 67108864usize        // 64 MiB
+pub const ARCHIVE_MAX_UNCOMPRESSED_TOTAL: usize = 268435456usize  // 256 MiB
+pub const ARCHIVE_MAX_SINGLE_FILE_SIZE: usize = 67108864usize    // 64 MiB
+pub const ARCHIVE_MAX_COMPRESSION_RATIO: usize = 100usize        // 100:1 ratio
+pub const ARCHIVE_MAX_ENTRIES: usize = 16384usize                // 16,384 files
+pub const ARCHIVE_CHUNK_SIZE: usize = 65536usize                 // 64 KiB chunks
+
+// Section Types per SPEC-112 AXS-REG-010 §2 & SPEC-24 AXS-ART-004
+pub const SECTION_MANIFEST: u16 = 1u16
+pub const SECTION_INTERFACE_SUMMARY: u16 = 2u16
+pub const SECTION_MERKLE_INDEX: u16 = 3u16
+pub const SECTION_PROVENANCE: u16 = 12u16
+pub const SECTION_PAYLOAD_BLOBS: u16 = 15u16
+
+// Artifact Distribution Kinds (`AXS-REG-020`)
+pub const ARTIFACT_KIND_SOURCE: u16 = 1u16
+pub const ARTIFACT_KIND_BINARY: u16 = 2u16
+pub const ARTIFACT_KIND_HYBRID: u16 = 3u16
+
+pub const FORMAT_FAMILY_AXPKG: u16 = 6u16
+pub const SCHEMA_VERSION_1: u16 = 1u16
+
+pub const ARTIFACT_HEADER_SIZE: usize = 88usize
+pub const SECTION_DESCRIPTOR_SIZE: usize = 48usize
+
+// =============================================================================
+// 2. FIPS 180-4 Cryptographic SHA-256 Engine (`AXS-REG-012`)
+// =============================================================================
+
+@derive(Copy)
+pub struct Sha256Digest {
+    pub bytes: [32]u8,
+}
+
+pub fn sha256_digest_zero() -> Sha256Digest {
+    Sha256Digest { bytes: [0u8; 32] }
+}
+
+pub fn sha256_digest_eq(a: view<Sha256Digest>, b: view<Sha256Digest>) -> bool {
+    let mut i: usize = 0usize
+    while i < 32usize {
+        if a.bytes[i] != b.bytes[i] {
+            return false
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+fn nibble_to_hex_char(nib: u8) -> u8 {
+    if (nib < 10u8) { 48u8 + nib } else { 87u8 + nib }
+}
+
+pub fn sha256_digest_format_hex(d: view<Sha256Digest>, out_buf: mut_view<LockBuffer>) {
+    let mut i: usize = 0usize
+    while i < 32usize {
+        let b = d.bytes[i]
+        let hi = (b >> 4u32) & 0x0Fu8
+        let lo = b & 0x0Fu8
+        lock_buf_push_byte(mut_view(*out_buf), nibble_to_hex_char(hi))
+        lock_buf_push_byte(mut_view(*out_buf), nibble_to_hex_char(lo))
+        i = i + 1usize
+    }
+}
+
+fn hex_nibble_val(c: u8) -> u8 {
+    if c >= 48u8 && c <= 57u8 {
+        return c - 48u8
+    }
+    if c >= 97u8 && c <= 102u8 {
+        return (c - 97u8) + 10u8
+    }
+    if c >= 65u8 && c <= 70u8 {
+        return (c - 65u8) + 10u8
+    }
+    255u8
+}
+
+pub fn parse_sha256_digest_hex(s: LockStrView, out_d: mut_view<Sha256Digest>) -> bool {
+    let mut raw = lsv_trim(s)
+    if lsv_starts_with_str(raw, "sha256:") {
+        raw = lsv_slice(raw, 7usize, raw.len)
+    }
+    if raw.len != 64usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < 32usize {
+        let c1 = lsv_byte(raw, i * 2usize)
+        let c2 = lsv_byte(raw, i * 2usize + 1usize)
+        let v1 = hex_nibble_val(c1)
+        let v2 = hex_nibble_val(c2)
+        if v1 == 255u8 || v2 == 255u8 {
+            return false
+        }
+        out_d.bytes[i] = (v1 << 4u32) | v2
+        i = i + 1usize
+    }
+    true
+}
+
+@derive(Copy)
+pub struct Sha256State {
+    pub h0: u32,
+    pub h1: u32,
+    pub h2: u32,
+    pub h3: u32,
+    pub h4: u32,
+    pub h5: u32,
+    pub h6: u32,
+    pub h7: u32,
+    pub block: [64]u8,
+    pub block_len: usize,
+    pub total_len: u64,
+}
+
+fn rotr(x: u32, n: u32) -> u32 {
+    rotate_right_u32(x, n)
+}
+
+fn sigma0(x: u32) -> u32 {
+    rotr(x, 7u32) ^ rotr(x, 18u32) ^ (x >> 3u32)
+}
+
+fn sigma1(x: u32) -> u32 {
+    rotr(x, 17u32) ^ rotr(x, 19u32) ^ (x >> 10u32)
+}
+
+fn cap_sigma0(x: u32) -> u32 {
+    rotr(x, 2u32) ^ rotr(x, 13u32) ^ rotr(x, 22u32)
+}
+
+fn cap_sigma1(x: u32) -> u32 {
+    rotr(x, 6u32) ^ rotr(x, 11u32) ^ rotr(x, 25u32)
+}
+
+fn ch(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) ^ ((~x) & z)
+}
+
+fn maj(x: u32, y: u32, z: u32) -> u32 {
+    (x & y) ^ (x & z) ^ (y & z)
+}
+
+fn sha256_round_k(i: usize) -> u32 {
+    let k: [64]u32 = [
+        0x428a2f98u32, 0x71374491u32, 0xb5c0fbcfu32, 0xe9b5dba5u32,
+        0x3956c25bu32, 0x59f111f1u32, 0x923f82a4u32, 0xab1c5ed5u32,
+        0xd807aa98u32, 0x12835b01u32, 0x243185beu32, 0x550c7dc3u32,
+        0x72be5d74u32, 0x80deb1feu32, 0x9bdc06a7u32, 0xc19bf174u32,
+        0xe49b69c1u32, 0xefbe4786u32, 0x0fc19dc6u32, 0x240ca1ccu32,
+        0x2de92c6fu32, 0x4a7484aau32, 0x5cb0a9dcu32, 0x76f988dau32,
+        0x983e5152u32, 0xa831c66du32, 0xb00327c8u32, 0xbf597fc7u32,
+        0xc6e00bf3u32, 0xd5a79147u32, 0x06ca6351u32, 0x14292967u32,
+        0x27b70a85u32, 0x2e1b2138u32, 0x4d2c6dfcu32, 0x53380d13u32,
+        0x650a7354u32, 0x766a0abbu32, 0x81c2c92eu32, 0x92722c85u32,
+        0xa2bfe8a1u32, 0xa81a664bu32, 0xc24b8b70u32, 0xc76c51a3u32,
+        0xd192e819u32, 0xd6990624u32, 0xf40e3585u32, 0x106aa070u32,
+        0x19a4c116u32, 0x1e376c08u32, 0x2748774cu32, 0x34b0bcb5u32,
+        0x391c0cb3u32, 0x4ed8aa4au32, 0x5b9cca4fu32, 0x682e6ff3u32,
+        0x748f82eeu32, 0x78a5636fu32, 0x84c87814u32, 0x8cc70208u32,
+        0x90befffau32, 0xa4506cebu32, 0xbef9a3f7u32, 0xc67178f2u32
+    ]
+    k[i]
+}
+
+fn sha256_process_block(s: mut_view<Sha256State>) {
+    let mut w: [64]u32 = [0u32; 64]
+    let mut t: usize = 0usize
+    while t < 16usize {
+        let b0 = s.block[t * 4usize] as u32
+        let b1 = s.block[t * 4usize + 1usize] as u32
+        let b2 = s.block[t * 4usize + 2usize] as u32
+        let b3 = s.block[t * 4usize + 3usize] as u32
+        w[t] = (b0 << 24u32) | (b1 << 16u32) | (b2 << 8u32) | b3
+        t = t + 1usize
+    }
+    while t < 64usize {
+        let s0 = sigma0(w[t - 15usize])
+        let s1 = sigma1(w[t - 2usize])
+        let term1 = wrapping_add_u32(w[t - 16usize], s0)
+        let term2 = wrapping_add_u32(w[t - 7usize], s1)
+        w[t] = wrapping_add_u32(term1, term2)
+        t = t + 1usize
+    }
+
+    let mut a = s.h0
+    let mut b = s.h1
+    let mut c = s.h2
+    let mut d = s.h3
+    let mut e = s.h4
+    let mut f = s.h5
+    let mut g = s.h6
+    let mut h = s.h7
+
+    t = 0usize
+    while t < 64usize {
+        let t1_part1 = wrapping_add_u32(h, cap_sigma1(e))
+        let t1_part2 = wrapping_add_u32(ch(e, f, g), sha256_round_k(t))
+        let t1 = wrapping_add_u32(wrapping_add_u32(t1_part1, t1_part2), w[t])
+        let t2 = wrapping_add_u32(cap_sigma0(a), maj(a, b, c))
+
+        h = g
+        g = f
+        f = e
+        e = wrapping_add_u32(d, t1)
+        d = c
+        c = b
+        b = a
+        a = wrapping_add_u32(t1, t2)
+        t = t + 1usize
+    }
+
+    s.h0 = wrapping_add_u32(s.h0, a)
+    s.h1 = wrapping_add_u32(s.h1, b)
+    s.h2 = wrapping_add_u32(s.h2, c)
+    s.h3 = wrapping_add_u32(s.h3, d)
+    s.h4 = wrapping_add_u32(s.h4, e)
+    s.h5 = wrapping_add_u32(s.h5, f)
+    s.h6 = wrapping_add_u32(s.h6, g)
+    s.h7 = wrapping_add_u32(s.h7, h)
+}
+
+pub fn sha256_init(s: mut_view<Sha256State>) {
+    s.h0 = 0x6a09e667u32
+    s.h1 = 0xbb67ae85u32
+    s.h2 = 0x3c6ef372u32
+    s.h3 = 0xa54ff53au32
+    s.h4 = 0x510e527fu32
+    s.h5 = 0x9b05688cu32
+    s.h6 = 0x1f83d9abu32
+    s.h7 = 0x5be0cd19u32
+    s.block_len = 0usize
+    s.total_len = 0u64
+}
+
+pub fn sha256_update(s: mut_view<Sha256State>, data: *const u8, byte_count: usize) {
+    if byte_count == 0usize || (data as usize) == 0usize {
+        return
+    }
+    s.total_len = s.total_len + (byte_count as u64)
+    let mut i: usize = 0usize
+    while i < byte_count {
+        s.block[s.block_len] = unsafe { *(data + i) }
+        s.block_len = s.block_len + 1usize
+        if s.block_len == 64usize {
+            sha256_process_block(mut_view(*s))
+            s.block_len = 0usize
+        }
+        i = i + 1usize
+    }
+}
+
+pub fn sha256_update_sv(s: mut_view<Sha256State>, sv: LockStrView) {
+    sha256_update(mut_view(*s), sv.ptr, sv.len)
+}
+
+pub fn sha256_final(s: mut_view<Sha256State>, out_d: mut_view<Sha256Digest>) {
+    let bit_len = s.total_len * 8u64
+    s.block[s.block_len] = 0x80u8
+    s.block_len = s.block_len + 1usize
+
+    if s.block_len > 56usize {
+        while (s.block_len) < 64usize {
+            s.block[s.block_len] = 0u8
+            s.block_len = s.block_len + 1usize
+        }
+        sha256_process_block(mut_view(*s))
+        s.block_len = 0usize
+    }
+
+    while (s.block_len) < 56usize {
+        s.block[s.block_len] = 0u8
+        s.block_len = s.block_len + 1usize
+    }
+
+    // Append 64-bit big endian length
+    let mut k: usize = 0usize
+    while k < 8usize {
+        let shift = ((56usize - k * 8usize) as u32)
+        s.block[56usize + k] = ((bit_len >> shift) & 0xFFu64) as u8
+        k = k + 1usize
+    }
+    sha256_process_block(mut_view(*s))
+
+    // Extract digest bytes in big-endian order
+    let mut h_idx: usize = 0usize
+    while h_idx < 8usize {
+        let h_val = match h_idx {
+            0usize => s.h0
+            1usize => s.h1
+            2usize => s.h2
+            3usize => s.h3
+            4usize => s.h4
+            5usize => s.h5
+            6usize => s.h6
+            _ => s.h7
+        }
+        out_d.bytes[h_idx * 4usize] = (h_val >> 24u32) as u8
+        out_d.bytes[h_idx * 4usize + 1usize] = (h_val >> 16u32) as u8
+        out_d.bytes[h_idx * 4usize + 2usize] = (h_val >> 8u32) as u8
+        out_d.bytes[h_idx * 4usize + 3usize] = h_val as u8
+        h_idx = h_idx + 1usize
+    }
+}
+
+pub fn sha256_hash_bytes(data: *const u8, byte_count: usize) -> Sha256Digest {
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    let mut d = sha256_digest_zero()
+    sha256_init(mut_view(st))
+    sha256_update(mut_view(st), data, byte_count)
+    sha256_final(mut_view(st), mut_view(d))
+    d
+}
+
+pub fn sha256_hash_sv(sv: LockStrView) -> Sha256Digest {
+    sha256_hash_bytes(sv.ptr, sv.len)
+}
+
+// =============================================================================
+// 3. Merkle Tree Construction & Verification (`AXS-REG-012`)
+// =============================================================================
+
+// Chunk digest: SHA256("AXPKG-CHUNK-v1\0" || u64_le(k) || C_{i,k})
+pub fn compute_chunk_sha256(chunk_idx: u64, data: *const u8, chunk_len: usize) -> Sha256Digest {
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    let mut d = sha256_digest_zero()
+    sha256_init(mut_view(st))
+
+    // Domain separation prefix (15 bytes)
+    let pfx = lsv_from_str("AXPKG-CHUNK-v1\0")
+    sha256_update(mut_view(st), pfx.ptr, 15usize)
+
+    // Little-endian u64 chunk index (8 bytes)
+    let mut le_idx: [8]u8 = [0u8; 8]
+    let mut k: usize = 0usize
+    while k < 8usize {
+        le_idx[k] = ((chunk_idx >> ((k * 8usize) as u32)) & 0xFFu64) as u8
+        k = k + 1usize
+    }
+    sha256_update(mut_view(st), unsafe { address_of(le_idx[0]) }, 8usize)
+
+    // Chunk payload bytes
+    if chunk_len > 0usize && (data as usize) != 0usize {
+        sha256_update(mut_view(st), data, chunk_len)
+    }
+
+    sha256_final(mut_view(st), mut_view(d))
+    d
+}
+
+// Binary Merkle reduction of adjacent pairs: Parent = SHA256("AXPKG-NODE-v1\0" || left || right)
+pub fn compute_parent_node_sha256(left: view<Sha256Digest>, right: view<Sha256Digest>) -> Sha256Digest {
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    let mut d = sha256_digest_zero()
+    sha256_init(mut_view(st))
+
+    let pfx = lsv_from_str("AXPKG-NODE-v1\0")
+    sha256_update(mut_view(st), pfx.ptr, 14usize)
+    sha256_update(mut_view(st), unsafe { address_of(left.bytes[0]) }, 32usize)
+    sha256_update(mut_view(st), unsafe { address_of(right.bytes[0]) }, 32usize)
+    sha256_final(mut_view(st), mut_view(d))
+    d
+}
+
+// Reduces array of node hashes to binary Merkle tree root (odd promoted)
+pub fn reduce_merkle_nodes(nodes: mut_view<[64]Sha256Digest>, count: usize) -> Sha256Digest {
+    if count == 0usize {
+        return sha256_digest_zero()
+    }
+    if count == 1usize {
+        return (*nodes)[0]
+    }
+    let mut cur_count = count
+    while cur_count > 1usize {
+        let mut next_count: usize = 0usize
+        let mut j: usize = 0usize
+        while j < cur_count {
+            if j + 1usize < cur_count {
+                let p = compute_parent_node_sha256(view((*nodes)[j]), view((*nodes)[j + 1usize]))
+                (*nodes)[next_count] = p
+                next_count = next_count + 1usize
+                j = j + 2usize
+            } else {
+                // Odd node promoted unchanged
+                (*nodes)[next_count] = (*nodes)[j]
+                next_count = next_count + 1usize
+                j = j + 1usize
+            }
+        }
+        cur_count = next_count
+    }
+    (*nodes)[0]
+}
+
+// Computes payload_sha256 over partitioned 64 KiB chunks
+pub fn compute_payload_sha256(data: *const u8, file_len: usize) -> Sha256Digest {
+    if file_len == 0usize {
+        return compute_chunk_sha256(0u64, data, 0usize)
+    }
+    let chunk_size = ARCHIVE_CHUNK_SIZE
+    let chunk_count = (file_len + chunk_size - 1usize) / chunk_size
+    if chunk_count == 1usize {
+        return compute_chunk_sha256(0u64, data, file_len)
+    }
+
+    let mut chunk_digests: [64]Sha256Digest = [sha256_digest_zero(); 64]
+    let limit = if (chunk_count < 64usize) { chunk_count } else { 64usize }
+    let mut k: usize = 0usize
+    while k < limit {
+        let offset = k * chunk_size
+        let len_k = if (offset + chunk_size <= file_len) { chunk_size } else { file_len - offset }
+        chunk_digests[k] = compute_chunk_sha256(k as u64, unsafe { data + offset }, len_k)
+        k = k + 1usize
+    }
+    reduce_merkle_nodes(mut_view(chunk_digests), limit)
+}
+
+// Leaf hash: SHA256("AXPKG-LEAF-v1\0" || u32_le(|P|) || P || u8(M) || u64_le(L) || D)
+pub fn compute_entry_leaf_sha256(
+    path: LockStrView,
+    mode: u8,
+    file_size: u64,
+    payload_sha256: view<Sha256Digest>
+) -> Sha256Digest {
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    let mut d = sha256_digest_zero()
+    sha256_init(mut_view(st))
+
+    let pfx = lsv_from_str("AXPKG-LEAF-v1\0")
+    sha256_update(mut_view(st), pfx.ptr, 14usize)
+
+    // u32_le(|path|)
+    let mut le_plen: [4]u8 = [0u8; 4]
+    let plen = path.len as u32
+    le_plen[0] = (plen & 0xFFu32) as u8
+    le_plen[1] = ((plen >> 8u32) & 0xFFu32) as u8
+    le_plen[2] = ((plen >> 16u32) & 0xFFu32) as u8
+    le_plen[3] = ((plen >> 24u32) & 0xFFu32) as u8
+    sha256_update(mut_view(st), unsafe { address_of(le_plen[0]) }, 4usize)
+
+    // path UTF-8 bytes
+    sha256_update(mut_view(st), path.ptr, path.len)
+
+    // u8(mode)
+    let m_byte: [1]u8 = [mode]
+    sha256_update(mut_view(st), unsafe { address_of(m_byte[0]) }, 1usize)
+
+    // u64_le(file_size)
+    let mut le_fsize: [8]u8 = [0u8; 8]
+    let mut k: usize = 0usize
+    while k < 8usize {
+        le_fsize[k] = ((file_size >> ((k * 8usize) as u32)) & 0xFFu64) as u8
+        k = k + 1usize
+    }
+    sha256_update(mut_view(st), unsafe { address_of(le_fsize[0]) }, 8usize)
+
+    // payload_sha256 (32 bytes)
+    sha256_update(mut_view(st), unsafe { address_of(payload_sha256.bytes[0]) }, 32usize)
+
+    sha256_final(mut_view(st), mut_view(d))
+    d
+}
+
+// Package Merkle root: SHA256("AXPKG-ROOT-v1\0" || D_manifest || D_iface || u32_le(N) || T_files)
+pub fn compute_axpkg_merkle_root(
+    manifest_bytes: LockStrView,
+    iface_bytes: LockStrView,
+    leaves: view<[64]Sha256Digest>,
+    entry_count: usize
+) -> Sha256Digest {
+    let d_manifest = sha256_hash_sv(manifest_bytes)
+    let d_iface = sha256_hash_sv(iface_bytes)
+
+    let mut t_files = sha256_digest_zero()
+    if entry_count > 0usize {
+        let mut node_copy: [64]Sha256Digest = [sha256_digest_zero(); 64]
+        let mut i: usize = 0usize
+        let limit = if (entry_count < 64usize) { entry_count } else { 64usize }
+        while i < limit {
+            node_copy[i] = (*leaves)[i]
+            i = i + 1usize
+        }
+        t_files = reduce_merkle_nodes(mut_view(node_copy), limit)
+    }
+
+    let mut st = Sha256State {
+        h0: 0u32, h1: 0u32, h2: 0u32, h3: 0u32,
+        h4: 0u32, h5: 0u32, h6: 0u32, h7: 0u32,
+        block: [0u8; 64], block_len: 0usize, total_len: 0u64,
+    }
+    let mut d = sha256_digest_zero()
+    sha256_init(mut_view(st))
+
+    let pfx = lsv_from_str("AXPKG-ROOT-v1\0")
+    sha256_update(mut_view(st), pfx.ptr, 14usize)
+    sha256_update(mut_view(st), unsafe { address_of(d_manifest.bytes[0]) }, 32usize)
+    sha256_update(mut_view(st), unsafe { address_of(d_iface.bytes[0]) }, 32usize)
+
+    let mut le_n: [4]u8 = [0u8; 4]
+    let n_u32 = entry_count as u32
+    le_n[0] = (n_u32 & 0xFFu32) as u8
+    le_n[1] = ((n_u32 >> 8u32) & 0xFFu32) as u8
+    le_n[2] = ((n_u32 >> 16u32) & 0xFFu32) as u8
+    le_n[3] = ((n_u32 >> 24u32) & 0xFFu32) as u8
+    sha256_update(mut_view(st), unsafe { address_of(le_n[0]) }, 4usize)
+
+    sha256_update(mut_view(st), unsafe { address_of(t_files.bytes[0]) }, 32usize)
+    sha256_final(mut_view(st), mut_view(d))
+    d
+}
+
+// =============================================================================
+// 4. Path Normalization, Traversal Defense & Case Collisions (`AXS-REG-011`, `013`)
+// =============================================================================
+
+pub fn check_axpkg_path_safety(p: LockStrView) -> u32 {
+    let t = lsv_trim(p)
+    if t.len == 0usize {
+        return ARCHIVE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Reject leading '/' or '\'
+    let b0 = lsv_byte(t, 0usize)
+    if b0 == 47u8 || b0 == 92u8 {
+        return ARCHIVE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Reject Windows drive letter 'C:'
+    if t.len >= 2usize && lsv_byte(t, 1usize) == 58u8 {
+        return ARCHIVE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Reject trailing '/'
+    if lsv_byte(t, t.len - 1usize) == 47u8 {
+        return ARCHIVE_STATUS_PATH_TRAVERSAL
+    }
+
+    let mut i: usize = 0usize
+    while i < t.len {
+        let b = lsv_byte(t, i)
+        // Reject backslash, control chars, DEL
+        if b == 92u8 || b < 32u8 || b == 127u8 {
+            return ARCHIVE_STATUS_PATH_TRAVERSAL
+        }
+        // Reject '.' or '..' segment
+        if b == 46u8 {
+            let prev_sep = i == 0usize || lsv_byte(t, i - 1usize) == 47u8
+            if prev_sep {
+                if (i + 1usize) == t.len || lsv_byte(t, i + 1usize) == 47u8 {
+                    // "." component
+                    return ARCHIVE_STATUS_PATH_TRAVERSAL
+                }
+                if lsv_byte(t, i + 1usize) == 46u8 {
+                    if (i + 2usize) == t.len || lsv_byte(t, i + 2usize) == 47u8 {
+                        // ".." component
+                        return ARCHIVE_STATUS_PATH_TRAVERSAL
+                    }
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    ARCHIVE_STATUS_OK
+}
+
+// Case-folding equality under ASCII lowercase (e.g. "src/Vec.ax" == "src/vec.ax")
+pub fn check_path_case_collision(a: LockStrView, b: LockStrView) -> bool {
+    if a.len != b.len {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < a.len {
+        let mut ba = lsv_byte(a, i)
+        let mut bb = lsv_byte(b, i)
+        if ba >= 65u8 && ba <= 90u8 {
+            ba = ba + 32u8
+        }
+        if bb >= 65u8 && bb <= 90u8 {
+            bb = bb + 32u8
+        }
+        if ba != bb {
+            return false
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+// Converts CRLF (\r\n) to LF (\n) in UTF-8 text sources (*.ax, *.toml, *.md, *.json, *.def)
+pub fn normalize_source_line_endings(source: LockStrView, out_buf: mut_view<LockBuffer>) {
+    if source.len == 0usize || (source.ptr as usize) == 0usize {
+        return
+    }
+    let mut i: usize = 0usize
+    while i < source.len {
+        let b = lsv_byte(source, i)
+        if b == 13u8 && (i + 1usize < source.len) && lsv_byte(source, i + 1usize) == 10u8 {
+            lock_buf_push_byte(mut_view(*out_buf), 10u8)
+            i = i + 2usize
+        } else {
+            lock_buf_push_byte(mut_view(*out_buf), b)
+            i = i + 1usize
+        }
+    }
+}
+
+// =============================================================================
+// 5. `.axpkg` Container Data Model & Lexicographical Sorting (`AXS-REG-010..011`)
+// =============================================================================
+
+@derive(Copy)
+pub struct AxpkgEntry {
+    pub path: LockStrView,
+    pub entry_mode: u8,
+    pub size: u64,
+    pub payload_sha256: Sha256Digest,
+    pub leaf_sha256: Sha256Digest,
+    pub data: LockStrView,
+}
+
+pub fn axpkg_entry_empty() -> AxpkgEntry {
+    let e = lsv_empty()
+    let zd = sha256_digest_zero()
+    AxpkgEntry {
+        path: e,
+        entry_mode: 0u8,
+        size: 0u64,
+        payload_sha256: zd,
+        leaf_sha256: zd,
+        data: e,
+    }
+}
+
+pub struct AxpkgArchive {
+    pub artifact_kind: u16,
+    pub manifest: LockStrView,
+    pub iface_summary: LockStrView,
+    pub provenance: LockStrView,
+    pub entries: [32]AxpkgEntry,
+    pub entry_count: usize,
+    pub merkle_root: Sha256Digest,
+}
+
+pub fn axpkg_archive_init(a: mut_view<AxpkgArchive>) {
+    let e = lsv_empty()
+    let zd = sha256_digest_zero()
+    let ze = axpkg_entry_empty()
+    a.artifact_kind = ARTIFACT_KIND_SOURCE
+    a.manifest = e
+    a.iface_summary = e
+    a.provenance = e
+    a.merkle_root = zd
+    a.entry_count = 0usize
+    let mut i: usize = 0usize
+    while i < 32usize {
+        a.entries[i] = ze
+        i = i + 1usize
+    }
+}
+
+pub fn axpkg_archive_add_entry(
+    a: mut_view<AxpkgArchive>,
+    path: LockStrView,
+    mode: u8,
+    data: LockStrView
+) -> u32 {
+    let safety = check_axpkg_path_safety(path)
+    if safety != ARCHIVE_STATUS_OK {
+        return safety
+    }
+    if (a.entry_count >= 32usize) {
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    // Check duplicate or case collision
+    let mut i: usize = 0usize
+    while i < a.entry_count {
+        if check_path_case_collision(a.entries[i].path, path) {
+            return ARCHIVE_STATUS_DUPLICATE_ENTRY
+        }
+        i = i + 1usize
+    }
+
+    let p_sha = compute_payload_sha256(data.ptr, data.len)
+    let l_sha = compute_entry_leaf_sha256(path, mode, data.len as u64, view(p_sha))
+
+    a.entries[a.entry_count] = AxpkgEntry {
+        path: path,
+        entry_mode: mode,
+        size: data.len as u64,
+        payload_sha256: p_sha,
+        leaf_sha256: l_sha,
+        data: data,
+    }
+    a.entry_count = a.entry_count + 1usize
+    ARCHIVE_STATUS_OK
+}
+
+// Strict ascending byte order sorting (`memcmp`) of entry paths
+pub fn sort_axpkg_entries(entries: mut_view<[32]AxpkgEntry>, count: usize) {
+    if count <= 1usize {
+        return
+    }
+    let mut i: usize = 0usize
+    while i < count {
+        let mut min_idx = i
+        let mut j = i + 1usize
+        while j < count {
+            if lsv_cmp((*entries)[j].path, (*entries)[min_idx].path) < 0i32 {
+                min_idx = j
+            }
+            j = j + 1usize
+        }
+        if min_idx != i {
+            let tmp = (*entries)[i]
+            (*entries)[i] = (*entries)[min_idx]
+            (*entries)[min_idx] = tmp
+        }
+        i = i + 1usize
+    }
+}
+
+// =============================================================================
+// 6. Deterministic `.axpkg` Packing (`AXS-REG-010..012`)
+// =============================================================================
+
+fn push_u16_le(buf: mut_view<LockBuffer>, v: u16) {
+    lock_buf_push_byte(mut_view(*buf), (v & 0xFFu16) as u8)
+    lock_buf_push_byte(mut_view(*buf), ((v >> 8u32) & 0xFFu16) as u8)
+}
+
+fn push_u32_le(buf: mut_view<LockBuffer>, v: u32) {
+    lock_buf_push_byte(mut_view(*buf), (v & 0xFFu32) as u8)
+    lock_buf_push_byte(mut_view(*buf), ((v >> 8u32) & 0xFFu32) as u8)
+    lock_buf_push_byte(mut_view(*buf), ((v >> 16u32) & 0xFFu32) as u8)
+    lock_buf_push_byte(mut_view(*buf), ((v >> 24u32) & 0xFFu32) as u8)
+}
+
+fn push_u64_le(buf: mut_view<LockBuffer>, v: u64) {
+    let mut k: usize = 0usize
+    while k < 8usize {
+        let b = ((v >> ((k * 8usize) as u32)) & 0xFFu64) as u8
+        lock_buf_push_byte(mut_view(*buf), b)
+        k = k + 1usize
+    }
+}
+
+fn align_buffer_to(buf: mut_view<LockBuffer>, align: usize) {
+    while (buf.len % align) != 0usize {
+        lock_buf_push_byte(mut_view(*buf), 0u8)
+    }
+}
+
+fn push_section_descriptor(
+    buf: mut_view<LockBuffer>,
+    id: u32,
+    stype: u16,
+    flags: u16,
+    align: u32,
+    off: u64,
+    comp_size: u64,
+    uncomp_size: u64,
+    checksum_lo: u64
+) {
+    push_u32_le(mut_view(*buf), id)
+    push_u16_le(mut_view(*buf), stype)
+    push_u16_le(mut_view(*buf), flags)
+    push_u32_le(mut_view(*buf), align)
+    push_u64_le(mut_view(*buf), off)
+    push_u64_le(mut_view(*buf), comp_size)
+    push_u64_le(mut_view(*buf), uncomp_size)
+    push_u64_le(mut_view(*buf), checksum_lo)
+    push_u32_le(mut_view(*buf), 0u32)
+}
+
+pub fn pack_axpkg(a: mut_view<AxpkgArchive>, out_buf: mut_view<LockBuffer>) -> u32 {
+    // 1. Sort entries lexicographically
+    sort_axpkg_entries(mut_view(a.entries), a.entry_count)
+
+    // 2. Validate paths, case-folding uniqueness, and quotas
+    let mut total_uncompressed: usize = a.manifest.len + a.iface_summary.len + a.provenance.len
+    let mut i: usize = 0usize
+    while i < a.entry_count {
+        let p_safety = check_axpkg_path_safety(a.entries[i].path)
+        if p_safety != ARCHIVE_STATUS_OK {
+            return p_safety
+        }
+        if i + 1usize < a.entry_count {
+            if check_path_case_collision(a.entries[i].path, a.entries[i + 1usize].path) {
+                return ARCHIVE_STATUS_DUPLICATE_ENTRY
+            }
+        }
+        let fsize = a.entries[i].size as usize
+        if fsize > ARCHIVE_MAX_SINGLE_FILE_SIZE {
+            return ARCHIVE_STATUS_QUOTA_EXCEEDED
+        }
+        total_uncompressed = total_uncompressed + fsize
+        i = i + 1usize
+    }
+    if total_uncompressed > ARCHIVE_MAX_UNCOMPRESSED_TOTAL {
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    // 3. Compute Merkle leaves and aggregate root
+    let mut leaves: [64]Sha256Digest = [sha256_digest_zero(); 64]
+    i = 0usize
+    while i < a.entry_count {
+        leaves[i] = a.entries[i].leaf_sha256
+        i = i + 1usize
+    }
+    let m_root = compute_axpkg_merkle_root(a.manifest, a.iface_summary, view(leaves), a.entry_count)
+    a.merkle_root = m_root
+
+    // 4. Construct Section Payloads
+    // Section 1: SECTION_MANIFEST
+    let s_manifest_bytes = a.manifest
+    // Section 2: SECTION_INTERFACE_SUMMARY
+    let s_iface_bytes = a.iface_summary
+
+    // Section 3: SECTION_MERKLE_INDEX
+    let mut merkle_idx_buf = lock_buf_new()
+    lock_buf_init(mut_view(merkle_idx_buf))
+    push_u32_le(mut_view(merkle_idx_buf), a.entry_count as u32)
+    push_u32_le(mut_view(merkle_idx_buf), a.entry_count as u32)
+    // 32-byte merkle_root
+    let mut b_idx: usize = 0usize
+    while b_idx < 32usize {
+        lock_buf_push_byte(mut_view(merkle_idx_buf), m_root.bytes[b_idx])
+        b_idx = b_idx + 1usize
+    }
+    // Entry records
+    i = 0usize
+    let mut cur_payload_offset: u64 = 0u64
+    while i < a.entry_count {
+        let e = a.entries[i]
+        push_u32_le(mut_view(merkle_idx_buf), e.path.len as u32)
+        lock_buf_push_sv(mut_view(merkle_idx_buf), e.path)
+        lock_buf_push_byte(mut_view(merkle_idx_buf), e.entry_mode)
+        push_u64_le(mut_view(merkle_idx_buf), 0u64) // mtime_sec = 0
+        push_u32_le(mut_view(merkle_idx_buf), 0u32) // mtime_nsec = 0
+        push_u32_le(mut_view(merkle_idx_buf), 0u32) // uid = 0
+        push_u32_le(mut_view(merkle_idx_buf), 0u32) // gid = 0
+        push_u64_le(mut_view(merkle_idx_buf), e.size)
+        // payload_sha256 (32 bytes)
+        b_idx = 0usize
+        while b_idx < 32usize {
+            lock_buf_push_byte(mut_view(merkle_idx_buf), e.payload_sha256.bytes[b_idx])
+            b_idx = b_idx + 1usize
+        }
+        push_u64_le(mut_view(merkle_idx_buf), cur_payload_offset)
+        // leaf_sha256 (32 bytes)
+        b_idx = 0usize
+        while b_idx < 32usize {
+            lock_buf_push_byte(mut_view(merkle_idx_buf), e.leaf_sha256.bytes[b_idx])
+            b_idx = b_idx + 1usize
+        }
+
+        // Align each payload blob to 8 bytes in SECTION_PAYLOAD_BLOBS
+        let padded_len = ((e.size as usize) + 7usize) & ~7usize
+        cur_payload_offset = cur_payload_offset + (padded_len as u64)
+        i = i + 1usize
+    }
+
+    // Section 4: SECTION_PROVENANCE
+    let s_prov_bytes = a.provenance
+
+    // Section 5: SECTION_PAYLOAD_BLOBS
+    let mut payload_blobs_buf = lock_buf_new()
+    lock_buf_init(mut_view(payload_blobs_buf))
+    i = 0usize
+    while i < a.entry_count {
+        lock_buf_push_sv(mut_view(payload_blobs_buf), a.entries[i].data)
+        align_buffer_to(mut_view(payload_blobs_buf), 8usize)
+        i = i + 1usize
+    }
+
+    // 5. Compute Section Offsets and Table
+    let section_count: u32 = 5u32
+    let section_table_size = (section_count as usize) * SECTION_DESCRIPTOR_SIZE
+    let payload_offset = ARTIFACT_HEADER_SIZE + section_table_size
+
+    let mut cur_offset = payload_offset
+
+    // Section 1: Manifest
+    let off1 = cur_offset
+    let len1 = s_manifest_bytes.len
+    cur_offset = cur_offset + len1
+    cur_offset = (cur_offset + 7usize) & ~7usize
+
+    // Section 2: Interface Summary
+    let off2 = cur_offset
+    let len2 = s_iface_bytes.len
+    cur_offset = cur_offset + len2
+    cur_offset = (cur_offset + 7usize) & ~7usize
+
+    // Section 3: Merkle Index
+    let off3 = cur_offset
+    let len3 = merkle_idx_buf.len
+    cur_offset = cur_offset + len3
+    cur_offset = (cur_offset + 7usize) & ~7usize
+
+    // Section 4: Provenance
+    let off4 = cur_offset
+    let len4 = s_prov_bytes.len
+    cur_offset = cur_offset + len4
+    cur_offset = (cur_offset + 7usize) & ~7usize
+
+    // Section 5: Payload Blobs
+    let off5 = cur_offset
+    let len5 = payload_blobs_buf.len
+    cur_offset = cur_offset + len5
+
+    let total_archive_size = cur_offset
+    if total_archive_size > ARCHIVE_MAX_ARCHIVE_SIZE {
+        lock_buf_free(mut_view(merkle_idx_buf))
+        lock_buf_free(mut_view(payload_blobs_buf))
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    // 6. Emit 88-byte ArtifactHeader (`AXS-REG-010`)
+    // magic: "AXPKG001"
+    lock_buf_push_byte(mut_view(*out_buf), 65u8) // 'A'
+    lock_buf_push_byte(mut_view(*out_buf), 88u8) // 'X'
+    lock_buf_push_byte(mut_view(*out_buf), 80u8) // 'P'
+    lock_buf_push_byte(mut_view(*out_buf), 75u8) // 'K'
+    lock_buf_push_byte(mut_view(*out_buf), 71u8) // 'G'
+    lock_buf_push_byte(mut_view(*out_buf), 48u8) // '0'
+    lock_buf_push_byte(mut_view(*out_buf), 48u8) // '0'
+    lock_buf_push_byte(mut_view(*out_buf), 49u8) // '1'
+
+    push_u16_le(mut_view(*out_buf), FORMAT_FAMILY_AXPKG)
+    push_u16_le(mut_view(*out_buf), SCHEMA_VERSION_1)
+    push_u16_le(mut_view(*out_buf), a.artifact_kind)
+    push_u16_le(mut_view(*out_buf), 3u16) // little_endian = 1, deterministic = 1
+
+    // target_fingerprint: 16 zero bytes for source
+    push_u64_le(mut_view(*out_buf), 0u64)
+    push_u64_le(mut_view(*out_buf), 0u64)
+
+    // interface_fingerprint: 16 bytes
+    push_u64_le(mut_view(*out_buf), 0u64)
+    push_u64_le(mut_view(*out_buf), 0u64)
+
+    push_u32_le(mut_view(*out_buf), section_count)
+    push_u32_le(mut_view(*out_buf), 0x00010000u32) // producer_version
+    push_u64_le(mut_view(*out_buf), payload_offset as u64)
+    push_u64_le(mut_view(*out_buf), (total_archive_size - ARTIFACT_HEADER_SIZE) as u64)
+    push_u64_le(mut_view(*out_buf), 0u64) // content_hash_lo
+    push_u64_le(mut_view(*out_buf), 0u64) // content_hash_hi
+
+    // 7. Emit Section Descriptors (48 bytes each)
+    push_section_descriptor(mut_view(*out_buf), 1u32, SECTION_MANIFEST, 0x01u16, 8u32, off1 as u64, len1 as u64, len1 as u64, 0u64)
+    push_section_descriptor(mut_view(*out_buf), 2u32, SECTION_INTERFACE_SUMMARY, 0x01u16, 8u32, off2 as u64, len2 as u64, len2 as u64, 0u64)
+    push_section_descriptor(mut_view(*out_buf), 3u32, SECTION_MERKLE_INDEX, 0x01u16, 8u32, off3 as u64, len3 as u64, len3 as u64, 0u64)
+    push_section_descriptor(mut_view(*out_buf), 4u32, SECTION_PROVENANCE, 0x01u16, 8u32, off4 as u64, len4 as u64, len4 as u64, 0u64)
+    push_section_descriptor(mut_view(*out_buf), 5u32, SECTION_PAYLOAD_BLOBS, 0x01u16, 8u32, off5 as u64, len5 as u64, len5 as u64, 0u64)
+
+    // 8. Emit Section Data
+    lock_buf_push_sv(mut_view(*out_buf), s_manifest_bytes)
+    align_buffer_to(mut_view(*out_buf), 8usize)
+
+    lock_buf_push_sv(mut_view(*out_buf), s_iface_bytes)
+    align_buffer_to(mut_view(*out_buf), 8usize)
+
+    lock_buf_push_sv(mut_view(*out_buf), lock_buf_as_lsv(view(merkle_idx_buf)))
+    align_buffer_to(mut_view(*out_buf), 8usize)
+
+    lock_buf_push_sv(mut_view(*out_buf), s_prov_bytes)
+    align_buffer_to(mut_view(*out_buf), 8usize)
+
+    lock_buf_push_sv(mut_view(*out_buf), lock_buf_as_lsv(view(payload_blobs_buf)))
+
+    lock_buf_free(mut_view(merkle_idx_buf))
+    lock_buf_free(mut_view(payload_blobs_buf))
+
+    ARCHIVE_STATUS_OK
+}
+
+// =============================================================================
+// 7. Deterministic `.axpkg` Unpacking & Verification (`AXS-REG-012..013`)
+// =============================================================================
+
+fn read_u16_le(bytes: LockStrView, offset: usize) -> u16 {
+    let b0 = lsv_byte(bytes, offset) as u16
+    let b1 = lsv_byte(bytes, offset + 1usize) as u16
+    (b1 << 8u32) | b0
+}
+
+fn read_u32_le(bytes: LockStrView, offset: usize) -> u32 {
+    let b0 = lsv_byte(bytes, offset) as u32
+    let b1 = lsv_byte(bytes, offset + 1usize) as u32
+    let b2 = lsv_byte(bytes, offset + 2usize) as u32
+    let b3 = lsv_byte(bytes, offset + 3usize) as u32
+    (b3 << 24u32) | (b2 << 16u32) | (b1 << 8u32) | b0
+}
+
+fn read_u64_le(bytes: LockStrView, offset: usize) -> u64 {
+    let mut v: u64 = 0u64
+    let mut k: usize = 0usize
+    while k < 8usize {
+        let b = lsv_byte(bytes, offset + k) as u64
+        v = v | (b << ((k * 8usize) as u32))
+        k = k + 1usize
+    }
+    v
+}
+
+pub fn unpack_axpkg(bytes: LockStrView, out_a: mut_view<AxpkgArchive>) -> u32 {
+    axpkg_archive_init(mut_view(*out_a))
+
+    if (bytes.len) < ARTIFACT_HEADER_SIZE {
+        return ARCHIVE_STATUS_CORRUPT
+    }
+    if bytes.len > ARCHIVE_MAX_ARCHIVE_SIZE {
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    // Check magic: "AXPKG001"
+    let magic_ok = lsv_byte(bytes, 0usize) == 65u8 &&
+                   lsv_byte(bytes, 1usize) == 88u8 &&
+                   lsv_byte(bytes, 2usize) == 80u8 &&
+                   lsv_byte(bytes, 3usize) == 75u8 &&
+                   lsv_byte(bytes, 4usize) == 71u8 &&
+                   lsv_byte(bytes, 5usize) == 48u8 &&
+                   lsv_byte(bytes, 6usize) == 48u8 &&
+                   lsv_byte(bytes, 7usize) == 49u8
+    if !magic_ok {
+        return ARCHIVE_STATUS_BAD_MAGIC
+    }
+
+    let format_family = read_u16_le(bytes, 8usize)
+    let schema_version = read_u16_le(bytes, 10usize)
+    if format_family != FORMAT_FAMILY_AXPKG || schema_version != SCHEMA_VERSION_1 {
+        return ARCHIVE_STATUS_UNSUPPORTED_VERSION
+    }
+
+    let art_kind = read_u16_le(bytes, 12usize)
+    let section_count = read_u32_le(bytes, 48usize) as usize
+    out_a.artifact_kind = art_kind
+
+    let required_header_and_table = ARTIFACT_HEADER_SIZE + section_count * SECTION_DESCRIPTOR_SIZE
+    if (bytes.len) < required_header_and_table {
+        return ARCHIVE_STATUS_CORRUPT
+    }
+
+    // Locate sections
+    let mut off_manifest: usize = 0usize
+    let mut len_manifest: usize = 0usize
+    let mut off_iface: usize = 0usize
+    let mut len_iface: usize = 0usize
+    let mut off_merkle: usize = 0usize
+    let mut len_merkle: usize = 0usize
+    let mut off_prov: usize = 0usize
+    let mut len_prov: usize = 0usize
+    let mut off_blobs: usize = 0usize
+    let mut len_blobs: usize = 0usize
+
+    let mut s_idx: usize = 0usize
+    while s_idx < section_count {
+        let desc_offset = ARTIFACT_HEADER_SIZE + s_idx * SECTION_DESCRIPTOR_SIZE
+        let stype = read_u16_le(bytes, desc_offset + 4usize)
+        let s_off = read_u64_le(bytes, desc_offset + 12usize) as usize
+        let s_len = read_u64_le(bytes, desc_offset + 28usize) as usize
+
+        if s_off + s_len > bytes.len {
+            return ARCHIVE_STATUS_CORRUPT
+        }
+
+        if stype == SECTION_MANIFEST {
+            off_manifest = s_off
+            len_manifest = s_len
+        } else if stype == SECTION_INTERFACE_SUMMARY {
+            off_iface = s_off
+            len_iface = s_len
+        } else if stype == SECTION_MERKLE_INDEX {
+            off_merkle = s_off
+            len_merkle = s_len
+        } else if stype == SECTION_PROVENANCE {
+            off_prov = s_off
+            len_prov = s_len
+        } else if stype == SECTION_PAYLOAD_BLOBS {
+            off_blobs = s_off
+            len_blobs = s_len
+        }
+        s_idx = s_idx + 1usize
+    }
+
+    if off_merkle == 0usize || len_merkle < 40usize {
+        return ARCHIVE_STATUS_MISSING_SECTION
+    }
+
+    out_a.manifest = lsv_slice(bytes, off_manifest, off_manifest + len_manifest)
+    out_a.iface_summary = lsv_slice(bytes, off_iface, off_iface + len_iface)
+    out_a.provenance = lsv_slice(bytes, off_prov, off_prov + len_prov)
+
+    // Parse SECTION_MERKLE_INDEX
+    let entry_count = read_u32_le(bytes, off_merkle) as usize
+    if entry_count > ARCHIVE_MAX_ENTRIES {
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    let mut expected_merkle_root = sha256_digest_zero()
+    let mut b_idx: usize = 0usize
+    while b_idx < 32usize {
+        expected_merkle_root.bytes[b_idx] = lsv_byte(bytes, off_merkle + 8usize + b_idx)
+        b_idx = b_idx + 1usize
+    }
+
+    let mut cur_idx_pos = off_merkle + 40usize
+    let mut i: usize = 0usize
+    let mut total_uncompressed: usize = len_manifest + len_iface + len_prov
+    let mut leaves: [64]Sha256Digest = [sha256_digest_zero(); 64]
+
+    while i < entry_count {
+        if cur_idx_pos + 4usize > off_merkle + len_merkle {
+            return ARCHIVE_STATUS_CORRUPT
+        }
+        let plen = read_u32_le(bytes, cur_idx_pos) as usize
+        cur_idx_pos = cur_idx_pos + 4usize
+        if cur_idx_pos + plen + 1usize + 8usize + 4usize + 4usize + 4usize + 8usize + 32usize + 8usize + 32usize > off_merkle + len_merkle {
+            return ARCHIVE_STATUS_CORRUPT
+        }
+
+        let entry_path = lsv_slice(bytes, cur_idx_pos, cur_idx_pos + plen)
+        let p_safety = check_axpkg_path_safety(entry_path)
+        if p_safety != ARCHIVE_STATUS_OK {
+            return p_safety
+        }
+        cur_idx_pos = cur_idx_pos + plen
+
+        let mode = lsv_byte(bytes, cur_idx_pos)
+        cur_idx_pos = cur_idx_pos + 1usize
+        // Skip mtime_sec (8), mtime_nsec (4), uid (4), gid (4) = 20 bytes
+        cur_idx_pos = cur_idx_pos + 20usize
+
+        let fsize = read_u64_le(bytes, cur_idx_pos)
+        cur_idx_pos = cur_idx_pos + 8usize
+        if (fsize as usize) > ARCHIVE_MAX_SINGLE_FILE_SIZE {
+            return ARCHIVE_STATUS_QUOTA_EXCEEDED
+        }
+        total_uncompressed = total_uncompressed + (fsize as usize)
+
+        // Read stored payload_sha256
+        let mut stored_p_sha = sha256_digest_zero()
+        b_idx = 0usize
+        while b_idx < 32usize {
+            stored_p_sha.bytes[b_idx] = lsv_byte(bytes, cur_idx_pos + b_idx)
+            b_idx = b_idx + 1usize
+        }
+        cur_idx_pos = cur_idx_pos + 32usize
+
+        let p_offset = read_u64_le(bytes, cur_idx_pos) as usize
+        cur_idx_pos = cur_idx_pos + 8usize
+
+        // Read stored leaf_sha256
+        let mut stored_leaf_sha = sha256_digest_zero()
+        b_idx = 0usize
+        while b_idx < 32usize {
+            stored_leaf_sha.bytes[b_idx] = lsv_byte(bytes, cur_idx_pos + b_idx)
+            b_idx = b_idx + 1usize
+        }
+        cur_idx_pos = cur_idx_pos + 32usize
+
+        // Slice payload from SECTION_PAYLOAD_BLOBS
+        let abs_file_off = off_blobs + p_offset
+        if abs_file_off + (fsize as usize) > bytes.len {
+            return ARCHIVE_STATUS_CORRUPT
+        }
+        let file_data = lsv_slice(bytes, abs_file_off, abs_file_off + (fsize as usize))
+
+        // Recompute chunk digests and payload_sha256
+        let recomputed_p_sha = compute_payload_sha256(file_data.ptr, file_data.len)
+        if !sha256_digest_eq(view(stored_p_sha), view(recomputed_p_sha)) {
+            return ARCHIVE_STATUS_MERKLE_MISMATCH
+        }
+
+        // Recompute leaf hash
+        let recomputed_leaf_sha = compute_entry_leaf_sha256(entry_path, mode, fsize, view(recomputed_p_sha))
+        if !sha256_digest_eq(view(stored_leaf_sha), view(recomputed_leaf_sha)) {
+            return ARCHIVE_STATUS_MERKLE_MISMATCH
+        }
+
+        if i < 32usize {
+            out_a.entries[i] = AxpkgEntry {
+                path: entry_path,
+                entry_mode: mode,
+                size: fsize,
+                payload_sha256: recomputed_p_sha,
+                leaf_sha256: recomputed_leaf_sha,
+                data: file_data,
+            }
+        }
+        if i < 64usize {
+            leaves[i] = recomputed_leaf_sha
+        }
+
+        // Check duplicate entry or case collision with previous entries
+        let mut k: usize = 0usize
+        while k < i {
+            if check_path_case_collision(out_a.entries[k].path, entry_path) {
+                return ARCHIVE_STATUS_DUPLICATE_ENTRY
+            }
+            k = k + 1usize
+        }
+
+        i = i + 1usize
+    }
+
+    if total_uncompressed > ARCHIVE_MAX_UNCOMPRESSED_TOTAL {
+        return ARCHIVE_STATUS_QUOTA_EXCEEDED
+    }
+
+    out_a.entry_count = if (entry_count < 32usize) { entry_count } else { 32usize }
+
+    // Recompute package Merkle root and verify against expected
+    let recomputed_m_root = compute_axpkg_merkle_root(out_a.manifest, out_a.iface_summary, view(leaves), entry_count)
+    if !sha256_digest_eq(view(expected_merkle_root), view(recomputed_m_root)) {
+        return ARCHIVE_STATUS_MERKLE_MISMATCH
+    }
+    out_a.merkle_root = recomputed_m_root
+
+    ARCHIVE_STATUS_OK
+}
+
+// Full integrity check of `.axpkg` archive bytes against optional expected Merkle root
+pub fn verify_axpkg(bytes: LockStrView, expected_merkle_root: view<Sha256Digest>) -> u32 {
+    let mut arc: AxpkgArchive = AxpkgArchive {
+        artifact_kind: 0u16,
+        manifest: lsv_empty(),
+        iface_summary: lsv_empty(),
+        provenance: lsv_empty(),
+        entries: [axpkg_entry_empty(); 32],
+        entry_count: 0usize,
+        merkle_root: sha256_digest_zero(),
+    }
+    let status = unpack_axpkg(bytes, mut_view(arc))
+    if status != ARCHIVE_STATUS_OK {
+        return status
+    }
+
+    let zero_d = sha256_digest_zero()
+    if !sha256_digest_eq(expected_merkle_root, view(zero_d)) {
+        if !sha256_digest_eq(view(arc.merkle_root), expected_merkle_root) {
+            return ARCHIVE_STATUS_MERKLE_MISMATCH
+        }
+    }
+
+    ARCHIVE_STATUS_OK
+}

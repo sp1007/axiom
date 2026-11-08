@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T856, T858]
 priority: 209
-status: doing
+status: done
 attempts: 1
 paths: [std/pkg/archive, std/pkg/registry, tests/run/pkg_registry]
 spec: [spec/SPEC-112-package-registry-distribution.md, tasks/0412, tasks/0665, tasks/0858, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-024]
 started: 2026-11-09 01:12:18
-agent: T859-impl
+finished: 2026-11-09 02:29:30
 ---
 # T859 — E20.3 Deterministic .axpkg archive packer/unpacker, Merkle content verifier & sparse/local registry repository client
 
@@ -43,3 +43,4 @@ Implement the deterministic `.axpkg` archive packer/unpacker, SHA-256 Merkle con
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-09 01:12:18 started (attempt 1) T859-impl
+- 2026-11-09 02:29:30 accepted by QA -> done
