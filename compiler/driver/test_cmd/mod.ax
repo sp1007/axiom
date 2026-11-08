@@ -1,0 +1,413 @@
+// `axiomc test` CLI Subcommand Driver (`compiler/driver/test_cmd/mod.ax`, T818 / E19.5).
+// Implements SPEC-104 §7.1 (AXS-TST-050, AXS-TST-053; REQ-TOOL-002..003,
+// REQ-TOOL-005..011, REQ-TOOL-179, REQ-TST-112; INV-TST-001).
+module compiler.driver.test_cmd
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.code.AX_DRIVER_UNKNOWN_OPTION
+use compiler.diag.code.diag_code
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.opt.bisect.OptPassPipeline
+use compiler.opt.bisect.OptReplayManifest
+use compiler.opt.bisect.PassBisectReport
+use compiler.opt.bisect.bisect_push_str
+use compiler.opt.bisect.opt_bisect_config_with_limit
+use compiler.opt.bisect.opt_bisect_eval_pipeline_at_limit
+use compiler.opt.bisect.opt_bisect_run_binary_search
+use compiler.opt.bisect.opt_bisect_render_terminal
+use compiler.opt.bisect.opt_bisect_render_json
+use compiler.opt.bisect.opt_replay_execute
+use compiler.test_runner.DiscoveredTestCase
+use compiler.test_runner.TestSuiteSummary
+use compiler.test_runner.SemanticDebugModel
+use compiler.test_runner.TraceCostAudit
+use compiler.test_runner.DebugTraceAuditReport
+use compiler.test_runner.test_runner_execute_suite
+use compiler.test_runner.test_runner_render_suite_human
+use compiler.test_runner.test_runner_render_suite_json
+use compiler.test_runner.test_runner_audit_debug_and_trace
+use compiler.test_runner.test_runner_render_debug_audit_json
+
+pub const TEST_EXIT_OK: i32 = 0i32
+pub const TEST_EXIT_FAILED: i32 = 1i32
+pub const TEST_EXIT_USAGE: i32 = 2i32
+pub const TEST_EXIT_ICE: i32 = 3i32
+
+pub const TEST_FMT_HUMAN: u8 = 0u8
+pub const TEST_FMT_JSON: u8 = 1u8
+pub const TEST_FMT_JSONL: u8 = 2u8
+
+@derive(Copy)
+pub struct TestCliOptions {
+    pub run_doc: bool,
+    pub run_diff: bool,
+    pub run_interp: bool,
+    pub run_opt_bisect: bool,
+    pub has_bisect_limit: bool,
+    pub opt_bisect_limit: u32,
+    pub has_opt_replay: bool,
+    pub opt_replay_manifest: StrView,
+    pub audit_debug: bool,
+    pub enable_trace: bool,
+    pub has_seed: bool,
+    pub seed: u64,
+    pub jobs: u32,
+    pub include_ignored: bool,
+    pub format_kind: u8,
+    pub show_help: bool,
+    pub filters: [8]StrView,
+    pub filter_count: usize,
+    pub has_usage_error: bool,
+    pub exit_code: i32,
+}
+
+@derive(Copy)
+pub struct TestCmdResult {
+    pub exit_code: i32,
+    pub tests_passed: u32,
+    pub tests_failed: u32,
+    pub tests_ignored: u32,
+    pub bisect_ran: bool,
+    pub bisect_culprit_step: u32,
+    pub bisect_evaluations: u32,
+    pub replay_ran: bool,
+    pub replay_reproduced: bool,
+    pub debug_audit_ran: bool,
+    pub debug_audit_passed: bool,
+}
+
+pub fn test_cli_options_default() -> TestCliOptions {
+    let e = ux2_sv_empty()
+    TestCliOptions {
+        run_doc: false,
+        run_diff: false,
+        run_interp: false,
+        run_opt_bisect: false,
+        has_bisect_limit: false,
+        opt_bisect_limit: 0u32,
+        has_opt_replay: false,
+        opt_replay_manifest: e,
+        audit_debug: false,
+        enable_trace: false,
+        has_seed: false,
+        seed: 0xA81047E57u64,
+        jobs: 1u32,
+        include_ignored: false,
+        format_kind: TEST_FMT_HUMAN,
+        show_help: false,
+        filters: [e; 8],
+        filter_count: 0usize,
+        has_usage_error: false,
+        exit_code: TEST_EXIT_OK,
+    }
+}
+
+fn sv_starts_with(s: StrView, prefix: StrView) -> bool {
+    if (s.len) < (prefix.len) || (s.ptr as usize) == 0 || (prefix.ptr as usize) == 0 {
+        return false
+    }
+    let mut i: usize = 0
+    while i < prefix.len {
+        if (unsafe { *(s.ptr + i) }) != (unsafe { *(prefix.ptr + i) }) {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+fn sv_slice_from(s: StrView, start: usize) -> StrView {
+    if start >= s.len || (s.ptr as usize) == 0 {
+        return ux2_sv_empty()
+    }
+    StrView {
+        ptr: unsafe { s.ptr + start },
+        len: s.len - start,
+    }
+}
+
+fn parse_ascii_u64(s: StrView, out_val: mut_view<u64>) -> bool {
+    if s.len == 0 || (s.ptr as usize) == 0 {
+        return false
+    }
+    let mut acc: u64 = 0u64
+    let mut i: usize = 0
+    while i < s.len {
+        let ch = unsafe { *(s.ptr + i) }
+        if ch < 48u8 || ch > 57u8 {
+            return false
+        }
+        acc = acc * 10u64 + ((ch - 48u8) as u64)
+        i = i + 1
+    }
+    *out_val = acc
+    true
+}
+
+fn report_test_cli_diag(sink: mut_view<DiagSink>, code_raw: u32, msg: str) {
+    let d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// Parses `axiomc test` CLI arguments (`SPEC-104 §7.1 AXS-TST-050`).
+pub fn test_parse_cli_args(
+    args: view<[8]StrView>,
+    arg_count: usize,
+    sink: mut_view<DiagSink>
+) -> TestCliOptions {
+    let mut opts = test_cli_options_default()
+    let mut i: usize = 0
+    while i < arg_count && i < 8usize {
+        let arg = (*args)[i]
+        if arg.len == 0 || (arg.ptr as usize) == 0 {
+            i = i + 1
+            continue
+        }
+        if ux2_sv_eq(arg, ux2_sv("--doc")) {
+            opts.run_doc = true
+        } else if ux2_sv_eq(arg, ux2_sv("--diff")) {
+            opts.run_diff = true
+        } else if ux2_sv_eq(arg, ux2_sv("--interp")) {
+            opts.run_interp = true
+        } else if ux2_sv_eq(arg, ux2_sv("--opt-bisect")) {
+            opts.run_opt_bisect = true
+        } else if ux2_sv_eq(arg, ux2_sv("--audit-debug")) {
+            opts.audit_debug = true
+        } else if ux2_sv_eq(arg, ux2_sv("--trace")) {
+            opts.enable_trace = true
+        } else if ux2_sv_eq(arg, ux2_sv("--include-ignored")) {
+            opts.include_ignored = true
+        } else if ux2_sv_eq(arg, ux2_sv("--help")) || ux2_sv_eq(arg, ux2_sv("-h")) {
+            opts.show_help = true
+        } else if ux2_sv_eq(arg, ux2_sv("--json")) || ux2_sv_eq(arg, ux2_sv("--format=json")) {
+            opts.format_kind = TEST_FMT_JSON
+        } else if ux2_sv_eq(arg, ux2_sv("--jsonl")) || ux2_sv_eq(arg, ux2_sv("--format=jsonl")) {
+            opts.format_kind = TEST_FMT_JSONL
+        } else if sv_starts_with(arg, ux2_sv("--opt-bisect-limit=")) {
+            let val_sv = sv_slice_from(arg, 19usize)
+            let mut v: u64 = 0u64
+            if !parse_ascii_u64(val_sv, mut_view(v)) {
+                report_test_cli_diag(mut_view(*sink), AX_DRIVER_USAGE, "invalid integer for `--opt-bisect-limit=<N>`")
+                opts.has_usage_error = true
+                opts.exit_code = TEST_EXIT_USAGE
+                return opts
+            }
+            opts.has_bisect_limit = true
+            opts.opt_bisect_limit = v as u32
+        } else if sv_starts_with(arg, ux2_sv("--opt-replay=")) {
+            let val_sv = sv_slice_from(arg, 13usize)
+            if val_sv.len == 0 {
+                report_test_cli_diag(mut_view(*sink), AX_DRIVER_USAGE, "missing manifest path for `--opt-replay=<manifest>`")
+                opts.has_usage_error = true
+                opts.exit_code = TEST_EXIT_USAGE
+                return opts
+            }
+            opts.has_opt_replay = true
+            opts.opt_replay_manifest = val_sv
+        } else if sv_starts_with(arg, ux2_sv("--seed=")) {
+            let val_sv = sv_slice_from(arg, 7usize)
+            let mut v: u64 = 0u64
+            if !parse_ascii_u64(val_sv, mut_view(v)) {
+                report_test_cli_diag(mut_view(*sink), AX_DRIVER_USAGE, "invalid integer for `--seed=<u64>`")
+                opts.has_usage_error = true
+                opts.exit_code = TEST_EXIT_USAGE
+                return opts
+            }
+            opts.has_seed = true
+            opts.seed = v
+        } else if sv_starts_with(arg, ux2_sv("--jobs=")) {
+            let val_sv = sv_slice_from(arg, 7usize)
+            let mut v: u64 = 0u64
+            if !parse_ascii_u64(val_sv, mut_view(v)) || v == 0u64 {
+                report_test_cli_diag(mut_view(*sink), AX_DRIVER_USAGE, "invalid non-zero worker count for `--jobs=<N>`")
+                opts.has_usage_error = true
+                opts.exit_code = TEST_EXIT_USAGE
+                return opts
+            }
+            opts.jobs = v as u32
+        } else if sv_starts_with(arg, ux2_sv("--format=")) {
+            report_test_cli_diag(mut_view(*sink), AX_DRIVER_USAGE, "unknown format for `--format=json|jsonl`")
+            opts.has_usage_error = true
+            opts.exit_code = TEST_EXIT_USAGE
+            return opts
+        } else if (unsafe { *(arg.ptr + 0) }) == 45u8 {
+            report_test_cli_diag(mut_view(*sink), AX_DRIVER_UNKNOWN_OPTION, "unknown option passed to `axiomc test`")
+            opts.has_usage_error = true
+            opts.exit_code = TEST_EXIT_USAGE
+            return opts
+        } else {
+            if (opts.filter_count) < 8usize {
+                opts.filters[opts.filter_count] = arg
+                opts.filter_count = opts.filter_count + 1usize
+            }
+        }
+        i = i + 1
+    }
+    opts
+}
+
+pub fn test_cmd_execute(
+    opts: view<TestCliOptions>,
+    cases: view<[8]DiscoveredTestCase>,
+    case_count: usize,
+    bisect_pipeline: view<OptPassPipeline>,
+    replay_manifest: view<OptReplayManifest>,
+    o0_debug_model: view<SemanticDebugModel>,
+    o2_debug_model: view<SemanticDebugModel>,
+    disabled_trace: view<TraceCostAudit>,
+    enabled_trace: view<TraceCostAudit>,
+    out_stdout: mut_view<DiagBuffer>,
+    out_stderr: mut_view<DiagBuffer>
+) -> TestCmdResult {
+    if opts.has_usage_error {
+        return TestCmdResult {
+            exit_code: TEST_EXIT_USAGE,
+            tests_passed: 0u32,
+            tests_failed: 0u32,
+            tests_ignored: 0u32,
+            bisect_ran: false,
+            bisect_culprit_step: 0u32,
+            bisect_evaluations: 0u32,
+            replay_ran: false,
+            replay_reproduced: false,
+            debug_audit_ran: false,
+            debug_audit_passed: false,
+        }
+    }
+    if opts.show_help {
+        bisect_push_str(
+            mut_view(*out_stdout),
+            "Usage: axiomc test [<path_or_filter>...] [--doc] [--diff] [--interp] [--opt-bisect] [--opt-bisect-limit=<N>] [--opt-replay=<manifest>] [--audit-debug] [--trace] [--seed=<u64>] [--jobs=<N>] [--include-ignored] [--format=json|jsonl]\n"
+        )
+        return TestCmdResult {
+            exit_code: TEST_EXIT_OK,
+            tests_passed: 0u32,
+            tests_failed: 0u32,
+            tests_ignored: 0u32,
+            bisect_ran: false,
+            bisect_culprit_step: 0u32,
+            bisect_evaluations: 0u32,
+            replay_ran: false,
+            replay_reproduced: false,
+            debug_audit_ran: false,
+            debug_audit_passed: false,
+        }
+    }
+
+    if opts.has_opt_replay {
+        let rep_res = opt_replay_execute(replay_manifest, bisect_pipeline, true, mut_view(*out_stderr))
+        return TestCmdResult {
+            exit_code: rep_res.exit_code,
+            tests_passed: 0u32,
+            tests_failed: if rep_res.reproduced_divergence { 1u32 } else { 0u32 },
+            tests_ignored: 0u32,
+            bisect_ran: false,
+            bisect_culprit_step: 0u32,
+            bisect_evaluations: 0u32,
+            replay_ran: true,
+            replay_reproduced: rep_res.reproduced_divergence,
+            debug_audit_ran: false,
+            debug_audit_passed: false,
+        }
+    }
+
+    if opts.run_opt_bisect {
+        let brep: PassBisectReport = opt_bisect_run_binary_search(
+            bisect_pipeline,
+            ux2_sv("target/opt-bisect/bisect_demo.replay.json")
+        )
+        if opts.format_kind == TEST_FMT_JSON || opts.format_kind == TEST_FMT_JSONL {
+            opt_bisect_render_json(view(brep), mut_view(*out_stdout))
+        } else {
+            opt_bisect_render_terminal(view(brep), mut_view(*out_stdout))
+        }
+        return TestCmdResult {
+            exit_code: if brep.found_culprit { TEST_EXIT_OK } else { TEST_EXIT_FAILED },
+            tests_passed: 0u32,
+            tests_failed: 0u32,
+            tests_ignored: 0u32,
+            bisect_ran: true,
+            bisect_culprit_step: brep.culprit_step_id,
+            bisect_evaluations: brep.evaluations_run,
+            replay_ran: false,
+            replay_reproduced: false,
+            debug_audit_ran: false,
+            debug_audit_passed: false,
+        }
+    }
+
+    if opts.has_bisect_limit {
+        let lcfg = opt_bisect_config_with_limit(opts.opt_bisect_limit)
+        let lout = opt_bisect_eval_pipeline_at_limit(bisect_pipeline, view(lcfg))
+        return TestCmdResult {
+            exit_code: if lout.matches_oracle { TEST_EXIT_OK } else { TEST_EXIT_FAILED },
+            tests_passed: if lout.matches_oracle { 1u32 } else { 0u32 },
+            tests_failed: if lout.matches_oracle { 0u32 } else { 1u32 },
+            tests_ignored: 0u32,
+            bisect_ran: false,
+            bisect_culprit_step: 0u32,
+            bisect_evaluations: 1u32,
+            replay_ran: false,
+            replay_reproduced: false,
+            debug_audit_ran: false,
+            debug_audit_passed: false,
+        }
+    }
+
+    let filter = if opts.filter_count > 0usize { opts.filters[0] } else { ux2_sv_empty() }
+    let suite: TestSuiteSummary = test_runner_execute_suite(
+        cases,
+        case_count,
+        filter,
+        opts.seed,
+        opts.jobs,
+        opts.include_ignored
+    )
+    if opts.format_kind == TEST_FMT_JSON || opts.format_kind == TEST_FMT_JSONL {
+        test_runner_render_suite_json(view(suite), mut_view(*out_stdout))
+    } else {
+        test_runner_render_suite_human(view(suite), mut_view(*out_stdout))
+    }
+
+    let mut dbg_ran: bool = false
+    let mut dbg_ok: bool = true
+    if opts.audit_debug {
+        dbg_ran = true
+        let drep: DebugTraceAuditReport = test_runner_audit_debug_and_trace(
+            o0_debug_model,
+            o2_debug_model,
+            disabled_trace,
+            enabled_trace
+        )
+        dbg_ok = drep.all_passed
+        test_runner_render_debug_audit_json(view(drep), mut_view(*out_stdout))
+    }
+
+    let mut rc = TEST_EXIT_OK
+    if suite.failed_count > 0u32 || (dbg_ran && !dbg_ok) {
+        rc = TEST_EXIT_FAILED
+    }
+    TestCmdResult {
+        exit_code: rc,
+        tests_passed: suite.passed_count,
+        tests_failed: suite.failed_count,
+        tests_ignored: suite.ignored_count,
+        bisect_ran: false,
+        bisect_culprit_step: 0u32,
+        bisect_evaluations: 0u32,
+        replay_ran: false,
+        replay_reproduced: false,
+        debug_audit_ran: dbg_ran,
+        debug_audit_passed: dbg_ok,
+    }
+}

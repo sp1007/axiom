@@ -8,13 +8,13 @@ model: opus
 gate_model: sonnet
 depends: [T219, T752, T755, T756, T759, T816]
 priority: 208
-status: doing
+status: done
 attempts: 1
 paths: [compiler/test_runner, compiler/opt/bisect, compiler/driver/test_cmd, tests/run/test_ux]
 spec: [spec/SPEC-104-docgen-test-framework-ux.md, 0120, 0121, 0147, 0161, 0163, tasks/0361, tasks/0418, tasks/0423, tasks/0662]
 covers: [REQ-TOOL-002, REQ-TOOL-003, REQ-TOOL-005, REQ-TOOL-006, REQ-TOOL-007, REQ-TOOL-008, REQ-TOOL-009, REQ-TOOL-010, REQ-TOOL-011, REQ-TOOL-179, REQ-TST-112]
 started: 2026-11-08 17:46:44
-agent: T818-impl
+finished: 2026-11-08 18:18:33
 ---
 # T818 — E19.5 Test runner UX 2.0 (axiomc test), MIR differential harness, optimization pass replay/bisection & debug/trace audit
 
@@ -43,3 +43,4 @@ Implement `axiomc test` UX 2.0, integrated MIR interpreter differential validati
 ## Log
 - 2026-11-03 09:50:00 created by T219 (P19 phase planning)
 - 2026-11-08 17:46:44 started (attempt 1) T818-impl
+- 2026-11-08 18:18:33 accepted by QA -> done

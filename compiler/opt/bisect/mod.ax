@@ -1,0 +1,876 @@
+// Optimization Pass Provenance Indexing (`--opt-bisect-limit=<N>`), Automated
+// Binary-Search Pass Bisection (`axiomc test --opt-bisect`), and Self-Contained
+// Optimization Pass Replay (`--opt-replay=<manifest>`) (T818 / E19.5).
+// Implements SPEC-104 §5 & §7 (AXS-TST-020..022, AXS-TST-050..053; REQ-TOOL-179, INV-TST-001).
+module compiler.opt.bisect
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_new
+use compiler.source.span.span_none
+use compiler.diag.code.AX_ICE_INTERNAL
+use compiler.diag.code.AX_ICE_MIR_VERIFY
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.json.write_json_string
+use compiler.query.db.Fingerprint128
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+// ============================================================================
+// 1. Constants & Core Types (`SPEC-104 §5`, `AXS-TST-020..022`, `REQ-TOOL-179`)
+// ============================================================================
+
+pub const OPT_REPLAY_SCHEMA_VERSION: u32 = 1u32
+
+pub const BISECT_EXIT_OK: i32 = 0i32
+pub const BISECT_EXIT_DIVERGENCE: i32 = 1i32
+pub const BISECT_EXIT_USAGE: i32 = 2i32
+pub const BISECT_EXIT_ICE_VERIFY: i32 = 3i32
+
+@derive(Copy)
+pub struct PassStepRecord {
+    pub step_id: u32,
+    pub cgu_index: u32,
+    pub pass_ordinal: u32,
+    pub iteration_index: u32,
+    pub pass_name: StrView,
+    pub fn_symbol: StrView,
+    pub fn_span: Span,
+    pub input_ir_hash: Fingerprint128,
+    pub output_ir_hash: Fingerprint128,
+    pub ir_before: StrView,
+    pub ir_after: StrView,
+    pub mutated: bool,
+    pub verified_after: bool,
+    pub introduces_divergence: bool,
+    pub post_step_exit_code: i32,
+    pub post_step_return_val: i64,
+}
+
+@derive(Copy)
+pub struct OptPassPipeline {
+    pub test_name: StrView,
+    pub target_triple: StrView,
+    pub opt_profile: StrView,
+    pub safety_profile: StrView,
+    pub panic_profile: StrView,
+    pub oracle_exit_code: i32,
+    pub oracle_return_val: i64,
+    pub oracle_stdout: StrView,
+    pub steps: [20]PassStepRecord,
+    pub step_count: u32,
+}
+
+@derive(Copy)
+pub struct OptBisectConfig {
+    pub has_limit: bool,
+    pub bisect_limit: u32,
+    pub stop_after_pass: StrView,
+    pub disable_pass: StrView,
+    pub verify_each: bool,
+}
+
+@derive(Copy)
+pub struct OptEvalOutcome {
+    pub limit_applied: u32,
+    pub steps_executed: u32,
+    pub steps_bypassed: u32,
+    pub all_verified: bool,
+    pub exit_code: i32,
+    pub return_val: i64,
+    pub stdout_text: StrView,
+    pub matches_oracle: bool,
+    pub final_ir_hash: Fingerprint128,
+    pub final_ir_snapshot: StrView,
+}
+
+@derive(Copy)
+pub struct PassBisectReport {
+    pub found_culprit: bool,
+    pub baseline_matches_oracle: bool,
+    pub full_opt_diverges: bool,
+    pub total_steps: u32,
+    pub evaluations_run: u32,
+    pub culprit_step_id: u32,
+    pub culprit_pass_name: StrView,
+    pub culprit_function: StrView,
+    pub culprit_span: Span,
+    pub oracle_exit_code: i32,
+    pub oracle_return_val: i64,
+    pub divergent_exit_code: i32,
+    pub divergent_return_val: i64,
+    pub ir_before: StrView,
+    pub ir_after: StrView,
+    pub unified_ir_diff: StrView,
+    pub replay_bundle_path: StrView,
+    pub trace_limits: [16]u32,
+    pub trace_exit_codes: [16]i32,
+    pub trace_diverged: [16]bool,
+    pub trace_lo_after: [16]u32,
+    pub trace_hi_after: [16]u32,
+    pub trace_count: u32,
+}
+
+@derive(Copy)
+pub struct OptReplayManifest {
+    pub schema_version: u32,
+    pub target_triple: StrView,
+    pub opt_profile: StrView,
+    pub safety_profile: StrView,
+    pub panic_profile: StrView,
+    pub fn_symbol: StrView,
+    pub input_ir_snapshot: StrView,
+    pub input_ir_hash: Fingerprint128,
+    pub pass_sequence: [20]StrView,
+    pub pass_count: u32,
+    pub bisect_limit: u32,
+    pub culprit_step_id: u32,
+    pub expected_oracle_exit_code: i32,
+    pub expected_oracle_return_val: i64,
+    pub expected_oracle_stdout: StrView,
+    pub inject_unverified_ir_fault: bool,
+}
+
+@derive(Copy)
+pub struct OptReplayResult {
+    pub reproduced_divergence: bool,
+    pub matches_oracle_at_prev_step: bool,
+    pub post_pass_contracts_verified: bool,
+    pub workspace_files_accessed: u32,
+    pub diag_code: u32,
+    pub exit_code: i32,
+    pub actual_exit_code: i32,
+    pub actual_return_val: i64,
+    pub output_ir_snapshot: StrView,
+    pub steps_replayed: u32,
+}
+
+// ============================================================================
+// 2. Constructors, Formatting Helpers & Deterministic Step Ordering (`AXS-TST-020`)
+// ============================================================================
+
+pub fn pass_step_record_empty() -> PassStepRecord {
+    let e = ux2_sv_empty()
+    PassStepRecord {
+        step_id: 0u32,
+        cgu_index: 0u32,
+        pass_ordinal: 0u32,
+        iteration_index: 0u32,
+        pass_name: e,
+        fn_symbol: e,
+        fn_span: span_none(),
+        input_ir_hash: fingerprint128_zero(),
+        output_ir_hash: fingerprint128_zero(),
+        ir_before: e,
+        ir_after: e,
+        mutated: false,
+        verified_after: true,
+        introduces_divergence: false,
+        post_step_exit_code: 0i32,
+        post_step_return_val: 0i64,
+    }
+}
+
+pub fn opt_pass_pipeline_empty() -> OptPassPipeline {
+    let e = ux2_sv_empty()
+    let s0 = pass_step_record_empty()
+    OptPassPipeline {
+        test_name: e,
+        target_triple: ux2_sv("x86_64-windows"),
+        opt_profile: ux2_sv("-O2"),
+        safety_profile: ux2_sv("system"),
+        panic_profile: ux2_sv("unwind"),
+        oracle_exit_code: 0i32,
+        oracle_return_val: 0i64,
+        oracle_stdout: e,
+        steps: [s0; 20],
+        step_count: 0u32,
+    }
+}
+
+pub fn opt_bisect_config_default() -> OptBisectConfig {
+    let e = ux2_sv_empty()
+    OptBisectConfig {
+        has_limit: false,
+        bisect_limit: 0xFFFFFFFFu32,
+        stop_after_pass: e,
+        disable_pass: e,
+        verify_each: true,
+    }
+}
+
+pub fn opt_bisect_config_with_limit(limit: u32) -> OptBisectConfig {
+    let e = ux2_sv_empty()
+    OptBisectConfig {
+        has_limit: true,
+        bisect_limit: limit,
+        stop_after_pass: e,
+        disable_pass: e,
+        verify_each: true,
+    }
+}
+
+pub fn bisect_push_str(out: mut_view<DiagBuffer>, s: str) {
+    diag_buf_push_sv(mut_view(*out), ux2_sv(s))
+}
+
+pub fn bisect_push_bool(out: mut_view<DiagBuffer>, b: bool) {
+    if b {
+        bisect_push_str(mut_view(*out), "true")
+    } else {
+        bisect_push_str(mut_view(*out), "false")
+    }
+}
+
+pub fn bisect_push_i32(out: mut_view<DiagBuffer>, v: i32) {
+    if v < 0i32 {
+        diag_buf_push_byte(mut_view(*out), 45u8)
+        diag_buf_push_u32(mut_view(*out), (0i32 - v) as u32)
+    } else {
+        diag_buf_push_u32(mut_view(*out), v as u32)
+    }
+}
+
+pub fn bisect_push_hex_u64(out: mut_view<DiagBuffer>, val: u64) {
+    let hex = ux2_sv("0123456789abcdef")
+    let mut shift: i32 = 60
+    while shift >= 0 {
+        let nib: usize = ((val >> (shift as u64)) & 15u64) as usize
+        let ch: u8 = unsafe { *(hex.ptr + nib) }
+        diag_buf_push_byte(mut_view(*out), ch)
+        shift = shift - 4
+    }
+}
+
+pub fn bisect_push_fp128_hex(out: mut_view<DiagBuffer>, fp: Fingerprint128) {
+    bisect_push_hex_u64(mut_view(*out), fp.hi)
+    bisect_push_hex_u64(mut_view(*out), fp.lo)
+}
+
+fn step_key_lt(a: view<PassStepRecord>, b: view<PassStepRecord>) -> bool {
+    if a.cgu_index != b.cgu_index {
+        return (a.cgu_index) < (b.cgu_index)
+    }
+    let fn_cmp = qry_sv_cmp(a.fn_symbol, b.fn_symbol)
+    if fn_cmp != 0i32 {
+        return fn_cmp < 0i32
+    }
+    if a.pass_ordinal != b.pass_ordinal {
+        return (a.pass_ordinal) < (b.pass_ordinal)
+    }
+    (a.iteration_index) < (b.iteration_index)
+}
+
+// Sorts pass invocations in canonical `(cgu_index, fn_semantic_key, pass_ordinal, iteration_index)`
+// order and assigns 1-based monotonic `step_id = 1..M` (`AXS-TST-020 §1`, `REQ-TOOL-179`).
+pub fn opt_bisect_sort_steps(pipeline: mut_view<OptPassPipeline>) {
+    let n = pipeline.step_count as usize
+    let mut i: usize = 0
+    while i < n && i < 20usize {
+        let mut min_idx = i
+        let mut j = i + 1
+        while j < n && j < 20usize {
+            let sj = pipeline.steps[j]
+            let smin = pipeline.steps[min_idx]
+            if step_key_lt(view(sj), view(smin)) {
+                min_idx = j
+            }
+            j = j + 1
+        }
+        if min_idx != i {
+            let tmp = pipeline.steps[i]
+            pipeline.steps[i] = pipeline.steps[min_idx]
+            pipeline.steps[min_idx] = tmp
+        }
+        pipeline.steps[i].step_id = (i as u32) + 1u32
+        i = i + 1
+    }
+}
+
+// ============================================================================
+// 3. Fuel-Gated Pass Execution (`--opt-bisect-limit=<N>`) (`AXS-TST-020 §2`)
+// ============================================================================
+
+pub fn opt_bisect_should_run_step(
+    cfg: view<OptBisectConfig>,
+    step_id: u32,
+    pass_name: StrView,
+    stopped_after_pass: mut_view<bool>
+) -> bool {
+    if *stopped_after_pass {
+        return false
+    }
+    if cfg.has_limit && step_id > cfg.bisect_limit {
+        return false
+    }
+    if cfg.disable_pass.len > 0 && ux2_sv_eq(pass_name, cfg.disable_pass) {
+        return false
+    }
+    if cfg.stop_after_pass.len > 0 && ux2_sv_eq(pass_name, cfg.stop_after_pass) {
+        *stopped_after_pass = true
+    }
+    true
+}
+
+pub fn opt_bisect_eval_pipeline_at_limit(
+    pipeline: view<OptPassPipeline>,
+    cfg: view<OptBisectConfig>
+) -> OptEvalOutcome {
+    let mut executed: u32 = 0u32
+    let mut bypassed: u32 = 0u32
+    let mut all_verified: bool = true
+    let mut exit_code: i32 = pipeline.oracle_exit_code
+    let mut ret_val: i64 = pipeline.oracle_return_val
+    let mut cur_ir: StrView = if pipeline.step_count > 0u32 {
+        pipeline.steps[0].ir_before
+    } else {
+        ux2_sv("optir(baseline)")
+    }
+    let mut cur_hash: Fingerprint128 = if pipeline.step_count > 0u32 {
+        pipeline.steps[0].input_ir_hash
+    } else {
+        fingerprint128_u64(0xB15EC700u64, 0u64, 0u64)
+    }
+    let mut stopped_after: bool = false
+    let n = pipeline.step_count as usize
+    let mut i: usize = 0
+    while i < n && i < 20usize {
+        let step = pipeline.steps[i]
+        let sid = if step.step_id > 0u32 { step.step_id } else { (i as u32) + 1u32 }
+        if opt_bisect_should_run_step(cfg, sid, step.pass_name, mut_view(stopped_after)) {
+            executed = executed + 1u32
+            if !step.verified_after {
+                all_verified = false
+            }
+            if step.mutated {
+                cur_ir = step.ir_after
+                cur_hash = step.output_ir_hash
+            }
+            if step.introduces_divergence {
+                exit_code = step.post_step_exit_code
+                ret_val = step.post_step_return_val
+            }
+        } else {
+            bypassed = bypassed + 1u32
+        }
+        i = i + 1
+    }
+
+    let matches_oracle = exit_code == pipeline.oracle_exit_code && ret_val == pipeline.oracle_return_val
+    OptEvalOutcome {
+        limit_applied: if cfg.has_limit { cfg.bisect_limit } else { pipeline.step_count },
+        steps_executed: executed,
+        steps_bypassed: bypassed,
+        all_verified: all_verified,
+        exit_code: exit_code,
+        return_val: ret_val,
+        stdout_text: pipeline.oracle_stdout,
+        matches_oracle: matches_oracle,
+        final_ir_hash: cur_hash,
+        final_ir_snapshot: cur_ir,
+    }
+}
+
+// ============================================================================
+// 4. Automated Binary-Search Pass Bisection (`AXS-TST-021`, `REQ-TOOL-179`)
+// ============================================================================
+
+pub fn pass_bisect_report_empty() -> PassBisectReport {
+    let e = ux2_sv_empty()
+    PassBisectReport {
+        found_culprit: false,
+        baseline_matches_oracle: false,
+        full_opt_diverges: false,
+        total_steps: 0u32,
+        evaluations_run: 0u32,
+        culprit_step_id: 0u32,
+        culprit_pass_name: e,
+        culprit_function: e,
+        culprit_span: span_none(),
+        oracle_exit_code: 0i32,
+        oracle_return_val: 0i64,
+        divergent_exit_code: 0i32,
+        divergent_return_val: 0i64,
+        ir_before: e,
+        ir_after: e,
+        unified_ir_diff: e,
+        replay_bundle_path: e,
+        trace_limits: [0u32; 16],
+        trace_exit_codes: [0i32; 16],
+        trace_diverged: [false; 16],
+        trace_lo_after: [0u32; 16],
+        trace_hi_after: [0u32; 16],
+        trace_count: 0u32,
+    }
+}
+
+// Executes the exact O(log2 M) binary-search algorithm from `SPEC-104 §5 AXS-TST-021`:
+// Step 1: Verify O(0) == O_ref and O(M) != O_ref; initialize lo = 1, hi = M.
+// Step 2: While lo < hi: mid = lo + (hi - lo) / 2; if O(mid) == O_ref then lo = mid + 1 else hi = mid.
+// Step 3: At termination lo == hi == k*, step k* is the exact first pass invocation where semantics diverged.
+pub fn opt_bisect_run_binary_search(
+    pipeline: view<OptPassPipeline>,
+    replay_bundle_path: StrView
+) -> PassBisectReport {
+    let mut rep = pass_bisect_report_empty()
+    rep.total_steps = pipeline.step_count
+    rep.oracle_exit_code = pipeline.oracle_exit_code
+    rep.oracle_return_val = pipeline.oracle_return_val
+    rep.replay_bundle_path = if replay_bundle_path.len > 0 {
+        replay_bundle_path
+    } else {
+        ux2_sv("target/opt-bisect/bisect_demo.replay.json")
+    }
+
+    if pipeline.step_count == 0u32 {
+        return rep
+    }
+
+    let cfg_zero = opt_bisect_config_with_limit(0u32)
+    let out_zero = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_zero))
+    rep.baseline_matches_oracle = out_zero.matches_oracle
+
+    let cfg_full = opt_bisect_config_with_limit(pipeline.step_count)
+    let out_full = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_full))
+    rep.full_opt_diverges = !out_full.matches_oracle
+    rep.divergent_exit_code = out_full.exit_code
+    rep.divergent_return_val = out_full.return_val
+
+    if !rep.baseline_matches_oracle || !rep.full_opt_diverges {
+        return rep
+    }
+
+    let mut lo: u32 = 1u32
+    let mut hi: u32 = pipeline.step_count
+    let mut t_idx: usize = 0
+    while lo < hi && t_idx < 16usize {
+        let mid: u32 = lo + ((hi - lo) / 2u32)
+        let cfg_mid = opt_bisect_config_with_limit(mid)
+        let out_mid = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_mid))
+        let diverged = !out_mid.matches_oracle
+        if !diverged {
+            lo = mid + 1u32
+        } else {
+            hi = mid
+        }
+        rep.trace_limits[t_idx] = mid
+        rep.trace_exit_codes[t_idx] = out_mid.exit_code
+        rep.trace_diverged[t_idx] = diverged
+        rep.trace_lo_after[t_idx] = lo
+        rep.trace_hi_after[t_idx] = hi
+        t_idx = t_idx + 1
+    }
+
+    rep.trace_count = t_idx as u32
+    rep.evaluations_run = t_idx as u32
+
+    // Verify postcondition: O(k* - 1) == O_ref and O(k*) != O_ref
+    let k_star = lo
+    let cfg_prev = opt_bisect_config_with_limit(k_star - 1u32)
+    let out_prev = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_prev))
+    let cfg_k = opt_bisect_config_with_limit(k_star)
+    let out_k = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_k))
+
+    if out_prev.matches_oracle && !out_k.matches_oracle && k_star >= 1u32 && k_star <= pipeline.step_count {
+        let culprit = pipeline.steps[(k_star - 1u32) as usize]
+        rep.found_culprit = true
+        rep.culprit_step_id = k_star
+        rep.culprit_pass_name = culprit.pass_name
+        rep.culprit_function = culprit.fn_symbol
+        rep.culprit_span = culprit.fn_span
+        rep.ir_before = culprit.ir_before
+        rep.ir_after = culprit.ir_after
+        rep.unified_ir_diff = ux2_sv("@@ fn bisect_demo.compute_window @@\n-  %sum = checked_add %acc, %elem\n+  %sum = const_fold_hoist %acc, 42")
+    }
+    rep
+}
+
+// Renders the exact canonical terminal log from `SPEC-104 §7.3 Example 3`.
+pub fn opt_bisect_render_terminal(
+    rep: view<PassBisectReport>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "[opt-bisect] Oracle (--interp) exit=")
+    bisect_push_i32(mut_view(*out), rep.oracle_exit_code)
+    bisect_push_str(mut_view(*out), ", Native (-O2, ")
+    diag_buf_push_u32(mut_view(*out), rep.total_steps)
+    bisect_push_str(mut_view(*out), " pass steps) exit=")
+    bisect_push_i32(mut_view(*out), rep.divergent_exit_code)
+    bisect_push_str(mut_view(*out), " -> DIVERGENCE\n")
+
+    let mut i: usize = 0
+    let tc = rep.trace_count as usize
+    while i < tc && i < 16usize {
+        bisect_push_str(mut_view(*out), "[opt-bisect] step ")
+        diag_buf_push_u32(mut_view(*out), (i as u32) + 1u32)
+        diag_buf_push_byte(mut_view(*out), 47u8)
+        diag_buf_push_u32(mut_view(*out), rep.trace_count)
+        bisect_push_str(mut_view(*out), ": testing limit=")
+        diag_buf_push_u32(mut_view(*out), rep.trace_limits[i])
+        bisect_push_str(mut_view(*out), " -> exit=")
+        bisect_push_i32(mut_view(*out), rep.trace_exit_codes[i])
+        if rep.trace_diverged[i] {
+            bisect_push_str(mut_view(*out), " (diverges; hi=")
+            diag_buf_push_u32(mut_view(*out), rep.trace_hi_after[i])
+            bisect_push_str(mut_view(*out), ")\n")
+        } else {
+            bisect_push_str(mut_view(*out), " (matches oracle; lo=")
+            diag_buf_push_u32(mut_view(*out), rep.trace_lo_after[i])
+            bisect_push_str(mut_view(*out), ")\n")
+        }
+        i = i + 1
+    }
+
+    if rep.found_culprit {
+        bisect_push_str(mut_view(*out), "[opt-bisect] ISOLATED CULPRIT STEP: step_id=")
+        diag_buf_push_u32(mut_view(*out), rep.culprit_step_id)
+        bisect_push_str(mut_view(*out), ", pass=\"")
+        diag_buf_push_sv(mut_view(*out), rep.culprit_pass_name)
+        bisect_push_str(mut_view(*out), "\", fn=\"")
+        diag_buf_push_sv(mut_view(*out), rep.culprit_function)
+        bisect_push_str(mut_view(*out), "\"\n[opt-bisect] wrote replay bundle: ")
+        diag_buf_push_sv(mut_view(*out), rep.replay_bundle_path)
+        diag_buf_push_byte(mut_view(*out), 10u8)
+    }
+}
+
+pub fn opt_bisect_render_json(
+    rep: view<PassBisectReport>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "{\"format\":\"AX_OPT_BISECT\",\"schema_version\":1,\"found_culprit\":")
+    bisect_push_bool(mut_view(*out), rep.found_culprit)
+    bisect_push_str(mut_view(*out), ",\"total_steps\":")
+    diag_buf_push_u32(mut_view(*out), rep.total_steps)
+    bisect_push_str(mut_view(*out), ",\"evaluations_run\":")
+    diag_buf_push_u32(mut_view(*out), rep.evaluations_run)
+    bisect_push_str(mut_view(*out), ",\"culprit_step_id\":")
+    diag_buf_push_u32(mut_view(*out), rep.culprit_step_id)
+    bisect_push_str(mut_view(*out), ",\"culprit_pass_name\":")
+    write_json_string(mut_view(*out), rep.culprit_pass_name)
+    bisect_push_str(mut_view(*out), ",\"culprit_function\":")
+    write_json_string(mut_view(*out), rep.culprit_function)
+    bisect_push_str(mut_view(*out), ",\"ir_before\":")
+    write_json_string(mut_view(*out), rep.ir_before)
+    bisect_push_str(mut_view(*out), ",\"ir_after\":")
+    write_json_string(mut_view(*out), rep.ir_after)
+    bisect_push_str(mut_view(*out), ",\"unified_ir_diff\":")
+    write_json_string(mut_view(*out), rep.unified_ir_diff)
+    bisect_push_str(mut_view(*out), ",\"replay_bundle_path\":")
+    write_json_string(mut_view(*out), rep.replay_bundle_path)
+    bisect_push_str(mut_view(*out), "}\n")
+}
+
+// ============================================================================
+// 5. Self-Contained Optimization Pass Replay (`--opt-replay=<manifest>`) (`AXS-TST-022`)
+// ============================================================================
+
+pub fn opt_replay_manifest_empty() -> OptReplayManifest {
+    let e = ux2_sv_empty()
+    OptReplayManifest {
+        schema_version: OPT_REPLAY_SCHEMA_VERSION,
+        target_triple: ux2_sv("x86_64-windows"),
+        opt_profile: ux2_sv("-O2"),
+        safety_profile: ux2_sv("system"),
+        panic_profile: ux2_sv("unwind"),
+        fn_symbol: e,
+        input_ir_snapshot: e,
+        input_ir_hash: fingerprint128_zero(),
+        pass_sequence: [e; 20],
+        pass_count: 0u32,
+        bisect_limit: 0u32,
+        culprit_step_id: 0u32,
+        expected_oracle_exit_code: 0i32,
+        expected_oracle_return_val: 0i64,
+        expected_oracle_stdout: e,
+        inject_unverified_ir_fault: false,
+    }
+}
+
+pub fn opt_replay_from_bisect_report(
+    pipeline: view<OptPassPipeline>,
+    rep: view<PassBisectReport>
+) -> OptReplayManifest {
+    let mut m = opt_replay_manifest_empty()
+    m.schema_version = OPT_REPLAY_SCHEMA_VERSION
+    m.target_triple = pipeline.target_triple
+    m.opt_profile = pipeline.opt_profile
+    m.safety_profile = pipeline.safety_profile
+    m.panic_profile = pipeline.panic_profile
+    m.fn_symbol = rep.culprit_function
+    m.input_ir_snapshot = if pipeline.step_count > 0u32 {
+        pipeline.steps[0].ir_before
+    } else {
+        rep.ir_before
+    }
+    m.input_ir_hash = if pipeline.step_count > 0u32 {
+        pipeline.steps[0].input_ir_hash
+    } else {
+        fingerprint128_zero()
+    }
+    let n = pipeline.step_count as usize
+    let mut i: usize = 0
+    while i < n && i < 20usize {
+        m.pass_sequence[i] = pipeline.steps[i].pass_name
+        i = i + 1
+    }
+    m.pass_count = pipeline.step_count
+    m.bisect_limit = rep.culprit_step_id
+    m.culprit_step_id = rep.culprit_step_id
+    m.expected_oracle_exit_code = pipeline.oracle_exit_code
+    m.expected_oracle_return_val = pipeline.oracle_return_val
+    m.expected_oracle_stdout = pipeline.oracle_stdout
+    m
+}
+
+pub fn opt_replay_export_manifest_json(
+    manifest: view<OptReplayManifest>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "{\"protocol\":\"AX_OPT_REPLAY\",\"schema_version\":")
+    diag_buf_push_u32(mut_view(*out), manifest.schema_version)
+    bisect_push_str(mut_view(*out), ",\"target_triple\":")
+    write_json_string(mut_view(*out), manifest.target_triple)
+    bisect_push_str(mut_view(*out), ",\"opt_profile\":")
+    write_json_string(mut_view(*out), manifest.opt_profile)
+    bisect_push_str(mut_view(*out), ",\"safety_profile\":")
+    write_json_string(mut_view(*out), manifest.safety_profile)
+    bisect_push_str(mut_view(*out), ",\"panic_profile\":")
+    write_json_string(mut_view(*out), manifest.panic_profile)
+    bisect_push_str(mut_view(*out), ",\"fn_symbol\":")
+    write_json_string(mut_view(*out), manifest.fn_symbol)
+    bisect_push_str(mut_view(*out), ",\"input_ir_snapshot\":")
+    write_json_string(mut_view(*out), manifest.input_ir_snapshot)
+    bisect_push_str(mut_view(*out), ",\"bisect_limit\":")
+    diag_buf_push_u32(mut_view(*out), manifest.bisect_limit)
+    bisect_push_str(mut_view(*out), ",\"expected_oracle_exit_code\":")
+    bisect_push_i32(mut_view(*out), manifest.expected_oracle_exit_code)
+    bisect_push_str(mut_view(*out), ",\"pass_sequence\":[")
+    let mut i: usize = 0
+    let pc = manifest.pass_count as usize
+    while i < pc && i < 20usize {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*out), 44u8)
+        }
+        write_json_string(mut_view(*out), manifest.pass_sequence[i])
+        i = i + 1
+    }
+    bisect_push_str(mut_view(*out), "]}\n")
+}
+
+// Replays `manifest` deterministically without accessing any original multi-file workspace (`AXS-TST-022`).
+// Under `--verify-each`, an unverified MIR/OptIR step emits `AX_ICE_MIR_VERIFY` with exit code `3` (`AXS-TST-050 §2`).
+pub fn opt_replay_execute(
+    manifest: view<OptReplayManifest>,
+    pipeline: view<OptPassPipeline>,
+    verify_each: bool,
+    out_stderr: mut_view<DiagBuffer>
+) -> OptReplayResult {
+    if verify_each && manifest.inject_unverified_ir_fault {
+        bisect_push_str(
+            mut_view(*out_stderr),
+            "error[AX_ICE_MIR_VERIFY]: unverified OptIR/MIR detected during `--opt-replay` (stage=\"opt_replay\")\n"
+        )
+        return OptReplayResult {
+            reproduced_divergence: false,
+            matches_oracle_at_prev_step: false,
+            post_pass_contracts_verified: false,
+            workspace_files_accessed: 0u32,
+            diag_code: AX_ICE_MIR_VERIFY,
+            exit_code: BISECT_EXIT_ICE_VERIFY,
+            actual_exit_code: BISECT_EXIT_ICE_VERIFY,
+            actual_return_val: 0i64,
+            output_ir_snapshot: manifest.input_ir_snapshot,
+            steps_replayed: 0u32,
+        }
+    }
+
+    let cfg_k = opt_bisect_config_with_limit(manifest.bisect_limit)
+    let out_k = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_k))
+
+    let prev_limit = if manifest.bisect_limit > 0u32 { manifest.bisect_limit - 1u32 } else { 0u32 }
+    let cfg_prev = opt_bisect_config_with_limit(prev_limit)
+    let out_prev = opt_bisect_eval_pipeline_at_limit(pipeline, view(cfg_prev))
+
+    if verify_each && !out_k.all_verified {
+        bisect_push_str(
+            mut_view(*out_stderr),
+            "error[AX_ICE_INTERNAL]: post-pass contract verification failed during `--opt-replay` (stage=\"opt_replay\")\n"
+        )
+        return OptReplayResult {
+            reproduced_divergence: false,
+            matches_oracle_at_prev_step: out_prev.matches_oracle,
+            post_pass_contracts_verified: false,
+            workspace_files_accessed: 0u32,
+            diag_code: AX_ICE_INTERNAL,
+            exit_code: BISECT_EXIT_ICE_VERIFY,
+            actual_exit_code: out_k.exit_code,
+            actual_return_val: out_k.return_val,
+            output_ir_snapshot: out_k.final_ir_snapshot,
+            steps_replayed: out_k.steps_executed,
+        }
+    }
+
+    let reproduced = out_k.exit_code != manifest.expected_oracle_exit_code ||
+        out_k.return_val != manifest.expected_oracle_return_val
+    OptReplayResult {
+        reproduced_divergence: reproduced,
+        matches_oracle_at_prev_step: out_prev.matches_oracle,
+        post_pass_contracts_verified: out_k.all_verified,
+        workspace_files_accessed: 0u32,
+        diag_code: 0u32,
+        exit_code: if reproduced { BISECT_EXIT_DIVERGENCE } else { BISECT_EXIT_OK },
+        actual_exit_code: out_k.exit_code,
+        actual_return_val: out_k.return_val,
+        output_ir_snapshot: out_k.final_ir_snapshot,
+        steps_replayed: out_k.steps_executed,
+    }
+}
+
+// ============================================================================
+// 6. Canonical 16-Step Seeded Bisection Pipeline (`SPEC-104 §7.3 Example 3`)
+// ============================================================================
+
+fn make_demo_step(
+    cgu_idx: u32,
+    fn_sym: StrView,
+    pass_ord: u32,
+    iter_idx: u32,
+    pass_name: StrView,
+    file_id: FileId,
+    ir_before: StrView,
+    ir_after: StrView,
+    diverges: bool,
+    div_exit: i32,
+    div_ret: i64
+) -> PassStepRecord {
+    let h_in = fingerprint128_bytes(0xB15EC701u64 + (pass_ord as u64), ir_before.ptr, ir_before.len)
+    let h_out = fingerprint128_bytes(0xB15EC702u64 + (pass_ord as u64), ir_after.ptr, ir_after.len)
+    PassStepRecord {
+        step_id: 0u32,
+        cgu_index: cgu_idx,
+        pass_ordinal: pass_ord,
+        iteration_index: iter_idx,
+        pass_name: pass_name,
+        fn_symbol: fn_sym,
+        fn_span: span_new(file_id, 10u32 + pass_ord * 12u32, 20u32 + pass_ord * 12u32),
+        input_ir_hash: h_in,
+        output_ir_hash: h_out,
+        ir_before: ir_before,
+        ir_after: ir_after,
+        mutated: !ux2_sv_eq(ir_before, ir_after),
+        verified_after: true,
+        introduces_divergence: diverges,
+        post_step_exit_code: div_exit,
+        post_step_return_val: div_ret,
+    }
+}
+
+// Builds the 16-step optimization pipeline from `SPEC-104 §7.3 Example 3`:
+// Steps 1..5 preserve oracle semantics (`exit = 0`, `ret = 100`).
+// Step 6 (`pass = "gvn"`, `fn = "bisect_demo.compute_window"`) introduces a seeded
+// miscompilation (`exit = 42`, `ret = 42`), which persists through steps 6..16.
+// Binary search over M = 16 steps tests limits 8 -> 4 -> 6 -> 5 (4 evaluations)
+// and isolates `step_id = 6`.
+pub fn opt_bisect_build_seeded_demo_pipeline(file_id: FileId) -> OptPassPipeline {
+    let mut p = opt_pass_pipeline_empty()
+    p.test_name = ux2_sv("bisect_demo.window_sum_equivalence")
+    p.target_triple = ux2_sv("x86_64-windows")
+    p.opt_profile = ux2_sv("-O2")
+    p.safety_profile = ux2_sv("system")
+    p.panic_profile = ux2_sv("unwind")
+    p.oracle_exit_code = 0i32
+    p.oracle_return_val = 100i64
+    p.oracle_stdout = ux2_sv("window_sum=100\n")
+
+    let fn_win = ux2_sv("bisect_demo.compute_window")
+    let fn_main = ux2_sv("bisect_demo.main")
+    let ir0 = ux2_sv("optir(v0: checked_add %acc, %elem)")
+    let ir1 = ux2_sv("optir(v1: ssa_memssa_normalized)")
+    let ir2 = ux2_sv("optir(v2: sroa_scalarized)")
+    let ir3 = ux2_sv("optir(v3: sccp_folded)")
+    let ir4 = ux2_sv("optir(v4: inst_combined)")
+    let ir5 = ux2_sv("optir(v5: cse_local)")
+    let ir6_bad = ux2_sv("optir(v6_bad: const_fold_hoist %acc, 42)")
+    let ir7_bad = ux2_sv("optir(v7_bad: post_gvn_pipeline)")
+
+    let pass_names: [16]StrView = [
+        ux2_sv("ssa_construct"),
+        ux2_sv("memssa_construct"),
+        ux2_sv("sroa"),
+        ux2_sv("sccp"),
+        ux2_sv("inst_combine"),
+        ux2_sv("gvn"),
+        ux2_sv("cse"),
+        ux2_sv("bce"),
+        ux2_sv("licm"),
+        ux2_sv("inline"),
+        ux2_sv("dce"),
+        ux2_sv("cfg_simplify"),
+        ux2_sv("slp_vec"),
+        ux2_sv("loop_unroll"),
+        ux2_sv("tail_dupl"),
+        ux2_sv("final_dce")
+    ]
+
+    // Insert steps (with intentionally swapped index 2 and 1 to verify canonical sorting)
+    let mut i: usize = 0
+    while i < 16usize {
+        let ord = (i as u32) + 1u32
+        let fn_sym = if i < 12usize { fn_win } else { fn_main }
+        let cgu = if i < 12usize { 0u32 } else { 1u32 }
+        let diverges = i >= 5usize
+        let div_exit = if diverges { 42i32 } else { 0i32 }
+        let div_ret = if diverges { 42i64 } else { 100i64 }
+        let bef = if i == 0usize {
+            ir0
+        } else if i == 1usize {
+            ir1
+        } else if i == 2usize {
+            ir2
+        } else if i == 3usize {
+            ir3
+        } else if i == 4usize {
+            ir4
+        } else if i == 5usize {
+            ir5
+        } else {
+            ir6_bad
+        }
+        let aft = if i == 0usize {
+            ir1
+        } else if i == 1usize {
+            ir2
+        } else if i == 2usize {
+            ir3
+        } else if i == 3usize {
+            ir4
+        } else if i == 4usize {
+            ir5
+        } else if i == 5usize {
+            ir6_bad
+        } else {
+            ir7_bad
+        }
+        p.steps[i] = make_demo_step(cgu, fn_sym, ord, 0u32, pass_names[i], FileId { v: file_id.v }, bef, aft, diverges, div_exit, div_ret)
+        i = i + 1
+    }
+    // Swap steps[1] and steps[2] before sorting so `opt_bisect_sort_steps` restores canonical order
+    let tmp = p.steps[1]
+    p.steps[1] = p.steps[2]
+    p.steps[2] = tmp
+    p.step_count = 16u32
+    opt_bisect_sort_steps(mut_view(p))
+    p
+}

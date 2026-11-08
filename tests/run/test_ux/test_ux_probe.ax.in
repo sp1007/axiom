@@ -1,0 +1,431 @@
+// Direct verification probe for `compiler.opt.bisect`, `compiler.test_runner`,
+// and `compiler.driver.test_cmd` (T818 / E19.5: SPEC-104 §§3..7,
+// REQ-TOOL-002..003, REQ-TOOL-005..011, REQ-TOOL-179, REQ-TST-112, INV-TST-001).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.query.db.CompilerDB
+use compiler.query.db.SourceFileId
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.PackageId
+use compiler.query.db.ITEM_NS_VALUE
+use compiler.query.db.ITEM_KIND_FN
+use compiler.query.db.DURABILITY_LOW
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.semantic_key_new
+use compiler.query.db.query_db_empty
+use compiler.query.db.query_db_init
+use compiler.query.db.query_db_free
+use compiler.query.db.query_db_set_source_file_input
+use compiler.query.db.query_db_set_module_tree_input
+use compiler.query.db.query_db_register_def
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+
+use compiler.opt.bisect.BISECT_EXIT_ICE_VERIFY
+use compiler.opt.bisect.opt_bisect_config_with_limit
+use compiler.opt.bisect.opt_bisect_eval_pipeline_at_limit
+use compiler.opt.bisect.opt_bisect_run_binary_search
+use compiler.opt.bisect.opt_bisect_render_terminal
+use compiler.opt.bisect.opt_bisect_render_json
+use compiler.opt.bisect.opt_replay_from_bisect_report
+use compiler.opt.bisect.opt_replay_export_manifest_json
+use compiler.opt.bisect.opt_replay_execute
+use compiler.opt.bisect.opt_bisect_build_seeded_demo_pipeline
+
+use compiler.test_runner.DEBUG_TIER_LINE_TABLES_O0
+use compiler.test_runner.DEBUG_TIER_FULL_DWARF
+use compiler.test_runner.TestOutcomeKind
+use compiler.test_runner.DiscoveredTestCase
+use compiler.test_runner.ObservableOutcome
+use compiler.test_runner.observable_outcome_empty
+use compiler.test_runner.test_runner_compute_test_id
+use compiler.test_runner.test_runner_derive_prng_seed
+use compiler.test_runner.test_runner_format_tempdir
+use compiler.test_runner.test_runner_verify_binary_isolation_and_feature_invariance
+use compiler.test_runner.test_runner_execute_suite
+use compiler.test_runner.test_runner_render_suite_human
+use compiler.test_runner.test_runner_render_suite_json
+use compiler.test_runner.test_runner_compare_differential
+use compiler.test_runner.test_runner_verify_zero_oracle_runtime_overhead
+use compiler.test_runner.test_runner_project_debug_container_sections
+use compiler.test_runner.test_runner_audit_debug_and_trace
+use compiler.test_runner.test_runner_render_debug_audit_json
+use compiler.test_runner.test_runner_build_demo_cases
+use compiler.test_runner.test_runner_build_o0_debug_model
+use compiler.test_runner.test_runner_build_o2_inlined_debug_model
+use compiler.test_runner.test_runner_build_disabled_trace_audit
+use compiler.test_runner.test_runner_build_enabled_trace_audit
+
+use compiler.driver.test_cmd.TEST_EXIT_OK
+use compiler.driver.test_cmd.TEST_EXIT_USAGE
+use compiler.driver.test_cmd.test_parse_cli_args
+use compiler.driver.test_cmd.test_cmd_execute
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn out_u32(v: u32) {
+    let mut buf: [16]u8 = [0u8; 16]
+    if v == 0u32 {
+        buf[0] = 48u8
+        let _ = unsafe { write(stdio(1), address_of<u8>(buf[0]), 1) }
+        return
+    }
+    let mut x = v
+    let mut n: usize = 0
+    while x > 0u32 {
+        buf[15 - n] = 48u8 + ((x % 10u32) as u8)
+        x = x / 10u32
+        n = n + 1
+    }
+    let _ = unsafe { write(stdio(1), address_of<u8>(buf[16 - n]), n) }
+}
+
+fn run_test_discovery_and_isolation_probe() -> bool {
+    let mut db = query_db_empty()
+    query_db_init(mut_view(db), 1u64)
+    let src = ux2_sv("module metrics.ring\npub fn average(x: i64) -> i64 { x }\ntest \"ring counter\" { assert_eq(average(20), 20) }\n")
+    let sf_id = SourceFileId { v: 1u32 }
+    let mod_id = ModuleId { v: 1u32 }
+    let def_id = DefId { v: 1u32 }
+    let sk = semantic_key_new(ux2_sv("pkg"), ux2_sv("metrics.ring"), ITEM_NS_VALUE, 0u32, ux2_sv("average"), ux2_sv_empty())
+    let _ = query_db_set_source_file_input(mut_view(db), sf_id, ux2_sv("src/metrics/ring.ax"), src, DURABILITY_LOW)
+    let _ = query_db_set_module_tree_input(mut_view(db), mod_id, PackageId { v: 1u32 }, ModuleId { v: 0u32 }, ux2_sv("metrics.ring"), sf_id, DURABILITY_LOW)
+    let _ = query_db_register_def(mut_view(db), def_id, mod_id, ITEM_KIND_FN, true, 0u32, 1u32, sk)
+
+    let iso = test_runner_verify_binary_isolation_and_feature_invariance(mut_view(db), mod_id, def_id)
+    let isolation_ok = !iso.prod_binary_has_test_blocks &&
+        !iso.prod_binary_has_test_harness &&
+        !iso.prod_binary_has_test_strings &&
+        !iso.core_semantics_altered_by_features &&
+        iso.ownership_rules_identical &&
+        iso.view_cap_rules_identical &&
+        iso.overflow_semantics_identical &&
+        iso.drop_order_identical &&
+        iso.send_share_rules_identical &&
+        iso.ast_body_abi_fingerprints_identical &&
+        !iso.debug_assert_creates_ub_hint
+
+    // Deterministic `test_id` and tempdir formatting (`AXS-TST-002`, `AXS-TST-004`)
+    let tid1 = test_runner_compute_test_id(ux2_sv("metrics.ring"), ux2_sv("ring counter"))
+    let tid2 = test_runner_compute_test_id(ux2_sv("metrics.ring"), ux2_sv("ring counter"))
+    let tid3 = test_runner_compute_test_id(ux2_sv("metrics.math"), ux2_sv("ring counter"))
+    let tid_ok = fingerprint128_eq(tid1, tid2) && !fingerprint128_eq(tid1, tid3)
+
+    let mut tmp_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(tmp_buf))
+    test_runner_format_tempdir(tid1, mut_view(tmp_buf))
+    let tmp_sv = diag_buf_as_str_view(view(tmp_buf))
+    let tmp_ok = ux2_sv_contains(tmp_sv, ux2_sv("target/test-tmp/")) && tmp_sv.len == 49usize
+    diag_buf_free(mut_view(tmp_buf))
+
+    // Parallel execution determinism (`--jobs=1` vs `--jobs=4` with reversed input order)
+    let cases_a: [8]DiscoveredTestCase = test_runner_build_demo_cases(FileId { v: 1u32 })
+    let mut cases_b: [8]DiscoveredTestCase = test_runner_build_demo_cases(FileId { v: 1u32 })
+    let swap_tmp = cases_b[0]
+    cases_b[0] = cases_b[3]
+    cases_b[3] = swap_tmp
+
+    let suite_j1 = test_runner_execute_suite(view(cases_a), 4usize, ux2_sv_empty(), 12345u64, 1u32, false)
+    let suite_j4 = test_runner_execute_suite(view(cases_b), 4usize, ux2_sv_empty(), 12345u64, 4u32, false)
+
+    let mut json_a = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut json_b = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(json_a))
+    diag_buf_init(mut_view(json_b))
+    test_runner_render_suite_json(view(suite_j1), mut_view(json_a))
+    test_runner_render_suite_json(view(suite_j4), mut_view(json_b))
+    let parallel_det_ok = ux2_sv_eq(diag_buf_as_str_view(view(json_a)), diag_buf_as_str_view(view(json_b))) &&
+        suite_j1.passed_count == 3u32 &&
+        suite_j1.ignored_count == 1u32 &&
+        suite_j1.failed_count == 0u32
+
+    // Filter predicate (`metrics.math` selects 2 tests: `test_checked_add` and `divide_by_zero_panics`)
+    let suite_filt = test_runner_execute_suite(view(cases_a), 4usize, ux2_sv("metrics.math"), 12345u64, 1u32, false)
+    let filter_ok = suite_filt.matched_filter_count == 2u32 && suite_filt.passed_count == 2u32
+
+    out_str("probe[test_ux] isolation_ok=")
+    out_bool(isolation_ok && tid_ok && tmp_ok)
+    out_str(" parallel_det_ok=")
+    out_bool(parallel_det_ok)
+    out_str(" filter_ok=")
+    out_bool(filter_ok)
+    out_str(" passed=")
+    out_u32(suite_j1.passed_count)
+    out_str(" ignored=")
+    out_u32(suite_j1.ignored_count)
+    out_str("\n")
+
+    diag_buf_free(mut_view(json_b))
+    diag_buf_free(mut_view(json_a))
+    query_db_free(mut_view(db))
+
+    isolation_ok && tid_ok && tmp_ok && parallel_det_ok && filter_ok
+}
+
+fn run_mir_diff_and_oracle_separation_probe() -> bool {
+    let mut o_interp: ObservableOutcome = observable_outcome_empty()
+    o_interp.exit_code = 0i32
+    o_interp.return_value = 20i64
+    o_interp.stdout_bytes = ux2_sv("avg=20\n")
+    o_interp.drop_sequence = ux2_sv("drop(c)->drop(b)->drop(a)")
+
+    let o_native_o0: ObservableOutcome = o_interp
+    let o_native_o2_ok: ObservableOutcome = o_interp
+    let mut o_native_o2_bad: ObservableOutcome = o_interp
+    o_native_o2_bad.exit_code = 42i32
+    o_native_o2_bad.return_value = 42i64
+
+    let d_ok = test_runner_compare_differential(
+        ux2_sv("metrics.ring.average"),
+        ux2_sv("-O2"),
+        view(o_interp),
+        view(o_native_o0),
+        view(o_native_o2_ok)
+    )
+    let d_div = test_runner_compare_differential(
+        ux2_sv("bisect_demo.compute_window"),
+        ux2_sv("-O2"),
+        view(o_interp),
+        view(o_native_o0),
+        view(o_native_o2_bad)
+    )
+    let oracle_sep_ok = test_runner_verify_zero_oracle_runtime_overhead(ux2_sv("sections=[.text,.rdata,.pdata,.xdata]")) &&
+        !test_runner_verify_zero_oracle_runtime_overhead(ux2_sv("sections=[.text,.axmir,__ax_interp_eval]")) &&
+        !d_ok.prod_embeds_interp_or_oracle &&
+        !d_ok.prod_requires_axmir_or_sidecar
+
+    let diff_ok = d_ok.equivalent &&
+        !d_ok.handoff_to_opt_bisect &&
+        !d_div.equivalent &&
+        d_div.handoff_to_opt_bisect &&
+        ux2_sv_eq(d_div.mismatch_field, ux2_sv("exit_code"))
+
+    out_str("probe[mir_diff] diff_ok=")
+    out_bool(diff_ok)
+    out_str(" handoff_bisect=")
+    out_bool(d_div.handoff_to_opt_bisect)
+    out_str(" oracle_zero_prod_ok=")
+    out_bool(oracle_sep_ok)
+    out_str("\n")
+
+    diff_ok && oracle_sep_ok
+}
+
+fn run_opt_bisect_and_replay_probe() -> bool {
+    let pipe = opt_bisect_build_seeded_demo_pipeline(FileId { v: 2u32 })
+
+    // 1. Fuel-gated `--opt-bisect-limit=5` matches oracle (`exit = 0`), while `limit=6` diverges (`exit = 42`)
+    let cfg5 = opt_bisect_config_with_limit(5u32)
+    let out5 = opt_bisect_eval_pipeline_at_limit(view(pipe), view(cfg5))
+    let cfg6 = opt_bisect_config_with_limit(6u32)
+    let out6 = opt_bisect_eval_pipeline_at_limit(view(pipe), view(cfg6))
+    let limit_ok = out5.matches_oracle && out5.steps_executed == 5u32 && out5.steps_bypassed == 11u32 &&
+        !out6.matches_oracle && out6.exit_code == 42i32
+
+    // 2. Automated O(log2 M) binary-search `--opt-bisect` over M = 16 steps:
+    // tests limits 8 -> 4 -> 6 -> 5 (4 evaluations) and isolates step_id = 6 (`pass="gvn"`, `fn="bisect_demo.compute_window"`)
+    let rep = opt_bisect_run_binary_search(view(pipe), ux2_sv("target/opt-bisect/bisect_demo.replay.json"))
+    let bisect_ok = rep.found_culprit &&
+        rep.total_steps == 16u32 &&
+        rep.evaluations_run == 4u32 &&
+        rep.culprit_step_id == 6u32 &&
+        ux2_sv_eq(rep.culprit_pass_name, ux2_sv("gvn")) &&
+        ux2_sv_eq(rep.culprit_function, ux2_sv("bisect_demo.compute_window")) &&
+        rep.trace_limits[0] == 8u32 &&
+        rep.trace_limits[1] == 4u32 &&
+        rep.trace_limits[2] == 6u32 &&
+        rep.trace_limits[3] == 5u32
+
+    let mut term_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut json_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(term_buf))
+    diag_buf_init(mut_view(json_buf))
+    opt_bisect_render_terminal(view(rep), mut_view(term_buf))
+    opt_bisect_render_json(view(rep), mut_view(json_buf))
+    let term_sv = diag_buf_as_str_view(view(term_buf))
+    let json_sv = diag_buf_as_str_view(view(json_buf))
+    let render_ok = ux2_sv_contains(term_sv, ux2_sv("[opt-bisect] ISOLATED CULPRIT STEP: step_id=6, pass=\"gvn\", fn=\"bisect_demo.compute_window\"")) &&
+        ux2_sv_contains(json_sv, ux2_sv("\"culprit_step_id\":6"))
+
+    // 3. Self-contained `--opt-replay=<manifest>` reproduction + `--verify-each` ICE check (`AXS-TST-022`, `AXS-TST-050`)
+    let manifest = opt_replay_from_bisect_report(view(pipe), view(rep))
+    let mut m_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut err_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(m_buf))
+    diag_buf_init(mut_view(err_buf))
+    opt_replay_export_manifest_json(view(manifest), mut_view(m_buf))
+    let r_res = opt_replay_execute(view(manifest), view(pipe), true, mut_view(err_buf))
+
+    let mut bad_manifest = manifest
+    bad_manifest.inject_unverified_ir_fault = true
+    let r_ice = opt_replay_execute(view(bad_manifest), view(pipe), true, mut_view(err_buf))
+
+    let replay_ok = r_res.reproduced_divergence &&
+        r_res.matches_oracle_at_prev_step &&
+        r_res.post_pass_contracts_verified &&
+        r_res.workspace_files_accessed == 0u32 &&
+        r_ice.exit_code == BISECT_EXIT_ICE_VERIFY &&
+        ux2_sv_contains(diag_buf_as_str_view(view(err_buf)), ux2_sv("AX_ICE_MIR_VERIFY"))
+
+    out_str("probe[opt_bisect] limit_ok=")
+    out_bool(limit_ok)
+    out_str(" culprit_step=")
+    out_u32(rep.culprit_step_id)
+    out_str(" evals=")
+    out_u32(rep.evaluations_run)
+    out_str(" replay_ok=")
+    out_bool(replay_ok && render_ok)
+    out_str("\n")
+
+    diag_buf_free(mut_view(err_buf))
+    diag_buf_free(mut_view(m_buf))
+    diag_buf_free(mut_view(json_buf))
+    diag_buf_free(mut_view(term_buf))
+
+    limit_ok && bisect_ok && render_ok && replay_ok
+}
+
+fn run_debug_trace_and_cli_probe() -> bool {
+    let o0_mod = test_runner_build_o0_debug_model(FileId { v: 1u32 })
+    let o2_mod = test_runner_build_o2_inlined_debug_model(FileId { v: 1u32 })
+    let dis_tr = test_runner_build_disabled_trace_audit()
+    let ena_tr = test_runner_build_enabled_trace_audit()
+
+    let audit = test_runner_audit_debug_and_trace(view(o0_mod), view(o2_mod), view(dis_tr), view(ena_tr))
+
+    // Verify target-neutral projection across PE, ELF, and Mach-O (`AXS-TST-030`, `REQ-TOOL-007`)
+    let mut sec_pe = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut sec_elf = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut sec_macho = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(sec_pe))
+    diag_buf_init(mut_view(sec_elf))
+    diag_buf_init(mut_view(sec_macho))
+    test_runner_project_debug_container_sections(ux2_sv("x86_64-windows"), DEBUG_TIER_LINE_TABLES_O0, mut_view(sec_pe))
+    test_runner_project_debug_container_sections(ux2_sv("x86_64-linux"), DEBUG_TIER_FULL_DWARF, mut_view(sec_elf))
+    test_runner_project_debug_container_sections(ux2_sv("aarch64-macos"), DEBUG_TIER_LINE_TABLES_O0, mut_view(sec_macho))
+    let proj_ok = ux2_sv_contains(diag_buf_as_str_view(view(sec_pe)), ux2_sv(".debug_line")) &&
+        ux2_sv_contains(diag_buf_as_str_view(view(sec_elf)), ux2_sv(".debug_info")) &&
+        ux2_sv_contains(diag_buf_as_str_view(view(sec_macho)), ux2_sv("__DWARF.__debug_line"))
+    diag_buf_free(mut_view(sec_macho))
+    diag_buf_free(mut_view(sec_elf))
+    diag_buf_free(mut_view(sec_pe))
+
+    // Verify `compiler.driver.test_cmd` CLI parsing and execution (`AXS-TST-050`)
+    let mut sink = DiagSink {
+        arena: (query_db_empty()).arena,
+        diags: 0 as *mut compiler.diag.emitter.Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+    diag_sink_init(mut_view(sink))
+    let args_ok: [8]StrView = [
+        ux2_sv("--diff"),
+        ux2_sv("--audit-debug"),
+        ux2_sv("--jobs=4"),
+        ux2_sv("--seed=999"),
+        ux2_sv("--format=json"),
+        ux2_sv("metrics.ring"),
+        ux2_sv_empty(),
+        ux2_sv_empty()
+    ]
+    let opts_ok = test_parse_cli_args(view(args_ok), 6usize, mut_view(sink))
+    let cases = test_runner_build_demo_cases(FileId { v: 1u32 })
+    let pipe = opt_bisect_build_seeded_demo_pipeline(FileId { v: 2u32 })
+    let brep = opt_bisect_run_binary_search(view(pipe), ux2_sv("target/opt-bisect/bisect_demo.replay.json"))
+    let rman = opt_replay_from_bisect_report(view(pipe), view(brep))
+
+    let mut out_stdout = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    let mut out_stderr = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 }
+    diag_buf_init(mut_view(out_stdout))
+    diag_buf_init(mut_view(out_stderr))
+    let cmd_res = test_cmd_execute(
+        view(opts_ok),
+        view(cases),
+        4usize,
+        view(pipe),
+        view(rman),
+        view(o0_mod),
+        view(o2_mod),
+        view(dis_tr),
+        view(ena_tr),
+        mut_view(out_stdout),
+        mut_view(out_stderr)
+    )
+
+    let args_bad: [8]StrView = [
+        ux2_sv("--unknown-test-flag"),
+        ux2_sv_empty(),
+        ux2_sv_empty(),
+        ux2_sv_empty(),
+        ux2_sv_empty(),
+        ux2_sv_empty(),
+        ux2_sv_empty(),
+        ux2_sv_empty()
+    ]
+    let opts_bad = test_parse_cli_args(view(args_bad), 1usize, mut_view(sink))
+    let cli_ok = cmd_res.exit_code == TEST_EXIT_OK &&
+        cmd_res.tests_passed == 1u32 &&
+        cmd_res.debug_audit_ran &&
+        cmd_res.debug_audit_passed &&
+        opts_bad.has_usage_error &&
+        opts_bad.exit_code == TEST_EXIT_USAGE
+
+    out_str("probe[debug_and_cli] audit_ok=")
+    out_bool(audit.all_passed && proj_ok)
+    out_str(" inline_frames=")
+    out_u32(o2_mod.logical_frame_count)
+    out_str(" trace_zero_cost=")
+    out_bool(audit.disabled_trace_zero_cost)
+    out_str(" cli_ok=")
+    out_bool(cli_ok)
+    out_str("\n")
+
+    diag_buf_free(mut_view(out_stderr))
+    diag_buf_free(mut_view(out_stdout))
+    diag_sink_free(mut_view(sink))
+
+    audit.all_passed && proj_ok && cli_ok
+}
+
+pub fn main() -> i32 {
+    let ok1 = run_test_discovery_and_isolation_probe()
+    let ok2 = run_mir_diff_and_oracle_separation_probe()
+    let ok3 = run_opt_bisect_and_replay_probe()
+    let ok4 = run_debug_trace_and_cli_probe()
+    if !ok1 || !ok2 || !ok3 || !ok4 {
+        return 1
+    }
+    out_str("TEST-UX-PROBE-PASS\n")
+    0
+}

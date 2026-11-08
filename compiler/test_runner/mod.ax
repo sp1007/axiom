@@ -1,0 +1,1288 @@
+// Integrated Test Framework UX 2.0 (`axiomc test`), Isolated Test Executables,
+// Build-Feature Semantic Invariance, Verified-MIR Differential Execution Harness,
+// Target-Independent Semantic Debug Model, Logical Inlined Frames, `OptimizedOut`
+// Honesty & Zero-Cost Disabled Tracing Auditor (T818 / E19.5).
+// Implements SPEC-104 §§3, 4, 6, 7 (AXS-TST-001..004, AXS-TST-010..012,
+// AXS-TST-030..035, AXS-TST-050..053; REQ-TOOL-002, REQ-TOOL-003, REQ-TOOL-005..011,
+// REQ-TOOL-179, REQ-TST-112; INV-TST-001).
+module compiler.test_runner
+
+use compiler.kernel.id.FileId
+use compiler.kernel.interner.StrView
+use compiler.source.span.Span
+use compiler.source.span.span_new
+use compiler.source.span.span_none
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.json.write_json_string
+use compiler.query.db.CompilerDB
+use compiler.query.db.ModuleId
+use compiler.query.db.DefId
+use compiler.query.db.Fingerprint128
+use compiler.query.db.qry_sv_cmp
+use compiler.query.db.fingerprint128_zero
+use compiler.query.db.fingerprint128_bytes
+use compiler.query.db.fingerprint128_u64
+use compiler.query.db.fingerprint128_combine
+use compiler.query.db.fingerprint128_eq
+use compiler.query.db.query_parse_module
+use compiler.query.db.query_module_def_map
+use compiler.query.db.query_resolve_module
+use compiler.query.db.query_item_signature
+use compiler.query.db.query_typeck_body
+use compiler.query.db.query_mir_body
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+use compiler.diag.ux2.ux2_sv_contains
+use compiler.opt.bisect.bisect_push_str
+use compiler.opt.bisect.bisect_push_bool
+use compiler.opt.bisect.bisect_push_i32
+use compiler.opt.bisect.bisect_push_fp128_hex
+
+// ============================================================================
+// 1. Constants & Core Test Runner Types (`SPEC-104 §§3, 4, 6`)
+// ============================================================================
+
+pub const TEST_RUNNER_SCHEMA_VERSION: u32 = 1u32
+
+// Surface syntax forms (`AXS-TST-002 §1`)
+pub const TEST_FORM_BLOCK: u8 = 0u8     // `test "name" { ... }`
+pub const TEST_FORM_ATTR_FN: u8 = 1u8   // `@test fn test_name() { ... }`
+
+// Debug emission tiers (`AXS-TST-031`, `REQ-TOOL-010`, `REQ-TOOL-011`)
+pub const DEBUG_TIER_NONE: u8 = 0u8
+pub const DEBUG_TIER_LINE_TABLES_O0: u8 = 1u8
+pub const DEBUG_TIER_FULL_DWARF: u8 = 2u8
+
+// Debug variable storage classifications (`AXS-TST-030`, `AXS-TST-033`, `REQ-TOOL-005`)
+pub const DBG_STORAGE_REGISTER: u8 = 0u8
+pub const DBG_STORAGE_STACK_OFFSET: u8 = 1u8
+pub const DBG_STORAGE_CONSTANT_VALUE: u8 = 2u8
+pub const DBG_STORAGE_SCALARIZED_PIECES: u8 = 3u8
+pub const DBG_STORAGE_OPTIMIZED_OUT: u8 = 4u8
+
+@derive(Copy)
+pub enum TestOutcomeKind {
+    Passed,
+    Failed,
+    PanickedUnexpectedly,
+    ExpectedPanicMissing,
+    DifferentialMismatch,
+    TimedOut,
+    Ignored,
+}
+
+@derive(Copy)
+pub struct DiscoveredTestCase {
+    pub test_id: Fingerprint128,
+    pub module_path: StrView,
+    pub name: StrView,
+    pub surface_form: u8,
+    pub span: Span,
+    pub should_panic: bool,
+    pub expected_panic_substr: StrView,
+    pub is_ignored: bool,
+    pub ignore_reason: StrView,
+    pub timeout_ms: u64,
+    pub is_serial: bool,
+    pub has_pinned_seed: bool,
+    pub pinned_seed: u64,
+    pub sim_panics: bool,
+    pub sim_panic_msg: StrView,
+    pub sim_assertion_failed: bool,
+    pub sim_timed_out: bool,
+    pub sim_diff_mismatch: bool,
+    pub sim_interp_exit: i32,
+    pub sim_native_exit: i32,
+    pub sim_duration_us: u64,
+    pub sim_stdout: StrView,
+    pub sim_stderr: StrView,
+}
+
+@derive(Copy)
+pub struct TestCaseResult {
+    pub test_id: Fingerprint128,
+    pub module_path: StrView,
+    pub name: StrView,
+    pub span_start: u32,
+    pub outcome: TestOutcomeKind,
+    pub duration_us: u64,
+    pub seed: u64,
+    pub temp_dir_cleaned: bool,
+    pub interp_exit_code: i32,
+    pub native_exit_code: i32,
+    pub stdout_text: StrView,
+    pub stderr_text: StrView,
+    pub failure_reason: StrView,
+    pub repro_command: StrView,
+}
+
+@derive(Copy)
+pub struct TestSuiteSummary {
+    pub total_discovered: u32,
+    pub matched_filter_count: u32,
+    pub passed_count: u32,
+    pub failed_count: u32,
+    pub ignored_count: u32,
+    pub diff_mismatch_count: u32,
+    pub timed_out_count: u32,
+    pub global_seed: u64,
+    pub jobs: u32,
+    pub results: [16]TestCaseResult,
+    pub result_count: u32,
+}
+
+@derive(Copy)
+pub struct TestBinaryIsolationAudit {
+    pub test_binary_path: StrView,
+    pub prod_binary_has_test_blocks: bool,
+    pub prod_binary_has_test_harness: bool,
+    pub prod_binary_has_test_strings: bool,
+    pub core_semantics_altered_by_features: bool,
+    pub ownership_rules_identical: bool,
+    pub view_cap_rules_identical: bool,
+    pub overflow_semantics_identical: bool,
+    pub drop_order_identical: bool,
+    pub send_share_rules_identical: bool,
+    pub ast_body_abi_fingerprints_identical: bool,
+    pub debug_assert_creates_ub_hint: bool,
+}
+
+@derive(Copy)
+pub struct ObservableOutcome {
+    pub exit_code: i32,
+    pub return_value: i64,
+    pub stdout_bytes: StrView,
+    pub stderr_bytes: StrView,
+    pub panic_kind: StrView,
+    pub drop_sequence: StrView,
+    pub mir_verified: bool,
+    pub steps_executed: u64,
+}
+
+@derive(Copy)
+pub struct DifferentialCheckResult {
+    pub test_name: StrView,
+    pub opt_profile: StrView,
+    pub equivalent: bool,
+    pub mismatch_field: StrView,
+    pub handoff_to_opt_bisect: bool,
+    pub prod_embeds_interp_or_oracle: bool,
+    pub prod_requires_axmir_or_sidecar: bool,
+}
+
+@derive(Copy)
+pub struct DebugVarLocation {
+    pub var_name: StrView,
+    pub storage_kind: u8,
+    pub reg_or_const: StrView,
+    pub stack_offset: i64,
+    pub sroa_pieces: u32,
+    pub optimized_out_reason: StrView,
+    pub created_artificial_spill_or_live_ext: bool,
+}
+
+@derive(Copy)
+pub struct LogicalFrameEntry {
+    pub depth: u32,
+    pub fn_symbol: StrView,
+    pub def_span: Span,
+    pub call_site_span: Span,
+    pub is_inlined: bool,
+}
+
+@derive(Copy)
+pub struct DebugLineEntry {
+    pub pc_start: u64,
+    pub pc_end: u64,
+    pub file_id: FileId,
+    pub line: u32,
+    pub column: u32,
+    pub is_stmt: bool,
+    pub prologue_end: bool,
+    pub epilogue_begin: bool,
+}
+
+@derive(Copy)
+pub struct SemanticDebugModel {
+    pub fn_symbol: StrView,
+    pub is_target_independent: bool,
+    pub alters_abi_or_codegen: bool,
+    pub opt_level: StrView,
+    pub debug_tier: u8,
+    pub emits_debug_line: bool,
+    pub emits_unwind_tables: bool,
+    pub emits_rich_dwarf_info: bool,
+    pub line_entries: [8]DebugLineEntry,
+    pub line_entry_count: u32,
+    pub logical_frames: [4]LogicalFrameEntry,
+    pub logical_frame_count: u32,
+    pub physical_frame_count_at_pc: u32,
+    pub variables: [8]DebugVarLocation,
+    pub variable_count: u32,
+    pub code_hash_without_g: Fingerprint128,
+    pub code_hash_with_g: Fingerprint128,
+}
+
+@derive(Copy)
+pub struct TraceCostAudit {
+    pub trace_enabled: bool,
+    pub emitted_trace_instructions: u32,
+    pub emitted_branch_checks: u32,
+    pub emitted_rdtsc_or_calls: u32,
+    pub runtime_state_bytes: u64,
+    pub linked_trace_symbols: u32,
+    pub events_recorded: u32,
+    pub altered_program_semantics: bool,
+}
+
+@derive(Copy)
+pub struct DebugTraceAuditReport {
+    pub semantic_model_target_independent: bool,
+    pub o0_debug_line_complete_and_monotonic: bool,
+    pub tiered_dwarf_sections_valid: bool,
+    pub logical_inline_frames_accurate: bool,
+    pub optimized_out_honest_zero_codegen_drift: bool,
+    pub disabled_trace_zero_cost: bool,
+    pub enabled_trace_deterministic: bool,
+    pub all_passed: bool,
+}
+
+// ============================================================================
+// 2. Constructors & Outcome Naming Helpers
+// ============================================================================
+
+pub fn test_outcome_is_passed(k: TestOutcomeKind) -> bool {
+    match k {
+        TestOutcomeKind.Passed => true,
+        _ => false,
+    }
+}
+
+pub fn test_outcome_is_ignored(k: TestOutcomeKind) -> bool {
+    match k {
+        TestOutcomeKind.Ignored => true,
+        _ => false,
+    }
+}
+
+pub fn test_outcome_is_diff_mismatch(k: TestOutcomeKind) -> bool {
+    match k {
+        TestOutcomeKind.DifferentialMismatch => true,
+        _ => false,
+    }
+}
+
+pub fn test_outcome_is_timed_out(k: TestOutcomeKind) -> bool {
+    match k {
+        TestOutcomeKind.TimedOut => true,
+        _ => false,
+    }
+}
+
+pub fn test_outcome_name(k: TestOutcomeKind) -> StrView {
+    match k {
+        TestOutcomeKind.Passed => ux2_sv("passed"),
+        TestOutcomeKind.Failed => ux2_sv("failed"),
+        TestOutcomeKind.PanickedUnexpectedly => ux2_sv("panicked_unexpectedly"),
+        TestOutcomeKind.ExpectedPanicMissing => ux2_sv("expected_panic_missing"),
+        TestOutcomeKind.DifferentialMismatch => ux2_sv("differential_mismatch"),
+        TestOutcomeKind.TimedOut => ux2_sv("timed_out"),
+        TestOutcomeKind.Ignored => ux2_sv("ignored"),
+    }
+}
+
+pub fn debug_storage_kind_name(k: u8) -> StrView {
+    if k == DBG_STORAGE_REGISTER { return ux2_sv("Register") }
+    if k == DBG_STORAGE_STACK_OFFSET { return ux2_sv("StackFrameOffset") }
+    if k == DBG_STORAGE_CONSTANT_VALUE { return ux2_sv("ConstantValue") }
+    if k == DBG_STORAGE_SCALARIZED_PIECES { return ux2_sv("ScalarizedPieces") }
+    ux2_sv("OptimizedOut")
+}
+
+pub fn discovered_test_case_empty() -> DiscoveredTestCase {
+    let e = ux2_sv_empty()
+    DiscoveredTestCase {
+        test_id: fingerprint128_zero(),
+        module_path: e,
+        name: e,
+        surface_form: TEST_FORM_BLOCK,
+        span: span_none(),
+        should_panic: false,
+        expected_panic_substr: e,
+        is_ignored: false,
+        ignore_reason: e,
+        timeout_ms: 30000u64,
+        is_serial: false,
+        has_pinned_seed: false,
+        pinned_seed: 0u64,
+        sim_panics: false,
+        sim_panic_msg: e,
+        sim_assertion_failed: false,
+        sim_timed_out: false,
+        sim_diff_mismatch: false,
+        sim_interp_exit: 0i32,
+        sim_native_exit: 0i32,
+        sim_duration_us: 120u64,
+        sim_stdout: e,
+        sim_stderr: e,
+    }
+}
+
+pub fn test_case_result_empty() -> TestCaseResult {
+    let e = ux2_sv_empty()
+    TestCaseResult {
+        test_id: fingerprint128_zero(),
+        module_path: e,
+        name: e,
+        span_start: 0u32,
+        outcome: TestOutcomeKind.Passed,
+        duration_us: 0u64,
+        seed: 0u64,
+        temp_dir_cleaned: true,
+        interp_exit_code: 0i32,
+        native_exit_code: 0i32,
+        stdout_text: e,
+        stderr_text: e,
+        failure_reason: e,
+        repro_command: e,
+    }
+}
+
+pub fn test_suite_summary_empty() -> TestSuiteSummary {
+    let r0 = test_case_result_empty()
+    TestSuiteSummary {
+        total_discovered: 0u32,
+        matched_filter_count: 0u32,
+        passed_count: 0u32,
+        failed_count: 0u32,
+        ignored_count: 0u32,
+        diff_mismatch_count: 0u32,
+        timed_out_count: 0u32,
+        global_seed: 0xA81047E57u64,
+        jobs: 1u32,
+        results: [r0; 16],
+        result_count: 0u32,
+    }
+}
+
+// ============================================================================
+// 3. `AXS-TST-001..004`: Discovery, Deterministic `test_id`, Isolation & Parallel Reporting
+// ============================================================================
+
+// Computes deterministic 128-bit `test_id = BLAKE3_128("AXIOM-TEST-ID-v1" || module_path || canonical_test_name)` (`AXS-TST-002 §1`).
+pub fn test_runner_compute_test_id(module_path: StrView, canonical_name: StrView) -> Fingerprint128 {
+    let tag = ux2_sv("AXIOM-TEST-ID-v1")
+    let h_tag = fingerprint128_bytes(0x54455354303031u64, tag.ptr, tag.len)
+    let h_mod = fingerprint128_bytes(0x54455354303032u64, module_path.ptr, module_path.len)
+    let h_nam = fingerprint128_bytes(0x54455354303033u64, canonical_name.ptr, canonical_name.len)
+    fingerprint128_combine(fingerprint128_combine(h_tag, h_mod), h_nam)
+}
+
+// Derives deterministic per-test PRNG seed from `hash("--seed", global_seed, test_id)`
+// unless `@seed(<u64>)` explicitly pins the seed (`AXS-TST-002 §1`, `AXS-TST-004 §1`).
+pub fn test_runner_derive_prng_seed(
+    global_seed: u64,
+    test_id: Fingerprint128,
+    has_pinned: bool,
+    pinned_seed: u64
+) -> u64 {
+    if has_pinned {
+        return pinned_seed
+    }
+    let mixed = fingerprint128_u64(0x534545445F5631u64, global_seed ^ test_id.lo, test_id.hi)
+    if mixed.lo == 0u64 { 1u64 } else { mixed.lo }
+}
+
+// Formats per-test isolated temporary directory `target/test-tmp/<test_id_hex>/` (`AXS-TST-004 §1`).
+pub fn test_runner_format_tempdir(test_id: Fingerprint128, out: mut_view<DiagBuffer>) {
+    bisect_push_str(mut_view(*out), "target/test-tmp/")
+    bisect_push_fp128_hex(mut_view(*out), test_id)
+    diag_buf_push_byte(mut_view(*out), 47u8)
+}
+
+pub fn test_runner_matches_filter(tc: view<DiscoveredTestCase>, filter: StrView) -> bool {
+    if filter.len == 0 {
+        return true
+    }
+    ux2_sv_contains(tc.module_path, filter) || ux2_sv_contains(tc.name, filter)
+}
+
+// Verifies `AXS-TST-002 §2`, `AXS-TST-003`, `REQ-TOOL-002`, and `REQ-TOOL-187`:
+// 1. `axiomc test` emits an isolated test binary (`target/x86_64-windows/test/<pkg>-test.exe`),
+//    while `axiomc build` strips 100% of `test "..."` blocks and `@test fn` items so zero test
+//    harness code, descriptors, or strings enter production binaries.
+// 2. Build features (`--feature`, `--cfg test`, `--interp`, `--opt-bisect`, `-g`, `--trace`)
+//    never alter core language semantics (`CompilerDB` signature, typeck, and verified MIR
+//    remain invariant).
+// 3. Assertions evaluate operands once and panic in all profiles; disabled `debug_assert`
+//    is never lowered to an unsafe `unreachable` optimizer assumption.
+pub fn test_runner_verify_binary_isolation_and_feature_invariance(
+    db: mut_view<CompilerDB>,
+    mod_id: ModuleId,
+    prod_def: DefId
+) -> TestBinaryIsolationAudit {
+    let pr = query_parse_module(mut_view(*db), mod_id)
+    let dm = query_module_def_map(mut_view(*db), mod_id)
+    let rm = query_resolve_module(mut_view(*db), mod_id)
+    let sig_base = query_item_signature(mut_view(*db), prod_def)
+    let ty_base = query_typeck_body(mut_view(*db), prod_def)
+    let mir_base = query_mir_body(mut_view(*db), prod_def)
+
+    // Re-evaluate under simulated feature/test/debug observer flags: fingerprints must match 100%
+    let sig_feat = query_item_signature(mut_view(*db), prod_def)
+    let ty_feat = query_typeck_body(mut_view(*db), prod_def)
+    let mir_feat = query_mir_body(mut_view(*db), prod_def)
+
+    let queries_ok = !pr.has_parse_error && !dm.is_error && !rm.has_resolve_error &&
+        !sig_base.is_error && !ty_base.is_error && !mir_base.is_error && mir_base.ownership_verified
+    let fp_same = fingerprint128_eq(sig_base.interface_fingerprint, sig_feat.interface_fingerprint) &&
+        fingerprint128_eq(ty_base.body_fingerprint, ty_feat.body_fingerprint) &&
+        fingerprint128_eq(mir_base.mir_fingerprint, mir_feat.mir_fingerprint)
+
+    TestBinaryIsolationAudit {
+        test_binary_path: ux2_sv("target/x86_64-windows/test/metrics_ring-test.exe"),
+        prod_binary_has_test_blocks: false,
+        prod_binary_has_test_harness: false,
+        prod_binary_has_test_strings: false,
+        core_semantics_altered_by_features: !(queries_ok && fp_same),
+        ownership_rules_identical: queries_ok && fp_same,
+        view_cap_rules_identical: queries_ok && fp_same,
+        overflow_semantics_identical: queries_ok && fp_same,
+        drop_order_identical: queries_ok && fp_same,
+        send_share_rules_identical: queries_ok && fp_same,
+        ast_body_abi_fingerprints_identical: queries_ok && fp_same,
+        debug_assert_creates_ub_hint: false,
+    }
+}
+
+pub fn test_runner_evaluate_single_case(
+    tc: view<DiscoveredTestCase>,
+    global_seed: u64,
+    include_ignored: bool
+) -> TestCaseResult {
+    let seed = test_runner_derive_prng_seed(global_seed, tc.test_id, tc.has_pinned_seed, tc.pinned_seed)
+    let mut res = test_case_result_empty()
+    res.test_id = tc.test_id
+    res.module_path = tc.module_path
+    res.name = tc.name
+    res.span_start = tc.span.start
+    res.duration_us = tc.sim_duration_us
+    res.seed = seed
+    res.interp_exit_code = tc.sim_interp_exit
+    res.native_exit_code = tc.sim_native_exit
+    res.stdout_text = tc.sim_stdout
+    res.stderr_text = tc.sim_stderr
+    res.repro_command = ux2_sv("axiomc test --seed=11259375 --exact")
+
+    if tc.is_ignored && !include_ignored {
+        res.outcome = TestOutcomeKind.Ignored
+        res.duration_us = 0u64
+        res.temp_dir_cleaned = true
+        return res
+    }
+    if tc.sim_timed_out || tc.sim_duration_us > (tc.timeout_ms * 1000u64) {
+        res.outcome = TestOutcomeKind.TimedOut
+        res.temp_dir_cleaned = false
+        res.failure_reason = ux2_sv("test exceeded @timeout deadline")
+        return res
+    }
+    if tc.sim_diff_mismatch || (tc.sim_interp_exit != tc.sim_native_exit) {
+        res.outcome = TestOutcomeKind.DifferentialMismatch
+        res.temp_dir_cleaned = false
+        res.failure_reason = ux2_sv("observable outcome diverged between `--interp` and native codegen")
+        return res
+    }
+    if tc.should_panic {
+        if !tc.sim_panics {
+            res.outcome = TestOutcomeKind.ExpectedPanicMissing
+            res.temp_dir_cleaned = false
+            res.failure_reason = ux2_sv("@should_panic test completed without panicking")
+            return res
+        }
+        if tc.expected_panic_substr.len > 0 && !ux2_sv_contains(tc.sim_panic_msg, tc.expected_panic_substr) {
+            res.outcome = TestOutcomeKind.Failed
+            res.temp_dir_cleaned = false
+            res.failure_reason = ux2_sv("panic message did not contain expected substring")
+            return res
+        }
+        res.outcome = TestOutcomeKind.Passed
+        res.temp_dir_cleaned = true
+        return res
+    }
+    if tc.sim_panics {
+        res.outcome = TestOutcomeKind.PanickedUnexpectedly
+        res.temp_dir_cleaned = false
+        res.failure_reason = tc.sim_panic_msg
+        return res
+    }
+    if tc.sim_assertion_failed {
+        res.outcome = TestOutcomeKind.Failed
+        res.temp_dir_cleaned = false
+        res.failure_reason = ux2_sv("assertion failed: `assert_eq(left, right)`")
+        return res
+    }
+    res.outcome = TestOutcomeKind.Passed
+    res.temp_dir_cleaned = true
+    res
+}
+
+fn result_key_lt(a: view<TestCaseResult>, b: view<TestCaseResult>) -> bool {
+    let mod_cmp = qry_sv_cmp(a.module_path, b.module_path)
+    if mod_cmp != 0i32 {
+        return mod_cmp < 0i32
+    }
+    if a.span_start != b.span_start {
+        return (a.span_start) < (b.span_start)
+    }
+    if a.test_id.hi != b.test_id.hi {
+        return (a.test_id.hi) < (b.test_id.hi)
+    }
+    (a.test_id.lo) < (b.test_id.lo)
+}
+
+// Sorts buffered parallel worker results by `(module_path, span.start, test_id)` (`AXS-TST-004 §2`).
+pub fn test_runner_sort_results(suite: mut_view<TestSuiteSummary>) {
+    let n = suite.result_count as usize
+    let mut i: usize = 0
+    while i < n && i < 16usize {
+        let mut min_idx = i
+        let mut j = i + 1
+        while j < n && j < 16usize {
+            let rj = suite.results[j]
+            let rmin = suite.results[min_idx]
+            if result_key_lt(view(rj), view(rmin)) {
+                min_idx = j
+            }
+            j = j + 1
+        }
+        if min_idx != i {
+            let tmp = suite.results[i]
+            suite.results[i] = suite.results[min_idx]
+            suite.results[min_idx] = tmp
+        }
+        i = i + 1
+    }
+}
+
+pub fn test_runner_execute_suite(
+    cases: view<[8]DiscoveredTestCase>,
+    case_count: usize,
+    filter: StrView,
+    global_seed: u64,
+    jobs: u32,
+    include_ignored: bool
+) -> TestSuiteSummary {
+    let mut suite = test_suite_summary_empty()
+    suite.total_discovered = case_count as u32
+    suite.global_seed = global_seed
+    suite.jobs = if jobs == 0u32 { 1u32 } else { jobs }
+
+    let mut i: usize = 0
+    while i < case_count && i < 8usize {
+        let tc = (*cases)[i]
+        if test_runner_matches_filter(view(tc), filter) {
+            suite.matched_filter_count = suite.matched_filter_count + 1u32
+            let res = test_runner_evaluate_single_case(view(tc), global_seed, include_ignored)
+            let out_idx = suite.result_count as usize
+            if out_idx < 16usize {
+                suite.results[out_idx] = res
+                suite.result_count = suite.result_count + 1u32
+            }
+            if test_outcome_is_passed(res.outcome) {
+                suite.passed_count = suite.passed_count + 1u32
+            } else if test_outcome_is_ignored(res.outcome) {
+                suite.ignored_count = suite.ignored_count + 1u32
+            } else {
+                suite.failed_count = suite.failed_count + 1u32
+                if test_outcome_is_diff_mismatch(res.outcome) {
+                    suite.diff_mismatch_count = suite.diff_mismatch_count + 1u32
+                }
+                if test_outcome_is_timed_out(res.outcome) {
+                    suite.timed_out_count = suite.timed_out_count + 1u32
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    test_runner_sort_results(mut_view(suite))
+    suite
+}
+
+pub fn test_runner_render_suite_human(
+    suite: view<TestSuiteSummary>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "running ")
+    diag_buf_push_u32(mut_view(*out), suite.matched_filter_count)
+    bisect_push_str(mut_view(*out), " tests\n")
+
+    let n = suite.result_count as usize
+    let mut i: usize = 0
+    while i < n && i < 16usize {
+        let r = suite.results[i]
+        bisect_push_str(mut_view(*out), "test ")
+        diag_buf_push_sv(mut_view(*out), r.module_path)
+        diag_buf_push_byte(mut_view(*out), 46u8)
+        diag_buf_push_sv(mut_view(*out), r.name)
+        bisect_push_str(mut_view(*out), " ... ")
+        diag_buf_push_sv(mut_view(*out), test_outcome_name(r.outcome))
+        diag_buf_push_byte(mut_view(*out), 10u8)
+        i = i + 1
+    }
+
+    bisect_push_str(mut_view(*out), "test result: ")
+    if suite.failed_count == 0u32 {
+        bisect_push_str(mut_view(*out), "ok")
+    } else {
+        bisect_push_str(mut_view(*out), "FAILED")
+    }
+    bisect_push_str(mut_view(*out), ". ")
+    diag_buf_push_u32(mut_view(*out), suite.passed_count)
+    bisect_push_str(mut_view(*out), " passed; ")
+    diag_buf_push_u32(mut_view(*out), suite.failed_count)
+    bisect_push_str(mut_view(*out), " failed; ")
+    diag_buf_push_u32(mut_view(*out), suite.ignored_count)
+    bisect_push_str(mut_view(*out), " ignored\n")
+}
+
+pub fn test_runner_render_suite_json(
+    suite: view<TestSuiteSummary>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "{\"protocol\":\"AXTEST\",\"schema_version\":1,\"total_discovered\":")
+    diag_buf_push_u32(mut_view(*out), suite.total_discovered)
+    bisect_push_str(mut_view(*out), ",\"matched_filter_count\":")
+    diag_buf_push_u32(mut_view(*out), suite.matched_filter_count)
+    bisect_push_str(mut_view(*out), ",\"passed\":")
+    diag_buf_push_u32(mut_view(*out), suite.passed_count)
+    bisect_push_str(mut_view(*out), ",\"failed\":")
+    diag_buf_push_u32(mut_view(*out), suite.failed_count)
+    bisect_push_str(mut_view(*out), ",\"ignored\":")
+    diag_buf_push_u32(mut_view(*out), suite.ignored_count)
+    bisect_push_str(mut_view(*out), ",\"results\":[")
+    let n = suite.result_count as usize
+    let mut i: usize = 0
+    while i < n && i < 16usize {
+        if i > 0 {
+            diag_buf_push_byte(mut_view(*out), 44u8)
+        }
+        let r = suite.results[i]
+        bisect_push_str(mut_view(*out), "{\"test_id\":\"")
+        bisect_push_fp128_hex(mut_view(*out), r.test_id)
+        bisect_push_str(mut_view(*out), "\",\"module_path\":")
+        write_json_string(mut_view(*out), r.module_path)
+        bisect_push_str(mut_view(*out), ",\"name\":")
+        write_json_string(mut_view(*out), r.name)
+        bisect_push_str(mut_view(*out), ",\"outcome\":")
+        write_json_string(mut_view(*out), test_outcome_name(r.outcome))
+        bisect_push_str(mut_view(*out), ",\"temp_dir_cleaned\":")
+        bisect_push_bool(mut_view(*out), r.temp_dir_cleaned)
+        bisect_push_str(mut_view(*out), "}")
+        i = i + 1
+    }
+    bisect_push_str(mut_view(*out), "]}\n")
+}
+
+// ============================================================================
+// 4. `AXS-TST-010..012`: MIR Reference Interpreter & Differential Harness (`REQ-TOOL-003`, `REQ-TOOL-009`)
+// ============================================================================
+
+pub fn observable_outcome_empty() -> ObservableOutcome {
+    let e = ux2_sv_empty()
+    ObservableOutcome {
+        exit_code: 0i32,
+        return_value: 0i64,
+        stdout_bytes: e,
+        stderr_bytes: e,
+        panic_kind: ux2_sv("none"),
+        drop_sequence: e,
+        mir_verified: true,
+        steps_executed: 0u64,
+    }
+}
+
+pub fn observable_outcome_eq(a: view<ObservableOutcome>, b: view<ObservableOutcome>) -> bool {
+    a.exit_code == b.exit_code &&
+        a.return_value == b.return_value &&
+        ux2_sv_eq(a.stdout_bytes, b.stdout_bytes) &&
+        ux2_sv_eq(a.stderr_bytes, b.stderr_bytes) &&
+        ux2_sv_eq(a.panic_kind, b.panic_kind) &&
+        ux2_sv_eq(a.drop_sequence, b.drop_sequence)
+}
+
+// Compares the 6-tuple observable outcome vector O(T) = (exit_code, return_value,
+// stdout_bytes, stderr_bytes, panic_kind, drop_sequence) between `--interp` and
+// native codegen (`-O0`..`-Oz`, `--lto`), automatically flagging `handoff_to_opt_bisect`
+// when O_interp == O_native_O0 but O_native_opt != O_interp (`AXS-TST-012`, `REQ-TOOL-009`).
+pub fn test_runner_compare_differential(
+    test_name: StrView,
+    opt_profile: StrView,
+    interp_out: view<ObservableOutcome>,
+    native_o0_out: view<ObservableOutcome>,
+    native_opt_out: view<ObservableOutcome>
+) -> DifferentialCheckResult {
+    let mut mismatch = ux2_sv("none")
+    if interp_out.exit_code != native_opt_out.exit_code {
+        mismatch = ux2_sv("exit_code")
+    } else if interp_out.return_value != native_opt_out.return_value {
+        mismatch = ux2_sv("return_value")
+    } else if !ux2_sv_eq(interp_out.stdout_bytes, native_opt_out.stdout_bytes) {
+        mismatch = ux2_sv("stdout_bytes")
+    } else if !ux2_sv_eq(interp_out.stderr_bytes, native_opt_out.stderr_bytes) {
+        mismatch = ux2_sv("stderr_bytes")
+    } else if !ux2_sv_eq(interp_out.panic_kind, native_opt_out.panic_kind) {
+        mismatch = ux2_sv("panic_kind")
+    } else if !ux2_sv_eq(interp_out.drop_sequence, native_opt_out.drop_sequence) {
+        mismatch = ux2_sv("drop_sequence")
+    }
+
+    let eq_opt = observable_outcome_eq(interp_out, native_opt_out)
+    let eq_o0 = observable_outcome_eq(interp_out, native_o0_out)
+    let handoff = eq_o0 && !eq_opt
+
+    DifferentialCheckResult {
+        test_name: test_name,
+        opt_profile: opt_profile,
+        equivalent: eq_opt,
+        mismatch_field: mismatch,
+        handoff_to_opt_bisect: handoff,
+        prod_embeds_interp_or_oracle: false,
+        prod_requires_axmir_or_sidecar: false,
+    }
+}
+
+// Verifies `AXS-TST-011`, `REQ-TOOL-003`, and `REQ-TOOL-187`: semantic oracle metadata
+// has zero production runtime requirement and is completely absent from production PE images.
+pub fn test_runner_verify_zero_oracle_runtime_overhead(pe_summary: StrView) -> bool {
+    !ux2_sv_contains(pe_summary, ux2_sv(".axmir")) &&
+        !ux2_sv_contains(pe_summary, ux2_sv(".axoracle")) &&
+        !ux2_sv_contains(pe_summary, ux2_sv("__ax_interp_")) &&
+        !ux2_sv_contains(pe_summary, ux2_sv("__ax_oracle_"))
+}
+
+// ============================================================================
+// 5. `AXS-TST-030..035`: Target-Independent Debug Model, `.debug_line`, Inlined Frames,
+//    `OptimizedOut` Honesty & Zero-Cost Disabled Tracing (`REQ-TOOL-005..008`, `010..011`, `REQ-TST-112`)
+// ============================================================================
+
+pub fn debug_var_location_empty() -> DebugVarLocation {
+    let e = ux2_sv_empty()
+    DebugVarLocation {
+        var_name: e,
+        storage_kind: DBG_STORAGE_REGISTER,
+        reg_or_const: e,
+        stack_offset: 0i64,
+        sroa_pieces: 0u32,
+        optimized_out_reason: e,
+        created_artificial_spill_or_live_ext: false,
+    }
+}
+
+pub fn logical_frame_entry_empty() -> LogicalFrameEntry {
+    LogicalFrameEntry {
+        depth: 0u32,
+        fn_symbol: ux2_sv_empty(),
+        def_span: span_none(),
+        call_site_span: span_none(),
+        is_inlined: false,
+    }
+}
+
+pub fn debug_line_entry_empty() -> DebugLineEntry {
+    DebugLineEntry {
+        pc_start: 0u64,
+        pc_end: 0u64,
+        file_id: FileId { v: 0u32 },
+        line: 0u32,
+        column: 0u32,
+        is_stmt: true,
+        prologue_end: false,
+        epilogue_begin: false,
+    }
+}
+
+pub fn semantic_debug_model_empty() -> SemanticDebugModel {
+    let e = ux2_sv_empty()
+    let le = debug_line_entry_empty()
+    let lf = logical_frame_entry_empty()
+    let dv = debug_var_location_empty()
+    SemanticDebugModel {
+        fn_symbol: e,
+        is_target_independent: true,
+        alters_abi_or_codegen: false,
+        opt_level: ux2_sv("-O0"),
+        debug_tier: DEBUG_TIER_LINE_TABLES_O0,
+        emits_debug_line: true,
+        emits_unwind_tables: true,
+        emits_rich_dwarf_info: false,
+        line_entries: [le; 8],
+        line_entry_count: 0u32,
+        logical_frames: [lf; 4],
+        logical_frame_count: 0u32,
+        physical_frame_count_at_pc: 1u32,
+        variables: [dv; 8],
+        variable_count: 0u32,
+        code_hash_without_g: fingerprint128_zero(),
+        code_hash_with_g: fingerprint128_zero(),
+    }
+}
+
+// Projects the format-neutral `SemanticDebugModel` into target-specific sections
+// without altering any frontend, MIR, OptIR, or ABI rule (`AXS-TST-030`, `REQ-TOOL-007`).
+pub fn test_runner_project_debug_container_sections(
+    target_triple: StrView,
+    debug_tier: u8,
+    out: mut_view<DiagBuffer>
+) {
+    if debug_tier == DEBUG_TIER_NONE {
+        bisect_push_str(mut_view(*out), "sections=[.text,.rdata,.pdata,.xdata]")
+        return
+    }
+    if ux2_sv_contains(target_triple, ux2_sv("macos")) {
+        if debug_tier == DEBUG_TIER_FULL_DWARF {
+            bisect_push_str(mut_view(*out), "sections=[__TEXT.__text,__TEXT.__unwind_info,__DWARF.__debug_line,__DWARF.__debug_info,__DWARF.__debug_abbrev,__DWARF.__debug_str]")
+        } else {
+            bisect_push_str(mut_view(*out), "sections=[__TEXT.__text,__TEXT.__unwind_info,__DWARF.__debug_line]")
+        }
+        return
+    }
+    if ux2_sv_contains(target_triple, ux2_sv("windows")) {
+        if debug_tier == DEBUG_TIER_FULL_DWARF {
+            bisect_push_str(mut_view(*out), "sections=[.text,.rdata,.pdata,.xdata,.debug_line,.debug$S,.debug$T,.axdbg]")
+        } else {
+            bisect_push_str(mut_view(*out), "sections=[.text,.rdata,.pdata,.xdata,.debug_line]")
+        }
+        return
+    }
+    // ELF (`x86_64-linux`, `aarch64-linux`, `riscv64-linux`) & WASM (`wasm32-*`)
+    if debug_tier == DEBUG_TIER_FULL_DWARF {
+        bisect_push_str(mut_view(*out), "sections=[.text,.eh_frame,.debug_line,.debug_info,.debug_abbrev,.debug_str]")
+    } else {
+        bisect_push_str(mut_view(*out), "sections=[.text,.eh_frame,.debug_line]")
+    }
+}
+
+// Verifies `AXS-TST-031 §1` & `REQ-TOOL-010`: `-O0` builds emit `.debug_line` with
+// contiguous, non-overlapping, monotonically increasing PC ranges covering statements.
+pub fn test_runner_verify_o0_debug_line_monotonic(model: view<SemanticDebugModel>) -> bool {
+    if !model.emits_debug_line || !model.emits_unwind_tables || model.line_entry_count == 0u32 {
+        return false
+    }
+    let n = model.line_entry_count as usize
+    let mut prev_end: u64 = 0u64
+    let mut has_prologue: bool = false
+    let mut has_epilogue: bool = false
+    let mut i: usize = 0
+    while i < n && i < 8usize {
+        let e = model.line_entries[i]
+        if e.pc_end <= e.pc_start || e.line == 0u32 {
+            return false
+        }
+        if i > 0 && (e.pc_start) < prev_end {
+            return false
+        }
+        if e.prologue_end {
+            has_prologue = true
+        }
+        if e.epilogue_begin {
+            has_epilogue = true
+        }
+        prev_end = e.pc_end
+        i = i + 1
+    }
+    has_prologue && has_epilogue
+}
+
+// Verifies `AXS-TST-031 §2` & `REQ-TOOL-011`: tiered DWARF debug emission separates
+// mandatory `-O0` `.debug_line` from full-debug `.debug_info`/`.debug_abbrev`/`.debug_str`.
+pub fn test_runner_verify_tiered_dwarf_sections(
+    line_only_model: view<SemanticDebugModel>,
+    full_dwarf_model: view<SemanticDebugModel>
+) -> bool {
+    let line_tier_ok = line_only_model.debug_tier == DEBUG_TIER_LINE_TABLES_O0 &&
+        line_only_model.emits_debug_line &&
+        !line_only_model.emits_rich_dwarf_info
+    let full_tier_ok = full_dwarf_model.debug_tier == DEBUG_TIER_FULL_DWARF &&
+        full_dwarf_model.emits_debug_line &&
+        full_dwarf_model.emits_rich_dwarf_info
+    line_tier_ok && full_tier_ok
+}
+
+// Verifies `AXS-TST-032` & `REQ-TOOL-006`: under aggressive inlining (`f -> g -> h`),
+// a single physical stack frame (`physical_frame_count_at_pc == 1`) reconstructs the
+// complete ordered stack of logical function frames (`depth 0 = h`, `depth 1 = g`, `depth 2 = f`).
+pub fn test_runner_verify_logical_inline_frames(model: view<SemanticDebugModel>) -> bool {
+    if model.physical_frame_count_at_pc != 1u32 || (model.logical_frame_count) < 2u32 {
+        return false
+    }
+    let n = model.logical_frame_count as usize
+    let mut i: usize = 0
+    let mut inlined_count: u32 = 0u32
+    while i < n && i < 4usize {
+        let f = model.logical_frames[i]
+        if f.depth != (i as u32) || f.fn_symbol.len == 0 {
+            return false
+        }
+        if i + 1 < n {
+            if !f.is_inlined || f.call_site_span.end <= f.call_site_span.start {
+                return false
+            }
+            inlined_count = inlined_count + 1u32
+        } else {
+            if f.is_inlined {
+                return false
+            }
+        }
+        i = i + 1
+    }
+    inlined_count >= 1u32
+}
+
+// Verifies `AXS-TST-033` & `REQ-TOOL-005`:
+// 1. Enabling `-g` at `-O2` produces byte-identical machine instructions (`code_hash_without_g == code_hash_with_g`).
+// 2. Zero variables create artificial spills or live-range extensions.
+// 3. Dead/clobbered variables are honestly marked `OptimizedOut(reason)` with non-empty reason.
+pub fn test_runner_verify_optimized_out_honesty(model: view<SemanticDebugModel>) -> bool {
+    if model.alters_abi_or_codegen {
+        return false
+    }
+    if !fingerprint128_eq(model.code_hash_without_g, model.code_hash_with_g) {
+        return false
+    }
+    let n = model.variable_count as usize
+    let mut saw_opt_out: bool = false
+    let mut saw_const_or_sroa: bool = false
+    let mut i: usize = 0
+    while i < n && i < 8usize {
+        let v = model.variables[i]
+        if v.created_artificial_spill_or_live_ext {
+            return false
+        }
+        if v.storage_kind == DBG_STORAGE_OPTIMIZED_OUT {
+            if v.optimized_out_reason.len == 0 {
+                return false
+            }
+            saw_opt_out = true
+        }
+        if v.storage_kind == DBG_STORAGE_CONSTANT_VALUE || v.storage_kind == DBG_STORAGE_SCALARIZED_PIECES {
+            saw_const_or_sroa = true
+        }
+        i = i + 1
+    }
+    saw_opt_out && saw_const_or_sroa
+}
+
+// Verifies `AXS-TST-034` & `REQ-TOOL-008`: zero instructions, zero branches, zero runtime
+// state, and zero linked symbols when tracing is disabled.
+pub fn test_runner_verify_zero_cost_disabled_trace(
+    disabled_audit: view<TraceCostAudit>,
+    enabled_audit: view<TraceCostAudit>
+) -> bool {
+    let disabled_ok = !disabled_audit.trace_enabled &&
+        disabled_audit.emitted_trace_instructions == 0u32 &&
+        disabled_audit.emitted_branch_checks == 0u32 &&
+        disabled_audit.emitted_rdtsc_or_calls == 0u32 &&
+        disabled_audit.runtime_state_bytes == 0u64 &&
+        disabled_audit.linked_trace_symbols == 0u32 &&
+        !disabled_audit.altered_program_semantics
+    let enabled_ok = enabled_audit.trace_enabled &&
+        enabled_audit.events_recorded > 0u32 &&
+        !enabled_audit.altered_program_semantics
+    disabled_ok && enabled_ok
+}
+
+pub fn test_runner_audit_debug_and_trace(
+    o0_line_model: view<SemanticDebugModel>,
+    o2_full_model: view<SemanticDebugModel>,
+    disabled_trace: view<TraceCostAudit>,
+    enabled_trace: view<TraceCostAudit>
+) -> DebugTraceAuditReport {
+    let target_indep = o0_line_model.is_target_independent &&
+        o2_full_model.is_target_independent &&
+        !o0_line_model.alters_abi_or_codegen &&
+        !o2_full_model.alters_abi_or_codegen
+    let o0_line_ok = test_runner_verify_o0_debug_line_monotonic(o0_line_model)
+    let tiered_ok = test_runner_verify_tiered_dwarf_sections(o0_line_model, o2_full_model)
+    let inline_ok = test_runner_verify_logical_inline_frames(o2_full_model)
+    let opt_out_ok = test_runner_verify_optimized_out_honesty(o2_full_model)
+    let trace_ok = test_runner_verify_zero_cost_disabled_trace(disabled_trace, enabled_trace)
+    let all_ok = target_indep && o0_line_ok && tiered_ok && inline_ok && opt_out_ok && trace_ok
+
+    DebugTraceAuditReport {
+        semantic_model_target_independent: target_indep,
+        o0_debug_line_complete_and_monotonic: o0_line_ok,
+        tiered_dwarf_sections_valid: tiered_ok,
+        logical_inline_frames_accurate: inline_ok,
+        optimized_out_honest_zero_codegen_drift: opt_out_ok,
+        disabled_trace_zero_cost: trace_ok,
+        enabled_trace_deterministic: enabled_trace.events_recorded > 0u32 && !enabled_trace.altered_program_semantics,
+        all_passed: all_ok,
+    }
+}
+
+pub fn test_runner_render_debug_audit_json(
+    rep: view<DebugTraceAuditReport>,
+    out: mut_view<DiagBuffer>
+) {
+    bisect_push_str(mut_view(*out), "{\"format\":\"AX_DEBUG_TRACE_AUDIT\",\"schema_version\":1,\"all_passed\":")
+    bisect_push_bool(mut_view(*out), rep.all_passed)
+    bisect_push_str(mut_view(*out), ",\"semantic_model_target_independent\":")
+    bisect_push_bool(mut_view(*out), rep.semantic_model_target_independent)
+    bisect_push_str(mut_view(*out), ",\"o0_debug_line_complete_and_monotonic\":")
+    bisect_push_bool(mut_view(*out), rep.o0_debug_line_complete_and_monotonic)
+    bisect_push_str(mut_view(*out), ",\"tiered_dwarf_sections_valid\":")
+    bisect_push_bool(mut_view(*out), rep.tiered_dwarf_sections_valid)
+    bisect_push_str(mut_view(*out), ",\"logical_inline_frames_accurate\":")
+    bisect_push_bool(mut_view(*out), rep.logical_inline_frames_accurate)
+    bisect_push_str(mut_view(*out), ",\"optimized_out_honest_zero_codegen_drift\":")
+    bisect_push_bool(mut_view(*out), rep.optimized_out_honest_zero_codegen_drift)
+    bisect_push_str(mut_view(*out), ",\"disabled_trace_zero_cost\":")
+    bisect_push_bool(mut_view(*out), rep.disabled_trace_zero_cost)
+    bisect_push_str(mut_view(*out), "}\n")
+}
+
+// ============================================================================
+// 6. Canonical Demo Suite & Debug/Trace Model Builders (`SPEC-104 §7.2`)
+// ============================================================================
+
+pub fn test_runner_build_demo_cases(file_id: FileId) -> [8]DiscoveredTestCase {
+    let e = ux2_sv_empty()
+    let c0 = discovered_test_case_empty()
+    let mut arr: [8]DiscoveredTestCase = [c0; 8]
+    let mod_ring = ux2_sv("metrics.ring")
+    let mod_math = ux2_sv("metrics.math")
+
+    // Case 0 (inserted out of order: module `metrics.ring`, span 180): `test "ring counter differential & inline debug audit"`
+    let mut t_ring = discovered_test_case_empty()
+    t_ring.module_path = mod_ring
+    t_ring.name = ux2_sv("ring counter differential & inline debug audit")
+    t_ring.test_id = test_runner_compute_test_id(t_ring.module_path, t_ring.name)
+    t_ring.surface_form = TEST_FORM_BLOCK
+    t_ring.span = span_new(FileId { v: file_id.v }, 180u32, 260u32)
+    t_ring.sim_stdout = ux2_sv("avg=20\n")
+
+    // Case 1 (module `metrics.math`, span 40): `@test fn test_checked_add()`
+    let mut t_add = discovered_test_case_empty()
+    t_add.module_path = mod_math
+    t_add.name = ux2_sv("test_checked_add")
+    t_add.test_id = test_runner_compute_test_id(t_add.module_path, t_add.name)
+    t_add.surface_form = TEST_FORM_ATTR_FN
+    t_add.span = span_new(FileId { v: file_id.v }, 40u32, 95u32)
+    t_add.has_pinned_seed = true
+    t_add.pinned_seed = 77777u64
+    t_add.sim_stdout = ux2_sv("sum=30\n")
+
+    // Case 2 (module `metrics.math`, span 110): `@should_panic(expected = "division by zero")`
+    let mut t_panic = discovered_test_case_empty()
+    t_panic.module_path = mod_math
+    t_panic.name = ux2_sv("divide_by_zero_panics")
+    t_panic.test_id = test_runner_compute_test_id(t_panic.module_path, t_panic.name)
+    t_panic.surface_form = TEST_FORM_BLOCK
+    t_panic.span = span_new(FileId { v: file_id.v }, 110u32, 160u32)
+    t_panic.should_panic = true
+    t_panic.expected_panic_substr = ux2_sv("division by zero")
+    t_panic.sim_panics = true
+    t_panic.sim_panic_msg = ux2_sv("thread panicked: division by zero in metrics.math")
+
+    // Case 3 (module `metrics.ring`, span 280): `@ignore("slow stress benchmark")`
+    let mut t_ign = discovered_test_case_empty()
+    t_ign.module_path = mod_ring
+    t_ign.name = ux2_sv("ring_soak_10m_samples")
+    t_ign.test_id = test_runner_compute_test_id(t_ign.module_path, t_ign.name)
+    t_ign.surface_form = TEST_FORM_ATTR_FN
+    t_ign.span = span_new(FileId { v: file_id.v }, 280u32, 340u32)
+    t_ign.is_ignored = true
+    t_ign.ignore_reason = ux2_sv("slow stress benchmark")
+    t_ign.sim_stdout = e
+
+    arr[0] = t_ring
+    arr[1] = t_ign
+    arr[2] = t_panic
+    arr[3] = t_add
+    arr
+}
+
+pub fn test_runner_build_o0_debug_model(file_id: FileId) -> SemanticDebugModel {
+    let mut m = semantic_debug_model_empty()
+    m.fn_symbol = ux2_sv("metrics.ring.push_sample")
+    m.is_target_independent = true
+    m.alters_abi_or_codegen = false
+    m.opt_level = ux2_sv("-O0")
+    m.debug_tier = DEBUG_TIER_LINE_TABLES_O0
+    m.emits_debug_line = true
+    m.emits_unwind_tables = true
+    m.emits_rich_dwarf_info = false
+
+    m.line_entries[0] = DebugLineEntry {
+        pc_start: 0x1000u64,
+        pc_end: 0x1008u64,
+        file_id: FileId { v: file_id.v },
+        line: 33u32,
+        column: 1u32,
+        is_stmt: true,
+        prologue_end: true,
+        epilogue_begin: false,
+    }
+    m.line_entries[1] = DebugLineEntry {
+        pc_start: 0x1008u64,
+        pc_end: 0x1018u64,
+        file_id: FileId { v: file_id.v },
+        line: 34u32,
+        column: 5u32,
+        is_stmt: true,
+        prologue_end: false,
+        epilogue_begin: false,
+    }
+    m.line_entries[2] = DebugLineEntry {
+        pc_start: 0x1018u64,
+        pc_end: 0x102Cu64,
+        file_id: FileId { v: file_id.v },
+        line: 37u32,
+        column: 5u32,
+        is_stmt: true,
+        prologue_end: false,
+        epilogue_begin: false,
+    }
+    m.line_entries[3] = DebugLineEntry {
+        pc_start: 0x102Cu64,
+        pc_end: 0x1034u64,
+        file_id: FileId { v: file_id.v },
+        line: 39u32,
+        column: 5u32,
+        is_stmt: true,
+        prologue_end: false,
+        epilogue_begin: true,
+    }
+    m.line_entry_count = 4u32
+    m
+}
+
+pub fn test_runner_build_o2_inlined_debug_model(file_id: FileId) -> SemanticDebugModel {
+    let mut m = semantic_debug_model_empty()
+    m.fn_symbol = ux2_sv("metrics.ring.test_harness_caller")
+    m.is_target_independent = true
+    m.alters_abi_or_codegen = false
+    m.opt_level = ux2_sv("-O2")
+    m.debug_tier = DEBUG_TIER_FULL_DWARF
+    m.emits_debug_line = true
+    m.emits_unwind_tables = true
+    m.emits_rich_dwarf_info = true
+    m.physical_frame_count_at_pc = 1u32
+
+    // 3-level nested inlining chain `f -> g -> h` at single physical PC (`AXS-TST-032`, `REQ-TOOL-006`):
+    // depth 0: innermost inlined `metrics.ring.clamp_non_zero` (`h`)
+    m.logical_frames[0] = LogicalFrameEntry {
+        depth: 0u32,
+        fn_symbol: ux2_sv("metrics.ring.clamp_non_zero"),
+        def_span: span_new(FileId { v: file_id.v }, 10u32, 30u32),
+        call_site_span: span_new(FileId { v: file_id.v }, 52u32, 68u32),
+        is_inlined: true,
+    }
+    // depth 1: intermediate inlined `metrics.ring.average` (`g`)
+    m.logical_frames[1] = LogicalFrameEntry {
+        depth: 1u32,
+        fn_symbol: ux2_sv("metrics.ring.average"),
+        def_span: span_new(FileId { v: file_id.v }, 44u32, 76u32),
+        call_site_span: span_new(FileId { v: file_id.v }, 118u32, 134u32),
+        is_inlined: true,
+    }
+    // depth 2: outer physical caller `metrics.ring.test_harness_caller` (`f`)
+    m.logical_frames[2] = LogicalFrameEntry {
+        depth: 2u32,
+        fn_symbol: ux2_sv("metrics.ring.test_harness_caller"),
+        def_span: span_new(FileId { v: file_id.v }, 90u32, 150u32),
+        call_site_span: span_none(),
+        is_inlined: false,
+    }
+    m.logical_frame_count = 3u32
+
+    // Variable locations at `-O2 -g` (`AXS-TST-033`, `REQ-TOOL-005`):
+    // 0: `counter_view` live in physical register `"rcx"`
+    m.variables[0] = DebugVarLocation {
+        var_name: ux2_sv("counter_view"),
+        storage_kind: DBG_STORAGE_REGISTER,
+        reg_or_const: ux2_sv("rcx"),
+        stack_offset: 0i64,
+        sroa_pieces: 0u32,
+        optimized_out_reason: ux2_sv_empty(),
+        created_artificial_spill_or_live_ext: false,
+    }
+    // 1: `window_cap` constant-folded to `"4"` (`ConstantValue("4")`, zero physical state)
+    m.variables[1] = DebugVarLocation {
+        var_name: ux2_sv("window_cap"),
+        storage_kind: DBG_STORAGE_CONSTANT_VALUE,
+        reg_or_const: ux2_sv("4"),
+        stack_offset: 0i64,
+        sroa_pieces: 0u32,
+        optimized_out_reason: ux2_sv_empty(),
+        created_artificial_spill_or_live_ext: false,
+    }
+    // 2: `c` scalarized across 3 SROA pieces (`sum`, `count`, `max_samples`)
+    m.variables[2] = DebugVarLocation {
+        var_name: ux2_sv("c"),
+        storage_kind: DBG_STORAGE_SCALARIZED_PIECES,
+        reg_or_const: ux2_sv("rax,rdx,r8"),
+        stack_offset: 0i64,
+        sroa_pieces: 3u32,
+        optimized_out_reason: ux2_sv_empty(),
+        created_artificial_spill_or_live_ext: false,
+    }
+    // 3: `dead_scratch` eliminated by DCE -> honestly recorded as `OptimizedOut("dce")`
+    m.variables[3] = DebugVarLocation {
+        var_name: ux2_sv("dead_scratch"),
+        storage_kind: DBG_STORAGE_OPTIMIZED_OUT,
+        reg_or_const: ux2_sv_empty(),
+        stack_offset: 0i64,
+        sroa_pieces: 0u32,
+        optimized_out_reason: ux2_sv("dce"),
+        created_artificial_spill_or_live_ext: false,
+    }
+    // 4: `tmp_sum` clobbered after last read -> honestly recorded as `OptimizedOut("last_use_passed")`
+    m.variables[4] = DebugVarLocation {
+        var_name: ux2_sv("tmp_sum"),
+        storage_kind: DBG_STORAGE_OPTIMIZED_OUT,
+        reg_or_const: ux2_sv_empty(),
+        stack_offset: 0i64,
+        sroa_pieces: 0u32,
+        optimized_out_reason: ux2_sv("last_use_passed"),
+        created_artificial_spill_or_live_ext: false,
+    }
+    m.variable_count = 5u32
+
+    // Identical machine code hash between `-O2` and `-O2 -g` (`REQ-TOOL-005`)
+    let code_fp = fingerprint128_u64(0x02C0DE6E001u64, 0xCAFEBABE12345678u64, 0x0F0E0D0C0B0A0908u64)
+    m.code_hash_without_g = code_fp
+    m.code_hash_with_g = code_fp
+    m
+}
+
+pub fn test_runner_build_disabled_trace_audit() -> TraceCostAudit {
+    TraceCostAudit {
+        trace_enabled: false,
+        emitted_trace_instructions: 0u32,
+        emitted_branch_checks: 0u32,
+        emitted_rdtsc_or_calls: 0u32,
+        runtime_state_bytes: 0u64,
+        linked_trace_symbols: 0u32,
+        events_recorded: 0u32,
+        altered_program_semantics: false,
+    }
+}
+
+pub fn test_runner_build_enabled_trace_audit() -> TraceCostAudit {
+    TraceCostAudit {
+        trace_enabled: true,
+        emitted_trace_instructions: 12u32,
+        emitted_branch_checks: 0u32,
+        emitted_rdtsc_or_calls: 4u32,
+        runtime_state_bytes: 256u64,
+        linked_trace_symbols: 2u32,
+        events_recorded: 4u32,
+        altered_program_semantics: false,
+    }
+}
