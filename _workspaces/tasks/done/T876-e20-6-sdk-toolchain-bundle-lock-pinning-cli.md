@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T856, T874, T875]
 priority: 226
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [std/sdk/bundle, compiler/driver/sdk_cmd, tests/run/sdk_toolchain_cli]
 spec: [spec/SPEC-116-sdk-sysroot-toolchain-distribution.md, tasks/0605, tasks/1034, tasks/0661, tasks/0858]
 covers: [REQ-ECO-8736, REQ-PKG-022]
+started: 2026-11-09 01:12:52
+finished: 2026-11-09 02:23:48
 ---
 # T876 — E20.6 Hermetic multi-target SDK/sysroot & toolchain archive packager, axiom.lock SDK pinning & axiomc sdk/toolchain CLI
 
@@ -40,3 +42,5 @@ Implement the hermetic multi-target SDK/sysroot and `AXTOOLCHAIN` bundle package
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-09 01:12:52 started (attempt 1) axiom-stdlib
+- 2026-11-09 02:23:48 accepted by QA -> done

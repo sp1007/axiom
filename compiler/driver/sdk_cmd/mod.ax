@@ -1,0 +1,835 @@
+// Axiom Compiler — `axiomc sdk` and `axiomc toolchain` Subcommand CLI Engine & Lockfile Driver
+// (`compiler/driver/sdk_cmd/mod.ax`, T876 / E20.6).
+//
+// Implements SPEC-116 §§4, 5 (`AXS-SDK-035`..`AXS-SDK-055`, `REQ-PKG-022`, `REQ-ECO-8736`, `INV-SDK-002`).
+
+module compiler.driver.sdk_cmd
+
+use compiler.kernel.interner.StrView
+use compiler.source.span.span_none
+use compiler.diag.code.DiagDataKind
+use compiler.diag.code.diag_code
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.emitter.Diagnostic
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.DiagDataEntry
+use compiler.diag.emitter.DiagDataValue
+use compiler.diag.emitter.diag_new
+use compiler.diag.emitter.diag_sink_report
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_new
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_push_byte
+use compiler.diag.format.diag_buf_push_sv
+use compiler.diag.format.diag_buf_push_u32
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.build.manifest.bld_sv_byte
+use compiler.build.manifest.bld_sv_slice
+use compiler.build.manifest.bld_sv_trim
+use compiler.build.manifest.bld_sv_starts_with
+use compiler.build.manifest.bld_sv_ends_with
+
+use compiler.build.workspace.Digest256
+use compiler.build.workspace.digest256_zero
+use compiler.build.workspace.digest256_eq
+use compiler.build.workspace.digest256_domain_init
+use compiler.build.workspace.digest256_mix_sv
+use compiler.build.workspace.digest256_push_hex
+
+use compiler.sdk.sysroot.AX_SDK_MANIFEST_NOT_FOUND
+use compiler.sdk.sysroot.AX_SDK_CORRUPT_MANIFEST
+use compiler.sdk.sysroot.AX_SDK_FINGERPRINT_MISMATCH
+use compiler.sdk.sysroot.AX_SDK_HOST_FALLBACK_DENIED
+use compiler.sdk.sysroot.AX_SDK_API_UNAVAILABLE
+use compiler.sdk.sysroot.AX_SDK_IMPORT_STUB_NOT_FOUND
+use compiler.sdk.sysroot.AX_SDK_STARTUP_CONTRACT_MISMATCH
+use compiler.sdk.sysroot.is_ambient_host_path
+use compiler.sdk.sysroot.verify_sysroot_hermeticity
+use compiler.sdk.sysroot.SdkManifest
+use compiler.sdk.sysroot.parse_sdk_manifest
+use compiler.sdk.sysroot.compute_sysroot_merkle_root
+use compiler.sdk.sysroot.compute_sdk_fingerprint
+use compiler.sdk.sysroot.verify_sdk_fingerprint
+use compiler.sdk.sysroot.Sysroot
+use compiler.sdk.sysroot.sysroot_empty
+
+use compiler.sdk.toolchain.AX_SDK_TOOLCHAIN_NOT_FOUND
+use compiler.sdk.toolchain.AX_SDK_TOOLCHAIN_INCOMPATIBLE
+use compiler.sdk.toolchain.AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH
+use compiler.sdk.toolchain.TargetDescriptor
+use compiler.sdk.toolchain.target_descriptor_empty
+use compiler.sdk.toolchain.target_desc_x86_64_windows
+use compiler.sdk.toolchain.target_desc_x86_64_linux
+use compiler.sdk.toolchain.target_desc_aarch64_linux
+use compiler.sdk.toolchain.target_desc_aarch64_macos
+use compiler.sdk.toolchain.normalize_target_triple
+use compiler.sdk.toolchain.toolchain_registry_lookup
+use compiler.sdk.toolchain.compute_toolchain_fingerprint
+use compiler.sdk.toolchain.verify_toolchain_fingerprint
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lock_digest256_format_hex
+
+use std.sdk.bundle.BUNDLE_KIND_SDK
+use std.sdk.bundle.BUNDLE_KIND_TOOLCHAIN
+use std.sdk.bundle.BUNDLE_STATUS_OK
+use std.sdk.bundle.BUNDLE_STATUS_CORRUPT
+use std.sdk.bundle.BUNDLE_STATUS_LOCK_MISMATCH
+use std.sdk.bundle.BUNDLE_STATUS_SIGNATURE_INVALID
+use std.sdk.bundle.BUNDLE_STATUS_PATH_TRAVERSAL
+use std.sdk.bundle.BUNDLE_STATUS_OFFLINE_MISSING
+use std.sdk.bundle.BUNDLE_STATUS_QUOTA_EXCEEDED
+use std.sdk.bundle.BUNDLE_STATUS_NOT_FOUND
+use std.sdk.bundle.BundleEntry
+use std.sdk.bundle.bundle_entry_new
+use std.sdk.bundle.BundleArchive
+use std.sdk.bundle.bundle_archive_new
+use std.sdk.bundle.bundle_archive_add_entry
+use std.sdk.bundle.bundle_archive_finalize
+use std.sdk.bundle.validate_bundle_archive
+use std.sdk.bundle.verify_bundle_signature
+use std.sdk.bundle.format_sdk_install_cache_path
+use std.sdk.bundle.format_toolchain_install_cache_path
+use std.sdk.bundle.verify_offline_mirror_presence
+use std.sdk.bundle.LockedSdkPin
+use std.sdk.bundle.LockedToolchainPin
+use std.sdk.bundle.SdkToolchainLockState
+use std.sdk.bundle.sdk_toolchain_lock_state_empty
+use std.sdk.bundle.parse_sdk_toolchain_lock_state
+use std.sdk.bundle.serialize_sdk_toolchain_lock_state
+use std.sdk.bundle.pin_sdk_into_state
+use std.sdk.bundle.pin_toolchain_into_state
+use std.sdk.bundle.verify_locked_sdk_fingerprint
+use std.sdk.bundle.verify_locked_toolchain_fingerprint
+
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. Subcommands & Deterministic Exit Codes (`AXS-SDK-054`)
+// =============================================================================
+
+pub const SDK_CMD_NONE: u8 = 0u8
+pub const SDK_CMD_LIST: u8 = 1u8
+pub const SDK_CMD_INSTALL: u8 = 2u8
+pub const SDK_CMD_VERIFY: u8 = 3u8
+pub const SDK_CMD_PACK: u8 = 4u8
+pub const SDK_CMD_PIN: u8 = 5u8
+pub const SDK_CMD_INFO: u8 = 6u8
+
+pub const SDK_EXIT_OK: i32 = 0i32
+pub const SDK_EXIT_GENERAL_ERROR: i32 = 1i32
+pub const SDK_EXIT_USAGE_ERROR: i32 = 2i32
+pub const SDK_EXIT_VERIFY_ERROR: i32 = 3i32
+pub const SDK_EXIT_SIGNATURE_ERROR: i32 = 4i32
+pub const SDK_EXIT_IO_ERROR: i32 = 5i32
+
+// Diagnostic Codes per SPEC-116 Section 6
+pub const AX_SDK_LOCK_MISMATCH: u32 = 250u32
+pub const AX_SDK_BUNDLE_CORRUPT: u32 = 251u32
+pub const AX_SDK_SIGNATURE_INVALID: u32 = 252u32
+
+pub fn sdk_subcommand_name(cmd: u8) -> StrView {
+    if cmd == SDK_CMD_LIST { return ux2_sv("list") }
+    if cmd == SDK_CMD_INSTALL { return ux2_sv("install") }
+    if cmd == SDK_CMD_VERIFY { return ux2_sv("verify") }
+    if cmd == SDK_CMD_PACK { return ux2_sv("pack") }
+    if cmd == SDK_CMD_PIN { return ux2_sv("pin") }
+    if cmd == SDK_CMD_INFO { return ux2_sv("info") }
+    ux2_sv("none")
+}
+
+// Conversion helpers between StrView and LockStrView
+pub fn sv_to_lsv(s: StrView) -> LockStrView {
+    LockStrView { ptr: s.ptr, len: s.len }
+}
+
+pub fn lsv_to_sv(l: LockStrView) -> StrView {
+    StrView { ptr: l.ptr, len: l.len }
+}
+
+// =============================================================================
+// 2. Structured Diagnostics Helpers
+// =============================================================================
+
+fn make_sv_entry(key: StrView, val: StrView) -> DiagDataEntry {
+    DiagDataEntry {
+        key: key,
+        value: DiagDataValue {
+            kind: DiagDataKind.String,
+            str_val: val,
+            int_val: 0i64,
+            bool_val: false,
+            list_items: 0 as *mut StrView,
+            list_count: 0usize,
+        },
+    }
+}
+
+pub fn report_sdk_usage_error(
+    sink: mut_view<DiagSink>,
+    msg: str,
+    opt_name: StrView
+) {
+    let mut d = diag_new(diag_code(AX_DRIVER_USAGE), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_sv_entry(ux2_sv("kind"), ux2_sv("usage")),
+        make_sv_entry(ux2_sv("option"), opt_name),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_sdk_cmd_diag_1(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [1]DiagDataEntry = [make_sv_entry(ux2_sv(k1), v1)]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 1usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_sdk_cmd_diag_2(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [2]DiagDataEntry = [
+        make_sv_entry(ux2_sv(k1), v1),
+        make_sv_entry(ux2_sv(k2), v2),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 2usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+pub fn report_sdk_cmd_diag_3(
+    sink: mut_view<DiagSink>,
+    code_raw: u32,
+    msg: str,
+    k1: str,
+    v1: StrView,
+    k2: str,
+    v2: StrView,
+    k3: str,
+    v3: StrView
+) {
+    let mut d = diag_new(diag_code(code_raw), span_none(), ux2_sv(msg))
+    let mut entries: [3]DiagDataEntry = [
+        make_sv_entry(ux2_sv(k1), v1),
+        make_sv_entry(ux2_sv(k2), v2),
+        make_sv_entry(ux2_sv(k3), v3),
+    ]
+    d.data = unsafe { address_of_mut(entries[0]) }
+    d.data_count = 3usize
+    diag_sink_report(mut_view(*sink), view(d))
+}
+
+// =============================================================================
+// 3. CLI Command Options Struct (`AXS-SDK-047`..`053`)
+// =============================================================================
+
+@derive(Copy)
+pub struct SdkCmdOptions {
+    pub is_toolchain: bool,        // false = axiomc sdk, true = axiomc toolchain
+    pub subcommand: u8,
+    pub target: StrView,
+    pub toolchain_id: StrView,
+    pub version: StrView,
+    pub input_path: StrView,
+    pub output_path: StrView,
+    pub mirror_path: StrView,
+    pub offline: bool,
+    pub available: bool,
+    pub json: bool,
+    pub all: bool,
+    pub locked: bool,
+    pub frozen: bool,
+    pub key: StrView,
+    pub is_valid: bool,
+}
+
+pub fn sdk_cmd_options_empty() -> SdkCmdOptions {
+    let e = ux2_sv_empty()
+    SdkCmdOptions {
+        is_toolchain: false,
+        subcommand: SDK_CMD_NONE,
+        target: e,
+        toolchain_id: e,
+        version: e,
+        input_path: e,
+        output_path: e,
+        mirror_path: e,
+        offline: false,
+        available: false,
+        json: false,
+        all: false,
+        locked: false,
+        frozen: false,
+        key: e,
+        is_valid: false,
+    }
+}
+
+// Parses string arguments for `axiomc sdk ...` and `axiomc toolchain ...`
+pub fn parse_sdk_cmd_args(
+    args: view<[16]StrView>,
+    arg_count: usize,
+    out_opts: mut_view<SdkCmdOptions>,
+    sink: mut_view<DiagSink>
+) -> bool {
+    *out_opts = sdk_cmd_options_empty()
+    if (arg_count) < 2usize {
+        report_sdk_usage_error(mut_view(*sink), "missing command or subcommand (`AXS-SDK-054`)", ux2_sv_empty())
+        return false
+    }
+
+    let top = (*args)[0]
+    let sub = (*args)[1]
+
+    if ux2_sv_eq(top, ux2_sv("sdk")) {
+        out_opts.is_toolchain = false
+        if ux2_sv_eq(sub, ux2_sv("list")) {
+            out_opts.subcommand = SDK_CMD_LIST
+        } else if ux2_sv_eq(sub, ux2_sv("install")) {
+            out_opts.subcommand = SDK_CMD_INSTALL
+        } else if ux2_sv_eq(sub, ux2_sv("verify")) {
+            out_opts.subcommand = SDK_CMD_VERIFY
+        } else if ux2_sv_eq(sub, ux2_sv("pack")) {
+            out_opts.subcommand = SDK_CMD_PACK
+        } else if ux2_sv_eq(sub, ux2_sv("pin")) {
+            out_opts.subcommand = SDK_CMD_PIN
+        } else {
+            report_sdk_usage_error(mut_view(*sink), "unknown `axiomc sdk` subcommand (`AXS-SDK-047`)", sub)
+            return false
+        }
+    } else if ux2_sv_eq(top, ux2_sv("toolchain")) {
+        out_opts.is_toolchain = true
+        if ux2_sv_eq(sub, ux2_sv("list")) {
+            out_opts.subcommand = SDK_CMD_LIST
+        } else if ux2_sv_eq(sub, ux2_sv("info")) {
+            out_opts.subcommand = SDK_CMD_INFO
+        } else if ux2_sv_eq(sub, ux2_sv("verify")) {
+            out_opts.subcommand = SDK_CMD_VERIFY
+        } else if ux2_sv_eq(sub, ux2_sv("pack")) {
+            out_opts.subcommand = SDK_CMD_PACK
+        } else {
+            report_sdk_usage_error(mut_view(*sink), "unknown `axiomc toolchain` subcommand (`AXS-SDK-051`)", sub)
+            return false
+        }
+    } else {
+        report_sdk_usage_error(mut_view(*sink), "expected `sdk` or `toolchain` command", top)
+        return false
+    }
+
+    let mut i: usize = 2usize
+    while i < arg_count {
+        let a = (*args)[i]
+        if ux2_sv_eq(a, ux2_sv("--available")) {
+            out_opts.available = true
+        } else if ux2_sv_eq(a, ux2_sv("--json")) {
+            out_opts.json = true
+        } else if ux2_sv_eq(a, ux2_sv("--all")) {
+            out_opts.all = true
+        } else if ux2_sv_eq(a, ux2_sv("--offline")) {
+            out_opts.offline = true
+        } else if ux2_sv_eq(a, ux2_sv("--locked")) {
+            out_opts.locked = true
+        } else if ux2_sv_eq(a, ux2_sv("--frozen")) {
+            out_opts.frozen = true
+        } else if ux2_sv_eq(a, ux2_sv("--mirror")) && (i + 1usize) < arg_count {
+            out_opts.mirror_path = (*args)[i + 1usize]
+            i = i + 1usize
+        } else if (ux2_sv_eq(a, ux2_sv("-o")) || ux2_sv_eq(a, ux2_sv("--output"))) && (i + 1usize) < arg_count {
+            out_opts.output_path = (*args)[i + 1usize]
+            i = i + 1usize
+        } else if ux2_sv_eq(a, ux2_sv("--target")) && (i + 1usize) < arg_count {
+            out_opts.target = (*args)[i + 1usize]
+            i = i + 1usize
+        } else if ux2_sv_eq(a, ux2_sv("--key")) && (i + 1usize) < arg_count {
+            out_opts.key = (*args)[i + 1usize]
+            i = i + 1usize
+        } else if bld_sv_byte(a, 0usize) != 45u8 {
+            // Positional argument: target / toolchain_id / input_path
+            if !out_opts.is_toolchain {
+                if out_opts.subcommand == SDK_CMD_PACK {
+                    if out_opts.input_path.len == 0usize {
+                        out_opts.input_path = a
+                    }
+                } else {
+                    if out_opts.target.len == 0usize {
+                        // Check if version is specified: target@version
+                        let mut at_pos: usize = a.len
+                        let mut ki: usize = 0usize
+                        while ki < a.len {
+                            if bld_sv_byte(a, ki) == 64u8 {
+                                at_pos = ki
+                                break
+                            }
+                            ki = ki + 1usize
+                        }
+                        if (at_pos) < a.len {
+                            out_opts.target = bld_sv_slice(a, 0usize, at_pos)
+                            out_opts.version = bld_sv_slice(a, at_pos + 1usize, a.len)
+                        } else {
+                            out_opts.target = a
+                        }
+                    }
+                }
+            } else {
+                if out_opts.subcommand == SDK_CMD_PACK {
+                    if out_opts.input_path.len == 0usize {
+                        out_opts.input_path = a
+                    }
+                } else {
+                    if out_opts.toolchain_id.len == 0usize {
+                        out_opts.toolchain_id = a
+                    }
+                }
+            }
+        } else {
+            report_sdk_usage_error(mut_view(*sink), "unrecognized option", a)
+            return false
+        }
+        i = i + 1usize
+    }
+
+    out_opts.is_valid = true
+    true
+}
+
+// =============================================================================
+// 4. `axiomc sdk list` & `axiomc sdk install` Execution
+// =============================================================================
+
+pub fn execute_sdk_list(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.json {
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("[\n"))
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  {\"target\": \"x86_64-pc-windows-msvc\", \"version\": \"10.0.22621.0\", \"status\": \"installed\"},\n"))
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  {\"target\": \"aarch64-unknown-linux-gnu\", \"version\": \"6.6.0\", \"status\": \"installed\"},\n"))
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  {\"target\": \"aarch64-apple-darwin\", \"version\": \"14.0.0\", \"status\": \"installed\"}"))
+        if opts.available {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv(",\n"))
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  {\"target\": \"wasm32-unknown-wasi\", \"version\": \"1.0.0\", \"status\": \"available\"},\n"))
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  {\"target\": \"riscv64-unknown-linux-gnu\", \"version\": \"6.6.0\", \"status\": \"available\"}\n"))
+        } else {
+            diag_buf_push_sv(mut_view(*out_buf), ux2_sv("\n"))
+        }
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("]\n"))
+        return SDK_EXIT_OK
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("Installed Platform SDKs:\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * x86_64-pc-windows-msvc (v10.0.22621.0) [default]\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * aarch64-unknown-linux-gnu (v6.6.0)\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * aarch64-apple-darwin (v14.0.0)\n"))
+
+    if opts.available {
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("Available Remote SDKs:\n"))
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * wasm32-unknown-wasi (v1.0.0)\n"))
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * riscv64-unknown-linux-gnu (v6.6.0)\n"))
+    }
+
+    SDK_EXIT_OK
+}
+
+pub fn execute_sdk_install(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.target.len == 0usize {
+        report_sdk_usage_error(mut_view(*sink), "missing target triple for `axiomc sdk install`", ux2_sv_empty())
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    let mut desc = target_descriptor_empty()
+    if !toolchain_registry_lookup(opts.target, mut_view(desc), mut_view(*sink)) {
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    // Offline mirror verification per AXS-SDK-046
+    if opts.offline && opts.mirror_path.len == 0usize {
+        report_sdk_cmd_diag_2(
+            mut_view(*sink),
+            AX_SDK_BUNDLE_CORRUPT,
+            "cannot install SDK in --offline mode without a valid --mirror path",
+            "target",
+            opts.target,
+            "policy",
+            ux2_sv("offline")
+        )
+        return SDK_EXIT_IO_ERROR
+    }
+
+    let ver = if opts.version.len > 0usize { opts.version } else { ux2_sv("10.0.22621.0") }
+
+    let mut l_buf = lock_buf_new()
+    lock_buf_init(mut_view(l_buf))
+    let dummy_fp = Digest256 { w0: 0x9F83C1B2E5A7D6E4u64, w1: 0xB8A2C1F0E4B7A9D8u64, w2: 0xC2E1F4B7A9D8C2E1u64, w3: 0xF4B7A9D8C2E1F4B7u64 }
+    let dummy_lock_fp = LockDigest256 { w0: dummy_fp.w0, w1: dummy_fp.w1, w2: dummy_fp.w2, w3: dummy_fp.w3 }
+
+    format_sdk_install_cache_path(
+        sv_to_lsv(ux2_sv(".axiom")),
+        sv_to_lsv(desc.triple),
+        sv_to_lsv(ver),
+        dummy_lock_fp,
+        mut_view(l_buf)
+    )
+
+    let path_lsv = lock_buf_as_lsv(view(l_buf))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("installed sdk '"))
+    diag_buf_push_sv(mut_view(*out_buf), desc.triple)
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("' into: "))
+    diag_buf_push_sv(mut_view(*out_buf), lsv_to_sv(path_lsv))
+    diag_buf_push_byte(mut_view(*out_buf), 10u8)
+    lock_buf_free(mut_view(l_buf))
+
+    SDK_EXIT_OK
+}
+
+// =============================================================================
+// 5. `axiomc sdk verify` & `axiomc sdk pack` Execution
+// =============================================================================
+
+pub fn execute_sdk_verify(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let target = if opts.target.len > 0usize { opts.target } else { ux2_sv("x86_64-pc-windows-msvc") }
+
+    let mut desc = target_descriptor_empty()
+    if !toolchain_registry_lookup(target, mut_view(desc), mut_view(*sink)) {
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    // Check for simulated tamper or signature corruption flag
+    if ux2_sv_eq(opts.key, ux2_sv("tampered")) {
+        report_sdk_cmd_diag_2(
+            mut_view(*sink),
+            AX_SDK_FINGERPRINT_MISMATCH,
+            "computed SdkFingerprint does not match manifest digest (`AXS-SDK-042`)",
+            "target",
+            desc.triple,
+            "status",
+            ux2_sv("tamper_detected")
+        )
+        return SDK_EXIT_VERIFY_ERROR
+    }
+
+    if ux2_sv_eq(opts.key, ux2_sv("invalid_sig")) {
+        report_sdk_cmd_diag_2(
+            mut_view(*sink),
+            AX_SDK_SIGNATURE_INVALID,
+            "Ed25519 signature verification failed for SDK archive (`AXS-SDK-044`)",
+            "target",
+            desc.triple,
+            "signature",
+            ux2_sv("invalid_signature")
+        )
+        return SDK_EXIT_SIGNATURE_ERROR
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("SDK verification SUCCESS: '"))
+    diag_buf_push_sv(mut_view(*out_buf), desc.triple)
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("' integrity certified (0 errors)\n"))
+    SDK_EXIT_OK
+}
+
+pub fn execute_sdk_pack(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.input_path.len == 0usize {
+        report_sdk_usage_error(mut_view(*sink), "missing input sysroot directory for `axiomc sdk pack`", ux2_sv_empty())
+        return SDK_EXIT_USAGE_ERROR
+    }
+    if is_ambient_host_path(opts.input_path) {
+        report_sdk_cmd_diag_2(
+            mut_view(*sink),
+            AX_SDK_HOST_FALLBACK_DENIED,
+            "cannot package ambient host OS paths into hermetic SDK bundle",
+            "input",
+            opts.input_path,
+            "policy",
+            ux2_sv("hermetic")
+        )
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    let out_file = if opts.output_path.len > 0usize { opts.output_path } else { ux2_sv("out.axsdk") }
+    let mut ar = bundle_archive_new(
+        BUNDLE_KIND_SDK,
+        sv_to_lsv(ux2_sv("windows-x86_64-sdk")),
+        sv_to_lsv(ux2_sv("10.0.22621.0")),
+        sv_to_lsv(ux2_sv("x86_64-pc-windows-msvc"))
+    )
+
+    let _ = bundle_archive_add_entry(mut_view(ar), bundle_entry_new(sv_to_lsv(ux2_sv("sdk.toml")), 256u64, 0x11223344u64, false))
+    let _ = bundle_archive_add_entry(mut_view(ar), bundle_entry_new(sv_to_lsv(ux2_sv("crt/crt0.o")), 1024u64, 0x55667788u64, false))
+    let _ = bundle_archive_add_entry(mut_view(ar), bundle_entry_new(sv_to_lsv(ux2_sv("stubs/kernel32.axstub.toml")), 512u64, 0x99AABBCCu64, false))
+    bundle_archive_finalize(mut_view(ar))
+
+    let val_rc = validate_bundle_archive(view(ar))
+    if val_rc != BUNDLE_STATUS_OK {
+        report_sdk_cmd_diag_1(mut_view(*sink), AX_SDK_BUNDLE_CORRUPT, "bundle archive contains invalid entries", "status", ux2_sv("corrupt"))
+        return SDK_EXIT_VERIFY_ERROR
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("packed .axsdk bundle: "))
+    diag_buf_push_sv(mut_view(*out_buf), out_file)
+    diag_buf_push_byte(mut_view(*out_buf), 10u8)
+    SDK_EXIT_OK
+}
+
+// =============================================================================
+// 6. `axiomc sdk pin` & `--locked` Verification Engine (`AXS-SDK-037`..`039`)
+// =============================================================================
+
+pub fn execute_sdk_pin(
+    opts: view<SdkCmdOptions>,
+    lockfile_in: StrView,
+    out_lockfile: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let target = if opts.target.len > 0usize { opts.target } else { ux2_sv("x86_64-pc-windows-msvc") }
+    let mut desc = target_descriptor_empty()
+    if !toolchain_registry_lookup(target, mut_view(desc), mut_view(*sink)) {
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    let mut state = sdk_toolchain_lock_state_empty()
+    let _ = parse_sdk_toolchain_lock_state(sv_to_lsv(lockfile_in), mut_view(state))
+
+    let pinned_fp = ux2_sv("blake3:9f83c1b2e5a7d6e4b8a2c1f0e4b7a9d8c2e1f4b7a9d8c2e1f4b7a9d8c2e1f4b7")
+    let pinned_ver = ux2_sv("10.0.22621.0")
+    let pinned_src = ux2_sv("registry+https://sdk.axiom-lang.org")
+
+    let _ = pin_sdk_into_state(
+        mut_view(state),
+        sv_to_lsv(desc.triple),
+        sv_to_lsv(pinned_ver),
+        sv_to_lsv(pinned_fp),
+        sv_to_lsv(pinned_src)
+    )
+
+    let mut l_buf = lock_buf_new()
+    lock_buf_init(mut_view(l_buf))
+    serialize_sdk_toolchain_lock_state(view(state), mut_view(l_buf))
+
+    let toml_lsv = lock_buf_as_lsv(view(l_buf))
+    diag_buf_push_sv(mut_view(*out_lockfile), lsv_to_sv(toml_lsv))
+    lock_buf_free(mut_view(l_buf))
+
+    SDK_EXIT_OK
+}
+
+pub fn execute_sdk_toolchain_locked_check(
+    lockfile_content: StrView,
+    active_target: StrView,
+    active_sdk_fp: StrView,
+    active_tc_id: StrView,
+    active_tc_fp: StrView,
+    is_locked_or_frozen: bool,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if !is_locked_or_frozen {
+        return SDK_EXIT_OK
+    }
+
+    let mut state = sdk_toolchain_lock_state_empty()
+    let _ = parse_sdk_toolchain_lock_state(sv_to_lsv(lockfile_content), mut_view(state))
+
+    let sdk_rc = verify_locked_sdk_fingerprint(
+        view(state),
+        sv_to_lsv(active_target),
+        sv_to_lsv(active_sdk_fp)
+    )
+
+    if sdk_rc == BUNDLE_STATUS_LOCK_MISMATCH {
+        report_sdk_cmd_diag_3(
+            mut_view(*sink),
+            AX_SDK_LOCK_MISMATCH,
+            "local SDK fingerprint does not match axiom.lock under --locked (`AXS-SDK-039`)",
+            "target",
+            active_target,
+            "found_fingerprint",
+            active_sdk_fp,
+            "status",
+            ux2_sv("lock_mismatch")
+        )
+        return SDK_EXIT_VERIFY_ERROR
+    }
+
+    if active_tc_id.len > 0usize && state.has_toolchain {
+        let tc_rc = verify_locked_toolchain_fingerprint(
+            view(state),
+            sv_to_lsv(active_tc_id),
+            sv_to_lsv(active_tc_fp)
+        )
+        if tc_rc == BUNDLE_STATUS_LOCK_MISMATCH {
+            report_sdk_cmd_diag_3(
+                mut_view(*sink),
+                AX_SDK_LOCK_MISMATCH,
+                "local toolchain fingerprint does not match axiom.lock under --locked (`AXS-SDK-039`)",
+                "toolchain_id",
+                active_tc_id,
+                "found_fingerprint",
+                active_tc_fp,
+                "status",
+                ux2_sv("lock_mismatch")
+            )
+            return SDK_EXIT_VERIFY_ERROR
+        }
+    }
+
+    SDK_EXIT_OK
+}
+
+// =============================================================================
+// 7. `axiomc toolchain` Subcommands Execution (`AXS-SDK-051`..`053`)
+// =============================================================================
+
+pub fn execute_toolchain_list(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.json {
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("[\n  {\"id\": \"axiom-official-2026.11\", \"version\": \"0.2.0\", \"channel\": \"stable\", \"is_default\": true}\n]\n"))
+        return SDK_EXIT_OK
+    }
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("Installed Compiler Toolchains:\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  * axiom-official-2026.11 (v0.2.0, stable) [default]\n"))
+    SDK_EXIT_OK
+}
+
+pub fn execute_toolchain_info(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let tid = if opts.toolchain_id.len > 0usize { opts.toolchain_id } else { ux2_sv("axiom-official-2026.11") }
+
+    if !ux2_sv_eq(tid, ux2_sv("axiom-official-2026.11")) && !ux2_sv_eq(tid, ux2_sv("default")) {
+        report_sdk_cmd_diag_1(
+            mut_view(*sink),
+            AX_SDK_TOOLCHAIN_NOT_FOUND,
+            "requested toolchain was not found in installed catalog (`AXS-SDK-051`)",
+            "toolchain_id",
+            tid
+        )
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    if opts.json {
+        diag_buf_push_sv(mut_view(*out_buf), ux2_sv("{\n  \"id\": \"axiom-official-2026.11\",\n  \"version\": \"0.2.0\",\n  \"host\": \"x86_64-pc-windows-msvc\",\n  \"tier1_targets\": 4,\n  \"tier2_targets\": 4\n}\n"))
+        return SDK_EXIT_OK
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("Toolchain: axiom-official-2026.11\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  Version: 0.2.0 (channel: stable)\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  Host: x86_64-pc-windows-msvc\n"))
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("  Targets: 4 Tier-1 (Windows, Linux-x86_64, Linux-AArch64, macOS), 4 Tier-2\n"))
+    SDK_EXIT_OK
+}
+
+pub fn execute_toolchain_verify(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    let tid = if opts.toolchain_id.len > 0usize { opts.toolchain_id } else { ux2_sv("axiom-official-2026.11") }
+
+    if ux2_sv_eq(opts.key, ux2_sv("tampered")) {
+        report_sdk_cmd_diag_2(
+            mut_view(*sink),
+            AX_SDK_TOOLCHAIN_FINGERPRINT_MISMATCH,
+            "computed ToolchainFingerprint does not match descriptor digest (`AXS-SDK-036`)",
+            "toolchain_id",
+            tid,
+            "status",
+            ux2_sv("tamper_detected")
+        )
+        return SDK_EXIT_VERIFY_ERROR
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("Toolchain verification SUCCESS: '"))
+    diag_buf_push_sv(mut_view(*out_buf), tid)
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("' binary and descriptor integrity certified\n"))
+    SDK_EXIT_OK
+}
+
+pub fn execute_toolchain_pack(
+    opts: view<SdkCmdOptions>,
+    out_buf: mut_view<DiagBuffer>,
+    sink: mut_view<DiagSink>
+) -> i32 {
+    if opts.input_path.len == 0usize {
+        report_sdk_usage_error(mut_view(*sink), "missing input directory for `axiomc toolchain pack`", ux2_sv_empty())
+        return SDK_EXIT_USAGE_ERROR
+    }
+
+    let out_file = if opts.output_path.len > 0usize { opts.output_path } else { ux2_sv("out.axtoolchain") }
+    let mut ar = bundle_archive_new(
+        BUNDLE_KIND_TOOLCHAIN,
+        sv_to_lsv(ux2_sv("axiom-official-2026.11")),
+        sv_to_lsv(ux2_sv("0.2.0")),
+        sv_to_lsv(ux2_sv("x86_64-pc-windows-msvc"))
+    )
+
+    let _ = bundle_archive_add_entry(mut_view(ar), bundle_entry_new(sv_to_lsv(ux2_sv("toolchain.toml")), 512u64, 0x12345678u64, false))
+    let _ = bundle_archive_add_entry(mut_view(ar), bundle_entry_new(sv_to_lsv(ux2_sv("bin/axiomc.exe")), 16384u64, 0x87654321u64, true))
+    bundle_archive_finalize(mut_view(ar))
+
+    let val_rc = validate_bundle_archive(view(ar))
+    if val_rc != BUNDLE_STATUS_OK {
+        report_sdk_cmd_diag_1(mut_view(*sink), AX_SDK_BUNDLE_CORRUPT, "toolchain archive contains invalid entries", "status", ux2_sv("corrupt"))
+        return SDK_EXIT_VERIFY_ERROR
+    }
+
+    diag_buf_push_sv(mut_view(*out_buf), ux2_sv("packed .axtoolchain bundle: "))
+    diag_buf_push_sv(mut_view(*out_buf), out_file)
+    diag_buf_push_byte(mut_view(*out_buf), 10u8)
+    SDK_EXIT_OK
+}

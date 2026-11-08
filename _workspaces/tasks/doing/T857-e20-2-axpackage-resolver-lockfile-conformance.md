@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T856]
 priority: 207
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p20/e20_2_package_manager_lockfile]
 spec: [spec/SPEC-111-package-manager-resolution-lockfiles.md, 0098, tasks/0412, tasks/0446, tasks/0661, tasks/1065]
 covers: [REQ-ECO-8736, REQ-PKG-022, REQ-PKG-024, REQ-PKG-025]
+started: 2026-11-09 01:11:31
+agent: T857-impl
 ---
 # T857 — E20.2 AXPACKAGE dependency resolution, monotonic feature unification, axiom.lock & offline vendoring conformance suite
 
@@ -42,3 +44,4 @@ Certify E20.2 exit criteria with an end-to-end conformance suite covering `AXPAC
 
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
+- 2026-11-09 01:11:31 started (attempt 1) T857-impl

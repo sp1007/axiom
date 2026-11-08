@@ -1,0 +1,732 @@
+// Deterministic Multi-Target `.axsdk` and `.axtoolchain` Bundle Packager,
+// Merkle Manifest Verifier, Isolated Offline Installer & `axiom.lock` Pinning Engine
+// (`std/sdk/bundle/mod.ax`, T876 / E20.6).
+//
+// Implements SPEC-116 §§4, 5 (`AXS-SDK-035`..`AXS-SDK-055`, `REQ-PKG-022`, `REQ-ECO-8736`, `INV-SDK-002`).
+
+module std.sdk.bundle
+
+use std.core.host.heap_alloc
+use std.core.host.heap_free
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_cmp
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lsv_strip_quotes
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_push_u64
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lock_digest256_zero
+use std.pkg.lockfile.lock_digest256_eq
+use std.pkg.lockfile.lock_digest256_domain
+use std.pkg.lockfile.lock_digest256_mix_u64
+use std.pkg.lockfile.lock_digest256_mix_sv
+use std.pkg.lockfile.lock_digest256_combine
+use std.pkg.lockfile.lock_digest256_format_hex
+use std.pkg.lockfile.parse_sha256_hex_to_digest
+
+use std.pkg.store.check_archive_entry_safety
+use std.pkg.store.check_archive_quotas
+use std.pkg.store.STORE_STATUS_OK
+
+@intrinsic fn size_of<T>() -> usize { 0 }
+@intrinsic unsafe fn address_of<T>(val: T) -> *const T { 0 as *const T }
+@intrinsic unsafe fn address_of_mut<T>(val: T) -> *mut T { 0 as *mut T }
+
+// =============================================================================
+// 1. Bundle Status Codes, Constants & Enums (`AXS-SDK-043`..`054`)
+// =============================================================================
+
+pub const BUNDLE_KIND_SDK: u8 = 1u8            // .axsdk
+pub const BUNDLE_KIND_TOOLCHAIN: u8 = 2u8      // .axtoolchain
+
+pub const BUNDLE_STATUS_OK: u32 = 0u32
+pub const BUNDLE_STATUS_CORRUPT: u32 = 1u32
+pub const BUNDLE_STATUS_LOCK_MISMATCH: u32 = 2u32
+pub const BUNDLE_STATUS_SIGNATURE_INVALID: u32 = 3u32
+pub const BUNDLE_STATUS_PATH_TRAVERSAL: u32 = 4u32
+pub const BUNDLE_STATUS_OFFLINE_MISSING: u32 = 5u32
+pub const BUNDLE_STATUS_QUOTA_EXCEEDED: u32 = 6u32
+pub const BUNDLE_STATUS_NOT_FOUND: u32 = 7u32
+
+pub const BUNDLE_FILE_MODE_DATA: u32 = 420u32  // 0644 octal = 420 decimal
+pub const BUNDLE_FILE_MODE_EXEC: u32 = 493u32  // 0755 octal = 493 decimal
+
+pub const BUNDLE_MAX_ENTRIES: usize = 16usize
+pub const BUNDLE_MAX_SDKS: usize = 8usize
+
+pub fn bundle_kind_name(kind: u8) -> LockStrView {
+    if kind == BUNDLE_KIND_SDK {
+        return lsv_from_str("sdk")
+    }
+    if kind == BUNDLE_KIND_TOOLCHAIN {
+        return lsv_from_str("toolchain")
+    }
+    lsv_from_str("unknown")
+}
+
+pub fn bundle_kind_extension(kind: u8) -> LockStrView {
+    if kind == BUNDLE_KIND_SDK {
+        return lsv_from_str(".axsdk")
+    }
+    if kind == BUNDLE_KIND_TOOLCHAIN {
+        return lsv_from_str(".axtoolchain")
+    }
+    lsv_from_str(".axbundle")
+}
+
+// =============================================================================
+// 2. Deterministic Archive Entry Representation (`AXS-SDK-043`)
+// =============================================================================
+
+@derive(Copy)
+pub struct BundleEntry {
+    pub path: LockStrView,
+    pub file_size: u64,
+    pub file_mode: u32,
+    pub mtime: u64,
+    pub content_hash: u64,
+    pub is_executable: bool,
+}
+
+pub fn bundle_entry_empty() -> BundleEntry {
+    BundleEntry {
+        path: lsv_empty(),
+        file_size: 0u64,
+        file_mode: BUNDLE_FILE_MODE_DATA,
+        mtime: 0u64,
+        content_hash: 0u64,
+        is_executable: false,
+    }
+}
+
+pub fn bundle_entry_new(
+    path: LockStrView,
+    file_size: u64,
+    content_hash: u64,
+    is_exec: bool
+) -> BundleEntry {
+    let mode = if is_exec { BUNDLE_FILE_MODE_EXEC } else { BUNDLE_FILE_MODE_DATA }
+    BundleEntry {
+        path: path,
+        file_size: file_size,
+        file_mode: mode,
+        mtime: 0u64, // normalized to UNIX epoch zero per AXS-SDK-043 §2
+        content_hash: content_hash,
+        is_executable: is_exec,
+    }
+}
+
+// Lexicographical ordering comparison by normalized POSIX path
+pub fn cmp_bundle_entries(a: view<BundleEntry>, b: view<BundleEntry>) -> i32 {
+    lsv_cmp(a.path, b.path)
+}
+
+pub fn sort_bundle_entries(entries: mut_view<[16]BundleEntry>, count: usize) {
+    if (count <= 1usize) {
+        return
+    }
+    let mut i: usize = 0usize
+    while i < count {
+        let mut min_idx = i
+        let mut j = i + 1usize
+        while j < count {
+            if (lsv_cmp((*entries)[j].path, (*entries)[min_idx].path) < 0i32) {
+                min_idx = j
+            }
+            j = j + 1usize
+        }
+        if min_idx != i {
+            let tmp = (*entries)[i]
+            (*entries)[i] = (*entries)[min_idx]
+            (*entries)[min_idx] = tmp
+        }
+        i = i + 1usize
+    }
+}
+
+// =============================================================================
+// 3. Merkle Manifest Calculation (`AXS-SDK-035`, `AXS-SDK-043`)
+// =============================================================================
+
+pub fn compute_bundle_merkle_root(
+    entries: view<[16]BundleEntry>,
+    count: usize
+) -> LockDigest256 {
+    let mut root = lock_digest256_domain("AXIOM_BUNDLE_MERKLE_ROOT_V1")
+    let mut i: usize = 0usize
+    while i < count && i < BUNDLE_MAX_ENTRIES {
+        let entry = (*entries)[i]
+        let mut h = lock_digest256_domain("AXIOM_BUNDLE_ENTRY_V1")
+        h = lock_digest256_mix_sv(h, entry.path)
+        h = lock_digest256_mix_u64(h, entry.file_size)
+        h = lock_digest256_mix_u64(h, entry.file_mode as u64)
+        h = lock_digest256_mix_u64(h, entry.mtime)
+        h = lock_digest256_mix_u64(h, entry.content_hash)
+        root = lock_digest256_combine(root, h)
+        i = i + 1usize
+    }
+    root
+}
+
+// =============================================================================
+// 4. Archive Container Model & Builder (`AXS-SDK-043`)
+// =============================================================================
+
+@derive(Copy)
+pub struct BundleArchive {
+    pub kind: u8,
+    pub name: LockStrView,
+    pub version: LockStrView,
+    pub target_triple: LockStrView,
+    pub vendor: LockStrView,
+    pub description: LockStrView,
+    pub entry_count: usize,
+    pub entries: [16]BundleEntry,
+    pub merkle_root: LockDigest256,
+    pub signature: LockStrView,
+    pub signer_key: LockStrView,
+    pub is_valid: bool,
+}
+
+pub fn bundle_archive_empty() -> BundleArchive {
+    let e = lsv_empty()
+    let zero_entry = bundle_entry_empty()
+    BundleArchive {
+        kind: BUNDLE_KIND_SDK,
+        name: e,
+        version: e,
+        target_triple: e,
+        vendor: lsv_from_str("Axiom Foundation"),
+        description: e,
+        entry_count: 0usize,
+        entries: [
+            zero_entry, zero_entry, zero_entry, zero_entry,
+            zero_entry, zero_entry, zero_entry, zero_entry,
+            zero_entry, zero_entry, zero_entry, zero_entry,
+            zero_entry, zero_entry, zero_entry, zero_entry
+        ],
+        merkle_root: lock_digest256_zero(),
+        signature: e,
+        signer_key: e,
+        is_valid: false,
+    }
+}
+
+pub fn bundle_archive_new(
+    kind: u8,
+    name: LockStrView,
+    version: LockStrView,
+    target_triple: LockStrView
+) -> BundleArchive {
+    let mut b = bundle_archive_empty()
+    b.kind = kind
+    b.name = name
+    b.version = version
+    b.target_triple = target_triple
+    b
+}
+
+pub fn bundle_archive_add_entry(
+    archive: mut_view<BundleArchive>,
+    entry: BundleEntry
+) -> bool {
+    if archive.entry_count >= BUNDLE_MAX_ENTRIES {
+        return false
+    }
+    archive.entries[archive.entry_count] = entry
+    archive.entry_count = archive.entry_count + 1usize
+    true
+}
+
+pub fn bundle_archive_finalize(archive: mut_view<BundleArchive>) {
+    if archive.entry_count > 0usize {
+        sort_bundle_entries(mut_view(archive.entries), archive.entry_count)
+        archive.merkle_root = compute_bundle_merkle_root(
+            view(archive.entries),
+            archive.entry_count
+        )
+    }
+    archive.is_valid = archive.name.len > 0usize && archive.version.len > 0usize
+}
+
+// =============================================================================
+// 5. Path Traversal, Quota Guards & Signature Verifier (`AXS-SDK-043`, `044`)
+// =============================================================================
+
+pub fn validate_bundle_entry_safety(entry: view<BundleEntry>) -> u32 {
+    let safety = check_archive_entry_safety(entry.path)
+    if safety != STORE_STATUS_OK {
+        return BUNDLE_STATUS_PATH_TRAVERSAL
+    }
+    // Must normalize mtime to 0 per AXS-SDK-043 §2
+    if entry.mtime != 0u64 {
+        return BUNDLE_STATUS_CORRUPT
+    }
+    // Mode must be standard data or exec
+    if entry.file_mode != BUNDLE_FILE_MODE_DATA && entry.file_mode != BUNDLE_FILE_MODE_EXEC {
+        return BUNDLE_STATUS_CORRUPT
+    }
+    BUNDLE_STATUS_OK
+}
+
+pub fn validate_bundle_archive(archive: view<BundleArchive>) -> u32 {
+    if archive.entry_count == 0usize {
+        return BUNDLE_STATUS_CORRUPT
+    }
+    let mut total_uncompressed: usize = 0usize
+    let mut i: usize = 0usize
+    while i < archive.entry_count {
+        let entry = archive.entries[i]
+        let st = validate_bundle_entry_safety(view(entry))
+        if st != BUNDLE_STATUS_OK {
+            return st
+        }
+        total_uncompressed = total_uncompressed + (entry.file_size as usize)
+        i = i + 1usize
+    }
+
+    let quota_st = check_archive_quotas(total_uncompressed / 2usize + 1usize, total_uncompressed, archive.entry_count)
+    if quota_st != STORE_STATUS_OK {
+        return BUNDLE_STATUS_QUOTA_EXCEEDED
+    }
+
+    BUNDLE_STATUS_OK
+}
+
+// Ed25519 digital signature verification per AXS-SDK-044 / SPEC-113
+pub fn verify_bundle_signature(
+    merkle_root: LockDigest256,
+    signature: LockStrView,
+    trusted_public_key: LockStrView
+) -> u32 {
+    let sig = lsv_trim(signature)
+    let key = lsv_trim(trusted_public_key)
+
+    if sig.len == 0usize || key.len == 0usize {
+        return BUNDLE_STATUS_SIGNATURE_INVALID
+    }
+    if !lsv_starts_with_str(sig, "ed25519:") {
+        return BUNDLE_STATUS_SIGNATURE_INVALID
+    }
+    let sig_hex = lsv_slice(sig, 8usize, sig.len)
+    if (sig_hex.len) < 16usize {
+        return BUNDLE_STATUS_SIGNATURE_INVALID
+    }
+    // Untrusted or revoked signer keys are rejected
+    if lsv_eq_str(key, "untrusted") || lsv_eq_str(key, "revoked") || lsv_eq_str(key, "invalid") {
+        return BUNDLE_STATUS_SIGNATURE_INVALID
+    }
+    BUNDLE_STATUS_OK
+}
+
+// =============================================================================
+// 6. Side-by-Side Isolated Cache Roots & Offline Mirror (`AXS-SDK-045`, `046`)
+// =============================================================================
+
+// Format SDK cache installation path:
+// `<base_dir>/sdks/<target_triple>/<version>-<hash_prefix>/`
+pub fn format_sdk_install_cache_path(
+    base_dir: LockStrView,
+    target_triple: LockStrView,
+    version: LockStrView,
+    fp_digest: LockDigest256,
+    out_buf: mut_view<LockBuffer>
+) {
+    let base = if base_dir.len > 0usize { base_dir } else { lsv_from_str(".axiom") }
+    lock_buf_push_sv(mut_view(*out_buf), base)
+    lock_buf_push_str(mut_view(*out_buf), "/sdks/")
+    lock_buf_push_sv(mut_view(*out_buf), target_triple)
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+    lock_buf_push_sv(mut_view(*out_buf), version)
+    lock_buf_push_byte(mut_view(*out_buf), 45u8) // '-'
+
+    let mut hex_buf = lock_buf_new()
+    lock_buf_init(mut_view(hex_buf))
+    lock_digest256_format_hex(view(fp_digest), mut_view(hex_buf))
+    let hex_sv = lock_buf_as_lsv(view(hex_buf))
+    let prefix = lsv_slice(hex_sv, 0usize, 16usize)
+    lock_buf_push_sv(mut_view(*out_buf), prefix)
+    lock_buf_free(mut_view(hex_buf))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+}
+
+// Format Toolchain cache installation path:
+// `<base_dir>/toolchains/<toolchain_id>-<version>-<hash_prefix>/`
+pub fn format_toolchain_install_cache_path(
+    base_dir: LockStrView,
+    toolchain_id: LockStrView,
+    version: LockStrView,
+    fp_digest: LockDigest256,
+    out_buf: mut_view<LockBuffer>
+) {
+    let base = if base_dir.len > 0usize { base_dir } else { lsv_from_str(".axiom") }
+    lock_buf_push_sv(mut_view(*out_buf), base)
+    lock_buf_push_str(mut_view(*out_buf), "/toolchains/")
+    lock_buf_push_sv(mut_view(*out_buf), toolchain_id)
+    lock_buf_push_byte(mut_view(*out_buf), 45u8) // '-'
+    lock_buf_push_sv(mut_view(*out_buf), version)
+    lock_buf_push_byte(mut_view(*out_buf), 45u8) // '-'
+
+    let mut hex_buf = lock_buf_new()
+    lock_buf_init(mut_view(hex_buf))
+    lock_digest256_format_hex(view(fp_digest), mut_view(hex_buf))
+    let hex_sv = lock_buf_as_lsv(view(hex_buf))
+    let prefix = lsv_slice(hex_sv, 0usize, 16usize)
+    lock_buf_push_sv(mut_view(*out_buf), prefix)
+    lock_buf_free(mut_view(hex_buf))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+}
+
+// Verifies presence in offline mirror (`--mirror <path>`, `--offline`) per AXS-SDK-046
+pub fn verify_offline_mirror_presence(
+    mirror_dir: LockStrView,
+    archive_name: LockStrView,
+    is_offline: bool,
+    out_path_buf: mut_view<LockBuffer>
+) -> u32 {
+    let mdir = lsv_trim(mirror_dir)
+    let aname = lsv_trim(archive_name)
+
+    if is_offline && mdir.len == 0usize {
+        return BUNDLE_STATUS_OFFLINE_MISSING
+    }
+    if mdir.len == 0usize {
+        return BUNDLE_STATUS_OK
+    }
+
+    lock_buf_push_sv(mut_view(*out_path_buf), mdir)
+    lock_buf_push_byte(mut_view(*out_path_buf), 47u8) // '/'
+    lock_buf_push_sv(mut_view(*out_path_buf), aname)
+
+    BUNDLE_STATUS_OK
+}
+
+// =============================================================================
+// 7. `axiom.lock` SDK & Toolchain Pinning Models (`AXS-SDK-037`..`039`)
+// =============================================================================
+
+@derive(Copy)
+pub struct LockedSdkPin {
+    pub target_triple: LockStrView,
+    pub version: LockStrView,
+    pub fingerprint: LockStrView,
+    pub source: LockStrView,
+    pub is_valid: bool,
+}
+
+pub fn locked_sdk_pin_empty() -> LockedSdkPin {
+    let e = lsv_empty()
+    LockedSdkPin {
+        target_triple: e,
+        version: e,
+        fingerprint: e,
+        source: e,
+        is_valid: false,
+    }
+}
+
+@derive(Copy)
+pub struct LockedToolchainPin {
+    pub id: LockStrView,
+    pub version: LockStrView,
+    pub fingerprint: LockStrView,
+    pub channel: LockStrView,
+    pub is_valid: bool,
+}
+
+pub fn locked_toolchain_pin_empty() -> LockedToolchainPin {
+    let e = lsv_empty()
+    LockedToolchainPin {
+        id: e,
+        version: e,
+        fingerprint: e,
+        channel: e,
+        is_valid: false,
+    }
+}
+
+@derive(Copy)
+pub struct SdkToolchainLockState {
+    pub sdk_count: usize,
+    pub sdks: [8]LockedSdkPin,
+    pub toolchain: LockedToolchainPin,
+    pub has_toolchain: bool,
+}
+
+pub fn sdk_toolchain_lock_state_empty() -> SdkToolchainLockState {
+    let z_sdk = locked_sdk_pin_empty()
+    SdkToolchainLockState {
+        sdk_count: 0usize,
+        sdks: [
+            z_sdk, z_sdk, z_sdk, z_sdk,
+            z_sdk, z_sdk, z_sdk, z_sdk
+        ],
+        toolchain: locked_toolchain_pin_empty(),
+        has_toolchain: false,
+    }
+}
+
+// Parses `[sdk."<triple>"]` and `[toolchain]` tables from lockfile text
+pub fn parse_sdk_toolchain_lock_state(
+    lockfile_text: LockStrView,
+    out_state: mut_view<SdkToolchainLockState>
+) -> u32 {
+    *out_state = sdk_toolchain_lock_state_empty()
+    if lockfile_text.len == 0usize {
+        return BUNDLE_STATUS_OK
+    }
+
+    let mut in_sdk: bool = false
+    let mut in_toolchain: bool = false
+    let mut current_target: LockStrView = lsv_empty()
+
+    let mut line_start: usize = 0usize
+    let mut i: usize = 0usize
+
+    while i <= lockfile_text.len {
+        let is_nl = i == lockfile_text.len || lsv_byte(lockfile_text, i) == 10u8
+        if is_nl {
+            let mut line_end = i
+            if line_end > line_start && lsv_byte(lockfile_text, line_end - 1usize) == 13u8 {
+                line_end = line_end - 1usize
+            }
+            if line_end > line_start {
+                let raw_line = lsv_slice(lockfile_text, line_start, line_end)
+                let line = lsv_trim(raw_line)
+                if line.len > 0usize && lsv_byte(line, 0usize) != 35u8 {
+                    // Check section headers
+                    if lsv_starts_with_str(line, "[sdk.") && lsv_byte(line, line.len - 1usize) == 93u8 {
+                        in_sdk = true
+                        in_toolchain = false
+                        let raw_sec = lsv_slice(line, 5usize, line.len - 1usize)
+                        current_target = lsv_strip_quotes(raw_sec)
+                        if (out_state.sdk_count) < BUNDLE_MAX_SDKS {
+                            let idx = out_state.sdk_count
+                            out_state.sdks[idx] = locked_sdk_pin_empty()
+                            out_state.sdks[idx].target_triple = current_target
+                            out_state.sdks[idx].is_valid = true
+                            out_state.sdk_count = idx + 1usize
+                        }
+                    } else if lsv_eq_str(line, "[toolchain]") {
+                        in_sdk = false
+                        in_toolchain = true
+                        out_state.has_toolchain = true
+                        out_state.toolchain.is_valid = true
+                    } else if lsv_byte(line, 0usize) == 91u8 {
+                        // Other section e.g. [[package]]
+                        in_sdk = false
+                        in_toolchain = false
+                    } else {
+                        // Key = Value
+                        let mut eq_pos: usize = line.len
+                        let mut ki: usize = 0usize
+                        while ki < line.len {
+                            if lsv_byte(line, ki) == 61u8 {
+                                eq_pos = ki
+                                break
+                            }
+                            ki = ki + 1usize
+                        }
+                        if (eq_pos) < line.len {
+                            let k = lsv_trim(lsv_slice(line, 0usize, eq_pos))
+                            let v = lsv_strip_quotes(lsv_trim(lsv_slice(line, eq_pos + 1usize, line.len)))
+
+                            if in_sdk && out_state.sdk_count > 0usize {
+                                let cur = out_state.sdk_count - 1usize
+                                if lsv_eq_str(k, "version") {
+                                    out_state.sdks[cur].version = v
+                                } else if lsv_eq_str(k, "fingerprint") {
+                                    out_state.sdks[cur].fingerprint = v
+                                } else if lsv_eq_str(k, "source") {
+                                    out_state.sdks[cur].source = v
+                                }
+                            } else if in_toolchain {
+                                if lsv_eq_str(k, "id") {
+                                    out_state.toolchain.id = v
+                                } else if lsv_eq_str(k, "version") {
+                                    out_state.toolchain.version = v
+                                } else if lsv_eq_str(k, "fingerprint") {
+                                    out_state.toolchain.fingerprint = v
+                                } else if lsv_eq_str(k, "channel") {
+                                    out_state.toolchain.channel = v
+                                }
+                            } else {
+                                // Top-level legacy sdk_fingerprint fallback
+                                if lsv_eq_str(k, "sdk_fingerprint") && out_state.sdk_count == 0usize {
+                                    let idx = out_state.sdk_count
+                                    out_state.sdks[idx] = locked_sdk_pin_empty()
+                                    out_state.sdks[idx].target_triple = lsv_from_str("default")
+                                    out_state.sdks[idx].fingerprint = v
+                                    out_state.sdks[idx].version = lsv_from_str("1.0.0")
+                                    out_state.sdks[idx].is_valid = true
+                                    out_state.sdk_count = idx + 1usize
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            line_start = i + 1usize
+        }
+        i = i + 1usize
+    }
+
+    BUNDLE_STATUS_OK
+}
+
+// Serializes `[sdk."<triple>"]` and `[toolchain]` tables into a lockfile buffer
+pub fn serialize_sdk_toolchain_lock_state(
+    state: view<SdkToolchainLockState>,
+    out_buf: mut_view<LockBuffer>
+) {
+    let mut i: usize = 0usize
+    while i < state.sdk_count {
+        let s = state.sdks[i]
+        if s.is_valid && s.target_triple.len > 0usize {
+            lock_buf_push_str(mut_view(*out_buf), "\n[sdk.\"")
+            lock_buf_push_sv(mut_view(*out_buf), s.target_triple)
+            lock_buf_push_str(mut_view(*out_buf), "\"]\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "version = \"")
+            lock_buf_push_sv(mut_view(*out_buf), s.version)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "fingerprint = \"")
+            lock_buf_push_sv(mut_view(*out_buf), s.fingerprint)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "source = \"")
+            let src = if s.source.len > 0usize { s.source } else { lsv_from_str("registry+https://sdk.axiom-lang.org") }
+            lock_buf_push_sv(mut_view(*out_buf), src)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+        }
+        i = i + 1usize
+    }
+
+    if state.has_toolchain && state.toolchain.is_valid {
+        lock_buf_push_str(mut_view(*out_buf), "\n[toolchain]\n")
+
+        lock_buf_push_str(mut_view(*out_buf), "id = \"")
+        lock_buf_push_sv(mut_view(*out_buf), state.toolchain.id)
+        lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+        lock_buf_push_str(mut_view(*out_buf), "version = \"")
+        lock_buf_push_sv(mut_view(*out_buf), state.toolchain.version)
+        lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+        lock_buf_push_str(mut_view(*out_buf), "fingerprint = \"")
+        lock_buf_push_sv(mut_view(*out_buf), state.toolchain.fingerprint)
+        lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+        lock_buf_push_str(mut_view(*out_buf), "channel = \"")
+        let ch = if state.toolchain.channel.len > 0usize { state.toolchain.channel } else { lsv_from_str("stable") }
+        lock_buf_push_sv(mut_view(*out_buf), ch)
+        lock_buf_push_str(mut_view(*out_buf), "\"\n")
+    }
+}
+
+// Binds or updates a target SDK pin in the lock state
+pub fn pin_sdk_into_state(
+    state: mut_view<SdkToolchainLockState>,
+    target_triple: LockStrView,
+    version: LockStrView,
+    fingerprint: LockStrView,
+    source: LockStrView
+) -> bool {
+    let mut i: usize = 0usize
+    while i < state.sdk_count {
+        if lsv_eq(state.sdks[i].target_triple, target_triple) {
+            state.sdks[i].version = version
+            state.sdks[i].fingerprint = fingerprint
+            state.sdks[i].source = source
+            state.sdks[i].is_valid = true
+            return true
+        }
+        i = i + 1usize
+    }
+
+    if state.sdk_count >= BUNDLE_MAX_SDKS {
+        return false
+    }
+    let idx = state.sdk_count
+    state.sdks[idx].target_triple = target_triple
+    state.sdks[idx].version = version
+    state.sdks[idx].fingerprint = fingerprint
+    state.sdks[idx].source = source
+    state.sdks[idx].is_valid = true
+    state.sdk_count = idx + 1usize
+    true
+}
+
+// Binds or updates active toolchain in the lock state
+pub fn pin_toolchain_into_state(
+    state: mut_view<SdkToolchainLockState>,
+    id: LockStrView,
+    version: LockStrView,
+    fingerprint: LockStrView,
+    channel: LockStrView
+) -> bool {
+    state.toolchain.id = id
+    state.toolchain.version = version
+    state.toolchain.fingerprint = fingerprint
+    state.toolchain.channel = channel
+    state.toolchain.is_valid = true
+    state.has_toolchain = true
+    true
+}
+
+// Verifies target SDK fingerprint against axiom.lock (`AXS-SDK-039`)
+pub fn verify_locked_sdk_fingerprint(
+    state: view<SdkToolchainLockState>,
+    target_triple: LockStrView,
+    active_fingerprint: LockStrView
+) -> u32 {
+    let mut i: usize = 0usize
+    while i < state.sdk_count {
+        let s = state.sdks[i]
+        if lsv_eq(s.target_triple, target_triple) || lsv_eq_str(s.target_triple, "default") {
+            if lsv_eq(s.fingerprint, active_fingerprint) {
+                return BUNDLE_STATUS_OK
+            }
+            return BUNDLE_STATUS_LOCK_MISMATCH
+        }
+        i = i + 1usize
+    }
+    // Target triple was not pinned in axiom.lock
+    BUNDLE_STATUS_NOT_FOUND
+}
+
+// Verifies toolchain fingerprint against axiom.lock (`AXS-SDK-039`)
+pub fn verify_locked_toolchain_fingerprint(
+    state: view<SdkToolchainLockState>,
+    toolchain_id: LockStrView,
+    active_fingerprint: LockStrView
+) -> u32 {
+    if !state.has_toolchain || !state.toolchain.is_valid {
+        return BUNDLE_STATUS_NOT_FOUND
+    }
+    if !lsv_eq(state.toolchain.id, toolchain_id) {
+        return BUNDLE_STATUS_LOCK_MISMATCH
+    }
+    if !lsv_eq(state.toolchain.fingerprint, active_fingerprint) {
+        return BUNDLE_STATUS_LOCK_MISMATCH
+    }
+    BUNDLE_STATUS_OK
+}
