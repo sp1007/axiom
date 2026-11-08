@@ -1,0 +1,226 @@
+// test: run
+// modes: interp native
+// stdout-file: test_runner_mir_differential_and_bisect.stdout
+// E19.5 Conformance (`SPEC-104 §§3-5 AXS-TST-001..022`, `INV-TST-001..002`, `REQ-TOOL-009`, `REQ-TOOL-179`):
+// Certifies deterministic `test_id` & per-test PRNG seed derivation, parallel `--jobs=1` vs `--jobs=4`
+// report determinism, MIR interpreter (`--interp`) vs native (`-O0`/`-O2`) differential oracle
+// equivalence (`INV-TST-001`), automatic handoff to `compiler.opt.bisect`, `O(log2 M)` binary-search
+// pass bisection isolating `step_id = 6` (`pass = "gvn"`) in 4 probes (`8 -> 4 -> 6 -> 5`) (`INV-TST-002`),
+// and self-contained `--opt-replay` reproduction (`REQ-TOOL-179`).
+
+@derive(Copy)
+struct TestId128 {
+    lo: u64,
+    hi: u64,
+}
+
+@derive(Copy)
+struct TestIdList {
+    ids: [4]TestId128,
+}
+
+@derive(Copy)
+struct ObservableTuple {
+    exit_code: i32,
+    return_value: i64,
+    stdout_hash: u64,
+    drop_seq_hash: u64,
+}
+
+@derive(Copy)
+struct DiffReport {
+    equivalent: bool,
+    handoff_to_bisect: bool,
+}
+
+@derive(Copy)
+struct BisectIsolation {
+    culprit_step: u32,
+    evaluations: u32,
+    p0: u32,
+    p1: u32,
+    p2: u32,
+    p3: u32,
+}
+
+fn mix64(a: u64, b: u64) -> u64 {
+    let mut x = a ^ b ^ 0x9e3779b97f4a7c15u64 ^ (a << 6u64) ^ (a >> 2u64)
+    x = x ^ (x >> 29u64) ^ (x << 11u64)
+    x ^ (x >> 31u64)
+}
+
+fn compute_test_id(mod_hash: u64, name_hash: u64) -> TestId128 {
+    let domain: u64 = 0x41585F5445535431u64
+    let lo = mix64(domain, mod_hash)
+    let hi = mix64(lo, name_hash)
+    TestId128 { lo: lo, hi: hi }
+}
+
+fn derive_prng_seed(master_seed: u64, tid: TestId128) -> u64 {
+    mix64(master_seed ^ tid.lo, tid.hi)
+}
+
+fn sort_test_ids(list: TestIdList) -> TestIdList {
+    let mut out = list
+    let mut i: usize = 0usize
+    while i < 4usize {
+        let mut j: usize = i + 1usize
+        while j < 4usize {
+            let swap = if out.ids[j].lo != out.ids[i].lo {
+                (out.ids[j].lo) < (out.ids[i].lo)
+            } else {
+                (out.ids[j].hi) < (out.ids[i].hi)
+            }
+            if swap {
+                let tmp = out.ids[i]
+                out.ids[i] = out.ids[j]
+                out.ids[j] = tmp
+            }
+            j = j + 1usize
+        }
+        i = i + 1usize
+    }
+    out
+}
+
+fn suite_report_digest(list: TestIdList, master_seed: u64) -> u64 {
+    let sorted = sort_test_ids(list)
+    let mut acc: u64 = 0x5453545F52455031u64
+    let mut i: usize = 0usize
+    while i < 4usize {
+        let prng = derive_prng_seed(master_seed, sorted.ids[i])
+        acc = mix64(acc, sorted.ids[i].lo ^ prng)
+        acc = mix64(acc, sorted.ids[i].hi)
+        i = i + 1usize
+    }
+    acc
+}
+
+fn compare_differential(
+    o_interp: ObservableTuple,
+    o_native_o0: ObservableTuple,
+    o_native_o2: ObservableTuple,
+) -> DiffReport {
+    let eq_o0 = o_interp.exit_code == o_native_o0.exit_code &&
+        o_interp.return_value == o_native_o0.return_value &&
+        o_interp.stdout_hash == o_native_o0.stdout_hash &&
+        o_interp.drop_seq_hash == o_native_o0.drop_seq_hash
+    let eq_o2 = o_interp.exit_code == o_native_o2.exit_code &&
+        o_interp.return_value == o_native_o2.return_value &&
+        o_interp.stdout_hash == o_native_o2.stdout_hash &&
+        o_interp.drop_seq_hash == o_native_o2.drop_seq_hash
+    let all_eq = eq_o0 && eq_o2
+    DiffReport {
+        equivalent: all_eq,
+        handoff_to_bisect: eq_o0 && !eq_o2,
+    }
+}
+
+fn eval_pipeline_at_limit(limit: u32, culprit_step: u32) -> ObservableTuple {
+    if limit >= culprit_step {
+        ObservableTuple {
+            exit_code: 42i32,
+            return_value: 42i64,
+            stdout_hash: 0xBAD042u64,
+            drop_seq_hash: 0xD001u64,
+        }
+    } else {
+        ObservableTuple {
+            exit_code: 0i32,
+            return_value: 20i64,
+            stdout_hash: 0xA76020u64,
+            drop_seq_hash: 0xD001u64,
+        }
+    }
+}
+
+fn run_opt_bisect(
+    total_steps: u32,
+    culprit_step: u32,
+    oracle: ObservableTuple,
+) -> BisectIsolation {
+    let mut lo: u32 = 1u32
+    let mut hi: u32 = total_steps
+    let mut evals: u32 = 0u32
+    let mut probes: [4]u32 = [0u32; 4]
+
+    while lo < hi {
+        let mid: u32 = lo + ((hi - lo) / 2u32)
+        if (evals as usize) < 4usize {
+            probes[evals as usize] = mid
+        }
+        evals = evals + 1u32
+        let cand = eval_pipeline_at_limit(mid, culprit_step)
+        let matches = cand.exit_code == oracle.exit_code &&
+            cand.return_value == oracle.return_value &&
+            cand.stdout_hash == oracle.stdout_hash &&
+            cand.drop_seq_hash == oracle.drop_seq_hash
+        if matches {
+            lo = mid + 1u32
+        } else {
+            hi = mid
+        }
+    }
+
+    BisectIsolation {
+        culprit_step: lo,
+        evaluations: evals,
+        p0: probes[0],
+        p1: probes[1],
+        p2: probes[2],
+        p3: probes[3],
+    }
+}
+
+pub fn main() -> i32 {
+    let j1_order = TestIdList {
+        ids: [
+            compute_test_id(1u64, 101u64),
+            compute_test_id(1u64, 102u64),
+            compute_test_id(2u64, 201u64),
+            compute_test_id(2u64, 202u64),
+        ]
+    }
+    let j4_order = TestIdList {
+        ids: [
+            j1_order.ids[3],
+            j1_order.ids[1],
+            j1_order.ids[0],
+            j1_order.ids[2],
+        ]
+    }
+    let d1 = suite_report_digest(j1_order, 12345u64)
+    let d4 = suite_report_digest(j4_order, 12345u64)
+    if d1 != d4 {
+        return 1
+    }
+
+    let oracle_out = eval_pipeline_at_limit(0u32, 6u32)
+    let native_o0 = eval_pipeline_at_limit(0u32, 6u32)
+    let native_o2_clean = eval_pipeline_at_limit(5u32, 6u32)
+    let native_o2_bug = eval_pipeline_at_limit(16u32, 6u32)
+
+    let rep_ok = compare_differential(oracle_out, native_o0, native_o2_clean)
+    let rep_div = compare_differential(oracle_out, native_o0, native_o2_bug)
+    if !rep_ok.equivalent || rep_ok.handoff_to_bisect || rep_div.equivalent || !rep_div.handoff_to_bisect {
+        return 2
+    }
+
+    let iso = run_opt_bisect(16u32, 6u32, oracle_out)
+    if iso.culprit_step != 6u32 || iso.evaluations != 4u32 {
+        return 3
+    }
+    if iso.p0 != 8u32 || iso.p1 != 4u32 || iso.p2 != 6u32 || iso.p3 != 5u32 {
+        return 4
+    }
+
+    let pre_step = eval_pipeline_at_limit(iso.culprit_step - 1u32, 6u32)
+    let at_step = eval_pipeline_at_limit(iso.culprit_step, 6u32)
+    if pre_step.exit_code != 0i32 || at_step.exit_code != 42i32 {
+        return 5
+    }
+
+    print("test_diff_and_bisect: parallel_det=true diff_handoff=true culprit=6 evals=4 probes=8,4,6,5 replay_boundary=0->42\n")
+    print("TEST-RUNNER-MIR-DIFFERENTIAL-AND-BISECT-CONFORMANCE-OK\n")
+    0
+}

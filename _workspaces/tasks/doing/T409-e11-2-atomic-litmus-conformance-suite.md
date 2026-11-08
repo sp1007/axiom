@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T407, T408]
 priority: 130
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [tests/conformance/p11/e11_2_atomics]
 spec: [spec/SPEC-31-atomics.md, 0033, 0092, 0128, 0208, tasks/0328, tasks/0515]
 covers: [REQ-CONC-076, REQ-CONC-077, REQ-CONC-078, REQ-CONC-079, REQ-ATM-028, REQ-ATM-029, REQ-ATM-030]
+started: 2026-11-08 19:20:28
+agent: T409-impl
 ---
 # T409 — E11.2 — Atomic & memory-ordering litmus conformance suite
 
@@ -38,3 +40,4 @@ Verify the `E11.2` exit criterion ('litmus tests pass under oracle and native st
 
 ## Log
 - 2026-11-03 00:10:00 created by T211 (P11 phase planning)
+- 2026-11-08 19:20:28 started (attempt 1) T409-impl
