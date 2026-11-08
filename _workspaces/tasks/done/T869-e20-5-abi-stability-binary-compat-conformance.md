@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T220, T681, T685, T318, T868]
 priority: 219
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p20/e20_5_abi_stability_compat]
 spec: [spec/SPEC-114-abi-stability-versioning-binary-compat.md, 0104, tasks/0452, tasks/0583, tasks/0739]
 covers: [REQ-ECO-8734, REQ-PKG-022, REQ-PKG-024]
 started: 2026-11-08 22:17:53
-agent: T869-impl
+finished: 2026-11-08 22:57:52
 ---
 # T869 — E20.5 ABI stability tiers, versioned symbol exports, .axmeta binary compatibility & axiomc abi-check conformance suite
 
@@ -45,3 +45,4 @@ Certify E20.5 exit criteria with an end-to-end conformance suite covering Axiom'
 ## Log
 - 2026-11-03 10:12:00 created by T220 (P20 phase planning)
 - 2026-11-08 22:17:53 started (attempt 1) T869-impl
+- 2026-11-08 22:57:52 accepted by QA -> done

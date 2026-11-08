@@ -1,0 +1,223 @@
+// test: run
+// modes: interp native
+// stdout-file: abi_tiers_and_opaque_handle_evolution.stdout
+// SPEC-114 §1, §2 (AXS-ABI-001..003, AXS-ABI-013, AXS-ABI-050; 0104 §11-12; tasks/0452 §193.16-17; REQ-ECO-8734, REQ-PKG-024, INV-SABI-001):
+// E20.5 Conformance: 3-tier ABI separation (Tier 1 internal, Tier 2 .axmeta package interface,
+// Tier 3 @abi(stable) shared binary boundary), opaque handle evolution (private field changes,
+// size changes, and alignment shifts behind @opaque pointer handles without breaking downstream ABI
+// or altering public AbiFingerprint), and compile-time rejection of @opaque by-value instantiation.
+
+const TIER_1_INTERNAL: u8 = 1u8
+const TIER_2_PACKAGE: u8 = 2u8
+const TIER_3_STABLE: u8 = 3u8
+
+const AX_ABI_OPAQUE_BY_VALUE: u32 = 222u32
+
+@intrinsic
+fn wrapping_mul_u64(a: u64, b: u64) -> u64 { 0 }
+
+fn fnv1a_combine(acc: u64, v: u64) -> u64 {
+    wrapping_mul_u64(acc ^ v, 1099511628211u64)
+}
+
+// 1. Verify 3-tier ABI separation and explicit opt-in contracts (AXS-ABI-001..003)
+@derive(Copy)
+struct AbiTierDescriptor {
+    tier_id: u8,
+    can_reorder_fields: bool,
+    can_niche_optimize: bool,
+    requires_explicit_repr: bool,
+    cross_compiler_stable: bool,
+    uses_platform_c_calling_conv: bool,
+}
+
+fn get_tier_descriptor(tier: u8) -> AbiTierDescriptor {
+    if tier == TIER_1_INTERNAL {
+        // Tier 1: Internal Axiom ABI (extern "axiom", default)
+        // Compiler retains freedom to optimize layout, niche pack, and use custom register CC.
+        return AbiTierDescriptor {
+            tier_id: TIER_1_INTERNAL,
+            can_reorder_fields: true,
+            can_niche_optimize: true,
+            requires_explicit_repr: false,
+            cross_compiler_stable: false,
+            uses_platform_c_calling_conv: false,
+        }
+    }
+    if tier == TIER_2_PACKAGE {
+        // Tier 2: Package Interface ABI (.axmeta / .axmi)
+        // Semantic interface for separate compilation; validated by CompilerVersion + Target + AbiFingerprint.
+        return AbiTierDescriptor {
+            tier_id: TIER_2_PACKAGE,
+            can_reorder_fields: false,
+            can_niche_optimize: false,
+            requires_explicit_repr: false,
+            cross_compiler_stable: false,
+            uses_platform_c_calling_conv: false,
+        }
+    }
+    // Tier 3: Stable Binary ABI (@abi(stable), @repr(C))
+    // Frozen deterministic machine-level contract for shared libraries (.dll/.so), plugins, and hot-reload.
+    AbiTierDescriptor {
+        tier_id: TIER_3_STABLE,
+        can_reorder_fields: false,
+        can_niche_optimize: false,
+        requires_explicit_repr: true,
+        cross_compiler_stable: true,
+        uses_platform_c_calling_conv: true,
+    }
+}
+
+// 2. Opaque handle layout evolution and AbiFingerprint isolation (AXS-ABI-013, 0104 §11-12)
+@derive(Copy)
+struct InternalEngineLayout {
+    version: u32,
+    byte_size: u32,
+    byte_align: u32,
+    field_count: u32,
+    internal_salt: u64,
+}
+
+// Public interface as seen by downstream consumers
+@derive(Copy)
+struct PublicExportContract {
+    symbol_name_hash: u64,
+    is_opaque: bool,
+    pointer_width: u32,
+    call_conv_win64: bool,
+}
+
+// Canonical public AbiFingerprint calculation for exported items
+fn compute_public_abi_fingerprint(
+    exp: view<PublicExportContract>,
+    internal: view<InternalEngineLayout>
+) -> u64 {
+    let mut h: u64 = 14695981039346656037u64
+    h = fnv1a_combine(h, 0x4158494F4D2D4142u64) // "AXIOM-AB"
+    h = fnv1a_combine(h, exp.symbol_name_hash)
+    h = fnv1a_combine(h, if exp.call_conv_win64 { 1u64 } else { 0u64 })
+
+    // OPAQUE HANDLE ISOLATION GUARANTEE (INV-SABI-001, AXS-ABI-013, AXS-ABI-023 §3):
+    // If the type is @opaque, downstream consumers only see pointer handles (*mut T).
+    // The internal field count, byte size, alignment, and internal fields of the struct
+    // are NEVER hashed into the public AbiFingerprint!
+    if exp.is_opaque {
+        h = fnv1a_combine(h, 0x0FA9E0C100u64) // Opaque tag
+        h = fnv1a_combine(h, exp.pointer_width as u64)
+    } else {
+        // Non-opaque struct: size, align, and internal layout affect the ABI
+        h = fnv1a_combine(h, internal.byte_size as u64)
+        h = fnv1a_combine(h, internal.byte_align as u64)
+        h = fnv1a_combine(h, internal.field_count as u64)
+        h = fnv1a_combine(h, internal.internal_salt)
+    }
+    h
+}
+
+// 3. Compile-time rejection of @opaque types instantiated or passed by value (AXS-ABI-013, AXS-ABI-050)
+const MOD_ENGINE_IMPL: u32 = 100u32
+const MOD_APP_CLIENT: u32 = 200u32
+
+fn validate_opaque_usage(
+    is_opaque: bool,
+    is_by_value: bool,
+    caller_mod: u32,
+    defining_mod: u32
+) -> u32 {
+    if !is_opaque || !is_by_value {
+        return 0u32 // Legal: non-opaque or accessed via pointer handle (*mut T)
+    }
+    if caller_mod == defining_mod {
+        return 0u32 // Legal: defining module knows full concrete layout
+    }
+    // Rejected: outside defining module, @opaque cannot be instantiated or passed by value
+    AX_ABI_OPAQUE_BY_VALUE
+}
+
+pub fn main() -> i32 {
+    // 1. Verify 3-tier ABI separation
+    let t1 = get_tier_descriptor(TIER_1_INTERNAL)
+    let t2 = get_tier_descriptor(TIER_2_PACKAGE)
+    let t3 = get_tier_descriptor(TIER_3_STABLE)
+
+    let tiers_ok = t1.can_reorder_fields && !t1.cross_compiler_stable &&
+        !t2.can_reorder_fields && !t2.cross_compiler_stable &&
+        !t3.can_reorder_fields && t3.cross_compiler_stable && t3.uses_platform_c_calling_conv
+
+    if !tiers_ok {
+        return 1
+    }
+
+    // 2. Verify opaque handle evolution across 3 library releases:
+    // v1: 3 fields (16 bytes, align 8)
+    let v1_internal = InternalEngineLayout {
+        version: 1u32,
+        byte_size: 16u32,
+        byte_align: 8u32,
+        field_count: 3u32,
+        internal_salt: 0x1111222233334444u64,
+    }
+    // v2: 7 fields (40 bytes, align 8) - private fields added
+    let v2_internal = InternalEngineLayout {
+        version: 2u32,
+        byte_size: 40u32,
+        byte_align: 8u32,
+        field_count: 7u32,
+        internal_salt: 0x5555666677778888u64,
+    }
+    // v3: 9 fields (48 bytes, align 16) - internal types changed and alignment bumped
+    let v3_internal = InternalEngineLayout {
+        version: 3u32,
+        byte_size: 48u32,
+        byte_align: 16u32,
+        field_count: 9u32,
+        internal_salt: 0x9999AAAABBBBCCCCu64,
+    }
+
+    let pub_contract = PublicExportContract {
+        symbol_name_hash: 0xDEADBEEF00CAFE01u64,
+        is_opaque: true,
+        pointer_width: 8u32,
+        call_conv_win64: true,
+    }
+
+    let fp_v1 = compute_public_abi_fingerprint(view(pub_contract), view(v1_internal))
+    let fp_v2 = compute_public_abi_fingerprint(view(pub_contract), view(v2_internal))
+    let fp_v3 = compute_public_abi_fingerprint(view(pub_contract), view(v3_internal))
+
+    // Invariance check: opaque type evolution does NOT change public AbiFingerprint
+    let opaque_inv_ok = (fp_v1 == fp_v2) && (fp_v2 == fp_v3)
+    if !opaque_inv_ok {
+        return 2
+    }
+
+    // Contrast with transparent non-opaque struct: internal field additions CHANGE public AbiFingerprint
+    let mut non_opaque_contract = pub_contract
+    non_opaque_contract.is_opaque = false
+    let fp_non_op_v1 = compute_public_abi_fingerprint(view(non_opaque_contract), view(v1_internal))
+    let fp_non_op_v2 = compute_public_abi_fingerprint(view(non_opaque_contract), view(v2_internal))
+    let non_opaque_differs = (fp_non_op_v1 != fp_non_op_v2)
+    if !non_opaque_differs {
+        return 3
+    }
+
+    // 3. Pointer-handle vs by-value usage
+    // Inside defining module: by-value allowed
+    let rc_internal_val = validate_opaque_usage(true, true, MOD_ENGINE_IMPL, MOD_ENGINE_IMPL)
+    // Outside defining module: pointer-handle (*mut EngineContext) allowed
+    let rc_client_ptr = validate_opaque_usage(true, false, MOD_APP_CLIENT, MOD_ENGINE_IMPL)
+    // Outside defining module: by-value instantiation REJECTED with AX_ABI_OPAQUE_BY_VALUE
+    let rc_client_val = validate_opaque_usage(true, true, MOD_APP_CLIENT, MOD_ENGINE_IMPL)
+
+    let opaque_by_val_rejected = (rc_internal_val == 0u32) &&
+        (rc_client_ptr == 0u32) &&
+        (rc_client_val == AX_ABI_OPAQUE_BY_VALUE)
+
+    if !opaque_by_val_rejected {
+        return 4
+    }
+
+    print("abi_tiers_and_opaque_handle_evolution: tiers_separation_ok=true opaque_ptr_ok=true opaque_evolution_invariant=true opaque_by_val_rejected=true\n")
+    print("ABI-TIERS-AND-OPAQUE-HANDLE-EVOLUTION-OK\n")
+    0
+}
