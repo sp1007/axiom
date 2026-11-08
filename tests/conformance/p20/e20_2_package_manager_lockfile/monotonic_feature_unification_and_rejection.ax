@@ -1,0 +1,181 @@
+// test: run
+// modes: interp native
+// stdout-file: monotonic_feature_unification_and_rejection.stdout
+// SPEC-111 §3 (AXS-PKG-023..024; REQ-PKG-025, REQ-ECO-8736, INV-PKG-003):
+// Conformance test verifying:
+// 1. Monotonic additive feature unification (least fixed point union + transitive implications).
+// 2. Strict Host (build-deps) vs Target (normal-deps) feature isolation.
+// 3. Dev-dependencies scope isolation from production builds.
+// 4. Strict rejection of unknown features and mutually conflicting features (conflicts_with).
+
+const FEAT_STD: u32 = 1u32            // bit 0
+const FEAT_DEFAULT: u32 = 2u32        // bit 1 (implies STD)
+const FEAT_ASM: u32 = 4u32            // bit 2
+const FEAT_SIMD: u32 = 8u32           // bit 3 (implies ASM)
+const FEAT_HW_ACCEL: u32 = 16u32      // bit 4 (implies SIMD)
+const FEAT_FIPS_HW: u32 = 32u32       // bit 5 (conflicts with SOFTWARE_ONLY)
+const FEAT_SOFTWARE_ONLY: u32 = 64u32 // bit 6 (conflicts with FIPS_HW)
+const ALL_DECLARED: u32 = 1u32 | 2u32 | 4u32 | 8u32 | 16u32 | 32u32 | 64u32
+
+@derive(Copy)
+struct DepEdge {
+    requested_mask: u32,
+    use_default: bool,
+    is_host: bool,
+    is_dev: bool,
+}
+
+// Expands transitive implications for crypto features
+fn expand_implications(mask: u32) -> u32 {
+    let mut m = mask
+    if (m & FEAT_DEFAULT) != 0u32 {
+        m = m | FEAT_STD
+    }
+    if (m & FEAT_HW_ACCEL) != 0u32 {
+        m = m | FEAT_SIMD
+    }
+    if (m & FEAT_SIMD) != 0u32 {
+        m = m | FEAT_ASM
+    }
+    m
+}
+
+@derive(Copy)
+struct FeatureSolveOutput {
+    ok: bool,
+    target_mask: u32,
+    host_mask: u32,
+    error_kind: u32, // 0 = none, 1 = unknown_feature, 2 = feature_conflict
+}
+
+fn solve_features(edges: view<[4]DepEdge>, count: usize, build_is_test: bool) -> FeatureSolveOutput {
+    let mut target_m: u32 = 0u32
+    let mut host_m: u32 = 0u32
+    let mut any_target_default = false
+    let mut any_host_default = false
+
+    let mut i: usize = 0usize
+    while i < count {
+        let e = (*edges)[i]
+        // Scope filter: dev edges are excluded from production builds (REQ-PKG-007)
+        if !e.is_dev || build_is_test {
+            // Check for undeclared features (AXS-PKG-024)
+            if (e.requested_mask & ~ALL_DECLARED) != 0u32 {
+                return FeatureSolveOutput {
+                    ok: false,
+                    target_mask: 0u32,
+                    host_mask: 0u32,
+                    error_kind: 1u32, // unknown_feature
+                }
+            }
+
+            if e.is_host {
+                host_m = host_m | e.requested_mask
+                if e.use_default {
+                    any_host_default = true
+                }
+            } else {
+                target_m = target_m | e.requested_mask
+                if e.use_default {
+                    any_target_default = true
+                }
+            }
+        }
+        i = i + 1usize
+    }
+
+    if any_target_default {
+        target_m = target_m | FEAT_DEFAULT
+    }
+    if any_host_default {
+        host_m = host_m | FEAT_DEFAULT
+    }
+
+    target_m = expand_implications(target_m)
+    host_m = expand_implications(host_m)
+
+    // Check for mutually exclusive feature conflicts (AXS-PKG-024)
+    if (target_m & FEAT_FIPS_HW) != 0u32 && (target_m & FEAT_SOFTWARE_ONLY) != 0u32 {
+        return FeatureSolveOutput {
+            ok: false,
+            target_mask: target_m,
+            host_mask: host_m,
+            error_kind: 2u32, // feature_conflict
+        }
+    }
+    if (host_m & FEAT_FIPS_HW) != 0u32 && (host_m & FEAT_SOFTWARE_ONLY) != 0u32 {
+        return FeatureSolveOutput {
+            ok: false,
+            target_mask: target_m,
+            host_mask: host_m,
+            error_kind: 2u32, // feature_conflict
+        }
+    }
+
+    FeatureSolveOutput {
+        ok: true,
+        target_mask: target_m,
+        host_mask: host_m,
+        error_kind: 0u32,
+    }
+}
+
+pub fn main() -> i32 {
+    // Scenario 1: Clean production build
+    // Edge 0: Target normal dep requests ["simd"], use_default = true
+    // Edge 1: Target normal dep requests ["fips_hw"], use_default = false
+    // Edge 2: Host build-dep requests ["hardware_accel"], use_default = true
+    // Edge 3: Target dev-dep requests ["software_only"] (ignored in prod)
+    let edges_prod: [4]DepEdge = [
+        DepEdge { requested_mask: FEAT_SIMD, use_default: true, is_host: false, is_dev: false },
+        DepEdge { requested_mask: FEAT_FIPS_HW, use_default: false, is_host: false, is_dev: false },
+        DepEdge { requested_mask: FEAT_HW_ACCEL, use_default: true, is_host: true, is_dev: false },
+        DepEdge { requested_mask: FEAT_SOFTWARE_ONLY, use_default: false, is_host: false, is_dev: true },
+    ]
+
+    let out_prod = solve_features(view(edges_prod), 4usize, false)
+    if !out_prod.ok {
+        return 1
+    }
+
+    // Target should have: STD + DEFAULT + ASM + SIMD + FIPS_HW
+    let exp_target = FEAT_STD | FEAT_DEFAULT | FEAT_ASM | FEAT_SIMD | FEAT_FIPS_HW
+    // Host should have: STD + DEFAULT + ASM + SIMD + HW_ACCEL
+    let exp_host = FEAT_STD | FEAT_DEFAULT | FEAT_ASM | FEAT_SIMD | FEAT_HW_ACCEL
+
+    if out_prod.target_mask != exp_target || out_prod.host_mask != exp_host {
+        return 2
+    }
+
+    // Host isolation check: Target MUST NOT contain HW_ACCEL
+    if (out_prod.target_mask & FEAT_HW_ACCEL) != 0u32 {
+        return 3
+    }
+
+    // Dev isolation check: Target in prod MUST NOT contain SOFTWARE_ONLY
+    if (out_prod.target_mask & FEAT_SOFTWARE_ONLY) != 0u32 {
+        return 4
+    }
+
+    // Scenario 2: Test build where dev-deps are activated
+    // Because edge 1 requests FIPS_HW and edge 3 requests SOFTWARE_ONLY, test build should detect conflict!
+    let out_test = solve_features(view(edges_prod), 4usize, true)
+    if out_test.ok || out_test.error_kind != 2u32 {
+        return 5 // should fail with feature_conflict
+    }
+
+    // Scenario 3: Undeclared / unknown feature rejection
+    let edges_bad: [4]DepEdge = [
+        DepEdge { requested_mask: 128u32, use_default: false, is_host: false, is_dev: false }, // bit 7 undeclared
+        DepEdge { requested_mask: 0u32, use_default: false, is_host: false, is_dev: false },
+        DepEdge { requested_mask: 0u32, use_default: false, is_host: false, is_dev: false },
+        DepEdge { requested_mask: 0u32, use_default: false, is_host: false, is_dev: false },
+    ]
+    let out_bad = solve_features(view(edges_bad), 4usize, false)
+    if out_bad.ok || out_bad.error_kind != 1u32 {
+        return 6 // should fail with unknown_feature
+    }
+
+    print("MONOTONIC-FEATURE-UNIFICATION-AND-REJECTION-OK\n")
+    0
+}

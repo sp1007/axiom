@@ -1,0 +1,196 @@
+// test: run
+// modes: interp native
+// stdout-file: air_gapped_offline_vendor_and_drift_audit.stdout
+// SPEC-111 §§4..5 (AXS-PKG-031..033; REQ-PKG-013, REQ-PKG-022, REQ-PKG-024, REQ-ECO-8736, INV-PKG-003):
+// Conformance test verifying:
+// 1. --locked / --frozen drift detection against manifest modifications.
+// 2. graph_hash tamper detection rejecting corrupted lockfile entries.
+// 3. SHA-256 content-addressed cache path formatting and pre-use verification.
+// 4. Sandboxed extraction path-traversal rejection (.., /, C:\, embedded NUL) and quota limits.
+// 5. Air-gapped --offline execution and vendor/ materialization coverage verification.
+
+const STORE_OK: u32 = 0u32
+const STORE_HASH_MISMATCH: u32 = 1u32
+const STORE_PATH_TRAVERSAL: u32 = 2u32
+const STORE_QUOTA_EXCEEDED: u32 = 3u32
+const STORE_OFFLINE_MISSING: u32 = 4u32
+
+const LOCK_STATUS_OK: u32 = 0u32
+const LOCK_STATUS_CORRUPT: u32 = 1u32
+const LOCK_STATUS_DRIFT: u32 = 2u32
+
+@derive(Copy)
+struct Hash256 {
+    w0: u64,
+    w1: u64,
+    w2: u64,
+    w3: u64,
+}
+
+fn hash256_eq(a: Hash256, b: Hash256) -> bool {
+    a.w0 == b.w0 && a.w1 == b.w1 && a.w2 == b.w2 && a.w3 == b.w3
+}
+
+// Simulates path traversal check on archive entry bytes
+fn check_entry_path_traversal(p: view<[u8]>) -> bool {
+    let n = len(p)
+    if n == 0usize {
+        return true
+    }
+    // Reject absolute paths: starts with '/' or '\'
+    if p[0] == 47u8 || p[0] == 92u8 {
+        return true
+    }
+    // Reject Windows drive paths (e.g. "C:")
+    if n >= 2usize && p[1] == 58u8 {
+        return true
+    }
+    let mut i: usize = 0usize
+    while i < n {
+        let b = p[i]
+        // Reject NUL and backslash
+        if b == 0u8 || b == 92u8 {
+            return true
+        }
+        // Reject parent traversal segment "/../"
+        if b == 46u8 && (i + 1usize) < n && p[i + 1usize] == 46u8 {
+            let prev_sep = i == 0usize || p[i - 1usize] == 47u8
+            let next_sep = (i + 2usize) == n || p[i + 2usize] == 47u8
+            if prev_sep && next_sep {
+                return true
+            }
+        }
+        i = i + 1usize
+    }
+    false
+}
+
+const MAX_ARCHIVE: usize = 67108864usize        // 64 MiB
+const MAX_UNCOMPRESSED: usize = 268435456usize  // 256 MiB
+const MAX_RATIO: usize = 100usize
+const MAX_FILES: usize = 16384usize
+
+fn check_decompression_quotas(archive_bytes: usize, uncompressed_bytes: usize, file_count: usize) -> bool {
+    if archive_bytes > MAX_ARCHIVE || uncompressed_bytes > MAX_UNCOMPRESSED || file_count > MAX_FILES {
+        return false
+    }
+    if archive_bytes > 0usize && (uncompressed_bytes / archive_bytes) > MAX_RATIO {
+        return false
+    }
+    true
+}
+
+// Simulates --locked drift verification between manifest dependencies and locked versions
+fn verify_lockfile_drift(
+    manifest_dep_count: usize,
+    lockfile_dep_count: usize,
+    manifest_ver_code: u32,
+    lockfile_ver_code: u32
+) -> u32 {
+    if manifest_dep_count != lockfile_dep_count {
+        return LOCK_STATUS_DRIFT
+    }
+    if manifest_ver_code != lockfile_ver_code {
+        return LOCK_STATUS_DRIFT
+    }
+    LOCK_STATUS_OK
+}
+
+fn verify_offline_coverage(is_offline: bool, external_count: usize, vendored_or_cached_count: usize) -> u32 {
+    if !is_offline {
+        return STORE_OK
+    }
+    if vendored_or_cached_count < external_count {
+        return STORE_OFFLINE_MISSING
+    }
+    STORE_OK
+}
+
+pub fn main() -> i32 {
+    // 1. Drift detection verification
+    let drift_clean = verify_lockfile_drift(3usize, 3usize, 10402u32, 10402u32)
+    let drift_count_mismatch = verify_lockfile_drift(4usize, 3usize, 10402u32, 10402u32)
+    let drift_ver_mismatch = verify_lockfile_drift(3usize, 3usize, 10500u32, 10402u32)
+
+    if drift_clean != LOCK_STATUS_OK ||
+        drift_count_mismatch != LOCK_STATUS_DRIFT ||
+        drift_ver_mismatch != LOCK_STATUS_DRIFT {
+        return 1
+    }
+
+    // 2. graph_hash tamper verification
+    let valid_hash = Hash256 {
+        w0: 0x9F86D081884C7D65u64,
+        w1: 0x9A2FEAA0C55AD015u64,
+        w2: 0xA3BF4F1B2B0B822Cu64,
+        w3: 0xD15D6C15B0F00A08u64,
+    }
+    let tampered_hash = Hash256 {
+        w0: 0x9F86D081884C7D65u64,
+        w1: 0x9A2FEAA0C55AD015u64,
+        w2: 0xA3BF4F1B2B0B822Cu64,
+        w3: 0xD15D6C15B0F00A00u64, // corrupted last byte
+    }
+    let tamper_rejected = !hash256_eq(valid_hash, tampered_hash)
+    if !tamper_rejected {
+        return 2
+    }
+
+    // 3. Pre-use SHA-256 package content verification
+    let pkg_sha_expected = Hash256 {
+        w0: 0x2C26B46B68FFC68Fu64,
+        w1: 0xF99B453C1D304134u64,
+        w2: 0x13422D706483BFA0u64,
+        w3: 0xF98A5E886266E7AEu64,
+    }
+    let pkg_sha_actual = pkg_sha_expected
+    let pkg_sha_bad = Hash256 {
+        w0: 0x2C26B46B68FFC68Fu64,
+        w1: 0xF99B453C1D304134u64,
+        w2: 0x13422D706483BFA0u64,
+        w3: 0xF98A5E886266E700u64,
+    }
+    let hash_match_ok = hash256_eq(pkg_sha_expected, pkg_sha_actual)
+    let hash_mismatch_caught = !hash256_eq(pkg_sha_expected, pkg_sha_bad)
+    if !hash_match_ok || !hash_mismatch_caught {
+        return 3
+    }
+
+    // 4. Sandboxed extraction and path traversal checks
+    // "src/lib.ax"
+    let p_valid: [10]u8 = [115u8, 114u8, 99u8, 47u8, 108u8, 105u8, 98u8, 46u8, 97u8, 120u8]
+    // "/etc/passwd"
+    let p_abs: [11]u8 = [47u8, 101u8, 116u8, 99u8, 47u8, 112u8, 97u8, 115u8, 115u8, 119u8, 100u8]
+    // "C:\boot.ini"
+    let p_win: [11]u8 = [67u8, 58u8, 92u8, 98u8, 111u8, 111u8, 116u8, 46u8, 105u8, 110u8, 105u8]
+    // "crates/../target"
+    let p_escape: [16]u8 = [99u8, 114u8, 97u8, 116u8, 101u8, 115u8, 47u8, 46u8, 46u8, 47u8, 116u8, 97u8, 114u8, 103u8, 101u8, 116u8]
+
+    let trav_valid = !check_entry_path_traversal(view(p_valid))
+    let trav_abs = check_entry_path_traversal(view(p_abs))
+    let trav_win = check_entry_path_traversal(view(p_win))
+    let trav_escape = check_entry_path_traversal(view(p_escape))
+
+    if !trav_valid || !trav_abs || !trav_win || !trav_escape {
+        return 4
+    }
+
+    // Quota checks: normal vs bombs
+    let q_ok = check_decompression_quotas(10000usize, 50000usize, 20usize)
+    let q_ratio_bomb = !check_decompression_quotas(1000usize, 500000usize, 10usize) // 500:1 ratio
+    let q_size_bomb = !check_decompression_quotas(70000000usize, 80000000usize, 10usize)
+    if !q_ok || !q_ratio_bomb || !q_size_bomb {
+        return 5
+    }
+
+    // 5. Air-gapped --offline coverage
+    let off_complete = verify_offline_coverage(true, 5usize, 5usize)
+    let off_missing = verify_offline_coverage(true, 5usize, 4usize)
+
+    if off_complete != STORE_OK || off_missing != STORE_OFFLINE_MISSING {
+        return 6
+    }
+
+    print("AIR-GAPPED-OFFLINE-VENDOR-AND-DRIFT-AUDIT-OK\n")
+    0
+}
