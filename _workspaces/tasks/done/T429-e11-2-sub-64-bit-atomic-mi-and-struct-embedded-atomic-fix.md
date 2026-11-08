@@ -8,14 +8,14 @@ model: opus
 gate_model: sonnet
 depends: [T407, T408]
 priority: 129
-status: doing
+status: done
 attempts: 1
 paths: [compiler/driver/pipeline.ax, compiler/types/typeck.ax, tests/run/atomics]
 locks: [tests/selfhost]
 spec: [spec/SPEC-31-atomics.md]
 covers: [REQ-CONC-134, REQ-ATM-022]
 started: 2026-11-09 02:32:16
-agent: T429-impl
+finished: 2026-11-09 06:50:53
 ---
 # T429 — E11.2 — Sub-64-bit atomic MI size preservation & struct-embedded Atomic<T> prelude resolution
 
@@ -55,3 +55,4 @@ Fix sub-64-bit atomic machine instruction operand width clobbering in `compiler/
 ## Log
 - 2026-11-08 23:15:00 created by axiom-architect to unblock T409 (fixes sub-64-bit atomic MI width clobber and struct-embedded Atomic<T> prelude ordering)
 - 2026-11-09 02:32:16 started (attempt 1) T429-impl
+- 2026-11-09 06:50:53 accepted by QA -> done
