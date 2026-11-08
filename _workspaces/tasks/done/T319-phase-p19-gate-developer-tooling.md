@@ -8,11 +8,13 @@ model: opus
 gate_model: opus
 depends: [T219, T318, T800, T801, T802, T803, T804, T805, T806, T807, T808, T809, T810, T811, T812, T813, T814, T815, T816, T817, T818, T819]
 priority: 319
-status: todo
-attempts: 0
+status: done
+attempts: 1
 paths: [tests/conformance/p19, _workspaces/reports/phase-P19-review.md]
 spec: [spec/ROADMAP.md, spec/SPEC-100-lsp-server-ide-engine.md, spec/SPEC-101-canonical-formatter.md, spec/SPEC-102-refactoring-engine-semantic-vcs.md, spec/SPEC-103-diagnostics-ux-ai-interface.md, spec/SPEC-104-docgen-test-framework-ux.md]
 covers: [REQ-TOOL-297, REQ-TOOL-298, REQ-TST-112]
+started: 2026-11-08 19:29:35
+finished: 2026-11-08 19:59:35
 ---
 # T319 — Phase P19 gate: Developer tooling
 
@@ -40,3 +42,5 @@ requirements mapped to the phase are implemented.
 ## Log
 - 2026-10-06 02:31:22 covers += REQ-TOOL-297, REQ-TOOL-298, REQ-TST-112 (metadata only)
 - 2026-11-03 09:50:00 updated by T219 (wired T318 and all 20 P19 tasks T800–T819 into depends and SPEC-100..SPEC-104 into spec)
+- 2026-11-08 19:29:35 started (attempt 1) T319-impl
+- 2026-11-08 19:59:35 accepted by QA -> done
