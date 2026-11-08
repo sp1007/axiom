@@ -8,11 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T463, T617]
 priority: 112
-status: todo
-attempts: 0
+status: doing
+attempts: 1
 paths: [compiler/opt/slp, compiler/lir/vec_lower, tests/run/opt_slp_vec]
 spec: [spec/SPEC-74-auto-vectorization.md, 0095, 0162, tasks/0403, tasks/0406, tasks/0407]
 covers: [REQ-OPT-213, REQ-OPT-214, REQ-OPT-215, REQ-OPT-216, REQ-OPT-217]
+started: 2026-11-08 14:29:00
+agent: T618-impl
 ---
 # T618 — E15.5 — Straight-line SLP vectorization, target SIMD width/cost model & LIR vector lowering
 
@@ -41,3 +43,4 @@ Implement Superword-Level Parallelism (`SLP`) straight-line basic-block vectoriz
 
 ## Log
 - 2026-11-03 02:42:00 created by T215 (P15 phase planning)
+- 2026-11-08 14:29:00 started (attempt 1) T618-impl

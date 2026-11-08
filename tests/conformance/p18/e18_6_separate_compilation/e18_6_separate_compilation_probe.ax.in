@@ -1,0 +1,445 @@
+module main
+
+use compiler.kernel.arena.Arena
+use compiler.kernel.arena.arena_with_chunk_size
+use compiler.kernel.arena.arena_destroy
+use compiler.kernel.arena.arena_alloc_raw
+use compiler.kernel.interner.StrView
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.link.gc.LGC_SEC_TEXT
+use compiler.link.gc.LGC_SEC_RDATA
+use compiler.link.gc.LGC_SEC_DATA
+use compiler.link.gc.LGC_SEC_BSS
+use compiler.link.gc.LGC_SEC_PDATA
+use compiler.link.gc.LGC_SEC_XDATA
+use compiler.link.gc.IMAGE_SCN_LNK_COMDAT
+use compiler.link.gc.COMDAT_SELECT_NONE
+use compiler.link.gc.COMDAT_SELECT_NODUPLICATES
+use compiler.link.gc.COMDAT_SELECT_ANY
+use compiler.link.gc.COMDAT_SELECT_SAME_SIZE
+use compiler.link.gc.COMDAT_SELECT_EXACT_MATCH
+use compiler.link.gc.COMDAT_SELECT_ASSOCIATIVE
+use compiler.link.gc.COMDAT_SELECT_LARGEST
+use compiler.link.gc.LGC_BIND_LOCAL
+use compiler.link.gc.LGC_BIND_GLOBAL
+use compiler.link.gc.LGC_BIND_WEAK
+use compiler.link.gc.LGC_BIND_COMDAT
+use compiler.link.gc.LGC_ROOT_NONE
+use compiler.link.gc.LGC_ROOT_ENTRY
+use compiler.link.gc.LGC_ROOT_EXPORT
+use compiler.link.gc.LGC_ROOT_USED
+use compiler.link.gc.LGC_ROOT_AT_PINNED
+use compiler.link.gc.LGC_ROOT_MODULE_INIT
+use compiler.link.gc.LGC_ROOT_REFLECTION
+use compiler.link.gc.LGC_RELOC_ADDR32NB
+use compiler.link.gc.LGC_RELOC_REL32
+use compiler.link.gc.AX_LINK_UNDEFINED_SYMBOL
+use compiler.link.gc.AX_LINK_DUPLICATE_SYMBOL
+use compiler.link.gc.AX_LINK_RELOC_OUT_OF_RANGE
+use compiler.link.gc.AX_LINK_ABI_MISMATCH
+use compiler.link.gc.AX_LINK_WX_VIOLATION
+use compiler.link.gc.AX_LINK_DANGLING_RELOC
+use compiler.link.gc.IMAGE_SCN_MEM_EXECUTE
+use compiler.link.gc.IMAGE_SCN_MEM_WRITE
+use compiler.link.gc.LGC_NONE_ID
+use compiler.link.gc.lgc_byte_at
+use compiler.link.gc.lgc_sec_at
+use compiler.link.gc.lgc_graph_new
+use compiler.link.gc.lgc_add_object
+use compiler.link.gc.lgc_add_archive_member
+use compiler.link.gc.lgc_add_section
+use compiler.link.gc.lgc_emit_function_with_unwind
+use compiler.link.gc.lgc_emit_static_datum
+use compiler.link.gc.lgc_set_pinned_vma
+use compiler.link.gc.lgc_mark_root
+use compiler.link.gc.lgc_add_reloc
+use compiler.link.gc.lgc_run_pipeline
+use compiler.link.gc.lgc_verify_post_gc_invariants
+use compiler.link.gc.lgc_emit_gc_sections_report
+use compiler.link.gc.lgc_emit_link_map_report
+
+fn new_arena(chunk: usize) -> Arena {
+    let mut a = arena_with_chunk_size(chunk);
+    let _ = arena_alloc_raw(mut_view(a), 16, 8);
+    a
+}
+
+fn alloc_sv8(arena: mut_view<Arena>, s0: u8, s1: u8, s2: u8, s3: u8, s4: u8, s5: u8, s6: u8, s7: u8, len: usize) -> StrView {
+    let b = arena_alloc_raw(mut_view(*arena), 8, 1);
+    unsafe {
+        *lgc_byte_at(b, 0) = s0;
+        *lgc_byte_at(b, 1) = s1;
+        *lgc_byte_at(b, 2) = s2;
+        *lgc_byte_at(b, 3) = s3;
+        *lgc_byte_at(b, 4) = s4;
+        *lgc_byte_at(b, 5) = s5;
+        *lgc_byte_at(b, 6) = s6;
+        *lgc_byte_at(b, 7) = s7;
+    }
+    StrView { ptr: b as *const u8, len: len }
+}
+
+fn diag_buf_eq(a: view<DiagBuffer>, b: view<DiagBuffer>) -> bool {
+    if a.len != b.len {
+        return false;
+    }
+    let mut i: usize = 0;
+    while i < a.len {
+        let ba = unsafe { *(a.ptr + i) };
+        let bb = unsafe { *(b.ptr + i) };
+        if ba != bb {
+            return false;
+        }
+        i = i + 1;
+    }
+    true
+}
+
+fn diag_buf_has_sub(db: view<DiagBuffer>, needle: StrView) -> bool {
+    let dlen: usize = db.len;
+    let nlen: usize = needle.len;
+    if nlen == 0 || dlen < nlen {
+        return false;
+    }
+    let limit: usize = dlen - nlen;
+    let mut i: usize = 0;
+    while i <= limit {
+        let mut ok: bool = true;
+        let mut j: usize = 0;
+        while j < nlen {
+            let a = unsafe { *(db.ptr + (i + j)) };
+            let b = unsafe { *(needle.ptr + j) };
+            if a != b {
+                ok = false;
+                j = nlen;
+            } else {
+                j = j + 1;
+            }
+        }
+        if ok {
+            return true;
+        }
+        i = i + 1;
+    }
+    false
+}
+
+// 1. Multi-module separate `.obj` + `.lib` archive + COMDAT generic/vtable deduplication & root propagation
+fn probe_separate_obj_lib_and_comdat(arena: mut_view<Arena>) -> bool {
+    let g = lgc_graph_new(mut_view(*arena), true, false, false);
+
+    let s_app_obj   = alloc_sv8(mut_view(*arena), 97u8, 112u8, 112u8, 46u8, 111u8, 98u8, 106u8, 0u8, 7);   // "app.obj"
+    let s_math_obj  = alloc_sv8(mut_view(*arena), 109u8, 97u8, 116u8, 104u8, 46u8, 111u8, 98u8, 106u8, 8); // "math.obj"
+    let s_scale_obj = alloc_sv8(mut_view(*arena), 115u8, 99u8, 108u8, 46u8, 111u8, 98u8, 106u8, 0u8, 7);   // "scl.obj"
+    let s_std_lib   = alloc_sv8(mut_view(*arena), 115u8, 116u8, 100u8, 46u8, 108u8, 105u8, 98u8, 0u8, 7);   // "std.lib"
+    let s_io_obj    = alloc_sv8(mut_view(*arena), 105u8, 111u8, 46u8, 111u8, 98u8, 106u8, 0u8, 0u8, 6);    // "io.obj"
+    let s_sys_obj   = alloc_sv8(mut_view(*arena), 115u8, 121u8, 115u8, 46u8, 111u8, 98u8, 106u8, 0u8, 7);  // "sys.obj"
+    let s_net_obj   = alloc_sv8(mut_view(*arena), 110u8, 101u8, 116u8, 46u8, 111u8, 98u8, 106u8, 0u8, 7);  // "net.obj"
+
+    let obj_app   = lgc_add_object(unsafe { mut_view(*g) }, mut_view(*arena), s_app_obj, 0x1001u64);
+    let obj_math  = lgc_add_object(unsafe { mut_view(*g) }, mut_view(*arena), s_math_obj, 0x1002u64);
+    let obj_scale = lgc_add_object(unsafe { mut_view(*g) }, mut_view(*arena), s_scale_obj, 0x1003u64);
+    let obj_io    = lgc_add_archive_member(unsafe { mut_view(*g) }, mut_view(*arena), s_std_lib, s_io_obj, 0x2001u64);
+    let obj_sys   = lgc_add_archive_member(unsafe { mut_view(*g) }, mut_view(*arena), s_std_lib, s_sys_obj, 0x2002u64);
+    let obj_net   = lgc_add_archive_member(unsafe { mut_view(*g) }, mut_view(*arena), s_std_lib, s_net_obj, 0x2003u64);
+
+    let sym_main  = alloc_sv8(mut_view(*arena), 109u8, 97u8, 105u8, 110u8, 0u8, 0u8, 0u8, 0u8, 4);         // "main"
+    let sym_clamp = alloc_sv8(mut_view(*arena), 99u8, 108u8, 97u8, 109u8, 112u8, 0u8, 0u8, 0u8, 5);       // "clamp"
+    let sym_vt    = alloc_sv8(mut_view(*arena), 118u8, 116u8, 95u8, 111u8, 114u8, 100u8, 0u8, 0u8, 6);    // "vt_ord"
+    let sym_ti    = alloc_sv8(mut_view(*arena), 116u8, 105u8, 95u8, 118u8, 101u8, 99u8, 0u8, 0u8, 6);     // "ti_vec"
+    let sym_pgo   = alloc_sv8(mut_view(*arena), 112u8, 103u8, 111u8, 95u8, 99u8, 116u8, 0u8, 0u8, 6);     // "pgo_ct"
+    let sym_hook  = alloc_sv8(mut_view(*arena), 104u8, 111u8, 111u8, 107u8, 0u8, 0u8, 0u8, 0u8, 4);       // "hook"
+    let sym_io    = alloc_sv8(mut_view(*arena), 105u8, 111u8, 95u8, 119u8, 114u8, 0u8, 0u8, 0u8, 5);      // "io_wr"
+    let sym_sys   = alloc_sv8(mut_view(*arena), 115u8, 121u8, 115u8, 95u8, 119u8, 114u8, 0u8, 0u8, 6);    // "sys_wr"
+    let sym_net   = alloc_sv8(mut_view(*arena), 110u8, 101u8, 116u8, 95u8, 102u8, 110u8, 0u8, 0u8, 6);    // "net_fn"
+    let sym_ghost = alloc_sv8(mut_view(*arena), 103u8, 104u8, 111u8, 115u8, 116u8, 0u8, 0u8, 0u8, 5);     // "ghost"
+
+    let sec_main = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_main, sym_main,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 64u32, 0xAA01u64, 16u32, LGC_ROOT_ENTRY
+    );
+
+    // 3 copies of COMDAT generic `clamp<i32>` across `app.obj`, `math.obj`, `scl.obj` (where `scl.obj` marks it `@export`)
+    let sec_clamp_app = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_clamp, sym_clamp,
+        LGC_BIND_COMDAT, COMDAT_SELECT_ANY, 80u32, 0xBB01u64, 16u32, LGC_ROOT_NONE
+    );
+    let sec_clamp_math = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_math, sym_clamp, sym_clamp,
+        LGC_BIND_COMDAT, COMDAT_SELECT_ANY, 80u32, 0xBB01u64, 16u32, LGC_ROOT_NONE
+    );
+    let _sec_clamp_scale = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_scale, sym_clamp, sym_clamp,
+        LGC_BIND_COMDAT, COMDAT_SELECT_ANY, 80u32, 0xBB01u64, 16u32, LGC_ROOT_EXPORT
+    );
+
+    // COMDAT vtable (`SAME_SIZE`) and typeinfo (`EXACT_MATCH`) and PGO counter (`LARGEST`)
+    let sec_vt_app = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_vt, sym_vt,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_SAME_SIZE, 32u32, 0xCC01u64, LGC_ROOT_NONE
+    );
+    let _sec_vt_math = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_math, sym_vt, sym_vt,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_SAME_SIZE, 32u32, 0xCC02u64, LGC_ROOT_NONE
+    );
+    let sec_ti_app = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_ti, sym_ti,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_EXACT_MATCH, 24u32, 0xDD01u64, LGC_ROOT_NONE
+    );
+    let _sec_ti_scale = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_scale, sym_ti, sym_ti,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_EXACT_MATCH, 24u32, 0xDD01u64, LGC_ROOT_NONE
+    );
+    let _sec_pgo_app = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_pgo, sym_pgo,
+        LGC_SEC_DATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_LARGEST, 16u32, 0xEE01u64, LGC_ROOT_NONE
+    );
+    let sec_pgo_math = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_math, sym_pgo, sym_pgo,
+        LGC_SEC_DATA, 8u32, LGC_BIND_COMDAT, COMDAT_SELECT_LARGEST, 64u32, 0xEE02u64, LGC_ROOT_NONE
+    );
+
+    // Weak fallback in `app.obj` overridden by Strong definition in `scale.obj`
+    let _sec_hook_weak = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_hook, sym_hook,
+        LGC_BIND_WEAK, COMDAT_SELECT_ANY, 24u32, 0xFF01u64, 0u32, LGC_ROOT_NONE
+    );
+    let sec_hook_strong = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_scale, sym_hook, sym_hook,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_ANY, 40u32, 0xFF02u64, 0u32, LGC_ROOT_NONE
+    );
+
+    // Archive members: `io.obj` -> `sys.obj` (extracted), `net.obj` -> `ghost` (unreferenced, skipped!)
+    let sec_io = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_io, sym_io, sym_io,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 48u32, 0x3001u64, 8u32, LGC_ROOT_NONE
+    );
+    let _sec_sys = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_sys, sym_sys, sym_sys,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 0x3002u64, 8u32, LGC_ROOT_NONE
+    );
+    let sec_net = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_net, sym_net, sym_net,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 128u32, 0x3003u64, 16u32, LGC_ROOT_NONE
+    );
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_net, 4u32, LGC_RELOC_REL32, sym_ghost, LGC_NONE_ID, 0);
+
+    // Relocations from live sections (including relocation targeting folded duplicate `sec_clamp_math`)
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_main, 4u32, LGC_RELOC_REL32, sym_clamp, sec_clamp_math, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_main, 8u32, LGC_RELOC_REL32, sym_io, LGC_NONE_ID, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_io, 12u32, LGC_RELOC_REL32, sym_sys, LGC_NONE_ID, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_clamp_app, 8u32, LGC_RELOC_ADDR32NB, sym_vt, sec_vt_app, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_clamp_app, 12u32, LGC_RELOC_ADDR32NB, sym_ti, sec_ti_app, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_clamp_app, 16u32, LGC_RELOC_ADDR32NB, sym_pgo, LGC_NONE_ID, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_clamp_app, 20u32, LGC_RELOC_REL32, sym_hook, LGC_NONE_ID, 0);
+
+    if !lgc_run_pipeline(unsafe { mut_view(*g) }, mut_view(*arena)) {
+        return false;
+    }
+
+    let st = unsafe { (*g).stats };
+    if st.extracted_archive_members != 2u32 || st.skipped_archive_members != 1u32 {
+        return false;
+    }
+    if st.comdat_groups_total != 5u32 || st.comdat_sections_folded != 6u32 || st.comdat_assoc_folded != 4u32 {
+        return false;
+    }
+    let clamp_win = unsafe { lgc_sec_at((*g).secs, sec_clamp_app as usize) };
+    let pgo_win = unsafe { lgc_sec_at((*g).secs, sec_pgo_math as usize) };
+    let hook_win = unsafe { lgc_sec_at((*g).secs, sec_hook_strong as usize) };
+    if !(unsafe { (*clamp_win).is_export }) || !(unsafe { (*pgo_win).is_live }) || !(unsafe { (*hook_win).is_live }) {
+        return false;
+    }
+    true
+}
+
+// 2. All 6 reachability roots, forward `.pdata`/`.xdata` + LSDA unwind chain, dead section stripping & inspect reports
+fn probe_root_set_gc_unwind_and_inspect(arena: mut_view<Arena>) -> bool {
+    let g = lgc_graph_new(mut_view(*arena), true, false, false);
+
+    let s_app = alloc_sv8(mut_view(*arena), 97u8, 112u8, 112u8, 46u8, 111u8, 98u8, 106u8, 0u8, 7);
+    let obj_app = lgc_add_object(unsafe { mut_view(*g) }, mut_view(*arena), s_app, 0x5001u64);
+
+    let sym_main  = alloc_sv8(mut_view(*arena), 109u8, 97u8, 105u8, 110u8, 0u8, 0u8, 0u8, 0u8, 4);
+    let sym_exp   = alloc_sv8(mut_view(*arena), 97u8, 112u8, 105u8, 95u8, 101u8, 120u8, 112u8, 0u8, 7);
+    let sym_used  = alloc_sv8(mut_view(*arena), 117u8, 115u8, 101u8, 100u8, 95u8, 99u8, 107u8, 0u8, 7);
+    let sym_mmio  = alloc_sv8(mut_view(*arena), 109u8, 109u8, 105u8, 111u8, 95u8, 114u8, 103u8, 0u8, 7);
+    let sym_init  = alloc_sv8(mut_view(*arena), 109u8, 111u8, 100u8, 95u8, 105u8, 110u8, 116u8, 0u8, 7);
+    let sym_refl  = alloc_sv8(mut_view(*arena), 114u8, 101u8, 102u8, 108u8, 95u8, 116u8, 98u8, 0u8, 7);
+    let sym_pers  = alloc_sv8(mut_view(*arena), 101u8, 104u8, 95u8, 112u8, 101u8, 114u8, 115u8, 0u8, 7);
+    let sym_lsda  = alloc_sv8(mut_view(*arena), 108u8, 115u8, 100u8, 97u8, 95u8, 116u8, 98u8, 0u8, 7);
+    let sym_deadf = alloc_sv8(mut_view(*arena), 100u8, 101u8, 97u8, 100u8, 95u8, 102u8, 110u8, 0u8, 7);
+    let sym_deadd = alloc_sv8(mut_view(*arena), 100u8, 101u8, 97u8, 100u8, 95u8, 100u8, 116u8, 0u8, 7);
+
+    let sec_main = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_main, sym_main,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 64u32, 0x5101u64, 16u32, LGC_ROOT_ENTRY
+    );
+    // sec_main is 0, its .xdata is 1, its .pdata is 2
+    let sec_main_xdata: u32 = sec_main + 1u32;
+
+    let _sec_exp = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_exp, sym_exp,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 48u32, 0x5102u64, 12u32, LGC_ROOT_EXPORT
+    );
+    let _sec_used = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_used, sym_used,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 24u32, 0x5103u64, LGC_ROOT_USED
+    );
+    let sec_mmio = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_mmio, sym_mmio,
+        LGC_SEC_DATA, 8u32, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 8u32, 0x5104u64, LGC_ROOT_NONE
+    );
+    lgc_set_pinned_vma(unsafe { mut_view(*g) }, sec_mmio, 0xFED00000u64);
+    let _sec_init = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_init, sym_init,
+        LGC_BIND_LOCAL, COMDAT_SELECT_NONE, 32u32, 0x5105u64, 8u32, LGC_ROOT_MODULE_INIT
+    );
+    let sec_refl = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_refl, sym_refl,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_LOCAL, COMDAT_SELECT_NONE, 40u32, 0x5106u64, LGC_ROOT_NONE
+    );
+    lgc_mark_root(unsafe { mut_view(*g) }, sec_refl, LGC_ROOT_REFLECTION);
+
+    // Personality handler + LSDA table referenced ONLY from `sec_main_xdata` (forward unwind reachability!)
+    let sec_pers = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_pers, sym_pers,
+        LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 0x5107u64, 0u32, LGC_ROOT_NONE
+    );
+    let sec_lsda = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_lsda, sym_lsda,
+        LGC_SEC_RDATA, 8u32, LGC_BIND_LOCAL, COMDAT_SELECT_NONE, 28u32, 0x5108u64, LGC_ROOT_NONE
+    );
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_main_xdata, 8u32, LGC_RELOC_ADDR32NB, sym_pers, sec_pers, 0);
+    lgc_add_reloc(unsafe { mut_view(*g) }, mut_view(*arena), sec_main_xdata, 12u32, LGC_RELOC_ADDR32NB, sym_lsda, sec_lsda, 0);
+
+    // Dead function + its `.pdata`/`.xdata` + dead `.bss` datum -> must all be swept!
+    let _sec_dead_fn = lgc_emit_function_with_unwind(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_deadf, sym_deadf,
+        LGC_BIND_LOCAL, COMDAT_SELECT_NONE, 144u32, 0xDEAD01u64, 16u32, LGC_ROOT_NONE
+    );
+    let _sec_dead_bss = lgc_emit_static_datum(
+        unsafe { mut_view(*g) }, mut_view(*arena), obj_app, sym_deadd, sym_deadd,
+        LGC_SEC_BSS, 16u32, LGC_BIND_LOCAL, COMDAT_SELECT_NONE, 512u32, 0u64, LGC_ROOT_NONE
+    );
+
+    if !lgc_run_pipeline(unsafe { mut_view(*g) }, mut_view(*arena)) {
+        return false;
+    }
+
+    let st = unsafe { (*g).stats };
+    if st.roots_seeded != 6u32 || st.retained_sections != 14u32 || st.dead_stripped_sections != 4u32 || st.dead_unwind_stripped != 2u32 {
+        return false;
+    }
+
+    let mut db1: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    let mut db2: DiagBuffer = DiagBuffer { ptr: 0 as *mut u8, len: 0, cap: 0 };
+    diag_buf_init(mut_view(db1));
+    diag_buf_init(mut_view(db2));
+    lgc_emit_gc_sections_report(unsafe { view(*g) }, mut_view(db1));
+    lgc_emit_link_map_report(unsafe { view(*g) }, mut_view(db1));
+    lgc_emit_gc_sections_report(unsafe { view(*g) }, mut_view(db2));
+    lgc_emit_link_map_report(unsafe { view(*g) }, mut_view(db2));
+
+    let ok_rep: bool = diag_buf_eq(view(db1), view(db2)) &&
+                       diag_buf_has_sub(view(db1), sym_main) &&
+                       diag_buf_has_sub(view(db1), sym_pers) &&
+                       diag_buf_has_sub(view(db1), sym_lsda) &&
+                       diag_buf_has_sub(view(db1), sym_deadf);
+    diag_buf_free(mut_view(db1));
+    diag_buf_free(mut_view(db2));
+    ok_rep
+}
+
+// 3. Negative diagnostics, dangling relocation check, W^X check, and `--kind lib` no-GC preservation
+fn probe_negative_diags_and_lib_mode(arena: mut_view<Arena>) -> bool {
+    let s_a = alloc_sv8(mut_view(*arena), 97u8, 46u8, 111u8, 98u8, 106u8, 0u8, 0u8, 0u8, 5);
+    let s_b = alloc_sv8(mut_view(*arena), 98u8, 46u8, 111u8, 98u8, 106u8, 0u8, 0u8, 0u8, 5);
+    let sym_dup = alloc_sv8(mut_view(*arena), 100u8, 117u8, 112u8, 95u8, 115u8, 121u8, 109u8, 0u8, 7);
+
+    // 3a. Duplicate strong symbol -> AX_LINK_DUPLICATE_SYMBOL (136)
+    let g1 = lgc_graph_new(mut_view(*arena), true, false, false);
+    let o1a = lgc_add_object(unsafe { mut_view(*g1) }, mut_view(*arena), s_a, 1u64);
+    let o1b = lgc_add_object(unsafe { mut_view(*g1) }, mut_view(*arena), s_b, 2u64);
+    let _s1 = lgc_emit_function_with_unwind(unsafe { mut_view(*g1) }, mut_view(*arena), o1a, sym_dup, sym_dup, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 1u64, 0u32, LGC_ROOT_ENTRY);
+    let _s2 = lgc_emit_function_with_unwind(unsafe { mut_view(*g1) }, mut_view(*arena), o1b, sym_dup, sym_dup, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 1u64, 0u32, LGC_ROOT_NONE);
+    if lgc_run_pipeline(unsafe { mut_view(*g1) }, mut_view(*arena)) || (unsafe { (*g1).stats.diag_code }) != AX_LINK_DUPLICATE_SYMBOL {
+        return false;
+    }
+
+    // 3b. Undefined symbol from live root -> AX_LINK_UNDEFINED_SYMBOL (135)
+    let g2 = lgc_graph_new(mut_view(*arena), true, false, false);
+    let o2a = lgc_add_object(unsafe { mut_view(*g2) }, mut_view(*arena), s_a, 1u64);
+    let u_root = lgc_emit_function_with_unwind(unsafe { mut_view(*g2) }, mut_view(*arena), o2a, sym_dup, sym_dup, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 1u64, 0u32, LGC_ROOT_ENTRY);
+    lgc_add_reloc(unsafe { mut_view(*g2) }, mut_view(*arena), u_root, 4u32, LGC_RELOC_REL32, s_b, LGC_NONE_ID, 0);
+    if lgc_run_pipeline(unsafe { mut_view(*g2) }, mut_view(*arena)) || (unsafe { (*g2).stats.diag_code }) != AX_LINK_UNDEFINED_SYMBOL {
+        return false;
+    }
+
+    // 3c. W^X violation -> AX_LINK_WX_VIOLATION (155)
+    let g3 = lgc_graph_new(mut_view(*arena), true, false, false);
+    let o3a = lgc_add_object(unsafe { mut_view(*g3) }, mut_view(*arena), s_a, 1u64);
+    let wx_sec = lgc_emit_function_with_unwind(unsafe { mut_view(*g3) }, mut_view(*arena), o3a, sym_dup, sym_dup, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 32u32, 1u64, 0u32, LGC_ROOT_ENTRY);
+    unsafe {
+        let sp = lgc_sec_at((*g3).secs, wx_sec as usize);
+        (*sp).characteristics = (*sp).characteristics | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_WRITE;
+    }
+    if lgc_run_pipeline(unsafe { mut_view(*g3) }, mut_view(*arena)) || (unsafe { (*g3).stats.diag_code }) != AX_LINK_WX_VIOLATION {
+        return false;
+    }
+
+    // 3d. Post-GC dangling relocation check -> AX_LINK_DANGLING_RELOC (156)
+    let g4 = lgc_graph_new(mut_view(*arena), true, false, false);
+    let o4a = lgc_add_object(unsafe { mut_view(*g4) }, mut_view(*arena), s_a, 1u64);
+    let live_s = lgc_add_section(unsafe { mut_view(*g4) }, mut_view(*arena), o4a, s_a, sym_dup, sym_dup, LGC_SEC_TEXT, 16u32, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, LGC_NONE_ID, 32u32, 1u64, LGC_ROOT_ENTRY);
+    let dead_s = lgc_add_section(unsafe { mut_view(*g4) }, mut_view(*arena), o4a, s_b, s_b, s_b, LGC_SEC_TEXT, 16u32, LGC_BIND_LOCAL, COMDAT_SELECT_NONE, LGC_NONE_ID, 32u32, 2u64, LGC_ROOT_NONE);
+    unsafe {
+        let lp = lgc_sec_at((*g4).secs, live_s as usize);
+        (*lp).is_live = true;
+        let dp = lgc_sec_at((*g4).secs, dead_s as usize);
+        (*dp).is_live = false;
+    }
+    lgc_add_reloc(unsafe { mut_view(*g4) }, mut_view(*arena), live_s, 4u32, LGC_RELOC_REL32, s_b, dead_s, 0);
+    if lgc_verify_post_gc_invariants(unsafe { mut_view(*g4) }) || (unsafe { (*g4).stats.diag_code }) != AX_LINK_DANGLING_RELOC {
+        return false;
+    }
+
+    // 3e. Static archive `--kind lib` disables `--gc-sections` so unreferenced sections stay live
+    let g5 = lgc_graph_new(mut_view(*arena), true, false, true);
+    let o5a = lgc_add_object(unsafe { mut_view(*g5) }, mut_view(*arena), s_a, 1u64);
+    let _lib_fn = lgc_emit_function_with_unwind(unsafe { mut_view(*g5) }, mut_view(*arena), o5a, sym_dup, sym_dup, LGC_BIND_GLOBAL, COMDAT_SELECT_NONE, 48u32, 1u64, 8u32, LGC_ROOT_NONE);
+    if !lgc_run_pipeline(unsafe { mut_view(*g5) }, mut_view(*arena)) || (unsafe { (*g5).stats.dead_stripped_sections }) != 0u32 || (unsafe { (*g5).stats.retained_sections }) != 3u32 {
+        return false;
+    }
+
+    if AX_LINK_ABI_MISMATCH != 153u32 || AX_LINK_RELOC_OUT_OF_RANGE != 137u32 || (IMAGE_SCN_LNK_COMDAT != 0x1000u32) {
+        return false;
+    }
+    true
+}
+
+fn main() -> i32 {
+    let mut arena = new_arena(524288);
+    if !probe_separate_obj_lib_and_comdat(mut_view(arena)) {
+        arena_destroy(mut_view(arena));
+        return 1;
+    }
+    print("e18_6_probe_separate_obj_lib_and_comdat_ok=true\n");
+
+    if !probe_root_set_gc_unwind_and_inspect(mut_view(arena)) {
+        arena_destroy(mut_view(arena));
+        return 2;
+    }
+    print("e18_6_probe_root_set_gc_unwind_and_inspect_ok=true\n");
+
+    if !probe_negative_diags_and_lib_mode(mut_view(arena)) {
+        arena_destroy(mut_view(arena));
+        return 3;
+    }
+    print("e18_6_probe_negative_diags_and_lib_mode_ok=true\n");
+    print("E18-6-SEPARATE-COMPILATION-PROBE-PASS\n");
+    arena_destroy(mut_view(arena));
+    0
+}

@@ -8,13 +8,13 @@ model: sonnet
 gate_model: sonnet
 depends: [T775, T759, T763, T767, T771, T773]
 priority: 725
-status: doing
+status: done
 attempts: 1
 paths: [tests/conformance/p18/e18_6_separate_compilation]
 spec: [spec/SPEC-27-separate-compilation-linker-v2.md, 0099, 0164, 0217, tasks/0369, tasks/0526, tasks/0786, tasks/0804]
 covers: [REQ-LNK-3945, REQ-LNK-3946, REQ-LNK-3947, REQ-LNK-3948, REQ-LNK-3949, REQ-LNK-3950, REQ-LNK-3951, REQ-LNK-3952, REQ-LNK-3953, REQ-LNK-3954, REQ-LNK-3955, REQ-LNK-3956, REQ-LNK-3957, REQ-LNK-3958, REQ-LNK-3959, REQ-LNK-3960, REQ-LNK-3961, REQ-LNK-3962, REQ-LNK-3963, REQ-LNK-3964, REQ-LNK-3965, REQ-LNK-3966, REQ-LNK-3967, REQ-LNK-3968, REQ-LNK-3969, REQ-LNK-3970, REQ-LNK-3971, REQ-LNK-3972, REQ-LNK-3973, REQ-LNK-3974, REQ-LNK-3975, REQ-LNK-3976, REQ-LNK-3977, REQ-LNK-3978, REQ-LNK-3979, REQ-LNK-3980, REQ-LNK-3981, REQ-LNK-3982, REQ-LNK-3983]
 started: 2026-11-08 14:22:06
-agent: T776-impl
+finished: 2026-11-08 14:44:01
 ---
 # T776 — E18.6 — Separate compilation, multi-object archives, section GC & P18 exit conformance suite
 
@@ -44,3 +44,4 @@ Certify E18.6 and the integrated P18 Compiler Architecture 2.0 pipeline with an 
 ## Log
 - 2026-11-03 03:01:00 created by T218 (P18 phase planning)
 - 2026-11-08 14:22:06 started (attempt 1) T776-impl
+- 2026-11-08 14:44:01 accepted by QA -> done
