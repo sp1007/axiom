@@ -1,0 +1,424 @@
+// Direct verification probe for `std.pkg.lockfile`, `std.pkg.store`, and `compiler.driver.pkg_cmd`
+// (T856 / E20.2: SPEC-111 §§4..5, REQ-ECO-8736, REQ-PKG-022, REQ-PKG-024, REQ-PKG-025, INV-PKG-002).
+
+module main
+
+use host_intrinsics.stdio
+use host_intrinsics.write
+
+use compiler.kernel.interner.StrView
+use compiler.diag.code.AX_DRIVER_BAD_MANIFEST
+use compiler.diag.code.AX_DRIVER_USAGE
+use compiler.diag.emitter.DiagSink
+use compiler.diag.emitter.diag_sink_init
+use compiler.diag.emitter.diag_sink_free
+use compiler.diag.format.DiagBuffer
+use compiler.diag.format.diag_buf_init
+use compiler.diag.format.diag_buf_free
+use compiler.diag.format.diag_buf_as_str_view
+use compiler.query.db.query_db_empty
+use compiler.diag.ux2.ux2_sv
+use compiler.diag.ux2.ux2_sv_empty
+use compiler.diag.ux2.ux2_sv_eq
+
+use compiler.pkg.resolver.PKG_SOURCE_REGISTRY
+use compiler.pkg.resolver.PKG_SOURCE_WORKSPACE
+use compiler.pkg.resolver.pkg_candidate_empty
+use compiler.pkg.resolver.pkg_candidate_new
+use compiler.pkg.resolver.pkg_candidate_add_feature
+use compiler.pkg.resolver.pkg_candidate_add_dep
+use compiler.pkg.resolver.pkg_dep_spec_new
+use compiler.pkg.resolver.pkg_resolver_policy_default
+use compiler.pkg.resolver.resolved_package_graph_empty
+use compiler.pkg.resolver.resolve_package_graph
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.LockfileV1
+use std.pkg.lockfile.LockPackageEntry
+use std.pkg.lockfile.LOCK_STATUS_OK
+use std.pkg.lockfile.LOCK_STATUS_CORRUPT
+use std.pkg.lockfile.LOCK_STATUS_DRIFT
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lockfile_v1_empty
+use std.pkg.lockfile.lock_package_entry_empty
+use std.pkg.lockfile.parse_lock_semver
+use std.pkg.lockfile.serialize_canonical_lockfile_v1
+use std.pkg.lockfile.parse_canonical_lockfile_v1
+use std.pkg.lockfile.verify_lockfile_drift_against_nodes
+
+use std.pkg.store.STORE_STATUS_OK
+use std.pkg.store.STORE_STATUS_HASH_MISMATCH
+use std.pkg.store.STORE_STATUS_PATH_TRAVERSAL
+use std.pkg.store.STORE_STATUS_QUOTA_EXCEEDED
+use std.pkg.store.STORE_STATUS_OFFLINE_MISSING
+use std.pkg.store.format_content_addressed_cache_path
+use std.pkg.store.verify_package_content_sha256
+use std.pkg.store.check_archive_entry_safety
+use std.pkg.store.check_archive_quotas
+use std.pkg.store.serialize_vendor_manifest
+use std.pkg.store.verify_offline_vendor_coverage
+
+use compiler.driver.pkg_cmd.PKG_CMD_INIT
+use compiler.driver.pkg_cmd.PKG_CMD_ADD
+use compiler.driver.pkg_cmd.PKG_CMD_TREE
+use compiler.driver.pkg_cmd.PKG_EXIT_OK
+use compiler.driver.pkg_cmd.PKG_EXIT_DIAG_ERROR
+use compiler.driver.pkg_cmd.pkg_cmd_options_empty
+use compiler.driver.pkg_cmd.parse_pkg_cmd_args
+use compiler.driver.pkg_cmd.execute_pkg_init
+use compiler.driver.pkg_cmd.parse_pkg_add_spec
+use compiler.driver.pkg_cmd.render_pkg_tree_text
+use compiler.driver.pkg_cmd.execute_pkg_verify_lock
+use compiler.driver.pkg_cmd.execute_pkg_vendor
+
+fn out_str(s: str) {
+    let sv = ux2_sv(s)
+    let _ = unsafe { write(stdio(1), sv.ptr, sv.len) }
+}
+
+fn out_bool(b: bool) {
+    if b {
+        out_str("true")
+    } else {
+        out_str("false")
+    }
+}
+
+fn new_diag_sink() -> DiagSink {
+    let mut sink = DiagSink {
+        arena: (query_db_empty()).arena,
+        diags: 0 as *mut compiler.diag.emitter.Diagnostic,
+        len: 0,
+        cap: 0,
+        errors: 0,
+        warnings: 0,
+    }
+    diag_sink_init(mut_view(sink))
+    sink
+}
+
+fn run_lockfile_probe() -> bool {
+    // 1. Construct an un-sorted lockfile with 3 packages
+    let mut lock = lockfile_v1_empty()
+    lock.sdk_fingerprint = lsv_from_str("blake3:4a90e1c27b8f03d16e52a49c8107f3d29b1c4e8a7f06d52319a8c4e7b2d10f63")
+
+    // Package 0: zebra@1.0.0 (alphabetically last)
+    let mut p_z = lock_package_entry_empty()
+    p_z.name = lsv_from_str("zebra")
+    let _ = parse_lock_semver(lsv_from_str("1.0.0"), mut_view(p_z.version))
+    p_z.source = lsv_from_str("registry:default")
+    p_z.sha256 = lsv_from_str("3333333333333333333333333333333333333333333333333333333333333333")
+    p_z.features[0] = lsv_from_str("z_feat")
+    p_z.features[1] = lsv_from_str("a_feat") // unsorted features
+    p_z.feature_count = 2usize
+
+    // Package 1: app_cli@0.2.0 (workspace root)
+    let mut p_app = lock_package_entry_empty()
+    p_app.name = lsv_from_str("app_cli")
+    let _ = parse_lock_semver(lsv_from_str("0.2.0"), mut_view(p_app.version))
+    p_app.source = lsv_from_str("workspace:crates/app_cli")
+    p_app.sha256 = lsv_from_str("1111111111111111111111111111111111111111111111111111111111111111")
+    p_app.dependencies[0] = lsv_from_str("default/zebra@1.0.0 (registry:default) [normal]")
+    p_app.dependencies[1] = lsv_from_str("default/core_math@0.2.0 (workspace:crates/core_math) [normal]") // unsorted deps
+    p_app.dependency_count = 2usize
+
+    // Package 2: core_math@0.2.0
+    let mut p_math = lock_package_entry_empty()
+    p_math.name = lsv_from_str("core_math")
+    let _ = parse_lock_semver(lsv_from_str("0.2.0"), mut_view(p_math.version))
+    p_math.source = lsv_from_str("workspace:crates/core_math")
+    p_math.sha256 = lsv_from_str("2222222222222222222222222222222222222222222222222222222222222222")
+
+    lock.packages[0] = p_z
+    lock.packages[1] = p_app
+    lock.packages[2] = p_math
+    lock.package_count = 3usize
+
+    // 2. Canonical serialization: sorts packages lexicographically (app_cli, core_math, zebra)
+    // and sorts features ("a_feat", "z_feat") and dependencies
+    let mut out_buf = lock_buf_new()
+    lock_buf_init(mut_view(out_buf))
+    serialize_canonical_lockfile_v1(mut_view(lock), mut_view(out_buf))
+    let serialized_text = lock_buf_as_lsv(view(out_buf))
+
+    let canonical_order = lsv_eq(lock.packages[0].name, lsv_from_str("app_cli")) &&
+        lsv_eq(lock.packages[1].name, lsv_from_str("core_math")) &&
+        lsv_eq(lock.packages[2].name, lsv_from_str("zebra")) &&
+        lsv_eq(lock.packages[2].features[0], lsv_from_str("a_feat")) &&
+        lsv_eq(lock.packages[2].features[1], lsv_from_str("z_feat")) &&
+        lsv_starts_with_str(lock.graph_hash, "sha256:")
+
+    // 3. Deserialization & roundtrip verification
+    let mut parsed_lock = lockfile_v1_empty()
+    let parse_rc = parse_canonical_lockfile_v1(serialized_text, mut_view(parsed_lock))
+    let roundtrip_ok = parse_rc == LOCK_STATUS_OK &&
+        parsed_lock.package_count == 3usize &&
+        lsv_eq(parsed_lock.packages[0].name, lsv_from_str("app_cli")) &&
+        lsv_eq(parsed_lock.packages[1].name, lsv_from_str("core_math")) &&
+        lsv_eq(parsed_lock.packages[2].name, lsv_from_str("zebra")) &&
+        lsv_eq(parsed_lock.graph_hash, lock.graph_hash)
+
+    // 4. Graph hash tamper detection (`AXS-PKG-031 §1`)
+    let mut tampered_buf = lock_buf_new()
+    lock_buf_init(mut_view(tampered_buf))
+    // Introduce single-byte corruption into sha256 of zebra
+    let mut ci: usize = 0usize
+    while ci < serialized_text.len {
+        let b = lsv_byte(serialized_text, ci)
+        if b == 51u8 && ci > 100usize { // '3'
+            lock_buf_push_byte(mut_view(tampered_buf), 52u8) // '4'
+        } else {
+            lock_buf_push_byte(mut_view(tampered_buf), b)
+        }
+        ci = ci + 1usize
+    }
+    let mut tampered_lock = lockfile_v1_empty()
+    let tamper_rc = parse_canonical_lockfile_v1(lock_buf_as_lsv(view(tampered_buf)), mut_view(tampered_lock))
+    let graph_hash_ok = tamper_rc == LOCK_STATUS_CORRUPT
+    lock_buf_free(mut_view(tampered_buf))
+
+    // 5. Drift detection: node count or version mismatch (`AXS-PKG-031 §1`)
+    let mut exp_ns: [16]LockStrView = [lsv_empty(); 16]
+    let mut exp_nm: [16]LockStrView = [lsv_empty(); 16]
+    let mut exp_ver: [16]LockStrView = [lsv_empty(); 16]
+    let mut exp_src: [16]LockStrView = [lsv_empty(); 16]
+    let mut exp_env: [16]LockStrView = [lsv_empty(); 16]
+
+    exp_ns[0] = lsv_from_str("default")
+    exp_nm[0] = lsv_from_str("app_cli")
+    exp_ver[0] = lsv_from_str("0.2.0")
+    exp_src[0] = lsv_from_str("workspace:crates/app_cli")
+    exp_env[0] = lsv_from_str("target")
+
+    exp_ns[1] = lsv_from_str("default")
+    exp_nm[1] = lsv_from_str("core_math")
+    exp_ver[1] = lsv_from_str("0.2.0")
+    exp_src[1] = lsv_from_str("workspace:crates/core_math")
+    exp_env[1] = lsv_from_str("target")
+
+    // Drift 1: expected graph has only 2 nodes, lockfile has 3
+    let mut drift_detail = lsv_empty()
+    let drift1_rc = verify_lockfile_drift_against_nodes(
+        view(parsed_lock),
+        view(exp_ns),
+        view(exp_nm),
+        view(exp_ver),
+        view(exp_src),
+        view(exp_env),
+        2usize,
+        mut_view(drift_detail)
+    )
+
+    // Drift 2: version changed to 0.3.0
+    exp_ns[2] = lsv_from_str("default")
+    exp_nm[2] = lsv_from_str("zebra")
+    exp_ver[2] = lsv_from_str("0.3.0") // drifted from 1.0.0
+    exp_src[2] = lsv_from_str("registry:default")
+    exp_env[2] = lsv_from_str("target")
+
+    let drift2_rc = verify_lockfile_drift_against_nodes(
+        view(parsed_lock),
+        view(exp_ns),
+        view(exp_nm),
+        view(exp_ver),
+        view(exp_src),
+        view(exp_env),
+        3usize,
+        mut_view(drift_detail)
+    )
+
+    let drift_rejected = drift1_rc == LOCK_STATUS_DRIFT && drift2_rc == LOCK_STATUS_DRIFT
+    lock_buf_free(mut_view(out_buf))
+
+    out_str("probe[lockfile] canonical_order=")
+    out_bool(canonical_order)
+    out_str(" graph_hash_ok=")
+    out_bool(graph_hash_ok)
+    out_str(" roundtrip_ok=")
+    out_bool(roundtrip_ok)
+    out_str(" drift_rejected=")
+    out_bool(drift_rejected)
+    out_str("\n")
+
+    canonical_order && graph_hash_ok && roundtrip_ok && drift_rejected
+}
+
+fn run_store_probe() -> bool {
+    // 1. Content-addressed path formatting (`AXS-PKG-032 §1`)
+    let mut p_buf = lock_buf_new()
+    lock_buf_init(mut_view(p_buf))
+    let sha_example = lsv_from_str("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    let ok_path = format_content_addressed_cache_path(sha_example, mut_view(p_buf))
+    let path_str = lock_buf_as_lsv(view(p_buf))
+    let cache_path_ok = ok_path &&
+        lsv_eq_str(path_str, ".axiom/cache/pkg/sha256/e3/b0/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855/")
+    lock_buf_free(mut_view(p_buf))
+
+    // 2. Pre-use SHA-256 verification (match vs mismatch rejection) (`AXS-PKG-032 §2`)
+    let sha_valid = lsv_from_str("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+    let sha_tampered = lsv_from_str("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b800")
+    let rc_match = verify_package_content_sha256(sha_valid, sha_valid)
+    let rc_mismatch = verify_package_content_sha256(sha_tampered, sha_valid)
+    let sha256_verify_ok = rc_match == STORE_STATUS_OK && rc_mismatch == STORE_STATUS_HASH_MISMATCH
+
+    // 3. Sandboxed entry safety: path traversal rejection (`AXS-PKG-032 §3`)
+    let safe_entry = lsv_from_str("src/lib.ax")
+    let escape_abs = lsv_from_str("/etc/passwd")
+    let escape_win = lsv_from_str("C:\\windows\\system32")
+    let escape_dotdot = lsv_from_str("src/../../secret.txt")
+
+    let r_safe = check_archive_entry_safety(safe_entry) == STORE_STATUS_OK
+    let r_abs = check_archive_entry_safety(escape_abs) == STORE_STATUS_PATH_TRAVERSAL
+    let r_win = check_archive_entry_safety(escape_win) == STORE_STATUS_PATH_TRAVERSAL
+    let r_dotdot = check_archive_entry_safety(escape_dotdot) == STORE_STATUS_PATH_TRAVERSAL
+    let traversal_rejected = r_safe && r_abs && r_win && r_dotdot
+
+    // 4. Decompression quotas enforcement (`tasks/1065 §115`)
+    let q_normal = check_archive_quotas(1024usize, 4096usize, 10usize) == STORE_STATUS_OK
+    let q_too_big = check_archive_quotas(100000000usize, 200000000usize, 10usize) == STORE_STATUS_QUOTA_EXCEEDED
+    let q_bomb = check_archive_quotas(1024usize, 500000usize, 10usize) == STORE_STATUS_QUOTA_EXCEEDED // > 100:1 ratio
+    let q_files = check_archive_quotas(1024usize, 2048usize, 20000usize) == STORE_STATUS_QUOTA_EXCEEDED
+    let quotas_enforced = q_normal && q_too_big && q_bomb && q_files
+
+    out_str("probe[store] cache_path_ok=")
+    out_bool(cache_path_ok)
+    out_str(" sha256_verify_ok=")
+    out_bool(sha256_verify_ok)
+    out_str(" traversal_rejected=")
+    out_bool(traversal_rejected)
+    out_str(" quotas_enforced=")
+    out_bool(quotas_enforced)
+    out_str("\n")
+
+    cache_path_ok && sha256_verify_ok && traversal_rejected && quotas_enforced
+}
+
+fn run_vendor_cli_probe() -> bool {
+    let mut sink = new_diag_sink()
+
+    // 1. `axiomc pkg vendor` offline manifest generation (`AXS-PKG-033 §1`)
+    let mut lock = lockfile_v1_empty()
+    let mut p0 = lock_package_entry_empty()
+    p0.namespace = lsv_from_str("default")
+    p0.name = lsv_from_str("core_math")
+    let _ = parse_lock_semver(lsv_from_str("0.2.0"), mut_view(p0.version))
+    p0.source = lsv_from_str("registry:default")
+    p0.sha256 = lsv_from_str("2222222222222222222222222222222222222222222222222222222222222222")
+
+    let mut p_root = lock_package_entry_empty()
+    p_root.name = lsv_from_str("app_cli")
+    let _ = parse_lock_semver(lsv_from_str("0.2.0"), mut_view(p_root.version))
+    p_root.source = lsv_from_str("workspace:crates/app_cli") // workspace root should not be vendored
+    p_root.sha256 = lsv_from_str("1111111111111111111111111111111111111111111111111111111111111111")
+
+    lock.packages[0] = p_root
+    lock.packages[1] = p0
+    lock.package_count = 2usize
+
+    let mut v_buf = lock_buf_new()
+    lock_buf_init(mut_view(v_buf))
+    serialize_vendor_manifest(view(lock), lsv_from_str("vendor"), mut_view(v_buf))
+    let v_text = lock_buf_as_lsv(view(v_buf))
+    let vendor_manifest_ok = lsv_starts_with_str(v_text, "# This file is automatically @generated by axiomc pkg vendor.")
+    lock_buf_free(mut_view(v_buf))
+
+    // 2. Air-gapped `--offline` missing package detection (`AXS-PKG-033 §2`)
+    let mut present_mask: [16]bool = [false; 16]
+    present_mask[0] = true // workspace root present
+    present_mask[1] = false // core_math missing!
+
+    let mut missing_name = lsv_empty()
+    let mut missing_sha = lsv_empty()
+    let rc_offline = verify_offline_vendor_coverage(
+        view(lock),
+        true,
+        view(present_mask),
+        mut_view(missing_name),
+        mut_view(missing_sha)
+    )
+    let offline_missing_ok = rc_offline == STORE_STATUS_OFFLINE_MISSING &&
+        lsv_eq_str(missing_name, "core_math")
+
+    // 3. `axiomc pkg init` execution (`AXS-PKG-040 §1`)
+    let mut init_opts = pkg_cmd_options_empty()
+    init_opts.subcommand = PKG_CMD_INIT
+    init_opts.name = ux2_sv("web_server")
+    init_opts.is_bin = true
+
+    let mut toml_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0usize, cap: 0usize }
+    diag_buf_init(mut_view(toml_buf))
+    let mut src_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0usize, cap: 0usize }
+    diag_buf_init(mut_view(src_buf))
+
+    let rc_init_ok = execute_pkg_init(view(init_opts), false, mut_view(toml_buf), mut_view(src_buf), mut_view(sink))
+    let rc_init_fail = execute_pkg_init(view(init_opts), true, mut_view(toml_buf), mut_view(src_buf), mut_view(sink))
+    let cli_init_ok = rc_init_ok == PKG_EXIT_OK && rc_init_fail == PKG_EXIT_DIAG_ERROR
+    diag_buf_free(mut_view(toml_buf))
+    diag_buf_free(mut_view(src_buf))
+
+    // 4. `axiomc pkg add` spec parser (`AXS-PKG-040 §2`)
+    let mut ns = ux2_sv_empty()
+    let mut nm = ux2_sv_empty()
+    let mut req = ux2_sv_empty()
+    let ok_add = parse_pkg_add_spec(ux2_sv("axiom/crypto@^1.4.0"), mut_view(ns), mut_view(nm), mut_view(req), mut_view(sink))
+    let cli_add_ok = ok_add &&
+        ux2_sv_eq(ns, ux2_sv("axiom")) &&
+        ux2_sv_eq(nm, ux2_sv("crypto")) &&
+        ux2_sv_eq(req, ux2_sv("^1.4.0"))
+
+    // 5. `axiomc pkg tree` rendering (`AXS-PKG-040 §7`)
+    let mut g = resolved_package_graph_empty()
+    g.node_count = 1usize
+    g.nodes[0].identity.namespace = ux2_sv("default")
+    g.nodes[0].identity.name = ux2_sv("app")
+    g.nodes[0].identity.version.raw = ux2_sv("1.0.0")
+    g.nodes[0].identity.source_kind = PKG_SOURCE_WORKSPACE
+    g.nodes[0].identity.source_id = ux2_sv("crates/app")
+
+    let mut tree_buf = DiagBuffer { ptr: 0 as *mut u8, len: 0usize, cap: 0usize }
+    diag_buf_init(mut_view(tree_buf))
+    render_pkg_tree_text(view(g), false, ux2_sv_empty(), mut_view(tree_buf))
+    let tree_str = diag_buf_as_str_view(view(tree_buf))
+    let tree_ok = tree_str.len > 0usize
+    diag_buf_free(mut_view(tree_buf))
+
+    diag_sink_free(mut_view(sink))
+
+    out_str("probe[vendor_cli] vendor_manifest_ok=")
+    out_bool(vendor_manifest_ok)
+    out_str(" offline_missing_ok=")
+    out_bool(offline_missing_ok)
+    out_str(" cli_init_ok=")
+    out_bool(cli_init_ok)
+    out_str(" cli_add_ok=")
+    out_bool(cli_add_ok)
+    out_str(" tree_ok=")
+    out_bool(tree_ok)
+    out_str("\n")
+
+    vendor_manifest_ok && offline_missing_ok && cli_init_ok && cli_add_ok && tree_ok
+}
+
+pub fn main() -> i32 {
+    let ok1 = run_lockfile_probe()
+    let ok2 = run_store_probe()
+    let ok3 = run_vendor_cli_probe()
+
+    if ok1 && ok2 && ok3 {
+        out_str("PKG-LOCKFILE-PROBE-PASS\n")
+        return 0
+    }
+    1
+}

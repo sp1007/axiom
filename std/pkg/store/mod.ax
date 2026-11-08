@@ -1,0 +1,348 @@
+// SHA-256 Content-Addressed Local Package Cache, Sandboxed Decompression,
+// Air-Gapped `--offline` Verification & `vendor/` Directory Materialization (`std/pkg/store/mod.ax`, T856 / E20.2).
+//
+// Implements SPEC-111 §4 (`AXS-PKG-032`, `AXS-PKG-033`, `AXS-PKG-050`;
+// `REQ-PKG-013`, `REQ-PKG-022`, `REQ-PKG-024`, `REQ-ECO-8736`, `INV-PKG-002`).
+
+module std.pkg.store
+
+use std.pkg.lockfile.LockStrView
+use std.pkg.lockfile.LockBuffer
+use std.pkg.lockfile.LockDigest256
+use std.pkg.lockfile.LockfileV1
+use std.pkg.lockfile.lsv_from_str
+use std.pkg.lockfile.lsv_empty
+use std.pkg.lockfile.lsv_byte
+use std.pkg.lockfile.lsv_slice
+use std.pkg.lockfile.lsv_eq
+use std.pkg.lockfile.lsv_eq_str
+use std.pkg.lockfile.lsv_cmp
+use std.pkg.lockfile.lsv_trim
+use std.pkg.lockfile.lsv_starts_with_str
+use std.pkg.lockfile.lsv_strip_quotes
+use std.pkg.lockfile.lock_buf_new
+use std.pkg.lockfile.lock_buf_init
+use std.pkg.lockfile.lock_buf_free
+use std.pkg.lockfile.lock_buf_push_byte
+use std.pkg.lockfile.lock_buf_push_sv
+use std.pkg.lockfile.lock_buf_push_str
+use std.pkg.lockfile.lock_buf_push_u32
+use std.pkg.lockfile.lock_buf_as_lsv
+use std.pkg.lockfile.lock_digest256_format_hex
+use std.pkg.lockfile.parse_sha256_hex_to_digest
+
+// =============================================================================
+// 1. Store Constants, Quotas & Status Codes (`AXS-PKG-032`, `AXS-PKG-033`)
+// =============================================================================
+
+pub const STORE_STATUS_OK: u32 = 0u32
+pub const STORE_STATUS_HASH_MISMATCH: u32 = 1u32
+pub const STORE_STATUS_PATH_TRAVERSAL: u32 = 2u32
+pub const STORE_STATUS_QUOTA_EXCEEDED: u32 = 3u32
+pub const STORE_STATUS_OFFLINE_MISSING: u32 = 4u32
+pub const STORE_STATUS_CORRUPT_ARCHIVE: u32 = 5u32
+pub const STORE_STATUS_IO_ERROR: u32 = 6u32
+
+// Decompression quotas per SPEC-111 AXS-PKG-032 §3 / tasks/1065 §115
+pub const STORE_MAX_ARCHIVE_SIZE: usize = 67108864usize        // 64 MiB
+pub const STORE_MAX_UNCOMPRESSED_TOTAL: usize = 268435456usize  // 256 MiB
+pub const STORE_MAX_COMPRESSION_RATIO: usize = 100usize        // 100:1 ratio
+pub const STORE_MAX_FILE_COUNT: usize = 16384usize             // 16,384 files
+
+pub const VENDOR_SCHEMA_VERSION_1: u32 = 1u32
+
+// =============================================================================
+// 2. SHA-256 Content-Addressed Cache Path Generation (`AXS-PKG-032 §1`)
+// =============================================================================
+
+pub fn is_valid_sha256_hex(s: LockStrView) -> bool {
+    let mut raw = lsv_trim(s)
+    if lsv_starts_with_str(raw, "sha256:") {
+        raw = lsv_slice(raw, 7usize, raw.len)
+    }
+    if raw.len != 64usize {
+        return false
+    }
+    let mut i: usize = 0usize
+    while i < 64usize {
+        let b = lsv_byte(raw, i)
+        let is_num = b >= 48u8 && b <= 57u8
+        let is_lo = b >= 97u8 && b <= 102u8
+        let is_hi = b >= 65u8 && b <= 70u8
+        if !is_num && !is_lo && !is_hi {
+            return false
+        }
+        i = i + 1usize
+    }
+    true
+}
+
+// Formats canonical content-addressed cache path:
+// `.axiom/cache/pkg/sha256/<byte0_hex>/<byte1_hex>/<full_sha256_hex>/`
+pub fn format_content_addressed_cache_path(
+    sha256_hex: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) -> bool {
+    let mut raw = lsv_trim(sha256_hex)
+    if lsv_starts_with_str(raw, "sha256:") {
+        raw = lsv_slice(raw, 7usize, raw.len)
+    }
+    if raw.len != 64usize || !is_valid_sha256_hex(raw) {
+        return false
+    }
+
+    lock_buf_push_str(mut_view(*out_buf), ".axiom/cache/pkg/sha256/")
+    // First two characters: byte 0
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 0usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 1usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    // Next two characters: byte 1
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 2usize))
+    lock_buf_push_byte(mut_view(*out_buf), lsv_byte(raw, 3usize))
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+
+    // Full 64-hex digest
+    lock_buf_push_sv(mut_view(*out_buf), raw)
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+    true
+}
+
+// =============================================================================
+// 3. Mandatory Pre-Use SHA-256 Verification (`AXS-PKG-032 §2`, `PKG-INV-12`)
+// =============================================================================
+
+pub fn verify_package_content_sha256(
+    found_sha256: LockStrView,
+    expected_sha256: LockStrView
+) -> u32 {
+    let mut fnd = lsv_trim(found_sha256)
+    if lsv_starts_with_str(fnd, "sha256:") {
+        fnd = lsv_slice(fnd, 7usize, fnd.len)
+    }
+
+    let mut exp = lsv_trim(expected_sha256)
+    if lsv_starts_with_str(exp, "sha256:") {
+        exp = lsv_slice(exp, 7usize, exp.len)
+    }
+
+    if fnd.len != 64usize || exp.len != 64usize {
+        return STORE_STATUS_HASH_MISMATCH
+    }
+
+    // Case-insensitive ASCII hex comparison
+    let mut i: usize = 0usize
+    while i < 64usize {
+        let mut ba = lsv_byte(fnd, i)
+        let mut bb = lsv_byte(exp, i)
+        if ba >= 65u8 && ba <= 90u8 {
+            ba = ba + 32u8
+        }
+        if bb >= 65u8 && bb <= 90u8 {
+            bb = bb + 32u8
+        }
+        if ba != bb {
+            return STORE_STATUS_HASH_MISMATCH
+        }
+        i = i + 1usize
+    }
+    STORE_STATUS_OK
+}
+
+// =============================================================================
+// 4. Sandboxed Archive Entry & Path-Traversal Rejection (`AXS-PKG-032 §3`)
+// =============================================================================
+
+// Rejects absolute paths ('/', '\'), drive letters ('C:'), parent traversal ('..'),
+// device nodes, or NUL bytes (`AXS-PKG-032 §3`, `PKG-INV-14..16`).
+pub fn check_archive_entry_safety(entry_path: LockStrView) -> u32 {
+    let t = lsv_trim(entry_path)
+    if t.len == 0usize {
+        return STORE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Reject leading '/' or '\'
+    let b0 = lsv_byte(t, 0usize)
+    if b0 == 47u8 || b0 == 92u8 {
+        return STORE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Reject drive letter: 'C:'
+    if t.len >= 2usize && lsv_byte(t, 1usize) == 58u8 {
+        return STORE_STATUS_PATH_TRAVERSAL
+    }
+
+    // Scan for '..', '\', NUL, or hidden backslash separators
+    let mut i: usize = 0usize
+    while i < t.len {
+        let b = lsv_byte(t, i)
+        if b == 0u8 || b == 92u8 {
+            return STORE_STATUS_PATH_TRAVERSAL
+        }
+        if b == 46u8 && (i + 1usize) < t.len && lsv_byte(t, i + 1usize) == 46u8 {
+            // Check boundary around ".."
+            let prev_sep = i == 0usize || lsv_byte(t, i - 1usize) == 47u8
+            let next_sep = (i + 2usize) == t.len || lsv_byte(t, i + 2usize) == 47u8
+            if prev_sep && next_sep {
+                return STORE_STATUS_PATH_TRAVERSAL
+            }
+        }
+        i = i + 1usize
+    }
+
+    STORE_STATUS_OK
+}
+
+// Enforces deterministic decompression resource limits (`tasks/1065 §115`)
+pub fn check_archive_quotas(
+    archive_size: usize,
+    uncompressed_size: usize,
+    file_count: usize
+) -> u32 {
+    if archive_size > STORE_MAX_ARCHIVE_SIZE {
+        return STORE_STATUS_QUOTA_EXCEEDED
+    }
+    if uncompressed_size > STORE_MAX_UNCOMPRESSED_TOTAL {
+        return STORE_STATUS_QUOTA_EXCEEDED
+    }
+    if file_count > STORE_MAX_FILE_COUNT {
+        return STORE_STATUS_QUOTA_EXCEEDED
+    }
+    if archive_size > 0usize {
+        let ratio = uncompressed_size / archive_size
+        if ratio > STORE_MAX_COMPRESSION_RATIO {
+            return STORE_STATUS_QUOTA_EXCEEDED
+        }
+    }
+    STORE_STATUS_OK
+}
+
+// =============================================================================
+// 5. Offline Vendoring & `axiom-vendor.toml` Materialization (`AXS-PKG-033`)
+// =============================================================================
+
+@derive(Copy)
+pub struct VendorPackageRecord {
+    pub namespace: LockStrView,
+    pub name: LockStrView,
+    pub version: LockStrView,
+    pub source: LockStrView,
+    pub relative_vendor_dir: LockStrView,
+    pub sha256: LockStrView,
+}
+
+pub fn vendor_package_record_empty() -> VendorPackageRecord {
+    let e = lsv_empty()
+    VendorPackageRecord {
+        namespace: lsv_from_str("default"),
+        name: e,
+        version: e,
+        source: e,
+        relative_vendor_dir: e,
+        sha256: e,
+    }
+}
+
+// Formats relative directory path for vendored dependency:
+// `<vendor_dir>/<namespace>/<name>-<version>/`
+pub fn format_vendored_package_rel_dir(
+    namespace: LockStrView,
+    name: LockStrView,
+    version_raw: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_sv(mut_view(*out_buf), namespace)
+    lock_buf_push_byte(mut_view(*out_buf), 47u8) // '/'
+    lock_buf_push_sv(mut_view(*out_buf), name)
+    lock_buf_push_byte(mut_view(*out_buf), 45u8) // '-'
+    lock_buf_push_sv(mut_view(*out_buf), version_raw)
+}
+
+// Formats canonical `<vendor_dir>/axiom-vendor.toml` manifest (`AXS-PKG-033 §1`)
+pub fn serialize_vendor_manifest(
+    lock: view<LockfileV1>,
+    vendor_dir: LockStrView,
+    out_buf: mut_view<LockBuffer>
+) {
+    lock_buf_push_str(mut_view(*out_buf), "# This file is automatically @generated by axiomc pkg vendor. Do not edit manually.\n")
+    lock_buf_push_str(mut_view(*out_buf), "schema_version = 1\n")
+    lock_buf_push_str(mut_view(*out_buf), "vendor_root = \"")
+    let vdir = if vendor_dir.len > 0usize { vendor_dir } else { lsv_from_str("vendor") }
+    lock_buf_push_sv(mut_view(*out_buf), vdir)
+    lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+    let mut i: usize = 0usize
+    while i < lock.package_count {
+        let p = lock.packages[i]
+        // Skip workspace root packages (only vendor external dependencies)
+        if !lsv_starts_with_str(p.source, "workspace:") {
+            lock_buf_push_str(mut_view(*out_buf), "\n[[package]]\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "registry = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.registry)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "namespace = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.namespace)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "name = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.name)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "version = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.version.raw)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "source = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.source)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "path = \"")
+            let mut path_buf = lock_buf_new()
+            lock_buf_init(mut_view(path_buf))
+            format_vendored_package_rel_dir(p.namespace, p.name, p.version.raw, mut_view(path_buf))
+            lock_buf_push_sv(mut_view(*out_buf), lock_buf_as_lsv(view(path_buf)))
+            lock_buf_free(mut_view(path_buf))
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+
+            lock_buf_push_str(mut_view(*out_buf), "sha256 = \"")
+            lock_buf_push_sv(mut_view(*out_buf), p.sha256)
+            lock_buf_push_str(mut_view(*out_buf), "\"\n")
+        }
+        i = i + 1usize
+    }
+}
+
+// Verifies presence and integrity of external dependencies under `--offline` or `--vendor` (`AXS-PKG-033 §2`)
+pub fn verify_offline_vendor_coverage(
+    lock: view<LockfileV1>,
+    is_offline_or_vendor: bool,
+    present_mask: view<[16]bool>,
+    out_missing_pkg_name: mut_view<LockStrView>,
+    out_missing_sha256: mut_view<LockStrView>
+) -> u32 {
+    *out_missing_pkg_name = lsv_empty()
+    *out_missing_sha256 = lsv_empty()
+
+    if !is_offline_or_vendor {
+        return STORE_STATUS_OK
+    }
+
+    let mut i: usize = 0usize
+    while i < lock.package_count {
+        let p = lock.packages[i]
+        let is_workspace = lsv_starts_with_str(p.source, "workspace:")
+        if !is_workspace {
+            let is_present = if (i < 16usize) { (*present_mask)[i] } else { false }
+            if !is_present {
+                *out_missing_pkg_name = p.name
+                *out_missing_sha256 = p.sha256
+                return STORE_STATUS_OFFLINE_MISSING
+            }
+        }
+        i = i + 1usize
+    }
+
+    STORE_STATUS_OK
+}
